@@ -11,8 +11,9 @@
 //! process-wide, so a test running beside it without a subscriber can switch
 //! the request events off before this one captures them.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
@@ -21,7 +22,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
 
-use ignis_artifact::vision::{PreparedMedia, ProcessorError, ProcessorOptions, VisionProcessor, IMAGE_PAD_ID};
+use ignis_artifact::vision::{PreparedMedia, ProcessorError, ProcessorOptions, VisionProcessor};
 use ignis_core::decision::{AnswerAlphabet, LabelTokenizer};
 use ignis_core::mock::MockCompute;
 use ignis_core::vision::Multimodal;
@@ -70,23 +71,40 @@ impl Preparer for Counting {
     }
 }
 
-/// The deterministic mock, reporting `micros` of encode time on every chunk
-/// of a multimodal prompt that covers an image placeholder (GitHub #192) —
-/// what the CUDA leaf's real encode reports on the GPU, without one; a chunk
-/// past the image encodes nothing there either. The rest of each outcome is
-/// the mock's own, so a decision's readout still reaches its caller (GitHub
-/// #245).
+/// The deterministic mock, reporting `micros` of encode time where the CUDA
+/// leaf's real encode reports it on the GPU (GitHub #192), without one: on
+/// a chunk that covers an image the leaf does not hold yet, which it keys by
+/// the image's bytes and grid (GitHub #243). A later chunk of the same
+/// image, or a later request that names it, encodes nothing, as there; this
+/// mock only never evicts one. The rest of each outcome is the mock's own,
+/// so a decision's readout still reaches its caller (GitHub #245).
 struct EncodingCompute {
     inner: MockCompute,
     micros: u64,
+    /// The images encoded so far, as the leaf's embedding pool holds them.
+    held: Mutex<HashSet<([u8; 32], [u32; 3])>>,
+}
+
+impl EncodingCompute {
+    fn new(micros: u64) -> Self {
+        Self { inner: MockCompute::new(), micros, held: Mutex::new(HashSet::new()) }
+    }
 }
 
 impl Compute for EncodingCompute {
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         let mut outcomes = self.inner.prefill_step(jobs)?;
+        let mut held = self.held.lock().unwrap();
         for (outcome, job) in outcomes.iter_mut().zip(jobs) {
-            let covers_image = job.multimodal.is_some() && job.tokens.contains(&IMAGE_PAD_ID);
-            outcome.encode_micros = if covers_image { self.micros } else { 0 };
+            let covered = job.multimodal.as_ref().and_then(|multimodal| {
+                let chunk = multimodal.chunk_media(job.start_position, job.tokens.len() as u32)?;
+                let item = &multimodal.media[chunk.item];
+                Some((item.content_digest, [item.grid.t, item.grid.h, item.grid.w]))
+            });
+            outcome.encode_micros = match covered {
+                Some(image) if held.insert(image) => self.micros,
+                _ => 0,
+            };
         }
         Ok(outcomes)
     }
@@ -188,7 +206,7 @@ async fn the_encode_time_of_a_multimodal_prefill_reaches_the_admitted_event() {
     let _guard = tracing::subscriber::set_default(
         tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone())),
     );
-    let compute = Arc::new(EncodingCompute { inner: MockCompute::new(), micros: 250_000 });
+    let compute = Arc::new(EncodingCompute::new(250_000));
     let app = app(compute, counting());
 
     let response = app.clone().oneshot(image_request(&data_uri(&png(64, 64)))).await.unwrap();
@@ -414,7 +432,7 @@ impl Scheduler for StopsAfterAnEncode {
 
 /// The mock's scheduler, encoding every multimodal chunk in 250 ms.
 fn encoding_scheduler(config: SchedulerConfig) -> ConcreteScheduler {
-    let compute = Arc::new(EncodingCompute { inner: MockCompute::new(), micros: 250_000 });
+    let compute = Arc::new(EncodingCompute::new(250_000));
     ConcreteScheduler::with_config(config, compute)
 }
 
@@ -429,7 +447,7 @@ fn deciding_server(scheduler: Box<dyn Scheduler>, timeout: Duration) -> axum::Ro
 }
 
 /// A decide-capable router of its own: one per test request, so no request
-/// claims another's prefix.
+/// claims another's prefix or finds its image already encoded.
 fn deciding_app() -> axum::Router {
     let config = SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() };
     deciding_server(Box::new(encoding_scheduler(config)), Duration::from_secs(10))
@@ -553,4 +571,38 @@ async fn a_question_past_its_deadline_reports_the_encode_it_paid_for_on_cancelle
     assert_eq!(media.get("media.encode_seconds"), Some(&json!(0.25)), "{events:?}");
     assert_eq!(media.get("media.vision_tokens"), Some(&json!(4)), "{media:?}");
     assert_eq!(media.len(), 8, "every media field: {media:?}");
+}
+
+#[tokio::test]
+async fn a_second_question_over_the_same_image_reports_no_encode_on_done() {
+    // The leaf keeps an encoded image for the next question that names it
+    // (GitHub #243), so the second question encodes nothing. Prompt reuse is
+    // off, so the second prefills the image's chunks itself rather than
+    // claiming the first's state; the chunks are two tokens wide, so the
+    // image spans several and is encoded once all the same.
+    let (sink, _guard) = capture();
+    let config = SchedulerConfig {
+        model: MODEL.into(),
+        serving_chunk_tokens: 2,
+        prompt_reuse: false,
+        ..SchedulerConfig::default()
+    };
+    let app = deciding_server(Box::new(encoding_scheduler(config)), Duration::from_secs(10));
+    let image = data_uri(&png(64, 64));
+    for asked in 1..=2 {
+        let answer = decide(&app, "noul", Some(&image)).await;
+        assert_eq!(answer["answers"]["q"]["type"], "noul", "{answer}");
+        logged(&sink, "ignis.request.done", asked).await;
+    }
+
+    let done: Vec<Value> = logged(&sink, "ignis.request.done", 2)
+        .await
+        .into_iter()
+        .filter(|e| e["event_name"] == "ignis.request.done")
+        .map(|e| e["attributes"].clone())
+        .collect();
+    assert_eq!(done[0]["media.encode_seconds"], 0.25, "encoded once: {:?}", done[0]);
+    assert_eq!(done[1]["media.encode_seconds"], 0.0, "{:?}", done[1]);
+    assert_eq!(done[1]["media.cache_hits"], 1, "{:?}", done[1]);
+    assert!(done[1].get("reuse_source").is_none(), "it prefilled the image's chunks: {:?}", done[1]);
 }
