@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { StreamOptions, StreamResult } from "../api/stream.ts";
 import { ASK_TASK, Asker, answerAt, askRequest, quickQuestions, readAnswered, withAnswer } from "./ask.ts";
 import { ASSIST_SYSTEM } from "./assist.ts";
+import { contextBlock } from "./taskContext.ts";
 import { addUtterance, createTranscript, type Transcript } from "./transcript.ts";
 
 // Ask about this conversation (spec speech/07, Q139): the transcript, the
@@ -18,7 +19,7 @@ describe("a question's request", () => {
   it("is the task, then the transcript and the question last", () => {
     const request = askRequest(heard(), "  Quando il backup? ", null);
     expect(request.settings).toMatchObject({ systemPrompt: `${ASSIST_SYSTEM}\n\n${ASK_TASK}`, reasoningEffort: "none", laneTag: "interactive" });
-    expect(request.turns[0].content).toBe("27 Oct 15:42 · Call\n\n[00:04] Me: Il backup si fa venerdì.\n\nQuestion: Quando il backup?");
+    expect(request.turns[0].content).toBe(contextBlock(heard()) + "27 Oct 15:42 · Call\n\n[00:04] Me: Il backup si fa venerdì.\n\nQuestion: Quando il backup?");
   });
 });
 

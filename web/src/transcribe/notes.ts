@@ -1,6 +1,7 @@
 import { canChat, imageLoaded, loadUnderWay, type ModelState } from "../api/model.ts";
 import type { ConversationRequest, Settings } from "../api/request.ts";
-import { assistRequest, transcriptInput } from "./assist.ts";
+import { assistRequest } from "./assist.ts";
+import { taskInput } from "./taskContext.ts";
 import { clock } from "./export.ts";
 import { dayAndTime, type Transcript } from "./transcript.ts";
 import { viewerChoice } from "./viewerChoice.ts";
@@ -134,7 +135,7 @@ export function notesTask(kind: NoteKind): string {
     sections,
     [
       "Rules:",
-      "- Keep each heading exactly as given. Write the text under them in the same language as the transcript: a transcript in Italian gets notes in Italian, one in German notes in German.",
+      "- Keep each heading exactly as given. Write the text under them in the language the context says to write in.",
       "- Short bullet points. No preamble, no closing remark, nothing outside the sections.",
       "- A section with nothing in it yet is `—` alone.",
       "- Point at a moment by its time, as [mm:ss].",
@@ -157,7 +158,7 @@ export const NOTES_SETTINGS: Omit<Settings, "systemPrompt"> = {
 
 /** A writing of `t`'s notes as `kind`, and where its transcript starts when the start did not fit. */
 export function notesRequest(t: Transcript, kind: NoteKind, contextLimit: number | null): { request: ConversationRequest; fromMs: number | null } {
-  const { content, fromMs } = transcriptInput(t, contextLimit, NOTES_MAX_TOKENS);
+  const { content, fromMs } = taskInput(t, contextLimit, NOTES_MAX_TOKENS);
   return { request: assistRequest(NOTES_SETTINGS, notesTask(kind), content), fromMs };
 }
 

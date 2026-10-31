@@ -4,6 +4,7 @@ import type { StreamOptions, StreamResult } from "../api/stream.ts";
 import { ASSIST_SYSTEM } from "./assist.ts";
 import { LIVE_GAP_MS, noNotes, notesTask, type Notes } from "./notes.ts";
 import { NotesWriter, type Written } from "./notesWriter.ts";
+import { contextBlock } from "./taskContext.ts";
 import { addUtterance, createTranscript, type Transcript } from "./transcript.ts";
 
 // The notes' writer (spec speech/07, Q124-Q127): one writing at a time, on
@@ -58,7 +59,7 @@ describe("writing a Transcript's notes", () => {
     w.subscribe(() => seen.push(w.getState().text));
     await w.write(heard(3, 7), "work", null);
     expect(fake.asked[0].request.settings.systemPrompt).toBe(`${ASSIST_SYSTEM}\n\n${notesTask("work")}`);
-    expect(fake.asked[0].request.turns).toEqual([{ role: "user", content: "27 Oct 15:42 · Call\n\n[00:00] Me: Frase 0.\n[00:05] Me: Frase 1.\n[00:10] Me: Frase 2.\n" }]);
+    expect(fake.asked[0].request.turns).toEqual([{ role: "user", content: contextBlock(heard(3, 7)) + "27 Oct 15:42 · Call\n\n[00:00] Me: Frase 0.\n[00:05] Me: Frase 1.\n[00:10] Me: Frase 2.\n" }]);
     expect(seen).toContain("## Summary\n- Si parte.\n- Dal budget [00:05].\n\n## Topics\n—");
     expect(written).toEqual([
       [

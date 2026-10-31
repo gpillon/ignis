@@ -1,5 +1,6 @@
-import { type AskDeps, askModel, assistRequest, Follower, settle, transcriptInput, Watched } from "./assist.ts";
+import { type AskDeps, askModel, assistRequest, Follower, settle, Watched } from "./assist.ts";
 import { ANALYSIS_GAP_MS, ANALYSIS_MAX_TOKENS, ANALYSIS_SETTINGS, ANALYSIS_TASK, type Analysis, dueForAnalysis, readAnalysis } from "./suggestions.ts";
+import { taskInput } from "./taskContext.ts";
 import type { Transcript } from "./transcript.ts";
 
 // The look for suggestions (spec speech/07, Q132): the text model reads a
@@ -48,7 +49,7 @@ export class Analyst extends Watched<AnalystState> {
     const readUntilMs = Math.max(0, ...t.utterances.map((u) => u.endMs));
     this.readUntil.set(t.id, readUntilMs);
     this.set({ looking: t.id, nextAt: { ...this.state.nextAt, [t.id]: began + ANALYSIS_GAP_MS }, failed: null });
-    const { content } = transcriptInput(t, contextLimit, ANALYSIS_MAX_TOKENS);
+    const { content } = taskInput(t, contextLimit, ANALYSIS_MAX_TOKENS);
     const asked = await askModel(assistRequest(ANALYSIS_SETTINGS, ANALYSIS_TASK, content), abort.signal, this.deps);
     const settled = settle(asked, (text) => text);
     if (settled === "stopped") return;

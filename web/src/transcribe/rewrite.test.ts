@@ -27,7 +27,9 @@ describe("a rewrite's request", () => {
     const request = rewriteRequest(call(), 3)!;
     expect(request.settings).toMatchObject({ systemPrompt: `${ASSIST_SYSTEM}\n\n${REWRITE_TASK}`, reasoningEffort: "low", laneTag: "interactive" });
     const content = request.turns[0].content;
-    expect(content.startsWith("Context:\nLanguages: Italian.\nTopic: Supporto informatico\nTerms: VPN.\n\nTranscript, around the utterance:\n[00:00] Others: Il portatile")).toBe(true);
+    expect(content.startsWith("Context of the conversation, told by the user:\n- Write in: Italian.")).toBe(true);
+    expect(content).toContain("- Topic: Supporto informatico\n- Terms, spelled so: VPN.");
+    expect(content).toContain("\n\nTranscript, around the utterance:\n[00:00] Others: Il portatile");
     expect(content).toContain("[00:15] Others: Vedi lo schermo adesso?");
     expect(content.endsWith("Misheard utterance: [00:10] Me: aspetta che me riattacco a Postgress")).toBe(true);
     expect(rewriteRequest(call(), 99)).toBeNull();

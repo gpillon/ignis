@@ -87,13 +87,13 @@ describe("the kinds of conversation", () => {
     expect(kindOf(t)).toBe("general");
   });
 
-  it("ask the model for their sections in order, under the headings as given, in the transcript's language", () => {
+  it("ask the model for their sections in order, under the headings as given, in the language the context names", () => {
     const prompt = notesTask("work");
     const at = (heading: string) => prompt.indexOf(`## ${heading}\n`);
     expect(at("Summary")).toBeGreaterThan(0);
     expect(at("Summary")).toBeLessThan(at("Topics"));
     expect(at("Action items")).toBeLessThan(at("Open questions"));
-    expect(prompt).toContain("Keep each heading exactly as given. Write the text under them in the same language as the transcript");
+    expect(prompt).toContain("Keep each heading exactly as given. Write the text under them in the language the context says to write in");
     expect(prompt).toContain("[mm:ss]");
     expect(prompt).not.toContain("## Games");
   });
