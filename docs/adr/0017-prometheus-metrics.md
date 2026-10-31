@@ -573,7 +573,9 @@ claim, which is sticky.
   series that can never hit.
 - **A miss is counted only where a hit can be.** A checkpoint is captured
   only with prompt reuse on, so `--reuse-prompt off` records no checkpoint
-  miss; before #222 every request on such a load counted a device one. A
+  miss; before #222 every request on such a load counted a device one. That
+  gate is the switch alone: a load with reuse on and no retained slot
+  captures nothing either, and still counts a checkpoint miss. A
   prefix is published only into a retained slot, prompt reuse on or off. Off,
   the head a claimant keeps past its publisher is a hit when claimed, so the
   device misses a prefix there too; a load with no retained slot, which is
