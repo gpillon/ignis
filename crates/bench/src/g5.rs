@@ -109,15 +109,15 @@ fn require_committed_budget(mut cell: ThroughputCell, committed_tokens: u32, ins
 /// starts with its own nonce, or its window in its own third of `corpus`,
 /// so an engine with prompt reuse has nothing a shallower depth left behind
 /// to serve a deeper one from, and a run whose prompts would share more is
-/// refused before it starts. Only the corpus path carries `instruction`
-/// (#162). A prompt that cannot be generated fails its own depth.
+/// refused before it starts. Each prompt ends with `instruction` when the
+/// run sends one. A prompt that cannot be generated fails its own depth.
 fn depth_prompts(
     template: &dyn PromptTemplate,
     corpus: Option<&[u32]>,
-    instruction: &str,
+    instruction: Option<&str>,
 ) -> Result<[Result<PromptSet, String>; DEPTHS.len()], String> {
     let labels = DEPTHS.map(|depth| format!("{depth}-token depth"));
-    let suffix = if corpus.is_some() { instruction } else { "" };
+    let suffix = instruction.unwrap_or("");
     ttft::generate_run_prompts(
         template,
         corpus,
@@ -271,16 +271,17 @@ pub fn measure(
     cfg: &G5Config,
 ) -> Record {
     let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path)).transpose();
-    let instruction = decode_instruction(cfg.committed_tokens);
-    let instructed = cfg.corpus.is_some();
-    let cells = match corpus.and_then(|bank| depth_prompts(template, bank.as_deref(), &instruction)) {
+    // Only the corpus path's prompts carry the decode instruction (#162), and
+    // only a prompt that carried it holds the engine to the budget.
+    let instruction = cfg.corpus.is_some().then(|| decode_instruction(cfg.committed_tokens));
+    let cells = match corpus.and_then(|bank| depth_prompts(template, bank.as_deref(), instruction.as_deref())) {
         Err(error) => DEPTHS.iter().map(|&depth| failed_cell(depth, cfg.committed_tokens, error.clone())).collect(),
         Ok(sets) => DEPTHS
             .iter()
             .zip(sets)
             .map(|(&depth, set)| {
                 let cell = measure_throughput_cell_with(ep, depth, cfg.committed_tokens, C1_CONCURRENCY, || set);
-                require_committed_budget(cell, cfg.committed_tokens, instructed)
+                require_committed_budget(cell, cfg.committed_tokens, instruction.is_some())
             })
             .collect(),
     };
