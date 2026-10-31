@@ -26,14 +26,18 @@ Everything goes through one structured log on stdout, in the format
   past its deadline, or let go when its client left, reports there the
   encode it paid for before the cancel. A request that takes a decode lane
   reports the same numbers on `admitted` too, where they explain a slow
-  first token. A decision answered by its prefill (`noul`, `choice`,
-  `score`, and a `point` or `box` read from the heads) never takes one. A
-  text request carries none of them, and neither does a decide question
-  the engine never ran, which logs no `ignis.request.*` line at all: one
-  answered `engine_full` when its fan-out found no room, or one answered
-  without the model, such as a head question whose image is not a grid the
-  heads can read. It never reached the vision tower, and what preparing its
-  image cost is on no line.
+  first token, so a sum over requests reads `done` and `cancelled` only:
+  each request's media are on exactly one of them, and the `done` a
+  request logs after its `cancelled`, when it finished as the cancel
+  landed, carries none. A decision answered by its prefill (`noul`,
+  `choice`, `score`, and a `point` or `box` read from the heads) never
+  takes a lane, so it has no `admitted` line. A text request carries none
+  of them, and neither does a decide question the engine never ran, which
+  logs no `ignis.request.*` line at all: one answered `engine_full` when
+  its fan-out found no room, or one answered without the model, such as a
+  head question whose image is not a grid the heads can read. It never
+  reached the vision tower, and what preparing its image cost is on no
+  line.
 - The scheduler counters are the DEBUG event `ignis.scheduler.interval`, emitted
   whenever `waiting`, `running` or `kv_evictions` change
   ([ADR 0025](../../adr/0025-scheduler-interval-as-a-log-event.md)):

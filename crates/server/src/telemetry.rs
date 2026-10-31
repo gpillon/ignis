@@ -1081,9 +1081,11 @@ impl Telemetry {
     /// the reference's `pos=[...]`, so the two logs read side by side.
     /// `media.*` (GitHub #245) are the `admitted` line's, from the same
     /// [`MediaSummary`]: a readout-only decision is never admitted onto a
-    /// lane (#238), so this is the one line it reports its media on, and a
-    /// request that was admitted reports the same numbers on both. Absent on
-    /// a request without media, as there.
+    /// lane (#238), so this line, or `cancelled` in its place, is the one it
+    /// reports its media on, and a request that was admitted reports the
+    /// same numbers on both, which is why a sum over requests reads the
+    /// terminal lines only. Absent on a request without media, as there, and
+    /// on a `done` that raced its cancel, whose media `cancelled` reported.
     ///
     /// GitHub #81 / ADR 0012: this runs on the async telemetry consumer
     /// task (`engine.rs`'s `telemetry_task`), not inside the HTTP root span
@@ -1163,9 +1165,10 @@ impl Telemetry {
             // absent on every request it did not happen to, budget or not.
             reasoning_redirected_at = thinking.redirected_at,
             // GitHub #245: the `admitted` line's `media.*`, again, on the
-            // line every request reaches. A readout-only decision ends where
-            // its prefill ends and is never admitted onto a lane (#238), so
-            // without these its encode was paid for and logged nowhere.
+            // line a request that completes ends with. A readout-only
+            // decision ends where its prefill ends and is never admitted onto
+            // a lane (#238), so without these its encode was paid for and
+            // logged nowhere.
             media.items = media.map(|m| m.items),
             media.vision_tokens = media.map(|m| m.vision_tokens),
             media.natural_vision_tokens = media.map(|m| m.natural_vision_tokens),
@@ -1646,7 +1649,7 @@ mod tests {
     #[test]
     fn a_request_on_a_lane_reports_the_same_media_on_admitted_and_done() {
         // GitHub #245: `admitted` keeps its fields, and `done` repeats them,
-        // so a reader finds them on the line every request reaches whatever
+        // so a reader finds them on the line a request ends with whatever
         // the primitive.
         let mut telemetry = telemetry();
         let media = MediaStats { items: 1, vision_tokens: 4, media_bytes: 2048, ..MediaStats::default() };

@@ -5,7 +5,8 @@
 //!
 //! And a readout-only decision over an image (GitHub #245): it never takes
 //! a decode lane, so it has no `admitted` event, and its media reach the
-//! `ignis.request.done` event every request ends with instead.
+//! event it ends with instead, `ignis.request.done`, or
+//! `ignis.request.cancelled` past its deadline.
 //!
 //! Its own binary, like `telemetry.rs`: tracing caches a callsite's interest
 //! process-wide, so a test running beside it without a subscriber can switch
