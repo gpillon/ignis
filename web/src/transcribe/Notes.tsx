@@ -4,7 +4,7 @@ import { Markdown } from "../ui/Markdown.tsx";
 import { Switch } from "../ui/Switch.tsx";
 import { useWatched } from "./assist.ts";
 import { jumpOnClick, linkTimes } from "./jump.ts";
-import { kindHint, kindOf, NOTE_KINDS, notesStatus } from "./notes.ts";
+import { kindHint, kindOf, NOTE_KINDS, notesMarkdown, notesStatus } from "./notes.ts";
 import type { NotesHandle, NotesWriterState } from "./notesWriter.ts";
 import type { Transcript } from "./transcript.ts";
 import type { TranscribeActions, TranscribeState } from "./useTranscribe.ts";
@@ -33,7 +33,7 @@ export function NotesPanel({ transcript: t, state, actions, writer }: { transcri
   const kind = kindOf(t);
   const here = writer.writing === t.id;
   const button = notesButton(t, writer, state.textBlocked);
-  const kept = t.notes?.text ?? "";
+  const kept = notesMarkdown(t.notes);
   // While a writing streams, its text; before its first token, the notes it replaces, dimmed.
   const shown = here && writer.text !== "" ? writer.text : kept;
   const status = here ? null : notesStatus(t.notes, t.utterances.length);
