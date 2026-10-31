@@ -677,6 +677,36 @@ impl PrefixCache {
         pages
     }
 
+    /// The links that come back once the holders `letting_go` counts on each
+    /// link let go, whatever order they go in (GitHub #445, ADR 0045 as
+    /// amended 2026-10-31): a link goes when they are all of its holders but
+    /// the links above it that go too, each of which held one reference on
+    /// it. Unlike [`PrefixCache::pages_a_holder_frees`], which follows one
+    /// holder up its chain, a link two holders reach through links of their
+    /// own goes when both of them do.
+    pub fn links_let_go(&self, letting_go: impl Fn(PrefixId) -> u32) -> Vec<PrefixId> {
+        let mut gone: Vec<PrefixId> = Vec::new();
+        loop {
+            let before = gone.len();
+            for e in &self.entries {
+                if gone.contains(&e.id) {
+                    continue;
+                }
+                let from_above = self
+                    .entries
+                    .iter()
+                    .filter(|c| c.parent == Some(e.id) && gone.contains(&c.id))
+                    .count() as u32;
+                if e.refcount == letting_go(e.id) + from_above {
+                    gone.push(e.id);
+                }
+            }
+            if gone.len() == before {
+                return gone;
+            }
+        }
+    }
+
     /// Release one reference to `entry` (the claimant completed or was
     /// re-queued). When the last reference drops, the entry (and its own
     /// pages) is released.
@@ -1227,6 +1257,34 @@ mod tests {
         cache.claim(&cache.keys(&prompt64())).expect("a sibling claims the head");
         assert_eq!(cache.pages_a_holder_frees(link, with_a_checkpoint), 2);
         assert_eq!(cache.pages_a_holder_frees(head + 100, with_a_checkpoint), 0, "an entry that is gone frees nothing");
+    }
+
+    #[test]
+    fn links_let_go_reach_a_head_two_of_them_held_together() {
+        // GitHub #445: requests 8 and 9 each lent the two pages past request
+        // 7's retained four-page head to a link of their own, and 7 is done.
+        // The head's holders are its retention and the two links. Each link,
+        // walked alone, stops at the head the other still holds; with every
+        // holder named letting go, both links go, and the head with them.
+        let mut cache = PrefixCache::new(16);
+        let (head, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        assert!(cache.retain_published(head, retention(0)));
+        cache.claim(&cache.keys(&prompt96())).expect("request 8 claims the head");
+        let (eight, _) = cache.register_link(8, &prompt96(), Some(head)).unwrap();
+        let other: Vec<TokenId> = (1..=64).chain(500..532).collect();
+        cache.claim(&cache.keys(&other)).expect("request 9 claims the head");
+        let (nine, _) = cache.register_link(9, &other, Some(head)).unwrap();
+        assert_eq!(cache.release(head), vec![], "request 7 is done");
+        let everyone = |id| u32::from(id == head || id == eight || id == nine);
+        assert_eq!(cache.pages_a_holder_frees(eight, |id| u32::from(id == head)), 2, "one link alone");
+        let mut gone = cache.links_let_go(everyone);
+        gone.sort_unstable();
+        assert_eq!(gone, vec![head, eight, nine], "both links and the head they held together");
+
+        // One link's holder stays: that link and the head stay, the other goes.
+        assert_eq!(cache.links_let_go(|id| u32::from(id == head || id == nine)), vec![nine]);
+        // Nothing named: nothing goes.
+        assert!(cache.links_let_go(|_: PrefixId| 0).is_empty());
     }
 
     #[test]

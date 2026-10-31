@@ -814,6 +814,12 @@ Prompt checkpoints and retained prefixes: state no live request needs. It
 never costs a live request anything — on the device it is always the first
 thing to go — and in KV-RAM it is discarded before any evicted live sequence.
 
+**Waiting claim**:
+What a request still waiting for its admission holds of the state it chose to
+resume from on the device: its reference on a **shared prefix**, and the
+**prompt checkpoint** its first chunk will copy. A bet not yet cashed, given up
+like **retained state** for an entry ranked above the request.
+
 **Retained slot**:
 A place reserved at load for one mutable-state image of a **shared prefix**
 (retained, chained or still claimed) or of a **prompt checkpoint**, the same

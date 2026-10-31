@@ -1100,12 +1100,119 @@ impl ConcreteScheduler {
     /// checkpoint's retained slot, so neither the slot nor the tail page may go
     /// before then.
     fn claimed_device_checkpoints(&self) -> Vec<crate::checkpoint::CheckpointId> {
+        self.claimed_device_checkpoints_but(&[])
+    }
+
+    /// [`Self::claimed_device_checkpoints`], leaving out the claims of the
+    /// waiting requests `yielding` (GitHub #445): a checkpoint only they hold
+    /// is retained state again once they let go.
+    fn claimed_device_checkpoints_but(&self, yielding: &[usize]) -> Vec<crate::checkpoint::CheckpointId> {
         self.requests
             .iter()
-            .filter(|r| r.state == RequestState::Admitted)
-            .filter(|r| r.reuse_source == Some(ReuseSource::Device))
-            .filter_map(|r| r.checkpoint_entry)
+            .enumerate()
+            .filter(|&(i, r)| r.state == RequestState::Admitted && !yielding.contains(&i))
+            .filter(|(_, r)| r.reuse_source == Some(ReuseSource::Device))
+            .filter_map(|(_, r)| r.checkpoint_entry)
             .collect()
+    }
+
+    /// The requests waiting for their admission that hold a device claim and
+    /// rank below `rank`, lowest-ranked first (GitHub #445, ADR 0045 as
+    /// amended 2026-10-31). Each holds a reference on the shared prefix it
+    /// claimed, a sibling's or retained state's, and with it any device
+    /// checkpoint it chose for its first chunk. A claim on KV-RAM or the disk
+    /// holds nothing on the device, and one already on the device is live.
+    fn waiting_claims_below(&self, rank: Rank) -> Vec<usize> {
+        let mut claims: Vec<usize> = self
+            .requests
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                r.state == RequestState::Admitted
+                    && !r.resident
+                    && !r.moving
+                    && !r.cancelled
+                    && r.prefix_entry.is_some()
+                    && rank.outranks(&Self::rank_of(r))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        claims.sort_by(|&a, &b| Rank::entry_order(&Self::rank_of(&self.requests[b]), &Self::rank_of(&self.requests[a])));
+        claims
+    }
+
+    /// The holders of `prefix` that let go for a need the waiting `claims`
+    /// yield to (GitHub #445): its retained holders
+    /// ([`Self::retained_holders_of`]), and those of the claims standing on
+    /// it.
+    fn holders_let_go(&self, prefix: PrefixId, claims: &[usize]) -> u32 {
+        let claimed = claims
+            .iter()
+            .filter(|&&i| self.requests[i].prefix_entry == Some(prefix))
+            .count() as u32;
+        self.retained_holders_of(prefix) + claimed
+    }
+
+    /// The KV pages that come back for a need ranked `rank` once retained
+    /// state is given up and the waiting claims below it go with it (GitHub
+    /// #445): every link of the device's chains nothing else holds, and the
+    /// tail page of every device checkpoint no claimant at or above `rank` is
+    /// about to be built from.
+    fn pages_given_up_for(&self, rank: Rank) -> u32 {
+        let claims = self.waiting_claims_below(rank);
+        let kept = self.claimed_device_checkpoints_but(&claims);
+        let tails = self
+            .checkpoints
+            .entries()
+            .iter()
+            .filter(|e| e.tier == ReuseSource::Device && !kept.contains(&e.id))
+            .filter(|e| self.tail_pages.contains(&e.publisher))
+            .count() as u32;
+        let links = self.prefix.links_let_go(|p| self.holders_let_go(p, &claims));
+        tails + links.into_iter().map(|p| self.prefix.pages_of(p)).sum::<u32>()
+    }
+
+    /// The lowest-ranked waiting claim below `rank` whose going gives pages
+    /// back once retained state is given up (GitHub #445): the link it holds
+    /// goes, or the tail page of the checkpoint it chose does. A claim on a
+    /// live sibling's prefix frees nothing, and is kept.
+    fn waiting_claim_to_give_up(&self, rank: Rank) -> Option<usize> {
+        let claims = self.waiting_claims_below(rank);
+        let links = self.prefix.links_let_go(|p| self.holders_let_go(p, &claims));
+        let kept = self.claimed_device_checkpoints_but(&claims);
+        claims.into_iter().find(|&i| {
+            let r = &self.requests[i];
+            r.prefix_entry.is_some_and(|p| links.contains(&p))
+                || (r.reuse_source == Some(ReuseSource::Device)
+                    && r.checkpoint_entry.is_some_and(|id| !kept.contains(&id))
+                    && r.checkpoint_publisher.is_some_and(|p| self.tail_pages.contains(&p)))
+        })
+    }
+
+    /// Give up the claim the waiting request `idx` holds (GitHub #445): its
+    /// reference on the prefix it claimed goes, as a cancel's would, and the
+    /// device checkpoint it chose is retained state again. The request is back
+    /// to claiming nothing, with its whole bound to reserve, and looks again
+    /// for state to resume from when it next comes up. A device claim has told
+    /// the backend nothing yet. It does not enter in the pass that took its
+    /// claim, whose cut was made for the shorter span: the room left once the
+    /// entry is in is less than the claim gave back, its chain and its tail
+    /// page at most, which its own bound holds.
+    fn release_waiting_claim(&mut self, idx: usize) {
+        let entry = self.requests[idx].prefix_entry;
+        self.release_prefix_claim(entry);
+        let r = &mut self.requests[idx];
+        r.resources.kv_pages += r.shared_pages;
+        r.prefix_entry = None;
+        r.prefix_publisher = None;
+        r.shared_prefix_tokens = 0;
+        r.shared_pages = 0;
+        r.checkpoint_publisher = None;
+        r.checkpoint_entry = None;
+        r.checkpoint_tokens = 0;
+        r.reuse_source = None;
+        r.prefill_progress = 0;
+        r.gdn = crate::gdn::GdnState::new();
     }
 
     /// The KV pages a checkpoint at `tokens` holds of its own: the page its
@@ -1552,7 +1659,7 @@ impl ConcreteScheduler {
         // Pages first: a slot is taken — and retained state given up for
         // one — only once the prefix is known to fit.
         let fits = self
-            .reclaim_retained_until(|s| s.kv_used_pages + pages <= s.capacity.kv_pages, events)
+            .reclaim_retained_until(|s| s.kv_used_pages + pages <= s.capacity.kv_pages, None, events)
             && self.take_retained_slot(holder, events).is_some_and(|slot| {
                 self.compute
                     .restore_prefix(spilled.publisher, spilled.length_tokens, slot)
@@ -1832,14 +1939,22 @@ impl ConcreteScheduler {
     /// work is disturbed, so a retained entry can never cause a live request
     /// to be refused, evicted or made to wait. Returns whether `idx` fits now.
     fn reclaim_retained(&mut self, idx: usize, events: &mut Vec<SchedEvent>) -> bool {
-        self.reclaim_retained_until(|s| s.fits_for_materialization(&s.requests[idx]), events)
+        self.reclaim_retained_until(|s| s.fits_for_materialization(&s.requests[idx]), None, events)
     }
 
     /// [`Self::reclaim_retained`] until `fits` holds (GitHub #190: a prefix
     /// coming back from KV-RAM needs pages without being a request).
+    ///
+    /// GitHub #445 (ADR 0045 as amended 2026-10-31): with `below`, an entry of
+    /// that rank, and once retained state alone has given up all it can, the
+    /// waiting claims below it go, lowest-ranked first: a bet its request has
+    /// not cashed yet is still a bet. The caller names the rank only once
+    /// [`Self::pages_given_up_for`] says the two make the room, so a claim
+    /// never goes for nothing.
     fn reclaim_retained_until(
         &mut self,
         fits: impl Fn(&Self) -> bool,
+        below: Option<Rank>,
         events: &mut Vec<SchedEvent>,
     ) -> bool {
         loop {
@@ -1887,6 +2002,10 @@ impl ConcreteScheduler {
             // up the checkpoints standing on it *and then* the retention,
             // which is the only sequence that returns those pages at all.
             let Some(prefix) = self.prefix.lru_retained() else {
+                if let Some(idx) = below.and_then(|rank| self.waiting_claim_to_give_up(rank)) {
+                    self.release_waiting_claim(idx);
+                    continue;
+                }
                 return false;
             };
             // GitHub #190: to KV-RAM first, while its pages are still there.
@@ -2972,10 +3091,29 @@ impl ConcreteScheduler {
     /// move that completes here, on a synchronous backend such as the mock, is
     /// followed by that pass at once, so the need is met in the advance that
     /// moved.
+    ///
+    /// GitHub #445 (ADR 0045 as amended 2026-10-31): the claims of the
+    /// requests waiting below the requester go before anything moves, after
+    /// retained state, once the two make the whole room. Nothing moves for
+    /// room a bet holds.
     fn make_room(&mut self, requester: usize, needed: &AdmissionResources, events: &mut Vec<SchedEvent>) -> bool {
         let need_fits = |s: &Self| s.charged().add(needed).fits(&s.capacity);
+        let rank = Self::rank_of(&self.requests[requester]);
         loop {
             if need_fits(self) {
+                return true;
+            }
+            let given_up = AdmissionResources {
+                kv_pages: self.pages_given_up_for(rank),
+                ..AdmissionResources::default()
+            };
+            if self
+                .charged()
+                .add(needed)
+                .sub(&given_up)
+                .is_none_or(|after| after.fits(&self.capacity))
+                && self.reclaim_retained_until(need_fits, Some(rank), events)
+            {
                 return true;
             }
             // Spec vram-budget/03: one move at a time. While one is under
@@ -2984,7 +3122,6 @@ impl ConcreteScheduler {
             if self.moving_out() {
                 return false;
             }
-            let rank = Self::rank_of(&self.requests[requester]);
             let victims = page_shortage_victims(rank, &self.page_shortage_candidates(requester));
             let victim_requests = || victims.iter().filter_map(|&id| self.requests.iter().find(|r| r.id == id));
             let freed = victim_requests().fold(AdmissionResources::default(), |freed, r| {
@@ -3003,14 +3140,20 @@ impl ConcreteScheduler {
             // Two victims standing on one link each see the other's reference,
             // so neither counts it: the sum never counts a page twice, and it
             // under-counts a link only a set of victims would free together.
-            let coverable = covers(&freed)
-                || covers(&freed.add(&AdmissionResources {
+            // GitHub #445: the claims waiting below the requester let go beside
+            // retained state, and what they give up off the victims' chains
+            // counts too, as it comes back once the victims have gone.
+            let coverable = covers(&freed) || {
+                let claims = self.waiting_claims_below(rank);
+                covers(&freed.add(&AdmissionResources {
                     kv_pages: victim_requests()
                         .filter_map(|r| r.prefix_entry)
-                        .map(|entry| self.prefix.pages_a_holder_frees(entry, |p| self.retained_holders_of(p)))
-                        .sum(),
+                        .map(|entry| self.prefix.pages_a_holder_frees(entry, |p| self.holders_let_go(p, &claims)))
+                        .sum::<u32>()
+                        + given_up.kv_pages,
                     ..AdmissionResources::default()
-                }));
+                }))
+            };
             let Some(&victim) = victims.first().filter(|_| coverable) else {
                 return false;
             };
@@ -3019,7 +3162,7 @@ impl ConcreteScheduler {
             }
             // GitHub #444: what held the victim's chain beside it is retained
             // state now, given up first as ever (ADR 0029).
-            self.reclaim_retained_until(need_fits, events);
+            self.reclaim_retained_until(need_fits, None, events);
         }
     }
 
@@ -3166,7 +3309,10 @@ impl ConcreteScheduler {
     /// entries `above` it (ADR 0045's entry rule, fixed branch). Retained
     /// pages count as reclaimable: they are given up when that is what makes
     /// the room, and not otherwise. Nothing live moves.
-    fn make_entry_room(&mut self, pages: u32, above: EntryRoom, events: &mut Vec<SchedEvent>) -> bool {
+    ///
+    /// GitHub #445 (ADR 0045 as amended 2026-10-31): so do the claims of the
+    /// requests waiting below the sequence, `rank`, after retained state.
+    fn make_entry_room(&mut self, pages: u32, above: EntryRoom, rank: Rank, events: &mut Vec<SchedEvent>) -> bool {
         if self.resident_slots_used + above.slots + 1 > self.capacity.resident_slots {
             return false;
         }
@@ -3175,10 +3321,10 @@ impl ConcreteScheduler {
         if fits(self) {
             return true;
         }
-        if self.kv_used_pages + pages > self.capacity.kv_pages + self.reclaimable_retained_pages() {
+        if self.kv_used_pages + pages > self.capacity.kv_pages + self.pages_given_up_for(rank) {
             return false;
         }
-        self.reclaim_retained_until(fits, events)
+        self.reclaim_retained_until(fits, Some(rank), events)
     }
 
     /// Bring `request`'s live snapshot back from KV-RAM when it can enter
@@ -3198,7 +3344,11 @@ impl ConcreteScheduler {
         }
         // The restored request's resident slot + pages must fit the GPU pool
         // either way.
-        if !self.make_entry_room(victim.pages, above, events) {
+        let rank = Rank {
+            class: victim.owner,
+            request_id: victim.request,
+        };
+        if !self.make_entry_room(victim.pages, above, rank, events) {
             return; // no room: leave it (retry next advance)
         }
         let idx = self
@@ -3614,7 +3764,11 @@ impl ConcreteScheduler {
         if victim.resume_phase == ResumePhase::Running && self.free_lanes.is_empty() {
             return;
         }
-        if !self.make_entry_room(victim.pages, above, events) {
+        let rank = Rank {
+            class: victim.owner,
+            request_id: victim.request,
+        };
+        if !self.make_entry_room(victim.pages, above, rank, events) {
             return;
         }
         let Some(idx) = self.requests.iter().position(|r| r.id == victim.request) else {

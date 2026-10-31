@@ -101,7 +101,10 @@ State lives in three tiers and moves down one when the tier above needs room
 Retained state is always the first to go: on the device it never delays or
 refuses an admission, and in KV-RAM it is discarded before any evicted live
 sequence. State reaches KV-RAM lazily, only when the device is about to discard
-it, never as a copy of what is still resident.
+it, never as a copy of what is still resident. A request still waiting for room
+holds the state it chose to resume from; when a request ranked above it needs
+those pages, it lets them go and looks again once it is its turn, resuming from
+KV-RAM if the state went there or prefilling the part it matched.
 
 The tiers also hold *live* sequences. When a request ranked above another
 cannot fit, the lower-ranked sequence (an `agent` one before an `interactive`
