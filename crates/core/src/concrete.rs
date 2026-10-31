@@ -2964,7 +2964,7 @@ impl ConcreteScheduler {
     ///
     /// GitHub #444 (ADR 0045 as amended 2026-10-31): a victim frees its own
     /// reservation and the pages of its prefix chain that only retained state
-    /// holds beside it ([`Self::chain_pages_a_move_frees`]): those it
+    /// holds beside it ([`PrefixCache::pages_a_holder_frees`]): those it
     /// published or lent, and those it claimed from a finished request. The
     /// chain is read only when the reservations alone fall short. A move a
     /// window at a time, as on both leaves, lands in a later advance, whose
@@ -2973,9 +2973,9 @@ impl ConcreteScheduler {
     /// followed by that pass at once, so the need is met in the advance that
     /// moved.
     fn make_room(&mut self, requester: usize, needed: &AdmissionResources, events: &mut Vec<SchedEvent>) -> bool {
-        let fits = |s: &Self| s.charged().add(needed).fits(&s.capacity);
+        let need_fits = |s: &Self| s.charged().add(needed).fits(&s.capacity);
         loop {
-            if fits(self) {
+            if need_fits(self) {
                 return true;
             }
             // Spec vram-budget/03: one move at a time. While one is under
@@ -3000,9 +3000,15 @@ impl ConcreteScheduler {
                     .sub(freed)
                     .is_none_or(|after| after.fits(&self.capacity))
             };
+            // Two victims standing on one link each see the other's reference,
+            // so neither counts it: the sum never counts a page twice, and it
+            // under-counts a link only a set of victims would free together.
             let coverable = covers(&freed)
                 || covers(&freed.add(&AdmissionResources {
-                    kv_pages: victim_requests().map(|r| self.chain_pages_a_move_frees(r)).sum(),
+                    kv_pages: victim_requests()
+                        .filter_map(|r| r.prefix_entry)
+                        .map(|entry| self.prefix.pages_a_holder_frees(entry, |p| self.retained_holders_of(p)))
+                        .sum(),
                     ..AdmissionResources::default()
                 }));
             let Some(&victim) = victims.first().filter(|_| coverable) else {
@@ -3013,7 +3019,7 @@ impl ConcreteScheduler {
             }
             // GitHub #444: what held the victim's chain beside it is retained
             // state now, given up first as ever (ADR 0029).
-            self.reclaim_retained_until(fits, events);
+            self.reclaim_retained_until(need_fits, events);
         }
     }
 
@@ -3026,36 +3032,6 @@ impl ConcreteScheduler {
             backend_pages: 0,
             resident_slots: self.resident_slots_used,
         }
-    }
-
-    /// The pages of `r`'s prefix chain that come back once `r` moves and the
-    /// first-victim pass gives retained state up (GitHub #444, ADR 0045 as
-    /// amended 2026-10-31): the published heads and pages-only links it lent,
-    /// and the entries it claimed, as far as only retained state holds them
-    /// beside it.
-    ///
-    /// From the entry `r` stands on toward the chain's root, a link counts
-    /// when its holders but one are retained state ([`Self::retained_holders_of`],
-    /// the membership the first-victim pass reclaims by): the one is `r`'s own
-    /// reference on the first link, and above it the reference of the link
-    /// below, which drops with it. The walk stops at the first link anything
-    /// else holds -- a live claimant, the claimant of a checkpoint on it,
-    /// another chain's link -- since every link above is held through it.
-    ///
-    /// Two victims standing on one link each see the other's reference, so
-    /// neither counts it: the sum over victims never counts a page twice, and
-    /// it under-counts a link only a set of victims would free together.
-    fn chain_pages_a_move_frees(&self, r: &Request) -> u32 {
-        let mut pages = 0;
-        let mut at = r.prefix_entry;
-        while let Some(entry) = at.and_then(|id| self.prefix.entry(id)) {
-            if entry.refcount - 1 != self.retained_holders_of(entry.id) {
-                break;
-            }
-            pages += entry.pages;
-            at = entry.parent;
-        }
-        pages
     }
 
     /// Try to admit a blocked head by evicting retained state until it fits
