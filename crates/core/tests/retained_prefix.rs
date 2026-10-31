@@ -894,6 +894,16 @@ fn the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds() {
     assert_eq!(sched.prefix_pinned_pages(), 0, "the block went when it had to");
 }
 
+/// The retained-state facts that moved something: every one but the misses,
+/// which the pressure's own lookups raise in every tier (GitHub #222) without
+/// moving anything.
+fn what_moved(events: &[SchedEvent]) -> Vec<(RetainedStateOperation, ReuseSource, RetainedKind)> {
+    retained_state(events)
+        .into_iter()
+        .filter(|&(operation, _, _)| operation != RetainedStateOperation::Miss)
+        .collect()
+}
+
 #[test]
 fn a_lifecycle_fact_names_which_kind_of_retained_state_moved() {
     // GitHub #216: `tier` alone counted a prompt checkpoint and a shared
@@ -929,12 +939,7 @@ fn a_lifecycle_fact_names_which_kind_of_retained_state_moved() {
         .submit(input(tokens(2000, 60), None, None, 4), RequestClass::Interactive)
         .unwrap();
     let events = run_to_idle(&mut sched);
-    // What moved: the pressure's own lookups aside, which miss a prefix in
-    // every tier (GitHub #222) without moving one.
-    let moved: Vec<_> = retained_state(&events)
-        .into_iter()
-        .filter(|&(operation, _, _)| operation != RetainedStateOperation::Miss)
-        .collect();
+    let moved = what_moved(&events);
     assert!(
         moved.iter().any(|&(operation, _, kind)| operation == RetainedStateOperation::Spill
             && kind == RetainedKind::Checkpoint),
@@ -950,10 +955,7 @@ fn a_lifecycle_fact_names_which_kind_of_retained_state_moved() {
         .submit(input(tokens(3000, 92), None, None, 4), RequestClass::Interactive)
         .unwrap();
     let events = run_to_idle(&mut sched);
-    let moved: Vec<_> = retained_state(&events)
-        .into_iter()
-        .filter(|&(operation, _, _)| operation != RetainedStateOperation::Miss)
-        .collect();
+    let moved = what_moved(&events);
     assert!(
         moved.iter().any(|&(_, _, kind)| kind == RetainedKind::Prefix),
         "the block's own fact says prefix: {moved:?}"

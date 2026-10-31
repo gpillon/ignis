@@ -164,6 +164,16 @@ fn count_kind(
         .count()
 }
 
+/// Asserts that each of `kinds` missed exactly once in each of `sources`.
+#[track_caller]
+fn assert_missed_once(events: &[SchedEvent], sources: &[ReuseSource], kinds: &[RetainedKind]) {
+    for &source in sources {
+        for &kind in kinds {
+            assert_eq!(count_kind(events, RetainedStateOperation::Miss, source, kind), 1, "{source:?} {kind:?}");
+        }
+    }
+}
+
 fn reuses(events: &[SchedEvent], request: RequestId) -> Vec<(ReuseSource, u32)> {
     events
         .iter()
@@ -645,18 +655,12 @@ fn a_first_turn_misses_every_configured_tier_once() {
     // GitHub #222: both lookups report a miss, each of its own kind -- the
     // checkpoint pool's, and the prefix walk's beside it -- and nothing
     // retained of either kind matched a first turn in either tier.
-    for source in [ReuseSource::Device, ReuseSource::KvRam] {
-        for kind in [RetainedKind::Checkpoint, RetainedKind::Prefix] {
-            assert_eq!(count_kind(&events, RetainedStateOperation::Miss, source, kind), 1, "{source:?} {kind:?}");
-        }
-    }
+    assert_missed_once(&events, &[ReuseSource::Device, ReuseSource::KvRam], &RetainedKind::ALL);
 
     let mut device_only = ConcreteScheduler::with_config(tight(0), Arc::new(MockCompute::with_sections(crate::sections())));
     device_only.submit(turn_at(1), RequestClass::Interactive).unwrap();
     let events = run_to_idle(&mut device_only);
-    for kind in [RetainedKind::Checkpoint, RetainedKind::Prefix] {
-        assert_eq!(count_kind(&events, RetainedStateOperation::Miss, ReuseSource::Device, kind), 1);
-    }
+    assert_missed_once(&events, &[ReuseSource::Device], &RetainedKind::ALL);
     assert_eq!(
         count(&events, RetainedStateOperation::Miss, ReuseSource::KvRam),
         0,
@@ -675,12 +679,8 @@ fn a_first_turn_misses_every_configured_tier_once() {
     );
     with_disk.submit(turn_at(1), RequestClass::Interactive).unwrap();
     let events = run_to_idle(&mut with_disk);
-    for source in [ReuseSource::Device, ReuseSource::KvRam, ReuseSource::Disk] {
-        assert_eq!(count_kind(&events, RetainedStateOperation::Miss, source, RetainedKind::Checkpoint), 1);
-    }
-    for source in [ReuseSource::Device, ReuseSource::KvRam] {
-        assert_eq!(count_kind(&events, RetainedStateOperation::Miss, source, RetainedKind::Prefix), 1);
-    }
+    assert_missed_once(&events, &ReuseSource::ALL, &[RetainedKind::Checkpoint]);
+    assert_missed_once(&events, &[ReuseSource::Device, ReuseSource::KvRam], &[RetainedKind::Prefix]);
     assert_eq!(
         count_kind(&events, RetainedStateOperation::Miss, ReuseSource::Disk, RetainedKind::Prefix),
         0,
@@ -711,11 +711,7 @@ fn a_request_that_waits_for_room_and_looks_again_misses_each_tier_once() {
         events.extend(step);
     }
     assert!(looks_without_room > 1, "it looked {looks_without_room} times without room");
-    for source in [ReuseSource::Device, ReuseSource::KvRam] {
-        for kind in [RetainedKind::Checkpoint, RetainedKind::Prefix] {
-            assert_eq!(count_kind(&events, RetainedStateOperation::Miss, source, kind), 1, "{source:?} {kind:?}");
-        }
-    }
+    assert_missed_once(&events, &[ReuseSource::Device, ReuseSource::KvRam], &RetainedKind::ALL);
 }
 
 #[test]
