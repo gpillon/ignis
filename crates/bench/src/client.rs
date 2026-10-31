@@ -273,7 +273,7 @@ pub trait Endpoint: Send + Sync {
     /// thereby cancel the server-side generation by dropping the body.
     ///
     /// `suppress_eos` names the token ids a measurement lane must not stop
-    /// on (see [`suppress_eos_in`]). It is a *request* the
+    /// on (see [`EosControl::apply`]). It is a *request* the
     /// endpoint may be unable to grant: this default ignores it, and even
     /// the HTTP endpoint can only pass it on, as the one control its engine
     /// is sent ([`HttpEndpoint::eos_control`]) — an engine that honours
@@ -743,37 +743,30 @@ impl EosControl {
         }
     }
 
-    /// The request field this control sets.
-    pub fn field(self) -> &'static str {
-        match self {
-            Self::IgnoreEos => "ignore_eos",
-            Self::LogitBias => "logit_bias",
+    /// `body` with the end-of-sequence tokens in `eos` suppressed through
+    /// this control alone, the one place either field is named. An empty
+    /// `eos` adds nothing.
+    pub fn apply(self, mut body: serde_json::Value, eos: &[u32]) -> serde_json::Value {
+        if eos.is_empty() {
+            return body;
         }
+        match self {
+            Self::IgnoreEos => body["ignore_eos"] = serde_json::json!(true),
+            Self::LogitBias => {
+                body["logit_bias"] = serde_json::Value::Object(
+                    eos.iter()
+                        .map(|id| (id.to_string(), serde_json::json!(-100.0)))
+                        .collect(),
+                );
+            }
+        }
+        body
     }
 }
 
 #[cfg(test)]
 fn request_body_suppressing_eos(req: &Request, eos: &[u32], control: EosControl) -> serde_json::Value {
-    suppress_eos_in(request_body(req), eos, control)
-}
-
-/// `body` with the end-of-sequence tokens in `eos` suppressed through
-/// `control` alone. An empty `eos` adds nothing.
-fn suppress_eos_in(mut body: serde_json::Value, eos: &[u32], control: EosControl) -> serde_json::Value {
-    if eos.is_empty() {
-        return body;
-    }
-    match control {
-        EosControl::IgnoreEos => body["ignore_eos"] = serde_json::json!(true),
-        EosControl::LogitBias => {
-            body["logit_bias"] = serde_json::Value::Object(
-                eos.iter()
-                    .map(|id| (id.to_string(), serde_json::json!(-100.0)))
-                    .collect(),
-            );
-        }
-    }
-    body
+    control.apply(request_body(req), eos)
 }
 
 /// The `usage` figures the TTFT instrument reads back: the prompt tokens
@@ -837,10 +830,12 @@ impl HttpEndpoint {
             .then(|| as_recorded_body(req))
             .flatten()
             .unwrap_or_else(|| request_body(req));
+        // A request that suppresses nothing never asks the engine which
+        // control it takes.
         if suppress_eos.is_empty() {
             return Ok(base);
         }
-        Ok(suppress_eos_in(base, suppress_eos, self.eos_control()?))
+        Ok(self.eos_control()?.apply(base, suppress_eos))
     }
 
     /// One request through to its outcome, resending an `engine_full`

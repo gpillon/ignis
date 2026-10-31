@@ -1038,7 +1038,10 @@ fn cmd_g3(args: &[String]) -> ExitCode {
     // GitHub #426: say which EOS control the ITL lanes carry, since ignis
     // refuses the reference's.
     match ep.eos_control() {
-        Ok(control) => eprintln!("ITL decode lanes suppress EOS with `{}`", control.field()),
+        Ok(control) => {
+            let eos = ttft::PromptTemplate::eos_token_ids(&frontend);
+            eprintln!("ITL decode lanes suppress EOS with {}", control.apply(serde_json::json!({}), &eos));
+        }
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
