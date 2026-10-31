@@ -174,12 +174,12 @@ retained tokens:
 - **An image inside the matched part.** A prefix never ends inside an image; it
   walks back to before it, and an image's identity is part of the match.
 
-`ignis_retained_state_misses_total` counts misses once per request, by tier
-and kind: no checkpoint matched in that tier, or no retained prefix did. A
-block shared from a sibling that is still running is not retained state, so
-it counts as a prefix miss. A prefix is only ever kept on the device and in
-KV-RAM, so its disk series stays at zero, and `--reuse-prompt off` counts no
-checkpoint miss ([metrics](../reference/metrics.md)).
+`ignis_retained_state_misses_total` counts, by tier and kind, each prefill run
+(a re-queued request counts again) that found nothing retained of that kind
+matching where the load could have held some, so a series that can never hit,
+such as a prefix's on the disk, stays at zero
+([ADR 0017](../../adr/0017-prometheus-metrics.md),
+[metrics](../reference/metrics.md)).
 
 ## Who can see it
 
