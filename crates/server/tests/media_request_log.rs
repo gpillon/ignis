@@ -42,7 +42,6 @@ use ignis_server::Server;
 #[path = "support/mod.rs"]
 mod support;
 use support::media::{data_uri, png, processor};
-use support::nudge;
 
 const MODEL: &str = "test-model";
 
@@ -153,11 +152,30 @@ fn image_request(image: &str) -> Request<Body> {
         .unwrap()
 }
 
-/// The `attributes` of every `ignis.request.admitted` event captured, in order.
-fn admitted_attributes(sink: &MemorySink) -> Vec<Value> {
-    sink.lines()
+/// Every event `sink` captured, once it holds `n` named `name`. The request
+/// lines are written by the telemetry consumer after the response the test
+/// read, so a test polls for every line it asserts on, for 5 s at most
+/// (CODING_STANDARDS.md, "A test waits for the whole end state").
+async fn logged(sink: &MemorySink, name: &str, n: usize) -> Vec<Value> {
+    let events = || -> Vec<Value> {
+        sink.lines().iter().map(|line| serde_json::from_str::<Value>(line).unwrap()).collect()
+    };
+    let count = || events().iter().filter(|e| e["event_name"] == name).count();
+    let settled = tokio::time::timeout(Duration::from_secs(5), async {
+        while count() < n {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "{} {name} lines, wanted {n}", count());
+    events()
+}
+
+/// The `attributes` of every `ignis.request.admitted` event among `events`,
+/// in order.
+fn admitted_attributes(events: &[Value]) -> Vec<Value> {
+    events
         .iter()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .filter(|e| e["event_name"] == "ignis.request.admitted")
         .map(|e| e["attributes"].clone())
         .collect()
@@ -186,9 +204,8 @@ async fn the_encode_time_of_a_multimodal_prefill_reaches_the_admitted_event() {
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status().as_u16(), 200);
     let _ = to_bytes(response.into_body(), usize::MAX).await;
-    nudge().await;
 
-    let admitted = admitted_attributes(&sink);
+    let admitted = admitted_attributes(&logged(&sink, "ignis.request.admitted", 2).await);
     assert_eq!(admitted.len(), 2, "{admitted:?}");
     // The prompt's 4 placeholders span one chunk, so one encode is reported.
     assert_eq!(admitted[0]["media.encode_seconds"], 0.25, "{:?}", admitted[0]);
@@ -218,9 +235,8 @@ async fn an_image_over_the_vision_budget_is_admitted_shrunk_and_the_log_shows_bo
     let response = app.oneshot(image_request(&data_uri(&png(256, 256)))).await.unwrap();
     assert_eq!(response.status().as_u16(), 200, "an image over the budget is shrunk, not refused");
     let _ = to_bytes(response.into_body(), usize::MAX).await;
-    nudge().await;
 
-    let admitted = admitted_attributes(&sink);
+    let admitted = admitted_attributes(&logged(&sink, "ignis.request.admitted", 1).await);
     assert_eq!(admitted.len(), 1, "{admitted:?}");
     assert_eq!(admitted[0]["media.vision_tokens"], 16, "{:?}", admitted[0]);
     assert_eq!(admitted[0]["media.natural_vision_tokens"], 64, "{:?}", admitted[0]);
@@ -240,9 +256,8 @@ async fn the_same_image_sent_twice_is_a_cache_hit_on_the_admitted_event() {
         assert_eq!(response.status().as_u16(), 200);
         let _ = to_bytes(response.into_body(), usize::MAX).await;
     }
-    nudge().await;
 
-    let admitted = admitted_attributes(&sink);
+    let admitted = admitted_attributes(&logged(&sink, "ignis.request.admitted", 2).await);
     assert_eq!(admitted.len(), 2, "{admitted:?}");
     let cache = |a: &Value| (a["media.cache_hits"].clone(), a["media.cache_misses"].clone());
     assert_eq!(cache(&admitted[0]), (json!(0), json!(1)), "{:?}", admitted[0]);
@@ -342,7 +357,9 @@ fn deciding_app() -> axum::Router {
 }
 
 /// One question of `kind` over `image` (or over a text `state` when `None`),
-/// answered 200: every event the request log captured meanwhile.
+/// answered 200: every event the request log captured, once it holds the
+/// question's `done` line. Its `admitted` line, when it has one, comes
+/// before: the consumer writes a request's lines in the order they happen.
 async fn decide_one(kind: &str, image: Option<&str>) -> Vec<Value> {
     let sink = Arc::new(MemorySink::new());
     let _guard = tracing::subscriber::set_default(
@@ -365,8 +382,7 @@ async fn decide_one(kind: &str, image: Option<&str>) -> Vec<Value> {
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
     let answer: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(answer["answers"]["q"]["type"], kind, "{answer}");
-    nudge().await;
-    sink.lines().iter().map(|line| serde_json::from_str::<Value>(line).unwrap()).collect()
+    logged(&sink, "ignis.request.done", 1).await
 }
 
 /// The `media.*` attributes of the one `name` event among `events`.
