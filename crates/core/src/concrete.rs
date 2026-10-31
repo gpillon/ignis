@@ -1378,18 +1378,34 @@ impl ConcreteScheduler {
     /// device, then KV-RAM when it is the tier below it, where
     /// [`Self::spill_prefix`] sends one the device gives up. Never the disk:
     /// nothing demotes a prefix there and no restore brings one back, so a
-    /// prefix miss on the disk would be a series that can never hit. None with
-    /// prompt reuse off, which retains no prefix at all.
+    /// prefix miss on the disk would be a series that can never hit. The
+    /// device alone with prompt reuse off, whose tier list stops there.
     fn prefix_tiers(&self) -> TierSet {
         let mut tiers = TierSet::default();
-        if !self.config.prompt_reuse {
-            return tiers;
-        }
         tiers.insert(ReuseSource::Device);
         if self.checkpoints.tiers().below(ReuseSource::Device) == Some(ReuseSource::KvRam) {
             tiers.insert(ReuseSource::KvRam);
         }
         tiers
+    }
+
+    /// The tiers each kind of retained state can be hit in on this load, and
+    /// so the only ones a look misses it in (GitHub #222): a miss counts a
+    /// request that found nothing where something could have been. Both
+    /// kinds' gates are here, applied the same way.
+    ///
+    /// - A **checkpoint** is captured only with prompt reuse on. Off, no
+    ///   lookup can hit, and its misses would count only the switch.
+    /// - A **prefix** is published only into a retained slot (GitHub #215),
+    ///   prompt reuse on or off. Off, a live sibling's head that outlives its
+    ///   publisher under a claimant is still a hit when claimed (#325). With
+    ///   no slot nothing is ever published.
+    fn hit_tiers(&self) -> TiersByKind {
+        let open = |gate: bool, tiers: TierSet| if gate { tiers } else { TierSet::default() };
+        TiersByKind::new(
+            open(self.config.prompt_reuse, self.checkpoints.tiers().sources()),
+            open(self.retained.capacity() > 0, self.prefix_tiers()),
+        )
     }
 
     /// The retained prefix `entry`, which the first-victim path is giving up,
@@ -4262,22 +4278,17 @@ impl Scheduler for ConcreteScheduler {
                     // One walk of the prompt answers all four questions below.
                     let keys = self.reuse_keys(i);
                     let lookup = self.checkpoints.lookup(&keys);
-                    // GitHub #222: with prompt reuse off nothing is captured,
-                    // so the lookup can never hit, and its misses would count
-                    // only the switch.
-                    let checkpoint_misses = if self.config.prompt_reuse {
-                        lookup.misses(self.checkpoints.tiers())
-                    } else {
-                        TierSet::default()
-                    };
-                    // And the prefix walk's misses, from the same keys and
-                    // before a block comes back from KV-RAM below: what this
-                    // look found retained in each tier a prefix lives in, by
-                    // the test the hit below applies (a live publisher's head
-                    // is a sibling's, not retained state).
-                    let prefix_misses =
-                        self.prefix.misses(&keys, self.prefix_tiers(), |publisher| !self.is_live(publisher));
-                    self.requests[i].pending_misses = TiersByKind::new(checkpoint_misses, prefix_misses);
+                    // GitHub #222: each lookup's misses, in the tiers its kind
+                    // can be hit in on this load. The prefix walk's come from
+                    // the same keys and before a block comes back from KV-RAM
+                    // below, by the test the hit below applies (a live
+                    // publisher's head is a sibling's, not retained state).
+                    let tiers = self.hit_tiers();
+                    self.requests[i].pending_misses = TiersByKind::new(
+                        lookup.misses(tiers.of(RetainedKind::Checkpoint)),
+                        self.prefix
+                            .misses(&keys, tiers.of(RetainedKind::Prefix), |publisher| !self.is_live(publisher)),
+                    );
                     // A KV-RAM checkpoint has to beat every device reuse by
                     // its restore floor, a prefix's included (GitHub #190).
                     let mut device_prefix = self

@@ -179,7 +179,7 @@ and kind: no checkpoint matched in that tier, or no retained prefix did. A
 block shared from a sibling that is still running is not retained state, so
 it counts as a prefix miss. A prefix is only ever kept on the device and in
 KV-RAM, so its disk series stays at zero, and `--reuse-prompt off` counts no
-miss at all ([metrics](../reference/metrics.md)).
+checkpoint miss ([metrics](../reference/metrics.md)).
 
 ## Who can see it
 

@@ -1035,24 +1035,67 @@ fn prompt_reuse_off_retains_no_prefix() {
 }
 
 #[test]
-fn prompt_reuse_off_records_no_miss_of_either_kind() {
-    // GitHub #222: off retains no prefix and captures no checkpoint, so no
-    // lookup there can ever hit, and a miss would count nothing but the
-    // switch being off.
+fn prompt_reuse_off_with_retained_slots_misses_a_prefix_where_one_can_be_hit() {
+    // GitHub #222: a miss is counted where a hit can be. The slots an operator
+    // names with prompt reuse off publish live siblings' heads (#215), and one
+    // outlives its publisher while a claimant stands on it, so the next claim
+    // of it is a device hit (#325). Off still captures no checkpoint, so no
+    // checkpoint lookup there can hit, and none misses.
     let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(
         compute,
         SchedulerConfig {
             prompt_reuse: false,
+            retained_slots: 2,
             ..config()
         },
     );
-    sched.submit(subagent(500), RequestClass::Agent).unwrap();
-    let mut events = run_to_idle(&mut sched);
-    sched.submit(subagent(900), RequestClass::Agent).unwrap();
+    let same = |max| input(tokens(1, 60), None, Some(57), max);
+    let a = sched.submit(same(4), RequestClass::Agent).unwrap();
+    let mut events = sched.advance();
+    let b = sched.submit(same(60), RequestClass::Agent).unwrap();
+    while !events.iter().any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == a)) {
+        assert!(!sched.is_idle(), "the first never finished");
+        events.extend(sched.advance());
+    }
+    let c = sched.submit(same(4), RequestClass::Agent).unwrap();
     events.extend(run_to_idle(&mut sched));
-    assert_eq!(misses(&events, RetainedKind::Prefix), vec![]);
+    assert_eq!(prefix_reuses(&events, b), vec![48], "the second claims the first's live head");
+    assert_eq!(prefix_reuses(&events, c), vec![48], "the third claims it after its publisher finished");
+    assert_eq!(hits(&events, RetainedKind::Prefix), vec![ReuseSource::Device], "the third's claim is the hit");
+    assert_eq!(
+        misses(&events, RetainedKind::Prefix),
+        vec![ReuseSource::Device, ReuseSource::Device],
+        "the first found nothing, the second only a live sibling's head"
+    );
     assert_eq!(misses(&events, RetainedKind::Checkpoint), vec![]);
+}
+
+#[test]
+fn a_load_with_no_retained_slot_records_no_prefix_miss() {
+    // GitHub #222: with no slot nothing is ever published, so no prefix can be
+    // hit, with prompt reuse on or off. Off, which is what the server resolves
+    // `--reuse-prompt off` to unless the operator names slots, captures no
+    // checkpoint either, and misses nothing at all.
+    for prompt_reuse in [true, false] {
+        let compute = Arc::new(MockCompute::with_sections(crate::sections()));
+        let mut sched = scheduler(
+            compute,
+            SchedulerConfig {
+                prompt_reuse,
+                retained_slots: 0,
+                ..config()
+            },
+        );
+        sched.submit(subagent(500), RequestClass::Agent).unwrap();
+        let mut events = run_to_idle(&mut sched);
+        sched.submit(subagent(900), RequestClass::Agent).unwrap();
+        events.extend(run_to_idle(&mut sched));
+        assert_eq!(misses(&events, RetainedKind::Prefix), vec![], "prompt reuse {prompt_reuse}");
+        if !prompt_reuse {
+            assert_eq!(misses(&events, RetainedKind::Checkpoint), vec![]);
+        }
+    }
 }
 
 /// [`subagent`] with a four-placeholder image of content `digest` in its

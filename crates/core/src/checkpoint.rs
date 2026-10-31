@@ -345,6 +345,15 @@ impl TierList {
         &self.0
     }
 
+    /// The tiers, as a set.
+    pub fn sources(&self) -> TierSet {
+        let mut sources = TierSet::default();
+        for tier in &self.0 {
+            sources.insert(tier.source);
+        }
+        sources
+    }
+
     /// `source`'s position in the order, or `None` when this load does not
     /// carry that tier at all.
     pub fn rank(&self, source: ReuseSource) -> Option<usize> {
@@ -623,11 +632,11 @@ impl CheckpointLookup {
     }
 
     /// The tiers of `tiers` in which nothing matched.
-    pub fn misses(&self, tiers: &TierList) -> TierSet {
+    pub fn misses(&self, tiers: TierSet) -> TierSet {
         let mut missed = TierSet::default();
-        for tier in tiers.tiers() {
-            if self.longest_in(tier.source).is_none() {
-                missed.insert(tier.source);
+        for source in tiers.iter() {
+            if self.longest_in(source).is_none() {
+                missed.insert(source);
             }
         }
         missed
@@ -1768,7 +1777,7 @@ mod tests {
         let chosen = pool.select(&lookup, 1_200).unwrap();
         assert_eq!((chosen.source, chosen.tokens), (ReuseSource::Device, 1_500));
         assert_eq!(
-            lookup.misses(pool.tiers()),
+            lookup.misses(pool.tiers().sources()),
             TierSet::default(),
             "both tiers matched something"
         );
