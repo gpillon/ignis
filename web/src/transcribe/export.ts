@@ -36,12 +36,15 @@ function lines(t: Transcript): { u: Utterance; text: string; speaker: string | n
     .filter((line) => line.text !== "");
 }
 
-/** "Started 25 Oct 2026, 15:42": a live listening's wall-clock start. */
-export function startedLine(startedAt: number): string {
+/** "25 Oct 2026, 15:42": a live listening's wall-clock start. */
+export function startedOn(startedAt: number): string {
   const at = new Date(startedAt);
   const { day, time } = dayAndTime(at);
-  return `Started ${day} ${at.getFullYear()}, ${time}`;
+  return `${day} ${at.getFullYear()}, ${time}`;
 }
+
+/** "Started 25 Oct 2026, 15:42". */
+export const startedLine = (startedAt: number): string => `Started ${startedOn(startedAt)}`;
 
 /** The clipboard's and `.txt`'s: `[mm:ss] Speaker: text`, one line per utterance. */
 export function toText(t: Transcript): string {

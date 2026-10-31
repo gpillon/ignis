@@ -19,6 +19,8 @@ import { Switch } from "../ui/Switch.tsx";
 import { HintText } from "../speech/Dictation.tsx";
 import { fileStem, toSrt, toText, toVtt } from "./export.ts";
 import { toMarkdown } from "./markdown.ts";
+import { choosePdfOptions, lastPdfOptions, type PdfOptions } from "./pdf.ts";
+import { PdfDialog, PdfPrint } from "./PrintView.tsx";
 import { StoreWorkspaceChooser } from "../workspace/WorkspaceChooser.tsx";
 import { type Destination, sentLine } from "../workspace/send.ts";
 import { pageWorkspaces, type Workspaces } from "../workspace/workspaces.ts";
@@ -478,11 +480,14 @@ function Side({ open, tab, onTab, waiting, children }: { open: boolean; tab: Sid
   );
 }
 
-/** The heading's exports: Copy, the four downloads behind one menu, and Open in chat. */
+/** The heading's exports: Copy, the four downloads and the PDF behind one menu, and Open in chat. */
 function Exports({ transcript: t, onOpenInChat, workspaces }: { transcript: Transcript; onOpenInChat: (markdown: string) => void; workspaces?: Workspaces }) {
   const [copied, setCopied] = useState(false);
   const [choosing, setChoosing] = useState(false);
   const [sent, setSent] = useState<string | null>(null);
+  // The PDF dialog's options while it is open; then the PDF being printed, a new one at each press.
+  const [pdf, setPdf] = useState<PdfOptions | null>(null);
+  const [printing, setPrinting] = useState<{ options: PdfOptions; press: number } | null>(null);
   const menu = useRef<HTMLDetailsElement>(null);
   const nothing = t.utterances.every((u) => u.text.trim() === "");
   return (
@@ -500,32 +505,60 @@ function Exports({ transcript: t, onOpenInChat, workspaces }: { transcript: Tran
       >
         {copied ? "Copied" : "Copy"}
       </button>
-      <details ref={menu} className={`group relative ${nothing ? "pointer-events-none opacity-50" : ""}`}>
-        <summary
-          aria-disabled={nothing}
-          className="flex cursor-pointer list-none items-center gap-1 border border-line px-2.5 py-1.5 font-display text-[13px] font-medium text-ink hover:border-ember [&::-webkit-details-marker]:hidden"
-        >
-          <IconDownload />
-          Download
-          <IconChevron className="rotate-180 transition-transform group-open:rotate-0 motion-reduce:transition-none" />
-        </summary>
-        <ul className="absolute right-0 z-20 mt-1 flex min-w-36 flex-col border border-line bg-surface py-1 shadow-lg">
-          {EXPORTS.map((format) => (
-            <li key={format.extension}>
+      <div className="relative">
+        <details ref={menu} className={`group relative ${nothing ? "pointer-events-none opacity-50" : ""}`}>
+          <summary
+            aria-disabled={nothing}
+            className="flex cursor-pointer list-none items-center gap-1 border border-line px-2.5 py-1.5 font-display text-[13px] font-medium text-ink hover:border-ember [&::-webkit-details-marker]:hidden"
+          >
+            <IconDownload />
+            Download
+            <IconChevron className="rotate-180 transition-transform group-open:rotate-0 motion-reduce:transition-none" />
+          </summary>
+          <ul className="absolute right-0 z-20 mt-1 flex min-w-36 flex-col border border-line bg-surface py-1 shadow-lg">
+            {EXPORTS.map((format) => (
+              <li key={format.extension}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    download(t, format);
+                    menu.current?.removeAttribute("open");
+                  }}
+                  className="w-full px-3 py-1.5 text-left font-display text-[13px] text-ink hover:bg-line"
+                >
+                  {format.label}
+                </button>
+              </li>
+            ))}
+            <li className="mt-1 border-t border-line pt-1">
               <button
                 type="button"
                 onClick={() => {
-                  download(t, format);
+                  setPdf(lastPdfOptions());
                   menu.current?.removeAttribute("open");
                 }}
                 className="w-full px-3 py-1.5 text-left font-display text-[13px] text-ink hover:bg-line"
               >
-                {format.label}
+                PDF…
               </button>
             </li>
-          ))}
-        </ul>
-      </details>
+          </ul>
+        </details>
+        {pdf && (
+          <PdfDialog
+            transcript={t}
+            options={pdf}
+            onOptions={setPdf}
+            onPrint={() => {
+              choosePdfOptions(pdf);
+              setPdf(null);
+              setPrinting({ options: pdf, press: Date.now() });
+            }}
+            onCancel={() => setPdf(null)}
+          />
+        )}
+        {printing && <PdfPrint key={printing.press} transcript={t} options={printing.options} onDone={() => setPrinting(null)} />}
+      </div>
       <button
         type="button"
         disabled={nothing}
