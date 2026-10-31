@@ -684,27 +684,24 @@ impl PrefixCache {
     /// it. Unlike [`PrefixCache::pages_a_holder_frees`], which follows one
     /// holder up its chain, a link two holders reach through links of their
     /// own goes when both of them do.
+    ///
+    /// One pass, newest link first, so each link is decided after every link
+    /// above it: entries are kept in registration order, and a link is
+    /// registered over a parent that already stands.
     pub fn links_let_go(&self, letting_go: impl Fn(PrefixId) -> u32) -> Vec<PrefixId> {
         let mut gone: Vec<PrefixId> = Vec::new();
-        loop {
-            let before = gone.len();
-            for e in &self.entries {
-                if gone.contains(&e.id) {
-                    continue;
+        let mut gone_above: std::collections::HashMap<PrefixId, u32> = std::collections::HashMap::new();
+        for e in self.entries.iter().rev() {
+            let from_above = gone_above.get(&e.id).copied().unwrap_or(0);
+            if e.refcount == letting_go(e.id) + from_above {
+                gone.push(e.id);
+                if let Some(parent) = e.parent {
+                    debug_assert!(parent < e.id, "a link is registered after its parent");
+                    *gone_above.entry(parent).or_default() += 1;
                 }
-                let from_above = self
-                    .entries
-                    .iter()
-                    .filter(|c| c.parent == Some(e.id) && gone.contains(&c.id))
-                    .count() as u32;
-                if e.refcount == letting_go(e.id) + from_above {
-                    gone.push(e.id);
-                }
-            }
-            if gone.len() == before {
-                return gone;
             }
         }
+        gone
     }
 
     /// Release one reference to `entry` (the claimant completed or was
@@ -1285,6 +1282,38 @@ mod tests {
         assert_eq!(cache.links_let_go(|id| u32::from(id == head || id == nine)), vec![nine]);
         // Nothing named: nothing goes.
         assert!(cache.links_let_go(|_: PrefixId| 0).is_empty());
+    }
+
+    #[test]
+    fn links_let_go_down_a_chain_only_as_far_as_every_holder_above_goes() {
+        // GitHub #445: request 8 claimed request 7's retained four-page head
+        // and published the two pages past it as a chained prefix, and
+        // request 9 claimed that and lent the two past it to a link. 7 is
+        // done. Each link has one holder of its own besides the link above
+        // it: the head its retention, the middle 8 (as a checkpoint would),
+        // the top 9 (as a claim would).
+        let mut cache = PrefixCache::new(16);
+        let (head, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        assert!(cache.retain_published(head, retention(0)));
+        cache.claim(&cache.keys(&prompt96())).expect("request 8 claims the head");
+        let (middle, _) = cache.register(8, &prompt96(), &gdn_boundary(96), Some(head)).unwrap();
+        let prompt128: Vec<TokenId> = (1..=128).collect();
+        assert_eq!(cache.claim(&cache.keys(&prompt128)).map(|c| c.id), Some(middle), "request 9 claims the middle");
+        let (top, _) = cache.register_link(9, &prompt128, Some(middle)).unwrap();
+        assert_eq!(cache.release(head), vec![], "request 7 is done");
+
+        let mut gone = cache.links_let_go(|_: PrefixId| 1);
+        gone.sort_unstable();
+        assert_eq!(gone, vec![head, middle, top], "every holder named: the whole chain");
+        assert_eq!(
+            cache.links_let_go(|id| u32::from(id != middle)),
+            vec![top],
+            "the middle's holder stays: the top goes, and the middle and the head under it stay"
+        );
+        assert!(
+            cache.links_let_go(|id| u32::from(id != top)).is_empty(),
+            "the top's holder stays: it holds the middle, which holds the head"
+        );
     }
 
     #[test]
