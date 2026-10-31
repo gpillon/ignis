@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { noNotes, type Notes } from "./notes.ts";
-import { readRecap, recapDue, recapMarkdown, recapRequest, recapSections, recapTask, withRecap } from "./recap.ts";
+import { readRecap, recapDue, recapMarkdown, recapRequest, recapSections, recapStatus, recapTask, withRecap } from "./recap.ts";
 import { addUtterance, createTranscript, type Transcript } from "./transcript.ts";
 
 function heard(texts: string[]): Transcript {
@@ -146,6 +146,17 @@ describe("the recap as kept", () => {
       ].join("\n\n"),
     );
     expect(recapMarkdown(undefined)).toBe("");
+  });
+
+  it("says when it was written, from how much, and what came since", () => {
+    const at = recap({ writtenAt: new Date(2026, 9, 27, 16, 5).getTime(), covered: 4 });
+    expect(recapStatus(at, 4)).toBe("Written at 16:05 from 4 utterances.");
+    expect(recapStatus(at, 7)).toBe("Written at 16:05 from 4 utterances. 3 more since.");
+    expect(recapStatus({ ...at, covered: 1 }, 2)).toBe("Written at 16:05 from 1 utterance. 1 more since.");
+    // Utterances deleted since leave fewer than the recap covered: nothing came since, never a negative count.
+    expect(recapStatus(at, 2)).toBe("Written at 16:05 from 4 utterances.");
+    expect(recapStatus({ ...at, fromMs: 125_000 }, 4)).toBe("Written at 16:05 from 4 utterances, from 02:05 on: the start did not fit the model's context.");
+    expect(recapStatus(undefined, 4)).toBeNull();
   });
 
   it("reads back from the store as written, one never written or malformed as none", () => {

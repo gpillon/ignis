@@ -5,7 +5,7 @@ import { ContextCard } from "./Context.tsx";
 import { ANSWER_AFTER_MS, Deck, deckHint, HEADPHONES, startBlocked, startPress, Strip, stripStatus, timeLeft } from "./Deck.tsx";
 import { IDLE, type ListeningState } from "./listening.ts";
 import { AskBar } from "./Ask.tsx";
-import { NotesPanel, notesButton, recapButton } from "./Notes.tsx";
+import { NotesPanel, notesButton, recapButton, rewriteButton } from "./Notes.tsx";
 import type { AnalystState } from "./analyst.ts";
 import type { AskerState } from "./ask.ts";
 import { SuggestionsPanel, suggestionText } from "./Suggestions.tsx";
@@ -50,6 +50,7 @@ const actions: TranscribeActions = {
   editText: none,
   setNoteKind: none,
   writeNotes: none,
+  rewriteNotes: none,
   writeRecap: none,
   stopNotes: none,
   setNotesLive: none,
@@ -547,7 +548,7 @@ describe("the notes", () => {
     ...t,
     notes: {
       kind: "work",
-      lines: [{ id: "N1", section: "Summary", text: "Si apre.", author: "model" }],
+      lines: [{ id: "N1", section: "Now", text: "Si apre.", author: "model" }],
       removed: [],
       nextId: 2,
       writtenAs: "work",
@@ -569,22 +570,44 @@ describe("the notes", () => {
     expect(html).toContain("About once a minute while something new is said, and the recap when the listening ends.");
   });
 
-  it("shows the notes written, their lines in the kind's sections, when and from how much, and offers to update them", () => {
-    const html = panel(addUtterance(written(room()), { stream: "mic-1", startMs: 9_000, endMs: 9_500, text: "Poi?", voice: null }));
-    expect(html).toMatch(/<h2>Summary<\/h2>\s*<ul>\s*<li>Si apre\.<\/li>/);
-    expect(html).toMatch(/<h2>Open questions<\/h2>\s*<p>—<\/p>/);
-    expect(html).toContain("Written at 16:05 from 1 utterance. 1 more since.");
+  it("shows the notes in the kind's live sections, when they were updated, and offers to update them", () => {
+    const t = addUtterance(written(room()), { stream: "mic-1", startMs: 9_000, endMs: 9_500, text: "Poi?", voice: null });
+    const html = panel(t);
+    expect(html).toMatch(/<h2>Now<\/h2>\s*<ul>\s*<li>Si apre\.<\/li>/);
+    expect(html).toMatch(/<h2>Commitments heard<\/h2>\s*<p>—<\/p>/);
+    expect(html).toContain("Updated at 16:05. 1 more since.");
     expect(html).toContain(">Update notes<");
     expect(html).toMatch(/role="radio" aria-checked="true"[^>]*><span[^>]*>Work call<\/span>/);
+    // Kept up while listening, the line says only when.
+    const live = panel(t, idle, { notesLive: true });
+    expect(live).toContain("Updated at 16:05.");
+    expect(live).not.toContain("more since");
   });
 
-  it("streams a writing under the heat, the button a Stop", () => {
+  it("updates the notes in place under the heat, the button a Stop", () => {
     const t = written(room());
-    const html = panel(t, { writing: t.id, form: "running", text: "## Argomenti\n- Il budget", failed: null });
+    const html = panel(t, { writing: t.id, form: "running", text: "", failed: null });
     expect(html).toContain("spine-live");
-    expect(html).toContain("<h2>Argomenti</h2>");
-    expect(html).not.toContain("Si apre.");
+    expect(html).toMatch(/aria-label="Notes" aria-busy="true"/);
+    // Not dimmed: the lines stay readable while they change.
+    expect(html).toContain('<div class="notes">');
+    expect(html).toContain("<li>Si apre.</li>");
+    expect(html).toContain("The model is reading what was said since.");
+    expect(html).not.toContain("Updated at");
+    expect(panel(room(), { writing: room().id, form: "running", text: "", failed: null })).toContain("The model is reading the transcript.");
     expect(notesButton(t, { writing: t.id, form: "running", text: "", failed: null }, null)).toEqual({ label: "Stop", disabled: false, stops: true });
+  });
+
+  it("offers Rewrite from scratch in a menu, once the model wrote a line and while nothing is under way", () => {
+    const t = written(room());
+    const html = panel(t);
+    expect(html).toMatch(/<summary[^>]*>.*More.*<\/summary>/s);
+    expect(html).toMatch(/<button type="button"[^>]*>.*Rewrite from scratch.*<\/button>/s);
+    expect(html).toContain("Drops the model&#x27;s lines and writes the notes again from the transcript.");
+    expect(rewriteButton(t, idle, null)).toEqual({ disabled: false });
+    expect(rewriteButton(room(), idle, null)).toEqual({ disabled: true });
+    expect(rewriteButton(t, { ...idle, writing: 9 }, null)).toEqual({ disabled: true });
+    expect(rewriteButton(t, idle, "No text model serves: the notes and the suggestions need one. Load it in the Server view.")).toEqual({ disabled: true });
   });
 
   it("cannot write with no text model, nothing heard, or another Transcript's notes under way, and says why it failed", () => {
@@ -613,10 +636,13 @@ describe("the notes", () => {
     },
   });
 
+  /** Where the running notes fold under the recap. */
+  const foldAt = (html: string) => html.lastIndexOf("<details", html.indexOf(">Running notes</summary>"));
+
   it("offers Write the recap at any moment, and shows no recap and no fold before one is written", () => {
     const html = panel(written(room()));
     expect(html).toContain(">Write the recap<");
-    expect(html).not.toContain("<details");
+    expect(html).not.toContain("Running notes</summary>");
     expect(html).toContain(">Copy notes<");
     expect(recapButton(room(), idle, null)).toEqual({ label: "Write the recap", disabled: false, stops: false });
   });
@@ -624,7 +650,7 @@ describe("the notes", () => {
   it("shows the recap on top once it exists, in its sections, the running notes folded under it", () => {
     const html = panel(recapped(room()));
     const recap = html.indexOf('aria-label="Recap"');
-    const fold = html.indexOf("<details");
+    const fold = foldAt(html);
     expect(recap).toBeGreaterThan(0);
     expect(fold).toBeGreaterThan(recap);
     expect(html.slice(recap, fold)).toMatch(/<h2>Figures &amp; dates<\/h2>\s*<ul>\s*<li>40k: il tetto/);
@@ -641,8 +667,8 @@ describe("the notes", () => {
     const html = panel(t, writing);
     const recap = html.indexOf('aria-label="Recap"');
     expect(recap).toBeGreaterThan(0);
-    expect(html.slice(recap, html.indexOf("<details"))).toContain("spine-live");
-    expect(html.slice(recap, html.indexOf("<details"))).toContain("<li>Il budget</li>");
+    expect(html.slice(recap, foldAt(html))).toContain("spine-live");
+    expect(html.slice(recap, foldAt(html))).toContain("<li>Il budget</li>");
     expect(recapButton(t, writing, null)).toEqual({ label: "Stop", disabled: false, stops: true });
     expect(notesButton(t, writing, null)).toMatchObject({ label: "Update notes", disabled: true, stops: false });
     expect(recapButton(t, { ...writing, form: "running" }, null)).toMatchObject({ disabled: true, stops: false });

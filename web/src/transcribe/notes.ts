@@ -1,30 +1,32 @@
 import { canChat, imageLoaded, loadUnderWay, type ModelState } from "../api/model.ts";
-import type { ConversationRequest, Settings } from "../api/request.ts";
-import { assistRequest } from "./assist.ts";
-import { taskInput } from "./taskContext.ts";
-import { clock } from "./export.ts";
+import type { Settings } from "../api/request.ts";
+import { hoursClocks } from "./export.ts";
 import { dayAndTime, type Transcript } from "./transcript.ts";
 import { viewerChoice } from "./viewerChoice.ts";
 
-// Notes on a Transcript (spec speech/07, Q124-Q127): the text model loaded
-// reads the transcript and writes the notes a kind of conversation wants, a
-// Markdown section each (the server has no structured output, #287). They are
-// written on a press, or kept up while listening: about once a minute while
-// something new was said, and once more at the end.
-//
-// The request is assist.ts's shape, which the suggestions share (Q134): the
-// preamble and this kind's sections as the system prompt, the title and the
-// transcript as its `.txt` as the user turn, which a listening only appends
-// to, so the next writing reuses what the engine read. The notes written
-// before are not sent back: each writing starts from the transcript, so a
-// correction holds in the next one and nothing the model got wrong compounds.
+// Notes on a Transcript (spec speech/07, Q124-Q127; spec #428): the text
+// model loaded keeps the notes a kind of conversation wants, as lines in
+// sections. They come in two forms. The running notes are kept while the
+// conversation goes on, in the kind's live sections, through a thread with
+// the model that changes them a line at a time (running.ts, ADR 0076); they
+// are updated on a press, or kept up while listening: about once a minute
+// while something new was said. The recap is written once from the whole
+// transcript, in the kind's sections, when a listening ends and on a press
+// (recap.ts).
 
 export type NoteKind = "general" | "work" | "game" | "lesson";
 
 /** A section the model fills, and what it asks for. */
 export type NoteSection = { name: string; ask: string };
 
-export type NoteKindSpec = { kind: NoteKind; label: string; about: string; sections: NoteSection[] };
+/** A section of the running notes: what it asks for, and how many of the model's lines it holds at most. */
+export type RunningSection = NoteSection & { cap: number };
+
+/**
+ * A kind of conversation: the sections its recap is written in (recap.ts adds to them), and the live sections its
+ * running notes keep, five at most, each holding the current state or facts that add up (spec #428).
+ */
+export type NoteKindSpec = { kind: NoteKind; label: string; about: string; sections: NoteSection[]; running: RunningSection[] };
 
 export const NOTE_KINDS: NoteKindSpec[] = [
   {
@@ -35,6 +37,13 @@ export const NOTE_KINDS: NoteKindSpec[] = [
       { name: "Summary", ask: "what the conversation is about and where it got to, in two to four sentences" },
       { name: "Key points", ask: "what was said that matters, a bullet each" },
       { name: "Next steps", ask: "what someone said they, or someone else, will do" },
+    ],
+    running: [
+      { name: "Now", cap: 1, ask: "what is being talked about right now, in one line" },
+      { name: "People", cap: 20, ask: "one line a person who spoke or was named: who they are, as the conversation shows it. Add a person the first time they come up, never remove one" },
+      { name: "Points", cap: 10, ask: "the points made, one a line, with who made them" },
+      { name: "Asked of me", cap: 6, ask: "questions or requests put to Me and not answered yet; remove a line once Me has answered it" },
+      { name: "Open questions", cap: 8, ask: "what was raised and is still open; remove a line once it is settled" },
     ],
   },
   {
@@ -49,6 +58,17 @@ export const NOTE_KINDS: NoteKindSpec[] = [
       { name: "Action items", ask: "who does what, and by when if it was said, with the time it was said, as a task list (`- [ ] `)" },
       { name: "Open questions", ask: "what was raised and left unresolved" },
     ],
+    running: [
+      { name: "Now", cap: 1, ask: "what is being discussed right now, in one line" },
+      {
+        name: "People",
+        cap: 20,
+        ask: "one line a person who spoke or was named: who they are, their role or stance as the conversation shows it. Add a person the first time they come up, complete their line as more is learned, never remove one",
+      },
+      { name: "Figures & dates", cap: 12, ask: "every figure said (an amount, a percentage, a quantity, a date, a deadline), one a line, with what it refers to" },
+      { name: "Asked of me", cap: 6, ask: "questions or requests put to Me and not answered yet; remove a line once Me has answered it" },
+      { name: "Commitments heard", cap: 10, ask: "who said they would do what, and by when if it was said" },
+    ],
   },
   {
     kind: "game",
@@ -59,6 +79,13 @@ export const NOTE_KINDS: NoteKindSpec[] = [
       { name: "Players", ask: "who played, and on which side or team where it shows" },
       { name: "Results", ask: "who won or lost what, with the scores where they were said" },
       { name: "Highlights", ask: "the moments worth remembering: plays, turnarounds, jokes" },
+    ],
+    running: [
+      { name: "Now playing", cap: 1, ask: "the game being played and where it stands, in one line" },
+      { name: "Players & sides", cap: 12, ask: "one line a player: their side, team or role" },
+      { name: "Score", cap: 8, ask: "the score or the standings as they are now" },
+      { name: "Moments", cap: 10, ask: "the moments that mattered, with their time" },
+      { name: "Rules in question", cap: 6, ask: "rules asked about or disputed, and how they were settled" },
     ],
   },
   {
@@ -71,14 +98,21 @@ export const NOTE_KINDS: NoteKindSpec[] = [
       { name: "Questions", ask: "what was asked, and the answer when one came" },
       { name: "To review", ask: "what to study or look up after" },
     ],
+    running: [
+      { name: "Now", cap: 1, ask: "the subject being taught right now, in one line" },
+      { name: "Concepts", cap: 12, ask: "the concepts taught, one a line, with a line of explanation" },
+      { name: "Terms", cap: 20, ask: "the terms introduced, one a line, with what they mean" },
+      { name: "Questions", cap: 8, ask: "the questions asked, with the answer if one was given" },
+      { name: "Homework & dates", cap: 8, ask: "homework, readings, exams and their dates" },
+    ],
   },
 ];
 
 export const specOf = (kind: NoteKind): NoteKindSpec => NOTE_KINDS.find((k) => k.kind === kind) ?? NOTE_KINDS[0];
 
-/** What a kind's tile says under its name: its sections, the summary left out of a long list, four at most. */
+/** What a kind's tile says under its name: its running notes' sections, the first (what is on now) left out of a long list, four at most. */
 export function kindHint(spec: NoteKindSpec): string {
-  const names = spec.sections.map((s) => s.name).filter((name, _, all) => all.length <= 4 || name !== "Summary");
+  const names = spec.running.map((s) => s.name).filter((_, i, all) => all.length <= 4 || i > 0);
   const shown = names.slice(0, 4).map((name, i) => (i === 0 ? name : name.toLocaleLowerCase()));
   return shown.join(", ");
 }
@@ -126,13 +160,7 @@ export type Notes = {
   fromMs: number | null;
 };
 
-/** The task: the kind's sections and how to write them (assist.ts). */
-export function notesTask(kind: NoteKind): string {
-  const spec = specOf(kind);
-  return sectionsTask(`Write the notes of ${spec.about}`, spec.sections);
-}
-
-/** A writing in sections (the notes, the recap): what to write, its sections in order, its own rules ahead of the notes'. */
+/** A writing in sections (the recap): what to write, its sections in order, its own rules ahead of the common ones. */
 export function sectionsTask(opening: string, sections: NoteSection[], rules: string[] = []): string {
   return [
     `${opening}: these sections, in this order, each under a level-2 Markdown heading (\`## \`):`,
@@ -149,7 +177,7 @@ export function sectionsTask(opening: string, sections: NoteSection[], rules: st
   ].join("\n\n");
 }
 
-/** The tokens a writing may take. */
+/** The tokens an answer of the notes thread may take. */
 export const NOTES_MAX_TOKENS = 1_500;
 
 export const NOTES_SETTINGS: Omit<Settings, "systemPrompt"> = {
@@ -161,11 +189,20 @@ export const NOTES_SETTINGS: Omit<Settings, "systemPrompt"> = {
   laneTag: "agent",
 };
 
-/** A writing of `t`'s notes as `kind`, and where its transcript starts when the start did not fit. */
-export function notesRequest(t: Transcript, kind: NoteKind, contextLimit: number | null): { request: ConversationRequest; fromMs: number | null } {
-  const { content, fromMs } = taskInput(t, contextLimit, NOTES_MAX_TOKENS);
-  return { request: assistRequest(NOTES_SETTINGS, notesTask(kind), content), fromMs };
-}
+/**
+ * The running notes' limits, beside each live section's cap (`RunningSection.cap`), as #429's replay measured them on
+ * the live model.
+ */
+export const RUNNING_NOTES = {
+  /** A thread whose last request's prompt passed this many tokens starts again from a snapshot of the notes. */
+  restartTokens: 64_000,
+  /** The requests one update makes at most; what is left goes to the next update. */
+  maxRounds: 6,
+  /** Rounds in a row that change nothing before an update ends. */
+  idleRounds: 2,
+  /** The longest line, in characters: a longer one is refused. */
+  lineChars: 240,
+};
 
 /** Keeping up: the first notes once this many utterances are in. */
 export const FIRST_LIVE_UTTERANCES = 3;
@@ -185,18 +222,18 @@ export function dueForUpdate({ notes, utterances, sinceLastMs }: { notes: Notes 
   return sinceLastMs === null || sinceLastMs >= LIVE_GAP_MS;
 }
 
-const counted = (n: number) => (n === 1 ? "1 utterance" : `${n} utterances`);
-
-/** The line under the notes: when they were written, from how much, and what came since; `null` before any. */
-export function notesStatus(notes: Notes | undefined, utterances: number): string | null {
+/**
+ * The line under the running notes: when they were last updated and, while they are not kept up (`live` off), how many
+ * utterances came since; `null` before any.
+ */
+export function notesStatus(notes: Notes | undefined, utterances: number, live: boolean): string | null {
   if (!notes?.writtenAs || notes.writtenAt === null) return null;
   const time = dayAndTime(new Date(notes.writtenAt)).time;
   if (notes.writtenAs !== notes.kind) {
     return `Written as ${specOf(notes.writtenAs).label} notes at ${time}. Write notes to redo them as ${specOf(notes.kind).label} notes.`;
   }
-  const from = notes.fromMs === null ? "" : `, from ${clock(notes.fromMs)} on: the start did not fit the model's context`;
   const fresh = Math.max(0, utterances - notes.covered);
-  return `Written at ${time} from ${counted(notes.covered)}${from}.${fresh > 0 ? ` ${fresh} more since.` : ""}`;
+  return `Updated at ${time}.${!live && fresh > 0 ? ` ${fresh} more since.` : ""}`;
 }
 
 /**
@@ -225,12 +262,13 @@ const SECTION_HEADING = /^##[ \t]+(.+?)[ \t#]*$/;
 const OTHER_HEADING = /^#{1,6}[ \t]+(.+?)[ \t#]*$/;
 const BULLET = /^[ \t]*(?:[-*+]|\d+[.)])[ \t]+(.*)$/;
 const RULE = /^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
-/** What a section with nothing in it holds (notesTask). */
+/** What a section with nothing in it holds (sectionsTask). */
 const NOTHING = /^[—–-]?$/;
 
 /**
- * The model's notes as lines: a line per bullet or paragraph, in the section of the level-2 heading above it, a heading
- * of the kind's written as the kind spells it. A section's `—` is no line; what sits under no heading goes under Other.
+ * Notes an older page kept as the model's Markdown, as lines: a line per bullet or paragraph, in the section of the
+ * level-2 heading above it, a heading of the kind's written as the kind spells it. A section's `—` is no line; what
+ * sits under no heading goes under Other.
  */
 export const parseNotes = (answer: string, kind: NoteKind): DraftLine[] => parseLines(answer, specOf(kind).sections.map((s) => s.name));
 
@@ -289,18 +327,24 @@ export function withWriting(notes: Notes | undefined, { lines: drafts, ...writte
   return { ...base, ...written, lines: [...lines, ...base.lines.filter((l) => l.author === "user")], nextId };
 }
 
+/** The sections notes are shown in: `named` in order, then any other a line sits in, Other last. */
+export function sectionOrder(named: string[], lines: NoteLine[]): string[] {
+  const sections = [...new Set([...named, ...lines.map((l) => l.section).filter((s) => s !== OTHER_SECTION)])];
+  return lines.some((l) => l.section === OTHER_SECTION) && !sections.includes(OTHER_SECTION) ? [...sections, OTHER_SECTION] : sections;
+}
+
 /**
- * The notes as Markdown, what the tab shows and Copy notes gives: the sections of the kind they were written as, in
- * order, `—` under one with no line, then any other section a line sits in; nothing says who wrote a line. "" before
- * any are written. `named`: the sections in order, when they are not the kind's (the recap's).
+ * The notes as Markdown, what the tab shows and Copy notes gives: the live sections of the kind they were written as,
+ * in order, `—` under one with no line, then any other section a line sits in, Other last; nothing says who wrote a
+ * line, and a time past the hour reads `h:mm:ss`. "" before any are written. `named`: the sections in order, when
+ * they are not the running notes' (the recap's).
  */
 export function notesMarkdown(notes: Notes | undefined, named?: NoteSection[]): string {
   if (!notes || (notes.writtenAs === null && notes.lines.length === 0)) return "";
-  const kinds = (named ?? specOf(notes.writtenAs ?? notes.kind).sections).map((s) => s.name);
-  const sections = [...new Set([...kinds, ...notes.lines.map((l) => l.section)])];
-  return sections
+  const kinds = (named ?? specOf(notes.writtenAs ?? notes.kind).running).map((s) => s.name);
+  return sectionOrder(kinds, notes.lines)
     .map((section) => {
-      const lines = notes.lines.filter((l) => l.section === section).map((l) => `- ${l.text}`);
+      const lines = notes.lines.filter((l) => l.section === section).map((l) => `- ${hoursClocks(l.text)}`);
       return `## ${section}\n${lines.length > 0 ? lines.join("\n") : "—"}`;
     })
     .join("\n\n");
