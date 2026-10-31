@@ -6,7 +6,7 @@ import type { Notes } from "./notes.ts";
 import { activeOf, openTranscript, removeTranscript, startList, titleOf, UNTITLED } from "./sessions.ts";
 import { restoreTranscripts, TRANSCRIBE_SESSIONS, TRANSCRIBE_VERSION, toStored, worthKeeping } from "./stored.ts";
 import { addUtterance, beginListening, clockOf, createTranscript, mergeSpeakers, type Transcript } from "./transcript.ts";
-import { addContextImage } from "./contextImages.ts";
+import { addContextImage, withReading } from "./contextImages.ts";
 
 // The Transcripts as the view lists them and the page's store keeps them
 // (spec speech/07, "The Transcript", Q86, Q101): a new kind of session, saved
@@ -182,6 +182,21 @@ describe("a Transcript in the store", () => {
     const [kept] = restoreTranscripts([{ ...stored, images: "a slide" }], 1).transcripts;
     expect(kept.utterances).toHaveLength(2);
     expect(kept).not.toHaveProperty("images");
+  });
+
+  it("keeps what was read in each context image, and drops a reading it cannot read, the image kept to be read again (#437)", async () => {
+    const reading = { shows: "A slide titled Q3.", topic: "Budget", names: ["Anna Rossi"], terms: ["OKR"], readAt: 1_761_900_030_000 };
+    let original = addContextImage(heardTwice(), { image: "c".repeat(64), atMs: 1_500, width: 1280, height: 720 }, 1_761_900_000_000);
+    original = withReading(addContextImage(original, { image: "e".repeat(64), atMs: 2_000, width: 800, height: 600 }, 1_761_900_010_000), 1, reading);
+    const stored = toStored(original, { key: "k", order: 1 });
+    const store = openIndexedDbStore(new IDBFactory(), "transcribe-readings-test");
+    await store.putDoc(TRANSCRIBE_SESSIONS, stored.key, stored);
+    const [back] = restoreTranscripts(await store.listDocs(TRANSCRIBE_SESSIONS), 1).transcripts;
+    expect(back.images).toEqual(original.images);
+    expect(back.images?.[0].reading).toEqual(reading);
+    expect(back.images?.[1]).not.toHaveProperty("reading");
+    const [unread] = restoreTranscripts([{ ...stored, images: [{ ...stored.images![0], reading: { ...reading, terms: "OKR" } }] }], 1).transcripts;
+    expect(unread.images).toEqual([{ id: 1, image: "c".repeat(64), atMs: 1_500, width: 1280, height: 720, addedAt: 1_761_900_000_000 }]);
   });
 
   it("is worth keeping, and is not reused as a new one, once a picture is added before anyone spoke (#431)", () => {

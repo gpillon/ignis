@@ -1,5 +1,6 @@
 import type { ConversationRequest, Settings } from "../api/request.ts";
 import { assistRequest, CHARS_PER_TOKEN } from "./assist.ts";
+import { readImages, readingLine } from "./contextImages.ts";
 import { type DraftLine, type NoteKind, type NoteLine, type Notes, NOTES_SETTINGS, notesMarkdown, type NoteSection, parseLines, readNotes, sectionsTask, specOf, withWriting, type Written } from "./notes.ts";
 import { clock } from "./export.ts";
 import { taskInput } from "./taskContext.ts";
@@ -77,13 +78,19 @@ function userRecap(recap: Notes | undefined): string[] {
 /**
  * A recap of `t` as `kind`, and where its transcript starts when the start did not fit. Its user turn is the context,
  * the title and the whole transcript, then what the context images showed (`readings`, a line each as their reading
- * gives it; none until images are read), the notes the user took, and the lines they wrote in the recap or removed
- * from it.
+ * gives it, `[mm:ss] (image) ...`: every image of `t` read, unless given), the notes the user took, and the lines they
+ * wrote in the recap or removed from it. The readings stand there whole, whatever of the transcript fits, and not again
+ * among its utterances.
  */
-export function recapRequest(t: Transcript, kind: NoteKind, contextLimit: number | null, readings: string[] = []): { request: ConversationRequest; fromMs: number | null } {
+export function recapRequest(
+  t: Transcript,
+  kind: NoteKind,
+  contextLimit: number | null,
+  readings: string[] = readImages(t).map((i) => readingLine(i)),
+): { request: ConversationRequest; fromMs: number | null } {
   const shown = readings.length > 0 ? [`Pictures shown during the conversation, as read at their moments:\n${readings.join("\n")}`] : [];
   const after = [...shown, userNotes(t), ...userRecap(t.recap)].join("\n\n");
-  const { content, fromMs } = taskInput(t, contextLimit, RECAP_MAX_TOKENS + Math.ceil(after.length / CHARS_PER_TOKEN));
+  const { content, fromMs } = taskInput({ ...t, images: [] }, contextLimit, RECAP_MAX_TOKENS + Math.ceil(after.length / CHARS_PER_TOKEN));
   return { request: assistRequest(RECAP_SETTINGS, recapTask(kind), `${content}\n${after}`), fromMs };
 }
 

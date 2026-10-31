@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CatalogRow } from "../server/routes.ts";
-import { createVisionWatch, readVision, visionOf } from "./vision.ts";
+import { createVisionWatch, readVision, visionModel, visionOf } from "./vision.ts";
 
 // Whether the loaded model has vision, as the page learns it from what the
 // server reports (#394): the running family's `vision.enabled` in
@@ -96,5 +96,16 @@ describe("the page's watch on vision", () => {
     const failing = createVisionWatch(() => Promise.reject(new Error("offline")));
     await failing.seen("qwen3.8-27b");
     expect(failing.has()).toBe(false);
+  });
+});
+
+describe("the model whose vision the Transcribe view follows (#437)", () => {
+  it("is the text model ready, read then; kept while it is unloaded idle; none for the image model, a switch or nothing", () => {
+    expect(visionModel({ state: "ready", id: "qwen3.8-27b", contextLimit: 262_144 })).toEqual({ id: "qwen3.8-27b", read: true });
+    // Unloaded, the catalog loads no row: what was read for it holds, and its next request loads it again.
+    expect(visionModel({ state: "unloaded", id: "qwen3.8-27b", contextLimit: 262_144 })).toEqual({ id: "qwen3.8-27b", read: false });
+    expect(visionModel({ state: "ready", id: "ignis-image-2.1-turbo", contextLimit: null, kind: "image" })).toEqual({ id: null, read: false });
+    expect(visionModel({ state: "switching", from: "qwen3.8-27b", to: "qwen3.8-flash-next", since: 0 })).toEqual({ id: null, read: false });
+    expect(visionModel({ state: "error", message: "down" })).toEqual({ id: null, read: false });
   });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { canChat, type ModelState } from "../api/model.ts";
 import { runningFamily } from "../server/band.ts";
 import { section } from "../server/form.ts";
@@ -10,6 +10,8 @@ import { type CatalogRow, type ConfigDocument, readCatalog, readConfig } from ".
 // The page learns it from what the server reports, the running family's
 // `vision.enabled` in `GET /v1/config`, and reads it again after every switch:
 // `make_image` switches models in the middle of a turn. Unknown is no vision.
+// The Transcribe view follows it as a state: a context image waits to be read
+// until the text model has vision (#437).
 
 /** The loaded model's vision: its family's own `vision.enabled`, else the group's; none for no loaded family. */
 export function visionOf(config: ConfigDocument | null, catalog: CatalogRow[] | null): boolean {
@@ -59,6 +61,39 @@ export function createVisionWatch(read: () => Promise<boolean>): VisionWatch {
     },
     has: () => known !== null && known.model === model && known.vision,
   };
+}
+
+/**
+ * The model whose vision a view follows (#437): the text model the page can chat with, by id, and whether to read it
+ * now, once it is ready. Unloaded while idle, the catalog loads no row, so no read can say: what was read for it holds,
+ * and its next request loads it again.
+ */
+export function visionModel(model: ModelState): { id: string | null; read: boolean } {
+  return canChat(model) ? { id: model.id, read: model.state === "ready" } : { id: null, read: false };
+}
+
+/**
+ * Whether the text model has vision, as a state a view redraws on (the Transcribe view's context images, #437): read
+ * each time it is ready after anything else, kept while it is unloaded idle, none until a read for it lands.
+ */
+export function useHasVision(model: ModelState, read: () => Promise<boolean> = readVision): boolean {
+  const [watch] = useState(() => createVisionWatch(read));
+  const [known, setKnown] = useState<{ model: string; vision: boolean } | null>(null);
+  const { id, read: ready } = visionModel(model);
+  useEffect(() => {
+    if (id === null) {
+      void watch.seen(null);
+      setKnown(null);
+      return;
+    }
+    if (!ready) return;
+    let current = true;
+    void watch.seen(id).then(() => current && setKnown({ model: id, vision: watch.has() }));
+    return () => {
+      current = false;
+    };
+  }, [watch, id, ready]);
+  return id !== null && known?.model === id && known.vision;
 }
 
 /**
