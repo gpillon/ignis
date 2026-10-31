@@ -94,13 +94,25 @@ int main(int argc, char **argv) {
                              : ignis_moe_experts_decode(dx.p, tokens, dids.as<int32_t>(), dw.as<float>(),
                                                         dslots.as<ignis_moe_slot>(), &ws, acc.as<int64_t>(), nullptr);
   const cudaError_t err = cudaDeviceSynchronize();
-  std::printf("trap (%s): launch rc %d, synchronize: %s (%d)\n", mode.c_str(), rc, cudaGetErrorString(err), static_cast<int>(err));
-  if (rc != 0 || err != cudaErrorLaunchFailure) {
+  // stderr, which is unbuffered: std::_Exit flushes nothing, and under CTest stdout is a pipe.
+  const std::string op_error = rc != 0 ? ignis_moe_last_error() : "";
+  std::fprintf(stderr, "trap (%s): launch rc %d%s%s, synchronize: %s (%d)\n", mode.c_str(), rc, op_error.empty() ? "" : ": ",
+               op_error.c_str(), cudaGetErrorString(err), static_cast<int>(err));
+  // The trap is asynchronous, and the first call into the driver after the trapping kernel has
+  // run reports it. That is usually the synchronize above. On a loaded host the op's own launch
+  // check can come first (prefill: after its grouping kernels; decode: right after its launch),
+  // and the op then returns -1 naming the launch failure (GitHub #424). Either way the context
+  // holds cudaErrorLaunchFailure. A rejection before any launch leaves it at cudaSuccess, and an
+  // out-of-bounds access at cudaErrorIllegalAddress.
+  const std::string launch_failure = std::string("launch failed: ") + cudaGetErrorString(cudaErrorLaunchFailure);
+  const bool trap_at_launch = rc != 0 && op_error.find(launch_failure) != std::string::npos;
+  if ((rc != 0 && !trap_at_launch) || err != cudaErrorLaunchFailure) {
     std::fprintf(stderr, "test_moe_slot_trap (%s): expected the launch to trap (cudaErrorLaunchFailure)\n", mode.c_str());
     std::fflush(stderr);
     std::_Exit(1);
   }
-  std::printf("test_moe_slot_trap (%s): OK\n", mode.c_str());
+  std::printf("test_moe_slot_trap (%s): OK, trap seen by %s\n", mode.c_str(),
+              trap_at_launch ? "the op's launch check" : "the synchronize");
   // The context is gone after the trap; leave without touching it again.
   std::fflush(stdout);
   std::_Exit(0);
