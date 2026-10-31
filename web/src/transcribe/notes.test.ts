@@ -201,7 +201,7 @@ describe("the notes as kept", () => {
     ]);
   });
 
-  it("keep what came before any heading, under a closing Other, and read a fenced answer and Windows line ends", () => {
+  it("keep what came before any heading, under a closing Other, and read a fenced answer and CRLF line ends", () => {
     expect(parseNotes("```markdown\nNotes of the call:\r\n\r\n## Summary\r\n### Launch\r\nThe cap is set.\r\n- ok\n```", "general")).toEqual([
       { section: "Other", text: "Notes of the call:" },
       { section: "Summary", text: "Launch" },
