@@ -647,10 +647,15 @@ pub struct Plan {
 #[derive(Debug, Clone, Serialize)]
 pub struct TtftCell {
     pub prompt_tokens: u32,
+    /// The median of the cold samples' TTFTs: a void sample is evidence of
+    /// nothing and enters no median (GitHub #443).
     pub median_ttft_ms: Option<f64>,
+    /// Every sample's TTFT, in order, the void ones included.
     pub samples_ms: Vec<f64>,
     /// Every sample was provably a cold prefix.
     pub all_cold: bool,
+    /// How many samples were void, left out of the median.
+    pub void_samples: usize,
     /// Why the cell has no median: not measurable here, or failed.
     pub error: Option<String>,
 }
@@ -658,7 +663,7 @@ pub struct TtftCell {
 impl TtftCell {
     /// A cell that was not measured, and why.
     fn unmeasured(prompt_tokens: u32, error: String) -> Self {
-        Self { prompt_tokens, median_ttft_ms: None, samples_ms: Vec::new(), all_cold: false, error: Some(error) }
+        Self { prompt_tokens, median_ttft_ms: None, samples_ms: Vec::new(), all_cold: false, void_samples: 0, error: Some(error) }
     }
 }
 
@@ -709,11 +714,13 @@ pub fn to_json(report: &Report) -> Result<String, String> {
 }
 
 fn ttft_cell(cell: &ttft::Cell) -> TtftCell {
+    let cold: Vec<f64> = cell.samples.iter().filter(|s| !s.void).map(|s| s.ttft_ms).collect();
     TtftCell {
         prompt_tokens: cell.prompt_tokens,
-        median_ttft_ms: cell.median_ttft_ms,
+        median_ttft_ms: ttft::median(&cold),
         samples_ms: cell.samples.iter().map(|s| s.ttft_ms).collect(),
         all_cold: cell.all_cold(),
+        void_samples: cell.void_samples().len(),
         error: cell.error.clone().or_else(|| {
             cell.void_samples().first().map(|s| s.void_reason.clone().unwrap_or_else(|| "a void sample".into()))
         }),
@@ -1316,6 +1323,35 @@ ignis_speculative_position_accepted_total{position=\"1\"} 90\n";
                 assert!(!body.contains(private), "{id} mentions {private}");
             }
         }
+    }
+
+    /// GitHub #443: a void sample is evidence of nothing, so the cell's
+    /// published median is its cold samples' alone, and the record counts the
+    /// void ones beside every sample's time.
+    #[test]
+    fn a_void_sample_is_counted_and_enters_no_median() {
+        let sample = |index, ttft_ms, void: bool| ttft::Sample {
+            index,
+            ttft_ms,
+            computed_prefill_tokens: Some(if void { 64 } else { 8_192 }),
+            void,
+            void_reason: void.then(|| "computed prefill 64 is short of the 8192-token prompt".to_string()),
+        };
+        let cell = ttft::Cell {
+            prompt_tokens: 8_192,
+            warmup_ttft_ms: Some(900.0),
+            samples: vec![sample(0, 10.0, true), sample(1, 100.0, false), sample(2, 300.0, false)],
+            median_ttft_ms: Some(100.0),
+            error: None,
+            image: None,
+        };
+        let json = serde_json::to_value(ttft_cell(&cell)).unwrap();
+        assert_eq!(json["median_ttft_ms"], 200.0, "the cold samples' median: {json}");
+        assert_eq!(json["void_samples"], 1, "{json}");
+        assert_eq!(json["all_cold"], false);
+        assert_eq!(json["samples_ms"], json!([10.0, 100.0, 300.0]), "every sample's time");
+        let all_void = ttft::Cell { samples: vec![sample(0, 10.0, true)], ..cell };
+        assert_eq!(serde_json::to_value(ttft_cell(&all_void)).unwrap()["median_ttft_ms"], Value::Null);
     }
 
     /// The default cells with one between them that does not fit a context

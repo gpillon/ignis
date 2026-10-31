@@ -165,6 +165,7 @@ fn the_record_is_assembled_from_what_the_server_exposes() {
     assert_eq!(cells[0]["prompt_tokens"], 200);
     assert!(cells[0]["median_ttft_ms"].as_f64().unwrap() > 0.0);
     assert_eq!(cells[0]["all_cold"], true);
+    assert_eq!(cells[0]["void_samples"], 0);
     assert_eq!(cells[0]["samples_ms"].as_array().unwrap().len(), 2);
     assert_eq!(cells[1]["prompt_tokens"], 30_000);
     assert_eq!(cells[1]["median_ttft_ms"], Value::Null);

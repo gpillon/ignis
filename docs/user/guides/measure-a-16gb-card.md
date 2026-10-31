@@ -73,7 +73,9 @@ request at a time, and another client's requests would land in them.
 - **Time to first token** at 8,192 and 65,536 prompt tokens, three cold samples
   each after a warm-up. A cell longer than the context the load runs is not
   measured: the record says so and names the largest cell that fits, which
-  `--cells` asks for.
+  `--cells` asks for. A sample the server served in part from its cache is
+  void: the cell's `void_samples` counts it, `all_cold` is false, and
+  `median_ttft_ms` is the median of the cold samples alone.
 - **Notes**: every piece it could not read, and why.
 
 `--metrics` points at the metrics listener when it is not where the server's
