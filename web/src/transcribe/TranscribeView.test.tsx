@@ -695,6 +695,10 @@ describe("the view", () => {
     expect(html).toContain(">Send to workspace<");
     // The Download menu opens downward: its chevron points down while it is closed.
     expect(html).toContain("rotate-180 transition-transform group-open:rotate-0");
+    // It offers the four files, then PDF, whose dialog asks what the PDF carries.
+    const menu = html.slice(html.indexOf(">Download"), html.indexOf(">Open in chat<"));
+    expect([...menu.matchAll(/<button[^>]*>([^<]+)<\/button>/g)].map((m) => m[1])).toEqual([".txt", ".md", ".srt", ".vtt", "PDF…"]);
+    expect(html).not.toContain('aria-label="Download as PDF"');
     expect(html).toMatch(/role="tab" id="transcribe-tab-call" aria-selected="true"/);
     expect(html).toMatch(/role="tab" id="transcribe-tab-notes" aria-selected="false"/);
     expect(html).toMatch(/role="tab" id="transcribe-tab-settings" aria-selected="false"/);

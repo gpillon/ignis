@@ -303,7 +303,7 @@ listening; so does a lost connection.
 ## Out of the view
 
 Beside the title, **Copy** puts it on the clipboard, and **Download** writes it
-as:
+as a file, or prints it as a [PDF](#a-pdf):
 
 | Format | Each utterance |
 |---|---|
@@ -311,8 +311,39 @@ as:
 | `.md` | `**Speaker** (mm:ss): text`, after the title and the start, with the notes and Ask's answers (below) |
 | `.srt` | a numbered cue from its start to its end, `Speaker: text` |
 | `.vtt` | a cue from its start to its end, `<v Speaker>text` |
+| PDF | its time, then the speaker in bold and the text, with the context images at their moments, and on request the notes, the context and Ask's answers (below) |
 
 The `.md` also carries what the view keeps beside the utterances. Under the title and the start come the **recap**, when the transcript has one, or else the running notes, each in its sections (`## Summary`, or `## Now` for the running notes, and so on, a section with no line shown as `—`), then a `## Transcript` heading over the utterances. Each answer Ask gave stands between the utterances at the moment it was asked, as a quoted block whose first line is the question in bold; an answer kept without a moment stands at the end. A transcript with no notes and no answers writes the `.md` as the table says. `.txt`, `.srt` and `.vtt` never carry notes or answers: they stay the transcript alone, so a tool reading them keeps working. Open in chat and Send to workspace use the same Markdown.
+
+### A PDF
+
+**PDF**, last in the Download menu, makes a document for someone who will only
+read the conversation. A small dialog asks what it carries beside the
+transcript:
+
+- **Recap**: the recap, or the running notes while there is none, in their
+  sections, before the transcript;
+- **Context in short**: the topic, the terms and the languages the context
+  tells, after the header (what you wrote under More stays out);
+- **Ask's answers**: each in a box titled by its question, at the moment it
+  was asked; an answer kept without a moment closes the document.
+
+Under each, the dialog says what it would add to this transcript, or that there
+is nothing to add yet. All three are on the first time; after that the dialog
+starts from your last choice, which this browser keeps, as it keeps the notes'
+kind. Whatever you pick, the PDF opens on a header with the title, the start,
+the duration and the speakers, then carries every utterance with its time and
+its speaker in bold, and each context image at its moment.
+
+**Print…** opens the browser's print dialog over that document alone: choose to
+save as PDF there; the file is offered under the name the other downloads take.
+The pages are A4 and light whatever the Playground's theme, in ignis's faces,
+with the ember for the rules, the speakers and the answer boxes, and the ignis
+mark in the header. A browser that draws page margin boxes, as a Chromium-based
+one does, prints "ignis · title · page n/m" at the foot of every page; if the
+print dialog adds its own headers and footers (the date, the address), turn
+them off there. The document is made in the page, from the transcript as it is
+in this browser: nothing is sent anywhere.
 
 **Open in chat** opens a new chat with the transcript as Markdown in its prompt
 box. Nothing is sent until you press Send: ask for a summary, the decisions,
@@ -337,7 +368,7 @@ five minutes again. The answer streams in on the time spine where you
 asked, after the last utterance it read, that moment's time in orange beside
 it, and stays there while the conversation goes on under it; **Forget** drops
 one. It reads the transcript alone, so a word heard wrong stays wrong in it.
-Answers are not searched, nor exported. A moment named as `[mm:ss]`, in an
+Answers are not searched; the `.md` and the [PDF](#a-pdf) carry them. A moment named as `[mm:ss]`, in an
 answer or in the notes, is a link: click it and the transcript shows that
 utterance, lit for a moment.
 
