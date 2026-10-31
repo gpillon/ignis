@@ -544,7 +544,16 @@ describe("the notes", () => {
   const idle: NotesWriterState = { writing: null, text: "", failed: null };
   const written = (t: Transcript): Transcript => ({
     ...t,
-    notes: { kind: "work", text: "## Riassunto\n- Si apre.", writtenAs: "work", covered: 1, writtenAt: new Date(2026, 9, 27, 16, 5).getTime(), fromMs: null },
+    notes: {
+      kind: "work",
+      lines: [{ id: "N1", section: "Summary", text: "Si apre.", author: "model" }],
+      removed: [],
+      nextId: 2,
+      writtenAs: "work",
+      covered: 1,
+      writtenAt: new Date(2026, 9, 27, 16, 5).getTime(),
+      fromMs: null,
+    },
   });
   const panel = (t: Transcript, writer: NotesWriterState = idle, patch: Partial<TranscribeState> = {}) =>
     renderToStaticMarkup(<NotesPanel transcript={t} state={state(patch)} actions={actions} writer={writer} />);
@@ -558,9 +567,10 @@ describe("the notes", () => {
     expect(html).toMatch(/role="switch" aria-checked="false"[^>]*>.*Keep updating while listening/);
   });
 
-  it("shows the notes written, when and from how much, and offers to update them", () => {
+  it("shows the notes written, their lines in the kind's sections, when and from how much, and offers to update them", () => {
     const html = panel(addUtterance(written(room()), { stream: "mic-1", startMs: 9_000, endMs: 9_500, text: "Poi?", voice: null }));
-    expect(html).toContain("<h2>Riassunto</h2>");
+    expect(html).toMatch(/<h2>Summary<\/h2>\s*<ul>\s*<li>Si apre\.<\/li>/);
+    expect(html).toMatch(/<h2>Open questions<\/h2>\s*<p>—<\/p>/);
     expect(html).toContain("Written at 16:05 from 1 utterance. 1 more since.");
     expect(html).toContain(">Update notes<");
     expect(html).toMatch(/role="radio" aria-checked="true"[^>]*><span[^>]*>Work call<\/span>/);
@@ -571,7 +581,7 @@ describe("the notes", () => {
     const html = panel(t, { writing: t.id, text: "## Argomenti\n- Il budget", failed: null });
     expect(html).toContain("spine-live");
     expect(html).toContain("<h2>Argomenti</h2>");
-    expect(html).not.toContain("Riassunto");
+    expect(html).not.toContain("Si apre.");
     expect(notesButton(t, { writing: t.id, text: "", failed: null }, null)).toEqual({ label: "Stop", disabled: false, stops: true });
   });
 

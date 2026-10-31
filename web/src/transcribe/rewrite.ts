@@ -1,7 +1,7 @@
 import type { ConversationRequest, Settings } from "../api/request.ts";
 import { type AskDeps, askModel, assistRequest, settle, Watched } from "./assist.ts";
-import { told } from "./context.ts";
 import { toText } from "./export.ts";
+import { contextBlock } from "./taskContext.ts";
 import type { Transcript, Utterance } from "./transcript.ts";
 
 // Rewrite (spec speech/07, Q138): the user asks the text model to rebuild one
@@ -39,11 +39,10 @@ export function rewriteRequest(t: Transcript, utterance: number): ConversationRe
   if (index === -1) return null;
   const around = { ...t, utterances: t.utterances.slice(Math.max(0, index - BEFORE), index + AFTER + 1) };
   const line = toText({ ...t, utterances: [t.utterances[index]] }).trim();
-  const { prompt, keywords } = told(t.context, t.speakers);
-  const context = [prompt, keywords.length > 0 ? `Terms: ${keywords.join(", ")}.` : ""].filter((part) => part !== "").join("\n");
-  const content = [context === "" ? "" : `Context:\n${context}`, `Transcript, around the utterance:\n${toText(around).trimEnd()}`, `Misheard utterance: ${line}`]
-    .filter((part) => part !== "")
-    .join("\n\n");
+  const content = `${contextBlock(t)}Transcript, around the utterance:
+${toText(around).trimEnd()}
+
+Misheard utterance: ${line}`;
   return assistRequest(REWRITE_SETTINGS, REWRITE_TASK, content);
 }
 

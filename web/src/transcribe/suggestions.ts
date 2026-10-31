@@ -221,8 +221,8 @@ export const ANALYSIS_TASK = [
   "Task: read the transcript and write what it suggests, one item a line, in exactly these forms, in this order, and nothing else:",
   'FIX: [mm:ss] heard => meant — first, check every name, product and technical term: where speech recognition misheard one as other words or a wrong spelling ("kuber netis" for Kubernetes, "libre ofis" for LibreOffice), write the utterance\'s time, the words exactly as the transcript has them, and the real name. Only names, products and terms, never a rephrasing; at most ten.',
   "TERM: each name, product or technical term the conversation mentions, spelled correctly, as fixed above (one a line, at most ten)",
-  "TOPIC: what the conversation is about, in a few words, in its language",
-  "TITLE: a short title for it, at most six words, in its language",
+  "TOPIC: what the conversation is about, in a few words, in the language the context says to write in",
+  "TITLE: a short title for it, at most six words, in the language the context says to write in",
   "Write a line only where the transcript shows it. With nothing to write, write NONE.",
 ].join("\n");
 

@@ -2,8 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { ChunkEvent } from "../api/sse.ts";
 import type { StreamOptions, StreamResult } from "../api/stream.ts";
 import { ASSIST_SYSTEM } from "./assist.ts";
-import { LIVE_GAP_MS, notesTask, type Notes } from "./notes.ts";
+import { LIVE_GAP_MS, noNotes, notesTask, type Notes } from "./notes.ts";
 import { NotesWriter, type Written } from "./notesWriter.ts";
+import { contextBlock } from "./taskContext.ts";
 import { addUtterance, createTranscript, type Transcript } from "./transcript.ts";
 
 // The notes' writer (spec speech/07, Q124-Q127): one writing at a time, on
@@ -52,15 +53,29 @@ function writer(scripts: Parameters<typeof fakeStream>[0], now = () => 1_000) {
 }
 
 describe("writing a Transcript's notes", () => {
-  it("sends the kind's prompt and the transcript, streams the text, and lands it on the Transcript it started on", async () => {
-    const { w, fake, written } = writer([{ chunks: ["## Riassunto\n", "- Si parte."] }]);
+  it("sends the kind's prompt and the transcript, streams the text, and lands it as lines on the Transcript it started on", async () => {
+    const { w, fake, written } = writer([{ chunks: ["## Summary\n", "- Si parte.\n- Dal budget [00:05].\n\n## Topics\n—"] }]);
     const seen: string[] = [];
     w.subscribe(() => seen.push(w.getState().text));
     await w.write(heard(3, 7), "work", null);
     expect(fake.asked[0].request.settings.systemPrompt).toBe(`${ASSIST_SYSTEM}\n\n${notesTask("work")}`);
-    expect(fake.asked[0].request.turns).toEqual([{ role: "user", content: "27 Oct 15:42 · Call\n\n[00:00] Me: Frase 0.\n[00:05] Me: Frase 1.\n[00:10] Me: Frase 2.\n" }]);
-    expect(seen).toContain("## Riassunto\n- Si parte.");
-    expect(written).toEqual([[7, { text: "## Riassunto\n- Si parte.", writtenAs: "work", covered: 3, writtenAt: 1_000, fromMs: null }]]);
+    expect(fake.asked[0].request.turns).toEqual([{ role: "user", content: contextBlock(heard(3, 7)) + "27 Oct 15:42 · Call\n\n[00:00] Me: Frase 0.\n[00:05] Me: Frase 1.\n[00:10] Me: Frase 2.\n" }]);
+    expect(seen).toContain("## Summary\n- Si parte.\n- Dal budget [00:05].\n\n## Topics\n—");
+    expect(written).toEqual([
+      [
+        7,
+        {
+          lines: [
+            { section: "Summary", text: "Si parte." },
+            { section: "Summary", text: "Dal budget [00:05]." },
+          ],
+          writtenAs: "work",
+          covered: 3,
+          writtenAt: 1_000,
+          fromMs: null,
+        },
+      ],
+    ]);
     expect(w.getState()).toEqual({ writing: null, text: "", failed: null });
   });
 
@@ -103,7 +118,7 @@ describe("writing a Transcript's notes", () => {
 });
 
 describe("keeping the notes up", () => {
-  const notes = (covered: number): Notes => ({ kind: "general", text: "## A", writtenAs: "general", covered, writtenAt: 0, fromMs: null });
+  const notes = (covered: number): Notes => ({ ...noNotes("general"), lines: [{ id: "N1", section: "Summary", text: "A", author: "model" }], nextId: 2, writtenAs: "general", covered, writtenAt: 0 });
 
   it("writes when the cadence says so, from this Transcript's last writing", async () => {
     let clock = 0;

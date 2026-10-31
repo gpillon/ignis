@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
 import { openIndexedDbStore } from "../store/indexeddb.ts";
 import { createMemoryStore } from "../store/memory.ts";
+import type { Notes } from "./notes.ts";
 import { activeOf, openTranscript, removeTranscript, startList, titleOf, UNTITLED } from "./sessions.ts";
 import { restoreTranscripts, TRANSCRIBE_SESSIONS, TRANSCRIBE_VERSION, toStored, worthKeeping } from "./stored.ts";
 import { addUtterance, beginListening, clockOf, createTranscript, mergeSpeakers, type Transcript } from "./transcript.ts";
@@ -72,13 +73,49 @@ describe("a Transcript in the store", () => {
     expect(JSON.stringify(stored)).not.toMatch(/audio|pcm/i);
   });
 
-  it("keeps its notes (Q124), and drops notes it cannot read without dropping the Transcript", () => {
-    const notes = { kind: "work" as const, text: "## Riassunto\n- Si parte dal budget.", writtenAs: "work" as const, covered: 2, writtenAt: 1_761_580_000_000, fromMs: null };
+  it("keeps its notes as lines (Q124), the user's and the removed ones with them, and drops notes it cannot read without dropping the Transcript", async () => {
+    const notes: Notes = {
+      kind: "work",
+      lines: [
+        { id: "N1", section: "Summary", text: "Si parte dal budget.", author: "model" },
+        { id: "N3", section: "Decisions", text: "Tetto a 40k [00:01]", author: "user" },
+      ],
+      removed: [{ id: "N2", section: "Topics", text: "Il pranzo", author: "model" }],
+      nextId: 4,
+      writtenAs: "work",
+      covered: 2,
+      writtenAt: 1_761_580_000_000,
+      fromMs: null,
+    };
     const original = { ...heardTwice(), notes };
-    const [back] = restoreTranscripts([toStored(original, { key: "k", order: 1 })], 1).transcripts;
-    expect(back.notes).toEqual(notes);
-    const garbled = { ...toStored(original, { key: "k", order: 1 }), notes: { kind: "party", text: 3 } };
+    for (const store of [createMemoryStore(), openIndexedDbStore(new IDBFactory(), "transcribe-notes-test")]) {
+      await store.putDoc(TRANSCRIBE_SESSIONS, "k", toStored(original, { key: "k", order: 1 }));
+      const [back] = restoreTranscripts(await store.listDocs(TRANSCRIBE_SESSIONS), 1).transcripts;
+      expect(back).toEqual({ ...original, id: back.id });
+    }
+    const garbled = { ...toStored(original, { key: "k", order: 1 }), notes: { ...notes, lines: [{ id: "N1", section: "Summary", text: 3, author: "model" }] } };
     const [kept] = restoreTranscripts([garbled], 1).transcripts;
+    expect(kept.utterances).toHaveLength(2);
+    expect(kept).not.toHaveProperty("notes");
+  });
+
+  it("turns notes an older page kept as Markdown into lines on first read, all of them the model's", () => {
+    const old = { kind: "work", text: "## Summary\nSi parte dal budget.\n\n## Action items\n- [ ] Ada manda le slide [00:01]\n\n## Decisions\n—", writtenAs: "work", covered: 2, writtenAt: 1_761_580_000_000, fromMs: null };
+    const [back] = restoreTranscripts([{ ...toStored(heardTwice(), { key: "k", order: 1 }), notes: old }], 1).transcripts;
+    expect(back.notes).toEqual({
+      kind: "work",
+      lines: [
+        { id: "N1", section: "Summary", text: "Si parte dal budget.", author: "model" },
+        { id: "N2", section: "Action items", text: "[ ] Ada manda le slide [00:01]", author: "model" },
+      ],
+      removed: [],
+      nextId: 3,
+      writtenAs: "work",
+      covered: 2,
+      writtenAt: 1_761_580_000_000,
+      fromMs: null,
+    });
+    const [kept] = restoreTranscripts([{ ...toStored(heardTwice(), { key: "k", order: 1 }), notes: { ...old, text: 3 } }], 1).transcripts;
     expect(kept.utterances).toHaveLength(2);
     expect(kept).not.toHaveProperty("notes");
   });

@@ -1,5 +1,5 @@
 import { type AskDeps, askModel, Follower, settle, Watched } from "./assist.ts";
-import { dueForUpdate, LIVE_GAP_MS, type NoteKind, type Notes, notesRequest, tidyNotes } from "./notes.ts";
+import { dueForUpdate, LIVE_GAP_MS, type NoteKind, notesRequest, parseNotes, tidyNotes, type Written } from "./notes.ts";
 import type { Transcript } from "./transcript.ts";
 
 // The notes' writer (spec speech/07, Q124-Q127): one writing at a time, on
@@ -9,7 +9,8 @@ import type { Transcript } from "./transcript.ts";
 // and a Stop or a failure leaves the notes there were. A full engine is
 // waited out a second at a time, as an agent's request is: the notes are a
 // side request on an agent lane, behind the chat. The page holds one, so a
-// writing goes on while the view is hidden.
+// writing goes on while the view is hidden. What lands is the model's
+// Markdown read as lines (notes.ts's parseNotes).
 
 export type NotesWriterState = {
   /** The Transcript whose notes are being written. */
@@ -20,8 +21,7 @@ export type NotesWriterState = {
   failed: { transcript: number; message: string } | null;
 };
 
-/** What a finished writing puts in a Transcript's notes. */
-export type Written = Pick<Notes, "text" | "writtenAs" | "covered" | "writtenAt" | "fromMs">;
+export type { Written };
 
 export type NotesWriterDeps = AskDeps & {
   onWritten: (transcript: number, written: Written) => void;
@@ -58,7 +58,7 @@ export class NotesWriter extends Watched<NotesWriterState> {
       this.set({ writing: null, text: "", failed: { transcript: t.id, message: settled.failed } });
       return;
     }
-    this.deps.onWritten(t.id, { text: settled.text, writtenAs: kind, covered, writtenAt: now(), fromMs });
+    this.deps.onWritten(t.id, { lines: parseNotes(settled.text, kind), writtenAs: kind, covered, writtenAt: now(), fromMs });
     this.set(IDLE);
   }
 

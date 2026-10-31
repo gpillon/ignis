@@ -12,12 +12,15 @@ import {
   noNotes,
   NOTES_SETTINGS,
   notesRequest,
+  notesMarkdown,
   notesTask,
   notesStatus,
+  parseNotes,
   readNotes,
   textModelBlocked,
   reloadNoteKind,
   tidyNotes,
+  withWriting,
   type Notes,
 } from "./notes.ts";
 import { addUtterance, createTranscript, type Transcript } from "./transcript.ts";
@@ -39,7 +42,17 @@ afterEach(() => {
   reloadNoteKind();
 });
 
-const written = (patch: Partial<Notes> = {}): Notes => ({ kind: "work", text: "## Riassunto\n- ok", writtenAs: "work", covered: 4, writtenAt: new Date(2026, 9, 27, 16, 5).getTime(), fromMs: null, ...patch });
+const written = (patch: Partial<Notes> = {}): Notes => ({
+  kind: "work",
+  lines: [{ id: "N1", section: "Summary", text: "ok", author: "model" }],
+  removed: [],
+  nextId: 2,
+  writtenAs: "work",
+  covered: 4,
+  writtenAt: new Date(2026, 9, 27, 16, 5).getTime(),
+  fromMs: null,
+  ...patch,
+});
 
 describe("the kinds of conversation", () => {
   it("show their sections in short on their tiles, a long list without its summary", () => {
@@ -74,13 +87,13 @@ describe("the kinds of conversation", () => {
     expect(kindOf(t)).toBe("general");
   });
 
-  it("ask the model for their sections in order, under the headings as given, in the transcript's language", () => {
+  it("ask the model for their sections in order, under the headings as given, in the language the context names", () => {
     const prompt = notesTask("work");
     const at = (heading: string) => prompt.indexOf(`## ${heading}\n`);
     expect(at("Summary")).toBeGreaterThan(0);
     expect(at("Summary")).toBeLessThan(at("Topics"));
     expect(at("Action items")).toBeLessThan(at("Open questions"));
-    expect(prompt).toContain("Keep each heading exactly as given. Write the text under them in the same language as the transcript");
+    expect(prompt).toContain("Keep each heading exactly as given. Write the text under them in the language the context says to write in");
     expect(prompt).toContain("[mm:ss]");
     expect(prompt).not.toContain("## Games");
   });
@@ -153,10 +166,165 @@ describe("the notes as kept", () => {
     expect(tidyNotes("  ## Summary\n- `x`\n")).toBe("## Summary\n- `x`");
   });
 
+  it("are lines: a bullet or a paragraph each, under the level-2 heading it sits in, the kind's headings as the kind spells them", () => {
+    const answer = [
+      "## Summary",
+      "The team sets the budget for the spring launch.",
+      "It closes at noon.",
+      "",
+      "## topics",
+      "- Budget: [01:10] the cap is 40k",
+      "  and travel is left out",
+      "* Hiring",
+      "  - a nested point",
+      "1. Numbered",
+      "",
+      "## Action items",
+      "- [ ] Ada sends the slides [03:05]",
+      "",
+      "## Decisions",
+      "—",
+      "",
+      "## Open questions",
+      "- —",
+      "---",
+      "## Rischi",
+      "- Il fornitore tarda",
+    ].join("\n");
+    expect(parseNotes(answer, "work")).toEqual([
+      { section: "Summary", text: "The team sets the budget for the spring launch. It closes at noon." },
+      { section: "Topics", text: "Budget: [01:10] the cap is 40k and travel is left out" },
+      { section: "Topics", text: "Hiring" },
+      { section: "Topics", text: "a nested point" },
+      { section: "Topics", text: "Numbered" },
+      { section: "Action items", text: "[ ] Ada sends the slides [03:05]" },
+      { section: "Rischi", text: "Il fornitore tarda" },
+    ]);
+  });
+
+  it("keep what came before any heading, under a closing Other, and read a fenced answer and Windows line ends", () => {
+    expect(parseNotes("```markdown\nNotes of the call:\r\n\r\n## Summary\r\n### Launch\r\nThe cap is set.\r\n- ok\n```", "general")).toEqual([
+      { section: "Other", text: "Notes of the call:" },
+      { section: "Summary", text: "Launch" },
+      { section: "Summary", text: "The cap is set." },
+      { section: "Summary", text: "ok" },
+    ]);
+    expect(parseNotes("## Summary\n—", "general")).toEqual([]);
+  });
+
+  it("take a writing's lines in place of the model's, a line written again word for word keeping its id, a new one the next id; the user's lines and removals stay", () => {
+    const before = written({
+      lines: [
+        { id: "N1", section: "Summary", text: "The budget.", author: "model" },
+        { id: "N2", section: "Topics", text: "Budget: the cap is 40k", author: "model" },
+        { id: "N3", section: "Topics", text: "Hiring waits", author: "user" },
+        { id: "N5", section: "Decisions", text: "No travel", author: "model" },
+      ],
+      removed: [{ id: "N4", section: "Topics", text: "Lunch", author: "model" }],
+      nextId: 6,
+    });
+    const after = withWriting(before, {
+      lines: [
+        { section: "Summary", text: "The budget and the hiring." },
+        { section: "Topics", text: "Budget: the cap is 40k" },
+        { section: "Decisions", text: "Cap at 40k [02:10]" },
+      ],
+      writtenAs: "work",
+      covered: 9,
+      writtenAt: 2_000,
+      fromMs: null,
+    });
+    expect(after).toEqual({
+      ...before,
+      lines: [
+        { id: "N6", section: "Summary", text: "The budget and the hiring.", author: "model" },
+        { id: "N2", section: "Topics", text: "Budget: the cap is 40k", author: "model" },
+        { id: "N7", section: "Decisions", text: "Cap at 40k [02:10]", author: "model" },
+        { id: "N3", section: "Topics", text: "Hiring waits", author: "user" },
+      ],
+      nextId: 8,
+      covered: 9,
+      writtenAt: 2_000,
+    });
+    // A Transcript's first notes: the kind they were written as, from N1.
+    expect(withWriting(undefined, { lines: [{ section: "Games", text: "Chess, from [00:10]." }], writtenAs: "game", covered: 3, writtenAt: 1_000, fromMs: 5_000 })).toEqual({
+      kind: "game",
+      lines: [{ id: "N1", section: "Games", text: "Chess, from [00:10].", author: "model" }],
+      removed: [],
+      nextId: 2,
+      writtenAs: "game",
+      covered: 3,
+      writtenAt: 1_000,
+      fromMs: 5_000,
+    });
+  });
+
+  it("give back Markdown, what the tab shows and Copy notes copies: the kind's sections in order, `—` for an empty one, others after, no mark of who wrote a line", () => {
+    const notes = written({
+      lines: [
+        { id: "N3", section: "Rischi", text: "Il fornitore tarda", author: "model" },
+        { id: "N1", section: "Topics", text: "Budget: [01:10] the cap is 40k", author: "model" },
+        { id: "N2", section: "Summary", text: "The team sets the budget.", author: "model" },
+        { id: "N4", section: "Topics", text: "Hiring", author: "user" },
+      ],
+      nextId: 5,
+    });
+    expect(notesMarkdown(notes)).toBe(
+      [
+        "## Summary\n- The team sets the budget.",
+        "## Topics\n- Budget: [01:10] the cap is 40k\n- Hiring",
+        "## People\n—",
+        "## Decisions\n—",
+        "## Action items\n—",
+        "## Open questions\n—",
+        "## Rischi\n- Il fornitore tarda",
+      ].join("\n\n"),
+    );
+    expect(notesMarkdown({ ...noNotes("game"), writtenAs: "game" })).toBe("## Games\n—\n\n## Players\n—\n\n## Results\n—\n\n## Highlights\n—");
+    expect(notesMarkdown(noNotes("work"))).toBe("");
+    expect(notesMarkdown(undefined)).toBe("");
+  });
+
   it("read back from the store as written, and a malformed one as none", () => {
+    const line = written().lines[0];
     expect(readNotes(written())).toEqual(written());
+    expect(readNotes(written({ lines: [{ ...line, author: "user" }], removed: [{ id: "N2", section: "Topics", text: "Hiring", author: "model" }], nextId: 3 }))).toEqual(
+      written({ lines: [{ ...line, author: "user" }], removed: [{ id: "N2", section: "Topics", text: "Hiring", author: "model" }], nextId: 3 }),
+    );
     expect(readNotes({ ...written(), kind: "party" })).toBeUndefined();
-    expect(readNotes({ ...written(), text: 3 })).toBeUndefined();
+    expect(readNotes({ ...written(), lines: [{ ...line, text: 3 }] })).toBeUndefined();
+    expect(readNotes({ ...written(), lines: [{ ...line, text: " " }] })).toBeUndefined();
+    expect(readNotes({ ...written(), lines: [{ ...line, id: "7" }] })).toBeUndefined();
+    expect(readNotes({ ...written(), lines: [{ ...line, author: "someone" }] })).toBeUndefined();
+    expect(readNotes({ ...written(), removed: "N1" })).toBeUndefined();
+    // An id given twice, or one the next line would take again.
+    expect(readNotes({ ...written(), lines: [line, { ...line, text: "again" }], nextId: 2 })).toBeUndefined();
+    expect(readNotes({ ...written(), removed: [line] })).toBeUndefined();
+    expect(readNotes({ ...written(), nextId: 1 })).toBeUndefined();
     expect(readNotes(null)).toBeUndefined();
+  });
+
+  it("written by an older page as Markdown, become lines the first time they are read, all of them the model's", () => {
+    const at = new Date(2026, 9, 27, 16, 5).getTime();
+    const old = { kind: "work", text: "## Summary\nThe budget for the launch.\n\n## Decisions\n- Cap at 40k [02:10]\n- No travel\n\n## Riassunto\n- ok", writtenAs: "work", covered: 4, writtenAt: at, fromMs: 125_000 };
+    expect(readNotes(old)).toEqual({
+      kind: "work",
+      lines: [
+        { id: "N1", section: "Summary", text: "The budget for the launch.", author: "model" },
+        { id: "N2", section: "Decisions", text: "Cap at 40k [02:10]", author: "model" },
+        { id: "N3", section: "Decisions", text: "No travel", author: "model" },
+        { id: "N4", section: "Riassunto", text: "ok", author: "model" },
+      ],
+      removed: [],
+      nextId: 5,
+      writtenAs: "work",
+      covered: 4,
+      writtenAt: at,
+      fromMs: 125_000,
+    });
+    // A kind picked before any notes were written.
+    expect(readNotes({ kind: "lesson", text: "", writtenAs: null, covered: 0, writtenAt: null, fromMs: null })).toEqual(noNotes("lesson"));
+    expect(readNotes({ ...old, text: 3 })).toBeUndefined();
+    expect(readNotes({ ...old, writtenAs: "party" })).toBeUndefined();
   });
 });

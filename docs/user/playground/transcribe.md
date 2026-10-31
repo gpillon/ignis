@@ -113,6 +113,17 @@ something else, which opens it as a draft, and **Edit the context**, and the
 Call tab frames the context in orange. **Start anyway** goes on. A draft left
 open asks nothing: the Start applies it.
 
+The context reaches the text model too. The notes, the look for suggestions,
+**Rewrite** and **Ask** each begin their request with it: the languages, the
+terms, the topic and anything else, that "Me" is you, and the speakers by the
+names you gave them, with a reminder that a sentence said as a hypothetical or
+an example is not a fact about them. It also names the language to write in:
+the first under **Force one**, otherwise the language heard most in the
+transcript, English when nothing is known. A transcript with no context still
+works; the model is told nothing was told. The context sits in the message
+with the transcript, so the instructions stay the same from one request to the
+next and the server can reuse them.
+
 The **Languages** are **Detect** unless you pick **Force one**:
 
 - **Detect**: the model detects each utterance's language, and the ones you
@@ -313,7 +324,7 @@ The field at the foot of the transcript, over the deck, asks the text model
 about it, while listening too. **What did I miss?** asks what was said in the last five minutes,
 **Decisions** what was decided and what is still open, **Who does what** who
 agreed to do what, each answered in the conversation's language; a question you
-type is answered in its own. Come back to the page after a minute or more away
+type is answered in the language the context names. Come back to the page after a minute or more away
 from it (another tab, another window) while it listens, and **What did I
 miss?** reads from what you had last seen instead, its button saying since
 when. While a text model serves, a time on the left of the transcript picks
@@ -342,7 +353,7 @@ notes. Pick the **kind of conversation** first; each asks for its own sections:
 
 **Write notes** sends the transcript as it stands, and the notes stream in
 under those headings, as written above; the text under them is in the
-transcript's language, a moment is pointed at as `[mm:ss]`, and a section with
+language the context names, a moment is pointed at as `[mm:ss]`, and a section with
 nothing in it is a dash. **Update notes** writes them again from the whole
 transcript, so a correction holds; **Stop** leaves the notes there were. The
 line under them says when they were written, from how many utterances, and how

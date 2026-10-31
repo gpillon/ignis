@@ -1,7 +1,8 @@
 import type { ConversationRequest, Settings } from "../api/request.ts";
-import { type AskDeps, askModel, assistRequest, settle, transcriptInput, Watched } from "./assist.ts";
+import { type AskDeps, askModel, assistRequest, settle, Watched } from "./assist.ts";
 import { clock } from "./export.ts";
 import { type MissedFrom, missedSince } from "./missed.ts";
+import { taskInput } from "./taskContext.ts";
 import { heardUntil, type Transcript, type Utterance } from "./transcript.ts";
 
 // Ask about this conversation (spec speech/07, Q139): a question about the
@@ -13,7 +14,7 @@ import { heardUntil, type Transcript, type Utterance } from "./transcript.ts";
 // pick after trying it in the Notes tab).
 
 export const ASK_TASK = [
-  "Task: answer the user's question about the conversation, from the transcript alone, briefly, in the language of the question, in Markdown.",
+  "Task: answer the user's question about the conversation, from the transcript alone, briefly, in the language the context says to write in, in Markdown.",
   "Point at the moments you draw on by their time, as [mm:ss]. When the transcript does not say, say so.",
 ].join("\n");
 
@@ -35,7 +36,7 @@ export const ASK_SETTINGS: Omit<Settings, "systemPrompt"> = {
 export type Answered = { id: number; question: string; answer: string; at: number; untilMs?: number };
 
 export function askRequest(t: Transcript, question: string, contextLimit: number | null): ConversationRequest {
-  const { content } = transcriptInput(t, contextLimit, ASK_MAX_TOKENS);
+  const { content } = taskInput(t, contextLimit, ASK_MAX_TOKENS);
   return assistRequest(ASK_SETTINGS, ASK_TASK, `${content}\nQuestion: ${question.trim()}`);
 }
 
