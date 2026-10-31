@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { clock, toSrt, toText, toVtt } from "./export.ts";
-import { toMarkdown } from "./markdown.ts";
+import { addContextImage, withReading } from "./contextImages.ts";
+import { toMarkdown, transcriptMarkdown } from "./markdown.ts";
 import { noNotes, type Notes } from "./notes.ts";
 import { addUtterance, createTranscript, editText, renameSpeaker, splitUtterance, type Transcript } from "./transcript.ts";
 
@@ -184,5 +185,18 @@ describe("the Markdown export with notes and answers", () => {
     expect(toText(t)).toBe(toText(plain));
     expect(toSrt(t)).toBe(toSrt(plain));
     expect(toVtt(t)).toBe(toVtt(plain));
+  });
+
+  it("gives Open in chat the transcript alone: the title, the start and the lines, no notes, recap, answer or picture's line", () => {
+    const plain = call();
+    let t = addContextImage({ ...plain, notes: written("work", [["Now", "x"]]), recap: written("work", [["Summary", "y"]]), asked: [answer(1, "Q?", "A.", 9_020)] }, { image: "slide", atMs: 2_000, width: 8, height: 6 }, 0);
+    t = withReading(t, 1, { shows: "A slide", topic: null, names: [], terms: [], readAt: 1 });
+    expect(transcriptMarkdown(t)).toBe(
+      ["# 25 Oct 15:42 · Call", "Started 25 Oct 2026, 15:42", "**Me** (00:01): Mi sentite bene?", "**Ada** (00:04): Sì, forte e chiaro.", "**Me** (01:01): Allora partiamo.", "**Ada** (~01:03): Va bene."].join("\n\n") + "\n",
+    );
+    // The .md keeps them all.
+    expect(toMarkdown(t)).toContain("- y");
+    expect(toMarkdown(t)).toContain("> **Q?**");
+    expect(toMarkdown(t)).toContain("[00:02] (image) A slide.");
   });
 });

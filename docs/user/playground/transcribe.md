@@ -352,7 +352,7 @@ as a file, or prints it as a [PDF](#a-pdf):
 | `.vtt` | a cue from its start to its end, `<v Speaker>text` |
 | PDF | its time, then the speaker in bold and the text, with the context images at their moments and what was read in each, and on request the notes, the context and Ask's answers (below) |
 
-The `.md` also carries what the view keeps beside the utterances. Under the title and the start come the **recap**, when the transcript has one, or else the running notes, each in its sections (`## Summary`, or `## Now` for the running notes, and so on, a section with no line shown as `—`), then a `## Transcript` heading over the utterances. Each answer Ask gave stands between the utterances at the moment it was asked, as a quoted block whose first line is the question in bold; an answer kept without a moment stands at the end. Each context image read stands at its moment as a line `[mm:ss] (image) ...` with what was read in it ([Reading it](#reading-it)), ahead of an answer asked at the same place; a picture not read yet has no line. A transcript with no notes, no answers and no picture read writes the `.md` as the table says. `.txt`, `.srt` and `.vtt` never carry notes, answers or pictures: they stay the transcript alone, so a tool reading them keeps working. Open in chat and Send to workspace use the same Markdown.
+The `.md` also carries what the view keeps beside the utterances. Under the title and the start come the **recap**, when the transcript has one, or else the running notes, each in its sections (`## Summary`, or `## Now` for the running notes, and so on, a section with no line shown as `—`), then a `## Transcript` heading over the utterances. Each answer Ask gave stands between the utterances at the moment it was asked, as a quoted block whose first line is the question in bold; an answer kept without a moment stands at the end. Each context image read stands at its moment as a line `[mm:ss] (image) ...` with what was read in it ([Reading it](#reading-it)), ahead of an answer asked at the same place; a picture not read yet has no line. A transcript with no notes, no answers and no picture read writes the `.md` as the table says. `.txt`, `.srt` and `.vtt` never carry notes, answers or pictures: they stay the transcript alone, so a tool reading them keeps working. Open in chat and Send to workspace carry the transcript alone, as this Markdown with no notes, answers or pictures.
 
 ### A PDF
 
@@ -386,10 +386,11 @@ them off there. The document is made in the page, from the transcript as it is
 in this browser: nothing is sent anywhere.
 
 **Open in chat** opens a new chat with the transcript as Markdown in its prompt
-box. Nothing is sent until you press Send: ask for a summary, the decisions,
+box, the title, the start and the utterances, without the notes, Ask's answers
+or the pictures' readings. Nothing is sent until you press Send: ask for a summary, the decisions,
 the action items.
 
-**Send to workspace** asks which workspace, a new one named after the transcript or one you already have, and adds the transcript to it as a Markdown file, the very text the `.md` download writes, so the model can read it in a chat whose workspace it is. A name the workspace already holds gets a number, as any file you add does. The transcript stays here as it was; the file is a copy, and a later correction does not reach it until you send again.
+**Send to workspace** asks which workspace, a new one named after the transcript or one you already have, and adds the transcript to it as a Markdown file, the text Open in chat carries, so the model can read it in a chat whose workspace it is. A name the workspace already holds gets a number, as any file you add does. The transcript stays here as it was; the file is a copy, and a later correction does not reach it until you send again.
 
 ## Asking about it
 

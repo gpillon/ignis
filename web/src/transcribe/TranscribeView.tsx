@@ -18,7 +18,7 @@ import { openSuggestions } from "./suggestions.ts";
 import { Switch } from "../ui/Switch.tsx";
 import { HintText } from "../speech/Dictation.tsx";
 import { fileStem, toSrt, toText, toVtt } from "./export.ts";
-import { toMarkdown } from "./markdown.ts";
+import { toMarkdown, transcriptMarkdown } from "./markdown.ts";
 import { choosePdfOptions, lastPdfOptions, type PdfOptions } from "./pdf.ts";
 import { PdfDialog, PdfPrint } from "./PrintView.tsx";
 import { StoreWorkspaceChooser } from "../workspace/WorkspaceChooser.tsx";
@@ -566,7 +566,7 @@ function Exports({ transcript: t, onOpenInChat, workspaces }: { transcript: Tran
         type="button"
         disabled={nothing}
         title="A new chat opens with the transcript in its prompt box. Nothing is sent until you press Send."
-        onClick={() => onOpenInChat(toMarkdown(t))}
+        onClick={() => onOpenInChat(transcriptMarkdown(t))}
         className="px-1.5 font-display text-[13px] font-semibold text-ember hover:underline disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:no-underline"
       >
         Open in chat

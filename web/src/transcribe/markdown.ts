@@ -14,8 +14,8 @@ function answerBlock(a: Answered): string {
 }
 
 /**
- * `.md`, and what Open in chat seeds the composer with: the title and the start, then the notes (the recap when
- * there is one, else the running notes) in their sections, then `**Speaker** (mm:ss): text` with each of Ask's
+ * `.md`: the title and the start, then the notes (the recap when there is one, else the running notes) in their
+ * sections, then `**Speaker** (mm:ss): text` with each of Ask's
  * answers as a quoted block, titled by its question, after the utterances it read (an answer with no place, at the
  * foot), and each context image read as a line `[mm:ss] (image) ...` with what was read, at its moment, ahead of an
  * answer at the same place. With neither notes, answers nor images read it is the title, the start and the lines.
@@ -40,3 +40,10 @@ export function toMarkdown(t: Transcript): string {
   asidesAt(t.utterances.length);
   return `${[...header, ...(notes === "" ? [] : [notes, ...(body.length > 0 ? ["## Transcript"] : [])]), ...body].join("\n\n")}\n`;
 }
+
+/**
+ * The transcript alone as Markdown, what Open in chat seeds the composer with and Send to workspace files: the `.md`
+ * of the title, the start and the lines, without the notes, Ask's answers or the context images' lines, which stay
+ * out of a chat (spec #428, Out of Scope).
+ */
+export const transcriptMarkdown = (t: Transcript): string => toMarkdown({ ...t, notes: undefined, recap: undefined, asked: undefined, images: undefined });
