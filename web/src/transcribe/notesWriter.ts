@@ -170,7 +170,7 @@ export class NotesWriter extends Watched<NotesWriterState> {
       const request: ConversationRequest = { settings, turns: thread.turns, extras };
       const calls: ToolCall[] = [];
       const results: Turn[] = [];
-      let unchanged = 0;
+      let changed = false;
       let prompt: number | null = null;
       const asked = await askModel(request, abort.signal, this.deps, undefined, {
         streamId: streamOf(t.id),
@@ -184,14 +184,14 @@ export class NotesWriter extends Watched<NotesWriterState> {
           const applied = applyCall(before, kind, call);
           calls.push(call);
           results.push({ role: "tool", content: applied.result, toolCallId: call.id });
-          if (applied.outcome === "unchanged") unchanged++;
           if (applied.outcome !== "applied") return;
-          const changed = stamp(now(), started.fromMs);
-          working.notes = changed(applied.notes);
+          changed = true;
+          const stamped = stamp(now(), started.fromMs);
+          working.notes = stamped(applied.notes);
           thread = { ...thread, lines: afterCall(thread.lines, before, applied.notes) };
           this.deps.onNotes(t.id, (n) => {
             const there = applyCall(n ?? noNotes(kind), kind, call);
-            return there.outcome === "applied" ? changed(there.notes) : there.notes;
+            return there.outcome === "applied" ? stamped(there.notes) : there.notes;
           });
         },
       });
@@ -206,8 +206,10 @@ export class NotesWriter extends Watched<NotesWriterState> {
       const turns = [...thread.turns, answer, ...results];
       thread = { ...thread, turns, promptTokens: prompt ?? Math.ceil((settings.systemPrompt.length + turns.reduce((n, turn) => n + turn.content.length, 0)) / CHARS_PER_TOKEN) };
       if (calls.length === 0) break;
-      // Rounds that change nothing, in a row, end the update; past the cap, what is left goes to the next one.
-      idle = unchanged === calls.length ? idle + 1 : 0;
+      // Rounds that change nothing, in a row, end the update; past the cap, what is left goes to the next one. A round
+      // changes nothing when none of its calls did, unchanged or refused alike: counting only the unchanged, the
+      // replay's model resent a refused rewrite until the round cap (docs/findings/2026-10-31-running-notes-recap-and-full-rewrite.md).
+      idle = changed ? 0 : idle + 1;
       if (idle >= RUNNING_NOTES.idleRounds) break;
     }
     this.abort = null;

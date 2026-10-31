@@ -173,7 +173,11 @@ export function applyCall(notes: Notes, kind: NoteKind, call: ToolCall): Applied
         const fits = text !== "" && [...text].length <= RUNNING_NOTES.lineChars;
         if (fits && !texts.some((t) => same(t, text)) && !theirs.some((l) => same(l.text, text)) && !removedFrom(notes, section.name, text)) texts.push(text);
       }
-      if (texts.length > section.cap) return refused(`Refused: ${texts.length} lines; ${section.name} holds ${section.cap} at most.`);
+      // The refusal says what to do: told only the cap, the replay's model sent the same rewrite until the round cap
+      // (docs/findings/2026-10-31-running-notes-recap-and-full-rewrite.md).
+      if (texts.length > section.cap) {
+        return refused(`Refused: ${texts.length} lines; ${section.name} holds ${section.cap} at most. Send ${section.cap} or fewer: merge lines that belong together, or drop the least useful.`);
+      }
       const old = theModels(notes, section.name);
       if (old.length < section.cap) {
         return refused(`Refused: ${section.name} has ${counted(old.length)}, not ${section.cap}: change single lines. rewrite_section is for a full section.`);

@@ -198,7 +198,7 @@ export const RUNNING_NOTES = {
   restartTokens: 64_000,
   /** The requests one update makes at most; what is left goes to the next update. */
   maxRounds: 6,
-  /** Rounds in a row that change nothing before an update ends. */
+  /** Rounds in a row that change nothing (each call unchanged or refused) before an update ends. */
   idleRounds: 2,
   /** The longest line, in characters: a longer one is refused. */
   lineChars: 240,

@@ -137,6 +137,37 @@ describe("the notes thread", () => {
     expect(w.getState().writing).toBeNull();
   });
 
+  it("counts a round whose calls were refused, or not JSON, as one that changed nothing", async () => {
+    // A section the model will not cut below its cap: the same over-cap rewrite again and again, then arguments cut short.
+    const overCap = (id: string) => call(id, "rewrite_section", { section: "Now", lines: ["Il budget.", "Le date."] });
+    const { w, fake, held } = writer([
+      { events: [call("c1", "add_line", { section: "Now", text: "Il budget." })] },
+      { events: [overCap("c2")] },
+      { events: [overCap("c3"), { kind: "tool_call", call: { id: "c4", name: "add_line", arguments: '{"section": "Now"' } }] },
+      { events: [overCap("c5")] },
+    ]);
+    await w.write(held(heard(3)), "work", null);
+    expect(fake.asked).toHaveLength(3);
+    expect(turnsOf(fake.asked, 2).filter((turn) => turn.role === "tool").map((turn) => turn.content)).toEqual([
+      "Added N1 to Now.",
+      "Refused: 2 lines; Now holds 1 at most. Send 1 or fewer: merge lines that belong together, or drop the least useful.",
+    ]);
+    expect(w.getState().writing).toBeNull();
+  });
+
+  it("counts a round that changed a line as one that did, whatever else it refused", async () => {
+    const { w, fake, held } = writer([
+      { events: [call("c1", "add_line", { section: "Decisions", text: "Si parte." })] },
+      { events: [call("c2", "add_line", { section: "Decisions", text: "Si parte." }), call("c3", "add_line", { section: "Now", text: "Il budget." })] },
+      { events: [call("c4", "add_line", { section: "Now", text: "Le date." })] },
+      { events: [call("c5", "add_line", { section: "Now", text: "Le date." })] },
+      {},
+    ]);
+    await w.write(held(heard(3)), "work", null);
+    // Refused, applied with a refusal, refused, refused: the last two end the update.
+    expect(fake.asked).toHaveLength(4);
+  });
+
   it("ends an update at the round cap, and what is left goes to the next one", async () => {
     const add = (n: number) => ({ events: [call(`c${n}`, "add_line", { section: "Figures & dates", text: `${n}0k di budget.` })] });
     const { w, fake, page, held } = writer([1, 2, 3, 4, 5, 6, 7].map(add));
@@ -202,7 +233,7 @@ describe("the page's guards", () => {
       "Refused: the text is empty; remove_line removes a line.",
       "Refused: Now is full (1 line). Rewrite it with rewrite_section, merging what belongs together and folding this in.",
       "Refused: People has 2 lines, not 20: change single lines. rewrite_section is for a full section.",
-      "Refused: 2 lines; Now holds 1 at most.",
+      "Refused: 2 lines; Now holds 1 at most. Send 1 or fewer: merge lines that belong together, or drop the least useful.",
       "Refused: N2 is the user's: leave it as it is.",
       "Refused: N2 is the user's: leave it as it is.",
       "Refused: the user removed that line from People; never write it again.",
