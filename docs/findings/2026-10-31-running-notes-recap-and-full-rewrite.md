@@ -132,7 +132,7 @@ where the owner can):
 
 - **AMI, the last full rewrite (A)** lists a decision that was not taken
   ("the product will use lightweight plastic rather than metal": a suggestion
-  at 15:59, never agreed) and gives the PowerPoint to Me, where the
+  at 15:59, never agreed) and gives the next presentation to Me, where the
   transcript's line at 16:12 is labelled Speaker 4. **The recap (C)** has two
   decisions, both taken (the 30-minute break, an international market), the
   same four people, five real figures, and the open questions the call left.
