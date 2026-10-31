@@ -735,20 +735,12 @@ impl Request {
         // core-07: the re-prefilled stream starts over — the old prefix
         // claim (released by the caller) is stale; a fresh prefill may
         // re-claim a live entry.
-        self.prefix_entry = None;
-        self.prefix_publisher = None;
-        self.shared_prefix_tokens = 0;
-        self.prefix_reuse = None;
-        self.shared_pages = 0;
         // GitHub #186: so is the retained-checkpoint claim, and for the same
         // reason — the pages and the image it resumed from were released with
         // the entry the caller let go of. `checkpoint_captured` is *not*
         // reset: whatever this request already retained is a real entry in
         // the pool, which a re-prefill must not duplicate.
-        self.checkpoint_publisher = None;
-        self.checkpoint_entry = None;
-        self.checkpoint_tokens = 0;
-        self.reuse_source = None;
+        self.forget_claim();
         // GitHub #190: so is whatever a materialized blob restored — the
         // caller released the KV-RAM claim, and the sequence is gone.
         self.kv_ram_claim = None;
@@ -774,6 +766,45 @@ impl Request {
         self.reasoning_redirected_at = None;
         self.forced_state = crate::forced_literal::ForcedState::default();
         true
+    }
+
+    /// Give up the device claim of a request still waiting for its admission
+    /// (GitHub #445, ADR 0045 as amended 2026-10-31): back to claiming
+    /// nothing, with its whole bound to reserve and its prefill to start at
+    /// the first token, so it looks again for state to resume from when it
+    /// next comes up. The caller released its reference on the prefix it
+    /// claimed; a device claim has told the backend nothing yet.
+    pub fn give_up_claim(&mut self) {
+        debug_assert!(
+            self.state == RequestState::Admitted && !self.resident,
+            "only a request waiting for its admission gives a claim up"
+        );
+        self.resources.kv_pages += self.shared_pages;
+        self.forget_claim();
+        self.prefill_progress = 0;
+        self.gdn = GdnState::new();
+    }
+
+    /// Forget what this request claimed to resume from (a shared prefix, a
+    /// retained checkpoint), whose holds the caller has released: what
+    /// [`Self::requeue`] and [`Self::give_up_claim`] both reset.
+    fn forget_claim(&mut self) {
+        self.prefix_entry = None;
+        self.prefix_publisher = None;
+        self.shared_prefix_tokens = 0;
+        self.prefix_reuse = None;
+        self.shared_pages = 0;
+        self.checkpoint_publisher = None;
+        self.checkpoint_entry = None;
+        self.checkpoint_tokens = 0;
+        self.reuse_source = None;
+    }
+
+    /// Whether this request is a newcomer still waiting for its entry onto
+    /// the device (ADR 0045): admitted, and neither on the device, on its way
+    /// there from the disk, nor cancelled.
+    pub fn waits_to_enter(&self) -> bool {
+        self.state == RequestState::Admitted && !self.resident && !self.moving && !self.cancelled
     }
 
     /// Record a GDN checkpoint / frontier boundary at `position` (core-02):

@@ -573,6 +573,16 @@ struct MovedSequence {
     ready: bool,
 }
 
+/// What a pass of the first-victim path may give up for room (GitHub #445).
+#[derive(Debug, Clone, Copy)]
+enum GiveUp {
+    /// Retained state, and nothing else.
+    RetainedState,
+    /// Retained state, then the claims of the requests waiting below an
+    /// entry of this rank (ADR 0045 as amended 2026-10-31).
+    ClaimsBelow(Rank),
+}
+
 /// The room held on the device for entries that have not come in yet (ADR
 /// 0045's entry rule): their reservations and a resident slot each.
 #[derive(Debug, Clone, Copy, Default)]
@@ -1134,14 +1144,7 @@ impl ConcreteScheduler {
             .requests
             .iter()
             .enumerate()
-            .filter(|(_, r)| {
-                r.state == RequestState::Admitted
-                    && !r.resident
-                    && !r.moving
-                    && !r.cancelled
-                    && r.prefix_entry.is_some()
-                    && rank.outranks(&Self::rank_of(r))
-            })
+            .filter(|(_, r)| r.waits_to_enter() && r.prefix_entry.is_some() && rank.outranks(&Self::rank_of(r)))
             .map(|(i, _)| i)
             .collect();
         claims.sort_by(|&a, &b| Rank::entry_order(&Self::rank_of(&self.requests[b]), &Self::rank_of(&self.requests[a])));
@@ -1214,19 +1217,7 @@ impl ConcreteScheduler {
     fn release_waiting_claim(&mut self, idx: usize) {
         let entry = self.requests[idx].prefix_entry;
         self.release_prefix_claim(entry);
-        let r = &mut self.requests[idx];
-        r.resources.kv_pages += r.shared_pages;
-        r.prefix_entry = None;
-        r.prefix_publisher = None;
-        r.shared_prefix_tokens = 0;
-        r.prefix_reuse = None;
-        r.shared_pages = 0;
-        r.checkpoint_publisher = None;
-        r.checkpoint_entry = None;
-        r.checkpoint_tokens = 0;
-        r.reuse_source = None;
-        r.prefill_progress = 0;
-        r.gdn = crate::gdn::GdnState::new();
+        self.requests[idx].give_up_claim();
     }
 
     /// The KV pages a checkpoint at `tokens` holds of its own: the page its
@@ -1673,7 +1664,7 @@ impl ConcreteScheduler {
         // Pages first: a slot is taken — and retained state given up for
         // one — only once the prefix is known to fit.
         let fits = self
-            .reclaim_retained_until(|s| s.kv_used_pages + pages <= s.capacity.kv_pages, None, events)
+            .reclaim_retained_until(|s| s.kv_used_pages + pages <= s.capacity.kv_pages, GiveUp::RetainedState, events)
             && self.take_retained_slot(holder, events).is_some_and(|slot| {
                 self.compute
                     .restore_prefix(spilled.publisher, spilled.length_tokens, slot)
@@ -1953,22 +1944,22 @@ impl ConcreteScheduler {
     /// work is disturbed, so a retained entry can never cause a live request
     /// to be refused, evicted or made to wait. Returns whether `idx` fits now.
     fn reclaim_retained(&mut self, idx: usize, events: &mut Vec<SchedEvent>) -> bool {
-        self.reclaim_retained_until(|s| s.fits_for_materialization(&s.requests[idx]), None, events)
+        self.reclaim_retained_until(|s| s.fits_for_materialization(&s.requests[idx]), GiveUp::RetainedState, events)
     }
 
     /// [`Self::reclaim_retained`] until `fits` holds (GitHub #190: a prefix
     /// coming back from KV-RAM needs pages without being a request).
     ///
-    /// GitHub #445 (ADR 0045 as amended 2026-10-31): with `below`, an entry of
-    /// that rank, and once retained state alone has given up all it can, the
-    /// waiting claims below it go, lowest-ranked first: a bet its request has
-    /// not cashed yet is still a bet. The caller names the rank only once
-    /// [`Self::pages_given_up_for`] says the two make the room, so a claim
-    /// never goes for nothing.
+    /// GitHub #445 (ADR 0045 as amended 2026-10-31): with
+    /// [`GiveUp::ClaimsBelow`] an entry's rank, and once retained state alone
+    /// has given up all it can, the waiting claims below it go, lowest-ranked
+    /// first: a bet its request has not cashed yet is still a bet. The caller
+    /// names the rank only once [`Self::pages_given_up_for`] says the two make
+    /// the room, so a claim never goes for nothing.
     fn reclaim_retained_until(
         &mut self,
         fits: impl Fn(&Self) -> bool,
-        below: Option<Rank>,
+        give_up: GiveUp,
         events: &mut Vec<SchedEvent>,
     ) -> bool {
         loop {
@@ -2014,7 +2005,11 @@ impl ConcreteScheduler {
             // up the checkpoints standing on it *and then* the retention,
             // which is the only sequence that returns those pages at all.
             let Some(prefix) = self.prefix.lru_retained() else {
-                if let Some(idx) = below.and_then(|rank| self.waiting_claim_to_give_up(rank)) {
+                let claim = match give_up {
+                    GiveUp::ClaimsBelow(rank) => self.waiting_claim_to_give_up(rank),
+                    GiveUp::RetainedState => None,
+                };
+                if let Some(idx) = claim {
                     self.release_waiting_claim(idx);
                     continue;
                 }
@@ -3124,7 +3119,7 @@ impl ConcreteScheduler {
                 .add(needed)
                 .sub(&given_up)
                 .is_none_or(|after| after.fits(&self.capacity))
-                && self.reclaim_retained_until(need_fits, Some(rank), events)
+                && self.reclaim_retained_until(need_fits, GiveUp::ClaimsBelow(rank), events)
             {
                 return true;
             }
@@ -3174,7 +3169,7 @@ impl ConcreteScheduler {
             }
             // GitHub #444: what held the victim's chain beside it is retained
             // state now, given up first as ever (ADR 0029).
-            self.reclaim_retained_until(need_fits, None, events);
+            self.reclaim_retained_until(need_fits, GiveUp::RetainedState, events);
         }
     }
 
@@ -3246,8 +3241,8 @@ impl ConcreteScheduler {
             }
             let above = self.waiting_above(moved.rank);
             match moved.below {
-                Below::KvRam => self.restore_from_kv_ram(moved.rank.request_id, above, events),
-                Below::Disk => self.restore_from_disk(moved.rank.request_id, above, events),
+                Below::KvRam => self.restore_from_kv_ram(moved.rank, above, events),
+                Below::Disk => self.restore_from_disk(moved.rank, above, events),
             }
         }
     }
@@ -3302,13 +3297,7 @@ impl ConcreteScheduler {
         let newcomers = self
             .requests
             .iter()
-            .filter(|r| {
-                r.state == RequestState::Admitted
-                    && !r.resident
-                    && !r.moving
-                    && !r.cancelled
-                    && Self::rank_of(r).outranks(&rank)
-            })
+            .filter(|r| r.waits_to_enter() && Self::rank_of(r).outranks(&rank))
             .map(|r| r.resources.kv_pages);
         moved.chain(newcomers).fold(EntryRoom::default(), |room, pages| EntryRoom {
             pages: room.pages + pages,
@@ -3336,7 +3325,7 @@ impl ConcreteScheduler {
         if self.kv_used_pages + pages > self.capacity.kv_pages + self.pages_given_up_for(rank) {
             return false;
         }
-        self.reclaim_retained_until(fits, Some(rank), events)
+        self.reclaim_retained_until(fits, GiveUp::ClaimsBelow(rank), events)
     }
 
     /// Bring `request`'s live snapshot back from KV-RAM when it can enter
@@ -3344,11 +3333,11 @@ impl ConcreteScheduler {
     /// (GitHub #309), charged now -- pages, resident slot, its lane -- and
     /// schedulable when it lands. One move onto the device at a time. A blob
     /// that fails to restore is dropped and its request re-prefills.
-    fn restore_from_kv_ram(&mut self, request: RequestId, above: EntryRoom, events: &mut Vec<SchedEvent>) {
+    fn restore_from_kv_ram(&mut self, rank: Rank, above: EntryRoom, events: &mut Vec<SchedEvent>) {
         if self.moving_in() {
             return;
         }
-        let Some(victim) = self.host.entry(request).cloned() else {
+        let Some(victim) = self.host.entry(rank.request_id).cloned() else {
             return;
         };
         if victim.resume_phase == ResumePhase::Running && self.free_lanes.is_empty() {
@@ -3356,10 +3345,6 @@ impl ConcreteScheduler {
         }
         // The restored request's resident slot + pages must fit the GPU pool
         // either way.
-        let rank = Rank {
-            class: victim.owner,
-            request_id: victim.request,
-        };
         if !self.make_entry_room(victim.pages, above, rank, events) {
             return; // no room: leave it (retry next advance)
         }
@@ -3766,20 +3751,16 @@ impl ConcreteScheduler {
     /// and schedulable when it lands. One restore at a time: while another is
     /// in flight it waits. A file that cannot be read loses its request's
     /// state.
-    fn restore_from_disk(&mut self, request: RequestId, above: EntryRoom, events: &mut Vec<SchedEvent>) {
+    fn restore_from_disk(&mut self, rank: Rank, above: EntryRoom, events: &mut Vec<SchedEvent>) {
         if self.moving_in() {
             return;
         }
-        let Some(victim) = self.disk.as_ref().and_then(|disk| disk.held().entry(request).cloned()) else {
+        let Some(victim) = self.disk.as_ref().and_then(|disk| disk.held().entry(rank.request_id).cloned()) else {
             return;
         };
         if victim.resume_phase == ResumePhase::Running && self.free_lanes.is_empty() {
             return;
         }
-        let rank = Rank {
-            class: victim.owner,
-            request_id: victim.request,
-        };
         if !self.make_entry_room(victim.pages, above, rank, events) {
             return;
         }
