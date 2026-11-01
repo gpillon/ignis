@@ -6,7 +6,7 @@
 - Last verified: 2026-09-24
 - Scope: kernel / vendored NVFP4 SwiGLU, W4A4 TMA GEMM, RMSNorm and hq-e8-2b prompt scratch; DFlash2 proposal head
 - Related: [ADR 0031](../adr/0031-vendored-kernel-bottleneck-exemption.md),
-  [upstream perf survey](2026-09-18-ninfer-upstream-perf-survey.md) (branch `ninfer-upstream-survey`),
+  [upstream perf survey](2026-09-18-ninfer-upstream-perf-survey.md),
   [Decode round anatomy](2026-09-18-decode-round-anatomy.md),
   [hq vs BF16 decode cost](2026-09-13-hq-vs-bf16-decode-cost.md)
 - Superseded by: none
