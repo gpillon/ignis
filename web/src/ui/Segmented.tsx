@@ -17,7 +17,9 @@ export function Segmented<T extends string>(props: {
 }) {
   const disabled = props.disabled ?? false;
   return (
-    <fieldset className="flex flex-col gap-2" disabled={disabled}>
+    // Relative: the hidden legend is `position: absolute`, and with no box of its own to sit in it is the page's, which
+    // a scrolling container does not clip, so a row below the fold scrolled the whole page.
+    <fieldset className="relative flex flex-col gap-2" disabled={disabled}>
       <legend className={props.legendHidden ? "sr-only" : `${caption} mb-2`}>{props.legend}</legend>
       <div className={`flex border border-line bg-surface p-0.5 ${disabled ? "opacity-50" : ""}`}>
         {props.options.map((o) => (
