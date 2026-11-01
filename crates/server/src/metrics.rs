@@ -1332,7 +1332,7 @@ impl Metrics {
             ),
             (
                 "ignis_retained_state_hits_total",
-                "Retained state chosen to resume from or brought back, by residency tier.",
+                "Retained state a request resumed from, by residency tier.",
                 &self.retained_state_hits,
             ),
             // Each `kind` is its own lookup's (GitHub #216, #222): the

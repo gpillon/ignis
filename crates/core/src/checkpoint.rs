@@ -225,9 +225,12 @@ impl TiersByKind {
 /// What happened to retained state in one residency tier (GitHub #190) — the
 /// lifecycle facts the scheduler reports, each a count of one:
 ///
-/// - **Hit**: a request chose retained state in this tier to resume
-///   from — a checkpoint (chosen, not yet restored: its prefill has not
-///   run), or a retained prefix brought back from KV-RAM for it.
+/// - **Hit**: a request resumed from retained state in this tier — a
+///   checkpoint, or a retained prefix, one brought back from KV-RAM for it
+///   included. Counted with the chunk that lands the claim, as a miss is
+///   (GitHub #445): a claim given up while its request waits for room, or
+///   whose prefill never lands, is no hit, and a claim chosen again counts
+///   once.
 /// - **Miss**: a request's first chunk landed with no checkpoint in this tier
 ///   matching its prompt, or, for a prefix, no retained prefix (a live
 ///   sibling's head is none; GitHub #222). Counted at the chunk rather than
@@ -237,8 +240,8 @@ impl TiersByKind {
 ///   written into this tier.
 /// - **Discard**: a checkpoint or retained prefix left this tier for nowhere.
 /// - **Restore**: a claimant's prefill landed on a checkpoint from this tier,
-///   or a retained prefix was brought back from it. A hit whose prefill never
-///   lands is a hit without a restore.
+///   or a retained prefix was brought back from it. A prefix brought back for
+///   a claim that never lands is a restore without a hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetainedStateOperation {
     Hit,

@@ -41,7 +41,7 @@ ignis_retained_reused_tokens_total{tier="device",kind="checkpoint"} 41200
 ignis_retained_reused_tokens_total{tier="device",kind="prefix"} 9800
 ignis_retained_reused_tokens_total{tier="kv_ram",kind="checkpoint"} 6400
 ignis_retained_reused_tokens_total{tier="kv_ram",kind="prefix"} 0
-# HELP ignis_retained_state_hits_total Retained state chosen to resume from or brought back, by residency tier.
+# HELP ignis_retained_state_hits_total Retained state a request resumed from, by residency tier.
 # TYPE ignis_retained_state_hits_total counter
 ignis_retained_state_hits_total{tier="device",kind="checkpoint"} 18
 ignis_retained_state_hits_total{tier="device",kind="prefix"} 7

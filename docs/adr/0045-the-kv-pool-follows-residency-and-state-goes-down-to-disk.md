@@ -124,7 +124,65 @@ cover moved nothing and waited behind a request that could have moved: every
 moved a window at a time, the need waiting through the move and met in the
 advance it lands; `crates/core/tests/live_moves.rs` pins them moved on the
 synchronous path in the advance their need arrives, and no move for pages a
-live claimant or a claimed checkpoint still needs.
+live claimant still needs.
+
+**Amended 2026-10-31 *(agent proposal, coordinator decision 2026-10-31, #445)*.**
+A request waiting for its admission holds what it claimed: a reference on the
+shared prefix it resumes from, and the device checkpoint it chose, tail page
+included, until its first chunk copies it. That room was neither retained
+state, which is given up, nor a live sequence, which moves. An entry ranked
+above the claimant that needed it waited for it, the claimant waited behind
+that entry, and nothing ran again: an admission, or a moved sequence that
+could not come back.
+
+- **A waiting claim is a bet not yet cashed, and goes as retained state goes,
+  for an entry that outranks its claimant.** An admission, or a moved sequence
+  coming back, counts the pages the claims below it hold as reclaimable, after
+  retained state. Retained state goes first, then the claims, the
+  lowest-ranked claimant first, each only if its going gives pages back:
+  alone, or, where claims stand together on a link, with the others below the
+  entry. A claim on a live sibling's prefix, or on a block that a checkpoint
+  another claim keeps chains over, frees nothing and stays. ADR 0029's
+  "retained state never delays or refuses an admission" now holds of what a
+  waiting request claimed from it too.
+- **Only when that makes the room.** Retained state, the claims below the
+  entry and, on an admission, the moves it may make must cover the need
+  together; otherwise nothing is given up, as `make_room` moves nothing that
+  would not make the whole room. No claim goes for an entry that would wait
+  anyway, and a claim that would make the room alone goes before anything
+  moves.
+- **Rank gates it, as it gates a move.** A claim goes only for an entry that
+  ranks above its claimant: a moved sequence never takes the claim of a
+  waiting request above it, whose room it already leaves. A need that fits
+  takes no claim, and no request enters ahead of a higher-ranked one.
+- **The claimant starts over.** Its reservation is its whole bound again, and
+  it looks again for state to resume from when it next comes up: the
+  checkpoint it chose, retained state again, may have gone to KV-RAM, from
+  where it comes back past the restore floor, or it prefills. Its claim has
+  reported nothing: a claim reports its reuse, its tokens and its hit with the
+  chunk that lands it, so `cached_tokens`, the request log's reuse and the hit
+  count say only what the request resumed from.
+- **A move counts it too.** A victim's chain counts the links only retained
+  state and such claims hold beside it, and the pages the claims give up off
+  it count beside the chain, so an Interactive need moves an Agent whose
+  checkpoint a lower-ranked request claimed. This narrows #444's walk: the
+  claimant of a checkpoint not yet built from ends it only when it does not
+  rank below the requester, and a live claimant always does.
+- **The count is exact over chains.** What retained state and the claims give
+  back is every link that nothing else holds once they all let go, a head two
+  claims reach through links of their own included, so a device that holds
+  only retained state and waiting claims always gives one bound its room: a
+  sequence alone still always fits. It is read only on an advance where an
+  entry is short of pages after retained state was given up.
+
+`crates/core/tests/live_moves.rs` pins the claim yielding to an admission with
+a move and without one, a claim on a retained prefix as on a checkpoint, and to
+a moved sequence coming back from KV-RAM and from the disk; never to an entry
+below its claimant; not for a need that fits; never a claim whose going frees
+nothing, and two that free a block only together both going. #444's test that cancelled
+the claimant to get past the hang no longer cancels it.
+`crates/core/tests/kv_ram_windowed_moves.rs` pins the claim going in the
+advance a move a window at a time lands.
 
 Sources: [Flash-Next on the 5090](../findings/2026-10-06-flash-next-on-the-5090.md)
 (its 2026-10-07 update: lanes at 262K), the F: disk bench

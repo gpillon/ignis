@@ -46,7 +46,7 @@ const VRAM_LINES: [string, number][] = [
 const SKIP_REASONS = ["publish_skipped_no_slot", "capture_skipped_no_slot", "capture_skipped_no_page"] as const;
 const RETAINED_FAMILIES: [string, string][] = [
   ["ignis_retained_reused_tokens_total", "Cumulative tokens skipped through retained state, by residency tier."],
-  ["ignis_retained_state_hits_total", "Retained state chosen to resume from or brought back, by residency tier."],
+  ["ignis_retained_state_hits_total", "Retained state a request resumed from, by residency tier."],
   ["ignis_retained_state_misses_total", "Prefill runs whose first chunk landed with no retained checkpoint, or no retained prefix, matching in the tier (a re-queued request counts again)."],
   ["ignis_retained_state_spills_total", "Retained checkpoints and prefixes spilled into the tier."],
   ["ignis_retained_state_discards_total", "Retained checkpoints and prefixes discarded from the tier."],

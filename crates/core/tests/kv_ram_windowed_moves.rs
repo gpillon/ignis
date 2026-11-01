@@ -697,3 +697,46 @@ fn a_windowed_move_frees_the_pages_an_agent_lent_to_a_link_once_it_lands() {
     // link, which only A holds then, drops with A.
     a_windowed_move_frees_the_chain(SchedulerConfig { opener_page_rides_capture: true, ..reuse_pool() }, agent_image_turn());
 }
+
+// ── GitHub #445: a waiting claim yields once the move it waits on lands ─────
+
+#[test]
+fn a_waiting_claim_yields_in_the_advance_the_move_it_waits_on_lands() {
+    // R continues A's conversation as an Agent: it claimed A's checkpoint,
+    // which holds the four pages under it and its tail page, and waits for
+    // room behind A. I needs 63 of the 64 pages: A's reservation, its chain
+    // and the tail page cover it once R's claim, ranked below I, lets go.
+    // A's move goes a window at a time, and while it is in flight R keeps
+    // its claim, since nothing it holds would be room yet. In the advance
+    // the move lands the claim and the checkpoint go, and I takes its pages.
+    let compute = windowed(4);
+    let mut run = Run::new(reuse_pool(), compute.clone());
+    let a = run.submit(agent_turn(), RequestClass::Agent);
+    run.steps(4);
+    let r = run.submit(input((1..67).chain(700..710).collect(), 700), RequestClass::Agent); // 49 pages
+    run.step();
+    assert_eq!(run.state(r), Some(RequestState::Admitted), "R waits for room");
+    assert!(run.sched.shared_prefix_of(r).is_some(), "R holds the pages under A's checkpoint");
+
+    let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
+    run.step();
+    assert_eq!(compute.kv_ram_moves_started(), vec![(a, true)], "I's need started A's move");
+    while !run.evicted(a) {
+        assert!(run.sched.shared_prefix_of(r).is_some(), "R's claim stays while A's move is in flight");
+        assert_eq!(run.state(i), Some(RequestState::Admitted), "I waits for the room");
+        run.step();
+    }
+    let landed = run.first(|e| matches!(e, SchedEvent::Evicted { request, .. } if *request == a)).unwrap();
+    assert_eq!(
+        run.first(|e| matches!(e, SchedEvent::PrefillChunk { request, .. } if *request == i)),
+        Some(landed),
+        "I took its pages in the advance A's move landed in"
+    );
+    assert!(run.sched.shared_prefix_of(r).is_none(), "R's claim went for them");
+    assert_eq!(compute.kv_ram_moves_started(), vec![(a, true)], "nothing else moved for I");
+    run.to_idle();
+    for (r, max) in [(a, 300), (i, 1000), (r, 700)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}

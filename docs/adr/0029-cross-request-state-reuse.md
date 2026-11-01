@@ -11,6 +11,10 @@ prefix image as well as checkpoint images — not a byte ledger over
 request-time allocations.
 **Amended 2026-10-07 by ADR 0045**: Tier 2 (KV-disk) is built — see the
 amendment at the end.
+**Amended 2026-10-31 by ADR 0045 (#445)**: what a request still waiting for
+its admission claimed of retained state on the device goes as retained state
+goes, for an entry ranked above it, and a claim reports its reuse and its hit
+only once it lands — see ADR 0045's amendment of that date.
 
 ## Context
 
@@ -57,7 +61,8 @@ That turn-opening checkpoint is the only one a new user message can still
 match once history drops the earlier thinking.
 
 **Retained state is free until the room is needed.** On the device it is
-always the first victim, and it never delays or refuses an admission. Its
+always the first victim, and it never delays or refuses an admission (nor does
+what a waiting request claimed of it: amended by ADR 0045, #445). Its
 mutable images live in a device pool reserved at load (retained slots, ADR 0030); when that pool is
 exhausted, a checkpoint is simply not taken. KV-RAM receives it lazily, only
 when the device would otherwise discard it, and discards it before any
@@ -220,7 +225,8 @@ What building Tier 1 decided that the Decision left open.
 - **Lifecycle facts.** Hit (chosen), miss (first chunk landed with no match in
   a tier), spill, discard and restore (landed) are emitted by the core, one
   per event, per tier, identically with metrics on or off (ADR 0017 as
-  amended by #190).
+  amended by #190). Since #445 a hit is counted when the claim lands, beside
+  its restore, not when it is chosen (ADR 0045 as amended 2026-10-31).
 
 ## Amendment (2026-09-16) — multimodal prompts (#193)
 

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
 use ignis_core::disk::disk_file_bytes;
 use ignis_core::host::{RetainedBlob, Tier};
-use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
+use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, RequestState, SchedEvent};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
 
 /// What the mock charges a KV-RAM blob: one nominal byte in this suite's own
@@ -606,7 +606,9 @@ fn a_kv_ram_restore_is_promoted_only_when_it_lands() {
     let n1 = sched.submit(next_turn_at(1), RequestClass::Interactive).unwrap();
     compute.fail_prefill(n1);
     let events = sched.advance();
-    assert_eq!(count(&events, RetainedStateOperation::Hit, ReuseSource::KvRam), 1, "chosen");
+    // GitHub #445: a hit is what a request resumed from, counted with the
+    // chunk that lands it, so a chunk that failed counts none.
+    assert_eq!(count(&events, RetainedStateOperation::Hit, ReuseSource::KvRam), 0, "chosen, not resumed from");
     assert_eq!(count(&events, RetainedStateOperation::Restore, ReuseSource::KvRam), 0);
     assert_eq!(
         sched.host().retained(blob).unwrap().tier,
@@ -618,8 +620,8 @@ fn a_kv_ram_restore_is_promoted_only_when_it_lands() {
     assert_eq!(reuses(&events, n1), vec![(ReuseSource::KvRam, 1150)], "the retry landed it");
     assert_eq!(
         count(&events, RetainedStateOperation::Hit, ReuseSource::KvRam),
-        0,
-        "the retry keeps the claim it had rather than choosing again"
+        1,
+        "the retry keeps the claim it had, and landing it is the one hit"
     );
     assert_eq!(count(&events, RetainedStateOperation::Restore, ReuseSource::KvRam), 1);
     assert_eq!(sched.host().retained(blob).unwrap().tier, Tier::Protected);
@@ -830,8 +832,8 @@ fn a_burst_block_the_device_gave_up_comes_back_once_and_the_burst_shares_it() {
     assert_eq!(count(&events, RetainedStateOperation::Hit, ReuseSource::KvRam), 1);
     assert_eq!(count(&events, RetainedStateOperation::Restore, ReuseSource::KvRam), 1);
     assert_eq!(prefix_reuses(&events, second), vec![(BIG_BLOCK, true)]);
-    // GitHub #325: one restore, one hit -- the `kv_ram` one `return_prefix`
-    // raised -- and the claim that follows it adds none on the device.
+    // GitHub #325: one restore, one hit -- in `kv_ram`, where the claim
+    // landed found it (#445) -- and none on the device.
     assert_eq!(count_kind(&events, RetainedStateOperation::Hit, ReuseSource::Device, RetainedKind::Prefix), 0);
     assert_eq!(widths(&compute, second), vec![40], "it prefilled its own question only");
     assert_eq!(sched.prefix_pinned_pages(), BIG_BLOCK / PAGE, "the block is on the device again");
@@ -945,4 +947,50 @@ fn a_subagent_block_in_kv_ram_gives_way_to_the_main_conversation() {
     let events = run_to_idle(&mut sched);
     assert!(compute.returned_prefixes().is_empty(), "there is nothing left to bring back");
     assert!(prefix_reuses(&events, second).is_empty());
+}
+
+// ── A claim given up before it lands (GitHub #445) ──────────────────────
+
+#[test]
+fn a_claim_given_up_and_chosen_again_is_one_hit_where_it_lands() {
+    // T's turn leaves its checkpoint on the device: 71 pages under the opener
+    // and its tail page. X, Interactive, decodes on 7 pages. R, an Agent
+    // continuing T's conversation, chooses the checkpoint and waits: its 8
+    // pages past it do not fit beside X. I, Interactive, needs 57 pages, which
+    // only R's claim keeps out: R ranks below I, so its claim goes as retained
+    // state goes (ADR 0045 as amended by #445), the checkpoint goes to KV-RAM,
+    // and I enters. Once I and X are done R chooses the checkpoint again, in
+    // KV-RAM, and lands it there. It resumed once: one hit, in KV-RAM, and
+    // none on the device for the claim it gave up.
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
+    let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
+    let t = sched.submit(turn_at(1), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.kv_used_pages(), 72, "the checkpoint holds 71 pages and its tail page");
+
+    let mut events = Vec::new();
+    sched.submit(input(tokens(90_000, 4), None, 100), RequestClass::Interactive).unwrap(); // 7 pages
+    events.extend(sched.advance());
+    let r = sched.submit(next_turn_at(1), RequestClass::Agent).unwrap();
+    events.extend(sched.advance());
+    assert_eq!(sched.request_state(r), Some(RequestState::Admitted), "R waits for room");
+    assert!(sched.shared_prefix_of(r).is_some(), "with its claim on T's checkpoint");
+
+    let i = sched.submit(input(tokens(80_000, 4), None, 900), RequestClass::Interactive).unwrap(); // 57 pages
+    events.extend(sched.advance());
+    assert_ne!(sched.request_state(i), Some(RequestState::Admitted), "I entered");
+    assert!(sched.shared_prefix_of(r).is_none(), "R's claim went for it");
+    assert_eq!(compute.spilled_checkpoints(), vec![t], "and the checkpoint went to KV-RAM");
+
+    events.extend(run_to_idle(&mut sched));
+    assert_eq!(reuses(&events, r), vec![(ReuseSource::KvRam, 1150)], "R resumed from KV-RAM");
+    let hits: Vec<_> = retained_state(&events)
+        .into_iter()
+        .filter(|&(operation, _, _)| operation == RetainedStateOperation::Hit)
+        .collect();
+    assert_eq!(
+        hits,
+        vec![(RetainedStateOperation::Hit, ReuseSource::KvRam, RetainedKind::Checkpoint)],
+        "one hit, where R resumed from"
+    );
 }

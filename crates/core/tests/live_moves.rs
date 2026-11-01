@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ignis_core::checkpoint::ReuseSource;
 use ignis_core::disk::disk_file_bytes;
 use ignis_core::scheduler::{DiskBlob, DiskSource};
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, RequestState, SchedEvent};
@@ -132,6 +133,25 @@ impl Run {
         while !self.sched.is_idle() {
             self.step();
             assert!(self.advances < 100_000, "the scheduler never went idle");
+        }
+    }
+
+    /// [`Run::to_idle`] within `bound` advances of the run's start, so that a
+    /// run that would never end fails at once, naming what still waits.
+    fn to_idle_within(&mut self, bound: usize) {
+        while !self.sched.is_idle() {
+            let waiting: Vec<(RequestId, Option<RequestState>)> = self
+                .tracked
+                .iter()
+                .map(|&r| (r, self.state(r)))
+                .filter(|(_, state)| *state != Some(RequestState::Done))
+                .collect();
+            assert!(
+                self.advances < bound,
+                "the run is not idle after {bound} advances: {waiting:?} still wait, {} pages in use",
+                self.sched.kv_used_pages()
+            );
+            self.step();
         }
     }
 
@@ -746,38 +766,362 @@ fn a_move_counts_no_page_a_live_claimant_stands_on() {
 }
 
 #[test]
-fn a_move_counts_no_page_a_claimed_checkpoint_still_needs() {
+fn a_move_counts_the_pages_a_claim_waiting_below_the_need_holds() {
     // R continues A's conversation: it claimed A's checkpoint, which holds the
     // four pages under it and its tail page for R's first chunk, and R waits
-    // for room behind A, which outranks it. I needs 63 of 64: A's 20 and the
-    // four would cover it, but R's claim keeps the four. Nothing moves, and
-    // the checkpoint and its tail page stay for R.
+    // for room behind A, which outranks it. I needs 63 of 64: A's 20 fall
+    // short, and so do A's 20 and the four while R's claim keeps them. That
+    // claim is a bet R has not cashed yet, and R ranks below I, so it goes as
+    // retained state goes (GitHub #445): I moves A, and the four and the tail
+    // page come back with R's claim and the checkpoint, in the advance I
+    // arrives. R prefills its whole prompt later. Until #445 this test
+    // cancelled R to get I in: without the cancel, nothing ever ran again.
     let compute = Arc::new(MockCompute::new());
     let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
     let a = run.submit(agent_turn(), RequestClass::Agent);
     run.steps(4);
-    // 49 pages, 45 past the 4 it shares with A's checkpoint: they do not fit
-    // beside A's 25.
-    let r = run.submit(input(tokens(1, 66).into_iter().chain(700..710).collect(), Some(700)), RequestClass::Agent);
+    // 45 pages past the 4 it shares with A's checkpoint: they do not fit beside
+    // A's 25.
+    let r = run.submit(next_turn(), RequestClass::Agent);
     run.step();
     assert_eq!(run.state(r), Some(RequestState::Admitted), "R waits for room");
     assert!(run.sched.shared_prefix_of(r).is_some(), "R holds the pages under A's checkpoint");
 
     let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
-    for _ in 0..50 {
-        run.step();
-        assert_eq!(run.state(i), Some(RequestState::Admitted), "I waits");
+    run.step();
+    assert!(run.evicted(a), "A moved for I");
+    assert_eq!(run.state(i), Some(RequestState::Running), "and I took its pages in the same advance");
+    assert!(run.sched.shared_prefix_of(r).is_none(), "R's claim went for them");
+    run.to_idle_within(3_000);
+    for (r, max) in [(a, 300), (i, 1000), (r, 700)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
     }
-    assert!(!run.moved_any(), "A did not move for pages R's claim holds");
-    assert_eq!(run.sched.checkpoint_pool().entry_count(), 1, "A's checkpoint stays for R");
-    assert_eq!(run.sched.retained_tail_pages(), 1, "and so does its tail page");
+    run.assert_no_work_lost();
+}
 
-    // R goes: the four pages are A's and the checkpoint's alone, and I moves A.
-    assert!(run.sched.cancel(r));
+// ── GitHub #445: a claim a waiting request holds yields to a need above it ──
+
+/// The next turn of [`agent_turn`]'s conversation: its prompt up to the
+/// opener, then ten tokens of its own, so it claims the turn's checkpoint.
+/// 776 tokens in all: 49 pages, 45 past the four it shares with the turn.
+fn next_turn() -> RequestInput {
+    input(tokens(1, 66).into_iter().chain(700..710).collect(), Some(700))
+}
+
+#[test]
+fn a_waiting_claim_yields_once_it_is_what_keeps_a_need_out() {
+    // A is an Interactive turn; R continues its conversation as an Agent: it
+    // claimed A's checkpoint, which holds the four pages under it and its tail
+    // page for R's first chunk, and it waits for room. I, Interactive and
+    // after A, needs 63 of 64 and can move nothing, since A outranks it.
+    // While A decodes, giving R's claim up would free the tail page alone,
+    // short of I's need, so it stays. Once A is done, R's claim is all that
+    // keeps I out: it ranks below I and goes as retained state goes, and I
+    // enters in the next advance. R prefills its whole prompt later.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let a = run.submit(agent_turn(), RequestClass::Interactive);
+    run.steps(4);
+    let r = run.submit(next_turn(), RequestClass::Agent);
+    run.step();
+    assert_eq!(run.state(r), Some(RequestState::Admitted), "R waits for room");
+    assert!(run.sched.shared_prefix_of(r).is_some(), "R holds the pages under A's checkpoint");
+
+    let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
+    run.until(|run| run.done(a));
+    assert_eq!(run.state(i), Some(RequestState::Admitted), "I waited for A, which it cannot move");
+    assert!(run.sched.shared_prefix_of(r).is_some(), "R's claim stayed while it could not make I's room");
+    assert_eq!(run.sched.retained_tail_pages(), 1, "and so did the checkpoint's tail page");
+    run.step();
+    assert_eq!(run.state(i), Some(RequestState::Running), "I took its pages in the next advance");
+    assert!(run.sched.shared_prefix_of(r).is_none(), "R's claim went for them");
+    assert!(!run.moved_any(), "nothing moved");
+    run.to_idle_within(3_000);
+    for (r, max) in [(a, 300), (i, 1000), (r, 700)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn a_waiting_claim_yields_to_a_moved_sequence_it_keeps_out() {
+    // The entry rule's side. I's need moved M, an Agent of 60 pages, to
+    // KV-RAM. P, an Interactive turn, then left a checkpoint, and R, an Agent
+    // continuing P's conversation and ranked below M, claimed it: R waits
+    // behind M, as entries are taken in rank order. Once I and P are done, M
+    // needs 60 pages and R's claim keeps five of the 64. It ranks below M and
+    // goes as retained state goes, M comes back in the advance I ends, and R
+    // prefills its whole prompt once M is done.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let m = run.submit(live(10, 956), RequestClass::Agent); // 60 pages
+    run.steps(3);
+    let i = run.submit(live(500, 476), RequestClass::Interactive); // 30 pages
+    run.step();
+    assert!(run.evicted(m), "I moved M");
+    let p = run.submit(agent_turn(), RequestClass::Interactive); // 24 pages and a tail page
+    run.steps(4);
+    let r = run.submit(next_turn(), RequestClass::Agent);
+    run.step();
+    assert!(run.sched.shared_prefix_of(r).is_some(), "R holds the pages under P's checkpoint");
+
+    run.until(|run| run.done(p));
+    assert!(run.sched.shared_prefix_of(r).is_some(), "R's claim stays while I holds the room M needs");
+    run.until(|run| run.done(i));
+    let restored = run.first(|e| matches!(e, SchedEvent::Restored { request, .. } if *request == m));
+    assert_eq!(restored, run.first(|e| matches!(e, SchedEvent::Done { request, .. } if *request == i)), "M came back in the advance I ended");
+    assert!(run.sched.shared_prefix_of(r).is_none(), "R's claim went for its room");
+    run.to_idle_within(3_000);
+    for (r, max) in [(m, 956), (i, 476), (p, 300), (r, 700)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn a_waiting_claim_yields_to_a_moved_sequence_coming_back_from_the_disk() {
+    // As above with no KV-RAM: I's need moved M, an Agent of 60 pages, to the
+    // disk. P left a checkpoint and R, ranked below M, claimed it. Once I and
+    // P are done, M needs 60 pages and R's claim keeps five of the 64: it goes
+    // as retained state goes, and M's restore from the disk starts in the
+    // advance I ends. A disk restore lands a window at a time.
+    let compute = Arc::new(MockCompute::new().with_disk(FakeDisk::with_room(1 << 30)));
+    let mut run = Run::new(ConcreteScheduler::with_config(
+        SchedulerConfig { kv_disk_capacity_bytes: 1 << 20, ..SchedulerConfig { prompt_reuse: true, retained_slots: 4, ..pool(0) } },
+        compute.clone(),
+    ));
+    let m = run.submit(live(10, 956), RequestClass::Agent); // 60 pages
+    run.steps(3);
+    let i = run.submit(live(500, 476), RequestClass::Interactive); // 30 pages
     run.until(|run| run.state(i) == Some(RequestState::Running));
-    assert!(run.evicted(a));
-    run.to_idle();
-    for (r, max) in [(a, 300), (i, 1000)] {
+    assert_eq!(compute.disk_spills(), vec![(DiskBlob::Live(m), DiskSource::Device)], "I moved M to the disk");
+    let p = run.submit(agent_turn(), RequestClass::Interactive); // 24 pages and a tail page
+    run.steps(4);
+    let r = run.submit(next_turn(), RequestClass::Agent);
+    run.step();
+    assert!(run.sched.shared_prefix_of(r).is_some(), "R holds the pages under P's checkpoint, on the device");
+
+    run.until(|run| run.done(p));
+    assert!(run.sched.shared_prefix_of(r).is_some(), "R's claim stays while I holds the room M needs");
+    assert!(compute.disk_restores().is_empty(), "and M stays on the disk");
+    run.until(|run| run.done(i));
+    assert_eq!(compute.disk_restores(), vec![DiskBlob::Live(m)], "M's restore started in the advance I ended");
+    assert!(run.sched.shared_prefix_of(r).is_none(), "R's claim went for its room");
+    run.to_idle_within(3_000);
+    for (r, max) in [(m, 956), (i, 476), (p, 300), (r, 700)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn a_waiting_claim_never_yields_to_an_entry_below_its_claimant() {
+    // H, Interactive, decodes on 38 pages to the end. P, an Interactive turn,
+    // moved M, an Agent of 3 pages, for its room and left a checkpoint. C, an
+    // Interactive request continuing P's conversation, claimed it and waits
+    // for H: its 23 pages past the four do not fit beside H once P is done.
+    // M's room comes after C's; giving C's claim up would make it, but C
+    // outranks M, so the claim stays, and C resumes from P's checkpoint once
+    // H is done.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let h = run.submit(live(600, 604), RequestClass::Interactive); // 38 pages
+    let m = run.submit(live(10, 40), RequestClass::Agent); // 3 pages
+    run.steps(2);
+    let p = run.submit(agent_turn(), RequestClass::Interactive); // 24 pages and a tail page
+    run.step();
+    assert!(run.evicted(m), "P moved M");
+    run.steps(4);
+    let c = run.submit(input(tokens(1, 66).into_iter().chain(700..710).collect(), Some(356)), RequestClass::Interactive); // 27 pages
+    run.step();
+    assert_eq!(run.state(c), Some(RequestState::Admitted), "C waits for room");
+    assert!(run.sched.shared_prefix_of(c).is_some(), "C holds the pages under P's checkpoint");
+
+    run.until(|run| run.done(p));
+    run.steps(10);
+    assert!(run.sched.shared_prefix_of(c).is_some(), "C's claim stayed for a sequence below it");
+    assert_eq!(run.sched.retained_tail_pages(), 1, "and so did the checkpoint's tail page");
+    assert!(!run.has(|e| matches!(e, SchedEvent::Restored { request, .. } if *request == m)), "M waits behind C");
+    run.to_idle_within(3_000);
+    assert!(
+        run.has(|e| matches!(
+            e,
+            SchedEvent::StateReused { request, source: ReuseSource::Device, tokens: 66, .. } if *request == c
+        )),
+        "C resumed from P's checkpoint"
+    );
+    for (r, max) in [(h, 604), (m, 40), (p, 300), (c, 356)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn a_need_that_fits_takes_no_claim_and_is_not_overtaken() {
+    // A, an Interactive turn, decodes beside its checkpoint, and R, an Agent
+    // continuing its conversation, claimed it and waits: its 45 pages past
+    // the four do not fit beside A's 25. I, Interactive, needs 30 of the 39
+    // free: it enters at once, ahead of R, and R keeps its claim. R enters
+    // once A and I are done, resuming from A's checkpoint.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let a = run.submit(agent_turn(), RequestClass::Interactive);
+    run.steps(4);
+    let r = run.submit(next_turn(), RequestClass::Agent);
+    run.step();
+    let i = run.submit(live(500, 476), RequestClass::Interactive); // 30 pages
+    run.step();
+    assert_eq!(run.state(i), Some(RequestState::Running), "I entered at once");
+    assert_eq!(run.state(r), Some(RequestState::Admitted), "R still waits");
+    assert!(run.sched.shared_prefix_of(r).is_some(), "with its claim");
+    assert_eq!(run.sched.retained_tail_pages(), 1, "and the checkpoint's tail page");
+    run.to_idle_within(3_000);
+    let entered = |x: RequestId| run.first(|e| matches!(e, SchedEvent::PrefillChunk { request, .. } if *request == x));
+    assert!(entered(i) < entered(r), "R did not enter before I");
+    assert!(
+        run.has(|e| matches!(
+            e,
+            SchedEvent::StateReused { request, source: ReuseSource::Device, tokens: 66, .. } if *request == r
+        )),
+        "R resumed from A's checkpoint"
+    );
+    assert!(!run.moved_any(), "nothing moved");
+    for (r, max) in [(a, 300), (i, 476), (r, 700)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn a_waiting_claim_on_a_retained_prefix_yields_too() {
+    // A, an Interactive turn, published its two-page system block as a
+    // retained prefix, and the two pages above it, to its opener's floor, as a
+    // prefix chained over the block, which its checkpoint stands on. R, an
+    // Agent opening with the same system block and nothing more of A's,
+    // claimed the block and waits. I, Interactive and after A, needs 63 of
+    // the 64 pages and cannot move A. Once A is done the checkpoint and the
+    // link above the block go for I, which is then one page short: the
+    // block's two pages, which R's claim keeps beside its retention. R's
+    // claim goes, the retention with it, and I enters.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let mut turn = agent_turn();
+    turn.system_block_tokens = Some(2 * PAGE);
+    let a = run.submit(turn, RequestClass::Interactive);
+    run.steps(4);
+    // 782 tokens: 49 pages, 47 past the block.
+    let r = run.submit(input(tokens(1, 32).into_iter().chain(800..850).collect(), Some(700)), RequestClass::Agent);
+    run.step();
+    assert_eq!(run.state(r), Some(RequestState::Admitted), "R waits for room");
+    assert_eq!(run.sched.shared_prefix_of(r).map(|(_, tokens)| tokens), Some(32), "R stands on A's system block");
+
+    let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
+    run.until(|run| run.done(a));
+    assert_eq!(run.state(i), Some(RequestState::Admitted), "I waited for A");
+    run.step();
+    assert_eq!(run.state(i), Some(RequestState::Running), "I took its pages in the next advance");
+    assert!(run.sched.shared_prefix_of(r).is_none(), "R's claim on the block went for them");
+    assert_eq!(run.sched.prefix_pinned_pages(), 0, "and so did the block");
+    run.to_idle_within(3_000);
+    assert!(
+        !run.has(|e| matches!(e, SchedEvent::PrefixReused { request, .. } if *request == r)),
+        "R prefilled from its first token and reports no reuse of the block it let go of"
+    );
+    for (r, max) in [(a, 300), (i, 1000), (r, 700)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+/// [`agent_turn`], opening with a two-page system block it publishes as a
+/// retained prefix; the two pages above it, to its opener's floor, become a
+/// prefix chained over the block, which its checkpoint stands on.
+fn agent_turn_with_block() -> RequestInput {
+    let mut turn = agent_turn();
+    turn.system_block_tokens = Some(2 * PAGE);
+    turn
+}
+
+/// An Agent's prompt opening with [`agent_turn_with_block`]'s block and
+/// nothing more of it, then 50 tokens of its own from `own`: 782 tokens, 49
+/// pages, 47 past the block.
+fn block_then(own: u32) -> RequestInput {
+    input(tokens(1, 32).into_iter().chain(own..own + 50).collect(), Some(700))
+}
+
+#[test]
+fn a_waiting_claim_whose_going_alone_frees_nothing_stays() {
+    // A, an Interactive turn, left its block, the link over it and its
+    // checkpoint. K, an Agent continuing A's conversation, claimed the
+    // checkpoint; J, an Agent after K, claimed the block. Both wait. I,
+    // Interactive, needs 60 of the 64 pages and cannot move A. Once A is done
+    // I is one page short. K's claim, let go, gives back the checkpoint's tail
+    // page and the link under it; J's gives back nothing while K's checkpoint
+    // chains over the block. J ranks lowest, but only K's claim goes, and I
+    // enters. J resumes from the block once I is done.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let a = run.submit(agent_turn_with_block(), RequestClass::Interactive);
+    run.steps(4);
+    let k = run.submit(next_turn(), RequestClass::Agent);
+    run.step();
+    let j = run.submit(block_then(800), RequestClass::Agent);
+    run.step();
+    let (k_link, j_block) = (run.sched.shared_prefix_of(k), run.sched.shared_prefix_of(j));
+    assert!(k_link.is_some(), "K stands on the link under A's checkpoint");
+    assert_eq!(j_block.map(|(_, tokens)| tokens), Some(32), "J stands on A's block");
+    assert_ne!(k_link.map(|(link, _)| link), j_block.map(|(block, _)| block), "two links, one over the other");
+
+    let i = run.submit(live(500, 956), RequestClass::Interactive); // 60 pages
+    run.until(|run| run.done(a));
+    assert_eq!(run.state(i), Some(RequestState::Admitted), "I waited for A");
+    run.step();
+    assert_eq!(run.state(i), Some(RequestState::Running), "I took its pages in the next advance");
+    assert!(run.sched.shared_prefix_of(k).is_none(), "K's claim went for them");
+    assert_eq!(
+        run.sched.shared_prefix_of(j).map(|(_, tokens)| tokens),
+        Some(32),
+        "J's claim, which would have freed nothing, stayed"
+    );
+    run.to_idle_within(3_000);
+    assert!(
+        run.has(|e| matches!(e, SchedEvent::PrefixReused { request, tokens: 32, .. } if *request == j)),
+        "J resumed from the block it kept"
+    );
+    for (r, max) in [(a, 300), (k, 700), (j, 700), (i, 956)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn two_waiting_claims_that_free_a_block_only_together_both_go() {
+    // J1 and J2, Agents opening with A's block and nothing more of it, each
+    // claimed the block and wait. I, Interactive, needs 63 of the 64 pages and
+    // cannot move A. Once A is done the checkpoint and the link over the block
+    // go for I, which is then the block's two pages short. Neither claim alone
+    // gives the block back, since the other still stands on it; together they
+    // do, so both go, J2's first, and I enters.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let a = run.submit(agent_turn_with_block(), RequestClass::Interactive);
+    run.steps(4);
+    let j1 = run.submit(block_then(800), RequestClass::Agent);
+    let j2 = run.submit(block_then(900), RequestClass::Agent);
+    run.step();
+    for j in [j1, j2] {
+        assert_eq!(run.sched.shared_prefix_of(j).map(|(_, tokens)| tokens), Some(32), "{j} stands on A's block");
+    }
+
+    let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
+    run.until(|run| run.done(a));
+    assert_eq!(run.state(i), Some(RequestState::Admitted), "I waited for A");
+    run.step();
+    assert_eq!(run.state(i), Some(RequestState::Running), "I took its pages in the next advance");
+    assert!(run.sched.shared_prefix_of(j1).is_none() && run.sched.shared_prefix_of(j2).is_none(), "both claims went");
+    assert_eq!(run.sched.prefix_pinned_pages(), 0, "and the block with them");
+    run.to_idle_within(3_000);
+    for (r, max) in [(a, 300), (j1, 700), (j2, 700), (i, 1000)] {
         assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
     }
     run.assert_no_work_lost();
