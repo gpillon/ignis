@@ -174,7 +174,8 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
     assert_eq!(row(&rows, "mock-a")["family"], "qwen38", "the loaded model is always the running family");
     assert_eq!(row(&rows, "mock-a")["switchable"], false, "already loaded");
 
-    let text = rows.to_string();
+    // The envelope's `disk` names `download.path` (GitHub #453); no row does.
+    let text = rows["data"].to_string();
     for path in [dir.to_string_lossy(), elsewhere.to_string_lossy()] {
         assert!(!text.contains(&*path.replace('\\', "\\\\")) && !text.contains(".ninfer"), "no row carries a path: {text}");
     }
@@ -282,6 +283,30 @@ async fn every_row_says_its_kind_the_headers_when_the_file_is_there_else_the_cat
         assert_eq!(row(&rows, id)["kind"].as_str(), kind, "{id}: {why}");
     }
     let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(elsewhere));
+}
+
+/// GitHub #453: the list says the free space under `download.path` — `disk`,
+/// its `path` as the server holds it and the bytes free on its volume — for a
+/// folder that exists and for one the first download has not created yet,
+/// read at the nearest folder above it that exists.
+#[tokio::test]
+async fn the_catalog_says_the_free_space_under_download_path_created_or_not() {
+    let loader = MockLoader::new();
+    let models = catalog_in("disk", &[("acme-none", Disk::Absent)]);
+    let above = fresh_dir("disk-above");
+    let not_yet = CatalogModels { catalog: Arc::clone(&models.catalog), dir: above.join("models") };
+    let elsewhere = fresh_dir("disk-elsewhere");
+    let start = file_in(&elsewhere, "mock-a.ninfer", b"start");
+    for models in [models.clone(), not_yet] {
+        let dir = models.dir.clone();
+        let app = server_with(&loader, &start, models, &[], true).app();
+        let (status, rows) = send(&app, Method::GET, "/v1/models/catalog", None).await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        assert_eq!(rows["disk"]["path"].as_str(), Some(dir.display().to_string().as_str()), "{rows}");
+        assert!(rows["disk"]["free_bytes"].as_u64().is_some_and(|free| free > 0), "{}: {}", dir.display(), rows["disk"]);
+    }
+    assert!(!above.join("models").exists(), "listing creates no folder");
+    let _ = (std::fs::remove_dir_all(models.dir), std::fs::remove_dir_all(above), std::fs::remove_dir_all(elsewhere));
 }
 
 /// A known model is listed once and its entry wins: the catalog row carries
@@ -589,6 +614,7 @@ async fn a_server_with_no_switcher_lists_the_loaded_model_alone() {
     assert_eq!(rows["data"].as_array().unwrap().len(), 1, "{rows}");
     assert_eq!(rows["data"][0]["id"], "mock-a");
     assert_eq!((rows["data"][0]["loaded"].clone(), rows["data"][0]["switchable"].clone()), (json!(true), json!(false)));
+    assert!(rows.get("disk").is_none(), "no catalog, no download.path to read: {rows}");
 }
 
 /// The start model stays switchable by id for the server's life: every

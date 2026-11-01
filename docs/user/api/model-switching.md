@@ -45,7 +45,11 @@ disk, which wins, else what the catalog tells of the entry, its `kind` or its
 family's, so every built-in entry has one before it is downloaded; it is absent
 only when neither tells, as for an operator entry of no family not yet
 downloaded. It
-answers during a switch and while one has failed, and carries no path. Each
+answers during a switch and while one has failed, and no row carries a path.
+Beside the rows the list carries `disk: {path, free_bytes}`: `--download-path`
+as the server holds it and the bytes free on its volume, read where a download
+checks them before it begins (at the nearest folder above it that exists, since
+the first download creates it); absent when they cannot be read. Each
 row also carries `bytes_on_disk`, what of it is there now, partial files
 included, and `download`: `running` while a
 [download through the API](../guides/models.md#downloading-from-the-server-view-post-v1modelsdownload)

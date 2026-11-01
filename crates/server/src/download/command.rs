@@ -142,8 +142,9 @@ fn fits(id: &str, dir: &Path, missing: u64, free: u64, margin: u64) -> Result<()
 /// `GetDiskFreeSpaceExW`, `statvfs` elsewhere
 /// ([`ignis_artifact::volume_free_bytes`]). Read at `dir`, or at the nearest
 /// folder above it that exists, since the first download into a models
-/// folder creates it.
-fn free_under(dir: &Path) -> Result<u64, String> {
+/// folder creates it. What `GET /v1/models/catalog` says as `disk` too
+/// (GitHub #453).
+pub(crate) fn free_under(dir: &Path) -> Result<u64, String> {
     let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
     let existing = dir.ancestors().find(|folder| folder.is_dir()).unwrap_or(&dir);
     ignis_artifact::volume_free_bytes(existing).map_err(|err| format!("{err}, which a download checks before it begins"))
