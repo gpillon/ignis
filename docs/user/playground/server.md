@@ -182,6 +182,15 @@ model family (its own values, which win over the shared ones). The groups
 Vision, Media, image, Download, N-gram table, KV-disk) are listed on the left;
 an orange count marks the groups holding a change.
 
+**Find a field**, beside the scope, narrows the form to the fields that hold
+every word typed, case aside, in their key, their description, their flag or
+their environment variable: `max context`, `--spec-backend` and `IGNIS_VRAM`
+each find theirs. The part of a name it matched is marked; a field found by its
+flag or variable shows them under its name, and one found in the rest of its
+description opens it. A group with nothing found is dimmed on the left. The
+search only hides rows: a change on a hidden one stays in the draft and is
+applied with the rest. **Escape** clears it.
+
 ![The Model group: values, their source, and the fields that reload](../images/playground/server-config.png)
 
 Each row is one field ([every field](../reference/configuration.md)): its

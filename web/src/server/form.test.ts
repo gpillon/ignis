@@ -9,6 +9,7 @@ import {
   type Basis,
   familiesOf,
   familyName,
+  fieldMatches,
   firstSentence,
   namedKeys,
   patchBody,
@@ -395,6 +396,40 @@ describe("text", () => {
     expect(shownOf(true)).toBe("On");
     expect(shownOf("127.0.0.1:8000")).toBe("127.0.0.1:8000");
     expect(shownOf(40960)).toBe("40960");
+  });
+});
+
+describe("fieldMatches", () => {
+  const maxContext = field("model.max_context");
+  const none = { marks: [], opens: false, ids: false };
+
+  it("lets every field through an empty search, marking nothing", () => {
+    expect(fieldMatches(maxContext, "")).toEqual(none);
+    expect(fieldMatches(maxContext, "   ")).toEqual(none);
+  });
+
+  it("marks where the name holds a word, whatever its case, and needs every word somewhere", () => {
+    expect(fieldMatches(maxContext, "CONTEXT")).toEqual({ ...none, marks: [[4, 11]] });
+    expect(fieldMatches(maxContext, "context max")).toEqual({ ...none, marks: [[0, 3], [4, 11]] });
+    expect(fieldMatches(maxContext, "max nowhere")).toBeNull();
+  });
+
+  it("finds a field by its group.name key, as a refusal names it, marking the part of the name it covers", () => {
+    expect(fieldMatches(maxContext, "model.max_context")).toEqual({ ...none, marks: [[0, 11]] });
+    expect(fieldMatches(maxContext, "model.max")).toEqual({ ...none, marks: [[0, 3]] });
+    // The group alone is in the section's heading: nothing in the name to mark.
+    expect(fieldMatches(maxContext, "model")).toEqual(none);
+  });
+
+  it("finds a field by its description, and opens it when the word is only behind More", () => {
+    expect(fieldMatches(maxContext, "reserve")).toEqual(none);
+    expect(fieldMatches(field("model.id"), "flash-next")).toEqual({ ...none, opens: true });
+  });
+
+  it("finds a field by its flag or its environment variable, which the row then shows", () => {
+    expect(fieldMatches(maxContext, "max-context")).toEqual({ ...none, ids: true });
+    expect(fieldMatches(maxContext, "ignis_model_max_context")).toEqual({ ...none, ids: true });
+    expect(fieldMatches(maxContext, "context --model")).toEqual({ marks: [[4, 11]], opens: false, ids: true });
   });
 });
 

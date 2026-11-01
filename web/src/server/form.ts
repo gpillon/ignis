@@ -415,6 +415,47 @@ export function firstSentence(text: string): [string, string] {
   return split ? [split[1], split[2]] : [text, ""];
 }
 
+/**
+ * How a field meets the Configuration search: `marks`, the spans of its name
+ * the words cover; `opens`, a word is only in the description's part behind
+ * "More"; `ids`, a word is only in the flag or the environment variable, which
+ * the row then shows.
+ */
+export type FieldMatch = { marks: [number, number][]; opens: boolean; ids: boolean };
+
+/**
+ * How `decl` meets `query`, or `null` when a word of it is in none of the
+ * field's `group.name` key, description, flag and environment variable. Case
+ * does not count, and every word must be in one of them; a word is taken where
+ * the row shows it first. An empty query lets every field through.
+ */
+export function fieldMatches(decl: FieldDecl, query: string): FieldMatch | null {
+  const key = decl.file_key.toLowerCase();
+  const [first, rest] = firstSentence(decl.description).map((part) => part.toLowerCase());
+  const ids = `${decl.flag} ${decl.env}`.toLowerCase();
+  // The name is the key's tail: a span of the key over it is a span of the name.
+  const start = key.length - decl.name.length;
+  const spans: [number, number][] = [];
+  const match: FieldMatch = { marks: [], opens: false, ids: false };
+  for (const word of query.toLowerCase().split(/\s+/).filter(Boolean)) {
+    if (key.includes(word)) {
+      for (let at = key.indexOf(word); at !== -1; at = key.indexOf(word, at + 1)) {
+        const from = Math.max(at, start);
+        if (from < at + word.length) spans.push([from - start, at + word.length - start]);
+      }
+    } else if (first.includes(word)) continue;
+    else if (rest.includes(word)) match.opens = true;
+    else if (ids.includes(word)) match.ids = true;
+    else return null;
+  }
+  for (const [from, to] of spans.sort((a, b) => a[0] - b[0])) {
+    const last = match.marks.at(-1);
+    if (last && from <= last[1]) last[1] = Math.max(last[1], to);
+    else match.marks.push([from, to]);
+  }
+  return match;
+}
+
 /** `switch.drain_timeout` in force: the seconds a switch or a reload gives a running reply. */
 export function drainTimeout(doc: ConfigDocument | null): number | null {
   const raw = doc?.switch?.drain_timeout;

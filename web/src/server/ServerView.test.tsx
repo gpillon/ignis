@@ -46,8 +46,8 @@ const decl = (key: string): FieldDecl => FIELDS.find((f) => f.file_key === key)!
 const edit = (draft: Draft, key: string, value: string | boolean, scope: string | null = "qwen38") =>
   editDraft(draft, decl(key), rowView(decl(key), CONFIG, ORIGINS, scope).inForce, value);
 
-/** The configuration form alone, opened on `scope` (`null` is "All models"). */
-const renderForm = (scope: string | null, draft: Draft = {}) =>
+/** The configuration form alone, opened on `scope` (`null` is "All models"), searching for `query`. */
+const renderForm = (scope: string | null, draft: Draft = {}, query?: string) =>
   renderToStaticMarkup(
     <ConfigForm
       fields={base.fields}
@@ -56,6 +56,7 @@ const renderForm = (scope: string | null, draft: Draft = {}) =>
       catalog={base.catalog}
       family="qwen38"
       initialScope={scope}
+      initialQuery={query}
       draft={draft}
       marked={[]}
       onEdit={actions.edit}
@@ -351,6 +352,48 @@ describe("ServerView: the configuration", () => {
     const fields = render().match(/<(input|textarea|select)\b[^>]*>/g) ?? [];
     expect(fields.length).toBeGreaterThan(0);
     for (const field of fields) expect(field).toMatch(/\s(id|name)="[^"]+"/);
+  });
+});
+
+/** The side navigation's markup. */
+const navOf = (html: string) => html.slice(html.indexOf('aria-label="Configuration groups"'), html.indexOf("</nav>"));
+
+describe("ServerView: the configuration search", () => {
+  it("shows only the fields a search finds, under their group, with the part of the name it matched marked", () => {
+    const html = renderForm("qwen38", {}, "DRAIN");
+    expect([...html.matchAll(/id="server-field-([\w.]+)-name"/g)].map((m) => m[1])).toEqual(["switch.drain_timeout"]);
+    expect(html).toContain('id="server-group-switch"');
+    expect(html).not.toContain('id="server-group-model"');
+    expect(rowOf(html, "switch.drain_timeout")).toContain("<mark");
+    expect(html).toMatch(/<input[^>]*type="search"[^>]*value="DRAIN"/);
+    expect(html).toContain(">1 field<");
+  });
+
+  it("shows the flag and variable of a field found by them, and opens a description found behind More", () => {
+    const byFlag = rowOf(renderForm("qwen38", {}, "max-context"), "model.max_context");
+    expect(byFlag).toContain("--model-max-context");
+    expect(byFlag).toContain("IGNIS_MODEL_MAX_CONTEXT");
+    expect(rowOf(renderForm("qwen38"), "model.max_context")).not.toContain("--model-max-context");
+    const opened = rowOf(renderForm("qwen38", {}, "flash-next"), "model.id");
+    expect(opened).toContain("Unset, a load is served under");
+    expect(opened).toContain(">Less<");
+  });
+
+  it("says when no field matches, and keeps every group in the side navigation, dimmed", () => {
+    const html = renderForm("qwen38", {}, "nothing-is-called-this");
+    expect(html).not.toMatch(/id="server-field-/);
+    expect(html).toContain("No field matches");
+    expect(html).toContain(">Clear search<");
+    expect(html).toContain(">None<");
+    const nav = navOf(html);
+    expect(nav.match(/<button/g)).toHaveLength(new Set(FIELDS.map((f) => f.group)).size);
+    expect(nav.match(/<button[^>]*disabled=""/g)).toHaveLength(new Set(FIELDS.map((f) => f.group)).size);
+  });
+
+  it("keeps a change on a row the search hides, counted in the side navigation", () => {
+    const nav = navOf(renderForm("qwen38", edit({}, "model.max_context", "524288"), "drain"));
+    expect(nav).toMatch(/<button[^>]*disabled=""[^>]*>Model<span[^>]*>1<\/span>/);
+    expect(nav).toMatch(/<button type="button" class="[^"]*">Model switch</);
   });
 });
 
