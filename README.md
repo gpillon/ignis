@@ -165,7 +165,7 @@ authors published it:
 
 | engine | weights and speculation | single-stream decode | source |
 |---|---|---:|---|
-| vLLM (main `g41f179b57`) | NVFP4, FP8 KV, DFlash2 drafter with 6 tokens | ~304 tok/s code at 8K, 221 at 60K | [HF discussion #132](https://huggingface.co/Qwen/Qwen3.8-27B/discussions/132) |
+| SGLang v0.5.20 | NVFP4, MTP with 4 tokens | 152 tok/s (93 without speculation) | [lucacadalora/sglang-rtx5090-mtp, 2026-09-23](https://github.com/lucacadalora/sglang-rtx5090-mtp) |
 | llama.cpp | NVFP4-MTP GGUF, q8_0 KV, MTP with 4 tokens | 122–142 tok/s | [DataCamp, 2026-08-25](https://www.datacamp.com/tutorial/how-to-run-qwen3-8-27b-locally) |
 | llama.cpp | MTP | 70.5 tok/s | [HF discussion #132](https://huggingface.co/Qwen/Qwen3.8-27B/discussions/132) |
 
@@ -184,12 +184,8 @@ of magnitude, not a ratio. **Prefill was where ignis trailed; 0.7.3 made it
 - **One same-session bench, someone else's**
   ([mkyt/qwen3-27b-5090](https://github.com/mkyt/qwen3-27b-5090), a 5090 at a
   400 W limit, 2026-10-11), cold 73K prompt:
-  - vLLM 4,800 tok/s;
   - NInfer 7,000;
   - that engine 8,800 (its attention runs on FP4/FP8 tensor cores).
-- The ~12,500 tok/s at 60K once published for vLLM in
-  [HF discussion #132](https://huggingface.co/Qwen/Qwen3.8-27B/discussions/132)
-  is not reproduced there.
 
 **The one same-session comparison** is against
 [NInfer](#lineage), the engine whose kernels ignis started from: same artifact,

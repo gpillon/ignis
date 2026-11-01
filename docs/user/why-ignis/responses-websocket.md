@@ -49,7 +49,7 @@ Every field, event and refusal: [The Responses API](../api/responses.md).
 |---|---|---|
 | 6 connections per origin over HTTP/1.1 cap the Playground at 6 parallel streams; the engine answered each request in about 1 ms | the Playground, six agents | [Browser connection limit](../../findings/2026-09-18-browser-connection-limit-caps-parallel-streams.md) |
 | 16 active streams and 32 stream ids per connection; idle close after 300 s by default | the code, as the API page states it | [The Responses API](../api/responses.md) |
-| As of 2026-09-29, none of the open inference servers surveyed (a vLLM change open, llama.cpp HTTP only) shipped the Responses WebSocket mode | a survey of public sources, dated | [Inference interfaces survey](../../findings/2026-09-29-openai-websocket-inference-interfaces.md) |
+| As of 2026-09-29, none of the open inference servers surveyed (SGLang and llama.cpp HTTP only; Ollama refuses the upgrade with a 426) shipped the Responses WebSocket mode | a survey of public sources, dated | [Inference interfaces survey](../../findings/2026-09-29-openai-websocket-inference-interfaces.md) |
 
 :::caution[No ignis latency figure]
 No finding compares the socket with HTTP on ignis. OpenAI's own guide says a

@@ -2306,8 +2306,7 @@ struct ModelInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     kind: Option<&'static str>,
     /// The context for one request, prompt plus `max_tokens`, in tokens
-    /// (vLLM's name for it; the Playground's context bar reads it). A text
-    /// model's only.
+    /// (the Playground's context bar reads it). A text model's only.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_model_len: Option<u32>,
     /// How many requests the model decodes at once: the load's decode lanes,
