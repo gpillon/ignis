@@ -166,6 +166,14 @@ impl CatalogEntry {
             .or_else(|| self.aliases.iter().find_map(|alias| ModelFamily::of_model_id(alias)))
     }
 
+    /// The model kind the catalog tells of the entry (GitHub #448): the
+    /// `kind` it states (a speech model, the diarizer), else its family's
+    /// ([`CatalogEntry::family()`]); `None` when it tells neither, which only
+    /// the artifact's header can then say.
+    pub fn model_kind(&self) -> Option<ModelKind> {
+        self.kind.or_else(|| self.family().map(ModelFamily::kind))
+    }
+
     /// Where the artifact lives under `dir` (flat: every file of an entry
     /// sits beside the others under the name the repo publishes it under).
     pub fn artifact_path(&self, dir: &Path) -> PathBuf {

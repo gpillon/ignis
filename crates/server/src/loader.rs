@@ -81,6 +81,14 @@ pub fn artifact_family(artifact: &Path) -> Result<Option<ignis_core::compute::Mo
     Ok(ignis_core::compute::ModelFamily::of_model_id(&reader.identity().model_id))
 }
 
+/// The kind of the family `artifact`'s header names — the 27B's for an
+/// artifact of no family, as a load serves it; `None` for a file that cannot
+/// be read as a container (a GGUF among them).
+pub fn artifact_kind(artifact: &Path) -> Option<ignis_core::compute::ModelKind> {
+    let family = artifact_family(artifact).ok()?;
+    Some(family.unwrap_or(ignis_core::compute::ModelFamily::Qwen38_27b).kind())
+}
+
 /// The sidecar next to `artifact` (the full artifact file name plus one
 /// of [`SIDECAR_SUFFIXES` — the reference tooling's naming, the graft
 /// record winning over the conversion record when both exist), when one

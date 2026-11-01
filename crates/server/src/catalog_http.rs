@@ -75,11 +75,12 @@ pub(crate) struct CatalogRow {
     family: Option<&'static str>,
     /// What the model takes in and gives back (GitHub #448), as `GET
     /// /v1/models` names it: `text`, `image`, `speech` or `diarizer`. The
-    /// artifact's header's when it is on disk, which wins (ADR 0047); else
-    /// what the catalog tells of the entry: its `kind` (a speech model, the
-    /// diarizer) or its family's (ADR 0074). Absent when neither tells: an
-    /// operator entry of no family not downloaded, a known model whose file
-    /// is gone or has no header. For the loaded model, what it runs.
+    /// artifact's header's when it is on disk, which wins (ADR 0047), the
+    /// 27B's for a header of no family, as a load serves it; else what the
+    /// catalog tells of the entry: its `kind` (a speech model, the diarizer)
+    /// or its family's (ADR 0074). Absent when neither tells: an operator
+    /// entry of no family not downloaded, a known model whose file is gone or
+    /// has no header. For the loaded model, what it runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     kind: Option<&'static str>,
     /// This is the model serving now (the start model before any switch).
@@ -175,7 +176,9 @@ fn rows(server: &Server) -> Vec<CatalogRow> {
     // models load from, which a removal of the entry listing them takes away.
     let started = switcher.and_then(Switcher::start);
     let known_models = switcher.map(Switcher::listed_models).unwrap_or_default();
-    let row = |id: &str, source, on_disk: OnDisk, bytes, header: Option<ModelFamily>, bytes_on_disk| {
+    // GitHub #448: the kind the file a row would load from reads, when it is there.
+    let kind_of = |path: &Path| crate::loader::artifact_kind(path);
+    let row = |id: &str, source, on_disk: OnDisk, bytes, header_family: Option<ModelFamily>, header_kind: Option<ModelKind>, bytes_on_disk| {
         let entry = match source {
             CatalogSource::Known => None,
             CatalogSource::BuiltIn | CatalogSource::Operator => {
@@ -194,11 +197,7 @@ fn rows(server: &Server) -> Vec<CatalogRow> {
         let loaded = serving && id == loaded_id;
         // GitHub #448: the header, the authority where the file is there,
         // then what the catalog tells of the entry.
-        let kind = if loaded {
-            Some(active.kind())
-        } else {
-            header.map(ModelFamily::kind).or_else(|| entry.and_then(|(entry, _)| entry.kind.or_else(|| entry.family().map(ModelFamily::kind))))
-        };
+        let kind = if loaded { Some(active.kind()) } else { header_kind.or_else(|| entry.and_then(|(entry, _)| entry.model_kind())) };
         let reason = switcher.filter(|_| !loaded).and_then(|switcher| switcher.unavailable_reason(id));
         let status = match source {
             CatalogSource::Known => DownloadStatus::None,
@@ -216,7 +215,7 @@ fn rows(server: &Server) -> Vec<CatalogRow> {
             source,
             on_disk,
             bytes,
-            family: if loaded { Some(scope(active.family)) } else { header.map(scope) },
+            family: if loaded { Some(scope(active.family)) } else { header_family.map(scope) },
             kind: kind.map(ModelKind::as_str),
             loaded,
             switchable: free && !loaded && switcher.is_some_and(|switcher| switcher.resolve(id).is_ok()),
@@ -245,25 +244,29 @@ fn rows(server: &Server) -> Vec<CatalogRow> {
             // does for a switch (`Switcher::resolve`): its file is where the
             // server would load it from, and gone it is absent, whatever
             // `download.path` holds.
-            let (on_disk, bytes, family, landed) = match listed.get(&found.entry.id) {
+            let (on_disk, bytes, family, kind, landed) = match listed.get(&found.entry.id) {
                 Some(artifact) => match file_size(artifact) {
-                    Some(bytes) => (OnDisk::Complete, bytes, family_of(artifact), bytes),
-                    None => (OnDisk::Absent, found.entry.total_bytes(), None, 0),
+                    Some(bytes) => (OnDisk::Complete, bytes, family_of(artifact), kind_of(artifact), bytes),
+                    None => (OnDisk::Absent, found.entry.total_bytes(), None, None, 0),
                 },
-                None => (found.on_disk, found.entry.total_bytes(), found.family, found.bytes_on_disk),
+                None => {
+                    let kind = kind_of(&found.entry.artifact_path(&catalog.dir));
+                    (found.on_disk, found.entry.total_bytes(), found.family, kind, found.bytes_on_disk)
+                }
             };
-            rows.push(row(&found.entry.id, found.entry.layer.into(), on_disk, Some(bytes), family, landed));
+            rows.push(row(&found.entry.id, found.entry.layer.into(), on_disk, Some(bytes), family, kind, landed));
         }
     }
     for (id, artifact) in listed.iter().filter(|(id, _)| !seen.contains(*id)) {
         let bytes = file_size(artifact);
         let on_disk = if bytes.is_some() { OnDisk::Complete } else { OnDisk::Absent };
         let family = bytes.and_then(|_| family_of(artifact));
-        rows.push(row(id, CatalogSource::Known, on_disk, bytes, family, bytes.unwrap_or(0)));
+        let kind = bytes.and_then(|_| kind_of(artifact));
+        rows.push(row(id, CatalogSource::Known, on_disk, bytes, family, kind, bytes.unwrap_or(0)));
     }
     // A loaded model with no artifact at all (a start built in process).
     if serving && !rows.iter().any(|row| row.loaded) {
-        rows.push(row(&loaded_id, CatalogSource::Known, OnDisk::Absent, None, None, 0));
+        rows.push(row(&loaded_id, CatalogSource::Known, OnDisk::Absent, None, None, None, 0));
     }
     rows
 }

@@ -93,13 +93,6 @@ models:
     files: [ … ]
 ```
 
-The family the catalog knows of an entry also gives it its model kind before
-it is downloaded: `GET /v1/models/catalog` reports `kind`, and the
-[Server view](../playground/server.md#the-model-band) its **Type**, from the
-catalog until the artifact is on disk, whose header then wins. An entry whose
-family nothing states has no kind until it is downloaded; stating `family`
-gives it one at once.
-
 On a 16 GB card a start, a switch and a request naming `acme-27b-ft` are
 served by `acme-27b-ft-16g`, under its own id; on a 32 GB card or larger, and
 on a card whose class is not known, by `acme-27b-ft` itself. `GET /v1/models`
@@ -121,3 +114,10 @@ and the 16 GB one answers to the other's id ([the uncensored variant](uncensored
   the switch or the request is refused `409 model_above_card_class`, naming
   both families, and a start is refused before the load. Named by its own id,
   the entry is served as it is.
+
+The family the catalog knows of an entry also gives it its model kind before
+it is downloaded: `GET /v1/models/catalog` reports `kind`, and the
+[Server view](../playground/server.md#the-model-band) its **Type**, from the
+catalog until the artifact is on disk, whose header then wins. An entry whose
+family nothing states has no kind until it is downloaded; stating `family`
+gives it one at once.

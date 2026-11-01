@@ -193,28 +193,58 @@ fn container(path: &Path, model_id: &str) -> u64 {
 }
 
 /// GitHub #448: every row says its `kind` — the artifact header's when the
-/// file is there, which wins (ADR 0047), else what the catalog tells of the
-/// entry, its `kind` or its family's (ADR 0074), else none.
+/// file is there, which wins (ADR 0047), the 27B's for a header of no family,
+/// as a load serves it; else what the catalog tells of the entry, its `kind`
+/// or its family's (ADR 0074); else none.
 #[tokio::test]
 async fn every_row_says_its_kind_the_headers_when_the_file_is_there_else_the_catalogs() {
+    /// What an entry's artifact is under `download.path`.
+    enum File {
+        Absent,
+        /// A container whose header names this model id.
+        Header(&'static str),
+        /// A file no container header can be read from, as a GGUF is.
+        Unreadable,
+    }
     let loader = MockLoader::new();
     let dir = fresh_dir("kind");
     let zeros = "0".repeat(64);
-    let mut yaml = String::from("models:\n");
-    // (id, the family it states, the model id its artifact's header names when on disk)
-    for (id, family, header) in [
-        ("acme-free", None, None),
-        ("acme-header", None, Some("ignis-image-2.1-turbo")),
-        ("acme-said-text", Some("qwen3.8-27b"), None),
-        ("acme-disagrees", Some("qwen3.8-27b"), Some("ignis-image-2.1-turbo")),
+    let mut yaml = String::from("models:
+");
+    // (id, the family it states, its artifact under `download.path`)
+    for (id, family, file) in [
+        ("acme-free", None, File::Absent),
+        ("acme-header", None, File::Header("ignis-image-2.1-turbo")),
+        ("acme-no-family", None, File::Header("acme-custom")),
+        ("acme-said-text", Some("qwen3.8-27b"), File::Absent),
+        ("acme-disagrees", Some("qwen3.8-27b"), File::Header("ignis-image-2.1-turbo")),
+        ("acme-unreadable", Some("qwen3.8-27b"), File::Unreadable),
+        ("acme-listed", None, File::Absent),
     ] {
-        let bytes = header.map_or(7, |header| container(&dir.join(format!("{id}.ninfer")), header));
-        if header.is_some() {
+        let artifact = dir.join(format!("{id}.ninfer"));
+        let bytes = match file {
+            File::Absent => 7,
+            File::Header(model_id) => container(&artifact, model_id),
+            File::Unreadable => {
+                std::fs::write(&artifact, b"GGUF...").unwrap();
+                7
+            }
+        };
+        if !matches!(file, File::Absent) {
             std::fs::write(dir.join(format!("{id}.ninfer.graft.json")), b"x").unwrap();
         }
-        let family = family.map_or(String::new(), |family| format!("    family: {family}\n"));
+        let family = family.map_or(String::new(), |family| format!("    family: {family}
+"));
         yaml.push_str(&format!(
-            "  - id: {id}\n    repo: acme/{id}\n    revision: v1\n    artifact: {id}.ninfer\n    card_class: 32\n{family}    files:\n      - {{ name: {id}.ninfer.graft.json, bytes: 1, sha256: \"{zeros}\" }}\n      - {{ name: {id}.ninfer, bytes: {bytes}, sha256: \"{zeros}\" }}\n"
+            "  - id: {id}
+    repo: acme/{id}
+    revision: v1
+    artifact: {id}.ninfer
+    card_class: 32
+{family}    files:
+      - {{ name: {id}.ninfer.graft.json, bytes: 1, sha256: \"{zeros}\" }}
+      - {{ name: {id}.ninfer, bytes: {bytes}, sha256: \"{zeros}\" }}
+"
         ));
     }
     let models = CatalogModels { catalog: Arc::new(parse_operator(&yaml, Format::Yaml, "test").expect("a valid catalog")), dir: dir.clone() };
@@ -222,34 +252,35 @@ async fn every_row_says_its_kind_the_headers_when_the_file_is_there_else_the_cat
     let start = file_in(&elsewhere, "mock-a.ninfer", b"start");
     let on_disk = file_in(&elsewhere, "mock-k.ninfer", b"known!!");
     let gone = elsewhere.join("gone.ninfer");
-    let app = server_with(&loader, &start, models, &[("mock-k", &on_disk), ("mock-gone", &gone)], true).app();
+    let listed = elsewhere.join("acme-listed.ninfer");
+    container(&listed, "ignis-image-2.1-turbo");
+    let app = server_with(&loader, &start, models, &[("mock-k", &on_disk), ("mock-gone", &gone), ("acme-listed", &listed)], true).app();
 
     let (status, rows) = send(&app, Method::GET, "/v1/models/catalog", None).await;
     assert_eq!(status, StatusCode::OK, "{rows}");
-    let kinds: Vec<(&str, Option<&str>)> = rows["data"].as_array().unwrap().iter().map(|row| (row["id"].as_str().unwrap(), row["kind"].as_str())).collect();
-    assert_eq!(
-        kinds,
-        [
-            // The built-in catalog, nothing on disk: each entry's family by its own id, its alias or the one it states, or its `kind`.
-            ("qwen3.8-27b", Some("text")),
-            ("qwen3.8-27b-abliterated", Some("text")),
-            ("qwen3.8-flash-next", Some("text")),
-            ("ignis-image-2.1-turbo", Some("image")),
-            ("qwen3.8-27b-16g", Some("text")),
-            ("qwen3.8-27b-abliterated-16g", Some("text")),
-            ("qwen3-asr-1.7b", Some("speech")),
-            ("qwen3-asr-1.7b-q8", Some("speech")),
-            ("qwen3-asr-0.6b", Some("speech")),
-            ("nemotron-3-diarization", Some("diarizer")),
-            ("acme-free", None),                // a free id, no family, no file: nothing tells
-            ("acme-header", Some("image")),     // the header tells where the catalog does not
-            ("acme-said-text", Some("text")),   // the family it states, no file to read
-            ("acme-disagrees", Some("image")),  // the header wins over the family it states
-            ("mock-a", Some("text")),           // the loaded model: what it runs
-            ("mock-gone", None),                // its file is gone
-            ("mock-k", None),                   // a file with no header to read
-        ]
-    );
+    for (id, kind, why) in [
+        // The built-in catalog, nothing on disk.
+        ("qwen3.8-27b", Some("text"), "a family's own id"),
+        ("qwen3.8-27b-16g", Some("text"), "its alias, a family's own id"),
+        ("qwen3.8-27b-abliterated", Some("text"), "the family it states"),
+        ("ignis-image-2.1-turbo", Some("image"), "a family's own id"),
+        ("qwen3-asr-1.7b", Some("speech"), "the kind it states"),
+        ("nemotron-3-diarization", Some("diarizer"), "the kind it states"),
+        // The operator's.
+        ("acme-free", None, "a free id, no family, no file: nothing tells"),
+        ("acme-header", Some("image"), "the header tells where the catalog does not"),
+        ("acme-no-family", Some("text"), "a header of no family loads as the 27B"),
+        ("acme-said-text", Some("text"), "the family it states, no file to read"),
+        ("acme-disagrees", Some("image"), "the header wins over the family it states"),
+        ("acme-unreadable", Some("text"), "no header to read: the family it states"),
+        ("acme-listed", Some("image"), "the listed file's header, where the server would load it from"),
+        // The known models that are no entry.
+        ("mock-a", Some("text"), "the loaded model: what it runs"),
+        ("mock-gone", None, "its file is gone"),
+        ("mock-k", None, "a file with no header to read"),
+    ] {
+        assert_eq!(row(&rows, id)["kind"].as_str(), kind, "{id}: {why}");
+    }
     let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(elsewhere));
 }
 

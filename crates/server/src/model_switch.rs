@@ -191,8 +191,7 @@ impl ModelLoader for ArtifactLoader {
     /// artifact of no family, as a load serves it; `None` for a file that
     /// cannot be read, which the switch's own prepare refuses.
     fn kind_of(&self, target: &ModelSource) -> Option<ModelKind> {
-        let family = crate::loader::artifact_family(&target.artifact).ok()?;
-        Some(family.unwrap_or(ModelFamily::Qwen38_27b).kind())
+        crate::loader::artifact_kind(&target.artifact)
     }
 
     /// The family the artifact's header names; `None` for a file that cannot
