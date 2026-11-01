@@ -1,4 +1,5 @@
 import { authHeaders, keyRequired } from "../api/auth.ts";
+import type { ModelKind } from "../api/model.ts";
 
 // The routes the Server view talks to (spec playground/05, GitHub #316),
 // beside GET /v1/models (api/model.ts): what each config field is, the
@@ -63,6 +64,8 @@ export type CatalogRow = {
   bytes?: number;
   /** The scope name the artifact's header names, when it is on disk; the running family for the loaded row. */
   family?: string;
+  /** The model kind (GitHub #448): the artifact header's when it is on disk, else what the catalog tells of the entry; absent when neither tells. An older server sends none. */
+  kind?: ModelKind | "diarizer";
   loaded: boolean;
   switchable: boolean;
   /** `false` when this card's class is below the entry's `card_class` (ADR 0064): no switch to it, no download of it. An older server sends neither field. */

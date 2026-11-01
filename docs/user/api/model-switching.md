@@ -38,7 +38,13 @@ model_not_found` naming the id — and, for a catalog entry, the `ignis-server
 model download <id>` that fetches it; a switch never starts a download.
 `GET /v1/models/catalog` lists the models a switch can go to, one row each:
 `id`, `source` (`built-in`, `operator` or `known`), `on_disk` (`complete`,
-`partial` or `absent`), `bytes`, `family`, `loaded` and `switchable`. It
+`partial` or `absent`), `bytes`, `family`, `kind`, `loaded` and
+`switchable`. `kind` is the model kind as `GET /v1/models` names it (`text`,
+`image`, `speech` or `diarizer`): the artifact header's when the file is on
+disk, which wins, else what the catalog tells of the entry, its `kind` or its
+family's, so every built-in entry has one before it is downloaded; it is absent
+only when neither tells, as for an operator entry of no family not yet
+downloaded. It
 answers during a switch and while one has failed, and carries no path. Each
 row also carries `bytes_on_disk`, what of it is there now, partial files
 included, and `download`: `running` while a

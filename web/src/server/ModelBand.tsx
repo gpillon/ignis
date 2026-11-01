@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { loadUnderWay, type ModelState } from "../api/model.ts";
-import { diskLabel, downloadCommand, elapsed, type PageGate, rowAction, runningFamily, sourceLabel, speechFigures } from "./band.ts";
+import { diskLabel, downloadCommand, elapsed, kindLabel, type PageGate, rowAction, runningFamily, sourceLabel, speechFigures } from "./band.ts";
 import { cancelReachable, downloadFailure, progressLabel } from "./download.ts";
 import { familyName } from "./form.ts";
 import { drainNote, lastSwitchLine, type Line } from "./outcome.ts";
@@ -217,19 +217,29 @@ function Catalog({
       </p>
     );
   }
+  // GitHub #448: from the sm breakpoint the rows share the list's columns
+  // (subgrid), so an action's width no longer moves the others; below it each
+  // row stacks its cells beside its actions, and the heading row is hidden.
   return (
-    <ul aria-label="Models this server can load" className="border-t border-kiln-line">
+    <ul aria-label="Models this server can load" className="sm:grid sm:grid-cols-[minmax(0,1.5fr)_auto_minmax(0,1fr)_minmax(0,1.3fr)_auto] sm:gap-x-4">
+      <li aria-hidden className="hidden border-t border-kiln-line px-5 pt-3 pb-1 text-[11px] text-[#939ba4] sm:col-span-full sm:grid sm:grid-cols-subgrid md:px-6">
+        <span>Model</span>
+        <span>Type</span>
+        <span>Source</span>
+        <span>On disk</span>
+      </li>
       {catalog.value.map((row) => (
         <li
           key={row.id}
-          className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-0.5 border-t border-kiln-line px-5 py-3 first:border-t-0 sm:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)_minmax(0,1.3fr)_auto] md:px-6"
+          className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-0.5 border-t border-kiln-line px-5 py-3 sm:col-span-full sm:grid-cols-subgrid md:px-6"
         >
           <span className="font-display text-base font-semibold text-white [overflow-wrap:anywhere]">{row.id}</span>
+          <span className="col-start-1 text-xs text-[#939ba4] sm:col-start-auto sm:text-sm">{kindLabel(row.kind)}</span>
           <span className="col-start-1 text-xs text-[#939ba4] sm:col-start-auto sm:text-sm">{sourceLabel(row.source)}</span>
           <span className="col-start-1 text-xs text-[#939ba4] sm:col-start-auto sm:text-sm">
             {row.download === "running" ? progressLabel(row, downloads.speed) : diskLabel(row)}
           </span>
-          <div className="col-start-2 row-span-3 row-start-1 flex flex-wrap items-center justify-end gap-x-1 gap-y-1 justify-self-end sm:col-start-auto sm:row-span-1 sm:row-start-auto">
+          <div className="col-start-2 row-span-4 row-start-1 flex flex-wrap items-center justify-end gap-x-1 gap-y-1 justify-self-end sm:col-start-auto sm:row-span-1 sm:row-start-auto">
             <RowActionView row={row} model={model} loadingId={loadingId} onLoad={onLoad} downloads={downloads} />
             <RemoveButton row={row} model={model} removals={removals} />
           </div>
