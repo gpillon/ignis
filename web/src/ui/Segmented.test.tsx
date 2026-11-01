@@ -10,4 +10,12 @@ describe("Segmented", () => {
     expect(html).toMatch(/^<fieldset class="relative[ "]/);
     expect(html).toContain('<legend class="sr-only">Scope</legend>');
   });
+
+  it("fills an accented option with the heat, its words said to a screen reader after the label", () => {
+    const html = renderToStaticMarkup(
+      <Segmented legend="Scope" name="scope" value="a" options={[{ value: "a", label: "A" }, { value: "b", label: "B", accent: "running" }]} onChange={() => {}} />,
+    );
+    expect(html).toMatch(/<span class="[^"]*heat-fill[^"]*">B<span class="sr-only"> \(running\)<\/span><\/span>/);
+    expect(html).toMatch(/<span class="(?![^"]*heat-fill)[^"]*">A<\/span>/);
+  });
 });

@@ -4,13 +4,15 @@ import { caption } from "./classes.ts";
  * A row of mutually exclusive options. `value` null checks none of them;
  * `disabled` greys the row and takes every option out of reach;
  * `legendHidden` keeps the legend for screen readers only, for a row that
- * names the field beside it.
+ * names the field beside it. An option's `accent` fills it with the heat,
+ * its words said to a screen reader after the label (the running family's
+ * "running").
  */
 export function Segmented<T extends string>(props: {
   legend: string;
   name: string;
   value: T | null;
-  options: { value: T; label: string }[];
+  options: { value: T; label: string; accent?: string }[];
   onChange: (value: T) => void;
   disabled?: boolean;
   legendHidden?: boolean;
@@ -32,9 +34,11 @@ export function Segmented<T extends string>(props: {
               onChange={() => props.onChange(o.value)}
             />
             <span
-              className={`block px-1 py-1.5 text-center font-display text-[13px] font-medium text-ash peer-checked:bg-ink peer-checked:text-ground peer-focus-visible:outline-2 peer-focus-visible:outline-ember ${disabled ? "cursor-not-allowed" : "cursor-pointer hover:text-ink peer-checked:hover:text-ground"}`}
+              // The heat's own text colour: a second colour utility beside it would win, Tailwind's order over the class string's.
+              className={`block px-1 py-1.5 text-center font-display text-[13px] font-medium ${o.accent ? "heat-fill peer-checked:ring-2 peer-checked:ring-ink peer-checked:ring-inset" : "text-ash peer-checked:bg-ink peer-checked:text-ground"} peer-focus-visible:outline-2 peer-focus-visible:outline-ember ${disabled ? "cursor-not-allowed" : o.accent ? "cursor-pointer hover:brightness-110" : "cursor-pointer hover:text-ink peer-checked:hover:text-ground"}`}
             >
               {o.label}
+              {o.accent && <span className="sr-only"> ({o.accent})</span>}
             </span>
           </label>
         ))}

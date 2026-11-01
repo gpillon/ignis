@@ -17,6 +17,7 @@ import {
   firstSentence,
   groupTitle,
   type InForce,
+  inScope,
   labelOf,
   noteLines,
   rowView,
@@ -35,7 +36,9 @@ import type { Loaded } from "./useServer.ts";
 //
 // A scope selector at the top picks whose values the rows show and edit (spec
 // playground/05 §Follow-up): "All models" the shared ones, a family its own
-// where it has any. It opens on the running family.
+// where it has any, and only the fields a family can set for itself
+// (`inScope`): one value for every model is All models' to show and change. It
+// opens on All models; the running family's segment is filled with the heat.
 //
 // A search beside it narrows the rows to the fields it finds (by key, flag,
 // environment variable or description) and the groups that hold them. It only
@@ -70,14 +73,12 @@ export function ConfigForm({
   family: string | null;
   draft: Draft;
   marked: string[];
-  /** The scope the form opens on: a family, or `null` for "All models". Unset, the running family. */
+  /** The scope the form opens on: a family, or `null` for "All models". Unset, All models. */
   initialScope?: string | null;
   /** The search the form opens with; empty, every field shows. */
   initialQuery?: string;
 } & RowEdits) {
-  // Undefined until picked: the scope then follows the running family, which the catalog may name only after the first read.
-  const [picked, setPicked] = useState<string | null | undefined>(initialScope);
-  const scope = picked === undefined ? family : picked;
+  const [scope, setScope] = useState<string | null>(initialScope ?? null);
   const [query, setQuery] = useState(initialQuery);
   return (
     <section aria-labelledby="server-config" className="flex flex-col gap-3">
@@ -92,16 +93,16 @@ export function ConfigForm({
         </div>
         {config.state === "ok" && <ConfigFileButton />}
       </div>
-      <Body fields={fields} config={config} origins={origins} catalog={catalog} family={family} scope={scope} onScope={setPicked} query={query} onQuery={setQuery} draft={draft} marked={marked} {...edits} />
+      <Body fields={fields} config={config} origins={origins} catalog={catalog} family={family} scope={scope} onScope={setScope} query={query} onQuery={setQuery} draft={draft} marked={marked} {...edits} />
     </section>
   );
 }
 
-/** "All models", then a family each, the running one marked: a segmented row from `sm`, a select below it. */
+/** "All models", then a family each, the running one marked: a segmented row from `sm`, filled with the heat; a select below it, in words. */
 function ScopeSelector({ families, running, scope, onScope }: { families: string[]; running: string | null; scope: string | null; onScope: (scope: string | null) => void }) {
-  const options = [
+  const options: { value: string; label: string; accent?: string }[] = [
     { value: "all", label: "All models" },
-    ...families.map((f) => ({ value: f, label: f === running ? `${familyName(f)} (running)` : familyName(f) })),
+    ...families.map((f) => ({ value: f, label: familyName(f), accent: f === running ? "running" : undefined })),
   ];
   const value = scope ?? "all";
   const pick = (next: string) => onScope(next === "all" ? null : next);
@@ -113,7 +114,7 @@ function ScopeSelector({ families, running, scope, onScope }: { families: string
       <select aria-label="Scope" name="server-scope-select" value={value} onChange={(e) => pick(e.target.value)} className={`w-full ${fieldLook} sm:hidden`}>
         {options.map((option) => (
           <option key={option.value} value={option.value}>
-            {option.label}
+            {option.accent ? `${option.label} (${option.accent})` : option.label}
           </option>
         ))}
       </select>
@@ -142,8 +143,9 @@ function Body({
   if (config.state === "error") return <Notice>The configuration could not be read: {config.refusal.message}</Notice>;
   if (fields.state === "loading" || config.state === "loading") return <p className="py-6 text-sm text-ash">Reading the configuration…</p>;
 
-  const groups = [...new Set(fields.value.map((decl) => decl.group))];
-  const found = fields.value.flatMap((decl) => {
+  const shown = fields.value.filter((decl) => inScope(decl, scope));
+  const groups = [...new Set(shown.map((decl) => decl.group))];
+  const found = shown.flatMap((decl) => {
     const match = fieldMatches(decl, query);
     return match ? [{ decl, match }] : [];
   });
@@ -158,6 +160,15 @@ function Body({
         </div>
         <SearchBox query={query} count={found.length} onQuery={onQuery} />
       </div>
+      {scope !== null && (
+        <p className="text-sm text-ash">
+          {`Only what ${familyName(scope)} can set for itself. The rest is in `}
+          <button type="button" onClick={() => onScope(null)} className="text-ember hover:underline">
+            All models
+          </button>
+          .
+        </p>
+      )}
       <div className="lg:grid lg:grid-cols-[11rem_minmax(0,1fr)] lg:items-start lg:gap-6">
         <nav aria-label="Configuration groups" className="sticky top-4 hidden lg:block">
           <ul className="flex flex-col">
@@ -349,7 +360,6 @@ function FieldRow({
           <Control decl={decl} id={id} nameId={nameId} value={shown} inForce={entry?.removal ? view.shared : inForce.value} marked={marked} onEdit={(value) => onEdit(decl, inForce, value)} />
         )}
         {mode.kind === "fixed" && <ReadOnly value={shownOf(inForce.value)} note="Set at start" />}
-        {mode.kind === "unused" && <p className="text-sm text-ash md:text-right">Not used by {familyName(mode.family)}</p>}
         {mode.kind === "list" && <KnownModels value={inForce.value} />}
       </div>
     </div>

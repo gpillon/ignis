@@ -303,15 +303,12 @@ describe("ServerView: the configuration", () => {
     expect(rowOf(html, "model.reasoning_effort")).toMatch(/<option value="" disabled="" selected="">auto<\/option>/);
   });
 
-  it("shows set-at-start, not-used and the known models read-only, and marks the fields a change reloads", () => {
+  it("shows set-at-start and the known models read-only, and marks the fields a change reloads", () => {
     const html = render();
     const bind = rowOf(html, "server.bind");
     expect(bind).toContain("127.0.0.1:8000");
     expect(bind).toContain("Set at start");
     expect(bind).not.toMatch(/<input|<select|role="switch"/);
-    const rows = rowOf(html, "spec.draft_rows");
-    expect(rows).toContain("Not used by Qwen3.8-27B");
-    expect(rows).not.toMatch(/<input|<select/);
     const known = rowOf(html, "switch.known_models");
     expect(known).toContain("qwen3.8-27b-fail");
     expect(known).toContain("Read-only here");
@@ -334,7 +331,7 @@ describe("ServerView: the configuration", () => {
   });
 
   it("reads a scoped field from the running family's section and says so", () => {
-    const html = render();
+    const html = renderForm("qwen38");
     const context = rowOf(html, "model.max_context");
     expect(context).toContain('value="786432"');
     expect(context).toContain("Own value");
@@ -360,7 +357,7 @@ const navOf = (html: string) => html.slice(html.indexOf('aria-label="Configurati
 
 describe("ServerView: the configuration search", () => {
   it("shows only the fields a search finds, under their group, with the part of the name it matched marked", () => {
-    const html = renderForm("qwen38", {}, "DRAIN");
+    const html = renderForm(null, {}, "DRAIN");
     expect([...html.matchAll(/id="server-field-([\w.]+)-name"/g)].map((m) => m[1])).toEqual(["switch.drain_timeout"]);
     expect(html).toContain('id="server-group-switch"');
     expect(html).not.toContain('id="server-group-model"');
@@ -370,17 +367,17 @@ describe("ServerView: the configuration search", () => {
   });
 
   it("shows the flag and variable of a field found by them, and opens a description found behind More", () => {
-    const byFlag = rowOf(renderForm("qwen38", {}, "max-context"), "model.max_context");
+    const byFlag = rowOf(renderForm(null, {}, "max-context"), "model.max_context");
     expect(byFlag).toContain("--model-max-context");
     expect(byFlag).toContain("IGNIS_MODEL_MAX_CONTEXT");
-    expect(rowOf(renderForm("qwen38"), "model.max_context")).not.toContain("--model-max-context");
-    const opened = rowOf(renderForm("qwen38", {}, "flash-next"), "model.id");
+    expect(rowOf(renderForm(null), "model.max_context")).not.toContain("--model-max-context");
+    const opened = rowOf(renderForm(null, {}, "flash-next"), "model.id");
     expect(opened).toContain("Unset, a load is served under");
     expect(opened).toContain(">Less<");
   });
 
   it("says when no field matches, and keeps every group in the side navigation, dimmed", () => {
-    const html = renderForm("qwen38", {}, "nothing-is-called-this");
+    const html = renderForm(null, {}, "nothing-is-called-this");
     expect(html).not.toMatch(/id="server-field-/);
     expect(html).toContain("No field matches");
     expect(html).toContain(">Clear search<");
@@ -391,7 +388,7 @@ describe("ServerView: the configuration search", () => {
   });
 
   it("keeps a change on a row the search hides, counted in the side navigation", () => {
-    const nav = navOf(renderForm("qwen38", edit({}, "model.max_context", "524288"), "drain"));
+    const nav = navOf(renderForm(null, edit({}, "model.max_context", "524288"), "drain"));
     expect(nav).toMatch(/<button[^>]*disabled=""[^>]*>Model<span[^>]*>1<\/span>/);
     expect(nav).toMatch(/<button type="button" class="[^"]*">Model switch</);
   });
@@ -404,16 +401,18 @@ const scopes = (html: string) => {
 };
 
 describe("ServerView: the scope selector", () => {
-  it("offers All models and each family, and opens on the running one, marked", () => {
-    expect(scopes(render())).toEqual({ labels: ["All models", "Qwen3.8-27B (running)", "Qwen3.8-Flash-Next"], checked: ["Qwen3.8-27B (running)"] });
-    expect(scopes(renderForm(null)).checked).toEqual(["All models"]);
+  it("offers All models and each family, opens on All models, and fills the running family with the heat", () => {
+    const html = render();
+    expect(scopes(html)).toEqual({ labels: ["All models", "Qwen3.8-27B", "Qwen3.8-Flash-Next"], checked: ["All models"] });
+    expect(html).toMatch(/name="server-scope"[^>]*\/><span class="[^"]*heat-fill[^"]*">Qwen3\.8-27B<span class="sr-only"> \(running\)<\/span>/);
     expect(scopes(renderForm("qwen38flashnext")).checked).toEqual(["Qwen3.8-Flash-Next"]);
   });
 
-  it("is a select below sm, so it fits a phone", () => {
+  it("is a select below sm, so it fits a phone, where the running family says so in words", () => {
     const html = render();
     expect(html).toMatch(/<select aria-label="Scope"[^>]*class="[^"]*sm:hidden"/);
-    expect(html).toContain('<option value="qwen38" selected="">Qwen3.8-27B (running)</option>');
+    expect(html).toContain('<option value="all" selected="">All models</option>');
+    expect(html).toContain('<option value="qwen38">Qwen3.8-27B (running)</option>');
     expect(html).toMatch(/class="hidden sm:block"><fieldset/);
   });
 });
@@ -464,15 +463,27 @@ describe("ServerView: the configuration in each scope", () => {
     expect(kv).not.toContain("Use shared value");
     // An own value over an unset shared one goes back to auto.
     expect(rowOf(html, "spec.backend")).toContain("Use shared value (auto)");
-    expect(rowOf(html, "server.request_timeout")).toContain("Same for every model");
-    expect(rowOf(html, "spec.draft_rows")).toContain("Not used by Qwen3.8-27B");
+  });
+
+  it("in a family's scope shows only what that family can set for itself, and says where the rest is", () => {
+    const html = renderForm("qwen38");
+    for (const key of ["model.max_context", "vram.headroom_bytes", "vision.enabled"]) expect(html).toContain(`id="server-field-${key}-name"`);
+    // One value for every model, and the other family's own: in All models.
+    for (const key of ["server.request_timeout", "model.id", "spec.draft_rows"]) expect(html).not.toContain(`id="server-field-${key}-name"`);
+    expect(html).not.toContain('id="server-group-server"');
+    const nav = navOf(html);
+    expect(nav).toContain(">Model<");
+    expect(nav).not.toContain(">Server<");
+    expect(html).toContain("Only what Qwen3.8-27B can set for itself. The rest is in");
+    expect(html).toMatch(/<button type="button"[^>]*>All models<\/button>/);
+    expect(renderForm(null)).not.toContain("can set for itself");
   });
 
   it("in the other family's scope shows that family's values, and edits its fields while the first runs", () => {
     const html = renderForm("qwen38flashnext");
     expect(rowOf(html, "model.max_context")).toMatch(/<input[^>]*value="589824"/);
     expect(rowOf(html, "model.max_context")).toContain("Own value");
-    expect(rowOf(html, "vision.enabled")).toContain("Not used by Qwen3.8-Flash-Next");
+    expect(html).not.toContain('id="server-field-vision.enabled-name"');
     const rows = rowOf(html, "spec.draft_rows");
     expect(rows).toMatch(/<input[^>]*name="spec\.draft_rows"/);
     expect(rows).not.toContain("Not used by");
@@ -610,7 +621,7 @@ describe("ServerView: the dock", () => {
     expect(live).toContain("2 changes");
     expect(live).toContain(">Discard<");
     expect(live).toMatch(/>Apply<\/button>/);
-    expect(live).not.toContain("heat-fill");
+    expect(live).toMatch(/class="(?![^"]*heat-fill)[^"]*">Apply<\/button>/);
 
     const reload = render({ draft: edit(edit({}, "server.request_timeout", "60"), "model.max_context", "524288") });
     expect(reload).toMatch(/class="[^"]*heat-fill[^"]*">Apply and reload qwen3\.8-27b<\/button>/);
@@ -619,7 +630,7 @@ describe("ServerView: the dock", () => {
   it("reloads only for what reaches the running model, and lists what waits for the other one", () => {
     const other = render({ draft: edit({}, "model.max_context", "524288", "qwen38flashnext") });
     expect(other).toMatch(/>Apply<\/button>/);
-    expect(other).not.toContain("heat-fill");
+    expect(other).toMatch(/class="(?![^"]*heat-fill)[^"]*">Apply<\/button>/);
     expect(other).toContain("Takes effect when Qwen3.8-Flash-Next loads: model.qwen38flashnext.max_context");
 
     const both = render({ draft: edit(edit({}, "model.max_context", "524288", "qwen38flashnext"), "model.kv_format", "bf16", null) });

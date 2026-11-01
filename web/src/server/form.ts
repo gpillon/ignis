@@ -54,13 +54,13 @@ export function controlFor(decl: FieldDecl, value: unknown): Control {
 
 /**
  * How a row shows its field: with a control, or read-only because it is set
- * at start (not patchable), because the running family does not take it, or
- * because it is `switch.known_models`, which a patch only adds to.
+ * at start (not patchable) or because it is `switch.known_models`, which a
+ * patch only adds to. A scope shows no field its family does not take
+ * (`inScope`).
  */
-export type RowMode = { kind: "edit" } | { kind: "fixed" } | { kind: "unused"; family: string } | { kind: "list" };
+export type RowMode = { kind: "edit" } | { kind: "fixed" } | { kind: "list" };
 
-export function rowMode(decl: FieldDecl, family: string | null): RowMode {
-  if (family !== null && decl.families !== null && !decl.families.includes(family)) return { kind: "unused", family };
+export function rowMode(decl: FieldDecl): RowMode {
   if (!decl.patchable) return { kind: "fixed" };
   if (decl.file_key === "switch.known_models") return { kind: "list" };
   return { kind: "edit" };
@@ -83,6 +83,17 @@ export const section = (doc: ConfigDocument, group: string, scope: string) => {
 
 /** The one family a field is only taken by; `null` for a field every family takes. */
 const onlyFamily = (decl: FieldDecl) => (decl.families?.length === 1 ? decl.families[0] : null);
+
+/**
+ * Whether a scope shows the field: All models (`null`) every field; a family
+ * only what it can set for itself, a field that takes a value per family and
+ * that it takes, or one only it takes. A field with one value for every model
+ * is All models', and so is the place to change it.
+ */
+export function inScope(decl: FieldDecl, scope: string | null): boolean {
+  if (scope === null) return true;
+  return onlyFamily(decl) === scope || (decl.scoped && (decl.families === null || decl.families.includes(scope)));
+}
 
 /** The value a family runs a field with: its own section's when it has one, else the group's. */
 export function resolved(doc: ConfigDocument, decl: FieldDecl, family: string): unknown {
@@ -132,7 +143,7 @@ type Scoped = { family: string; value: unknown; origin: Origin };
  * §Follow-up. `inForce` is the value the control starts from and the section
  * an edit goes to; `shared` is the group's value, which "Use shared value"
  * falls back to; `note` says what the value is: its origin in a family's
- * scope, the same for every model, or which families have a value of their own.
+ * scope, or which families have a value of their own.
  */
 export type RowView = {
   mode: RowMode;
@@ -140,14 +151,13 @@ export type RowView = {
   shared: unknown;
   note:
     | { kind: "scoped"; origin: Origin }
-    | { kind: "every" }
     | { kind: "only"; family: string }
     | { kind: "overridden"; by: Scoped[] }
     | null;
 };
 
 export function rowView(decl: FieldDecl, doc: ConfigDocument | null, origins: OriginRow[] | null, scope: string | null): RowView {
-  const mode = rowMode(decl, scope);
+  const mode = rowMode(decl);
   const shared = doc?.[decl.group]?.[decl.name];
   const only = onlyFamily(decl);
   if (only !== null) {
@@ -156,7 +166,8 @@ export function rowView(decl: FieldDecl, doc: ConfigDocument | null, origins: Or
     return { mode, shared, inForce: { value: own?.[decl.name], scope: only }, note: scope === null ? { kind: "only", family: only } : null };
   }
   if (!decl.scoped) {
-    return { mode, shared, inForce: { value: shared, scope: null }, note: scope === null || !decl.patchable ? null : { kind: "every" } };
+    // Shown in All models only (`inScope`), which says nothing of a field every family shares.
+    return { mode, shared, inForce: { value: shared, scope: null }, note: null };
   }
   if (scope === null) {
     // The families the origins name for the field; unread, those whose section holds it.
@@ -184,8 +195,6 @@ export function noteLines(view: RowView, entry: DraftEntry | undefined): string[
     case "scoped":
       if (entry?.removal) return ["Back to the shared value once applied"];
       return [entry ? "Own value" : originLine(note.origin)];
-    case "every":
-      return ["Same for every model"];
     case "only":
       return [`${familyName(note.family)} only`];
     case "overridden":

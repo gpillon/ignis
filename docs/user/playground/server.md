@@ -176,8 +176,13 @@ network still frees its disk.
 
 ## The configuration
 
-**Scope** picks what the form edits: **All models** (the shared values) or one
-model family (its own values, which win over the shared ones). The groups
+**Scope** picks what the form shows and edits. **All models**, which the form
+opens on, shows every field with its shared value. A model family shows only
+what that family can set for itself: the fields that take a value per family
+(its own, which wins over the shared one) and the fields only that family
+takes; a field with one value for every model, such as
+`server.request_timeout`, is changed in All models. The running family's
+segment is filled orange. The groups
 (Server, Model, VRAM, Prompt reuse, Model switch, Speculative decoding,
 Vision, Media, image, Download, N-gram table, KV-disk) are listed on the left;
 an orange count marks the groups holding a change.

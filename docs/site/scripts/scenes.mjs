@@ -295,7 +295,9 @@ export const scenes = [
     run: async (page) => {
       await chatReady(page);
       await view(page, "Server");
-      // The Model group: the fields a reload follows, with where each value came from.
+      // The running family's Model group: the fields a reload follows, with where each value came from.
+      // Its segment says "running" to a screen reader only.
+      await page.getByRole("group", { name: "Scope" }).getByText("Qwen3.8-27B (running)", { exact: true }).click();
       await page.getByRole("navigation", { name: "Configuration groups" }).getByRole("button", { name: "Model", exact: true }).click();
       await page.waitForTimeout(1200);
     },
