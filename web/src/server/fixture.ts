@@ -237,15 +237,16 @@ export const CONFIG: ConfigDocument = {
 /**
  * `GET /v1/models/catalog` with the 27B loaded: the three built-in entries
  * (their totals are the catalog's file sizes summed), an operator entry not
- * fetched, and a known model that is no catalog entry.
+ * fetched, of no family (so the server tells no `kind`), and a known model
+ * that is no catalog entry.
  */
 export const CATALOG: CatalogRow[] = [
-  { id: "qwen3.8-27b", source: "built-in", on_disk: "complete", bytes: 19406949449, family: "qwen38", loaded: true, switchable: false, download: "none", bytes_on_disk: 19406949449 },
-  { id: "qwen3.8-27b-abliterated", source: "built-in", on_disk: "partial", bytes: 19406984175, loaded: false, switchable: false, download: "none", bytes_on_disk: 6442450944 },
-  { id: "qwen3.8-flash-next", source: "built-in", on_disk: "complete", bytes: 72799980571, family: "qwen38flashnext", loaded: false, switchable: true, download: "none", bytes_on_disk: 72799980571 },
+  { id: "qwen3.8-27b", source: "built-in", kind: "text", on_disk: "complete", bytes: 19406949449, family: "qwen38", loaded: true, switchable: false, download: "none", bytes_on_disk: 19406949449 },
+  { id: "qwen3.8-27b-abliterated", source: "built-in", kind: "text", on_disk: "partial", bytes: 19406984175, loaded: false, switchable: false, download: "none", bytes_on_disk: 6442450944 },
+  { id: "qwen3.8-flash-next", source: "built-in", kind: "text", on_disk: "complete", bytes: 72799980571, family: "qwen38flashnext", loaded: false, switchable: true, download: "none", bytes_on_disk: 72799980571 },
   { id: "qwen3.8-27b-custom", source: "operator", on_disk: "absent", bytes: 19406949449, loaded: false, switchable: false, download: "none", bytes_on_disk: 0 },
-  { id: "qwen3.8-27b-dead", source: "known", on_disk: "complete", bytes: 19406942468, family: "qwen38", loaded: false, switchable: true, download: "none", bytes_on_disk: 19406942468 },
-  { id: "qwen3.8-27b-fail", source: "known", on_disk: "complete", bytes: 19406942468, family: "qwen38", loaded: false, switchable: true, download: "none", bytes_on_disk: 19406942468 },
+  { id: "qwen3.8-27b-dead", source: "known", kind: "text", on_disk: "complete", bytes: 19406942468, family: "qwen38", loaded: false, switchable: true, download: "none", bytes_on_disk: 19406942468 },
+  { id: "qwen3.8-27b-fail", source: "known", kind: "text", on_disk: "complete", bytes: 19406942468, family: "qwen38", loaded: false, switchable: true, download: "none", bytes_on_disk: 19406942468 },
 ];
 
 /** The families the fixture's server declares, read from its declarations and catalog as the page reads them. */

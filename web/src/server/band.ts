@@ -19,6 +19,18 @@ export function sourceLabel(source: CatalogRow["source"]): string {
   return SOURCES[source] ?? source;
 }
 
+const KINDS: Record<NonNullable<CatalogRow["kind"]>, string> = {
+  text: "Text",
+  image: "Image",
+  speech: "Speech",
+  diarizer: "Diarizer",
+};
+
+/** The model kind a row's Type column shows (GitHub #448); empty where the server tells none. */
+export function kindLabel(kind: CatalogRow["kind"]): string {
+  return kind === undefined ? "" : (KINDS[kind] ?? kind);
+}
+
 /** What of a model is on disk; an entry's size is its total, whatever is there. */
 export function diskLabel(row: CatalogRow): string {
   const size = row.bytes === undefined ? "" : formatBytes(row.bytes);

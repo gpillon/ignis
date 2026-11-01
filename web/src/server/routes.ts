@@ -63,6 +63,8 @@ export type CatalogRow = {
   bytes?: number;
   /** The scope name the artifact's header names, when it is on disk; the running family for the loaded row. */
   family?: string;
+  /** The model kind (GitHub #448): the artifact header's when it is on disk, else what the catalog tells of the entry; absent when neither tells. An older server sends none. */
+  kind?: "text" | "image" | "speech" | "diarizer";
   loaded: boolean;
   switchable: boolean;
   /** `false` when this card's class is below the entry's `card_class` (ADR 0064): no switch to it, no download of it. An older server sends neither field. */

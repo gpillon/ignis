@@ -15,6 +15,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
+use ignis_artifact::{ArtifactIdentity, ContainerWriter, ResourceEncoding};
 use ignis_server::config::file::{Format, RealFiles};
 use ignis_server::config::{resolve_with, ConfigOutcome};
 use ignis_server::config_http::ConfigState;
@@ -180,6 +181,75 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
     for object in rows["data"].as_array().unwrap() {
         assert!(object.get("path").is_none() && object.get("artifact").is_none(), "{object}");
     }
+    let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(elsewhere));
+}
+
+/// A `.ninfer` container whose header names `model_id`, holding one 1-byte resource; its size.
+fn container(path: &Path, model_id: &str) -> u64 {
+    let identity = ArtifactIdentity { model_id: model_id.to_owned(), weights_id: "test".to_owned() };
+    let mut writer = ContainerWriter::create(path, identity, 4096).unwrap();
+    writer.append_resource("test/r", ResourceEncoding::RawBytesV1, 1, &mut &b"x"[..]).unwrap();
+    writer.finish().unwrap()
+}
+
+/// GitHub #448: every row says its `kind` — the artifact header's when the
+/// file is there, which wins (ADR 0047), else what the catalog tells of the
+/// entry, its `kind` or its family's (ADR 0074), else none.
+#[tokio::test]
+async fn every_row_says_its_kind_the_headers_when_the_file_is_there_else_the_catalogs() {
+    let loader = MockLoader::new();
+    let dir = fresh_dir("kind");
+    let zeros = "0".repeat(64);
+    let mut yaml = String::from("models:\n");
+    // (id, the family it states, the model id its artifact's header names when on disk)
+    for (id, family, header) in [
+        ("acme-free", None, None),
+        ("acme-header", None, Some("ignis-image-2.1-turbo")),
+        ("acme-said-text", Some("qwen3.8-27b"), None),
+        ("acme-disagrees", Some("qwen3.8-27b"), Some("ignis-image-2.1-turbo")),
+    ] {
+        let bytes = header.map_or(7, |header| container(&dir.join(format!("{id}.ninfer")), header));
+        if header.is_some() {
+            std::fs::write(dir.join(format!("{id}.ninfer.graft.json")), b"x").unwrap();
+        }
+        let family = family.map_or(String::new(), |family| format!("    family: {family}\n"));
+        yaml.push_str(&format!(
+            "  - id: {id}\n    repo: acme/{id}\n    revision: v1\n    artifact: {id}.ninfer\n    card_class: 32\n{family}    files:\n      - {{ name: {id}.ninfer.graft.json, bytes: 1, sha256: \"{zeros}\" }}\n      - {{ name: {id}.ninfer, bytes: {bytes}, sha256: \"{zeros}\" }}\n"
+        ));
+    }
+    let models = CatalogModels { catalog: Arc::new(parse_operator(&yaml, Format::Yaml, "test").expect("a valid catalog")), dir: dir.clone() };
+    let elsewhere = fresh_dir("kind-elsewhere");
+    let start = file_in(&elsewhere, "mock-a.ninfer", b"start");
+    let on_disk = file_in(&elsewhere, "mock-k.ninfer", b"known!!");
+    let gone = elsewhere.join("gone.ninfer");
+    let app = server_with(&loader, &start, models, &[("mock-k", &on_disk), ("mock-gone", &gone)], true).app();
+
+    let (status, rows) = send(&app, Method::GET, "/v1/models/catalog", None).await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    let kinds: Vec<(&str, Option<&str>)> = rows["data"].as_array().unwrap().iter().map(|row| (row["id"].as_str().unwrap(), row["kind"].as_str())).collect();
+    assert_eq!(
+        kinds,
+        [
+            // The built-in catalog, nothing on disk: each entry's family by its own id, its alias or the one it states, or its `kind`.
+            ("qwen3.8-27b", Some("text")),
+            ("qwen3.8-27b-abliterated", Some("text")),
+            ("qwen3.8-flash-next", Some("text")),
+            ("ignis-image-2.1-turbo", Some("image")),
+            ("qwen3.8-27b-16g", Some("text")),
+            ("qwen3.8-27b-abliterated-16g", Some("text")),
+            ("qwen3-asr-1.7b", Some("speech")),
+            ("qwen3-asr-1.7b-q8", Some("speech")),
+            ("qwen3-asr-0.6b", Some("speech")),
+            ("nemotron-3-diarization", Some("diarizer")),
+            ("acme-free", None),                // a free id, no family, no file: nothing tells
+            ("acme-header", Some("image")),     // the header tells where the catalog does not
+            ("acme-said-text", Some("text")),   // the family it states, no file to read
+            ("acme-disagrees", Some("image")),  // the header wins over the family it states
+            ("mock-a", Some("text")),           // the loaded model: what it runs
+            ("mock-gone", None),                // its file is gone
+            ("mock-k", None),                   // a file with no header to read
+        ]
+    );
     let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(elsewhere));
 }
 

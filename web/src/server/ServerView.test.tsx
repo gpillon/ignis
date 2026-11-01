@@ -5,7 +5,7 @@ import { CATALOG, CONFIG, FIELDS, ORIGINS } from "./fixture.ts";
 import { ConfigFileDialog, FILE_NOTE, INITIAL_FOCUS } from "./ConfigFile.tsx";
 import { ConfigForm } from "./ConfigForm.tsx";
 import { type Draft, editDraft, removeDraft, rowView } from "./form.ts";
-import type { FieldDecl } from "./routes.ts";
+import type { CatalogRow, FieldDecl } from "./routes.ts";
 import { ServerView } from "./ServerView.tsx";
 import type { ServerActions, ServerState } from "./useServer.ts";
 
@@ -92,6 +92,26 @@ describe("ServerView: the model band", () => {
     expect(html).not.toContain("Copy download command");
     expect(html).toContain("On disk, 67.8 GiB");
     expect(html).toContain("Partly downloaded, 6 GiB of 18.07 GiB");
+  });
+
+  // GitHub #448: each row's model kind, as the server tells it, under the Type heading.
+  it("says each model's kind under the Type heading, and nothing where the server tells none", () => {
+    const rows: CatalogRow[] = [
+      ...CATALOG,
+      { id: "ignis-image-2.1-turbo", source: "built-in", kind: "image", on_disk: "absent", bytes: 16722262468, loaded: false, switchable: false, download: "none", bytes_on_disk: 0 },
+      { id: "qwen3-asr-1.7b", source: "built-in", kind: "speech", on_disk: "complete", bytes: 1288490188, loaded: false, switchable: false, download: "none", bytes_on_disk: 1288490188 },
+      { id: "nemotron-3-diarization", source: "built-in", kind: "diarizer", on_disk: "absent", bytes: 966367641, loaded: false, switchable: false, download: "none", bytes_on_disk: 0 },
+    ];
+    const html = render({ catalog: { state: "ok", value: rows } });
+    expect(html).toMatch(/>Model<.*>Type<.*>Source<.*>On disk</);
+    /** The markup of the catalog row of `id`, from its `<li>` to the next. */
+    const item = (id: string) => html.split("<li").find((li) => li.includes(`>${id}</span>`)) ?? "";
+    expect(item("qwen3.8-flash-next")).toContain(">Text<");
+    expect(item("ignis-image-2.1-turbo")).toContain(">Image<");
+    expect(item("qwen3-asr-1.7b")).toContain(">Speech<");
+    expect(item("nemotron-3-diarization")).toContain(">Diarizer<");
+    // An operator entry of no family, not downloaded: the server tells no kind.
+    expect(item("qwen3.8-27b-custom")).not.toMatch(/>(Text|Image|Speech|Diarizer)</);
   });
 
   // Spec speech/08: the diarizer beside the speech model, its id, whether it

@@ -27,10 +27,13 @@ model that gives a live transcript its
 model's idle unload frees it) or **Not loaded**. Either one that cannot serve
 reads **Unavailable**, with the server's reason under the figures: turned off,
 or its files missing, with the `ignis-server model download` command that
-fetches them. Under it, one row per model the server's catalog knows
-(`GET /v1/models/catalog`): where the entry comes from (the built-in catalog,
-an [operator catalog](../guides/operator-catalog.md), or a known model), how
-much of it is on disk, and its action:
+fetches them. Under it, a table with one row per model the server's catalog
+knows (`GET /v1/models/catalog`): its **Type** (`Text`, `Image`, `Speech` or
+`Diarizer`, known before a built-in entry is downloaded, and blank only when
+nothing tells it, as for an operator entry of no family not yet downloaded),
+its **Source** (the built-in catalog, an
+[operator catalog](../guides/operator-catalog.md), or a known model), how
+much of it is **On disk**, and its action:
 
 - **Loaded** for the model that serves;
 - **Load** for one on disk: it switches to it by id (`POST /v1/models/switch`),
