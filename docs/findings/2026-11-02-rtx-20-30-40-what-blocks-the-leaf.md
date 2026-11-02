@@ -7,7 +7,7 @@
 - Scope: kernel / every CUDA translation unit of `ignis_kernel` and `ignis_vendor` and its op tests, the build's
   architecture target, the instructions each route needs; serving / `--profile auto` and the card class; models / which
   catalog entry depends on which route
-- Related: [GitHub #456](https://github.com/gpillon/ignis/issues/456),
+- Related: [GitHub #456](https://github.com/gpillon/ignis/issues/456), [GitHub #457](https://github.com/gpillon/ignis/issues/457),
   [ADR 0005](../adr/0005-performance-first-principle.md),
   [ADR 0010](../adr/0010-vendored-reference-kernels.md),
   [ADR 0031](../adr/0031-vendored-kernel-bottleneck-exemption.md),
@@ -158,4 +158,6 @@ Inferred (not run on any of these cards):
 ## Follow-ups
 
 - [GitHub #456](https://github.com/gpillon/ignis/issues/456): RTX 30 and 40 support (idea).
+- [GitHub #457](https://github.com/gpillon/ignis/issues/457): a start on a card the kernels were not built for refuses
+  by name, before the load.
 - Raw evidence: `.scratch/arch-probe/sm89-ninja-k0.log`, `.scratch/arch-probe/arch-probe.ps1`.
