@@ -1,5 +1,6 @@
 import { Fragment, type ReactNode, useState } from "react";
 import { field, fieldLook } from "../ui/classes.ts";
+import { IconClose, IconSearch } from "../ui/icons.tsx";
 import { Segmented } from "../ui/Segmented.tsx";
 import { Switch } from "../ui/Switch.tsx";
 import { ConfigFileButton } from "./ConfigFile.tsx";
@@ -11,9 +12,12 @@ import {
   draftKey,
   familiesOf,
   familyName,
+  type FieldMatch,
+  fieldMatches,
   firstSentence,
   groupTitle,
   type InForce,
+  inScope,
   labelOf,
   noteLines,
   rowView,
@@ -32,7 +36,13 @@ import type { Loaded } from "./useServer.ts";
 //
 // A scope selector at the top picks whose values the rows show and edit (spec
 // playground/05 §Follow-up): "All models" the shared ones, a family its own
-// where it has any. It opens on the running family.
+// where it has any, and only the fields a family can set for itself
+// (`inScope`): one value for every model is All models' to show and change. It
+// opens on All models; the running family's segment is filled with the heat.
+//
+// A search beside it narrows the rows to the fields it finds (by key, flag,
+// environment variable or description) and the groups that hold them. It only
+// hides rows: a change on a hidden one stays in the draft, and in the patch.
 
 /** What a row's controls ask of the draft: an edit, the family's own value removed, or that removal taken back. */
 export type RowEdits = {
@@ -50,6 +60,7 @@ export function ConfigForm({
   draft,
   marked,
   initialScope,
+  initialQuery = "",
   ...edits
 }: {
   fields: Loaded<FieldDecl[]>;
@@ -62,17 +73,19 @@ export function ConfigForm({
   family: string | null;
   draft: Draft;
   marked: string[];
-  /** The scope the form opens on: a family, or `null` for "All models". Unset, the running family. */
+  /** The scope the form opens on: a family, or `null` for "All models". Unset, All models. */
   initialScope?: string | null;
+  /** The search the form opens with; empty, every field shows. */
+  initialQuery?: string;
 } & RowEdits) {
-  // Undefined until picked: the scope then follows the running family, which the catalog may name only after the first read.
-  const [picked, setPicked] = useState<string | null | undefined>(initialScope);
-  const scope = picked === undefined ? family : picked;
+  const [scope, setScope] = useState<string | null>(initialScope ?? null);
+  const [query, setQuery] = useState(initialQuery);
   return (
     <section aria-labelledby="server-config" className="flex flex-col gap-3">
       <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-1">
         <div className="min-w-0">
-          <h2 id="server-config" className="font-display text-xl font-semibold">
+          {/* The tab above names it: the heading stays for a screen reader's outline. */}
+          <h2 id="server-config" className="sr-only">
             Configuration
           </h2>
           <p className="text-sm text-ash">
@@ -81,16 +94,16 @@ export function ConfigForm({
         </div>
         {config.state === "ok" && <ConfigFileButton />}
       </div>
-      <Body fields={fields} config={config} origins={origins} catalog={catalog} family={family} scope={scope} onScope={setPicked} draft={draft} marked={marked} {...edits} />
+      <Body fields={fields} config={config} origins={origins} catalog={catalog} family={family} scope={scope} onScope={setScope} query={query} onQuery={setQuery} draft={draft} marked={marked} {...edits} />
     </section>
   );
 }
 
-/** "All models", then a family each, the running one marked: a segmented row from `sm`, a select below it. */
+/** "All models", then a family each, the running one marked: a segmented row from `sm`, filled with the heat; a select below it, in words. */
 function ScopeSelector({ families, running, scope, onScope }: { families: string[]; running: string | null; scope: string | null; onScope: (scope: string | null) => void }) {
-  const options = [
+  const options: { value: string; label: string; accent?: string }[] = [
     { value: "all", label: "All models" },
-    ...families.map((f) => ({ value: f, label: f === running ? `${familyName(f)} (running)` : familyName(f) })),
+    ...families.map((f) => ({ value: f, label: familyName(f), accent: f === running ? "running" : undefined })),
   ];
   const value = scope ?? "all";
   const pick = (next: string) => onScope(next === "all" ? null : next);
@@ -102,7 +115,7 @@ function ScopeSelector({ families, running, scope, onScope }: { families: string
       <select aria-label="Scope" name="server-scope-select" value={value} onChange={(e) => pick(e.target.value)} className={`w-full ${fieldLook} sm:hidden`}>
         {options.map((option) => (
           <option key={option.value} value={option.value}>
-            {option.label}
+            {option.accent ? `${option.label} (${option.accent})` : option.label}
           </option>
         ))}
       </select>
@@ -118,10 +131,12 @@ function Body({
   family,
   scope,
   onScope,
+  query,
+  onQuery,
   draft,
   marked,
   ...edits
-}: Parameters<typeof ConfigForm>[0] & { scope: string | null; onScope: (scope: string | null) => void }) {
+}: Parameters<typeof ConfigForm>[0] & { scope: string | null; onScope: (scope: string | null) => void; query: string; onQuery: (query: string) => void }) {
   if (config.state === "error" && config.refusal.status === 501) {
     return <Notice>This server has no running configuration to show. The model above can still be switched.</Notice>;
   }
@@ -129,12 +144,32 @@ function Body({
   if (config.state === "error") return <Notice>The configuration could not be read: {config.refusal.message}</Notice>;
   if (fields.state === "loading" || config.state === "loading") return <p className="py-6 text-sm text-ash">Reading the configuration…</p>;
 
-  const groups = [...new Set(fields.value.map((decl) => decl.group))];
+  const shown = fields.value.filter((decl) => inScope(decl, scope));
+  const groups = [...new Set(shown.map((decl) => decl.group))];
+  const found = shown.flatMap((decl) => {
+    const match = fieldMatches(decl, query);
+    return match ? [{ decl, match }] : [];
+  });
+  const holding = new Set(found.map(({ decl }) => decl.group));
   const changed = changes(draft);
   const jump = (group: string) => document.getElementById(`server-group-${group}`)?.scrollIntoView({ block: "start" });
   return (
     <div className="flex flex-col gap-3">
-      <ScopeSelector families={familiesOf(fields.value, catalog.state === "ok" ? catalog.value : null, family)} running={family} scope={scope} onScope={onScope} />
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch sm:gap-4">
+        <div className="min-w-0 sm:flex-1">
+          <ScopeSelector families={familiesOf(fields.value, catalog.state === "ok" ? catalog.value : null, family)} running={family} scope={scope} onScope={onScope} />
+        </div>
+        <SearchBox query={query} count={found.length} onQuery={onQuery} />
+      </div>
+      {scope !== null && (
+        <p className="text-sm text-ash">
+          {`Only what ${familyName(scope)} can set for itself. The rest is in `}
+          <button type="button" onClick={() => onScope(null)} className="text-ember hover:underline">
+            All models
+          </button>
+          .
+        </p>
+      )}
       <div className="lg:grid lg:grid-cols-[11rem_minmax(0,1fr)] lg:items-start lg:gap-6">
         <nav aria-label="Configuration groups" className="sticky top-4 hidden lg:block">
           <ul className="flex flex-col">
@@ -142,10 +177,12 @@ function Body({
               const count = Object.values(changed).filter((entry) => entry.group === group).length;
               return (
                 <li key={group}>
+                  {/* A group the search finds nothing in stays, dimmed, so the list does not jump; its changes still count. */}
                   <button
                     type="button"
+                    disabled={!holding.has(group)}
                     onClick={() => jump(group)}
-                    className="flex w-full items-baseline justify-between gap-2 px-3 py-1.5 text-left text-sm text-ash hover:bg-surface hover:text-ink"
+                    className="flex w-full items-baseline justify-between gap-2 px-3 py-1.5 text-left text-sm text-ash enabled:hover:bg-surface enabled:hover:text-ink disabled:opacity-40"
                   >
                     {groupTitle(group)}
                     {count > 0 && <span className="text-xs text-ember tabular-nums">{count}</span>}
@@ -156,7 +193,15 @@ function Body({
           </ul>
         </nav>
         <div className="cut min-w-0 bg-surface [--cut-size:14px]">
-          {groups.map((group) => (
+          {query.trim() !== "" && found.length === 0 && (
+            <p className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-4 py-6 text-sm text-ash md:px-5">
+              <span>No field matches “{query.trim()}”.</span>
+              <button type="button" onClick={() => onQuery("")} className="text-ember hover:underline">
+                Clear search
+              </button>
+            </p>
+          )}
+          {groups.filter((group) => holding.has(group)).map((group) => (
             <section
               key={group}
               id={`server-group-${group}`}
@@ -167,12 +212,13 @@ function Body({
                 <span className="font-display text-[17px] font-semibold">{groupTitle(group)}</span>
                 <code className="font-mono text-xs text-ash">{group}</code>
               </h3>
-              {fields.value
-                .filter((decl) => decl.group === group)
-                .map((decl) => (
+              {found
+                .filter(({ decl }) => decl.group === group)
+                .map(({ decl, match }) => (
                   <FieldRow
                     key={decl.file_key}
                     decl={decl}
+                    match={match}
                     config={config.value}
                     origins={origins.state === "ok" ? origins.value : null}
                     scope={scope}
@@ -189,12 +235,62 @@ function Body({
   );
 }
 
+/** The search over the fields, in the look of the Transcribe view's: the count inside it, Escape or ✕ to clear. */
+function SearchBox({ query, count, onQuery }: { query: string; count: number; onQuery: (query: string) => void }) {
+  const searching = query.trim() !== "";
+  return (
+    <div
+      role="search"
+      className={`flex min-h-[34px] items-center gap-1.5 rounded-[2px] border bg-surface pr-1 pl-2.5 sm:w-72 sm:shrink-0 ${searching ? "border-ember/70" : "border-line"} focus-within:border-ember`}
+    >
+      <span className="text-ash" aria-hidden="true">
+        <IconSearch />
+      </span>
+      <input
+        type="search"
+        name="server-search"
+        aria-label="Search the configuration"
+        value={query}
+        placeholder="Find a field"
+        autoComplete="off"
+        spellCheck={false}
+        onChange={(e) => onQuery(e.currentTarget.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") onQuery("");
+        }}
+        className="min-w-0 flex-1 bg-transparent py-1.5 text-sm text-ink placeholder:text-ash focus:outline-none [&::-webkit-search-cancel-button]:hidden"
+      />
+      <span aria-live="polite" className={`shrink-0 font-display text-xs tabular-nums ${count === 0 ? "text-fault" : "text-ash"}`}>
+        {searching ? (count === 0 ? "None" : count === 1 ? "1 field" : `${count} fields`) : ""}
+      </span>
+      {searching && (
+        <button type="button" aria-label="Clear the search" onClick={() => onQuery("")} className="grid size-6 place-items-center text-ash hover:text-ink">
+          <IconClose />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** `text` with the spans a search matched marked. */
+function Marked({ text, marks }: { text: string; marks: [number, number][] }) {
+  const parts: ReactNode[] = [];
+  let at = 0;
+  for (const [from, to] of marks) {
+    parts.push(text.slice(at, from), <mark key={from} className="bg-ember/20 text-ink">{text.slice(from, to)}</mark>);
+    at = to;
+  }
+  parts.push(text.slice(at));
+  return <>{parts}</>;
+}
+
 function Notice({ children }: { children: ReactNode }) {
   return <p className="cut bg-surface px-4 py-3 text-sm text-ash [--cut-size:10px]">{children}</p>;
 }
 
 function FieldRow({
   decl,
+  match,
   config,
   origins,
   scope,
@@ -205,6 +301,8 @@ function FieldRow({
   onUndo,
 }: {
   decl: FieldDecl;
+  /** How the search found it: the name's spans to mark, and what to show of why. */
+  match: FieldMatch;
   config: ConfigDocument;
   origins: OriginRow[] | null;
   /** The scope the form shows: a family's scope name, or `null` for "All models". */
@@ -228,11 +326,17 @@ function FieldRow({
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
           <span id={nameId} className="font-mono text-[13px] font-semibold break-all text-ink">
-            {decl.name}
+            <Marked text={decl.name} marks={match.marks} />
           </span>
           {decl.reload_required && mode.kind === "edit" && <ReloadMark />}
         </div>
-        <Description text={decl.description} />
+        {match.ids && (
+          <p className="mt-0.5 flex flex-wrap gap-x-3 font-mono text-xs break-all text-ash">
+            <span>{decl.flag}</span>
+            <span>{decl.env}</span>
+          </p>
+        )}
+        <Description text={decl.description} opens={match.opens} />
         {notes.length > 0 && (
           <ul className="mt-1 flex flex-col gap-0.5 text-xs text-ash">
             {notes.map((note) => (
@@ -257,7 +361,6 @@ function FieldRow({
           <Control decl={decl} id={id} nameId={nameId} value={shown} inForce={entry?.removal ? view.shared : inForce.value} marked={marked} onEdit={(value) => onEdit(decl, inForce, value)} />
         )}
         {mode.kind === "fixed" && <ReadOnly value={shownOf(inForce.value)} note="Set at start" />}
-        {mode.kind === "unused" && <p className="text-sm text-ash md:text-right">Not used by {familyName(mode.family)}</p>}
         {mode.kind === "list" && <KnownModels value={inForce.value} />}
       </div>
     </div>
@@ -274,9 +377,10 @@ function ReloadMark() {
   );
 }
 
-/** The first sentence, the rest behind "More". */
-function Description({ text }: { text: string }) {
-  const [open, setOpen] = useState(false);
+/** The first sentence, the rest behind "More"; open from the start when the search found its word there (`opens`), until toggled. */
+function Description({ text, opens }: { text: string; opens: boolean }) {
+  const [toggled, setOpen] = useState<boolean | null>(null);
+  const open = toggled ?? opens;
   const [first, rest] = firstSentence(text);
   return (
     <p className="mt-1 text-sm text-ash">
@@ -288,7 +392,7 @@ function Description({ text }: { text: string }) {
         </>
       )}
       {rest && (
-        <button type="button" aria-expanded={open} onClick={() => setOpen((o) => !o)} className="ml-1.5 text-ember hover:underline">
+        <button type="button" aria-expanded={open} onClick={() => setOpen(!open)} className="ml-1.5 text-ember hover:underline">
           {open ? "Less" : "More"}
         </button>
       )}

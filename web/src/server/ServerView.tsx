@@ -1,19 +1,24 @@
+import { type KeyboardEvent, type ReactNode, useState } from "react";
 import { canSend, type ModelState } from "../api/model.ts";
 import { IconClose } from "../ui/icons.tsx";
 import { ConfigForm } from "./ConfigForm.tsx";
 import { actionInk, actionShape } from "../ui/classes.ts";
 import { changes, drainTimeout, familiesOf, needsReload, primaryLabel, waitingForOthers, waitingLine } from "./form.ts";
-import { ModelBand } from "./ModelBand.tsx";
+import { Models } from "./Models.tsx";
+import { StatusBar } from "./StatusBar.tsx";
 import { drainNote, type Line } from "./outcome.ts";
 import { runningFamily } from "./band.ts";
 import { downloadsFromPage, runningDownload } from "./download.ts";
 import { removalsFromPage } from "./removal.ts";
 import type { ServerActions, ServerState } from "./useServer.ts";
 
-// The Server view (spec playground/05, GitHub #316): the loaded model and the
-// models it can switch to, then the running configuration as a form, and a
-// dock at the foot while the draft holds a change. It has no side drawers.
-// It renders `state` and nothing else; useServer owns it.
+// The Server view (spec playground/05, GitHub #316): a status bar of what
+// each engine runs, which stays put, then two tabs whose panels scroll under
+// it (GitHub #454), the models the server can switch to or fetch, and the
+// running configuration as a form, and a dock at the foot while the draft
+// holds a change. Both panels stay mounted, so a draft, a search and a scope
+// outlive a change of tab. It has no side drawers. It renders `state` and
+// nothing else; useServer owns it.
 
 export function ServerView({
   model,
@@ -35,53 +40,103 @@ export function ServerView({
   const drain = drainTimeout(config);
   const count = Object.keys(changes(state.draft)).length;
   const docked = Object.keys(state.draft).length > 0 || state.result !== null || state.pending !== null;
+  const [tab, setTab] = useState<ServerTab>("models");
   return (
-    <main aria-label="Server" className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-      <div className="mx-auto flex w-full max-w-[1180px] flex-1 flex-col gap-6 px-4 py-5 md:px-6">
-        <ModelBand
-          model={model}
-          catalog={state.catalog}
-          loadingId={state.loadingId}
-          refusal={state.loadRefusal ?? state.downloadRefusal}
-          streaming={streaming}
-          drain={drain}
-          now={now}
-          onLoad={actions.load}
-          downloads={{
-            gate: { fromPage: downloadsFromPage(config), busy: state.downloadingId !== null || runningDownload(rows) !== null },
-            sendingId: state.downloadingId,
-            speed: state.downloadSpeed,
-            onDownload: actions.download,
-            cancelling: state.cancelling,
-            onCancel: actions.cancel,
-          }}
-          removals={{
-            gate: { fromPage: removalsFromPage(config), busy: state.removingId !== null },
-            removingId: state.removingId,
-            confirming: state.confirmingRemoval,
-            config,
-            onAsk: actions.askRemoval,
-            onConfirm: actions.confirmRemoval,
-            onKeep: actions.keepModel,
-          }}
-          removal={state.removal}
-        />
-        <ConfigForm
-          fields={state.fields}
-          config={state.config}
-          origins={state.origins}
-          catalog={state.catalog}
-          family={family}
-          draft={state.draft}
-          marked={state.marked}
-          onEdit={actions.edit}
-          onRemove={actions.remove}
-          onUndo={actions.undo}
-        />
+    <main aria-label="Server" className="flex min-h-0 flex-1 flex-col">
+      <div className="mx-auto w-full max-w-[1180px] shrink-0 px-4 pt-5 md:px-6">
+        <StatusBar model={model} family={family} streaming={streaming} drain={drain} now={now} />
+        <div role="tablist" aria-label="Server sections" onKeyDown={(e) => step(e, setTab)} className="mt-4 flex gap-6 border-b border-line">
+          <Tab tab="models" selected={tab} onSelect={setTab}>
+            Models
+          </Tab>
+          <Tab tab="config" selected={tab} onSelect={setTab}>
+            Configuration
+            {count > 0 && <span className="ml-1.5 text-xs text-ember tabular-nums">{count}</span>}
+          </Tab>
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto w-full max-w-[1180px] px-4 py-5 md:px-6">
+          <div role="tabpanel" id="server-panel-models" aria-labelledby="server-tab-models" hidden={tab !== "models"}>
+            <Models
+              model={model}
+              catalog={state.catalog}
+              disk={state.disk}
+              loadingId={state.loadingId}
+              refusal={state.loadRefusal ?? state.downloadRefusal}
+              onLoad={actions.load}
+              downloads={{
+                gate: { fromPage: downloadsFromPage(config), busy: state.downloadingId !== null || runningDownload(rows) !== null },
+                sendingId: state.downloadingId,
+                speed: state.downloadSpeed,
+                onDownload: actions.download,
+                cancelling: state.cancelling,
+                onCancel: actions.cancel,
+              }}
+              removals={{
+                gate: { fromPage: removalsFromPage(config), busy: state.removingId !== null },
+                removingId: state.removingId,
+                confirming: state.confirmingRemoval,
+                config,
+                onAsk: actions.askRemoval,
+                onConfirm: actions.confirmRemoval,
+                onKeep: actions.keepModel,
+              }}
+              removal={state.removal}
+            />
+          </div>
+          <div role="tabpanel" id="server-panel-config" aria-labelledby="server-tab-config" hidden={tab !== "config"}>
+            <ConfigForm
+              fields={state.fields}
+              config={state.config}
+              origins={state.origins}
+              catalog={state.catalog}
+              family={family}
+              draft={state.draft}
+              marked={state.marked}
+              onEdit={actions.edit}
+              onRemove={actions.remove}
+              onUndo={actions.undo}
+            />
+          </div>
+        </div>
       </div>
       {docked && <Dock model={model} state={state} actions={actions} count={count} streaming={streaming} drain={drain} family={family} />}
     </main>
   );
+}
+
+type ServerTab = "models" | "config";
+const TABS: ServerTab[] = ["models", "config"];
+
+/** A tab, in the header's look: the selected one in ink over the ember's line. */
+function Tab({ tab, selected, onSelect, children }: { tab: ServerTab; selected: ServerTab; onSelect: (tab: ServerTab) => void; children: ReactNode }) {
+  const on = tab === selected;
+  return (
+    <button
+      type="button"
+      role="tab"
+      id={`server-tab-${tab}`}
+      aria-selected={on}
+      aria-controls={`server-panel-${tab}`}
+      tabIndex={on ? 0 : -1}
+      onClick={() => onSelect(tab)}
+      className={`-mb-px flex items-baseline border-b-2 pb-2.5 font-display text-[15px] font-medium ${on ? "border-ember text-ink" : "border-transparent text-ash hover:text-ink"}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** The arrow keys move between the tabs, as a tab list's do. */
+function step(e: KeyboardEvent, onSelect: (tab: ServerTab) => void) {
+  const by = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+  if (by === 0) return;
+  e.preventDefault();
+  const at = TABS.findIndex((tab) => document.getElementById(`server-tab-${tab}`) === document.activeElement);
+  const next = TABS[(Math.max(at, 0) + by + TABS.length) % TABS.length];
+  onSelect(next);
+  document.getElementById(`server-tab-${next}`)?.focus();
 }
 
 const TONE: Record<Line["tone"], string> = { done: "text-good", warn: "text-warn", fault: "text-fault" };

@@ -237,7 +237,8 @@ export const CONFIG: ConfigDocument = {
 /**
  * `GET /v1/models/catalog` with the 27B loaded: the three built-in entries
  * (their totals are the catalog's file sizes summed), an operator entry not
- * fetched, of no family (so the server tells no `kind`), and a known model
+ * fetched, of no family (so the server tells no `kind`), the speech model and
+ * the diarizer, not fetched (as the mock's `speech` says), and a known model
  * that is no catalog entry.
  */
 export const CATALOG: CatalogRow[] = [
@@ -245,6 +246,8 @@ export const CATALOG: CatalogRow[] = [
   { id: "qwen3.8-27b-abliterated", source: "built-in", kind: "text", on_disk: "partial", bytes: 19406984175, loaded: false, switchable: false, download: "none", bytes_on_disk: 6442450944 },
   { id: "qwen3.8-flash-next", source: "built-in", kind: "text", on_disk: "complete", bytes: 72799980571, family: "qwen38flashnext", loaded: false, switchable: true, download: "none", bytes_on_disk: 72799980571 },
   { id: "qwen3.8-27b-custom", source: "operator", on_disk: "absent", bytes: 19406949449, loaded: false, switchable: false, download: "none", bytes_on_disk: 0 },
+  { id: "qwen3-asr-1.7b", source: "built-in", kind: "speech", on_disk: "absent", bytes: 1642070016, loaded: false, switchable: false, download: "none", bytes_on_disk: 0 },
+  { id: "nemotron-3-diarization", source: "built-in", kind: "diarizer", on_disk: "absent", bytes: 199229440, loaded: false, switchable: false, download: "none", bytes_on_disk: 0 },
   { id: "qwen3.8-27b-dead", source: "known", kind: "text", on_disk: "complete", bytes: 19406942468, family: "qwen38", loaded: false, switchable: true, download: "none", bytes_on_disk: 19406942468 },
   { id: "qwen3.8-27b-fail", source: "known", kind: "text", on_disk: "complete", bytes: 19406942468, family: "qwen38", loaded: false, switchable: true, download: "none", bytes_on_disk: 19406942468 },
 ];

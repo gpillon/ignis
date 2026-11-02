@@ -11,8 +11,11 @@ describe("createMetricsSim", () => {
     expect(first.kvDisk).toMatchObject({ used: 0, spills: { device: 0, kv_ram: 0 }, failures: { write: 0, read: 0 } });
     expect(first.retained.spills.disk).toEqual({ checkpoint: 0, prefix: 0 });
 
-    // Ten minutes of traffic: the disk fills a little and every series stays known.
-    const later = readSnapshot(parseExposition(sim.render(start + 600_000)));
+    // Ten minutes of traffic: the disk fills a little and every series stays known. A scrape
+    // simulates at most the 120 s before it, so the ten minutes are scraped once a minute (#455).
+    let text = "";
+    for (let t = start + 60_000; t <= start + 600_000; t += 60_000) text = sim.render(t);
+    const later = readSnapshot(parseExposition(text));
     expect(later.unknown).toEqual([]);
     expect(later.kvDisk?.capacity).toBeGreaterThan(0);
     expect(later.kvDisk?.used).toBeLessThanOrEqual(later.kvDisk!.capacity!);

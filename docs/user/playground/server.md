@@ -1,20 +1,23 @@
 ---
 title: "Server"
-description: "The Server view: the loaded model, the models a switch can go to, and the running configuration as a form you can apply."
+description: "The Server view: what each engine runs, the models a switch can go to or the server can fetch, and the running configuration as a form you can apply."
 sidebar:
   order: 10
 ---
 
 The **Server** view changes the running server from the page. At the top, the
-**model band**: what is loaded, its state and context, and every model the
-server knows. Below it, the **configuration**: every field the server runs
-with, as a form. Applying a change sends one `PATCH /v1/config`; the server
-judges every value, applies what it can live, and reloads the model only for
-a field that needs it.
+**status bar**: what each engine runs now (the main model, the speech model,
+the diarizer) and how the last switch ended. It stays in place while the two
+tabs under it scroll: **Models**, every model the server can switch to or
+fetch, and **Configuration**, every field the server runs with, as a form.
+Applying a change sends one `PATCH /v1/config`; the server judges every value,
+applies what it can live, and reloads the model only for a field that needs
+it. A change of tab leaves the other as it was: a draft, a search and a scope
+stay.
 
-![The model band and the start of the configuration](../images/playground/server.png)
+![The status bar and the Models tab](../images/playground/server.png)
 
-## The model band
+## The status bar
 
 The headline is the loaded model's id with its **State** (`Serving`,
 `Switching`, `Loading`, `Unloaded`, `Not serving`), its **Context** in tokens
@@ -25,19 +28,47 @@ model that gives a live transcript its
 [speakers](../api/realtime-transcription.md#speakers), with whether it is
 **Loaded** (the first session that asks for speakers loads it, the speech
 model's idle unload frees it) or **Not loaded**. Either one that cannot serve
-reads **Unavailable**, with the server's reason under the figures: turned off,
-or its files missing, with the `ignis-server model download` command that
-fetches them. Under it, a table with one row per model the server's catalog
-knows (`GET /v1/models/catalog`): its **Type** (`Text`, `Image`, `Speech` or
-`Diarizer`, known before a built-in entry is downloaded, and blank only when
-nothing tells it, as for an operator entry of no family not yet downloaded),
-its **Source** (the built-in catalog, an
-[operator catalog](../guides/operator-catalog.md), or a known model), how
-much of it is **On disk**, and its action:
+reads **Unavailable**, and **Why** beside it opens the server's reason under
+the figures: turned off, or its files missing, with the
+`ignis-server model download` command that fetches them.
+
+During a switch the bar says what is happening and for how long; afterwards
+it keeps the outcome: `Switched from … to …`, or why the switch was refused
+or failed and which model serves now. A model the server
+[unloaded while idle](../api/idle-unload.md) shows as **Unloaded**, not as an
+error; the next message loads it again, and **Load** does it now. While a chat
+reply streams, the bar says how long a switch would let it finish
+(`switch.drain_timeout`) before cancelling it.
+
+![A switch from the 27B to Flash-Next, under way](../images/playground/server-switching.png)
+
+## Models
+
+The **Models** tab lists every model the server's catalog knows
+(`GET /v1/models/catalog`), under a line that totals what they take on disk and
+the room left on the volume of the server's `download.path`:
+`The listed models take <size>. <size> free under <path>.`, without the second
+sentence when the server could not read it. The rows are grouped by the engine
+they are for, and a group with no model is left out:
+
+- **Main model**: the text and image models, one loaded at a time; **Load**
+  switches the server to one.
+- **Speech**: the models that transcribe. No row loads one: `speech.model`, in
+  Configuration, picks it.
+- **Diarizer**: the models that tell speakers apart, picked by
+  `diarizer.model` the same way.
+
+Each row says its **Type** (`Text`, `Image`, `Speech` or `Diarizer`, known
+before a built-in entry is downloaded, and blank only when nothing tells it,
+as for an operator entry of no family not yet downloaded), its **Source** (the
+built-in catalog, an [operator catalog](../guides/operator-catalog.md), or a
+known model), how much of it is **On disk**, and its action:
 
 - **Loaded** for the model that serves;
-- **Load** for one on disk: it switches to it by id (`POST /v1/models/switch`),
-  whatever `switch.allow_implicit` says;
+- **Load** for a main model on disk: it switches to it by id
+  (`POST /v1/models/switch`), whatever `switch.allow_implicit` says;
+- **In use** for the speech model or the diarizer the configuration picks,
+  while it can serve; another one on disk offers only **Remove**;
 - **Download** for a catalog entry not on disk: the server downloads it
   ([Downloading a model](#downloading-a-model));
 - **Resume** for one partly downloaded, a cancelled download's included: the
@@ -53,15 +84,8 @@ much of it is **On disk**, and its action:
   beside **Resume** on one partly downloaded: it deletes the entry's files from
   the server, after a confirmation ([Removing a model](#removing-a-model)).
 
-During a switch the band says what is happening and for how long; afterwards
-it keeps the outcome: `Switched from … to …`, or why the switch was refused
-or failed and which model serves now. A model the server
-[unloaded while idle](../api/idle-unload.md) shows as **Unloaded**, not as an
-error; the next message loads it again, and **Load** does it now. While a chat
-reply streams, the band says how long a switch would let it finish
-(`switch.drain_timeout`) before cancelling it.
-
-![A switch from the 27B to Flash-Next, under way](../images/playground/server-switching.png)
+A refused **Load**, **Download** or **Remove** shows the server's reason above
+the list, where the outcome of a removal shows too.
 
 ## Downloading a model
 
@@ -86,15 +110,15 @@ that reads `On disk` shows no failure. A gated
 repository fails naming the token the server reads from its environment
 (`IGNIS_DOWNLOAD_TOKEN`, or `HF_TOKEN` for huggingface.co). The page never asks
 for a token nor shows one. A refused **Download** (another one running, the
-entry already on disk, downloading turned off) shows the server's reason in the
-band.
+entry already on disk, downloading turned off) shows the server's reason above
+the list.
 
 Before a byte is written, the server checks that the volume of its
 `download.path` has room for the entry's bytes still missing plus
 `download.free_margin` (`1G` by default). Short of room, **Download** (or a
 partial entry's **Resume**) is refused, and the reason, naming the bytes needed
 and the bytes free, shows under
-the row rather than in the band, `Download failed: not enough room for …`,
+the row rather than above the list, `Download failed: not enough room for …`,
 until the entry's next download, a restart, or the entry on disk whole
 ([Room on the disk](../guides/models.md#room-on-the-disk---download-free-margin)).
 Free some space there and press it again. `download.free_margin` is
@@ -153,12 +177,13 @@ nothing.
 The server deletes the entry's files under its `download.path`, each at its
 name and its `.part`, and answers once they are gone
 ([Get a model](../guides/models.md#removing-a-model-post-v1modelsremove)). The
-band then says `Removed <id>: <size> freed.`, and the row reads `Not downloaded`
-and offers **Download**. A file another entry also lists stays while that entry
-is on disk or being downloaded, and the band names it, `Kept <file>, which
-<entry> also lists.`: the entry removed then reads partly downloaded.
+line above the list then says `Removed <id>: <size> freed.`, and the row reads
+`Not downloaded` and offers **Download**. A file another entry also lists stays
+while that entry is on disk or being downloaded, and that line names it,
+`Kept <file>, which <entry> also lists.`: the entry removed then reads partly
+downloaded.
 
-The server refuses, with its reason in the band, the model loaded (also when it
+The server refuses, with its reason above the list, the model loaded (also when it
 was unloaded while idle, or serves from the entry's files under another id),
 the model a switch or a load is loading, the speech model the speech worker has
 loaded (until it unloads it, `speech.idle_unload` seconds after its last
@@ -176,11 +201,27 @@ network still frees its disk.
 
 ## The configuration
 
-**Scope** picks what the form edits: **All models** (the shared values) or one
-model family (its own values, which win over the shared ones). The groups
+The **Configuration** tab holds the form; an orange count beside its name says
+how many changes the draft holds, whichever tab is open. **Scope** picks what
+the form shows and edits. **All models**, which the form
+opens on, shows every field with its shared value. A model family shows only
+what that family can set for itself: the fields that take a value per family
+(its own, which wins over the shared one) and the fields only that family
+takes; a field with one value for every model, such as
+`server.request_timeout`, is changed in All models. The running family's
+segment is filled orange. The groups
 (Server, Model, VRAM, Prompt reuse, Model switch, Speculative decoding,
 Vision, Media, image, Download, N-gram table, KV-disk) are listed on the left;
 an orange count marks the groups holding a change.
+
+**Find a field**, beside the scope, narrows the form to the fields that hold
+every word typed, case aside, in their key, their description, their flag or
+their environment variable: `max context`, `--spec-backend` and `IGNIS_VRAM`
+each find theirs. The part of a name it matched is marked; a field found by its
+flag or variable shows them under its name, and one found in the rest of its
+description opens it. A group with nothing found is dimmed on the left. The
+search only hides rows: a change on a hidden one stays in the draft and is
+applied with the rest. **Escape** clears it.
 
 ![The Model group: values, their source, and the fields that reload](../images/playground/server-config.png)
 
@@ -200,7 +241,7 @@ confirmation; there is no dialog.
 - A live change answers at once: `Applied and written to <path>`, the config
   file in use, or why it was not written. A value a flag or an environment
   variable would override at the next start is named.
-- A reload is followed in the model band, then `Reloaded <model> and written
+- A reload is followed in the status bar, then `Reloaded <model> and written
   to <path>`.
 - A refused value is named by the server; its row is marked `Refused by the
   server`, and nothing was applied.

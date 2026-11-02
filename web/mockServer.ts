@@ -1,7 +1,7 @@
 import type { LastSwitch } from "./src/api/model.ts";
 import { CATALOG, CONFIG, FIELDS, originRows, PROVENANCE, type Provenance, SCOPES } from "./src/server/fixture.ts";
 import { familyName, resolved, section } from "./src/server/form.ts";
-import type { CatalogRow, ConfigDocument, FieldDecl } from "./src/server/routes.ts";
+import type { CatalogDisk, CatalogRow, ConfigDocument, FieldDecl } from "./src/server/routes.ts";
 
 // A fake of the routes the Server view talks to, for `npm run dev:mock`
 // (spec playground/05 §Mock): GET /v1/config/fields, GET and PATCH
@@ -330,7 +330,7 @@ export function createServerSim() {
       };
     },
 
-    catalog(now: number): { object: "list"; data: CatalogRow[] } {
+    catalog(now: number): { object: "list"; data: CatalogRow[]; disk: CatalogDisk } {
       advance(now);
       return {
         object: "list",
@@ -339,6 +339,8 @@ export function createServerSim() {
           // A switch can begin while serving or after a failed one, never during one.
           return { ...row, loaded: isLoaded, switchable: !running && !isLoaded && onDisk(row), ...downloadOf(row, now) };
         }),
+        // GitHub #453: the room left under download.path, a made-up 412 GiB.
+        disk: { path: String(CONFIG.download.path), free_bytes: 412 * 1024 ** 3 },
       };
     },
 

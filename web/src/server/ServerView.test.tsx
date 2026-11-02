@@ -23,6 +23,7 @@ const base: ServerState = {
   config: { state: "ok", value: CONFIG },
   origins: { state: "ok", value: ORIGINS },
   catalog: { state: "ok", value: CATALOG },
+  disk: null,
   draft: {},
   marked: [],
   result: null,
@@ -46,8 +47,8 @@ const decl = (key: string): FieldDecl => FIELDS.find((f) => f.file_key === key)!
 const edit = (draft: Draft, key: string, value: string | boolean, scope: string | null = "qwen38") =>
   editDraft(draft, decl(key), rowView(decl(key), CONFIG, ORIGINS, scope).inForce, value);
 
-/** The configuration form alone, opened on `scope` (`null` is "All models"). */
-const renderForm = (scope: string | null, draft: Draft = {}) =>
+/** The configuration form alone, opened on `scope` (`null` is "All models"), searching for `query`. */
+const renderForm = (scope: string | null, draft: Draft = {}, query?: string) =>
   renderToStaticMarkup(
     <ConfigForm
       fields={base.fields}
@@ -56,6 +57,7 @@ const renderForm = (scope: string | null, draft: Draft = {}) =>
       catalog={base.catalog}
       family="qwen38"
       initialScope={scope}
+      initialQuery={query}
       draft={draft}
       marked={[]}
       onEdit={actions.edit}
@@ -73,6 +75,58 @@ const rowOf = (html: string, key: string) => {
   const next = names.exec(html);
   return html.slice(start, next ? next.index : undefined);
 };
+
+/** The status bar's markup (GitHub #454): the section named Model, up to the tabs under it. */
+const statusOf = (html: string) => html.slice(html.indexOf('aria-label="Model"'), html.indexOf('role="tablist"'));
+
+describe("ServerView: the layout", () => {
+  it("puts the running model, the speech model and the diarizer in a status bar above the tabs", () => {
+    const html = render({}, { ...ready, speech: { available: true, id: "qwen3-asr-1.7b", diarizer: { id: "nemotron-3-diarization", loaded: false, available: true } } });
+    expect(html.indexOf('aria-label="Model"')).toBeGreaterThan(-1);
+    expect(html.indexOf('aria-label="Model"')).toBeLessThan(html.indexOf('role="tablist"'));
+    const status = statusOf(html);
+    expect(status).toContain(">qwen3.8-27b</h2>");
+    expect(status).toContain("786,432 tokens");
+    expect(status).toMatch(/>Speech<\/dt>.*qwen3-asr-1\.7b/);
+    expect(status).toMatch(/>Diarizer<\/dt>.*nemotron-3-diarization/);
+    // The status bar stays put: only the tabs' panels scroll.
+    expect(html.indexOf("overflow-y-auto")).toBeGreaterThan(html.indexOf('role="tablist"'));
+  });
+
+  it("opens on Models, keeps Configuration mounted but hidden, and counts the draft's changes on its tab", () => {
+    const html = render({ draft: edit(edit({}, "server.request_timeout", "60"), "switch.drain_timeout", "5") });
+    expect(html).toMatch(/<button type="button" role="tab" id="server-tab-models" aria-selected="true"[^>]*>Models<\/button>/);
+    expect(html).toMatch(/<button type="button" role="tab" id="server-tab-config" aria-selected="false"[^>]*>Configuration<span[^>]*>2<\/span><\/button>/);
+    expect(html).toMatch(/<div role="tabpanel" id="server-panel-models" aria-labelledby="server-tab-models"[^>]*>/);
+    expect(html).not.toMatch(/id="server-panel-models"[^>]*hidden=""/);
+    expect(html).toMatch(/<div role="tabpanel" id="server-panel-config" aria-labelledby="server-tab-config"[^>]*hidden=""/);
+    expect(html).toContain('id="server-field-server.request_timeout-name"');
+    expect(render()).toMatch(/>Configuration<\/button>/);
+  });
+
+  it("lists the models by slot under their headings, main first, and offers no Load on a speech model or a diarizer", () => {
+    const html = render();
+    const main = html.indexOf(">Main model</h3>");
+    const speech = html.indexOf(">Speech</h3>");
+    const diarizer = html.indexOf(">Diarizer</h3>");
+    expect(main).toBeGreaterThan(-1);
+    expect(speech).toBeGreaterThan(main);
+    expect(diarizer).toBeGreaterThan(speech);
+    expect(html.slice(main, speech)).toContain(">qwen3.8-flash-next</span>");
+    expect(html.slice(speech, diarizer)).toContain(">qwen3-asr-1.7b</span>");
+    expect(html.slice(speech, diarizer)).toContain("speech.model");
+    expect(html.slice(diarizer)).toContain(">nemotron-3-diarization</span>");
+    expect(html.slice(diarizer)).toContain("diarizer.model");
+    expect(html).not.toContain('aria-label="Load qwen3-asr-1.7b"');
+    expect(html).toContain('aria-label="Download qwen3-asr-1.7b"');
+  });
+
+  it("totals what the listed models take, and the room left where the server downloads them", () => {
+    const html = render({ disk: { path: "/srv/models", free_bytes: 412 * 1024 ** 3 } });
+    expect(html).toMatch(/The listed models take [\d.]+ GiB\. 412 GiB free under \/srv\/models\./);
+    expect(render()).toMatch(/The listed models take [\d.]+ GiB\.</);
+  });
+});
 
 describe("ServerView: the model band", () => {
   it("shows the loaded id, its state, context and family, and one row per catalog row with its action", () => {
@@ -123,11 +177,13 @@ describe("ServerView: the model band", () => {
     expect(html).toMatch(/>Diarizer<\/dt>.*nemotron-3-diarization.*Not loaded/);
     expect(render({}, { ...ready, speech: { available: true, id: "qwen3-asr-1.7b", diarizer: { ...diarizer, loaded: true } } })).toMatch(/nemotron-3-diarization.*>Loaded</);
     const missing = "nemotron-3-diarization is not on disk: `ignis-server model download nemotron-3-diarization`";
-    const unavailable = render({}, { ...ready, speech: { available: false, reason: "the speech model is turned off", diarizer: { ...diarizer, available: false, reason: missing } } });
-    expect(unavailable).toContain("Speech: the speech model is turned off");
-    expect(unavailable).toContain(`Diarizer: ${missing}`);
+    // GitHub #454: why either cannot serve opens under the status bar, from its slot.
+    const unavailable = statusOf(render({}, { ...ready, speech: { available: false, reason: "the speech model is turned off", diarizer: { ...diarizer, available: false, reason: missing } } }));
+    expect(unavailable).toMatch(/<button type="button" aria-expanded="false"[^>]*title="the speech model is turned off"[^>]*>Why<\/button>/);
+    expect(unavailable).toContain(`title="${missing}"`);
+    expect(unavailable).not.toContain("Speech: the speech model is turned off");
     // An older server reports neither.
-    expect(render()).not.toContain(">Diarizer<");
+    expect(statusOf(render())).not.toContain(">Diarizer<");
   });
 
   // GitHub #376: a download from the page, followed on its row.
@@ -302,15 +358,12 @@ describe("ServerView: the configuration", () => {
     expect(rowOf(html, "model.reasoning_effort")).toMatch(/<option value="" disabled="" selected="">auto<\/option>/);
   });
 
-  it("shows set-at-start, not-used and the known models read-only, and marks the fields a change reloads", () => {
+  it("shows set-at-start and the known models read-only, and marks the fields a change reloads", () => {
     const html = render();
     const bind = rowOf(html, "server.bind");
     expect(bind).toContain("127.0.0.1:8000");
     expect(bind).toContain("Set at start");
     expect(bind).not.toMatch(/<input|<select|role="switch"/);
-    const rows = rowOf(html, "spec.draft_rows");
-    expect(rows).toContain("Not used by Qwen3.8-27B");
-    expect(rows).not.toMatch(/<input|<select/);
     const known = rowOf(html, "switch.known_models");
     expect(known).toContain("qwen3.8-27b-fail");
     expect(known).toContain("Read-only here");
@@ -333,7 +386,7 @@ describe("ServerView: the configuration", () => {
   });
 
   it("reads a scoped field from the running family's section and says so", () => {
-    const html = render();
+    const html = renderForm("qwen38");
     const context = rowOf(html, "model.max_context");
     expect(context).toContain('value="786432"');
     expect(context).toContain("Own value");
@@ -354,6 +407,48 @@ describe("ServerView: the configuration", () => {
   });
 });
 
+/** The side navigation's markup. */
+const navOf = (html: string) => html.slice(html.indexOf('aria-label="Configuration groups"'), html.indexOf("</nav>"));
+
+describe("ServerView: the configuration search", () => {
+  it("shows only the fields a search finds, under their group, with the part of the name it matched marked", () => {
+    const html = renderForm(null, {}, "DRAIN");
+    expect([...html.matchAll(/id="server-field-([\w.]+)-name"/g)].map((m) => m[1])).toEqual(["switch.drain_timeout"]);
+    expect(html).toContain('id="server-group-switch"');
+    expect(html).not.toContain('id="server-group-model"');
+    expect(rowOf(html, "switch.drain_timeout")).toContain("<mark");
+    expect(html).toMatch(/<input[^>]*type="search"[^>]*value="DRAIN"/);
+    expect(html).toContain(">1 field<");
+  });
+
+  it("shows the flag and variable of a field found by them, and opens a description found behind More", () => {
+    const byFlag = rowOf(renderForm(null, {}, "max-context"), "model.max_context");
+    expect(byFlag).toContain("--model-max-context");
+    expect(byFlag).toContain("IGNIS_MODEL_MAX_CONTEXT");
+    expect(rowOf(renderForm(null), "model.max_context")).not.toContain("--model-max-context");
+    const opened = rowOf(renderForm(null, {}, "flash-next"), "model.id");
+    expect(opened).toContain("Unset, a load is served under");
+    expect(opened).toContain(">Less<");
+  });
+
+  it("says when no field matches, and keeps every group in the side navigation, dimmed", () => {
+    const html = renderForm(null, {}, "nothing-is-called-this");
+    expect(html).not.toMatch(/id="server-field-/);
+    expect(html).toContain("No field matches");
+    expect(html).toContain(">Clear search<");
+    expect(html).toContain(">None<");
+    const nav = navOf(html);
+    expect(nav.match(/<button/g)).toHaveLength(new Set(FIELDS.map((f) => f.group)).size);
+    expect(nav.match(/<button[^>]*disabled=""/g)).toHaveLength(new Set(FIELDS.map((f) => f.group)).size);
+  });
+
+  it("keeps a change on a row the search hides, counted in the side navigation", () => {
+    const nav = navOf(renderForm(null, edit({}, "model.max_context", "524288"), "drain"));
+    expect(nav).toMatch(/<button[^>]*disabled=""[^>]*>Model<span[^>]*>1<\/span>/);
+    expect(nav).toMatch(/<button type="button" class="[^"]*">Model switch</);
+  });
+});
+
 /** The scope selector's options in order, and the one that is checked. */
 const scopes = (html: string) => {
   const radios = [...html.matchAll(/<input type="radio"([^>]*name="server-scope"[^>]*)\/><span[^>]*>([^<]*)</g)];
@@ -361,16 +456,18 @@ const scopes = (html: string) => {
 };
 
 describe("ServerView: the scope selector", () => {
-  it("offers All models and each family, and opens on the running one, marked", () => {
-    expect(scopes(render())).toEqual({ labels: ["All models", "Qwen3.8-27B (running)", "Qwen3.8-Flash-Next"], checked: ["Qwen3.8-27B (running)"] });
-    expect(scopes(renderForm(null)).checked).toEqual(["All models"]);
+  it("offers All models and each family, opens on All models, and fills the running family with the heat", () => {
+    const html = render();
+    expect(scopes(html)).toEqual({ labels: ["All models", "Qwen3.8-27B", "Qwen3.8-Flash-Next"], checked: ["All models"] });
+    expect(html).toMatch(/name="server-scope"[^>]*\/><span class="[^"]*heat-fill[^"]*">Qwen3\.8-27B<span class="sr-only"> \(running\)<\/span>/);
     expect(scopes(renderForm("qwen38flashnext")).checked).toEqual(["Qwen3.8-Flash-Next"]);
   });
 
-  it("is a select below sm, so it fits a phone", () => {
+  it("is a select below sm, so it fits a phone, where the running family says so in words", () => {
     const html = render();
     expect(html).toMatch(/<select aria-label="Scope"[^>]*class="[^"]*sm:hidden"/);
-    expect(html).toContain('<option value="qwen38" selected="">Qwen3.8-27B (running)</option>');
+    expect(html).toContain('<option value="all" selected="">All models</option>');
+    expect(html).toContain('<option value="qwen38">Qwen3.8-27B (running)</option>');
     expect(html).toMatch(/class="hidden sm:block"><fieldset/);
   });
 });
@@ -421,15 +518,27 @@ describe("ServerView: the configuration in each scope", () => {
     expect(kv).not.toContain("Use shared value");
     // An own value over an unset shared one goes back to auto.
     expect(rowOf(html, "spec.backend")).toContain("Use shared value (auto)");
-    expect(rowOf(html, "server.request_timeout")).toContain("Same for every model");
-    expect(rowOf(html, "spec.draft_rows")).toContain("Not used by Qwen3.8-27B");
+  });
+
+  it("in a family's scope shows only what that family can set for itself, and says where the rest is", () => {
+    const html = renderForm("qwen38");
+    for (const key of ["model.max_context", "vram.headroom_bytes", "vision.enabled"]) expect(html).toContain(`id="server-field-${key}-name"`);
+    // One value for every model, and the other family's own: in All models.
+    for (const key of ["server.request_timeout", "model.id", "spec.draft_rows"]) expect(html).not.toContain(`id="server-field-${key}-name"`);
+    expect(html).not.toContain('id="server-group-server"');
+    const nav = navOf(html);
+    expect(nav).toContain(">Model<");
+    expect(nav).not.toContain(">Server<");
+    expect(html).toContain("Only what Qwen3.8-27B can set for itself. The rest is in");
+    expect(html).toMatch(/<button type="button"[^>]*>All models<\/button>/);
+    expect(renderForm(null)).not.toContain("can set for itself");
   });
 
   it("in the other family's scope shows that family's values, and edits its fields while the first runs", () => {
     const html = renderForm("qwen38flashnext");
     expect(rowOf(html, "model.max_context")).toMatch(/<input[^>]*value="589824"/);
     expect(rowOf(html, "model.max_context")).toContain("Own value");
-    expect(rowOf(html, "vision.enabled")).toContain("Not used by Qwen3.8-Flash-Next");
+    expect(html).not.toContain('id="server-field-vision.enabled-name"');
     const rows = rowOf(html, "spec.draft_rows");
     expect(rows).toMatch(/<input[^>]*name="spec\.draft_rows"/);
     expect(rows).not.toContain("Not used by");
@@ -567,7 +676,7 @@ describe("ServerView: the dock", () => {
     expect(live).toContain("2 changes");
     expect(live).toContain(">Discard<");
     expect(live).toMatch(/>Apply<\/button>/);
-    expect(live).not.toContain("heat-fill");
+    expect(live).toMatch(/class="(?![^"]*heat-fill)[^"]*">Apply<\/button>/);
 
     const reload = render({ draft: edit(edit({}, "server.request_timeout", "60"), "model.max_context", "524288") });
     expect(reload).toMatch(/class="[^"]*heat-fill[^"]*">Apply and reload qwen3\.8-27b<\/button>/);
@@ -576,7 +685,7 @@ describe("ServerView: the dock", () => {
   it("reloads only for what reaches the running model, and lists what waits for the other one", () => {
     const other = render({ draft: edit({}, "model.max_context", "524288", "qwen38flashnext") });
     expect(other).toMatch(/>Apply<\/button>/);
-    expect(other).not.toContain("heat-fill");
+    expect(other).toMatch(/class="(?![^"]*heat-fill)[^"]*">Apply<\/button>/);
     expect(other).toContain("Takes effect when Qwen3.8-Flash-Next loads: model.qwen38flashnext.max_context");
 
     const both = render({ draft: edit(edit({}, "model.max_context", "524288", "qwen38flashnext"), "model.kv_format", "bf16", null) });

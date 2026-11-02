@@ -9,7 +9,9 @@ import {
   type Basis,
   familiesOf,
   familyName,
+  fieldMatches,
   firstSentence,
+  inScope,
   namedKeys,
   patchBody,
   canUseShared,
@@ -80,20 +82,36 @@ describe("controlFor", () => {
 
 describe("rowMode", () => {
   it("reads a field that is not patchable as set at start, with no control", () => {
-    expect(rowMode(field("server.bind"), "qwen38")).toEqual({ kind: "fixed" });
-    expect(rowMode(field("download.path"), null)).toEqual({ kind: "fixed" });
+    expect(rowMode(field("server.bind"))).toEqual({ kind: "fixed" });
+    expect(rowMode(field("download.path"))).toEqual({ kind: "fixed" });
   });
 
-  it("reads a field the running family does not take as not used by it", () => {
-    expect(rowMode(field("vision.enabled"), "qwen38flashnext")).toEqual({ kind: "unused", family: "qwen38flashnext" });
-    expect(rowMode(field("spec.draft_rows"), "qwen38")).toEqual({ kind: "unused", family: "qwen38" });
-    expect(rowMode(field("spec.draft_rows"), "qwen38flashnext")).toEqual({ kind: "edit" });
-    // With no family known, the server judges: the control stays.
-    expect(rowMode(field("vision.enabled"), null)).toEqual({ kind: "edit" });
+  it("gives a patchable field its control", () => {
+    expect(rowMode(field("spec.draft_rows"))).toEqual({ kind: "edit" });
+    expect(rowMode(field("vision.enabled"))).toEqual({ kind: "edit" });
   });
 
   it("shows the known models read-only: a patch only adds to them", () => {
-    expect(rowMode(field("switch.known_models"), "qwen38")).toEqual({ kind: "list" });
+    expect(rowMode(field("switch.known_models"))).toEqual({ kind: "list" });
+  });
+});
+
+describe("inScope", () => {
+  it("shows every field in All models", () => {
+    for (const key of ["server.request_timeout", "model.max_context", "vision.enabled", "spec.draft_rows"]) expect(inScope(field(key), null), key).toBe(true);
+  });
+
+  it("shows in a family's scope only what that family can set for itself: a per-family field, or one only it takes", () => {
+    expect(inScope(field("model.max_context"), "qwen38")).toBe(true);
+    expect(inScope(field("vram.headroom_bytes"), "qwen38")).toBe(true);
+    expect(inScope(field("vision.enabled"), "qwen38")).toBe(true);
+    // One value for every model, set at start or live: All models'.
+    expect(inScope(field("server.request_timeout"), "qwen38")).toBe(false);
+    expect(inScope(field("model.id"), "qwen38")).toBe(false);
+    // Another family's own.
+    expect(inScope(field("spec.draft_rows"), "qwen38")).toBe(false);
+    expect(inScope(field("spec.draft_rows"), "qwen38flashnext")).toBe(true);
+    expect(inScope(field("vision.enabled"), "qwen38flashnext")).toBe(false);
   });
 });
 
@@ -161,9 +179,8 @@ describe("rowView", () => {
     expect(noteLines(view("model.kv_format", null), undefined)).toEqual([]);
   });
 
-  it("marks a field every family shares as the same for every model, in a family's scope", () => {
-    expect(view("server.request_timeout", "qwen38")).toMatchObject({ inForce: { value: 120, scope: null }, note: { kind: "every" } });
-    expect(noteLines(view("server.request_timeout", "qwen38"), undefined)).toEqual(["Same for every model"]);
+  it("edits the group's value of a field every family shares, whichever scope asks, and says nothing of it", () => {
+    expect(view("server.request_timeout", "qwen38")).toMatchObject({ inForce: { value: 120, scope: null }, note: null });
     expect(noteLines(view("server.request_timeout", null), undefined)).toEqual([]);
     // A field with no control says nothing about its sharing.
     expect(noteLines(view("server.bind", "qwen38"), undefined)).toEqual([]);
@@ -174,7 +191,6 @@ describe("rowView", () => {
     expect(view("vision.enabled", null).inForce).toEqual({ value: true, scope: "qwen38" });
     expect(noteLines(view("vision.enabled", null), undefined)).toEqual(["Qwen3.8-27B only"]);
     expect(noteLines(view("vision.enabled", "qwen38"), undefined)).toEqual([]);
-    expect(view("vision.enabled", "qwen38flashnext").mode).toEqual({ kind: "unused", family: "qwen38flashnext" });
     // It is editable while the other family runs: the section is its family's.
     expect(view("spec.draft_rows", null)).toMatchObject({ mode: { kind: "edit" }, inForce: { value: null, scope: "qwen38flashnext" } });
     expect(noteLines(view("spec.draft_rows", null), undefined)).toEqual(["Qwen3.8-Flash-Next only"]);
@@ -395,6 +411,40 @@ describe("text", () => {
     expect(shownOf(true)).toBe("On");
     expect(shownOf("127.0.0.1:8000")).toBe("127.0.0.1:8000");
     expect(shownOf(40960)).toBe("40960");
+  });
+});
+
+describe("fieldMatches", () => {
+  const maxContext = field("model.max_context");
+  const none = { marks: [], opens: false, ids: false };
+
+  it("lets every field through an empty search, marking nothing", () => {
+    expect(fieldMatches(maxContext, "")).toEqual(none);
+    expect(fieldMatches(maxContext, "   ")).toEqual(none);
+  });
+
+  it("marks where the name holds a word, whatever its case, and needs every word somewhere", () => {
+    expect(fieldMatches(maxContext, "CONTEXT")).toEqual({ ...none, marks: [[4, 11]] });
+    expect(fieldMatches(maxContext, "context max")).toEqual({ ...none, marks: [[0, 3], [4, 11]] });
+    expect(fieldMatches(maxContext, "max nowhere")).toBeNull();
+  });
+
+  it("finds a field by its group.name key, as a refusal names it, marking the part of the name it covers", () => {
+    expect(fieldMatches(maxContext, "model.max_context")).toEqual({ ...none, marks: [[0, 11]] });
+    expect(fieldMatches(maxContext, "model.max")).toEqual({ ...none, marks: [[0, 3]] });
+    // The group alone is in the section's heading: nothing in the name to mark.
+    expect(fieldMatches(maxContext, "model")).toEqual(none);
+  });
+
+  it("finds a field by its description, and opens it when the word is only behind More", () => {
+    expect(fieldMatches(maxContext, "reserve")).toEqual(none);
+    expect(fieldMatches(field("model.id"), "flash-next")).toEqual({ ...none, opens: true });
+  });
+
+  it("finds a field by its flag or its environment variable, which the row then shows", () => {
+    expect(fieldMatches(maxContext, "max-context")).toEqual({ ...none, ids: true });
+    expect(fieldMatches(maxContext, "ignis_model_max_context")).toEqual({ ...none, ids: true });
+    expect(fieldMatches(maxContext, "context --model")).toEqual({ marks: [[4, 11]], opens: false, ids: true });
   });
 });
 

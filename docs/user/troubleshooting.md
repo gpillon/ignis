@@ -164,7 +164,7 @@ its `.part`. A killed or crashed fetch leaves no lock behind, and the
 ### The Server view's Download is refused, or fails
 
 **Download** (`POST /v1/models/download`) answers with the server's reason,
-shown in the model band
+shown above the Models tab's list
 ([Downloading from the Server view](guides/models.md#downloading-from-the-server-view-post-v1modelsdownload)):
 
 - `403 download_disabled`: `--download-enabled false` or
@@ -184,7 +184,7 @@ shown in the model band
   server cannot create or write to `--download-path`. Give the server's user
   write access to that folder, or point `--download-path` at one it can write.
 - `507 download_no_room`: the models folder has no room for the entry; the
-  reason shows under its row instead of the band
+  reason shows under its row instead of above the list
   ([`not enough room for … under …`](#not-enough-room-for--under-)).
 
 A download that began and failed keeps its reason under its row,
@@ -200,8 +200,8 @@ continues from what is on disk.
 
 ### The Server view's Remove is refused
 
-**Remove** (`POST /v1/models/remove`) answers with the server's reason, shown in
-the model band
+**Remove** (`POST /v1/models/remove`) answers with the server's reason, shown above
+the Models tab's list
 ([Removing a model](guides/models.md#removing-a-model-post-v1modelsremove)):
 
 - `409 model_in_use`: the entry is the model loaded (also unloaded while idle,
@@ -220,7 +220,7 @@ the model band
   what was deleted before it: on Windows, a process holding it open. Close it
   and press **Remove** again.
 
-After a removal the band names any file kept because another entry also lists
+After a removal the line above the list names any file kept because another entry also lists
 it: that entry is on disk or being downloaded, and the entry removed reads
 partly downloaded until the other one goes too.
 

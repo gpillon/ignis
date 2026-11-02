@@ -147,7 +147,18 @@ export const readOrigins = (fetcher: typeof fetch = fetch) => call("/v1/config/o
 /** The configuration in force as the file it amounts to (`?format=yaml`), as text. */
 export const readConfigFile = (fetcher: typeof fetch = fetch) => callText("/v1/config?format=yaml", {}, (text) => text, fetcher);
 
-export const readCatalog = (fetcher: typeof fetch = fetch) => call("/v1/models/catalog", {}, listData<CatalogRow>, fetcher);
+/** Where the server downloads models, and the bytes free to it on that volume (GitHub #453). */
+export type CatalogDisk = { path: string; free_bytes: number };
+
+/** The catalog's rows, with the envelope's `disk` beside them: absent from an older server, or when it cannot be read. */
+export type CatalogList = CatalogRow[] & { disk?: CatalogDisk };
+
+const catalogList = (body: unknown): CatalogList => {
+  const disk = (body as { disk?: CatalogDisk }).disk;
+  return Object.assign(listData<CatalogRow>(body), disk ? { disk } : {});
+};
+
+export const readCatalog = (fetcher: typeof fetch = fetch) => call("/v1/models/catalog", {}, catalogList, fetcher);
 
 /** Switch to `id` by id alone: the server resolves it to a known model or a catalog entry on disk. */
 export const switchTo = (id: string, fetcher: typeof fetch = fetch) =>

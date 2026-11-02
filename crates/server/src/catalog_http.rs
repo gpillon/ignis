@@ -8,7 +8,8 @@
 //! is not a catalog entry. An entry's state is what `model list` computes
 //! ([`crate::download::command::list_rows`]: sizes only, never a hash); a
 //! known model is `complete` when its artifact is a file, else `absent`. No
-//! row carries a path: the page switches by id.
+//! row carries a path: the page switches by id. Beside the rows, `disk` says
+//! the free space under `download.path` (GitHub #453).
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -23,7 +24,7 @@ use utoipa::ToSchema;
 use crate::api::ApiError;
 use crate::config::field::scope;
 use crate::download::catalog::CatalogLayer;
-use crate::download::command::{file_size, lists_file, OnDisk};
+use crate::download::command::{file_size, free_under, lists_file, OnDisk};
 use crate::download_http::DownloadStatus;
 use crate::model_switch::Switcher;
 use crate::{ModelStatus, Server};
@@ -149,6 +150,32 @@ pub(crate) struct CatalogList {
     object: &'static str,
     /// The models, catalog entries first.
     data: Vec<CatalogRow>,
+    /// The free space where the server downloads models (GitHub #453).
+    /// Absent when it cannot be read, or the server has no catalog to
+    /// download.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk: Option<CatalogDisk>,
+}
+
+/// `download.path` and the bytes free on its volume (`CatalogList::disk`).
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CatalogDisk {
+    /// `download.path`, as the server holds it.
+    path: String,
+    /// The bytes free to the server on the volume `path` is on, read where a
+    /// download checks them before it begins: at `path`, or at the nearest
+    /// folder above it that exists, since the first download creates it.
+    free_bytes: u64,
+}
+
+/// The list, as of now: the rows and the free space under `download.path`.
+/// Reads the filesystem, as [`rows`] does.
+fn list(server: &Server) -> CatalogList {
+    let catalog = server.switcher.as_deref().and_then(Switcher::catalog);
+    let disk = catalog.and_then(|catalog| {
+        free_under(&catalog.dir).ok().map(|free_bytes| CatalogDisk { path: catalog.dir.display().to_string(), free_bytes })
+    });
+    CatalogList { object: "list", data: rows(server), disk }
 }
 
 /// The rows, as of now. Reads the filesystem (sizes, and the header of an
@@ -278,7 +305,7 @@ fn rows(server: &Server) -> Vec<CatalogRow> {
     tag = "models",
     operation_id = "list_model_catalog",
     summary = "The models this server can switch to or fetch",
-    description = "One row per model the server knows of: every catalog entry (the built-in ones, then the operator's `download.catalog`), then every known model (`switch.known_models`, and the model the server started on) that is not a catalog entry. Each row says where the model is from (`source`), how much of it is there (`on_disk`: `complete`, `partial` or `absent` under `download.path`, or `complete` when the artifact a listed model or the start names is a file — file sizes only, never a hash, as `ignis-server model list` computes it; a known model is `complete` when its artifact is a file), its size, the model family its artifact's header names, its model kind (`kind`: `text`, `image`, `speech` or `diarizer`, as `GET /v1/models` names it: the artifact's header's when the file is there, which wins, else what the catalog tells of the entry, its stated `kind` or its family's; absent when neither tells), whether it is the model serving now (`loaded`: exactly one row, none while a failed switch has left nothing serving) and whether `POST /v1/models/switch` with this `model` alone would begin a switch to this row's own model now (`switchable`: the id resolves, the artifact is on disk, it fits the card's class, it is not the loaded one, and no switch is under way). A catalog entry whose `card_class` is above this card's (ADR 0064) is `available: false`, with the `reason` naming its class and the card's, and the entry that serves a request naming it here when one answers to its id; it is never switchable itself — a switch naming its id switches to that entry, when there is one — and `model download` refuses it. Every other row is `available: true`. No row carries a path: switch by id. A model not on disk is fetched with `ignis-server model download <id>`, or in the background with `POST /v1/models/download`; a switch never starts a download. Each row carries `bytes_on_disk`, what of it is there now, partial files included, and a catalog entry's `download`: `running` while that download runs (reading the catalog again shows its progress), `failed` with its `download_reason` once one failed, until the entry's next download, the entry complete on disk another way (`ignis-server model download`), or a restart, else `none`. The row of an entry the server started on from one of its files under `download.path` names that model in `start_model`, and the row of an entry `switch.known_models` names at one of its files there lists those ids in `known_models`, whatever id each is served under: what `POST /v1/models/remove` of it takes away.\n\nAnswers during a model switch and while one has failed, like `GET /v1/models`.",
+    description = "One row per model the server knows of: every catalog entry (the built-in ones, then the operator's `download.catalog`), then every known model (`switch.known_models`, and the model the server started on) that is not a catalog entry. Each row says where the model is from (`source`), how much of it is there (`on_disk`: `complete`, `partial` or `absent` under `download.path`, or `complete` when the artifact a listed model or the start names is a file — file sizes only, never a hash, as `ignis-server model list` computes it; a known model is `complete` when its artifact is a file), its size, the model family its artifact's header names, its model kind (`kind`: `text`, `image`, `speech` or `diarizer`, as `GET /v1/models` names it: the artifact's header's when the file is there, which wins, else what the catalog tells of the entry, its stated `kind` or its family's; absent when neither tells), whether it is the model serving now (`loaded`: exactly one row, none while a failed switch has left nothing serving) and whether `POST /v1/models/switch` with this `model` alone would begin a switch to this row's own model now (`switchable`: the id resolves, the artifact is on disk, it fits the card's class, it is not the loaded one, and no switch is under way). A catalog entry whose `card_class` is above this card's (ADR 0064) is `available: false`, with the `reason` naming its class and the card's, and the entry that serves a request naming it here when one answers to its id; it is never switchable itself — a switch naming its id switches to that entry, when there is one — and `model download` refuses it. Every other row is `available: true`. No row carries a path: switch by id. A model not on disk is fetched with `ignis-server model download <id>`, or in the background with `POST /v1/models/download`; a switch never starts a download. Each row carries `bytes_on_disk`, what of it is there now, partial files included, and a catalog entry's `download`: `running` while that download runs (reading the catalog again shows its progress), `failed` with its `download_reason` once one failed, until the entry's next download, the entry complete on disk another way (`ignis-server model download`), or a restart, else `none`. The row of an entry the server started on from one of its files under `download.path` names that model in `start_model`, and the row of an entry `switch.known_models` names at one of its files there lists those ids in `known_models`, whatever id each is served under: what `POST /v1/models/remove` of it takes away. Beside the rows the list carries `disk`, `{path, free_bytes}`: `download.path` as the server holds it and the bytes free to the server on its volume, read where a download checks them before it begins (at the nearest folder above it that exists, since the first download creates it); absent when they cannot be read.\n\nAnswers during a model switch and while one has failed, like `GET /v1/models`.",
     responses(
         (status = 200, description = "The models, catalog entries first.", body = CatalogList),
         (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = ApiError),
@@ -287,6 +314,5 @@ fn rows(server: &Server) -> Vec<CatalogRow> {
 )]
 pub(crate) async fn get_models_catalog(State(server): State<Arc<Server>>) -> Json<CatalogList> {
     let server = Server::clone(&server);
-    let rows = tokio::task::spawn_blocking(move || rows(&server)).await.expect("listing the catalog does not panic");
-    Json(CatalogList { object: "list", data: rows })
+    Json(tokio::task::spawn_blocking(move || list(&server)).await.expect("listing the catalog does not panic"))
 }
