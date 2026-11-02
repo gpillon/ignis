@@ -5,6 +5,8 @@ import { afterPatch, afterSwitch, type Line, type PendingReload, settleReload } 
 import {
   type Answer,
   cancelDownload,
+  type CatalogDisk,
+  type CatalogList,
   type CatalogRow,
   type ConfigDocument,
   type FieldDecl,
@@ -42,6 +44,8 @@ export type ServerState = {
   /** Where each value of `config` comes from; unread, the rows fall back to the file's shape. */
   origins: Loaded<OriginRow[]>;
   catalog: Loaded<CatalogRow[]>;
+  /** Where the server downloads models and the room left there, from the last catalog read that said it (GitHub #453). */
+  disk: CatalogDisk | null;
   draft: Draft;
   /** The file keys of the rows the last refusal named. */
   marked: string[];
@@ -102,6 +106,7 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
   const [config, setConfig] = useState<Loaded<ConfigDocument>>({ state: "loading" });
   const [origins, setOrigins] = useState<Loaded<OriginRow[]>>({ state: "loading" });
   const [catalog, setCatalog] = useState<Loaded<CatalogRow[]>>({ state: "loading" });
+  const [disk, setDisk] = useState<CatalogDisk | null>(null);
   const [draft, setDraft] = useState<Draft>({});
   const [marked, setMarked] = useState<string[]>([]);
   const [result, setResult] = useState<Line[] | null>(null);
@@ -124,9 +129,10 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
   modelNow.current = model;
 
   // A catalog read: the rows, and whether a download runs to be followed.
-  const acceptCatalog = useCallback((answer: Answer<CatalogRow[]>) => {
+  const acceptCatalog = useCallback((answer: Answer<CatalogList>) => {
     setCatalog(loaded(answer));
     if (!answer.ok) return;
+    setDisk(answer.value.disk ?? null);
     setProgress((current) => nextProgress(current, answer.value, Date.now()));
     setFollowing(runningDownload(answer.value) !== null);
   }, []);
@@ -320,7 +326,7 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
   );
 
   return [
-    { fields, config, origins, catalog, draft, marked, result, pending, applying, loadingId, loadRefusal, downloadingId, downloadRefusal, downloadSpeed: speedOf(progress), cancelling, confirmingRemoval, removingId, removal },
+    { fields, config, origins, catalog, disk, draft, marked, result, pending, applying, loadingId, loadRefusal, downloadingId, downloadRefusal, downloadSpeed: speedOf(progress), cancelling, confirmingRemoval, removingId, removal },
     actions,
   ];
 }

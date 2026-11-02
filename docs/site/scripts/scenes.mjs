@@ -295,10 +295,13 @@ export const scenes = [
     run: async (page) => {
       await chatReady(page);
       await view(page, "Server");
+      await page.getByRole("tab", { name: /^Configuration/ }).click();
       // The running family's Model group: the fields a reload follows, with where each value came from.
       // Its segment says "running" to a screen reader only.
       await page.getByRole("group", { name: "Scope" }).getByText("Qwen3.8-27B (running)", { exact: true }).click();
       await page.getByRole("navigation", { name: "Configuration groups" }).getByRole("button", { name: "Model", exact: true }).click();
+      // The panel scrolls under the pointer, which would leave another group's button lit.
+      await page.mouse.move(0, 450);
       await page.waitForTimeout(1200);
     },
   },

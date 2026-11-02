@@ -1,6 +1,6 @@
 import { canSend, loadUnderWay, type ModelState, type SpeechStatus } from "../api/model.ts";
 import { formatBytes, formatSeconds } from "../monitor/format.ts";
-import { type CatalogRow, unavailableReason } from "./routes.ts";
+import { type CatalogDisk, type CatalogRow, unavailableReason } from "./routes.ts";
 
 // The model band's rows (spec playground/05 §Model band): one per
 // GET /v1/models/catalog row, switched to by id alone. A catalog entry not on
@@ -46,6 +46,31 @@ export function diskLabel(row: CatalogRow): string {
   return size ? `Not downloaded, ${size}` : "Not downloaded";
 }
 
+/**
+ * The engine a row is for (GitHub #454): the main model, one at a time, which
+ * Load switches to (text, image, and a row of no kind, which a switch by id
+ * can only load there); the speech model; or the diarizer.
+ */
+export type Slot = "main" | "speech" | "diarizer";
+
+export function slotOf(row: CatalogRow): Slot {
+  return row.kind === "speech" || row.kind === "diarizer" ? row.kind : "main";
+}
+
+/** The rows by slot, main, speech, diarizer, each in catalog order; a slot no row fills is left out. */
+export function groupBySlot(rows: CatalogRow[]): { slot: Slot; rows: CatalogRow[] }[] {
+  return (["main", "speech", "diarizer"] as const)
+    .map((slot) => ({ slot, rows: rows.filter((row) => slotOf(row) === slot) }))
+    .filter((group) => group.rows.length > 0);
+}
+
+/** The line over the models: what the listed models take on disk, and the room left where the server downloads them (GitHub #453). */
+export function diskSummary(rows: CatalogRow[], disk: CatalogDisk | null): string {
+  const listed = rows.reduce((sum, row) => sum + (row.bytes_on_disk ?? 0), 0);
+  const free = disk ? ` ${formatBytes(disk.free_bytes)} free under ${disk.path}.` : "";
+  return `The listed models take ${formatBytes(listed)}.${free}`;
+}
+
 export function downloadCommand(id: string): string {
   return `ignis-server model download ${id}`;
 }
@@ -65,6 +90,10 @@ export type RowAction =
   | { kind: "downloading" }
   /** A known model whose artifact is not there. */
   | { kind: "missing" }
+  /** The speech model or diarizer the configuration picks, while it can serve (GitHub #454). */
+  | { kind: "inUse" }
+  /** Another speech model or diarizer on disk: no row loads one, the configuration picks it. */
+  | { kind: "idle" }
   /** A catalog entry above this card's class (ADR 0064): neither switched to nor downloaded; `reason` is the server's. */
   | { kind: "unavailable"; reason: string };
 
@@ -93,15 +122,25 @@ export function rowAction(row: CatalogRow, model: ModelState, gate: PageGate = {
   const unavailable = unavailableReason(row);
   if (unavailable !== null) return { kind: "unavailable", reason: unavailable };
   if (row.download === "running") return { kind: "downloading" };
-  // `switchable` decides first: the server knows a switch by id alone can begin
-  // (a catalog entry fetched since the last read, the model torn down by a
-  // failed restore), whatever `on_disk` last said.
-  if (row.switchable || row.on_disk === "complete") {
+  // No row loads a speech model or a diarizer: `speech.model` and
+  // `diarizer.model` pick them, so their files are all a row offers.
+  if (slotOf(row) !== "main") {
+    if (row.on_disk === "complete") return inUse(row, model.speech) ? { kind: "inUse" } : { kind: "idle" };
+  } else if (row.switchable || row.on_disk === "complete") {
+    // `switchable` decides first: the server knows a switch by id alone can
+    // begin (a catalog entry fetched since the last read, the model torn down
+    // by a failed restore), whatever `on_disk` last said.
     return { kind: "load", enabled: row.switchable && !loading && model.state !== "reading" };
   }
   if (row.source === "known") return { kind: "missing" };
   if (row.on_disk === "partial" && gate.fromPage) return { kind: "resume", enabled: !gate.busy && canSend(model) };
   return gate.fromPage ? { kind: "download", enabled: !gate.busy && canSend(model) } : { kind: "copy" };
+}
+
+/** Whether `row` is the speech model or the diarizer that serves now, as `GET /v1/models`' `speech` names it. */
+function inUse(row: CatalogRow, speech: SpeechStatus | undefined): boolean {
+  const status = row.kind === "speech" ? speech : speech?.diarizer;
+  return status?.available === true && status.id === row.id;
 }
 
 /** The family the loaded model runs as (its scope name), from the catalog's loaded row. */

@@ -23,6 +23,7 @@ const base: ServerState = {
   config: { state: "ok", value: CONFIG },
   origins: { state: "ok", value: ORIGINS },
   catalog: { state: "ok", value: CATALOG },
+  disk: null,
   draft: {},
   marked: [],
   result: null,
@@ -75,6 +76,58 @@ const rowOf = (html: string, key: string) => {
   return html.slice(start, next ? next.index : undefined);
 };
 
+/** The status bar's markup (GitHub #454): the section named Model, up to the tabs under it. */
+const statusOf = (html: string) => html.slice(html.indexOf('aria-label="Model"'), html.indexOf('role="tablist"'));
+
+describe("ServerView: the layout", () => {
+  it("puts the running model, the speech model and the diarizer in a status bar above the tabs", () => {
+    const html = render({}, { ...ready, speech: { available: true, id: "qwen3-asr-1.7b", diarizer: { id: "nemotron-3-diarization", loaded: false, available: true } } });
+    expect(html.indexOf('aria-label="Model"')).toBeGreaterThan(-1);
+    expect(html.indexOf('aria-label="Model"')).toBeLessThan(html.indexOf('role="tablist"'));
+    const status = statusOf(html);
+    expect(status).toContain(">qwen3.8-27b</h2>");
+    expect(status).toContain("786,432 tokens");
+    expect(status).toMatch(/>Speech<\/dt>.*qwen3-asr-1\.7b/);
+    expect(status).toMatch(/>Diarizer<\/dt>.*nemotron-3-diarization/);
+    // The status bar stays put: only the tabs' panels scroll.
+    expect(html.indexOf("overflow-y-auto")).toBeGreaterThan(html.indexOf('role="tablist"'));
+  });
+
+  it("opens on Models, keeps Configuration mounted but hidden, and counts the draft's changes on its tab", () => {
+    const html = render({ draft: edit(edit({}, "server.request_timeout", "60"), "switch.drain_timeout", "5") });
+    expect(html).toMatch(/<button type="button" role="tab" id="server-tab-models" aria-selected="true"[^>]*>Models<\/button>/);
+    expect(html).toMatch(/<button type="button" role="tab" id="server-tab-config" aria-selected="false"[^>]*>Configuration<span[^>]*>2<\/span><\/button>/);
+    expect(html).toMatch(/<div role="tabpanel" id="server-panel-models" aria-labelledby="server-tab-models"[^>]*>/);
+    expect(html).not.toMatch(/id="server-panel-models"[^>]*hidden=""/);
+    expect(html).toMatch(/<div role="tabpanel" id="server-panel-config" aria-labelledby="server-tab-config"[^>]*hidden=""/);
+    expect(html).toContain('id="server-field-server.request_timeout-name"');
+    expect(render()).toMatch(/>Configuration<\/button>/);
+  });
+
+  it("lists the models by slot under their headings, main first, and offers no Load on a speech model or a diarizer", () => {
+    const html = render();
+    const main = html.indexOf(">Main model</h3>");
+    const speech = html.indexOf(">Speech</h3>");
+    const diarizer = html.indexOf(">Diarizer</h3>");
+    expect(main).toBeGreaterThan(-1);
+    expect(speech).toBeGreaterThan(main);
+    expect(diarizer).toBeGreaterThan(speech);
+    expect(html.slice(main, speech)).toContain(">qwen3.8-flash-next</span>");
+    expect(html.slice(speech, diarizer)).toContain(">qwen3-asr-1.7b</span>");
+    expect(html.slice(speech, diarizer)).toContain("speech.model");
+    expect(html.slice(diarizer)).toContain(">nemotron-3-diarization</span>");
+    expect(html.slice(diarizer)).toContain("diarizer.model");
+    expect(html).not.toContain('aria-label="Load qwen3-asr-1.7b"');
+    expect(html).toContain('aria-label="Download qwen3-asr-1.7b"');
+  });
+
+  it("totals what the listed models take, and the room left where the server downloads them", () => {
+    const html = render({ disk: { path: "/srv/models", free_bytes: 412 * 1024 ** 3 } });
+    expect(html).toMatch(/The listed models take [\d.]+ GiB\. 412 GiB free under \/srv\/models\./);
+    expect(render()).toMatch(/The listed models take [\d.]+ GiB\.</);
+  });
+});
+
 describe("ServerView: the model band", () => {
   it("shows the loaded id, its state, context and family, and one row per catalog row with its action", () => {
     const html = render();
@@ -124,11 +177,13 @@ describe("ServerView: the model band", () => {
     expect(html).toMatch(/>Diarizer<\/dt>.*nemotron-3-diarization.*Not loaded/);
     expect(render({}, { ...ready, speech: { available: true, id: "qwen3-asr-1.7b", diarizer: { ...diarizer, loaded: true } } })).toMatch(/nemotron-3-diarization.*>Loaded</);
     const missing = "nemotron-3-diarization is not on disk: `ignis-server model download nemotron-3-diarization`";
-    const unavailable = render({}, { ...ready, speech: { available: false, reason: "the speech model is turned off", diarizer: { ...diarizer, available: false, reason: missing } } });
-    expect(unavailable).toContain("Speech: the speech model is turned off");
-    expect(unavailable).toContain(`Diarizer: ${missing}`);
+    // GitHub #454: why either cannot serve opens under the status bar, from its slot.
+    const unavailable = statusOf(render({}, { ...ready, speech: { available: false, reason: "the speech model is turned off", diarizer: { ...diarizer, available: false, reason: missing } } }));
+    expect(unavailable).toMatch(/<button type="button" aria-expanded="false"[^>]*title="the speech model is turned off"[^>]*>Why<\/button>/);
+    expect(unavailable).toContain(`title="${missing}"`);
+    expect(unavailable).not.toContain("Speech: the speech model is turned off");
     // An older server reports neither.
-    expect(render()).not.toContain(">Diarizer<");
+    expect(statusOf(render())).not.toContain(">Diarizer<");
   });
 
   // GitHub #376: a download from the page, followed on its row.

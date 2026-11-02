@@ -130,6 +130,15 @@ describe("the list routes", () => {
     expect(catalog).toMatchObject({ ok: true, value: [{ id: "a", loaded: true }] });
   });
 
+  it("keep the catalog's disk beside its rows, and none from a server that sends none (GitHub #453)", async () => {
+    saveKey("sk-test");
+    const disk = { path: "/srv/models", free_bytes: 1024 };
+    const read = await readCatalog(answering(200, { object: "list", data: [{ id: "a" }], disk }));
+    expect(read.ok && read.value.disk).toEqual(disk);
+    const older = await readCatalog(answering(200, { object: "list", data: [{ id: "a" }] }));
+    expect(older.ok && older.value.disk).toBeUndefined();
+  });
+
   it("show the key prompt on a 401, and say when ignis cannot be reached", async () => {
     saveKey("sk-test");
     const refused = await readFields(answering(401, { error: { message: "invalid api key", code: "invalid_api_key" } }));

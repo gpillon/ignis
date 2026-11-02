@@ -84,7 +84,8 @@ export function ConfigForm({
     <section aria-labelledby="server-config" className="flex flex-col gap-3">
       <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-1">
         <div className="min-w-0">
-          <h2 id="server-config" className="font-display text-xl font-semibold">
+          {/* The tab above names it: the heading stays for a screen reader's outline. */}
+          <h2 id="server-config" className="sr-only">
             Configuration
           </h2>
           <p className="text-sm text-ash">

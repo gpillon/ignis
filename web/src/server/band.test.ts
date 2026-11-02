@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ModelState } from "../api/model.ts";
-import { diskLabel, downloadCommand, elapsed, rowAction, runningFamily, sourceLabel, speechFigures } from "./band.ts";
+import { diskLabel, diskSummary, downloadCommand, elapsed, groupBySlot, rowAction, runningFamily, slotOf, sourceLabel, speechFigures } from "./band.ts";
 import { CATALOG } from "./fixture.ts";
 import type { CatalogRow } from "./routes.ts";
 
@@ -102,6 +102,71 @@ describe("rowAction", () => {
     const loading: ModelState = { state: "loading", to: "qwen3.8-27b", since: 0 };
     expect(rowAction(unloadedRow, loading)).toEqual({ kind: "loading" });
     expect(rowAction(row("qwen3.8-flash-next"), loading)).toEqual({ kind: "load", enabled: false });
+  });
+});
+
+// GitHub #454: a speech model and a diarizer are picked by the configuration (`speech.model`, `diarizer.model`), so
+// their rows offer no Load: the one in use says so, and the rest offer what their files need.
+describe("rowAction on a speech or diarizer row", () => {
+  const asr: CatalogRow = { id: "asr-a", source: "built-in", kind: "speech", on_disk: "complete", bytes: 10, bytes_on_disk: 10, loaded: false, switchable: false, download: "none" };
+  const dia: CatalogRow = { ...asr, id: "dia-a", kind: "diarizer" };
+  const hearing: ModelState = { ...ready, speech: { available: true, id: "asr-a", diarizer: { id: "dia-a", loaded: true, available: true } } };
+
+  it("says In use on the one the configuration picks while it can serve, and offers nothing on another on disk", () => {
+    expect(rowAction(asr, hearing)).toEqual({ kind: "inUse" });
+    expect(rowAction(dia, hearing)).toEqual({ kind: "inUse" });
+    expect(rowAction({ ...asr, id: "asr-b" }, hearing)).toEqual({ kind: "idle" });
+    expect(rowAction({ ...dia, id: "dia-b" }, hearing)).toEqual({ kind: "idle" });
+  });
+
+  it("says nothing of use while the picked one cannot serve, which the status bar explains", () => {
+    const deaf: ModelState = { ...ready, speech: { available: false, reason: "no files", diarizer: { id: "dia-a", loaded: false, available: false, reason: "no files" } } };
+    expect(rowAction(asr, deaf)).toEqual({ kind: "idle" });
+    expect(rowAction(dia, deaf)).toEqual({ kind: "idle" });
+  });
+
+  it("downloads, resumes and follows its files as any row's", () => {
+    expect(rowAction({ ...asr, on_disk: "absent", bytes_on_disk: 0 }, hearing)).toEqual({ kind: "download", enabled: true });
+    expect(rowAction({ ...dia, on_disk: "partial", bytes_on_disk: 4 }, hearing)).toEqual({ kind: "resume", enabled: true });
+    expect(rowAction({ ...asr, on_disk: "partial", download: "running" }, hearing)).toEqual({ kind: "downloading" });
+  });
+});
+
+describe("slots", () => {
+  it("puts text, image and a row of no kind in the main slot, speech and diarizer rows in their own", () => {
+    expect(slotOf(row("qwen3.8-27b"))).toBe("main");
+    expect(slotOf({ ...row("qwen3.8-27b"), kind: "image" })).toBe("main");
+    expect(slotOf(row("qwen3.8-27b-custom"))).toBe("main");
+    expect(slotOf({ ...row("qwen3.8-27b"), kind: "speech" })).toBe("speech");
+    expect(slotOf({ ...row("qwen3.8-27b"), kind: "diarizer" })).toBe("diarizer");
+  });
+
+  it("groups the rows main, speech, diarizer, each in catalog order, leaving out a slot no row fills", () => {
+    const rows: CatalogRow[] = [
+      { ...row("qwen3.8-27b"), id: "dia", kind: "diarizer" },
+      row("qwen3.8-27b"),
+      { ...row("qwen3.8-27b"), id: "img", kind: "image" },
+      { ...row("qwen3.8-27b"), id: "asr", kind: "speech" },
+    ];
+    expect(groupBySlot(rows).map(({ slot, rows }) => [slot, rows.map((r) => r.id)])).toEqual([
+      ["main", ["qwen3.8-27b", "img"]],
+      ["speech", ["asr"]],
+      ["diarizer", ["dia"]],
+    ]);
+    expect(groupBySlot([row("qwen3.8-27b")]).map(({ slot }) => slot)).toEqual(["main"]);
+  });
+});
+
+describe("diskSummary", () => {
+  it("totals what the listed models take on disk, and the room left where the server downloads them", () => {
+    const rows: CatalogRow[] = [
+      { ...row("qwen3.8-27b"), bytes_on_disk: 2 * 1024 ** 3 },
+      { ...row("qwen3.8-27b"), id: "b", bytes_on_disk: 1024 ** 3 / 2 },
+      { ...row("qwen3.8-27b"), id: "c", bytes_on_disk: undefined },
+    ];
+    expect(diskSummary(rows, { path: "/srv/models", free_bytes: 412 * 1024 ** 3 })).toBe("The listed models take 2.5 GiB. 412 GiB free under /srv/models.");
+    // An older server says no free space.
+    expect(diskSummary(rows, null)).toBe("The listed models take 2.5 GiB.");
   });
 });
 

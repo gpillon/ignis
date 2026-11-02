@@ -117,7 +117,7 @@ and the 16 GB one answers to the other's id ([the uncensored variant](uncensored
 
 The family the catalog knows of an entry also gives it its model kind before
 it is downloaded: `GET /v1/models/catalog` reports `kind`, and the
-[Server view](../playground/server.md#the-model-band) its **Type**, from the
+[Server view](../playground/server.md#models) its **Type**, from the
 catalog until the artifact is on disk, whose header then wins. An entry whose
 family nothing states has no kind until it is downloaded; stating `family`
 gives it one at once.
