@@ -30,7 +30,7 @@ A driver that reports 12.x cannot run any of the three; update it from NVIDIA.
 
 The native binaries, for running ignis directly on the machine with no
 container. They are on the
-[Releases page](https://github.com/gpillon/ignis/releases), each beside its
+[latest release](https://github.com/gpillon/ignis/releases/latest), each beside its
 SHA-256:
 
 - `ignis-v<version>-x86_64-pc-windows-msvc.zip`
@@ -50,10 +50,11 @@ Each unpacks into one folder of the same name, holding:
 
 In PowerShell, download, check and unpack the zip (the commands use the
 [GitHub CLI](https://cli.github.com/); downloading both files from the Releases
-page works the same):
+page works the same). The first line reads the latest release's tag; set `$v`
+to an older tag to install that one:
 
 ```powershell
-$v = "v0.8.0"
+$v = gh release view --repo gpillon/ignis --json tagName --jq .tagName   # the latest release
 $zip = "ignis-$v-x86_64-pc-windows-msvc.zip"
 gh release download $v --repo gpillon/ignis --pattern "$zip*"
 (Get-FileHash $zip).Hash -eq (Get-Content "$zip.sha256").Split(" ")[0]   # True
@@ -75,10 +76,10 @@ The binaries are built on Ubuntu 24.04 and load the CUDA 13 runtime
 (`libcudart.so.13`) from the host, which the driver does not provide. Install
 it from NVIDIA's CUDA repository for your distribution, or with a CUDA 13
 toolkit, and make sure the loader finds it (its `lib64` on `LD_LIBRARY_PATH`
-if it is not in a system path). Then:
+if it is not in a system path). Then, again from the latest release's tag:
 
 ```sh
-v=v0.8.0
+v=$(gh release view --repo gpillon/ignis --json tagName --jq .tagName)   # the latest release
 tarball=ignis-$v-x86_64-unknown-linux-gnu.tar.gz
 gh release download $v --repo gpillon/ignis --pattern "$tarball*"
 sha256sum -c "$tarball.sha256"
