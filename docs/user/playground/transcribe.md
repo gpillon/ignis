@@ -23,6 +23,12 @@ images and who speaks; **Notes**; and **Settings**, the view's own. Below 1024
 px wide the
 side columns open from the header as drawers (**Call** opens the right one).
 
+<div class="ignis-video ignis-tour not-content">
+  <iframe src="https://www.youtube-nocookie.com/embed/JLv9f_4KWGo" title="The ignis Transcribe view: meetings written down live, on your own server" loading="lazy" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+</div>
+
+Panel tour 6 on YouTube: [The ignis Transcribe view: meetings written down live, on your own server](https://www.youtube.com/watch?v=JLv9f_4KWGo).
+
 ## Listening
 
 **Start** stands in the deck at the foot, with what it listens to beside it:

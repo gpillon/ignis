@@ -19,6 +19,12 @@ The image model's weights are under the Qwen Research License: non-commercial
 use only. ignis's own code is Apache-2.0; the weights are not.
 :::
 
+<div class="ignis-video ignis-tour not-content">
+  <iframe src="https://www.youtube-nocookie.com/embed/kJeO3eKdytk" title="The ignis Image view: make and edit pictures on the same card as your coding model" loading="lazy" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+</div>
+
+Panel tour 3 on YouTube: [The ignis Image view: make and edit pictures on the same card as your coding model](https://www.youtube.com/watch?v=kJeO3eKdytk).
+
 ## A session is a chain of steps
 
 A session keeps every picture uploaded into it, made by it or marked in it,

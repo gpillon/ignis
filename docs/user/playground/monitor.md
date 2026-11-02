@@ -15,6 +15,12 @@ default).
 
 ![The Monitor after a minute and a half of agent-like traffic](../images/playground/monitor.png)
 
+<div class="ignis-video ignis-tour not-content">
+  <iframe src="https://www.youtube-nocookie.com/embed/p_eNE9uRbyk" title="The ignis Monitor: a verdict in words, the VRAM plan and the work it skipped" loading="lazy" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+</div>
+
+Panel tour 4 on YouTube: [The ignis Monitor: a verdict in words, the VRAM plan and the work it skipped](https://www.youtube.com/watch?v=p_eNE9uRbyk).
+
 ## The controls
 
 The bar under the header shows whether the board is **Live** (or `Paused`,

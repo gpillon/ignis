@@ -20,6 +20,12 @@ The view has three columns: **Decisions** on the left (kept in this browser,
 like the chat's sessions), the **answers** in the middle, and the **bench** on
 the right, where the evidence and the questions are written.
 
+<div class="ignis-video ignis-tour not-content">
+  <iframe src="https://www.youtube-nocookie.com/embed/Nlc95n5ofRM" title="Ignis Decide: many questions over one piece of evidence, answered from one prefill" loading="lazy" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+</div>
+
+Panel tour 2 on YouTube: [Ignis Decide: many questions over one piece of evidence, answered from one prefill](https://www.youtube.com/watch?v=Nlc95n5ofRM).
+
 ## Start from an example, or from your file
 
 The opening screen offers your own file (a log, a document or a JSON file,

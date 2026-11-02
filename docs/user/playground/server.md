@@ -17,6 +17,12 @@ stay.
 
 ![The status bar and the Models tab](../images/playground/server.png)
 
+<div class="ignis-video ignis-tour not-content">
+  <iframe src="https://www.youtube-nocookie.com/embed/xnyLYSv4DFI" title="The ignis Server view: switch models, download and configure, without a restart" loading="lazy" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+</div>
+
+Panel tour 5 on YouTube: [The ignis Server view: switch models, download and configure, without a restart](https://www.youtube.com/watch?v=xnyLYSv4DFI).
+
 ## The status bar
 
 The headline is the loaded model's id with its **State** (`Serving`,

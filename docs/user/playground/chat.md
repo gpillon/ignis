@@ -14,6 +14,12 @@ what it answered, and the figures the browser measured while it streamed.
 
 ![A reply: reasoning folded, the answer, the figures line and the context meter's details](../images/playground/chat-reply.png)
 
+<div class="ignis-video ignis-tour not-content">
+  <iframe src="https://www.youtube-nocookie.com/embed/PzrR2BNEwrA" title="The ignis Playground: watch a local model reason, call tools and run subagents" loading="lazy" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+</div>
+
+Panel tour 1 on YouTube: [The ignis Playground: watch a local model reason, call tools and run subagents](https://www.youtube.com/watch?v=PzrR2BNEwrA).
+
 ## Sending a prompt
 
 Type in the box at the foot: **Enter** sends, **Shift+Enter** starts a new

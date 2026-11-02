@@ -40,6 +40,11 @@ on by default). Below 640 px wide the tabs become one menu, and below 1024 px
 the side columns of the chat, Decide, Image and Transcribe views open as
 drawers from the header.
 
+Each view's page opens with its panel tour, a video of about ninety seconds;
+the six are together on YouTube in the playlist
+[ignis panel tours](https://www.youtube.com/playlist?list=PLLaOL0TvSBP4),
+after [Ignis in 90 seconds](https://www.youtube.com/watch?v=XLjfh5rNy6A).
+
 ## The header
 
 Left to right: the flame, which burns while a reply streams or a model loads;

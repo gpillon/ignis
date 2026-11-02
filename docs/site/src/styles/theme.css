@@ -164,9 +164,14 @@ starlight-tabs [role="tab"] {
   color: var(--sl-color-white);
 }
 
-/* The landing page's video: 16:9 at the content width, framed like a screenshot. */
+/* A video: 16:9 at the content width, framed like a screenshot. The front
+   page's sits under the hero; a Playground page's panel tour (.ignis-tour)
+   sits in the text, with the line that names it close below. */
 .ignis-video {
   margin-block: 0 2.5rem;
+}
+.ignis-video.ignis-tour {
+  margin-block: 1.5rem 0;
 }
 .ignis-video iframe {
   display: block;
