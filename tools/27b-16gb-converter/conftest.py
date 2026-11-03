@@ -11,11 +11,13 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import container  # noqa: E402
 import exl3  # noqa: E402
 
 REVISION = "86b95530f9d365d90dd24d01a997a8de0cdf6c55"
@@ -259,3 +261,53 @@ def make_override(root, src, seed=420, records=None):
     with open(os.path.join(ov, "replay.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(replay, f)
     return {"override": ov, "bf16": bf16, "keys": sorted(records), "ref_shard": ref_shard}
+
+
+FINE_TUNE_SERVED = "nvfp4full-swift-1.5"
+FINE_TUNE_FILE = "qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer"
+
+
+def make_fine_tune_served(src, sidecar="conversion", weights_id=FINE_TUNE_SERVED, seed=465):
+    """A fine-tune's served artifact beside `src`'s (GitHub #465): the same directory under its own
+    weights id, with payloads of its own, and its sidecar: the `.conversion.json` the
+    `qwen3.8-27b-nvfp4` packer family writes (the converter's record carried through, the recipe id,
+    the artifact's bytes and object count, every local NVFP4 parent with its divisor), or with
+    `sidecar="graft"` a copy of the served graft record. Returns `src` with it as "served"."""
+    rng = random.Random(seed)
+    vanilla = container.Container(src["served"])
+    path = os.path.join(os.path.dirname(src["served"]), FINE_TUNE_FILE)
+    objects = [({k: v for k, v in o.items() if k not in ("offset", "bytes")}, _bytes(rng, o["bytes"]))
+               for o in vanilla.objects]
+    write_container(path, {"model_id": "qwen3.8-27b", "weights_id": weights_id}, objects)
+    if sidecar == "graft":
+        with open(src["served"] + ".graft.json", "rb") as f, open(path + ".graft.json", "wb") as g:
+            g.write(f.read())
+    else:
+        record = {"identity": {"model_id": "qwen3.8-27b", "weights_id": weights_id},
+                  "license": "swift-open-license-1.0",
+                  "source": {"repo": "someone/fine-tune", "revision": "a" * 40, "model_path": "H:/models/fine-tune"},
+                  "recipe_id": "qwen3_8_27b_nvfp4full-v2",
+                  "artifact": {"bytes": os.path.getsize(path)},
+                  "objects": {"count": len(objects)},
+                  "local_nvfp4": {"encoder_profile": "NVFP4_MAXABS_DIVISOR_RNE_V1", "parents": {
+                      "dflash2/feature_projection": {"weight_scale_divisor": None, "relative_frobenius_error": 0.08},
+                      "text/layers/0/mlp/down": {"weight_scale_divisor": 2688.0, "relative_frobenius_error": 0.07}}}}
+        with open(path + ".conversion.json", "w", encoding="utf-8", newline="\n") as f:
+            json.dump(record, f)
+    return dict(src, served=path)
+
+
+def make_local_quant(src):
+    """`src`'s quant as a local conversion leaves it (GitHub #465): no Hugging Face download record, and
+    beside it the pins its conversion recorded, every file's bytes and sha256 (`{"files": {name:
+    {bytes, sha256}}}`). Returns the pins' path."""
+    shutil.rmtree(os.path.join(src["quant"], ".cache"))
+    files = {}
+    for name in sorted(os.listdir(src["quant"])):
+        with open(os.path.join(src["quant"], name), "rb") as f:
+            data = f.read()
+        files[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    path = src["quant"] + ".pins.json"
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"files": files}, f)
+    return path

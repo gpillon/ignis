@@ -11,6 +11,11 @@ writes the container.
 - The source is pinned: the quant's repository, branch and revision (from its Hugging Face
   download metadata), every file the converter reads by sha256, each shard's checked against its
   LFS oid; the served artifact and its graft sidecar by sha256.
+- A fine-tune's 16 GB artifact (GitHub #465) is built from the fine-tune's own NVFP4 artifact
+  (`--served-weights-id`, its sidecar a `.conversion.json`) and a quant converted locally, which has
+  no download record and is pinned by its files' bytes and sha256 instead (`--quant-pins`); the
+  record's license and source labels are arguments (`--license`, `--quant-repo`, `--quant-branch`,
+  `--bf16-repo`). Without them, everything is as before.
 - Every trellis matrix's reconstruction error against the BF16 checkpoint is recorded, and one
   above `--error-bound` fails the conversion (`reconstruction.py`, the GPU step). The BF16 checkpoint
   it is measured against is pinned like the quant: its revision, every file the step reads by
@@ -55,7 +60,14 @@ QUANT_META = ("model.safetensors.index.json", "quantization_config.json", "confi
 # The override's files beside its shards (it holds no config.json; replay.json is its provenance).
 OVERRIDE_META = (override_mod.INDEX, "quantization_config.json", override_mod.REPLAY_RECORD)
 BF16_REPO = "Qwen/Qwen3.8-27B"
+# The record's labels, each an argument for a fine-tune's conversion (GitHub #465): the quant's
+# license, repository and branch, and the BF16 checkpoint's repository.
+LABELS = {"license": "apache-2.0", "quant_repo": REPO, "quant_branch": BRANCH, "bf16_repo": BF16_REPO}
 INDEX = override_mod.INDEX
+# The served artifact's sidecar, in the loader's order (`SIDECAR_SUFFIXES`, crates/server/src/loader.rs):
+# the graft record, or the `.conversion.json` the `qwen3.8-27b-nvfp4` packer family writes (GitHub #465).
+GRAFT_SIDECAR = ".graft.json"
+CONVERSION_SIDECAR = ".conversion.json"
 EXIT_REFUSED = 2
 EXIT_VERIFY_FAILED = 3
 
@@ -103,6 +115,53 @@ def pin_local(root, digests):
     record: the digest is taken at conversion time."""
     return {name: {"bytes": os.path.getsize(os.path.join(root, name)), "sha256": future.result()}
             for name, future in digests.items()}
+
+
+def read_pins(path, root, names):
+    """The pins of a quant converted locally (GitHub #465), which has no download record: `path` is the
+    JSON its conversion recorded, whose `files` give each file's bytes and sha256. Every file of `names`
+    under `root` must have one, and its bytes; returns {name: {bytes, sha256}}. Refused names the file."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            files = json.load(f).get("files")
+    except (OSError, ValueError, AttributeError) as e:
+        raise Refused(f"the quant's pins {path} cannot be read: {e}")
+    if not isinstance(files, dict):
+        raise Refused(f"{path} has no `files`: the quant's files cannot be pinned")
+    out = {}
+    for name in names:
+        pin = files.get(name)
+        if not isinstance(pin, dict) or not isinstance(pin.get("bytes"), int) or not isinstance(pin.get("sha256"), str):
+            raise Refused(f"{name}: {path} gives no bytes and sha256 for it")
+        file = os.path.join(root, name)
+        if not os.path.isfile(file):
+            raise Refused(f"{name} is pinned, and missing from {root}")
+        if os.path.getsize(file) != pin["bytes"]:
+            raise Refused(f"{name} is {os.path.getsize(file)} bytes, its pin is {pin['bytes']}")
+        out[name] = {"bytes": pin["bytes"], "sha256": pin["sha256"]}
+    return out
+
+
+def pin_against(root, digests, pins):
+    """{name: {bytes, sha256}} from `digests` (name -> future sha256), each checked against its pin
+    in `pins` (`read_pins`)."""
+    out = {}
+    for name, future in digests.items():
+        digest = future.result()
+        if digest != pins[name]["sha256"]:
+            raise Refused(f"{name} hashes to {digest}, its pin is {pins[name]['sha256']}")
+        out[name] = {"bytes": os.path.getsize(os.path.join(root, name)), "sha256": digest}
+    return out
+
+
+def served_sidecar(served_path):
+    """The served artifact's sidecar, the one the loader reads: its graft record when it has one, else
+    its conversion record; Refused when it has neither."""
+    for suffix in (GRAFT_SIDECAR, CONVERSION_SIDECAR):
+        if os.path.isfile(served_path + suffix):
+            return served_path + suffix
+    raise Refused(f"{served_path} has no {GRAFT_SIDECAR} and no {CONVERSION_SIDECAR}: the copied NVFP4 "
+                  f"objects' records come from its sidecar")
 
 
 def bf16_shards(bf16_root):
@@ -153,6 +212,11 @@ def identity_of(weights_id):
     return IDENTITY if weights_id is None else IDENTITY | {"weights_id": weights_id}
 
 
+def served_identity_of(weights_id):
+    """The served artifact's identity; `weights_id` names a fine-tune's own NVFP4 build (GitHub #465)."""
+    return SERVED_IDENTITY if weights_id is None else SERVED_IDENTITY | {"weights_id": weights_id}
+
+
 def refuse_override(override, matrices):
     problems = override.problems(matrices)
     if problems:
@@ -171,20 +235,34 @@ def versions():
 
 
 def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, error_bound=reconstruction.ERROR_BOUND,
-            errors_fn=None, log=print, override=None, weights_id=None):
+            errors_fn=None, log=print, override=None, weights_id=None, served_weights_id=None, labels=None,
+            quant_pins=None):
     """Writes the work tree `out_work`; returns the converter.json record. Raises Refused.
-    `override` (an `override.Override`) swaps its records for the quant's of the same name."""
+    `override` (an `override.Override`) swaps its records for the quant's of the same name;
+    `served_weights_id` is the served artifact's when it is not the vanilla one (a fine-tune's);
+    `labels` replaces some of `LABELS`; `quant_pins` (a path) pins a quant converted locally, in
+    place of its download record (`read_pins`)."""
     t0 = time.time()
+    given = labels or {}
+    unknown = sorted(set(given) - set(LABELS))
+    if unknown:
+        raise ValueError(f"no such label: {unknown}")
+    labels = LABELS | given
+    if quant_pins is not None and not {"quant_repo", "quant_branch"} <= set(given):
+        raise Refused("a locally converted quant takes its own repository and branch labels (--quant-repo, "
+                      f"--quant-branch): the record would name {REPO} {BRANCH}")
     if os.path.isdir(out_work) and os.listdir(out_work):
         raise Refused(f"{out_work} is not empty: remove it to convert again")
     served = container.Container(served_path)
-    if served.identity != SERVED_IDENTITY:
-        raise Refused(f"{served_path} is {served.identity}, not the served artifact {SERVED_IDENTITY}")
-    graft_path = served_path + ".graft.json"
-    if not os.path.isfile(graft_path):
-        raise Refused(f"{graft_path} is missing: the DFlash2 graft's provenance comes from it")
-    with open(graft_path, encoding="utf-8") as f:
-        graft = json.load(f)
+    want_served = served_identity_of(served_weights_id)
+    if served.identity != want_served:
+        raise Refused(f"{served_path} is {served.identity}, not the served artifact {want_served}")
+    # Of the sidecar, the conversion reads `local_nvfp4` and `recipe_id`; of a graft record, its
+    # provenance of the DFlash2 module too.
+    sidecar_path = served_sidecar(served_path)
+    grafted = sidecar_path.endswith(GRAFT_SIDECAR)
+    with open(sidecar_path, encoding="utf-8") as f:
+        sidecar = json.load(f)
     quant = exl3.Quant(quant_root)
     check_quant_config(quant.config)
 
@@ -198,7 +276,11 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
     # The revisions are read before the GPU step; the hashes (~33 GB, ~88 GB with the BF16
     # reference) run beside it.
     quant_files = list(quant.shards) + list(QUANT_META)
-    quant_revision = revision_of(quant_root, quant_files, "the quant")
+    if quant_pins is None:
+        quant_revision, pins = revision_of(quant_root, quant_files, "the quant"), None
+    else:
+        # A local conversion has no hub revision: its pins stand for the download record.
+        quant_revision, pins = None, read_pins(quant_pins, quant_root, quant_files)
     bf16_files = [] if skip_errors else bf16_shards(bf16_root) + [INDEX]
     bf16_revision = revision_of(bf16_root, bf16_files, "the BF16 checkpoint") if bf16_files else None
     ov_files, ov_reference = [], None
@@ -225,7 +307,8 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
             # The override's matrices are measured against its own reference BF16.
             extra = {} if override is None else {"override": override}
             rel = (errors_fn or reconstruction.rel_errors)(quant, bf16_root, objects, log=log, **extra)
-        pinned = pin_files(quant_root, quant_digests, set(quant.shards))
+        pinned = (pin_files(quant_root, quant_digests, set(quant.shards)) if pins is None
+                  else pin_against(quant_root, quant_digests, pins))
         bf16_pinned = pin_files(bf16_root, bf16_digests, set(bf16_files) - {INDEX})
         if override is not None:
             ov_pinned = pin_local(override.root, ov_digests)
@@ -274,42 +357,50 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
         log(f"{unit}: {len(digests)} objects, {time.time() - started:.1f} s")
 
     nvfp4_copied = {p.name for p in objects if p.copy is not None and p.format == "NVFP4"}
-    local_nvfp4 = dict(graft.get("local_nvfp4") or {})
+    local_nvfp4 = dict(sidecar.get("local_nvfp4") or {})
     local_nvfp4["parents"] = {n: v for n, v in (local_nvfp4.get("parents") or {}).items() if n in nvfp4_copied}
     errors_list = [t["rel_error"] for t in trellis.values() if t["rel_error"] is not None]
     k_hist = {}
     for t in trellis.values():
         k_hist[t["format"]] = k_hist.get(t["format"], 0) + 1
+    sidecar_pin = {"file": os.path.basename(sidecar_path), "sha256": work.file_digest(sidecar_path)}
     record = {
         "schema": SCHEMA,
         "status": "dry-run" if skip_errors else "complete",
         "identity": identity_of(weights_id),
         "source": {
-            "repo": REPO,
-            "branch": BRANCH,
+            "repo": labels["quant_repo"],
+            "branch": labels["quant_branch"],
             "revision": quant_revision,
-            "license": "apache-2.0",
+            "license": labels["license"],
             "quantization_config": {k: quant.config.get(k) for k in QUANT_CONFIG},
             "files": pinned,
+            # A local conversion: the pins its files were checked against.
+            **({} if quant_pins is None else {"pins": {"file": os.path.basename(quant_pins),
+                                                       "bytes": os.path.getsize(quant_pins),
+                                                       "sha256": work.file_digest(quant_pins)}}),
         },
         "served": {
             "file": os.path.basename(served_path),
             "bytes": os.path.getsize(served_path),
             "sha256": served_sha256,
             "identity": served.identity,
-            "graft_sidecar": {"file": os.path.basename(graft_path), "sha256": work.file_digest(graft_path)},
+            **({"graft_sidecar": sidecar_pin} if grafted
+               else {"conversion_sidecar": sidecar_pin | {"recipe_id": sidecar.get("recipe_id")}}),
         },
         # The checkpoint the reconstruction errors are measured against (none in a dry run).
-        "reference": None if skip_errors else {"repo": BF16_REPO, "revision": bf16_revision, "files": bf16_pinned},
-        "graft": {
+        "reference": None if skip_errors else {"repo": labels["bf16_repo"], "revision": bf16_revision,
+                                               "files": bf16_pinned},
+        # A served artifact that grafted the DFlash2 module: the graft's provenance.
+        **({"graft": {
             "how": f"the {sum(n.startswith('dflash2/') for n in copied)} dflash2/* objects copied byte for byte "
                    f"from the served artifact, which grafted them",
-            "recipe_id": graft.get("recipe_id"),
-            "grafted_from": graft.get("grafted_from"),
-            "source": graft.get("source"),
-            "objects": graft.get("objects"),
-        },
-        # The served graft's per-object NVFP4 records of the objects copied here, so
+            "recipe_id": sidecar.get("recipe_id"),
+            "grafted_from": sidecar.get("grafted_from"),
+            "source": sidecar.get("source"),
+            "objects": sidecar.get("objects"),
+        }} if grafted else {}),
+        # The served sidecar's per-object NVFP4 records of the objects copied here, so
         # `checksum::verify` covers the copied drafter in this artifact as in the served one.
         "local_nvfp4": local_nvfp4,
         "objects": {"tensors": sum(p.kind == "tensor" for p in objects),
@@ -468,8 +559,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
     r = sub.add_parser("run", help="write the packer's work tree and converter.json")
-    r.add_argument("--served", required=True, help="the served qwen3_8_27b_nvfp4full-v2.ninfer (its .graft.json beside)")
-    r.add_argument("--quant", required=True, help="the SC_3.00bpw_H4 download, with .cache/huggingface/download")
+    r.add_argument("--served", required=True, help="the served qwen3_8_27b_nvfp4full-v2.ninfer, or a fine-tune's NVFP4 "
+                                                   "artifact (its .graft.json or .conversion.json beside)")
+    r.add_argument("--served-weights-id", help="the served artifact's weights id when it is a fine-tune's "
+                                               "(default %s)" % SERVED_IDENTITY["weights_id"])
+    r.add_argument("--quant", required=True, help="the SC_3.00bpw_H4 download, with .cache/huggingface/download, "
+                                                  "or a quant converted locally (with --quant-pins)")
+    r.add_argument("--quant-pins", help="a locally converted quant's pins: a JSON whose `files` give each file's "
+                                        "bytes and sha256, in place of its download record")
     r.add_argument("--bf16", required=True, help="the BF16 checkpoint the reconstruction errors are measured against")
     r.add_argument("--work", required=True, help="the work tree to write (absent or empty)")
     add_override_arguments(r)
@@ -477,6 +574,9 @@ def main(argv=None):
     r.add_argument("--skip-errors", action="store_true", help="skip the GPU step: a dry-run tree")
     r.add_argument("--error-bound", type=float, default=reconstruction.ERROR_BOUND,
                    help="the largest relative reconstruction error (default %(default)s; above it is a layout error)")
+    for label, what in (("license", "the license the record states"), ("quant-repo", "the quant's repository"),
+                        ("quant-branch", "the quant's branch"), ("bf16-repo", "the BF16 checkpoint's repository")):
+        r.add_argument("--" + label, help=f"{what} (default {LABELS[label.replace('-', '_')]})")
     v = sub.add_parser("verify", help="check a packed artifact against the plan and its sources")
     v.add_argument("--artifact", required=True, help="the packed .ninfer")
     v.add_argument("--served", required=True, help="the served artifact it copies from")
@@ -490,8 +590,10 @@ def main(argv=None):
     log = lambda line: print(line, flush=True)
     if a.command == "run":
         try:
+            labels = {k: getattr(a, k) for k in LABELS if getattr(a, k) is not None}
             convert(a.served, a.quant, a.bf16, a.work, skip_errors=a.skip_errors, error_bound=a.error_bound, log=log,
-                    override=override_of(a), weights_id=a.weights_id)
+                    override=override_of(a), weights_id=a.weights_id, served_weights_id=a.served_weights_id,
+                    labels=labels, quant_pins=a.quant_pins)
         except Refused as e:
             print(f"REFUSED: {e}", flush=True)
             return EXIT_REFUSED
