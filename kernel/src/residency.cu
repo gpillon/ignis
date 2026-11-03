@@ -17,6 +17,7 @@
 #include "ignis_residency.h"
 
 #include "moe_router_select.cuh"
+#include "pdl_launch.cuh"
 
 #include <cub/block/block_scan.cuh>
 #include <cuda_bf16.h>
@@ -503,7 +504,7 @@ __global__ void __launch_bounds__(kThreads)
 __global__ void __launch_bounds__(kThreads)
     resolve_demand_routed(Dev d, uint32_t layer, uint32_t phase, const float *logits, int32_t *ids, float *weights,
                           uint32_t tokens) {
-  asm volatile("griddepcontrol.wait;\n" ::: "memory");
+  ignis::pdl::wait();
   const uint32_t warps = blockDim.x >> 5;
   for (uint32_t row = threadIdx.x >> 5; row < tokens; row += warps) {
     ignis_moe_select::select_token(logits, static_cast<int>(row), static_cast<int>(threadIdx.x & 31), ids, weights);
@@ -1321,7 +1322,7 @@ int32_t step_demand(ignis_residency *r, uint32_t layer, uint32_t phase, const fl
     attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr.val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = &attr;
-    cfg.numAttrs = 1;
+    cfg.numAttrs = ignis::pdl::available() ? 1 : 0;
     RESIDENCY_CUDA(cudaLaunchKernelEx(&cfg, resolve_demand_routed, r->dev, layer, phase, logits, ids, weights,
                                       tokens));
   } else {

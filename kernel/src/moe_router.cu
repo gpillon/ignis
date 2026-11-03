@@ -25,6 +25,7 @@
 
 #include "moe_common.cuh"
 #include "moe_router_select.cuh"
+#include "pdl_launch.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -52,7 +53,7 @@ __global__ void router_logits_kernel(const __nv_bfloat16 *__restrict__ x, int to
                                      float *__restrict__ logits) {
   extern __shared__ uint4 xs[];  // [rows][kHidden / 8]
   // The select launch may be scheduled now; it waits for this grid on the device.
-  asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+  ignis::pdl::launch_dependents();
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int warps = blockDim.x >> 5;
@@ -91,7 +92,7 @@ __global__ void router_logits_kernel(const __nv_bfloat16 *__restrict__ x, int to
 __global__ void router_select_kernel(const float *__restrict__ logits, int tokens,
                                      int32_t *__restrict__ ids, float *__restrict__ weights) {
   // Launched as a programmatic dependent of the logits kernel: wait for its results here.
-  asm volatile("griddepcontrol.wait;\n" ::: "memory");
+  ignis::pdl::wait();
   const int lane = threadIdx.x & 31;
   const int t = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   if (t >= tokens) return;
@@ -156,7 +157,7 @@ extern "C" int32_t ignis_moe_router(const void *x, uint32_t tokens, const void *
   attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = ignis::pdl::available() ? 1 : 0;
   const cudaError_t err = cudaLaunchKernelEx(&cfg, router_select_kernel, static_cast<const float *>(logits),
                                              static_cast<int>(tokens), ids, weights);
   if (err != cudaSuccess) return fail(std::string("ignis_moe_router (select): ") + cudaGetErrorString(err));

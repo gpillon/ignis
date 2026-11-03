@@ -432,7 +432,7 @@ int32_t launch_decode(const DeviceState &st, const DecodeParams &p, cudaStream_t
   attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = ignis::pdl::available() ? 1 : 0;
   const cudaError_t err = wide ? launch_one<true>(cfg, cls, p) : launch_one<false>(cfg, cls, p);
   if (err != cudaSuccess) return fail(std::string("ignis_trellis: decode launch: ") + cudaGetErrorString(err));
   return 0;

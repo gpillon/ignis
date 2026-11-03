@@ -6,6 +6,7 @@
 #define IGNIS_TRELLIS_LINEAR_INTERNAL_CUH
 
 #include "ignis_trellis_linear.h"
+#include "pdl_launch.cuh"
 #include "trellis_decode.cuh"
 
 #include <cuda_bf16.h>
@@ -192,9 +193,9 @@ __device__ __forceinline__ bool sm_admitted(int capped, const uint32_t (&admit)[
 }
 
 // Programmatic dependent launch: the rotation lets the kernel after it start, which issues its
-// weight loads and then waits here for the rotated activations.
-__device__ __forceinline__ void grid_dependency_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
-__device__ __forceinline__ void grid_dependents_launch() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+// weight loads and then waits here for the rotated activations (none below sm_90, pdl_launch.cuh).
+__device__ __forceinline__ void grid_dependency_wait() { ignis::pdl::wait(); }
+__device__ __forceinline__ void grid_dependents_launch() { ignis::pdl::launch_dependents(); }
 
 // Runs f(std::integral_constant<int, K2>{}) for a weight's K class: the one place the six K
 // instantiations are chosen. A k2 the host did not admit traps.

@@ -318,7 +318,7 @@ int32_t launch_prefill(const DeviceState &st, const PrefillParams &p, cudaStream
   attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = ignis::pdl::available() ? 1 : 0;
   cudaError_t err = cudaSuccess;
   switch (p.w.k2) {
   case 4: err = launch_one<4>(cfg, p); break;

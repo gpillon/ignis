@@ -67,6 +67,10 @@ or 40 card yet ([#456](https://github.com/gpillon/ignis/issues/456)). A card
 none of the listed architectures runs on is refused at start
 ([Troubleshooting](../troubleshooting.md#starting)).
 
+On a card below compute capability 9.0, programmatic dependent launch, an
+sm_90 feature, is off: a kernel that would start early waits for the one
+before it on the stream instead.
+
 ## 2. The Rust workspace
 
 ```
