@@ -289,12 +289,13 @@ refuses the tree, naming the field, without them:
 
 | field | from | read by |
 |---|---|---|
-| `recipe_id` | `converter.json` | the loader (`Sidecar::load`) |
+| `recipe_id` | `converter.json` | the loader (`Sidecar::load`); the 16 GB converter, which records it |
 | `artifact.bytes` | the packer: the container's size | the loader's checksum verification |
 | `objects.count` | the packer: 1,325 | the loader's checksum verification |
 | `local_nvfp4.parents.<name>.weight_scale_divisor` | `converter.json`, checked against the work files | the loader's checksum verification: each recorded divisor must equal the container's trailing FP32 word, a `null` one is a presence check |
-| `identity`, `source.repo`, `source.revision`, `source.license` | `converter.json` | the 16 GB converter (#465), the hub card |
-| `local_nvfp4` (the `dflash2/` records) | `converter.json` | the 16 GB converter, which copies the drafter's records into its own sidecar |
+| `local_nvfp4` (the `dflash2/` records) | `converter.json` | the 16 GB converter (#465, `--served-weights-id`), which copies the drafter's records into its own sidecar |
+| `source` (`repo`, `revision`, `license`), `objects` | `converter.json`, the packer | the 16 GB converter, which carries them into its record; the hub card |
+| `identity` | `converter.json`, the run's | whoever reads the sidecar without the container |
 
 The loader finds the sidecar beside the artifact as `<artifact>.conversion.json` (a served artifact
 may carry a `.graft.json` instead) and refuses a load whose verification is not clean.
