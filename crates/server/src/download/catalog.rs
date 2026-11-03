@@ -48,9 +48,10 @@ pub static BUILT_IN_CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
     Catalog { entries }
 });
 
-/// The keys an entry takes; every one but `kind`, `card_class`, `family` and
-/// `aliases` is required.
-const ENTRY_KEYS: [&str; 9] = ["id", "repo", "revision", "artifact", "kind", "card_class", "family", "aliases", "files"];
+/// The keys an entry takes; every one but `kind`, `card_class`, `family`,
+/// `aliases` and `license` is required (`license` is required of a built-in
+/// entry, ADR 0078).
+const ENTRY_KEYS: [&str; 10] = ["id", "repo", "revision", "artifact", "kind", "card_class", "family", "aliases", "license", "files"];
 
 /// The name an entry's audio encoder carries beside its decoder (`kind:
 /// speech`): the speech adapter finds the encoder by this prefix.
@@ -96,6 +97,17 @@ pub struct CatalogFile {
     pub sha256: String,
 }
 
+/// The license an entry's weights are published under (`license`, ADR 0078).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct License {
+    /// The license's identifier as Hugging Face cards name it (`apache-2.0`,
+    /// `qwen-community-1.0`, `openmdw-1.1`...).
+    pub id: String,
+    /// A link to its text: the license file in the entry's repo at the
+    /// pinned revision when the repo holds one, else the canonical text.
+    pub url: String,
+}
+
 /// One published model (`GLOSSARY.md`, **Catalog entry**): its served id,
 /// where it is published, and every file it needs with its byte count and
 /// digest pinned.
@@ -138,6 +150,10 @@ pub struct CatalogEntry {
     /// that on a card class below that id's own entry a request naming it is
     /// served by this one. Usually none.
     pub aliases: Vec<String>,
+    /// The license its weights are published under (`license`, ADR 0078),
+    /// when it states one: required of a built-in entry, optional of an
+    /// operator's, so a catalog written before it still loads.
+    pub license: Option<License>,
     /// Every file, as the catalog lists them.
     pub files: Vec<CatalogFile>,
     /// Which catalog it came from.
@@ -542,6 +558,10 @@ fn read_entry(value: &Value, layer: CatalogLayer) -> Result<CatalogEntry, String
     let card_class = card_class(map)?;
     let family = family(map, &id)?;
     let aliases = aliases(map, &id, family)?;
+    let license = license(map)?;
+    if layer == CatalogLayer::BuiltIn && license.is_none() {
+        return Err("`license` is missing: every built-in entry states the license its weights are published under".to_owned());
+    }
     let Some(Value::Array(listed)) = map.get("files") else {
         return Err("`files` must be a list of `{ name, bytes, sha256 }`".to_owned());
     };
@@ -588,7 +608,20 @@ fn read_entry(value: &Value, layer: CatalogLayer) -> Result<CatalogEntry, String
             ));
         }
     }
-    Ok(CatalogEntry { id, repo, revision, artifact, kind, card_class, family, aliases, files, layer })
+    Ok(CatalogEntry { id, repo, revision, artifact, kind, card_class, family, aliases, license, files, layer })
+}
+
+/// `license`, when stated: a map of `id` and `url`, both text.
+fn license(map: &Map<String, Value>) -> Result<Option<License>, String> {
+    let Some(value) = map.get("license") else {
+        return Ok(None);
+    };
+    let Value::Object(parts) = value else {
+        return Err(format!("`license` must be a map of `id` and `url`, got {value}"));
+    };
+    known_keys(parts, &["id", "url"], "`license`").map_err(|reason| format!("`license`: {reason}"))?;
+    let part = |key| text(parts, key).map_err(|reason| format!("`license`: {reason}"));
+    Ok(Some(License { id: part("id")?, url: part("url")? }))
 }
 
 /// `kind`, when stated: `speech` or `diarizer`, the kinds a catalog says. A
@@ -1282,6 +1315,82 @@ mod tests {
         let sixteen = catalog.entry("qwen3.8-27b-16g").unwrap();
         assert_eq!((sixteen.family, sixteen.family()), (None, Some(ModelFamily::Qwen38_27b)));
         assert_eq!(resolved(&catalog, "qwen3.8-27b", Some(CardClass::Gb16)), Ok("qwen3.8-27b-16g"));
+    }
+
+    /// ADR 0078: an entry may state its `license`, as an `id` and a `url`; a
+    /// `license` without either is refused naming the entry, and an operator
+    /// catalog that states none loads unchanged.
+    #[test]
+    fn an_operator_entry_may_state_a_license_and_one_missing_a_part_is_refused() {
+        let stated = OPERATOR.replacen(
+            "    card_class: 32
+",
+            "    card_class: 32
+    license: { id: acme-1.0, url: \"https://acme.example/LICENSE\" }
+",
+            1,
+        );
+        let catalog = operator(&stated).expect("a license of both parts");
+        let license = catalog.entry("acme-qwen3.8-27b-ft").unwrap().license.as_ref().expect("stated");
+        assert_eq!((license.id.as_str(), license.url.as_str()), ("acme-1.0", "https://acme.example/LICENSE"));
+        assert_eq!(operator(OPERATOR).unwrap().entry("acme-qwen3.8-27b-ft").unwrap().license, None);
+        for (license, says) in [
+            ("{ url: \"https://acme.example/LICENSE\" }", "`id`"),
+            ("{ id: acme-1.0 }", "`url`"),
+            ("{ id: \"\", url: x }", "`id`"),
+            ("{ id: acme-1.0, url: x, text: y }", "`text`"),
+            ("acme-1.0", "`license`"),
+        ] {
+            let text = OPERATOR.replacen("    card_class: 32
+", &format!("    card_class: 32
+    license: {license}
+"), 1);
+            let err = operator(&text).expect_err(&text).0;
+            for said in ["acme-qwen3.8-27b-ft", "`license`", says] {
+                assert!(err.contains(said), "{license}: `{said}` missing from: {err}");
+            }
+        }
+    }
+
+    /// ADR 0078: every built-in entry states its license, pinned here beside
+    /// its card class and family; the identifier is the card's at the pinned
+    /// revision, the link the license file in the entry's repo at that
+    /// revision when the repo holds one, else the license's canonical text.
+    #[test]
+    fn every_built_in_entry_states_its_license() {
+        let pinned = [
+            ("qwen3.8-27b", "apache-2.0", "https://www.apache.org/licenses/LICENSE-2.0"),
+            ("qwen3.8-27b-abliterated", "apache-2.0", "https://www.apache.org/licenses/LICENSE-2.0"),
+            ("qwen3.8-flash-next", "qwen-community-1.0", "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/8d94db83cd8e58d6be31e796723e5e35b960638c/LICENSE"),
+            ("ignis-image-2.1-turbo", "qwen-research", "https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/LICENSE"),
+            ("qwen3.8-27b-16g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis/blob/f5bbd2cc14c9ca573ef5553c100ac69410f1fe58/LICENSE"),
+            ("qwen3.8-27b-abliterated-16g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis/blob/94a8bfc0f47ce86403f274be03e2c0f79500727c/LICENSE"),
+            ("qwen3-asr-1.7b", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE"),
+            ("qwen3-asr-1.7b-q8", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE"),
+            ("qwen3-asr-0.6b", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis/blob/af02916ea7a532a667a907c2a163b16a8c04b433/LICENSE"),
+            ("nemotron-3-diarization", "openmdw-1.1", "https://huggingface.co/gpillon/Nemotron-3-Diarization-GGUF-ignis/blob/d46d59d03be709db18e223b6bf92e8c32d14f422/LICENSE"),
+        ];
+        let entries = BUILT_IN_CATALOG.entries();
+        assert_eq!(entries.len(), pinned.len());
+        for (entry, (id, license, url)) in entries.iter().zip(pinned) {
+            assert_eq!(entry.id, id);
+            let stated = entry.license.as_ref().unwrap_or_else(|| panic!("{id}: every built-in entry states its license"));
+            assert_eq!((stated.id.as_str(), stated.url.as_str()), (license, url), "{id}");
+        }
+        // Beside each text or image model's card class and family, as RELEASES pins them.
+        for (entry, release) in entries.iter().zip(RELEASES) {
+            assert_eq!((entry.card_class.map(CardClass::gb), entry.family()), (Some(release.4), Some(release.5)), "{}", release.0);
+        }
+    }
+
+    /// A built-in entry that states no license is refused at parse.
+    #[test]
+    fn a_built_in_entry_without_a_license_is_refused() {
+        let text = OPERATOR;
+        let document = Format::Yaml.read(text).unwrap();
+        let err = parse(&document, "built into this binary", CatalogLayer::BuiltIn).expect_err("no license").0;
+        assert!(err.contains("acme-qwen3.8-27b-ft") && err.contains("`license`"), "{err}");
+        assert!(parse(&document, "x", CatalogLayer::Operator).is_ok());
     }
 
     #[test]

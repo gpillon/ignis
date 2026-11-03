@@ -57,6 +57,7 @@ async fn a_fetch_with_a_token_logs_its_urls_and_never_the_token() {
         card_class: Some(ignis_server::config::profile::CardClass::Gb32),
         family: None,
         aliases: Vec::new(),
+        license: None,
         kind: None,
         files: vec![pinned("m.ninfer.graft.json", SIDECAR_BODY), pinned("m.ninfer", ARTIFACT_BODY)],
         layer: CatalogLayer::Operator,

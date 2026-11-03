@@ -13,20 +13,20 @@ editUrl: false
 Generated from the code by `make docs-reference` (`crates/server/src/user_docs.rs`); an edit here is overwritten, and `cargo test` fails while this page and the code disagree.
 :::
 
-The models the server knows how to fetch without an operator catalog. Each is pinned file by file, byte count and SHA-256, at a fixed revision of its Hugging Face repository, and nothing outside the binary can change a pin ([Get a model](../guides/models.md), [an operator catalog](../guides/operator-catalog.md)).
+The models the server knows how to fetch without an operator catalog. Each is pinned file by file, byte count and SHA-256, at a fixed revision of its Hugging Face repository, and nothing outside the binary can change a pin. Each entry states the license its weights are published under, linked to its text ([Get a model](../guides/models.md), [an operator catalog](../guides/operator-catalog.md)).
 
-| Id | Repository | Size | Artifact |
-|---|---|---|---|
-| [`qwen3.8-27b`](#qwen38-27b) | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer) | 18.1 GiB | `qwen3_8_27b_nvfp4full-v2.ninfer` |
-| [`qwen3.8-27b-abliterated`](#qwen38-27b-abliterated) | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer) | 18.1 GiB | `qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer` |
-| [`qwen3.8-flash-next`](#qwen38-flash-next) | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | 67.8 GiB | `qwen3_8_flash_next_trellis_a25-v2.ninfer` |
-| [`ignis-image-2.1-turbo`](#ignis-image-21-turbo) | [`gpillon/ignis-image-2.1-turbo`](https://huggingface.co/gpillon/ignis-image-2.1-turbo) | 15.6 GiB | `ignis_image_2_1_turbo-v2.ninfer` |
-| [`qwen3.8-27b-16g`](#qwen38-27b-16g) | [`gpillon/Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB | `qwen3_8_27b_trellis_sc30-v2.ninfer` |
-| [`qwen3.8-27b-abliterated-16g`](#qwen38-27b-abliterated-16g) | [`gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis) | 12.5 GiB | `qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer` |
-| [`qwen3-asr-1.7b`](#qwen3-asr-17b) | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 1.5 GiB | `Qwen3-ASR-1.7B-Q4_K_M.gguf` |
-| [`qwen3-asr-1.7b-q8`](#qwen3-asr-17b-q8) | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 2.3 GiB | `Qwen3-ASR-1.7B-Q8_0.gguf` |
-| [`qwen3-asr-0.6b`](#qwen3-asr-06b) | [`gpillon/Qwen3-ASR-0.6B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis) | 0.9 GiB | `Qwen3-ASR-0.6B-Q8_0.gguf` |
-| [`nemotron-3-diarization`](#nemotron-3-diarization) | [`gpillon/Nemotron-3-Diarization-GGUF-ignis`](https://huggingface.co/gpillon/Nemotron-3-Diarization-GGUF-ignis) | 0.2 GiB | `Nemotron-3-Diarization-F16.gguf` |
+| Id | Repository | Size | License | Artifact |
+|---|---|---|---|---|
+| [`qwen3.8-27b`](#qwen38-27b) | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer) | 18.1 GiB | [`apache-2.0`](https://www.apache.org/licenses/LICENSE-2.0) | `qwen3_8_27b_nvfp4full-v2.ninfer` |
+| [`qwen3.8-27b-abliterated`](#qwen38-27b-abliterated) | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer) | 18.1 GiB | [`apache-2.0`](https://www.apache.org/licenses/LICENSE-2.0) | `qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer` |
+| [`qwen3.8-flash-next`](#qwen38-flash-next) | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | 67.8 GiB | [`qwen-community-1.0`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/8d94db83cd8e58d6be31e796723e5e35b960638c/LICENSE) | `qwen3_8_flash_next_trellis_a25-v2.ninfer` |
+| [`ignis-image-2.1-turbo`](#ignis-image-21-turbo) | [`gpillon/ignis-image-2.1-turbo`](https://huggingface.co/gpillon/ignis-image-2.1-turbo) | 15.6 GiB | [`qwen-research`](https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/LICENSE) | `ignis_image_2_1_turbo-v2.ninfer` |
+| [`qwen3.8-27b-16g`](#qwen38-27b-16g) | [`gpillon/Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis/blob/f5bbd2cc14c9ca573ef5553c100ac69410f1fe58/LICENSE) | `qwen3_8_27b_trellis_sc30-v2.ninfer` |
+| [`qwen3.8-27b-abliterated-16g`](#qwen38-27b-abliterated-16g) | [`gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis) | 12.5 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis/blob/94a8bfc0f47ce86403f274be03e2c0f79500727c/LICENSE) | `qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer` |
+| [`qwen3-asr-1.7b`](#qwen3-asr-17b) | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 1.5 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE) | `Qwen3-ASR-1.7B-Q4_K_M.gguf` |
+| [`qwen3-asr-1.7b-q8`](#qwen3-asr-17b-q8) | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 2.3 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE) | `Qwen3-ASR-1.7B-Q8_0.gguf` |
+| [`qwen3-asr-0.6b`](#qwen3-asr-06b) | [`gpillon/Qwen3-ASR-0.6B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis) | 0.9 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis/blob/af02916ea7a532a667a907c2a163b16a8c04b433/LICENSE) | `Qwen3-ASR-0.6B-Q8_0.gguf` |
+| [`nemotron-3-diarization`](#nemotron-3-diarization) | [`gpillon/Nemotron-3-Diarization-GGUF-ignis`](https://huggingface.co/gpillon/Nemotron-3-Diarization-GGUF-ignis) | 0.2 GiB | [`openmdw-1.1`](https://huggingface.co/gpillon/Nemotron-3-Diarization-GGUF-ignis/blob/d46d59d03be709db18e223b6bf92e8c32d14f422/LICENSE) | `Nemotron-3-Diarization-F16.gguf` |
 
 ## qwen3.8-27b
 

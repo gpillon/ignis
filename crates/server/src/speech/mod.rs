@@ -413,6 +413,7 @@ mod tests {
             card_class: None,
             family: None,
             aliases: Vec::new(),
+            license: None,
             kind: Some(ignis_core::compute::ModelKind::Speech),
             files: vec![file(&format!("{id}-encoder.gguf")), file(&format!("{id}-decoder.gguf"))],
             layer: CatalogLayer::BuiltIn,

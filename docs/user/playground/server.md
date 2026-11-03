@@ -68,7 +68,14 @@ Each row says its **Type** (`Text`, `Image`, `Speech` or `Diarizer`, known
 before a built-in entry is downloaded, and blank only when nothing tells it,
 as for an operator entry of no family not yet downloaded), its **Source** (the
 built-in catalog, an [operator catalog](../guides/operator-catalog.md), or a
-known model), how much of it is **On disk**, and its action:
+known model), how much of it is **On disk**, and its action. Under a catalog
+model's id sits its **license**, the identifier (`apache-2.0`,
+`qwen-community-1.0`...) as a link to the license's text, from the entry's
+`license` ([the catalog](../guides/models.md#the-catalog)); an entry that
+states none shows none. While a download is sent or runs, its row says the
+same again: downloading it, you are bound by its license, with the link. The
+page asks for no acceptance: the terms bind whoever downloads, as with any
+download from the hub.
 
 - **Loaded** for the model that serves;
 - **Load** for a main model on disk: it switches to it by id

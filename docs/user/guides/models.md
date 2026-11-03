@@ -33,6 +33,20 @@ revision of its Hugging Face repository:
 The id is the **served id**: what `--model-id` names, what `/v1/models`
 reports and what a request puts in `model`.
 
+Every entry states the **license** its weights are published under: an
+identifier as the entry's Hugging Face card names it at the pinned revision,
+and a link to the text. The four 27B entries and the speech
+models are `apache-2.0`, Flash-Next is `qwen-community-1.0`, the image model
+`qwen-research` and the diarizer `openmdw-1.1`; the
+[generated reference](../reference/models.md) lists each entry's. It is shown
+beside the entry in the [Server view](../playground/server.md#models), in
+`model list` (a `LICENSE` column, and `license` in `--format json`) and in
+`model download`, and `GET /v1/models/catalog` reports it. Whoever downloads
+is bound by the license, as with any download from the hub; no step asks to
+accept it, and a download fetches only the entry's pinned files, never a
+license file. An [operator entry](operator-catalog.md#an-entrys-license) may
+state one too.
+
 The three `qwen3-asr-*` entries are the **speech models** (`kind: speech`): two
 GGUF files each, a decoder and its audio encoder, with no sidecar. They run on
 the CPU beside the loaded model, so they state no card class and no card refuses
@@ -72,7 +86,7 @@ a card whose class is not known refuses nothing.
 `ignis-server model list` shows every entry and how much of it is on disk:
 
 ```
-ignis-server model list                 # id, built-in or operator, repo@revision, size, complete/partial/absent, family
+ignis-server model list                 # id, built-in or operator, repo@revision, size, complete/partial/absent, family, license
 ignis-server model list --format json
 ```
 
@@ -100,6 +114,10 @@ model loads, and a GPU load on a machine without the driver is refused as
 A driver too old for the build's CUDA runtime (a lower CUDA major version than
 the runtime's; a lower minor is fine) is refused naming both versions and asking
 to update the NVIDIA driver.
+Before it fetches an entry, it prints the entry's license, its identifier and
+the link to its text (`<id>: license <license>: <url>`, on stderr with the
+progress), for an entry that states one; nothing asks to accept it, and you
+are bound by it as with any download from the hub.
 Progress goes to stderr, the artifact paths to stdout, and the exit code is 0
 only when every entry verified. It reads the same configuration a start does
 (config file, environment, flags). It is fitted to the card of the machine it
