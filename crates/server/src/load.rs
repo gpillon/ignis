@@ -93,6 +93,10 @@ pub enum LoadError {
     /// (`ignis.model.eos_missing`): a backend that can never stop on EOS
     /// would run every request to its cap.
     EosMissing,
+    /// The model needs a route the card does not run
+    /// (`ignis.model.route_unsupported`, GitHub #456): kernels this build
+    /// compiles for its arch-specific Blackwell targets alone.
+    RouteUnsupported(String),
     /// The GPU load itself failed (`ignis.model.load_failed`).
     LoadFailed(String),
     /// A host plan refused the load -- Flash-Next's, or the 27B's (ADR
@@ -152,6 +156,7 @@ impl std::fmt::Display for LoadError {
             | Self::ThinkingBudgetInert(message)
             | Self::ThinkingInvalid(message)
             | Self::VisionProcessorInvalid(message)
+            | Self::RouteUnsupported(message)
             | Self::LoadFailed(message) => write!(f, "{message}"),
             Self::HostPlan(refusal) => write!(f, "{refusal}"),
         }
@@ -190,6 +195,9 @@ impl LoadError {
                 %artifact,
                 "generation_config.json has no eos_token_id — {outcome}"
             ),
+            Self::RouteUnsupported(error) => {
+                tracing::error!(name: "ignis.model.route_unsupported", %artifact, %error, "{outcome}")
+            }
             Self::LoadFailed(error) => tracing::error!(name: "ignis.model.load_failed", %artifact, %error, "{outcome}"),
             Self::HostPlan(error) => tracing::error!(name: "ignis.model.load_failed", %artifact, %error, "{outcome}"),
         }
@@ -271,9 +279,21 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
         return Err(LoadError::ArtifactMissing);
     }
     let sidecar = crate::loader::find_sidecar(artifact).map_err(|e| LoadError::SidecarMissing(e.to_string()))?;
+    // GitHub #456: a model whose kernels the card does not run is refused
+    // before its checksum is read. An artifact whose header cannot be read
+    // is checked as the 27B, and refused below for what it is.
+    let named = crate::loader::artifact_family(artifact).ok().flatten();
+    // The leaf reads the variable as it does (`kernel/src/flash_next/program.cu`).
+    let staged = std::env::var("IGNIS_FN_MOE_STAGED").is_ok_and(|value| value.starts_with('1'));
+    let nvfp4_body = || crate::loader::has_nvfp4_body(artifact).unwrap_or(false);
+    if let Some(refusal) =
+        crate::config::arch::load_refusal(config.card(), named.unwrap_or(ModelFamily::Qwen38_27b), nvfp4_body, staged)
+    {
+        return Err(LoadError::RouteUnsupported(refusal));
+    }
     // The image model's container holds no text frontend (spec
     // image-model/01): it is verified, and its runner reads the rest.
-    if crate::loader::artifact_family(artifact).ok().flatten().map(ModelFamily::kind) == Some(ModelKind::Image) {
+    if named.map(ModelFamily::kind) == Some(ModelKind::Image) {
         return prepare_image_model(config, artifact, &sidecar);
     }
     let frontend =
@@ -672,6 +692,55 @@ mod tests {
         let text = PreparedText { provider, processor: None, item_bound: None, thinking_close: None, eos: None };
         let prepared = PreparedModel { artifact: artifact.path.clone(), model: model.into(), family: ModelFamily::Qwen38_27b, config, text: Some(text) };
         (artifact, prepared)
+    }
+
+    /// GitHub #456: on an Ampere card of a build for it, the 27B NVFP4
+    /// artifact is refused before its checksum is read, naming its W4A4
+    /// GEMMs; on a Blackwell card the same artifact gets past that check, to
+    /// be refused for what it lacks.
+    #[test]
+    fn a_load_the_card_has_no_route_for_is_refused_before_its_checksum() {
+        use crate::config::{arch, profile};
+        use ignis_artifact::fixture::{self, FixtureObject};
+        let body = FixtureObject::Tensor {
+            name: "layers.0.mlp.gate_up",
+            shape: vec![128, 64],
+            format: "NVFP4",
+            layout: "blockscale-k16-m128x4-v1",
+            offset: 0,
+            bytes: 4612,
+        };
+        let artifact = fixture::write_fixture(&[body], &vec![0u8; 4612], "route-nvfp4").expect("fixture");
+        let name = artifact.path.file_name().unwrap().to_str().unwrap().to_owned();
+        // Found, and never read on the Ampere card: the refusal comes first.
+        let sidecar = artifact.path.with_file_name(format!("{name}.graft.json"));
+        std::fs::write(&sidecar, "{}").expect("sidecar");
+        let on = |major: u32, minor: u32| {
+            let card = profile::Card::Read(profile::CardReading {
+                total: 24 << 30,
+                name: "a test card".to_owned(),
+                capability: arch::ComputeCapability::new(major, minor),
+                built_for: arch::BuiltArchitectures::parse("86;120a").unwrap(),
+            });
+            let args: Vec<String> = ["--profile", "none"].map(String::from).to_vec();
+            match crate::config::resolve_on(&args, |_| None, &crate::config::file::NoFiles, &|| card.clone()).expect("resolves") {
+                crate::config::ConfigOutcome::Config(config) => config,
+                other => panic!("expected a start, got {other:?}"),
+            }
+        };
+        match prepare_model(&on(8, 6), &artifact.path) {
+            Err(LoadError::RouteUnsupported(refusal)) => {
+                assert!(refusal.contains("W4A4") && refusal.contains("a test card (8.6)"), "{refusal}")
+            }
+            Err(other) => panic!("expected the route refused, got {other}"),
+            Ok(_) => panic!("expected the route refused"),
+        }
+        match prepare_model(&on(12, 0), &artifact.path) {
+            Err(LoadError::RouteUnsupported(refusal)) => panic!("a Blackwell card runs it: {refusal}"),
+            Err(_) => {}
+            Ok(_) => panic!("the fixture holds no frontend"),
+        }
+        let _ = std::fs::remove_file(&sidecar);
     }
 
     /// Every model the process serves text with starts its engine as a

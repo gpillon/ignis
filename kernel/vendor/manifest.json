@@ -253,7 +253,12 @@
     },
     {
       "path": "src/core/pdl.cuh",
-      "sha256": "787b6d0fdfc5b25fe29dcb32548de56637e4d5b9b3561b9caaa2544cba4eb57f"
+      "sha256": "787b6d0fdfc5b25fe29dcb32548de56637e4d5b9b3561b9caaa2544cba4eb57f",
+      "patch": {
+        "diff": "patches/src/core/pdl.cuh.diff",
+        "sha256": "8943ed61840d01d539340cc52644536a5934ba89a89f092e1c88c1acef6042b5",
+        "reason": "Portability (ADR 0077; GitHub #456): builds for Ampere (sm_86) and Ada (sm_89). Programmatic dependent launch is sm_90, so trigger_dependents and wait_for_dependencies compile to nothing below __CUDA_ARCH__ 900, and launch_dependent leaves off the programmatic-serialization attribute on a device below compute capability 9.0 (programmatic_launch_available, read once per process), since whether such a device ignores or rejects it is untested. It fixes the 32 vendored translation units whose sm_89 compile failed on griddepcontrol (docs/findings/2026-11-02-rtx-20-30-40-what-blocks-the-leaf.md); the default 120a build's device code is unchanged (cuobjdump -sass of both archives)."
+      }
     },
     {
       "path": "src/core/tensor.cpp",

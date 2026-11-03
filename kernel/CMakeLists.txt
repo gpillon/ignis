@@ -13,18 +13,47 @@
 # crates/artifact/build.rs links into the Rust binaries.
 
 cmake_minimum_required(VERSION 3.28)
+
+# The CUDA architectures the leaf is compiled for (GitHub #456): the
+# environment's IGNIS_CUDA_ARCHITECTURES, a CMake list such as `86;120a`, read
+# here and nowhere else -- kernel/build.ps1, kernel/build.sh, the cargo build
+# (crates/artifact/build.rs) and the Containerfile's CUDA_ARCHITECTURES pass
+# it through. Unset or empty, `120a` alone: the RTX 50 and RTX PRO 6000
+# Blackwell cards, the build every release ships (proven on this machine with
+# CMake 3.28, NINFER_WINDOWS_BUILD_NOTES section 14). Set before project(),
+# which would otherwise give CMAKE_CUDA_ARCHITECTURES the compiler's default,
+# and forced into the cache, so a build directory configured before follows
+# the knob as it is now.
+set(IGNIS_CUDA_ARCHITECTURES "$ENV{IGNIS_CUDA_ARCHITECTURES}")
+if(IGNIS_CUDA_ARCHITECTURES STREQUAL "")
+  set(IGNIS_CUDA_ARCHITECTURES 120a)
+endif()
+foreach(arch IN LISTS IGNIS_CUDA_ARCHITECTURES)
+  if(NOT arch MATCHES "^[1-9][0-9]+a?$")
+    message(FATAL_ERROR "IGNIS_CUDA_ARCHITECTURES (${IGNIS_CUDA_ARCHITECTURES}): `${arch}` is not an architecture such as 86 or 120a")
+  endif()
+endforeach()
+# The sm_120a set: the kernels that build for the arch-specific Blackwell
+# targets alone (the NVFP4 W4A4 prefill GEMMs, the block-scaled FP8 MMA,
+# Flash-Next's decode clusters and staged kernel, and three vendored ones
+# with more static shared memory than an sm_8x block takes) compile for those
+# entries of the list only, so on any other card a launch of one fails with
+# CUDA's "no kernel image is available" rather than running a stand-in.
+set(IGNIS_SM120A_ARCHITECTURES ${IGNIS_CUDA_ARCHITECTURES})
+list(FILTER IGNIS_SM120A_ARCHITECTURES INCLUDE REGEX "^12[0-9]a$")
+if(NOT IGNIS_SM120A_ARCHITECTURES)
+  message(FATAL_ERROR "IGNIS_CUDA_ARCHITECTURES (${IGNIS_CUDA_ARCHITECTURES}) names no arch-specific Blackwell target such as 120a: the leaf's W4A4, FP8 and cluster kernels have no other (GitHub #456)")
+endif()
+set(CMAKE_CUDA_ARCHITECTURES "${IGNIS_CUDA_ARCHITECTURES}" CACHE STRING
+  "The CUDA architectures, from IGNIS_CUDA_ARCHITECTURES (kernel/CMakeLists.txt)" FORCE)
+message(STATUS "ignis kernel: CUDA architectures ${CMAKE_CUDA_ARCHITECTURES}, the sm_120a set ${IGNIS_SM120A_ARCHITECTURES}")
+
 project(ignis-kernel LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-# RTX 5090 (Blackwell consumer). Proven on this machine with CMake 3.28
-# (NINFER_WINDOWS_BUILD_NOTES section 14).
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120a)
-endif()
 
 # -GS- : the kernel objects are linked into a Rust binary via lld, which cannot
 # satisfy the /GS security-cookie symbols (__security_cookie,
@@ -68,7 +97,39 @@ find_package(CUDAToolkit REQUIRED)
 # The source list is explicit, not a glob: the manifest is the only thing that
 # decides what is vendored, and a glob would silently absorb a stray file.
 set(IGNIS_VENDOR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor)
+# GitHub #456: the NVFP4 W4A4 prefill GEMMs -- the FP4 MMA
+# (`kind::mxf4nvf4.block_scale`), TMA and setmaxnreg, with no counterpart
+# before Blackwell -- compile for the sm_120a set alone, as an object library
+# whose objects ignis_vendor archives: the files stay verbatim (ADR 0010), and
+# a launch of one on any other card fails with "no kernel image is
+# available". Their host code (plans, workspace sizes, launchers) is the same
+# on every card. The NVFP4 linear's W4A4 MMA and TMA routes (P1-09, GitHub
+# #45), the W4A4 arms of the attention input projection and the linear +
+# residual (P1-11, #47), of the GDN input projection (P1-12, #48) and of the
+# MLP gate_up, MMA and TMA (P1-13, #49). With them, three whose kernels
+# declare more than 48 KiB of static shared memory per block, which ptxas
+# refuses for sm_8x and accepts for 120a: the W8 linear's small-T and
+# split-K routes (P1-10, #46; on the 27B only its MTP layer, which no load
+# binds, takes the small-T route, and only a [2048, 16384] problem no served
+# artifact holds takes split-K) and the i8 decode attention (P1-15, #51; no
+# KV format a load can name):
+add_library(ignis_vendor_sm120a OBJECT
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_w4a4.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_splitk.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_small_t.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_i8.cu
+)
+set_target_properties(ignis_vendor_sm120a PROPERTIES CUDA_ARCHITECTURES "${IGNIS_SM120A_ARCHITECTURES}")
+target_include_directories(ignis_vendor_sm120a PRIVATE ${IGNIS_VENDOR_DIR}/src ${IGNIS_VENDOR_DIR}/include)
+target_link_libraries(ignis_vendor_sm120a PRIVATE CUDA::cudart)
 add_library(ignis_vendor STATIC
+  $<TARGET_OBJECTS:ignis_vendor_sm120a>
   ${IGNIS_VENDOR_DIR}/src/core/arena.cu
   ${IGNIS_VENDOR_DIR}/src/core/cyclic_kv_cache.cpp
   ${IGNIS_VENDOR_DIR}/src/core/device.cu
@@ -107,8 +168,6 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_format.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_gemv.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_small_t.cu
-  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_w4a4.cu
-  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cu
   # P1-10 (GitHub #46): the BF16 linear op family (GEMV, small-T, MMA).
   ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_dispatch.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_gemm_mma.cu
@@ -119,15 +178,12 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_decode.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_mma.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_simt.cu
-  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_splitk.cu
-  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_small_t.cu
   # P1-11 (GitHub #47): the fused attention input projection (NVFP4 + BF16
   # arms) and the fused linear+residual output projection (NVFP4 + BF16
   # arms).
   ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
   ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
-  ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
   ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/bf16/bf16_attn_input_decode.cu
   ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu
   ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/bf16/bf16_attn_input_plan.cpp
@@ -135,7 +191,6 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/nvfp4/nvfp4_linear_add_decode.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu
-  ${IGNIS_VENDOR_DIR}/src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_decode.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_plan.cpp
@@ -148,7 +203,6 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu
   ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu
-  ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
   ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode.cu
   ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_post.cu
@@ -188,7 +242,6 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/kv_cache_append_prefix.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_bf16.cu
-  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_i8.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_hq_27.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_hq_35.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_prefill.cu
@@ -260,8 +313,6 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
-  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
-  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
 )
 # No PREFIX override: the platform default is what crates/artifact/build.rs
 # expects on each host — "" on MSVC (ignis_vendor.lib), "lib" on Linux, where
@@ -301,12 +352,45 @@ target_link_libraries(ignis_vendor PUBLIC CUDA::cudart)
 file(GLOB_RECURSE IGNIS_KERNEL_SRCS CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu
 )
-add_library(ignis_kernel STATIC ${IGNIS_KERNEL_SRCS})
+# GitHub #456: our sources whose every kernel needs the sm_120a set compile
+# for it alone, as ignis_vendor_sm120a above: Flash-Next's decode clusters
+# (thread-block clusters) and staged kernel (`mbarrier.try_wait`), neither its
+# default route, and the image model's FP8 GEMM and attention (the
+# block-scaled FP8 MMA). On another card the prepare step finds no staged or
+# cluster kernel and Flash-Next keeps its register kernel; a launch fails
+# with "no kernel image is available".
+set(IGNIS_KERNEL_SM120A_SRCS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/moe_decode_cluster.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/moe_decode_staged.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/image/fp8_gemm.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/image/attn8.cu
+)
+list(LENGTH IGNIS_KERNEL_SRCS kernel_sources)
+list(REMOVE_ITEM IGNIS_KERNEL_SRCS ${IGNIS_KERNEL_SM120A_SRCS})
+list(LENGTH IGNIS_KERNEL_SRCS kernel_sources_left)
+math(EXPR kernel_sources_moved "${kernel_sources} - ${kernel_sources_left}")
+if(NOT kernel_sources_moved EQUAL 4)
+  message(FATAL_ERROR "the sm_120a set's four sources are not all under kernel/src (${kernel_sources_moved} found)")
+endif()
+add_library(ignis_kernel_sm120a OBJECT ${IGNIS_KERNEL_SM120A_SRCS})
+set_target_properties(ignis_kernel_sm120a PROPERTIES CUDA_ARCHITECTURES "${IGNIS_SM120A_ARCHITECTURES}")
+target_include_directories(ignis_kernel_sm120a PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include ${IGNIS_VENDOR_DIR}/src ${IGNIS_VENDOR_DIR}/include)
+target_link_libraries(ignis_kernel_sm120a PRIVATE CUDA::cudart)
+add_library(ignis_kernel STATIC ${IGNIS_KERNEL_SRCS} $<TARGET_OBJECTS:ignis_kernel_sm120a>)
 # No PREFIX override: the platform default is what crates/artifact/build.rs
 # expects on each host — "" on MSVC (ignis_kernel.lib), "lib" on Linux, where
 # `-lignis_*` only finds libignis_kernel.a.
 set_target_properties(ignis_kernel PROPERTIES OUTPUT_NAME "ignis_kernel")
 target_include_directories(ignis_kernel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# GitHub #457: the architectures this build compiles for, as the text
+# ignis_build_cuda_architectures returns (kernel/src/device.cu), so a start
+# refuses a card none of them runs on, by name, before anything loads.
+# file(CONFIGURE) rewrites the header only when the list changes.
+file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/ignis_build_architectures.h
+  CONTENT "#pragma once\n#define IGNIS_BUILD_CUDA_ARCHITECTURES \"${CMAKE_CUDA_ARCHITECTURES}\"\n")
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/device.cu PROPERTIES
+  INCLUDE_DIRECTORIES ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(ignis_kernel PUBLIC ignis_vendor)
 # ...and back: the dependency between the two archives is genuinely mutual.
 # The vendored plans call `ninfer::ops::linear` (nvfp4_linear_swiglu_plan.cpp,

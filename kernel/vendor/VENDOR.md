@@ -12,8 +12,10 @@ is the reference's file*, and a script proves it.
   replaced by our own implementation in `kernel/src/` and leave the subtree —
   and `docs/adr/0037-a-vendored-file-may-carry-a-correctness-patch.md` — a file
   with a *demonstrated* correctness bug may carry a recorded patch, with a test
-  that fails without it. Read both before editing anything here; nothing below
-  changes.
+  that fails without it — and `docs/adr/0077-a-vendored-file-may-carry-a-portability-patch.md`
+  (proposed) — a file may carry a recorded patch that makes it build and run on
+  an architecture the build targets, changing nothing on `120a`. Read them
+  before editing anything here; nothing below changes.
 - Attribution: `kernel/NOTICE` (the subtree is Apache-2.0; `LICENSE` is
   vendored alongside the code)
 - Spec: `docs/specs/runtime/01-device-resident-forward.md` (GitHub #36)
@@ -83,9 +85,21 @@ From then on `verify` expects the *patched* hash locally and the *reference's*
 hash upstream, so both an unrecorded edit and upstream drift are caught. `sync`
 will not overwrite a patched file unless it is told to.
 
-A patch is admitted for one of two reasons, and its `reason` says which: a
-measured bottleneck (ADR 0031), or a demonstrated correctness bug (ADR 0037),
-in which case the `reason` also names the test that fails without the patch.
+A patch is admitted for one of three reasons, and its `reason` says which: a
+measured bottleneck (ADR 0031); a demonstrated correctness bug (ADR 0037),
+in which case the `reason` also names the test that fails without the patch;
+or portability to an architecture the build targets (ADR 0077), in
+which case the `reason` names the architecture and the compile it fixes, and
+the default `120a` build's device code is unchanged. The one portability
+patch is `src/core/pdl.cuh` (GitHub #456): programmatic dependent launch is a
+no-op below sm_90, and a device below compute capability 9.0 launches without
+the programmatic-serialization attribute. A portability patch changes no
+behaviour where the reference runs, so it adds no row to the table below. A
+file that cannot build for an older architecture is not patched: ten compile,
+verbatim, for the arch-specific Blackwell targets alone (`ignis_vendor_sm120a`
+in `kernel/CMakeLists.txt`) -- the seven NVFP4 W4A4 prefill GEMMs, and the W8
+small-T and split-K routes and the i8 decode attention, whose kernels declare
+more than the 48 KiB of static shared memory per block an sm_8x build allows.
 One patch has neither reason and says so: the W8 dispatch's arms for the
 image model's vision tower (`src/ops/linear/w8/w8_dispatch.cpp` and its test
 cases, spec image-model/03, GitHub #320), a registry extension sanctioned as

@@ -17,8 +17,8 @@
 # first). A GPU load there is refused naming the missing driver.
 #
 # The kernel leaf is compiled for SM120a (RTX 5090 / Blackwell consumer),
-# the one architecture kernel/CMakeLists.txt targets. The image will not run
-# on another card.
+# kernel/CMakeLists.txt's default; CUDA_ARCHITECTURES below adds others. On a
+# card the build does not cover the server refuses to start, naming the card.
 
 # --- the Playground frontend (ADR 0026) ------------------------------------
 #
@@ -57,6 +57,14 @@ COPY --from=web /src/web/dist ./web/dist
 # count (kernel/build.sh reads this).
 ARG KERNEL_BUILD_JOBS=
 ENV IGNIS_KERNEL_BUILD_JOBS=${KERNEL_BUILD_JOBS}
+
+# The CUDA architectures the kernel leaf is compiled for (GitHub #456), which
+# kernel/CMakeLists.txt reads: empty is its default, 120a alone, and
+# `--build-arg CUDA_ARCHITECTURES='86;120a'` adds Ampere, a development build
+# (docs/user/contributing/building.md). Each architecture added is another
+# device compile of nearly every translation unit.
+ARG CUDA_ARCHITECTURES=
+ENV IGNIS_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
 
 # --target explicitly: .cargo/config.toml pins the MSVC triple for every host
 # (cargo has no host condition for build.target -- GitHub #167).

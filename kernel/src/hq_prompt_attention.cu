@@ -106,6 +106,17 @@ constexpr int kFaSmemBytes = 2 * kStageBytes<kFp8>;  // two stages: 32 KiB (FP8)
 
 // ---- PTX helpers (upstream engine/src/mma.cuh) --------------------------------------------------
 
+// GitHub #456: the 8-bit band's own instructions -- the block-scaled E4M3 MMA and the e4m3x2
+// conversions -- are sm_120a's. A build for an older card compiles this file for it too, for
+// the BF16 window and the FP16 band, which are sm_80 throughout: there the helpers that issue
+// those instructions trap, and so does the 8-bit band at its entry. The host never runs that
+// band below compute capability 12.0 (--model-prefill-attention resolves to fp16 there).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
+#define IGNIS_HQ_PROMPT_FP8_BAND 0
+#else
+#define IGNIS_HQ_PROMPT_FP8_BAND 1
+#endif
+
 __device__ __forceinline__ std::uint32_t smem_u32(const void *p) {
   return static_cast<std::uint32_t>(__cvta_generic_to_shared(p));
 }
@@ -160,12 +171,16 @@ __device__ __forceinline__ void mma_s8(int *d, const std::uint32_t *a, const std
 // register carries the same scale here, so which lane supplies it does not matter.
 __device__ __forceinline__ void mma_e4m3(float *d, const std::uint32_t *a, const std::uint32_t *b,
                                          std::uint32_t sfa, std::uint32_t sfb) {
+#if IGNIS_HQ_PROMPT_FP8_BAND
   asm volatile(
       "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X.f32.e4m3.e4m3."
       "f32.ue8m0 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %11, {0, 0};\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sfa), "r"(sfb));
+#else
+  __trap();
+#endif
 }
 __device__ __forceinline__ float ex2_approx(float x) {
   float y;
@@ -174,15 +189,21 @@ __device__ __forceinline__ float ex2_approx(float x) {
 }
 // E4M3 of 2^a, 2^b (a in byte 0) through an f16x2 exp2: enough for the 3-bit mantissa.
 __device__ __forceinline__ std::uint32_t exp2_e4m3x2(float a, float b) {
+#if IGNIS_HQ_PROMPT_FP8_BAND
   std::uint32_t h;
   std::uint16_t r;
   asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(h) : "f"(b), "f"(a));
   asm("ex2.approx.f16x2 %0, %0;" : "+r"(h));
   asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(r) : "r"(h));
   return r;
+#else
+  __trap();
+  return 0;
+#endif
 }
 // The sum of the four E4M3 values of x.
 __device__ __forceinline__ float sum_e4m3x4(std::uint32_t x) {
+#if IGNIS_HQ_PROMPT_FP8_BAND
   std::uint32_t lo, hi;
   asm("{\n.reg .b16 a, b;\n"
       "mov.b32 {a, b}, %2;\n"
@@ -193,6 +214,10 @@ __device__ __forceinline__ float sum_e4m3x4(std::uint32_t x) {
   const float2 f = __half22float2(*reinterpret_cast<const __half2 *>(&lo));
   const float2 g = __half22float2(*reinterpret_cast<const __half2 *>(&hi));
   return (f.x + f.y) + (g.x + g.y);
+#else
+  __trap();
+  return 0.0f;
+#endif
 }
 __device__ __forceinline__ std::uint32_t pack_bf16(float lo, float hi) {
   const __nv_bfloat162 h = __floats2bfloat162_rn(lo, hi);
@@ -470,6 +495,11 @@ __global__ void __launch_bounds__(kFaThreads, 1)
     fa_kernel(Queries qs, int start, int width, float scale, Columns cols, PassBuffers buf,
               int splits, int resume, Carry carry) {
   static_assert(!(kFp8 && kHalf), "one band precision");
+#if !IGNIS_HQ_PROMPT_FP8_BAND
+  if constexpr (kFp8) {
+    __trap();  // the 8-bit band below sm_120: never a silent stand-in (GitHub #456)
+  }
+#endif
   extern __shared__ __align__(128) std::uint8_t fa_smem[];
   constexpr int kKSteps = kFp8 ? kHeadDim / 32 : kHeadDim / 16;  // QK contraction steps
   const std::uint32_t sbase = smem_u32(fa_smem);

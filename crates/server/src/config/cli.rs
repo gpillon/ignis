@@ -662,12 +662,12 @@ mod tests {
     #[test]
     fn model_download_is_fitted_to_the_card_the_start_reads() {
         let files = MemFiles::default();
-        let sixteen = Card::Total(16 << 30);
+        let sixteen = Card::blackwell(16 << 30);
         let (ids, ..) = download_of(run_on(&["model", "download"], &files, sixteen.clone()).unwrap());
         assert_eq!(ids, ["qwen3.8-27b-16g"]);
         let err = run_on(&["model", "download", "qwen3.8-flash-next"], &files, sixteen).unwrap_err().0;
         assert!(err.contains("nothing fetched") && err.contains("32 GB") && err.contains("16 GB"), "{err}");
-        let five_090 = Card::Total(super::super::profile::RTX_5090_TOTAL_BYTES);
+        let five_090 = Card::blackwell(super::super::profile::RTX_5090_TOTAL_BYTES);
         let (ids, ..) = download_of(run_on(&["model", "download"], &files, five_090).unwrap());
         assert_eq!(ids, ["qwen3.8-27b"]);
     }

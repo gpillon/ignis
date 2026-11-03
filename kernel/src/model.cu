@@ -1887,8 +1887,15 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // GitHub #341: the BF16 exception tensors a load holds in FP8 run on the FP8
   // linear and the W8A8 GEMM (kernel/src/fp8_exception.h), which refuse an
   // unprepared device. Prepared here, outside any capture, whichever way the
-  // tensors are held: it only sets kernel attributes.
-  if (ignis_fp8_linear_prepare() != 0 || ignis_image_gemm_prepare() != 0) {
+  // tensors are held: it only sets kernel attributes. The W8A8 GEMM compiles
+  // for the sm_120a set alone (GitHub #456): a device with no image of it
+  // leaves it unprepared, so its route refuses there, and the host never has
+  // a load on such a card hold the tensors in FP8.
+  const auto no_image_here = [] {
+    const cudaError_t err = cudaGetLastError();
+    return err == cudaErrorNoKernelImageForDevice || err == cudaErrorInvalidDeviceFunction;
+  };
+  if (ignis_fp8_linear_prepare() != 0 || (ignis_image_gemm_prepare() != 0 && !no_image_here())) {
     set_error(std::string("ignis_model_load: preparing the FP8 exception kernels: ") +
               ignis_fp8_linear_last_error() + " / " + ignis_image_gemm_last_error());
     return -1;

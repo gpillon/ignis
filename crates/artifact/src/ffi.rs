@@ -84,6 +84,21 @@ unsafe extern "C" {
         total_bytes: *mut u64,
     ) -> i32;
 
+    /// The name (NVML's, NUL-terminated into `name`) and compute capability
+    /// (the CUDA runtime's) of CUDA device `device_id`, read without
+    /// creating a CUDA context (GitHub #457).
+    pub fn ignis_device_identity(
+        device_id: i32,
+        name: *mut std::os::raw::c_char,
+        name_bytes: u32,
+        major: *mut i32,
+        minor: *mut i32,
+    ) -> i32;
+
+    /// The CUDA architectures this leaf's kernels were compiled for, as the
+    /// build named them (`120a`, `86;120a`): a static NUL-terminated string.
+    pub fn ignis_build_cuda_architectures() -> *const std::os::raw::c_char;
+
     /// Free a device allocation returned by [`ignis_device_alloc`]. NULL
     /// device or pointer is a no-op.
     pub fn ignis_device_free(d: *mut IgnisDevice, ptr: *mut c_void);

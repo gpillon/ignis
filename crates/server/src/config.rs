@@ -31,6 +31,7 @@ use ignis_core::image::ImageSize;
 use crate::instruction::InstructionPolicy;
 use crate::thinking::ReasoningEffort;
 
+pub mod arch;
 pub mod cli;
 pub mod field;
 pub mod file;
@@ -729,7 +730,7 @@ pub fn resolve_with(
     env: impl Fn(&str) -> Option<String>,
     files: &dyn file::Files,
 ) -> Result<ConfigOutcome, ConfigError> {
-    resolve_on(args, env, files, &|| profile::Card::Total(profile::RTX_5090_TOTAL_BYTES))
+    resolve_on(args, env, files, &|| profile::Card::blackwell(profile::RTX_5090_TOTAL_BYTES))
 }
 
 /// [`resolve_with`] on the card `card` reads (ADR 0063): what `--profile
@@ -762,7 +763,14 @@ pub fn resolve_on(
             _ => {}
         }
     }
-    start_config(args, &env, files, card).map(ConfigOutcome::Config)
+    // GitHub #457: a start on a card this build's kernels do not run on is
+    // refused first, whatever the profile -- before a card class or anything
+    // else is asked of it. The verbs, which load nothing, read it as before.
+    let read = card();
+    if let Some(refusal) = read.refusal() {
+        return Err(ConfigError(refusal));
+    }
+    start_config(args, &env, files, &|| read.clone()).map(ConfigOutcome::Config)
 }
 
 /// The configuration a start reads from `args` (field flags, `--config`,
@@ -784,8 +792,8 @@ pub(crate) fn start_config(
     let (mut sources, _) = gather(parsed, env, files, choice, card)?;
     // A start reads the card's total whichever way its profile was chosen,
     // so the catalog can check what fits it (ADR 0064).
-    if sources.card_total.is_none() {
-        sources.card_total = card().total();
+    if sources.card.is_none() {
+        sources.card = card().reading().cloned();
     }
     Config::from_sources(sources)
 }
@@ -867,10 +875,10 @@ pub(crate) fn gather(
         .or(document.profile)
         .unwrap_or_else(|| profile::DEFAULT_PROFILE.to_owned());
     let profile_auto = named == profile::AUTO_PROFILE;
-    let mut card_total = None;
+    let mut card_read = None;
     let profile_name = if profile_auto {
         let card = card();
-        card_total = card.total();
+        card_read = card.reading().cloned();
         // No card (a build without CUDA) resolves as `none` would.
         profile::auto(card)?.unwrap_or(profile::NONE_PROFILE).to_owned()
     } else {
@@ -890,7 +898,7 @@ pub(crate) fn gather(
         profile,
         profile_name,
         profile_auto,
-        card_total,
+        card: card_read,
     };
     Ok((sources, value))
 }
@@ -920,7 +928,14 @@ impl Config {
     /// a `model` verb), or when a verb resolved under a named profile, which
     /// reads none.
     pub fn card_total_bytes(&self) -> Option<u64> {
-        self.basis.sources().card_total
+        self.card().map(|card| card.total)
+    }
+
+    /// The card the start read, when it read one ([`Config::card_total_bytes`]
+    /// says when): its name and compute capability beside its total, and
+    /// what the build's kernels were compiled for.
+    pub fn card(&self) -> Option<&profile::CardReading> {
+        self.basis.sources().card.as_ref()
     }
 
     /// The [`profile::CardClass`] of [`Config::card_total_bytes`]: what the
@@ -1186,6 +1201,17 @@ fn derive(
     let rope_scaling = s.model.rope_scaling.resolve(s.model.max_context).map_err(|e| {
         ConfigError(format!("`{} {}`: {e}", spelled("model", "max_context"), s.model.max_context))
     })?;
+    // GitHub #456: the band the card runs, whatever the field resolved to.
+    let prefill_attention = arch::prefill_attention(
+        s.model.prefill_attention,
+        !resolution.adapts("model", "prefill_attention"),
+        sources.card.as_ref(),
+        &spelled("model", "prefill_attention"),
+    )
+    .map_err(ConfigError)?;
+    let exception_weights =
+        arch::exception_weights(s.model.exception_weights, sources.card.as_ref(), &spelled("model", "exception_weights"))
+            .map_err(ConfigError)?;
 
     let config = Config {
         model,
@@ -1262,8 +1288,8 @@ fn derive(
         decode_lanes: s.spec.decode_lanes,
         vision,
         rope_scaling,
-        prefill_attention: s.model.prefill_attention,
-        exception_weights: s.model.exception_weights,
+        prefill_attention,
+        exception_weights,
         media,
         request_timeout_secs: s.server.request_timeout,
         stream_timeout_secs: s.server.stream_timeout,
@@ -1298,7 +1324,7 @@ pub fn log_source(config: &Config) {
         path = path.as_deref().unwrap_or("none"),
         profile = %sources.profile_name,
         profile_by = if sources.profile_auto { "auto" } else { "named" },
-        card_total_bytes = sources.card_total,
+        card_total_bytes = config.card_total_bytes(),
         "configuration source"
     );
 }

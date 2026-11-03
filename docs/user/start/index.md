@@ -46,7 +46,10 @@ You can add models of your own with an
   catalog entry states the smallest card class it loads on, and the server
   refuses one above the card before it unloads or fetches anything.
   Other cards, including the DGX Spark, are not supported; [why not DGX
-  Spark?](../guides/dgx-spark.md) gives the reasoning.
+  Spark?](../guides/dgx-spark.md) gives the reasoning. A start on one is
+  refused before anything loads, naming the card, its compute capability and
+  the one the build supports
+  ([Troubleshooting](../troubleshooting.md#this-builds-kernels-run-on-compute-capability-120-rtx-50-rtx-pro-6000-blackwell-built-for-120a-the-card-is--89-which-they-were-not-built-for)).
 - **Operating systems.** Windows and Linux on x86-64. A `v*` release publishes
   a Windows `.zip`, a Linux `.tar.gz` and a `linux/amd64` container image
   ([Install](install.md)). There is no ARM build.

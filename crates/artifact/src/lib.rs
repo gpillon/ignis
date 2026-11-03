@@ -61,7 +61,7 @@ pub use checksum::{
 pub use device::{CpuDevice, Device, DeviceBuffer, HostMappedBuffer};
 pub use direct::{AlignedBuffer, DirectReader, DirectWriter, volume_free_bytes};
 #[cfg(feature = "cuda")]
-pub use device::CudaDevice;
+pub use device::{built_cuda_architectures, CudaDevice};
 #[cfg(feature = "cuda")]
 pub use kv_budget::{paged_kv_page_budget, PagedKvBudget, PagedKvPlane};
 pub use frontend::{

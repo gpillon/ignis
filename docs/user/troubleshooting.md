@@ -13,6 +13,41 @@ count, differs from run to run. Error bodies on `/v1` are OpenAI's
 
 ## Starting
 
+### `this build's kernels run on compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell), built for 120a; the card is … (8.9), which they were not built for`
+
+The card is not one the build's kernels were compiled for. The full message
+names the card as NVML does and its compute capability, here an RTX 40 card at
+8.9, and ends "see GitHub #456". Every release, and a build from a checkout by
+default, is compiled for `120a` only: compute capability 12.0, the RTX 50 and
+RTX PRO 6000 Blackwell cards
+([What it runs on](start/index.md#what-it-runs-on)). The server checks the
+card before anything else, whatever `--profile` says, because a load could only
+fail at its first kernel with CUDA's own "no kernel image is available for
+execution on the device". `model download`, `model list` and the `config`
+commands load nothing and still run on such a card.
+
+RTX 30 and 40 cards are not supported
+([#456](https://github.com/gpillon/ignis/issues/456)). On a machine with more
+than one card, ignis uses CUDA device 0; when that is the other card,
+`CUDA_VISIBLE_DEVICES` names the supported one.
+
+### `… needs kernels this build compiles for 120a alone, which run on compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell); the card is … (8.6)`
+
+Only a build for older cards than Blackwell says it
+([Other card architectures](contributing/building.md#other-card-architectures)),
+on such a card. The model or the route named first has kernels for Blackwell
+alone: the 27B's NVFP4 artifact (its W4A4 prefill GEMMs), the image model, or
+Flash-Next's staged expert decode (`IGNIS_FN_MOE_STAGED=1`). The load is
+refused before it starts, under the event `ignis.model.route_unsupported`; a
+switch to it is refused the same way and the loaded model keeps serving. Load
+the 27B from its trellis artifact (`--model-id qwen3.8-27b-16g`), and unset
+`IGNIS_FN_MOE_STAGED`.
+
+On the same card `--model-prefill-attention fp8`, named by a flag, the
+environment, a config file or a `PATCH`, is refused naming that spelling, and
+so is `--model-exception-weights fp8`. Unset, the 27B's prompt attention runs
+the FP16 band there and its exception tensors stay BF16.
+
 ### A start under `--profile auto` is refused, naming `--profile`
 
 The card's total memory is not one the built-in profiles serve (under 20 GiB,

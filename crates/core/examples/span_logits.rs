@@ -18,6 +18,10 @@
 //! `IGNIS_MODEL_EXCEPTION_WEIGHTS=fp8`, the server's own variable for
 //! `--model-exception-weights`, holds the BF16 exception tensors in FP8
 //! (GitHub #341); unset, they are held as stored, as the server's default.
+//! `IGNIS_MODEL_PREFILL_ATTENTION=fp16`, the server's own variable for
+//! `--model-prefill-attention`, prefills on the FP16 band (GitHub #335): the
+//! band a card below compute capability 12.0 runs, where the 8-bit band traps
+//! (GitHub #456); unset, the 8-bit default.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,7 +29,9 @@ use std::path::{Path, PathBuf};
 use ignis_artifact::{CudaDevice, ModelScope, VisionResidency, Reader, bind_model_scope_27b_with, materialize};
 use ignis_core::{ExceptionWeights, KvFormat};
 use ignis_core::compute::ModelConfig;
-use ignis_core::model_load::load_qwen38_27b;
+use ignis_core::model_load::load_qwen38_27b_with_prefill_attention;
+use ignis_core::rope_scaling::RopeScaling;
+use ignis_core::PrefillAttention;
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step::{prefill_program, prefill_program_span_logits};
 
@@ -59,12 +65,27 @@ fn main() {
         .map_or(Ok(ExceptionWeights::default()), |v| ExceptionWeights::parse(&v))
         .unwrap_or_else(|e| panic!("IGNIS_MODEL_EXCEPTION_WEIGHTS: {e}"));
     eprintln!("exception weights: {exceptions}");
+    let prefill_attention = std::env::var("IGNIS_MODEL_PREFILL_ATTENTION")
+        .map_or(Ok(PrefillAttention::default()), |v| PrefillAttention::parse(&v))
+        .unwrap_or_else(|e| panic!("IGNIS_MODEL_PREFILL_ATTENTION: {e}"));
+    eprintln!("prefill attention: {prefill_attention}");
     let scope = ModelScope { draft: None, vision: false, vision_residency: VisionResidency::Device, fp8_exceptions: exceptions.is_fp8() };
     let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = CudaDevice::create(0).unwrap_or_else(|e| panic!("CUDA: {e}"));
     let artifact = materialize(&reader, &plan, &mut device, None).unwrap_or_else(|e| panic!("materialize: {e}"));
-    let model = load_qwen38_27b(&reader, &artifact, &handles, prefill_chunk, max_context, kv_format)
-        .unwrap_or_else(|e| panic!("model load: {e}"));
+    let model = load_qwen38_27b_with_prefill_attention(
+        &reader,
+        &artifact,
+        &handles,
+        prefill_chunk,
+        max_context,
+        kv_format,
+        None,
+        None,
+        RopeScaling::NONE,
+        prefill_attention,
+    )
+    .unwrap_or_else(|e| panic!("model load: {e}"));
     let pool = SeqPool::create(
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {

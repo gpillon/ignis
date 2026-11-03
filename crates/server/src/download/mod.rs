@@ -408,7 +408,7 @@ mod tests {
 
     /// [`start_config_on`] with `flags` on the command line.
     fn start_config_with(flags: &[&str], total: u64) -> crate::config::Config {
-        let card = move || crate::config::profile::Card::Total(total);
+        let card = move || crate::config::profile::Card::blackwell(total);
         let flags: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
         match crate::config::resolve_on(&flags, |_: &str| None, &crate::config::file::NoFiles, &card).expect("resolves") {
             crate::config::ConfigOutcome::Config(config) => config,

@@ -45,7 +45,7 @@ settings. The figures hold for those, not for any card.
 
 | Check | Command | Passes when |
 |---|---|---|
-| The card | `nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv` | `compute_cap` reads `12.0` and the card is one named above. |
+| The card | `nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv` | `compute_cap` reads `12.0` and the card is one named above. On any other `compute_cap` the server refuses to start, naming the card ([Troubleshooting](../troubleshooting.md#starting)). |
 | The driver | `nvidia-smi` | its header reads `CUDA Version: 13.x` or later. |
 | The system | | Windows or Linux on x86-64. The Linux archive needs glibc 2.39 or newer (`ldd --version`) and the CUDA 13 runtime; the container needs podman or docker with the NVIDIA container toolkit. |
 | Disk | | the model fits where the user wants to keep it: sizes in [What it serves](../start/index.md#what-it-serves). |

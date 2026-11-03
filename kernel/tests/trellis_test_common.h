@@ -165,8 +165,9 @@ inline Reference reference(const std::vector<uint16_t> &x, int rows, const void 
 
 // ---- the tolerance -------------------------------------------------------------------------------
 
-// The header's bound, |y - Y| <= 2^-8 |Y| + 2^-9 s, and how much of it an output used: the largest
-// |y - Y| / bound over a call (below 1 passes) and the relative RMS error, for the report.
+// The header's bound, |y - Y| <= 2^-8 |Y| + 2^-9 s (2^-8 s below compute capability 9.0, as the
+// header states), and how much of it an output used: the largest |y - Y| / bound over a call
+// (below 1 passes) and the relative RMS error, for the report.
 struct Agreement {
   double worst = 0.0;  // max |y - Y| / bound
   double rel_rms = 0.0;
@@ -174,7 +175,18 @@ struct Agreement {
   size_t first_bad = 0;
 };
 
-inline double bound(double y, double s) { return std::ldexp(std::fabs(y), -8) + std::ldexp(s, -9); }
+// The exponent of the bound's second term on the card the test runs on (device 0, as every
+// trellis test uses): -9, or -8 below compute capability 9.0.
+inline int accumulation_exponent() {
+  static const int exponent = [] {
+    int major = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess) return -9;
+    return major < 9 ? -8 : -9;
+  }();
+  return exponent;
+}
+
+inline double bound(double y, double s) { return std::ldexp(std::fabs(y), -8) + std::ldexp(s, accumulation_exponent()); }
 
 inline Agreement agree(const std::vector<double> &got, const std::vector<double> &want, const std::vector<double> &bounds) {
   Agreement a;
