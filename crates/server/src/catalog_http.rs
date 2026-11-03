@@ -23,7 +23,7 @@ use utoipa::ToSchema;
 
 use crate::api::ApiError;
 use crate::config::field::scope;
-use crate::download::catalog::CatalogLayer;
+use crate::download::catalog::{CatalogLayer, License};
 use crate::download::command::{file_size, free_under, lists_file, OnDisk};
 use crate::download_http::DownloadStatus;
 use crate::model_switch::Switcher;
@@ -58,6 +58,12 @@ pub(crate) struct CatalogLicense {
     id: String,
     /// A link to the license's text.
     url: String,
+}
+
+impl From<&License> for CatalogLicense {
+    fn from(license: &License) -> Self {
+        Self { id: license.id.clone(), url: license.url.clone() }
+    }
 }
 
 /// One model the server can switch to or fetch.
@@ -258,7 +264,7 @@ fn rows(server: &Server) -> Vec<CatalogRow> {
             bytes,
             family: if loaded { Some(scope(active.family)) } else { header_family.map(scope) },
             kind: kind.map(ModelKind::as_str),
-            license: entry.and_then(|(entry, _)| entry.license.as_ref()).map(|license| CatalogLicense { id: license.id.clone(), url: license.url.clone() }),
+            license: entry.and_then(|(entry, _)| entry.license.as_ref()).map(CatalogLicense::from),
             loaded,
             switchable: free && !loaded && switcher.is_some_and(|switcher| switcher.resolve(id).is_ok()),
             available: reason.is_none(),

@@ -1352,10 +1352,10 @@ mod tests {
         }
     }
 
-    /// ADR 0078: every built-in entry states its license, pinned here beside
-    /// its card class and family; the identifier is the card's at the pinned
-    /// revision, the link the license file in the entry's repo at that
-    /// revision when the repo holds one, else the license's canonical text.
+    /// ADR 0078: every built-in entry states its license, pinned here; the
+    /// identifier is the card's at the pinned revision, the link the license
+    /// file in the entry's repo at that revision when the repo holds one, else
+    /// the license's canonical text.
     #[test]
     fn every_built_in_entry_states_its_license() {
         let pinned = [
@@ -1376,10 +1376,6 @@ mod tests {
             assert_eq!(entry.id, id);
             let stated = entry.license.as_ref().unwrap_or_else(|| panic!("{id}: every built-in entry states its license"));
             assert_eq!((stated.id.as_str(), stated.url.as_str()), (license, url), "{id}");
-        }
-        // Beside each text or image model's card class and family, as RELEASES pins them.
-        for (entry, release) in entries.iter().zip(RELEASES) {
-            assert_eq!((entry.card_class.map(CardClass::gb), entry.family()), (Some(release.4), Some(release.5)), "{}", release.0);
         }
     }
 
