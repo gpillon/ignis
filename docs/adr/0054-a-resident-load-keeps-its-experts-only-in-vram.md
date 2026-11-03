@@ -61,7 +61,7 @@ no host copy of any expert.**
 - The load reads the artifact as before. Whether the residency phase is shorter (no second copy,
   pool to VRAM) or longer (one synchronous copy per record from pageable buffers) was not settled
   by a load of each with the page cache warm. The admission bench measures the copy alone: ~3.5-3.7
-  GB/s on the 5090 (Gen 3 link, a lower bound for the card), above the cloud volume's ~1 GB/s. So,
+  GB/s on the 5090 (Gen 3 link, a lower bound for the card), above the network volume's ~1 GB/s. So,
   inferred: a cold load is disk-bound, and a warm one takes at least ~37.8 / 3.6 = ~10 s to admit.
   Admitting a layer in fewer, larger copies (4.9-12.6 GB/s measured) is the follow-up if the warm
   case matters.
