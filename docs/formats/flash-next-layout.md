@@ -4,9 +4,11 @@ GitHub: #299 (spec 01). Owner of this document: the converter (`tools/flash-next
 Readers: the Rust packer and reader (`crates/artifact`), the MoE kernels (spec 02),
 residency (spec 03), the forward and its gates (spec 04). A spec named by its number here
 is the Flash-Next spec of that number under `docs/specs/flash-next/`. Why the format is what
-it is: ADR 0044 (the trellis experts) and ADR 0002 (the `.ninfer` container). Two more
+it is: ADR 0044 (the trellis experts) and ADR 0002 (the `.ninfer` container). Three more
 converters write by it: the 16 GB 27B's (`tools/27b-16gb-converter/`) §2's work tree and §3's
-records, the image model's (`tools/image-converter/`) §2's work tree and §6's encodings.
+records, the image model's (`tools/image-converter/`) §2's work tree and §6's encodings, and the
+27B NVFP4 converter (#468) §2's completion protocol, under its own contract
+(`27b-nvfp4-work-tree.md`).
 
 This is the byte-level contract between the Python converter, which writes **work
 files**, and everything that reads them: the Rust packer that assembles the `.ninfer`

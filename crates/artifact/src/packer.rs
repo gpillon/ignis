@@ -49,10 +49,22 @@
 //! 27b-16gb/01): `frontend/`, then the tensors.json units of
 //! [`TRELLIS_27B_UNITS`], each object under its unit's prefix, written by
 //! `tools/27b-16gb-converter`.
+//!
+//! And an NVFP4 container of the 27B ([`Family::Qwen27bNvfp4`], GitHub
+//! #467): the same five units, planned from the inventory
+//! ([`crate::nvfp4_27b::inventory`]) rather than from the converter's lists,
+//! so the container holds exactly the 1,325 objects in the served order
+//! under the weights id the run is given. It packs only a whole tree: until
+//! every unit and `converter.json` are complete it waits, and a missing
+//! object, one of the wrong format, layout or shape, an object the
+//! inventory does not name, or a `converter.json` whose record is short of
+//! the sidecar's fields or whose NVFP4 divisors are not the work files' is
+//! refused by name before anything is created. The work tree's contract is
+//! `docs/formats/27b-nvfp4-work-tree.md`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -133,6 +145,9 @@ pub fn trellis_27b_identity() -> ArtifactIdentity {
     }
 }
 
+/// An NVFP4 27B container's header reservation: its directory is ~0.3 MB.
+pub const NVFP4_27B_HEADER_BYTES: u64 = 4 << 20;
+
 /// The MTP companion container's identity (flash-next-layout.md §13.2).
 pub fn mtp_identity() -> ArtifactIdentity {
     ArtifactIdentity {
@@ -155,6 +170,9 @@ pub enum Family {
     /// The 27B's 16 GB artifact (spec 27b-16gb/01): `frontend/` and the
     /// tensor units of [`TRELLIS_27B_UNITS`].
     Qwen27bTrellis,
+    /// An NVFP4 container of the 27B (GitHub #467): the units of
+    /// [`crate::nvfp4_27b::UNITS`], holding the inventory at `geometry`.
+    Qwen27bNvfp4 { geometry: crate::nvfp4_27b::Geometry },
 }
 
 /// What one [`pack`] call is asked to do.
@@ -237,6 +255,24 @@ impl PackOptions {
         }
     }
 
+    /// The defaults for an NVFP4 container of the 27B: `work_dir` →
+    /// `artifact` under `weights_id`, which has no default (the content hash
+    /// covers the identity and the directory, not the payload, so the
+    /// weights id is what tells one build of this layout from another).
+    pub fn nvfp4_27b(work_dir: PathBuf, artifact: PathBuf, weights_id: &str, geometry: crate::nvfp4_27b::Geometry) -> Self {
+        Self {
+            work_dir,
+            artifact,
+            geometry: None,
+            identity: crate::nvfp4_27b::identity(weights_id),
+            header_bytes: NVFP4_27B_HEADER_BYTES,
+            keep_work: false,
+            delete_batch_bytes: DEFAULT_DELETE_BATCH_BYTES,
+            accept_status: vec!["complete".into()],
+            family: Family::Qwen27bNvfp4 { geometry },
+        }
+    }
+
     /// The layer count the state records: Flash-Next's, 0 for the image model.
     fn layers(&self) -> usize {
         self.geometry.as_ref().map_or(0, |g| g.layers)
@@ -288,6 +324,7 @@ pub fn family_units(family: &Family, layers: usize) -> Vec<String> {
         Family::Qwen27bTrellis => {
             std::iter::once("frontend").chain(TRELLIS_27B_UNITS.iter().copied()).map(String::from).collect()
         }
+        Family::Qwen27bNvfp4 { .. } => crate::nvfp4_27b::UNITS.map(String::from).to_vec(),
     }
 }
 
@@ -318,7 +355,7 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
     let units = family_units(&options.family, options.layers());
     let pair = match &options.family {
         Family::Mtp { pair_main } => Some(pair_record(pair_main)?),
-        Family::Main | Family::QwenImage21 | Family::Qwen27bTrellis => None,
+        Family::Main | Family::QwenImage21 | Family::Qwen27bTrellis | Family::Qwen27bNvfp4 { .. } => None,
     };
 
     let mut state = if state_file.exists() {
@@ -357,6 +394,11 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
                 state_file.display()
             )));
         }
+        if let Family::Qwen27bNvfp4 { .. } = options.family {
+            if let Some(waiting) = preflight_nvfp4_27b(options, &units)? {
+                return Ok(waiting);
+            }
+        }
         let writer =
             ContainerWriter::create(&options.artifact, options.identity.clone(), options.header_bytes)?;
         let state = PackState {
@@ -384,18 +426,7 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
         });
     }
     if converter.exists() {
-        let status = read_json(&converter)?
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        if !options.accept_status.contains(&status) {
-            return Err(fail(format!(
-                "{} has status {status:?}; this run packs only {:?}",
-                converter.display(),
-                options.accept_status
-            )));
-        }
+        check_status(&converter, &read_json(&converter)?, &options.accept_status)?;
         if let Some(pair) = &pair {
             check_pair(&read_json(&converter)?, pair)?;
         }
@@ -643,6 +674,19 @@ impl UnitPlan {
         });
         Ok(())
     }
+
+    /// A `tensors.json` entry, whose `bytes` must be its file's.
+    fn listed(&mut self, done: &Done, tensor: Listed) -> Result<()> {
+        self.tensor(done, tensor.name.clone(), &tensor.file, tensor.format, tensor.layout, tensor.shape)?;
+        let stored = self.files.last().unwrap().bytes;
+        if tensor.bytes != stored {
+            return Err(fail(format!(
+                "tensor {}: tensors.json says {} bytes, the file holds {stored}",
+                tensor.name, tensor.bytes
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// `DONE`'s file list: relative name → (bytes, sha256).
@@ -688,6 +732,11 @@ fn plan_unit(
     };
     let flash_next = || geometry.ok_or_else(|| fail(format!("unit {unit} needs Flash-Next's geometry")));
     let mut plan = UnitPlan::new(dir);
+    // Every unit of this family, the frontend included, is the inventory's.
+    if let Family::Qwen27bNvfp4 { geometry } = family {
+        plan_nvfp4_27b(&mut plan, &done, unit, geometry)?;
+        return Ok(Some(plan));
+    }
     // Only the files flash-next-layout.md names are read; anything else in a unit
     // directory (a layer's `layer.json`, `route_*.npy`) is the converter's
     // own record. A container object the converter forgot to list is caught
@@ -732,10 +781,18 @@ fn plan_unit(
     Ok(Some(plan))
 }
 
-/// The tensors a `tensors.json` lists (flash-next-layout.md §6.3), each whole in its
-/// file, under its own name, which must start with `prefix` when one is
-/// given (a layer's `layers.{L}.`, the MTP head's `mtp.`).
-fn plan_tensors_json(plan: &mut UnitPlan, done: &Done, prefix: Option<&str>) -> Result<()> {
+/// One entry of a `tensors.json` (flash-next-layout.md §6.3).
+struct Listed {
+    name: String,
+    file: String,
+    format: NumericFormat,
+    layout: StorageLayout,
+    shape: Vec<u64>,
+    bytes: u64,
+}
+
+/// The entries of the unit's `tensors.json`, in its order.
+fn read_tensors_json(plan: &UnitPlan, done: &Done) -> Result<Vec<Listed>> {
     if !done.contains_key("tensors.json") {
         return Err(fail(format!("{}'s DONE does not list tensors.json", plan.dir.display())));
     }
@@ -745,14 +802,10 @@ fn plan_tensors_json(plan: &mut UnitPlan, done: &Done, prefix: Option<&str>) -> 
         .get("tensors")
         .and_then(Value::as_array)
         .ok_or_else(|| fail(format!("{} has no tensors array", path.display())))?;
+    let mut listed = Vec::with_capacity(tensors.len());
     for entry in tensors {
         let name = require_string(&entry["name"], "tensor name")?.to_owned();
-        if let Some(prefix) = prefix {
-            if !name.starts_with(prefix) {
-                return Err(fail(format!("{} lists {name}, outside {prefix}", path.display())));
-            }
-        }
-        let file = require_string(&entry["file"], "tensor file")?;
+        let file = require_string(&entry["file"], "tensor file")?.to_owned();
         let format = NumericFormat::parse(require_string(&entry["format"], "tensor format")?)?;
         let layout = StorageLayout::parse(require_string(&entry["layout"], "tensor layout")?)?;
         let shape = entry
@@ -762,15 +815,88 @@ fn plan_tensors_json(plan: &mut UnitPlan, done: &Done, prefix: Option<&str>) -> 
             .iter()
             .map(|d| d.as_u64().ok_or_else(|| fail(format!("tensor {name} has a bad shape"))))
             .collect::<Result<Vec<_>>>()?;
-        let listed = entry
+        let bytes = entry
             .get("bytes")
             .and_then(Value::as_u64)
             .ok_or_else(|| fail(format!("tensor {name} has no bytes")))?;
-        plan.tensor(done, name.clone(), file, format, layout, shape)?;
-        let stored = plan.files.last().unwrap().bytes;
-        if listed != stored {
-            return Err(fail(format!("tensor {name}: tensors.json says {listed} bytes, the file holds {stored}")));
+        listed.push(Listed { name, file, format, layout, shape, bytes });
+    }
+    Ok(listed)
+}
+
+/// The tensors a `tensors.json` lists (flash-next-layout.md §6.3), each whole in its
+/// file, under its own name, which must start with `prefix` when one is
+/// given (a layer's `layers.{L}.`, the MTP head's `mtp.`).
+fn plan_tensors_json(plan: &mut UnitPlan, done: &Done, prefix: Option<&str>) -> Result<()> {
+    let path = plan.dir.join("tensors.json");
+    for listed in read_tensors_json(plan, done)? {
+        if let Some(prefix) = prefix {
+            if !listed.name.starts_with(prefix) {
+                return Err(fail(format!("{} lists {}, outside {prefix}", path.display(), listed.name)));
+            }
         }
+        plan.listed(done, listed)?;
+    }
+    Ok(())
+}
+
+/// A unit of [`Family::Qwen27bNvfp4`], planned from the inventory: the
+/// objects it gives `unit`, in its order, each with the inventory's exact
+/// format, layout and shape. A missing object, one described otherwise, and
+/// one the inventory does not give the unit are refused by name.
+fn plan_nvfp4_27b(plan: &mut UnitPlan, done: &Done, unit: &str, geometry: &crate::nvfp4_27b::Geometry) -> Result<()> {
+    use crate::nvfp4_27b::{inventory, Entry};
+    let expected: Vec<Entry> = inventory(geometry).into_iter().filter(|e| e.unit() == unit).collect();
+    let names: BTreeSet<&str> = expected.iter().map(Entry::name).collect();
+    if unit == "frontend" {
+        if let Some(file) = done.keys().find(|file| !names.contains(format!("frontend/{file}").as_str())) {
+            return Err(fail(format!("frontend/{file} is not an object of the 27B NVFP4 inventory")));
+        }
+        for entry in &expected {
+            let file = &entry.name()["frontend/".len()..];
+            if !done.contains_key(file) {
+                return Err(fail(format!("the work tree has no {}: frontend/DONE does not list {file}", entry.name())));
+            }
+            let index = plan.file(done, file)?;
+            let bytes = plan.files[index].bytes;
+            plan.objects.push(Planned {
+                name: entry.name().to_owned(),
+                spec: Spec::Resource { bytes },
+                slices: vec![Slice { file: index, offset: 0, len: bytes }],
+            });
+        }
+        return Ok(());
+    }
+    let mut listed: BTreeMap<String, Listed> = BTreeMap::new();
+    for tensor in read_tensors_json(plan, done)? {
+        if !names.contains(tensor.name.as_str()) {
+            return Err(fail(format!(
+                "{unit}/tensors.json lists {}, which is not a {unit}/ object of the 27B NVFP4 inventory",
+                tensor.name
+            )));
+        }
+        if let Some(twice) = listed.insert(tensor.name.clone(), tensor) {
+            return Err(fail(format!("{unit}/tensors.json lists {} twice", twice.name)));
+        }
+    }
+    for entry in expected {
+        let Entry::Tensor { name, format, layout, shape } = entry else {
+            return Err(fail(format!("{} is a resource outside frontend/", entry.name())));
+        };
+        let Some(tensor) = listed.remove(&name) else {
+            return Err(fail(format!("the work tree has no {name}: {unit}/tensors.json does not list it")));
+        };
+        if (tensor.format, tensor.layout, &tensor.shape) != (format, layout, &shape) {
+            return Err(fail(format!(
+                "{name} is {} {} {:?} in {unit}/tensors.json; the 27B NVFP4 inventory has {} {} {shape:?}",
+                tensor.format.name(),
+                tensor.layout.name(),
+                tensor.shape,
+                format.name(),
+                layout.name()
+            )));
+        }
+        plan.listed(done, tensor)?;
     }
     Ok(())
 }
@@ -1264,6 +1390,122 @@ fn remove_file(path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(fail(format!("delete {}: {e}", path.display()))),
     }
+}
+
+/// `converter.json`'s `status` must be one this run packs.
+fn check_status(converter: &Path, record: &Value, accept: &[String]) -> Result<()> {
+    let status = record.get("status").and_then(Value::as_str).unwrap_or_default();
+    if !accept.iter().any(|a| a == status) {
+        return Err(fail(format!(
+            "{} has status {status:?}; this run packs only {accept:?}",
+            converter.display()
+        )));
+    }
+    Ok(())
+}
+
+/// [`Family::Qwen27bNvfp4`] before its container exists: the whole tree is
+/// checked, so a refusal leaves nothing behind (but the lock file). Waits
+/// (`Some`) until `converter.json` and every unit are complete; refuses
+/// `converter.json` short of the sidecar's fields, a unit that is not the
+/// inventory's ([`plan_nvfp4_27b`]), and NVFP4 records that are not the
+/// work files'.
+fn preflight_nvfp4_27b(options: &PackOptions, units: &[String]) -> Result<Option<PackOutcome>> {
+    let waiting = |next: &str| Some(PackOutcome::Waiting { appended: 0, total: units.len(), next: next.into() });
+    let converter = options.work_dir.join("converter.json");
+    if !converter.exists() {
+        return Ok(waiting("converter.json"));
+    }
+    let record = read_json(&converter)?;
+    check_status(&converter, &record, &options.accept_status)?;
+    check_nvfp4_27b_record(&record, &options.identity)?;
+    let mut plans = Vec::with_capacity(units.len());
+    for unit in units {
+        match plan_unit(&options.work_dir, unit, &options.family, None)? {
+            Some(plan) => plans.push(plan),
+            None => return Ok(waiting(unit)),
+        }
+    }
+    check_nvfp4_27b_divisors(&record, &plans)?;
+    Ok(None)
+}
+
+/// The fields of `converter.json` the 27B NVFP4 sidecar must carry: the
+/// recipe id (never the file name's), the identity this run packs, the
+/// source's repo, revision and license, and the NVFP4 parents' records.
+fn check_nvfp4_27b_record(record: &Value, identity: &ArtifactIdentity) -> Result<()> {
+    for pointer in ["/recipe_id", "/source/repo", "/source/revision", "/source/license"] {
+        if record.pointer(pointer).and_then(Value::as_str).is_none_or(str::is_empty) {
+            return Err(fail(format!("converter.json has no {}", pointer[1..].replace('/', "."))));
+        }
+    }
+    let recorded = (
+        record.pointer("/identity/model_id").and_then(Value::as_str),
+        record.pointer("/identity/weights_id").and_then(Value::as_str),
+    );
+    if recorded != (Some(identity.model_id.as_str()), Some(identity.weights_id.as_str())) {
+        return Err(fail(format!(
+            "converter.json records identity {}/{}; this run packs {}/{}",
+            recorded.0.unwrap_or("-"),
+            recorded.1.unwrap_or("-"),
+            identity.model_id,
+            identity.weights_id
+        )));
+    }
+    if !record.pointer("/local_nvfp4/parents").is_some_and(Value::is_object) {
+        return Err(fail("converter.json has no local_nvfp4.parents"));
+    }
+    Ok(())
+}
+
+/// `local_nvfp4.parents` records exactly the NVFP4 objects: a text parent
+/// with the weight divisor its work file ends with (the container's
+/// trailing FP32 word, which `checksum::verify` compares), a drafter parent
+/// (`dflash2/`, weight-only) with none.
+fn check_nvfp4_27b_divisors(record: &Value, plans: &[UnitPlan]) -> Result<()> {
+    let parents = record.pointer("/local_nvfp4/parents").and_then(Value::as_object).cloned().unwrap_or_default();
+    let mut seen = BTreeSet::new();
+    for plan in plans {
+        for object in &plan.objects {
+            let Spec::Tensor { format: NumericFormat::Nvfp4, shape, .. } = &object.spec else { continue };
+            let name = object.name.as_str();
+            seen.insert(name);
+            let recorded = parents
+                .get(name)
+                .ok_or_else(|| fail(format!("converter.json's local_nvfp4.parents does not record {name}")))?
+                .get("weight_scale_divisor")
+                .unwrap_or(&Value::Null);
+            if name.starts_with("dflash2/") {
+                if !recorded.is_null() {
+                    return Err(fail(format!(
+                        "converter.json records a weight_scale_divisor for {name}, which is weight-only"
+                    )));
+                }
+                continue;
+            }
+            let recorded = recorded
+                .as_f64()
+                .ok_or_else(|| fail(format!("converter.json records no weight_scale_divisor for {name}")))?;
+            let file = &plan.files[object.slices[0].file];
+            let at = crate::block_scale_geometry(NumericFormat::Nvfp4, shape)?.weight_divisor_offset;
+            let mut word = [0u8; 4];
+            File::open(&file.path)
+                .and_then(|mut f| f.seek(SeekFrom::Start(at)).and_then(|_| f.read_exact(&mut word)))
+                .map_err(|e| fail(format!("read {}'s weight divisor: {e}", file.path.display())))?;
+            let stored = f32::from_le_bytes(word);
+            if f64::from(stored) != recorded {
+                return Err(fail(format!(
+                    "{name} stores weight divisor {stored}; converter.json records {recorded}"
+                )));
+            }
+        }
+    }
+    if let Some(stray) = parents.keys().find(|name| !seen.contains(name.as_str())) {
+        return Err(fail(format!(
+            "converter.json's local_nvfp4.parents records {stray}, which is not an NVFP4 object of the inventory"
+        )));
+    }
+    Ok(())
 }
 
 /// What an MTP companion records of its main container (flash-next-layout.md §13.5

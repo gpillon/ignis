@@ -69,16 +69,16 @@ const SH_GDN_AB: [u64; 2] = [96, 5120]; // the GDN a/b projection
 /// The GQA layers whose `attention/query_key_gate_value` projection is
 /// BF16 (the "early-attention exception" — the artifact's directory: the
 /// first six GQA layers, 3 through 23).
-const QKGV_BF16_LAYERS: &[usize] = &[3, 7, 11, 15, 19, 23];
+pub(crate) const QKGV_BF16_LAYERS: &[usize] = &[3, 7, 11, 15, 19, 23];
 
 /// The GQA layers whose `attention/output` projection is BF16 (the
 /// artifact's directory: the first two GQA layers, 3 and 7).
-const ATTENTION_OUT_BF16_LAYERS: &[usize] = &[3, 7];
+pub(crate) const ATTENTION_OUT_BF16_LAYERS: &[usize] = &[3, 7];
 
 /// The GDN layers whose `gdn/output` projection is BF16 (the artifact's
 /// directory quirk: layer 4 — its `gdn/output` is BF16, so the
 /// `gdn/output_projection/input_scale_divisor` object is absent).
-const GDN_OUT_BF16_LAYERS: &[usize] = &[4];
+pub(crate) const GDN_OUT_BF16_LAYERS: &[usize] = &[4];
 
 /// GitHub #341: the row blocks a BF16 exception tensor converts to FP8 in --
 /// the fused projection's q | k | gate | v (its stored row order), and an

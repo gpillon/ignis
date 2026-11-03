@@ -24,7 +24,11 @@ cuda = []
 
 [dependencies]
 memmap2 = { workspace = true }
-serde_json = { workspace = true }
+# `float_roundtrip` (GitHub #467): a sidecar's `weight_scale_divisor` is the
+# shortest decimal of an FP32 word widened to f64, and `checksum::verify`
+# compares it with the stored word exactly. serde_json's default float parser
+# may land one ULP away, which refused a record of the very word it names.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 
 # The frontend extraction (artifact-02) parses the container-carried
 # `frontend/tokenizer.json` (the HuggingFace `tokenizers` format) and
