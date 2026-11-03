@@ -37,18 +37,24 @@ Raw: `.scratch/449/gates/470/gate1.log`, `gate1.json`, `results/`.
 | Pair | KLD | 95% window-bootstrap CI |
 |---|---|---|
 | Swift NVFP4 given Swift BF16 (the gate) | 0.05355 | [0.04692, 0.06023] |
-| served NVFP4 given Swift BF16 (cross_artifact) | 0.05651 | |
-| Swift NVFP4 given base BF16 (cross_reference) | 0.05923 | |
-| served NVFP4 given base BF16 (baseline, #340) | 0.04916 | |
+| served NVFP4 given Swift BF16 (cross_artifact) | 0.05651 | [0.04930, 0.06380] |
+| Swift NVFP4 given base BF16 (cross_reference) | 0.05923 | [0.05234, 0.06636] |
+| served NVFP4 given base BF16 (baseline, #340) | 0.04916 | not computed: the limit's base |
 
 The limit is 1.2 x 0.04916 = 0.0590. The baseline pair reproduced #340's 0.04916 to the bit. By kind, the gate pair:
 chat 0.04798, code 0.04923, prose 0.06837. Against the served artifact's own pair the ratio is 1.089, CI [1.034, 1.160].
 The registered rule is the point estimate, so gate 1 is a PASS; the CI's upper end (0.06023) is above the limit.
 
-**Controls.** The matched pair is lower than the cross_artifact term by 0.00296, CI of the difference [0.00129,
-0.00534], in 13 of 16 windows; cross_reference is above the matched pair in 16 of 16. The scorer's every-window rule
-printed STOP (13 of 16). The ticket's "far above" has no registered number; the owner accepted the control as measured
-(CI of the difference above 0, and 16 of 16 on the reference cross term), recorded on #470. The wiring controls all held.
+**Controls.** Each cross term against the matched pair, its 95% CIs from the same window resamples:
+
+| Cross term | / matched pair, 95% CI | - matched pair, 95% CI | Above it in |
+|---|---|---|---|
+| cross_artifact | 1.055 [1.024, 1.099] | 0.00296 [0.00129, 0.00534] | 13 of 16 windows |
+| cross_reference | 1.106 [1.070, 1.153] | 0.00569 [0.00381, 0.00806] | 16 of 16 windows |
+
+The scorer's every-window rule printed STOP (cross_artifact, 13 of 16). The ticket's "far above" has no registered
+number; the owner accepted the control as measured (CI of the difference above 0, and 16 of 16 on the reference cross
+term), recorded on #470. The wiring controls all held.
 
 **Gate 2** (DFlash2 on against off, decode tok/s; `.scratch/449/gates/470/cells/gate2.txt`, `b3.py`):
 
@@ -81,8 +87,8 @@ Observed:
 
 - Gate 1 passes: KLD 0.05355 against a limit of 0.0590, on the point estimate the spec registered. The CI's upper end
   is above the limit.
-- Both cross terms sit above the matched pair (by 0.00296 and 0.00568), the artifact one in 13 of 16 windows with a CI
-  of the difference above 0, the reference one in 16 of 16.
+- Both cross terms sit above the matched pair (by 0.00296 and 0.00569, both CIs of the difference above 0), the
+  artifact one in 13 of 16 windows, the reference one in 16 of 16.
 - Gate 2 passes in all nine cells; DFlash2 is worth 3.7x to 5.3x of decode.
 - The served artifact and Swift's agree on the replay to 1.001, and Swift's own-accept (3.467 / 3.535) is above the
   served artifact's (3.397 / 3.466).
