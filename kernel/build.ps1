@@ -1,4 +1,6 @@
-# Build the ignis kernel leaf (CMake + Ninja + nvcc, SM120a).
+# Build the ignis kernel leaf (CMake + Ninja + nvcc), for the CUDA architectures
+# kernel/CMakeLists.txt reads from IGNIS_CUDA_ARCHITECTURES: unset, 120a alone
+# (GitHub #456; docs/user/contributing/building.md).
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File kernel/build.ps1
 #
@@ -61,7 +63,6 @@ $cmakeArgs = @(
     '-B', $BuildPath,
     '-G', 'Ninja',
     '-DCMAKE_BUILD_TYPE=Release',
-    '-DCMAKE_CUDA_ARCHITECTURES=120a',
     "-DCMAKE_CUDA_COMPILER=$Nvcc",
     '-DCMAKE_C_COMPILER_LAUNCHER=',
     '-DCMAKE_CXX_COMPILER_LAUNCHER=',

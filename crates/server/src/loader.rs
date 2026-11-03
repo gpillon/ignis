@@ -81,6 +81,20 @@ pub fn artifact_family(artifact: &Path) -> Result<Option<ignis_core::compute::Mo
     Ok(ignis_core::compute::ModelFamily::of_model_id(&reader.identity().model_id))
 }
 
+/// Whether `artifact` holds a body linear in NVFP4 (GitHub #456): an NVFP4
+/// tensor outside the DFlash2 drafter's `dflash2/` objects, which run the A16
+/// routes alone. The 27B prefills such a body on the W4A4 GEMMs; its trellis
+/// artifact holds NVFP4 only in the drafter it grafts.
+pub fn has_nvfp4_body(artifact: &Path) -> Result<bool> {
+    let reader = Reader::open(artifact)?;
+    Ok(reader.objects().iter().any(|object| match object {
+        ignis_artifact::Object::Tensor(tensor) => {
+            tensor.format == ignis_artifact::NumericFormat::Nvfp4 && !tensor.name.starts_with("dflash2/")
+        }
+        ignis_artifact::Object::Resource(_) => false,
+    }))
+}
+
 /// The kind of the family `artifact`'s header names — the 27B's for an
 /// artifact of no family, as a load serves it; `None` for a file that cannot
 /// be read as a container (a GGUF among them).
@@ -254,6 +268,30 @@ mod tests {
         assert_eq!(artifact_family(&fixture.path).expect("open fixture"), None);
         let missing = fixture.path.with_file_name("no-such-artifact.ninfer");
         assert!(artifact_family(&missing).is_err(), "an unreadable artifact is an error, not a family");
+    }
+
+    /// GitHub #456: an NVFP4 tensor outside `dflash2/` is an NVFP4 body; the
+    /// drafter's own NVFP4 objects (all the trellis artifact holds in NVFP4)
+    /// and the other formats are not.
+    #[test]
+    fn an_nvfp4_tensor_outside_the_drafter_is_an_nvfp4_body() {
+        let nvfp4 = |name: &'static str| FixtureObject::Tensor {
+            name,
+            shape: vec![128, 64],
+            format: "NVFP4",
+            layout: "blockscale-k16-m128x4-v1",
+            offset: 0,
+            bytes: 4612,
+        };
+        let payload = vec![0u8; 4612];
+        let body = fixture::write_fixture(&[nvfp4("layers.0.mlp.gate_up")], &payload, "nvfp4-body").expect("fixture");
+        assert!(has_nvfp4_body(&body.path).unwrap());
+        let drafter = fixture::write_fixture(&[nvfp4("dflash2/fc")], &payload, "nvfp4-drafter").expect("fixture");
+        assert!(!has_nvfp4_body(&drafter.path).unwrap());
+        let (frontend, _) = frontend_fixture("nvfp4-none");
+        assert!(!has_nvfp4_body(&frontend.path).unwrap());
+        let layouts = fixture::write_fixture(&fixture::all_layout_objects(), &fixture::all_layout_payload(), "nvfp4-all").expect("fixture");
+        assert!(has_nvfp4_body(&layouts.path).unwrap(), "w/nvfp4 is outside the drafter");
     }
 
     #[test]

@@ -643,6 +643,25 @@ enum class Window { Production, CodecOnly };
 // GQA layer runs for every hq-e8-2b prefill chunk. The second takes one dense sequence.
 enum class Route { Vendored, Ignis };
 
+// The 8-bit band (INT8 Q K^T, E4M3 P V) exists from compute capability 12.0 and traps below it
+// (GitHub #456). There, as the server does, an arm that leaves the precision at its default runs
+// on the FP16 band, so the rest of the test (the FP16 arms, the decode routes) still runs.
+IgnisHqPromptOptions for_this_card(const IgnisHqPromptOptions &requested) {
+  static const bool has_8bit_band = [] {
+    int major = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess) return true;
+    if (major < 12) {
+      std::printf("compute capability %d.x: the default-precision prompt arms run on the FP16 band\n", major);
+    }
+    return major >= 12;
+  }();
+  IgnisHqPromptOptions options = requested;
+  if (!has_8bit_band && options.precision == IgnisHqPromptPrecision::kFp8) {
+    options.precision = IgnisHqPromptPrecision::kFp16;
+  }
+  return options;
+}
+
 // Runs `call` against a freshly built pool in `kv_format` and returns the
 // BF16 output rows, host-side. Everything device-side is torn down before
 // returning, so the two arms never hold two pools at once.
@@ -651,7 +670,8 @@ std::vector<std::uint16_t> run_route(const Fixture &fx, int32_t kv_format, const
                                      WorkspaceFill fill = WorkspaceFill::Zero,
                                      Window window = Window::Production,
                                      Route route = Route::Vendored,
-                                     const IgnisHqPromptOptions &options = {}) {
+                                     const IgnisHqPromptOptions &requested = {}) {
+  const IgnisHqPromptOptions options = for_this_card(requested);
   if (route == Route::Ignis &&
       (kv_format != IGNIS_KV_FORMAT_HQ_E8_2B || call.batch != 1 || !call.valid.empty() ||
        call.envelope_keys != 0)) {

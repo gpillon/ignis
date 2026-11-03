@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use super::arch::{BuiltArchitectures, ComputeCapability};
 use super::file::read_document;
 use super::source::Layer;
 use super::ConfigError;
@@ -39,8 +40,8 @@ pub const AUTO_PROFILE: &str = "auto";
 /// [`Card::Absent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Card {
-    /// The card's total memory in bytes, as NVML reports it.
-    Total(u64),
+    /// The card the start read ([`CardReading`]).
+    Read(CardReading),
     /// A build with no CUDA (the mock engine, CI): there is no card to read,
     /// and `auto` resolves as `none` would — the hardcoded defaults.
     Absent,
@@ -49,13 +50,54 @@ pub enum Card {
     Unreadable(String),
 }
 
+/// What the start read of a card (GitHub #457): its total memory, which
+/// `--profile auto` chooses by, and what it is, which decides whether this
+/// build's kernels run on it at all ([`super::arch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardReading {
+    /// The card's total memory in bytes, as NVML reports it.
+    pub total: u64,
+    /// Its name, as NVML reports it ("NVIDIA GeForce RTX 5090").
+    pub name: String,
+    /// Its compute capability, as the CUDA runtime reports it.
+    pub capability: ComputeCapability,
+    /// The architectures this build's kernels were compiled for.
+    pub built_for: BuiltArchitectures,
+}
+
 impl Card {
     /// The card's total memory when it was read.
     pub fn total(&self) -> Option<u64> {
+        self.reading().map(|reading| reading.total)
+    }
+
+    /// What was read of the card, when it was.
+    pub fn reading(&self) -> Option<&CardReading> {
         match self {
-            Self::Total(total) => Some(*total),
+            Self::Read(reading) => Some(reading),
             Self::Absent | Self::Unreadable(_) => None,
         }
+    }
+
+    /// A Blackwell card (compute capability 12.0) of `total` bytes under the
+    /// default build, which its kernels run on: what the CPU tests and the
+    /// callers with no card to read inject.
+    pub fn blackwell(total: u64) -> Card {
+        Card::Read(CardReading {
+            total,
+            name: "NVIDIA RTX (Blackwell)".to_owned(),
+            capability: ComputeCapability::new(12, 0),
+            built_for: BuiltArchitectures::default_build(),
+        })
+    }
+
+    /// The refusal of a start on this card (GitHub #457): a card the build's
+    /// kernels do not run on, named with its compute capability and the
+    /// capabilities they do run on. Nothing to refuse on a card they run on,
+    /// or with no card read (the mock build; NVML that cannot be read is
+    /// `--profile auto`'s to refuse).
+    pub fn refusal(&self) -> Option<String> {
+        self.reading().and_then(|card| super::arch::uncovered(&card.name, card.capability, &card.built_for))
     }
 }
 
@@ -73,7 +115,7 @@ pub fn auto(card: Card) -> Result<Option<&'static str>, ConfigError> {
             "`--profile auto` could not read the card's total memory ({why}): name a profile with `--profile` or IGNIS_PROFILE ({}, or `none`)",
             built_in_names()
         ))),
-        Card::Total(total) => CardClass::of_total(total).map(|class| Some(class.profile())).ok_or_else(|| {
+        Card::Read(CardReading { total, .. }) => CardClass::of_total(total).map(|class| Some(class.profile())).ok_or_else(|| {
             ConfigError(format!(
                 "`--profile auto`: a card of {:.1} GiB is no card class ({}): name a profile with `--profile` or IGNIS_PROFILE ({}, or `none`)",
                 total as f64 / (1u64 << 30) as f64,

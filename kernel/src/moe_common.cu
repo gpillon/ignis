@@ -150,9 +150,13 @@ extern "C" int32_t ignis_moe_prepare(void) {
   if (ignis_fp8_linear_prepare() != 0 || prepare_router() != 0 || prepare_prefill() != 0 || prepare_decode(&grid) != 0) {
     return -1;
   }
-  // A device the staged kernel does not fit (its shared memory) runs the register kernel on the
-  // tickets route at every width.
-  if (prepare_decode_staged(&staged_grid) != 0) staged_grid = 0;
+  // A device the staged kernel does not fit (its shared memory), or that has no image of it (it
+  // compiles for the sm_120a set alone, GitHub #456), runs the register kernel on the tickets
+  // route at every width.
+  if (prepare_decode_staged(&staged_grid) != 0) {
+    staged_grid = 0;
+    (void)cudaGetLastError();  // a kernel this device cannot run is an answer here, not an error to keep
+  }
   int cluster_size = 0;
   prepare_decode_clusters(&cluster_size);
   g_cluster_size[device].store(cluster_size);

@@ -36,7 +36,11 @@
  * sqrt(sum_k (x'_k inner_kj)^2) -- the size of the products the output sums, x' the rotated
  * activations. The first term is the BF16 output's rounding (at most 2^-8 |y| by itself), the
  * second the fp16 operands' and the accumulation's (the test prints the share of the bound the
- * worst output used). The residual add
+ * worst output used). On a card below compute capability 9.0 the second term is 2^-8 s: those
+ * tensor cores do not round the FP32 accumulation to nearest (Fasi, Higham, Mikaitis and
+ * Pranesh, "Numerical behavior of NVIDIA tensor cores", 2021), and on an sm_86 card the head's
+ * worst output reached 1.04 of the 2^-9 bound, against 0.92 on sm_120, at the same relative RMS
+ * error (GitHub #456). The residual add
  * rounds Y + r once; SwiGLU's bound composes the two through silu (the test states it), and the
  * prefill SwiGLU stores the gate in BF16 between its two passes.
  *

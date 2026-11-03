@@ -21,8 +21,9 @@ links it.
 ## 1. The kernel leaf
 
 `kernel/build.ps1` (Windows) and `kernel/build.sh` (Linux) configure and build
-the leaf with CMake + Ninja + `nvcc`, targeting `SM120a`
-(`CMAKE_CUDA_ARCHITECTURES=120a`) in a Release build, into `kernel/build/` —
+the leaf with CMake + Ninja + `nvcc`, targeting `SM120a` unless
+`IGNIS_CUDA_ARCHITECTURES` names more ([below](#other-card-architectures)), in a
+Release build, into `kernel/build/` —
 which `crates/*/build.rs` link. The PowerShell script imports the MSVC
 environment itself, so no developer prompt is needed. In a shell that already
 has one (`cl.exe` on `PATH`) it uses that environment as it is, so a toolchain
@@ -35,6 +36,52 @@ powershell -NoProfile -ExecutionPolicy Bypass -File kernel\build.ps1
 A second argument is an alternate build directory (`kernel\build.ps1 build-a`),
 so a parallel workstream can verify new `.cu` files without contending on the
 canonical `kernel/build/`.
+
+### Other card architectures
+
+`IGNIS_CUDA_ARCHITECTURES` names the architectures the leaf is compiled for,
+as a CMake list. Unset, it is `120a` alone: compute capability 12.0, the RTX 50
+and RTX PRO 6000 Blackwell cards, and what every release ships. It is read in
+one place, `kernel/CMakeLists.txt`; both build scripts, the `--features cuda`
+cargo build (which rebuilds the leaf when the variable changes) and the
+container build (`--build-arg CUDA_ARCHITECTURES=…`) pass it through.
+
+```powershell
+$env:IGNIS_CUDA_ARCHITECTURES = '86;120a'
+powershell -NoProfile -ExecutionPolicy Bypass -File kernel\build.ps1
+```
+
+`86;120a` adds Ampere (RTX 30). The sm_86 machine code also runs on Ada
+(RTX 40), and `89;120a` adds Ada alone. Each list keeps an arch-specific
+Blackwell entry such as `120a`: the NVFP4 W4A4 prefill GEMMs, the block-scaled
+FP8 kernels and Flash-Next's decode clusters and staged kernel compile for that
+entry alone, and so do three vendored kernels that declare more than 48 KiB of
+static shared memory per block (the W8 linear's small-T and split-K routes, the
+i8 decode attention), on no route the 27B's trellis artifact takes. A launch
+of one on another card fails with CUDA's "no kernel image is available".
+Every architecture added costs another device compile of nearly every
+translation unit.
+
+Such a build is for development: it compiles, and nothing has run on an RTX 30
+or 40 card yet ([#456](https://github.com/gpillon/ignis/issues/456)). A card
+none of the listed architectures runs on is refused at start
+([Troubleshooting](../troubleshooting.md#starting)).
+
+On a card below compute capability 9.0, programmatic dependent launch, an
+sm_90 feature, is off: a kernel that would start early waits for the one
+before it on the stream instead.
+
+On a card below compute capability 12.0 the server picks what the card runs:
+
+- the 27B's prompt attention left unset runs the FP16 band, and a named
+  `--model-prefill-attention fp8` is refused; `GET /v1/config` still shows
+  the field's value, `fp8`;
+- `--model-exception-weights fp8` is refused: the exception tensors stay
+  BF16, since in FP8 they prefill on the block-scaled FP8 tensor cores;
+- the 27B NVFP4 artifact, the image model and Flash-Next's staged decode
+  (`IGNIS_FN_MOE_STAGED=1`) are refused before the load, by name
+  ([Troubleshooting](../troubleshooting.md#starting)). The 27B loads from its
+  trellis artifact (`--model-id qwen3.8-27b-16g`).
 
 ## 2. The Rust workspace
 

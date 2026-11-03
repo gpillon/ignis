@@ -53,11 +53,20 @@ fn exit_after_flush(logging_handle: &ignis_logging::LoggingHandle, code: i32) ->
 /// device 0 on a CUDA build — a total it cannot read refuses the start — and
 /// no card on a build without CUDA, where `auto` resolves as `none`. Read
 /// here, never in the config module, which runs on machines with no NVML.
+/// With it, what the card is and what the leaf was built for, which a start
+/// checks before anything else (GitHub #457); none of it creates a context.
 #[cfg(feature = "cuda")]
 fn card_probe() -> config::profile::Card {
-    match ignis_artifact::CudaDevice::nvml_memory(0) {
-        Ok((_, total)) => config::profile::Card::Total(total),
-        Err(error) => config::profile::Card::Unreadable(error.to_string()),
+    use config::{arch, profile};
+    let read = || -> Result<profile::CardReading, String> {
+        let (_, total) = ignis_artifact::CudaDevice::nvml_memory(0).map_err(|error| error.to_string())?;
+        let (name, (major, minor)) = ignis_artifact::CudaDevice::identity(0).map_err(|error| error.to_string())?;
+        let built_for = arch::BuiltArchitectures::parse(&ignis_artifact::built_cuda_architectures())?;
+        Ok(profile::CardReading { total, name, capability: arch::ComputeCapability::new(major, minor), built_for })
+    };
+    match read() {
+        Ok(reading) => profile::Card::Read(reading),
+        Err(error) => profile::Card::Unreadable(error),
     }
 }
 

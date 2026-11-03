@@ -387,6 +387,26 @@ impl CudaDevice {
         Ok((free, total))
     }
 
+    /// The name (NVML's) and compute capability (the CUDA runtime's, as
+    /// `(major, minor)`) of device `device_id`, read without creating a CUDA
+    /// context (GitHub #457): what the start checks against
+    /// [`built_cuda_architectures`].
+    pub fn identity(device_id: i32) -> Result<(String, (u32, u32))> {
+        Self::require_driver()?;
+        let mut name = [0 as std::os::raw::c_char; 256];
+        let (mut major, mut minor) = (0i32, 0i32);
+        let rc = unsafe {
+            crate::ffi::ignis_device_identity(device_id, name.as_mut_ptr(), name.len() as u32, &mut major, &mut minor)
+        };
+        if rc != 0 || major <= 0 || minor < 0 {
+            return Err(fail(format!(
+                "ignis_device_identity({device_id}) failed; is NVML ({NVML_LIBRARY}, shipped with the driver) available?"
+            )));
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned();
+        Ok((name, (major as u32, minor as u32)))
+    }
+
     /// Asked first by everything here that reaches the GPU -- a load reaches
     /// [`CudaDevice::nvml_memory`] or [`CudaDevice::create`] before anything
     /// else -- so a machine without the driver is named as such (GitHub #329).
@@ -397,6 +417,16 @@ impl CudaDevice {
         let runtime_rc = unsafe { crate::ffi::ignis_device_runtime_version(&mut runtime) };
         driver_check(if runtime_rc == 0 { rc } else { runtime_rc }, version, runtime)
     }
+}
+
+/// The CUDA architectures the kernel leaf linked into this binary was
+/// compiled for, as its build named them (`120a`, `86;120a`): the set a card's
+/// compute capability is checked against at start (GitHub #457). Needs no
+/// driver and no device.
+#[cfg(feature = "cuda")]
+pub fn built_cuda_architectures() -> String {
+    let list = unsafe { crate::ffi::ignis_build_cuda_architectures() };
+    unsafe { std::ffi::CStr::from_ptr(list) }.to_string_lossy().into_owned()
 }
 
 #[cfg(feature = "cuda")]
