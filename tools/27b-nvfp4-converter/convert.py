@@ -7,6 +7,8 @@ weights id of its own.
       --dflash2 DIR --ranking FILE --calibration CALIBRATION.json --weights-id ID --work DIR [--device cuda]
   python convert.py verify --artifact A.ninfer --checkpoint DIR --dflash2 DIR --ranking FILE \\
       --calibration CALIBRATION.json --weights-id ID [--device cuda] [--report R.json]
+  python convert.py compare --served SERVED.ninfer --artifact A.ninfer --checkpoint DIR --report R.json \\
+      [--device cpu]
 
 - `calibrate` measures the 247 activation divisors on the checkpoint (`calibrate.py`, the GPU step).
 - `run` writes the work tree: every object of the inventory from its route (`recipe.py`), every one of the
@@ -16,6 +18,8 @@ weights id of its own.
 - `verify` reads a packed artifact back against its sources: its identity, its directory against the
   inventory, and every object's payload against the one its sources give (each local parent re-encoded
   byte-equal, each divisor the calibration's word). It prints VERIFY PASS or VERIFY FAILED (exit 3).
+- `compare` (GitHub #469, `compare.py`) sets an artifact built from the base checkpoint beside the served one
+  in three tiers, the first binding: TIER 1 PASS or TIER 1 FAILED (exit 3).
 
 Every refusal (exit 2) names what failed and comes before anything is written. At most one safetensors
 shard is open at a time (`shards.py`).
@@ -167,10 +171,11 @@ def read_calibration(path, sources):
 # The objects, from their sources
 # ---------------------------------------------------------------------------------------------------
 
-def produce(sources, table, divisors, ids, device):
-    """(object, payload, NVFP4 record or None) for every object of the inventory, in its order. The
-    checkpoint's reader is closed before the drafter's opens."""
-    objs = inventory.objects(sources.geometry)
+def produce(sources, table, divisors, ids, device, wanted=None):
+    """(object, payload, NVFP4 record or None) for every object of the inventory, or of the names `wanted`,
+    in its order. The checkpoint's reader is closed before the drafter's opens, which opens only when a
+    drafter object is wanted."""
+    objs = [o for o in inventory.objects(sources.geometry) if wanted is None or o.name in wanted]
     with shards.ShardReader(sources.checkpoint, sources.weight_map) as reader:
         for o in objs:
             if o.unit == "dflash2":
@@ -186,6 +191,8 @@ def produce(sources, table, divisors, ids, device):
             else:
                 payload, record = encode.encode(o, recipe.materialize(r, o, reader, ids), device)
                 yield o, payload, record
+    if not any(o.unit == "dflash2" for o in objs):
+        return
     with shards.ShardReader.single(os.path.join(sources.drafter, checkpoint.DRAFTER_FILE)) as reader:
         for o in objs:
             if o.unit != "dflash2":
@@ -422,6 +429,14 @@ def parser():
         else:
             s.add_argument("--artifact", required=True)
             s.add_argument("--report")
+
+    s = sub.add_parser("compare", help="#469: an artifact built from the base against the served one, in three tiers")
+    s.add_argument("--served", required=True, help="the served artifact, its .graft.json or .conversion.json beside it")
+    s.add_argument("--artifact", required=True, help="the artifact built from --checkpoint, its .conversion.json beside it")
+    s.add_argument("--checkpoint", required=True, help="the BF16 checkpoint it was built from: the parents' rows")
+    s.add_argument("--report", required=True, help="the JSON report to write; the summary goes beside it as .txt")
+    s.add_argument("--device", default="cpu")
+    s.add_argument("--geometry", default="qwen3.8-27b", choices=("qwen3.8-27b", "fixture"))
     return p
 
 
@@ -434,6 +449,9 @@ def main(argv=None, disk_free=None):
             run_calibrate(args, g, device)
         elif args.command == "run":
             run_convert(args, g, device, disk_free)
+        elif args.command == "compare":
+            import compare  # it builds on this module (`produce`, the recipe id, the directory's checks)
+            return compare.run(args, g, device)
         else:
             return run_verify(args, g, device)
     except Refused as e:

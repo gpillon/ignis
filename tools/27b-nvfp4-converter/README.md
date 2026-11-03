@@ -30,9 +30,10 @@ fine-tune. Everything else is the served recipe's:
 
 | File | What it is |
 |---|---|
-| `convert.py` | The command: `calibrate` (the GPU step), `run` (the work tree and `converter.json`) and `verify` (a packed artifact against its sources). |
+| `convert.py` | The command: `calibrate` (the GPU step), `run` (the work tree and `converter.json`), `verify` (a packed artifact against its sources) and `compare` (#469). |
+| `compare.py` | `compare`: an artifact built from the base checkpoint against the served one, in #469's three tiers; `rebuild`, the machine-local test's tier 1 from the sources. |
 | `inventory.py` | The container's objects from a geometry: the 27B's, or the tests' reduced one (the packer's `--geometry fixture`). |
-| `recipe.py` | Each object's route and its parts in the checkpoint or the drafter; the local-only recipe's counts. |
+| `recipe.py` | Each object's route and its parts in the checkpoint or the drafter; the local-only recipe's counts; the served artifact's recipe, which `compare` reads. |
 | `encode.py` | The encoders: NVFP4 (`blockscale-k16-m128x4-v1`), grouped (`row-split-k128-v1`), direct (`contiguous-le-v1`). |
 | `calibrate.py` | The corpus, the 247 sites and the streamed prefill that measures them. |
 | `checkpoint.py` | The sources' checks: the 27B's tensors and configuration, the drafter's, the download-record pins, the ranking and the draft head's rows. |
@@ -63,17 +64,26 @@ F:/ai/ngram-venv/Scripts/python.exe -m pytest tools/27b-nvfp4-converter -q
   records), the base's drafter at those widths and a ranking, on the CPU: the calibration equals the whole
   model's forward; the work tree holds the inventory under the weights id, every NVFP4 parent encoded from its
   BF16 rows beside its calibrated divisor; every refusal below, by name, with nothing written; at most one
-  safetensors handle open, in calibration, conversion and `verify`.
+  safetensors handle open, in calibration, conversion, `verify` and `compare`; the encoders give the same bytes
+  a block of rows at a time as at once.
 - The packed artifact (the packer's own checks of the tree, then the sidecar's fields the loader's checksum
-  verification reads) and `verify`, passing and failing by name, need the packer binary: `IGNIS_ARTIFACT_PACK`,
-  else this checkout's `target/**/ignis-artifact-pack.exe`. They skip, saying so, without one
-  (`cargo build -p ignis-artifact --bin ignis-artifact-pack`).
+  verification reads), `verify`, passing and failing by name, and `compare` need the packer binary:
+  `IGNIS_ARTIFACT_PACK`, else this checkout's `target/**/ignis-artifact-pack.exe`. They skip, saying so,
+  without one (`cargo build -p ignis-artifact --bin ignis-artifact-pack`). `compare` runs on the packed
+  artifact against a copy of it under the served recipe's `.graft.json`: tier 1 and tier 2 byte-equal and
+  tier 3 exactly the 112 MLP parents of layers 0-55; a tier-1 difference named and failing; a tier-2 parent
+  perturbed by hand (three codes, a scale, its weight and activation divisors doubled) measured right; its
+  refusals.
 - Machine-local, skipped where absent: the 27B inventory is the served artifact's directory, object for object;
   the base and Swift checkpoints on H: pass the cheap checks; the corpus is 2,690 tokens of the 27B's
-  tokenizer; ninfer's ranking is the pinned one; the encoders' bytes are ninfer's; and a spot check of #469's
-  comparison: 13 objects the recipe makes of the base on the CPU (the draft head's rows, a resource, the GDN
-  small set, a norm, a BF16 exception, one of the parents ninfer encoded itself, the Q4, Q5, Q6 and W8
-  encoders on the vision tower and the MTP layer) are the served artifact's byte for byte.
+  tokenizer; ninfer's ranking is the pinned one; the encoders' bytes are ninfer's; the served recipe's
+  third-party parents are ninfer's `SOURCE_NVFP4_WEIGHT_SPECS`; and **#469's real-artifact test**: the 765
+  tier-1 objects the recipe makes of the base checkpoint on the CPU (`H:/models/Qwen3.8-27B`, every object but
+  the drafter's) are the served artifact's byte for byte, and so are the 66 DFlash2 objects of the drafter
+  (`H:/models/Qwen3.8-27B-DFlash2`), a test that also skips until the drafter's file is there and hashes to its
+  LFS oid; one of the 135 parents ninfer encoded itself re-encodes byte-equal. The 765 take 25-30 s and peak
+  at 6.6 GiB working set and 10.7 GiB commit for the whole process (the open shard's mapping counts its file
+  size, up to 4 GB); `pytest -s` prints both.
 
 No test touches the GPU: `conftest.py` hides CUDA from the process and fails the session if CUDA was
 initialized.
@@ -138,6 +148,12 @@ F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-nvfp4-converter/convert.py veri
     --checkpoint H:/models/Qwen3.8-27B --dflash2 H:/models/Qwen3.8-27B-DFlash2 \
     --ranking F:/ai/q38/ninfer/tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64 \
     --calibration H:/nvfp4-469/calibration.json --weights-id nvfp4full-local-469 --report H:/nvfp4-469/verify.json
+
+# 5. #469 only, CPU: the scratch artifact against the served one, in three tiers (`compare` below)
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-nvfp4-converter/convert.py compare \
+    --served F:/ai/opencode/inference/models/qwen3_8_27b_nvfp4full-v2.ninfer \
+    --artifact H:/nvfp4-469/qwen3_8_27b_nvfp4full-v2-local-469.ninfer \
+    --checkpoint H:/models/Qwen3.8-27B --report H:/nvfp4-469/compare.json
 ```
 
 - **Disk.** The packer deletes each unit's work files once the unit is in the container (`--keep-work` keeps
@@ -148,8 +164,9 @@ F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-nvfp4-converter/convert.py veri
   against their records (`pins: ...`: 55.6 GB of shards, each command). The calibration record keeps its own.
   The estimates, not measured: calibration minutes (one prefill of 2,690 tokens with one layer on the card,
   bound by reading the shards); conversion and `verify` tens of minutes each (bound by reading the shards and
-  writing or reading the tree). The W8 output head's grouped quantization on the card is the VRAM peak
-  (the 248,320 x 5,120 matrix in FP32 and its temporaries, ~15-20 GB): the card must be free.
+  writing or reading the tree). Every matrix is encoded 8,192 rows at a time (`encode.ROWS`), so the W8 output
+  head (248,320 x 5,120) never stands on the card in FP32 at once; the VRAM peak is a block's temporaries, a GB
+  or two (estimated, not measured): the card must be free all the same.
 - **An interrupted run** leaves a partial tree without `converter.json`, which the packer does not take; delete
   it and run again (`run` refuses a non-empty `--work`).
 
@@ -211,3 +228,43 @@ payload against the one its sources give: each of the 247 local parents re-encod
 divisor the calibration's word, the drafter's parents re-encoded, every other object its source's bytes. It
 prints the failures by object name and VERIFY PASS or VERIFY FAILED (exit 3); `--report` writes them with the
 counts checked. Its sources are checked as `run`'s are (exit 2).
+
+## `compare` (#469)
+
+The proof of the tool before it builds a fine-tune: after the run above on the base checkpoint (the drafter,
+calibration, conversion, packing, `verify` PASS), `compare` sets the scratch artifact beside the served
+`qwen3_8_27b_nvfp4full-v2.ninfer`, object by object. It runs on the CPU (`--device cuda` when the card is free),
+reads both artifacts and the base checkpoint's BF16 rows, and writes nothing but its report.
+
+- **Which object is which.** Each artifact's sidecar names its recipe: the served `.graft.json`
+  `qwen3_8_27b_nvfp4full-v2`, the scratch `.conversion.json` `qwen3_8_27b_nvfp4full-v2-local`. The routes are
+  `recipe.py`'s: `recipes` for the local one, `served_recipes` for the served one, which is the same but for
+  the MLP parents of layers 0-55 and their divisors, copied from the third-party quant. The served sidecar
+  records only the drafter's 34 parents, so that split is ninfer's `SOURCE_NVFP4_MLP_LAYERS`, stated in
+  `recipe.py` and checked against ninfer's inventory by a machine-local test.
+- **Tier 1, binding** (831 objects): every object neither calibrated nor taken from the quant (the 6 frontend
+  resources, the 401 norms and GDN small set, the 9 BF16 exceptions, the 349 objects of the embedding, the heads,
+  the MTP layer and the vision tower, the 66 DFlash2 objects) must be byte-equal. A difference names the object,
+  its route and its differing bytes, and the comparison ends TIER 1 FAILED (exit 3): the work stops and the owner
+  hears of it.
+- **Tier 2** (the 135 parents both recipes encode locally, and their divisors): byte-equal, or per parent the
+  differing words (E2M1 codes of `N·K`, E4M3 scales of `N·K/16`, the FP32 weight divisor, and any padding byte),
+  the weight divisor on both sides with its relative difference `(scratch - served) / served`, and the relative
+  reconstruction error `|W - W_hat| / |W|` against the BF16 rows on both sides; per divisor, both values and
+  their relative difference. A difference is a finding for the owner, not noise.
+- **Tier 3** (the 112 parents the served artifact took from the quant, and their divisors): each parent's
+  reconstruction error against the BF16 on both sides, the weight divisors and the activation divisors with
+  their relative differences, and the means and maxima of both sides' errors.
+- **Out.** `--report` (JSON: both artifacts' identities, sizes and recipes, the checkpoint's revision, the
+  three tiers with every entry, the verdict, seconds and peaks) and beside it the same name with `.txt`: the
+  summary it prints, which ends TIER 1 PASS or TIER 1 FAILED.
+- **Refused** (exit 2, nothing written): an artifact with no sidecar, or whose sidecar names a recipe `compare`
+  does not know, records another size or object count, or records as encoded locally a parent its recipe takes
+  from the quant; a directory that is not the inventory's; recipes that put an object in no tier; a checkpoint
+  that is not the one the scratch artifact's record names (its revision and every shard's LFS oid, read from the
+  download records: `run` and `verify` hashed the shards, `compare` does not).
+- **Cost** (estimated from one parent, not measured whole): it reads every payload of both artifacts once
+  (19.4 GB each: tier 1 6.0 GB, tier 2 5.0 GB, tier 3 8.4 GB) and the 112 tier-3 parents' BF16 rows (about
+  30 GB), and decodes both sides of each tier-3 parent, about 2 s per `gate_up` side and 1 s per `down` side
+  on this box's CPU: some ten minutes in all. At most one shard is open at a time, and the log names every
+  measured parent as it goes.

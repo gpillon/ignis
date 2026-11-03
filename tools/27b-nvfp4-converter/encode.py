@@ -13,6 +13,9 @@ Ports of ninfer's, which made the served artifact and are its byte-level referen
 
 The arithmetic is torch's on the device given; the scale words of a grouped format are computed on the
 host, as ninfer does, because a device's division is not correctly rounded at every binary16 boundary.
+A matrix is encoded `ROWS` rows at a time: every word but the NVFP4 weight divisor (the whole matrix's,
+taken first) depends on its own row only, so the bytes are the whole matrix's, and the 27B's W8 heads
+(248,320 x 5,120) never stand in FP32 at once.
 """
 import struct
 
@@ -28,6 +31,8 @@ _E2M1_TIE_UP = (False, True, False, True, False, True, False)
 _E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _FP16_MIN_SUBNORMAL = 2.0 ** -24
 QRANGE = {inventory.W8: (-127, 127), inventory.Q4: (-8, 7), inventory.Q5: (-16, 15), inventory.Q6: (-32, 31)}
+# Rows encoded at once: a multiple of 128, the NVFP4 scale plane's tile.
+ROWS = 8192
 
 
 def binary32(value):
@@ -51,18 +56,32 @@ def e2m1_codes(values):
     return code.to(torch.uint8) | sign
 
 
-def nvfp4_words(weight, device):
-    """(packed codes uint8 [N, K/2], natural scales uint8 [N, K/16], weight divisor) of a `[N, K]` parent."""
+def nvfp4_words(weight, device, rows=ROWS):
+    """(packed codes uint8 [N, K/2], natural scales uint8 [N, K/16], weight divisor) of a `[N, K]` parent,
+    `rows` rows at a time once the divisor is known."""
     if weight.dim() != 2 or weight.shape[1] % 16:
         raise ValueError("an NVFP4 parent is rank 2 with K divisible by 16")
-    source = weight.detach().to(device=device, dtype=torch.float32)
-    if not torch.isfinite(source).all():
-        raise ValueError("an NVFP4 parent holds NaN or infinity")
-    rows, columns = source.shape
-    amax = source.abs().amax().item()
+    n, columns = weight.shape
+    amax = 0.0
+    for a in range(0, n, rows):
+        source = weight[a: a + rows].detach().to(device=device, dtype=torch.float32)
+        if not torch.isfinite(source).all():
+            raise ValueError("an NVFP4 parent holds NaN or infinity")
+        amax = max(amax, source.abs().amax().item())
     divisor = binary32(divisor_of(amax))
     if not divisor > 0.0:
         raise ValueError("the NVFP4 weight divisor is not finite and positive")
+    packed = torch.empty((n, columns // 2), dtype=torch.uint8)
+    scales = torch.empty((n, columns // 16), dtype=torch.uint8)
+    for a in range(0, n, rows):
+        packed[a: a + rows], scales[a: a + rows] = _nvfp4_rows(weight[a: a + rows], divisor, device)
+    return packed, scales, divisor
+
+
+def _nvfp4_rows(weight, divisor, device):
+    """(packed codes, natural scales) of a block of a parent's rows, at the parent's divisor."""
+    source = weight.detach().to(device=device, dtype=torch.float32)
+    rows, columns = source.shape
     blocks = (source * torch.tensor(divisor, dtype=torch.float32, device=device)).reshape(rows, columns // 16, 16)
     scales = (blocks.abs().amax(dim=2) / 6.0).clamp(max=448.0).to(torch.float8_e4m3fn).view(torch.uint8)
     scale_values = scales.view(torch.float8_e4m3fn).to(torch.float32)
@@ -73,7 +92,7 @@ def nvfp4_words(weight, device):
     codes = e2m1_codes(ratio).reshape(rows, columns)
     pairs = codes.reshape(rows, -1, 2)
     packed = (pairs[:, :, 0] | (pairs[:, :, 1] << 4)).to(torch.uint8)
-    return packed.cpu(), scales.reshape(rows, columns // 16).contiguous().cpu(), divisor
+    return packed.cpu(), scales.reshape(rows, columns // 16).contiguous().cpu()
 
 
 def nvfp4_dequantize(packed, scales, divisor):
@@ -100,20 +119,36 @@ def nvfp4_layout(packed, scales, divisor, shape):
     return bytes(payload)
 
 
-def nvfp4(weight, device):
+def nvfp4_unlayout(payload, shape):
+    """The words of a `blockscale-k16-m128x4-v1` payload, `nvfp4_layout`'s inverse: (packed codes uint8
+    [N, K/2], natural scales uint8 [N, K/16], weight divisor)."""
+    n, k = shape
+    scale_offset, divisor_offset, size = inventory.block_scale_geometry(shape)
+    if len(payload) != size:
+        raise ValueError(f"an NVFP4 {list(shape)} payload is {size} bytes, not {len(payload)}")
+    packed = torch.frombuffer(bytearray(payload[: n * k // 2]), dtype=torch.uint8).reshape(n, k // 2)
+    stored = torch.frombuffer(bytearray(payload[scale_offset: divisor_offset]), dtype=torch.uint8)
+    scales = stored.reshape(n // 128, k // 64, 32, 4, 4).permute(0, 3, 2, 1, 4).contiguous().reshape(n, k // 16)
+    return packed, scales, struct.unpack("<f", payload[divisor_offset:])[0]
+
+
+def nvfp4(weight, device, rows=ROWS):
     """(payload, weight divisor, relative Frobenius error) of one NVFP4 parent."""
-    packed, scales, divisor = nvfp4_words(weight, device)
+    packed, scales, divisor = nvfp4_words(weight, device, rows)
     payload = nvfp4_layout(packed, scales, divisor, tuple(weight.shape))
-    reconstructed = nvfp4_dequantize(packed.to(device), scales.to(device), divisor)
-    return payload, divisor, relative_error(weight.to(device), reconstructed)
+    return payload, divisor, nvfp4_error(weight, packed, scales, divisor, device, rows)
 
 
-def relative_error(original, reconstructed):
-    """`|W - W_hat| / |W|` (Frobenius), in binary64 on the tensors' device."""
-    a = original.detach().double()
-    d = (a - reconstructed.detach().double()).norm().item()
-    n = a.norm().item()
-    return 0.0 if n == 0.0 and d == 0.0 else float("inf") if n == 0.0 else d / n
+def nvfp4_error(weight, packed, scales, divisor, device, rows=ROWS):
+    """`|W - W_hat| / |W|` (Frobenius, in binary64 on the device) of a parent's values and the values its NVFP4
+    words represent, the sums of squares accumulated `rows` rows at a time."""
+    difference = norm = 0.0
+    for a in range(0, weight.shape[0], rows):
+        original = weight[a: a + rows].detach().to(device).double()
+        reconstructed = nvfp4_dequantize(packed[a: a + rows].to(device), scales[a: a + rows].to(device), divisor)
+        difference += ((original - reconstructed.double()) ** 2).sum().item()
+        norm += (original ** 2).sum().item()
+    return 0.0 if norm == 0.0 and difference == 0.0 else float("inf") if norm == 0.0 else (difference / norm) ** 0.5
 
 
 def _scale_words(max_abs, qmax):
@@ -135,12 +170,28 @@ def _scale_words(max_abs, qmax):
     return torch.from_numpy(scale), torch.from_numpy(reciprocal)
 
 
-def grouped(weight, fmt, device):
-    """The `row-split-k128-v1` payload of a W8/Q4/Q5/Q6 matrix."""
+def grouped(weight, fmt, device, rows=ROWS):
+    """The `row-split-k128-v1` payload of a W8/Q4/Q5/Q6 matrix, `rows` rows at a time: each row's words are
+    its own, at `row * row bytes` in each plane."""
+    n, k = weight.shape
+    _, _, base_row, high_row, scale_row, high_offset, scale_offset, size = inventory.row_split_geometry(fmt, (n, k))
+    payload = bytearray(size)
+    for a in range(0, n, rows):
+        b = min(n, a + rows)
+        base, high, scales = _grouped_rows(weight[a:b], fmt, device)
+        payload[a * base_row: b * base_row] = base
+        if high is not None:
+            payload[high_offset + a * high_row: high_offset + b * high_row] = high
+        payload[scale_offset + a * scale_row: scale_offset + b * scale_row] = scales
+    return bytes(payload)
+
+
+def _grouped_rows(weight, fmt, device):
+    """(low plane, high plane or None, scale plane) bytes of a block of a grouped matrix's rows."""
     group, bits = inventory.GROUP[fmt]
     qmin, qmax = QRANGE[fmt]
     n, k = weight.shape
-    k_pad, groups, base_row, high_row, _, high_offset, scale_offset, size = inventory.row_split_geometry(fmt, (n, k))
+    k_pad, groups = inventory.row_split_geometry(fmt, (n, k))[:2]
     logical = weight.detach().to(device=device, dtype=torch.float32)
     if k_pad != k:
         padded = torch.zeros((n, k_pad), dtype=torch.float32, device=device)
@@ -162,12 +213,8 @@ def grouped(weight, fmt, device):
             upper = ((flat.to(torch.int32) & ((1 << bits) - 1)) >> 4) & ((1 << hb) - 1)
             bit_planes = ((upper.unsqueeze(-1) >> torch.arange(hb, dtype=torch.int32)) & 1).reshape(flat.shape[0], -1, 8)
             high = (bit_planes * (1 << torch.arange(8, dtype=torch.int32))).sum(-1).to(torch.uint8)
-    payload = bytearray(size)
-    payload[: n * base_row] = base.numpy().tobytes()
-    if high is not None:
-        payload[high_offset: high_offset + n * high_row] = high.numpy().tobytes()
-    payload[scale_offset:] = scales.contiguous().view(torch.uint8).numpy().tobytes()
-    return bytes(payload)
+    return (base.numpy().tobytes(), None if high is None else high.numpy().tobytes(),
+            scales.contiguous().view(torch.uint8).numpy().tobytes())
 
 
 DTYPE = {inventory.BF16: torch.bfloat16, inventory.FP32: torch.float32, inventory.I32: torch.int32}

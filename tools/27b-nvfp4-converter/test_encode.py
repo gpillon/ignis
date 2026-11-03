@@ -81,3 +81,31 @@ def test_the_bytes_are_ninfers_on_the_same_values():
             w = (torch.randn(shape, generator=rng) * 0.05).to(torch.bfloat16)
             w[1, : shape[1] // 2] = 0.0
             assert encode.grouped(w, fmt, "cpu") == quantize_and_encode(w, fmt, device="cpu"), (fmt, shape)
+
+
+def test_a_matrix_encoded_a_block_of_rows_at_a_time_is_the_whole_matrixs_bytes():
+    """The encoders are row-independent but for the NVFP4 weight divisor, which is the whole matrix's: blocks of
+    128 rows give the bytes of one block of all 640, the largest magnitude sitting in the last block."""
+    rng = torch.Generator().manual_seed(469)
+    w = (torch.randn(640, 192, generator=rng) * 0.03).to(torch.bfloat16)
+    w[600, 5] = 1.0
+    for fmt in (inventory.W8, inventory.Q4, inventory.Q5, inventory.Q6):
+        assert encode.grouped(w, fmt, "cpu", rows=128) == encode.grouped(w, fmt, "cpu", rows=640), fmt
+    whole, divisor, error = encode.nvfp4(w, "cpu", rows=640)
+    blocks, block_divisor, block_error = encode.nvfp4(w, "cpu", rows=128)
+    assert blocks == whole and block_divisor == divisor == 2688.0
+    assert block_error == pytest.approx(error, rel=1e-12)
+
+
+def test_an_nvfp4_payload_reads_back_as_its_words():
+    """The inverse of the layout: the payload of the worked example above gives back its codes, its scales in
+    their natural order (row 5, group 0 is E4M3FN 448) and its divisor, which lay out to the same payload."""
+    w = torch.ones(128, 64, dtype=torch.bfloat16)
+    w[5, 7] = 3.0
+    payload, _, _ = encode.nvfp4(w, "cpu")
+    packed, scales, divisor = encode.nvfp4_unlayout(payload, (128, 64))
+    assert divisor == 896.0
+    assert scales.shape == (128, 4) and scales[5, 0].item() == 0x7E
+    assert sorted(set(scales.flatten().tolist()) - {0x7E}) == [0x71]
+    assert packed.shape == (128, 32) and packed[5, 3].item() == (7 << 4) | 4
+    assert encode.nvfp4_layout(packed, scales, divisor, (128, 64)) == payload

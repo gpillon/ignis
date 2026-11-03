@@ -16,6 +16,10 @@ The routes, each object in exactly one:
   and the vision tower;
 - `dflash2` (66): the base's drafter, its NVFP4 matrices weight-only;
 - `resource` (6): the frontend files, the checkpoint's bytes.
+
+`served_recipes` is the served artifact's recipe (ninfer's `qwen3_8_27b_nvfp4full-v2`), which #469 compares
+against: the same but for the MLP parents of layers 0-55, routed `source_nvfp4` (112), and their divisors,
+`source_input_divisor` (112), both copied from the third-party quant.
 """
 from dataclasses import dataclass
 
@@ -26,6 +30,10 @@ import inventory
 TEXT = "model.language_model."
 EXPECTED_ROUTES = {"resource": 6, "local_nvfp4": 247, "input_divisor": 247, "bf16_exception": 9,
                    "base_direct": 401, "official": 349, "dflash2": 66}
+SERVED_RECIPE_ID = "qwen3_8_27b_nvfp4full-v2"
+# The layers whose MLP parents the served recipe took from the third-party quant (ninfer
+# `inventory_nvfp4full.SOURCE_NVFP4_MLP_LAYERS`); its record names none of them (#469).
+SERVED_SOURCE_MLP_LAYERS = tuple(range(56))
 
 
 @dataclass(frozen=True)
@@ -150,6 +158,18 @@ def recipes(g):
     drafter("dflash2/selector/hidden", "candidate_selector.hidden_projection.weight")
     drafter("dflash2/selector/predecessor", "candidate_selector.predecessor_codebook")
     drafter("dflash2/selector/successor", "candidate_selector.successor_codebook")
+    return out
+
+
+def served_recipes(g):
+    """object name -> Recipe of the served artifact's recipe: `recipes` with the MLP parents of
+    `SERVED_SOURCE_MLP_LAYERS` and their divisors copied from the third-party quant (no parts: the BF16 rows
+    they stand for are the local recipe's)."""
+    out = recipes(g)
+    for i in SERVED_SOURCE_MLP_LAYERS:
+        for parent in (f"text/layers/{i}/mlp/gate_up", f"text/layers/{i}/mlp/down"):
+            out[parent] = Recipe("source_nvfp4")
+            out[inventory.divisor_name(parent)] = Recipe("source_input_divisor", ((parent, None),))
     return out
 
 

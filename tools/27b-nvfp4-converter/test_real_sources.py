@@ -1,18 +1,19 @@
 """Machine-local: the 27B geometry's expectations against the real sources, when they are on this machine
-(each test skips otherwise): headers, configurations, records and the tokenizer, and a few objects of the base
-checkpoint against the served artifact's, encoded on the CPU. No shard is hashed, nothing runs on the GPU."""
+(each test skips otherwise): headers, configurations, records and the tokenizer, and #469's tier 1, every
+object of the served artifact neither calibrated nor taken from the third-party quant, made of the base
+checkpoint and its drafter on the CPU. No shard is hashed (the drafter's file is), nothing runs on the GPU."""
 import os
+import time
 
 import pytest
-import torch
 
 import calibrate
 import checkpoint
+import compare
 import container
-import encode
+import convert
 import inventory
 import recipe
-import shards
 
 G = inventory.Geometry.qwen3_8_27b()
 CHECKPOINTS = {"Qwen/Qwen3.8-27B": ("H:/models/Qwen3.8-27B", "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"),
@@ -47,35 +48,68 @@ def test_ninfers_ranking_is_the_pinned_one():
 
 
 SERVED = "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer"
-# Objects the served artifact made from the base checkpoint, each route and encoder once, small enough for the
-# CPU: the draft head's rows (the shortlist), a resource, the GDN small set (the convolution's orientation, the
-# FP32 cast, the a/b order), a norm, a BF16 exception (the interleaved q_proj split at 24 heads), one of the 135
-# parents ninfer already encoded locally (NVFP4), and the grouped encoders on the vision tower and the MTP layer.
-SPOT_CHECK = ("text/draft_head_token_ids", "frontend/chat_template.jinja", "text/layers/0/gdn/convolution",
-              "text/layers/0/gdn/a_log", "text/layers/0/gdn/a_b_projection", "text/layers/0/input_norm",
-              "text/layers/3/attention/query_key_gate_value", "text/layers/0/gdn/query_key_value_z",
-              "vision/patch_embedding", "vision/layers/0/attention/qkv", "vision/layers/0/attention/output",
-              "vision/merger/fc1", "mtp/layer/attention/output")
+DRAFTER = "H:/models/Qwen3.8-27B-DFlash2"
 
 
-def test_the_served_artifacts_objects_are_what_the_recipe_makes_of_the_base():
-    """A preview of #469's byte-for-byte comparison, on the CPU: each object of SPOT_CHECK is the served one."""
+def base_sources(drafter=None):
+    """The base checkpoint's sources through the cheap checks (no shard hashed), or a skip naming what is
+    absent."""
     root, revision = CHECKPOINTS["Qwen/Qwen3.8-27B"]
     for path in (SERVED, RANKING, os.path.join(root, "model.safetensors.index.json")):
         if not os.path.isfile(path):
             pytest.skip(f"{path} is not on this machine")
-    served = container.Container(SERVED)
-    table = recipe.recipes(G)
-    objs = {o.name: o for o in inventory.objects(G)}
-    ids, _ = checkpoint.draft_ids(RANKING, root, G)
-    with shards.ShardReader.checkpoint(root) as reader:
-        for name in SPOT_CHECK:
-            o, r = objs[name], table[name]
-            if r.route == "resource":
-                with open(os.path.join(root, r.parts[0][0]), "rb") as f:
-                    payload = f.read()
-            elif r.transform == "ids":
-                payload = encode.direct(torch.from_numpy(ids).to(torch.int32), o.format)
-            else:
-                payload, _ = encode.encode(o, recipe.materialize(r, o, reader, ids), "cpu")
-            assert payload == served.read(name), name
+    return checkpoint.check_sources(G, root, revision, drafter, RANKING)
+
+
+def costed(rebuild, *args):
+    """`rebuild(*args)`, with its wall time and this process's peaks so far printed (`pytest -s`)."""
+    t0 = time.time()
+    done = rebuild(*args)
+    measured = convert.peaks(convert.torch.device("cpu"))
+    gib = lambda n: "-" if n is None else f"{n / 2 ** 30:.2f} GiB"  # noqa: E731
+    print(f"\n{done['objects']} objects, {done['bytes']} bytes in {time.time() - t0:.0f} s; process peak "
+          f"{gib(measured['host_peak_working_set_bytes'])} working set, {gib(measured['host_peak_commit_bytes'])} "
+          f"commit")
+    return done
+
+
+def test_tier_1_of_the_base_checkpoint_is_the_served_artifacts_byte_for_byte():
+    """#469's binding tier on the CPU: the 765 tier-1 objects the recipe makes of the base checkpoint (the
+    frontend resources, the norms and the GDN small set, the BF16 exceptions, the W8 embedding and output head,
+    the Q4 draft head and its ids, the MTP layer and the vision tower) are the served artifact's byte for byte."""
+    sources = base_sources()
+    ids, _ = checkpoint.draft_ids(RANKING, sources.checkpoint, G)
+    wanted = {n for n in compare.tier_names(G, 1) if not n.startswith("dflash2/")}
+    done = costed(compare.rebuild, container.Container(SERVED), sources, recipe.recipes(G), ids, wanted, "cpu")
+    assert done["differ"] == []
+    assert done["objects"] == 765
+
+
+def test_a_parent_the_served_artifact_encoded_itself_re_encodes_byte_equal():
+    """A tier-2 preview: one of the 135 parents ninfer encoded locally, from the base on the CPU."""
+    name = "text/layers/0/gdn/query_key_value_z"
+    done = compare.rebuild(container.Container(SERVED), base_sources(), recipe.recipes(G), None, {name}, "cpu")
+    assert (done["objects"], done["differ"]) == (1, [])
+
+
+def drafter_or_skip():
+    """The drafter's directory when its file is on this machine and hashes to its LFS oid; a skip otherwise."""
+    path = os.path.join(DRAFTER, checkpoint.DRAFTER_FILE)
+    if not os.path.isfile(path):
+        pytest.skip(f"the DFlash2 drafter is not on this machine ({path})")
+    try:
+        etags = checkpoint.check_drafter(DRAFTER, G)
+        checkpoint.hash_pins(DRAFTER, {checkpoint.DRAFTER_FILE: etags[checkpoint.DRAFTER_FILE]}, "the drafter")
+    except checkpoint.Refused as e:
+        pytest.skip(f"the DFlash2 drafter on this machine is not the pinned one: {e}")
+    return DRAFTER
+
+
+def test_the_dflash2_objects_of_the_bases_drafter_are_the_served_artifacts_byte_for_byte():
+    """The rest of tier 1: the 66 DFlash2 objects the recipe makes of the base's drafter (dedf8df6), its 34
+    NVFP4 matrices weight-only, are the served artifact's byte for byte."""
+    sources = base_sources(drafter_or_skip())
+    wanted = {n for n in compare.tier_names(G, 1) if n.startswith("dflash2/")}
+    done = costed(compare.rebuild, container.Container(SERVED), sources, recipe.recipes(G), None, wanted, "cpu")
+    assert done["differ"] == []
+    assert done["objects"] == 66

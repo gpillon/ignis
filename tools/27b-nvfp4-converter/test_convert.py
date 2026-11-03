@@ -3,11 +3,9 @@ import json
 import os
 import shutil
 import struct
-import subprocess
 
 import pytest
 import torch
-from safetensors.torch import load_file
 
 import calibrate
 import checkpoint
@@ -15,40 +13,9 @@ import container
 import convert
 import inventory
 import recipe
-import shards
-from conftest import (G, LICENSE, REPO, REVISION, WEIGHTS_ID, drafter_config_json, make_checkpoint, make_drafter,
-                      make_sources)
-
-
-def calibrate_args(src, out):
-    return ["calibrate", "--checkpoint", src["checkpoint"], "--out", out, "--device", "cpu", "--geometry", "fixture"]
-
-
-def run_args(src, calibration, work_dir, weights_id=WEIGHTS_ID):
-    return ["run", "--checkpoint", src["checkpoint"], "--source-repo", REPO, "--source-revision", REVISION,
-            "--license", LICENSE, "--dflash2", src["drafter"], "--ranking", src["ranking"],
-            "--calibration", calibration, "--weights-id", weights_id, "--work", work_dir,
-            "--device", "cpu", "--geometry", "fixture"]
-
-
-@pytest.fixture(scope="session")
-def built(tmp_path_factory):
-    """The sources, their calibration and a work tree converted from them."""
-    root = str(tmp_path_factory.mktemp("built"))
-    src = make_sources(root)
-    src["calibration"] = os.path.join(root, "calibration.json")
-    assert convert.main(calibrate_args(src, src["calibration"])) == 0
-    src["work"] = os.path.join(root, "work")
-    assert convert.main(run_args(src, src["calibration"], src["work"])) == 0
-    return src
-
-
-def checkpoint_tensors(root):
-    out = {}
-    for name in sorted(os.listdir(root)):
-        if name.endswith(".safetensors"):
-            out.update(load_file(os.path.join(root, name)))
-    return out
+from conftest import (ALL_FILES, ARTIFACT, G, LICENSE, REPO, REVISION, WEIGHTS_ID, bf16_parent, calibrate_args,
+                      checkpoint_tensors, corrupt, decode_nvfp4, drafter_config_json, make_checkpoint, make_drafter,
+                      run_args)
 
 
 def test_the_calibration_is_the_whole_models_forward_measured_one_layer_at_a_time(built):
@@ -81,38 +48,6 @@ def test_the_calibration_is_the_whole_models_forward_measured_one_layer_at_a_tim
     for name, entry in sites.items():
         assert entry["amax"] == seen[name], name
         assert entry["input_scale_divisor"] == struct.unpack("<f", struct.pack("<f", 2688.0 / seen[name]))[0], name
-
-
-E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
-
-
-def decode_nvfp4(payload, n, k):
-    """The values of a `blockscale-k16-m128x4-v1` payload (contract §3), and its weight divisor."""
-    codes = torch.frombuffer(bytearray(payload[: n * k // 2]), dtype=torch.uint8).reshape(n, k // 2).to(torch.int64)
-    nibbles = torch.stack((codes & 0xF, codes >> 4), dim=2).reshape(n, k)
-    offset = -(-(n * k // 2) // 256) * 256
-    stored = torch.frombuffer(bytearray(payload[offset: offset + n * k // 16]), dtype=torch.uint8)
-    scales = stored.reshape(n // 128, k // 64, 32, 4, 4).permute(0, 3, 2, 1, 4).reshape(n, k // 16)
-    (divisor,) = struct.unpack("<f", payload[-4:])
-    values = torch.tensor(E2M1)[nibbles].reshape(n, k // 16, 16)
-    return (values * scales.view(torch.float8_e4m3fn).float().unsqueeze(-1) / divisor).reshape(n, k), divisor
-
-
-def bf16_parent(tensors, name):
-    """A text NVFP4 parent's BF16 rows, fused as the contract's §4.2 states."""
-    _, _, layer, block, suffix = name.split("/")
-    p = f"model.language_model.layers.{layer}."
-    if block == "mlp":
-        return torch.cat([tensors[p + "mlp.gate_proj.weight"], tensors[p + "mlp.up_proj.weight"]]) \
-            if suffix == "gate_up" else tensors[p + "mlp.down_proj.weight"]
-    if block == "gdn":
-        return torch.cat([tensors[p + "linear_attn.in_proj_qkv.weight"], tensors[p + "linear_attn.in_proj_z.weight"]]) \
-            if suffix == "query_key_value_z" else tensors[p + "linear_attn.out_proj.weight"]
-    if suffix == "output":
-        return tensors[p + "self_attn.o_proj.weight"]
-    q = tensors[p + "self_attn.q_proj.weight"].reshape(G.attention_heads, 2, G.head_dim, G.hidden)
-    return torch.cat([q[:, 0].reshape(-1, G.hidden), tensors[p + "self_attn.k_proj.weight"],
-                      q[:, 1].reshape(-1, G.hidden), tensors[p + "self_attn.v_proj.weight"]])
 
 
 def read_tree(work_dir):
@@ -178,40 +113,6 @@ def test_every_nvfp4_parent_is_encoded_here_beside_its_calibrated_divisor(built)
         assert tree[site][1] == struct.pack("<f", sites[site]["input_scale_divisor"]), site
 
 
-ARTIFACT = "qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer"
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
-def packer():
-    """The packer binary: IGNIS_ARTIFACT_PACK, else this checkout's build of it."""
-    if os.environ.get("IGNIS_ARTIFACT_PACK"):
-        return os.environ["IGNIS_ARTIFACT_PACK"]
-    for build in ("debug", "release"):
-        for target in (os.path.join("x86_64-pc-windows-msvc", build), build):
-            for exe in ("ignis-artifact-pack.exe", "ignis-artifact-pack"):
-                path = os.path.join(REPO_ROOT, "target", target, exe)
-                if os.path.isfile(path):
-                    return path
-    return None
-
-
-@pytest.fixture(scope="session")
-def packed(built, tmp_path_factory):
-    """The work tree packed by the `qwen3.8-27b-nvfp4` family at the fixture geometry."""
-    exe = packer()
-    if exe is None:
-        pytest.skip("no ignis-artifact-pack: set IGNIS_ARTIFACT_PACK or build it "
-                    "(cargo build -p ignis-artifact --bin ignis-artifact-pack)")
-    root = str(tmp_path_factory.mktemp("packed"))
-    work_dir = os.path.join(root, "work")
-    shutil.copytree(built["work"], work_dir)
-    out = os.path.join(root, ARTIFACT)
-    done = subprocess.run([exe, "--family", "qwen3.8-27b-nvfp4", "--work", work_dir, "--out", out,
-                           "--weights-id", WEIGHTS_ID, "--geometry", "fixture"], capture_output=True, text=True)
-    assert done.returncode == 0, done.stdout + done.stderr
-    return out
-
-
 def test_the_packed_container_carries_a_sidecar_the_loader_reads(packed):
     """The packer took the tree (it checks every work file against the inventory and every recorded
     divisor against its file's trailing word, `docs/formats/27b-nvfp4-work-tree.md` §7) and wrote the
@@ -239,19 +140,6 @@ def test_verify_passes_on_the_packed_artifact(built, packed, capsys, tmp_path):
     with open(report, encoding="utf-8") as f:
         checked = json.load(f)["checked"]
     assert checked["objects"] == 1325 and checked["local_nvfp4"] == 247 and checked["input_divisor"] == 247
-
-
-def corrupt(artifact, tmp_path, name, at=0):
-    """A copy of `artifact` with one byte of `name`'s payload flipped."""
-    copy = str(tmp_path / ARTIFACT)
-    shutil.copyfile(artifact, copy)
-    offset, _ = container.Container(copy).span(name)
-    with open(copy, "r+b") as f:
-        f.seek(offset + at)
-        byte = f.read(1)
-        f.seek(offset + at)
-        f.write(bytes([byte[0] ^ 0x01]))
-    return copy
 
 
 def test_verify_fails_naming_a_parent_that_does_not_re_encode(built, packed, capsys, tmp_path):
@@ -405,33 +293,7 @@ def test_a_disk_without_room_for_the_work_tree_is_refused(built, capsys, tmp_pat
 # One shard open at a time
 # ---------------------------------------------------------------------------------------------------
 
-ALL_FILES = {"model-00001-of-00003.safetensors", "model-00002-of-00003.safetensors",
-             "model-00003-of-00003.safetensors", "model.safetensors"}
 
-
-@pytest.fixture
-def handles(monkeypatch):
-    """Every safetensors handle the tool opens, counted: the most open at once and the files opened."""
-    real = shards.safe_open
-    state = {"open": 0, "peak": 0, "opened": []}
-
-    class Counted:
-        def __init__(self, path, **kwargs):
-            self.inner = real(path, **kwargs)
-            self.path = path
-
-        def __enter__(self):
-            state["open"] += 1
-            state["peak"] = max(state["peak"], state["open"])
-            state["opened"].append(os.path.basename(self.path))
-            return self.inner.__enter__()
-
-        def __exit__(self, *exc):
-            state["open"] -= 1
-            return self.inner.__exit__(*exc)
-
-    monkeypatch.setattr(shards, "safe_open", Counted)
-    return state
 
 
 def test_no_two_shards_are_open_at_once_in_calibration(built, handles, tmp_path):
