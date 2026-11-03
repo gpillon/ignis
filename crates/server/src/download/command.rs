@@ -351,6 +351,7 @@ pub fn render_list(rows: &[ListRow], format: ListFormat) -> String {
                         "bytes": row.entry.total_bytes(),
                         "on_disk": row.on_disk.as_str(),
                         "family": row.family.map(|family| family.name()),
+                        "license": row.entry.license.as_ref().map(|license| json!({ "id": license.id, "url": license.url })),
                     })
                 })
                 .collect();
@@ -359,7 +360,7 @@ pub fn render_list(rows: &[ListRow], format: ListFormat) -> String {
             text
         }
         ListFormat::Text => {
-            let mut table = vec![["ID".to_owned(), "LAYER".to_owned(), "REPO@REVISION".to_owned(), "SIZE".to_owned(), "ON DISK".to_owned(), "FAMILY".to_owned()]];
+            let mut table = vec![["ID".to_owned(), "LAYER".to_owned(), "REPO@REVISION".to_owned(), "SIZE".to_owned(), "ON DISK".to_owned(), "FAMILY".to_owned(), "LICENSE".to_owned()]];
             for row in rows {
                 table.push([
                     row.entry.id.clone(),
@@ -368,9 +369,10 @@ pub fn render_list(rows: &[ListRow], format: ListFormat) -> String {
                     format!("{:.1} GiB", row.entry.gib()),
                     row.on_disk.as_str().to_owned(),
                     row.family.map_or("—", |family| family.name()).to_owned(),
+                    row.entry.license.as_ref().map_or("—", |license| license.id.as_str()).to_owned(),
                 ]);
             }
-            let widths: Vec<usize> = (0..6).map(|column| table.iter().map(|line| line[column].chars().count()).max().unwrap_or(0)).collect();
+            let widths: Vec<usize> = (0..7).map(|column| table.iter().map(|line| line[column].chars().count()).max().unwrap_or(0)).collect();
             let mut text = String::new();
             for line in &table {
                 let cells: Vec<String> = line.iter().zip(&widths).map(|(cell, width)| format!("{cell:<width$}")).collect();
@@ -415,6 +417,10 @@ pub async fn run(command: ModelCommand, out: &mut dyn Write, progress: Arc<dyn F
                     entry.revision,
                     dir.display()
                 ));
+                // ADR 0078: the license first, before anything is fetched.
+                if let Some(license) = &entry.license {
+                    progress(&format!("{}: license {}: {}", entry.id, license.id, license.url));
+                }
                 // GitHub #378: the room is read before each entry, as the
                 // server reads it: the entry before may have used it.
                 if let Err(err) = room_for(entry, &dir, free_margin) {
@@ -585,8 +591,8 @@ mod tests {
         assert_eq!(lines.len(), 12, "{text}");
         assert!(lines[0].starts_with("ID") && lines[0].contains("REPO@REVISION") && lines[0].contains("FAMILY"), "{text}");
         assert!(lines[1].contains("built-in") && lines[1].contains("gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer@e961b419b672e183aa55df8c4b975abc82006e8a"), "{text}");
-        assert!(lines[1].contains("18.1 GiB") && lines[1].contains("complete") && lines[1].ends_with("Qwen3.8-27B"), "{text}");
-        assert!(lines[3].contains("67.8 GiB") && lines[3].contains("absent") && lines[3].ends_with('—'), "{text}");
+        assert!(lines[1].contains("18.1 GiB") && lines[1].contains("complete") && lines[1].contains("Qwen3.8-27B"), "{text}");
+        assert!(lines[3].contains("67.8 GiB") && lines[3].contains("absent") && lines[3].contains('—'), "{text}");
         assert!(lines[5].contains("built-in") && lines[5].contains("gpillon/Qwen3.8-27B-trellis-3bpw-ignis@f5bbd2cc") && lines[5].contains("12.5 GiB"), "{text}");
         assert!(lines[6].contains("built-in") && lines[6].contains("gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis@94a8bfc0") && lines[6].contains("12.5 GiB"), "{text}");
         assert!(lines[10].contains("gpillon/Nemotron-3-Diarization-GGUF-ignis@d46d59d0") && lines[10].contains("absent"), "{text}");
@@ -602,6 +608,12 @@ mod tests {
         assert_eq!(json[0]["family"], "Qwen3.8-27B");
         assert_eq!(json[10]["layer"], "operator");
         assert_eq!(json[10]["family"], Value::Null);
+        // ADR 0078: the identifier beside each entry, `—` where none is stated.
+        assert!(lines[0].ends_with("LICENSE") && lines[1].ends_with("apache-2.0"), "{text}");
+        assert!(lines[3].ends_with("qwen-community-1.0") && lines[4].ends_with("qwen-research"), "{text}");
+        assert!(lines[10].ends_with("openmdw-1.1") && lines[11].ends_with('—'), "{text}");
+        assert_eq!(json[0]["license"], serde_json::json!({ "id": "apache-2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0" }));
+        assert_eq!(json[10]["license"], Value::Null);
     }
 
     fn fetched(catalog: &Catalog, ids: &[&str], all: bool, card: Option<CardClass>) -> Result<Vec<String>, String> {

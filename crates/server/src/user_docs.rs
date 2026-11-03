@@ -172,19 +172,21 @@ pub fn models() -> String {
     out.push_str(
         "The models the server knows how to fetch without an operator catalog. Each is pinned \
          file by file, byte count and SHA-256, at a fixed revision of its Hugging Face repository, \
-         and nothing outside the binary can change a pin ([Get a model](../guides/models.md), \
+         and nothing outside the binary can change a pin. Each entry states the license its weights are \
+         published under, linked to its text ([Get a model](../guides/models.md), \
          [an operator catalog](../guides/operator-catalog.md)).\n\n",
     );
     let catalog = Catalog::built_in();
-    let _ = writeln!(out, "| Id | Repository | Size | Artifact |\n|---|---|---|---|");
+    let _ = writeln!(out, "| Id | Repository | Size | License | Artifact |\n|---|---|---|---|---|");
     for entry in catalog.entries() {
         let _ = writeln!(
             out,
-            "| [`{id}`](#{anchor}) | [`{repo}`](https://huggingface.co/{repo}) | {gib:.1} GiB | `{artifact}` |",
+            "| [`{id}`](#{anchor}) | [`{repo}`](https://huggingface.co/{repo}) | {gib:.1} GiB | {license} | `{artifact}` |",
             id = entry.id,
             anchor = anchor(&entry.id),
             repo = entry.repo,
             gib = entry.gib(),
+            license = entry.license.as_ref().map_or_else(|| "—".to_owned(), |license| format!("[`{}`]({})", license.id, license.url)),
             artifact = entry.artifact
         );
     }
@@ -395,6 +397,15 @@ mod tests {
         assert_eq!(thousands(7), "7");
         assert_eq!(thousands(6981), "6,981");
         assert_eq!(thousands(19406942468), "19,406,942,468");
+    }
+
+    /// ADR 0078: the built-in models page names each entry's license, linked.
+    #[test]
+    fn the_built_in_models_page_links_each_entrys_license() {
+        let page = models();
+        assert!(page.contains("| License |"), "{page}");
+        assert!(page.contains("[`qwen-community-1.0`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/8d94db83cd8e58d6be31e796723e5e35b960638c/LICENSE)"));
+        assert!(page.contains("[`openmdw-1.1`]"));
     }
 
     #[test]

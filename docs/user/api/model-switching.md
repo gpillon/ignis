@@ -44,7 +44,11 @@ model download <id>` that fetches it; a switch never starts a download.
 disk, which wins, else what the catalog tells of the entry, its `kind` or its
 family's, so every built-in entry has one before it is downloaded; it is absent
 only when neither tells, as for an operator entry of no family not yet
-downloaded. It
+downloaded. A catalog entry's row also carries `license`, `{id, url}`: the
+license its weights are published under, as the hub's cards name it, and a link
+to its text ([the catalog](../guides/models.md#the-catalog)); it is absent on a
+known model and on an operator entry that states none, and `GET /v1/models` is
+unchanged. It
 answers during a switch and while one has failed, and no row carries a path.
 Beside the rows the list carries `disk: {path, free_bytes}`: `--download-path`
 as the server holds it and the bytes free on its volume, read where a download
