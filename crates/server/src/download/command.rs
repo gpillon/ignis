@@ -597,8 +597,8 @@ mod tests {
         assert!(lines[3].contains("67.8 GiB") && lines[3].contains("absent") && lines[3].contains('—'), "{text}");
         assert!(lines[5].contains("built-in") && lines[5].contains("gpillon/Qwen3.8-27B-trellis-3bpw-ignis@f5bbd2cc") && lines[5].contains("12.5 GiB"), "{text}");
         assert!(lines[6].contains("built-in") && lines[6].contains("gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis@94a8bfc0") && lines[6].contains("12.5 GiB"), "{text}");
-        assert!(lines[7].contains("built-in") && lines[7].contains("gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis@aaaaaaaa") && lines[7].contains("18.1 GiB"), "{text}");
-        assert!(lines[8].contains("built-in") && lines[8].contains("gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis@bbbbbbbb") && lines[8].contains("12.5 GiB"), "{text}");
+        assert!(lines[7].contains("built-in") && lines[7].contains("gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") && lines[7].contains("18.1 GiB"), "{text}");
+        assert!(lines[8].contains("built-in") && lines[8].contains("gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") && lines[8].contains("12.5 GiB"), "{text}");
         assert!(lines[12].contains("gpillon/Nemotron-3-Diarization-GGUF-ignis@d46d59d0") && lines[12].contains("absent"), "{text}");
         assert!(lines[13].contains("operator") && lines[13].contains("acme/ft@v1") && lines[13].contains("partial"), "{text}");
         assert!(lines[9].contains("gpillon/Qwen3-ASR-1.7B-GGUF-ignis@f8a5263e") && lines[9].contains("1.5 GiB") && lines[9].contains("absent"), "{text}");
