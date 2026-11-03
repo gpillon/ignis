@@ -31,6 +31,8 @@ it. Python never writes the container.
 | `overlay.py` | A BF16 checkpoint with a `replay.py fetch` directory laid over it: which file holds each tensor, the overlay's checked like for like and pinned by `fetch.json`. The KLD reference of the abliterated BF16 reads through it (GitHub #422). |
 | `reconstruction.py` | The conversion's GPU step and its only exllamav3 user: each trellis matrix's relative reconstruction error against the BF16 checkpoint. |
 | `replay.py` | The abliterated variant's 70 matrices re-quantized by replaying exllamav3's conversion: the plan (no torch), `fetch` of huihui's changed tensors by HTTP range, `run` (the GPU step). |
+| `recipe.py` | A local conversion's per-tensor recipe, derived from the quant's `quantization_config.json` (a pure step): every matrix at the quant's K and shape, the head at 4. |
+| `local_quant.py` | A fine-tune's EXL3 quant converted on this machine by exllamav3 at that recipe: `run` (the GPU step, its check, the pins and the provenance) and `control` (each matrix's error against the fine-tune's BF16 beside the default artifact's). |
 | `work.py` | The DONE protocol the packer checks (copied from `tools/image-converter/work.py`). |
 | `test_*.py`, `conftest.py` | Unit tests (CPU only) on a reduced synthetic served artifact and quant. |
 
@@ -165,6 +167,58 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
   pass the packer the same `--weights-id` and the output name.
 - **`verify`** reads neither sidecar nor pins: `--served` is the fine-tune's NVFP4 artifact, whose objects
   the packed one's copies must be, and `--quant` the local quant.
+
+## The fine-tune's local quant
+
+`local_quant.py` makes that local quant (GitHub #471): exllamav3 1.5.3's own conversion of the fine-tune's
+BF16 at the bit widths of `SC_3.00bpw_H4`, with that quant's own calibration trace. Of the quant only two
+files are fetched, at the revision the default 16 GB artifact's record names (its `source`):
+
+```
+F:/ai/ngram-venv/Scripts/hf.exe download turboderp/Qwen3.8-27B-exl3 quantization_config.json cal_trace.safetensors \
+    --revision 86b95530f9d365d90dd24d01a997a8de0cdf6c55 --local-dir H:/swift-471/sc30
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/local_quant.py run \
+    --bf16 H:/models/Swift-1.5-Qwen3.8-27b --bf16-repo ukisai/Swift-1.5-Qwen3.8-27b \
+    --recipe-quant H:/swift-471/sc30 \
+    --record F:/ai/q38/ninfer-models/qwen3_8_27b_trellis_sc30-v2.ninfer.conversion.json \
+    --out H:/models/Swift-1.5-Qwen3.8-27b-exl3-sc30 --work H:/swift-471/work [--check]
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/local_quant.py control \
+    --quant H:/models/Swift-1.5-Qwen3.8-27b-exl3-sc30 \
+    --bf16 H:/models/Swift-1.5-Qwen3.8-27b --bf16-repo ukisai/Swift-1.5-Qwen3.8-27b \
+    --record F:/ai/q38/ninfer-models/qwen3_8_27b_trellis_sc30-v2.ninfer.conversion.json \
+    --out F:/ai/opencode/inference/.scratch/471/control.json
+```
+
+- **The recipe** (`recipe.py`, no torch) is the quant's `quantization_config.json`: each matrix's K is its
+  `tensor_storage` entry's, which must be the K its stored trellis holds and one the container stores; the
+  head is at `head_bits`, 4; bits 3.0, `mul1`, out scales always, MTP bits 3, calibration 250 x 2,048,
+  checked as `convert.py run` checks a quant. On `SC_3.00bpw_H4`: K2 34, K3 297, K4 66, K5 4 over 401
+  matrices, the head included. exllamav3's YAML (`<out>.recipe.yaml`) lists the 400 body matrices only: it
+  takes the head from `head_bits` and would ignore an entry for it.
+- **`run`** refuses (exit 2), before the GPU and writing nothing: the two files at another revision than the
+  record's quant, a configuration whose sha256 is not the record's, a trace that is not its LFS oid, a BF16
+  checkpoint without its download records or without a recipe matrix at its shape, a non-empty `--out` or
+  `--work`, and a disk with less free space than the output, exllamav3's work files and three copies of
+  its fp32 calibration state (54 GiB for the 27B; `--no-checkpoints` leaves the copies out, 25 GiB, and
+  gives up `--resume`). `--check` stops there.
+- **The conversion** is `exllamav3.conversion.convert_model`'s parser, `prepare` and `main`, run in this
+  process: `-hb 4 -mb 3 -vb 16 -cb mul1 --out_scales always -cd <trace> -cr 250 -cc 2048 --recipe`. The
+  vision tower stays unquantized as in the quant (1.5.3 would quantize it at 6 bits). `--resume` resumes an
+  interrupted job from `--work` (exllamav3's `-r`). The time and the peaks are logged and recorded: the
+  CUDA allocator's (allocated, reserved) and the process's working set and commit.
+- **The check.** Every matrix of the recipe at its K and shape (the head at 4), nothing else quantized but
+  the MTP layer at its bits, the configuration `convert.py run` takes; a quant that is not the recipe's is
+  refused naming the matrix, and gets no pins.
+- **`<out>.pins.json`**, beside the quant: `files`, every file of the quant by bytes and sha256 (the
+  `--quant-pins` above), and `provenance`: the BF16's repository, revision, index and shards (LFS oid),
+  the quant's repository, branch and revision with its configuration's sha256 and the exllamav3 that made
+  it, the calibration trace's sha256 and size, the recipe (its YAML's sha256, its formats, the YAML itself),
+  exllamav3's version and arguments (paths by role), the run's seconds and peaks, the converter's commit
+  and the versions. No local path.
+- **`control`** (GPU) measures each matrix's relative reconstruction error against the fine-tune's BF16
+  (`reconstruction.rel_errors`) beside the default 16 GB artifact's error on the same matrix against the
+  base BF16 (its record's `trellis.matrices`), under the record's object names, and refuses a record that
+  does not hold the quant's matrices at their K.
 
 ## The sidecar
 
