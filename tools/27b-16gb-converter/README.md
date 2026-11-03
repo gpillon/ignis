@@ -185,7 +185,8 @@ F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/local_quant.py r
 F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/local_quant.py control \
     --quant H:/models/Swift-1.5-Qwen3.8-27b-exl3-sc30 \
     --bf16 H:/models/Swift-1.5-Qwen3.8-27b --bf16-repo ukisai/Swift-1.5-Qwen3.8-27b \
-    --record F:/ai/q38/ninfer-models/qwen3_8_27b_trellis_sc30-v2.ninfer.conversion.json --out .scratch/471/control.json
+    --record F:/ai/q38/ninfer-models/qwen3_8_27b_trellis_sc30-v2.ninfer.conversion.json \
+    --out F:/ai/opencode/inference/.scratch/471/control.json
 ```
 
 - **The recipe** (`recipe.py`, no torch) is the quant's `quantization_config.json`: each matrix's K is its

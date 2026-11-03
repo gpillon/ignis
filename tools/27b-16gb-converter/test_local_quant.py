@@ -9,18 +9,15 @@ import hashlib
 import json
 import os
 import shutil
-import struct
 import sys
 import types
 
 import pytest
 import yaml
 
-import container
 import convert
 import exl3
 import local_quant
-import plan
 from conftest import REVISION, download_records, make_sources, write_safetensors
 
 SWIFT_REVISION = "b4c84d42903a8646b25857eb2827288d92ed85a4"
