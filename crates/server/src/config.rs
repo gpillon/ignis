@@ -1201,6 +1201,17 @@ fn derive(
     let rope_scaling = s.model.rope_scaling.resolve(s.model.max_context).map_err(|e| {
         ConfigError(format!("`{} {}`: {e}", spelled("model", "max_context"), s.model.max_context))
     })?;
+    // GitHub #456: the band the card runs, whatever the field resolved to.
+    let prefill_attention = arch::prefill_attention(
+        s.model.prefill_attention,
+        !resolution.adapts("model", "prefill_attention"),
+        sources.card.as_ref(),
+        &spelled("model", "prefill_attention"),
+    )
+    .map_err(ConfigError)?;
+    let exception_weights =
+        arch::exception_weights(s.model.exception_weights, sources.card.as_ref(), &spelled("model", "exception_weights"))
+            .map_err(ConfigError)?;
 
     let config = Config {
         model,
@@ -1277,8 +1288,8 @@ fn derive(
         decode_lanes: s.spec.decode_lanes,
         vision,
         rope_scaling,
-        prefill_attention: s.model.prefill_attention,
-        exception_weights: s.model.exception_weights,
+        prefill_attention,
+        exception_weights,
         media,
         request_timeout_secs: s.server.request_timeout,
         stream_timeout_secs: s.server.stream_timeout,

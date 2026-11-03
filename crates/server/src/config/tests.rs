@@ -3267,6 +3267,29 @@ fn the_verbs_read_a_card_the_kernels_were_not_built_for_as_before() {
     assert!(on_card(&[], profile::Card::Absent).is_ok());
 }
 
+/// GitHub #456: on an Ampere card of a build for it, the 27B's prompt
+/// attention left unset (or to a profile) runs the FP16 band, a named `fp16`
+/// stays, and a named `fp8` is refused by the spelling that named it; on a
+/// Blackwell card of the same build nothing changes.
+#[test]
+fn the_prefill_attention_on_an_ampere_card_is_fp16_unless_fp8_is_named() {
+    let ampere = card_of(15.9, "NVIDIA RTX A4000", (8, 6), "86;120a");
+    let on = |flags: &[&str], env: &'static [(&'static str, &'static str)]| {
+        let env = move |key: &str| env.iter().find(|(name, _)| *name == key).map(|(_, value)| value.to_string());
+        resolve_on(&args(flags), env, &file::NoFiles, &|| ampere.clone()).map(expect_config)
+    };
+    assert_eq!(on(&[], &[]).unwrap().prefill_attention, PrefillAttention::Fp16);
+    assert_eq!(on(&["--model-prefill-attention", "fp16"], &[]).unwrap().prefill_attention, PrefillAttention::Fp16);
+    let flag = on(&["--model-prefill-attention", "fp8"], &[]).unwrap_err().0;
+    assert!(flag.contains("`--model-prefill-attention fp8`") && flag.contains("NVIDIA RTX A4000 (8.6)"), "{flag}");
+    let env = on(&[], &[("IGNIS_MODEL_PREFILL_ATTENTION", "fp8")]).unwrap_err().0;
+    assert!(env.contains("`IGNIS_MODEL_PREFILL_ATTENTION fp8`"), "{env}");
+    let blackwell = card_of(31.8, "NVIDIA GeForce RTX 5090", (12, 0), "86;120a");
+    let fp8 = on_card(&["--model-prefill-attention", "fp8"], blackwell.clone()).unwrap();
+    assert_eq!(fp8.prefill_attention, PrefillAttention::Fp8);
+    assert_eq!(on_card(&[], blackwell).unwrap().prefill_attention, PrefillAttention::Fp8);
+}
+
 /// `rtx50-16gb` for the 27B: the values the spec derives, and Flash-Next
 /// started under it resolves without refusal.
 #[test]

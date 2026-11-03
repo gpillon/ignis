@@ -71,6 +71,18 @@ On a card below compute capability 9.0, programmatic dependent launch, an
 sm_90 feature, is off: a kernel that would start early waits for the one
 before it on the stream instead.
 
+On a card below compute capability 12.0 the server picks what the card runs:
+
+- the 27B's prompt attention left unset runs the FP16 band, and a named
+  `--model-prefill-attention fp8` is refused; `GET /v1/config` still shows
+  the field's value, `fp8`;
+- `--model-exception-weights fp8` is refused: the exception tensors stay
+  BF16, since in FP8 they prefill on the block-scaled FP8 tensor cores;
+- the 27B NVFP4 artifact, the image model and Flash-Next's staged decode
+  (`IGNIS_FN_MOE_STAGED=1`) are refused before the load, by name
+  ([Troubleshooting](../troubleshooting.md#starting)). The 27B loads from its
+  trellis artifact (`--model-id qwen3.8-27b-16g`).
+
 ## 2. The Rust workspace
 
 ```
