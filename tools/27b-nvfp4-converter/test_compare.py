@@ -116,12 +116,13 @@ def compare_args(src, served, artifact, report):
 
 
 def run_compare(src, served, artifact, tmp_path, capsys, expect=0):
-    """Runs `compare`; returns its JSON report and its summary, which it also printed."""
-    report = str(tmp_path / "compare.json")
+    """Runs `compare`, its report in a directory that does not exist yet; returns the JSON report and the
+    summary, which it also printed."""
+    report = str(tmp_path / "reports" / "compare.json")
     assert convert.main(compare_args(src, served, artifact, report)) == expect
     with open(report, encoding="utf-8") as f:
         doc = json.load(f)
-    with open(str(tmp_path / "compare.txt"), encoding="utf-8") as f:
+    with open(str(tmp_path / "reports" / "compare.txt"), encoding="utf-8") as f:
         summary = f.read()
     assert summary in capsys.readouterr().out
     return doc, summary

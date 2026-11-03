@@ -431,8 +431,8 @@ def parser():
             s.add_argument("--report")
 
     s = sub.add_parser("compare", help="#469: an artifact built from the base against the served one, in three tiers")
-    s.add_argument("--served", required=True, help="the served artifact, its .graft.json or .conversion.json beside it")
-    s.add_argument("--artifact", required=True, help="the artifact built from --checkpoint, its .conversion.json beside it")
+    s.add_argument("--served", required=True, help="the served artifact, its .graft.json or .conversion.json by it")
+    s.add_argument("--artifact", required=True, help="the artifact built from --checkpoint, its .conversion.json by it")
     s.add_argument("--checkpoint", required=True, help="the BF16 checkpoint it was built from: the parents' rows")
     s.add_argument("--report", required=True, help="the JSON report to write; the summary goes beside it as .txt")
     s.add_argument("--device", default="cpu")

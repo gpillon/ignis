@@ -62,7 +62,7 @@ def tiers(served, local):
         if routes in TIER_OF:
             out[name] = TIER_OF[routes]
         else:
-            problems.append(f"{name} is routed {routes[0]} by the served recipe and {routes[1]} by the local one")
+            problems.append(f"{name} is routed {routes[0]} by the served recipe and {routes[1]} by the built one")
     checkpoint.refuse_if(problems, "the recipes put objects in no tier")
     return out
 
@@ -301,6 +301,7 @@ def run(args, g, device):
     ours = Side(args.artifact, g, "the artifact")
     tier = tiers(served.table, ours.table)
     sources = bound_checkpoint(g, args.checkpoint, ours)
+    os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)
     t0 = time.time()
     objs = inventory.objects(g)
     report = {"served": served.described(), "artifact": ours.described(),
