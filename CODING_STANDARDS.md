@@ -51,7 +51,7 @@ correctness bug, whose patch ships with a test that fails without it and a
 `reason` naming the bug and the test (ADR 0037); or portability to an
 architecture the build targets, whose patch leaves the default `120a` build's
 device code unchanged and whose `reason` names the architecture and the
-compile it fixes (ADR 0077, proposed). An op rewritten as ours, or
+compile it fixes (ADR 0077). An op rewritten as ours, or
 changed beyond a recorded patch, leaves the vendored tree and
 makes no parity claim (ADR 0031, ADR 0051). A comparison with the reference
 says whether it crosses an Ignis-patched behaviour.

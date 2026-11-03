@@ -88,7 +88,7 @@ will not overwrite a patched file unless it is told to.
 A patch is admitted for one of three reasons, and its `reason` says which: a
 measured bottleneck (ADR 0031); a demonstrated correctness bug (ADR 0037),
 in which case the `reason` also names the test that fails without the patch;
-or portability to an architecture the build targets (ADR 0077, proposed), in
+or portability to an architecture the build targets (ADR 0077), in
 which case the `reason` names the architecture and the compile it fixes, and
 the default `120a` build's device code is unchanged. The one portability
 patch is `src/core/pdl.cuh` (GitHub #456): programmatic dependent launch is a

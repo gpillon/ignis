@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # A vendored file may carry a portability patch
