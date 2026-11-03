@@ -25,7 +25,13 @@ until the test suite is green.
   CPU-only (GitHub #38).
 - Kernel work (`kernel/`, CUDA) is not exercised by `cargo test`: build and
   run the leaf's own op-test executable (CTest) with `kernel/build.ps1 -Test`,
-  and verify end to end through the GPU profile. The one kernel-adjacent thing
+  and verify end to end through the GPU profile. On a card below compute
+  capability 12.0, with a build that covers it (`IGNIS_CUDA_ARCHITECTURES`,
+  #456), run CTest as `ctest -LE sm120a-only`: the tests that label leaves out
+  exercise the kernels only the sm_120a set holds, and fail there by design.
+  `ignis_kernel_gdn_gating_proj_tests` also fails on a card with fewer SMs
+  than an RTX 5090: it forces cooperative schedules sized for 170 SMs, which
+  the engine's own planner skips. The one kernel-adjacent thing
   `cargo test` *does* check is the vendored subtree's integrity
   (`crates/vendor`): a vendored file edited without a recorded patch turns the
   workspace red (ADR 0010, `kernel/vendor/VENDOR.md`).

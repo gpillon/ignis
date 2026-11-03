@@ -1026,3 +1026,28 @@ add_executable(ignis_kernel_trellis_body_test test_trellis_body.cu)
 target_include_directories(ignis_kernel_trellis_body_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_trellis_body_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_trellis_body_test COMMAND ignis_kernel_trellis_body_test)
+
+# GitHub #456: the tests whose kernels only the sm_120a set holds (kernel/CMakeLists.txt). On a
+# card below compute capability 12.0 they fail at their first launch, "no kernel image", which is
+# the loud failure the set is built for; there run `ctest -LE sm120a-only`. W8 aborts at its
+# [2048, 16384] instance (static shared memory past sm_86's 48 KiB), the MoE decode routes test at
+# its staged arms, the cluster arms on the cluster kernel, the rest on FP4 W4A4 or FP8 MMA.
+set(ignis_sm120a_only_tests
+  ignis_kernel_w8_linear_tests
+  ignis_kernel_nvfp4_linear_a4_tests
+  ignis_kernel_attn_input_proj_tests
+  ignis_kernel_nvfp4_linear_add_tests
+  ignis_kernel_gdn_input_proj_tests
+  ignis_kernel_nvfp4_linear_swiglu_tests
+  ignis_kernel_moe_decode_routes_test
+  ignis_kernel_moe_slot_trap_decode-clusters_test
+  ignis_kernel_moe_slot_trap_decode-id-clusters_test
+  ignis_kernel_moe_slot_trap_decode-nan-clusters_test
+  ignis_kernel_moe_experts_clusters_test
+  ignis_kernel_moe_block_clusters_test
+  ignis_kernel_fp8_exception_arms_test
+  ignis_kernel_image_gemm_test
+  ignis_kernel_image_attn_test
+  ignis_kernel_image_encoder_test
+  ignis_kernel_image_transformer_test)
+set_tests_properties(${ignis_sm120a_only_tests} PROPERTIES LABELS sm120a-only)
