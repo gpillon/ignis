@@ -26,8 +26,8 @@ from dataclasses import dataclass
 import torch
 
 import inventory
+from checkpoint import TEXT
 
-TEXT = "model.language_model."
 EXPECTED_ROUTES = {"resource": 6, "local_nvfp4": 247, "input_divisor": 247, "bf16_exception": 9,
                    "base_direct": 401, "official": 349, "dflash2": 66}
 SERVED_RECIPE_ID = "qwen3_8_27b_nvfp4full-v2"

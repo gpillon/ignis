@@ -9,6 +9,8 @@ layouts and order; only the widths differ. The layer counts and the positional B
 """
 from dataclasses import dataclass
 
+from container import align_up
+
 MODEL_ID = "qwen3.8-27b"
 UNITS = ("frontend", "text", "mtp", "vision", "dflash2")
 FRONTEND_FILES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json",
@@ -221,10 +223,6 @@ def objects(g):
             Obj("dflash2/selector/predecessor", NVFP4, (g.vocab, g.dflash2_selector_rank)),
             Obj("dflash2/selector/successor", NVFP4, (g.vocab, g.dflash2_selector_rank))]
     return out
-
-
-def align_up(value, alignment):
-    return (value + alignment - 1) // alignment * alignment
 
 
 GROUP = {W8: (32, 8), Q4: (64, 4), Q5: (64, 5), Q6: (64, 6)}

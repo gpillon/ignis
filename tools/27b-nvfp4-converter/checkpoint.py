@@ -23,6 +23,7 @@ import numpy as np
 
 import inventory
 import shards
+import work
 
 LFS_OID = re.compile(r"^[0-9a-f]{64}$")
 GIT_BLOB = re.compile(r"^[0-9a-f]{40}$")
@@ -282,10 +283,6 @@ def hash_pins(root, etags, what, workers=4):
     return out
 
 
-def file_sha256(path):
-    return _digest(path, False)[0]
-
-
 # ---------------------------------------------------------------------------------------------------
 # The draft head's rows (ninfer qwen3_6/common/draft_head.py)
 # ---------------------------------------------------------------------------------------------------
@@ -426,7 +423,7 @@ def check_drafter(root, g):
 def check_ranking(path, g):
     if not os.path.isfile(path):
         raise Refused(f"the ranking {path} does not exist")
-    digest = file_sha256(path)
+    digest = work.file_digest(path)
     expected = PINNED[g.name]["ranking_sha256"]
     if expected is not None and digest != expected:
         raise Refused(f"the ranking hashes to {digest}, the committed ranking's sha256 is {expected}")

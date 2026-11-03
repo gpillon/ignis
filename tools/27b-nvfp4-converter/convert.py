@@ -163,7 +163,7 @@ def read_calibration(path, sources):
         out[name] = d
     provenance = {k: doc.get(k) for k in ("encoder_profile", "divisor_formula", "corpus", "gdn_kernel", "device",
                                           "versions", "converter")}
-    provenance.update(sha256=checkpoint.file_sha256(path), sites=len(out))
+    provenance.update(sha256=work.file_digest(path), sites=len(out))
     return out, provenance
 
 
