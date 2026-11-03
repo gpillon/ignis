@@ -64,6 +64,8 @@ def test_a_cross_term_not_above_the_matched_pair_in_every_window_stops_the_gate(
     code, report = run(tmp_path, world(tmp_path, matched), "--limit", "0.0590", "--baseline", "0.04916")
     assert (code, report["verdict"], report["stop"]) == (0, "PASS", False)
     assert report["cross"]["cross_artifact"]["above_windows"] == 4
+    assert report["cross"]["cross_reference"]["ratio"] == pytest.approx(0.3 / 0.045)
+    assert report["cross_rule"] == "above in every window, the CI of the difference above 0"
 
     # The vanilla artifact sits below the matched pair in window 2: the gate may have measured the base.
     code, report = run(tmp_path, world(tmp_path, matched, cross_artifact=(0.3, 0.3, 0.03, 0.3)),
@@ -71,18 +73,6 @@ def test_a_cross_term_not_above_the_matched_pair_in_every_window_stops_the_gate(
     assert (code, report["verdict"], report["stop"]) == (3, "PASS", True)
     assert report["cross"]["cross_artifact"]["above_windows"] == 3
     assert report["cross"]["cross_reference"]["above"] is True
-
-
-def test_a_cross_margin_asks_the_cross_terms_to_be_that_many_times_the_matched_pair(tmp_path):
-    # Every resample's cross / matched lies in [0.3 / 0.06, 0.3 / 0.02] = [5, 15]; the pooled ratio is 6.67.
-    terms = world(tmp_path, matched=(0.02, 0.06, 0.05, 0.03))
-
-    code, report = run(tmp_path, terms, "--limit", "0.0590", "--baseline", "0.04916", "--cross-margin", "4.9")
-    assert (code, report["stop"]) == (0, False)
-    assert report["cross"]["cross_reference"]["ratio"] == pytest.approx(0.3 / 0.045)
-
-    code, report = run(tmp_path, terms, "--limit", "0.0590", "--baseline", "0.04916", "--cross-margin", "7")
-    assert (code, report["stop"]) == (3, True)
 
 
 def test_the_gate_is_void_unless_its_terms_are_two_dumps_against_two_references(tmp_path):

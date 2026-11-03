@@ -27,9 +27,8 @@ references, the fine-tune's BF16 and the base's. Each `gate1.py` term is `NAME=F
 | `--baseline-pair` | vanilla | base BF16 | the registered baseline's own measurement; `--reproduce NAME=FILE` compares it per position with a prior run's arm (reported; `--require-reproduction` makes it void the gate) |
 
 **The cross terms.** A cross term holds when it is above the matched pair in every window and the window
-bootstrap's 95% CI of its difference from the matched pair is above 0; `--cross-margin R` also asks the CI of
-its ratio to the matched pair to be at or above `R`. The spec says "far above" and registers no number, so the
-printed ratios and differences go to the owner either way. On #422's data (a 70-matrix change) the cross
+bootstrap's 95% CI of its difference from the matched pair is above 0. The spec says "far above" and
+registers no number, so the printed ratios and differences go to the owner either way. On #422's data (a 70-matrix change) the cross
 terms are 1.07x and 1.09x the matched pair and lower in one window each: under this rule that gate would
 have stopped.
 
