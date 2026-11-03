@@ -43,8 +43,24 @@ def test_the_corpus_is_2690_tokens_of_the_27bs_tokenizer():
 
 
 @pytest.mark.skipif(not os.path.isfile(RANKING), reason=f"ninfer's ranking is not on this machine ({RANKING})")
-def test_ninfers_ranking_is_the_pinned_one():
-    assert checkpoint.check_ranking(RANKING, G)["sha256"] == checkpoint.PINNED["qwen3.8-27b"]["ranking_sha256"]
+def test_ninfers_ranking_is_pinned_and_the_committed_totals_are_its_first_row():
+    record = checkpoint.check_ranking(RANKING, G)
+    assert record["sha256"] == "c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5"
+    assert record["bytes"] == 11919360
+    assert record["origin"] == "ninfer tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64 (row 0: the totals)"
+    with open(checkpoint.TOTALS, "rb") as committed, open(RANKING, "rb") as ninfers:
+        row = committed.read()
+        assert len(row) * 6 == 11919360 and ninfers.read(len(row)) == row
+
+
+def test_both_rankings_give_the_draft_head_the_same_rows():
+    root = CHECKPOINTS["Qwen/Qwen3.8-27B"][0]
+    for path in (RANKING, os.path.join(root, "tokenizer.json")):
+        if not os.path.isfile(path):
+            pytest.skip(f"{path} is not on this machine")
+    committed, _ = checkpoint.draft_ids(checkpoint.TOTALS, root, G)
+    ninfers, _ = checkpoint.draft_ids(RANKING, root, G)
+    assert len(committed) == 131072 and committed.tolist() == ninfers.tolist()
 
 
 SERVED = "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer"
@@ -52,13 +68,13 @@ DRAFTER = "H:/models/Qwen3.8-27B-DFlash2"
 
 
 def base_sources(drafter=None):
-    """The base checkpoint's sources through the cheap checks (no shard hashed), or a skip naming what is
-    absent."""
+    """The base checkpoint's sources, with the committed ranking, through the cheap checks (no shard hashed),
+    or a skip naming what is absent."""
     root, revision = CHECKPOINTS["Qwen/Qwen3.8-27B"]
-    for path in (SERVED, RANKING, os.path.join(root, "model.safetensors.index.json")):
+    for path in (SERVED, os.path.join(root, "model.safetensors.index.json")):
         if not os.path.isfile(path):
             pytest.skip(f"{path} is not on this machine")
-    return checkpoint.check_sources(G, root, revision, drafter, RANKING)
+    return checkpoint.check_sources(G, root, revision, drafter, checkpoint.TOTALS)
 
 
 def costed(rebuild, *args):
@@ -76,9 +92,10 @@ def costed(rebuild, *args):
 def test_tier_1_of_the_base_checkpoint_is_the_served_artifacts_byte_for_byte():
     """#469's binding tier on the CPU: the 765 tier-1 objects the recipe makes of the base checkpoint (the
     frontend resources, the norms and the GDN small set, the BF16 exceptions, the W8 embedding and output head,
-    the Q4 draft head and its ids, the MTP layer and the vision tower) are the served artifact's byte for byte."""
+    the Q4 draft head and its ids from the committed ranking, the MTP layer and the vision tower) are the served
+    artifact's byte for byte."""
     sources = base_sources()
-    ids, _ = checkpoint.draft_ids(RANKING, sources.checkpoint, G)
+    ids, _ = checkpoint.draft_ids(sources.ranking, sources.checkpoint, G)
     wanted = {n for n in compare.tier_names(G, 1) if not n.startswith("dflash2/")}
     done = costed(compare.rebuild, container.Container(SERVED), sources, recipe.recipes(G), ids, wanted, "cpu")
     assert done["differ"] == []

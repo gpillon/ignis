@@ -152,3 +152,9 @@ are not in this repository or its build: they are converted to a GGUF file by
 tools/speech-diarizer/convert.py and distributed beside it under their own
 licence, the OpenMDW License Agreement, version 1.1
 (https://openmdw.ai/license/1-1/).
+
+The 27B NVFP4 converter's draft-head ranking
+(tools/27b-nvfp4-converter/data/ranking.totals.i64) is the total row, row 0,
+of ninfer's tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64, from
+Neroued/ninfer commit eea471ce, licensed under the Apache License, Version
+2.0 (see LICENSE); the README beside it says how it was taken.

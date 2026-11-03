@@ -10,8 +10,9 @@ ranking. Every check here runs before anything is written, and a failure is `Ref
   at one revision; a file whose record holds an LFS oid must hash to it (every shard does), and one whose
   record holds a git blob id (the small JSON and template files, the frontend's among them) must be that
   blob. The pattern is the 16 GB converter's `download_record` and `revision_of`, with the blob check added.
-- **The ranking**: ninfer's committed `ranking.train.counts.i64`, pinned by its sha256, whose total row
-  picks the draft head's rows (ninfer `qwen3_6/common/draft_head.py`, ported here).
+- **The ranking**: its total row picks the draft head's rows (ninfer `qwen3_6/common/draft_head.py`, ported
+  here). By default the committed `data/ranking.totals.i64`, row 0 of ninfer's `ranking.train.counts.i64`;
+  ninfer's whole file gives the same row. Each is pinned by its sha256.
 """
 import hashlib
 import json
@@ -28,13 +29,24 @@ import work
 LFS_OID = re.compile(r"^[0-9a-f]{64}$")
 GIT_BLOB = re.compile(r"^[0-9a-f]{40}$")
 CONFIG = "config.json"
+# The ranking ignis carries, `--ranking`'s default: row 0 of ninfer's ranking, the totals (data/README.md).
+TOTALS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ranking.totals.i64")
+# The 27B's rankings by sha256, with the origin the converter's record names: the committed totals and
+# ninfer's whole file, whose total row they are.
+RANKING_ORIGINS = {
+    "1e8fb35cd76655acac1cc422e2ef36e7dbedae567e04527ae433cf30b7dbd59f":
+        "ignis tools/27b-nvfp4-converter/data/ranking.totals.i64 (row 0 of ninfer's ranking.train.counts.i64: "
+        "the totals)",
+    "c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5":
+        "ninfer tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64 (row 0: the totals)",
+}
 # What each geometry pins beyond its widths: the configuration members the widths do not give, the
-# drafter's repository and revision, the ranking's sha256 and the tokenizer's id count.
+# drafter's repository and revision, the rankings' sha256s and the tokenizer's id count.
 PINNED = {
     "qwen3.8-27b": {
         "mrope_section": [11, 11, 10], "vision_heads": 16,
         "drafter": ("incoai/Qwen3.8-27B-DFlash2", "dedf8df68adfb1afeaf7b7480c0a0243108177b4"),
-        "ranking_sha256": "c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5",
+        "ranking_sha256": tuple(RANKING_ORIGINS),
         "tokenizer_ids": 248077,
     },
     "fixture": {
@@ -43,7 +55,6 @@ PINNED = {
         "ranking_sha256": None, "tokenizer_ids": None,
     },
 }
-RANKING_ORIGIN = "ninfer tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64 (row 0: the totals)"
 TEXT = "model.language_model."
 
 
@@ -421,13 +432,17 @@ def check_drafter(root, g):
 
 
 def check_ranking(path, g):
+    """The ranking's record: at a pinned geometry its sha256 is one of the pins, the committed totals' or
+    ninfer's whole file's, which give the same total row."""
     if not os.path.isfile(path):
         raise Refused(f"the ranking {path} does not exist")
     digest = work.file_digest(path)
     expected = PINNED[g.name]["ranking_sha256"]
-    if expected is not None and digest != expected:
-        raise Refused(f"the ranking hashes to {digest}, the committed ranking's sha256 is {expected}")
-    return {"file": os.path.basename(path), "bytes": os.path.getsize(path), "sha256": digest, "origin": RANKING_ORIGIN}
+    if expected is not None and digest not in expected:
+        raise Refused(f"the ranking {path} hashes to {digest}, not one of the pinned rankings: "
+                      + "; ".join(f"{sha} ({RANKING_ORIGINS[sha]})" for sha in expected))
+    return {"file": os.path.basename(path), "bytes": os.path.getsize(path), "sha256": digest,
+            "origin": RANKING_ORIGINS.get(digest, "unpinned")}
 
 
 def check_sources(g, checkpoint, revision=None, drafter=None, ranking=None):

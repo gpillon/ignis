@@ -4,8 +4,8 @@ weights id of its own.
 
   python convert.py calibrate --checkpoint DIR --out CALIBRATION.json [--device cuda]
   python convert.py run --checkpoint DIR --source-repo REPO --source-revision REV --license ID \\
-      --dflash2 DIR --ranking FILE --calibration CALIBRATION.json --weights-id ID --work DIR [--device cuda]
-  python convert.py verify --artifact A.ninfer --checkpoint DIR --dflash2 DIR --ranking FILE \\
+      --dflash2 DIR [--ranking FILE] --calibration CALIBRATION.json --weights-id ID --work DIR [--device cuda]
+  python convert.py verify --artifact A.ninfer --checkpoint DIR --dflash2 DIR [--ranking FILE] \\
       --calibration CALIBRATION.json --weights-id ID [--device cuda] [--report R.json]
   python convert.py compare --served SERVED.ninfer --artifact A.ninfer --checkpoint DIR --report R.json \\
       [--device cpu]
@@ -418,7 +418,9 @@ def parser():
         s = sub.add_parser(name)
         common(s)
         s.add_argument("--dflash2", required=True, help="the base's DFlash2 drafter, with its download records")
-        s.add_argument("--ranking", required=True, help="ninfer's ranking.train.counts.i64")
+        s.add_argument("--ranking", default=checkpoint.TOTALS,
+                       help="the draft head's ranking: the committed totals (data/ranking.totals.i64) by default, "
+                            "or ninfer's ranking.train.counts.i64, whose row 0 they are")
         s.add_argument("--calibration", required=True)
         s.add_argument("--weights-id", required=True)
         if name == "run":

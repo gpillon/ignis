@@ -113,6 +113,26 @@ def test_every_nvfp4_parent_is_encoded_here_beside_its_calibrated_divisor(built)
         assert tree[site][1] == struct.pack("<f", sites[site]["input_scale_divisor"]), site
 
 
+def test_without_ranking_the_draft_head_takes_its_rows_from_the_committed_totals(built, tmp_path):
+    """No `--ranking`: the committed totals, which the fixture geometry (no ranking pin) reads as whole rows
+    of its 256 ids (248,320 = 970 x 256), so its draft head is their first 256 ids' shortlist."""
+    argv = run_args(built, built["calibration"], str(tmp_path / "work"))
+    at = argv.index("--ranking")
+    del argv[at:at + 2]
+    assert convert.main(argv) == 0
+    tree, record = read_tree(str(tmp_path / "work"))
+    assert record["ranking"] == {
+        "file": "ranking.totals.i64", "bytes": 1986560,
+        "sha256": "1e8fb35cd76655acac1cc422e2ef36e7dbedae567e04527ae433cf30b7dbd59f",
+        "origin": "ignis tools/27b-nvfp4-converter/data/ranking.totals.i64 (row 0 of ninfer's "
+                  "ranking.train.counts.i64: the totals)",
+        "tokenizer_ids": 256, "forced_special_ids": 6, "rows": 128}
+    ids, _ = checkpoint.draft_ids(checkpoint.TOTALS, built["checkpoint"], G)
+    stored = tree["text/draft_head_token_ids"][1]
+    assert stored == ids.astype("<i4").tobytes()
+    assert stored != read_tree(built["work"])[0]["text/draft_head_token_ids"][1]
+
+
 def test_the_packed_container_carries_a_sidecar_the_loader_reads(packed):
     """The packer took the tree (it checks every work file against the inventory and every recorded
     divisor against its file's trailing word, `docs/formats/27b-nvfp4-work-tree.md` §7) and wrote the

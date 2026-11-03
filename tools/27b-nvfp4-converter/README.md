@@ -20,9 +20,9 @@ fine-tune. Everything else is the served recipe's:
   16 elements, E2M1 rounded to nearest even) and the grouped W8/Q4/Q5/Q6 one, whose bytes are ninfer's
   (`test_encode.py` compares them when ninfer's checkout is on the machine);
 - the fixed calibration corpus: ten documents, 2,690 tokens of the 27B's tokenizer, one prefill;
-- the W8 token embedding and output head, the Q4 draft head of 131,072 rows picked by ninfer's committed
-  frequency ranking, the MTP layer, the vision tower in W8, Q4, Q5, Q6 and BF16, the norms and the GDN small set
-  as the checkpoint holds them, the six frontend resources byte for byte;
+- the W8 token embedding and output head, the Q4 draft head of 131,072 rows picked by ninfer's frequency
+  ranking (its total row, carried in `data/`), the MTP layer, the vision tower in W8, Q4, Q5, Q6 and BF16,
+  the norms and the GDN small set as the checkpoint holds them, the six frontend resources byte for byte;
 - the 66 DFlash2 objects, encoded weight-only from the base's drafter (`incoai/Qwen3.8-27B-DFlash2` at
   `dedf8df6`), trained for the base and used unchanged for every fine-tune.
 
@@ -40,6 +40,7 @@ fine-tune. Everything else is the served recipe's:
 | `shards.py` | Safetensors reads that keep at most one shard open; headers read without a handle. |
 | `container.py` | Read-only access to a `.ninfer` v2 container (copied from `tools/27b-16gb-converter`). |
 | `work.py` | The DONE protocol the packer checks (copied from `tools/image-converter`). |
+| `data/ranking.totals.i64` | The draft head's ranking, `--ranking`'s default: row 0 of ninfer's `ranking.train.counts.i64`, the totals. `data/README.md` gives its provenance and licence. |
 | `test_*.py`, `conftest.py` | The tests (CPU only) on a reduced synthetic checkpoint, and the machine-local checks of the real sources. |
 
 ## The Python environment
@@ -63,9 +64,11 @@ F:/ai/ngram-venv/Scripts/python.exe -m pytest tools/27b-nvfp4-converter -q
   checkpoint at narrow widths, three shards cut through layers, a word-level tokenizer of 256 ids, download
   records), the base's drafter at those widths and a ranking, on the CPU: the calibration equals the whole
   model's forward; the work tree holds the inventory under the weights id, every NVFP4 parent encoded from its
-  BF16 rows beside its calibrated divisor; every refusal below, by name, with nothing written; at most one
-  safetensors handle open, in calibration, conversion, `verify` and `compare`; the encoders give the same bytes
-  a block of rows at a time as at once.
+  BF16 rows beside its calibrated divisor; without `--ranking`, the draft head's rows from the committed totals;
+  every refusal below, by name, with nothing written; at most one safetensors handle open, in calibration,
+  conversion, `verify` and `compare`; the encoders give the same bytes a block of rows at a time as at once.
+  The committed totals' size and sha256 are their pin, and at the 27B's geometry a ranking matching neither pin
+  is refused.
 - The packed artifact (the packer's own checks of the tree, then the sidecar's fields the loader's checksum
   verification reads), `verify`, passing and failing by name, and `compare` need the packer binary:
   `IGNIS_ARTIFACT_PACK`, else this checkout's `target/**/ignis-artifact-pack.exe`. They skip, saying so,
@@ -76,12 +79,14 @@ F:/ai/ngram-venv/Scripts/python.exe -m pytest tools/27b-nvfp4-converter -q
   refusals.
 - Machine-local, skipped where absent: the 27B inventory is the served artifact's directory, object for object;
   the base and Swift checkpoints on H: pass the cheap checks; the corpus is 2,690 tokens of the 27B's
-  tokenizer; ninfer's ranking is the pinned one; the encoders' bytes are ninfer's; the served recipe's
+  tokenizer; ninfer's ranking is pinned and the committed totals are its first row, and both give the base
+  checkpoint's draft head the same 131,072 ids; the encoders' bytes are ninfer's; the served recipe's
   third-party parents are ninfer's `SOURCE_NVFP4_WEIGHT_SPECS`; and **#469's real-artifact test**: the 765
   tier-1 objects the recipe makes of the base checkpoint on the CPU (`H:/models/Qwen3.8-27B`, every object but
-  the drafter's) are the served artifact's byte for byte, and so are the 66 DFlash2 objects of the drafter
-  (`H:/models/Qwen3.8-27B-DFlash2`), a test that also skips until the drafter's file is there and hashes to its
-  LFS oid; one of the 135 parents ninfer encoded itself re-encodes byte-equal. Measured here, each test alone
+  the drafter's, the draft head's ids from the committed totals) are the served artifact's byte for byte, and so
+  are the 66 DFlash2 objects of the drafter (`H:/models/Qwen3.8-27B-DFlash2`), a test that also skips until
+  the drafter's file is there and hashes to its LFS oid; one of the 135 parents ninfer encoded itself re-encodes
+  byte-equal. Measured here, each test alone
   (`pytest -s` prints the cost): the 765 take 25-30 s and peak at 6.6 GiB working set and 10.7 GiB commit; the
   66 take 94 s, the drafter's hash included, and peak at 8.1 GiB working set and 11.4 GiB commit. Both are the
   whole process's peaks, and the open file's mapping counts in them (a shard up to 4 GB, the drafter 3.8 GB).
@@ -99,9 +104,11 @@ initialized.
 - **The drafter** (`--dflash2`): `config.json` and `model.safetensors` of `incoai/Qwen3.8-27B-DFlash2` at
   `dedf8df68adfb1afeaf7b7480c0a0243108177b4`, with their download records; the file's SHA-256 its LFS oid
   (`67fc76d6...`), its configuration and its 81 tensors the base's drafter's.
-- **The ranking** (`--ranking`): ninfer's `tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64`
-  (11,919,360 bytes, sha256 `c692dc76...`, pinned); its total row picks the draft head's rows over the
-  tokenizer's 248,077 ids, the special ones forced in. It stays in ninfer's checkout; ignis does not carry it.
+- **The ranking** (`--ranking`, optional): by default `data/ranking.totals.i64`, the total row of ninfer's
+  `tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64` (1,986,560 bytes, sha256 `1e8fb35c...`, pinned;
+  `data/README.md`); `--ranking` also takes ninfer's whole file (11,919,360 bytes, sha256 `c692dc76...`, pinned),
+  whose row 0 gives the same ids. The total row picks the draft head's rows over the tokenizer's 248,077 ids, the
+  special ones forced in. `converter.json` names the file used.
 - **The calibration** (`--calibration`): the record `calibrate` writes from the same checkpoint.
 - **The labels**: `--weights-id` (the build's own; `nvfp4full`, the served artifact's, is refused),
   `--source-repo`, `--source-revision`, `--license` (the identifier the catalog names, ADR 0078). They go into
@@ -134,7 +141,6 @@ F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-nvfp4-converter/convert.py run 
     --checkpoint H:/models/Qwen3.8-27B --source-repo Qwen/Qwen3.8-27B \
     --source-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 --license apache-2.0 \
     --dflash2 H:/models/Qwen3.8-27B-DFlash2 \
-    --ranking F:/ai/q38/ninfer/tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64 \
     --calibration H:/nvfp4-469/calibration.json --weights-id nvfp4full-local-469 --work H:/nvfp4-469/work
 
 # 3. packing (CPU): the container, 19,406,942,468 bytes, and its .conversion.json
@@ -147,7 +153,6 @@ target/x86_64-pc-windows-msvc/release/ignis-artifact-pack.exe --family qwen3.8-2
 F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-nvfp4-converter/convert.py verify \
     --artifact H:/nvfp4-469/qwen3_8_27b_nvfp4full-v2-local-469.ninfer \
     --checkpoint H:/models/Qwen3.8-27B --dflash2 H:/models/Qwen3.8-27B-DFlash2 \
-    --ranking F:/ai/q38/ninfer/tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64 \
     --calibration H:/nvfp4-469/calibration.json --weights-id nvfp4full-local-469 --report H:/nvfp4-469/verify.json
 
 # 5. #469 only, CPU: the scratch artifact against the served one, in three tiers (`compare` below)
@@ -181,7 +186,8 @@ Refused (exit 2), naming what failed and writing nothing:
 - a file with no download record, files from two revisions or from another revision than `--source-revision`, a
   shard whose record holds no LFS oid or whose SHA-256 is not its oid, a small file that is not its git blob;
 - a drafter at another revision, or whose configuration or tensors are not the base's drafter's;
-- a ranking whose sha256 is not the pinned one, a tokenizer whose id count is not the 27B's;
+- a ranking whose sha256 is neither pin (the committed totals', ninfer's whole file's), a tokenizer whose id
+  count is not the 27B's;
 - a calibration measured on another checkpoint (another revision or another shard's LFS oid), over another
   corpus, or that does not cover the 247 sites with finite positive binary32 divisors;
 - a recipe other than the local-only one: its route counts (6 resources, 247 local NVFP4 parents, 247
@@ -204,7 +210,8 @@ The converter's half of the sidecar (`docs/formats/27b-nvfp4-work-tree.md` §6),
 - `schema`, `status` (`complete`), `recipe_id` (`qwen3_8_27b_nvfp4full-v2-local`: the sidecar's, never the
   file name's), `identity` (`qwen3.8-27b` and the `--weights-id`), `geometry`, `device`;
 - `source`: `repo`, `revision`, `license` and `files`, every checkpoint file read by bytes and sha256;
-- `drafter`: its repository, revision, files and configuration; `ranking`: its file, bytes, sha256 and origin,
+- `drafter`: its repository, revision, files and configuration; `ranking`: the file used (the committed
+  `ranking.totals.i64` or ninfer's `ranking.train.counts.i64`), its bytes, sha256 and origin,
   the tokenizer's id count, the forced special ids and the rows;
 - `calibration`: the record's sha256 and its provenance (corpus, encoder profile, GDN rule, device, versions);
 - `recipe`: the route counts; `local_nvfp4`: the encoder profile and the 281 NVFP4 parents, each text parent
