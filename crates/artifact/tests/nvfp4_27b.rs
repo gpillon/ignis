@@ -629,3 +629,31 @@ fn the_pack_binary_names_the_family_and_needs_a_weights_id_and_an_out() {
     let reader = Reader::open(&artifact).unwrap();
     assert_eq!((reader.identity().model_id.as_str(), reader.identity().weights_id.as_str()), ("qwen3.8-27b", WEIGHTS_ID));
 }
+
+/// The 27B families have no Flash-Next geometry: the NVFP4 one takes its own
+/// `--geometry` and refuses `--layers` and `--experts`, the trellis one all three.
+#[test]
+fn the_pack_binary_refuses_flash_next_flags_for_the_27b_families() {
+    let scratch = Scratch::new("binary-flags");
+    let artifact = scratch.0.join(ARTIFACT);
+    for (family, flag, refused) in [
+        ("qwen3.8-27b-nvfp4", ["--layers", "2"], "--layers and --experts are Flash-Next's, not this --family's"),
+        ("qwen3.8-27b-nvfp4", ["--experts", "2"], "--layers and --experts are Flash-Next's, not this --family's"),
+        ("qwen3.8-27b-trellis", ["--geometry", "fixture"], "--layers, --experts and --geometry are Flash-Next's, not this --family's"),
+        ("qwen3.8-27b-trellis", ["--layers", "2"], "--layers, --experts and --geometry are Flash-Next's, not this --family's"),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_ignis-artifact-pack"))
+            .arg("--work")
+            .arg(scratch.0.join("work"))
+            .args(["--family", family, "--out"])
+            .arg(&artifact)
+            .args(["--weights-id", WEIGHTS_ID])
+            .args(flag)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{family} {flag:?}: {stderr}");
+        assert!(stderr.starts_with(&format!("{refused}\n")), "{family} {flag:?}: {stderr}");
+    }
+    assert!(!artifact.exists());
+}

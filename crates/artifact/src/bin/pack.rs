@@ -135,21 +135,16 @@ fn main() {
         (Family::Main | Family::Mtp { .. }, None | Some("qwen3.8-flash-next")) => FlashNextGeometry::qwen38_flash_next(),
         (Family::Main | Family::Mtp { .. }, Some("fixture")) => FlashNextGeometry::fixture(),
         (Family::Main | Family::Mtp { .. }, Some(_)) => usage_error("--geometry takes qwen3.8-flash-next or fixture"),
-        (Family::QwenImage21 | Family::Qwen27bTrellis, Some(_)) => {
-            usage_error("--layers, --experts and --geometry are Flash-Next's, not this --family's")
-        }
+        (Family::QwenImage21 | Family::Qwen27bTrellis, Some(_)) => not_flash_next(FLASH_NEXT_FLAGS),
         // unused by the other families
         _ => FlashNextGeometry::qwen38_flash_next(),
     };
     if layers.is_some() || experts.is_some() {
         match family {
             Family::Main | Family::Mtp { .. } => {}
-            Family::Qwen27bNvfp4 { .. } => usage_error("--layers and --experts are Flash-Next's, not this --family's"),
-            _ => usage_error("--layers, --experts and --geometry are Flash-Next's, not this --family's"),
+            Family::Qwen27bNvfp4 { .. } => not_flash_next("--layers and --experts"),
+            _ => not_flash_next(FLASH_NEXT_FLAGS),
         }
-    }
-    if matches!(family, Family::Qwen27bNvfp4 { .. }) && weights_id.is_none() {
-        usage_error("--family qwen3.8-27b-nvfp4 needs --weights-id: it is what tells one build of the layout from another");
     }
     let artifact = match out {
         Some(out) => out,
@@ -176,9 +171,10 @@ fn main() {
         Family::Main => PackOptions::new(work_dir, artifact, geometry),
         Family::QwenImage21 => PackOptions::qwen_image(work_dir, artifact),
         Family::Qwen27bTrellis => PackOptions::trellis_27b(work_dir, artifact),
-        Family::Qwen27bNvfp4 { geometry } => {
-            PackOptions::nvfp4_27b(work_dir, artifact, weights_id.as_deref().unwrap_or_default(), geometry)
-        }
+        Family::Qwen27bNvfp4 { geometry } => match weights_id.as_deref() {
+            Some(id) => PackOptions::nvfp4_27b(work_dir, artifact, id, geometry),
+            None => usage_error("--family qwen3.8-27b-nvfp4 needs --weights-id: it is what tells one build of the layout from another"),
+        },
     };
     if let Some(mib) = header_mib {
         options.header_bytes = match mib.checked_mul(1 << 20) {
@@ -233,4 +229,12 @@ fn positive(value: Option<String>, flag: &str) -> u64 {
 fn usage_error(message: &str) -> ! {
     eprintln!("{message}\n{USAGE}");
     std::process::exit(2);
+}
+
+/// Flash-Next's own flags, which a family without its geometry refuses.
+const FLASH_NEXT_FLAGS: &str = "--layers, --experts and --geometry";
+
+/// Refuses `flags` for a family that has no Flash-Next geometry.
+fn not_flash_next(flags: &str) -> ! {
+    usage_error(&format!("{flags} are Flash-Next's, not this --family's"))
 }

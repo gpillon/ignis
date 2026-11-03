@@ -5,14 +5,20 @@
 //!
 //! The 1,325 objects are the served artifact's, in its directory order:
 //! - `frontend/`: the six resources of [`FRONTEND_FILES`];
-//! - `text/`: ignis's 27B text scope ([`crate::inventory::text_scope_27b`],
-//!   the positional BF16 exceptions on the early attention and GDN layers
-//!   included), then the draft head pair
-//!   ([`crate::inventory::draft_head_scope_27b`]);
+//! - `text/`: ignis's 27B text scope (the positional BF16 exceptions on the
+//!   early attention and GDN layers included), then the draft head pair;
 //! - `mtp/`: the checkpoint's MTP layer, W8 and BF16 (ignis binds none of
 //!   it; the container carries it as the served one does);
-//! - `vision/`: the tower ([`crate::inventory::vision_scope_27b`]);
-//! - `dflash2/`: the drafter module ([`crate::inventory::dflash2_scope_27b`]).
+//! - `vision/`: the tower;
+//! - `dflash2/`: the drafter module.
+//!
+//! [`inventory()`] does not call `crate::inventory`'s templates, which are
+//! fixed at the 27B's widths: it restates them with a [`Geometry`] argument
+//! (`text/` as [`crate::inventory::text_scope_27b`] and
+//! [`crate::inventory::draft_head_scope_27b`], `vision/` as
+//! [`crate::inventory::vision_scope_27b`], `dflash2/` as
+//! [`crate::inventory::dflash2_scope_27b`]), and `tests/nvfp4_27b.rs` holds
+//! the two equal, object for object, at the served geometry.
 //!
 //! The inventory is generated from a [`Geometry`]: the 27B's
 //! ([`Geometry::qwen3_8_27b`]), or the converter's reduced synthetic
