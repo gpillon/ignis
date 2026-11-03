@@ -71,7 +71,7 @@ you download.
 card:
 
 ```
-swift-1.5-27b-16g: license swift-open-license-1.0: https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/LICENSE
+swift-1.5-27b-16g: license swift-open-license-1.0: https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/3fe94555a30b3df89a283bf61338281243642166/LICENSE
 ```
 
 No step asks to accept it: whoever downloads is bound by it, as with any

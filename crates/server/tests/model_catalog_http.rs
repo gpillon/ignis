@@ -156,11 +156,11 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
     // each entry's repo at its pinned revision.
     assert_eq!(
         row(&rows, "swift-1.5-27b")["license"],
-        json!({ "id": "swift-open-license-1.0", "url": "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/LICENSE" })
+        json!({ "id": "swift-open-license-1.0", "url": "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/890d5744d116caff2ee6746285bf839da175a63e/LICENSE" })
     );
     assert_eq!(
         row(&rows, "swift-1.5-27b-16g")["license"],
-        json!({ "id": "swift-open-license-1.0", "url": "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/LICENSE" })
+        json!({ "id": "swift-open-license-1.0", "url": "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/3fe94555a30b3df89a283bf61338281243642166/LICENSE" })
     );
 
     let full = row(&rows, "acme-full");

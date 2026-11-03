@@ -117,11 +117,11 @@ models:
   # Pinned to the upload's hub commit.
   - id: swift-1.5-27b
     repo: gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis
-    revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    revision: "890d5744d116caff2ee6746285bf839da175a63e"
     artifact: qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer
     card_class: 32
     family: qwen3.8-27b
-    license: { id: swift-open-license-1.0, url: "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/LICENSE" }
+    license: { id: swift-open-license-1.0, url: "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/890d5744d116caff2ee6746285bf839da175a63e/LICENSE" }
     files:
       - { name: qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer.conversion.json, bytes: 51122, sha256: "3cf455bb5943d26027a5c7a436405a915992ec7e5819bc029a522ead28c708fb" }
       - { name: qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer, bytes: 19410923780, sha256: "c387c6d019b1e6a42f9e1bb1c2864cee29ea4f501db9de27eedfdfd8248b8912" }
@@ -134,12 +134,12 @@ models:
   # 16 GB card. Pinned to the upload's hub commit.
   - id: swift-1.5-27b-16g
     repo: gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis
-    revision: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    revision: "3fe94555a30b3df89a283bf61338281243642166"
     artifact: qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer
     card_class: 16
     family: qwen3.8-27b
     aliases: [swift-1.5-27b]
-    license: { id: swift-open-license-1.0, url: "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/LICENSE" }
+    license: { id: swift-open-license-1.0, url: "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/3fe94555a30b3df89a283bf61338281243642166/LICENSE" }
     files:
       - { name: qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer.conversion.json, bytes: 308144, sha256: "c3116f23756f7c759d84616cf78486618d424ecc5001bfd823c3ddf08cbb3d2d" }
       - { name: qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer, bytes: 13379877124, sha256: "3a039cb76d2291e3c68f8df5f7b37ac3e83981eb8090625f8a730a670bab63df" }

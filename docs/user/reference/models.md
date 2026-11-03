@@ -23,8 +23,8 @@ The models the server knows how to fetch without an operator catalog. Each is pi
 | [`ignis-image-2.1-turbo`](#ignis-image-21-turbo) | [`gpillon/ignis-image-2.1-turbo`](https://huggingface.co/gpillon/ignis-image-2.1-turbo) | 15.6 GiB | [`qwen-research`](https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/LICENSE) | `ignis_image_2_1_turbo-v2.ninfer` |
 | [`qwen3.8-27b-16g`](#qwen38-27b-16g) | [`gpillon/Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis/blob/f5bbd2cc14c9ca573ef5553c100ac69410f1fe58/LICENSE) | `qwen3_8_27b_trellis_sc30-v2.ninfer` |
 | [`qwen3.8-27b-abliterated-16g`](#qwen38-27b-abliterated-16g) | [`gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis) | 12.5 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis/blob/94a8bfc0f47ce86403f274be03e2c0f79500727c/LICENSE) | `qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer` |
-| [`swift-1.5-27b`](#swift-15-27b) | [`gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis) | 18.1 GiB | [`swift-open-license-1.0`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/LICENSE) | `qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer` |
-| [`swift-1.5-27b-16g`](#swift-15-27b-16g) | [`gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB | [`swift-open-license-1.0`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/LICENSE) | `qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer` |
+| [`swift-1.5-27b`](#swift-15-27b) | [`gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis) | 18.1 GiB | [`swift-open-license-1.0`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/890d5744d116caff2ee6746285bf839da175a63e/LICENSE) | `qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer` |
+| [`swift-1.5-27b-16g`](#swift-15-27b-16g) | [`gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB | [`swift-open-license-1.0`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/3fe94555a30b3df89a283bf61338281243642166/LICENSE) | `qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer` |
 | [`qwen3-asr-1.7b`](#qwen3-asr-17b) | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 1.5 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE) | `Qwen3-ASR-1.7B-Q4_K_M.gguf` |
 | [`qwen3-asr-1.7b-q8`](#qwen3-asr-17b-q8) | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 2.3 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE) | `Qwen3-ASR-1.7B-Q8_0.gguf` |
 | [`qwen3-asr-0.6b`](#qwen3-asr-06b) | [`gpillon/Qwen3-ASR-0.6B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis) | 0.9 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis/blob/af02916ea7a532a667a907c2a163b16a8c04b433/LICENSE) | `Qwen3-ASR-0.6B-Q8_0.gguf` |
@@ -88,7 +88,7 @@ The models the server knows how to fetch without an operator catalog. Each is pi
 
 ## swift-1.5-27b
 
-[`gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis) at revision `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`, 19,410,974,902 bytes in 2 files.
+[`gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis) at revision `890d5744d116caff2ee6746285bf839da175a63e`, 19,410,974,902 bytes in 2 files.
 
 | File | Bytes | SHA-256 |
 |---|---|---|
@@ -97,7 +97,7 @@ The models the server knows how to fetch without an operator catalog. Each is pi
 
 ## swift-1.5-27b-16g
 
-[`gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis) at revision `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`, 13,380,185,268 bytes in 2 files.
+[`gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis) at revision `3fe94555a30b3df89a283bf61338281243642166`, 13,380,185,268 bytes in 2 files.
 
 | File | Bytes | SHA-256 |
 |---|---|---|

@@ -955,7 +955,7 @@ mod tests {
         (
             "swift-1.5-27b",
             "gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "890d5744d116caff2ee6746285bf839da175a63e",
             "qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer",
             32,
             ModelFamily::Qwen38_27b,
@@ -973,7 +973,7 @@ mod tests {
         (
             "swift-1.5-27b-16g",
             "gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis",
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "3fe94555a30b3df89a283bf61338281243642166",
             "qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer",
             16,
             ModelFamily::Qwen38_27b,
@@ -1403,8 +1403,8 @@ mod tests {
             ("ignis-image-2.1-turbo", "qwen-research", "https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/LICENSE"),
             ("qwen3.8-27b-16g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis/blob/f5bbd2cc14c9ca573ef5553c100ac69410f1fe58/LICENSE"),
             ("qwen3.8-27b-abliterated-16g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis/blob/94a8bfc0f47ce86403f274be03e2c0f79500727c/LICENSE"),
-            ("swift-1.5-27b", "swift-open-license-1.0", "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/LICENSE"),
-            ("swift-1.5-27b-16g", "swift-open-license-1.0", "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/LICENSE"),
+            ("swift-1.5-27b", "swift-open-license-1.0", "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/890d5744d116caff2ee6746285bf839da175a63e/LICENSE"),
+            ("swift-1.5-27b-16g", "swift-open-license-1.0", "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/3fe94555a30b3df89a283bf61338281243642166/LICENSE"),
             ("qwen3-asr-1.7b", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE"),
             ("qwen3-asr-1.7b-q8", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE"),
             ("qwen3-asr-0.6b", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis/blob/af02916ea7a532a667a907c2a163b16a8c04b433/LICENSE"),
