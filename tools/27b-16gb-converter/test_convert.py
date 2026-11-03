@@ -657,10 +657,17 @@ def test_a_served_artifact_whose_sidecar_is_a_conversion_record_is_taken(tmp_pat
     assert record["local_nvfp4"]["encoder_profile"] == "NVFP4_MAXABS_DIVISOR_RNE_V1"
     assert record["served"]["conversion_sidecar"] == {
         "file": "qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer.conversion.json",
-        "sha256": _sha(src["served"] + ".conversion.json"), "recipe_id": "qwen3_8_27b_nvfp4full-v2"}
-    # no graft to describe, and nothing else of the served record (its local paths) is carried
+        "sha256": _sha(src["served"] + ".conversion.json"), "recipe_id": "qwen3_8_27b_nvfp4full-v2-local"}
+    # no graft to describe, and nothing else of the served record is carried: the NVFP4 build's source,
+    # revision and license are read through the sidecar pinned above, the record's own are the labels'
     assert "graft" not in record and "graft_sidecar" not in record["served"]
-    assert "H:/models" not in json.dumps(record)
+    with open(src["served"] + ".conversion.json", encoding="utf-8") as f:
+        served_source = json.load(f)["source"]
+    text = json.dumps(record)
+    for value in served_source.values():
+        assert value not in text, value
+    assert (record["source"]["license"], record["reference"]["repo"]) == (convert.LABELS["license"],
+                                                                         convert.LABELS["bf16_repo"])
 
 
 def test_with_both_sidecars_the_graft_record_is_read_as_the_loader_reads_it(tmp_path):

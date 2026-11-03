@@ -284,9 +284,8 @@ def make_fine_tune_served(src, sidecar="conversion", weights_id=FINE_TUNE_SERVED
             g.write(f.read())
     else:
         record = {"identity": {"model_id": "qwen3.8-27b", "weights_id": weights_id},
-                  "license": "swift-open-license-1.0",
-                  "source": {"repo": "someone/fine-tune", "revision": "a" * 40, "model_path": "H:/models/fine-tune"},
-                  "recipe_id": "qwen3_8_27b_nvfp4full-v2",
+                  "source": {"repo": "someone/fine-tune", "revision": "a" * 40, "license": "swift-open-license-1.0"},
+                  "recipe_id": "qwen3_8_27b_nvfp4full-v2-local",
                   "artifact": {"bytes": os.path.getsize(path)},
                   "objects": {"count": len(objects)},
                   "local_nvfp4": {"encoder_profile": "NVFP4_MAXABS_DIVISOR_RNE_V1", "parents": {

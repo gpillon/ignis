@@ -294,8 +294,13 @@ refuses the tree, naming the field, without them:
 | `objects.count` | the packer: 1,325 | the loader's checksum verification |
 | `local_nvfp4.parents.<name>.weight_scale_divisor` | `converter.json`, checked against the work files | the loader's checksum verification: each recorded divisor must equal the container's trailing FP32 word, a `null` one is a presence check |
 | `local_nvfp4` (the `dflash2/` records) | `converter.json` | the 16 GB converter (#465, `--served-weights-id`), which copies the drafter's records into its own sidecar |
-| `source` (`repo`, `revision`, `license`), `objects` | `converter.json`, the packer | the 16 GB converter, which carries them into its record; the hub card |
+| `source` (`repo`, `revision`, `license`), `objects` | `converter.json`, the packer | the hub card; the 16 GB converter copies neither, it pins this sidecar (below) |
 | `identity` | `converter.json`, the run's | whoever reads the sidecar without the container |
+
+The 16 GB converter's record names this build by reference: its `served` pins the artifact by file, bytes
+and SHA-256 and this sidecar by file and SHA-256 with its `recipe_id` (`served.conversion_sidecar`), so the
+NVFP4 build's source, revision and license are read from the sidecar it pins. The fine-tune's own license and
+its BF16 repository and revision are in that record's `source.license` and `reference`.
 
 The loader finds the sidecar beside the artifact as `<artifact>.conversion.json` (a served artifact
 may carry a `.graft.json` instead) and refuses a load whose verification is not clean.
