@@ -600,7 +600,9 @@ One published model: its served id, repo, revision, the artifact to load, every
 file it needs with its byte count and SHA-256 pinned, the smallest **card
 class** it loads on (`card_class`, optional: an entry stating none is never
 refused by class; every built-in text and image model states it, while the
-speech models and the diarizer, which run on the CPU, state none), the
+speech models and the diarizer, which run on the CPU, state none), the oldest
+**GPU generation** it loads on (`generation`, optional: an entry stating none
+loads on every generation the build runs on), the
 **aliases** it may answer to (ADR 0064), its **model family** when
 neither its id nor its aliases name one (`family`, ADR 0074), and the license
 its weights are published under (`license`: the license's identifier and a link
@@ -1422,15 +1424,36 @@ cache's floor, `Only(27B)` for vision). An explicit value for a family that
 cannot take it is refused at start and dropped, with a log line, on a switch;
 a value equal to the field's default is neither.
 
+**GPU generation**:
+The family of NVIDIA cards whose features the kernels and routes are reasoned
+about by: Ampere (RTX 30, compute capability 8.6), Ada (RTX 40, 8.9) and
+Blackwell (RTX 50 and RTX PRO, 12.0). The word a user meets.
+_Avoid_: architecture (the glossary's word for a **model family**), arch.
+
+**Compute capability**:
+The version a card reports to CUDA (`8.6`, `12.0`), read at start. It says
+whose machine code runs on the card and which routes the server takes there.
+
+**CUDA architecture**:
+One target the kernel leaf is compiled for (`86`, `120a`), as
+`IGNIS_CUDA_ARCHITECTURES` names it. Plain code runs on every compute
+capability of its major from its own up; an arch-specific `a` target runs on
+its own alone. A start on a card none of the build's entries runs on is
+refused by name.
+_Avoid_: arch, SM version.
+
 **Card class**:
-The device memory a profile is shaped for: 32 GB (RTX 5090), 96 GB (RTX PRO
-6000), 16 GB (RTX 5060 Ti / 5070 Ti / 5080). It decides which artifact, how
-many lanes and what context the profile defaults to.
+The device memory a profile is shaped for: 16 GB (RTX 5060 Ti / 5070 Ti /
+5080, RTX 4060 Ti 16 GB / 4080), 24 GB (RTX 3090, RTX 4090), 32 GB (RTX 5090),
+96 GB (RTX PRO 6000). Memory alone: the **GPU generation** is a separate axis
+that decides routes, never the class. It decides which artifact, how many
+lanes and what context the profile defaults to.
 _Avoid_: GPU tier.
 
 **Profile**:
 A named bundle of hardware-shaped field defaults (`--profile`, built-in
-`rtx50-16gb`, `rtx5090` or `rtxpro6000`, or a config file's `profiles:`):
+`rtx-16gb` (also accepted as `rtx50-16gb`), `rtx-24gb`, `rtx5090` or
+`rtxpro6000`, or a config file's `profiles:`):
 below the config file, above the hardcoded defaults — a default, never an
 override. `auto`, the default, picks the built-in profile of the card's **card
 class** from NVML's total memory (ADR 0063); a named profile always wins.

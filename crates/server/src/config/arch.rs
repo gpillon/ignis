@@ -333,7 +333,7 @@ mod tests {
     }
 
     /// The default build (`120a`) runs on 12.0 alone: not on the RTX 40 and
-    /// 30, not on the DGX Spark's 12.1, not on a datacenter Hopper.
+    /// 30, not on the DGX Spark's 12.1, not on any other capability.
     #[test]
     fn the_default_build_covers_12_0_alone() {
         let built = BuiltArchitectures::default_build();
