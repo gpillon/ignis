@@ -573,6 +573,14 @@ same family (ADR 0064, ADR 0074). It resolves only within
 one model family — the entry that answers to it holds an artifact whose header
 names that family — and only to an entry the card can load.
 
+**Fine-tune**:
+A catalog entry of a model family whose weights are another party's
+post-training of the family's checkpoint: the same family, told apart by its
+served id, and published under its own license, which may not be the family's.
+The **uncensored variant** is the fine-tune whose post-training is an
+abliteration.
+_Avoid_: finetuned model (the upstream checkpoint), variant (alone)
+
 **Uncensored variant**:
 A catalog entry of a model family whose weights carry an abliteration of the
 refusal direction: the same family, told apart by its served id, and it does
@@ -593,9 +601,11 @@ file it needs with its byte count and SHA-256 pinned, the smallest **card
 class** it loads on (`card_class`, optional: an entry stating none is never
 refused by class; every built-in text and image model states it, while the
 speech models and the diarizer, which run on the CPU, state none), the
-**aliases** it may answer to (ADR 0064), and its **model family** when
-neither its id nor its aliases name one (`family`, ADR 0074). An operator
-entry never reuses a built-in id.
+**aliases** it may answer to (ADR 0064), its **model family** when
+neither its id nor its aliases name one (`family`, ADR 0074), and the license
+its weights are published under (`license`: the license's identifier and a link
+to its text; every built-in entry states it, an operator entry may; ADR 0078). An
+operator entry never reuses a built-in id.
 
 **Endpoint**:
 The server a catalog entry's files are fetched from: Hugging Face by default,
