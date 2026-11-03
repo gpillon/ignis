@@ -90,6 +90,10 @@ fn main() {
     for file in KERNEL_BUILD_FILES {
         println!("cargo:rerun-if-changed={}", kernel_dir.join(file).display());
     }
+    // The CUDA architectures the leaf compiles for (GitHub #456): read by
+    // kernel/CMakeLists.txt from the environment the script inherits, so a
+    // change to it is a change to how the leaf is built.
+    println!("cargo:rerun-if-env-changed=IGNIS_CUDA_ARCHITECTURES");
 
     let windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
 

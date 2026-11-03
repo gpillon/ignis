@@ -873,6 +873,9 @@ target_compile_definitions(ignis_kernel_flash_next_sparse_attention_hq_test PRIV
 add_executable(ignis_mma_peak_bench bench_mma_peak.cu)
 target_include_directories(ignis_mma_peak_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_mma_peak_bench PRIVATE CUDA::cudart)
+# GitHub #456: its FP8 forms are the sm_120a set's (kernel/CMakeLists.txt), and so are the
+# image GEMM sweep's below.
+set_target_properties(ignis_mma_peak_bench PROPERTIES CUDA_ARCHITECTURES "${IGNIS_SM120A_ARCHITECTURES}")
 
 # GitHub #341: OURS -- the FP8 arms of the 27B's BF16 exception matrices (kernel/src/fp8_exception.h,
 # a leaf-internal header) through the public attn_input_proj / linear_add dispatch. GPU (ADR 0006).
@@ -894,11 +897,13 @@ add_executable(ignis_kernel_image_gemm_test test_image_gemm.cu image_gemm_sweep.
 target_include_directories(ignis_kernel_image_gemm_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_image_gemm_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_image_gemm_test COMMAND ignis_kernel_image_gemm_test)
+set_target_properties(ignis_kernel_image_gemm_test PROPERTIES CUDA_ARCHITECTURES "${IGNIS_SM120A_ARCHITECTURES}")
 # Its speed at the DiT's shapes (acceptance 2 "Speed") and the standalone quantization's cost
 # (acceptance 3). A timing is a finding: a tool, NOT registered with CTest.
 add_executable(ignis_image_gemm_bench bench_image_gemm.cu image_gemm_sweep.cu)
 target_include_directories(ignis_image_gemm_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_image_gemm_bench PRIVATE ignis_kernel ignis_vendor CUDA::nvml)
+set_target_properties(ignis_image_gemm_bench PROPERTIES CUDA_ARCHITECTURES "${IGNIS_SM120A_ARCHITECTURES}")
 # The 8-bit DiT attention (acceptance 4, kernel/include/ignis_image_attn.h; an adapted op): the
 # quantizers against their definitions, every call the DiT makes against fp64 on the same
 # quantized operands (a tight bound) and on the unquantized inputs (cosine per head). GPU

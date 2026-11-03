@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Build the ignis kernel leaf (CMake + Ninja + nvcc, SM120a) on Linux.
+# Build the ignis kernel leaf (CMake + Ninja + nvcc) on Linux, for the CUDA
+# architectures kernel/CMakeLists.txt reads from IGNIS_CUDA_ARCHITECTURES:
+# unset, 120a alone (GitHub #456; docs/user/contributing/building.md).
 #
 #   bash kernel/build.sh [build-dir] [--test]
 #
 # The Linux half of kernel/build.ps1: same generator, same build type, same
-# architecture, same canonical kernel/build output directory. There is no
+# architectures, same canonical kernel/build output directory. There is no
 # MSVC env to import here, so the script is only toolchain discovery plus the
 # two cmake calls.
 #
@@ -57,7 +59,6 @@ done
 cmake -S "$kernel" -B "$build_path" \
     -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_ARCHITECTURES=120a \
     -DCMAKE_CUDA_COMPILER="$nvcc" \
     -DCMAKE_C_COMPILER_LAUNCHER= \
     -DCMAKE_CXX_COMPILER_LAUNCHER= \
