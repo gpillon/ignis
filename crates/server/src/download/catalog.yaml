@@ -17,12 +17,17 @@
 # `qwen3.8-27b` on a 16 GB card. `family` (optional) is the model family an
 # entry is of, by the family's own id (ADR 0074): stated where an alias
 # involves an entry and neither its id nor its aliases is a family's own id.
+# `license` (required here, ADR 0078) is the license the entry's weights are
+# published under: `id` as the entry's Hugging Face card names it at the
+# pinned revision, `url` the license file in the entry's repo at that
+# revision when it holds one, else the license's canonical text.
 models:
   - id: qwen3.8-27b
     repo: gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer
     revision: "e961b419b672e183aa55df8c4b975abc82006e8a"
     artifact: qwen3_8_27b_nvfp4full-v2.ninfer
     card_class: 32
+    license: { id: apache-2.0, url: "https://www.apache.org/licenses/LICENSE-2.0" }
     files:
       - { name: qwen3_8_27b_nvfp4full-v2.ninfer.graft.json, bytes: 6981, sha256: "b87e3c005fb1daf7d6b208da52790f95a3f478732f767f87417a5d7fc23491d1" }
       - { name: qwen3_8_27b_nvfp4full-v2.ninfer, bytes: 19406942468, sha256: "abb1e120d5f1f32d61689604d238227ff579ab76cbd9319628f3b3904fffd9af" }
@@ -36,6 +41,7 @@ models:
     artifact: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer
     card_class: 32
     family: qwen3.8-27b
+    license: { id: apache-2.0, url: "https://www.apache.org/licenses/LICENSE-2.0" }
     files:
       - { name: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer.graft.json, bytes: 41707, sha256: "09b0df892c314563192b0a4f102139939d4ef6261fcd210439d4e2636d12e6fe" }
       - { name: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer, bytes: 19406942468, sha256: "18954280c794cb2ff1fc24ada8158de1df11bf0a0a2ea63f109045af48905ef1" }
@@ -48,6 +54,7 @@ models:
     revision: "8d94db83cd8e58d6be31e796723e5e35b960638c"
     artifact: qwen3_8_flash_next_trellis_a25-v2.ninfer
     card_class: 32
+    license: { id: qwen-community-1.0, url: "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/8d94db83cd8e58d6be31e796723e5e35b960638c/LICENSE" }
     files:
       - { name: qwen3_8_flash_next_mtp_3p0-v2.ninfer.conversion.json, bytes: 179029, sha256: "a5b2c10fe0745cfe6b8e2914135e44903cfb80acb3f0db21e549e76641f14127" }
       - { name: qwen3_8_flash_next_trellis_a25-v2.ninfer.conversion.json, bytes: 1183942, sha256: "9858d9fb03dd66fa2558b5dc6aa6463ee70f00024ffbd746545b231c9514f7a0" }
@@ -63,6 +70,7 @@ models:
     revision: "d6912417aa47320cd71c78e19d99872faa5cb63b"
     artifact: ignis_image_2_1_turbo-v2.ninfer
     card_class: 32
+    license: { id: qwen-research, url: "https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/LICENSE" }
     files:
       - { name: ignis_image_2_1_turbo-v2.ninfer.conversion.json, bytes: 617924, sha256: "a97f04912b9a6d76e828efc02b7e458d0f45d00bc00d794cca39d703ad0f33ca" }
       - { name: ignis_image_2_1_turbo-v2.ninfer, bytes: 16721644544, sha256: "4205dd1932f0801804b0a544fe1340697e4e0a0dea4a276996bcb981006050af" }
@@ -77,6 +85,7 @@ models:
     artifact: qwen3_8_27b_trellis_sc30-v2.ninfer
     card_class: 16
     aliases: [qwen3.8-27b]
+    license: { id: apache-2.0, url: "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis/blob/f5bbd2cc14c9ca573ef5553c100ac69410f1fe58/LICENSE" }
     files:
       - { name: qwen3_8_27b_trellis_sc30-v2.ninfer.conversion.json, bytes: 309495, sha256: "210ab54bfe8b04e5fc4337ee3755c340ea3f21239aa625c505aa2406645a340d" }
       - { name: qwen3_8_27b_trellis_sc30-v2.ninfer, bytes: 13379877124, sha256: "2c4c9ee4d6b25c08da6c2d85840126e73d120564e230f926b6230b5b95ee8b3c" }
@@ -94,9 +103,46 @@ models:
     card_class: 16
     family: qwen3.8-27b
     aliases: [qwen3.8-27b-abliterated]
+    license: { id: apache-2.0, url: "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis/blob/94a8bfc0f47ce86403f274be03e2c0f79500727c/LICENSE" }
     files:
       - { name: qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer.conversion.json, bytes: 339543, sha256: "b5b61863b218bf722e4786ec8ca5e7ffde03548068f92184f10ecd95f6fd0f61" }
       - { name: qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer, bytes: 13379877124, sha256: "4929bc8e1fbc747092f96aebae6b81a0b619db452d05a56df3499fbe1afe9ac5" }
+
+  # Swift 1.5, UkisAI's post-training of the 27B: a fine-tune of the 27B's
+  # family (spec #449, GitHub #473), under the Swift Open License v1.0, which
+  # leaves commercial use above its revenue threshold unlicensed (ADR 0078).
+  # The NVFP4 artifact the 27B NVFP4 converter built from Swift's BF16, every
+  # matrix encoded and every divisor calibrated locally, under its own weights
+  # id (GitHub #470). Its id names no family, so it states it (ADR 0074).
+  # Pinned to the upload's hub commit.
+  - id: swift-1.5-27b
+    repo: gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis
+    revision: "890d5744d116caff2ee6746285bf839da175a63e"
+    artifact: qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer
+    card_class: 32
+    family: qwen3.8-27b
+    license: { id: swift-open-license-1.0, url: "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/890d5744d116caff2ee6746285bf839da175a63e/LICENSE" }
+    files:
+      - { name: qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer.conversion.json, bytes: 51122, sha256: "3cf455bb5943d26027a5c7a436405a915992ec7e5819bc029a522ead28c708fb" }
+      - { name: qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer, bytes: 19410923780, sha256: "c387c6d019b1e6a42f9e1bb1c2864cee29ea4f501db9de27eedfdfd8248b8912" }
+
+  # Swift 1.5 for the 16 GB card class (spec #449, GitHub #473): the trellis
+  # body and head of a local exllamav3 conversion of Swift's BF16 at the
+  # 16 GB 27B's per-matrix bit widths, every other object the Swift NVFP4
+  # artifact's (GitHub #472). Its id and its alias name no family, so it
+  # states its own (ADR 0074); it answers to the 32 GB entry's served id on a
+  # 16 GB card. Pinned to the upload's hub commit.
+  - id: swift-1.5-27b-16g
+    repo: gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis
+    revision: "3fe94555a30b3df89a283bf61338281243642166"
+    artifact: qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer
+    card_class: 16
+    family: qwen3.8-27b
+    aliases: [swift-1.5-27b]
+    license: { id: swift-open-license-1.0, url: "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/3fe94555a30b3df89a283bf61338281243642166/LICENSE" }
+    files:
+      - { name: qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer.conversion.json, bytes: 308144, sha256: "c3116f23756f7c759d84616cf78486618d424ecc5001bfd823c3ddf08cbb3d2d" }
+      - { name: qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer, bytes: 13379877124, sha256: "3a039cb76d2291e3c68f8df5f7b37ac3e83981eb8090625f8a730a670bab63df" }
 
   # The speech models (ADR 0067, spec speech/01 §6, GitHub #351): the
   # Qwen3-ASR decoder and its audio encoder as GGUFs, converted by the owner
@@ -110,6 +156,7 @@ models:
     revision: "f8a5263e398c1b3606abedc6b9c74dcbced9f93f"
     artifact: Qwen3-ASR-1.7B-Q4_K_M.gguf
     kind: speech
+    license: { id: apache-2.0, url: "https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE" }
     files:
       - { name: mmproj-Qwen3-ASR-1.7B-Q8_0.gguf, bytes: 355709472, sha256: "f325a44bdbc23b2df78ed35ad6342da3aabf1e618e1a9ffd1ef8861cb3b1b0f6" }
       - { name: Qwen3-ASR-1.7B-Q4_K_M.gguf, bytes: 1282435136, sha256: "5c5f878af090a70b25dc7a0f1090620e734654e9eceb6f4ac4656423c243974c" }
@@ -119,6 +166,7 @@ models:
     revision: "f8a5263e398c1b3606abedc6b9c74dcbced9f93f"
     artifact: Qwen3-ASR-1.7B-Q8_0.gguf
     kind: speech
+    license: { id: apache-2.0, url: "https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE" }
     files:
       - { name: mmproj-Qwen3-ASR-1.7B-Q8_0.gguf, bytes: 355709472, sha256: "f325a44bdbc23b2df78ed35ad6342da3aabf1e618e1a9ffd1ef8861cb3b1b0f6" }
       - { name: Qwen3-ASR-1.7B-Q8_0.gguf, bytes: 2165035072, sha256: "9039c0cbbc13be5c25f2b34fcb70258f68f06b64f67a48831c7e13c72593e1e7" }
@@ -128,6 +176,7 @@ models:
     revision: "af02916ea7a532a667a907c2a163b16a8c04b433"
     artifact: Qwen3-ASR-0.6B-Q8_0.gguf
     kind: speech
+    license: { id: apache-2.0, url: "https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis/blob/af02916ea7a532a667a907c2a163b16a8c04b433/LICENSE" }
     files:
       - { name: mmproj-Qwen3-ASR-0.6B-Q8_0.gguf, bytes: 214392608, sha256: "ee5e87436bcf8b1c550edd4300fd0516067d55b547611734d27fbc55ecaec3bc" }
       - { name: Qwen3-ASR-0.6B-Q8_0.gguf, bytes: 804749376, sha256: "027ad3329549cd2c14e4ebd7d104e0390566e06570270c33062529474ec56015" }
@@ -139,5 +188,6 @@ models:
     revision: "d46d59d03be709db18e223b6bf92e8c32d14f422"
     artifact: Nemotron-3-Diarization-F16.gguf
     kind: diarizer
+    license: { id: openmdw-1.1, url: "https://huggingface.co/gpillon/Nemotron-3-Diarization-GGUF-ignis/blob/d46d59d03be709db18e223b6bf92e8c32d14f422/LICENSE" }
     files:
       - { name: Nemotron-3-Diarization-F16.gguf, bytes: 198805760, sha256: "f7a80981d178be5d683aee225166bc03806aac2d9b629f42f418d4e5fd2c8623" }

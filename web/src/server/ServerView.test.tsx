@@ -197,6 +197,35 @@ describe("ServerView: the model band", () => {
     expect(html).not.toMatch(/aria-label="Load qwen3\.8-flash-next" disabled=""/);
   });
 
+  // ADR 0078: the license beside each model, as a link to its text.
+  it("shows each catalog model's license identifier as a link to its text, and nothing where it states none", () => {
+    const html = render();
+    const item = (id: string) => html.split("<li").find((li) => li.includes(`>${id}</span>`)) ?? "";
+    expect(item("qwen3.8-flash-next")).toContain('<a href="https://huggingface.co/acme/flash/blob/abc/LICENSE"');
+    expect(item("qwen3.8-flash-next")).toMatch(/>qwen-community-1\.0<\/a>/);
+    expect(item("nemotron-3-diarization")).toMatch(/href="https:\/\/openmdw\.ai\/license\/1-1\/"[^>]*>openmdw-1\.1<\/a>/);
+    expect(item("qwen3.8-27b")).toMatch(/>apache-2\.0<\/a>/);
+    expect(item("qwen3.8-27b-custom")).not.toContain("<a ");
+    expect(item("qwen3.8-27b-dead")).not.toContain("<a ");
+  });
+
+  // ADR 0078: the confirmation a download gets states the license, with no acceptance step.
+  it("states the license on a download being sent or running, and asks nothing to accept it", () => {
+    const stated = { id: "acme-1.0", url: "https://acme.example/LICENSE" };
+    const rows = CATALOG.map((r) => (r.id === "qwen3.8-27b-custom" ? { ...r, license: stated } : r));
+    const catalog = { state: "ok" as const, value: rows };
+    const row = (html: string) => html.split("<li").find((li) => li.includes(">qwen3.8-27b-custom<"))!;
+    const before = row(render({ catalog }));
+    expect(before).not.toContain("bound by");
+    const sending = row(render({ catalog, downloadingId: "qwen3.8-27b-custom" }));
+    expect(sending).toMatch(/bound by its license, <a href="https:\/\/acme\.example\/LICENSE"[^>]*>acme-1\.0<\/a>/);
+    const running = row(render({ catalog: { state: "ok", value: rows.map((r) => (r.id === "qwen3.8-27b-custom" ? { ...r, on_disk: "partial" as const, download: "running" as const } : r)) } }));
+    expect(running).toContain("bound by its license");
+    expect(sending).not.toMatch(/checkbox|I accept|Accept/);
+    // A row that states none says nothing of one.
+    expect(row(render({ downloadingId: "qwen3.8-27b-custom" }))).not.toContain("bound by");
+  });
+
   // GitHub #377: Cancel on the running row, Resume on a partial one.
   it("offers Cancel on the running row, held while it is sent or the server is not answering, in reach during a switch, and Resume on a partial row with its bytes", () => {
     const rows = CATALOG.map((r) => (r.id === "qwen3.8-27b-custom" ? { ...r, on_disk: "partial" as const, download: "running" as const, bytes_on_disk: 1.5 * 1024 ** 3 } : r));

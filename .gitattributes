@@ -37,6 +37,10 @@ crates/server/tests/fixtures/catalog/*.yaml text eol=lf
 # unit's DONE pins the sha256 of its JSON files, so a CRLF checkout would break the pack.
 crates/artifact/tests/fixtures/qwen_image_work/** -text
 
+# The 27B NVFP4 converter's draft-head ranking: little-endian int64 counts, pinned by sha256 in
+# tools/27b-nvfp4-converter/checkpoint.py.
+tools/27b-nvfp4-converter/data/*.i64 binary
+
 # The speech oracle's fixtures (crates/speech/tests): f32 tensors and the FLEURS clip, read byte
 # for byte by front_end.rs and oracle.rs.
 crates/speech/tests/fixtures/oracle/**/*.bin -text

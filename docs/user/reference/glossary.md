@@ -44,8 +44,8 @@ picks one by the card's memory. See [profiles](../concepts/profiles.md).
 the card is refused before anything is unloaded or fetched. See
 [models and artifacts](../concepts/models-and-artifacts.md).
 
-**Catalog.** The models the server knows how to fetch: ten entries built into
-the binary (six text and image models, three speech models and a diarizer),
+**Catalog.** The models the server knows how to fetch: twelve entries built into
+the binary (eight text and image models, three speech models and a diarizer),
 pinned file by file, plus any an operator adds. See
 [models and artifacts](../concepts/models-and-artifacts.md) and
 [Get a model](../guides/models.md).
@@ -108,6 +108,12 @@ family. See [models and artifacts](../concepts/models-and-artifacts.md).
 
 **Field.** One setting, named the same as a flag, an `IGNIS_*` variable and a file
 key. See [configuration](../configuration/index.md).
+
+**Fine-tune.** A catalog entry of a model family whose weights are another
+party's post-training of the family's checkpoint: the same family under its own
+served id, published under its own license. The abliterated variant and Swift
+1.5 (`swift-1.5-27b`) are fine-tunes of the 27B. See
+[fine-tunes](../guides/fine-tunes.md).
 
 **Flash-Next.** Qwen3.8-Flash-Next, the 125B mixture-of-experts model with 6B
 active parameters. See [models and artifacts](../concepts/models-and-artifacts.md).

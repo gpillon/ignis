@@ -625,6 +625,35 @@ mod tests {
         let _ = std::fs::remove_file(sidecar_path);
     }
 
+    /// GitHub #467: a converter writes each divisor as the shortest decimal of
+    /// its FP32 value widened to f64, often 17 significant digits
+    /// (`185.37930297851562`). The record must parse back to that exact f64,
+    /// or the loader refuses a sidecar that records the stored word.
+    #[test]
+    fn a_divisor_written_as_its_shortest_f64_decimal_verifies_clean() {
+        let (fixture, reader, _) = nvfp4_fixture("chk-shortest");
+        let divisor = 2688.0f32 / 14.5;
+        let geometry = crate::block_scale_geometry(NumericFormat::Nvfp4, &[128, 64]).unwrap();
+        let mut bytes = std::fs::read(&fixture.path).unwrap();
+        let at = (reader.payload_offset() + geometry.weight_divisor_offset) as usize;
+        bytes[at..at + 4].copy_from_slice(&divisor.to_le_bytes());
+        drop(reader);
+        std::fs::write(&fixture.path, &bytes).unwrap();
+        let reader = Reader::open(&fixture.path).unwrap();
+        let path = fixture.path.with_extension("shortest.json");
+        let record = format!(
+            r#"{{"recipe_id":"test-recipe","artifact":{{"bytes":{}}},"objects":{{"count":1}},
+              "local_nvfp4":{{"parents":{{"w/nvfp4":{{"weight_scale_divisor":{}}}}}}}}}"#,
+            bytes.len(),
+            f64::from(divisor)
+        );
+        assert!(record.contains("185.379302978515"), "{record}");
+        std::fs::write(&path, record).unwrap();
+        let report = verify(&reader, &Sidecar::load(&path).unwrap()).unwrap();
+        assert!(report.is_clean(), "{report:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn sidecar_null_divisor_is_a_presence_check() {
         let (fixture, reader, _) = nvfp4_fixture("chk-null-divisor");

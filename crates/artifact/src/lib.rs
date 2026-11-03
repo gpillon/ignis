@@ -33,6 +33,7 @@ pub mod frontend;
 pub mod inventory;
 pub mod materializer;
 pub mod normalize;
+pub mod nvfp4_27b;
 pub mod packer;
 pub mod qwen_image;
 pub mod f64_reference;

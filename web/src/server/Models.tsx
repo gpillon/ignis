@@ -151,7 +151,10 @@ function Catalog({
           key={row.id}
           className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-0.5 border-t border-line px-5 py-3 sm:col-span-full sm:grid-cols-subgrid md:px-6"
         >
-          <span className="font-display text-base font-semibold text-ink [overflow-wrap:anywhere]">{row.id}</span>
+          <div className="flex flex-col">
+            <span className="font-display text-base font-semibold text-ink [overflow-wrap:anywhere]">{row.id}</span>
+            {row.license && <LicenseLink license={row.license} />}
+          </div>
           <span className="col-start-1 text-xs text-ash sm:col-start-auto sm:text-sm">{kindLabel(row.kind)}</span>
           <span className="col-start-1 text-xs text-ash sm:col-start-auto sm:text-sm">{sourceLabel(row.source)}</span>
           <span className="col-start-1 text-xs text-ash sm:col-start-auto sm:text-sm">
@@ -161,6 +164,11 @@ function Catalog({
             <RowActionView row={row} model={model} loadingId={loadingId} onLoad={onLoad} downloads={downloads} />
             <RemoveButton row={row} model={model} removals={removals} />
           </div>
+          {row.license && (row.download === "running" || downloads.sendingId === row.id) && (
+            <p className="col-span-full pt-1 text-xs text-ash">
+              Downloading it, you are bound by its license, <LicenseLink license={row.license} />.
+            </p>
+          )}
           {downloadFailure(row) !== null && (
             <p className="col-span-full pt-1 text-xs text-fault [overflow-wrap:anywhere]">Download failed: {downloadFailure(row)}</p>
           )}
@@ -170,6 +178,15 @@ function Catalog({
         </Fragment>
       ))}
     </ul>
+  );
+}
+
+/** The license's identifier, linking to its text (ADR 0078): there is no acceptance step, the link is all the page adds. */
+function LicenseLink({ license }: { license: NonNullable<CatalogRow["license"]> }) {
+  return (
+    <a href={license.url} target="_blank" rel="noreferrer" className="text-xs text-ash underline decoration-line underline-offset-2 hover:text-ember">
+      {license.id}
+    </a>
   );
 }
 

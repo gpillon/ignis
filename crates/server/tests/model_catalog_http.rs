@@ -138,7 +138,7 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
     assert_eq!(
         ids,
         [
-            "qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", // the built-in catalog, then the operator's
+            "qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", // the built-in catalog, then the operator's
             "acme-full", "acme-part", "acme-none",
             "mock-a", "mock-gone", "mock-k", // the known models that are not entries, the start model among them
         ]
@@ -149,6 +149,19 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
     assert!(built_in["bytes"].as_u64().unwrap() > 1 << 30, "an entry's total, even absent: {built_in}");
     assert_eq!((built_in["loaded"].clone(), built_in["switchable"].clone()), (json!(false), json!(false)), "nothing on disk to switch to");
     assert!(built_in.get("family").is_none(), "no artifact, no header to name a family");
+    // ADR 0078: a built-in entry always states its license.
+    assert_eq!(built_in["license"], json!({ "id": "apache-2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0" }));
+    assert_eq!(row(&rows, "qwen3.8-flash-next")["license"]["id"], "qwen-community-1.0");
+    // Swift 1.5's two entries (GitHub #473): its own license, the LICENSE in
+    // each entry's repo at its pinned revision.
+    assert_eq!(
+        row(&rows, "swift-1.5-27b")["license"],
+        json!({ "id": "swift-open-license-1.0", "url": "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/890d5744d116caff2ee6746285bf839da175a63e/LICENSE" })
+    );
+    assert_eq!(
+        row(&rows, "swift-1.5-27b-16g")["license"],
+        json!({ "id": "swift-open-license-1.0", "url": "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/3fe94555a30b3df89a283bf61338281243642166/LICENSE" })
+    );
 
     let full = row(&rows, "acme-full");
     assert_eq!(full, &json!({ "id": "acme-full", "source": "operator", "on_disk": "complete", "bytes": 8, "loaded": false, "switchable": true, "available": true, "download": "none", "bytes_on_disk": 8 }));
@@ -183,6 +196,45 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
         assert!(object.get("path").is_none() && object.get("artifact").is_none(), "{object}");
     }
     let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(elsewhere));
+}
+
+/// ADR 0078: an operator entry that states a license reports it as `id` and
+/// `url`, one that states none reports none, and neither does a known model.
+#[tokio::test]
+async fn an_entrys_license_is_reported_as_id_and_url_and_absent_when_it_states_none() {
+    let loader = MockLoader::new();
+    let dir = fresh_dir("license");
+    let zeros = "0".repeat(64);
+    let entry = |id: &str, license: &str| {
+        format!(
+            "  - id: {id}
+    repo: acme/{id}
+    revision: v1
+    artifact: {id}.ninfer
+    card_class: 32
+{license}    files:
+      - {{ name: {id}.ninfer.graft.json, bytes: 1, sha256: \"{zeros}\" }}
+      - {{ name: {id}.ninfer, bytes: 7, sha256: \"{zeros}\" }}
+"
+        )
+    };
+    let yaml = format!("models:
+{}{}", entry("acme-stated", "    license: { id: acme-1.0, url: \"https://acme.example/LICENSE\" }
+"), entry("acme-silent", ""));
+    let catalog = parse_operator(&yaml, Format::Yaml, "test").expect("a valid catalog");
+    let start = file_in(&dir, "mock-a.ninfer", b"start");
+    let app = server_with(&loader, &start, CatalogModels { catalog: Arc::new(catalog), dir: dir.clone() }, &[], true).app();
+
+    let (status, rows) = send(&app, Method::GET, "/v1/models/catalog", None).await;
+
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(row(&rows, "acme-stated")["license"], json!({ "id": "acme-1.0", "url": "https://acme.example/LICENSE" }));
+    assert!(row(&rows, "acme-silent").get("license").is_none(), "{}", row(&rows, "acme-silent"));
+    assert!(row(&rows, "mock-a").get("license").is_none(), "a known model states none");
+    // `GET /v1/models` is unchanged: no license there.
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert!(!models.to_string().contains("license"), "{models}");
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A `.ninfer` container whose header names `model_id`, holding one 1-byte resource; its size.
@@ -264,6 +316,8 @@ async fn every_row_says_its_kind_the_headers_when_the_file_is_there_else_the_cat
         ("qwen3.8-27b", Some("text"), "a family's own id"),
         ("qwen3.8-27b-16g", Some("text"), "its alias, a family's own id"),
         ("qwen3.8-27b-abliterated", Some("text"), "the family it states"),
+        ("swift-1.5-27b", Some("text"), "the family it states"),
+        ("swift-1.5-27b-16g", Some("text"), "the family it states"),
         ("ignis-image-2.1-turbo", Some("image"), "a family's own id"),
         ("qwen3-asr-1.7b", Some("speech"), "the kind it states"),
         ("nemotron-3-diarization", Some("diarizer"), "the kind it states"),

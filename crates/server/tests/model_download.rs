@@ -70,6 +70,7 @@ fn entry() -> CatalogEntry {
         card_class: Some(ignis_server::config::profile::CardClass::Gb32),
         family: None,
         aliases: Vec::new(),
+        license: None,
         kind: None,
         // Listed large first: the fetch order is the transfer's, not the list's.
         files: vec![pinned(ARTIFACT, &artifact_bytes()), pinned(SIDECAR, SIDECAR_BODY)],
@@ -766,6 +767,38 @@ async fn model_download_fetches_an_entry_into_the_download_path_and_prints_its_a
     assert!(progress.iter().any(|line| line.starts_with("test-model:") && line.contains(&endpoint)), "{progress:?}");
     assert!(progress.iter().any(|line| line.contains(SIDECAR) && line.contains("verified")), "{progress:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn model_download_prints_the_entrys_license_and_its_link_before_it_fetches() {
+    // ADR 0078: the license an entry states is printed first, as an
+    // identifier and a link, with no acceptance step; an entry that states
+    // none prints no license line.
+    let (addr, _state) = repo_server().await;
+    let endpoint = format!("http://{addr}");
+    let mut stated = operator_catalog();
+    stated.1 = stated.1.replace("    card_class: 32
+", "    card_class: 32
+    license: { id: acme-1.0, url: \"https://acme.example/LICENSE\" }
+");
+    for (files, license) in [(stated, true), (operator_catalog(), false)] {
+        let dir = temp_dir("cli-license");
+        let dir_text = dir.display().to_string();
+        let argv = ["model", "download", "test-model", "--download-catalog", "ops.catalog.yaml", "--download-endpoint", &endpoint, "--download-path", &dir_text];
+
+        let (_stdout, progress, code) = ran(command(&argv, &files)).await;
+
+        assert_eq!(code, 0, "{progress:?}");
+        let said = progress.iter().position(|line| line.contains("license acme-1.0") && line.contains("https://acme.example/LICENSE"));
+        assert_eq!(said.is_some(), license, "{progress:?}");
+        if let Some(said) = said {
+            let first_fetch = progress.iter().position(|line| line.contains("fetching")).expect("the fetch is reported");
+            assert!(said < first_fetch, "the license comes before the fetch: {progress:?}");
+        } else {
+            assert!(!progress.iter().any(|line| line.contains(": license ")), "{progress:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[tokio::test]

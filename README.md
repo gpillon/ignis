@@ -574,8 +574,8 @@ box says what sending will do first:
 
 ### The weights
 
-Six artifacts on Hugging Face: four of the 27B, all carrying the DFlash2
-drafter (the two NVFP4 ones 18.07 GiB, the two for 16 GB cards 12.46 GiB),
+Eight artifacts on Hugging Face: six of the 27B, all carrying the DFlash2
+drafter (the three NVFP4 ones 18.07-18.08 GiB, the three for 16 GB cards 12.46 GiB),
 Flash-Next, and the image model:
 
 | | Hugging Face | file |
@@ -584,6 +584,8 @@ Flash-Next, and the image model:
 | **Uncensored** | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer) | `qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer` |
 | **16 GB card** (trellis body, about 3 bits per weight) | [`gpillon/Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis) | `qwen3_8_27b_trellis_sc30-v2.ninfer` |
 | **Uncensored, 16 GB card** | [`gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis) | `qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer` |
+| **Swift 1.5** (a fine-tune of the 27B; **commercial use above the license's US$1M revenue threshold is not licensed**) | [`gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis) | `qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer` |
+| **Swift 1.5, 16 GB card** | [`gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis) | `qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer` |
 | **Flash-Next** (125B MoE, 67.8 GiB with its MTP companion) | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | `qwen3_8_flash_next_trellis_a25-v2.ninfer` |
 | **Image** (Qwen-Image-2.1-Turbo, 15.57 GiB, **non-commercial use only**) | [`gpillon/ignis-image-2.1-turbo`](https://huggingface.co/gpillon/ignis-image-2.1-turbo) | `ignis_image_2_1_turbo-v2.ninfer` |
 
@@ -597,6 +599,8 @@ ignis-server model download qwen3.8-27b
 ignis-server model download qwen3.8-27b-abliterated
 ignis-server model download qwen3.8-27b-16g
 ignis-server model download qwen3.8-27b-abliterated-16g
+ignis-server model download swift-1.5-27b
+ignis-server model download swift-1.5-27b-16g
 ignis-server model download qwen3.8-flash-next
 ignis-server model download ignis-image-2.1-turbo
 ```
@@ -614,6 +618,14 @@ faithful to them as the 16 GB artifact is to the standard ones
 ([the uncensored variant](https://gpillon.github.io/ignis/guides/uncensored/)).
 **It does not refuse**, so put the guardrails in the application or tool layer
 and do not expose it to untrusted users.
+
+Swift 1.5 is UkisAI's post-training of the 27B, served as `swift-1.5-27b`, and
+on a 16 GB card by `swift-1.5-27b-16g`, which answers to that id there. Its
+weights are under the Swift Open License v1.0, not Apache-2.0: commercial use
+by an organization whose gross revenue, with its affiliates, was US$1,000,000
+or more in its last fiscal year needs UkisAI's Swift Enterprise License.
+`model download` prints the license before it fetches
+([fine-tunes](https://gpillon.github.io/ignis/guides/fine-tunes/)).
 
 ### Container
 

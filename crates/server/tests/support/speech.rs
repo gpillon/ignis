@@ -55,6 +55,7 @@ pub fn models(dir: &std::path::Path) -> SpeechModels {
         card_class: None,
         family: None,
         aliases: Vec::new(),
+        license: None,
         kind: Some(ignis_core::compute::ModelKind::Speech),
         files: ["encoder", "decoder"]
             .iter()
