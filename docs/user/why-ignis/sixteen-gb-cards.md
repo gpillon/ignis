@@ -70,6 +70,8 @@ thinking budget forced a close on 15 of 32 turns against 8 of 32 on NVFP4.
 - **The uncensored variant**: `ignis-server model download qwen3.8-27b-abliterated`
   fetches `qwen3.8-27b-abliterated-16g` on a 16 GB card
   ([the uncensored variant](../guides/uncensored.md)).
+- **Swift 1.5**: `ignis-server model download swift-1.5-27b` fetches
+  `swift-1.5-27b-16g` on a 16 GB card ([fine-tunes](../guides/fine-tunes.md)).
 - **The profile**: `--profile auto` (the default) or `--profile rtx50-16gb`
   ([profiles](../concepts/profiles.md#rtx50-16gb)).
 - **The adaptation**: [`model.adapt_context_step`](../reference/configuration.md#modeladapt_context_step)

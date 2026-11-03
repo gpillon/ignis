@@ -19,9 +19,9 @@ that built it. How that works is in
 
 ## What it serves
 
-Ten entries are built into the server's [catalog](../guides/models.md#the-catalog):
-the six text and image models below, three speech models and a diarizer. It
-loads one of the six at a time and switches between them without a restart.
+Twelve entries are built into the server's [catalog](../guides/models.md#the-catalog):
+the eight text and image models below, three speech models and a diarizer. It
+loads one of the eight at a time and switches between them without a restart.
 
 | Model | Id | What it is | Size on disk |
 |---|---|---|---|
@@ -29,6 +29,8 @@ loads one of the six at a time and switches between them without a restart.
 | Qwen3.8-27B for 16 GB cards | `qwen3.8-27b-16g` | The same 27B with a 3-bit trellis body, for the 16 GB class; it answers to `qwen3.8-27b` on a 16 GB card. | 12.5 GiB |
 | Qwen3.8-27B, uncensored | `qwen3.8-27b-abliterated` | The same weights with an abliteration applied. It does not refuse, so [read its page](../guides/uncensored.md) before exposing it. | 18.1 GiB |
 | Qwen3.8-27B, uncensored, for 16 GB cards | `qwen3.8-27b-abliterated-16g` | The 16 GB artifact with the same abliteration; it answers to `qwen3.8-27b-abliterated` on a 16 GB card. | 12.5 GiB |
+| Swift 1.5 | `swift-1.5-27b` | UkisAI's post-training of the 27B, a [fine-tune](../guides/fine-tunes.md). Its license does not cover commercial use by an organization whose gross revenue was US$1,000,000 or more in its last fiscal year: [read its page](../guides/fine-tunes.md#its-license). | 18.1 GiB |
+| Swift 1.5 for 16 GB cards | `swift-1.5-27b-16g` | Swift 1.5 with a 3-bit trellis body; it answers to `swift-1.5-27b` on a 16 GB card. | 12.5 GiB |
 | Qwen3.8-Flash-Next | `qwen3.8-flash-next` | A 125B mixture-of-experts model with 6B active parameters, its experts re-quantized to 2.5 bits per weight on average. A VRAM cache holds the hot experts and the rest stream from host RAM. | 67.8 GiB with its MTP companion |
 | Qwen-Image-2.1-Turbo | `ignis-image-2.1-turbo` | The [image model](../api/images.md): generation and edits from up to ten input images. Its weights are for non-commercial use only. | 15.6 GiB |
 

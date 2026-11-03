@@ -66,7 +66,11 @@ Ask before the install does anything large or visible:
    `qwen3.8-flash-next` needs the host RAM above.
    `qwen3.8-27b-abliterated` does not refuse anything:
    [its page](../guides/uncensored.md) comes first; on a 16 GB card its 16 GB
-   entry, `qwen3.8-27b-abliterated-16g`, serves it. `ignis-image-2.1-turbo`
+   entry, `qwen3.8-27b-abliterated-16g`, serves it. `swift-1.5-27b` is a
+   fine-tune of the 27B under a license that does not cover commercial use by
+   an organization with US$1,000,000 or more of gross revenue in its last
+   fiscal year ([its license](../guides/fine-tunes.md#its-license)); on a
+   16 GB card `swift-1.5-27b-16g` serves it. `ignis-image-2.1-turbo`
    makes images and its weights are non-commercial
    ([What it serves](../start/index.md#what-it-serves)).
 2. **Where the model is kept, and the download itself.** A model is tens of

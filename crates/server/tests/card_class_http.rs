@@ -12,7 +12,8 @@
 //! models are `support/switch.rs`'s mocks, loaded by id. An alias may also be
 //! another entry's id of the same family (ADR 0074): the uncensored variant's
 //! 16 GB build, also built in (GitHub #423), answers to
-//! `qwen3.8-27b-abliterated` on a 16 GB card.
+//! `qwen3.8-27b-abliterated` on a 16 GB card, and Swift 1.5's (GitHub #473)
+//! to `swift-1.5-27b`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +48,10 @@ const IMAGE: &str = "ignis-image-2.1-turbo";
 /// 16 GB build (ADR 0074, GitHub #423).
 const ABLITERATED: &str = "qwen3.8-27b-abliterated";
 const ABLITERATED_16G: &str = "qwen3.8-27b-abliterated-16g";
+/// Swift 1.5's served id, its NVFP4 entry's, and the id of its 16 GB build
+/// (GitHub #473): a fine-tune of the 27B's family, both entries stating it.
+const SWIFT: &str = "swift-1.5-27b";
+const SWIFT_16G: &str = "swift-1.5-27b-16g";
 /// The catalog's CPU models: the three speech entries and the diarizer.
 const CPU_MODELS: [&str; 4] = ["qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization"];
 
@@ -67,7 +72,7 @@ fn catalog_on_disk(tag: &str) -> CatalogModels {
 }
 
 /// A server on `start`, on a card of class `card`, whose requests may switch
-/// to any built-in catalog entry on disk, the artifacts' headers of the two
+/// to any built-in catalog entry on disk, the artifacts' headers of the three
 /// 16 GB entries naming the 27B's family.
 fn server_on(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, tag: &str) -> Server {
     abliterated_server(loader, start, card, ModelFamily::Qwen38_27b, tag)
@@ -83,6 +88,7 @@ fn server_over(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, c
 fn abliterated_server(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, header: ModelFamily, tag: &str) -> Server {
     loader.header(SIXTEEN, ModelFamily::Qwen38_27b);
     loader.header(ABLITERATED_16G, header);
+    loader.header(SWIFT_16G, ModelFamily::Qwen38_27b);
     server_over(loader, start, card, catalog_on_disk(tag))
 }
 
@@ -388,14 +394,14 @@ async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_
         models["data"].as_array().unwrap().iter().map(|entry| (entry["id"].as_str().unwrap(), entry["available"].as_bool().unwrap())).collect();
     assert_eq!(
         listed,
-        [(SIXTEEN, true), (DEFAULT_27B, false), (ABLITERATED, false), (FLASH_NEXT, false), (IMAGE, false), (ABLITERATED_16G, true)],
+        [(SIXTEEN, true), (DEFAULT_27B, false), (ABLITERATED, false), (FLASH_NEXT, false), (IMAGE, false), (ABLITERATED_16G, true), (SWIFT, false), (SWIFT_16G, true)],
         "the entries it lists today, each marked: {models}"
     );
     let reason = |id: &str| -> String {
         let entry = models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == id).unwrap();
         entry["reason"].as_str().unwrap_or_default().to_owned()
     };
-    for id in [DEFAULT_27B, ABLITERATED, FLASH_NEXT, IMAGE] {
+    for id in [DEFAULT_27B, ABLITERATED, FLASH_NEXT, IMAGE, SWIFT] {
         let reason = reason(id);
         assert!(reason.contains(id) && reason.contains("32 GB") && reason.contains("16 GB"), "{id}: {reason}");
     }
@@ -409,7 +415,7 @@ async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_
     for row in catalog["data"].as_array().unwrap() {
         let id = row["id"].as_str().unwrap();
         // A speech model and the diarizer run on the CPU: no class, so no card refuses them.
-        let fits = id == SIXTEEN || id == ABLITERATED_16G || CPU_MODELS.contains(&id);
+        let fits = id == SIXTEEN || id == ABLITERATED_16G || id == SWIFT_16G || CPU_MODELS.contains(&id);
         assert_eq!(row["available"], fits, "{row}");
         assert_eq!(row.get("reason").is_some(), !fits, "{row}");
         if !fits {
@@ -619,4 +625,135 @@ async fn on_a_16gb_card_the_model_lists_name_the_build_that_serves_the_uncensore
     assert_eq!((row(ABLITERATED_16G)["available"].as_bool(), row(ABLITERATED_16G)["switchable"].as_bool()), (Some(true), Some(true)), "{catalog}");
     assert_eq!((row(ABLITERATED)["available"].as_bool(), row(ABLITERATED)["switchable"].as_bool()), (Some(false), Some(false)), "{catalog}");
     assert!(row(ABLITERATED)["reason"].as_str().unwrap().contains(&format!("served by {ABLITERATED_16G}")), "{catalog}");
+}
+
+/// GitHub #473 (ADR 0074): on a 16 GB card a request naming Swift 1.5's id
+/// switches to its 16 GB build, whose artifact is on disk, never to the NVFP4
+/// entry's, and is served under the build's own id; once it is loaded a
+/// request naming the id is served by it, lane tag and all, with no switch,
+/// and an explicit switch by the id resolves it the same way. The build can
+/// be named by its own id too, by a request and by a switch.
+#[tokio::test]
+async fn on_a_16gb_card_swifts_id_is_served_by_its_16gb_build_which_can_be_named_too() {
+    let loader = MockLoader::new();
+    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "swift");
+    let app = server.app();
+    let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(SWIFT))).await;
+    assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(SWIFT_16G)), "{completion}");
+    assert_eq!(loader.loads(), [SWIFT_16G]);
+    assert_eq!(loader.prepared_artifacts(), [artifact_of(&server, SWIFT_16G)], "the 16 GB build's artifact, not the NVFP4 entry's");
+    let (status, answered) = send(&app, Method::POST, "/v1/responses", Some(response_body(&format!("{SWIFT}@agent")))).await;
+    assert_eq!((status, answered["model"].as_str()), (StatusCode::OK, Some(SWIFT_16G)), "{answered}");
+    assert_eq!(loader.loads(), [SWIFT_16G], "served by the loaded build, no switch");
+
+    let (status, _) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": SIXTEEN }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(until_serving(&app).await["data"][0]["id"], SIXTEEN);
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": SWIFT }))).await;
+    assert_eq!((status, accepted["to"].as_str()), (StatusCode::ACCEPTED, Some(SWIFT_16G)), "{accepted}");
+    assert_eq!(until_serving(&app).await["data"][0]["id"], SWIFT_16G);
+
+    // Named by its own id, by a request and by a switch.
+    let (status, _) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": SIXTEEN }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    until_serving(&app).await;
+    let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(SWIFT_16G))).await;
+    assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(SWIFT_16G)), "{completion}");
+    let (status, _) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": SIXTEEN }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    until_serving(&app).await;
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": SWIFT_16G }))).await;
+    assert_eq!((status, accepted["to"].as_str()), (StatusCode::ACCEPTED, Some(SWIFT_16G)), "{accepted}");
+    assert_eq!(until_serving(&app).await["data"][0]["id"], SWIFT_16G);
+    assert_eq!(loader.loads(), [SWIFT_16G, SIXTEEN, SWIFT_16G, SIXTEEN, SWIFT_16G, SIXTEEN, SWIFT_16G]);
+}
+
+/// GitHub #473 (ADR 0074): the switch to Swift 1.5's 16 GB build needs its
+/// artifact on disk, and its header to name the 27B's family. Without the
+/// artifact, a request and a switch naming `swift-1.5-27b` are refused before
+/// anything stops, naming the build, never served by the NVFP4 entry, which
+/// this card cannot load; with an artifact of another family they are
+/// refused naming both families, and the lists say why.
+#[tokio::test]
+async fn swifts_id_on_a_16gb_card_needs_its_16gb_build_on_disk_and_of_the_27bs_family() {
+    let loader = MockLoader::new();
+    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "swift-absent");
+    std::fs::remove_file(artifact_of(&server, SWIFT_16G)).unwrap();
+    let app = server.app();
+    let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(SWIFT))).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("model_not_found")), "{refused}");
+    assert!(refused["error"]["message"].as_str().unwrap().contains(SWIFT_16G), "{refused}");
+    let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": SWIFT }))).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("model_not_found")), "{refused}");
+    still_serving(&app, &server, &loader, SIXTEEN).await;
+
+    let loader = MockLoader::new();
+    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "swift-header");
+    loader.header(SWIFT_16G, ModelFamily::FlashNext);
+    let app = server.app();
+    let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(SWIFT))).await;
+    refused_by_class(status, &refused, SWIFT);
+    let message = refused["error"]["message"].as_str().unwrap();
+    for named in [&format!("{SWIFT_16G} lists it as an alias"), "its artifact is Qwen3.8-Flash-Next", &format!("{SWIFT} is Qwen3.8-27B"), "one model family"] {
+        assert!(message.contains(named), "{named}: {message}");
+    }
+    let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": SWIFT }))).await;
+    refused_by_class(status, &refused, SWIFT);
+    still_serving(&app, &server, &loader, SIXTEEN).await;
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    let listed = models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == SWIFT).cloned().unwrap();
+    assert_eq!(listed["available"], false, "{listed}");
+    assert!(listed["reason"].as_str().unwrap().contains("one model family"), "{listed}");
+}
+
+/// GitHub #473: on a 32 GB card, a 96 GB one or one of no known class
+/// `swift-1.5-27b` is the NVFP4 entry's, for a request's switch and an
+/// explicit one, and every list marks it available.
+#[tokio::test]
+async fn on_other_cards_swifts_id_is_its_nvfp4_entrys() {
+    for (card, tag) in [(Some(CardClass::Gb32), "swift-32"), (Some(CardClass::Gb96), "swift-96"), (None, "swift-unknown")] {
+        let loader = MockLoader::new();
+        let server = server_on(&loader, DEFAULT_27B, card, tag);
+        let app = server.app();
+        let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(SWIFT))).await;
+        assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(SWIFT)), "{tag}: {completion}");
+        assert_eq!(loader.prepared_artifacts(), [artifact_of(&server, SWIFT)], "{tag}: the NVFP4 entry's own artifact");
+        let (status, _) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": DEFAULT_27B }))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{tag}");
+        until_serving(&app).await;
+        let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": SWIFT }))).await;
+        assert_eq!((status, accepted["to"].as_str()), (StatusCode::ACCEPTED, Some(SWIFT)), "{tag}: {accepted}");
+        assert_eq!(until_serving(&app).await["data"][0]["id"], SWIFT, "{tag}");
+        assert_eq!(loader.loads(), [SWIFT, DEFAULT_27B, SWIFT], "{tag}");
+        let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+        let data = models["data"].as_array().unwrap();
+        assert!(data.iter().all(|entry| entry["available"] == true && entry.get("reason").is_none()), "{tag}: {models}");
+    }
+}
+
+/// GitHub #473, ADR 0064 §3: on a 16 GB card `GET /v1/models` lists Swift
+/// 1.5's 16 GB build, and marks its NVFP4 entry unavailable with the reason,
+/// naming the build that serves a request for its id here;
+/// `GET /v1/models/catalog` says the same of their rows.
+#[tokio::test]
+async fn on_a_16gb_card_the_model_lists_name_the_build_that_serves_swift() {
+    let loader = MockLoader::new();
+    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "swift-lists");
+    let app = server.app();
+    let (status, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = |id: &str| models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == id).cloned().unwrap_or_else(|| panic!("{id} listed: {models}"));
+    assert_eq!((entry(SWIFT_16G)["available"].as_bool(), entry(SWIFT_16G).get("reason")), (Some(true), None), "{models}");
+    assert_eq!(entry(SWIFT)["available"], false, "{models}");
+    let reason = entry(SWIFT)["reason"].as_str().unwrap().to_owned();
+    for said in [SWIFT, "32 GB", "16 GB", &format!("served by {SWIFT_16G}")] {
+        assert!(reason.contains(said), "{said}: {reason}");
+    }
+
+    let (status, catalog) = send(&app, Method::GET, "/v1/models/catalog", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let row = |id: &str| catalog["data"].as_array().unwrap().iter().find(|row| row["id"] == id).cloned().unwrap();
+    assert_eq!((row(SWIFT_16G)["available"].as_bool(), row(SWIFT_16G)["switchable"].as_bool()), (Some(true), Some(true)), "{catalog}");
+    assert_eq!((row(SWIFT)["available"].as_bool(), row(SWIFT)["switchable"].as_bool()), (Some(false), Some(false)), "{catalog}");
+    assert!(row(SWIFT)["reason"].as_str().unwrap().contains(&format!("served by {SWIFT_16G}")), "{catalog}");
 }

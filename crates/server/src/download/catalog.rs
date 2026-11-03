@@ -809,7 +809,7 @@ pub(crate) mod testing {
 
     /// The built-in catalog without its 16 GB entries: a catalog in which no
     /// entry answers to the 27B's default id, nor to the uncensored
-    /// variant's, on a 16 GB card.
+    /// variant's or Swift 1.5's, on a 16 GB card.
     pub(crate) fn thirty_two() -> super::Catalog {
         let entries = super::Catalog::built_in().entries.iter().filter(|entry| entry.card_class != Some(super::CardClass::Gb16));
         super::Catalog { entries: entries.cloned().collect() }
@@ -831,15 +831,16 @@ mod tests {
     /// `card_class` in GB, its model family, its aliases, then each file's
     /// name, bytes and SHA-256 in the order listed). Every built-in entry
     /// states its card class (ADR 0064 §1: an operator's may leave it out, a
-    /// built-in one never does), the 32 GB one for each but the two 16 GB
+    /// built-in one never does), the 32 GB one for each but the three 16 GB
     /// entries, the only ones with an alias: the 16 GB 27B's (GitHub #338,
-    /// spec 27b-16gb/01) `qwen3.8-27b`, and its uncensored variant's build's
-    /// (GitHub #423, ADR 0074) `qwen3.8-27b-abliterated`, the 32 GB entry's
-    /// served id. Every one is of a family the catalog tells (ADR 0074): its
-    /// own id's, its alias's, or the one it states — the abliterated 27B's
-    /// and its 16 GB build's, whose ids name none.
+    /// spec 27b-16gb/01) `qwen3.8-27b`, its uncensored variant's build's
+    /// (GitHub #423, ADR 0074) `qwen3.8-27b-abliterated`, and Swift 1.5's
+    /// (GitHub #473) `swift-1.5-27b`, each the 32 GB entry's served id. Every
+    /// one is of a family the catalog tells (ADR 0074): its own id's, its
+    /// alias's, or the one it states — the abliterated 27B's, Swift's and
+    /// their 16 GB builds', whose ids name none.
     #[allow(clippy::type_complexity)]
-    const RELEASES: [(&str, &str, &str, &str, u32, ModelFamily, &[&str], &[(&str, u64, &str)]); 6] = [
+    const RELEASES: [(&str, &str, &str, &str, u32, ModelFamily, &[&str], &[(&str, u64, &str)]); 8] = [
         (
             "qwen3.8-27b",
             "gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer",
@@ -947,6 +948,43 @@ mod tests {
                     13_379_877_124,
                     "4929bc8e1fbc747092f96aebae6b81a0b619db452d05a56df3499fbe1afe9ac5",
                 ),
+            ],
+        ),
+        // Swift 1.5, a fine-tune of the 27B's family (spec #449, GitHub
+        // #473): the NVFP4 artifact (GitHub #470), the upload's hub commit.
+        (
+            "swift-1.5-27b",
+            "gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer",
+            32,
+            ModelFamily::Qwen38_27b,
+            &[],
+            &[
+                (
+                    "qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer.conversion.json",
+                    51_122,
+                    "3cf455bb5943d26027a5c7a436405a915992ec7e5819bc029a522ead28c708fb",
+                ),
+                ("qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer", 19_410_923_780, "c387c6d019b1e6a42f9e1bb1c2864cee29ea4f501db9de27eedfdfd8248b8912"),
+            ],
+        ),
+        // And its 16 GB build (GitHub #472), the upload's hub commit.
+        (
+            "swift-1.5-27b-16g",
+            "gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer",
+            16,
+            ModelFamily::Qwen38_27b,
+            &["swift-1.5-27b"],
+            &[
+                (
+                    "qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer.conversion.json",
+                    308_144,
+                    "c3116f23756f7c759d84616cf78486618d424ecc5001bfd823c3ddf08cbb3d2d",
+                ),
+                ("qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer", 13_379_877_124, "3a039cb76d2291e3c68f8df5f7b37ac3e83981eb8090625f8a730a670bab63df"),
             ],
         ),
     ];
@@ -1182,7 +1220,7 @@ mod tests {
         let json = serde_json::to_string(&Format::Yaml.read(OPERATOR).unwrap()).unwrap();
         let from_json = parse_operator(&json, Format::Json, "acme.catalog.json").expect("valid");
         assert_eq!(from_yaml, from_json);
-        assert_eq!(from_yaml.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", "acme-qwen3.8-27b-ft"]);
+        assert_eq!(from_yaml.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", "acme-qwen3.8-27b-ft"]);
         let acme = from_yaml.entry("acme-qwen3.8-27b-ft").unwrap();
         assert_eq!(acme.layer, CatalogLayer::Operator);
         assert_eq!(acme.revision, "v1");
@@ -1365,6 +1403,8 @@ mod tests {
             ("ignis-image-2.1-turbo", "qwen-research", "https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/LICENSE"),
             ("qwen3.8-27b-16g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis/blob/f5bbd2cc14c9ca573ef5553c100ac69410f1fe58/LICENSE"),
             ("qwen3.8-27b-abliterated-16g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis/blob/94a8bfc0f47ce86403f274be03e2c0f79500727c/LICENSE"),
+            ("swift-1.5-27b", "swift-open-license-1.0", "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/LICENSE"),
+            ("swift-1.5-27b-16g", "swift-open-license-1.0", "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/LICENSE"),
             ("qwen3-asr-1.7b", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE"),
             ("qwen3-asr-1.7b-q8", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE"),
             ("qwen3-asr-0.6b", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis/blob/af02916ea7a532a667a907c2a163b16a8c04b433/LICENSE"),
@@ -1496,7 +1536,7 @@ mod tests {
     fn an_id_resolves_to_its_own_entry_when_the_card_class_fits() {
         use CardClass::*;
         let catalog = Catalog::built_in();
-        for (id, card) in [("qwen3.8-27b", Gb32), ("qwen3.8-27b", Gb96), ("qwen3.8-flash-next", Gb32), ("ignis-image-2.1-turbo", Gb96), ("qwen3.8-27b-16g", Gb16), ("qwen3.8-27b-16g", Gb32), ("qwen3.8-27b-abliterated", Gb32), ("qwen3.8-27b-abliterated-16g", Gb16)] {
+        for (id, card) in [("qwen3.8-27b", Gb32), ("qwen3.8-27b", Gb96), ("qwen3.8-flash-next", Gb32), ("ignis-image-2.1-turbo", Gb96), ("qwen3.8-27b-16g", Gb16), ("qwen3.8-27b-16g", Gb32), ("qwen3.8-27b-abliterated", Gb32), ("qwen3.8-27b-abliterated-16g", Gb16), ("swift-1.5-27b", Gb32), ("swift-1.5-27b", Gb96), ("swift-1.5-27b-16g", Gb16), ("swift-1.5-27b-16g", Gb32)] {
             assert_eq!(catalog.above_class(id, Some(card)), None, "{id} on {card}");
             assert_eq!(catalog.answering(id, Some(card)), Ok(None), "{id} on {card}: it stands as it is");
         }
@@ -1505,11 +1545,11 @@ mod tests {
     /// ADR 0064 §2: on a card below the id's own entry, the entry of its
     /// family that answers to it, and fits, serves it — each id its own
     /// answering entry: the 27B's default id the 16 GB 27B, the uncensored
-    /// variant's its 16 GB build (ADR 0074).
+    /// variant's its 16 GB build (ADR 0074), Swift 1.5's its own (GitHub #473).
     #[test]
     fn an_id_above_the_card_class_resolves_to_the_entry_that_answers_to_it() {
         let catalog = Catalog::built_in();
-        for (id, answering) in [("qwen3.8-27b", "qwen3.8-27b-16g"), ("qwen3.8-27b-abliterated", "qwen3.8-27b-abliterated-16g")] {
+        for (id, answering) in [("qwen3.8-27b", "qwen3.8-27b-16g"), ("qwen3.8-27b-abliterated", "qwen3.8-27b-abliterated-16g"), ("swift-1.5-27b", "swift-1.5-27b-16g")] {
             assert_eq!(resolved(&catalog, id, Some(CardClass::Gb16)), Ok(answering));
             assert!(catalog.above_class(id, Some(CardClass::Gb16)).is_some(), "{id}: its own entry is still above the class");
         }
@@ -1614,7 +1654,7 @@ mod tests {
     #[test]
     fn an_unknown_card_class_refuses_nothing() {
         let catalog = Catalog::built_in();
-        for id in ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g"] {
+        for id in ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g"] {
             assert_eq!(catalog.answering(id, None), Ok(None), "{id}: the id's own entry, never the one answering to it");
             assert_eq!(catalog.above_class(id, None), None, "{id}");
         }

@@ -566,7 +566,7 @@ mod tests {
             path.ends_with(&entry.artifact).then_some(ModelFamily::Qwen38_27b)
         };
         let rows = list_rows(&catalog, Path::new("m"), &sizes(&on), &family_of);
-        assert_eq!(rows.len(), 11);
+        assert_eq!(rows.len(), 13);
         assert_eq!(
             rows.iter().map(|row| (row.entry.id.as_str(), row.on_disk, row.family)).collect::<Vec<_>>(),
             [
@@ -576,6 +576,8 @@ mod tests {
                 ("ignis-image-2.1-turbo", OnDisk::Absent, None),
                 ("qwen3.8-27b-16g", OnDisk::Absent, None),
                 ("qwen3.8-27b-abliterated-16g", OnDisk::Absent, None),
+                ("swift-1.5-27b", OnDisk::Absent, None),
+                ("swift-1.5-27b-16g", OnDisk::Absent, None),
                 ("qwen3-asr-1.7b", OnDisk::Absent, None),
                 ("qwen3-asr-1.7b-q8", OnDisk::Absent, None),
                 ("qwen3-asr-0.6b", OnDisk::Absent, None),
@@ -588,16 +590,18 @@ mod tests {
 
         let text = render_list(&rows, ListFormat::Text);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 12, "{text}");
+        assert_eq!(lines.len(), 14, "{text}");
         assert!(lines[0].starts_with("ID") && lines[0].contains("REPO@REVISION") && lines[0].contains("FAMILY"), "{text}");
         assert!(lines[1].contains("built-in") && lines[1].contains("gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer@e961b419b672e183aa55df8c4b975abc82006e8a"), "{text}");
         assert!(lines[1].contains("18.1 GiB") && lines[1].contains("complete") && lines[1].contains("Qwen3.8-27B"), "{text}");
         assert!(lines[3].contains("67.8 GiB") && lines[3].contains("absent") && lines[3].contains('—'), "{text}");
         assert!(lines[5].contains("built-in") && lines[5].contains("gpillon/Qwen3.8-27B-trellis-3bpw-ignis@f5bbd2cc") && lines[5].contains("12.5 GiB"), "{text}");
         assert!(lines[6].contains("built-in") && lines[6].contains("gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis@94a8bfc0") && lines[6].contains("12.5 GiB"), "{text}");
-        assert!(lines[10].contains("gpillon/Nemotron-3-Diarization-GGUF-ignis@d46d59d0") && lines[10].contains("absent"), "{text}");
-        assert!(lines[11].contains("operator") && lines[11].contains("acme/ft@v1") && lines[11].contains("partial"), "{text}");
-        assert!(lines[7].contains("gpillon/Qwen3-ASR-1.7B-GGUF-ignis@f8a5263e") && lines[7].contains("1.5 GiB") && lines[7].contains("absent"), "{text}");
+        assert!(lines[7].contains("built-in") && lines[7].contains("gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis@aaaaaaaa") && lines[7].contains("18.1 GiB"), "{text}");
+        assert!(lines[8].contains("built-in") && lines[8].contains("gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis@bbbbbbbb") && lines[8].contains("12.5 GiB"), "{text}");
+        assert!(lines[12].contains("gpillon/Nemotron-3-Diarization-GGUF-ignis@d46d59d0") && lines[12].contains("absent"), "{text}");
+        assert!(lines[13].contains("operator") && lines[13].contains("acme/ft@v1") && lines[13].contains("partial"), "{text}");
+        assert!(lines[9].contains("gpillon/Qwen3-ASR-1.7B-GGUF-ignis@f8a5263e") && lines[9].contains("1.5 GiB") && lines[9].contains("absent"), "{text}");
 
         let json: Vec<Value> = serde_json::from_str(&render_list(&rows, ListFormat::Json)).unwrap();
         assert_eq!(json[0]["id"], "qwen3.8-27b");
@@ -606,14 +610,15 @@ mod tests {
         assert_eq!(json[0]["bytes"], entry.total_bytes());
         assert_eq!(json[0]["on_disk"], "complete");
         assert_eq!(json[0]["family"], "Qwen3.8-27B");
-        assert_eq!(json[10]["layer"], "operator");
-        assert_eq!(json[10]["family"], Value::Null);
+        assert_eq!(json[12]["layer"], "operator");
+        assert_eq!(json[12]["family"], Value::Null);
         // ADR 0078: the identifier beside each entry, `—` where none is stated.
         assert!(lines[0].ends_with("LICENSE") && lines[1].ends_with("apache-2.0"), "{text}");
         assert!(lines[3].ends_with("qwen-community-1.0") && lines[4].ends_with("qwen-research"), "{text}");
-        assert!(lines[10].ends_with("openmdw-1.1") && lines[11].ends_with('—'), "{text}");
+        assert!(lines[7].ends_with("swift-open-license-1.0") && lines[8].ends_with("swift-open-license-1.0"), "{text}");
+        assert!(lines[12].ends_with("openmdw-1.1") && lines[13].ends_with('—'), "{text}");
         assert_eq!(json[0]["license"], serde_json::json!({ "id": "apache-2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0" }));
-        assert_eq!(json[10]["license"], Value::Null);
+        assert_eq!(json[12]["license"], Value::Null);
     }
 
     fn fetched(catalog: &Catalog, ids: &[&str], all: bool, card: Option<CardClass>) -> Result<Vec<String>, String> {
@@ -632,7 +637,7 @@ mod tests {
         assert_eq!(fetched(&catalog, &["QWEN3.8-27B", "qwen3.8-27b-16g"], false, sixteen), Ok(vec!["qwen3.8-27b-16g".to_owned()]));
         for card in [Some(CardClass::Gb32), None] {
             assert_eq!(fetched(&catalog, &["qwen3.8-27b"], false, card), Ok(vec!["qwen3.8-27b".to_owned()]), "{card:?}: nothing changes");
-            assert_eq!(fetched(&catalog, &[], true, card).unwrap().len(), 10, "{card:?}");
+            assert_eq!(fetched(&catalog, &[], true, card).unwrap().len(), 12, "{card:?}");
         }
     }
 
@@ -650,6 +655,20 @@ mod tests {
         }
     }
 
+    /// ADR 0074, GitHub #473: `model download swift-1.5-27b` on a 16 GB card
+    /// fetches Swift 1.5's 16 GB build, which can be named too, and on a
+    /// larger card, or one of no known class, the NVFP4 entry.
+    #[test]
+    fn a_download_of_swift_fetches_its_16gb_build_on_a_16gb_card() {
+        let catalog = super::super::catalog::testing::built_in();
+        let sixteen = Some(CardClass::Gb16);
+        assert_eq!(fetched(&catalog, &["swift-1.5-27b"], false, sixteen), Ok(vec!["swift-1.5-27b-16g".to_owned()]));
+        assert_eq!(fetched(&catalog, &["swift-1.5-27b-16g", "SWIFT-1.5-27B"], false, sixteen), Ok(vec!["swift-1.5-27b-16g".to_owned()]), "each entry once");
+        for card in [Some(CardClass::Gb32), Some(CardClass::Gb96), None] {
+            assert_eq!(fetched(&catalog, &["swift-1.5-27b"], false, card), Ok(vec!["swift-1.5-27b".to_owned()]), "{card:?}");
+        }
+    }
+
     /// ADR 0064 §3: a download of an entry above the card's class is
     /// refused whole, before anything is fetched — each such entry named
     /// with both classes, `--all` too — and the default model on a 16 GB
@@ -664,10 +683,11 @@ mod tests {
             assert!(err.contains(said), "{said}: {err}");
         }
         // `--all` names every entry, each through the same resolve step: the
-        // 27B's own and the uncensored variant's resolve to their 16 GB
-        // entries, the others are refused.
+        // 27B's own, the uncensored variant's and Swift 1.5's resolve to
+        // their 16 GB entries, the others are refused.
         let err = fetched(&catalog, &[], true, sixteen).unwrap_err();
         assert!(err.contains("qwen3.8-flash-next needs") && !err.contains("qwen3.8-27b needs") && !err.contains("qwen3.8-27b-abliterated needs"), "{err}");
+        assert!(!err.contains("swift-1.5-27b needs"), "{err}");
         let err = fetched(&super::super::catalog::testing::thirty_two(), &[], false, sixteen).unwrap_err();
         assert!(err.contains("qwen3.8-27b needs a 32 GB card"), "{err}");
         assert!(fetched(&catalog, &["acme-nothing"], false, sixteen).unwrap_err().contains("not in the catalog"));

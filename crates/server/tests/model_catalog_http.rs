@@ -138,7 +138,7 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
     assert_eq!(
         ids,
         [
-            "qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", // the built-in catalog, then the operator's
+            "qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", // the built-in catalog, then the operator's
             "acme-full", "acme-part", "acme-none",
             "mock-a", "mock-gone", "mock-k", // the known models that are not entries, the start model among them
         ]
@@ -152,6 +152,16 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
     // ADR 0078: a built-in entry always states its license.
     assert_eq!(built_in["license"], json!({ "id": "apache-2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0" }));
     assert_eq!(row(&rows, "qwen3.8-flash-next")["license"]["id"], "qwen-community-1.0");
+    // Swift 1.5's two entries (GitHub #473): its own license, the LICENSE in
+    // each entry's repo at its pinned revision.
+    assert_eq!(
+        row(&rows, "swift-1.5-27b")["license"],
+        json!({ "id": "swift-open-license-1.0", "url": "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/LICENSE" })
+    );
+    assert_eq!(
+        row(&rows, "swift-1.5-27b-16g")["license"],
+        json!({ "id": "swift-open-license-1.0", "url": "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/LICENSE" })
+    );
 
     let full = row(&rows, "acme-full");
     assert_eq!(full, &json!({ "id": "acme-full", "source": "operator", "on_disk": "complete", "bytes": 8, "loaded": false, "switchable": true, "available": true, "download": "none", "bytes_on_disk": 8 }));
@@ -306,6 +316,8 @@ async fn every_row_says_its_kind_the_headers_when_the_file_is_there_else_the_cat
         ("qwen3.8-27b", Some("text"), "a family's own id"),
         ("qwen3.8-27b-16g", Some("text"), "its alias, a family's own id"),
         ("qwen3.8-27b-abliterated", Some("text"), "the family it states"),
+        ("swift-1.5-27b", Some("text"), "the family it states"),
+        ("swift-1.5-27b-16g", Some("text"), "the family it states"),
         ("ignis-image-2.1-turbo", Some("image"), "a family's own id"),
         ("qwen3-asr-1.7b", Some("speech"), "the kind it states"),
         ("nemotron-3-diarization", Some("diarizer"), "the kind it states"),

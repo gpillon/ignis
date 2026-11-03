@@ -12,8 +12,8 @@ one container, verified against its provenance sidecar (`.graft.json` or
 ## The catalog
 
 The models the server knows how to fetch are its **catalog**
-([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Ten entries
-are built into the binary, six text and image models, three speech models and a
+([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Twelve entries
+are built into the binary, eight text and image models, three speech models and a
 diarizer, each pinned file by file — byte count and SHA-256 — at a fixed
 revision of its Hugging Face repository:
 
@@ -25,6 +25,8 @@ revision of its Hugging Face repository:
 | `ignis-image-2.1-turbo` | [`gpillon/ignis-image-2.1-turbo`](https://huggingface.co/gpillon/ignis-image-2.1-turbo) | 15.6 GiB (the [image model](../api/images.md); non-commercial licence) |
 | `qwen3.8-27b-16g` | [`gpillon/Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB (the 27B for 16 GB cards) |
 | `qwen3.8-27b-abliterated-16g` | [`gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis) | 12.5 GiB (the [uncensored variant](uncensored.md) for 16 GB cards) |
+| `swift-1.5-27b` | [`gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis) | 18.1 GiB (Swift 1.5, a [fine-tune](fine-tunes.md) of the 27B; a license that restricts commercial use) |
+| `swift-1.5-27b-16g` | [`gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB (Swift 1.5 for 16 GB cards) |
 | `qwen3-asr-1.7b` | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 1.5 GiB (the [speech model](../api/transcriptions.md), `speech.model: auto`: a Q4_K_M decoder and a Q8_0 audio encoder) |
 | `qwen3-asr-1.7b-q8` | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 2.3 GiB (the same with a Q8_0 decoder) |
 | `qwen3-asr-0.6b` | [`gpillon/Qwen3-ASR-0.6B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis) | 0.9 GiB (the smaller speech model, for a weak CPU) |
@@ -35,8 +37,9 @@ reports and what a request puts in `model`.
 
 Every entry states the **license** its weights are published under: an
 identifier as the entry's Hugging Face card names it at the pinned revision,
-and a link to the text. The four 27B entries and the speech
-models are `apache-2.0`, Flash-Next is `qwen-community-1.0`, the image model
+and a link to the text. The 27B's own four entries and the speech
+models are `apache-2.0`, Swift 1.5's two
+[`swift-open-license-1.0`](fine-tunes.md#its-license), Flash-Next is `qwen-community-1.0`, the image model
 `qwen-research` and the diarizer `openmdw-1.1`; the
 [generated reference](../reference/models.md) lists each entry's. It is shown
 beside the entry in the [Server view](../playground/server.md#models), in
@@ -61,7 +64,7 @@ another, and `ignis-server model download <id>` fetches it like any entry.
 
 Each entry states the smallest **card class** it loads on
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md)): every
-built-in model is 32 GB, the RTX 5090's class, except `qwen3.8-27b-16g` and `qwen3.8-27b-abliterated-16g` (16 GB) and the speech models (none).
+built-in model is 32 GB, the RTX 5090's class, except `qwen3.8-27b-16g`, `qwen3.8-27b-abliterated-16g` and `swift-1.5-27b-16g` (16 GB) and the speech models (none).
 On a card of a smaller class (16 GB), the server refuses an entry above it before unloading or fetching
 anything: a switch to it and a request naming it are answered
 `409 model_above_card_class`, naming both classes, while the loaded model
@@ -74,7 +77,8 @@ its family's default id as an **alias**: the 16 GB 27B answers to
 artifact is of the 27B's family, by the artifact's header, answers to it; one
 of another family is refused, naming both. An alias may also be another
 entry's id of the same family: `qwen3.8-27b-abliterated-16g` answers to
-`qwen3.8-27b-abliterated` on a 16 GB card, and an [operator's catalog](operator-catalog.md#an-entrys-family-and-an-alias-of-your-own)
+`qwen3.8-27b-abliterated` on a 16 GB card, `swift-1.5-27b-16g` to
+`swift-1.5-27b` ([fine-tunes](fine-tunes.md)), and an [operator's catalog](operator-catalog.md#an-entrys-family-and-an-alias-of-your-own)
 does the same with an entry's `family`. `GET /v1/models` lists the entry
 under its own id, never under an alias. A model loaded from a path named
 for the load itself — `--model-artifact`, a switch naming its `artifact` — is

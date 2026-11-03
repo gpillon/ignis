@@ -108,6 +108,42 @@ models:
       - { name: qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer.conversion.json, bytes: 339543, sha256: "b5b61863b218bf722e4786ec8ca5e7ffde03548068f92184f10ecd95f6fd0f61" }
       - { name: qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer, bytes: 13379877124, sha256: "4929bc8e1fbc747092f96aebae6b81a0b619db452d05a56df3499fbe1afe9ac5" }
 
+  # Swift 1.5, UkisAI's post-training of the 27B: a fine-tune of the 27B's
+  # family (spec #449, GitHub #473), under the Swift Open License v1.0, which
+  # leaves commercial use above its revenue threshold unlicensed (ADR 0078).
+  # The NVFP4 artifact the 27B NVFP4 converter built from Swift's BF16, every
+  # matrix encoded and every divisor calibrated locally, under its own weights
+  # id (GitHub #470). Its id names no family, so it states it (ADR 0074).
+  # Pinned to the upload's hub commit.
+  - id: swift-1.5-27b
+    repo: gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis
+    revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    artifact: qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer
+    card_class: 32
+    family: qwen3.8-27b
+    license: { id: swift-open-license-1.0, url: "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/LICENSE" }
+    files:
+      - { name: qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer.conversion.json, bytes: 51122, sha256: "3cf455bb5943d26027a5c7a436405a915992ec7e5819bc029a522ead28c708fb" }
+      - { name: qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer, bytes: 19410923780, sha256: "c387c6d019b1e6a42f9e1bb1c2864cee29ea4f501db9de27eedfdfd8248b8912" }
+
+  # Swift 1.5 for the 16 GB card class (spec #449, GitHub #473): the trellis
+  # body and head of a local exllamav3 conversion of Swift's BF16 at the
+  # 16 GB 27B's per-matrix bit widths, every other object the Swift NVFP4
+  # artifact's (GitHub #472). Its id and its alias name no family, so it
+  # states its own (ADR 0074); it answers to the 32 GB entry's served id on a
+  # 16 GB card. Pinned to the upload's hub commit.
+  - id: swift-1.5-27b-16g
+    repo: gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis
+    revision: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    artifact: qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer
+    card_class: 16
+    family: qwen3.8-27b
+    aliases: [swift-1.5-27b]
+    license: { id: swift-open-license-1.0, url: "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/LICENSE" }
+    files:
+      - { name: qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer.conversion.json, bytes: 308144, sha256: "c3116f23756f7c759d84616cf78486618d424ecc5001bfd823c3ddf08cbb3d2d" }
+      - { name: qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer, bytes: 13379877124, sha256: "3a039cb76d2291e3c68f8df5f7b37ac3e83981eb8090625f8a730a670bab63df" }
+
   # The speech models (ADR 0067, spec speech/01 §6, GitHub #351): the
   # Qwen3-ASR decoder and its audio encoder as GGUFs, converted by the owner
   # (tools/speech-gguf/convert.sh) and run on the CPU beside the active model.

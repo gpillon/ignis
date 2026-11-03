@@ -136,20 +136,24 @@ reports. It tells artifacts of one family apart: `qwen3.8-27b` and
 operator's `--model-id`, or the family's default when none is named.
 
 The **catalog** is the set of models the server knows how to fetch
-([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Ten entries
+([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Twelve entries
 are built into the binary, each pinned file by file at a fixed revision of its
-Hugging Face repository: six text and image models, `qwen3.8-27b`,
+Hugging Face repository: eight text and image models, `qwen3.8-27b`,
 `qwen3.8-27b-16g`, `qwen3.8-27b-abliterated`, `qwen3.8-27b-abliterated-16g`,
-`qwen3.8-flash-next` and `ignis-image-2.1-turbo`, plus three speech models and
-a diarizer. Each of the six states the smallest **card class** it loads
-on: 32 GB for all but the two `-16g` entries, which load on 16 GB and answer
-there to `qwen3.8-27b` and to `qwen3.8-27b-abliterated`
+`swift-1.5-27b`, `swift-1.5-27b-16g`, `qwen3.8-flash-next` and
+`ignis-image-2.1-turbo`, plus three speech models and a diarizer. Each of the
+eight states the smallest **card class** it loads on: 32 GB for all but the
+three `-16g` entries, which load on 16 GB and answer there to `qwen3.8-27b`,
+to `qwen3.8-27b-abliterated` and to `swift-1.5-27b`
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md),
 [ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md))
 ([the catalog](../guides/models.md#the-catalog)). An operator can add entries
 with a catalog file of the same format, but cannot re-pin a built-in id; a
 variant of a built-in model is a new id
-([operator catalog](../guides/operator-catalog.md)).
+([operator catalog](../guides/operator-catalog.md)). The abliterated variant
+and Swift 1.5 are **fine-tunes** of the 27B: another party's post-training of
+its checkpoint, the same family under their own ids and licenses
+([fine-tunes](../guides/fine-tunes.md)).
 
 A request may name any **servable** model: the loaded one, plus every model
 whose artifact is on disk. Naming one other than the loaded model switches the

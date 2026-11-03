@@ -514,6 +514,51 @@ mod tests {
         assert_eq!(served_start_options(options.clone(), &served, Some(&own), &catalog, options.card_class(), &|_| panic!("its own entry")).unwrap(), options);
     }
 
+    /// ADR 0074, `main`'s start path end to end with the built-in catalog
+    /// (GitHub #473): `--model-id swift-1.5-27b` on a 16 GB card starts Swift
+    /// 1.5's 16 GB build, which answers to it, under its own id, when its
+    /// artifact's header names the 27B's family; one of another family
+    /// refuses the start before it loads. `--model-id swift-1.5-27b-16g`
+    /// names the build itself. On a 32 GB card, a 96 GB one or one of no
+    /// known class `swift-1.5-27b` is the NVFP4 entry's.
+    #[test]
+    fn a_start_naming_swift_on_a_16gb_card_serves_its_16gb_build() {
+        use crate::config::profile::CardClass;
+        let catalog = catalog::testing::built_in();
+        let dir = PathBuf::from(DIR);
+        let options = start_config_with(&["--model-id", "swift-1.5-27b"], 16 << 30);
+        assert_eq!((options.model.as_str(), options.card_class()), ("swift-1.5-27b", Some(CardClass::Gb16)));
+        let served = start_model(&catalog, &options.model, options.card_class()).unwrap();
+        assert_eq!(served, "swift-1.5-27b-16g");
+        let mut settings = settings(&served, &dir);
+        settings.catalog = &catalog;
+        let ArtifactSource::Use(path) = artifact_source(&settings, |_| true, never_asked) else { panic!("on disk") };
+        assert_eq!(path, dir.join("qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer"));
+        let card = options.card_class();
+        let serving = served_start_options(options.clone(), &served, Some(&path), &catalog, card, &|_| Some(ModelFamily::Qwen38_27b)).unwrap();
+        assert_eq!((serving.model.as_str(), serving.artifact.as_deref()), ("swift-1.5-27b-16g", Some(path.as_path())));
+        let Err(StartRefusal::AboveClass(refusal)) = served_start_options(options.clone(), &served, Some(&path), &catalog, card, &|_| Some(ModelFamily::FlashNext)) else {
+            panic!("a header of another family refuses the start")
+        };
+        let said = refusal.to_string();
+        for named in ["swift-1.5-27b-16g lists it as an alias", "Qwen3.8-Flash-Next", "Qwen3.8-27B", "one model family"] {
+            assert!(said.contains(named), "{named}: {said}");
+        }
+        assert_eq!(start_model(&catalog, "swift-1.5-27b-16g", card), Ok("swift-1.5-27b-16g".to_owned()), "named itself");
+
+        for card in [Some(CardClass::Gb32), Some(CardClass::Gb96), None] {
+            assert_eq!(start_model(&catalog, "swift-1.5-27b", card), Ok("swift-1.5-27b".to_owned()), "{card:?}");
+        }
+        let options = start_config_with(&["--model-id", "swift-1.5-27b"], crate::config::profile::RTX_5090_TOTAL_BYTES);
+        let served = start_model(&catalog, &options.model, options.card_class()).unwrap();
+        assert_eq!(served, "swift-1.5-27b");
+        let mut own_settings = self::settings(&served, &dir);
+        own_settings.catalog = &catalog;
+        let ArtifactSource::Use(own) = artifact_source(&own_settings, |_| true, never_asked) else { panic!("on disk") };
+        assert_eq!(own, dir.join("qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer"));
+        assert_eq!(served_start_options(options.clone(), &served, Some(&own), &catalog, options.card_class(), &|_| panic!("its own entry")).unwrap(), options);
+    }
+
     /// ADR 0064 §3: a start whose model no entry loads on this card is
     /// refused naming both classes — the default model on a 16 GB card in a
     /// catalog without the 16 GB 27B.
