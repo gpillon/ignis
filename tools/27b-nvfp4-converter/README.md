@@ -70,7 +70,10 @@ F:/ai/ngram-venv/Scripts/python.exe -m pytest tools/27b-nvfp4-converter -q
   (`cargo build -p ignis-artifact --bin ignis-artifact-pack`).
 - Machine-local, skipped where absent: the 27B inventory is the served artifact's directory, object for object;
   the base and Swift checkpoints on H: pass the cheap checks; the corpus is 2,690 tokens of the 27B's
-  tokenizer; ninfer's ranking is the pinned one; the encoders' bytes are ninfer's.
+  tokenizer; ninfer's ranking is the pinned one; the encoders' bytes are ninfer's; and a spot check of #469's
+  comparison: 13 objects the recipe makes of the base on the CPU (the draft head's rows, a resource, the GDN
+  small set, a norm, a BF16 exception, one of the parents ninfer encoded itself, the Q4, Q5, Q6 and W8
+  encoders on the vision tower and the MTP layer) are the served artifact's byte for byte.
 
 No test touches the GPU: `conftest.py` hides CUDA from the process and fails the session if CUDA was
 initialized.
