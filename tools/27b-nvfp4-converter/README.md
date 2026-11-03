@@ -81,9 +81,10 @@ F:/ai/ngram-venv/Scripts/python.exe -m pytest tools/27b-nvfp4-converter -q
   tier-1 objects the recipe makes of the base checkpoint on the CPU (`H:/models/Qwen3.8-27B`, every object but
   the drafter's) are the served artifact's byte for byte, and so are the 66 DFlash2 objects of the drafter
   (`H:/models/Qwen3.8-27B-DFlash2`), a test that also skips until the drafter's file is there and hashes to its
-  LFS oid; one of the 135 parents ninfer encoded itself re-encodes byte-equal. The 765 take 25-30 s and peak
-  at 6.6 GiB working set and 10.7 GiB commit for the whole process (the open shard's mapping counts its file
-  size, up to 4 GB); `pytest -s` prints both.
+  LFS oid; one of the 135 parents ninfer encoded itself re-encodes byte-equal. Measured here, each test alone
+  (`pytest -s` prints the cost): the 765 take 25-30 s and peak at 6.6 GiB working set and 10.7 GiB commit; the
+  66 take 94 s, the drafter's hash included, and peak at 8.1 GiB working set and 11.4 GiB commit. Both are the
+  whole process's peaks, and the open file's mapping counts in them (a shard up to 4 GB, the drafter 3.8 GB).
 
 No test touches the GPU: `conftest.py` hides CUDA from the process and fails the session if CUDA was
 initialized.
