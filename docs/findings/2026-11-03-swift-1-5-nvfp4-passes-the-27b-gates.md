@@ -110,7 +110,8 @@ Inferred:
 ## Limits and unknowns
 
 - One machine, one run per leg. The loop rate has n = 32 and used a different build and context from #340's.
-- The replay's texts were sampled from the base, so the replay is biased in Swift's favour.
+- The replay's texts were sampled on the base's NVFP4, so the replay leans against Swift: 1.43% of the recorded tokens
+  fall outside Swift's sampling support (`analyze-swift.txt`), against 0.84% for the served NVFP4 in #340.
 - The server was started by `.scratch/449/gates/srv.py` with exactly the flags `make -n start ARTIFACT=... IDLE_UNLOAD=0
   UI=0 [SPEC=off]` prints, because PowerShell (which `make start` runs) took 2-25 minutes to start on this host.
 - The KLD dumps were deleted after scoring for disk; the results JSONs are kept.
