@@ -590,3 +590,200 @@ def test_the_verify_command_takes_a_baseline(tmp_path):
                          "--override", ov["override"], "--weights-id", VARIANT, "--baseline", base, "--report", out])
     assert code == 0
     assert _json(out)["baseline"]["differ"] == OV_NAMES
+
+
+# --- a fine-tune's 16 GB artifact (#465) ---
+
+UNITS = ("frontend", "text", "mtp", "vision", "dflash2")
+# The record (but its `converter` and `versions`) and each unit's DONE on the synthetic sources, as
+# the converter wrote them at d27e8524, before the fine-tune arguments: without them, both stay so.
+TODAY_RECORD = "61fe88bf8d99a85e198b4c9fafacae60c81a2a7232b97a34afb878b7e5d63022"
+TODAY_DONE = {"frontend": "a6633fda050f6f1ecd5efe4102de8db54cf5423c9d6a09bcd5816452e9c811ee",
+              "text": "eb4e6bc263a2e8d17ba1cfd838eef9f3278e00e47b407c7f5759e98586982c5d",
+              "mtp": "27aa9add2ec029ede049a70d3844a591139f2065a93845fac28166fd463dd4b9",
+              "vision": "6757962a42ccfc76476069a658c0545872a32b5d960d07ed7be73bfa941aaa6e",
+              "dflash2": "c0e16b1d6444a1dee5bfb4aac3ae3cf48f2b4e9c57b3bda12bbac421c4589338"}
+
+
+def _record_digest(record):
+    pinned = {k: v for k, v in record.items() if k not in ("converter", "versions")}
+    return hashlib.sha256(json.dumps(pinned, sort_keys=True).encode()).hexdigest()
+
+
+def test_without_the_fine_tune_arguments_the_work_tree_and_the_record_are_todays(tmp_path):
+    src = make_sources(str(tmp_path))
+    work = str(tmp_path / "work")
+    record = _run(src, work)
+    assert {unit: _sha(os.path.join(work, unit, "DONE")) for unit in UNITS} == TODAY_DONE
+    assert _record_digest(record) == TODAY_RECORD
+    assert sorted(record) == ["converter", "copied", "dropped", "graft", "identity", "local_nvfp4", "objects",
+                              "quant_unused", "reference", "schema", "served", "source", "status", "trellis",
+                              "versions"]
+    assert sorted(record["served"]) == ["bytes", "file", "graft_sidecar", "identity", "sha256"]
+    assert record["served"]["identity"] == {"model_id": "qwen3.8-27b", "weights_id": "nvfp4full"}
+    s = record["source"]
+    assert sorted(s) == ["branch", "files", "license", "quantization_config", "repo", "revision"]
+    assert (s["repo"], s["branch"], s["revision"], s["license"]) == (
+        "turboderp/Qwen3.8-27B-exl3", "SC_3.00bpw_H4", REVISION, "apache-2.0")
+    assert record["reference"]["repo"] == "Qwen/Qwen3.8-27B"
+
+
+from conftest import FINE_TUNE_SERVED, make_fine_tune_served  # noqa: E402
+
+
+def test_a_served_artifact_of_another_weights_id_is_taken_when_named(tmp_path):
+    src = make_fine_tune_served(make_sources(str(tmp_path)), sidecar="graft")
+    with pytest.raises(convert.Refused, match="nvfp4full-swift-1.5.*not the served artifact .*'nvfp4full'"):
+        _run(src, str(tmp_path / "refused"), errors_fn=_never)
+    assert not (tmp_path / "refused").exists()
+    work = str(tmp_path / "work")
+    record = _run(src, work, served_weights_id=FINE_TUNE_SERVED)
+    assert record["served"]["identity"] == {"model_id": "qwen3.8-27b", "weights_id": FINE_TUNE_SERVED}
+    assert record["served"]["file"] == "qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer"
+    # every copied object is the fine-tune's, not the vanilla artifact's
+    served, vanilla = container.Container(src["served"]), container.Container(str(tmp_path / "served" /
+                                                                                  "qwen3_8_27b_nvfp4full-v2.ninfer"))
+    for name, c in record["copied"]["objects"].items():
+        assert c["sha256"] == hashlib.sha256(served.read(name)).hexdigest() != hashlib.sha256(vanilla.read(name)).hexdigest()
+
+
+def test_a_served_artifact_whose_sidecar_is_a_conversion_record_is_taken(tmp_path):
+    src = make_fine_tune_served(make_sources(str(tmp_path)))
+    assert not os.path.exists(src["served"] + ".graft.json")
+    record = _run(src, str(tmp_path / "work"), served_weights_id=FINE_TUNE_SERVED)
+    # the copied drafter's NVFP4 record is the conversion record's, the body plane it names is gone
+    assert record["local_nvfp4"]["parents"] == {
+        "dflash2/feature_projection": {"weight_scale_divisor": None, "relative_frobenius_error": 0.08}}
+    assert record["local_nvfp4"]["encoder_profile"] == "NVFP4_MAXABS_DIVISOR_RNE_V1"
+    assert record["served"]["conversion_sidecar"] == {
+        "file": "qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer.conversion.json",
+        "sha256": _sha(src["served"] + ".conversion.json"), "recipe_id": "qwen3_8_27b_nvfp4full-v2"}
+    # no graft to describe, and nothing else of the served record (its local paths) is carried
+    assert "graft" not in record and "graft_sidecar" not in record["served"]
+    assert "H:/models" not in json.dumps(record)
+
+
+def test_with_both_sidecars_the_graft_record_is_read_as_the_loader_reads_it(tmp_path):
+    src = make_fine_tune_served(make_sources(str(tmp_path)))
+    with open(src["served"] + ".graft.json", "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"recipe_id": "graft", "local_nvfp4": {"parents": {}}}, f)
+    record = _run(src, str(tmp_path / "work"), served_weights_id=FINE_TUNE_SERVED)
+    assert record["served"]["graft_sidecar"]["file"].endswith(".graft.json")
+    assert "conversion_sidecar" not in record["served"] and record["local_nvfp4"]["parents"] == {}
+
+
+def test_a_served_artifact_with_no_sidecar_is_refused_naming_both(tmp_path):
+    src = make_fine_tune_served(make_sources(str(tmp_path)))
+    os.remove(src["served"] + ".conversion.json")
+    with pytest.raises(convert.Refused, match=r"no \.graft\.json and no \.conversion\.json"):
+        _run(src, str(tmp_path / "work"), served_weights_id=FINE_TUNE_SERVED, errors_fn=_never)
+    assert not (tmp_path / "work").exists()
+
+
+LABELS = {"license": "swift-open-license-1.0", "quant_repo": "someone/fine-tune-exl3", "quant_branch": "sc30-recipe",
+          "bf16_repo": "someone/fine-tune"}
+
+
+def test_the_records_license_and_source_labels_are_the_arguments(tmp_path):
+    src = make_sources(str(tmp_path))
+    record = _run(src, str(tmp_path / "work"), labels=LABELS)
+    s = record["source"]
+    assert (s["license"], s["repo"], s["branch"]) == ("swift-open-license-1.0", "someone/fine-tune-exl3", "sc30-recipe")
+    assert record["reference"]["repo"] == "someone/fine-tune"
+    # they change nothing else: back to today's values, the record is today's
+    s.update(license="apache-2.0", repo="turboderp/Qwen3.8-27B-exl3", branch="SC_3.00bpw_H4")
+    record["reference"]["repo"] = "Qwen/Qwen3.8-27B"
+    assert _record_digest(record) == TODAY_RECORD
+
+
+from conftest import make_local_quant  # noqa: E402
+
+QUANT_FILES = ["config.json", "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+               "model.safetensors.index.json", "quantization_config.json"]
+
+
+def test_a_locally_converted_quant_is_pinned_by_its_files_bytes_and_sha256(tmp_path):
+    src = make_sources(str(tmp_path))
+    pins = make_local_quant(src)
+    work = str(tmp_path / "work")
+    record = _run(src, work, quant_pins=pins, labels=LABELS)
+    s = record["source"]
+    assert s["revision"] is None, "a local conversion has no hub revision"
+    assert s["pins"] == {"file": "quant.pins.json", "bytes": os.path.getsize(pins), "sha256": _sha(pins)}
+    assert sorted(s["files"]) == QUANT_FILES
+    for name, pin in s["files"].items():
+        assert pin == {"bytes": os.path.getsize(os.path.join(src["quant"], name)),
+                       "sha256": _sha(os.path.join(src["quant"], name))}
+    # the same quant files give the same work tree as the downloaded quant's
+    assert {unit: _sha(os.path.join(work, unit, "DONE")) for unit in UNITS} == TODAY_DONE
+
+
+def test_a_local_quant_file_whose_hash_is_not_its_pin_is_refused_naming_it(tmp_path):
+    src = make_sources(str(tmp_path))
+    pins = make_local_quant(src)
+    path = os.path.join(src["quant"], "model-00002-of-00002.safetensors")
+    with open(path, "r+b") as f:
+        f.seek(-1, 2)
+        last = f.read(1)
+        f.seek(-1, 2)
+        f.write(bytes([last[0] ^ 1]))
+    with pytest.raises(convert.Refused, match=f"model-00002-of-00002.safetensors hashes to {_sha(path)}, its pin is "):
+        _run(src, str(tmp_path / "work"), quant_pins=pins, labels=LABELS)
+    assert not (tmp_path / "work").exists()
+
+
+@pytest.mark.parametrize("change,message", [
+    (lambda p: p["files"].pop("config.json"), "config.json: .*quant.pins.json gives no bytes and sha256 for it"),
+    (lambda p: p["files"]["model-00001-of-00002.safetensors"].update(bytes=1),
+     r"model-00001-of-00002.safetensors is \d+ bytes, its pin is 1$"),
+    (lambda p: p.pop("files"), "quant.pins.json has no `files`"),
+])
+def test_a_local_quant_its_pins_do_not_cover_is_refused_before_the_gpu_step(tmp_path, change, message):
+    src = make_sources(str(tmp_path))
+    pins = make_local_quant(src)
+    _edit_json(pins, change)
+    with pytest.raises(convert.Refused, match=message):
+        _run(src, str(tmp_path / "work"), quant_pins=pins, labels=LABELS, errors_fn=_never)
+    assert not (tmp_path / "work").exists()
+
+
+def test_a_local_quant_takes_its_own_source_labels_and_never_passes_for_the_downloaded_one(tmp_path):
+    src = make_sources(str(tmp_path))
+    pins = make_local_quant(src)
+    with pytest.raises(convert.Refused, match="takes its own repository and branch labels"):
+        _run(src, str(tmp_path / "work"), quant_pins=pins, labels={"license": "apache-2.0"}, errors_fn=_never)
+    # without its pins, it is refused as any quant with no download record
+    with pytest.raises(convert.Refused, match="no Hugging Face download record"):
+        _run(src, str(tmp_path / "work"), errors_fn=_never)
+    assert not (tmp_path / "work").exists()
+
+
+def test_the_fine_tune_route_runs_and_verifies_from_the_command_line(tmp_path, capsys):
+    """Swift's 16 GB build (#472) in small: its own NVFP4 artifact with a conversion record, its local
+    quant, its labels, its own weights id."""
+    src = make_fine_tune_served(make_sources(str(tmp_path)))
+    pins = make_local_quant(src)
+    work = str(tmp_path / "work")
+    code = convert.main(["run", "--served", src["served"], "--quant", src["quant"], "--bf16", src["bf16"],
+                         "--work", work, "--served-weights-id", FINE_TUNE_SERVED, "--quant-pins", pins,
+                         "--license", LABELS["license"], "--quant-repo", LABELS["quant_repo"],
+                         "--quant-branch", LABELS["quant_branch"], "--bf16-repo", LABELS["bf16_repo"],
+                         "--weights-id", "trellis-sc30-swift-1.5", "--skip-errors"])
+    assert code == 0, capsys.readouterr().out
+    record = _json(os.path.join(work, "converter.json"))
+    assert record["identity"] == {"model_id": "qwen3.8-27b", "weights_id": "trellis-sc30-swift-1.5"}
+    assert record["served"]["identity"]["weights_id"] == FINE_TUNE_SERVED
+    assert "conversion_sidecar" in record["served"] and record["source"]["pins"]["file"] == "quant.pins.json"
+    assert (record["source"]["license"], record["source"]["repo"], record["source"]["branch"]) == (
+        LABELS["license"], LABELS["quant_repo"], LABELS["quant_branch"])
+    artifact = str(tmp_path / "swift-16g.ninfer")
+    pack(work, artifact, identity=convert.identity_of("trellis-sc30-swift-1.5"))
+    capsys.readouterr()
+    code = convert.main(["verify", "--artifact", artifact, "--served", src["served"], "--quant", src["quant"],
+                         "--weights-id", "trellis-sc30-swift-1.5"])
+    assert (code, capsys.readouterr().out.splitlines()[-1]) == (0, "VERIFY PASS")
+    # against the vanilla served artifact, every copied object differs
+    vanilla = str(tmp_path / "served" / "qwen3_8_27b_nvfp4full-v2.ninfer")
+    ok, report = convert.verify(artifact, vanilla, src["quant"], log=lambda _: None, weights_id="trellis-sc30-swift-1.5")
+    assert not ok and report["problems"] and all("sha256 differs from the served object's" in p
+                                                 for p in report["problems"])

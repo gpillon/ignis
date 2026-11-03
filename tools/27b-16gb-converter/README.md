@@ -71,7 +71,7 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
 - **`run`** refuses (exit 2, nothing written) a non-empty `--work`, another quant recipe (its
   `quantization_config.json` must say exl3, mul1, out scales always, 3.0 bits, head 4), a shard whose
   sha256 is not its LFS oid (the BF16 checkpoint's too), files from two revisions or with no download
-  record, a quant matrix with no served plane or a plane
+  record (a quant converted locally is pinned instead: "A fine-tune" below), a quant matrix with no served plane or a plane
   with no quant matrix, split parts that do not tile their plane, and any matrix whose reconstruction
   error is above `--error-bound` (0.6: a layout error, never a quantization one). `--skip-errors` skips
   the GPU step and writes a `dry-run` tree, which the packer takes only with `--accept-status dry-run`.
@@ -120,17 +120,65 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify .
 F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify ... --override H:/override-386 --weights-id trellis-sc30-abliterated --baseline F:/ai/models/Qwen3.8-27B-trellis-3bpw-ignis/qwen3_8_27b_trellis_sc30-v2.ninfer
 ```
 
+## A fine-tune
+
+`run` also builds the 16 GB artifact of a **fine-tune** of the 27B (GitHub #465, spec #449: Swift 1.5),
+from the fine-tune's own NVFP4 artifact and an EXL3 quant converted on this machine at the per-matrix bit
+widths of `SC_3.00bpw_H4`, rather than downloaded. Every object outside the body and the head is then the
+fine-tune's, byte for byte. Each argument below defaults to the vanilla build: with none of them, the work
+tree and `converter.json` are as before.
+
+```
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/convert.py run \
+    --served H:/models/<fine-tune NVFP4>/qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer \
+    --served-weights-id nvfp4full-swift-1.5 \
+    --quant H:/models/<local quant> --quant-pins H:/models/<local quant pins>.json \
+    --quant-repo <the local quant's name> --quant-branch <its recipe> \
+    --bf16 H:/models/<fine-tune BF16> --bf16-repo ukisai/Swift-1.5-Qwen3.8-27b \
+    --license swift-open-license-1.0 --weights-id trellis-sc30-swift-1.5 --work H:/<work>
+F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
+    --artifact H:/<out>/qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer \
+    --served H:/models/<fine-tune NVFP4>/qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer \
+    --quant H:/models/<local quant> --weights-id trellis-sc30-swift-1.5 --report <report.json>
+```
+
+- **The served artifact.** `--served-weights-id` is its weights id (default `nvfp4full`); its model id is
+  `qwen3.8-27b` always, and `run` refuses (exit 2) any other identity. Its sidecar is the one the loader
+  reads: its `.graft.json` when it has one, else the `.conversion.json` the `qwen3.8-27b-nvfp4` packer
+  family writes; `run` refuses an artifact with neither. Of a conversion record `run` reads only
+  `recipe_id` and `local_nvfp4` (whose `parents` it keeps for the copied NVFP4 objects, the DFlash2
+  module's); of a graft record also its provenance of the DFlash2 module (`grafted_from`, `source`,
+  `objects`).
+- **A locally converted quant** has no download record, so its revision cannot be read: `--quant-pins` pins
+  it instead by its files' bytes and sha256, the pins its conversion recorded, as a JSON file:
+  `{"files": {"<file name>": {"bytes": <n>, "sha256": "<hex>"}}}` (other keys are ignored, so the file can
+  carry the conversion's provenance too). Every file the converter reads (the shards, the index,
+  `quantization_config.json`, `config.json`) needs its pin. `run` refuses (exit 2), naming the file, one
+  with no pin or of another size, before the GPU step, and one whose sha256 is not its pin's, once hashed
+  beside it. A local quant takes `--quant-repo` and `--quant-branch` too, so the record never names the
+  downloaded quant's. Its recipe is checked as the download's is (exl3, mul1, out scales always, 3.0 bits,
+  head 4).
+- **The labels** are the record's: `--license` (default `apache-2.0`), `--quant-repo` and `--quant-branch`
+  (default `turboderp/Qwen3.8-27B-exl3`, `SC_3.00bpw_H4`) in `source`, `--bf16-repo` (default
+  `Qwen/Qwen3.8-27B`) in `reference`. The BF16 checkpoint is pinned by its download record as before.
+- **`--weights-id`** is the fine-tune's own 16 GB weights id, so its content hash is not the vanilla one's;
+  pass the packer the same `--weights-id` and the output name.
+- **`verify`** reads neither sidecar nor pins: `--served` is the fine-tune's NVFP4 artifact, whose objects
+  the packed one's copies must be, and `--quant` the local quant.
+
 ## The sidecar
 
 `converter.json` (merged into `<artifact>.conversion.json`) carries no local path and no timestamp:
 
 - `source`: the quant's repository, branch, revision and every file the converter reads, by bytes and
-  sha256; its `quantization_config`.
-- `served`: the served artifact's file name, bytes, sha256 and identity; its graft sidecar's sha256.
+  sha256; its `quantization_config`; its `license`. A local quant has no revision (`null`) and `pins`, its
+  pins file by name, bytes and sha256.
+- `served`: the served artifact's file name, bytes, sha256 and identity; its graft sidecar's sha256
+  (`graft_sidecar`), or its conversion sidecar's sha256 and recipe id (`conversion_sidecar`).
 - `reference`: the BF16 checkpoint the errors are measured against: repository, revision, its index
   and shards by bytes and sha256 (none in a dry run).
-- `graft`: the served graft sidecar's provenance of the DFlash2 module (`grafted_from`, the drafter's
-  config); `local_nvfp4`: its per-object NVFP4 records of the copied objects, which
+- `graft` (only with a graft sidecar): its provenance of the DFlash2 module (`grafted_from`, the drafter's
+  config); `local_nvfp4`: the served sidecar's per-object NVFP4 records of the copied objects, which
   `ignis_artifact::checksum::verify` reads.
 - `trellis`: per matrix its source key, `k2` (2·K), format, shape, bytes, sha256 and relative
   reconstruction error; the K histogram, the bound, the maximum and the mean.
