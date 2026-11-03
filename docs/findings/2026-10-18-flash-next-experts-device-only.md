@@ -79,8 +79,8 @@ charged only while the experts load (below, Limits).
   byte for byte and a refused layer ending the stream; `vram.rs` checks that
   only a resident load's cache holds every expert.
 
-**On the card** (RTX PRO 6000 Server Edition, g7e.4xlarge, Linux, driver
-595.91.07). The develop image (main 851100c7, host pool) was compared with
+**On the card** (RTX PRO 6000 Server Edition, a 16-thread host with 128 GiB
+of RAM, Linux). The develop image (main 851100c7, host pool) was compared with
 the branch built from the same commit, in the same pod shape: same flags
 (`--profile rtxpro6000`, `IGNIS_NGRAM_HOT_BYTES=27G`, loop guard off), same
 prompts, greedy, 512 tokens, 3 reps after a warm-up cell:
@@ -98,13 +98,13 @@ prompts, greedy, 512 tokens, 3 reps after a warm-up cell:
 
 Every one of the 32 lanes (1-lane code and prose, 8-lane code, all reps)
 produced the same text byte for byte. The two `shmem` figures were read in
-the pods with `oc exec` (transcribed in
+the pods, with an exec into each pod (transcribed in
 `.scratch/rtxpro6000-profile/observed-values-not-in-logs.md`).
 
 **The residency load phase** is not compared: the logs saved hold develop's
 51.3 s cold and 12.8 s with the page cache warm, but only one load of the
-branch on the 4xlarge, 38.1 s, whose page cache state was not recorded. On
-the 2xlarge, whose 64 GiB cannot cache the artifact beside the whole n-gram
+branch on the larger host, 38.1 s, whose page cache state was not recorded. On
+the smaller host, whose 64 GiB cannot cache the artifact beside the whole n-gram
 table, every load of the branch took 24-33 s (`ignis-2x-test-current.log`).
 
 **Admission throughput** (`crates/core/examples/residency_admit_bench.rs`,
@@ -127,21 +127,21 @@ they are lower bounds for this host as well:
 Over the six reps (a) ranged 3.15-4.70 GB/s and (b) 3.94-9.58; (c) stayed
 within 10.7-12.6.
 
-**On a g7e.2xlarge** (8 vCPU / 64 GiB, the same RTX PRO 6000): the branch
+**On an 8-thread host with 64 GiB** (the same RTX PRO 6000): the branch
 loaded Flash-Next with the whole n-gram table. Host plan: 61.0 GB available,
 36.8 GB planned, 24.2 GB left. The develop image's plan, 69.9 GB, does not fit
-there. A cold load (fresh node, artifact off the EBS volume) took 2 min:
-device weights 7.6 s, residency 67 s, n-gram 46 s. That first boot's log was
-not saved; its plan and phases are transcribed in
+there. A cold load (a freshly booted host, artifact off the network volume)
+took 2 min: device weights 7.6 s, residency 67 s, n-gram 46 s. That first
+boot's log was not saved; its plan and phases are transcribed in
 `.scratch/rtxpro6000-profile/observed-values-not-in-logs.md`, and the later
 loads of the same Deployment (62.2 and 61.5 GB available) are in
 `ignis-2x-test-current.log`. The same cells as above:
 - 1 lane code / prose: 263.6 / 197.8 tok/s;
 - 8 lanes code: 430.2 tok/s;
 - TTFT 32K: 7.25 s;
-- 0 misses, and the same 32 texts as the 4xlarge's.
+- 0 misses, and the same 32 texts as the larger host's.
 
-Eight vCPUs instead of sixteen cost nothing measurable.
+Eight CPU threads instead of sixteen cost nothing measurable.
 
 ## Finding
 
@@ -176,9 +176,9 @@ Eight vCPUs instead of sixteen cost nothing measurable.
 ## Implications
 
 - A machine around a 96 GB card no longer needs RAM for the experts. A 64 GB
-  host holds Flash-Next with the whole n-gram table, which on a cloud volume
-  is worth 1.24x decode and 2.3x prefill. Measured on a g7e.2xlarge above: the
-  cheaper instance ($3.36/h against $4.00/h) serves at the 4xlarge's rates.
+  host holds Flash-Next with the whole n-gram table, which on a network block
+  volume is worth 1.24x decode and 2.3x prefill. Measured on the smaller host
+  above: it serves at the larger host's rates.
 - The 5090's offloaded path is unchanged (cache < catalog): same pool, split,
   warm start and misses.
 - The exclusive variant (a host pool of only what VRAM does not hold, with

@@ -21,7 +21,7 @@ does it cost in VRAM?
 
 **Setup.**
 - Card and host: one RTX PRO 6000 Blackwell Server Edition (96 GB) on an
-  AWS g7e.2xlarge (8 vCPU, 64 GiB), ROSA HCP, us-east-2a.
+  8-thread host with 64 GiB of RAM, in a Kubernetes cluster.
 - Server: branch `verify-rows` at 33c15274 (`git archive`), built in the
   cluster's dev pod (`cargo build --release --target
   x86_64-unknown-linux-gnu -p ignis-server --features ignis-server/cuda`,

@@ -100,7 +100,7 @@ A host with RAM to spare can go the other way: `--ngram-hot-bytes auto`
 (`make MODEL=flash-next NGRAM_HOT_BYTES=auto`) gives the hot rows what the
 plan leaves, and with about 28 GB more available than the figure above
 (~75 GB) it holds the whole table and the NVMe is out of the decode path. The
-`rtxpro6000` profile sets `auto`. On a cloud block volume (EBS gp3, 16,000
+`rtxpro6000` profile sets `auto`. On a network block volume (16,000
 IOPS) the whole table measured 1.24x the 1 GiB default's decode at one and
 eight lanes and 2.3x its prefill (a 32K-token TTFT of 7.4 s instead of 16.9 s,
 [finding](../../findings/2026-10-18-rtxpro6000-profile-measured.md)). A local

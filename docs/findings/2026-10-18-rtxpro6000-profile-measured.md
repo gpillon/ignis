@@ -1,4 +1,4 @@
-# On an RTX PRO 6000 the derived `rtxpro6000` profile holds: Flash-Next's MTP pays up to 1.85x, and the n-gram rows read off a cloud volume cost a fifth of decode
+# On an RTX PRO 6000 the derived `rtxpro6000` profile holds: Flash-Next's MTP pays up to 1.85x, and the n-gram rows read off a network block volume cost a fifth of decode
 
 - Kind: experiment
 - Status: current
@@ -18,13 +18,13 @@ keep, and what does a 96 GB card want that the profile does not set?
 ## Evidence
 
 **Setup.** One NVIDIA RTX PRO 6000 Blackwell Server Edition (96 GB, 97,887
-MiB), driver 595.91.07, on an AWS g7e.4xlarge (16 vCPU, 128 GiB RAM) in a
-ROSA HCP cluster (OpenShift 4.20.40, RHCOS 9.6, us-east-2a). The engine is
+MiB), Linux, NVIDIA driver, on a 16-thread host with 128 GiB of RAM in a
+Kubernetes cluster. The engine is
 `ghcr.io/gpillon/ignis:develop` at 8adb2e9d
 (`sha256:0a7597167706eadb36b720f25653483d7300228e73773cad63d011fbb956bd95`),
 `--profile rtxpro6000 --model-loop-guard off --model-idle-unload 0`, in a
 pod with a 112 GiB memory limit. The artifacts are the built-in catalog's,
-on an EBS gp3 volume provisioned to 16,000 IOPS and 1,000 MiB/s. Knobs
+on a network block volume provisioned to 16,000 IOPS and 1,000 MiB/s. Knobs
 changed through `PATCH /v1/config`, which reloads in place, and the models
 through `POST /v1/models/switch`, so one pod ran the whole campaign. The
 simulated agents alone ran on another build and host (below).
@@ -111,7 +111,7 @@ reps average 360, so 3 drafts may be ahead there.
 - seed 7, so both configurations get the same schedule.
 
 This ran on the device-only expert build of branch
-`resident-experts-vram-only` on a g7e.2xlarge (8 vCPU, 64 GiB RAM), with the
+`resident-experts-vram-only` on an 8-thread host with 64 GiB of RAM, with the
 whole n-gram table, after a one-lane warm-up per configuration. Its decode
 rates are within 4% of this build's (finding
 2026-10-18-flash-next-experts-device-only).
@@ -235,12 +235,13 @@ mid-campaign, was:
   itself is not timed).
 - **The n-gram table is the 96 GB card's real lever, and it is a host
   setting.** With the 1 GiB default every decode round and every prefill
-  chunk wait on reads of the artifact's table range. On a cloud block volume
+  chunk wait on reads of the artifact's table range. On a network block volume
   (16,000 IOPS, ms latency) that costs a fifth of decode (the whole table
   runs 1.24x) and more than half the prefill (2.3x).
   - The whole table in RAM takes them all off the disk. It costs ~28.8 GB of
     RAM and ~28 s of load.
-  - The gap measured here is EBS's; a local NVMe was not measured.
+  - The gap measured here is the network volume's; a local NVMe was not
+    measured.
 - **Device-resident retained slots are not a profile number.** At 64K
   Flash-Next the device slots' range sits 8-51 ms below the host slots'; the
   27B's ranges overlap. The rest of the second turn's ~0.15-0.35 s is not in
@@ -267,7 +268,7 @@ mid-campaign, was:
   (`active_file` + `inactive_file`; pinned and `shmem` pages count as taken).
   Without this, anvil-serving's recipe shape (52 GiB limit on a ~93 GB host)
   would plan the whole table and be killed.
-- On a 64 GiB host (g7e.2xlarge) the ~38 GB pinned pool of every expert
+- On a 64 GiB host (the smaller one) the ~38 GB pinned pool of every expert
   leaves `auto` less than the whole table. It plans a partial table, above
   the 1 GiB default, whose speed was not measured. The pinned pool itself
   is unverified there against the single-allocation ceiling. A 128 GiB host
@@ -283,7 +284,8 @@ mid-campaign, was:
 - One card, the Server Edition, under Linux. The Workstation and Max-Q
   editions (and Windows) are not measured; the Max-Q's 300 W cap may lower
   every rate.
-- The whole-table gain is measured against a cloud volume, not a local NVMe.
+- The whole-table gain is measured against a network block volume, not a
+  local NVMe.
 - The MTP lane table ran with the 1 GiB hot-rows default, before the profile
   set `auto`; with the whole table, MTP was compared with speculation off
   only at one lane sampled and with the simulated agents.
@@ -332,7 +334,7 @@ https://github.com/gpillon/ignis/issues/329, among them:
 device-only expert residency (ADR 0054), the MTP window fix, the listener
 bound before the load, exit on SIGTERM during a load, the Responses
 WebSocket idle close (`server.socket_idle_close`, 300 s). Same card and
-driver, on a g7e.2xlarge (8 vCPU, 64 GiB, node MemTotal 66.9 GB), pod limit
+driver, on an 8-thread host with 64 GiB (node MemTotal 66.9 GB), pod limit
 56 GiB, `--profile rtxpro6000 --model-loop-guard off --model-idle-unload 0`,
 no n-gram override. First a plain Deployment (grace 120 s, liveness
 `/health` after 10 s, readiness `/ready`) driven from the bench pod, then
@@ -347,7 +349,7 @@ except the decode cells.
   liveness event or kill (`verify-events.txt`); that `/health` answered
   200 throughout is inferred from that, since no poll of it was saved.
   The Knative Service, liveness after 10 s, scaled from zero on the warm
-  node: a request through the gate's Route answered
+  node: a request through the gate answered
   in 129 s (container start 10 s, load 118 s), restarts 0, no liveness
   event (`ksvc-coldstart.out`, `ksvc-*-startup.jsonl`, `ksvc-*-events.txt`).
 - **Host plan (#329 item 8).** `memory.max` 60,129,542,144 (56 GiB);
@@ -361,16 +363,16 @@ except the decode cells.
 - **VRAM plan.** Expert cache 37,795,446,784 = the whole catalog (expected
   hit rate 1.0), `prefill_staging_bytes` 0, KV pool 52.6 GB =
   **11,493,504 tokens** (11,149,376 with the pinned pool's build).
-- **Cold load** (fresh node, volume just attached): device weights 7.5 s,
-  residency 67.0 s, MTP 1.9 s, n-gram whole table 45.8 s. The ksvc's cold
-  load: 7.5 / 61.2 / 1.9 / 45.8 s.
+- **Cold load** (a freshly booted host, volume just attached): device
+  weights 7.5 s, residency 67.0 s, MTP 1.9 s, n-gram whole table 45.8 s. The
+  ksvc's cold load: 7.5 / 61.2 / 1.9 / 45.8 s.
 - **#329 items 4/6.** `repro.py`: the warm-up's first request, one lane at
   slack 0 past 256 and 512 tokens, two lanes at slack 0 together: all five
   `length` at exactly `max_tokens`. Over the 40 requests of this pod's
   first life: 0 `ignis.runtime.leaf_error`, no WARN or ERROR line, and
   still none after the long request and four reloads (`b-repro.out`,
   `verify-log-after-b.jsonl`, `verify-log-after-r4.jsonl`).
-- **Decode against the branch binary's cells** (`fn-x2-*`, same node type;
+- **Decode against the branch binary's cells** (`fn-x2-*`, same host size;
   aggregate tok/s, median of 3; `b-cells.jsonl`):
 
   | Cell | 0a810c0b | branch | MTP acceptance |
@@ -398,15 +400,15 @@ except the decode cells.
   | `hot_bytes: auto` (whole table) | 39.2 GB | **5.0 s** | 45.2 s | 61.9 s |
 
   Device weights took 7.4-7.5 s on every load. For comparison: the pinned-pool
-  build on the 4xlarge read residency cold in 51.3 s and warm in 12.5-12.8 s
-  over 13 reloads; the device-only branch on this node type read residency
+  build on the larger host read residency cold in 51.3 s and warm in 12.5-12.8 s
+  over 13 reloads; the device-only branch on this host size read residency
   in 24-33 s on its reloads (`.scratch/rtxpro6000-profile/ignis-tuning-server.log`,
   `ignis-2x-test-current.log`). The one replacement pod of item 17 below
   that finished residency, the volume still attached, read it in 13.5 s.
 
   Item 16's verdict: device-only residency is faster warm only when every
   expert is in the page cache (5.0 s here, against the pinned pool's
-  12.5-12.8 s measured on the 4xlarge, a different node). A reload under
+  12.5-12.8 s measured on the larger host, a different node). A reload under
   `auto` on this 64 GiB host, the profile's own setting, reads it in
   ~31 s, which is **slower** than the pool path's warm reloads: the whole
   n-gram table in anon memory leaves the page cache too small for the
@@ -426,9 +428,9 @@ except the decode cells.
   (server.socket_idle_close); open a new socket to continue" (`ws-idle.out`).
 - **Knative delete with an idle WebSocket open:** the queue-proxy's
   `preStop` drain returned after its fixed 30 s sleep, ignis got SIGTERM at
-  +30.1 s and stopped 0.64 s later, the pod was gone 33 s after `oc delete
-  ksvc` (the pod's grace: 3,600 s). No close frame reached the client: the
-  socket just ended (`ksvc-delete.out`,
+  +30.1 s and stopped 0.64 s later, the pod was gone 33 s after deleting the
+  Knative Service (the pod's grace: 3,600 s). No close frame reached the
+  client: the socket just ended (`ksvc-delete.out`,
   `ksvc-delete-ignis-tail.jsonl`, `ksvc-delete-qp-tail.txt`).
 
 **Inferred.**
@@ -446,10 +448,10 @@ except the decode cells.
 - The ksvc's first load was near cold (61.2 s) because the volume was
   detached between the Deployment's pod and it (`SuccessfulAttachVolume`
   12:55:19Z), and its page cache went with it.
-- 28.8 GB in 45 s and 37.8 GB in 67 s, 0.56-0.64 GB/s, where the 4xlarge
-  read the same table off the same volume in 27.8 s (~1.04 GB/s): the
-  2xlarge's own EBS bandwidth, not the volume's 1,000 MiB/s. Not measured
-  directly.
+- 28.8 GB in 45 s and 37.8 GB in 67 s, 0.56-0.64 GB/s, where the larger
+  host read the same table off the same volume in 27.8 s (~1.04 GB/s): the
+  smaller host's own bandwidth to the network volume, not the volume's
+  1,000 MiB/s. Not measured directly.
 - The missing close frame is ignis's: `crates/server` has no close-at-
   shutdown path for a WebSocket (from the code; Kourier's Envoy sits in
   between and was not ruled out).
