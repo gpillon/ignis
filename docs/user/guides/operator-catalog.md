@@ -19,6 +19,7 @@ models:
     card_class: 32                     # optional: the smallest card class it loads on, in GB: 16, 32 or 96
     # family: qwen3.8-27b              # optional: its model family, by the family's own id (see below)
     # aliases: [qwen3.8-27b]           # optional: the ids it answers to on a smaller card: its family's default id, or another entry's of its family
+    # license: { id: acme-1.0, url: "https://acme.example/LICENSE" }   # optional: the license its weights are published under (see below)
     files:                             # every file, all pinned
       - { name: acme_ft.ninfer.graft.json, bytes: 48211,       sha256: 9c1e… }
       - { name: acme_ft.ninfer,            bytes: 19406942468, sha256: abb1… }
@@ -61,6 +62,27 @@ default id as an alias — your own 16 GB build answering to `qwen3.8-27b` —
 since the built-in entry keeps its id and pins and still serves it wherever it
 fits: the alias is consulted only on a card below its class, and the answer
 names your entry.
+
+## An entry's license
+
+`license` says which license an entry's weights are published under
+([ADR 0078](../../adr/0078-the-built-in-catalog-names-each-entrys-license-and-may-ship-restricted-weights.md)).
+It has two parts, both required once `license` is there:
+
+- `id`: the license's identifier as Hugging Face cards name it (`apache-2.0`,
+  `qwen-community-1.0`, `openmdw-1.1`...);
+- `url`: a link to its text, the license file in the entry's repo at its
+  pinned revision when the repo holds one, otherwise the license's canonical
+  text.
+
+The built-in entries all state one. Yours may: an entry with no `license`
+loads as before, and a catalog written before the field existed is unchanged.
+A `license` that is not a map of `id` and `url`, or lacks either, or names
+another key, is refused with the entry named. The [Server
+view](../playground/server.md#models), `model list` and `model download` show
+what you state, and `GET /v1/models/catalog` reports it as `license`, absent
+on an entry that states none. Nothing asks the user to accept it: whoever
+downloads is bound by the license, as with any download from the hub.
 
 ## An entry's family, and an alias of your own
 

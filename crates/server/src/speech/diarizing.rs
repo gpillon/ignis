@@ -154,6 +154,7 @@ mod tests {
                 card_class: None,
                 family: None,
                 aliases: Vec::new(),
+                license: None,
                 kind: Some(ModelKind::Diarizer),
                 files: vec![CatalogFile { name: format!("{id}.gguf"), bytes: 4, sha256: "0".repeat(64) }],
                 layer: CatalogLayer::Operator,
