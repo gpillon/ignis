@@ -87,6 +87,21 @@ int32_t ignis_device_runtime_version(int32_t *version);
  * not load, or on a bad argument. */
 int32_t ignis_device_nvml_mem_info(int device_id, uint64_t *free_bytes, uint64_t *total_bytes);
 
+/* The name of CUDA device `device_id` as NVML reports it ("NVIDIA GeForce RTX
+ * 5090"), NUL-terminated into `name` (`name_bytes` long, truncated to fit),
+ * and its compute capability as the CUDA runtime reports it, into `*major`
+ * and `*minor` (12 and 0 on an RTX 5090): what the start checks against
+ * ignis_build_cuda_architectures (GitHub #457). Creates no context and needs
+ * no ignis_device. Returns 0 on success, -1 on a CUDA or NVML error (logged
+ * to stderr), on NVML that does not load, or on a bad argument. */
+int32_t ignis_device_identity(int device_id, char *name, uint32_t name_bytes, int32_t *major, int32_t *minor);
+
+/* The CUDA architectures this leaf's kernels were compiled for, as the build
+ * named them (CMake's CUDA_ARCHITECTURES: "120a", "86;120a"): a static
+ * NUL-terminated string. A card's kernels run on it when one entry's machine
+ * code does (GitHub #457). */
+const char *ignis_build_cuda_architectures(void);
+
 /* Free a device allocation returned by ignis_device_alloc. NULL device or
  * pointer is a no-op. */
 void ignis_device_free(struct ignis_device *d, void *ptr);

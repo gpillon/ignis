@@ -307,6 +307,14 @@ add_library(ignis_kernel STATIC ${IGNIS_KERNEL_SRCS})
 # `-lignis_*` only finds libignis_kernel.a.
 set_target_properties(ignis_kernel PROPERTIES OUTPUT_NAME "ignis_kernel")
 target_include_directories(ignis_kernel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# GitHub #457: the architectures this build compiles for, as the text
+# ignis_build_cuda_architectures returns (kernel/src/device.cu), so a start
+# refuses a card none of them runs on, by name, before anything loads.
+# file(CONFIGURE) rewrites the header only when the list changes.
+file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/ignis_build_architectures.h
+  CONTENT "#pragma once\n#define IGNIS_BUILD_CUDA_ARCHITECTURES \"${CMAKE_CUDA_ARCHITECTURES}\"\n")
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/device.cu PROPERTIES
+  INCLUDE_DIRECTORIES ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(ignis_kernel PUBLIC ignis_vendor)
 # ...and back: the dependency between the two archives is genuinely mutual.
 # The vendored plans call `ninfer::ops::linear` (nvfp4_linear_swiglu_plan.cpp,

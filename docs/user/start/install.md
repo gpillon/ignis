@@ -14,8 +14,8 @@ Every `v*` release publishes ignis three ways, all from the same compile:
 | **Container image** `ghcr.io/gpillon/ignis` | `linux/amd64`, under podman or docker with the NVIDIA container toolkit | the NVIDIA driver; the image carries the CUDA runtime |
 
 All three are compiled for `SM120a` only: the RTX 5090, the RTX PRO 6000 and
-the 16 GB RTX 50 class ([what it runs on](index.md#what-it-runs-on)). None
-carries a model: the server fetches one on first start, or you point it at a
+the 16 GB RTX 50 class ([what it runs on](index.md#what-it-runs-on)); on any
+other card the server refuses to start, naming it. None carries a model: the server fetches one on first start, or you point it at a
 `.ninfer` file you already have ([Get a model](../guides/models.md)). To build
 from a checkout instead, see [Building](../contributing/building.md).
 

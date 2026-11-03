@@ -13,6 +13,24 @@ count, differs from run to run. Error bodies on `/v1` are OpenAI's
 
 ## Starting
 
+### `this build's kernels run on compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell), built for 120a; the card is … (8.9), which they were not built for`
+
+The card is not one the build's kernels were compiled for. The full message
+names the card as NVML does and its compute capability, here an RTX 40 card at
+8.9, and ends "see GitHub #456". Every release, and a build from a checkout by
+default, is compiled for `120a` only: compute capability 12.0, the RTX 50 and
+RTX PRO 6000 Blackwell cards
+([What it runs on](start/index.md#what-it-runs-on)). The server checks the
+card before anything else, whatever `--profile` says, because a load could only
+fail at its first kernel with CUDA's own "no kernel image is available for
+execution on the device". `model download`, `model list` and the `config`
+commands load nothing and still run on such a card.
+
+RTX 30 and 40 cards are not supported
+([#456](https://github.com/gpillon/ignis/issues/456)). On a machine with more
+than one card, ignis uses CUDA device 0; when that is the other card,
+`CUDA_VISIBLE_DEVICES` names the supported one.
+
 ### A start under `--profile auto` is refused, naming `--profile`
 
 The card's total memory is not one the built-in profiles serve (under 20 GiB,

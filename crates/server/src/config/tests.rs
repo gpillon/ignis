@@ -3116,7 +3116,7 @@ fn on_card(flags: &[&str], card: profile::Card) -> Result<Config, ConfigError> {
 }
 
 fn on_total(flags: &[&str], gib: f64) -> Result<Config, ConfigError> {
-    on_card(flags, profile::Card::Total((gib * GIB_F) as u64))
+    on_card(flags, profile::Card::blackwell((gib * GIB_F) as u64))
 }
 
 /// Each card class gets its class's built-in profile, named by what it
@@ -3173,11 +3173,11 @@ fn a_named_profile_beats_auto_whatever_the_card() {
     assert_eq!(flag.card_class(), None, "24 GiB is no class; the named profile still starts");
     assert_eq!(on_total(&["--profile", "none"], 31.8).unwrap().basis.sources().profile_name, "none");
     let env = |key: &str| (key == "IGNIS_PROFILE").then(|| "rtx50-16gb".to_owned());
-    let from_env = resolve_on(&[], env, &file::NoFiles, &|| profile::Card::Total(profile::RTX_5090_TOTAL_BYTES)).map(expect_config).unwrap();
+    let from_env = resolve_on(&[], env, &file::NoFiles, &|| profile::Card::blackwell(profile::RTX_5090_TOTAL_BYTES)).map(expect_config).unwrap();
     assert_eq!(from_env.basis.sources().profile_name, "rtx50-16gb");
     assert_eq!(from_env.card_class(), Some(profile::CardClass::Gb32), "the total read is the card's, not the profile's");
     let files = MemFiles::with(&[("c.yaml", "profile: none\n")]);
-    let from_file = resolve_on(&args(&["--config", "c.yaml"]), no_env, &files, &|| profile::Card::Total(24 << 30)).map(expect_config).unwrap();
+    let from_file = resolve_on(&args(&["--config", "c.yaml"]), no_env, &files, &|| profile::Card::blackwell(24 << 30)).map(expect_config).unwrap();
     assert_eq!(from_file.basis.sources().profile_name, "none");
     // A named profile reads no total for the choice: a probe that panics
     // is never called by `gather`.
@@ -3189,7 +3189,7 @@ fn a_named_profile_beats_auto_whatever_the_card() {
 /// family, exactly as `--profile rtx5090` does.
 #[test]
 fn auto_on_a_5090_resolves_exactly_as_rtx5090_does() {
-    let auto = on_card(&[], profile::Card::Total(profile::RTX_5090_TOTAL_BYTES)).unwrap();
+    let auto = on_card(&[], profile::Card::blackwell(profile::RTX_5090_TOTAL_BYTES)).unwrap();
     let named = config(&["--profile", "rtx5090"]);
     assert_eq!(auto.settings(), named.settings());
     for family in field::FAMILIES {
@@ -3198,6 +3198,73 @@ fn auto_on_a_5090_resolves_exactly_as_rtx5090_does() {
         assert_eq!(a.max_context, n.max_context, "{family:?}");
     }
     assert_eq!(auto.for_family(ModelFamily::Qwen38_27b).unwrap().max_context, 917_504);
+}
+
+// ── a card the kernels were not built for (GitHub #457) ─────────────────────
+
+/// A card of `gib` named `name`, of compute capability `major.minor`, read by
+/// a build whose kernels were compiled for `built_for`.
+fn card_of(gib: f64, name: &str, (major, minor): (u32, u32), built_for: &str) -> profile::Card {
+    profile::Card::Read(profile::CardReading {
+        total: (gib * GIB_F) as u64,
+        name: name.to_owned(),
+        capability: arch::ComputeCapability::new(major, minor),
+        built_for: arch::BuiltArchitectures::parse(built_for).unwrap(),
+    })
+}
+
+/// A start on a card the build's kernels do not run on is refused before
+/// anything loads, under `auto` and under a named profile alike, naming the
+/// card, its compute capability and what the kernels run on: a 16 GB RTX 40
+/// card, which `auto` would otherwise put in the 16 GB class, and a 24 GB one,
+/// which it would refuse as no class.
+#[test]
+fn a_start_on_a_card_the_kernels_were_not_built_for_is_refused_by_name() {
+    for card in [
+        card_of(15.9, "NVIDIA GeForce RTX 4080", (8, 9), "120a"),
+        card_of(23.6, "NVIDIA GeForce RTX 3090", (8, 6), "120a"),
+    ] {
+        let name = card.reading().unwrap().name.clone();
+        for flags in [&[][..], &["--profile", "rtx50-16gb"], &["--profile", "none"]] {
+            let err = on_card(flags, card.clone()).unwrap_err().0;
+            assert!(err.contains(&name), "{flags:?}: {err}");
+            assert!(err.contains("compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell)"), "{flags:?}: {err}");
+            assert!(err.contains("built for 120a;") && err.contains("#456"), "{flags:?}: {err}");
+            assert!(!err.contains("card class"), "the card is refused before its class is asked: {err}");
+        }
+    }
+    let ada = on_card(&[], card_of(15.9, "NVIDIA GeForce RTX 4080", (8, 9), "120a")).unwrap_err().0;
+    assert!(ada.contains("NVIDIA GeForce RTX 4080 (8.9)"), "{ada}");
+}
+
+/// The same card under a build that covers it starts as any card of its
+/// total does; a Blackwell card under the default build is unchanged.
+#[test]
+fn a_card_the_kernels_were_built_for_starts_as_before() {
+    let ampere = on_card(&[], card_of(15.9, "NVIDIA RTX A4000", (8, 6), "86;120a")).unwrap();
+    assert_eq!(ampere.basis.sources().profile_name, "rtx50-16gb");
+    assert_eq!(ampere.card_class(), Some(profile::CardClass::Gb16));
+    let ada_on_ampere_build = on_card(&[], card_of(15.9, "NVIDIA GeForce RTX 4080", (8, 9), "86;120a")).unwrap();
+    assert_eq!(ada_on_ampere_build.basis.sources().profile_name, "rtx50-16gb", "8.6 machine code runs on 8.9");
+    let blackwell = on_card(&[], card_of(31.8, "NVIDIA GeForce RTX 5090", (12, 0), "120a")).unwrap();
+    assert_eq!(blackwell.settings(), config(&["--profile", "rtx5090"]).settings());
+    assert_eq!(blackwell.card().map(|card| card.name.as_str()), Some("NVIDIA GeForce RTX 5090"));
+}
+
+/// The verbs that load nothing read the card as they always did: `config
+/// print` resolves on it, `model list` and `model download` fit to its
+/// class, and the mock build (no card) is unchanged.
+#[test]
+fn the_verbs_read_a_card_the_kernels_were_not_built_for_as_before() {
+    let card = card_of(15.9, "NVIDIA GeForce RTX 4080", (8, 9), "120a");
+    let print = resolve_on(&args(&["config", "print"]), no_env, &file::NoFiles, &|| card.clone()).unwrap();
+    assert!(matches!(print, ConfigOutcome::Print(_)), "{print:?}");
+    let list = resolve_on(&args(&["model", "list"]), no_env, &file::NoFiles, &|| card.clone()).unwrap();
+    assert!(matches!(list, ConfigOutcome::Model(_)), "{list:?}");
+    let download = resolve_on(&args(&["model", "download"]), no_env, &file::NoFiles, &|| card.clone()).unwrap();
+    assert!(matches!(download, ConfigOutcome::Model(_)), "{download:?}");
+    assert_eq!(profile::Card::Absent.refusal(), None);
+    assert!(on_card(&[], profile::Card::Absent).is_ok());
 }
 
 /// `rtx50-16gb` for the 27B: the values the spec derives, and Flash-Next
@@ -3360,7 +3427,7 @@ fn a_file_cannot_define_a_profile_called_none_or_auto() {
 #[test]
 fn a_file_redefining_a_built_in_profile_replaces_what_auto_picks() {
     let files = MemFiles::with(&[("c.yaml", "profiles:\n  rtx5090:\n    model:\n      qwen38:\n        max_context: 131072\n")]);
-    let config = resolve_on(&args(&["--config", "c.yaml"]), no_env, &files, &|| profile::Card::Total(profile::RTX_5090_TOTAL_BYTES))
+    let config = resolve_on(&args(&["--config", "c.yaml"]), no_env, &files, &|| profile::Card::blackwell(profile::RTX_5090_TOTAL_BYTES))
         .map(expect_config)
         .unwrap();
     assert_eq!(config.basis.sources().profile_name, "rtx5090");
@@ -3371,7 +3438,7 @@ fn a_file_redefining_a_built_in_profile_replaces_what_auto_picks() {
 /// `config print` under `auto` refuses naming `--profile`.
 #[test]
 fn the_config_verbs_refuse_a_card_of_no_class_under_auto() {
-    let refused = resolve_on(&args(&["config", "print"]), no_env, &file::NoFiles, &|| profile::Card::Total(24 << 30)).unwrap_err().0;
+    let refused = resolve_on(&args(&["config", "print"]), no_env, &file::NoFiles, &|| profile::Card::blackwell(24 << 30)).unwrap_err().0;
     assert!(refused.contains("--profile"), "{refused}");
-    resolve_on(&args(&["config", "print", "--profile", "none"]), no_env, &file::NoFiles, &|| profile::Card::Total(24 << 30)).unwrap();
+    resolve_on(&args(&["config", "print", "--profile", "none"]), no_env, &file::NoFiles, &|| profile::Card::blackwell(24 << 30)).unwrap();
 }
