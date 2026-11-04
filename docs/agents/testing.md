@@ -432,8 +432,8 @@ stops the release. Check `make gpu-status` first, as for any GPU run.
    The large image sits near the profile's vision item bound
    (`vision.max_tokens`).
 
-The release binary is also checked to carry code for 8.6 and 12.0
-(`mk/cuda-build-check.sh`, already in CI, #482).
+The release binary is also checked to carry code for 8.6 and 12.0, whatever
+list the build was given (`mk/cuda-build-check.sh --require`, in CI, #482).
 
 The gate records correctness only: KLD, top-1, pass or fail per part, and the
 small image's patch count. Never a speed, never a detail of the machine. The

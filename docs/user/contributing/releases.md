@@ -44,7 +44,8 @@ every artifact runs on RTX 30 and RTX 40 cards as well as on Blackwell
 packages a server that is not a CUDA build: `mk/cuda-build-check.sh` reads the
 binaries and refuses a server that would fall back to the CPU mock, which
 v0.9.0 and v0.9.1 shipped (#408), or any binary that carries no machine code
-for 8.6, or none for 12.0 (#482).
+for 8.6, or none for 12.0, which the workflow requires apart from the list the
+build is given (#482).
 
 ## The sm_86 gate
 
@@ -99,7 +100,7 @@ cannot hold resident (#478): skips there are expected, failures are not.
 Each must be answered correctly.
 
 The release binary must also carry machine code for 8.6 and 12.0: the release
-check above does that in CI.
+check above does that in CI, whatever list the build was given.
 
 The gate records correctness only: the two KLD and top-1 figures, pass or fail
 for each part, and the small image's patch count. It records no speed and no

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Refuses an ignis-server binary that is not a CUDA build (GitHub #408), or
 # a binary that carries no machine code for an architecture its build asked
-# for (#482):
+# for, or the release requires (#482):
 #
-#   bash mk/cuda-build-check.sh <binary>...
+#   bash mk/cuda-build-check.sh [--require <list>] <binary>...
 #
 # A server built without the `cuda` feature still starts, reports ready and
 # serves MockCompute's placeholder completions, so nothing downstream of the
@@ -18,8 +18,15 @@
 # as machine code, an ELF cubin in one of the binary's fatbin containers (the
 # blocks nvcc embeds, one per object), counted across the whole binary: the
 # sm_120a-only objects carry no other architecture in any build. PTX does not
-# count. The releases ask for `86;120a` (.github/workflows/release.yml), so a
-# release binary without code for 8.6, or without code for 12.0, is refused.
+# count.
+#
+# `--require <list>`, in the same form, names architectures the binary must
+# carry whatever list the build ran with: what the release requires, `86;120a`
+# (.github/workflows/release.yml), written apart from the build's list, so an
+# edit that drops an architecture from the build is refused here rather than
+# checked against itself. The build's own list is checked beside it; an empty
+# list requires nothing more. A release binary without code for 8.6, or
+# without code for 12.0, is refused.
 #
 # A binary it cannot read is refused too. Every release build runs it on the
 # three binaries it packages, before packaging (the Containerfile's build
@@ -36,23 +43,40 @@ set -uo pipefail
 # holds the two equal.
 marker='built without --features cuda'
 
-if [ "$#" -eq 0 ]; then
-    echo "usage: bash mk/cuda-build-check.sh <binary>..." >&2
+usage() {
+    echo "usage: bash mk/cuda-build-check.sh [--require <list>] <binary>..." >&2
     exit 2
+}
+
+required=
+if [ "${1-}" = --require ]; then
+    [ "$#" -ge 2 ] || usage
+    required=$2
+    shift 2
 fi
+[ "$#" -gt 0 ] || usage
 
 # The list as kernel/CMakeLists.txt reads it, and the machine code each entry
-# asks for: `120a` is sm_120a, an ELF cubin for architecture 120.
+# asks for: `120a` is sm_120a, an ELF cubin for architecture 120. Each wanted
+# architecture keeps what asked for it first, for the refusal to name.
 list=${IGNIS_CUDA_ARCHITECTURES:-120a}
 wanted=()
-IFS=';' read -r -a entries <<< "$list"
-for entry in "${entries[@]}"; do
-    if ! [[ "$entry" =~ ^[1-9][0-9]+a?$ ]]; then
-        echo "cuda-build-check: IGNIS_CUDA_ARCHITECTURES ($list): \`$entry\` is not an architecture such as 86 or 120a" >&2
-        exit 2
-    fi
-    wanted+=("${entry%a}")
-done
+asked=()
+want() {
+    local entry entries
+    IFS=';' read -r -a entries <<< "$1"
+    for entry in "${entries[@]}"; do
+        if ! [[ "$entry" =~ ^[1-9][0-9]+a?$ ]]; then
+            echo "cuda-build-check: $2: \`$entry\` is not an architecture such as 86 or 120a" >&2
+            exit 2
+        fi
+        [[ " ${wanted[*]} " == *" ${entry%a} "* ]] && continue
+        wanted+=("${entry%a}")
+        asked+=("$2")
+    done
+}
+want "$list" "IGNIS_CUDA_ARCHITECTURES ($list)"
+want "$required" "the release's requirement (--require $required)"
 
 # Every architecture a binary carries machine code for, one number per line.
 # A fatbin container is the magic 0xBA55ED50, version 1, a 16-byte header and
@@ -113,19 +137,19 @@ for binary in "$@"; do
         status=1
         continue
     fi
-    missing=()
-    for arch in "${wanted[@]}"; do
-        grep -qx "$arch" <<< "$carried" || missing+=("$arch")
-    done
     found=$(for arch in $carried; do printf 'sm_%s ' "$arch"; done)
     found=${found% }
-    if [ "${#missing[@]}" -gt 0 ]; then
-        for arch in "${missing[@]}"; do
-            echo "cuda-build-check: $binary carries no machine code for compute capability $((arch / 10)).$((arch % 10)) (sm_$arch), which IGNIS_CUDA_ARCHITECTURES ($list) asks for; it has code for: ${found:-none}" >&2
-        done
+    refused=0
+    for i in "${!wanted[@]}"; do
+        arch=${wanted[$i]}
+        grep -qx "$arch" <<< "$carried" && continue
+        echo "cuda-build-check: $binary carries no machine code for compute capability $((arch / 10)).$((arch % 10)) (sm_$arch), which ${asked[$i]} asks for; it has code for: ${found:-none}" >&2
+        refused=1
+    done
+    if [ "$refused" = 1 ]; then
         status=1
         continue
     fi
-    echo "cuda-build-check: $binary: CUDA build, machine code for ${found// /, } (IGNIS_CUDA_ARCHITECTURES: $list)"
+    echo "cuda-build-check: $binary: CUDA build, machine code for ${found// /, } (IGNIS_CUDA_ARCHITECTURES: $list${required:+; required: $required})"
 done
 exit "$status"

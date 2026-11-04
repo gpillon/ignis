@@ -102,6 +102,17 @@ expect 1 - "the default list refuses the mock" "$dir/mock"
 # Any other list is read the same way.
 expect 1 '89;120a' "a list naming 8.9 refuses a build carrying 8.6 alone" "$dir/both"
 expect 2 '86-real;120a' "a list kernel/CMakeLists.txt refuses is a usage error" "$dir/both"
+# The release's own requirement, --require, holds whatever list the build
+# was given: a list that shrank does not shrink the check with it.
+expect 0 '86;120a' "the release's requirement passes a build with both" --require '86;120a' "$dir/both"
+expect 1 '120a' "the release's requirement refuses a build missing 8.6, whatever the build's list" --require '86;120a' "$dir/no-86"
+expect 1 - "the release's requirement refuses a build missing 8.6 with no list set" --require '86;120a' "$dir/no-86"
+expect 1 '86' "the release's requirement refuses a build missing 12.0, whatever the build's list" --require '86;120a' "$dir/no-120"
+expect 1 '86;120a' "the release's requirement lets no mock through" --require '86;120a' "$dir/mock"
+expect 1 '86;120a' "the build's own list is still checked beside the requirement" --require '120a' "$dir/no-86"
+expect 0 - "an empty requirement adds nothing to the build's list" --require '' "$dir/no-86"
+expect 2 - "a requirement kernel/CMakeLists.txt would refuse is a usage error" --require '86-real;120a' "$dir/both"
+expect 2 - "--require with no list is a usage error" --require
 # The binaries themselves.
 expect 1 '86;120a' "one refused binary among good ones refuses the run" "$dir/both" "$dir/no-86" "$dir/both"
 expect 1 - "a missing binary is refused" "$dir/missing"

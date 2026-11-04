@@ -74,10 +74,11 @@ translation unit.
 image included: `.github/workflows/release.yml` sets the variable for both
 builds. Before packaging, `mk/cuda-build-check.sh` reads each binary
 (`ignis-server`, `ignis-bench`, `ignis-artifact-inspect`) and refuses one that
-carries no machine code for an architecture of the list, so a release without
-code for 8.6, or without code for 12.0, is not published. The
-sm_120a code in such a build is the same, byte for byte, as a `120a`-only
-build's.
+carries no machine code for an architecture of the list, or for 8.6 or 12.0,
+which the workflow requires apart from the list (`--require`): a release
+without code for 8.6, or without code for 12.0, is not published, whatever
+the list says. The sm_120a code in such a build is the same, byte for byte, as
+a `120a`-only build's.
 
 Which cards are supported is in [What it runs on](../start/index.md#what-it-runs-on).
 A card none of the listed architectures runs on is refused at start
