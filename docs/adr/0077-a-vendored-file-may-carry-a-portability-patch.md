@@ -41,3 +41,14 @@ launch attribute on a device below compute capability 9.0, which it reads once
 per process, because whether such a device ignores the attribute or rejects it
 is untested. The proposal answers #456's first owner decision ("a new
 exemption, or our own copy under `kernel/src`?"); the owner decides at merge.
+
+The second is the vendored GDN gating test, `tests/ops/test_gdn_gating_proj.cpp`
+(#478). What it fixes is a card size, not an architecture: the test's
+cooperative schedules are sized for the RTX 5090's 170 SMs, and the planner
+resolves the 27B's fused norm/control route with no fallback, so on a card
+with fewer than 120 SMs, RTX 50 included, the test aborted at its first check.
+These terms therefore also admit a host check on the card's SM count in a
+test, which holds no device code: the test asks the planner's own residency
+query and skips, naming it on its output, each schedule the query refuses. On
+the 5090 every schedule is resident, so the test runs and prints what it did
+before. The `reason` names the card size and the planner query it reuses.

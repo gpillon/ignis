@@ -29,9 +29,11 @@ until the test suite is green.
   capability 12.0, with a build that covers it (`IGNIS_CUDA_ARCHITECTURES`,
   #456), run CTest as `ctest -LE sm120a-only`: the tests that label leaves out
   exercise the kernels only the sm_120a set holds, and fail there by design.
-  `ignis_kernel_gdn_gating_proj_tests` also fails on a card with fewer SMs
-  than an RTX 5090: it forces cooperative schedules sized for 170 SMs, which
-  the engine's own planner skips. The one kernel-adjacent thing
+  `ignis_kernel_gdn_gating_proj_tests` runs cooperative schedules sized for
+  the RTX 5090's 170 SMs: on a card with fewer SMs it skips each one the
+  planner's own residency query refuses there and names it in a `SKIP` line
+  of its output (#478, a portability patch under ADR 0077); on the 5090 it
+  skips none. The one kernel-adjacent thing
   `cargo test` *does* check is the vendored subtree's integrity
   (`crates/vendor`): a vendored file edited without a recorded patch turns the
   workspace red (ADR 0010, `kernel/vendor/VENDOR.md`).

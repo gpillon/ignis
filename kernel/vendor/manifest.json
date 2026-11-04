@@ -1639,7 +1639,12 @@
     },
     {
       "path": "tests/ops/test_gdn_gating_proj.cpp",
-      "sha256": "5d6ea618f0b3338fa87792afaa031eec907b9c92e689d0fb3078ea948895375f"
+      "sha256": "5d6ea618f0b3338fa87792afaa031eec907b9c92e689d0fb3078ea948895375f",
+      "patch": {
+        "diff": "patches/tests/ops/test_gdn_gating_proj.cpp.diff",
+        "sha256": "6ff29740d2ad1b5acc74392844f18228d56596184520eafaa22da29c87c02e7c",
+        "reason": "Portability (ADR 0077; GitHub #478): the test runs on a card with fewer SMs than the RTX 5090. The cooperative schedules are sized for its 170 SMs, and the 27B fused norm/control route at T=1..8 (cooperative split40) has no planner fallback, so on a card below 120 SMs gdn_norm_gating_proj_workspace_capacity_bytes throws and the test aborts at its first check. The test now asks the planner's own residency query (candidate_is_legal, through bf16_gdn_gating_resolve_candidate) and skips, naming on stdout, the fused 27B cases and the 27B norm/control workspace interval when it refuses split40; it also names a projection case where bf16_gdn_gating_resolve_plan runs the unsplit route in place of a cooperative one. A host check in a test, no device code; on the RTX 5090 every schedule is resident, the test runs every case it ran before and its output and exit code are unchanged."
+      }
     },
     {
       "path": "tests/ops/test_gdn_input_proj.cpp",
