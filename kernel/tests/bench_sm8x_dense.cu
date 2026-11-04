@@ -12,8 +12,9 @@
 //                      as the dense W: blocks of 128 outputs x 64 inputs, 8 KiB each, [n][k]
 //                      inside, block (nb, kb) at (nb * in / 64 + kb) * 8 KiB.
 //   sm8x_dense_a8      x o suh, the 128-wide Hadamard, then per token amax / 127 over the whole K,
-//                      ties to even (rotate_token_kernel's arithmetic): INT8 [tokens][in], the
-//                      scale and the sum of the token's INT8 values (the offset's rank-1 term).
+//                      ties to even (rotate_token_kernel's arithmetic): INT8 in 64-input slabs,
+//                      [in / 64][tokens][64], so a GEMM stage's activations are one contiguous run;
+//                      the scale and the sum of the token's INT8 values (the offset's rank-1 term).
 //   sm8x_dense_gemm    BM tokens x 128 outputs a CTA, 64 inputs a stage, a 4-stage cp.async
 //                      pipeline, ldmatrix from XOR-swizzled shared memory, 8 warps of 64 x 64 (BM
 //                      256) or 64 x 32 (BM 128), int32 accumulators over the whole K. Epilogue:
@@ -96,20 +97,27 @@ constexpr int kBlockBytes = kBlockN * kBlockK;
 
 __device__ __forceinline__ uint32_t load_stream(const uint32_t *p) { return __ldcs(p); }
 
+// Input k of token t in the INT8 activations: 64-input slabs, [in / 64][tokens][64].
+__host__ __device__ __forceinline__ size_t a_index(int tokens, int t, int k) {
+  return (static_cast<size_t>(k >> 6) * tokens + t) * 64 + (k & 63);
+}
+
 // One warp per strip of 16 outputs x 64 inputs (four trellis tiles down K): lane t decodes its
 // eight steps of each tile -- inputs 16 i + {r0, r0 + 1, r0 + 8, r0 + 9}, outputs {c0, c0 + 8}, r0 =
 // 2 (t % 4), c0 = t / 4 (the format's tensor-core order) -- into the strip in shared memory, then
 // the warp stores the strip's 1 KiB. Strips run outputs-fastest, so a CTA's warps read
 // neighbouring trellis tiles and write neighbouring KiB.
-template <int K2>
-__global__ void __launch_bounds__(kDecWarps * 32) sm8x_dense_decode(const uint32_t *trellis, int stride, int in,
-                                                                     int out, int8_t *w) {
-  __shared__ __align__(16) uint8_t strip[kDecWarps][16 * kBlockK];
+// WARPS 4 is the standalone launch; WARPS 2 (2 KiB of shared memory) fits beside a GEMM CTA in an
+// SM's 100 KiB, for the overlap.
+template <int K2, int WARPS>
+__global__ void __launch_bounds__(WARPS * 32) sm8x_dense_decode(const uint32_t *trellis, int stride, int in,
+                                                                 int out, int8_t *w) {
+  __shared__ __align__(16) uint8_t strip[WARPS][16 * kBlockK];
   constexpr int words = ignis_trellis::tile_words(K2);
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int kbs = in / kBlockK;
-  const long long s = static_cast<long long>(blockIdx.x) * kDecWarps + warp;
+  const long long s = static_cast<long long>(blockIdx.x) * WARPS + warp;
   if (s >= static_cast<long long>(out / 16) * kbs) return;
   const int sub = static_cast<int>(s % 8);
   const int kb = static_cast<int>((s / 8) % kbs);
@@ -197,7 +205,7 @@ __global__ void __launch_bounds__(256) sm8x_dense_a8(const __nv_bfloat16 *x, con
       sum += q[i];
     }
     const uint32_t packed = (q[0] & 0xFF) | ((q[1] & 0xFF) << 8) | ((q[2] & 0xFF) << 16) | (static_cast<uint32_t>(q[3] & 0xFF) << 24);
-    *reinterpret_cast<uint32_t *>(a + static_cast<size_t>(t) * in + blk * 128 + 4 * lane) = packed;
+    *reinterpret_cast<uint32_t *>(a + a_index(tokens, t, blk * 128 + 4 * lane)) = packed;
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xFFFFFFFFu, sum, o);
@@ -221,7 +229,7 @@ constexpr int kBN = 128;  // outputs per CTA: one Hadamard block
 constexpr int kERow = 132;  // fp32 per epilogue staging row
 
 struct GemmParams {
-  const int8_t *a;    // [tokens][in]
+  const int8_t *a;    // [in / 64][tokens][64] (a_index)
   const int8_t *w;    // dense W, blocked (sm8x_dense_decode)
   const float *sa;    // [tokens]
   const int32_t *sq;  // [tokens]
@@ -290,7 +298,7 @@ __device__ __forceinline__ void load_stage(const GemmParams &p, uint32_t st, int
     const int c = idx & 3;
     const int t = row0 + r;
     const bool valid = t < p.tokens;
-    cp_async16_zfill(st + swz(r, c), p.a + static_cast<size_t>(valid ? t : 0) * p.in + kt * kBK + 16 * c, valid);
+    cp_async16_zfill(st + swz(r, c), p.a + a_index(p.tokens, valid ? t : 0, kt * kBK + 16 * c), valid);
   }
   const int8_t *blk = p.w + (static_cast<size_t>(tn) * (p.in / kBK) + kt) * kBlockBytes;
 #pragma unroll
@@ -327,7 +335,9 @@ __device__ __forceinline__ void mma_frags(const uint32_t (&a)[Cfg<BM>::kMI][4], 
     for (int n = 0; n < C::kNI; ++n) mma_s8(acc[i][n], a[i], b[n >> 1][2 * (n & 1)], b[n >> 1][2 * (n & 1) + 1]);
 }
 
-template <int BM>
+// kDiag (a diagnostic of the bench, not the route): 1 skips the main loop's global loads (the
+// stages keep the prologue's data), 2 also its ldmatrix (one set of fragments for every step).
+template <int BM, int kDiag = 0>
 __global__ void __launch_bounds__(kGemmThreads, 1) sm8x_dense_gemm(const __grid_constant__ GemmParams p) {
   using C = Cfg<BM>;
   extern __shared__ __align__(128) uint8_t smem[];
@@ -356,16 +366,24 @@ __global__ void __launch_bounds__(kGemmThreads, 1) sm8x_dense_gemm(const __grid_
     if (s < kts) load_stage<BM>(p, base + s * C::kStage, s, row0, tn);
     cp_async_commit();
   }
+  uint32_t a0[C::kMI][4], b0[C::kNI / 2][4], a1[C::kMI][4], b1[C::kNI / 2][4];
+  if constexpr (kDiag == 2) {
+    cp_async_wait<0>();
+    __syncthreads();
+    load_frags<BM>(base, 0, wm, wn, a0, b0);
+    load_frags<BM>(base, 1, wm, wn, a1, b1);
+  }
   for (int kt = 0; kt < kts; ++kt) {
     cp_async_wait<kStages - 2>();
     __syncthreads();
     const int pf = kt + kStages - 1;
-    if (pf < kts) load_stage<BM>(p, base + (pf % kStages) * C::kStage, pf, row0, tn);
+    if (kDiag == 0 && pf < kts) load_stage<BM>(p, base + (pf % kStages) * C::kStage, pf, row0, tn);
     cp_async_commit();
     const uint32_t st = base + (kt % kStages) * C::kStage;
-    uint32_t a0[C::kMI][4], b0[C::kNI / 2][4], a1[C::kMI][4], b1[C::kNI / 2][4];
-    load_frags<BM>(st, 0, wm, wn, a0, b0);
-    load_frags<BM>(st, 1, wm, wn, a1, b1);
+    if constexpr (kDiag < 2) {
+      load_frags<BM>(st, 0, wm, wn, a0, b0);
+      load_frags<BM>(st, 1, wm, wn, a1, b1);
+    }
     mma_frags<BM>(a0, b0, acc);
     mma_frags<BM>(a1, b1, acc);
   }
@@ -444,22 +462,28 @@ struct Dense {
   int8_t *w = nullptr;  // the dense W, in * out bytes
 };
 
-int decode_grid(int in, int out) { return static_cast<int>((static_cast<long long>(out / 16) * (in / kBlockK) + kDecWarps - 1) / kDecWarps); }
-
-void launch_decode(const ignis_trellis_weight &tw, int8_t *w, cudaStream_t s) {
-  const int grid = decode_grid(static_cast<int>(tw.in), static_cast<int>(tw.out));
+template <int WARPS> void launch_decode_w(const ignis_trellis_weight &tw, int8_t *w, cudaStream_t s) {
+  const int grid = static_cast<int>((static_cast<long long>(tw.out / 16) * (tw.in / kBlockK) + WARPS - 1) / WARPS);
   const uint32_t *t = static_cast<const uint32_t *>(tw.trellis);
   const int stride = static_cast<int>(tw.tile_stride == 0 ? tw.out / 16 : tw.tile_stride);
   const int in = static_cast<int>(tw.in), out = static_cast<int>(tw.out);
   switch (tw.k2) {
-  case 4: sm8x_dense_decode<4><<<grid, kDecWarps * 32, 0, s>>>(t, stride, in, out, w); break;
-  case 5: sm8x_dense_decode<5><<<grid, kDecWarps * 32, 0, s>>>(t, stride, in, out, w); break;
-  case 6: sm8x_dense_decode<6><<<grid, kDecWarps * 32, 0, s>>>(t, stride, in, out, w); break;
-  case 8: sm8x_dense_decode<8><<<grid, kDecWarps * 32, 0, s>>>(t, stride, in, out, w); break;
-  case 10: sm8x_dense_decode<10><<<grid, kDecWarps * 32, 0, s>>>(t, stride, in, out, w); break;
-  default: sm8x_dense_decode<12><<<grid, kDecWarps * 32, 0, s>>>(t, stride, in, out, w); break;
+  case 4: sm8x_dense_decode<4, WARPS><<<grid, WARPS * 32, 0, s>>>(t, stride, in, out, w); break;
+  case 5: sm8x_dense_decode<5, WARPS><<<grid, WARPS * 32, 0, s>>>(t, stride, in, out, w); break;
+  case 6: sm8x_dense_decode<6, WARPS><<<grid, WARPS * 32, 0, s>>>(t, stride, in, out, w); break;
+  case 8: sm8x_dense_decode<8, WARPS><<<grid, WARPS * 32, 0, s>>>(t, stride, in, out, w); break;
+  case 10: sm8x_dense_decode<10, WARPS><<<grid, WARPS * 32, 0, s>>>(t, stride, in, out, w); break;
+  default: sm8x_dense_decode<12, WARPS><<<grid, WARPS * 32, 0, s>>>(t, stride, in, out, w); break;
   }
   BENCH_CUDA(cudaGetLastError());
+}
+
+void launch_decode(const ignis_trellis_weight &tw, int8_t *w, cudaStream_t s, int warps = kDecWarps) {
+  if (warps == 2) {
+    launch_decode_w<2>(tw, w, s);
+  } else {
+    launch_decode_w<kDecWarps>(tw, w, s);
+  }
 }
 
 void launch_a8(const void *x, const void *suh, int tokens, int in, int8_t *a, float *sa, int32_t *sq, cudaStream_t s) {
@@ -470,6 +494,8 @@ void launch_a8(const void *x, const void *suh, int tokens, int in, int8_t *a, fl
 void prepare_gemm() {
   BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm<256>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg<256>::kSmem));
   BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm<128>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg<128>::kSmem));
+  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm<256, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg<256>::kSmem));
+  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm<256, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg<256>::kSmem));
 }
 
 struct GemmCall {
@@ -485,6 +511,7 @@ struct GemmCall {
   int32_t *raw = nullptr;
   int bm = 256;
   int raster = 0;
+  int diag = 0;
 };
 
 void launch_gemm(const GemmCall &c, cudaStream_t s) {
@@ -507,7 +534,10 @@ void launch_gemm(const GemmCall &c, cudaStream_t s) {
   p.ldy = c.ldy;
   p.raw = c.raw;
   const int grid = p.mt * p.nt;
-  if (c.bm == 256) {
+  if (c.diag != 0) {
+    if (c.diag == 1) sm8x_dense_gemm<256, 1><<<grid, kGemmThreads, Cfg<256>::kSmem, s>>>(p);
+    else sm8x_dense_gemm<256, 2><<<grid, kGemmThreads, Cfg<256>::kSmem, s>>>(p);
+  } else if (c.bm == 256) {
     sm8x_dense_gemm<256><<<grid, kGemmThreads, Cfg<256>::kSmem, s>>>(p);
   } else {
     sm8x_dense_gemm<128><<<grid, kGemmThreads, Cfg<128>::kSmem, s>>>(p);
@@ -537,7 +567,7 @@ __global__ void __launch_bounds__(256) ref_int_gemm(const int8_t *a, const int8_
       const int r = i >> 4;
       const int wd = i & 15;
       const int t = t0 + r;
-      as[r][wd] = t < tokens ? *reinterpret_cast<const int32_t *>(a + static_cast<size_t>(t) * in + k0 + 4 * wd) : 0;
+      as[r][wd] = t < tokens ? *reinterpret_cast<const int32_t *>(a + sm8x::a_index(tokens, t, k0 + 4 * wd)) : 0;
       const int n = n0 + r;
       ws[r][wd] = *reinterpret_cast<const int32_t *>(w + (static_cast<size_t>(n >> 7) * (in >> 6) + (k0 >> 6)) * 8192 + (n & 127) * 64 + 4 * wd);
     }
@@ -645,6 +675,49 @@ __global__ void __launch_bounds__(256) peak_kernel(int iters, uint32_t seed, flo
     s += __uint_as_float(hacc[c][0]) + __uint_as_float(hacc[c][1]);
   }
   sink[id] = s;
+}
+
+// L2-resident read bandwidth: a 32 MiB buffer (well inside the L2) read with 16-byte
+// ld.global.cg, four independent loads in flight per thread per step, power-of-two indexing.
+__global__ void __launch_bounds__(256) l2_read(const uint4 *p, uint32_t mask, int iters, unsigned *sink) {
+  uint32_t acc = 0;
+  const uint32_t stride = gridDim.x * blockDim.x;
+  uint32_t i = (blockIdx.x * blockDim.x + threadIdx.x) & mask;
+  for (int it = 0; it < iters; ++it) {
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const uint4 v = __ldcg(p + ((i + u * stride) & mask));
+      acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    i = (i + 4 * stride) & mask;
+  }
+  if (acc == 0x12345678u) *sink = acc;
+}
+
+double l2_read_tbs(int sms) {
+  const size_t bytes = 32ull << 20;
+  DeviceBytes buf(bytes), sink(4);
+  BENCH_CUDA(cudaMemset(buf.p, 1, bytes));
+  const int blocks = 8 * sms, iters = 256;
+  const uint32_t mask = static_cast<uint32_t>(bytes / 16 - 1);
+  l2_read<<<blocks, 256>>>(buf.as<uint4>(), mask, iters, sink.as<unsigned>());
+  cudaEvent_t a, b;
+  BENCH_CUDA(cudaEventCreate(&a));
+  BENCH_CUDA(cudaEventCreate(&b));
+  float best = 1e30f;
+  for (int r = 0; r < 5; ++r) {
+    BENCH_CUDA(cudaEventRecord(a));
+    l2_read<<<blocks, 256>>>(buf.as<uint4>(), mask, iters, sink.as<unsigned>());
+    BENCH_CUDA(cudaEventRecord(b));
+    BENCH_CUDA(cudaEventSynchronize(b));
+    float ms = 0.0f;
+    BENCH_CUDA(cudaEventElapsedTime(&ms, a, b));
+    best = std::min(best, ms);
+  }
+  cudaEventDestroy(a);
+  cudaEventDestroy(b);
+  const double moved = static_cast<double>(blocks) * 256 * iters * 4 * 16;
+  return moved / (best * 1e-3) / 1e12;
 }
 
 struct Rate {
@@ -979,10 +1052,9 @@ void check_matrix(const Artifact &art, const std::string &name, int tokens, cuda
     for (int t = 0; t < tokens; ++t) {
       long long sum = 0;
       for (int k = 0; k < in; ++k) {
-        const size_t i = static_cast<size_t>(t) * in + k;
-        const float v = moe_test::f16_to_f32(xr[i]);
-        wrong += v != static_cast<float>(a[i]);
-        sum += a[i];
+        const int8_t q = a[a_index(tokens, t, k)];
+        wrong += moe_test::f16_to_f32(xr[static_cast<size_t>(t) * in + k]) != static_cast<float>(q);
+        sum += q;
       }
       for (int b = 0; b < in / 128; ++b) wrong_scale += inv[static_cast<size_t>(b) * tokens + t] != sa[t];
       wrong_sum += sum != sq[t];
@@ -1041,7 +1113,7 @@ void check_matrix(const Artifact &art, const std::string &name, int tokens, cuda
     moe_test::hadamard128_inplace(y, out);
     std::vector<double> s2(out / 128, 0.0);
     for (int k = 0; k < in; ++k) {
-      const double av = static_cast<double>(sa[t]) * a[static_cast<size_t>(t) * in + k];
+      const double av = static_cast<double>(sa[t]) * a[a_index(tokens, t, k)];
       for (int b = 0; b < out / 128; ++b) s2[b] += av * av * wsq[static_cast<size_t>(k) * (out / 128) + b];
     }
     for (int n = 0; n < out; ++n) {
@@ -1306,14 +1378,21 @@ void speed(int tokens, Route &r, cudaStream_t s, ChunkTotals &chunk) {
 
 // One layer's matrices in order, the next one's decode on a second stream through the double
 // buffer, against the same sequence on one stream.
-void overlap(int tokens, Route &r, cudaStream_t s1, cudaStream_t s2, double *gdn_ser, double *gdn_ovl, double *gqa_ser,
-             double *gqa_ovl) {
+struct OverlapTimes {
+  double serial = 0, naive = 0, coresident = 0;
+};
+
+// serial: decode, A8, GEMM per matrix on one stream. naive: the next matrix's decode (4 warps a CTA)
+// on a second stream of the same priority. coresident: that decode at 2 warps a CTA, small enough to
+// sit beside a GEMM CTA, on the lowest-priority stream, the A8s and GEMMs on the highest.
+void overlap(int tokens, Route &r, cudaStream_t s1, cudaStream_t s2, cudaStream_t hi, cudaStream_t lo, OverlapTimes *gdn_t,
+             OverlapTimes *gqa_t) {
   const Shape gdn[] = {{"gdn qkv", 5120, 10240, 6, 0}, {"gdn z", 5120, 6144, 6, 0}, {"gdn out", 6144, 5120, 6, 0},
                        {"mlp gate", 5120, 17408, 6, 0}, {"mlp up", 5120, 17408, 6, 0}, {"mlp down", 17408, 5120, 6, 0}};
   const Shape gqa[] = {{"gqa q", 5120, 12288, 6, 0}, {"gqa k", 5120, 1024, 8, 0}, {"gqa v", 5120, 1024, 8, 0},
                        {"gqa o", 6144, 5120, 6, 0}, {"mlp gate", 5120, 17408, 6, 0}, {"mlp up", 5120, 17408, 6, 0},
                        {"mlp down", 17408, 5120, 6, 0}};
-  auto run = [&](const Shape *seq, int n, double *ser, double *ovl) {
+  auto run = [&](const Shape *seq, int n, OverlapTimes *out) {
     std::vector<Pool> pools(n);
     for (int i = 0; i < n; ++i) make_pool(pools[i], seq[i], 1);
     std::vector<GemmCall> calls;
@@ -1341,31 +1420,31 @@ void overlap(int tokens, Route &r, cudaStream_t s1, cudaStream_t s2, double *gdn
         launch_gemm(calls[i], s1);
       }
     };
-    auto overlapped = [&](int rep) {
-      BENCH_CUDA(cudaEventRecord(fork, s1));
-      BENCH_CUDA(cudaStreamWaitEvent(s2, fork, 0));
-      launch_decode(pools[0].w[rep % pools[0].w.size()], r.w[0].as<int8_t>(), s2);
-      BENCH_CUDA(cudaEventRecord(dec[0], s2));
+    auto overlapped = [&](int rep, cudaStream_t sc, cudaStream_t sd, int warps) {
+      BENCH_CUDA(cudaEventRecord(fork, sc));
+      BENCH_CUDA(cudaStreamWaitEvent(sd, fork, 0));
+      launch_decode(pools[0].w[rep % pools[0].w.size()], r.w[0].as<int8_t>(), sd, warps);
+      BENCH_CUDA(cudaEventRecord(dec[0], sd));
       for (int i = 0; i < n; ++i) {
+        launch_a8(r.x.p, r.svh.p, tokens, seq[i].in, r.a.as<int8_t>(), r.sa.as<float>(), r.sq.as<int32_t>(), sc);
+        BENCH_CUDA(cudaStreamWaitEvent(sc, dec[i], 0));
+        launch_gemm(calls[i], sc);
+        BENCH_CUDA(cudaEventRecord(gem[i], sc));
         if (i + 1 < n) {
-          if (i >= 1) BENCH_CUDA(cudaStreamWaitEvent(s2, gem[i - 1], 0));  // buffer (i + 1) % 2 is free
-          launch_decode(pools[i + 1].w[rep % pools[i + 1].w.size()], r.w[(i + 1) & 1].as<int8_t>(), s2);
-          BENCH_CUDA(cudaEventRecord(dec[i + 1], s2));
+          if (i >= 1) BENCH_CUDA(cudaStreamWaitEvent(sd, gem[i - 1], 0));  // buffer (i + 1) % 2 is free
+          launch_decode(pools[i + 1].w[rep % pools[i + 1].w.size()], r.w[(i + 1) & 1].as<int8_t>(), sd, warps);
+          BENCH_CUDA(cudaEventRecord(dec[i + 1], sd));
         }
-        launch_a8(r.x.p, r.svh.p, tokens, seq[i].in, r.a.as<int8_t>(), r.sa.as<float>(), r.sq.as<int32_t>(), s1);
-        BENCH_CUDA(cudaStreamWaitEvent(s1, dec[i], 0));
-        launch_gemm(calls[i], s1);
-        BENCH_CUDA(cudaEventRecord(gem[i], s1));
       }
     };
-    auto measure = [&](auto &&f) {
+    auto measure = [&](cudaStream_t sc, auto &&f) {
       f(0);
       BENCH_CUDA(cudaDeviceSynchronize());
       double best = 1e30;
       for (int rep = 0; rep < g_reps; ++rep) {
-        BENCH_CUDA(cudaEventRecord(a, s1));
+        BENCH_CUDA(cudaEventRecord(a, sc));
         f(rep + 1);
-        BENCH_CUDA(cudaEventRecord(b, s1));
+        BENCH_CUDA(cudaEventRecord(b, sc));
         BENCH_CUDA(cudaEventSynchronize(b));
         float ms = 0.0f;
         BENCH_CUDA(cudaEventElapsedTime(&ms, a, b));
@@ -1373,8 +1452,9 @@ void overlap(int tokens, Route &r, cudaStream_t s1, cudaStream_t s2, double *gdn
       }
       return best;
     };
-    *ser = measure(serial);
-    *ovl = measure(overlapped);
+    out->serial = measure(s1, serial);
+    out->naive = measure(s1, [&](int rep) { overlapped(rep, s1, s2, kDecWarps); });
+    out->coresident = measure(hi, [&](int rep) { overlapped(rep, hi, lo, 2); });
     for (int i = 0; i < n; ++i) {
       cudaEventDestroy(dec[i]);
       cudaEventDestroy(gem[i]);
@@ -1383,8 +1463,8 @@ void overlap(int tokens, Route &r, cudaStream_t s1, cudaStream_t s2, double *gdn
     cudaEventDestroy(b);
     cudaEventDestroy(fork);
   };
-  run(gdn, 6, gdn_ser, gdn_ovl);
-  run(gqa, 7, gqa_ser, gqa_ovl);
+  run(gdn, 6, gdn_t);
+  run(gqa, 7, gqa_t);
 }
 
 void kernel_report(const char *name, const void *f, int threads, int smem) {
@@ -1414,7 +1494,7 @@ int main(int argc, char **argv) {
   std::string artifact;
   std::vector<int> tokens = {2048, 4096};
   int check_tokens = 2048;
-  bool do_check = true, do_speed = true, do_peaks = true;
+  bool do_check = true, do_speed = true, do_peaks = true, diag = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--artifact" && i + 1 < argc) {
@@ -1431,6 +1511,8 @@ int main(int argc, char **argv) {
       do_speed = false;
     } else if (a == "--no-peaks") {
       do_peaks = false;
+    } else if (a == "--diag") {
+      diag = true;
     } else {
       std::fprintf(stderr,
                    "usage: %s [--artifact PATH] [--tokens 2048,4096] [--check-tokens N] [--reps N] [--no-check] [--no-speed] [--no-peaks]\n",
@@ -1459,8 +1541,9 @@ int main(int argc, char **argv) {
   std::printf("kernels:\n");
   kernel_report("sm8x_dense_gemm<256>", reinterpret_cast<const void *>(sm8x_dense_gemm<256>), kGemmThreads, Cfg<256>::kSmem);
   kernel_report("sm8x_dense_gemm<128>", reinterpret_cast<const void *>(sm8x_dense_gemm<128>), kGemmThreads, Cfg<128>::kSmem);
-  kernel_report("sm8x_dense_decode<6>", reinterpret_cast<const void *>(sm8x_dense_decode<6>), kDecWarps * 32, 0);
-  kernel_report("sm8x_dense_decode<10>", reinterpret_cast<const void *>(sm8x_dense_decode<10>), kDecWarps * 32, 0);
+  kernel_report("sm8x_dense_decode<6, 4>", reinterpret_cast<const void *>(sm8x_dense_decode<6, 4>), 128, 0);
+  kernel_report("sm8x_dense_decode<10, 4>", reinterpret_cast<const void *>(sm8x_dense_decode<10, 4>), 128, 0);
+  kernel_report("sm8x_dense_decode<6, 2>", reinterpret_cast<const void *>(sm8x_dense_decode<6, 2>), 64, 0);
   kernel_report("sm8x_dense_a8", reinterpret_cast<const void *>(sm8x_dense_a8), 256, 0);
 
   if (do_peaks) {
@@ -1468,6 +1551,7 @@ int main(int argc, char **argv) {
     const meter::Rate f32 = meter::peak<meter::kF16F32>(g_sms, 4096, 10, 300);
     const meter::Rate f16 = meter::peak<meter::kF16F16>(g_sms, 4096, 10, 300);
     g_s8_peak = s8.tops;
+    std::printf("L2-resident read bandwidth (32 MiB, ld.global.cg, all SMs): %.2f TB/s\n", meter::l2_read_tbs(g_sms));
     std::printf("register-loop peaks (%d blocks x 256 threads, 8 chains):\n", 4 * g_sms);
     std::printf("  %-22s %7.1f TOPS   at %5.0f MHz\n", meter::kPeakName[0], s8.tops, s8.mhz);
     std::printf("  %-22s %7.1f TFLOPS at %5.0f MHz\n", meter::kPeakName[1], f32.tops, f32.mhz);
@@ -1478,9 +1562,13 @@ int main(int argc, char **argv) {
   }
   if (g_s8_peak <= 0.0) g_s8_peak = 1.0;
 
-  cudaStream_t s1, s2;
+  cudaStream_t s1, s2, hi, lo;
   BENCH_CUDA(cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking));
   BENCH_CUDA(cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking));
+  int least = 0, greatest = 0;
+  BENCH_CUDA(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+  BENCH_CUDA(cudaStreamCreateWithPriority(&hi, cudaStreamNonBlocking, greatest));
+  BENCH_CUDA(cudaStreamCreateWithPriority(&lo, cudaStreamNonBlocking, least));
   if (do_check) {
     if (artifact.empty()) {
       std::printf("check: skipped (no --artifact)\n");
@@ -1496,6 +1584,25 @@ int main(int argc, char **argv) {
       for (const char *n : names) check_matrix(art, n, check_tokens, s1);
     }
   }
+  if (diag) {
+    Route r(*std::max_element(tokens.begin(), tokens.end()));
+    std::printf("\n== GEMM diagnostic (BM 256, tokens fastest): full, no global loads, no loads and no ldmatrix ==\n");
+    for (const int t : tokens)
+      for (const Shape &sh : kBody) {
+        double us[3];
+        for (int d = 0; d < 3; ++d) {
+          us[d] = time_us([&](int i) {
+            GemmCall c = gemm_call(r, sh, t, i & 1, 256, 0);
+            c.diag = d;
+            launch_gemm(c, s1);
+          }, 6, s1);
+        }
+        const double ops = 2.0 * t * sh.in * sh.out;
+        std::printf("T %d %-12s %8.1f us %6.1f%% | %8.1f us %6.1f%% | %8.1f us %6.1f%% of s8\n", t, sh.name, us[0],
+                    100.0 * ops / (us[0] * 1e-6) / 1e12 / g_s8_peak, us[1], 100.0 * ops / (us[1] * 1e-6) / 1e12 / g_s8_peak, us[2],
+                    100.0 * ops / (us[2] * 1e-6) / 1e12 / g_s8_peak);
+      }
+  }
   if (do_speed) {
     Route r(*std::max_element(tokens.begin(), tokens.end()));
     std::vector<ChunkTotals> chunks(tokens.size());
@@ -1503,19 +1610,23 @@ int main(int argc, char **argv) {
     std::printf("\n== overlap: the next matrix's decode on a second stream (us per layer) ==\n");
     std::vector<double> ovl_chunk(tokens.size());
     for (size_t i = 0; i < tokens.size(); ++i) {
-      double gs, go, qs, qo;
-      overlap(tokens[i], r, s1, s2, &gs, &go, &qs, &qo);
-      std::printf("T = %d: GDN + MLP layer %.1f serial, %.1f overlapped (%.3fx); GQA + MLP layer %.1f serial, %.1f overlapped (%.3fx)\n",
-                  tokens[i], gs, go, gs / go, qs, qo, qs / qo);
-      std::printf("        48 GDN + 16 GQA layers at K 3 (k, v at K 4): %.2f ms serial, %.2f ms overlapped\n",
-                  (48 * gs + 16 * qs) / 1e3, (48 * go + 16 * qo) / 1e3);
-      ovl_chunk[i] = (48 * go + 16 * qo) / (48 * gs + 16 * qs);
+      OverlapTimes g, q;
+      overlap(tokens[i], r, s1, s2, hi, lo, &g, &q);
+      std::printf("T = %d: GDN + MLP layer %.1f serial, %.1f naive (%.3fx), %.1f co-resident (%.3fx)\n", tokens[i], g.serial,
+                  g.naive, g.serial / g.naive, g.coresident, g.serial / g.coresident);
+      std::printf("        GQA + MLP layer %.1f serial, %.1f naive (%.3fx), %.1f co-resident (%.3fx)\n", q.serial, q.naive,
+                  q.serial / q.naive, q.coresident, q.serial / q.coresident);
+      const double ser = 48 * g.serial + 16 * q.serial;
+      const double best = std::min(48 * g.naive + 16 * q.naive, 48 * g.coresident + 16 * q.coresident);
+      std::printf("        48 GDN + 16 GQA layers at K 3 (k, v at K 4): %.2f ms serial, %.2f ms naive, %.2f ms co-resident\n",
+                  ser / 1e3, (48 * g.naive + 16 * q.naive) / 1e3, (48 * g.coresident + 16 * q.coresident) / 1e3);
+      ovl_chunk[i] = std::min(1.0, best / ser);
     }
     std::printf("\n== projection: the body's prefill GEMMs per prompt (ms) ==\n");
     for (size_t i = 0; i < tokens.size(); ++i) {
       for (const int prompt : {8192, 65536}) {
         const double n = static_cast<double>(prompt) / tokens[i];
-        std::printf("T = %d, %6d tokens: %4.0f chunks; dense %8.1f (overlapped %8.1f), fused %8.1f, fused / dense %.2f\n", tokens[i],
+        std::printf("T = %d, %6d tokens: %4.0f chunks; dense %8.1f (best overlap %8.1f), fused %8.1f, fused / dense %.2f\n", tokens[i],
                     prompt, n, n * chunks[i].total() / 1e3, n * chunks[i].total() * ovl_chunk[i] / 1e3, n * chunks[i].fused / 1e3,
                     chunks[i].fused / chunks[i].total());
       }
@@ -1523,6 +1634,8 @@ int main(int argc, char **argv) {
   }
   BENCH_CUDA(cudaStreamDestroy(s1));
   BENCH_CUDA(cudaStreamDestroy(s2));
+  BENCH_CUDA(cudaStreamDestroy(hi));
+  BENCH_CUDA(cudaStreamDestroy(lo));
   if (g_failed != 0) {
     std::printf("\n%d check(s) FAILED\n", g_failed);
     return 1;
