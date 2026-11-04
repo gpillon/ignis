@@ -139,10 +139,10 @@ fn the_server_view_routes_are_documented_with_their_responses() {
         );
         assert!(document["components"]["schemas"][ok]["properties"].is_object(), "{ok}");
     }
-    // An origin's source is one of six, each named; no configuration is a 501.
+    // An origin's source is one of seven, each named; no configuration is a 501.
     assert_eq!(
         document["components"]["schemas"]["OriginSource"]["enum"],
-        serde_json::json!(["default", "profile", "file", "env", "flag", "live"])
+        serde_json::json!(["default", "profile", "file", "env", "card", "flag", "live"])
     );
     assert!(document["paths"]["/v1/config/origins"]["get"]["responses"]["501"].is_object());
     // The switch takes a model alone, and says what a 404 is.

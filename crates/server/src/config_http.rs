@@ -350,6 +350,8 @@ pub(crate) enum OriginSource {
     File,
     /// An environment variable.
     Env,
+    /// The card, which decided a value no one named: the band it runs.
+    Card,
     /// A command-line flag.
     Flag,
     /// A `PATCH /v1/config` since the server started.
@@ -363,6 +365,7 @@ impl From<Source> for OriginSource {
             Source::Flag => Self::Flag,
             Source::Env => Self::Env,
             Source::File => Self::File,
+            Source::Card => Self::Card,
             Source::Profile => Self::Profile,
             Source::Default => Self::Default,
         }
@@ -416,7 +419,7 @@ fn visible_origins(config: &Config) -> Vec<OriginRow> {
         // definition; the operator chose the profile, by name.
         let spelling = match (source, origin) {
             (Source::Profile, _) => Some(profile.clone()),
-            (Source::Flag | Source::Env | Source::File, Some(origin)) => Some(origin.spelling.clone()),
+            (Source::Flag | Source::Env | Source::File | Source::Card, Some(origin)) => Some(origin.spelling.clone()),
             _ => None,
         };
         let scoped = origin.is_some_and(|origin| origin.scoped);

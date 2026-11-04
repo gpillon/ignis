@@ -107,7 +107,7 @@ export function resolved(doc: ConfigDocument, decl: FieldDecl, family: string): 
  * reach and a removal takes away; a profile's, or a flag's or env var's,
  * which a shared edit does reach and nothing here removes; or the shared one.
  */
-export type Origin = { kind: "own" } | { kind: "profile"; name?: string } | { kind: "set"; spelling?: string } | { kind: "shared" };
+export type Origin = { kind: "own" } | { kind: "profile"; name?: string } | { kind: "card"; name?: string } | { kind: "set"; spelling?: string } | { kind: "shared" };
 
 /**
  * A family's value of `decl` by its origin. Without the origins read, a
@@ -120,6 +120,8 @@ export function originOf(decl: FieldDecl, doc: ConfigDocument | null, origins: O
     const own = doc ? section(doc, decl.group, family) : undefined;
     return own !== undefined && decl.name in own ? { kind: "own" } : { kind: "shared" };
   }
+  // The card decided it (GitHub #477): the band it runs, whatever the field was left to.
+  if (row.source === "card") return { kind: "card", name: row.spelling };
   if (!row.scoped) return { kind: "shared" };
   switch (row.source) {
     case "file":
@@ -163,7 +165,9 @@ export function rowView(decl: FieldDecl, doc: ConfigDocument | null, origins: Or
   if (only !== null) {
     // Only ever in its family's section, whichever scope shows it.
     const own = doc ? section(doc, decl.group, only) : undefined;
-    return { mode, shared, inForce: { value: own?.[decl.name], scope: only }, note: scope === null ? { kind: "only", family: only } : null };
+    const origin = originOf(decl, doc, origins, only);
+    const note = origin.kind === "card" ? { kind: "scoped" as const, origin } : scope === null ? { kind: "only" as const, family: only } : null;
+    return { mode, shared, inForce: { value: own?.[decl.name], scope: only }, note };
   }
   if (!decl.scoped) {
     // Shown in All models only (`inScope`), which says nothing of a field every family shares.
@@ -210,6 +214,8 @@ function originLine(origin: Origin): string {
       return "Own value";
     case "profile":
       return origin.name ? `From profile ${origin.name}` : "From profile";
+    case "card":
+      return origin.name ? `Decided by the card, ${origin.name}` : "Decided by the card";
     case "set":
       return `Set by ${setBy(origin.spelling)}`;
     case "shared":

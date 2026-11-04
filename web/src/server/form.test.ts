@@ -124,6 +124,17 @@ describe("rowView", () => {
     expect(view("spec.backend", "qwen38flashnext")).toMatchObject({ inForce: { value: null, scope: "qwen38flashnext" }, note: { kind: "scoped", origin: { kind: "shared" } } });
   });
 
+  it("says the card decided a value it runs in place of the one left to its default (GitHub #477), also for a field only one model takes", () => {
+    const decided = withRow("model.adapt_context_step", "qwen38", { source: "card", spelling: "NVIDIA GeForce RTX 3090 (8.6)" });
+    for (const scope of ["qwen38", null]) {
+      const card = view("model.adapt_context_step", scope, decided);
+      expect(card.note).toEqual({ kind: "scoped", origin: { kind: "card", name: "NVIDIA GeForce RTX 3090 (8.6)" } });
+      expect(noteLines(card, undefined)).toEqual(["Decided by the card, NVIDIA GeForce RTX 3090 (8.6)"]);
+      expect(canUseShared(card, undefined)).toBe(false);
+    }
+    expect(view("model.adapt_context_step", null).note).toEqual({ kind: "only", family: "qwen38" });
+  });
+
   it("reads a family's value by its origin: the profile's and a flag's are neither own nor removable", () => {
     const profile = view("vram.headroom_bytes", "qwen38");
     expect(profile).toMatchObject({ inForce: { value: "1200M", scope: "qwen38" }, shared: "1536M", note: { kind: "scoped", origin: { kind: "profile", name: "rtx5090" } } });
