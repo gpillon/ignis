@@ -681,7 +681,7 @@ mod tests {
     #[test]
     fn the_model_verbs_read_the_cards_generation_as_a_start_does() {
         let files = MemFiles::default();
-        let rtx_3090 = Card::Read(super::super::profile::CardReading::of(24 << 30, "NVIDIA GeForce RTX 3090", super::super::arch::ComputeCapability::new(8, 6)));
+        let rtx_3090 = Card::Read(super::super::profile::testing::rtx_3090());
         let (ids, ..) = download_of(run_on(&["model", "download", "qwen3.8-27b"], &files, rtx_3090.clone()).unwrap());
         assert_eq!(ids, ["qwen3.8-27b-16g"]);
         let err = run_on(&["model", "download", "qwen3.8-flash-next"], &files, rtx_3090.clone()).unwrap_err().0;

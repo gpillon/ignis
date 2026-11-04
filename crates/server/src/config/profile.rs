@@ -67,14 +67,6 @@ pub struct CardReading {
 }
 
 impl CardReading {
-    /// A card of `total` bytes named `name`, of compute capability
-    /// `capability`, under the release's build (`86;120a`), whose kernels run
-    /// on every GPU generation: what the CPU tests inject for a card by its
-    /// total memory and capability, an RTX 3090 as 24 GiB and 8.6 (spec #474).
-    pub fn of(total: u64, name: &str, capability: ComputeCapability) -> CardReading {
-        CardReading { total, name: name.to_owned(), capability, built_for: BuiltArchitectures::parse("86;120a").expect("the release's list parses") }
-    }
-
     /// The card's class, by its total ([`CardClass::of_total`]); `None` for a
     /// total of no class.
     pub fn class(&self) -> Option<CardClass> {
@@ -464,6 +456,48 @@ pub fn lookup(name: &str, from_file: &BTreeMap<String, Layer>) -> Result<Layer, 
         known.dedup();
         ConfigError(format!("no profile `{name}` (the profiles are {})", known.join(", ")))
     })
+}
+
+/// The cards the CPU tests inject (spec #474), as the start reads them:
+/// by total memory, name and compute capability, under the release's build
+/// (`86;120a`), whose kernels run on every GPU generation. The integration
+/// tests have their own copy, `tests/support/card.rs`.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{CardClass, CardReading, RTX_5090_TOTAL_BYTES};
+    use crate::config::arch::{BuiltArchitectures, ComputeCapability};
+
+    /// A card of `total` bytes named `name`, of compute capability
+    /// `major.minor`.
+    pub(crate) fn reading(total: u64, name: &str, major: u32, minor: u32) -> CardReading {
+        CardReading {
+            total,
+            name: name.to_owned(),
+            capability: ComputeCapability::new(major, minor),
+            built_for: BuiltArchitectures::parse("86;120a").expect("the release's list parses"),
+        }
+    }
+
+    /// A Blackwell card (compute capability 12.0) of `class`: the card the
+    /// class rule's tests are written for, whose generation every entry fits.
+    pub(crate) fn on(class: CardClass) -> CardReading {
+        reading(u64::from(class.gb()) << 30, "NVIDIA RTX (Blackwell)", 12, 0)
+    }
+
+    /// The cards spec #474 is written for, by total memory and compute
+    /// capability: an RTX 3090 (Ampere) and an RTX 4090 (Ada), both 24 GiB.
+    pub(crate) fn rtx_3090() -> CardReading {
+        reading(24 << 30, "NVIDIA GeForce RTX 3090", 8, 6)
+    }
+
+    pub(crate) fn rtx_4090() -> CardReading {
+        reading(24 << 30, "NVIDIA GeForce RTX 4090", 8, 9)
+    }
+
+    /// An RTX 5090, at the total NVML reports for it.
+    pub(crate) fn rtx_5090() -> CardReading {
+        reading(RTX_5090_TOTAL_BYTES, "NVIDIA GeForce RTX 5090", 12, 0)
+    }
 }
 
 #[cfg(test)]

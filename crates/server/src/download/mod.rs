@@ -333,14 +333,10 @@ pub fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::profile::testing::{on, rtx_3090};
     use ignis_core::compute::ModelFamily;
 
     const DIR: &str = "models";
-
-    /// A Blackwell card (compute capability 12.0) of `class`.
-    fn on(class: crate::config::profile::CardClass) -> crate::config::profile::CardReading {
-        crate::config::profile::CardReading::of(u64::from(class.gb()) << 30, "NVIDIA RTX (Blackwell)", crate::config::arch::ComputeCapability::new(12, 0))
-    }
 
     fn settings<'a>(model: &'a str, dir: &'a Path) -> DownloadSettings<'a> {
         DownloadSettings {
@@ -585,10 +581,9 @@ mod tests {
     /// by generation, naming the card and its capability.
     #[test]
     fn a_start_on_an_rtx_3090_serves_the_16gb_entry_and_refuses_the_blackwell_only_ones() {
-        use crate::config::profile::{Card, CardReading};
+        use crate::config::profile::Card;
         let catalog = catalog::testing::built_in();
-        let rtx_3090 = || Card::Read(CardReading::of(24 << 30, "NVIDIA GeForce RTX 3090", crate::config::arch::ComputeCapability::new(8, 6)));
-        let options = start_config_reading(&[], rtx_3090());
+        let options = start_config_reading(&[], Card::Read(rtx_3090()));
         assert_eq!(options.basis.sources().profile_name, "rtx-24gb");
         let served = start_model(&catalog, &options.model, options.card()).unwrap();
         assert_eq!(served, "qwen3.8-27b-16g");
@@ -596,7 +591,7 @@ mod tests {
         let serving = served_start_options(options.clone(), &served, Some(&path), &catalog, options.card(), &|_| Some(ModelFamily::Qwen38_27b)).unwrap();
         assert_eq!(serving.model, "qwen3.8-27b-16g");
         for model in ["qwen3.8-flash-next", "swift-1.5-27b"] {
-            let options = start_config_reading(&["--model-id", model], rtx_3090());
+            let options = start_config_reading(&["--model-id", model], Card::Read(rtx_3090()));
             let refusal = start_model(&catalog, &options.model, options.card()).unwrap_err();
             assert_eq!(refusal.code(), "model_above_gpu_generation", "{model}");
             assert!(refusal.to_string().contains("NVIDIA GeForce RTX 3090 (compute capability 8.6), is of the Ampere generation"), "{refusal}");

@@ -480,19 +480,9 @@ pub async fn run(command: ModelCommand, out: &mut dyn Write, progress: Arc<dyn F
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::arch::ComputeCapability;
+    use crate::config::profile::testing::{on, rtx_3090};
     use crate::config::profile::CardClass;
     use std::collections::BTreeMap;
-
-    /// A Blackwell card (compute capability 12.0) of `class`.
-    fn on(class: CardClass) -> CardReading {
-        CardReading::of(u64::from(class.gb()) << 30, "NVIDIA RTX (Blackwell)", ComputeCapability::new(12, 0))
-    }
-
-    /// An RTX 3090: 24 GiB, compute capability 8.6, Ampere.
-    fn rtx_3090() -> CardReading {
-        CardReading::of(24 << 30, "NVIDIA GeForce RTX 3090", ComputeCapability::new(8, 6))
-    }
 
     /// A directory listing as a size probe.
     fn sizes(files: &[(&str, u64)]) -> impl Fn(&Path) -> Option<u64> {

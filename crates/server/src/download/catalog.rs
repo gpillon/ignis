@@ -952,7 +952,7 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{sixteen_over_thirty_two, thirty_two, SIXTEEN};
     use super::*;
-    use crate::config::arch::ComputeCapability;
+    use crate::config::profile::testing::{on, reading, rtx_3090, rtx_4090, rtx_5090};
 
     /// The spec's table, written out again: what the built-in catalog must
     /// hold, value for value (`id`, `repo`, `revision`, `artifact`, its
@@ -1194,22 +1194,6 @@ mod tests {
 
     fn operator(text: &str) -> Result<Catalog, CatalogError> {
         parse_operator(text, Format::Yaml, "acme.catalog.yaml")
-    }
-
-    /// A Blackwell card (compute capability 12.0) of `class`: the card the
-    /// class rule's tests are written for, whose generation every entry fits.
-    fn on(class: CardClass) -> CardReading {
-        CardReading::of(u64::from(class.gb()) << 30, "NVIDIA RTX (Blackwell)", ComputeCapability::new(12, 0))
-    }
-
-    /// The cards spec #474 is written for, by total memory and compute
-    /// capability: an RTX 3090 (Ampere) and an RTX 4090 (Ada), both 24 GiB.
-    fn rtx_3090() -> CardReading {
-        CardReading::of(24 << 30, "NVIDIA GeForce RTX 3090", ComputeCapability::new(8, 6))
-    }
-
-    fn rtx_4090() -> CardReading {
-        CardReading::of(24 << 30, "NVIDIA GeForce RTX 4090", ComputeCapability::new(8, 9))
     }
 
     /// AC 1: the built-in catalog is the data file, it parses under every
@@ -1909,7 +1893,7 @@ mod tests {
     #[test]
     fn on_a_blackwell_card_or_none_nothing_is_refused_by_generation() {
         let catalog = Catalog::built_in();
-        let five_090 = CardReading::of(crate::config::profile::RTX_5090_TOTAL_BYTES, "NVIDIA GeForce RTX 5090", ComputeCapability::new(12, 0));
+        let five_090 = rtx_5090();
         for entry in catalog.entries() {
             for card in [Some(&on(CardClass::Gb24)), Some(&five_090), None] {
                 let code = catalog.refusal_on(&entry.id, card).map(|refusal| refusal.code());
@@ -1927,7 +1911,7 @@ mod tests {
     /// and is never refused by class on a card of no class.
     #[test]
     fn on_an_ada_card_of_no_class_the_alias_serves_the_16gb_entry() {
-        let card = CardReading::of(48 << 30, "NVIDIA RTX (Ada)", ComputeCapability::new(8, 9));
+        let card = reading(48 << 30, "NVIDIA RTX (Ada)", 8, 9);
         assert_eq!((card.class(), card.generation()), (None, Some(GpuGeneration::Ada)));
         let catalog = Catalog::built_in();
         let refusal = catalog.refusal_on("qwen3.8-27b", Some(&card)).expect("refused by generation");
