@@ -85,6 +85,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <type_traits>
 #include <string>
 #include <vector>
 
@@ -510,9 +511,63 @@ __device__ __forceinline__ void mma_frags(const uint32_t (&a)[Cfg<BM>::kMI][4], 
 // fragments load while the first one's MMAs run.
 // kDiag (a diagnostic of the bench, not the route): 1 skips the main loop's global loads (the
 // stages keep the prologue's data), 2 also its ldmatrix (one set of fragments for every step).
-template <int BM, int kDiag = 0>
+//
+// Lever D (phase 2c), ML 1 and 2: the fragments double-buffered across the stage boundary. Step i
+// loads its second k32 step's fragments, issues stage i + NST - 1 (into the buffer step i - 1 read,
+// freed by step i - 1's barrier), runs the first k32 step's MMAs, then waits for stage i + 1 and
+// syncs, loads its first fragments, and runs the second k32 step's MMAs on fragments that landed
+// long before: the barrier and the ldmatrix latency sit under MMAs instead of in front of them.
+// ML 1 keeps 4 stages, ML 2 has 3. ML 0 is phase 2a's loop.
+template <int ML> __host__ __device__ constexpr int ml_stages() { return ML == 2 ? 3 : kStages; }
+template <int BM, int ML> __host__ __device__ constexpr int gemm_smem() { return Cfg<BM>::kStage * ml_stages<ML>(); }
+static_assert(Cfg<256>::kWarpsM * 16 * kERow * 4 <= gemm_smem<256, 2>(), "the epilogue staging overlays three stages");
+static_assert(Cfg<128>::kWarpsM * 16 * kERow * 4 <= gemm_smem<128, 2>(), "the epilogue staging overlays three stages");
+
+template <int BM, int kDiag, int NST>
+__device__ __forceinline__ void gemm_mainloop_pipelined(const GemmParams &p, uint32_t base, const int8_t *wcol, int row0, int k0,
+                                                        int k1, int wm, int wn, int32_t (&acc)[Cfg<BM>::kMI][Cfg<BM>::kNI][4]) {
+  using C = Cfg<BM>;
+  const int n = k1 - k0;
+#pragma unroll
+  for (int s = 0; s < NST - 1; ++s) {
+    if (s < n) load_stage<BM>(p, base + s * C::kStage, k0 + s, row0, wcol);
+    cp_async_commit();
+  }
+  uint32_t a0[C::kMI][4], b0[C::kNI / 2][4], a1[C::kMI][4], b1[C::kNI / 2][4];
+  cp_async_wait<NST - 2>();
+  __syncthreads();
+  load_frags<BM>(base, 0, wm, wn, a0, b0);
+  if constexpr (kDiag == 2) load_frags<BM>(base, 1, wm, wn, a1, b1);
+  // The stage read and the stage written rotate through the ring by offset, no modulo; the loop
+  // stays rolled (unrolled, it costs registers the persistent kernel does not have).
+  const uint32_t last = base + (NST - 1) * C::kStage;
+  uint32_t rd = base, wr = last;
+#pragma unroll 1
+  for (int kt = 0; kt < n; ++kt) {
+    if constexpr (kDiag < 2) load_frags<BM>(rd, 1, wm, wn, a1, b1);
+    const int pf = kt + NST - 1;
+    if (kDiag == 0 && pf < n) load_stage<BM>(p, wr, k0 + pf, row0, wcol);
+    cp_async_commit();
+    wr = wr == last ? base : wr + C::kStage;
+    mma_frags<BM>(a0, b0, acc);
+    rd = rd == last ? base : rd + C::kStage;
+    if (kt + 1 < n) {
+      cp_async_wait<NST - 2>();
+      __syncthreads();
+      if constexpr (kDiag < 2) load_frags<BM>(rd, 0, wm, wn, a0, b0);
+    }
+    mma_frags<BM>(a1, b1, acc);
+  }
+  cp_async_wait<0>();
+}
+
+template <int BM, int kDiag = 0, int ML = 0>
 __device__ __forceinline__ void gemm_mainloop(const GemmParams &p, uint32_t base, const int8_t *wcol, int row0, int k0, int k1,
                                               int wm, int wn, int32_t (&acc)[Cfg<BM>::kMI][Cfg<BM>::kNI][4]) {
+  if constexpr (ML != 0) {
+    gemm_mainloop_pipelined<BM, kDiag, ml_stages<ML>()>(p, base, wcol, row0, k0, k1, wm, wn, acc);
+    return;
+  }
   using C = Cfg<BM>;
   const int n = k1 - k0;
 #pragma unroll
@@ -633,8 +688,8 @@ __device__ __forceinline__ const int8_t *w_column(const GemmParams &p, int tn) {
   return p.w + static_cast<size_t>(tn) * (p.in / kBK) * kBlockBytes;
 }
 
-// Phase 2a's launch: one CTA per tile.
-template <int BM, int kDiag = 0>
+// Phase 2a's launch: one CTA per tile (ML: lever D's main loop).
+template <int BM, int kDiag = 0, int ML = 0>
 __global__ void __launch_bounds__(kGemmThreads, 1) sm8x_dense_gemm(const __grid_constant__ GemmParams p) {
   using C = Cfg<BM>;
   extern __shared__ __align__(128) uint8_t smem[];
@@ -647,7 +702,7 @@ __global__ void __launch_bounds__(kGemmThreads, 1) sm8x_dense_gemm(const __grid_
   const int wn = warp % C::kWarpsN;
   int32_t acc[C::kMI][C::kNI][4];
   zero_acc<BM>(acc);
-  gemm_mainloop<BM, kDiag>(p, base, w_column(p, tn), row0, 0, p.in / kBK, wm, wn, acc);
+  gemm_mainloop<BM, kDiag, ML>(p, base, w_column(p, tn), row0, 0, p.in / kBK, wm, wn, acc);
   gemm_epilogue<BM>(p, smem, row0, tn, wm, wn, acc);
 }
 
@@ -664,11 +719,12 @@ __global__ void __launch_bounds__(kGemmThreads, 1) sm8x_dense_gemm(const __grid_
 //     counter for the next launch. No CTA waits for another.
 // A segment touches at most two tiles partly (its first and its last), so each has two slots.
 // The persistent kernel's register caps: uncapped (255) it takes 254 registers, the whole 64K file,
-// so no decode CTA fits beside it; capped at 224 (no spills on 86 or 120a, cuobjdump -res-usage) it
-// leaves room for the 2-warp decode CTAs of the co-resident overlap, at a small cost in speed. The
-// route runs the first, the co-resident overlap the second.
+// so no decode CTA fits beside it; capped at 240 (240 x 256 + a 2-warp decode CTA at <= 48 = 64,512
+// of 65,536) it leaves room for the co-resident overlap's decode, at a small cost in speed. The
+// route runs the first, the co-resident overlap the second. (Of the 254, about 30 are the stream-K
+// reduction's; with lever D's main loop the kernel spills a little, reported by cuobjdump.)
 constexpr int kRegsRoute = 255;
-constexpr int kRegsCoresident = 224;
+constexpr int kRegsCoresident = 240;
 
 struct PSched {
   int dp_tiles;
@@ -691,7 +747,7 @@ __device__ __forceinline__ int seg_of(const PSched &s, int i) {
   return j;
 }
 
-template <int BM, int REGS>
+template <int BM, int REGS, int ML = 0>
 __global__ void __maxnreg__(REGS) sm8x_dense_gemm_persistent(const __grid_constant__ GemmParams p, const __grid_constant__ PSched s) {
   using C = Cfg<BM>;
   constexpr int kFrags = C::kMI * C::kNI;
@@ -700,7 +756,7 @@ __global__ void __maxnreg__(REGS) sm8x_dense_gemm_persistent(const __grid_consta
   // and the one broadcast (the last arrival) goes through the stage buffers' last word, free
   // between two main loops.
   extern __shared__ __align__(128) uint8_t smem[];
-  int *const s_last = reinterpret_cast<int *>(smem + C::kSmem) - 1;
+  int *const s_last = reinterpret_cast<int *>(smem + gemm_smem<BM, ML>()) - 1;
   const uint32_t base = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -736,7 +792,7 @@ __global__ void __maxnreg__(REGS) sm8x_dense_gemm_persistent(const __grid_consta
       int tm, tn;
       tile_coords(p, tile, tm, tn);
       zero_acc<BM>(acc);
-      gemm_mainloop<BM>(p, base, w_column(p, tn), tm * BM, k0, k1, wm, wn, acc);
+      gemm_mainloop<BM, 0, ML>(p, base, w_column(p, tn), tm * BM, k0, k1, wm, wn, acc);
     }
     if (slot >= 0) {
       const int lt = tile - s.dp_tiles;
@@ -822,15 +878,23 @@ void launch_a8_shared(const void *x, int tokens, int in, const A8Shared &g, cuda
   BENCH_CUDA(cudaGetLastError());
 }
 
+template <int ML> void prepare_gemm_ml() {
+  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm<256, 0, ML>, cudaFuncAttributeMaxDynamicSharedMemorySize, gemm_smem<256, ML>()));
+  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm<128, 0, ML>, cudaFuncAttributeMaxDynamicSharedMemorySize, gemm_smem<128, ML>()));
+  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm<256, 1, ML>, cudaFuncAttributeMaxDynamicSharedMemorySize, gemm_smem<256, ML>()));
+  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm<256, 2, ML>, cudaFuncAttributeMaxDynamicSharedMemorySize, gemm_smem<256, ML>()));
+  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm_persistent<256, kRegsRoute, ML>, cudaFuncAttributeMaxDynamicSharedMemorySize, gemm_smem<256, ML>()));
+  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm_persistent<128, kRegsRoute, ML>, cudaFuncAttributeMaxDynamicSharedMemorySize, gemm_smem<128, ML>()));
+  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm_persistent<256, kRegsCoresident, ML>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  gemm_smem<256, ML>()));
+  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm_persistent<128, kRegsCoresident, ML>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  gemm_smem<128, ML>()));
+}
+
 void prepare_gemm() {
-  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm<256>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg<256>::kSmem));
-  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm<128>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg<128>::kSmem));
-  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm<256, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg<256>::kSmem));
-  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm<256, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg<256>::kSmem));
-  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm_persistent<256, kRegsRoute>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg<256>::kSmem));
-  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm_persistent<128, kRegsRoute>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg<128>::kSmem));
-  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm_persistent<256, kRegsCoresident>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg<256>::kSmem));
-  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm_persistent<128, kRegsCoresident>, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg<128>::kSmem));
+  prepare_gemm_ml<0>();
+  prepare_gemm_ml<1>();
+  prepare_gemm_ml<2>();
 }
 
 struct GemmCall {
@@ -848,6 +912,7 @@ struct GemmCall {
   int raster = 0;
   int diag = 0;
   int ldr = 0;  // the raw output's row stride (0: out)
+  int ml = 0;   // lever D's main loop: 0 phase 2a's, 1 pipelined over 4 stages, 2 over 3
 };
 
 GemmParams gemm_params(const GemmCall &c) {
@@ -873,16 +938,26 @@ GemmParams gemm_params(const GemmCall &c) {
   return p;
 }
 
-void launch_gemm(const GemmCall &c, cudaStream_t s) {
-  const GemmParams p = gemm_params(c);
+template <int ML> void launch_gemm_ml(const GemmCall &c, const GemmParams &p, cudaStream_t s) {
   const int grid = p.mt * p.nt;
   if (c.diag != 0) {
-    if (c.diag == 1) sm8x_dense_gemm<256, 1><<<grid, kGemmThreads, Cfg<256>::kSmem, s>>>(p);
-    else sm8x_dense_gemm<256, 2><<<grid, kGemmThreads, Cfg<256>::kSmem, s>>>(p);
+    if (c.diag == 1) sm8x_dense_gemm<256, 1, ML><<<grid, kGemmThreads, gemm_smem<256, ML>(), s>>>(p);
+    else sm8x_dense_gemm<256, 2, ML><<<grid, kGemmThreads, gemm_smem<256, ML>(), s>>>(p);
   } else if (c.bm == 256) {
-    sm8x_dense_gemm<256><<<grid, kGemmThreads, Cfg<256>::kSmem, s>>>(p);
+    sm8x_dense_gemm<256, 0, ML><<<grid, kGemmThreads, gemm_smem<256, ML>(), s>>>(p);
   } else {
-    sm8x_dense_gemm<128><<<grid, kGemmThreads, Cfg<128>::kSmem, s>>>(p);
+    sm8x_dense_gemm<128, 0, ML><<<grid, kGemmThreads, gemm_smem<128, ML>(), s>>>(p);
+  }
+}
+
+void launch_gemm(const GemmCall &c, cudaStream_t s) {
+  const GemmParams p = gemm_params(c);
+  if (c.ml == 1) {
+    launch_gemm_ml<1>(c, p, s);
+  } else if (c.ml == 2) {
+    launch_gemm_ml<2>(c, p, s);
+  } else {
+    launch_gemm_ml<0>(c, p, s);
   }
   BENCH_CUDA(cudaGetLastError());
 }
@@ -940,12 +1015,22 @@ void launch_gemm_persistent(const GemmCall &c, int sk, cudaStream_t st, bool cap
   const GemmParams p = gemm_params(c);
   const PSched s = make_psched(p.mt * p.nt, p.in / kBK, sk);
   const int grid = s.dp_tiles > 0 ? g_grid_sms : s.segs;
-  if (c.bm == 256) {
-    if (cap) sm8x_dense_gemm_persistent<256, kRegsCoresident><<<grid, kGemmThreads, Cfg<256>::kSmem, st>>>(p, s);
-    else sm8x_dense_gemm_persistent<256, kRegsRoute><<<grid, kGemmThreads, Cfg<256>::kSmem, st>>>(p, s);
+  auto go = [&](auto ml_tag) {
+    constexpr int ML = decltype(ml_tag)::value;
+    if (c.bm == 256) {
+      if (cap) sm8x_dense_gemm_persistent<256, kRegsCoresident, ML><<<grid, kGemmThreads, gemm_smem<256, ML>(), st>>>(p, s);
+      else sm8x_dense_gemm_persistent<256, kRegsRoute, ML><<<grid, kGemmThreads, gemm_smem<256, ML>(), st>>>(p, s);
+    } else {
+      if (cap) sm8x_dense_gemm_persistent<128, kRegsCoresident, ML><<<grid, kGemmThreads, gemm_smem<128, ML>(), st>>>(p, s);
+      else sm8x_dense_gemm_persistent<128, kRegsRoute, ML><<<grid, kGemmThreads, gemm_smem<128, ML>(), st>>>(p, s);
+    }
+  };
+  if (c.ml == 1) {
+    go(std::integral_constant<int, 1>{});
+  } else if (c.ml == 2) {
+    go(std::integral_constant<int, 2>{});
   } else {
-    if (cap) sm8x_dense_gemm_persistent<128, kRegsCoresident><<<grid, kGemmThreads, Cfg<128>::kSmem, st>>>(p, s);
-    else sm8x_dense_gemm_persistent<128, kRegsRoute><<<grid, kGemmThreads, Cfg<128>::kSmem, st>>>(p, s);
+    go(std::integral_constant<int, 0>{});
   }
   BENCH_CUDA(cudaGetLastError());
 }
@@ -1411,6 +1496,7 @@ struct Lever {
   bool a8_shared = false;   // A: one A8 launch per shared input (--a8 shared)
   bool persistent = false;  // B: the persistent tile scheduler with a stream-K tail (--sched persistent)
   bool slice = false;       // C: decode into L2-sized output slices, each consumed at once (--decode slice)
+  bool loop = false;        // D: the GEMM main loop with its fragments pipelined (--mainloop pipelined)
 };
 
 std::string lever_name(const Lever &l) {
@@ -1418,6 +1504,7 @@ std::string lever_name(const Lever &l) {
   if (l.a8_shared) n += "A";
   if (l.persistent) n += n.empty() ? "B" : "+B";
   if (l.slice) n += n.empty() ? "C" : "+C";
+  if (l.loop) n += n.empty() ? "D" : "+D";
   return n.empty() ? std::string("phase 2a") : n;
 }
 
@@ -1427,25 +1514,40 @@ struct RouteVariant {
   int raster = 0;
   int sk = 0;        // persistent: 0 stream-K over the last partial wave, 1 over it and one full wave more
   bool cap = false;  // persistent: the co-resident overlap's register-capped instantiation
+  int ml = 0;        // lever D's main loop
 };
 
+// The main loops a configuration picks from: phase 2a's, or lever D's two depths.
+std::vector<int> lever_loops(const Lever &cfg) { return cfg.loop ? std::vector<int>{1, 2} : std::vector<int>{0}; }
+
+// The check's variants: every main loop of the configuration; persistent, each raster, stream-K
+// split and register cap at least once per main loop.
 std::vector<RouteVariant> route_variants(const Lever &cfg) {
-  if (!cfg.persistent) return {RouteVariant{0, 0, false}};
   std::vector<RouteVariant> v;
-  for (const bool cap : {false, true})
-    for (const int raster : {0, 1})
-      for (const int sk : {0, 1}) v.push_back(RouteVariant{raster, sk, cap});
+  for (const int ml : lever_loops(cfg)) {
+    if (!cfg.persistent) {
+      v.push_back(RouteVariant{0, 0, false, ml});
+    } else {
+      v.push_back(RouteVariant{0, 0, false, ml});
+      v.push_back(RouteVariant{1, 1, false, ml});
+      v.push_back(RouteVariant{0, 1, true, ml});
+      v.push_back(RouteVariant{1, 0, true, ml});
+    }
+  }
   return v;
 }
 
 std::string route_label(const Lever &cfg) {
   std::string s;
-  if (cfg.persistent) s += ", persistent: 2 rasters x 2 stream-K splits x 2 register caps";
+  if (cfg.persistent) s += ", persistent: both rasters, stream-K splits and register caps";
   if (cfg.slice) s += ", slice decode";
+  if (cfg.loop) s += ", lever D's main loop over 4 and 3 stages";
   return s;
 }
 
-void gemm_sched(const Lever &cfg, const RouteVariant &rv, const GemmCall &c, cudaStream_t s) {
+void gemm_sched(const Lever &cfg, const RouteVariant &rv, const GemmCall &c0, cudaStream_t s) {
+  GemmCall c = c0;
+  c.ml = rv.ml;
   if (cfg.persistent) {
     launch_gemm_persistent(c, rv.sk, s, rv.cap);
   } else {
@@ -2028,59 +2130,78 @@ GemmCall gemm_call(Route &r, const Shape &sh, int tokens, int wbuf, int bm, int 
   return c;
 }
 
-double time_gemm(Route &r, const Shape &sh, int tokens, int bm, int raster, cudaStream_t s) {
-  return time_us([&](int i) { launch_gemm(gemm_call(r, sh, tokens, i & 1, bm, raster), s); }, 6, s);
+double time_gemm(Route &r, const Shape &sh, int tokens, int bm, int raster, cudaStream_t s, int ml = 0) {
+  return time_us([&](int i) {
+    GemmCall c = gemm_call(r, sh, tokens, i & 1, bm, raster);
+    c.ml = ml;
+    launch_gemm(c, s);
+  }, 6, s);
 }
 
-double time_gemm_persistent(Route &r, const Shape &sh, int tokens, int bm, int raster, int sk, cudaStream_t s) {
-  return time_us([&](int i) { launch_gemm_persistent(gemm_call(r, sh, tokens, i & 1, bm, raster), sk, s); }, 6, s);
+double time_gemm_persistent(Route &r, const Shape &sh, int tokens, int bm, int raster, int sk, cudaStream_t s, int ml = 0) {
+  return time_us([&](int i) {
+    GemmCall c = gemm_call(r, sh, tokens, i & 1, bm, raster);
+    c.ml = ml;
+    launch_gemm_persistent(c, sk, s);
+  }, 6, s);
 }
 
 struct GemmChoice {
   double us = 1e30;
-  int bm = 256, raster = 0, sk = 0;
+  int bm = 256, raster = 0, sk = 0, ml = 0;
 };
 
-// The GEMM's tile height and raster order, the faster of the four on this card for this shape.
-GemmChoice best_gemm(Route &r, const Shape &sh, int tokens, cudaStream_t s) {
+// The GEMM's tile height and raster order (and with lever D its main loop's depth), the fastest
+// on this card for this shape.
+GemmChoice best_gemm(Route &r, const Shape &sh, int tokens, const std::vector<int> &mls, cudaStream_t s) {
   GemmChoice best;
-  for (const int bm : {256, 128})
-    for (const int raster : {0, 1}) {
-      const double us = time_gemm(r, sh, tokens, bm, raster, s);
-      if (us < best.us) best = GemmChoice{us, bm, raster, 0};
-    }
-  return best;
-}
-
-// Lever B: the tile height, raster order and stream-K split, the fastest of the eight.
-GemmChoice best_gemm_persistent(Route &r, const Shape &sh, int tokens, cudaStream_t s) {
-  GemmChoice best;
-  for (const int bm : {256, 128})
-    for (const int raster : {0, 1})
-      for (const int sk : {0, 1}) {
-        const double us = time_gemm_persistent(r, sh, tokens, bm, raster, sk, s);
-        if (us < best.us) best = GemmChoice{us, bm, raster, sk};
+  for (const int ml : mls)
+    for (const int bm : {256, 128})
+      for (const int raster : {0, 1}) {
+        const double us = time_gemm(r, sh, tokens, bm, raster, s, ml);
+        if (us < best.us) best = GemmChoice{us, bm, raster, 0, ml};
       }
   return best;
 }
 
-std::map<std::string, GemmChoice> g_choice;   // per (shape, tokens): the grid launch
-std::map<std::string, GemmChoice> g_pchoice;  // per (shape, tokens): the persistent launch
+// Lever B: the tile height, raster order and stream-K split (and the main loop), the fastest.
+GemmChoice best_gemm_persistent(Route &r, const Shape &sh, int tokens, const std::vector<int> &mls, cudaStream_t s) {
+  GemmChoice best;
+  for (const int ml : mls)
+    for (const int bm : {256, 128})
+      for (const int raster : {0, 1})
+        for (const int sk : {0, 1}) {
+          const double us = time_gemm_persistent(r, sh, tokens, bm, raster, sk, s, ml);
+          if (us < best.us) best = GemmChoice{us, bm, raster, sk, ml};
+        }
+  return best;
+}
+
+double time_choice(Route &r, const Shape &sh, int tokens, bool persistent, const GemmChoice &c, cudaStream_t s) {
+  return persistent ? time_gemm_persistent(r, sh, tokens, c.bm, c.raster, c.sk, s, c.ml) : time_gemm(r, sh, tokens, c.bm, c.raster, s, c.ml);
+}
+
+std::map<std::string, GemmChoice> g_choice;  // per (shape, tokens, scheduler, main loop)
 
 std::string key(const Shape &s, int tokens) { return std::string(s.name) + "/" + std::to_string(tokens); }
+std::string gkey(const Shape &s, int tokens, bool persistent, bool loop) {
+  return key(s, tokens) + (persistent ? "/persistent" : "/grid") + (loop ? "/D" : "");
+}
 
-GemmChoice gemm_choice(Route &r, const Shape &sh, int tokens, bool persistent, cudaStream_t s) {
-  std::map<std::string, GemmChoice> &m = persistent ? g_pchoice : g_choice;
-  auto it = m.find(key(sh, tokens));
-  if (it != m.end()) return it->second;
-  const GemmChoice c = persistent ? best_gemm_persistent(r, sh, tokens, s) : best_gemm(r, sh, tokens, s);
-  m[key(sh, tokens)] = c;
+GemmChoice gemm_choice(Route &r, const Shape &sh, int tokens, bool persistent, bool loop, cudaStream_t s) {
+  const std::string k = gkey(sh, tokens, persistent, loop);
+  auto it = g_choice.find(k);
+  if (it != g_choice.end()) return it->second;
+  const std::vector<int> mls = loop ? std::vector<int>{1, 2} : std::vector<int>{0};
+  const GemmChoice c = persistent ? best_gemm_persistent(r, sh, tokens, mls, s) : best_gemm(r, sh, tokens, mls, s);
+  g_choice[k] = c;
   return c;
 }
 
 std::string choice_label(const GemmChoice &c, bool persistent) {
   std::string s = "BM " + std::to_string(c.bm) + (c.raster == 0 ? ", tokens fastest" : ", outputs fastest");
   if (persistent) s += c.sk == 0 ? ", stream-K tail" : ", stream-K tail + 1 wave";
+  if (c.ml != 0) s += c.ml == 1 ? ", D 4 stages" : ", D 3 stages";
   return s;
 }
 
@@ -2150,7 +2271,7 @@ struct SliceTimes {
 
 SliceTimes time_slice(Route &r, const Pool &pool, const Shape &sh, int tokens, const Lever &cfg, const GemmChoice &gc, cudaStream_t s) {
   const int per = sh.swiglu ? 2 : 1;
-  const RouteVariant rv{gc.raster, gc.sk};
+  const RouteVariant rv{gc.raster, gc.sk, false, gc.ml};
   const size_t slice = static_cast<size_t>(slice_even(static_cast<int>(sh.in), static_cast<int>(sh.out) / kBlockN)) * kBlockN * sh.in;
   SliceTimes t;
   for (int round = 0; round < 3; ++round) {
@@ -2194,13 +2315,13 @@ ShapeTimes shape_times(Route &r, const Shape &sh, int tokens, const Lever &cfg, 
   const int per = sh.swiglu ? 2 : 1;
   int8_t *const wb[2] = {r.w[0].as<int8_t>(), r.w[1].as<int8_t>()};
   ShapeTimes st;
-  st.gc = gemm_choice(r, sh, tokens, cfg.persistent, s);
+  st.gc = gemm_choice(r, sh, tokens, cfg.persistent, cfg.loop, s);
   st.gemm = st.gc.us * per;
   st.a8 = a8_cost(r, sh, tokens, cfg, s);
   const std::string fk = kkey(sh, tokens), dk = kkey(sh, 0);
   const bool need_fused = g_fused && g_fused_us.find(fk) == g_fused_us.end();
   const bool need_dec = g_dec_us.find(dk) == g_dec_us.end();
-  const std::string sk = fk + (cfg.persistent ? "/persistent" : "/grid");
+  const std::string sk = fk + (cfg.persistent ? "/persistent" : "/grid") + (cfg.loop ? "/D" : "");
   const bool need_slice = cfg.slice && g_slice_us.find(sk) == g_slice_us.end();
   Pool pool;
   if (need_fused || need_dec || need_slice) make_pool(pool, sh, per);
@@ -2265,14 +2386,15 @@ void prepare_choices(int tokens, Route &r, cudaStream_t s) {
   BENCH_CUDA(cudaStreamSynchronize(s));
   const Lever per_matrix = Lever{}, shared = Lever{"A", true, false, false};
   auto one = [&](const Shape &sh) {
-    if (g_choice.count(key(sh, tokens)) != 0) return;
-    GemmChoice g = gemm_choice(r, sh, tokens, false, s), p = gemm_choice(r, sh, tokens, true, s);
-    for (int rep = 0; rep < 3; ++rep) {
-      g.us = std::min(g.us, time_gemm(r, sh, tokens, g.bm, g.raster, s));
-      p.us = std::min(p.us, time_gemm_persistent(r, sh, tokens, p.bm, p.raster, p.sk, s));
-    }
-    g_choice[key(sh, tokens)] = g;
-    g_pchoice[key(sh, tokens)] = p;
+    if (g_choice.count(gkey(sh, tokens, false, false)) != 0) return;
+    GemmChoice c[2][2];
+    for (int pe = 0; pe < 2; ++pe)
+      for (int lo = 0; lo < 2; ++lo) c[pe][lo] = gemm_choice(r, sh, tokens, pe == 1, lo == 1, s);
+    for (int rep = 0; rep < 3; ++rep)
+      for (int pe = 0; pe < 2; ++pe)
+        for (int lo = 0; lo < 2; ++lo) c[pe][lo].us = std::min(c[pe][lo].us, time_choice(r, sh, tokens, pe == 1, c[pe][lo], s));
+    for (int pe = 0; pe < 2; ++pe)
+      for (int lo = 0; lo < 2; ++lo) g_choice[gkey(sh, tokens, pe == 1, lo == 1)] = c[pe][lo];
     a8_cost(r, sh, tokens, per_matrix, s);
     a8_cost(r, sh, tokens, shared, s);
   };
@@ -2280,24 +2402,30 @@ void prepare_choices(int tokens, Route &r, cudaStream_t s) {
   for (const MixEntry &e : kMix) one(e.shape);
 }
 
-// Lever B's per-shape table: the grid launch against the persistent one, each at its best choice,
-// timed alternately three times (best of each).
-void lever_b_table(int tokens, Route &r, cudaStream_t s) {
-  std::printf("\n== lever B at T = %d: the GEMM per call (us), one CTA per tile against the persistent stream-K launch (%d SMs) ==\n",
+// Levers B and D per shape: the GEMM under phase 2a's launch, the persistent one (B), phase 2a's
+// launch with lever D's main loop, and both (B+D), each at its best choice, the four timed
+// alternately three times (best of each).
+void lever_bd_table(int tokens, Route &r, cudaStream_t s) {
+  std::printf("\n== levers B and D at T = %d: the GEMM per call (us, %% of s8), one CTA per tile against the persistent stream-K launch"
+              " (%d SMs), each with phase 2a's main loop and lever D's ==\n",
               tokens, g_sms);
-  std::printf("%-12s %6s %6s %6s | %8s %6s %-28s | %8s %6s %-44s | %6s\n", "matrix", "in", "out", "tiles", "grid", "%s8", "",
-              "persist", "%s8", "", "g/p");
+  std::printf("%-12s %6s %6s %6s | %15s | %15s | %15s | %15s | %6s %6s %6s\n", "matrix", "in", "out", "tiles", "phase 2a", "B", "D", "B+D", "B",
+              "D", "B+D");
   for (const Shape &sh : kBody) {
-    GemmChoice g = gemm_choice(r, sh, tokens, false, s), p = gemm_choice(r, sh, tokens, true, s);
-    for (int rep = 0; rep < 3; ++rep) {
-      g.us = std::min(g.us, time_gemm(r, sh, tokens, g.bm, g.raster, s));
-      p.us = std::min(p.us, time_gemm_persistent(r, sh, tokens, p.bm, p.raster, p.sk, s));
-    }
+    GemmChoice c[2][2];
+    for (int pe = 0; pe < 2; ++pe)
+      for (int lo = 0; lo < 2; ++lo) c[pe][lo] = gemm_choice(r, sh, tokens, pe == 1, lo == 1, s);
+    for (int rep = 0; rep < 3; ++rep)
+      for (int pe = 0; pe < 2; ++pe)
+        for (int lo = 0; lo < 2; ++lo) c[pe][lo].us = std::min(c[pe][lo].us, time_choice(r, sh, tokens, pe == 1, c[pe][lo], s));
     const double ops = 2.0 * tokens * sh.in * sh.out;
-    const int tiles = ((tokens + p.bm - 1) / p.bm) * static_cast<int>(sh.out / kBN);
-    std::printf("%-12s %6u %6u %6d | %8.1f %5.1f%% %-28s | %8.1f %5.1f%% %-44s | %6.3f\n", sh.name, sh.in, sh.out, tiles, g.us,
-                100.0 * ops / (g.us * 1e-6) / 1e12 / g_s8_peak, choice_label(g, false).c_str(), p.us,
-                100.0 * ops / (p.us * 1e-6) / 1e12 / g_s8_peak, choice_label(p, true).c_str(), g.us / p.us);
+    auto pct = [&](double us) { return 100.0 * ops / (us * 1e-6) / 1e12 / g_s8_peak; };
+    const int tiles = ((tokens + 255) / 256) * static_cast<int>(sh.out / kBN);
+    std::printf("%-12s %6u %6u %6d | %8.1f %5.1f%% | %8.1f %5.1f%% | %8.1f %5.1f%% | %8.1f %5.1f%% | %6.3f %6.3f %6.3f\n", sh.name, sh.in,
+                sh.out, tiles, c[0][0].us, pct(c[0][0].us), c[1][0].us, pct(c[1][0].us), c[0][1].us, pct(c[0][1].us), c[1][1].us,
+                pct(c[1][1].us), c[0][0].us / c[1][0].us, c[0][0].us / c[0][1].us, c[0][0].us / c[1][1].us);
+    std::printf("%-12s   phase 2a: %s; B: %s; D: %s; B+D: %s\n", "", choice_label(c[0][0], false).c_str(), choice_label(c[1][0], true).c_str(),
+                choice_label(c[0][1], false).c_str(), choice_label(c[1][1], true).c_str());
   }
 }
 
@@ -2330,7 +2458,7 @@ void overlap(int tokens, Route &r, cudaStream_t s1, cudaStream_t s2, cudaStream_
       const Shape body = std::string(seq[i].name).rfind("mlp gate", 0) == 0 || std::string(seq[i].name).rfind("mlp up", 0) == 0
                              ? Shape{"mlp gate+up", 5120, 17408, 6, 1}
                              : seq[i];
-      const GemmChoice gc = gemm_choice(r, body, tokens, cfg.persistent, s1);
+      const GemmChoice gc = gemm_choice(r, body, tokens, cfg.persistent, cfg.loop, s1);
       choices.push_back(gc);
       calls.push_back(gemm_call(r, seq[i], tokens, i & 1, gc.bm, gc.raster));
     }
@@ -2341,7 +2469,9 @@ void overlap(int tokens, Route &r, cudaStream_t s1, cudaStream_t s2, cudaStream_
         launch_a8_shared(r.x.p, tokens, seq[i].in, r.shared(tokens, seq[i].in, a8n[i]), s);
       }
     };
-    auto gemm = [&](int i, cudaStream_t s, bool cap) { gemm_sched(cfg, RouteVariant{choices[i].raster, choices[i].sk, cap}, calls[i], s); };
+    auto gemm = [&](int i, cudaStream_t s, bool cap) {
+      gemm_sched(cfg, RouteVariant{choices[i].raster, choices[i].sk, cap, choices[i].ml}, calls[i], s);
+    };
     std::vector<cudaEvent_t> dec(n), gem(n);
     for (int i = 0; i < n; ++i) {
       BENCH_CUDA(cudaEventCreateWithFlags(&dec[i], cudaEventDisableTiming));
@@ -2426,8 +2556,8 @@ void overlap(int tokens, Route &r, cudaStream_t s1, cudaStream_t s2, cudaStream_
           const SliceItem &it = items[k];
           if (it.nb0 == 0) a8(it.m, hi);
           BENCH_CUDA(cudaStreamWaitEvent(hi, sdec[k], 0));
-          gemm_sched(cfg, RouteVariant{choices[it.m].raster, choices[it.m].sk, true}, slice_call(calls[it.m], it.nb0, it.nbs, r.w[k & 1].as<int8_t>()),
-                     hi);
+          gemm_sched(cfg, RouteVariant{choices[it.m].raster, choices[it.m].sk, true, choices[it.m].ml},
+                     slice_call(calls[it.m], it.nb0, it.nbs, r.w[k & 1].as<int8_t>()), hi);
           BENCH_CUDA(cudaEventRecord(sgem[k], hi));
           if (k + 1 < items.size()) {
             if (k >= 1) BENCH_CUDA(cudaStreamWaitEvent(lo, sgem[k - 1], 0));  // buffer (k + 1) % 2 is free
@@ -2458,7 +2588,7 @@ void kernel_report(const char *name, const void *f, int threads, int smem) {
   BENCH_CUDA(cudaFuncGetAttributes(&at, f));
   int ctas = 0;
   BENCH_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, f, threads, smem));
-  std::printf("  %-34s %3d regs, %5zu B local (spills), %6d B dynamic + %5zu B static smem, %d threads, %d CTA/SM\n", name,
+  std::printf("  %-42s %3d regs, %5zu B local (spills), %6d B dynamic + %5zu B static smem, %d threads, %d CTA/SM\n", name,
               at.numRegs, at.localSizeBytes, smem, at.sharedSizeBytes, threads, ctas);
 }
 
@@ -2474,20 +2604,23 @@ std::vector<int> parse_list(const std::string &s) {
   return v;
 }
 
-Lever make_lever(bool a8_shared, bool persistent, bool slice) {
+Lever make_lever(bool a8_shared, bool persistent, bool slice, bool loop = false) {
   Lever l;
   l.a8_shared = a8_shared;
   l.persistent = persistent;
   l.slice = slice;
+  l.loop = loop;
   l.name = lever_name(l);
   return l;
 }
 
-// The ablation's rows: phase 2a's route, each lever alone (C on both schedulers: its per-slice
-// launches are the persistent launch's case), and the combinations.
+// The ablation's rows: phase 2a's route, each lever alone (C also on lever B's scheduler: its
+// per-slice launches are the persistent launch's case), and the combinations.
 std::vector<Lever> ablation_levers() {
-  return {make_lever(false, false, false), make_lever(true, false, false), make_lever(false, true, false), make_lever(false, false, true),
-          make_lever(false, true, true),   make_lever(true, true, false),  make_lever(true, true, true)};
+  return {make_lever(false, false, false), make_lever(true, false, false),      make_lever(false, true, false),
+          make_lever(false, false, true),  make_lever(false, false, false, true), make_lever(false, true, true),
+          make_lever(false, true, false, true), make_lever(true, true, false),   make_lever(true, false, false, true),
+          make_lever(true, true, false, true),  make_lever(true, true, true, true)};
 }
 
 }  // namespace
@@ -2502,7 +2635,7 @@ int main(int argc, char **argv) {
   auto usage = [&]() {
     std::fprintf(stderr,
                  "usage: %s [--artifact PATH] [--tokens 2048,4096] [--check-tokens N] [--reps N] [--no-check] [--no-speed] [--no-peaks]"
-                 " [--diag] [--no-fused] [--a8 per-matrix|shared] [--sched grid|persistent] [--decode whole|slice] [--slice-mb MB]"
+                 " [--diag] [--no-fused] [--a8 per-matrix|shared] [--sched grid|persistent] [--decode whole|slice] [--mainloop 2a|pipelined] [--slice-mb MB]"
                  " [--l2-persist] [--ablation]\n",
                  argv[0]);
     return 2;
@@ -2540,6 +2673,10 @@ int main(int argc, char **argv) {
       const std::string v = argv[++i];
       if (v != "whole" && v != "slice") return usage();
       cfg.slice = v == "slice";
+    } else if (a == "--mainloop" && more) {
+      const std::string v = argv[++i];
+      if (v != "2a" && v != "pipelined") return usage();
+      cfg.loop = v == "pipelined";
     } else if (a == "--slice-mb" && more) {
       slice_mb = std::atof(argv[++i]);
     } else if (a == "--l2-persist") {
@@ -2590,10 +2727,22 @@ int main(int argc, char **argv) {
                 Cfg<256>::kSmem);
   kernel_report("sm8x_dense_gemm_persistent<128>", reinterpret_cast<const void *>(sm8x_dense_gemm_persistent<128, kRegsRoute>), kGemmThreads,
                 Cfg<128>::kSmem);
-  kernel_report("sm8x_dense_gemm_persistent<256, 224>", reinterpret_cast<const void *>(sm8x_dense_gemm_persistent<256, kRegsCoresident>),
+  kernel_report("sm8x_dense_gemm_persistent<256, 240>", reinterpret_cast<const void *>(sm8x_dense_gemm_persistent<256, kRegsCoresident>),
                 kGemmThreads, Cfg<256>::kSmem);
-  kernel_report("sm8x_dense_gemm_persistent<128, 224>", reinterpret_cast<const void *>(sm8x_dense_gemm_persistent<128, kRegsCoresident>),
+  kernel_report("sm8x_dense_gemm_persistent<128, 240>", reinterpret_cast<const void *>(sm8x_dense_gemm_persistent<128, kRegsCoresident>),
                 kGemmThreads, Cfg<128>::kSmem);
+  kernel_report("sm8x_dense_gemm<256> D 4 stages", reinterpret_cast<const void *>(sm8x_dense_gemm<256, 0, 1>), kGemmThreads, gemm_smem<256, 1>());
+  kernel_report("sm8x_dense_gemm<256> D 3 stages", reinterpret_cast<const void *>(sm8x_dense_gemm<256, 0, 2>), kGemmThreads, gemm_smem<256, 2>());
+  kernel_report("sm8x_dense_gemm<128> D 4 stages", reinterpret_cast<const void *>(sm8x_dense_gemm<128, 0, 1>), kGemmThreads, gemm_smem<128, 1>());
+  kernel_report("sm8x_dense_gemm<128> D 3 stages", reinterpret_cast<const void *>(sm8x_dense_gemm<128, 0, 2>), kGemmThreads, gemm_smem<128, 2>());
+  kernel_report("sm8x_dense_gemm_persistent<256> D 4", reinterpret_cast<const void *>(sm8x_dense_gemm_persistent<256, kRegsRoute, 1>),
+                kGemmThreads, gemm_smem<256, 1>());
+  kernel_report("sm8x_dense_gemm_persistent<256> D 3", reinterpret_cast<const void *>(sm8x_dense_gemm_persistent<256, kRegsRoute, 2>),
+                kGemmThreads, gemm_smem<256, 2>());
+  kernel_report("sm8x_dense_gemm_persistent<256, 240> D 4", reinterpret_cast<const void *>(sm8x_dense_gemm_persistent<256, kRegsCoresident, 1>),
+                kGemmThreads, gemm_smem<256, 1>());
+  kernel_report("sm8x_dense_gemm_persistent<256, 240> D 3", reinterpret_cast<const void *>(sm8x_dense_gemm_persistent<256, kRegsCoresident, 2>),
+                kGemmThreads, gemm_smem<256, 2>());
   kernel_report("sm8x_dense_decode<6, 4>", reinterpret_cast<const void *>(sm8x_dense_decode<6, 4>), 128, 0);
   kernel_report("sm8x_dense_decode<10, 4>", reinterpret_cast<const void *>(sm8x_dense_decode<10, 4>), 128, 0);
   kernel_report("sm8x_dense_decode<6, 2>", reinterpret_cast<const void *>(sm8x_dense_decode<6, 2>), 64, 0);
@@ -2653,22 +2802,27 @@ int main(int argc, char **argv) {
   }
   if (diag) {
     Route r(*std::max_element(tokens.begin(), tokens.end()));
-    std::printf("\n== GEMM diagnostic (BM 256, tokens fastest): full, no global loads, no loads and no ldmatrix ==\n");
-    for (const int t : tokens)
-      for (const Shape &sh : kBody) {
-        double us[3];
-        for (int d = 0; d < 3; ++d) {
-          us[d] = time_us([&](int i) {
-            GemmCall c = gemm_call(r, sh, t, i & 1, 256, 0);
-            c.diag = d;
-            launch_gemm(c, s1);
-          }, 6, s1);
+    // Each main loop: phase 2a's (ML 0), lever D's over 4 stages (ML 1) and over 3 (ML 2).
+    for (const int ml : {0, 1, 2}) {
+      std::printf("\n== GEMM diagnostic (BM 256, tokens fastest, %s): full, no global loads, no loads and no ldmatrix ==\n",
+                  ml == 0 ? "phase 2a's main loop" : (ml == 1 ? "lever D's main loop, 4 stages" : "lever D's main loop, 3 stages"));
+      for (const int t : tokens)
+        for (const Shape &sh : kBody) {
+          double us[3];
+          for (int d = 0; d < 3; ++d) {
+            us[d] = time_us([&](int i) {
+              GemmCall c = gemm_call(r, sh, t, i & 1, 256, 0);
+              c.diag = d;
+              c.ml = ml;
+              launch_gemm(c, s1);
+            }, 6, s1);
+          }
+          const double ops = 2.0 * t * sh.in * sh.out;
+          std::printf("T %d %-12s %8.1f us %6.1f%% | %8.1f us %6.1f%% | %8.1f us %6.1f%% of s8\n", t, sh.name, us[0],
+                      100.0 * ops / (us[0] * 1e-6) / 1e12 / g_s8_peak, us[1], 100.0 * ops / (us[1] * 1e-6) / 1e12 / g_s8_peak, us[2],
+                      100.0 * ops / (us[2] * 1e-6) / 1e12 / g_s8_peak);
         }
-        const double ops = 2.0 * t * sh.in * sh.out;
-        std::printf("T %d %-12s %8.1f us %6.1f%% | %8.1f us %6.1f%% | %8.1f us %6.1f%% of s8\n", t, sh.name, us[0],
-                    100.0 * ops / (us[0] * 1e-6) / 1e12 / g_s8_peak, us[1], 100.0 * ops / (us[1] * 1e-6) / 1e12 / g_s8_peak, us[2],
-                    100.0 * ops / (us[2] * 1e-6) / 1e12 / g_s8_peak);
-      }
+    }
     // Lever C's premise: the whole decode writes its W through to DRAM; one L2-sized slice rewritten
     // in place should not. The same trellis (gate_proj's shape, K 3, the pool missing the L2) decoded
     // into the whole W, and slice by slice into one slice buffer.
@@ -2776,7 +2930,7 @@ int main(int argc, char **argv) {
       for (size_t c = 0; c < cfgs.size(); ++c) speed(tokens[i], r, s1, cfgs[c], chunks[i][c]);
     }
     if (ablation) {
-      for (const int t : tokens) lever_b_table(t, r, s1);
+      for (const int t : tokens) lever_bd_table(t, r, s1);
       for (size_t i = 0; i < tokens.size(); ++i) {
         std::printf("\n== ablation at T = %d: per chunk of the 64-layer body (ms) ==\n", tokens[i]);
         std::printf("%-12s | %8s %8s %9s %9s | %9s %7s | %8s\n", "levers", "decode", "A8", "GEMM", "dense", "fused", "f/d", "vs 2a");
@@ -2788,7 +2942,11 @@ int main(int argc, char **argv) {
       }
     }
     std::vector<Lever> ov = {cfgs[0]};
-    if (ablation) ov.push_back(make_lever(true, true, false));
+    if (ablation) {
+      ov.push_back(make_lever(true, true, false));
+      ov.push_back(make_lever(true, false, false, true));
+      ov.push_back(make_lever(true, true, false, true));
+    }
     std::printf("\n== overlap: the next matrix's decode on a second stream (us per layer) ==\n");
     for (const Lever &l : ov)
       for (size_t i = 0; i < tokens.size(); ++i) {
