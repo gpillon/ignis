@@ -67,13 +67,28 @@ hardware.
 
 ### What blocks it today
 
-1. **GPU architecture.** The kernel leaf is compiled for `120a` only
+1. **GPU architecture.** The kernel leaf is compiled for `120a` unless
+   `IGNIS_CUDA_ARCHITECTURES` names more
    ([`kernel/CMakeLists.txt`](../../../kernel/CMakeLists.txt),
-   [`kernel/build.sh`](../../../kernel/build.sh)). GB10 is compute capability
-   12.1. Code built for an `a` target, whether machine code or PTX, runs only on
-   that exact capability, so on a Spark the binary would fail to load any
-   kernel. The fix is to build for `121a`, or for `120a;121a` in one binary.
-   The architecture-specific instructions the kernels use are the block-scaled
+   [building](../contributing/building.md#other-card-architectures)). GB10 is
+   compute capability 12.1. Code built for an `a` target, whether machine code
+   or PTX, runs only on that exact capability, so a default build would fail to
+   load any kernel on a Spark. The build steps are the same two scripts,
+   [`kernel/build.sh`](../../../kernel/build.sh) and `kernel/build.ps1`, with
+   the knob set to `121a`, or to `120a;121a` for one binary that covers both
+   the RTX 50 cards and the Spark:
+
+   ```bash
+   IGNIS_CUDA_ARCHITECTURES='121a' bash kernel/build.sh
+   IGNIS_CUDA_ARCHITECTURES='120a;121a' bash kernel/build.sh
+   ```
+
+   On Windows, set `$env:IGNIS_CUDA_ARCHITECTURES` before running
+   `kernel\build.ps1`. The knob needs an arch-specific Blackwell entry (`120a`
+   or `121a`): without one, the configure step stops with an error that names
+   it. Both values pass CMake's configure step today (checked with CUDA 13.1,
+   configure only, nothing compiled), so the build files need no edit. No Spark
+   has run the result. The architecture-specific instructions the kernels use are the block-scaled
    FP4 MMA (`mma.sync…kind::mxf4nvf4.block_scale`,
    [`common/mma.cuh`](../../../kernel/vendor/src/ops/common/mma.cuh)), TMA bulk
    tensor copies and `setmaxnreg`
@@ -115,6 +130,6 @@ hardware.
 
 ### The smallest port
 
-Four pieces: a `121a` build target, an `aarch64` build, an NVML fallback, and a
+Four pieces: a `121a` build target (the knob above), an `aarch64` build, an NVML fallback, and a
 unified-memory mode in the memory plan. None of them is large, but none of them
 can be checked without a Spark to run on.

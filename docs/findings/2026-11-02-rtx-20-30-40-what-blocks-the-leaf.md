@@ -3,7 +3,7 @@
 - Kind: experiment
 - Status: current
 - Observed: 2026-11-02
-- Last verified: 2026-11-02
+- Last verified: 2026-11-04
 - Scope: kernel / every CUDA translation unit of `ignis_kernel` and `ignis_vendor` and its op tests, the build's
   architecture target, the instructions each route needs; serving / `--profile auto` and the card class; models / which
   catalog entry depends on which route
@@ -102,6 +102,15 @@ Observed:
 - A 16 GB RTX 40 card (4060 Ti 16 GB, 4070 Ti Super, 4080) resolves to `rtx50-16gb` under `--profile auto` and starts
   a load that fails at its first kernel launch with CUDA's own "no kernel image" error. A 24 GB card (3090, 4090)
   is refused as "no card class", by accident of the memory ranges.
+
+- **Static shared memory (added 2026-11-04, from the sm_86 build of #456).** Three vendored units declare more than
+  48 KiB of static shared memory per block: the W8 linear's small-T route (`w8_small_t.cu`), its split-K route
+  (`w8_rowsplit_gemm_splitk.cu`) and the i8 decode attention (`gqa_attention_decode_i8.cu`). ptxas refuses that for
+  sm_86 (`0xc000 max`, 49,152 bytes) and accepts it for `120a`. The sm_89 probe above never saw it: those units had
+  already failed on `griddepcontrol`, which stops compilation before ptxas reaches the shared-memory check. Once PDL
+  is guarded out, these three still fail on an sm_8x target, so they compile for the sm_120a set alone
+  (`ignis_vendor_sm120a` in `kernel/CMakeLists.txt`) and a launch of one on another card fails with CUDA's "no kernel
+  image is available". On the 27B only its MTP layer, which no load binds, takes the small-T route.
 
 Inferred (not run on any of these cards):
 
