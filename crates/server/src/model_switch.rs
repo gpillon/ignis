@@ -77,8 +77,8 @@ use std::time::{Duration, Instant};
 
 use ignis_core::compute::{ModelFamily, ModelKind};
 
-use crate::config::profile::CardClass;
-use crate::download::ClassRefusal;
+use crate::config::profile::CardReading;
+use crate::download::CardRefusal;
 use crate::load::LoadedModel;
 use crate::{ActiveModel, InFlight, ModelSource, ModelStatus, Server, StatusCell};
 
@@ -308,10 +308,11 @@ pub struct Switcher {
     /// Set once the serve has begun to stop ([`Switcher::stop_waiting`]):
     /// from then on no request waits for a switch or a load (GitHub #329).
     stopping: tokio::sync::watch::Sender<bool>,
-    /// The card's class, when the start read one ([`Switcher::with_card_class`],
-    /// ADR 0064): what a catalog entry is fitted to before a switch, a
-    /// request or a listing names it. `None` refuses nothing.
-    card: Option<CardClass>,
+    /// The card the start read, when it read one ([`Switcher::with_card`],
+    /// ADR 0064, ADR 0079): what a catalog entry is fitted to, by its class
+    /// and its GPU generation, before a switch, a request or a listing names
+    /// it. `None` refuses nothing.
+    card: Option<CardReading>,
 }
 
 /// The two tables a server's models are named by, computed together from the
@@ -391,10 +392,11 @@ pub enum Unswitchable {
     /// A catalog entry whose artifact is not under `download.path`: it has to
     /// be fetched first (`model download`), a switch never starts a download.
     NotDownloaded,
-    /// A catalog entry above the card's class with no entry answering to it
-    /// that fits (ADR 0064 §3): `409 model_above_card_class`, before anything
-    /// is prepared or torn down.
-    AboveClass(ClassRefusal),
+    /// A catalog entry the card cannot load, by class or by generation, with
+    /// no entry answering to it that fits (ADR 0064 §3, ADR 0079): `409
+    /// model_above_card_class` or `409 model_above_gpu_generation`
+    /// ([`CardRefusal::code`]), before anything is prepared or torn down.
+    AboveCard(CardRefusal),
     /// A speech model's catalog entry (ADR 0067): loaded beside the active
     /// model by the first transcription, never switched to.
     Speech,
@@ -410,7 +412,8 @@ pub struct Servable {
     /// Its id.
     pub id: String,
     /// Why a request naming it is not served by it on this card (ADR 0064
-    /// §3): a catalog id on disk above the card's class. `None` for a model
+    /// §3, ADR 0079): a catalog id on disk the card cannot load, by class or
+    /// by generation. `None` for a model
     /// a request naming it switches to.
     pub unavailable: Option<String>,
 }
@@ -459,11 +462,12 @@ impl Switcher {
         }
     }
 
-    /// Fit every catalog entry a switch, a request or a listing names to a
-    /// card of class `card` (ADR 0064): the class `main` reads from NVML's
-    /// total at start, `None` when it read none — which refuses nothing, the
-    /// VRAM plan's refusal still guarding.
-    pub fn with_card_class(self, card: Option<CardClass>) -> Self {
+    /// Fit every catalog entry a switch, a request or a listing names to
+    /// `card` (ADR 0064, ADR 0079): the card `main` read at start, by its
+    /// total's class and its compute capability's generation, `None` when it
+    /// read none — which refuses nothing, the VRAM plan's refusal and the
+    /// route checks still guarding.
+    pub fn with_card(self, card: Option<CardReading>) -> Self {
         Self { card, ..self }
     }
 
@@ -617,14 +621,15 @@ impl Switcher {
     /// operator's. Looked up at each call: a download landing in the
     /// directory needs no restart.
     ///
-    /// A catalog id above the card's class is refused first, before a switch
-    /// begins (ADR 0064 §3) — listed or not: the class is the catalog
-    /// entry's, whatever path the operator gave its id; an id another entry
+    /// A catalog id the card cannot load is refused first, before a switch
+    /// begins (ADR 0064 §3, ADR 0079) — listed or not: the class and the
+    /// generation are the catalog entry's, whatever path the operator gave its
+    /// id; an id another entry
     /// answers to on this card is the caller's to rewrite first
     /// ([`Switcher::on_this_card`]).
     pub fn resolve(&self, model: &str) -> Result<PathBuf, Unswitchable> {
-        if let Some(refusal) = self.above_class(model) {
-            return Err(Unswitchable::AboveClass(refusal));
+        if let Some(refusal) = self.above_card(model) {
+            return Err(Unswitchable::AboveCard(refusal));
         }
         if self.is_speech(model) {
             return Err(Unswitchable::Speech);
@@ -641,17 +646,18 @@ impl Switcher {
         if artifact.is_file() { Ok(artifact) } else { Err(Unswitchable::NotDownloaded) }
     }
 
-    /// The catalog's class-aware step ([`crate::download::Catalog::answering`],
-    /// ADR 0064 §2-3) for a request's `model` or a switch by id, lane tag
-    /// stripped: `Ok(None)` when `model` stands as it is — the catalog does
-    /// not hold it (an operator's own model, which has no class), or its own
-    /// entry fits the card; `Ok(Some(id))` when another entry of its family
-    /// answers to it on this card, the id the request is then served under
-    /// (an alias: the 27B's default id on a 16 GB card); `Err` when its own
-    /// entry is above the card's class and none answers for it, which
-    /// refuses the request or the switch before anything is drained or torn
-    /// down. A catalog id the operator also listed (`switch.known_models`)
-    /// is fitted all the same: the class is the catalog entry's. Whether
+    /// The catalog's card-aware step ([`crate::download::Catalog::answering`],
+    /// ADR 0064 §2-3, ADR 0079) for a request's `model` or a switch by id,
+    /// lane tag stripped: `Ok(None)` when `model` stands as it is — the
+    /// catalog does not hold it (an operator's own model, which has no class),
+    /// or its own entry fits the card; `Ok(Some(id))` when another entry of
+    /// its family answers to it on this card, the id the request is then
+    /// served under (an alias: the 27B's default id on a 16 GB card or an RTX
+    /// 3090); `Err` when its own entry is above the card's class or its
+    /// generation and none answers for it, which refuses the request or the
+    /// switch before anything is drained or torn down. A catalog id the
+    /// operator also listed (`switch.known_models`) is fitted all the same:
+    /// the class and the generation are the catalog entry's. Whether
     /// implicit switching is on does not matter: an alias served by the
     /// loaded model is no switch.
     ///
@@ -661,40 +667,50 @@ impl Switcher {
     /// here, before anything stops, and one of another family — or of none —
     /// does not answer to the alias. One not on disk is a switch that cannot
     /// begin, refused as such.
-    pub fn on_this_card(&self, model: &str) -> Result<Option<String>, ClassRefusal> {
+    pub fn on_this_card(&self, model: &str) -> Result<Option<String>, CardRefusal> {
         let Some(catalog) = self.catalog.as_ref() else {
             return Ok(None);
         };
-        let Some(entry) = catalog.catalog.answering(model, self.card)? else {
+        let Some(entry) = catalog.catalog.answering(model, self.card.as_ref())? else {
             return Ok(None);
         };
         if let Ok(artifact) = self.resolve(&entry.id) {
             let header = self.loader.family_of(&ModelSource { artifact, model: entry.id.clone() });
-            catalog.catalog.alias_holds(model, entry, header, self.card)?;
+            catalog.catalog.alias_holds(model, entry, header, self.card.as_ref())?;
         }
         Ok(Some(entry.id.clone()))
     }
 
     /// Why the catalog entry `model` itself cannot be loaded on this card,
-    /// for `GET /v1/models` and `GET /v1/models/catalog` (ADR 0064 §3): its
-    /// class is above the card's, and when another entry serves a request
-    /// naming it here, which one. `None` for an entry that fits, a model the
-    /// catalog does not hold, or with no card class known.
+    /// for `GET /v1/models` and `GET /v1/models/catalog` (ADR 0064 §3, ADR
+    /// 0079): its class or its generation is above the card's, and when
+    /// another entry serves a request naming it here, which one. `None` for
+    /// an entry that fits, a model the catalog does not hold, or with no card
+    /// read.
     pub fn unavailable_reason(&self, model: &str) -> Option<String> {
-        let refusal = self.above_class(model)?;
+        self.unavailable(model).map(|(_, reason)| reason)
+    }
+
+    /// [`Switcher::unavailable_reason`] with the code a refusal of `model`
+    /// answers ([`CardRefusal::code`]): what `POST /v1/models/download`
+    /// refuses such an entry with. The code is that of the refusal the reason
+    /// gives: the entry's own, or the one an alias of another family's
+    /// artifact gives.
+    pub fn unavailable(&self, model: &str) -> Option<(&'static str, String)> {
+        let refusal = self.above_card(model)?;
         Some(match self.on_this_card(model) {
-            Ok(Some(serving)) => format!("{refusal}; a request naming it is served by {serving}"),
+            Ok(Some(serving)) => (refusal.code(), format!("{refusal}; a request naming it is served by {serving}")),
             // The entry that would answer holds another family's artifact:
             // that refusal says both.
-            Err(answered) => answered.to_string(),
-            Ok(None) => refusal.to_string(),
+            Err(answered) => (answered.code(), answered.to_string()),
+            Ok(None) => (refusal.code(), refusal.to_string()),
         })
     }
 
-    /// The class refusal of the catalog entry `model` itself
-    /// ([`crate::download::Catalog::above_class`]) on this card.
-    fn above_class(&self, model: &str) -> Option<ClassRefusal> {
-        self.catalog.as_ref()?.catalog.above_class(model, self.card)
+    /// The refusal of the catalog entry `model` itself on this card
+    /// ([`crate::download::Catalog::above_card`]).
+    pub fn above_card(&self, model: &str) -> Option<CardRefusal> {
+        self.catalog.as_ref()?.catalog.above_card(model, self.card.as_ref())
     }
 
     /// How the last switch or reload ended; `None` before the first.
@@ -747,7 +763,7 @@ impl Switcher {
     /// [`Switcher::text_model`] with `listing` listed too, over the listed
     /// models: what a config change about to list them would resolve.
     pub fn text_model_among(&self, model: &str, listing: &BTreeMap<String, PathBuf>) -> Option<ModelSource> {
-        if self.above_class(model).is_some() {
+        if self.above_card(model).is_some() {
             return None;
         }
         let artifact = listing
@@ -805,7 +821,7 @@ impl Switcher {
         if self.is_speech(model) || self.is_diarizer(model) {
             return None;
         }
-        if self.above_class(model).is_some() {
+        if self.above_card(model).is_some() {
             return None;
         }
         if let Some(listed) = self.known.lock().expect("known models lock").get(model) {

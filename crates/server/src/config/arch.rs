@@ -34,6 +34,70 @@ impl fmt::Display for ComputeCapability {
     }
 }
 
+/// A card's **GPU generation** (`GLOSSARY.md`, spec #474): Ampere, Ada or
+/// Blackwell, ordered by age, so `entry > card` reads "the entry needs a
+/// newer card than this one". It follows from the compute capability the
+/// start reads ([`GpuGeneration::of`]); a catalog entry states the oldest one
+/// it loads on (`generation`, ADR 0079).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GpuGeneration {
+    Ampere,
+    Ada,
+    Blackwell,
+}
+
+impl GpuGeneration {
+    /// Every generation, oldest first.
+    pub const ALL: [GpuGeneration; 3] = [Self::Ampere, Self::Ada, Self::Blackwell];
+
+    /// The generation of a card of `capability`: 8.6 and 8.7 Ampere, 8.9
+    /// Ada, every 12.x Blackwell. `None` for any other, which no catalog
+    /// entry is refused on by generation.
+    pub fn of(capability: ComputeCapability) -> Option<Self> {
+        match (capability.major, capability.minor) {
+            (8, 6 | 7) => Some(Self::Ampere),
+            (8, 9) => Some(Self::Ada),
+            (12, _) => Some(Self::Blackwell),
+            _ => None,
+        }
+    }
+
+    /// As a catalog entry's `generation` spells it: `ampere`, `ada`,
+    /// `blackwell`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ampere => "ampere",
+            Self::Ada => "ada",
+            Self::Blackwell => "blackwell",
+        }
+    }
+
+    /// The generation a catalog entry's `generation` names, matched exactly;
+    /// `None` for any other text.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|generation| generation.as_str() == name)
+    }
+
+    /// The cards of the generation, as a refusal names them.
+    pub fn cards(self) -> &'static str {
+        match self {
+            Self::Ampere => "RTX 30",
+            Self::Ada => "RTX 40",
+            Self::Blackwell => "RTX 50, RTX PRO",
+        }
+    }
+}
+
+impl fmt::Display for GpuGeneration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Ampere => "Ampere",
+            Self::Ada => "Ada",
+            Self::Blackwell => "Blackwell",
+        })
+    }
+}
+
 /// One architecture the leaf was compiled for, as CMake names it: `86`,
 /// machine code for 8.6, which CUDA runs on every 8.x from 8.6 up; or `120a`,
 /// arch-specific code, which runs on 12.0 alone.
@@ -319,6 +383,30 @@ mod tests {
 
     fn cc(major: u32, minor: u32) -> ComputeCapability {
         ComputeCapability::new(major, minor)
+    }
+
+    /// Spec #474: the GPU generation follows from the compute capability the
+    /// start reads — 8.6 and 8.7 Ampere, 8.9 Ada, every 12.x Blackwell — and
+    /// a capability of none of them has none, which refuses nothing. The
+    /// three are ordered by age, as a catalog entry's `generation` reads them.
+    #[test]
+    fn the_gpu_generation_follows_from_the_compute_capability() {
+        use GpuGeneration::*;
+        for (capability, generation) in [(cc(8, 6), Ampere), (cc(8, 7), Ampere), (cc(8, 9), Ada), (cc(12, 0), Blackwell), (cc(12, 1), Blackwell)] {
+            assert_eq!(GpuGeneration::of(capability), Some(generation), "{capability}");
+        }
+        for capability in [cc(7, 5), cc(8, 0), cc(8, 8), cc(9, 0), cc(10, 0), cc(11, 0)] {
+            assert_eq!(GpuGeneration::of(capability), None, "{capability}");
+        }
+        assert!(Ampere < Ada && Ada < Blackwell);
+        assert_eq!(GpuGeneration::ALL, [Ampere, Ada, Blackwell]);
+        for (generation, name, said, cards) in [(Ampere, "ampere", "Ampere", "RTX 30"), (Ada, "ada", "Ada", "RTX 40"), (Blackwell, "blackwell", "Blackwell", "RTX 50, RTX PRO")] {
+            assert_eq!((generation.as_str(), generation.to_string(), generation.cards()), (name, said.to_owned(), cards));
+            assert_eq!(GpuGeneration::from_name(name), Some(generation));
+        }
+        for other in ["Blackwell", "turing", "", " ada", "12"] {
+            assert_eq!(GpuGeneration::from_name(other), None, "{other:?}");
+        }
     }
 
     #[test]

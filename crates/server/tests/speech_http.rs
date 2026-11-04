@@ -841,6 +841,7 @@ async fn a_speech_entry_is_told_by_its_kind_and_not_by_its_id() {
         artifact: format!("{id}.gguf"),
         kind,
         card_class: None,
+        generation: None,
         family: None,
         aliases: Vec::new(),
         license: None,

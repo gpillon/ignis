@@ -68,6 +68,7 @@ fn entry() -> CatalogEntry {
         revision: REVISION.to_owned(),
         artifact: ARTIFACT.to_owned(),
         card_class: Some(ignis_server::config::profile::CardClass::Gb32),
+        generation: None,
         family: None,
         aliases: Vec::new(),
         license: None,

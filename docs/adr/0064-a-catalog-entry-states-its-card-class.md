@@ -16,6 +16,11 @@ family, or no alias involves it.
 built-in speech models (2026-10-24, 3982dd70, ADR 0067) and the diarizer (ADR 0069) run on the CPU and state none, so
 no card refuses them; the built-in catalog test pins them at none.
 
+**Amended by [ADR 0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md)** (spec #474): an entry
+may also state the oldest GPU generation it loads on. The class rule and the resolve step take the card's class and
+its generation together, an alias answers only where its entry fits both, and a refusal for the generation, alone or
+with the class, is `409 model_above_gpu_generation`; one for the class alone stays `409 model_above_card_class`.
+
 Related:
 - [ADR 0047](0047-a-catalog-the-operator-can-extend.md): a catalog the operator can extend;
 - [ADR 0060](0060-the-27b-has-a-trellis-body-for-small-cards.md): the 16 GB body;
