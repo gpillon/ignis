@@ -71,7 +71,10 @@ __host__ __device__ constexpr int state_shift(int k2, int j) {
 
 // The eight weights of a lane from its normalized window (`hi` the top 32 bits, `lo` the next
 // 32, the lane's first bit at bit 31 of `hi`), as four half2 registers in fragment order.
-template <int K2>
+// PROTOTYPE (sm8x dense prefill, phase 1): kW8 emulates the dense INT8 copy. The codebook
+// integer s = bsum in [0, 1020] is quantized q = clamp(rn((s - 510) / 4), -127, 127) (ties to
+// even) and dequantized s' = 4 q + 510, exact in the fp16 1024 + s', before the same affine map.
+template <int K2, bool kW8 = false>
 __device__ __forceinline__ void decode_window(uint32_t hi, uint32_t lo, uint32_t (&frag)[4]) {
   uint32_t bits[8];
 #pragma unroll
@@ -79,6 +82,11 @@ __device__ __forceinline__ void decode_window(uint32_t hi, uint32_t lo, uint32_t
     const int sh = state_shift(K2, j);  // a constant once the loop is unrolled
     const uint32_t raw = sh >= 32 ? hi >> (sh - 32) : __funnelshift_r(lo, hi, sh);
     bits[j] = __dp4a((raw & 0xFFFFu) * kMul1, 0x01010101u, 0x6400u);
+    if constexpr (kW8) {
+      const int d = static_cast<int>(bits[j]) - 0x6400 - 510;  // s - 510
+      const int q = max(-127, min(127, __float2int_rn(static_cast<float>(d) * 0.25f)));
+      bits[j] = static_cast<uint32_t>(0x6400 + 510 + 4 * q);
+    }
   }
   const __half2 k_inv = __halves2half2(__ushort_as_half(0x1EEE), __ushort_as_half(0x1EEE));
   const __half2 k_bias = __halves2half2(__ushort_as_half(0xC931), __ushort_as_half(0xC931));
@@ -94,11 +102,11 @@ __device__ __forceinline__ void decode_window(uint32_t hi, uint32_t lo, uint32_t
 // (= tile[w0]) and `word1` (= tile[w1]), as four half2 registers in fragment order: frag[0] = B
 // rows (k0, k0 + 1) of n8 half 0, frag[1] = rows (k0 + 8, k0 + 9) of half 0, frag[2] and frag[3]
 // the same for half 1.
-template <int K2>
+template <int K2, bool kW8 = false>
 __device__ __forceinline__ void decode_fragment(uint32_t word0, uint32_t word1, const LanePlan &plan,
                                                 uint32_t (&frag)[4]) {
   const uint64_t window = ((static_cast<uint64_t>(word0) << 32) | word1) << plan.off;
-  decode_window<K2>(static_cast<uint32_t>(window >> 32), static_cast<uint32_t>(window), frag);
+  decode_window<K2, kW8>(static_cast<uint32_t>(window >> 32), static_cast<uint32_t>(window), frag);
 }
 
 // K = 5 and 6: the lane's window spans up to three consecutive words w0, w1, w2 of the tile
@@ -115,10 +123,10 @@ __host__ __device__ inline LanePlan3 lane_plan3(int k2, int lane) {
   return LanePlan3{p.w0, p.w1, (p.w1 + 1) % tile_words(k2), p.off};
 }
 
-template <int K2>
+template <int K2, bool kW8 = false>
 __device__ __forceinline__ void decode_fragment3(uint32_t word0, uint32_t word1, uint32_t word2,
                                                  const LanePlan3 &plan, uint32_t (&frag)[4]) {
-  decode_window<K2>(__funnelshift_l(word1, word0, plan.off), __funnelshift_l(word2, word1, plan.off), frag);
+  decode_window<K2, kW8>(__funnelshift_l(word1, word0, plan.off), __funnelshift_l(word2, word1, plan.off), frag);
 }
 
 }  // namespace ignis_trellis

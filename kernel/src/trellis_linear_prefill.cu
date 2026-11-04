@@ -109,15 +109,15 @@ template <int K2> struct Plan {
 };
 
 // The warp's B fragments of tile row kk of a stage.
-template <int K2>
+template <int K2, bool kW8>
 __device__ __forceinline__ void decode_tile(const Stage &st, int kk, const Plan<K2> &plan, uint32_t (&frag)[4]) {
   constexpr int words = ignis_trellis::tile_words(K2);
   const uint32_t *tile = st.b + (kk * 8 + (threadIdx.x >> 5)) * words;
   if constexpr (K2 >= 10) {
-    ignis_trellis::decode_fragment3<K2>(tile[plan.p.w0], tile[plan.p.w1], tile[plan.p.w2], plan.p, frag);
+    ignis_trellis::decode_fragment3<K2, kW8>(tile[plan.p.w0], tile[plan.p.w1], tile[plan.p.w2], plan.p, frag);
   } else {
     const ignis_trellis::LanePlan q{plan.p.w0, plan.p.w1, plan.p.off};
-    ignis_trellis::decode_fragment<K2>(tile[q.w0], tile[q.w1], q, frag);
+    ignis_trellis::decode_fragment<K2, kW8>(tile[q.w0], tile[q.w1], q, frag);
   }
 }
 
@@ -158,7 +158,7 @@ __device__ __forceinline__ void fold(const Stage &st, uint32_t (&acc16)[kMB][2][
   }
 }
 
-template <int K2>
+template <int K2, bool kW8>
 __device__ void tile(const PrefillParams &p, Stage *stages, int tm, int cb) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -191,7 +191,7 @@ __device__ void tile(const PrefillParams &p, Stage *stages, int tm, int cb) {
   __syncthreads();
   const Plan<K2> plan;
   uint32_t next[4];
-  decode_tile<K2>(stages[0], 0, plan, next);
+  decode_tile<K2, kW8>(stages[0], 0, plan, next);
   for (int ks = 0; ks < steps; ++ks) {
     const Stage &st = stages[ks % kStages];
     if (ks + kStages - 1 < steps) load_stage<K2>(p, stages[(ks + kStages - 1) % kStages], ks + kStages - 1, row0, cb);
@@ -202,9 +202,9 @@ __device__ void tile(const PrefillParams &p, Stage *stages, int tm, int cb) {
       uint32_t a[kMB][4];
       load_a(st, kk, a);
       if (kk < 3) {
-        decode_tile<K2>(st, kk + 1, plan, next);
+        decode_tile<K2, kW8>(st, kk + 1, plan, next);
       } else if (ks + 1 < steps) {
-        decode_tile<K2>(stages[(ks + 1) % kStages], 0, plan, next);
+        decode_tile<K2, kW8>(stages[(ks + 1) % kStages], 0, plan, next);
       }
       mma_row(a, frag, acc16[kk >> 1]);
       if (kk == 2) fold(st, acc16[0], acc);
@@ -253,7 +253,7 @@ __device__ void tile(const PrefillParams &p, Stage *stages, int tm, int cb) {
   }
 }
 
-template <int K2>
+template <int K2, bool kW8>
 __global__ void __launch_bounds__(kThreads, 1) prefill_kernel(const __grid_constant__ PrefillParams p) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   __shared__ int s_ticket, s_next;
@@ -265,7 +265,7 @@ __global__ void __launch_bounds__(kThreads, 1) prefill_kernel(const __grid_const
     while (s_ticket < p.tiles) {
       const int ticket = s_ticket;
       if (threadIdx.x == 0) s_next = static_cast<int>(atomicAdd(&p.counters[0], 1u));
-      tile<K2>(p, stages, ticket / cbs, ticket % cbs);
+      tile<K2, kW8>(p, stages, ticket / cbs, ticket % cbs);
       __syncthreads();
       if (threadIdx.x == 0) s_ticket = s_next;
       __syncthreads();
@@ -281,17 +281,21 @@ __global__ void __launch_bounds__(kThreads, 1) prefill_kernel(const __grid_const
 }
 
 template <int K2> int32_t prepare_one(int *ctas) {
-  cudaError_t err = cudaFuncSetAttribute(prefill_kernel<K2>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmem));
+  cudaError_t err = cudaFuncSetAttribute(prefill_kernel<K2, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmem));
   if (err != cudaSuccess) return fail(std::string("ignis_trellis_prepare: prefill attributes: ") + cudaGetErrorString(err));
   int n = 0;
-  err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, prefill_kernel<K2>, kThreads, kSmem);
+  err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, prefill_kernel<K2, false>, kThreads, kSmem);
   if (err != cudaSuccess || n < 1) return fail("ignis_trellis_prepare: the prefill kernel does not fit an SM");
   *ctas = *ctas == 0 || n < *ctas ? n : *ctas;
+  // PROTOTYPE: the W8 instantiation, set up beside it; it does not move the resident count (a
+  // tile's sums do not depend on the grid).
+  err = cudaFuncSetAttribute(prefill_kernel<K2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmem));
+  if (err != cudaSuccess) return fail(std::string("ignis_trellis_prepare: W8 prefill attributes: ") + cudaGetErrorString(err));
   return 0;
 }
 
 template <int K2> cudaError_t launch_one(cudaLaunchConfig_t &cfg, const PrefillParams &p) {
-  return cudaLaunchKernelEx(&cfg, prefill_kernel<K2>, p);
+  return p.w8 ? cudaLaunchKernelEx(&cfg, prefill_kernel<K2, true>, p) : cudaLaunchKernelEx(&cfg, prefill_kernel<K2, false>, p);
 }
 
 }  // namespace

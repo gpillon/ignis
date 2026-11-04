@@ -18,9 +18,12 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace ignis_tl {
@@ -106,6 +109,12 @@ __device__ __forceinline__ int frag_position(int k) {
   return ((j & 7) >> 1) * 32 + (k >> 4) * 4 + (j >> 3) * 2 + (j & 1);
 }
 
+// PROTOTYPE kBlock8 (IGNIS_PROTO_FAKEQUANT=w8a8blk, the prefill route only): A8 per (token,
+// 128-input block) under the block's own power of two. The block's largest entry sits in
+// [2^(E-1), 2^E) with E = kScaleExp = 9; the INT8 value is the mantissa two binades down, max in
+// [64, 128): q = clamp(rn(v 2^(shift - 2)), +-127), stored as 4 q (exact in fp16) beside the same
+// inverse scale.
+template <bool kBlock8>
 __global__ void __launch_bounds__(kThreads) rotate_kernel(const __grid_constant__ RotateParams p) {
   grid_dependents_launch();
   const int lane = threadIdx.x & 31;
@@ -132,8 +141,16 @@ __global__ void __launch_bounds__(kThreads) rotate_kernel(const __grid_constant_
   shift = min(shift, 126);
   const float scale = ldexpf(1.0f, shift);
   __half h[4];
+  if constexpr (kBlock8) {
 #pragma unroll
-  for (int q = 0; q < 4; ++q) h[q] = __float2half_rn(v[q] * scale);
+    for (int q = 0; q < 4; ++q) {
+      const int i8 = max(-127, min(127, __float2int_rn(v[q] * scale * 0.25f)));
+      h[q] = __int2half_rn(4 * i8);
+    }
+  } else {
+#pragma unroll
+    for (int q = 0; q < 4; ++q) h[q] = __float2half_rn(v[q] * scale);
+  }
   if (p.frag_order) {
     __half *dst = p.xr + static_cast<size_t>(item) * 128;
     // Elements 4 lane + {0, 1} and + {2, 3} are pairs that sit together in fragment order.
@@ -149,6 +166,58 @@ __global__ void __launch_bounds__(kThreads) rotate_kernel(const __grid_constant_
     *reinterpret_cast<uint2 *>(dst) = packed;
   }
   if (lane == 0) p.inv[item] = ldexpf(1.0f, -shift);
+}
+
+// PROTOTYPE (IGNIS_PROTO_FAKEQUANT=w8a8tok, the prefill route only, one weight): A8 per token. One
+// CTA per token rotates its row twice -- the same fp32 arithmetic as rotate_kernel -- first for
+// the amax over the whole K, then to store q = clamp(rn(v 127 / amax), +-127) in fp16 (exact)
+// with amax / 127 as every block's inverse scale.
+__global__ void __launch_bounds__(kThreads) rotate_token_kernel(const __grid_constant__ RotateParams p) {
+  grid_dependents_launch();
+  __shared__ float s_max[kWarps];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nb = p.in / 128;
+  const int t = blockIdx.x;
+  auto rotated = [&](int blk, float (&v)[4]) {
+    const int k0 = blk * 128 + 4 * lane;
+    float x[4], s[4];
+    load_bf16x4(p.x + static_cast<size_t>(t) * p.in + k0, x);
+    load_half4(p.suh[0] + k0, s);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) v[q] = x[q] * s[q];
+    ignis_moe::warp_hadamard128(v);
+  };
+  float m = 0.0f;
+  for (int blk = warp; blk < nb; blk += kWarps) {
+    float v[4];
+    rotated(blk, v);
+    m = fmaxf(m, fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3]))));
+  }
+  m = ignis_moe::warp_max(m);
+  if (lane == 0) s_max[warp] = m;
+  __syncthreads();
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kWarps; ++i) amax = fmaxf(amax, s_max[i]);
+  const bool finite = amax > 0.0f && amax <= 3.0e38f;
+  const float to_q = finite ? 127.0f / amax : 0.0f;
+  const float inv = finite ? amax * (1.0f / 127.0f) : 0.0f;
+  for (int blk = warp; blk < nb; blk += kWarps) {
+    float v[4];
+    rotated(blk, v);
+    __half h[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) h[q] = __int2half_rn(max(-127, min(127, __float2int_rn(v[q] * to_q))));
+    __half *dst = p.xr + static_cast<size_t>(t) * p.in + blk * 128 + 4 * lane;
+    uint2 packed;
+    const __half2 a = __halves2half2(h[0], h[1]);
+    const __half2 b = __halves2half2(h[2], h[3]);
+    packed.x = *reinterpret_cast<const uint32_t *>(&a);
+    packed.y = *reinterpret_cast<const uint32_t *>(&b);
+    *reinterpret_cast<uint2 *>(dst) = packed;
+    if (lane == 0) p.inv[static_cast<size_t>(blk) * p.tokens + t] = inv;
+  }
 }
 
 // ---- reconstruct -----------------------------------------------------------------------------
@@ -241,10 +310,27 @@ int32_t check_call(const char *op, const DeviceState &st, const void *x, uint32_
   return 0;
 }
 
+const char *fq_name(int fq) {
+  return fq == kFqW8 ? "w8" : fq == kFqW8A8Token ? "w8a8tok" : fq == kFqW8A8Block ? "w8a8blk" : "off";
+}
+
+// PROTOTYPE: each matrix shape the fake quant touches, printed the first time it does (the
+// evidence of what the prefill route carries: the body's matrices, never the head).
+void proto_log_shape(int fq, const ignis_trellis_weight &w, uint32_t tokens) {
+  static std::mutex m;
+  static std::set<std::tuple<uint32_t, uint32_t, uint32_t>> seen;
+  std::lock_guard<std::mutex> lock(m);
+  if (seen.insert(std::make_tuple(w.in, w.out, w.k2)).second) {
+    std::fprintf(stderr, "ignis proto: fake quant %s on the prefill route: in %u out %u k2 %u (tokens %u)\n",
+                 fq_name(fq), w.in, w.out, w.k2, tokens);
+  }
+}
+
 // The rotation of `weights` weights' activations, into the call's layout.
 int32_t rotate(const char *op, const void *x, const ignis_trellis_weight *const *w, int weights, uint32_t tokens,
-               bool decode, const Layout &l, const ignis_trellis_workspace *ws, cudaStream_t stream) {
+               bool decode, const Layout &l, const ignis_trellis_workspace *ws, cudaStream_t stream, int fq = kFqOff) {
   RotateParams r{};
+  r.fq = fq;
   r.x = static_cast<const __nv_bfloat16 *>(x);
   for (int i = 0; i < weights; ++i) r.suh[i] = static_cast<const __half *>(w[i]->suh);
   r.weights = weights;
@@ -298,8 +384,10 @@ int32_t run(const char *op, const DeviceState &st, const ignis_trellis_weight *g
   // pass stores BF16 gate values into h; the up pass reads them back.
   for (int i = 0; i < weights; ++i) {
     const ignis_trellis_weight *w = ws_list[i];
-    if (rotate(op, x, &w, 1, tokens, false, l, ws, stream) != 0) return -1;
+    if (st.fq != kFqOff) proto_log_shape(st.fq, *w, tokens);
+    if (rotate(op, x, &w, 1, tokens, false, l, ws, stream, st.fq) != 0) return -1;
     PrefillParams p{};
+    p.w8 = st.fq != kFqOff ? 1 : 0;
     p.w = device_weight(*w);
     p.tokens = static_cast<int>(tokens);
     p.in = static_cast<int>(in);
@@ -324,7 +412,13 @@ int32_t run(const char *op, const DeviceState &st, const ignis_trellis_weight *g
 
 int32_t launch_rotate(const RotateParams &p, cudaStream_t stream) {
   const int items = p.weights * p.tokens * (p.in / 128);
-  rotate_kernel<<<(items + kWarps - 1) / kWarps, kThreads, 0, stream>>>(p);
+  if (!p.frag_order && p.weights == 1 && p.fq == kFqW8A8Token) {
+    rotate_token_kernel<<<p.tokens, kThreads, 0, stream>>>(p);
+  } else if (!p.frag_order && p.fq == kFqW8A8Block) {
+    rotate_kernel<true><<<(items + kWarps - 1) / kWarps, kThreads, 0, stream>>>(p);
+  } else {
+    rotate_kernel<false><<<(items + kWarps - 1) / kWarps, kThreads, 0, stream>>>(p);
+  }
   return 0;
 }
 
@@ -352,6 +446,21 @@ extern "C" int32_t ignis_trellis_prepare(void) {
     st.cap = static_cast<uint32_t>(cap);
     if (st.cap != 0 && admit_first(st.sms, st.cap, st.admit) != 0) return -1;
   }
+  // PROTOTYPE: the prefill route's fake quant; a value it does not know refuses the prepare.
+  const char *fq = std::getenv("IGNIS_PROTO_FAKEQUANT");
+  const std::string mode = fq == nullptr ? "" : fq;
+  if (mode.empty() || mode == "off") {
+    st.fq = kFqOff;
+  } else if (mode == "w8") {
+    st.fq = kFqW8;
+  } else if (mode == "w8a8tok") {
+    st.fq = kFqW8A8Token;
+  } else if (mode == "w8a8blk") {
+    st.fq = kFqW8A8Block;
+  } else {
+    return fail("ignis_trellis_prepare: IGNIS_PROTO_FAKEQUANT must be off, w8, w8a8tok or w8a8blk, got '" + mode + "'");
+  }
+  std::fprintf(stderr, "ignis proto: IGNIS_PROTO_FAKEQUANT=%s\n", fq_name(st.fq));
   std::lock_guard<std::mutex> lock(g_mutex);
   g_state[device] = st;
   return 0;

@@ -45,7 +45,12 @@ struct DeviceState {
   int prefill_ctas = 0;      // resident CTAs per SM of the prefill kernel
   uint32_t cap = 0;          // the debug SM cap, 0 for none
   uint32_t admit[kMaxSmIds / 32] = {};  // SM ids whose CTAs run when capped
+  int fq = 0;                // PROTOTYPE: IGNIS_PROTO_FAKEQUANT, a FakeQuant
 };
+
+// PROTOTYPE (sm8x dense prefill, phase 1): the prefill route's fake quant, IGNIS_PROTO_FAKEQUANT.
+// Off leaves every route as it was; the others touch the prefill route (more than 64 tokens) only.
+enum FakeQuant : int { kFqOff = 0, kFqW8 = 1, kFqW8A8Token = 2, kFqW8A8Block = 3 };
 int32_t require_prepared(const char *op, DeviceState *state);
 // Each kernel translation unit's share of ignis_trellis_prepare: its attributes and occupancy.
 int32_t prepare_decode(DeviceState *state);
@@ -138,6 +143,7 @@ struct RotateParams {
   int frag_order;  // decode's fragment-order blocks, else row-major
   __half *xr;
   float *inv;
+  int fq;          // PROTOTYPE: a FakeQuant; launch_rotate quantizes the prefill activations under A8
 };
 
 struct DecodeParams {
@@ -176,6 +182,7 @@ struct PrefillParams {
   int ldy;
   int capped;
   uint32_t admit[kMaxSmIds / 32];
+  int w8;         // PROTOTYPE: the host picks prefill_kernel<K2, true> (the W8 decode)
 };
 
 int32_t launch_rotate(const RotateParams &p, cudaStream_t stream);
