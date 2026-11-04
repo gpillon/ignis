@@ -71,8 +71,8 @@ figure when you size an agent workload.
 - **The backend**: [`spec.backend`](../reference/configuration.md#specbackend)
   (`dflash2`, `mtp` or `off`) and
   [`spec.draft_tokens`](../reference/configuration.md#specdraft_tokens), 1 to 7
-  and required with `dflash2`. The built-in `rtx5090`, `rtxpro6000` and
-  `rtx-16gb` profiles set `dflash2` at 7.
+  and required with `dflash2`. The built-in `rtx5090`, `rtxpro6000`,
+  `rtx-16gb` and `rtx-24gb` profiles set `dflash2` at 7.
 - **The proposal head**: [`spec.draft_head`](../reference/configuration.md#specdraft_head),
   `full` or `shortlist`. The `ignis.runtime.draft_head` log line prints the
   choice at load.

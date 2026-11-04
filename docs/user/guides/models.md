@@ -65,19 +65,19 @@ another, and `ignis-server model download <id>` fetches it like any entry.
 Each entry states the smallest **card class** it loads on
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md)): every
 built-in model is 32 GB, the RTX 5090's class, except `qwen3.8-27b-16g`, `qwen3.8-27b-abliterated-16g` and `swift-1.5-27b-16g` (16 GB) and the speech models (none).
-On a card of a smaller class (16 GB), the server refuses an entry above it before unloading or fetching
+On a card of a smaller class (16 or 24 GB), the server refuses an entry above it before unloading or fetching
 anything: a switch to it and a request naming it are answered
 `409 model_above_card_class`, naming both classes, while the loaded model
 serves on; a start with no artifact that would load it, and its
 `model download`, are refused; `GET /v1/models`, `GET /v1/models/catalog` and
 the Playground list it as unavailable, with the reason. An entry may answer to
 its family's default id as an **alias**: the 16 GB 27B answers to
-`qwen3.8-27b` on a 16 GB card, so a client configured with
+`qwen3.8-27b` on a 16 or 24 GB card, so a client configured with
 `qwen3.8-27b` is served by it, and the answer names it — only an entry whose
 artifact is of the 27B's family, by the artifact's header, answers to it; one
 of another family is refused, naming both. An alias may also be another
 entry's id of the same family: `qwen3.8-27b-abliterated-16g` answers to
-`qwen3.8-27b-abliterated` on a 16 GB card, `swift-1.5-27b-16g` to
+`qwen3.8-27b-abliterated` on a 16 or 24 GB card, `swift-1.5-27b-16g` to
 `swift-1.5-27b` ([fine-tunes](fine-tunes.md)), and an [operator's catalog](operator-catalog.md#an-entrys-family-and-an-alias-of-your-own)
 does the same with an entry's `family`. `GET /v1/models` lists the entry
 under its own id, never under an alias. A model loaded from a path named
