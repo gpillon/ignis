@@ -139,6 +139,14 @@ pub fn profiles() -> String {
          name of `{}` and is still accepted everywhere a profile is named, as the same profile.\n",
         CardClass::Gb16.profile()
     );
+    let _ = writeln!(
+        out,
+        "A profile follows the card's memory, not its generation. The RTX 3090 and 3090 Ti are \
+         supported, on the 27B's 16 GB entries; the RTX 4090 and the 16 GB RTX 40 cards are \
+         expected to work, and reports are welcome; the RTX 50 and RTX PRO 6000 run every model. \
+         The NVFP4 27B, Flash-Next and the image model load on Blackwell alone \
+         ([What it runs on](../start/index.md#what-it-runs-on)).\n"
+    );
     for (name, layer) in built_in() {
         let _ = writeln!(out, "## {name}\n");
         if let Some(class) = CardClass::ALL.into_iter().find(|class| class.profile() == name) {
@@ -418,6 +426,8 @@ mod tests {
     #[test]
     fn the_profiles_page_names_the_class_auto_picks_each_profile_for() {
         let page = profiles();
+        assert!(page.contains("RTX 3090 and 3090 Ti are supported, on the 27B's 16 GB entries"), "{page}");
+        assert!(page.contains("load on Blackwell alone"), "{page}");
         assert!(page.contains("## rtx-24gb\n\n`--profile auto` picks it on a card of the 24 GB class: a total memory from 20 to under 28 GiB.\n"), "{page}");
         assert!(page.contains("## rtx-16gb\n\n`--profile auto` picks it on a card of the 16 GB class: a total memory below 20 GiB.\n"), "{page}");
         assert!(page.contains("## rtx5090\n\n`--profile auto` picks it on a card of the 32 GB class: a total memory from 28 to 40 GiB.\n"), "{page}");

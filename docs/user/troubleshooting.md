@@ -17,17 +17,20 @@ count, differs from run to run. Error bodies on `/v1` are OpenAI's
 
 The card is not one the build's kernels were compiled for. The full message
 names the card as NVML does and its compute capability, here an RTX 40 card at
-8.9, and ends "see GitHub #456". Every release, and a build from a checkout by
-default, is compiled for `120a` only: compute capability 12.0, the RTX 50 and
-RTX PRO 6000 Blackwell cards
-([What it runs on](start/index.md#what-it-runs-on)). The server checks the
-card before anything else, whatever `--profile` says, because a load could only
+8.9, and ends with a link to the guide's
+[What it runs on](start/index.md#what-it-runs-on). A build from a checkout by
+default is compiled for `120a` only: compute capability 12.0, the RTX 50 and
+RTX PRO 6000 Blackwell cards. A release is compiled for `86;120a`, which adds
+the RTX 30 and RTX 40 cards, so it refuses a card older than those, such as an
+RTX 20. The server checks the card before anything else, whatever `--profile` says, because a load could only
 fail at its first kernel with CUDA's own "no kernel image is available for
 execution on the device". `model download`, `model list` and the `config`
 commands load nothing and still run on such a card.
 
-RTX 30 and 40 cards are not supported
-([#456](https://github.com/gpillon/ignis/issues/456)). On a machine with more
+On an RTX 30 or RTX 40 card, use a release, or build for it
+([Other card architectures](contributing/building.md#other-card-architectures)):
+the RTX 3090 and 3090 Ti are supported, the RTX 4090 and the 16 GB RTX 40
+cards are expected to work, and reports are welcome. On a machine with more
 than one card, ignis uses CUDA device 0; when that is the other card,
 `CUDA_VISIBLE_DEVICES` names the supported one.
 

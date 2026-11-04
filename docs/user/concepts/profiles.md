@@ -48,6 +48,13 @@ in force came from, `profile` included.
 
 ## The built-in profiles
 
+A card's profile follows from its memory, not its generation. Which cards run
+ignis: Blackwell (RTX 50, RTX PRO 6000) with every model; the RTX 3090 and
+3090 Ti, supported, on the 27B's 16 GB entries; the RTX 4090 and the 16 GB RTX
+40 cards, expected to work, reports welcome. The NVFP4 27B, Flash-Next and the
+image model load on Blackwell alone ([What it runs on](../start/index.md#what-it-runs-on)).
+No profile here carries a speed for an RTX 30 or RTX 40 card.
+
 `rtx5090` and `rtxpro6000` carry numbers measured on the card they name,
 with the finding for each choice linked below; `rtx-16gb` is derived from
 them, since no 16 GB card exists in the project; `rtx-24gb` takes the 5090's

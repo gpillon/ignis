@@ -225,6 +225,10 @@ impl fmt::Display for BuiltArchitectures {
     }
 }
 
+/// The guide's account of the cards ignis runs on, where a refusal on a card
+/// sends the reader.
+const WHAT_IT_RUNS_ON: &str = "https://gpillon.github.io/ignis/start/#what-it-runs-on";
+
 /// The card series a refusal names beside a capability, by architecture.
 const KNOWN_SERIES: [(ComputeCapability, &str); 3] = [
     (ComputeCapability::new(8, 6), "RTX 30"),
@@ -240,7 +244,7 @@ const KNOWN_SERIES: [(ComputeCapability, &str); 3] = [
 pub fn uncovered(name: &str, capability: ComputeCapability, built_for: &BuiltArchitectures) -> Option<String> {
     (!built_for.cover(capability)).then(|| {
         format!(
-            "this build's kernels run on compute capability {}, built for {built_for}; the card is {name} ({capability}), which they were not built for: see GitHub #456",
+            "this build's kernels run on compute capability {}, built for {built_for}; the card is {name} ({capability}), which they were not built for: see {WHAT_IT_RUNS_ON}",
             built_for.describe()
         )
     })
@@ -302,7 +306,7 @@ pub fn refuse(card: Option<&CardReading>, route: Sm120aRoute) -> Option<String> 
     }
     let set: Vec<String> = card.built_for.sm120a().map(Architecture::to_string).collect();
     Some(format!(
-        "{} needs kernels this build compiles for {} alone, which run on compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell); the card is {} ({}){}: see GitHub #456",
+        "{} needs kernels this build compiles for {} alone, which run on compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell); the card is {} ({}){}: see {WHAT_IT_RUNS_ON}",
         route.what(),
         set.join(";"),
         card.name,
@@ -452,7 +456,9 @@ mod tests {
         let refusal = uncovered("NVIDIA GeForce RTX 4080", cc(8, 9), &built).unwrap();
         assert!(refusal.contains("NVIDIA GeForce RTX 4080 (8.9)"), "{refusal}");
         assert!(refusal.contains("compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell)"), "{refusal}");
-        assert!(refusal.contains("built for 120a;") && refusal.contains("#456"), "{refusal}");
+        assert!(refusal.contains("built for 120a;"), "{refusal}");
+        assert!(refusal.ends_with("see https://gpillon.github.io/ignis/start/#what-it-runs-on"), "{refusal}");
+        assert!(!refusal.contains("#456"), "{refusal}");
         assert_eq!(uncovered("NVIDIA GeForce RTX 5090", cc(12, 0), &built), None);
         let ampere = BuiltArchitectures::parse("86;120a").unwrap();
         assert_eq!(uncovered("NVIDIA GeForce RTX 3090", cc(8, 6), &ampere), None);
