@@ -27,8 +27,8 @@ since under `host` residency vision costs it no context while no image is in fli
 **Amended by [ADR 0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md)** (spec #474, GitHub
 #476, #480): a 24 GB card class, the RTX 3090 and RTX 4090, from 20 GiB up to but not including 28 GiB, which `auto`
 starts under a new built-in profile, `rtx-24gb`; the 16 GB profile is named `rtx-16gb`, with `rtx50-16gb` kept as a
-permanent alias. The class stays memory alone, and the GPU generation is an axis beside it; architectures other than
-SM120 are now in scope.
+permanent alias. The class stays memory alone, and the GPU generation is an axis beside it; the RTX 30 (Ampere,
+compute capability 8.6) and RTX 40 (Ada, 8.9) cards are now in scope beside SM120.
 
 Related:
 - [ADR 0030](0030-device-memory-reserved-at-load.md): device memory is reserved at load;
