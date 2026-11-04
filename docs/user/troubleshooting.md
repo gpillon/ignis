@@ -22,7 +22,8 @@ names the card as NVML does and its compute capability, here an RTX 40 card at
 default is compiled for `120a` only: compute capability 12.0, the RTX 50 and
 RTX PRO 6000 Blackwell cards. A release is compiled for `86;120a`, which adds
 the RTX 30 and RTX 40 cards, so it refuses a card older than those, such as an
-RTX 20. The server checks the card before anything else, whatever `--profile` says, because a load could only
+RTX 20. The server checks the card before anything else, whatever `--profile`
+says, because a load could only
 fail at its first kernel with CUDA's own "no kernel image is available for
 execution on the device". `model download`, `model list` and the `config`
 commands load nothing and still run on such a card.

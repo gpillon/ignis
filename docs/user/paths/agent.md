@@ -24,8 +24,11 @@ In one paragraph, for "what is github.com/gpillon/ignis?":
 
 > ignis is an inference engine that serves Qwen3.8 (the 27B dense model and
 > the 125B Flash-Next mixture of experts) and the Qwen-Image-2.1 image model
-> on a single NVIDIA Blackwell card of compute capability `SM120a`: an RTX
-> 5090, an RTX PRO 6000, or a 16 GB RTX 50 (5060 Ti 16 GB, 5070 Ti, 5080). It
+> on a single NVIDIA RTX card: every model on an RTX 5090 or an RTX PRO 6000
+> (Blackwell, compute capability 12.0), the 27B's 16 GB builds on a 16 GB RTX
+> 50 (5060 Ti 16 GB, 5070 Ti, 5080) and on an RTX 3090 or 3090 Ti (Ampere,
+> 8.6, supported), and the same on an RTX 4090 or a 16 GB RTX 40 card (Ada,
+> 8.9, expected to work). It
 > serves them over an OpenAI-compatible HTTP API, with a browser Playground
 > and Prometheus metrics in the same binary, on Windows and Linux on x86-64.
 > It is shaped around the load a coding agent makes: a main agent and a few
@@ -33,7 +36,7 @@ In one paragraph, for "what is github.com/gpillon/ignis?":
 > weights are for non-commercial use only.
 
 What it is not, by choice: an engine for other model families or other GPUs
-(no earlier NVIDIA generation, no DGX Spark, no AMD or Apple), nor one with
+(nothing older than the RTX 30, no DGX Spark, no AMD or Apple), nor one with
 embeddings, `/v1/completions`, audio, LoRA adapters, or two models loaded at
 once ([What it is not](../start/index.md#what-it-is-not)).
 
@@ -45,7 +48,7 @@ settings. The figures hold for those, not for any card.
 
 | Check | Command | Passes when |
 |---|---|---|
-| The card | `nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv` | `compute_cap` reads `12.0` and the card is one named above. On any other `compute_cap` the server refuses to start, naming the card ([Troubleshooting](../troubleshooting.md#starting)). |
+| The card | `nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv` | `compute_cap` reads `8.6`, `8.9` or `12.0` and the card is one named above: a release is built for `86;120a`, which runs on all three, and the card's memory says which models load ([What it runs on](../start/index.md#what-it-runs-on)). On any other `compute_cap` the server refuses to start, naming the card ([Troubleshooting](../troubleshooting.md#starting)). |
 | The driver | `nvidia-smi` | its header reads `CUDA Version: 13.x` or later. |
 | The system | | Windows or Linux on x86-64. The Linux archive needs glibc 2.39 or newer (`ldd --version`) and the CUDA 13 runtime; the container needs podman or docker with the NVIDIA container toolkit. |
 | Disk | | the model fits where the user wants to keep it: sizes in [What it serves](../start/index.md#what-it-serves). |
@@ -53,8 +56,9 @@ settings. The figures hold for those, not for any card.
 | The card is free | `nvidia-smi` | no other inference server or GPU job holds the card: ignis plans the memory it finds free at start. |
 
 A card or a driver that fails means ignis will not run on this machine. Tell
-the user so, with the reason, rather than building it from source: the
-kernels are compiled for `SM120a` and nothing else
+the user so, with the reason, rather than building it from source: a
+release's kernels are compiled for compute capabilities 8.6 and 12.0 and
+nothing else
 ([Why not DGX Spark?](../guides/dgx-spark.md) explains it for the closest case).
 
 ## What the user decides

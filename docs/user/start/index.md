@@ -42,9 +42,9 @@ You can add models of your own with an
 - **Cards.** By GPU generation (Ampere is RTX 30, Ada RTX 40, Blackwell
   RTX 50 and RTX PRO):
   - *Blackwell (compute capability 12.0).* One RTX 5090 (32 GB) or one RTX
-    PRO 6000 Blackwell (96 GB), and the 16 GB class (RTX 5060 Ti 16 GB, 5070
-    Ti, 5080) for the 27B's 16 GB entry, whose profile is derived rather than
-    measured. Every model loads here.
+    PRO 6000 Blackwell (96 GB) loads every model. The 16 GB class (RTX 5060 Ti
+    16 GB, 5070 Ti, 5080) loads the 16 GB entries (the 27B, its uncensored
+    variant, Swift 1.5), on a profile derived rather than measured.
   - *Ampere.* The RTX 3090 and the RTX 3090 Ti (8.6, 24 GB) are supported, on
     the 27B's 16 GB entries.
   - *Ada.* The RTX 4090 (24 GB) and the 16 GB RTX 40 cards (RTX 4060 Ti 16 GB,
@@ -52,7 +52,8 @@ You can add models of your own with an
   - *Blackwell only.* The NVFP4 27B (`qwen3.8-27b`, `qwen3.8-27b-abliterated`),
     the Swift 1.5 builds, Flash-Next and the image model. On an RTX 30 or RTX
     40 card the server refuses them, and the 27B's ids are served by their 16
-    GB entries.
+    GB entries. All of them but Swift 1.5's 16 GB build also need a card of
+    32 GB or more, by their card class.
   - This guide gives no speed for an RTX 30 or RTX 40 card.
 
   Each catalog entry states the smallest card class and the oldest GPU

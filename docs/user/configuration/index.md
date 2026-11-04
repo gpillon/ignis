@@ -83,7 +83,8 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   ([Flash-Next n-gram startup cache](ngram-cache.md)). Everything else is as on the
   5090, except that the 27B's VRAM headroom stays at its default. `--profile
   auto` picks it on this card; `--profile rtxpro6000` names it.
-- `rtx-16gb` is the 16 GB class (RTX 5060 Ti 16 GB, 5070 Ti, 5080): derived,
+- `rtx-16gb` is the 16 GB class (RTX 5060 Ti 16 GB, 5070 Ti, 5080, RTX 4060 Ti
+  16 GB, RTX 4080): derived,
   not measured, since no 16 GB card exists in the project. The 27B at
   262,144 tokens of context on two decode lanes, with DFlash2 at 7 draft
   tokens and the drafter's head `auto`, vision on at 4,096 tokens an image (the tower and pool in host RAM, so
@@ -139,10 +140,10 @@ one, which does not.
 
 A file's `profiles: { <name>: { <group>: { … } } }` defines one for any other
 card. `auto` picks the class's profile by name, the lookup a named profile
-goes through, so a file whose `profiles:` redefines `rtx-16gb`, `rtx5090` or
-`rtxpro6000` replaces what `auto` picks for that class. A profile called `none`
-or `auto` is refused when the file is read: both words mean something to
-`--profile`, so such a profile could never be reached.
+goes through, so a file whose `profiles:` redefines `rtx-16gb`, `rtx-24gb`,
+`rtx5090` or `rtxpro6000` replaces what `auto` picks for that class. A profile
+called `none` or `auto` is refused when the file is read: both words mean
+something to `--profile`, so such a profile could never be reached.
 
 `config generate` writes every resolved value as a value of the FILE, the
 profile's among them: a file generated under `auto` carries the numbers of the

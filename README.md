@@ -89,11 +89,12 @@ the prompt optionally rewritten first by the 27B
 ([Images made](#images-made-on-the-same-card)). Its weights are for
 non-commercial use only.
 
-**What it runs on.** The RTX 5090, the RTX PRO 6000 and the 16 GB RTX 50 cards
-run every model. The **RTX 3090 and 3090 Ti** are supported, on the 27B's 16 GB
-entries; the **RTX 4090** and the 16 GB RTX 40 cards are expected to work, and
-reports are welcome. The NVFP4 27B, Flash-Next and the image model load on
-Blackwell alone. The figures here are measured on an RTX 5090
+**What it runs on.** The RTX 5090 and the RTX PRO 6000 run every model, and
+the 16 GB RTX 50 cards the 16 GB entries. The **RTX 3090 and 3090 Ti** are
+supported, on the 27B's 16 GB entries; the **RTX 4090** and the 16 GB RTX 40
+cards are expected to work, and reports are welcome. The NVFP4 27B, Flash-Next
+and the image model load on Blackwell alone, on a card of 32 GB or more. The
+figures here are measured on an RTX 5090
 ([the guide's list](https://gpillon.github.io/ignis/start/#what-it-runs-on)).
 
 The 27B also fits a **16 GB card** (RTX 5060 Ti 16 GB, 5070 Ti, 5080), from a
@@ -122,7 +123,8 @@ that build it, and the rest of that is what the remaining work is for.
 
 Take a build from **[Releases](https://github.com/gpillon/ignis/releases)** — a
 Windows `.zip`, a Linux `.tar.gz`, or the `linux/amd64` container image on
-`ghcr.io/gpillon/ignis`. Run it on an RTX 50, RTX PRO 6000 or RTX 30 card; the releases are built for compute capabilities 8.6 and 12.0. (Every push to `main` that
+`ghcr.io/gpillon/ignis`. Run it on an RTX 50, RTX PRO 6000 or RTX 30 card; the
+releases are built for compute capabilities 8.6 and 12.0. (Every push to `main` that
 changes code also publishes a rolling development build, **not a release**: the image
 `ghcr.io/gpillon/ignis:develop` and the `develop` prerelease.)
 

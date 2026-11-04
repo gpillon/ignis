@@ -29,7 +29,8 @@ Choose a profile with `--profile <name>`, `IGNIS_PROFILE`, or `profile:` in the
 config file. With none of them the profile is `auto`: the start reads the
 card's total memory from NVML and takes the built-in profile of its class,
 `rtx-16gb` under 20 GiB, `rtx-24gb` from 20 GiB up to 28 GiB, `rtx5090` from
-28 to 40 GiB, `rtxpro6000` from 88 to 104 GiB. The log line `ignis.config.source` names the profile chosen and
+28 to 40 GiB, `rtxpro6000` from 88 to 104 GiB. The log line
+`ignis.config.source` names the profile chosen and
 the total it was chosen by. To skip the layer entirely and run on the hardcoded
 defaults, name `none`. A name that is not defined is refused with the list of
 the ones that are.
@@ -48,11 +49,13 @@ in force came from, `profile` included.
 
 ## The built-in profiles
 
-A card's profile follows from its memory, not its generation. Which cards run
-ignis: Blackwell (RTX 50, RTX PRO 6000) with every model; the RTX 3090 and
-3090 Ti, supported, on the 27B's 16 GB entries; the RTX 4090 and the 16 GB RTX
-40 cards, expected to work, reports welcome. The NVFP4 27B, Flash-Next and the
-image model load on Blackwell alone ([What it runs on](../start/index.md#what-it-runs-on)).
+A card's profile follows from its memory, not its generation; what it loads
+follows from both. Which cards run ignis: the RTX 5090 and RTX PRO 6000 with
+every model, and the 16 GB RTX 50 cards with the 16 GB entries; the RTX 3090
+and 3090 Ti, supported, on the 27B's 16 GB entries; the RTX 4090 and the 16 GB
+RTX 40 cards, expected to work, reports welcome. The NVFP4 27B, Flash-Next and
+the image model load on Blackwell alone, on a card of 32 GB or more
+([What it runs on](../start/index.md#what-it-runs-on)).
 No profile here carries a speed for an RTX 30 or RTX 40 card.
 
 `rtx5090` and `rtxpro6000` carry numbers measured on the card they name,
@@ -151,7 +154,8 @@ Why each:
 
 ### `rtx-16gb`
 
-The 16 GB class: the RTX 5060 Ti 16 GB, 5070 Ti and 5080. It serves the 27B
+The 16 GB class: the RTX 5060 Ti 16 GB, 5070 Ti and 5080, and the RTX 4060 Ti
+16 GB and RTX 4080. It serves the 27B
 from the catalog's 16 GB entry, `qwen3.8-27b-16g`; the profile names no
 model, and a start with no artifact resolves the default id `qwen3.8-27b` to
 that entry ([Get a model](../guides/models.md)).
