@@ -17,6 +17,8 @@ A profile is a layer of defaults for one kind of card, between the config file a
 
 ## rtx-16gb
 
+`--profile auto` picks it on a card of the 16 GB class: a total memory below 20 GiB.
+
 | Field | Model | Value |
 |---|---|---|
 | [`model.max_context`](configuration.md#modelmax_context) | Qwen3.8-27B | `262144` |
@@ -29,7 +31,23 @@ A profile is a layer of defaults for one kind of card, between the config file a
 | [`vision.residency`](configuration.md#visionresidency) | every model | `host` |
 | [`vram.headroom_bytes`](configuration.md#vramheadroom_bytes) | Qwen3.8-27B | `1200M` |
 
+## rtx-24gb
+
+`--profile auto` picks it on a card of the 24 GB class: a total memory from 20 to under 28 GiB.
+
+| Field | Model | Value |
+|---|---|---|
+| [`model.max_context`](configuration.md#modelmax_context) | Qwen3.8-27B | `1048576` |
+| [`model.prefill_chunk`](configuration.md#modelprefill_chunk) | Qwen3.8-27B | `2048` |
+| [`spec.backend`](configuration.md#specbackend) | Qwen3.8-27B | `dflash2` |
+| [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-27B | `7` |
+| [`vision.enabled`](configuration.md#visionenabled) | every model | `true` |
+| [`vision.residency`](configuration.md#visionresidency) | every model | `host` |
+| [`vram.headroom_bytes`](configuration.md#vramheadroom_bytes) | Qwen3.8-27B | `1200M` |
+
 ## rtx5090
+
+`--profile auto` picks it on a card of the 32 GB class: a total memory from 28 to 40 GiB.
 
 | Field | Model | Value |
 |---|---|---|
@@ -46,6 +64,8 @@ A profile is a layer of defaults for one kind of card, between the config file a
 | [`vram.pinned_expert_bytes`](configuration.md#vrampinned_expert_bytes) | every model | `2G` |
 
 ## rtxpro6000
+
+`--profile auto` picks it on a card of the 96 GB class: a total memory from 88 to 104 GiB.
 
 | Field | Model | Value |
 |---|---|---|
