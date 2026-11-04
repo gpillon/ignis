@@ -55,7 +55,7 @@ async fn catalog() -> Json<Value> {
 
 async fn origins() -> Json<Value> {
     Json(json!({ "object": "list", "data": [
-        { "key": "model.max_context", "scope": null, "source": "profile", "scoped": false, "spelling": "rtx50-16gb" },
+        { "key": "model.max_context", "scope": null, "source": "profile", "scoped": false, "spelling": "rtx-16gb" },
         { "key": "vram.budget_bytes", "scope": null, "source": "flag", "scoped": false, "spelling": "--vram-budget-bytes" },
     ]}))
 }
@@ -126,7 +126,7 @@ fn the_record_is_assembled_from_what_the_server_exposes() {
 
     assert_eq!(json["server"]["version"], "0.7.3-test");
     assert_eq!(json["server"]["model_id"], common::MODEL);
-    assert_eq!(json["server"]["profile"], "rtx50-16gb");
+    assert_eq!(json["server"]["profile"], "rtx-16gb");
     assert_eq!(json["server"]["max_model_len"], MAX_MODEL_LEN);
     assert_eq!(json["server"]["family"], "qwen38flashnext", "the catalog's loaded row, not the id");
     assert_eq!(json["plan"]["budget_bytes"], 17_179_869_184u64);
