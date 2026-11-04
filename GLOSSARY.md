@@ -1,9 +1,10 @@
 # ignis
 
-ignis is the Rust inference engine for Qwen models on a single SM120a card:
+ignis is the Rust inference engine for Qwen models on one NVIDIA RTX card:
 text models and an image model, one loaded at a time, and a speech model
 loaded beside whichever it is. It is deliberately specialized, to few model
-families and one GPU class.
+families and to the consumer and workstation GPU generations it is built for,
+Blackwell (RTX 50, RTX PRO), Ampere (RTX 30) and Ada (RTX 40).
 
 ## Language
 
