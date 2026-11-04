@@ -40,7 +40,10 @@
 //   project    the body's prefill-GEMM time per 8K and per 64K tokens, dense against fused
 //
 //   ignis_sm8x_dense_bench [--artifact PATH] [--tokens 2048,4096] [--check-tokens N] [--reps N]
-//                          [--no-check] [--no-speed] [--no-peaks]
+//                          [--no-check] [--no-speed] [--no-peaks] [--diag] [--no-fused]
+//
+// If the fused trellis linear does not prepare on a card (or with --no-fused), the bench says so and
+// runs the dense route alone: no fused column, no V2 comparisons.
 
 #include "moe_common.cuh"
 #include "trellis_linear_internal.cuh"
@@ -785,11 +788,19 @@ void set_env(const char *name, const char *value) {
 }
 
 // ignis_trellis_prepare under a fake-quant mode (phase 1's IGNIS_PROTO_FAKEQUANT): "off" is today's
-// fused prefill kernel, "w8a8tok" phase 1's V2.
-void prepare_fused(const char *fakequant) {
+// fused prefill kernel, "w8a8tok" phase 1's V2. Not fatal: if the leaf does not prepare on a card,
+// the bench says why and runs the dense route alone (no fused timings, no V2 comparisons).
+bool g_fused = true;
+
+bool prepare_fused(const char *fakequant) {
   set_env("IGNIS_TRELLIS_SM_CAP", "0");
   set_env("IGNIS_PROTO_FAKEQUANT", fakequant);
-  TL_RC(ignis_trellis_prepare());
+  if (ignis_trellis_prepare() != 0) {
+    std::printf("fused trellis linear unavailable on this card (ignis_trellis_prepare: %s): the dense route runs alone\n",
+                ignis_trellis_last_error());
+    g_fused = false;
+  }
+  return g_fused;
 }
 
 // Device microseconds per launch: `inner` back-to-back launches between two events, best of g_reps.
@@ -1037,14 +1048,16 @@ void check_matrix(const Artifact &art, const std::string &name, int tokens, cuda
   const std::vector<float> sa = trellis_test::download<float>(d_sa.p, tokens);
   const std::vector<int32_t> sq = trellis_test::download<int32_t>(d_sq.p, tokens);
 
-  prepare_fused("w8a8tok");
-  const uint64_t ws_bytes = ignis_trellis_workspace_bytes(m.in, m.out, 1, tokens);
-  DeviceBytes ws_mem(ws_bytes), d_yv(2ull * tokens * out);
-  ignis_trellis_workspace ws{ws_mem.p, ws_bytes};
-  TL_RC(ignis_trellis_workspace_init(&ws, stream));
-  TL_RC(ignis_trellis_linear(&tw, d_x.p, tokens, d_yv.p, m.out, IGNIS_TRELLIS_STORE, &ws, stream));
-  BENCH_CUDA(cudaStreamSynchronize(stream));
-  {
+  DeviceBytes d_yv(2ull * tokens * out);
+  const bool v2 = g_fused && prepare_fused("w8a8tok");
+  if (!v2) std::printf("    V2 comparisons skipped: the fused trellis linear is unavailable\n");
+  if (v2) {
+    const uint64_t ws_bytes = ignis_trellis_workspace_bytes(m.in, m.out, 1, tokens);
+    DeviceBytes ws_mem(ws_bytes);
+    ignis_trellis_workspace ws{ws_mem.p, ws_bytes};
+    TL_RC(ignis_trellis_workspace_init(&ws, stream));
+    TL_RC(ignis_trellis_linear(&tw, d_x.p, tokens, d_yv.p, m.out, IGNIS_TRELLIS_STORE, &ws, stream));
+    BENCH_CUDA(cudaStreamSynchronize(stream));
     const ignis_tl::Layout l = ignis_tl::layout(m.in, m.out, 1, tokens, 1);
     const std::vector<uint16_t> xr = trellis_test::download<uint16_t>(static_cast<char *>(ws_mem.p) + l.xr, static_cast<size_t>(tokens) * in);
     const std::vector<float> inv = trellis_test::download<float>(static_cast<char *>(ws_mem.p) + l.inv, static_cast<size_t>(in / 128) * tokens);
@@ -1062,8 +1075,8 @@ void check_matrix(const Artifact &art, const std::string &name, int tokens, cuda
     std::printf("    A8 against V2's rotation: %zu of %zu values, %zu scales and %zu sums differ\n", wrong,
                 static_cast<size_t>(tokens) * in, wrong_scale, wrong_sum);
     verdict(wrong == 0 && wrong_scale == 0 && wrong_sum == 0, "A8 bit-identical to V2's");
+    prepare_fused("off");
   }
-  prepare_fused("off");
 
   // The GEMM's int32 accumulators against the integer reference, both tile heights.
   DeviceBytes d_raw(4ull * tokens * out), d_ref(4ull * tokens * out);
@@ -1143,10 +1156,11 @@ void check_matrix(const Artifact &art, const std::string &name, int tokens, cuda
     max_ulps = std::max(max_ulps, u);
   }
   std::printf("    dense - ref: worst %.3f of 2^-8|Y| + 2^-9 s (BF16 rounding of the exact sum), rel RMS %.3g\n", dr.worst, dr.rel_rms);
+  verdict(dr.over == 0, "dense output = the exact product within BF16 rounding");
+  if (!v2) return;
   std::printf("    V2    - ref: worst %.3f of 2^-8|Y| + 2^-8 s (fp16 accumulation), rel RMS %.3g\n", vr.worst, vr.rel_rms);
   std::printf("    dense - V2:  worst %.3f of the two bounds' sum, rel RMS %.3g; BF16 bits equal at %.2f%%, within 1 ulp at %.3f%%, max %.1f ulp\n",
               dv.worst, dv.rel_rms, 100.0 * same / yd.size(), 100.0 * one_ulp / yd.size(), max_ulps);
-  verdict(dr.over == 0, "dense output = the exact product within BF16 rounding");
   verdict(vr.over == 0, "V2 output = the exact product within fp16 accumulation's bound");
   verdict(dv.over == 0, "dense output = V2 within the two bounds' sum");
 }
@@ -1340,7 +1354,7 @@ void speed(int tokens, Route &r, cudaStream_t s, ChunkTotals &chunk) {
     const double gemm = gc.us * per;
     const double ops = 2.0 * tokens * sh.in * sh.out * per;
     const double tops = ops / (gemm * 1e-6) / 1e12;
-    const double fused = time_fused(pool, sh, tokens, s);
+    const double fused = g_fused ? time_fused(pool, sh, tokens, s) : std::nan("");
     const double dense = dec + a8 + gemm;
     std::printf("%-12s %6u %6u %3.1f | %8.1f %7.1f %8.1f %7.1f %5.1f%% %9.1f | %9.1f %7.1f | %6.2f   (BM %d, %s)\n", sh.name,
                 sh.in, sh.out, sh.k2 / 2.0, dec, a8, gemm, tops, 100.0 * tops / g_s8_peak, dense, fused,
@@ -1365,7 +1379,7 @@ void speed(int tokens, Route &r, cudaStream_t s, ChunkTotals &chunk) {
       const double gemm = time_gemm(r, sh, tokens, gc.bm, gc.raster, s) * per;
       it = a8_gemm.emplace(sh.name, std::make_pair(a8, gemm)).first;
     }
-    const double fused = time_fused(pool, sh, tokens, s);
+    const double fused = g_fused ? time_fused(pool, sh, tokens, s) : std::nan("");
     chunk.decode += e.calls * dec;
     chunk.a8 += e.calls * it->second.first;
     chunk.gemm += e.calls * it->second.second;
@@ -1516,9 +1530,11 @@ int main(int argc, char **argv) {
       do_peaks = false;
     } else if (a == "--diag") {
       diag = true;
+    } else if (a == "--no-fused") {
+      g_fused = false;
     } else {
       std::fprintf(stderr,
-                   "usage: %s [--artifact PATH] [--tokens 2048,4096] [--check-tokens N] [--reps N] [--no-check] [--no-speed] [--no-peaks]\n",
+                   "usage: %s [--artifact PATH] [--tokens 2048,4096] [--check-tokens N] [--reps N] [--no-check] [--no-speed] [--no-peaks] [--diag] [--no-fused]\n",
                    argv[0]);
       return 2;
     }
@@ -1540,7 +1556,11 @@ int main(int argc, char **argv) {
   std::printf("device: sm_%d%d, %d SMs, %zu B shared memory per block (opt-in), %zu B per SM, %d MB L2\n", prop.major, prop.minor,
               prop.multiProcessorCount, prop.sharedMemPerBlockOptin, prop.sharedMemPerMultiprocessor, prop.l2CacheSize >> 20);
   prepare_gemm();
-  prepare_fused("off");
+  if (g_fused) {
+    prepare_fused("off");  // a failure leaves g_fused false and is printed
+  } else {
+    std::printf("fused trellis linear: not run (--no-fused): the dense route runs alone\n");
+  }
   std::printf("kernels:\n");
   kernel_report("sm8x_dense_gemm<256>", reinterpret_cast<const void *>(sm8x_dense_gemm<256>), kGemmThreads, Cfg<256>::kSmem);
   kernel_report("sm8x_dense_gemm<128>", reinterpret_cast<const void *>(sm8x_dense_gemm<128>), kGemmThreads, Cfg<128>::kSmem);
