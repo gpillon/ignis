@@ -82,7 +82,7 @@ fn card_probe() -> config::profile::Card {
 /// the one that answers holds an artifact of another family. Logged under
 /// the refusal's code: `ignis.model.above_gpu_generation` when the generation
 /// refuses it, `ignis.model.above_card_class` for the class alone.
-fn refuse_above_card(logging_handle: &ignis_logging::LoggingHandle, refusal: &download::CardRefusal) -> ! {
+fn refuse_on_card(logging_handle: &ignis_logging::LoggingHandle, refusal: &download::CardRefusal) -> ! {
     let card_class = refusal.class.as_ref().map(|class| class.needs.gb());
     let card = refusal.class.as_ref().map(|class| class.card.gb());
     let fix = "refusing to start: name a model this card loads (`--model-id`), or its artifact (`--model-artifact`)";
@@ -93,7 +93,7 @@ fn refuse_above_card(logging_handle: &ignis_logging::LoggingHandle, refusal: &do
             model = %refusal.model,
             generation = generation.needs.as_str(),
             card_generation = generation.card.as_str(),
-            compute_capability = %generation.capability,
+            compute_capability = %refusal.card.capability,
             card_class,
             card,
             error = %refusal,
@@ -339,7 +339,7 @@ async fn main() {
         Some(_) => model.clone(),
         None => match download::start_model(&catalog, &model, card.as_ref()) {
             Ok(served) => served,
-            Err(refusal) => refuse_above_card(&logging_handle, &refusal),
+            Err(refusal) => refuse_on_card(&logging_handle, &refusal),
         },
     };
 
@@ -398,7 +398,7 @@ async fn main() {
     let artifact_family = |path: &std::path::Path| ignis_server::loader::artifact_family(path).ok().flatten();
     let start_options = match download::served_start_options(start_options, &served, artifact.as_deref(), &catalog, card.as_ref(), &artifact_family) {
         Ok(options) => options,
-        Err(download::StartRefusal::AboveCard(refusal)) => refuse_above_card(&logging_handle, &refusal),
+        Err(download::StartRefusal::RefusedOnCard(refusal)) => refuse_on_card(&logging_handle, &refusal),
         Err(download::StartRefusal::Config(err)) => {
             tracing::error!(name: "ignis.config.invalid", error = %err, "refusing to start");
             exit_after_flush(&logging_handle, 1);

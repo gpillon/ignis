@@ -615,7 +615,7 @@ async fn serve(server: Arc<Server>, mut request: ImageRequest, conditions: Condi
     // rewritten, an entry above the card's class refused before anything.
     request.model = match crate::api::model_on_this_card(&server, request.model.take()) {
         Ok(model) => model,
-        Err(refusal) => return crate::api::above_card(&refusal),
+        Err(refusal) => return crate::api::refused_on_card(&refusal),
     };
     let named = split_model_lane(request.model.clone()).0;
     if let Err(refused) = check_kind(&server, ModelKind::Image, named.as_deref()) {

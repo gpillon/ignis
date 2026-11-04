@@ -35,7 +35,7 @@ pub mod command;
 mod lock;
 mod transfer;
 
-pub use catalog::{CardRefusal, Catalog, CatalogEntry, CatalogError, CatalogFile, CatalogLayer, License, BUILT_IN_CATALOG};
+pub use catalog::{CardRefusal, Catalog, CatalogEntry, CatalogError, CatalogFile, CatalogLayer, License, Unavailable, BUILT_IN_CATALOG};
 pub use command::{ListFormat, ModelCommand, OnDisk};
 pub use lock::{EntryLock, Holder, NotLocked};
 pub use transfer::{Download, DownloadError, Downloader, Ended, Report};
@@ -200,7 +200,7 @@ pub fn served_start_options(
         return Ok(options);
     };
     if let (Some(own), Some(entry)) = (catalog.entry(&options.model), catalog.entry(served)) {
-        catalog.alias_holds(&own.id, entry, header(path), card).map_err(StartRefusal::AboveCard)?;
+        catalog.alias_holds(&own.id, entry, header(path), card).map_err(StartRefusal::RefusedOnCard)?;
     }
     crate::config::target_patch(path, served).and_then(|patch| options.general_with(&patch)).map_err(StartRefusal::Config)
 }
@@ -211,7 +211,7 @@ pub fn served_start_options(
 pub enum StartRefusal {
     /// The entry that answers to the configured id holds an artifact of
     /// another family (ADR 0064 §2): the alias does not resolve.
-    AboveCard(CardRefusal),
+    RefusedOnCard(CardRefusal),
     /// Its artifact and id over the start options do not resolve.
     Config(crate::config::ConfigError),
 }
@@ -483,7 +483,7 @@ mod tests {
         let ArtifactSource::Download { entry, dir } = artifact_source(&settings, nothing_exists, |_, _| None) else { panic!("fetched") };
         let fetched = entry.artifact_path(&dir);
         for header in [Some(ModelFamily::FlashNext), None] {
-            let Err(StartRefusal::AboveCard(refusal)) = served_start_options(options.clone(), &served, Some(&fetched), &catalog, options.card(), &|_| header) else {
+            let Err(StartRefusal::RefusedOnCard(refusal)) = served_start_options(options.clone(), &served, Some(&fetched), &catalog, options.card(), &|_| header) else {
                 panic!("{header:?}: refused")
             };
             let said = refusal.to_string();
@@ -515,7 +515,7 @@ mod tests {
         let card = options.card();
         let serving = served_start_options(options.clone(), &served, Some(&path), &catalog, card, &|_| Some(ModelFamily::Qwen38_27b)).unwrap();
         assert_eq!((serving.model.as_str(), serving.artifact.as_deref()), ("qwen3.8-27b-abliterated-16g", Some(path.as_path())));
-        let Err(StartRefusal::AboveCard(refusal)) = served_start_options(options.clone(), &served, Some(&path), &catalog, card, &|_| Some(ModelFamily::FlashNext)) else {
+        let Err(StartRefusal::RefusedOnCard(refusal)) = served_start_options(options.clone(), &served, Some(&path), &catalog, card, &|_| Some(ModelFamily::FlashNext)) else {
             panic!("a header of another family refuses the start")
         };
         let said = refusal.to_string();
@@ -556,7 +556,7 @@ mod tests {
         let card = options.card();
         let serving = served_start_options(options.clone(), &served, Some(&path), &catalog, card, &|_| Some(ModelFamily::Qwen38_27b)).unwrap();
         assert_eq!((serving.model.as_str(), serving.artifact.as_deref()), ("swift-1.5-27b-16g", Some(path.as_path())));
-        let Err(StartRefusal::AboveCard(refusal)) = served_start_options(options.clone(), &served, Some(&path), &catalog, card, &|_| Some(ModelFamily::FlashNext)) else {
+        let Err(StartRefusal::RefusedOnCard(refusal)) = served_start_options(options.clone(), &served, Some(&path), &catalog, card, &|_| Some(ModelFamily::FlashNext)) else {
             panic!("a header of another family refuses the start")
         };
         let said = refusal.to_string();

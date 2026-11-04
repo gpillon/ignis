@@ -78,7 +78,7 @@ use std::time::{Duration, Instant};
 use ignis_core::compute::{ModelFamily, ModelKind};
 
 use crate::config::profile::CardReading;
-use crate::download::CardRefusal;
+use crate::download::{CardRefusal, Unavailable};
 use crate::load::LoadedModel;
 use crate::{ActiveModel, InFlight, ModelSource, ModelStatus, Server, StatusCell};
 
@@ -396,7 +396,7 @@ pub enum Unswitchable {
     /// no entry answering to it that fits (ADR 0064 §3, ADR 0079): `409
     /// model_above_card_class` or `409 model_above_gpu_generation`
     /// ([`CardRefusal::code`]), before anything is prepared or torn down.
-    AboveCard(CardRefusal),
+    RefusedOnCard(CardRefusal),
     /// A speech model's catalog entry (ADR 0067): loaded beside the active
     /// model by the first transcription, never switched to.
     Speech,
@@ -628,8 +628,8 @@ impl Switcher {
     /// answers to on this card is the caller's to rewrite first
     /// ([`Switcher::on_this_card`]).
     pub fn resolve(&self, model: &str) -> Result<PathBuf, Unswitchable> {
-        if let Some(refusal) = self.above_card(model) {
-            return Err(Unswitchable::AboveCard(refusal));
+        if let Some(refusal) = self.refusal_on_card(model) {
+            return Err(Unswitchable::RefusedOnCard(refusal));
         }
         if self.is_speech(model) {
             return Err(Unswitchable::Speech);
@@ -688,29 +688,28 @@ impl Switcher {
     /// an entry that fits, a model the catalog does not hold, or with no card
     /// read.
     pub fn unavailable_reason(&self, model: &str) -> Option<String> {
-        self.unavailable(model).map(|(_, reason)| reason)
+        self.unavailable(model).map(|unavailable| unavailable.to_string())
     }
 
-    /// [`Switcher::unavailable_reason`] with the code a refusal of `model`
-    /// answers ([`CardRefusal::code`]): what `POST /v1/models/download`
-    /// refuses such an entry with. The code is that of the refusal the reason
-    /// gives: the entry's own, or the one an alias of another family's
-    /// artifact gives.
-    pub fn unavailable(&self, model: &str) -> Option<(&'static str, String)> {
-        let refusal = self.above_card(model)?;
+    /// [`Switcher::unavailable_reason`] as the refusal it gives, with its code
+    /// ([`Unavailable::code`]): what `POST /v1/models/download` refuses such
+    /// an entry with. The refusal is the entry's own, or the one an alias of
+    /// another family's artifact gives.
+    pub fn unavailable(&self, model: &str) -> Option<Unavailable> {
+        let refusal = self.refusal_on_card(model)?;
         Some(match self.on_this_card(model) {
-            Ok(Some(serving)) => (refusal.code(), format!("{refusal}; a request naming it is served by {serving}")),
+            Ok(Some(serving)) => Unavailable { refusal, served_by: Some(serving) },
             // The entry that would answer holds another family's artifact:
             // that refusal says both.
-            Err(answered) => (answered.code(), answered.to_string()),
-            Ok(None) => (refusal.code(), refusal.to_string()),
+            Err(answered) => Unavailable { refusal: answered, served_by: None },
+            Ok(None) => Unavailable { refusal, served_by: None },
         })
     }
 
     /// The refusal of the catalog entry `model` itself on this card
-    /// ([`crate::download::Catalog::above_card`]).
-    pub fn above_card(&self, model: &str) -> Option<CardRefusal> {
-        self.catalog.as_ref()?.catalog.above_card(model, self.card.as_ref())
+    /// ([`crate::download::Catalog::refusal_on`]).
+    pub fn refusal_on_card(&self, model: &str) -> Option<CardRefusal> {
+        self.catalog.as_ref()?.catalog.refusal_on(model, self.card.as_ref())
     }
 
     /// How the last switch or reload ended; `None` before the first.
@@ -763,7 +762,7 @@ impl Switcher {
     /// [`Switcher::text_model`] with `listing` listed too, over the listed
     /// models: what a config change about to list them would resolve.
     pub fn text_model_among(&self, model: &str, listing: &BTreeMap<String, PathBuf>) -> Option<ModelSource> {
-        if self.above_card(model).is_some() {
+        if self.refusal_on_card(model).is_some() {
             return None;
         }
         let artifact = listing
@@ -821,7 +820,7 @@ impl Switcher {
         if self.is_speech(model) || self.is_diarizer(model) {
             return None;
         }
-        if self.above_card(model).is_some() {
+        if self.refusal_on_card(model).is_some() {
             return None;
         }
         if let Some(listed) = self.known.lock().expect("known models lock").get(model) {

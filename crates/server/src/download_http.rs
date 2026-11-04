@@ -274,12 +274,12 @@ pub(crate) async fn post_model_download(State(server): State<Arc<Server>>, Json(
             Some("model"),
         );
     };
-    if let Some((code, reason)) = switcher.and_then(|switcher| switcher.unavailable(&entry.id)) {
+    if let Some(unavailable) = switcher.and_then(|switcher| switcher.unavailable(&entry.id)) {
         return error_response_naming(
             StatusCode::CONFLICT,
             "invalid_request_error",
-            code,
-            format!("{reason}: it is not downloaded for this card"),
+            unavailable.code(),
+            format!("{unavailable}: it is not downloaded for this card"),
             Some("model"),
         );
     }
