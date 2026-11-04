@@ -3,7 +3,7 @@
 - Kind: experiment
 - Status: current
 - Observed: 2026-11-03
-- Last verified: 2026-11-03
+- Last verified: 2026-11-04
 - Scope: kernel / the leaf built for `86;120a` (`IGNIS_CUDA_ARCHITECTURES`), its CTest suite on an sm_86 card, the
   dense trellis decode body; serving / the start-up architecture check, the routes keyed on compute capability, the
   27B trellis entry (`qwen3.8-27b-16g`) end to end; quality / top-64 KLD against the BF16 checkpoint
@@ -70,6 +70,11 @@ default archives is identical (phase 0's comparison).
 - `ignis_kernel_gdn_gating_proj_tests` (vendored) forces cooperative schedules sized for the RTX 5090's 170 SMs,
   which a card with fewer SMs cannot hold resident. The engine's own planner skips them; this test fails on any
   smaller card, RTX 50 included.
+  - **Corrected 2026-11-04 (#478):** on sm_86 the planner did not skip them all. Its blocks-per-SM figures were the
+    sm_120a build's, and compiled for sm_86 the gating kernels use more registers (72 against 62), so a card such
+    as the RTX 3090 (82 SMs) was admitted cooperative grids it cannot hold resident (in the engine: prefill chunks
+    of 1,025 to 1,664 tokens under a chunk above 1,024). The planner now takes each schedule's figure from CUDA's
+    occupancy query, and the test names what it skips; both are portability patches under ADR 0077.
 
 With the fixes, `ctest -LE sm120a-only` on the sm_86 card: 121 of 122 pass, the GDN gating test the one failure.
 
