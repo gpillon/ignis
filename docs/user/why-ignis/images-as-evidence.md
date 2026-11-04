@@ -60,8 +60,7 @@ about one new image takes the same time as before.
 ## See it, control it
 
 - **Switch it on**: [`vision.enabled`](../reference/configuration.md#visionenabled)
-  (off unless the profile turns it on; the `rtx5090` and `rtxpro6000` profiles
-  do). Without it every `image_url` part is refused, whatever the artifact
+  (off unless the profile turns it on; every built-in profile does). Without it every `image_url` part is refused, whatever the artifact
   holds.
 - **Size it**: [`vision.max_tokens`](../reference/configuration.md#visionmax_tokens),
   [`vision.embedding_pool_mib`](../reference/configuration.md#visionembedding_pool_mib)

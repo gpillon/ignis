@@ -143,8 +143,8 @@ Hugging Face repository: eight text and image models, `qwen3.8-27b`,
 `swift-1.5-27b`, `swift-1.5-27b-16g`, `qwen3.8-flash-next` and
 `ignis-image-2.1-turbo`, plus three speech models and a diarizer. Each of the
 eight states the smallest **card class** it loads on: 32 GB for all but the
-three `-16g` entries, which load on 16 GB and answer there to `qwen3.8-27b`,
-to `qwen3.8-27b-abliterated` and to `swift-1.5-27b`
+three `-16g` entries, which load on 16 GB and answer to `qwen3.8-27b`,
+to `qwen3.8-27b-abliterated` and to `swift-1.5-27b` on a 16 or 24 GB card
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md),
 [ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md))
 ([the catalog](../guides/models.md#the-catalog)). An operator can add entries

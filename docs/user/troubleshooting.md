@@ -51,7 +51,7 @@ the FP16 band there and its exception tensors stay BF16.
 ### A start under `--profile auto` is refused, naming `--profile`
 
 The card's total memory is not one the built-in profiles serve (under 20 GiB,
-28 to 40, 88 to 104), or NVML could not read it. Name the profile that fits the
+from 20 up to 28, 28 to 40, 88 to 104), or NVML could not read it. Name the profile that fits the
 card, or `none` for the hardcoded defaults
 ([Profiles and defaults](concepts/profiles.md)).
 

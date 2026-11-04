@@ -36,11 +36,11 @@ and only on a card it loads on: on a 16 GB card, `qwen3.8-27b-16g` answers to
 `qwen3.8-27b`. See [Get a model](../guides/models.md).
 
 **Card.** The GPU ignis runs on. The built-in profiles are written for the
-16 GB class, a 32 GB RTX 5090 and a 96 GB RTX PRO 6000, and `--profile auto`
-picks one by the card's memory. See [profiles](../concepts/profiles.md).
+16 GB class, the 24 GB class, a 32 GB RTX 5090 and a 96 GB RTX PRO 6000, and
+`--profile auto` picks one by the card's memory. See [profiles](../concepts/profiles.md).
 
 **Card class.** The cards one built-in profile serves, named by their memory
-(16, 32 or 96 GB), and the smallest one a catalog entry loads on. An entry above
+(16, 24, 32 or 96 GB), and the smallest one a catalog entry loads on. An entry above
 the card is refused before anything is unloaded or fetched. See
 [models and artifacts](../concepts/models-and-artifacts.md).
 

@@ -1253,8 +1253,8 @@ mod tests {
             ("bytes: 48211", "bytes: lots", vec![entry, "`bytes`"]),
             // ADR 0064 §1: a card class stated is one of the classes there
             // are.
-            ("card_class: 32", "card_class: 24", vec![entry, "`card_class`", "16, 32, 96", "got 24"]),
-            ("card_class: 32", "card_class: \"32\"", vec![entry, "`card_class`", "16, 32, 96"]),
+            ("card_class: 32", "card_class: 48", vec![entry, "`card_class`", "16, 24, 32, 96", "got 48"]),
+            ("card_class: 32", "card_class: \"32\"", vec![entry, "`card_class`", "16, 24, 32, 96"]),
             ("card_class: 32", "card_class: -16", vec![entry, "`card_class`"]),
             // ADR 0064 §2: an alias is of one family, never the entry's own
             // id.
@@ -1464,6 +1464,22 @@ mod tests {
         assert_eq!(built_in.family(), Some(ModelFamily::Qwen38_27b));
     }
 
+    /// GitHub #480: `card_class: 24` names the 24 GB class, the RTX 3090's and
+    /// RTX 4090's: an operator entry stating it is above a 16 GB card and fits
+    /// a 24 GB one and every larger one.
+    #[test]
+    fn an_operator_entry_may_state_the_24gb_class() {
+        use CardClass::*;
+        let catalog = operator(&OPERATOR.replacen("card_class: 32", "card_class: 24", 1)).expect("24 is a card class");
+        let id = "acme-qwen3.8-27b-ft";
+        assert_eq!(catalog.entry(id).unwrap().card_class, Some(Gb24));
+        let refusal = catalog.above_class(id, Some(Gb16)).expect("above a 16 GB card");
+        assert!(refusal.to_string().contains("needs a 24 GB card or larger"), "{refusal}");
+        for card in [Gb24, Gb32, Gb96] {
+            assert_eq!(catalog.above_class(id, Some(card)), None, "{card}");
+        }
+    }
+
     /// ADR 0064 §1 as built: `card_class` is optional, by one rule — an
     /// entry that states none is never refused by class, as its own id or
     /// answering to an alias; the VRAM plan's refusal still guards it. So an
@@ -1536,7 +1552,7 @@ mod tests {
     fn an_id_resolves_to_its_own_entry_when_the_card_class_fits() {
         use CardClass::*;
         let catalog = Catalog::built_in();
-        for (id, card) in [("qwen3.8-27b", Gb32), ("qwen3.8-27b", Gb96), ("qwen3.8-flash-next", Gb32), ("ignis-image-2.1-turbo", Gb96), ("qwen3.8-27b-16g", Gb16), ("qwen3.8-27b-16g", Gb32), ("qwen3.8-27b-abliterated", Gb32), ("qwen3.8-27b-abliterated-16g", Gb16), ("swift-1.5-27b", Gb32), ("swift-1.5-27b", Gb96), ("swift-1.5-27b-16g", Gb16), ("swift-1.5-27b-16g", Gb32)] {
+        for (id, card) in [("qwen3.8-27b", Gb32), ("qwen3.8-27b", Gb96), ("qwen3.8-flash-next", Gb32), ("ignis-image-2.1-turbo", Gb96), ("qwen3.8-27b-16g", Gb16), ("qwen3.8-27b-16g", Gb32), ("qwen3.8-27b-abliterated", Gb32), ("qwen3.8-27b-abliterated-16g", Gb16), ("swift-1.5-27b", Gb32), ("swift-1.5-27b", Gb96), ("swift-1.5-27b-16g", Gb16), ("swift-1.5-27b-16g", Gb32), ("qwen3.8-27b-16g", Gb24), ("qwen3.8-27b-abliterated-16g", Gb24), ("swift-1.5-27b-16g", Gb24)] {
             assert_eq!(catalog.above_class(id, Some(card)), None, "{id} on {card}");
             assert_eq!(catalog.answering(id, Some(card)), Ok(None), "{id} on {card}: it stands as it is");
         }
@@ -1545,13 +1561,17 @@ mod tests {
     /// ADR 0064 §2: on a card below the id's own entry, the entry of its
     /// family that answers to it, and fits, serves it — each id its own
     /// answering entry: the 27B's default id the 16 GB 27B, the uncensored
-    /// variant's its 16 GB build (ADR 0074), Swift 1.5's its own (GitHub #473).
+    /// variant's its 16 GB build (ADR 0074), Swift 1.5's its own (GitHub #473);
+    /// on a 16 GB card and on a 24 GB one (GitHub #480), which no built-in
+    /// entry states.
     #[test]
     fn an_id_above_the_card_class_resolves_to_the_entry_that_answers_to_it() {
         let catalog = Catalog::built_in();
-        for (id, answering) in [("qwen3.8-27b", "qwen3.8-27b-16g"), ("qwen3.8-27b-abliterated", "qwen3.8-27b-abliterated-16g"), ("swift-1.5-27b", "swift-1.5-27b-16g")] {
-            assert_eq!(resolved(&catalog, id, Some(CardClass::Gb16)), Ok(answering));
-            assert!(catalog.above_class(id, Some(CardClass::Gb16)).is_some(), "{id}: its own entry is still above the class");
+        for card in [CardClass::Gb16, CardClass::Gb24] {
+            for (id, answering) in [("qwen3.8-27b", "qwen3.8-27b-16g"), ("qwen3.8-27b-abliterated", "qwen3.8-27b-abliterated-16g"), ("swift-1.5-27b", "swift-1.5-27b-16g")] {
+                assert_eq!(resolved(&catalog, id, Some(card)), Ok(answering), "{card}");
+                assert!(catalog.above_class(id, Some(card)).is_some(), "{id}: its own entry is still above the {card} class");
+            }
         }
     }
 
