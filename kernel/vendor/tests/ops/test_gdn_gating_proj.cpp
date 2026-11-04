@@ -40,14 +40,17 @@ constexpr ReductionCriterion kGdnNormControlFp32{/*relative_l2=*/8.0e-4,
                                                  /*gross_relative_to_max_reference=*/1.05e-3};
 
 // Ignis portability patch (ADR 0077, GitHub #478): the cooperative schedules' grids are sized for
-// the RTX 5090's 170 SMs. On a card with fewer SMs the test skips, and names, each one the
-// planner's own residency query refuses (candidate_is_legal, reached through resolve_candidate and
-// resolve_plan). On the RTX 5090 it refuses none and nothing is named.
+// the RTX 5090's 170 SMs. On a card that cannot hold one resident (fewer SMs, or fewer CTAs/SM in
+// the build it runs) the test skips, and names, each one the planner's own residency query refuses
+// (candidate_is_legal, reached through resolve_candidate and resolve_plan). On the RTX 5090 it
+// refuses none, nothing is named, and main checks that.
 //
 // The 27B's fused norm/control route at T=1..8 is cooperative split40, which the planner resolves
 // with no fallback, so a card that cannot hold its grid throws from the capacity query on. For
 // that admitted problem and schedule, resolve_candidate refuses only a grid the card cannot hold
 // resident. The 35B's fused split32 route falls back to the composed route by itself.
+int skipped_schedules = 0;
+
 bool fused_27_norm_route_is_resident(const Geometry& geometry, std::int32_t tokens) {
     if (geometry.heads != 48 || geometry.hidden != 5120 || tokens > 8) { return true; }
     try {
@@ -61,6 +64,7 @@ bool fused_27_norm_route_is_resident(const Geometry& geometry, std::int32_t toke
 }
 
 void name_skipped_fused_27_norm_route(const std::string& where) {
+    ++skipped_schedules;
     std::cout << "SKIP "
               << ops::detail::bf16_gdn_norm_gating_schedule_name(
                      ops::detail::Bf16GdnNormGatingScheduleId::MmaCooperativeSplit40)
@@ -73,10 +77,75 @@ void name_skipped_cooperative_route(const Geometry& geometry, std::int32_t token
     const ops::detail::Bf16GdnGatingPlan plan =
         ops::detail::bf16_gdn_gating_resolve_plan({geometry.heads, geometry.hidden, tokens});
     if (plan.schedule == ops::detail::Bf16GdnGatingScheduleId::MmaUnsplit && tokens < 4097) {
+        ++skipped_schedules;
         std::cout << "SKIP the cooperative route of gdn_gating_proj " << geometry.label
                   << " T=" << tokens << ": not resident on this card, the planner runs "
                   << ops::detail::bf16_gdn_gating_schedule_name(plan.schedule) << "\n";
     }
+}
+
+// The planner takes each cooperative kernel's CTAs/SM from the occupancy query. On a compute
+// capability 12.0 device the query must give the budget the planner hardcoded for the registered
+// sm_120a build, so its routes there are the reference's; split40's 2 was counted against its 80
+// workspace splits, the same grid limit as 1 against the 40 it launches. Elsewhere the lines only
+// report the build's values.
+struct CooperativeBudget {
+    ops::detail::Bf16GdnGatingCooperativeKernel kernel;
+    const char* name;
+    int sm120a_ctas_per_sm;
+};
+
+constexpr CooperativeBudget kCooperativeBudgets[] = {
+    {ops::detail::Bf16GdnGatingCooperativeKernel::Mma27Split8, "27b split8", 2},
+    {ops::detail::Bf16GdnGatingCooperativeKernel::Mma27Split4, "27b split4", 2},
+    {ops::detail::Bf16GdnGatingCooperativeKernel::Mma27Split2, "27b split2", 2},
+    {ops::detail::Bf16GdnGatingCooperativeKernel::Norm27Split40, "27b norm split40", 1},
+    {ops::detail::Bf16GdnGatingCooperativeKernel::Mma35Split32, "35b split32", 2},
+    {ops::detail::Bf16GdnGatingCooperativeKernel::Norm35Split32, "35b norm split32", 2},
+    {ops::detail::Bf16GdnGatingCooperativeKernel::Mma35Split16, "35b split16", 4},
+    {ops::detail::Bf16GdnGatingCooperativeKernel::Mma35Split8, "35b split8", 4},
+    {ops::detail::Bf16GdnGatingCooperativeKernel::Mma35Split4, "35b split4", 4},
+    {ops::detail::Bf16GdnGatingCooperativeKernel::Mma35Split2, "35b split2", 4},
+};
+
+constexpr int kRtx5090Multiprocessors = 170;
+
+struct DeviceShape {
+    int major;
+    int minor;
+    int multiprocessors;
+};
+
+DeviceShape current_device_shape() {
+    int device = 0;
+    cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+    DeviceShape shape{};
+    cuda_check(cudaDeviceGetAttribute(&shape.major, cudaDevAttrComputeCapabilityMajor, device),
+               "cudaDeviceGetAttribute(major)");
+    cuda_check(cudaDeviceGetAttribute(&shape.minor, cudaDevAttrComputeCapabilityMinor, device),
+               "cudaDeviceGetAttribute(minor)");
+    cuda_check(cudaDeviceGetAttribute(&shape.multiprocessors, cudaDevAttrMultiProcessorCount,
+                                      device),
+               "cudaDeviceGetAttribute(multiprocessors)");
+    return shape;
+}
+
+bool is_sm120(const DeviceShape& shape) { return shape.major == 12 && shape.minor == 0; }
+
+int verify_cooperative_budgets(const DeviceShape& shape) {
+    int failures = 0;
+    for (const CooperativeBudget& budget : kCooperativeBudgets) {
+        const int ctas = ops::detail::bf16_gdn_gating_cooperative_ctas_per_sm(budget.kernel);
+        std::cout << "budget gdn_gating_proj " << budget.name << ": " << ctas
+                  << " CTAs/SM (sm_120a " << budget.sm120a_ctas_per_sm << ")\n";
+        if (is_sm120(shape) && ctas != budget.sm120a_ctas_per_sm) {
+            std::cerr << "gdn_gating_proj " << budget.name << ": " << ctas
+                      << " CTAs/SM on compute capability 12.0, the planner was tuned on "
+                      << budget.sm120a_ctas_per_sm << "\n";
+            ++failures;
+        }
+    }
+    return failures;
 }
 
 double softplus(double value) {
@@ -491,6 +560,8 @@ int main() {
     }
 
     int failures = 0;
+    const DeviceShape device = current_device_shape();
+    failures += verify_cooperative_budgets(device);
     failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097});
     failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
 
@@ -520,6 +591,13 @@ int main() {
     failures += run_norm_projection_case(kQwen35, 16, 0x4010u);
     failures += run_norm_projection_case(kQwen35, 17, 0x4011u);
     failures += run_norm_projection_case(kQwen35, 64, 0x4040u);
+
+    if (is_sm120(device) && device.multiprocessors >= kRtx5090Multiprocessors &&
+        skipped_schedules != 0) {
+        std::cerr << "gdn_gating_proj: " << skipped_schedules
+                  << " schedule(s) skipped on a card the schedules are sized for\n";
+        ++failures;
+    }
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating_proj correctness\n";
     return failures == 0 ? 0 : 1;

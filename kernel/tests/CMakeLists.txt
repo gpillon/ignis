@@ -200,9 +200,12 @@ add_test(NAME ignis_kernel_gdn_input_proj_tests COMMAND ignis_kernel_gdn_input_p
 # P1-12 (GitHub #48): the reference's own gdn_gating_proj test (BF16-only op,
 # no excluded op family to trim) — both the Qwen3.8-27B ([96,5120] ab_weight)
 # and Qwen3.6-35B geometries. Since GitHub #478 it carries a portability patch
-# (ADR 0077): on a card with fewer SMs than the RTX 5090 it skips, and names
-# in a SKIP line, each cooperative schedule the planner's residency query
-# refuses there, with no change to its exit code. The wrapper itself is
+# (ADR 0077): on a card that cannot hold a cooperative schedule resident (fewer
+# SMs than the RTX 5090, or an sm_86 build's fewer CTAs per SM) it skips, and
+# names in a SKIP line, each one the planner's residency query refuses there;
+# it prints each cooperative kernel's CTAs per SM and, on compute capability
+# 12.0, fails if one is not the value the planner was tuned on, or on the 5090
+# if it skips any. The wrapper itself is
 # vendored (kernel/vendor/src/ops/wrapper/gdn_gating_proj.cpp, built into
 # ignis_vendor), so this links only ignis_vendor, same as the norm/glue tests
 # above.

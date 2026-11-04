@@ -52,3 +52,22 @@ test, which holds no device code: the test asks the planner's own residency
 query and skips, naming it on its output, each schedule the query refuses. On
 the 5090 every schedule is resident, so the test runs and prints what it did
 before. The `reason` names the card size and the planner query it reuses.
+
+The third is the GDN gating planner,
+`src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp`, with the query
+it asks from `bf16_gdn_gating_proj_kernels.{h,cu}` (#478). The planner admits
+a cooperative split-K schedule only for a grid the card holds resident, its
+SMs times the CTAs one SM holds, and took the second factor from constants
+true of the `120a` build. An sm_86 build of those kernels uses more registers
+(72 in place of 62), so the 27B's split4 and split2 hold one CTA per SM, not
+two, and the 35B's split8, split4 and split2 hold three, not four. On an RTX
+3090 (82 SMs) the planner admitted grids the card cannot hold, a 27B prefill
+chunk of 1025 to 1664 tokens among them, and the launch failed with
+`cudaErrorCooperativeLaunchTooLarge`. The planner now takes each kernel's
+CTAs per SM from CUDA's occupancy query on the kernel it launches, once per
+device. That is a host change the 5090 takes the way the reference does: on
+compute capability 12.0 the query gives the former constants, which the
+gating test checks (it fails if one differs, and on the 5090 if it skips any
+schedule), and the `120a` build's device code is unchanged (`cuobjdump -sass`
+of the kernels' object, before and after). The test's patch now also prints
+each kernel's CTAs per SM.

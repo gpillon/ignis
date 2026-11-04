@@ -1,0 +1,82 @@
+diff --git a/reference/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu b/vendor/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
+index 9f1a9bf..88716c9 100644
+--- a/reference/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
++++ b/vendor/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
+@@ -10,6 +10,7 @@
+ 
+ #include <cuda_bf16.h>
+ 
++#include <algorithm>
+ #include <cstddef>
+ #include <cstdint>
+ #include <stdexcept>
+@@ -331,6 +332,32 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++// Ignis portability patch (ADR 0077, GitHub #478): CTAs/SM of one kernel launch_bf16_prefill_mma
++// launches, configured as it configures it. Its template arguments take the launch's defaults, so
++// a call reads like the launch it budgets; it names only instantiations the launches already make.
++template <class Geometry, int SplitK, int Warps, bool NormalizeInput, int NormTokenCapacity,
++          bool FullTokens>
++int prefill_mma_variant_ctas_per_sm() {
++    constexpr int kSmemBytes = kBf16GdnSmemBytes<Geometry::kBlockN>;
++    const auto kernel = bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
++                                                             NormalizeInput, NormTokenCapacity>;
++    CUDA_CHECK(
++        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
++    int ctas = 0;
++    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, kernel, Warps * 32, kSmemBytes));
++    return ctas;
++}
++
++template <class Geometry, int SplitK, int Warps = kBf16GdnWarps, bool NormalizeInput = false,
++          int NormTokenCapacity = 0>
++int prefill_mma_ctas_per_sm() {
++    return std::min(
++        prefill_mma_variant_ctas_per_sm<Geometry, SplitK, Warps, NormalizeInput, NormTokenCapacity,
++                                        true>(),
++        prefill_mma_variant_ctas_per_sm<Geometry, SplitK, Warps, NormalizeInput, NormTokenCapacity,
++                                        false>());
++}
++
+ } // namespace
+ 
+ void bf16_gdn_gating_proj_gemv_launch(const Tensor& x, const Weight& a_weight,
+@@ -577,4 +604,36 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
+                                                      stream);
+ }
+ 
++// Ignis portability patch (ADR 0077, GitHub #478): each case names the kernel its launch above
++// runs, with the same template arguments.
++int bf16_gdn_gating_cooperative_ctas_per_sm(Bf16GdnGatingCooperativeKernel kernel) {
++    switch (kernel) {
++    case Bf16GdnGatingCooperativeKernel::Mma27Split8:
++        return prefill_mma_ctas_per_sm<Bf16Gdn27Geometry, 8, 8>();
++    case Bf16GdnGatingCooperativeKernel::Mma27Split4:
++        return prefill_mma_ctas_per_sm<Bf16Gdn27Geometry, 4>();
++    case Bf16GdnGatingCooperativeKernel::Mma27Split2:
++        return prefill_mma_ctas_per_sm<Bf16Gdn27Geometry, 2>();
++    case Bf16GdnGatingCooperativeKernel::Norm27Split40:
++        return std::min(prefill_mma_ctas_per_sm<Bf16Gdn27Geometry, 40, 8, true, 6>(),
++                        prefill_mma_ctas_per_sm<Bf16Gdn27Geometry, 40, 8, true, 8>());
++    case Bf16GdnGatingCooperativeKernel::Mma35Split32:
++        return prefill_mma_ctas_per_sm<Bf16Gdn35Geometry, 32, 8>();
++    case Bf16GdnGatingCooperativeKernel::Norm35Split32:
++        return std::min({prefill_mma_ctas_per_sm<Bf16Gdn35Geometry, 32, 8, true, 6>(),
++                         prefill_mma_ctas_per_sm<Bf16Gdn35Geometry, 32, 8, true, 8>(),
++                         prefill_mma_ctas_per_sm<Bf16Gdn35Geometry, 32, 8, true, 12>(),
++                         prefill_mma_ctas_per_sm<Bf16Gdn35Geometry, 32, 8, true, 16>()});
++    case Bf16GdnGatingCooperativeKernel::Mma35Split16:
++        return prefill_mma_ctas_per_sm<Bf16Gdn35Geometry, 16, 8>();
++    case Bf16GdnGatingCooperativeKernel::Mma35Split8:
++        return prefill_mma_ctas_per_sm<Bf16Gdn35Geometry, 8, 8>();
++    case Bf16GdnGatingCooperativeKernel::Mma35Split4:
++        return prefill_mma_ctas_per_sm<Bf16Gdn35Geometry, 4, 8>();
++    case Bf16GdnGatingCooperativeKernel::Mma35Split2:
++        return prefill_mma_ctas_per_sm<Bf16Gdn35Geometry, 2, 8>();
++    }
++    throw std::logic_error("BF16 GDN gating: unknown cooperative kernel");
++}
++
+ } // namespace ninfer::ops::detail

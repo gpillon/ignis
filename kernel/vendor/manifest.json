@@ -358,15 +358,30 @@
     },
     {
       "path": "src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu",
-      "sha256": "b14306ddd2b42adc4b2b6502279b5e92689df692a765d9c153dc90821a2347fe"
+      "sha256": "b14306ddd2b42adc4b2b6502279b5e92689df692a765d9c153dc90821a2347fe",
+      "patch": {
+        "diff": "patches/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu.diff",
+        "sha256": "c76af453b4d457d3b9a625248cccf696d6cb4acaa4ac54edaf38469358ae67e9",
+        "reason": "Portability (ADR 0077; GitHub #478): defines bf16_gdn_gating_cooperative_ctas_per_sm, cudaOccupancyMaxActiveBlocksPerMultiprocessor on each cooperative kernel the launches run (same block size, dynamic shared memory and attribute), the minimum over its token variants, for the planner residency budget on Ampere (sm_86). Host code that names only template instantiations the launches already make: the default 120a build device code is unchanged (cuobjdump -sass of the object identical before and after)."
+      }
     },
     {
       "path": "src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h",
-      "sha256": "d1e7282543b5df34a4784d96620dd0a51ca09d6ea242884619c6b9ad1a05c108"
+      "sha256": "d1e7282543b5df34a4784d96620dd0a51ca09d6ea242884619c6b9ad1a05c108",
+      "patch": {
+        "diff": "patches/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h.diff",
+        "sha256": "85267af522732f5464b6b6735b286098797e6d2326cea73acfc66ee909852c86",
+        "reason": "Portability (ADR 0077; GitHub #478): declares bf16_gdn_gating_cooperative_ctas_per_sm and its kernel enum, the occupancy query with which the planner (bf16_gdn_gating_proj_plan.cpp) budgets cooperative grids on Ampere (sm_86), where the split kernels hold fewer CTAs/SM than the 120a constants it hardcoded. Declarations only."
+      }
     },
     {
       "path": "src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp",
-      "sha256": "8043b407c8882a0dc024dba37f899d26698ed51e6e0b49ab5a9c1d21a41dc33f"
+      "sha256": "8043b407c8882a0dc024dba37f899d26698ed51e6e0b49ab5a9c1d21a41dc33f",
+      "patch": {
+        "diff": "patches/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp.diff",
+        "sha256": "bcd5a6fe7227b5f24a390901d4ade72fe0ab4941a67eff20976216a2e1308a4f",
+        "reason": "Portability (ADR 0077; GitHub #478): runs on Ampere (sm_86). The planner admits a cooperative split-K schedule only for a grid the device holds resident, its SMs times the CTAs one SM holds, and took the CTAs/SM from constants true of the 120a build (27B split8/4/2: 2; 35B split32: 2, split16/8/4/2: 4). An sm_86 build of the split kernels uses 72 registers in place of 62, so the 27B split4/2 hold 1 CTA/SM and the 35B split8/4/2 hold 3: on an RTX 3090 (82 SMs) the planner admitted grids the card cannot hold, a 27B prefill chunk of 1025 to 1664 tokens on split4 among them, and the launch failed with cudaErrorCooperativeLaunchTooLarge. The CTAs/SM now come from bf16_gdn_gating_cooperative_ctas_per_sm (the occupancy query on the launched kernel, in bf16_gdn_gating_proj_kernels.{h,cu}), read once per device and kernel, and the split40 grid is counted at the 40 splits it launches (its 80 still sizes the workspace; 1 CTA/SM against 40 is the old 2 against 80). On compute capability 12.0 the query returns the former constants, which tests/ops/test_gdn_gating_proj.cpp checks, so the RTX 5090 takes every route the reference takes."
+      }
     },
     {
       "path": "src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h",
@@ -1642,8 +1657,8 @@
       "sha256": "5d6ea618f0b3338fa87792afaa031eec907b9c92e689d0fb3078ea948895375f",
       "patch": {
         "diff": "patches/tests/ops/test_gdn_gating_proj.cpp.diff",
-        "sha256": "6ff29740d2ad1b5acc74392844f18228d56596184520eafaa22da29c87c02e7c",
-        "reason": "Portability (ADR 0077; GitHub #478): the test runs on a card with fewer SMs than the RTX 5090. The cooperative schedules are sized for its 170 SMs, and the 27B fused norm/control route at T=1..8 (cooperative split40) has no planner fallback, so on a card below 120 SMs gdn_norm_gating_proj_workspace_capacity_bytes throws and the test aborts at its first check. The test now asks the planner's own residency query (candidate_is_legal, through bf16_gdn_gating_resolve_candidate) and skips, naming on stdout, the fused 27B cases and the 27B norm/control workspace interval when it refuses split40; it also names a projection case where bf16_gdn_gating_resolve_plan runs the unsplit route in place of a cooperative one. A host check in a test, no device code; on the RTX 5090 every schedule is resident, the test runs every case it ran before and its output and exit code are unchanged."
+        "sha256": "2b4362736a52f26c110029e92776845468c51f9f8133f4e1d6681a9c4616fdb6",
+        "reason": "Portability (ADR 0077; GitHub #478): the test runs on a card that cannot hold every cooperative schedule resident, with fewer SMs than the RTX 5090 or the fewer CTAs/SM of an Ampere (sm_86) build. The cooperative schedules are sized for the 5090 and its 170 SMs, and the 27B fused norm/control route at T=1..8 (cooperative split40) has no planner fallback, so on a card below 120 SMs gdn_norm_gating_proj_workspace_capacity_bytes throws and the test aborted at its first check. The test now asks the planner residency query (candidate_is_legal, through bf16_gdn_gating_resolve_candidate) and skips, naming on stdout, the fused 27B cases and the 27B norm/control workspace interval when it refuses split40; it also names a projection case where bf16_gdn_gating_resolve_plan runs the unsplit route in place of a cooperative one. It prints the CTAs/SM of each cooperative kernel from the planner occupancy query (bf16_gdn_gating_cooperative_ctas_per_sm) and fails on compute capability 12.0 if one differs from the constant the planner hardcoded for the 120a build, and on a 12.0 card of 170 SMs or more if it skipped any schedule. A host check in a test, no device code; on the RTX 5090 it runs every case it ran before."
       }
     },
     {

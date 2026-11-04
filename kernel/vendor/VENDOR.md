@@ -90,15 +90,24 @@ measured bottleneck (ADR 0031); a demonstrated correctness bug (ADR 0037),
 in which case the `reason` also names the test that fails without the patch;
 or portability to an architecture the build targets (ADR 0077), in
 which case the `reason` names the architecture and the compile it fixes, and
-the default `120a` build's device code is unchanged. There are two
+the default `120a` build's device code is unchanged. There are three
 portability patches. `src/core/pdl.cuh` (GitHub #456): programmatic dependent
 launch is a no-op below sm_90, and a device below compute capability 9.0
-launches without the programmatic-serialization attribute.
-`tests/ops/test_gdn_gating_proj.cpp` (GitHub #478), a test with no device
-code: its cooperative schedules are sized for the RTX 5090's 170 SMs, so on a
-card with fewer SMs it skips each one the planner's own residency query
-refuses and names it on its output (`SKIP` lines); on the 5090 it runs every
-case as before and names none. A portability patch changes no
+launches without the programmatic-serialization attribute. The GDN gating
+planner, `src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp` with
+`bf16_gdn_gating_proj_kernels.{h,cu}` (GitHub #478): it budgeted each
+cooperative schedule's CTAs per SM with constants true of the `120a` build,
+which an sm_86 build's kernels (72 registers in place of 62) do not meet, so
+on an RTX 3090 it admitted grids the card cannot hold and the launch failed;
+it now asks CUDA's occupancy query on the kernel it launches, which gives
+those constants on compute capability 12.0. `tests/ops/test_gdn_gating_proj.cpp`
+(GitHub #478), a test with no device code: its cooperative schedules are sized
+for the RTX 5090's 170 SMs, so on a card that cannot hold one resident it
+skips each one the planner's own residency query refuses and names it on its
+output (`SKIP` lines); it prints each cooperative kernel's CTAs per SM
+(`budget` lines) and fails on compute capability 12.0 if one is not the
+planner's former constant; on the 5090 it runs every case as before, names
+none, and fails if it skips one. A portability patch changes no
 behaviour where the reference runs, so it adds no row to the table below. A
 file that cannot build for an older architecture is not patched: ten compile,
 verbatim, for the arch-specific Blackwell targets alone (`ignis_vendor_sm120a`
@@ -453,7 +462,8 @@ epilogue, NVFP4 arm only:
 The remaining op family (the fused GDN projections: gdn_input_proj,
 gdn_gating_proj) arrives with P1-12, adding its files to this manifest and
 its reference op test to the leaf's test suite (the gdn_gating_proj test
-carries a portability patch since GitHub #478, in the patch policy above).
+and its planner carry portability patches since GitHub #478, in the patch
+policy above).
 
 P2-03 (GitHub #85) qualifies the W4A4 activation-quantized route, turning on
 the A4 cases that the earlier tickets trimmed:
