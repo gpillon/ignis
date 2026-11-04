@@ -50,7 +50,7 @@ export type OriginRow = {
   /** `<group>.<name>`, a declaration's `file_key`. */
   key: string;
   scope: string | null;
-  source: "default" | "profile" | "file" | "env" | "flag" | "live";
+  source: "default" | "profile" | "card" | "file" | "env" | "flag" | "live";
   scoped: boolean;
   spelling?: string;
 };
