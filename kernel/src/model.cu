@@ -643,6 +643,17 @@ std::size_t gdn_layer_scratch_bytes(const ignis_topology &topology, const GdnLay
   bytes += bf16_bytes(static_cast<int64_t>(hidden) * columns);        // post
   bytes += bf16_bytes(static_cast<int64_t>(ffn) * columns);           // fused
 
+  // GitHub #478: the gating query reads each of its routes at the route's last
+  // width only, so on a card with fewer SMs it can miss a split schedule that
+  // cooperative residency admits inside a route whose last width runs unsplit.
+  // The reservation still holds it. A prefill chunk is a multiple of 128, the
+  // gating's column tile, which divides every route boundary past 8 tokens, so
+  // a width the query misses is at least 128 columns narrower than the chunk:
+  // the buffers above, sized at the chunk, then leave 128 columns of them
+  // unused (19.7 MB on the 27B), and a gating workspace is at most 3 MiB (8
+  // splits x 1024 columns x 96 rows of FP32). A round, at most 8 lanes of 8
+  // columns, stays inside one column tile, where the residency test gives
+  // every width the answer it gives the round's own.
   bytes += round_up_arena_align(
       ninfer::ops::gdn_gating_proj_workspace_capacity_bytes(value_heads, hidden, 1, columns));
   bytes += round_up_arena_align(ninfer::ops::gated_delta_net_workspace_capacity_bytes(
