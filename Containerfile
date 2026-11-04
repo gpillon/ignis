@@ -16,9 +16,11 @@
 # `--download-enabled false`, or the start fetches the configured model
 # first). A GPU load there is refused naming the missing driver.
 #
-# The kernel leaf is compiled for SM120a (RTX 5090 / Blackwell consumer),
-# kernel/CMakeLists.txt's default; CUDA_ARCHITECTURES below adds others. On a
-# card the build does not cover the server refuses to start, naming the card.
+# The kernel leaf is compiled for 120a (RTX 50 and RTX PRO, Blackwell),
+# kernel/CMakeLists.txt's default; CUDA_ARCHITECTURES below adds others, and
+# the release image is built with `86;120a`, which adds RTX 30 and RTX 40
+# (Ampere, Ada). On a card the build does not cover the server refuses to
+# start, naming the card.
 
 # --- the Playground frontend (ADR 0026) ------------------------------------
 #
@@ -60,9 +62,11 @@ ENV IGNIS_KERNEL_BUILD_JOBS=${KERNEL_BUILD_JOBS}
 
 # The CUDA architectures the kernel leaf is compiled for (GitHub #456), which
 # kernel/CMakeLists.txt reads: empty is its default, 120a alone, and
-# `--build-arg CUDA_ARCHITECTURES='86;120a'` adds Ampere, a development build
-# (docs/user/contributing/building.md). Each architecture added is another
-# device compile of nearly every translation unit.
+# `--build-arg CUDA_ARCHITECTURES='86;120a'` adds the sm_86 machine code RTX 30
+# and RTX 40 cards run, the list the release workflow passes (#482,
+# docs/user/contributing/building.md). Each architecture added is another
+# device compile of nearly every translation unit. The check after the build
+# reads the same variable.
 ARG CUDA_ARCHITECTURES=
 ENV IGNIS_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
 
@@ -74,10 +78,14 @@ ENV IGNIS_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
 # reads `ignis-server/cuda` as a feature of that dependency, which a build of
 # the binaries never compiles. The server then came out without CUDA, with no
 # error, in v0.9.0 and v0.9.1 (GitHub #408). The check after the build reads
-# the binary itself and refuses one that would fall back to the CPU mock.
+# the binary itself and refuses one that would fall back to the CPU mock, or
+# that carries no machine code for an entry of IGNIS_CUDA_ARCHITECTURES (#482),
+# on each of the three binaries the image and the tarball ship.
 RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
         --workspace --features cuda \
     && bash mk/cuda-build-check.sh target/x86_64-unknown-linux-gnu/release/ignis-server \
+             target/x86_64-unknown-linux-gnu/release/ignis-bench \
+             target/x86_64-unknown-linux-gnu/release/ignis-artifact-inspect \
     && strip target/x86_64-unknown-linux-gnu/release/ignis-server \
              target/x86_64-unknown-linux-gnu/release/ignis-bench \
              target/x86_64-unknown-linux-gnu/release/ignis-artifact-inspect
@@ -149,7 +157,9 @@ ENTRYPOINT ["/usr/local/bin/ignis-server"]
 # anyone passes after the image name, which is how `--server-ui` used to disappear
 # the moment someone added a flag.
 
+# The release workflow's metadata step replaces the description on the image
+# it publishes, built for `86;120a`; this one is a local build's.
 LABEL org.opencontainers.image.title="ignis" \
-      org.opencontainers.image.description="ignis: OpenAI-compatible inference server for Qwen3.8-27B NVFP4 on Blackwell (SM120a), with the Playground UI" \
+      org.opencontainers.image.description="ignis: OpenAI-compatible inference server for Qwen3.8 with the Playground UI, on NVIDIA RTX 50 and RTX PRO (Blackwell) cards, and on RTX 30 and RTX 40 (Ampere, Ada) built for 86;120a as the release image is" \
       org.opencontainers.image.source="https://github.com/gpillon/ignis" \
       org.opencontainers.image.licenses="Apache-2.0"

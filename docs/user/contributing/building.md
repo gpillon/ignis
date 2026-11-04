@@ -13,8 +13,9 @@ links it.
 - **Rust** — the workspace (Cargo).
 - **A C++ toolchain** — MSVC C++ build tools (Visual Studio 2022, C++ workload)
   on Windows; GCC on Linux.
-- **The NVIDIA CUDA Toolkit** (`nvcc`), target `SM120a`. Set `CUDA_PATH`
-  (`CUDA_HOME` on Linux) if it is not on the default install path.
+- **The NVIDIA CUDA Toolkit** (`nvcc`), target `120a` unless you name more
+  ([below](#other-card-architectures)). Set `CUDA_PATH` (`CUDA_HOME` on Linux)
+  if it is not on the default install path.
 - **CMake + Ninja** — the kernel leaf builds with the Ninja generator.
 - **Node.js**, for the Playground.
 
@@ -47,10 +48,11 @@ everything and then runs CTest.
 
 `IGNIS_CUDA_ARCHITECTURES` names the architectures the leaf is compiled for,
 as a CMake list. Unset, it is `120a` alone: compute capability 12.0, the RTX 50
-and RTX PRO 6000 Blackwell cards, and what every release ships. It is read in
-one place, `kernel/CMakeLists.txt`; both build scripts, the `--features cuda`
-cargo build (which rebuilds the leaf when the variable changes) and the
-container build (`--build-arg CUDA_ARCHITECTURES=…`) pass it through.
+and RTX PRO 6000 Blackwell cards. It is read in one place,
+`kernel/CMakeLists.txt`; both build scripts, the `--features cuda` cargo build
+(which rebuilds the leaf when the variable changes) and the container build
+(`--build-arg CUDA_ARCHITECTURES=…`) pass it through. A `make build` sets
+nothing, so it builds `120a` alone.
 
 ```powershell
 $env:IGNIS_CUDA_ARCHITECTURES = '86;120a'
@@ -68,9 +70,17 @@ of one on another card fails with CUDA's "no kernel image is available".
 Every architecture added costs another device compile of nearly every
 translation unit.
 
-Such a build is for development: it compiles, and nothing has run on an RTX 30
-or 40 card yet ([#456](https://github.com/gpillon/ignis/issues/456)). A card
-none of the listed architectures runs on is refused at start
+**Releases are built for `86;120a`**, on Windows and on Linux, the container
+image included: `.github/workflows/release.yml` sets the variable for both
+builds. Before packaging, `mk/cuda-build-check.sh` reads each binary
+(`ignis-server`, `ignis-bench`, `ignis-artifact-inspect`) and refuses one that
+carries no machine code for an architecture of the list, so a release without
+code for 8.6, or without code for 12.0, is not published. The
+sm_120a code in such a build is the same, byte for byte, as a `120a`-only
+build's.
+
+Which cards are supported is in [What it runs on](../start/index.md#what-it-runs-on).
+A card none of the listed architectures runs on is refused at start
 ([Troubleshooting](../troubleshooting.md#starting)).
 
 On a card below compute capability 9.0, programmatic dependent launch, an

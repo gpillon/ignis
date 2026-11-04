@@ -6,7 +6,10 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
+#include <utility>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -89,19 +92,27 @@ bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     return false;
 }
 
-int device_multiprocessor_count() {
-    static const int count = [] {
-        int device = 0;
-        CUDA_CHECK(cudaGetDevice(&device));
-        int multiprocessors = 0;
-        CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount,
-                                          device));
-        if (multiprocessors <= 0) {
-            throw std::runtime_error("BF16 GDN gating: device reports no multiprocessors");
-        }
-        return multiprocessors;
-    }();
-    return count;
+// Ignis portability patch (ADR 0077, GitHub #478): a cooperative launch fails unless the device
+// holds its whole grid at once, the kernel's CTAs/SM times the SMs. Both come from the current
+// device, read once per device and kernel, since the planner runs on every call.
+std::int64_t device_resident_ctas(Bf16GdnGatingCooperativeKernel kernel) {
+    static std::mutex mutex;
+    static std::map<std::pair<int, Bf16GdnGatingCooperativeKernel>, std::int64_t> resident;
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    const std::lock_guard<std::mutex> lock(mutex);
+    const auto key = std::make_pair(device, kernel);
+    if (const auto found = resident.find(key); found != resident.end()) { return found->second; }
+    int multiprocessors = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device));
+    if (multiprocessors <= 0) {
+        throw std::runtime_error("BF16 GDN gating: device reports no multiprocessors");
+    }
+    const std::int64_t ctas =
+        static_cast<std::int64_t>(bf16_gdn_gating_cooperative_ctas_per_sm(kernel)) *
+        multiprocessors;
+    resident.emplace(key, ctas);
+    return ctas;
 }
 
 std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
@@ -133,32 +144,85 @@ std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
     throw std::logic_error("BF16 GDN gating: unknown schedule");
 }
 
+// Ignis portability patch (ADR 0077, GitHub #478): the launched grid's split dimension. Split40
+// launches forty splits of two K tiles each; the 80 of schedule_split_k sizes its workspace.
+std::int32_t schedule_grid_splits(Bf16GdnGatingScheduleId schedule) {
+    return schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit40 ? 40
+                                                                       : schedule_split_k(schedule);
+}
+
 bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols,
                                   std::int32_t tile_cols, std::int32_t row_tiles,
-                                  std::int32_t resident_ctas) noexcept {
+                                  std::int64_t resident_ctas) noexcept {
     const std::int64_t column_tiles = (static_cast<std::int64_t>(cols) + tile_cols - 1) / tile_cols;
     const std::int64_t grid_ctas =
-        column_tiles * row_tiles * static_cast<std::int64_t>(schedule_split_k(schedule));
+        column_tiles * row_tiles * static_cast<std::int64_t>(schedule_grid_splits(schedule));
     return grid_ctas <= resident_ctas;
 }
 
 bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) {
-    // BN128 uses 40 KiB of dynamic shared memory. Split8 uses 71 registers with 256 threads;
-    // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM. The
-    // SM count is device-specific: a desktop RTX 5090 and its Laptop GPU do not have the same
-    // cooperative-launch budget.
-    return cooperative_grid_is_resident(schedule, cols, 128, 3, 2 * device_multiprocessor_count());
+    // BN128 uses 40 KiB of dynamic shared memory. Split8 and the fused split40 run 256 threads,
+    // split4/2 512. The SM count is device-specific: a desktop RTX 5090 and its Laptop GPU do not
+    // have the same cooperative-launch budget.
+    //
+    // Ignis portability patch (ADR 0077, GitHub #478): the CTAs/SM come from the occupancy query
+    // on the kernel. On the registered CUDA 13.1/sm_120a build it gives the budget this planner
+    // hardcoded: 2 for split8/4/2 and 1 for split40 (2 against its 80 workspace splits, the same
+    // grid limit). An sm_86 build's split4/2 use 72 registers and hold 1. The gating test checks
+    // the sm_120a values on a compute capability 12.0 device.
+    Bf16GdnGatingCooperativeKernel kernel = Bf16GdnGatingCooperativeKernel::Mma27Split8;
+    switch (schedule) {
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
+        kernel = Bf16GdnGatingCooperativeKernel::Norm27Split40;
+        break;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
+        kernel = Bf16GdnGatingCooperativeKernel::Mma27Split8;
+        break;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
+        kernel = Bf16GdnGatingCooperativeKernel::Mma27Split4;
+        break;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
+        kernel = Bf16GdnGatingCooperativeKernel::Mma27Split2;
+        break;
+    default:
+        throw std::logic_error("BF16 GDN gating: not a 27B cooperative schedule");
+    }
+    return cooperative_grid_is_resident(schedule, cols, 128, 3, device_resident_ctas(kernel));
 }
 
 bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) {
-    // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles. With the registered CUDA
-    // 13.1/sm_120a build, split32 uses 91/93 registers per thread and admits two CTAs/SM;
-    // split16/8/4/2 use at most 62 registers and admit four CTAs/SM. The device-wide limit is
-    // derived from the active GPU's SM count.
-    const std::int32_t resident_per_sm =
-        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 2 : 4;
-    return cooperative_grid_is_resident(schedule, cols, 64, 2,
-                                        resident_per_sm * device_multiprocessor_count());
+    // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles.
+    //
+    // Ignis portability patch (ADR 0077, GitHub #478): the CTAs/SM come from the occupancy query
+    // on the kernel. On the registered CUDA 13.1/sm_120a build it gives the budget this planner
+    // hardcoded: 2 for split32 (91/93 registers per thread) and 4 for split16/8/4/2 (at most 62).
+    // An sm_86 build's split8/4/2 use 72 registers and hold 3. Split32 is both the plain schedule
+    // and the control of the fused norm/control route, so it takes the smaller of the two
+    // kernels' budgets. The gating test checks the sm_120a values on a compute capability 12.0
+    // device.
+    std::int64_t resident_ctas = 0;
+    switch (schedule) {
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
+        resident_ctas =
+            std::min(device_resident_ctas(Bf16GdnGatingCooperativeKernel::Mma35Split32),
+                     device_resident_ctas(Bf16GdnGatingCooperativeKernel::Norm35Split32));
+        break;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
+        resident_ctas = device_resident_ctas(Bf16GdnGatingCooperativeKernel::Mma35Split16);
+        break;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
+        resident_ctas = device_resident_ctas(Bf16GdnGatingCooperativeKernel::Mma35Split8);
+        break;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
+        resident_ctas = device_resident_ctas(Bf16GdnGatingCooperativeKernel::Mma35Split4);
+        break;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
+        resident_ctas = device_resident_ctas(Bf16GdnGatingCooperativeKernel::Mma35Split2);
+        break;
+    default:
+        throw std::logic_error("BF16 GDN gating: not a 35B cooperative schedule");
+    }
+    return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas);
 }
 
 bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,

@@ -19,8 +19,9 @@ cmake_minimum_required(VERSION 3.28)
 # here and nowhere else -- kernel/build.ps1, kernel/build.sh, the cargo build
 # (crates/artifact/build.rs) and the Containerfile's CUDA_ARCHITECTURES pass
 # it through. Unset or empty, `120a` alone: the RTX 50 and RTX PRO 6000
-# Blackwell cards, the build every release ships (proven on this machine with
-# CMake 3.28, NINFER_WINDOWS_BUILD_NOTES section 14). Set before project(),
+# Blackwell cards, what a build from a checkout compiles (proven on this
+# machine with CMake 3.28, NINFER_WINDOWS_BUILD_NOTES section 14); the releases
+# pass `86;120a` (.github/workflows/release.yml, #482). Set before project(),
 # which would otherwise give CMAKE_CUDA_ARCHITECTURES the compiler's default,
 # and forced into the cache, so a build directory configured before follows
 # the knob as it is now.
