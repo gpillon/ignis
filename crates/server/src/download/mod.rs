@@ -610,8 +610,10 @@ mod tests {
     fn a_start_with_no_artifact_the_card_cannot_load_is_refused_naming_both_classes() {
         use crate::config::profile::CardClass;
         let refusal = start_model(&catalog::testing::thirty_two(), crate::config::DEFAULT_MODEL, Some(&on(CardClass::Gb16))).unwrap_err();
-        let class = Some(catalog::ClassGap { needs: CardClass::Gb32, card: CardClass::Gb16 });
-        assert_eq!((refusal.model.as_str(), refusal.class, refusal.generation), ("qwen3.8-27b", class, None));
+        assert_eq!(
+            (refusal.code(), refusal.to_string()),
+            ("model_above_card_class", "qwen3.8-27b needs a 32 GB card or larger (its catalog entry's card_class), and this card is of the 16 GB class".to_owned())
+        );
         let refusal = start_model(&catalog::testing::built_in(), "Qwen3.8-Flash-Next", Some(&on(CardClass::Gb16))).unwrap_err();
         assert!(refusal.to_string().contains("qwen3.8-flash-next needs a 32 GB card"), "{refusal}");
     }

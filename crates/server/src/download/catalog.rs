@@ -1718,9 +1718,11 @@ mod tests {
     fn an_id_above_the_card_class_with_no_entry_answering_to_it_is_refused_naming_both_classes() {
         let err = resolved(&thirty_two(), "qwen3.8-27b", Some(&on(CardClass::Gb16))).unwrap_err();
         assert!(err.contains("qwen3.8-27b") && err.contains("32 GB") && err.contains("16 GB"), "{err}");
-        let refusal = CardRefusal { model: "ignis-image-2.1-turbo".to_owned(), class: Some(ClassGap { needs: CardClass::Gb32, card: CardClass::Gb16 }), generation: None, other_family: None };
-        assert_eq!(Catalog::built_in().answering("ignis-image-2.1-turbo", Some(&on(CardClass::Gb16))), Err(refusal.clone()));
-        assert_eq!(Catalog::built_in().above_card("ignis-image-2.1-turbo", Some(&on(CardClass::Gb16))), Some(refusal));
+        let said = "ignis-image-2.1-turbo needs a 32 GB card or larger (its catalog entry's card_class), and this card is of the 16 GB class";
+        let refused = |refusal: CardRefusal| (refusal.code(), refusal.to_string());
+        let card = on(CardClass::Gb16);
+        assert_eq!(Catalog::built_in().answering("ignis-image-2.1-turbo", Some(&card)).map_err(refused), Err(("model_above_card_class", said.to_owned())));
+        assert_eq!(Catalog::built_in().above_card("ignis-image-2.1-turbo", Some(&card)).map(refused), Some(("model_above_card_class", said.to_owned())));
     }
 
     /// ADR 0064 §2 on the artifact: the entry that answers to an alias must
@@ -1824,15 +1826,16 @@ mod tests {
         let id = "acme-qwen3.8-27b-ft";
         let none = operator(OPERATOR).expect("a catalog written before `generation` loads");
         assert_eq!(none.entry(id).unwrap().generation, None);
-        for card in [rtx_3090(), rtx_4090(), on(CardClass::Gb32)] {
-            assert_eq!(none.above_card(id, Some(&card)).and_then(|refusal| refusal.generation), None, "{}", card.name);
+        for (card, code) in [(rtx_3090(), Some("model_above_card_class")), (rtx_4090(), Some("model_above_card_class")), (on(CardClass::Gb32), None)] {
+            assert_eq!(none.above_card(id, Some(&card)).map(|refusal| refusal.code()), code, "{}: its class alone", card.name);
         }
 
         let ada = operator(&OPERATOR.replacen("card_class: 32", "card_class: 24\n    generation: ada", 1)).expect("ada is a generation");
         assert_eq!(ada.entry(id).unwrap().generation, Some(GpuGeneration::Ada));
         let refusal = ada.above_card(id, Some(&rtx_3090())).expect("above an Ampere card");
-        assert_eq!((refusal.code(), refusal.class.clone()), ("model_above_gpu_generation", None));
+        assert_eq!(refusal.code(), "model_above_gpu_generation");
         let said = refusal.to_string();
+        assert!(!said.contains("card_class"), "the 24 GB class fits: {said}");
         assert!(said.starts_with("acme-qwen3.8-27b-ft needs a card of the Ada generation (RTX 40) or newer (its catalog entry's generation)"), "{said}");
         assert!(said.ends_with("this card, NVIDIA GeForce RTX 3090 (compute capability 8.6), is of the Ampere generation"), "{said}");
         for card in [rtx_4090(), on(CardClass::Gb24), on(CardClass::Gb96)] {
@@ -1861,7 +1864,6 @@ mod tests {
             for id in ["qwen3.8-27b", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "swift-1.5-27b"] {
                 let refusal = catalog.above_card(id, card).unwrap_or_else(|| panic!("{id} on {generation}"));
                 assert_eq!(refusal.code(), "model_above_gpu_generation", "{id}");
-                assert_eq!(refusal.class, Some(ClassGap { needs: CardClass::Gb32, card: CardClass::Gb24 }), "{id}: both, named both");
                 let said = refusal.to_string();
                 let card_said = format!("this card, {} (compute capability {capability}), is of the {generation} generation and of the 24 GB class", card.unwrap().name);
                 for named in [id, "needs a card of the Blackwell generation (RTX 50, RTX PRO) or newer (its catalog entry's generation) and a 32 GB card or larger", &card_said] {
@@ -1872,7 +1874,7 @@ mod tests {
                 assert_eq!(catalog.answering(id, card).map_err(|refusal| refusal.code()), Err("model_above_gpu_generation"), "{id} on {generation}");
             }
             let alone = catalog.answering("swift-1.5-27b-16g", card).unwrap_err();
-            assert_eq!((alone.code(), alone.class.clone()), ("model_above_gpu_generation", None));
+            assert_eq!(alone.code(), "model_above_gpu_generation");
             assert!(alone.to_string().starts_with("swift-1.5-27b-16g needs a card of the Blackwell generation") && !alone.to_string().contains("card_class"), "{alone}");
         }
     }
@@ -1888,7 +1890,8 @@ mod tests {
         let five_090 = CardReading::of(crate::config::profile::RTX_5090_TOTAL_BYTES, "NVIDIA GeForce RTX 5090", ComputeCapability::new(12, 0));
         for entry in catalog.entries() {
             for card in [Some(&on(CardClass::Gb24)), Some(&five_090), None] {
-                assert_eq!(catalog.above_card(&entry.id, card).and_then(|refusal| refusal.generation), None, "{} on {card:?}", entry.id);
+                let code = catalog.above_card(&entry.id, card).map(|refusal| refusal.code());
+                assert_ne!(code, Some("model_above_gpu_generation"), "{} on {card:?}", entry.id);
             }
             assert_eq!(catalog.answering(&entry.id, Some(&five_090)), Ok(None), "{}", entry.id);
         }
@@ -1906,7 +1909,8 @@ mod tests {
         assert_eq!((card.class(), card.generation()), (None, Some(GpuGeneration::Ada)));
         let catalog = Catalog::built_in();
         let refusal = catalog.above_card("qwen3.8-27b", Some(&card)).expect("refused by generation");
-        assert_eq!((refusal.code(), refusal.class.clone()), ("model_above_gpu_generation", None));
+        assert_eq!(refusal.code(), "model_above_gpu_generation");
+        assert!(!refusal.to_string().contains("card_class"), "a card of no class refuses nothing by class: {refusal}");
         assert_eq!(resolved(catalog, "qwen3.8-27b", Some(&card)), Ok("qwen3.8-27b-16g"));
         assert_eq!(catalog.answering("qwen3.8-flash-next", Some(&card)).map_err(|refusal| refusal.code()), Err("model_above_gpu_generation"));
     }
