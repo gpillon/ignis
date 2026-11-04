@@ -27,7 +27,7 @@ pub const DEFAULT_PROFILE: &str = AUTO_PROFILE;
 /// the real profile first and names that one, so `GET /v1/config`, `make
 /// config` and the Playground show `rtx5090`, never `auto`. It picks the
 /// class's profile by NAME, through the same [`lookup`] a named profile goes
-/// through: a config file's `profiles:` that redefines `rtx50-16gb`,
+/// through: a config file's `profiles:` that redefines `rtx-16gb`,
 /// `rtx5090` or `rtxpro6000` replaces what `auto` picks for that class.
 pub const AUTO_PROFILE: &str = "auto";
 
@@ -221,7 +221,8 @@ pub const NONE_PROFILE: &str = "none";
 /// the host plan leaves room, never refusing a start the 1 GiB default would
 /// make. The VRAM plan sizes the rest, the KV pool among it.
 ///
-/// `rtx50-16gb` is the 16 GB class (ADR 0063, ADR 0064): the RTX 5060 Ti 16 GB,
+/// `rtx-16gb` is the 16 GB class (ADR 0063, ADR 0064; named `rtx50-16gb` until
+/// GitHub #476, a name [`canonical`] still accepts): the RTX 5060 Ti 16 GB,
 /// 5070 Ti and 5080, the RTX 50 cards `--profile auto` finds below 20 GiB.
 /// Derived, not measured: no 16 GB card exists in the project. It serves the 27B
 /// (the 16 GB catalog entry) at the 262,144 positions it was trained on, with
@@ -271,7 +272,7 @@ const BUILT_IN: &str = r#"{
         },
         "ngram": { "hot_bytes": "auto" }
     },
-    "rtx50-16gb": {
+    "rtx-16gb": {
         "vram": {
             "qwen38": { "headroom_bytes": "1200M" }
         },
@@ -341,7 +342,7 @@ impl CardClass {
     /// The built-in profile `--profile auto` picks for a card of this class.
     pub fn profile(self) -> &'static str {
         match self {
-            Self::Gb16 => "rtx50-16gb",
+            Self::Gb16 => "rtx-16gb",
             Self::Gb32 => "rtx5090",
             Self::Gb96 => "rtxpro6000",
         }
@@ -354,6 +355,21 @@ impl std::fmt::Display for CardClass {
     }
 }
 
+/// The 16 GB profile's name before GitHub #476: still accepted everywhere a
+/// profile is named, permanently and without a warning.
+pub const LEGACY_16GB_PROFILE: &str = "rtx50-16gb";
+
+/// The name a profile is known by: [`LEGACY_16GB_PROFILE`] is `rtx-16gb`,
+/// every other name is itself. `--profile`, `IGNIS_PROFILE`, a file's
+/// `profile:` and the keys of its `profiles:` all go through it.
+pub fn canonical(name: &str) -> &str {
+    if name == LEGACY_16GB_PROFILE {
+        CardClass::Gb16.profile()
+    } else {
+        name
+    }
+}
+
 /// Every built-in profile, by name.
 pub fn built_in() -> BTreeMap<String, Layer> {
     let value = serde_json::from_str(&format!(r#"{{"profiles": {BUILT_IN}}}"#)).expect("the built-in profiles are JSON");
@@ -363,6 +379,7 @@ pub fn built_in() -> BTreeMap<String, Layer> {
 /// The profile called `name`: the config file's own first (an operator may
 /// redefine a built-in one for their card), then the built-in ones.
 pub fn lookup(name: &str, from_file: &BTreeMap<String, Layer>) -> Result<Layer, ConfigError> {
+    let name = canonical(name);
     if let Some(layer) = from_file.get(name) {
         return Ok(layer.clone());
     }
@@ -604,6 +621,15 @@ mod tests {
     }
 
     #[test]
+    fn the_old_16gb_name_is_the_same_profile() {
+        assert_eq!(canonical("rtx50-16gb"), "rtx-16gb");
+        assert_eq!(canonical("rtx5090"), "rtx5090");
+        assert_eq!(CardClass::Gb16.profile(), "rtx-16gb");
+        assert!(built_in().contains_key("rtx-16gb") && !built_in().contains_key("rtx50-16gb"));
+        assert_eq!(lookup("rtx50-16gb", &BTreeMap::new()).unwrap(), built_in()["rtx-16gb"]);
+    }
+
+    #[test]
     fn a_file_profile_shadows_a_built_in_one_and_an_unknown_name_lists_the_known() {
         let headroom = field("vram", "headroom_bytes").unwrap();
         let mut mine = Layer::default();
@@ -611,7 +637,7 @@ mod tests {
         let from_file = BTreeMap::from([("rtx5090".to_owned(), mine.clone()), ("a4000".to_owned(), mine.clone())]);
         assert_eq!(lookup("rtx5090", &from_file).unwrap(), mine);
         assert_eq!(lookup("rtx5090", &BTreeMap::new()).unwrap(), built_in()["rtx5090"]);
-        let err = lookup("h100", &from_file).unwrap_err().0;
-        assert!(err.contains("`h100`") && err.contains("a4000, rtx50-16gb, rtx5090"), "{err}");
+        let err = lookup("no-such-card", &from_file).unwrap_err().0;
+        assert!(err.contains("`no-such-card`") && err.contains("a4000, rtx-16gb, rtx5090"), "{err}");
     }
 }

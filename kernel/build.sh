@@ -3,7 +3,7 @@
 # architectures kernel/CMakeLists.txt reads from IGNIS_CUDA_ARCHITECTURES:
 # unset, 120a alone (GitHub #456; docs/user/contributing/building.md).
 #
-#   bash kernel/build.sh [build-dir] [--test]
+#   bash kernel/build.sh [build-dir] [--test] [--archives-only]
 #
 # The Linux half of kernel/build.ps1: same generator, same build type, same
 # architectures, same canonical kernel/build output directory. There is no
@@ -13,6 +13,11 @@
 # --test also runs the leaf's op-test executables through CTest. Those are GPU
 # tests and they FAIL (never skip) when the GPU is busy or a kernel errors
 # (ADR 0006), so run them on a free GPU: stop the reference runner first.
+#
+# --archives-only builds just the two archives the Rust link uses (ignis_kernel,
+# ignis_vendor) and none of the CTest executables: crates/artifact/build.rs
+# passes it, so a cargo build does not compile kernel/tests/ (GitHub #460).
+# A hand run and --test build everything; --test wins over --archives-only.
 
 set -euo pipefail
 
@@ -23,9 +28,11 @@ kernel="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # workstream verify new .cu files without contending on the canonical build.
 build_dir="build"
 run_tests=0
+archives_only=0
 for arg in "$@"; do
     case "$arg" in
         --test) run_tests=1 ;;
+        --archives-only) archives_only=1 ;;
         -*) echo "unknown option: $arg" >&2; exit 2 ;;
         *) build_dir="$arg" ;;
     esac
@@ -67,7 +74,11 @@ cmake -S "$kernel" -B "$build_path" \
 # IGNIS_KERNEL_BUILD_JOBS caps the parallel compile width. nvcc on the W4A4 /
 # TMA translation units peaks well above 2 GB of RSS, so a small container or
 # VM needs a lower width than its core count; unset means "all cores".
-cmake --build "$build_path" --parallel ${IGNIS_KERNEL_BUILD_JOBS:+"$IGNIS_KERNEL_BUILD_JOBS"}
+build_targets=()
+if [ "$archives_only" = 1 ] && [ "$run_tests" = 0 ]; then
+    build_targets=(--target ignis_kernel ignis_vendor)
+fi
+cmake --build "$build_path" --parallel ${IGNIS_KERNEL_BUILD_JOBS:+"$IGNIS_KERNEL_BUILD_JOBS"} ${build_targets[@]+"${build_targets[@]}"}
 
 if [ "$run_tests" = 1 ]; then
     echo "[ignis-kernel] ctest (GPU: a skip is never green, ADR 0006)"

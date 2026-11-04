@@ -158,7 +158,7 @@ pub fn artifact_source(
 /// or the catalog does not hold it (for [`artifact_source`] to answer as
 /// before); on a card below its entry's class, the entry of its family that
 /// answers to it there — the default id `qwen3.8-27b` on a 16 GB card is the
-/// 16 GB 27B's, which is how the `rtx50-16gb` profile's default model is
+/// 16 GB 27B's, which is how the `rtx-16gb` profile's default model is
 /// realized, served under that entry's own id; refused, naming both classes,
 /// when no entry that answers to it fits: the start is refused before
 /// anything is fetched. Matched as [`artifact_source`] matches `model`,

@@ -173,9 +173,9 @@ model, set the same three in your harness's OpenAI-compatible provider.
 
 ## Testing a 16 GB card
 
-The `rtx50-16gb` profile is derived from an RTX 5090 held inside a 16 GB
+The `rtx-16gb` profile is derived from an RTX 5090 held inside a 16 GB
 budget: no real 16 GB card has run it
-([the profile](../concepts/profiles.md#rtx50-16gb)). A user who asks you to
+([the profile](../concepts/profiles.md#rtx-16gb)). A user who asks you to
 test ignis on their RTX 5060 Ti 16 GB, 5070 Ti or 5080 and report how it went
 gives the project its first real numbers. The reports are collected on
 [issue #360](https://github.com/gpillon/ignis/issues/360), one comment per
@@ -371,7 +371,7 @@ At the end the user chooses to keep ignis or to remove it.
   Linux ([the config file](../configuration/index.md)). It holds only the
   model's directory and the settings the test named, not every field: a value
   in the file comes before the profile, so a file of every default (what
-  `config generate` writes) would hold them over `rtx50-16gb` and over a
+  `config generate` writes) would hold them over `rtx-16gb` and over a
   later release's defaults. `config patch` writes such a file, and checks it:
   the file starts as `{}`, then
 

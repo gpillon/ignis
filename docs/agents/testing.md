@@ -46,7 +46,12 @@ until the test suite is green.
   `kernel/include`, `kernel/tests`, `kernel/vendor/src` and
   `kernel/vendor/include` (plus `CMakeLists.txt` and `build.ps1`) and runs
   `kernel/build.ps1` whenever one changes; a build with nothing to do costs
-  a few seconds. Do not trust a binary built any other way to carry your
+  a few seconds. It passes `-ArchivesOnly` (`--archives-only` to
+  `build.sh`), so a cargo build compiles the two archives the link uses and
+  none of the CTest executables (#460); a hand run of the script, `-Test`
+  and `make kernel-test` build the whole project, tests included. The first
+  CTest run after a cargo-only build therefore compiles the test
+  executables once. Do not trust a binary built any other way to carry your
   kernel change: until GitHub #94 that script rebuilt only when
   `kernel/build/*.lib` was *missing*, so an edited `.cu` was linked from
   the previous archive with every test around it still green. That is what

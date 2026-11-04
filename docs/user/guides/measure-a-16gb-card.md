@@ -5,8 +5,8 @@ sidebar:
   order: 5
 ---
 
-The `rtx50-16gb` profile is derived, not measured: the project has no 16 GB
-card ([the profile](../concepts/profiles.md#rtx50-16gb)). If you run the 27B
+The `rtx-16gb` profile is derived, not measured: the project has no 16 GB
+card ([the profile](../concepts/profiles.md#rtx-16gb)). If you run the 27B
 on an RTX 5060 Ti 16 GB, a 5070 Ti or a 5080, one command against your running
 server writes a record of what it does there, and that record, posted on
 [issue #360](https://github.com/gpillon/ignis/issues/360), is how the profile
@@ -57,7 +57,7 @@ request at a time, and another client's requests would land in them.
   from (default, profile, file, env or flag).
 - **What the load adapted**: the context and the decode lanes it runs at beside
   the ones configured, and every step it took to fit the card
-  (`adaptation.adapted`, empty when it took none) — the 27B under `rtx50-16gb`
+  (`adaptation.adapted`, empty when it took none) — the 27B under `rtx-16gb`
   in a 13 GiB budget (16 GiB less 3 GiB of desktop, set by hand on an RTX 5090
   to imitate a 16 GB card) took
   `max_context 262144 -> 65536 (adapt_context_step 65536, adapt_spare_tokens

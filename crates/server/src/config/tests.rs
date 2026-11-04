@@ -289,8 +289,8 @@ fn the_file_value_wins_over_its_own_profile_and_the_profile_is_named_by_flag_env
     assert_eq!(with_files(&["--config", "c.yaml"], env, &files).unwrap().retained_device_slots, 4, "the env var over the file's choice");
     let env = env_map(&[("IGNIS_PROFILE", "from-env")]);
     assert_eq!(with_files(&["--config", "c.yaml", "--profile", "from-file"], env, &files).unwrap().retained_device_slots, 2, "the flag over the env var");
-    let err = with_files(&["--config", "c.yaml", "--profile", "h100"], no_env, &files).unwrap_err().0;
-    assert!(err.contains("`h100`") && err.contains("from-env, from-file, rtx50-16gb, rtx5090"), "{err}");
+    let err = with_files(&["--config", "c.yaml", "--profile", "no-such-card"], no_env, &files).unwrap_err().0;
+    assert!(err.contains("`no-such-card`") && err.contains("from-env, from-file, rtx-16gb, rtx5090"), "{err}");
     assert!(refused(&["--profile", "nope"]).contains("rtx5090"));
 }
 
@@ -2275,7 +2275,8 @@ fn the_built_in_profiles_pick_the_vision_residency() {
     let at = |profile: &str| config(&["--profile", profile, "--vision-enabled"]).vision.map(|v| v.residency());
     assert_eq!(at("rtx5090"), Some(VisionResidency::Host));
     assert_eq!(at("rtxpro6000"), Some(VisionResidency::Device));
-    assert_eq!(at("rtx50-16gb"), Some(VisionResidency::Host), "GitHub #418: written in the profile");
+    assert_eq!(at("rtx-16gb"), Some(VisionResidency::Host), "GitHub #418: written in the profile");
+    assert_eq!(at("rtx50-16gb"), Some(VisionResidency::Host), "the old name is the same profile");
     let flag = config(&["--profile", "rtxpro6000", "--vision-residency", "host"]);
     assert_eq!(flag.vision.map(|v| v.residency()), Some(VisionResidency::Host), "a flag wins over the profile");
 }
@@ -3124,7 +3125,7 @@ fn on_total(flags: &[&str], gib: f64) -> Result<Config, ConfigError> {
 #[test]
 fn auto_picks_the_profile_of_the_cards_class() {
     for (gib, name, class) in [
-        (15.9, "rtx50-16gb", profile::CardClass::Gb16),
+        (15.9, "rtx-16gb", profile::CardClass::Gb16),
         (31.8, "rtx5090", profile::CardClass::Gb32),
         (95.5, "rtxpro6000", profile::CardClass::Gb96),
     ] {
@@ -3145,7 +3146,7 @@ fn auto_refuses_a_card_of_no_class_naming_profile() {
     for gib in [24.0, 48.0] {
         let err = on_total(&[], gib).unwrap_err().0;
         assert!(err.contains(&format!("{gib:.1} GiB")), "{err}");
-        assert!(err.contains("--profile") && err.contains("rtx5090") && err.contains("rtx50-16gb"), "{err}");
+        assert!(err.contains("--profile") && err.contains("rtx5090") && err.contains("rtx-16gb"), "{err}");
     }
     let unreadable = on_card(&[], profile::Card::Unreadable("NVML is not installed".to_owned())).unwrap_err().0;
     assert!(unreadable.contains("--profile") && unreadable.contains("total"), "{unreadable}");
@@ -3174,7 +3175,7 @@ fn a_named_profile_beats_auto_whatever_the_card() {
     assert_eq!(on_total(&["--profile", "none"], 31.8).unwrap().basis.sources().profile_name, "none");
     let env = |key: &str| (key == "IGNIS_PROFILE").then(|| "rtx50-16gb".to_owned());
     let from_env = resolve_on(&[], env, &file::NoFiles, &|| profile::Card::blackwell(profile::RTX_5090_TOTAL_BYTES)).map(expect_config).unwrap();
-    assert_eq!(from_env.basis.sources().profile_name, "rtx50-16gb");
+    assert_eq!(from_env.basis.sources().profile_name, "rtx-16gb", "the old name resolves to the new");
     assert_eq!(from_env.card_class(), Some(profile::CardClass::Gb32), "the total read is the card's, not the profile's");
     let files = MemFiles::with(&[("c.yaml", "profile: none\n")]);
     let from_file = resolve_on(&args(&["--config", "c.yaml"]), no_env, &files, &|| profile::Card::blackwell(24 << 30)).map(expect_config).unwrap();
@@ -3242,10 +3243,10 @@ fn a_start_on_a_card_the_kernels_were_not_built_for_is_refused_by_name() {
 #[test]
 fn a_card_the_kernels_were_built_for_starts_as_before() {
     let ampere = on_card(&[], card_of(15.9, "NVIDIA RTX A4000", (8, 6), "86;120a")).unwrap();
-    assert_eq!(ampere.basis.sources().profile_name, "rtx50-16gb");
+    assert_eq!(ampere.basis.sources().profile_name, "rtx-16gb");
     assert_eq!(ampere.card_class(), Some(profile::CardClass::Gb16));
     let ada_on_ampere_build = on_card(&[], card_of(15.9, "NVIDIA GeForce RTX 4080", (8, 9), "86;120a")).unwrap();
-    assert_eq!(ada_on_ampere_build.basis.sources().profile_name, "rtx50-16gb", "8.6 machine code runs on 8.9");
+    assert_eq!(ada_on_ampere_build.basis.sources().profile_name, "rtx-16gb", "8.6 machine code runs on 8.9");
     let blackwell = on_card(&[], card_of(31.8, "NVIDIA GeForce RTX 5090", (12, 0), "120a")).unwrap();
     assert_eq!(blackwell.settings(), config(&["--profile", "rtx5090"]).settings());
     assert_eq!(blackwell.card().map(|card| card.name.as_str()), Some("NVIDIA GeForce RTX 5090"));
@@ -3288,6 +3289,55 @@ fn the_prefill_attention_on_an_ampere_card_is_fp16_unless_fp8_is_named() {
     let fp8 = on_card(&["--model-prefill-attention", "fp8"], blackwell.clone()).unwrap();
     assert_eq!(fp8.prefill_attention, PrefillAttention::Fp8);
     assert_eq!(on_card(&[], blackwell).unwrap().prefill_attention, PrefillAttention::Fp8);
+}
+
+/// GitHub #477: `GET /v1/config` and its origins report the band the load
+/// runs. On an RTX 3090 (8.6) the field left to its default, or given by a
+/// profile as `fp8`, reads `fp16` with the card as its origin; a named `fp16`
+/// keeps its own origin; a named `fp8` is refused. On an RTX 5090 (12.0), and
+/// on a start that read no card, it reads `fp8` from the default, as before.
+/// (A 24 GB card has no class yet, so the 8.6 card here is a 16 GB reading
+/// under a named profile, as `--profile none` would give.)
+#[test]
+fn the_config_reports_the_prefill_attention_band_the_card_runs() {
+    use source::{Candidate, Source};
+    let field = schema::field("model", "prefill_attention").unwrap();
+    let report = |config: &Config| {
+        let (shared, families) = file::resolutions(config);
+        let (_, family) = families.iter().find(|(family, _)| *family == ModelFamily::Qwen38_27b).expect("the 27B resolves");
+        let document = file::effective_document(config);
+        let shown = document["model"]["qwen38"]["prefill_attention"].as_str().map(str::to_owned);
+        (shared.origin("model", "prefill_attention").cloned(), family.origin("model", "prefill_attention").cloned(), shown)
+    };
+    let rtx3090 = card_of(15.9, "NVIDIA GeForce RTX 3090", (8, 6), "86;120a");
+    let default = on_card(&["--profile", "none"], rtx3090.clone()).unwrap();
+    let (shared, family, shown) = report(&default);
+    assert_eq!(shown.as_deref(), Some("fp16"));
+    for origin in [shared.unwrap(), family.unwrap()] {
+        assert_eq!(origin.source, Source::Card);
+        assert_eq!(origin.spelling, "NVIDIA GeForce RTX 3090 (8.6)");
+        assert!(!origin.source.explicit());
+    }
+
+    // A profile that gives `fp8` reads `fp16` too, the card as origin.
+    let mut sources = default.basis.sources().clone();
+    sources.profile.set(field, None, Candidate { raw: "fp8".into(), spelling: "rtx-test".into() }).unwrap();
+    let resolution = source::resolve_settings(&sources, Some(ModelFamily::Qwen38_27b), source::Fit::Switch).unwrap();
+    assert_eq!(resolution.settings.render()["model"]["prefill_attention"], "fp16");
+    assert_eq!(resolution.origin("model", "prefill_attention").unwrap().source, Source::Card);
+
+    let named = on_card(&["--profile", "none", "--model-prefill-attention", "fp16"], rtx3090.clone()).unwrap();
+    let (_, family, shown) = report(&named);
+    assert_eq!((shown.as_deref(), family.unwrap().source), (Some("fp16"), Source::Flag));
+    assert!(on_card(&["--profile", "none", "--model-prefill-attention", "fp8"], rtx3090).is_err());
+
+    let rtx5090 = card_of(31.8, "NVIDIA GeForce RTX 5090", (12, 0), "86;120a");
+    let blackwell = on_card(&[], rtx5090).unwrap();
+    let (shared, family, shown) = report(&blackwell);
+    assert_eq!((shown.as_deref(), shared, family), (Some("fp8"), None, None));
+    let unread = on_card(&[], profile::Card::Absent).unwrap();
+    let (shared, family, shown) = report(&unread);
+    assert_eq!((shown.as_deref(), shared, family), (Some("fp8"), None, None));
 }
 
 /// `rtx50-16gb` for the 27B: the values the spec derives, and Flash-Next
@@ -3464,4 +3514,62 @@ fn the_config_verbs_refuse_a_card_of_no_class_under_auto() {
     let refused = resolve_on(&args(&["config", "print"]), no_env, &file::NoFiles, &|| profile::Card::blackwell(24 << 30)).unwrap_err().0;
     assert!(refused.contains("--profile"), "{refused}");
     resolve_on(&args(&["config", "print", "--profile", "none"]), no_env, &file::NoFiles, &|| profile::Card::blackwell(24 << 30)).unwrap();
+}
+
+// ── the 16 GB profile's name (GitHub #476) ──────────────────────────────────
+
+/// The old name, by flag, by the environment and as a file's `profile:`, is
+/// the new profile: same name reported, same values.
+#[test]
+fn the_old_16gb_name_resolves_to_rtx_16gb_by_flag_environment_and_file() {
+    let new = config(&["--profile", "rtx-16gb"]);
+    let old = config(&["--profile", "rtx50-16gb"]);
+    assert_eq!(old.basis.sources().profile_name, "rtx-16gb");
+    assert_eq!(old.settings(), new.settings());
+    let env = env_map(&[("IGNIS_PROFILE", "rtx50-16gb")]);
+    let from_env = with_files(&[], env, &MemFiles::with(&[])).unwrap();
+    assert_eq!(from_env.basis.sources().profile_name, "rtx-16gb");
+    assert_eq!(from_env.settings(), new.settings());
+    let files = MemFiles::with(&[("c.yaml", "profile: rtx50-16gb
+")]);
+    let from_file = with_files(&["--config", "c.yaml"], no_env, &files).unwrap();
+    assert_eq!(from_file.basis.sources().profile_name, "rtx-16gb");
+    assert_eq!(from_file.settings(), new.settings());
+}
+
+/// A file's `profiles:` under the old name redefines `rtx-16gb`, and `auto`
+/// on a 16 GB card picks the redefinition, under either name.
+#[test]
+fn a_profiles_key_under_either_16gb_name_replaces_what_auto_picks() {
+    for key in ["rtx50-16gb", "rtx-16gb"] {
+        let files = MemFiles::with(&[("c.yaml", &format!("profiles:
+  {key}:
+    spec:
+      qwen38:
+        decode_lanes: 1
+"))]);
+        let redefined = with_files(&["--config", "c.yaml", "--profile", "rtx-16gb"], no_env, &files).unwrap();
+        let by_old = with_files(&["--config", "c.yaml", "--profile", "rtx50-16gb"], no_env, &files).unwrap();
+        assert_eq!(redefined.settings(), by_old.settings(), "{key}");
+        assert_ne!(redefined.settings(), config(&["--profile", "rtx-16gb"]).settings(), "{key}: the file's profile replaces the built-in one");
+        let args = args(&["--config", "c.yaml"]);
+        let auto = resolve_on(&args, no_env, &files, &|| profile::Card::blackwell(15 << 30)).map(expect_config).unwrap();
+        assert_eq!(auto.basis.sources().profile_name, "rtx-16gb", "{key}");
+        assert_eq!(auto.settings(), redefined.settings(), "{key}: auto picks the redefinition");
+    }
+}
+
+/// A file defining both names is refused at start, naming both.
+#[test]
+fn a_file_defining_both_16gb_names_is_refused() {
+    let files = MemFiles::with(&[("c.yaml", "profiles:
+  rtx-16gb:
+    vram:
+      headroom_bytes: 2G
+  rtx50-16gb:
+    vram:
+      headroom_bytes: 3G
+")]);
+    let err = with_files(&["--config", "c.yaml"], no_env, &files).unwrap_err().0;
+    assert!(err.contains("`rtx-16gb`") && err.contains("`rtx50-16gb`"), "{err}");
 }

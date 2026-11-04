@@ -28,7 +28,7 @@ counts as unset.
 Choose a profile with `--profile <name>`, `IGNIS_PROFILE`, or `profile:` in the
 config file. With none of them the profile is `auto`: the start reads the
 card's total memory from NVML and takes the built-in profile of its class,
-`rtx50-16gb` under 20 GiB, `rtx5090` from 28 to 40 GiB, `rtxpro6000` from 88
+`rtx-16gb` under 20 GiB, `rtx5090` from 28 to 40 GiB, `rtxpro6000` from 88
 to 104 GiB. The log line `ignis.config.source` names the profile chosen and
 the total it was chosen by. To skip the layer entirely and run on the hardcoded
 defaults, name `none`. A name that is not defined is refused with the list of
@@ -49,7 +49,7 @@ in force came from, `profile` included.
 ## The built-in profiles
 
 `rtx5090` and `rtxpro6000` carry numbers measured on the card they name,
-with the finding for each choice linked below; `rtx50-16gb` is derived from
+with the finding for each choice linked below; `rtx-16gb` is derived from
 them, since no 16 GB card exists in the project.
 
 ### `rtx5090`
@@ -140,7 +140,7 @@ Why each:
 - **No pinned hot set.** The profile leaves `vram.pinned_expert_bytes` at its
   default, 0.
 
-### `rtx50-16gb`
+### `rtx-16gb`
 
 The 16 GB class: the RTX 5060 Ti 16 GB, 5070 Ti and 5080. It serves the 27B
 from the catalog's 16 GB entry, `qwen3.8-27b-16g`; the profile names no

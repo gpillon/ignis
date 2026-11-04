@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::config::cli::default_text;
 use crate::config::field::{FieldMeta, FAMILIES};
-use crate::config::profile::{built_in, AUTO_PROFILE, DEFAULT_PROFILE, NONE_PROFILE};
+use crate::config::profile::{built_in, CardClass, AUTO_PROFILE, DEFAULT_PROFILE, LEGACY_16GB_PROFILE, NONE_PROFILE};
 use crate::config::schema::GROUPS;
 use crate::download::catalog::Catalog;
 use crate::metrics::{LoadReservations, LocateFound, Metrics, Primitive, TokenizeRoute};
@@ -135,7 +135,9 @@ pub fn profiles() -> String {
          is `{DEFAULT_PROFILE}`, and `{AUTO_PROFILE}` takes the built-in profile of the card's class, \
          read from its total memory; `--profile {NONE_PROFILE}` skips the layer. A config file's \
          `profiles:` section defines more, or shadows these \
-         ([Profiles and defaults](../concepts/profiles.md)).\n"
+         ([Profiles and defaults](../concepts/profiles.md)). `{LEGACY_16GB_PROFILE}` is the former \
+         name of `{}` and is still accepted everywhere a profile is named, as the same profile.\n",
+        CardClass::Gb16.profile()
     );
     for (name, layer) in built_in() {
         let _ = writeln!(out, "## {name}\n");

@@ -112,7 +112,7 @@ never reused for it.
 
 Measured on one RTX 5090 against Swift's own BF16: `swift-1.5-27b` as the 27B
 is served (eight lanes, a 2,048-token prefill chunk, DFlash2 with 7 draft
-tokens), `swift-1.5-27b-16g` held to a 16 GB card's budget (`rtx50-16gb`,
+tokens), `swift-1.5-27b-16g` held to a 16 GB card's budget (`rtx-16gb`,
 17,179,869,184 bytes, 262,144 tokens of context, two lanes, a 1,024-token
 chunk, vision off). The KLD limits are 1.2 times what the 27B's artifact of
 the same card class scores against the base's BF16 (0.04916 and 0.04034),

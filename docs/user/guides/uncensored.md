@@ -68,7 +68,7 @@ How it was made:
   under one 16 GB artifact is never reused by the other.
 
 Its three gates were registered before the run and measured on an RTX 5090 held
-to a 16 GB card's budget (`rtx50-16gb`, 262,144 tokens of context, two lanes,
+to a 16 GB card's budget (`rtx-16gb`, 262,144 tokens of context, two lanes,
 vision off). All three pass:
 
 | Gate | The 16 GB abliterated artifact | Against | Pass if |

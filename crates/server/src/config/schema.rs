@@ -334,7 +334,10 @@ config_group! {
             [Visible, Patchable, ReloadRequired, Scoped];
         /// The 27B's prompt attention precision (GitHub #335): `fp8` (the
         /// default, the band pass in 8 bits) or `fp16` (the FP16-accumulate
-        /// fallback). Flash-Next's attention is QSA and has no such pass.
+        /// fallback). Flash-Next's attention is QSA and has no such pass. On a
+        /// card below compute capability 12.0 left to its default, or to a
+        /// profile's `fp8`, it reads `fp16`, the band the load runs, its
+        /// origin the card; a named `fp8` is refused (GitHub #477).
         prefill_attention: PrefillAttentionKind = PrefillAttention::default(), Validator::OneOf(&PrefillAttention::NAMES), QWEN38_ONLY,
             [Visible, Patchable, ReloadRequired];
         /// How the 27B holds its nine BF16 exception tensors on the device
