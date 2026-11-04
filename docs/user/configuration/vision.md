@@ -7,8 +7,8 @@ sidebar:
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--vision-enabled` | `IGNIS_VISION_ENABLED` | off; on under the `rtx5090`, `rtxpro6000` and `rtx50-16gb` profiles (`--vision-enabled false` turns it off) | Load the vision tower and reserve its workspace. Without it every `image_url` part is refused with `vision_disabled`, whatever the artifact holds. |
-| `--vision-max-tokens <n>` | `IGNIS_VISION_MAX_TOKENS` | `32768` with `--vision-enabled` (`4096` under the `rtx50-16gb` profile) | Merged vision tokens per request, 1..1,048,576. An image whose natural size is past the cap is downscaled to fit (aspect ratio kept, one token = 32 x 32 pixels), not refused, unless its aspect ratio is too extreme for the cap (a side cannot go below 32 pixels); the request log reports both sizes, `media.vision_tokens` (admitted) and `media.natural_vision_tokens` ([telemetry](../guides/telemetry.md)). Several images whose total is past the cap are still refused with `media_budget_exceeded`. |
+| `--vision-enabled` | `IGNIS_VISION_ENABLED` | off; on under the `rtx5090`, `rtxpro6000` and `rtx-16gb` profiles (`--vision-enabled false` turns it off) | Load the vision tower and reserve its workspace. Without it every `image_url` part is refused with `vision_disabled`, whatever the artifact holds. |
+| `--vision-max-tokens <n>` | `IGNIS_VISION_MAX_TOKENS` | `32768` with `--vision-enabled` (`4096` under the `rtx-16gb` profile) | Merged vision tokens per request, 1..1,048,576. An image whose natural size is past the cap is downscaled to fit (aspect ratio kept, one token = 32 x 32 pixels), not refused, unless its aspect ratio is too extreme for the cap (a side cannot go below 32 pixels); the request log reports both sizes, `media.vision_tokens` (admitted) and `media.natural_vision_tokens` ([telemetry](../guides/telemetry.md)). Several images whose total is past the cap are still refused with `media_budget_exceeded`. |
 | `--vision-embedding-pool-mib <n>` | `IGNIS_VISION_EMBEDDING_POOL_MIB` | one envelope-wide embedding | Encoded images kept for reuse across requests, 1..65536, counted where `--vision-residency` puts the pool ([below](#where-the-vision-tower-and-the-embedding-pool-live)). |
 | `--vision-residency <host\|device>` | `IGNIS_VISION_RESIDENCY` | `host`; `device` under `rtxpro6000` | Needs `--vision-enabled`. Where the vision tower's weights and the embedding pool live: `device` in VRAM, `host` in pinned host RAM, the weights copied to the GPU for each image ([below](#where-the-vision-tower-and-the-embedding-pool-live)). Read at load: a change takes effect at the next one. |
 | `--media-cache-mib <n>` | `IGNIS_MEDIA_CACHE_MIB` | `1024` with `--vision-enabled` | Prepared images kept for reuse; `0` disables, max 65536. |
@@ -38,7 +38,7 @@ a vision load keeps both:
   `weights_bytes` leaves the tower out, its `media_embedding_bytes` is 0, and
   its `workspace_bytes` grows by the slots (75 MB) only where the image
   encoder, not the prefill chunk, sets the scratch's size. Under the
-  `rtx50-16gb` profile at a 1,024- or 4,096-token envelope it does not grow,
+  `rtx-16gb` profile at a 1,024- or 4,096-token envelope it does not grow,
   and a vision load keeps the KV pool of a text-only one. An encode takes a few
   milliseconds more: about 7 ms on a 1,024-token image (49 ms against 42 under
   `device`) on a PCIe Gen 3 host under Windows, and nothing measurable on a
