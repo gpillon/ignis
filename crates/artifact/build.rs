@@ -104,10 +104,14 @@ fn main() {
         let script = kernel_dir.join("build.ps1");
         let mut c = Command::new("powershell");
         c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script.to_str().unwrap()]);
+        // Only the two archives the link below uses, not the CTest
+        // executables under kernel/tests/ (GitHub #460).
+        c.arg("-ArchivesOnly");
         c
     } else {
         let mut c = Command::new("bash");
         c.arg(kernel_dir.join("build.sh"));
+        c.arg("--archives-only");
         c
     };
     let script_name = if windows { "kernel/build.ps1" } else { "kernel/build.sh" };
