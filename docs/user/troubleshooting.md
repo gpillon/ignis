@@ -13,7 +13,7 @@ count, differs from run to run. Error bodies on `/v1` are OpenAI's
 
 ## Starting
 
-### `this build's kernels run on compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell), built for 120a; the card is … (8.9), which they were not built for`
+### `this build's kernels run on compute capability 12.0 (RTX 50, RTX PRO), built for 120a; the card is … (8.9), which they were not built for`
 
 The card is not one the build's kernels were compiled for. The full message
 names the card as NVML does and its compute capability, here an RTX 40 card at
@@ -34,7 +34,7 @@ cards are expected to work, and reports are welcome. On a machine with more
 than one card, ignis uses CUDA device 0; when that is the other card,
 `CUDA_VISIBLE_DEVICES` names the supported one.
 
-### `… needs kernels this build compiles for 120a alone, which run on compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell); the card is … (8.6)`
+### `… needs kernels this build compiles for 120a alone, which run on compute capability 12.0 (RTX 50, RTX PRO); the card is … (8.6)`
 
 Only a build for older cards than Blackwell says it
 ([Other card architectures](contributing/building.md#other-card-architectures)),
