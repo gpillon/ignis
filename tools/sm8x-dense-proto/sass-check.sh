@@ -1,12 +1,12 @@
 #!/bin/sh
-# PROTOTYPE (sm8x dense prefill, phase 2a; GitHub #474), throwaway: the seed of the spec's SASS
+# PROTOTYPE (sm8x dense prefill, phases 2a and 2c; GitHub #474), throwaway: the seed of the spec's SASS
 # check. Dumps the SASS of one architecture's cubins in the dense bench and holds its new kernels
-# (every function whose name holds sm8x_dense_: the decode, the A8 quantization, the GEMM) to the MMA
-# forms a GeForce card runs at full rate:
+# (every function whose name holds sm8x_dense_: the decode, the A8 quantization and phase 2c's shared
+# A8, the GEMM and phase 2c's persistent GEMM) to the MMA forms a GeForce card runs at full rate:
 #   - FAIL on any HMMA with an F32 accumulator, any BF16, TF32 or FP8/FP6/FP4 form, and any
 #     QMMA, OMMA or warpgroup/tensor-memory MMA;
-#   - FAIL unless every GEMM instantiation holds IMMA, and unless the decode, A8 and GEMM kernels
-#     are all in the dump;
+#   - FAIL unless every GEMM instantiation holds IMMA, and unless the decode, A8, shared A8, GEMM and
+#     persistent GEMM kernels are all in the dump;
 #   - an HMMA with an F16 accumulator is allowed by the rule but reported (none is expected).
 # Prints each new kernel's MMA opcodes with their counts. The bench's meters (the register-loop
 # peaks, the reference) and today's fused kernel are other functions and are not held to it.
@@ -34,7 +34,7 @@ fi
 "$CUOBJDUMP" -sass -arch "$ARCH" "$BIN" | awk -v arch="$ARCH" -v pat="${SASS_CHECK_PATTERN:-sm8x_dense_}" '
 function pretty(fn,   name, args, rest) {
   name = fn
-  if (match(name, /sm8x_dense_[a-z0-9]+/) || match(name, /[a-z0-9_]*_kernel/)) {
+  if (match(name, /sm8x_dense_[a-z0-9_]+/) || match(name, /[a-z0-9_]*_kernel/)) {
     rest = substr(name, RSTART + RLENGTH)
     name = substr(name, RSTART, RLENGTH)
   } else {
@@ -60,7 +60,7 @@ fn ~ pat {
 }
 END {
   fail = 0
-  kinds["decode"] = 0; kinds["a8"] = 0; kinds["gemm"] = 0
+  kinds["decode"] = 0; kinds["a8"] = 0; kinds["a8_shared"] = 0; kinds["gemm"] = 0; kinds["gemm_persistent"] = 0
   for (f in seen) {
     p = pretty(f)
     for (k in kinds) if (p ~ ("^sm8x_dense_" k)) kinds[k]++
@@ -77,7 +77,7 @@ END {
       }
     }
     if (p ~ /^sm8x_dense_gemm/ && imma == 0) { printf("FAIL %s: no IMMA\n", p); fail = 1 }
-    printf("%s %-28s%s\n", arch, p, shown == "" ? " (no MMA)" : shown)
+    printf("%s %-36s%s\n", arch, p, shown == "" ? " (no MMA)" : shown)
   }
   for (k in kinds) if (kinds[k] == 0) { printf("FAIL: no sm8x_dense_%s kernel in the %s dump\n", k, arch); fail = 1 }
   if (fail) { print "sass-check " arch ": FAIL"; exit 1 }
