@@ -23,7 +23,7 @@ not.
 | `/v1/realtime?intent=transcription` | GET | A live transcription session over a WebSocket, OpenAI's Realtime transcription subset ([Live transcription](realtime-transcription.md)). Served on the CPU through a model switch. |
 | `/v1/config` | GET, PATCH | The running configuration, and a change to it ([configuration](../configuration/index.md)). |
 | `/v1/config/fields` | GET | What each visible configuration field is: kind, default, rule, families, whether a change reloads. |
-| `/v1/config/origins` | GET | Where each visible value in force comes from, shared and per model family: default, profile, file, env, flag or live. |
+| `/v1/config/origins` | GET | Where each visible value in force comes from, shared and per model family: default, profile, card, file, env, flag or live. |
 | `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
 | `/v1/responses` | POST | The OpenAI Responses API, streaming (`stream: true`, SSE) and non-streaming ([The Responses API](responses.md)). |
 | `/v1/responses` | GET | Its WebSocket mode: the upgrade, then `response.create` events ([The Responses API](responses.md)). |

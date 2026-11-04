@@ -182,7 +182,9 @@ a change is live, needs a reload, or can only be made at start — the same
 declarations as `ignis-server help --fields --format json`, minus the fields
 `GET /v1/config` hides. `GET /v1/config/origins` says where each value in force
 comes from, for the shared value and for each model family: the default, the
-profile, the file, an env var, a flag or a live change, whether it was set for
-that family itself, and the flag, env var, file key or profile that set it.
+profile, the card, the file, an env var, a flag or a live change, whether it
+was set for that family itself, and the flag, env var, file key or profile
+that set it, or the card that decided it (the prompt attention's FP16 band on
+a card below compute capability 12.0).
 A family's own value in the file or from a live change is the one a group
 change does not reach and a `null` removes.
