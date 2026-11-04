@@ -1613,7 +1613,6 @@ int main(int argc, char **argv) {
     std::vector<ChunkTotals> chunks(tokens.size());
     for (size_t i = 0; i < tokens.size(); ++i) speed(tokens[i], r, s1, chunks[i]);
     std::printf("\n== overlap: the next matrix's decode on a second stream (us per layer) ==\n");
-    std::vector<double> ovl_chunk(tokens.size());
     for (size_t i = 0; i < tokens.size(); ++i) {
       OverlapTimes g, q;
       overlap(tokens[i], r, s1, s2, hi, lo, &g, &q);
@@ -1622,18 +1621,17 @@ int main(int argc, char **argv) {
       std::printf("        GQA + MLP layer %.1f serial, %.1f naive (%.3fx), %.1f co-resident (%.3fx)\n", q.serial, q.naive,
                   q.serial / q.naive, q.coresident, q.serial / q.coresident);
       const double ser = 48 * g.serial + 16 * q.serial;
-      const double best = std::min(48 * g.naive + 16 * q.naive, 48 * g.coresident + 16 * q.coresident);
-      std::printf("        48 GDN + 16 GQA layers at K 3 (k, v at K 4): %.2f ms serial, %.2f ms naive, %.2f ms co-resident\n",
-                  ser / 1e3, (48 * g.naive + 16 * q.naive) / 1e3, (48 * g.coresident + 16 * q.coresident) / 1e3);
-      ovl_chunk[i] = std::min(1.0, best / ser);
+      const double naive = 48 * g.naive + 16 * q.naive, cores = 48 * g.coresident + 16 * q.coresident;
+      std::printf("        48 GDN + 16 GQA layers at K 3 (k, v at K 4): %.2f ms serial, %.2f naive (%.3fx), %.2f co-resident (%.3fx)\n",
+                  ser / 1e3, naive / 1e3, ser / naive, cores / 1e3, ser / cores);
     }
-    std::printf("\n== projection: the body's prefill GEMMs per prompt (ms) ==\n");
+    std::printf("\n== projection: the body's prefill GEMMs per prompt, decode + A8 + GEMM on one stream (ms) ==\n");
     for (size_t i = 0; i < tokens.size(); ++i) {
       for (const int prompt : {8192, 65536}) {
         const double n = static_cast<double>(prompt) / tokens[i];
-        std::printf("T = %d, %6d tokens: %4.0f chunks; dense %8.1f (best overlap %8.1f), fused %8.1f, fused / dense %.2f\n", tokens[i],
-                    prompt, n, n * chunks[i].total() / 1e3, n * chunks[i].total() * ovl_chunk[i] / 1e3, n * chunks[i].fused / 1e3,
-                    chunks[i].fused / chunks[i].total());
+        std::printf("T = %d, %6d tokens: %4.0f chunks; dense %8.1f (decode %7.1f, A8 %7.1f, GEMM %8.1f), fused %8.1f; fused / dense %.2f\n",
+                    tokens[i], prompt, n, n * chunks[i].total() / 1e3, n * chunks[i].decode / 1e3, n * chunks[i].a8 / 1e3,
+                    n * chunks[i].gemm / 1e3, n * chunks[i].fused / 1e3, chunks[i].fused / chunks[i].total());
       }
     }
   }
