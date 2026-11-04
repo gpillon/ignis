@@ -1,0 +1,29 @@
+diff --git a/reference/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h b/vendor/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h
+index 34ed6b9..d38fb70 100644
+--- a/reference/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h
++++ b/vendor/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h
+@@ -93,4 +93,24 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
+                                                 const Tensor& A_log, const Tensor& dt_bias,
+                                                 Tensor& g, Tensor& beta, cudaStream_t stream);
+ 
++// Ignis portability patch (ADR 0077, GitHub #478): the cooperative MMA kernels the planner keeps
++// resident, one per launched specialization family.
++enum class Bf16GdnGatingCooperativeKernel {
++    Mma27Split8,
++    Mma27Split4,
++    Mma27Split2,
++    Norm27Split40,
++    Mma35Split32,
++    Norm35Split32,
++    Mma35Split16,
++    Mma35Split8,
++    Mma35Split4,
++    Mma35Split2,
++};
++
++// CTAs of `kernel` one SM of the current device holds at once: the occupancy query at the block
++// size and dynamic shared memory its launch uses, the minimum over every token variant (and fused
++// token capacity) a launch can pick.
++int bf16_gdn_gating_cooperative_ctas_per_sm(Bf16GdnGatingCooperativeKernel kernel);
++
+ } // namespace ninfer::ops::detail
