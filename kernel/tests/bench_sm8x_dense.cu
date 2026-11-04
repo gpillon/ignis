@@ -689,8 +689,7 @@ __device__ __forceinline__ const int8_t *w_column(const GemmParams &p, int tn) {
 }
 
 // Phase 2a's launch: one CTA per tile (ML: lever D's main loop).
-template <int BM, int kDiag = 0, int ML = 0>
-__global__ void __launch_bounds__(kGemmThreads, 1) sm8x_dense_gemm(const __grid_constant__ GemmParams p) {
+template <int BM, int kDiag, int ML> __device__ __forceinline__ void gemm_one_tile(const GemmParams &p) {
   using C = Cfg<BM>;
   extern __shared__ __align__(128) uint8_t smem[];
   const uint32_t base = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
@@ -704,6 +703,11 @@ __global__ void __launch_bounds__(kGemmThreads, 1) sm8x_dense_gemm(const __grid_
   zero_acc<BM>(acc);
   gemm_mainloop<BM, kDiag, ML>(p, base, w_column(p, tn), row0, 0, p.in / kBK, wm, wn, acc);
   gemm_epilogue<BM>(p, smem, row0, tn, wm, wn, acc);
+}
+
+template <int BM, int kDiag = 0, int ML = 0>
+__global__ void __launch_bounds__(kGemmThreads, 1) sm8x_dense_gemm(const __grid_constant__ GemmParams p) {
+  gemm_one_tile<BM, kDiag, ML>(p);
 }
 
 // ---- sm8x_dense_gemm_persistent (phase 2c, lever B) ------------------------------------------------
@@ -831,6 +835,13 @@ __global__ void __maxnreg__(REGS) sm8x_dense_gemm_persistent(const __grid_consta
   }
 }
 
+// Lever D's grid launch capped at kRegsCoresident, for the co-resident overlap: uncapped, its main
+// loop takes 242 to 248 registers, which leaves no room for a decode CTA beside it.
+template <int BM, int ML>
+__global__ void __maxnreg__(kRegsCoresident) sm8x_dense_gemm_capped(const __grid_constant__ GemmParams p) {
+  gemm_one_tile<BM, 0, ML>(p);
+}
+
 // ---- host side of the route ----------------------------------------------------------------------
 
 struct Dense {
@@ -889,6 +900,8 @@ template <int ML> void prepare_gemm_ml() {
                                   gemm_smem<256, ML>()));
   BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm_persistent<128, kRegsCoresident, ML>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   gemm_smem<128, ML>()));
+  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm_capped<256, ML>, cudaFuncAttributeMaxDynamicSharedMemorySize, gemm_smem<256, ML>()));
+  BENCH_CUDA(cudaFuncSetAttribute(sm8x_dense_gemm_capped<128, ML>, cudaFuncAttributeMaxDynamicSharedMemorySize, gemm_smem<128, ML>()));
 }
 
 void prepare_gemm() {
@@ -913,6 +926,7 @@ struct GemmCall {
   int diag = 0;
   int ldr = 0;  // the raw output's row stride (0: out)
   int ml = 0;   // lever D's main loop: 0 phase 2a's, 1 pipelined over 4 stages, 2 over 3
+  bool cap = false;  // the co-resident overlap's register-capped instantiation (lever D's grid launch)
 };
 
 GemmParams gemm_params(const GemmCall &c) {
@@ -943,6 +957,9 @@ template <int ML> void launch_gemm_ml(const GemmCall &c, const GemmParams &p, cu
   if (c.diag != 0) {
     if (c.diag == 1) sm8x_dense_gemm<256, 1, ML><<<grid, kGemmThreads, gemm_smem<256, ML>(), s>>>(p);
     else sm8x_dense_gemm<256, 2, ML><<<grid, kGemmThreads, gemm_smem<256, ML>(), s>>>(p);
+  } else if (c.cap && ML != 0) {
+    if (c.bm == 256) sm8x_dense_gemm_capped<256, ML><<<grid, kGemmThreads, gemm_smem<256, ML>(), s>>>(p);
+    else sm8x_dense_gemm_capped<128, ML><<<grid, kGemmThreads, gemm_smem<128, ML>(), s>>>(p);
   } else if (c.bm == 256) {
     sm8x_dense_gemm<256, 0, ML><<<grid, kGemmThreads, gemm_smem<256, ML>(), s>>>(p);
   } else {
@@ -1527,6 +1544,7 @@ std::vector<RouteVariant> route_variants(const Lever &cfg) {
   for (const int ml : lever_loops(cfg)) {
     if (!cfg.persistent) {
       v.push_back(RouteVariant{0, 0, false, ml});
+      if (ml != 0) v.push_back(RouteVariant{1, 0, true, ml});
     } else {
       v.push_back(RouteVariant{0, 0, false, ml});
       v.push_back(RouteVariant{1, 1, false, ml});
@@ -1548,6 +1566,7 @@ std::string route_label(const Lever &cfg) {
 void gemm_sched(const Lever &cfg, const RouteVariant &rv, const GemmCall &c0, cudaStream_t s) {
   GemmCall c = c0;
   c.ml = rv.ml;
+  c.cap = rv.cap;
   if (cfg.persistent) {
     launch_gemm_persistent(c, rv.sk, s, rv.cap);
   } else {
@@ -2735,6 +2754,10 @@ int main(int argc, char **argv) {
   kernel_report("sm8x_dense_gemm<256> D 3 stages", reinterpret_cast<const void *>(sm8x_dense_gemm<256, 0, 2>), kGemmThreads, gemm_smem<256, 2>());
   kernel_report("sm8x_dense_gemm<128> D 4 stages", reinterpret_cast<const void *>(sm8x_dense_gemm<128, 0, 1>), kGemmThreads, gemm_smem<128, 1>());
   kernel_report("sm8x_dense_gemm<128> D 3 stages", reinterpret_cast<const void *>(sm8x_dense_gemm<128, 0, 2>), kGemmThreads, gemm_smem<128, 2>());
+  kernel_report("sm8x_dense_gemm_capped<256> D 4 stages", reinterpret_cast<const void *>(sm8x_dense_gemm_capped<256, 1>), kGemmThreads,
+                gemm_smem<256, 1>());
+  kernel_report("sm8x_dense_gemm_capped<256> D 3 stages", reinterpret_cast<const void *>(sm8x_dense_gemm_capped<256, 2>), kGemmThreads,
+                gemm_smem<256, 2>());
   kernel_report("sm8x_dense_gemm_persistent<256> D 4", reinterpret_cast<const void *>(sm8x_dense_gemm_persistent<256, kRegsRoute, 1>),
                 kGemmThreads, gemm_smem<256, 1>());
   kernel_report("sm8x_dense_gemm_persistent<256> D 3", reinterpret_cast<const void *>(sm8x_dense_gemm_persistent<256, kRegsRoute, 2>),
