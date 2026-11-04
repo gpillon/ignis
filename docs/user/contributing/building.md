@@ -37,6 +37,12 @@ A second argument is an alternate build directory (`kernel\build.ps1 build-a`),
 so a parallel workstream can verify new `.cu` files without contending on the
 canonical `kernel/build/`.
 
+Run by hand, the script builds the whole project, the leaf's CTest executables
+included. A `--features cuda` cargo build passes `-ArchivesOnly` (`--archives-only`
+to `build.sh`) and compiles only the two archives it links, `ignis_kernel` and
+`ignis_vendor`, so it skips the tests' share of a cold build. `-Test` builds
+everything and then runs CTest.
+
 ### Other card architectures
 
 `IGNIS_CUDA_ARCHITECTURES` names the architectures the leaf is compiled for,
