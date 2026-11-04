@@ -16,7 +16,7 @@ models:
     revision: v1                       # commit, tag or branch; required
     artifact: acme_ft.ninfer           # the file the server loads
     # kind: speech                     # optional: "speech" or "diarizer" (see below); a text or image model states none
-    card_class: 32                     # optional: the smallest card class it loads on, in GB: 16, 32 or 96
+    card_class: 32                     # optional: the smallest card class it loads on, in GB: 16, 24, 32 or 96
     # family: qwen3.8-27b              # optional: its model family, by the family's own id (see below)
     # aliases: [qwen3.8-27b]           # optional: the ids it answers to on a smaller card: its family's default id, or another entry's of its family
     # license: { id: acme-1.0, url: "https://acme.example/LICENSE" }   # optional: the license its weights are published under (see below)
@@ -32,7 +32,7 @@ the form `<owner>/<name>`, an empty `revision`, an `artifact` not among its
 `files`, no sidecar (the artifact's name plus `.graft.json` or
 `.conversion.json`), a `sha256` that is not 64 lowercase hex digits, a `bytes`
 of 0, a file name that is not a plain name (a path separator, `..`, an
-absolute path), a `card_class` that is not 16, 32 or 96, a `family` that is
+absolute path), a `card_class` that is not 16, 24, 32 or 96, a `family` that is
 not a model family's default id (`qwen3.8-27b`, `qwen3.8-flash-next`,
 `ignis-image-2.1-turbo`, `nemotron-3-diarization`) or that contradicts what
 the entry's id or an alias says, no `family` where one is required (below), or

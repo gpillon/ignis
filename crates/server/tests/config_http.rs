@@ -986,6 +986,52 @@ fn origins_of(origins: &Value, key: &str) -> Vec<(Value, String, bool, Option<St
     .collect()
 }
 
+/// GitHub #480: under `--profile auto` an RTX 3090 (24 GiB, compute
+/// capability 8.6, under a build for it) and a 24 GB Blackwell card (12.0)
+/// start on `rtx-24gb`: `GET /v1/config` shows its 27B values, the measured
+/// 1,048,576-token context among them, and `GET /v1/config/origins` names
+/// the profile as their source. The prompt-attention band is the card's: FP16
+/// on the 3090, FP8 on Blackwell.
+#[tokio::test]
+async fn under_auto_a_24gb_card_runs_rtx_24gb_and_the_config_says_so() {
+    use ignis_server::config::arch::{BuiltArchitectures, ComputeCapability};
+    use ignis_server::config::file::NoFiles;
+    use ignis_server::config::profile::{Card, CardReading};
+    use ignis_server::config::resolve_on;
+
+    let rtx3090 = Card::Read(CardReading {
+        total: 24 << 30,
+        name: "NVIDIA GeForce RTX 3090".to_owned(),
+        capability: ComputeCapability::new(8, 6),
+        built_for: BuiltArchitectures::parse("86;120a").unwrap(),
+    });
+    for (card, band) in [(rtx3090, "fp16"), (Card::blackwell(24 << 30), "fp8")] {
+        let start = match resolve_on(&[], |_| None, &NoFiles, &|| card.clone()).expect("the start resolves") {
+            ConfigOutcome::Config(config) => config,
+            other => panic!("{other:?}"),
+        };
+        let loader = MockLoader::new();
+        let app = family_server(&loader, ModelFamily::Qwen38_27b, start).app();
+        let (status, document) = send(&app, Method::GET, "/v1/config", None).await;
+        assert_eq!(status, StatusCode::OK, "{document}");
+        let qwen = (&document["model"]["qwen38"], &document["spec"]["qwen38"], &document["vram"]["qwen38"]);
+        assert_eq!((&qwen.0["max_context"], &qwen.0["prefill_chunk"]), (&json!(1048576), &json!(2048)), "{band}: {document}");
+        assert_eq!((&qwen.1["backend"], &qwen.1["draft_tokens"]), (&json!("dflash2"), &json!(7)), "{band}: {document}");
+        assert_eq!(qwen.2["headroom_bytes"], "1200M", "{band}: {document}");
+        let vision = &document["vision"]["qwen38"];
+        assert_eq!((&vision["enabled"], &vision["residency"], &vision["max_tokens"]), (&json!(true), &json!("host"), &json!(32768)), "{band}: {document}");
+        assert_eq!(qwen.0["prefill_attention"], band, "{document}");
+
+        let (status, origins) = send(&app, Method::GET, "/v1/config/origins", None).await;
+        assert_eq!(status, StatusCode::OK, "{origins}");
+        let profile = |key: &str| origins_of(&origins, key).into_iter().find(|(scope, ..)| scope == "qwen38").unwrap();
+        for key in ["model.max_context", "model.prefill_chunk", "spec.backend", "spec.draft_tokens", "vram.headroom_bytes"] {
+            assert_eq!(profile(key), (json!("qwen38"), "profile".to_owned(), true, Some("rtx-24gb".to_owned())), "{band}: {key}");
+        }
+        assert_eq!(origins_of(&origins, "vision.residency")[0], (Value::Null, "profile".to_owned(), false, Some("rtx-24gb".to_owned())), "{band}");
+    }
+}
+
 /// Spec playground/05 AC 28: every visible field once per scope — `null`,
 /// then each family that takes it — with the source of the value that
 /// resolves there, whether it was set for that family, and where, spelled

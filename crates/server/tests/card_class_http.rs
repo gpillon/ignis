@@ -13,7 +13,9 @@
 //! another entry's id of the same family (ADR 0074): the uncensored variant's
 //! 16 GB build, also built in (GitHub #423), answers to
 //! `qwen3.8-27b-abliterated` on a 16 GB card, and Swift 1.5's (GitHub #473)
-//! to `swift-1.5-27b`.
+//! to `swift-1.5-27b`. A 24 GB card (GitHub #480), an RTX 3090 or RTX 4090,
+//! is below every 32 GB entry and above every 16 GB one, so there the 16 GB
+//! entries answer as on a 16 GB card.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -174,12 +176,25 @@ async fn until_serving(app: &axum::Router) -> Value {
     panic!("`GET /v1/models` never reported serving");
 }
 
-/// A refusal naming the entry's class and the card's.
+/// A refusal naming the entry's class and the card's, a 16 GB one.
 fn refused_by_class(status: StatusCode, body: &Value, model: &str) {
+    refused_on(status, body, model, CardClass::Gb16);
+}
+
+/// A refusal naming the entry's class, 32 GB, and the card's, `card`.
+fn refused_on(status: StatusCode, body: &Value, model: &str, card: CardClass) {
     assert_eq!(status, StatusCode::CONFLICT, "{model}: {body}");
     assert_eq!(body["error"]["code"], "model_above_card_class", "{body}");
     let message = body["error"]["message"].as_str().unwrap();
-    assert!(message.contains(model) && message.contains("32 GB") && message.contains("16 GB"), "{message}");
+    assert!(message.contains(model) && message.contains("32 GB") && message.contains(&format!("the {card} class")), "{message}");
+}
+
+/// The total memory of an RTX 3090 or an RTX 4090, as NVML reports it.
+const RTX_3090_TOTAL: u64 = 24 << 30;
+
+/// The class of a card of [`RTX_3090_TOTAL`]: the 24 GB one (GitHub #480).
+fn twenty_four() -> Option<CardClass> {
+    CardClass::of_total(RTX_3090_TOTAL)
 }
 
 /// The server still serves `loaded`, nothing was prepared or loaded, and a
@@ -756,4 +771,61 @@ async fn on_a_16gb_card_the_model_lists_name_the_build_that_serves_swift() {
     assert_eq!((row(SWIFT_16G)["available"].as_bool(), row(SWIFT_16G)["switchable"].as_bool()), (Some(true), Some(true)), "{catalog}");
     assert_eq!((row(SWIFT)["available"].as_bool(), row(SWIFT)["switchable"].as_bool()), (Some(false), Some(false)), "{catalog}");
     assert!(row(SWIFT)["reason"].as_str().unwrap().contains(&format!("served by {SWIFT_16G}")), "{catalog}");
+}
+
+/// GitHub #480: on a 24 GB card, an RTX 3090 or RTX 4090, a switch to
+/// Flash-Next or to the image model, explicit or a request's, is refused
+/// `409 model_above_card_class` before anything stops, naming the entry's
+/// class and the card's, and the loaded model serves on.
+#[tokio::test]
+async fn on_a_24gb_card_a_switch_to_flash_next_or_the_image_model_is_refused_before_anything_stops() {
+    assert_eq!(twenty_four(), Some(CardClass::Gb24));
+    let loader = MockLoader::new();
+    let server = server_on(&loader, SIXTEEN, twenty_four(), "24-refused");
+    let app = server.app();
+    for model in [FLASH_NEXT, IMAGE] {
+        let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": model }))).await;
+        refused_on(status, &refused, model, CardClass::Gb24);
+    }
+    let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(FLASH_NEXT))).await;
+    refused_on(status, &refused, FLASH_NEXT, CardClass::Gb24);
+    let (status, refused) = send(&app, Method::POST, "/v1/images/generations", Some(json!({ "model": IMAGE, "prompt": "a fox", "size": "1024x1024" }))).await;
+    refused_on(status, &refused, IMAGE, CardClass::Gb24);
+    still_serving(&app, &server, &loader, SIXTEEN).await;
+}
+
+/// GitHub #480: on a 24 GB card no built-in entry states the card's class, so
+/// a request naming `qwen3.8-27b` is served by the 16 GB entry through its
+/// alias, with no switch when it is loaded, and a switch by the id goes to it;
+/// `qwen3.8-27b-abliterated` switches to its 16 GB build. The lists mark the
+/// 32 GB entries unavailable, naming the entry that serves each id here.
+#[tokio::test]
+async fn on_a_24gb_card_the_default_id_is_served_by_the_16gb_entry() {
+    let loader = MockLoader::new();
+    let server = server_on(&loader, SIXTEEN, twenty_four(), "24-alias");
+    let app = server.app();
+    let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(DEFAULT_27B))).await;
+    assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(SIXTEEN)), "{completion}");
+    assert!(loader.loads().is_empty(), "served by the loaded 16 GB entry, no switch: {:?}", loader.loads());
+
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    let entry = |id: &str| models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == id).cloned().unwrap();
+    for (id, served_by) in [(DEFAULT_27B, SIXTEEN), (ABLITERATED, ABLITERATED_16G), (SWIFT, SWIFT_16G)] {
+        assert_eq!(entry(id)["available"], false, "{models}");
+        let reason = entry(id)["reason"].as_str().unwrap().to_owned();
+        for said in [id, "32 GB", "24 GB", &format!("served by {served_by}")] {
+            assert!(reason.contains(said), "{said}: {reason}");
+        }
+    }
+    for id in [SIXTEEN, ABLITERATED_16G, SWIFT_16G] {
+        assert_eq!((entry(id)["available"].as_bool(), entry(id).get("reason")), (Some(true), None), "{models}");
+    }
+
+    let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
+    assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(ABLITERATED_16G)), "{completion}");
+    assert_eq!(loader.prepared_artifacts(), [artifact_of(&server, ABLITERATED_16G)], "the 16 GB build's artifact, not the 32 GB entry's");
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": DEFAULT_27B }))).await;
+    assert_eq!((status, accepted["to"].as_str()), (StatusCode::ACCEPTED, Some(SIXTEEN)), "{accepted}");
+    assert_eq!(until_serving(&app).await["data"][0]["id"], SIXTEEN);
+    assert_eq!(loader.loads(), [ABLITERATED_16G, SIXTEEN]);
 }

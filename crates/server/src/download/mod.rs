@@ -422,7 +422,8 @@ mod tests {
     /// disk and serves it under that entry's own id, its artifact and id over
     /// the start options, as a switch to it would serve it. On a 32 GB card
     /// the options are the start's own; so are they on the placeholder path,
-    /// which loads no artifact.
+    /// which loads no artifact. A 24 GB card (GitHub #480), whose class no
+    /// built-in entry states, starts the 16 GB entry the same way.
     #[test]
     fn a_start_the_card_class_fitted_serves_the_answering_entry_under_its_own_id() {
         use crate::config::profile::CardClass;
@@ -440,6 +441,13 @@ mod tests {
         assert_eq!((serving.model.as_str(), serving.artifact.as_deref()), ("qwen3.8-27b-16g", Some(dir.join("qwen3_8_27b_trellis_sc30-v2.ninfer").as_path())));
         let placeholder = served_start_options(options.clone(), &served, None, &catalog, card, &|_| panic!("no artifact, no header"));
         assert_eq!(placeholder.unwrap(), options, "a placeholder start loads nothing");
+
+        let options = start_config_on(24 << 30);
+        assert_eq!((options.basis.sources().profile_name.as_str(), options.card_class()), ("rtx-24gb", Some(CardClass::Gb24)));
+        let served = start_model(&catalog, &options.model, options.card_class()).unwrap();
+        assert_eq!(served, "qwen3.8-27b-16g");
+        let serving = served_start_options(options.clone(), &served, Some(&path), &catalog, options.card_class(), &|_| Some(ModelFamily::Qwen38_27b)).unwrap();
+        assert_eq!((serving.model.as_str(), serving.artifact.as_deref()), ("qwen3.8-27b-16g", Some(path.as_path())));
 
         let options = start_config_on(crate::config::profile::RTX_5090_TOTAL_BYTES);
         let served = start_model(&catalog, &options.model, options.card_class()).unwrap();
