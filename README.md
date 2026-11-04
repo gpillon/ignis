@@ -92,7 +92,7 @@ non-commercial use only.
 The 27B also fits a **16 GB card** (RTX 5060 Ti 16 GB, 5070 Ti, 5080), from a
 second artifact: its body re-encoded in a trellis code at about 3 bits per
 weight, 12.5 GiB on disk, with the same DFlash2 drafter. On such a card the
-server picks the `rtx50-16gb` profile and that artifact by itself, 262,144
+server picks the `rtx-16gb` profile and that artifact by itself, 262,144
 tokens of context on two lanes, and the artifact passed four pre-registered
 quality gates against the NVFP4 it stands in for: its KL divergence from BF16
 is 0.77-0.82x the NVFP4's. It has not run on a 16 GB card yet. On the 5090 held
@@ -130,7 +130,7 @@ speculative decoding and image input; the Prometheus
 metrics the Playground's Monitor reads are on by default. A bare `ignis-server`
 already gets DFlash2 and image input from the built-in `rtx5090` profile, with
 an 896K context (YaRN x3.5). On a 16 GB card, run a bare `ignis-server`
-instead: it takes the `rtx50-16gb` profile and offers to fetch the 27B's
+instead: it takes the `rtx-16gb` profile and offers to fetch the 27B's
 16 GB artifact, while the flags above ask for a longer context than that card's KV
 pool holds. Flash-Next is `--model-id
 qwen3.8-flash-next`; the flags `make` serves it with are on its
@@ -463,7 +463,7 @@ guide's [Why ignis](https://gpillon.github.io/ignis/why-ignis/) section.
   kernels of ignis's own, beside the NVFP4 artifact's token embedding and
   DFlash2 drafter: **12.5 GiB on disk** against 18.1 GiB.
 - **Chosen by the card.** Under `--profile auto` a card under 20 GiB takes
-  `rtx50-16gb` (262,144 tokens of context, two lanes, DFlash2 with 7 drafts,
+  `rtx-16gb` (262,144 tokens of context, two lanes, DFlash2 with 7 drafts,
   no image input), and the default id `qwen3.8-27b` resolves to the 16 GB
   entry. On a 5090 held to a 16 GiB budget the load fits with nothing
   adapted, and at 15 GiB too; at 13 GiB it lowers its context to 65,536
@@ -507,7 +507,7 @@ guide's [Why ignis](https://gpillon.github.io/ignis/why-ignis/) section.
 - **One declaration per setting**: every option is a flag, an `IGNIS_*`
   variable and a key in a YAML or JSON config file, with per-model values and
   a built-in profile chosen by the card's memory by default (`--profile auto`:
-  the measured `rtx5090`, `rtxpro6000` for the 96 GB card and the derived `rtx50-16gb` for the 16 GB cards); `GET`/`PATCH /v1/config`
+  the measured `rtx5090`, `rtxpro6000` for the 96 GB card and the derived `rtx-16gb` for the 16 GB cards); `GET`/`PATCH /v1/config`
   reads and changes the running server, reloading the model only for a field
   that needs it.
 - **`POST /v1/tokenize`** counts a chat body's prompt exactly as it would be

@@ -13,9 +13,9 @@ editUrl: false
 Generated from the code by `make docs-reference` (`crates/server/src/user_docs.rs`); an edit here is overwritten, and `cargo test` fails while this page and the code disagree.
 :::
 
-A profile is a layer of defaults for one kind of card, between the config file and the built-in defaults: any flag, env var or file value still wins over it. An unset `--profile` is `auto`, and `auto` takes the built-in profile of the card's class, read from its total memory; `--profile none` skips the layer. A config file's `profiles:` section defines more, or shadows these ([Profiles and defaults](../concepts/profiles.md)).
+A profile is a layer of defaults for one kind of card, between the config file and the built-in defaults: any flag, env var or file value still wins over it. An unset `--profile` is `auto`, and `auto` takes the built-in profile of the card's class, read from its total memory; `--profile none` skips the layer. A config file's `profiles:` section defines more, or shadows these ([Profiles and defaults](../concepts/profiles.md)). `rtx50-16gb` is the former name of `rtx-16gb` and is still accepted everywhere a profile is named, as the same profile.
 
-## rtx50-16gb
+## rtx-16gb
 
 | Field | Model | Value |
 |---|---|---|

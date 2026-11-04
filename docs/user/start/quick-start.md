@@ -80,7 +80,7 @@ after the `Retry-After` seconds. Other messages are in
   Playground's Monitor reads the same data at `/ui/metrics` on port 8000
   ([Install](install.md#the-container-image) shows how to scrape it from
   outside).
-- The default profile is `auto`: the start picks `rtx50-16gb`, `rtx5090` or
+- The default profile is `auto`: the start picks `rtx-16gb`, `rtx5090` or
   `rtxpro6000` by the card's memory ([Profiles and defaults](../concepts/profiles.md)).
 - The model unloads after 300 s without a request and loads again on the next
   one ([Idle unload](../api/idle-unload.md)).

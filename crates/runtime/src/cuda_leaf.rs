@@ -1150,7 +1150,7 @@ mod tests {
 
     #[test]
     fn the_capture_is_complete_at_the_loads_lanes_not_at_eight() {
-        // GitHub #339: `rtx50-16gb` loads 2 lanes and captures widths 1..=2;
+        // GitHub #339: `rtx-16gb` loads 2 lanes and captures widths 1..=2;
         // 2 ready of 2 warned "not all widths ready" against a literal 8.
         assert!(capture_complete(2, 2));
         assert!(capture_complete(8, 8));

@@ -25,7 +25,7 @@ The same page answers the other things you might ask it:
 
 ## Test a 16 GB card
 
-The `rtx50-16gb` profile has never run on a real 16 GB card. With an RTX 5060
+The `rtx-16gb` profile has never run on a real 16 GB card. With an RTX 5060
 Ti 16 GB, a 5070 Ti or a 5080, your agent can install ignis, test it and
 write a report for [issue #360](https://github.com/gpillon/ignis/issues/360):
 
