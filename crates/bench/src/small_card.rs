@@ -1102,13 +1102,13 @@ ignis_speculative_position_accepted_total{position=\"1\"} 90\n";
 
     fn origins_doc() -> Value {
         json!({ "object": "list", "data": [
-            { "key": "model.max_context", "scope": null, "source": "profile", "scoped": false, "spelling": "rtx50-16gb" },
-            { "key": "model.max_context", "scope": "qwen38", "source": "profile", "scoped": true, "spelling": "rtx50-16gb" },
+            { "key": "model.max_context", "scope": null, "source": "profile", "scoped": false, "spelling": "rtx-16gb" },
+            { "key": "model.max_context", "scope": "qwen38", "source": "profile", "scoped": true, "spelling": "rtx-16gb" },
             { "key": "model.prefill_chunk", "scope": null, "source": "file", "scoped": false,
               "spelling": "model.prefill_chunk in C:/Users/someone/ignis.yaml" },
             { "key": "vram.budget_bytes", "scope": null, "source": "env", "scoped": false, "spelling": "IGNIS_VRAM_BUDGET_BYTES" },
             { "key": "spec.decode_lanes", "scope": null, "source": "default", "scoped": false },
-            { "key": "model.rope_scaling", "scope": "qwen38", "source": "profile", "scoped": true, "spelling": "rtx50-16gb" },
+            { "key": "model.rope_scaling", "scope": "qwen38", "source": "profile", "scoped": true, "spelling": "rtx-16gb" },
         ]})
     }
 
@@ -1117,7 +1117,7 @@ ignis_speculative_position_accepted_total{position=\"1\"} 90\n";
         let view = config_view(&config_doc(), Some(&origins_doc()), "qwen38");
         assert_eq!(view["model.max_context"].value, json!(262144));
         assert_eq!(view["model.max_context"].source.as_deref(), Some("profile"));
-        assert_eq!(view["model.max_context"].spelling.as_deref(), Some("rtx50-16gb"));
+        assert_eq!(view["model.max_context"].spelling.as_deref(), Some("rtx-16gb"));
         // the family's section beats the group's value
         assert_eq!(view["model.rope_scaling"].value, json!("none"));
         assert_eq!(view["vram.budget_bytes"].source.as_deref(), Some("env"));
@@ -1148,7 +1148,7 @@ ignis_speculative_position_accepted_total{position=\"1\"} 90\n";
 
     #[test]
     fn the_profile_is_the_spelling_of_a_profile_sourced_value() {
-        assert_eq!(profile_name(&origins_doc()).as_deref(), Some("rtx50-16gb"));
+        assert_eq!(profile_name(&origins_doc()).as_deref(), Some("rtx-16gb"));
         assert_eq!(profile_name(&json!({ "data": [{ "key": "a.b", "source": "default" }] })), None);
     }
 

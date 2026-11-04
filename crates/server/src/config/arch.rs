@@ -78,12 +78,24 @@ impl GpuGeneration {
         Self::ALL.into_iter().find(|generation| generation.as_str() == name)
     }
 
-    /// The cards of the generation, as a refusal names them.
+    /// The cards of the generation, as a refusal names them: the one
+    /// wording every refusal on a card takes, by generation or by compute
+    /// capability ([`BuiltArchitectures::describe`]).
     pub fn cards(self) -> &'static str {
         match self {
             Self::Ampere => "RTX 30",
             Self::Ada => "RTX 40",
             Self::Blackwell => "RTX 50, RTX PRO",
+        }
+    }
+
+    /// The compute capability of the generation's RTX cards ([`Self::cards`]):
+    /// 8.6, 8.9, 12.0.
+    pub const fn capability(self) -> ComputeCapability {
+        match self {
+            Self::Ampere => ComputeCapability::new(8, 6),
+            Self::Ada => ComputeCapability::new(8, 9),
+            Self::Blackwell => ComputeCapability::new(12, 0),
         }
     }
 }
@@ -196,9 +208,9 @@ impl BuiltArchitectures {
         self.sm120a().any(|arch| arch.runs_on(capability))
     }
 
-    /// The capabilities the kernels run on, with the cards that have them:
-    /// "12.0 (RTX 50, RTX PRO 6000 Blackwell)", "8.6 and up within 8.x (RTX
-    /// 30, RTX 40) and 12.0 (…)".
+    /// The capabilities the kernels run on, with the cards that have them
+    /// ([`GpuGeneration::cards`]): "12.0 (RTX 50, RTX PRO)", "8.6 and up
+    /// within 8.x (RTX 30, RTX 40) and 12.0 (…)".
     pub fn describe(&self) -> String {
         let described: Vec<String> = self
             .0
@@ -210,7 +222,7 @@ impl BuiltArchitectures {
                     format!("{} and up within {}.x", arch.capability, arch.capability.major)
                 };
                 let cards: Vec<&str> =
-                    KNOWN_SERIES.iter().filter(|(capability, _)| arch.runs_on(*capability)).map(|(_, series)| *series).collect();
+                    GpuGeneration::ALL.iter().filter(|generation| arch.runs_on(generation.capability())).map(|generation| generation.cards()).collect();
                 if cards.is_empty() { span } else { format!("{span} ({})", cards.join(", ")) }
             })
             .collect();
@@ -228,13 +240,6 @@ impl fmt::Display for BuiltArchitectures {
 /// The guide's account of the cards ignis runs on, where a refusal on a card
 /// sends the reader.
 const WHAT_IT_RUNS_ON: &str = "https://gpillon.github.io/ignis/start/#what-it-runs-on";
-
-/// The card series a refusal names beside a capability, by architecture.
-const KNOWN_SERIES: [(ComputeCapability, &str); 3] = [
-    (ComputeCapability::new(8, 6), "RTX 30"),
-    (ComputeCapability::new(8, 9), "RTX 40"),
-    (ComputeCapability::new(12, 0), "RTX 50, RTX PRO 6000 Blackwell"),
-];
 
 /// The refusal of a start on a card of `capability` named `name` that the
 /// build's kernels do not run on; `None` when they do. A start on such a card
@@ -305,10 +310,13 @@ pub fn refuse(card: Option<&CardReading>, route: Sm120aRoute) -> Option<String> 
         return None;
     }
     let set: Vec<String> = card.built_for.sm120a().map(Architecture::to_string).collect();
+    let blackwell = GpuGeneration::Blackwell;
     Some(format!(
-        "{} needs kernels this build compiles for {} alone, which run on compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell); the card is {} ({}){}: see {WHAT_IT_RUNS_ON}",
+        "{} needs kernels this build compiles for {} alone, which run on compute capability {} ({}); the card is {} ({}){}: see {WHAT_IT_RUNS_ON}",
         route.what(),
         set.join(";"),
+        blackwell.capability(),
+        blackwell.cards(),
         card.name,
         card.capability,
         route.instead()
@@ -404,8 +412,11 @@ mod tests {
         }
         assert!(Ampere < Ada && Ada < Blackwell);
         assert_eq!(GpuGeneration::ALL, [Ampere, Ada, Blackwell]);
-        for (generation, name, said, cards) in [(Ampere, "ampere", "Ampere", "RTX 30"), (Ada, "ada", "Ada", "RTX 40"), (Blackwell, "blackwell", "Blackwell", "RTX 50, RTX PRO")] {
-            assert_eq!((generation.as_str(), generation.to_string(), generation.cards()), (name, said.to_owned(), cards));
+        for (generation, name, said, cards, capability) in
+            [(Ampere, "ampere", "Ampere", "RTX 30", cc(8, 6)), (Ada, "ada", "Ada", "RTX 40", cc(8, 9)), (Blackwell, "blackwell", "Blackwell", "RTX 50, RTX PRO", cc(12, 0))]
+        {
+            assert_eq!((generation.as_str(), generation.to_string(), generation.cards(), generation.capability()), (name, said.to_owned(), cards, capability));
+            assert_eq!(GpuGeneration::of(capability), Some(generation));
             assert_eq!(GpuGeneration::from_name(name), Some(generation));
         }
         for other in ["Blackwell", "turing", "", " ada", "12"] {
@@ -455,7 +466,7 @@ mod tests {
         let built = BuiltArchitectures::default_build();
         let refusal = uncovered("NVIDIA GeForce RTX 4080", cc(8, 9), &built).unwrap();
         assert!(refusal.contains("NVIDIA GeForce RTX 4080 (8.9)"), "{refusal}");
-        assert!(refusal.contains("compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell)"), "{refusal}");
+        assert!(refusal.contains("compute capability 12.0 (RTX 50, RTX PRO), built for 120a;"), "{refusal}");
         assert!(refusal.contains("built for 120a;"), "{refusal}");
         assert!(refusal.ends_with("see https://gpillon.github.io/ignis/start/#what-it-runs-on"), "{refusal}");
         assert!(!refusal.contains("#456"), "{refusal}");
@@ -463,7 +474,7 @@ mod tests {
         let ampere = BuiltArchitectures::parse("86;120a").unwrap();
         assert_eq!(uncovered("NVIDIA GeForce RTX 3090", cc(8, 6), &ampere), None);
         let turing = uncovered("NVIDIA GeForce RTX 2080 Ti", cc(7, 5), &ampere).unwrap();
-        assert!(turing.contains("8.6 and up within 8.x (RTX 30, RTX 40) and 12.0 (RTX 50"), "{turing}");
+        assert!(turing.contains("8.6 and up within 8.x (RTX 30, RTX 40) and 12.0 (RTX 50, RTX PRO), built for 86;120a;"), "{turing}");
     }
 
     fn card(name: &str, capability: ComputeCapability, built_for: &str) -> CardReading {
@@ -531,6 +542,7 @@ mod tests {
         let ampere = ampere();
         let image = load_refusal(Some(&ampere), ModelFamily::QwenImage21, never, false).unwrap();
         assert!(image.starts_with("the image model") && image.contains("NVIDIA GeForce RTX 3090 (8.6)") && image.contains("120a alone"), "{image}");
+        assert!(image.contains("which run on compute capability 12.0 (RTX 50, RTX PRO); the card is"), "{image}");
         let nvfp4 = load_refusal(Some(&ampere), ModelFamily::Qwen38_27b, || true, false).unwrap();
         assert!(nvfp4.contains("W4A4") && nvfp4.contains("--model-id qwen3.8-27b-16g"), "{nvfp4}");
         assert_eq!(load_refusal(Some(&ampere), ModelFamily::Qwen38_27b, || false, false), None, "the trellis artifact loads");

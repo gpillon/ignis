@@ -416,7 +416,7 @@ pub async fn run(command: ModelCommand, out: &mut dyn Write, progress: Arc<dyn F
         ModelCommand::List { catalog, dir, format, card } => {
             let family_of = |path: &Path| crate::loader::artifact_family(path).ok().flatten();
             let rows = list_rows(&catalog, &dir, &file_size, &family_of);
-            let unavailable = |id: &str| catalog.unavailable(id, card.as_ref());
+            let unavailable = |id: &str| catalog.unavailable(id, card.as_ref()).map(|unavailable| unavailable.to_string());
             let _ = out.write_all(render_list(&rows, format, &unavailable).as_bytes());
             0
         }
@@ -480,19 +480,9 @@ pub async fn run(command: ModelCommand, out: &mut dyn Write, progress: Arc<dyn F
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::arch::ComputeCapability;
+    use crate::config::profile::testing::{on, rtx_3090};
     use crate::config::profile::CardClass;
     use std::collections::BTreeMap;
-
-    /// A Blackwell card (compute capability 12.0) of `class`.
-    fn on(class: CardClass) -> CardReading {
-        CardReading::of(u64::from(class.gb()) << 30, "NVIDIA RTX (Blackwell)", ComputeCapability::new(12, 0))
-    }
-
-    /// An RTX 3090: 24 GiB, compute capability 8.6, Ampere.
-    fn rtx_3090() -> CardReading {
-        CardReading::of(24 << 30, "NVIDIA GeForce RTX 3090", ComputeCapability::new(8, 6))
-    }
 
     /// A directory listing as a size probe.
     fn sizes(files: &[(&str, u64)]) -> impl Fn(&Path) -> Option<u64> {
@@ -761,7 +751,7 @@ mod tests {
         let catalog = Catalog::built_in();
         let rows = list_rows(catalog, Path::new("m"), &|_| None, &|_| None);
         let card = rtx_3090();
-        let unavailable = |id: &str| catalog.unavailable(id, Some(&card));
+        let unavailable = |id: &str| catalog.unavailable(id, Some(&card)).map(|unavailable| unavailable.to_string());
         let text = render_list(&rows, ListFormat::Text, &unavailable);
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].contains("AVAILABLE") && lines[0].ends_with("LICENSE"), "{text}");
@@ -785,7 +775,7 @@ mod tests {
         assert!(row("qwen3.8-flash-next")["reason"].as_str().unwrap().contains("Blackwell generation"));
         assert_eq!((row("qwen3.8-27b-16g")["available"].clone(), row("qwen3.8-27b-16g").get("reason")), (Value::Bool(true), None));
 
-        let none: Vec<Value> = serde_json::from_str(&render_list(&rows, ListFormat::Json, &|id| catalog.unavailable(id, None))).unwrap();
+        let none: Vec<Value> = serde_json::from_str(&render_list(&rows, ListFormat::Json, &|id| catalog.unavailable(id, None).map(|unavailable| unavailable.to_string()))).unwrap();
         assert!(none.iter().all(|row| row["available"] == true && row.get("reason").is_none()));
     }
 }

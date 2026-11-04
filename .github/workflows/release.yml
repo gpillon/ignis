@@ -39,7 +39,7 @@
 # mk/cuda-build-check.sh on it first. v0.9.0 and v0.9.1 shipped the CPU mock
 # under a release name, and nothing here noticed (GitHub #408). The same check
 # refuses any packaged binary that carries no machine code for 8.6, or none
-# for 12.0 (#482).
+# for 12.0, whatever list the build was given (#482).
 
 name: release
 
@@ -83,6 +83,13 @@ env:
   # CUDA_ARCHITECTURES. A build from a checkout leaves it unset: `120a` alone.
   # The sm_120a cubins are the same bytes as a `120a`-only build's.
   IGNIS_CUDA_ARCHITECTURES: "86;120a"
+  # What the release requires of every binary it packages, whatever the list
+  # above (spec #474, #482): machine code for 8.6 and for 12.0. It is written
+  # apart from that list and passed to mk/cuda-build-check.sh as --require, so
+  # an edit that drops an architecture from the builds is refused, not checked
+  # against itself. The Windows check reads it from here, the Linux one from
+  # the Containerfile's CUDA_REQUIRED_ARCHITECTURES.
+  IGNIS_CUDA_REQUIRED_ARCHITECTURES: "86;120a"
 
 jobs:
   # The version the artifacts are named after. On a tag it must be the version
@@ -293,6 +300,7 @@ jobs:
           build-args: |
             KERNEL_BUILD_JOBS=3
             CUDA_ARCHITECTURES=${{ env.IGNIS_CUDA_ARCHITECTURES }}
+            CUDA_REQUIRED_ARCHITECTURES=${{ env.IGNIS_CUDA_REQUIRED_ARCHITECTURES }}
 
       # Same context, same build args, same `build` stage -- everything up to
       # the final COPY is already in this builder's local cache, so this step
@@ -320,6 +328,7 @@ jobs:
           build-args: |
             KERNEL_BUILD_JOBS=3
             CUDA_ARCHITECTURES=${{ env.IGNIS_CUDA_ARCHITECTURES }}
+            CUDA_REQUIRED_ARCHITECTURES=${{ env.IGNIS_CUDA_REQUIRED_ARCHITECTURES }}
 
       - name: Image published
         if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
@@ -494,9 +503,9 @@ jobs:
           cp target/x86_64-pc-windows-msvc/release/ignis-artifact-inspect.exe "$name"/
           # A server that would fall back to the CPU mock is not packaged
           # (GitHub #408), nor a binary without machine code for every entry
-          # of IGNIS_CUDA_ARCHITECTURES (#482); the Linux build runs the same
-          # check in the Containerfile.
-          bash mk/cuda-build-check.sh "$name"/ignis-server.exe "$name"/ignis-bench.exe "$name"/ignis-artifact-inspect.exe
+          # of IGNIS_CUDA_ARCHITECTURES and of the release's requirement
+          # (#482); the Linux build runs the same check in the Containerfile.
+          bash mk/cuda-build-check.sh --require "$IGNIS_CUDA_REQUIRED_ARCHITECTURES" "$name"/ignis-server.exe "$name"/ignis-bench.exe "$name"/ignis-artifact-inspect.exe
           # Apache-2.0 asks that a redistribution carry LICENSE and NOTICE;
           # kernel/NOTICE is the vendored ops' own provenance (ADR 0010).
           cp LICENSE NOTICE README.md "$name"/

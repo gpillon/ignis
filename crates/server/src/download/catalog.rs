@@ -33,7 +33,7 @@ use std::sync::LazyLock;
 use ignis_core::compute::{ModelFamily, ModelKind};
 use serde_json::{Map, Value};
 
-use crate::config::arch::{ComputeCapability, GpuGeneration};
+use crate::config::arch::GpuGeneration;
 use crate::config::file::{Files, Format};
 use crate::config::profile::{CardClass, CardReading};
 
@@ -228,15 +228,10 @@ impl CatalogEntry {
     /// generation newer than the card's, or both. `None` when it fits both:
     /// an axis the entry states nothing on, or the card has nothing known of
     /// (a total of no class, a capability of no generation), refuses nothing.
-    pub fn above(&self, card: &CardReading) -> Option<CardRefusal> {
+    pub fn refusal_on(&self, card: &CardReading) -> Option<CardRefusal> {
         let class = self.card_class.zip(card.class()).filter(|(needs, class)| needs > class).map(|(needs, class)| ClassGap { needs, card: class });
-        let generation = self.generation.zip(card.generation()).filter(|(needs, generation)| needs > generation).map(|(needs, generation)| GenerationGap {
-            needs,
-            card: generation,
-            name: card.name.clone(),
-            capability: card.capability,
-        });
-        (class.is_some() || generation.is_some()).then(|| CardRefusal { model: self.id.clone(), class, generation, other_family: None })
+        let generation = self.generation.zip(card.generation()).filter(|(needs, generation)| needs > generation).map(|(needs, generation)| GenerationGap { needs, card: generation });
+        (class.is_some() || generation.is_some()).then(|| CardRefusal { model: self.id.clone(), card: card.clone(), class, generation, other_family: None })
     }
 }
 
@@ -277,7 +272,7 @@ impl Catalog {
     }
 
     /// The entry `id` itself does not load on `card` (ADR 0064 §1, §3, ADR
-    /// 0079): its refusal ([`CatalogEntry::above`]), naming what the entry
+    /// 0079): its refusal ([`CatalogEntry::refusal_on`]), naming what the entry
     /// needs and the card. `None` when it fits, no card was read (`None`: a
     /// build with no CUDA, NVML unread by a `model` verb, the CPU tests), or
     /// no entry has the id: an operator's own model is not the catalog's to
@@ -289,30 +284,30 @@ impl Catalog {
     /// models and the engine match them — not case-insensitively as
     /// [`Catalog::entry`] does for the `model` command line, whose callers
     /// take the entry's own id first.
-    pub fn above_card(&self, id: &str, card: Option<&CardReading>) -> Option<CardRefusal> {
+    pub fn refusal_on(&self, id: &str, card: Option<&CardReading>) -> Option<CardRefusal> {
         let card = card?;
-        self.entries.iter().find(|entry| entry.id == id)?.above(card)
+        self.entries.iter().find(|entry| entry.id == id)?.refusal_on(card)
     }
 
     /// The card-aware step (ADR 0064 §2-3, ADR 0079, spec 27b-16gb/04 §6)
     /// every adapter takes — the start, a switch, a request, a download, the
     /// model lists: which entry answers to `requested` on `card` in its place.
     /// `Ok(None)` when `requested` stands as it is — its own entry is not
-    /// [`Catalog::above_card`]; `Ok(Some(entry))` when its own entry is, and
+    /// [`Catalog::refusal_on`]; `Ok(Some(entry))` when its own entry is, and
     /// `entry`, of its family, lists it as an alias and fits the card's class
     /// and generation both; refused, naming what the requested entry needs and
     /// the card, when no entry that answers to it fits. Matched exactly, as
-    /// [`Catalog::above_card`] matches. The family is the one the catalog
+    /// [`Catalog::refusal_on`] matches. The family is the one the catalog
     /// tells of `requested`'s entry ([`CatalogEntry::family()`]): its id's,
     /// or the one it states (ADR 0074) — an entry of no family the catalog
     /// tells has none to answer to it.
     pub fn answering(&self, requested: &str, card: Option<&CardReading>) -> Result<Option<&CatalogEntry>, CardRefusal> {
-        let Some(refusal) = self.above_card(requested, card) else {
+        let Some(refusal) = self.refusal_on(requested, card) else {
             return Ok(None);
         };
         let family = self.family_of(requested);
         let answering = self.entries.iter().find(|entry| {
-            card.and_then(|card| entry.above(card)).is_none()
+            card.and_then(|card| entry.refusal_on(card)).is_none()
                 && family.is_some()
                 && entry.family() == family
                 && entry.aliases.iter().any(|alias| alias == requested)
@@ -326,13 +321,11 @@ impl Catalog {
     /// ([`Catalog::answering`]). `None` for an entry that loads, an id no
     /// entry has, or no card read. The server's lists say the same, with the
     /// answering entry's artifact checked too
-    /// ([`crate::model_switch::Switcher::unavailable_reason`]).
-    pub fn unavailable(&self, id: &str, card: Option<&CardReading>) -> Option<String> {
-        let refusal = self.above_card(id, card)?;
-        Some(match self.answering(id, card) {
-            Ok(Some(serving)) => format!("{refusal}; a request naming it is served by {}", serving.id),
-            _ => refusal.to_string(),
-        })
+    /// ([`crate::model_switch::Switcher::unavailable`]).
+    pub fn unavailable(&self, id: &str, card: Option<&CardReading>) -> Option<Unavailable> {
+        let refusal = self.refusal_on(id, card)?;
+        let served_by = self.answering(id, card).ok().flatten().map(|serving| serving.id.clone());
+        Some(Unavailable { refusal, served_by })
     }
 
     /// The family the catalog tells of the entry whose id is exactly `id`
@@ -352,7 +345,7 @@ impl Catalog {
     /// no family is refused too, the safe side. `Ok` when no alias is in
     /// play: `requested`'s own entry loads on the card.
     pub fn alias_holds(&self, requested: &str, entry: &CatalogEntry, header: Option<ModelFamily>, card: Option<&CardReading>) -> Result<(), CardRefusal> {
-        let Some(mut refusal) = self.above_card(requested, card) else {
+        let Some(mut refusal) = self.refusal_on(requested, card) else {
             return Ok(());
         };
         let alias_family = self.family_of(requested);
@@ -371,6 +364,9 @@ impl Catalog {
 pub struct CardRefusal {
     /// The entry's id: the one requested.
     pub model: String,
+    /// The card it is refused on, as the start read it: a refusal by
+    /// generation names it by its name and compute capability.
+    pub card: CardReading,
     /// The entry's class and the card's, when the class refuses it.
     pub class: Option<ClassGap>,
     /// The entry's generation and the card's, when the generation refuses it.
@@ -404,18 +400,13 @@ pub struct ClassGap {
     pub card: CardClass,
 }
 
-/// An entry's generation newer than the card's, with what a refusal names of
-/// the card.
+/// An entry's generation newer than the card's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationGap {
     /// The entry's `generation`.
     pub needs: GpuGeneration,
     /// The card's generation.
     pub card: GpuGeneration,
-    /// The card's name, as NVML reports it.
-    pub name: String,
-    /// The card's compute capability.
-    pub capability: ComputeCapability,
 }
 
 /// An entry that would answer to an alias but holds an artifact of another
@@ -442,7 +433,7 @@ impl std::fmt::Display for CardRefusal {
         if let Some(generation) = &self.generation {
             needs.push(format!("a card of the {} generation ({}) or newer (its catalog entry's generation)", generation.needs, generation.needs.cards()));
             is.push(format!("of the {} generation", generation.card));
-            card = format!(", {} (compute capability {}),", generation.name, generation.capability);
+            card = format!(", {} (compute capability {}),", self.card.name, self.card.capability);
         }
         if let Some(class) = &self.class {
             needs.push(format!("a {} card or larger (its catalog entry's card_class)", class.needs));
@@ -463,6 +454,36 @@ impl std::fmt::Display for CardRefusal {
 }
 
 impl std::error::Error for CardRefusal {}
+
+/// Why a catalog entry is not available on the card, as the model lists say
+/// it (ADR 0064 §3, ADR 0079): the refusal a switch to it or a download of
+/// it answers, and the entry that serves a request naming it here, when one
+/// answers to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unavailable {
+    /// The refusal: the entry's own, or the one an alias whose entry holds
+    /// another family's artifact gives ([`Catalog::alias_holds`]).
+    pub refusal: CardRefusal,
+    /// The id of the entry a request naming it is served by on this card.
+    pub served_by: Option<String>,
+}
+
+impl Unavailable {
+    /// The code its refusal answers ([`CardRefusal::code`]).
+    pub fn code(&self) -> &'static str {
+        self.refusal.code()
+    }
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.refusal)?;
+        match &self.served_by {
+            Some(id) => write!(f, "; a request naming it is served by {id}"),
+            None => Ok(()),
+        }
+    }
+}
 
 /// A catalog that cannot be used: unreadable, malformed, or naming an entry
 /// it may not. Refuses the start, and every `model` subcommand.
@@ -931,6 +952,7 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{sixteen_over_thirty_two, thirty_two, SIXTEEN};
     use super::*;
+    use crate::config::profile::testing::{on, reading, rtx_3090, rtx_4090, rtx_5090};
 
     /// The spec's table, written out again: what the built-in catalog must
     /// hold, value for value (`id`, `repo`, `revision`, `artifact`, its
@@ -1172,22 +1194,6 @@ mod tests {
 
     fn operator(text: &str) -> Result<Catalog, CatalogError> {
         parse_operator(text, Format::Yaml, "acme.catalog.yaml")
-    }
-
-    /// A Blackwell card (compute capability 12.0) of `class`: the card the
-    /// class rule's tests are written for, whose generation every entry fits.
-    fn on(class: CardClass) -> CardReading {
-        CardReading::of(u64::from(class.gb()) << 30, "NVIDIA RTX (Blackwell)", ComputeCapability::new(12, 0))
-    }
-
-    /// The cards spec #474 is written for, by total memory and compute
-    /// capability: an RTX 3090 (Ampere) and an RTX 4090 (Ada), both 24 GiB.
-    fn rtx_3090() -> CardReading {
-        CardReading::of(24 << 30, "NVIDIA GeForce RTX 3090", ComputeCapability::new(8, 6))
-    }
-
-    fn rtx_4090() -> CardReading {
-        CardReading::of(24 << 30, "NVIDIA GeForce RTX 4090", ComputeCapability::new(8, 9))
     }
 
     /// AC 1: the built-in catalog is the data file, it parses under every
@@ -1609,10 +1615,10 @@ mod tests {
         let catalog = operator(&OPERATOR.replacen("card_class: 32", "card_class: 24", 1)).expect("24 is a card class");
         let id = "acme-qwen3.8-27b-ft";
         assert_eq!(catalog.entry(id).unwrap().card_class, Some(Gb24));
-        let refusal = catalog.above_card(id, Some(&on(Gb16))).expect("above a 16 GB card");
+        let refusal = catalog.refusal_on(id, Some(&on(Gb16))).expect("above a 16 GB card");
         assert!(refusal.to_string().contains("needs a 24 GB card or larger"), "{refusal}");
         for card in [Gb24, Gb32, Gb96] {
-            assert_eq!(catalog.above_card(id, Some(&on(card))), None, "{card}");
+            assert_eq!(catalog.refusal_on(id, Some(&on(card))), None, "{card}");
         }
     }
 
@@ -1627,7 +1633,7 @@ mod tests {
         let acme = catalog.entry("acme-qwen3.8-27b-ft").unwrap();
         assert_eq!(acme.card_class, None);
         for card in [Some(&on(Gb16)), Some(&on(Gb32)), None] {
-            assert_eq!(catalog.above_card(&acme.id, card), None, "{card:?}");
+            assert_eq!(catalog.refusal_on(&acme.id, card), None, "{card:?}");
             assert_eq!(resolved(&catalog, &acme.id, card), Ok(acme.id.as_str()), "{card:?}");
         }
         let classless = sixteen_over_thirty_two(&SIXTEEN.replacen("    card_class: 16\n", "", 1)).unwrap();
@@ -1689,7 +1695,7 @@ mod tests {
         use CardClass::*;
         let catalog = Catalog::built_in();
         for (id, card) in [("qwen3.8-27b", Gb32), ("qwen3.8-27b", Gb96), ("qwen3.8-flash-next", Gb32), ("ignis-image-2.1-turbo", Gb96), ("qwen3.8-27b-16g", Gb16), ("qwen3.8-27b-16g", Gb32), ("qwen3.8-27b-abliterated", Gb32), ("qwen3.8-27b-abliterated-16g", Gb16), ("swift-1.5-27b", Gb32), ("swift-1.5-27b", Gb96), ("swift-1.5-27b-16g", Gb16), ("swift-1.5-27b-16g", Gb32), ("qwen3.8-27b-16g", Gb24), ("qwen3.8-27b-abliterated-16g", Gb24), ("swift-1.5-27b-16g", Gb24)] {
-            assert_eq!(catalog.above_card(id, Some(&on(card))), None, "{id} on {card}");
+            assert_eq!(catalog.refusal_on(id, Some(&on(card))), None, "{id} on {card}");
             assert_eq!(catalog.answering(id, Some(&on(card))), Ok(None), "{id} on {card}: it stands as it is");
         }
     }
@@ -1706,7 +1712,7 @@ mod tests {
         for card in [CardClass::Gb16, CardClass::Gb24] {
             for (id, answering) in [("qwen3.8-27b", "qwen3.8-27b-16g"), ("qwen3.8-27b-abliterated", "qwen3.8-27b-abliterated-16g"), ("swift-1.5-27b", "swift-1.5-27b-16g")] {
                 assert_eq!(resolved(&catalog, id, Some(&on(card))), Ok(answering), "{card}");
-                assert!(catalog.above_card(id, Some(&on(card))).is_some(), "{id}: its own entry is still above the {card} class");
+                assert!(catalog.refusal_on(id, Some(&on(card))).is_some(), "{id}: its own entry is still above the {card} class");
             }
         }
     }
@@ -1718,9 +1724,11 @@ mod tests {
     fn an_id_above_the_card_class_with_no_entry_answering_to_it_is_refused_naming_both_classes() {
         let err = resolved(&thirty_two(), "qwen3.8-27b", Some(&on(CardClass::Gb16))).unwrap_err();
         assert!(err.contains("qwen3.8-27b") && err.contains("32 GB") && err.contains("16 GB"), "{err}");
-        let refusal = CardRefusal { model: "ignis-image-2.1-turbo".to_owned(), class: Some(ClassGap { needs: CardClass::Gb32, card: CardClass::Gb16 }), generation: None, other_family: None };
-        assert_eq!(Catalog::built_in().answering("ignis-image-2.1-turbo", Some(&on(CardClass::Gb16))), Err(refusal.clone()));
-        assert_eq!(Catalog::built_in().above_card("ignis-image-2.1-turbo", Some(&on(CardClass::Gb16))), Some(refusal));
+        let said = "ignis-image-2.1-turbo needs a 32 GB card or larger (its catalog entry's card_class), and this card is of the 16 GB class";
+        let refused = |refusal: CardRefusal| (refusal.code(), refusal.to_string());
+        let card = on(CardClass::Gb16);
+        assert_eq!(Catalog::built_in().answering("ignis-image-2.1-turbo", Some(&card)).map_err(refused), Err(("model_above_card_class", said.to_owned())));
+        assert_eq!(Catalog::built_in().refusal_on("ignis-image-2.1-turbo", Some(&card)).map(refused), Some(("model_above_card_class", said.to_owned())));
     }
 
     /// ADR 0064 §2 on the artifact: the entry that answers to an alias must
@@ -1824,19 +1832,20 @@ mod tests {
         let id = "acme-qwen3.8-27b-ft";
         let none = operator(OPERATOR).expect("a catalog written before `generation` loads");
         assert_eq!(none.entry(id).unwrap().generation, None);
-        for card in [rtx_3090(), rtx_4090(), on(CardClass::Gb32)] {
-            assert_eq!(none.above_card(id, Some(&card)).and_then(|refusal| refusal.generation), None, "{}", card.name);
+        for (card, code) in [(rtx_3090(), Some("model_above_card_class")), (rtx_4090(), Some("model_above_card_class")), (on(CardClass::Gb32), None)] {
+            assert_eq!(none.refusal_on(id, Some(&card)).map(|refusal| refusal.code()), code, "{}: its class alone", card.name);
         }
 
         let ada = operator(&OPERATOR.replacen("card_class: 32", "card_class: 24\n    generation: ada", 1)).expect("ada is a generation");
         assert_eq!(ada.entry(id).unwrap().generation, Some(GpuGeneration::Ada));
-        let refusal = ada.above_card(id, Some(&rtx_3090())).expect("above an Ampere card");
-        assert_eq!((refusal.code(), refusal.class.clone()), ("model_above_gpu_generation", None));
+        let refusal = ada.refusal_on(id, Some(&rtx_3090())).expect("above an Ampere card");
+        assert_eq!(refusal.code(), "model_above_gpu_generation");
         let said = refusal.to_string();
+        assert!(!said.contains("card_class"), "the 24 GB class fits: {said}");
         assert!(said.starts_with("acme-qwen3.8-27b-ft needs a card of the Ada generation (RTX 40) or newer (its catalog entry's generation)"), "{said}");
         assert!(said.ends_with("this card, NVIDIA GeForce RTX 3090 (compute capability 8.6), is of the Ampere generation"), "{said}");
         for card in [rtx_4090(), on(CardClass::Gb24), on(CardClass::Gb96)] {
-            assert_eq!(ada.above_card(id, Some(&card)), None, "{}", card.name);
+            assert_eq!(ada.refusal_on(id, Some(&card)), None, "{}", card.name);
         }
     }
 
@@ -1859,9 +1868,8 @@ mod tests {
                 assert_eq!(catalog.answering(answering, card), Ok(None), "{answering} on {generation}: it stands as it is");
             }
             for id in ["qwen3.8-27b", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "swift-1.5-27b"] {
-                let refusal = catalog.above_card(id, card).unwrap_or_else(|| panic!("{id} on {generation}"));
+                let refusal = catalog.refusal_on(id, card).unwrap_or_else(|| panic!("{id} on {generation}"));
                 assert_eq!(refusal.code(), "model_above_gpu_generation", "{id}");
-                assert_eq!(refusal.class, Some(ClassGap { needs: CardClass::Gb32, card: CardClass::Gb24 }), "{id}: both, named both");
                 let said = refusal.to_string();
                 let card_said = format!("this card, {} (compute capability {capability}), is of the {generation} generation and of the 24 GB class", card.unwrap().name);
                 for named in [id, "needs a card of the Blackwell generation (RTX 50, RTX PRO) or newer (its catalog entry's generation) and a 32 GB card or larger", &card_said] {
@@ -1872,7 +1880,7 @@ mod tests {
                 assert_eq!(catalog.answering(id, card).map_err(|refusal| refusal.code()), Err("model_above_gpu_generation"), "{id} on {generation}");
             }
             let alone = catalog.answering("swift-1.5-27b-16g", card).unwrap_err();
-            assert_eq!((alone.code(), alone.class.clone()), ("model_above_gpu_generation", None));
+            assert_eq!(alone.code(), "model_above_gpu_generation");
             assert!(alone.to_string().starts_with("swift-1.5-27b-16g needs a card of the Blackwell generation") && !alone.to_string().contains("card_class"), "{alone}");
         }
     }
@@ -1885,10 +1893,11 @@ mod tests {
     #[test]
     fn on_a_blackwell_card_or_none_nothing_is_refused_by_generation() {
         let catalog = Catalog::built_in();
-        let five_090 = CardReading::of(crate::config::profile::RTX_5090_TOTAL_BYTES, "NVIDIA GeForce RTX 5090", ComputeCapability::new(12, 0));
+        let five_090 = rtx_5090();
         for entry in catalog.entries() {
             for card in [Some(&on(CardClass::Gb24)), Some(&five_090), None] {
-                assert_eq!(catalog.above_card(&entry.id, card).and_then(|refusal| refusal.generation), None, "{} on {card:?}", entry.id);
+                let code = catalog.refusal_on(&entry.id, card).map(|refusal| refusal.code());
+                assert_ne!(code, Some("model_above_gpu_generation"), "{} on {card:?}", entry.id);
             }
             assert_eq!(catalog.answering(&entry.id, Some(&five_090)), Ok(None), "{}", entry.id);
         }
@@ -1902,11 +1911,12 @@ mod tests {
     /// and is never refused by class on a card of no class.
     #[test]
     fn on_an_ada_card_of_no_class_the_alias_serves_the_16gb_entry() {
-        let card = CardReading::of(48 << 30, "NVIDIA RTX (Ada)", ComputeCapability::new(8, 9));
+        let card = reading(48 << 30, "NVIDIA RTX (Ada)", 8, 9);
         assert_eq!((card.class(), card.generation()), (None, Some(GpuGeneration::Ada)));
         let catalog = Catalog::built_in();
-        let refusal = catalog.above_card("qwen3.8-27b", Some(&card)).expect("refused by generation");
-        assert_eq!((refusal.code(), refusal.class.clone()), ("model_above_gpu_generation", None));
+        let refusal = catalog.refusal_on("qwen3.8-27b", Some(&card)).expect("refused by generation");
+        assert_eq!(refusal.code(), "model_above_gpu_generation");
+        assert!(!refusal.to_string().contains("card_class"), "a card of no class refuses nothing by class: {refusal}");
         assert_eq!(resolved(catalog, "qwen3.8-27b", Some(&card)), Ok("qwen3.8-27b-16g"));
         assert_eq!(catalog.answering("qwen3.8-flash-next", Some(&card)).map_err(|refusal| refusal.code()), Err("model_above_gpu_generation"));
     }
@@ -1918,7 +1928,7 @@ mod tests {
         let catalog = Catalog::built_in();
         for id in ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g"] {
             assert_eq!(catalog.answering(id, None), Ok(None), "{id}: the id's own entry, never the one answering to it");
-            assert_eq!(catalog.above_card(id, None), None, "{id}");
+            assert_eq!(catalog.refusal_on(id, None), None, "{id}");
         }
     }
 
@@ -1931,7 +1941,7 @@ mod tests {
         for card in [None, Some(&on(CardClass::Gb16)), Some(&on(CardClass::Gb32))] {
             for id in ["acme-model", "QWEN3.8-27B"] {
                 assert_eq!(catalog.answering(id, card), Ok(None), "{id} {card:?}");
-                assert_eq!(catalog.above_card(id, card), None, "{id} {card:?}");
+                assert_eq!(catalog.refusal_on(id, card), None, "{id} {card:?}");
             }
         }
     }

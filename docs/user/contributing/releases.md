@@ -44,7 +44,8 @@ every artifact runs on RTX 30 and RTX 40 cards as well as on Blackwell
 packages a server that is not a CUDA build: `mk/cuda-build-check.sh` reads the
 binaries and refuses a server that would fall back to the CPU mock, which
 v0.9.0 and v0.9.1 shipped (#408), or any binary that carries no machine code
-for 8.6, or none for 12.0 (#482).
+for 8.6, or none for 12.0, which the workflow requires apart from the list the
+build is given (#482).
 
 ## The sm_86 gate
 
@@ -62,44 +63,91 @@ Any line of output means the gate runs; none means it does not. The gate has
 three parts, and a failure of any of them stops the release.
 
 **Quality.** The method is the
-[first-light finding's](../../findings/2026-11-03-first-light-on-sm86.md), whose
-scripts and reference it names: the 16 windows of 4,096 tokens of #340's gate 1
-(`tools/kld-gate/`), dumped by the `span_logits` example at prefill chunk 1024
-with the `hq-e8-2b` KV format and `IGNIS_MODEL_PREFILL_ATTENTION=fp16` (the
-band a card below compute capability 12.0 runs), and scored against the BF16
-checkpoint's 64 most probable next tokens per position (`kl_top64`,
-`crates/bench/src/flash_next/kld.rs`). The limits come from the RTX 5090's
-figures on the same FP16 band, 0.03825 for the top-64 KLD and 93.42% for top-1:
+[first-light finding's](../../findings/2026-11-03-first-light-on-sm86.md): the
+16 windows of 4,096 tokens of #340's gate 1, dumped by the `span_logits`
+example at prefill chunk 1024 with the `hq-e8-2b` KV format and
+`IGNIS_MODEL_PREFILL_ATTENTION=fp16` (the band a card below compute capability
+12.0 runs), and scored against the BF16 checkpoint's 64 most probable next
+tokens per position (`kl_top64`, `crates/bench/src/flash_next/kld.rs`). That
+reference is a set of about 90 MB, the windows included, which stays out of
+the repo: `tools/kld-gate/ref_top64.py` builds it from the BF16 checkpoint on
+the RTX 5090 ([its README](../../../tools/kld-gate/README.md)), and the
+coordinator carries it to the card. `tools/kld-gate/score_top64.py` scores a
+dump against it. The limits come from the RTX 5090's figures on the same FP16
+band, 0.03825 for the top-64 KLD and 93.42% for top-1, and are read on the
+`all` row of the scorer's table:
 
 | | limit |
 |---|---|
-| top-64 KLD, all windows | at most 0.04016 (1.05 times the 5090's) |
-| top-1 | at least 92.92% (within 0.5 points of the 5090's) |
+| `KLD top64`, all windows | at most 0.04016 (1.05 times the 5090's) |
+| `top-1` | at least 92.92% (within 0.5 points of the 5090's) |
+
+```sh
+# On the sm_86 card, from the release's checkout, the set ref27b-top64/ beside it
+# (tools/kld-gate/README.md) and 32.5 GB free for the dump. ignis-server is the
+# release candidate's; on Linux every cargo command here also needs
+# CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu.
+export IGNIS_CUDA_ARCHITECTURES='86;120a'
+ignis-server model download qwen3.8-27b-16g      # into ./models
+IGNIS_MODEL_PREFILL_ATTENTION=fp16 cargo run --release -p ignis-core --features cuda --example span_logits -- \
+    models/qwen3_8_27b_trellis_sc30-v2.ninfer hq-e8-2b ref27b-top64/windows.json dump-sm86 1024
+python3 tools/kld-gate/score_top64.py ref27b-top64 dump-sm86 --json gate-sm86.json
+```
 
 A change that alters the 5090's numerics records the 5090's new FP16-band
-figures in a finding first, and the limits follow them.
+figures in a finding first, from the same dump and score on the 5090, and the
+limits follow them.
 
-**The leaf's tests.** Build with `IGNIS_CUDA_ARCHITECTURES=86;120a` and run
-`ctest -LE sm120a-only`: every test passes. `ignis_kernel_gdn_gating_proj_tests`
-prints `budget` lines and names with `SKIP` the cooperative schedules the card
-cannot hold resident (#478): skips there are expected, failures are not.
+**The leaf's tests.** Built for `86;120a`, `ctest -LE sm120a-only` passes every
+test. `ignis_kernel_gdn_gating_proj_tests` prints `budget` lines and names with
+`SKIP` the cooperative schedules the card cannot hold resident (#478): skips
+there are expected, failures are not.
+
+```sh
+bash kernel/build.sh            # kernel\build.ps1 on Windows: the whole project, tests included
+ctest --test-dir kernel/build -LE sm120a-only --output-on-failure
+```
 
 **Smoke.** Start the server under `--profile auto` (on a 24 GB card that is
-`rtx-24gb`) with DFlash2 on, and ask for:
+`rtx-24gb`, which turns DFlash2 and vision on), and ask for:
 
 - a greedy chat completion;
 - a small image: the smallest the processor accepts, since it upscales every
   image to its 65,536-pixel floor, which is 256 patches at the vision tower and
-  64 tokens after the merge. The tower's W8 shapes have no small-token route
-  (the SIMT routes serve up to 16 tokens, the merger's up to 4 or 5, and
-  `mma_r64_c128` above), so no image reaches a kernel only an sm_120a build
-  holds;
-- a large image, near the profile's vision item bound (`vision.max_tokens`).
+  64 tokens after the merge (the request's `media.vision_tokens` in the
+  server's log). The tower's W8 shapes have no small-token route (the SIMT
+  routes serve up to 16 tokens, the merger's up to 4 or 5, and `mma_r64_c128`
+  above), so no image reaches a kernel only an sm_120a build holds;
+- a large image, at the processor's item bound: 16,384 tokens, 4096 x 4096
+  pixels at 32 x 32 a merged token, under the profile's `vision.max_tokens`.
 
-Each must be answered correctly.
+```sh
+ignis-server --profile auto      # its ignis.config.source line names rtx-24gb
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d \
+  '{"model":"qwen3.8-27b","temperature":0,"enable_thinking":false,"max_tokens":64,"messages":[{"role":"user","content":"What is the capital of France? One word."}]}'
+# Two solid-colour PNGs: 32 x 32 red, upscaled to the floor; 4096 x 4096 blue, the item bound.
+python3 - <<'EOF'
+import struct, zlib
+def png(path, side, rgb):
+    chunk = lambda kind, data: struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    rows = (b"\0" + bytes(rgb) * side) * side
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+png("small.png", 32, (220, 30, 30))
+png("large.png", 4096, (30, 60, 220))
+EOF
+for image in small large; do
+  printf '{"model":"qwen3.8-27b","temperature":0,"enable_thinking":false,"max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"What colour is this image? One word."},{"type":"image_url","image_url":{"url":"data:image/png;base64,%s"}}]}]}' \
+    "$(base64 -w0 "$image.png")" > "$image.json"
+  curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d "@$image.json"
+done
+```
+
+Each must be answered correctly: `Paris`, red, blue.
 
 The release binary must also carry machine code for 8.6 and 12.0: the release
-check above does that in CI.
+check above does that in CI, whatever list the build was given.
 
 The gate records correctness only: the two KLD and top-1 figures, pass or fail
 for each part, and the small image's patch count. It records no speed and no

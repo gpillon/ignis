@@ -29,6 +29,10 @@ use repo::{catalog_served, files_of, Repo};
 mod routes;
 use routes::{config, files_in, model_download, row, send, until_row, until_status, PATIENT};
 
+#[path = "support/card.rs"]
+mod cards;
+use cards::card;
+
 /// A server on `mock-a`, switching to the catalog `models`, downloading as
 /// `config` says.
 fn server_with(loader: &Arc<MockLoader>, models: CatalogModels, config: &Config) -> Server {
@@ -172,11 +176,6 @@ async fn a_download_is_refused_with_a_reason_and_fetches_nothing() {
     let _ = std::fs::remove_dir_all(built_in_dir);
     assert!(repo.seen().is_empty(), "no refusal reached the endpoint: {:?}", repo.seen());
     let _ = std::fs::remove_dir_all(dir);
-}
-
-/// A card of `gib` GiB named `name`, of compute capability `major.minor`.
-fn card(gib: u64, name: &str, major: u32, minor: u32) -> ignis_server::config::profile::CardReading {
-    ignis_server::config::profile::CardReading::of(gib << 30, name, ignis_server::config::arch::ComputeCapability::new(major, minor))
 }
 
 /// GitHub #378: a download the models folder has no room for — its bytes

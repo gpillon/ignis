@@ -290,6 +290,41 @@ fn the_release_builds_every_artifact_for_86_and_120a() {
     assert!(key.contains("${{ env.IGNIS_CUDA_ARCHITECTURES }}"), "the kernel cache key does not name the list: {key}");
 }
 
+/// The release requires machine code for 8.6 and for 12.0 of every binary it
+/// packages, whatever list its builds were given (spec #474, #482). The
+/// requirement is its own entry of the workflow's environment, never read
+/// from IGNIS_CUDA_ARCHITECTURES: a change to the build's list that drops an
+/// architecture is refused by the check, not checked against itself. Each
+/// host's check is passed it as `--require`, the Windows job from the
+/// workflow's environment, the Linux build inside the Containerfile from a
+/// build argument both docker builds pass, whose empty default leaves a
+/// container build from a checkout checking its own list.
+#[test]
+fn the_release_check_requires_86_and_120a_whatever_the_build_list() {
+    let repo = repo();
+    let workflow = read(&repo.join(".github/workflows/release.yml"));
+    assert!(
+        workflow_env(&workflow).contains(&"  IGNIS_CUDA_REQUIRED_ARCHITECTURES: \"86;120a\""),
+        "release.yml's top-level env no longer sets IGNIS_CUDA_REQUIRED_ARCHITECTURES: \"86;120a\""
+    );
+    let docker_builds = workflow.matches("uses: docker/build-push-action@").count();
+    let passing = workflow.matches("CUDA_REQUIRED_ARCHITECTURES=${{ env.IGNIS_CUDA_REQUIRED_ARCHITECTURES }}").count();
+    assert_eq!(passing, docker_builds, "every docker build in release.yml passes the release's requirement to the Containerfile");
+    let containerfile = read(&repo.join("Containerfile"));
+    assert!(containerfile.lines().any(|line| line == "ARG CUDA_REQUIRED_ARCHITECTURES="), "the Containerfile's requirement has an empty default");
+    for (recipe, text, required) in [
+        (".github/workflows/release.yml", &workflow, "--require \"$IGNIS_CUDA_REQUIRED_ARCHITECTURES\" "),
+        ("Containerfile", &containerfile, "--require \"$CUDA_REQUIRED_ARCHITECTURES\" "),
+    ] {
+        let check = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .find_map(|line| line.split_once("bash mk/cuda-build-check.sh ").map(|(_, rest)| rest))
+            .unwrap_or_else(|| panic!("{recipe} no longer runs mk/cuda-build-check.sh"));
+        assert!(check.starts_with(required), "{recipe}'s check is not passed the release's requirement: {check}");
+    }
+}
+
 /// A build from a checkout is unchanged by the release's list (#482): the
 /// leaf's own default and the Containerfile's stay `120a` alone, no make file
 /// names a list, and the check asks for the leaf's default when none is set.

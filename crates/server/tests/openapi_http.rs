@@ -145,6 +145,11 @@ fn the_server_view_routes_are_documented_with_their_responses() {
         serde_json::json!(["default", "profile", "file", "env", "card", "flag", "live"])
     );
     assert!(document["paths"]["/v1/config/origins"]["get"]["responses"]["501"].is_object());
+    // The operation says what each of the seven is, the card's too (GitHub #477).
+    let described = document["paths"]["/v1/config/origins"]["get"]["description"].as_str().unwrap();
+    for source in ["default", "profile", "card", "file", "env", "flag", "live"] {
+        assert!(described.contains(&format!("`{source}`")), "{source}: {described}");
+    }
     // The switch takes a model alone, and says what a 404 is.
     let switch = &document["paths"]["/v1/models/switch"]["post"];
     assert!(switch["responses"]["404"].is_object());

@@ -388,8 +388,9 @@ pub(crate) struct OriginRow {
     /// value's row.
     scoped: bool,
     /// Where the value was set, as the startup log spells it: the flag, the
-    /// env var, the file key and the file's path, or the profile's name.
-    /// Absent for a default and for a live change.
+    /// env var, the file key and the file's path, the profile's name, or the
+    /// card's name and compute capability. Absent for a default and for a live
+    /// change.
     #[serde(skip_serializing_if = "Option::is_none")]
     spelling: Option<String>,
 }
@@ -442,7 +443,7 @@ fn visible_origins(config: &Config) -> Vec<OriginRow> {
     tag = "config",
     operation_id = "get_config_origins",
     summary = "Where each configuration value comes from",
-    description = "One row per field `GET /v1/config` shows and per scope: `scope: null` for the shared value (the group key), then one row per model family that takes the field (`qwen38`, `qwen38flashnext`). `source` is where the value in force in that scope comes from: `default` (the hardcoded default), `profile` (the hardware profile in use, a default and never an override), `file` (the config file), `env`, `flag`, or `live` (a `PATCH /v1/config` since the server started). `scoped` is true when the value was set for that family itself — a family section of the file or of the profile, a `--<family>-…` flag, an `IGNIS_<FAMILY>_…` env var, a live family value. `spelling` names where, as the startup log does: the flag, the env var, the file key and the file's path, or the profile's name; it is absent for a default and a live change.\n\nThe value each row describes is the one `GET /v1/config` shows in that scope: one resolution decides both. A family's own value from the file or a live change (`scoped`, `source` `file` or `live`) is the operator's: a patched group value does not reach that family, and a `null` in the family's section removes it. A family's value from a profile, a flag or an env var is not removed by a `null`: a patched group value replaces it while the server runs, and a flag or an env var takes it back at the next start (`shadowed_at_restart` says so).\n\nAnswers during a model switch, showing the configuration still running.",
+    description = "One row per field `GET /v1/config` shows and per scope: `scope: null` for the shared value (the group key), then one row per model family that takes the field (`qwen38`, `qwen38flashnext`). `source` is where the value in force in that scope comes from: `default` (the hardcoded default), `profile` (the hardware profile in use, a default and never an override), `card` (the card the start read, which decided a value no one named: the prompt attention's FP16 band on a card below compute capability 12.0), `file` (the config file), `env`, `flag`, or `live` (a `PATCH /v1/config` since the server started). `scoped` is true when the value was set for that family itself — a family section of the file or of the profile, a `--<family>-…` flag, an `IGNIS_<FAMILY>_…` env var, a live family value. `spelling` names where, as the startup log does: the flag, the env var, the file key and the file's path, the profile's name, or the card's name and compute capability; it is absent for a default and a live change.\n\nThe value each row describes is the one `GET /v1/config` shows in that scope: one resolution decides both. A family's own value from the file or a live change (`scoped`, `source` `file` or `live`) is the operator's: a patched group value does not reach that family, and a `null` in the family's section removes it. A family's value from a profile, a flag or an env var is not removed by a `null`: a patched group value replaces it while the server runs, and a flag or an env var takes it back at the next start (`shadowed_at_restart` says so).\n\nAnswers during a model switch, showing the configuration still running.",
     responses(
         (status = 200, description = "Each visible field's origin, shared value first, then each family's.", body = OriginList),
         (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = ApiError),

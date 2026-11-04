@@ -70,6 +70,12 @@ ENV IGNIS_KERNEL_BUILD_JOBS=${KERNEL_BUILD_JOBS}
 ARG CUDA_ARCHITECTURES=
 ENV IGNIS_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
 
+# What the check requires of the binaries whatever list they were built for:
+# the release workflow passes `86;120a`, written apart from
+# CUDA_ARCHITECTURES (#482). Empty, the default, it requires nothing beyond
+# that list, so a container build from a checkout checks its own.
+ARG CUDA_REQUIRED_ARCHITECTURES=
+
 # --target explicitly: .cargo/config.toml pins the MSVC triple for every host
 # (cargo has no host condition for build.target -- GitHub #167).
 #
@@ -79,11 +85,12 @@ ENV IGNIS_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
 # the binaries never compiles. The server then came out without CUDA, with no
 # error, in v0.9.0 and v0.9.1 (GitHub #408). The check after the build reads
 # the binary itself and refuses one that would fall back to the CPU mock, or
-# that carries no machine code for an entry of IGNIS_CUDA_ARCHITECTURES (#482),
-# on each of the three binaries the image and the tarball ship.
+# that carries no machine code for an entry of IGNIS_CUDA_ARCHITECTURES or of
+# CUDA_REQUIRED_ARCHITECTURES (#482), on each of the three binaries the image
+# and the tarball ship.
 RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
         --workspace --features cuda \
-    && bash mk/cuda-build-check.sh target/x86_64-unknown-linux-gnu/release/ignis-server \
+    && bash mk/cuda-build-check.sh --require "$CUDA_REQUIRED_ARCHITECTURES" target/x86_64-unknown-linux-gnu/release/ignis-server \
              target/x86_64-unknown-linux-gnu/release/ignis-bench \
              target/x86_64-unknown-linux-gnu/release/ignis-artifact-inspect \
     && strip target/x86_64-unknown-linux-gnu/release/ignis-server \

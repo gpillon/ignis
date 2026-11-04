@@ -459,11 +459,11 @@ fn switching_message(from: &str, to: &str) -> String {
 /// Before all of it, `model` becomes the id this card serves the request
 /// under ([`model_on_this_card`], ADR 0064, ADR 0079), rewritten in place so
 /// that everything after reads it: an alias the entry that answers to it, an
-/// entry the card cannot load refused [`above_card`]. A route that switches
+/// entry the card cannot load refused [`refused_on_card`]. A route that switches
 /// through here cannot skip that step; the image, decision and counting
 /// routes, which switch their own way or not at all, take it themselves.
 pub(crate) async fn switch_to_named_model(server: &Server, route: ModelKind, model: &mut Option<String>) -> Result<(), Response> {
-    *model = model_on_this_card(server, model.take()).map_err(|refusal| above_card(&refusal))?;
+    *model = model_on_this_card(server, model.take()).map_err(|refusal| refused_on_card(&refusal))?;
     let (named, _) = split_model_lane(model.clone());
     check_kind(server, route, named.as_deref())?;
     if let Some(named) = unswitchable_named(server, route, named.as_deref()) {
@@ -568,7 +568,7 @@ pub(crate) fn check_served_kind(server: &Server, route: ModelKind, model: Option
 /// anything else reads the request's `model`: the kind check, the implicit
 /// switch and the engine's own model check all see the id the request is
 /// served under, and the answer names it. Each route words the refusal its
-/// own way: [`above_card`] on all but `/v1/decide`.
+/// own way: [`refused_on_card`] on all but `/v1/decide`.
 pub(crate) fn model_on_this_card(server: &Server, model: Option<String>) -> Result<Option<String>, crate::download::CardRefusal> {
     let Some(model) = model else {
         return Ok(None);
@@ -592,7 +592,7 @@ pub(crate) fn model_on_this_card(server: &Server, model: Option<String>) -> Resu
 /// before anything is prepared, drained or torn down: the loaded model serves
 /// on. A conflict as `model_kind_mismatch` is — a model the server knows,
 /// that it cannot serve here — and never worth a retry.
-pub(crate) fn above_card(refusal: &crate::download::CardRefusal) -> Response {
+pub(crate) fn refused_on_card(refusal: &crate::download::CardRefusal) -> Response {
     error_response_naming(
         StatusCode::CONFLICT,
         "invalid_request_error",
@@ -2179,7 +2179,7 @@ async fn switch_model(State(server): State<Arc<Server>>, Json(req): Json<SwitchR
         Some(artifact) => (artifact.into(), req.model),
         None => {
             let model = match server.switcher.as_ref().map(|switcher| switcher.on_this_card(&req.model)) {
-                Some(Err(refusal)) => return above_card(&refusal),
+                Some(Err(refusal)) => return refused_on_card(&refusal),
                 Some(Ok(Some(served))) => served,
                 Some(Ok(None)) | None => req.model,
             };
@@ -2211,7 +2211,7 @@ fn resolve_by_id(server: &Server, model: &str) -> Result<std::path::PathBuf, Res
     };
     switcher.resolve(model).map_err(|why| {
         let message = match why {
-            Unswitchable::AboveCard(refusal) => return above_card(&refusal),
+            Unswitchable::RefusedOnCard(refusal) => return refused_on_card(&refusal),
             Unswitchable::Speech => {
                 return error_response_naming(
                     StatusCode::CONFLICT,

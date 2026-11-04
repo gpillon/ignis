@@ -83,7 +83,8 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   ([Flash-Next n-gram startup cache](ngram-cache.md)). Everything else is as on the
   5090, except that the 27B's VRAM headroom stays at its default. `--profile
   auto` picks it on this card; `--profile rtxpro6000` names it.
-- `rtx-16gb` is the 16 GB class (RTX 5060 Ti 16 GB, 5070 Ti, 5080): derived,
+- `rtx-16gb` is the 16 GB class (RTX 5060 Ti 16 GB, 5070 Ti, 5080, RTX 4060 Ti
+  16 GB, RTX 4080): derived,
   not measured, since no 16 GB card exists in the project. The 27B at
   262,144 tokens of context on two decode lanes, with DFlash2 at 7 draft
   tokens and the drafter's head `auto`, vision on at 4,096 tokens an image (the tower and pool in host RAM, so
@@ -139,10 +140,10 @@ one, which does not.
 
 A file's `profiles: { <name>: { <group>: { … } } }` defines one for any other
 card. `auto` picks the class's profile by name, the lookup a named profile
-goes through, so a file whose `profiles:` redefines `rtx-16gb`, `rtx5090` or
-`rtxpro6000` replaces what `auto` picks for that class. A profile called `none`
-or `auto` is refused when the file is read: both words mean something to
-`--profile`, so such a profile could never be reached.
+goes through, so a file whose `profiles:` redefines `rtx-16gb`, `rtx-24gb`,
+`rtx5090` or `rtxpro6000` replaces what `auto` picks for that class. A profile
+called `none` or `auto` is refused when the file is read: both words mean
+something to `--profile`, so such a profile could never be reached.
 
 `config generate` writes every resolved value as a value of the FILE, the
 profile's among them: a file generated under `auto` carries the numbers of the
@@ -182,7 +183,9 @@ a change is live, needs a reload, or can only be made at start — the same
 declarations as `ignis-server help --fields --format json`, minus the fields
 `GET /v1/config` hides. `GET /v1/config/origins` says where each value in force
 comes from, for the shared value and for each model family: the default, the
-profile, the file, an env var, a flag or a live change, whether it was set for
-that family itself, and the flag, env var, file key or profile that set it.
+profile, the card, the file, an env var, a flag or a live change, whether it
+was set for that family itself, and the flag, env var, file key or profile
+that set it, or the card that decided it (the prompt attention's FP16 band on
+a card below compute capability 12.0).
 A family's own value in the file or from a live change is the one a group
 change does not reach and a `null` removes.

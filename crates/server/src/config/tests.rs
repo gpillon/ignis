@@ -3247,7 +3247,7 @@ fn a_start_on_a_card_the_kernels_were_not_built_for_is_refused_by_name() {
         for flags in [&[][..], &["--profile", "rtx50-16gb"], &["--profile", "none"]] {
             let err = on_card(flags, card.clone()).unwrap_err().0;
             assert!(err.contains(&name), "{flags:?}: {err}");
-            assert!(err.contains("compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell)"), "{flags:?}: {err}");
+            assert!(err.contains("compute capability 12.0 (RTX 50, RTX PRO), built for 120a;"), "{flags:?}: {err}");
             assert!(err.contains("built for 120a;") && !err.contains("#456"), "{flags:?}: {err}");
             assert!(err.ends_with("see https://gpillon.github.io/ignis/start/#what-it-runs-on"), "{flags:?}: {err}");
             assert!(!err.contains("card class"), "the card is refused before its class is asked: {err}");

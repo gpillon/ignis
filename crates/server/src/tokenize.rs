@@ -132,7 +132,7 @@ pub(crate) async fn tokenize(State(server): State<Arc<Server>>, Json(mut req): J
     let server = Arc::new(server.pinned());
     req.model = match crate::api::model_on_this_card(&server, req.model.take()) {
         Ok(model) => model,
-        Err(refusal) => return crate::api::above_card(&refusal),
+        Err(refusal) => return crate::api::refused_on_card(&refusal),
     };
     if let Some(metrics) = &server.metrics {
         metrics.record_tokenize(TokenizeRoute::Tokenize);

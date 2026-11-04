@@ -28,7 +28,8 @@ makes it build and run on an architecture the build targets, on these terms:
   patched: it compiles for the arch-specific Blackwell targets alone, so a
   launch anywhere else fails with CUDA's "no kernel image is available", never
   as a stand-in.
-- **The `reason` names the architecture, this ADR and the compile it fixes.**
+- **The `reason` names the CUDA architecture or the card size, this ADR and
+  what it fixes**: a compile, or a launch that fails at run time there.
 
 Our own copy of `pdl.cuh` under `kernel/src`, ADR 0031's option (b), was
 rejected. The 32 files include it by its vendored path, so a copy would need
@@ -43,7 +44,7 @@ is untested. The proposal answers #456's first owner decision ("a new
 exemption, or our own copy under `kernel/src`?"); the owner decides at merge.
 
 The second is the vendored GDN gating test, `tests/ops/test_gdn_gating_proj.cpp`
-(#478). What it fixes is a card size, not an architecture: the test's
+(#478). What it fixes is a card size, not a CUDA architecture: the test's
 cooperative schedules are sized for the RTX 5090's 170 SMs, and the planner
 resolves the 27B's fused norm/control route with no fallback, so on a card
 with fewer than 120 SMs, RTX 50 included, the test aborted at its first check.

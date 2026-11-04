@@ -15,7 +15,7 @@ Generated from the code by `make docs-reference` (`crates/server/src/user_docs.r
 
 A profile is a layer of defaults for one kind of card, between the config file and the built-in defaults: any flag, env var or file value still wins over it. An unset `--profile` is `auto`, and `auto` takes the built-in profile of the card's class, read from its total memory; `--profile none` skips the layer. A config file's `profiles:` section defines more, or shadows these ([Profiles and defaults](../concepts/profiles.md)). `rtx50-16gb` is the former name of `rtx-16gb` and is still accepted everywhere a profile is named, as the same profile.
 
-A profile follows the card's memory, not its generation. The RTX 3090 and 3090 Ti are supported, on the 27B's 16 GB entries; the RTX 4090 and the 16 GB RTX 40 cards are expected to work, and reports are welcome; the RTX 50 and RTX PRO 6000 run every model. The NVFP4 27B, Flash-Next and the image model load on Blackwell alone ([What it runs on](../start/index.md#what-it-runs-on)).
+A profile follows the card's memory, not its generation, and what a card loads follows from both. The RTX 5090 and RTX PRO 6000 run every model, and the 16 GB RTX 50 cards the 16 GB entries; the RTX 3090 and 3090 Ti are supported, on the 27B's 16 GB entries; the RTX 4090 and the 16 GB RTX 40 cards are expected to work, and reports are welcome. The NVFP4 27B, Flash-Next and the image model load on Blackwell alone, on a card of 32 GB or more ([What it runs on](../start/index.md#what-it-runs-on)).
 
 ## rtx-16gb
 

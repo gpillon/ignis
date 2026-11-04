@@ -32,8 +32,7 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use ignis_core::compute::ModelFamily;
-use ignis_server::config::arch::ComputeCapability;
-use ignis_server::config::profile::{CardClass, CardReading, RTX_5090_TOTAL_BYTES};
+use ignis_server::config::profile::{CardClass, CardReading};
 use ignis_server::download::catalog::Catalog;
 use ignis_server::model_switch::{CatalogModels, Switcher};
 use ignis_server::{ModelStatus, Server};
@@ -46,6 +45,10 @@ use switch_support::MockLoader;
 
 #[path = "support/responses.rs"]
 mod responses;
+
+#[path = "support/card.rs"]
+mod cards;
+use cards::{card, rtx_3090, rtx_4090, rtx_5090};
 
 const PATIENT: Duration = Duration::from_secs(30);
 
@@ -198,38 +201,19 @@ fn refused_on(status: StatusCode, body: &Value, model: &str, card: CardClass) {
     assert!(message.contains(model) && message.contains("32 GB") && message.contains(&format!("the {card} class")), "{message}");
 }
 
-/// A card by its total memory and its compute capability, as the start
-/// reads it (spec #474).
-fn card(gib: u64, name: &str, major: u32, minor: u32) -> Option<CardReading> {
-    Some(CardReading::of(gib << 30, name, ComputeCapability::new(major, minor)))
-}
-
 /// A 16 GB Blackwell card.
 fn sixteen() -> Option<CardReading> {
-    card(16, "NVIDIA GeForce RTX 5080", 12, 0)
+    Some(card(16, "NVIDIA GeForce RTX 5080", 12, 0))
 }
 
 /// A 24 GB card of the Blackwell generation (GitHub #480): its class the RTX
 /// 3090's and RTX 4090's, its generation every entry's.
 fn twenty_four() -> Option<CardReading> {
-    card(24, "NVIDIA RTX (Blackwell)", 12, 0)
-}
-
-fn rtx_5090() -> Option<CardReading> {
-    Some(CardReading::of(RTX_5090_TOTAL_BYTES, "NVIDIA GeForce RTX 5090", ComputeCapability::new(12, 0)))
+    Some(card(24, "NVIDIA RTX (Blackwell)", 12, 0))
 }
 
 fn rtx_pro_6000() -> Option<CardReading> {
-    card(96, "NVIDIA RTX PRO 6000 Blackwell", 12, 0)
-}
-
-/// The cards spec #474 is written for: 24 GiB each, Ampere and Ada.
-fn rtx_3090() -> Option<CardReading> {
-    card(24, "NVIDIA GeForce RTX 3090", 8, 6)
-}
-
-fn rtx_4090() -> Option<CardReading> {
-    card(24, "NVIDIA GeForce RTX 4090", 8, 9)
+    Some(card(96, "NVIDIA RTX PRO 6000 Blackwell", 12, 0))
 }
 
 /// The server still serves `loaded`, nothing was prepared or loaded, and a
@@ -412,7 +396,7 @@ async fn an_alias_never_resolves_to_an_artifact_of_another_family() {
 /// Flash-Next switches to it.
 #[tokio::test]
 async fn on_a_32gb_card_or_an_unknown_one_nothing_changes() {
-    for (card, tag) in [(rtx_5090(), "32"), (None, "unknown")] {
+    for (card, tag) in [(Some(rtx_5090()), "32"), (None, "unknown")] {
         let loader = MockLoader::new();
         let server = server_on(&loader, DEFAULT_27B, card, tag);
         let app = server.app();
@@ -473,7 +457,7 @@ async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_
         }
     }
 
-    let thirty_two = server_on(&MockLoader::new(), SIXTEEN, rtx_5090(), "lists-32").app();
+    let thirty_two = server_on(&MockLoader::new(), SIXTEEN, Some(rtx_5090()), "lists-32").app();
     let (_, catalog) = send(&thirty_two, Method::GET, "/v1/models/catalog", None).await;
     for row in catalog["data"].as_array().unwrap() {
         assert_eq!((row["available"].as_bool(), row.get("reason")), (Some(true), None), "{row}");
@@ -546,7 +530,7 @@ async fn the_prompt_enhancer_is_served_by_the_entry_that_answers_to_it() {
     assert_eq!(enhancer_on_this_card(&alone, FLASH_NEXT), FLASH_NEXT);
     assert!(unknown_enhancer(&alone, FLASH_NEXT, &none).is_some_and(|reason| reason.contains(FLASH_NEXT)));
 
-    let thirty_two = server_on(&MockLoader::new(), FLASH_NEXT, rtx_5090(), "enhancer-32");
+    let thirty_two = server_on(&MockLoader::new(), FLASH_NEXT, Some(rtx_5090()), "enhancer-32");
     assert_eq!(enhancer_on_this_card(&thirty_two, DEFAULT_27B), DEFAULT_27B, "its own entry fits");
     assert_eq!(unknown_enhancer(&thirty_two, DEFAULT_27B, &none), None);
 }
@@ -630,7 +614,7 @@ async fn an_uncensored_variants_16gb_build_whose_header_names_another_family_doe
 /// request's switch and an explicit one, whatever the 16 GB build's header.
 #[tokio::test]
 async fn on_other_cards_the_uncensored_variants_id_is_its_own_entrys() {
-    for (card, tag) in [(rtx_5090(), "abliterated-32"), (rtx_pro_6000(), "abliterated-96"), (None, "abliterated-unknown")] {
+    for (card, tag) in [(Some(rtx_5090()), "abliterated-32"), (rtx_pro_6000(), "abliterated-96"), (None, "abliterated-unknown")] {
         let loader = MockLoader::new();
         let server = abliterated_server(&loader, DEFAULT_27B, card, ModelFamily::Qwen38_27b, tag);
         let app = server.app();
@@ -761,7 +745,7 @@ async fn swifts_id_on_a_16gb_card_needs_its_16gb_build_on_disk_and_of_the_27bs_f
 /// explicit one, and every list marks it available.
 #[tokio::test]
 async fn on_other_cards_swifts_id_is_its_nvfp4_entrys() {
-    for (card, tag) in [(rtx_5090(), "swift-32"), (rtx_pro_6000(), "swift-96"), (None, "swift-unknown")] {
+    for (card, tag) in [(Some(rtx_5090()), "swift-32"), (rtx_pro_6000(), "swift-96"), (None, "swift-unknown")] {
         let loader = MockLoader::new();
         let server = server_on(&loader, DEFAULT_27B, card, tag);
         let app = server.app();
@@ -889,7 +873,7 @@ fn refused_by_generation(status: StatusCode, body: &Value, model: &str, card: &O
 /// class is above the card's too, the message names both.
 #[tokio::test]
 async fn on_an_rtx_3090_or_4090_a_blackwell_only_entry_is_refused_before_anything_stops() {
-    for (card, tag) in [(rtx_3090(), "3090-refused"), (rtx_4090(), "4090-refused")] {
+    for (card, tag) in [(Some(rtx_3090()), "3090-refused"), (Some(rtx_4090()), "4090-refused")] {
         let loader = MockLoader::new();
         let server = server_on(&loader, SIXTEEN, card.clone(), tag);
         let app = server.app();
@@ -923,7 +907,7 @@ async fn on_an_rtx_3090_or_4090_a_blackwell_only_entry_is_refused_before_anythin
 /// switchable.
 #[tokio::test]
 async fn on_an_rtx_3090_or_4090_the_27bs_ids_are_served_by_their_16gb_builds_and_the_lists_say_why() {
-    for (card, tag) in [(rtx_3090(), "3090-alias"), (rtx_4090(), "4090-alias")] {
+    for (card, tag) in [(Some(rtx_3090()), "3090-alias"), (Some(rtx_4090()), "4090-alias")] {
         let loader = MockLoader::new();
         let server = server_on(&loader, SIXTEEN, card.clone(), tag);
         let app = server.app();
@@ -979,7 +963,7 @@ async fn on_an_rtx_3090_or_4090_the_27bs_ids_are_served_by_their_16gb_builds_and
 /// whose class is below the NVFP4 entry's, the NVFP4 entry elsewhere.
 #[tokio::test]
 async fn on_a_blackwell_card_or_none_nothing_is_refused_by_generation() {
-    for (card, tag, swift) in [(twenty_four(), "gen-24", SWIFT_16G), (rtx_5090(), "gen-5090", SWIFT), (None, "gen-none", SWIFT)] {
+    for (card, tag, swift) in [(twenty_four(), "gen-24", SWIFT_16G), (Some(rtx_5090()), "gen-5090", SWIFT), (None, "gen-none", SWIFT)] {
         let loader = MockLoader::new();
         let server = server_on(&loader, DEFAULT_27B, card, tag);
         let app = server.app();
@@ -1000,7 +984,7 @@ async fn on_a_blackwell_card_or_none_nothing_is_refused_by_generation() {
 /// the 16 GB entry; Flash-Next is refused `409 model_above_gpu_generation`.
 #[tokio::test]
 async fn on_an_ada_card_of_no_class_the_alias_serves_the_16gb_entry() {
-    let ada = card(48, "NVIDIA RTX (Ada)", 8, 9);
+    let ada = Some(card(48, "NVIDIA RTX (Ada)", 8, 9));
     assert_eq!(ada.as_ref().unwrap().class(), None);
     let loader = MockLoader::new();
     let server = server_on(&loader, SIXTEEN, ada.clone(), "ada-no-class");
@@ -1025,7 +1009,7 @@ async fn on_an_ada_card_of_no_class_the_alias_serves_the_16gb_entry() {
 #[tokio::test]
 async fn on_an_rtx_3090_a_catalog_id_the_operator_listed_is_fitted_by_generation_all_the_same() {
     let loader = MockLoader::new();
-    let card = rtx_3090();
+    let card = Some(rtx_3090());
     let server = server_on(&loader, SIXTEEN, card.clone(), "3090-listed");
     let switcher = server.switcher.as_ref().unwrap();
     let listed: std::collections::BTreeMap<String, std::path::PathBuf> = [(SWIFT_16G.to_owned(), switch_support::source(SWIFT_16G).artifact)].into_iter().collect();

@@ -46,7 +46,8 @@ requires a key ([ADR 0028](../../adr/0028-expose-modes-always-keyed.md)). The
 ([ADR 0036](../../adr/0036-the-v1-surface-documents-itself.md)).
 
 **Platforms.** A `v*` tag publishes a Windows `.zip`, a Linux `.tar.gz` and a
-`linux/amd64` container image on ghcr.io, all compiled for `SM120a`.
+`linux/amd64` container image on ghcr.io, all compiled for compute
+capabilities 8.6 and 12.0 (`86;120a`).
 
 ![The Monitor, live, from the same binary](../images/playground/monitor.png)
 
@@ -84,7 +85,9 @@ There are no performance figures here. These are the defaults:
   operator's act.
 - A quick tunnel is a quick tunnel: the key is required, and `GET /v1/config`
   never shows it.
-- ignis targets `SM120a`, the RTX 5090 and the RTX PRO 6000. It does not run on a
+- A release targets compute capabilities 8.6 and 12.0: the RTX 30 and RTX 40
+  cards, the RTX 50 cards and the RTX PRO 6000
+  ([What it runs on](../start/index.md#what-it-runs-on)). It does not run on a
   DGX Spark ([DGX Spark](../guides/dgx-spark.md)).
 
 ## Read more
