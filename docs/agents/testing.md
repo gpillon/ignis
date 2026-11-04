@@ -391,6 +391,55 @@ runs hq, which is right for the serving-shape checks (the HTTP surface, the
 TTFT instrument, the `CudaLeaf` smoke test) and wrong for anything carrying
 a derived tolerance.
 
+## The sm_86 gate
+
+A release built for `86;120a` runs on RTX 30 cards that no CI runner and no
+default suite covers. Before a release whose range touched the kernel leaf or
+the server's architecture module, the release's coordinator runs this gate on
+an sm_86 card (spec #474, #484). The range's check:
+
+```
+git diff --stat "$(git describe --tags --abbrev=0 --match 'v*')".. -- kernel/ crates/server/src/config/arch.rs
+```
+
+Output means the gate runs; none means it does not. A failure of any part
+stops the release. Check `make gpu-status` first, as for any GPU run.
+
+1. **Quality**, by the method of
+   `docs/findings/2026-11-03-first-light-on-sm86.md` (it names the scripts
+   and the reference): #340's gate 1 windows, 16 of 4,096 tokens, dumped with
+   `span_logits` at chunk 1024, KV `hq-e8-2b` and
+   `IGNIS_MODEL_PREFILL_ATTENTION=fp16`, scored top-64 against the BF16
+   reference (`kl_top64` in `crates/bench/src/flash_next/kld.rs`; the
+   windows and `ref_kld.py` are under `tools/kld-gate/`). The RTX 5090's
+   figures on the FP16 band, from that finding, are a top-64 KLD of 0.03825
+   and a top-1 of 93.42%. Limits: top-64 KLD at most 0.04016 (1.05 times),
+   top-1 at least 92.92% (0.5 points under). A change that alters the 5090's
+   numerics records new 5090 FP16-band figures in a finding first.
+2. **The leaf's tests**: build with `IGNIS_CUDA_ARCHITECTURES=86;120a`, then
+   `ctest -LE sm120a-only`. Every test passes. In
+   `ignis_kernel_gdn_gating_proj_tests` the `budget` lines and the `SKIP`
+   lines that name the cooperative schedules the card cannot hold resident
+   (#478) are expected; a failure is not.
+3. **Smoke**: a server started under `--profile auto` (on a 24 GB card,
+   `rtx-24gb`) with DFlash2 on answers a greedy chat completion, a small
+   image and a large image, each correctly. The small image is the smallest
+   the processor accepts: it upscales every image to the 65,536-pixel floor,
+   so 256 patches at the vision tower and 64 tokens after the merge; record
+   that count. The tower's W8 shapes have no small-token route in the
+   vendored dispatch (SIMT up to 16 tokens, the merger's up to 4 or 5, then
+   `mma_r64_c128`), so no image reaches a kernel only the sm_120a set holds.
+   The large image sits near the profile's vision item bound
+   (`vision.max_tokens`).
+
+The release binary is also checked to carry code for 8.6 and 12.0
+(`mk/cuda-build-check.sh`, already in CI, #482).
+
+The gate records correctness only: KLD, top-1, pass or fail per part, and the
+small image's patch count. Never a speed, never a detail of the machine. The
+same procedure, for contributors, is in
+`docs/user/contributing/releases.md`.
+
 ## Done means
 
 1. every new or changed behavior has a test that covers it
