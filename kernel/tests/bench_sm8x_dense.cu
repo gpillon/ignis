@@ -1323,6 +1323,9 @@ struct ChunkTotals {
 
 void speed(int tokens, Route &r, cudaStream_t s, ChunkTotals &chunk) {
   int8_t *const wb[2] = {r.w[0].as<int8_t>(), r.w[1].as<int8_t>()};
+  // The clocks up first: about half a second of the largest GEMM.
+  for (int i = 0; i < 400 * 2048 / tokens; ++i) launch_gemm(gemm_call(r, kBody[7], tokens, i & 1, 256, 0), s);
+  BENCH_CUDA(cudaStreamSynchronize(s));
   std::printf("\n== T = %d: per call (us), the dense route against today's fused trellis prefill kernel ==\n", tokens);
   std::printf("%-12s %6s %6s %3s | %8s %7s %8s %7s %6s %9s | %9s %7s | %6s\n", "matrix", "in", "out", "K", "decode", "A8",
               "GEMM", "TOPS", "%s8", "dense", "fused", "TFLOPS", "f/d");
@@ -1578,7 +1581,9 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "FATAL: %s is not a readable .ninfer v2 artifact\n", artifact.c_str());
         return 1;
       }
-      std::printf("check on %s, %d tokens of the activation stand-in:\n", artifact.c_str(), check_tokens);
+      const size_t slash = artifact.find_last_of("/\\");
+      std::printf("check on %s, %d tokens of the activation stand-in:\n",
+                  (slash == std::string::npos ? artifact : artifact.substr(slash + 1)).c_str(), check_tokens);
       const char *names[] = {"text/layers/0/mlp/gate_proj", "text/layers/1/gdn/in_proj_qkv", "text/layers/3/attention/k_proj",
                              "text/layers/15/attention/v_proj", "text/layers/3/mlp/down"};
       for (const char *n : names) check_matrix(art, n, check_tokens, s1);
