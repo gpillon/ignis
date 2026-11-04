@@ -67,6 +67,8 @@
 #include <algorithm>
 #include <climits>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -103,6 +105,25 @@ template <bool kFp8>
 constexpr int kStageBytes = 2 * kKTileBytes<kFp8>;
 template <bool kFp8>
 constexpr int kFaSmemBytes = 2 * kStageBytes<kFp8>;  // two stages: 32 KiB (FP8), 64 KiB (BF16)
+
+// PROTOTYPE (sm8x dense prefill, phase 1, step 2): IGNIS_PROTO_BAND, in place of the FP16 band
+// (IGNIS_MODEL_PREFILL_ATTENTION=fp16), the band an sm_8x card could run on its integer MMAs:
+//   i8:   Q K^T as the 8-bit band (INT8 Q per row, INT8 K per 32-key tile, exact in int32); P V on
+//         the u8 x s8 MMA, P = rn(255 p) (p in [0, 1], scale 1/255), V^T in s8 with amax / 127 per
+//         32-key tile and KV head, exact in int32 within a tile, folded into the fp32 O;
+//   i8qk: Q K^T as i8, P V as the FP16 band (P = p and V in FP16, FP16 accumulate per tile).
+constexpr int kProtoOff = 0;
+constexpr int kProtoI8 = 1;
+constexpr int kProtoI8Qk = 2;
+// The V tile's bytes: FP16 rows under i8qk, else as K's.
+template <bool kFp8, int kProto>
+constexpr int kVTileBytesP = kProto == kProtoI8Qk ? kTile * kHeadDim * 2 : kKTileBytes<kFp8>;
+template <bool kFp8, int kProto>
+constexpr int kStageBytesP = kKTileBytes<kFp8> + kVTileBytesP<kFp8, kProto>;
+template <bool kFp8, int kProto>
+constexpr int kFaSmemBytesP = 2 * kStageBytesP<kFp8, kProto>;
+static_assert(kStageBytesP<true, kProtoOff> == kStageBytes<true> && kStageBytesP<false, kProtoOff> == kStageBytes<false>,
+              "the band as it was keeps its stages");
 
 // ---- PTX helpers (upstream engine/src/mma.cuh) --------------------------------------------------
 
@@ -162,6 +183,14 @@ __device__ __forceinline__ float2 half2_bits(std::uint32_t x) {
 __device__ __forceinline__ void mma_s8(int *d, const std::uint32_t *a, const std::uint32_t *b) {
   asm volatile(
       "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+// PROTOTYPE: D += A B with A u8 and B s8, int32 accumulate (exact): the i8 band's P V.
+__device__ __forceinline__ void mma_u8s8(int *d, const std::uint32_t *a, const std::uint32_t *b) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
@@ -325,6 +354,7 @@ struct PassBuffers {
   std::int32_t capacity;  // columns per KV head
 };
 
+template <int kProto = kProtoOff>
 __device__ __forceinline__ void store_fp8_tile(const __nv_bfloat16 *tile, bool role_v, int head,
                                                int tile_index, PassBuffers buf, float *warp_amax,
                                                float &tile_scale);
@@ -332,7 +362,8 @@ __device__ __forceinline__ void store_fp8_tile(const __nv_bfloat16 *tile, bool r
 // `role_first`: the role of blockIdx.z == 0 (K, or V when 1): a pass launches both roles, a
 // fetch one.
 // `kHalf` (with !kFp8): the fallback band, the rows stored in FP16 instead of BF16.
-template <bool kFp8, bool kHalf = false>
+// PROTOTYPE `kProto` (with kFp8): i8 stores V^T in s8; i8qk stores K in INT8 and V rows in FP16.
+template <bool kFp8, bool kHalf = false, int kProto = kProtoOff>
 __global__ void __launch_bounds__(256) tile_kernel(IgnisHqPromptKeys src, Columns cols,
                                                    PassBuffers buf, int role_first) {
   __shared__ __align__(16) __nv_bfloat16 tile[kTile * kHeadDim];
@@ -356,7 +387,11 @@ __global__ void __launch_bounds__(256) tile_kernel(IgnisHqPromptKeys src, Column
   }
   __syncthreads();
 
-  if constexpr (!kFp8) {
+  if constexpr (!kFp8 || kProto == kProtoI8Qk) {
+    if (kFp8 && !role_v) {  // PROTOTYPE i8qk: K in INT8, as the 8-bit band
+      store_fp8_tile<kProtoOff>(tile, role_v, head, tile_index, buf, warp_amax, tile_scale);
+      return;
+    }
     // BF16 rows as the prompt planes held them, four 16-byte units per thread; rows past the
     // buffer's capacity (a fetch of a count that is no multiple of 32) are not stored.
     std::uint8_t *base = role_v ? buf.v : buf.k;
@@ -366,7 +401,7 @@ __global__ void __launch_bounds__(256) tile_kernel(IgnisHqPromptKeys src, Column
     for (int u = tid; u < kTile * kHeadDim / 8; u += 256) {
       if (column0 + u / (kHeadDim / 8) >= buf.capacity) continue;
       uint4 w = from[u];
-      if constexpr (kHalf) {
+      if constexpr (kHalf || kProto == kProtoI8Qk) {
         std::uint32_t *x = &w.x;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -377,11 +412,13 @@ __global__ void __launch_bounds__(256) tile_kernel(IgnisHqPromptKeys src, Column
       dst[u] = w;
     }
   } else {
-    store_fp8_tile(tile, role_v, head, tile_index, buf, warp_amax, tile_scale);
+    store_fp8_tile<kProto>(tile, role_v, head, tile_index, buf, warp_amax, tile_scale);
   }
 }
 
 // The 8-bit half of tile_kernel: the tile's scale, then K rows in INT8 or V^T segments in E4M3.
+// PROTOTYPE i8: V^T in s8 under amax / 127, in the same segment order.
+template <int kProto>
 __device__ __forceinline__ void store_fp8_tile(const __nv_bfloat16 *tile, bool role_v, int head,
                                                int tile_index, PassBuffers buf, float *warp_amax,
                                                float &tile_scale) {
@@ -412,7 +449,9 @@ __device__ __forceinline__ void store_fp8_tile(const __nv_bfloat16 *tile, bool r
     float amax = 0.0f;
     for (int w = 0; w < 8; ++w) amax = fmaxf(amax, warp_amax[w]);
     float scale = 1.0f;
-    if (amax > 0.0f && role_v) {
+    if (amax > 0.0f && role_v && kProto == kProtoI8) {
+      scale = amax / kInt8Max;
+    } else if (amax > 0.0f && role_v) {
       int e = 0;
       (void)frexpf(amax / kE4m3Max, &e);  // amax / 448 < 2^e
       scale = ldexpf(1.0f, e);
@@ -461,8 +500,8 @@ __device__ __forceinline__ void store_fp8_tile(const __nv_bfloat16 *tile, bool r
 #pragma unroll
         for (int b = 0; b < 4; ++b) {
           const int key_l = 16 * hh + 2 * j + (b & 1) + 8 * (b >> 1);
-          word |= static_cast<std::uint32_t>(e4m3(__bfloat162float(tile[key_l * kHeadDim + d]) * inv))
-                  << (8 * b);
+          const float x = __bfloat162float(tile[key_l * kHeadDim + d]) * inv;
+          word |= static_cast<std::uint32_t>(kProto == kProtoI8 ? i8(x) : e4m3(x)) << (8 * b);
         }
         w[j] = word;
       }
@@ -490,11 +529,14 @@ struct Queries {
 
 // kFp8: the 8-bit band (INT8 Q K^T, E4M3 P V); kHalf: the FP16-accumulate fallback band; neither:
 // the BF16 window.
-template <bool kFp8, bool kHalf = false>
+// PROTOTYPE kProto (with kFp8): the i8 / i8qk bands, Q K^T as the 8-bit band's.
+template <bool kFp8, bool kHalf = false, int kProto = kProtoOff>
 __global__ void __launch_bounds__(kFaThreads, 1)
     fa_kernel(Queries qs, int start, int width, float scale, Columns cols, PassBuffers buf,
               int splits, int resume, Carry carry) {
   static_assert(!(kFp8 && kHalf), "one band precision");
+  static_assert(kProto == kProtoOff || kFp8, "the prototype bands run Q K^T in INT8");
+  constexpr int kStage = kStageBytesP<kFp8, kProto>;
 #if !IGNIS_HQ_PROMPT_FP8_BAND
   if constexpr (kFp8) {
     __trap();  // the 8-bit band below sm_120: never a silent stand-in (GitHub #456)
@@ -523,8 +565,23 @@ __global__ void __launch_bounds__(kFaThreads, 1)
   if (cend <= cbeg && resume != 0) return;
 
   auto issue = [&](int c) {
-    const std::uint32_t st = sbase + static_cast<std::uint32_t>((c & 1) * kStageBytes<kFp8>);
-    if constexpr (kFp8) {
+    const std::uint32_t st = sbase + static_cast<std::uint32_t>((c & 1) * kStage);
+    if constexpr (kProto == kProtoI8Qk) {
+      // K in INT8 rows as the 8-bit band, V in FP16 rows as the fallback band.
+      const std::uint8_t *ksrc =
+          buf.k + (static_cast<std::int64_t>(g) * buf.capacity + c * kTile) * kHeadDim;
+      const std::int64_t at = (static_cast<std::int64_t>(g) * buf.capacity + c * kTile) * kHeadDim * 2;
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const int u = tid + j * kFaThreads;
+        cp_async16(st + row_swz<true>(u >> 4, u & 15), ksrc + u * 16);
+      }
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int u = tid + j * kFaThreads;
+        cp_async16(st + kKTileBytes<true> + row_swz<false>(u >> 5, u & 31), buf.v + at + u * 16);
+      }
+    } else if constexpr (kFp8) {
       const std::uint8_t *ksrc =
           buf.k + (static_cast<std::int64_t>(g) * buf.capacity + c * kTile) * kHeadDim;
       const std::uint8_t *vsrc =
@@ -615,7 +672,7 @@ __global__ void __launch_bounds__(kFaThreads, 1)
   for (int c = cbeg; c < cend; ++c) {
     cp_wait<1>();
     __syncthreads();
-    const std::uint32_t ks = sbase + static_cast<std::uint32_t>((c & 1) * kStageBytes<kFp8>);
+    const std::uint32_t ks = sbase + static_cast<std::uint32_t>((c & 1) * kStage);
     const std::uint32_t vs = ks + kKTileBytes<kFp8>;
     const int key0 = cols.key(c * kTile);  // the tile's keys are key0 .. key0 + 31
     if (key0 <= warp_last) {
@@ -623,9 +680,11 @@ __global__ void __launch_bounds__(kFaThreads, 1)
       float sc[4][4] = {};
       float sk = 1.0f;
       std::uint32_t sfv = kUnitScale;
+      float sv = 1.0f;  // PROTOTYPE i8: the V tile's amax / 127
       if constexpr (kFp8) {
         const int tiles = buf.capacity / kTile;
         sk = buf.scale[g * tiles + c];
+        if constexpr (kProto == kProtoI8) sv = buf.scale[(kKvHeads + g) * tiles + c];
         // The V tile's power-of-two scale as a UE8M0 byte: its float exponent field.
         sfv = ((__float_as_uint(buf.scale[(kKvHeads + g) * tiles + c]) >> 23) & 0xFFu) * 0x01010101u;
         // Q K^T in INT8, exact in int32: |S| <= 256 * 127^2 < 2^22, so 1.5 * 2^23 + S holds S
@@ -714,7 +773,49 @@ __global__ void __launch_bounds__(kFaThreads, 1)
       const float bias[2] = {8.0f - (m[0] == -CUDART_INF_F ? 0.0f : m[0]),
                              8.0f - (m[1] == -CUDART_INF_F ? 0.0f : m[1])};
       float ps[2] = {0.0f, 0.0f};
-      if constexpr (kFp8) {
+      if constexpr (kProto == kProtoI8) {
+        // PROTOTYPE i8: P = rn(255 p) as one u8 A fragment over the 32 keys, in V^T's order (the
+        // bytes the E4M3 path packs); P V on the u8 x s8 MMA, exact in int32 for the tile
+        // (|sum| <= 32 * 255 * 127 < 2^24), then folded into the fp32 O at 256 p = P 256 / 255.
+        std::uint32_t pf[4];
+        int pi[2] = {0, 0};
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          std::uint32_t hx[4];
+#pragma unroll
+          for (int nt = 0; nt < 4; ++nt) {
+            const int a = __float2int_rn(255.0f * ex2_approx(sc[nt][2 * r] + bias[r] - 8.0f));
+            const int b = __float2int_rn(255.0f * ex2_approx(sc[nt][2 * r + 1] + bias[r] - 8.0f));
+            hx[nt] = static_cast<std::uint32_t>(a) | static_cast<std::uint32_t>(b) << 8;
+            pi[r] += a + b;
+          }
+          pf[r] = hx[0] | hx[1] << 16;
+          pf[2 + r] = hx[2] | hx[3] << 16;
+        }
+        constexpr float kU8 = 256.0f / 255.0f;
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          pi[r] += __shfl_xor_sync(0xffffffffu, pi[r], 1);
+          pi[r] += __shfl_xor_sync(0xffffffffu, pi[r], 2);
+          l[r] = l[r] * corr[r] + static_cast<float>(pi[r]) * kU8;
+        }
+        const float fv = sv * kU8;
+#pragma unroll
+        for (int dp = 0; dp < kHeadDim / 16; ++dp) {
+          int t[2][4] = {};
+          std::uint32_t b[4];
+          ldsm_x4(b, vs + vt_off(16 * dp + 8 * (lm / 2) + lr, lm % 2));
+          mma_u8s8(t[0], pf, b);
+          mma_u8s8(t[1], pf, b + 2);
+#pragma unroll
+          for (int x = 0; x < 2; ++x) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+              o[2 * dp + x][e] = o[2 * dp + x][e] * corr[e / 2] + static_cast<float>(t[x][e]) * fv;
+            }
+          }
+        }
+      } else if constexpr (kFp8 && kProto == kProtoOff) {
         // One E4M3 A fragment over the 32 keys, in V^T's order.
         std::uint32_t pf[4];
 #pragma unroll
@@ -748,7 +849,7 @@ __global__ void __launch_bounds__(kFaThreads, 1)
             for (int e = 0; e < 4; ++e) o[2 * dp + x][e] = o[2 * dp + x][e] * corr[e / 2] + t[x][e];
           }
         }
-      } else if constexpr (kHalf) {
+      } else if constexpr (kHalf || kProto == kProtoI8Qk) {
         // P = p (not 256 p: the FP16 accumulator holds 32 keys of P V) as FP16 A fragments, each
         // tile's P V folded into the fp32 O at 256 p, the scale O and l carry.
         std::uint32_t pf[2][4];
@@ -1008,18 +1109,38 @@ void check_launch(const char *what) {
   }
 }
 
-template <bool kFp8, bool kHalf = false>
+template <bool kFp8, bool kHalf = false, int kProto = kProtoOff>
 void launch_fa(dim3 grid, Queries qs, int start, int width, float scale, Columns cols,
                PassBuffers buf, int splits, int resume, Carry carry, cudaStream_t stream) {
+  constexpr int kSmem = kFaSmemBytesP<kFp8, kProto>;
   static const cudaError_t attribute = cudaFuncSetAttribute(
-      fa_kernel<kFp8, kHalf>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFaSmemBytes<kFp8>);
+      fa_kernel<kFp8, kHalf, kProto>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
   if (attribute != cudaSuccess) {
     throw std::runtime_error(std::string("ignis_hq_prompt_attention: shared memory attribute: ") +
                              cudaGetErrorString(attribute));
   }
-  fa_kernel<kFp8, kHalf><<<grid, kFaThreads, kFaSmemBytes<kFp8>, stream>>>(
+  fa_kernel<kFp8, kHalf, kProto><<<grid, kFaThreads, kSmem, stream>>>(
       qs, start, width, scale, cols, buf, splits, resume, carry);
   check_launch(kFp8 || kHalf ? "band attention" : "window attention");
+}
+
+// PROTOTYPE: IGNIS_PROTO_BAND (off, i8, i8qk), read once; a value it does not know throws.
+int proto_band() {
+  static const int mode = [] {
+    const char *env = std::getenv("IGNIS_PROTO_BAND");
+    const std::string m = env == nullptr ? "" : env;
+    int r = kProtoOff;
+    if (m == "i8") {
+      r = kProtoI8;
+    } else if (m == "i8qk") {
+      r = kProtoI8Qk;
+    } else if (!m.empty() && m != "off") {
+      throw std::invalid_argument("IGNIS_PROTO_BAND must be off, i8 or i8qk, got '" + m + "'");
+    }
+    std::fprintf(stderr, "ignis proto: IGNIS_PROTO_BAND=%s\n", r == kProtoI8 ? "i8" : r == kProtoI8Qk ? "i8qk" : "off");
+    return r;
+  }();
+  return mode;
 }
 
 } // namespace
@@ -1101,8 +1222,13 @@ void ignis_hq_prompt_attention(const ninfer::Tensor &q, const ninfer::Tensor &k,
   const auto visible = static_cast<std::uint32_t>(start_position + width);
   auto scope = workspace.scope();
   const Workspace ws = allocate(workspace, width, visible, options.band_keys);
-  const bool half_band = options.precision == IgnisHqPromptPrecision::kFp16;
-  const std::uint32_t band = band_capacity(visible, options.band_keys, options.precision);
+  // PROTOTYPE: IGNIS_PROTO_BAND takes the FP16 band's place, and only its place.
+  const int proto = proto_band();
+  require(proto == kProtoOff || options.precision == IgnisHqPromptPrecision::kFp16,
+          "IGNIS_PROTO_BAND replaces the FP16 band: set IGNIS_MODEL_PREFILL_ATTENTION=fp16");
+  const bool half_band = options.precision == IgnisHqPromptPrecision::kFp16 && proto == kProtoOff;
+  const std::uint32_t band = band_capacity(
+      visible, options.band_keys, proto == kProtoI8 ? IgnisHqPromptPrecision::kFp8 : options.precision);
   const std::uint32_t window = window_capacity(width, visible);
   const BandArea area = band_area(width, visible, options.band_keys, window);
   auto *area_base = static_cast<std::uint8_t *>(ws.area.data);
@@ -1167,6 +1293,16 @@ void ignis_hq_prompt_attention(const ninfer::Tensor &q, const ninfer::Tensor &k,
       check_launch("band tiles");
       launch_fa<false, true>(fa_grid, qs, start_position, width, scale, cols, buf, splits, resume,
                              carry, stream);
+    } else if (proto == kProtoI8) {
+      tile_kernel<true, false, kProtoI8><<<tiles, 256, 0, stream>>>(src, cols, buf, 0);
+      check_launch("band tiles");
+      launch_fa<true, false, kProtoI8>(fa_grid, qs, start_position, width, scale, cols, buf, splits,
+                                       resume, carry, stream);
+    } else if (proto == kProtoI8Qk) {
+      tile_kernel<true, false, kProtoI8Qk><<<tiles, 256, 0, stream>>>(src, cols, buf, 0);
+      check_launch("band tiles");
+      launch_fa<true, false, kProtoI8Qk>(fa_grid, qs, start_position, width, scale, cols, buf, splits,
+                                         resume, carry, stream);
     } else {
       tile_kernel<true><<<tiles, 256, 0, stream>>>(src, cols, buf, 0);
       check_launch("band tiles");
