@@ -14,6 +14,8 @@
 #   tools/sm8x-dense-proto/sass-check.sh BINARY [ARCH]
 #
 # ARCH defaults to sm_86 (also sm_120a). cuobjdump comes from PATH, else $CUDA_PATH/bin.
+# SASS_CHECK_PATTERN (default sm8x_dense_) picks the functions held to the rule; another pattern is
+# the check's negative control (peak_kernel, the bench's f32-accumulate meter, must FAIL).
 set -eu
 if [ $# -lt 1 ]; then
   echo "usage: $0 BINARY [ARCH]" >&2
@@ -29,13 +31,15 @@ if [ -z "$CUOBJDUMP" ]; then
   echo "sass-check: no cuobjdump on PATH or under \$CUDA_PATH/bin" >&2
   exit 2
 fi
-"$CUOBJDUMP" -sass -arch "$ARCH" "$BIN" | awk -v arch="$ARCH" '
+"$CUOBJDUMP" -sass -arch "$ARCH" "$BIN" | awk -v arch="$ARCH" -v pat="${SASS_CHECK_PATTERN:-sm8x_dense_}" '
 function pretty(fn,   name, args, rest) {
   name = fn
-  sub(/^.*sm8x_dense_/, "sm8x_dense_", name)
-  match(name, /^sm8x_dense_[a-z0-9]+/)
-  rest = substr(name, RLENGTH + 1)
-  name = substr(name, 1, RLENGTH)
+  if (match(name, /sm8x_dense_[a-z0-9]+/) || match(name, /[a-z0-9_]*_kernel/)) {
+    rest = substr(name, RSTART + RLENGTH)
+    name = substr(name, RSTART, RLENGTH)
+  } else {
+    rest = ""
+  }
   args = ""
   while (match(rest, /Li[0-9]+E/)) {
     args = args (args == "" ? "" : ",") substr(rest, RSTART + 2, RLENGTH - 3)
@@ -43,8 +47,8 @@ function pretty(fn,   name, args, rest) {
   }
   return args == "" ? name : name "<" args ">"
 }
-/Function : / { fn = $3; if (fn ~ /sm8x_dense_/) { seen[fn] = 1; nfn++ } next }
-fn ~ /sm8x_dense_/ {
+/Function : / { fn = $3; if (fn ~ pat) { seen[fn] = 1; nfn++ } next }
+fn ~ pat {
   line = $0
   while (match(line, /[A-Z]*MMA[.A-Z0-9_]*/)) {
     op = substr(line, RSTART, RLENGTH)
