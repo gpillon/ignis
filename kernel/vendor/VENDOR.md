@@ -88,9 +88,11 @@ will not overwrite a patched file unless it is told to.
 A patch is admitted for one of three reasons, and its `reason` says which: a
 measured bottleneck (ADR 0031); a demonstrated correctness bug (ADR 0037),
 in which case the `reason` also names the test that fails without the patch;
-or portability to an architecture the build targets (ADR 0077), in
-which case the `reason` names the architecture and the compile it fixes, and
-the default `120a` build's device code is unchanged. There are three
+or portability to a CUDA architecture the build targets, or to a card smaller
+than the RTX 5090 (ADR 0077), in which case the `reason` names the CUDA
+architecture or the card size and what it fixes, a compile or a launch that
+fails at run time there, and the default `120a` build's device code is
+unchanged. There are three
 portability patches. `src/core/pdl.cuh` (GitHub #456): programmatic dependent
 launch is a no-op below sm_90, and a device below compute capability 9.0
 launches without the programmatic-serialization attribute. The GDN gating
