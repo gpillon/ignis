@@ -678,6 +678,17 @@ endforeach()
 # TFLOP/s, under the debug SM caps). A tool and NOT a CTest; timing wants the card to itself.
 add_executable(ignis_kernel_trellis_linear_bench bench_trellis_linear.cu)
 target_link_libraries(ignis_kernel_trellis_linear_bench PRIVATE ignis_kernel ignis_vendor)
+# PROTOTYPE (sm8x dense prefill, phase 2a; GitHub #474), throwaway: the dense INT8 prefill bench.
+# Standalone, so one binary carries it to another card: it compiles the trellis linear's three
+# sources itself instead of linking the leaf, and the CUDA runtime statically. Built for every
+# IGNIS_CUDA_ARCHITECTURES entry. A tool, not a CTest.
+add_executable(ignis_sm8x_dense_bench bench_sm8x_dense.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src/trellis_linear.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src/trellis_linear_prefill.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src/trellis_linear_decode.cu)
+target_include_directories(ignis_sm8x_dense_bench PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+set_target_properties(ignis_sm8x_dense_bench PROPERTIES CUDA_RUNTIME_LIBRARY Static)
 # The MoE microbenchmark: a report of every op's achieved bandwidth or throughput. The spec's
 # decode floor (one-token routed decode >= 50% of the DRAM roofline) is its one pass/fail,
 # opt-in with --check-floor; it is a tool and NOT a CTest while that floor is open, so the stage
