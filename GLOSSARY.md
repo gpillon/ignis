@@ -567,9 +567,10 @@ tells artifacts of one family apart; the family never does.
 _Avoid_: model name
 
 **Alias**:
-A served id one catalog entry also answers to on a **card class** below that
-id's own entry: its family's default id, or another entry's served id of the
-same family (ADR 0064, ADR 0074). It resolves only within
+A served id one catalog entry also answers to on a card that cannot load that
+id's own entry, its **card class** below the entry's or its **GPU generation**
+older: its family's default id, or another entry's served id of the same
+family (ADR 0064, ADR 0074, ADR 0079). It resolves only within
 one model family — the entry that answers to it holds an artifact whose header
 names that family — and only to an entry the card can load.
 

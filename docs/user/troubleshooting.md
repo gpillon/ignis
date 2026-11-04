@@ -212,8 +212,9 @@ shown above the Models tab's list
   the same `--download-path`, is fetching the entry. Download it once that
   ends, or let the command land it.
 - `409 model_already_downloaded`: the entry is on disk; **Load** switches to it.
-- `409 model_above_card_class`: the card cannot load the entry (**Not for this
-  card**).
+- `409 model_above_card_class`, `409 model_above_gpu_generation`: the card
+  cannot load the entry, by its class or by its GPU generation (**Not for
+  this card**).
 - `500 download_failed`: the download could not begin, the message says why:
   most often the entry's `<artifact>.lock` cannot be opened, because the
   server cannot create or write to `--download-path`. Give the server's user
@@ -386,6 +387,20 @@ and the loaded model keeps serving. Name an entry the card loads on
 an alias but its artifact's header names another model family than the id's,
 the message names both families: that entry's files, or the `family` its
 catalog states, are wrong ([an operator catalog](guides/operator-catalog.md#an-entrys-family-and-an-alias-of-your-own)).
+
+### `409 model_above_gpu_generation`
+
+The request, the switch or the download names a catalog entry that needs a
+newer GPU generation than this card's: an entry that states `generation:
+blackwell` (the NVFP4 27B, Swift 1.5, Flash-Next, the image model) on an RTX 30
+or RTX 40 card. The message names the generation the entry needs and the card,
+its name, compute capability and generation, and the entry's class as well
+when that is above the card's too; the loaded model keeps serving, and a start
+that would load it is refused. On such a card name `qwen3.8-27b` or
+`qwen3.8-27b-abliterated`, which their 16 GB entries serve there, or one of
+those entries by its own id ([Get a model](guides/models.md#the-catalog)). An
+operator entry that states a `generation` its artifact does not need is
+fixed in its catalog ([an operator catalog](guides/operator-catalog.md)).
 
 ### `409 model_kind_mismatch`
 

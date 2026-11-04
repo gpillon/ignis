@@ -13,9 +13,17 @@
 //! another entry's id of the same family (ADR 0074): the uncensored variant's
 //! 16 GB build, also built in (GitHub #423), answers to
 //! `qwen3.8-27b-abliterated` on a 16 GB card, and Swift 1.5's (GitHub #473)
-//! to `swift-1.5-27b`. A 24 GB card (GitHub #480), an RTX 3090 or RTX 4090,
-//! is below every 32 GB entry and above every 16 GB one, so there the 16 GB
-//! entries answer as on a 16 GB card.
+//! to `swift-1.5-27b`. A 24 GB card (GitHub #480) is below every 32 GB entry
+//! and above every 16 GB one, so there the 16 GB entries answer as on a 16 GB
+//! card.
+//!
+//! The card is injected as the start reads it, by its total memory and its
+//! compute capability, so the catalog fits an entry to the card's class and
+//! its GPU generation together (spec #474, ADR 0079). On an RTX 3090 (24 GiB,
+//! 8.6) and an RTX 4090 (24 GiB, 8.9) every Blackwell-only entry is refused
+//! `409 model_above_gpu_generation`, while the 27B's 16 GB entries, which
+//! state no generation, answer to their aliases; a 24 GB Blackwell card, an
+//! RTX 5090 and no card at all refuse nothing by generation.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +32,8 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use ignis_core::compute::ModelFamily;
-use ignis_server::config::profile::CardClass;
+use ignis_server::config::arch::ComputeCapability;
+use ignis_server::config::profile::{CardClass, CardReading, RTX_5090_TOTAL_BYTES};
 use ignis_server::download::catalog::Catalog;
 use ignis_server::model_switch::{CatalogModels, Switcher};
 use ignis_server::{ModelStatus, Server};
@@ -73,21 +82,21 @@ fn catalog_on_disk(tag: &str) -> CatalogModels {
     CatalogModels { catalog: Arc::new(catalog), dir }
 }
 
-/// A server on `start`, on a card of class `card`, whose requests may switch
-/// to any built-in catalog entry on disk, the artifacts' headers of the three
-/// 16 GB entries naming the 27B's family.
-fn server_on(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, tag: &str) -> Server {
+/// A server on `start`, on `card`, whose requests may switch to any built-in
+/// catalog entry on disk, the artifacts' headers of the three 16 GB entries
+/// naming the 27B's family.
+fn server_on(loader: &Arc<MockLoader>, start: &str, card: Option<CardReading>, tag: &str) -> Server {
     abliterated_server(loader, start, card, ModelFamily::Qwen38_27b, tag)
 }
 
-fn server_over(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, catalog: CatalogModels) -> Server {
+fn server_over(loader: &Arc<MockLoader>, start: &str, card: Option<CardReading>, catalog: CatalogModels) -> Server {
     Server::from_active(loader.model(start))
-        .with_switcher(Switcher::new(Arc::clone(loader) as _, PATIENT).with_catalog(catalog, true).with_card_class(card))
+        .with_switcher(Switcher::new(Arc::clone(loader) as _, PATIENT).with_catalog(catalog, true).with_card(card))
 }
 
 /// [`server_on`], the header of the uncensored variant's 16 GB build's
 /// artifact naming `header`.
-fn abliterated_server(loader: &Arc<MockLoader>, start: &str, card: Option<CardClass>, header: ModelFamily, tag: &str) -> Server {
+fn abliterated_server(loader: &Arc<MockLoader>, start: &str, card: Option<CardReading>, header: ModelFamily, tag: &str) -> Server {
     loader.header(SIXTEEN, ModelFamily::Qwen38_27b);
     loader.header(ABLITERATED_16G, header);
     loader.header(SWIFT_16G, ModelFamily::Qwen38_27b);
@@ -189,12 +198,38 @@ fn refused_on(status: StatusCode, body: &Value, model: &str, card: CardClass) {
     assert!(message.contains(model) && message.contains("32 GB") && message.contains(&format!("the {card} class")), "{message}");
 }
 
-/// The total memory of an RTX 3090 or an RTX 4090, as NVML reports it.
-const RTX_3090_TOTAL: u64 = 24 << 30;
+/// A card by its total memory and its compute capability, as the start
+/// reads it (spec #474).
+fn card(gib: u64, name: &str, major: u32, minor: u32) -> Option<CardReading> {
+    Some(CardReading::of(gib << 30, name, ComputeCapability::new(major, minor)))
+}
 
-/// The class of a card of [`RTX_3090_TOTAL`]: the 24 GB one (GitHub #480).
-fn twenty_four() -> Option<CardClass> {
-    CardClass::of_total(RTX_3090_TOTAL)
+/// A 16 GB Blackwell card.
+fn sixteen() -> Option<CardReading> {
+    card(16, "NVIDIA GeForce RTX 5080", 12, 0)
+}
+
+/// A 24 GB card of the Blackwell generation (GitHub #480): its class the RTX
+/// 3090's and RTX 4090's, its generation every entry's.
+fn twenty_four() -> Option<CardReading> {
+    card(24, "NVIDIA RTX (Blackwell)", 12, 0)
+}
+
+fn rtx_5090() -> Option<CardReading> {
+    Some(CardReading::of(RTX_5090_TOTAL_BYTES, "NVIDIA GeForce RTX 5090", ComputeCapability::new(12, 0)))
+}
+
+fn rtx_pro_6000() -> Option<CardReading> {
+    card(96, "NVIDIA RTX PRO 6000 Blackwell", 12, 0)
+}
+
+/// The cards spec #474 is written for: 24 GiB each, Ampere and Ada.
+fn rtx_3090() -> Option<CardReading> {
+    card(24, "NVIDIA GeForce RTX 3090", 8, 6)
+}
+
+fn rtx_4090() -> Option<CardReading> {
+    card(24, "NVIDIA GeForce RTX 4090", 8, 9)
 }
 
 /// The server still serves `loaded`, nothing was prepared or loaded, and a
@@ -220,7 +255,7 @@ async fn still_serving(app: &axum::Router, server: &Server, loader: &MockLoader,
 #[tokio::test]
 async fn an_explicit_switch_to_an_entry_above_the_card_class_is_refused_before_anything_stops() {
     let loader = MockLoader::new();
-    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "explicit");
+    let server = server_on(&loader, SIXTEEN, sixteen(), "explicit");
     let app = server.app();
     for model in [FLASH_NEXT, IMAGE] {
         let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": model }))).await;
@@ -241,7 +276,7 @@ async fn an_explicit_switch_to_an_entry_above_the_card_class_is_refused_before_a
 #[tokio::test]
 async fn a_request_naming_an_entry_above_the_card_class_is_refused_before_anything_stops() {
     let loader = MockLoader::new();
-    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "implicit");
+    let server = server_on(&loader, SIXTEEN, sixteen(), "implicit");
     let app = server.app();
     for model in [FLASH_NEXT, &format!("{FLASH_NEXT}@agent")] {
         let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(model))).await;
@@ -274,7 +309,7 @@ async fn a_request_naming_an_entry_above_the_card_class_is_refused_before_anythi
 #[tokio::test]
 async fn on_a_16gb_card_the_default_id_is_served_by_the_entry_that_answers_to_it() {
     let loader = MockLoader::new();
-    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "alias");
+    let server = server_on(&loader, SIXTEEN, sixteen(), "alias");
     let app = server.app();
     // The lane tag is kept, an empty one included.
     for model in [DEFAULT_27B, &format!("{DEFAULT_27B}@agent"), &format!("{DEFAULT_27B}@")] {
@@ -311,7 +346,7 @@ async fn on_a_16gb_card_the_default_id_is_served_by_the_entry_that_answers_to_it
 #[tokio::test]
 async fn on_a_16gb_card_the_default_id_switches_to_the_entry_that_answers_to_it() {
     let loader = MockLoader::new();
-    let server = server_on(&loader, FLASH_NEXT, Some(CardClass::Gb16), "alias-switch");
+    let server = server_on(&loader, FLASH_NEXT, sixteen(), "alias-switch");
     let app = server.app();
     let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(FLASH_NEXT))).await;
     assert_eq!(status, StatusCode::OK, "the loaded model is served, whatever its class: {completion}");
@@ -346,7 +381,7 @@ async fn an_alias_never_resolves_to_an_artifact_of_another_family() {
     for (header, tag) in [(ModelFamily::FlashNext, "family-other"), (ModelFamily::Qwen38_27b, "family-same")] {
         let loader = MockLoader::new();
         loader.header(SIXTEEN, header);
-        let server = server_over(&loader, "mock-a", Some(CardClass::Gb16), catalog_on_disk(tag));
+        let server = server_over(&loader, "mock-a", sixteen(), catalog_on_disk(tag));
         let app = server.app();
         if header == ModelFamily::Qwen38_27b {
             let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(DEFAULT_27B))).await;
@@ -377,7 +412,7 @@ async fn an_alias_never_resolves_to_an_artifact_of_another_family() {
 /// Flash-Next switches to it.
 #[tokio::test]
 async fn on_a_32gb_card_or_an_unknown_one_nothing_changes() {
-    for (card, tag) in [(Some(CardClass::Gb32), "32"), (None, "unknown")] {
+    for (card, tag) in [(rtx_5090(), "32"), (None, "unknown")] {
         let loader = MockLoader::new();
         let server = server_on(&loader, DEFAULT_27B, card, tag);
         let app = server.app();
@@ -401,7 +436,7 @@ async fn on_a_32gb_card_or_an_unknown_one_nothing_changes() {
 #[tokio::test]
 async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_reason() {
     let loader = MockLoader::new();
-    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "lists");
+    let server = server_on(&loader, SIXTEEN, sixteen(), "lists");
     let app = server.app();
     let (status, models) = send(&app, Method::GET, "/v1/models", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -438,7 +473,7 @@ async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_
         }
     }
 
-    let thirty_two = server_on(&MockLoader::new(), SIXTEEN, Some(CardClass::Gb32), "lists-32").app();
+    let thirty_two = server_on(&MockLoader::new(), SIXTEEN, rtx_5090(), "lists-32").app();
     let (_, catalog) = send(&thirty_two, Method::GET, "/v1/models/catalog", None).await;
     for row in catalog["data"].as_array().unwrap() {
         assert_eq!((row["available"].as_bool(), row.get("reason")), (Some(true), None), "{row}");
@@ -456,7 +491,7 @@ async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_
 #[tokio::test]
 async fn a_catalog_id_the_operator_listed_is_fitted_to_the_card_all_the_same() {
     let loader = MockLoader::new();
-    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "listed");
+    let server = server_on(&loader, SIXTEEN, sixteen(), "listed");
     let switcher = server.switcher.as_ref().unwrap();
     let listed = [(FLASH_NEXT, switch_support::source(FLASH_NEXT).artifact), ("acme-own", switch_support::source("acme-own").artifact)];
     let listed: std::collections::BTreeMap<String, std::path::PathBuf> = listed.into_iter().map(|(id, artifact)| (id.to_owned(), artifact)).collect();
@@ -492,11 +527,11 @@ async fn a_catalog_id_the_operator_listed_is_fitted_to_the_card_all_the_same() {
 async fn the_prompt_enhancer_is_served_by_the_entry_that_answers_to_it() {
     use ignis_server::images::enhance::{enhancer_on_this_card, unknown_enhancer};
     let none = std::collections::BTreeMap::new();
-    let loaded = server_on(&MockLoader::new(), SIXTEEN, Some(CardClass::Gb16), "enhancer-loaded");
+    let loaded = server_on(&MockLoader::new(), SIXTEEN, sixteen(), "enhancer-loaded");
     assert_eq!(enhancer_on_this_card(&loaded, DEFAULT_27B), SIXTEEN, "the loaded model rewrites in place");
     assert_eq!(unknown_enhancer(&loaded, DEFAULT_27B, &none), None);
 
-    let visited = server_on(&MockLoader::new(), FLASH_NEXT, Some(CardClass::Gb16), "enhancer-visit");
+    let visited = server_on(&MockLoader::new(), FLASH_NEXT, sixteen(), "enhancer-visit");
     assert_eq!(enhancer_on_this_card(&visited, DEFAULT_27B), SIXTEEN);
     let via = visited.switcher.as_ref().unwrap().text_model(SIXTEEN).expect("a visit loads the 16 GB 27B");
     assert_eq!(via.artifact.file_name().and_then(|name| name.to_str()), Some(SIXTEEN_ARTIFACT));
@@ -507,11 +542,11 @@ async fn the_prompt_enhancer_is_served_by_the_entry_that_answers_to_it() {
     assert_eq!(unknown_enhancer(&visited, ABLITERATED, &none), None);
 
     // An enhancer no entry answers to on this card: Flash-Next's id.
-    let alone = server_on(&MockLoader::new(), SIXTEEN, Some(CardClass::Gb16), "enhancer-alone");
+    let alone = server_on(&MockLoader::new(), SIXTEEN, sixteen(), "enhancer-alone");
     assert_eq!(enhancer_on_this_card(&alone, FLASH_NEXT), FLASH_NEXT);
     assert!(unknown_enhancer(&alone, FLASH_NEXT, &none).is_some_and(|reason| reason.contains(FLASH_NEXT)));
 
-    let thirty_two = server_on(&MockLoader::new(), FLASH_NEXT, Some(CardClass::Gb32), "enhancer-32");
+    let thirty_two = server_on(&MockLoader::new(), FLASH_NEXT, rtx_5090(), "enhancer-32");
     assert_eq!(enhancer_on_this_card(&thirty_two, DEFAULT_27B), DEFAULT_27B, "its own entry fits");
     assert_eq!(unknown_enhancer(&thirty_two, DEFAULT_27B, &none), None);
 }
@@ -524,7 +559,7 @@ async fn the_prompt_enhancer_is_served_by_the_entry_that_answers_to_it() {
 #[tokio::test]
 async fn on_a_16gb_card_the_uncensored_variants_id_is_served_by_its_16gb_build() {
     let loader = MockLoader::new();
-    let server = abliterated_server(&loader, SIXTEEN, Some(CardClass::Gb16), ModelFamily::Qwen38_27b, "abliterated");
+    let server = abliterated_server(&loader, SIXTEEN, sixteen(), ModelFamily::Qwen38_27b, "abliterated");
     let app = server.app();
     let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
     assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(ABLITERATED_16G)), "{completion}");
@@ -551,7 +586,7 @@ async fn on_a_16gb_card_the_uncensored_variants_id_is_served_by_its_16gb_build()
 #[tokio::test]
 async fn the_switch_to_the_uncensored_variants_16gb_build_needs_its_artifact_on_disk() {
     let loader = MockLoader::new();
-    let server = abliterated_server(&loader, SIXTEEN, Some(CardClass::Gb16), ModelFamily::Qwen38_27b, "abliterated-absent");
+    let server = abliterated_server(&loader, SIXTEEN, sixteen(), ModelFamily::Qwen38_27b, "abliterated-absent");
     std::fs::remove_file(artifact_of(&server, ABLITERATED_16G)).unwrap();
     let app = server.app();
     let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
@@ -570,7 +605,7 @@ async fn the_switch_to_the_uncensored_variants_16gb_build_needs_its_artifact_on_
 #[tokio::test]
 async fn an_uncensored_variants_16gb_build_whose_header_names_another_family_does_not_answer() {
     let loader = MockLoader::new();
-    let server = abliterated_server(&loader, SIXTEEN, Some(CardClass::Gb16), ModelFamily::FlashNext, "abliterated-header");
+    let server = abliterated_server(&loader, SIXTEEN, sixteen(), ModelFamily::FlashNext, "abliterated-header");
     let app = server.app();
     let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
     refused_by_class(status, &refused, ABLITERATED);
@@ -595,7 +630,7 @@ async fn an_uncensored_variants_16gb_build_whose_header_names_another_family_doe
 /// request's switch and an explicit one, whatever the 16 GB build's header.
 #[tokio::test]
 async fn on_other_cards_the_uncensored_variants_id_is_its_own_entrys() {
-    for (card, tag) in [(Some(CardClass::Gb32), "abliterated-32"), (Some(CardClass::Gb96), "abliterated-96"), (None, "abliterated-unknown")] {
+    for (card, tag) in [(rtx_5090(), "abliterated-32"), (rtx_pro_6000(), "abliterated-96"), (None, "abliterated-unknown")] {
         let loader = MockLoader::new();
         let server = abliterated_server(&loader, DEFAULT_27B, card, ModelFamily::Qwen38_27b, tag);
         let app = server.app();
@@ -622,7 +657,7 @@ async fn on_other_cards_the_uncensored_variants_id_is_its_own_entrys() {
 #[tokio::test]
 async fn on_a_16gb_card_the_model_lists_name_the_build_that_serves_the_uncensored_variant() {
     let loader = MockLoader::new();
-    let server = abliterated_server(&loader, SIXTEEN, Some(CardClass::Gb16), ModelFamily::Qwen38_27b, "abliterated-lists");
+    let server = abliterated_server(&loader, SIXTEEN, sixteen(), ModelFamily::Qwen38_27b, "abliterated-lists");
     let app = server.app();
     let (status, models) = send(&app, Method::GET, "/v1/models", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -651,7 +686,7 @@ async fn on_a_16gb_card_the_model_lists_name_the_build_that_serves_the_uncensore
 #[tokio::test]
 async fn on_a_16gb_card_swifts_id_is_served_by_its_16gb_build_which_can_be_named_too() {
     let loader = MockLoader::new();
-    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "swift");
+    let server = server_on(&loader, SIXTEEN, sixteen(), "swift");
     let app = server.app();
     let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(SWIFT))).await;
     assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(SWIFT_16G)), "{completion}");
@@ -692,7 +727,7 @@ async fn on_a_16gb_card_swifts_id_is_served_by_its_16gb_build_which_can_be_named
 #[tokio::test]
 async fn swifts_id_on_a_16gb_card_needs_its_16gb_build_on_disk_and_of_the_27bs_family() {
     let loader = MockLoader::new();
-    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "swift-absent");
+    let server = server_on(&loader, SIXTEEN, sixteen(), "swift-absent");
     std::fs::remove_file(artifact_of(&server, SWIFT_16G)).unwrap();
     let app = server.app();
     let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(SWIFT))).await;
@@ -703,7 +738,7 @@ async fn swifts_id_on_a_16gb_card_needs_its_16gb_build_on_disk_and_of_the_27bs_f
     still_serving(&app, &server, &loader, SIXTEEN).await;
 
     let loader = MockLoader::new();
-    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "swift-header");
+    let server = server_on(&loader, SIXTEEN, sixteen(), "swift-header");
     loader.header(SWIFT_16G, ModelFamily::FlashNext);
     let app = server.app();
     let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(SWIFT))).await;
@@ -726,7 +761,7 @@ async fn swifts_id_on_a_16gb_card_needs_its_16gb_build_on_disk_and_of_the_27bs_f
 /// explicit one, and every list marks it available.
 #[tokio::test]
 async fn on_other_cards_swifts_id_is_its_nvfp4_entrys() {
-    for (card, tag) in [(Some(CardClass::Gb32), "swift-32"), (Some(CardClass::Gb96), "swift-96"), (None, "swift-unknown")] {
+    for (card, tag) in [(rtx_5090(), "swift-32"), (rtx_pro_6000(), "swift-96"), (None, "swift-unknown")] {
         let loader = MockLoader::new();
         let server = server_on(&loader, DEFAULT_27B, card, tag);
         let app = server.app();
@@ -753,7 +788,7 @@ async fn on_other_cards_swifts_id_is_its_nvfp4_entrys() {
 #[tokio::test]
 async fn on_a_16gb_card_the_model_lists_name_the_build_that_serves_swift() {
     let loader = MockLoader::new();
-    let server = server_on(&loader, SIXTEEN, Some(CardClass::Gb16), "swift-lists");
+    let server = server_on(&loader, SIXTEEN, sixteen(), "swift-lists");
     let app = server.app();
     let (status, models) = send(&app, Method::GET, "/v1/models", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -773,13 +808,15 @@ async fn on_a_16gb_card_the_model_lists_name_the_build_that_serves_swift() {
     assert!(row(SWIFT)["reason"].as_str().unwrap().contains(&format!("served by {SWIFT_16G}")), "{catalog}");
 }
 
-/// GitHub #480: on a 24 GB card, an RTX 3090 or RTX 4090, a switch to
+/// GitHub #480: on a 24 GB card of the Blackwell generation a switch to
 /// Flash-Next or to the image model, explicit or a request's, is refused
 /// `409 model_above_card_class` before anything stops, naming the entry's
-/// class and the card's, and the loaded model serves on.
+/// class and the card's, and the loaded model serves on. Its generation
+/// refuses nothing (spec #474); on an RTX 3090 or RTX 4090, the same class,
+/// the code is the generation's, below.
 #[tokio::test]
 async fn on_a_24gb_card_a_switch_to_flash_next_or_the_image_model_is_refused_before_anything_stops() {
-    assert_eq!(twenty_four(), Some(CardClass::Gb24));
+    assert_eq!(twenty_four().unwrap().class(), Some(CardClass::Gb24));
     let loader = MockLoader::new();
     let server = server_on(&loader, SIXTEEN, twenty_four(), "24-refused");
     let app = server.app();
@@ -794,11 +831,12 @@ async fn on_a_24gb_card_a_switch_to_flash_next_or_the_image_model_is_refused_bef
     still_serving(&app, &server, &loader, SIXTEEN).await;
 }
 
-/// GitHub #480: on a 24 GB card no built-in entry states the card's class, so
-/// a request naming `qwen3.8-27b` is served by the 16 GB entry through its
-/// alias, with no switch when it is loaded, and a switch by the id goes to it;
-/// `qwen3.8-27b-abliterated` switches to its 16 GB build. The lists mark the
-/// 32 GB entries unavailable, naming the entry that serves each id here.
+/// GitHub #480: on a 24 GB Blackwell card no built-in entry states the card's
+/// class, so a request naming `qwen3.8-27b` is served by the 16 GB entry
+/// through its alias, with no switch when it is loaded, and a switch by the
+/// id goes to it; `qwen3.8-27b-abliterated` switches to its 16 GB build. The
+/// lists mark the 32 GB entries unavailable, naming the entry that serves
+/// each id here.
 #[tokio::test]
 async fn on_a_24gb_card_the_default_id_is_served_by_the_16gb_entry() {
     let loader = MockLoader::new();
@@ -828,4 +866,179 @@ async fn on_a_24gb_card_the_default_id_is_served_by_the_16gb_entry() {
     assert_eq!((status, accepted["to"].as_str()), (StatusCode::ACCEPTED, Some(SIXTEEN)), "{accepted}");
     assert_eq!(until_serving(&app).await["data"][0]["id"], SIXTEEN);
     assert_eq!(loader.loads(), [ABLITERATED_16G, SIXTEEN]);
+}
+
+/// A refusal by generation (spec #474, ADR 0079): `409
+/// model_above_gpu_generation`, naming what `model` needs and the card — its
+/// name, compute capability and generation.
+fn refused_by_generation(status: StatusCode, body: &Value, model: &str, card: &Option<CardReading>) {
+    let card = card.as_ref().unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{model}: {body}");
+    assert_eq!(body["error"]["code"], "model_above_gpu_generation", "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    let generation = card.generation().unwrap();
+    let named = format!("this card, {} (compute capability {}), is of the {generation} generation", card.name, card.capability);
+    assert!(message.contains(model) && message.contains("Blackwell generation (RTX 50, RTX PRO)") && message.contains(&named), "{message}");
+}
+
+/// Spec #474 on an RTX 3090 and an RTX 4090: a switch or a request to a
+/// Blackwell-only entry — Swift 1.5's NVFP4 entry and its trellis build,
+/// Flash-Next, the image model — is refused `409 model_above_gpu_generation`
+/// before anything stops, on every route that switches, `422` with the same
+/// code on the decision endpoint; the loaded model keeps serving. Where the
+/// class is above the card's too, the message names both.
+#[tokio::test]
+async fn on_an_rtx_3090_or_4090_a_blackwell_only_entry_is_refused_before_anything_stops() {
+    for (card, tag) in [(rtx_3090(), "3090-refused"), (rtx_4090(), "4090-refused")] {
+        let loader = MockLoader::new();
+        let server = server_on(&loader, SIXTEEN, card.clone(), tag);
+        let app = server.app();
+        for model in [SWIFT, SWIFT_16G, FLASH_NEXT, IMAGE] {
+            let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": model }))).await;
+            refused_by_generation(status, &refused, model, &card);
+        }
+        let tagged = format!("{FLASH_NEXT}@agent");
+        for (model, named) in [(SWIFT, SWIFT), (FLASH_NEXT, FLASH_NEXT), (tagged.as_str(), FLASH_NEXT)] {
+            let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(model))).await;
+            refused_by_generation(status, &refused, named, &card);
+        }
+        let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(FLASH_NEXT))).await;
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(status == StatusCode::CONFLICT && message.contains("a 32 GB card or larger") && message.contains("of the 24 GB class"), "both named: {message}");
+        let (status, refused) = send(&app, Method::POST, "/v1/responses", Some(response_body(SWIFT_16G))).await;
+        refused_by_generation(status, &refused, SWIFT_16G, &card);
+        let (status, refused) = send(&app, Method::POST, "/v1/images/generations", Some(json!({ "model": IMAGE, "prompt": "a fox", "size": "1024x1024" }))).await;
+        refused_by_generation(status, &refused, IMAGE, &card);
+        let (status, refused) = send(&app, Method::POST, "/v1/decide", Some(decision(FLASH_NEXT))).await;
+        assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("model_above_gpu_generation")), "{refused}");
+        still_serving(&app, &server, &loader, SIXTEEN).await;
+    }
+}
+
+/// Spec #474 on an RTX 3090 and an RTX 4090: `qwen3.8-27b` and
+/// `qwen3.8-27b-abliterated` are served by their 16 GB builds, which state no
+/// generation — the loaded one with no switch, the other switched to — and
+/// both lists report every Blackwell-only entry unavailable with the reason,
+/// naming the entry that serves its id here where one does; none of them is
+/// switchable.
+#[tokio::test]
+async fn on_an_rtx_3090_or_4090_the_27bs_ids_are_served_by_their_16gb_builds_and_the_lists_say_why() {
+    for (card, tag) in [(rtx_3090(), "3090-alias"), (rtx_4090(), "4090-alias")] {
+        let loader = MockLoader::new();
+        let server = server_on(&loader, SIXTEEN, card.clone(), tag);
+        let app = server.app();
+        let generation = card.as_ref().unwrap().generation().unwrap().to_string();
+
+        let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+        let listed: Vec<(&str, bool)> =
+            models["data"].as_array().unwrap().iter().map(|entry| (entry["id"].as_str().unwrap(), entry["available"].as_bool().unwrap())).collect();
+        assert_eq!(
+            listed,
+            [(SIXTEEN, true), (DEFAULT_27B, false), (ABLITERATED, false), (FLASH_NEXT, false), (IMAGE, false), (ABLITERATED_16G, true), (SWIFT, false), (SWIFT_16G, false)],
+            "{tag}: {models}"
+        );
+        let reason = |id: &str| -> String {
+            let entry = models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == id).unwrap();
+            entry["reason"].as_str().unwrap_or_default().to_owned()
+        };
+        for id in [DEFAULT_27B, ABLITERATED, FLASH_NEXT, IMAGE, SWIFT, SWIFT_16G] {
+            let reason = reason(id);
+            assert!(reason.contains(id) && reason.contains("Blackwell generation") && reason.contains(&format!("of the {generation} generation")), "{id}: {reason}");
+        }
+        assert!(reason(DEFAULT_27B).ends_with(&format!("served by {SIXTEEN}")), "{}", reason(DEFAULT_27B));
+        assert!(reason(ABLITERATED).ends_with(&format!("served by {ABLITERATED_16G}")), "{}", reason(ABLITERATED));
+        assert!(!reason(SWIFT).contains("served by") && !reason(SWIFT_16G).contains("card_class"), "{} / {}", reason(SWIFT), reason(SWIFT_16G));
+
+        let (_, catalog) = send(&app, Method::GET, "/v1/models/catalog", None).await;
+        for row in catalog["data"].as_array().unwrap() {
+            let id = row["id"].as_str().unwrap();
+            let fits = id == SIXTEEN || id == ABLITERATED_16G || CPU_MODELS.contains(&id);
+            assert_eq!((row["available"].as_bool(), row.get("reason").is_some()), (Some(fits), !fits), "{tag}: {row}");
+            if !fits {
+                assert_eq!(row["switchable"], false, "{row}");
+                assert!(row["reason"].as_str().unwrap().contains("Blackwell generation"), "{row}");
+            }
+        }
+
+        let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(DEFAULT_27B))).await;
+        assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(SIXTEEN)), "{completion}");
+        assert!(loader.loads().is_empty(), "served by the loaded 16 GB entry: {:?}", loader.loads());
+        let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
+        assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(ABLITERATED_16G)), "{completion}");
+        assert_eq!(loader.prepared_artifacts(), [artifact_of(&server, ABLITERATED_16G)], "the 16 GB build's artifact, not the NVFP4 entry's");
+        let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": DEFAULT_27B }))).await;
+        assert_eq!((status, accepted["to"].as_str()), (StatusCode::ACCEPTED, Some(SIXTEEN)), "{accepted}");
+        assert_eq!(until_serving(&app).await["data"][0]["id"], SIXTEEN);
+    }
+}
+
+/// Spec #474: the cards that change nothing by generation. On a 24 GB
+/// Blackwell card, an RTX 5090, and with no card read (a capability unread or
+/// absent), no list gives a generation as a reason, and a request naming
+/// Swift 1.5 switches to an entry of it: its trellis build on the 24 GB card,
+/// whose class is below the NVFP4 entry's, the NVFP4 entry elsewhere.
+#[tokio::test]
+async fn on_a_blackwell_card_or_none_nothing_is_refused_by_generation() {
+    for (card, tag, swift) in [(twenty_four(), "gen-24", SWIFT_16G), (rtx_5090(), "gen-5090", SWIFT), (None, "gen-none", SWIFT)] {
+        let loader = MockLoader::new();
+        let server = server_on(&loader, DEFAULT_27B, card, tag);
+        let app = server.app();
+        for path in ["/v1/models", "/v1/models/catalog"] {
+            let (_, listed) = send(&app, Method::GET, path, None).await;
+            for row in listed["data"].as_array().unwrap() {
+                assert!(!row["reason"].as_str().unwrap_or_default().contains("generation"), "{tag} {path}: {row}");
+            }
+        }
+        let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(SWIFT))).await;
+        assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(swift)), "{tag}: {completion}");
+    }
+}
+
+/// Spec #474: a card whose total is no class (48 GiB) but whose generation is
+/// Ada (8.9). The NVFP4 entry is refused by its generation alone — unavailable
+/// on the lists, naming the entry that serves its id — and the alias serves
+/// the 16 GB entry; Flash-Next is refused `409 model_above_gpu_generation`.
+#[tokio::test]
+async fn on_an_ada_card_of_no_class_the_alias_serves_the_16gb_entry() {
+    let ada = card(48, "NVIDIA RTX (Ada)", 8, 9);
+    assert_eq!(ada.as_ref().unwrap().class(), None);
+    let loader = MockLoader::new();
+    let server = server_on(&loader, SIXTEEN, ada.clone(), "ada-no-class");
+    let app = server.app();
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    let default = models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == DEFAULT_27B).cloned().unwrap();
+    assert_eq!(default["available"], false, "{default}");
+    let reason = default["reason"].as_str().unwrap();
+    assert!(reason.contains("of the Ada generation") && !reason.contains("card_class") && reason.ends_with(&format!("served by {SIXTEEN}")), "{reason}");
+    let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(DEFAULT_27B))).await;
+    assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(SIXTEEN)), "{completion}");
+    let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": FLASH_NEXT }))).await;
+    refused_by_generation(status, &refused, FLASH_NEXT, &ada);
+    still_serving(&app, &server, &loader, SIXTEEN).await;
+}
+
+/// Spec #474, ADR 0064's As built: the generation is the catalog entry's,
+/// whoever names its id, so on an RTX 3090 a catalog id the operator also
+/// listed by path (`switch.known_models`) is fitted all the same: unavailable
+/// on the list with the reason, and a switch or a request naming it refused
+/// `409 model_above_gpu_generation` before anything stops.
+#[tokio::test]
+async fn on_an_rtx_3090_a_catalog_id_the_operator_listed_is_fitted_by_generation_all_the_same() {
+    let loader = MockLoader::new();
+    let card = rtx_3090();
+    let server = server_on(&loader, SIXTEEN, card.clone(), "3090-listed");
+    let switcher = server.switcher.as_ref().unwrap();
+    let listed: std::collections::BTreeMap<String, std::path::PathBuf> = [(SWIFT_16G.to_owned(), switch_support::source(SWIFT_16G).artifact)].into_iter().collect();
+    switcher.set_knobs(PATIENT, listed.clone(), true);
+    switcher.set_listed_models(listed);
+    let app = server.app();
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    let entry = models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == SWIFT_16G).cloned().unwrap();
+    assert_eq!(entry["available"], false, "{models}");
+    assert!(entry["reason"].as_str().unwrap().contains("Ampere generation"), "{entry}");
+    let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": SWIFT_16G }))).await;
+    refused_by_generation(status, &refused, SWIFT_16G, &card);
+    let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(SWIFT_16G))).await;
+    refused_by_generation(status, &refused, SWIFT_16G, &card);
+    still_serving(&app, &server, &loader, SIXTEEN).await;
 }

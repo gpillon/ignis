@@ -121,7 +121,7 @@ A body carrying an `image_url` part is refused with `media_not_countable`: an im
         (status = 400, description = "Both `messages` and `prompt`, or neither; an empty `messages`; a body chat would refuse; `stream: true`; or an image part (`media_not_countable`).", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The body named a model this server has not loaded.", body = ApiError),
-        (status = 409, description = "The loaded model is the image model, which has no chat template to count with (`model_kind_mismatch`). Or `model` names a catalog entry this card's class cannot load, and no entry that answers to it can (`model_above_card_class`, naming the entry's class and the card's, ADR 0064). A `model` another entry answers to on this card (`qwen3.8-27b` on a 16 GB card) is counted on that entry.", body = ApiError),
+        (status = 409, description = "The loaded model is the image model, which has no chat template to count with (`model_kind_mismatch`). Or `model` names a catalog entry this card cannot load, and no entry that answers to it can: by its class (`model_above_card_class`, naming the entry's class and the card's, ADR 0064) or by its GPU generation, alone or with its class (`model_above_gpu_generation`, naming the generation the entry needs and the card's name, compute capability and generation, ADR 0079). A `model` another entry answers to on this card (`qwen3.8-27b` on a 16 GB card or an RTX 3090) is counted on that entry.", body = ApiError),
         (status = 501, description = "The raw form on a load whose tokenizer cannot be asked for ids (`tokenizer_unavailable`).", body = ApiError),
     ),
 )]
@@ -132,7 +132,7 @@ pub(crate) async fn tokenize(State(server): State<Arc<Server>>, Json(mut req): J
     let server = Arc::new(server.pinned());
     req.model = match crate::api::model_on_this_card(&server, req.model.take()) {
         Ok(model) => model,
-        Err(refusal) => return crate::api::above_card_class(&refusal),
+        Err(refusal) => return crate::api::above_card(&refusal),
     };
     if let Some(metrics) = &server.metrics {
         metrics.record_tokenize(TokenizeRoute::Tokenize);

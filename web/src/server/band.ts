@@ -94,7 +94,7 @@ export type RowAction =
   | { kind: "inUse" }
   /** Another speech model or diarizer on disk: no row loads one, the configuration picks it. */
   | { kind: "idle" }
-  /** A catalog entry above this card's class (ADR 0064): neither switched to nor downloaded; `reason` is the server's. */
+  /** A catalog entry above this card's class or its GPU generation (ADR 0064, ADR 0079): neither switched to nor downloaded; `reason` is the server's. */
   | { kind: "unavailable"; reason: string };
 
 /**

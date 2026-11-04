@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use super::arch::{BuiltArchitectures, ComputeCapability};
+use super::arch::{BuiltArchitectures, ComputeCapability, GpuGeneration};
 use super::file::read_document;
 use super::source::Layer;
 use super::ConfigError;
@@ -64,6 +64,28 @@ pub struct CardReading {
     pub capability: ComputeCapability,
     /// The architectures this build's kernels were compiled for.
     pub built_for: BuiltArchitectures,
+}
+
+impl CardReading {
+    /// A card of `total` bytes named `name`, of compute capability
+    /// `capability`, under the release's build (`86;120a`), whose kernels run
+    /// on every GPU generation: what the CPU tests inject for a card by its
+    /// total memory and capability, an RTX 3090 as 24 GiB and 8.6 (spec #474).
+    pub fn of(total: u64, name: &str, capability: ComputeCapability) -> CardReading {
+        CardReading { total, name: name.to_owned(), capability, built_for: BuiltArchitectures::parse("86;120a").expect("the release's list parses") }
+    }
+
+    /// The card's class, by its total ([`CardClass::of_total`]); `None` for a
+    /// total of no class.
+    pub fn class(&self) -> Option<CardClass> {
+        CardClass::of_total(self.total)
+    }
+
+    /// The card's GPU generation, by its compute capability
+    /// ([`GpuGeneration::of`]); `None` for a capability of none.
+    pub fn generation(&self) -> Option<GpuGeneration> {
+        GpuGeneration::of(self.capability)
+    }
 }
 
 impl Card {

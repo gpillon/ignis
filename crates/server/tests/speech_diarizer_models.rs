@@ -41,6 +41,7 @@ fn catalog_with(dir: &std::path::Path, diarizers: &[&str]) -> SpeechModels {
             revision: "0".repeat(40),
             artifact: format!("{id}.gguf"),
             card_class: None,
+            generation: None,
             family: None,
             aliases: Vec::new(),
             license: None,

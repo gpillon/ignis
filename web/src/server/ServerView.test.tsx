@@ -288,6 +288,18 @@ describe("ServerView: the model band", () => {
     expect(copying).not.toContain('aria-label="Download qwen3.8-27b-custom"');
   });
 
+  it("offers Not for this card, the server's reason and no Download above the card's GPU generation", () => {
+    const reason =
+      "qwen3.8-27b-custom needs a card of the Blackwell generation (RTX 50, RTX PRO) or newer (its catalog entry's generation), and this card, NVIDIA GeForce RTX 3090 (compute capability 8.6), is of the Ampere generation";
+    const above = CATALOG.map((r) => (r.id === "qwen3.8-27b-custom" ? { ...r, on_disk: "absent" as const, switchable: false, available: false, reason } : r));
+    const html = render({ catalog: { state: "ok", value: above } });
+    const row = html.split("<li").find((li) => li.includes(">qwen3.8-27b-custom<"));
+    expect(row).toContain("Not for this card");
+    expect(row).toMatch(/title="qwen3\.8-27b-custom needs a card of the Blackwell generation[^"]*NVIDIA GeForce RTX 3090 \(compute capability 8\.6\), is of the Ampere generation"/);
+    expect(row).not.toContain('aria-label="Download qwen3.8-27b-custom"');
+    expect(row).not.toContain('aria-label="Load qwen3.8-27b-custom"');
+  });
+
   it("has no Loaded row while nothing serves, and offers Load for the retry, the torn-down model's included", () => {
     const dead: ModelState = { state: "error", message: "Switch failed: x", failed: true };
     const torn = CATALOG.map((r) => ({ ...r, loaded: false, switchable: r.on_disk === "complete" }));

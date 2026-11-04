@@ -17,6 +17,7 @@ models:
     artifact: acme_ft.ninfer           # the file the server loads
     # kind: speech                     # optional: "speech" or "diarizer" (see below); a text or image model states none
     card_class: 32                     # optional: the smallest card class it loads on, in GB: 16, 24, 32 or 96
+    # generation: blackwell            # optional: the oldest GPU generation it loads on: ampere, ada or blackwell
     # family: qwen3.8-27b              # optional: its model family, by the family's own id (see below)
     # aliases: [qwen3.8-27b]           # optional: the ids it answers to on a smaller card: its family's default id, or another entry's of its family
     # license: { id: acme-1.0, url: "https://acme.example/LICENSE" }   # optional: the license its weights are published under (see below)
@@ -32,7 +33,8 @@ the form `<owner>/<name>`, an empty `revision`, an `artifact` not among its
 `files`, no sidecar (the artifact's name plus `.graft.json` or
 `.conversion.json`), a `sha256` that is not 64 lowercase hex digits, a `bytes`
 of 0, a file name that is not a plain name (a path separator, `..`, an
-absolute path), a `card_class` that is not 16, 24, 32 or 96, a `family` that is
+absolute path), a `card_class` that is not 16, 24, 32 or 96, a `generation`
+that is not `ampere`, `ada` or `blackwell` (lowercase), a `family` that is
 not a model family's default id (`qwen3.8-27b`, `qwen3.8-flash-next`,
 `ignis-image-2.1-turbo`, `nemotron-3-diarization`) or that contradicts what
 the entry's id or an alias says, no `family` where one is required (below), or
@@ -43,7 +45,12 @@ entry's — a built-in one's included. A relative `--download-catalog` set in a 
 from that file's directory; from a flag or an env var, from the working
 directory. An entry with no `card_class` states no class: it is never refused
 by class, so a catalog written before card classes still starts, and only the
-VRAM plan says it does not fit.
+VRAM plan says it does not fit. An entry with no `generation` loads on every
+GPU generation the build runs on; one that states it is refused on an older
+card, `409 model_above_gpu_generation`, and its alias may serve its id there
+([ADR 0079](../../adr/0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md)):
+state `blackwell` on an NVFP4 artifact, which runs only on Blackwell, and on
+a trellis build until you have checked it on an older card.
 
 `kind: speech` is the one kind a catalog states: it makes the entry a
 [speech model](../api/transcriptions.md) (a Qwen3-ASR decoder and its audio
@@ -134,8 +141,10 @@ so are `swift-1.5-27b` and `swift-1.5-27b-16g` ([fine-tunes](fine-tunes.md)).
   authority. The entry that answers to an alias must hold an artifact whose
   header names the alias's family, read before anything stops once the
   artifact is on disk. One whose header names another family does not answer:
-  the switch or the request is refused `409 model_above_card_class`, naming
-  both families, and a start is refused before the load. Named by its own id,
+  the switch or the request is refused `409 model_above_card_class` (or
+  `409 model_above_gpu_generation` when the id's own entry is above the
+  card's generation), naming both families, and a start is refused before the
+  load. Named by its own id,
   the entry is served as it is.
 
 The family the catalog knows of an entry also gives it its model kind before

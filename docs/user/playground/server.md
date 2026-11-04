@@ -87,9 +87,9 @@ download from the hub.
 - **Resume** for one partly downloaded, a cancelled download's included: the
   server downloads the rest ([Cancelling and resuming](#cancelling-and-resuming));
 - **Cancel** while its download runs: it stops it, keeping what it fetched;
-- **Not for this card** for an entry above the card's class
-  ([the catalog](../guides/models.md#the-catalog)), with the server's reason as
-  its tooltip: neither loaded nor downloaded;
+- **Not for this card** for an entry above the card's class or its GPU
+  generation ([the catalog](../guides/models.md#the-catalog)), with the
+  server's reason as its tooltip: neither loaded nor downloaded;
 - **Copy download command** in place of **Download** or **Resume** when the server does not
   download from the page (`download.enabled` or `download.from_ui` false): it
   copies `ignis-server model download <id>`;

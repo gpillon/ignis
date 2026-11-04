@@ -8,15 +8,21 @@
 # at that revision. Files are listed small first. Adding one of the owner's
 # models is an entry here and a new binary.
 #
-# `card_class` is the smallest card class an entry loads on, in GB (16, 32
-# or 96; ADR 0064): a switch, a request, a start or a download naming an
+# `card_class` is the smallest card class an entry loads on, in GB (16, 24,
+# 32 or 96; ADR 0064): a switch, a request, a start or a download naming an
 # entry above the card's class is refused before anything is torn down or
-# fetched. `aliases` (optional) lists the ids an entry also answers to: its
-# family's default id, or another entry's served id of its family, served by
-# it on a card below that id's own entry — how the 16 GB 27B answers to
-# `qwen3.8-27b` on a 16 GB card. `family` (optional) is the model family an
-# entry is of, by the family's own id (ADR 0074): stated where an alias
-# involves an entry and neither its id nor its aliases is a family's own id.
+# fetched. `generation` (optional; ADR 0079) is the oldest GPU generation an
+# entry loads on, `ampere`, `ada` or `blackwell`, refused the same way on an
+# older card; an entry stating none loads on every generation the build runs
+# on. An NVFP4 artifact, Flash-Next and the image model state `blackwell`,
+# and so does a trellis build until it is verified below it. `aliases`
+# (optional) lists the ids an entry also answers to: its family's default id,
+# or another entry's served id of its family, served by it on a card that
+# cannot load that id's own entry — how the 16 GB 27B answers to
+# `qwen3.8-27b` on a 16 GB card, and on an RTX 3090. `family` (optional) is
+# the model family an entry is of, by the family's own id (ADR 0074): stated
+# where an alias involves an entry and neither its id nor its aliases is a
+# family's own id.
 # `license` (required here, ADR 0078) is the license the entry's weights are
 # published under: `id` as the entry's Hugging Face card names it at the
 # pinned revision, `url` the license file in the entry's repo at that
@@ -27,6 +33,7 @@ models:
     revision: "e961b419b672e183aa55df8c4b975abc82006e8a"
     artifact: qwen3_8_27b_nvfp4full-v2.ninfer
     card_class: 32
+    generation: blackwell
     license: { id: apache-2.0, url: "https://www.apache.org/licenses/LICENSE-2.0" }
     files:
       - { name: qwen3_8_27b_nvfp4full-v2.ninfer.graft.json, bytes: 6981, sha256: "b87e3c005fb1daf7d6b208da52790f95a3f478732f767f87417a5d7fc23491d1" }
@@ -40,6 +47,7 @@ models:
     revision: "ef3216949e42c42fc713feffb2e05849d57f0f3b"
     artifact: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer
     card_class: 32
+    generation: blackwell
     family: qwen3.8-27b
     license: { id: apache-2.0, url: "https://www.apache.org/licenses/LICENSE-2.0" }
     files:
@@ -54,6 +62,7 @@ models:
     revision: "8d94db83cd8e58d6be31e796723e5e35b960638c"
     artifact: qwen3_8_flash_next_trellis_a25-v2.ninfer
     card_class: 32
+    generation: blackwell
     license: { id: qwen-community-1.0, url: "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/8d94db83cd8e58d6be31e796723e5e35b960638c/LICENSE" }
     files:
       - { name: qwen3_8_flash_next_mtp_3p0-v2.ninfer.conversion.json, bytes: 179029, sha256: "a5b2c10fe0745cfe6b8e2914135e44903cfb80acb3f0db21e549e76641f14127" }
@@ -70,6 +79,7 @@ models:
     revision: "d6912417aa47320cd71c78e19d99872faa5cb63b"
     artifact: ignis_image_2_1_turbo-v2.ninfer
     card_class: 32
+    generation: blackwell
     license: { id: qwen-research, url: "https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/LICENSE" }
     files:
       - { name: ignis_image_2_1_turbo-v2.ninfer.conversion.json, bytes: 617924, sha256: "a97f04912b9a6d76e828efc02b7e458d0f45d00bc00d794cca39d703ad0f33ca" }
@@ -120,6 +130,7 @@ models:
     revision: "890d5744d116caff2ee6746285bf839da175a63e"
     artifact: qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer
     card_class: 32
+    generation: blackwell
     family: qwen3.8-27b
     license: { id: swift-open-license-1.0, url: "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/890d5744d116caff2ee6746285bf839da175a63e/LICENSE" }
     files:
@@ -131,12 +142,14 @@ models:
   # 16 GB 27B's per-matrix bit widths, every other object the Swift NVFP4
   # artifact's (GitHub #472). Its id and its alias name no family, so it
   # states its own (ADR 0074); it answers to the 32 GB entry's served id on a
-  # 16 GB card. Pinned to the upload's hub commit.
+  # 16 GB card. It states `blackwell` until it has been verified below it.
+  # Pinned to the upload's hub commit.
   - id: swift-1.5-27b-16g
     repo: gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis
     revision: "3fe94555a30b3df89a283bf61338281243642166"
     artifact: qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer
     card_class: 16
+    generation: blackwell
     family: qwen3.8-27b
     aliases: [swift-1.5-27b]
     license: { id: swift-open-license-1.0, url: "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/3fe94555a30b3df89a283bf61338281243642166/LICENSE" }

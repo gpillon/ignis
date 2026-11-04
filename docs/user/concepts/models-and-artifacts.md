@@ -147,7 +147,12 @@ three `-16g` entries, which load on 16 GB and answer to `qwen3.8-27b`,
 to `qwen3.8-27b-abliterated` and to `swift-1.5-27b` on a 16 or 24 GB card
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md),
 [ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md))
-([the catalog](../guides/models.md#the-catalog)). An operator can add entries
+([the catalog](../guides/models.md#the-catalog)). All but `qwen3.8-27b-16g` and
+`qwen3.8-27b-abliterated-16g` also state the oldest **GPU generation** they
+load on, Blackwell: on an RTX 30 or RTX 40 card those two serve the 27B's ids,
+and the rest are refused
+([ADR 0079](../../adr/0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md)).
+An operator can add entries
 with a catalog file of the same format, but cannot re-pin a built-in id; a
 variant of a built-in model is a new id
 ([operator catalog](../guides/operator-catalog.md)). The abliterated variant

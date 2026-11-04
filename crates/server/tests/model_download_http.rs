@@ -124,7 +124,7 @@ async fn a_download_is_refused_with_a_reason_and_fetches_nothing() {
     std::fs::write(dir.join(&here.sidecar.0), &here.sidecar.1).unwrap();
     std::fs::write(dir.join(&here.artifact.0), &here.artifact.1).unwrap();
     let on_16gb = Server::from_active(loader.model("mock-a"))
-        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_catalog(models, true).with_card_class(Some(ignis_server::config::profile::CardClass::Gb16)))
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_catalog(models, true).with_card(Some(card(16, "NVIDIA RTX (Blackwell)", 12, 0))))
         .with_downloads(Downloads::of(&config(&repo, &[]), None))
         .app();
 
@@ -154,8 +154,29 @@ async fn a_download_is_refused_with_a_reason_and_fetches_nothing() {
         assert!(files_in(&off_dir).is_empty(), "{flag}: nothing landed");
         let _ = std::fs::remove_dir_all(off_dir);
     }
+
+    // Spec #474: on an RTX 3090 a Blackwell-only built-in entry is refused
+    // `409 model_above_gpu_generation`, naming the card, before any fetch.
+    let built_in = CatalogModels { catalog: Arc::new(ignis_server::download::Catalog::built_in().clone()), dir: repo::fresh_dir("refused-generation") };
+    let built_in_dir = built_in.dir.clone();
+    let on_3090 = Server::from_active(loader.model("mock-a"))
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_catalog(built_in, true).with_card(Some(card(24, "NVIDIA GeForce RTX 3090", 8, 6))))
+        .with_downloads(Downloads::of(&config(&repo, &[]), None))
+        .app();
+    for model in ["qwen3.8-flash-next", "swift-1.5-27b-16g"] {
+        let (status, code, message) = refused(on_3090.clone(), model).await;
+        assert_eq!((status, code.as_str()), (StatusCode::CONFLICT, "model_above_gpu_generation"), "{message}");
+        assert!(message.contains("Blackwell generation") && message.contains("NVIDIA GeForce RTX 3090 (compute capability 8.6)"), "{message}");
+    }
+    assert!(files_in(&built_in_dir).is_empty(), "nothing landed");
+    let _ = std::fs::remove_dir_all(built_in_dir);
     assert!(repo.seen().is_empty(), "no refusal reached the endpoint: {:?}", repo.seen());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A card of `gib` GiB named `name`, of compute capability `major.minor`.
+fn card(gib: u64, name: &str, major: u32, minor: u32) -> ignis_server::config::profile::CardReading {
+    ignis_server::config::profile::CardReading::of(gib << 30, name, ignis_server::config::arch::ComputeCapability::new(major, minor))
 }
 
 /// GitHub #378: a download the models folder has no room for — its bytes
