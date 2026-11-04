@@ -38,9 +38,13 @@ Windows, and only then builds the GPU engine for both hosts — on every push to
 `workspace.package.version`, or the job refuses it — turns the same run into a
 GitHub Release and pushes the container image. The image is built by the same
 job as the Linux tarball, out of the same compile, so the two can never carry
-different binaries (ADR 0032). Neither host packages a server that is not a
-CUDA build: `mk/cuda-build-check.sh` reads the binary and refuses one that
-would fall back to the CPU mock, which v0.9.0 and v0.9.1 shipped (#408).
+different binaries (ADR 0032). Both hosts build the kernel for `86;120a`, so
+every artifact runs on RTX 30 and RTX 40 cards as well as on Blackwell
+([Building from source](building.md#other-card-architectures)). Neither host
+packages a server that is not a CUDA build: `mk/cuda-build-check.sh` reads the
+binaries and refuses a server that would fall back to the CPU mock, which
+v0.9.0 and v0.9.1 shipped (#408), or any binary that carries no machine code
+for 8.6, or none for 12.0 (#482).
 
 The user guide follows the release. `.github/workflows/docs.yml` builds the
 site from the tag and publishes it once the release run has ended, and again
