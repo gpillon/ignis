@@ -86,7 +86,9 @@ ARG CUDA_REQUIRED_ARCHITECTURES=
 # error, in v0.9.0 and v0.9.1 (GitHub #408). The check after the build reads
 # the binary itself and refuses one that would fall back to the CPU mock, or
 # that carries no machine code for an entry of IGNIS_CUDA_ARCHITECTURES or of
-# CUDA_REQUIRED_ARCHITECTURES (#482), on each of the three binaries the image
+# CUDA_REQUIRED_ARCHITECTURES (#482), or whose 8.6 code breaks the full-rate rule
+# of mk/full-rate-kernels.txt (cuobjdump comes with this devel image, #512), on
+# each of the three binaries the image
 # and the tarball ship.
 RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
         --workspace --features cuda \
