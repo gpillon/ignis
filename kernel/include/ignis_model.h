@@ -255,8 +255,8 @@ enum ignis_prefill_attention {
    * FP32: the fallback. */
   IGNIS_PREFILL_ATTENTION_FP16 = 1,
   /* GitHub #505 (spec #503): the integer band of the 8.x cards, Q K^T on the
-   * INT8 MMA and P V on the u8 x s8 one. A leaf that does not carry it
-   * refuses the value. */
+   * INT8 MMA and P V on the u8 x s8 one; the residual window's prefill pass
+   * runs on it too (GitHub #510). */
   IGNIS_PREFILL_ATTENTION_INT8 = 2,
 };
 

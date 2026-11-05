@@ -524,8 +524,9 @@ other key through the **band** in 8 bits (or FP16 with FP16 accumulate, the
 fallback; the load option `--model-prefill-attention` picks one, `8bit` or
 `fp8` naming the 8-bit band). On an 8.x card (RTX 30, RTX 40) the 8-bit band is
 the **integer band** (spec #503, ADR 0080): Q K^T in INT8 and P V on the u8 x s8
-MMA, which `int8` names on any card. Its workspace stops growing with the
-context at one band.
+MMA, which `int8` names on any card; it runs the residual window's prefill pass
+too, while decode keeps the window's BF16 rows. Its workspace stops growing
+with the context at one band.
 
 **Fused prefill**:
 The 27B trellis body's prefill as it has always run: the trellis decoded
