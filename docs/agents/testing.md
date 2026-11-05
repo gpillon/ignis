@@ -420,11 +420,11 @@ stops the release. Check `make gpu-status` first, as for any GPU run.
    RTX 5090 (`tools/kld-gate/README.md`), and the coordinator carries it to
    the card. The limits are derived from the RTX 5090 on the same route, the
    same windows, chunk and reference set: the same dump there under the same
-   three variables, scored by the same command, gives a top-64 KLD of
-   TODO(#515 coordinator: the 5090's top-64 KLD on this route) and a top-1 of
-   TODO(#515 coordinator: the 5090's top-1 on this route). Limits, on the `all`
-   row of the scorer's table: `KLD top64` at most 1.05 times the 5090's, `top-1`
-   at least 0.5 points under the 5090's. A change that alters the 5090's
+   three variables, scored by the same command, gives a top-64 KLD of 0.03887
+   and a top-1 of 93.35% (the base 16 GB entry, spec #503's gate leg of #514).
+   Limits, on the `all` row of the scorer's table: `KLD top64` at most 0.04081
+   (1.05 times the 5090's), `top-1` at least 92.85% (0.5 points under the
+   5090's). A change that alters the 5090's
    numerics on this route records new 5090 figures in a finding first, and the
    limits follow them. (The limits of the FP16 band, 0.04016 and 92.92% from
    the first-light finding's 5090 figures of 0.03825 and 93.42%, gated the
@@ -458,7 +458,8 @@ The commands, in order:
 # CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu.
 export IGNIS_CUDA_ARCHITECTURES='86;120a'
 ignis-server model download qwen3.8-27b-16g      # into ./models
-IGNIS_MODEL_PREFILL_LINEAR=int8 IGNIS_MODEL_PREFILL_ATTENTION=int8 IGNIS_GDN_PREFILL=ours \n    cargo run --release -p ignis-core --features cuda --example span_logits -- \
+IGNIS_MODEL_PREFILL_LINEAR=int8 IGNIS_MODEL_PREFILL_ATTENTION=int8 IGNIS_GDN_PREFILL=ours \
+    cargo run --release -p ignis-core --features cuda --example span_logits -- \
     models/qwen3_8_27b_trellis_sc30-v2.ninfer hq-e8-2b ref27b-top64/windows.json dump-sm86 1024
 python3 tools/kld-gate/score_top64.py ref27b-top64 dump-sm86 --json gate-sm86.json
 ```
