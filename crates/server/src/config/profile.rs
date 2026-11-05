@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use super::arch::{BuiltArchitectures, ComputeCapability};
+use super::arch::{BuiltArchitectures, ComputeCapability, GpuGeneration};
 use super::file::read_document;
 use super::source::Layer;
 use super::ConfigError;
@@ -27,8 +27,9 @@ pub const DEFAULT_PROFILE: &str = AUTO_PROFILE;
 /// the real profile first and names that one, so `GET /v1/config`, `make
 /// config` and the Playground show `rtx5090`, never `auto`. It picks the
 /// class's profile by NAME, through the same [`lookup`] a named profile goes
-/// through: a config file's `profiles:` that redefines `rtx50-16gb`,
-/// `rtx5090` or `rtxpro6000` replaces what `auto` picks for that class.
+/// through: a config file's `profiles:` that redefines `rtx-16gb`,
+/// `rtx-24gb`, `rtx5090` or `rtxpro6000` replaces what `auto` picks for that
+/// class.
 pub const AUTO_PROFILE: &str = "auto";
 
 /// What the start could read of the card `--profile auto` chooses by. Injected
@@ -63,6 +64,20 @@ pub struct CardReading {
     pub capability: ComputeCapability,
     /// The architectures this build's kernels were compiled for.
     pub built_for: BuiltArchitectures,
+}
+
+impl CardReading {
+    /// The card's class, by its total ([`CardClass::of_total`]); `None` for a
+    /// total of no class.
+    pub fn class(&self) -> Option<CardClass> {
+        CardClass::of_total(self.total)
+    }
+
+    /// The card's GPU generation, by its compute capability
+    /// ([`GpuGeneration::of`]); `None` for a capability of none.
+    pub fn generation(&self) -> Option<GpuGeneration> {
+        GpuGeneration::of(self.capability)
+    }
 }
 
 impl Card {
@@ -127,18 +142,10 @@ pub fn auto(card: Card) -> Result<Option<&'static str>, ConfigError> {
 }
 
 /// The boundaries of every class, spelled from the `CARD_CLASS_*` constants:
-/// "16 GB below 20 GiB, 32 GB from 28 to 40 GiB, 96 GB from 88 to 104 GiB".
+/// "16 GB below 20 GiB, 24 GB from 20 to under 28 GiB, 32 GB from 28 to 40
+/// GiB, 96 GB from 88 to 104 GiB".
 fn class_bounds() -> String {
-    let gib = |bytes: u64| bytes >> 30;
-    CardClass::ALL
-        .into_iter()
-        .map(|class| match class {
-            CardClass::Gb16 => format!("{class} below {} GiB", gib(CARD_CLASS_16GB_BELOW_BYTES)),
-            CardClass::Gb32 => format!("{class} from {} to {} GiB", gib(*CARD_CLASS_32GB_BYTES.start()), gib(*CARD_CLASS_32GB_BYTES.end())),
-            CardClass::Gb96 => format!("{class} from {} to {} GiB", gib(*CARD_CLASS_96GB_BYTES.start()), gib(*CARD_CLASS_96GB_BYTES.end())),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+    CardClass::ALL.into_iter().map(|class| format!("{class} {}", class.totals())).collect::<Vec<_>>().join(", ")
 }
 
 /// The sentence `--help` gives `--profile auto`: each class's profile by its
@@ -221,7 +228,8 @@ pub const NONE_PROFILE: &str = "none";
 /// the host plan leaves room, never refusing a start the 1 GiB default would
 /// make. The VRAM plan sizes the rest, the KV pool among it.
 ///
-/// `rtx50-16gb` is the 16 GB class (ADR 0063, ADR 0064): the RTX 5060 Ti 16 GB,
+/// `rtx-16gb` is the 16 GB class (ADR 0063, ADR 0064; named `rtx50-16gb` until
+/// GitHub #476, a name [`canonical`] still accepts): the RTX 5060 Ti 16 GB,
 /// 5070 Ti and 5080, the RTX 50 cards `--profile auto` finds below 20 GiB.
 /// Derived, not measured: no 16 GB card exists in the project. It serves the 27B
 /// (the 16 GB catalog entry) at the 262,144 positions it was trained on, with
@@ -240,8 +248,33 @@ pub const NONE_PROFILE: &str = "none";
 /// context, and leaves the drafter's head to `auto`, the full head (ADR 0063).
 /// Every one of these is a default the load adapts when the free memory it
 /// finds cannot hold it: the head, then the context down to 65,536, then one
-/// lane (ADR 0063 §3). No other card ships a profile; a config file's
-/// `profiles:` defines one for any other card.
+/// lane (ADR 0063 §3).
+///
+/// `rtx-24gb` is the 24 GB class (GitHub #480, spec #474): the RTX 3090 and
+/// RTX 4090, the cards `--profile auto` finds from 20 GiB up to 28 GiB. It
+/// takes the RTX 5090 profile's 27B values: `vram.qwen38.headroom_bytes`
+/// 1200M, a 2,048-token prefill chunk, DFlash2 at 7 tokens, vision on with
+/// residency `host` at the default envelope, and the decode lanes (8) and the
+/// drafter's head at their defaults. Like `rtx-16gb` it names no model: no
+/// built-in entry states the 24 GB class, the 32 GB ones stay above it and the
+/// 16 GB ones fit it, so a start with no artifact resolves the default id
+/// `qwen3.8-27b` through the catalog's class-aware alias to the 16 GB entry.
+/// Its context is measured (2026-11-04) by the simulation `rtx-16gb`'s numbers
+/// came from: the 16 GB entry on the RTX 5090 under a 24 GiB budget
+/// (`--vram-budget-bytes 25769803776`), with the FP16 prompt band
+/// (`--model-prefill-attention fp16`, the band a card below compute capability
+/// 12.0 runs), hq-e8-2b KV and the 5090 profile's 27B values. 1,048,576 tokens
+/// load with nothing adapted (`adapted: ""`), 8 decode lanes and a KV pool of
+/// 18,735 pages (1,199,040 tokens); 1,048,640 is refused at the start by the
+/// 27B's hq-e8-2b attention envelope, so the context is capped by that
+/// envelope, as on `rtxpro6000`, not by memory. `auto` rope scaling makes the
+/// 27B's table YaRN at 4 over its 262,144 trained positions (ADR 0057). The
+/// pool's 150,464 tokens past the context (~1.39 GB) are what a real card's
+/// desktop may take before the load adapts, as it adapts every value here
+/// that the free memory it finds cannot hold (ADR 0063 §3); the closing runs
+/// on an RTX 3090 and an RTX 4090 confirm the context (spec #474). No other
+/// card ships a profile; a config file's `profiles:` defines one for any
+/// other card.
 const BUILT_IN: &str = r#"{
     "rtx5090": {
         "vram": {
@@ -271,7 +304,7 @@ const BUILT_IN: &str = r#"{
         },
         "ngram": { "hot_bytes": "auto" }
     },
-    "rtx50-16gb": {
+    "rtx-16gb": {
         "vram": {
             "qwen38": { "headroom_bytes": "1200M" }
         },
@@ -281,6 +314,18 @@ const BUILT_IN: &str = r#"{
         "vision": { "enabled": true, "max_tokens": 4096, "residency": "host" },
         "spec": {
             "qwen38": { "backend": "dflash2", "draft_tokens": 7, "decode_lanes": 2, "draft_head": "auto" }
+        }
+    },
+    "rtx-24gb": {
+        "vram": {
+            "qwen38": { "headroom_bytes": "1200M" }
+        },
+        "model": {
+            "qwen38": { "max_context": 1048576, "prefill_chunk": 2048 }
+        },
+        "vision": { "enabled": true, "residency": "host" },
+        "spec": {
+            "qwen38": { "backend": "dflash2", "draft_tokens": 7 }
         }
     }
 }"#;
@@ -292,28 +337,34 @@ const BUILT_IN: &str = r#"{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CardClass {
     Gb16,
+    Gb24,
     Gb32,
     Gb96,
 }
 
-/// The total memories each [`CardClass`] covers (spec 27b-16gb/04), as NVML
-/// reports a card's total: below 20 GiB is the 16 GB class (a 16 GB card
-/// reports ~15.9 GiB), 28-40 GiB the 32 GB one (the 5090 ~31.8 GiB), 88-104
-/// GiB the 96 GB one (the RTX PRO 6000 ~95.6 GiB). Any other total is no
-/// class: `--profile auto` refuses it, naming `--profile`.
+/// The total memories each [`CardClass`] covers (spec 27b-16gb/04, spec #474),
+/// as NVML reports a card's total: below 20 GiB is the 16 GB class (a 16 GB
+/// card reports ~15.9 GiB), from 20 GiB up to, but not including, 28 GiB the
+/// 24 GB one (the RTX 3090 and RTX 4090, 24 GiB), 28-40 GiB the 32 GB one
+/// (the 5090 ~31.8 GiB), 88-104 GiB the 96 GB one (the RTX PRO 6000 ~95.6
+/// GiB). Any other total is no class: `--profile auto` refuses it, naming
+/// `--profile`.
 pub const CARD_CLASS_16GB_BELOW_BYTES: u64 = 20 << 30;
+pub const CARD_CLASS_24GB_BYTES: std::ops::Range<u64> = CARD_CLASS_16GB_BELOW_BYTES..*CARD_CLASS_32GB_BYTES.start();
 pub const CARD_CLASS_32GB_BYTES: std::ops::RangeInclusive<u64> = (28 << 30)..=(40 << 30);
 pub const CARD_CLASS_96GB_BYTES: std::ops::RangeInclusive<u64> = (88 << 30)..=(104 << 30);
 
 impl CardClass {
     /// Every class, smallest first.
-    pub const ALL: [CardClass; 3] = [Self::Gb16, Self::Gb32, Self::Gb96];
+    pub const ALL: [CardClass; 4] = [Self::Gb16, Self::Gb24, Self::Gb32, Self::Gb96];
 
     /// The class a card whose total memory is `total_bytes` belongs to, by
     /// the boundaries above; `None` for a total between or past them.
     pub fn of_total(total_bytes: u64) -> Option<Self> {
         if total_bytes < CARD_CLASS_16GB_BELOW_BYTES {
             Some(Self::Gb16)
+        } else if CARD_CLASS_24GB_BYTES.contains(&total_bytes) {
+            Some(Self::Gb24)
         } else if CARD_CLASS_32GB_BYTES.contains(&total_bytes) {
             Some(Self::Gb32)
         } else if CARD_CLASS_96GB_BYTES.contains(&total_bytes) {
@@ -323,10 +374,24 @@ impl CardClass {
         }
     }
 
+    /// The total memories the class covers, spelled from the `CARD_CLASS_*`
+    /// constants: "below 20 GiB", "from 20 to under 28 GiB", "from 28 to 40
+    /// GiB", "from 88 to 104 GiB".
+    pub fn totals(self) -> String {
+        let gib = |bytes: u64| bytes >> 30;
+        match self {
+            Self::Gb16 => format!("below {} GiB", gib(CARD_CLASS_16GB_BELOW_BYTES)),
+            Self::Gb24 => format!("from {} to under {} GiB", gib(CARD_CLASS_24GB_BYTES.start), gib(CARD_CLASS_24GB_BYTES.end)),
+            Self::Gb32 => format!("from {} to {} GiB", gib(*CARD_CLASS_32GB_BYTES.start()), gib(*CARD_CLASS_32GB_BYTES.end())),
+            Self::Gb96 => format!("from {} to {} GiB", gib(*CARD_CLASS_96GB_BYTES.start()), gib(*CARD_CLASS_96GB_BYTES.end())),
+        }
+    }
+
     /// The class's size in GB, as a catalog entry spells it (`card_class: 16`).
     pub fn gb(self) -> u32 {
         match self {
             Self::Gb16 => 16,
+            Self::Gb24 => 24,
             Self::Gb32 => 32,
             Self::Gb96 => 96,
         }
@@ -341,7 +406,8 @@ impl CardClass {
     /// The built-in profile `--profile auto` picks for a card of this class.
     pub fn profile(self) -> &'static str {
         match self {
-            Self::Gb16 => "rtx50-16gb",
+            Self::Gb16 => "rtx-16gb",
+            Self::Gb24 => "rtx-24gb",
             Self::Gb32 => "rtx5090",
             Self::Gb96 => "rtxpro6000",
         }
@@ -354,6 +420,21 @@ impl std::fmt::Display for CardClass {
     }
 }
 
+/// The 16 GB profile's name before GitHub #476: still accepted everywhere a
+/// profile is named, permanently and without a warning.
+pub const LEGACY_16GB_PROFILE: &str = "rtx50-16gb";
+
+/// The name a profile is known by: [`LEGACY_16GB_PROFILE`] is `rtx-16gb`,
+/// every other name is itself. `--profile`, `IGNIS_PROFILE`, a file's
+/// `profile:` and the keys of its `profiles:` all go through it.
+pub fn canonical(name: &str) -> &str {
+    if name == LEGACY_16GB_PROFILE {
+        CardClass::Gb16.profile()
+    } else {
+        name
+    }
+}
+
 /// Every built-in profile, by name.
 pub fn built_in() -> BTreeMap<String, Layer> {
     let value = serde_json::from_str(&format!(r#"{{"profiles": {BUILT_IN}}}"#)).expect("the built-in profiles are JSON");
@@ -363,6 +444,7 @@ pub fn built_in() -> BTreeMap<String, Layer> {
 /// The profile called `name`: the config file's own first (an operator may
 /// redefine a built-in one for their card), then the built-in ones.
 pub fn lookup(name: &str, from_file: &BTreeMap<String, Layer>) -> Result<Layer, ConfigError> {
+    let name = canonical(name);
     if let Some(layer) = from_file.get(name) {
         return Ok(layer.clone());
     }
@@ -374,6 +456,48 @@ pub fn lookup(name: &str, from_file: &BTreeMap<String, Layer>) -> Result<Layer, 
         known.dedup();
         ConfigError(format!("no profile `{name}` (the profiles are {})", known.join(", ")))
     })
+}
+
+/// The cards the CPU tests inject (spec #474), as the start reads them:
+/// by total memory, name and compute capability, under the release's build
+/// (`86;120a`), whose kernels run on every GPU generation. The integration
+/// tests have their own copy, `tests/support/card.rs`.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{CardClass, CardReading, RTX_5090_TOTAL_BYTES};
+    use crate::config::arch::{BuiltArchitectures, ComputeCapability};
+
+    /// A card of `total` bytes named `name`, of compute capability
+    /// `major.minor`.
+    pub(crate) fn reading(total: u64, name: &str, major: u32, minor: u32) -> CardReading {
+        CardReading {
+            total,
+            name: name.to_owned(),
+            capability: ComputeCapability::new(major, minor),
+            built_for: BuiltArchitectures::parse("86;120a").expect("the release's list parses"),
+        }
+    }
+
+    /// A Blackwell card (compute capability 12.0) of `class`: the card the
+    /// class rule's tests are written for, whose generation every entry fits.
+    pub(crate) fn on(class: CardClass) -> CardReading {
+        reading(u64::from(class.gb()) << 30, "NVIDIA RTX (Blackwell)", 12, 0)
+    }
+
+    /// The cards spec #474 is written for, by total memory and compute
+    /// capability: an RTX 3090 (Ampere) and an RTX 4090 (Ada), both 24 GiB.
+    pub(crate) fn rtx_3090() -> CardReading {
+        reading(24 << 30, "NVIDIA GeForce RTX 3090", 8, 6)
+    }
+
+    pub(crate) fn rtx_4090() -> CardReading {
+        reading(24 << 30, "NVIDIA GeForce RTX 4090", 8, 9)
+    }
+
+    /// An RTX 5090, at the total NVML reports for it.
+    pub(crate) fn rtx_5090() -> CardReading {
+        reading(RTX_5090_TOTAL_BYTES, "NVIDIA GeForce RTX 5090", 12, 0)
+    }
 }
 
 #[cfg(test)]
@@ -479,6 +603,8 @@ mod tests {
         assert_eq!(bare.settings.model.prefill_chunk, DEFAULT_PREFILL_CHUNK);
         let pro = Sources { profile: built_in()["rtxpro6000"].clone(), ..Sources::default() };
         assert_eq!(resolve_settings(&pro, Some(ModelFamily::Qwen38_27b), Fit::Start).unwrap().settings.model.prefill_chunk, 2048);
+        let rtx24 = Sources { profile: built_in()["rtx-24gb"].clone(), ..Sources::default() };
+        assert_eq!(resolve_settings(&rtx24, Some(ModelFamily::Qwen38_27b), Fit::Start).unwrap().settings.model.prefill_chunk, 2048, "the 5090's");
     }
 
     /// `auto` rope scaling under each profile, as a load of each model
@@ -501,6 +627,7 @@ mod tests {
         assert_eq!(table("rtx5090", ModelFamily::FlashNext).factor(), 2.25, "589,824 / 262,144");
         assert_eq!(table("rtxpro6000", ModelFamily::Qwen38_27b).factor(), 4.0);
         assert_eq!(table("rtxpro6000", ModelFamily::FlashNext).factor(), 4.0);
+        assert_eq!(table("rtx-24gb", ModelFamily::Qwen38_27b).factor(), 4.0, "1,048,576 / 262,144");
     }
 
     /// The RTX PRO 6000 Blackwell series (Workstation, Max-Q, Server Edition:
@@ -554,6 +681,43 @@ mod tests {
         assert!(profiles["rtx5090"].get(hot, None).is_none(), "the 5090 keeps the 1 GiB default");
     }
 
+    /// GitHub #480: `rtx-24gb` is the RTX 5090 profile's 27B values at the
+    /// context measured for the 24 GB class, and nothing else: no Flash-Next
+    /// section, no general value, the lanes and the drafter's head unset.
+    #[test]
+    fn the_rtx_24gb_profile_takes_the_5090s_27b_values_at_its_measured_context() {
+        use ignis_core::compute::ModelFamily::{FlashNext, Qwen38_27b};
+
+        let profiles = built_in();
+        let rtx24 = &profiles["rtx-24gb"];
+        let value = |group: &str, name: &str, family| rtx24.get(field(group, name).unwrap(), family).map(|candidate| candidate.raw.clone());
+        assert_eq!(value("model", "max_context", Some(Qwen38_27b)).as_deref(), Some("1048576"), "measured: the hq-e8-2b envelope");
+        assert_eq!(value("vram", "headroom_bytes", Some(Qwen38_27b)).as_deref(), Some("1200M"));
+        assert_eq!(value("model", "prefill_chunk", Some(Qwen38_27b)).as_deref(), Some("2048"));
+        assert_eq!(value("spec", "backend", Some(Qwen38_27b)).as_deref(), Some("dflash2"));
+        assert_eq!(value("spec", "draft_tokens", Some(Qwen38_27b)).as_deref(), Some("7"));
+        assert_eq!(value("vision", "enabled", None).as_deref(), Some("true"));
+        assert_eq!(value("vision", "residency", None).as_deref(), Some("host"));
+        for (group, name) in [("vision", "max_tokens"), ("spec", "decode_lanes"), ("spec", "draft_head"), ("vram", "pinned_expert_bytes"), ("ngram", "hot_bytes"), ("model", "rope_scaling")] {
+            assert_eq!(value(group, name, None), None, "{group}.{name}: left to its default");
+            assert_eq!(value(group, name, Some(Qwen38_27b)), None, "{group}.{name}: the 27B's default");
+        }
+        assert_eq!(value("vram", "headroom_bytes", None), None, "the general headroom stays the default");
+        assert!(rtx24.entries().all(|(_, family, _)| family != Some(FlashNext)), "no Flash-Next section");
+        // The values the 5090's profile gives the 27B, but its context.
+        let rtx5090 = &profiles["rtx5090"];
+        for (group, name) in [("vram", "headroom_bytes"), ("model", "prefill_chunk"), ("spec", "backend"), ("spec", "draft_tokens"), ("spec", "decode_lanes"), ("spec", "draft_head")] {
+            let meta = field(group, name).unwrap();
+            let raw = |layer: &Layer| layer.get(meta, Some(Qwen38_27b)).map(|candidate| candidate.raw.clone());
+            assert_eq!(raw(rtx24), raw(rtx5090), "{group}.{name}");
+        }
+        for (group, name) in [("vision", "enabled"), ("vision", "residency"), ("vision", "max_tokens")] {
+            let meta = field(group, name).unwrap();
+            let raw = |layer: &Layer| layer.get(meta, None).map(|candidate| candidate.raw.clone());
+            assert_eq!(raw(rtx24), raw(rtx5090), "{group}.{name}");
+        }
+    }
+
     /// The 27B started under `rtxpro6000` takes the profile's Flash-Next-only
     /// n-gram budget as a default it passes over, not a value to refuse.
     #[test]
@@ -568,8 +732,8 @@ mod tests {
         assert_eq!(flash.settings.ngram.hot_bytes.map(|b| b.to_string()).as_deref(), Some("auto"));
     }
 
-    /// Spec 27b-16gb/04: the class boundaries by NVML's total, at the totals
-    /// the cards report and either side of every boundary.
+    /// Spec 27b-16gb/04 and spec #474: the class boundaries by NVML's total,
+    /// at the totals the cards report and either side of every boundary.
     #[test]
     fn a_cards_total_memory_names_its_class() {
         const GIB: f64 = (1u64 << 30) as f64;
@@ -579,16 +743,16 @@ mod tests {
         assert_eq!(class(31.8), Some(CardClass::Gb32), "the 5090");
         assert_eq!(class(95.5), Some(CardClass::Gb96), "the RTX PRO 6000");
         assert_eq!(CardClass::of_total(CARD_CLASS_16GB_BELOW_BYTES - 1), Some(CardClass::Gb16));
-        assert_eq!(CardClass::of_total(CARD_CLASS_16GB_BELOW_BYTES), None, "20 GiB: no class");
-        assert_eq!(class(24.0), None, "a 24 GB card");
-        assert_eq!(CardClass::of_total(*CARD_CLASS_32GB_BYTES.start() - 1), None);
+        assert_eq!(CardClass::of_total(CARD_CLASS_16GB_BELOW_BYTES), Some(CardClass::Gb24), "20 GiB: the 24 GB class");
+        assert_eq!(class(24.0), Some(CardClass::Gb24), "an RTX 3090 or RTX 4090");
+        assert_eq!(CardClass::of_total(*CARD_CLASS_32GB_BYTES.start() - 1), Some(CardClass::Gb24), "just below 28 GiB");
         assert_eq!(CardClass::of_total(*CARD_CLASS_32GB_BYTES.start()), Some(CardClass::Gb32));
         assert_eq!(CardClass::of_total(*CARD_CLASS_32GB_BYTES.end()), Some(CardClass::Gb32));
         assert_eq!(CardClass::of_total(*CARD_CLASS_32GB_BYTES.end() + 1), None);
         assert_eq!(class(48.0), None, "a 48 GB card");
         assert_eq!(CardClass::of_total(*CARD_CLASS_96GB_BYTES.start()), Some(CardClass::Gb96));
         assert_eq!(CardClass::of_total(*CARD_CLASS_96GB_BYTES.end() + 1), None, "past 104 GiB");
-        assert_eq!(class(141.0), None, "an H200");
+        assert_eq!(class(141.0), None, "a 141 GB card");
     }
 
     #[test]
@@ -596,11 +760,23 @@ mod tests {
         for class in CardClass::ALL {
             assert_eq!(CardClass::from_gb(class.gb()), Some(class));
         }
-        assert_eq!(CardClass::from_gb(24), None);
-        assert!(CardClass::Gb16 < CardClass::Gb32 && CardClass::Gb32 < CardClass::Gb96);
+        assert_eq!(CardClass::from_gb(24), Some(CardClass::Gb24));
+        assert_eq!(CardClass::from_gb(48), None);
+        assert!(CardClass::Gb16 < CardClass::Gb24 && CardClass::Gb24 < CardClass::Gb32 && CardClass::Gb32 < CardClass::Gb96);
+        assert_eq!(CardClass::Gb24.to_string(), "24 GB");
         assert_eq!(CardClass::Gb32.to_string(), "32 GB");
+        assert_eq!(CardClass::Gb24.profile(), "rtx-24gb");
         assert_eq!(CardClass::Gb32.profile(), "rtx5090", "the 5090's class keeps its profile");
         assert_eq!(CardClass::Gb96.profile(), "rtxpro6000");
+    }
+
+    #[test]
+    fn the_old_16gb_name_is_the_same_profile() {
+        assert_eq!(canonical("rtx50-16gb"), "rtx-16gb");
+        assert_eq!(canonical("rtx5090"), "rtx5090");
+        assert_eq!(CardClass::Gb16.profile(), "rtx-16gb");
+        assert!(built_in().contains_key("rtx-16gb") && !built_in().contains_key("rtx50-16gb"));
+        assert_eq!(lookup("rtx50-16gb", &BTreeMap::new()).unwrap(), built_in()["rtx-16gb"]);
     }
 
     #[test]
@@ -611,7 +787,7 @@ mod tests {
         let from_file = BTreeMap::from([("rtx5090".to_owned(), mine.clone()), ("a4000".to_owned(), mine.clone())]);
         assert_eq!(lookup("rtx5090", &from_file).unwrap(), mine);
         assert_eq!(lookup("rtx5090", &BTreeMap::new()).unwrap(), built_in()["rtx5090"]);
-        let err = lookup("h100", &from_file).unwrap_err().0;
-        assert!(err.contains("`h100`") && err.contains("a4000, rtx50-16gb, rtx5090"), "{err}");
+        let err = lookup("no-such-card", &from_file).unwrap_err().0;
+        assert!(err.contains("`no-such-card`") && err.contains("a4000, rtx-16gb, rtx-24gb, rtx5090"), "{err}");
     }
 }

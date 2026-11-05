@@ -29,9 +29,14 @@ until the test suite is green.
   capability 12.0, with a build that covers it (`IGNIS_CUDA_ARCHITECTURES`,
   #456), run CTest as `ctest -LE sm120a-only`: the tests that label leaves out
   exercise the kernels only the sm_120a set holds, and fail there by design.
-  `ignis_kernel_gdn_gating_proj_tests` also fails on a card with fewer SMs
-  than an RTX 5090: it forces cooperative schedules sized for 170 SMs, which
-  the engine's own planner skips. The one kernel-adjacent thing
+  `ignis_kernel_gdn_gating_proj_tests` runs cooperative schedules sized for
+  the RTX 5090's 170 SMs: on a card that cannot hold one resident (fewer SMs,
+  or an sm_86 build's fewer CTAs per SM) it skips each one the planner's own
+  residency query refuses there and names it in a `SKIP` line of its output
+  (#478, a portability patch under ADR 0077). Its `budget` lines give each
+  cooperative kernel's CTAs per SM; on compute capability 12.0 it fails if
+  one is not the value the planner was tuned on, and on the 5090 if it skips
+  any schedule. The one kernel-adjacent thing
   `cargo test` *does* check is the vendored subtree's integrity
   (`crates/vendor`): a vendored file edited without a recorded patch turns the
   workspace red (ADR 0010, `kernel/vendor/VENDOR.md`).
@@ -44,7 +49,12 @@ until the test suite is green.
   `kernel/include`, `kernel/tests`, `kernel/vendor/src` and
   `kernel/vendor/include` (plus `CMakeLists.txt` and `build.ps1`) and runs
   `kernel/build.ps1` whenever one changes; a build with nothing to do costs
-  a few seconds. Do not trust a binary built any other way to carry your
+  a few seconds. It passes `-ArchivesOnly` (`--archives-only` to
+  `build.sh`), so a cargo build compiles the two archives the link uses and
+  none of the CTest executables (#460); a hand run of the script, `-Test`
+  and `make kernel-test` build the whole project, tests included. The first
+  CTest run after a cargo-only build therefore compiles the test
+  executables once. Do not trust a binary built any other way to carry your
   kernel change: until GitHub #94 that script rebuilt only when
   `kernel/build/*.lib` was *missing*, so an edited `.cu` was linked from
   the previous archive with every test around it still green. That is what
@@ -380,6 +390,104 @@ in a test that drives the leaf directly. A test that inherits the default
 runs hq, which is right for the serving-shape checks (the HTTP surface, the
 TTFT instrument, the `CudaLeaf` smoke test) and wrong for anything carrying
 a derived tolerance.
+
+## The sm_86 gate
+
+A release built for `86;120a` runs on RTX 30 cards that no CI runner and no
+default suite covers. Before a release whose range touched the kernel leaf or
+the server's architecture module, the release's coordinator runs this gate on
+an sm_86 card (spec #474, #484). The range's check:
+
+```
+git diff --stat "$(git describe --tags --abbrev=0 --match 'v*')".. -- kernel/ crates/server/src/config/arch.rs
+```
+
+Output means the gate runs; none means it does not. A failure of any part
+stops the release. Check `make gpu-status` first, as for any GPU run.
+
+1. **Quality**, by the method of
+   `docs/findings/2026-11-03-first-light-on-sm86.md`: #340's gate 1 windows,
+   16 of 4,096 tokens, dumped by the `span_logits` example at chunk 1024, KV
+   `hq-e8-2b` and `IGNIS_MODEL_PREFILL_ATTENTION=fp16` (the band a card below
+   12.0 runs), scored top-64 against the BF16 checkpoint (`kl_top64` in
+   `crates/bench/src/flash_next/kld.rs`). The reference is a set, about 90 MB,
+   that holds the BF16 model's 64 most probable next tokens per position and
+   the windows themselves. It stays out of the repo:
+   `tools/kld-gate/ref_top64.py` builds it from the BF16 checkpoint on the
+   RTX 5090 (`tools/kld-gate/README.md`), and the coordinator carries it to
+   the card. The RTX 5090's figures on the FP16 band, from that finding, are a
+   top-64 KLD of 0.03825 and a top-1 of 93.42%. Limits, on the `all` row of
+   the scorer's table: `KLD top64` at most 0.04016 (1.05 times), `top-1` at
+   least 92.92% (0.5 points under). A change
+   that alters the 5090's numerics records new 5090 FP16-band figures in a
+   finding first: the same dump on the 5090 under the same variable, scored
+   by the same command.
+2. **The leaf's tests**: built for `86;120a`, then `ctest -LE sm120a-only`.
+   Every test passes. In `ignis_kernel_gdn_gating_proj_tests` the `budget`
+   lines and the `SKIP` lines that name the cooperative schedules the card
+   cannot hold resident (#478) are expected; a failure is not.
+3. **Smoke**: a server started under `--profile auto` (on a 24 GB card,
+   `rtx-24gb`, which turns DFlash2 and vision on) answers a greedy chat
+   completion, a small image and a large image, each correctly: `Paris`, red,
+   blue. The small image is the smallest the processor accepts: it upscales
+   every image to the 65,536-pixel floor, so 256 patches at the vision tower
+   and 64 tokens after the merge; record that count, the request's
+   `media.vision_tokens` in the server's log. The tower's W8 shapes have no
+   small-token route in the vendored dispatch (SIMT up to 16 tokens, the
+   merger's up to 4 or 5, then `mma_r64_c128`), so no image reaches a kernel
+   only the sm_120a set holds. The large image sits at the processor's item
+   bound, 16,384 tokens (4096 x 4096 pixels, a merged token being 32 x 32),
+   under the profile's `vision.max_tokens`.
+
+The commands, in order:
+
+```sh
+# On the sm_86 card, from the release's checkout, the set ref27b-top64/ beside it
+# (tools/kld-gate/README.md) and 32.5 GB free for the dump. ignis-server is the
+# release candidate's; on Linux every cargo command here also needs
+# CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu.
+export IGNIS_CUDA_ARCHITECTURES='86;120a'
+ignis-server model download qwen3.8-27b-16g      # into ./models
+IGNIS_MODEL_PREFILL_ATTENTION=fp16 cargo run --release -p ignis-core --features cuda --example span_logits -- \
+    models/qwen3_8_27b_trellis_sc30-v2.ninfer hq-e8-2b ref27b-top64/windows.json dump-sm86 1024
+python3 tools/kld-gate/score_top64.py ref27b-top64 dump-sm86 --json gate-sm86.json
+```
+
+```sh
+bash kernel/build.sh            # kernel\build.ps1 on Windows: the whole project, tests included
+ctest --test-dir kernel/build -LE sm120a-only --output-on-failure
+```
+
+```sh
+ignis-server --profile auto      # its ignis.config.source line names rtx-24gb
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d \
+  '{"model":"qwen3.8-27b","temperature":0,"enable_thinking":false,"max_tokens":64,"messages":[{"role":"user","content":"What is the capital of France? One word."}]}'
+# Two solid-colour PNGs: 32 x 32 red, upscaled to the floor; 4096 x 4096 blue, the item bound.
+python3 - <<'EOF'
+import struct, zlib
+def png(path, side, rgb):
+    chunk = lambda kind, data: struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    rows = (b"\0" + bytes(rgb) * side) * side
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+png("small.png", 32, (220, 30, 30))
+png("large.png", 4096, (30, 60, 220))
+EOF
+for image in small large; do
+  printf '{"model":"qwen3.8-27b","temperature":0,"enable_thinking":false,"max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"What colour is this image? One word."},{"type":"image_url","image_url":{"url":"data:image/png;base64,%s"}}]}]}' \
+    "$(base64 -w0 "$image.png")" > "$image.json"
+  curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d "@$image.json"
+done
+```
+
+The release binary is also checked to carry code for 8.6 and 12.0, whatever
+list the build was given (`mk/cuda-build-check.sh --require`, in CI, #482).
+
+The gate records correctness only: KLD, top-1, pass or fail per part, and the
+small image's patch count. Never a speed, never a detail of the machine. The
+same procedure, for contributors, is in
+`docs/user/contributing/releases.md`.
 
 ## Done means
 

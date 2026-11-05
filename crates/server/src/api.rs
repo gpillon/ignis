@@ -457,13 +457,13 @@ fn switching_message(from: &str, to: &str) -> String {
 /// ([`check_served_kind`]).
 ///
 /// Before all of it, `model` becomes the id this card serves the request
-/// under ([`model_on_this_card`], ADR 0064), rewritten in place so that
-/// everything after reads it: an alias the entry that answers to it, an entry
-/// above the card's class refused [`above_card_class`]. A route that switches
+/// under ([`model_on_this_card`], ADR 0064, ADR 0079), rewritten in place so
+/// that everything after reads it: an alias the entry that answers to it, an
+/// entry the card cannot load refused [`refused_on_card`]. A route that switches
 /// through here cannot skip that step; the image, decision and counting
 /// routes, which switch their own way or not at all, take it themselves.
 pub(crate) async fn switch_to_named_model(server: &Server, route: ModelKind, model: &mut Option<String>) -> Result<(), Response> {
-    *model = model_on_this_card(server, model.take()).map_err(|refusal| above_card_class(&refusal))?;
+    *model = model_on_this_card(server, model.take()).map_err(|refusal| refused_on_card(&refusal))?;
     let (named, _) = split_model_lane(model.clone());
     check_kind(server, route, named.as_deref())?;
     if let Some(named) = unswitchable_named(server, route, named.as_deref()) {
@@ -558,17 +558,18 @@ pub(crate) fn check_served_kind(server: &Server, route: ModelKind, model: Option
 }
 
 /// A request's `model`, lane tag and all, as this card serves it (ADR 0064,
-/// spec 27b-16gb/04 §6, [`crate::model_switch::Switcher::on_this_card`]): an
-/// id another catalog entry answers to on this card is rewritten to that
-/// entry's — on a 16 GB card `qwen3.8-27b` is served by `qwen3.8-27b-16g`,
-/// loaded or switched to — and an entry the card cannot load is refused
-/// before anything loads, drains or switches. The loaded model's own id
-/// stands, whatever its class. Run first, before anything else reads the
-/// request's `model`: the kind check, the implicit switch and the engine's
-/// own model check all see the id the request is served under, and the
-/// answer names it. Each route words the refusal its own way:
-/// [`above_card_class`] on all but `/v1/decide`.
-pub(crate) fn model_on_this_card(server: &Server, model: Option<String>) -> Result<Option<String>, crate::download::ClassRefusal> {
+/// ADR 0079, spec 27b-16gb/04 §6,
+/// [`crate::model_switch::Switcher::on_this_card`]): an id another catalog
+/// entry answers to on this card is rewritten to that entry's — on a 16 GB
+/// card or an RTX 3090 `qwen3.8-27b` is served by `qwen3.8-27b-16g`, loaded
+/// or switched to — and an entry the card cannot load, by class or by
+/// generation, is refused before anything loads, drains or switches. The
+/// loaded model's own id stands, whatever its class. Run first, before
+/// anything else reads the request's `model`: the kind check, the implicit
+/// switch and the engine's own model check all see the id the request is
+/// served under, and the answer names it. Each route words the refusal its
+/// own way: [`refused_on_card`] on all but `/v1/decide`.
+pub(crate) fn model_on_this_card(server: &Server, model: Option<String>) -> Result<Option<String>, crate::download::CardRefusal> {
     let Some(model) = model else {
         return Ok(None);
     };
@@ -584,17 +585,18 @@ pub(crate) fn model_on_this_card(server: &Server, model: Option<String>) -> Resu
     }))
 }
 
-/// `409 model_above_card_class` (ADR 0064 §3): the model a request or a
-/// switch names is a catalog entry this card's class cannot load, and no
-/// entry that answers to it can either. Refused before anything is
-/// prepared, drained or torn down: the loaded model serves on. A conflict
-/// as `model_kind_mismatch` is — a model the server knows, that it cannot
-/// serve here — and never worth a retry.
-pub(crate) fn above_card_class(refusal: &crate::download::ClassRefusal) -> Response {
+/// `409 model_above_card_class` or `409 model_above_gpu_generation` (ADR 0064
+/// §3, ADR 0079, [`crate::download::CardRefusal::code`]): the model a request
+/// or a switch names is a catalog entry this card cannot load, by its class
+/// or its generation, and no entry that answers to it can either. Refused
+/// before anything is prepared, drained or torn down: the loaded model serves
+/// on. A conflict as `model_kind_mismatch` is — a model the server knows,
+/// that it cannot serve here — and never worth a retry.
+pub(crate) fn refused_on_card(refusal: &crate::download::CardRefusal) -> Response {
     error_response_naming(
         StatusCode::CONFLICT,
         "invalid_request_error",
-        "model_above_card_class",
+        refusal.code(),
         format!("{refusal}: it is not loaded on this card, and the loaded model serves on"),
         Some("model"),
     )
@@ -1844,7 +1846,7 @@ pub(crate) fn now() -> u64 {
     tag = "models",
     operation_id = "list_models",
     summary = "The servable models, the loaded one first",
-    description = "The models a request may name and be served by now, without a download. `data[0]` is always the model this server loaded (`active: true`), with its `kind` (`text` or `image`: the routes it serves; the speech model's is `speech`) and for a text model the context a single request may spend (`max_model_len`, prompt plus completion), how many requests it decodes at once (`decode_lanes`) and every adaptation its load took to fit the VRAM plan (`adapted`, in the order taken, as the `ignis.runtime.vram_plan` log line spells them; `\"\"` when it took none — the 27B under `rtx50-16gb` in a 13 GiB budget (16 GiB less 3 GiB of desktop) says `max_context 262144 -> 65536 (adapt_context_step 65536, adapt_spare_tokens 65536)`). `max_model_len` and `decode_lanes` are the values the load runs, after any adaptation; `GET /v1/config` keeps the values configured. The other entries (`active: false`) are the models a request naming them switches to: every catalog entry whose artifact is under `download.path` (catalog order), then every known model (`switch.known_models`, and the model the server started on) whose artifact is a file (id order) — read at each request, so a model downloaded into a running server is listed at once. Their `kind` is given only when the id is a model family's own, and `max_model_len`, `decode_lanes` and `adapted` never: they are known once a model is loaded. No entry carries a path. With `switch.allow_implicit` false only `data[0]` is listed. Among the others, a catalog entry on disk whose `card_class` is above this card's (ADR 0064) is listed with `available: false` and the `reason`, naming its class and the card's: a request naming it is refused `409 model_above_card_class` and never switches to it — or, on a card where another entry answers to its id (on a 16 GB card `qwen3.8-27b-16g` to `qwen3.8-27b`), is served by that one, which the reason names. Every other entry is `available: true`. A server serves one text or image model at a time: a request naming another entry waits while it replaces the loaded one; a text request naming the image model is refused `409 model_kind_mismatch`. The speech model is loaded beside it, not instead of it (ADR 0067): it is listed right after `data[0]`, with `kind: \"speech\"`, `active: true` and `available: true`, only while it is available -- turned on by `speech.model`, its files on disk and the host able to run it -- whether or not it is loaded right now, and never as a model a switch goes to. Its compat names (`speech.compat_names`) are not listed.
+    description = "The models a request may name and be served by now, without a download. `data[0]` is always the model this server loaded (`active: true`), with its `kind` (`text` or `image`: the routes it serves; the speech model's is `speech`) and for a text model the context a single request may spend (`max_model_len`, prompt plus completion), how many requests it decodes at once (`decode_lanes`) and every adaptation its load took to fit the VRAM plan (`adapted`, in the order taken, as the `ignis.runtime.vram_plan` log line spells them; `\"\"` when it took none — the 27B under `rtx-16gb` in a 13 GiB budget (16 GiB less 3 GiB of desktop) says `max_context 262144 -> 65536 (adapt_context_step 65536, adapt_spare_tokens 65536)`). `max_model_len` and `decode_lanes` are the values the load runs, after any adaptation; `GET /v1/config` keeps the values configured. The other entries (`active: false`) are the models a request naming them switches to: every catalog entry whose artifact is under `download.path` (catalog order), then every known model (`switch.known_models`, and the model the server started on) whose artifact is a file (id order) — read at each request, so a model downloaded into a running server is listed at once. Their `kind` is given only when the id is a model family's own, and `max_model_len`, `decode_lanes` and `adapted` never: they are known once a model is loaded. No entry carries a path. With `switch.allow_implicit` false only `data[0]` is listed. Among the others, a catalog entry on disk whose `card_class` is above this card's (ADR 0064), or whose `generation` is newer than the card's GPU generation (ADR 0079: the RTX 30 and RTX 40 cards load no Blackwell-only entry), is listed with `available: false` and the `reason`, naming what it needs and the card: a request naming it is refused `409 model_above_card_class` or `409 model_above_gpu_generation` and never switches to it — or, on a card where another entry answers to its id (on a 16 GB card or an RTX 3090 `qwen3.8-27b-16g` to `qwen3.8-27b`), is served by that one, which the reason names. Every other entry is `available: true`. A server serves one text or image model at a time: a request naming another entry waits while it replaces the loaded one; a text request naming the image model is refused `409 model_kind_mismatch`. The speech model is loaded beside it, not instead of it (ADR 0067): it is listed right after `data[0]`, with `kind: \"speech\"`, `active: true` and `available: true`, only while it is available -- turned on by `speech.model`, its files on disk and the host able to run it -- whether or not it is loaded right now, and never as a model a switch goes to. Its compat names (`speech.compat_names`) are not listed.
 
 The top-level `speech` object, `{\"available\": bool, \"reason\": string, \"diarizer\": {...}}`, is always present, beside `status`: `reason` says why the speech model cannot serve (turned off, its files missing and the command that fetches them, or the CPU lacking AVX2) and is absent while it can, so a page can disable its microphone before it is pressed. Its `diarizer` member, `{\"id\": string, \"loaded\": bool, \"available\": bool, \"reason\": string}`, says the same of the diarizer that gives a Realtime session its speakers (`diarizer.model`; it is no entry of `data`, no request names it): `id` is the model `diarizer.model` names and is absent when it names none, `loaded` whether its weights are in memory now (the first session that asks for speakers loads them, the speech model's idle unload frees them), `available` and `reason` as the speech model's, the reason naming `ignis-server model download <id>` when its files are missing.
 
@@ -2149,14 +2151,14 @@ struct SwitchAccepted {
     tag = "models",
     operation_id = "switch_model",
     summary = "Replace the loaded model",
-    description = "Unloads the model being served and loads `artifact` in its place under the id `model` — or, with `model` alone, the artifact the server knows it by: the `switch.known_models` entry for the id (which wins), else a catalog entry whose artifact is under `download.path` (`GET /v1/models/catalog` lists them, with whether each is switchable). `switch.allow_implicit` does not apply to that: it gates the switch a request triggers by naming a model. An id that is neither, or whose artifact is not on disk, is `404 model_not_found`; a switch never starts a download. An id sent alone is fitted to the card's class first (ADR 0064), whether or not `switch.known_models` lists it, since the class is its catalog entry's: a catalog entry whose `card_class` is above the card's is refused `409 model_above_card_class` before anything is unloaded, unless another entry of its family answers to the id as an alias, fits, and holds an artifact whose header names that family — on a 16 GB card `qwen3.8-27b` switches to `qwen3.8-27b-16g`, and `to` names it. A switch naming its `artifact` is the operator's word and is not fitted: only the VRAM plan guards it. The switch is on the same process: a full reload, the two models never resident together, every flag the server started with applied to the new load except one the new model does not take (`--vision-enabled` on Qwen3.8-Flash-Next, the other model's `--spec-backend` backend, the Flash-Next-only knobs), which is left off for it.\n\nAnswers `202` at once; the switch runs behind it. Meanwhile every other `/v1` route answers `503 model_switching` with `Retry-After`, and `GET /v1/models` reports `status: switching`. Requests already running on the old model get `--switch-drain-timeout` (30 s by default) to finish; any still running then ends with an `engine_error`. A target that can be refused without unloading anything — a path with no file, a checksum that is not clean, a model id of the other model, a flag it cannot take — leaves the old model serving. A target that fails to load after the old model was unloaded has the old model reloaded from its artifact; `GET /v1/models` reports `status: failed` until one of them serves.",
+    description = "Unloads the model being served and loads `artifact` in its place under the id `model` — or, with `model` alone, the artifact the server knows it by: the `switch.known_models` entry for the id (which wins), else a catalog entry whose artifact is under `download.path` (`GET /v1/models/catalog` lists them, with whether each is switchable). `switch.allow_implicit` does not apply to that: it gates the switch a request triggers by naming a model. An id that is neither, or whose artifact is not on disk, is `404 model_not_found`; a switch never starts a download. An id sent alone is fitted to the card's class and GPU generation first (ADR 0064, ADR 0079), whether or not `switch.known_models` lists it, since both are its catalog entry's: a catalog entry whose `card_class` is above the card's is refused `409 model_above_card_class`, and one whose `generation` is newer than the card's `409 model_above_gpu_generation`, before anything is unloaded, unless another entry of its family answers to the id as an alias, fits, and holds an artifact whose header names that family — on a 16 GB card or an RTX 3090 `qwen3.8-27b` switches to `qwen3.8-27b-16g`, and `to` names it. A switch naming its `artifact` is the operator's word and is not fitted: only the VRAM plan guards it. The switch is on the same process: a full reload, the two models never resident together, every flag the server started with applied to the new load except one the new model does not take (`--vision-enabled` on Qwen3.8-Flash-Next, the other model's `--spec-backend` backend, the Flash-Next-only knobs), which is left off for it.\n\nAnswers `202` at once; the switch runs behind it. Meanwhile every other `/v1` route answers `503 model_switching` with `Retry-After`, and `GET /v1/models` reports `status: switching`. Requests already running on the old model get `--switch-drain-timeout` (30 s by default) to finish; any still running then ends with an `engine_error`. A target that can be refused without unloading anything — a path with no file, a checksum that is not clean, a model id of the other model, a flag it cannot take — leaves the old model serving. A target that fails to load after the old model was unloaded has the old model reloaded from its artifact; `GET /v1/models` reports `status: failed` until one of them serves.",
     request_body = SwitchRequest,
     responses(
         (status = 202, description = "The switch began.", body = SwitchAccepted),
         (status = 400, description = "`artifact` (when given) or `model` is empty.", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "`model` was sent alone and is not a known model or a catalog entry on disk (`model_not_found`); for a catalog entry not yet fetched the message names the `model download` command.", body = ApiError),
-        (status = 409, description = "A switch is already under way (`switch_in_progress`): switches are not queued. Or `model`, sent alone, is a catalog entry this card's class cannot load, and no entry that answers to it can (`model_above_card_class`, naming the entry's class and the card's): refused before anything is unloaded.", body = ApiError),
+        (status = 409, description = "A switch is already under way (`switch_in_progress`): switches are not queued. Or `model`, sent alone, is a catalog entry this card cannot load, and no entry that answers to it can: by its class (`model_above_card_class`, naming the entry's class and the card's) or by its GPU generation, alone or with its class (`model_above_gpu_generation`, naming the generation the entry needs and the card's name, compute capability and generation, ADR 0079): refused before anything is unloaded.", body = ApiError),
         (status = 501, description = "This server was built without a model loader (`switch_unavailable`).", body = ApiError),
         (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`); or the server is stopping (`server_stopping`, with `Retry-After`): no switch begins, since the process would end under it.", body = ApiError),
     ),
@@ -2170,13 +2172,14 @@ async fn switch_model(State(server): State<Arc<Server>>, Json(req): Json<SwitchR
     }
     // An artifact named is the operator's word (ADR 0047), guarded by the
     // VRAM plan alone; an id sent alone is the catalog's, fitted to the card
-    // first (ADR 0064): an alias switches to the entry that answers to it
-    // here, an entry above the card's class is refused before anything stops.
+    // first (ADR 0064, ADR 0079): an alias switches to the entry that answers
+    // to it here, an entry the card cannot load is refused before anything
+    // stops.
     let (artifact, model) = match req.artifact {
         Some(artifact) => (artifact.into(), req.model),
         None => {
             let model = match server.switcher.as_ref().map(|switcher| switcher.on_this_card(&req.model)) {
-                Some(Err(refusal)) => return above_card_class(&refusal),
+                Some(Err(refusal)) => return refused_on_card(&refusal),
                 Some(Ok(Some(served))) => served,
                 Some(Ok(None)) | None => req.model,
             };
@@ -2208,7 +2211,7 @@ fn resolve_by_id(server: &Server, model: &str) -> Result<std::path::PathBuf, Res
     };
     switcher.resolve(model).map_err(|why| {
         let message = match why {
-            Unswitchable::AboveClass(refusal) => return above_card_class(&refusal),
+            Unswitchable::RefusedOnCard(refusal) => return refused_on_card(&refusal),
             Unswitchable::Speech => {
                 return error_response_naming(
                     StatusCode::CONFLICT,
@@ -2318,14 +2321,16 @@ struct ModelInfo {
     /// when it took none. The active text model's only.
     #[serde(skip_serializing_if = "Option::is_none")]
     adapted: Option<String>,
-    /// Whether a request naming it is served now (ADR 0064): `false` for a
-    /// catalog entry on disk whose `card_class` is above this card's, which
-    /// a request naming it never switches to. Always `true` on the active
-    /// entry.
+    /// Whether a request naming it is served now (ADR 0064, ADR 0079):
+    /// `false` for a catalog entry on disk whose `card_class` is above this
+    /// card's, or whose `generation` is newer than the card's GPU generation,
+    /// which a request naming it never switches to. Always `true` on the
+    /// active entry.
     available: bool,
-    /// Why the entry is not available, naming its class and the card's —
-    /// and, when another entry answers to its id on this card, that one.
-    /// Only with `available: false`.
+    /// Why the entry is not available, naming what it needs and the card —
+    /// its class, or its GPU generation with the card's name and compute
+    /// capability — and, when another entry answers to its id on this card,
+    /// that one. Only with `available: false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -2439,7 +2444,7 @@ Tool calls come back whole -- one complete `tool_calls` delta per call, never a 
         (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take.", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
-        (status = 409, description = "The model that would serve the request is the image model: the one loaded, with no `model` naming a text model to switch to, or the one `model` names (`model_kind_mismatch`, naming both kinds and the loaded id). Or `model` names a catalog entry this card's class cannot load, and no entry that answers to it can (`model_above_card_class`, naming the entry's class and the card's, ADR 0064): refused before anything loads or switches, the loaded model serving on.", body = ApiError),
+        (status = 409, description = "The model that would serve the request is the image model: the one loaded, with no `model` naming a text model to switch to, or the one `model` names (`model_kind_mismatch`, naming both kinds and the loaded id). Or `model` names a catalog entry this card cannot load, and no entry that answers to it can: by its class (`model_above_card_class`, naming the entry's class and the card's, ADR 0064) or by its GPU generation, alone or with its class (`model_above_gpu_generation`, naming the generation the entry needs and the card's name, compute capability and generation, ADR 0079): refused before anything loads or switches, the loaded model serving on.", body = ApiError),
         (status = 413, description = "The prompt is longer than this server's `--model-max-context`.", body = ApiError),
         (status = 500, description = "A non-streaming request the engine could not run (`engine_error`): it ended the request with an error, or let it go without a finish. Never a deadline, which is the 504.", body = ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted (`engine_full`, with `Retry-After`: when a lane is expected to free, 1 to 60 s); or a model switch is under way (`model_switching`, with `Retry-After`); or the switch this request's `model` began did not land (`model_switch_failed`); or the model was unloaded while idle and loading it again failed (`model_load_failed`); or the server began to stop while the request waited for a switch or a load (`server_stopping`, with `Retry-After`).", body = ApiError),

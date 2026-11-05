@@ -874,6 +874,7 @@ pub(crate) fn gather(
         .or_else(|| env(PROFILE_ENV).filter(|name| !name.is_empty()))
         .or(document.profile)
         .unwrap_or_else(|| profile::DEFAULT_PROFILE.to_owned());
+    let named = profile::canonical(&named).to_owned();
     let profile_auto = named == profile::AUTO_PROFILE;
     let mut card_read = None;
     let profile_name = if profile_auto {

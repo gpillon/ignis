@@ -234,3 +234,120 @@ fn the_release_check_looks_for_the_warning_only_a_build_without_cuda_carries() {
         assert!(read(&repo.join(recipe)).contains("bash mk/cuda-build-check.sh "), "{recipe} no longer runs mk/cuda-build-check.sh");
     }
 }
+
+/// Each host checks every binary it packages (#482): the three carry the
+/// kernel leaf's machine code (the server all of it, the bench and the
+/// inspector the device objects they link), and the server alone can carry
+/// the mock's warning.
+#[test]
+fn the_release_check_runs_on_every_packaged_binary() {
+    let repo = repo();
+    for recipe in ["Containerfile", ".github/workflows/release.yml"] {
+        let text = read(&repo.join(recipe)).replace("\\\n", " ");
+        let checked: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.split_once("bash mk/cuda-build-check.sh ").map(|(_, rest)| rest.split("&&").next().unwrap()))
+            .collect();
+        assert_eq!(checked.len(), 1, "{recipe} runs the check once: {checked:?}");
+        for binary in ["ignis-server", "ignis-bench", "ignis-artifact-inspect"] {
+            assert!(checked[0].contains(binary), "{recipe} packages {binary} without checking it: {}", checked[0]);
+        }
+    }
+}
+
+/// The lines of a workflow's top-level `env:` block.
+fn workflow_env(workflow: &str) -> Vec<&str> {
+    workflow
+        .lines()
+        .skip_while(|line| *line != "env:")
+        .skip(1)
+        .take_while(|line| line.is_empty() || line.starts_with(' ') || line.starts_with('#'))
+        .collect()
+}
+
+/// Every release artifact carries machine code for RTX 30 and RTX 40 cards
+/// (8.6) as well as for Blackwell (12.0) (#482). The list is set once, in the
+/// release workflow's own environment, where the Windows build and the check
+/// after it read it; the Linux build and its check read it inside the
+/// Containerfile, from the build argument. Both docker builds pass it: they
+/// are one compile only while their build arguments are the same (ADR 0032),
+/// and the runtime image would otherwise be a second, `120a`-only, build.
+#[test]
+fn the_release_builds_every_artifact_for_86_and_120a() {
+    let workflow = read(&repo().join(".github/workflows/release.yml"));
+    assert!(
+        workflow_env(&workflow).contains(&"  IGNIS_CUDA_ARCHITECTURES: \"86;120a\""),
+        "release.yml's top-level env no longer sets IGNIS_CUDA_ARCHITECTURES: \"86;120a\""
+    );
+    let docker_builds = workflow.matches("uses: docker/build-push-action@").count();
+    let passing = workflow.matches("CUDA_ARCHITECTURES=${{ env.IGNIS_CUDA_ARCHITECTURES }}").count();
+    assert!(docker_builds >= 2, "release.yml builds the Linux binaries and the image with docker/build-push-action");
+    assert_eq!(passing, docker_builds, "every docker build in release.yml passes CUDA_ARCHITECTURES from the workflow's list");
+    // The Windows leaf cache: a build directory for another list restored
+    // under an exact key would be compiled again on every run, and never saved.
+    let key = workflow.lines().find(|line| line.trim_start().starts_with("key: kernel-")).expect("release.yml caches kernel/build");
+    assert!(key.contains("${{ env.IGNIS_CUDA_ARCHITECTURES }}"), "the kernel cache key does not name the list: {key}");
+}
+
+/// The release requires machine code for 8.6 and for 12.0 of every binary it
+/// packages, whatever list its builds were given (spec #474, #482). The
+/// requirement is its own entry of the workflow's environment, never read
+/// from IGNIS_CUDA_ARCHITECTURES: a change to the build's list that drops an
+/// architecture is refused by the check, not checked against itself. Each
+/// host's check is passed it as `--require`, the Windows job from the
+/// workflow's environment, the Linux build inside the Containerfile from a
+/// build argument both docker builds pass, whose empty default leaves a
+/// container build from a checkout checking its own list.
+#[test]
+fn the_release_check_requires_86_and_120a_whatever_the_build_list() {
+    let repo = repo();
+    let workflow = read(&repo.join(".github/workflows/release.yml"));
+    assert!(
+        workflow_env(&workflow).contains(&"  IGNIS_CUDA_REQUIRED_ARCHITECTURES: \"86;120a\""),
+        "release.yml's top-level env no longer sets IGNIS_CUDA_REQUIRED_ARCHITECTURES: \"86;120a\""
+    );
+    let docker_builds = workflow.matches("uses: docker/build-push-action@").count();
+    let passing = workflow.matches("CUDA_REQUIRED_ARCHITECTURES=${{ env.IGNIS_CUDA_REQUIRED_ARCHITECTURES }}").count();
+    assert_eq!(passing, docker_builds, "every docker build in release.yml passes the release's requirement to the Containerfile");
+    let containerfile = read(&repo.join("Containerfile"));
+    assert!(containerfile.lines().any(|line| line == "ARG CUDA_REQUIRED_ARCHITECTURES="), "the Containerfile's requirement has an empty default");
+    for (recipe, text, required) in [
+        (".github/workflows/release.yml", &workflow, "--require \"$IGNIS_CUDA_REQUIRED_ARCHITECTURES\" "),
+        ("Containerfile", &containerfile, "--require \"$CUDA_REQUIRED_ARCHITECTURES\" "),
+    ] {
+        let check = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .find_map(|line| line.split_once("bash mk/cuda-build-check.sh ").map(|(_, rest)| rest))
+            .unwrap_or_else(|| panic!("{recipe} no longer runs mk/cuda-build-check.sh"));
+        assert!(check.starts_with(required), "{recipe}'s check is not passed the release's requirement: {check}");
+    }
+}
+
+/// A build from a checkout is unchanged by the release's list (#482): the
+/// leaf's own default and the Containerfile's stay `120a` alone, no make file
+/// names a list, and the check asks for the leaf's default when none is set.
+#[test]
+fn a_build_from_a_checkout_stays_120a_alone() {
+    let repo = repo();
+    let cmake = read(&repo.join("kernel/CMakeLists.txt"));
+    assert!(cmake.contains("if(IGNIS_CUDA_ARCHITECTURES STREQUAL \"\")\n  set(IGNIS_CUDA_ARCHITECTURES 120a)\nendif()"));
+    let containerfile = read(&repo.join("Containerfile"));
+    assert!(containerfile.lines().any(|line| line == "ARG CUDA_ARCHITECTURES="), "the Containerfile's CUDA_ARCHITECTURES has a default");
+    assert!(containerfile.lines().any(|line| line == "ENV IGNIS_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}"));
+    let mut makefiles = vec![repo.join("Makefile")];
+    for dir in [repo.join("mk"), repo.join("mk/os")] {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            if entry.path().extension().is_some_and(|ext| ext == "mk") {
+                makefiles.push(entry.path());
+            }
+        }
+    }
+    assert!(makefiles.len() > 2, "no make files found under mk/");
+    for path in makefiles {
+        assert!(!read(&path).contains("IGNIS_CUDA_ARCHITECTURES"), "{} names the CUDA architectures", path.display());
+    }
+    let check = read(&repo.join("mk/cuda-build-check.sh"));
+    assert!(check.contains("list=${IGNIS_CUDA_ARCHITECTURES:-120a}"), "the check's default is not the leaf's");
+}

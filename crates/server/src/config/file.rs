@@ -292,7 +292,15 @@ pub fn read_document(value: &Value, origin: &str) -> Result<Document, ConfigErro
                     for (group, fields) in body {
                         read_group(group, fields, &format!("profile {name} in {origin}"), &mut layer, Nulls::Unset)?;
                     }
-                    document.profiles.insert(name.clone(), layer);
+                    // The 16 GB profile's old name is the new one (GitHub #476).
+                    let canonical = super::profile::canonical(name);
+                    if document.profiles.insert(canonical.to_owned(), layer).is_some() {
+                        return Err(ConfigError(format!(
+                            "`profiles` in {origin} defines both `{}` and `{}`, which are one profile: keep one",
+                            super::profile::CardClass::Gb16.profile(),
+                            super::profile::LEGACY_16GB_PROFILE
+                        )));
+                    }
                 }
             }
             group => read_group(group, value, origin, &mut document.values, Nulls::Unset)?,

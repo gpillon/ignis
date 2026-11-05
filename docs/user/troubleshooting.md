@@ -13,25 +13,29 @@ count, differs from run to run. Error bodies on `/v1` are OpenAI's
 
 ## Starting
 
-### `this build's kernels run on compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell), built for 120a; the card is … (8.9), which they were not built for`
+### `this build's kernels run on compute capability 12.0 (RTX 50, RTX PRO), built for 120a; the card is … (8.9), which they were not built for`
 
 The card is not one the build's kernels were compiled for. The full message
 names the card as NVML does and its compute capability, here an RTX 40 card at
-8.9, and ends "see GitHub #456". Every release, and a build from a checkout by
-default, is compiled for `120a` only: compute capability 12.0, the RTX 50 and
-RTX PRO 6000 Blackwell cards
-([What it runs on](start/index.md#what-it-runs-on)). The server checks the
-card before anything else, whatever `--profile` says, because a load could only
+8.9, and ends with a link to the guide's
+[What it runs on](start/index.md#what-it-runs-on). A build from a checkout by
+default is compiled for `120a` only: compute capability 12.0, the RTX 50 and
+RTX PRO 6000 Blackwell cards. A release is compiled for `86;120a`, which adds
+the RTX 30 and RTX 40 cards, so it refuses a card older than those, such as an
+RTX 20. The server checks the card before anything else, whatever `--profile`
+says, because a load could only
 fail at its first kernel with CUDA's own "no kernel image is available for
 execution on the device". `model download`, `model list` and the `config`
 commands load nothing and still run on such a card.
 
-RTX 30 and 40 cards are not supported
-([#456](https://github.com/gpillon/ignis/issues/456)). On a machine with more
+On an RTX 30 or RTX 40 card, use a release, or build for it
+([Other card architectures](contributing/building.md#other-card-architectures)):
+the RTX 3090 and 3090 Ti are supported, the RTX 4090 and the 16 GB RTX 40
+cards are expected to work, and reports are welcome. On a machine with more
 than one card, ignis uses CUDA device 0; when that is the other card,
 `CUDA_VISIBLE_DEVICES` names the supported one.
 
-### `… needs kernels this build compiles for 120a alone, which run on compute capability 12.0 (RTX 50, RTX PRO 6000 Blackwell); the card is … (8.6)`
+### `… needs kernels this build compiles for 120a alone, which run on compute capability 12.0 (RTX 50, RTX PRO); the card is … (8.6)`
 
 Only a build for older cards than Blackwell says it
 ([Other card architectures](contributing/building.md#other-card-architectures)),
@@ -51,7 +55,7 @@ the FP16 band there and its exception tensors stay BF16.
 ### A start under `--profile auto` is refused, naming `--profile`
 
 The card's total memory is not one the built-in profiles serve (under 20 GiB,
-28 to 40, 88 to 104), or NVML could not read it. Name the profile that fits the
+from 20 up to 28, 28 to 40, 88 to 104), or NVML could not read it. Name the profile that fits the
 card, or `none` for the hardcoded defaults
 ([Profiles and defaults](concepts/profiles.md)).
 
@@ -212,8 +216,9 @@ shown above the Models tab's list
   the same `--download-path`, is fetching the entry. Download it once that
   ends, or let the command land it.
 - `409 model_already_downloaded`: the entry is on disk; **Load** switches to it.
-- `409 model_above_card_class`: the card cannot load the entry (**Not for this
-  card**).
+- `409 model_above_card_class`, `409 model_above_gpu_generation`: the card
+  cannot load the entry, by its class or by its GPU generation (**Not for
+  this card**).
 - `500 download_failed`: the download could not begin, the message says why:
   most often the entry's `<artifact>.lock` cannot be opened, because the
   server cannot create or write to `--download-path`. Give the server's user
@@ -386,6 +391,20 @@ and the loaded model keeps serving. Name an entry the card loads on
 an alias but its artifact's header names another model family than the id's,
 the message names both families: that entry's files, or the `family` its
 catalog states, are wrong ([an operator catalog](guides/operator-catalog.md#an-entrys-family-and-an-alias-of-your-own)).
+
+### `409 model_above_gpu_generation`
+
+The request, the switch or the download names a catalog entry that needs a
+newer GPU generation than this card's: an entry that states `generation:
+blackwell` (the NVFP4 27B, Swift 1.5, Flash-Next, the image model) on an RTX 30
+or RTX 40 card. The message names the generation the entry needs and the card,
+its name, compute capability and generation, and the entry's class as well
+when that is above the card's too; the loaded model keeps serving, and a start
+that would load it is refused. On such a card name `qwen3.8-27b` or
+`qwen3.8-27b-abliterated`, which their 16 GB entries serve there, or one of
+those entries by its own id ([Get a model](guides/models.md#the-catalog)). An
+operator entry that states a `generation` its artifact does not need is
+fixed in its catalog ([an operator catalog](guides/operator-catalog.md)).
 
 ### `409 model_kind_mismatch`
 

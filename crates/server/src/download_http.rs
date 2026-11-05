@@ -241,7 +241,7 @@ pub(crate) struct DownloadAccepted {
         (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = ApiError),
         (status = 403, description = "Downloading through the API is off (`download_disabled`): `download.enabled` is false, so the server never uses the network, or `download.from_ui` is false; the message names which.", body = ApiError),
         (status = 404, description = "`model` is not a catalog entry (`model_not_found`): a known model is a path, and nothing but a catalog entry is downloaded.", body = ApiError),
-        (status = 409, description = "A download already runs (`download_in_progress`, naming it): downloads are one at a time, never queued. Or the entry's `card_class` is above this card's (`model_above_card_class`, ADR 0064), or every file of it is already on disk (`model_already_downloaded`). Or another fetch of the entry into `download.path` holds its lock (`download_locked`): `ignis-server model download`, or another server on the same folder, which the message names with its process id; one writer per entry.", body = ApiError),
+        (status = 409, description = "A download already runs (`download_in_progress`, naming it): downloads are one at a time, never queued. Or the entry's `card_class` is above this card's (`model_above_card_class`, ADR 0064), or its `generation` newer than the card's GPU generation, alone or with its class (`model_above_gpu_generation`, ADR 0079), or every file of it is already on disk (`model_already_downloaded`). Or another fetch of the entry into `download.path` holds its lock (`download_locked`): `ignis-server model download`, or another server on the same folder, which the message names with its process id; one writer per entry.", body = ApiError),
         (status = 500, description = "The download could not begin (`download_failed`): the HTTP client could not be built, or the entry's lock file under `download.path` could not be opened; the message says which. Nothing was fetched.", body = ApiError),
         (status = 501, description = "This server has no catalog to download from (`download_unavailable`).", body = ApiError),
         (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`), or a model switch is under way (`model_switching`).", body = ApiError),
@@ -274,12 +274,12 @@ pub(crate) async fn post_model_download(State(server): State<Arc<Server>>, Json(
             Some("model"),
         );
     };
-    if let Some(reason) = switcher.and_then(|switcher| switcher.unavailable_reason(&entry.id)) {
+    if let Some(unavailable) = switcher.and_then(|switcher| switcher.unavailable(&entry.id)) {
         return error_response_naming(
             StatusCode::CONFLICT,
             "invalid_request_error",
-            "model_above_card_class",
-            format!("{reason}: it is not downloaded for this card"),
+            unavailable.code(),
+            format!("{unavailable}: it is not downloaded for this card"),
             Some("model"),
         );
     }

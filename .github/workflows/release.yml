@@ -1,6 +1,6 @@
-# Build ignis for Windows and Linux (x86_64, CUDA/SM120a), build the
-# linux/amd64 container image, and publish all three: a release on a v* tag, a
-# development build on a push to main.
+# Build ignis for Windows and Linux (x86_64, CUDA for compute capability 8.6
+# and 12.0), build the linux/amd64 container image, and publish all three: a
+# release on a v* tag, a development build on a push to main.
 #
 #   v*.*.* tag   the release: image tagged <version> + <major>.<minor> +
 #                latest, and a GitHub release with the archives.
@@ -30,13 +30,16 @@
 #
 # Both halves build the real GPU engine (`--features cuda`). No runner has an
 # NVIDIA GPU, so nothing here is *run* -- the kernel leaf is compiled for
-# SM120a and links the CUDA runtime only: the driver (libcuda/nvcuda) and NVML
-# are opened at run time (kernel/src/cuda_driver_shim.cu, shared_library.cu;
-# crates/artifact/build.rs), so no driver stub is needed at link time.
+# `86;120a` (IGNIS_CUDA_ARCHITECTURES below) and links the CUDA runtime only:
+# the driver (libcuda/nvcuda) and NVML are opened at run time
+# (kernel/src/cuda_driver_shim.cu, shared_library.cu; crates/artifact/build.rs),
+# so no driver stub is needed at link time.
 #
 # Neither half packages a server that is not a CUDA build: both run
 # mk/cuda-build-check.sh on it first. v0.9.0 and v0.9.1 shipped the CPU mock
-# under a release name, and nothing here noticed (GitHub #408).
+# under a release name, and nothing here noticed (GitHub #408). The same check
+# refuses any packaged binary that carries no machine code for 8.6, or none
+# for 12.0, whatever list the build was given (#482).
 
 name: release
 
@@ -72,6 +75,21 @@ concurrency:
 
 env:
   CUDA_VERSION: "13.1.1"
+  # The CUDA architectures the kernel leaf is compiled for on both hosts (#482,
+  # ADR 0077): sm_86 machine code, which RTX 30 (Ampere) and RTX 40 (Ada)
+  # cards run, and sm_120a, which RTX 50 and RTX PRO (Blackwell) cards run.
+  # kernel/CMakeLists.txt reads it; the Windows build and its check read it
+  # from here, the Linux build and its check from the Containerfile's
+  # CUDA_ARCHITECTURES. A build from a checkout leaves it unset: `120a` alone.
+  # The sm_120a cubins are the same bytes as a `120a`-only build's.
+  IGNIS_CUDA_ARCHITECTURES: "86;120a"
+  # What the release requires of every binary it packages, whatever the list
+  # above (spec #474, #482): machine code for 8.6 and for 12.0. It is written
+  # apart from that list and passed to mk/cuda-build-check.sh as --require, so
+  # an edit that drops an architecture from the builds is refused, not checked
+  # against itself. The Windows check reads it from here, the Linux one from
+  # the Containerfile's CUDA_REQUIRED_ARCHITECTURES.
+  IGNIS_CUDA_REQUIRED_ARCHITECTURES: "86;120a"
 
 jobs:
   # The version the artifacts are named after. On a tag it must be the version
@@ -236,6 +254,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The labels it generates take the image's description from the
+      # repository's, in place of the Containerfile's; the one below names the
+      # cards this image's `86;120a` build runs on (#482).
       - id: meta
         uses: docker/metadata-action@v5
         with:
@@ -245,6 +266,8 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=develop,enable=${{ github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.description=ignis: OpenAI-compatible inference server for Qwen3.8 on NVIDIA RTX 30 and RTX 40 (Ampere, Ada) and RTX 50 and RTX PRO (Blackwell) cards, with the Playground UI
 
       - name: Build the Linux binaries
         uses: docker/build-push-action@v6
@@ -272,9 +295,12 @@ jobs:
           # files out of a layer already in the cache.
           cache-from: type=gha,scope=linux-cuda
           # 4 cores, 16 GB: nvcc on the W4A4/TMA units needs more than 2 GB
-          # each, so the width is capped below the core count.
+          # each, so the width is capped below the core count. The image step
+          # below passes the same arguments, or it is a second compile.
           build-args: |
             KERNEL_BUILD_JOBS=3
+            CUDA_ARCHITECTURES=${{ env.IGNIS_CUDA_ARCHITECTURES }}
+            CUDA_REQUIRED_ARCHITECTURES=${{ env.IGNIS_CUDA_REQUIRED_ARCHITECTURES }}
 
       # Same context, same build args, same `build` stage -- everything up to
       # the final COPY is already in this builder's local cache, so this step
@@ -301,6 +327,8 @@ jobs:
           cache-to: type=gha,mode=max,scope=linux-cuda
           build-args: |
             KERNEL_BUILD_JOBS=3
+            CUDA_ARCHITECTURES=${{ env.IGNIS_CUDA_ARCHITECTURES }}
+            CUDA_REQUIRED_ARCHITECTURES=${{ env.IGNIS_CUDA_REQUIRED_ARCHITECTURES }}
 
       - name: Image published
         if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
@@ -441,14 +469,16 @@ jobs:
 
       # kernel/build.ps1 is cmake + ninja + nvcc and takes the better part of
       # an hour on a 4-core runner. It rebuilds only what changed, so the
-      # build directory is cached on the kernel sources themselves.
+      # build directory is cached on the kernel sources themselves, and on the
+      # architectures: a directory built for another list compiles every
+      # object again, and restored under an exact key it would never be saved.
       - name: Cache the kernel leaf build
         uses: actions/cache@v4
         with:
           path: kernel/build
-          key: kernel-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-${{ hashFiles('kernel/CMakeLists.txt', 'kernel/build.ps1', 'kernel/src/**', 'kernel/include/**', 'kernel/tests/**', 'kernel/vendor/src/**', 'kernel/vendor/include/**') }}
+          key: kernel-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-${{ env.IGNIS_CUDA_ARCHITECTURES }}-${{ hashFiles('kernel/CMakeLists.txt', 'kernel/build.ps1', 'kernel/src/**', 'kernel/include/**', 'kernel/tests/**', 'kernel/vendor/src/**', 'kernel/vendor/include/**') }}
           restore-keys: |
-            kernel-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-
+            kernel-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-${{ env.IGNIS_CUDA_ARCHITECTURES }}-
 
       # `--features cuda`, never `ignis-server/cuda`: the Containerfile's
       # build stage says why (GitHub #408).
@@ -472,9 +502,10 @@ jobs:
           cp target/x86_64-pc-windows-msvc/release/ignis-bench.exe "$name"/
           cp target/x86_64-pc-windows-msvc/release/ignis-artifact-inspect.exe "$name"/
           # A server that would fall back to the CPU mock is not packaged
-          # (GitHub #408); the Linux build runs the same check in the
-          # Containerfile.
-          bash mk/cuda-build-check.sh "$name"/ignis-server.exe
+          # (GitHub #408), nor a binary without machine code for every entry
+          # of IGNIS_CUDA_ARCHITECTURES and of the release's requirement
+          # (#482); the Linux build runs the same check in the Containerfile.
+          bash mk/cuda-build-check.sh --require "$IGNIS_CUDA_REQUIRED_ARCHITECTURES" "$name"/ignis-server.exe "$name"/ignis-bench.exe "$name"/ignis-artifact-inspect.exe
           # Apache-2.0 asks that a redistribution carry LICENSE and NOTICE;
           # kernel/NOTICE is the vendored ops' own provenance (ADR 0010).
           cp LICENSE NOTICE README.md "$name"/
@@ -566,9 +597,18 @@ jobs:
 
             ### Binaries
 
-            The kernel is compiled for **SM120a** (RTX 5090 / Blackwell
-            consumer) only, and the engine needs a `.ninfer` artifact, which
-            is not part of this release. The Linux tarball needs the CUDA 13
+            The kernel is compiled for compute capability 8.6 and 12.0
+            (`86;120a`), so the same binaries run on:
+
+            - RTX 30 cards (Ampere): the RTX 3090 and 3090 Ti are supported,
+              on the 27B's 16 GB entries;
+            - RTX 40 cards (Ada), on the 8.6 code: the RTX 4090 and the 16 GB
+              cards are expected to work, and reports are welcome;
+            - RTX 50 and RTX PRO 6000 cards (Blackwell).
+
+            The NVFP4 27B, Flash-Next and the image model load on Blackwell
+            alone. The engine needs a `.ninfer` artifact, which is not part of
+            this release. The Linux tarball needs the CUDA 13
             runtime on the host; the Windows zip carries `cudart64_*.dll`.
             Both need an NVIDIA driver new enough for CUDA 13.
 
@@ -630,8 +670,8 @@ jobs:
           ```
 
           (`docker`: `--gpus all` in place of `--device`.) The archives below
-          come from the same build. SM120a (RTX 5090 / Blackwell consumer)
-          only.
+          come from the same build, compiled for RTX 30 and RTX 40 (Ampere,
+          Ada) and RTX 50 and RTX PRO (Blackwell) cards.
           EOF
           sed -i "s|__SHA__|${GITHUB_SHA}|; s|__REPO__|${GITHUB_REPOSITORY}|" notes.md
           gh release delete develop --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true

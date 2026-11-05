@@ -51,9 +51,10 @@ ignis-server config patch --model-max-context 131072   # change the file in plac
 
 **Profiles.** `--profile <name>` / `IGNIS_PROFILE` / the file's `profile:`
 names a bundle of hardware-shaped defaults, below the file and above the
-built-in defaults. Three are built in, and the default, `--profile auto`,
+built-in defaults. Four are built in, and the default, `--profile auto`,
 picks one by the card's total memory as NVML reports it: under 20 GiB
-(a 16 GB card) `rtx50-16gb`, 28 to 40 GiB (a 5090) `rtx5090`, 88 to 104 GiB
+(a 16 GB card) `rtx-16gb`, from 20 GiB up to 28 GiB (an RTX 3090 or RTX 4090)
+`rtx-24gb`, 28 to 40 GiB (a 5090) `rtx5090`, 88 to 104 GiB
 (an RTX PRO 6000) `rtxpro6000`. A card of any other size, or a total NVML
 cannot read, is refused, naming `--profile` — at a start, and at `config
 generate|print|patch` and `model list|download` too, which resolve exactly as a
@@ -82,7 +83,8 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   ([Flash-Next n-gram startup cache](ngram-cache.md)). Everything else is as on the
   5090, except that the 27B's VRAM headroom stays at its default. `--profile
   auto` picks it on this card; `--profile rtxpro6000` names it.
-- `rtx50-16gb` is the 16 GB class (RTX 5060 Ti 16 GB, 5070 Ti, 5080): derived,
+- `rtx-16gb` is the 16 GB class (RTX 5060 Ti 16 GB, 5070 Ti, 5080, RTX 4060 Ti
+  16 GB, RTX 4080): derived,
   not measured, since no 16 GB card exists in the project. The 27B at
   262,144 tokens of context on two decode lanes, with DFlash2 at 7 draft
   tokens and the drafter's head `auto`, vision on at 4,096 tokens an image (the tower and pool in host RAM, so
@@ -90,6 +92,15 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   5090's 27B (1200M) and a 1,024-token prefill chunk.
   It names no model: a start with no artifact takes the catalog's 16 GB entry
   of the default id.
+- `rtx-24gb` is the 24 GB class (RTX 3090, RTX 4090): the 5090 profile's
+  values for the 27B (VRAM headroom 1200M, a 2,048-token prefill chunk,
+  DFlash2 at 7 draft tokens, vision on with the tower and pool in host RAM,
+  the default lanes and drafter's head) at 1,048,576 tokens of context (YaRN
+  at 4 under `auto` rope scaling), the 27B's whole compressed-KV attention
+  envelope, measured on the 5090 held to a 24 GiB budget
+  ([Profiles and defaults](../concepts/profiles.md#rtx-24gb)). No catalog
+  entry states the 24 GB class, so the 27B is the catalog's 16 GB entry here
+  too, and the profile names no model.
 
 **Adaptation.** A profile's values, and the built-in defaults, are what the
 27B asks for, not what it insists on: when the VRAM plan cannot hold them in
@@ -129,10 +140,10 @@ one, which does not.
 
 A file's `profiles: { <name>: { <group>: { … } } }` defines one for any other
 card. `auto` picks the class's profile by name, the lookup a named profile
-goes through, so a file whose `profiles:` redefines `rtx50-16gb`, `rtx5090` or
-`rtxpro6000` replaces what `auto` picks for that class. A profile called `none`
-or `auto` is refused when the file is read: both words mean something to
-`--profile`, so such a profile could never be reached.
+goes through, so a file whose `profiles:` redefines `rtx-16gb`, `rtx-24gb`,
+`rtx5090` or `rtxpro6000` replaces what `auto` picks for that class. A profile
+called `none` or `auto` is refused when the file is read: both words mean
+something to `--profile`, so such a profile could never be reached.
 
 `config generate` writes every resolved value as a value of the FILE, the
 profile's among them: a file generated under `auto` carries the numbers of the
@@ -172,7 +183,9 @@ a change is live, needs a reload, or can only be made at start — the same
 declarations as `ignis-server help --fields --format json`, minus the fields
 `GET /v1/config` hides. `GET /v1/config/origins` says where each value in force
 comes from, for the shared value and for each model family: the default, the
-profile, the file, an env var, a flag or a live change, whether it was set for
-that family itself, and the flag, env var, file key or profile that set it.
+profile, the card, the file, an env var, a flag or a live change, whether it
+was set for that family itself, and the flag, env var, file key or profile
+that set it, or the card that decided it (the prompt attention's FP16 band on
+a card below compute capability 12.0).
 A family's own value in the file or from a live change is the one a group
 change does not reach and a `null` removes.

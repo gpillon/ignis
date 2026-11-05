@@ -20,6 +20,11 @@ $BuildPath = if ([System.IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else {
 # tests and they FAIL (never skip) when the GPU is busy or a kernel errors
 # (ADR 0006), so run them on a free GPU: stop the reference runner first.
 $RunTests = $args -contains '-Test'
+# -ArchivesOnly builds just the two archives the Rust link uses (ignis_kernel,
+# ignis_vendor) and none of the CTest executables: crates/artifact/build.rs
+# passes it, so a cargo build does not compile kernel/tests/ (GitHub #460).
+# A hand run and -Test build everything; -Test wins over -ArchivesOnly.
+$ArchivesOnly = ($args -contains '-ArchivesOnly') -and -not $RunTests
 
 function Import-Vcvars {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -72,7 +77,9 @@ $cmakeArgs = @(
 & cmake @cmakeArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-& cmake --build $BuildPath --parallel
+$buildArgs = @('--build', $BuildPath, '--parallel')
+if ($ArchivesOnly) { $buildArgs += @('--target', 'ignis_kernel', 'ignis_vendor') }
+& cmake @buildArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 if ($RunTests) {

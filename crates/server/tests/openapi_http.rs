@@ -139,12 +139,17 @@ fn the_server_view_routes_are_documented_with_their_responses() {
         );
         assert!(document["components"]["schemas"][ok]["properties"].is_object(), "{ok}");
     }
-    // An origin's source is one of six, each named; no configuration is a 501.
+    // An origin's source is one of seven, each named; no configuration is a 501.
     assert_eq!(
         document["components"]["schemas"]["OriginSource"]["enum"],
-        serde_json::json!(["default", "profile", "file", "env", "flag", "live"])
+        serde_json::json!(["default", "profile", "file", "env", "card", "flag", "live"])
     );
     assert!(document["paths"]["/v1/config/origins"]["get"]["responses"]["501"].is_object());
+    // The operation says what each of the seven is, the card's too (GitHub #477).
+    let described = document["paths"]["/v1/config/origins"]["get"]["description"].as_str().unwrap();
+    for source in ["default", "profile", "card", "file", "env", "flag", "live"] {
+        assert!(described.contains(&format!("`{source}`")), "{source}: {described}");
+    }
     // The switch takes a model alone, and says what a 404 is.
     let switch = &document["paths"]["/v1/models/switch"]["post"];
     assert!(switch["responses"]["404"].is_object());
@@ -233,10 +238,10 @@ fn the_models_list_documents_the_servable_models_and_the_active_entry() {
     assert!(required.contains(&"active") && !required.contains(&"kind"), "{entry}");
 }
 
-/// ADR 0064 (GitHub #336): every route that names a model documents the
-/// card-class refusal — `409`, or `422` on the decision endpoint as its other
-/// model refusals — and both model lists say what `available` and `reason`
-/// are.
+/// ADR 0064 (GitHub #336), ADR 0079 (spec #474): every route that names a
+/// model documents the card-class refusal and the GPU-generation one — `409`,
+/// or `422` on the decision endpoint as its other model refusals — and both
+/// model lists say what `available` and `reason` are, on either axis.
 #[test]
 fn the_card_class_refusal_and_availability_are_documented() {
     let document = document();
@@ -251,16 +256,17 @@ fn the_card_class_refusal_and_availability_are_documented() {
         ("/v1/decide", "422"),
     ] {
         let said = document["paths"][path]["post"]["responses"][status]["description"].as_str().unwrap_or_default();
-        assert!(said.contains("model_above_card_class"), "{path} {status}: {said}");
+        assert!(said.contains("model_above_card_class") && said.contains("model_above_gpu_generation"), "{path} {status}: {said}");
     }
     for (schema, path) in [("ModelInfo", "/v1/models"), ("CatalogRow", "/v1/models/catalog")] {
         let entry = &document["components"]["schemas"][schema];
         let required: Vec<&str> = entry["required"].as_array().unwrap().iter().map(|key| key.as_str().unwrap()).collect();
         assert!(required.contains(&"available") && !required.contains(&"reason"), "{schema}: {entry}");
-        assert!(entry["properties"]["available"]["description"].as_str().unwrap().contains("card_class"), "{schema}: {entry}");
+        let available = entry["properties"]["available"]["description"].as_str().unwrap();
+        assert!(available.contains("card_class") && available.contains("`generation`"), "{schema}: {entry}");
         assert!(entry["properties"]["reason"]["description"].as_str().unwrap().contains("available: false"), "{schema}: {entry}");
         let description = document["paths"][path]["get"]["description"].as_str().unwrap();
-        assert!(description.contains("`available: false`") && description.contains("ADR 0064"), "{path}: {description}");
+        assert!(description.contains("`available: false`") && description.contains("ADR 0064") && description.contains("ADR 0079"), "{path}: {description}");
     }
 }
 

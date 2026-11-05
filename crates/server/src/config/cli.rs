@@ -272,9 +272,9 @@ fn model_download(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, 
     }
     let config = super::start_config(args, env, files, card)?;
     let catalog = download::catalog::load(files, config.download_catalog.as_deref()).map_err(|err| ConfigError(err.0))?;
-    // Fitted to the card's class (ADR 0064), as a start reads it from NVML's
-    // total; none without a card, which refuses nothing.
-    let entries = download::command::entries_to_fetch(&catalog, &ids, all, &config.model, config.card_class()).map_err(ConfigError)?;
+    // Fitted to the card's class and generation (ADR 0064, ADR 0079), as a
+    // start reads them; none without a card, which refuses nothing.
+    let entries = download::command::entries_to_fetch(&catalog, &ids, all, &config.model, config.card()).map_err(ConfigError)?;
     let token = download::bearer_token(&config.download_endpoint, config.download_token.as_ref(), env("HF_TOKEN").as_deref());
     Ok(ConfigOutcome::Model(ModelCommand::Download {
         entries,
@@ -286,7 +286,8 @@ fn model_download(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, 
 }
 
 /// `model list [--format text|json] [field flags]`: every entry of the
-/// catalog a start would load, with its state under `download.path`.
+/// catalog a start would load, with its state under `download.path` and
+/// whether the card a start would read loads it (ADR 0064, ADR 0079).
 fn model_list(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files: &dyn Files, card: &dyn Fn() -> Card) -> Result<ConfigOutcome, ConfigError> {
     let format = match take_value(args, "--format")?.as_deref() {
         None | Some("text") => ListFormat::Text,
@@ -295,7 +296,7 @@ fn model_list(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, file
     };
     let config = super::start_config(args, env, files, card)?;
     let catalog = download::catalog::load(files, config.download_catalog.as_deref()).map_err(|err| ConfigError(err.0))?;
-    Ok(ConfigOutcome::Model(ModelCommand::List { catalog, dir: config.model_download_path.clone(), format }))
+    Ok(ConfigOutcome::Model(ModelCommand::List { catalog, dir: config.model_download_path.clone(), format, card: config.card().cloned() }))
 }
 
 /// Where `config print` and `config patch` look with no `--file`: the first
@@ -672,6 +673,25 @@ mod tests {
         assert_eq!(ids, ["qwen3.8-27b"]);
     }
 
+    /// Spec #474, through the command line on an RTX 3090 (24 GiB, 8.6): the
+    /// `model` verbs read the card's generation as a start does. `model
+    /// download qwen3.8-27b` fetches the 16 GB entry, a Blackwell-only entry
+    /// is refused before any fetch, naming the card, and `model list` carries
+    /// the card it marks each entry by.
+    #[test]
+    fn the_model_verbs_read_the_cards_generation_as_a_start_does() {
+        let files = MemFiles::default();
+        let rtx_3090 = Card::Read(super::super::profile::testing::rtx_3090());
+        let (ids, ..) = download_of(run_on(&["model", "download", "qwen3.8-27b"], &files, rtx_3090.clone()).unwrap());
+        assert_eq!(ids, ["qwen3.8-27b-16g"]);
+        let err = run_on(&["model", "download", "qwen3.8-flash-next"], &files, rtx_3090.clone()).unwrap_err().0;
+        assert!(err.contains("nothing fetched") && err.contains("Blackwell generation") && err.contains("NVIDIA GeForce RTX 3090 (compute capability 8.6)"), "{err}");
+        match run_on(&["model", "list"], &files, rtx_3090.clone()).unwrap() {
+            ConfigOutcome::Model(ModelCommand::List { card, .. }) => assert_eq!(card, rtx_3090.reading().cloned()),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// `docs/user/guides/models.md`: the CUDA build fetches and lists on a machine
     /// with no NVIDIA driver. NVML that cannot be read is no card to the
     /// `model` verbs — nothing is fitted to a class, nothing refused — while
@@ -699,9 +719,9 @@ mod tests {
         let catalog = "models:\n  - id: acme-ft\n    repo: acme/ft\n    revision: v1\n    artifact: a.ninfer\n    card_class: 32\n    files:\n      - { name: a.ninfer.graft.json, bytes: 1, sha256: 0000000000000000000000000000000000000000000000000000000000000001 }\n      - { name: a.ninfer, bytes: 2, sha256: 0000000000000000000000000000000000000000000000000000000000000002 }\n";
         let files = MemFiles::with(&[("conf/ignis.config.yaml", "download:\n  catalog: acme.yaml\n  path: /srv/models\n"), ("conf/acme.yaml", catalog)]);
         match run(&["model", "list", "--config", "conf/ignis.config.yaml", "--format", "json"], &[], &files).unwrap() {
-            ConfigOutcome::Model(ModelCommand::List { catalog, dir, format }) => {
+            ConfigOutcome::Model(ModelCommand::List { catalog, dir, format, card }) => {
                 assert_eq!(catalog.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", "acme-ft"]);
-                assert_eq!((dir, format), (PathBuf::from("/srv/models"), ListFormat::Json));
+                assert_eq!((dir, format, card.map(|card| card.total)), (PathBuf::from("/srv/models"), ListFormat::Json, Some(super::super::profile::RTX_5090_TOTAL_BYTES)));
             }
             other => panic!("{other:?}"),
         }

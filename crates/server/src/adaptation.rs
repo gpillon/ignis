@@ -342,7 +342,7 @@ mod tests {
         lane: 196_880_384 + 35_651_648 + (4_623_344 + 82_125_920 + 152_139_488 + 78_027_552) / 8,
     };
 
-    /// A 16 GB card's 27B under `rtx50-16gb`: a stand-in for the 16 GB
+    /// A 16 GB card's 27B under `rtx-16gb`: a stand-in for the 16 GB
     /// body's weights (#338), text only.
     const GB16: Card = Card { budget: 0, weights: 12_500_000_000, workspace: 342_290_432, lane: 268_000_000 };
 

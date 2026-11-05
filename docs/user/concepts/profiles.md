@@ -1,6 +1,6 @@
 ---
 title: "Profiles and defaults"
-description: "What a hardware profile is, where it sits between the config file and the built-in defaults, what the rtx5090 and rtxpro6000 profiles choose and why, and how to define your own."
+description: "What a hardware profile is, where it sits between the config file and the built-in defaults, what each built-in profile chooses and why, and how to define your own."
 sidebar:
   order: 8
 ---
@@ -28,8 +28,9 @@ counts as unset.
 Choose a profile with `--profile <name>`, `IGNIS_PROFILE`, or `profile:` in the
 config file. With none of them the profile is `auto`: the start reads the
 card's total memory from NVML and takes the built-in profile of its class,
-`rtx50-16gb` under 20 GiB, `rtx5090` from 28 to 40 GiB, `rtxpro6000` from 88
-to 104 GiB. The log line `ignis.config.source` names the profile chosen and
+`rtx-16gb` under 20 GiB, `rtx-24gb` from 20 GiB up to 28 GiB, `rtx5090` from
+28 to 40 GiB, `rtxpro6000` from 88 to 104 GiB. The log line
+`ignis.config.source` names the profile chosen and
 the total it was chosen by. To skip the layer entirely and run on the hardcoded
 defaults, name `none`. A name that is not defined is refused with the list of
 the ones that are.
@@ -48,9 +49,20 @@ in force came from, `profile` included.
 
 ## The built-in profiles
 
+A card's profile follows from its memory, not its generation; what it loads
+follows from both. Which cards run ignis: the RTX 5090 and RTX PRO 6000 with
+every model, and the 16 GB RTX 50 cards with the 16 GB entries; the RTX 3090
+and 3090 Ti, supported, on the 27B's 16 GB entries; the RTX 4090 and the 16 GB
+RTX 40 cards, expected to work, reports welcome. The NVFP4 27B, Flash-Next and
+the image model load on Blackwell alone, on a card of 32 GB or more
+([What it runs on](../start/index.md#what-it-runs-on)).
+No profile here carries a speed for an RTX 30 or RTX 40 card.
+
 `rtx5090` and `rtxpro6000` carry numbers measured on the card they name,
-with the finding for each choice linked below; `rtx50-16gb` is derived from
-them, since no 16 GB card exists in the project.
+with the finding for each choice linked below; `rtx-16gb` is derived from
+them, since no 16 GB card exists in the project; `rtx-24gb` takes the 5090's
+values for the 27B, at a context measured on the 5090 held to a 24 GiB
+budget.
 
 ### `rtx5090`
 
@@ -140,9 +152,10 @@ Why each:
 - **No pinned hot set.** The profile leaves `vram.pinned_expert_bytes` at its
   default, 0.
 
-### `rtx50-16gb`
+### `rtx-16gb`
 
-The 16 GB class: the RTX 5060 Ti 16 GB, 5070 Ti and 5080. It serves the 27B
+The 16 GB class: the RTX 5060 Ti 16 GB, 5070 Ti and 5080, and the RTX 4060 Ti
+16 GB and RTX 4080. It serves the 27B
 from the catalog's 16 GB entry, `qwen3.8-27b-16g`; the profile names no
 model, and a start with no artifact resolves the default id `qwen3.8-27b` to
 that entry ([Get a model](../guides/models.md)).
@@ -171,6 +184,40 @@ Why each:
   2,048 would cost about 0.4 GB of KV pool.
 - **The headroom** is the 5090's 27B value until a real card says otherwise
   ([measure yours](../guides/measure-a-16gb-card.md)).
+
+### `rtx-24gb`
+
+The 24 GB class: the RTX 3090 and the RTX 4090, from 20 GiB up to 28 GiB of
+total memory. No catalog entry states this class: the 32 GB entries stay above
+it and the 16 GB entries fit it, so it serves the 27B from `qwen3.8-27b-16g`,
+as `rtx-16gb` does. The profile names no model, and a start with no artifact
+resolves the default id `qwen3.8-27b` to that entry
+([Get a model](../guides/models.md)).
+
+| Field | 27B |
+|---|---|
+| Context | 1,048,576 |
+| Vision | on, tower and pool in host RAM (`vision.residency: host`) |
+| Speculation | DFlash2, 7 draft tokens |
+| Decode lanes | 8 (the default) |
+| Prefill chunk | 2,048 |
+| VRAM headroom | 1,200 MiB |
+
+Why each:
+
+- **The 5090's values for the 27B.** The headroom, the 2,048-token chunk,
+  DFlash2 at 7 drafts and vision in host RAM are what `rtx5090` gives the
+  27B; the lanes and the drafter's head stay at their defaults.
+- **A million tokens of context.** Measured as the 16 GB numbers were: the
+  16 GB entry on the RTX 5090 held to a 24 GiB budget, with the FP16 prompt
+  band a card below compute capability 12.0 runs. 1,048,576 tokens load with
+  nothing adapted, on eight lanes, with a KV pool of 1,199,040 tokens. The
+  cap is the 27B's compressed-KV attention envelope, as on `rtxpro6000`, not
+  the memory; `auto` rope scaling makes the 27B YaRN at 4. No request that
+  long was run.
+- **The pool past the context**, about 1.4 GB, is room for what a real card's
+  desktop holds; past that the load adapts
+  ([when a profile does not fit](#when-a-profile-does-not-fit)).
 
 ## When a profile does not fit
 

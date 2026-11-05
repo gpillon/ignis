@@ -48,10 +48,12 @@ it, under its manifest (ADR 0010, `kernel/vendor/VENDOR.md`). Three reasons
 admit a recorded patch, made with `scripts/vendor-ninfer.ps1 record-patch`: a
 measurement that shows the op is the bottleneck (ADR 0031); a demonstrated
 correctness bug, whose patch ships with a test that fails without it and a
-`reason` naming the bug and the test (ADR 0037); or portability to an
-architecture the build targets, whose patch leaves the default `120a` build's
-device code unchanged and whose `reason` names the architecture and the
-compile it fixes (ADR 0077). An op rewritten as ours, or
+`reason` naming the bug and the test (ADR 0037); or portability to a CUDA
+architecture the build targets, or to a card smaller than the RTX 5090, whose
+patch leaves the default `120a` build's device code unchanged and whose
+`reason` names the CUDA architecture or the card size and what it fixes: a
+compile, or a launch that fails at run time there (ADR 0077). An op rewritten
+as ours, or
 changed beyond a recorded patch, leaves the vendored tree and
 makes no parity claim (ADR 0031, ADR 0051). A comparison with the reference
 says whether it crosses an Ignis-patched behaviour.

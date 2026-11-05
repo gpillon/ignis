@@ -87,9 +87,9 @@ download from the hub.
 - **Resume** for one partly downloaded, a cancelled download's included: the
   server downloads the rest ([Cancelling and resuming](#cancelling-and-resuming));
 - **Cancel** while its download runs: it stops it, keeping what it fetched;
-- **Not for this card** for an entry above the card's class
-  ([the catalog](../guides/models.md#the-catalog)), with the server's reason as
-  its tooltip: neither loaded nor downloaded;
+- **Not for this card** for an entry above the card's class or its GPU
+  generation ([the catalog](../guides/models.md#the-catalog)), with the
+  server's reason as its tooltip: neither loaded nor downloaded;
 - **Copy download command** in place of **Download** or **Resume** when the server does not
   download from the page (`download.enabled` or `download.from_ui` false): it
   copies `ignis-server model download <id>`;
@@ -241,8 +241,9 @@ applied with the rest. **Escape** clears it.
 Each row is one field ([every field](../reference/configuration.md)): its
 name, the first sentence of its description (**More** for the rest), and
 where its value comes from: `From profile rtx5090`, `Set by
-IGNIS_MODEL_THINKING_BUDGET` (a flag or an environment variable), `Shared`,
-or `Own value`. A **reload** mark says a change to it reloads the model. A
+IGNIS_MODEL_THINKING_BUDGET` (a flag or an environment variable), `Decided by
+the card, NVIDIA GeForce RTX 3090 (8.6)` (the prompt attention's FP16 band on
+a card below compute capability 12.0), `Shared`, or `Own value`. A **reload** mark says a change to it reloads the model. A
 field set only at start (the bind address, the API key, the artifact) is shown
 read-only, `Set at start`.
 

@@ -50,7 +50,7 @@ export type OriginRow = {
   /** `<group>.<name>`, a declaration's `file_key`. */
   key: string;
   scope: string | null;
-  source: "default" | "profile" | "file" | "env" | "flag" | "live";
+  source: "default" | "profile" | "card" | "file" | "env" | "flag" | "live";
   scoped: boolean;
   spelling?: string;
 };
@@ -70,9 +70,9 @@ export type CatalogRow = {
   license?: { id: string; url: string };
   loaded: boolean;
   switchable: boolean;
-  /** `false` when this card's class is below the entry's `card_class` (ADR 0064): no switch to it, no download of it. An older server sends neither field. */
+  /** `false` when this card's class is below the entry's `card_class` (ADR 0064), or its GPU generation older than the entry's `generation` (ADR 0079): no switch to it, no download of it. An older server sends neither field. */
   available?: boolean;
-  /** Why it is not available, naming both classes; only with `available: false`. */
+  /** Why it is not available, naming what the entry needs and the card; only with `available: false`. */
   reason?: string;
   /** Its download through `POST /v1/models/download`: running now, or the last one failed. An older server sends none of the three. */
   download?: "none" | "running" | "failed";

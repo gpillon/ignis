@@ -32,15 +32,15 @@ trellis). It is read from the artifact, never configured. See
 [models and artifacts](../concepts/models-and-artifacts.md).
 
 **Alias.** A second id a catalog entry answers to, within its own model family
-and only on a card it loads on: on a 16 GB card, `qwen3.8-27b-16g` answers to
-`qwen3.8-27b`. See [Get a model](../guides/models.md).
+and only on a card it loads on: on a 16 GB card or an RTX 3090,
+`qwen3.8-27b-16g` answers to `qwen3.8-27b`. See [Get a model](../guides/models.md).
 
 **Card.** The GPU ignis runs on. The built-in profiles are written for the
-16 GB class, a 32 GB RTX 5090 and a 96 GB RTX PRO 6000, and `--profile auto`
-picks one by the card's memory. See [profiles](../concepts/profiles.md).
+16 GB class, the 24 GB class, a 32 GB RTX 5090 and a 96 GB RTX PRO 6000, and
+`--profile auto` picks one by the card's memory. See [profiles](../concepts/profiles.md).
 
 **Card class.** The cards one built-in profile serves, named by their memory
-(16, 32 or 96 GB), and the smallest one a catalog entry loads on. An entry above
+(16, 24, 32 or 96 GB), and the smallest one a catalog entry loads on. An entry above
 the card is refused before anything is unloaded or fetched. See
 [models and artifacts](../concepts/models-and-artifacts.md).
 
@@ -121,6 +121,12 @@ active parameters. See [models and artifacts](../concepts/models-and-artifacts.m
 **Generation cap.** The most a request may generate, reasoning included: its
 `max_tokens`, or `--model-default-max-tokens`. See
 [chat completions](../api/chat-completions.md).
+
+**GPU generation.** The family of NVIDIA cards a card belongs to, read from its
+compute capability at start: Ampere (RTX 30), Ada (RTX 40) or Blackwell (RTX 50,
+RTX PRO). A catalog entry may state the oldest one it loads on, and an entry
+newer than the card is refused `409 model_above_gpu_generation`. See
+[Get a model](../guides/models.md#the-catalog).
 
 **Group.** The section a field belongs to (`server`, `model`, `vram`, `reuse`,
 `switch`, `spec`, `vision`, `media`, `download`, `ngram`, `kv_disk`). See

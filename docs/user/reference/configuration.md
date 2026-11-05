@@ -264,7 +264,7 @@ The KV storage format: `hq-e8-2b` (the serving default) or `bf16` (the retained 
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The 27B's prompt attention precision (GitHub #335): `fp8` (the default, the band pass in 8 bits) or `fp16` (the FP16-accumulate fallback). Flash-Next's attention is QSA and has no such pass.
+The 27B's prompt attention precision (GitHub #335): `fp8` (the default, the band pass in 8 bits) or `fp16` (the FP16-accumulate fallback). Flash-Next's attention is QSA and has no such pass. On a card below compute capability 12.0 left to its default, or to a profile's `fp8`, it reads `fp16`, the band the load runs, its origin the card; a named `fp8` is refused (GitHub #477).
 
 ### `model.exception_weights`
 

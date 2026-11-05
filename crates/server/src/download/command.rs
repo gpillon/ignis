@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use super::catalog::{Catalog, CatalogEntry};
 use super::transfer::{part_path, Downloader, Report};
-use crate::config::profile::CardClass;
+use crate::config::profile::CardReading;
 use crate::config::ApiKey;
 
 /// What a `model` command line asked for, resolved.
@@ -36,8 +36,10 @@ pub enum ModelCommand {
         /// the bytes it still misses ([`room_for`]).
         free_margin: u64,
     },
-    /// One row per entry of `catalog`, with its state under `dir`.
-    List { catalog: Catalog, dir: PathBuf, format: ListFormat },
+    /// One row per entry of `catalog`, with its state under `dir` and
+    /// whether `card`, the card the start would read, loads it (ADR 0064,
+    /// ADR 0079): with none read, every entry does.
+    List { catalog: Catalog, dir: PathBuf, format: ListFormat, card: Option<CardReading> },
 }
 
 /// How `model list` prints.
@@ -295,17 +297,17 @@ pub fn list_rows(
 }
 
 /// The entries `model download` fetches (spec model-download/02, ADR 0064
-/// §3): each of `ids`, matched case-insensitively as a command line's ids
-/// are; every entry with `all`; the configured model, `configured`, with
-/// neither. Each is fitted to the card's class `card` first
-/// ([`Catalog::answering`]): an id another entry answers to on this card
-/// fetches that one (`qwen3.8-27b` on a 16 GB card, the 16 GB 27B), and one
-/// this card cannot load refuses the whole command — every such entry named,
-/// with its class and the card's — before anything is fetched. So `--all` on
-/// a card below one of the entries is refused too: name the ids it loads. A
-/// card of no known class refuses nothing. Each entry once, in the order
-/// named.
-pub fn entries_to_fetch(catalog: &Catalog, ids: &[String], all: bool, configured: &str, card: Option<CardClass>) -> Result<Vec<CatalogEntry>, String> {
+/// §3, ADR 0079): each of `ids`, matched case-insensitively as a command
+/// line's ids are; every entry with `all`; the configured model,
+/// `configured`, with neither. Each is fitted to `card`, the card the start
+/// would read, first ([`Catalog::answering`]): an id another entry answers to
+/// on this card fetches that one (`qwen3.8-27b` on a 16 GB card or an RTX
+/// 3090, the 16 GB 27B), and one this card cannot load, by class or by
+/// generation, refuses the whole command — every such entry named, with what
+/// it needs and the card — before anything is fetched. So `--all` on a card
+/// that cannot load one of the entries is refused too: name the ids it loads.
+/// No card read refuses nothing. Each entry once, in the order named.
+pub fn entries_to_fetch(catalog: &Catalog, ids: &[String], all: bool, configured: &str, card: Option<&CardReading>) -> Result<Vec<CatalogEntry>, String> {
     let named: Vec<&CatalogEntry> = match (all, ids) {
         (true, []) => catalog.entries().iter().collect(),
         (true, _) => return Err("`model download --all` fetches every entry: name ids or `--all`, not both".to_owned()),
@@ -336,14 +338,19 @@ fn catalog_entry<'a>(catalog: &'a Catalog, id: &str) -> Result<&'a CatalogEntry,
     catalog.entry(id).ok_or_else(|| format!("`{id}` is not in the catalog (the ids are {})", catalog.ids().join(", ")))
 }
 
-/// The rows as `model list` prints them.
-pub fn render_list(rows: &[ListRow], format: ListFormat) -> String {
+/// The rows as `model list` prints them, each marked available or not on
+/// the card by `unavailable`, which gives why an entry is not
+/// ([`Catalog::unavailable`]): in text, a yes or no column, then each such
+/// entry's reason under the table; in JSON, `available` and the `reason`, as
+/// `GET /v1/models/catalog` gives them.
+pub fn render_list(rows: &[ListRow], format: ListFormat, unavailable: &dyn Fn(&str) -> Option<String>) -> String {
     match format {
         ListFormat::Json => {
             let rows: Vec<Value> = rows
                 .iter()
                 .map(|row| {
-                    json!({
+                    let reason = unavailable(&row.entry.id);
+                    let mut listed = json!({
                         "id": row.entry.id,
                         "layer": row.entry.layer.as_str(),
                         "repo": row.entry.repo,
@@ -352,7 +359,12 @@ pub fn render_list(rows: &[ListRow], format: ListFormat) -> String {
                         "on_disk": row.on_disk.as_str(),
                         "family": row.family.map(|family| family.name()),
                         "license": row.entry.license.as_ref().map(|license| json!({ "id": license.id, "url": license.url })),
-                    })
+                        "available": reason.is_none(),
+                    });
+                    if let Some(reason) = reason {
+                        listed["reason"] = json!(reason);
+                    }
+                    listed
                 })
                 .collect();
             let mut text = serde_json::to_string_pretty(&rows).expect("plain JSON");
@@ -360,8 +372,10 @@ pub fn render_list(rows: &[ListRow], format: ListFormat) -> String {
             text
         }
         ListFormat::Text => {
-            let mut table = vec![["ID".to_owned(), "LAYER".to_owned(), "REPO@REVISION".to_owned(), "SIZE".to_owned(), "ON DISK".to_owned(), "FAMILY".to_owned(), "LICENSE".to_owned()]];
+            let mut table = vec![["ID".to_owned(), "LAYER".to_owned(), "REPO@REVISION".to_owned(), "SIZE".to_owned(), "ON DISK".to_owned(), "FAMILY".to_owned(), "AVAILABLE".to_owned(), "LICENSE".to_owned()]];
+            let mut reasons = Vec::new();
             for row in rows {
+                let reason = unavailable(&row.entry.id);
                 table.push([
                     row.entry.id.clone(),
                     row.entry.layer.as_str().to_owned(),
@@ -369,14 +383,23 @@ pub fn render_list(rows: &[ListRow], format: ListFormat) -> String {
                     format!("{:.1} GiB", row.entry.gib()),
                     row.on_disk.as_str().to_owned(),
                     row.family.map_or("—", |family| family.name()).to_owned(),
+                    if reason.is_some() { "no" } else { "yes" }.to_owned(),
                     row.entry.license.as_ref().map_or("—", |license| license.id.as_str()).to_owned(),
                 ]);
+                reasons.extend(reason.map(|reason| format!("{}: not available on this card: {reason}", row.entry.id)));
             }
-            let widths: Vec<usize> = (0..7).map(|column| table.iter().map(|line| line[column].chars().count()).max().unwrap_or(0)).collect();
+            let widths: Vec<usize> = (0..8).map(|column| table.iter().map(|line| line[column].chars().count()).max().unwrap_or(0)).collect();
             let mut text = String::new();
             for line in &table {
                 let cells: Vec<String> = line.iter().zip(&widths).map(|(cell, width)| format!("{cell:<width$}")).collect();
                 text.push_str(cells.join("  ").trim_end());
+                text.push('\n');
+            }
+            if !reasons.is_empty() {
+                text.push('\n');
+            }
+            for reason in reasons {
+                text.push_str(&reason);
                 text.push('\n');
             }
             text
@@ -390,10 +413,11 @@ pub fn render_list(rows: &[ListRow], format: ListFormat) -> String {
 /// ended verified.
 pub async fn run(command: ModelCommand, out: &mut dyn Write, progress: Arc<dyn Fn(&str) + Send + Sync>) -> i32 {
     match command {
-        ModelCommand::List { catalog, dir, format } => {
+        ModelCommand::List { catalog, dir, format, card } => {
             let family_of = |path: &Path| crate::loader::artifact_family(path).ok().flatten();
             let rows = list_rows(&catalog, &dir, &file_size, &family_of);
-            let _ = out.write_all(render_list(&rows, format).as_bytes());
+            let unavailable = |id: &str| catalog.unavailable(id, card.as_ref()).map(|unavailable| unavailable.to_string());
+            let _ = out.write_all(render_list(&rows, format, &unavailable).as_bytes());
             0
         }
         ModelCommand::Download { entries, dir, endpoint, token, free_margin } => {
@@ -456,6 +480,8 @@ pub async fn run(command: ModelCommand, out: &mut dyn Write, progress: Arc<dyn F
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::profile::testing::{on, rtx_3090};
+    use crate::config::profile::CardClass;
     use std::collections::BTreeMap;
 
     /// A directory listing as a size probe.
@@ -588,7 +614,7 @@ mod tests {
         );
         assert_eq!(probed.into_inner(), [Path::new("m").join(&entry.artifact), Path::new("m").join("a.ninfer")], "only an artifact on disk is opened");
 
-        let text = render_list(&rows, ListFormat::Text);
+        let text = render_list(&rows, ListFormat::Text, &|_| None);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 14, "{text}");
         assert!(lines[0].starts_with("ID") && lines[0].contains("REPO@REVISION") && lines[0].contains("FAMILY"), "{text}");
@@ -603,7 +629,7 @@ mod tests {
         assert!(lines[13].contains("operator") && lines[13].contains("acme/ft@v1") && lines[13].contains("partial"), "{text}");
         assert!(lines[9].contains("gpillon/Qwen3-ASR-1.7B-GGUF-ignis@f8a5263e") && lines[9].contains("1.5 GiB") && lines[9].contains("absent"), "{text}");
 
-        let json: Vec<Value> = serde_json::from_str(&render_list(&rows, ListFormat::Json)).unwrap();
+        let json: Vec<Value> = serde_json::from_str(&render_list(&rows, ListFormat::Json, &|_| None)).unwrap();
         assert_eq!(json[0]["id"], "qwen3.8-27b");
         assert_eq!(json[0]["layer"], "built-in");
         assert_eq!(json[0]["revision"], "e961b419b672e183aa55df8c4b975abc82006e8a");
@@ -621,7 +647,7 @@ mod tests {
         assert_eq!(json[12]["license"], Value::Null);
     }
 
-    fn fetched(catalog: &Catalog, ids: &[&str], all: bool, card: Option<CardClass>) -> Result<Vec<String>, String> {
+    fn fetched(catalog: &Catalog, ids: &[&str], all: bool, card: Option<&CardReading>) -> Result<Vec<String>, String> {
         let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
         entries_to_fetch(catalog, &ids, all, crate::config::DEFAULT_MODEL, card).map(|entries| entries.into_iter().map(|entry| entry.id).collect())
     }
@@ -632,10 +658,11 @@ mod tests {
     #[test]
     fn a_download_fetches_the_entry_that_serves_an_id_on_the_card() {
         let catalog = super::super::catalog::testing::built_in();
-        let sixteen = Some(CardClass::Gb16);
+        let sixteen_gb = on(CardClass::Gb16);
+        let sixteen = Some(&sixteen_gb);
         assert_eq!(fetched(&catalog, &[], false, sixteen), Ok(vec!["qwen3.8-27b-16g".to_owned()]), "the configured model");
         assert_eq!(fetched(&catalog, &["QWEN3.8-27B", "qwen3.8-27b-16g"], false, sixteen), Ok(vec!["qwen3.8-27b-16g".to_owned()]));
-        for card in [Some(CardClass::Gb32), None] {
+        for card in [Some(&on(CardClass::Gb32)), None] {
             assert_eq!(fetched(&catalog, &["qwen3.8-27b"], false, card), Ok(vec!["qwen3.8-27b".to_owned()]), "{card:?}: nothing changes");
             assert_eq!(fetched(&catalog, &[], true, card).unwrap().len(), 12, "{card:?}");
         }
@@ -649,8 +676,8 @@ mod tests {
     fn a_download_of_the_uncensored_variant_fetches_its_16gb_build_on_a_16gb_card() {
         let catalog = super::super::catalog::testing::built_in();
         let abliterated = ["qwen3.8-27b-abliterated"];
-        assert_eq!(fetched(&catalog, &abliterated, false, Some(CardClass::Gb16)), Ok(vec!["qwen3.8-27b-abliterated-16g".to_owned()]));
-        for card in [Some(CardClass::Gb32), Some(CardClass::Gb96), None] {
+        assert_eq!(fetched(&catalog, &abliterated, false, Some(&on(CardClass::Gb16))), Ok(vec!["qwen3.8-27b-abliterated-16g".to_owned()]));
+        for card in [Some(&on(CardClass::Gb32)), Some(&on(CardClass::Gb96)), None] {
             assert_eq!(fetched(&catalog, &abliterated, false, card), Ok(vec!["qwen3.8-27b-abliterated".to_owned()]), "{card:?}");
         }
     }
@@ -661,10 +688,11 @@ mod tests {
     #[test]
     fn a_download_of_swift_fetches_its_16gb_build_on_a_16gb_card() {
         let catalog = super::super::catalog::testing::built_in();
-        let sixteen = Some(CardClass::Gb16);
+        let sixteen_gb = on(CardClass::Gb16);
+        let sixteen = Some(&sixteen_gb);
         assert_eq!(fetched(&catalog, &["swift-1.5-27b"], false, sixteen), Ok(vec!["swift-1.5-27b-16g".to_owned()]));
         assert_eq!(fetched(&catalog, &["swift-1.5-27b-16g", "SWIFT-1.5-27B"], false, sixteen), Ok(vec!["swift-1.5-27b-16g".to_owned()]), "each entry once");
-        for card in [Some(CardClass::Gb32), Some(CardClass::Gb96), None] {
+        for card in [Some(&on(CardClass::Gb32)), Some(&on(CardClass::Gb96)), None] {
             assert_eq!(fetched(&catalog, &["swift-1.5-27b"], false, card), Ok(vec!["swift-1.5-27b".to_owned()]), "{card:?}");
         }
     }
@@ -676,7 +704,8 @@ mod tests {
     #[test]
     fn a_download_of_an_entry_above_the_card_class_is_refused_before_any_fetch() {
         let catalog = super::super::catalog::testing::built_in();
-        let sixteen = Some(CardClass::Gb16);
+        let sixteen_gb = on(CardClass::Gb16);
+        let sixteen = Some(&sixteen_gb);
         let err = fetched(&catalog, &["qwen3.8-27b-16g", "qwen3.8-flash-next", "ignis-image-2.1-turbo"], false, sixteen).unwrap_err();
         assert!(err.starts_with("nothing fetched"), "{err}");
         for said in ["qwen3.8-flash-next needs a 32 GB card", "ignis-image-2.1-turbo needs a 32 GB card", "16 GB class"] {
@@ -691,5 +720,62 @@ mod tests {
         let err = fetched(&super::super::catalog::testing::thirty_two(), &[], false, sixteen).unwrap_err();
         assert!(err.contains("qwen3.8-27b needs a 32 GB card"), "{err}");
         assert!(fetched(&catalog, &["acme-nothing"], false, sixteen).unwrap_err().contains("not in the catalog"));
+    }
+
+    /// Spec #474 on an RTX 3090 (24 GiB, 8.6): `model download qwen3.8-27b`
+    /// fetches the 16 GB entry, and so does the configured model, while a
+    /// Blackwell-only entry is refused before any fetch, naming the card, its
+    /// compute capability and its generation; `--all` too.
+    #[test]
+    fn a_download_on_an_rtx_3090_fetches_the_16gb_entry_and_refuses_a_blackwell_only_one() {
+        let catalog = super::super::catalog::testing::built_in();
+        let card = rtx_3090();
+        let card = Some(&card);
+        assert_eq!(fetched(&catalog, &["qwen3.8-27b"], false, card), Ok(vec!["qwen3.8-27b-16g".to_owned()]));
+        assert_eq!(fetched(&catalog, &[], false, card), Ok(vec!["qwen3.8-27b-16g".to_owned()]), "the configured model");
+        for id in ["qwen3.8-flash-next", "ignis-image-2.1-turbo", "swift-1.5-27b", "swift-1.5-27b-16g"] {
+            let err = fetched(&catalog, &[id], false, card).unwrap_err();
+            for said in ["nothing fetched", id, "Blackwell generation", "NVIDIA GeForce RTX 3090 (compute capability 8.6), is of the Ampere generation"] {
+                assert!(err.contains(said), "{said}: {err}");
+            }
+        }
+        assert!(fetched(&catalog, &[], true, card).unwrap_err().contains("qwen3.8-flash-next needs a card of the Blackwell generation"));
+    }
+
+    /// Spec #474: `model list` says which entries the card loads — a yes or
+    /// no column, and each reason under the table, the entry that serves its
+    /// id here named; `available` and `reason` in JSON. With no card read,
+    /// every entry is available.
+    #[test]
+    fn the_listing_shows_which_entries_the_card_loads() {
+        let catalog = Catalog::built_in();
+        let rows = list_rows(catalog, Path::new("m"), &|_| None, &|_| None);
+        let card = rtx_3090();
+        let unavailable = |id: &str| catalog.unavailable(id, Some(&card)).map(|unavailable| unavailable.to_string());
+        let text = render_list(&rows, ListFormat::Text, &unavailable);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].contains("AVAILABLE") && lines[0].ends_with("LICENSE"), "{text}");
+        let available = |id: &str| -> &str {
+            let line = lines.iter().find(|line| line.split_whitespace().next() == Some(id)).unwrap_or_else(|| panic!("{id}: {text}"));
+            line.split_whitespace().rev().nth(1).unwrap()
+        };
+        for id in ["qwen3.8-27b", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "swift-1.5-27b", "swift-1.5-27b-16g"] {
+            assert_eq!(available(id), "no", "{id}: {text}");
+        }
+        for id in ["qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "qwen3-asr-1.7b", "nemotron-3-diarization"] {
+            assert_eq!(available(id), "yes", "{id}: {text}");
+        }
+        let reason = lines.iter().find(|line| line.starts_with("qwen3.8-27b: not available on this card: ")).unwrap_or_else(|| panic!("{text}"));
+        assert!(reason.contains("Ampere generation") && reason.ends_with("a request naming it is served by qwen3.8-27b-16g"), "{reason}");
+        assert!(lines.iter().any(|line| line.starts_with("swift-1.5-27b-16g: not available on this card: ")), "{text}");
+
+        let json: Vec<Value> = serde_json::from_str(&render_list(&rows, ListFormat::Json, &unavailable)).unwrap();
+        let row = |id: &str| json.iter().find(|row| row["id"] == id).unwrap().clone();
+        assert_eq!(row("qwen3.8-flash-next")["available"], false);
+        assert!(row("qwen3.8-flash-next")["reason"].as_str().unwrap().contains("Blackwell generation"));
+        assert_eq!((row("qwen3.8-27b-16g")["available"].clone(), row("qwen3.8-27b-16g").get("reason")), (Value::Bool(true), None));
+
+        let none: Vec<Value> = serde_json::from_str(&render_list(&rows, ListFormat::Json, &|id| catalog.unavailable(id, None).map(|unavailable| unavailable.to_string()))).unwrap();
+        assert!(none.iter().all(|row| row["available"] == true && row.get("reason").is_none()));
     }
 }

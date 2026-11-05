@@ -1,9 +1,9 @@
 ---
 title: ignis
-description: A CUDA inference engine for Qwen3.8 on RTX 50-series and RTX PRO 6000 cards. Install it, configure it, call it, extend it.
+description: A CUDA inference engine for Qwen3.8 on RTX 50-series, RTX PRO 6000 and RTX 30 cards. Install it, configure it, call it, extend it.
 template: splash
 hero:
-  tagline: A CUDA inference engine for Qwen3.8 on Blackwell cards. OpenAI-compatible API, a Playground in the browser, one binary.
+  tagline: A CUDA inference engine for Qwen3.8 on RTX 50, RTX PRO 6000 and RTX 30 cards. OpenAI-compatible API, a Playground in the browser, one binary.
   image:
     file: ../../web/src/brand/flame.webp
     alt: The ignis flame
@@ -31,8 +31,16 @@ import { Card, CardGrid, LinkCard } from "@astrojs/starlight/components";
 
 ## What sets it apart
 
-One model family on one class of card, built for the load an agent makes: a
+One model family on NVIDIA RTX cards, built for the load an agent makes: a
 main conversation and its subagents on the same GPU at once.
+
+**What it runs on.** RTX 5090 and RTX PRO 6000 Blackwell with every model, and
+the 16 GB RTX 50 cards with the 16 GB entries. The RTX 3090 and 3090 Ti are
+supported, on the 27B's 16 GB entries. The RTX 4090 and the 16 GB RTX 40 cards
+are expected to work; reports are welcome. The NVFP4 27B, Flash-Next and the
+image model load on Blackwell alone, on a card of 32 GB or more
+([the details](start/#what-it-runs-on)). The figures below are
+measured on an RTX 5090.
 
 <div class="ignis-stats not-content">
   <a href="why-ignis/decode-round/"><b>367 tok/s</b>one lane, coding prompts, greedy</a>
@@ -56,10 +64,10 @@ Every model the server fetches by itself is a public Hugging Face repository,
 pinned file by file at a fixed revision ([Get a model](guides/models.md)).
 
 <CardGrid>
-  <LinkCard title="Qwen3.8-27B, NVFP4 + DFlash2" description="qwen3.8-27b, the default: 18.1 GiB, with its grafted DFlash2 drafter. RTX 5090 and RTX PRO 6000." href="https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer" />
-  <LinkCard title="Qwen3.8-27B for 16 GB cards" description="qwen3.8-27b-16g: the 27B with a 3-bit trellis body, 12.5 GiB, for the RTX 5060 Ti 16 GB, 5070 Ti and 5080." href="https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis" />
+  <LinkCard title="Qwen3.8-27B, NVFP4 + DFlash2" description="qwen3.8-27b, the default: 18.1 GiB, with its grafted DFlash2 drafter. RTX 5090 and RTX PRO 6000 (Blackwell only)." href="https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer" />
+  <LinkCard title="Qwen3.8-27B for 16 GB cards" description="qwen3.8-27b-16g: the 27B with a 3-bit trellis body, 12.5 GiB, for the RTX 5060 Ti 16 GB, 5070 Ti and 5080, and the RTX 3090." href="https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis" />
   <LinkCard title="Qwen3.8-27B, uncensored" description="qwen3.8-27b-abliterated: the same 27B, abliterated (uncensored), 18.1 GiB." href="https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer" />
-  <LinkCard title="Qwen3.8-Flash-Next, 125B MoE" description="qwen3.8-flash-next: experts in a 2.5-bit trellis code, 67.8 GiB with its MTP head, on a 32 GB card." href="https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis" />
+  <LinkCard title="Qwen3.8-Flash-Next, 125B MoE" description="qwen3.8-flash-next: experts in a 2.5-bit trellis code, 67.8 GiB with its MTP head, on a 32 GB Blackwell card." href="https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis" />
   <LinkCard title="Qwen-Image-2.1-Turbo" description="ignis-image-2.1-turbo: the image model, 15.6 GiB. Non-commercial licence." href="https://huggingface.co/gpillon/ignis-image-2.1-turbo" />
 </CardGrid>
 

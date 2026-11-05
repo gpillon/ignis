@@ -33,7 +33,7 @@ the artifact it stands in for. The DFlash2 drafter is the same.
 
 **A profile chosen by the card** ([ADR 0063](../../adr/0063-the-profile-follows-the-card-class.md)).
 With `--profile auto`, the default, the server reads the card's memory and
-picks `rtx50-16gb` under 20 GiB: 262,144 tokens of context, two decode lanes,
+picks `rtx-16gb` under 20 GiB: 262,144 tokens of context, two decode lanes,
 DFlash2 with 7 drafts, vision on at 4,096 tokens an image (the tower and the
 embedding pool sit in pinned host RAM, so with no image in flight vision costs no
 context; `--vision-enabled false` turns it off). The VRAM budget is the card's free memory less the
@@ -72,8 +72,8 @@ thinking budget forced a close on 15 of 32 turns against 8 of 32 on NVFP4.
   ([the uncensored variant](../guides/uncensored.md)).
 - **Swift 1.5**: `ignis-server model download swift-1.5-27b` fetches
   `swift-1.5-27b-16g` on a 16 GB card ([fine-tunes](../guides/fine-tunes.md)).
-- **The profile**: `--profile auto` (the default) or `--profile rtx50-16gb`
-  ([profiles](../concepts/profiles.md#rtx50-16gb)).
+- **The profile**: `--profile auto` (the default) or `--profile rtx-16gb`
+  ([profiles](../concepts/profiles.md#rtx-16gb)).
 - **The adaptation**: [`model.adapt_context_step`](../reference/configuration.md#modeladapt_context_step)
   and [`vram.adapt_spare_tokens`](../reference/configuration.md#vramadapt_spare_tokens);
   `GET /v1/models` reports `decode_lanes` and `adapted`.

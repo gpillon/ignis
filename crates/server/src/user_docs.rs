@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::config::cli::default_text;
 use crate::config::field::{FieldMeta, FAMILIES};
-use crate::config::profile::{built_in, AUTO_PROFILE, DEFAULT_PROFILE, NONE_PROFILE};
+use crate::config::profile::{built_in, CardClass, AUTO_PROFILE, DEFAULT_PROFILE, LEGACY_16GB_PROFILE, NONE_PROFILE};
 use crate::config::schema::GROUPS;
 use crate::download::catalog::Catalog;
 use crate::metrics::{LoadReservations, LocateFound, Metrics, Primitive, TokenizeRoute};
@@ -135,10 +135,24 @@ pub fn profiles() -> String {
          is `{DEFAULT_PROFILE}`, and `{AUTO_PROFILE}` takes the built-in profile of the card's class, \
          read from its total memory; `--profile {NONE_PROFILE}` skips the layer. A config file's \
          `profiles:` section defines more, or shadows these \
-         ([Profiles and defaults](../concepts/profiles.md)).\n"
+         ([Profiles and defaults](../concepts/profiles.md)). `{LEGACY_16GB_PROFILE}` is the former \
+         name of `{}` and is still accepted everywhere a profile is named, as the same profile.\n",
+        CardClass::Gb16.profile()
+    );
+    let _ = writeln!(
+        out,
+        "A profile follows the card's memory, not its generation, and what a card loads follows \
+         from both. The RTX 5090 and RTX PRO 6000 run every model, and the 16 GB RTX 50 cards the \
+         16 GB entries; the RTX 3090 and 3090 Ti are supported, on the 27B's 16 GB entries; the \
+         RTX 4090 and the 16 GB RTX 40 cards are expected to work, and reports are welcome. The \
+         NVFP4 27B, Flash-Next and the image model load on Blackwell alone, on a card of 32 GB or \
+         more ([What it runs on](../start/index.md#what-it-runs-on)).\n"
     );
     for (name, layer) in built_in() {
         let _ = writeln!(out, "## {name}\n");
+        if let Some(class) = CardClass::ALL.into_iter().find(|class| class.profile() == name) {
+            let _ = writeln!(out, "`--profile {AUTO_PROFILE}` picks it on a card of the {class} class: a total memory {}.\n", class.totals());
+        }
         let _ = writeln!(out, "| Field | Model | Value |\n|---|---|---|");
         let mut rows: Vec<(String, String, String)> = layer
             .entries()
@@ -406,6 +420,19 @@ mod tests {
         assert!(page.contains("| License |"), "{page}");
         assert!(page.contains("[`qwen-community-1.0`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/8d94db83cd8e58d6be31e796723e5e35b960638c/LICENSE)"));
         assert!(page.contains("[`openmdw-1.1`]"));
+    }
+
+    /// GitHub #480: the profiles page says, under each built-in profile, the
+    /// card class `auto` picks it for and the totals that class covers.
+    #[test]
+    fn the_profiles_page_names_the_class_auto_picks_each_profile_for() {
+        let page = profiles();
+        assert!(page.contains("RTX 3090 and 3090 Ti are supported, on the 27B's 16 GB entries"), "{page}");
+        assert!(page.contains("load on Blackwell alone"), "{page}");
+        assert!(page.contains("## rtx-24gb\n\n`--profile auto` picks it on a card of the 24 GB class: a total memory from 20 to under 28 GiB.\n"), "{page}");
+        assert!(page.contains("## rtx-16gb\n\n`--profile auto` picks it on a card of the 16 GB class: a total memory below 20 GiB.\n"), "{page}");
+        assert!(page.contains("## rtx5090\n\n`--profile auto` picks it on a card of the 32 GB class: a total memory from 28 to 40 GiB.\n"), "{page}");
+        assert!(page.contains("## rtxpro6000\n\n`--profile auto` picks it on a card of the 96 GB class: a total memory from 88 to 104 GiB.\n"), "{page}");
     }
 
     #[test]

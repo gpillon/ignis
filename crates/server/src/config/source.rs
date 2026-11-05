@@ -52,6 +52,10 @@ pub enum Source {
     Env,
     /// The config file (`<group>.<field>`, `<group>.<family>.<field>`).
     File,
+    /// The card, which decided a value no operator named: the band it runs
+    /// where the field's default or a profile's value is one it cannot (GitHub
+    /// #477). Not explicit, so a load's adaptation may still lower it.
+    Card,
     /// The hardware profile in use: a default, never an override.
     Profile,
     /// The field's hardcoded default.
@@ -410,8 +414,28 @@ impl Resolution {
 /// artifact has named one, so only general values and no applicability).
 pub fn resolve_settings(sources: &Sources, family: Option<ModelFamily>, fit: Fit) -> Result<Resolution, ConfigError> {
     let resolver = Resolver { sources, family, fit, origins: RefCell::default(), dropped: RefCell::default() };
-    let settings = Settings::resolve(&resolver)?;
-    Ok(Resolution { settings, origins: resolver.origins.into_inner(), dropped: resolver.dropped.into_inner() })
+    let mut settings = Settings::resolve(&resolver)?;
+    let mut origins = resolver.origins.into_inner();
+    decide_by_card(sources, &mut settings, &mut origins);
+    Ok(Resolution { settings, origins, dropped: resolver.dropped.into_inner() })
+}
+
+/// The values the card decides (GitHub #477): the report says what the load
+/// runs. The 27B's prompt attention left to its default or a profile is the
+/// FP16 band on a card without the block-scaled FP8 tensor cores
+/// ([`super::arch::prefill_attention`]); its origin is the card. A named
+/// value is left as it is: a named `fp8` is refused where the config is built.
+fn decide_by_card(sources: &Sources, settings: &mut Settings, origins: &mut BTreeMap<(&'static str, &'static str), Origin>) {
+    use ignis_core::PrefillAttention;
+    let key = ("model", "prefill_attention");
+    let named = origins.get(&key).is_some_and(|origin| origin.source.explicit());
+    let card = sources.card.as_ref();
+    let decided = super::arch::prefill_attention(settings.model.prefill_attention, named, card, "");
+    if let (Ok(PrefillAttention::Fp16), PrefillAttention::Fp8, Some(card)) = (decided, settings.model.prefill_attention, card) {
+        settings.model.prefill_attention = PrefillAttention::Fp16;
+        let spelling = format!("{} ({})", card.name, card.capability);
+        origins.insert(key, Origin { source: Source::Card, spelling, at_default: false, scoped: false });
+    }
 }
 
 /// Resolves one field at a time against a [`Sources`] — the one function

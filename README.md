@@ -9,12 +9,12 @@
 </p>
 
 <p align="center">
-  OpenAI-compatible HTTP API &nbsp;·&nbsp; Rust core &nbsp;·&nbsp; C++/CUDA kernel leaf &nbsp;·&nbsp; one Blackwell card
+  OpenAI-compatible HTTP API &nbsp;·&nbsp; Rust core &nbsp;·&nbsp; C++/CUDA kernel leaf &nbsp;·&nbsp; one RTX card
 </p>
 
 <p align="center">
   <img alt="license Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-d94b1f?style=flat-square">
-  <img alt="target SM120a" src="https://img.shields.io/badge/target-SM120a%20%2F%20RTX%205090%20%7C%20RTX%20PRO%206000%20%7C%2016%20GB%20RTX%2050-d94b1f?style=flat-square">
+  <img alt="cards RTX 50, RTX PRO 6000 and RTX 30" src="https://img.shields.io/badge/cards-RTX%2050%20%7C%20RTX%20PRO%206000%20%7C%20RTX%203090-d94b1f?style=flat-square">
   <img alt="models Qwen3.8-27B NVFP4 and trellis, Qwen3.8-Flash-Next and Qwen-Image-2.1-Turbo" src="https://img.shields.io/badge/models-Qwen3.8--27B%20NVFP4%20%2F%20trellis%20%7C%20Flash--Next%20125B%20MoE%20%7C%20Qwen--Image--2.1-d94b1f?style=flat-square">
   <img alt="API OpenAI-compatible" src="https://img.shields.io/badge/API-OpenAI--compatible-d94b1f?style=flat-square">
   <br>
@@ -58,10 +58,10 @@ https://github.com/user-attachments/assets/ed4eab53-6a9e-4f5b-b37c-226fcc0784a7
 
 ---
 
-Ignis is a deliberately specialized engine: **one model family, one class of
-card**. It gives up generality and takes back speed. It loads an NVFP4
+Ignis is a deliberately specialized engine: **one model family, NVIDIA RTX
+cards**. It gives up generality and takes back speed. It loads an NVFP4
 Qwen3.8-27B onto a single Blackwell card — an **RTX 5090** or an **RTX PRO
-6000**, both `SM120a` ([why not DGX Spark?](docs/user/guides/dgx-spark.md)) — serves streaming and non-streaming
+6000**, both compute capability 12.0 ([why not DGX Spark?](docs/user/guides/dgx-spark.md)) — serves streaming and non-streaming
 completions over the OpenAI v1 API, and is shaped around the workload a
 developer actually produces — *one main agent plus a handful of subagents
 hitting the same card at once*. Eight resident decode lanes run as one
@@ -89,10 +89,20 @@ the prompt optionally rewritten first by the 27B
 ([Images made](#images-made-on-the-same-card)). Its weights are for
 non-commercial use only.
 
+**What it runs on.** The RTX 5090 and the RTX PRO 6000 run every model, and
+the 16 GB RTX 50 cards the 16 GB entries. The **RTX 3090 and 3090 Ti** are
+supported, on the 27B's 16 GB entries; the **RTX 4090** and the 16 GB RTX 40
+cards are expected to work, and reports are welcome. An RTX 30 or RTX 40 card
+needs release 0.10.0 or the development build: the 0.9 releases are built for
+Blackwell alone. The NVFP4 27B, Flash-Next
+and the image model load on Blackwell alone, on a card of 32 GB or more. The
+figures here are measured on an RTX 5090
+([the guide's list](https://gpillon.github.io/ignis/start/#what-it-runs-on)).
+
 The 27B also fits a **16 GB card** (RTX 5060 Ti 16 GB, 5070 Ti, 5080), from a
 second artifact: its body re-encoded in a trellis code at about 3 bits per
 weight, 12.5 GiB on disk, with the same DFlash2 drafter. On such a card the
-server picks the `rtx50-16gb` profile and that artifact by itself, 262,144
+server picks the `rtx-16gb` profile and that artifact by itself, 262,144
 tokens of context on two lanes, and the artifact passed four pre-registered
 quality gates against the NVFP4 it stands in for: its KL divergence from BF16
 is 0.77-0.82x the NVFP4's. It has not run on a 16 GB card yet. On the 5090 held
@@ -115,7 +125,9 @@ that build it, and the rest of that is what the remaining work is for.
 
 Take a build from **[Releases](https://github.com/gpillon/ignis/releases)** — a
 Windows `.zip`, a Linux `.tar.gz`, or the `linux/amd64` container image on
-`ghcr.io/gpillon/ignis`. Run it on a Blackwell card. (Every push to `main` that
+`ghcr.io/gpillon/ignis`. Run it on an RTX 50, RTX PRO 6000 or RTX 30 card; the
+releases from 0.10.0 are built for compute capabilities 8.6 and 12.0, the 0.9
+ones for 12.0 alone. (Every push to `main` that
 changes code also publishes a rolling development build, **not a release**: the image
 `ghcr.io/gpillon/ignis:develop` and the `develop` prerelease.)
 
@@ -130,7 +142,7 @@ speculative decoding and image input; the Prometheus
 metrics the Playground's Monitor reads are on by default. A bare `ignis-server`
 already gets DFlash2 and image input from the built-in `rtx5090` profile, with
 an 896K context (YaRN x3.5). On a 16 GB card, run a bare `ignis-server`
-instead: it takes the `rtx50-16gb` profile and offers to fetch the 27B's
+instead: it takes the `rtx-16gb` profile and offers to fetch the 27B's
 16 GB artifact, while the flags above ask for a longer context than that card's KV
 pool holds. Flash-Next is `--model-id
 qwen3.8-flash-next`; the flags `make` serves it with are on its
@@ -463,7 +475,7 @@ guide's [Why ignis](https://gpillon.github.io/ignis/why-ignis/) section.
   kernels of ignis's own, beside the NVFP4 artifact's token embedding and
   DFlash2 drafter: **12.5 GiB on disk** against 18.1 GiB.
 - **Chosen by the card.** Under `--profile auto` a card under 20 GiB takes
-  `rtx50-16gb` (262,144 tokens of context, two lanes, DFlash2 with 7 drafts,
+  `rtx-16gb` (262,144 tokens of context, two lanes, DFlash2 with 7 drafts,
   no image input), and the default id `qwen3.8-27b` resolves to the 16 GB
   entry. On a 5090 held to a 16 GiB budget the load fits with nothing
   adapted, and at 15 GiB too; at 13 GiB it lowers its context to 65,536
@@ -507,7 +519,7 @@ guide's [Why ignis](https://gpillon.github.io/ignis/why-ignis/) section.
 - **One declaration per setting**: every option is a flag, an `IGNIS_*`
   variable and a key in a YAML or JSON config file, with per-model values and
   a built-in profile chosen by the card's memory by default (`--profile auto`:
-  the measured `rtx5090`, `rtxpro6000` for the 96 GB card and the derived `rtx50-16gb` for the 16 GB cards); `GET`/`PATCH /v1/config`
+  the measured `rtx5090`, `rtxpro6000` for the 96 GB card and the derived `rtx-16gb` for the 16 GB cards and `rtx-24gb` for the 24 GB cards); `GET`/`PATCH /v1/config`
   reads and changes the running server, reloading the model only for a field
   that needs it.
 - **`POST /v1/tokenize`** counts a chat body's prompt exactly as it would be

@@ -13,9 +13,12 @@ Every `v*` release publishes ignis three ways, all from the same compile:
 | **Linux `.tar.gz`** | Linux on x86-64, glibc 2.39 or newer (Ubuntu 24.04 or a distribution of its age) | an NVIDIA driver new enough for CUDA 13, and the CUDA 13 runtime (`libcudart.so.13`) |
 | **Container image** `ghcr.io/gpillon/ignis` | `linux/amd64`, under podman or docker with the NVIDIA container toolkit | the NVIDIA driver; the image carries the CUDA runtime |
 
-All three are compiled for `SM120a` only: the RTX 5090, the RTX PRO 6000 and
-the 16 GB RTX 50 class ([what it runs on](index.md#what-it-runs-on)); on any
-other card the server refuses to start, naming it. None carries a model: the server fetches one on first start, or you point it at a
+All three are compiled for compute capabilities 8.6 and 12.0 (`86;120a`): the
+RTX 5090, the RTX PRO 6000 and the 16 GB RTX 50 class, and the RTX 3090 and
+3090 Ti; the RTX 4090 and the 16 GB RTX 40 cards are expected to work, and
+reports are welcome. The NVFP4 27B, Flash-Next and the image model load on
+Blackwell alone ([what it runs on](index.md#what-it-runs-on)); on any card
+the build is not compiled for, the server refuses to start, naming it. None carries a model: the server fetches one on first start, or you point it at a
 `.ninfer` file you already have ([Get a model](../guides/models.md)). To build
 from a checkout instead, see [Building](../contributing/building.md).
 

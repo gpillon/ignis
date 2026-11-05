@@ -65,19 +65,19 @@ another, and `ignis-server model download <id>` fetches it like any entry.
 Each entry states the smallest **card class** it loads on
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md)): every
 built-in model is 32 GB, the RTX 5090's class, except `qwen3.8-27b-16g`, `qwen3.8-27b-abliterated-16g` and `swift-1.5-27b-16g` (16 GB) and the speech models (none).
-On a card of a smaller class (16 GB), the server refuses an entry above it before unloading or fetching
+On a card of a smaller class (16 or 24 GB), the server refuses an entry above it before unloading or fetching
 anything: a switch to it and a request naming it are answered
 `409 model_above_card_class`, naming both classes, while the loaded model
 serves on; a start with no artifact that would load it, and its
 `model download`, are refused; `GET /v1/models`, `GET /v1/models/catalog` and
 the Playground list it as unavailable, with the reason. An entry may answer to
 its family's default id as an **alias**: the 16 GB 27B answers to
-`qwen3.8-27b` on a 16 GB card, so a client configured with
+`qwen3.8-27b` on a 16 or 24 GB card, so a client configured with
 `qwen3.8-27b` is served by it, and the answer names it — only an entry whose
 artifact is of the 27B's family, by the artifact's header, answers to it; one
 of another family is refused, naming both. An alias may also be another
 entry's id of the same family: `qwen3.8-27b-abliterated-16g` answers to
-`qwen3.8-27b-abliterated` on a 16 GB card, `swift-1.5-27b-16g` to
+`qwen3.8-27b-abliterated` on a 16 or 24 GB card, `swift-1.5-27b-16g` to
 `swift-1.5-27b` ([fine-tunes](fine-tunes.md)), and an [operator's catalog](operator-catalog.md#an-entrys-family-and-an-alias-of-your-own)
 does the same with an entry's `family`. `GET /v1/models` lists the entry
 under its own id, never under an alias. A model loaded from a path named
@@ -87,12 +87,43 @@ catalog id you also list in `--switch-known-models` is fitted all the same:
 the class is its catalog entry's. A model id no entry holds has no class, and
 a card whose class is not known refuses nothing.
 
-`ignis-server model list` shows every entry and how much of it is on disk:
+An entry may also state the oldest **GPU generation** it loads on,
+`generation: ampere`, `ada` or `blackwell`
+([ADR 0079](../../adr/0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md)).
+The server reads the card's generation from its compute capability at start:
+8.6 is Ampere (RTX 30), 8.9 Ada (RTX 40), 12.x Blackwell (RTX 50, RTX PRO).
+`qwen3.8-27b`, `qwen3.8-27b-abliterated`, `swift-1.5-27b`,
+`swift-1.5-27b-16g`, `qwen3.8-flash-next` and `ignis-image-2.1-turbo` state
+`blackwell`; `qwen3.8-27b-16g`, `qwen3.8-27b-abliterated-16g`, the speech
+models and the diarizer state none, so they load on every generation the build
+runs on. On an RTX 3090 or RTX 4090, `qwen3.8-27b` and
+`qwen3.8-27b-abliterated` are served by their 16 GB entries through their
+aliases, and an entry no alias serves is refused as for the class, with
+`409 model_above_gpu_generation`: a switch to it, a request naming it, a start
+with no artifact that would load it and its `model download`. The message
+names what the entry needs and the card: its name, compute capability and
+generation. When the class is above the card's too, the code is
+`model_above_gpu_generation` and the message names both, since a larger card
+of the same generation would not load it either
+([troubleshooting](../troubleshooting.md#409-model_above_gpu_generation)). The
+lists mark it unavailable with the reason, as for the class. A card whose
+compute capability could not be read refuses nothing by generation. A load the
+card has no route for, such as an NVFP4 artifact named by its path, is still
+refused by name at the load, whatever a catalog says.
+
+`ignis-server model list` shows every entry, how much of it is on disk, and
+whether the card of the machine it runs on loads it:
 
 ```
-ignis-server model list                 # id, built-in or operator, repo@revision, size, complete/partial/absent, family, license
+ignis-server model list                 # id, built-in or operator, repo@revision, size, complete/partial/absent, family, available, license
 ignis-server model list --format json
 ```
+
+`AVAILABLE` is `no` for an entry the card cannot load, by class or by
+generation, and each such entry's reason follows the table, naming the entry
+that serves its id on this card when one does; `--format json` gives
+`available` and `reason`, as `GET /v1/models/catalog` does. On a machine with
+no card read, every entry is available.
 
 ## Fetching one: `ignis-server model download`
 
@@ -125,9 +156,11 @@ are bound by it as with any download from the hub.
 Progress goes to stderr, the artifact paths to stdout, and the exit code is 0
 only when every entry verified. It reads the same configuration a start does
 (config file, environment, flags). It is fitted to the card of the machine it
-runs on: an id an entry answers to there fetches that entry, and an entry
-above the card's class refuses the whole command before anything is fetched —
-fetch it on the machine that will run it, or on one without a GPU.
+runs on: an id an entry answers to there fetches that entry
+(`model download qwen3.8-27b` on an RTX 3090 fetches `qwen3.8-27b-16g`), and
+an entry above the card's class or its generation refuses the whole command
+before anything is fetched — fetch it on the machine that will run it, or on
+one without a GPU.
 
 A model fetched into a running server's `--download-path` is switchable at
 once: a request naming its id switches the server to it, as a
@@ -211,6 +244,7 @@ itself at the next start: a partial entry's next download, the Server view's
 | `409 download_in_progress` | A download already runs, named in the message: one at a time, never queued. |
 | `409 download_locked` | Another fetch of this entry into `--download-path` holds its lock: `model download`, or another server on the same folder ([one writer per entry](#one-writer-per-entry)). |
 | `409 model_above_card_class` | The entry's `card_class` is above this card's. |
+| `409 model_above_gpu_generation` | The entry's `generation` is newer than this card's GPU generation, its class above the card's or not. |
 | `409 model_already_downloaded` | Every file of it is already on disk. |
 | `500 download_failed` | The download could not begin: the server could not build its HTTP client, or could not open the entry's lock file under `--download-path` (a folder it cannot create or write to); the message says which. Nothing was fetched, and the row keeps no reason. |
 | `503 model_switching` | A switch is under way; retry once it lands. |

@@ -34,6 +34,6 @@ var, config file, profile, built-in default; a field's qwen38 / qwen38flashnext
 value wins within each. `help --fields` prints every field in full.
 
 --profile defaults to `auto`: the built-in profile of the card's total memory
-(16 GB: rtx50-16gb, 32 GB: rtx5090, 96 GB: rtxpro6000); a card of no class is refused, naming --profile. A named profile
+(16 GB: rtx-16gb, 24 GB: rtx-24gb, 32 GB: rtx5090, 96 GB: rtxpro6000); a card of no class is refused, naming --profile. A named profile
 (or `none`) always wins.
 ```
