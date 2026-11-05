@@ -971,29 +971,67 @@ __global__ void __launch_bounds__(kFaThreads, 1)
 //     packed with PRMT, its row sum with IDP4A; the mask only on a tile that needs it;
 //   - kStages cp.async stages with one barrier per tile (kOneBarrier), or 5ea54bc6's two;
 //   - kPipeQk: tile c + 1's Q K^T is issued before tile c's softmax, so its MMAs run under it;
-//   - kQSmem: Q's fragments by ldmatrix from shared memory instead of 32 registers.
+//   - kQSmem: Q's fragments by ldmatrix from shared memory instead of 32 registers;
+//   - kPingPong: the two warps of each scheduler run half a tile apart -- the early one runs tile
+//     c's Q K^T, softmax and P V, the late one tile c - 1's P V, then tile c's Q K^T and softmax --
+//     so one warp's MMAs fill the other's softmax; a stage is refilled one tile later;
+//   - kFuseQk: tile c + 1's Q K^T inside tile c's P V loop, one k step every two dims, so the
+//     SASS itself alternates the two MMAs with the fold (a separate next-tile block, kPipeQk, is
+//     front-loaded by the compiler and leaves the softmax without MMAs);
+//   - kOneHead: a CTA of 4 warps for one head's 64 rows, two CTAs an SM, so each scheduler holds
+//     warps of two CTAs whose barriers do not line them up (each K and V tile is staged per 64
+//     rows instead of 128);
+//   - kPad: the staged tiles padded instead of XOR-swizzled (K rows 272 bytes apart, V^T 16 bytes
+//     after every 4 dims), still conflict-free, so every ldmatrix of a tile is one base register
+//     and an immediate offset.
 // kDiag (the bench's --diag; the op never launches it) disables stages: kDiagNoPv drops P V and
 // its fold, kDiagNoSoftmax takes P from S's bits, kDiagNoQk takes S from Q's bits (or the lane).
 constexpr int kDiagNoPv = 1;
 constexpr int kDiagNoSoftmax = 2;
 constexpr int kDiagNoQk = 4;
-constexpr int kI8TileBytes = 2 * kKTileBytes<true>;          // K rows + V^T: 16 KiB a tile
-constexpr int kQSmemBytes = kHeadsPerCta * kQ * kHeadDim;  // the CTA's INT8 Q: 32 KiB
-constexpr std::int32_t kMagic = 0x4B400000;                // 1.5 2^23 as float bits
+constexpr int kKRowPad = kHeadDim + 16;  // a padded K row: 272 bytes
+template <bool kPad>
+constexpr int kI8KBytes = kPad ? kTile * kKRowPad : kKTileBytes<true>;
+template <bool kPad>
+constexpr int kI8VBytes = kPad ? kVtTileBytes + kHeadDim / 4 * 16 : kVtTileBytes;
+template <bool kPad>
+constexpr int kI8TileBytes = kI8KBytes<kPad> + kI8VBytes<kPad>;  // 16 KiB, padded 17.5 KiB
+template <bool kPad>
+constexpr int kQSmemBytes = kHeadsPerCta * kQ * (kPad ? kKRowPad : kHeadDim);  // the CTA's Q
+constexpr std::int32_t kMagic = 0x4B400000;  // 1.5 2^23 as float bits
 constexpr float kMagicF = 12582912.0f;
-template <int kStages, bool kQSmem>
-constexpr int kI8SmemBytes = kStages * kI8TileBytes + (kQSmem ? kQSmemBytes : 0);
+template <int kStages, bool kQSmem, bool kPad>
+constexpr int kI8SmemBytes = kStages * kI8TileBytes<kPad> + (kQSmem ? kQSmemBytes<kPad> : 0);
 
-template <int kStages, bool kOneBarrier, bool kPipeQk, bool kQSmem, int kDiag = 0>
-__global__ void __launch_bounds__(kFaThreads, 1)
+// 16-byte unit `unit` of K row `row`, and V^T segment (dim d, keys 16 hh .. 16 hh + 15), in a
+// staged tile: XOR-swizzled as fa_kernel's (row_swz<true>, vt_off), or padded.
+template <bool kPad>
+__device__ __forceinline__ std::uint32_t k_at(int row, int unit) {
+  return kPad ? static_cast<std::uint32_t>(row * kKRowPad + unit * 16) : row_swz<true>(row, unit);
+}
+template <bool kPad>
+__device__ __forceinline__ std::uint32_t vt_at(int d, int hh) {
+  return kPad ? static_cast<std::uint32_t>(d * 32 + (d >> 2) * 16 + hh * 16) : vt_off(d, hh);
+}
+
+template <int kStages, bool kOneBarrier, bool kPipeQk, bool kQSmem, bool kPingPong, bool kPad,
+          bool kFuseQk, bool kOneHead, int kDiag = 0>
+__global__ void __launch_bounds__(kOneHead ? kFaThreads / 2 : kFaThreads, kOneHead ? 2 : 1)
     fa_i8_kernel(Queries qs, int start, int width, float scale, Columns cols, PassBuffers buf,
                  int splits, int resume, Carry carry) {
   static_assert(kStages >= 2 && (!kPipeQk || (kOneBarrier && kStages >= 3)),
                 "the pipelined Q K^T needs one barrier per tile and three stages");
+  static_assert(!kPingPong || (!kPipeQk && kStages >= 3),
+                "the ping-pong holds a stage one tile longer: three stages");
+  static_assert(!kFuseQk || (kOneBarrier && !kPipeQk && !kPingPong && kStages >= 3),
+                "the fused Q K^T reads the next tile during this one's P V: one barrier, three stages");
+  static_assert(!kOneHead || (!kPingPong && !kQSmem), "one head a CTA: no partner warp, no shared Q");
+  constexpr int kThreads = kOneHead ? kFaThreads / 2 : kFaThreads;
   extern __shared__ __align__(128) std::uint8_t fa_smem[];
   constexpr int kKSteps = kHeadDim / 32;
+  constexpr int kTileB = kI8TileBytes<kPad>;
   const std::uint32_t sbase = smem_u32(fa_smem);
-  const std::uint32_t qbase = sbase + static_cast<std::uint32_t>(kStages * kI8TileBytes);
+  const std::uint32_t qbase = sbase + static_cast<std::uint32_t>(kStages * kTileB);
   const int lead = start % kQ;
   const int ntiles = (lead + width + kQ - 1) / kQ;
   const int tile = ntiles - 1 - static_cast<int>(blockIdx.x) / splits;  // longest first
@@ -1003,14 +1041,16 @@ __global__ void __launch_bounds__(kFaThreads, 1)
   const int rend = min(start + q0 + kQ, start + width);
   const int tid = static_cast<int>(threadIdx.x);
   const int warp = (tid / 32) % (kQ / 16), lane = tid % 32;
-  const int g = static_cast<int>(blockIdx.y) / kHeadPairs;
-  const int hl = tid / (kQ / 16 * 32);  // the CTA's head, 0 or 1
-  const int h = g * kGroup + (static_cast<int>(blockIdx.y) % kHeadPairs) * kHeadsPerCta + hl;
+  // kOneHead: blockIdx.y is the head (24), else the KV head and head pair (12).
+  const int g = static_cast<int>(blockIdx.y) / (kOneHead ? kGroup : kHeadPairs);
+  const int hl = kOneHead ? 0 : tid / (kQ / 16 * 32);  // the CTA's head, 0 or 1
+  const int h = kOneHead ? static_cast<int>(blockIdx.y)
+                         : g * kGroup + (static_cast<int>(blockIdx.y) % kHeadPairs) * kHeadsPerCta + hl;
   const int n = (cols.before(rend) + kTile - 1) / kTile;
   const int cbeg = split * n / splits, cend = (split + 1) * n / splits;
   if (cend <= cbeg && resume != 0) return;
 
-  auto stage_of = [](int c) { return static_cast<std::uint32_t>((c % kStages) * kI8TileBytes); };
+  auto stage_of = [](int c) { return static_cast<std::uint32_t>((c % kStages) * kTileB); };
   auto issue = [&](int c) {
     const std::uint32_t st = sbase + stage_of(c);
     const std::uint8_t *ksrc =
@@ -1018,21 +1058,22 @@ __global__ void __launch_bounds__(kFaThreads, 1)
     const std::uint8_t *vsrc =
         buf.v + (static_cast<std::int64_t>(g) * (buf.capacity / kTile) + c) * kVtTileBytes;
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      const int u = tid + j * kFaThreads;
-      cp_async16(st + row_swz<true>(u >> 4, u & 15), ksrc + u * 16);
-      cp_async16(st + kKTileBytes<true> + vt_off(u >> 1, u & 1), vsrc + u * 16);
+    for (int j = 0; j < 2 * kFaThreads / kThreads; ++j) {
+      const int u = tid + j * kThreads;
+      cp_async16(st + k_at<kPad>(u >> 4, u & 15), ksrc + u * 16);
+      cp_async16(st + kI8KBytes<kPad> + vt_at<kPad>(u >> 1, u & 1), vsrc + u * 16);
     }
   };
-  // kQSmem: the CTA's two heads of 64 rows, row-swizzled as K, in the first tile's group; a row
+  // kQSmem: the CTA's two heads of 64 rows, laid out as K, in the first tile's group; a row
   // outside the call is zeros, as the register path's.
   auto issue_q = [&]() {
     if constexpr (kQSmem) {
 #pragma unroll
-      for (int j = 0; j < kQSmemBytes / 16 / kFaThreads; ++j) {
+      for (int j = 0; j < kHeadsPerCta * kQ * 16 / kFaThreads; ++j) {
         const int u = tid + j * kFaThreads;
         const int head = u / (kQ * 16), row = (u / 16) % kQ, unit = u % 16;
-        const std::uint32_t dst = qbase + static_cast<std::uint32_t>(head * kQ * kHeadDim) + row_swz<true>(row, unit);
+        const std::uint32_t dst =
+            qbase + static_cast<std::uint32_t>(head * (kQSmemBytes<kPad> / kHeadsPerCta)) + k_at<kPad>(row, unit);
         const int t = q0 + row;
         if (t >= 0 && t < width) {
           const int hh = g * kGroup + (static_cast<int>(blockIdx.y) % kHeadPairs) * kHeadsPerCta + head;
@@ -1095,7 +1136,7 @@ __global__ void __launch_bounds__(kFaThreads, 1)
     }
   }
   const int lm = lane / 8, lr = lane % 8;
-  const std::uint32_t qrow = qbase + static_cast<std::uint32_t>(hl * kQ * kHeadDim);
+  const std::uint32_t qrow = qbase + static_cast<std::uint32_t>(hl * (kQSmemBytes<kPad> / kHeadsPerCta));
   const int tiles_per_head = buf.capacity / kTile;
 
   // S of tile c's keys into si, from 1.5 2^23 (exact in int32).
@@ -1118,7 +1159,7 @@ __global__ void __launch_bounds__(kFaThreads, 1)
       for (int kk = 0; kk < kKSteps; ++kk) {
         std::uint32_t a[4];
         if constexpr (kQSmem) {
-          ldsm_x4(a, qrow + row_swz<true>(warp * 16 + lr + 8 * (lm & 1), 2 * kk + (lm >> 1)));
+          ldsm_x4(a, qrow + k_at<kPad>(warp * 16 + lr + 8 * (lm & 1), 2 * kk + (lm >> 1)));
         } else {
           a[0] = qa[kk][0];
           a[1] = qa[kk][1];
@@ -1128,7 +1169,7 @@ __global__ void __launch_bounds__(kFaThreads, 1)
 #pragma unroll
         for (int p = 0; p < 2; ++p) {
           std::uint32_t b[4];
-          ldsm_x4(b, ks + row_swz<true>(16 * p + lr + 8 * (lm / 2), 2 * kk + lm % 2));
+          ldsm_x4(b, ks + k_at<kPad>(16 * p + lr + 8 * (lm / 2), 2 * kk + lm % 2));
           mma_s8(si[2 * p], a, b);
           mma_s8(si[2 * p + 1], a, b + 2);
         }
@@ -1136,15 +1177,15 @@ __global__ void __launch_bounds__(kFaThreads, 1)
     }
   };
 
-  // Tile c's softmax and P V, folded into O, from its S.
-  auto soft_pv = [&](int c, int key0, const int (&si)[4][4]) {
-    const std::uint32_t vs = sbase + stage_of(c) + kKTileBytes<true>;
+  // Tile c's softmax from its S: m and l move on; P's u8 A fragment, each row's correction of O,
+  // and the factor of the tile's P V.
+  constexpr float kU8 = 256.0f / 255.0f;
+  auto softmax = [&](int c, int key0, const int (&si)[4][4], std::uint32_t (&pf)[4], float (&corr)[2],
+                     float &fv) {
     const float sk = buf.scale[g * tiles_per_head + c];
     const float sv = buf.scale[(kKvHeads + g) * tiles_per_head + c];
-    constexpr float kU8 = 256.0f / 255.0f;
-    std::uint32_t pf[4];
+    fv = __fmul_rn(sv, kU8);
     int pi[2];
-    float corr[2];
     if constexpr ((kDiag & kDiagNoSoftmax) != 0) {
 #pragma unroll
       for (int r = 0; r < 2; ++r) {
@@ -1210,15 +1251,19 @@ __global__ void __launch_bounds__(kFaThreads, 1)
         l[r] = __fmaf_rn(l[r], corr[r], __fmul_rn(static_cast<float>(pi[r]), kU8));
       }
     }
+  };
+
+  // O = O corr + P V for the tile staged at `stage`.
+  auto pv = [&](std::uint32_t stage, const std::uint32_t (&pf)[4], const float (&corr)[2], float fv) {
     if constexpr ((kDiag & kDiagNoPv) == 0) {
-      const float fv = __fmul_rn(sv, kU8);
+      const std::uint32_t vs = sbase + stage + kI8KBytes<kPad>;
 #pragma unroll
       for (int dp = 0; dp < kHeadDim / 16; ++dp) {
         int t[2][4];
 #pragma unroll
         for (int x = 0; x < 2; ++x) t[x][0] = t[x][1] = t[x][2] = t[x][3] = kMagic;
         std::uint32_t b[4];
-        ldsm_x4(b, vs + vt_off(16 * dp + 8 * (lm / 2) + lr, lm % 2));
+        ldsm_x4(b, vs + vt_at<kPad>(16 * dp + 8 * (lm / 2) + lr, lm % 2));
         mma_u8s8(t[0], pf, b);
         mma_u8s8(t[1], pf, b + 2);
 #pragma unroll
@@ -1232,8 +1277,161 @@ __global__ void __launch_bounds__(kFaThreads, 1)
       }
     }
   };
+  // pv, with tile cn's Q K^T into sn interleaved: k step dp / 2, keys 16 (dp % 2) .. + 15.
+  auto pv_qk = [&](std::uint32_t stage, const std::uint32_t (&pf)[4], const float (&corr)[2], float fv,
+                   int cn, int (&sn)[4][4]) {
+    const std::uint32_t vs = sbase + stage + kI8KBytes<kPad>;
+    const std::uint32_t ks = sbase + stage_of(cn);
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) sn[nt][0] = sn[nt][1] = sn[nt][2] = sn[nt][3] = kMagic;
+    std::uint32_t a[4];
+#pragma unroll
+    for (int dp = 0; dp < kHeadDim / 16; ++dp) {
+      int t[2][4];
+      if constexpr ((kDiag & kDiagNoPv) == 0) {
+#pragma unroll
+        for (int x = 0; x < 2; ++x) t[x][0] = t[x][1] = t[x][2] = t[x][3] = kMagic;
+        std::uint32_t b[4];
+        ldsm_x4(b, vs + vt_at<kPad>(16 * dp + 8 * (lm / 2) + lr, lm % 2));
+        mma_u8s8(t[0], pf, b);
+        mma_u8s8(t[1], pf, b + 2);
+      }
+      if constexpr ((kDiag & kDiagNoQk) == 0) {
+        const int kk = dp >> 1, p = dp & 1;
+        if (p == 0) {
+          if constexpr (kQSmem) {
+            ldsm_x4(a, qrow + k_at<kPad>(warp * 16 + lr + 8 * (lm & 1), 2 * kk + (lm >> 1)));
+          } else {
+            a[0] = qa[kk][0];
+            a[1] = qa[kk][1];
+            a[2] = qa[kk][2];
+            a[3] = qa[kk][3];
+          }
+        }
+        std::uint32_t bk[4];
+        ldsm_x4(bk, ks + k_at<kPad>(16 * p + lr + 8 * (lm / 2), 2 * kk + lm % 2));
+        mma_s8(sn[2 * p], a, bk);
+        mma_s8(sn[2 * p + 1], a, bk + 2);
+      }
+      if constexpr ((kDiag & kDiagNoPv) == 0) {
+#pragma unroll
+        for (int x = 0; x < 2; ++x) {
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            o[2 * dp + x][e] = __fmaf_rn(o[2 * dp + x][e], corr[e / 2],
+                                         __fmul_rn(__fsub_rn(__int_as_float(t[x][e]), kMagicF), fv));
+          }
+        }
+      }
+    }
+    if constexpr ((kDiag & kDiagNoQk) != 0) {
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          std::uint32_t bits = static_cast<std::uint32_t>(lane * 977 + nt * 31 + e);
+          if constexpr (!kQSmem) bits ^= qa[nt][e];
+          sn[nt][e] = kMagic + ((static_cast<int>(bits) ^ (cn * 131)) & 0x3FFF) - 0x2000;
+        }
+      }
+    }
+  };
+  auto soft_pv = [&](int c, int key0, const int (&si)[4][4]) {
+    std::uint32_t pf[4];
+    float corr[2], fv;
+    softmax(c, key0, si, pf, corr, fv);
+    pv(stage_of(c), pf, corr, fv);
+  };
 
-  if constexpr (!kPipeQk) {
+  if constexpr (kFuseQk) {
+    // Tiles cbeg .. cbeg + kStages - 2 ahead; tile cbeg's Q K^T alone; then iteration c waits for
+    // tile c + 1, refills tile c - 1's stage, runs tile c's softmax and its P V with tile c + 1's
+    // Q K^T inside. Keys rise with the column, so a warp past its last tile is past every later one.
+#pragma unroll
+    for (int i = 0; i < kStages - 1; ++i) {
+      if (i == 0) issue_q();
+      if (cbeg + i < cend) issue(cbeg + i);
+      cp_commit();
+    }
+    int sn[4][4];
+    if (cend > cbeg) {
+      cp_wait<kStages - 2>();
+      __syncthreads();
+      if (cols.key(cbeg * kTile) <= warp_last) qk_tile(cbeg, sn);
+    }
+    for (int c = cbeg; c < cend; ++c) {
+      cp_wait<kStages - 3>();
+      __syncthreads();  // tile c + 1 is everyone's; every warp is done with tile c - 1's stage
+      if (c + kStages - 1 < cend) issue(c + kStages - 1);
+      cp_commit();
+      const int key0 = cols.key(c * kTile);
+      if (key0 <= warp_last) {
+        std::uint32_t pf[4];
+        float corr[2], fv;
+        softmax(c, key0, sn, pf, corr, fv);
+        if (c + 1 < cend && cols.key((c + 1) * kTile) <= warp_last) {
+          pv_qk(stage_of(c), pf, corr, fv, c + 1, sn);
+        } else {
+          pv(stage_of(c), pf, corr, fv);
+        }
+      }
+    }
+  } else if constexpr (kPingPong) {
+    // One barrier: iteration c refills tile c - 2's stage at its top (the late warp reads tile
+    // c - 1's V^T during it). Two barriers: it refills tile c - 1's stage after its second.
+    constexpr int kPre = kOneBarrier ? kStages - 2 : kStages - 1;
+#pragma unroll
+    for (int i = 0; i < kPre; ++i) {
+      if (i == 0) issue_q();
+      if (cbeg + i < cend) issue(cbeg + i);
+      cp_commit();
+    }
+    std::uint32_t ppf[4] = {0u, 0u, 0u, 0u};
+    float pcorr[2] = {1.0f, 1.0f}, pfv = 0.0f;
+    std::uint32_t pstage = 0;
+    bool held = false;  // the late warp: a tile whose P V is still to fold
+    // Which warp of a scheduler runs late: a warp and its partner on the same scheduler differ
+    // in it whether the schedulers take warps w and w + 4 or w and w + 1.
+    const bool late = (hl ^ (warp & 1)) != 0;
+    for (int c = cbeg; c < cend; ++c) {
+      if constexpr (kOneBarrier) {
+        cp_wait<kStages - 3>();
+        __syncthreads();  // tile c is everyone's; every warp is done with tile c - 2's stage
+        if (c + kStages - 2 < cend) issue(c + kStages - 2);
+        cp_commit();
+      } else {
+        cp_wait<kStages - 2>();
+        __syncthreads();
+      }
+      if (late && held) pv(pstage, ppf, pcorr, pfv);
+      held = false;
+      const int key0 = cols.key(c * kTile);
+      if (key0 <= warp_last) {
+        int si[4][4];
+        qk_tile(c, si);
+        std::uint32_t pf[4];
+        float corr[2], fv;
+        softmax(c, key0, si, pf, corr, fv);
+        if (!late) {
+          pv(stage_of(c), pf, corr, fv);
+        } else {
+#pragma unroll
+          for (int i = 0; i < 4; ++i) ppf[i] = pf[i];
+          pcorr[0] = corr[0];
+          pcorr[1] = corr[1];
+          pfv = fv;
+          pstage = stage_of(c);
+          held = true;
+        }
+      }
+      if constexpr (!kOneBarrier) {
+        __syncthreads();  // every warp is done with tile c - 1's stage
+        if (c + kStages - 1 < cend) issue(c + kStages - 1);
+        cp_commit();
+      }
+    }
+    if (late && held) pv(pstage, ppf, pcorr, pfv);
+  } else if constexpr (!kPipeQk) {
     constexpr int kPre = kOneBarrier ? kStages - 1 : kStages;
 #pragma unroll
     for (int i = 0; i < kPre; ++i) {
@@ -1491,55 +1689,75 @@ void launch_fa(dim3 grid, Queries qs, int start, int width, float scale, Columns
 struct I8Variant {
   const char *name;
   int stages;
-  bool one_barrier, pipe_qk, q_smem;
+  bool one_barrier, pipe_qk, q_smem, ping_pong, pad, fuse_qk, one_head;
 };
 constexpr I8Variant kI8Variants[] = {
-    {"conversions (2 stages, 2 barriers)", 2, false, false, false},
-    {"+ one barrier, 2 stages", 2, true, false, false},
-    {"+ 3 stages", 3, true, false, false},
-    {"+ 4 stages", 4, true, false, false},
-    {"+ QK of tile c+1 under the softmax, 3 stages", 3, true, true, false},
-    {"+ QK under the softmax, 4 stages", 4, true, true, false},
-    {"+ Q from shared memory, 3 stages", 3, true, true, true},
-    {"+ Q from shared memory, 4 stages", 4, true, true, true},
+    {"conversions (2 stages, 2 barriers)", 2, false, false, false, false, false, false, false},
+    {"+ one barrier, 2 stages", 2, true, false, false, false, false, false, false},
+    {"+ one barrier, 3 stages", 3, true, false, false, false, false, false, false},
+    {"+ one barrier, 4 stages", 4, true, false, false, false, false, false, false},
+    {"QK of tile c+1 under the softmax, 3 stages", 3, true, true, false, false, false, false, false},
+    {"QK under the softmax, 4 stages", 4, true, true, false, false, false, false, false},
+    {"QK under the softmax, Q from shared memory, 4 stages", 4, true, true, true, false, false, false, false},
+    {"ping-pong of the two heads, 3 stages", 3, true, false, false, true, false, false, false},
+    {"ping-pong, 4 stages", 4, true, false, false, true, false, false, false},
+    {"conversions, padded tiles (2 stages, 2 barriers)", 2, false, false, false, false, true, false, false},
+    {"ping-pong, 3 stages, padded tiles", 3, true, false, false, true, true, false, false},
+    {"ping-pong, 4 stages, padded tiles", 4, true, false, false, true, true, false, false},
+    {"QK of tile c+1 inside the P V loop, 3 stages", 3, true, false, false, false, false, true, false},
+    {"QK inside the P V loop, 4 stages", 4, true, false, false, false, false, true, false},
+    {"QK inside the P V loop, 4 stages, padded tiles", 4, true, false, false, false, true, true, false},
+    {"QK inside the P V loop, 4 stages, Q from shared memory", 4, true, false, true, false, false, true, false},
+    {"conversions, 3 stages, 2 barriers", 3, false, false, false, false, false, false, false},
+    {"conversions, 4 stages, 2 barriers", 4, false, false, false, false, false, false, false},
+    {"ping-pong, 3 stages, 2 barriers", 3, false, false, false, true, false, false, false},
+    {"ping-pong, 4 stages, 2 barriers", 4, false, false, false, true, false, false, false},
+    {"one head a CTA, 2 CTAs an SM (2 stages, 2 barriers)", 2, false, false, false, false, false, false, true},
+    {"one head a CTA, 3 stages, 2 barriers", 3, false, false, false, false, false, false, true},
+    {"one head a CTA, 3 stages, one barrier", 3, true, false, false, false, false, false, true},
+    {"one head a CTA, 2 stages, 2 barriers, padded tiles", 2, false, false, false, false, true, false, true},
 };
 constexpr int kI8VariantCount = static_cast<int>(sizeof(kI8Variants) / sizeof(kI8Variants[0]));
-constexpr int kI8Default = 5;
+constexpr int kI8Default = 0;
 
-template <int kStages, bool kOneBarrier, bool kPipeQk, bool kQSmem, int kDiag = 0>
+template <int kStages, bool kOneBarrier, bool kPipeQk, bool kQSmem, bool kPingPong, bool kPad, bool kFuseQk,
+          bool kOneHead, int kDiag = 0>
 void launch_fa_i8(dim3 grid, Queries qs, int start, int width, float scale, Columns cols,
                   PassBuffers buf, int splits, int resume, Carry carry, cudaStream_t stream) {
-  constexpr int kSmem = kI8SmemBytes<kStages, kQSmem>;
+  constexpr int kSmem = kI8SmemBytes<kStages, kQSmem, kPad>;
   static const cudaError_t attribute =
-      cudaFuncSetAttribute(fa_i8_kernel<kStages, kOneBarrier, kPipeQk, kQSmem, kDiag>,
+      cudaFuncSetAttribute(fa_i8_kernel<kStages, kOneBarrier, kPipeQk, kQSmem, kPingPong, kPad, kFuseQk, kOneHead, kDiag>,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
   if (attribute != cudaSuccess) {
     throw std::runtime_error(std::string("ignis_hq_prompt_attention: shared memory attribute: ") +
                              cudaGetErrorString(attribute));
   }
-  fa_i8_kernel<kStages, kOneBarrier, kPipeQk, kQSmem, kDiag><<<grid, kFaThreads, kSmem, stream>>>(
-      qs, start, width, scale, cols, buf, splits, resume, carry);
+  // kOneHead: twice the CTAs, one head each (blockIdx.y the head), of half the threads.
+  const dim3 g = kOneHead ? dim3(grid.x, kKvHeads * kGroup) : grid;
+  fa_i8_kernel<kStages, kOneBarrier, kPipeQk, kQSmem, kPingPong, kPad, kFuseQk, kOneHead, kDiag>
+      <<<g, kOneHead ? kFaThreads / 2 : kFaThreads, kSmem, stream>>>(qs, start, width, scale, cols, buf, splits,
+                                                                     resume, carry);
   check_launch("band attention");
 }
 
-// The bench's stage-disabled copies of the default variant (IGNIS_HQ_PROMPT_DIAG only).
-template <int kDiag>
-void launch_fa_i8_default(dim3 grid, Queries qs, int start, int width, float scale, Columns cols,
+template <int kVariant, int kDiag = 0>
+void launch_fa_i8_variant(dim3 grid, Queries qs, int start, int width, float scale, Columns cols,
                           PassBuffers buf, int splits, int resume, Carry carry, cudaStream_t stream) {
-  constexpr I8Variant v = kI8Variants[kI8Default];
-  launch_fa_i8<v.stages, v.one_barrier, v.pipe_qk, v.q_smem, kDiag>(grid, qs, start, width, scale, cols,
-                                                                      buf, splits, resume, carry, stream);
+  constexpr I8Variant v = kI8Variants[kVariant];
+  launch_fa_i8<v.stages, v.one_barrier, v.pipe_qk, v.q_smem, v.ping_pong, v.pad, v.fuse_qk, v.one_head, kDiag>(
+      grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
 }
 
 void launch_i8(int variant, int diag, dim3 grid, Queries qs, int start, int width, float scale,
                Columns cols, PassBuffers buf, int splits, int resume, Carry carry, cudaStream_t stream) {
 #ifdef IGNIS_HQ_PROMPT_DIAG
+  // The bench's stage-disabled copies of the default variant.
   if (diag != 0) {
     switch (diag) {
-      case kDiagNoPv: return launch_fa_i8_default<kDiagNoPv>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
-      case kDiagNoPv | kDiagNoSoftmax: return launch_fa_i8_default<kDiagNoPv | kDiagNoSoftmax>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
-      case kDiagNoQk: return launch_fa_i8_default<kDiagNoQk>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
-      case kDiagNoPv | kDiagNoSoftmax | kDiagNoQk: return launch_fa_i8_default<kDiagNoPv | kDiagNoSoftmax | kDiagNoQk>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
+      case kDiagNoPv: return launch_fa_i8_variant<kI8Default, kDiagNoPv>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
+      case kDiagNoPv | kDiagNoSoftmax: return launch_fa_i8_variant<kI8Default, kDiagNoPv | kDiagNoSoftmax>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
+      case kDiagNoQk: return launch_fa_i8_variant<kI8Default, kDiagNoQk>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
+      case kDiagNoPv | kDiagNoSoftmax | kDiagNoQk: return launch_fa_i8_variant<kI8Default, kDiagNoPv | kDiagNoSoftmax | kDiagNoQk>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
       default: throw std::invalid_argument("ignis_hq_prompt_attention: no such i8 diagnostic");
     }
   }
@@ -1547,11 +1765,8 @@ void launch_i8(int variant, int diag, dim3 grid, Queries qs, int start, int widt
   if (diag != 0) throw std::invalid_argument("ignis_hq_prompt_attention: the i8 diagnostics are the bench's");
 #endif
   switch (variant) {
-#define IGNIS_I8_CASE(i)                                                                            \
-  case i:                                                                                           \
-    return launch_fa_i8<kI8Variants[i].stages, kI8Variants[i].one_barrier, kI8Variants[i].pipe_qk, \
-                        kI8Variants[i].q_smem>(grid, qs, start, width, scale, cols, buf, splits,    \
-                                               resume, carry, stream);
+#define IGNIS_I8_CASE(i) \
+  case i: return launch_fa_i8_variant<i>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
     IGNIS_I8_CASE(0)
     IGNIS_I8_CASE(1)
     IGNIS_I8_CASE(2)
@@ -1560,11 +1775,27 @@ void launch_i8(int variant, int diag, dim3 grid, Queries qs, int start, int widt
     IGNIS_I8_CASE(5)
     IGNIS_I8_CASE(6)
     IGNIS_I8_CASE(7)
+    IGNIS_I8_CASE(8)
+    IGNIS_I8_CASE(9)
+    IGNIS_I8_CASE(10)
+    IGNIS_I8_CASE(11)
+    IGNIS_I8_CASE(12)
+    IGNIS_I8_CASE(13)
+    IGNIS_I8_CASE(14)
+    IGNIS_I8_CASE(15)
+    IGNIS_I8_CASE(16)
+    IGNIS_I8_CASE(17)
+    IGNIS_I8_CASE(18)
+    IGNIS_I8_CASE(19)
+    IGNIS_I8_CASE(20)
+    IGNIS_I8_CASE(21)
+    IGNIS_I8_CASE(22)
+    IGNIS_I8_CASE(23)
 #undef IGNIS_I8_CASE
     default: throw std::invalid_argument("ignis_hq_prompt_attention: no such i8 variant");
   }
 }
-static_assert(kI8VariantCount == 8, "launch_i8 names every variant");
+static_assert(kI8VariantCount == 24, "launch_i8 names every variant");
 
 // PROTOTYPE: which band a call runs. The op takes it from the precision and IGNIS_PROTO_BAND, the
 // bench names it: kI8 is the i8 band on fa_i8_kernel, kI8Ref the same band on 5ea54bc6's

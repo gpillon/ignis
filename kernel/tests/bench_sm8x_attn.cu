@@ -588,12 +588,12 @@ double median(std::vector<double> v) {
   return v.empty() ? 0.0 : v[v.size() / 2];
 }
 
-void kernel_report(const char *name, const void *f, int smem) {
+void kernel_report(const char *name, const void *f, int smem, int threads = 256) {
   cudaFuncAttributes at{};
   BENCH_CUDA(cudaFuncGetAttributes(&at, f));
   if (smem > 48 * 1024) BENCH_CUDA(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
   int ctas = 0;
-  BENCH_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, f, 256, smem));
+  BENCH_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, f, threads, smem));
   std::printf("  %-52s %3d regs, %4zu B local (spills), %6d B dynamic + %5zu B static smem, %d CTA/SM\n", name,
               at.numRegs, at.localSizeBytes, smem, at.sharedSizeBytes, ctas);
 }
@@ -601,16 +601,19 @@ void kernel_report(const char *name, const void *f, int smem) {
 template <int I> void report_variant() {
   constexpr I8Variant v = kI8Variants[I];
   char name[96];
-  std::snprintf(name, sizeof(name), "fa_i8_kernel v%d <%d,%d,%d,%d>", I, v.stages, v.one_barrier, v.pipe_qk, v.q_smem);
-  kernel_report(name, reinterpret_cast<const void *>(fa_i8_kernel<v.stages, v.one_barrier, v.pipe_qk, v.q_smem>),
-                kI8SmemBytes<v.stages, v.q_smem>);
+  std::snprintf(name, sizeof(name), "fa_i8_kernel v%d <%d,%d,%d,%d,%d,%d,%d,%d>", I, v.stages, v.one_barrier,
+                v.pipe_qk, v.q_smem, v.ping_pong, v.pad, v.fuse_qk, v.one_head);
+  kernel_report(name,
+                reinterpret_cast<const void *>(fa_i8_kernel<v.stages, v.one_barrier, v.pipe_qk, v.q_smem, v.ping_pong, v.pad, v.fuse_qk, v.one_head>),
+                kI8SmemBytes<v.stages, v.q_smem, v.pad>, v.one_head ? 128 : 256);
 }
 template <int kDiag> void report_diag(const char *what) {
   constexpr I8Variant v = kI8Variants[kI8Default];
   char name[96];
   std::snprintf(name, sizeof(name), "fa_i8_kernel default, %s", what);
-  kernel_report(name, reinterpret_cast<const void *>(fa_i8_kernel<v.stages, v.one_barrier, v.pipe_qk, v.q_smem, kDiag>),
-                kI8SmemBytes<v.stages, v.q_smem>);
+  kernel_report(
+      name, reinterpret_cast<const void *>(fa_i8_kernel<v.stages, v.one_barrier, v.pipe_qk, v.q_smem, v.ping_pong, v.pad, v.fuse_qk, v.one_head, kDiag>),
+      kI8SmemBytes<v.stages, v.q_smem, v.pad>, v.one_head ? 128 : 256);
 }
 
 }  // namespace bench
@@ -700,6 +703,23 @@ int main(int argc, char **argv) {
   report_variant<5>();
   report_variant<6>();
   report_variant<7>();
+  report_variant<8>();
+  report_variant<9>();
+  report_variant<10>();
+  report_variant<11>();
+  report_variant<12>();
+  report_variant<13>();
+  report_variant<14>();
+  report_variant<15>();
+  report_variant<16>();
+  report_variant<17>();
+  report_variant<18>();
+  report_variant<19>();
+  report_variant<20>();
+  report_variant<21>();
+  report_variant<22>();
+  report_variant<23>();
+  static_assert(kI8VariantCount == 24, "the kernel report names every variant");
   report_diag<kDiagNoPv>("no P V");
   report_diag<kDiagNoPv | kDiagNoSoftmax>("Q K^T only");
   report_diag<kDiagNoQk>("no Q K^T");
