@@ -32,7 +32,6 @@ cuda     dense_prefill_decode_kernel      kernel/src/dense_prefill.cu
 cuda     dense_prefill_a8_kernel          kernel/src/dense_prefill.cu
 cuda     dense_prefill_a8_wide_kernel     kernel/src/dense_prefill.cu
 cuda     dense_prefill_rmsnorm_a8_kernel  kernel/src/dense_prefill.cu   # #511: the A8 quantisation fused into its producer (RMSNorm), CUDA cores
-cuda     dense_prefill_a8_blocks_kernel   kernel/src/dense_prefill.cu   # #511: the A8 quantisation fused into the block producer, CUDA cores
 mma      dense_prefill_gemm_kernel        kernel/src/dense_prefill.cu
 
 # The integer band (#510): the attention kernel is integer MMA, the V

@@ -294,8 +294,6 @@ uint64_t expected_dense_line(uint32_t head_tokens) {
   // GDN qkv and z, GQA q, k and v, gate and up, the two outputs and down.
   const Group groups[] = {{kHidden, 2}, {kHidden, 3}, {kStateRows, 1}, {kQWidth, 1}, {kFfn, 1}};
   for (const Group &g : groups) line = std::max(line, ignis_dense_prefill_workspace_bytes(g.in, g.matrices, kChunk));
-  // GitHub #511: the MLP with its A8 fused, down's block maxima past the activations.
-  line = std::max(line, ignis_dense_prefill_mlp_workspace_bytes(kHidden, kFfn, kChunk));
   for (uint32_t t = 1; t <= head_tokens; ++t) {
     line = std::max(line, ignis_trellis_workspace_bytes(kHidden, kVocab, 1, t));
   }

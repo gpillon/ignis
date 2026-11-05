@@ -1679,20 +1679,6 @@ std::size_t trellis_workspace_bytes(const ignis_model &model, uint32_t prefill_c
       line = std::max<std::size_t>(line, bytes);
     }
   }
-  // GitHub #511: the dense prefill's MLP, its A8 fused into its producers,
-  // keeps down's block maxima past the activations of gate, up and down.
-  if (prefill_chunk_tokens > IGNIS_TRELLIS_DECODE_MAX_TOKENS && dense) {
-    for (const LayerWeights &layer : model.layers) {
-      const TrellisTail &t = layer.kind == IGNIS_LAYER_GQA ? layer.gqa.trellis.tail : layer.gdn.trellis.tail;
-      const uint64_t bytes = ignis_dense_prefill_mlp_workspace_bytes(t.gate_proj.in, t.gate_proj.out, prefill_chunk_tokens);
-      if (bytes == 0) {
-        throw std::runtime_error("the dense prefill refuses an MLP of " + std::to_string(t.gate_proj.in) + " x " +
-                                 std::to_string(t.gate_proj.out) + " at " + std::to_string(prefill_chunk_tokens) +
-                                 " tokens");
-      }
-      line = std::max<std::size_t>(line, bytes);
-    }
-  }
   return line;
 }
 

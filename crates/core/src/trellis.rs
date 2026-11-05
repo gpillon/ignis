@@ -105,10 +105,10 @@ pub fn sm_cap() -> u32 {
 }
 
 /// Test-only (GitHub #511): `false` sends the trellis body's dense prefill (`PrefillLinear::Int8`)
-/// back to its standalone A8 passes, the RMSnorms and the SwiGLU writing their BF16 rows for the
-/// quantize to read; `true`, the default, fuses A8 into those producers. The activations are the
-/// same bits either way, which is what a test of the switch holds. Process-wide and read at each
-/// body call: set it between prefills, never during one. Public for the GPU test
+/// back to its standalone A8 passes, the RMSnorms writing their BF16 rows for the quantize to
+/// read; `true`, the default, fuses A8 into those RMSnorms (down's A8 is standalone either way).
+/// The activations are the same bits either way, which is what a test of the switch holds.
+/// Process-wide and read at each body call: set it between prefills, never during one. Public for the GPU test
 /// `tests/prefill_linear_gpu.rs`; no serving path calls it.
 #[doc(hidden)]
 pub fn set_dense_prefill_fused_producers(fused: bool) {
