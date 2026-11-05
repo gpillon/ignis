@@ -528,7 +528,7 @@ is not in its file. A kernel that predates the rule and stays as it is takes an
 `exempt` line whose comment names the issue that decided it, never a reason of
 its own; #488's kernels are the only ones. A form the rule refuses is fixed in the
 kernel, not excused in the list. The selftest (`make cuda-build-check-selftest`)
-runs the whole rule on SASS text and needs no GPU or CUDA toolkit; to run the
+runs the whole rule on SASS text and needs no GPU or CUDA toolkit, and its passing dump follows the list, so a new line needs no selftest edit; to run the
 check by hand on a build, `IGNIS_CUDA_ARCHITECTURES='86;120a' bash
 mk/cuda-build-check.sh --require '86;120a' <binary>...`.
 

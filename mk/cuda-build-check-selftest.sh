@@ -105,21 +105,27 @@ function_sass() {
 # anonymous namespace (`_ZN`, template arguments after its name).
 plain() { function_sass "_Z${#1}$1PKvi" "${@:2}"; }
 templ() { function_sass "_ZN12_GLOBAL__N_1${#1}$1ILi128ELb1EEvv" "${@:2}"; }
+list_file="$(dirname "$0")/full-rate-kernels.txt"
+# The mma and cuda kernels of a list file, and one kernel's role in it.
+covered_kernels() { sed -e 's/#.*//' "$1" | awk '$1 == "mma" || $1 == "cuda" { print $2 }'; }
+role_of() { sed -e 's/#.*//' "$1" | awk -v k="$2" '$2 == k { print $1 }'; }
 # A dump in which every kernel of the list is as the rule wants it, and the
 # kernels of #488 and the control are as they are in the build. `$swap` names
 # one kernel whose opcodes are `$swap_ops` instead (none when empty), `$drop`
 # one the dump leaves out, `$more` text appended.
 good_dump() {
     printf 'Fatbin elf code:\n================\narch = sm_86\ncode version = [1,7]\nhost = linux\ncompile_size = 64bit\n\n\tcode for sm_86\n'
-    local name
-    for name in dense_prefill_decode_kernel dense_prefill_a8_kernel dense_prefill_a8_wide_kernel \
-        tile_vt_group_kernel gdn_split_conv_kernel gdn_split_conv_state_kernel dense_prefill_gemm_kernel \
-        fa_int8_kernel nvfp4_a16_mma_kernel output_kernel fa_kernel not_in_the_list_kernel; do
+    local name role rest
+    # The covered kernels come from the list itself, so a kernel joining it
+    # needs no edit here; #488's exempt kernels and the control are explicit.
+    for name in $(covered_kernels "${list:-$list_file}")         fa_int8_kernel nvfp4_a16_mma_kernel output_kernel fa_kernel not_in_the_list_kernel; do
         [ "${drop-}" = "$name" ] && continue
         local ops
         case $name in
-            dense_prefill_gemm_kernel) ops="IMMA.16832.S8.S8 IMMA.16832.S8.S8" ;;
             fa_int8_kernel) ops="IMMA.16832.S8.S8 IMMA.16832.U8.S8" ;;
+            # A cuda kernel whose source uses HMMA with an f16 accumulator:
+            # the "reported, allowed" path.
+            gdn_prefill_recurrence_kernel) ops="HMMA.16816.F16" ;;
             # #488's drafter, and the chunked delta rule, are BF16 and TF32.
             nvfp4_a16_mma_kernel) ops="HMMA.16816.F32.BF16" ;;
             output_kernel) ops="HMMA.1688.F32.TF32" ;;
@@ -127,7 +133,7 @@ good_dump() {
             fa_kernel) ops="HMMA.16816.F32.BF16 IMMA.16832.S8.S8" ;;
             # Not in the list: no rule of this check.
             not_in_the_list_kernel) ops="HMMA.16816.F32.BF16" ;;
-            *) ops="" ;;
+            *) ops=""; [ "$(role_of "${list:-$list_file}" "$name")" = mma ] && ops="IMMA.16832.S8.S8 IMMA.16832.S8.S8" ;;
         esac
         [ "${swap-}" = "$name" ] && ops=$swap_ops
         case $name in
@@ -246,6 +252,14 @@ rule 0 'fa_int8_kernel holds HMMA.16816 \(f16 accumulate, allowed\)' "HMMA with 
 # Each instantiation of a template is held to the rule.
 more=$(function_sass "_ZN12_GLOBAL__N_114fa_int8_kernelILi64ELb0EEvv" HMMA.16816.F32) good_dump > "$dir/case.sass"
 rule 1 'kernel fa_int8_kernel \(_ZN12_GLOBAL__N_114fa_int8_kernelILi64ELb0EEvv\) holds HMMA.16816.F32' "every instantiation of a covered template is held to the rule"
+
+# The dump follows the list: a kernel joining it is one more kernel in the
+# passing build, with no edit of this script.
+{ cat "$list_file"; printf 'cuda  brand_new_kernel  kernel/src/new.cu
+mma   brand_new_gemm_kernel
+'; } > "$dir/extended.list"
+list="$dir/extended.list" good_dump > "$dir/case.sass"
+FAKE_SASS="$dir/case.sass" IGNIS_FULL_RATE_LIST="$dir/extended.list" says 0 'sm_86 mma brand_new_gemm_kernel: IMMA' "a list with an extra covered kernel still gives a passing build" "$dir/both"
 
 # A GEMM or band kernel holds integer MMA; a CUDA-core kernel needs none.
 swap=dense_prefill_gemm_kernel swap_ops="" good_dump > "$dir/case.sass"
