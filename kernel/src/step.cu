@@ -1158,18 +1158,24 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       }
     }
 
+    // GitHub #507: a GDN layer runs in place on `left` (its body consumes its
+    // input residual and adds into it, no copy of it); a GQA layer writes
+    // `right` and the two swap. The test-only switch back to the pre-#507
+    // prefill (kernel/src/layer_internal.h) swaps after every layer.
+    const bool gdn_in_place = !ignis_gdn_layer_layout_copies();
     uint64_t dispatches = 0;
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
       profiler.record_layer_begin(layer, model->stream);
       const bool reads_attention =
           attention_readout != nullptr && model->layers[layer].kind == IGNIS_LAYER_GQA &&
           readout_armed[ignis_gqa_relative_layer(layer)];
+      const bool in_place = gdn_in_place && model->layers[layer].kind != IGNIS_LAYER_GQA;
       const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
           ? ignis_gqa_layer_run_body(
                 model, pool, seq, layer, left.data, right.data, num_tokens, mode, rope_positions,
                 reads_attention ? &readout_targets[ignis_gqa_relative_layer(layer)] : nullptr)
-          : ignis_gdn_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens,
-                                     mode);
+          : ignis_gdn_layer_run_body(model, pool, seq, layer, left.data,
+                                     in_place ? left.data : right.data, num_tokens, mode);
       if (rc != 0) {
         const char *detail = model->layers[layer].kind == IGNIS_LAYER_GQA
             ? ignis_gqa_layer_last_error()
@@ -1181,7 +1187,9 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
         return -1;
       }
       profiler.record_layer_end(layer, model->stream);
-      std::swap(left, right);
+      if (!in_place) {
+        std::swap(left, right);
+      }
       ++dispatches;
       if (tap_count > 0) {
         // `left` is this layer's output now. Tap j occupies rows
@@ -1210,8 +1218,8 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     }
     profiler.record_head_begin(model->stream);
 
-    // `left` and `right` were swapped once per layer, so after an even
-    // layer count the final residual is back in `left`.
+    // `left` holds every layer's output once the layer is done (a swap after
+    // each layer that wrote `right`), so the final residual is in `left`.
     ninfer::Tensor final_residual = left;
     // The measurement readout (`ignis_prefill_options::out_span_logits`):
     // the head over every column of the chunk, 32 columns at a time, each

@@ -552,6 +552,14 @@ add_executable(ignis_kernel_gdn_conv_split_test test_gdn_conv_split.cu)
 target_include_directories(ignis_kernel_gdn_conv_split_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_gdn_conv_split_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_gdn_conv_split_test COMMAND ignis_kernel_gdn_conv_split_test)
+# GitHub #507: OURS -- the GDN prefill copies no layout: the layer body at the prefill chunks and
+# the chunked program prefill on a synthetic trellis body of the 27B's widths, against the body and
+# loop as they ran before (the leaf's test-only switch, kernel/src/layer_internal.h), bit for bit,
+# and the copy counter at zero. GPU; no SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_gdn_prefill_layout_test test_gdn_prefill_layout.cu)
+target_include_directories(ignis_kernel_gdn_prefill_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_gdn_prefill_layout_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_gdn_prefill_layout_test COMMAND ignis_kernel_gdn_prefill_layout_test)
 
 # ADR 0062: the token embedding in mapped pinned host memory (OURS: the
 # device surface's allocation), gathered by the vendored W8 op bit for bit as
