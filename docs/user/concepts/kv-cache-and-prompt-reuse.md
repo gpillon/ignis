@@ -78,7 +78,8 @@ all hit.
 
 Each image of mutable state occupies a **retained slot**, reserved at load. By
 default there are none on the device and two per decode lane in one pinned host
-block. A host slot costs a PCIe copy where a device slot costs a device copy
+block; the `rtx-24gb` profile also keeps two on the device for the 27B
+([Profiles and defaults](profiles.md#rtx-24gb)). A host slot costs a PCIe copy where a device slot costs a device copy
 (a claim of 182 MiB measured 15.6 ms from the host against 0.29 ms on the
 device) but no VRAM, so the KV pool gets that room: at the default load it raised
 the pool from about 475K to about 680K tokens at level throughput, and in an
@@ -138,11 +139,16 @@ beyond the best match above it (for KV-disk, 8,192 on Flash-Next and
   log line names the tier and the kind of reuse.
 - **A tax on short cold prompts.** To be reusable, a prompt is cut at its
   publish point and again at the generation opener, so one traversal of the model
-  becomes three. Each extra traversal costs a fixed ~19 ms because it re-streams
-  the weights. Measured on 2026-09-18, that was 37 percent of the TTFT of a
-  1,024-token cold request, and under 2 percent on a 70K prompt
+  becomes three. Each extra traversal costs a fixed ~19 ms on the RTX 5090
+  because it re-streams the weights. Measured on 2026-09-18, that was 37 percent
+  of the TTFT of a 1,024-token cold request, and under 2 percent on a 70K prompt
   ([the finding](../../findings/2026-09-18-prompt-reuse-tax-on-short-ttft.md)).
-  The bet is that a later request skips more than that.
+  The bet is that a later request skips more than that. On Flash-Next, and on
+  the 27B on an RTX 30 or RTX 40 card, where a traversal costs clearly more, the
+  publish point rides the opener's cut instead: the capture at the opener hands
+  over the whole pages below it, and the prompt is cut once. What that gives up
+  is the image at the opener's page floor, which only a prompt parting from
+  this one in the last page before its opener would have resumed from.
 - **A reused request may differ in the last bit.** A reused request and a cold
   prefill split their chunks differently, so they can diverge at near-ties of
   the model's own choice.

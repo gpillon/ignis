@@ -49,7 +49,9 @@ Flash-Next). The lines include:
 - the **lane state** of every decode lane (on the 27B, about 144 MiB per lane
   for the linear-attention layers);
 - the **decode and drafter graphs**' staging buffers;
-- the **retained slots** that live on the device (none by default) and, under
+- the **retained slots** that live on the device (none by default, two for
+  the 27B under `rtx-24gb`; the event's `retained_device_slots` counts them
+  and `retained_slots_bytes` is their line) and, under
   the compressed KV format, the residual window of every lane and slot;
 - the **media embedding** pool for images (0 under `--vision-residency host`,
   which keeps it in pinned host RAM);

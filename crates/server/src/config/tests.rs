@@ -3508,16 +3508,45 @@ fn the_rtx_24gb_profile_serves_the_27b_with_the_5090s_values_at_the_measured_con
     assert_eq!(s27.settings().spec.draft_head, None, "the drafter's head at its default");
     assert_eq!(s27.adaptable(), crate::adaptation::Adaptable::ALL, "every value the profile's or a default, so every one adapts");
 
-    // The 5090 profile's 27B values, the context alone apart.
+    // The 5090 profile's 27B values, the context and (GitHub #508) the
+    // device retained slots apart.
     let rtx5090 = config(&["--profile", "rtx5090"]);
     let mut want = rtx5090.for_family(ModelFamily::Qwen38_27b).unwrap().settings().clone();
     want.model.max_context = 1_048_576;
+    want.reuse.retained_device = Some(profile::RTX_24GB_RETAINED_DEVICE_SLOTS);
     assert_eq!(s27.settings(), &want);
 
     let flash = rtx24.for_family(ModelFamily::FlashNext).expect("Flash-Next resolves under the 27B's profile");
     assert_eq!(flash.decode_lanes, None, "no Flash-Next section: its own default");
     assert_eq!(flash.settings().vram.pinned_expert_bytes, 0, "no pinned hot set");
     assert!(flash.speculation.is_none());
+}
+
+/// GitHub #508 (spec #503): `rtx-24gb` keeps the 27B's prompt checkpoint and
+/// prefix images on the device, in its own retained slots beside the host
+/// ones, on an RTX 3090 and an RTX 4090 as `--profile auto` finds them; its
+/// context and lanes stay #474's. The other profiles, and no profile, keep
+/// none on the device; Flash-Next keeps none under any.
+#[test]
+fn rtx_24gb_keeps_the_27b_s_device_retained_slots_and_its_context() {
+    for card in [card_of(24.0, "NVIDIA GeForce RTX 3090", (8, 6), "86;120a"), card_of(24.0, "NVIDIA GeForce RTX 4090", (8, 9), "86;120a")] {
+        let config = on_card(&[], card.clone()).unwrap();
+        let s27 = config.for_family(ModelFamily::Qwen38_27b).unwrap();
+        assert_eq!(s27.retained_device_slots, profile::RTX_24GB_RETAINED_DEVICE_SLOTS, "{card:?}");
+        assert_eq!(s27.retained_host_slots, 16, "{card:?}: the host slots, two a lane, as before");
+        assert_eq!((s27.max_context, s27.decode_lanes), (1_048_576, None), "{card:?}: the context and the lanes of #474");
+        let shape = crate::runtime::EngineShape::from(&s27);
+        assert_eq!(shape.retained_device_slots, profile::RTX_24GB_RETAINED_DEVICE_SLOTS, "{card:?}: the load reserves them");
+        assert_eq!(config.for_family(ModelFamily::FlashNext).unwrap().retained_device_slots, 0, "{card:?}: Flash-Next");
+    }
+    let named = on_card(&["--reuse-retained-device", "0"], card_of(24.0, "NVIDIA GeForce RTX 3090", (8, 6), "86;120a")).unwrap();
+    assert_eq!(named.for_family(ModelFamily::Qwen38_27b).unwrap().retained_device_slots, 0, "the operator's count wins");
+    for profile in ["rtx-16gb", "rtx50-16gb", "rtx5090", "rtxpro6000", "none"] {
+        let config = config(&["--profile", profile]);
+        for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
+            assert_eq!(config.for_family(family).unwrap().retained_device_slots, 0, "{profile}: {family:?}");
+        }
+    }
 }
 
 /// GitHub #418 (ADR 0063 as amended by ADR 0075): `rtx50-16gb` turns vision
