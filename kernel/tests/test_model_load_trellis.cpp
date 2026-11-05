@@ -22,13 +22,18 @@
 //   layers -- each its activations, the vendored queries the trellis body
 //   keeps (the GQA attention's, the GDN gating's and recurrence's) and, on the
 //   GQA layer, the q | gate buffer; no projection workspace -- at the 16 GiB
-//   load's shape.
+//   load's shape;
+// - GitHub #509: under the dense prefill the plan holds its one buffer, the
+//   body's largest matrix in INT8 (`trellis_dense_bytes`), and the trellis
+//   workspace asks the dense op at the chunk in place of the fused prefill;
+//   the served body and an unknown route are refused.
 //
 // The op's workspace query needs a prepared device (the decode route splits
 // for its SM count), so this runs on the GPU like every CTest here. ADR 0006 /
 // docs/agents/testing.md: no SKIP_RETURN_CODE, so nothing here reads as a
 // skip; a host without a device fails.
 
+#include "ignis_dense_prefill.h"
 #include "ignis_gqa_workspace.h"
 #include "ignis_model.h"
 #include "ignis_seq.h"
@@ -213,7 +218,8 @@ struct Plan {
 };
 
 Plan plan(const std::vector<Entry> &entries, const Topology &topology, uint32_t lanes, int32_t backend = 0,
-          uint32_t draft_tokens = 0, uint32_t max_context = kMaxContext) {
+          uint32_t draft_tokens = 0, uint32_t max_context = kMaxContext,
+          uint32_t prefill_linear = IGNIS_PREFILL_LINEAR_FUSED) {
   std::vector<ignis_bound_tensor> tensors;
   for (const Entry &e : entries) {
     ignis_bound_tensor t{};
@@ -236,6 +242,7 @@ Plan plan(const std::vector<Entry> &entries, const Topology &topology, uint32_t 
   options.decode_lanes = lanes;
   options.speculative_backend = backend;
   options.draft_tokens = draft_tokens;
+  options.prefill_linear = prefill_linear;
   Plan p;
   p.rc = ignis_model_plan_reservations(tensors.data(), tensors.size(), &topology.raw, kChunk, max_context,
                                        IGNIS_KV_FORMAT_HQ_E8_2B, &options, &p.reserved);
@@ -259,6 +266,34 @@ uint64_t expected_line(uint32_t head_tokens) {
     }
     line = std::max(line, ignis_trellis_workspace_bytes(c.in, c.out, c.weights, kChunk));
   }
+  for (uint32_t t = 1; t <= head_tokens; ++t) {
+    line = std::max(line, ignis_trellis_workspace_bytes(kHidden, kVocab, 1, t));
+  }
+  return line;
+}
+
+// GitHub #509: the line under the dense prefill -- the same decode-route and
+// head asks, and at the chunk each shared input's group of matrices asked of
+// the dense op.
+uint64_t expected_dense_line(uint32_t head_tokens) {
+  struct Call {
+    uint32_t in, out, weights;
+  };
+  const Call body[] = {{kHidden, kConvChannels, 1}, {kHidden, kStateRows, 1}, {kStateRows, kHidden, 1},
+                       {kHidden, 2 * kQWidth, 1},   {kHidden, kKvWidth, 1},   {kQWidth, kHidden, 1},
+                       {kHidden, kFfn, 2},          {kFfn, kHidden, 1}};
+  uint64_t line = 0;
+  for (const Call &c : body) {
+    for (uint32_t t = 1; t <= IGNIS_TRELLIS_DECODE_MAX_TOKENS; ++t) {
+      line = std::max(line, ignis_trellis_workspace_bytes(c.in, c.out, c.weights, t));
+    }
+  }
+  struct Group {
+    uint32_t in, matrices;
+  };
+  // GDN qkv and z, GQA q, k and v, gate and up, the two outputs and down.
+  const Group groups[] = {{kHidden, 2}, {kHidden, 3}, {kStateRows, 1}, {kQWidth, 1}, {kFfn, 1}};
+  for (const Group &g : groups) line = std::max(line, ignis_dense_prefill_workspace_bytes(g.in, g.matrices, kChunk));
   for (uint32_t t = 1; t <= head_tokens; ++t) {
     line = std::max(line, ignis_trellis_workspace_bytes(kHidden, kVocab, 1, t));
   }
@@ -392,6 +427,34 @@ int main() {
               head.reserved.sampling_bytes == served.reserved.sampling_bytes &&
               head.reserved.decode_graph_bytes == served.reserved.decode_graph_bytes,
           "with no layer, the bodies' other lines are the same");
+  }
+
+  // GitHub #509: the dense prefill's two lines.
+  {
+    const Plan fused = plan(trellis_body(4), four, 2);
+    const Plan dense = plan(trellis_body(4), four, 2, 0, 0, kMaxContext, IGNIS_PREFILL_LINEAR_DENSE);
+    check(dense.rc == 0, "the trellis body plans the dense prefill: " + dense.error);
+    check(fused.reserved.trellis_dense_bytes == 0, "the fused prefill reserves no dense buffer");
+    check(dense.reserved.trellis_dense_bytes == static_cast<uint64_t>(kHidden) * kFfn,
+          "the dense buffer is the largest matrix in INT8, gate, up and down's 5120 x 17408 (" +
+              std::to_string(dense.reserved.trellis_dense_bytes) + ")");
+    check(dense.reserved.trellis_workspace_bytes == expected_dense_line(32),
+          "the dense prefill's trellis workspace is its widest ask (" +
+              std::to_string(dense.reserved.trellis_workspace_bytes) + " vs " + std::to_string(expected_dense_line(32)) +
+              ")");
+    check(dense.reserved.workspace_bytes == fused.reserved.workspace_bytes &&
+              dense.reserved.decode_graph_bytes == fused.reserved.decode_graph_bytes,
+          "the dense prefill moves no other line");
+    std::printf("dense prefill at chunk %u: trellis_dense %llu bytes, trellis_workspace %llu (fused prefill %llu)\n",
+                kChunk, static_cast<unsigned long long>(dense.reserved.trellis_dense_bytes),
+                static_cast<unsigned long long>(dense.reserved.trellis_workspace_bytes),
+                static_cast<unsigned long long>(fused.reserved.trellis_workspace_bytes));
+    const Plan served = plan(served_endpoints(), none, 2, 0, 0, kMaxContext, IGNIS_PREFILL_LINEAR_DENSE);
+    check(served.rc != 0 && contains(served.error, "the dense prefill") && contains(served.error, "NVFP4"),
+          "the served (NVFP4) body refuses the dense prefill: " + served.error);
+    const Plan unknown = plan(trellis_body(4), four, 2, 0, 0, kMaxContext, 2);
+    check(unknown.rc != 0 && contains(unknown.error, "prefill_linear 2"),
+          "an unknown prefill route is refused: " + unknown.error);
   }
 
   // One body, never a mix.

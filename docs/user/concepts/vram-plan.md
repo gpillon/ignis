@@ -41,6 +41,11 @@ Flash-Next). The lines include:
   of the two (under `--vision-residency host` the encoder's share includes the
   slots its weights are copied through,
   [Vision](../configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live));
+- on the 27B's 16 GB trellis entries, the **trellis workspace** its matrices
+  share and, when the load runs the dense prefill (`--model-prefill-linear
+  int8`), the **dense prefill buffer** (`trellis_dense`): the largest matrix
+  decoded to INT8, 89 MB, which every matrix of a prefill chunk is decoded into
+  in turn, so it costs the KV pool about that much and no more;
 - the **lane state** of every decode lane (on the 27B, about 144 MiB per lane
   for the linear-attention layers);
 - the **decode and drafter graphs**' staging buffers;

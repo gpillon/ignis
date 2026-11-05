@@ -698,6 +698,22 @@ foreach(name IN ITEMS trellis_dense_decode trellis_linear)
   target_link_libraries(ignis_kernel_${name}_test PRIVATE ignis_kernel ignis_vendor)
   add_test(NAME ignis_kernel_${name}_test COMMAND ignis_kernel_${name}_test)
 endforeach()
+# GitHub #509 (spec #503): OURS -- the dense prefill (kernel/include/ignis_dense_prefill.h): its
+# W8 codes against a host decode, its A8 against a host reference bit for bit, its int32
+# accumulators against an exact integer reference on the CUDA cores at every tile plan, and the
+# composed call's outputs within BF16 rounding of the fp64 epilogue; on synthetic matrices of
+# every K class, and on real matrices of the base 16 GB artifact ($IGNIS_DENSE_PREFILL_ARTIFACT,
+# SKIP outside the GPU profile when absent, a failure under it). Not sm120a-only: the kernels fit
+# sm_86. The leaf-internal tile plan (dense_prefill_internal.cuh) is why it sees kernel/src.
+add_executable(ignis_kernel_dense_prefill_test test_dense_prefill.cu)
+target_include_directories(ignis_kernel_dense_prefill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_dense_prefill_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_dense_prefill_test COMMAND ignis_kernel_dense_prefill_test)
+# Its bench, against the fused prefill per body shape and per chunk at the quant's K mix (--tokens,
+# --sweep for every tile plan). A tool and NOT a CTest; timing wants the card to itself.
+add_executable(ignis_kernel_dense_prefill_bench bench_dense_prefill.cu)
+target_include_directories(ignis_kernel_dense_prefill_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_dense_prefill_bench PRIVATE ignis_kernel ignis_vendor)
 # The dense trellis microbenchmark: spec 02's report (DRAM bandwidth at 1..64 tokens, prefill
 # TFLOP/s, under the debug SM caps). A tool and NOT a CTest; timing wants the card to itself.
 add_executable(ignis_kernel_trellis_linear_bench bench_trellis_linear.cu)

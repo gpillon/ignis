@@ -261,14 +261,17 @@ enum ignis_prefill_attention {
 };
 
 /* GitHub #505 (spec #503): how the 27B's trellis prefill multiplies its
- * matrices. */
+ * matrices: a body call of more than IGNIS_TRELLIS_DECODE_MAX_TOKENS tokens
+ * (ignis_trellis_linear.h); a narrower call, a round and the head take the
+ * fused op's decode route either way (GitHub #509). */
 enum ignis_prefill_linear {
   /* The fused prefill: the trellis decoded inside the GEMM's inner loop, the
    * multiply in f16. Today's route. */
   IGNIS_PREFILL_LINEAR_FUSED = 0,
-  /* The dense prefill: each matrix decoded once per chunk into one INT8
-   * buffer and multiplied on the integer MMA. A leaf that does not carry it
-   * refuses the value. */
+  /* The dense prefill (GitHub #509): each matrix decoded once per chunk into
+   * INT8, the activations quantized to INT8 per token, our own s8 GEMM
+   * (ignis_dense_prefill.h), with the dense copy's buffer the plan line
+   * `trellis_dense_bytes`. The trellis body's alone. */
   IGNIS_PREFILL_LINEAR_DENSE = 1,
 };
 
@@ -408,9 +411,10 @@ struct ignis_model_load_options {
    * load refuses either mismatch, and the plan (which reads no pointer) sizes
    * the scratch for the ring by this field alone. */
   uint32_t vision_residency;
-  /* enum ignis_prefill_linear (GitHub #505); anything else is refused.
-   * Fixed for the life of the load. IGNIS_PREFILL_LINEAR_FUSED on
-   * Flash-Next. Appended at the end: the struct grew by one padded word. */
+  /* enum ignis_prefill_linear (GitHub #505); anything else is refused, and
+   * DENSE on a body that is not trellis (GitHub #509). Fixed for the life of
+   * the load. IGNIS_PREFILL_LINEAR_FUSED on Flash-Next and the NVFP4 body.
+   * Appended at the end: the struct grew by one padded word. */
   uint32_t prefill_linear;
 };
 
@@ -458,8 +462,14 @@ struct ignis_model_reservations {
    * `ignis_trellis_workspace`, one buffer at a stable address for every
    * trellis call on the model's stream -- the widest of its body's and its
    * head's calls at 1..IGNIS_TRELLIS_DECODE_MAX_TOKENS tokens and at the
-   * prefill chunk, on this device. 0 on the NVFP4 body and on Flash-Next. */
+   * prefill chunk, on this device. 0 on the NVFP4 body and on Flash-Next.
+   * Under IGNIS_PREFILL_LINEAR_DENSE it holds the dense prefill's INT8
+   * activations at the chunk instead of the fused prefill's fp16 ones. */
   uint64_t trellis_workspace_bytes;
+  /* GitHub #509: the dense prefill's one buffer, the INT8 copy of the body's
+   * largest trellis matrix (in x out bytes), which every matrix is decoded
+   * into in turn. 0 unless IGNIS_PREFILL_LINEAR_DENSE. */
+  uint64_t trellis_dense_bytes;
 };
 
 struct ignis_model_stats {
@@ -486,11 +496,12 @@ struct ignis_model_stats {
 #ifdef __cplusplus
 /* Neither struct has a `size` field, so both sides pin their layouts (here,
  * and crates/core/src/model_load.rs's mirror test). */
-static_assert(sizeof(struct ignis_model_reservations) == 64 &&
-                  offsetof(struct ignis_model_reservations, trellis_workspace_bytes) == 56,
+static_assert(sizeof(struct ignis_model_reservations) == 72 &&
+                  offsetof(struct ignis_model_reservations, trellis_workspace_bytes) == 56 &&
+                  offsetof(struct ignis_model_reservations, trellis_dense_bytes) == 64,
               "ignis_model_reservations drifted from crates/core/src/model_load.rs IgnisModelReservations");
-static_assert(sizeof(struct ignis_model_stats) == 96 && offsetof(struct ignis_model_stats, reserved) == 24 &&
-                  offsetof(struct ignis_model_stats, host_mapped_bytes) == 88,
+static_assert(sizeof(struct ignis_model_stats) == 104 && offsetof(struct ignis_model_stats, reserved) == 24 &&
+                  offsetof(struct ignis_model_stats, host_mapped_bytes) == 96,
               "ignis_model_stats drifted from crates/core/src/model_load.rs IgnisModelStats");
 #endif
 

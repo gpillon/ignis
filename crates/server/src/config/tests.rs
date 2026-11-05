@@ -3358,12 +3358,14 @@ fn the_config_reports_the_prefill_attention_band_the_card_runs() {
 }
 
 /// Spec #503 (GitHub #505): the prefill route and the integer band, named
-/// by every source, on an 8.x and a 12.x capability, while the build carries
-/// neither: a named value the load cannot run is refused by the spelling that
-/// named it, a profile's value falls back with the card as its origin, and
-/// `fp16` runs everywhere. Nothing is `int8` by default.
+/// by every source, on an 8.x and a 12.x capability, with the dense prefill
+/// built (GitHub #509) and the integer band not yet: a named `int8` route
+/// runs on either card, and a profile's runs on 8.x and falls back to the
+/// fused prefill on 12.x, the card as its origin; a named integer band is
+/// refused by the spelling that named it, and a profile's falls back. `fp16`
+/// runs everywhere, and nothing is `int8` by default.
 #[test]
-fn a_named_dense_prefill_or_integer_band_is_refused_and_a_profiles_falls_back() {
+fn a_named_dense_prefill_runs_a_named_integer_band_is_refused_and_a_profiles_follows_the_card() {
     use source::{Candidate, Source};
     let cards = [
         ("8.x", card_of(24.0, "NVIDIA GeForce RTX 3090", (8, 6), "86;120a")),
@@ -3390,15 +3392,15 @@ fn a_named_dense_prefill_or_integer_band_is_refused_and_a_profiles_falls_back() 
 ")).unwrap();
         assert_eq!((from_file.prefill_linear, from_file.prefill_attention), (PrefillLinear::Fp16, PrefillAttention::Fp16), "{generation}");
 
-        // Named `int8` is refused by the spelling that named it.
-        let flag = on(&["--model-prefill-linear", "int8"], &[], &no_files).unwrap_err().0;
-        assert!(flag.contains("`--model-prefill-linear int8`") && flag.contains("dense prefill"), "{generation}: {flag}");
-        let env = on(&[], &[("IGNIS_MODEL_PREFILL_LINEAR", "int8")], &no_files).unwrap_err().0;
-        assert!(env.contains("`IGNIS_MODEL_PREFILL_LINEAR int8`"), "{generation}: {env}");
+        // Named `int8` runs the dense prefill, from every source, on either card.
+        let flag = on(&["--model-prefill-linear", "int8"], &[], &no_files).unwrap();
+        assert_eq!(flag.prefill_linear, PrefillLinear::Int8, "{generation}");
+        let env = on(&[], &[("IGNIS_MODEL_PREFILL_LINEAR", "int8")], &no_files).unwrap();
+        assert_eq!(env.prefill_linear, PrefillLinear::Int8, "{generation}");
         let text = on(&["--config", "c.yaml"], &[], &file("model:
   prefill_linear: int8
-")).unwrap_err().0;
-        assert!(text.contains("prefill_linear") && text.contains("c.yaml") && text.contains("dense prefill"), "{generation}: {text}");
+")).unwrap();
+        assert_eq!(text.prefill_linear, PrefillLinear::Int8, "{generation}");
         for (flags, env) in [
             (&["--model-prefill-attention", "int8"][..], &[][..]),
             (&[][..], &[("IGNIS_MODEL_PREFILL_ATTENTION", "int8")][..]),
@@ -3423,7 +3425,8 @@ fn a_named_dense_prefill_or_integer_band_is_refused_and_a_profiles_falls_back() 
             }
         }
 
-        // A profile's value falls back, the card as its origin.
+        // A profile's integer band falls back, the card as its origin; its
+        // dense prefill runs on 8.x and falls back to the fused one on 12.x.
         let profile = on(&["--profile", "none"], &[], &no_files).unwrap();
         let mut sources = profile.basis.sources().clone();
         for (name, raw) in [("prefill_linear", "int8"), ("prefill_attention", "int8")] {
@@ -3433,12 +3436,14 @@ fn a_named_dense_prefill_or_integer_band_is_refused_and_a_profiles_falls_back() 
         let resolution = source::resolve_settings(&sources, Some(ModelFamily::Qwen38_27b), source::Fit::Switch).unwrap();
         let shown = resolution.settings.render();
         let attention = if generation == "8.x" { "fp16" } else { "fp8" };
-        assert_eq!((&shown["model"]["prefill_linear"], &shown["model"]["prefill_attention"]), (&"fp16".into(), &attention.into()), "{generation}");
-        for name in ["prefill_linear", "prefill_attention"] {
-            let origin = resolution.origin("model", name).unwrap();
-            assert_eq!(origin.source, Source::Card, "{generation} {name}");
-            assert!(!origin.source.explicit());
-        }
+        let linear = if generation == "8.x" { "int8" } else { "fp16" };
+        assert_eq!((&shown["model"]["prefill_linear"], &shown["model"]["prefill_attention"]), (&linear.into(), &attention.into()), "{generation}");
+        let origin = resolution.origin("model", "prefill_attention").unwrap();
+        assert_eq!(origin.source, Source::Card, "{generation} prefill_attention");
+        assert!(!origin.source.explicit());
+        let origin = resolution.origin("model", "prefill_linear").unwrap();
+        assert_eq!(origin.source == Source::Card, generation == "12.x", "{generation} prefill_linear: {:?}", origin.source);
+        assert!(!origin.source.explicit());
     }
 }
 

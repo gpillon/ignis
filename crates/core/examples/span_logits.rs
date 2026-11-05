@@ -22,6 +22,9 @@
 //! `--model-prefill-attention`, prefills on the FP16 band (GitHub #335): the
 //! band a card below compute capability 12.0 runs, where the 8-bit band traps
 //! (GitHub #456); unset, the 8-bit default.
+//! `IGNIS_MODEL_PREFILL_LINEAR=int8`, the variable of `--model-prefill-linear`,
+//! prefills the trellis body on the dense prefill (GitHub #509); unset, the
+//! fused prefill, the default. An NVFP4 artifact refuses `int8` at load.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,9 +32,9 @@ use std::path::{Path, PathBuf};
 use ignis_artifact::{CudaDevice, ModelScope, VisionResidency, Reader, bind_model_scope_27b_with, materialize};
 use ignis_core::{ExceptionWeights, KvFormat};
 use ignis_core::compute::ModelConfig;
-use ignis_core::model_load::load_qwen38_27b_with_prefill_attention;
+use ignis_core::model_load::load_qwen38_27b_with_decode_lanes;
 use ignis_core::rope_scaling::RopeScaling;
-use ignis_core::PrefillAttention;
+use ignis_core::{PrefillAttention, PrefillLinear};
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step::{prefill_program, prefill_program_span_logits};
 
@@ -69,11 +72,15 @@ fn main() {
         .map_or(Ok(PrefillAttention::default()), |v| PrefillAttention::parse(&v))
         .unwrap_or_else(|e| panic!("IGNIS_MODEL_PREFILL_ATTENTION: {e}"));
     eprintln!("prefill attention: {prefill_attention}");
+    let prefill_linear = std::env::var("IGNIS_MODEL_PREFILL_LINEAR")
+        .map_or(Ok(PrefillLinear::default()), |v| PrefillLinear::parse(&v))
+        .unwrap_or_else(|e| panic!("IGNIS_MODEL_PREFILL_LINEAR: {e}"));
+    eprintln!("prefill linear: {prefill_linear}");
     let scope = ModelScope { draft: None, vision: false, vision_residency: VisionResidency::Device, fp8_exceptions: exceptions.is_fp8() };
     let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = CudaDevice::create(0).unwrap_or_else(|e| panic!("CUDA: {e}"));
     let artifact = materialize(&reader, &plan, &mut device, None).unwrap_or_else(|e| panic!("materialize: {e}"));
-    let model = load_qwen38_27b_with_prefill_attention(
+    let model = load_qwen38_27b_with_decode_lanes(
         &reader,
         &artifact,
         &handles,
@@ -84,6 +91,8 @@ fn main() {
         None,
         RopeScaling::NONE,
         prefill_attention,
+        prefill_linear,
+        ignis_core::N_DECODE_LANES as u32,
     )
     .unwrap_or_else(|e| panic!("model load: {e}"));
     let pool = SeqPool::create(

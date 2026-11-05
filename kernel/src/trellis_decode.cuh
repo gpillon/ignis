@@ -121,6 +121,43 @@ __device__ __forceinline__ void decode_fragment3(uint32_t word0, uint32_t word1,
   decode_window<K2>(__funnelshift_l(word1, word0, plan.off), __funnelshift_l(word2, word1, plan.off), frag);
 }
 
+// ---- the dense prefill's W8 (GitHub #509, kernel/include/ignis_trellis_dense.h) -------------
+//
+// The codebook integers of a lane, and the dense copy's quantizer on them. decode_window computes
+// the same codes and keeps its own copy of the loop, so the fused kernels' code does not move.
+
+// The eight codes of a lane from its normalized window (as decode_window reads it), each as the
+// fp16 bit pattern of 1024 + s, s the step's byte sum in [0, 1020], in the order of its steps.
+template <int K2>
+__device__ __forceinline__ void window_codes(uint32_t hi, uint32_t lo, uint32_t (&bits)[8]) {
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const int sh = state_shift(K2, j);
+    const uint32_t raw = sh >= 32 ? hi >> (sh - 32) : __funnelshift_r(lo, hi, sh);
+    bits[j] = __dp4a((raw & 0xFFFFu) * kMul1, 0x01010101u, 0x6400u);
+  }
+}
+
+// W8: q = clamp(rn((s - 510) / 4), -127, 127), ties to even, of a code of window_codes.
+__device__ __forceinline__ int w8_code(uint32_t bits) {
+  const int d = static_cast<int>(bits) - 0x6400 - 510;  // s - 510
+  return max(-127, min(127, __float2int_rn(static_cast<float>(d) * 0.25f)));
+}
+
+// A lane's normalized window from its words: the two-word plan (K <= 4) and the three-word one.
+__device__ __forceinline__ void lane_window(uint32_t word0, uint32_t word1, const LanePlan &plan, uint32_t &hi,
+                                            uint32_t &lo) {
+  const uint64_t window = ((static_cast<uint64_t>(word0) << 32) | word1) << plan.off;
+  hi = static_cast<uint32_t>(window >> 32);
+  lo = static_cast<uint32_t>(window);
+}
+
+__device__ __forceinline__ void lane_window3(uint32_t word0, uint32_t word1, uint32_t word2, const LanePlan3 &plan,
+                                             uint32_t &hi, uint32_t &lo) {
+  hi = __funnelshift_l(word1, word0, plan.off);
+  lo = __funnelshift_l(word2, word1, plan.off);
+}
+
 }  // namespace ignis_trellis
 
 #endif  // IGNIS_TRELLIS_DECODE_CUH

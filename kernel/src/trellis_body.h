@@ -66,12 +66,36 @@ inline uint64_t tile_bytes(const ignis_trellis_weight &w) {
   return static_cast<uint64_t>(w.in) * w.out / 16 * w.k2;
 }
 
+// GitHub #509: whether a body call of `tokens` tokens takes the dense prefill
+// (kernel/include/ignis_dense_prefill.h): a load under
+// IGNIS_PREFILL_LINEAR_DENSE, and a call wider than the fused op's decode
+// route. Every other call, and the head always, is the fused op's. The calls
+// below dispatch on it; the ones that read one input with several matrices
+// quantize it once for all of them.
+bool dense_prefill(const ignis_model &model, int32_t tokens);
+
 // y = x W through `epilogue` (IGNIS_TRELLIS_STORE or IGNIS_TRELLIS_ADD): `x`
 // a BF16 `[in, T]` activation, `y` the first column of a BF16 `[ldy, T]`
 // buffer. Throws std::runtime_error with the op's message on a refusal, as the
 // vendored ops do, so a layer body's own catch reports it.
 void linear(const ignis_model &model, const ignis_trellis_weight &w, const ninfer::Tensor &x, void *y,
             uint32_t ldy, uint32_t epilogue, cudaStream_t stream);
+
+// The GDN layer's input projection: `in_proj_qkv` into `qkv` (`[ldqkv, T]`,
+// the conv input) and `in_proj_z` into `z` (`[ldz, T]`), both stores.
+void gdn_projection(const ignis_model &model, const ignis_trellis_weight &in_proj_qkv,
+                    const ignis_trellis_weight &in_proj_z, const ninfer::Tensor &x, void *qkv, uint32_t ldqkv,
+                    void *z, uint32_t ldz, cudaStream_t stream);
+
+// The GQA layer's input projection: the query and the output gate from
+// `q_proj` (as `query_gate` below), the key and the value from `k_proj` and
+// `v_proj`. On the dense prefill the GEMM's epilogue writes the query and the
+// gate straight to their buffers, so the split's copy does not run.
+void attention_projection(const ignis_model &model, const ignis_trellis_weight &q_proj,
+                          const ignis_trellis_weight &k_proj, const ignis_trellis_weight &v_proj,
+                          const ninfer::Tensor &x, int32_t heads, int32_t head_dim, ninfer::DeviceArena &arena,
+                          ninfer::Tensor &query, ninfer::Tensor &gate, ninfer::Tensor &key, ninfer::Tensor &value,
+                          cudaStream_t stream);
 
 // h = silu(x G) * (x U): the MLP's gate and up matrices, `h` BF16 `[out, T]`.
 void swiglu(const ignis_model &model, const ignis_trellis_weight &gate, const ignis_trellis_weight &up,

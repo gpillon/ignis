@@ -375,7 +375,8 @@ impl PrefillRoute {
 /// builds a route flips its line here, with its test.
 pub const fn prefill_route_built(route: PrefillRoute) -> bool {
     match route {
-        PrefillRoute::DensePrefill => false,
+        // GitHub #509: the leaf's dense prefill (kernel/include/ignis_dense_prefill.h).
+        PrefillRoute::DensePrefill => true,
         PrefillRoute::IntegerBand => false,
     }
 }
@@ -669,12 +670,18 @@ mod tests {
     }
 
     /// Spec #503 (GitHub #505): the build says whether it carries a route
-    /// ([`prefill_route_built`]); both are false until their tickets build
-    /// them, and the decision reads them through that one predicate.
+    /// ([`prefill_route_built`]), and the decision reads them through that one
+    /// predicate. GitHub #509 built the dense prefill; the integer band waits
+    /// for #510.
     #[test]
-    fn this_build_carries_neither_route_yet() {
-        assert!(!prefill_route_built(PrefillRoute::DensePrefill));
+    fn this_build_carries_the_dense_prefill_and_not_yet_the_integer_band() {
+        assert!(prefill_route_built(PrefillRoute::DensePrefill));
         assert!(!prefill_route_built(PrefillRoute::IntegerBand));
+        let flag = "--model-prefill-linear";
+        let (a, b) = (ampere(), blackwell());
+        assert_eq!(prefill_linear(PrefillLinear::Int8, false, Some(&a), flag), Ok(PrefillLinear::Int8), "8.x: from a profile");
+        assert_eq!(prefill_linear(PrefillLinear::Int8, true, Some(&b), flag), Ok(PrefillLinear::Int8), "Blackwell: named");
+        assert_eq!(prefill_linear(PrefillLinear::Int8, false, Some(&b), flag), Ok(PrefillLinear::Fp16), "Blackwell: a profile's falls back");
     }
 
     /// The prompt attention band by generation, with the integer band not

@@ -251,8 +251,8 @@ describe("deriveMemory", () => {
     expect(m.expertCacheBytes).toBe(500);
     expect(m.kvRoomBytes).toBe(800);
     expect(m.spareBytes).toBe(0);
-    // A server that predates the two lines (and #339's trellis workspace) exports twelve; the plan is whole all the same.
-    const old: Record<string, number | null> = { ...reserved, trellis_workspace: null, residency: null, expert_cache: null };
+    // A server that predates the two lines (and #339's trellis workspace, #509's dense buffer) exports twelve; the plan is whole all the same.
+    const old: Record<string, number | null> = { ...reserved, trellis_workspace: null, trellis_dense: null, residency: null, expert_cache: null };
     const o = deriveMemory([memoryAt(0, { reserved: old as MemorySeries["reserved"], budgetBytes: 2000 })], 0);
     expect(o.planned).toBe(true);
     expect(o.linesBytes).toBe(600);
@@ -294,9 +294,9 @@ describe("deriveMemory", () => {
     // was laid out in, and the panel has to be able to say so.
     const reserved = Object.fromEntries(Object.keys(emptySnapshot().memory.reserved).map((line) => [line, 100]));
     const m = deriveMemory([memoryAt(0, { reserved: reserved as MemorySeries["reserved"], budgetBytes: 900, kvPoolPages: 2, kvPageBytes: 50 })], 0);
-    expect(m.linesBytes).toBe(1600);
-    expect(m.kvRoomBytes).toBe(-700);
-    expect(m.spareBytes).toBe(-800);
+    expect(m.linesBytes).toBe(1700);
+    expect(m.kvRoomBytes).toBe(-800);
+    expect(m.spareBytes).toBe(-900);
     expect(m.oversubscribed).toBe(true);
   });
 
