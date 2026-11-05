@@ -49,7 +49,9 @@ build is given (#482). It also reads the 8.6 code of the kernels the RTX 30 and
 RTX 40 prefill added and refuses one that uses a tensor-core form those cards run
 at half rate (HMMA with an f32 accumulator, BF16, TF32, FP8), naming the kernel
 and the opcode (`mk/full-rate-kernels.txt`, #512); `cuobjdump`, which comes with
-nvcc, must be on the build host.
+nvcc, must be on the build host. The Containerfile's build stage installs the
+CUDA toolkit's `cuobjdump` package if its devel image lacks it, and points the
+check at it (`IGNIS_CUOBJDUMP`).
 
 ## The sm_86 gate
 
