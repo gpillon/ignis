@@ -12,14 +12,23 @@
 //   dense    the engine's sequence for one matrix, decode then GEMM;
 //   fused    ignis_trellis_linear (ignis_trellis_linear_swiglu for gate and up), rotation included;
 //   A8       ignis_dense_prefill_quantize of each shared input: qkv and z, q k and v, gate and up,
-//            the output projections (in 6144) and down (in 17408).
+//            the output projections (in 6144) and down (in 17408);
+//   fused A8 (GitHub #511) A8 fused into its producers: each norm group's fused RMSnorm less the
+//            vendored rmsnorm it replaces, and for down what keeping its block maxima adds to up's
+//            SwiGLU pass plus the light second pass.
 // Then the 64-layer body per chunk: dense = sum of each entry's dense x its calls + each group's
-// A8 x its layers, against fused = sum of each entry's fused x its calls.
+// A8 x its layers, against fused = sum of each entry's fused x its calls; and the chunk's A8
+// before the fusion (standalone, every group) and after it (fused, the output projections' still
+// standalone).
 //
-//   ignis_kernel_dense_prefill_bench [--tokens 2048,4096] [--reps 5] [--inner 32] [--sweep]
+//   ignis_kernel_dense_prefill_bench [--tokens 2048,4096] [--reps 5] [--inner 32] [--sweep] [--a8]
+//
+// --a8 times the A8 alone (the standalone groups and the fused producers), not the body.
 
 #include "dense_prefill_internal.cuh"
 #include "trellis_test_common.h"
+
+#include "ninfer/ops/rmsnorm.h"
 
 #include <cuda_runtime.h>
 
@@ -226,6 +235,86 @@ double time_a8(const A8Group &g, uint32_t tokens, cudaStream_t stream) {
   return time_us([&](int) { TL_RC(ignis_dense_prefill_quantize(x.p, tokens, wl.data(), g.matrices, a.data(), stream)); }, stream);
 }
 
+// GitHub #511: A8 fused into its producers, per chunk. A norm group's A8 after the fusion is the
+// fused RMSnorm less the vendored rmsnorm it replaces (h written for the GDN group alone, whose
+// gating projection reads it); down's is what keeping the block maxima adds to up's SwiGLU pass,
+// plus the light second pass. The output projections' A8 (in 6144) stays standalone.
+struct FusedA8 {
+  double norms = 0, maxima = 0, second = 0;  // us per chunk over the 64 layers
+};
+
+FusedA8 time_fused_a8(uint32_t tokens, cudaStream_t stream) {
+  constexpr uint32_t kHidden = 5120, kFfn = 17408;
+  FusedA8 f;
+  std::vector<uint16_t> suh(kFfn), xh(static_cast<size_t>(tokens) * kHidden), norm(kHidden);
+  for (uint32_t k = 0; k < kFfn; ++k) suh[k] = moe_test::f32_to_f16(k % 3 == 0 ? -0.04f : 0.05f);
+  for (size_t i = 0; i < xh.size(); ++i) xh[i] = moe_test::f32_to_bf16(moe_test::hash_uniform(7, i, 1.5f));
+  for (uint32_t k = 0; k < kHidden; ++k) norm[k] = moe_test::f32_to_bf16(moe_test::hash_uniform(8, k, 0.5f));
+  DeviceBytes d_suh(2ull * kFfn), x(2ull * xh.size()), h(2ull * xh.size()), d_norm(2ull * kHidden);
+  upload(d_suh, suh);
+  upload(x, xh);
+  upload(d_norm, norm);
+  struct Norm {
+    const char *name;
+    uint32_t matrices;
+    bool h;
+    int layers;
+  };
+  const Norm groups[] = {{"gdn qkv, z", 2, true, 48}, {"gqa q, k, v", 3, false, 16}, {"mlp gate, up", 2, false, 64}};
+  std::vector<DeviceBytes> mem;
+  // Only suh and the shape of a matrix are read by A8.
+  const ignis_trellis_weight w{d_suh.p, d_suh.p, d_suh.p, 6, kHidden, 128, 0};
+  std::vector<ignis_dense_prefill_activations> a(3);
+  for (int i = 0; i < 3; ++i) {
+    mem.emplace_back(static_cast<size_t>(tokens) * kHidden);
+    void *q = mem.back().p;
+    mem.emplace_back(8ull * tokens);
+    a[i] = ignis_dense_prefill_activations{q, static_cast<float *>(mem.back().p),
+                                           reinterpret_cast<int32_t *>(static_cast<char *>(mem.back().p) + 4ull * tokens)};
+  }
+  const ignis_trellis_weight *wl[3] = {&w, &w, &w};
+  const ninfer::Tensor xt(x.p, ninfer::DType::BF16, {static_cast<int32_t>(kHidden), static_cast<int32_t>(tokens), 1, 1});
+  const ninfer::Tensor nt(d_norm.p, ninfer::DType::BF16, {static_cast<int32_t>(kHidden), 1, 1, 1});
+  ninfer::Tensor ht(h.p, ninfer::DType::BF16, {static_cast<int32_t>(kHidden), static_cast<int32_t>(tokens), 1, 1});
+  const double rms = time_us([&](int) { ninfer::ops::rmsnorm(xt, nt, 1e-6f, true, ht, stream); }, stream);
+  for (const Norm &g : groups) {
+    const double fused = time_us([&](int) {
+      TL_RC(ignis_dense_prefill_rmsnorm_quantize(x.p, d_norm.p, 1e-6f, tokens, g.h ? h.p : nullptr, wl, g.matrices, a.data(),
+                                                 stream));
+    }, stream);
+    std::printf("  fused A8 %-15s RMSnorm with A8 %7.1f us - RMSnorm %7.1f = A8 %7.1f us x %d layers\n", g.name, fused, rms,
+                fused - rms, g.layers);
+    f.norms += (fused - rms) * g.layers;
+  }
+  // Up's SwiGLU pass of [17408 x 5120], plain and keeping down's block maxima, and down's second pass.
+  const Shape s{"mlp up", kHidden, kFfn, 6, 0};
+  Pool pool;
+  make_pool(pool, s);
+  DeviceBytes dense(static_cast<uint64_t>(kHidden) * kFfn), hf(2ull * tokens * kFfn), amax(4ull * tokens * (kFfn / 128));
+  DeviceBytes dq(static_cast<size_t>(tokens) * kFfn), dscale(8ull * tokens);
+  const ignis_dense_prefill_activations ad{dq.p, dscale.as<float>(),
+                                           reinterpret_cast<int32_t *>(static_cast<char *>(dscale.p) + 4ull * tokens)};
+  TL_RC(ignis_dense_prefill_quantize(x.p, tokens, wl, 1, a.data(), stream));
+  TL_RC(ignis_dense_prefill_decode(&pool.w[0], dense.p, dense.bytes, stream));
+  MOE_CUDA(cudaMemsetAsync(hf.p, 0, hf.bytes, stream));
+  const ignis_trellis_weight down{d_suh.p, d_suh.p, d_suh.p, 6, kFfn, kHidden, 0};
+  const ignis_dense_prefill_output plain{hf.p, kFfn, IGNIS_DENSE_PREFILL_SWIGLU_UP, 0, 0, nullptr};
+  const ignis_dense_prefill_output kept{hf.p, kFfn, IGNIS_DENSE_PREFILL_SWIGLU_UP, 0, 0, nullptr, d_suh.p, amax.as<float>()};
+  const double up_plain =
+      time_us([&](int) { TL_RC(ignis_dense_prefill_gemm(&pool.w[0], dense.p, &a[0], tokens, &plain, stream)); }, stream);
+  const double up_kept =
+      time_us([&](int) { TL_RC(ignis_dense_prefill_gemm(&pool.w[0], dense.p, &a[0], tokens, &kept, stream)); }, stream);
+  const double second = time_us([&](int) {
+    TL_RC(ignis_dense_prefill_quantize_blocks(hf.p, tokens, &down, amax.as<float>(), &ad, stream));
+  }, stream);
+  std::printf("  fused A8 mlp down        up's SwiGLU pass %8.1f us, keeping the maxima %8.1f (+%.1f); second pass %7.1f us "
+              "x 64 layers\n",
+              up_plain, up_kept, up_kept - up_plain, second);
+  f.maxima = (up_kept - up_plain) * 64;
+  f.second = second * 64;
+  return f;
+}
+
 std::vector<uint32_t> parse_list(const char *s) {
   std::vector<uint32_t> v;
   for (const char *p = s; *p != '\0';) {
@@ -240,14 +329,15 @@ std::vector<uint32_t> parse_list(const char *s) {
 
 int main(int argc, char **argv) {
   std::vector<uint32_t> widths = {2048, 4096};
-  bool sweep = false;
+  bool sweep = false, a8_only = false;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) widths = parse_list(argv[++i]);
     else if (std::strcmp(argv[i], "--reps") == 0 && i + 1 < argc) g_reps = std::atoi(argv[++i]);
     else if (std::strcmp(argv[i], "--inner") == 0 && i + 1 < argc) g_inner = std::atoi(argv[++i]);
     else if (std::strcmp(argv[i], "--sweep") == 0) sweep = true;
+    else if (std::strcmp(argv[i], "--a8") == 0) a8_only = true;
     else {
-      std::fprintf(stderr, "usage: %s [--tokens 2048,4096] [--reps 5] [--inner 32] [--sweep]\n", argv[0]);
+      std::fprintf(stderr, "usage: %s [--tokens 2048,4096] [--reps 5] [--inner 32] [--sweep] [--a8]\n", argv[0]);
       return 2;
     }
   }
@@ -266,22 +356,33 @@ int main(int argc, char **argv) {
   MOE_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   for (const uint32_t tokens : widths) {
     std::printf("== chunk of %u tokens (us per call; gate+up is the pair)\n", tokens);
-    double decode = 0, gemm = 0, dense = 0, fused = 0, a8 = 0;
-    for (const MixEntry &e : kMix) {
-      const Times t = time_entry(e.shape, tokens, sweep, st, stream);
-      decode += t.decode * e.calls;
-      gemm += t.gemm * e.calls;
-      dense += t.dense * e.calls;
-      fused += t.fused * e.calls;
+    double decode = 0, gemm = 0, dense = 0, fused = 0, a8 = 0, a8_output = 0;
+    if (!a8_only) {
+      for (const MixEntry &e : kMix) {
+        const Times t = time_entry(e.shape, tokens, sweep, st, stream);
+        decode += t.decode * e.calls;
+        gemm += t.gemm * e.calls;
+        dense += t.dense * e.calls;
+        fused += t.fused * e.calls;
+      }
     }
     for (const A8Group &g : kA8) {
       const double us = time_a8(g, tokens, stream);
       std::printf("  A8 %-18s in %5u, %u matrix(es): %7.1f us x %d layers\n", g.name, g.in, g.matrices, us, g.layers);
       a8 += us * g.layers;
+      if (g.in == 6144) a8_output += us * g.layers;
     }
-    std::printf("chunk of %u tokens, the 64-layer body at the quant's K mix (ms): decode %.2f + GEMM %.2f (alone) | "
-                "dense (decode then GEMM) %.2f + A8 %.2f = %.2f | fused %.2f | fused / dense %.3f\n",
-                tokens, decode / 1e3, gemm / 1e3, dense / 1e3, a8 / 1e3, (dense + a8) / 1e3, fused / 1e3, fused / (dense + a8));
+    const FusedA8 f = time_fused_a8(tokens, stream);
+    const double a8_fused = f.norms + f.maxima + f.second + a8_output;
+    if (!a8_only) {
+      std::printf("chunk of %u tokens, the 64-layer body at the quant's K mix (ms): decode %.2f + GEMM %.2f (alone) | "
+                  "dense (decode then GEMM) %.2f + A8 %.2f = %.2f | fused %.2f | fused / dense %.3f\n",
+                  tokens, decode / 1e3, gemm / 1e3, dense / 1e3, a8 / 1e3, (dense + a8) / 1e3, fused / 1e3, fused / (dense + a8));
+    }
+    std::printf("chunk of %u tokens, the 64-layer body's A8 (ms): before the fusion %.3f (standalone, every group) | after "
+                "%.3f = the norms' %.3f + down's maxima %.3f + down's second pass %.3f + the output projections' %.3f "
+                "(standalone)\n",
+                tokens, a8 / 1e3, a8_fused / 1e3, f.norms / 1e3, f.maxima / 1e3, f.second / 1e3, a8_output / 1e3);
   }
   MOE_CUDA(cudaStreamDestroy(stream));
   return 0;

@@ -16,6 +16,13 @@
 //            residual add, SwiGLU's two passes and the query/gate split.
 //   shared workspace  the fused op's decode route on the workspace a dense call used gives its
 //            fresh workspace's bits: the dense call leaves the fused op's counters alone.
+//   fused producers (GitHub #511)  A8 fused into the kernels that produce its input, against the
+//            standalone A8 on the same inputs, bit for bit: the RMSnorm's row against the vendored
+//            rmsnorm's and its activations against the standalone A8 of that row, per matrix of
+//            the group; the SwiGLU epilogue's block maxima against a host rotation of the row it
+//            stored, at every tile plan, and the second pass's activations against the standalone
+//            A8 of that row; and the composed calls the engine runs (the norm with a group's
+//            projections, the whole MLP) against the unfused composition, every output bit.
 //   rejects  the arguments the ops refuse.
 //
 // Two arms. synthetic: counter-hash trellis words at every K class (2, 2.5, 3, 4, 5, 6) and every
@@ -29,6 +36,8 @@
 
 #include "dense_prefill_internal.cuh"
 #include "trellis_test_common.h"
+
+#include "ninfer/ops/rmsnorm.h"
 
 #include <cuda_runtime.h>
 
@@ -374,6 +383,15 @@ struct Artifact {
     m.upload_all();
     return true;
   }
+
+  // A 1-D BF16 tensor (a norm's weight).
+  bool vector(const std::string &name, std::vector<uint16_t> &v) const {
+    std::string format;
+    uint64_t offset = 0, n = 0, rest = 0;
+    if (!find(name, format, offset, n, rest) || format != "BF16" || n == 0 || rest != 0) return false;
+    v.resize(n);
+    return read(offset, 2 * n, v.data());
+  }
 };
 
 // ---- the checks ------------------------------------------------------------------------------
@@ -635,7 +653,285 @@ void check_group(const std::string &label, const std::vector<Matrix *> &g, const
   }
 }
 
+// ---- A8 fused into its producers (GitHub #511) -----------------------------------------------
+
+constexpr float kEps = 1e-6f;  // the 27B's rms_norm_eps
+
+// A norm's weight like a trained one's: the gain is 1 + w, w around 0.
+std::vector<uint16_t> standin_norm(int in, uint32_t seed) {
+  std::vector<uint16_t> v(in);
+  for (int k = 0; k < in; ++k) v[k] = moe_test::f32_to_bf16(moe_test::hash_uniform(seed, k, 0.6f));
+  return v;
+}
+
+// The vendored rmsnorm with a unit offset (ninfer::ops::rmsnorm) of x [tokens][in] into h.
+void vendored_rmsnorm(const void *x, const void *norm, int tokens, int in, void *h) {
+  const ninfer::Tensor xt(const_cast<void *>(x), ninfer::DType::BF16, {in, tokens, 1, 1});
+  const ninfer::Tensor nt(const_cast<void *>(norm), ninfer::DType::BF16, {in, 1, 1, 1});
+  ninfer::Tensor ht(h, ninfer::DType::BF16, {in, tokens, 1, 1});
+  ninfer::ops::rmsnorm(xt, nt, kEps, /*unit_offset=*/true, ht, nullptr);
+  MOE_CUDA(cudaDeviceSynchronize());
+}
+
+size_t differing(const std::vector<uint16_t> &a, const std::vector<uint16_t> &b) {
+  size_t d = 0;
+  for (size_t i = 0; i < a.size(); ++i) d += a[i] != b[i];
+  return d;
+}
+
+// The RMSnorm before a group of matrices fused with their A8: its row against the vendored
+// rmsnorm's, its activations against the standalone A8 of that row (and the host's), with h
+// written and without; then the composed call against the vendored rmsnorm followed by
+// ignis_dense_prefill_linear, every output bit.
+void check_norm_group(const std::string &label, const std::vector<Matrix *> &g, const std::vector<Out> &outs,
+                      const std::vector<uint16_t> &norm, int tokens, uint32_t seed) {
+  const int n = static_cast<int>(g.size());
+  const int in = static_cast<int>(g[0]->in);
+  std::printf("  %s: the RMSnorm with %d matrix(es)' A8, in %d, %d tokens\n", label.c_str(), n, in, tokens);
+  const std::vector<uint16_t> xh = standin_x(tokens, in, seed);
+  const size_t row_elems = static_cast<size_t>(tokens) * in;
+  DeviceBytes d_x(2 * row_elems), d_norm(2ull * in), d_ref(2 * row_elems), d_h(2 * row_elems);
+  upload(d_x, xh);
+  upload(d_norm, norm);
+  vendored_rmsnorm(d_x.p, d_norm.p, tokens, in, d_ref.p);
+  const std::vector<uint16_t> href = download<uint16_t>(d_ref.p, row_elems);
+
+  const ignis_trellis_weight *wl[IGNIS_DENSE_PREFILL_MAX_GROUP];
+  std::vector<DeviceA8> ref, fused, bare;
+  ref.reserve(n);
+  fused.reserve(n);
+  bare.reserve(n);
+  ignis_dense_prefill_activations ar[IGNIS_DENSE_PREFILL_MAX_GROUP], af[IGNIS_DENSE_PREFILL_MAX_GROUP],
+      ab[IGNIS_DENSE_PREFILL_MAX_GROUP];
+  for (int i = 0; i < n; ++i) {
+    wl[i] = &g[i]->w;
+    ref.emplace_back(tokens, in);
+    fused.emplace_back(tokens, in);
+    bare.emplace_back(tokens, in);
+    ar[i] = ref[i].a;
+    af[i] = fused[i].a;
+    ab[i] = bare[i].a;
+  }
+  TL_RC(ignis_dense_prefill_quantize(d_ref.p, static_cast<uint32_t>(tokens), wl, static_cast<uint32_t>(n), ar, nullptr));
+  MOE_CUDA(cudaMemset(d_h.p, 0xFF, d_h.bytes));
+  TL_RC(ignis_dense_prefill_rmsnorm_quantize(d_x.p, d_norm.p, kEps, static_cast<uint32_t>(tokens), d_h.p, wl,
+                                             static_cast<uint32_t>(n), af, nullptr));
+  TL_RC(ignis_dense_prefill_rmsnorm_quantize(d_x.p, d_norm.p, kEps, static_cast<uint32_t>(tokens), nullptr, wl,
+                                             static_cast<uint32_t>(n), ab, nullptr));
+  MOE_CUDA(cudaDeviceSynchronize());
+  const size_t rows = differing(download<uint16_t>(d_h.p, row_elems), href);
+  std::printf("    the fused RMSnorm's row against the vendored rmsnorm's: %zu of %zu values differ\n", rows, row_elems);
+  check(rows == 0, label + ": the fused RMSnorm's row is the vendored rmsnorm's bit for bit");
+  for (int i = 0; i < n; ++i) {
+    const A8 want = ref[i].fetch(tokens, in);
+    const A8 got = fused[i].fetch(tokens, in);
+    size_t values = 0, scales = 0, sums = 0;
+    for (size_t k = 0; k < got.q.size(); ++k) values += got.q[k] != want.q[k];
+    for (int t = 0; t < tokens; ++t) {
+      scales += std::memcmp(&got.scale[t], &want.scale[t], 4) != 0;
+      sums += got.sum[t] != want.sum[t];
+    }
+    std::printf("    %s: the fused A8 against the standalone A8 of the row: %zu of %zu values, %zu scales, %zu sums differ\n",
+                g[i]->name.c_str(), values, got.q.size(), scales, sums);
+    check(values == 0 && scales == 0 && sums == 0, label + ": " + g[i]->name + ": the fused A8 is the standalone A8's bit for bit");
+    check(same_a8(want, host_a8(href, g[i]->suh, tokens, in)), label + ": " + g[i]->name + ": the standalone A8 of the row is the host's");
+    check(same_a8(bare[i].fetch(tokens, in), want), label + ": " + g[i]->name + ": the fused A8 without h is the same");
+  }
+
+  // The composed call against the unfused composition.
+  uint64_t dense_bytes = 0;
+  for (const Matrix *m : g) dense_bytes = std::max<uint64_t>(dense_bytes, ignis_dense_prefill_weight_bytes(m->in, m->out));
+  DeviceBytes d_dense(dense_bytes);
+  const uint64_t ws_bytes = ignis_dense_prefill_workspace_bytes(static_cast<uint32_t>(in), static_cast<uint32_t>(n),
+                                                                static_cast<uint32_t>(tokens));
+  DeviceBytes d_ws(ws_bytes);
+  const ignis_trellis_workspace ws{d_ws.p, ws_bytes};
+  std::vector<DeviceBytes> y_ref, y2_ref, y_got, y2_got;
+  std::vector<ignis_dense_prefill_output> o_ref(n), o_got(n);
+  for (int i = 0; i < n; ++i) {
+    const uint32_t width = outs[i].split == 0 ? g[i]->out : g[i]->out / 2;
+    const size_t elems = static_cast<size_t>(tokens) * width;
+    // The same start in both: a residual under an add, else NaN (a column the call misses fails).
+    std::vector<uint16_t> start(elems, 0xFFFF);
+    if (outs[i].epilogue == IGNIS_TRELLIS_ADD) {
+      for (size_t k = 0; k < elems; ++k) start[k] = moe_test::f32_to_bf16(moe_test::hash_uniform(seed + 5, k, 0.8f));
+    }
+    y_ref.emplace_back(2 * elems);
+    y_got.emplace_back(2 * elems);
+    upload(y_ref.back(), start);
+    upload(y_got.back(), start);
+    y2_ref.emplace_back(outs[i].split != 0 ? 2 * elems : 0);
+    y2_got.emplace_back(outs[i].split != 0 ? 2 * elems : 0);
+    if (outs[i].split != 0) {
+      upload(y2_ref.back(), start);
+      upload(y2_got.back(), start);
+    }
+    o_ref[i] = ignis_dense_prefill_output{y_ref[i].p, width, outs[i].epilogue, outs[i].split, 0, y2_ref[i].p};
+    o_got[i] = ignis_dense_prefill_output{y_got[i].p, width, outs[i].epilogue, outs[i].split, 0, y2_got[i].p};
+  }
+  TL_RC(ignis_dense_prefill_linear(wl, static_cast<uint32_t>(n), d_ref.p, static_cast<uint32_t>(tokens), o_ref.data(), &ws,
+                                   d_dense.p, dense_bytes, nullptr));
+  MOE_CUDA(cudaMemset(d_h.p, 0xFF, d_h.bytes));
+  TL_RC(ignis_dense_prefill_norm_linear(wl, static_cast<uint32_t>(n), d_x.p, d_norm.p, kEps, static_cast<uint32_t>(tokens),
+                                        d_h.p, o_got.data(), &ws, d_dense.p, dense_bytes, nullptr));
+  MOE_CUDA(cudaDeviceSynchronize());
+  check(differing(download<uint16_t>(d_h.p, row_elems), href) == 0, label + ": the composed call's row is the vendored rmsnorm's");
+  for (int i = 0; i < n; ++i) {
+    const size_t elems = y_ref[i].bytes / 2;
+    size_t d = differing(download<uint16_t>(y_got[i].p, elems), download<uint16_t>(y_ref[i].p, elems));
+    if (outs[i].split != 0) d += differing(download<uint16_t>(y2_got[i].p, elems), download<uint16_t>(y2_ref[i].p, elems));
+    std::printf("    %s: the composed call's output against the vendored rmsnorm then the dense linear: %zu differ\n",
+                g[i]->name.c_str(), d);
+    check(d == 0, label + ": " + g[i]->name + ": the norm's composed call gives the unfused output bit for bit");
+  }
+}
+
+// The host's first A8 pass of a row the SwiGLU stored: per token and 128-block, max |v| of the
+// block rotated by suh, in the kernel's fp32 operations.
+std::vector<float> host_block_amax(const std::vector<uint16_t> &x, const std::vector<uint16_t> &suh, int tokens, int in) {
+  std::vector<float> amax(static_cast<size_t>(tokens) * (in / 128));
+  float v[128];
+  for (int t = 0; t < tokens; ++t)
+    for (int b = 0; b < in / 128; ++b) {
+      for (int i = 0; i < 128; ++i) {
+        const int k = 128 * b + i;
+        v[i] = moe_test::bf16_to_f32(x[static_cast<size_t>(t) * in + k]) * moe_test::f16_to_f32(suh[k]);
+      }
+      host_hadamard128(v);
+      float m = 0.0f;
+      for (int i = 0; i < 128; ++i) m = std::fmax(m, std::fabs(v[i]));
+      amax[static_cast<size_t>(t) * (in / 128) + b] = m;
+    }
+  return amax;
+}
+
+// The MLP of gate, up and down with every A8 fused: the up pass's epilogue keeping down's block
+// maxima at every tile plan (its stored row unchanged, the maxima the host's, the second pass's
+// activations the standalone A8's of the row), then the composed call against the vendored
+// rmsnorm, ignis_dense_prefill_linear over gate and up, and over down, every bit of h and y.
+void check_mlp(const std::string &label, Matrix &gate, Matrix &up, Matrix &down, const std::vector<uint16_t> &norm, int tokens,
+               uint32_t seed) {
+  const int in = static_cast<int>(gate.in), ffn = static_cast<int>(gate.out);
+  std::printf("  %s: the MLP with its A8 fused, in %d, ffn %d, %d tokens\n", label.c_str(), in, ffn, tokens);
+  const std::vector<uint16_t> xh = standin_x(tokens, in, seed);
+  DeviceBytes d_x(xh.size() * 2), d_norm(2ull * in), d_post(xh.size() * 2);
+  upload(d_x, xh);
+  upload(d_norm, norm);
+  vendored_rmsnorm(d_x.p, d_norm.p, tokens, in, d_post.p);
+  const ignis_trellis_weight *gu[2] = {&gate.w, &up.w};
+  DeviceA8 ag(tokens, in), au(tokens, in);
+  const ignis_dense_prefill_activations a2[2] = {ag.a, au.a};
+  TL_RC(ignis_dense_prefill_quantize(d_post.p, static_cast<uint32_t>(tokens), gu, 2, a2, nullptr));
+  DeviceBytes d_dense(std::max(ignis_dense_prefill_weight_bytes(gate.in, gate.out), ignis_dense_prefill_weight_bytes(down.in, down.out)));
+  const size_t h_elems = static_cast<size_t>(tokens) * ffn;
+  DeviceBytes d_href(2 * h_elems), d_h(2 * h_elems), d_amax(4ull * tokens * (ffn / 128));
+  // The reference row: gate's store, then up's SwiGLU pass, no maxima kept.
+  TL_RC(ignis_dense_prefill_decode(&gate.w, d_dense.p, d_dense.bytes, nullptr));
+  const ignis_dense_prefill_output og{d_href.p, gate.out, IGNIS_TRELLIS_STORE, 0, 0, nullptr};
+  TL_RC(ignis_dense_prefill_gemm(&gate.w, d_dense.p, &ag.a, static_cast<uint32_t>(tokens), &og, nullptr));
+  MOE_CUDA(cudaDeviceSynchronize());
+  const std::vector<uint16_t> gate_row = download<uint16_t>(d_href.p, h_elems);
+  TL_RC(ignis_dense_prefill_decode(&up.w, d_dense.p, d_dense.bytes, nullptr));
+  const ignis_dense_prefill_output ou{d_href.p, up.out, IGNIS_DENSE_PREFILL_SWIGLU_UP, 0, 0, nullptr};
+  TL_RC(ignis_dense_prefill_gemm(&up.w, d_dense.p, &au.a, static_cast<uint32_t>(tokens), &ou, nullptr));
+  MOE_CUDA(cudaDeviceSynchronize());
+  const std::vector<uint16_t> href = download<uint16_t>(d_href.p, h_elems);
+  DeviceA8 aref(tokens, ffn);
+  const ignis_trellis_weight *dl[1] = {&down.w};
+  TL_RC(ignis_dense_prefill_quantize(d_href.p, static_cast<uint32_t>(tokens), dl, 1, &aref.a, nullptr));
+  const A8 want = aref.fetch(tokens, ffn);
+  check(same_a8(want, host_a8(href, down.suh, tokens, ffn)), label + ": down's standalone A8 of the row is the host's");
+  const std::vector<float> amax_host = host_block_amax(href, down.suh, tokens, ffn);
+
+  // Up's pass keeping the maxima, at every tile plan, over the gate's stored row.
+  int plans = 0;
+  for (const int bm : ignis_dense::kTileHeights)
+    for (const int stages : ignis_dense::kDepths)
+      for (const int raster : {ignis_dense::kTokensFastest, ignis_dense::kOutputsFastest}) {
+        ignis_dense::Plan p;
+        p.bm = bm;
+        p.stages = stages;
+        p.raster = raster;
+        const std::string at = label + ": BM " + std::to_string(bm) + ", " + std::to_string(stages) + " stages, raster " +
+                               std::to_string(raster);
+        upload(d_h, gate_row);
+        MOE_CUDA(cudaMemset(d_amax.p, 0xFF, d_amax.bytes));
+        const ignis_dense_prefill_output ok{d_h.p, up.out, IGNIS_DENSE_PREFILL_SWIGLU_UP, 0, 0, nullptr, down.w.suh, d_amax.as<float>()};
+        TL_RC(ignis_dense::gemm_at("test", p, &up.w, d_dense.p, &au.a, static_cast<uint32_t>(tokens), &ok, nullptr, 0, nullptr));
+        MOE_CUDA(cudaDeviceSynchronize());
+        check(differing(download<uint16_t>(d_h.p, h_elems), href) == 0, at + ": the SwiGLU row is the one stored without the maxima");
+        const std::vector<float> amax = download<float>(d_amax.p, amax_host.size());
+        check(std::memcmp(amax.data(), amax_host.data(), 4 * amax.size()) == 0, at + ": the block maxima are the host's bit for bit");
+        DeviceA8 got(tokens, ffn);
+        TL_RC(ignis_dense_prefill_quantize_blocks(d_h.p, static_cast<uint32_t>(tokens), &down.w, d_amax.as<float>(), &got.a, nullptr));
+        check(same_a8(got.fetch(tokens, ffn), want), at + ": down's activations from the maxima are the standalone A8's bit for bit");
+        ++plans;
+      }
+  std::printf("    up's SwiGLU pass keeping down's block maxima at %d tile plans: the row, the maxima and down's A8 checked\n", plans);
+
+  // The composed MLP against the unfused composition, from the residual.
+  std::vector<uint16_t> residual(static_cast<size_t>(tokens) * in);
+  for (size_t k = 0; k < residual.size(); ++k) residual[k] = moe_test::f32_to_bf16(moe_test::hash_uniform(seed + 9, k, 0.8f));
+  DeviceBytes y_ref(2ull * tokens * in), y_got(2ull * tokens * in);
+  upload(y_ref, residual);
+  upload(y_got, residual);
+  const uint64_t ws_ref_bytes = std::max(ignis_dense_prefill_workspace_bytes(gate.in, 2, static_cast<uint32_t>(tokens)),
+                                         ignis_dense_prefill_workspace_bytes(down.in, 1, static_cast<uint32_t>(tokens)));
+  const uint64_t ws_bytes = ignis_dense_prefill_mlp_workspace_bytes(gate.in, gate.out, static_cast<uint32_t>(tokens));
+  check(ws_bytes >= ws_ref_bytes, label + ": the MLP's workspace holds the unfused calls'");
+  DeviceBytes d_ws(ws_bytes);
+  const ignis_trellis_workspace ws{d_ws.p, ws_bytes};
+  // Unfused: the norm of the residual, gate and up into h, down added into y.
+  vendored_rmsnorm(y_ref.p, d_norm.p, tokens, in, d_post.p);
+  const ignis_dense_prefill_output o2[2] = {ignis_dense_prefill_output{d_href.p, gate.out, IGNIS_TRELLIS_STORE, 0, 0, nullptr},
+                                            ignis_dense_prefill_output{d_href.p, gate.out, IGNIS_DENSE_PREFILL_SWIGLU_UP, 0, 0, nullptr}};
+  TL_RC(ignis_dense_prefill_linear(gu, 2, d_post.p, static_cast<uint32_t>(tokens), o2, &ws, d_dense.p, d_dense.bytes, nullptr));
+  const ignis_dense_prefill_output od{y_ref.p, gate.in, IGNIS_TRELLIS_ADD, 0, 0, nullptr};
+  TL_RC(ignis_dense_prefill_linear(dl, 1, d_href.p, static_cast<uint32_t>(tokens), &od, &ws, d_dense.p, d_dense.bytes, nullptr));
+  // Fused, y the residual itself as the engine runs it.
+  MOE_CUDA(cudaMemset(d_h.p, 0xFF, d_h.bytes));
+  TL_RC(ignis_dense_prefill_norm_mlp(&gate.w, &up.w, &down.w, y_got.p, d_norm.p, kEps, static_cast<uint32_t>(tokens), d_h.p,
+                                     y_got.p, gate.in, &ws, d_dense.p, d_dense.bytes, nullptr));
+  MOE_CUDA(cudaDeviceSynchronize());
+  const size_t dh = differing(download<uint16_t>(d_h.p, h_elems), download<uint16_t>(d_href.p, h_elems));
+  const size_t dy = differing(download<uint16_t>(y_got.p, residual.size()), download<uint16_t>(y_ref.p, residual.size()));
+  check(download<uint16_t>(y_ref.p, residual.size()) != residual, label + ": down's add moved the residual");
+  std::printf("    the composed MLP against the unfused one: %zu of %zu SwiGLU values, %zu of %zu residual values differ\n", dh,
+              h_elems, dy, residual.size());
+  check(dh == 0 && dy == 0, label + ": the composed MLP gives the unfused SwiGLU row and residual bit for bit");
+}
+
 // ---- the arms --------------------------------------------------------------------------------
+
+void fused_producers_arm() {
+  std::printf("fused producers: A8 in the RMSnorm and in the SwiGLU epilogue, against the standalone A8\n");
+  // The norm's widths: 4096 and 8192 bracket the 27B's 5120, a group of every size.
+  {
+    Matrix a = synthetic(6, 4096, 384, 7000);
+    check_norm_group("synthetic in 4096", {&a}, {Out{}}, standin_norm(4096, 81), 300, 82);
+  }
+  {
+    Matrix q = synthetic(4, 5120, 512, 7010), k = synthetic(8, 5120, 256, 7020), v = synthetic(12, 5120, 128, 7030);
+    check_norm_group("synthetic q, k, v at in 5120", {&q, &k, &v},
+                     {Out{IGNIS_TRELLIS_STORE, 128}, Out{IGNIS_TRELLIS_STORE, 0}, Out{IGNIS_TRELLIS_STORE, 0}},
+                     standin_norm(5120, 83), 270, 84);
+  }
+  {
+    Matrix a = synthetic(5, 8192, 256, 7040), b = synthetic(10, 8192, 128, 7050);
+    check_norm_group("synthetic pair at in 8192", {&a, &b}, {Out{}, Out{IGNIS_TRELLIS_ADD, 0}}, standin_norm(8192, 85), 130, 86);
+  }
+  // The MLP at down's two A8 widths: up to 6144 (the register-resident A8) and past it (two passes).
+  for (const uint32_t ffn : {768u, 6400u}) {
+    Matrix gate = synthetic(6, 4096, ffn, 7100 + ffn), up = synthetic(8, 4096, ffn, 7110 + ffn),
+           down = synthetic(4, ffn, 4096, 7120 + ffn);
+    check_mlp("synthetic MLP, ffn " + std::to_string(ffn), gate, up, down, standin_norm(4096, 87), 300, 88);
+  }
+  check(ignis_dense_prefill_fused_producers() == 1, "the fused producers are the default");
+  ignis_dense_prefill_set_fused_producers(0);
+  check(ignis_dense_prefill_fused_producers() == 0, "the switch turns the fused producers off");
+  ignis_dense_prefill_set_fused_producers(7);
+  check(ignis_dense_prefill_fused_producers() == 1, "the switch turns them back on");
+}
 
 void synthetic_arm() {
   std::printf("synthetic: counter-hash words at every K class\n");
@@ -720,6 +1016,39 @@ void artifact_arm() {
     if (load("text/layers/3/mlp/down", down)) check_group("layer 3 down", {&down}, {Out{IGNIS_TRELLIS_ADD, 0}}, tokens, 64, step);
     if (load("text/layers/3/attention/output", o)) check_group("layer 3 output", {&o}, {Out{IGNIS_TRELLIS_ADD, 0}}, tokens, 65, step);
   }
+  // GitHub #511: the fused producers on real matrices after their real norms.
+  auto norm = [&](const std::string &name, std::vector<uint16_t> &v) {
+    const bool ok = art.vector(name, v);
+    check(ok, "artifact: " + name + " is a BF16 vector of the artifact");
+    return ok;
+  };
+  {
+    // Layer 1's GDN projections after its input norm.
+    Matrix qkv, z;
+    std::vector<uint16_t> n;
+    if (load("text/layers/1/gdn/in_proj_qkv", qkv) && load("text/layers/1/gdn/in_proj_z", z) &&
+        norm("text/layers/1/input_norm", n)) {
+      check_norm_group("layer 1 input norm, qkv and z", {&qkv, &z}, {Out{}, Out{}}, n, tokens, 66);
+    }
+  }
+  {
+    // Layer 3's attention projections after its input norm, the query and gate split.
+    Matrix q, k, v;
+    std::vector<uint16_t> n;
+    if (load("text/layers/3/attention/q_proj", q) && load("text/layers/3/attention/k_proj", k) &&
+        load("text/layers/3/attention/v_proj", v) && norm("text/layers/3/input_norm", n)) {
+      check_norm_group("layer 3 input norm, q, k and v", {&q, &k, &v}, {Out{IGNIS_TRELLIS_STORE, 256}, Out{}, Out{}}, n, tokens, 67);
+    }
+  }
+  {
+    // Layer 0's MLP after its post-attention norm: down's 17408 inputs.
+    Matrix gate, up, down;
+    std::vector<uint16_t> n;
+    if (load("text/layers/0/mlp/gate_proj", gate) && load("text/layers/0/mlp/up_proj", up) &&
+        load("text/layers/0/mlp/down", down) && norm("text/layers/0/post_attention_norm", n)) {
+      check_mlp("layer 0 MLP", gate, up, down, n, tokens, 68);
+    }
+  }
 }
 
 void shared_workspace_arm() {
@@ -796,6 +1125,47 @@ void rejects_arm() {
   check(ignis_dense_prefill_workspace_bytes(256, 4, 8) == 0, "a workspace query for four matrices answers 0");
   check(ignis_dense_prefill_weight_bytes(256, 100) == 0, "a dense size at out = 100 answers 0");
   check(ignis_dense_prefill_weight_bytes(5120, 17408) == 5120ull * 17408, "the dense copy of [17408 x 5120] is 89,128,960 bytes");
+
+  // GitHub #511's ops.
+  Matrix n2048 = synthetic(6, 2048, 128, 6020), n5248 = synthetic(6, 5248, 128, 6030), n4096 = synthetic(6, 4096, 128, 6040);
+  DeviceBytes nx(2ull * tokens * 5248), nw(2ull * 5248);
+  DeviceA8 na(tokens, 5248);
+  const ignis_trellis_weight *w2048[1] = {&n2048.w}, *w5248[1] = {&n5248.w}, *w4096[1] = {&n4096.w};
+  check(ignis_dense_prefill_rmsnorm_quantize(nx.p, nw.p, kEps, tokens, nullptr, w2048, 1, &na.a, nullptr) != 0,
+        "the fused RMSnorm refuses in = 2048, below the vendored wide-row form");
+  check(ignis_dense_prefill_rmsnorm_quantize(nx.p, nw.p, kEps, tokens, nullptr, w5248, 1, &na.a, nullptr) != 0,
+        "the fused RMSnorm refuses in = 5248, no multiple of 1024");
+  check(ignis_dense_prefill_rmsnorm_quantize(nx.p, nw.p, 0.0f, tokens, nullptr, w4096, 1, &na.a, nullptr) != 0,
+        "the fused RMSnorm refuses eps = 0");
+  check(ignis_dense_prefill_rmsnorm_quantize(nx.p, nw.p, NAN, tokens, nullptr, w4096, 1, &na.a, nullptr) != 0,
+        "the fused RMSnorm refuses eps = NaN");
+  check(ignis_dense_prefill_rmsnorm_quantize(nx.p, nw.p, kEps, 0, nullptr, w4096, 1, &na.a, nullptr) != 0,
+        "the fused RMSnorm refuses zero tokens");
+  check(ignis_dense_prefill_rmsnorm_quantize(static_cast<char *>(nx.p) + 2, nw.p, kEps, tokens, nullptr, w4096, 1, &na.a,
+                                             nullptr) != 0,
+        "the fused RMSnorm refuses an unaligned x");
+  DeviceBytes amax(4ull * tokens * 2);
+  o = ignis_dense_prefill_output{y.p, 256, IGNIS_TRELLIS_STORE, 0, 0, nullptr, nullptr, amax.as<float>()};
+  check(ignis_dense_prefill_gemm(&m.w, dense.p, &a.a, tokens, &o, nullptr) != 0, "block maxima without next_suh are refused");
+  o = ignis_dense_prefill_output{y.p, 128, IGNIS_TRELLIS_STORE, 128, 0, y2.p, m.w.suh, amax.as<float>()};
+  check(ignis_dense_prefill_gemm(&m.w, dense.p, &a.a, tokens, &o, nullptr) != 0, "block maxima under a split are refused");
+  check(ignis_dense_prefill_quantize_blocks(static_cast<char *>(x.p) + 2, tokens, &m.w, amax.as<float>(), &a.a, nullptr) != 0,
+        "the second pass refuses an unaligned x");
+  check(ignis_dense_prefill_mlp_workspace_bytes(100, 256, 8) == 0, "an MLP workspace query at in = 100 answers 0");
+  check(ignis_dense_prefill_mlp_workspace_bytes(5120, 17408, 1024) >
+            ignis_dense_prefill_workspace_bytes(17408, 1, 1024),
+        "the MLP's workspace is wider than down's alone: the block maxima sit past it");
+  Matrix up = synthetic(6, 4096, 256, 6050), down = synthetic(6, 256, 4096, 6060);
+  const uint64_t mlp_need = ignis_dense_prefill_mlp_workspace_bytes(4096, 256, tokens);
+  DeviceBytes mlp_ws(mlp_need), h(2ull * tokens * 256), resid(2ull * tokens * 4096), mlp_dense(4096 * 256);
+  const ignis_trellis_workspace mlp_short{mlp_ws.p, mlp_need - 1};
+  check(ignis_dense_prefill_norm_mlp(&up.w, &up.w, &down.w, resid.p, nw.p, kEps, tokens, h.p, resid.p, 4096, &mlp_short,
+                                     mlp_dense.p, mlp_dense.bytes, nullptr) != 0,
+        "an MLP workspace one byte short is refused");
+  const ignis_trellis_workspace mlp_full{mlp_ws.p, mlp_need};
+  check(ignis_dense_prefill_norm_mlp(&up.w, &up.w, &up.w, resid.p, nw.p, kEps, tokens, h.p, resid.p, 4096, &mlp_full,
+                                     mlp_dense.p, mlp_dense.bytes, nullptr) != 0,
+        "an MLP whose down does not read gate and up's output is refused");
 }
 
 }  // namespace
@@ -810,6 +1180,7 @@ int main() {
   TL_RC(ignis_trellis_prepare());
   TL_RC(ignis_dense_prefill_prepare());
   synthetic_arm();
+  fused_producers_arm();
   shared_workspace_arm();
   rejects_arm();
   artifact_arm();

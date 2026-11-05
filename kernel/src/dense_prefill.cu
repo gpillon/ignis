@@ -15,6 +15,14 @@
 //                                       cp.async stages, ldmatrix from XOR-swizzled 64-byte rows,
 //                                       8 warps of 64 x 64 (BM 256) or 64 x 32 (BM 128), int32
 //                                       accumulators over the whole K, the epilogue in fp32.
+// GitHub #511 fuses A8 into the kernels that produce its input, with two more:
+//   dense_prefill_rmsnorm_a8_kernel     one CTA per token: the RMSnorm before a block's first
+//                                       matrices (the vendored rmsnorm's arithmetic, bit for bit),
+//                                       then each matrix's A8 of the normalized row;
+//   dense_prefill_a8_blocks_kernel      one CTA per token: the second pass of an A8 whose block
+//                                       maxima the producing GEMM's epilogue kept (gate+up's,
+//                                       for down);
+// the GEMM's epilogue keeps those maxima on request.
 // None of them has a tensor-core form but the s8 x s8 -> s32 MMA (the full-rate rule of spec
 // #503); the SASS check of #512 holds them to it.
 
@@ -24,10 +32,17 @@
 #include "trellis_decode.cuh"
 #include "trellis_linear_internal.cuh"
 
+// The vendored rmsnorm's device helpers (block_reduce_sum and the offset epilogue), which the fused
+// RMSnorm restates; none of its kernels is instantiated here.
+#include "ops/kernel/rmsnorm.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -152,18 +167,22 @@ __device__ __forceinline__ uint32_t quantize4(const float (&v)[4], float to_q, i
   return (q[0] & 0xFF) | ((q[1] & 0xFF) << 8) | ((q[2] & 0xFF) << 16) | (static_cast<uint32_t>(q[3] & 0xFF) << 24);
 }
 
-// The token's amax from the warps' maxima (s_max[warp]), and the scale it gives: 127 / amax and
-// amax / 127, or 0 and 0 for a row of zeros or a non-finite one.
+// The token's amax from the CTA's `Warps` warps' maxima (s_max[warp]), and the scale it gives:
+// 127 / amax and amax / 127, or 0 and 0 for a row of zeros or a non-finite one. The max does not
+// depend on which warp held which block, so every A8 kernel below gives the same scale.
+template <int Warps>
 __device__ __forceinline__ void token_scale(const float *s_max, float &to_q, float &scale) {
   float amax = 0.0f;
 #pragma unroll
-  for (int i = 0; i < kWarps; ++i) amax = fmaxf(amax, s_max[i]);
+  for (int i = 0; i < Warps; ++i) amax = fmaxf(amax, s_max[i]);
   const bool finite = amax > 0.0f && amax <= 3.0e38f;
   to_q = finite ? 127.0f / amax : 0.0f;
   scale = finite ? amax * (1.0f / 127.0f) : 0.0f;
 }
 
-// The token's sum of q from each lane's `sum`, written with the scale by thread 0.
+// The token's sum of q from each lane's `sum` over the CTA's `Warps` warps, written with the scale
+// by thread 0 (an integer sum: the same whichever warp held which block).
+template <int Warps>
 __device__ __forceinline__ void token_sum(int sum, int *s_sum, const A8Target &m, int t, float scale) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -174,7 +193,7 @@ __device__ __forceinline__ void token_sum(int sum, int *s_sum, const A8Target &m
   if (threadIdx.x == 0) {
     int total = 0;
 #pragma unroll
-    for (int i = 0; i < kWarps; ++i) total += s_sum[i];
+    for (int i = 0; i < Warps; ++i) total += s_sum[i];
     m.scale[t] = scale;
     m.sum[t] = total;
   }
@@ -217,7 +236,7 @@ __global__ void __launch_bounds__(kThreads, 1) dense_prefill_a8_kernel(const __n
     if (lane == 0) s_max[mi][warp] = mx;
     __syncthreads();
     float to_q, scale;
-    token_scale(s_max[mi], to_q, scale);
+    token_scale<kWarps>(s_max[mi], to_q, scale);
     int sum = 0;
 #pragma unroll
     for (int j = 0; j < MAXB; ++j) {
@@ -226,7 +245,7 @@ __global__ void __launch_bounds__(kThreads, 1) dense_prefill_a8_kernel(const __n
         *reinterpret_cast<uint32_t *>(m.q + a_index(tokens, t, blk * 128 + 4 * lane)) = quantize4(v[j], to_q, sum);
       }
     }
-    token_sum(sum, s_sum[mi], m, t, scale);
+    token_sum<kWarps>(sum, s_sum[mi], m, t, scale);
   }
 }
 
@@ -255,14 +274,170 @@ __global__ void __launch_bounds__(kThreads) dense_prefill_a8_wide_kernel(const _
   if (lane == 0) s_max[warp] = mx;
   __syncthreads();
   float to_q, scale;
-  token_scale(s_max, to_q, scale);
+  token_scale<kWarps>(s_max, to_q, scale);
   int sum = 0;
   for (int blk = warp; blk < nb; blk += kWarps) {
     float v[4];
     rotated(blk, v);
     *reinterpret_cast<uint32_t *>(m.q + a_index(tokens, t, blk * 128 + 4 * lane)) = quantize4(v, to_q, sum);
   }
-  token_sum(sum, s_sum, m, t, scale);
+  token_sum<kWarps>(sum, s_sum, m, t, scale);
+}
+
+// ---- A8 fused into its producers (GitHub #511) -------------------------------------------------
+
+// The RMSnorm before a block's first matrices, with their A8: one CTA of 512 threads per token.
+// Its first half is the vendored rmsnorm's wide-row form restated operation for operation
+// (kernel/vendor/src/ops/kernel/rmsnorm.cuh, rmsnorm_cta_bf16x2_kernel<Offset, 512, 8, true>, what
+// ninfer's launcher runs for a unit-offset row of 3072 < in <= 8192, in % 1024 == 0): the same
+// pairs per thread in the same order, the same sum of squares, block_reduce_sum, rsqrtf and offset
+// epilogue, so its BF16 row is that kernel's bit for bit. The row stays in shared memory (and goes
+// to h when asked); the second half is dense_prefill_a8_kernel's per matrix of the group, from the
+// row: each 128-block through rotate4, the amax over the row, quantize4 and the sum. A block's
+// values do not depend on which warp holds it, nor the max and the integer sum on the order, so
+// the activations are the standalone A8's of h bit for bit.
+constexpr int kNormThreads = 512;
+constexpr int kNormWarps = kNormThreads / 32;
+constexpr int kNormMaxPairs = 8;     // the vendored form's pairs per thread
+constexpr int kNormRowBlocks = 4;    // the 128-blocks a warp holds: 16 x 4 x 128 = 8192 inputs
+constexpr uint32_t kNormMaxIn = 2 * kNormThreads * kNormMaxPairs;
+static_assert(kNormWarps * kNormRowBlocks * 128 == static_cast<int>(kNormMaxIn), "every block of the widest row has a warp");
+
+// The widths the fused RMSnorm takes: the vendored launcher's wide-row form's.
+bool norm_width(uint32_t in) { return in > 3072 && in <= kNormMaxIn && in % 1024 == 0; }
+
+__global__ void __launch_bounds__(kNormThreads, 2)
+    dense_prefill_rmsnorm_a8_kernel(const __nv_bfloat162 *x, const __nv_bfloat162 *norm, int d, float eps,
+                                    __nv_bfloat162 *h, int tokens, const __grid_constant__ A8Group g) {
+  __shared__ __align__(16) __nv_bfloat162 row[kNormMaxIn / 2];
+  __shared__ float warp_sums[kNormWarps];
+  __shared__ float inv_shared;
+  __shared__ float s_max[IGNIS_DENSE_PREFILL_MAX_GROUP][kNormWarps];
+  __shared__ int s_sum[IGNIS_DENSE_PREFILL_MAX_GROUP][kNormWarps];
+  const int t = blockIdx.x;
+  // The vendored form, its x and weight loads, sum of squares and epilogue, with the row kept.
+  const int pairs = d / 2;
+  const int pairs_per_thread = pairs / kNormThreads;
+  const std::int64_t row_base = static_cast<std::int64_t>(t) * pairs;
+  __nv_bfloat162 values[kNormMaxPairs];
+  __nv_bfloat162 weights[kNormMaxPairs];
+  float sum = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kNormMaxPairs; ++k) {
+    if (k < pairs_per_thread) {
+      const int pair = static_cast<int>(threadIdx.x) + k * kNormThreads;
+      values[k] = x[row_base + pair];
+      weights[k] = norm[pair];
+      const float2 xf = __bfloat1622float2(values[k]);
+      sum += xf.x * xf.x + xf.y * xf.y;
+    }
+  }
+  const float block_sum = ninfer::ops::block_reduce_sum<kNormThreads>(sum, warp_sums);
+  if (threadIdx.x == 0) { inv_shared = rsqrtf(block_sum / static_cast<float>(d) + eps); }
+  __syncthreads();
+  const float inv = inv_shared;
+#pragma unroll
+  for (int k = 0; k < kNormMaxPairs; ++k) {
+    if (k < pairs_per_thread) {
+      const int pair = static_cast<int>(threadIdx.x) + k * kNormThreads;
+      const float2 xf = __bfloat1622float2(values[k]);
+      const float2 wf = __bfloat1622float2(weights[k]);
+      const __nv_bfloat162 r =
+          __floats2bfloat162_rn(ninfer::ops::rmsnorm_epilogue<ninfer::ops::RmsEpilogue::Offset>(xf.x, inv, wf.x, 0.0f),
+                                ninfer::ops::rmsnorm_epilogue<ninfer::ops::RmsEpilogue::Offset>(xf.y, inv, wf.y, 0.0f));
+      row[pair] = r;
+      if (h != nullptr) h[row_base + pair] = r;
+    }
+  }
+  __syncthreads();
+  // dense_prefill_a8_kernel's A8 per matrix, warp w holding blocks w, w + 16, ...
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nb = d / 128;
+  const __nv_bfloat16 *rb = reinterpret_cast<const __nv_bfloat16 *>(row);
+#pragma unroll
+  for (int mi = 0; mi < IGNIS_DENSE_PREFILL_MAX_GROUP; ++mi) {
+    if (mi >= g.count) break;
+    const A8Target &m = g.m[mi];
+    float v[kNormRowBlocks][4];
+    float mx = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kNormRowBlocks; ++j) {
+      const int blk = warp + kNormWarps * j;
+      if (blk < nb) {
+        float xv[4];
+        ignis_tl::load_bf16x4(rb + blk * 128 + 4 * lane, xv);
+        rotate4(xv, m.suh + blk * 128 + 4 * lane, v[j]);
+        mx = fmaxf(mx, max4(v[j]));
+      }
+    }
+    mx = ignis_moe::warp_max(mx);
+    if (lane == 0) s_max[mi][warp] = mx;
+    __syncthreads();
+    float to_q, scale;
+    token_scale<kNormWarps>(s_max[mi], to_q, scale);
+    int qsum = 0;
+#pragma unroll
+    for (int j = 0; j < kNormRowBlocks; ++j) {
+      const int blk = warp + kNormWarps * j;
+      if (blk < nb) {
+        *reinterpret_cast<uint32_t *>(m.q + a_index(tokens, t, blk * 128 + 4 * lane)) = quantize4(v[j], to_q, qsum);
+      }
+    }
+    token_sum<kNormWarps>(qsum, s_sum[mi], m, t, scale);
+  }
+}
+
+// The light second pass of an A8 whose producer kept each 128-block's max (a GEMM epilogue's
+// block_amax, gate+up's for down): one CTA per token, the amax over the row from its block maxima
+// in place of dense_prefill_a8_wide_kernel's first pass, then that kernel's second pass, each
+// block of x rotated again and quantized. The maxima are rotate4's of the same BF16 values, so
+// the row is the standalone A8's bit for bit.
+__global__ void __launch_bounds__(kThreads) dense_prefill_a8_blocks_kernel(const __nv_bfloat16 *x, int tokens, int in,
+                                                                           const float *block_amax,
+                                                                           const __grid_constant__ A8Target m) {
+  __shared__ float s_max[kWarps];
+  __shared__ int s_sum[kWarps];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nb = in / 128;
+  const int t = blockIdx.x;
+  float mx = 0.0f;
+  for (int b = static_cast<int>(threadIdx.x); b < nb; b += kThreads) mx = fmaxf(mx, block_amax[static_cast<size_t>(t) * nb + b]);
+  mx = ignis_moe::warp_max(mx);
+  if (lane == 0) s_max[warp] = mx;
+  __syncthreads();
+  float to_q, scale;
+  token_scale<kWarps>(s_max, to_q, scale);
+  int sum = 0;
+  for (int blk = warp; blk < nb; blk += kWarps) {
+    float xv[4], v[4];
+    ignis_tl::load_bf16x4(x + static_cast<size_t>(t) * in + blk * 128 + 4 * lane, xv);
+    rotate4(xv, m.suh + blk * 128 + 4 * lane, v);
+    *reinterpret_cast<uint32_t *>(m.q + a_index(tokens, t, blk * 128 + 4 * lane)) = quantize4(v, to_q, sum);
+  }
+  token_sum<kWarps>(sum, s_sum, m, t, scale);
+}
+
+// ignis_tl::store_bf16x4, also handing back the four values it stored as a BF16 read gives them.
+__device__ __forceinline__ void store_bf16x4_kept(__nv_bfloat16 *y, const float (&v)[4], bool add, float (&kept)[4]) {
+  float o[4] = {v[0], v[1], v[2], v[3]};
+  if (add) {
+    float r[4];
+    ignis_tl::load_bf16x4(y, r);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) o[i] += r[i];
+  }
+  const __nv_bfloat162 a = __floats2bfloat162_rn(o[0], o[1]);
+  const __nv_bfloat162 b = __floats2bfloat162_rn(o[2], o[3]);
+  uint2 packed;
+  packed.x = *reinterpret_cast<const uint32_t *>(&a);
+  packed.y = *reinterpret_cast<const uint32_t *>(&b);
+  *reinterpret_cast<uint2 *>(y) = packed;
+  kept[0] = __low2float(a);
+  kept[1] = __high2float(a);
+  kept[2] = __low2float(b);
+  kept[3] = __high2float(b);
 }
 
 // ---- GEMM --------------------------------------------------------------------------------------
@@ -286,6 +461,10 @@ struct GemmParams {
   int split;          // 0, or the split's half width
   int32_t *acc;       // non-null: the int32 accumulators [tokens][ldacc] instead of y
   int ldacc;
+  // GitHub #511: non-null, the next matrix's A8 block maxima of the rows stored, by its suh [out]:
+  // block_amax[t * (out / 128) + tile]. Never with a split.
+  const __half *next_suh;
+  float *block_amax;
 };
 
 template <int BM> struct Tile {
@@ -497,7 +676,18 @@ __device__ __forceinline__ void epilogue(const GemmParams &p, uint8_t *smem, int
 #pragma unroll
         for (int j = 0; j < 4; ++j) v[j] = ignis_moe::silu(gate[j]) * v[j];
       }
-      ignis_tl::store_bf16x4(y, v, p.epilogue == ignis_tl::kAdd);
+      if (p.block_amax == nullptr) {
+        ignis_tl::store_bf16x4(y, v, p.epilogue == ignis_tl::kAdd);
+        continue;
+      }
+      // GitHub #511: the row as stored, rotated as the next matrix's A8 reads it back (its suh
+      // over this tile's 128 columns, its input block tn), and the block's max |v| for the light
+      // second pass (dense_prefill_a8_blocks_kernel).
+      float kept[4], r[4];
+      store_bf16x4_kept(y, v, p.epilogue == ignis_tl::kAdd, kept);
+      rotate4(kept, p.next_suh + tn * kBlockN + 4 * lane, r);
+      const float mx = ignis_moe::warp_max(max4(r));
+      if (lane == 0) p.block_amax[static_cast<size_t>(t) * p.nt + tn] = mx;
     }
   }
 }
@@ -557,6 +747,14 @@ int32_t check_activations(const char *op, const ignis_dense_prefill_activations 
   return 0;
 }
 
+int32_t check_workspace(const char *op, const ignis_trellis_workspace *workspace, uint64_t need) {
+  if (workspace == nullptr || !aligned(workspace->base, 256) || need == 0 || workspace->bytes < need) {
+    return fail(std::string(op) + ": the workspace must be 256-byte aligned and hold " + std::to_string(need) +
+                " bytes, got " + std::to_string(workspace == nullptr ? 0 : workspace->bytes));
+  }
+  return 0;
+}
+
 template <int BM, int NST> int32_t prepare_one(State &st) {
   cudaError_t err = cudaFuncSetAttribute(dense_prefill_gemm_kernel<BM, NST>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                          gemm_smem<BM, NST>());
@@ -599,6 +797,44 @@ Carve carve(uint32_t in, uint32_t tokens) {
 }
 
 uint64_t activations_offset() { return ignis_tl::align256(256 + 4ull * ignis_tl::kArrivalBlocks); }
+
+// The activations of a group of `count` matrices of `in` inputs in the workspace, matrix i at its
+// carve.
+void group_activations(const ignis_trellis_workspace &ws, uint32_t in, uint32_t count, uint32_t tokens,
+                       ignis_dense_prefill_activations *a) {
+  const Carve c = carve(in, tokens);
+  char *base = static_cast<char *>(ws.base) + activations_offset();
+  for (uint32_t i = 0; i < count; ++i) {
+    char *m = base + i * c.bytes;
+    a[i] = ignis_dense_prefill_activations{m + c.q, reinterpret_cast<float *>(m + c.scale),
+                                           reinterpret_cast<int32_t *>(m + c.sum)};
+  }
+}
+
+// GitHub #511: the MLP's workspace past the counters. Gate and up's activations sit at their
+// group's carve and down's at the first carve of its width, over theirs (down quantizes once up's
+// GEMM has read them); down's block maxima sit past both, as up's GEMM writes them while it reads
+// its activations and down's second pass reads them while it writes its own.
+uint64_t mlp_amax_offset(uint32_t in, uint32_t ffn, uint32_t tokens) {
+  return std::max(2 * carve(in, tokens).bytes, carve(ffn, tokens).bytes);
+}
+
+uint64_t mlp_amax_bytes(uint32_t ffn, uint32_t tokens) { return ignis_tl::align256(4ull * tokens * (ffn / 128)); }
+
+// Each matrix of a group in turn, on activations already quantized: its decode into `dense`, then
+// its GEMM into out[i].
+int32_t decode_and_gemm(const ignis_trellis_weight *const *w, uint32_t count, const ignis_dense_prefill_activations *a,
+                        uint32_t tokens, const ignis_dense_prefill_output *out, void *dense, uint64_t dense_bytes,
+                        void *stream) {
+  for (uint32_t i = 0; i < count; ++i) {
+    if (ignis_dense_prefill_decode(w[i], dense, dense_bytes, stream) != 0) return -1;
+    if (ignis_dense_prefill_gemm(w[i], dense, &a[i], tokens, &out[i], stream) != 0) return -1;
+  }
+  return 0;
+}
+
+// The test-only switch of GitHub #511 (ignis_dense_prefill_set_fused_producers).
+std::atomic<uint32_t> g_fused_producers{1};
 
 }  // namespace
 
@@ -675,10 +911,19 @@ int32_t gemm_at(const char *op, const Plan &pl, const ignis_trellis_weight *w, c
     p.epilogue = out->epilogue == IGNIS_TRELLIS_ADD ? ignis_tl::kAdd
                  : out->epilogue == IGNIS_DENSE_PREFILL_SWIGLU_UP ? ignis_tl::kSwiGluUp
                                                             : ignis_tl::kStore;
+    if ((out->next_suh == nullptr) != (out->block_amax == nullptr)) {
+      return fail(std::string(op) + ": next_suh and block_amax are both set or both NULL");
+    }
+    if (out->block_amax != nullptr && (out->split != 0 || !aligned(out->next_suh, 8) || !aligned(out->block_amax, 4))) {
+      return fail(std::string(op) + ": the next matrix's block maxima take no split, next_suh 8-byte aligned and "
+                                    "block_amax 4-byte aligned");
+    }
     p.y = static_cast<__nv_bfloat16 *>(out->y);
     p.y2 = static_cast<__nv_bfloat16 *>(out->y2);
     p.ldy = static_cast<int>(out->ldy);
     p.split = static_cast<int>(out->split);
+    p.next_suh = static_cast<const __half *>(out->next_suh);
+    p.block_amax = out->block_amax;
   }
   const cudaStream_t s = static_cast<cudaStream_t>(stream);
   cudaError_t err;
@@ -811,23 +1056,117 @@ extern "C" int32_t ignis_dense_prefill_linear(const ignis_trellis_weight *const 
     return fail(std::string(op) + ": 1 to " + std::to_string(IGNIS_DENSE_PREFILL_MAX_GROUP) + " matrices");
   }
   if (check_weight(op, w[0]) != 0) return -1;
-  const uint64_t need = ignis_dense_prefill_workspace_bytes(w[0]->in, count, tokens);
-  if (workspace == nullptr || !aligned(workspace->base, 256) || need == 0 || workspace->bytes < need) {
-    return fail(std::string(op) + ": the workspace must be 256-byte aligned and hold " + std::to_string(need) +
-                " bytes, got " + std::to_string(workspace == nullptr ? 0 : workspace->bytes));
-  }
-  const Carve c = carve(w[0]->in, tokens);
-  char *base = static_cast<char *>(workspace->base) + activations_offset();
+  if (check_workspace(op, workspace, ignis_dense_prefill_workspace_bytes(w[0]->in, count, tokens)) != 0) return -1;
   ignis_dense_prefill_activations a[IGNIS_DENSE_PREFILL_MAX_GROUP];
-  for (uint32_t i = 0; i < count; ++i) {
-    char *m = base + i * c.bytes;
-    a[i] = ignis_dense_prefill_activations{m + c.q, reinterpret_cast<float *>(m + c.scale),
-                                           reinterpret_cast<int32_t *>(m + c.sum)};
-  }
+  group_activations(*workspace, w[0]->in, count, tokens, a);
   if (ignis_dense_prefill_quantize(x, tokens, w, count, a, stream) != 0) return -1;
-  for (uint32_t i = 0; i < count; ++i) {
-    if (ignis_dense_prefill_decode(w[i], dense, dense_bytes, stream) != 0) return -1;
-    if (ignis_dense_prefill_gemm(w[i], dense, &a[i], tokens, &out[i], stream) != 0) return -1;
-  }
-  return 0;
+  return decode_and_gemm(w, count, a, tokens, out, dense, dense_bytes, stream);
 }
+
+extern "C" int32_t ignis_dense_prefill_rmsnorm_quantize(const void *x, const void *norm, float eps, uint32_t tokens,
+                                                        void *h, const ignis_trellis_weight *const *w, uint32_t count,
+                                                        const ignis_dense_prefill_activations *out, void *stream) {
+  const char *op = "ignis_dense_prefill_rmsnorm_quantize";
+  if (w == nullptr || out == nullptr || count < 1 || count > IGNIS_DENSE_PREFILL_MAX_GROUP) {
+    return fail(std::string(op) + ": 1 to " + std::to_string(IGNIS_DENSE_PREFILL_MAX_GROUP) + " matrices");
+  }
+  if (!aligned(x, 4) || !aligned(norm, 4) || (h != nullptr && !aligned(h, 4))) {
+    return fail(std::string(op) + ": x and the norm's weight must be 4-byte aligned, and h when given");
+  }
+  if (!(eps > 0.0f) || !std::isfinite(eps)) return fail(std::string(op) + ": eps must be positive and finite");
+  if (tokens == 0) return fail(std::string(op) + ": tokens must be positive");
+  for (uint32_t i = 0; i < count; ++i) {
+    if (check_weight(op, w[i]) != 0 || check_activations(op, &out[i]) != 0) return -1;
+    if (w[i]->in != w[0]->in) return fail(std::string(op) + ": the matrices read inputs of different widths");
+  }
+  if (!norm_width(w[0]->in)) {
+    return fail(std::string(op) + ": in " + std::to_string(w[0]->in) +
+                ": the fused RMSnorm takes a multiple of 1024 in (3072, 8192], the vendored rmsnorm's wide-row form");
+  }
+  State st;
+  if (state(op, &st) != 0) return -1;
+  A8Group g{};
+  g.count = static_cast<int>(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    g.m[i] = A8Target{static_cast<const __half *>(w[i]->suh), static_cast<int8_t *>(out[i].q), out[i].scale, out[i].sum};
+  }
+  dense_prefill_rmsnorm_a8_kernel<<<tokens, kNormThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const __nv_bfloat162 *>(x), static_cast<const __nv_bfloat162 *>(norm), static_cast<int>(w[0]->in), eps,
+      static_cast<__nv_bfloat162 *>(h), static_cast<int>(tokens), g);
+  return check_launch(op);
+}
+
+extern "C" int32_t ignis_dense_prefill_quantize_blocks(const void *x, uint32_t tokens, const ignis_trellis_weight *w,
+                                                       const float *block_amax,
+                                                       const ignis_dense_prefill_activations *out, void *stream) {
+  const char *op = "ignis_dense_prefill_quantize_blocks";
+  if (check_weight(op, w) != 0 || check_activations(op, out) != 0) return -1;
+  if (!aligned(x, 16) || !aligned(block_amax, 4)) {
+    return fail(std::string(op) + ": x must be 16-byte aligned and block_amax 4-byte aligned");
+  }
+  if (tokens == 0) return fail(std::string(op) + ": tokens must be positive");
+  State st;
+  if (state(op, &st) != 0) return -1;
+  const A8Target m{static_cast<const __half *>(w->suh), static_cast<int8_t *>(out->q), out->scale, out->sum};
+  dense_prefill_a8_blocks_kernel<<<tokens, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const __nv_bfloat16 *>(x), static_cast<int>(tokens), static_cast<int>(w->in), block_amax, m);
+  return check_launch(op);
+}
+
+extern "C" int32_t ignis_dense_prefill_norm_linear(const ignis_trellis_weight *const *w, uint32_t count, const void *x,
+                                                   const void *norm, float eps, uint32_t tokens, void *h,
+                                                   const ignis_dense_prefill_output *out,
+                                                   const ignis_trellis_workspace *workspace, void *dense,
+                                                   uint64_t dense_bytes, void *stream) {
+  const char *op = "ignis_dense_prefill_norm_linear";
+  if (w == nullptr || out == nullptr || count < 1 || count > IGNIS_DENSE_PREFILL_MAX_GROUP) {
+    return fail(std::string(op) + ": 1 to " + std::to_string(IGNIS_DENSE_PREFILL_MAX_GROUP) + " matrices");
+  }
+  if (check_weight(op, w[0]) != 0) return -1;
+  if (check_workspace(op, workspace, ignis_dense_prefill_workspace_bytes(w[0]->in, count, tokens)) != 0) return -1;
+  ignis_dense_prefill_activations a[IGNIS_DENSE_PREFILL_MAX_GROUP];
+  group_activations(*workspace, w[0]->in, count, tokens, a);
+  if (ignis_dense_prefill_rmsnorm_quantize(x, norm, eps, tokens, h, w, count, a, stream) != 0) return -1;
+  return decode_and_gemm(w, count, a, tokens, out, dense, dense_bytes, stream);
+}
+
+extern "C" uint64_t ignis_dense_prefill_mlp_workspace_bytes(uint32_t in, uint32_t ffn, uint32_t tokens) {
+  if (in == 0 || in % 128 != 0 || ffn == 0 || ffn % 128 != 0 || tokens == 0) return 0;
+  return activations_offset() + mlp_amax_offset(in, ffn, tokens) + mlp_amax_bytes(ffn, tokens);
+}
+
+extern "C" int32_t ignis_dense_prefill_norm_mlp(const ignis_trellis_weight *gate, const ignis_trellis_weight *up,
+                                                const ignis_trellis_weight *down, const void *x, const void *norm,
+                                                float eps, uint32_t tokens, void *h, void *y, uint32_t ldy,
+                                                const ignis_trellis_workspace *workspace, void *dense,
+                                                uint64_t dense_bytes, void *stream) {
+  const char *op = "ignis_dense_prefill_norm_mlp";
+  if (check_weight(op, gate) != 0 || check_weight(op, up) != 0 || check_weight(op, down) != 0) return -1;
+  if (up->in != gate->in || up->out != gate->out || down->in != gate->out || down->out != gate->in) {
+    return fail(std::string(op) + ": gate and up must share their shape, and down read their output and write their input");
+  }
+  if (!aligned(h, 16)) return fail(std::string(op) + ": h must be 16-byte aligned");
+  const uint32_t in = gate->in, ffn = gate->out;
+  if (check_workspace(op, workspace, ignis_dense_prefill_mlp_workspace_bytes(in, ffn, tokens)) != 0) return -1;
+  ignis_dense_prefill_activations a[2], ad;
+  group_activations(*workspace, in, 2, tokens, a);
+  group_activations(*workspace, ffn, 1, tokens, &ad);
+  float *block_amax = reinterpret_cast<float *>(static_cast<char *>(workspace->base) + activations_offset() +
+                                                mlp_amax_offset(in, ffn, tokens));
+  const ignis_trellis_weight *gu[2] = {gate, up};
+  // The gate's store into h, the up's SwiGLU pass over it keeping down's block maxima, then down's add into y.
+  const ignis_dense_prefill_output o[2] = {
+      ignis_dense_prefill_output{h, ffn, IGNIS_TRELLIS_STORE, 0, 0, nullptr, nullptr, nullptr},
+      ignis_dense_prefill_output{h, ffn, IGNIS_DENSE_PREFILL_SWIGLU_UP, 0, 0, nullptr, down->suh, block_amax}};
+  const ignis_dense_prefill_output od{y, ldy, IGNIS_TRELLIS_ADD, 0, 0, nullptr, nullptr, nullptr};
+  if (ignis_dense_prefill_rmsnorm_quantize(x, norm, eps, tokens, nullptr, gu, 2, a, stream) != 0) return -1;
+  if (decode_and_gemm(gu, 2, a, tokens, o, dense, dense_bytes, stream) != 0) return -1;
+  if (ignis_dense_prefill_quantize_blocks(h, tokens, down, block_amax, &ad, stream) != 0) return -1;
+  return decode_and_gemm(&down, 1, &ad, tokens, &od, dense, dense_bytes, stream);
+}
+
+extern "C" void ignis_dense_prefill_set_fused_producers(uint32_t fused) {
+  g_fused_producers.store(fused != 0 ? 1u : 0u, std::memory_order_relaxed);
+}
+
+extern "C" uint32_t ignis_dense_prefill_fused_producers(void) { return g_fused_producers.load(std::memory_order_relaxed); }
