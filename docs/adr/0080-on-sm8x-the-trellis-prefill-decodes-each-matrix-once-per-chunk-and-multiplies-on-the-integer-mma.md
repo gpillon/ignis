@@ -42,6 +42,6 @@ In a prototype on the RTX 5090 the dense route ran the body's prefill GEMMs abou
 
 ## Consequences
 
-- **VRAM.** The dense buffer (89 MB on the 27B) is a line of the VRAM plan on 8.x. It costs a 16 GB card about ten thousand tokens of context.
+- **VRAM.** The dense buffer (89 MB on the 27B) is a line of the VRAM plan on 8.x. The prefill scratch is sized by the routes the load runs, so the dense prefill and our GDN prefill give some of it back. On the RTX 5090 at a 16 GB card's budget less 1 GiB the 8.x routes cost 6,656 tokens of KV pool, and the profile's context held.
 - **A different decode cost.** The chunk width changes how often the decode is paid. That is one reason for #489's wider chunk when no lane is decoding.
 - **A wider SASS check.** The release check's SASS rule covers the `86` cubin's new kernels.
