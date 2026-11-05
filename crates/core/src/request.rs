@@ -48,8 +48,8 @@ pub enum CaptureLink {
     /// at its opener's page floor (#187) or one it already stands on.
     #[default]
     None,
-    /// The load's opener page rides the capture (#306,
-    /// [`crate::compute::ModelFamily::opener_page_rides_capture`]): the
+    /// The load's opener page rides the capture (#306, #508,
+    /// [`crate::SchedulerConfig::opener_page_rides_capture`]): the
     /// request publishes nothing at its floor, so its `publish_tokens` is 0,
     /// and the capture lends the pages instead.
     OpenerPageRides,

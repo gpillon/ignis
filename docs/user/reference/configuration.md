@@ -264,7 +264,7 @@ The KV storage format: `hq-e8-2b` (the serving default) or `bf16` (the retained 
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The 27B's prompt attention band (GitHub #335): `fp8` (the default, the band pass in 8 bits; `8bit` is its other spelling), `fp16` (the FP16-accumulate fallback) or `int8` (the integer band of the 8.x cards, spec #503). Flash-Next's attention is QSA and has no such pass. On a card below compute capability 12.0 left to its default, or to a profile's `fp8`, it reads `fp16` until the build carries the integer band, its origin the card; a named `fp8` or `int8` the build cannot run is refused (GitHub #477, #505).
+The 27B's prompt attention band (GitHub #335): `fp8` (the default, the band pass in 8 bits; `8bit` is its other spelling), `fp16` (the FP16-accumulate fallback) or `int8` (the integer band of the 8.x cards, spec #503). Flash-Next's attention is QSA and has no such pass. On a card below compute capability 12.0 left to its default, or to a profile's `fp8`, it reads `fp16` while the integer band is opt-in there, its origin the card; a named `fp8` there runs the integer band and reads `int8` (GitHub #477, #505, #510).
 
 ### `model.prefill_linear`
 
@@ -781,7 +781,7 @@ Cross-request state reuse. Off, no prompt checkpoint is captured or claimed, and
 | Per model | `--qwen38-reuse-retained-device`, `--qwen38flashnext-reuse-retained-device` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-Retained slots in VRAM, reserved in the VRAM plan and handed out first. Unset, 0. With prompt reuse off, a count shares heads between live siblings only.
+Retained slots in VRAM, reserved in the VRAM plan and handed out first, each a device-to-device copy per capture and per claim. Unset, 0, unless a profile gives some: `rtx-24gb` does, for the 27B. With prompt reuse off, a count shares heads between live siblings only.
 
 ### `reuse.retained_host`
 

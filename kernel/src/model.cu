@@ -1242,21 +1242,17 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     vision_residency = options->vision_residency;
   }
   // GitHub #335: a value the leaf does not know is refused rather than run as
-  // one of the two.
+  // one of the three.
   if (prefill_attention != IGNIS_PREFILL_ATTENTION_FP8 && prefill_attention != IGNIS_PREFILL_ATTENTION_FP16 &&
       prefill_attention != IGNIS_PREFILL_ATTENTION_INT8) {
     set_error("ignis_model_load: prefill_attention " + std::to_string(prefill_attention) +
               " is not 0 (8-bit), 1 (FP16 accumulate) or 2 (integer)");
     return nullptr;
   }
-  // GitHub #505 (spec #503): the integer band is named by the option surface
-  // before its kernels exist; until they do, the leaf refuses it by name
-  // instead of running the other route. The dense prefill is built (GitHub
-  // #509): an NVFP4 body refuses it below, once its head says which body it is.
-  if (prefill_attention == IGNIS_PREFILL_ATTENTION_INT8) {
-    set_error("ignis_model_load: prefill_attention 2 (the integer band) is not built yet");
-    return nullptr;
-  }
+  // GitHub #505 (spec #503): both routes are named by the option surface. The
+  // integer band runs (GitHub #510) and so does the dense prefill (GitHub
+  // #509): an NVFP4 body refuses the dense one below, once its head says which
+  // body it is.
   if (prefill_linear != IGNIS_PREFILL_LINEAR_FUSED && prefill_linear != IGNIS_PREFILL_LINEAR_DENSE) {
     set_error("ignis_model_load: prefill_linear " + std::to_string(prefill_linear) +
               " is not 0 (fused) or 1 (dense)");

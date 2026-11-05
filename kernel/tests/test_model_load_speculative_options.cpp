@@ -198,17 +198,16 @@ int main() {
     check(contains(m, "draft_tokens") && contains(m, "speculative_backend"),
           "a window with no backend is refused: " + m);
   }
-  // GitHub #505 (spec #503): the integer band is named by the option surface
-  // before its kernels exist; the leaf refuses it by name, and a value past
-  // the prefill_linear enum as well. The dense prefill is built (GitHub #509):
-  // like the fused prefill it reaches the binding.
+  // GitHub #505 (spec #503): both routes are named by the option surface; the
+  // leaf accepts the integer band (GitHub #510) and the dense prefill (GitHub
+  // #509), which reach the binding, and refuses a value past the prefill_linear
+  // enum by name.
   {
     ignis_model_load_options band{};
     band.size = sizeof(band);
     band.prefill_attention = IGNIS_PREFILL_ATTENTION_INT8;
     const std::string m = load_error({}, &band);
-    check(contains(m, "prefill_attention") && contains(m, "integer band") && contains(m, "not built yet"),
-          "the integer band is refused by name: " + m);
+    check(contains(m, "text/token_embedding"), "the integer band reaches the binding: " + m);
     ignis_model_load_options dense{};
     dense.size = sizeof(dense);
     dense.prefill_linear = IGNIS_PREFILL_LINEAR_DENSE;

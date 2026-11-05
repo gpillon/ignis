@@ -377,6 +377,18 @@ pub const fn prefill_route_built(route: PrefillRoute) -> bool {
     match route {
         // GitHub #509: the leaf's dense prefill (kernel/include/ignis_dense_prefill.h).
         PrefillRoute::DensePrefill => true,
+        // GitHub #510: the integer band's kernel (kernel/src/hq_prompt_int8.cu).
+        PrefillRoute::IntegerBand => true,
+    }
+}
+
+/// Whether `route` is what an 8.x card runs when nothing names it: the one
+/// place that says so (spec #503). A route is opt-in, run only when named,
+/// until the gates pass and #515 flips its line here; until then a default's
+/// or a profile's 8-bit band on an 8.x card stays the FP16 band.
+pub const fn prefill_route_is_the_8x_default(route: PrefillRoute) -> bool {
+    match route {
+        PrefillRoute::DensePrefill => false,
         PrefillRoute::IntegerBand => false,
     }
 }
@@ -388,13 +400,15 @@ fn is_8x(card: Option<&CardReading>) -> bool {
 }
 
 /// The 27B's prompt attention band on `card` (`--model-prefill-attention`,
-/// GitHub #456, #505): `resolved` where the card and the build run it. The
-/// 8-bit band (`8bit`, `fp8`) is the integer band on an 8.x card and today's
-/// block-scaled FP8 band elsewhere; `int8` names the integer band on every
-/// card, and a default or a profile gives it on an 8.x card alone. A band
-/// the build cannot run is the FP16 band on an 8.x card (the FP8 band
-/// elsewhere) when the operator left the field to its default or a profile,
-/// and a refusal naming `spelled` when they named it (`named`).
+/// GitHub #456, #505, #510): `resolved` where the card and the build run it.
+/// The 8-bit band (`8bit`, `fp8`) is the integer band on an 8.x card and
+/// today's block-scaled FP8 band elsewhere; `int8` names the integer band on
+/// every card, and a profile gives it on an 8.x card alone. A default's or a
+/// profile's 8-bit band is the FP16 band on an 8.x card while the integer
+/// band is opt-in there ([`prefill_route_is_the_8x_default`]). A band the
+/// build cannot run is the FP16 band on an 8.x card (the FP8 band elsewhere)
+/// when the operator left the field to its default or a profile, and a
+/// refusal naming `spelled` when they named it (`named`).
 pub fn prefill_attention(
     resolved: PrefillAttention,
     named: bool,
@@ -415,6 +429,9 @@ pub fn prefill_attention_with(
 ) -> Result<PrefillAttention, String> {
     let on_8x = is_8x(card);
     let band = match resolved {
+        PrefillAttention::Fp8 if on_8x && !named && !prefill_route_is_the_8x_default(PrefillRoute::IntegerBand) => {
+            return Ok(PrefillAttention::Fp16);
+        }
         PrefillAttention::Fp8 if on_8x => PrefillAttention::Int8,
         other => other,
     };
@@ -483,6 +500,30 @@ pub fn prefill_linear_with(
     }
     // Built: no default or profile on a Blackwell card selects it.
     Ok(if named || is_8x(card) { PrefillLinear::Int8 } else { PrefillLinear::Fp16 })
+}
+
+/// Whether a load of `family` on a card of `generation` publishes its
+/// generation opener's page by the prompt checkpoint's capture, as a
+/// pages-only link (ADR 0029 as amended 2026-10-07 and 2026-11-05, GitHub
+/// #306, #508): the one decision, which [`crate::runtime::EngineShape`] asks
+/// for the load's family and the card the start read.
+///
+/// On, a reusable prompt is cut once, at the opener; off, twice, at the
+/// opener's page floor too, where its imaged prefix is published. Flash-Next
+/// rides on every card: its cut is a traversal that re-streams its experts.
+/// The 27B rides on Ampere and Ada, where a traversal of its trellis body
+/// decodes every matrix again and the cut costs clearly more than the ~19 ms
+/// it costs on the RTX 5090. On Blackwell, and with no card read, it keeps
+/// both cuts and the imaged prefix at the floor, its splits unchanged since
+/// #306. The image model and the diarizer capture nothing. A request whose
+/// image spans its opener's page floor lends the pages at its capture on any
+/// load (GitHub #249, `CaptureLink::ImageSpansFloor`).
+pub fn opener_page_rides_capture(family: ModelFamily, generation: Option<GpuGeneration>) -> bool {
+    match family {
+        ModelFamily::FlashNext => true,
+        ModelFamily::Qwen38_27b => matches!(generation, Some(GpuGeneration::Ampere | GpuGeneration::Ada)),
+        ModelFamily::QwenImage21 | ModelFamily::Nemotron3Diarization => false,
+    }
 }
 
 /// The 27B's BF16 exception tensors on `card` (`--model-exception-weights`,
@@ -615,17 +656,17 @@ mod tests {
     }
 
     /// On an Ampere card the prompt attention's band left to its default is
-    /// the FP16 one, a named `fp16` stays, and a named `fp8` is refused by its
-    /// spelling; a Blackwell card and no card at all keep what resolved.
+    /// the FP16 one, a named `fp16` stays, and a named `fp8` runs the integer
+    /// band (GitHub #510; a build without it refuses it by its spelling, which
+    /// `the_prefill_attention_without_the_integer_band_built` holds); a
+    /// Blackwell card and no card at all keep what resolved.
     #[test]
     fn the_prefill_attention_follows_the_card() {
         let (fp8, fp16) = (PrefillAttention::Fp8, PrefillAttention::Fp16);
         let flag = "--model-prefill-attention";
         assert_eq!(prefill_attention(fp8, false, Some(&ampere()), flag), Ok(fp16));
         assert_eq!(prefill_attention(fp16, true, Some(&ampere()), flag), Ok(fp16));
-        let refused = prefill_attention(fp8, true, Some(&ampere()), "IGNIS_MODEL_PREFILL_ATTENTION").unwrap_err();
-        assert!(refused.contains("`IGNIS_MODEL_PREFILL_ATTENTION fp8`") && refused.contains("NVIDIA GeForce RTX 3090 (8.6)"), "{refused}");
-        assert!(refused.contains("`fp16`"), "{refused}");
+        assert_eq!(prefill_attention(fp8, true, Some(&ampere()), flag), Ok(PrefillAttention::Int8));
         for named in [false, true] {
             assert_eq!(prefill_attention(fp8, named, Some(&blackwell()), flag), Ok(fp8));
             assert_eq!(prefill_attention(fp8, named, None, flag), Ok(fp8));
@@ -669,17 +710,19 @@ mod tests {
         }
     }
 
-    /// Spec #503 (GitHub #505): the build says whether it carries a route
-    /// ([`prefill_route_built`]), and the decision reads them through that one
-    /// predicate. GitHub #509 built the dense prefill; the integer band waits
-    /// for #510.
+    /// Spec #503 (GitHub #505, #509, #510): the build says whether it carries a
+    /// route ([`prefill_route_built`]): both, the dense prefill and the integer
+    /// band. Neither is yet what an 8.x card runs when nothing names it
+    /// ([`prefill_route_is_the_8x_default`]): both are opt-in until #515.
     #[test]
-    fn this_build_carries_the_dense_prefill_and_not_yet_the_integer_band() {
+    fn this_build_carries_both_routes_and_both_are_opt_in() {
         assert!(prefill_route_built(PrefillRoute::DensePrefill));
-        assert!(!prefill_route_built(PrefillRoute::IntegerBand));
+        assert!(prefill_route_built(PrefillRoute::IntegerBand));
+        assert!(!prefill_route_is_the_8x_default(PrefillRoute::DensePrefill));
+        assert!(!prefill_route_is_the_8x_default(PrefillRoute::IntegerBand));
         let flag = "--model-prefill-linear";
         let (a, b) = (ampere(), blackwell());
-        assert_eq!(prefill_linear(PrefillLinear::Int8, false, Some(&a), flag), Ok(PrefillLinear::Int8), "8.x: from a profile");
+        assert_eq!(prefill_linear(PrefillLinear::Int8, true, Some(&a), flag), Ok(PrefillLinear::Int8), "8.x: named");
         assert_eq!(prefill_linear(PrefillLinear::Int8, true, Some(&b), flag), Ok(PrefillLinear::Int8), "Blackwell: named");
         assert_eq!(prefill_linear(PrefillLinear::Int8, false, Some(&b), flag), Ok(PrefillLinear::Fp16), "Blackwell: a profile's falls back");
     }
@@ -712,21 +755,45 @@ mod tests {
         assert_eq!(prefill_attention_with(PrefillAttention::Fp8, true, None, flag, none), Ok(PrefillAttention::Fp8));
     }
 
-    /// The same decision with the integer band built, the line #510 flips: it
-    /// runs on 8.x for every spelling of the 8-bit band, and on Blackwell
-    /// only when named.
+    /// The same decision with the integer band built, the line #510 flips: on
+    /// 8.x it runs for every spelling of the 8-bit band named, and for a
+    /// profile's `int8`, while a default's or a profile's `fp8` stays the
+    /// FP16 band (opt-in until #515); on Blackwell it runs only when named.
     #[test]
     fn the_prefill_attention_with_the_integer_band_built() {
         let built = |route: PrefillRoute| route == PrefillRoute::IntegerBand;
         let (a, b) = (ampere(), blackwell());
+        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, true, Some(&a), "", built), Ok(PrefillAttention::Int8));
+        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, false, Some(&a), "", built), Ok(PrefillAttention::Fp16));
+        assert_eq!(prefill_attention(PrefillAttention::Fp8, false, Some(&a), ""), Ok(PrefillAttention::Fp16), "the build's own");
+        assert_eq!(prefill_attention(PrefillAttention::Fp8, true, Some(&a), ""), Ok(PrefillAttention::Int8), "the build's own");
         for named in [false, true] {
-            assert_eq!(prefill_attention_with(PrefillAttention::Fp8, named, Some(&a), "", built), Ok(PrefillAttention::Int8));
             assert_eq!(prefill_attention_with(PrefillAttention::Int8, named, Some(&a), "", built), Ok(PrefillAttention::Int8));
             assert_eq!(prefill_attention_with(PrefillAttention::Fp8, named, Some(&b), "", built), Ok(PrefillAttention::Fp8));
         }
         assert_eq!(prefill_attention_with(PrefillAttention::Int8, true, Some(&b), "", built), Ok(PrefillAttention::Int8));
         assert_eq!(prefill_attention_with(PrefillAttention::Int8, false, Some(&b), "", built), Ok(PrefillAttention::Fp8));
         assert_eq!(prefill_attention_with(PrefillAttention::Fp16, true, Some(&a), "", built), Ok(PrefillAttention::Fp16));
+    }
+
+    /// GitHub #508 (spec #503): the 27B's generation-opener page rides the
+    /// prompt checkpoint's capture on Ampere and Ada, and not on Blackwell nor
+    /// with no card read; Flash-Next's rides it on every card, as since #306;
+    /// the image model and the diarizer capture nothing.
+    #[test]
+    fn the_opener_page_rides_the_capture_by_family_and_generation() {
+        use GpuGeneration::*;
+        let qwen = |generation| opener_page_rides_capture(ModelFamily::Qwen38_27b, generation);
+        assert!(qwen(Some(Ampere)), "the 27B on Ampere: one cut, at the opener");
+        assert!(qwen(Some(Ada)), "the 27B on Ada: one cut, at the opener");
+        assert!(!qwen(Some(Blackwell)), "the 27B on Blackwell keeps its two cuts");
+        assert!(!qwen(None), "no card read: the 27B keeps its two cuts");
+        for generation in [Some(Ampere), Some(Ada), Some(Blackwell), None] {
+            assert!(opener_page_rides_capture(ModelFamily::FlashNext, generation), "Flash-Next on {generation:?}");
+            for family in [ModelFamily::QwenImage21, ModelFamily::Nemotron3Diarization] {
+                assert!(!opener_page_rides_capture(family, generation), "{family:?} on {generation:?}");
+            }
+        }
     }
 
     /// The trellis prefill route: `fp16` runs everywhere; `int8` named is

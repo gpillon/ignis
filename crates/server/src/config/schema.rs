@@ -337,9 +337,9 @@ config_group! {
         /// FP16-accumulate fallback) or `int8` (the integer band of the 8.x
         /// cards, spec #503). Flash-Next's attention is QSA and has no such
         /// pass. On a card below compute capability 12.0 left to its default,
-        /// or to a profile's `fp8`, it reads `fp16` until the build carries the
-        /// integer band, its origin the card; a named `fp8` or `int8` the
-        /// build cannot run is refused (GitHub #477, #505).
+        /// or to a profile's `fp8`, it reads `fp16` while the integer band is
+        /// opt-in there, its origin the card; a named `fp8` there runs the
+        /// integer band and reads `int8` (GitHub #477, #505, #510).
         prefill_attention: PrefillAttentionKind = PrefillAttention::default(), Validator::OneOf(&PrefillAttention::NAMES), QWEN38_ONLY,
             [Visible, Patchable, ReloadRequired];
         /// The 27B's trellis prefill route (spec #503, GitHub #505): `fp16`
@@ -519,8 +519,10 @@ config_group! {
         /// `retained_host` gives slots for it.
         prompt: Bool = super::DEFAULT_PROMPT_REUSE, NO_RULE, ALL, [Visible, Patchable, ReloadRequired, Scoped];
         /// Retained slots in VRAM, reserved in the VRAM plan and handed out
-        /// first. Unset, 0. With prompt reuse off, a count shares heads
-        /// between live siblings only.
+        /// first, each a device-to-device copy per capture and per claim.
+        /// Unset, 0, unless a profile gives some: `rtx-24gb` does, for the
+        /// 27B. With prompt reuse off, a count shares heads between live
+        /// siblings only.
         retained_device: Opt<Slots> = None, NO_RULE, ALL, [Visible, Patchable, ReloadRequired, Scoped];
         /// Retained slots in one pinned host block reserved at start, ~222
         /// MiB each, a PCIe copy per capture and per claim. Unset, the
