@@ -729,6 +729,10 @@ int main(int argc, char **argv) {
   kernel_report("tile_kernel<bf16> (window tiles)", reinterpret_cast<const void *>(tile_kernel<false>), 0);
   std::printf("\n");
 
+  std::printf("== i8 variants (fa_i8_kernel; each must equal i8ref byte for byte; the op runs v%d)\n", kI8Default);
+  for (int v = 0; v < kI8VariantCount; ++v) std::printf("  v%-2d %s\n", v, kI8Variants[v].name);
+  std::printf("\n");
+
   // ---- peaks ----
   std::printf("== peaks (register-only MMA loops, %d CTAs of 8 warps)\n", 4 * sms);
   Rate rates[kPkForms];
@@ -936,8 +940,9 @@ int main(int argc, char **argv) {
                 "times %d layers\n",
                 p, chunks, chunk, total_pairs.total(), total_pairs.window, total_pairs.band, ops_all / 1e12, kLayers);
     // Per chunk, the bands (not the diag series).
-    std::printf("per chunk, one layer, ms (median of %d rounds): prep + window tiles + window FA + band tiles + band FA + "
-                "merge = total\n", rounds);
+    std::printf("per chunk, one layer, ms (median of %d rounds):", rounds);
+    for (int x = 0; x < kCats; ++x) std::printf("%s %s", x == 0 ? "" : " +", kCatName[x]);
+    std::printf(" = total\n");
     for (std::size_t si = 0; si < bands.size(); ++si) {
       for (int c = 0; c < chunks; ++c) {
         const auto &m = med[si][c];

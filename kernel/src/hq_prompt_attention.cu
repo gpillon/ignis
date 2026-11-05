@@ -1699,7 +1699,7 @@ constexpr I8Variant kI8Variants[] = {
     {"QK of tile c+1 under the softmax, 3 stages", 3, true, true, false, false, false, false, false},
     {"QK under the softmax, 4 stages", 4, true, true, false, false, false, false, false},
     {"QK under the softmax, Q from shared memory, 4 stages", 4, true, true, true, false, false, false, false},
-    {"ping-pong of the two heads, 3 stages", 3, true, false, false, true, false, false, false},
+    {"ping-pong of each scheduler's two warps, 3 stages", 3, true, false, false, true, false, false, false},
     {"ping-pong, 4 stages", 4, true, false, false, true, false, false, false},
     {"conversions, padded tiles (2 stages, 2 barriers)", 2, false, false, false, false, true, false, false},
     {"ping-pong, 3 stages, padded tiles", 3, true, false, false, true, true, false, false},
