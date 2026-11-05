@@ -189,6 +189,16 @@ pub struct PrefillJob {
     /// emits -- for a request that starts inside its reasoning block. `None`
     /// on every other job ([`DecodeJob::reasoning_close`]).
     pub reasoning_close: Option<TokenId>,
+    /// The **drafter floor** (GitHub #506): the first prompt position whose
+    /// feature taps a later DFlash2 drafter window reads. It is the earliest
+    /// retained-image point at or past this job's end — a prefix the request
+    /// may publish, its prompt checkpoint, or the prompt's end, where decode
+    /// reads the window — minus the window's 2048 positions.
+    ///
+    /// The job taps from the later of its own last 2048 positions and this,
+    /// so a job whose span lies wholly below it taps nothing; 0 is the span
+    /// rule alone. Unread on a load without the drafter.
+    pub drafter_floor: u32,
 }
 
 impl PrefillJob {

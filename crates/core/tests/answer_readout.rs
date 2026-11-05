@@ -29,6 +29,7 @@ fn job(request: u64, readout: Option<Vec<TokenId>>) -> PrefillJob {
         permitted: None,
         attention: None,
         reasoning_close: None,
+        drafter_floor: 0,
     }
 }
 

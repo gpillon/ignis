@@ -235,6 +235,7 @@ fn decode_batch(
             permitted: None,
             attention: None,
             reasoning_close: None,
+            drafter_floor: 0,
         })
         .collect();
     compute.prefill_step(&jobs).unwrap_or_else(|e| panic!("prefill_step: {e}"));

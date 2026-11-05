@@ -131,6 +131,7 @@ fn a_readout_crosses_the_real_compute_seam() {
         permitted: None,
         attention: None,
         reasoning_close: None,
+        drafter_floor: 0,
 };
 
     // ── the readout itself ───────────────────────────────────────────────

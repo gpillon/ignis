@@ -3011,6 +3011,7 @@ mod tests {
             _sequence: &mut Self::Sequence,
             _tokens: &[TokenId],
             _start_position: u32,
+            _drafter_floor: u32,
             _params: DecodeParams,
             _permitted: &[TokenId],
             _redirect: Option<&mut ignis_runtime::DrawRedirect<'_>>,

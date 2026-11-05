@@ -361,6 +361,16 @@ fn lands_on(start: u32, take: u32, point: u32) -> bool {
     point > start && point - start <= take
 }
 
+/// The drafter floor of a prefill job ending at `end` (GitHub #506): the
+/// earliest of `points` at or past `end`, minus the drafter window, or 0 when
+/// the window reaches back past the prompt's start. A point inside the job is
+/// none of its business: an image is taken only where a job ends, so one there
+/// was not cut at. `points` holds the prompt's end, which no job passes.
+fn drafter_floor(points: impl IntoIterator<Item = u32>, end: u32) -> u32 {
+    let window = crate::speculation::DFLASH2_WINDOW_TOKENS as u32;
+    points.into_iter().filter(|&at| at >= end).min().unwrap_or(end).saturating_sub(window)
+}
+
 /// The capture point `at` a chunk of `take` tokens from `start` may take: `at`
 /// itself, or 0 when `held` says the checkpoint pool already holds that
 /// content (GitHub #189). `held` walks the prompt's match chain, so it is
@@ -5014,6 +5024,17 @@ impl Scheduler for ConcreteScheduler {
                     // first decode round emits, and the block is open there.
                     reasoning_close: reasoning_close(&self.config, r)
                         .filter(|_| start + take >= r.input.tokens.len() as u32),
+                    // GitHub #506: the earliest image a drafter window reads
+                    // past this job, from the points the request itself may
+                    // cut at -- a decision, or `--reuse-prompt off`, captures
+                    // no checkpoint (the capture points above).
+                    drafter_floor: drafter_floor(
+                        r.drafter_read_points(
+                            self.config.kv_page_tokens,
+                            self.config.prompt_reuse && !r.input.is_decision(),
+                        ),
+                        start + take,
+                    ),
                 }
             })
             .collect();

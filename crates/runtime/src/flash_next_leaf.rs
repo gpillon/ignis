@@ -598,6 +598,8 @@ impl StepLeaf for FlashNextLeaf {
         sequence: &mut Self::Sequence,
         tokens: &[TokenId],
         start_position: u32,
+        // GitHub #506: Flash-Next carries no DFlash2 drafter to tap.
+        _drafter_floor: u32,
         params: DecodeParams,
         permitted: &[TokenId],
         mut redirect: Option<&mut DrawRedirect<'_>>,

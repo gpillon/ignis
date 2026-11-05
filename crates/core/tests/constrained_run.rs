@@ -54,6 +54,7 @@ fn prefill_job(program: &Schedule) -> PrefillJob {
         permitted: program.step(0),
         attention: None,
         reasoning_close: None,
+        drafter_floor: 0,
     }
 }
 
