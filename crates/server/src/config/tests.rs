@@ -3287,19 +3287,20 @@ fn the_verbs_read_a_card_the_kernels_were_not_built_for_as_before() {
     assert!(on_card(&[], profile::Card::Absent).is_ok());
 }
 
-/// GitHub #456: on an Ampere card of a build for it, the 27B's prompt
-/// attention left unset (or to a profile) runs the FP16 band, a named `fp16`
-/// stays, and a named `fp8` runs the integer band, the 8-bit band there
-/// (GitHub #510; before it, a named `fp8` was refused); on a Blackwell card
-/// of the same build nothing changes.
+/// GitHub #456, #515: on an Ampere card of a build for it, the 27B's prompt
+/// attention left unset (or to a profile) runs the integer band, the 8-bit
+/// band there (#515 made it the default; until then it was the FP16 band and
+/// the integer band ran only when named), a named `fp16` stays the FP16 band,
+/// and a named `fp8` runs the integer band; on a Blackwell card of the same
+/// build nothing changes.
 #[test]
-fn the_prefill_attention_on_an_ampere_card_is_fp16_unless_fp8_is_named() {
+fn the_prefill_attention_on_an_ampere_card_is_the_integer_band_unless_fp16_is_named() {
     let ampere = card_of(15.9, "NVIDIA RTX A4000", (8, 6), "86;120a");
     let on = |flags: &[&str], env: &'static [(&'static str, &'static str)]| {
         let env = move |key: &str| env.iter().find(|(name, _)| *name == key).map(|(_, value)| value.to_string());
         resolve_on(&args(flags), env, &file::NoFiles, &|| ampere.clone()).map(expect_config)
     };
-    assert_eq!(on(&[], &[]).unwrap().prefill_attention, PrefillAttention::Fp16);
+    assert_eq!(on(&[], &[]).unwrap().prefill_attention, PrefillAttention::Int8);
     assert_eq!(on(&["--model-prefill-attention", "fp16"], &[]).unwrap().prefill_attention, PrefillAttention::Fp16);
     assert_eq!(on(&["--model-prefill-attention", "fp8"], &[]).unwrap().prefill_attention, PrefillAttention::Int8);
     assert_eq!(on(&[], &[("IGNIS_MODEL_PREFILL_ATTENTION", "fp8")]).unwrap().prefill_attention, PrefillAttention::Int8);
@@ -3311,9 +3312,9 @@ fn the_prefill_attention_on_an_ampere_card_is_fp16_unless_fp8_is_named() {
 
 /// GitHub #477: `GET /v1/config` and its origins report the band the load
 /// runs. On an RTX 3090 (8.6) the field left to its default, or given by a
-/// profile as `fp8`, reads `fp16` with the card as its origin; a named `fp16`
-/// keeps its own origin; a named `fp8` reads `int8`, the integer band it runs
-/// there (GitHub #510), and keeps its own origin. On an RTX 5090 (12.0), and
+/// profile as `fp8`, reads `int8`, the integer band, with the card as its
+/// origin (GitHub #515; it read `fp16` before); a named `fp16` keeps its own
+/// origin; a named `fp8` reads `int8` and keeps its own origin. On an RTX 5090 (12.0), and
 /// on a start that read no card, it reads `fp8` from the default, as before.
 #[test]
 fn the_config_reports_the_prefill_attention_band_the_card_runs() {
@@ -3329,18 +3330,18 @@ fn the_config_reports_the_prefill_attention_band_the_card_runs() {
     let rtx3090 = card_of(24.0, "NVIDIA GeForce RTX 3090", (8, 6), "86;120a");
     let default = on_card(&["--profile", "none"], rtx3090.clone()).unwrap();
     let (shared, family, shown) = report(&default);
-    assert_eq!(shown.as_deref(), Some("fp16"));
+    assert_eq!(shown.as_deref(), Some("int8"));
     for origin in [shared.unwrap(), family.unwrap()] {
         assert_eq!(origin.source, Source::Card);
         assert_eq!(origin.spelling, "NVIDIA GeForce RTX 3090 (8.6)");
         assert!(!origin.source.explicit());
     }
 
-    // A profile that gives `fp8` reads `fp16` too, the card as origin.
+    // A profile that gives `fp8` reads `int8` too, the card as origin.
     let mut sources = default.basis.sources().clone();
     sources.profile.set(field, None, Candidate { raw: "fp8".into(), spelling: "rtx-test".into() }).unwrap();
     let resolution = source::resolve_settings(&sources, Some(ModelFamily::Qwen38_27b), source::Fit::Switch).unwrap();
-    assert_eq!(resolution.settings.render()["model"]["prefill_attention"], "fp16");
+    assert_eq!(resolution.settings.render()["model"]["prefill_attention"], "int8");
     assert_eq!(resolution.origin("model", "prefill_attention").unwrap().source, Source::Card);
 
     let named = on_card(&["--profile", "none", "--model-prefill-attention", "fp16"], rtx3090.clone()).unwrap();
@@ -3365,8 +3366,8 @@ fn the_config_reports_the_prefill_attention_band_the_card_runs() {
 /// carrying both routes: a named `int8` runs on either card for the dense
 /// prefill and for the integer band; a profile's dense prefill runs on 8.x and
 /// falls back to the fused one on 12.x, the card as its origin, and a profile's
-/// integer band runs on 8.x alone; `fp16` runs everywhere. Nothing is `int8`
-/// by default.
+/// integer band runs on 8.x alone; `fp16` runs everywhere. On 12.x nothing is
+/// `int8` by default; on 8.x both are (GitHub #515, the next test).
 #[test]
 fn a_named_dense_prefill_and_a_named_integer_band_run_and_a_profiles_follows_the_card() {
     use source::{Candidate, Source};
@@ -3382,9 +3383,11 @@ fn a_named_dense_prefill_and_a_named_integer_band_run_and_a_profiles_follows_the
         let no_files = MemFiles::default();
         let file = |text: &str| MemFiles::with(&[("c.yaml", text)]);
 
-        // The defaults do not move, and `fp16` is accepted from every source.
+        // The defaults: the fused prefill on 12.x, the dense one on 8.x
+        // (GitHub #515); `fp16` is accepted from every source.
         let default = on(&[], &[], &no_files).unwrap();
-        assert_eq!(default.prefill_linear, PrefillLinear::Fp16, "{generation}");
+        let default_linear = if generation == "8.x" { PrefillLinear::Int8 } else { PrefillLinear::Fp16 };
+        assert_eq!(default.prefill_linear, default_linear, "{generation}");
         let fp16 = on(&["--model-prefill-linear", "fp16"], &[], &no_files).unwrap();
         assert_eq!(fp16.prefill_linear, PrefillLinear::Fp16, "{generation}");
         let env = on(&[], &[("IGNIS_MODEL_PREFILL_LINEAR", "FP16")], &no_files).unwrap();
@@ -3443,6 +3446,52 @@ fn a_named_dense_prefill_and_a_named_integer_band_run_and_a_profiles_follows_the
         assert_eq!(origin.source == Source::Card, generation == "12.x", "{generation} prefill_linear: {:?}", origin.source);
         assert!(!origin.source.explicit());
     }
+}
+
+/// Spec #503, GitHub #515: on an 8.x capability a load that names neither
+/// `prefill_linear` nor `prefill_attention` runs the dense prefill and the
+/// integer band, and the effective document and origins (what `GET /v1/config`
+/// reports) show both with the card as source; `fp16` for either, named, keeps
+/// the fused prefill or the FP16 band with its own source. On 12.x nothing
+/// changes: the fused prefill and the FP8 band, no card origin.
+#[test]
+fn an_8x_card_runs_the_dense_prefill_and_the_integer_band_unless_fp16_is_named() {
+    use source::Source;
+    let report = |config: &Config| {
+        let (shared, families) = file::resolutions(config);
+        let (_, family) = families.iter().find(|(family, _)| *family == ModelFamily::Qwen38_27b).expect("the 27B resolves");
+        let document = file::effective_document(config);
+        let model = &document["model"]["qwen38"];
+        let shown = |name: &str| model[name].as_str().map(str::to_owned);
+        let source = |name: &str| family.origin("model", name).map(|origin| origin.source);
+        let shared_source = |name: &str| shared.origin("model", name).map(|origin| origin.source);
+        (
+            (shown("prefill_linear"), shown("prefill_attention")),
+            (source("prefill_linear"), source("prefill_attention")),
+            (shared_source("prefill_linear"), shared_source("prefill_attention")),
+        )
+    };
+    for (name, capability) in [("NVIDIA GeForce RTX 3090", (8, 6)), ("NVIDIA GeForce RTX 4090", (8, 9))] {
+        let card = card_of(24.0, name, capability, "86;120a");
+        for flags in [&[][..], &["--profile", "none"][..]] {
+            let config = on_card(flags, card.clone()).unwrap();
+            assert_eq!((config.prefill_linear, config.prefill_attention), (PrefillLinear::Int8, PrefillAttention::Int8), "{name}");
+            let (shown, family, shared) = report(&config);
+            assert_eq!((shown.0.as_deref(), shown.1.as_deref()), (Some("int8"), Some("int8")), "{name}");
+            assert_eq!(family, (Some(Source::Card), Some(Source::Card)), "{name}");
+            assert_eq!(shared, (Some(Source::Card), Some(Source::Card)), "{name}");
+        }
+        let fused = on_card(&["--model-prefill-linear", "fp16", "--model-prefill-attention", "fp16"], card.clone()).unwrap();
+        assert_eq!((fused.prefill_linear, fused.prefill_attention), (PrefillLinear::Fp16, PrefillAttention::Fp16), "{name}");
+        let (shown, family, _) = report(&fused);
+        assert_eq!((shown.0.as_deref(), shown.1.as_deref()), (Some("fp16"), Some("fp16")), "{name}");
+        assert_eq!(family, (Some(Source::Flag), Some(Source::Flag)), "{name}");
+    }
+    let blackwell = on_card(&[], card_of(31.8, "NVIDIA GeForce RTX 5090", (12, 0), "86;120a")).unwrap();
+    assert_eq!((blackwell.prefill_linear, blackwell.prefill_attention), (PrefillLinear::Fp16, PrefillAttention::Fp8));
+    let (shown, family, shared) = report(&blackwell);
+    assert_eq!((shown.0.as_deref(), shown.1.as_deref()), (Some("fp16"), Some("fp8")));
+    assert_eq!((family, shared), ((None, None), (None, None)));
 }
 
 /// `rtx50-16gb` for the 27B: the values the spec derives, and Flash-Next

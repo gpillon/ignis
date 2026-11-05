@@ -383,13 +383,15 @@ pub const fn prefill_route_built(route: PrefillRoute) -> bool {
 }
 
 /// Whether `route` is what an 8.x card runs when nothing names it: the one
-/// place that says so (spec #503). A route is opt-in, run only when named,
-/// until the gates pass and #515 flips its line here; until then a default's
-/// or a profile's 8-bit band on an 8.x card stays the FP16 band.
+/// place that says so (spec #503, GitHub #515). Both routes are: an RTX 30 or
+/// RTX 40 card with `--model-prefill-linear` and `--model-prefill-attention`
+/// unset runs the dense prefill and the integer band, and `fp16` for either
+/// names the fused prefill or the FP16 band instead. A Blackwell card keeps
+/// its fused prefill and its block-scaled FP8 band; nothing here moves it.
 pub const fn prefill_route_is_the_8x_default(route: PrefillRoute) -> bool {
     match route {
-        PrefillRoute::DensePrefill => false,
-        PrefillRoute::IntegerBand => false,
+        PrefillRoute::DensePrefill => true,
+        PrefillRoute::IntegerBand => true,
     }
 }
 
@@ -463,8 +465,9 @@ pub fn prefill_attention_with(
 
 /// The 27B's trellis prefill route on `card` (`--model-prefill-linear`,
 /// spec #503, GitHub #505): `resolved` where the build runs it. The dense
-/// prefill (`int8`) is a default or a profile's on an 8.x card alone; on
-/// another card it runs only when named. One the build does not carry is the
+/// prefill (`int8`) is the default and a profile's on an 8.x card alone
+/// ([`prefill_route_is_the_8x_default`]; `fp16` names the fused prefill
+/// there); on another card it runs only when named. One the build does not carry is the
 /// fused prefill (`fp16`) when a default or a profile gave it, and a refusal
 /// naming `spelled` when the operator named it (`named`).
 pub fn prefill_linear(
@@ -485,6 +488,15 @@ pub fn prefill_linear_with(
     spelled: &str,
     built: impl Fn(PrefillRoute) -> bool,
 ) -> Result<PrefillLinear, String> {
+    if resolved == PrefillLinear::Fp16
+        && !named
+        && is_8x(card)
+        && prefill_route_is_the_8x_default(PrefillRoute::DensePrefill)
+        && built(PrefillRoute::DensePrefill)
+    {
+        // Left unset on an 8.x card: the dense prefill (GitHub #515).
+        return Ok(PrefillLinear::Int8);
+    }
     if resolved != PrefillLinear::Int8 {
         return Ok(resolved);
     }
@@ -656,15 +668,16 @@ mod tests {
     }
 
     /// On an Ampere card the prompt attention's band left to its default is
-    /// the FP16 one, a named `fp16` stays, and a named `fp8` runs the integer
-    /// band (GitHub #510; a build without it refuses it by its spelling, which
+    /// the integer one (GitHub #515; it was the FP16 band until then), a named
+    /// `fp16` stays, and a named `fp8` runs the integer band (a build without
+    /// it refuses it by its spelling, which
     /// `the_prefill_attention_without_the_integer_band_built` holds); a
     /// Blackwell card and no card at all keep what resolved.
     #[test]
     fn the_prefill_attention_follows_the_card() {
         let (fp8, fp16) = (PrefillAttention::Fp8, PrefillAttention::Fp16);
         let flag = "--model-prefill-attention";
-        assert_eq!(prefill_attention(fp8, false, Some(&ampere()), flag), Ok(fp16));
+        assert_eq!(prefill_attention(fp8, false, Some(&ampere()), flag), Ok(PrefillAttention::Int8));
         assert_eq!(prefill_attention(fp16, true, Some(&ampere()), flag), Ok(fp16));
         assert_eq!(prefill_attention(fp8, true, Some(&ampere()), flag), Ok(PrefillAttention::Int8));
         for named in [false, true] {
@@ -713,15 +726,18 @@ mod tests {
     /// Spec #503 (GitHub #505, #509, #510): the build says whether it carries a
     /// route ([`prefill_route_built`]): both, the dense prefill and the integer
     /// band. Neither is yet what an 8.x card runs when nothing names it
-    /// ([`prefill_route_is_the_8x_default`]): both are opt-in until #515.
+    /// ([`prefill_route_is_the_8x_default`]): both are, since #515.
     #[test]
-    fn this_build_carries_both_routes_and_both_are_opt_in() {
+    fn this_build_carries_both_routes_and_both_are_the_8x_default() {
         assert!(prefill_route_built(PrefillRoute::DensePrefill));
         assert!(prefill_route_built(PrefillRoute::IntegerBand));
-        assert!(!prefill_route_is_the_8x_default(PrefillRoute::DensePrefill));
-        assert!(!prefill_route_is_the_8x_default(PrefillRoute::IntegerBand));
+        assert!(prefill_route_is_the_8x_default(PrefillRoute::DensePrefill));
+        assert!(prefill_route_is_the_8x_default(PrefillRoute::IntegerBand));
         let flag = "--model-prefill-linear";
         let (a, b) = (ampere(), blackwell());
+        assert_eq!(prefill_linear(PrefillLinear::Fp16, false, Some(&a), flag), Ok(PrefillLinear::Int8), "8.x: unset");
+        assert_eq!(prefill_linear(PrefillLinear::Fp16, true, Some(&a), flag), Ok(PrefillLinear::Fp16), "8.x: fp16 named");
+        assert_eq!(prefill_linear(PrefillLinear::Fp16, false, Some(&b), flag), Ok(PrefillLinear::Fp16), "Blackwell: unset");
         assert_eq!(prefill_linear(PrefillLinear::Int8, true, Some(&a), flag), Ok(PrefillLinear::Int8), "8.x: named");
         assert_eq!(prefill_linear(PrefillLinear::Int8, true, Some(&b), flag), Ok(PrefillLinear::Int8), "Blackwell: named");
         assert_eq!(prefill_linear(PrefillLinear::Int8, false, Some(&b), flag), Ok(PrefillLinear::Fp16), "Blackwell: a profile's falls back");
@@ -757,15 +773,15 @@ mod tests {
 
     /// The same decision with the integer band built, the line #510 flips: on
     /// 8.x it runs for every spelling of the 8-bit band named, and for a
-    /// profile's `int8`, while a default's or a profile's `fp8` stays the
-    /// FP16 band (opt-in until #515); on Blackwell it runs only when named.
+    /// profile's `int8`, and for a default's or a profile's `fp8` (the
+    /// default since #515); on Blackwell it runs only when named.
     #[test]
     fn the_prefill_attention_with_the_integer_band_built() {
         let built = |route: PrefillRoute| route == PrefillRoute::IntegerBand;
         let (a, b) = (ampere(), blackwell());
         assert_eq!(prefill_attention_with(PrefillAttention::Fp8, true, Some(&a), "", built), Ok(PrefillAttention::Int8));
-        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, false, Some(&a), "", built), Ok(PrefillAttention::Fp16));
-        assert_eq!(prefill_attention(PrefillAttention::Fp8, false, Some(&a), ""), Ok(PrefillAttention::Fp16), "the build's own");
+        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, false, Some(&a), "", built), Ok(PrefillAttention::Int8));
+        assert_eq!(prefill_attention(PrefillAttention::Fp8, false, Some(&a), ""), Ok(PrefillAttention::Int8), "the build's own");
         assert_eq!(prefill_attention(PrefillAttention::Fp8, true, Some(&a), ""), Ok(PrefillAttention::Int8), "the build's own");
         for named in [false, true] {
             assert_eq!(prefill_attention_with(PrefillAttention::Int8, named, Some(&a), "", built), Ok(PrefillAttention::Int8));
@@ -813,6 +829,9 @@ mod tests {
             assert!(refused.contains("`--model-prefill-linear int8`") && refused.contains("dense prefill") && refused.contains("not carry"), "{refused}");
         }
         assert_eq!(prefill_linear_with(PrefillLinear::Int8, false, Some(&a), flag, built), Ok(PrefillLinear::Int8));
+        assert_eq!(prefill_linear_with(PrefillLinear::Fp16, false, Some(&a), flag, built), Ok(PrefillLinear::Int8), "unset on 8.x");
+        assert_eq!(prefill_linear_with(PrefillLinear::Fp16, false, Some(&a), flag, none), Ok(PrefillLinear::Fp16), "not built: fused");
+        assert_eq!(prefill_linear_with(PrefillLinear::Fp16, false, Some(&b), flag, built), Ok(PrefillLinear::Fp16), "unset on Blackwell");
         assert_eq!(prefill_linear_with(PrefillLinear::Int8, true, Some(&a), flag, built), Ok(PrefillLinear::Int8));
         assert_eq!(prefill_linear_with(PrefillLinear::Int8, true, Some(&b), flag, built), Ok(PrefillLinear::Int8));
         assert_eq!(prefill_linear_with(PrefillLinear::Int8, false, Some(&b), flag, built), Ok(PrefillLinear::Fp16), "no profile selects it there");

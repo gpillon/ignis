@@ -54,6 +54,13 @@ You can add models of your own with an
     40 card the server refuses them, and the 27B's ids are served by their 16
     GB entries. All of them but Swift 1.5's 16 GB build also need a card of
     32 GB or more, by their card class.
+  - *The prefill on an RTX 30 or RTX 40 card.* Unset, the 27B reads a prompt
+    through the **dense prefill** (each trellis matrix decoded once per chunk
+    and multiplied on the integer MMA), the **integer band** of the prompt
+    attention (INT8 scores) and ignis's own gated delta net prefill kernels.
+    `--model-prefill-linear fp16` and `--model-prefill-attention fp16` name
+    the fused prefill and the FP16 band instead
+    ([Context and speculation](../configuration/context-and-speculation.md)).
   - This guide gives no speed for an RTX 30 or RTX 40 card.
 
   Each catalog entry states the smallest card class and the oldest GPU

@@ -69,22 +69,29 @@ three parts, and a failure of any of them stops the release.
 **Quality.** The method is the
 [first-light finding's](../../findings/2026-11-03-first-light-on-sm86.md): the
 16 windows of 4,096 tokens of #340's gate 1, dumped by the `span_logits`
-example at prefill chunk 1024 with the `hq-e8-2b` KV format and
-`IGNIS_MODEL_PREFILL_ATTENTION=fp16` (the band a card below compute capability
-12.0 runs), and scored against the BF16 checkpoint's 64 most probable next
-tokens per position (`kl_top64`, `crates/bench/src/flash_next/kld.rs`). That
-reference is a set of about 90 MB, the windows included, which stays out of
-the repo: `tools/kld-gate/ref_top64.py` builds it from the BF16 checkpoint on
-the RTX 5090 ([its README](../../../tools/kld-gate/README.md)), and the
-coordinator carries it to the card. `tools/kld-gate/score_top64.py` scores a
-dump against it. The limits come from the RTX 5090's figures on the same FP16
-band, 0.03825 for the top-64 KLD and 93.42% for top-1, and are read on the
-`all` row of the scorer's table:
+example at prefill chunk 1024 with the `hq-e8-2b` KV format, on the route a
+card below compute capability 12.0 runs when nothing names one: the dense
+prefill, the integer band and ignis's own gated delta net prefill. The example
+reads the variables rather than the card's default, so the gate names the
+route: `IGNIS_MODEL_PREFILL_LINEAR=int8 IGNIS_MODEL_PREFILL_ATTENTION=int8
+IGNIS_GDN_PREFILL=ours`. The dump is scored against the BF16 checkpoint's 64
+most probable next tokens per position (`kl_top64`,
+`crates/bench/src/flash_next/kld.rs`). That reference is a set of about 90 MB,
+the windows included, which stays out of the repo: `tools/kld-gate/ref_top64.py`
+builds it from the BF16 checkpoint on the RTX 5090
+([its README](../../../tools/kld-gate/README.md)), and the coordinator carries
+it to the card. `tools/kld-gate/score_top64.py` scores a dump against it. The
+limits are derived from the RTX 5090 on the same route: the same dump there,
+under the same three variables, with the same windows, chunk and reference
+set, scored by the same command. Its figures are TODO(#515 coordinator: the
+5090's top-64 KLD on this route) for the top-64 KLD and TODO(#515 coordinator:
+the 5090's top-1 on this route) for top-1, and the limits, read on the `all`
+row of the scorer's table, follow from them:
 
 | | limit |
 |---|---|
-| `KLD top64`, all windows | at most 0.04016 (1.05 times the 5090's) |
-| `top-1` | at least 92.92% (within 0.5 points of the 5090's) |
+| `KLD top64`, all windows | at most 1.05 times the 5090's |
+| `top-1` | at least 0.5 points under the 5090's |
 
 ```sh
 # On the sm_86 card, from the release's checkout, the set ref27b-top64/ beside it
@@ -93,14 +100,17 @@ band, 0.03825 for the top-64 KLD and 93.42% for top-1, and are read on the
 # CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu.
 export IGNIS_CUDA_ARCHITECTURES='86;120a'
 ignis-server model download qwen3.8-27b-16g      # into ./models
-IGNIS_MODEL_PREFILL_ATTENTION=fp16 cargo run --release -p ignis-core --features cuda --example span_logits -- \
+IGNIS_MODEL_PREFILL_LINEAR=int8 IGNIS_MODEL_PREFILL_ATTENTION=int8 IGNIS_GDN_PREFILL=ours \n    cargo run --release -p ignis-core --features cuda --example span_logits -- \
     models/qwen3_8_27b_trellis_sc30-v2.ninfer hq-e8-2b ref27b-top64/windows.json dump-sm86 1024
 python3 tools/kld-gate/score_top64.py ref27b-top64 dump-sm86 --json gate-sm86.json
 ```
 
-A change that alters the 5090's numerics records the 5090's new FP16-band
+A change that alters the 5090's numerics on this route records the 5090's new
 figures in a finding first, from the same dump and score on the 5090, and the
-limits follow them.
+limits follow them. Releases before 0.10.0 gated the FP16 band instead (0.04016
+and 92.92%, from the 5090's 0.03825 and 93.42%); naming
+`IGNIS_MODEL_PREFILL_LINEAR=fp16 IGNIS_MODEL_PREFILL_ATTENTION=fp16` still runs
+that route on the card, and it is no longer the gate.
 
 **The leaf's tests.** Built for `86;120a`, `ctest -LE sm120a-only` passes every
 test. `ignis_kernel_gdn_gating_proj_tests` prints `budget` lines and names with
@@ -113,7 +123,9 @@ ctest --test-dir kernel/build -LE sm120a-only --output-on-failure
 ```
 
 **Smoke.** Start the server under `--profile auto` (on a 24 GB card that is
-`rtx-24gb`, which turns DFlash2 and vision on), and ask for:
+`rtx-24gb`, which turns DFlash2 and vision on). Its `GET /v1/config` reports
+`prefill_linear` and `prefill_attention` as `int8`, the card their source: the
+smoke runs the route the card's users run. Ask for:
 
 - a greedy chat completion;
 - a small image: the smallest the processor accepts, since it upscales every

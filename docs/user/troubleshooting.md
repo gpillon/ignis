@@ -49,11 +49,15 @@ the 27B from its trellis artifact (`--model-id qwen3.8-27b-16g`), and unset
 
 On the same card `--model-exception-weights fp8` is refused naming that
 spelling, whatever its source (a flag, the environment, a config file or a
-`PATCH`). A named `--model-prefill-attention fp8` (or `8bit`, or `int8`) runs
-the integer band there, which is opt-in for now. Unset, the 27B's prompt
-attention runs the FP16 band there, its trellis prefill the fused one, and its
-exception tensors stay BF16. `--model-prefill-linear int8`, the dense prefill,
-runs there; on any card the load refuses it on the NVFP4 artifact, whose body
+`PATCH`). Unset, the 27B's prompt attention there runs the
+integer band (INT8 scores, `--model-prefill-attention int8`, also what a named
+`8bit` or `fp8` means on such a card) and its trellis prefill the dense one
+(`--model-prefill-linear int8`), and its exception tensors stay BF16;
+`--model-prefill-attention fp16` and `--model-prefill-linear fp16` name the
+FP16 band and the fused prefill instead. The gated delta net prefill there
+runs ignis's own kernels, with no option. An RTX 50 or RTX PRO card keeps the
+FP8 band and the fused prefill unless `int8` is named. On any card the load
+refuses the dense prefill on the NVFP4 artifact, whose body
 has no trellis matrices to decode ("prefill_linear 1 (the dense prefill) runs
 the trellis body's matrices, and this artifact's body is NVFP4"): name `fp16`,
 or load the trellis artifact.
