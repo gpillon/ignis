@@ -48,7 +48,7 @@ use ignis_core::step::{
     capture_decode_graphs, decode_program_batch_sampled, decode_program_verify_runs, prefill_program_sampled,
     program_stats, SamplingParams, VerifyLane,
 };
-use ignis_core::{KvFormat, PrefillAttention, RopeScaling, Speculation, SpeculativeBackend};
+use ignis_core::{KvFormat, PrefillAttention, PrefillLinear, RopeScaling, Speculation, SpeculativeBackend};
 
 use near_tie::{assert_equivalent, first_divergence};
 
@@ -103,7 +103,7 @@ fn load(
         None,
         RopeScaling::NONE,
         PrefillAttention::default(),
-        ignis_core::PrefillLinear::default(),
+        PrefillLinear::default(),
         LANES,
     )
     .unwrap_or_else(|e| panic!("model load ({speculation:?}, {LANES} lanes): {e}"));

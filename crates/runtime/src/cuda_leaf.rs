@@ -112,8 +112,8 @@ pub struct CudaLeafConfig {
     /// GitHub #335): the 8-bit band by default, or the FP16-accumulate fallback. Fixed
     /// for the life of the load; Flash-Next's QSA ignores it.
     pub prefill_attention: ignis_core::PrefillAttention,
-    /// The trellis body's prefill route (`--model-prefill-linear`, GitHub
-    /// #509): the fused prefill by default, or the dense prefill, whose one
+    /// The trellis prefill's route (`--model-prefill-linear`, GitHub #505):
+    /// the fused prefill by default, or the dense one (GitHub #509), whose one
     /// buffer is the plan's `trellis_dense` line. Fixed for the life of the
     /// load; the NVFP4 body and Flash-Next take the fused default.
     pub prefill_linear: ignis_core::PrefillLinear,

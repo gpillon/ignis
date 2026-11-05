@@ -72,3 +72,5 @@ gating test checks (it fails if one differs, and on the 5090 if it skips any
 schedule), and the `120a` build's device code is unchanged (`cuobjdump -sass`
 of the kernels' object, before and after). The test's patch now also prints
 each kernel's CTAs per SM.
+
+**Amended by [ADR 0080](0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md)** (spec #503, GitHub #505): on an 8.x card the 8-bit prompt attention band is the integer band, and the route checks gain two routes of the same kind, the dense prefill and the integer band, which a build refuses by name when the operator names one it does not carry and falls back from when a default or a profile gives it.

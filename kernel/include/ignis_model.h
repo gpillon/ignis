@@ -254,18 +254,22 @@ enum ignis_prefill_attention {
   /* FP16 operands with FP16 accumulate inside a 32-key tile, folded into
    * FP32: the fallback. */
   IGNIS_PREFILL_ATTENTION_FP16 = 1,
+  /* GitHub #505 (spec #503): the integer band of the 8.x cards, Q K^T on the
+   * INT8 MMA and P V on the u8 x s8 one. A leaf that does not carry it
+   * refuses the value. */
+  IGNIS_PREFILL_ATTENTION_INT8 = 2,
 };
 
-/* GitHub #509 (spec #503): how the 27B's trellis body multiplies a prefill
- * chunk, a call of more than IGNIS_TRELLIS_DECODE_MAX_TOKENS tokens
+/* GitHub #505 (spec #503): how the 27B's trellis prefill multiplies its
+ * matrices: a body call of more than IGNIS_TRELLIS_DECODE_MAX_TOKENS tokens
  * (ignis_trellis_linear.h); a narrower call, a round and the head take the
- * fused op's decode route either way. */
+ * fused op's decode route either way (GitHub #509). */
 enum ignis_prefill_linear {
-  /* The fused prefill: the trellis decoded inside the GEMM's inner loop on
-   * fp16 tensor cores (ignis_trellis_linear.h). The default. */
+  /* The fused prefill: the trellis decoded inside the GEMM's inner loop, the
+   * multiply in f16. Today's route. */
   IGNIS_PREFILL_LINEAR_FUSED = 0,
-  /* The dense prefill: each matrix decoded once per chunk into INT8, the
-   * activations quantized to INT8 per token, our own s8 GEMM
+  /* The dense prefill (GitHub #509): each matrix decoded once per chunk into
+   * INT8, the activations quantized to INT8 per token, our own s8 GEMM
    * (ignis_dense_prefill.h), with the dense copy's buffer the plan line
    * `trellis_dense_bytes`. The trellis body's alone. */
   IGNIS_PREFILL_LINEAR_DENSE = 1,
@@ -407,9 +411,10 @@ struct ignis_model_load_options {
    * load refuses either mismatch, and the plan (which reads no pointer) sizes
    * the scratch for the ring by this field alone. */
   uint32_t vision_residency;
-  /* enum ignis_prefill_linear (GitHub #509); anything else is refused, and
-   * DENSE on a body that is not trellis. Fixed for the life of the load.
-   * IGNIS_PREFILL_LINEAR_FUSED on Flash-Next and the NVFP4 body. */
+  /* enum ignis_prefill_linear (GitHub #505); anything else is refused, and
+   * DENSE on a body that is not trellis (GitHub #509). Fixed for the life of
+   * the load. IGNIS_PREFILL_LINEAR_FUSED on Flash-Next and the NVFP4 body.
+   * Appended at the end: the struct grew by one padded word. */
   uint32_t prefill_linear;
 };
 

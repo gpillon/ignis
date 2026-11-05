@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use ignis_core::image::ImageSize;
 use ignis_core::ngram_cache::CacheLocation;
 use ignis_core::ngram_table::HotBudget;
-use ignis_core::{ExceptionWeights, KvFormat, KvPoolSize, PrefillAttention, ProposalHeadSetting, RopeSetting, SpeculativeBackend, VisionResidency};
+use ignis_core::{ExceptionWeights, KvFormat, KvPoolSize, PrefillAttention, PrefillLinear, ProposalHeadSetting, RopeSetting, SpeculativeBackend, VisionResidency};
 use serde_json::Value;
 
 use super::{ApiKey, ApiKeySetting, Expose, SpecChoice};
@@ -574,7 +574,8 @@ impl FieldKind for KvFormatKind {
     }
 }
 
-/// The 27B's prompt attention precision (GitHub #335): `fp8` or `fp16`.
+/// The 27B's prompt attention band (GitHub #335, #505): `8bit` (`fp8`),
+/// `fp16` or `int8`.
 pub struct PrefillAttentionKind;
 
 impl FieldKind for PrefillAttentionKind {
@@ -586,6 +587,23 @@ impl FieldKind for PrefillAttentionKind {
     }
 
     fn render(value: &PrefillAttention) -> Value {
+        Value::String(value.as_str().to_owned())
+    }
+}
+
+/// The 27B's trellis prefill route (GitHub #505): `fp16`, the fused prefill,
+/// or `int8`, the dense prefill.
+pub struct PrefillLinearKind;
+
+impl FieldKind for PrefillLinearKind {
+    type Value = PrefillLinear;
+    const TAG: &'static str = "prefill linear";
+
+    fn parse(raw: &str) -> Result<PrefillLinear, String> {
+        PrefillLinear::parse(raw)
+    }
+
+    fn render(value: &PrefillLinear) -> Value {
         Value::String(value.as_str().to_owned())
     }
 }
@@ -1136,6 +1154,9 @@ mod tests {
         assert_eq!(KvFormatKind::parse("hq"), Ok(KvFormat::HqE8_2b));
         assert_eq!(PrefillAttentionKind::parse("FP16"), Ok(PrefillAttention::Fp16));
         assert!(PrefillAttentionKind::parse("fp4").unwrap_err().contains("fp8"));
+        assert_eq!(PrefillAttentionKind::parse("8bit"), Ok(PrefillAttention::Fp8));
+        assert_eq!(PrefillLinearKind::parse("INT8"), Ok(PrefillLinear::Int8));
+        assert!(PrefillLinearKind::parse("fp8").unwrap_err().contains("int8"));
         assert_eq!(ExceptionWeightsKind::parse("FP8"), Ok(ExceptionWeights::Fp8));
         assert!(ExceptionWeightsKind::parse("nvfp4").unwrap_err().contains("bf16"));
         assert_eq!(Effort::parse("LOW"), Ok(ReasoningEffort::Low));
@@ -1151,6 +1172,8 @@ mod tests {
         assert_eq!(TimeoutReplyKind::parse("Partial"), Ok(crate::deadline::TimeoutReply::Partial));
         round_trips::<KvFormatKind>(KvFormat::Bf16);
         round_trips::<PrefillAttentionKind>(PrefillAttention::Fp16);
+        round_trips::<PrefillAttentionKind>(PrefillAttention::Int8);
+        round_trips::<PrefillLinearKind>(PrefillLinear::Int8);
         round_trips::<ExceptionWeightsKind>(ExceptionWeights::Fp8);
         round_trips::<SpecBackend>(SpecChoice::Off);
         round_trips::<DeveloperPolicy>(DeveloperMessagePolicy::IntoSystem);

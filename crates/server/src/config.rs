@@ -216,7 +216,7 @@ pub const DEFAULT_IMAGE_SIZES: [ImageSize; 8] = [
 // to be kept in sync by hand across the crate boundary.
 pub use ignis_runtime::{DEFAULT_MAX_CONTEXT, DEFAULT_PREFILL_CHUNK, PREFILL_CHUNK_ALIGNMENT};
 
-pub use ignis_core::{ExceptionWeights, KvFormat, KvPoolSize, PrefillAttention, VramMode};
+pub use ignis_core::{ExceptionWeights, KvFormat, KvPoolSize, PrefillAttention, PrefillLinear, VramMode};
 use ignis_core::compute::ModelFamily;
 
 /// `--vram-headroom-bytes`' default: what a derived VRAM budget leaves to the
@@ -470,6 +470,10 @@ pub struct Config {
     /// for the life of the load; the 27B's alone, so a Flash-Next start
     /// refuses an explicit value.
     pub prefill_attention: PrefillAttention,
+    /// The 27B's trellis prefill route (`--model-prefill-linear`, GitHub
+    /// #505): the fused prefill by default, or the dense one. Fixed for the
+    /// life of the load; the 27B's alone.
+    pub prefill_linear: PrefillLinear,
     /// How the 27B holds its BF16 exception tensors (`--model-exception-weights`,
     /// GitHub #341): as stored by default, or converted to FP8 at load. Fixed
     /// for the life of the load; the 27B's alone.
@@ -1210,6 +1214,13 @@ fn derive(
         &spelled("model", "prefill_attention"),
     )
     .map_err(ConfigError)?;
+    let prefill_linear = arch::prefill_linear(
+        s.model.prefill_linear,
+        !resolution.adapts("model", "prefill_linear"),
+        sources.card.as_ref(),
+        &spelled("model", "prefill_linear"),
+    )
+    .map_err(ConfigError)?;
     let exception_weights =
         arch::exception_weights(s.model.exception_weights, sources.card.as_ref(), &spelled("model", "exception_weights"))
             .map_err(ConfigError)?;
@@ -1290,6 +1301,7 @@ fn derive(
         vision,
         rope_scaling,
         prefill_attention,
+        prefill_linear,
         exception_weights,
         media,
         request_timeout_secs: s.server.request_timeout,

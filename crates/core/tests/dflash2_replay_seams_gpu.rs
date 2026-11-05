@@ -49,7 +49,7 @@ use ignis_core::step::{
     capture_decode_graphs, decode_program_verify_forced, decode_program_verify_runs, prefill_program_sampled,
     LaneVerifyRun, SamplingParams, VerifyLane,
 };
-use ignis_core::{KvFormat, PrefillAttention, RopeScaling, Speculation, SpeculativeBackend};
+use ignis_core::{KvFormat, PrefillAttention, PrefillLinear, RopeScaling, Speculation, SpeculativeBackend};
 
 const NVFP4: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const TRELLIS: &str = "F:/ai/models/Qwen3.8-27B-trellis-3bpw-ignis/qwen3_8_27b_trellis_sc30-v2.ninfer";
@@ -209,7 +209,7 @@ fn the_replay_seams_hold(artifact_path: &str, body: Body27b, decode_lanes: u32) 
             None,
             RopeScaling::NONE,
             PrefillAttention::default(),
-            ignis_core::PrefillLinear::default(),
+            PrefillLinear::default(),
             decode_lanes,
         )
         .unwrap_or_else(|e| panic!("model load: {e}"));
