@@ -150,6 +150,20 @@ The 27B's hq-e8-2b prefill attention without prompt planes (`ignis_hq_prompt_att
   > OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
   > DEALINGS IN THE SOFTWARE.
 
+### `kernel/src/gdn_conv_split.cu` (spec #503, GitHub #507)
+The GDN prefill's causal conv, writing the query, key and value planes split
+(`ignis::gdn_conv::split_conv`, leaf-internal).
+- Upstream: the reference, `gpillon/ninfer`, commit `a00648cb828457986cf5b4b4f712b4cbcd7af0d1`
+  (the commit `kernel/vendor/manifest.json` pins), Apache-2.0 (`kernel/vendor/LICENSE`):
+  - `src/ops/kernel/causal_conv1d.cuh`: `causal_conv1d_prefill_pairs_kernel` (a thread per
+    token and channel pair, the taps from the chunk or the state, the fp32 accumulation, SiLU,
+    the paired BF16 rounding) and `causal_conv1d_prefill_state_kernel`;
+  - `src/ops/launcher/causal_conv1d.cu`: `causal_conv1d_prefill_launch`'s grids.
+- Changed here: each output pair is stored into its own plane by channel range, so the layer
+  body's three strided copies go; one form for every T; the state in place only. The file
+  header lists the changes. The vendored op stays in the subtree as its oracle and for the
+  decode, graph and verify forms (`kernel/vendor/VENDOR.md`).
+
 ## Per-file provenance (pre-#42 adaptations, superseded by ADR 0010)
 
 ### `kernel/src/nvfp4_gemm_decode.cuh` (ticket 03)

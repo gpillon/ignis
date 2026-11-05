@@ -314,7 +314,14 @@ P1-14 (GitHub #50) adds the GDN family:
   `ops/launcher/causal_conv1d.{h,cu}`, `ops/wrapper/causal_conv1d_silu.cpp`,
   `ninfer/ops/causal_conv1d_silu.h`: the depthwise causal width-4 conv fused
   with SiLU over the conv'd channels, plus its rolling-tap and B-way snapshot
-  forms.
+  forms. GitHub #507 (spec #503, ADR 0031 option (b)): the GDN prefill body's
+  call left it for `kernel/src/gdn_conv_split.cu`, an adapted op of its
+  prefill pair form that writes the query, key and value planes split, so the
+  three strided copies that split this op's single plane are gone. The files
+  stay here unpatched: the decode round's body still runs the snapshot form,
+  and the plain op is the oracle the adapted one is held to
+  bit for bit (`kernel/tests/test_gdn_conv_split.cu`) and the test-only
+  pre-#507 body (`kernel/src/layer_internal.h`).
 - **gdn_gating** — `ops/kernel/gdn_gating.cuh`, `ops/launcher/gdn_gating.{h,cu}`,
   `ops/wrapper/gdn_gating.cpp`, `ninfer/ops/gdn_gating.h`: the per-head decay
   gate `g = -exp(A_log)*softplus(a+dt_bias)` and update gate
