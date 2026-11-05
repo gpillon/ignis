@@ -989,6 +989,15 @@ __global__ void __launch_bounds__(kFaThreads, 1)
 constexpr int kDiagNoPv = 1;
 constexpr int kDiagNoSoftmax = 2;
 constexpr int kDiagNoQk = 4;
+// Finer cuts inside the softmax (fa_i8_kernel only): no exp2 (its input taken as is), no max and
+// sum reductions (each row's max taken from one element, no quad shuffles), no P -> u8 conversion
+// and packing (P's bytes from the bits of 255 p).
+constexpr int kDiagNoExp = 8;
+constexpr int kDiagNoMaxSum = 16;
+constexpr int kDiagNoPack = 32;
+// The fold with one FP32 op an element instead of three (o += the accumulator's bits as a float):
+// what the exact conversion and the scale cost.
+constexpr int kDiagCheapFold = 64;
 constexpr int kKRowPad = kHeadDim + 16;  // a padded K row: 272 bytes
 template <bool kPad>
 constexpr int kI8KBytes = kPad ? kTile * kKRowPad : kKTileBytes<true>;
@@ -1215,17 +1224,26 @@ __global__ void __launch_bounds__(kOneHead ? kFaThreads / 2 : kFaThreads, kOneHe
         }
       }
       float mx[2] = {-CUDART_INF_F, -CUDART_INF_F};
+      if constexpr ((kDiag & kDiagNoMaxSum) != 0) {
+        mx[0] = sc[0][0];
+        mx[1] = sc[0][2];
+      } else {
 #pragma unroll
-      for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < 4; ++nt) {
 #pragma unroll
-        for (int e = 0; e < 4; ++e) mx[e / 2] = fmaxf(mx[e / 2], sc[nt][e]);
+          for (int e = 0; e < 4; ++e) mx[e / 2] = fmaxf(mx[e / 2], sc[nt][e]);
+        }
       }
 #pragma unroll
       for (int r = 0; r < 2; ++r) {
-        mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
-        mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
+        if constexpr ((kDiag & kDiagNoMaxSum) == 0) {
+          mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
+          mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
+        }
         const float mn = fmaxf(m[r], mx[r]);
-        corr[r] = mn == -CUDART_INF_F ? 1.0f : ex2_approx(__fsub_rn(m[r], mn));
+        corr[r] = mn == -CUDART_INF_F ? 1.0f
+                  : (kDiag & kDiagNoExp) != 0 ? __fsub_rn(m[r], mn)
+                                               : ex2_approx(__fsub_rn(m[r], mn));
         m[r] = mn;
       }
       const float bias[2] = {__fsub_rn(8.0f, m[0] == -CUDART_INF_F ? 0.0f : m[0]),
@@ -1235,19 +1253,31 @@ __global__ void __launch_bounds__(kOneHead ? kFaThreads / 2 : kFaThreads, kOneHe
         std::uint32_t w[4];
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt) {
-          const float a = __fmul_rn(255.0f, ex2_approx(__fsub_rn(__fadd_rn(sc[nt][2 * r], bias[r]), 8.0f)));
-          const float b = __fmul_rn(255.0f, ex2_approx(__fsub_rn(__fadd_rn(sc[nt][2 * r + 1], bias[r]), 8.0f)));
-          // rn(x) for 0 <= x < 2^22 is the low bits of x + 1.5 2^23: bytes [a, b] of the pair.
-          w[nt] = __byte_perm(__float_as_uint(__fadd_rn(a, kMagicF)), __float_as_uint(__fadd_rn(b, kMagicF)), 0x0040);
+          auto ex = [](float x) { return (kDiag & kDiagNoExp) != 0 ? x : ex2_approx(x); };
+          const float a = __fmul_rn(255.0f, ex(__fsub_rn(__fadd_rn(sc[nt][2 * r], bias[r]), 8.0f)));
+          const float b = __fmul_rn(255.0f, ex(__fsub_rn(__fadd_rn(sc[nt][2 * r + 1], bias[r]), 8.0f)));
+          if constexpr ((kDiag & kDiagNoPack) != 0) {
+            w[nt] = __float_as_uint(a) ^ __float_as_uint(b);
+          } else {
+            // rn(x) for 0 <= x < 2^22 is the low bits of x + 1.5 2^23: bytes [a, b] of the pair.
+            w[nt] = __byte_perm(__float_as_uint(__fadd_rn(a, kMagicF)), __float_as_uint(__fadd_rn(b, kMagicF)), 0x0040);
+          }
         }
-        pf[r] = __byte_perm(w[0], w[1], 0x5410);
-        pf[2 + r] = __byte_perm(w[2], w[3], 0x5410);
+        if constexpr ((kDiag & kDiagNoPack) != 0) {
+          pf[r] = w[0] ^ w[1];
+          pf[2 + r] = w[2] ^ w[3];
+        } else {
+          pf[r] = __byte_perm(w[0], w[1], 0x5410);
+          pf[2 + r] = __byte_perm(w[2], w[3], 0x5410);
+        }
         pi[r] = static_cast<int>(__dp4a(pf[2 + r], 0x01010101u, __dp4a(pf[r], 0x01010101u, 0u)));
       }
 #pragma unroll
       for (int r = 0; r < 2; ++r) {
-        pi[r] += __shfl_xor_sync(0xffffffffu, pi[r], 1);
-        pi[r] += __shfl_xor_sync(0xffffffffu, pi[r], 2);
+        if constexpr ((kDiag & kDiagNoMaxSum) == 0) {
+          pi[r] += __shfl_xor_sync(0xffffffffu, pi[r], 1);
+          pi[r] += __shfl_xor_sync(0xffffffffu, pi[r], 2);
+        }
         l[r] = __fmaf_rn(l[r], corr[r], __fmul_rn(static_cast<float>(pi[r]), kU8));
       }
     }
@@ -1270,8 +1300,12 @@ __global__ void __launch_bounds__(kOneHead ? kFaThreads / 2 : kFaThreads, kOneHe
         for (int x = 0; x < 2; ++x) {
 #pragma unroll
           for (int e = 0; e < 4; ++e) {
-            o[2 * dp + x][e] = __fmaf_rn(o[2 * dp + x][e], corr[e / 2],
-                                         __fmul_rn(__fsub_rn(__int_as_float(t[x][e]), kMagicF), fv));
+            if constexpr ((kDiag & kDiagCheapFold) != 0) {
+              o[2 * dp + x][e] = __fadd_rn(o[2 * dp + x][e], __int_as_float(t[x][e]));
+            } else {
+              o[2 * dp + x][e] = __fmaf_rn(o[2 * dp + x][e], corr[e / 2],
+                                           __fmul_rn(__fsub_rn(__int_as_float(t[x][e]), kMagicF), fv));
+            }
           }
         }
       }
@@ -1514,6 +1548,360 @@ __global__ void __launch_bounds__(kOneHead ? kFaThreads / 2 : kFaThreads, kOneHe
   }
 }
 
+// ---- PROTOTYPE (phase 2d): the i8 band with the head dim split over a warp pair -----------------
+//
+// fa_i8_kernel's math, row for row and tile for tile (the bench holds it to i8ref byte for byte),
+// on twice the warps: a CTA of 16 warps for the same 64 queries of two heads, warps w and w ^ 8 a
+// pair on the same 16 rows. Each runs Q K^T over its half of the 256 dims (4 of the 8 k steps)
+// into an exact int32 partial S, the pair sums the two partials through shared memory (the integer
+// sum is the S of the whole row, in any order), both run the same softmax on it, and each folds
+// P V for its half of O. So a thread holds 64 fp32 of O and 16 registers of Q instead of 128 and
+// 32, the kernel fits 128 registers, and a scheduler holds 4 warps instead of 2. The cost: the
+// softmax twice, and 2 KiB of partial S a warp and tile through shared memory.
+constexpr int kPairThreads = 2 * kFaThreads;                    // 16 warps
+constexpr int kPairXBytes = kPairThreads / 32 * 32 * 16 * 4;    // partial S: 2 KiB a warp
+template <int kStages, bool kQSmem>
+constexpr int kPairSmemBytes = kStages * kI8TileBytes<false> + kPairXBytes + (kQSmem ? kQSmemBytes<false> : 0);
+
+__device__ __forceinline__ void bar_named(int id, int threads) {
+  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(threads) : "memory");
+}
+
+template <int kStages, bool kOneBarrier, bool kQSmem, int kDiag = 0>
+__global__ void __launch_bounds__(kPairThreads, 1)
+    fa_i8_pair_kernel(Queries qs, int start, int width, float scale, Columns cols, PassBuffers buf,
+                      int splits, int resume, Carry carry) {
+  static_assert(kStages >= 2 && (!kOneBarrier || kStages >= 3), "one barrier needs three stages");
+  extern __shared__ __align__(128) std::uint8_t fa_smem[];
+  constexpr int kTileB = kI8TileBytes<false>;
+  constexpr int kHalfSteps = kHeadDim / 32 / 2;  // k steps of Q K^T a warp: 4
+  constexpr int kHalfDt = kHeadDim / 8 / 2;      // n8 tiles of O a warp: 16
+  const std::uint32_t sbase = smem_u32(fa_smem);
+  const std::uint32_t xbase = sbase + static_cast<std::uint32_t>(kStages * kTileB);
+  const std::uint32_t qbase = xbase + static_cast<std::uint32_t>(kPairXBytes);
+  const int lead = start % kQ;
+  const int ntiles = (lead + width + kQ - 1) / kQ;
+  const int tile = ntiles - 1 - static_cast<int>(blockIdx.x) / splits;  // longest first
+  const int split = static_cast<int>(blockIdx.x) % splits;
+  if (tile < 0) return;
+  const int q0 = tile * kQ - lead;
+  const int rend = min(start + q0 + kQ, start + width);
+  const int tid = static_cast<int>(threadIdx.x);
+  const int wid = tid / 32, lane = tid % 32;
+  const int half = wid / 8;        // dims 128 half .. 128 half + 127
+  const int rg = wid % 8;          // the pair's 16 rows: head rg / 4, rows 16 (rg % 4) ..
+  const int warp = rg % 4;
+  const int hl = rg / 4;
+  const int g = static_cast<int>(blockIdx.y) / kHeadPairs;
+  const int h = g * kGroup + (static_cast<int>(blockIdx.y) % kHeadPairs) * kHeadsPerCta + hl;
+  const int n = (cols.before(rend) + kTile - 1) / kTile;
+  const int cbeg = split * n / splits, cend = (split + 1) * n / splits;
+  if (cend <= cbeg && resume != 0) return;
+
+  auto stage_of = [](int c) { return static_cast<std::uint32_t>((c % kStages) * kTileB); };
+  auto issue = [&](int c) {
+    const std::uint32_t st = sbase + stage_of(c);
+    const std::uint8_t *ksrc =
+        buf.k + (static_cast<std::int64_t>(g) * buf.capacity + c * kTile) * kHeadDim;
+    const std::uint8_t *vsrc =
+        buf.v + (static_cast<std::int64_t>(g) * (buf.capacity / kTile) + c) * kVtTileBytes;
+    cp_async16(st + row_swz<true>(tid >> 4, tid & 15), ksrc + tid * 16);
+    cp_async16(st + kKTileBytes<true> + vt_off(tid >> 1, tid & 1), vsrc + tid * 16);
+  };
+  auto issue_q = [&]() {
+    if constexpr (kQSmem) {
+#pragma unroll
+      for (int j = 0; j < kHeadsPerCta * kQ * 16 / kPairThreads; ++j) {
+        const int u = tid + j * kPairThreads;
+        const int head = u / (kQ * 16), row = (u / 16) % kQ, unit = u % 16;
+        const std::uint32_t dst = qbase + static_cast<std::uint32_t>(head * kQ * kHeadDim) + row_swz<true>(row, unit);
+        const int t = q0 + row;
+        if (t >= 0 && t < width) {
+          const int hh = g * kGroup + (static_cast<int>(blockIdx.y) % kHeadPairs) * kHeadsPerCta + head;
+          cp_async16(dst, qs.q8 + (static_cast<std::int64_t>(t) * kQHeads + hh) * kHeadDim + unit * 16);
+        } else {
+          asm volatile("st.shared.v4.u32 [%0], {%1, %1, %1, %1};" ::"r"(dst), "r"(0u));
+        }
+      }
+    }
+  };
+
+  const int r0 = lane / 4, c2 = 2 * (lane % 4);
+  const int ta = warp * 16 + r0, tb = ta + 8;
+  std::uint32_t qa[kQSmem ? 1 : kHalfSteps][4];
+  float f[2];
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    const int t = q0 + (r ? tb : ta);
+    const bool in = t >= 0 && t < width;
+    const float sq = in ? qs.q_scale[static_cast<std::int64_t>(t) * kQHeads + h] : 1.0f;
+    f[r] = in ? sq * scale * kLog2e : 0.0f;
+  }
+  if constexpr (!kQSmem) {
+#pragma unroll
+    for (int k = 0; k < kHalfSteps; ++k) {
+      const int kk = kHalfSteps * half + k;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int t = q0 + ((i & 1) ? tb : ta);
+        const std::int64_t row = static_cast<std::int64_t>(t) * kQHeads + h;
+        qa[k][i] = t < 0 || t >= width
+                       ? 0u
+                       : *reinterpret_cast<const std::uint32_t *>(qs.q8 + row * kHeadDim + kk * 32 +
+                                                                  16 * (i / 2) + 4 * (lane % 4));
+      }
+    }
+  }
+  const int pa = start + q0 + ta, pb = start + q0 + tb;
+  const int warp_last = start + q0 + warp * 16 + 15;
+
+  // This warp's half of O: n8 tiles kHalfDt half .. kHalfDt half + 15.
+  float o[kHalfDt][4];
+  float m[2] = {-CUDART_INF_F, -CUDART_INF_F}, l[2] = {0.0f, 0.0f};
+#pragma unroll
+  for (int i = 0; i < kHalfDt; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+  if (resume != 0) {
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      const int t = q0 + (r ? tb : ta);
+      if (t < 0 || t >= width) continue;
+      const std::int64_t row = (static_cast<std::int64_t>(split) * width + t) * kQHeads + h;
+      m[r] = carry.m[row];
+      l[r] = carry.l[row];
+      const __half *po = carry.o + row * kHeadDim + kHalfDt * 8 * half;
+#pragma unroll
+      for (int dt = 0; dt < kHalfDt; ++dt) {
+        const float2 v = __half22float2(*reinterpret_cast<const __half2 *>(po + dt * 8 + c2));
+        o[dt][2 * r] = v.x * l[r];
+        o[dt][2 * r + 1] = v.y * l[r];
+      }
+    }
+  }
+  const int lm = lane / 8, lr = lane % 8;
+  const std::uint32_t qrow = qbase + static_cast<std::uint32_t>(hl * kQ * kHeadDim);
+  const std::uint32_t xmine = xbase + static_cast<std::uint32_t>(wid * 2048 + lane * 16);
+  const std::uint32_t xpart = xbase + static_cast<std::uint32_t>((wid ^ 8) * 2048 + lane * 16);
+  const int tiles_per_head = buf.capacity / kTile;
+  constexpr float kU8 = 256.0f / 255.0f;
+
+  auto tile_work = [&](int c, int key0) {
+    const std::uint32_t ks = sbase + stage_of(c);
+    const std::uint32_t vs = ks + kKTileBytes<true>;
+    const float sk = buf.scale[g * tiles_per_head + c];
+    const float sv = buf.scale[(kKvHeads + g) * tiles_per_head + c];
+    // Q K^T over this warp's half of the dims; half 0 carries 1.5 2^23, so the pair's sum is S
+    // from 1.5 2^23 as fa_i8_kernel's.
+    int si[4][4];
+    const int s0 = half == 0 ? kMagic : 0;
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) si[nt][0] = si[nt][1] = si[nt][2] = si[nt][3] = s0;
+    if constexpr ((kDiag & kDiagNoQk) != 0) {
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) si[nt][e] += ((lane * 977 + nt * 31 + e) ^ (c * 131)) & 0x1FFF;
+      }
+    } else {
+#pragma unroll
+      for (int k = 0; k < kHalfSteps; ++k) {
+        const int kk = kHalfSteps * half + k;
+        std::uint32_t a[4];
+        if constexpr (kQSmem) {
+          ldsm_x4(a, qrow + row_swz<true>(warp * 16 + lr + 8 * (lm & 1), 2 * kk + (lm >> 1)));
+        } else {
+          a[0] = qa[k][0];
+          a[1] = qa[k][1];
+          a[2] = qa[k][2];
+          a[3] = qa[k][3];
+        }
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+          std::uint32_t b[4];
+          ldsm_x4(b, ks + row_swz<true>(16 * p + lr + 8 * (lm / 2), 2 * kk + lm % 2));
+          mma_s8(si[2 * p], a, b);
+          mma_s8(si[2 * p + 1], a, b + 2);
+        }
+      }
+    }
+    // The pair's partial S summed: each writes its own, then adds its partner's.
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+      asm volatile("st.shared.v4.s32 [%0], {%1, %2, %3, %4};" ::"r"(xmine + nt * 512), "r"(si[nt][0]),
+                   "r"(si[nt][1]), "r"(si[nt][2]), "r"(si[nt][3])
+                   : "memory");
+    }
+    bar_named(1 + rg, 64);
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+      int x0, x1, x2, x3;
+      asm volatile("ld.shared.v4.s32 {%0, %1, %2, %3}, [%4];"
+                   : "=r"(x0), "=r"(x1), "=r"(x2), "=r"(x3)
+                   : "r"(xpart + nt * 512)
+                   : "memory");
+      si[nt][0] += x0;
+      si[nt][1] += x1;
+      si[nt][2] += x2;
+      si[nt][3] += x3;
+    }
+    // The softmax, as fa_i8_kernel's (both warps of the pair run it on the same S).
+    std::uint32_t pf[4];
+    float corr[2];
+    int pi[2];
+    if constexpr ((kDiag & kDiagNoSoftmax) != 0) {
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        pf[r] = static_cast<std::uint32_t>(si[0][2 * r] ^ si[1][2 * r + 1]) & 0x7F7F7F7Fu;
+        pf[2 + r] = static_cast<std::uint32_t>(si[2][2 * r] ^ si[3][2 * r + 1]) & 0x7F7F7F7Fu;
+        pi[r] = static_cast<int>(pf[r] & 0xFFFFu);
+        corr[r] = 1.0f;
+        l[r] = l[r] + static_cast<float>(pi[r]);
+      }
+    } else {
+      float sc[4][4];
+      const float fs[2] = {__fmul_rn(f[0], sk), __fmul_rn(f[1], sk)};
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) sc[nt][e] = __fmul_rn(__fsub_rn(__int_as_float(si[nt][e]), kMagicF), fs[e / 2]);
+      }
+      const bool edge = key0 + kTile - 1 > start + q0 + warp * 16 || (c + 1) * kTile > cols.count;
+      if (edge) {
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            const int col = nt * 8 + c2 + (e & 1);
+            if (c * kTile + col >= cols.count || key0 + col > (e < 2 ? pa : pb)) sc[nt][e] = -CUDART_INF_F;
+          }
+        }
+      }
+      float mx[2] = {-CUDART_INF_F, -CUDART_INF_F};
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) mx[e / 2] = fmaxf(mx[e / 2], sc[nt][e]);
+      }
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
+        mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
+        const float mn = fmaxf(m[r], mx[r]);
+        corr[r] = mn == -CUDART_INF_F ? 1.0f : ex2_approx(__fsub_rn(m[r], mn));
+        m[r] = mn;
+      }
+      const float bias[2] = {__fsub_rn(8.0f, m[0] == -CUDART_INF_F ? 0.0f : m[0]),
+                             __fsub_rn(8.0f, m[1] == -CUDART_INF_F ? 0.0f : m[1])};
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        std::uint32_t w[4];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+          const float a = __fmul_rn(255.0f, ex2_approx(__fsub_rn(__fadd_rn(sc[nt][2 * r], bias[r]), 8.0f)));
+          const float b = __fmul_rn(255.0f, ex2_approx(__fsub_rn(__fadd_rn(sc[nt][2 * r + 1], bias[r]), 8.0f)));
+          w[nt] = __byte_perm(__float_as_uint(__fadd_rn(a, kMagicF)), __float_as_uint(__fadd_rn(b, kMagicF)), 0x0040);
+        }
+        pf[r] = __byte_perm(w[0], w[1], 0x5410);
+        pf[2 + r] = __byte_perm(w[2], w[3], 0x5410);
+        pi[r] = static_cast<int>(__dp4a(pf[2 + r], 0x01010101u, __dp4a(pf[r], 0x01010101u, 0u)));
+      }
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        pi[r] += __shfl_xor_sync(0xffffffffu, pi[r], 1);
+        pi[r] += __shfl_xor_sync(0xffffffffu, pi[r], 2);
+        l[r] = __fmaf_rn(l[r], corr[r], __fmul_rn(static_cast<float>(pi[r]), kU8));
+      }
+    }
+    // P V for this warp's half of the dims.
+    if constexpr ((kDiag & kDiagNoPv) == 0) {
+      const float fv = __fmul_rn(sv, kU8);
+#pragma unroll
+      for (int j = 0; j < kHalfDt / 2; ++j) {
+        const int dp = kHalfDt / 2 * half + j;
+        int t[2][4];
+#pragma unroll
+        for (int x = 0; x < 2; ++x) t[x][0] = t[x][1] = t[x][2] = t[x][3] = kMagic;
+        std::uint32_t b[4];
+        ldsm_x4(b, vs + vt_off(16 * dp + 8 * (lm / 2) + lr, lm % 2));
+        mma_u8s8(t[0], pf, b);
+        mma_u8s8(t[1], pf, b + 2);
+#pragma unroll
+        for (int x = 0; x < 2; ++x) {
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            o[2 * j + x][e] = __fmaf_rn(o[2 * j + x][e], corr[e / 2],
+                                        __fmul_rn(__fsub_rn(__int_as_float(t[x][e]), kMagicF), fv));
+          }
+        }
+      }
+    } else {
+      (void)sv;
+    }
+  };
+
+  constexpr int kPre = kOneBarrier ? kStages - 1 : kStages;
+#pragma unroll
+  for (int i = 0; i < kPre; ++i) {
+    if (i == 0) issue_q();
+    if (cbeg + i < cend) issue(cbeg + i);
+    cp_commit();
+  }
+  for (int c = cbeg; c < cend; ++c) {
+    if constexpr (kOneBarrier) {
+      cp_wait<kStages - 2>();
+      __syncthreads();  // tile c is everyone's; every warp is done with tile c - 1's stage and S
+      if (c + kStages - 1 < cend) issue(c + kStages - 1);
+      cp_commit();
+    } else {
+      cp_wait<kStages - 1>();
+      __syncthreads();
+    }
+    // Both warps of a pair skip a tile together (the same rows).
+    const int key0 = cols.key(c * kTile);
+    if (key0 <= warp_last) tile_work(c, key0);
+    if constexpr (!kOneBarrier) {
+      __syncthreads();  // every warp is done with this stage and its partner's S
+      if (c + kStages < cend) issue(c + kStages);
+      cp_commit();
+    }
+  }
+
+  // The split's state: each warp its half of O; m and l (the same in both) from half 0.
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    const int t = q0 + (r ? tb : ta);
+    if (t < 0 || t >= width) continue;
+    const std::int64_t row = (static_cast<std::int64_t>(split) * width + t) * kQHeads + h;
+    __half *po = carry.o + row * kHeadDim + kHalfDt * 8 * half;
+    const float inv = l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
+#pragma unroll
+    for (int dt = 0; dt < kHalfDt; ++dt) {
+      *reinterpret_cast<__half2 *>(po + dt * 8 + c2) =
+          __floats2half2_rn(o[dt][2 * r] * inv, o[dt][2 * r + 1] * inv);
+    }
+    if (c2 == 0 && half == 0) {
+      carry.m[row] = m[r];
+      carry.l[row] = l[r];
+    }
+  }
+}
+
+void check_launch(const char *what);
+
+template <int kStages, bool kOneBarrier, bool kQSmem, int kDiag = 0>
+void launch_fa_i8_pair(dim3 grid, Queries qs, int start, int width, float scale, Columns cols,
+                       PassBuffers buf, int splits, int resume, Carry carry, cudaStream_t stream) {
+  constexpr int kSmem = kPairSmemBytes<kStages, kQSmem>;
+  static const cudaError_t attribute = cudaFuncSetAttribute(
+      fa_i8_pair_kernel<kStages, kOneBarrier, kQSmem, kDiag>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+  if (attribute != cudaSuccess) {
+    throw std::runtime_error(std::string("ignis_hq_prompt_attention: shared memory attribute: ") +
+                             cudaGetErrorString(attribute));
+  }
+  fa_i8_pair_kernel<kStages, kOneBarrier, kQSmem, kDiag><<<grid, kPairThreads, kSmem, stream>>>(
+      qs, start, width, scale, cols, buf, splits, resume, carry);
+  check_launch("band attention");
+}
+
 // ---- the merge: the splits combined, normalized and un-rotated, one warp per row ---------------
 
 __global__ void __launch_bounds__(kRowThreads) merge_kernel(Carry carry, int width, int splits,
@@ -1690,32 +2078,37 @@ struct I8Variant {
   const char *name;
   int stages;
   bool one_barrier, pipe_qk, q_smem, ping_pong, pad, fuse_qk, one_head;
+  bool pair;  // fa_i8_pair_kernel (stages, one_barrier and q_smem apply)
 };
 constexpr I8Variant kI8Variants[] = {
-    {"conversions (2 stages, 2 barriers)", 2, false, false, false, false, false, false, false},
-    {"+ one barrier, 2 stages", 2, true, false, false, false, false, false, false},
-    {"+ one barrier, 3 stages", 3, true, false, false, false, false, false, false},
-    {"+ one barrier, 4 stages", 4, true, false, false, false, false, false, false},
-    {"QK of tile c+1 under the softmax, 3 stages", 3, true, true, false, false, false, false, false},
-    {"QK under the softmax, 4 stages", 4, true, true, false, false, false, false, false},
-    {"QK under the softmax, Q from shared memory, 4 stages", 4, true, true, true, false, false, false, false},
-    {"ping-pong of each scheduler's two warps, 3 stages", 3, true, false, false, true, false, false, false},
-    {"ping-pong, 4 stages", 4, true, false, false, true, false, false, false},
-    {"conversions, padded tiles (2 stages, 2 barriers)", 2, false, false, false, false, true, false, false},
-    {"ping-pong, 3 stages, padded tiles", 3, true, false, false, true, true, false, false},
-    {"ping-pong, 4 stages, padded tiles", 4, true, false, false, true, true, false, false},
-    {"QK of tile c+1 inside the P V loop, 3 stages", 3, true, false, false, false, false, true, false},
-    {"QK inside the P V loop, 4 stages", 4, true, false, false, false, false, true, false},
-    {"QK inside the P V loop, 4 stages, padded tiles", 4, true, false, false, false, true, true, false},
-    {"QK inside the P V loop, 4 stages, Q from shared memory", 4, true, false, true, false, false, true, false},
-    {"conversions, 3 stages, 2 barriers", 3, false, false, false, false, false, false, false},
-    {"conversions, 4 stages, 2 barriers", 4, false, false, false, false, false, false, false},
-    {"ping-pong, 3 stages, 2 barriers", 3, false, false, false, true, false, false, false},
-    {"ping-pong, 4 stages, 2 barriers", 4, false, false, false, true, false, false, false},
-    {"one head a CTA, 2 CTAs an SM (2 stages, 2 barriers)", 2, false, false, false, false, false, false, true},
-    {"one head a CTA, 3 stages, 2 barriers", 3, false, false, false, false, false, false, true},
-    {"one head a CTA, 3 stages, one barrier", 3, true, false, false, false, false, false, true},
-    {"one head a CTA, 2 stages, 2 barriers, padded tiles", 2, false, false, false, false, true, false, true},
+    {"conversions (2 stages, 2 barriers)", 2, false, false, false, false, false, false, false, false},
+    {"+ one barrier, 2 stages", 2, true, false, false, false, false, false, false, false},
+    {"+ one barrier, 3 stages", 3, true, false, false, false, false, false, false, false},
+    {"+ one barrier, 4 stages", 4, true, false, false, false, false, false, false, false},
+    {"QK of tile c+1 under the softmax, 3 stages", 3, true, true, false, false, false, false, false, false},
+    {"QK under the softmax, 4 stages", 4, true, true, false, false, false, false, false, false},
+    {"QK under the softmax, Q from shared memory, 4 stages", 4, true, true, true, false, false, false, false, false},
+    {"ping-pong of each scheduler's two warps, 3 stages", 3, true, false, false, true, false, false, false, false},
+    {"ping-pong, 4 stages", 4, true, false, false, true, false, false, false, false},
+    {"conversions, padded tiles (2 stages, 2 barriers)", 2, false, false, false, false, true, false, false, false},
+    {"ping-pong, 3 stages, padded tiles", 3, true, false, false, true, true, false, false, false},
+    {"ping-pong, 4 stages, padded tiles", 4, true, false, false, true, true, false, false, false},
+    {"QK of tile c+1 inside the P V loop, 3 stages", 3, true, false, false, false, false, true, false, false},
+    {"QK inside the P V loop, 4 stages", 4, true, false, false, false, false, true, false, false},
+    {"QK inside the P V loop, 4 stages, padded tiles", 4, true, false, false, false, true, true, false, false},
+    {"QK inside the P V loop, 4 stages, Q from shared memory", 4, true, false, true, false, false, true, false, false},
+    {"conversions, 3 stages, 2 barriers", 3, false, false, false, false, false, false, false, false},
+    {"conversions, 4 stages, 2 barriers", 4, false, false, false, false, false, false, false, false},
+    {"ping-pong, 3 stages, 2 barriers", 3, false, false, false, true, false, false, false, false},
+    {"ping-pong, 4 stages, 2 barriers", 4, false, false, false, true, false, false, false, false},
+    {"one head a CTA, 2 CTAs an SM (2 stages, 2 barriers)", 2, false, false, false, false, false, false, true, false},
+    {"one head a CTA, 3 stages, 2 barriers", 3, false, false, false, false, false, false, true, false},
+    {"one head a CTA, 3 stages, one barrier", 3, true, false, false, false, false, false, true, false},
+    {"one head a CTA, 2 stages, 2 barriers, padded tiles", 2, false, false, false, false, true, false, true, false},
+    {"head dim split over a warp pair, 16 warps (2 stages, 2 barriers)", 2, false, false, false, false, false, false, false, true},
+    {"warp pair, 3 stages, one barrier", 3, true, false, false, false, false, false, false, true},
+    {"warp pair, 3 stages, 2 barriers", 3, false, false, false, false, false, false, false, true},
+    {"warp pair, Q from shared memory (2 stages, 2 barriers)", 2, false, false, true, false, false, false, false, true},
 };
 constexpr int kI8VariantCount = static_cast<int>(sizeof(kI8Variants) / sizeof(kI8Variants[0]));
 constexpr int kI8Default = 0;
@@ -1744,8 +2137,13 @@ template <int kVariant, int kDiag = 0>
 void launch_fa_i8_variant(dim3 grid, Queries qs, int start, int width, float scale, Columns cols,
                           PassBuffers buf, int splits, int resume, Carry carry, cudaStream_t stream) {
   constexpr I8Variant v = kI8Variants[kVariant];
-  launch_fa_i8<v.stages, v.one_barrier, v.pipe_qk, v.q_smem, v.ping_pong, v.pad, v.fuse_qk, v.one_head, kDiag>(
-      grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
+  if constexpr (v.pair) {
+    launch_fa_i8_pair<v.stages, v.one_barrier, v.q_smem, kDiag>(grid, qs, start, width, scale, cols, buf, splits,
+                                                                 resume, carry, stream);
+  } else {
+    launch_fa_i8<v.stages, v.one_barrier, v.pipe_qk, v.q_smem, v.ping_pong, v.pad, v.fuse_qk, v.one_head, kDiag>(
+        grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
+  }
 }
 
 void launch_i8(int variant, int diag, dim3 grid, Queries qs, int start, int width, float scale,
@@ -1758,6 +2156,11 @@ void launch_i8(int variant, int diag, dim3 grid, Queries qs, int start, int widt
       case kDiagNoPv | kDiagNoSoftmax: return launch_fa_i8_variant<kI8Default, kDiagNoPv | kDiagNoSoftmax>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
       case kDiagNoQk: return launch_fa_i8_variant<kI8Default, kDiagNoQk>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
       case kDiagNoPv | kDiagNoSoftmax | kDiagNoQk: return launch_fa_i8_variant<kI8Default, kDiagNoPv | kDiagNoSoftmax | kDiagNoQk>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
+      case kDiagNoExp: return launch_fa_i8_variant<kI8Default, kDiagNoExp>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
+      case kDiagNoMaxSum: return launch_fa_i8_variant<kI8Default, kDiagNoMaxSum>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
+      case kDiagNoPack: return launch_fa_i8_variant<kI8Default, kDiagNoPack>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
+      case kDiagCheapFold: return launch_fa_i8_variant<kI8Default, kDiagCheapFold>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
+      case kDiagNoExp | kDiagNoMaxSum | kDiagNoPack: return launch_fa_i8_variant<kI8Default, kDiagNoExp | kDiagNoMaxSum | kDiagNoPack>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream);
       default: throw std::invalid_argument("ignis_hq_prompt_attention: no such i8 diagnostic");
     }
   }
@@ -1791,11 +2194,15 @@ void launch_i8(int variant, int diag, dim3 grid, Queries qs, int start, int widt
     IGNIS_I8_CASE(21)
     IGNIS_I8_CASE(22)
     IGNIS_I8_CASE(23)
+    IGNIS_I8_CASE(24)
+    IGNIS_I8_CASE(25)
+    IGNIS_I8_CASE(26)
+    IGNIS_I8_CASE(27)
 #undef IGNIS_I8_CASE
     default: throw std::invalid_argument("ignis_hq_prompt_attention: no such i8 variant");
   }
 }
-static_assert(kI8VariantCount == 24, "launch_i8 names every variant");
+static_assert(kI8VariantCount == 28, "launch_i8 names every variant");
 
 // PROTOTYPE: which band a call runs. The op takes it from the precision and IGNIS_PROTO_BAND, the
 // bench names it: kI8 is the i8 band on fa_i8_kernel, kI8Ref the same band on 5ea54bc6's

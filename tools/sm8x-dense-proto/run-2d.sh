@@ -38,7 +38,9 @@
 #   speed     per prompt: per chunk and pass for each band (Q prep, window tiles, window FA, band
 #             tiles, band FA, merge), then per prompt over the 16 GQA layers, with each band's MMA
 #             floor and efficiency; every i8 variant; --diag: the i8 kernel with P V, the softmax or
-#             Q K^T taken out, and every key split from 1 to 5 for i8 and fp16
+#             Q K^T taken out, then with exp2, the max and sum reductions, or the P -> u8
+#             conversion and packing taken out, or the fold cut to one op an element; and every key
+#             split from 1 to 5 for i8 and fp16
 # and OUT_DIR/stderr-2d.txt. The exit status is the bench's: 0, or 1 when a check failed. Expect
 # about 10 to 20 minutes on an sm_86 card (the 5090 takes about a minute).
 set -u

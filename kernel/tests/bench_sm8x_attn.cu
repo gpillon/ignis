@@ -601,6 +601,12 @@ void kernel_report(const char *name, const void *f, int smem, int threads = 256)
 template <int I> void report_variant() {
   constexpr I8Variant v = kI8Variants[I];
   char name[96];
+  if constexpr (v.pair) {
+    std::snprintf(name, sizeof(name), "fa_i8_pair_kernel v%d <%d,%d,%d>", I, v.stages, v.one_barrier, v.q_smem);
+    kernel_report(name, reinterpret_cast<const void *>(fa_i8_pair_kernel<v.stages, v.one_barrier, v.q_smem>),
+                  kPairSmemBytes<v.stages, v.q_smem>, kPairThreads);
+    return;
+  }
   std::snprintf(name, sizeof(name), "fa_i8_kernel v%d <%d,%d,%d,%d,%d,%d,%d,%d>", I, v.stages, v.one_barrier,
                 v.pipe_qk, v.q_smem, v.ping_pong, v.pad, v.fuse_qk, v.one_head);
   kernel_report(name,
@@ -610,7 +616,12 @@ template <int I> void report_variant() {
 template <int kDiag> void report_diag(const char *what) {
   constexpr I8Variant v = kI8Variants[kI8Default];
   char name[96];
-  std::snprintf(name, sizeof(name), "fa_i8_kernel default, %s", what);
+  std::snprintf(name, sizeof(name), "fa_i8 default (v%d), %s", kI8Default, what);
+  if constexpr (v.pair) {
+    kernel_report(name, reinterpret_cast<const void *>(fa_i8_pair_kernel<v.stages, v.one_barrier, v.q_smem, kDiag>),
+                  kPairSmemBytes<v.stages, v.q_smem>, kPairThreads);
+    return;
+  }
   kernel_report(
       name, reinterpret_cast<const void *>(fa_i8_kernel<v.stages, v.one_barrier, v.pipe_qk, v.q_smem, v.ping_pong, v.pad, v.fuse_qk, v.one_head, kDiag>),
       kI8SmemBytes<v.stages, v.q_smem, v.pad>, v.one_head ? 128 : 256);
@@ -719,11 +730,20 @@ int main(int argc, char **argv) {
   report_variant<21>();
   report_variant<22>();
   report_variant<23>();
-  static_assert(kI8VariantCount == 24, "the kernel report names every variant");
+  report_variant<24>();
+  report_variant<25>();
+  report_variant<26>();
+  report_variant<27>();
+  static_assert(kI8VariantCount == 28, "the kernel report names every variant");
   report_diag<kDiagNoPv>("no P V");
   report_diag<kDiagNoPv | kDiagNoSoftmax>("Q K^T only");
   report_diag<kDiagNoQk>("no Q K^T");
   report_diag<kDiagNoPv | kDiagNoSoftmax | kDiagNoQk>("loads only");
+  report_diag<kDiagNoExp>("no exp2");
+  report_diag<kDiagNoMaxSum>("no max, sum reductions");
+  report_diag<kDiagNoPack>("no P -> u8 conversion, packing");
+  report_diag<kDiagNoExp | kDiagNoMaxSum | kDiagNoPack>("none of the three");
+  report_diag<kDiagCheapFold>("the fold with 1 op an element");
   kernel_report("tile_kernel<i8> (band tiles, i8 and i8ref)", reinterpret_cast<const void *>(tile_kernel<true, false, kProtoI8>), 0);
   kernel_report("tile_kernel<fp16>", reinterpret_cast<const void *>(tile_kernel<false, true>), 0);
   kernel_report("tile_kernel<bf16> (window tiles)", reinterpret_cast<const void *>(tile_kernel<false>), 0);
@@ -877,6 +897,11 @@ int main(int argc, char **argv) {
     series.push_back({"i8 Q K^T only", Run{Band::kI8, kI8Default, kDiagNoPv | kDiagNoSoftmax, 0}});
     series.push_back({"i8 no Q K^T", Run{Band::kI8, kI8Default, kDiagNoQk, 0}});
     series.push_back({"i8 loads only", Run{Band::kI8, kI8Default, kDiagNoPv | kDiagNoSoftmax | kDiagNoQk, 0}});
+    series.push_back({"i8 no exp2", Run{Band::kI8, kI8Default, kDiagNoExp, 0}});
+    series.push_back({"i8 no max, sum", Run{Band::kI8, kI8Default, kDiagNoMaxSum, 0}});
+    series.push_back({"i8 no P->u8, pack", Run{Band::kI8, kI8Default, kDiagNoPack, 0}});
+    series.push_back({"i8 no exp/max/pack", Run{Band::kI8, kI8Default, kDiagNoExp | kDiagNoMaxSum | kDiagNoPack, 0}});
+    series.push_back({"i8 fold 1 op", Run{Band::kI8, kI8Default, kDiagCheapFold, 0}});
     for (int s = 1; s <= kIgnisHqPromptMaxSplits; ++s) {
       series.push_back({"i8 splits " + std::to_string(s), Run{Band::kI8, kI8Default, 0, s}});
       series.push_back({"fp16 splits " + std::to_string(s), Run{Band::kFp16, kI8Default, 0, s}});
