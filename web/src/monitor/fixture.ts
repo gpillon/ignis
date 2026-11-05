@@ -82,6 +82,7 @@ ignis_vram_reserved_bytes{line="weights"} 17179869184
 ignis_vram_reserved_bytes{line="cuda_context"} 587202560
 ignis_vram_reserved_bytes{line="workspace"} 1342177280
 ignis_vram_reserved_bytes{line="trellis_workspace"} 0
+ignis_vram_reserved_bytes{line="trellis_dense"} 0
 ignis_vram_reserved_bytes{line="media_embedding"} 402653184
 ignis_vram_reserved_bytes{line="sampling"} 33554432
 ignis_vram_reserved_bytes{line="decode_graph"} 16777216

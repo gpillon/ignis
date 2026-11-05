@@ -503,6 +503,7 @@ pub fn log_vram_plan(
                 cuda_context_bytes = lines.cuda_context,
                 workspace_bytes = lines.workspace,
                 trellis_workspace_bytes = lines.trellis_workspace,
+                trellis_dense_bytes = lines.trellis_dense,
                 media_embedding_bytes = lines.media_embedding,
                 sampling_bytes = lines.sampling,
                 decode_graph_bytes = lines.decode_graph,
@@ -2224,6 +2225,7 @@ mod tests {
         let reserved = ignis_runtime::ReservedBytes {
             workspace: 1,
             trellis_workspace: 2,
+            trellis_dense: 12,
             media_embedding: 3,
             sampling: 4,
             decode_graph: 5,
@@ -2242,6 +2244,7 @@ mod tests {
                 ignis_runtime::CUDA_CONTEXT_BYTES,
                 1,
                 2,
+                12,
                 3,
                 4,
                 5,

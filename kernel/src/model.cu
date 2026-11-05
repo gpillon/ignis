@@ -26,6 +26,7 @@
 #include "ignis_step.h"
 
 #include "attention_readout.h"
+#include "ignis_dense_prefill.h"
 #include "layer_internal.h"
 #include "model_internal.h"
 #include "trellis_body.h"
@@ -1024,6 +1025,8 @@ struct LoadOptions {
   uint32_t attention_text_max_keys = 0;
   // GitHub #335: the prompt attention's precision (enum ignis_prefill_attention).
   uint32_t prefill_attention = IGNIS_PREFILL_ATTENTION_FP8;
+  // GitHub #509: the trellis body's prefill route (enum ignis_prefill_linear).
+  uint32_t prefill_linear = IGNIS_PREFILL_LINEAR_FUSED;
   // GitHub #336: the 27B's decode lanes, resolved (0 is IGNIS_DECODE_MAX_BATCH):
   // the widest round, and every round reservation's width.
   uint32_t decode_lanes = IGNIS_DECODE_MAX_BATCH;
@@ -1213,27 +1216,20 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     vision_residency = options->vision_residency;
   }
   // GitHub #335: a value the leaf does not know is refused rather than run as
-  // one of the two.
+  // one of the three.
   if (prefill_attention != IGNIS_PREFILL_ATTENTION_FP8 && prefill_attention != IGNIS_PREFILL_ATTENTION_FP16 &&
       prefill_attention != IGNIS_PREFILL_ATTENTION_INT8) {
     set_error("ignis_model_load: prefill_attention " + std::to_string(prefill_attention) +
               " is not 0 (8-bit), 1 (FP16 accumulate) or 2 (integer)");
     return nullptr;
   }
-  // GitHub #505 (spec #503): the integer band and the dense prefill are named
-  // by the option surface before their kernels exist; until they do, the leaf
-  // refuses them by name instead of running the other route.
-  if (prefill_attention == IGNIS_PREFILL_ATTENTION_INT8) {
-    set_error("ignis_model_load: prefill_attention 2 (the integer band) is not built yet");
-    return nullptr;
-  }
+  // GitHub #505 (spec #503): both routes are named by the option surface. The
+  // integer band runs (GitHub #510) and so does the dense prefill (GitHub
+  // #509): an NVFP4 body refuses the dense one below, once its head says which
+  // body it is.
   if (prefill_linear != IGNIS_PREFILL_LINEAR_FUSED && prefill_linear != IGNIS_PREFILL_LINEAR_DENSE) {
     set_error("ignis_model_load: prefill_linear " + std::to_string(prefill_linear) +
               " is not 0 (fused) or 1 (dense)");
-    return nullptr;
-  }
-  if (prefill_linear == IGNIS_PREFILL_LINEAR_DENSE) {
-    set_error("ignis_model_load: prefill_linear 1 (the dense prefill) is not built yet");
     return nullptr;
   }
   // GitHub #227: a scaling that cannot build a table is refused by name --
@@ -1314,6 +1310,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.attention_text_max_keys = std::min(attention_text_max_keys, max_context_tokens);
   out.prefill_attention = prefill_attention;
   out.vision_residency = vision_residency;
+  out.prefill_linear = prefill_linear;
 
   // GitHub #302: Flash-Next binds its own schema (kernel/src/flash_next/
   // bind.cu) into its own program (kernel/src/flash_next/program.h), and has
@@ -1393,6 +1390,12 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
       !(model->is_trellis_body
             ? binder.bind_trellis("text/output_head", {g.vocab, g.hidden}, model->trellis_head)
             : binder.bind("text/output_head", {g.vocab, g.hidden}, model->output_head))) {
+    return nullptr;
+  }
+  // GitHub #509: the dense prefill decodes trellis matrices; an NVFP4 body has none.
+  if (prefill_linear == IGNIS_PREFILL_LINEAR_DENSE && !model->is_trellis_body) {
+    set_error("ignis_model_load: prefill_linear 1 (the dense prefill) runs the trellis body's matrices, and this "
+              "artifact's body is NVFP4");
     return nullptr;
   }
 
@@ -1495,6 +1498,8 @@ struct LoadSizes {
   std::size_t sampling_logits = 0;
   // GitHub #339: the trellis body's one workspace (0 on the NVFP4 body).
   std::size_t trellis_workspace = 0;
+  // GitHub #509: the dense prefill's one buffer (0 unless the load runs it).
+  std::size_t trellis_dense = 0;
   // GitHub #336: the load's decode lanes, which every round line is sized
   // for.
   std::size_t lanes = IGNIS_DECODE_MAX_BATCH;
@@ -1528,6 +1533,7 @@ struct LoadSizes {
     out.drafter_round_bytes =
         drafter_scratch == 0 ? 0 : drafter_features + sizeof(std::int32_t) * lanes + drafter_scratch;
     out.trellis_workspace_bytes = trellis_workspace;
+    out.trellis_dense_bytes = trellis_dense;
     return out;
   }
 };
@@ -1554,12 +1560,17 @@ struct LoadSizes {
 // pinned below at compile time, and a load whose head would still be wider is
 // refused here, naming why, rather than its first such round failing mid-
 // decode on a workspace sized for a narrower call.
+//
+// GitHub #509: under the dense prefill (`dense`) no body call wider than the
+// decode route reaches the fused op, so the prefill width asks the dense op
+// instead: the INT8 activations of each shared input's matrices together
+// (`ignis_dense_prefill_workspace_bytes`), past the fused op's counters.
 static_assert(IGNIS_DECODE_MAX_BATCH * (IGNIS_DFLASH2_MAX_DRAFT_TOKENS + 1) <= IGNIS_TRELLIS_DECODE_MAX_TOKENS,
               "a verify round's head columns (lanes x (k + 1)) must stay on the trellis op's decode route");
 static_assert(kSpanLogitsBlockColumns <= IGNIS_TRELLIS_DECODE_MAX_TOKENS,
               "a span-logits block's head columns must stay on the trellis op's decode route");
 std::size_t trellis_workspace_bytes(const ignis_model &model, uint32_t prefill_chunk_tokens,
-                                    uint32_t head_tokens) {
+                                    uint32_t head_tokens, bool dense) {
   if (head_tokens > IGNIS_TRELLIS_DECODE_MAX_TOKENS) {
     throw std::runtime_error("the trellis head's widest call, " + std::to_string(head_tokens) +
                              " columns (a round's lanes x (k + 1), or a span-logits block), is past the trellis " +
@@ -1571,35 +1582,37 @@ std::size_t trellis_workspace_bytes(const ignis_model &model, uint32_t prefill_c
     // would have to state (the SM probe runs under the debug cap alone).
     throw std::runtime_error(std::string("preparing the trellis linear: ") + ignis_trellis_last_error());
   }
+  // `group`: the matrices that read the call's input, which the dense
+  // prefill quantizes together (trellis_body.h).
   struct Call {
-    uint32_t in, out, weights, max_decode_tokens, prefill_tokens;
+    uint32_t in, out, weights, max_decode_tokens, prefill_tokens, group;
   };
   std::vector<Call> calls;
-  const auto body = [&](const ignis_trellis_weight &w, uint32_t weights) {
-    calls.push_back({w.in, w.out, weights, IGNIS_TRELLIS_DECODE_MAX_TOKENS, prefill_chunk_tokens});
+  const auto body = [&](const ignis_trellis_weight &w, uint32_t weights, uint32_t group) {
+    calls.push_back({w.in, w.out, weights, IGNIS_TRELLIS_DECODE_MAX_TOKENS, prefill_chunk_tokens, group});
   };
   // The tail's output and down projections, and its gate and up as one SwiGLU.
   const auto tail = [&](const TrellisTail &t) {
-    body(t.output, 1);
-    body(t.down, 1);
-    body(t.gate_proj, 2);
+    body(t.output, 1, 1);
+    body(t.down, 1, 1);
+    body(t.gate_proj, 2, 2);
   };
   for (const LayerWeights &layer : model.layers) {
     if (layer.kind == IGNIS_LAYER_GQA) {
       const GqaTrellisWeights &t = layer.gqa.trellis;
       for (const ignis_trellis_weight *w : {&t.q_proj, &t.k_proj, &t.v_proj}) {
-        body(*w, 1);
+        body(*w, 1, 3);
       }
       tail(t.tail);
     } else {
       const GdnTrellisWeights &t = layer.gdn.trellis;
       for (const ignis_trellis_weight *w : {&t.in_proj_qkv, &t.in_proj_z}) {
-        body(*w, 1);
+        body(*w, 1, 2);
       }
       tail(t.tail);
     }
   }
-  calls.push_back({model.trellis_head.in, model.trellis_head.out, 1, head_tokens, 0});
+  calls.push_back({model.trellis_head.in, model.trellis_head.out, 1, head_tokens, 0, 1});
   std::size_t line = 0;
   for (std::size_t i = 0; i < calls.size(); ++i) {
     const Call &c = calls[i];
@@ -1607,7 +1620,8 @@ std::size_t trellis_workspace_bytes(const ignis_model &model, uint32_t prefill_c
     bool seen = false;
     for (std::size_t j = 0; j < i && !seen; ++j) {
       seen = calls[j].in == c.in && calls[j].out == c.out && calls[j].weights == c.weights &&
-             calls[j].max_decode_tokens == c.max_decode_tokens && calls[j].prefill_tokens == c.prefill_tokens;
+             calls[j].max_decode_tokens == c.max_decode_tokens && calls[j].prefill_tokens == c.prefill_tokens &&
+             calls[j].group == c.group;
     }
     if (seen) {
       continue;
@@ -1624,9 +1638,44 @@ std::size_t trellis_workspace_bytes(const ignis_model &model, uint32_t prefill_c
     for (uint32_t tokens = 1; tokens <= c.max_decode_tokens; ++tokens) {
       ask(tokens);
     }
-    if (c.prefill_tokens > IGNIS_TRELLIS_DECODE_MAX_TOKENS) {
+    if (c.prefill_tokens > IGNIS_TRELLIS_DECODE_MAX_TOKENS && !dense) {
       ask(c.prefill_tokens);
     }
+    if (c.prefill_tokens > IGNIS_TRELLIS_DECODE_MAX_TOKENS && dense) {
+      const uint64_t bytes = ignis_dense_prefill_workspace_bytes(c.in, c.group, c.prefill_tokens);
+      if (bytes == 0) {
+        throw std::runtime_error("the dense prefill refuses " + std::to_string(c.group) + " matrices of " +
+                                 std::to_string(c.in) + " inputs at " + std::to_string(c.prefill_tokens) + " tokens");
+      }
+      line = std::max<std::size_t>(line, bytes);
+    }
+  }
+  return line;
+}
+
+// GitHub #509: the dense prefill's one buffer -- the INT8 copy of the body's
+// largest trellis matrix, which each matrix is decoded into in turn (on the
+// 27B the MLP's gate, up and down, 5120 x 17408 bytes). Never the head's: the
+// head runs on the fused op's decode route.
+std::size_t trellis_dense_bytes(const ignis_model &model) {
+  std::size_t line = 0;
+  const auto body = [&](const ignis_trellis_weight &w) {
+    line = std::max<std::size_t>(line, ignis_dense_prefill_weight_bytes(w.in, w.out));
+  };
+  for (const LayerWeights &layer : model.layers) {
+    const TrellisTail &tail = layer.kind == IGNIS_LAYER_GQA ? layer.gqa.trellis.tail : layer.gdn.trellis.tail;
+    if (layer.kind == IGNIS_LAYER_GQA) {
+      body(layer.gqa.trellis.q_proj);
+      body(layer.gqa.trellis.k_proj);
+      body(layer.gqa.trellis.v_proj);
+    } else {
+      body(layer.gdn.trellis.in_proj_qkv);
+      body(layer.gdn.trellis.in_proj_z);
+    }
+    body(tail.output);
+    body(tail.down);
+    body(tail.gate_proj);
+    body(tail.up_proj);
   }
   return line;
 }
@@ -1752,9 +1801,13 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
   // round's columns across the load's lanes or one span-logits block.
   if (model.is_trellis_body) {
     const uint32_t round_head_columns = lanes * static_cast<uint32_t>(round_columns);
+    const bool dense = options.prefill_linear == IGNIS_PREFILL_LINEAR_DENSE;
     sizes.trellis_workspace = trellis_workspace_bytes(
         model, prefill_chunk_tokens,
-        std::max<uint32_t>(round_head_columns, static_cast<uint32_t>(kSpanLogitsBlockColumns)));
+        std::max<uint32_t>(round_head_columns, static_cast<uint32_t>(kSpanLogitsBlockColumns)), dense);
+    if (dense) {
+      sizes.trellis_dense = trellis_dense_bytes(model);
+    }
   }
   return sizes;
 }
@@ -1784,6 +1837,7 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
   out.decode_graph_bytes = capacity(model.decode_graph_scratch) + bytes(model.decode_graph_token_ids) +
                            bytes(model.decode_graph_slots) + bytes(model.decode_rope_positions);
   out.trellis_workspace_bytes = bytes(model.trellis_workspace_buffer);
+  out.trellis_dense_bytes = bytes(model.trellis_dense_buffer);
   if (model.verify != nullptr) {
     out.drafter_round_bytes = bytes(model.verify->features) + bytes(model.verify->append_counts) +
                               capacity(model.verify->drafter_scratch);
@@ -1917,6 +1971,9 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // GitHub #335: the prompt attention's precision, read by every hq-e8-2b
   // prefill chunk (`kernel/src/gqa_layer.cu`).
   model->prefill_attention = load.prefill_attention;
+  // GitHub #509: the trellis body's prefill route, read by every body call
+  // (kernel/src/trellis_body.cu).
+  model->prefill_linear = load.prefill_linear;
 
   // GitHub #341: the BF16 exception tensors a load holds in FP8 run on the FP8
   // linear and the W8A8 GEMM (kernel/src/fp8_exception.h), which refuse an
@@ -2007,6 +2064,22 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       }
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: trellis workspace allocation failed: ") + e.what());
+      cudaStreamDestroy(model->stream);
+      model->stream = nullptr;
+      return -1;
+    }
+  }
+  // GitHub #509: the dense prefill's kernels prepared (its GEMM's shared
+  // memory and occupancy), and its one buffer, at a stable address like the
+  // workspace's.
+  if (model->prefill_linear == IGNIS_PREFILL_LINEAR_DENSE) {
+    try {
+      if (ignis_dense_prefill_prepare() != 0) {
+        throw std::runtime_error(ignis_trellis_last_error());
+      }
+      model->trellis_dense_buffer = std::make_unique<ninfer::DeviceBuffer>(sizes.trellis_dense);
+    } catch (const std::exception &e) {
+      set_error(std::string("ignis_model_load: the dense prefill's buffer: ") + e.what());
       cudaStreamDestroy(model->stream);
       model->stream = nullptr;
       return -1;

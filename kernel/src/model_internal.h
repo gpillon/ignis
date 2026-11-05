@@ -475,6 +475,13 @@ struct ignis_model {
   // leaves its counters zero. Null on the NVFP4 body.
   std::unique_ptr<ninfer::DeviceBuffer> trellis_workspace_buffer;
   ignis_trellis_workspace trellis_workspace{};
+  // GitHub #509: `ignis_model_load_options::prefill_linear` (enum
+  // ignis_prefill_linear). Under DENSE every body call wider than the decode
+  // route runs the dense prefill (kernel/src/trellis_body.cu): its INT8
+  // activations in `trellis_workspace`, each matrix decoded in turn into
+  // this one buffer (the plan line `trellis_dense_bytes`), null otherwise.
+  uint32_t prefill_linear = IGNIS_PREFILL_LINEAR_FUSED;
+  std::unique_ptr<ninfer::DeviceBuffer> trellis_dense_buffer;
   uint64_t vram_bytes = 0;
   // ADR 0062: what of the bound tensors lives in mapped host memory.
   uint64_t host_mapped_bytes = 0;

@@ -113,8 +113,9 @@ pub struct CudaLeafConfig {
     /// for the life of the load; Flash-Next's QSA ignores it.
     pub prefill_attention: ignis_core::PrefillAttention,
     /// The trellis prefill's route (`--model-prefill-linear`, GitHub #505):
-    /// the fused prefill by default, or the dense one. Fixed for the life of
-    /// the load; Flash-Next ignores it.
+    /// the fused prefill by default, or the dense one (GitHub #509), whose one
+    /// buffer is the plan's `trellis_dense` line. Fixed for the life of the
+    /// load; the NVFP4 body and Flash-Next take the fused default.
     pub prefill_linear: ignis_core::PrefillLinear,
 }
 
@@ -353,6 +354,7 @@ fn reserved_bytes(
     ReservedBytes {
         workspace: model.workspace_bytes,
         trellis_workspace: model.trellis_workspace_bytes,
+        trellis_dense: model.trellis_dense_bytes,
         media_embedding: model.media_embedding_bytes,
         sampling: model.sampling_bytes,
         decode_graph: model.decode_graph_bytes,

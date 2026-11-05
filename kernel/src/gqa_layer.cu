@@ -54,19 +54,17 @@ ninfer::Tensor weight_tensor(const ninfer::Weight &weight, ninfer::DType dtype,
 // load bound -- the vendored fused projection under the call's mode policy,
 // or the trellis body's three matrices: `q_proj`'s per-head [q | gate] rows
 // split into the query and the gate (kernel/src/trellis_body.h), `k_proj`
-// and `v_proj` straight into theirs. The trellis op has no policy to
-// resolve; `mode` is the NVFP4 arm's alone.
+// and `v_proj` straight into theirs (GitHub #509: on the dense prefill, one
+// quantized input for the three and the split in the epilogue). The trellis
+// op has no policy to resolve; `mode` is the NVFP4 arm's alone.
 void input_projection(ignis_model &model, const GqaLayerWeights &weights, const ninfer::Tensor &normalized,
                       ninfer::Tensor &query, ninfer::Tensor &gate, ninfer::Tensor &key, ninfer::Tensor &value,
                       std::int32_t heads, std::int32_t head_dim, ninfer::DeviceArena &arena, LinearPolicyMode mode,
                       cudaStream_t stream) {
   if (model.is_trellis_body) {
     const GqaTrellisWeights &t = weights.trellis;
-    ignis::trellis_body::query_gate(model, t.q_proj, normalized, heads, head_dim, arena, query, gate, stream);
-    ignis::trellis_body::linear(model, t.k_proj, normalized, key.data, static_cast<uint32_t>(key.ne[0]),
-                                IGNIS_TRELLIS_STORE, stream);
-    ignis::trellis_body::linear(model, t.v_proj, normalized, value.data, static_cast<uint32_t>(value.ne[0]),
-                                IGNIS_TRELLIS_STORE, stream);
+    ignis::trellis_body::attention_projection(model, t.q_proj, t.k_proj, t.v_proj, normalized, heads, head_dim, arena,
+                                              query, gate, key, value, stream);
     return;
   }
   ninfer::ops::attn_input_proj(normalized, weights.query_key_gate_value, query, gate, key, value,
@@ -327,9 +325,9 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     };
     if (hq_prompt) {
       IgnisHqPromptOptions options;
-      options.precision = model->prefill_attention == IGNIS_PREFILL_ATTENTION_FP16
-                              ? IgnisHqPromptPrecision::kFp16
-                              : IgnisHqPromptPrecision::kFp8;
+      options.precision = model->prefill_attention == IGNIS_PREFILL_ATTENTION_FP16   ? IgnisHqPromptPrecision::kFp16
+                          : model->prefill_attention == IGNIS_PREFILL_ATTENTION_INT8 ? IgnisHqPromptPrecision::kInt8
+                                                                                     : IgnisHqPromptPrecision::kFp8;
       options.after_attention = [&](const IgnisHqPromptKeys &keys) { readout(&keys); };
       ignis_hq_prompt_attention(rotated_query_heads, rotated_key_heads, value_heads, positions,
                                 start_position, gate.view({kHeadDim, kQHeads, tokens, 1}),

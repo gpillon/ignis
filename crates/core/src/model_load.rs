@@ -108,8 +108,8 @@ pub(crate) mod ffi {
         pub mtp_expert_slots: *const IgnisMoeSlot,
         /// GitHub #335: the 27B's prompt attention band pass,
         /// [`crate::prefill_attention::PrefillAttention::abi_code`]: 0 = 8-bit,
-        /// 1 = FP16 accumulate, 2 = the integer band (which the leaf refuses
-        /// until it carries it). Flash-Next's attention is QSA and takes 0.
+        /// 1 = FP16 accumulate, 2 = the integer band. Flash-Next's attention
+        /// is QSA and takes 0.
         pub prefill_attention: u32,
         /// GitHub #414 (ADR 0075): where the vision tower lives,
         /// [`crate::vision::VisionResidency::abi_code`]: 0 = the device, 1 =
@@ -117,8 +117,8 @@ pub(crate) mod ffi {
         pub vision_residency: u32,
         /// GitHub #505 (spec #503): the 27B's trellis prefill route,
         /// [`crate::prefill_attention::PrefillLinear::abi_code`]: 0 = the
-        /// fused prefill, 1 = the dense prefill (which the leaf refuses until
-        /// it carries it). Flash-Next takes 0.
+        /// fused prefill, 1 = the dense prefill (GitHub #509; the NVFP4 body
+        /// refuses it). Flash-Next takes 0.
         pub prefill_linear: u32,
     }
 
@@ -153,6 +153,10 @@ pub(crate) mod ffi {
         /// op's answer for the load's widest call; 0 on the NVFP4 body and on
         /// Flash-Next.
         pub trellis_workspace_bytes: u64,
+        /// GitHub #509: the dense prefill's one buffer, the INT8 copy of the
+        /// body's largest trellis matrix; 0 unless the load runs the dense
+        /// prefill.
+        pub trellis_dense_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_model_stats`.
@@ -1503,14 +1507,15 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, mtp_expert_slots), 72);
         // uint64 x 3, then (GitHub #210) the six uint64 reservation lines,
         // (GitHub #302) the seventh, Flash-Next's activations, (GitHub #339)
-        // the eighth, the trellis workspace, and (ADR 0062) the uint64
-        // host-mapped bytes. The leaf pins the same sizes
-        // (kernel/include/ignis_model.h).
-        assert_eq!(std::mem::size_of::<IgnisModelReservations>(), 64);
+        // the eighth, the trellis workspace, (GitHub #509) the ninth, the
+        // dense prefill's buffer, and (ADR 0062) the uint64 host-mapped
+        // bytes. The leaf pins the same sizes (kernel/include/ignis_model.h).
+        assert_eq!(std::mem::size_of::<IgnisModelReservations>(), 72);
         assert_eq!(std::mem::offset_of!(IgnisModelReservations, trellis_workspace_bytes), 56);
-        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 96);
+        assert_eq!(std::mem::offset_of!(IgnisModelReservations, trellis_dense_bytes), 64);
+        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 104);
         assert_eq!(std::mem::offset_of!(IgnisModelStats, reserved), 24);
-        assert_eq!(std::mem::offset_of!(IgnisModelStats, host_mapped_bytes), 88);
+        assert_eq!(std::mem::offset_of!(IgnisModelStats, host_mapped_bytes), 96);
     }
 
     #[test]

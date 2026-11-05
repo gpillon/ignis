@@ -186,6 +186,8 @@ pub struct ReservedBytes {
     pub workspace: u64,
     /// The 27B trellis body's workspace (GitHub #339); 0 on the NVFP4 body.
     pub trellis_workspace: u64,
+    /// The dense prefill's one buffer (GitHub #509); 0 unless the load runs it.
+    pub trellis_dense: u64,
     pub media_embedding: u64,
     pub sampling: u64,
     pub decode_graph: u64,
@@ -226,6 +228,7 @@ pub fn vram_lines(weights_bytes: u64, reserved: ReservedBytes) -> ignis_core::Vr
         cuda_context: CUDA_CONTEXT_BYTES,
         workspace: reserved.workspace,
         trellis_workspace: reserved.trellis_workspace,
+        trellis_dense: reserved.trellis_dense,
         media_embedding: reserved.media_embedding,
         sampling: reserved.sampling,
         decode_graph: reserved.decode_graph,
@@ -2308,6 +2311,7 @@ mod tests {
             lane_state: base + 8,
             retained_slots: base + 9,
             hq_residual_window: base + 10,
+            trellis_dense: base + 11,
             kv_pool: 0,
         }
     }

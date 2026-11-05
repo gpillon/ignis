@@ -121,10 +121,9 @@ void output_and_mlp(ignis_model &model, const GdnLayerWeights &w, const ninfer::
 void input_projection(ignis_model &model, const GdnLayerWeights &w, const ninfer::Tensor &h, ninfer::Tensor &qkv,
                       ninfer::Tensor &z, ninfer::DeviceArena &arena, LinearPolicyMode mode, cudaStream_t stream) {
   if (model.is_trellis_body) {
-    ignis::trellis_body::linear(model, w.trellis.in_proj_qkv, h, qkv.data, static_cast<uint32_t>(qkv.ne[0]),
-                                IGNIS_TRELLIS_STORE, stream);
-    ignis::trellis_body::linear(model, w.trellis.in_proj_z, h, z.data, static_cast<uint32_t>(z.ne[0]),
-                                IGNIS_TRELLIS_STORE, stream);
+    ignis::trellis_body::gdn_projection(model, w.trellis.in_proj_qkv, w.trellis.in_proj_z, h, qkv.data,
+                                        static_cast<uint32_t>(qkv.ne[0]), z.data, static_cast<uint32_t>(z.ne[0]),
+                                        stream);
     return;
   }
   ninfer::ops::gdn_input_proj(h, w.query_key_value_z, qkv, z, ignis_policy_for(w.query_key_value_z.qtype, mode),

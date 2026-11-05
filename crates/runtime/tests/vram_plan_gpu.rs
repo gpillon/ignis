@@ -369,6 +369,8 @@ fn the_round_lines_follow_the_loads_lanes() {
         workspace,
         // GitHub #339: the served artifact's body is NVFP4.
         trellis_workspace: 0,
+        // GitHub #509: and runs the fused prefill.
+        trellis_dense: 0,
         media_embedding,
         sampling: 4_623_344,
         decode_graph,
