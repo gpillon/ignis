@@ -87,14 +87,7 @@ typedef struct ignis_dense_prefill_activations {
  * columns, [first half | second half] per head (the GQA q_proj's [query | gate] rows): column c of
  * head h = c / (2 split) lands in `y` at h split + c mod (2 split) when that is below split, and
  * in `y2` at h split + c mod (2 split) - split otherwise, both [tokens][ldy]. split is then a
- * multiple of 128 and out a multiple of 2 split.
- *
- * `next_suh` and `block_amax` (GitHub #511): both NULL, or both set on a call without split. Set,
- * the epilogue also runs the first pass of the A8 of the matrix that reads y next, whose suh
- * (fp16 [out], 8-byte aligned) is next_suh: for each token t and 128-column block b of the row it
- * stored, block_amax[t * (out / 128) + b] = max |v| over the block, v the stored BF16 values
- * rotated as A8 rotates them. ignis_dense_prefill_quantize_blocks then writes that matrix's
- * activations from them: the MLP's down after gate+up's SwiGLU pass. */
+ * multiple of 128 and out a multiple of 2 split. */
 typedef struct ignis_dense_prefill_output {
   void *y;
   uint32_t ldy;
@@ -102,8 +95,6 @@ typedef struct ignis_dense_prefill_output {
   uint32_t split;
   uint32_t reserved; /* 0 */
   void *y2;          /* NULL unless split */
-  const void *next_suh;
-  float *block_amax; /* [tokens][out / 128] */
 } ignis_dense_prefill_output;
 
 /* Prepares the current device for every op here: the GEMM's shared-memory attributes, its
@@ -154,11 +145,13 @@ int32_t ignis_dense_prefill_linear(const ignis_trellis_weight *const *w, uint32_
                                    void *stream);
 
 /* ---- A8 fused into its producers (GitHub #511, spec #503 "A8") ----------------------------------
- * Where A8's input has just been produced, A8 is no pass of its own: the RMSnorm before a block's
- * first matrices writes their activations as it normalizes the row, and gate+up's SwiGLU epilogue
- * keeps down's block maxima for a light second pass. The activations are the standalone A8's of
- * the same BF16 row bit for bit (ignis_dense_prefill_quantize: the same products, the same
- * rounding); only the passes change. */
+ * Where A8's input has just been produced by an RMSnorm, A8 is no pass of its own: the RMSnorm
+ * before a block's first matrices writes their activations as it normalizes the row. The
+ * activations are the standalone A8's of the same BF16 row bit for bit
+ * (ignis_dense_prefill_quantize: the same products, the same rounding); only the passes change.
+ * Down's A8 stays ignis_dense_prefill_quantize's: fused into gate+up's SwiGLU epilogue (each
+ * block's max kept there, then a light second pass) it measured slower than the standalone pass
+ * on the RTX 5090 and on an sm_86 card. */
 
 /* The RMSnorm with a unit offset, h = x rsqrt(mean(x^2) + eps) (1 + norm), of x [tokens][in] BF16
  * by norm [in] BF16, bit for bit the vendored rmsnorm's (ninfer::ops::rmsnorm, unit_offset) at the
@@ -170,40 +163,18 @@ int32_t ignis_dense_prefill_rmsnorm_quantize(const void *x, const void *norm, fl
                                              const ignis_trellis_weight *const *w, uint32_t count,
                                              const ignis_dense_prefill_activations *out, void *stream);
 
-/* The second pass of an A8 whose first a GEMM epilogue ran (next_suh = w's suh): from x
- * [tokens][in] (16-byte aligned, the rows that GEMM stored) and its block_amax [tokens][in / 128],
- * w's activations into `out`, bit for bit ignis_dense_prefill_quantize's of x. */
-int32_t ignis_dense_prefill_quantize_blocks(const void *x, uint32_t tokens, const ignis_trellis_weight *w,
-                                            const float *block_amax, const ignis_dense_prefill_activations *out,
-                                            void *stream);
-
 /* ignis_dense_prefill_linear for matrices whose input is the RMSnorm of x: the RMSnorm with their
  * A8 (ignis_dense_prefill_rmsnorm_quantize, h written when non-NULL) into `workspace`
- * (ignis_dense_prefill_workspace_bytes of the same group), then each matrix's decode and GEMM. */
+ * (ignis_dense_prefill_workspace_bytes of the same group), then each matrix's decode and GEMM. The
+ * MLP's gate and up are such a group, with the outputs of ignis_dense_prefill_linear's SwiGLU. */
 int32_t ignis_dense_prefill_norm_linear(const ignis_trellis_weight *const *w, uint32_t count, const void *x,
                                         const void *norm, float eps, uint32_t tokens, void *h,
                                         const ignis_dense_prefill_output *out, const ignis_trellis_workspace *workspace,
                                         void *dense, uint64_t dense_bytes, void *stream);
 
-/* The ignis_trellis_workspace bytes an ignis_dense_prefill_norm_mlp call of `in` hidden and `ffn`
- * intermediate widths needs at `tokens`: the counters, gate and up's activations with down's over
- * them, and past both down's block maxima. 0 for a call the op refuses. */
-uint64_t ignis_dense_prefill_mlp_workspace_bytes(uint32_t in, uint32_t ffn, uint32_t tokens);
-
-/* A block's MLP from its residual x [tokens][in], every A8 fused into its producer: the RMSnorm by
- * norm with gate and up's A8 (the normalized row not written), gate's store into h [tokens][ffn]
- * (16-byte aligned), up's SwiGLU pass over it keeping down's block maxima, down's second A8 pass,
- * then down's residual add into y [tokens][ldy] (which may be x: the RMSnorm has read it by then).
- * gate and up are [ffn x in], down [in x ffn]. Workspace: ignis_dense_prefill_mlp_workspace_bytes. */
-int32_t ignis_dense_prefill_norm_mlp(const ignis_trellis_weight *gate, const ignis_trellis_weight *up,
-                                     const ignis_trellis_weight *down, const void *x, const void *norm, float eps,
-                                     uint32_t tokens, void *h, void *y, uint32_t ldy,
-                                     const ignis_trellis_workspace *workspace, void *dense, uint64_t dense_bytes,
-                                     void *stream);
-
 /* Test-only (GitHub #511): 0 sends the trellis body's dense prefill back to the standalone A8 of
- * #509 -- the RMSnorms and the SwiGLU write their BF16 rows and ignis_dense_prefill_quantize reads
- * them -- so a test can hold the fused producers' output to it; nonzero, the default, fuses them.
+ * #509 -- the RMSnorms write their BF16 rows and ignis_dense_prefill_quantize reads them -- so a
+ * test can hold the fused producers' output to it; nonzero, the default, fuses them.
  * Process-wide, read at each body call: set it between prefills, never during one. The count of
  * fused RMSnorm launches this process has enqueued tells such a test which passes ran. */
 void ignis_dense_prefill_set_fused_producers(uint32_t fused);
