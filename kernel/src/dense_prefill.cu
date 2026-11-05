@@ -1,8 +1,21 @@
 // ignis kernel leaf: the dense prefill of the 27B's trellis body -- OURS (GitHub #509, spec #503;
-// kernel/include/ignis_dense_prefill.h). Ported from the prototype's bench on the branch
+// kernel/include/ignis_dense_prefill.h), but for one ADAPTED part (ADR 0051 tier 2), the first
+// half of dense_prefill_rmsnorm_a8_kernel. Ported from the prototype's bench on the branch
 // prototype/sm8x-dense-prefill (kernel/tests/bench_sm8x_dense.cu, phase 2a's kernels with phase
 // 2c's levers A, one quantize launch per shared input, and D, the fragments double-buffered
 // across the stage boundary over 3 or 4 stages), written from the PTX ISA and our own kernels.
+//
+// The ADAPTED part (GitHub #511): the RMSnorm restates the vendored rmsnorm's wide-row form
+// operation for operation, so its BF16 row is that kernel's bit for bit.
+//   Upstream: the reference, gpillon/ninfer, commit a00648cb828457986cf5b4b4f712b4cbcd7af0d1
+//   (the commit kernel/vendor/manifest.json pins), Apache-2.0 (kernel/vendor/LICENSE):
+//   src/ops/kernel/rmsnorm.cuh  rmsnorm_cta_bf16x2_kernel<Offset, 512, 8, true> (the pairs per
+//                               thread and their order, the sum of squares, rsqrtf of the mean
+//                               plus eps).
+//   From the vendored reference, called and not copied: block_reduce_sum and the offset epilogue
+//   (rmsnorm_epilogue<RmsEpilogue::Offset>), from the same header.
+//   Changed here: the normalized row stays in shared memory (and goes to h only when asked), for
+//   the A8 of each matrix of the group that follows it in the same kernel.
 //
 // Four kernels, each its own launch on the caller's stream:
 //   dense_prefill_decode_kernel<K2>     a warp turns four trellis tiles (16 outputs x 64 inputs)

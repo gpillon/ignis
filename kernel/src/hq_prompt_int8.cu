@@ -2,6 +2,13 @@
 // OURS, kernel/src/hq_prompt_int8.h. ignis_hq_prompt_attention (hq_prompt_attention.cu) runs its
 // passes under IgnisHqPromptPrecision::kInt8: it stores each pass's K tiles (tile_kernel<true>,
 // the 8-bit band's) and its Q, and calls `attend` here for V^T and the attention.
+//
+// What it takes from an upstream, through kernel/src/hq_prompt_common.cuh: the ADAPTED helpers
+// that header names from mkyt/qwen3-27b-5090 (commit 0594e77ca099f397ccefed0c68c981e32869989f,
+// MIT; kernel/NOTICE): ldsm_x4 (its ldmatrix), row_swz (its sw8 swizzle, on K and Q's rows) and
+// vt_off (V^T's segments). Its CTA, two query heads by 64 tokens in eight warps of 16 over 32-key
+// tiles, is fa_kernel's (hq_prompt_attention.cu), the structure that file adapts from the same
+// upstream; the integer MMAs, the fold groups, the lazy rescale and the buffers below are our own.
 
 #include "hq_prompt_int8.h"
 
