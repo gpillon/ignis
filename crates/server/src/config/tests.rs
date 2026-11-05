@@ -1167,6 +1167,24 @@ fn retained_slots_with_reuse_off_are_accepted_for_live_siblings() {
     assert_eq!(retained_slots_of(&config(&["--reuse-prompt", "off", "--reuse-retained-host", "3"])), (0, 3));
 }
 
+/// GitHub #508 (the review of spec #503): `rtx-24gb`'s device slots serve
+/// prompt reuse, so with reuse off the 27B reserves none of them, as it
+/// reserves none of its default host slots; a count the operator names is
+/// still kept for live siblings, and with reuse on the profile's stand.
+#[test]
+fn a_profiles_device_slots_are_not_reserved_with_reuse_off() {
+    let rtx3090 = card_of(24.0, "NVIDIA GeForce RTX 3090", (8, 6), "86;120a");
+    let the_27b = |flags: &[&str]| on_card(flags, rtx3090.clone()).unwrap().for_family(ModelFamily::Qwen38_27b).unwrap();
+    let slots = profile::RTX_24GB_RETAINED_DEVICE_SLOTS;
+    assert_eq!(the_27b(&[]).retained_device_slots, slots, "reuse on: the profile's");
+    assert_eq!(retained_slots_of(&the_27b(&["--reuse-prompt", "off"])), (0, 0), "reuse off: none of either kind");
+    let named = the_27b(&["--reuse-prompt", "off", "--reuse-retained-device", "1"]);
+    assert_eq!(named.retained_device_slots, 1, "a named count with reuse off");
+    let env = env_map(&[("IGNIS_REUSE_PROMPT", "off"), ("IGNIS_REUSE_RETAINED_DEVICE", "2")]);
+    let from_env = resolve_on(&args(&[]), env, &file::NoFiles, &|| rtx3090.clone()).map(expect_config).unwrap();
+    assert_eq!(from_env.for_family(ModelFamily::Qwen38_27b).unwrap().retained_device_slots, 2, "named by the environment");
+}
+
 // ── GitHub #209: instruction-message policies ────────────────────────────
 
 #[test]

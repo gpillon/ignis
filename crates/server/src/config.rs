@@ -1276,10 +1276,14 @@ fn derive(
         host_pool_bytes: s.reuse.kv_host_pool_bytes,
         host_margin_bytes: s.model.host_margin_bytes,
         prompt_reuse,
-        retained_device_slots: s
-            .reuse
-            .retained_device
-            .unwrap_or(if prompt_reuse { DEFAULT_RETAINED_DEVICE_SLOTS } else { 0 }),
+        // A profile's device slots serve prompt reuse (`rtx-24gb`'s, GitHub
+        // #508): with it off they are not reserved; a count the operator
+        // names still shares heads between live siblings.
+        retained_device_slots: match s.reuse.retained_device {
+            Some(slots) if prompt_reuse || !resolution.adapts("reuse", "retained_device") => slots,
+            _ if prompt_reuse => DEFAULT_RETAINED_DEVICE_SLOTS,
+            _ => 0,
+        },
         // The 27B's default, two per decode lane, from the lanes as named;
         // Flash-Next's own replaces it at load (`EngineShape::for_family`,
         // which asks the same function).

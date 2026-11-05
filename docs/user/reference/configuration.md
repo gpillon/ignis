@@ -781,7 +781,7 @@ Cross-request state reuse. Off, no prompt checkpoint is captured or claimed, and
 | Per model | `--qwen38-reuse-retained-device`, `--qwen38flashnext-reuse-retained-device` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-Retained slots in VRAM, reserved in the VRAM plan and handed out first, each a device-to-device copy per capture and per claim. Unset, 0, unless a profile gives some: `rtx-24gb` does, for the 27B. With prompt reuse off, a count shares heads between live siblings only.
+Retained slots in VRAM, reserved in the VRAM plan and handed out first, each a device-to-device copy per capture and per claim. Unset, 0, unless a profile gives some: `rtx-24gb` does, for the 27B. With prompt reuse off a profile's count is not reserved, and a named one shares heads between live siblings only.
 
 ### `reuse.retained_host`
 

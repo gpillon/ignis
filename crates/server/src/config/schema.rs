@@ -525,8 +525,8 @@ config_group! {
         /// Retained slots in VRAM, reserved in the VRAM plan and handed out
         /// first, each a device-to-device copy per capture and per claim.
         /// Unset, 0, unless a profile gives some: `rtx-24gb` does, for the
-        /// 27B. With prompt reuse off, a count shares heads between live
-        /// siblings only.
+        /// 27B. With prompt reuse off a profile's count is not reserved, and
+        /// a named one shares heads between live siblings only.
         retained_device: Opt<Slots> = None, NO_RULE, ALL, [Visible, Patchable, ReloadRequired, Scoped];
         /// Retained slots in one pinned host block reserved at start, ~222
         /// MiB each, a PCIe copy per capture and per claim. Unset, the
