@@ -449,14 +449,20 @@ int main() {
   DeviceBytes workspace(ignis::gdn_prefill::workspace_bytes(kQkHeads, kValueHeads, 4096));
   std::printf("gdn_prefill: the recurrence runs %d warps per CTA here\n", ignis::gdn_prefill::recurrence_warps());
 
-  // The layer body takes our workspace from the vendored op's reservation (kernel/src/gdn_layer.cu):
-  // it must fit at every width the body sends here.
+  // The load reserves our workspace at the prefill chunk in place of the vendored op's
+  // (kernel/src/model.cu's gdn_layer_scratch_bytes): at every width the body sends here it must not
+  // shrink as the call widens, so the chunk's holds every narrower call, and it is no larger than
+  // the vendored op's, so the route never grows the plan.
   for (int32_t T = ignis::gdn_prefill::kMinTokens; T <= 16384; ++T) {
     const std::size_t ours = ignis::gdn_prefill::workspace_bytes(kQkHeads, kValueHeads, T);
     const std::size_t vendored =
         ninfer::ops::gated_delta_net_workspace_capacity_bytes(kQkHeads, kValueHeads, /*normalize_qk=*/true, 1, T);
     if (ours > vendored) {
       check(false, "our workspace at T=" + std::to_string(T) + " exceeds the vendored reservation");
+      break;
+    }
+    if (ours < ignis::gdn_prefill::workspace_bytes(kQkHeads, kValueHeads, T - 1)) {
+      check(false, "our workspace at T=" + std::to_string(T) + " is smaller than at one token fewer");
       break;
     }
   }

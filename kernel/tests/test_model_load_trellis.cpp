@@ -26,7 +26,13 @@
 // - GitHub #509: under the dense prefill the plan holds its one buffer, the
 //   body's largest matrix in INT8 (`trellis_dense_bytes`), and the trellis
 //   workspace asks the dense op at the chunk in place of the fused prefill;
-//   the served body and an unknown route are refused.
+//   the served body and an unknown route are refused;
+// - the review of spec #503: the prefill chunk's arena is sized by the routes
+//   the load runs -- no GDN conv plane since #507, q_proj's interleaved buffer
+//   only for the fused op's calls under the dense prefill, our GDN prefill's
+//   workspace in place of the vendored op's (#514), named here by its
+//   measurement switch so the closed forms hold on any card -- and a round's
+//   arena by none of them.
 //
 // The op's workspace query needs a prepared device (the decode route splits
 // for its SM count), so this runs on the GPU like every CTest here. ADR 0006 /
@@ -39,6 +45,8 @@
 #include "ignis_seq.h"
 #include "ignis_trellis_linear.h"
 
+#include "gdn_prefill.h"
+
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 
@@ -50,6 +58,16 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -219,7 +237,7 @@ struct Plan {
 
 Plan plan(const std::vector<Entry> &entries, const Topology &topology, uint32_t lanes, int32_t backend = 0,
           uint32_t draft_tokens = 0, uint32_t max_context = kMaxContext,
-          uint32_t prefill_linear = IGNIS_PREFILL_LINEAR_FUSED) {
+          uint32_t prefill_linear = IGNIS_PREFILL_LINEAR_FUSED, uint32_t chunk = kChunk) {
   std::vector<ignis_bound_tensor> tensors;
   for (const Entry &e : entries) {
     ignis_bound_tensor t{};
@@ -244,7 +262,7 @@ Plan plan(const std::vector<Entry> &entries, const Topology &topology, uint32_t 
   options.draft_tokens = draft_tokens;
   options.prefill_linear = prefill_linear;
   Plan p;
-  p.rc = ignis_model_plan_reservations(tensors.data(), tensors.size(), &topology.raw, kChunk, max_context,
+  p.rc = ignis_model_plan_reservations(tensors.data(), tensors.size(), &topology.raw, chunk, max_context,
                                        IGNIS_KV_FORMAT_HQ_E8_2B, &options, &p.reserved);
   if (p.rc != 0) p.error = ignis_model_last_error();
   return p;
@@ -320,27 +338,64 @@ uint64_t outer_bytes(uint64_t T, uint64_t B, bool head_every_column) {
 
 // The GQA layer: normalized, post; query, gate, rotated query, attention;
 // key, value, rotated key; positions and KV rows; fused; the attention's
-// query; and `q_proj`'s interleaved q | gate before its split.
-uint64_t gqa_bytes(uint64_t T, uint64_t B, uint32_t max_context, uint64_t *attention) {
+// query; and `q_proj`'s interleaved q | gate before its split -- under the
+// dense prefill (`dense`, GitHub #509) only for a call the fused op takes, 64
+// tokens at most, since the dense GEMM writes the query and the gate split.
+uint64_t gqa_bytes(uint64_t T, uint64_t B, uint32_t max_context, uint64_t *attention, bool dense = false) {
   const uint64_t c = T * B;
   *attention = aligned(ignis_gqa_attention_capacity_bytes(
       ninfer::DType::U8, {1, max_context}, static_cast<int32_t>(B), 1, static_cast<int32_t>(T)));
+  const uint64_t fused_columns = dense ? std::min<uint64_t>(c, IGNIS_TRELLIS_DECODE_MAX_TOKENS) : c;
   return 2 * bf16(kHidden * c) + 4 * bf16(kQWidth * c) + 3 * bf16(kKvWidth * c) + word(c) + word(B) +
-         bf16(kFfn * c) + *attention + bf16(2ull * kQWidth * c);
+         bf16(kFfn * c) + *attention + bf16(2ull * kQWidth * fused_columns);
 }
 
-// The GDN layer: h, post; qkv and its convolution; query, key; value, z, the
-// recurrence's readout, gated; g, beta; fused; the gating's and the
-// recurrence's queries.
-uint64_t gdn_bytes(uint64_t T, uint64_t B, uint64_t *gating, uint64_t *recurrence) {
+// Which arena a GDN layer's scratch is planned for (the review of spec #503):
+// a decode round's, whose conv is the vendored one into a [conv_channels, T]
+// plane; the prefill chunk's, whose conv writes q, k and v split (GitHub #507);
+// and the prefill chunk's on our GDN prefill (GitHub #514), whose recurrence
+// takes its own workspace from ignis::gdn_prefill::kMinTokens tokens.
+enum class GdnArena { kRound, kPrefill, kPrefillOurs };
+
+// The GDN layer: h, post; qkv and, on a round, its convolution; query, key;
+// value, z, the recurrence's readout, gated; g, beta; fused; the gating's and
+// the recurrence's queries.
+uint64_t gdn_bytes(uint64_t T, uint64_t B, GdnArena arena, uint64_t *gating, uint64_t *recurrence) {
   const uint64_t c = T * B;
+  const int32_t qk_heads = kKeyWidth / 128;
   *gating = aligned(ninfer::ops::gdn_gating_proj_workspace_capacity_bytes(kValueHeads, kHidden, 1,
                                                                           static_cast<int32_t>(c)));
-  *recurrence = aligned(ninfer::ops::gated_delta_net_workspace_capacity_bytes(
-      kKeyWidth / 128, kValueHeads, /*normalize_qk=*/true, 1, static_cast<int32_t>(c)));
-  return 2 * bf16(kHidden * c) + 2 * bf16(kConvChannels * c) + 2 * bf16(kKeyWidth * c) +
+  const auto vendored = [&](uint64_t width) {
+    return aligned(ninfer::ops::gated_delta_net_workspace_capacity_bytes(qk_heads, kValueHeads, /*normalize_qk=*/true,
+                                                                         1, static_cast<int32_t>(width)));
+  };
+  *recurrence = vendored(c);
+  if (arena == GdnArena::kPrefillOurs && c >= static_cast<uint64_t>(ignis::gdn_prefill::kMinTokens)) {
+    *recurrence = std::max<uint64_t>(
+        aligned(ignis::gdn_prefill::workspace_bytes(qk_heads, kValueHeads, static_cast<int32_t>(c))),
+        vendored(ignis::gdn_prefill::kMinTokens - 1));
+  }
+  const uint64_t conv_planes = arena == GdnArena::kRound ? 2 : 1;
+  return 2 * bf16(kHidden * c) + conv_planes * bf16(kConvChannels * c) + 2 * bf16(kKeyWidth * c) +
          4 * bf16(kStateRows * c) + 2 * word(kValueHeads * c) + bf16(kFfn * c) + *gating + *recurrence;
 }
+
+// Sets (or, with null, removes) a variable in the operating system's
+// environment, where the leaf reads the GDN prefill's measurement switch
+// (kernel/src/gdn_prefill.h `route_for_load`).
+void set_environment(const char *name, const char *value) {
+#ifdef _WIN32
+  SetEnvironmentVariableA(name, value);
+#else
+  if (value != nullptr) {
+    setenv(name, value, 1);
+  } else {
+    unsetenv(name);
+  }
+#endif
+}
+
+constexpr const char *kGdnSwitch = "IGNIS_GDN_PREFILL";
 
 }  // namespace
 
@@ -352,6 +407,9 @@ int main() {
   }
   const Topology four = topology_of(4);
   const Topology none = topology_of(0);
+  // The closed forms below are the vendored GDN prefill's unless a case names
+  // ours: the measurement switch picks the route on any card.
+  set_environment(kGdnSwitch, "vendored");
 
   // The trellis body binds, and its workspace is the widest call.
   {
@@ -382,15 +440,16 @@ int main() {
   // 262,144 keys of hq-e8-2b, two lanes, window 7): their closed forms. The
   // drafter's prefill append, which `rtx50-16gb`'s DFlash2 adds to
   // `workspace`, is the served body's own term; the verify-only backend has
-  // the same round arena without it.
+  // the same round arena without it. The prefill chunk's GDN layer holds no
+  // conv plane (GitHub #507), a round's does.
+  constexpr uint32_t kLanes = 2, kWindow = 7, kContext = 262144;
   {
-    constexpr uint32_t kLanes = 2, kWindow = 7, kContext = 262144;
     const Plan p = plan(trellis_body(4), four, kLanes, IGNIS_SPECULATIVE_VERIFY_ONLY, kWindow, kContext);
     check(p.rc == 0, "the 16 GiB shape plans: " + p.error);
     uint64_t attention = 0, gating = 0, recurrence = 0;
     const uint64_t chunk_outer = outer_bytes(kChunk, 1, false);
     const uint64_t chunk_gqa = gqa_bytes(kChunk, 1, kContext, &attention);
-    const uint64_t chunk_gdn = gdn_bytes(kChunk, 1, &gating, &recurrence);
+    const uint64_t chunk_gdn = gdn_bytes(kChunk, 1, GdnArena::kPrefill, &gating, &recurrence);
     const uint64_t workspace = chunk_outer + std::max(chunk_gqa, chunk_gdn);
     std::printf("workspace at chunk %u: outer %llu + max(GQA %llu [attention %llu], GDN %llu [gating %llu, "
                 "recurrence %llu]) = %llu\n",
@@ -403,7 +462,7 @@ int main() {
               std::to_string(workspace) + ")");
     const uint64_t round_outer = outer_bytes(kWindow + 1, kLanes, true);
     const uint64_t round_gqa = gqa_bytes(kWindow + 1, kLanes, kContext, &attention);
-    const uint64_t round_gdn = gdn_bytes(kWindow + 1, kLanes, &gating, &recurrence);
+    const uint64_t round_gdn = gdn_bytes(kWindow + 1, kLanes, GdnArena::kRound, &gating, &recurrence);
     const uint64_t decode_graph = round_outer + std::max(round_gqa, round_gdn) + 2 * 4 * kLanes;
     std::printf("decode_graph at %u lanes x %u columns: outer %llu + max(GQA %llu [attention %llu], GDN %llu "
                 "[gating %llu, recurrence %llu]) + %u = %llu\n",
@@ -415,6 +474,61 @@ int main() {
     check(p.reserved.decode_graph_bytes == decode_graph,
           "decode_graph is its closed form (" + std::to_string(p.reserved.decode_graph_bytes) + " vs " +
               std::to_string(decode_graph) + ")");
+  }
+
+  // The review of spec #503: the same shape on the route an 8.x card runs,
+  // the dense prefill and our GDN prefill (GitHub #509, #514), whatever card
+  // this is. The prefill chunk's GQA layer holds q_proj's interleaved buffer
+  // only for a call the fused op takes, and its GDN layer our recurrence's
+  // workspace in place of the vendored op's; the round arena does not move.
+  {
+    const Plan vendored = plan(trellis_body(4), four, kLanes, IGNIS_SPECULATIVE_VERIFY_ONLY, kWindow, kContext,
+                               IGNIS_PREFILL_LINEAR_DENSE);
+    set_environment(kGdnSwitch, "ours");
+    const Plan p = plan(trellis_body(4), four, kLanes, IGNIS_SPECULATIVE_VERIFY_ONLY, kWindow, kContext,
+                        IGNIS_PREFILL_LINEAR_DENSE);
+    set_environment(kGdnSwitch, "vendored");
+    check(p.rc == 0 && vendored.rc == 0, "the 16 GiB shape plans the 8.x routes: " + p.error + vendored.error);
+    uint64_t attention = 0, gating = 0, recurrence = 0;
+    const uint64_t chunk_outer = outer_bytes(kChunk, 1, false);
+    const uint64_t chunk_gqa = gqa_bytes(kChunk, 1, kContext, &attention, /*dense=*/true);
+    const uint64_t chunk_gdn = gdn_bytes(kChunk, 1, GdnArena::kPrefillOurs, &gating, &recurrence);
+    const uint64_t workspace = chunk_outer + std::max(chunk_gqa, chunk_gdn);
+    std::printf("8.x routes at chunk %u: workspace outer %llu + max(GQA %llu, GDN %llu [recurrence %llu]) = %llu "
+                "(vendored GDN prefill %llu)\n",
+                kChunk, static_cast<unsigned long long>(chunk_outer), static_cast<unsigned long long>(chunk_gqa),
+                static_cast<unsigned long long>(chunk_gdn), static_cast<unsigned long long>(recurrence),
+                static_cast<unsigned long long>(workspace),
+                static_cast<unsigned long long>(vendored.reserved.workspace_bytes));
+    check(p.reserved.workspace_bytes == workspace,
+          "the 8.x routes' workspace is its closed form (" + std::to_string(p.reserved.workspace_bytes) + " vs " +
+              std::to_string(workspace) + ")");
+    check(p.reserved.workspace_bytes <= vendored.reserved.workspace_bytes, "our GDN prefill never grows the plan");
+    check(p.reserved.decode_graph_bytes == vendored.reserved.decode_graph_bytes &&
+              p.reserved.trellis_workspace_bytes == vendored.reserved.trellis_workspace_bytes &&
+              p.reserved.trellis_dense_bytes == vendored.reserved.trellis_dense_bytes,
+          "our GDN prefill moves no other line");
+  }
+
+  // What the routes' sizing holds back at the default chunk and the solo
+  // chunks (#489), at rtx-24gb's context: a printout for the report, the
+  // closed forms above being the check.
+  for (const uint32_t chunk : {2048u, 4096u, 8192u}) {
+    constexpr uint32_t kMillion = 1048576;
+    const Plan fused = plan(trellis_body(4), four, 8, IGNIS_SPECULATIVE_VERIFY_ONLY, kWindow, kMillion,
+                            IGNIS_PREFILL_LINEAR_FUSED, chunk);
+    const Plan dense = plan(trellis_body(4), four, 8, IGNIS_SPECULATIVE_VERIFY_ONLY, kWindow, kMillion,
+                            IGNIS_PREFILL_LINEAR_DENSE, chunk);
+    set_environment(kGdnSwitch, "ours");
+    const Plan ours = plan(trellis_body(4), four, 8, IGNIS_SPECULATIVE_VERIFY_ONLY, kWindow, kMillion,
+                           IGNIS_PREFILL_LINEAR_DENSE, chunk);
+    set_environment(kGdnSwitch, "vendored");
+    check(fused.rc == 0 && dense.rc == 0 && ours.rc == 0,
+          "chunk " + std::to_string(chunk) + " plans: " + fused.error + dense.error + ours.error);
+    std::printf("chunk %u at %u keys: workspace fused %llu, dense %llu, dense + our GDN prefill %llu\n", chunk,
+                kMillion, static_cast<unsigned long long>(fused.reserved.workspace_bytes),
+                static_cast<unsigned long long>(dense.reserved.workspace_bytes),
+                static_cast<unsigned long long>(ours.reserved.workspace_bytes));
   }
 
   // The served body: no trellis line; the trellis endpoints alone: one.
@@ -444,9 +558,18 @@ int main() {
           "the dense prefill's trellis workspace is its widest ask (" +
               std::to_string(dense.reserved.trellis_workspace_bytes) + " vs " + std::to_string(expected_dense_line(32)) +
               ")");
-    check(dense.reserved.workspace_bytes == fused.reserved.workspace_bytes &&
-              dense.reserved.decode_graph_bytes == fused.reserved.decode_graph_bytes,
-          "the dense prefill moves no other line");
+    // The prefill chunk's workspace loses q_proj's interleaved buffer past
+    // the fused op's 64 tokens; no other line moves.
+    uint64_t attention = 0, gating = 0, recurrence = 0;
+    const uint64_t dense_workspace =
+        outer_bytes(kChunk, 1, false) + std::max(gqa_bytes(kChunk, 1, kMaxContext, &attention, /*dense=*/true),
+                                                 gdn_bytes(kChunk, 1, GdnArena::kPrefill, &gating, &recurrence));
+    check(dense.reserved.workspace_bytes == dense_workspace,
+          "the dense prefill's workspace is its closed form (" + std::to_string(dense.reserved.workspace_bytes) +
+              " vs " + std::to_string(dense_workspace) + ")");
+    check(dense.reserved.workspace_bytes <= fused.reserved.workspace_bytes, "the dense prefill never grows it");
+    check(dense.reserved.decode_graph_bytes == fused.reserved.decode_graph_bytes,
+          "the dense prefill moves no round line");
     std::printf("dense prefill at chunk %u: trellis_dense %llu bytes, trellis_workspace %llu (fused prefill %llu)\n",
                 kChunk, static_cast<unsigned long long>(dense.reserved.trellis_dense_bytes),
                 static_cast<unsigned long long>(dense.reserved.trellis_workspace_bytes),
@@ -527,6 +650,7 @@ int main() {
           "a misplaced svh is refused: " + r.error);
   }
 
+  set_environment(kGdnSwitch, nullptr);
   if (g_failed != 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failed);
     return 1;
