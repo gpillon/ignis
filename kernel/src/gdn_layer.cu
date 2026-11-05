@@ -20,6 +20,7 @@
 #include "ignis_gdn_layer.h"
 
 #include "ignis_seq_internal.h"
+#include "gdn_conv_split.h"
 #include "layer_internal.h"
 #include "model_internal.h"
 #include "trellis_body.h"
@@ -46,6 +47,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
@@ -58,6 +60,12 @@ namespace {
 // separate channel from the model / step / seq ABIs (each ABI surface owns
 // its own, model.cu / step.cu / seq.cu's convention).
 thread_local std::string g_last_error;
+
+// GitHub #507: the test-only switch back to the pre-#507 prefill body, and
+// the count of the layout copies the prefill body has enqueued
+// (kernel/src/layer_internal.h).
+std::atomic<bool> g_layout_copies{false};
+std::atomic<std::uint64_t> g_layout_copies_enqueued{0};
 
 void set_error(std::string message) {
   g_last_error = std::move(message);
@@ -160,12 +168,14 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
   // f64 reference's 1/sqrt(GDN_HEAD_DIM).
   const float readout_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
+  // GitHub #507: the pre-#507 body, under the test-only switch alone.
+  const bool layout_copies = g_layout_copies.load(std::memory_order_relaxed);
+
   ninfer::DeviceArena::Scope scope = model->scratch->scope();
   try {
     // --- per-layer intermediates (the layer's scratch for this step) ---
     ninfer::Tensor h = model->scratch->alloc(ninfer::DType::BF16, {hidden, T, 1, 1});
     ninfer::Tensor qkv = model->scratch->alloc(ninfer::DType::BF16, {conv_channels, T, 1, 1});
-    ninfer::Tensor qkv_conv = model->scratch->alloc(ninfer::DType::BF16, {conv_channels, T, 1, 1});
     ninfer::Tensor query = model->scratch->alloc(ninfer::DType::BF16, {qk_width, T, 1, 1});
     ninfer::Tensor key = model->scratch->alloc(ninfer::DType::BF16, {qk_width, T, 1, 1});
     ninfer::Tensor value = model->scratch->alloc(ninfer::DType::BF16, {value_width, T, 1, 1});
@@ -201,8 +211,8 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     // plane, in place on the sequence's rolling conv taps. The fused
     // projection+conv+split op (gdn_input_proj_conv_snapshot) has no leaf
     // implementation yet (kernel/src/gdn_input_proj.cu only wires the plain
-    // projection); composing the two vendored ops here is equivalent for
-    // T within the conv's dense (unmasked) domain, which every caller of
+    // projection); composing the projection and the conv here is equivalent
+    // for T within the conv's dense (unmasked) domain, which every caller of
     // this step ABI uses (no mid-batch padding).
     const ninfer::Tensor conv_weight = weight_tensor(
         w.convolution, ninfer::DType::BF16, {conv_channels, kIgnisGdnConvKernel, 1, 1});
@@ -214,31 +224,38 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     // widest policy, P2-01, GitHub #83), so a chunk's A4 route needs
     // nothing new. GitHub #339: the trellis body's two matrices instead.
     input_projection(*model, w, h, qkv, zbuf, *model->scratch, mode, stream);
-    ninfer::ops::causal_conv1d_silu(qkv, conv_weight, conv_state, qkv_conv, stream);
-
-    // The convolved query/key/value channel ranges are strided sub-views of
-    // `qkv_conv` (a [conv_channels, T] feature-major buffer: for a fixed
-    // token column, channels are contiguous), so a per-range device-to-device
-    // strided copy (not a Tensor::slice view) lands each range in its own
-    // contiguous buffer -- the per-head views below require contiguous
-    // storage.
-    constexpr std::size_t kElemBytes = 2;  // BF16
-    auto copy_channel_range = [&](std::int32_t offset, std::int32_t width,
-                                  ninfer::Tensor &dst) -> cudaError_t {
-      const auto *src = static_cast<const std::uint8_t *>(qkv_conv.data) +
-                        static_cast<std::size_t>(offset) * kElemBytes;
-      return cudaMemcpy2DAsync(dst.data, static_cast<std::size_t>(width) * kElemBytes, src,
-                               static_cast<std::size_t>(conv_channels) * kElemBytes,
-                               static_cast<std::size_t>(width) * kElemBytes,
-                               static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, stream);
-    };
-    cudaError_t err = copy_channel_range(0, qk_width, query);
-    if (err == cudaSuccess) { err = copy_channel_range(qk_width, qk_width, key); }
-    if (err == cudaSuccess) { err = copy_channel_range(2 * qk_width, value_width, value); }
-    if (err != cudaSuccess) {
-      set_error(std::string("ignis_gdn_layer_step: cudaMemcpy2DAsync(qkv split) failed: ") +
-                cudaGetErrorString(err));
-      return -1;
+    cudaError_t err = cudaSuccess;
+    if (!layout_copies) {
+      // GitHub #507: the conv writes the convolved query/key/value channel
+      // ranges straight into their own contiguous planes (the per-head views
+      // below require contiguous storage), the vendored conv's arithmetic
+      // bit for bit (kernel/src/gdn_conv_split.h).
+      ignis::gdn_conv::split_conv(qkv, conv_weight, conv_state, query, key, value, stream);
+    } else {
+      // The pre-#507 body (test-only, kernel/src/layer_internal.h): the
+      // vendored conv into one [conv_channels, T] plane, whose ranges are
+      // strided sub-views, then a strided device-to-device copy per range.
+      ninfer::Tensor qkv_conv = model->scratch->alloc(ninfer::DType::BF16, {conv_channels, T, 1, 1});
+      ninfer::ops::causal_conv1d_silu(qkv, conv_weight, conv_state, qkv_conv, stream);
+      constexpr std::size_t kElemBytes = 2;  // BF16
+      auto copy_channel_range = [&](std::int32_t offset, std::int32_t width,
+                                    ninfer::Tensor &dst) -> cudaError_t {
+        const auto *src = static_cast<const std::uint8_t *>(qkv_conv.data) +
+                          static_cast<std::size_t>(offset) * kElemBytes;
+        g_layout_copies_enqueued.fetch_add(1, std::memory_order_relaxed);
+        return cudaMemcpy2DAsync(dst.data, static_cast<std::size_t>(width) * kElemBytes, src,
+                                 static_cast<std::size_t>(conv_channels) * kElemBytes,
+                                 static_cast<std::size_t>(width) * kElemBytes,
+                                 static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, stream);
+      };
+      err = copy_channel_range(0, qk_width, query);
+      if (err == cudaSuccess) { err = copy_channel_range(qk_width, qk_width, key); }
+      if (err == cudaSuccess) { err = copy_channel_range(2 * qk_width, value_width, value); }
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_gdn_layer_step: cudaMemcpy2DAsync(qkv split) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
     }
 
     // --- GDN gating projection + gating -> g (decay) and beta (update gate) ---
@@ -281,14 +298,20 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
 
     // --- output projection + residual (the layer's attention residual add; the
     // layer-4 BF16 output arm, exercised by the test). `residual_view` is not
-    // const: the linear_adds update the residual in place.
+    // const: the linear_adds update the residual in place. GitHub #507: in
+    // the in-place form (`in_residual == out_residual`, the chunk loop's) the
+    // input is that residual already -- the input RMSNorm above was its only
+    // other reader -- so only distinct buffers copy it.
     ninfer::Tensor residual_view(out_residual, ninfer::DType::BF16, {hidden, T, 1, 1});
-    err = cudaMemcpyAsync(out_residual, in_residual, static_cast<std::size_t>(hidden) * T * 2,
-                          cudaMemcpyDeviceToDevice, stream);
-    if (err != cudaSuccess) {
-      set_error(std::string("ignis_gdn_layer_step: cudaMemcpyAsync(residual) failed: ") +
-                cudaGetErrorString(err));
-      return -1;
+    if (out_residual != in_residual) {
+      g_layout_copies_enqueued.fetch_add(1, std::memory_order_relaxed);
+      err = cudaMemcpyAsync(out_residual, in_residual, static_cast<std::size_t>(hidden) * T * 2,
+                            cudaMemcpyDeviceToDevice, stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_gdn_layer_step: cudaMemcpyAsync(residual) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
     }
     // The output projection's residual add, then the MLP tail: post-attention
     // norm -> SwiGLU (gate_up + SiLU-mul) -> down + residual.
@@ -737,4 +760,17 @@ extern "C" int32_t ignis_gdn_layer_step(struct ignis_model *model, struct ignis_
 
 extern "C" const char *ignis_gdn_layer_last_error(void) {
   return g_last_error.c_str();
+}
+
+// GitHub #507: the test-only hooks (kernel/src/layer_internal.h).
+void ignis_gdn_layer_set_layout_copies(bool enabled) {
+  g_layout_copies.store(enabled, std::memory_order_relaxed);
+}
+
+bool ignis_gdn_layer_layout_copies() {
+  return g_layout_copies.load(std::memory_order_relaxed);
+}
+
+uint64_t ignis_gdn_layer_layout_copies_enqueued() {
+  return g_layout_copies_enqueued.load(std::memory_order_relaxed);
 }

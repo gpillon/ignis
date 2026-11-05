@@ -139,9 +139,33 @@ int32_t ignis_gqa_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, igni
 // call's compute-policy mode (P2-03, GitHub #85): every NVFP4 projection
 // in the layer is dispatched under the policy `ignis_policy_for` resolves
 // for it.
+//
+// GitHub #507: `in_residual == out_residual` is the in-place form, the one
+// the chunk loop uses: the body consumes its input residual (the input
+// RMSNorm reads it first) and adds into it, so no copy of it runs. Distinct
+// buffers leave `in_residual` untouched and copy it into `out_residual`
+// first, as before.
 int32_t ignis_gdn_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                   uint32_t layer, const void *in_residual, void *out_residual,
                                   uint64_t num_tokens, LinearPolicyMode mode);
+
+// GitHub #507: the GDN prefill body copies no layout between its kernels --
+// its conv writes the query, key and value planes split
+// (kernel/src/gdn_conv_split.h), and in the in-place form above the residual
+// is not copied either. Two test-only hooks hold that to the body as it ran
+// before (kernel/tests/test_gdn_prefill_layout.cu):
+//   - `ignis_gdn_layer_set_layout_copies(true)` brings the pre-#507 prefill
+//     back: the vendored conv into one plane and the three strided copies
+//     that split it, and the chunk loop's two buffers with a swap after every
+//     layer, so a test produces today's golden in its own run. No production
+//     caller sets it; it is process-wide.
+//   - `ignis_gdn_layer_layout_copies_enqueued()` counts the layout copies the
+//     prefill body has enqueued since the process started: the split's three
+//     and the residual's one, on the host as they are enqueued.
+// The decode and verify bodies below are not the prefill's and keep theirs.
+void ignis_gdn_layer_set_layout_copies(bool enabled);
+bool ignis_gdn_layer_layout_copies();
+uint64_t ignis_gdn_layer_layout_copies_enqueued();
 
 // The GDN counterpart of `ignis_gqa_layer_step_mode` (no position advance:
 // the GDN layer's state is updated in place by the enqueued work, so only

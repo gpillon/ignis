@@ -543,6 +543,24 @@ add_executable(ignis_kernel_dflash2_topk_test test_dflash2_topk.cu)
 target_link_libraries(ignis_kernel_dflash2_topk_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_dflash2_topk_test COMMAND ignis_kernel_dflash2_topk_test)
 
+# GitHub #507: OURS, an adapted op -- the GDN prefill's split conv (kernel/src/gdn_conv_split.h,
+# leaf-internal) against what the layer body ran before it, the vendored causal conv and the three
+# strided copies that split its plane, at every form the vendored wrapper switches between and the
+# 27B's prefill chunks. The conv is exact, so the bound is bit equality. Links ignis_kernel for
+# ours and ignis_vendor for the oracle; no SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_gdn_conv_split_test test_gdn_conv_split.cu)
+target_include_directories(ignis_kernel_gdn_conv_split_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_gdn_conv_split_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_gdn_conv_split_test COMMAND ignis_kernel_gdn_conv_split_test)
+# GitHub #507: OURS -- the GDN prefill copies no layout: the layer body at the prefill chunks and
+# the chunked program prefill on a synthetic trellis body of the 27B's widths, against the body and
+# loop as they ran before (the leaf's test-only switch, kernel/src/layer_internal.h), bit for bit,
+# and the copy counter at zero. GPU; no SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_gdn_prefill_layout_test test_gdn_prefill_layout.cu)
+target_include_directories(ignis_kernel_gdn_prefill_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_gdn_prefill_layout_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_gdn_prefill_layout_test COMMAND ignis_kernel_gdn_prefill_layout_test)
+
 # ADR 0062: the token embedding in mapped pinned host memory (OURS: the
 # device surface's allocation), gathered by the vendored W8 op bit for bit as
 # from device memory, eager and graph-replayed. GPU; no SKIP_RETURN_CODE
