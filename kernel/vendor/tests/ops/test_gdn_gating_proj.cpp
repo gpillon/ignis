@@ -71,9 +71,40 @@ void name_skipped_fused_27_norm_route(const std::string& where) {
               << " " << where << ": not resident on this card\n";
 }
 
+// The unsplit route, where the planner runs it in place of a cooperative route the card cannot
+// hold resident, is checked against a criterion of its own. kGdnProjectionFp32 was tuned on the
+// RTX 5090, where every T below 4097 runs split-K, and holds the unsplit route with no margin: on
+// an sm_86 card on which the cooperative schedules are not resident, as on an RTX 3090, T=1024
+// and T=2049 failed it.
+//
+// The unsplit route keeps one fp32 accumulator per output through 320 m16n8k16 MMAs in k order
+// (K = 5120) and sums no partials. The tensor core normalizes each MMA's sum toward zero (the RTX
+// 5090's unsplit outputs match a CPU model of 16 exact products and the accumulator, aligned to
+// the largest exponent and truncated toward zero: 575 of 576 g values within 2.5e-7 relative),
+// so step i loses a fraction below 2^-23 of the running sum s_i, always toward zero. The losses
+// add as a bias, -sum(rho_i * s_i), not as a random walk: over n steps its rms grows as n^(3/2)
+// against the sum's n^(1/2), a relative error that grows as n. A route of S splits runs S chains
+// of n/S steps and carries 1/S of the unsplit route's error. On the RTX 5090, on this test's data,
+// g's rel_l2 is 1.4e-7 on split8 (T=1024), 2.6e-7 on split4 (T=1025) and 5.8e-7 on split2
+// (T=2049); the unsplit route forced at the same T gives 1.33e-6, 1.12e-6 and 1.30e-6, and
+// 1.24e-6 at T=4097, where the planner runs it. At T=1024 that is 0.95 of kGdnProjectionFp32's
+// rel_l2 and 1.12 of its gross limit. Over 300 seeds the CPU model gives a mean rel_l2 of 1.2e-6,
+// at most 1.85e-6 and 1.6 times that gross limit; models of the same truncation that fit the sm_86
+// card's failures reach 2.3e-6 and 2.2 times.
+//
+// This criterion is kGdnProjectionFp32 times 3 in each term: the unsplit chain carries twice the
+// error of split2, the longest chain kGdnProjectionFp32 holds with margin (0.41 of it), and the
+// spread of the bias across data takes the rest. Those models stay within 0.73 of it over 300
+// seeds, the RTX 5090's unsplit route within 0.37 on this data; a wrong tile or K range errs by
+// ~1e-2. The 35B's fallback (K = 2048, 128 MMAs, at most 3.3e-7 on the RTX 5090) is held to it. On
+// the RTX 5090 no case is a fallback, so every check there is the reference's.
+constexpr ReductionCriterion kGdnProjectionUnsplitFp32{/*relative_l2=*/4.2e-6,
+                                                       /*gross_absolute=*/1.5e-6,
+                                                       /*gross_relative_to_max_reference=*/7.5e-6};
+
 // Below the unsplit route's first T (4097), the planner runs the unsplit route only in place of a
-// cooperative route the card cannot hold resident.
-void name_skipped_cooperative_route(const Geometry& geometry, std::int32_t tokens) {
+// cooperative route the card cannot hold resident. Returns whether it does.
+bool name_skipped_cooperative_route(const Geometry& geometry, std::int32_t tokens) {
     const ops::detail::Bf16GdnGatingPlan plan =
         ops::detail::bf16_gdn_gating_resolve_plan({geometry.heads, geometry.hidden, tokens});
     if (plan.schedule == ops::detail::Bf16GdnGatingScheduleId::MmaUnsplit && tokens < 4097) {
@@ -81,7 +112,9 @@ void name_skipped_cooperative_route(const Geometry& geometry, std::int32_t token
         std::cout << "SKIP the cooperative route of gdn_gating_proj " << geometry.label
                   << " T=" << tokens << ": not resident on this card, the planner runs "
                   << ops::detail::bf16_gdn_gating_schedule_name(plan.schedule) << "\n";
+        return true;
     }
+    return false;
 }
 
 // The planner takes each cooperative kernel's CTAs/SM from the occupancy query. On a compute
@@ -327,7 +360,9 @@ int verify_inputs_unchanged(const std::string& label, const DeviceBuffer& device
 }
 
 int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed) {
-    name_skipped_cooperative_route(geometry, tokens);
+    const ReductionCriterion& criterion = name_skipped_cooperative_route(geometry, tokens)
+                                              ? kGdnProjectionUnsplitFp32
+                                              : kGdnProjectionFp32;
     std::vector<float> x(static_cast<std::size_t>(geometry.hidden) * tokens);
     std::vector<float> a_weight(static_cast<std::size_t>(geometry.heads) * geometry.hidden);
     std::vector<float> b_weight(static_cast<std::size_t>(geometry.heads) * geometry.hidden);
@@ -393,9 +428,9 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
     failures += require_all_finite(label + " g", full_g);
     failures += require_all_finite(label + " beta", full_beta);
     failures += verify_normwise(label + " g", select_tokens(full_g, selected, geometry.heads),
-                                reference_g, kGdnProjectionFp32);
+                                reference_g, criterion);
     failures += verify_normwise(label + " beta", select_tokens(full_beta, selected, geometry.heads),
-                                reference_beta, kGdnProjectionFp32);
+                                reference_beta, criterion);
     failures += device_g.verify_guards((label + " g").c_str());
     failures += device_beta.verify_guards((label + " beta").c_str());
     failures += verify_inputs_unchanged(label, device_x, x_bits, device_weight, weight_bits,

@@ -74,14 +74,14 @@ inline uint64_t tile_bytes(const ignis_trellis_weight &w) {
 // quantize it once for all of them.
 bool dense_prefill(const ignis_model &model, int32_t tokens);
 
-// GitHub #511: whether such a call also runs A8 fused into the producers of
-// its inputs: the dense prefill, under the leaf's test-only switch
+// GitHub #511: whether such a call also runs A8 fused into the RMSnorm that
+// produces its input: the dense prefill, under the leaf's test-only switch
 // (ignis_dense_prefill_set_fused_producers, on by default). The RMSnorm
 // before a block's first matrices then quantizes their input as it normalizes
 // it (the norm_* calls below, which the layer programs run in place of the
-// RMSnorm and the projection), and the MLP's SwiGLU epilogue keeps down's
-// block maxima (output_and_mlp). The activations are the standalone A8's bit
-// for bit; only the passes change.
+// RMSnorm and the projection, and output_and_mlp's norm with gate and up).
+// The activations are the standalone A8's bit for bit; only the passes
+// change. Down's A8 stays the standalone pass.
 bool fused_producers(const ignis_model &model, int32_t tokens);
 
 // y = x W through `epilogue` (IGNIS_TRELLIS_STORE or IGNIS_TRELLIS_ADD): `x`
@@ -151,8 +151,8 @@ std::int32_t mlp_width(const ignis_model &model, const TrellisTail &tail, const 
 // in this order: the output projection of `mixed` added into `residual`, the
 // post-attention norm (`post_norm`, BF16 `[hidden]`) into `post`, the SwiGLU
 // into `fused`, and the down projection added into `residual`. Under
-// fused_producers (GitHub #511) the norm, the SwiGLU and down run as one dense
-// MLP with every A8 fused into its producer, and `post` is not written.
+// fused_producers (GitHub #511) the norm writes gate and up's A8 in place of
+// `post`, which is not written; down quantizes `fused` on its own.
 void output_and_mlp(const ignis_model &model, const TrellisTail &tail, const ninfer::Tensor &mixed,
                     const ninfer::Tensor &post_norm, ninfer::Tensor &residual, ninfer::Tensor &post,
                     ninfer::Tensor &fused, cudaStream_t stream);

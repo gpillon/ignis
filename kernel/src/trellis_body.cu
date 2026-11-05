@@ -251,23 +251,23 @@ void output_and_mlp(const ignis_model &model, const TrellisTail &tail, const nin
   linear(model, tail.output, mixed, residual.data, hidden, IGNIS_TRELLIS_ADD, stream);
   if (fused_producers(model, residual.ne[1])) {
     // GitHub #511: the norm with gate and up's A8, gate's store and up's
-    // SwiGLU pass into `fused` keeping down's block maxima, down's second A8
-    // pass and its add into the residual (`post` unwritten).
-    require_activation(residual, tail.gate_proj.in, "dense prefill");
-    require_norm(model, post_norm, residual);
+    // SwiGLU pass into `fused` (`post` unwritten); down's A8 stays the
+    // standalone pass of the dense linear below.
+    if (tail.up_proj.in != tail.gate_proj.in || tail.up_proj.out != tail.gate_proj.out) {
+      throw std::invalid_argument("trellis swiglu: gate and up shapes differ");
+    }
     if (fused.dtype != ninfer::DType::BF16 || fused.ne[0] != static_cast<std::int32_t>(tail.gate_proj.out) ||
         fused.ne[1] != residual.ne[1] || !fused.is_contiguous()) {
       throw std::invalid_argument("dense prefill: the SwiGLU's output is not a BF16 [ffn, T] matrix");
     }
-    check(ignis_dense_prefill_norm_mlp(&tail.gate_proj, &tail.up_proj, &tail.down, residual.data, post_norm.data,
-                                       model.rms_norm_eps, static_cast<uint32_t>(residual.ne[1]), fused.data,
-                                       residual.data, hidden, &model.trellis_workspace, model.trellis_dense_buffer->p,
-                                       model.trellis_dense_buffer->bytes, stream),
-          "dense prefill");
-    return;
+    const ignis_trellis_weight *ws[2] = {&tail.gate_proj, &tail.up_proj};
+    const ignis_dense_prefill_output out[2] = {dense_output(fused.data, tail.gate_proj.out, IGNIS_TRELLIS_STORE),
+                                               dense_output(fused.data, tail.gate_proj.out, IGNIS_DENSE_PREFILL_SWIGLU_UP)};
+    norm_linear(model, ws, 2, residual, post_norm, nullptr, out, stream);
+  } else {
+    ninfer::ops::rmsnorm(residual, post_norm, model.rms_norm_eps, /*unit_offset=*/true, post, stream);
+    swiglu(model, tail.gate_proj, tail.up_proj, post, fused, stream);
   }
-  ninfer::ops::rmsnorm(residual, post_norm, model.rms_norm_eps, /*unit_offset=*/true, post, stream);
-  swiglu(model, tail.gate_proj, tail.up_proj, post, fused, stream);
   linear(model, tail.down, fused, residual.data, hidden, IGNIS_TRELLIS_ADD, stream);
 }
 
