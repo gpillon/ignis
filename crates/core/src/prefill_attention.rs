@@ -117,6 +117,38 @@ impl fmt::Display for PrefillLinear {
     }
 }
 
+/// The 27B's gated delta net prefill route (GitHub #514), which no load option
+/// names: the leaf decides it once per load from the card's generation, or from
+/// the measurement switch `IGNIS_GDN_PREFILL`, and reports it
+/// ([`crate::model_load::Model::gdn_prefill`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GdnPrefill {
+    /// The vendored chunked kernels: what an RTX 50 or RTX PRO card runs.
+    Vendored,
+    /// ignis's own kernels in full-rate forms: what an 8.x card runs.
+    Ours,
+}
+
+impl GdnPrefill {
+    /// `enum ignis_gdn_prefill`: 0 the vendored kernels, 1 ours; `None` for
+    /// any other code.
+    pub const fn from_abi(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Vendored),
+            1 => Some(Self::Ours),
+            _ => None,
+        }
+    }
+
+    /// The switch's own spellings.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vendored => "vendored",
+            Self::Ours => "ours",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +161,15 @@ mod tests {
         assert_eq!(PrefillAttention::Int8.abi_code(), 2);
         assert_eq!(PrefillLinear::default(), PrefillLinear::Fp16);
         assert_eq!((PrefillLinear::Fp16.abi_code(), PrefillLinear::Int8.abi_code()), (0, 1));
+    }
+
+    /// The leaf's codes, and the switch's spellings.
+    #[test]
+    fn the_gdn_prefill_routes_are_the_headers_codes() {
+        assert_eq!(GdnPrefill::from_abi(0), Some(GdnPrefill::Vendored));
+        assert_eq!(GdnPrefill::from_abi(1), Some(GdnPrefill::Ours));
+        assert_eq!(GdnPrefill::from_abi(2), None);
+        assert_eq!((GdnPrefill::Vendored.as_str(), GdnPrefill::Ours.as_str()), ("vendored", "ours"));
     }
 
     #[test]

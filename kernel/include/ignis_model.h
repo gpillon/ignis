@@ -277,6 +277,17 @@ enum ignis_prefill_linear {
   IGNIS_PREFILL_LINEAR_DENSE = 1,
 };
 
+/* GitHub #514: the 27B's gated delta net prefill route, which no load option
+ * names: decided once per load from the card's generation, unless the
+ * measurement switch IGNIS_GDN_PREFILL (`ours` or `vendored`) does
+ * (kernel/src/gdn_prefill.h). `ignis_model_gdn_prefill` reports it. */
+enum ignis_gdn_prefill {
+  /* The vendored chunked kernels: what an RTX 50 or RTX PRO card runs. */
+  IGNIS_GDN_PREFILL_VENDORED = 0,
+  /* ignis's own kernels in full-rate forms: what an 8.x card runs. */
+  IGNIS_GDN_PREFILL_OURS = 1,
+};
+
 /* GitHub #414 (ADR 0075): where a vision load keeps the 27B's vision tower
  * and (GitHub #415) its media embedding pool. The binder places the tower and
  * the load checks it is where this says. */
@@ -584,6 +595,12 @@ int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, uint64_t coun
 /* Statistics of a loaded model. Returns 0 on success, -1 on a null
  * argument. */
 int32_t ignis_model_stats(const struct ignis_model *model, struct ignis_model_stats *out_stats);
+
+/* The gated delta net prefill route a loaded 27B runs (enum
+ * ignis_gdn_prefill; the review of spec #503): what the load decided, which
+ * also sized its scratch. IGNIS_GDN_PREFILL_VENDORED for NULL and for
+ * Flash-Next, whose GDN layers are its own. */
+uint32_t ignis_model_gdn_prefill(const struct ignis_model *model);
 
 /* Release a model handle. NULL is a no-op. */
 void ignis_model_free(struct ignis_model *model);

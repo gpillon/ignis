@@ -2336,6 +2336,13 @@ extern "C" int32_t ignis_model_stats(const struct ignis_model *model,
   return 0;
 }
 
+extern "C" uint32_t ignis_model_gdn_prefill(const struct ignis_model *model) {
+  if (model == nullptr || model->flash_next) {
+    return IGNIS_GDN_PREFILL_VENDORED;
+  }
+  return model->gdn_prefill_ours ? IGNIS_GDN_PREFILL_OURS : IGNIS_GDN_PREFILL_VENDORED;
+}
+
 extern "C" void ignis_model_free(struct ignis_model *model) {
   if (model != nullptr) {
     // P3-05 (GitHub #102, ADR 0019): destroy every captured decode graph

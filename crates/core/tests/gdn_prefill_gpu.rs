@@ -4,6 +4,7 @@
 //! base 16 GB artifact prefills one prompt in 512-token chunks, once on the
 //! vendored chunked kernels and once on ours:
 //!
+//! - the leaf reports the route each load took (`Model::gdn_prefill`);
 //! - every span logit of our route is finite;
 //! - the logits moved (the switch reached the 48 GDN layers);
 //! - the two greedy readings agree almost everywhere: both routes compute the
@@ -115,6 +116,8 @@ fn our_gdn_prefill_runs_the_48_layers_and_agrees_with_the_vendored_one() {
             1,
         )
         .unwrap_or_else(|e| panic!("{route}: model load: {e}"));
+        // The review of spec #503: the leaf reports the route the load took.
+        assert_eq!(model.gdn_prefill().as_str(), route, "the route the load reports");
         let pool = SeqPool::create(
             &ModelConfig::qwen38_27b(),
             &SeqPoolBudget {
