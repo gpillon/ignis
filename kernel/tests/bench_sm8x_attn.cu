@@ -1,4 +1,4 @@
-// PROTOTYPE (sm8x dense prefill, phase 2d; GitHub #474), throwaway: the 27B's prompt attention
+// PROTOTYPE (sm8x dense prefill, phases 2d and 2e; GitHub #474), throwaway: the 27B's prompt attention
 // over a whole causal prompt, chunk by chunk, for each band a card below compute capability 12.0
 // could run, against today's 8-bit band where the card has it. NOT a CTest test (a timing is a
 // finding, not a pass/fail; docs/agents/testing.md), though its check exits 1 when it fails.
@@ -10,6 +10,7 @@
 //
 //   ignis_sm8x_attn_bench [--prompts 8192,65536] [--chunk 4096] [--rounds 5] [--diag]
 //                         [--no-check] [--variants] [--peaks S8,F16F16,F16F32]
+//                         [--profile V START | --profile-cand NAME START]
 //
 // The prompt: every chunk of --chunk tokens attends its whole prefix and itself causally, the
 // residual window on as the engine serves it (the sinks, the ring of the 512 keys before the
@@ -26,6 +27,11 @@
 //          u8 x s8 MMA, exact in int32 per 32-key tile;
 //   i8     the same band on fa_i8_kernel (phase 2d's schedule); its output must equal i8ref's
 //          byte for byte.
+// Phase 2e drops the bit identity and adds candidates that change the numerics (the KLD gate
+// scores them, not this bench): the window in a full-rate form (W8: the band's own 8-bit kernel;
+// W16: the FP16 band's kernel), fa_i8f_kernel's fold group and lazy rescale, i8qk on v0's schedule
+// (i8qk2), and the key splits 2d measured best. Its check holds fa_i8f_kernel at F32 eager to
+// i8ref byte for byte and prints every candidate's distance from i8ref and from fp16.
 //
 // Sections: the setting, the kernels' resources, the MMA peaks, the check (i8 against i8ref, every
 // chunk of every prompt, every i8 variant, byte for byte in the output and in the carried state;
@@ -352,16 +358,23 @@ struct Marks {
 
 struct Run {
   Band band;
-  int variant = kI8Default;  // the i8 band's
-  int diag = 0;
-  int splits = 0;  // 0: the op's pick
+  Proto proto{};   // the window, the i8f levers, the i8 variant, the diagnostic
+  int splits = 0;  // 0: the op's pick; -1: phase 2e's rule (2 up to 16K keys, 3 above)
 };
+// The i8 band on 2d's variant `variant` (diagnostic `diag`), the window as served.
+Run i8run(Band band, int variant, int diag, int splits) {
+  Run r{band};
+  r.proto.i8_variant = variant;
+  r.proto.diag = diag;
+  r.splits = splits;
+  return r;
+}
 
 struct Bench {
   int width = 4096;
   int max_ctx = 65536;
   Cache cache;
-  DeviceBytes q, k, v, out, out_ref, q_band, q_scale, area, band_scale, carry_o, carry_m, carry_l;
+  DeviceBytes q, k, v, out, out_ref, out_fp16, q_band, q_scale, area, band_scale, carry_o, carry_m, carry_l;
   DeviceBytes carry_o_ref, carry_m_ref, carry_l_ref, counter, dist_max, dist_sums;
   Marks marks;
   cudaStream_t stream = nullptr;
@@ -401,6 +414,7 @@ struct Bench {
     v.alloc(kve * 2);
     out.alloc(qe * 2);
     out_ref.alloc(qe * 2);
+    out_fp16.alloc(qe * 2);
     // The workspace, as allocate lays it out, sized for the longest prompt's last chunk.
     const auto visible = static_cast<std::uint32_t>(ctx);
     const std::uint32_t band = band_capacity(visible, kIgnisHqPromptBandKeys, IgnisHqPromptPrecision::kFp8);
@@ -464,7 +478,7 @@ struct Bench {
     marks.n = 0;
     const PassHook hook{&Marks::mark, &marks};
     attend(q.as<__nv_bfloat16>(), keys(start), true, start, width, 1.0f / 16.0f, run.band, kIgnisHqPromptBandKeys,
-           run.splits, ws(), out.as<__nv_bfloat16>(), stream, timed ? &hook : nullptr, run.variant, run.diag);
+           run.splits, ws(), out.as<__nv_bfloat16>(), stream, timed ? &hook : nullptr, run.proto);
     BENCH_CUDA(cudaStreamSynchronize(stream));
     if (timed) {
       marks.collect(ms);
@@ -474,7 +488,8 @@ struct Bench {
   }
 
   int splits_of(int start, int splits_option) const {
-    return splits_option > 0 ? splits_option : pick_splits(width, static_cast<std::uint32_t>(start + width));
+    const auto visible = static_cast<std::uint32_t>(start + width);
+    return splits_option > 0 ? splits_option : splits_option < 0 ? rule_splits(visible) : pick_splits(width, visible);
   }
 
   unsigned long long differ(const DeviceBytes &a, const DeviceBytes &b, std::size_t bytes) {
@@ -488,13 +503,13 @@ struct Bench {
     return n;
   }
 
-  // max |out - out_ref| and the RMS of the difference over the RMS of out_ref.
-  void distance(double *maxd, double *rel, unsigned long long *bad) {
+  // max |out - ref| and the RMS of the difference over the RMS of ref (default out_ref).
+  void distance(double *maxd, double *rel, unsigned long long *bad, const DeviceBytes *ref = nullptr) {
     BENCH_CUDA(cudaMemsetAsync(dist_max.p, 0, 8, stream));
     BENCH_CUDA(cudaMemsetAsync(dist_sums.p, 0, 32, stream));
     BENCH_CUDA(cudaMemsetAsync(counter.p, 0, 8, stream));
     const std::size_t n = static_cast<std::size_t>(width) * kQHeads * kHeadDim;
-    bf16_distance<<<1024, 256, 0, stream>>>(out.as<__nv_bfloat16>(), out_ref.as<__nv_bfloat16>(), n,
+    bf16_distance<<<1024, 256, 0, stream>>>(out.as<__nv_bfloat16>(), (ref != nullptr ? ref : &out_ref)->as<__nv_bfloat16>(), n,
                                             dist_max.as<unsigned>(), dist_sums.as<double>(),
                                             counter.as<unsigned long long>());
     BENCH_CUDA(cudaGetLastError());
@@ -556,6 +571,8 @@ const char *band_name(Band b) {
     case Band::kFp16: return "fp16";
     case Band::kI8: return "i8";
     case Band::kI8Ref: return "i8ref";
+    case Band::kI8F: return "i8f";
+    case Band::kI8Qk2: return "i8qk2";
     default: return "i8qk";
   }
 }
@@ -627,6 +644,78 @@ template <int kDiag> void report_diag(const char *what) {
       kI8SmemBytes<v.stages, v.q_smem, v.pad>, v.one_head ? 128 : 256);
 }
 
+// ---- phase 2e: the candidates -------------------------------------------------------------------
+
+Run cand(Band band, Window w, int fold, bool lazy, bool kv, int splits, int variant = kI8Default, bool qsm = false) {
+  Run r{band};
+  r.proto.window = w;
+  r.proto.fold = fold;
+  r.proto.lazy = lazy;
+  r.proto.split_kv = kv;
+  r.proto.q_smem = qsm;
+  r.proto.i8_variant = variant;
+  r.splits = splits;
+  return r;
+}
+
+struct Series {
+  std::string name;
+  Run run;
+};
+
+// Each lever alone (the window as served, the op's splits), then the combinations under the
+// split rule (S). Names: F<keys> the fold group, L the lazy rescale, kv one K and one V^T buffer,
+// Qs Q in shared memory, W8 / W16 the window, S the splits 2d measured best (2 up to 16K keys, 3
+// above).
+std::vector<Series> candidates() {
+  const Window B = Window::kBf16, W8 = Window::kW8, W16 = Window::kW16;
+  const int v0 = kI8Default;
+  return {
+      {"i8qk", cand(Band::kI8Qk, B, 32, false, false, 0)},
+      {"i8qk2", cand(Band::kI8Qk2, B, 32, false, false, 0)},
+      {"F32 L", cand(Band::kI8F, B, 32, true, false, 0)},
+      {"F64 L", cand(Band::kI8F, B, 64, true, false, 0)},
+      {"F64 kv", cand(Band::kI8F, B, 64, false, true, 0)},
+      {"F64 L kv", cand(Band::kI8F, B, 64, true, true, 0)},
+      {"F64 kv Qs", cand(Band::kI8F, B, 64, false, true, 0, v0, true)},
+      {"F64 L kv Qs", cand(Band::kI8F, B, 64, true, true, 0, v0, true)},
+      {"F128 L kv", cand(Band::kI8F, B, 128, true, true, 0)},
+      {"F128 kv Qs", cand(Band::kI8F, B, 128, false, true, 0, v0, true)},
+      {"F128 L kv Qs", cand(Band::kI8F, B, 128, true, true, 0, v0, true)},
+      {"i8 W16", cand(Band::kI8, W16, 32, false, false, 0)},
+      {"i8 W8", cand(Band::kI8, W8, 32, false, false, 0)},
+      {"i8qk2 W16", cand(Band::kI8Qk2, W16, 32, false, false, 0)},
+      {"i8qk2 W8", cand(Band::kI8Qk2, W8, 32, false, false, 0)},
+      {"fp16 S", cand(Band::kFp16, B, 32, false, false, -1)},
+      {"i8 S", cand(Band::kI8, B, 32, false, false, -1)},
+      {"F128 L kv Qs S", cand(Band::kI8F, B, 128, true, true, -1, v0, true)},
+      {"i8 W8 S", cand(Band::kI8, W8, 32, false, false, -1)},
+      {"i8 v7 W8 S", cand(Band::kI8, W8, 32, false, false, -1, 7)},
+      {"F64 L kv W16 S", cand(Band::kI8F, W16, 64, true, true, -1)},
+      {"F128 L kv Qs W16 S", cand(Band::kI8F, W16, 128, true, true, -1, v0, true)},
+      {"F64 L kv W8 S", cand(Band::kI8F, W8, 64, true, true, -1)},
+      {"F64 L kv Qs W8 S", cand(Band::kI8F, W8, 64, true, true, -1, v0, true)},
+      {"F128 L kv W8 S", cand(Band::kI8F, W8, 128, true, true, -1)},
+      {"F128 L kv Qs W8 S", cand(Band::kI8F, W8, 128, true, true, -1, v0, true)},
+      {"i8qk2 W16 S", cand(Band::kI8Qk2, W16, 32, false, false, -1)},
+      {"i8qk2 W8 S", cand(Band::kI8Qk2, W8, 32, false, false, -1)},
+  };
+}
+
+const char *window_name(Window w) { return w == Window::kW8 ? "w8" : w == Window::kW16 ? "w16" : "bf16"; }
+
+template <int F, bool L, bool S, bool Q, int D = 0> void report_i8f(const char *what = nullptr) {
+  char name[96];
+  if (what == nullptr) {
+    std::snprintf(name, sizeof(name), "fa_i8f_kernel <F%d,%s,%s%s>", F, L ? "lazy" : "eager", S ? "kv" : "2 stages",
+                  Q ? ",Qs" : "");
+  } else {
+    std::snprintf(name, sizeof(name), "fa_i8f <F%d,%s,%s%s>, %s", F, L ? "lazy" : "eager", S ? "kv" : "2 stages",
+                  Q ? ",Qs" : "", what);
+  }
+  kernel_report(name, reinterpret_cast<const void *>(fa_i8f_kernel<F, L, S, Q, D>), kI8fSmemBytes<F, S, Q>);
+}
+
 }  // namespace bench
 
 int main(int argc, char **argv) {
@@ -635,6 +724,7 @@ int main(int argc, char **argv) {
   int chunk = 4096, rounds = 5;
   bool diag = false, check = true, variants = false;
   int profile = -100, profile_start = -1;  // --profile V START: one chunk of i8 variant V (-1: i8ref, -2: fp16, -3: fp8)
+  std::string profile_cand;                // --profile-cand NAME START: one chunk of a phase 2e candidate
   std::vector<double> nominal;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -648,6 +738,9 @@ int main(int argc, char **argv) {
     else if (a == "--peaks") nominal = parse_doubles(next());
     else if (a == "--profile") {
       profile = std::atoi(next().c_str());
+      profile_start = std::atoi(next().c_str());
+    } else if (a == "--profile-cand") {
+      profile_cand = next();
       profile_start = std::atoi(next().c_str());
     }
     else {
@@ -686,7 +779,7 @@ int main(int argc, char **argv) {
   std::size_t free_b = 0, total_b = 0;
   BENCH_CUDA(cudaMemGetInfo(&free_b, &total_b));
   const bool has_fp8 = major >= 12;
-  std::printf("sm8x prompt attention, phase 2d (prototype, GitHub #474)\n");
+  std::printf("sm8x prompt attention, phase 2e (prototype, GitHub #474)\n");
   std::printf("device: compute capability %d.%d, %d SMs, L2 %.1f MiB, %d B shared memory per block (opt-in), "
               "%.1f of %.1f GiB free, runtime %d.%d, driver %d.%d\n",
               major, minor, sms, l2 / 1048576.0, smem_optin, free_b / 1073741824.0, total_b / 1073741824.0,
@@ -695,63 +788,110 @@ int main(int argc, char **argv) {
               "sinks %d, ring %d\n",
               kQHeads, kKvHeads, kHeadDim, kLayers, chunk, kIgnisHqPromptBandKeys, kIgnisHqPromptBandKeys / 2, kSinks,
               kRing);
-  std::printf("bands: fp16%s, i8ref, i8 (variant %d: %s)\n\n", has_fp8 ? ", fp8" : " (fp8 needs compute capability 12.0)",
-              kI8Default, kI8Variants[kI8Default].name);
+  std::printf("bands: fp16%s, i8ref, i8 (2d's v%d: %s), and phase 2e's candidates (below)\n\n",
+              has_fp8 ? ", fp8" : " (fp8 needs compute capability 12.0)", kI8Default, kI8Variants[kI8Default].name);
 
   // ---- kernels ----
   std::printf("== kernels\n");
-  kernel_report("fa_kernel<bf16> (the window)", reinterpret_cast<const void *>(fa_kernel<false>), kFaSmemBytesP<false, kProtoOff>);
-  kernel_report("fa_kernel<fp16> (the FP16 band)", reinterpret_cast<const void *>(fa_kernel<false, true>),
+  kernel_report("fa_kernel<bf16> (the window as served)", reinterpret_cast<const void *>(fa_kernel<false>), kFaSmemBytesP<false, kProtoOff>);
+  kernel_report("fa_kernel<fp16> (the FP16 band; the W16 window)", reinterpret_cast<const void *>(fa_kernel<false, true>),
                 kFaSmemBytesP<false, kProtoOff>);
   kernel_report("fa_kernel<fp8> (the 8-bit band)", reinterpret_cast<const void *>(fa_kernel<true>), kFaSmemBytesP<true, kProtoOff>);
   kernel_report("fa_kernel<i8> (i8ref, 5ea54bc6)", reinterpret_cast<const void *>(fa_kernel<true, false, kProtoI8>),
                 kFaSmemBytesP<true, kProtoI8>);
+  kernel_report("fa_kernel<i8qk> (i8qk, 5ea54bc6)", reinterpret_cast<const void *>(fa_kernel<true, false, kProtoI8Qk>),
+                kFaSmemBytesP<true, kProtoI8Qk>);
   report_variant<0>();
-  report_variant<1>();
-  report_variant<2>();
-  report_variant<3>();
-  report_variant<4>();
-  report_variant<5>();
-  report_variant<6>();
-  report_variant<7>();
-  report_variant<8>();
-  report_variant<9>();
-  report_variant<10>();
-  report_variant<11>();
-  report_variant<12>();
-  report_variant<13>();
-  report_variant<14>();
-  report_variant<15>();
-  report_variant<16>();
-  report_variant<17>();
-  report_variant<18>();
-  report_variant<19>();
-  report_variant<20>();
-  report_variant<21>();
-  report_variant<22>();
-  report_variant<23>();
-  report_variant<24>();
-  report_variant<25>();
-  report_variant<26>();
-  report_variant<27>();
+  if (variants) {
+    report_variant<1>();
+    report_variant<2>();
+    report_variant<3>();
+    report_variant<4>();
+    report_variant<5>();
+    report_variant<6>();
+    report_variant<7>();
+    report_variant<8>();
+    report_variant<9>();
+    report_variant<10>();
+    report_variant<11>();
+    report_variant<12>();
+    report_variant<13>();
+    report_variant<14>();
+    report_variant<15>();
+    report_variant<16>();
+    report_variant<17>();
+    report_variant<18>();
+    report_variant<19>();
+    report_variant<20>();
+    report_variant<21>();
+    report_variant<22>();
+    report_variant<23>();
+    report_variant<24>();
+    report_variant<25>();
+    report_variant<26>();
+    report_variant<27>();
+  } else {
+    report_variant<7>();
+  }
   static_assert(kI8VariantCount == 28, "the kernel report names every variant");
-  report_diag<kDiagNoPv>("no P V");
-  report_diag<kDiagNoPv | kDiagNoSoftmax>("Q K^T only");
-  report_diag<kDiagNoQk>("no Q K^T");
-  report_diag<kDiagNoPv | kDiagNoSoftmax | kDiagNoQk>("loads only");
-  report_diag<kDiagNoExp>("no exp2");
-  report_diag<kDiagNoMaxSum>("no max, sum reductions");
-  report_diag<kDiagNoPack>("no P -> u8 conversion, packing");
-  report_diag<kDiagNoExp | kDiagNoMaxSum | kDiagNoPack>("none of the three");
-  report_diag<kDiagCheapFold>("the fold with 1 op an element");
-  kernel_report("tile_kernel<i8> (band tiles, i8 and i8ref)", reinterpret_cast<const void *>(tile_kernel<true, false, kProtoI8>), 0);
-  kernel_report("tile_kernel<fp16>", reinterpret_cast<const void *>(tile_kernel<false, true>), 0);
-  kernel_report("tile_kernel<bf16> (window tiles)", reinterpret_cast<const void *>(tile_kernel<false>), 0);
+  report_i8f<32, false, false, false>();
+  report_i8f<32, true, false, false>();
+  report_i8f<32, true, false, true>();
+  report_i8f<64, true, false, false>();
+  report_i8f<64, true, false, true>();
+  report_i8f<64, false, true, false>();
+  report_i8f<64, true, true, false>();
+  report_i8f<64, false, true, true>();
+  report_i8f<64, true, true, true>();
+  report_i8f<128, true, true, false>();
+  report_i8f<128, false, true, true>();
+  report_i8f<128, true, true, true>();
+  kernel_report("fa_i8qk2_kernel (i8qk on v0's schedule)", reinterpret_cast<const void *>(fa_i8qk2_kernel<0>),
+                2 * kI8qkStageBytes);
+  if (diag) {
+    report_diag<kDiagNoPv>("no P V");
+    report_diag<kDiagNoPv | kDiagNoSoftmax>("Q K^T only");
+    report_diag<kDiagNoQk>("no Q K^T");
+    report_diag<kDiagNoPv | kDiagNoSoftmax | kDiagNoQk>("loads only");
+    report_diag<kDiagNoExp>("no exp2");
+    report_diag<kDiagNoMaxSum>("no max, sum reductions");
+    report_diag<kDiagNoPack>("no P -> u8 conversion, packing");
+    report_diag<kDiagNoExp | kDiagNoMaxSum | kDiagNoPack>("none of the three");
+    report_diag<kDiagCheapFold>("the fold with 1 op an element");
+    report_i8f<I8fDiagOf::kF, I8fDiagOf::kLazy, I8fDiagOf::kSplitKV, I8fDiagOf::kQs, kDiagNoPv>("no P V");
+    report_i8f<I8fDiagOf::kF, I8fDiagOf::kLazy, I8fDiagOf::kSplitKV, I8fDiagOf::kQs, kDiagNoPv | kDiagNoSoftmax>("Q K^T only");
+    report_i8f<I8fDiagOf::kF, I8fDiagOf::kLazy, I8fDiagOf::kSplitKV, I8fDiagOf::kQs, kDiagNoQk>("no Q K^T");
+    report_i8f<I8fDiagOf::kF, I8fDiagOf::kLazy, I8fDiagOf::kSplitKV, I8fDiagOf::kQs, kDiagNoPv | kDiagNoSoftmax | kDiagNoQk>("loads only");
+  }
+  kernel_report("tile_kernel<i8> (i8 K and V^T a tile)", reinterpret_cast<const void *>(tile_kernel<true, false, kProtoI8>), 0);
+  kernel_report("tile_vgroup_kernel<64> (V^T a 64-key group)", reinterpret_cast<const void *>(tile_vgroup_kernel<64>),
+                64 * kHeadDim * 2);
+  kernel_report("tile_vgroup_kernel<128> (V^T a 128-key group)", reinterpret_cast<const void *>(tile_vgroup_kernel<128>),
+                128 * kHeadDim * 2);
+  kernel_report("tile_kernel<i8qk> (INT8 K, FP16 V rows)", reinterpret_cast<const void *>(tile_kernel<true, false, kProtoI8Qk>), 0);
+  kernel_report("tile_kernel<fp16> (FP16 band, W16 window)", reinterpret_cast<const void *>(tile_kernel<false, true>), 0);
+  kernel_report("tile_kernel<bf16> (window tiles as served)", reinterpret_cast<const void *>(tile_kernel<false>), 0);
   std::printf("\n");
 
-  std::printf("== i8 variants (fa_i8_kernel; each must equal i8ref byte for byte; the op runs v%d)\n", kI8Default);
-  for (int v = 0; v < kI8VariantCount; ++v) std::printf("  v%-2d %s\n", v, kI8Variants[v].name);
+  const std::vector<Series> cands = candidates();
+  std::printf("== phase 2e candidates (band, window, fold group, lazy rescale, buffers, splits)\n");
+  std::printf("  i8qk   5ea54bc6's INT8 Q K^T + FP16 P V; i8qk2 the same math on v0's schedule and conversions\n");
+  std::printf("  F<n>   fa_i8f_kernel: one V^T scale and one fold per n keys; L the lazy rescale (threshold 2^%g);\n"
+              "         kv one K and one V^T buffer instead of two stages; F32 eager is v0 byte for byte\n", kLazyLog2);
+  std::printf("  W8     the window on the band's own 8-bit kernel; W16 the window on the FP16 band's kernel\n");
+  std::printf("  S      key splits 2 up to 16K visible keys, 3 above; otherwise the op's pick\n");
+  for (const Series &c : cands) {
+    std::printf("  %-18s band %-6s window %-4s fold %3d %-5s %-8s %-8s splits %s\n", c.name.c_str(), band_name(c.run.band),
+                window_name(c.run.proto.window), c.run.proto.fold, c.run.proto.lazy ? "lazy" : "eager",
+                c.run.proto.split_kv ? "kv" : "2 stages", c.run.proto.q_smem ? "Q smem" : "Q regs",
+                c.run.splits == 0 ? "auto" : c.run.splits < 0 ? "rule" : std::to_string(c.run.splits).c_str());
+  }
   std::printf("\n");
+  if (variants) {
+    std::printf("== i8 variants (fa_i8_kernel; each must equal i8ref byte for byte; the op runs v%d)\n", kI8Default);
+    for (int v = 0; v < kI8VariantCount; ++v) std::printf("  v%-2d %s\n", v, kI8Variants[v].name);
+    std::printf("\n");
+  }
 
   // ---- peaks ----
   std::printf("== peaks (register-only MMA loops, %d CTAs of 8 warps)\n", 4 * sms);
@@ -765,8 +905,6 @@ int main(int argc, char **argv) {
     if (f == kPkE4m3 && !has_fp8) continue;
     std::printf("  %-36s %8.1f TOPS at %.0f MHz\n", kPeakName[f], rates[f].tops, rates[f].mhz);
   }
-  // The rates the efficiencies use: measured, or the --peaks the caller names (s8, f16 with f16
-  // accumulate, f16 / bf16 with f32 accumulate; the block-scaled E4M3 stays measured).
   double pk_s8 = rates[kPkS8].tops, pk_f16 = rates[kPkF16F16].tops, pk_f32 = rates[kPkBf16F32].tops;
   const double pk_e4m3 = has_fp8 ? rates[kPkE4m3].tops : 0.0;
   if (nominal.size() == 3) {
@@ -781,16 +919,34 @@ int main(int argc, char **argv) {
   std::printf("\n");
 
   Bench b;
-  if (profile > -100) {
+  if (profile > -100 || !profile_cand.empty()) {
     // For a profiler: one chunk at START, twice (the first warms), nothing else.
     b.init(std::max(max_ctx, profile_start + chunk), chunk);
-    const Band bd = profile >= 0 ? Band::kI8 : profile == -1 ? Band::kI8Ref : profile == -2 ? Band::kFp16 : Band::kFp8;
+    Run run = i8run(Band::kI8, std::max(profile, 0), 0, 0);
+    std::string name = "i8 v" + std::to_string(std::max(profile, 0));
+    if (!profile_cand.empty()) {
+      bool found = false;
+      for (const Series &c : cands) {
+        if (c.name == profile_cand) {
+          run = c.run;
+          name = c.name;
+          found = true;
+        }
+      }
+      if (!found) {
+        std::fprintf(stderr, "no candidate named %s\n", profile_cand.c_str());
+        return 2;
+      }
+    } else if (profile < 0) {
+      run.band = profile == -1 ? Band::kI8Ref : profile == -2 ? Band::kFp16 : Band::kFp8;
+      name = band_name(run.band);
+    }
     double ms[kCats];
     for (int i = 0; i < 2; ++i) {
       b.stage_chunk(profile_start);
-      b.attend_chunk(profile_start, Run{bd, std::max(profile, 0), 0, 0}, ms, true);
+      b.attend_chunk(profile_start, run, ms, true);
     }
-    std::printf("profile: %s v%d at start %d: band FA %.3f ms, window FA %.3f ms\n", band_name(bd), profile, profile_start,
+    std::printf("profile: %s at start %d: band FA %.3f ms, window FA %.3f ms\n", name.c_str(), profile_start,
                 ms[kCatBandFa], ms[kCatWindowFa]);
     return 0;
   }
@@ -805,7 +961,9 @@ int main(int argc, char **argv) {
 
   // ---- check ----
   if (check) {
-    std::printf("== check: i8 against i8ref, byte for byte (the output and the state carried between passes)\n");
+    std::printf("== check: byte for byte against i8ref (the output and the state carried between passes): fa_i8f_kernel at\n"
+                "   F32 eager (v0's math on phase 2e's kernel)%s; then every candidate's distance from i8ref and from fp16\n",
+                variants ? " and 2d's 28 variants" : "");
     struct Case {
       int prompt, splits;
     };
@@ -813,65 +971,92 @@ int main(int argc, char **argv) {
     for (int p : prompts) cases.push_back({p, 0});
     cases.push_back({prompts.front(), 1});
     cases.push_back({prompts.front(), 3});
+    std::vector<Series> exact = {{"i8f F32 eager", cand(Band::kI8F, Window::kBf16, 32, false, false, 0)}};
+    if (variants) {
+      for (int var = 0; var < kI8VariantCount; ++var) exact.push_back({"i8 v" + std::to_string(var), i8run(Band::kI8, var, 0, 0)});
+    }
     for (const Case &cs : cases) {
       const int chunks = cs.prompt / chunk;
-      std::vector<unsigned long long> diff_out(kI8VariantCount, 0), diff_carry(kI8VariantCount, 0);
-      double worst_rel[2] = {0, 0}, worst_max[2] = {0, 0};
+      std::vector<unsigned long long> diff_out(exact.size(), 0), diff_carry(exact.size(), 0);
+      std::vector<double> dmax(cands.size() + 1, 0), drel(cands.size() + 1, 0), dmax16(cands.size() + 1, 0),
+          drel16(cands.size() + 1, 0);
       unsigned long long nonfinite = 0;
+      double fp8_max = 0, fp8_rel = 0;
       for (int c = 0; c < chunks; ++c) {
         const int start = c * chunk;
         const int splits = b.splits_of(start, cs.splits);
-        b.stage_chunk(start);
-        b.clear_state();
-        b.attend_chunk(start, Run{Band::kI8Ref, kI8Default, 0, cs.splits}, dummy, false);
-        b.keep_reference(splits);
         const std::size_t qe = static_cast<std::size_t>(chunk) * kQHeads * kHeadDim;
         const std::size_t rows = static_cast<std::size_t>(kQHeads) * chunk * splits;
-        for (int var = 0; var < kI8VariantCount; ++var) {
+        b.stage_chunk(start);
+        b.clear_state();
+        b.attend_chunk(start, i8run(Band::kI8Ref, kI8Default, 0, cs.splits), dummy, false);
+        b.keep_reference(splits);
+        for (std::size_t i = 0; i < exact.size(); ++i) {
+          Run run = exact[i].run;
+          run.splits = cs.splits;
           b.clear_state();
-          b.attend_chunk(start, Run{Band::kI8, var, 0, cs.splits}, dummy, false);
-          diff_out[var] += b.differ(b.out, b.out_ref, qe * 2);
-          diff_carry[var] += b.differ(b.carry_o, b.carry_o_ref, rows * kHeadDim * 2) +
-                             b.differ(b.carry_m, b.carry_m_ref, rows * 4) + b.differ(b.carry_l, b.carry_l_ref, rows * 4);
+          b.attend_chunk(start, run, dummy, false);
+          diff_out[i] += b.differ(b.out, b.out_ref, qe * 2);
+          diff_carry[i] += b.differ(b.carry_o, b.carry_o_ref, rows * kHeadDim * 2) +
+                           b.differ(b.carry_m, b.carry_m_ref, rows * 4) + b.differ(b.carry_l, b.carry_l_ref, rows * 4);
         }
-        // The other bands' distance from i8ref (a broken setup would show here), and i8ref's own
-        // finiteness.
-        if (cs.splits == 0) {
-          int idx = 0;
-          for (Band other : {Band::kFp16, Band::kFp8}) {
-            if (other == Band::kFp8 && !has_fp8) continue;
-            b.clear_state();
-            b.attend_chunk(start, Run{other, kI8Default, 0, 0}, dummy, false);
-            double mx = 0, rel = 0;
-            unsigned long long bad = 0;
-            b.distance(&mx, &rel, &bad);
-            worst_max[idx] = std::max(worst_max[idx], mx);
-            worst_rel[idx] = std::max(worst_rel[idx], rel);
-            nonfinite += bad;
-            ++idx;
-          }
-          BENCH_CUDA(cudaMemcpyAsync(b.out.p, b.out_ref.p, qe * 2, cudaMemcpyDeviceToDevice, b.stream));
+        if (cs.splits != 0) continue;
+        // fp16 (V0) first, kept as the second reference; then every candidate, and fp8 where it runs.
+        auto measure = [&](const Run &run, std::size_t slot) {
+          b.clear_state();
+          b.attend_chunk(start, run, dummy, false);
+          double mx = 0, rel = 0, mx16 = 0, rel16 = 0;
+          unsigned long long bad = 0, bad16 = 0;
+          b.distance(&mx, &rel, &bad);
+          b.distance(&mx16, &rel16, &bad16, &b.out_fp16);
+          dmax[slot] = std::max(dmax[slot], mx);
+          drel[slot] = std::max(drel[slot], rel);
+          dmax16[slot] = std::max(dmax16[slot], mx16);
+          drel16[slot] = std::max(drel16[slot], rel16);
+          nonfinite += bad;
+        };
+        b.clear_state();
+        b.attend_chunk(start, i8run(Band::kFp16, kI8Default, 0, 0), dummy, false);
+        BENCH_CUDA(cudaMemcpyAsync(b.out_fp16.p, b.out.p, qe * 2, cudaMemcpyDeviceToDevice, b.stream));
+        measure(i8run(Band::kFp16, kI8Default, 0, 0), cands.size());
+        for (std::size_t i = 0; i < cands.size(); ++i) measure(cands[i].run, i);
+        if (has_fp8) {
+          b.clear_state();
+          b.attend_chunk(start, i8run(Band::kFp8, kI8Default, 0, 0), dummy, false);
           double mx = 0, rel = 0;
           unsigned long long bad = 0;
           b.distance(&mx, &rel, &bad);
+          fp8_max = std::max(fp8_max, mx);
+          fp8_rel = std::max(fp8_rel, rel);
           nonfinite += bad;
         }
+        BENCH_CUDA(cudaMemcpyAsync(b.out.p, b.out_ref.p, qe * 2, cudaMemcpyDeviceToDevice, b.stream));
+        double mx = 0, rel = 0;
+        unsigned long long bad = 0;
+        b.distance(&mx, &rel, &bad);
+        nonfinite += bad;
       }
-      for (int var = 0; var < kI8VariantCount; ++var) {
-        const bool ok = diff_out[var] == 0 && diff_carry[var] == 0;
+      for (std::size_t i = 0; i < exact.size(); ++i) {
+        const bool ok = diff_out[i] == 0 && diff_carry[i] == 0;
         failures += ok ? 0 : 1;
-        std::printf("check [%s] prompt %6d, splits %s, %2d chunks, i8 v%d: %llu output words and %llu state words differ "
+        std::printf("check [%s] prompt %6d, splits %s, %2d chunks, %s: %llu output words and %llu state words differ "
                     "from i8ref\n",
                     ok ? "PASS" : "FAIL", cs.prompt, cs.splits == 0 ? "auto" : std::to_string(cs.splits).c_str(), chunks,
-                    var, diff_out[var], diff_carry[var]);
+                    exact[i].name.c_str(), diff_out[i], diff_carry[i]);
       }
       if (cs.splits == 0) {
-        std::printf("  sanity, prompt %d: fp16 against i8ref: max |d| %.4f, RMS(d)/RMS %.4f", cs.prompt, worst_max[0],
-                    worst_rel[0]);
-        if (has_fp8) std::printf("; fp8 against i8ref: max |d| %.4f, RMS(d)/RMS %.4f", worst_max[1], worst_rel[1]);
-        std::printf("; non-finite outputs %llu\n", nonfinite);
-        if (nonfinite != 0 || worst_rel[0] > 0.2 || worst_rel[0] == 0.0) {
-          std::printf("check [FAIL] the bands disagree too much, or not at all: the setup is broken\n");
+        std::printf("  distance, prompt %d (worst chunk; RMS(d)/RMS of the reference):\n", cs.prompt);
+        std::printf("    %-16s vs i8ref max |d| %.4f, rel %.4f\n", "fp16", dmax[cands.size()], drel[cands.size()]);
+        if (has_fp8) std::printf("    %-16s vs i8ref max |d| %.4f, rel %.4f\n", "fp8", fp8_max, fp8_rel);
+        bool far = false;
+        for (std::size_t i = 0; i < cands.size(); ++i) {
+          std::printf("    %-16s vs i8ref max |d| %.4f, rel %.4f; vs fp16 max |d| %.4f, rel %.4f\n", cands[i].name.c_str(),
+                      dmax[i], drel[i], dmax16[i], drel16[i]);
+          far = far || drel[i] > 0.2 || drel[i] == 0.0;
+        }
+        std::printf("    non-finite outputs %llu\n", nonfinite);
+        if (nonfinite != 0 || drel[cands.size()] > 0.2 || drel[cands.size()] == 0.0 || far) {
+          std::printf("check [FAIL] a band or candidate is non-finite, too far from i8ref (> 0.2), or equal to it: broken\n");
           ++failures;
         }
       }
@@ -880,40 +1065,60 @@ int main(int argc, char **argv) {
   }
 
   // ---- speed: alternated rounds, the median per chunk and pass ----
-  struct Series {
-    std::string name;
-    Run run;
-  };
   std::vector<Series> series;
-  for (Band bd : bands) series.push_back({band_name(bd), Run{bd, kI8Default, 0, 0}});
+  for (Band bd : bands) series.push_back({band_name(bd), i8run(bd, kI8Default, 0, 0)});
+  const std::size_t n_bands = series.size();
+  for (const Series &c : cands) series.push_back(c);
+  const std::size_t n_main = series.size();
   if (variants) {
     for (int var = 0; var < kI8VariantCount; ++var) {
       if (var == kI8Default) continue;
-      series.push_back({"i8 v" + std::to_string(var), Run{Band::kI8, var, 0, 0}});
+      series.push_back({"i8 v" + std::to_string(var), i8run(Band::kI8, var, 0, 0)});
     }
   }
   if (diag) {
-    series.push_back({"i8 no P V", Run{Band::kI8, kI8Default, kDiagNoPv, 0}});
-    series.push_back({"i8 Q K^T only", Run{Band::kI8, kI8Default, kDiagNoPv | kDiagNoSoftmax, 0}});
-    series.push_back({"i8 no Q K^T", Run{Band::kI8, kI8Default, kDiagNoQk, 0}});
-    series.push_back({"i8 loads only", Run{Band::kI8, kI8Default, kDiagNoPv | kDiagNoSoftmax | kDiagNoQk, 0}});
-    series.push_back({"i8 no exp2", Run{Band::kI8, kI8Default, kDiagNoExp, 0}});
-    series.push_back({"i8 no max, sum", Run{Band::kI8, kI8Default, kDiagNoMaxSum, 0}});
-    series.push_back({"i8 no P->u8, pack", Run{Band::kI8, kI8Default, kDiagNoPack, 0}});
-    series.push_back({"i8 no exp/max/pack", Run{Band::kI8, kI8Default, kDiagNoExp | kDiagNoMaxSum | kDiagNoPack, 0}});
-    series.push_back({"i8 fold 1 op", Run{Band::kI8, kI8Default, kDiagCheapFold, 0}});
-    for (int s = 1; s <= kIgnisHqPromptMaxSplits; ++s) {
-      series.push_back({"i8 splits " + std::to_string(s), Run{Band::kI8, kI8Default, 0, s}});
-      series.push_back({"fp16 splits " + std::to_string(s), Run{Band::kFp16, kI8Default, 0, s}});
+    series.push_back({"i8 no P V", i8run(Band::kI8, kI8Default, kDiagNoPv, 0)});
+    series.push_back({"i8 Q K^T only", i8run(Band::kI8, kI8Default, kDiagNoPv | kDiagNoSoftmax, 0)});
+    series.push_back({"i8 no Q K^T", i8run(Band::kI8, kI8Default, kDiagNoQk, 0)});
+    series.push_back({"i8 loads only", i8run(Band::kI8, kI8Default, kDiagNoPv | kDiagNoSoftmax | kDiagNoQk, 0)});
+    series.push_back({"i8 fold 1 op", i8run(Band::kI8, kI8Default, kDiagCheapFold, 0)});
+    char nm[64];
+    std::snprintf(nm, sizeof(nm), "F%d%s%s%s", I8fDiagOf::kF, I8fDiagOf::kLazy ? " L" : "", I8fDiagOf::kSplitKV ? " kv" : "",
+                  I8fDiagOf::kQs ? " Qs" : "");
+    const std::string base = nm;
+    auto i8fd = [&](int d) {
+      Run r = cand(Band::kI8F, Window::kBf16, I8fDiagOf::kF, I8fDiagOf::kLazy, I8fDiagOf::kSplitKV, 0, kI8Default,
+                   I8fDiagOf::kQs);
+      r.proto.diag = d;
+      return r;
+    };
+    series.push_back({base + " no P V", i8fd(kDiagNoPv)});
+    series.push_back({base + " QK only", i8fd(kDiagNoPv | kDiagNoSoftmax)});
+    series.push_back({base + " no Q K^T", i8fd(kDiagNoQk)});
+    series.push_back({base + " loads only", i8fd(kDiagNoPv | kDiagNoSoftmax | kDiagNoQk)});
+    // Every key split, for today's bands and the combinations.
+    const std::vector<Series> sweep = {
+        {"fp16", i8run(Band::kFp16, kI8Default, 0, 0)},
+        {"i8 W8", cand(Band::kI8, Window::kW8, 32, false, false, 0)},
+        {"F64 L kv W8", cand(Band::kI8F, Window::kW8, 64, true, true, 0)},
+        {"F128 L kv Qs W8", cand(Band::kI8F, Window::kW8, 128, true, true, 0, kI8Default, true)},
+        {"i8qk2 W8", cand(Band::kI8Qk2, Window::kW8, 32, false, false, 0)},
+        {"F128 L kv Qs W16", cand(Band::kI8F, Window::kW16, 128, true, true, 0, kI8Default, true)},
+    };
+    for (const Series &sw : sweep) {
+      for (int s = 1; s <= kIgnisHqPromptMaxSplits; ++s) {
+        Series x = sw;
+        x.name += " s" + std::to_string(s);
+        x.run.splits = s;
+        series.push_back(x);
+      }
     }
   }
 
   for (int p : prompts) {
     const int chunks = p / chunk;
-    // ms[series][chunk][cat], per round
     std::vector<std::vector<std::vector<std::vector<double>>>> t(
         series.size(), std::vector<std::vector<std::vector<double>>>(chunks, std::vector<std::vector<double>>(kCats)));
-    // One untimed prompt per series first (the attributes, the caches, the clocks).
     for (std::size_t si = 0; si < series.size(); ++si) {
       for (int c = 0; c < chunks; ++c) {
         b.stage_chunk(c * chunk);
@@ -922,7 +1127,6 @@ int main(int argc, char **argv) {
     }
     for (int r = 0; r < rounds; ++r) {
       for (std::size_t k = 0; k < series.size(); ++k) {
-        // Alternate the order round by round, so a drift of the clocks lands on no one series.
         const std::size_t si = (r % 2 == 0) ? k : series.size() - 1 - k;
         for (int c = 0; c < chunks; ++c) {
           double ms[kCats];
@@ -932,7 +1136,6 @@ int main(int argc, char **argv) {
         }
       }
     }
-    // Medians.
     std::vector<std::vector<std::vector<double>>> med(series.size(), std::vector<std::vector<double>>(chunks, std::vector<double>(kCats)));
     for (std::size_t si = 0; si < series.size(); ++si)
       for (int c = 0; c < chunks; ++c)
@@ -944,60 +1147,66 @@ int main(int argc, char **argv) {
       total_pairs.window += pc.window;
       total_pairs.band += pc.band;
     }
-    const double ops_all = 4.0 * macs(total_pairs.total());  // Q K^T and P V, 2 ops a multiply-add
+    const double ops_all = 4.0 * macs(total_pairs.total());
     const double ops_win = 4.0 * macs(total_pairs.window), ops_band = 4.0 * macs(total_pairs.band);
-    auto floor_s = [&](Band bd) {  // the whole prompt's MMA time at the band's own rate, one layer
+    // A pass's MMA time at a band's rates: half the ops are Q K^T, half P V.
+    auto at_rate = [&](Band bd, double ops) {
       switch (bd) {
-        case Band::kFp16: return ops_all / (pk_f16 * 1e12);
-        case Band::kFp8: return 0.5 * ops_all / (pk_s8 * 1e12) + 0.5 * ops_all / (pk_e4m3 * 1e12);
-        default: return ops_all / (pk_s8 * 1e12);
+        case Band::kFp16: return ops / (pk_f16 * 1e12);
+        case Band::kFp8: return 0.5 * ops / (pk_s8 * 1e12) + 0.5 * ops / (pk_e4m3 * 1e12);
+        case Band::kI8Qk:
+        case Band::kI8Qk2: return 0.5 * ops / (pk_s8 * 1e12) + 0.5 * ops / (pk_f16 * 1e12);
+        default: return ops / (pk_s8 * 1e12);
       }
     };
-    auto band_floor_s = [&](Band bd) {  // the band pass alone at the band's rate
-      switch (bd) {
-        case Band::kFp16: return ops_band / (pk_f16 * 1e12);
-        case Band::kFp8: return 0.5 * ops_band / (pk_s8 * 1e12) + 0.5 * ops_band / (pk_e4m3 * 1e12);
-        default: return ops_band / (pk_s8 * 1e12);
+    auto win_floor = [&](const Run &run) {
+      switch (run.proto.window) {
+        case Window::kW8: return at_rate(run.band, ops_win);
+        case Window::kW16: return ops_win / (pk_f16 * 1e12);
+        default: return ops_win / (pk_f32 * 1e12);
       }
     };
 
     std::printf("== prompt %d: %d chunks of %d, %.3g pairs a head (window %.3g, band %.3g); per layer %.3g TOPs, "
                 "times %d layers\n",
                 p, chunks, chunk, total_pairs.total(), total_pairs.window, total_pairs.band, ops_all / 1e12, kLayers);
-    // Per chunk, the bands (not the diag series).
     std::printf("per chunk, one layer, ms (median of %d rounds):", rounds);
     for (int x = 0; x < kCats; ++x) std::printf("%s %s", x == 0 ? "" : " +", kCatName[x]);
     std::printf(" = total\n");
-    for (std::size_t si = 0; si < bands.size(); ++si) {
+    for (std::size_t si = 0; si < n_main; ++si) {
       for (int c = 0; c < chunks; ++c) {
         const auto &m = med[si][c];
         double tot = 0;
         for (double x : m) tot += x;
-        std::printf("  %-6s chunk %2d (start %6d): %7.3f %7.3f %8.3f %7.3f %8.3f %7.3f = %8.3f\n", series[si].name.c_str(), c,
+        std::printf("  %-16s chunk %2d (start %6d): %7.3f %7.3f %8.3f %7.3f %8.3f %7.3f = %8.3f\n", series[si].name.c_str(), c,
                     c * chunk, m[kCatPrep], m[kCatWindowTiles], m[kCatWindowFa], m[kCatBandTiles], m[kCatBandFa],
                     m[kCatMerge], tot);
       }
     }
     std::printf("per prompt, %d layers, s:\n", kLayers);
-    std::printf("  %-18s %8s %8s %8s %8s %8s %8s | %9s | %8s %6s | %8s %6s | %6s\n", "series", "prep", "w.tiles", "w.FA",
-                "b.tiles", "b.FA", "merge", "total", "floor", "eff", "b.floor", "b.eff", "w.eff");
-    const double win_floor = ops_win / (pk_f32 * 1e12);
+    std::printf("  %-18s %8s %8s %8s %8s %8s %8s | %9s %6s | %8s %6s | %8s %6s | %6s\n", "series", "prep", "w.tiles", "w.FA",
+                "b.tiles", "b.FA", "merge", "total", "xfp16", "floor", "eff", "b.floor", "b.eff", "w.eff");
+    double fp16_total = 0;
     for (std::size_t si = 0; si < series.size(); ++si) {
       double cat[kCats] = {};
       for (int c = 0; c < chunks; ++c)
         for (int x = 0; x < kCats; ++x) cat[x] += med[si][c][x] * 1e-3 * kLayers;
       double tot = 0;
       for (double x : cat) tot += x;
-      const Band bd = series[si].run.band;
-      const double fl = floor_s(bd) * kLayers, bfl = band_floor_s(bd) * kLayers;
-      std::printf("  %-18s %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f | %9.4f | %8.4f %5.1f%% | %8.4f %5.1f%% | %5.1f%%\n",
+      if (si == 0) fp16_total = tot;
+      const Run &run = series[si].run;
+      const double fl = at_rate(run.band, ops_all) * kLayers, bfl = at_rate(run.band, ops_band) * kLayers;
+      const double wfl = win_floor(run) * kLayers;
+      std::printf("  %-18s %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f | %9.4f %5.2fx | %8.4f %5.1f%% | %8.4f %5.1f%% | %5.1f%%\n",
                   series[si].name.c_str(), cat[kCatPrep], cat[kCatWindowTiles], cat[kCatWindowFa], cat[kCatBandTiles],
-                  cat[kCatBandFa], cat[kCatMerge], tot, fl, 100.0 * fl / tot, bfl, 100.0 * bfl / cat[kCatBandFa],
-                  100.0 * win_floor * kLayers / cat[kCatWindowFa]);
+                  cat[kCatBandFa], cat[kCatMerge], tot, fp16_total / tot, fl, 100.0 * fl / tot, bfl,
+                  100.0 * bfl / cat[kCatBandFa], 100.0 * wfl / cat[kCatWindowFa]);
+      if (si + 1 == n_bands || si + 1 == n_main) std::printf("  --\n");
     }
-    std::printf("  floor: the whole prompt's Q K^T and P V at the band's MMA rate (fp16: f16-f16; fp8: s8 and e4m3; "
-                "i8: s8); eff = floor / total.\n  b.floor, b.eff: the band pass's own pairs against its band FA time; "
-                "w.eff: the window's pairs at f16-f32 against its window FA time.\n\n");
+    std::printf("  xfp16: the fp16 band's total over this total. floor: the whole prompt's Q K^T and P V at the band's MMA\n"
+                "  rates (fp16: f16-f16; fp8: s8 and e4m3; i8, i8f: s8; i8qk, i8qk2: s8 Q K^T and f16-f16 P V); eff = floor /\n"
+                "  total. b.floor, b.eff: the band pass's own pairs at those rates against its band FA time. w.eff: the window's\n"
+                "  pairs at the window's rates (as served: bf16-f32; W16: f16-f16; W8: the band's) against its window FA time.\n\n");
   }
   std::printf("bench: %s\n", failures == 0 ? "done" : "check(s) FAILED");
   return failures == 0 ? 0 : 1;

@@ -1902,6 +1902,802 @@ void launch_fa_i8_pair(dim3 grid, Queries qs, int start, int width, float scale,
   check_launch("band attention");
 }
 
+// ---- PROTOTYPE (sm8x dense prefill, phase 2e): the i8 band without 2d's bit identity ------------
+//
+// Phase 2e drops the rule that the i8 band match 5ea54bc6 byte for byte; the KLD gate scores each
+// change instead. fa_i8f_kernel is fa_i8_kernel v0 (its conversions, two stages, two barriers) with
+// three levers:
+//   - kF, the fold group (32, 64 or 128 keys): V^T has one amax / 127 scale per group
+//     (tile_vgroup_kernel), the softmax takes each row's max over the whole group before P is
+//     quantized, so the group's kF / 32 u8 x s8 MMAs of a dim tile accumulate in one int32
+//     accumulator and O is folded once a group instead of once a 32-key tile. The sum stays exact
+//     from 1.5 2^23: |sum| <= kF 255 127 = 4,145,280 < 2^22 at kF = 128. K keeps its scale per
+//     32-key tile (it folds into the score scale for free). kF = 32 is v0 byte for byte (the bench
+//     checks it).
+//   - kLazy: O and l carry a reference m_ref that moves only when a row's running max m passes it
+//     by more than kLazyLog2 = 8 (log2 units: a factor 256). P is still rn(255 2^(s - m)) against
+//     the running max, so its bytes are the eager path's; the group's P V and P sum enter O and l
+//     times 2^(m - m_ref), in [1, 256], a per-row factor folded into the V scale. The fold is one
+//     FADD (the magic) and one FFMA an element instead of three ops, and O is rescaled only on a
+//     group whose max passes the threshold (warp-uniform). Exactness: every term of O and of l
+//     carries the same factor 2^(-m_ref), so O / l -- what the carry stores and the merge reads --
+//     does not depend on the reference, and the lazy path differs from the eager one by fp32
+//     rounding only; 2^8 of headroom cannot overflow fp32 (l <= 2^16 keys x 256 x 2^8 = 2^32). The
+//     carried l is brought back to the running max before it is stored, so the state means what
+//     it meant.
+//   - kSplitKV: one buffer for the group's K rows and one for its V^T, refilled at opposite points
+//     of the group (V^T during Q K^T and the softmax, the next K during P V), two barriers a group:
+//     half the shared memory of two stages, which kF = 128 needs (64 KiB a group, against about
+//     100 KiB a CTA).
+//   - kQs: the CTA's Q (two heads of 64 rows, 32 KiB) in shared memory, one ldmatrix a k step
+//     shared by the group's kF / 32 tiles, instead of 32 registers a thread: the register file is
+//     what every lever here runs into (O holds 128 of them).
+// kDiag (the bench's --diag) as fa_i8_kernel's: kDiagNoPv, kDiagNoSoftmax, kDiagNoQk.
+constexpr float kLazyLog2 = 8.0f;
+template <int kF>
+constexpr int kI8fGroupBytes = kF * kHeadDim * 2;  // a group's K rows and V^T, 8 bits each
+constexpr int kI8fQBytes = kHeadsPerCta * kQ * kHeadDim;  // kQs: the CTA's Q, 32 KiB
+template <int kF, bool kSplitKV, bool kQs = false>
+constexpr int kI8fSmemBytes = (kSplitKV ? kI8fGroupBytes<kF> : 2 * kI8fGroupBytes<kF>) + (kQs ? kI8fQBytes : 0);
+
+template <int kF, bool kLazy, bool kSplitKV, bool kQs, int kDiag = 0>
+__global__ void __launch_bounds__(kFaThreads, 1)
+    fa_i8f_kernel(Queries qs, int start, int width, float scale, Columns cols, PassBuffers buf,
+                  int splits, int resume, Carry carry) {
+  static_assert(kF == 32 || kF == 64 || kF == 128, "a fold group is 1, 2 or 4 tiles");
+  constexpr int kSub = kF / kTile;
+  constexpr int kKSteps = kHeadDim / 32;
+  constexpr int kKBytes = kF * kHeadDim;
+  extern __shared__ __align__(128) std::uint8_t fa_smem[];
+  const std::uint32_t sbase = smem_u32(fa_smem);
+  const std::uint32_t qbase = sbase + static_cast<std::uint32_t>(kI8fSmemBytes<kF, kSplitKV, false>);
+  const int lead = start % kQ;
+  const int ntiles = (lead + width + kQ - 1) / kQ;
+  const int tile = ntiles - 1 - static_cast<int>(blockIdx.x) / splits;  // longest first
+  const int split = static_cast<int>(blockIdx.x) % splits;
+  if (tile < 0) return;
+  const int q0 = tile * kQ - lead;
+  const int rend = min(start + q0 + kQ, start + width);
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = (tid / 32) % (kQ / 16), lane = tid % 32;
+  const int g = static_cast<int>(blockIdx.y) / kHeadPairs;
+  const int hl = tid / (kQ / 16 * 32);  // the CTA's head, 0 or 1
+  const int h = g * kGroup + (static_cast<int>(blockIdx.y) % kHeadPairs) * kHeadsPerCta + hl;
+  // This CTA's groups, then its split of them.
+  const int n = (cols.before(rend) + kF - 1) / kF;
+  const int gbeg = split * n / splits, gend = (split + 1) * n / splits;
+  if (gend <= gbeg && resume != 0) return;
+
+  auto stage_of = [](int gi) {
+    return kSplitKV ? 0u : static_cast<std::uint32_t>((gi & 1) * kI8fGroupBytes<kF>);
+  };
+  auto issue_k = [&](int gi) {
+    const std::uint32_t st = sbase + stage_of(gi);
+    const std::uint8_t *ksrc =
+        buf.k + (static_cast<std::int64_t>(g) * buf.capacity + gi * kF) * kHeadDim;
+#pragma unroll
+    for (int j = 0; j < kF * 16 / kFaThreads; ++j) {
+      const int u = tid + j * kFaThreads;
+      cp_async16(st + row_swz<true>(u >> 4, u & 15), ksrc + u * 16);
+    }
+  };
+  auto issue_v = [&](int gi) {
+    const std::uint32_t st = sbase + stage_of(gi) + static_cast<std::uint32_t>(kKBytes);
+    const std::uint8_t *vsrc =
+        buf.v + (static_cast<std::int64_t>(g) * (buf.capacity / kTile) + gi * kSub) * kVtTileBytes;
+#pragma unroll
+    for (int j = 0; j < kSub * 2; ++j) {
+      const int u = tid + j * kFaThreads;  // 512 16-byte segments a tile
+      cp_async16(st + static_cast<std::uint32_t>((u >> 9) * kVtTileBytes) + vt_off((u & 511) >> 1, u & 1),
+                 vsrc + u * 16);
+    }
+  };
+  // kQs: the CTA's two heads of 64 rows, laid out as K rows; a row outside the call is zeros.
+  auto issue_q = [&]() {
+    if constexpr (kQs) {
+#pragma unroll
+      for (int j = 0; j < kI8fQBytes / 16 / kFaThreads; ++j) {
+        const int u = tid + j * kFaThreads;
+        const int head = u / (kQ * 16), row = (u / 16) % kQ, unit = u % 16;
+        const std::uint32_t dst = qbase + static_cast<std::uint32_t>(head * kQ * kHeadDim) + row_swz<true>(row, unit);
+        const int t = q0 + row;
+        if (t >= 0 && t < width) {
+          const int hh = g * kGroup + (static_cast<int>(blockIdx.y) % kHeadPairs) * kHeadsPerCta + head;
+          cp_async16(dst, qs.q8 + (static_cast<std::int64_t>(t) * kQHeads + hh) * kHeadDim + unit * 16);
+        } else {
+          asm volatile("st.shared.v4.u32 [%0], {%1, %1, %1, %1};" ::"r"(dst), "r"(0u));
+        }
+      }
+    }
+  };
+
+  const int r0 = lane / 4, c2 = 2 * (lane % 4);
+  const int ta = warp * 16 + r0, tb = ta + 8;
+  std::uint32_t qa[kQs ? 1 : kKSteps][4];
+  float f[2];
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    const int t = q0 + (r ? tb : ta);
+    const bool in = t >= 0 && t < width;
+    const float sq = in ? qs.q_scale[static_cast<std::int64_t>(t) * kQHeads + h] : 1.0f;
+    f[r] = in ? sq * scale * kLog2e : 0.0f;
+  }
+  if constexpr (!kQs) {
+#pragma unroll
+    for (int kk = 0; kk < kKSteps; ++kk) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int t = q0 + ((i & 1) ? tb : ta);
+        const std::int64_t row = static_cast<std::int64_t>(t) * kQHeads + h;
+        qa[kk][i] = t < 0 || t >= width
+                        ? 0u
+                        : *reinterpret_cast<const std::uint32_t *>(qs.q8 + row * kHeadDim + kk * 32 +
+                                                                   16 * (i / 2) + 4 * (lane % 4));
+      }
+    }
+  }
+  const int pa = start + q0 + ta, pb = start + q0 + tb;
+  const int warp_last = start + q0 + warp * 16 + 15;
+  const std::uint32_t qrow = qbase + static_cast<std::uint32_t>(hl * kQ * kHeadDim);
+
+  float o[kHeadDim / 8][4];
+  float m[2] = {-CUDART_INF_F, -CUDART_INF_F}, l[2] = {0.0f, 0.0f};
+#pragma unroll
+  for (int i = 0; i < kHeadDim / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+  if (resume != 0) {
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      const int t = q0 + (r ? tb : ta);
+      if (t < 0 || t >= width) continue;
+      const std::int64_t row = (static_cast<std::int64_t>(split) * width + t) * kQHeads + h;
+      m[r] = carry.m[row];
+      l[r] = carry.l[row];
+      const __half *po = carry.o + row * kHeadDim;
+#pragma unroll
+      for (int dt = 0; dt < kHeadDim / 8; ++dt) {
+        const float2 v = __half22float2(*reinterpret_cast<const __half2 *>(po + dt * 8 + c2));
+        o[dt][2 * r] = v.x * l[r];
+        o[dt][2 * r + 1] = v.y * l[r];
+      }
+    }
+  }
+  float mref[2] = {m[0], m[1]};  // kLazy: the reference O and l are held at
+  const int lm = lane / 8, lr = lane % 8;
+  const int tiles_per_head = buf.capacity / kTile;
+  constexpr float kU8 = 256.0f / 255.0f;
+
+  // S of group gi's tiles, from 1.5 2^23 (exact in int32); a tile wholly past the warp's last row
+  // is left empty (the mask covers it). A k step's Q fragment serves every tile of the group.
+  auto qk = [&](int gi, int (&si)[kSub][4][4]) {
+    const std::uint32_t ks = sbase + stage_of(gi);
+    bool act[kSub];
+#pragma unroll
+    for (int j = 0; j < kSub; ++j) {
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) si[j][nt][0] = si[j][nt][1] = si[j][nt][2] = si[j][nt][3] = kMagic;
+      act[j] = j == 0 || cols.key((gi * kSub + j) * kTile) <= warp_last;
+    }
+    if constexpr ((kDiag & kDiagNoQk) != 0) {
+#pragma unroll
+      for (int j = 0; j < kSub; ++j) {
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            std::uint32_t bits = static_cast<std::uint32_t>(lane * 977 + nt * 31 + e);
+            if constexpr (!kQs) bits ^= qa[nt][e];
+            si[j][nt][e] = kMagic + ((static_cast<int>(bits) ^ ((gi * kSub + j) * 131)) & 0x3FFF) - 0x2000;
+          }
+        }
+      }
+    } else {
+#pragma unroll
+      for (int kk = 0; kk < kKSteps; ++kk) {
+        std::uint32_t a[4];
+        if constexpr (kQs) {
+          ldsm_x4(a, qrow + row_swz<true>(warp * 16 + lr + 8 * (lm & 1), 2 * kk + (lm >> 1)));
+        } else {
+          a[0] = qa[kk][0];
+          a[1] = qa[kk][1];
+          a[2] = qa[kk][2];
+          a[3] = qa[kk][3];
+        }
+#pragma unroll
+        for (int j = 0; j < kSub; ++j) {
+          if (act[j]) {
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+              std::uint32_t b[4];
+              ldsm_x4(b, ks + static_cast<std::uint32_t>(j * kTile * kHeadDim) +
+                             row_swz<true>(16 * p + lr + 8 * (lm / 2), 2 * kk + lm % 2));
+              mma_s8(si[j][2 * p], a, b);
+              mma_s8(si[j][2 * p + 1], a, b + 2);
+            }
+          }
+        }
+      }
+    }
+  };
+
+  // Group gi's softmax from its S: m (and m_ref) and l move on; P's u8 A fragments, one per tile;
+  // the fold's per-row factors (eager: O corr + (P V) fv; lazy: O + (P V) fv 2^(m - m_ref)).
+  auto softmax = [&](int gi, const int (&si)[kSub][4][4], std::uint32_t (&pf)[kSub][4], float (&fa)[2],
+                     float (&fb)[2]) {
+    const float sv = buf.scale[(kKvHeads + g) * tiles_per_head + gi * kSub];
+    const float fv = __fmul_rn(sv, kU8);
+    unsigned pi[2] = {0u, 0u};
+    if constexpr ((kDiag & kDiagNoSoftmax) != 0) {
+#pragma unroll
+      for (int j = 0; j < kSub; ++j) {
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          pf[j][r] = static_cast<std::uint32_t>(si[j][0][2 * r] ^ si[j][1][2 * r + 1]) & 0x7F7F7F7Fu;
+          pf[j][2 + r] = static_cast<std::uint32_t>(si[j][2][2 * r] ^ si[j][3][2 * r + 1]) & 0x7F7F7F7Fu;
+          pi[r] += pf[j][r] & 0xFFFFu;
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        fa[r] = 1.0f;
+        fb[r] = fv;
+        l[r] = l[r] + static_cast<float>(pi[r]);
+      }
+    } else {
+      float sc[kSub][4][4];
+      float mx[2] = {-CUDART_INF_F, -CUDART_INF_F};
+#pragma unroll
+      for (int j = 0; j < kSub; ++j) {
+        const int c = gi * kSub + j;
+        const float sk = buf.scale[g * tiles_per_head + c];
+        const float fs[2] = {__fmul_rn(f[0], sk), __fmul_rn(f[1], sk)};
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+          for (int e = 0; e < 4; ++e) sc[j][nt][e] = __fmul_rn(__fsub_rn(__int_as_float(si[j][nt][e]), kMagicF), fs[e / 2]);
+        }
+        const int key0 = cols.key(c * kTile);
+        const bool edge = key0 + kTile - 1 > start + q0 + warp * 16 || (c + 1) * kTile > cols.count;
+        if (edge) {
+#pragma unroll
+          for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+              const int col = nt * 8 + c2 + (e & 1);
+              if (c * kTile + col >= cols.count || key0 + col > (e < 2 ? pa : pb)) sc[j][nt][e] = -CUDART_INF_F;
+            }
+          }
+        }
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+          for (int e = 0; e < 4; ++e) mx[e / 2] = fmaxf(mx[e / 2], sc[j][nt][e]);
+        }
+      }
+      float corr[2];
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
+        mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
+        const float mn = fmaxf(m[r], mx[r]);
+        corr[r] = mn == -CUDART_INF_F ? 1.0f : ex2_approx(__fsub_rn(m[r], mn));
+        m[r] = mn;
+      }
+      const float bias[2] = {__fsub_rn(8.0f, m[0] == -CUDART_INF_F ? 0.0f : m[0]),
+                             __fsub_rn(8.0f, m[1] == -CUDART_INF_F ? 0.0f : m[1])};
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+#pragma unroll
+        for (int j = 0; j < kSub; ++j) {
+          std::uint32_t w[4];
+#pragma unroll
+          for (int nt = 0; nt < 4; ++nt) {
+            const float a = __fmul_rn(255.0f, ex2_approx(__fsub_rn(__fadd_rn(sc[j][nt][2 * r], bias[r]), 8.0f)));
+            const float b = __fmul_rn(255.0f, ex2_approx(__fsub_rn(__fadd_rn(sc[j][nt][2 * r + 1], bias[r]), 8.0f)));
+            // rn(x) for 0 <= x < 2^22 is the low bits of x + 1.5 2^23: bytes [a, b] of the pair.
+            w[nt] = __byte_perm(__float_as_uint(__fadd_rn(a, kMagicF)), __float_as_uint(__fadd_rn(b, kMagicF)), 0x0040);
+          }
+          pf[j][r] = __byte_perm(w[0], w[1], 0x5410);
+          pf[j][2 + r] = __byte_perm(w[2], w[3], 0x5410);
+          pi[r] = __dp4a(pf[j][2 + r], 0x01010101u, __dp4a(pf[j][r], 0x01010101u, pi[r]));
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        pi[r] += __shfl_xor_sync(0xffffffffu, pi[r], 1);
+        pi[r] += __shfl_xor_sync(0xffffffffu, pi[r], 2);
+      }
+      if constexpr (!kLazy) {
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          l[r] = __fmaf_rn(l[r], corr[r], __fmul_rn(static_cast<float>(static_cast<int>(pi[r])), kU8));
+          fa[r] = corr[r];
+          fb[r] = fv;
+        }
+      } else {
+        (void)corr;
+        // -inf - -inf is NaN, which passes no threshold: a row with no key yet keeps its reference.
+        const bool need = __fsub_rn(m[0], mref[0]) > kLazyLog2 || __fsub_rn(m[1], mref[1]) > kLazyLog2;
+        if (__any_sync(0xffffffffu, need)) {
+          float cr[2];
+#pragma unroll
+          for (int r = 0; r < 2; ++r) {
+            cr[r] = mref[r] == m[r] || m[r] == -CUDART_INF_F ? 1.0f : ex2_approx(__fsub_rn(mref[r], m[r]));
+            l[r] = __fmul_rn(l[r], cr[r]);
+            mref[r] = m[r];
+          }
+#pragma unroll
+          for (int dt = 0; dt < kHeadDim / 8; ++dt) {
+            o[dt][0] = __fmul_rn(o[dt][0], cr[0]);
+            o[dt][1] = __fmul_rn(o[dt][1], cr[0]);
+            o[dt][2] = __fmul_rn(o[dt][2], cr[1]);
+            o[dt][3] = __fmul_rn(o[dt][3], cr[1]);
+          }
+        }
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          const float fac = mref[r] == m[r] ? 1.0f : ex2_approx(__fsub_rn(m[r], mref[r]));
+          l[r] = __fmaf_rn(__fmul_rn(static_cast<float>(static_cast<int>(pi[r])), kU8), fac, l[r]);
+          fa[r] = 1.0f;
+          fb[r] = __fmul_rn(fv, fac);
+        }
+      }
+    }
+  };
+
+  // O = O fa + (P V) fb for group gi's V^T: one int32 accumulator over the group's tiles.
+  auto pv = [&](int gi, const std::uint32_t (&pf)[kSub][4], const float (&fa)[2], const float (&fb)[2]) {
+    if constexpr ((kDiag & kDiagNoPv) == 0) {
+      const std::uint32_t vs = sbase + stage_of(gi) + static_cast<std::uint32_t>(kKBytes);
+#pragma unroll
+      for (int dp = 0; dp < kHeadDim / 16; ++dp) {
+        int t[2][4];
+#pragma unroll
+        for (int x = 0; x < 2; ++x) t[x][0] = t[x][1] = t[x][2] = t[x][3] = kMagic;
+#pragma unroll
+        for (int j = 0; j < kSub; ++j) {
+          std::uint32_t b[4];
+          ldsm_x4(b, vs + static_cast<std::uint32_t>(j * kVtTileBytes) + vt_off(16 * dp + 8 * (lm / 2) + lr, lm % 2));
+          mma_u8s8(t[0], pf[j], b);
+          mma_u8s8(t[1], pf[j], b + 2);
+        }
+#pragma unroll
+        for (int x = 0; x < 2; ++x) {
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            if constexpr (kLazy) {
+              o[2 * dp + x][e] = __fmaf_rn(__fsub_rn(__int_as_float(t[x][e]), kMagicF), fb[e / 2], o[2 * dp + x][e]);
+            } else {
+              o[2 * dp + x][e] = __fmaf_rn(o[2 * dp + x][e], fa[e / 2],
+                                           __fmul_rn(__fsub_rn(__int_as_float(t[x][e]), kMagicF), fb[e / 2]));
+            }
+          }
+        }
+      }
+    } else {
+      (void)fa;
+      (void)fb;
+    }
+  };
+
+  if constexpr (!kSplitKV) {
+    // v0's schedule a group at a time: two stages, the next but one refilled after the second barrier.
+    issue_q();
+    if (gend > gbeg) {
+      issue_k(gbeg);
+      issue_v(gbeg);
+    }
+    cp_commit();
+    if (gend - gbeg > 1) {
+      issue_k(gbeg + 1);
+      issue_v(gbeg + 1);
+    }
+    cp_commit();
+    for (int gi = gbeg; gi < gend; ++gi) {
+      cp_wait<1>();
+      __syncthreads();
+      if (cols.key(gi * kF) <= warp_last) {
+        int si[kSub][4][4];
+        qk(gi, si);
+        std::uint32_t pf[kSub][4];
+        float fa[2], fb[2];
+        softmax(gi, si, pf, fa, fb);
+        pv(gi, pf, fa, fb);
+      }
+      __syncthreads();  // every warp is done with this stage
+      if (gi + 2 < gend) {
+        issue_k(gi + 2);
+        issue_v(gi + 2);
+      }
+      cp_commit();
+    }
+  } else {
+    // One K buffer, one V^T buffer: the top barrier makes K(gi) everyone's and frees V^T (every
+    // warp is past P V of gi - 1); the second makes V^T(gi) everyone's and frees K.
+    issue_q();
+    if (gend > gbeg) issue_k(gbeg);
+    cp_commit();
+    for (int gi = gbeg; gi < gend; ++gi) {
+      cp_wait<0>();
+      __syncthreads();
+      issue_v(gi);
+      cp_commit();
+      const bool work = cols.key(gi * kF) <= warp_last;
+      std::uint32_t pf[kSub][4];
+      float fa[2] = {1.0f, 1.0f}, fb[2] = {0.0f, 0.0f};
+      if (work) {
+        int si[kSub][4][4];
+        qk(gi, si);
+        softmax(gi, si, pf, fa, fb);
+      }
+      cp_wait<0>();
+      __syncthreads();
+      if (gi + 1 < gend) issue_k(gi + 1);
+      cp_commit();
+      if (work) pv(gi, pf, fa, fb);
+    }
+  }
+
+  // The split's state, as fa_kernel leaves it (kLazy: l brought back to the running max).
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    const int t = q0 + (r ? tb : ta);
+    if (t < 0 || t >= width) continue;
+    const std::int64_t row = (static_cast<std::int64_t>(split) * width + t) * kQHeads + h;
+    __half *po = carry.o + row * kHeadDim;
+    const float inv = l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
+#pragma unroll
+    for (int dt = 0; dt < kHeadDim / 8; ++dt) {
+      *reinterpret_cast<__half2 *>(po + dt * 8 + c2) =
+          __floats2half2_rn(o[dt][2 * r] * inv, o[dt][2 * r + 1] * inv);
+    }
+    if (c2 == 0) {
+      carry.m[row] = m[r];
+      carry.l[row] = kLazy && mref[r] != m[r] ? __fmul_rn(l[r], ex2_approx(__fsub_rn(mref[r], m[r]))) : l[r];
+    }
+  }
+}
+
+// PROTOTYPE (phase 2e): V^T of a pass in s8 with one amax / 127 scale per kF-key group (stored for
+// each 32-key tile of it, so the attention reads it at the group's first tile), the segment order
+// store_fp8_tile's; K stays per tile (tile_kernel<true, false, kProtoI8> with role K alone). A
+// column past the pass's keys is a zero row.
+template <int kF>
+__global__ void __launch_bounds__(256) tile_vgroup_kernel(IgnisHqPromptKeys src, Columns cols, PassBuffers buf) {
+  constexpr int kSub = kF / kTile;
+  extern __shared__ __align__(16) std::uint8_t vg_smem[];
+  auto *rows = reinterpret_cast<__nv_bfloat16 *>(vg_smem);  // kF rows of 256
+  __shared__ std::int8_t signs[kHeadDim];
+  __shared__ float warp_amax[8];
+  __shared__ float group_scale;
+  const int group = static_cast<int>(blockIdx.x);
+  const int head = static_cast<int>(blockIdx.y);
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid >> 5, lane = tid & 31;
+  ninfer::ops::hq_engine_signs_fill(signs);
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < kSub; ++i) {
+    const int key_l = i * kTile + warp * 4 + (lane >> 3);
+    const int column = group * kF + key_l;
+    ignis_hq_prompt::fetch_rows_warp(src, head, true, column < cols.count ? cols.key(column) : -1,
+                                     rows + key_l * kHeadDim, signs);
+  }
+  __syncthreads();
+  float mx = 0.0f;
+  for (int u = tid; u < kF * kHeadDim / 8; u += 256) {
+    const uint4 w = reinterpret_cast<const uint4 *>(rows)[u];
+    const std::uint32_t words[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 v = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&words[j]));
+      mx = fmaxf(mx, fmaxf(fabsf(v.x), fabsf(v.y)));
+    }
+  }
+  mx = warp_max(mx);
+  if (lane == 0) warp_amax[warp] = mx;
+  __syncthreads();
+  const int tiles = buf.capacity / kTile;
+  if (tid == 0) {
+    float amax = 0.0f;
+    for (int w = 0; w < 8; ++w) amax = fmaxf(amax, warp_amax[w]);
+    const float s = amax > 0.0f ? amax / kInt8Max : 1.0f;
+    group_scale = s;
+    for (int i = 0; i < kSub; ++i) buf.scale[(kKvHeads + head) * tiles + group * kSub + i] = s;
+  }
+  __syncthreads();
+  const float inv = 1.0f / group_scale;
+#pragma unroll
+  for (int i = 0; i < kSub; ++i) {
+    const __nv_bfloat16 *tile = rows + i * kTile * kHeadDim;
+    std::uint8_t *dst = buf.v + (static_cast<std::int64_t>(head) * tiles + group * kSub + i) * kVtTileBytes;
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+      const int seg = tid + k * 256, d = seg >> 1, hh = seg & 1;
+      std::uint32_t w[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        std::uint32_t word = 0;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          const int key_l = 16 * hh + 2 * j + (b & 1) + 8 * (b >> 1);
+          word |= static_cast<std::uint32_t>(i8(__bfloat162float(tile[key_l * kHeadDim + d]) * inv)) << (8 * b);
+        }
+        w[j] = word;
+      }
+      *reinterpret_cast<uint4 *>(dst + seg * 16) = make_uint4(w[0], w[1], w[2], w[3]);
+    }
+  }
+}
+
+// ---- PROTOTYPE (phase 2e): the control, i8qk brought up to date ------------------------------------
+//
+// fa_kernel<true, false, kProtoI8Qk> (5ea54bc6: INT8 Q K^T, P V on the FP16 MMA with FP16
+// accumulate per tile, V in FP16 rows) on fa_i8_kernel v0's schedule and conversions: S lifted
+// from 1.5 2^23 by one FADD, the mask only on a tile that needs it, P = p packed two at a time. O
+// and l are held in units of p (the carry's are 256 p), so each element's fold is one FFMA after
+// its half -> float conversion: o = o corr + (P V).
+constexpr int kI8qkStageBytes = kKTileBytes<true> + kTile * kHeadDim * 2;  // INT8 K, FP16 V: 24 KiB
+
+template <int kDiag = 0>
+__global__ void __launch_bounds__(kFaThreads, 1)
+    fa_i8qk2_kernel(Queries qs, int start, int width, float scale, Columns cols, PassBuffers buf,
+                    int splits, int resume, Carry carry) {
+  constexpr int kKSteps = kHeadDim / 32;
+  extern __shared__ __align__(128) std::uint8_t fa_smem[];
+  const std::uint32_t sbase = smem_u32(fa_smem);
+  const int lead = start % kQ;
+  const int ntiles = (lead + width + kQ - 1) / kQ;
+  const int tile = ntiles - 1 - static_cast<int>(blockIdx.x) / splits;
+  const int split = static_cast<int>(blockIdx.x) % splits;
+  if (tile < 0) return;
+  const int q0 = tile * kQ - lead;
+  const int rend = min(start + q0 + kQ, start + width);
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = (tid / 32) % (kQ / 16), lane = tid % 32;
+  const int g = static_cast<int>(blockIdx.y) / kHeadPairs;
+  const int h = g * kGroup + (static_cast<int>(blockIdx.y) % kHeadPairs) * kHeadsPerCta + tid / (kQ / 16 * 32);
+  const int n = (cols.before(rend) + kTile - 1) / kTile;
+  const int cbeg = split * n / splits, cend = (split + 1) * n / splits;
+  if (cend <= cbeg && resume != 0) return;
+
+  auto issue = [&](int c) {
+    const std::uint32_t st = sbase + static_cast<std::uint32_t>((c & 1) * kI8qkStageBytes);
+    const std::uint8_t *ksrc = buf.k + (static_cast<std::int64_t>(g) * buf.capacity + c * kTile) * kHeadDim;
+    const std::int64_t at = (static_cast<std::int64_t>(g) * buf.capacity + c * kTile) * kHeadDim * 2;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const int u = tid + j * kFaThreads;
+      cp_async16(st + row_swz<true>(u >> 4, u & 15), ksrc + u * 16);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int u = tid + j * kFaThreads;
+      cp_async16(st + kKTileBytes<true> + row_swz<false>(u >> 5, u & 31), buf.v + at + u * 16);
+    }
+  };
+
+  const int r0 = lane / 4, c2 = 2 * (lane % 4);
+  const int ta = warp * 16 + r0, tb = ta + 8;
+  std::uint32_t qa[kKSteps][4];
+  float f[2];
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    const int t = q0 + (r ? tb : ta);
+    const bool in = t >= 0 && t < width;
+    const float sq = in ? qs.q_scale[static_cast<std::int64_t>(t) * kQHeads + h] : 1.0f;
+    f[r] = in ? sq * scale * kLog2e : 0.0f;
+  }
+#pragma unroll
+  for (int kk = 0; kk < kKSteps; ++kk) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int t = q0 + ((i & 1) ? tb : ta);
+      const std::int64_t row = static_cast<std::int64_t>(t) * kQHeads + h;
+      qa[kk][i] = t < 0 || t >= width
+                      ? 0u
+                      : *reinterpret_cast<const std::uint32_t *>(qs.q8 + row * kHeadDim + kk * 32 +
+                                                                 16 * (i / 2) + 4 * (lane % 4));
+    }
+  }
+  const int pa = start + q0 + ta, pb = start + q0 + tb;
+  const int warp_last = start + q0 + warp * 16 + 15;
+
+  float o[kHeadDim / 8][4];
+  float m[2] = {-CUDART_INF_F, -CUDART_INF_F}, l[2] = {0.0f, 0.0f};  // O and l in units of p
+#pragma unroll
+  for (int i = 0; i < kHeadDim / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+  if (resume != 0) {
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      const int t = q0 + (r ? tb : ta);
+      if (t < 0 || t >= width) continue;
+      const std::int64_t row = (static_cast<std::int64_t>(split) * width + t) * kQHeads + h;
+      m[r] = carry.m[row];
+      l[r] = carry.l[row] * (1.0f / 256.0f);
+      const __half *po = carry.o + row * kHeadDim;
+#pragma unroll
+      for (int dt = 0; dt < kHeadDim / 8; ++dt) {
+        const float2 v = __half22float2(*reinterpret_cast<const __half2 *>(po + dt * 8 + c2));
+        o[dt][2 * r] = v.x * l[r];
+        o[dt][2 * r + 1] = v.y * l[r];
+      }
+    }
+  }
+  const int lm = lane / 8, lr = lane % 8;
+  const int tiles_per_head = buf.capacity / kTile;
+
+  if (cend > cbeg) issue(cbeg);
+  cp_commit();
+  if (cend - cbeg > 1) issue(cbeg + 1);
+  cp_commit();
+  for (int c = cbeg; c < cend; ++c) {
+    cp_wait<1>();
+    __syncthreads();
+    const std::uint32_t ks = sbase + static_cast<std::uint32_t>((c & 1) * kI8qkStageBytes);
+    const std::uint32_t vs = ks + kKTileBytes<true>;
+    const int key0 = cols.key(c * kTile);
+    if (key0 <= warp_last) {
+      int si[4][4];
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) si[nt][0] = si[nt][1] = si[nt][2] = si[nt][3] = kMagic;
+      if constexpr ((kDiag & kDiagNoQk) == 0) {
+#pragma unroll
+        for (int kk = 0; kk < kKSteps; ++kk) {
+#pragma unroll
+          for (int p = 0; p < 2; ++p) {
+            std::uint32_t b[4];
+            ldsm_x4(b, ks + row_swz<true>(16 * p + lr + 8 * (lm / 2), 2 * kk + lm % 2));
+            mma_s8(si[2 * p], qa[kk], b);
+            mma_s8(si[2 * p + 1], qa[kk], b + 2);
+          }
+        }
+      }
+      const float sk = buf.scale[g * tiles_per_head + c];
+      const float fs[2] = {__fmul_rn(f[0], sk), __fmul_rn(f[1], sk)};
+      float sc[4][4];
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) sc[nt][e] = __fmul_rn(__fsub_rn(__int_as_float(si[nt][e]), kMagicF), fs[e / 2]);
+      }
+      const bool edge = key0 + kTile - 1 > start + q0 + warp * 16 || (c + 1) * kTile > cols.count;
+      if (edge) {
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            const int col = nt * 8 + c2 + (e & 1);
+            if (c * kTile + col >= cols.count || key0 + col > (e < 2 ? pa : pb)) sc[nt][e] = -CUDART_INF_F;
+          }
+        }
+      }
+      float mx[2] = {-CUDART_INF_F, -CUDART_INF_F};
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) mx[e / 2] = fmaxf(mx[e / 2], sc[nt][e]);
+      }
+      float corr[2];
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
+        mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
+        const float mn = fmaxf(m[r], mx[r]);
+        corr[r] = mn == -CUDART_INF_F ? 1.0f : ex2_approx(__fsub_rn(m[r], mn));
+        m[r] = mn;
+      }
+      const float bias[2] = {__fsub_rn(8.0f, m[0] == -CUDART_INF_F ? 0.0f : m[0]),
+                             __fsub_rn(8.0f, m[1] == -CUDART_INF_F ? 0.0f : m[1])};
+      // P = p as FP16 A fragments for keys 0-15 and 16-31, straight from the S accumulators.
+      std::uint32_t pf[2][4];
+      float ps[2] = {0.0f, 0.0f};
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          const std::uint32_t p2 = pack_half(ex2_approx(__fsub_rn(__fadd_rn(sc[nt][2 * r], bias[r]), 8.0f)),
+                                             ex2_approx(__fsub_rn(__fadd_rn(sc[nt][2 * r + 1], bias[r]), 8.0f)));
+          const float2 pr = half2_bits(p2);
+          ps[r] += pr.x + pr.y;
+          pf[nt / 2][(nt % 2) * 2 + r] = p2;
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        ps[r] += __shfl_xor_sync(0xffffffffu, ps[r], 1);
+        ps[r] += __shfl_xor_sync(0xffffffffu, ps[r], 2);
+        l[r] = __fmaf_rn(l[r], corr[r], ps[r]);
+      }
+      if constexpr ((kDiag & kDiagNoPv) == 0) {
+#pragma unroll
+        for (int dp = 0; dp < kHeadDim / 16; ++dp) {
+          std::uint32_t t[2][2] = {};
+#pragma unroll
+          for (int j = 0; j < 2; ++j) {
+            std::uint32_t b[4];
+            ldsm_x4_trans(b, vs + row_swz<false>(16 * j + lr + 8 * (lm % 2), 2 * dp + lm / 2));
+            mma_f16acc(t[0], pf[j], b);
+            mma_f16acc(t[1], pf[j], b + 2);
+          }
+#pragma unroll
+          for (int x = 0; x < 2; ++x) {
+            const float2 lo = half2_bits(t[x][0]), hi = half2_bits(t[x][1]);
+            o[2 * dp + x][0] = __fmaf_rn(o[2 * dp + x][0], corr[0], lo.x);
+            o[2 * dp + x][1] = __fmaf_rn(o[2 * dp + x][1], corr[0], lo.y);
+            o[2 * dp + x][2] = __fmaf_rn(o[2 * dp + x][2], corr[1], hi.x);
+            o[2 * dp + x][3] = __fmaf_rn(o[2 * dp + x][3], corr[1], hi.y);
+          }
+        }
+      }
+    }
+    __syncthreads();
+    if (c + 2 < cend) issue(c + 2);
+    cp_commit();
+  }
+
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    const int t = q0 + (r ? tb : ta);
+    if (t < 0 || t >= width) continue;
+    const std::int64_t row = (static_cast<std::int64_t>(split) * width + t) * kQHeads + h;
+    __half *po = carry.o + row * kHeadDim;
+    const float inv = l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
+#pragma unroll
+    for (int dt = 0; dt < kHeadDim / 8; ++dt) {
+      *reinterpret_cast<__half2 *>(po + dt * 8 + c2) =
+          __floats2half2_rn(o[dt][2 * r] * inv, o[dt][2 * r + 1] * inv);
+    }
+    if (c2 == 0) {
+      carry.m[row] = m[r];
+      carry.l[row] = l[r] * 256.0f;
+    }
+  }
+}
+
+template <int kF, bool kLazy, bool kSplitKV, bool kQs, int kDiag = 0>
+void launch_fa_i8f(dim3 grid, Queries qs, int start, int width, float scale, Columns cols, PassBuffers buf,
+                   int splits, int resume, Carry carry, cudaStream_t stream) {
+  constexpr int kSmem = kI8fSmemBytes<kF, kSplitKV, kQs>;
+  static const cudaError_t attribute = cudaFuncSetAttribute(
+      fa_i8f_kernel<kF, kLazy, kSplitKV, kQs, kDiag>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+  if (attribute != cudaSuccess) {
+    throw std::runtime_error(std::string("ignis_hq_prompt_attention: shared memory attribute: ") +
+                             cudaGetErrorString(attribute));
+  }
+  fa_i8f_kernel<kF, kLazy, kSplitKV, kQs, kDiag><<<grid, kFaThreads, kSmem, stream>>>(qs, start, width, scale, cols,
+                                                                                      buf, splits, resume, carry);
+  check_launch("i8f attention");
+}
+
+template <int kDiag = 0>
+void launch_fa_i8qk2(dim3 grid, Queries qs, int start, int width, float scale, Columns cols, PassBuffers buf,
+                     int splits, int resume, Carry carry, cudaStream_t stream) {
+  constexpr int kSmem = 2 * kI8qkStageBytes;
+  static const cudaError_t attribute =
+      cudaFuncSetAttribute(fa_i8qk2_kernel<kDiag>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+  if (attribute != cudaSuccess) {
+    throw std::runtime_error(std::string("ignis_hq_prompt_attention: shared memory attribute: ") +
+                             cudaGetErrorString(attribute));
+  }
+  fa_i8qk2_kernel<kDiag><<<grid, kFaThreads, kSmem, stream>>>(qs, start, width, scale, cols, buf, splits, resume,
+                                                              carry);
+  check_launch("i8qk2 attention");
+}
+
+template <int kF>
+void launch_tile_vgroup(IgnisHqPromptKeys src, Columns cols, PassBuffers buf, cudaStream_t stream) {
+  constexpr int kSmem = kF * kHeadDim * 2;
+  static const cudaError_t attribute =
+      cudaFuncSetAttribute(tile_vgroup_kernel<kF>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+  if (attribute != cudaSuccess) {
+    throw std::runtime_error(std::string("ignis_hq_prompt_attention: shared memory attribute: ") +
+                             cudaGetErrorString(attribute));
+  }
+  tile_vgroup_kernel<kF><<<dim3(static_cast<unsigned>((cols.count + kF - 1) / kF), kKvHeads, 1), 256, kSmem, stream>>>(
+      src, cols, buf);
+  check_launch("V^T groups");
+}
+
 // ---- the merge: the splits combined, normalized and un-rotated, one warp per row ---------------
 
 __global__ void __launch_bounds__(kRowThreads) merge_kernel(Carry carry, int width, int splits,
@@ -1948,8 +2744,11 @@ constexpr std::size_t kAlign = 256;
 
 std::size_t aligned(std::size_t bytes) { return (bytes + kAlign - 1) / kAlign * kAlign; }
 
+// PROTOTYPE (phase 2e): a pass's planes hold whole fold groups of up to 128 keys (fa_i8f_kernel),
+// so a capacity rounds up to 128 keys; the passes still launch by their key count.
+constexpr std::uint32_t kCapacityKeys = 128;
 std::uint32_t round_up_tile(std::uint32_t keys) {
-  return (keys + kIgnisHqPromptTileKeys - 1) / kIgnisHqPromptTileKeys * kIgnisHqPromptTileKeys;
+  return (keys + kCapacityKeys - 1) / kCapacityKeys * kCapacityKeys;
 }
 
 // The band pass's keys per band -- the FP16 fallback's band holds half as many in the same bytes
@@ -2206,29 +3005,147 @@ static_assert(kI8VariantCount == 28, "launch_i8 names every variant");
 
 // PROTOTYPE: which band a call runs. The op takes it from the precision and IGNIS_PROTO_BAND, the
 // bench names it: kI8 is the i8 band on fa_i8_kernel, kI8Ref the same band on 5ea54bc6's
-// fa_kernel<true, false, kProtoI8>, kept as the reference the bench holds kI8 to.
-enum class Band { kFp8, kFp16, kI8, kI8Ref, kI8Qk };
+// fa_kernel<true, false, kProtoI8>, kept as the reference the bench holds kI8 to; phase 2e adds
+// kI8F (fa_i8f_kernel: the fold group, the lazy rescale) and kI8Qk2 (fa_i8qk2_kernel, the control).
+enum class Band { kFp8, kFp16, kI8, kI8Ref, kI8Qk, kI8F, kI8Qk2 };
 
-// PROTOTYPE: IGNIS_PROTO_BAND (off, i8, i8ref, i8qk), read once; a value it does not know throws.
-// Off: the precision decides. Else the band replaces the FP16 band.
-int proto_band() {
-  static const int mode = [] {
-    const char *env = std::getenv("IGNIS_PROTO_BAND");
-    const std::string m = env == nullptr ? "" : env;
-    int r = -1;
-    if (m == "i8") {
-      r = static_cast<int>(Band::kI8);
-    } else if (m == "i8ref") {
-      r = static_cast<int>(Band::kI8Ref);
-    } else if (m == "i8qk") {
-      r = static_cast<int>(Band::kI8Qk);
-    } else if (!m.empty() && m != "off") {
-      throw std::invalid_argument("IGNIS_PROTO_BAND must be off, i8, i8ref or i8qk, got '" + m + "'");
-    }
-    std::fprintf(stderr, "ignis proto: IGNIS_PROTO_BAND=%s\n", m.empty() ? "off" : m.c_str());
-    return r;
+// PROTOTYPE (phase 2e): the window pass's form. kBf16: as served (BF16, f32 accumulate). kW8: the
+// band's own kernel and tiles (8-bit Q K^T; INT8 K per 32-key tile; P V as the band runs it: u8 x
+// s8 for the i8 bands, FP16 for i8qk and i8qk2), so every key goes through one 8-bit pass. kW16:
+// the FP16 band's kernel (FP16 rows, FP16 accumulate inside a tile, folded into fp32 per tile).
+enum class Window { kBf16, kW8, kW16 };
+
+// PROTOTYPE (phase 2e): a call's levers besides its band.
+struct Proto {
+  Window window = Window::kBf16;
+  int fold = 32;                // kI8F: keys a fold group (32, 64, 128)
+  bool lazy = false;            // kI8F: the lazy rescale
+  bool split_kv = false;        // kI8F: one K and one V^T buffer instead of two stages
+  bool q_smem = false;          // kI8F: Q in shared memory
+  int i8_variant = kI8Default;  // kI8: phase 2d's variant
+  int diag = 0;                 // kI8 or kI8F: the bench's stage cuts
+};
+
+// PROTOTYPE (phase 2e): the key splits 2d measured best on the RTX 5090, 2 up to 16K visible keys
+// and 3 above (IGNIS_PROTO_SPLITS=rule, the bench's splits -1); every band takes them.
+std::int32_t rule_splits(std::uint32_t visible_keys) { return visible_keys <= 16384 ? 2 : 3; }
+
+// PROTOTYPE: the switches, read once; a value they do not know throws.
+//   IGNIS_PROTO_BAND    off | i8 | i8ref | i8qk | i8f | i8qk2; off: the precision decides, else the
+//                       band replaces the FP16 band.
+//   IGNIS_PROTO_FOLD    32 | 64 | 128 (i8f's fold group; default 32)
+//   IGNIS_PROTO_LAZY    0 | 1 (i8f's lazy rescale; default 0)
+//   IGNIS_PROTO_SPLITKV 0 | 1 (i8f's one K and one V^T buffer; default 0; fold 128 needs 1)
+//   IGNIS_PROTO_QSMEM   0 | 1 (i8f's Q in shared memory; default 0)
+//   IGNIS_PROTO_WINDOW  off | w8 | w16 (the window pass; w8 needs an 8-bit band)
+//   IGNIS_PROTO_SPLITS  auto | rule | 1..5 (auto: the op's pick_splits)
+struct ProtoEnv {
+  int band = -1;
+  Proto proto;
+  std::int32_t splits = 0;  // 0: pick_splits; -1: rule_splits; else the count
+  bool any = false;
+};
+const ProtoEnv &proto_env() {
+  static const ProtoEnv env = [] {
+    auto get = [](const char *name) {
+      const char *v = std::getenv(name);
+      return std::string(v == nullptr ? "" : v);
+    };
+    ProtoEnv e;
+    const std::string band = get("IGNIS_PROTO_BAND");
+    if (band == "i8") e.band = static_cast<int>(Band::kI8);
+    else if (band == "i8ref") e.band = static_cast<int>(Band::kI8Ref);
+    else if (band == "i8qk") e.band = static_cast<int>(Band::kI8Qk);
+    else if (band == "i8f") e.band = static_cast<int>(Band::kI8F);
+    else if (band == "i8qk2") e.band = static_cast<int>(Band::kI8Qk2);
+    else if (!band.empty() && band != "off")
+      throw std::invalid_argument("IGNIS_PROTO_BAND must be off, i8, i8ref, i8qk, i8f or i8qk2, got '" + band + "'");
+    const std::string fold = get("IGNIS_PROTO_FOLD");
+    if (fold == "64") e.proto.fold = 64;
+    else if (fold == "128") e.proto.fold = 128;
+    else if (!fold.empty() && fold != "32")
+      throw std::invalid_argument("IGNIS_PROTO_FOLD must be 32, 64 or 128, got '" + fold + "'");
+    const std::string lazy = get("IGNIS_PROTO_LAZY");
+    if (lazy == "1") e.proto.lazy = true;
+    else if (!lazy.empty() && lazy != "0") throw std::invalid_argument("IGNIS_PROTO_LAZY must be 0 or 1, got '" + lazy + "'");
+    const std::string skv = get("IGNIS_PROTO_SPLITKV");
+    if (skv == "1") e.proto.split_kv = true;
+    else if (!skv.empty() && skv != "0") throw std::invalid_argument("IGNIS_PROTO_SPLITKV must be 0 or 1, got '" + skv + "'");
+    const std::string qsm = get("IGNIS_PROTO_QSMEM");
+    if (qsm == "1") e.proto.q_smem = true;
+    else if (!qsm.empty() && qsm != "0") throw std::invalid_argument("IGNIS_PROTO_QSMEM must be 0 or 1, got '" + qsm + "'");
+    const std::string win = get("IGNIS_PROTO_WINDOW");
+    if (win == "w8") e.proto.window = Window::kW8;
+    else if (win == "w16") e.proto.window = Window::kW16;
+    else if (!win.empty() && win != "off")
+      throw std::invalid_argument("IGNIS_PROTO_WINDOW must be off, w8 or w16, got '" + win + "'");
+    const std::string sp = get("IGNIS_PROTO_SPLITS");
+    if (sp == "rule") e.splits = -1;
+    else if (sp.size() == 1 && sp[0] >= '1' && sp[0] <= '5') e.splits = sp[0] - '0';
+    else if (!sp.empty() && sp != "auto")
+      throw std::invalid_argument("IGNIS_PROTO_SPLITS must be auto, rule or 1..5, got '" + sp + "'");
+    if (e.band != static_cast<int>(Band::kI8F) && (e.proto.fold != 32 || e.proto.lazy || e.proto.split_kv || e.proto.q_smem))
+      throw std::invalid_argument("IGNIS_PROTO_FOLD, _LAZY, _SPLITKV and _QSMEM are i8f's");
+    if (e.proto.fold == 128 && !e.proto.split_kv)
+      throw std::invalid_argument("IGNIS_PROTO_FOLD=128 needs IGNIS_PROTO_SPLITKV=1 (two 64 KiB stages do not fit)");
+    if (e.proto.window == Window::kW8 && e.band < 0)
+      throw std::invalid_argument("IGNIS_PROTO_WINDOW=w8 runs the window on an 8-bit band's kernel: set IGNIS_PROTO_BAND");
+    e.any = e.band >= 0 || e.proto.window != Window::kBf16 || e.splits != 0;
+    std::fprintf(stderr,
+                 "ignis proto: IGNIS_PROTO_BAND=%s FOLD=%d LAZY=%d SPLITKV=%d QSMEM=%d WINDOW=%s SPLITS=%s\n",
+                 band.empty() ? "off" : band.c_str(), e.proto.fold, e.proto.lazy ? 1 : 0, e.proto.split_kv ? 1 : 0,
+                 e.proto.q_smem ? 1 : 0,
+                 e.proto.window == Window::kW8 ? "w8" : e.proto.window == Window::kW16 ? "w16" : "off",
+                 sp.empty() ? "auto" : sp.c_str());
+    return e;
   }();
-  return mode;
+  return env;
+}
+
+// PROTOTYPE (phase 2e): fa_i8f_kernel by its levers. kF = 128 runs only with one K and one V^T
+// buffer (two 64 KiB stages exceed a CTA's shared memory); the diagnostics cut stages of kI8fDiag.
+struct I8fDiagOf {
+  static constexpr int kF = 128;
+  static constexpr bool kLazy = true;
+  static constexpr bool kSplitKV = true;
+  static constexpr bool kQs = true;
+};
+void launch_i8f(const Proto &p, dim3 grid, Queries qs, int start, int width, float scale, Columns cols,
+                PassBuffers buf, int splits, int resume, Carry carry, cudaStream_t stream) {
+#define IGNIS_I8F(F, L, S, Q, D) \
+  return launch_fa_i8f<F, L, S, Q, D>(grid, qs, start, width, scale, cols, buf, splits, resume, carry, stream)
+  if (p.diag != 0) {
+#ifdef IGNIS_HQ_PROMPT_DIAG
+    constexpr int F = I8fDiagOf::kF;
+    constexpr bool L = I8fDiagOf::kLazy, S = I8fDiagOf::kSplitKV, Q = I8fDiagOf::kQs;
+    switch (p.diag) {
+      case kDiagNoPv: IGNIS_I8F(F, L, S, Q, kDiagNoPv);
+      case kDiagNoPv | kDiagNoSoftmax: IGNIS_I8F(F, L, S, Q, kDiagNoPv | kDiagNoSoftmax);
+      case kDiagNoQk: IGNIS_I8F(F, L, S, Q, kDiagNoQk);
+      case kDiagNoPv | kDiagNoSoftmax | kDiagNoQk: IGNIS_I8F(F, L, S, Q, kDiagNoPv | kDiagNoSoftmax | kDiagNoQk);
+      default: throw std::invalid_argument("ignis_hq_prompt_attention: no such i8f diagnostic");
+    }
+#else
+    throw std::invalid_argument("ignis_hq_prompt_attention: the i8f diagnostics are the bench's");
+#endif
+  }
+  const int key = p.fold * 8 + (p.lazy ? 4 : 0) + (p.split_kv ? 2 : 0) + (p.q_smem ? 1 : 0);
+  switch (key) {
+    case 32 * 8 + 0: IGNIS_I8F(32, false, false, false, 0);
+    case 32 * 8 + 4: IGNIS_I8F(32, true, false, false, 0);
+    case 32 * 8 + 5: IGNIS_I8F(32, true, false, true, 0);
+    case 64 * 8 + 4: IGNIS_I8F(64, true, false, false, 0);
+    case 64 * 8 + 5: IGNIS_I8F(64, true, false, true, 0);
+    case 64 * 8 + 2: IGNIS_I8F(64, false, true, false, 0);
+    case 64 * 8 + 6: IGNIS_I8F(64, true, true, false, 0);
+    case 64 * 8 + 3: IGNIS_I8F(64, false, true, true, 0);
+    case 64 * 8 + 7: IGNIS_I8F(64, true, true, true, 0);
+    case 128 * 8 + 6: IGNIS_I8F(128, true, true, false, 0);
+    case 128 * 8 + 3: IGNIS_I8F(128, false, true, true, 0);
+    case 128 * 8 + 7: IGNIS_I8F(128, true, true, true, 0);
+    default: throw std::invalid_argument("ignis_hq_prompt_attention: no such i8f kernel instantiated");
+  }
+#undef IGNIS_I8F
 }
 
 // The op's workspace as raw pointers, laid out by allocate (the bench sizes its own).
@@ -2257,26 +3174,35 @@ void attend(const __nv_bfloat16 *q, const IgnisHqPromptKeys &src, bool window_pa
             std::int32_t start_position, std::int32_t width, float scale, Band band_kind,
             std::uint32_t band_keys, std::int32_t splits_option, const WorkspacePtrs &ws,
             __nv_bfloat16 *out, cudaStream_t stream, const PassHook *hook = nullptr,
-            int i8_variant = kI8Default, int i8_diag = 0) {
+            const Proto &proto = Proto{}) {
   auto mark = [&](int what) {
     if (hook != nullptr) hook->mark(hook->ctx, what);
   };
   const auto visible = static_cast<std::uint32_t>(start_position + width);
   const bool half_band = band_kind == Band::kFp16;
+  const bool i8qk_band = band_kind == Band::kI8Qk || band_kind == Band::kI8Qk2;
+  const Window wmode = window_pass ? proto.window : Window::kBf16;
+  if (wmode == Window::kW8 && (band_kind == Band::kFp16 || band_kind == Band::kFp8)) {
+    throw std::invalid_argument("ignis_hq_prompt_attention: the W8 window runs on an i8 band's kernel");
+  }
   // The band's keys: the FP16 rows (FP16 band, i8qk's V) fit half of band_keys.
   const std::uint32_t band = band_capacity(
       visible, band_keys,
-      band_kind == Band::kFp16 || band_kind == Band::kI8Qk ? IgnisHqPromptPrecision::kFp16
-                                                            : IgnisHqPromptPrecision::kFp8);
+      half_band || i8qk_band ? IgnisHqPromptPrecision::kFp16 : IgnisHqPromptPrecision::kFp8);
   const std::uint32_t window = window_capacity(width, visible);
   const BandArea area = band_area(width, visible, band_keys, window);
   std::uint8_t *area_base = ws.area;
 
+  // Q: INT8 for an 8-bit band (and the W8 window), FP16 over 16 for the FP16 band or the W16
+  // window (in the window's Q slot when the band is 8-bit), BF16 for the window as served.
   Queries qs{};
   qs.q8 = half_band ? nullptr : ws.q_band;
   qs.q_scale = ws.q_scale;
-  qs.qh = half_band ? reinterpret_cast<const __half *>(ws.q_band) : nullptr;
-  qs.q16 = window_pass ? reinterpret_cast<const __nv_bfloat16 *>(area_base + area.q16) : nullptr;
+  qs.qh = half_band ? reinterpret_cast<const __half *>(ws.q_band)
+          : wmode == Window::kW16 ? reinterpret_cast<const __half *>(area_base + area.q16)
+                                  : nullptr;
+  qs.q16 = window_pass && wmode == Window::kBf16 ? reinterpret_cast<const __nv_bfloat16 *>(area_base + area.q16)
+                                                 : nullptr;
   const int rows = width * kQHeads;
   const int row_blocks = (rows + kRowThreads / 32 - 1) / (kRowThreads / 32);
   mark(kMarkBegin);
@@ -2286,28 +3212,90 @@ void attend(const __nv_bfloat16 *q, const IgnisHqPromptKeys &src, bool window_pa
   check_launch("prep_q");
   mark(kMarkPrep);
 
-  const std::int32_t splits = splits_option > 0 ? splits_option : pick_splits(width, visible);
+  const std::int32_t splits = splits_option > 0    ? splits_option
+                              : splits_option < 0 ? rule_splits(visible)
+                                                  : pick_splits(width, visible);
   const Carry carry{ws.carry_o, ws.carry_m, ws.carry_l};
   // Up to one more query tile than width / 64: the first one may start mid-block.
   const dim3 fa_grid(static_cast<unsigned>(((width + kQ - 1) / kQ + 1) * splits),
                      static_cast<unsigned>(kKvHeads * kHeadPairs));
   int resume = 0;
 
-  // The window pass: the sinks, then the ring before the chunk and the chunk, in BF16.
+  // An 8-bit pass (a band, or the window under W8) on band_kind's tiles and kernel.
+  auto pass8 = [&](const Columns &cols, const PassBuffers &buf, int mark_tiles, int mark_fa) {
+    const unsigned tiles = static_cast<unsigned>((cols.count + kTile - 1) / kTile);
+    if (i8qk_band) {
+      tile_kernel<true, false, kProtoI8Qk><<<dim3(tiles, kKvHeads, 2), 256, 0, stream>>>(src, cols, buf, 0);
+    } else if (band_kind == Band::kI8F && proto.fold != 32) {
+      tile_kernel<true, false, kProtoI8><<<dim3(tiles, kKvHeads, 1), 256, 0, stream>>>(src, cols, buf, 0);
+      check_launch("K tiles");
+      if (proto.fold == 64) {
+        launch_tile_vgroup<64>(src, cols, buf, stream);
+      } else {
+        launch_tile_vgroup<128>(src, cols, buf, stream);
+      }
+    } else {
+      tile_kernel<true, false, kProtoI8><<<dim3(tiles, kKvHeads, 2), 256, 0, stream>>>(src, cols, buf, 0);
+    }
+    check_launch("8-bit tiles");
+    mark(mark_tiles);
+    switch (band_kind) {
+      case Band::kI8:
+        launch_i8(proto.i8_variant, proto.diag, fa_grid, qs, start_position, width, scale, cols, buf, splits,
+                  resume, carry, stream);
+        break;
+      case Band::kI8Ref:
+        launch_fa<true, false, kProtoI8>(fa_grid, qs, start_position, width, scale, cols, buf, splits, resume,
+                                         carry, stream);
+        break;
+      case Band::kI8Qk:
+        launch_fa<true, false, kProtoI8Qk>(fa_grid, qs, start_position, width, scale, cols, buf, splits, resume,
+                                           carry, stream);
+        break;
+      case Band::kI8F:
+        launch_i8f(proto, fa_grid, qs, start_position, width, scale, cols, buf, splits, resume, carry, stream);
+        break;
+      case Band::kI8Qk2:
+        launch_fa_i8qk2(fa_grid, qs, start_position, width, scale, cols, buf, splits, resume, carry, stream);
+        break;
+      default:
+        throw std::invalid_argument("ignis_hq_prompt_attention: not an 8-bit prototype band");
+    }
+    mark(mark_fa);
+  };
+
+  // The window pass: the sinks, then the ring before the chunk and the chunk, in BF16 (or W8, W16).
   const auto sinks = static_cast<std::int32_t>(std::min<std::uint32_t>(kSinks, visible));
   const std::int32_t ring_from = std::max(kSinks, start_position - kRing);
   if (window_pass) {
     const Columns cols{0, sinks, ring_from,
                        sinks + std::max(0, static_cast<std::int32_t>(visible) - ring_from)};
-    const PassBuffers buf{area_base + area.window_k, area_base + area.window_v, nullptr,
-                          static_cast<std::int32_t>(window)};
-    tile_kernel<false><<<dim3(static_cast<unsigned>((cols.count + kTile - 1) / kTile), kKvHeads, 2),
-                         256, 0, stream>>>(src, cols, buf, 0);
-    check_launch("window tiles");
-    mark(kMarkWindowTiles);
-    launch_fa<false>(fa_grid, qs, start_position, width, scale, cols, buf, splits, resume, carry,
-                     stream);
-    mark(kMarkWindowFa);
+    if (wmode == Window::kW8) {
+      // 8-bit K (and s8 V^T, or i8qk's FP16 V rows) in the BF16 planes' room; the scales after K.
+      const PassBuffers buf{area_base + area.window_k, area_base + area.window_v,
+                            reinterpret_cast<float *>(area_base + area.window_k +
+                                                      static_cast<std::size_t>(kKvHeads) * window * kHeadDim),
+                            static_cast<std::int32_t>(window)};
+      pass8(cols, buf, kMarkWindowTiles, kMarkWindowFa);
+    } else {
+      const PassBuffers buf{area_base + area.window_k, area_base + area.window_v, nullptr,
+                            static_cast<std::int32_t>(window)};
+      const dim3 tiles(static_cast<unsigned>((cols.count + kTile - 1) / kTile), kKvHeads, 2);
+      if (wmode == Window::kW16) {
+        tile_kernel<false, true><<<tiles, 256, 0, stream>>>(src, cols, buf, 0);
+      } else {
+        tile_kernel<false><<<tiles, 256, 0, stream>>>(src, cols, buf, 0);
+      }
+      check_launch("window tiles");
+      mark(kMarkWindowTiles);
+      if (wmode == Window::kW16) {
+        launch_fa<false, true>(fa_grid, qs, start_position, width, scale, cols, buf, splits, resume, carry,
+                               stream);
+      } else {
+        launch_fa<false>(fa_grid, qs, start_position, width, scale, cols, buf, splits, resume, carry, stream);
+      }
+      mark(kMarkWindowFa);
+    }
     resume = 1;
   }
 
@@ -2327,31 +3315,17 @@ void attend(const __nv_bfloat16 *q, const IgnisHqPromptKeys &src, bool window_pa
       mark(kMarkBandTiles);
       launch_fa<false, true>(fa_grid, qs, start_position, width, scale, cols, buf, splits, resume,
                              carry, stream);
-    } else if (band_kind == Band::kI8 || band_kind == Band::kI8Ref) {
-      tile_kernel<true, false, kProtoI8><<<tiles, 256, 0, stream>>>(src, cols, buf, 0);
-      check_launch("band tiles");
-      mark(kMarkBandTiles);
-      if (band_kind == Band::kI8) {
-        launch_i8(i8_variant, i8_diag, fa_grid, qs, start_position, width, scale, cols, buf, splits,
-                  resume, carry, stream);
-      } else {
-        launch_fa<true, false, kProtoI8>(fa_grid, qs, start_position, width, scale, cols, buf, splits,
-                                         resume, carry, stream);
-      }
-    } else if (band_kind == Band::kI8Qk) {
-      tile_kernel<true, false, kProtoI8Qk><<<tiles, 256, 0, stream>>>(src, cols, buf, 0);
-      check_launch("band tiles");
-      mark(kMarkBandTiles);
-      launch_fa<true, false, kProtoI8Qk>(fa_grid, qs, start_position, width, scale, cols, buf, splits,
-                                         resume, carry, stream);
-    } else {
+      mark(kMarkBandFa);
+    } else if (band_kind == Band::kFp8) {
       tile_kernel<true><<<tiles, 256, 0, stream>>>(src, cols, buf, 0);
       check_launch("band tiles");
       mark(kMarkBandTiles);
       launch_fa<true>(fa_grid, qs, start_position, width, scale, cols, buf, splits, resume, carry,
                       stream);
+      mark(kMarkBandFa);
+    } else {
+      pass8(cols, buf, kMarkBandTiles, kMarkBandFa);
     }
-    mark(kMarkBandFa);
     resume = 1;
   }
 
@@ -2443,13 +3417,15 @@ void ignis_hq_prompt_attention(const ninfer::Tensor &q, const ninfer::Tensor &k,
   const auto visible = static_cast<std::uint32_t>(start_position + width);
   auto scope = workspace.scope();
   const Workspace ws = allocate(workspace, width, visible, options.band_keys);
-  // PROTOTYPE: IGNIS_PROTO_BAND takes the FP16 band's place, and only its place.
-  const int proto = proto_band();
-  require(proto < 0 || options.precision == IgnisHqPromptPrecision::kFp16,
-          "IGNIS_PROTO_BAND replaces the FP16 band: set IGNIS_MODEL_PREFILL_ATTENTION=fp16");
-  const Band band = proto >= 0 ? static_cast<Band>(proto)
+  // PROTOTYPE: IGNIS_PROTO_BAND takes the FP16 band's place, and only its place; the phase 2e
+  // switches (window, fold, lazy rescale, splits) likewise run only there.
+  const ProtoEnv &penv = proto_env();
+  require(!penv.any || options.precision == IgnisHqPromptPrecision::kFp16,
+          "IGNIS_PROTO_* replace the FP16 band: set IGNIS_MODEL_PREFILL_ATTENTION=fp16");
+  const Band band = penv.band >= 0 ? static_cast<Band>(penv.band)
                     : options.precision == IgnisHqPromptPrecision::kFp16 ? Band::kFp16
                                                                           : Band::kFp8;
+  const std::int32_t splits_option = penv.splits != 0 ? penv.splits : options.splits;
 
   // ADR 0037 (GitHub #258): with the residual window the chunk reads the ring as it stood
   // before the chunk, so it attends first and is appended after; without it, it is appended
@@ -2466,7 +3442,8 @@ void ignis_hq_prompt_attention(const ninfer::Tensor &q, const ninfer::Tensor &k,
                            static_cast<float *>(ws.carry_m.data),
                            static_cast<float *>(ws.carry_l.data)};
   attend(static_cast<const __nv_bfloat16 *>(q.data), src, window_pass, start_position, width, scale,
-         band, options.band_keys, options.splits, ptrs, static_cast<__nv_bfloat16 *>(out.data), stream);
+         band, options.band_keys, splits_option, ptrs, static_cast<__nv_bfloat16 *>(out.data), stream,
+         nullptr, penv.proto);
 
   if (options.after_attention) options.after_attention(src);
   if (window_pass) ninfer::ops::gqa_kv_append(k, v, positions, cache, stream);
