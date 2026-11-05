@@ -123,9 +123,10 @@ impl fmt::Display for PrefillLinear {
 /// ([`crate::model_load::Model::gdn_prefill`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GdnPrefill {
-    /// The vendored chunked kernels: what an RTX 50 or RTX PRO card runs.
+    /// The vendored chunked kernels: what `IGNIS_GDN_PREFILL=vendored` names.
     Vendored,
-    /// ignis's own kernels in full-rate forms: what an 8.x card runs.
+    /// ignis's own kernels in full-rate forms: what every card runs unless the
+    /// switch names the other (on Blackwell since GitHub #514's measurement).
     Ours,
 }
 
