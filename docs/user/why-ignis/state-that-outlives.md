@@ -56,7 +56,7 @@ The tiers, the matching rule and what it costs, in full:
 | Host retained slots: KV pool 475K up to 677-682K tokens (+42-44%) at level throughput; later-turn TTFT p50 on the long load 2.21 s up to 2.82 s | eight-agent swarm, 262,144-context load, prototype build of 2026-09-29 | [Retained slots on the host](../../findings/2026-09-28-retained-slots-on-the-host.md) |
 | A host claim costs 15.6 ms for 182 MiB against 0.29 ms on the device | same | same |
 | KV-disk: a spill of about 1 GB takes about 0.63 s; two decoding Flash-Next lanes keep ITL p50 within +3% to +8% | Flash-Next, NVMe volume, four runs | [KV-disk contention](../../findings/2026-10-08-kv-disk-contention-on-the-volume.md) |
-| The tax: a reusable prompt is cut at its publish point and at the opener, three traversals at about 19 ms each extra; 37% of a 1,024-token cold TTFT, under 2% at 70K | 27B | [Prompt reuse tax](../../findings/2026-09-18-prompt-reuse-tax-on-short-ttft.md) |
+| The tax: a reusable prompt is cut at its publish point and at the opener, three traversals at about 19 ms each extra; 37% of a 1,024-token cold TTFT, under 2% at 70K. On an RTX 30 or RTX 40 card the 27B is cut once, at the opener ([what it costs](../concepts/kv-cache-and-prompt-reuse.md#what-it-saves-and-what-it-costs)) | 27B, RTX 5090 | [Prompt reuse tax](../../findings/2026-09-18-prompt-reuse-tax-on-short-ttft.md) |
 
 :::caution[Dated numbers]
 The 475K to about 680K pool is a 262,144-context load of 2026-09-29. The
