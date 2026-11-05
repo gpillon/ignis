@@ -15,7 +15,8 @@
 #   - an NVIDIA driver that supports CUDA 13.1 or newer (the "CUDA Version" nvidia-smi prints); the
 #     bench refuses an older one.
 #   - about 1 GB of free device memory, and the card to itself: the bench times kernels. The script
-#     stops if another process holds the card, unless FORCE=1.
+#     stops if another process holds the card, unless FORCE=1 (under Windows nvidia-smi cannot tell
+#     a compute process from the desktop, so there the script cannot check).
 #   - a POSIX shell. nvidia-smi is optional (it adds the card's limits to the report).
 #
 # The bands (the bench's own header says more):
@@ -55,8 +56,10 @@ mkdir -p "$OUT"
 REPORT=$OUT/report-2d.txt
 
 if command -v nvidia-smi >/dev/null 2>&1; then
-  # Busy only by nvidia-smi's own answer: a failing nvidia-smi prints its error on stdout.
-  BUSY=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null) || BUSY=
+  # Busy only by nvidia-smi's own answer: a failing nvidia-smi prints its error on stdout. Under
+  # Windows' WDDM every process on the card, the desktop's too, shows [N/A] memory, so those rows
+  # say nothing and are skipped: there, keep the card to yourself.
+  BUSY=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null | grep -v '\[N/A\]') || BUSY=
   if [ -n "$BUSY" ] && [ "${FORCE:-0}" != "1" ]; then
     echo "run-2d: another process holds the card (pid, memory):" >&2
     echo "$BUSY" >&2
