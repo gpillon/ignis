@@ -153,6 +153,11 @@ pub struct VramLines {
     /// widest of the dense trellis linears' calls, decode and prefill, on
     /// the load's one stream. 0 on the NVFP4 body and on Flash-Next.
     pub trellis_workspace: u64,
+    /// The dense prefill's one buffer (GitHub #509, `--model-prefill-linear
+    /// int8`): the INT8 copy of the body's largest trellis matrix, which every
+    /// matrix of a prefill chunk is decoded into in turn. 0 on a load that
+    /// runs the fused prefill.
+    pub trellis_dense: u64,
     /// One media item's encoder output (0 without `--vision-enabled`).
     pub media_embedding: u64,
     /// Device sampling's staging buffers and workspace.
@@ -186,7 +191,7 @@ pub struct VramLines {
 impl VramLines {
     /// How many lines a plan has. The arity of [`VramLines::entries`], named
     /// so a reader of the plan does not have to write the number out again.
-    pub const LINES: usize = 13;
+    pub const LINES: usize = 14;
 
     /// `(name, bytes)` in plan order; the names are the `*_bytes` fields of
     /// `ignis.runtime.vram_plan` without the suffix.
@@ -196,6 +201,7 @@ impl VramLines {
             ("cuda_context", self.cuda_context),
             ("workspace", self.workspace),
             ("trellis_workspace", self.trellis_workspace),
+            ("trellis_dense", self.trellis_dense),
             ("media_embedding", self.media_embedding),
             ("sampling", self.sampling),
             ("decode_graph", self.decode_graph),
@@ -625,6 +631,7 @@ mod tests {
             // max(1300 MiB of prefill scratch, 2 GiB of vision encoder).
             workspace: 2 * GIB,
             trellis_workspace: 0,
+            trellis_dense: 0,
             media_embedding: 320 * MIB,
             sampling: 10 * MIB,
             decode_graph: 200 * MIB,
@@ -1181,6 +1188,40 @@ mod tests {
         assert!(!message.contains("--vision-enabled"), "{message}");
     }
 
+    /// GitHub #509: the dense prefill's buffer is a line like any other, so
+    /// the KV pool loses what it holds, and a budget that held the context
+    /// to the page without it is below the minimum with it -- which is what
+    /// starts the server's ladder down the contexts (ADR 0063).
+    #[test]
+    fn the_dense_prefill_buffer_is_a_line_the_pool_and_the_context_give_way_to() {
+        const DENSE: u64 = 5_120 * 17_408;  // the 27B's largest trellis matrix, in INT8
+        let fused = plan_vram(&request(DERIVED, 30 * GIB)).expect("fits");
+        let with = |free| {
+            let mut r = request(DERIVED, free);
+            r.lines.trellis_dense = DENSE;
+            plan_vram(&r)
+        };
+        let dense = with(30 * GIB).expect("fits");
+        assert_eq!(dense.total_bytes - dense.kv_pool_bytes, fused.total_bytes - fused.kv_pool_bytes + DENSE);
+        // The pool is the rest in whole pages, so it gives up the buffer's
+        // bytes in pages rounded one way or the other.
+        let lost = u64::from(fused.kv_page_count - dense.kv_page_count);
+        assert!(
+            lost == DENSE / page_bytes() || lost == DENSE.div_ceil(page_bytes()),
+            "the pool gives up the pages the buffer's bytes are worth: {lost}"
+        );
+        // The free memory that holds the 262,144-token context and one tail
+        // page per retained slot exactly, without the buffer.
+        let pages = 262_144 / 64 + SLOTS;
+        let exact = lines().total() + arena(pages) + GIB;
+        assert!(plan_vram(&request(DERIVED, exact)).is_ok());
+        assert!(
+            matches!(with(exact), Err(VramPlanError::BelowMinimum { .. })),
+            "the context no longer fits beside the buffer: {:?}",
+            with(exact)
+        );
+    }
+
     #[test]
     fn the_lines_keep_plan_order_and_add_up() {
         let names: Vec<_> = lines().entries().iter().map(|(name, _)| *name).collect();
@@ -1191,6 +1232,7 @@ mod tests {
                 "cuda_context",
                 "workspace",
                 "trellis_workspace",
+                "trellis_dense",
                 "media_embedding",
                 "sampling",
                 "decode_graph",

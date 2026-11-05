@@ -95,6 +95,7 @@ fn a_two_lane_load_serves_two_lanes_and_refuses_a_third() {
             None,
             RopeScaling::NONE,
             PrefillAttention::default(),
+            ignis_core::PrefillLinear::default(),
             lanes,
         )
     };

@@ -88,6 +88,7 @@ pub mod ngram_cache;
 pub mod pointing;
 pub mod exception_weights;
 pub mod prefill_attention;
+pub mod prefill_linear;
 pub mod prefix;
 pub mod constrained;
 pub mod request;
@@ -138,6 +139,7 @@ pub use kv_format::{
 pub use mock::{FakeDisk, MockCompute, MockSections};
 pub use exception_weights::ExceptionWeights;
 pub use prefill_attention::PrefillAttention;
+pub use prefill_linear::PrefillLinear;
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};
 pub use retained_slot::{

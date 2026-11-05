@@ -52,6 +52,7 @@ fn leaf_config(shape: &LoadShape, kv_pool_bytes: u64) -> CudaLeafConfig {
         vision: None,
         rope_scaling: shape.rope,
         prefill_attention: PrefillAttention::default(),
+        prefill_linear: ignis_core::PrefillLinear::default(),
     }
 }
 
@@ -146,6 +147,7 @@ pub fn load(reader: &Reader, shape: LoadShape) -> Result<Loaded, String> {
         config.vision,
         config.rope_scaling,
         config.prefill_attention,
+        config.prefill_linear,
         config.slot_count,
     )
     .map_err(|e| format!("model load: {e}"))?;

@@ -27,6 +27,12 @@ trellis linear (spec 27b-16gb/02), the widest call its body and head make on
 the device, reserved at load at the address the round graphs bake -- placed
 after `workspace`. 0 on the served NVFP4 body and on Flash-Next, whose plans
 are otherwise unchanged.
+**Amended 2026-11-05 by spec #503** (GitHub #509): a fourteenth plan line,
+`trellis_dense` -- the dense prefill's one buffer, the INT8 copy of the trellis
+body's largest matrix that every matrix of a prefill chunk is decoded into in
+turn -- placed after `trellis_workspace`. 0 on a load that runs the fused
+prefill; under the dense prefill `trellis_workspace` holds its INT8
+activations at the chunk in place of the fused prefill's.
 Amended 2026-09-18 (#216, owner decision) where building it settled three
 readings this section had left to the source column — the retained slots'
 capacity, what the KV pool's occupancy counts, and what the KV-RAM arena's
@@ -168,7 +174,7 @@ again. They add no serving work of any kind.
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `ignis_vram_reserved_bytes` | gauge | `line=weights\|cuda_context\|workspace\|trellis_workspace\|media_embedding\|sampling\|decode_graph\|verify_round\|drafter_round\|lane_state\|retained_slots\|hq_residual_window\|residual\|residency\|expert_cache\|condition_budget` | the plan's thirteen lines (`hq_residual_window` since #257, `trellis_workspace`, the 27B trellis body's, since #339), the same set and spelling the `ignis.runtime.vram_plan` event carries, then Flash-Next's two (#306): `residency`, the expert residency's fixed bytes (its tables, plus the prefill staging ring on an offloaded load: a device-only one has none, ADR 0054), and `expert_cache`, the VRAM expert cache that takes the budget the weights, program, pool and residency leave (the `residency_fixed_bytes` and `expert_cache_bytes` of `ignis.runtime.flash_next_plan`). Both are 0 on the 27B, and the KV pool is no line, so the budget less every line is the pool plus its page rounding. Then the image model's `condition_budget` (#324): the bytes its plan sets aside for its jobs' condition prefixes, 0 on a text load; its weights are `weights` and its arena `workspace` |
+| `ignis_vram_reserved_bytes` | gauge | `line=weights\|cuda_context\|workspace\|trellis_workspace\|trellis_dense\|media_embedding\|sampling\|decode_graph\|verify_round\|drafter_round\|lane_state\|retained_slots\|hq_residual_window\|residual\|residency\|expert_cache\|condition_budget` | the plan's fourteen lines (`hq_residual_window` since #257, `trellis_workspace`, the 27B trellis body's, since #339, `trellis_dense`, its dense prefill's buffer, since #509), the same set and spelling the `ignis.runtime.vram_plan` event carries, then Flash-Next's two (#306): `residency`, the expert residency's fixed bytes (its tables, plus the prefill staging ring on an offloaded load: a device-only one has none, ADR 0054), and `expert_cache`, the VRAM expert cache that takes the budget the weights, program, pool and residency leave (the `residency_fixed_bytes` and `expert_cache_bytes` of `ignis.runtime.flash_next_plan`). Both are 0 on the 27B, and the KV pool is no line, so the budget less every line is the pool plus its page rounding. Then the image model's `condition_budget` (#324): the bytes its plan sets aside for its jobs' condition prefixes, 0 on a text load; its weights are `weights` and its arena `workspace` |
 | `ignis_vram_budget_bytes` | gauge | none | the budget the plan was laid out inside, derived or explicit |
 | `ignis_kv_pool_pages` | gauge | none | the pool's page count, leaf-verified at load |
 | `ignis_kv_page_bytes` | gauge | none | one page's bytes |

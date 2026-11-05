@@ -103,6 +103,7 @@ fn load(
         None,
         RopeScaling::NONE,
         PrefillAttention::default(),
+        ignis_core::PrefillLinear::default(),
         LANES,
     )
     .unwrap_or_else(|e| panic!("model load ({speculation:?}, {LANES} lanes): {e}"));

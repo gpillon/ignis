@@ -209,6 +209,7 @@ fn the_replay_seams_hold(artifact_path: &str, body: Body27b, decode_lanes: u32) 
             None,
             RopeScaling::NONE,
             PrefillAttention::default(),
+            ignis_core::PrefillLinear::default(),
             decode_lanes,
         )
         .unwrap_or_else(|e| panic!("model load: {e}"));

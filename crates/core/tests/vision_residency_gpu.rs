@@ -94,6 +94,7 @@ fn held_at(reader: &Reader, device: &mut CudaDevice, residency: VisionResidency)
         Some(vision),
         RopeScaling::NONE,
         PrefillAttention::default(),
+        ignis_core::PrefillLinear::default(),
         N_DECODE_LANES as u32,
     )
     .unwrap_or_else(|e| panic!("plan ({residency}): {e}"));
@@ -214,6 +215,7 @@ fn on_the_16_gb_profile_the_ring_fits_the_prefill_scratch_and_the_pool_leaves_vr
             vision,
             RopeScaling::NONE,
             PrefillAttention::default(),
+            ignis_core::PrefillLinear::default(),
             2,
         )
         .unwrap_or_else(|e| panic!("plan {vision:?}: {e}"))

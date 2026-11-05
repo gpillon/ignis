@@ -16,7 +16,7 @@
 // Then the 64-layer body per chunk: dense = sum of each entry's dense x its calls + each group's
 // A8 x its layers, against fused = sum of each entry's fused x its calls.
 //
-//   ignis_kernel_dense_prefill_bench [--tokens 2048,4096] [--reps 5] [--inner 8] [--sweep]
+//   ignis_kernel_dense_prefill_bench [--tokens 2048,4096] [--reps 5] [--inner 32] [--sweep]
 
 #include "dense_prefill_internal.cuh"
 #include "trellis_test_common.h"
@@ -73,7 +73,7 @@ const A8Group kA8[] = {
 };
 
 int g_reps = 5;
-int g_inner = 8;
+int g_inner = 32;  // every copy of a pool once per round, so small matrices miss the L2 too
 
 template <typename F> double time_us(F &&launch, cudaStream_t s) {
   for (int i = 0; i < 2; ++i) launch(i);
@@ -247,7 +247,7 @@ int main(int argc, char **argv) {
     else if (std::strcmp(argv[i], "--inner") == 0 && i + 1 < argc) g_inner = std::atoi(argv[++i]);
     else if (std::strcmp(argv[i], "--sweep") == 0) sweep = true;
     else {
-      std::fprintf(stderr, "usage: %s [--tokens 2048,4096] [--reps 5] [--inner 8] [--sweep]\n", argv[0]);
+      std::fprintf(stderr, "usage: %s [--tokens 2048,4096] [--reps 5] [--inner 32] [--sweep]\n", argv[0]);
       return 2;
     }
   }

@@ -371,6 +371,25 @@ pub fn prefill_attention(
     ))
 }
 
+/// Spec #503's two prefill routes for RTX 30 and RTX 40 cards: the dense
+/// prefill of the trellis body (`--model-prefill-linear int8`, GitHub #509)
+/// and the integer band of the prompt attention (GitHub #510).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefillRoute {
+    DensePrefill,
+    IntegerBand,
+}
+
+/// Whether this build carries `route`: the one place that says so, which the
+/// prefill options' resolution consults before it lets a value through.
+pub const fn prefill_route_built(route: PrefillRoute) -> bool {
+    match route {
+        // GitHub #509: the leaf's dense prefill (kernel/include/ignis_dense_prefill.h).
+        PrefillRoute::DensePrefill => true,
+        PrefillRoute::IntegerBand => false,
+    }
+}
+
 /// The 27B's BF16 exception tensors on `card` (`--model-exception-weights`,
 /// GitHub #456): held in FP8, they prefill on the W8A8 GEMM, the sm_120a
 /// set's block-scaled FP8 MMA, so on a card that does not run it `fp8` is
@@ -392,6 +411,14 @@ pub fn exception_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GitHub #509: the build carries the dense prefill; the integer band is
+    /// #510's to flip.
+    #[test]
+    fn the_build_carries_the_dense_prefill() {
+        assert!(prefill_route_built(PrefillRoute::DensePrefill));
+        assert!(!prefill_route_built(PrefillRoute::IntegerBand));
+    }
 
     fn cc(major: u32, minor: u32) -> ComputeCapability {
         ComputeCapability::new(major, minor)
