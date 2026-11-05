@@ -1211,10 +1211,11 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     vision_residency = options->vision_residency;
   }
   // GitHub #335: a value the leaf does not know is refused rather than run as
-  // one of the two.
-  if (prefill_attention != IGNIS_PREFILL_ATTENTION_FP8 && prefill_attention != IGNIS_PREFILL_ATTENTION_FP16) {
+  // one of the three (GitHub #510 added the integer band).
+  if (prefill_attention != IGNIS_PREFILL_ATTENTION_FP8 && prefill_attention != IGNIS_PREFILL_ATTENTION_FP16 &&
+      prefill_attention != IGNIS_PREFILL_ATTENTION_INT8) {
     set_error("ignis_model_load: prefill_attention " + std::to_string(prefill_attention) +
-              " is not 0 (8-bit) or 1 (FP16 accumulate)");
+              " is not 0 (8-bit), 1 (FP16 accumulate) or 2 (the integer band)");
     return nullptr;
   }
   // GitHub #227: a scaling that cannot build a table is refused by name --

@@ -254,6 +254,10 @@ enum ignis_prefill_attention {
   /* FP16 operands with FP16 accumulate inside a 32-key tile, folded into
    * FP32: the fallback. */
   IGNIS_PREFILL_ATTENTION_FP16 = 1,
+  /* GitHub #510 (spec #503): the integer band, the 8-bit band on integer
+   * MMAs alone (Q K^T in INT8, P V on the u8 x s8 MMA), which a card without
+   * the FP8 MMA runs; the residual window's prefill pass runs on it too. */
+  IGNIS_PREFILL_ATTENTION_INT8 = 2,
 };
 
 /* GitHub #414 (ADR 0075): where a vision load keeps the 27B's vision tower
