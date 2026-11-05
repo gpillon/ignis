@@ -139,6 +139,7 @@ fn a_head_set_no_armed_layer_can_read_comes_back_unread_and_a_readable_one_whole
         permitted: None,
         attention,
         reasoning_close: None,
+        drafter_floor: 0,
     };
 
     for (request, tail) in [(1u64, 16u32), (2, 4)] {

@@ -1022,6 +1022,14 @@ projected into the drafter's context. Taken by a prefill chunk and by the
 verify traversal; scoped to that chunk or round: never persisted, never a state
 section.
 
+**Drafter floor**:
+The first prompt position whose **feature taps** a later **drafter window**
+reads, which the scheduler hands each prefill job: the earliest point at or
+past the job's end where a window is read — a prefix it publishes, its
+**prompt checkpoint**, its prompt's end — minus the window's 2048. A job taps
+from the later of its own last 2048 positions and its floor; a job wholly
+below its floor taps nothing (GitHub #506).
+
 **Verify round**:
 The speculative form of the **decode round** (P5-04): each lane contributes
 `k+1` columns — its anchor (the pending successor) followed by the drafts, the

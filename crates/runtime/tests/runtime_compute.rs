@@ -30,6 +30,8 @@ struct Calls {
     sequences_allocated: Vec<u32>,
     sequences_released: u32,
     prefill_positions: Vec<u32>,
+    /// GitHub #506: each prefill call's drafter floor, in order.
+    prefill_floors: Vec<u32>,
     prefill_params: Vec<DecodeParams>,
     /// The permitted set of each prefill call, in order (GitHub #242).
     prefill_permitted: Vec<Vec<u32>>,
@@ -278,6 +280,7 @@ impl StepLeaf for StubLeaf {
         sequence: &mut Self::Sequence,
         tokens: &[u32],
         start_position: u32,
+        drafter_floor: u32,
         params: DecodeParams,
         permitted: &[u32],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -293,7 +296,7 @@ impl StepLeaf for StubLeaf {
                 .media
                 .map(|media| (*media.embedding, media.first_column, media.scatter_indices.to_vec())),
         });
-        self.prefill(model, sequence, tokens, start_position, params, permitted, redirect, out_logits, attention)
+        self.prefill(model, sequence, tokens, start_position, drafter_floor, params, permitted, redirect, out_logits, attention)
     }
 
     fn release_model(&self, _model: Self::Model) {
@@ -461,6 +464,7 @@ impl StepLeaf for StubLeaf {
         _sequence: &mut Self::Sequence,
         _tokens: &[u32],
         start_position: u32,
+        drafter_floor: u32,
         params: DecodeParams,
         permitted: &[u32],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -523,6 +527,7 @@ impl StepLeaf for StubLeaf {
         let call = {
             let mut calls = self.calls.lock().unwrap();
             calls.prefill_positions.push(start_position);
+            calls.prefill_floors.push(drafter_floor);
             calls.prefill_params.push(params);
             calls.prefill_permitted.push(permitted.to_vec());
             calls
@@ -683,6 +688,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 permitted: None,
                 attention: None,
                 reasoning_close: None,
+                drafter_floor: 0,
             },
             PrefillJob {
                 checkpoint: None,
@@ -699,6 +705,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 permitted: None,
                 attention: None,
                 reasoning_close: None,
+                drafter_floor: 0,
             },
         ])
         .unwrap();
@@ -848,10 +855,12 @@ fn a_prefill_hands_the_leaf_its_reasoning_redirect_and_reports_it() {
     let compute = RuntimeCompute::new(model, 99);
     let outcomes = compute
         .prefill_step(&[
-            PrefillJob { reasoning_close: Some(42), ..prefill(1, Some(8)) },
+            PrefillJob { reasoning_close: Some(42),
+ drafter_floor: 0, ..prefill(1, Some(8)) },
             prefill(2, Some(8)),
             PrefillJob {
                 reasoning_close: Some(42),
+                drafter_floor: 0,
                 params: DecodeParams { ignore_eos: true, ..DecodeParams::default() },
                 ..prefill(3, Some(8))
             },
@@ -949,6 +958,7 @@ fn prefill(request: u64, max_tokens: Option<u32>) -> PrefillJob {
         permitted: None,
         attention: None,
         reasoning_close: None,
+        drafter_floor: 0,
     }
 }
 
@@ -1617,6 +1627,7 @@ fn a_spill_the_leaf_fails_leaves_the_device_image_to_discard() {
             permitted: None,
             attention: None,
             reasoning_close: None,
+            drafter_floor: 0,
 }])
         .unwrap();
 
@@ -1654,6 +1665,7 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
             permitted: None,
             attention: None,
             reasoning_close: None,
+            drafter_floor: 0,
 }])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().capture_slots, vec![2], "the slot the job named");
@@ -1680,6 +1692,7 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
                 permitted: None,
                 attention: None,
                 reasoning_close: None,
+                drafter_floor: 0,
 }])
             .unwrap();
     }
@@ -1962,6 +1975,7 @@ fn multimodal_job(request: u64, prompt: &Arc<Multimodal>, start: u32, len: u32) 
         permitted: None,
         attention: None,
         reasoning_close: None,
+        drafter_floor: 0,
     }
 }
 
@@ -2013,6 +2027,22 @@ fn a_media_item_is_encoded_once_and_let_go_after_its_last_placeholder() {
         ]
     );
     assert!(calls.prefill_positions == [0, 18], "the multimodal spans warm the sequence");
+}
+
+/// GitHub #506: each job's drafter floor reaches the leaf with its span, on
+/// the text path and on the multimodal one -- the scheduler decides it, and
+/// the leaf taps by it.
+#[test]
+fn each_prefill_hands_the_leaf_its_jobs_drafter_floor() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    compute
+        .prefill_step(&[PrefillJob { drafter_floor: 3952, ..prefill(1, Some(8)) }, prefill(2, Some(8))])
+        .unwrap();
+    let prompt = multimodal(40, vec![image(10, 4)]);
+    compute
+        .prefill_step(&[PrefillJob { drafter_floor: 7, ..multimodal_job(3, &prompt, 0, 18) }])
+        .unwrap();
+    assert_eq!(leaf.calls.lock().unwrap().prefill_floors, [3952, 0, 7]);
 }
 
 #[test]
@@ -2272,6 +2302,7 @@ fn a_request_that_publishes_a_block_and_chains_over_it_keeps_both_heads_claimabl
         permitted: None,
         attention: None,
         reasoning_close: None,
+        drafter_floor: 0,
 };
     compute.prefill_step(&[job(1, vec![1, 2, 3, 4], 0, Some(4))]).unwrap();
     compute.prefill_step(&[job(1, vec![5, 6, 7, 8], 4, Some(8))]).unwrap();
@@ -2315,6 +2346,7 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             permitted: None,
             attention: None,
             reasoning_close: None,
+            drafter_floor: 0,
 }])
         .unwrap();
     compute.release(1);
@@ -2355,6 +2387,7 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             permitted: None,
             attention: None,
             reasoning_close: None,
+            drafter_floor: 0,
 }])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().claimed_prefixes, vec![4], "claimable by name");

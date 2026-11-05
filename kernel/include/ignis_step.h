@@ -302,6 +302,17 @@ struct ignis_prefill_options {
    * the sequence's pending token is `reasoning_close_id` in place of a drawn
    * stop id -- else 0. NULL asks for nothing. */
   int32_t *out_reasoning_redirected;
+  /* GitHub #506: the drafter floor -- the first absolute position whose
+   * feature taps a later DFlash2 drafter window reads, as the scheduler sees
+   * the request: its earliest retained-image point at or past the span's end
+   * (a prefix it publishes, its prompt checkpoint, its prompt's end) minus the
+   * 2048-position window. On a load with the drafter the chunked route taps
+   * the positions at or past the later of the span's last 2048 and this one;
+   * a span wholly below it taps nothing, and the drafter window's frontier
+   * still moves to the span's end, so every check on that frontier holds. 0
+   * is the span rule alone, and what a NULL options pointer means. Unread on a
+   * load without the drafter, on the per-token route and on Flash-Next. */
+  uint64_t drafter_floor;
 };
 
 /* The most heads a readout may bring whole rows back for (GitHub #275): the

@@ -62,6 +62,7 @@ fn prefill(compute: &dyn Compute, request: u64, permitted: Option<&[TokenId]>, c
         permitted: permitted.map(|ids| ids.to_vec().into()),
         attention: None,
         reasoning_close: close,
+        drafter_floor: 0,
     };
     let outcomes = compute.prefill_step(&[job]).unwrap_or_else(|e| panic!("prefill_step {request}: {e}"));
     outcomes[0].reasoning_redirected
