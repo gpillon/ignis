@@ -54,6 +54,8 @@ $PY tools/kld-gate/gate1.py --limit L --baseline B --matched ft=results/ftref-ft
     --baseline-pair van=results/baseref-van.json --json gate1.json
 ```
 
+`--hidden` reads only the reference's output head: the saved reference's `--ckpt` index and the one shard holding `lm_head.weight`, nothing else. The overlay and the base shards it replaces are needed only when the reference's overlay replaced an `lm_head.` tensor (the abliterated reference's does not), so a checkpoint trimmed to that shard and the index is enough. A missing index or shard fails naming the path, the index and the shard. The scores are the same: the same head bytes go into the same matmul.
+
 `F:/ai/ngram-venv` holds what it needs (torch with CUDA, transformers with `Qwen3_5`, safetensors, numpy,
 pytest). The reference reads the checkpoint through `tools/27b-16gb-converter/overlay.py`
 (`IGNIS_CONVERTER_TOOLS` names another copy), which also lays a `replay.py fetch` overlay over it (`--overlay`,
