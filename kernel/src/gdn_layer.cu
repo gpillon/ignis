@@ -310,8 +310,8 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     ninfer::Tensor recurrent_out = recurrent.view({head_dim, value_heads, T, 1});
     if (model->gdn_prefill_ours && T >= ignis::gdn_prefill::kMinTokens) {
       // GitHub #514: our full-rate kernels (kernel/src/gdn_prefill.h), the
-      // load's route (every card's unless IGNIS_GDN_PREFILL=vendored names
-      // the other), the same contract: the slot in, the slot out. The load reserved its
+      // load's route (on 8.x always; on Blackwell under IGNIS_GDN_PREFILL),
+      // the same contract: the slot in, the slot out. The load reserved its
       // workspace at the chunk in place of the vendored op's
       // (kernel/src/model.cu's gdn_layer_scratch_bytes), so this is still no
       // allocation beyond the plan on the prefill path.

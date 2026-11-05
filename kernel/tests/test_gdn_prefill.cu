@@ -1,5 +1,5 @@
 // GitHub #514: the GDN prefill's chunked delta rule on our own kernels (kernel/src/gdn_prefill.h)
-// against the vendored chunked path it replaces, and both against an fp64 recurrence --
+// against the vendored chunked path it replaces on 8.x, and both against an fp64 recurrence --
 // OURS, not vendored.
 //
 // The oracle is the vendored op the layer body calls (ADR 0031): `ninfer::ops::gated_delta_net`
@@ -192,18 +192,17 @@ void set_environment(const char *name, const char *value) {
 }
 
 // The route per generation and the measurement switch (kernel/src/gdn_prefill.h `route_for_load`):
-// ours by default on 8.x and on Blackwell, either one when named, anything else refused naming the
-// variable.
+// ours on 8.x and the vendored kernels on Blackwell by default, either one when named, anything else
+// refused naming the variable.
 void check_route() {
   constexpr const char *kSwitch = "IGNIS_GDN_PREFILL";
   set_environment(kSwitch, nullptr);
   check(ignis::gdn_prefill::route_for_load(8), "8.x runs ours by default");
-  check(ignis::gdn_prefill::route_for_load(12), "Blackwell runs ours by default");
+  check(!ignis::gdn_prefill::route_for_load(12), "Blackwell keeps the vendored kernels by default");
+  set_environment(kSwitch, "ours");
+  check(ignis::gdn_prefill::route_for_load(12), "IGNIS_GDN_PREFILL=ours runs ours on Blackwell");
   set_environment(kSwitch, "vendored");
   check(!ignis::gdn_prefill::route_for_load(8), "IGNIS_GDN_PREFILL=vendored runs the vendored kernels on 8.x");
-  check(!ignis::gdn_prefill::route_for_load(12), "IGNIS_GDN_PREFILL=vendored runs the vendored kernels on Blackwell");
-  set_environment(kSwitch, "ours");
-  check(ignis::gdn_prefill::route_for_load(12), "IGNIS_GDN_PREFILL=ours runs ours");
   set_environment(kSwitch, "fp16");
   bool refused = false;
   try {

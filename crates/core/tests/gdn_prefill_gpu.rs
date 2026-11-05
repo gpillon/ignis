@@ -1,12 +1,10 @@
 //! GitHub #514 (spec #503): the GDN prefill on the leaf's own full-rate kernels
-//! (`kernel/src/gdn_prefill.h`), the route every card runs, the RTX 5090 since
-//! it measured them faster than the vendored chunked kernels with its KLD
-//! holding. On the card, the base 16 GB artifact prefills one prompt in
-//! 512-token chunks, once on the vendored kernels, named by the measurement
-//! switch `IGNIS_GDN_PREFILL=vendored`, and once with the switch unset:
+//! (`kernel/src/gdn_prefill.h`), the route 8.x cards run and the one the RTX 5090
+//! runs under the measurement switch `IGNIS_GDN_PREFILL=ours`. On the card, the
+//! base 16 GB artifact prefills one prompt in 512-token chunks, once on the
+//! vendored chunked kernels and once on ours:
 //!
-//! - the leaf reports the route each load took (`Model::gdn_prefill`), and
-//!   unset it is ours;
+//! - the leaf reports the route each load took (`Model::gdn_prefill`);
 //! - every span logit of our route is finite;
 //! - the logits moved (the switch reached the 48 GDN layers);
 //! - the two greedy readings agree almost everywhere: both routes compute the
@@ -99,14 +97,10 @@ fn our_gdn_prefill_runs_the_48_layers_and_agrees_with_the_vendored_one() {
     };
     let vocab = ModelConfig::qwen38_27b().vocab as usize;
     let mut logits = Vec::new();
-    // The vendored kernels by name, then the card's own route, ours on every card.
-    for (route, switch) in [("vendored", Some("vendored")), ("ours", None)] {
+    for route in ["vendored", "ours"] {
         // SAFETY: this binary holds this one test, which runs on one thread; nothing else reads
         // or writes the environment while it is set, and the leaf reads it inside the load below.
-        match switch {
-            Some(value) => unsafe { std::env::set_var(SWITCH, value) },
-            None => unsafe { std::env::remove_var(SWITCH) },
-        }
+        unsafe { std::env::set_var(SWITCH, route) };
         let model = load_qwen38_27b_with_decode_lanes(
             &reader,
             &artifact,
@@ -123,7 +117,7 @@ fn our_gdn_prefill_runs_the_48_layers_and_agrees_with_the_vendored_one() {
         )
         .unwrap_or_else(|e| panic!("{route}: model load: {e}"));
         // The review of spec #503: the leaf reports the route the load took.
-        assert_eq!(model.gdn_prefill().as_str(), route, "the route the load reports, the switch {switch:?}");
+        assert_eq!(model.gdn_prefill().as_str(), route, "the route the load reports");
         let pool = SeqPool::create(
             &ModelConfig::qwen38_27b(),
             &SeqPoolBudget {

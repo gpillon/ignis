@@ -22,20 +22,15 @@ In a prototype on the RTX 5090 the dense route ran the body's prefill GEMMs abou
 - **Speed and quality.** On the RTX 5090 this attention runs about 2x faster than the FP16 band at 8K and 64K. Together with the dense route, its KLD stays within 1.03x of the FP16 band's.
 - **The option values.** `8bit` and `fp8` are two spellings of `--model-prefill-attention`'s 8-bit band: on Blackwell it is today's FP8 band, which reports as `fp8`; on 8.x it is the new band, which reports as `int8`. `int8` names the new band on every card, and on Blackwell it runs only when named.
 
-**The GDN prefill** runs on our own kernels in those forms (#514), on 8.x and on Blackwell.
+**The GDN prefill on 8.x** runs on our own kernels in those forms (#514).
 - A small prepare per 32-token chunk solves the chunk's triangular system on the CUDA cores in fp32. One recurrence keeps each head's state in registers and writes the output itself, so no chunk's state goes through memory.
 - Its products are f16 MMAs with an f16 accumulator over spans of 32 products, each span folded into fp32, the operand rows on power-of-two scales that keep a span below 2^15. Against an fp64 recurrence its rows are closer than the vendored kernels' (0.93 against 2.6 bf16 roundings RMS, measured on the RTX 5090 on the leaf test's synthetic inputs).
-- It has no option: it is the route on every card. Blackwell took it by #514's rule, which replaced the vendored chunked kernels there only if the RTX 5090 measured ours faster with its KLD holding. It did, on Blackwell's default routes (the fused prefill, the FP8 band) and with one binary for both legs:
-  - the GDN prefill kernels alone ran 2.4 to 2.6 times faster;
-  - the time to first token on the 16 GB trellis entry went from 2,309 to 2,210 ms at 8K and from 19,520 to 18,773 ms at 64K, and a second alternated round of ten agreed; on the NVFP4 entry from 770 to 738 ms and from 6,787 to 6,543 ms;
-  - the full-vocabulary KLD against BF16 went from 0.04034 to 0.04049 on the trellis entry (ratio 1.0036, interval 0.9926 to 1.0167) and from 0.05221 to 0.05124 on the NVFP4 entry (ratio 0.9816, interval 0.9392 to 1.0167), with top-1 within 0.02 points.
-
-  `IGNIS_GDN_PREFILL=vendored|ours` is the switch for such a measurement, not a setting.
+- It has no option: on 8.x it is the route. Blackwell keeps the vendored chunked kernels unless the RTX 5090 measures ours faster with its KLD holding. `IGNIS_GDN_PREFILL=ours|vendored` is the switch for that measurement, not a setting.
 
 **What stays.**
 - The fused route stays the route on sm_120. On 8.x it is one option away, `--model-prefill-linear fp16`, as the FP16 band is with `--model-prefill-attention fp16`.
 - Only a field left to its default takes the card's own route; a profile's value, `fp16` included, is kept where the card runs it. A value the card or the build cannot run falls back when it comes from a default or a profile, and is refused, naming the option, when the operator names it (#456). The build's own answer, `prefill_route_built`, is one predicate per route, so a build that does not carry a route yet refuses it by name instead of running the other.
-- `--model-prefill-linear int8|fp16` (`model.prefill_linear`) chooses the route and `GET /v1/config` reports it, as it reports the band, with the card as its source when the card decided. On 8.x the dense prefill, the integer band and the GDN prefill below are the default since #515, after the RTX 5090's KLD legs (#513, #514) passed; the sm_86 gate (#516) confirms them on the card before 0.10.0. Blackwell's trellis prefill and band defaults do not move; its GDN prefill moved by the measurement above.
+- `--model-prefill-linear int8|fp16` (`model.prefill_linear`) chooses the route and `GET /v1/config` reports it, as it reports the band, with the card as its source when the card decided. On 8.x the dense prefill, the integer band and the GDN prefill below are the default since #515, after the RTX 5090's KLD legs (#513, #514) passed; the sm_86 gate (#516) confirms them on the card before 0.10.0. Blackwell's defaults do not move.
 - One `86` cubin serves 8.6 and 8.9. A dedicated `89` path (spec C) hangs on `arch::GpuGeneration`.
 
 ## Considered options

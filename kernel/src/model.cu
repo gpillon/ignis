@@ -1076,9 +1076,8 @@ struct LoadOptions {
 
 // GitHub #514: the GDN prefill on our full-rate kernels (kernel/src/gdn_prefill.h)
 // or on the vendored chunked ones, decided once per load: the card's generation
-// decides (ours on 8.x and on Blackwell, `ignis::gdn_prefill::runs_by_default`)
-// unless the measurement switch IGNIS_GDN_PREFILL names a route
-// (`ignis::gdn_prefill::route_for_load`);
+// decides (ours on 8.x, the vendored kernels on Blackwell) unless the measurement
+// switch IGNIS_GDN_PREFILL names a route (`ignis::gdn_prefill::route_for_load`);
 // any other value is refused by name. False (error set) on a refusal or when the
 // device cannot say its generation.
 bool gdn_prefill_route(bool &ours) {

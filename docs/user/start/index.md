@@ -57,8 +57,7 @@ You can add models of your own with an
   - *The prefill on an RTX 30 or RTX 40 card.* Unset, the 27B reads a prompt
     through the **dense prefill** (each trellis matrix decoded once per chunk
     and multiplied on the integer MMA), the **integer band** of the prompt
-    attention (INT8 scores) and ignis's own gated delta net prefill kernels,
-    which every card runs.
+    attention (INT8 scores) and ignis's own gated delta net prefill kernels.
     `--model-prefill-linear fp16` and `--model-prefill-attention fp16` name
     the fused prefill and the FP16 band instead
     ([Context and speculation](../configuration/context-and-speculation.md)).

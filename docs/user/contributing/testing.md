@@ -57,15 +57,16 @@ the other. They are no configuration fields: `GET /v1/config` and
 `config print` do not show them, and an operator has no reason to set one.
 
 - `IGNIS_GDN_PREFILL=ours|vendored` picks the 27B's gated delta net prefill at
-  each model load, on any card: ignis's own full-rate kernels, which every
-  card runs unset, or the vendored chunked kernels they replaced, which run
-  only when named
-  ([ADR 0080](../../adr/0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md)).
-  Any other value refuses the load, naming the variable. The load logs the
-  route it runs, under `ignis.runtime.prefill_routes`, with the trellis
-  prefill and the prompt attention band beside it, and its VRAM plan is
-  sized for that route. The sm_86 gate's quality leg ([Releases](releases.md))
-  names `ours` beside the other two routes, as its limits were measured.
+  each model load, on any card: ignis's own full-rate kernels, which an RTX 30
+  or RTX 40 card runs, or the vendored chunked kernels an RTX 50 or RTX PRO
+  card runs ([ADR 0080](../../adr/0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md)).
+  Unset, the card's generation decides. Any other value refuses the load,
+  naming the variable. The load logs the route it runs, under
+  `ignis.runtime.prefill_routes`, with the trellis prefill and the prompt
+  attention band beside it, and its VRAM plan is sized for that route. The
+  sm_86 gate's quality leg ([Releases](releases.md)) sets it to `ours`, since
+  the `span_logits` example it runs reads the variables rather than the
+  card.
 
 ## The speech executor's CPU legs
 
