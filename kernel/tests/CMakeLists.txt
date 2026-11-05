@@ -202,7 +202,9 @@ add_test(NAME ignis_kernel_gdn_input_proj_tests COMMAND ignis_kernel_gdn_input_p
 # and Qwen3.6-35B geometries. Since GitHub #478 it carries a portability patch
 # (ADR 0077): on a card that cannot hold a cooperative schedule resident (fewer
 # SMs than the RTX 5090, or an sm_86 build's fewer CTAs per SM) it skips, and
-# names in a SKIP line, each one the planner's residency query refuses there;
+# names in a SKIP line, each one the planner's residency query refuses there,
+# and holds a projection case the planner then runs on the unsplit route to
+# that route's own error criterion;
 # it prints each cooperative kernel's CTAs per SM and, on compute capability
 # 12.0, fails if one is not the value the planner was tuned on, or on the 5090
 # if it skips any. The wrapper itself is
