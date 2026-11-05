@@ -274,7 +274,9 @@ pub const NONE_PROFILE: &str = "none";
 /// that the free memory it finds cannot hold (ADR 0063 §3); the closing runs
 /// on an RTX 3090 and an RTX 4090 confirm the context (spec #474). The 27B
 /// also keeps [`RTX_24GB_RETAINED_DEVICE_SLOTS`] retained slots on the device
-/// (GitHub #508), written in the text below by that constant's name. No other
+/// (GitHub #508), written in the text below by that constant's name; with
+/// them the same load keeps 17,946 pages (1,148,544 tokens), 99,968 past the
+/// context (~0.92 GB). No other
 /// card ships a profile; a config file's `profiles:` defines one for any
 /// other card.
 const BUILT_IN: &str = r#"{
@@ -446,11 +448,12 @@ pub fn canonical(name: &str) -> &str {
 /// lane's state and its hq-e8-2b residual window, ~232 MB at the profile's
 /// shape, and the KV pool pays for it: the profile's context is capped by the
 /// 27B's attention envelope, not by memory, and #474's 24 GiB load left 150,464
-/// tokens (~1.39 GB) of pool past it, of which two slots take ~0.47 GB, about
-/// 50,000 tokens (derived). The value holds only while the 16 GB entry still
-/// loads under that 24 GiB budget at 1,048,576 tokens and 8 lanes with nothing
-/// adapted; were the context to drop, it is 1. The 16 GB profiles keep none:
-/// their context is set by memory.
+/// tokens (~1.39 GB) of pool past it. Measured on the RTX 5090 (2026-11-05,
+/// `trellis_16g_gpu`'s 24 GiB test, #474's flags): with two slots the 16 GB
+/// entry still loads at 1,048,576 tokens on 8 lanes with nothing adapted, the
+/// slots a 393,760,768-byte line, the pool 17,946 pages (1,148,544 tokens),
+/// 99,968 past the context. Were the context to drop, the value is 1. The
+/// 16 GB profiles keep none: their context is set by memory.
 pub const RTX_24GB_RETAINED_DEVICE_SLOTS: u32 = 2;
 
 /// Every built-in profile, by name: [`BUILT_IN`], its constants' names

@@ -212,7 +212,8 @@ Why each:
 - **A million tokens of context.** Measured as the 16 GB numbers were: the
   16 GB entry on the RTX 5090 held to a 24 GiB budget, with the FP16 prompt
   band a card below compute capability 12.0 runs. 1,048,576 tokens load with
-  nothing adapted, on eight lanes, with a KV pool of 1,199,040 tokens. The
+  nothing adapted, on eight lanes, with a KV pool of 1,148,544 tokens beside
+  the two device retained slots (1,199,040 without them). The
   cap is the 27B's compressed-KV attention envelope, as on `rtxpro6000`, not
   the memory; `auto` rope scaling makes the 27B YaRN at 4. No request that
   long was run.
@@ -224,9 +225,10 @@ Why each:
   context is capped by the attention envelope, and the pool had about 1.4 GB
   past it. The 16 GB profiles keep none, since their context is set by
   memory.
-- **The pool past the context**, about 1.4 GB less what the device slots
-  take, is room for what a real card's desktop holds; past that the load
-  adapts ([when a profile does not fit](#when-a-profile-does-not-fit)).
+- **The pool past the context**, 99,968 tokens or about 0.9 GB once the
+  device slots have theirs, is room for what a real card's desktop holds;
+  past that the load adapts
+  ([when a profile does not fit](#when-a-profile-does-not-fit)).
 
 ## When a profile does not fit
 

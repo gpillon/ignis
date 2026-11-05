@@ -511,7 +511,10 @@ async fn the_profiles_own_default_load_has_host_vision_and_the_text_only_kv_pool
 /// card below compute capability 12.0 runs, the profile's own values), keeps
 /// #474's 1,048,576 tokens on 8 lanes with nothing adapted now that the
 /// profile keeps the 27B's device retained slots. The plan names them, and
-/// their line is a lane's state each, beside the 16 host slots.
+/// their line is a lane's state each, beside the 16 host slots. On the 5090
+/// (2026-11-05) two slots made a 393,760,768-byte line and left a KV pool of
+/// 17,946 pages (1,148,544 tokens), 99,968 past the context, #474's 18,735
+/// less 789.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn rtx_24gb_keeps_its_context_and_lanes_in_24_gib_with_its_device_retained_slots() {
