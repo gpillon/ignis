@@ -108,8 +108,8 @@ pub(crate) mod ffi {
         pub mtp_expert_slots: *const IgnisMoeSlot,
         /// GitHub #335: the 27B's prompt attention band pass,
         /// [`crate::prefill_attention::PrefillAttention::abi_code`]: 0 = 8-bit,
-        /// 1 = FP16 accumulate, 2 = the integer band (which the leaf refuses
-        /// until it carries it). Flash-Next's attention is QSA and takes 0.
+        /// 1 = FP16 accumulate, 2 = the integer band. Flash-Next's attention
+        /// is QSA and takes 0.
         pub prefill_attention: u32,
         /// GitHub #414 (ADR 0075): where the vision tower lives,
         /// [`crate::vision::VisionResidency::abi_code`]: 0 = the device, 1 =

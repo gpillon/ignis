@@ -10,6 +10,11 @@
 //! - from the chunk at 640 on, the keys between the sinks and the ring go
 //!   through the band, so the logits move -- the option reached the kernel --
 //!   and stay close: the two greedy readings agree almost everywhere.
+//!
+//! GitHub #510 (spec #503): the same prompt under the integer band (`int8`,
+//! which a card of any generation runs, named). It rounds the window's keys to
+//! 8 bits too, so its logits move from the first chunk on, stay finite, and
+//! agree with the FP16 band's greedy reading almost everywhere.
 
 #![cfg(feature = "cuda")]
 
@@ -61,12 +66,13 @@ fn argmax(row: &[u16]) -> usize {
     best
 }
 
-#[test]
-#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
-fn the_fp16_prefill_attention_moves_only_the_band() {
+/// The prompt, and its span logits prefilled under each of `precisions`, in
+/// 128-token chunks; `None` when the profile lets a missing artifact or GPU
+/// skip.
+fn prefill_under(precisions: &[PrefillAttention]) -> Option<(Vec<i32>, Vec<Vec<u16>>)> {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
-        return;
+        return None;
     }
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
@@ -81,7 +87,7 @@ fn the_fp16_prefill_attention_moves_only_the_band() {
         .into_iter()
         .map(|id| i32::try_from(id).expect("token id fits i32"))
         .collect();
-    let prompt = &prompt[..prompt.len().min(MAX_CONTEXT as usize - 1)];
+    let prompt = prompt[..prompt.len().min(MAX_CONTEXT as usize - 1)].to_vec();
     assert!(prompt.len() >= FIRST_BAND_CHUNK_START + 2 * CHUNK as usize, "{} tokens", prompt.len());
 
     let (plan, handles) = bind_text_scope_27b(&reader).unwrap_or_else(|e| panic!("bind: {e}"));
@@ -89,7 +95,7 @@ fn the_fp16_prefill_attention_moves_only_the_band() {
         Ok(device) => device,
         Err(e) => {
             if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
-                return;
+                return None;
             }
             unreachable!();
         }
@@ -98,14 +104,14 @@ fn the_fp16_prefill_attention_moves_only_the_band() {
         Ok(artifact) => artifact,
         Err(e) => {
             if gpu_profile::skip_or_fail(&format!("materialize: {e}")) {
-                return;
+                return None;
             }
             unreachable!("skip_or_fail panics under the profile");
         }
     };
     let vocab = ModelConfig::qwen38_27b().vocab as usize;
     let mut logits = Vec::new();
-    for precision in [PrefillAttention::Fp8, PrefillAttention::Fp16] {
+    for &precision in precisions {
         let model = load_qwen38_27b_with_prefill_attention(
             &reader,
             &artifact,
@@ -122,12 +128,21 @@ fn the_fp16_prefill_attention_moves_only_the_band() {
         let pool = new_pool();
         let mut sequence = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("{precision}: alloc: {e}"));
         let mut span = vec![0u16; prompt.len() * vocab];
-        prefill_program_span_logits(&model, &pool, &mut sequence, prompt, 0, &mut span)
+        prefill_program_span_logits(&model, &pool, &mut sequence, &prompt, 0, &mut span)
             .unwrap_or_else(|e| panic!("{precision}: prefill: {e}"));
         logits.push(span);
     }
     artifact.release_arena(&mut device).expect("release");
+    Some((prompt, logits))
+}
 
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn the_fp16_prefill_attention_moves_only_the_band() {
+    let Some((prompt, logits)) = prefill_under(&[PrefillAttention::Fp8, PrefillAttention::Fp16]) else {
+        return;
+    };
+    let vocab = ModelConfig::qwen38_27b().vocab as usize;
     let (fp8, fp16) = (&logits[0], &logits[1]);
     let window = FIRST_BAND_CHUNK_START * vocab;
     let window_differing = fp8[..window].iter().zip(&fp16[..window]).filter(|(a, b)| a != b).count();
@@ -150,5 +165,36 @@ fn the_fp16_prefill_attention_moves_only_the_band() {
         prompt.len(),
         prompt.len().div_ceil(CHUNK as usize),
         band_rows * vocab
+    );
+}
+
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn the_integer_band_prefills_and_agrees_with_the_fp16_band() {
+    let Some((prompt, logits)) = prefill_under(&[PrefillAttention::Int8, PrefillAttention::Fp16]) else {
+        return;
+    };
+    let vocab = ModelConfig::qwen38_27b().vocab as usize;
+    let (int8, fp16) = (&logits[0], &logits[1]);
+    let nonfinite = int8.iter().filter(|&&bits| !bf16(bits).is_finite()).count();
+    assert_eq!(nonfinite, 0, "the integer band's logits hold {nonfinite} non-finite values");
+    let window = FIRST_BAND_CHUNK_START * vocab;
+    let window_differing = int8[..window].iter().zip(&fp16[..window]).filter(|(a, b)| a != b).count();
+    assert!(window_differing > 0, "the window-only chunks match the FP16 band's: the integer band did not run there");
+    let agreeing = (0..prompt.len())
+        .filter(|&p| argmax(&int8[p * vocab..(p + 1) * vocab]) == argmax(&fp16[p * vocab..(p + 1) * vocab]))
+        .count();
+    let agreement = agreeing as f64 / prompt.len() as f64;
+    assert!(
+        agreement >= ARGMAX_AGREEMENT_FLOOR,
+        "the integer and FP16 bands agree on the argmax at {agreeing} of {} positions",
+        prompt.len()
+    );
+    println!(
+        "integer band: {} prompt tokens in {} chunks; {window_differing} of {window} window logits moved, argmax \
+         agreed with the FP16 band at {agreeing} of {}",
+        prompt.len(),
+        prompt.len().div_ceil(CHUNK as usize),
+        prompt.len()
     );
 }

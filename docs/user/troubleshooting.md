@@ -47,13 +47,13 @@ switch to it is refused the same way and the loaded model keeps serving. Load
 the 27B from its trellis artifact (`--model-id qwen3.8-27b-16g`), and unset
 `IGNIS_FN_MOE_STAGED`.
 
-On the same card `--model-prefill-attention fp8` (or `8bit`, or `int8`) and
-`--model-prefill-linear int8`, named by a flag, the environment, a config
-file or a `PATCH`, are refused naming that spelling, since this build carries
-neither the integer band nor the dense prefill yet, and so is
-`--model-exception-weights fp8`. Unset, the 27B's prompt attention runs the
-FP16 band there, its trellis prefill the fused one, and its exception tensors
-stay BF16.
+On the same card `--model-prefill-linear int8`, named by a flag, the
+environment, a config file or a `PATCH`, is refused naming that spelling,
+since this build does not carry the dense prefill yet, and so is
+`--model-exception-weights fp8`. A named `--model-prefill-attention fp8` (or
+`8bit`, or `int8`) runs the integer band there, which is opt-in for now.
+Unset, the 27B's prompt attention runs the FP16 band there, its trellis
+prefill the fused one, and its exception tensors stay BF16.
 
 ### A start under `--profile auto` is refused, naming `--profile`
 
