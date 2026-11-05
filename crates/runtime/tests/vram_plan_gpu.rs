@@ -285,12 +285,15 @@ fn the_vision_encoder_workspace_is_the_prefill_scratch_not_beside_it() {
         "workspace: text at a 2,048-token chunk {}, bounded vision at 2,048 {} and at 4,096 {}",
         wide_text.workspace, wide_bounded.workspace, widest_bounded.workspace
     );
-    // ~399 KB per chunk token: 12,128,000 B short of the bounded encoder at 2,048, 669,716,736 B
-    // past it at 4,096 (the same arena the rtx5090 profile plans at 917,504 tokens).
-    assert_eq!(wide_text.workspace, 870_055_680 + text_room);
+    // 26,832,384 B short of the bounded encoder at 2,048, 585,830,656 B past it at 4,096 (the same
+    // arena the rtx5090 profile plans at 917,504 tokens). Since the review of spec #503 the GDN
+    // layer's prefill holds no conv plane (its conv writes q, k and v split, GitHub #507): at 2,048
+    // the GQA layer is the larger, 14,704,384 B under the 870,055,680 the plan held before, and at
+    // 4,096 the GDN layer is still, 83,886,080 B (the plane, 10,240 x 4,096 BF16) under 1,578,309,632.
+    assert_eq!(wide_text.workspace, 855_351_296 + text_room);
     assert!(wide_text.workspace < bounded.workspace, "at 2,048 the bounded encoder is still the larger");
     assert_eq!(wide_bounded.workspace, bounded.workspace, "with vision on, the 2,048 chunk is free");
-    assert_eq!(widest_bounded.workspace, 1_578_309_632, "at 4,096 the text scratch is the larger");
+    assert_eq!(widest_bounded.workspace, 1_494_423_552, "at 4,096 the text scratch is the larger");
 
     // GitHub #341: held in FP8, the exception tensors' prefill quantizes its
     // activations into the call's workspace (a code per input and a scale per
@@ -305,9 +308,10 @@ fn the_vision_encoder_workspace_is_the_prefill_scratch_not_beside_it() {
         fp8_text.workspace as i64 - wide_text.workspace as i64,
         fp8_bounded.workspace
     );
-    // 5,513,216 B more: a 2,048-token exception call's E4M3 codes and scales (12,591,104 B at
-    // K = 6,144), less the room the layer's scratch already had at that step.
-    assert_eq!(fp8_text.workspace, 875_568_896 + text_room);
+    // 10,108,928 B more: a 2,048-token exception call's E4M3 codes and scales (12,591,104 B at
+    // K = 6,144), less the room the layer's scratch already had at that step (5,513,216 B more
+    // while the GDN layer's conv plane was reserved, before the review of spec #503).
+    assert_eq!(fp8_text.workspace, 865_460_224 + text_room);
     assert_eq!(fp8_bounded.workspace, bounded.workspace, "with vision on, still the encoder's arena");
 
     // A short context caps the envelope, and with it the item, below the
