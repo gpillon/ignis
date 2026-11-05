@@ -66,3 +66,4 @@ is defined once in [`GLOSSARY.md`](../../../GLOSSARY.md); the
    findings, the guide, commits.
 5. [Cutting a release](releases.md): version, changelog, tag, and what the
    workflows publish.
+6. [Working in a fork](forks.md): what to send upstream, and how.

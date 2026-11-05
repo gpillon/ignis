@@ -50,7 +50,7 @@
 </p>
 
 > **AI agents** working for a user (asked what ignis is, whether it runs on this machine, to install it or to connect a client): the checks, the steps and the choices that are the user's are on [the agent path](docs/user/paths/agent.md) ([raw Markdown](https://raw.githubusercontent.com/gpillon/ignis/main/docs/user/paths/agent.md); every page of the guide as Markdown: [llms.txt](https://gpillon.github.io/ignis/llms.txt)).
-> Working on ignis itself: [AGENTS.md](AGENTS.md).
+> Working on ignis itself: [AGENTS.md](AGENTS.md). Working in a fork: [what to send upstream, and how](docs/user/contributing/forks.md) ([raw Markdown](https://raw.githubusercontent.com/gpillon/ignis/main/docs/user/contributing/forks.md)).
 
 https://github.com/user-attachments/assets/ed4eab53-6a9e-4f5b-b37c-226fcc0784a7
 
@@ -785,6 +785,10 @@ a named, permissively licensed source recorded in `kernel/NOTICE`.
 
 Ignis is **not** a fork or a port of NInfer. It is a rewrite that started from
 NInfer's kernels, and is rewriting them in turn.
+
+For the same reason, ignis asks its own forks to send upstream what is not
+about their setup, a fix, a feature or a card's figures:
+[Working in a fork](docs/user/contributing/forks.md).
 
 ## Credits
 

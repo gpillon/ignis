@@ -3,6 +3,8 @@
 This file is for agents working **on** ignis: its code, its guide, its issues.
 An agent here for a user of ignis (to explain it, install it, or connect a
 client to it) wants [the agent path](docs/user/paths/agent.md) instead.
+An agent working in a fork of ignis reads
+[Working in a fork](docs/user/contributing/forks.md) first: what goes upstream.
 
 ## Agent skills
 

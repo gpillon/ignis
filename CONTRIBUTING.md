@@ -8,6 +8,8 @@ discipline, make, and how work is tracked.
 
 In short:
 
+- Working in a fork: send upstream what is not about your setup, a fix, a
+  feature or a card's figures ([Working in a fork](docs/user/contributing/forks.md)).
 - Report a bug or ask for a feature in a [GitHub issue](https://github.com/gpillon/ignis/issues):
   the command you ran (or `make config`'s output), what you expected, what
   happened, and the server's log lines around it.
