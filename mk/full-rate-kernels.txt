@@ -31,6 +31,8 @@
 cuda     dense_prefill_decode_kernel      kernel/src/dense_prefill.cu
 cuda     dense_prefill_a8_kernel          kernel/src/dense_prefill.cu
 cuda     dense_prefill_a8_wide_kernel     kernel/src/dense_prefill.cu
+cuda     dense_prefill_rmsnorm_a8_kernel  kernel/src/dense_prefill.cu   # #511: the A8 quantisation fused into its producer (RMSNorm), CUDA cores
+cuda     dense_prefill_a8_blocks_kernel   kernel/src/dense_prefill.cu   # #511: the A8 quantisation fused into the block producer, CUDA cores
 mma      dense_prefill_gemm_kernel        kernel/src/dense_prefill.cu
 
 # The integer band (#510): the attention kernel is integer MMA, the V
@@ -41,6 +43,10 @@ cuda     tile_vt_group_kernel             kernel/src/hq_prompt_int8.cu
 # The split conv of the GDN prefill (#507): CUDA cores.
 cuda     gdn_split_conv_kernel            kernel/src/gdn_conv_split.cu
 cuda     gdn_split_conv_state_kernel      kernel/src/gdn_conv_split.cu
+
+# The 27B's own GDN prefill on 8.x (#514).
+cuda     gdn_prefill_prepare_kernel       kernel/src/gdn_prefill.cu     # #514: the chunk preparation, CUDA cores
+cuda     gdn_prefill_recurrence_kernel    kernel/src/gdn_prefill.cu     # #514: HMMA with an f16 accumulator only (reported); no integer MMA required, it is neither a GEMM nor a band kernel
 
 # The kernels of the prompt prefill that predate the rule and stay as they are
 # (#488, parked): each leaves the list when #488 converts it.
