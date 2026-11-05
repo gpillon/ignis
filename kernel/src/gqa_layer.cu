@@ -71,6 +71,26 @@ void input_projection(ignis_model &model, const GqaLayerWeights &weights, const 
                                ignis_policy_for(weights.query_key_gate_value.qtype, mode), arena, stream);
 }
 
+// The layer's input RMSNorm of `input` into `normalized`, then the input
+// projection above. GitHub #511: on the dense prefill the norm writes the
+// three matrices' INT8 input instead (kernel/src/trellis_body.h,
+// fused_producers), and `normalized`, which nothing past the projection
+// reads, is not written.
+void norm_and_input_projection(ignis_model &model, const GqaLayerWeights &weights, const ninfer::Tensor &input,
+                               const ninfer::Tensor &input_norm, ninfer::Tensor &normalized, ninfer::Tensor &query,
+                               ninfer::Tensor &gate, ninfer::Tensor &key, ninfer::Tensor &value, std::int32_t heads,
+                               std::int32_t head_dim, ninfer::DeviceArena &arena, LinearPolicyMode mode,
+                               cudaStream_t stream) {
+  if (model.is_trellis_body && ignis::trellis_body::fused_producers(model, input.ne[1])) {
+    const GqaTrellisWeights &t = weights.trellis;
+    ignis::trellis_body::norm_attention_projection(model, input, input_norm, t.q_proj, t.k_proj, t.v_proj, heads,
+                                                   head_dim, query, gate, key, value, stream);
+    return;
+  }
+  ninfer::ops::rmsnorm(input, input_norm, model.rms_norm_eps, /*unit_offset=*/true, normalized, stream);
+  input_projection(model, weights, normalized, query, gate, key, value, heads, head_dim, arena, mode, stream);
+}
+
 // GitHub #339: the output projection's residual add and the MLP tail on the
 // body the load bound (see `input_projection`).
 void output_and_mlp(ignis_model &model, const GqaLayerWeights &weights, const ninfer::Tensor &attention,
@@ -146,10 +166,9 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     const ninfer::Tensor input(in_residual, ninfer::DType::BF16, {hidden, tokens, 1, 1});
     const ninfer::Tensor input_norm =
         weight_tensor(weights.input_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
-    ninfer::ops::rmsnorm(input, input_norm, model->rms_norm_eps, /*unit_offset=*/true,
-                         normalized, stream);
 
-    // P2-03 (GitHub #85): the reference's own activation-quantization policy
+    // The input RMSNorm, then the projection (GitHub #511: one fused pass on
+    // the dense prefill). P2-03 (GitHub #85): the reference's own activation-quantization policy
     // under the call's mode (ADR 0016): AllowA4 on the NVFP4 projection when
     // the mode is the engine default -- the W4A4 (MMA/TMA) route is then the
     // vendored dispatch's own decision per its token thresholds, not ours --
@@ -157,8 +176,8 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     // from the model's scratch (reserved at load for the widest policy,
     // P2-01, GitHub #83), so a chunk's A4 route needs nothing new. GitHub
     // #339: the trellis body's three matrices instead.
-    input_projection(*model, weights, normalized, query, gate, key, value, kQHeads, kHeadDim, *model->scratch,
-                     mode, stream);
+    norm_and_input_projection(*model, weights, input, input_norm, normalized, query, gate, key, value, kQHeads,
+                              kHeadDim, *model->scratch, mode, stream);
 
     // The future full prefill/decode step supplies the same offset to every
     // GQA layer for a token, so positions advance per token, never per layer.

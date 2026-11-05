@@ -62,10 +62,62 @@ void dense_linear(const ignis_model &model, const ignis_trellis_weight *const *w
         "dense prefill");
 }
 
+// GitHub #511: the norm the dense prefill fuses A8 into, a BF16 [hidden] weight.
+void require_norm(const ignis_model &model, const ninfer::Tensor &norm, const ninfer::Tensor &x) {
+  if (norm.dtype != ninfer::DType::BF16 || norm.ne[0] != x.ne[0] || norm.data == nullptr) {
+    throw std::invalid_argument("dense prefill: the RMSnorm's weight is not BF16 [" + std::to_string(x.ne[0]) + "]");
+  }
+  if (model.trellis_dense_buffer == nullptr) {
+    throw std::runtime_error("dense prefill: the load reserved no dense buffer");
+  }
+}
+
+// GitHub #511: dense_linear with the A8 of `count` matrices fused into the
+// RMSnorm of `x` by `norm`, the normalized row written to `h` when non-null.
+void norm_linear(const ignis_model &model, const ignis_trellis_weight *const *w, uint32_t count,
+                 const ninfer::Tensor &x, const ninfer::Tensor &norm, void *h, const ignis_dense_prefill_output *out,
+                 cudaStream_t stream) {
+  for (uint32_t i = 0; i < count; ++i) {
+    require_activation(x, w[i]->in, "dense prefill");
+  }
+  require_norm(model, norm, x);
+  check(ignis_dense_prefill_norm_linear(w, count, x.data, norm.data, model.rms_norm_eps,
+                                        static_cast<uint32_t>(x.ne[1]), h, out, &model.trellis_workspace,
+                                        model.trellis_dense_buffer->p, model.trellis_dense_buffer->bytes, stream),
+        "dense prefill");
+}
+
+// The GQA layer's three outputs on the dense prefill: the query and the gate
+// split from `q_proj` by the epilogue (column c of head h lands in the query
+// at h head_dim + c, or past head_dim in the gate), the key and the value
+// straight into theirs.
+struct AttentionOutputs {
+  ignis_dense_prefill_output o[3];
+};
+
+AttentionOutputs attention_outputs(const ignis_trellis_weight &q_proj, int32_t tokens, int32_t heads,
+                                   int32_t head_dim, ninfer::Tensor &query, ninfer::Tensor &gate, ninfer::Tensor &key,
+                                   ninfer::Tensor &value) {
+  const std::int32_t width = heads * head_dim;
+  if (q_proj.out != static_cast<uint32_t>(2 * width) || query.ne[0] != width || gate.ne[0] != width ||
+      query.ne[1] != tokens || gate.ne[1] != tokens) {
+    throw std::invalid_argument("trellis query/gate: q_proj is not " + std::to_string(heads) + " heads of 2 x " +
+                                std::to_string(head_dim) + " rows for this call's query and gate");
+  }
+  return AttentionOutputs{{ignis_dense_prefill_output{query.data, static_cast<uint32_t>(width), IGNIS_TRELLIS_STORE,
+                                                      static_cast<uint32_t>(head_dim), 0, gate.data},
+                           dense_output(key.data, static_cast<uint32_t>(key.ne[0]), IGNIS_TRELLIS_STORE),
+                           dense_output(value.data, static_cast<uint32_t>(value.ne[0]), IGNIS_TRELLIS_STORE)}};
+}
+
 }  // namespace
 
 bool dense_prefill(const ignis_model &model, int32_t tokens) {
   return model.prefill_linear == IGNIS_PREFILL_LINEAR_DENSE && tokens > IGNIS_TRELLIS_DECODE_MAX_TOKENS;
+}
+
+bool fused_producers(const ignis_model &model, int32_t tokens) {
+  return dense_prefill(model, tokens) && ignis_dense_prefill_fused_producers() != 0;
 }
 
 void linear(const ignis_model &model, const ignis_trellis_weight &w, const ninfer::Tensor &x, void *y,
@@ -160,22 +212,32 @@ void attention_projection(const ignis_model &model, const ignis_trellis_weight &
     fused_linear(model, v_proj, x, value.data, static_cast<uint32_t>(value.ne[0]), IGNIS_TRELLIS_STORE, stream);
     return;
   }
-  const std::int32_t width = heads * head_dim;
-  const std::int32_t tokens = x.ne[1];
-  if (q_proj.out != static_cast<uint32_t>(2 * width) || query.ne[0] != width || gate.ne[0] != width ||
-      query.ne[1] != tokens || gate.ne[1] != tokens) {
-    throw std::invalid_argument("trellis query/gate: q_proj is not " + std::to_string(heads) + " heads of 2 x " +
-                                std::to_string(head_dim) + " rows for this call's query and gate");
-  }
-  // The split's halves straight from the epilogue: column c of head h lands
-  // in the query at h head_dim + c, or past head_dim in the gate.
+  const AttentionOutputs out = attention_outputs(q_proj, x.ne[1], heads, head_dim, query, gate, key, value);
   const ignis_trellis_weight *ws[3] = {&q_proj, &k_proj, &v_proj};
-  const ignis_dense_prefill_output out[3] = {
-      ignis_dense_prefill_output{query.data, static_cast<uint32_t>(width), IGNIS_TRELLIS_STORE,
-                                 static_cast<uint32_t>(head_dim), 0, gate.data},
-      dense_output(key.data, static_cast<uint32_t>(key.ne[0]), IGNIS_TRELLIS_STORE),
-      dense_output(value.data, static_cast<uint32_t>(value.ne[0]), IGNIS_TRELLIS_STORE)};
-  dense_linear(model, ws, 3, x, out, stream);
+  dense_linear(model, ws, 3, x, out.o, stream);
+}
+
+void norm_gdn_projection(const ignis_model &model, const ninfer::Tensor &x, const ninfer::Tensor &norm,
+                         ninfer::Tensor &h, const ignis_trellis_weight &in_proj_qkv,
+                         const ignis_trellis_weight &in_proj_z, void *qkv, uint32_t ldqkv, void *z, uint32_t ldz,
+                         cudaStream_t stream) {
+  if (h.dtype != ninfer::DType::BF16 || h.ne[0] != x.ne[0] || h.ne[1] != x.ne[1] || !h.is_contiguous()) {
+    throw std::invalid_argument("dense prefill: the normalized row is not a BF16 [hidden, T] matrix");
+  }
+  const ignis_trellis_weight *ws[2] = {&in_proj_qkv, &in_proj_z};
+  const ignis_dense_prefill_output out[2] = {dense_output(qkv, ldqkv, IGNIS_TRELLIS_STORE),
+                                             dense_output(z, ldz, IGNIS_TRELLIS_STORE)};
+  norm_linear(model, ws, 2, x, norm, h.data, out, stream);
+}
+
+void norm_attention_projection(const ignis_model &model, const ninfer::Tensor &x, const ninfer::Tensor &norm,
+                               const ignis_trellis_weight &q_proj, const ignis_trellis_weight &k_proj,
+                               const ignis_trellis_weight &v_proj, int32_t heads, int32_t head_dim,
+                               ninfer::Tensor &query, ninfer::Tensor &gate, ninfer::Tensor &key,
+                               ninfer::Tensor &value, cudaStream_t stream) {
+  const AttentionOutputs out = attention_outputs(q_proj, x.ne[1], heads, head_dim, query, gate, key, value);
+  const ignis_trellis_weight *ws[3] = {&q_proj, &k_proj, &v_proj};
+  norm_linear(model, ws, 3, x, norm, nullptr, out.o, stream);
 }
 
 std::int32_t mlp_width(const ignis_model &model, const TrellisTail &tail, const ninfer::Weight &gate_up) {
@@ -187,6 +249,23 @@ void output_and_mlp(const ignis_model &model, const TrellisTail &tail, const nin
                     ninfer::Tensor &fused, cudaStream_t stream) {
   const auto hidden = static_cast<uint32_t>(model.hidden);
   linear(model, tail.output, mixed, residual.data, hidden, IGNIS_TRELLIS_ADD, stream);
+  if (fused_producers(model, residual.ne[1])) {
+    // GitHub #511: the norm with gate and up's A8, gate's store and up's
+    // SwiGLU pass into `fused` keeping down's block maxima, down's second A8
+    // pass and its add into the residual (`post` unwritten).
+    require_activation(residual, tail.gate_proj.in, "dense prefill");
+    require_norm(model, post_norm, residual);
+    if (fused.dtype != ninfer::DType::BF16 || fused.ne[0] != static_cast<std::int32_t>(tail.gate_proj.out) ||
+        fused.ne[1] != residual.ne[1] || !fused.is_contiguous()) {
+      throw std::invalid_argument("dense prefill: the SwiGLU's output is not a BF16 [ffn, T] matrix");
+    }
+    check(ignis_dense_prefill_norm_mlp(&tail.gate_proj, &tail.up_proj, &tail.down, residual.data, post_norm.data,
+                                       model.rms_norm_eps, static_cast<uint32_t>(residual.ne[1]), fused.data,
+                                       residual.data, hidden, &model.trellis_workspace, model.trellis_dense_buffer->p,
+                                       model.trellis_dense_buffer->bytes, stream),
+          "dense prefill");
+    return;
+  }
   ninfer::ops::rmsnorm(residual, post_norm, model.rms_norm_eps, /*unit_offset=*/true, post, stream);
   swiglu(model, tail.gate_proj, tail.up_proj, post, fused, stream);
   linear(model, tail.down, fused, residual.data, hidden, IGNIS_TRELLIS_ADD, stream);
