@@ -107,5 +107,5 @@ END {
   }
   for (i = 1; i <= nk; i++) if (kcount[i] == 0) { printf("FAIL: no %s kernel (%s) in the %s dump\n", klabel[i], kre[i], arch); fail = 1 }
   if (fail) { print "sass-check " arch ": FAIL"; exit 1 }
-  printf("sass-check %s: PASS (%d new kernels, integer MMA only)\n", arch, nfn)
+  printf("sass-check %s: PASS (%d new kernels, full-rate GeForce forms only: IMMA, and HMMA.F16 where noted)\n", arch, nfn)
 }'
