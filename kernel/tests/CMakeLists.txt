@@ -616,6 +616,15 @@ target_compile_definitions(ignis_kernel_hq_route_agreement_test PRIVATE
 target_link_libraries(ignis_kernel_hq_route_agreement_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_hq_route_agreement_test COMMAND ignis_kernel_hq_route_agreement_test)
 
+# GitHub #510 (spec #503): OURS -- the integer band (IgnisHqPromptPrecision::kInt8) against an fp64
+# attention over the rows it reads, within a bound built from each of its roundings, its output
+# and its carried state, at the 8K and 64K prefixes of a prompt prefilled at chunk 4096, on one
+# split, the band's split rule and a narrow band. It runs on compute capability 8.6 as on 12.0:
+# no sm120a-only label. No SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_hq_prompt_int8_test test_hq_prompt_int8.cu)
+target_link_libraries(ignis_kernel_hq_prompt_int8_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_hq_prompt_int8_test COMMAND ignis_kernel_hq_prompt_int8_test)
+
 # P4-10 (GitHub #126): OURS, not vendored -- device prefix reuse. It checks
 # the two halves ADR 0024 describes against the device itself: that a
 # claimant's block-table row addresses the *publisher's own physical pages*

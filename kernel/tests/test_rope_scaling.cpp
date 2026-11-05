@@ -264,9 +264,9 @@ int main() {
     }
   }
 
-  // --- 6. GitHub #335: the prefill attention precision, same gate ---------------
+  // --- 6. GitHub #335: the prefill attention precision (#510: the integer band, 2), same gate
   {
-    for (const uint32_t precision : {2u, 7u}) {
+    for (const uint32_t precision : {3u, 7u}) {
       ignis_model_load_options options = scaled(0.0F, 0.1F, 32.0F, 1.0F);
       options.prefill_attention = precision;
       const std::string m = load_error(options);
@@ -274,7 +274,8 @@ int main() {
             "precision " + std::to_string(precision) + " is refused by name: " + m);
     }
     for (const uint32_t precision : {static_cast<uint32_t>(IGNIS_PREFILL_ATTENTION_FP8),
-                                     static_cast<uint32_t>(IGNIS_PREFILL_ATTENTION_FP16)}) {
+                                     static_cast<uint32_t>(IGNIS_PREFILL_ATTENTION_FP16),
+                                     static_cast<uint32_t>(IGNIS_PREFILL_ATTENTION_INT8)}) {
       ignis_model_load_options options = scaled(0.0F, 0.1F, 32.0F, 1.0F);
       options.prefill_attention = precision;
       const std::string m = load_error(options);
