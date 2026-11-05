@@ -272,7 +272,11 @@ pub const NONE_PROFILE: &str = "none";
 /// pool's 150,464 tokens past the context (~1.39 GB) are what a real card's
 /// desktop may take before the load adapts, as it adapts every value here
 /// that the free memory it finds cannot hold (ADR 0063 §3); the closing runs
-/// on an RTX 3090 and an RTX 4090 confirm the context (spec #474). No other
+/// on an RTX 3090 and an RTX 4090 confirm the context (spec #474). The 27B
+/// also keeps [`RTX_24GB_RETAINED_DEVICE_SLOTS`] retained slots on the device
+/// (GitHub #508), written in the text below by that constant's name; with
+/// them the same load keeps 17,946 pages (1,148,544 tokens), 99,968 past the
+/// context (~0.92 GB). No other
 /// card ships a profile; a config file's `profiles:` defines one for any
 /// other card.
 const BUILT_IN: &str = r#"{
@@ -322,6 +326,9 @@ const BUILT_IN: &str = r#"{
         },
         "model": {
             "qwen38": { "max_context": 1048576, "prefill_chunk": 2048 }
+        },
+        "reuse": {
+            "qwen38": { "retained_device": RTX_24GB_RETAINED_DEVICE_SLOTS }
         },
         "vision": { "enabled": true, "residency": "host" },
         "spec": {
@@ -435,9 +442,25 @@ pub fn canonical(name: &str) -> &str {
     }
 }
 
-/// Every built-in profile, by name.
+/// The device retained slots `rtx-24gb` gives the 27B (GitHub #508, spec
+/// #503): its prompt checkpoints and prefix images are then copied device to
+/// device, off the PCIe path a host slot's capture and claim take. A slot is a
+/// lane's state and its hq-e8-2b residual window, ~232 MB at the profile's
+/// shape, and the KV pool pays for it: the profile's context is capped by the
+/// 27B's attention envelope, not by memory, and #474's 24 GiB load left 150,464
+/// tokens (~1.39 GB) of pool past it. Measured on the RTX 5090 (2026-11-05,
+/// `trellis_16g_gpu`'s 24 GiB test, #474's flags): with two slots the 16 GB
+/// entry still loads at 1,048,576 tokens on 8 lanes with nothing adapted, the
+/// slots a 393,760,768-byte line, the pool 17,946 pages (1,148,544 tokens),
+/// 99,968 past the context. Were the context to drop, the value is 1. The
+/// 16 GB profiles keep none: their context is set by memory.
+pub const RTX_24GB_RETAINED_DEVICE_SLOTS: u32 = 2;
+
+/// Every built-in profile, by name: [`BUILT_IN`], its constants' names
+/// replaced by their values.
 pub fn built_in() -> BTreeMap<String, Layer> {
-    let value = serde_json::from_str(&format!(r#"{{"profiles": {BUILT_IN}}}"#)).expect("the built-in profiles are JSON");
+    let profiles = BUILT_IN.replace("RTX_24GB_RETAINED_DEVICE_SLOTS", &RTX_24GB_RETAINED_DEVICE_SLOTS.to_string());
+    let value = serde_json::from_str(&format!(r#"{{"profiles": {profiles}}}"#)).expect("the built-in profiles are JSON");
     read_document(&value, "the built-in profiles").expect("the built-in profiles name only declared fields").profiles
 }
 
@@ -698,6 +721,15 @@ mod tests {
         assert_eq!(value("spec", "draft_tokens", Some(Qwen38_27b)).as_deref(), Some("7"));
         assert_eq!(value("vision", "enabled", None).as_deref(), Some("true"));
         assert_eq!(value("vision", "residency", None).as_deref(), Some("host"));
+        // GitHub #508: one or two device retained slots, the 27B's alone.
+        assert!((1..=2).contains(&RTX_24GB_RETAINED_DEVICE_SLOTS), "one or two slots (spec #503)");
+        assert_eq!(value("reuse", "retained_device", Some(Qwen38_27b)), Some(RTX_24GB_RETAINED_DEVICE_SLOTS.to_string()));
+        assert_eq!(value("reuse", "retained_device", None), None, "no general value");
+        for (name, layer) in &profiles {
+            if name != "rtx-24gb" {
+                assert!(layer.entries().all(|(meta, _, _)| meta.group != "reuse"), "{name}: no reuse value");
+            }
+        }
         for (group, name) in [("vision", "max_tokens"), ("spec", "decode_lanes"), ("spec", "draft_head"), ("vram", "pinned_expert_bytes"), ("ngram", "hot_bytes"), ("model", "rope_scaling")] {
             assert_eq!(value(group, name, None), None, "{group}.{name}: left to its default");
             assert_eq!(value(group, name, Some(Qwen38_27b)), None, "{group}.{name}: the 27B's default");
