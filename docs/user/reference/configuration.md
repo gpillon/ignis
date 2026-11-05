@@ -260,11 +260,25 @@ The KV storage format: `hq-e8-2b` (the serving default) or `bf16` (the retained 
 | Env var | `IGNIS_MODEL_PREFILL_ATTENTION` |
 | Kind | `prefill attention` |
 | Default | `fp8` |
-| Rule | one of fp8, fp16 |
+| Rule | one of 8bit, fp8, fp16, int8 |
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The 27B's prompt attention precision (GitHub #335): `fp8` (the default, the band pass in 8 bits) or `fp16` (the FP16-accumulate fallback). Flash-Next's attention is QSA and has no such pass. On a card below compute capability 12.0 left to its default, or to a profile's `fp8`, it reads `fp16`, the band the load runs, its origin the card; a named `fp8` is refused (GitHub #477).
+The 27B's prompt attention band (GitHub #335): `fp8` or `8bit`, two spellings of the 8-bit band and the default, which is the block-scaled FP8 band on an RTX 50 or RTX PRO card (it reads `fp8`) and the integer band on an RTX 30 or RTX 40 card, below compute capability 12.0 (it reads `int8`, its origin the card unless named); `fp16`, the FP16-accumulate fallback, kept from every source, a profile's too; or `int8`, the integer band by name, which an RTX 50 or RTX PRO card runs only when named (spec #503, GitHub #477, #505, #510, #515). Flash-Next's attention is QSA and has no such pass.
+
+### `model.prefill_linear`
+
+| | |
+|---|---|
+| Flag | `--model-prefill-linear` |
+| Env var | `IGNIS_MODEL_PREFILL_LINEAR` |
+| Kind | `prefill linear` |
+| Default | `fp16` |
+| Rule | one of fp16, int8 |
+| Models | Qwen3.8-27B |
+| `/v1/config` | shown by `GET`, patchable, with a model reload |
+
+The 27B's trellis prefill route (spec #503, GitHub #505): `fp16` (the fused prefill, the trellis decoded inside the GEMM) or `int8` (the dense prefill, each matrix decoded once per chunk and multiplied on the integer MMA). Left unset it is `fp16` on an RTX 50 or RTX PRO card and `int8` on an RTX 30 or RTX 40 card, where it reads `int8` with the card as its origin (GitHub #515); a profile's or a named `fp16` keeps the fused prefill there. On a Blackwell card `int8` runs only when named, and the NVFP4 artifact refuses a named `int8`. A value the build cannot run falls back to `fp16` when it comes from a profile and is refused when named. Flash-Next has its own prefill.
 
 ### `model.exception_weights`
 
@@ -767,7 +781,7 @@ Cross-request state reuse. Off, no prompt checkpoint is captured or claimed, and
 | Per model | `--qwen38-reuse-retained-device`, `--qwen38flashnext-reuse-retained-device` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-Retained slots in VRAM, reserved in the VRAM plan and handed out first. Unset, 0. With prompt reuse off, a count shares heads between live siblings only.
+Retained slots in VRAM, reserved in the VRAM plan and handed out first, each a device-to-device copy per capture and per claim. Unset, 0, unless a profile gives some: `rtx-24gb` does, for the 27B. With prompt reuse off a profile's count is not reserved, and a named one shares heads between live siblings only.
 
 ### `reuse.retained_host`
 

@@ -69,6 +69,81 @@ printf '\177ELF\0\0 ignis.model.mock_compute \0built without --features cuda —
 : > "$dir/empty"
 mkdir "$dir/a-directory"
 
+
+# The full-rate rule reads the sm_86 SASS of a binary that carries 8.6, which
+# cuobjdump prints. The selftest has no CUDA toolkit, so IGNIS_CUOBJDUMP names a
+# stand-in that prints the text file $FAKE_SASS (with no file it fails);
+# the dumps are text, written here in the form cuobjdump -sass prints:
+# a header, then per function its mangled name and its instructions.
+cat > "$dir/cuobjdump" <<'FAKE'
+#!/usr/bin/env bash
+# A dump named <FAKE_SASS>.<the binary's file name> stands for that binary alone.
+f=${FAKE_SASS-}.$(basename "${@: -1}")
+[ -f "$f" ] && FAKE_SASS=$f
+[ -n "${FAKE_SASS-}" ] && [ -f "$FAKE_SASS" ] || exit 1
+cat "$FAKE_SASS"
+FAKE
+chmod +x "$dir/cuobjdump"
+export IGNIS_CUOBJDUMP="$dir/cuobjdump"
+# function <mangled name> <opcode>...: one function with one instruction per
+# opcode, as cuobjdump -sass prints them.
+function_sass() {
+    local name=$1 op at=16
+    shift
+    printf '\t\tFunction : %s\n\t.headerflags\t@"EF_CUDA_SM86 EF_CUDA_VIRTUAL_SM(EF_CUDA_SM86)"\n' "$name"
+    printf '        /*0000*/                   MOV R1, c[0x0][0x28] ;                 /* 0x00000a0000017a02 */\n'
+    printf '                                                                          /* 0x000fc40000000f00 */\n'
+    for op in "$@"; do
+        printf '        /*%04x*/                   %s R8, R4, R12, R8 ;     /* 0x0000000000000000 */\n' "$at" "$op"
+        printf '                                                                          /* 0x000fe20000000000 */\n'
+        at=$((at + 16))
+    done
+    printf '        /*%04x*/                   EXIT ;                                 /* 0x000000000000794d */\n' "$at"
+    printf '\t\t.........................\n\n\n'
+}
+# A plain function (`_Z`, parameters after its name) and a template in an
+# anonymous namespace (`_ZN`, template arguments after its name).
+plain() { function_sass "_Z${#1}$1PKvi" "${@:2}"; }
+templ() { function_sass "_ZN12_GLOBAL__N_1${#1}$1ILi128ELb1EEvv" "${@:2}"; }
+list_file="$(dirname "$0")/full-rate-kernels.txt"
+# The mma and cuda kernels of a list file, and one kernel's role in it.
+covered_kernels() { sed -e 's/#.*//' "$1" | awk '$1 == "mma" || $1 == "cuda" { print $2 }'; }
+role_of() { sed -e 's/#.*//' "$1" | awk -v k="$2" '$2 == k { print $1 }'; }
+# A dump in which every kernel of the list is as the rule wants it, and the
+# kernels of #488 and the control are as they are in the build. `$swap` names
+# one kernel whose opcodes are `$swap_ops` instead (none when empty), `$drop`
+# one the dump leaves out, `$more` text appended.
+good_dump() {
+    printf 'Fatbin elf code:\n================\narch = sm_86\ncode version = [1,7]\nhost = linux\ncompile_size = 64bit\n\n\tcode for sm_86\n'
+    local name role rest
+    # The covered kernels come from the list itself, so a kernel joining it
+    # needs no edit here; #488's exempt kernels and the control are explicit.
+    for name in $(covered_kernels "${list:-$list_file}")         fa_int8_kernel nvfp4_a16_mma_kernel output_kernel fa_kernel not_in_the_list_kernel; do
+        [ "${drop-}" = "$name" ] && continue
+        local ops
+        case $name in
+            fa_int8_kernel) ops="IMMA.16832.S8.S8 IMMA.16832.U8.S8" ;;
+            # A cuda kernel whose source uses HMMA with an f16 accumulator:
+            # the "reported, allowed" path.
+            gdn_prefill_recurrence_kernel) ops="HMMA.16816.F16" ;;
+            # #488's drafter, and the chunked delta rule, are BF16 and TF32.
+            nvfp4_a16_mma_kernel) ops="HMMA.16816.F32.BF16" ;;
+            output_kernel) ops="HMMA.1688.F32.TF32" ;;
+            # The control: the window's BF16 form accumulates in f32.
+            fa_kernel) ops="HMMA.16816.F32.BF16 IMMA.16832.S8.S8" ;;
+            # Not in the list: no rule of this check.
+            not_in_the_list_kernel) ops="HMMA.16816.F32.BF16" ;;
+            *) ops=""; [ "$(role_of "${list:-$list_file}" "$name")" = mma ] && ops="IMMA.16832.S8.S8 IMMA.16832.S8.S8" ;;
+        esac
+        [ "${swap-}" = "$name" ] && ops=$swap_ops
+        case $name in
+            fa_int8_kernel | fa_kernel) templ "$name" $ops ;;
+            *) plain "$name" $ops ;;
+        esac
+    done
+    printf '%s' "${more-}"
+}
+
 # expect <exit status> <IGNIS_CUDA_ARCHITECTURES, - for unset> <name> <argument>...
 expect() {
     local want=$1 list=$2 name=$3 got
@@ -87,6 +162,8 @@ expect() {
     fi
 }
 
+good_dump > "$dir/good.sass"
+export FAKE_SASS="$dir/good.sass"
 # What a release asks for: machine code for 8.6 and for 12.0.
 expect 0 '86;120a' "a build with machine code for both passes" "$dir/both"
 expect 1 '86;120a' "a build missing the 8.6 machine code is refused" "$dir/no-86"
@@ -119,5 +196,121 @@ expect 1 - "a missing binary is refused" "$dir/missing"
 expect 1 - "an empty binary is refused" "$dir/empty"
 expect 1 - "a directory is refused, not read as a pass" "$dir/a-directory"
 expect 2 - "no argument is a usage error"
+
+
+# ---------------------------------------------------------------------------
+# The full-rate rule (#503, #512), on the SASS a binary with 8.6 machine code
+# dumps. `both` carries 8.6, so every case above ran it against `good`.
+dump() { good_dump > "$dir/$1.sass"; }
+
+# says <exit status> <regex of what the check prints, stdout and stderr> <name> <argument>...
+# Run with IGNIS_CUDA_ARCHITECTURES=86;120a and `$FAKE_SASS` set.
+says() {
+    local want=$1 pattern=$2 name=$3 got output
+    shift 3
+    output=$(IGNIS_CUDA_ARCHITECTURES='86;120a' bash "$check" "$@" 2>&1)
+    got=$?
+    if [ "$got" = "$want" ] && grep -qE -- "$pattern" <<< "$output"; then
+        printf 'ok    %s\n' "$name"
+    else
+        printf 'FAIL  %s: expected exit %s and /%s/, got exit %s:\n%s\n' "$name" "$want" "$pattern" "$got" "$output"
+        failed=1
+    fi
+}
+# rule <exit status> <regex> <name>: the dump $dir/$FAKE_SASS against the list.
+rule() {
+    FAKE_SASS="$dir/case.sass" says "$1" "$2" "$3" "$dir/both"
+}
+
+# A passing build: every covered kernel as the rule wants it, the exceptions
+# and the control as they are in the build, a kernel outside the list that
+# breaks the rule without being refused.
+good_dump > "$dir/case.sass"
+rule 0 'sm_86 mma fa_int8_kernel: IMMA' "a passing build is read and its kernels reported"
+rule 0 'sm_86 exempt nvfp4_a16_mma_kernel: HMMA.16816.F32.BF16' "#488's drafter keeps its BF16 form and is reported"
+rule 0 'sm_86 exempt output_kernel: HMMA.1688.F32.TF32' "#488's chunked delta rule keeps its TF32 form"
+rule 0 'sm_86 control fa_kernel' "the negative control is read in a passing build"
+
+# A forbidden form in a covered kernel is refused, and the refusal names the
+# kernel and the opcode.
+forbid() { # forbid <kernel> <opcodes> <opcode named>
+    swap=$1 swap_ops=$2 good_dump > "$dir/case.sass"
+    rule 1 "kernel $1 \(.*\) holds $3," "$1 holding $3 is refused, kernel and opcode named"
+}
+forbid dense_prefill_gemm_kernel "IMMA.16832.S8.S8 HMMA.16816.F32" "HMMA.16816.F32"
+forbid dense_prefill_gemm_kernel "IMMA.16832.S8.S8 HMMA.16816.F32.BF16" "HMMA.16816.F32.BF16"
+forbid dense_prefill_gemm_kernel "IMMA.16832.S8.S8 HMMA.1688.F32.TF32" "HMMA.1688.F32.TF32"
+forbid dense_prefill_gemm_kernel "IMMA.16832.S8.S8 QMMA.16832.F32.E4M3.E4M3" "QMMA.16832.F32.E4M3.E4M3"
+forbid dense_prefill_gemm_kernel "IMMA.16832.S8.S8 QMMA.16864.F32.E2M1.E2M1" "QMMA.16864.F32.E2M1.E2M1"
+forbid fa_int8_kernel "IMMA.16832.S8.S8 HGMMA.64x64x16.F32" "HGMMA.64x64x16.F32"
+forbid dense_prefill_a8_kernel "UTCHMMA" "UTCHMMA"
+forbid gdn_split_conv_kernel "HMMA.16816.F32" "HMMA.16816.F32"
+forbid fa_int8_kernel "IMMA.16832.S8.S8 BMMA.88128.POPC" "BMMA.88128.POPC"
+# An f16 accumulate is allowed, and said.
+swap=fa_int8_kernel swap_ops="IMMA.16832.S8.S8 HMMA.16816" good_dump > "$dir/case.sass"
+rule 0 'fa_int8_kernel holds HMMA.16816 \(f16 accumulate, allowed\)' "HMMA with an f16 accumulate is allowed and reported"
+# Each instantiation of a template is held to the rule.
+more=$(function_sass "_ZN12_GLOBAL__N_114fa_int8_kernelILi64ELb0EEvv" HMMA.16816.F32) good_dump > "$dir/case.sass"
+rule 1 'kernel fa_int8_kernel \(_ZN12_GLOBAL__N_114fa_int8_kernelILi64ELb0EEvv\) holds HMMA.16816.F32' "every instantiation of a covered template is held to the rule"
+
+# The dump follows the list: a kernel joining it is one more kernel in the
+# passing build, with no edit of this script.
+{ cat "$list_file"; printf 'cuda  brand_new_kernel  kernel/src/new.cu
+mma   brand_new_gemm_kernel
+'; } > "$dir/extended.list"
+list="$dir/extended.list" good_dump > "$dir/case.sass"
+FAKE_SASS="$dir/case.sass" IGNIS_FULL_RATE_LIST="$dir/extended.list" says 0 'sm_86 mma brand_new_gemm_kernel: IMMA' "a list with an extra covered kernel still gives a passing build" "$dir/both"
+
+# A GEMM or band kernel holds integer MMA; a CUDA-core kernel needs none.
+swap=dense_prefill_gemm_kernel swap_ops="" good_dump > "$dir/case.sass"
+rule 1 'kernel dense_prefill_gemm_kernel .* holds no integer MMA' "a GEMM kernel with no MMA at all is refused"
+swap=fa_int8_kernel swap_ops="HMMA.16816" good_dump > "$dir/case.sass"
+rule 1 'kernel fa_int8_kernel .* holds no integer MMA' "a band kernel holding only f16 MMA is refused"
+swap=dense_prefill_decode_kernel swap_ops="IMMA.16832.S8.S8" good_dump > "$dir/case.sass"
+rule 0 'sm_86 cuda dense_prefill_decode_kernel: IMMA' "a CUDA-core kernel may hold integer MMA"
+
+# A listed kernel the binaries do not carry is refused: a rename must not skip
+# the rule. The names are read from the list, so one more line is one more kernel.
+drop=dense_prefill_gemm_kernel good_dump > "$dir/case.sass"
+rule 1 'kernel dense_prefill_gemm_kernel, which .*full-rate-kernels.txt .*none of the binaries' "a covered kernel missing from the build is refused"
+drop=nvfp4_a16_mma_kernel good_dump > "$dir/case.sass"
+rule 0 'sm_86 cuda' "an exempt kernel missing from the build is not refused"
+# The binaries are read together: one that links part of the leaf is not
+# refused for the kernels another carries.
+cp "$dir/both" "$dir/other"
+drop=dense_prefill_gemm_kernel good_dump > "$dir/case.sass.both"
+good_dump > "$dir/case.sass.other"
+FAKE_SASS="$dir/case.sass" says 0 'CUDA build' "two binaries carrying the list between them pass" "$dir/both" "$dir/other"
+FAKE_SASS="$dir/case.sass" says 1 'dense_prefill_gemm_kernel, which' "a kernel in none of them is refused" "$dir/both" "$dir/both"
+rm "$dir/case.sass.both" "$dir/case.sass.other"
+
+# The negative control: the existing window kernel's f32-accumulate form. Held
+# to the rule it must be refused, which proves the check can fail; a dump in
+# which it shows no forbidden form is refused, since nothing could be.
+good_dump > "$dir/case.sass"
+printf 'mma fa_kernel\n' > "$dir/control.list"
+FAKE_SASS="$dir/case.sass" IGNIS_FULL_RATE_LIST="$dir/control.list" says 1 'kernel fa_kernel \(.*\) holds HMMA.16816.F32.BF16, which is not a full-rate form' "the window kernel's f32-accumulate form fails the rule (the negative control)" "$dir/both"
+swap=fa_kernel swap_ops="IMMA.16832.S8.S8" good_dump > "$dir/case.sass"
+rule 1 'negative control fa_kernel shows no forbidden MMA form' "a dump in which the negative control passes is refused"
+drop=fa_kernel good_dump > "$dir/case.sass"
+rule 1 'negative control fa_kernel shows no forbidden MMA form' "a dump without the negative control's kernel is refused"
+
+# The tool and the list.
+rm -f "$dir/case.sass"
+rule 1 'cuobjdump could not dump' "a cuobjdump that fails refuses the build"
+good_dump > "$dir/case.sass"
+FAKE_SASS="$dir/case.sass" IGNIS_CUOBJDUMP="$dir/no-such-cuobjdump" says 1 'could not dump' "a cuobjdump that is not there refuses the build" "$dir/both"
+# PATH without the directory that holds cuobjdump, on a machine that has one.
+clean=; IFS=: read -r -a path_dirs <<< "$PATH"
+for p in "${path_dirs[@]}"; do [ -e "$p/cuobjdump" ] || [ -e "$p/cuobjdump.exe" ] || clean+="$p:"; done
+FAKE_SASS="$dir/case.sass" IGNIS_CUOBJDUMP= PATH="$clean" CUDA_PATH= CUDA_HOME= says 1 'none is on PATH' "no cuobjdump anywhere refuses a build with 8.6" "$dir/both"
+printf 'gemm dense_prefill_gemm_kernel\n' > "$dir/bad.list"
+FAKE_SASS="$dir/case.sass" IGNIS_FULL_RATE_LIST="$dir/bad.list" says 1 'cannot read the line' "a list line with an unknown role refuses the build" "$dir/both"
+printf 'mma a_kernel\ncuda a_kernel\n' > "$dir/dup.list"
+FAKE_SASS="$dir/case.sass" IGNIS_FULL_RATE_LIST="$dir/dup.list" says 1 'cannot read the line' "a kernel listed twice refuses the build" "$dir/both"
+FAKE_SASS="$dir/case.sass" IGNIS_FULL_RATE_LIST="$dir/missing.list" says 1 'list of full-rate kernels is missing' "a missing list refuses the build" "$dir/both"
+# Only a binary with 8.6 machine code is held to the rule: the default list is
+# 12.0 alone, and needs no cuobjdump.
+IGNIS_CUDA_ARCHITECTURES=120a FAKE_SASS= IGNIS_CUOBJDUMP="$dir/no-such-cuobjdump" bash "$check" "$dir/no-86" > /dev/null 2>&1 && echo "ok    a build without 8.6 code does not run the rule" || { echo "FAIL  a build without 8.6 code does not run the rule"; failed=1; }
 
 exit "$failed"

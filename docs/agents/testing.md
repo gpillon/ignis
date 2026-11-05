@@ -33,7 +33,10 @@ until the test suite is green.
   the RTX 5090's 170 SMs: on a card that cannot hold one resident (fewer SMs,
   or an sm_86 build's fewer CTAs per SM) it skips each one the planner's own
   residency query refuses there and names it in a `SKIP` line of its output
-  (#478, a portability patch under ADR 0077). Its `budget` lines give each
+  (#478, a portability patch under ADR 0077). A projection case the planner
+  then runs on the unsplit route is held to that route's own error
+  criterion, derived in the test's comment, three times the split-K one. Its
+  `budget` lines give each
   cooperative kernel's CTAs per SM; on compute capability 12.0 it fails if
   one is not the value the planner was tuned on, and on the 5090 if it skips
   any schedule. The one kernel-adjacent thing
@@ -408,27 +411,37 @@ stops the release. Check `make gpu-status` first, as for any GPU run.
 1. **Quality**, by the method of
    `docs/findings/2026-11-03-first-light-on-sm86.md`: #340's gate 1 windows,
    16 of 4,096 tokens, dumped by the `span_logits` example at chunk 1024, KV
-   `hq-e8-2b` and `IGNIS_MODEL_PREFILL_ATTENTION=fp16` (the band a card below
-   12.0 runs), scored top-64 against the BF16 checkpoint (`kl_top64` in
+   `hq-e8-2b`, on the route an 8.x card runs unset (spec #503, #515): the dense
+   prefill, the integer band and ignis's own gated delta net prefill, named by
+   `IGNIS_MODEL_PREFILL_LINEAR=int8 IGNIS_MODEL_PREFILL_ATTENTION=int8
+   IGNIS_GDN_PREFILL=ours` (the example reads the variables, not the card's
+   default), scored top-64 against the BF16 checkpoint (`kl_top64` in
    `crates/bench/src/flash_next/kld.rs`). The reference is a set, about 90 MB,
    that holds the BF16 model's 64 most probable next tokens per position and
    the windows themselves. It stays out of the repo:
    `tools/kld-gate/ref_top64.py` builds it from the BF16 checkpoint on the
    RTX 5090 (`tools/kld-gate/README.md`), and the coordinator carries it to
-   the card. The RTX 5090's figures on the FP16 band, from that finding, are a
-   top-64 KLD of 0.03825 and a top-1 of 93.42%. Limits, on the `all` row of
-   the scorer's table: `KLD top64` at most 0.04016 (1.05 times), `top-1` at
-   least 92.92% (0.5 points under). A change
-   that alters the 5090's numerics records new 5090 FP16-band figures in a
-   finding first: the same dump on the 5090 under the same variable, scored
-   by the same command.
+   the card. The limits are derived from the RTX 5090 on the same route, the
+   same windows, chunk and reference set: the same dump there under the same
+   three variables, scored by the same command, gives a top-64 KLD of 0.03887
+   and a top-1 of 93.35% (the base 16 GB entry, spec #503's gate leg of #514).
+   Limits, on the `all` row of the scorer's table: `KLD top64` at most 0.04081
+   (1.05 times the 5090's), `top-1` at least 92.85% (0.5 points under the
+   5090's). A change that alters the 5090's
+   numerics on this route records new 5090 figures in a finding first, and the
+   limits follow them. (The limits of the FP16 band, 0.04016 and 92.92% from
+   the first-light finding's 5090 figures of 0.03825 and 93.42%, gated the
+   releases before 0.10.0; `IGNIS_MODEL_PREFILL_LINEAR=fp16
+   IGNIS_MODEL_PREFILL_ATTENTION=fp16` still runs that route, one option away
+   on the card, and is not the gate.)
 2. **The leaf's tests**: built for `86;120a`, then `ctest -LE sm120a-only`.
    Every test passes. In `ignis_kernel_gdn_gating_proj_tests` the `budget`
    lines and the `SKIP` lines that name the cooperative schedules the card
    cannot hold resident (#478) are expected; a failure is not.
 3. **Smoke**: a server started under `--profile auto` (on a 24 GB card,
-   `rtx-24gb`, which turns DFlash2 and vision on) answers a greedy chat
-   completion, a small image and a large image, each correctly: `Paris`, red,
+   `rtx-24gb`, which turns DFlash2 and vision on; its `GET /v1/config` reports
+   `prefill_linear` and `prefill_attention` as `int8`, the card their source)
+   answers a greedy chat completion, a small image and a large image, each correctly: `Paris`, red,
    blue. The small image is the smallest the processor accepts: it upscales
    every image to the 65,536-pixel floor, so 256 patches at the vision tower
    and 64 tokens after the merge; record that count, the request's
@@ -448,7 +461,8 @@ The commands, in order:
 # CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu.
 export IGNIS_CUDA_ARCHITECTURES='86;120a'
 ignis-server model download qwen3.8-27b-16g      # into ./models
-IGNIS_MODEL_PREFILL_ATTENTION=fp16 cargo run --release -p ignis-core --features cuda --example span_logits -- \
+IGNIS_MODEL_PREFILL_LINEAR=int8 IGNIS_MODEL_PREFILL_ATTENTION=int8 IGNIS_GDN_PREFILL=ours \
+    cargo run --release -p ignis-core --features cuda --example span_logits -- \
     models/qwen3_8_27b_trellis_sc30-v2.ninfer hq-e8-2b ref27b-top64/windows.json dump-sm86 1024
 python3 tools/kld-gate/score_top64.py ref27b-top64 dump-sm86 --json gate-sm86.json
 ```
@@ -484,10 +498,39 @@ done
 The release binary is also checked to carry code for 8.6 and 12.0, whatever
 list the build was given (`mk/cuda-build-check.sh --require`, in CI, #482).
 
+The same check holds the `86` cubin to the full-rate rule (spec #503, #512): an
+RTX 30 or RTX 40 card runs some tensor-core forms at half the rate of others, and
+a kernel the sm_8x prefill work added uses only the full-rate ones, INT8 and HMMA
+with an f16 accumulator. `mk/full-rate-kernels.txt` is the one place that lists
+the covered kernels and #488's exceptions. The check dumps the `sm_86` SASS with
+`cuobjdump` (the CUDA toolkit's, wherever nvcc is) and refuses a covered kernel
+that holds HMMA with an f32 accumulator, any BF16, TF32 or FP8/FP6/FP4 form, a
+warpgroup or tensor-memory MMA or a form it does not know, or that holds no
+integer MMA where the list asks for it; the refusal names the kernel and the
+opcode. It also refuses a listed kernel that no binary carries (a rename must
+not skip the rule) and a dump in which the negative control, the existing window
+kernel's f32-accumulate form, passes: a check that cannot fail is not a pass.
+
 The gate records correctness only: KLD, top-1, pass or fail per part, and the
 small image's patch count. Never a speed, never a detail of the machine. The
 same procedure, for contributors, is in
 `docs/user/contributing/releases.md`.
+
+### A new kernel and the full-rate rule
+
+A kernel added to the sm_8x path joins the list in the same commit, with one line
+in `mk/full-rate-kernels.txt`: its role (`mma` for a GEMM or band kernel, which
+must hold integer MMA, or `cuda` for a kernel that runs on the CUDA cores), its
+name without template arguments (every instantiation is held to the rule) and its
+source file. A test in `crates/server/tests/cuda_build_recipes.rs` fails when a
+file the list names declares a kernel it does not list, and when a listed kernel
+is not in its file. A kernel that predates the rule and stays as it is takes an
+`exempt` line whose comment names the issue that decided it, never a reason of
+its own; #488's kernels are the only ones. A form the rule refuses is fixed in the
+kernel, not excused in the list. The selftest (`make cuda-build-check-selftest`)
+runs the whole rule on SASS text and needs no GPU or CUDA toolkit, and its passing dump follows the list, so a new line needs no selftest edit; to run the
+check by hand on a build, `IGNIS_CUDA_ARCHITECTURES='86;120a' bash
+mk/cuda-build-check.sh --require '86;120a' <binary>...`.
 
 ## Done means
 

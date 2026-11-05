@@ -108,8 +108,12 @@ for the RTX 5090's 170 SMs, so on a card that cannot hold one resident it
 skips each one the planner's own residency query refuses and names it on its
 output (`SKIP` lines); it prints each cooperative kernel's CTAs per SM
 (`budget` lines) and fails on compute capability 12.0 if one is not the
-planner's former constant; on the 5090 it runs every case as before, names
-none, and fails if it skips one. A portability patch changes no
+planner's former constant; a projection case the planner moves to the unsplit
+route is held to that route's own criterion, three times the split-K one,
+since its single fp32 accumulator carries the tensor core's truncation over
+all of K (the test's comment derives it); on the 5090 it runs every case as
+before, against the same criteria, names none, and fails if it skips one. A
+portability patch changes no
 behaviour where the reference runs, so it adds no row to the table below. A
 file that cannot build for an older architecture is not patched: ten compile,
 verbatim, for the arch-specific Blackwell targets alone (`ignis_vendor_sm120a`
@@ -314,7 +318,14 @@ P1-14 (GitHub #50) adds the GDN family:
   `ops/launcher/causal_conv1d.{h,cu}`, `ops/wrapper/causal_conv1d_silu.cpp`,
   `ninfer/ops/causal_conv1d_silu.h`: the depthwise causal width-4 conv fused
   with SiLU over the conv'd channels, plus its rolling-tap and B-way snapshot
-  forms.
+  forms. GitHub #507 (spec #503, ADR 0031 option (b)): the GDN prefill body's
+  call left it for `kernel/src/gdn_conv_split.cu`, an adapted op of its
+  prefill pair form that writes the query, key and value planes split, so the
+  three strided copies that split this op's single plane are gone. The files
+  stay here unpatched: the decode round's body still runs the snapshot form,
+  and the plain op is the oracle the adapted one is held to
+  bit for bit (`kernel/tests/test_gdn_conv_split.cu`) and the test-only
+  pre-#507 body (`kernel/src/layer_internal.h`).
 - **gdn_gating** — `ops/kernel/gdn_gating.cuh`, `ops/launcher/gdn_gating.{h,cu}`,
   `ops/wrapper/gdn_gating.cpp`, `ninfer/ops/gdn_gating.h`: the per-head decay
   gate `g = -exp(A_log)*softplus(a+dt_bias)` and update gate

@@ -34,6 +34,14 @@
 //! profile's own default, so the tests above load the profile as it ships,
 //! vision on, and the text-only load is asked for with `--vision-enabled false`.
 //!
+//! GitHub #508 (spec #503) loads `rtx-24gb` inside the 24 GiB budget spec #474
+//! measured the 24 GB class in, with the device retained slots the profile now
+//! keeps for the 27B: its context and lanes stay #474's, nothing adapted, and
+//! the plan carries the slots on their own line. Since the review of spec #503
+//! it loads on the routes an 8.x card runs unset (the dense prefill, the
+//! integer band, our GDN prefill), named so the 5090 runs them, as does a
+//! 16 GB load less 1 GiB, which keeps the profile's context.
+//!
 //! Its own test binary: the request log is written on the engine's telemetry
 //! task, so the capture is the process's global subscriber. The two budget
 //! cases read only the load's own lines, logged on the loading thread, so
@@ -499,4 +507,136 @@ async fn the_profiles_own_default_load_has_host_vision_and_the_text_only_kv_pool
     assert_eq!(shipped["weights_bytes"], text["weights_bytes"], "the tower is staged, not resident");
     assert_eq!(shipped["workspace_bytes"].as_u64(), Some(WORKSPACE_BYTES), "the workspace line, readout included");
     assert_eq!(shipped["kv_pool_pages"], text["kv_pool_pages"], "vision on costs no context with no image in flight");
+}
+
+/// The prefill routes an 8.x card runs unset, named so the RTX 5090 runs them
+/// (spec #503, GitHub #515): the dense prefill and the integer band.
+const ROUTES_8X: [&str; 4] = ["--model-prefill-linear", "int8", "--model-prefill-attention", "int8"];
+/// The dense prefill's one buffer on the 27B, the INT8 copy of its largest
+/// matrix, 5120 x 17408 (GitHub #509).
+const TRELLIS_DENSE_BYTES: u64 = 89_128_960;
+
+/// The GDN prefill's measurement switch set to `ours`, the route an 8.x card
+/// runs, for the loads of one test (`kernel/src/gdn_prefill.h`: the leaf reads
+/// the process environment at each load, and sizes its plan for the route).
+/// Removed on drop, a failing test's too. The GPU profile runs this binary's
+/// tests one at a time (`--test-threads=1`), so no other load reads it.
+struct OurGdnPrefill;
+
+impl OurGdnPrefill {
+    fn set() -> Self {
+        // SAFETY: the tests of this binary run one at a time under the GPU
+        // profile, and nothing else reads or writes the environment while
+        // one holds the switch.
+        unsafe { std::env::set_var("IGNIS_GDN_PREFILL", "ours") };
+        OurGdnPrefill
+    }
+}
+
+impl Drop for OurGdnPrefill {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`.
+        unsafe { std::env::remove_var("IGNIS_GDN_PREFILL") };
+    }
+}
+
+/// The load logged the routes an 8.x card runs (`ignis.runtime.prefill_routes`)
+/// and planned the dense prefill's buffer on its own line.
+fn assert_the_8x_routes(events: &[serde_json::Value], lines: &serde_json::Value) {
+    let routes = named(events, "ignis.runtime.prefill_routes");
+    assert_eq!(routes.len(), 1, "{events:?}");
+    let routes = &routes[0]["attributes"];
+    assert_eq!((&routes["prefill_linear"], &routes["prefill_attention"], &routes["gdn_prefill"]), (&"int8".into(), &"int8".into(), &"ours".into()), "{routes}");
+    assert_eq!(lines["trellis_dense_bytes"].as_u64(), Some(TRELLIS_DENSE_BYTES), "the dense buffer's line");
+}
+
+/// The review of spec #503: a 16 GB card of 8.x less 1 GiB of desktop, on the
+/// routes it runs unset (the dense prefill, the integer band and our GDN
+/// prefill), still loads the profile's 262,144 tokens on two lanes with
+/// nothing adapted: the dense buffer's line costs KV pool, not context. The
+/// pool against the fused load's is printed, the figure the profiles page
+/// quotes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn the_8x_routes_keep_262144_tokens_on_two_lanes_less_1_gib() {
+    let _switch = OurGdnPrefill::set();
+    let Some((model, events)) = load_16g_with(BUDGET_LESS_1_GIB, &ROUTES_8X) else { return };
+    let plan = named(&events, "ignis.runtime.vram_plan");
+    assert_eq!(plan.len(), 1, "{events:?}");
+    println!("vram_plan: {}", plan[0]);
+    let lines = &plan[0]["attributes"];
+    assert_the_8x_routes(&events, lines);
+    assert_eq!(lines["adapted"], "", "the profile's shape fits less 1 GiB on the 8.x routes");
+    let pool = lines["kv_pool_tokens"].as_u64().unwrap();
+    let fused = POOL_TOKENS - 1_820 * 64;
+    println!(
+        "kv pool: {pool} tokens on the 8.x routes, {fused} on the fused prefill and the FP8 band: {} fewer; workspace {} (fused {})",
+        fused.saturating_sub(pool),
+        lines["workspace_bytes"],
+        WORKSPACE_BYTES
+    );
+    assert!(pool >= 262_144 + SPARE_TOKENS, "one sequence and the spare reservation: {pool}");
+    let load = named(&events, "ignis.model.loaded");
+    assert_eq!(load[0]["attributes"]["decode_lanes"], 2);
+    assert_eq!(load[0]["attributes"]["max_context"], 262_144);
+    tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
+}
+
+/// GitHub #508 (spec #503): `rtx-24gb` on the 16 GB entry, inside the 24 GiB
+/// budget #474 measured the 24 GB class in, on the routes an 8.x card runs
+/// unset (the dense prefill, the integer band and our GDN prefill, named so the
+/// 5090 runs them; the review of spec #503) and the profile's own values, keeps
+/// #474's 1,048,576 tokens on 8 lanes with nothing adapted now that the profile
+/// keeps the 27B's device retained slots and the dense buffer has its line. The
+/// plan names the slots, and their line is a lane's state each, beside the 16
+/// host slots. On the 5090 (2026-11-05), under the FP16 band and the fused
+/// prefill, two slots made a 393,760,768-byte line and left a KV pool of 17,946
+/// pages (1,148,544 tokens), 99,968 past the context, #474's 18,735 less 789.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn rtx_24gb_keeps_its_context_and_lanes_in_24_gib_with_its_device_retained_slots() {
+    if !Path::new(TRELLIS).exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {TRELLIS}")) {
+        return;
+    }
+    let _switch = OurGdnPrefill::set();
+    let slots = ignis_server::config::profile::RTX_24GB_RETAINED_DEVICE_SLOTS;
+    let flags = [
+        &["--profile", "rtx-24gb", "--vram-budget-bytes", "25769803776", "--model-idle-unload", "0", "--model-loop-guard", "off"][..],
+        &ROUTES_8X[..],
+    ]
+    .concat();
+    let options = ignis_server::config::Config { model: MODEL.to_owned(), model_named: true, ..the_27b(&flags) };
+    assert_eq!(options.retained_device_slots, slots, "the profile's device slots");
+    let (loaded, events) = captured(|| {
+        ignis_server::load::prepare_model(&options, Path::new(TRELLIS)).and_then(ignis_server::load::load_model)
+    });
+    let model = match loaded {
+        Ok(loaded) => loaded.model,
+        Err(e) => {
+            gpu_profile::skip_or_fail(&format!("load the 16 GB artifact under rtx-24gb in 24 GiB: {e}"));
+            return;
+        }
+    };
+    let plan = named(&events, "ignis.runtime.vram_plan");
+    assert_eq!(plan.len(), 1, "{events:?}");
+    println!("vram_plan: {}", plan[0]);
+    let lines = &plan[0]["attributes"];
+    assert_eq!(lines["budget_bytes"], 25_769_803_776u64);
+    assert_the_8x_routes(&events, lines);
+    assert_eq!(lines["adapted"], "", "the profile's shape fits 24 GiB as asked");
+    assert_eq!(lines["retained_device_slots"], slots, "the plan names the device slots");
+    assert_eq!(lines["retained_host_slots"], 16, "and the host ones, two a lane, as before");
+    let lane_state = lines["lane_state_bytes"].as_u64().unwrap();
+    assert_eq!(
+        lines["retained_slots_bytes"].as_u64().unwrap() * 8,
+        u64::from(slots) * lane_state,
+        "a lane's state per device slot, on its own line"
+    );
+    let pool = lines["kv_pool_tokens"].as_u64().unwrap();
+    println!("kv pool: {pool} tokens, {} past the context", pool.saturating_sub(1_048_576));
+    let load = named(&events, "ignis.model.loaded");
+    println!("model.loaded: {}", load[0]);
+    assert_eq!(load[0]["attributes"]["decode_lanes"], 8);
+    assert_eq!(load[0]["attributes"]["max_context"], 1_048_576, "#474's context");
+    tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
 }

@@ -571,9 +571,17 @@ bool dflash2_matches_load(const ignis_model *model, const ignis_seq_pool *pool, 
 // or all of it when it is shorter. Anything earlier would be overwritten in
 // the ring before the span ends, so it is never tapped or projected -- which
 // is what bounds the drafter's TTFT cost by the window, not by the prompt.
-std::uint64_t dflash2_tap_from(std::uint64_t span_start, std::uint64_t num_tokens) {
-  return span_start + num_tokens -
-         std::min<std::uint64_t>(num_tokens, kIgnisDflash2WindowTokens);
+//
+// GitHub #506: and never below the caller's drafter floor
+// (`ignis_prefill_options::drafter_floor`), the first position a later window
+// reads. A span whose positions no retained image and no decode reads through
+// the window taps nothing at all, so the drafter's cost is bounded by where
+// the window is read, not by how many jobs the prompt was cut into.
+std::uint64_t dflash2_tap_from(std::uint64_t span_start, std::uint64_t num_tokens,
+                               std::uint64_t drafter_floor) {
+  return std::max<std::uint64_t>(
+      span_start + num_tokens - std::min<std::uint64_t>(num_tokens, kIgnisDflash2WindowTokens),
+      drafter_floor);
 }
 
 void copy_i32_to_device(ninfer::Tensor &dst, const std::int32_t *src, std::size_t count,
@@ -1158,18 +1166,24 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       }
     }
 
+    // GitHub #507: a GDN layer runs in place on `left` (its body consumes its
+    // input residual and adds into it, no copy of it); a GQA layer writes
+    // `right` and the two swap. The test-only switch back to the pre-#507
+    // prefill (kernel/src/layer_internal.h) swaps after every layer.
+    const bool gdn_in_place = !ignis_gdn_layer_layout_copies();
     uint64_t dispatches = 0;
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
       profiler.record_layer_begin(layer, model->stream);
       const bool reads_attention =
           attention_readout != nullptr && model->layers[layer].kind == IGNIS_LAYER_GQA &&
           readout_armed[ignis_gqa_relative_layer(layer)];
+      const bool in_place = gdn_in_place && model->layers[layer].kind != IGNIS_LAYER_GQA;
       const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
           ? ignis_gqa_layer_run_body(
                 model, pool, seq, layer, left.data, right.data, num_tokens, mode, rope_positions,
                 reads_attention ? &readout_targets[ignis_gqa_relative_layer(layer)] : nullptr)
-          : ignis_gdn_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens,
-                                     mode);
+          : ignis_gdn_layer_run_body(model, pool, seq, layer, left.data,
+                                     in_place ? left.data : right.data, num_tokens, mode);
       if (rc != 0) {
         const char *detail = model->layers[layer].kind == IGNIS_LAYER_GQA
             ? ignis_gqa_layer_last_error()
@@ -1181,7 +1195,9 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
         return -1;
       }
       profiler.record_layer_end(layer, model->stream);
-      std::swap(left, right);
+      if (!in_place) {
+        std::swap(left, right);
+      }
       ++dispatches;
       if (tap_count > 0) {
         // `left` is this layer's output now. Tap j occupies rows
@@ -1210,8 +1226,8 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     }
     profiler.record_head_begin(model->stream);
 
-    // `left` and `right` were swapped once per layer, so after an even
-    // layer count the final residual is back in `left`.
+    // `left` holds every layer's output once the layer is done (a swap after
+    // each layer that wrote `right`), so the final residual is in `left`.
     ninfer::Tensor final_residual = left;
     // The measurement readout (`ignis_prefill_options::out_span_logits`):
     // the head over every column of the chunk, 32 columns at a time, each
@@ -1386,7 +1402,10 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       seq->dflash2_pending = false;
       seq->dflash2_pending_features.clear();
     }
-    if (tap_count > 0) {
+    // GitHub #506: over a chunk it tapped nothing of too. The positions below
+    // the tap start are ones no later window reads, so the frontier stands at
+    // the chunk's end exactly as it would have had they been tapped.
+    if (pool->has_dflash2()) {
       seq->dflash2_position = chunk_start + num_tokens;
     }
     model->last_step_kernel_count = dispatches;
@@ -1407,17 +1426,18 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
 // position's successor/logits are observable. A chunk that fails leaves
 // `seq` at its pre-chunk position: every earlier chunk in this span already
 // committed its position advance, and this loop stops before advancing for
-// the failing one.
+// the failing one. `drafter_floor` is the call's
+// (`ignis_prefill_options::drafter_floor`, GitHub #506).
 int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                     const int32_t *token_ids, uint64_t num_tokens,
                                     const ignis_sampling_params &sampling, float *out_logits,
                                     LinearPolicyMode mode, const SpanMultimodal &multimodal,
                                     float *permitted_prob,
                                     const ArmedAttentionReadout *attention_readout,
-                                    std::uint16_t *span_logits) {
+                                    std::uint16_t *span_logits, uint64_t drafter_floor) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
   ChunkProfiler::instance().begin_span(num_tokens, model->prefill_chunk_tokens);
-  const uint64_t tap_from = dflash2_tap_from(seq->position, num_tokens);
+  const uint64_t tap_from = dflash2_tap_from(seq->position, num_tokens, drafter_floor);
   uint64_t offset = 0;
   while (offset < num_tokens) {
     const uint64_t chunk_len = std::min<uint64_t>(chunk_width, num_tokens - offset);
@@ -1735,7 +1755,8 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   } else {
     rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, *sampling,
                                      out_logits, mode, multimodal, permitted_prob,
-                                     arms_readout ? &attention_readout : nullptr, span_logits);
+                                     arms_readout ? &attention_readout : nullptr, span_logits,
+                                     options != nullptr ? options->drafter_floor : 0);
   }
   if (rc != 0) {
     return rc;

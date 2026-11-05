@@ -156,6 +156,30 @@ def load_hidden(path, windows):
     return saved["hidden"], saved["reference"]
 
 
+def read_head(reference):
+    """The output head (`lm_head.weight`) of a reference `save_hidden` described, for `--hidden`.
+
+    The head is read from the checkpoint alone, opening only its index and the shard holding `lm_head.*`,
+    unless the reference's overlay replaced it (`replaced_tensors` names an `lm_head.` tensor): then the
+    overlay is laid over the checkpoint as the forward did. Either way the same bytes the reference's
+    forward used go into the same matmul, so the scores do not change; the overlay directory and the
+    shards it replaces are not needed otherwise (a trimmed checkpoint is enough)."""
+    root = reference["ckpt"]
+    if any(name.startswith("lm_head.") for name in reference.get("replaced_tensors") or []):
+        return Checkpoint(root, reference.get("overlay")).tensors("lm_head.")["weight"]
+    index = os.path.join(root, "model.safetensors.index.json")
+    if not os.path.isfile(index):
+        raise FileNotFoundError(f"the reference's checkpoint {root} has no index {index}, which the output head needs")
+    with open(index) as f:
+        shard = json.load(f)["weight_map"]["lm_head.weight"]
+    path = os.path.join(root, shard)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"the output head is in the shard {shard} of the reference's checkpoint {root} "
+                                f"(index {index}), which is missing: {path}")
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        return handle.get_tensor("lm_head.weight")
+
+
 def forward(a, windows):
     """The reference's forward over `windows`, layer by layer: its post-norm hidden rows, its output head on
     the device and what it is; None for `--smoke`, which prints the first argmaxes instead."""
@@ -291,7 +315,7 @@ def main(argv=None):
               + (f" + {reference['overlay']}" if reference.get("overlay") else ", no overlay"), flush=True)
         dev = "cuda"
         hidden = [h.to(dev) for h in hidden]
-        head = Checkpoint(reference["ckpt"], reference.get("overlay")).tensors("lm_head.")["weight"].to(dev)
+        head = read_head(reference).to(dev)
         reference = dict(reference, hidden=a.hidden)
     else:
         done = forward(a, windows)

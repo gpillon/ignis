@@ -48,8 +48,8 @@ pub enum CaptureLink {
     /// at its opener's page floor (#187) or one it already stands on.
     #[default]
     None,
-    /// The load's opener page rides the capture (#306,
-    /// [`crate::compute::ModelFamily::opener_page_rides_capture`]): the
+    /// The load's opener page rides the capture (#306, #508,
+    /// [`crate::SchedulerConfig::opener_page_rides_capture`]): the
     /// request publishes nothing at its floor, so its `publish_tokens` is 0,
     /// and the capture lends the pages instead.
     OpenerPageRides,
@@ -418,13 +418,20 @@ impl Request {
     /// One function so that the chunk decomposition (where to cut) and the
     /// registration (when to publish) cannot disagree about it.
     pub fn publish_point(&self, page_tokens: u32) -> u32 {
+        // The next boundary is the lowest one past what the request shares:
+        // the prefill reaches it first.
+        self.publish_boundaries(page_tokens).min().unwrap_or(0)
+    }
+
+    /// Every boundary past what the request shares that it may still publish
+    /// a prefix at, in no particular order: [`Request::publish_point`] is the
+    /// lowest of them, and the drafter floor (GitHub #506) reads them all.
+    fn publish_boundaries(&self, page_tokens: u32) -> impl Iterator<Item = u32> + '_ {
         // GitHub #306: a capture lent the pages below the opener to a
         // pages-only link, and the leaf refuses the lender a publish -- its
         // first own pages would get a second owner. Nothing past the opener
         // is published.
-        if self.lender {
-            return 0;
-        }
+        let lender = self.lender;
         // Pages already shared, or restored as the request's own from a
         // materialized blob: a boundary inside either is behind it.
         let shared = self
@@ -437,14 +444,32 @@ impl Request {
         let resumed = self.prefix_entry.is_some() || self.standalone_tokens > 0;
         let gated = resumed && self.input.opener_tokens.is_none();
         let structural = [self.retained_prefix_point(page_tokens), self.publish_tokens];
-        // The next boundary is the lowest one past what the request shares:
-        // the prefill reaches it first.
         self.predicted_boundaries(page_tokens)
             .map(|boundary| boundary.tokens)
-            .chain(structural.into_iter().filter(|_| !gated))
-            .filter(|&at| at > shared)
-            .min()
-            .unwrap_or(0)
+            .chain(structural.into_iter().filter(move |_| !gated))
+            .filter(move |&at| !lender && at > shared)
+    }
+
+    /// Every prompt position at which this request's prefill may still leave
+    /// an image of its state that a later **drafter window** reads (GitHub
+    /// #506): each prefix it may publish ([`Request::publish_boundaries`]),
+    /// its prompt checkpoint when `captures` ([`Request::checkpoint_point`]),
+    /// and its prompt's end, where decode reads the window.
+    ///
+    /// A superset on purpose. A point that is never cut at costs only the taps
+    /// below it; a point missed here would leave an image with a stale window.
+    /// Each is read from the same function that decides the cut, so the
+    /// points are the ones this request has — two cuts at the opener where
+    /// the load publishes its page floor, one where the page rides the
+    /// capture — never an assumption about the load.
+    pub fn drafter_read_points(&self, page_tokens: u32, captures: bool) -> impl Iterator<Item = u32> + '_ {
+        let checkpoint = match captures {
+            true => self.checkpoint_point(page_tokens),
+            false => 0,
+        };
+        self.publish_boundaries(page_tokens)
+            .chain([checkpoint, self.input.tokens.len() as u32])
+            .filter(|&at| at > 0)
     }
 
     /// Every **reuse boundary** this request publishes a shared prefix at

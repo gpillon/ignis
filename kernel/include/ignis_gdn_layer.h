@@ -42,7 +42,10 @@ extern "C" {
  * zero-based layer index (a GDN layer, e.g. 4 for the 27B's BF16
  * output-projection exception). `in_residual` / `out_residual` are device
  * BF16 `[hidden, num_tokens]` feature-major buffers (out_residual is updated in
- * place and receives the final residual). Returns 0 on success, -1 on a
+ * place and receives the final residual). GitHub #507: the same buffer for
+ * both is the in-place form -- the layer consumes its input residual and no
+ * copy of it runs, as the chunked prefill calls it; distinct buffers leave
+ * `in_residual` untouched. Returns 0 on success, -1 on a
  * null/invalid argument, an unknown layer, or a kernel error (see
  * ignis_gdn_layer_last_error). */
 int32_t ignis_gdn_layer_step(struct ignis_model *model, struct ignis_seq_pool *pool,

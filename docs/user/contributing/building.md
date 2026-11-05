@@ -79,6 +79,9 @@ which the workflow requires apart from the list (`--require`): a release
 without code for 8.6, or without code for 12.0, is not published, whatever
 the list says. The sm_120a code in such a build is the same, byte for byte, as
 a `120a`-only build's.
+The same check refuses a build whose 8.6 code holds, in a kernel of the RTX 30 and
+RTX 40 prefill, a tensor-core form those cards run at half rate
+(`mk/full-rate-kernels.txt`).
 
 Which cards are supported is in [What it runs on](../start/index.md#what-it-runs-on).
 A card none of the listed architectures runs on is refused at start
@@ -90,11 +93,18 @@ before it on the stream instead.
 
 On a card below compute capability 12.0 the server picks what the card runs:
 
-- the 27B's prompt attention left unset runs the FP16 band, and a named
-  `--model-prefill-attention fp8` is refused; `GET /v1/config` still shows
-  the field's value, `fp8`;
+- the 27B's prompt attention left unset, or named `8bit` or `fp8`, runs the
+  integer band, and its trellis prefill left unset runs the dense prefill;
+  `GET /v1/config` reports both as `int8`, the card their source, and `fp16`
+  for either, named or a profile's, keeps the FP16 band or the fused prefill
+  ([Context and speculation](../configuration/context-and-speculation.md));
 - `--model-exception-weights fp8` is refused: the exception tensors stay
   BF16, since in FP8 they prefill on the block-scaled FP8 tensor cores;
+- the 27B's 48 linear-attention (GDN) layers prefill on ignis's own kernels,
+  in the tensor-core forms a GeForce card runs at full rate, where a Blackwell
+  card keeps the vendored ones (ours measured 3-4% faster on the RTX 5090 with its KLD intact, but two entailment gate cases and the vision verify probe moved). That route has no option; the load logs which
+  one runs (`ignis.runtime.prefill_routes`), and the measurement switch that
+  compares the two is a contributor's ([Testing](testing.md#measurement-switches));
 - the 27B NVFP4 artifact, the image model and Flash-Next's staged decode
   (`IGNIS_FN_MOE_STAGED=1`) are refused before the load, by name
   ([Troubleshooting](../troubleshooting.md#starting)). The 27B loads from its

@@ -202,7 +202,9 @@ add_test(NAME ignis_kernel_gdn_input_proj_tests COMMAND ignis_kernel_gdn_input_p
 # and Qwen3.6-35B geometries. Since GitHub #478 it carries a portability patch
 # (ADR 0077): on a card that cannot hold a cooperative schedule resident (fewer
 # SMs than the RTX 5090, or an sm_86 build's fewer CTAs per SM) it skips, and
-# names in a SKIP line, each one the planner's residency query refuses there;
+# names in a SKIP line, each one the planner's residency query refuses there,
+# and holds a projection case the planner then runs on the unsplit route to
+# that route's own error criterion;
 # it prints each cooperative kernel's CTAs per SM and, on compute capability
 # 12.0, fails if one is not the value the planner was tuned on, or on the 5090
 # if it skips any. The wrapper itself is
@@ -543,6 +545,39 @@ add_executable(ignis_kernel_dflash2_topk_test test_dflash2_topk.cu)
 target_link_libraries(ignis_kernel_dflash2_topk_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_dflash2_topk_test COMMAND ignis_kernel_dflash2_topk_test)
 
+# GitHub #507: OURS, an adapted op -- the GDN prefill's split conv (kernel/src/gdn_conv_split.h,
+# leaf-internal) against what the layer body ran before it, the vendored causal conv and the three
+# strided copies that split its plane, at every form the vendored wrapper switches between and the
+# 27B's prefill chunks. The conv is exact, so the bound is bit equality. Links ignis_kernel for
+# ours and ignis_vendor for the oracle; no SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_gdn_conv_split_test test_gdn_conv_split.cu)
+target_include_directories(ignis_kernel_gdn_conv_split_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_gdn_conv_split_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_gdn_conv_split_test COMMAND ignis_kernel_gdn_conv_split_test)
+# GitHub #507: OURS -- the GDN prefill copies no layout: the layer body at the prefill chunks and
+# the chunked program prefill on a synthetic trellis body of the 27B's widths, against the body and
+# loop as they ran before (the leaf's test-only switch, kernel/src/layer_internal.h), bit for bit,
+# and the copy counter at zero. GPU; no SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_gdn_prefill_layout_test test_gdn_prefill_layout.cu)
+target_include_directories(ignis_kernel_gdn_prefill_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_gdn_prefill_layout_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_gdn_prefill_layout_test COMMAND ignis_kernel_gdn_prefill_layout_test)
+# GitHub #514 (spec #503): OURS -- the GDN prefill's chunked delta rule on our own full-rate kernels
+# (kernel/src/gdn_prefill.h, leaf-internal) against the vendored chunked path (the oracle, ADR 0031)
+# and both against an fp64 recurrence: outputs and carried state at the 27B's prefill chunks 1024,
+# 2048 and 4096, three calls carrying the state in place, and ragged remainders, within the bound
+# the test file argues. Not sm120a-only: it runs on 8.6. GPU; no SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_gdn_prefill_test test_gdn_prefill.cu)
+target_include_directories(ignis_kernel_gdn_prefill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_gdn_prefill_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_gdn_prefill_test COMMAND ignis_kernel_gdn_prefill_test)
+# Its bench: one layer's GDN recurrence per chunk width (--tokens) and a prompt's 48 layers
+# (--prompts), the vendored chunked kernels against ours. A tool and NOT a CTest; timing wants the
+# card to itself.
+add_executable(ignis_kernel_gdn_prefill_bench bench_gdn_prefill.cu)
+target_include_directories(ignis_kernel_gdn_prefill_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_gdn_prefill_bench PRIVATE ignis_kernel ignis_vendor)
+
 # ADR 0062: the token embedding in mapped pinned host memory (OURS: the
 # device surface's allocation), gathered by the vendored W8 op bit for bit as
 # from device memory, eager and graph-replayed. GPU; no SKIP_RETURN_CODE
@@ -597,6 +632,15 @@ target_compile_definitions(ignis_kernel_hq_route_agreement_test PRIVATE
   IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
 target_link_libraries(ignis_kernel_hq_route_agreement_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_hq_route_agreement_test COMMAND ignis_kernel_hq_route_agreement_test)
+
+# GitHub #510 (spec #503): OURS -- the integer band (IgnisHqPromptPrecision::kInt8) against an fp64
+# attention over the rows it reads, within a bound built from each of its roundings, its output
+# and its carried state, at the 8K and 64K prefixes of a prompt prefilled at chunk 4096, on one
+# split, the band's split rule and a narrow band. It runs on compute capability 8.6 as on 12.0:
+# no sm120a-only label. No SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_hq_prompt_int8_test test_hq_prompt_int8.cu)
+target_link_libraries(ignis_kernel_hq_prompt_int8_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_hq_prompt_int8_test COMMAND ignis_kernel_hq_prompt_int8_test)
 
 # P4-10 (GitHub #126): OURS, not vendored -- device prefix reuse. It checks
 # the two halves ADR 0024 describes against the device itself: that a
@@ -680,6 +724,22 @@ foreach(name IN ITEMS trellis_dense_decode trellis_linear)
   target_link_libraries(ignis_kernel_${name}_test PRIVATE ignis_kernel ignis_vendor)
   add_test(NAME ignis_kernel_${name}_test COMMAND ignis_kernel_${name}_test)
 endforeach()
+# GitHub #509 (spec #503): OURS -- the dense prefill (kernel/include/ignis_dense_prefill.h): its
+# W8 codes against a host decode, its A8 against a host reference bit for bit, its int32
+# accumulators against an exact integer reference on the CUDA cores at every tile plan, and the
+# composed call's outputs within BF16 rounding of the fp64 epilogue; on synthetic matrices of
+# every K class, and on real matrices of the base 16 GB artifact ($IGNIS_DENSE_PREFILL_ARTIFACT,
+# SKIP outside the GPU profile when absent, a failure under it). Not sm120a-only: the kernels fit
+# sm_86. The leaf-internal tile plan (dense_prefill_internal.cuh) is why it sees kernel/src.
+add_executable(ignis_kernel_dense_prefill_test test_dense_prefill.cu)
+target_include_directories(ignis_kernel_dense_prefill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_dense_prefill_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_dense_prefill_test COMMAND ignis_kernel_dense_prefill_test)
+# Its bench, against the fused prefill per body shape and per chunk at the quant's K mix (--tokens,
+# --sweep for every tile plan). A tool and NOT a CTest; timing wants the card to itself.
+add_executable(ignis_kernel_dense_prefill_bench bench_dense_prefill.cu)
+target_include_directories(ignis_kernel_dense_prefill_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_dense_prefill_bench PRIVATE ignis_kernel ignis_vendor)
 # The dense trellis microbenchmark: spec 02's report (DRAM bandwidth at 1..64 tokens, prefill
 # TFLOP/s, under the debug SM caps). A tool and NOT a CTest; timing wants the card to itself.
 add_executable(ignis_kernel_trellis_linear_bench bench_trellis_linear.cu)
@@ -1026,6 +1086,7 @@ add_test(NAME ignis_kernel_image_transformer_test COMMAND ignis_kernel_image_tra
 # (kernel/src/trellis_body.h, leaf-internal): the q_proj's per-head [q | gate] split, query_gate,
 # the head and the two epilogues. GPU: the op's workspace query needs a prepared device (ADR 0006).
 add_executable(ignis_kernel_model_load_trellis_test test_model_load_trellis.cpp)
+target_include_directories(ignis_kernel_model_load_trellis_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_model_load_trellis_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_model_load_trellis_test COMMAND ignis_kernel_model_load_trellis_test)
 add_executable(ignis_kernel_trellis_body_test test_trellis_body.cu)

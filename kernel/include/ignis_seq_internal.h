@@ -424,6 +424,9 @@ struct ignis_seq {
   // last absolute position whose context K/V it holds (the ring keeps the
   // 2048 before it). Only a pool with the drafter moves it: a prefill writes
   // its span's tail into the window and leaves this at the span's end.
+  // GitHub #506: a span below its drafter floor writes none and still leaves
+  // this at its end -- the 2048 before it are complete wherever a window is
+  // read (a retained image, decode), not after every prefill call.
   // Decode does not move it yet, so it may trail `position`; that is why it
   // is carried in the progress image rather than derived from `position`.
   std::uint64_t dflash2_position = 0;

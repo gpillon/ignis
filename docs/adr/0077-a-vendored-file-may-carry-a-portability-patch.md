@@ -53,6 +53,17 @@ test, which holds no device code: the test asks the planner's own residency
 query and skips, naming it on its output, each schedule the query refuses. On
 the 5090 every schedule is resident, so the test runs and prints what it did
 before. The `reason` names the card size and the planner query it reuses.
+Such a card runs the unsplit route in place of a cooperative one, at sizes
+where the 5090 never runs it, and the test's error criterion, tuned on the
+5090's split-K routes, held the unsplit route with no margin: on an sm_86 card
+on which the cooperative schedules are not resident, as on an RTX 3090, two
+cases failed it. A check that fails only because the card runs another route
+is neither a compile nor a launch, so these terms also admit, in a test, a
+criterion derived for the route the card runs, applied only where it runs in
+place of the reference's: the unsplit route keeps one fp32 accumulator over
+all of K, and its criterion, three times the split-K one, is derived in the
+test's comment. On the 5090 no case falls back, so every check there is the
+reference's.
 
 The third is the GDN gating planner,
 `src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp`, with the query
@@ -72,3 +83,5 @@ gating test checks (it fails if one differs, and on the 5090 if it skips any
 schedule), and the `120a` build's device code is unchanged (`cuobjdump -sass`
 of the kernels' object, before and after). The test's patch now also prints
 each kernel's CTAs per SM.
+
+**Amended by [ADR 0080](0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md)** (spec #503, GitHub #505): on an 8.x card the 8-bit prompt attention band is the integer band, and the route checks gain two routes of the same kind, the dense prefill and the integer band, which a build refuses by name when the operator names one it does not carry and falls back from when a default or a profile gives it.

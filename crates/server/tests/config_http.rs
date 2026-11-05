@@ -990,8 +990,10 @@ fn origins_of(origins: &Value, key: &str) -> Vec<(Value, String, bool, Option<St
 /// capability 8.6, under a build for it) and a 24 GB Blackwell card (12.0)
 /// start on `rtx-24gb`: `GET /v1/config` shows its 27B values, the measured
 /// 1,048,576-token context among them, and `GET /v1/config/origins` names
-/// the profile as their source. The prompt-attention band is the card's: FP16
-/// on the 3090, FP8 on Blackwell.
+/// the profile as their source. The prompt-attention band and the prefill
+/// route are the card's (GitHub #515): the integer band and the dense prefill
+/// on the 3090, the card as their source; FP8 and the fused prefill on
+/// Blackwell, their defaults.
 #[tokio::test]
 async fn under_auto_a_24gb_card_runs_rtx_24gb_and_the_config_says_so() {
     use ignis_server::config::arch::{BuiltArchitectures, ComputeCapability};
@@ -1005,7 +1007,7 @@ async fn under_auto_a_24gb_card_runs_rtx_24gb_and_the_config_says_so() {
         capability: ComputeCapability::new(8, 6),
         built_for: BuiltArchitectures::parse("86;120a").unwrap(),
     });
-    for (card, band) in [(rtx3090, "fp16"), (Card::blackwell(24 << 30), "fp8")] {
+    for (card, band, route, route_source) in [(rtx3090, "int8", "int8", "card"), (Card::blackwell(24 << 30), "fp8", "fp16", "default")] {
         let start = match resolve_on(&[], |_| None, &NoFiles, &|| card.clone()).expect("the start resolves") {
             ConfigOutcome::Config(config) => config,
             other => panic!("{other:?}"),
@@ -1021,12 +1023,20 @@ async fn under_auto_a_24gb_card_runs_rtx_24gb_and_the_config_says_so() {
         let vision = &document["vision"]["qwen38"];
         assert_eq!((&vision["enabled"], &vision["residency"], &vision["max_tokens"]), (&json!(true), &json!("host"), &json!(32768)), "{band}: {document}");
         assert_eq!(qwen.0["prefill_attention"], band, "{document}");
+        // Spec #503 (GitHub #505): the prefill route is reported as the load resolves it.
+        assert_eq!(qwen.0["prefill_linear"], route, "{document}");
+        assert!(document["model"]["qwen38flashnext"].get("prefill_linear").is_none(), "the 27B's alone: {document}");
 
         let (status, origins) = send(&app, Method::GET, "/v1/config/origins", None).await;
         assert_eq!(status, StatusCode::OK, "{origins}");
         let profile = |key: &str| origins_of(&origins, key).into_iter().find(|(scope, ..)| scope == "qwen38").unwrap();
         for key in ["model.max_context", "model.prefill_chunk", "spec.backend", "spec.draft_tokens", "vram.headroom_bytes"] {
             assert_eq!(profile(key), (json!("qwen38"), "profile".to_owned(), true, Some("rtx-24gb".to_owned())), "{band}: {key}");
+        }
+        for key in ["model.prefill_linear", "model.prefill_attention"] {
+            let origin = origins_of(&origins, key);
+            let expected = if key.ends_with("linear") || route_source == "card" { route_source } else { "default" };
+            assert!(!origin.is_empty() && origin.iter().all(|(_, source, ..)| source == expected), "{band}: {key} {origin:?}");
         }
         assert_eq!(origins_of(&origins, "vision.residency")[0], (Value::Null, "profile".to_owned(), false, Some("rtx-24gb".to_owned())), "{band}");
     }

@@ -337,6 +337,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "model.prefill_chunk",
     "model.kv_format",
     "model.prefill_attention",
+    "model.prefill_linear",
     "model.exception_weights",
     "model.rope_scaling",
     "model.enable_thinking",

@@ -184,6 +184,13 @@ Why each:
   2,048 would cost about 0.4 GB of KV pool.
 - **The headroom** is the 5090's 27B value until a real card says otherwise
   ([measure yours](../guides/measure-a-16gb-card.md)).
+- **On a 16 GB RTX 40 card** the 27B prefills on the routes those cards run
+  ([Context and speculation](../configuration/context-and-speculation.md)):
+  the dense prefill's 89 MB buffer is a line of the VRAM plan, and the prefill
+  scratch it holds is smaller. On the RTX 5090 held to a 16 GB card's budget
+  less 1 GiB of desktop, those routes left the KV pool 6,656 tokens smaller
+  than an RTX 50 card's (386,048 against 392,704) and the context loaded at
+  262,144 with nothing adapted: the buffer costs pool, not context.
 
 ### `rtx-24gb`
 
@@ -202,6 +209,7 @@ resolves the default id `qwen3.8-27b` to that entry
 | Decode lanes | 8 (the default) |
 | Prefill chunk | 2,048 |
 | VRAM headroom | 1,200 MiB |
+| Retained slots | 2 on the device, beside the 16 in host RAM |
 
 Why each:
 
@@ -209,14 +217,27 @@ Why each:
   DFlash2 at 7 drafts and vision in host RAM are what `rtx5090` gives the
   27B; the lanes and the drafter's head stay at their defaults.
 - **A million tokens of context.** Measured as the 16 GB numbers were: the
-  16 GB entry on the RTX 5090 held to a 24 GiB budget, with the FP16 prompt
-  band a card below compute capability 12.0 runs. 1,048,576 tokens load with
-  nothing adapted, on eight lanes, with a KV pool of 1,199,040 tokens. The
+  16 GB entry on the RTX 5090 held to a 24 GiB budget, on the routes a card
+  below compute capability 12.0 runs (the dense prefill with its 89 MB buffer,
+  the integer band, ignis's gated delta net prefill). 1,048,576 tokens load
+  with nothing adapted, on eight lanes, with a KV pool of 1,139,776 tokens
+  beside the two device retained slots (1,148,544 on the fused prefill and the
+  FP16 band, 1,199,040 without the slots). The
   cap is the 27B's compressed-KV attention envelope, as on `rtxpro6000`, not
   the memory; `auto` rope scaling makes the 27B YaRN at 4. No request that
   long was run.
-- **The pool past the context**, about 1.4 GB, is room for what a real card's
-  desktop holds; past that the load adapts
+- **Two retained slots on the device.** The 27B's prompt checkpoints and
+  shared prefixes go to them first, and a capture or a claim is then a copy
+  on the card instead of one over PCIe
+  ([retained slots](kv-cache-and-prompt-reuse.md#what-is-kept)). Each is about
+  232 MB, a lane's state, and comes out of the KV pool, not the context: the
+  context is capped by the attention envelope, and the pool had about 1.4 GB
+  past it. With `--reuse-prompt off` they are not reserved. The 16 GB
+  profiles keep none, since their context is set by memory.
+- **The pool past the context**, 91,200 tokens or about 0.84 GB once the
+  device slots and the dense buffer have theirs, is room for what a real
+  card's desktop holds;
+  past that the load adapts
   ([when a profile does not fit](#when-a-profile-does-not-fit)).
 
 ## When a profile does not fit

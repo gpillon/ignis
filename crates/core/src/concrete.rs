@@ -234,13 +234,15 @@ pub struct SchedulerConfig {
     /// prompt it is given.
     pub prompt_reuse: bool,
     /// Whether the generation opener's page **rides the capture** (ADR 0029
-    /// as amended 2026-10-07, GitHub #306; [`crate::compute::ModelFamily`]
-    /// decides it at load). On, a request that can capture a prompt checkpoint
+    /// as amended 2026-10-07 and 2026-11-05, GitHub #306, #508; the server
+    /// decides it at load, by the model's family and the card's GPU
+    /// generation). On, a request that can capture a prompt checkpoint
     /// publishes nothing at its opener's page floor: the capture hands those
     /// pages over as a **pages-only link**, and the prefill is cut once, at the
-    /// opener. Off, they are a chained prefix with an image, published at a cut
-    /// of their own (#187) -- the 27B, whose extra traversal costs ~19 ms where
-    /// Flash-Next's costs an expert stream.
+    /// opener -- Flash-Next, whose extra traversal costs an expert stream, and
+    /// the 27B on Ampere and Ada. Off, they are a chained prefix with an image,
+    /// published at a cut of their own (#187) -- the 27B on Blackwell, whose
+    /// extra traversal costs ~19 ms there.
     pub opener_page_rides_capture: bool,
     /// The load's **retained slots** (GitHub #215, #281, ADR 0030; the
     /// operator's `--reuse-retained-device` and `--reuse-retained-host` together): how
@@ -359,6 +361,16 @@ fn cut_at(start: u32, take: u32, point: u32) -> u32 {
 /// a publish or a capture at `point` happens on (0 is no point).
 fn lands_on(start: u32, take: u32, point: u32) -> bool {
     point > start && point - start <= take
+}
+
+/// The drafter floor of a prefill job ending at `end` (GitHub #506): the
+/// earliest of `points` at or past `end`, minus the drafter window, or 0 when
+/// the window reaches back past the prompt's start. A point inside the job is
+/// none of its business: an image is taken only where a job ends, so one there
+/// was not cut at. `points` holds the prompt's end, which no job passes.
+fn drafter_floor(points: impl IntoIterator<Item = u32>, end: u32) -> u32 {
+    let window = crate::speculation::DFLASH2_WINDOW_TOKENS as u32;
+    points.into_iter().filter(|&at| at >= end).min().unwrap_or(end).saturating_sub(window)
 }
 
 /// The capture point `at` a chunk of `take` tokens from `start` may take: `at`
@@ -5014,6 +5026,17 @@ impl Scheduler for ConcreteScheduler {
                     // first decode round emits, and the block is open there.
                     reasoning_close: reasoning_close(&self.config, r)
                         .filter(|_| start + take >= r.input.tokens.len() as u32),
+                    // GitHub #506: the earliest image a drafter window reads
+                    // past this job, from the points the request itself may
+                    // cut at -- a decision, or `--reuse-prompt off`, captures
+                    // no checkpoint (the capture points above).
+                    drafter_floor: drafter_floor(
+                        r.drafter_read_points(
+                            self.config.kv_page_tokens,
+                            self.config.prompt_reuse && !r.input.is_decision(),
+                        ),
+                        start + take,
+                    ),
                 }
             })
             .collect();

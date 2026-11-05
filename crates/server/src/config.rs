@@ -216,7 +216,7 @@ pub const DEFAULT_IMAGE_SIZES: [ImageSize; 8] = [
 // to be kept in sync by hand across the crate boundary.
 pub use ignis_runtime::{DEFAULT_MAX_CONTEXT, DEFAULT_PREFILL_CHUNK, PREFILL_CHUNK_ALIGNMENT};
 
-pub use ignis_core::{ExceptionWeights, KvFormat, KvPoolSize, PrefillAttention, VramMode};
+pub use ignis_core::{ExceptionWeights, KvFormat, KvPoolSize, PrefillAttention, PrefillLinear, VramMode};
 use ignis_core::compute::ModelFamily;
 
 /// `--vram-headroom-bytes`' default: what a derived VRAM budget leaves to the
@@ -470,6 +470,10 @@ pub struct Config {
     /// for the life of the load; the 27B's alone, so a Flash-Next start
     /// refuses an explicit value.
     pub prefill_attention: PrefillAttention,
+    /// The 27B's trellis prefill route (`--model-prefill-linear`, GitHub
+    /// #505): the fused prefill by default, or the dense one. Fixed for the
+    /// life of the load; the 27B's alone.
+    pub prefill_linear: PrefillLinear,
     /// How the 27B holds its BF16 exception tensors (`--model-exception-weights`,
     /// GitHub #341): as stored by default, or converted to FP8 at load. Fixed
     /// for the life of the load; the 27B's alone.
@@ -1202,12 +1206,21 @@ fn derive(
     let rope_scaling = s.model.rope_scaling.resolve(s.model.max_context).map_err(|e| {
         ConfigError(format!("`{} {}`: {e}", spelled("model", "max_context"), s.model.max_context))
     })?;
-    // GitHub #456: the band the card runs, whatever the field resolved to.
+    // GitHub #456: the band and the route the card runs, whatever the fields
+    // resolved to (`source::decide_by_card` decided them already; here a
+    // named value the card or the build cannot run is refused).
     let prefill_attention = arch::prefill_attention(
         s.model.prefill_attention,
-        !resolution.adapts("model", "prefill_attention"),
+        arch::GivenBy::of(resolution.origin("model", "prefill_attention")),
         sources.card.as_ref(),
         &spelled("model", "prefill_attention"),
+    )
+    .map_err(ConfigError)?;
+    let prefill_linear = arch::prefill_linear(
+        s.model.prefill_linear,
+        arch::GivenBy::of(resolution.origin("model", "prefill_linear")),
+        sources.card.as_ref(),
+        &spelled("model", "prefill_linear"),
     )
     .map_err(ConfigError)?;
     let exception_weights =
@@ -1265,10 +1278,14 @@ fn derive(
         host_pool_bytes: s.reuse.kv_host_pool_bytes,
         host_margin_bytes: s.model.host_margin_bytes,
         prompt_reuse,
-        retained_device_slots: s
-            .reuse
-            .retained_device
-            .unwrap_or(if prompt_reuse { DEFAULT_RETAINED_DEVICE_SLOTS } else { 0 }),
+        // A profile's device slots serve prompt reuse (`rtx-24gb`'s, GitHub
+        // #508): with it off they are not reserved; a count the operator
+        // names still shares heads between live siblings.
+        retained_device_slots: match s.reuse.retained_device {
+            Some(slots) if prompt_reuse || !resolution.adapts("reuse", "retained_device") => slots,
+            _ if prompt_reuse => DEFAULT_RETAINED_DEVICE_SLOTS,
+            _ => 0,
+        },
         // The 27B's default, two per decode lane, from the lanes as named;
         // Flash-Next's own replaces it at load (`EngineShape::for_family`,
         // which asks the same function).
@@ -1290,6 +1307,7 @@ fn derive(
         vision,
         rope_scaling,
         prefill_attention,
+        prefill_linear,
         exception_weights,
         media,
         request_timeout_secs: s.server.request_timeout,

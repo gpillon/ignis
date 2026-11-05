@@ -186,6 +186,8 @@ pub struct ReservedBytes {
     pub workspace: u64,
     /// The 27B trellis body's workspace (GitHub #339); 0 on the NVFP4 body.
     pub trellis_workspace: u64,
+    /// The dense prefill's one buffer (GitHub #509); 0 unless the load runs it.
+    pub trellis_dense: u64,
     pub media_embedding: u64,
     pub sampling: u64,
     pub decode_graph: u64,
@@ -226,6 +228,7 @@ pub fn vram_lines(weights_bytes: u64, reserved: ReservedBytes) -> ignis_core::Vr
         cuda_context: CUDA_CONTEXT_BYTES,
         workspace: reserved.workspace,
         trellis_workspace: reserved.trellis_workspace,
+        trellis_dense: reserved.trellis_dense,
         media_embedding: reserved.media_embedding,
         sampling: reserved.sampling,
         decode_graph: reserved.decode_graph,
@@ -773,6 +776,10 @@ pub trait StepLeaf: Send + Sync + 'static {
     ///
     /// `redirect` is the span's draw's reasoning redirect (GitHub #315); see
     /// [`DrawRedirect`]. `None` draws as the leaf always has.
+    ///
+    /// `drafter_floor` is the job's [`PrefillJob::drafter_floor`] (GitHub
+    /// #506): the span taps the drafter's window from the later of its own
+    /// last 2048 positions and this. A leaf without the drafter ignores it.
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,
@@ -780,6 +787,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         sequence: &mut Self::Sequence,
         tokens: &[TokenId],
         start_position: u32,
+        drafter_floor: u32,
         params: DecodeParams,
         permitted: &[TokenId],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -804,8 +812,8 @@ pub trait StepLeaf: Send + Sync + 'static {
     ///
     /// `attention` is the **attention readout** (GitHub #260), read at the
     /// span's last position; see [`AttentionRead`] for what the leaf owes
-    /// it. The text path carries one too (GitHub #275). `redirect` is
-    /// [`StepLeaf::prefill`]'s.
+    /// it. The text path carries one too (GitHub #275). `redirect` and
+    /// `drafter_floor` are [`StepLeaf::prefill`]'s.
     #[allow(clippy::too_many_arguments)]
     fn prefill_multimodal(
         &self,
@@ -813,6 +821,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         _sequence: &mut Self::Sequence,
         _tokens: &[TokenId],
         _start_position: u32,
+        _drafter_floor: u32,
         _params: DecodeParams,
         _permitted: &[TokenId],
         _redirect: Option<&mut DrawRedirect<'_>>,
@@ -1353,6 +1362,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             sequence,
             &job.tokens,
             start,
+            job.drafter_floor,
             job.params,
             &permitted,
             redirect,
@@ -1611,6 +1621,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             &mut sequence.handle,
                             &job.tokens,
                             job.start_position,
+                            job.drafter_floor,
                             job.params,
                             // GitHub #242: the set this chunk's own draw is
                             // restricted to, borrowed and not cloned — every
@@ -2300,6 +2311,7 @@ mod tests {
             lane_state: base + 8,
             retained_slots: base + 9,
             hq_residual_window: base + 10,
+            trellis_dense: base + 11,
             kv_pool: 0,
         }
     }

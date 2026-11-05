@@ -291,6 +291,17 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
     {
         return Err(LoadError::RouteUnsupported(refusal));
     }
+    // GitHub #509: a named dense prefill on the NVFP4 artifact, by the option's
+    // spelling, before the leaf refuses it by number. Options the 27B cannot
+    // take are refused below, where it is fitted.
+    if named.unwrap_or(ModelFamily::Qwen38_27b) == ModelFamily::Qwen38_27b {
+        if let Ok(the_27b) = fitted(config, ModelFamily::Qwen38_27b) {
+            let spelled = the_27b.basis.resolution().spelled("model", "prefill_linear");
+            if let Some(refusal) = crate::config::arch::prefill_linear_refusal(the_27b.prefill_linear, nvfp4_body, &spelled) {
+                return Err(LoadError::RouteUnsupported(refusal));
+            }
+        }
+    }
     // The image model's container holds no text frontend (spec
     // image-model/01): it is verified, and its runner reads the rest.
     if named.map(ModelFamily::kind) == Some(ModelKind::Image) {
@@ -737,6 +748,63 @@ mod tests {
         }
         match prepare_model(&on(12, 0), &artifact.path) {
             Err(LoadError::RouteUnsupported(refusal)) => panic!("a Blackwell card runs it: {refusal}"),
+            Err(_) => {}
+            Ok(_) => panic!("the fixture holds no frontend"),
+        }
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    /// GitHub #509 (the review of spec #503): on a Blackwell card a named
+    /// dense prefill on the 27B's NVFP4 artifact is refused before its
+    /// checksum is read, naming the option as the operator spelled it, by
+    /// flag or by the environment; unnamed, the same load goes past that
+    /// check, to be refused for what the fixture lacks.
+    #[test]
+    fn a_named_dense_prefill_on_the_nvfp4_artifact_is_refused_naming_the_option() {
+        use crate::config::{arch, profile};
+        use ignis_artifact::fixture::{self, FixtureObject};
+        let body = FixtureObject::Tensor {
+            name: "layers.0.mlp.gate_up",
+            shape: vec![128, 64],
+            format: "NVFP4",
+            layout: "blockscale-k16-m128x4-v1",
+            offset: 0,
+            bytes: 4612,
+        };
+        let artifact = fixture::write_fixture(&[body], &vec![0u8; 4612], "dense-nvfp4").expect("fixture");
+        let name = artifact.path.file_name().unwrap().to_str().unwrap().to_owned();
+        let sidecar = artifact.path.with_file_name(format!("{name}.graft.json"));
+        std::fs::write(&sidecar, "{}").expect("sidecar");
+        let card = profile::Card::Read(profile::CardReading {
+            total: 32 << 30,
+            name: "a test card".to_owned(),
+            capability: arch::ComputeCapability::new(12, 0),
+            built_for: arch::BuiltArchitectures::parse("86;120a").unwrap(),
+        });
+        let on = |flags: &[&str], env: &'static [(&'static str, &'static str)]| {
+            let args: Vec<String> = [&["--profile", "none"][..], flags].concat().into_iter().map(String::from).collect();
+            let env = move |key: &str| env.iter().find(|(name, _)| *name == key).map(|(_, value)| value.to_string());
+            match crate::config::resolve_on(&args, env, &crate::config::file::NoFiles, &|| card.clone()).expect("resolves") {
+                crate::config::ConfigOutcome::Config(config) => config,
+                other => panic!("expected a start, got {other:?}"),
+            }
+        };
+        let named = [
+            (on(&["--model-prefill-linear", "int8"], &[]), "--model-prefill-linear"),
+            (on(&[], &[("IGNIS_MODEL_PREFILL_LINEAR", "int8")]), "IGNIS_MODEL_PREFILL_LINEAR"),
+        ];
+        for (config, spelled) in named {
+            match prepare_model(&config, &artifact.path) {
+                Err(LoadError::RouteUnsupported(refusal)) => {
+                    assert!(refusal.starts_with(&format!("`{spelled} int8` names the dense prefill")), "{refusal}");
+                    assert!(refusal.contains("NVFP4"), "{refusal}");
+                }
+                Err(other) => panic!("expected the dense prefill refused, got {other}"),
+                Ok(_) => panic!("expected the dense prefill refused"),
+            }
+        }
+        match prepare_model(&on(&[], &[]), &artifact.path) {
+            Err(LoadError::RouteUnsupported(refusal)) => panic!("the fused prefill runs it: {refusal}"),
             Err(_) => {}
             Ok(_) => panic!("the fixture holds no frontend"),
         }

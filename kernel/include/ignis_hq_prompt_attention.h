@@ -11,7 +11,8 @@
 //   - every other key, which only the codec holds, decoded once per chunk and layer into a fixed
 //     band of `band_keys` keys in 8 bits (2,048 bytes per key: K in INT8, V in E4M3) and
 //     attended on the INT8 MMA (Q K^T) and the block-scaled FP8 MMA (P V), band after band.
-// Without the residual window every key takes the FP8 pass.
+// Without the residual window every key takes the FP8 pass. The integer band (kInt8 below) runs
+// both passes on one 8-bit kernel of its own.
 //
 // The call is A1's for one sequence (B = 1) on an hq-e8-2b cache, with the same order of append
 // and attention: with the residual window on, the chunk attends first (its own rows exact from
@@ -42,22 +43,43 @@ inline constexpr std::uint32_t kIgnisHqPromptTileKeys = 32;
 struct IgnisHqPromptKeys;
 
 // How the band pass multiplies (spec 27b-16gb/03 Solution 6): in 8 bits, the default -- Q K^T on
-// the INT8 MMA, exact in int32, P V in E4M3 on the block-scaled FP8 MMA; or the fallback, FP16
-// operands with FP16 accumulate inside each 32-key tile, folded into FP32 -- its band holds half
-// the keys in the same bytes. The window pass is BF16 either way.
-enum class IgnisHqPromptPrecision { kFp8, kFp16 };
+// the INT8 MMA, exact in int32, P V in E4M3 on the block-scaled FP8 MMA, sm_120a's; or the
+// fallback, FP16 operands with FP16 accumulate inside each 32-key tile, folded into FP32 -- its
+// band holds half the keys in the same bytes. The window pass is BF16 under both.
+//
+// kInt8, the integer band (GitHub #510, spec #503): the 8-bit band on integer MMAs alone, which
+// every sm_80 card runs at full rate, and the window pass with it. Q K^T as kFp8's; P V on the
+// u8 x s8 MMA, P = rn(255 p), V^T in s8 with one amax / 127 scale per 128-key group and KV head,
+// exact in int32 across the group and folded into FP32 once a group, O rescaled only when a row's
+// max grows past 2^8. Its key splits, unless `splits` names them: 2 up to 16,384 visible keys,
+// 3 above. The residual window's rows stay BF16 in the cache for decode: only this pass rounds
+// them to 8 bits.
+enum class IgnisHqPromptPrecision { kFp8, kFp16, kInt8 };
+
+// Where one call's split states are, in its workspace, after the passes and the merge: the state
+// each split carried from pass to pass. Device pointers, valid until the workspace's next use.
+struct IgnisHqPromptCarry {
+  const void *o = nullptr;   // FP16 [split][token][24][256], rotated frame, O over the split's l
+  const float *m = nullptr;  // [split][token][24], log2 units of the scaled score
+  const float *l = nullptr;  // [split][token][24], in units of 256 p at m
+  std::int32_t splits = 0;
+  std::int32_t width = 0;
+};
 
 struct IgnisHqPromptOptions {
   // Keys per band, a multiple of `kIgnisHqPromptTileKeys`. Tests narrow it to walk several
   // bands at a small context; the engine keeps the default.
   std::uint32_t band_keys = kIgnisHqPromptBandKeys;
-  // Key splits, 1..kIgnisHqPromptMaxSplits; 0 lets the op pick them to fill the card.
+  // Key splits, 1..kIgnisHqPromptMaxSplits; 0 lets the op pick them (kInt8: its own rule).
   std::int32_t splits = 0;
   IgnisHqPromptPrecision precision = IgnisHqPromptPrecision::kFp8;
   // Runs on the host after the attention is enqueued and before an attend-first append, while
   // every key the attention read is still where it read it, and is told where they are (the
   // attention readout, GitHub #260, and the test-only tap).
   std::function<void(const IgnisHqPromptKeys &)> after_attention;
+  // Runs on the host after the merge is enqueued, told where the split states are: the leaf's
+  // tests read the carried state there. Unset in the engine.
+  std::function<void(const IgnisHqPromptCarry &)> after_merge;
 };
 
 // Where one chunk's keys are, as the attention reads them: the codec planes, the residual window

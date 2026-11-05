@@ -503,3 +503,32 @@ its opener over that, and the turn after it stands on both.
   so with either the repeat and the next turn resume (on the 5090 the
   thinking-on repeat resumed 16,442 of its 16,444 tokens). Lifting the limit
   is #201's.
+
+## Amendment (2026-11-05) — the 27B's opener page rides the capture on Ampere and Ada (#508, spec #503, owner decision 2026-11-05)
+
+The #306 amendment kept the 27B's imaged prefix at the opener's page floor
+because its extra cut costs ~19 ms on the RTX 5090. That cost does not hold on
+an RTX 30 or RTX 40 card: a traversal of the trellis body decodes every
+matrix again, and the cut costs clearly more there.
+
+**On Ampere and Ada the 27B's generation-opener page rides the capture, as
+Flash-Next's does.** The prefill of a reusable prompt is cut once, at the
+opener, and the capture lends the whole pages below it to a pages-only link.
+On Blackwell the 27B keeps both cuts and the imaged prefix at the floor, so
+its splits and its outputs are those of #306.
+
+- **One decision, by the GPU generation.** The family switch the #306 and #249
+  amendments named, `ModelFamily::opener_page_rides_capture`, is gone from the
+  core, which reads no card. The server decides it,
+  `config::arch::opener_page_rides_capture(family, generation)`, from the
+  family the load was fitted to and the generation of the card the start
+  read. With no card read (the mock build, a test's shape) the 27B keeps both
+  cuts. Flash-Next rides on every card, the image model and the diarizer
+  capture nothing.
+- **What it gives up** is the #306 amendment's: the image at the opener's page
+  floor, which only a prompt parting from this one in the last page before its
+  opener would have resumed from.
+- **Exactness.** As for #306: a reused request is bit-exact against a cold
+  prefill split at the same boundaries, now `[…, opener)` and `[opener, end)`
+  (`crates/core/tests/prompt_checkpoint_one_cut_gpu.rs`, on the 16 GB trellis
+  artifact that RTX 30 and RTX 40 cards load, in the FP16 band they run).

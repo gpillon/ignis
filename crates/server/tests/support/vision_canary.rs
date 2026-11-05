@@ -97,6 +97,7 @@ pub fn prefill_prompt(
             sequence,
             &tokens[start as usize..(start + len) as usize],
             u64::from(start),
+            0,
             SamplingParams::greedy(),
             // GitHub #242: no permitted set — this helper prefills a prompt,
             // it does not force a run.
