@@ -351,3 +351,142 @@ fn a_build_from_a_checkout_stays_120a_alone() {
     let check = read(&repo.join("mk/cuda-build-check.sh"));
     assert!(check.contains("list=${IGNIS_CUDA_ARCHITECTURES:-120a}"), "the check's default is not the leaf's");
 }
+
+/// One line of `mk/full-rate-kernels.txt`: its role, the kernel's name, the
+/// source file it names (covered kernels) and the comment after `#`.
+struct Listed {
+    role: String,
+    name: String,
+    file: Option<String>,
+    comment: String,
+}
+
+fn full_rate_list(repo: &Path) -> Vec<Listed> {
+    let mut listed = Vec::new();
+    for line in read(&repo.join("mk/full-rate-kernels.txt")).lines() {
+        let (code, comment) = line.split_once('#').unwrap_or((line, ""));
+        let words: Vec<&str> = code.split_whitespace().collect();
+        if words.is_empty() {
+            continue;
+        }
+        assert!(words.len() >= 2 && words.len() <= 3, "mk/full-rate-kernels.txt: cannot read `{line}`");
+        listed.push(Listed {
+            role: words[0].to_string(),
+            name: words[1].to_string(),
+            file: words.get(2).map(|file| file.to_string()),
+            comment: comment.to_string(),
+        });
+    }
+    listed
+}
+
+/// The names of the `__global__` functions of a CUDA source: the identifier
+/// before the first `(` once `__launch_bounds__(..)` is cut out of the
+/// declaration, whichever side of `__global__` it stands on.
+fn kernels_declared(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for (at, _) in source.match_indices("__global__") {
+        let mut declaration = String::new();
+        let mut rest = &source[at + "__global__".len()..];
+        // Up to the first `(` that is not `__launch_bounds__(`'s own, skipping its arguments.
+        loop {
+            let Some(open) = rest.find('(') else {
+                break;
+            };
+            let head = &rest[..open];
+            if head.trim_end().ends_with("__launch_bounds__") {
+                let mut depth = 0;
+                let mut end = open;
+                for (i, c) in rest[open..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + i + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                declaration.push_str(&head.replace("__launch_bounds__", ""));
+                rest = &rest[end..];
+            } else {
+                declaration.push_str(head);
+                break;
+            }
+        }
+        if let Some(name) = declaration.split_whitespace().last() {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+#[test]
+fn the_scan_reads_the_kernel_names_of_every_declaration_form() {
+    let source = "__global__ void __launch_bounds__(kThreads, 1) a_kernel(int x) {}\n\
+                  __global__ void b_kernel(int x);\n\
+                  __launch_bounds__(kernel_dims<N>::THREADS, 4) __global__\n    void c_kernel(const float* y) {}\n\
+                  template <int K> __global__ __launch_bounds__(kThreads) void d_kernel(int x) {}\n";
+    assert_eq!(kernels_declared(source), ["a_kernel", "b_kernel", "c_kernel", "d_kernel"]);
+}
+
+/// The full-rate rule's list is one place (#503, #512): every `__global__`
+/// function of a source file it names has its line, so a kernel added to one
+/// of those files is held to the rule or the test says so, and every listed
+/// kernel is in the file its line names. #488's exceptions each name that
+/// issue, and no kernel is listed twice.
+#[test]
+fn the_full_rate_list_holds_every_kernel_of_the_files_it_names() {
+    let repo = repo();
+    let listed = full_rate_list(&repo);
+    let mut seen = std::collections::HashSet::new();
+    for line in &listed {
+        assert!(["mma", "cuda", "exempt", "control"].contains(&line.role.as_str()), "{}: unknown role {}", line.name, line.role);
+        assert!(seen.insert(line.name.clone()), "{} is listed twice", line.name);
+        match line.role.as_str() {
+            "mma" | "cuda" => assert!(line.file.is_some(), "{}: a covered kernel names its source file", line.name),
+            _ => assert!(line.file.is_none(), "{}: only a covered kernel names a source file", line.name),
+        }
+        if line.role == "exempt" {
+            assert!(line.comment.contains("#488"), "{}: an exception names the issue that decided it", line.name);
+        }
+    }
+    assert!(listed.iter().any(|line| line.role == "control"), "the list holds the negative control");
+    assert!(listed.iter().any(|line| line.role == "mma"), "the list holds a GEMM or band kernel");
+    let mut files: Vec<&str> = listed.iter().filter_map(|line| line.file.as_deref()).collect();
+    files.sort();
+    files.dedup();
+    assert!(files.len() >= 3, "the dense prefill, the band and the split conv are named: {files:?}");
+    for file in files {
+        let declared = kernels_declared(&read(&repo.join(file)));
+        assert!(!declared.is_empty(), "{file} declares no kernel");
+        for name in &declared {
+            assert!(
+                listed.iter().any(|line| &line.name == name && line.file.as_deref() == Some(file)),
+                "{file} declares {name}, which mk/full-rate-kernels.txt does not list for it (docs/agents/testing.md, \"A new kernel and the full-rate rule\")"
+            );
+        }
+        for line in listed.iter().filter(|line| line.file.as_deref() == Some(file)) {
+            assert!(declared.contains(&line.name), "mk/full-rate-kernels.txt lists {} for {file}, which does not declare it", line.name);
+        }
+    }
+}
+
+/// The release check holds an `86` build to the list: the check reads the
+/// list from the one file, and the selftest, which the release workflow runs
+/// on both hosts, covers a forbidden form and the negative control.
+#[test]
+fn the_release_check_reads_the_full_rate_list_and_the_selftest_covers_it() {
+    let repo = repo();
+    let check = read(&repo.join("mk/cuda-build-check.sh"));
+    assert!(check.contains("full-rate-kernels.txt"), "the check no longer reads mk/full-rate-kernels.txt");
+    assert!(check.contains("-sass -arch sm_86"), "the check no longer dumps the sm_86 SASS");
+    let selftest = read(&repo.join("mk/cuda-build-check-selftest.sh"));
+    for case in ["(the negative control)", "is refused, kernel and opcode named", "a passing build is read"] {
+        assert!(selftest.contains(case), "the selftest no longer covers: {case}");
+    }
+    assert!(read(&repo.join(".github/workflows/release.yml")).contains("bash mk/cuda-build-check-selftest.sh"));
+}
