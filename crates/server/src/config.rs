@@ -1206,17 +1206,19 @@ fn derive(
     let rope_scaling = s.model.rope_scaling.resolve(s.model.max_context).map_err(|e| {
         ConfigError(format!("`{} {}`: {e}", spelled("model", "max_context"), s.model.max_context))
     })?;
-    // GitHub #456: the band the card runs, whatever the field resolved to.
+    // GitHub #456: the band and the route the card runs, whatever the fields
+    // resolved to (`source::decide_by_card` decided them already; here a
+    // named value the card or the build cannot run is refused).
     let prefill_attention = arch::prefill_attention(
         s.model.prefill_attention,
-        !resolution.adapts("model", "prefill_attention"),
+        arch::GivenBy::of(resolution.origin("model", "prefill_attention")),
         sources.card.as_ref(),
         &spelled("model", "prefill_attention"),
     )
     .map_err(ConfigError)?;
     let prefill_linear = arch::prefill_linear(
         s.model.prefill_linear,
-        !resolution.adapts("model", "prefill_linear"),
+        arch::GivenBy::of(resolution.origin("model", "prefill_linear")),
         sources.card.as_ref(),
         &spelled("model", "prefill_linear"),
     )

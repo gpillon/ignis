@@ -3512,6 +3512,66 @@ fn an_8x_card_runs_the_dense_prefill_and_the_integer_band_unless_fp16_is_named()
     assert_eq!((family, shared), ((None, None), (None, None)));
 }
 
+/// Spec #503's fallback rule (GitHub #456; the review of #515): only a field
+/// left to its hardcoded default takes the card's own route. A profile's
+/// value is kept where the card runs it, so a profile's `fp16` stays the fused
+/// prefill and the FP16 band on an 8.x card as on a 12.x one, its origin the
+/// profile, through the config built from it as well as the resolution; a
+/// named `fp16` stays, from the flag, the environment or a file. Left unset,
+/// an 8.x card runs the dense prefill and the integer band, and a 12.x card
+/// the fused prefill and the FP8 band.
+#[test]
+fn only_a_default_takes_the_cards_prefill_route_and_a_profiles_fp16_stays() {
+    use source::{Candidate, Source};
+    let cards = [
+        ("8.x", card_of(24.0, "NVIDIA GeForce RTX 3090", (8, 6), "86;120a")),
+        ("12.x", card_of(31.8, "NVIDIA GeForce RTX 5090", (12, 0), "86;120a")),
+    ];
+    let fp16 = (PrefillLinear::Fp16, PrefillAttention::Fp16);
+    for (generation, card) in cards {
+        let run = |flags: &[&str], env: &'static [(&'static str, &'static str)], files: &MemFiles| {
+            let env = move |key: &str| env.iter().find(|(name, _)| *name == key).map(|(_, value)| value.to_string());
+            resolve_on(&args(flags), env, files, &|| card.clone()).map(expect_config).unwrap()
+        };
+        let routes = |config: &Config| (config.prefill_linear, config.prefill_attention);
+        let no_files = MemFiles::default();
+
+        let default = run(&["--profile", "none"], &[], &no_files);
+        let card_route = if generation == "8.x" {
+            (PrefillLinear::Int8, PrefillAttention::Int8)
+        } else {
+            (PrefillLinear::Fp16, PrefillAttention::Fp8)
+        };
+        assert_eq!(routes(&default), card_route, "{generation}: the default");
+
+        let flag = run(&["--model-prefill-linear", "fp16", "--model-prefill-attention", "fp16"], &[], &no_files);
+        let env = run(&[], &[("IGNIS_MODEL_PREFILL_LINEAR", "fp16"), ("IGNIS_MODEL_PREFILL_ATTENTION", "fp16")], &no_files);
+        let file = MemFiles::with(&[("c.yaml", "model:\n  prefill_linear: fp16\n  prefill_attention: fp16\n")]);
+        let file = run(&["--config", "c.yaml"], &[], &file);
+        for (source, config) in [("flag", flag), ("env", env), ("file", file)] {
+            assert_eq!(routes(&config), fp16, "{generation}: `fp16` named by the {source}");
+        }
+
+        let mut sources = default.basis.sources().clone();
+        for name in ["prefill_linear", "prefill_attention"] {
+            let field = schema::field("model", name).unwrap();
+            sources.profile.set(field, None, Candidate { raw: "fp16".into(), spelling: "rtx-test".into() }).unwrap();
+        }
+        let resolution = source::resolve_settings(&sources, Some(ModelFamily::Qwen38_27b), source::Fit::Switch).unwrap();
+        let shown = resolution.settings.render();
+        assert_eq!(
+            (&shown["model"]["prefill_linear"], &shown["model"]["prefill_attention"]),
+            (&"fp16".into(), &"fp16".into()),
+            "{generation}: a profile's `fp16`"
+        );
+        for name in ["prefill_linear", "prefill_attention"] {
+            assert_eq!(resolution.origin("model", name).unwrap().source, Source::Profile, "{generation}: {name}'s origin");
+        }
+        let profiled = Config::from_sources(sources).unwrap().for_family(ModelFamily::Qwen38_27b).unwrap();
+        assert_eq!(routes(&profiled), fp16, "{generation}: the config a profile's `fp16` builds");
+    }
+}
+
 /// `rtx50-16gb` for the 27B: the values the spec derives, and Flash-Next
 /// started under it resolves without refusal.
 #[test]

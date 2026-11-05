@@ -8,9 +8,12 @@
 
 use std::fmt;
 
-/// `--model-prefill-attention`: `fp8` (the default), `fp16` or `int8`.
-/// `8bit` is the 8-bit band on whichever card the load runs (spec #503):
-/// [`Self::parse`] reads it, and `fp8`, as [`Self::Fp8`].
+/// `--model-prefill-attention`: the 8-bit band (the default), `fp16` or
+/// `int8`. `8bit` and `fp8` are two spellings of the 8-bit band (spec #503):
+/// [`Self::parse`] reads both as [`Self::Fp8`], which is the block-scaled FP8
+/// band on an RTX 50 or RTX PRO card and the integer band on an 8.x card,
+/// where the server's decision makes it [`Self::Int8`]. It renders `fp8`
+/// ([`Self::as_str`]), so a report reads `fp8` on Blackwell and `int8` on 8.x.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PrefillAttention {
     /// The band pass in 8 bits: Q·Kᵀ in INT8, P·V in E4M3.
@@ -25,7 +28,8 @@ pub enum PrefillAttention {
 }
 
 impl PrefillAttention {
-    /// The spellings `parse` accepts, canonical first.
+    /// The spellings `parse` accepts: `8bit` and `fp8` name the same band,
+    /// rendered `fp8`.
     pub const NAMES: [&'static str; 4] = ["8bit", "fp8", "fp16", "int8"];
 
     /// `struct ignis_model_load_options::prefill_attention`: 0 = 8-bit,
@@ -68,7 +72,8 @@ impl fmt::Display for PrefillAttention {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PrefillLinear {
     /// The fused prefill: the trellis decoded inside the GEMM's inner loop,
-    /// the multiply in f16. Today's route and the default.
+    /// the multiply in f16. The field's default, which an RTX 50 or RTX PRO
+    /// card runs; an 8.x card left to it runs the dense prefill (GitHub #515).
     #[default]
     Fp16,
     /// The dense prefill: each matrix decoded once per chunk into one INT8
@@ -138,11 +143,14 @@ mod tests {
         assert!(PrefillLinear::parse("fp8").unwrap_err().contains("int8"));
     }
 
+    /// Every spelling reads back as itself, but `8bit`: it and `fp8` are two
+    /// spellings of the 8-bit band, which renders `fp8`.
     #[test]
     fn parse_is_case_insensitive_and_refuses_the_rest() {
         assert_eq!(PrefillAttention::parse("FP16"), Ok(PrefillAttention::Fp16));
-        for name in PrefillAttention::NAMES.into_iter().filter(|name| *name != "8bit") {
-            assert_eq!(PrefillAttention::parse(name).map(PrefillAttention::as_str), Ok(name));
+        for name in PrefillAttention::NAMES {
+            let rendered = if name == "8bit" { "fp8" } else { name };
+            assert_eq!(PrefillAttention::parse(name).map(PrefillAttention::as_str), Ok(rendered), "{name}");
         }
         assert!(PrefillAttention::parse("bf16").unwrap_err().contains("fp16"));
     }

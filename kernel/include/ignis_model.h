@@ -266,7 +266,9 @@ enum ignis_prefill_attention {
  * fused op's decode route either way (GitHub #509). */
 enum ignis_prefill_linear {
   /* The fused prefill: the trellis decoded inside the GEMM's inner loop, the
-   * multiply in f16. Today's route. */
+   * multiply in f16. A zeroed option's route; the server sends it on an RTX
+   * 50 or RTX PRO card unless the dense prefill is named, and on an 8.x card
+   * only when it is named (`--model-prefill-linear fp16`, GitHub #515). */
   IGNIS_PREFILL_LINEAR_FUSED = 0,
   /* The dense prefill (GitHub #509): each matrix decoded once per chunk into
    * INT8, the activations quantized to INT8 per token, our own s8 GEMM

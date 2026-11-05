@@ -14,6 +14,7 @@ use ignis_core::compute::ModelFamily;
 use ignis_core::{ExceptionWeights, PrefillAttention, PrefillLinear};
 
 use super::profile::CardReading;
+use super::source::{Origin, Source};
 
 /// A card's compute capability, as the CUDA runtime reports it: `8.6`, `12.0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -382,16 +383,34 @@ pub const fn prefill_route_built(route: PrefillRoute) -> bool {
     }
 }
 
-/// Whether `route` is what an 8.x card runs when nothing names it: the one
-/// place that says so (spec #503, GitHub #515). Both routes are: an RTX 30 or
-/// RTX 40 card with `--model-prefill-linear` and `--model-prefill-attention`
-/// unset runs the dense prefill and the integer band, and `fp16` for either
-/// names the fused prefill or the FP16 band instead. A Blackwell card keeps
-/// its fused prefill and its block-scaled FP8 band; nothing here moves it.
-pub const fn prefill_route_is_the_8x_default(route: PrefillRoute) -> bool {
-    match route {
-        PrefillRoute::DensePrefill => true,
-        PrefillRoute::IntegerBand => true,
+/// Who gave a prefill route's value (spec #503's fallback rule, GitHub
+/// #456): what decides whether the card replaces it, keeps it or refuses it.
+/// Only a field left to its hardcoded default takes the card's own route; a
+/// profile's value is kept wherever the card and the build run it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GivenBy {
+    /// No one: the field's hardcoded default, which an 8.x card replaces with
+    /// its own route (GitHub #515).
+    Default,
+    /// A hardware profile, or the card's own decision already made
+    /// ([`Source::Card`]): kept where the card and the build run it, the
+    /// fallback where they do not.
+    Profile,
+    /// The operator, from a flag, the environment, a file or a live patch:
+    /// kept, or refused by its spelling where the card or the build cannot
+    /// run it.
+    Operator,
+}
+
+impl GivenBy {
+    /// The giver of a value whose origin is `origin` (`None`: the hardcoded
+    /// default, as [`super::source::Resolution::origin`] reports it).
+    pub fn of(origin: Option<&Origin>) -> Self {
+        match origin.map(|origin| origin.source) {
+            None | Some(Source::Default) => Self::Default,
+            Some(Source::Profile | Source::Card) => Self::Profile,
+            Some(Source::Patch | Source::Flag | Source::Env | Source::File) => Self::Operator,
+        }
     }
 }
 
@@ -402,44 +421,38 @@ fn is_8x(card: Option<&CardReading>) -> bool {
 }
 
 /// The 27B's prompt attention band on `card` (`--model-prefill-attention`,
-/// GitHub #456, #505, #510): `resolved` where the card and the build run it.
-/// The 8-bit band (`8bit`, `fp8`) is the integer band on an 8.x card and
-/// today's block-scaled FP8 band elsewhere; `int8` names the integer band on
-/// every card, and a profile gives it on an 8.x card alone. A default's or a
-/// profile's 8-bit band is the FP16 band on an 8.x card while the integer
-/// band is opt-in there ([`prefill_route_is_the_8x_default`]). A band the
-/// build cannot run is the FP16 band on an 8.x card (the FP8 band elsewhere)
-/// when the operator left the field to its default or a profile, and a
-/// refusal naming `spelled` when they named it (`named`).
+/// GitHub #456, #505, #510, #515): `resolved` where the card and the build
+/// run it. The 8-bit band, spelled `8bit` or `fp8`, is the integer band on an
+/// 8.x card, so the default there is the integer band, and today's
+/// block-scaled FP8 band elsewhere; `int8` names the integer band on every
+/// card, and a profile gives it on an 8.x card alone. `fp16` is kept from
+/// every source. A band the build cannot run is the FP16 band on an 8.x card
+/// (the FP8 band elsewhere) when a default or a profile `given` it, and a
+/// refusal naming `spelled` when the operator named it.
 pub fn prefill_attention(
     resolved: PrefillAttention,
-    named: bool,
+    given: GivenBy,
     card: Option<&CardReading>,
     spelled: &str,
 ) -> Result<PrefillAttention, String> {
-    prefill_attention_with(resolved, named, card, spelled, prefill_route_built)
+    prefill_attention_with(resolved, given, card, spelled, prefill_route_built)
 }
 
 /// [`prefill_attention`] with the build's routes given, for the tests that
 /// flip one.
 pub fn prefill_attention_with(
     resolved: PrefillAttention,
-    named: bool,
+    given: GivenBy,
     card: Option<&CardReading>,
     spelled: &str,
     built: impl Fn(PrefillRoute) -> bool,
 ) -> Result<PrefillAttention, String> {
     let on_8x = is_8x(card);
-    let band = match resolved {
-        PrefillAttention::Fp8 if on_8x && !named && !prefill_route_is_the_8x_default(PrefillRoute::IntegerBand) => {
-            return Ok(PrefillAttention::Fp16);
-        }
-        PrefillAttention::Fp8 if on_8x => PrefillAttention::Int8,
-        other => other,
-    };
+    let band = if on_8x && resolved == PrefillAttention::Fp8 { PrefillAttention::Int8 } else { resolved };
     if band != PrefillAttention::Int8 {
         return Ok(band);
     }
+    let named = given == GivenBy::Operator;
     if !on_8x && !named {
         // No default or profile on another card selects the integer band.
         return Ok(PrefillAttention::Fp8);
@@ -464,42 +477,37 @@ pub fn prefill_attention_with(
 }
 
 /// The 27B's trellis prefill route on `card` (`--model-prefill-linear`,
-/// spec #503, GitHub #505): `resolved` where the build runs it. The dense
-/// prefill (`int8`) is the default and a profile's on an 8.x card alone
-/// ([`prefill_route_is_the_8x_default`]; `fp16` names the fused prefill
-/// there); on another card it runs only when named. One the build does not carry is the
-/// fused prefill (`fp16`) when a default or a profile gave it, and a refusal
-/// naming `spelled` when the operator named it (`named`).
+/// spec #503, GitHub #505, #515): `resolved` where the build runs it. Left to
+/// its default, the field is the dense prefill (`int8`) on an 8.x card and
+/// the fused prefill (`fp16`) elsewhere; a profile's or a named `fp16` is
+/// kept on every card; a profile's `int8` runs on an 8.x card alone, a named
+/// one on every card. One the build does not carry is the fused prefill when
+/// a default or a profile `given` it, and a refusal naming `spelled` when the
+/// operator named it.
 pub fn prefill_linear(
     resolved: PrefillLinear,
-    named: bool,
+    given: GivenBy,
     card: Option<&CardReading>,
     spelled: &str,
 ) -> Result<PrefillLinear, String> {
-    prefill_linear_with(resolved, named, card, spelled, prefill_route_built)
+    prefill_linear_with(resolved, given, card, spelled, prefill_route_built)
 }
 
 /// [`prefill_linear`] with the build's routes given, for the tests that flip
 /// one.
 pub fn prefill_linear_with(
     resolved: PrefillLinear,
-    named: bool,
+    given: GivenBy,
     card: Option<&CardReading>,
     spelled: &str,
     built: impl Fn(PrefillRoute) -> bool,
 ) -> Result<PrefillLinear, String> {
-    if resolved == PrefillLinear::Fp16
-        && !named
-        && is_8x(card)
-        && prefill_route_is_the_8x_default(PrefillRoute::DensePrefill)
-        && built(PrefillRoute::DensePrefill)
-    {
-        // Left unset on an 8.x card: the dense prefill (GitHub #515).
-        return Ok(PrefillLinear::Int8);
+    // Left to its default on an 8.x card: the dense prefill (GitHub #515).
+    let wanted = if given == GivenBy::Default && is_8x(card) { PrefillLinear::Int8 } else { resolved };
+    if wanted != PrefillLinear::Int8 {
+        return Ok(wanted);
     }
-    if resolved != PrefillLinear::Int8 {
-        return Ok(resolved);
-    }
+    let named = given == GivenBy::Operator;
     if !built(PrefillRoute::DensePrefill) {
         return if named {
             Err(format!(
@@ -512,6 +520,26 @@ pub fn prefill_linear_with(
     }
     // Built: no default or profile on a Blackwell card selects it.
     Ok(if named || is_8x(card) { PrefillLinear::Int8 } else { PrefillLinear::Fp16 })
+}
+
+/// The refusal of the 27B's dense prefill on an artifact whose body is
+/// NVFP4 (`nvfp4_body`, asked only for `int8`), which has no trellis matrix
+/// to decode (GitHub #509; the review of spec #503), naming the option as
+/// `spelled` gave it. Only a named `int8` reaches it: no default or profile
+/// selects the dense prefill on an RTX 50 or RTX PRO card, and on an 8.x
+/// card [`load_refusal`] refuses the NVFP4 artifact first. The leaf refuses
+/// the same load too, by its option's number.
+pub fn prefill_linear_refusal(
+    prefill_linear: PrefillLinear,
+    nvfp4_body: impl FnOnce() -> bool,
+    spelled: &str,
+) -> Option<String> {
+    (prefill_linear == PrefillLinear::Int8 && nvfp4_body()).then(|| {
+        format!(
+            "`{spelled} int8` names the dense prefill, which decodes the trellis body's matrices, and this artifact's \
+             body is NVFP4: name `fp16` or leave it unset, or load the 27B's trellis artifact (`--model-id qwen3.8-27b-16g`)"
+        )
+    })
 }
 
 /// Whether a load of `family` on a card of `generation` publishes its
@@ -668,21 +696,39 @@ mod tests {
     }
 
     /// On an Ampere card the prompt attention's band left to its default is
-    /// the integer one (GitHub #515; it was the FP16 band until then), a named
-    /// `fp16` stays, and a named `fp8` runs the integer band (a build without
-    /// it refuses it by its spelling, which
+    /// the integer one (GitHub #515; it was the FP16 band until then), a
+    /// profile's or a named `fp16` stays, and a named `fp8` runs the integer
+    /// band (a build without it refuses it by its spelling, which
     /// `the_prefill_attention_without_the_integer_band_built` holds); a
     /// Blackwell card and no card at all keep what resolved.
     #[test]
     fn the_prefill_attention_follows_the_card() {
+        use GivenBy::*;
         let (fp8, fp16) = (PrefillAttention::Fp8, PrefillAttention::Fp16);
         let flag = "--model-prefill-attention";
-        assert_eq!(prefill_attention(fp8, false, Some(&ampere()), flag), Ok(PrefillAttention::Int8));
-        assert_eq!(prefill_attention(fp16, true, Some(&ampere()), flag), Ok(fp16));
-        assert_eq!(prefill_attention(fp8, true, Some(&ampere()), flag), Ok(PrefillAttention::Int8));
-        for named in [false, true] {
-            assert_eq!(prefill_attention(fp8, named, Some(&blackwell()), flag), Ok(fp8));
-            assert_eq!(prefill_attention(fp8, named, None, flag), Ok(fp8));
+        assert_eq!(prefill_attention(fp8, Default, Some(&ampere()), flag), Ok(PrefillAttention::Int8));
+        for given in [Profile, Operator] {
+            assert_eq!(prefill_attention(fp16, given, Some(&ampere()), flag), Ok(fp16), "{given:?}");
+            assert_eq!(prefill_attention(fp8, given, Some(&ampere()), flag), Ok(PrefillAttention::Int8), "{given:?}");
+        }
+        for given in [Default, Profile, Operator] {
+            assert_eq!(prefill_attention(fp8, given, Some(&blackwell()), flag), Ok(fp8));
+            assert_eq!(prefill_attention(fp8, given, None, flag), Ok(fp8));
+        }
+    }
+
+    /// Who gave a value, by its origin: the hardcoded default (no origin),
+    /// the profile or the card's decision, the operator from any source.
+    #[test]
+    fn the_giver_of_a_value_is_its_origins_source() {
+        let origin = |source| Origin { source, spelling: String::new(), at_default: false, scoped: false };
+        assert_eq!(GivenBy::of(None), GivenBy::Default);
+        assert_eq!(GivenBy::of(Some(&origin(Source::Default))), GivenBy::Default);
+        for source in [Source::Profile, Source::Card] {
+            assert_eq!(GivenBy::of(Some(&origin(source))), GivenBy::Profile, "{source:?}");
+        }
+        for source in [Source::Patch, Source::Flag, Source::Env, Source::File] {
+            assert_eq!(GivenBy::of(Some(&origin(source))), GivenBy::Operator, "{source:?}");
         }
     }
 
@@ -723,24 +769,27 @@ mod tests {
         }
     }
 
-    /// Spec #503 (GitHub #505, #509, #510): the build says whether it carries a
-    /// route ([`prefill_route_built`]): both, the dense prefill and the integer
-    /// band. Neither is yet what an 8.x card runs when nothing names it
-    /// ([`prefill_route_is_the_8x_default`]): both are, since #515.
+    /// Spec #503 (GitHub #505, #509, #510, #515): the build carries both
+    /// routes ([`prefill_route_built`]), the dense prefill and the integer
+    /// band, and an 8.x card runs the dense prefill when the field is left to
+    /// its default; a profile's or a named `fp16` keeps the fused prefill
+    /// there, and Blackwell runs the dense prefill only when named.
     #[test]
-    fn this_build_carries_both_routes_and_both_are_the_8x_default() {
+    fn this_build_carries_both_routes_and_an_8x_card_runs_the_dense_prefill_by_default() {
+        use GivenBy::*;
         assert!(prefill_route_built(PrefillRoute::DensePrefill));
         assert!(prefill_route_built(PrefillRoute::IntegerBand));
-        assert!(prefill_route_is_the_8x_default(PrefillRoute::DensePrefill));
-        assert!(prefill_route_is_the_8x_default(PrefillRoute::IntegerBand));
         let flag = "--model-prefill-linear";
         let (a, b) = (ampere(), blackwell());
-        assert_eq!(prefill_linear(PrefillLinear::Fp16, false, Some(&a), flag), Ok(PrefillLinear::Int8), "8.x: unset");
-        assert_eq!(prefill_linear(PrefillLinear::Fp16, true, Some(&a), flag), Ok(PrefillLinear::Fp16), "8.x: fp16 named");
-        assert_eq!(prefill_linear(PrefillLinear::Fp16, false, Some(&b), flag), Ok(PrefillLinear::Fp16), "Blackwell: unset");
-        assert_eq!(prefill_linear(PrefillLinear::Int8, true, Some(&a), flag), Ok(PrefillLinear::Int8), "8.x: named");
-        assert_eq!(prefill_linear(PrefillLinear::Int8, true, Some(&b), flag), Ok(PrefillLinear::Int8), "Blackwell: named");
-        assert_eq!(prefill_linear(PrefillLinear::Int8, false, Some(&b), flag), Ok(PrefillLinear::Fp16), "Blackwell: a profile's falls back");
+        assert_eq!(prefill_linear(PrefillLinear::Fp16, Default, Some(&a), flag), Ok(PrefillLinear::Int8), "8.x: unset");
+        assert_eq!(prefill_linear(PrefillLinear::Fp16, Profile, Some(&a), flag), Ok(PrefillLinear::Fp16), "8.x: a profile's fp16");
+        assert_eq!(prefill_linear(PrefillLinear::Fp16, Operator, Some(&a), flag), Ok(PrefillLinear::Fp16), "8.x: fp16 named");
+        assert_eq!(prefill_linear(PrefillLinear::Fp16, Default, Some(&b), flag), Ok(PrefillLinear::Fp16), "Blackwell: unset");
+        assert_eq!(prefill_linear(PrefillLinear::Int8, Profile, Some(&a), flag), Ok(PrefillLinear::Int8), "8.x: a profile's");
+        assert_eq!(prefill_linear(PrefillLinear::Int8, Operator, Some(&a), flag), Ok(PrefillLinear::Int8), "8.x: named");
+        assert_eq!(prefill_linear(PrefillLinear::Int8, Operator, Some(&b), flag), Ok(PrefillLinear::Int8), "Blackwell: named");
+        assert_eq!(prefill_linear(PrefillLinear::Int8, Profile, Some(&b), flag), Ok(PrefillLinear::Fp16), "Blackwell: a profile's falls back");
+        assert_eq!(prefill_linear(PrefillLinear::Fp16, Default, None, flag), Ok(PrefillLinear::Fp16), "no card read: unset");
     }
 
     /// The prompt attention band by generation, with the integer band not
@@ -750,25 +799,28 @@ mod tests {
     /// back; `fp16` runs everywhere; Blackwell keeps its FP8 band.
     #[test]
     fn the_prefill_attention_without_the_integer_band_built() {
+        use GivenBy::*;
         let none = |_: PrefillRoute| false;
         let flag = "--model-prefill-attention";
         for card in [ampere(), card("NVIDIA GeForce RTX 4090", cc(8, 9), "86;120a")] {
             let c = Some(&card);
-            assert_eq!(prefill_attention_with(PrefillAttention::Fp8, false, c, flag, none), Ok(PrefillAttention::Fp16));
-            assert_eq!(prefill_attention_with(PrefillAttention::Int8, false, c, flag, none), Ok(PrefillAttention::Fp16));
-            assert_eq!(prefill_attention_with(PrefillAttention::Fp16, true, c, flag, none), Ok(PrefillAttention::Fp16));
-            let fp8 = prefill_attention_with(PrefillAttention::Fp8, true, c, flag, none).unwrap_err();
+            for given in [Default, Profile] {
+                assert_eq!(prefill_attention_with(PrefillAttention::Fp8, given, c, flag, none), Ok(PrefillAttention::Fp16));
+                assert_eq!(prefill_attention_with(PrefillAttention::Int8, given, c, flag, none), Ok(PrefillAttention::Fp16));
+            }
+            assert_eq!(prefill_attention_with(PrefillAttention::Fp16, Operator, c, flag, none), Ok(PrefillAttention::Fp16));
+            let fp8 = prefill_attention_with(PrefillAttention::Fp8, Operator, c, flag, none).unwrap_err();
             assert!(fp8.contains("`--model-prefill-attention fp8`") && fp8.contains("integer band") && fp8.contains("not carry"), "{fp8}");
-            let int8 = prefill_attention_with(PrefillAttention::Int8, true, c, flag, none).unwrap_err();
+            let int8 = prefill_attention_with(PrefillAttention::Int8, Operator, c, flag, none).unwrap_err();
             assert!(int8.contains("`--model-prefill-attention int8`") && int8.contains(&card.name), "{int8}");
         }
         let b = blackwell();
         let c = Some(&b);
-        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, true, c, flag, none), Ok(PrefillAttention::Fp8));
-        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, false, c, flag, none), Ok(PrefillAttention::Fp8));
-        assert_eq!(prefill_attention_with(PrefillAttention::Int8, false, c, flag, none), Ok(PrefillAttention::Fp8), "no profile selects it there");
-        assert!(prefill_attention_with(PrefillAttention::Int8, true, c, flag, none).unwrap_err().contains("int8"));
-        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, true, None, flag, none), Ok(PrefillAttention::Fp8));
+        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, Operator, c, flag, none), Ok(PrefillAttention::Fp8));
+        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, Default, c, flag, none), Ok(PrefillAttention::Fp8));
+        assert_eq!(prefill_attention_with(PrefillAttention::Int8, Profile, c, flag, none), Ok(PrefillAttention::Fp8), "no profile selects it there");
+        assert!(prefill_attention_with(PrefillAttention::Int8, Operator, c, flag, none).unwrap_err().contains("int8"));
+        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, Operator, None, flag, none), Ok(PrefillAttention::Fp8));
     }
 
     /// The same decision with the integer band built, the line #510 flips: on
@@ -777,19 +829,35 @@ mod tests {
     /// default since #515); on Blackwell it runs only when named.
     #[test]
     fn the_prefill_attention_with_the_integer_band_built() {
+        use GivenBy::*;
         let built = |route: PrefillRoute| route == PrefillRoute::IntegerBand;
         let (a, b) = (ampere(), blackwell());
-        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, true, Some(&a), "", built), Ok(PrefillAttention::Int8));
-        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, false, Some(&a), "", built), Ok(PrefillAttention::Int8));
-        assert_eq!(prefill_attention(PrefillAttention::Fp8, false, Some(&a), ""), Ok(PrefillAttention::Int8), "the build's own");
-        assert_eq!(prefill_attention(PrefillAttention::Fp8, true, Some(&a), ""), Ok(PrefillAttention::Int8), "the build's own");
-        for named in [false, true] {
-            assert_eq!(prefill_attention_with(PrefillAttention::Int8, named, Some(&a), "", built), Ok(PrefillAttention::Int8));
-            assert_eq!(prefill_attention_with(PrefillAttention::Fp8, named, Some(&b), "", built), Ok(PrefillAttention::Fp8));
+        for given in [Default, Profile, Operator] {
+            assert_eq!(prefill_attention_with(PrefillAttention::Fp8, given, Some(&a), "", built), Ok(PrefillAttention::Int8));
+            assert_eq!(prefill_attention(PrefillAttention::Fp8, given, Some(&a), ""), Ok(PrefillAttention::Int8), "the build's own");
+            assert_eq!(prefill_attention_with(PrefillAttention::Fp8, given, Some(&b), "", built), Ok(PrefillAttention::Fp8));
         }
-        assert_eq!(prefill_attention_with(PrefillAttention::Int8, true, Some(&b), "", built), Ok(PrefillAttention::Int8));
-        assert_eq!(prefill_attention_with(PrefillAttention::Int8, false, Some(&b), "", built), Ok(PrefillAttention::Fp8));
-        assert_eq!(prefill_attention_with(PrefillAttention::Fp16, true, Some(&a), "", built), Ok(PrefillAttention::Fp16));
+        for given in [Profile, Operator] {
+            assert_eq!(prefill_attention_with(PrefillAttention::Int8, given, Some(&a), "", built), Ok(PrefillAttention::Int8));
+            assert_eq!(prefill_attention_with(PrefillAttention::Fp16, given, Some(&a), "", built), Ok(PrefillAttention::Fp16));
+        }
+        assert_eq!(prefill_attention_with(PrefillAttention::Int8, Operator, Some(&b), "", built), Ok(PrefillAttention::Int8));
+        assert_eq!(prefill_attention_with(PrefillAttention::Int8, Profile, Some(&b), "", built), Ok(PrefillAttention::Fp8));
+    }
+
+    /// The dense prefill on the NVFP4 artifact is refused naming the option
+    /// as it was spelled; on the trellis artifact, and for `fp16`, nothing is
+    /// refused, and the artifact is asked about its body for `int8` alone.
+    #[test]
+    fn the_dense_prefill_on_an_nvfp4_body_is_refused_naming_the_option() {
+        let never = || -> bool { panic!("the body is asked only for int8") };
+        for spelled in ["--model-prefill-linear", "IGNIS_MODEL_PREFILL_LINEAR"] {
+            let refusal = prefill_linear_refusal(PrefillLinear::Int8, || true, spelled).unwrap();
+            assert!(refusal.starts_with(&format!("`{spelled} int8` names the dense prefill")), "{refusal}");
+            assert!(refusal.contains("NVFP4") && refusal.contains("`fp16`") && refusal.contains("qwen3.8-27b-16g"), "{refusal}");
+        }
+        assert_eq!(prefill_linear_refusal(PrefillLinear::Int8, || false, "--model-prefill-linear"), None, "the trellis artifact");
+        assert_eq!(prefill_linear_refusal(PrefillLinear::Fp16, never, "--model-prefill-linear"), None);
     }
 
     /// GitHub #508 (spec #503): the 27B's generation-opener page rides the
@@ -812,29 +880,34 @@ mod tests {
         }
     }
 
-    /// The trellis prefill route: `fp16` runs everywhere; `int8` named is
-    /// refused while the dense prefill is not built and a default or profile
-    /// one falls back; built, it runs on 8.x from any source and on
-    /// Blackwell only when named.
+    /// The trellis prefill route: `fp16` given by a profile or named runs
+    /// everywhere; `int8` named is refused while the dense prefill is not
+    /// built and a default or profile one falls back; built, it runs on 8.x
+    /// from the default, a profile or the operator, and on Blackwell only
+    /// when named.
     #[test]
     fn the_prefill_linear_follows_the_build_and_the_generation() {
+        use GivenBy::*;
         let flag = "--model-prefill-linear";
         let none = |_: PrefillRoute| false;
         let built = |route: PrefillRoute| route == PrefillRoute::DensePrefill;
         let (a, b) = (ampere(), blackwell());
         for card in [Some(&a), Some(&b), None] {
-            assert_eq!(prefill_linear_with(PrefillLinear::Fp16, true, card, flag, none), Ok(PrefillLinear::Fp16));
-            assert_eq!(prefill_linear_with(PrefillLinear::Int8, false, card, flag, none), Ok(PrefillLinear::Fp16));
-            let refused = prefill_linear_with(PrefillLinear::Int8, true, card, flag, none).unwrap_err();
+            for given in [Profile, Operator] {
+                assert_eq!(prefill_linear_with(PrefillLinear::Fp16, given, card, flag, none), Ok(PrefillLinear::Fp16));
+                assert_eq!(prefill_linear_with(PrefillLinear::Fp16, given, card, flag, built), Ok(PrefillLinear::Fp16));
+            }
+            assert_eq!(prefill_linear_with(PrefillLinear::Int8, Profile, card, flag, none), Ok(PrefillLinear::Fp16));
+            let refused = prefill_linear_with(PrefillLinear::Int8, Operator, card, flag, none).unwrap_err();
             assert!(refused.contains("`--model-prefill-linear int8`") && refused.contains("dense prefill") && refused.contains("not carry"), "{refused}");
         }
-        assert_eq!(prefill_linear_with(PrefillLinear::Int8, false, Some(&a), flag, built), Ok(PrefillLinear::Int8));
-        assert_eq!(prefill_linear_with(PrefillLinear::Fp16, false, Some(&a), flag, built), Ok(PrefillLinear::Int8), "unset on 8.x");
-        assert_eq!(prefill_linear_with(PrefillLinear::Fp16, false, Some(&a), flag, none), Ok(PrefillLinear::Fp16), "not built: fused");
-        assert_eq!(prefill_linear_with(PrefillLinear::Fp16, false, Some(&b), flag, built), Ok(PrefillLinear::Fp16), "unset on Blackwell");
-        assert_eq!(prefill_linear_with(PrefillLinear::Int8, true, Some(&a), flag, built), Ok(PrefillLinear::Int8));
-        assert_eq!(prefill_linear_with(PrefillLinear::Int8, true, Some(&b), flag, built), Ok(PrefillLinear::Int8));
-        assert_eq!(prefill_linear_with(PrefillLinear::Int8, false, Some(&b), flag, built), Ok(PrefillLinear::Fp16), "no profile selects it there");
-        assert_eq!(prefill_linear(PrefillLinear::Fp16, true, Some(&a), flag), Ok(PrefillLinear::Fp16));
+        assert_eq!(prefill_linear_with(PrefillLinear::Int8, Profile, Some(&a), flag, built), Ok(PrefillLinear::Int8));
+        assert_eq!(prefill_linear_with(PrefillLinear::Fp16, Default, Some(&a), flag, built), Ok(PrefillLinear::Int8), "unset on 8.x");
+        assert_eq!(prefill_linear_with(PrefillLinear::Fp16, Default, Some(&a), flag, none), Ok(PrefillLinear::Fp16), "not built: fused");
+        assert_eq!(prefill_linear_with(PrefillLinear::Fp16, Default, Some(&b), flag, built), Ok(PrefillLinear::Fp16), "unset on Blackwell");
+        assert_eq!(prefill_linear_with(PrefillLinear::Int8, Operator, Some(&a), flag, built), Ok(PrefillLinear::Int8));
+        assert_eq!(prefill_linear_with(PrefillLinear::Int8, Operator, Some(&b), flag, built), Ok(PrefillLinear::Int8));
+        assert_eq!(prefill_linear_with(PrefillLinear::Int8, Profile, Some(&b), flag, built), Ok(PrefillLinear::Fp16), "no profile selects it there");
+        assert_eq!(prefill_linear(PrefillLinear::Fp16, Operator, Some(&a), flag), Ok(PrefillLinear::Fp16));
     }
 }
