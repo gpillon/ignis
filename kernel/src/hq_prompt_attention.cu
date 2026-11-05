@@ -47,10 +47,15 @@
 //     FP16 at half the keys, Q K^T and P V on the FP16 MMAs with FP16 accumulate inside a tile
 //     (the rate GeForce runs at twice FP32 accumulate), P = p in FP16, each tile's P V folded into
 //     the FP32 O; Q pre-scaled by 1/16 as upstream's BF16 path does.
+//   - The integer band (IgnisHqPromptPrecision::kInt8, GitHub #510, spec #503): the 8-bit band
+//     for a card without the FP8 MMA, on integer MMAs alone, for the band and the window both. Its
+//     kernels are kernel/src/hq_prompt_int8.cu's; this file stores its K tiles and its Q.
 //   - One geometry: 24 query heads over 4 KV heads of 256, one sequence.
 
 #include "ignis_hq_prompt_attention.h"
 
+#include "hq_prompt_common.cuh"
+#include "hq_prompt_int8.h"
 #include "hq_prompt_keys.cuh"
 
 #include "ninfer/ops/gqa_attention.h"
@@ -72,29 +77,12 @@
 
 namespace {
 
-using Geometry = ninfer::ops::Gqa27Geometry;
-
-constexpr int kHeadDim = 256;
-constexpr int kQHeads = Geometry::QHeads;    // 24
-constexpr int kKvHeads = Geometry::KVHeads;  // 4
-constexpr int kGroup = Geometry::GroupSize;  // 6
-constexpr int kTile = static_cast<int>(kIgnisHqPromptTileKeys);  // keys per tile
 constexpr int kSinks = static_cast<int>(ninfer::ops::kGqaHqSinkKeys);
 constexpr int kRing = static_cast<int>(ninfer::ops::kGqaHqRecentKeys);
-constexpr int kQ = 64;  // query tokens per CTA
-constexpr int kHeadsPerCta = 2;
-constexpr int kHeadPairs = kGroup / kHeadsPerCta;        // 3
-constexpr int kFaThreads = kHeadsPerCta * kQ / 16 * 32;  // 256
-constexpr int kVtTileBytes = kHeadDim * kTile;           // 8 KiB of E4M3 V^T
-constexpr float kLog2e = 1.4426950408889634f;
 constexpr float kE4m3Max = 448.0f;
-constexpr float kInt8Max = 127.0f;
 // The UE8M0 encoding of 2^0 in every byte: a unit block scale.
 constexpr std::uint32_t kUnitScale = 0x7F7F7F7Fu;
 constexpr int kRowThreads = 256;  // prep / merge: one warp per (token, head) row
-
-static_assert(kGroup % kHeadsPerCta == 0, "a CTA's heads share one KV group");
-static_assert(kFaThreads == 256, "the FA CTA is 8 warps");
 
 // A tile's K and V bytes in one pass: 8-bit rows of 256 bytes, or 16-bit rows of 512.
 template <bool kFp8>
@@ -117,22 +105,6 @@ constexpr int kFaSmemBytes = 2 * kStageBytes<kFp8>;  // two stages: 32 KiB (FP8)
 #define IGNIS_HQ_PROMPT_FP8_BAND 1
 #endif
 
-__device__ __forceinline__ std::uint32_t smem_u32(const void *p) {
-  return static_cast<std::uint32_t>(__cvta_generic_to_shared(p));
-}
-__device__ __forceinline__ void cp_async16(std::uint32_t smem, const void *g) {
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem), "l"(g));
-}
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;"); }
-template <int N>
-__device__ __forceinline__ void cp_wait() {
-  asm volatile("cp.async.wait_group %0;" ::"n"(N));
-}
-__device__ __forceinline__ void ldsm_x4(std::uint32_t *r, std::uint32_t smem) {
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(smem));
-}
 __device__ __forceinline__ void ldsm_x4_trans(std::uint32_t *r, std::uint32_t smem) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
@@ -158,14 +130,6 @@ __device__ __forceinline__ void mma_f16acc(std::uint32_t *d, const std::uint32_t
 __device__ __forceinline__ float2 half2_bits(std::uint32_t x) {
   return __half22float2(*reinterpret_cast<const __half2 *>(&x));
 }
-// D += A B over INT8, int32 accumulate (exact): the band's Q K^T.
-__device__ __forceinline__ void mma_s8(int *d, const std::uint32_t *a, const std::uint32_t *b) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
 // D += (A * 2^(sfa-127)) (B * 2^(sfb-127)): E4M3 m16n8k32 with fp32 accumulate on the
 // block-scaled form, which the 5090 runs at twice the plain form's rate. Every byte of a scale
 // register carries the same scale here, so which lane supplies it does not matter.
@@ -181,11 +145,6 @@ __device__ __forceinline__ void mma_e4m3(float *d, const std::uint32_t *a, const
 #else
   __trap();
 #endif
-}
-__device__ __forceinline__ float ex2_approx(float x) {
-  float y;
-  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-  return y;
 }
 // E4M3 of 2^a, 2^b (a in byte 0) through an f16x2 exp2: enough for the 3-bit mantissa.
 __device__ __forceinline__ std::uint32_t exp2_e4m3x2(float a, float b) {
@@ -227,50 +186,10 @@ __device__ __forceinline__ std::uint32_t pack_half(float lo, float hi) {
   const __half2 h = __floats2half2_rn(lo, hi);
   return *reinterpret_cast<const std::uint32_t *>(&h);
 }
-// One INT8 code of x (|x| <= 127 by construction), as a byte.
-__device__ __forceinline__ std::uint8_t i8(float x) {
-  return static_cast<std::uint8_t>(static_cast<std::int8_t>(max(-127, min(127, __float2int_rn(x)))));
-}
 __device__ __forceinline__ std::uint8_t e4m3(float x) {
   return static_cast<std::uint8_t>(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3));
 }
-// 16-byte unit `unit` of K (or V) row `row` in a staged tile, XOR-swizzled by row % 8 so that
-// ldmatrix is conflict-free: rows of 256 bytes on the FP8 path (upstream sw8), 512 on the BF16
-// path (upstream tc_swz).
-template <bool kFp8>
-__device__ __forceinline__ std::uint32_t row_swz(int row, int unit) {
-  return static_cast<std::uint32_t>(row * kHeadDim * (kFp8 ? 1 : 2) + ((unit ^ (row & 7)) << 4));
-}
-// 16-byte segment (dim d, keys 16 hh .. 16 hh + 15) of a staged V^T tile.
-__device__ __forceinline__ std::uint32_t vt_off(int d, int hh) {
-  return static_cast<std::uint32_t>(((2 * d + hh) ^ ((d >> 2) & 7)) << 4);
-}
-__device__ __forceinline__ float warp_max(float x) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, o));
-  return x;
-}
 
-// ---- which keys a pass reads, and where each one comes from ----------------------------------
-
-// A pass's keys in column order: column i < split is key first0 + i, a later one key
-// first1 + i - split; columns from `count` on hold no key. The window pass is the sinks then the
-// ring and the chunk; a band is one run of keys.
-struct Columns {
-  int first0;
-  int split;
-  int first1;
-  int count;
-
-  __device__ __forceinline__ int key(int i) const { return i < split ? first0 + i : first1 + i - split; }
-  // How many columns hold keys below `limit`: keys rise with the column.
-  __device__ __forceinline__ int before(int limit) const {
-    const int head = min(split, count);
-    const int n0 = max(0, min(head, limit - first0));
-    if (n0 < head || count <= split) return n0;
-    return n0 + max(0, min(count - split, limit - first1));
-  }
-};
 
 // ---- Q: rotate into the codec's frame, once per call ------------------------------------------
 
@@ -315,15 +234,6 @@ __global__ void __launch_bounds__(kRowThreads) prep_q_kernel(const __nv_bfloat16
 
 // ---- a pass's keys: one 32-key tile of one KV head and role per CTA ---------------------------
 
-// Where a pass's tiles live. 8-bit: k = INT8 [kv_head][capacity][256], v = E4M3 V^T
-// [kv_head][capacity / 32][256 dims x 32 keys], scale = [role][kv_head][capacity / 32] (K's
-// amax / 127, V's a power of two). BF16 / FP16: k, v = [kv_head][capacity][256], no scale.
-struct PassBuffers {
-  std::uint8_t *k;
-  std::uint8_t *v;
-  float *scale;
-  std::int32_t capacity;  // columns per KV head
-};
 
 __device__ __forceinline__ void store_fp8_tile(const __nv_bfloat16 *tile, bool role_v, int head,
                                                int tile_index, PassBuffers buf, float *warp_amax,
@@ -473,20 +383,6 @@ __device__ __forceinline__ void store_fp8_tile(const __nv_bfloat16 *tile, bool r
 
 // ---- the attention over one pass ----------------------------------------------------------------
 
-struct Carry {
-  // [split][token][head][256], in the rotated frame, normalized by the split's own l: FP16 keeps
-  // 11 bits of it where BF16 would keep 8, and the value stays inside V's own range.
-  __half *o;
-  float *m;          // [split][token][head], log2 units of the scaled score
-  float *l;          // [split][token][head], in units of 256 p
-};
-
-struct Queries {
-  const std::uint8_t *q8;   // INT8 [token][head][256]
-  const float *q_scale;     // [token][head]
-  const __half *qh;         // FP16 [token][head][256], over 16
-  const __nv_bfloat16 *q16; // BF16 [token][head][256]
-};
 
 // kFp8: the 8-bit band (INT8 Q K^T, E4M3 P V); kHalf: the FP16-accumulate fallback band; neither:
 // the BF16 window.
@@ -1022,6 +918,13 @@ void launch_fa(dim3 grid, Queries qs, int start, int width, float scale, Columns
   check_launch(kFp8 || kHalf ? "band attention" : "window attention");
 }
 
+// An integer pass (GitHub #510): its K tiles, tile_kernel<true>'s with K alone, then V^T and the
+// attention in hq_prompt_int8.cu. Defined at the end of the file: the existing kernels' sm_120a
+// code moves with the order the file first names them in, and tile_kernel<true> keeps its place.
+void int8_pass(const IgnisHqPromptKeys &src, const Queries &qs, int start, int width, float scale,
+               const Columns &cols, const PassBuffers &buf, int splits, int resume, const Carry &carry,
+               cudaStream_t stream);
+
 } // namespace
 
 IgnisHqPromptKeys ignis_hq_prompt_keys(const ninfer::PagedKVLayerView &cache,
@@ -1102,6 +1005,7 @@ void ignis_hq_prompt_attention(const ninfer::Tensor &q, const ninfer::Tensor &k,
   auto scope = workspace.scope();
   const Workspace ws = allocate(workspace, width, visible, options.band_keys);
   const bool half_band = options.precision == IgnisHqPromptPrecision::kFp16;
+  const bool int8_band = options.precision == IgnisHqPromptPrecision::kInt8;
   const std::uint32_t band = band_capacity(visible, options.band_keys, options.precision);
   const std::uint32_t window = window_capacity(width, visible);
   const BandArea area = band_area(width, visible, options.band_keys, window);
@@ -1119,7 +1023,8 @@ void ignis_hq_prompt_attention(const ninfer::Tensor &q, const ninfer::Tensor &k,
   qs.q8 = half_band ? nullptr : static_cast<const std::uint8_t *>(ws.q_band.data);
   qs.q_scale = static_cast<const float *>(ws.q_scale.data);
   qs.qh = half_band ? static_cast<const __half *>(ws.q_band.data) : nullptr;
-  qs.q16 = window_pass ? reinterpret_cast<const __nv_bfloat16 *>(area_base + area.q16) : nullptr;
+  qs.q16 = window_pass && !int8_band ? reinterpret_cast<const __nv_bfloat16 *>(area_base + area.q16)
+                                     : nullptr;
   const int rows = width * kQHeads;
   const int row_blocks = (rows + kRowThreads / 32 - 1) / (kRowThreads / 32);
   prep_q_kernel<<<row_blocks, kRowThreads, 0, stream>>>(
@@ -1128,7 +1033,9 @@ void ignis_hq_prompt_attention(const ninfer::Tensor &q, const ninfer::Tensor &k,
       const_cast<__nv_bfloat16 *>(qs.q16));
   check_launch("prep_q");
 
-  const std::int32_t splits = options.splits > 0 ? options.splits : pick_splits(width, visible);
+  const std::int32_t splits = options.splits > 0 ? options.splits
+                              : int8_band         ? ignis_hq_prompt_int8::splits(visible)
+                                                  : pick_splits(width, visible);
   const Carry carry{static_cast<__half *>(ws.carry_o.data),
                     static_cast<float *>(ws.carry_m.data), static_cast<float *>(ws.carry_l.data)};
   // Up to one more query tile than width / 64: the first one may start mid-block.
@@ -1136,10 +1043,21 @@ void ignis_hq_prompt_attention(const ninfer::Tensor &q, const ninfer::Tensor &k,
                      static_cast<unsigned>(kKvHeads * kHeadPairs));
   int resume = 0;
 
-  // The window pass: the sinks, then the ring before the chunk and the chunk, in BF16.
+  // The window pass: the sinks, then the ring before the chunk and the chunk, in BF16 (the
+  // integer band: on its own kernel, its INT8 K, s8 V^T and their scales in the BF16 planes' room,
+  // the scales after K).
   const auto sinks = static_cast<std::int32_t>(std::min<std::uint32_t>(kSinks, visible));
   const std::int32_t ring_from = std::max(kSinks, start_position - kRing);
-  if (window_pass) {
+  if (window_pass && int8_band) {
+    const Columns cols{0, sinks, ring_from,
+                       sinks + std::max(0, static_cast<std::int32_t>(visible) - ring_from)};
+    const PassBuffers buf{area_base + area.window_k, area_base + area.window_v,
+                          reinterpret_cast<float *>(area_base + area.window_k +
+                                                    static_cast<std::size_t>(kKvHeads) * window * kHeadDim),
+                          static_cast<std::int32_t>(window)};
+    int8_pass(src, qs, start_position, width, scale, cols, buf, splits, resume, carry, stream);
+    resume = 1;
+  } else if (window_pass) {
     const Columns cols{0, sinks, ring_from,
                        sinks + std::max(0, static_cast<std::int32_t>(visible) - ring_from)};
     const PassBuffers buf{area_base + area.window_k, area_base + area.window_v, nullptr,
@@ -1162,7 +1080,9 @@ void ignis_hq_prompt_attention(const ninfer::Tensor &q, const ninfer::Tensor &k,
     const PassBuffers buf{area_base + area.band_k, area_base + area.band_v,
                           static_cast<float *>(ws.band_scale.data), static_cast<std::int32_t>(band)};
     const dim3 tiles(static_cast<unsigned>((cols.count + kTile - 1) / kTile), kKvHeads, 2);
-    if (half_band) {
+    if (int8_band) {
+      int8_pass(src, qs, start_position, width, scale, cols, buf, splits, resume, carry, stream);
+    } else if (half_band) {
       tile_kernel<false, true><<<tiles, 256, 0, stream>>>(src, cols, buf, 0);
       check_launch("band tiles");
       launch_fa<false, true>(fa_grid, qs, start_position, width, scale, cols, buf, splits, resume,
@@ -1179,8 +1099,28 @@ void ignis_hq_prompt_attention(const ninfer::Tensor &q, const ninfer::Tensor &k,
   merge_kernel<<<row_blocks, kRowThreads, 0, stream>>>(carry, width, splits,
                                                        static_cast<__nv_bfloat16 *>(out.data));
   check_launch("merge");
+  if (options.after_merge) {
+    options.after_merge(IgnisHqPromptCarry{ws.carry_o.data, carry.m, carry.l, splits, width});
+  }
 
   if (options.after_attention) options.after_attention(src);
   if (window_pass) ninfer::ops::gqa_kv_append(k, v, positions, cache, stream);
   ninfer::ops::sigmoid_mul(gate, out, stream);
 }
+
+namespace {
+
+void int8_pass(const IgnisHqPromptKeys &src, const Queries &qs, int start, int width, float scale,
+               const Columns &cols, const PassBuffers &buf, int splits, int resume, const Carry &carry,
+               cudaStream_t stream) {
+  tile_kernel<true><<<dim3(static_cast<unsigned>((cols.count + kTile - 1) / kTile), kKvHeads, 1), 256, 0,
+                      stream>>>(src, cols, buf, 0);
+  check_launch("integer K tiles");
+  ignis_hq_prompt_int8::attend(src,
+                               {qs.q8, qs.q_scale, start, width, scale, cols.first0, cols.split, cols.first1,
+                                cols.count, buf.k, buf.v, buf.scale, buf.capacity, splits, resume, carry.o,
+                                carry.m, carry.l},
+                               stream);
+}
+
+} // namespace
