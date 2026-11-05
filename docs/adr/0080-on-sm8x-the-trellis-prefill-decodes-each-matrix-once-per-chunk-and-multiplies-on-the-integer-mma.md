@@ -22,6 +22,11 @@ In a prototype on the RTX 5090 the dense route ran the body's prefill GEMMs abou
 - **Speed and quality.** On the RTX 5090 this attention runs about 2x faster than the FP16 band at 8K and 64K. Together with the dense route, its KLD stays within 1.03x of the FP16 band's.
 - **The option values.** `8bit` is the canonical value of `--model-prefill-attention` on 8.x, and `fp8` its alias; both resolve to the new band there and keep today's FP8 band on Blackwell. `int8` names the band on every card, and on Blackwell it runs only when named.
 
+**The GDN prefill on 8.x** runs on our own kernels in those forms (#514).
+- A small prepare per 32-token chunk solves the chunk's triangular system on the CUDA cores in fp32. One recurrence keeps each head's state in registers and writes the output itself, so no chunk's state goes through memory.
+- Its products are f16 MMAs with an f16 accumulator over spans of 32 products, each span folded into fp32, the operand rows on power-of-two scales that keep a span below 2^15. Against an fp64 recurrence its rows are closer than the vendored kernels' (0.93 against 2.6 bf16 roundings RMS).
+- It has no option: on 8.x it is the route. Blackwell keeps the vendored chunked kernels unless the RTX 5090 measures ours faster with its KLD holding. `IGNIS_GDN_PREFILL=ours|vendored` is the switch for that measurement, not a setting.
+
 **What stays.**
 - The fused route stays the route on sm_120. On 8.x it becomes an opt-in, `--model-prefill-linear fp16`.
 - A value the card or the build cannot run falls back when it comes from a default or a profile, and is refused, naming the option, when the operator names it (#456). The build's own answer, `prefill_route_built`, is one predicate per route, so a build that does not carry a route yet refuses it by name instead of running the other.

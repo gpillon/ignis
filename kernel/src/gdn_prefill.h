@@ -48,9 +48,16 @@ inline constexpr std::int32_t kMinTokens = 64;
 
 // The route per GPU generation, the one switch: our kernels on Ampere and Ada (compute capability
 // 8.x), where they replace the vendored GDN prefill; Blackwell keeps the vendored kernels until the
-// RTX 5090's measurement decides (GitHub #514). `IGNIS_GDN_PREFILL` overrides it at load, for that
-// measurement only (kernel/src/model.cu `gdn_prefill_route`).
+// RTX 5090's measurement decides (GitHub #514).
 constexpr bool runs_by_default(int compute_capability_major) { return compute_capability_major == 8; }
+
+// The route a load takes (true: ours): `runs_by_default`, unless the process environment's
+// IGNIS_GDN_PREFILL names one, `ours` or `vendored` -- a measurement switch (the RTX 5090's timing
+// and KLD of both routes), not an operator setting. Read from the operating system's environment
+// at each call (kernel/src/model.cu calls it once per load): on Windows the C runtime's getenv
+// holds a copy taken at start, which a later SetEnvironmentVariable (Rust's std::env::set_var)
+// does not reach. Throws std::invalid_argument, naming the variable, on any other value.
+bool route_for_load(int compute_capability_major);
 
 // The workspace bytes `chunked` takes at `tokens` (any width; 0 for none).
 std::size_t workspace_bytes(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t tokens);

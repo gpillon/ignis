@@ -95,6 +95,11 @@ On a card below compute capability 12.0 the server picks what the card runs:
   the field's value, `fp8`;
 - `--model-exception-weights fp8` is refused: the exception tensors stay
   BF16, since in FP8 they prefill on the block-scaled FP8 tensor cores;
+- the 27B's 48 linear-attention (GDN) layers prefill on ignis's own kernels,
+  in the tensor-core forms a GeForce card runs at full rate, where a Blackwell
+  card keeps the vendored ones. `IGNIS_GDN_PREFILL=ours` or `vendored` names
+  either route at the model load on any card, to measure the two; any other
+  value is refused at the load;
 - the 27B NVFP4 artifact, the image model and Flash-Next's staged decode
   (`IGNIS_FN_MOE_STAGED=1`) are refused before the load, by name
   ([Troubleshooting](../troubleshooting.md#starting)). The 27B loads from its

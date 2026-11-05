@@ -37,6 +37,9 @@
 // inputs stress the solve: consecutive keys strongly correlated (a shared direction plus noise),
 // beta up to 0.999, decays from 0.002 to 3 per token, values of different sizes per head.
 //
+// The route per GPU generation and its measurement switch, IGNIS_GDN_PREFILL, are checked on the
+// host: the generation's default, both names, and another value refused by name.
+//
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE, so a missing or busy GPU fails this
 // test rather than skipping it.
 
@@ -59,6 +62,16 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace moe_test;
 
@@ -162,6 +175,43 @@ void reference_head(const Inputs &in, int32_t T, int32_t head, std::vector<doubl
       out[static_cast<std::size_t>(t) * kDim + d] = kScale * o;
     }
   }
+}
+
+// Sets (or, with null, removes) a variable in the operating system's environment, as a host
+// process's own runtime does (Rust's std::env::set_var).
+void set_environment(const char *name, const char *value) {
+#ifdef _WIN32
+  SetEnvironmentVariableA(name, value);
+#else
+  if (value != nullptr) {
+    setenv(name, value, 1);
+  } else {
+    unsetenv(name);
+  }
+#endif
+}
+
+// The route per generation and the measurement switch (kernel/src/gdn_prefill.h `route_for_load`):
+// ours on 8.x and the vendored kernels on Blackwell by default, either one when named, anything else
+// refused naming the variable.
+void check_route() {
+  constexpr const char *kSwitch = "IGNIS_GDN_PREFILL";
+  set_environment(kSwitch, nullptr);
+  check(ignis::gdn_prefill::route_for_load(8), "8.x runs ours by default");
+  check(!ignis::gdn_prefill::route_for_load(12), "Blackwell keeps the vendored kernels by default");
+  set_environment(kSwitch, "ours");
+  check(ignis::gdn_prefill::route_for_load(12), "IGNIS_GDN_PREFILL=ours runs ours on Blackwell");
+  set_environment(kSwitch, "vendored");
+  check(!ignis::gdn_prefill::route_for_load(8), "IGNIS_GDN_PREFILL=vendored runs the vendored kernels on 8.x");
+  set_environment(kSwitch, "fp16");
+  bool refused = false;
+  try {
+    (void)ignis::gdn_prefill::route_for_load(8);
+  } catch (const std::invalid_argument &e) {
+    refused = std::string(e.what()).find(kSwitch) != std::string::npos;
+  }
+  check(refused, "another value of IGNIS_GDN_PREFILL is refused by name");
+  set_environment(kSwitch, nullptr);
 }
 
 // --- the two device paths ---------------------------------------------------------------------
@@ -416,6 +466,8 @@ int main() {
   run_case("chunk 4096", {4096}, 3000, arena, workspace, stream);
   run_case("chunks 4096, 4096, 777 (the state carried in place)", {4096, 4096, 777}, 4000, arena, workspace, stream);
   run_case("ragged 64, 100, 1000, 40", {64, 100, 1000, 40}, 5000, arena, workspace, stream);
+
+  check_route();
 
   // Refusals, each by name before any launch: value heads that are not a multiple of the q/k
   // heads, a v at another T, and a workspace too small.

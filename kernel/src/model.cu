@@ -27,6 +27,7 @@
 
 #include "attention_readout.h"
 #include "ignis_dense_prefill.h"
+#include "gdn_prefill.h"
 #include "layer_internal.h"
 #include "model_internal.h"
 #include "trellis_body.h"
@@ -1033,7 +1034,32 @@ struct LoadOptions {
   // GitHub #414 (ADR 0075): where the vision tower lives (enum
   // ignis_vision_residency); HOST only with vision.
   uint32_t vision_residency = IGNIS_VISION_RESIDENCY_DEVICE;
+  // GitHub #514: the GDN prefill's route (`gdn_prefill_route`).
+  bool gdn_prefill_ours = false;
 };
+
+// GitHub #514: the GDN prefill on our full-rate kernels (kernel/src/gdn_prefill.h)
+// or on the vendored chunked ones, decided once per load: the card's generation
+// decides (ours on 8.x, the vendored kernels on Blackwell) unless the measurement
+// switch IGNIS_GDN_PREFILL names a route (`ignis::gdn_prefill::route_for_load`);
+// any other value is refused by name. False (error set) on a refusal or when the
+// device cannot say its generation.
+bool gdn_prefill_route(bool &ours) {
+  int device = 0, major = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err == cudaSuccess) err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_model_load: the GPU generation for the GDN prefill: ") + cudaGetErrorString(err));
+    return false;
+  }
+  try {
+    ours = ignis::gdn_prefill::route_for_load(major);
+  } catch (const std::invalid_argument &e) {
+    set_error(std::string("ignis_model_load: ") + e.what());
+    return false;
+  }
+  return true;
+}
 
 // GitHub #243: one embedding pool page, in bytes -- the width every side of
 // the leaf agrees on (kernel/include/ignis_step.h).
@@ -1315,6 +1341,9 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.prefill_attention = prefill_attention;
   out.vision_residency = vision_residency;
   out.prefill_linear = prefill_linear;
+  if (!gdn_prefill_route(out.gdn_prefill_ours)) {
+    return nullptr;
+  }
 
   // GitHub #302: Flash-Next binds its own schema (kernel/src/flash_next/
   // bind.cu) into its own program (kernel/src/flash_next/program.h), and has
@@ -1978,6 +2007,9 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // GitHub #509: the trellis body's prefill route, read by every body call
   // (kernel/src/trellis_body.cu).
   model->prefill_linear = load.prefill_linear;
+  // GitHub #514: the GDN prefill's route, read by every GDN prefill call
+  // (kernel/src/gdn_layer.cu).
+  model->gdn_prefill_ours = load.gdn_prefill_ours;
 
   // GitHub #341: the BF16 exception tensors a load holds in FP8 run on the FP8
   // linear and the W8A8 GEMM (kernel/src/fp8_exception.h), which refuse an

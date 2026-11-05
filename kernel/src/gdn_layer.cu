@@ -21,6 +21,7 @@
 
 #include "ignis_seq_internal.h"
 #include "gdn_conv_split.h"
+#include "gdn_prefill.h"
 #include "layer_internal.h"
 #include "model_internal.h"
 #include "trellis_body.h"
@@ -283,10 +284,24 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     // `[128, value_heads, T]` view of the `recurrent` buffer (the op writes
     // it in place, so it must be an lvalue, not a temporary view).
     ninfer::Tensor recurrent_out = recurrent.view({head_dim, value_heads, T, 1});
-    ninfer::ops::gated_delta_net(
-        query.view({head_dim, qk_heads, T, 1}), key.view({head_dim, qk_heads, T, 1}),
-        value.view({head_dim, value_heads, T, 1}), g, beta, readout_scale, /*normalize_qk=*/true,
-        *model->scratch, ssm_state, ssm_state, recurrent_out, stream);
+    if (model->gdn_prefill_ours && T >= ignis::gdn_prefill::kMinTokens) {
+      // GitHub #514: our full-rate kernels (kernel/src/gdn_prefill.h), the
+      // load's route (on 8.x always; on Blackwell under IGNIS_GDN_PREFILL),
+      // the same contract: the slot in, the slot out. Its workspace fits
+      // inside the vendored capacity reserved above at every width from
+      // kMinTokens (kernel/tests/test_gdn_prefill.cu holds that), so this is
+      // still no allocation on the prefill path.
+      const std::size_t ws_bytes = ignis::gdn_prefill::workspace_bytes(qk_heads, value_heads, T);
+      const ninfer::DeviceSpan ws = model->scratch->alloc_bytes(ws_bytes);
+      ignis::gdn_prefill::chunked(query.view({head_dim, qk_heads, T, 1}), key.view({head_dim, qk_heads, T, 1}),
+                                  value.view({head_dim, value_heads, T, 1}), g, beta, readout_scale, ssm_state,
+                                  ssm_state, recurrent_out, ws.data, ws.bytes, stream);
+    } else {
+      ninfer::ops::gated_delta_net(
+          query.view({head_dim, qk_heads, T, 1}), key.view({head_dim, qk_heads, T, 1}),
+          value.view({head_dim, value_heads, T, 1}), g, beta, readout_scale, /*normalize_qk=*/true,
+          *model->scratch, ssm_state, ssm_state, recurrent_out, stream);
+    }
 
     // --- gated RMSNorm with z (per-head norm * SiLU(z)) ---
     const ninfer::Tensor gdn_norm =
