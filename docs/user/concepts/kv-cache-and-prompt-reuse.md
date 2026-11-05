@@ -138,11 +138,16 @@ beyond the best match above it (for KV-disk, 8,192 on Flash-Next and
   log line names the tier and the kind of reuse.
 - **A tax on short cold prompts.** To be reusable, a prompt is cut at its
   publish point and again at the generation opener, so one traversal of the model
-  becomes three. Each extra traversal costs a fixed ~19 ms because it re-streams
-  the weights. Measured on 2026-09-18, that was 37 percent of the TTFT of a
-  1,024-token cold request, and under 2 percent on a 70K prompt
+  becomes three. Each extra traversal costs a fixed ~19 ms on the RTX 5090
+  because it re-streams the weights. Measured on 2026-09-18, that was 37 percent
+  of the TTFT of a 1,024-token cold request, and under 2 percent on a 70K prompt
   ([the finding](../../findings/2026-09-18-prompt-reuse-tax-on-short-ttft.md)).
-  The bet is that a later request skips more than that.
+  The bet is that a later request skips more than that. On Flash-Next, and on
+  the 27B on an RTX 30 or RTX 40 card, where a traversal costs clearly more, the
+  publish point rides the opener's cut instead: the capture at the opener hands
+  over the whole pages below it, and the prompt is cut once. What that gives up
+  is the image at the opener's page floor, which only a prompt parting from
+  this one in the last page before its opener would have resumed from.
 - **A reused request may differ in the last bit.** A reused request and a cold
   prefill split their chunks differently, so they can diverge at near-ties of
   the model's own choice.

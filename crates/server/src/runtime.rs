@@ -64,9 +64,15 @@ pub struct EngineShape {
     /// Cross-request state reuse (`--reuse-prompt`, GitHub #186, ADR 0029).
     pub prompt_reuse: bool,
     /// Whether the generation opener's page rides the checkpoint capture (ADR
-    /// 0029 as amended 2026-10-07, GitHub #306): the family's, set by
+    /// 0029 as amended 2026-10-07 and 2026-11-05, GitHub #306, #508): decided
+    /// by [`crate::config::arch::opener_page_rides_capture`] for the family
+    /// the config was fitted to and the card's generation, and again by
     /// [`EngineShape::for_family`]; no flag names it.
     pub opener_page_rides_capture: bool,
+    /// The GPU generation of the card the start read, `None` when it read
+    /// none (the mock build, a test's shape): what the opener policy above
+    /// is decided by.
+    pub gpu_generation: Option<crate::config::arch::GpuGeneration>,
     /// The retained slots the load reserves (GitHub #215, #281, ADR 0030):
     /// in VRAM (`--reuse-retained-device`) and in the pinned host block
     /// (`--reuse-retained-host`), both 0 with prompt reuse off unless named.
@@ -157,6 +163,7 @@ impl Default for EngineShape {
             host_margin_bytes: crate::config::DEFAULT_HOST_MARGIN_BYTES,
             prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
             opener_page_rides_capture: false,
+            gpu_generation: None,
             retained_device_slots: crate::config::DEFAULT_RETAINED_DEVICE_SLOTS,
             retained_host_slots: crate::config::DEFAULT_RETAINED_HOST_SLOTS,
             retained_host_named: false,
@@ -184,6 +191,7 @@ impl Default for EngineShape {
 
 impl From<&crate::config::Config> for EngineShape {
     fn from(config: &crate::config::Config) -> Self {
+        let gpu_generation = config.card().and_then(crate::config::profile::CardReading::generation);
         Self {
             prefill_chunk: config.prefill_chunk,
             decode_share_percent: config.decode_share_percent,
@@ -197,7 +205,13 @@ impl From<&crate::config::Config> for EngineShape {
             host_pool_bytes: config.host_pool_bytes,
             host_margin_bytes: config.host_margin_bytes,
             prompt_reuse: config.prompt_reuse,
-            opener_page_rides_capture: false,
+            // GitHub #508: a config fitted to a family decides it on the card;
+            // one fitted to none leaves it to `for_family`.
+            opener_page_rides_capture: config
+                .basis
+                .family()
+                .is_some_and(|family| crate::config::arch::opener_page_rides_capture(family, gpu_generation)),
+            gpu_generation,
             retained_device_slots: config.retained_device_slots,
             retained_host_slots: config.retained_host_slots,
             retained_host_named: config.retained_host_named,
@@ -266,9 +280,9 @@ impl EngineShape {
     /// off, is left as it is.
     pub fn for_family(self, family: ignis_core::compute::ModelFamily) -> Self {
         // GitHub #306: and so is an unnamed decode share, and where the
-        // opener's page is published.
+        // opener's page is published -- on the card's generation (#508).
         let this = Self {
-            opener_page_rides_capture: family.opener_page_rides_capture(),
+            opener_page_rides_capture: crate::config::arch::opener_page_rides_capture(family, self.gpu_generation),
             ..self.with_family_decode_share(family)
         };
         if this.retained_host_named || !this.prompt_reuse {
@@ -1657,10 +1671,13 @@ mod tests {
             panic!("expected a runnable config");
         };
         // A resolution says what may adapt and that the rope table is
-        // `auto`'s; a shape built by hand adapts nothing (ADR 0063 §3).
+        // `auto`'s; a shape built by hand adapts nothing (ADR 0063 §3). It also
+        // knows the generation of the card it read, the 5090 `resolve`
+        // injects, where a shape built by hand read none (GitHub #508).
         let resolved = EngineShape {
             adaptable: crate::adaptation::Adaptable::ALL,
             rope_setting: ignis_core::RopeSetting::Auto,
+            gpu_generation: Some(crate::config::arch::GpuGeneration::Blackwell),
             ..EngineShape::default()
         };
         assert_eq!(EngineShape::from(&config), resolved);
@@ -1906,10 +1923,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_flash_next_load_lets_the_opener_s_page_ride_the_capture() {
+    fn with_no_card_read_only_a_flash_next_load_lets_the_opener_s_page_ride_the_capture() {
         // ADR 0029 as amended 2026-10-07 (GitHub #306): Flash-Next hands the
         // pages below an opener over with its checkpoint, the 27B keeps its
-        // imaged prefix at a cut of its own.
+        // imaged prefix at a cut of its own -- on a shape that read no card,
+        // as on Blackwell (GitHub #508).
         use ignis_core::compute::ModelFamily;
         let unnamed = EngineShape::default();
         let flash = scheduler_config_for_shape("m".into(), unnamed.for_family(ModelFamily::FlashNext), 64, 1024, 8);
@@ -1926,6 +1944,31 @@ mod tests {
         assert!(!scheduler_config_for_shape("m".into(), on_27b, 64, 1024, 8).opener_page_rides_capture);
         assert!(!scheduler_config_for_shape("m".into(), unnamed.for_family(ModelFamily::Qwen38_27b), 64, 1024, 8)
             .opener_page_rides_capture);
+    }
+
+    /// GitHub #508 (ADR 0029 as amended 2026-11-05): the 27B's opener page
+    /// rides the capture on the card the start read when it is an Ampere or an
+    /// Ada one, on the path its load takes (`load::load_shape`, then its
+    /// decode share) and when the shape is fitted to it again; on an RTX 5090
+    /// it keeps its two cuts. Flash-Next's rides on every card.
+    #[test]
+    fn the_27b_s_opener_page_rides_the_capture_on_ampere_and_ada_cards() {
+        use crate::config::profile::{testing, Card};
+        use ignis_core::compute::ModelFamily;
+        for (card, rides) in [(testing::rtx_3090(), true), (testing::rtx_4090(), true), (testing::rtx_5090(), false)] {
+            let name = card.name.clone();
+            let crate::config::ConfigOutcome::Config(config) =
+                crate::config::resolve_on(&[], |_| None, &crate::config::file::NoFiles, &|| Card::Read(card.clone())).expect("resolve")
+            else {
+                panic!("expected a runnable config");
+            };
+            let qwen = config.for_family(ModelFamily::Qwen38_27b).expect("the 27B");
+            let loaded = crate::load::load_shape(&qwen, None).with_family_decode_share(ModelFamily::Qwen38_27b);
+            assert_eq!(scheduler_config_for_shape("m".into(), loaded, 64, 1024, 8).opener_page_rides_capture, rides, "{name}");
+            assert_eq!(loaded.for_family(ModelFamily::Qwen38_27b).opener_page_rides_capture, rides, "{name}: fitted again");
+            let flash = EngineShape::from(&config).for_family(ModelFamily::FlashNext);
+            assert!(scheduler_config_for_shape("m".into(), flash, 64, 1024, 8).opener_page_rides_capture, "{name}: Flash-Next");
+        }
     }
 
     #[test]
@@ -2027,6 +2070,7 @@ mod tests {
             host_margin_bytes: crate::config::DEFAULT_HOST_MARGIN_BYTES,
             prompt_reuse: true,
             opener_page_rides_capture: false,
+            gpu_generation: None,
             retained_device_slots: 2,
             retained_host_slots: 3,
             retained_host_named: true,

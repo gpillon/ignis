@@ -234,13 +234,15 @@ pub struct SchedulerConfig {
     /// prompt it is given.
     pub prompt_reuse: bool,
     /// Whether the generation opener's page **rides the capture** (ADR 0029
-    /// as amended 2026-10-07, GitHub #306; [`crate::compute::ModelFamily`]
-    /// decides it at load). On, a request that can capture a prompt checkpoint
+    /// as amended 2026-10-07 and 2026-11-05, GitHub #306, #508; the server
+    /// decides it at load, by the model's family and the card's GPU
+    /// generation). On, a request that can capture a prompt checkpoint
     /// publishes nothing at its opener's page floor: the capture hands those
     /// pages over as a **pages-only link**, and the prefill is cut once, at the
-    /// opener. Off, they are a chained prefix with an image, published at a cut
-    /// of their own (#187) -- the 27B, whose extra traversal costs ~19 ms where
-    /// Flash-Next's costs an expert stream.
+    /// opener -- Flash-Next, whose extra traversal costs an expert stream, and
+    /// the 27B on Ampere and Ada. Off, they are a chained prefix with an image,
+    /// published at a cut of their own (#187) -- the 27B on Blackwell, whose
+    /// extra traversal costs ~19 ms there.
     pub opener_page_rides_capture: bool,
     /// The load's **retained slots** (GitHub #215, #281, ADR 0030; the
     /// operator's `--reuse-retained-device` and `--reuse-retained-host` together): how

@@ -485,6 +485,30 @@ pub fn prefill_linear_with(
     Ok(if named || is_8x(card) { PrefillLinear::Int8 } else { PrefillLinear::Fp16 })
 }
 
+/// Whether a load of `family` on a card of `generation` publishes its
+/// generation opener's page by the prompt checkpoint's capture, as a
+/// pages-only link (ADR 0029 as amended 2026-10-07 and 2026-11-05, GitHub
+/// #306, #508): the one decision, which [`crate::runtime::EngineShape`] asks
+/// for the load's family and the card the start read.
+///
+/// On, a reusable prompt is cut once, at the opener; off, twice, at the
+/// opener's page floor too, where its imaged prefix is published. Flash-Next
+/// rides on every card: its cut is a traversal that re-streams its experts.
+/// The 27B rides on Ampere and Ada, where a traversal of its trellis body
+/// decodes every matrix again and the cut costs clearly more than the ~19 ms
+/// it costs on the RTX 5090. On Blackwell, and with no card read, it keeps
+/// both cuts and the imaged prefix at the floor, its splits unchanged since
+/// #306. The image model and the diarizer capture nothing. A request whose
+/// image spans its opener's page floor lends the pages at its capture on any
+/// load (GitHub #249, `CaptureLink::ImageSpansFloor`).
+pub fn opener_page_rides_capture(family: ModelFamily, generation: Option<GpuGeneration>) -> bool {
+    match family {
+        ModelFamily::FlashNext => true,
+        ModelFamily::Qwen38_27b => matches!(generation, Some(GpuGeneration::Ampere | GpuGeneration::Ada)),
+        ModelFamily::QwenImage21 | ModelFamily::Nemotron3Diarization => false,
+    }
+}
+
 /// The 27B's BF16 exception tensors on `card` (`--model-exception-weights`,
 /// GitHub #456): held in FP8, they prefill on the W8A8 GEMM, the sm_120a
 /// set's block-scaled FP8 MMA, so on a card that does not run it `fp8` is
@@ -727,6 +751,26 @@ mod tests {
         assert_eq!(prefill_attention_with(PrefillAttention::Int8, true, Some(&b), "", built), Ok(PrefillAttention::Int8));
         assert_eq!(prefill_attention_with(PrefillAttention::Int8, false, Some(&b), "", built), Ok(PrefillAttention::Fp8));
         assert_eq!(prefill_attention_with(PrefillAttention::Fp16, true, Some(&a), "", built), Ok(PrefillAttention::Fp16));
+    }
+
+    /// GitHub #508 (spec #503): the 27B's generation-opener page rides the
+    /// prompt checkpoint's capture on Ampere and Ada, and not on Blackwell nor
+    /// with no card read; Flash-Next's rides it on every card, as since #306;
+    /// the image model and the diarizer capture nothing.
+    #[test]
+    fn the_opener_page_rides_the_capture_by_family_and_generation() {
+        use GpuGeneration::*;
+        let qwen = |generation| opener_page_rides_capture(ModelFamily::Qwen38_27b, generation);
+        assert!(qwen(Some(Ampere)), "the 27B on Ampere: one cut, at the opener");
+        assert!(qwen(Some(Ada)), "the 27B on Ada: one cut, at the opener");
+        assert!(!qwen(Some(Blackwell)), "the 27B on Blackwell keeps its two cuts");
+        assert!(!qwen(None), "no card read: the 27B keeps its two cuts");
+        for generation in [Some(Ampere), Some(Ada), Some(Blackwell), None] {
+            assert!(opener_page_rides_capture(ModelFamily::FlashNext, generation), "Flash-Next on {generation:?}");
+            for family in [ModelFamily::QwenImage21, ModelFamily::Nemotron3Diarization] {
+                assert!(!opener_page_rides_capture(family, generation), "{family:?} on {generation:?}");
+            }
+        }
     }
 
     /// The trellis prefill route: `fp16` runs everywhere; `int8` named is

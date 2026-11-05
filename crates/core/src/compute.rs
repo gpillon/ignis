@@ -869,20 +869,6 @@ impl ModelFamily {
         }
     }
 
-    /// Whether the generation opener's page rides the prompt-checkpoint
-    /// capture as a pages-only link (ADR 0029 as amended 2026-10-07, GitHub
-    /// #306): on Flash-Next, where the cut it saves is a traversal that
-    /// re-streams its experts -- 0.13-0.66 s of a reused agent turn. Not on the
-    /// 27B, whose cut costs ~19 ms and whose prefills keep their splits. A
-    /// request whose image spans its opener's page floor lends on any load
-    /// (GitHub #249, `CaptureLink::ImageSpansFloor`).
-    pub fn opener_page_rides_capture(self) -> bool {
-        match self {
-            ModelFamily::Qwen38_27b | ModelFamily::QwenImage21 | ModelFamily::Nemotron3Diarization => false,
-            ModelFamily::FlashNext => true,
-        }
-    }
-
     /// The `model_id` of this family's artifacts, and the id it is served
     /// under by default. The image model's is its published name (ADR 0050:
     /// "Qwen" is never the primary name of a derivative of its weights).
@@ -1464,7 +1450,7 @@ mod tests {
     fn the_image_model_has_no_text_machinery() {
         let image = ModelFamily::QwenImage21;
         assert_eq!(image.name(), "Qwen-Image-2.1");
-        assert!(!image.takes_images() && !image.serves_readouts() && !image.opener_page_rides_capture());
+        assert!(!image.takes_images() && !image.serves_readouts());
         assert_eq!(image.drafter(), None);
         assert_eq!(image.default_retained_host_slots(image.default_decode_lanes()), 0);
         assert_eq!(image.default_decode_lanes(), 0);
