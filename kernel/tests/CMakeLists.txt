@@ -560,6 +560,15 @@ add_executable(ignis_kernel_gdn_prefill_layout_test test_gdn_prefill_layout.cu)
 target_include_directories(ignis_kernel_gdn_prefill_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_gdn_prefill_layout_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_gdn_prefill_layout_test COMMAND ignis_kernel_gdn_prefill_layout_test)
+# GitHub #514 (spec #503): OURS -- the GDN prefill's chunked delta rule on our own full-rate kernels
+# (kernel/src/gdn_prefill.h, leaf-internal) against the vendored chunked path (the oracle, ADR 0031)
+# and both against an fp64 recurrence: outputs and carried state at the 27B's prefill chunks 1024,
+# 2048 and 4096, three calls carrying the state in place, and ragged remainders, within the bound
+# the test file argues. Not sm120a-only: it runs on 8.6. GPU; no SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_gdn_prefill_test test_gdn_prefill.cu)
+target_include_directories(ignis_kernel_gdn_prefill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_gdn_prefill_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_gdn_prefill_test COMMAND ignis_kernel_gdn_prefill_test)
 
 # ADR 0062: the token embedding in mapped pinned host memory (OURS: the
 # device surface's allocation), gathered by the vendored W8 op bit for bit as
