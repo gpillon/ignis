@@ -115,6 +115,9 @@ pub struct EngineShape {
     /// The 27B's prompt attention precision (`--model-prefill-attention`,
     /// GitHub #335); Flash-Next ignores it.
     pub prefill_attention: ignis_core::PrefillAttention,
+    /// The 27B's trellis prefill route (`--model-prefill-linear`, GitHub
+    /// #505); Flash-Next ignores it.
+    pub prefill_linear: ignis_core::PrefillLinear,
     /// How the 27B holds its BF16 exception tensors (`--model-exception-weights`,
     /// GitHub #341): the binder places them converted to FP8 or as stored.
     pub exception_weights: ignis_core::ExceptionWeights,
@@ -170,6 +173,7 @@ impl Default for EngineShape {
             adaptable: crate::adaptation::Adaptable::NONE,
             adapt_ladder: crate::adaptation::Ladder::default(),
             prefill_attention: ignis_core::PrefillAttention::default(),
+            prefill_linear: ignis_core::PrefillLinear::default(),
             exception_weights: ignis_core::ExceptionWeights::default(),
             ngram_hot_bytes: ignis_core::ngram_table::HotBudget::default(),
             kv_disk_bytes: None,
@@ -210,6 +214,7 @@ impl From<&crate::config::Config> for EngineShape {
             adaptable: config.adaptable(),
             adapt_ladder: config.adapt_ladder(),
             prefill_attention: config.prefill_attention,
+            prefill_linear: config.prefill_linear,
             exception_weights: config.exception_weights,
             ngram_hot_bytes: config.ngram_hot_bytes.unwrap_or_default(),
             kv_disk_bytes: config.kv_disk_bytes,
@@ -905,6 +910,7 @@ fn leaf_config_for_shape(shape: EngineShape, kv_pool_bytes: u64) -> ignis_runtim
         vision: shape.vision,
         rope_scaling: shape.rope_scaling,
         prefill_attention: shape.prefill_attention,
+        prefill_linear: shape.prefill_linear,
         retained_device_slots: shape.retained_device_slots,
         retained_host_slots: shape.retained_host_slots,
         ..ignis_runtime::CudaLeafConfig::default()
@@ -2034,6 +2040,7 @@ mod tests {
             adaptable: crate::adaptation::Adaptable::NONE,
             adapt_ladder: crate::adaptation::Ladder::default(),
             prefill_attention: ignis_core::PrefillAttention::default(),
+            prefill_linear: ignis_core::PrefillLinear::default(),
             exception_weights: ignis_core::ExceptionWeights::default(),
             ngram_hot_bytes: ignis_core::ngram_table::HotBudget::Auto,
             kv_disk_bytes: None,

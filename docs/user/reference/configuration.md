@@ -260,11 +260,25 @@ The KV storage format: `hq-e8-2b` (the serving default) or `bf16` (the retained 
 | Env var | `IGNIS_MODEL_PREFILL_ATTENTION` |
 | Kind | `prefill attention` |
 | Default | `fp8` |
-| Rule | one of fp8, fp16 |
+| Rule | one of 8bit, fp8, fp16, int8 |
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The 27B's prompt attention precision (GitHub #335): `fp8` (the default, the band pass in 8 bits) or `fp16` (the FP16-accumulate fallback). Flash-Next's attention is QSA and has no such pass. On a card below compute capability 12.0 left to its default, or to a profile's `fp8`, it reads `fp16`, the band the load runs, its origin the card; a named `fp8` is refused (GitHub #477).
+The 27B's prompt attention band (GitHub #335): `fp8` (the default, the band pass in 8 bits; `8bit` is its other spelling), `fp16` (the FP16-accumulate fallback) or `int8` (the integer band of the 8.x cards, spec #503). Flash-Next's attention is QSA and has no such pass. On a card below compute capability 12.0 left to its default, or to a profile's `fp8`, it reads `fp16` until the build carries the integer band, its origin the card; a named `fp8` or `int8` the build cannot run is refused (GitHub #477, #505).
+
+### `model.prefill_linear`
+
+| | |
+|---|---|
+| Flag | `--model-prefill-linear` |
+| Env var | `IGNIS_MODEL_PREFILL_LINEAR` |
+| Kind | `prefill linear` |
+| Default | `fp16` |
+| Rule | one of fp16, int8 |
+| Models | Qwen3.8-27B |
+| `/v1/config` | shown by `GET`, patchable, with a model reload |
+
+The 27B's trellis prefill route (spec #503, GitHub #505): `fp16` (the default, the fused prefill, the trellis decoded inside the GEMM) or `int8` (the dense prefill, each matrix decoded once per chunk and multiplied on the integer MMA). A value the build cannot run falls back to `fp16` when it comes from a profile and is refused when named; on a Blackwell card `int8` runs only when named. Flash-Next has its own prefill.
 
 ### `model.exception_weights`
 

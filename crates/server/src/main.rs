@@ -250,6 +250,7 @@ async fn main() {
         // knobs.
         rope_scaling: _,
         prefill_attention: _,
+        prefill_linear: _,
         exception_weights: _,
         media: _,
         request_timeout_secs,

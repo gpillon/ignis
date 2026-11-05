@@ -2,10 +2,15 @@
 //! 27b-16gb/03 solution 6): the 8-bit band by default, the FP16-accumulate fallback
 //! behind a load option. A load argument, fixed for the life of the load:
 //! `kernel/src/gqa_layer.cu` hands it to every hq-e8-2b prefill chunk.
+//!
+//! Spec #503 (GitHub #505) adds the integer band of the 8.x cards, `int8`, and
+//! the **prefill linear** route beside it ([`PrefillLinear`]).
 
 use std::fmt;
 
-/// `--model-prefill-attention`: `fp8` (the default) or `fp16`.
+/// `--model-prefill-attention`: `fp8` (the default), `fp16` or `int8`.
+/// `8bit` is the 8-bit band on whichever card the load runs (spec #503):
+/// [`Self::parse`] reads it, and `fp8`, as [`Self::Fp8`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PrefillAttention {
     /// The band pass in 8 bits: Q·Kᵀ in INT8, P·V in E4M3.
@@ -13,18 +18,23 @@ pub enum PrefillAttention {
     Fp8,
     /// The FP16-accumulate fallback.
     Fp16,
+    /// The integer band: Q·Kᵀ in INT8, P·V on the u8×s8 MMA. The 8-bit band of
+    /// the 8.x cards (`8bit` and `fp8` resolve to it there); on any other
+    /// card only when named.
+    Int8,
 }
 
 impl PrefillAttention {
     /// The spellings `parse` accepts, canonical first.
-    pub const NAMES: [&'static str; 2] = ["fp8", "fp16"];
+    pub const NAMES: [&'static str; 4] = ["8bit", "fp8", "fp16", "int8"];
 
     /// `struct ignis_model_load_options::prefill_attention`: 0 = 8-bit,
-    /// 1 = FP16 accumulate.
+    /// 1 = FP16 accumulate, 2 = the integer band.
     pub const fn abi_code(self) -> u32 {
         match self {
             Self::Fp8 => 0,
             Self::Fp16 => 1,
+            Self::Int8 => 2,
         }
     }
 
@@ -32,20 +42,71 @@ impl PrefillAttention {
         match self {
             Self::Fp8 => "fp8",
             Self::Fp16 => "fp16",
+            Self::Int8 => "int8",
         }
     }
 
     /// Case-insensitive.
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "fp8" => Ok(Self::Fp8),
+            "8bit" | "fp8" => Ok(Self::Fp8),
             "fp16" => Ok(Self::Fp16),
-            other => Err(format!("unknown prefill attention `{other}` (expected `fp8` or `fp16`)")),
+            "int8" => Ok(Self::Int8),
+            other => Err(format!("unknown prefill attention `{other}` (expected `8bit`, `fp8`, `fp16` or `int8`)")),
         }
     }
 }
 
 impl fmt::Display for PrefillAttention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `--model-prefill-linear`: how the 27B's trellis prefill multiplies its
+/// matrices (spec #503, GitHub #505).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrefillLinear {
+    /// The fused prefill: the trellis decoded inside the GEMM's inner loop,
+    /// the multiply in f16. Today's route and the default.
+    #[default]
+    Fp16,
+    /// The dense prefill: each matrix decoded once per chunk into one INT8
+    /// buffer and multiplied on the integer MMA.
+    Int8,
+}
+
+impl PrefillLinear {
+    /// The spellings `parse` accepts, canonical first.
+    pub const NAMES: [&'static str; 2] = ["fp16", "int8"];
+
+    /// `struct ignis_model_load_options::prefill_linear`: 0 = the fused
+    /// prefill, 1 = the dense prefill.
+    pub const fn abi_code(self) -> u32 {
+        match self {
+            Self::Fp16 => 0,
+            Self::Int8 => 1,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fp16 => "fp16",
+            Self::Int8 => "int8",
+        }
+    }
+
+    /// Case-insensitive.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "fp16" => Ok(Self::Fp16),
+            "int8" => Ok(Self::Int8),
+            other => Err(format!("unknown prefill linear `{other}` (expected `fp16` or `int8`)")),
+        }
+    }
+}
+
+impl fmt::Display for PrefillLinear {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -60,12 +121,27 @@ mod tests {
         assert_eq!(PrefillAttention::default(), PrefillAttention::Fp8);
         assert_eq!(PrefillAttention::Fp8.abi_code(), 0);
         assert_eq!(PrefillAttention::Fp16.abi_code(), 1);
+        assert_eq!(PrefillAttention::Int8.abi_code(), 2);
+        assert_eq!(PrefillLinear::default(), PrefillLinear::Fp16);
+        assert_eq!((PrefillLinear::Fp16.abi_code(), PrefillLinear::Int8.abi_code()), (0, 1));
+    }
+
+    #[test]
+    fn the_integer_band_and_the_8bit_alias_parse() {
+        assert_eq!(PrefillAttention::parse("INT8"), Ok(PrefillAttention::Int8));
+        assert_eq!(PrefillAttention::parse("8bit"), Ok(PrefillAttention::Fp8));
+        assert_eq!(PrefillAttention::parse("fp8"), Ok(PrefillAttention::Fp8));
+        assert_eq!(PrefillLinear::parse("Int8"), Ok(PrefillLinear::Int8));
+        for name in PrefillLinear::NAMES {
+            assert_eq!(PrefillLinear::parse(name).map(PrefillLinear::as_str), Ok(name));
+        }
+        assert!(PrefillLinear::parse("fp8").unwrap_err().contains("int8"));
     }
 
     #[test]
     fn parse_is_case_insensitive_and_refuses_the_rest() {
         assert_eq!(PrefillAttention::parse("FP16"), Ok(PrefillAttention::Fp16));
-        for name in PrefillAttention::NAMES {
+        for name in PrefillAttention::NAMES.into_iter().filter(|name| *name != "8bit") {
             assert_eq!(PrefillAttention::parse(name).map(PrefillAttention::as_str), Ok(name));
         }
         assert!(PrefillAttention::parse("bf16").unwrap_err().contains("fp16"));

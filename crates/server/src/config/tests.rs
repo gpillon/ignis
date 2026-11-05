@@ -3357,6 +3357,91 @@ fn the_config_reports_the_prefill_attention_band_the_card_runs() {
     assert_eq!((shown.as_deref(), shared, family), (Some("fp8"), None, None));
 }
 
+/// Spec #503 (GitHub #505): the prefill route and the integer band, named
+/// by every source, on an 8.x and a 12.x capability, while the build carries
+/// neither: a named value the load cannot run is refused by the spelling that
+/// named it, a profile's value falls back with the card as its origin, and
+/// `fp16` runs everywhere. Nothing is `int8` by default.
+#[test]
+fn a_named_dense_prefill_or_integer_band_is_refused_and_a_profiles_falls_back() {
+    use source::{Candidate, Source};
+    let cards = [
+        ("8.x", card_of(24.0, "NVIDIA GeForce RTX 3090", (8, 6), "86;120a")),
+        ("12.x", card_of(31.8, "NVIDIA GeForce RTX 5090", (12, 0), "86;120a")),
+    ];
+    for (generation, card) in cards {
+        let on = |flags: &[&str], env: &'static [(&'static str, &'static str)], files: &MemFiles| {
+            let env = move |key: &str| env.iter().find(|(name, _)| *name == key).map(|(_, value)| value.to_string());
+            resolve_on(&args(flags), env, files, &|| card.clone()).map(expect_config)
+        };
+        let no_files = MemFiles::default();
+        let file = |text: &str| MemFiles::with(&[("c.yaml", text)]);
+
+        // The defaults do not move, and `fp16` is accepted from every source.
+        let default = on(&[], &[], &no_files).unwrap();
+        assert_eq!(default.prefill_linear, PrefillLinear::Fp16, "{generation}");
+        let fp16 = on(&["--model-prefill-linear", "fp16"], &[], &no_files).unwrap();
+        assert_eq!(fp16.prefill_linear, PrefillLinear::Fp16, "{generation}");
+        let env = on(&[], &[("IGNIS_MODEL_PREFILL_LINEAR", "FP16")], &no_files).unwrap();
+        assert_eq!(env.prefill_linear, PrefillLinear::Fp16, "{generation}");
+        let from_file = on(&["--config", "c.yaml"], &[], &file("model:
+  prefill_linear: fp16
+  prefill_attention: fp16
+")).unwrap();
+        assert_eq!((from_file.prefill_linear, from_file.prefill_attention), (PrefillLinear::Fp16, PrefillAttention::Fp16), "{generation}");
+
+        // Named `int8` is refused by the spelling that named it.
+        let flag = on(&["--model-prefill-linear", "int8"], &[], &no_files).unwrap_err().0;
+        assert!(flag.contains("`--model-prefill-linear int8`") && flag.contains("dense prefill"), "{generation}: {flag}");
+        let env = on(&[], &[("IGNIS_MODEL_PREFILL_LINEAR", "int8")], &no_files).unwrap_err().0;
+        assert!(env.contains("`IGNIS_MODEL_PREFILL_LINEAR int8`"), "{generation}: {env}");
+        let text = on(&["--config", "c.yaml"], &[], &file("model:
+  prefill_linear: int8
+")).unwrap_err().0;
+        assert!(text.contains("prefill_linear") && text.contains("c.yaml") && text.contains("dense prefill"), "{generation}: {text}");
+        for (flags, env) in [
+            (&["--model-prefill-attention", "int8"][..], &[][..]),
+            (&[][..], &[("IGNIS_MODEL_PREFILL_ATTENTION", "int8")][..]),
+        ] {
+            let refused = on(flags, env, &no_files).unwrap_err().0;
+            assert!(refused.contains("int8`") && refused.contains("integer band") && refused.contains("not carry"), "{generation}: {refused}");
+        }
+        let text = on(&["--config", "c.yaml"], &[], &file("model:
+  prefill_attention: int8
+")).unwrap_err().0;
+        assert!(text.contains("prefill_attention") && text.contains("c.yaml"), "{generation}: {text}");
+
+        // `8bit` and `fp8` name the same band: the integer one on 8.x, which
+        // this build cannot run, and today's FP8 band on 12.x.
+        for spelling in ["8bit", "fp8"] {
+            let named = on(&["--model-prefill-attention", spelling], &[], &no_files);
+            if generation == "8.x" {
+                let refused = named.unwrap_err().0;
+                assert!(refused.contains("`--model-prefill-attention fp8`") && refused.contains("integer band"), "{spelling}: {refused}");
+            } else {
+                assert_eq!(named.unwrap().prefill_attention, PrefillAttention::Fp8, "{spelling} on {generation}");
+            }
+        }
+
+        // A profile's value falls back, the card as its origin.
+        let profile = on(&["--profile", "none"], &[], &no_files).unwrap();
+        let mut sources = profile.basis.sources().clone();
+        for (name, raw) in [("prefill_linear", "int8"), ("prefill_attention", "int8")] {
+            let field = schema::field("model", name).unwrap();
+            sources.profile.set(field, None, Candidate { raw: raw.into(), spelling: "rtx-test".into() }).unwrap();
+        }
+        let resolution = source::resolve_settings(&sources, Some(ModelFamily::Qwen38_27b), source::Fit::Switch).unwrap();
+        let shown = resolution.settings.render();
+        let attention = if generation == "8.x" { "fp16" } else { "fp8" };
+        assert_eq!((&shown["model"]["prefill_linear"], &shown["model"]["prefill_attention"]), (&"fp16".into(), &attention.into()), "{generation}");
+        for name in ["prefill_linear", "prefill_attention"] {
+            let origin = resolution.origin("model", name).unwrap();
+            assert_eq!(origin.source, Source::Card, "{generation} {name}");
+            assert!(!origin.source.explicit());
+        }
+    }
+}
+
 /// `rtx50-16gb` for the 27B: the values the spec derives, and Flash-Next
 /// started under it resolves without refusal.
 #[test]

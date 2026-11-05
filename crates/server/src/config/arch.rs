@@ -11,7 +11,7 @@
 use std::fmt;
 
 use ignis_core::compute::ModelFamily;
-use ignis_core::{ExceptionWeights, PrefillAttention};
+use ignis_core::{ExceptionWeights, PrefillAttention, PrefillLinear};
 
 use super::profile::CardReading;
 
@@ -347,28 +347,141 @@ pub fn load_refusal(
     route.and_then(|route| refuse(card, route))
 }
 
+/// A prefill route spec #503 adds, which this build carries or not
+/// ([`prefill_route_built`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefillRoute {
+    /// The dense prefill: each trellis matrix decoded once per chunk into one
+    /// INT8 buffer and multiplied on the integer MMA (`--model-prefill-linear
+    /// int8`).
+    DensePrefill,
+    /// The integer band of the prompt attention (`--model-prefill-attention
+    /// int8`, the 8-bit band of the 8.x cards).
+    IntegerBand,
+}
+
+impl PrefillRoute {
+    fn what(self) -> &'static str {
+        match self {
+            Self::DensePrefill => "the dense prefill",
+            Self::IntegerBand => "the integer band",
+        }
+    }
+}
+
+/// Whether this build carries `route`: the one place that says so (spec
+/// #503). A route no kernel runs yet is refused when the operator names it
+/// and falls back when a default or a profile gives it; the ticket that
+/// builds a route flips its line here, with its test.
+pub const fn prefill_route_built(route: PrefillRoute) -> bool {
+    match route {
+        PrefillRoute::DensePrefill => false,
+        PrefillRoute::IntegerBand => false,
+    }
+}
+
+/// Whether `card` is read and runs no sm_120a kernel: an 8.x card, whose
+/// 8-bit prompt attention band is the integer one.
+fn is_8x(card: Option<&CardReading>) -> bool {
+    card.is_some_and(|card| !runs_sm120a(Some(card)))
+}
+
 /// The 27B's prompt attention band on `card` (`--model-prefill-attention`,
-/// GitHub #456): `resolved` on a card that runs the 8-bit band's
-/// block-scaled E4M3 MMA; elsewhere the FP16 band, when the operator left the
-/// field to its default or a profile, and a refusal naming `spelled` when
-/// they named the 8-bit band (`named`).
+/// GitHub #456, #505): `resolved` where the card and the build run it. The
+/// 8-bit band (`8bit`, `fp8`) is the integer band on an 8.x card and today's
+/// block-scaled FP8 band elsewhere; `int8` names the integer band on every
+/// card, and a default or a profile gives it on an 8.x card alone. A band
+/// the build cannot run is the FP16 band on an 8.x card (the FP8 band
+/// elsewhere) when the operator left the field to its default or a profile,
+/// and a refusal naming `spelled` when they named it (`named`).
 pub fn prefill_attention(
     resolved: PrefillAttention,
     named: bool,
     card: Option<&CardReading>,
     spelled: &str,
 ) -> Result<PrefillAttention, String> {
-    if resolved != PrefillAttention::Fp8 || runs_sm120a(card) {
-        return Ok(resolved);
+    prefill_attention_with(resolved, named, card, spelled, prefill_route_built)
+}
+
+/// [`prefill_attention`] with the build's routes given, for the tests that
+/// flip one.
+pub fn prefill_attention_with(
+    resolved: PrefillAttention,
+    named: bool,
+    card: Option<&CardReading>,
+    spelled: &str,
+    built: impl Fn(PrefillRoute) -> bool,
+) -> Result<PrefillAttention, String> {
+    let on_8x = is_8x(card);
+    let band = match resolved {
+        PrefillAttention::Fp8 if on_8x => PrefillAttention::Int8,
+        other => other,
+    };
+    if band != PrefillAttention::Int8 {
+        return Ok(band);
+    }
+    if !on_8x && !named {
+        // No default or profile on another card selects the integer band.
+        return Ok(PrefillAttention::Fp8);
+    }
+    if built(PrefillRoute::IntegerBand) {
+        return Ok(PrefillAttention::Int8);
     }
     if !named {
         return Ok(PrefillAttention::Fp16);
     }
-    let card = card.expect("a card that runs no sm_120a kernel was read");
+    let on = card.map(|card| format!("; the card is {} ({})", card.name, card.capability)).unwrap_or_default();
+    let value = if resolved == PrefillAttention::Int8 { "int8" } else { "fp8" };
+    let meaning = if resolved == PrefillAttention::Int8 {
+        "names the integer band".to_owned()
+    } else {
+        "names the 8-bit band, which on compute capability 8.x is the integer band".to_owned()
+    };
     Err(format!(
-        "`{spelled} fp8` runs the prompt attention's band on the block-scaled FP8 tensor cores, which compute capability 12.0 has and the card, {} ({}), does not: name `fp16`, or leave it unset and it is `fp16` on this card",
-        card.name, card.capability
+        "`{spelled} {value}` {meaning}, and this build does not carry {} yet{on}: name `fp16`, or leave it unset and it is `fp16` on this card",
+        PrefillRoute::IntegerBand.what()
     ))
+}
+
+/// The 27B's trellis prefill route on `card` (`--model-prefill-linear`,
+/// spec #503, GitHub #505): `resolved` where the build runs it. The dense
+/// prefill (`int8`) is a default or a profile's on an 8.x card alone; on
+/// another card it runs only when named. One the build does not carry is the
+/// fused prefill (`fp16`) when a default or a profile gave it, and a refusal
+/// naming `spelled` when the operator named it (`named`).
+pub fn prefill_linear(
+    resolved: PrefillLinear,
+    named: bool,
+    card: Option<&CardReading>,
+    spelled: &str,
+) -> Result<PrefillLinear, String> {
+    prefill_linear_with(resolved, named, card, spelled, prefill_route_built)
+}
+
+/// [`prefill_linear`] with the build's routes given, for the tests that flip
+/// one.
+pub fn prefill_linear_with(
+    resolved: PrefillLinear,
+    named: bool,
+    card: Option<&CardReading>,
+    spelled: &str,
+    built: impl Fn(PrefillRoute) -> bool,
+) -> Result<PrefillLinear, String> {
+    if resolved != PrefillLinear::Int8 {
+        return Ok(resolved);
+    }
+    if !built(PrefillRoute::DensePrefill) {
+        return if named {
+            Err(format!(
+                "`{spelled} int8` names {}, which this build does not carry yet: name `fp16`, or leave it unset and it is `fp16`",
+                PrefillRoute::DensePrefill.what()
+            ))
+        } else {
+            Ok(PrefillLinear::Fp16)
+        };
+    }
+    // Built: no default or profile on a Blackwell card selects it.
+    Ok(if named || is_8x(card) { PrefillLinear::Int8 } else { PrefillLinear::Fp16 })
 }
 
 /// The 27B's BF16 exception tensors on `card` (`--model-exception-weights`,
@@ -553,5 +666,82 @@ mod tests {
             assert_eq!(load_refusal(Some(&blackwell()), family, never, true), None, "{family:?}");
             assert_eq!(load_refusal(None, family, never, true), None, "{family:?}");
         }
+    }
+
+    /// Spec #503 (GitHub #505): the build says whether it carries a route
+    /// ([`prefill_route_built`]); both are false until their tickets build
+    /// them, and the decision reads them through that one predicate.
+    #[test]
+    fn this_build_carries_neither_route_yet() {
+        assert!(!prefill_route_built(PrefillRoute::DensePrefill));
+        assert!(!prefill_route_built(PrefillRoute::IntegerBand));
+    }
+
+    /// The prompt attention band by generation, with the integer band not
+    /// built: the 8-bit band (`fp8`, `8bit`) is the integer one on 8.x and
+    /// falls back to `fp16` from a default or a profile, is refused when
+    /// named; `int8` named is refused on every card, from a profile it falls
+    /// back; `fp16` runs everywhere; Blackwell keeps its FP8 band.
+    #[test]
+    fn the_prefill_attention_without_the_integer_band_built() {
+        let none = |_: PrefillRoute| false;
+        let flag = "--model-prefill-attention";
+        for card in [ampere(), card("NVIDIA GeForce RTX 4090", cc(8, 9), "86;120a")] {
+            let c = Some(&card);
+            assert_eq!(prefill_attention_with(PrefillAttention::Fp8, false, c, flag, none), Ok(PrefillAttention::Fp16));
+            assert_eq!(prefill_attention_with(PrefillAttention::Int8, false, c, flag, none), Ok(PrefillAttention::Fp16));
+            assert_eq!(prefill_attention_with(PrefillAttention::Fp16, true, c, flag, none), Ok(PrefillAttention::Fp16));
+            let fp8 = prefill_attention_with(PrefillAttention::Fp8, true, c, flag, none).unwrap_err();
+            assert!(fp8.contains("`--model-prefill-attention fp8`") && fp8.contains("integer band") && fp8.contains("not carry"), "{fp8}");
+            let int8 = prefill_attention_with(PrefillAttention::Int8, true, c, flag, none).unwrap_err();
+            assert!(int8.contains("`--model-prefill-attention int8`") && int8.contains(&card.name), "{int8}");
+        }
+        let b = blackwell();
+        let c = Some(&b);
+        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, true, c, flag, none), Ok(PrefillAttention::Fp8));
+        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, false, c, flag, none), Ok(PrefillAttention::Fp8));
+        assert_eq!(prefill_attention_with(PrefillAttention::Int8, false, c, flag, none), Ok(PrefillAttention::Fp8), "no profile selects it there");
+        assert!(prefill_attention_with(PrefillAttention::Int8, true, c, flag, none).unwrap_err().contains("int8"));
+        assert_eq!(prefill_attention_with(PrefillAttention::Fp8, true, None, flag, none), Ok(PrefillAttention::Fp8));
+    }
+
+    /// The same decision with the integer band built, the line #510 flips: it
+    /// runs on 8.x for every spelling of the 8-bit band, and on Blackwell
+    /// only when named.
+    #[test]
+    fn the_prefill_attention_with_the_integer_band_built() {
+        let built = |route: PrefillRoute| route == PrefillRoute::IntegerBand;
+        let (a, b) = (ampere(), blackwell());
+        for named in [false, true] {
+            assert_eq!(prefill_attention_with(PrefillAttention::Fp8, named, Some(&a), "", built), Ok(PrefillAttention::Int8));
+            assert_eq!(prefill_attention_with(PrefillAttention::Int8, named, Some(&a), "", built), Ok(PrefillAttention::Int8));
+            assert_eq!(prefill_attention_with(PrefillAttention::Fp8, named, Some(&b), "", built), Ok(PrefillAttention::Fp8));
+        }
+        assert_eq!(prefill_attention_with(PrefillAttention::Int8, true, Some(&b), "", built), Ok(PrefillAttention::Int8));
+        assert_eq!(prefill_attention_with(PrefillAttention::Int8, false, Some(&b), "", built), Ok(PrefillAttention::Fp8));
+        assert_eq!(prefill_attention_with(PrefillAttention::Fp16, true, Some(&a), "", built), Ok(PrefillAttention::Fp16));
+    }
+
+    /// The trellis prefill route: `fp16` runs everywhere; `int8` named is
+    /// refused while the dense prefill is not built and a default or profile
+    /// one falls back; built, it runs on 8.x from any source and on
+    /// Blackwell only when named.
+    #[test]
+    fn the_prefill_linear_follows_the_build_and_the_generation() {
+        let flag = "--model-prefill-linear";
+        let none = |_: PrefillRoute| false;
+        let built = |route: PrefillRoute| route == PrefillRoute::DensePrefill;
+        let (a, b) = (ampere(), blackwell());
+        for card in [Some(&a), Some(&b), None] {
+            assert_eq!(prefill_linear_with(PrefillLinear::Fp16, true, card, flag, none), Ok(PrefillLinear::Fp16));
+            assert_eq!(prefill_linear_with(PrefillLinear::Int8, false, card, flag, none), Ok(PrefillLinear::Fp16));
+            let refused = prefill_linear_with(PrefillLinear::Int8, true, card, flag, none).unwrap_err();
+            assert!(refused.contains("`--model-prefill-linear int8`") && refused.contains("dense prefill") && refused.contains("not carry"), "{refused}");
+        }
+        assert_eq!(prefill_linear_with(PrefillLinear::Int8, false, Some(&a), flag, built), Ok(PrefillLinear::Int8));
+        assert_eq!(prefill_linear_with(PrefillLinear::Int8, true, Some(&a), flag, built), Ok(PrefillLinear::Int8));
+        assert_eq!(prefill_linear_with(PrefillLinear::Int8, true, Some(&b), flag, built), Ok(PrefillLinear::Int8));
+        assert_eq!(prefill_linear_with(PrefillLinear::Int8, false, Some(&b), flag, built), Ok(PrefillLinear::Fp16), "no profile selects it there");
+        assert_eq!(prefill_linear(PrefillLinear::Fp16, true, Some(&a), flag), Ok(PrefillLinear::Fp16));
     }
 }
