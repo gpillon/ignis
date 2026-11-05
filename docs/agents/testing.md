@@ -33,7 +33,10 @@ until the test suite is green.
   the RTX 5090's 170 SMs: on a card that cannot hold one resident (fewer SMs,
   or an sm_86 build's fewer CTAs per SM) it skips each one the planner's own
   residency query refuses there and names it in a `SKIP` line of its output
-  (#478, a portability patch under ADR 0077). Its `budget` lines give each
+  (#478, a portability patch under ADR 0077). A projection case the planner
+  then runs on the unsplit route is held to that route's own error
+  criterion, derived in the test's comment, three times the split-K one. Its
+  `budget` lines give each
   cooperative kernel's CTAs per SM; on compute capability 12.0 it fails if
   one is not the value the planner was tuned on, and on the 5090 if it skips
   any schedule. The one kernel-adjacent thing
