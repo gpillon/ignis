@@ -24,7 +24,7 @@ In a prototype on the RTX 5090 the dense route ran the body's prefill GEMMs abou
 
 **The GDN prefill on 8.x** runs on our own kernels in those forms (#514).
 - A small prepare per 32-token chunk solves the chunk's triangular system on the CUDA cores in fp32. One recurrence keeps each head's state in registers and writes the output itself, so no chunk's state goes through memory.
-- Its products are f16 MMAs with an f16 accumulator over spans of 32 products, each span folded into fp32, the operand rows on power-of-two scales that keep a span below 2^15. Against an fp64 recurrence its rows are closer than the vendored kernels' (0.93 against 2.6 bf16 roundings RMS).
+- Its products are f16 MMAs with an f16 accumulator over spans of 32 products, each span folded into fp32, the operand rows on power-of-two scales that keep a span below 2^15. Against an fp64 recurrence its rows are closer than the vendored kernels' (0.93 against 2.6 bf16 roundings RMS, measured on the RTX 5090 on the leaf test's synthetic inputs).
 - It has no option: on 8.x it is the route. Blackwell keeps the vendored chunked kernels unless the RTX 5090 measures ours faster with its KLD holding. `IGNIS_GDN_PREFILL=ours|vendored` is the switch for that measurement, not a setting.
 
 **What stays.**
