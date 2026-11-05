@@ -204,9 +204,11 @@ int32_t ignis_dense_prefill_norm_mlp(const ignis_trellis_weight *gate, const ign
 /* Test-only (GitHub #511): 0 sends the trellis body's dense prefill back to the standalone A8 of
  * #509 -- the RMSnorms and the SwiGLU write their BF16 rows and ignis_dense_prefill_quantize reads
  * them -- so a test can hold the fused producers' output to it; nonzero, the default, fuses them.
- * Process-wide, read at each body call: set it between prefills, never during one. */
+ * Process-wide, read at each body call: set it between prefills, never during one. The count of
+ * fused RMSnorm launches this process has enqueued tells such a test which passes ran. */
 void ignis_dense_prefill_set_fused_producers(uint32_t fused);
 uint32_t ignis_dense_prefill_fused_producers(void);
+uint64_t ignis_dense_prefill_fused_norm_launches(void);
 
 #ifdef __cplusplus
 }

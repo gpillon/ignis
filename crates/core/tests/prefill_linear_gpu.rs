@@ -9,7 +9,11 @@
 //! - the logits moved (the option reached the body), and the two greedy
 //!   readings agree almost everywhere: the dense prefill's numerics are the
 //!   prototype's W8 and per-token A8, which the KLD gate measured within a
-//!   percent or two of the fused prefill (spec #503).
+//!   percent or two of the fused prefill (spec #503);
+//! - GitHub #511: the dense prefill with its A8 fused into the producers of
+//!   its inputs (the default) gives every span logit of a third run with the
+//!   standalone A8 passes (`trellis::set_dense_prefill_fused_producers(false)`)
+//!   bit for bit: the fusion changes the passes, not the values.
 //!
 //! The FP16 band, so the test runs on every card the route serves.
 //! Explicit GPU profile (ADR 0006): outside `IGNIS_GPU_PROFILE=1` a missing
@@ -25,6 +29,7 @@ use ignis_core::gpu_profile;
 use ignis_core::model_load::load_qwen38_27b_with_decode_lanes;
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step::prefill_program_span_logits;
+use ignis_core::trellis;
 use ignis_core::{KvFormat, PrefillAttention, PrefillLinear, RopeScaling};
 
 const TRELLIS: &str = "F:/ai/models/Qwen3.8-27B-trellis-3bpw-ignis/qwen3_8_27b_trellis_sc30-v2.ninfer";
@@ -94,7 +99,11 @@ fn the_dense_prefill_runs_the_trellis_body_and_agrees_with_the_fused_one() {
     };
     let vocab = ModelConfig::qwen38_27b().vocab as usize;
     let mut logits = Vec::new();
-    for route in [PrefillLinear::Fp16, PrefillLinear::Int8] {
+    // The fused prefill, the dense one with its A8 fused into its producers
+    // (the default), and the dense one with the standalone A8 passes.
+    assert!(trellis::dense_prefill_fused_producers(), "the dense prefill fuses A8 into its producers by default");
+    for (route, fused_producers) in [(PrefillLinear::Fp16, true), (PrefillLinear::Int8, true), (PrefillLinear::Int8, false)] {
+        trellis::set_dense_prefill_fused_producers(fused_producers);
         let model = load_qwen38_27b_with_decode_lanes(
             &reader,
             &artifact,
@@ -127,13 +136,27 @@ fn the_dense_prefill_runs_the_trellis_body_and_agrees_with_the_fused_one() {
         .unwrap_or_else(|e| panic!("{route}: seq pool: {e}"));
         let mut sequence = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("{route}: alloc: {e}"));
         let mut span = vec![0u16; prompt.len() * vocab];
+        let launches = trellis::dense_prefill_fused_norm_launches();
         prefill_program_span_logits(&model, &pool, &mut sequence, prompt, 0, &mut span)
             .unwrap_or_else(|e| panic!("{route}: prefill: {e}"));
+        // The fused RMSnorm ran on the dense prefill under the switch alone.
+        let fused_norms = trellis::dense_prefill_fused_norm_launches() - launches;
+        if route == PrefillLinear::Int8 && fused_producers {
+            assert!(fused_norms > 0, "{route}: the fused producers ran no fused RMSnorm");
+        } else {
+            assert_eq!(fused_norms, 0, "{route}, fused producers {fused_producers}: a fused RMSnorm ran");
+        }
         logits.push(span);
     }
+    trellis::set_dense_prefill_fused_producers(true);
     artifact.release_arena(&mut device).expect("release");
 
-    let (fused, dense) = (&logits[0], &logits[1]);
+    let (fused, dense, standalone) = (&logits[0], &logits[1], &logits[2]);
+    let unfused = dense.iter().zip(standalone).filter(|(a, b)| a != b).count();
+    assert_eq!(
+        unfused, 0,
+        "{unfused} span logits of the dense prefill with its A8 fused into its producers differ from the standalone A8's"
+    );
     let non_finite = dense.iter().filter(|&&v| !bf16(v).is_finite()).count();
     assert_eq!(non_finite, 0, "the dense prefill's span logits hold {non_finite} non-finite values");
     let differing = fused.iter().zip(dense).filter(|(a, b)| a != b).count();
@@ -149,7 +172,8 @@ fn the_dense_prefill_runs_the_trellis_body_and_agrees_with_the_fused_one() {
     );
     println!(
         "prefill linear: {} prompt tokens in {} chunks of {CHUNK}; dense buffer {DENSE_BYTES} bytes; {differing} of {} \
-         logits moved, none non-finite; argmax agreed at {agreeing} of {}",
+         logits moved, none non-finite; argmax agreed at {agreeing} of {}; the fused producers' logits are the \
+         standalone A8's bit for bit",
         prompt.len(),
         prompt.len().div_ceil(CHUNK as usize),
         prompt.len() * vocab,

@@ -130,6 +130,24 @@ void input_projection(ignis_model &model, const GdnLayerWeights &w, const ninfer
                               arena, stream);
 }
 
+// The layer's input RMSNorm of `in` into `h`, then the input projection
+// above. GitHub #511: on the dense prefill the norm writes the projection's
+// INT8 input as it writes `h` (kernel/src/trellis_body.h, fused_producers),
+// so the projection quantizes nothing of its own.
+void norm_and_input_projection(ignis_model &model, const GdnLayerWeights &w, const ninfer::Tensor &in,
+                               const ninfer::Tensor &input_norm, ninfer::Tensor &h, ninfer::Tensor &qkv,
+                               ninfer::Tensor &z, ninfer::DeviceArena &arena, LinearPolicyMode mode,
+                               cudaStream_t stream) {
+  if (model.is_trellis_body && ignis::trellis_body::fused_producers(model, in.ne[1])) {
+    ignis::trellis_body::norm_gdn_projection(model, in, input_norm, h, w.trellis.in_proj_qkv, w.trellis.in_proj_z,
+                                             qkv.data, static_cast<uint32_t>(qkv.ne[0]), z.data,
+                                             static_cast<uint32_t>(z.ne[0]), stream);
+    return;
+  }
+  ninfer::ops::rmsnorm(in, input_norm, model.rms_norm_eps, /*unit_offset=*/true, h, stream);
+  input_projection(model, w, h, qkv, z, arena, mode, stream);
+}
+
 // Runs one GDN layer for `num_tokens` sequential tokens of one sequence
 // (GitHub #58). `slot` is the sequence's state-pool slot (conv taps + fp32
 // recurrent state); `layer` is the *model's* zero-based layer index (0..63,
@@ -199,10 +217,10 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     // The input residual viewed as the layer's [hidden, T] feature-major input.
     const ninfer::Tensor in(in_residual, ninfer::DType::BF16, {hidden, T, 1, 1});
 
-    // --- input RMSNorm (the layer's pre-attention norm) ---
+    // --- input RMSNorm (the layer's pre-attention norm), run with the input
+    // projection below (GitHub #511) ---
     const ninfer::Tensor input_norm =
         weight_tensor(w.input_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
-    ninfer::ops::rmsnorm(in, input_norm, model->rms_norm_eps, /*unit_offset=*/true, h, stream);
 
     // --- GDN input projection (NVFP4, kernel/src/gdn_input_proj.cu) -> the
     // combined pre-conv q/k/v plane (query/key/value channel order) and z
@@ -222,7 +240,7 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     // workspace comes from the model's scratch (reserved at load for the
     // widest policy, P2-01, GitHub #83), so a chunk's A4 route needs
     // nothing new. GitHub #339: the trellis body's two matrices instead.
-    input_projection(*model, w, h, qkv, zbuf, *model->scratch, mode, stream);
+    norm_and_input_projection(*model, w, in, input_norm, h, qkv, zbuf, *model->scratch, mode, stream);
     cudaError_t err = cudaSuccess;
     if (!layout_copies) {
       // GitHub #507: the conv writes the convolved query/key/value channel

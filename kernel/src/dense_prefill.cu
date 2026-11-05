@@ -833,8 +833,10 @@ int32_t decode_and_gemm(const ignis_trellis_weight *const *w, uint32_t count, co
   return 0;
 }
 
-// The test-only switch of GitHub #511 (ignis_dense_prefill_set_fused_producers).
+// The test-only switch of GitHub #511 (ignis_dense_prefill_set_fused_producers), and the fused
+// RMSnorm launches enqueued, which a test of the switch reads.
 std::atomic<uint32_t> g_fused_producers{1};
+std::atomic<uint64_t> g_fused_norm_launches{0};
 
 }  // namespace
 
@@ -1093,7 +1095,9 @@ extern "C" int32_t ignis_dense_prefill_rmsnorm_quantize(const void *x, const voi
   dense_prefill_rmsnorm_a8_kernel<<<tokens, kNormThreads, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const __nv_bfloat162 *>(x), static_cast<const __nv_bfloat162 *>(norm), static_cast<int>(w[0]->in), eps,
       static_cast<__nv_bfloat162 *>(h), static_cast<int>(tokens), g);
-  return check_launch(op);
+  if (check_launch(op) != 0) return -1;
+  g_fused_norm_launches.fetch_add(1, std::memory_order_relaxed);
+  return 0;
 }
 
 extern "C" int32_t ignis_dense_prefill_quantize_blocks(const void *x, uint32_t tokens, const ignis_trellis_weight *w,
@@ -1170,3 +1174,7 @@ extern "C" void ignis_dense_prefill_set_fused_producers(uint32_t fused) {
 }
 
 extern "C" uint32_t ignis_dense_prefill_fused_producers(void) { return g_fused_producers.load(std::memory_order_relaxed); }
+
+extern "C" uint64_t ignis_dense_prefill_fused_norm_launches(void) {
+  return g_fused_norm_launches.load(std::memory_order_relaxed);
+}

@@ -77,6 +77,10 @@ pub mod ffi {
         ) -> i32;
         pub fn ignis_trellis_reconstruct(w: *const TrellisWeight, w_f16: *mut c_void, stream: *mut c_void) -> i32;
         pub fn ignis_trellis_last_error() -> *const c_char;
+        // `kernel/include/ignis_dense_prefill.h`'s test-only switch (GitHub #511).
+        pub fn ignis_dense_prefill_set_fused_producers(fused: u32);
+        pub fn ignis_dense_prefill_fused_producers() -> u32;
+        pub fn ignis_dense_prefill_fused_norm_launches() -> u64;
     }
 }
 
@@ -98,6 +102,30 @@ pub fn prepare() -> Result<(), String> {
 /// The SM cap the current device was prepared with, 0 for none.
 pub fn sm_cap() -> u32 {
     unsafe { ffi::ignis_trellis_sm_cap() }
+}
+
+/// Test-only (GitHub #511): `false` sends the trellis body's dense prefill (`PrefillLinear::Int8`)
+/// back to its standalone A8 passes, the RMSnorms and the SwiGLU writing their BF16 rows for the
+/// quantize to read; `true`, the default, fuses A8 into those producers. The activations are the
+/// same bits either way, which is what a test of the switch holds. Process-wide and read at each
+/// body call: set it between prefills, never during one. Public for the GPU test
+/// `tests/prefill_linear_gpu.rs`; no serving path calls it.
+#[doc(hidden)]
+pub fn set_dense_prefill_fused_producers(fused: bool) {
+    unsafe { ffi::ignis_dense_prefill_set_fused_producers(u32::from(fused)) }
+}
+
+/// Whether the dense prefill fuses A8 into its producers ([`set_dense_prefill_fused_producers`]).
+#[doc(hidden)]
+pub fn dense_prefill_fused_producers() -> bool {
+    unsafe { ffi::ignis_dense_prefill_fused_producers() != 0 }
+}
+
+/// The fused RMSnorm launches this process has enqueued: which passes a run under
+/// [`set_dense_prefill_fused_producers`] took.
+#[doc(hidden)]
+pub fn dense_prefill_fused_norm_launches() -> u64 {
+    unsafe { ffi::ignis_dense_prefill_fused_norm_launches() }
 }
 
 /// One call's shape: a linear (`weights` 1) or a gate/up pair (`weights` 2, each `out` wide).

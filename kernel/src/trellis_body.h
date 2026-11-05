@@ -74,6 +74,16 @@ inline uint64_t tile_bytes(const ignis_trellis_weight &w) {
 // quantize it once for all of them.
 bool dense_prefill(const ignis_model &model, int32_t tokens);
 
+// GitHub #511: whether such a call also runs A8 fused into the producers of
+// its inputs: the dense prefill, under the leaf's test-only switch
+// (ignis_dense_prefill_set_fused_producers, on by default). The RMSnorm
+// before a block's first matrices then quantizes their input as it normalizes
+// it (the norm_* calls below, which the layer programs run in place of the
+// RMSnorm and the projection), and the MLP's SwiGLU epilogue keeps down's
+// block maxima (output_and_mlp). The activations are the standalone A8's bit
+// for bit; only the passes change.
+bool fused_producers(const ignis_model &model, int32_t tokens);
+
 // y = x W through `epilogue` (IGNIS_TRELLIS_STORE or IGNIS_TRELLIS_ADD): `x`
 // a BF16 `[in, T]` activation, `y` the first column of a BF16 `[ldy, T]`
 // buffer. Throws std::runtime_error with the op's message on a refusal, as the
@@ -96,6 +106,21 @@ void attention_projection(const ignis_model &model, const ignis_trellis_weight &
                           const ninfer::Tensor &x, int32_t heads, int32_t head_dim, ninfer::DeviceArena &arena,
                           ninfer::Tensor &query, ninfer::Tensor &gate, ninfer::Tensor &key, ninfer::Tensor &value,
                           cudaStream_t stream);
+
+// GitHub #511, under fused_producers: the layer's input RMSnorm (`norm`, BF16
+// `[hidden]`, unit offset, the model's eps) of the residual `x` and the input
+// projection above, the projection's A8 fused into the norm. The GDN form
+// writes the normalized row to `h` (its gating projection reads it); the GQA
+// form writes none, as nothing past the projection reads it.
+void norm_gdn_projection(const ignis_model &model, const ninfer::Tensor &x, const ninfer::Tensor &norm,
+                         ninfer::Tensor &h, const ignis_trellis_weight &in_proj_qkv,
+                         const ignis_trellis_weight &in_proj_z, void *qkv, uint32_t ldqkv, void *z, uint32_t ldz,
+                         cudaStream_t stream);
+void norm_attention_projection(const ignis_model &model, const ninfer::Tensor &x, const ninfer::Tensor &norm,
+                               const ignis_trellis_weight &q_proj, const ignis_trellis_weight &k_proj,
+                               const ignis_trellis_weight &v_proj, int32_t heads, int32_t head_dim,
+                               ninfer::Tensor &query, ninfer::Tensor &gate, ninfer::Tensor &key,
+                               ninfer::Tensor &value, cudaStream_t stream);
 
 // h = silu(x G) * (x U): the MLP's gate and up matrices, `h` BF16 `[out, T]`.
 void swiglu(const ignis_model &model, const ignis_trellis_weight &gate, const ignis_trellis_weight &up,
@@ -125,7 +150,9 @@ std::int32_t mlp_width(const ignis_model &model, const TrellisTail &tail, const 
 // What every GDN and GQA body runs after its token mixer on a trellis load,
 // in this order: the output projection of `mixed` added into `residual`, the
 // post-attention norm (`post_norm`, BF16 `[hidden]`) into `post`, the SwiGLU
-// into `fused`, and the down projection added into `residual`.
+// into `fused`, and the down projection added into `residual`. Under
+// fused_producers (GitHub #511) the norm, the SwiGLU and down run as one dense
+// MLP with every A8 fused into its producer, and `post` is not written.
 void output_and_mlp(const ignis_model &model, const TrellisTail &tail, const ninfer::Tensor &mixed,
                     const ninfer::Tensor &post_norm, ninfer::Tensor &residual, ninfer::Tensor &post,
                     ninfer::Tensor &fused, cudaStream_t stream);

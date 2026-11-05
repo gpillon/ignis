@@ -926,6 +926,7 @@ void fused_producers_arm() {
            down = synthetic(4, ffn, 4096, 7120 + ffn);
     check_mlp("synthetic MLP, ffn " + std::to_string(ffn), gate, up, down, standin_norm(4096, 87), 300, 88);
   }
+  check(ignis_dense_prefill_fused_norm_launches() >= 11, "the fused RMSnorm launches are counted (three per norm group, one per MLP)");
   check(ignis_dense_prefill_fused_producers() == 1, "the fused producers are the default");
   ignis_dense_prefill_set_fused_producers(0);
   check(ignis_dense_prefill_fused_producers() == 0, "the switch turns the fused producers off");
