@@ -264,7 +264,7 @@ The KV storage format: `hq-e8-2b` (the serving default) or `bf16` (the retained 
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The 27B's prompt attention band (GitHub #335): `fp8` (the default, the band pass in 8 bits; `8bit` is its other spelling), `fp16` (the FP16-accumulate fallback) or `int8` (the integer band of the 8.x cards, spec #503). Flash-Next's attention is QSA and has no such pass. On a card below compute capability 12.0 left to its default, or to a profile's `fp8`, it reads `fp16` while the integer band is opt-in there, its origin the card; a named `fp8` there runs the integer band and reads `int8` (GitHub #477, #505, #510).
+The 27B's prompt attention band (GitHub #335): `fp8` (the default on an RTX 50 or RTX PRO card, the band pass in 8 bits; `8bit` is its other spelling), `fp16` (the FP16-accumulate fallback) or `int8` (the integer band of the 8.x cards, spec #503). Flash-Next's attention is QSA and has no such pass. On a card below compute capability 12.0 (RTX 30, RTX 40) left to its default, or to a profile's `fp8`, it reads `int8`, the integer band, its origin the card; a named `fp8` there runs it too, and a named `fp16` keeps the FP16 band (GitHub #477, #505, #510, #515).
 
 ### `model.prefill_linear`
 
@@ -278,7 +278,7 @@ The 27B's prompt attention band (GitHub #335): `fp8` (the default, the band pass
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The 27B's trellis prefill route (spec #503, GitHub #505): `fp16` (the default, the fused prefill, the trellis decoded inside the GEMM) or `int8` (the dense prefill, each matrix decoded once per chunk and multiplied on the integer MMA). A value the build cannot run falls back to `fp16` when it comes from a profile and is refused when named; on a Blackwell card `int8` runs only when named. Flash-Next has its own prefill.
+The 27B's trellis prefill route (spec #503, GitHub #505): `fp16` (the default on an RTX 50 or RTX PRO card, the fused prefill, the trellis decoded inside the GEMM) or `int8` (the dense prefill, each matrix decoded once per chunk and multiplied on the integer MMA, the default on an RTX 30 or RTX 40 card, GitHub #515, where it reads `int8` with the card as its origin). A value the build cannot run falls back to `fp16` when it comes from a profile and is refused when named; on a Blackwell card `int8` runs only when named. Flash-Next has its own prefill.
 
 ### `model.exception_weights`
 
