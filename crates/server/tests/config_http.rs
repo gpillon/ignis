@@ -1021,6 +1021,9 @@ async fn under_auto_a_24gb_card_runs_rtx_24gb_and_the_config_says_so() {
         let vision = &document["vision"]["qwen38"];
         assert_eq!((&vision["enabled"], &vision["residency"], &vision["max_tokens"]), (&json!(true), &json!("host"), &json!(32768)), "{band}: {document}");
         assert_eq!(qwen.0["prefill_attention"], band, "{document}");
+        // Spec #503 (GitHub #505): the prefill route is reported as the load resolves it.
+        assert_eq!(qwen.0["prefill_linear"], "fp16", "{document}");
+        assert!(document["model"]["qwen38flashnext"].get("prefill_linear").is_none(), "the 27B's alone: {document}");
 
         let (status, origins) = send(&app, Method::GET, "/v1/config/origins", None).await;
         assert_eq!(status, StatusCode::OK, "{origins}");
@@ -1028,6 +1031,8 @@ async fn under_auto_a_24gb_card_runs_rtx_24gb_and_the_config_says_so() {
         for key in ["model.max_context", "model.prefill_chunk", "spec.backend", "spec.draft_tokens", "vram.headroom_bytes"] {
             assert_eq!(profile(key), (json!("qwen38"), "profile".to_owned(), true, Some("rtx-24gb".to_owned())), "{band}: {key}");
         }
+        let linear = origins_of(&origins, "model.prefill_linear");
+        assert!(!linear.is_empty() && linear.iter().all(|(_, source, ..)| source == "default"), "{band}: {linear:?}");
         assert_eq!(origins_of(&origins, "vision.residency")[0], (Value::Null, "profile".to_owned(), false, Some("rtx-24gb".to_owned())), "{band}");
     }
 }

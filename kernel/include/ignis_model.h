@@ -254,10 +254,22 @@ enum ignis_prefill_attention {
   /* FP16 operands with FP16 accumulate inside a 32-key tile, folded into
    * FP32: the fallback. */
   IGNIS_PREFILL_ATTENTION_FP16 = 1,
-  /* GitHub #510 (spec #503): the integer band, the 8-bit band on integer
-   * MMAs alone (Q K^T in INT8, P V on the u8 x s8 MMA), which a card without
-   * the FP8 MMA runs; the residual window's prefill pass runs on it too. */
+  /* GitHub #505 (spec #503): the integer band of the 8.x cards, Q K^T on the
+   * INT8 MMA and P V on the u8 x s8 one; the residual window's prefill pass
+   * runs on it too (GitHub #510). */
   IGNIS_PREFILL_ATTENTION_INT8 = 2,
+};
+
+/* GitHub #505 (spec #503): how the 27B's trellis prefill multiplies its
+ * matrices. */
+enum ignis_prefill_linear {
+  /* The fused prefill: the trellis decoded inside the GEMM's inner loop, the
+   * multiply in f16. Today's route. */
+  IGNIS_PREFILL_LINEAR_FUSED = 0,
+  /* The dense prefill: each matrix decoded once per chunk into one INT8
+   * buffer and multiplied on the integer MMA. A leaf that does not carry it
+   * refuses the value. */
+  IGNIS_PREFILL_LINEAR_DENSE = 1,
 };
 
 /* GitHub #414 (ADR 0075): where a vision load keeps the 27B's vision tower
@@ -396,6 +408,10 @@ struct ignis_model_load_options {
    * load refuses either mismatch, and the plan (which reads no pointer) sizes
    * the scratch for the ring by this field alone. */
   uint32_t vision_residency;
+  /* enum ignis_prefill_linear (GitHub #505); anything else is refused.
+   * Fixed for the life of the load. IGNIS_PREFILL_LINEAR_FUSED on
+   * Flash-Next. Appended at the end: the struct grew by one padded word. */
+  uint32_t prefill_linear;
 };
 
 /* The widest vision envelope a load accepts, in merged tokens: 4x that many

@@ -521,8 +521,23 @@ oracle the route agreement test holds it against.
 ignis's own hq-e8-2b prefill attention (an adapted op, ADR 0051/0061): two
 passes sharing one online softmax, the **residual window** in BF16 and every
 other key through the **band** in 8 bits (or FP16 with FP16 accumulate, the
-fallback; the load option `--model-prefill-attention` picks one, `fp8` naming
-the 8-bit band). Its workspace stops growing with the context at one band.
+fallback; the load option `--model-prefill-attention` picks one, `8bit` or
+`fp8` naming the 8-bit band). On an 8.x card (RTX 30, RTX 40) the 8-bit band is
+the **integer band** (spec #503, ADR 0080): Q K^T in INT8 and P V on the u8 x s8
+MMA, which `int8` names on any card. Its workspace stops growing with the
+context at one band.
+
+**Fused prefill**:
+The 27B trellis body's prefill as it has always run: the trellis decoded
+inside the GEMM's inner loop and the multiply in f16 (`--model-prefill-linear
+fp16`). The route on sm_120; on an 8.x card a GeForce's decode on the CUDA
+cores binds it.
+
+**Dense prefill**:
+The 27B trellis body's other prefill route (spec #503, ADR 0080,
+`--model-prefill-linear int8`): each matrix decoded once per chunk into one
+dense INT8 buffer, sized for the largest matrix, and multiplied on the integer
+MMA with an INT8 activation. The route of the 8.x cards once gated.
 
 **Band**:
 The fixed buffer the prompt attention decodes the codec's keys into, once per

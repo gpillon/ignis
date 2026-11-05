@@ -112,6 +112,10 @@ pub struct CudaLeafConfig {
     /// GitHub #335): the 8-bit band by default, or the FP16-accumulate fallback. Fixed
     /// for the life of the load; Flash-Next's QSA ignores it.
     pub prefill_attention: ignis_core::PrefillAttention,
+    /// The trellis prefill's route (`--model-prefill-linear`, GitHub #505):
+    /// the fused prefill by default, or the dense one. Fixed for the life of
+    /// the load; Flash-Next ignores it.
+    pub prefill_linear: ignis_core::PrefillLinear,
 }
 
 impl Default for CudaLeafConfig {
@@ -144,6 +148,7 @@ impl Default for CudaLeafConfig {
             vision: None,
             rope_scaling: ignis_core::RopeScaling::NONE,
             prefill_attention: ignis_core::PrefillAttention::default(),
+            prefill_linear: ignis_core::PrefillLinear::default(),
         }
     }
 }
@@ -294,6 +299,7 @@ impl CudaLeafConfig {
             self.vision,
             self.rope_scaling,
             self.prefill_attention,
+            self.prefill_linear,
             self.slot_count,
         )?;
         let pool = self.pool_plan(1)?;
@@ -560,6 +566,7 @@ impl StepLeaf for CudaLeaf {
             self.config.vision,
             self.config.rope_scaling,
             self.config.prefill_attention,
+            self.config.prefill_linear,
             self.config.slot_count,
         )
         .map_err(|e| leaf_error("model load", e))?;

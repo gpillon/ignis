@@ -1188,6 +1188,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   uint32_t attention_text_max_keys = 0;
   uint32_t draft_row_budget = 0;
   uint32_t prefill_attention = 0;
+  uint32_t prefill_linear = IGNIS_PREFILL_LINEAR_FUSED;
   uint32_t vision_residency = IGNIS_VISION_RESIDENCY_DEVICE;
   ignis::RopeScaling rope_scaling{};
   if (options != nullptr) {
@@ -1208,14 +1209,27 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     attention_text_max_keys = options->attention_text_max_keys;
     draft_row_budget = options->draft_row_budget;
     prefill_attention = options->prefill_attention;
+    prefill_linear = options->prefill_linear;
     vision_residency = options->vision_residency;
   }
   // GitHub #335: a value the leaf does not know is refused rather than run as
-  // one of the three (GitHub #510 added the integer band).
+  // one of the three.
   if (prefill_attention != IGNIS_PREFILL_ATTENTION_FP8 && prefill_attention != IGNIS_PREFILL_ATTENTION_FP16 &&
       prefill_attention != IGNIS_PREFILL_ATTENTION_INT8) {
     set_error("ignis_model_load: prefill_attention " + std::to_string(prefill_attention) +
-              " is not 0 (8-bit), 1 (FP16 accumulate) or 2 (the integer band)");
+              " is not 0 (8-bit), 1 (FP16 accumulate) or 2 (integer)");
+    return nullptr;
+  }
+  // GitHub #505 (spec #503): the dense prefill is named by the option surface
+  // before its kernels exist; until they do, the leaf refuses it by name
+  // instead of running the other route. The integer band runs (GitHub #510).
+  if (prefill_linear != IGNIS_PREFILL_LINEAR_FUSED && prefill_linear != IGNIS_PREFILL_LINEAR_DENSE) {
+    set_error("ignis_model_load: prefill_linear " + std::to_string(prefill_linear) +
+              " is not 0 (fused) or 1 (dense)");
+    return nullptr;
+  }
+  if (prefill_linear == IGNIS_PREFILL_LINEAR_DENSE) {
+    set_error("ignis_model_load: prefill_linear 1 (the dense prefill) is not built yet");
     return nullptr;
   }
   // GitHub #227: a scaling that cannot build a table is refused by name --
@@ -1304,6 +1318,10 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   if (flash_next) {
     if (prefill_attention != IGNIS_PREFILL_ATTENTION_FP8) {
       set_error("ignis_model_load: prefill_attention is the 27B's; Qwen3.8-Flash-Next's attention is QSA");
+      return nullptr;
+    }
+    if (prefill_linear != IGNIS_PREFILL_LINEAR_FUSED) {
+      set_error("ignis_model_load: prefill_linear is the 27B's; Qwen3.8-Flash-Next has its own prefill");
       return nullptr;
     }
     if (vision_max_tokens != 0 || attention_text_max_keys != 0) {

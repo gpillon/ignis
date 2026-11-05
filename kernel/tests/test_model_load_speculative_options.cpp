@@ -198,6 +198,32 @@ int main() {
     check(contains(m, "draft_tokens") && contains(m, "speculative_backend"),
           "a window with no backend is refused: " + m);
   }
+  // GitHub #505 (spec #503): the dense prefill is named by the option surface
+  // before its kernels exist; the leaf refuses it by name, and a value past the
+  // enum as well. The integer band runs (GitHub #510): it reaches the binding.
+  {
+    ignis_model_load_options band{};
+    band.size = sizeof(band);
+    band.prefill_attention = IGNIS_PREFILL_ATTENTION_INT8;
+    const std::string m = load_error({}, &band);
+    check(contains(m, "text/token_embedding"), "the integer band reaches the binding: " + m);
+    ignis_model_load_options dense{};
+    dense.size = sizeof(dense);
+    dense.prefill_linear = IGNIS_PREFILL_LINEAR_DENSE;
+    const std::string d = load_error({}, &dense);
+    check(contains(d, "prefill_linear") && contains(d, "dense") && contains(d, "not built yet"),
+          "the dense prefill is refused by name: " + d);
+    ignis_model_load_options unknown{};
+    unknown.size = sizeof(unknown);
+    unknown.prefill_linear = 7;
+    const std::string u = load_error({}, &unknown);
+    check(contains(u, "prefill_linear 7"), "an unknown prefill_linear is refused by value: " + u);
+    ignis_model_load_options fused{};
+    fused.size = sizeof(fused);
+    fused.prefill_linear = IGNIS_PREFILL_LINEAR_FUSED;
+    const std::string f = load_error({}, &fused);
+    check(contains(f, "text/token_embedding"), "the fused prefill reaches the binding: " + f);
+  }
   // The control arm for the checks above: every valid window gets past them
   // and fails on binding instead.
   for (uint32_t window = 1; window <= IGNIS_DFLASH2_MAX_DRAFT_TOKENS; ++window) {
