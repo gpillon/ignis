@@ -689,6 +689,15 @@ add_executable(ignis_sm8x_dense_bench bench_sm8x_dense.cu
 target_include_directories(ignis_sm8x_dense_bench PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../src ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 set_target_properties(ignis_sm8x_dense_bench PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+# PROTOTYPE (sm8x dense prefill, phase 2d; GitHub #474), throwaway: the prompt attention's bands
+# over a whole causal prompt. Standalone as the dense bench: it includes hq_prompt_attention.cu for
+# its kernels and pass driver (without the op's entry points) and builds the cache with the
+# vendored codec's device encoder, so it links nothing of the leaf. A tool, not a CTest.
+add_executable(ignis_sm8x_attn_bench bench_sm8x_attn.cu)
+target_include_directories(ignis_sm8x_attn_bench PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src ${CMAKE_CURRENT_SOURCE_DIR}/../include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/src ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/include)
+set_target_properties(ignis_sm8x_attn_bench PROPERTIES CUDA_RUNTIME_LIBRARY Static)
 # The MoE microbenchmark: a report of every op's achieved bandwidth or throughput. The spec's
 # decode floor (one-token routed decode >= 50% of the DRAM roofline) is its one pass/fail,
 # opt-in with --check-floor; it is a tool and NOT a CTest while that floor is open, so the stage
