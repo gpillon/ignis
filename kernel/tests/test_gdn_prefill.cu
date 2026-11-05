@@ -19,10 +19,13 @@
 // their worst over 20,480 rows at about 4.6 times that, the tail of the same spread. So:
 //   - kRmsBound = 4 x 2^-9 on each path's RMS row error against fp64, and kWorstBound = 16 x 2^-9
 //     on its worst row; kRmsBound on each carried state;
-//   - ours no farther from fp64 than the vendored path, worst row and RMS each (it rounds to
-//     f16, 2^-11 per operand, q and k included, and accumulates in f16 over spans of 32 products
-//     that stay below 2^15, each folded into fp32; only its bf16 output is the vendored path's
-//     rounding);
+//   - ours no farther from fp64 than the vendored path, worst row and RMS each, wherever the
+//     vendored op runs its chunked kernels (64 tokens and more; below, it runs its fp32
+//     recurrent kernel, and so does the layer body). Ours rounds to f16, 2^-11 per operand, q and
+//     k included, and accumulates in f16 over spans of 32 products that stay below 2^15, each
+//     folded into fp32; only its bf16 output is a bf16 rounding. Measured on the RTX 5090 its
+//     rows land at 0.93 x 2^-9 RMS (the output's own rounding) and its states about six times
+//     closer to fp64 than the vendored path's;
 //   - ours against the vendored path on all 48 heads: every row within the triangle
 //     inequality's sum of the two paths' bounds, 2 x kWorstBound (RMS 2 x kRmsBound), and every
 //     carried state within 2 x kRmsBound.
@@ -216,6 +219,16 @@ Result run_vendored(const Inputs &in, int32_t T, const std::vector<float> &state
   return download_call(d, T);
 }
 
+// Ours, the same call: the state in place, the workspace the op asks for.
+Result run_ours(const Inputs &in, int32_t T, const std::vector<float> &state, const DeviceBytes &workspace,
+                cudaStream_t stream) {
+  Device d = upload_call(in, T, state);
+  Tensors t = tensors(d, T);
+  ignis::gdn_prefill::chunked(t.q, t.k, t.v, t.g, t.beta, kScale, t.state, t.state, t.out, workspace.p,
+                              workspace.bytes, stream);
+  return download_call(d, T);
+}
+
 // --- comparisons --------------------------------------------------------------------------------
 
 struct Distance {
@@ -260,6 +273,47 @@ Distance rows_vs_reference(const std::vector<uint16_t> &out, int32_t T, const st
   return dist;
 }
 
+// Our output rows against the vendored path's on every head, floored at each head's RMS row.
+Distance rows_vs_vendored(const std::vector<uint16_t> &ours, const std::vector<uint16_t> &vendored, int32_t T) {
+  Distance dist;
+  for (int32_t h = 0; h < kValueHeads; ++h) {
+    double head = 0.0;
+    for (int32_t t = 0; t < T; ++t) {
+      for (int d = 0; d < kDim; ++d) {
+        const double v = bf16_to_f32(vendored[(static_cast<std::size_t>(t) * kValueHeads + h) * kDim + d]);
+        head += v * v;
+      }
+    }
+    const double floor_sq = kRowFloor * kRowFloor * head / static_cast<double>(T);
+    for (int32_t t = 0; t < T; ++t) {
+      double num = 0.0, den = 0.0;
+      for (int d = 0; d < kDim; ++d) {
+        const std::size_t at = (static_cast<std::size_t>(t) * kValueHeads + h) * kDim + d;
+        const double want = bf16_to_f32(vendored[at]), got = bf16_to_f32(ours[at]);
+        num += (got - want) * (got - want);
+        den += want * want;
+      }
+      dist.add(std::isfinite(num) ? num : 1e300, std::max(den, floor_sq));
+    }
+  }
+  return dist;
+}
+
+Distance states_vs_vendored(const std::vector<float> &ours, const std::vector<float> &vendored) {
+  Distance dist;
+  for (int32_t h = 0; h < kValueHeads; ++h) {
+    double num = 0.0, den = 0.0;
+    for (int i = 0; i < kDim * kDim; ++i) {
+      const std::size_t at = static_cast<std::size_t>(h) * kDim * kDim + i;
+      const double diff = static_cast<double>(ours[at]) - vendored[at];
+      num += diff * diff;
+      den += static_cast<double>(vendored[at]) * vendored[at];
+    }
+    dist.add(std::isfinite(num) ? num : 1e300, den);
+  }
+  return dist;
+}
+
 // The carried state of the reference heads against fp64.
 Distance states_vs_reference(const std::vector<float> &state, const std::vector<std::vector<double>> &ref) {
   Distance dist;
@@ -285,9 +339,10 @@ void check_distance(const std::string &what, const Distance &d, double worst_bou
 
 // One case: consecutive calls from one state, the state carried between them.
 void run_case(const char *name, const std::vector<int32_t> &calls, uint32_t stream, ninfer::DeviceArena &arena,
-              cudaStream_t cuda) {
+              const DeviceBytes &workspace, cudaStream_t cuda) {
   std::printf("  %s\n", name);
   std::vector<float> s_vendored = initial_state();
+  std::vector<float> s_ours = s_vendored;
   std::vector<std::vector<double>> s_ref(kRefCount);
   for (int r = 0; r < kRefCount; ++r) {
     s_ref[r].assign(s_vendored.begin() + static_cast<std::ptrdiff_t>(kRefHeads[r]) * kDim * kDim,
@@ -302,11 +357,29 @@ void run_case(const char *name, const std::vector<int32_t> &calls, uint32_t stre
       workers.emplace_back([&, r] { reference_head(in, T, kRefHeads[r], s_ref[r], o_ref[r]); });
     }
     const Result vendored = run_vendored(in, T, s_vendored, arena, cuda);
+    const Result ours = run_ours(in, T, s_ours, workspace, cuda);
     for (auto &w : workers) w.join();
     const std::string at = "call " + std::to_string(c + 1) + " (T=" + std::to_string(T) + ")";
-    check_distance(at + " vendored rows vs fp64", rows_vs_reference(vendored.out, T, o_ref), kWorstBound, kRmsBound);
-    check_distance(at + " vendored state vs fp64", states_vs_reference(vendored.state, s_ref), kRmsBound, kRmsBound);
+    const Distance v_rows = rows_vs_reference(vendored.out, T, o_ref);
+    const Distance v_state = states_vs_reference(vendored.state, s_ref);
+    const Distance o_rows = rows_vs_reference(ours.out, T, o_ref);
+    const Distance o_state = states_vs_reference(ours.state, s_ref);
+    check_distance(at + " vendored rows vs fp64", v_rows, kWorstBound, kRmsBound);
+    check_distance(at + " vendored state vs fp64", v_state, kRmsBound, kRmsBound);
+    check_distance(at + " ours rows vs fp64", o_rows, kWorstBound, kRmsBound);
+    check_distance(at + " ours state vs fp64", o_state, kRmsBound, kRmsBound);
+    // Below kMinTokens the vendored op runs its fp32 recurrent kernel alone, and so does the layer
+    // body (ours is not called there): only the chunked kernels it replaces are the yardstick.
+    if (T >= ignis::gdn_prefill::kMinTokens) {
+      check(o_rows.worst <= v_rows.worst && o_rows.rms() <= v_rows.rms(), at + ": our rows are farther from fp64");
+      check(o_state.worst <= v_state.worst && o_state.rms() <= v_state.rms(), at + ": our state is farther from fp64");
+    }
+    check_distance(at + " ours vs vendored rows, 48 heads", rows_vs_vendored(ours.out, vendored.out, T),
+                   2 * kWorstBound, 2 * kRmsBound);
+    check_distance(at + " ours vs vendored state, 48 heads", states_vs_vendored(ours.state, vendored.state),
+                   2 * kRmsBound, 2 * kRmsBound);
     s_vendored = vendored.state;
+    s_ours = ours.state;
   }
 }
 
@@ -323,11 +396,59 @@ int main() {
   ninfer::DeviceArena arena(
       ninfer::ops::gated_delta_net_workspace_capacity_bytes(kQkHeads, kValueHeads, /*normalize_qk=*/true, 1, 4096));
 
-  run_case("chunk 1024", {1024}, 1000, arena, stream);
-  run_case("chunk 2048", {2048}, 2000, arena, stream);
-  run_case("chunk 4096", {4096}, 3000, arena, stream);
-  run_case("chunks 4096, 4096, 777 (the state carried in place)", {4096, 4096, 777}, 4000, arena, stream);
-  run_case("ragged 64, 100, 1000, 40", {64, 100, 1000, 40}, 5000, arena, stream);
+  DeviceBytes workspace(ignis::gdn_prefill::workspace_bytes(kQkHeads, kValueHeads, 4096));
+  std::printf("gdn_prefill: the recurrence runs %d warps per CTA here\n", ignis::gdn_prefill::recurrence_warps());
+
+  // The layer body takes our workspace from the vendored op's reservation (kernel/src/gdn_layer.cu):
+  // it must fit at every width the body sends here.
+  for (int32_t T = ignis::gdn_prefill::kMinTokens; T <= 16384; ++T) {
+    const std::size_t ours = ignis::gdn_prefill::workspace_bytes(kQkHeads, kValueHeads, T);
+    const std::size_t vendored =
+        ninfer::ops::gated_delta_net_workspace_capacity_bytes(kQkHeads, kValueHeads, /*normalize_qk=*/true, 1, T);
+    if (ours > vendored) {
+      check(false, "our workspace at T=" + std::to_string(T) + " exceeds the vendored reservation");
+      break;
+    }
+  }
+
+  run_case("chunk 1024", {1024}, 1000, arena, workspace, stream);
+  run_case("chunk 2048", {2048}, 2000, arena, workspace, stream);
+  run_case("chunk 4096", {4096}, 3000, arena, workspace, stream);
+  run_case("chunks 4096, 4096, 777 (the state carried in place)", {4096, 4096, 777}, 4000, arena, workspace, stream);
+  run_case("ragged 64, 100, 1000, 40", {64, 100, 1000, 40}, 5000, arena, workspace, stream);
+
+  // Refusals, each by name before any launch: value heads that are not a multiple of the q/k
+  // heads, a v at another T, and a workspace too small.
+  {
+    const Inputs in = make_inputs(9, 64);
+    Device d = upload_call(in, 64, initial_state());
+    Tensors t = tensors(d, 64);
+    const auto refuses = [&](const char *what, auto &&call) {
+      bool refused = false;
+      try {
+        call();
+      } catch (const std::invalid_argument &) {
+        refused = true;
+      }
+      check(refused, std::string("refuses ") + what);
+    };
+    refuses("47 value heads over 16 q/k heads", [&] {
+      ninfer::Tensor v47(d.v.p, ninfer::DType::BF16, {kDim, 47, 64, 1});
+      ninfer::Tensor out47(d.out.p, ninfer::DType::BF16, {kDim, 47, 64, 1});
+      ignis::gdn_prefill::chunked(t.q, t.k, v47, t.g, t.beta, kScale, t.state, t.state, out47, workspace.p,
+                                  workspace.bytes, stream);
+    });
+    refuses("v at another T", [&] {
+      ninfer::Tensor v63(d.v.p, ninfer::DType::BF16, {kDim, kValueHeads, 63, 1});
+      ignis::gdn_prefill::chunked(t.q, t.k, v63, t.g, t.beta, kScale, t.state, t.state, t.out, workspace.p,
+                                  workspace.bytes, stream);
+    });
+    refuses("a short workspace", [&] {
+      ignis::gdn_prefill::chunked(t.q, t.k, t.v, t.g, t.beta, kScale, t.state, t.state, t.out, workspace.p,
+                                  ignis::gdn_prefill::workspace_bytes(kQkHeads, kValueHeads, 64) - 256, stream);
+    });
+    MOE_CUDA(cudaDeviceSynchronize());
+  }
 
   MOE_CUDA(cudaStreamDestroy(stream));
   if (g_failed != 0) {
