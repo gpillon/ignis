@@ -36,8 +36,10 @@ Flash-Next). The lines include:
 
 - the **weights** (the 27B's vision tower among them only under
   `--vision-residency device`);
-- **workspaces**: the prefill scratch, sized for `--model-prefill-chunk`; with
-  vision on, the image encoder's workspace shares it and the line is the larger
+- **workspaces**: the prefill scratch, sized for `--model-prefill-chunk` and
+  for the prefill routes the load runs (the dense prefill and an RTX 30 or RTX
+  40 card's gated delta net prefill hold less of it than the fused prefill and
+  the vendored kernels); with vision on, the image encoder's workspace shares it and the line is the larger
   of the two (under `--vision-residency host` the encoder's share includes the
   slots its weights are copied through,
   [Vision](../configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live));
@@ -50,7 +52,7 @@ Flash-Next). The lines include:
   for the linear-attention layers);
 - the **decode and drafter graphs**' staging buffers;
 - the **retained slots** that live on the device (none by default, two for
-  the 27B under `rtx-24gb`; the event's `retained_device_slots` counts them
+  the 27B under `rtx-24gb` with prompt reuse on; the event's `retained_device_slots` counts them
   and `retained_slots_bytes` is their line) and, under
   the compressed KV format, the residual window of every lane and slot;
 - the **media embedding** pool for images (0 under `--vision-residency host`,

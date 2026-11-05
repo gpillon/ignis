@@ -20,7 +20,7 @@ In a prototype on the RTX 5090 the dense route ran the body's prefill GEMMs abou
 - **P·V** on the u8×s8 MMA, with one Vᵀ scale and one fp32 fold per 128 keys, and O rescaled only when a row's running max grows past 2^8.
 - **The window.** In the prefill pass the residual window's keys are quantized the same way, instead of a bf16 pass with an f32 accumulator; decode keeps their BF16 rows.
 - **Speed and quality.** On the RTX 5090 this attention runs about 2x faster than the FP16 band at 8K and 64K. Together with the dense route, its KLD stays within 1.03x of the FP16 band's.
-- **The option values.** `8bit` is the canonical value of `--model-prefill-attention` on 8.x, and `fp8` its alias; both resolve to the new band there and keep today's FP8 band on Blackwell. `int8` names the band on every card, and on Blackwell it runs only when named.
+- **The option values.** `8bit` and `fp8` are two spellings of `--model-prefill-attention`'s 8-bit band: on Blackwell it is today's FP8 band, which reports as `fp8`; on 8.x it is the new band, which reports as `int8`. `int8` names the new band on every card, and on Blackwell it runs only when named.
 
 **The GDN prefill on 8.x** runs on our own kernels in those forms (#514).
 - A small prepare per 32-token chunk solves the chunk's triangular system on the CUDA cores in fp32. One recurrence keeps each head's state in registers and writes the output itself, so no chunk's state goes through memory.
@@ -28,9 +28,9 @@ In a prototype on the RTX 5090 the dense route ran the body's prefill GEMMs abou
 - It has no option: on 8.x it is the route. Blackwell keeps the vendored chunked kernels unless the RTX 5090 measures ours faster with its KLD holding. `IGNIS_GDN_PREFILL=ours|vendored` is the switch for that measurement, not a setting.
 
 **What stays.**
-- The fused route stays the route on sm_120. On 8.x it becomes an opt-in, `--model-prefill-linear fp16`.
-- A value the card or the build cannot run falls back when it comes from a default or a profile, and is refused, naming the option, when the operator names it (#456). The build's own answer, `prefill_route_built`, is one predicate per route, so a build that does not carry a route yet refuses it by name instead of running the other.
-- `--model-prefill-linear int8|fp16` (`model.prefill_linear`) chooses the route and `GET /v1/config` reports it, as it reports the band, with the card as its source when the card decided. Nothing changes by default until the routes are gated: `fp16`, the fused prefill, is the default on every card.
+- The fused route stays the route on sm_120. On 8.x it is one option away, `--model-prefill-linear fp16`, as the FP16 band is with `--model-prefill-attention fp16`.
+- Only a field left to its default takes the card's own route; a profile's value, `fp16` included, is kept where the card runs it. A value the card or the build cannot run falls back when it comes from a default or a profile, and is refused, naming the option, when the operator names it (#456). The build's own answer, `prefill_route_built`, is one predicate per route, so a build that does not carry a route yet refuses it by name instead of running the other.
+- `--model-prefill-linear int8|fp16` (`model.prefill_linear`) chooses the route and `GET /v1/config` reports it, as it reports the band, with the card as its source when the card decided. On 8.x the dense prefill, the integer band and the GDN prefill below are the default since #515, after the RTX 5090's KLD legs (#513, #514) passed; the sm_86 gate (#516) confirms them on the card before 0.10.0. Blackwell's defaults do not move.
 - One `86` cubin serves 8.6 and 8.9. A dedicated `89` path (spec C) hangs on `arch::GpuGeneration`.
 
 ## Considered options
@@ -42,6 +42,6 @@ In a prototype on the RTX 5090 the dense route ran the body's prefill GEMMs abou
 
 ## Consequences
 
-- **VRAM.** The dense buffer (89 MB on the 27B) is a line of the VRAM plan on 8.x. It costs a 16 GB card about ten thousand tokens of context.
+- **VRAM.** The dense buffer (89 MB on the 27B) is a line of the VRAM plan on 8.x. The prefill scratch is sized by the routes the load runs, so the dense prefill and our GDN prefill give some of it back. On the RTX 5090 at a 16 GB card's budget less 1 GiB the 8.x routes cost 6,656 tokens of KV pool, and the profile's context held.
 - **A different decode cost.** The chunk width changes how often the decode is paid. That is one reason for #489's wider chunk when no lane is decoding.
 - **A wider SASS check.** The release check's SASS rule covers the `86` cubin's new kernels.

@@ -574,6 +574,17 @@ impl StepLeaf for CudaLeaf {
             self.config.slot_count,
         )
         .map_err(|e| leaf_error("model load", e))?;
+        // The review of spec #503: the prefill routes this load runs, the
+        // gated delta net's among them, which no option names (the leaf decides
+        // it from the card, or the measurement switch IGNIS_GDN_PREFILL does).
+        // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80).
+        tracing::info!(
+            name: "ignis.runtime.prefill_routes",
+            prefill_linear = self.config.prefill_linear.as_str(),
+            prefill_attention = self.config.prefill_attention.as_str(),
+            gdn_prefill = model.gdn_prefill().as_str(),
+            "prefill routes"
+        );
         let cfg = ModelConfig::qwen38_27b();
         // The pool holds the pages the byte budget bought under this load's
         // format, shared across the slots; `max_context_tokens` is the

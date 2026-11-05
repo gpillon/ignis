@@ -235,6 +235,23 @@ fn the_release_check_looks_for_the_warning_only_a_build_without_cuda_carries() {
     }
 }
 
+/// #512 (the review of spec #503): the check reads a binary's 8.6 SASS with
+/// cuobjdump and refuses a build it cannot read, so the Containerfile's build
+/// stage makes sure the toolkit's cuobjdump is there, installing its package
+/// if the devel image lacks it, and points the check at it before the build
+/// that runs the check.
+#[test]
+fn the_container_build_stage_holds_the_cuobjdump_the_check_reads() {
+    let text = read(&repo().join("Containerfile"));
+    let stage = text.split(" AS build\n").nth(1).and_then(|rest| rest.split("\nFROM ").next()).expect("a build stage");
+    let cuobjdump = "/usr/local/cuda/bin/cuobjdump";
+    assert!(stage.contains(&format!("test -x {cuobjdump} || {{ apt-get update")), "{stage}");
+    assert!(stage.contains("\"cuda-cuobjdump-$(echo \"$CUDA_VERSION\""), "the toolkit's own package: {stage}");
+    let pointed = stage.find(&format!("ENV IGNIS_CUOBJDUMP={cuobjdump}\n")).expect("the check is pointed at it");
+    let checked = stage.find("bash mk/cuda-build-check.sh ").expect("the stage runs the check");
+    assert!(pointed < checked, "pointed at before the check runs");
+}
+
 /// Each host checks every binary it packages (#482): the three carry the
 /// kernel leaf's machine code (the server all of it, the bench and the
 /// inspector the device objects they link), and the server alone can carry

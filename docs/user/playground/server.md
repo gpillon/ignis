@@ -242,8 +242,8 @@ Each row is one field ([every field](../reference/configuration.md)): its
 name, the first sentence of its description (**More** for the rest), and
 where its value comes from: `From profile rtx5090`, `Set by
 IGNIS_MODEL_THINKING_BUDGET` (a flag or an environment variable), `Decided by
-the card, NVIDIA GeForce RTX 3090 (8.6)` (the prompt attention's FP16 band on
-a card below compute capability 12.0), `Shared`, or `Own value`. A **reload** mark says a change to it reloads the model. A
+the card, NVIDIA GeForce RTX 3090 (8.6)` (the prompt attention's integer band
+and the dense prefill on a card below compute capability 12.0), `Shared`, or `Own value`. A **reload** mark says a change to it reloads the model. A
 field set only at start (the bind address, the API key, the artifact) is shown
 read-only, `Set at start`.
 

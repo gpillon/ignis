@@ -253,7 +253,13 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
       // The pre-#507 body (test-only, kernel/src/layer_internal.h): the
       // vendored conv into one [conv_channels, T] plane, whose ranges are
       // strided sub-views, then a strided device-to-device copy per range.
-      ninfer::Tensor qkv_conv = model->scratch->alloc(ninfer::DType::BF16, {conv_channels, T, 1, 1});
+      // The plan reserves that plane no more (kernel/src/model.cu), so it
+      // borrows `fused`, which nothing writes before the MLP, on this stream
+      // after the copies have read the plane.
+      if (ffn < conv_channels) {
+        throw std::invalid_argument("the pre-#507 body's conv plane is wider than the MLP's buffer");
+      }
+      ninfer::Tensor qkv_conv(fused.data, ninfer::DType::BF16, {conv_channels, T, 1, 1});
       ninfer::ops::causal_conv1d_silu(qkv, conv_weight, conv_state, qkv_conv, stream);
       constexpr std::size_t kElemBytes = 2;  // BF16
       auto copy_channel_range = [&](std::int32_t offset, std::int32_t width,
@@ -305,10 +311,10 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     if (model->gdn_prefill_ours && T >= ignis::gdn_prefill::kMinTokens) {
       // GitHub #514: our full-rate kernels (kernel/src/gdn_prefill.h), the
       // load's route (on 8.x always; on Blackwell under IGNIS_GDN_PREFILL),
-      // the same contract: the slot in, the slot out. Its workspace fits
-      // inside the vendored capacity reserved above at every width from
-      // kMinTokens (kernel/tests/test_gdn_prefill.cu holds that), so this is
-      // still no allocation on the prefill path.
+      // the same contract: the slot in, the slot out. The load reserved its
+      // workspace at the chunk in place of the vendored op's
+      // (kernel/src/model.cu's gdn_layer_scratch_bytes), so this is still no
+      // allocation beyond the plan on the prefill path.
       const std::size_t ws_bytes = ignis::gdn_prefill::workspace_bytes(qk_heads, value_heads, T);
       const ninfer::DeviceSpan ws = model->scratch->alloc_bytes(ws_bytes);
       ignis::gdn_prefill::chunked(query.view({head_dim, qk_heads, T, 1}), key.view({head_dim, qk_heads, T, 1}),

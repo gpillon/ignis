@@ -207,6 +207,8 @@ pub(crate) mod ffi {
 
         pub fn ignis_model_stats(model: *const IgnisModel, out_stats: *mut IgnisModelStats) -> i32;
 
+        pub fn ignis_model_gdn_prefill(model: *const IgnisModel) -> u32;
+
         pub fn ignis_model_free(model: *mut IgnisModel);
 
         pub fn ignis_model_last_error() -> *const c_char;
@@ -227,6 +229,13 @@ impl Model {
         let rc = unsafe { ffi::ignis_model_stats(self.handle, &mut stats) };
         assert_eq!(rc, 0, "ignis_model_stats: null handle (unreachable — Model always holds one)");
         stats
+    }
+
+    /// The gated delta net prefill route this load runs (GitHub #514), as
+    /// the leaf decided it at load.
+    pub fn gdn_prefill(&self) -> crate::GdnPrefill {
+        let code = unsafe { ffi::ignis_model_gdn_prefill(self.handle) };
+        crate::GdnPrefill::from_abi(code).unwrap_or_else(|| panic!("ignis_model_gdn_prefill: unknown route {code}"))
     }
 
     /// The raw handle the step ABI (`crate::step`, GitHub #54) passes to

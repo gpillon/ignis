@@ -164,6 +164,32 @@ The GDN prefill's causal conv, writing the query, key and value planes split
   header lists the changes. The vendored op stays in the subtree as its oracle and for the
   decode, graph and verify forms (`kernel/vendor/VENDOR.md`).
 
+### `kernel/src/hq_prompt_common.cuh` (spec #503, GitHub #510)
+The helpers the prompt attention's two translation units share, moved from
+`kernel/src/hq_prompt_attention.cu` with the rest of its common code.
+- Upstream: `mkyt/qwen3-27b-5090`, commit `0594e77ca099f397ccefed0c68c981e32869989f`, MIT,
+  "Copyright (c) 2026 Masahiro Kiyota" (its licence is quoted under
+  `kernel/src/hq_prompt_attention.cu` above):
+  - `engine/src/attention.cu`: `vt_off`, and the `sw8` / `tc_swz` swizzles, which `row_swz`
+    restates for both row widths;
+  - `engine/src/mma.cuh`: `ldmatrix` (`ldsm_x4`).
+- Changed here: the two swizzles are one function, its row width a template argument. The rest
+  of the file is our own.
+- `kernel/src/hq_prompt_int8.cu`, the integer band, is our own and uses these three helpers; its
+  CTA is `fa_kernel`'s, the structure `hq_prompt_attention.cu` adapts from the same upstream.
+
+### `kernel/src/dense_prefill.cu` (spec #503, GitHub #509, #511)
+The dense prefill of the 27B's trellis body, our own but for the RMSnorm half of
+`dense_prefill_rmsnorm_a8_kernel`, the RMSnorm with its A8 fused.
+- Upstream: the reference, `gpillon/ninfer`, commit `a00648cb828457986cf5b4b4f712b4cbcd7af0d1`
+  (the commit `kernel/vendor/manifest.json` pins), Apache-2.0 (`kernel/vendor/LICENSE`):
+  - `src/ops/kernel/rmsnorm.cuh`: `rmsnorm_cta_bf16x2_kernel<Offset, 512, 8, true>`, the
+    wide-row form, restated operation for operation (the pairs per thread and their order, the
+    sum of squares, `rsqrtf` of the mean plus eps), so the normalized row is its bit for bit.
+- `block_reduce_sum` and the offset epilogue are the vendored header's, called and not copied.
+- Changed here: the row stays in shared memory for the A8 of each matrix that follows in the
+  same kernel, and goes to `h` only when asked. The file header lists it.
+
 ## Per-file provenance (pre-#42 adaptations, superseded by ADR 0010)
 
 ### `kernel/src/nvfp4_gemm_decode.cuh` (ticket 03)

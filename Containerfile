@@ -43,6 +43,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build pkg-config curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# cuobjdump reads the binaries' 8.6 SASS for the full-rate check after the
+# build (#512). The devel image's toolkit is expected to carry it; where it
+# does not, this installs the toolkit's own package (the image's CUDA_VERSION,
+# from its NVIDIA apt source), and the check is pointed at it either way.
+RUN test -x /usr/local/cuda/bin/cuobjdump || { apt-get update \
+        && apt-get install -y --no-install-recommends \
+            "cuda-cuobjdump-$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr . -)" \
+        && rm -rf /var/lib/apt/lists/*; } \
+    && test -x /usr/local/cuda/bin/cuobjdump
+ENV IGNIS_CUOBJDUMP=/usr/local/cuda/bin/cuobjdump
+
 ARG RUST_VERSION=1.98.0
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal \
@@ -87,7 +98,7 @@ ARG CUDA_REQUIRED_ARCHITECTURES=
 # the binary itself and refuses one that would fall back to the CPU mock, or
 # that carries no machine code for an entry of IGNIS_CUDA_ARCHITECTURES or of
 # CUDA_REQUIRED_ARCHITECTURES (#482), or whose 8.6 code breaks the full-rate rule
-# of mk/full-rate-kernels.txt (cuobjdump comes with this devel image, #512), on
+# of mk/full-rate-kernels.txt (with the cuobjdump above, #512), on
 # each of the three binaries the image
 # and the tarball ship.
 RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \

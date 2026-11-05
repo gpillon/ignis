@@ -1084,6 +1084,7 @@ add_test(NAME ignis_kernel_image_transformer_test COMMAND ignis_kernel_image_tra
 # (kernel/src/trellis_body.h, leaf-internal): the q_proj's per-head [q | gate] split, query_gate,
 # the head and the two epilogues. GPU: the op's workspace query needs a prepared device (ADR 0006).
 add_executable(ignis_kernel_model_load_trellis_test test_model_load_trellis.cpp)
+target_include_directories(ignis_kernel_model_load_trellis_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_model_load_trellis_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_model_load_trellis_test COMMAND ignis_kernel_model_load_trellis_test)
 add_executable(ignis_kernel_trellis_body_test test_trellis_body.cu)

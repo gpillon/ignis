@@ -541,6 +541,22 @@ std::size_t i32_bytes(int64_t elements) {
   return round_up_arena_align(static_cast<std::size_t>(elements) * 4);
 }
 
+// Which of the load's prefill routes an arena's layers run (the review of spec
+// #503): the prefill chunk's arena runs every one the load chose, a decode
+// round's none -- its calls are a round's columns at most, which take the fused
+// op's decode route, and its GDN layers the vendored conv and recurrence forms.
+struct LayerRoutes {
+  // GitHub #507: the GDN prefill's conv writes q, k and v split, so the layer
+  // allocates no [conv_channels, T] plane.
+  bool split_conv = false;
+  // GitHub #509: the dense prefill, which takes a call wider than
+  // IGNIS_TRELLIS_DECODE_MAX_TOKENS and writes the query and the gate split.
+  bool dense = false;
+  // GitHub #514: the GDN prefill on our kernels (`gdn_prefill_route`), from
+  // ignis::gdn_prefill::kMinTokens tokens, with their own workspace.
+  bool gdn_ours = false;
+};
+
 // One GQA layer's peak scratch at `T` tokens per row and `batch` rows
 // (kernel/src/gqa_layer.cu's `run_gqa_layer` at batch 1, its
 // `run_gqa_layer_graph` at T=1 and a decode round's width): every plain
@@ -560,10 +576,13 @@ std::size_t i32_bytes(int64_t elements) {
 // GitHub #339: on the trellis body (`trellis`) the projections take no
 // vendored workspace -- the trellis op's is its own plan line -- and the
 // query projection lands in a `[2 q_width, columns]` buffer before its heads'
-// halves move into `query` and `gate` (kernel/src/trellis_body.h).
+// halves move into `query` and `gate` (kernel/src/trellis_body.h). Under the
+// dense prefill (`routes.dense`, GitHub #509) only a call the fused op takes
+// does, IGNIS_TRELLIS_DECODE_MAX_TOKENS columns at most.
 std::size_t gqa_layer_scratch_bytes(const ignis_topology &topology, const GqaLayerWeights &w,
                                      std::int32_t T, uint32_t max_context_tokens,
-                                     ninfer::DType cache_dtype, std::int32_t batch, bool trellis) {
+                                     ninfer::DType cache_dtype, std::int32_t batch, bool trellis,
+                                     LayerRoutes routes) {
   const auto hidden = static_cast<std::int32_t>(topology.hidden);
   const auto q_width = static_cast<std::int32_t>(topology.num_q_heads * topology.head_dim);
   const auto kv_width = static_cast<std::int32_t>(topology.num_kv_heads * topology.head_dim);
@@ -589,7 +608,9 @@ std::size_t gqa_layer_scratch_bytes(const ignis_topology &topology, const GqaLay
   bytes += round_up_arena_align(ignis_gqa_attention_capacity_bytes(
       cache_dtype, envelope, /*batch_size=*/batch, /*min_width=*/1, /*max_width=*/T));
   if (trellis) {
-    return bytes + bf16_bytes(2 * static_cast<int64_t>(q_width) * columns);  // interleaved q | gate
+    const std::int64_t fused_columns =
+        routes.dense ? std::min<std::int64_t>(columns, IGNIS_TRELLIS_DECODE_MAX_TOKENS) : columns;
+    return bytes + bf16_bytes(2 * static_cast<int64_t>(q_width) * fused_columns);  // interleaved q | gate
   }
   bytes += round_up_arena_align(ninfer::ops::attn_input_proj_workspace_capacity_bytes(
       w.query_key_gate_value.qtype, w.query_key_gate_value.n, w.query_key_gate_value.k,
@@ -616,8 +637,12 @@ std::size_t gqa_layer_scratch_bytes(const ignis_topology &topology, const GqaLay
 // one either way. GitHub #339: on the trellis body (`trellis`) the
 // projections take no vendored workspace, and the activations are the same
 // buffers -- the two input projections write `qkv` and `zbuf` themselves.
+// The prefill's `routes` (the review of spec #503): its conv writes q, k and v
+// split, so there is no `qkv_conv` plane (GitHub #507), and on our GDN
+// prefill a call of ignis::gdn_prefill::kMinTokens or more takes our
+// recurrence's workspace, a narrower one the vendored op's (GitHub #514).
 std::size_t gdn_layer_scratch_bytes(const ignis_topology &topology, const GdnLayerWeights &w,
-                                     std::int32_t T, std::int32_t batch, bool trellis) {
+                                     std::int32_t T, std::int32_t batch, bool trellis, LayerRoutes routes) {
   const auto hidden = static_cast<std::int32_t>(topology.hidden);
   const auto ffn = static_cast<std::int32_t>(topology.ffn_intermediate);
   const auto state_rows = static_cast<std::int32_t>(topology.gdn_state_rows);
@@ -633,7 +658,9 @@ std::size_t gdn_layer_scratch_bytes(const ignis_topology &topology, const GdnLay
   std::size_t bytes = 0;
   bytes += bf16_bytes(static_cast<int64_t>(hidden) * columns);        // h
   bytes += bf16_bytes(static_cast<int64_t>(conv_channels) * columns); // qkv
-  bytes += bf16_bytes(static_cast<int64_t>(conv_channels) * columns); // qkv_conv
+  if (!routes.split_conv) {
+    bytes += bf16_bytes(static_cast<int64_t>(conv_channels) * columns); // qkv_conv
+  }
   bytes += bf16_bytes(static_cast<int64_t>(qk_width) * columns);      // query
   bytes += bf16_bytes(static_cast<int64_t>(qk_width) * columns);      // key
   bytes += bf16_bytes(static_cast<int64_t>(value_width) * columns);   // value
@@ -658,8 +685,16 @@ std::size_t gdn_layer_scratch_bytes(const ignis_topology &topology, const GdnLay
   // every width the answer it gives the round's own.
   bytes += round_up_arena_align(
       ninfer::ops::gdn_gating_proj_workspace_capacity_bytes(value_heads, hidden, 1, columns));
-  bytes += round_up_arena_align(ninfer::ops::gated_delta_net_workspace_capacity_bytes(
-      qk_heads, value_heads, /*normalize_qk=*/true, 1, columns));
+  if (routes.gdn_ours && columns >= ignis::gdn_prefill::kMinTokens) {
+    // Ours grows with the call's tokens, so the chunk's bounds every call it
+    // takes; below kMinTokens the vendored op runs, at most that wide.
+    bytes += std::max(round_up_arena_align(ignis::gdn_prefill::workspace_bytes(qk_heads, value_heads, columns)),
+                      round_up_arena_align(ninfer::ops::gated_delta_net_workspace_capacity_bytes(
+                          qk_heads, value_heads, /*normalize_qk=*/true, 1, ignis::gdn_prefill::kMinTokens - 1)));
+  } else {
+    bytes += round_up_arena_align(ninfer::ops::gated_delta_net_workspace_capacity_bytes(
+        qk_heads, value_heads, /*normalize_qk=*/true, 1, columns));
+  }
   if (trellis) {
     return bytes;
   }
@@ -709,17 +744,18 @@ std::size_t program_outer_scratch_bytes(const ignis_topology &topology, std::int
 // The program scratch arena's total reservation: the outer scope's own
 // allocations plus the widest single decoder layer's peak (layers run
 // sequentially, one nested scope at a time, so only one layer's scratch is
-// ever live alongside the outer scope's).
+// ever live alongside the outer scope's). `routes`: the prefill routes the
+// arena's layers run, none for a decode round's.
 std::size_t compute_program_scratch_bytes(const ignis_model &model, const ignis_topology &topology,
                                           std::int32_t chunk, uint32_t max_context_tokens,
                                           ninfer::DType cache_dtype, std::int32_t batch,
-                                          bool head_every_column = false) {
+                                          bool head_every_column, LayerRoutes routes) {
   std::size_t layer_peak = 0;
   for (const auto &layer : model.layers) {
     const std::size_t layer_bytes = layer.kind == IGNIS_LAYER_GQA
         ? gqa_layer_scratch_bytes(topology, layer.gqa, chunk, max_context_tokens, cache_dtype, batch,
-                                  model.is_trellis_body)
-        : gdn_layer_scratch_bytes(topology, layer.gdn, chunk, batch, model.is_trellis_body);
+                                  model.is_trellis_body, routes)
+        : gdn_layer_scratch_bytes(topology, layer.gdn, chunk, batch, model.is_trellis_body, routes);
     layer_peak = std::max(layer_peak, layer_bytes);
   }
   return program_outer_scratch_bytes(topology, chunk, batch, head_every_column) + layer_peak;
@@ -1749,10 +1785,15 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
   sizes.lanes = lanes;
 
   // P2-01 (GitHub #83): the scratch, sized for a `prefill_chunk_tokens`-wide
-  // chunk (see compute_program_scratch_bytes above).
+  // chunk (see compute_program_scratch_bytes above), for the routes the
+  // load's prefill runs (the review of spec #503).
+  LayerRoutes prefill_routes;
+  prefill_routes.split_conv = true;
+  prefill_routes.dense = options.prefill_linear == IGNIS_PREFILL_LINEAR_DENSE;
+  prefill_routes.gdn_ours = options.gdn_prefill_ours;
   sizes.prefill_scratch = compute_program_scratch_bytes(
       model, topology, static_cast<std::int32_t>(prefill_chunk_tokens), max_context_tokens,
-      options.cache_dtype, /*batch=*/1);
+      options.cache_dtype, /*batch=*/1, /*head_every_column=*/false, prefill_routes);
   if (options.speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
     sizes.prefill_scratch +=
         dflash2_prefill_scratch_bytes(topology, static_cast<std::int32_t>(prefill_chunk_tokens));
@@ -1822,7 +1863,7 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
   const auto round_columns = static_cast<std::int32_t>(windowed ? options.draft_tokens + 1 : 1);
   sizes.decode_graph_scratch = compute_program_scratch_bytes(
       model, topology, /*chunk=*/round_columns, max_context_tokens, options.cache_dtype,
-      /*batch=*/static_cast<std::int32_t>(lanes), /*head_every_column=*/windowed);
+      /*batch=*/static_cast<std::int32_t>(lanes), /*head_every_column=*/windowed, LayerRoutes{});
 
   if (windowed) {
     sizes.verify_round =
@@ -2334,6 +2375,13 @@ extern "C" int32_t ignis_model_stats(const struct ignis_model *model,
   out_stats->vision_reserved_bytes = model->vision_reserved_bytes();
   out_stats->reserved = model->flash_next ? ignis::flash_next::reserved(*model) : reserved_of(*model);
   return 0;
+}
+
+extern "C" uint32_t ignis_model_gdn_prefill(const struct ignis_model *model) {
+  if (model == nullptr || model->flash_next) {
+    return IGNIS_GDN_PREFILL_VENDORED;
+  }
+  return model->gdn_prefill_ours ? IGNIS_GDN_PREFILL_OURS : IGNIS_GDN_PREFILL_VENDORED;
 }
 
 extern "C" void ignis_model_free(struct ignis_model *model) {

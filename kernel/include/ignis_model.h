@@ -266,13 +266,26 @@ enum ignis_prefill_attention {
  * fused op's decode route either way (GitHub #509). */
 enum ignis_prefill_linear {
   /* The fused prefill: the trellis decoded inside the GEMM's inner loop, the
-   * multiply in f16. Today's route. */
+   * multiply in f16. A zeroed option's route; the server sends it on an RTX
+   * 50 or RTX PRO card unless the dense prefill is named, and on an 8.x card
+   * only when it is named (`--model-prefill-linear fp16`, GitHub #515). */
   IGNIS_PREFILL_LINEAR_FUSED = 0,
   /* The dense prefill (GitHub #509): each matrix decoded once per chunk into
    * INT8, the activations quantized to INT8 per token, our own s8 GEMM
    * (ignis_dense_prefill.h), with the dense copy's buffer the plan line
    * `trellis_dense_bytes`. The trellis body's alone. */
   IGNIS_PREFILL_LINEAR_DENSE = 1,
+};
+
+/* GitHub #514: the 27B's gated delta net prefill route, which no load option
+ * names: decided once per load from the card's generation, unless the
+ * measurement switch IGNIS_GDN_PREFILL (`ours` or `vendored`) does
+ * (kernel/src/gdn_prefill.h). `ignis_model_gdn_prefill` reports it. */
+enum ignis_gdn_prefill {
+  /* The vendored chunked kernels: what an RTX 50 or RTX PRO card runs. */
+  IGNIS_GDN_PREFILL_VENDORED = 0,
+  /* ignis's own kernels in full-rate forms: what an 8.x card runs. */
+  IGNIS_GDN_PREFILL_OURS = 1,
 };
 
 /* GitHub #414 (ADR 0075): where a vision load keeps the 27B's vision tower
@@ -582,6 +595,12 @@ int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, uint64_t coun
 /* Statistics of a loaded model. Returns 0 on success, -1 on a null
  * argument. */
 int32_t ignis_model_stats(const struct ignis_model *model, struct ignis_model_stats *out_stats);
+
+/* The gated delta net prefill route a loaded 27B runs (enum
+ * ignis_gdn_prefill; the review of spec #503): what the load decided, which
+ * also sized its scratch. IGNIS_GDN_PREFILL_VENDORED for NULL and for
+ * Flash-Next, whose GDN layers are its own. */
+uint32_t ignis_model_gdn_prefill(const struct ignis_model *model);
 
 /* Release a model handle. NULL is a no-op. */
 void ignis_model_free(struct ignis_model *model);

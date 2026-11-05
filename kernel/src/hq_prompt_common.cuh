@@ -5,6 +5,17 @@
 // existing kernels' sm_120a code moves with whatever else a translation unit instantiates, and
 // those kernels stay as they were. In an anonymous namespace, as they were, so each unit's kernels
 // keep their names; include it from those two files only.
+//
+// Three of the helpers are ADAPTED (ADR 0051 tier 2), parts of the upstream the former's header
+// and kernel/NOTICE name, moved here with it:
+//
+// Upstream: mkyt/qwen3-27b-5090, commit 0594e77ca099f397ccefed0c68c981e32869989f, MIT
+// ("Copyright (c) 2026 Masahiro Kiyota"):
+//   engine/src/attention.cu  vt_off (a staged V^T tile's 16-byte segments) and the sw8 / tc_swz
+//                            swizzles that row_swz restates for both row widths;
+//   engine/src/mma.cuh       ldmatrix, ldsm_x4 here.
+// Changed here: upstream's two swizzles are one function, row_swz, the row width (FP8 or BF16
+// rows) its template argument. Everything else in this file is our own.
 #pragma once
 
 #include "ignis_hq_prompt_attention.h"

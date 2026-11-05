@@ -49,7 +49,9 @@ build is given (#482). It also reads the 8.6 code of the kernels the RTX 30 and
 RTX 40 prefill added and refuses one that uses a tensor-core form those cards run
 at half rate (HMMA with an f32 accumulator, BF16, TF32, FP8), naming the kernel
 and the opcode (`mk/full-rate-kernels.txt`, #512); `cuobjdump`, which comes with
-nvcc, must be on the build host.
+nvcc, must be on the build host. The Containerfile's build stage installs the
+CUDA toolkit's `cuobjdump` package if its devel image lacks it, and points the
+check at it (`IGNIS_CUOBJDUMP`).
 
 ## The sm_86 gate
 
@@ -83,15 +85,14 @@ builds it from the BF16 checkpoint on the RTX 5090
 it to the card. `tools/kld-gate/score_top64.py` scores a dump against it. The
 limits are derived from the RTX 5090 on the same route: the same dump there,
 under the same three variables, with the same windows, chunk and reference
-set, scored by the same command. Its figures are TODO(#515 coordinator: the
-5090's top-64 KLD on this route) for the top-64 KLD and TODO(#515 coordinator:
-the 5090's top-1 on this route) for top-1, and the limits, read on the `all`
+set, scored by the same command. Its figures are 0.03887 for the top-64 KLD
+and 93.35% for top-1 (the base 16 GB entry), and the limits, read on the `all`
 row of the scorer's table, follow from them:
 
 | | limit |
 |---|---|
-| `KLD top64`, all windows | at most 1.05 times the 5090's |
-| `top-1` | at least 0.5 points under the 5090's |
+| `KLD top64`, all windows | at most 0.04081, 1.05 times the 5090's |
+| `top-1` | at least 92.85%, 0.5 points under the 5090's |
 
 ```sh
 # On the sm_86 card, from the release's checkout, the set ref27b-top64/ beside it
@@ -100,7 +101,8 @@ row of the scorer's table, follow from them:
 # CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu.
 export IGNIS_CUDA_ARCHITECTURES='86;120a'
 ignis-server model download qwen3.8-27b-16g      # into ./models
-IGNIS_MODEL_PREFILL_LINEAR=int8 IGNIS_MODEL_PREFILL_ATTENTION=int8 IGNIS_GDN_PREFILL=ours \n    cargo run --release -p ignis-core --features cuda --example span_logits -- \
+IGNIS_MODEL_PREFILL_LINEAR=int8 IGNIS_MODEL_PREFILL_ATTENTION=int8 IGNIS_GDN_PREFILL=ours \
+    cargo run --release -p ignis-core --features cuda --example span_logits -- \
     models/qwen3_8_27b_trellis_sc30-v2.ninfer hq-e8-2b ref27b-top64/windows.json dump-sm86 1024
 python3 tools/kld-gate/score_top64.py ref27b-top64 dump-sm86 --json gate-sm86.json
 ```

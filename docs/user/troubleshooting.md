@@ -56,11 +56,18 @@ integer band (INT8 scores, `--model-prefill-attention int8`, also what a named
 `--model-prefill-attention fp16` and `--model-prefill-linear fp16` name the
 FP16 band and the fused prefill instead. The gated delta net prefill there
 runs ignis's own kernels, with no option. An RTX 50 or RTX PRO card keeps the
-FP8 band and the fused prefill unless `int8` is named. On any card the load
-refuses the dense prefill on the NVFP4 artifact, whose body
-has no trellis matrices to decode ("prefill_linear 1 (the dense prefill) runs
-the trellis body's matrices, and this artifact's body is NVFP4"): name `fp16`,
-or load the trellis artifact.
+FP8 band and the fused prefill unless `int8` is named.
+
+### `` `--model-prefill-linear int8` names the dense prefill, which decodes the trellis body's matrices, and this artifact's body is NVFP4 ``
+
+The dense prefill was named for the 27B's NVFP4 artifact, whose body has no
+trellis matrices to decode. Only an RTX 50 or RTX PRO card gets this far (an
+RTX 30 or RTX 40 card refuses the NVFP4 artifact first), and only for a named
+`int8`: unset, that card runs the fused prefill. The message names the option
+as it was given, `IGNIS_MODEL_PREFILL_LINEAR` or a config file's key included,
+and the load is refused before it starts, under the event
+`ignis.model.route_unsupported`. Name `fp16` or unset the option, or load the
+trellis artifact (`--model-id qwen3.8-27b-16g`).
 
 ### A start under `--profile auto` is refused, naming `--profile`
 
