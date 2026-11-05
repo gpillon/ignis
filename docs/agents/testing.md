@@ -494,10 +494,39 @@ done
 The release binary is also checked to carry code for 8.6 and 12.0, whatever
 list the build was given (`mk/cuda-build-check.sh --require`, in CI, #482).
 
+The same check holds the `86` cubin to the full-rate rule (spec #503, #512): an
+RTX 30 or RTX 40 card runs some tensor-core forms at half the rate of others, and
+a kernel the sm_8x prefill work added uses only the full-rate ones, INT8 and HMMA
+with an f16 accumulator. `mk/full-rate-kernels.txt` is the one place that lists
+the covered kernels and #488's exceptions. The check dumps the `sm_86` SASS with
+`cuobjdump` (the CUDA toolkit's, wherever nvcc is) and refuses a covered kernel
+that holds HMMA with an f32 accumulator, any BF16, TF32 or FP8/FP6/FP4 form, a
+warpgroup or tensor-memory MMA or a form it does not know, or that holds no
+integer MMA where the list asks for it; the refusal names the kernel and the
+opcode. It also refuses a listed kernel that no binary carries (a rename must
+not skip the rule) and a dump in which the negative control, the existing window
+kernel's f32-accumulate form, passes: a check that cannot fail is not a pass.
+
 The gate records correctness only: KLD, top-1, pass or fail per part, and the
 small image's patch count. Never a speed, never a detail of the machine. The
 same procedure, for contributors, is in
 `docs/user/contributing/releases.md`.
+
+### A new kernel and the full-rate rule
+
+A kernel added to the sm_8x path joins the list in the same commit, with one line
+in `mk/full-rate-kernels.txt`: its role (`mma` for a GEMM or band kernel, which
+must hold integer MMA, or `cuda` for a kernel that runs on the CUDA cores), its
+name without template arguments (every instantiation is held to the rule) and its
+source file. A test in `crates/server/tests/cuda_build_recipes.rs` fails when a
+file the list names declares a kernel it does not list, and when a listed kernel
+is not in its file. A kernel that predates the rule and stays as it is takes an
+`exempt` line whose comment names the issue that decided it, never a reason of
+its own; #488's kernels are the only ones. A form the rule refuses is fixed in the
+kernel, not excused in the list. The selftest (`make cuda-build-check-selftest`)
+runs the whole rule on SASS text and needs no GPU or CUDA toolkit; to run the
+check by hand on a build, `IGNIS_CUDA_ARCHITECTURES='86;120a' bash
+mk/cuda-build-check.sh --require '86;120a' <binary>...`.
 
 ## Done means
 

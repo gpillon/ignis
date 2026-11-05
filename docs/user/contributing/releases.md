@@ -45,7 +45,11 @@ packages a server that is not a CUDA build: `mk/cuda-build-check.sh` reads the
 binaries and refuses a server that would fall back to the CPU mock, which
 v0.9.0 and v0.9.1 shipped (#408), or any binary that carries no machine code
 for 8.6, or none for 12.0, which the workflow requires apart from the list the
-build is given (#482).
+build is given (#482). It also reads the 8.6 code of the kernels the RTX 30 and
+RTX 40 prefill added and refuses one that uses a tensor-core form those cards run
+at half rate (HMMA with an f32 accumulator, BF16, TF32, FP8), naming the kernel
+and the opcode (`mk/full-rate-kernels.txt`, #512); `cuobjdump`, which comes with
+nvcc, must be on the build host.
 
 ## The sm_86 gate
 

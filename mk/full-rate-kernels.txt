@@ -1,0 +1,61 @@
+# The kernels the release's CUDA build check holds to the full-rate rule on the
+# `86` cubin (GitHub #503, #512): mk/cuda-build-check.sh reads this file, and
+# nothing else says which kernels the rule covers. One kernel, one line:
+#
+#   <role>  <kernel name>  [<source file>]   # why
+#
+# The name is the function's own name, without its template arguments, so every
+# instantiation is held to the rule. The roles:
+#
+#   mma      a GEMM or band kernel. Refused: HMMA with an f32 accumulator, any
+#            BF16, TF32 or FP8/FP6/FP4 form, any warpgroup or tensor-memory MMA,
+#            any MMA form not named below. Allowed: IMMA, and HMMA with an f16
+#            accumulator (reported). Required: IMMA in each instantiation.
+#   cuda     a kernel that runs on the CUDA cores: the same refusals, and no
+#            MMA required.
+#   exempt   a kernel that predates the rule and is left as it is. Never
+#            refused, its MMA forms are reported. Each one names the issue that
+#            decided it; a kernel leaves the list when that issue converts it.
+#   control  the check's negative control: a kernel that does carry a forbidden
+#            form. The check refuses a build in which it does not find one, so
+#            a dump the check can no longer read is not a pass.
+#
+# A kernel in a covered role must be in the cubin of one of the binaries the
+# check is given (a renamed or dropped kernel is refused, not skipped), and the
+# tests hold every `__global__` function of each source file named here to a
+# line of this file. A new kernel of the sm_8x prefill work joins with one line
+# (docs/agents/testing.md, "A new kernel and the full-rate rule").
+
+# The dense prefill (#509): the trellis decode and the A8 quantisation run on
+# the CUDA cores, the GEMM is integer MMA.
+cuda     dense_prefill_decode_kernel      kernel/src/dense_prefill.cu
+cuda     dense_prefill_a8_kernel          kernel/src/dense_prefill.cu
+cuda     dense_prefill_a8_wide_kernel     kernel/src/dense_prefill.cu
+cuda     dense_prefill_rmsnorm_a8_kernel  kernel/src/dense_prefill.cu   # #511: the A8 quantisation fused into its producer (RMSNorm), CUDA cores
+cuda     dense_prefill_a8_blocks_kernel   kernel/src/dense_prefill.cu   # #511: the A8 quantisation fused into the block producer, CUDA cores
+mma      dense_prefill_gemm_kernel        kernel/src/dense_prefill.cu
+
+# The integer band (#510): the attention kernel is integer MMA, the V
+# transpose runs on the CUDA cores.
+mma      fa_int8_kernel                   kernel/src/hq_prompt_int8.cu
+cuda     tile_vt_group_kernel             kernel/src/hq_prompt_int8.cu
+
+# The split conv of the GDN prefill (#507): CUDA cores.
+cuda     gdn_split_conv_kernel            kernel/src/gdn_conv_split.cu
+cuda     gdn_split_conv_state_kernel      kernel/src/gdn_conv_split.cu
+
+# The 27B's own GDN prefill on 8.x (#514).
+cuda     gdn_prefill_prepare_kernel       kernel/src/gdn_prefill.cu     # #514: the chunk preparation, CUDA cores
+cuda     gdn_prefill_recurrence_kernel    kernel/src/gdn_prefill.cu     # #514: HMMA with an f16 accumulator only (reported); no integer MMA required, it is neither a GEMM nor a band kernel
+
+# The kernels of the prompt prefill that predate the rule and stay as they are
+# (#488, parked): each leaves the list when #488 converts it.
+exempt   nvfp4_a16_mma_kernel                       # #488: the DFlash2 drafter's prompt prefill, BF16 MMA
+exempt   bf16_gdn_gating_proj_gemm_mma_kernel       # #488: the GDN gating projection, BF16 MMA
+exempt   output_kernel                              # #488: the GDN chunked delta rule, output
+exempt   prepare_wy_wu_kernel                       # #488: the GDN chunked delta rule, WY/WU preparation
+exempt   state_passing_kernel                       # #488: the GDN chunked delta rule, state passing
+
+# The negative control: the prompt attention's existing window kernel, whose
+# BF16 form accumulates in f32 (#488 leaves it as it is).
+control  fa_kernel

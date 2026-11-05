@@ -79,6 +79,9 @@ which the workflow requires apart from the list (`--require`): a release
 without code for 8.6, or without code for 12.0, is not published, whatever
 the list says. The sm_120a code in such a build is the same, byte for byte, as
 a `120a`-only build's.
+The same check refuses a build whose 8.6 code holds, in a kernel of the RTX 30 and
+RTX 40 prefill, a tensor-core form those cards run at half rate
+(`mk/full-rate-kernels.txt`).
 
 Which cards are supported is in [What it runs on](../start/index.md#what-it-runs-on).
 A card none of the listed architectures runs on is refused at start
