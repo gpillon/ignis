@@ -202,6 +202,7 @@ resolves the default id `qwen3.8-27b` to that entry
 | Decode lanes | 8 (the default) |
 | Prefill chunk | 2,048 |
 | VRAM headroom | 1,200 MiB |
+| Retained slots | 2 on the device, beside the 16 in host RAM |
 
 Why each:
 
@@ -215,9 +216,17 @@ Why each:
   cap is the 27B's compressed-KV attention envelope, as on `rtxpro6000`, not
   the memory; `auto` rope scaling makes the 27B YaRN at 4. No request that
   long was run.
-- **The pool past the context**, about 1.4 GB, is room for what a real card's
-  desktop holds; past that the load adapts
-  ([when a profile does not fit](#when-a-profile-does-not-fit)).
+- **Two retained slots on the device.** The 27B's prompt checkpoints and
+  shared prefixes go to them first, and a capture or a claim is then a copy
+  on the card instead of one over PCIe
+  ([retained slots](kv-cache-and-prompt-reuse.md#what-is-kept)). Each is about
+  232 MB, a lane's state, and comes out of the KV pool, not the context: the
+  context is capped by the attention envelope, and the pool had about 1.4 GB
+  past it. The 16 GB profiles keep none, since their context is set by
+  memory.
+- **The pool past the context**, about 1.4 GB less what the device slots
+  take, is room for what a real card's desktop holds; past that the load
+  adapts ([when a profile does not fit](#when-a-profile-does-not-fit)).
 
 ## When a profile does not fit
 

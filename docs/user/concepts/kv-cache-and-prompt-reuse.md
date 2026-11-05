@@ -78,7 +78,8 @@ all hit.
 
 Each image of mutable state occupies a **retained slot**, reserved at load. By
 default there are none on the device and two per decode lane in one pinned host
-block. A host slot costs a PCIe copy where a device slot costs a device copy
+block; the `rtx-24gb` profile also keeps two on the device for the 27B
+([Profiles and defaults](profiles.md#rtx-24gb)). A host slot costs a PCIe copy where a device slot costs a device copy
 (a claim of 182 MiB measured 15.6 ms from the host against 0.29 ms on the
 device) but no VRAM, so the KV pool gets that room: at the default load it raised
 the pool from about 475K to about 680K tokens at level throughput, and in an
