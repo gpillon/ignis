@@ -102,7 +102,7 @@ On a card below compute capability 12.0 the server picks what the card runs:
   BF16, since in FP8 they prefill on the block-scaled FP8 tensor cores;
 - the 27B's 48 linear-attention (GDN) layers prefill on ignis's own kernels,
   in the tensor-core forms a GeForce card runs at full rate, where a Blackwell
-  card keeps the vendored ones. That route has no option; the load logs which
+  card keeps the vendored ones (ours measured 3-4% faster on the RTX 5090 with its KLD intact, but two entailment gate cases and the vision verify probe moved). That route has no option; the load logs which
   one runs (`ignis.runtime.prefill_routes`), and the measurement switch that
   compares the two is a contributor's ([Testing](testing.md#measurement-switches));
 - the 27B NVFP4 artifact, the image model and Flash-Next's staged decode
