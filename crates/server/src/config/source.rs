@@ -420,21 +420,38 @@ pub fn resolve_settings(sources: &Sources, family: Option<ModelFamily>, fit: Fit
     Ok(Resolution { settings, origins, dropped: resolver.dropped.into_inner() })
 }
 
-/// The values the card decides (GitHub #477): the report says what the load
-/// runs. The 27B's prompt attention left to its default or a profile is the
-/// FP16 band on a card without the block-scaled FP8 tensor cores
-/// ([`super::arch::prefill_attention`]); its origin is the card. A named
-/// value is left as it is: a named `fp8` is refused where the config is built.
+/// The values the card and the build decide (GitHub #477, #505): the report
+/// says what the load runs. The 27B's prompt attention left to its default or
+/// a profile is the FP16 band on a card without the block-scaled FP8 tensor
+/// cores, until the build carries the integer band
+/// ([`super::arch::prefill_attention`]); its trellis prefill route is the
+/// fused prefill where a profile's `int8` cannot run
+/// ([`super::arch::prefill_linear`]). The origin of a value so decided is the
+/// card. A named value is left as it is: one the load cannot run is refused
+/// where the config is built.
 fn decide_by_card(sources: &Sources, settings: &mut Settings, origins: &mut BTreeMap<(&'static str, &'static str), Origin>) {
-    use ignis_core::PrefillAttention;
+    let card = sources.card.as_ref();
+    let spelling = card.map_or_else(|| "this build".to_owned(), |card| format!("{} ({})", card.name, card.capability));
+    let decided_by_card = |origins: &mut BTreeMap<(&'static str, &'static str), Origin>, key| {
+        origins.insert(key, Origin { source: Source::Card, spelling: spelling.clone(), at_default: false, scoped: false });
+    };
     let key = ("model", "prefill_attention");
     let named = origins.get(&key).is_some_and(|origin| origin.source.explicit());
-    let card = sources.card.as_ref();
-    let decided = super::arch::prefill_attention(settings.model.prefill_attention, named, card, "");
-    if let (Ok(PrefillAttention::Fp16), PrefillAttention::Fp8, Some(card)) = (decided, settings.model.prefill_attention, card) {
-        settings.model.prefill_attention = PrefillAttention::Fp16;
-        let spelling = format!("{} ({})", card.name, card.capability);
-        origins.insert(key, Origin { source: Source::Card, spelling, at_default: false, scoped: false });
+    let resolved = settings.model.prefill_attention;
+    if let Ok(decided) = super::arch::prefill_attention(resolved, named, card, "") {
+        if decided != resolved && !named {
+            settings.model.prefill_attention = decided;
+            decided_by_card(origins, key);
+        }
+    }
+    let key = ("model", "prefill_linear");
+    let named = origins.get(&key).is_some_and(|origin| origin.source.explicit());
+    let resolved = settings.model.prefill_linear;
+    if let Ok(decided) = super::arch::prefill_linear(resolved, named, card, "") {
+        if decided != resolved && !named {
+            settings.model.prefill_linear = decided;
+            decided_by_card(origins, key);
+        }
     }
 }
 

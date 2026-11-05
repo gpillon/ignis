@@ -26,7 +26,7 @@ use ignis_core::step::{
     capture_decode_graphs, decode_program_batch_sampled, decode_program_verify_runs, prefill_program_sampled,
     program_stats, SamplingParams, VerifyLane,
 };
-use ignis_core::{KvFormat, PrefillAttention, RopeScaling, Speculation, SpeculativeBackend};
+use ignis_core::{KvFormat, PrefillAttention, PrefillLinear, RopeScaling, Speculation, SpeculativeBackend};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 128;
@@ -95,6 +95,7 @@ fn a_two_lane_load_serves_two_lanes_and_refuses_a_third() {
             None,
             RopeScaling::NONE,
             PrefillAttention::default(),
+            PrefillLinear::default(),
             lanes,
         )
     };
