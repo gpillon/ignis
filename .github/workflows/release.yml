@@ -39,7 +39,9 @@
 # mk/cuda-build-check.sh on it first. v0.9.0 and v0.9.1 shipped the CPU mock
 # under a release name, and nothing here noticed (GitHub #408). The same check
 # refuses any packaged binary that carries no machine code for 8.6, or none
-# for 12.0, whatever list the build was given (#482).
+# for 12.0, whatever list the build was given (#482), and holds the 8.6 code
+# of the kernels listed in mk/full-rate-kernels.txt to the full-rate rule, read
+# with cuobjdump from the CUDA toolkit (#512).
 
 name: release
 
