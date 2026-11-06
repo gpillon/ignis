@@ -32,6 +32,8 @@ struct Calls {
     prefill_positions: Vec<u32>,
     /// GitHub #506: each prefill call's drafter floor, in order.
     prefill_floors: Vec<u32>,
+    /// GitHub #519: each prefill call's next prompt token, in order.
+    prefill_next_tokens: Vec<Option<u32>>,
     prefill_params: Vec<DecodeParams>,
     /// The permitted set of each prefill call, in order (GitHub #242).
     prefill_permitted: Vec<Vec<u32>>,
@@ -286,6 +288,7 @@ impl StepLeaf for StubLeaf {
         tokens: &[u32],
         start_position: u32,
         drafter_floor: u32,
+        next_prompt_token: Option<u32>,
         params: DecodeParams,
         permitted: &[u32],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -301,7 +304,7 @@ impl StepLeaf for StubLeaf {
                 .media
                 .map(|media| (*media.embedding, media.first_column, media.scatter_indices.to_vec())),
         });
-        self.prefill(model, sequence, tokens, start_position, drafter_floor, params, permitted, redirect, out_logits, attention)
+        self.prefill(model, sequence, tokens, start_position, drafter_floor, next_prompt_token, params, permitted, redirect, out_logits, attention)
     }
 
     fn release_model(&self, _model: Self::Model) {
@@ -470,6 +473,7 @@ impl StepLeaf for StubLeaf {
         _tokens: &[u32],
         start_position: u32,
         drafter_floor: u32,
+        next_prompt_token: Option<u32>,
         params: DecodeParams,
         permitted: &[u32],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -533,6 +537,7 @@ impl StepLeaf for StubLeaf {
             let mut calls = self.calls.lock().unwrap();
             calls.prefill_positions.push(start_position);
             calls.prefill_floors.push(drafter_floor);
+            calls.prefill_next_tokens.push(next_prompt_token);
             calls.prefill_params.push(params);
             calls.prefill_permitted.push(permitted.to_vec());
             calls
@@ -880,6 +885,7 @@ fn a_prefill_hands_the_leaf_its_reasoning_redirect_and_reports_it() {
             PrefillJob {
                 reasoning_close: Some(42),
                 drafter_floor: 0,
+                next_prompt_token: None,
                 params: DecodeParams { ignore_eos: true, ..DecodeParams::default() },
                 ..prefill(3, Some(8))
             },
@@ -2075,6 +2081,45 @@ fn each_prefill_hands_the_leaf_its_jobs_drafter_floor() {
         .prefill_step(&[PrefillJob { drafter_floor: 7, ..multimodal_job(3, &prompt, 0, 18) }])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().prefill_floors, [3952, 0, 7]);
+}
+
+/// GitHub #519: each job's next prompt token reaches the leaf with its span,
+/// on the text path and on the multimodal one, so the leaf skips the head on
+/// every job but the prompt's last -- 0 being a real token id. A job whose
+/// state a prefix or a prompt checkpoint retains is handed none: its draw is
+/// the pending token the image carries, which a full-prompt claimant emits.
+#[test]
+fn each_prefill_hands_the_leaf_its_jobs_next_prompt_token_but_a_retained_job_none() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    compute
+        .prefill_step(&[
+            PrefillJob { next_prompt_token: Some(31), ..prefill(1, Some(8)) },
+            prefill(2, Some(8)),
+            PrefillJob { next_prompt_token: Some(0), ..prefill(3, Some(8)) },
+        ])
+        .unwrap();
+    compute
+        .prefill_step(&[
+            PrefillJob {
+                next_prompt_token: Some(32),
+                publish_prefix: Some(RetainedAt { tokens: 2, slot: 0 }),
+                ..prefill(4, Some(8))
+            },
+            PrefillJob {
+                next_prompt_token: Some(33),
+                capture_checkpoint: Some(RetainedAt { tokens: 2, slot: 1 }),
+                ..prefill(5, Some(8))
+            },
+        ])
+        .unwrap();
+    let prompt = multimodal(40, vec![image(10, 4)]);
+    compute
+        .prefill_step(&[PrefillJob { next_prompt_token: Some(34), ..multimodal_job(6, &prompt, 0, 18) }])
+        .unwrap();
+    let calls = leaf.calls.lock().unwrap();
+    assert_eq!(calls.prefixes_published, [2], "the publish ran");
+    assert_eq!(calls.checkpoints_captured, [2], "the capture ran");
+    assert_eq!(calls.prefill_next_tokens, [Some(31), None, Some(0), None, None, Some(34)]);
 }
 
 #[test]

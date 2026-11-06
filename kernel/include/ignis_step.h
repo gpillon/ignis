@@ -313,6 +313,18 @@ struct ignis_prefill_options {
    * is the span rule alone, and what a NULL options pointer means. Unread on a
    * load without the drafter, on the per-token route and on Flash-Next. */
   uint64_t drafter_floor;
+  /* GitHub #519: the next prompt token -- the prompt's token right after this
+   * span, or -1 on the prompt's last span, whose draw is the sequence's
+   * pending token; -1 is what a NULL options pointer means, and every caller
+   * sets it (0 is a real token id). With a token, nothing reads the span's
+   * draw: the 27B, and Flash-Next without MTP, run no output head and sample
+   * nothing over it, and leave the sequence with no pending token. Flash-Next
+   * with MTP still draws there, as its head's entry at the span's last
+   * position reads the draw. Such a span asks for no logits (`out_logits`,
+   * `out_span_logits`), no permitted set, no reasoning redirect and no
+   * attention readout, and runs the chunked route: the call is refused
+   * otherwise. A token outside the vocabulary is refused too. */
+  int32_t next_prompt_token;
 };
 
 /* The most heads a readout may bring whole rows back for (GitHub #275): the
