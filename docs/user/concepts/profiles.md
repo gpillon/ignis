@@ -101,6 +101,15 @@ Why each:
   decode unchanged; the cost is that a decoding lane's longest pause while a
   prompt prefills grows by about 65 percent
   ([finding](../../findings/2026-10-21-the-27b-prefill-chunk-at-2048.md)).
+  No profile names a [solo width](../configuration/context-and-speculation.md#the-solo-width):
+  `auto` widens the chunk while no lane decodes only on an RTX 30 or RTX 40
+  card, where the plan holds it with nothing else adapted.
+- **Flash-Next's prefill chunk.** 8,192 under `rtx5090` and `rtxpro6000`, as
+  `make` always started it: each chunk streams the experts once, so a narrower
+  one costs its TTFT nearly in proportion (2,048 took 1.86 times as long at
+  34K) and under load only halves a decoding lane's longest pause, which the
+  decode share already paces
+  ([finding](../../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)).
 - **Flash-Next's context and lanes.** 589,824 is 512K plus two 32K
   allowances, the floor asked for on both the expert cache (at least 15 GiB; it
   measured about 16.6) and the context. Three lanes is Flash-Next's own default.
@@ -207,7 +216,7 @@ resolves the default id `qwen3.8-27b` to that entry
 | Vision | on, tower and pool in host RAM (`vision.residency: host`) |
 | Speculation | DFlash2, 7 draft tokens |
 | Decode lanes | 8 (the default) |
-| Prefill chunk | 2,048 |
+| Prefill chunk | 2,048; 4,096 while no lane decodes, where the card has the room ([the solo width](../configuration/context-and-speculation.md#the-solo-width)) |
 | VRAM headroom | 1,200 MiB |
 | Retained slots | 2 on the device, beside the 16 in host RAM |
 
@@ -239,13 +248,23 @@ Why each:
   card's desktop holds;
   past that the load adapts
   ([when a profile does not fit](#when-a-profile-does-not-fit)).
+- **A wider chunk while no lane decodes.** No profile names a
+  [solo width](../configuration/context-and-speculation.md#the-solo-width):
+  `auto` plans 8,192, then 4,096, and keeps the first that leaves the whole
+  context and everything above as they are. In the same 24 GiB simulation
+  8,192 did not fit and 4,096 did, taking 13,312 of those tokens (a pool of
+  1,126,464, 77,888 past the context). A card whose desktop needs that room
+  keeps the 2,048-token chunk instead: the solo width never costs context.
 
 ## When a profile does not fit
 
 A profile's values, and the built-in defaults, are what the 27B asks for, not
 what it insists on. When the VRAM plan cannot hold them in the memory the
 start finds free, the load lowers them one at a time and plans again: the
-drafter's head first, then the context in steps, then the lanes. A value you
+drafter's head first, then the context in steps, then the lanes. A
+[solo width](../configuration/context-and-speculation.md#the-solo-width) is
+settled before any of them: `auto` takes a wider one only where nothing else
+has to give, and one you named drops to the prefill chunk first. A value you
 name yourself never adapts, and the `ignis.runtime.vram_plan` log event lists
 every step taken ([Configuration](../configuration/index.md)); so does
 `GET /v1/models`, in `adapted`, beside the context and the decode lanes the

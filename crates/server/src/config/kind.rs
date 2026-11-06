@@ -24,7 +24,7 @@ use ignis_core::ngram_table::HotBudget;
 use ignis_core::{ExceptionWeights, KvFormat, KvPoolSize, PrefillAttention, PrefillLinear, ProposalHeadSetting, RopeSetting, SpeculativeBackend, VisionResidency};
 use serde_json::Value;
 
-use super::{ApiKey, ApiKeySetting, Expose, SpecChoice};
+use super::{ApiKey, ApiKeySetting, Expose, SoloWidth, SpecChoice};
 use crate::instruction::{DeveloperMessagePolicy, SystemMessagePolicy};
 use crate::thinking::ReasoningEffort;
 
@@ -894,6 +894,39 @@ impl FieldKind for DraftRows {
     }
 }
 
+/// The solo width (GitHub #489): a token count, or `auto` for the one the
+/// load resolves. A count is a number for the field's numeric rule; `auto`
+/// is none.
+pub struct SoloTokens;
+
+impl FieldKind for SoloTokens {
+    type Value = SoloWidth;
+    const TAG: &'static str = "tokens|auto";
+
+    fn parse(raw: &str) -> Result<SoloWidth, String> {
+        if raw == "auto" {
+            return Ok(SoloWidth::Auto);
+        }
+        raw.parse::<u32>()
+            .map(SoloWidth::Tokens)
+            .map_err(|_| format!("expects a token count or auto, got `{raw}`"))
+    }
+
+    fn render(value: &SoloWidth) -> Value {
+        match value {
+            SoloWidth::Auto => Value::String("auto".to_owned()),
+            SoloWidth::Tokens(tokens) => Value::from(*tokens),
+        }
+    }
+
+    fn number(value: &SoloWidth) -> Option<i64> {
+        match value {
+            SoloWidth::Auto => None,
+            SoloWidth::Tokens(tokens) => Some(i64::from(*tokens)),
+        }
+    }
+}
+
 /// Flash-Next's n-gram hot-row budget (GitHub #306): a byte count, or
 /// `auto` for what the host plan leaves.
 pub struct HotBytes;
@@ -1234,6 +1267,20 @@ mod tests {
         assert_eq!(Location::parse("D:/kv"), Ok(CacheLocation::Directory(PathBuf::from("D:/kv"))));
         round_trips::<HotBytes>(HotBudget::Bytes(4 << 30));
         round_trips::<Location>(CacheLocation::Directory(PathBuf::from("custom")));
+    }
+
+    #[test]
+    fn a_solo_width_is_a_token_count_or_auto() {
+        // GitHub #489: `auto` carries no number, so the field's multiple-of-128
+        // rule judges a count alone.
+        assert_eq!(SoloTokens::parse("auto"), Ok(SoloWidth::Auto));
+        assert_eq!(SoloTokens::parse("8192"), Ok(SoloWidth::Tokens(8192)));
+        assert_eq!(SoloTokens::parse("8k").unwrap_err(), "expects a token count or auto, got `8k`");
+        assert_eq!(SoloTokens::number(&SoloWidth::Auto), None);
+        assert_eq!(SoloTokens::number(&SoloWidth::Tokens(4096)), Some(4096));
+        assert_eq!(SoloTokens::render(&SoloWidth::Auto), Value::String("auto".to_owned()));
+        round_trips::<SoloTokens>(SoloWidth::Auto);
+        round_trips::<SoloTokens>(SoloWidth::Tokens(4096));
     }
 
     #[test]

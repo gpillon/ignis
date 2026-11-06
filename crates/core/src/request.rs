@@ -678,6 +678,18 @@ impl Request {
         self.prefill_progress as usize >= self.input.tokens.len()
     }
 
+    /// Whether this request's lane waits on every prefill chunk (GitHub
+    /// #489): from the end of its prefill until it ends, decoding on a lane
+    /// or waiting to be dealt one. A suspended request is not; restored onto
+    /// a lane, it is again.
+    pub fn decode_ready(&self) -> bool {
+        match self.state {
+            RequestState::Running => self.remaining_work > 0,
+            RequestState::Prefilling => self.prefill_complete() && !self.moving,
+            _ => false,
+        }
+    }
+
     /// Abort the request regardless of its current lifecycle state (P3-01,
     /// ADR 0018: cancel is abort, not suspend — there is no suspend/resume
     /// primitive for a cancelled request). Unlike [`Request::advance`], this

@@ -654,6 +654,64 @@ fn an_invalid_prefill_chunk_env_var_is_a_usage_error_too() {
 }
 
 #[test]
+fn the_solo_width_is_auto_unless_named_and_no_profile_names_one() {
+    // GitHub #489: a flag, its env var or a family's section names a width.
+    assert_eq!(config(&[]).prefill_chunk_solo, SoloWidth::Auto);
+    assert_eq!(config(&["--model-prefill-chunk-solo", "8192"]).prefill_chunk_solo, SoloWidth::Tokens(8192));
+    let env = expect_config(resolve(&[], env_map(&[("IGNIS_MODEL_PREFILL_CHUNK_SOLO", "4096")])).expect("resolve"));
+    assert_eq!(env.prefill_chunk_solo, SoloWidth::Tokens(4096));
+    let scoped = config(&["--qwen38-model-prefill-chunk-solo", "4096"]);
+    assert_eq!(scoped.for_family(ModelFamily::Qwen38_27b).unwrap().prefill_chunk_solo, SoloWidth::Tokens(4096));
+    assert_eq!(scoped.for_family(ModelFamily::FlashNext).unwrap().prefill_chunk_solo, SoloWidth::Auto, "the 27B's section");
+    for profile in ["rtx5090", "rtxpro6000", "rtx-16gb", "rtx-24gb"] {
+        let named = config(&["--profile", profile]);
+        for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
+            assert_eq!(named.for_family(family).unwrap().prefill_chunk_solo, SoloWidth::Auto, "{profile} {family:?}");
+        }
+    }
+}
+
+#[test]
+fn an_unaligned_zero_or_non_numeric_solo_width_is_a_usage_error() {
+    let err = refused(&["--model-prefill-chunk-solo", "1000"]);
+    assert!(err.contains("128") && err.contains("1000") && err.contains("--model-prefill-chunk-solo"), "{err}");
+    assert!(refused(&["--model-prefill-chunk-solo", "0"]).contains("nonzero"));
+    assert!(refused(&["--model-prefill-chunk-solo", "wide"]).contains("auto"));
+}
+
+#[test]
+fn a_solo_width_narrower_than_a_named_prefill_chunk_is_refused_naming_both() {
+    // GitHub #489: the operator named two widths that contradict each other.
+    let err = refused(&["--model-prefill-chunk", "4096", "--model-prefill-chunk-solo", "2048"]);
+    assert!(err.contains("--model-prefill-chunk-solo 2048") && err.contains("--model-prefill-chunk 4096"), "{err}");
+    let err = refused(&["--qwen38flashnext-model-prefill-chunk", "8192", "--model-prefill-chunk-solo", "4096"]);
+    assert!(err.contains("--model-prefill-chunk-solo 4096") && err.contains("--qwen38flashnext-model-prefill-chunk 8192"), "{err}");
+    // As wide as the chunk is the chunk itself.
+    let equal = config(&["--model-prefill-chunk", "2048", "--model-prefill-chunk-solo", "2048"]);
+    assert_eq!(equal.prefill_chunk_solo, SoloWidth::Tokens(2048));
+}
+
+#[test]
+fn a_solo_width_narrower_than_a_profiles_prefill_chunk_starts_and_follows_it() {
+    // Below a chunk the profile gave -- Flash-Next's 8,192 under `rtx5090`,
+    // for a width named for every model -- the start goes on, and the load
+    // runs the chunk (`EngineShape::solo_width`, its line says so).
+    let named = config(&["--profile", "rtx5090", "--model-prefill-chunk-solo", "4096"]);
+    let flash = named.for_family(ModelFamily::FlashNext).unwrap();
+    assert_eq!((flash.prefill_chunk, flash.prefill_chunk_solo), (8192, SoloWidth::Tokens(4096)));
+    let shape = crate::runtime::EngineShape::from(&flash);
+    assert_eq!(shape.solo_width(), 8192);
+    assert_eq!(shape.solo_text(flash.prefill_chunk_solo), "prefill_chunk_solo 4096 -> 8192 (= prefill_chunk)");
+    assert_eq!(crate::runtime::EngineShape::from(&named.for_family(ModelFamily::Qwen38_27b).unwrap()).solo_width(), 4096);
+}
+
+#[test]
+fn a_solo_width_wider_than_the_context_is_refused() {
+    let err = refused(&["--model-max-context", "8192", "--model-prefill-chunk-solo", "16384"]);
+    assert!(err.contains("--model-prefill-chunk-solo 16384") && err.contains("--model-max-context 8192"), "{err}");
+}
+
+#[test]
 fn a_zero_max_context_is_a_usage_error() {
     assert!(refused(&["--model-max-context", "0"]).contains("--model-max-context"));
 }

@@ -363,8 +363,16 @@ config_group! {
         /// cores. Flash-Next has none.
         exception_weights: ExceptionWeightsKind = ExceptionWeights::default(), Validator::OneOf(&ExceptionWeights::NAMES), QWEN38_ONLY,
             [Visible, Patchable, ReloadRequired];
-        /// The prefill chunk width, in tokens.
+        /// The prefill chunk width, in tokens, while a lane is decoding.
         prefill_chunk: Tokens = super::DEFAULT_PREFILL_CHUNK, Validator::MultipleOf(super::PREFILL_CHUNK_ALIGNMENT as u64), ALL,
+            [Visible, Patchable, ReloadRequired, Scoped];
+        /// The prefill chunk width, in tokens, while no lane is decoding (the
+        /// solo width), its prefill scratch planned at load. `auto` is the
+        /// widest of 8192 and 4096 the VRAM plan holds with nothing else
+        /// adapted, for the 27B on an RTX 30 or RTX 40 card; otherwise
+        /// `prefill_chunk`. A width below `prefill_chunk` is `prefill_chunk`,
+        /// and refused when both are named.
+        prefill_chunk_solo: SoloTokens = super::SoloWidth::Auto, Validator::MultipleOf(super::PREFILL_CHUNK_ALIGNMENT as u64), ALL,
             [Visible, Patchable, ReloadRequired, Scoped];
         /// The percent of the model's time decoding lanes keep while a prompt
         /// prefills. Unset, the model's own: 25 on both. 0 is one decode
@@ -1224,6 +1232,23 @@ mod tests {
         assert_eq!(field("spec", "decode_lanes").unwrap().validator, between(1, 8));
         assert!(matches!(field("model", "kv_format").unwrap().validator, Validator::OneOf(names) if names.contains(&"bf16") && names.contains(&"hq-e8-2b")));
         assert_eq!(field("server", "request_timeout").unwrap().validator, between(0, 3600));
+    }
+
+    /// GitHub #489: the solo width is declared as the prefill chunk is -- its
+    /// rule, its tags, a section per family -- under its own names.
+    #[test]
+    fn the_solo_width_is_declared_as_the_prefill_chunk_is() {
+        let chunk = field("model", "prefill_chunk").unwrap();
+        let solo = field("model", "prefill_chunk_solo").unwrap();
+        assert_eq!(solo.validator, chunk.validator);
+        assert_eq!(
+            (solo.visible, solo.patchable, solo.reload_required, solo.scoped, solo.applies),
+            (chunk.visible, chunk.patchable, chunk.reload_required, chunk.scoped, chunk.applies)
+        );
+        assert_eq!(solo.flag(), "--model-prefill-chunk-solo");
+        assert_eq!(solo.env(), "IGNIS_MODEL_PREFILL_CHUNK_SOLO");
+        assert_eq!(solo.scoped_flag(ModelFamily::Qwen38_27b), "--qwen38-model-prefill-chunk-solo");
+        assert_eq!(solo.scoped_flag(ModelFamily::FlashNext), "--qwen38flashnext-model-prefill-chunk-solo");
     }
 
     /// The `OneOf` lists are literal (a `const` cannot call `as_str`); each

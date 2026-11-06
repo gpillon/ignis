@@ -30,6 +30,22 @@ starts under a new built-in profile, `rtx-24gb`; the 16 GB profile is named `rtx
 permanent alias. The class stays memory alone, and the GPU generation is an axis beside it; the RTX 30 (Ampere,
 compute capability 8.6) and RTX 40 (Ada, 8.9) cards are now in scope beside SM120.
 
+**Amended 2026-11-06 (GitHub #489, [ADR 0018](0018-chunk-level-prefill-decode-interleaving.md) as amended the same
+day):** the solo width comes before point 3's steps.
+- At `auto`, the default, the load first plans at the profile's values with each width of the solo ladder in turn,
+  8192 then 4096, for the 27B on an RTX 30 or RTX 40 card, and keeps the first the plan fits there, nothing else
+  adapted for it. A width the plan refuses is no step and is not named in `adapted`. When none fits, the solo width
+  is the prefill chunk and the steps run as before. On `rtx-24gb` that keeps the whole 1,048,576-token context in the
+  KV pool. The ladder is one function (`config::arch::solo_ladder`); on Blackwell and for Flash-Next it is empty.
+- A width the operator names is the one exception to "an explicit value never adapts": when the plan refuses it
+  below its minimum, its drop to the prefill chunk is the first step (`prefill_chunk_solo 8192 -> 2048`), and the
+  steps follow at the prefill chunk. It only ever narrows a chunk, never a context or a lane. Flash-Next adapts
+  nothing, its solo width included.
+- A named width narrower than a prefill chunk also named is refused naming both; narrower than a chunk a profile or
+  the default gave (Flash-Next's 8192 under `rtx5090`, for a width named for every model), it is that chunk.
+- The width the load runs is logged (`ignis.runtime.prefill_chunk_solo`: `prefill_chunk_solo auto -> 8192`) and
+  reported by `GET /v1/models` (`prefill_chunk_solo`); `GET /v1/config` keeps `auto`. No built-in profile names one.
+
 Related:
 - [ADR 0030](0030-device-memory-reserved-at-load.md): device memory is reserved at load;
 - [ADR 0046](0046-one-declaration-per-config-field.md): one declaration per config field;

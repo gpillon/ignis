@@ -53,7 +53,7 @@ admission
   |  retained state? claim the longest matching prefix
   v
 prefill lane (one prompt at a time)
-  |  chunks of --model-prefill-chunk tokens
+  |  chunks of --model-prefill-chunk tokens (the solo width while no lane decodes)
   |  a decode round between chunks (decode share)
   v
 decode lanes (8 on the 27B; 1..8 on Flash-Next)
@@ -116,7 +116,10 @@ recurrent state and to draw the first token. Two rules shape it:
 - **A prompt is prefilled in chunks, and decode takes turns with it.** The
   scheduler hands the leaf one chunk (`--model-prefill-chunk`, 1,024 tokens by
   default, 2,048 for the 27B under the built-in profiles) and runs a decode
-  round for the lanes already generating before the next chunk. Nothing runs
+  round for the lanes already generating before the next chunk. While no lane
+  is generating, the chunk is the wider
+  [solo width](../configuration/context-and-speculation.md#the-solo-width)
+  instead, decided again at every chunk boundary. Nothing runs
   concurrently on the card: prefill and decode alternate on one stream
   ([ADR 0018](../../adr/0018-chunk-level-prefill-decode-interleaving.md)).
 

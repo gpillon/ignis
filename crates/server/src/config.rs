@@ -358,6 +358,10 @@ pub struct Config {
     /// The prefill chunk width, in tokens (a nonzero multiple of
     /// [`PREFILL_CHUNK_ALIGNMENT`]).
     pub prefill_chunk: u32,
+    /// The solo width as configured (`--model-prefill-chunk-solo`, GitHub
+    /// #489): `auto`, resolved at load, or a width of at least
+    /// `prefill_chunk` and at most `max_context`.
+    pub prefill_chunk_solo: SoloWidth,
     /// The **decode share** (`--model-decode-share`, GitHub #306): the
     /// percent of the model's time decoding lanes keep while a prompt
     /// prefills, 0-99. `None`: the model family's own.
@@ -585,6 +589,30 @@ impl std::fmt::Debug for Basis {
     /// sources hold the API key's raw text).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Basis").field("family", &self.0.family).field("sources", &self.0.sources).finish()
+    }
+}
+
+/// The **solo width** a config names (`--model-prefill-chunk-solo`, GitHub
+/// #489, ADR 0018 as amended): the prefill chunk while no lane is
+/// decode-ready. `auto`, the default, is resolved at load, where the VRAM
+/// plan and the card are known ([`crate::config::arch::solo_ladder`]); a
+/// width is a nonzero multiple of 128, at least the prefill chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SoloWidth {
+    /// The widest of the card's ladder the plan holds with nothing else
+    /// adapted, else the prefill chunk.
+    #[default]
+    Auto,
+    /// This many tokens.
+    Tokens(u32),
+}
+
+impl std::fmt::Display for SoloWidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Tokens(tokens) => write!(f, "{tokens}"),
+        }
     }
 }
 
@@ -1206,6 +1234,7 @@ fn derive(
     let rope_scaling = s.model.rope_scaling.resolve(s.model.max_context).map_err(|e| {
         ConfigError(format!("`{} {}`: {e}", spelled("model", "max_context"), s.model.max_context))
     })?;
+    derive_solo_width(&resolution, &spelled)?;
     // GitHub #456: the band and the route the card runs, whatever the fields
     // resolved to (`source::decide_by_card` decided them already; here a
     // named value the card or the build cannot run is refused).
@@ -1267,6 +1296,7 @@ fn derive(
             nudge_again: s.model.loop_guard_nudge_again.clone(),
         },
         prefill_chunk: s.model.prefill_chunk,
+        prefill_chunk_solo: s.model.prefill_chunk_solo,
         decode_share_percent: s.model.decode_share,
         max_context: s.model.max_context,
         default_max_tokens: s.model.default_max_tokens,
@@ -1354,6 +1384,40 @@ struct FamilyFit<'a> {
     model: &'a mut String,
     speculation: &'a mut Option<Speculation>,
     dropped: &'a mut Vec<String>,
+}
+
+/// The solo width against the prefill chunk and the context (GitHub #489): a
+/// width is refused, never clamped, when the operator named both it and a
+/// prefill chunk wider than it -- the error names both -- or when it is wider
+/// than one sequence. Below a chunk a profile or the default gave, as below
+/// Flash-Next's 8,192 for a width named for every model, it follows the
+/// chunk, and the load's `ignis.runtime.prefill_chunk_solo` line says so
+/// (`EngineShape::solo_width`). `auto` refuses nothing: it is resolved at
+/// load.
+fn derive_solo_width(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> String) -> Result<(), ConfigError> {
+    let model = &resolution.settings.model;
+    let SoloWidth::Tokens(solo) = model.prefill_chunk_solo else {
+        return Ok(());
+    };
+    let named = |name| resolution.explicit("model", name);
+    if solo < model.prefill_chunk && named("prefill_chunk") && named("prefill_chunk_solo") {
+        return Err(ConfigError(format!(
+            "`{} {solo}` is narrower than `{} {}`: the solo width is the prefill chunk while no lane decodes, at least \
+             the one while a lane does; name a wider one, or leave it `auto`",
+            spelled("model", "prefill_chunk_solo"),
+            spelled("model", "prefill_chunk"),
+            model.prefill_chunk
+        )));
+    }
+    if solo > model.max_context {
+        return Err(ConfigError(format!(
+            "`{} {solo}` exceeds `{} {}`: a chunk is never wider than one sequence",
+            spelled("model", "prefill_chunk_solo"),
+            spelled("model", "max_context"),
+            model.max_context
+        )));
+    }
+    Ok(())
 }
 
 /// The VRAM budget's mode (GitHub #210, ADR 0030): `--vram-headroom-bytes`

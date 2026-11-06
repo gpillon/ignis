@@ -7,7 +7,9 @@ Accepted (2026-09-09, grilling session for GitHub #64 / G3). Builds on ADR
 options). Does not amend either.
 
 **Amended by #306** (2026-10-07): the decode share, for Flash-Next's
-seconds-long chunk. See the amendment at the end.
+seconds-long chunk. **Amended by #489** (2026-11-06): two planned widths, the
+prefill chunk and the solo width, chosen at every chunk boundary. See the
+amendments at the end.
 
 Sources: `docs/ROADMAP.md` phase 3, `docs/REVIEW-2026-09-05.md` §6.
 
@@ -158,3 +160,35 @@ at 1.0-1.1 tok/s while a 34K prompt prefilled.
   instead halves the gap (1.7 s) but leaves the lanes at ~1 tok/s and costs
   28.3-28.7 s of TTFT even with nobody decoding
   ([finding](../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)).
+
+## Amendment (2026-11-06) — two planned widths, chosen at every chunk boundary (#489)
+
+The serving width stops being one number fixed for the scheduler's life. A load plans two, and the scheduler picks
+between them at every chunk boundary.
+
+- **The solo width** (`model.prefill_chunk_solo`) is the prefill chunk while no lane is decode-ready. A lane is
+  decode-ready from the end of its prefill until its request ends, whether it holds a lane or waits for one; a
+  suspended sequence is not. The prefill chunk (`model.prefill_chunk`) is the width while at least one lane is. The
+  width changes within a prompt: a long prompt that starts while a lane decodes widens once that lane ends, and
+  narrows again at the next boundary when a sequence is restored onto a lane.
+- **Both widths are planned at load ([ADR 0030](0030-device-memory-reserved-at-load.md)).** The prefill scratch is
+  reserved once, for the solo width, the wider; serving narrows to the prefill chunk without allocating anything,
+  which is this ADR's "shrinking at serving time is free". Nothing is borrowed from the KV pool.
+- **The cost lands only on a lane that starts decoding mid-prefill.** One request holds multi-chunk prefill
+  progress at a time, so a request that arrives during a solo chunk waits for that whole prefill at either width. A
+  sequence restored from KV-RAM or KV-disk while a prompt prefills waits at most one solo chunk, then the chunks
+  narrow.
+- **A solo chunk owes no decode share.** No lane was decoding while it ran, so the hold after it is skipped; a lane
+  dealt at its end, or restored, waits one round, not a share of the wider chunk's time.
+- **`auto` is the default**, resolved at load ([ADR 0063](0063-the-profile-follows-the-card-class.md) §3 as amended
+  the same day): 8192, then 4096, for the 27B on an RTX 30 or RTX 40 card where the plan holds it with nothing else
+  adapted, otherwise the prefill chunk. On Blackwell `auto` is the prefill chunk: a wider chunk bought the 27B at
+  most 4% of cold TTFT there ([finding](../findings/2026-10-07-27b-prefill-chunk-width.md)), and the `rtx5090`
+  profile's margin does not hold 4096 ([finding](../findings/2026-10-21-the-27b-prefill-chunk-at-2048.md)).
+  Flash-Next's `auto` is its prefill chunk on every card: each chunk pays a near-constant expert stream, so it wants
+  its widest chunk with lanes decoding as well
+  ([finding](../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)), and the built-in profiles set
+  that chunk to 8192, as `make` already did.
+- **The same prompt can end in logits that differ in the last bits**, depending on whether lanes were decoding. The
+  quality gates use KLD; a test that compares logits bit for bit pins both widths. At the prefill chunk, a load with
+  the solo scratch reserved runs the same kernels on the same cuts as one without.
