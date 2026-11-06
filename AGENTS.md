@@ -11,7 +11,8 @@ An agent working in a fork of ignis reads
 ### Issue tracker
 
 GitHub Issues on `gpillon/ignis`, through the `gh` CLI: a spec is an issue and
-its tickets are sub-issues with native blocking. See `docs/agents/issue-tracker.md`.
+its tickets are sub-issues with native blocking, planned on a public project
+board. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

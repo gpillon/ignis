@@ -28,7 +28,8 @@ GitHub shares one number space across issues and PRs, so a bare `#42` may be eit
 
 ## When a skill says "publish to the issue tracker"
 
-Create a GitHub issue.
+Create a GitHub issue, then set its fields on the board (**Project board**
+below).
 
 ## When a skill says "fetch the relevant ticket"
 
@@ -61,7 +62,37 @@ closes a ticket with `gh issue close <n> --comment "..."` naming the commit on
 `main` that delivers it, and comments on the ticket when work starts and when
 it merges. Implementer agents never comment on or close an issue. A ticket whose
 acceptance is the owner's (a live check, a GPU gate the owner runs) stays open
-until the owner says so.
+until the owner says so. With its start and merge comments the coordinating
+session moves the ticket's Status on the board (**Project board** below).
+
+## Project board
+
+The public project [ignis](https://github.com/users/gpillon/projects/6) plans
+these issues. An open issue joins it by itself in Inbox, and closing it moves
+it to Done. The issue stays the source of truth and the board adds what no
+label says: labels lead, the board follows them.
+
+The session that publishes or triages an issue sets its fields; implementer
+agents leave the board alone, as they leave the issue.
+
+- **Area**: on every new issue, the one area it touches.
+- **Release**: when the spec or the owner names one. A ticket takes its
+  spec's Release and Area.
+- **Status**, from the state label: `idea` Parked, `needs-triage` and
+  `needs-info` Inbox, `ready-for-agent` and `ready-for-human` Ready. The
+  coordinating session moves a ticket to In progress when work starts, and
+  to Waiting on owner when it merges with the owner's acceptance still open.
+- **Start date** and **Target date**: on release work only, estimates along
+  the blocking edges that the coordinating session moves when the plan moves.
+
+One field per call, by name (`gh` needs the `project` scope:
+`gh auth refresh -s project`):
+`gh project item-edit 6 --owner gpillon --url <issue-url> --field Area --value "Platforms"`;
+a date takes `--value YYYY-MM-DD`, and the option names of Area, Release and
+Status come from `gh project field-list 6 --owner gpillon --format json`.
+An issue not on the board yet joins with
+`gh project item-add 6 --owner gpillon --url <issue-url>`. The board sets a
+newly added issue's Status to Inbox, so Status is the last field set.
 
 ## Auth
 

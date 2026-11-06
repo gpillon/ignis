@@ -44,3 +44,6 @@ undoing it.
   folder `/triage` keeps, created at the first rejection.
 - The open issues with no category get `bug` or `enhancement` from a list an
   agent proposes and the owner approves before anything is applied (#367).
+- The issues are planned on the public project board (gpillon/projects/6):
+  Status, Release, Area and dates, set by the session that publishes,
+  triages or coordinates (`docs/agents/issue-tracker.md`, Project board).

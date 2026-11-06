@@ -12,6 +12,8 @@ The skills speak in terms of five canonical triage roles. This file maps those r
 
 When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding label string from this table.
 
+A state label also sets the issue's Status on the project board: **Project board** in `docs/agents/issue-tracker.md`.
+
 Edit the "Label in our tracker" column to match whatever vocabulary you actually use.
 
 ## Category roles
