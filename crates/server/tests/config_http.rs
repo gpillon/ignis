@@ -1018,6 +1018,9 @@ async fn under_auto_a_24gb_card_runs_rtx_24gb_and_the_config_says_so() {
         assert_eq!(status, StatusCode::OK, "{document}");
         let qwen = (&document["model"]["qwen38"], &document["spec"]["qwen38"], &document["vram"]["qwen38"]);
         assert_eq!((&qwen.0["max_context"], &qwen.0["prefill_chunk"]), (&json!(1048576), &json!(2048)), "{band}: {document}");
+        // GitHub #489: the solo width as configured, which the load resolves.
+        assert_eq!(document["model"]["prefill_chunk_solo"], "auto", "{band}: {document}");
+        assert_eq!(qwen.0["prefill_chunk_solo"], 2048, "the profile pins the 27B's to its chunk: {document}");
         assert_eq!((&qwen.1["backend"], &qwen.1["draft_tokens"]), (&json!("dflash2"), &json!(7)), "{band}: {document}");
         assert_eq!(qwen.2["headroom_bytes"], "1200M", "{band}: {document}");
         let vision = &document["vision"]["qwen38"];

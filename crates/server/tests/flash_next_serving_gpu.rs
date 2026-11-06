@@ -192,6 +192,64 @@ fn the_default_plan_is_offloaded_at_524288_tokens_and_the_floor_opt_in_warns() {
     assert!(warning["knobs"].as_str().unwrap().contains("--vram-kv-pool-bytes"), "{warning}");
 }
 
+/// What the profile's ~16.6 GiB of expert cache at Flash-Next's old 1,024-token
+/// chunk (`config::profile`'s `rtx5090` note) may give up to the 8,192 one
+/// and keep the 15 GiB the owner asked for.
+const CACHE_ROOM_ABOVE_THE_FLOOR: u64 = 1_717_986_918; // 16.6 - 15 GiB
+
+/// Flash-Next's VRAM plan at `shape`, read off `ignis.runtime.flash_next_plan`
+/// with a host margin no host has, so the load stops at its host plan, past
+/// the VRAM plan and before it pins anything; `None` where the profile allows
+/// a skip.
+fn vram_plan_only(path: &std::path::Path, shape: EngineShape) -> Option<serde_json::Value> {
+    let shape = EngineShape { host_margin_bytes: 1 << 40, ..shape };
+    let (records, loaded) = captured(|| flash_next_scheduler(path, MODEL.into(), EOS, shape, None));
+    match loaded {
+        Err(e) if e.contains("not enough RAM") => Some(attributes(&records, "ignis.runtime.flash_next_plan")),
+        Err(e) => {
+            gpu_profile::skip_or_fail(&format!("plan Flash-Next: {e}"));
+            None
+        }
+        Ok(_) => panic!("a 1 TiB host margin holds no load"),
+    }
+}
+
+/// GitHub #489: under `rtx5090` Flash-Next prefills 8,192 tokens a chunk, as
+/// `make` always started it, and its solo width is that chunk (`auto` has no
+/// ladder on Flash-Next). The wider scratch keeps the expert cache at or
+/// above the 15 GiB the owner asked the profile for: against the 1,024-token
+/// chunk it costs less than the profile's measured room above the floor.
+/// Planned twice on the card as it is, the desktop's share of it included,
+/// so only the difference is asserted; nothing is pinned. On 2026-11-06,
+/// with 4.7 GB of the card taken: 15,833,292,112 bytes at 1,024, 14,732,307,024
+/// at 8,192, 1.03 GiB less.
+#[test]
+#[ignore = "GPU profile only: the real Flash-Next artifact"]
+fn under_rtx5090_flash_next_prefills_8192_a_chunk_and_keeps_15_gib_of_expert_cache() {
+    let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(MODEL_DIR), PathBuf::from);
+    let path = dir.join(ARTIFACT_FILE_NAME);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("no Flash-Next artifact at {}", path.display())) {
+        return;
+    }
+    let args = ["--profile", "rtx5090"].map(str::to_owned);
+    let ignis_server::config::ConfigOutcome::Config(config) = ignis_server::config::resolve(&args, |_| None).expect("resolve")
+    else {
+        panic!("expected a runnable config");
+    };
+    let config = config.for_family(ignis_core::compute::ModelFamily::FlashNext).expect("Flash-Next");
+    let profile = EngineShape::from(&config).for_family(ignis_core::compute::ModelFamily::FlashNext);
+    assert_eq!((profile.prefill_chunk, profile.solo_width()), (8192, 8192));
+    let Some(wide) = vram_plan_only(&path, profile) else { return };
+    let Some(narrow) = vram_plan_only(&path, EngineShape { prefill_chunk: 1024, ..profile }) else { return };
+    println!("plan at 8192: {wide}");
+    println!("plan at 1024: {narrow}");
+    let cache = |plan: &serde_json::Value| plan["expert_cache_bytes"].as_u64().unwrap();
+    let cost = cache(&narrow) - cache(&wide);
+    println!("the 8,192-token chunk costs the expert cache {cost} bytes ({:.2} GiB) against 1,024", cost as f64 / (1u64 << 30) as f64);
+    assert_eq!(wide["budget_bytes"], narrow["budget_bytes"], "one card, one budget");
+    assert!(cost <= CACHE_ROOM_ABOVE_THE_FLOOR, "the profile's 16.6 GiB less {cost} bytes is below 15 GiB");
+}
+
 fn load(shape: EngineShape) -> Option<ConcreteScheduler> {
     let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(MODEL_DIR), PathBuf::from);
     let path = dir.join(ARTIFACT_FILE_NAME);

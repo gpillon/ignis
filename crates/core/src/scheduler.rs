@@ -952,6 +952,14 @@ pub trait Scheduler: Send {
         crate::N_DECODE_LANES
     }
 
+    /// The load's **solo width** (GitHub #489), for `GET /v1/models`: the
+    /// prefill chunk a prompt takes while no lane is decode-ready -- the
+    /// prefill chunk itself on a load with no wider one. `None` from a
+    /// scheduler that says nothing of its chunks (the default).
+    fn prefill_chunk_solo(&self) -> Option<u32> {
+        None
+    }
+
     /// The operating mode (reported by telemetry interval lines).
     fn mode(&self) -> crate::types::EngineMode;
 

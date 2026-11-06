@@ -36,7 +36,9 @@ Flash-Next). The lines include:
 
 - the **weights** (the 27B's vision tower among them only under
   `--vision-residency device`);
-- **workspaces**: the prefill scratch, sized for `--model-prefill-chunk` and
+- **workspaces**: the prefill scratch, sized for the wider of
+  `--model-prefill-chunk` and
+  [the solo width](../configuration/context-and-speculation.md#the-solo-width) and
   for the prefill routes the load runs (the dense prefill and an RTX 30 or RTX
   40 card's gated delta net prefill hold less of it than the fused prefill and
   the vendored kernels); with vision on, the image encoder's workspace shares it and the line is the larger

@@ -200,7 +200,12 @@ pub const NONE_PROFILE: &str = "none";
 /// back 2.149 GB of the host pool's RAM for 0.1-0.2% of one-lane and
 /// 0.2-1.1% of three-lane decode (two sessions), greedy text unchanged; `4G`
 /// would give back 4.296 GB for 4.3% and 5.9%. The field is
-/// Flash-Next-only: the 27B passes it over.
+/// Flash-Next-only: the 27B passes it over. Flash-Next prefills 8,192 tokens a
+/// chunk (GitHub #489), as `make` always started it: each chunk streams its
+/// experts once (finding 2026-10-07-flash-next-prefill-chunk-and-decode-share),
+/// and the wider scratch costs the expert cache 1.03 GiB against 1,024
+/// (1,100,985,088 bytes, planned on the card on 2026-11-06), so from the ~16.6
+/// GiB measured at 1,024 it keeps ~15.6, above the 15 GiB asked for.
 ///
 /// `rtxpro6000` is the RTX PRO 6000 Blackwell series (Workstation, Max-Q,
 /// Server Edition: 96 GB each, sm_120, the 5090's architecture). Derived
@@ -252,7 +257,12 @@ pub const NONE_PROFILE: &str = "none";
 /// spec #503 add the dense prefill's 89 MB buffer and take less prefill
 /// scratch: on the 5090 at a 16 GB budget less 1 GiB (2026-11-05) they left the
 /// KV pool 6,656 tokens smaller, 386,048 against 392,704, and the context
-/// loaded with nothing adapted.
+/// loaded with nothing adapted. The 27B's solo width (GitHub #489) is pinned
+/// to the chunk, the owner's call (2026-11-06): the KV pool before a wider
+/// chunk. On that load, with an RTX 4080 as the card read, `auto` would keep
+/// 2,048 (4,096 leaves less than the spare reservation past the context), its
+/// pool 352,768 tokens against 386,048. Flash-Next's `prefill_chunk` 2,048 is
+/// a placeholder no card of the class has measured (GitHub #526).
 ///
 /// `rtx-24gb` is the 24 GB class (GitHub #480, spec #474): the RTX 3090 and
 /// RTX 4090, the cards `--profile auto` finds from 20 GiB up to 28 GiB. It
@@ -286,9 +296,14 @@ pub const NONE_PROFILE: &str = "none";
 /// `--model-prefill-linear int8 --model-prefill-attention int8` and
 /// `IGNIS_GDN_PREFILL=ours`, 2026-11-05) it still loads 1,048,576 tokens on 8
 /// lanes with nothing adapted, the slots beside them, and keeps 17,809 pages
-/// (1,139,776 tokens), 91,200 past the context (~0.84 GB). No other
-/// card ships a profile; a config file's `profiles:` defines one for any
-/// other card.
+/// (1,139,776 tokens), 91,200 past the context (~0.84 GB). The 27B's solo
+/// width (GitHub #489) is pinned to the 2,048-token chunk, the owner's call
+/// (2026-11-06); on that simulation, with an RTX 3090 as the card read, `auto`
+/// would keep 4,096 for 13,312 of those tokens (8,192 does not fit), which
+/// #516's session can weigh on a real card. Flash-Next's `prefill_chunk` 4,096
+/// is a placeholder no card of the class has measured (GitHub #526). No other
+/// card ships a profile; a config file's `profiles:` defines one for any other
+/// card.
 const BUILT_IN: &str = r#"{
     "rtx5090": {
         "vram": {
@@ -298,7 +313,7 @@ const BUILT_IN: &str = r#"{
         },
         "model": {
             "qwen38": { "max_context": 917504, "prefill_chunk": 2048 },
-            "qwen38flashnext": { "max_context": 589824 }
+            "qwen38flashnext": { "max_context": 589824, "prefill_chunk": 8192 }
         },
         "vision": { "enabled": true, "residency": "host" },
         "spec": {
@@ -309,7 +324,7 @@ const BUILT_IN: &str = r#"{
     "rtxpro6000": {
         "model": {
             "qwen38": { "max_context": 1048576, "prefill_chunk": 2048 },
-            "qwen38flashnext": { "max_context": 1048576 }
+            "qwen38flashnext": { "max_context": 1048576, "prefill_chunk": 8192 }
         },
         "vision": { "enabled": true, "residency": "device" },
         "spec": {
@@ -323,7 +338,8 @@ const BUILT_IN: &str = r#"{
             "qwen38": { "headroom_bytes": "1200M" }
         },
         "model": {
-            "qwen38": { "max_context": 262144 }
+            "qwen38": { "max_context": 262144, "prefill_chunk_solo": 1024 },
+            "qwen38flashnext": { "prefill_chunk": 2048 }
         },
         "vision": { "enabled": true, "max_tokens": 4096, "residency": "host" },
         "spec": {
@@ -335,7 +351,8 @@ const BUILT_IN: &str = r#"{
             "qwen38": { "headroom_bytes": "1200M" }
         },
         "model": {
-            "qwen38": { "max_context": 1048576, "prefill_chunk": 2048 }
+            "qwen38": { "max_context": 1048576, "prefill_chunk": 2048, "prefill_chunk_solo": 2048 },
+            "qwen38flashnext": { "prefill_chunk": 4096 }
         },
         "reuse": {
             "qwen38": { "retained_device": RTX_24GB_RETAINED_DEVICE_SLOTS }
@@ -618,9 +635,12 @@ mod tests {
         }
     }
 
-    /// GitHub #341: the 27B prefills 2,048 tokens a chunk under both built-in
-    /// profiles, free there because vision's encoder sizes the arena;
-    /// Flash-Next and a start without a profile keep the hardcoded width.
+    /// GitHub #341: the 27B prefills 2,048 tokens a chunk under the built-in
+    /// profiles that set one, free there because vision's encoder sizes the
+    /// arena; a start without a profile keeps the hardcoded width. GitHub
+    /// #489: Flash-Next prefills 8,192 under the two that give it a section,
+    /// as `make` always started it, since each of its chunks streams its
+    /// experts once.
     #[test]
     fn under_the_built_in_profiles_the_27b_prefills_2048_tokens_a_chunk() {
         use super::super::source::{resolve_settings, Fit, Sources};
@@ -631,13 +651,21 @@ mod tests {
         let qwen = resolve_settings(&sources, Some(ModelFamily::Qwen38_27b), Fit::Start).unwrap();
         assert_eq!(qwen.settings.model.prefill_chunk, 2048);
         let flash = resolve_settings(&sources, Some(ModelFamily::FlashNext), Fit::Start).unwrap();
-        assert_eq!(flash.settings.model.prefill_chunk, DEFAULT_PREFILL_CHUNK);
+        assert_eq!(flash.settings.model.prefill_chunk, 8192);
         let bare = resolve_settings(&Sources::default(), Some(ModelFamily::Qwen38_27b), Fit::Start).unwrap();
         assert_eq!(bare.settings.model.prefill_chunk, DEFAULT_PREFILL_CHUNK);
         let pro = Sources { profile: built_in()["rtxpro6000"].clone(), ..Sources::default() };
         assert_eq!(resolve_settings(&pro, Some(ModelFamily::Qwen38_27b), Fit::Start).unwrap().settings.model.prefill_chunk, 2048);
+        assert_eq!(resolve_settings(&pro, Some(ModelFamily::FlashNext), Fit::Start).unwrap().settings.model.prefill_chunk, 8192);
         let rtx24 = Sources { profile: built_in()["rtx-24gb"].clone(), ..Sources::default() };
         assert_eq!(resolve_settings(&rtx24, Some(ModelFamily::Qwen38_27b), Fit::Start).unwrap().settings.model.prefill_chunk, 2048, "the 5090's");
+        let small = Sources { profile: built_in()["rtx-16gb"].clone(), ..Sources::default() };
+        // GitHub #489: Flash-Next's chunk on the 24 and 16 GB classes, values
+        // no card of theirs has measured yet (GitHub #526).
+        for (profile, chunk) in [(&rtx24, 4096), (&small, 2048)] {
+            let flash = resolve_settings(profile, Some(ModelFamily::FlashNext), Fit::Start).unwrap();
+            assert_eq!(flash.settings.model.prefill_chunk, chunk);
+        }
     }
 
     /// `auto` rope scaling under each profile, as a load of each model
@@ -745,7 +773,9 @@ mod tests {
             assert_eq!(value(group, name, Some(Qwen38_27b)), None, "{group}.{name}: the 27B's default");
         }
         assert_eq!(value("vram", "headroom_bytes", None), None, "the general headroom stays the default");
-        assert!(rtx24.entries().all(|(_, family, _)| family != Some(FlashNext)), "no Flash-Next section");
+        // GitHub #489: Flash-Next's section holds its prefill chunk alone.
+        let flash: Vec<_> = rtx24.entries().filter(|(_, family, _)| *family == Some(FlashNext)).map(|(meta, _, _)| meta.name).collect();
+        assert_eq!(flash, ["prefill_chunk"], "Flash-Next's section");
         // The values the 5090's profile gives the 27B, but its context.
         let rtx5090 = &profiles["rtx5090"];
         for (group, name) in [("vram", "headroom_bytes"), ("model", "prefill_chunk"), ("spec", "backend"), ("spec", "draft_tokens"), ("spec", "decode_lanes"), ("spec", "draft_head")] {
