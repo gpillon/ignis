@@ -94,7 +94,9 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   no context lost while no image is in flight), the VRAM headroom of the
   5090's 27B (1200M) and a 1,024-token prefill chunk. On an RTX 40 card of the
   class the chunk widens while no lane decodes where the plan holds it with
-  nothing adapted ([the solo width](context-and-speculation.md#the-solo-width)).
+  nothing adapted ([the solo width](context-and-speculation.md#the-solo-width)):
+  4,096 in a 16 GiB budget less 1 GiB, which takes the KV pool from 386,048
+  tokens to 302,912.
   It names no model: a start with no artifact takes the catalog's 16 GB entry
   of the default id.
 - `rtx-24gb` is the 24 GB class (RTX 3090, RTX 4090): the 5090 profile's

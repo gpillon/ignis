@@ -925,8 +925,9 @@ impl ConcreteScheduler {
     /// time the one that started at `began` took -- unless it was every
     /// request's last, when the next chunk is a newcomer's and the hold ends.
     /// Nor after a chunk at the solo width (GitHub #489): no lane was decoding
-    /// while it ran, so no lane is owed a share of it, and one dealt at its
-    /// end, or restored, would otherwise wait a share of the wider chunk.
+    /// while it ran, so none is owed a share of its time. A lane dealt at its
+    /// end, or restored, takes its share of the narrow chunks that follow; the
+    /// prompt is not held a share of the wider one.
     fn hold_prefill(&mut self, began: Instant, last_chunk: bool, solo: bool) {
         let share = self.config.decode_share;
         if last_chunk || solo {

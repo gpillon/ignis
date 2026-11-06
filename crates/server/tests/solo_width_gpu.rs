@@ -12,8 +12,14 @@
 //! line, `GET /v1/models` and the request log say the width (`GET /v1/config`
 //! keeping `auto` is `config_http.rs`'s, on the CPU).
 //!
+//! `rtx-16gb` on an RTX 40 card (16 GiB, 8.9) is the other built-in profile
+//! the ladder runs under: the same entry and routes inside the 16 GiB budget
+//! less 1 GiB the profile's 8.x note was measured in, its 262,144 tokens on
+//! two lanes kept.
+//!
 //! Its own test binary: the request log is written on the engine's telemetry
-//! task, so the capture is the process's global subscriber.
+//! task, so the capture is the process's global subscriber, installed once
+//! for both tests, each reading what its own load logged.
 //!
 //! Explicit GPU profile (ADR 0006): outside `IGNIS_GPU_PROFILE=1` a missing
 //! artifact or GPU is a skip; under it, a failure.
@@ -47,6 +53,27 @@ const ROUTES_8X: [&str; 4] = ["--model-prefill-linear", "int8", "--model-prefill
 /// #508's pool on these routes at the 2,048-token chunk: 17,809 pages,
 /// 91,200 tokens past the context (`config::profile`'s `rtx-24gb` note).
 const POOL_AT_THE_CHUNK: u64 = 1_139_776;
+/// `rtx-16gb`'s pool on these routes at its 1,024-token chunk, 16 GiB less
+/// 1 GiB (`config::profile`'s `rtx-16gb` note).
+const POOL_16GB_AT_THE_CHUNK: u64 = 386_048;
+
+/// The process's one subscriber, installed by the first test that asks.
+fn sink() -> &'static Arc<ignis_logging::MemorySink> {
+    static SINK: std::sync::OnceLock<Arc<ignis_logging::MemorySink>> = std::sync::OnceLock::new();
+    SINK.get_or_init(|| {
+        let sink = Arc::new(ignis_logging::MemorySink::new());
+        tracing_subscriber::registry()
+            .with(ignis_logging::JsonLayer::new(sink.clone()))
+            .try_init()
+            .expect("this test binary installs the only subscriber");
+        sink
+    })
+}
+
+/// Every event logged since the sink held `start` lines.
+fn events_since(start: usize) -> Vec<serde_json::Value> {
+    sink().lines()[start..].iter().map(|line| serde_json::from_str(line).expect("json")).collect()
+}
 
 /// The GDN prefill's measurement switch set to `ours`, the route an 8.x card
 /// runs (the leaf reads it at each load). Removed on drop.
@@ -72,16 +99,33 @@ fn named<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a serde_json:
     events.iter().filter(|event| event["event_name"] == name).collect()
 }
 
-/// The start's config for `flags` on an RTX 3090, fitted to the 27B.
-fn on_an_rtx_3090(flags: &[&str]) -> ignis_server::config::Config {
+/// The start's config for `flags` on `card`, fitted to the 27B, served as the
+/// default id.
+fn on_card(card: Card, flags: &[&str]) -> ignis_server::config::Config {
     let args: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
-    let rtx3090 = Card::Read(card::rtx_3090());
     let ConfigOutcome::Config(config) =
-        ignis_server::config::resolve_on(&args, |_| None, &NoFiles, &|| rtx3090.clone()).expect("resolve")
+        ignis_server::config::resolve_on(&args, |_| None, &NoFiles, &|| card.clone()).expect("resolve")
     else {
         panic!("expected a runnable config");
     };
-    config.for_family(ModelFamily::Qwen38_27b).expect("the 27B")
+    let config = config.for_family(ModelFamily::Qwen38_27b).expect("the 27B");
+    ignis_server::config::Config { model: MODEL.to_owned(), model_named: true, ..config }
+}
+
+/// The 16 GB entry loaded through the server's own path under `options`, and
+/// the sink's length before it; `None` where the profile allows a skip.
+fn load(options: &ignis_server::config::Config, what: &str) -> Option<(ignis_server::ActiveModel, usize)> {
+    if !Path::new(TRELLIS).exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {TRELLIS}")) {
+        return None;
+    }
+    let start = sink().lines().len();
+    match ignis_server::load::prepare_model(options, Path::new(TRELLIS)).and_then(ignis_server::load::load_model) {
+        Ok(loaded) => Some((loaded.model, start)),
+        Err(e) => {
+            gpu_profile::skip_or_fail(&format!("load the 16 GB artifact {what}: {e}"));
+            None
+        }
+    }
 }
 
 async fn get(app: &axum::Router, uri: &str) -> serde_json::Value {
@@ -118,37 +162,18 @@ async fn complete(app: &axum::Router, prompt: &str, max_tokens: u32) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn rtx_24gb_on_an_rtx_30_card_widens_its_solo_chunk_and_keeps_its_context() {
-    if !Path::new(TRELLIS).exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {TRELLIS}")) {
-        return;
-    }
     let _switch = OurGdnPrefill::set();
-    let sink = Arc::new(ignis_logging::MemorySink::new());
-    tracing_subscriber::registry()
-        .with(ignis_logging::JsonLayer::new(sink.clone()))
-        .try_init()
-        .expect("this test binary installs the only subscriber");
-    let events = || -> Vec<serde_json::Value> {
-        sink.lines().iter().map(|line| serde_json::from_str(line).expect("json")).collect()
-    };
-
     let flags = [
         &["--profile", "rtx-24gb", "--vram-budget-bytes", "25769803776", "--model-idle-unload", "0", "--model-loop-guard", "off"][..],
         &ROUTES_8X[..],
     ]
     .concat();
-    let options = ignis_server::config::Config { model: MODEL.to_owned(), model_named: true, ..on_an_rtx_3090(&flags) };
+    let options = on_card(Card::Read(card::rtx_3090()), &flags);
     assert_eq!(options.prefill_chunk, 2048);
     assert_eq!(options.prefill_chunk_solo, ignis_server::config::SoloWidth::Auto, "no profile names one");
     let slots = ignis_server::config::profile::RTX_24GB_RETAINED_DEVICE_SLOTS;
-    let loaded = match ignis_server::load::prepare_model(&options, Path::new(TRELLIS)).and_then(ignis_server::load::load_model)
-    {
-        Ok(loaded) => loaded,
-        Err(e) => {
-            gpu_profile::skip_or_fail(&format!("load the 16 GB artifact under rtx-24gb in 24 GiB: {e}"));
-            return;
-        }
-    };
-    let model = loaded.model;
+    let Some((model, start)) = load(&options, "under rtx-24gb in 24 GiB") else { return };
+    let events = || events_since(start);
     let logged = events();
 
     let plan = named(&logged, "ignis.runtime.vram_plan");
@@ -191,11 +216,67 @@ async fn rtx_24gb_on_an_rtx_30_card_widens_its_solo_chunk_and_keeps_its_context(
     let answer = complete(&app, &prompt, 8).await;
     println!("answer: {answer:?}");
     assert!(!answer.trim().is_empty());
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let admitted = named(&events(), "ignis.request.admitted").last().map(|event| event["attributes"].clone()).expect("admitted");
+    // The request log is written on the engine's telemetry task: poll until
+    // the `admitted` line carries both counts this test reads.
+    let mut admitted = serde_json::Value::Null;
+    for _ in 0..100 {
+        if let Some(line) = named(&events(), "ignis.request.admitted").last().map(|event| event["attributes"].clone())
+            && line["prefill_chunks_consumed"].is_u64()
+            && line["prefill_chunks_solo"].is_u64()
+        {
+            admitted = line;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     println!("admitted: {admitted}");
     let consumed = admitted["prefill_chunks_consumed"].as_u64().unwrap();
     assert!(consumed >= 2, "past one solo chunk: {admitted}");
     assert_eq!(admitted["prefill_chunks_solo"].as_u64(), Some(consumed), "nothing decoded beside it: {admitted}");
+    tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
+}
+
+/// `rtx-16gb` on an RTX 4080: the ladder runs on an RTX 40 card of the 16 GB
+/// class too, and keeps a width only where the profile's 262,144 tokens on
+/// two lanes stay, nothing adapted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn rtx_16gb_on_an_rtx_40_card_keeps_its_context_and_lanes_under_its_solo_width() {
+    let _switch = OurGdnPrefill::set();
+    let budget = (17_179_869_184u64 - (1 << 30)).to_string();
+    let flags = [
+        &["--profile", "rtx-16gb", "--vram-budget-bytes", budget.as_str(), "--model-idle-unload", "0", "--model-loop-guard", "off"][..],
+        &ROUTES_8X[..],
+    ]
+    .concat();
+    let options = on_card(Card::Read(card::card(16, "NVIDIA GeForce RTX 4080", 8, 9)), &flags);
+    assert_eq!(options.prefill_chunk, 1024);
+    let Some((model, start)) = load(&options, "under rtx-16gb in 16 GiB less 1 GiB") else { return };
+    let logged = events_since(start);
+    let plan = named(&logged, "ignis.runtime.vram_plan");
+    assert_eq!(plan.len(), 1, "{logged:?}");
+    println!("vram_plan: {}", plan[0]);
+    let lines = &plan[0]["attributes"];
+    assert_eq!(lines["adapted"], "", "nothing adapted for the solo width");
+    let pool = lines["kv_pool_tokens"].as_u64().unwrap();
+    let solo = named(&logged, "ignis.runtime.prefill_chunk_solo");
+    assert_eq!(solo.len(), 1, "{logged:?}");
+    println!("prefill_chunk_solo: {}", solo[0]);
+    let width = solo[0]["attributes"]["width"].as_u64().unwrap();
+    println!(
+        "solo width {width}: kv pool {pool} tokens, {} past the context, {} fewer than at the chunk; workspace {}",
+        pool.saturating_sub(262_144),
+        POOL_16GB_AT_THE_CHUNK.saturating_sub(pool),
+        lines["workspace_bytes"]
+    );
+    // Measured 2026-11-06: 4,096, with a pool of 302,912 tokens, 40,768 past
+    // the context, 83,136 fewer than at the chunk: less than the 65,536-token
+    // spare reservation an adapted context keeps for a second request.
+    assert_eq!(width, 4096, "the widest of the 8.x ladder the plan holds as the profile asks");
+    assert!(pool >= 262_144 + 4 * 64, "the whole context and the slots' tail pages: {pool}");
+    let load = named(&logged, "ignis.model.loaded");
+    assert_eq!(load[0]["attributes"]["max_context"], 262_144);
+    assert_eq!(load[0]["attributes"]["decode_lanes"], 2);
+    assert_eq!(load[0]["attributes"]["prefill_chunk_solo"], width);
     tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
 }

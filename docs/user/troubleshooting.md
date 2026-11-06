@@ -150,6 +150,13 @@ solo width, or leave it `auto`
 Below a chunk a profile gave, it is not refused: it is that chunk, and the load
 line says so (`prefill_chunk_solo 4096 -> 8192 (= prefill_chunk)`).
 
+### `` `--model-prefill-chunk-solo …` exceeds `--model-max-context …` ``
+
+A chunk is never wider than one sequence, so a solo width past the context is
+refused. Name one at most `--model-max-context`, or leave it `auto`, which
+never tries a width past the context
+([the solo width](configuration/context-and-speculation.md#the-solo-width)).
+
 ### Flash-Next refuses the start because the expert cache is below 12 GiB
 
 Below 12 GiB the expert cache refuses the start, because decode slows sharply

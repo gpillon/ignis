@@ -257,7 +257,9 @@ pub const NONE_PROFILE: &str = "none";
 /// spec #503 add the dense prefill's 89 MB buffer and take less prefill
 /// scratch: on the 5090 at a 16 GB budget less 1 GiB (2026-11-05) they left the
 /// KV pool 6,656 tokens smaller, 386,048 against 392,704, and the context
-/// loaded with nothing adapted.
+/// loaded with nothing adapted. There `auto`'s solo width (GitHub #489) is
+/// 4,096, with nothing adapted: the pool falls to 302,912 tokens, 40,768 past
+/// the context (2026-11-06, an RTX 4080 as the card read).
 ///
 /// `rtx-24gb` is the 24 GB class (GitHub #480, spec #474): the RTX 3090 and
 /// RTX 4090, the cards `--profile auto` finds from 20 GiB up to 28 GiB. It

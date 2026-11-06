@@ -233,7 +233,7 @@ pub fn contexts(from: u32, context_step: u32) -> Vec<u32> {
 
 /// The solo widths a 27B load tries before any adaptation (GitHub #489).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SoloWidths {
+pub enum SoloCandidates {
     /// `auto`: these widths, widest first, each kept only if the plan fits
     /// it at the start's values; then the prefill chunk. Empty where the
     /// card's ladder is ([`crate::config::arch::solo_ladder`]).
@@ -250,13 +250,13 @@ pub enum SoloWidths {
 /// context and the lanes. Any other refusal of a named width is the start's.
 pub fn adapt_solo<T, E>(
     start: Attempt,
-    solo: &SoloWidths,
+    solo: &SoloCandidates,
     adaptable: Adaptable,
     ladder: Ladder,
     mut plan: impl FnMut(Attempt) -> Result<Planned<T>, E>,
 ) -> Result<Adapted<T>, AdaptError<E>> {
     let named = match solo {
-        SoloWidths::Auto(widths) => {
+        SoloCandidates::Auto(widths) => {
             for &width in widths.iter().filter(|&&width| width > start.prefill_chunk_solo) {
                 let attempt = Attempt { prefill_chunk_solo: width, ..start };
                 if let Planned::Fits { plan, .. } = plan(attempt).map_err(AdaptError::Failed)? {
@@ -265,8 +265,8 @@ pub fn adapt_solo<T, E>(
             }
             return adapt(start, adaptable, ladder, plan);
         }
-        &SoloWidths::Named(width) if width > start.prefill_chunk_solo => width,
-        SoloWidths::Named(_) => return adapt(start, adaptable, ladder, plan),
+        &SoloCandidates::Named(width) if width > start.prefill_chunk_solo => width,
+        SoloCandidates::Named(_) => return adapt(start, adaptable, ladder, plan),
     };
     let attempt = Attempt { prefill_chunk_solo: named, ..start };
     match plan(attempt).map_err(AdaptError::Failed)? {
@@ -483,7 +483,7 @@ mod tests {
         fn adapt_solo(
             &self,
             start: Attempt,
-            solo: &SoloWidths,
+            solo: &SoloCandidates,
             adaptable: Adaptable,
         ) -> (Result<Adapted<VramPlan>, AdaptError<Infallible>>, Vec<Attempt>) {
             let mut attempts = Vec::new();
@@ -516,8 +516,8 @@ mod tests {
     }
 
     /// The `auto` ladder of an RTX 30 or RTX 40 card.
-    fn auto_8x() -> SoloWidths {
-        SoloWidths::Auto(vec![8192, 4096])
+    fn auto_8x() -> SoloCandidates {
+        SoloCandidates::Auto(vec![8192, 4096])
     }
 
     /// The budget at which the 24 GB class's start just holds its whole
@@ -575,7 +575,7 @@ mod tests {
     fn an_empty_ladder_plans_the_prefill_chunk_alone() {
         let start = values(1_048_576, 8);
         let card = RTX5090.with_budget(rtx24_holding(start, 8192));
-        for solo in [SoloWidths::Auto(Vec::new()), SoloWidths::Auto(vec![CHUNK, 1024]), SoloWidths::Named(CHUNK)] {
+        for solo in [SoloCandidates::Auto(Vec::new()), SoloCandidates::Auto(vec![CHUNK, 1024]), SoloCandidates::Named(CHUNK)] {
             let (result, attempts) = card.adapt_solo(start, &solo, Adaptable::ALL);
             assert_eq!(kept(result).attempt, start, "{solo:?}");
             assert_eq!(attempts, [start], "{solo:?}");
@@ -588,7 +588,7 @@ mod tests {
     #[test]
     fn a_named_solo_width_is_dropped_to_the_prefill_chunk_as_the_first_step() {
         let start = values(1_048_576, 8);
-        let named = SoloWidths::Named(8192);
+        let named = SoloCandidates::Named(8192);
         let card = RTX5090.with_budget(rtx24_holding(start, 8192));
         assert_eq!(kept(card.adapt_solo(start, &named, Adaptable::NONE).0).attempt, solo_at(start, 8192));
 
@@ -611,7 +611,7 @@ mod tests {
     fn a_refused_start_names_the_solo_drop_it_tried_first() {
         let start = values(1_048_576, 8);
         let card = RTX5090.with_budget(rtx24_holding(start, CHUNK) - 1);
-        let refusal = refused(card.adapt_solo(start, &SoloWidths::Named(8192), Adaptable::NONE).0);
+        let refusal = refused(card.adapt_solo(start, &SoloCandidates::Named(8192), Adaptable::NONE).0);
         assert_eq!(refusal.tried, [Tried::Step(AdaptStep::PrefillChunkSolo { from: 8192, to: CHUNK })]);
         let text = refusal.to_string();
         assert!(text.ends_with("; adaptation tried, in order: prefill_chunk_solo 8192 -> 2048"), "{text}");

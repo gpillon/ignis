@@ -955,6 +955,28 @@ mod tests {
         r
     }
 
+    /// GitHub #489: a request's lane waits on every prefill chunk from the end
+    /// of its prefill until it ends -- decoding, or waiting to be dealt a lane
+    /// -- and not while it prefills, moves, is suspended, or has nothing left.
+    #[test]
+    fn a_request_is_decode_ready_from_the_end_of_its_prefill_until_it_ends() {
+        let ready = |state, progress, moving, work| {
+            let mut r = req(0, RequestClass::Agent, state);
+            r.prefill_progress = progress;
+            r.moving = moving;
+            r.remaining_work = work;
+            r.decode_ready()
+        };
+        assert!(ready(RequestState::Running, 3, false, 4), "decoding");
+        assert!(!ready(RequestState::Running, 3, false, 0), "nothing left to decode");
+        assert!(ready(RequestState::Prefilling, 3, false, 4), "prefilled, waiting for a lane");
+        assert!(!ready(RequestState::Prefilling, 2, false, 4), "still prefilling");
+        assert!(!ready(RequestState::Prefilling, 3, true, 4), "prefilled but moving");
+        assert!(!ready(RequestState::Evicted, 3, false, 4), "suspended");
+        assert!(!ready(RequestState::Admitted, 0, false, 4), "queued");
+        assert!(!ready(RequestState::Done, 3, false, 0), "ended");
+    }
+
     #[test]
     fn lifecycle_is_a_strict_pipeline() {
         let mut r = req(0, RequestClass::Agent, RequestState::Admitted);

@@ -329,10 +329,10 @@ impl EngineShape {
     /// The solo widths a load of `family` tries before adapting (GitHub
     /// #489, ADR 0063 §3 as amended): `auto`'s, the card's ladder above the
     /// prefill chunk and within the context; or the width named.
-    pub fn solo_widths(&self, family: ignis_core::compute::ModelFamily) -> crate::adaptation::SoloWidths {
+    pub fn solo_widths(&self, family: ignis_core::compute::ModelFamily) -> crate::adaptation::SoloCandidates {
         match self.prefill_chunk_solo {
-            crate::config::SoloWidth::Tokens(tokens) => crate::adaptation::SoloWidths::Named(tokens),
-            crate::config::SoloWidth::Auto => crate::adaptation::SoloWidths::Auto(
+            crate::config::SoloWidth::Tokens(tokens) => crate::adaptation::SoloCandidates::Named(tokens),
+            crate::config::SoloWidth::Auto => crate::adaptation::SoloCandidates::Auto(
                 crate::config::arch::solo_ladder(family, self.gpu_generation)
                     .iter()
                     .copied()
@@ -2142,7 +2142,7 @@ mod tests {
     /// named width is tried as named.
     #[test]
     fn the_solo_widths_follow_the_card_the_chunk_and_the_context() {
-        use crate::adaptation::SoloWidths;
+        use crate::adaptation::SoloCandidates;
         use crate::config::SoloWidth::{Auto, Tokens};
         use crate::config::arch::GpuGeneration::{Ada, Ampere, Blackwell};
         let shape = |generation, chunk, context| EngineShape {
@@ -2153,16 +2153,16 @@ mod tests {
         };
         use ignis_core::compute::ModelFamily;
         let qwen = ModelFamily::Qwen38_27b;
-        assert_eq!(shape(Some(Ampere), 2048, 1_048_576).solo_widths(qwen), SoloWidths::Auto(vec![8192, 4096]));
-        assert_eq!(shape(Some(Ada), 4096, 1_048_576).solo_widths(qwen), SoloWidths::Auto(vec![8192]), "above the chunk only");
-        assert_eq!(shape(Some(Ampere), 16_384, 1_048_576).solo_widths(qwen), SoloWidths::Auto(vec![]), "a chunk wider than the ladder");
-        assert_eq!(shape(Some(Ampere), 2048, 6144).solo_widths(qwen), SoloWidths::Auto(vec![4096]), "within the context");
-        assert_eq!(shape(Some(Blackwell), 2048, 1_048_576).solo_widths(qwen), SoloWidths::Auto(vec![]));
-        assert_eq!(shape(None, 2048, 1_048_576).solo_widths(qwen), SoloWidths::Auto(vec![]));
-        assert_eq!(shape(Some(Ampere), 2048, 1_048_576).solo_widths(ModelFamily::FlashNext), SoloWidths::Auto(vec![]));
+        assert_eq!(shape(Some(Ampere), 2048, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![8192, 4096]));
+        assert_eq!(shape(Some(Ada), 4096, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![8192]), "above the chunk only");
+        assert_eq!(shape(Some(Ampere), 16_384, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![]), "a chunk wider than the ladder");
+        assert_eq!(shape(Some(Ampere), 2048, 6144).solo_widths(qwen), SoloCandidates::Auto(vec![4096]), "within the context");
+        assert_eq!(shape(Some(Blackwell), 2048, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![]));
+        assert_eq!(shape(None, 2048, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![]));
+        assert_eq!(shape(Some(Ampere), 2048, 1_048_576).solo_widths(ModelFamily::FlashNext), SoloCandidates::Auto(vec![]));
         let named = EngineShape { prefill_chunk_solo: Tokens(8192), ..shape(Some(Blackwell), 2048, 1_048_576) };
-        assert_eq!(named.solo_widths(qwen), SoloWidths::Named(8192));
-        assert_eq!(named.solo_widths(ModelFamily::FlashNext), SoloWidths::Named(8192));
+        assert_eq!(named.solo_widths(qwen), SoloCandidates::Named(8192));
+        assert_eq!(named.solo_widths(ModelFamily::FlashNext), SoloCandidates::Named(8192));
         assert_eq!(EngineShape { prefill_chunk_solo: Auto, ..named }.solo_width(), 2048);
         assert_eq!(named.solo_width(), 8192);
     }
