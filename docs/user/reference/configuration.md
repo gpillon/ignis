@@ -307,7 +307,22 @@ How the 27B holds its nine BF16 exception tensors on the device (GitHub #341): `
 | Per model | `--qwen38-model-prefill-chunk`, `--qwen38flashnext-model-prefill-chunk` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The prefill chunk width, in tokens.
+The prefill chunk width, in tokens, while a lane is decoding.
+
+### `model.prefill_chunk_solo`
+
+| | |
+|---|---|
+| Flag | `--model-prefill-chunk-solo` |
+| Env var | `IGNIS_MODEL_PREFILL_CHUNK_SOLO` |
+| Kind | `tokens\|auto` |
+| Default | `auto` |
+| Rule | nonzero multiple of 128 |
+| Models | all |
+| Per model | `--qwen38-model-prefill-chunk-solo`, `--qwen38flashnext-model-prefill-chunk-solo` |
+| `/v1/config` | shown by `GET`, patchable, with a model reload |
+
+The prefill chunk width, in tokens, while no lane is decoding (the solo width), its prefill scratch planned at load. `auto` is the widest of 8192, 4096 and 2048 above `prefill_chunk` that the VRAM plan holds with nothing else adapted and, at more than one lane, `vram.adapt_spare_tokens` left beside the context, for the 27B on an RTX 30 or RTX 40 card; otherwise `prefill_chunk`. A width below `prefill_chunk` is `prefill_chunk`, and refused when both are named.
 
 ### `model.decode_share`
 

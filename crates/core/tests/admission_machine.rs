@@ -75,6 +75,7 @@ fn small_pool() -> SchedulerConfig {
         // for its donors instead of being admitted via a lane eviction.
         host_capacity_bytes: 0,
         serving_chunk_tokens: ignis_core::DEFAULT_SERVING_CHUNK_TOKENS,
+        solo_chunk_tokens: None,
         decode_share: 0.0,
         prompt_reuse: true,
         opener_page_rides_capture: false,
@@ -452,6 +453,7 @@ fn admission_capacity_is_built_from_the_leaf_verified_kv_pool_and_never_dispatch
             resident_slot_capacity: 16,
             host_capacity_bytes: 0,
             serving_chunk_tokens: ignis_core::DEFAULT_SERVING_CHUNK_TOKENS,
+            solo_chunk_tokens: None,
             decode_share: 0.0,
             prompt_reuse: true,
             opener_page_rides_capture: false,

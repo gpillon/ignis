@@ -10,7 +10,9 @@
 //!    `serving_chunk_tokens` tokens per request, so a long prompt costs the
 //!    decode lanes one chunk of latency instead of the whole span (a 32K
 //!    prompt no longer inserts a multi-second gap into every other lane's
-//!    token stream). Several **queued** requests may still share that one
+//!    token stream). While no lane is decode-ready the chunk is the wider
+//!    `solo_chunk_tokens` instead (GitHub #489), chosen anew every advance.
+//!    Several **queued** requests may still share that one
 //!    call — up to `max_prefill_batch` of them, `PrefillJob`s batched
 //!    together — but only while each finishes within its own single chunk;
 //!    the moment one of them would need more than one chunk, the batch stops
@@ -217,10 +219,19 @@ pub struct SchedulerConfig {
     /// chunk of latency instead of the whole span. Must be `<=` the width
     /// the program scratch was reserved for at model load (P2-01 / #83) —
     /// resolve against that bound with [`resolve_serving_chunk_tokens`]
-    /// before constructing this config; a real load should default this to
-    /// the load width. No adaptive policy: fixed for the scheduler's
-    /// lifetime.
+    /// before constructing this config. It is the width while at least one
+    /// lane is decode-ready; [`SchedulerConfig::solo_chunk_tokens`] is the
+    /// one while none is.
     pub serving_chunk_tokens: u32,
+    /// The **solo width** (GitHub #489, ADR 0018 as amended): the prefill
+    /// chunk while no lane is decode-ready, so nobody waits for it. A lane is
+    /// decode-ready from the end of its request's prefill until the request
+    /// ends, holding a lane or waiting for one; a suspended one is not. The
+    /// scheduler picks between the two widths at every chunk boundary. At
+    /// least `serving_chunk_tokens`, and within the width the load reserved
+    /// its prefill scratch for, which is the wider of the two. `None`: every
+    /// chunk is `serving_chunk_tokens` wide.
+    pub solo_chunk_tokens: Option<u32>,
     /// The **decode share** (GitHub #306): the part of the model's time the
     /// decoding lanes keep while a prompt prefills. After a chunk that took
     /// `t`, the next chunk waits until they have decoded for
@@ -481,6 +492,9 @@ impl Default for SchedulerConfig {
             // byte flag rather than this default.
             host_capacity_bytes: (N_DECODE_LANES * (8192 / 16)) as u64,
             serving_chunk_tokens: DEFAULT_SERVING_CHUNK_TOKENS,
+            // A test that narrows the chunk to drive several of them is not
+            // widened behind its back.
+            solo_chunk_tokens: None,
             decode_share: 0.0,
             // GitHub #186: on by default (ADR 0029), with a slot per lane -- a
             // fixed test default, not the server's (`--reuse-retained-device` and
@@ -771,6 +785,12 @@ impl ConcreteScheduler {
             "the serving prefill chunk width must be non-zero"
         );
         assert!(
+            config.solo_chunk_tokens.is_none_or(|solo| solo >= config.serving_chunk_tokens),
+            "the solo width ({:?}) must be at least the prefill chunk ({})",
+            config.solo_chunk_tokens,
+            config.serving_chunk_tokens
+        );
+        assert!(
             (0.0..1.0).contains(&config.decode_share),
             "the decode share must be in [0, 1), got {}",
             config.decode_share
@@ -904,9 +924,13 @@ impl ConcreteScheduler {
     /// GitHub #306: hold the next prefill chunk for the decode share of the
     /// time the one that started at `began` took -- unless it was every
     /// request's last, when the next chunk is a newcomer's and the hold ends.
-    fn hold_prefill(&mut self, began: Instant, last_chunk: bool) {
+    /// Nor after a chunk at the solo width (GitHub #489): no lane was decoding
+    /// while it ran, so none is owed a share of its time. A lane dealt at its
+    /// end, or restored, takes its share of the narrow chunks that follow; the
+    /// prompt is not held a share of the wider one.
+    fn hold_prefill(&mut self, began: Instant, last_chunk: bool, solo: bool) {
         let share = self.config.decode_share;
-        if last_chunk {
+        if last_chunk || solo {
             self.prefill_held_until = None;
         } else if share > 0.0 {
             let now = self.now();
@@ -923,6 +947,19 @@ impl ConcreteScheduler {
                 .requests
                 .iter()
                 .any(|r| r.state == RequestState::Running && r.remaining_work > 0)
+    }
+
+    /// The prefill chunk width of this advance (GitHub #489, ADR 0018 as
+    /// amended): the solo width while no lane is decode-ready, the prefill
+    /// chunk while one is. Decided once per advance, before the batch is
+    /// built, so the cut and the jobs agree even when admission evicts a
+    /// lane in between.
+    fn chunk_width(&self) -> u32 {
+        let narrow = self.config.serving_chunk_tokens;
+        match self.config.solo_chunk_tokens {
+            Some(solo) if solo > narrow && !self.requests.iter().any(Request::decode_ready) => solo,
+            _ => narrow,
+        }
     }
 
     /// The KV-RAM tier, for observation.
@@ -4431,6 +4468,10 @@ impl Scheduler for ConcreteScheduler {
         // rest queue). Otherwise the batch is built fresh from the
         // `Admitted` queue, same as before chunking existed.
         // GitHub #306: no chunk at all while the decode share holds it.
+        // GitHub #489: this tick's width, the solo width while no lane is
+        // decode-ready, decided before anything below can move a lane.
+        let width = self.chunk_width();
+        let solo = width > self.config.serving_chunk_tokens;
         let held = self.prefill_held();
         let active = self
             .requests
@@ -4639,7 +4680,7 @@ impl Scheduler for ConcreteScheduler {
                 // short of the serving width.
                 if let Some(cut) = b.iter().position(|&i| {
                     let r = &self.requests[i];
-                    chunk_take(r, self.config.serving_chunk_tokens)
+                    chunk_take(r, width)
                         < r.input.tokens.len() as u32 - r.prefill_progress
                 }) {
                     b.truncate(cut + 1);
@@ -4827,7 +4868,7 @@ impl Scheduler for ConcreteScheduler {
                     // The `take` tested is the **pre-cut** one: the cut below
                     // is computed *from* this answer, so testing the cut
                     // width would make the guard true by construction.
-                    capture_unless_held(r.prefill_progress, chunk_take(r, self.config.serving_chunk_tokens), at, || {
+                    capture_unless_held(r.prefill_progress, chunk_take(r, width), at, || {
                         let media = media_keys(&r.input);
                         let head = PromptContent::new(&r.input.tokens, &media).key_at(at);
                         self.checkpoints.holds(head)
@@ -4865,7 +4906,7 @@ impl Scheduler for ConcreteScheduler {
         for (n, &i) in batch.iter().enumerate() {
             let (request, start, take) = {
                 let r = &self.requests[i];
-                (r.id, r.prefill_progress, chunk_take(r, self.config.serving_chunk_tokens))
+                (r.id, r.prefill_progress, chunk_take(r, width))
             };
             let publish_at = publish_points[n];
             if lands_on(start, take, publish_at) {
@@ -4907,7 +4948,7 @@ impl Scheduler for ConcreteScheduler {
                 }
             }
         }
-        // Each job carries at most `serving_chunk_tokens` tokens starting
+        // Each job carries at most `width` tokens starting
         // at the request's own prefill progress (0 for a fresh request
         // with no shared prefix, `shared_prefix_tokens` for a claimant,
         // or wherever an earlier chunk left off for a continuing request).
@@ -4933,7 +4974,7 @@ impl Scheduler for ConcreteScheduler {
                 // that actually takes the checkpoint.
                 let take = cut_at(
                     start,
-                    cut_at(start, chunk_take(r, self.config.serving_chunk_tokens), publish_points[n]),
+                    cut_at(start, chunk_take(r, width), publish_points[n]),
                     capture_points[n],
                 );
                 let (publish_prefix, capture_checkpoint) = places[n];
@@ -5047,7 +5088,7 @@ impl Scheduler for ConcreteScheduler {
                 .iter()
                 .zip(&jobs)
                 .all(|(&i, job)| job.start_position as usize + job.tokens.len() >= self.requests[i].input.tokens.len());
-            self.hold_prefill(began, last_chunk);
+            self.hold_prefill(began, last_chunk, solo);
             match result {
                 Ok(outcomes) => {
                     // One outcome per job, in order (GitHub #192). A backend
@@ -5115,6 +5156,7 @@ impl Scheduler for ConcreteScheduler {
                             chunk_tokens: job.tokens.len() as u32,
                             prefilled_tokens: r.prefill_progress,
                             encode_micros: outcome.encode_micros,
+                            solo,
                         });
                         // core-07 — registration, driven by the job that
                         // actually published (P4-10, GitHub #126). The leaf
@@ -5753,6 +5795,10 @@ impl Scheduler for ConcreteScheduler {
     /// The cap admission holds (GitHub #336): the load's lanes.
     fn max_in_flight(&self) -> usize {
         self.config.max_in_flight
+    }
+
+    fn prefill_chunk_solo(&self) -> Option<u32> {
+        Some(self.config.solo_chunk_tokens.unwrap_or(self.config.serving_chunk_tokens))
     }
 
     fn mode(&self) -> EngineMode {

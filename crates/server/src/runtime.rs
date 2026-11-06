@@ -28,8 +28,14 @@ pub fn scheduler<L: StepLeaf>(
 /// travel together from `main` to the leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineShape {
-    /// The prefill chunk width, in tokens (a nonzero multiple of 128).
+    /// The prefill chunk width, in tokens (a nonzero multiple of 128): the
+    /// one while a lane is decode-ready.
     pub prefill_chunk: u32,
+    /// The solo width (`--model-prefill-chunk-solo`, GitHub #489): the
+    /// prefill chunk while no lane is decode-ready, as configured until a
+    /// 27B load resolves it ([`EngineShape::at`]); [`EngineShape::solo_width`]
+    /// is the width it stands for.
+    pub prefill_chunk_solo: crate::config::SoloWidth,
     /// The decode share, in percent (`--model-decode-share`, GitHub #306); `None`
     /// takes the family's ([`EngineShape::for_family`]), and the 27B's is 0.
     pub decode_share_percent: Option<u32>,
@@ -149,6 +155,10 @@ impl Default for EngineShape {
     fn default() -> Self {
         Self {
             prefill_chunk: ignis_runtime::DEFAULT_PREFILL_CHUNK,
+            // A shape built by hand plans one width, as before GitHub #489:
+            // `auto` resolves only where a 27B load on an RTX 30 or RTX 40
+            // card finds room for a wider one.
+            prefill_chunk_solo: crate::config::SoloWidth::Auto,
             decode_share_percent: None,
             max_context: ignis_runtime::DEFAULT_MAX_CONTEXT,
             default_max_tokens: crate::config::DEFAULT_MAX_TOKENS,
@@ -194,6 +204,7 @@ impl From<&crate::config::Config> for EngineShape {
         let gpu_generation = config.card().and_then(crate::config::profile::CardReading::generation);
         Self {
             prefill_chunk: config.prefill_chunk,
+            prefill_chunk_solo: config.prefill_chunk_solo,
             decode_share_percent: config.decode_share_percent,
             max_context: config.max_context,
             default_max_tokens: config.default_max_tokens,
@@ -292,13 +303,54 @@ impl EngineShape {
         Self { retained_host_slots: family.default_retained_host_slots(this.decode_lanes), ..this }
     }
 
+    /// The solo width this shape stands for (GitHub #489): a width it names,
+    /// else -- `auto` not resolved to a wider one -- the prefill chunk. The
+    /// prefill scratch is planned for it, the wider of the load's two widths.
+    pub fn solo_width(&self) -> u32 {
+        match self.prefill_chunk_solo {
+            crate::config::SoloWidth::Tokens(tokens) => tokens.max(self.prefill_chunk),
+            crate::config::SoloWidth::Auto => self.prefill_chunk,
+        }
+    }
+
+    /// What `ignis.runtime.prefill_chunk_solo` says of this loaded shape's
+    /// solo width (GitHub #489), configured as `configured`: `auto` and what
+    /// it resolved to -- the prefill chunk said as such -- or the width
+    /// named, and where adaptation dropped it, to what.
+    pub fn solo_text(&self, configured: crate::config::SoloWidth) -> String {
+        let width = self.solo_width();
+        let chunk = if width == self.prefill_chunk { " (= prefill_chunk)" } else { "" };
+        match configured {
+            crate::config::SoloWidth::Tokens(named) if named == width => format!("prefill_chunk_solo {named}"),
+            setting => format!("prefill_chunk_solo {setting} -> {width}{chunk}"),
+        }
+    }
+
+    /// The solo widths a load of `family` tries before adapting (GitHub
+    /// #489, ADR 0063 §3 as amended): `auto`'s, the card's ladder above the
+    /// prefill chunk and within the context; or the width named.
+    pub fn solo_widths(&self, family: ignis_core::compute::ModelFamily) -> crate::adaptation::SoloCandidates {
+        match self.prefill_chunk_solo {
+            crate::config::SoloWidth::Tokens(tokens) => crate::adaptation::SoloCandidates::Named(tokens),
+            crate::config::SoloWidth::Auto => crate::adaptation::SoloCandidates::Auto(
+                crate::config::arch::solo_ladder(family, self.gpu_generation)
+                    .iter()
+                    .copied()
+                    .filter(|&width| width > self.prefill_chunk && width <= self.max_context)
+                    .collect(),
+            ),
+        }
+    }
+
     /// The values the 27B's adaptation starts from (ADR 0063 §3): this
-    /// shape's context, its lanes and its drafter's head.
+    /// shape's context, its lanes and its drafter's head, at the prefill
+    /// chunk, above which `adaptation::adapt_solo` tries the solo widths.
     pub fn adaptation_start(&self) -> crate::adaptation::Attempt {
         crate::adaptation::Attempt {
             max_context: self.max_context,
             decode_lanes: self.decode_lanes_for(ignis_core::compute::ModelFamily::Qwen38_27b),
             draft_head: self.speculation.map(|speculation| speculation.proposal_head()),
+            prefill_chunk_solo: self.prefill_chunk,
         }
     }
 
@@ -307,8 +359,8 @@ impl EngineShape {
     /// table re-resolved for it (ADR 0057), and the vision encoder's item
     /// bound kept within the envelope at it; the lanes, and the host retained
     /// slots nobody named -- two a lane (GitHub #336), and with them the
-    /// plan's per-slot pages; the drafter's head. At its own values, the
-    /// shape itself.
+    /// plan's per-slot pages; the drafter's head; the solo width, as the
+    /// width planned (GitHub #489). At its own values, the shape itself.
     pub fn at(self, attempt: crate::adaptation::Attempt) -> Self {
         let family = ignis_core::compute::ModelFamily::Qwen38_27b;
         let mut shape = self;
@@ -333,6 +385,9 @@ impl EngineShape {
         }
         if let (Some(head), Some(speculation)) = (attempt.draft_head, self.speculation) {
             shape.speculation = Some(speculation.with_proposal_head(head));
+        }
+        if attempt.prefill_chunk_solo != self.solo_width() {
+            shape.prefill_chunk_solo = crate::config::SoloWidth::Tokens(attempt.prefill_chunk_solo);
         }
         shape
     }
@@ -460,6 +515,9 @@ fn scheduler_config_for_shape(
         kv_capacity_pages: capacity_pages,
         host_capacity_bytes: shape.host_pool_bytes,
         serving_chunk_tokens: shape.prefill_chunk,
+        // GitHub #489: the width the leaf's scratch was planned for, when it
+        // is the wider.
+        solo_chunk_tokens: (shape.solo_width() > shape.prefill_chunk).then(|| shape.solo_width()),
         decode_share: f64::from(shape.decode_share_percent.unwrap_or(0)) / 100.0,
         prompt_reuse: shape.prompt_reuse,
         opener_page_rides_capture: shape.opener_page_rides_capture,
@@ -920,7 +978,9 @@ fn leaf_config_for_shape(shape: EngineShape, kv_pool_bytes: u64) -> ignis_runtim
         kv_pool_bytes,
         // GitHub #336: the pool's slots and the model's widest round.
         slot_count: shape.decode_lanes_for(ignis_core::compute::ModelFamily::Qwen38_27b),
-        prefill_chunk_tokens: shape.prefill_chunk,
+        // GitHub #489: the scratch serves the wider width; the scheduler
+        // narrows to the prefill chunk while a lane is decode-ready.
+        prefill_chunk_tokens: shape.solo_width(),
         speculation: shape.speculation,
         vision: shape.vision,
         rope_scaling: shape.rope_scaling,
@@ -1061,7 +1121,10 @@ pub fn qwen27b_load(
     // objects are bound and uploaded only when the operator asked for them;
     // otherwise the plan is the text scope's alone, as before.
     let mut bound = Vec::new();
-    let adapted = crate::adaptation::adapt(shape.adaptation_start(), shape.adaptable, shape.adapt_ladder, |attempt| {
+    // GitHub #489: the solo width first, at the shape's values (ADR 0063 §3
+    // as amended).
+    let solo = shape.solo_widths(ignis_core::compute::ModelFamily::Qwen38_27b);
+    let adapted = crate::adaptation::adapt_solo(shape.adaptation_start(), &solo, shape.adaptable, shape.adapt_ladder, |attempt| {
         let shape = shape.at(attempt);
         let BoundScope { plan, handles, .. } = bound_scope(&reader, &mut bound, model_scope_27b(&shape))?;
         let planning = leaf_config_for_shape(shape, 0);
@@ -1105,8 +1168,15 @@ pub fn qwen27b_load(
     let (vram, reservations) = adapted.plan;
     let index = bound_index(&bound, model_scope_27b(&shape)).expect("the kept plan's scope is bound");
     let BoundScope { plan, handles, .. } = bound.swap_remove(index);
-    if shape.prefill_chunk > ignis_runtime::DEFAULT_PREFILL_CHUNK {
-        let narrow = EngineShape { prefill_chunk: ignis_runtime::DEFAULT_PREFILL_CHUNK, ..shape };
+    // Only where the scratch is the prefill chunk's: a wider solo width is
+    // one the plan held with nothing adapted, or one the operator named
+    // (GitHub #489), and narrowing the chunk alone would free nothing.
+    if shape.prefill_chunk > ignis_runtime::DEFAULT_PREFILL_CHUNK && shape.solo_width() == shape.prefill_chunk {
+        let narrow = EngineShape {
+            prefill_chunk: ignis_runtime::DEFAULT_PREFILL_CHUNK,
+            prefill_chunk_solo: crate::config::SoloWidth::Auto,
+            ..shape
+        };
         let narrow = leaf_config_for_shape(narrow, 0).plan_reservations(&reader, &plan, &handles)?;
         if let Some(bytes) = workspace_saving(reservations.reserved.workspace, narrow.reserved.workspace) {
             // hotpath-lint-allow: one line per model load.
@@ -1327,7 +1397,8 @@ fn flash_next_engine_options(
 ) -> ignis_core::flash_next::EngineOptions {
     ignis_core::flash_next::EngineOptions {
         ngram_cache,
-        prefill_chunk_tokens: shape.prefill_chunk,
+        // GitHub #489: as the 27B's, the wider of the two widths.
+        prefill_chunk_tokens: shape.solo_width(),
         max_context_tokens: shape.max_context,
         kv_format: shape.kv_format,
         decode_lanes: lanes,
@@ -1414,7 +1485,7 @@ pub(crate) fn flash_next_load(
     let pool_plan = pool_plan_at(1)?;
     let kv_arena_bytes = |pages: u32| pool_plan_at(pages).map_or(u64::MAX, |plan| plan.kv_bytes + plan.indexer_bytes);
     let cat = catalog(&plan.experts)?;
-    let max_tokens = shape.prefill_chunk.max(lanes);
+    let max_tokens = shape.solo_width().max(lanes);
     let staging_ring = prefill_staging_ring_bytes(&cat);
     let tables = residency_table_bytes(
         u64::from(cat.layers()),
@@ -2054,10 +2125,54 @@ mod tests {
         assert_eq!(config.kv_disk_capacity_bytes, 0);
     }
 
+    /// GitHub #489: the load line names the setting and the width it runs,
+    /// the prefill chunk said as such -- never "off".
+    #[test]
+    fn the_solo_width_line_names_the_setting_and_the_width() {
+        use crate::config::SoloWidth::{Auto, Tokens};
+        let at = |solo| EngineShape { prefill_chunk: 2048, prefill_chunk_solo: solo, ..EngineShape::default() };
+        assert_eq!(at(Tokens(8192)).solo_text(Auto), "prefill_chunk_solo auto -> 8192");
+        assert_eq!(at(Auto).solo_text(Auto), "prefill_chunk_solo auto -> 2048 (= prefill_chunk)");
+        assert_eq!(at(Tokens(4096)).solo_text(Tokens(4096)), "prefill_chunk_solo 4096");
+        assert_eq!(at(Tokens(2048)).solo_text(Tokens(8192)), "prefill_chunk_solo 8192 -> 2048 (= prefill_chunk)", "dropped");
+    }
+
+    /// GitHub #489: `auto`'s widths are the card's ladder above the prefill
+    /// chunk and within the context, on the 27B on Ampere and Ada alone; a
+    /// named width is tried as named.
+    #[test]
+    fn the_solo_widths_follow_the_card_the_chunk_and_the_context() {
+        use crate::adaptation::SoloCandidates;
+        use crate::config::SoloWidth::{Auto, Tokens};
+        use crate::config::arch::GpuGeneration::{Ada, Ampere, Blackwell};
+        let shape = |generation, chunk, context| EngineShape {
+            prefill_chunk: chunk,
+            max_context: context,
+            gpu_generation: generation,
+            ..EngineShape::default()
+        };
+        use ignis_core::compute::ModelFamily;
+        let qwen = ModelFamily::Qwen38_27b;
+        assert_eq!(shape(Some(Ampere), 2048, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![8192, 4096]));
+        assert_eq!(shape(Some(Ada), 1024, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![8192, 4096, 2048]));
+        assert_eq!(shape(Some(Ada), 4096, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![8192]), "above the chunk only");
+        assert_eq!(shape(Some(Ampere), 16_384, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![]), "a chunk wider than the ladder");
+        assert_eq!(shape(Some(Ampere), 2048, 6144).solo_widths(qwen), SoloCandidates::Auto(vec![4096]), "within the context");
+        assert_eq!(shape(Some(Blackwell), 2048, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![]));
+        assert_eq!(shape(None, 2048, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![]));
+        assert_eq!(shape(Some(Ampere), 2048, 1_048_576).solo_widths(ModelFamily::FlashNext), SoloCandidates::Auto(vec![]));
+        let named = EngineShape { prefill_chunk_solo: Tokens(8192), ..shape(Some(Blackwell), 2048, 1_048_576) };
+        assert_eq!(named.solo_widths(qwen), SoloCandidates::Named(8192));
+        assert_eq!(named.solo_widths(ModelFamily::FlashNext), SoloCandidates::Named(8192));
+        assert_eq!(EngineShape { prefill_chunk_solo: Auto, ..named }.solo_width(), 2048);
+        assert_eq!(named.solo_width(), 8192);
+    }
+
     #[test]
     fn the_operator_prefill_chunk_reaches_the_scheduler_config() {
         let shape = EngineShape {
             prefill_chunk: 512,
+            prefill_chunk_solo: crate::config::SoloWidth::Tokens(2048),
             decode_share_percent: Some(25),
             max_context: 65_536,
             default_max_tokens: 8_192,
@@ -2095,6 +2210,10 @@ mod tests {
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768, 8);
 
         assert_eq!(config.serving_chunk_tokens, 512);
+        // GitHub #489: and the solo width beside it.
+        assert_eq!(config.solo_chunk_tokens, Some(2048));
+        let off = EngineShape { prefill_chunk_solo: crate::config::SoloWidth::Auto, ..shape };
+        assert_eq!(scheduler_config_for_shape("m".into(), off, 64, 32_768, 8).solo_chunk_tokens, None, "auto unresolved: one width");
         // ADR 0045: and the default cap.
         assert_eq!(config.default_max_tokens, 8_192);
         // GitHub #306: and the decode share, as a fraction.
@@ -2157,8 +2276,18 @@ mod tests {
         assert_eq!(ladder, crate::adaptation::Ladder { context_step: 131_072, spare_tokens: 0 }, "the fields reach the shape");
         assert_eq!((shape.max_context, shape.rope_scaling.factor()), (917_504, 3.5));
         let start = shape.adaptation_start();
-        assert_eq!(start, Attempt { max_context: 917_504, decode_lanes: 8, draft_head: Some(ProposalHead::Full) });
+        assert_eq!(
+            start,
+            Attempt { max_context: 917_504, decode_lanes: 8, draft_head: Some(ProposalHead::Full), prefill_chunk_solo: 2048 }
+        );
         assert_eq!(shape.at(start), shape, "at its own values, itself");
+        // GitHub #489: a wider solo width planned is the shape's from then on.
+        let solo = shape.at(Attempt { prefill_chunk_solo: 8192, ..start });
+        assert_eq!((solo.prefill_chunk, solo.solo_width()), (2048, 8192));
+        assert_eq!(solo.prefill_chunk_solo, crate::config::SoloWidth::Tokens(8192));
+        let named = EngineShape { prefill_chunk_solo: crate::config::SoloWidth::Tokens(8192), ..shape };
+        assert_eq!(named.at(start).solo_width(), 2048, "a named width dropped to the prefill chunk");
+        assert_eq!(named.at(Attempt { prefill_chunk_solo: 8192, ..start }), named, "or kept");
 
         let narrower = shape.at(Attempt { max_context: 786_432, ..start });
         assert_eq!((narrower.max_context, narrower.rope_scaling.factor()), (786_432, 3.0), "auto re-resolved");

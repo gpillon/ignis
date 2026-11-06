@@ -59,6 +59,10 @@ out="$(flags MODEL=flash-next DECODE_SHARE=25)"
 has "DECODE_SHARE=25" "$out" "--model-decode-share 25"
 out="$(flags DECODE_SHARE=0)"
 has "27B DECODE_SHARE=0" "$out" "--model-decode-share 0"
+# GitHub #489: the solo width is the server's `auto` unless named.
+lacks "27B default" "$(flags)" "--model-prefill-chunk-solo"
+lacks "default" "$(flags MODEL=flash-next)" "--model-prefill-chunk-solo"
+has "PREFILL_CHUNK_SOLO=4096" "$(flags PREFILL_CHUNK_SOLO=4096)" "--model-prefill-chunk-solo 4096"
 
 # `make config` says what a Flash-Next start will get, before it loads.
 plan="$(make config CUDA=1 MODEL=flash-next 2>/dev/null | sed -n 's/^PLAN  *//p')"

@@ -620,11 +620,21 @@ fn cuda_scheduler_for(
     // The 27B's context, lanes and head are the ones its plan kept, and so
     // its rope table: what the scheduler admits and `GET /v1/models` says.
     let (scheduler, reserved, shape, adapted) = loaded?;
+    // GitHub #489: the solo width as configured and as the load resolved it.
+    tracing::info!(
+        name: "ignis.runtime.prefill_chunk_solo",
+        prefill_chunk_solo = %config.prefill_chunk_solo,
+        width = shape.solo_width(),
+        prefill_chunk = shape.prefill_chunk,
+        "{}",
+        shape.solo_text(config.prefill_chunk_solo)
+    );
     tracing::info!(
         name: "ignis.model.loaded",
         artifact = %artifact.display(),
         eos,
         prefill_chunk = shape.prefill_chunk,
+        prefill_chunk_solo = shape.solo_width(),
         max_context = shape.max_context,
         // GitHub #336: the 27B's are a load setting too.
         decode_lanes = shape.decode_lanes_for(family),
