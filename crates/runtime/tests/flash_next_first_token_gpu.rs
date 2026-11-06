@@ -26,7 +26,8 @@ const MODEL_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
 const MAX_CONTEXT: u32 = 4096;
 const PROMPT: u32 = 300;
 const GENERATED: u32 = 24;
-/// No stop id: the synthetic prompt's text runs to its cap either way.
+/// Unread: every request runs under `ignore_eos`, so the synthetic prompt's
+/// text runs to its cap either way.
 const NO_EOS: TokenId = TokenId::MAX;
 
 fn leaf(speculation: Option<FlashNextSpeculation>) -> Option<FlashNextLeaf> {
@@ -50,7 +51,7 @@ fn leaf(speculation: Option<FlashNextSpeculation>) -> Option<FlashNextLeaf> {
 /// counters. `first_with_the_prefill`: the way the scheduler serves it since
 /// #518; otherwise every round returns its anchor, as before.
 fn serve(compute: &RuntimeCompute<FlashNextLeaf>, request: RequestId, first_with_the_prefill: bool) -> (Vec<TokenId>, SpecCounters) {
-    let params = DecodeParams { max_tokens: Some(GENERATED), ..DecodeParams::default() };
+    let params = DecodeParams { max_tokens: Some(GENERATED), ignore_eos: true, ..DecodeParams::default() };
     let outcomes = compute
         .prefill_step(&[PrefillJob {
             checkpoint: None,
