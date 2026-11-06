@@ -53,7 +53,8 @@ pinned file by file, plus any an operator adds. See
 **Checkpoint.** See *Prompt checkpoint*.
 
 **Chunk.** The slice of a prompt that one prefill call processes
-(`--model-prefill-chunk`). Decode rounds run between chunks. See
+(`--model-prefill-chunk`; the *solo width* while no lane decodes). Decode
+rounds run between chunks. See
 [how ignis serves a request](../concepts/how-ignis-serves.md).
 
 **Committed run.** The tokens a verify round emits for one lane: the anchor plus
@@ -257,6 +258,11 @@ tells artifacts of one family apart. See
 **Sidecar.** The file beside an artifact (`.graft.json` or `.conversion.json`) that
 records its provenance, checked at load. See
 [models and artifacts](../concepts/models-and-artifacts.md).
+
+**Solo width.** The prefill chunk a prompt takes while no lane is decoding
+(`--model-prefill-chunk-solo`), at least the prefill chunk and planned at load
+beside it. "Solo" names the absence of decoding lanes, not of users. See
+[the solo width](../configuration/context-and-speculation.md#the-solo-width).
 
 **Speculation.** Drafting tokens ahead and verifying them in one pass, so a round
 can yield several tokens. See

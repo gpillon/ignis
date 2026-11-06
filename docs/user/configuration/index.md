@@ -73,6 +73,9 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   turns it off. The 27B prefills 2,048 tokens a chunk (`--model-prefill-chunk`):
   with vision on that costs no VRAM, and long prompts prefill ~2% faster
   ([finding](../../findings/2026-10-21-the-27b-prefill-chunk-at-2048.md)).
+  Flash-Next prefills 8,192, as `make` always started it: each of its chunks
+  streams its experts once
+  ([finding](../../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)).
 - `rtxpro6000` is the RTX PRO 6000 Blackwell series (Workstation, Max-Q,
   Server Edition, 96 GB each), measured on a Server Edition under Linux
   ([finding](../../findings/2026-10-18-rtxpro6000-profile-measured.md)). Both
@@ -89,7 +92,9 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   262,144 tokens of context on two decode lanes, with DFlash2 at 7 draft
   tokens and the drafter's head `auto`, vision on at 4,096 tokens an image (the tower and pool in host RAM, so
   no context lost while no image is in flight), the VRAM headroom of the
-  5090's 27B (1200M) and a 1,024-token prefill chunk.
+  5090's 27B (1200M) and a 1,024-token prefill chunk, at that width with no
+  lane decoding too ([the solo width](context-and-speculation.md#the-solo-width)
+  pinned to it).
   It names no model: a start with no artifact takes the catalog's 16 GB entry
   of the default id.
 - `rtx-24gb` is the 24 GB class (RTX 3090, RTX 4090): the 5090 profile's
@@ -100,12 +105,18 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   envelope, measured on the 5090 held to a 24 GiB budget
   ([Profiles and defaults](../concepts/profiles.md#rtx-24gb)). No catalog
   entry states the 24 GB class, so the 27B is the catalog's 16 GB entry here
-  too, and the profile names no model.
+  too, and the profile names no model. The 27B's solo width is pinned to its
+  2,048-token chunk, as on the 16 GB class.
 
 **Adaptation.** A profile's values, and the built-in defaults, are what the
 27B asks for, not what it insists on: when the VRAM plan cannot hold them in
 the memory the start finds free, the load lowers them, in this order, and
-plans again after each step:
+plans again after each step. Before any of them it settles
+[the solo width](context-and-speculation.md#the-solo-width): `auto` keeps a
+wider chunk only where the plan holds it with nothing below adapted and room
+for a second request, else the prefill chunk, and a width you named falls to
+the prefill chunk as the first step (`prefill_chunk_solo 8192 -> 2048`), the
+one named value that adapts.
 
 1. the drafter's head: a `shortlist` from a profile falls to `full` (the
    shortlist is bound beside the full head and costs ~357 MB);

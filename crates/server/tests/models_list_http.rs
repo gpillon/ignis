@@ -187,7 +187,7 @@ async fn the_list_is_the_active_model_then_the_catalog_on_disk_then_the_known_mo
     for entry in &entries[1..] {
         assert_eq!(entry["active"], false, "{entry}");
         assert_eq!((entry["object"].as_str(), entry["owned_by"].as_str()), (Some("model"), Some("ignis")), "{entry}");
-        for field in ["max_model_len", "decode_lanes", "adapted"] {
+        for field in ["max_model_len", "decode_lanes", "adapted", "prefill_chunk_solo"] {
             assert!(entry.get(field).is_none(), "{field}: {entry}");
         }
         let kind = if entry["id"] == "qwen3.8-flash-next" { Some("text") } else { None };
@@ -228,10 +228,22 @@ async fn the_active_entry_says_the_lanes_it_decodes_on_and_what_its_load_adapted
     let list = get_models(&Server::from_active(model).app()).await;
     assert_eq!((&list["data"][0]["decode_lanes"], &list["data"][0]["adapted"]), (&json!(1), &json!(lanes)), "{list}");
 
-    // The image model: neither.
+    // GitHub #489: and the solo width the load runs, a number -- the prefill
+    // chunk itself where no wider one is planned.
+    assert_eq!(list["data"][0]["prefill_chunk_solo"], SchedulerConfig::default().serving_chunk_tokens, "{list}");
+    let solo = ConcreteScheduler::with_config(
+        SchedulerConfig { model: "mock-a".into(), serving_chunk_tokens: 2048, solo_chunk_tokens: Some(8192), ..SchedulerConfig::default() },
+        Arc::new(MockCompute::new()),
+    );
+    let model = ActiveModel::new(Engine::new(Box::new(solo)), Arc::new(SimpleTemplateProvider));
+    let list = get_models(&Server::from_active(model).app()).await;
+    assert_eq!(list["data"][0]["prefill_chunk_solo"], 8192, "{list}");
+
+    // The image model: none of them.
     let list = get_models(&Server::from_active(loader.model(IMAGE)).app()).await;
     assert_eq!(list["data"][0]["kind"], "image", "{list}");
     assert!(list["data"][0].get("decode_lanes").is_none() && list["data"][0].get("adapted").is_none(), "{list}");
+    assert!(list["data"][0].get("prefill_chunk_solo").is_none(), "{list}");
 }
 
 /// AC 2: with `switch.allow_implicit` off only the active model is listed,

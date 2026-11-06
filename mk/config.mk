@@ -56,6 +56,8 @@ ifeq ($(MODEL_FAMILY),flash-next)
   LANES ?= 3
   ROPE_SCALING ?=
   PREFILL_CHUNK ?= 8192
+  # No solo width of its own (GitHub #489): its `auto` is the prefill chunk.
+  PREFILL_CHUNK_SOLO ?=
   # The part of the model's time decoding lanes keep while a prompt prefills
   # (--model-decode-share, percent, 0-99). Empty = the server's: 25 on both models (0 = one decode round per chunk).
   DECODE_SHARE ?=
@@ -87,6 +89,7 @@ ifeq ($(MODEL_FAMILY),image)
   MAX_CONTEXT ?=
   KV_FORMAT ?=
   PREFILL_CHUNK ?=
+  PREFILL_CHUNK_SOLO ?=
   DECODE_SHARE ?=
   SPEC ?=
   DRAFT_TOKENS ?=
@@ -170,10 +173,15 @@ LOOP_GUARD ?=
 # off (SPEC= leaves it to the server, and the card class's profile speculates).
 # PREFILL_CHUNK is left to the server too: the card class's profile (`auto`):
 # 2048 on the 5090 (GitHub #341; free there, vision's encoder sizes the
-# arena), 1024 without it.
+# arena), 1024 without it. So is PREFILL_CHUNK_SOLO (--model-prefill-chunk-solo,
+# GitHub #489), the chunk while no lane decodes: the card class's profile, the
+# chunk itself on the 16 and 24 GB classes and on the 5090; `auto` on an RTX 30
+# or RTX 40 card no profile pins, 8192, 4096 or 2048 where the VRAM plan holds
+# it with nothing adapted and room for a second request.
 MAX_CONTEXT ?=
 KV_FORMAT ?= hq-e8-2b
 PREFILL_CHUNK ?=
+PREFILL_CHUNK_SOLO ?=
 DECODE_SHARE ?=
 REQUEST_TIMEOUT ?=
 STREAM_TIMEOUT ?=

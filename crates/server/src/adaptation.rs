@@ -11,6 +11,16 @@
 //! leaf's lines at each attempt's context, lanes and head. So every rule
 //! below is a CPU test with injected budgets.
 //!
+//! Before any of them, the **solo width** (GitHub #489, ADR 0063 §3 as
+//! amended; [`adapt_solo`]): at `auto`, each width of the card's ladder is
+//! planned at the start's values, and the first the plan fits is kept, with
+//! nothing else adapted for it and, at more than one lane, the KV pool still
+//! holding one full sequence and the spare reservation (the criterion an
+//! adapted context is kept by); otherwise the solo width is the prefill
+//! chunk and the order below runs. A width the operator named is the one
+//! explicit value that adapts: when the plan refuses it below its minimum,
+//! its drop to the prefill chunk is the first step.
+//!
 //! The order, each adaptation taken only while the plan is still refused:
 //! 1. the drafter's proposal head: a `shortlist` from the profile falls to
 //!    `full`, freeing the shortlist's ~357 MB (it is bound beside the full
@@ -47,6 +57,16 @@ pub struct Ladder {
     pub spare_tokens: u32,
 }
 
+impl Ladder {
+    /// Whether a KV pool of `kv_tokens` keeps what a kept context needs: one
+    /// full sequence of `context` tokens and, at more than one lane, the spare
+    /// reservation beside it; at one lane, where a spare reservation has no
+    /// lane to serve, the plan's own floor, which a plan that fits holds.
+    fn keeps(&self, context: u32, lanes: u32, kv_tokens: u64) -> bool {
+        lanes <= 1 || kv_tokens >= u64::from(context) + u64::from(self.spare_tokens)
+    }
+}
+
 impl Default for Ladder {
     /// The fields' defaults ([`crate::config::DEFAULT_ADAPT_CONTEXT_STEP`],
     /// [`crate::config::DEFAULT_ADAPT_SPARE_TOKENS`]).
@@ -65,6 +85,9 @@ pub struct Attempt {
     pub decode_lanes: u32,
     /// The drafter's proposal head; `None` without a drafter.
     pub draft_head: Option<ProposalHead>,
+    /// The solo width the prefill scratch is planned for (GitHub #489): the
+    /// prefill chunk, unless [`adapt_solo`] tries a wider one.
+    pub prefill_chunk_solo: u32,
 }
 
 /// Which of an [`Attempt`]'s values the operator left to the profile or the
@@ -107,6 +130,9 @@ pub enum AdaptStep {
     /// Down the ladder's `context_step` at a time, kept by `room`.
     MaxContext { from: u32, to: u32, context_step: u32, room: Room },
     DecodeLanes { from: u32, to: u32 },
+    /// A solo width the operator named, dropped to the prefill chunk (GitHub
+    /// #489).
+    PrefillChunkSolo { from: u32, to: u32 },
 }
 
 impl std::fmt::Display for AdaptStep {
@@ -125,6 +151,7 @@ impl std::fmt::Display for AdaptStep {
                 }
             }
             Self::DecodeLanes { from, to } => write!(f, "decode_lanes {from} -> {to}"),
+            Self::PrefillChunkSolo { from, to } => write!(f, "prefill_chunk_solo {from} -> {to}"),
         }
     }
 }
@@ -216,6 +243,69 @@ pub fn contexts(from: u32, context_step: u32) -> Vec<u32> {
     contexts
 }
 
+/// The solo widths a 27B load tries before any adaptation (GitHub #489).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SoloCandidates {
+    /// `auto`: these widths, widest first, each kept only if the plan fits
+    /// it at the start's values with the room an adapted context keeps;
+    /// then the prefill chunk. Empty on a card with no ladder
+    /// ([`crate::config::arch::solo_ladder`]).
+    Auto(Vec<u32>),
+    /// A width the operator or a profile named.
+    Named(u32),
+}
+
+/// [`adapt`] with the solo width first (GitHub #489, ADR 0063 §3 as
+/// amended): `start` is at the prefill chunk (its `prefill_chunk_solo`), and
+/// `solo` says what is tried above it. An `auto` width is kept where the plan
+/// fits it and, at more than one lane, its KV pool holds the start's context
+/// and `ladder`'s spare reservation; one that does not is no step and leaves
+/// no trace. A named width the plan refuses below its minimum
+/// is dropped to the prefill chunk as the first step, before the head, the
+/// context and the lanes. Any other refusal of a named width is the start's.
+pub fn adapt_solo<T, E>(
+    start: Attempt,
+    solo: &SoloCandidates,
+    adaptable: Adaptable,
+    ladder: Ladder,
+    mut plan: impl FnMut(Attempt) -> Result<Planned<T>, E>,
+) -> Result<Adapted<T>, AdaptError<E>> {
+    let named = match solo {
+        SoloCandidates::Auto(widths) => {
+            for &width in widths.iter().filter(|&&width| width > start.prefill_chunk_solo) {
+                let attempt = Attempt { prefill_chunk_solo: width, ..start };
+                match plan(attempt).map_err(AdaptError::Failed)? {
+                    Planned::Fits { plan, kv_tokens } if ladder.keeps(start.max_context, start.decode_lanes, kv_tokens) => {
+                        return Ok(Adapted { attempt, plan, steps: Vec::new() });
+                    }
+                    Planned::Fits { .. } | Planned::Unfit(_) => {}
+                }
+            }
+            return adapt(start, adaptable, ladder, plan);
+        }
+        &SoloCandidates::Named(width) if width > start.prefill_chunk_solo => width,
+        SoloCandidates::Named(_) => return adapt(start, adaptable, ladder, plan),
+    };
+    let attempt = Attempt { prefill_chunk_solo: named, ..start };
+    match plan(attempt).map_err(AdaptError::Failed)? {
+        Planned::Fits { plan, .. } => return Ok(Adapted { attempt, plan, steps: Vec::new() }),
+        Planned::Unfit(VramPlanError::BelowMinimum { .. }) => {}
+        Planned::Unfit(error) => return Err(AdaptError::Refused(StartRefusal { error, tried: Vec::new() })),
+    }
+    let step = AdaptStep::PrefillChunkSolo { from: named, to: start.prefill_chunk_solo };
+    match adapt(start, adaptable, ladder, plan) {
+        Ok(mut adapted) => {
+            adapted.steps.insert(0, step);
+            Ok(adapted)
+        }
+        Err(AdaptError::Refused(mut refusal)) => {
+            refusal.tried.insert(0, Tried::Step(step));
+            Err(AdaptError::Refused(refusal))
+        }
+        Err(failed) => Err(failed),
+    }
+}
+
 /// Plan at `start`, and when the plan refuses it below its minimum, adapt
 /// what `adaptable` allows, in the order the module doc gives, down
 /// `ladder`'s contexts and against its spare reservation, until a plan
@@ -263,9 +353,7 @@ pub fn adapt<T, E>(
         for &context in &candidates[skip..] {
             let candidate = Attempt { max_context: context, ..attempt };
             match plan(candidate)? {
-                Planned::Fits { plan, kv_tokens }
-                    if room == Room::OneLane || kv_tokens >= u64::from(context) + u64::from(ladder.spare_tokens) =>
-                {
+                Planned::Fits { plan, kv_tokens } if ladder.keeps(context, attempt.decode_lanes, kv_tokens) => {
                     if context != start.max_context {
                         steps.push(context_step(context, room));
                     }
@@ -331,6 +419,9 @@ mod tests {
         workspace: u64,
         /// What a lane costs: its state, hq window and round buffers.
         lane: u64,
+        /// The prefill chunk its workspace is planned at; a wider solo width
+        /// costs `SOLO_SCRATCH_PER_TOKEN` a token above it.
+        chunk: u32,
     }
 
     /// The 5090's 27B under `rtx5090`: its plan's lines at 8 lanes, from
@@ -340,11 +431,12 @@ mod tests {
         weights: 18_585_584_640 + 452_595_712 + 335_544_320 + 124_474_800,
         workspace: 1_508_311_552 - 4_096 * 262_144,
         lane: 196_880_384 + 35_651_648 + (4_623_344 + 82_125_920 + 152_139_488 + 78_027_552) / 8,
+        chunk: CHUNK,
     };
 
     /// A 16 GB card's 27B under `rtx-16gb`: a stand-in for the 16 GB
     /// body's weights (#338), text only.
-    const GB16: Card = Card { budget: 0, weights: 12_500_000_000, workspace: 342_290_432, lane: 268_000_000 };
+    const GB16: Card = Card { budget: 0, weights: 12_500_000_000, workspace: 342_290_432, lane: 268_000_000, chunk: CHUNK };
 
     impl Card {
         fn with_budget(self, budget: u64) -> Self {
@@ -356,6 +448,7 @@ mod tests {
             let head = if attempt.draft_head == Some(ProposalHead::Shortlist) { SHORTLIST_BYTES } else { 0 };
             self.weights + head + self.workspace + 4_096 * u64::from(attempt.max_context.min(262_144))
                 + self.lane * u64::from(attempt.decode_lanes)
+                + SOLO_SCRATCH_PER_TOKEN * u64::from(attempt.prefill_chunk_solo - self.chunk)
         }
 
         /// The budget at which `attempt` keeps its context with exactly the
@@ -404,10 +497,184 @@ mod tests {
         fn adapt(&self, start: Attempt, adaptable: Adaptable) -> (Result<Adapted<VramPlan>, AdaptError<Infallible>>, Vec<Attempt>) {
             self.adapt_with(start, adaptable, DEFAULT)
         }
+
+        /// The ladder with the solo width first (GitHub #489), at its default
+        /// fields.
+        fn adapt_solo(
+            &self,
+            start: Attempt,
+            solo: &SoloCandidates,
+            adaptable: Adaptable,
+        ) -> (Result<Adapted<VramPlan>, AdaptError<Infallible>>, Vec<Attempt>) {
+            let mut attempts = Vec::new();
+            let adapted = adapt_solo(start, solo, adaptable, DEFAULT, |attempt| {
+                attempts.push(attempt);
+                Ok::<_, Infallible>(match self.plan(attempt) {
+                    Ok(plan) => Planned::Fits { kv_tokens: plan.kv_token_capacity(), plan },
+                    Err(error) => Planned::Unfit(error),
+                })
+            });
+            (adapted, attempts)
+        }
     }
 
+    /// The prefill chunk the tests' starts take: the profiles' 2,048.
+    const CHUNK: u32 = 2048;
+
+    /// What a solo width costs the tests' cards past the prefill chunk's
+    /// scratch, a token: 8,192 takes ~0.6 GB more, about what the 24 GB
+    /// class's routes are estimated to (spec #503).
+    const SOLO_SCRATCH_PER_TOKEN: u64 = 100_000;
+
     fn values(max_context: u32, decode_lanes: u32) -> Attempt {
-        Attempt { max_context, decode_lanes, draft_head: Some(ProposalHead::Full) }
+        Attempt { max_context, decode_lanes, draft_head: Some(ProposalHead::Full), prefill_chunk_solo: CHUNK }
+    }
+
+    /// `start` with its scratch planned for `solo` tokens.
+    fn solo_at(start: Attempt, solo: u32) -> Attempt {
+        Attempt { prefill_chunk_solo: solo, ..start }
+    }
+
+    /// The `auto` ladder of an RTX 30 or RTX 40 card, above a 1,024-token
+    /// chunk as above the tests' 2,048 (the ladder is filtered to the widths
+    /// above the chunk).
+    fn auto_8x() -> SoloCandidates {
+        SoloCandidates::Auto(vec![8192, 4096, 2048])
+    }
+
+    /// The budget at which the 24 GB class's start holds its whole context
+    /// and the default spare reservation beside it, at `solo`: the room
+    /// `auto` keeps a width by.
+    fn rtx24_holding(start: Attempt, solo: u32) -> u64 {
+        RTX5090.budget_holding(solo_at(start, solo), 1_048_576 + 65_536)
+    }
+
+    /// The budget at which the 24 GB class's start just holds its whole
+    /// context and its eight lanes' retained slots' tail pages, at `solo`:
+    /// the plan's own floor, below which a start adapts.
+    fn rtx24_floor(start: Attempt, solo: u32) -> u64 {
+        RTX5090.budget_holding(solo_at(start, solo), 1_048_576 + 16 * 64)
+    }
+
+    /// GitHub #489: `auto` keeps 8,192 where the plan fits it at the
+    /// profile's values with the spare reservation: one plan, nothing
+    /// adapted, no step named.
+    #[test]
+    fn auto_keeps_the_widest_solo_width_the_plan_holds_with_nothing_adapted() {
+        let start = values(1_048_576, 8);
+        let card = RTX5090.with_budget(rtx24_holding(start, 8192));
+        let (result, attempts) = card.adapt_solo(start, &auto_8x(), Adaptable::ALL);
+        let adapted = kept(result);
+        assert_eq!((adapted.attempt, adapted.steps.as_slice()), (solo_at(start, 8192), &[][..]));
+        assert_eq!(attempts, [solo_at(start, 8192)]);
+    }
+
+    /// A byte short of 8,192's room, 4,096; a byte short of 4,096's, the
+    /// prefill chunk -- each at the full context, never a smaller context
+    /// for a wider chunk, and never named in `adapted`.
+    #[test]
+    fn auto_walks_8192_then_4096_then_the_prefill_chunk_at_the_profiles_values() {
+        let start = values(1_048_576, 8);
+        let card = RTX5090.with_budget(rtx24_holding(start, 8192) - 1);
+        let (result, attempts) = card.adapt_solo(start, &auto_8x(), Adaptable::ALL);
+        assert_eq!(kept(result).attempt, solo_at(start, 4096));
+        assert_eq!(attempts, [solo_at(start, 8192), solo_at(start, 4096)]);
+
+        let card = RTX5090.with_budget(rtx24_holding(start, 4096) - 1);
+        let (result, attempts) = card.adapt_solo(start, &auto_8x(), Adaptable::ALL);
+        let adapted = kept(result);
+        assert_eq!((adapted.attempt, adapted.steps.as_slice()), (start, &[][..]));
+        assert_eq!(attempts, [solo_at(start, 8192), solo_at(start, 4096), start]);
+    }
+
+    /// A width the plan fits whose pool keeps one sequence but not the spare
+    /// reservation beside it is passed over, as a context is (ADR 0063 §3):
+    /// the room for a second request comes before a wider chunk. At one
+    /// lane, where the reservation has no lane to serve, the plan's own
+    /// floor is enough.
+    #[test]
+    fn auto_keeps_the_spare_reservation_at_more_than_one_lane() {
+        let start = values(1_048_576, 8);
+        let card = RTX5090.with_budget(rtx24_holding(start, 4096));
+        assert!(card.plan(solo_at(start, 8192)).is_ok(), "8,192 fits, its pool short of the spare reservation");
+        let (result, attempts) = card.adapt_solo(start, &auto_8x(), Adaptable::ALL);
+        assert_eq!(kept(result).attempt, solo_at(start, 4096), "{attempts:?}");
+        let one = values(1_048_576, 1);
+        let card = RTX5090.with_budget(RTX5090.budget_holding(solo_at(one, 8192), 1_048_576 + 2 * 64));
+        assert_eq!(kept(card.adapt_solo(one, &auto_8x(), Adaptable::ALL).0).attempt, solo_at(one, 8192));
+    }
+
+    /// The ladder steps down to 2,048 where the chunk is narrower: a
+    /// 1,024-token chunk whose 4,096 leaves no spare reservation keeps 2,048.
+    #[test]
+    fn auto_steps_down_to_2048_above_a_1024_token_chunk() {
+        let start = Attempt { prefill_chunk_solo: 1024, ..values(262_144, 2) };
+        let card = Card { chunk: 1024, ..GB16 };
+        let card = card.with_budget(card.budget_holding(solo_at(start, 2048), 262_144 + 65_536));
+        let (result, attempts) = card.adapt_solo(start, &auto_8x(), Adaptable::ALL);
+        assert_eq!(kept(result).attempt, solo_at(start, 2048), "{attempts:?}");
+        assert_eq!(attempts.iter().map(|a| a.prefill_chunk_solo).collect::<Vec<_>>(), [8192, 4096, 2048]);
+    }
+
+    /// Where even the prefill chunk needs the context lowered, the context
+    /// adapts at the prefill chunk, as before the solo width existed.
+    #[test]
+    fn auto_never_trades_context_for_a_wider_chunk() {
+        let start = values(1_048_576, 8);
+        let card = RTX5090.with_budget(rtx24_floor(start, CHUNK) - 100_000_000);
+        let (result, _) = card.adapt_solo(start, &auto_8x(), Adaptable::ALL);
+        let adapted = kept(result);
+        assert_eq!(adapted.attempt.prefill_chunk_solo, CHUNK);
+        assert!(adapted.attempt.max_context < 1_048_576, "{:?}", adapted.attempt);
+        assert!(matches!(adapted.steps[..], [AdaptStep::MaxContext { .. }]), "{:?}", adapted.steps);
+    }
+
+    /// Blackwell's ladder is empty, and a width at or below the chunk is no
+    /// candidate: one plan at the prefill chunk.
+    #[test]
+    fn an_empty_ladder_plans_the_prefill_chunk_alone() {
+        let start = values(1_048_576, 8);
+        let card = RTX5090.with_budget(rtx24_holding(start, 8192));
+        for solo in [SoloCandidates::Auto(Vec::new()), SoloCandidates::Auto(vec![CHUNK, 1024]), SoloCandidates::Named(CHUNK)] {
+            let (result, attempts) = card.adapt_solo(start, &solo, Adaptable::ALL);
+            assert_eq!(kept(result).attempt, start, "{solo:?}");
+            assert_eq!(attempts, [start], "{solo:?}");
+        }
+    }
+
+    /// A named width the plan holds is kept; one it refuses below its
+    /// minimum falls to the prefill chunk first, named as the first step,
+    /// even with nothing else adaptable -- then the context adapts after it.
+    #[test]
+    fn a_named_solo_width_is_dropped_to_the_prefill_chunk_as_the_first_step() {
+        let start = values(1_048_576, 8);
+        let named = SoloCandidates::Named(8192);
+        let card = RTX5090.with_budget(rtx24_floor(start, 8192));
+        assert_eq!(kept(card.adapt_solo(start, &named, Adaptable::NONE).0).attempt, solo_at(start, 8192), "no spare reservation asked");
+
+        let card = RTX5090.with_budget(rtx24_floor(start, 8192) - 1);
+        let (result, attempts) = card.adapt_solo(start, &named, Adaptable::NONE);
+        let adapted = kept(result);
+        assert_eq!(adapted.attempt, start);
+        assert_eq!(steps_text(&adapted.steps), "prefill_chunk_solo 8192 -> 2048");
+        assert_eq!(attempts, [solo_at(start, 8192), start]);
+
+        let card = RTX5090.with_budget(rtx24_floor(start, CHUNK) - 100_000_000);
+        let adapted = kept(card.adapt_solo(start, &named, Adaptable::ALL).0);
+        let text = steps_text(&adapted.steps);
+        assert!(text.starts_with("prefill_chunk_solo 8192 -> 2048, max_context 1048576 -> "), "{text}");
+    }
+
+    /// A start that fits at no width is refused with the drop among the
+    /// adaptations tried, first.
+    #[test]
+    fn a_refused_start_names_the_solo_drop_it_tried_first() {
+        let start = values(1_048_576, 8);
+        let card = RTX5090.with_budget(rtx24_floor(start, CHUNK) - 1);
+        let refusal = refused(card.adapt_solo(start, &SoloCandidates::Named(8192), Adaptable::NONE).0);
+        assert_eq!(refusal.tried, [Tried::Step(AdaptStep::PrefillChunkSolo { from: 8192, to: CHUNK })]);
+        let text = refusal.to_string();
+        assert!(text.ends_with("; adaptation tried, in order: prefill_chunk_solo 8192 -> 2048"), "{text}");
     }
 
     fn kept(result: Result<Adapted<VramPlan>, AdaptError<Infallible>>) -> Adapted<VramPlan> {

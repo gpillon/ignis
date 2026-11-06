@@ -37,11 +37,18 @@ fn engine() -> Engine {
 /// per-phase fields gets exercised end to end, not just `Telemetry`'s own
 /// methods called directly.
 fn engine_with_chunk(chunk: u32) -> Engine {
+    engine_with_widths(chunk, None)
+}
+
+/// An engine at a `chunk`-token prefill chunk and a `solo`-token solo width
+/// (GitHub #489).
+fn engine_with_widths(chunk: u32, solo: Option<u32>) -> Engine {
     let compute = Arc::new(MockCompute::new());
     let scheduler = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: "test-model".into(),
             serving_chunk_tokens: chunk,
+            solo_chunk_tokens: solo,
             ..SchedulerConfig::default()
         },
         compute,
@@ -406,4 +413,31 @@ async fn a_chunked_prefill_reports_its_phase_summary_through_the_real_engine() {
         "a 10-token prompt at a 4-token chunk width takes 3 chunks"
     );
     assert_eq!(admitted["attributes"]["prefilled_tokens"], 10);
+    assert_eq!(admitted["attributes"]["prefill_chunks_solo"], 0, "a load with no solo width");
+}
+
+/// GitHub #489: the same prompt alone on an engine whose solo width is 8
+/// takes two chunks, both at the solo width, and the `admitted` line counts
+/// them -- and the engine reports the width (`GET /v1/models`).
+#[tokio::test]
+async fn the_admitted_line_counts_the_chunks_run_at_the_solo_width() {
+    let (log_sink, _guard) = capture_events();
+    let engine = engine_with_widths(4, Some(8));
+    assert_eq!(engine.prefill_chunk_solo(), Some(8));
+    assert_eq!(engine_with_chunk(4).prefill_chunk_solo(), Some(4), "the prefill chunk, with no wider one");
+    let (_id, mut rx) = engine
+        .submit(input((1..=10).collect(), 1), RequestClass::Interactive)
+        .await
+        .expect("submit");
+    collect_tokens(&mut rx, Duration::from_secs(5))
+        .await
+        .expect("the request completes");
+    nudge().await;
+
+    let admitted = events(&log_sink)
+        .into_iter()
+        .find(|e| e["event_name"] == "ignis.request.admitted")
+        .expect("an admitted event");
+    assert_eq!(admitted["attributes"]["prefill_chunks_consumed"], 2, "8 + 2");
+    assert_eq!(admitted["attributes"]["prefill_chunks_solo"], 2);
 }

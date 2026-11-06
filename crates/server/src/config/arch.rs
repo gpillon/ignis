@@ -566,6 +566,33 @@ pub fn opener_page_rides_capture(family: ModelFamily, generation: Option<GpuGene
     }
 }
 
+/// The solo widths an `auto` load of `family` on a card of `generation`
+/// tries, widest first (GitHub #489, ADR 0018 and ADR 0063 §3 as amended):
+/// the one decision, which [`crate::runtime::EngineShape::solo_widths`] asks.
+/// The load keeps the first its VRAM plan holds with nothing else adapted and,
+/// at more than one lane, the spare reservation left beside the context,
+/// otherwise the prefill chunk. The `rtx-16gb` and `rtx-24gb` profiles pin
+/// the width to their chunk, so the ladder runs on the 8.x cards no built-in
+/// profile pins: a 32 GB one under `rtx5090`, a larger one under none.
+///
+/// 8,192, 4,096, then 2,048 for the 27B on Ampere and Ada, where the dense
+/// prefill decodes each trellis matrix once per chunk, so a wider chunk
+/// spreads that decode over more tokens; the load tries those above its
+/// prefill chunk, widest first. None on Blackwell: a wider chunk buys the 27B at
+/// most 4% of cold TTFT there (finding 2026-10-07-27b-prefill-chunk-width),
+/// and the `rtx5090` profile's margin does not hold 4,096 (finding
+/// 2026-10-21-the-27b-prefill-chunk-at-2048). None for Flash-Next on any
+/// card: every chunk pays a near-constant expert stream, so it wants its
+/// widest chunk with lanes decoding as well (finding
+/// 2026-10-07-flash-next-prefill-chunk-and-decode-share). None with no card
+/// read.
+pub fn solo_ladder(family: ModelFamily, generation: Option<GpuGeneration>) -> &'static [u32] {
+    match (family, generation) {
+        (ModelFamily::Qwen38_27b, Some(GpuGeneration::Ampere | GpuGeneration::Ada)) => &[8192, 4096, 2048],
+        _ => &[],
+    }
+}
+
 /// The 27B's BF16 exception tensors on `card` (`--model-exception-weights`,
 /// GitHub #456): held in FP8, they prefill on the W8A8 GEMM, the sm_120a
 /// set's block-scaled FP8 MMA, so on a card that does not run it `fp8` is
@@ -876,6 +903,23 @@ mod tests {
             assert!(opener_page_rides_capture(ModelFamily::FlashNext, generation), "Flash-Next on {generation:?}");
             for family in [ModelFamily::QwenImage21, ModelFamily::Nemotron3Diarization] {
                 assert!(!opener_page_rides_capture(family, generation), "{family:?} on {generation:?}");
+            }
+        }
+    }
+
+    /// GitHub #489: `auto`'s solo ladder is 8,192, 4,096, 2,048 for the 27B
+    /// on Ampere and Ada, and empty everywhere else: Blackwell, no card
+    /// read, Flash-Next on any card, the models with no prefill chunk.
+    #[test]
+    fn the_solo_ladder_is_the_27bs_on_ampere_and_ada_only() {
+        use GpuGeneration::*;
+        assert_eq!(solo_ladder(ModelFamily::Qwen38_27b, Some(Ampere)), [8192, 4096, 2048]);
+        assert_eq!(solo_ladder(ModelFamily::Qwen38_27b, Some(Ada)), [8192, 4096, 2048]);
+        assert!(solo_ladder(ModelFamily::Qwen38_27b, Some(Blackwell)).is_empty());
+        assert!(solo_ladder(ModelFamily::Qwen38_27b, None).is_empty());
+        for generation in [Some(Ampere), Some(Ada), Some(Blackwell), None] {
+            for family in [ModelFamily::FlashNext, ModelFamily::QwenImage21, ModelFamily::Nemotron3Diarization] {
+                assert!(solo_ladder(family, generation).is_empty(), "{family:?} on {generation:?}");
             }
         }
     }

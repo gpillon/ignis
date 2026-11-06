@@ -101,6 +101,18 @@ Why each:
   decode unchanged; the cost is that a decoding lane's longest pause while a
   prompt prefills grows by about 65 percent
   ([finding](../../findings/2026-10-21-the-27b-prefill-chunk-at-2048.md)).
+  Neither Blackwell profile names a
+  [solo width](../configuration/context-and-speculation.md#the-solo-width):
+  `auto` is the prefill chunk on these cards.
+- **Flash-Next's prefill chunk.** 8,192 under `rtx5090` and `rtxpro6000`, as
+  `make` always started it: each chunk streams the experts once, so a narrower
+  one costs its TTFT nearly in proportion (2,048 took 1.86 times as long at
+  34K) and under load only halves a decoding lane's longest pause, which the
+  decode share already paces
+  ([finding](../../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)).
+  The wider scratch costs the expert cache 1.03 GiB against 1,024: from the
+  ~16.6 GiB measured at 1,024 it keeps ~15.6. `rtx-24gb` and `rtx-16gb` give
+  it 4,096 and 2,048, placeholders until Flash-Next runs on those cards.
 - **Flash-Next's context and lanes.** 589,824 is 512K plus two 32K
   allowances, the floor asked for on both the expert cache (at least 15 GiB; it
   measured about 16.6) and the context. Three lanes is Flash-Next's own default.
@@ -166,7 +178,7 @@ that entry ([Get a model](../guides/models.md)).
 | Vision | on, 4,096 tokens an image, tower and pool in host RAM |
 | Speculation | DFlash2, 7 draft tokens, the drafter's head `auto` (the full head) |
 | Decode lanes | 2 |
-| Prefill chunk | 1,024 (the default) |
+| Prefill chunk | 1,024 (the default), with no lane decoding too ([the solo width](../configuration/context-and-speculation.md#the-solo-width) pinned) |
 | VRAM headroom | 1,200 MiB |
 
 Why each:
@@ -181,7 +193,9 @@ Why each:
   [host RAM for the 27B](../configuration/host-ram.md#host-ram-for-the-27b).
 - **Two lanes.** Eight would leave no room for the context.
 - **The 1,024-token chunk.** The prefill scratch is sized by the chunk, and
-  2,048 would cost about 0.4 GB of KV pool.
+  2,048 would cost about 0.4 GB of KV pool. The solo width is pinned to it for
+  the same reason: on an RTX 40 card in a 16 GiB budget less 1 GiB, `auto`
+  would take 2,048 and the KV pool from 386,048 tokens to 352,768.
 - **The headroom** is the 5090's 27B value until a real card says otherwise
   ([measure yours](../guides/measure-a-16gb-card.md)).
 - **On a 16 GB RTX 40 card** the 27B prefills on the routes those cards run
@@ -207,7 +221,7 @@ resolves the default id `qwen3.8-27b` to that entry
 | Vision | on, tower and pool in host RAM (`vision.residency: host`) |
 | Speculation | DFlash2, 7 draft tokens |
 | Decode lanes | 8 (the default) |
-| Prefill chunk | 2,048 |
+| Prefill chunk | 2,048, with no lane decoding too ([the solo width](../configuration/context-and-speculation.md#the-solo-width) pinned) |
 | VRAM headroom | 1,200 MiB |
 | Retained slots | 2 on the device, beside the 16 in host RAM |
 
@@ -239,13 +253,21 @@ Why each:
   card's desktop holds;
   past that the load adapts
   ([when a profile does not fit](#when-a-profile-does-not-fit)).
+- **No wider chunk while no lane decodes.** The
+  [solo width](../configuration/context-and-speculation.md#the-solo-width) is
+  pinned to the 2,048-token chunk, so those 91,200 tokens stay the desktop's.
+  In the same 24 GiB simulation `auto` would have taken 4,096 for 13,312 of
+  them (8,192 does not fit); `--model-prefill-chunk-solo auto` asks for it.
 
 ## When a profile does not fit
 
 A profile's values, and the built-in defaults, are what the 27B asks for, not
 what it insists on. When the VRAM plan cannot hold them in the memory the
 start finds free, the load lowers them one at a time and plans again: the
-drafter's head first, then the context in steps, then the lanes. A value you
+drafter's head first, then the context in steps, then the lanes. A
+[solo width](../configuration/context-and-speculation.md#the-solo-width) is
+settled before any of them: `auto` takes a wider one only where nothing else
+has to give, and one you named drops to the prefill chunk first. A value you
 name yourself never adapts, and the `ignis.runtime.vram_plan` log event lists
 every step taken ([Configuration](../configuration/index.md)); so does
 `GET /v1/models`, in `adapted`, beside the context and the decode lanes the

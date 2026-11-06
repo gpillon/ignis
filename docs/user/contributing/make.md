@@ -45,7 +45,7 @@ positions to the context; `MAX_CONTEXT=524288` names a context, `yarn:2`, that
 never adapts; the gate legs ran at `MAX_CONTEXT=262144 ROPE_SCALING=none`) --
 `KV_FORMAT=hq-e8-2b`,
 `SPEC=dflash2` with
-`DRAFT_TOKENS=7`, `PREFILL_CHUNK` empty (the server's: the `rtx5090` profile's 2048), `KV_HOST_POOL_BYTES=8G` (the 27B's; Flash-Next's own arena
+`DRAFT_TOKENS=7`, `PREFILL_CHUNK` empty (the server's: the `rtx5090` profile's 2048), `PREFILL_CHUNK_SOLO` empty (the server's `auto`, [the solo width](../configuration/context-and-speculation.md#the-solo-width)), `KV_HOST_POOL_BYTES=8G` (the 27B's; Flash-Next's own arena
 is `FN_KV_HOST_POOL_BYTES=2G`, passed on every start so a switch to it gets it
 too). `REQUEST_TIMEOUT` and `STREAM_TIMEOUT` are empty: the server's 2400 s
 deadlines ([Deadlines](../api/deadlines.md)). `HOST_MARGIN_BYTES` sets Flash-Next's host

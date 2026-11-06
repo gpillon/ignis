@@ -140,6 +140,23 @@ on Flash-Next) ([VRAM budget and the KV pool](configuration/vram-and-kv-pool.md#
 [ADR 0030](../adr/0030-device-memory-reserved-at-load.md)). On a card that
 another program shares, closing that program is the other fix.
 
+### `` `--model-prefill-chunk-solo …` is narrower than `--model-prefill-chunk …` ``
+
+`--model-prefill-chunk-solo` is the chunk while no lane decodes, so it is at
+least the one while a lane does. The start is refused when you named both and
+the solo width is the narrower; the message names both spellings. Name a wider
+solo width, or leave it `auto`
+([the solo width](configuration/context-and-speculation.md#the-solo-width)).
+Below a chunk a profile gave, it is not refused: it is that chunk, and the load
+line says so (`prefill_chunk_solo 4096 -> 8192 (= prefill_chunk)`).
+
+### `` `--model-prefill-chunk-solo …` exceeds `--model-max-context …` ``
+
+A chunk is never wider than one sequence, so a solo width past the context is
+refused. Name one at most `--model-max-context`, or leave it `auto`, which
+never tries a width past the context
+([the solo width](configuration/context-and-speculation.md#the-solo-width)).
+
 ### Flash-Next refuses the start because the expert cache is below 12 GiB
 
 Below 12 GiB the expert cache refuses the start, because decode slows sharply
