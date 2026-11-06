@@ -26,7 +26,7 @@ Everything goes through one structured log on stdout, in the format
   names a `lane` only when one was dealt first. A request that ends on its
   first token (`max_tokens: 1`, an end-of-sequence token, a stop sequence
   the token completes) never takes a lane and logs no `admitted` line: its
-  `done` line carries the prefill fields instead, `prompt_tokens`,
+  `done` line names no `lane` and carries the prefill fields instead, `prompt_tokens`,
   `prefill_chunks_consumed`, `prefill_chunks_solo` and `prefilled_tokens`,
   as does a decision's.
 - A request with images says what they cost on the line it ends with,

@@ -628,7 +628,7 @@ impl Telemetry {
         let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class, reuse, budget_dropped, media) = match rt {
             Some(rt) => (
                 rt.submitted_ms,
-                rt.lane,
+                rt.admitted.then_some(rt.lane),
                 rt.itl_count,
                 rt.itl_sum_ms,
                 rt.itl_max_ms,
@@ -639,7 +639,7 @@ impl Telemetry {
             ),
             None => (
                 self.clock.now_ms(),
-                0,
+                None,
                 0,
                 0,
                 0,
@@ -1150,7 +1150,7 @@ impl Telemetry {
         ms: u64,
         n: u32,
         tok_s: f64,
-        lane: LaneId,
+        lane: Option<LaneId>,
         reason: FinishReason,
         itl_ms_mean: f64,
         itl_ms_max: u64,
@@ -1171,7 +1171,8 @@ impl Telemetry {
             name: "ignis.request.done",
             request_id = id,
             duration_ms = ms,
-            lane = lane as u64,
+            // Absent for a request never dealt a lane (#518), as on `ttft`.
+            lane = lane.map(|lane| lane as u64),
             tokens = n,
             tok_s = tok_s,
             finish_reason = finish_reason_str(reason),

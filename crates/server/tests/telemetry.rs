@@ -447,7 +447,7 @@ async fn the_admitted_line_counts_the_chunks_run_at_the_solo_width() {
 
 /// #518: a request that ends on its first token, which leaves with the
 /// prefill, is never dealt a lane and logs no `admitted` line; its `done`
-/// line carries the prefill phase's summary instead.
+/// line carries the prefill phase's summary instead, and names no lane.
 #[tokio::test]
 async fn a_request_that_ends_on_its_first_token_reports_its_prefill_on_the_done_line() {
     for (solo, chunks, at_solo) in [(None, 3, 0), (Some(8), 2, 2)] {
@@ -476,5 +476,6 @@ async fn a_request_that_ends_on_its_first_token_reports_its_prefill_on_the_done_
         assert_eq!(done["attributes"]["prefill_chunks_consumed"], chunks, "solo {solo:?}");
         assert_eq!(done["attributes"]["prefill_chunks_solo"], at_solo, "solo {solo:?}");
         assert_eq!(done["attributes"]["prefilled_tokens"], 10, "solo {solo:?}");
+        assert!(done["attributes"]["lane"].is_null(), "solo {solo:?}: it held no lane: {done}");
     }
 }
