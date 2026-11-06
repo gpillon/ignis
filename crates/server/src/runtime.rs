@@ -3188,6 +3188,7 @@ mod tests {
             _tokens: &[TokenId],
             _start_position: u32,
             _drafter_floor: u32,
+            _next_prompt_token: Option<TokenId>,
             _params: DecodeParams,
             _permitted: &[TokenId],
             _redirect: Option<&mut ignis_runtime::DrawRedirect<'_>>,

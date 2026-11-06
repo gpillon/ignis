@@ -17,6 +17,7 @@ use std::marker::PhantomData;
 
 use crate::model_load::Model;
 use crate::seq::{Seq, SeqPool, ffi::IgnisSeq};
+use crate::types::TokenId;
 use crate::vision::{Grid, VisionItemControl};
 
 pub(crate) mod ffi {
@@ -148,6 +149,10 @@ pub(crate) mod ffi {
         /// later drafter window reads. The span taps from the later of its
         /// last 2048 positions and this; 0 is that span rule alone.
         pub drafter_floor: u64,
+        /// GitHub #519: the prompt token after the span, or -1 on the
+        /// prompt's last span. With a token the leaf runs no output head and
+        /// draws nothing (Flash-Next with MTP still draws).
+        pub next_prompt_token: i32,
     }
 
     /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -712,6 +717,19 @@ impl PrefillRoute {
             ngram_rows: std::ptr::null(),
             out_reasoning_redirected: std::ptr::null_mut(),
             drafter_floor: 0,
+            next_prompt_token: -1,
+        }
+    }
+}
+
+/// The C field's value for a span's next prompt token (GitHub #519): the id,
+/// or -1 on the prompt's last span. An id past `i32` names no vocabulary
+/// entry; it is refused here rather than wrapped into one.
+fn next_prompt_token_field(what: &str, next_prompt_token: Option<TokenId>) -> Result<i32, String> {
+    match next_prompt_token {
+        None => Ok(-1),
+        Some(token) => {
+            i32::try_from(token).map_err(|_| format!("{what}: next prompt token {token} is no vocabulary id"))
         }
     }
 }
@@ -777,7 +795,7 @@ pub fn prefill_program_sampled(
     sampling: SamplingParams,
     out_logits: Option<&mut [f32]>,
 ) -> Result<(), String> {
-    prefill_program_draw(model, pool, sequence, token_ids, start_position, 0, LaneDraw::free(sampling), out_logits)
+    prefill_program_draw(model, pool, sequence, token_ids, start_position, 0, None, LaneDraw::free(sampling), out_logits)
         .map(|_| ())
 }
 
@@ -793,6 +811,12 @@ pub fn prefill_program_sampled(
 /// this, and a span wholly below it taps nothing while the drafter's
 /// frontier still moves to the span's end. 0 is the span rule alone, what
 /// every other prefill entry point passes.
+///
+/// `next_prompt_token` (GitHub #519) is the prompt token right after the
+/// span, or `None` on the prompt's last span. With a token the span draws
+/// nothing: no output head, no sample, and the sequence is left with no
+/// pending token. `draw` must then be a free one and `out_logits` `None`,
+/// which only the prompt's last span reads; the leaf refuses either.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_program_draw(
     model: &Model,
@@ -801,6 +825,7 @@ pub fn prefill_program_draw(
     token_ids: &[i32],
     start_position: u64,
     drafter_floor: u64,
+    next_prompt_token: Option<TokenId>,
     draw: LaneDraw<'_>,
     out_logits: Option<&mut [f32]>,
 ) -> Result<SpanDraw, String> {
@@ -811,6 +836,7 @@ pub fn prefill_program_draw(
         out_permitted_prob: &mut probability,
         out_reasoning_redirected: &mut redirected,
         drafter_floor,
+        next_prompt_token: next_prompt_token_field("prefill_program_draw", next_prompt_token)?,
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     let logits_ptr = match out_logits {
@@ -969,6 +995,10 @@ pub fn flash_next_ngram_token_bytes() -> usize {
 /// draw's reasoning redirect (GitHub #315). Returns the drawn token's
 /// probability within its permitted set (0 without one) and whether it was
 /// redirected.
+///
+/// `next_prompt_token` is [`prefill_program_draw`]'s (GitHub #519): with a
+/// token, a load without MTP draws nothing over the span; an MTP load still
+/// draws, as its head's entry at the span's last position reads the draw.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_flash_next(
     model: &Model,
@@ -976,6 +1006,7 @@ pub fn prefill_flash_next(
     sequence: &mut Seq<'_>,
     token_ids: &[i32],
     start_position: u64,
+    next_prompt_token: Option<TokenId>,
     sampling: SamplingParams,
     permitted: &[i32],
     redirect: Redirect<'_>,
@@ -1019,6 +1050,7 @@ pub fn prefill_flash_next(
         out_permitted_prob: &mut probability,
         ngram_rows: ngram_rows.as_ptr(),
         out_reasoning_redirected: &mut redirected,
+        next_prompt_token: next_prompt_token_field("prefill_flash_next", next_prompt_token)?,
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     let params = redirect.arm(permitted_params("prefill_flash_next", sampling, permitted)?);
@@ -1320,7 +1352,7 @@ pub fn prefill_program_permitted(
         permitted,
         ..LaneDraw::free(sampling)
     };
-    prefill_program_draw(model, pool, sequence, token_ids, start_position, 0, draw, out_logits)
+    prefill_program_draw(model, pool, sequence, token_ids, start_position, 0, None, draw, out_logits)
         .map(|drawn| drawn.probability)
 }
 
@@ -1804,7 +1836,9 @@ pub struct SpanMediaColumns<'a> {
 /// about an image starts inside its reasoning as a text one does.
 ///
 /// `drafter_floor` is [`prefill_program_draw`]'s (GitHub #506): an image's
-/// span taps the drafter's window by the same rule as a text one.
+/// span taps the drafter's window by the same rule as a text one. So is
+/// `next_prompt_token` (GitHub #519): an image's intermediate span draws
+/// nothing either.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_program_multimodal(
     model: &Model,
@@ -1813,6 +1847,7 @@ pub fn prefill_program_multimodal(
     token_ids: &[i32],
     start_position: u64,
     drafter_floor: u64,
+    next_prompt_token: Option<TokenId>,
     sampling: SamplingParams,
     permitted: &[i32],
     redirect: Redirect<'_>,
@@ -1828,6 +1863,7 @@ pub fn prefill_program_multimodal(
         token_ids,
         start_position,
         drafter_floor,
+        next_prompt_token,
         LaneDraw {
             sampling,
             permitted,
@@ -1846,7 +1882,9 @@ pub fn prefill_program_multimodal(
 ///
 /// Returns the permitted draw's probability (0 with no set) and whether it
 /// was redirected (GitHub #315), and whether the leaf could read the keys
-/// the readout names. `drafter_floor` is [`prefill_program_draw`]'s.
+/// the readout names. `drafter_floor` and `next_prompt_token` are
+/// [`prefill_program_draw`]'s: a readout is the prompt's last span's, so the
+/// leaf refuses one with a next token.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_program_attention(
     model: &Model,
@@ -1855,6 +1893,7 @@ pub fn prefill_program_attention(
     token_ids: &[i32],
     start_position: u64,
     drafter_floor: u64,
+    next_prompt_token: Option<TokenId>,
     draw: LaneDraw<'_>,
     out_logits: Option<&mut [f32]>,
     attention: AttentionReadout<'_>,
@@ -1867,6 +1906,7 @@ pub fn prefill_program_attention(
         token_ids,
         start_position,
         drafter_floor,
+        next_prompt_token,
         draw,
         None,
         out_logits,
@@ -1886,6 +1926,7 @@ fn prefill_program_reading(
     token_ids: &[i32],
     start_position: u64,
     drafter_floor: u64,
+    next_prompt_token: Option<TokenId>,
     draw: LaneDraw<'_>,
     span: Option<MultimodalPrefill<'_>>,
     out_logits: Option<&mut [f32]>,
@@ -1900,6 +1941,7 @@ fn prefill_program_reading(
         out_permitted_prob: &mut probability,
         out_reasoning_redirected: &mut redirected,
         drafter_floor,
+        next_prompt_token: next_prompt_token_field(what, next_prompt_token)?,
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     if let Some(span) = span {

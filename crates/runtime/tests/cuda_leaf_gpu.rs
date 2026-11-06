@@ -88,6 +88,7 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
             attention: None,
             reasoning_close: None,
             drafter_floor: 0,
+            next_prompt_token: None,
 }])
         .unwrap_or_else(|e| panic!("prefill_step: {e}"));
 

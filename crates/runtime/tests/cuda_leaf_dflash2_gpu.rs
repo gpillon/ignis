@@ -105,6 +105,7 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
             attention: None,
             reasoning_close: None,
             drafter_floor: 0,
+            next_prompt_token: None,
 }])
         .unwrap_or_else(|e| panic!("prefill_step: {e}"));
 

@@ -135,6 +135,7 @@ impl StepLeaf for ByteLeaf {
         tokens: &[u32],
         _start_position: u32,
         _drafter_floor: u32,
+        _next_prompt_token: Option<u32>,
         _params: DecodeParams,
         _permitted: &[u32],
         _redirect: Option<&mut ignis_runtime::DrawRedirect<'_>>,
@@ -229,6 +230,7 @@ pub fn prefill(compute: &RuntimeCompute<ByteLeaf>, request: RequestId) {
         attention: None,
         reasoning_close: None,
         drafter_floor: 0,
+        next_prompt_token: None,
     };
     compute.prefill_step(&[job]).unwrap();
 }

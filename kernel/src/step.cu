@@ -1430,13 +1430,19 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
 // committed its position advance, and this loop stops before advancing for
 // the failing one. `drafter_floor` is the call's
 // (`ignis_prefill_options::drafter_floor`, GitHub #506).
+//
+// GitHub #519: `draws` is false on a span with a next prompt token: no chunk
+// computes the output head or samples, and the span leaves the sequence with
+// no pending token (-1) rather than an earlier span's -- its draw is the
+// prompt's last span's to make.
 int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                     const int32_t *token_ids, uint64_t num_tokens,
                                     const ignis_sampling_params &sampling, float *out_logits,
                                     LinearPolicyMode mode, const SpanMultimodal &multimodal,
                                     float *permitted_prob,
                                     const ArmedAttentionReadout *attention_readout,
-                                    std::uint16_t *span_logits, uint64_t drafter_floor) {
+                                    std::uint16_t *span_logits, uint64_t drafter_floor,
+                                    bool draws) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
   ChunkProfiler::instance().begin_span(num_tokens, model->prefill_chunk_tokens);
   const uint64_t tap_from = dflash2_tap_from(seq->position, num_tokens, drafter_floor);
@@ -1447,7 +1453,7 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
     int32_t successor = -1;
     float *slot_logits = is_last_chunk ? out_logits : nullptr;
     if (run_program_chunk(model, pool, seq, token_ids + offset, chunk_len, offset, tap_from,
-                          is_last_chunk, sampling, &successor, slot_logits, mode, multimodal,
+                          is_last_chunk && draws, sampling, &successor, slot_logits, mode, multimodal,
                           is_last_chunk ? permitted_prob : nullptr,
                           is_last_chunk ? attention_readout : nullptr,
                           span_logits == nullptr
@@ -1457,6 +1463,7 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
     }
     seq->position += chunk_len;
     if (is_last_chunk) {
+      // `successor` stays -1 on a span that does not draw (GitHub #519).
       seq->pending_token = successor;
     }
     offset += chunk_len;
@@ -1602,6 +1609,15 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     set_error("ignis_program_prefill: out_span_logits needs the chunked route");
     return -1;
   }
+  // GitHub #519: a span with a next prompt token draws nothing -- no output
+  // head, no sample -- since only the prompt's last span's draw is read.
+  if (const std::string why = ignis::step::next_prompt_token_refusal(
+          static_cast<std::int32_t>(model->vocab), *sampling, options, out_logits);
+      !why.empty()) {
+    set_error("ignis_program_prefill: " + why);
+    return -1;
+  }
+  const bool draws = ignis::step::next_prompt_token(options) < 0;
   // GitHub #260 (ADR 0038): the attention readout. A negative ordinal or a
   // null score buffer asks for none. What is refused here is only what the
   // host can never mean -- a head or layer the model does not have, a span
@@ -1758,15 +1774,20 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, *sampling,
                                      out_logits, mode, multimodal, permitted_prob,
                                      arms_readout ? &attention_readout : nullptr, span_logits,
-                                     options != nullptr ? options->drafter_floor : 0);
+                                     options != nullptr ? options->drafter_floor : 0, draws);
   }
   if (rc != 0) {
     return rc;
   }
   // GitHub #315 (ADR 0048): the span's draw is the token the first round
   // emits; a stop id drawn with the reasoning block open becomes `</think>`.
-  if (redirect_span_draw(pool, seq, *sampling, model->stream,
-                         options != nullptr ? options->out_reasoning_redirected : nullptr) != 0) {
+  // GitHub #519: a span that drew nothing has nothing to redirect.
+  int32_t *redirected = options != nullptr ? options->out_reasoning_redirected : nullptr;
+  if (!draws) {
+    if (redirected != nullptr) {
+      *redirected = 0;
+    }
+  } else if (redirect_span_draw(pool, seq, *sampling, model->stream, redirected) != 0) {
     return -1;
   }
   if (multimodal.positions != nullptr) {
@@ -2858,6 +2879,37 @@ void redirect_penalty_move(const ninfer::ops::SamplingConfig &cfg, std::int32_t 
 int32_t redirect_span_draw(ignis_seq_pool *pool, ignis_seq *seq, const ignis_sampling_params &sampling,
                            cudaStream_t stream, int32_t *out_redirected) {
   return ::redirect_span_draw(pool, seq, sampling, stream, out_redirected);
+}
+
+int32_t next_prompt_token(const ignis_prefill_options *options) {
+  return options != nullptr ? options->next_prompt_token : -1;
+}
+
+std::string next_prompt_token_refusal(std::int32_t vocab, const ignis_sampling_params &sampling,
+                                      const ignis_prefill_options *options, const float *out_logits) {
+  const std::int32_t next = next_prompt_token(options);
+  if (next == -1) {
+    return {};
+  }
+  const std::string named = "a span with a next prompt token (" + std::to_string(next) + ") ";
+  if (next < 0 || next >= vocab) {
+    return "next prompt token " + std::to_string(next) + " is neither -1 nor a vocabulary id below " +
+           std::to_string(vocab);
+  }
+  if (options->route != IGNIS_PREFILL_ROUTE_CHUNKED) {
+    return named + "runs the chunked route";
+  }
+  if (out_logits != nullptr || options->out_span_logits != nullptr) {
+    return named + "draws nothing, so it has no logits to read; only the prompt's last span does";
+  }
+  if (!::unconstrained(sampling) || sampling.reasoning_close_id >= 0) {
+    return named + "draws nothing, so a permitted set or a reasoning redirect has no draw to act on";
+  }
+  if ((options->attention_gqa_ordinal >= 0 && options->out_attention_scores != nullptr) ||
+      options->attention_set_count != 0 || options->out_attention_set_rows != nullptr) {
+    return named + "is not the prompt's last, whose last position an attention readout reads";
+  }
+  return {};
 }
 
 }  // namespace ignis::step
