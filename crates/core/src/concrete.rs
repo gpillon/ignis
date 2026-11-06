@@ -5121,10 +5121,10 @@ impl Scheduler for ConcreteScheduler {
                 // ever emitted; intermediate successors are discarded by
                 // the next prompt chunk and therefore must stay greedy (the
                 // greedy leaf branch has no sampling-state side effect).
-                // GitHub #519: most intermediate jobs draw nothing at all
-                // now (`next_prompt_token` below); the ones that still do --
-                // Flash-Next with MTP, a job whose image a prefix or a
-                // checkpoint retains -- draw greedily as before.
+                // GitHub #519, #520: most intermediate jobs draw nothing at
+                // all now (`next_prompt_token` below); the ones that still do
+                // -- a job whose image a prefix or a checkpoint retains --
+                // draw greedily as before.
                 let params = if take == remaining {
                     r.input.params
                 } else {

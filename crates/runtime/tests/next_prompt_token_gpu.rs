@@ -1,25 +1,29 @@
-//! The head runs only on a prompt's last prefill job (GitHub #519, spec #502
-//! part 4), on each leaf through the `StepLeaf` seam `RuntimeCompute` calls.
+//! The head runs only on a prompt's last prefill job (GitHub #519, #520, spec
+//! #502 part 4), on each leaf through the `StepLeaf` seam `RuntimeCompute`
+//! calls.
 //!
 //! One prompt is cut into several jobs and prefilled twice on the same load:
-//! once as today, every job handed no next prompt token (every job draws),
-//! and once with each job handed the prompt's token after its span, the last
-//! none (`PrefillJob::next_prompt_token`). Then:
+//! once as before #519, every job handed no next prompt token (every job
+//! draws), and once with each job handed the prompt's token after its span,
+//! the last none (`PrefillJob::next_prompt_token`), one job keeping its draw
+//! as a job whose state a prefix or a checkpoint retains does. Then:
 //!
-//! - **the intermediate jobs run no head**: on the 27B and on Flash-Next
-//!   without MTP the sequence holds no pending token after each of them --
-//!   the draw is the head's only product, and today's run holds one there;
-//! - **the last job's draw, the sequence's state and the greedy text are
-//!   today's**: the pending token after the last job, the whole snapshot blob
-//!   at the end of the prefill (every section, the drafter's window
+//! - **the intermediate jobs run no head**: the sequence holds no pending
+//!   token after each of them -- the draw is the head's only product, and
+//!   the first run holds one there; the job that keeps its draw holds the
+//!   first run's;
+//! - **the last job's draw, the sequence's state and the greedy text are the
+//!   first run's**: the pending token after the last job, the whole snapshot
+//!   blob at the end of the prefill (every section, the drafter's window
 //!   included), and the tokens a few greedy rounds then commit;
-//! - **Flash-Next with MTP is unchanged, bit for bit**: its head's entry at a
-//!   job's last position still reads that job's draw, so every job still
-//!   draws (#520 removes that), and its pending tokens after every job, its
-//!   blob and its text are today's.
+//! - **Flash-Next with MTP builds its head's entry at a job's last position
+//!   from the next prompt token** (#520), not from the job's draw: the whole
+//!   state at the prompt's end, the head's entries at every job boundary
+//!   included, is a one-span prefill's of the same prompt, while the first
+//!   run's differs from it; the text is the first run's.
 //!
 //! Which job gets a token, and that a job whose state a prefix or a checkpoint
-//! retains gets none, is the scheduler's and `RuntimeCompute`'s
+//! retains keeps its draw, is the scheduler's and `RuntimeCompute`'s
 //! (`crates/core/tests/next_prompt_token.rs`, `runtime_compute.rs`).
 //!
 //! Explicit GPU profile (ADR 0006): outside `IGNIS_GPU_PROFILE=1` a missing
@@ -52,6 +56,14 @@ const PREFILL_CHUNK: u32 = 256;
 /// The prompt's jobs, by where each ends: two long ones, a prefix-like cut, a
 /// short opener-like one, then the rest -- the shapes the scheduler deals.
 const CUTS: [usize; 5] = [300, 640, 650, 1000, 1200];
+/// The job that keeps its draw, as one whose state a prefix image retains
+/// (GitHub #520): the prefix-like cut.
+const KEPT: usize = 1;
+/// The Flash-Next MTP load's prefill chunk, and its jobs: each a whole chunk
+/// of a one-span prefill of the prompt, so a job runs exactly the chunk that
+/// span runs and the two states compare bit for bit.
+const MTP_CHUNK: u32 = 256;
+const MTP_CUTS: [usize; 5] = [256, 512, 768, 1024, 1200];
 const GENERATED: usize = 16;
 /// Where the progress image keeps the pending token: after the position.
 const PROGRESS_PENDING_TOKEN: usize = 8;
@@ -105,16 +117,30 @@ fn greedy<L: StepLeaf>(leaf: &L, model: &L::Model, seq: &mut L::Sequence, label:
     text
 }
 
-/// The prompt prefilled as [`CUTS`]' jobs on a fresh sequence, each handed
-/// the prompt's next token when `hands_next`, none as today otherwise.
-fn run<L: StepLeaf>(leaf: &L, model: &L::Model, prompt: &[TokenId], hands_next: bool, header: usize, label: &str) -> Run {
+/// How a run deals the prompt's jobs.
+#[derive(Clone, Copy)]
+enum Jobs<'a> {
+    /// Before #519: every job handed no next prompt token, so every one draws.
+    Drawing(&'a [usize]),
+    /// Each job handed the prompt's token after its span, the last none, and
+    /// the `.1`th keeping its draw, as a job a prefix image retains.
+    Next(&'a [usize], usize),
+}
+
+/// The prompt prefilled as `jobs` deals it on a fresh sequence.
+fn run<L: StepLeaf>(leaf: &L, model: &L::Model, prompt: &[TokenId], jobs: Jobs<'_>, header: usize, label: &str) -> Run {
+    let (cuts, hands_next, kept) = match jobs {
+        Jobs::Drawing(cuts) => (cuts, false, None),
+        Jobs::Next(cuts, kept) => (cuts, true, Some(kept)),
+    };
     let mut seq = leaf.allocate_sequence(model, MAX_CONTEXT).unwrap_or_else(|code| panic!("{label}: alloc: {code}"));
-    let mut pending = Vec::with_capacity(CUTS.len());
+    let mut pending = Vec::with_capacity(cuts.len());
     let mut start = 0;
-    for end in CUTS {
+    for (job, &end) in cuts.iter().enumerate() {
         let next = if hands_next { prompt.get(end).copied() } else { None };
+        let keeps_draw = kept == Some(job);
         // Greedy, as the scheduler deals every job but the prompt's last.
-        leaf.prefill(model, &mut seq, &prompt[start..end], start as u32, 0, next, DecodeParams::default(), &[], None, None, None)
+        leaf.prefill(model, &mut seq, &prompt[start..end], start as u32, 0, next, keeps_draw, DecodeParams::default(), &[], None, None, None)
             .unwrap_or_else(|code| panic!("{label}: prefill [{start}, {end}): leaf code {code}"));
         pending.push(pending_of(&snapshot(leaf, model, &seq, label), header));
         start = end;
@@ -125,17 +151,18 @@ fn run<L: StepLeaf>(leaf: &L, model: &L::Model, prompt: &[TokenId], hands_next: 
     Run { pending, blob, text }
 }
 
-/// Today's run and the run with next tokens, each after one that decoded the
-/// same text. A snapshot copies whole pages, and the rows of the last page
-/// past the prompt's end are whatever the previous sequence on those pages
-/// decoded there -- after a fresh load, nothing: Flash-Next's indexer keys
-/// differ there between a load's first run and its second, today's path both
-/// times. So a first run warms the pages and is compared with nothing.
+/// The drawing run and the run with next tokens over [`CUTS`], each after one
+/// that decoded the same text. A snapshot copies whole pages, and the rows of
+/// the last page past the prompt's end are whatever the previous sequence on
+/// those pages decoded there -- after a fresh load, nothing: Flash-Next's
+/// indexer keys differ there between a load's first run and its second, the
+/// same path both times. So a first run warms the pages and is compared with
+/// nothing.
 fn today_and_cut<L: StepLeaf>(leaf: &L, model: &L::Model, header: usize, label: &str) -> (Run, Run) {
     let prompt = prompt();
-    let warm = run(leaf, model, &prompt, false, header, &format!("{label}, warming the pages"));
-    let today = run(leaf, model, &prompt, false, header, &format!("{label}, today"));
-    let cut = run(leaf, model, &prompt, true, header, &format!("{label}, next tokens"));
+    let warm = run(leaf, model, &prompt, Jobs::Drawing(&CUTS), header, &format!("{label}, warming the pages"));
+    let today = run(leaf, model, &prompt, Jobs::Drawing(&CUTS), header, &format!("{label}, today"));
+    let cut = run(leaf, model, &prompt, Jobs::Next(&CUTS, KEPT), header, &format!("{label}, next tokens"));
     assert_eq!(today.text, warm.text, "{label}: today's text reproduces");
     (today, cut)
 }
@@ -157,33 +184,45 @@ fn differences(a: &[u8], b: &[u8], header: usize) -> String {
     out.join(", ")
 }
 
-/// The head ran only on the last job, and left what today's run leaves.
-fn the_head_runs_only_on_the_last_job(today: &Run, cut: &Run, header: usize, label: &str) {
+/// The head ran only on the last job and the one that keeps its draw, and
+/// each of them drew what the drawing run drew there.
+fn the_head_runs_only_where_a_draw_is_read(today: &Run, cut: &Run, label: &str) {
     assert!(today.pending.iter().all(Option::is_some), "{label}: today every job draws: {:?}", today.pending);
     let (last, intermediate) = cut.pending.split_last().expect("jobs");
-    assert!(intermediate.iter().all(Option::is_none), "{label}: an intermediate job drew: {:?}", cut.pending);
-    assert_eq!(*last, today.pending[CUTS.len() - 1], "{label}: the last job's draw");
+    for (job, pending) in intermediate.iter().enumerate() {
+        match job == KEPT {
+            true => assert_eq!(*pending, today.pending[job], "{label}: the kept job's draw: {:?}", cut.pending),
+            false => assert!(pending.is_none(), "{label}: intermediate job {job} drew: {:?}", cut.pending),
+        }
+    }
+    assert_eq!(*last, today.pending[cut.pending.len() - 1], "{label}: the last job's draw");
+}
+
+/// The head ran only where a draw is read, and the run left what the drawing
+/// run leaves.
+fn the_head_runs_only_where_read_and_leaves_todays_state(today: &Run, cut: &Run, header: usize, label: &str) {
+    the_head_runs_only_where_a_draw_is_read(today, cut, label);
     assert!(
         cut.blob == today.blob,
         "{label}: the sequence's state at the prompt's end differs from today's: {}",
         differences(&today.blob, &cut.blob, header)
     );
     assert_eq!(cut.text, today.text, "{label}: the greedy text");
-    println!("{label}: last draw {last:?}, text {:?}", cut.text);
+    println!("{label}: pending {:?}, text {:?}", cut.pending, cut.text);
 }
 
 fn check_format() {
     assert_eq!(snapshot_format_version(), 5, "this test reads the version-5 blob layout");
 }
 
-fn flash_next_leaf(speculation: Option<FlashNextSpeculation>) -> Option<FlashNextLeaf> {
+fn flash_next_leaf(speculation: Option<FlashNextSpeculation>, prefill_chunk_tokens: u32) -> Option<FlashNextLeaf> {
     let dir = std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(FLASH_NEXT_DIR), PathBuf::from);
     let path = dir.join(ARTIFACT_FILE_NAME);
     if !path.exists() {
         gpu_profile::skip_or_fail(&format!("no Flash-Next artifact at {}", path.display()));
         return None;
     }
-    let options = EngineOptions { max_context_tokens: MAX_CONTEXT, speculation, ..EngineOptions::default() };
+    let options = EngineOptions { max_context_tokens: MAX_CONTEXT, prefill_chunk_tokens, speculation, ..EngineOptions::default() };
     match FlashNextLeaf::open(&path, options) {
         Ok(leaf) => Some(leaf),
         Err(e) => {
@@ -237,7 +276,7 @@ fn the_27b_runs_the_head_only_on_the_prompts_last_job() {
     let leaf = CudaLeaf::new(device, reader, artifact, handles, config);
     let model = leaf.load_model().unwrap_or_else(|code| panic!("model load: leaf code {code}"));
     let (today, cut) = today_and_cut(&leaf, &model, 0, "27B");
-    the_head_runs_only_on_the_last_job(&today, &cut, 0, "27B");
+    the_head_runs_only_where_read_and_leaves_todays_state(&today, &cut, 0, "27B");
 
     // What only the prompt's last span reads is refused beside a next token,
     // before any work: the sequence stays where it was.
@@ -247,14 +286,14 @@ fn the_27b_runs_the_head_only_on_the_prompts_last_job() {
     let next = Some(prompt[CUTS[0]]);
     let mut logits = vec![0f32; leaf.vocab(&model) as usize];
     assert!(
-        leaf.prefill(&model, &mut seq, span, 0, 0, next, DecodeParams::default(), &[], None, Some(&mut logits), None).is_err(),
+        leaf.prefill(&model, &mut seq, span, 0, 0, next, false, DecodeParams::default(), &[], None, Some(&mut logits), None).is_err(),
         "a logits readout beside a next token"
     );
     assert!(
-        leaf.prefill(&model, &mut seq, span, 0, 0, next, DecodeParams::default(), &[prompt[0]], None, None, None).is_err(),
+        leaf.prefill(&model, &mut seq, span, 0, 0, next, false, DecodeParams::default(), &[prompt[0]], None, None, None).is_err(),
         "a permitted set beside a next token"
     );
-    leaf.prefill(&model, &mut seq, span, 0, 0, next, DecodeParams::default(), &[], None, None, None)
+    leaf.prefill(&model, &mut seq, span, 0, 0, next, false, DecodeParams::default(), &[], None, None, None)
         .expect("the refusals left the sequence at position 0");
     leaf.release_sequence(&model, seq);
     leaf.release_model(model);
@@ -264,29 +303,61 @@ fn the_27b_runs_the_head_only_on_the_prompts_last_job() {
 #[ignore = "GPU profile only: the real Flash-Next artifact"]
 fn flash_next_without_mtp_runs_the_head_only_on_the_prompts_last_job() {
     check_format();
-    let Some(leaf) = flash_next_leaf(None) else { return };
+    let Some(leaf) = flash_next_leaf(None, EngineOptions::default().prefill_chunk_tokens) else { return };
     let model = leaf.load_model().unwrap_or_else(|code| panic!("model load: leaf code {code}"));
     let (today, cut) = today_and_cut(&leaf, &model, FLASH_NEXT_CONTEXT_BLOCK, "Flash-Next");
-    the_head_runs_only_on_the_last_job(&today, &cut, FLASH_NEXT_CONTEXT_BLOCK, "Flash-Next");
+    the_head_runs_only_where_read_and_leaves_todays_state(&today, &cut, FLASH_NEXT_CONTEXT_BLOCK, "Flash-Next");
     leaf.release_model(model);
 }
 
+/// GitHub #520: on an MTP load the head's entry at a job's last position is
+/// built from the prompt's next token, a kept draw's job included, so the
+/// state after the prompt's jobs is a one-span prefill's, the head's entries
+/// at every job boundary with it; before, each was built from the job's
+/// greedy draw. The jobs are whole chunks of that span ([`MTP_CUTS`]), so the
+/// two run the same chunks and compare bit for bit.
 #[test]
 #[ignore = "GPU profile only: the real Flash-Next artifact"]
-fn flash_next_with_mtp_draws_on_every_job_as_today() {
+fn flash_next_with_mtp_builds_each_job_boundarys_entry_from_the_next_prompt_token() {
     check_format();
     let mtp = FlashNextSpeculation::new(SpeculativeBackend::Mtp, 3, 0).unwrap();
-    let Some(leaf) = flash_next_leaf(Some(mtp)) else { return };
+    let Some(leaf) = flash_next_leaf(Some(mtp), MTP_CHUNK) else { return };
     let model = leaf.load_model().unwrap_or_else(|code| panic!("model load: leaf code {code}"));
-    let (today, cut) = today_and_cut(&leaf, &model, FLASH_NEXT_CONTEXT_BLOCK, "Flash-Next MTP");
-    assert!(today.pending.iter().all(Option::is_some), "today every job draws: {:?}", today.pending);
-    assert_eq!(cut.pending, today.pending, "Flash-Next with MTP: every job still draws, today's draw");
+    let prompt = prompt();
+    let header = FLASH_NEXT_CONTEXT_BLOCK;
+    let label = "Flash-Next MTP";
+    let one_span = [prompt.len()];
+    // Each compared run follows one that dealt its jobs the same way, so the
+    // rows past the prompt's end hold the same decode (see `today_and_cut`):
+    // the run with next tokens and the one-span run reach one state, and the
+    // drawing run is compared with the one-span run after another of them.
+    let warm = run(&leaf, &model, &prompt, Jobs::Drawing(&MTP_CUTS), header, &format!("{label}, warming the pages"));
+    let today = run(&leaf, &model, &prompt, Jobs::Drawing(&MTP_CUTS), header, &format!("{label}, drawing"));
+    assert_eq!(today.text, warm.text, "{label}: the drawing run's text reproduces");
+    run(&leaf, &model, &prompt, Jobs::Next(&MTP_CUTS, KEPT), header, &format!("{label}, warming for next tokens"));
+    let cut = run(&leaf, &model, &prompt, Jobs::Next(&MTP_CUTS, KEPT), header, &format!("{label}, next tokens"));
+    let single = run(&leaf, &model, &prompt, Jobs::Drawing(&one_span), header, &format!("{label}, one span"));
+    let drawing = run(&leaf, &model, &prompt, Jobs::Drawing(&MTP_CUTS), header, &format!("{label}, drawing again"));
+    assert_eq!(drawing.text, today.text, "{label}: the drawing run's text reproduces after the others");
+
+    the_head_runs_only_where_a_draw_is_read(&today, &cut, label);
     assert!(
-        cut.blob == today.blob,
-        "Flash-Next with MTP: the state at the prompt's end differs from today's: {}",
-        differences(&today.blob, &cut.blob, FLASH_NEXT_CONTEXT_BLOCK)
+        cut.blob == single.blob,
+        "{label}: the state after the jobs differs from a one-span prefill's: {}",
+        differences(&single.blob, &cut.blob, header)
     );
-    assert_eq!(cut.text, today.text, "Flash-Next with MTP: the greedy text");
-    println!("Flash-Next MTP: pending {:?}, text {:?}", cut.pending, cut.text);
+    assert!(
+        drawing.blob != single.blob,
+        "{label}: the drawing run's entries at the job boundaries equal the one-span run's: the test reads nothing"
+    );
+    assert_eq!(cut.pending.last(), single.pending.last(), "{label}: the last draw is the one-span run's");
+    assert_eq!(cut.text, today.text, "{label}: the greedy text is the drawing run's");
+    assert_eq!(single.text, cut.text, "{label}: the one-span run's text");
+    println!(
+        "{label}: pending {:?}, text {:?}; the drawing run against one span: {}",
+        cut.pending,
+        cut.text,
+        differences(&single.blob, &drawing.blob, header)
+    );
     leaf.release_model(model);
 }

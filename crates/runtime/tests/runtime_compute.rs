@@ -34,6 +34,8 @@ struct Calls {
     prefill_floors: Vec<u32>,
     /// GitHub #519: each prefill call's next prompt token, in order.
     prefill_next_tokens: Vec<Option<u32>>,
+    /// GitHub #520: whether each prefill call keeps its span's draw, in order.
+    prefill_kept_draws: Vec<bool>,
     prefill_params: Vec<DecodeParams>,
     /// The permitted set of each prefill call, in order (GitHub #242).
     prefill_permitted: Vec<Vec<u32>>,
@@ -289,6 +291,7 @@ impl StepLeaf for StubLeaf {
         start_position: u32,
         drafter_floor: u32,
         next_prompt_token: Option<u32>,
+        keeps_draw: bool,
         params: DecodeParams,
         permitted: &[u32],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -304,7 +307,7 @@ impl StepLeaf for StubLeaf {
                 .media
                 .map(|media| (*media.embedding, media.first_column, media.scatter_indices.to_vec())),
         });
-        self.prefill(model, sequence, tokens, start_position, drafter_floor, next_prompt_token, params, permitted, redirect, out_logits, attention)
+        self.prefill(model, sequence, tokens, start_position, drafter_floor, next_prompt_token, keeps_draw, params, permitted, redirect, out_logits, attention)
     }
 
     fn release_model(&self, _model: Self::Model) {
@@ -474,6 +477,7 @@ impl StepLeaf for StubLeaf {
         start_position: u32,
         drafter_floor: u32,
         next_prompt_token: Option<u32>,
+        keeps_draw: bool,
         params: DecodeParams,
         permitted: &[u32],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -538,6 +542,7 @@ impl StepLeaf for StubLeaf {
             calls.prefill_positions.push(start_position);
             calls.prefill_floors.push(drafter_floor);
             calls.prefill_next_tokens.push(next_prompt_token);
+            calls.prefill_kept_draws.push(keeps_draw);
             calls.prefill_params.push(params);
             calls.prefill_permitted.push(permitted.to_vec());
             calls
@@ -2083,13 +2088,15 @@ fn each_prefill_hands_the_leaf_its_jobs_drafter_floor() {
     assert_eq!(leaf.calls.lock().unwrap().prefill_floors, [3952, 0, 7]);
 }
 
-/// GitHub #519: each job's next prompt token reaches the leaf with its span,
-/// on the text path and on the multimodal one, so the leaf skips the head on
-/// every job but the prompt's last -- 0 being a real token id. A job whose
-/// state a prefix or a prompt checkpoint retains is handed none: its draw is
-/// the pending token the image carries, which a full-prompt claimant emits.
+/// GitHub #519, #520: each job's next prompt token reaches the leaf with its
+/// span, on the text path and on the multimodal one, so the leaf skips the
+/// head on every job but the prompt's last -- 0 being a real token id. A job
+/// whose state a prefix or a prompt checkpoint retains gets its token too,
+/// for Flash-Next's MTP entry at its last position, and keeps its draw: the
+/// draw is the pending token the image carries, which a full-prompt claimant
+/// emits.
 #[test]
-fn each_prefill_hands_the_leaf_its_jobs_next_prompt_token_but_a_retained_job_none() {
+fn each_prefill_hands_the_leaf_its_jobs_next_prompt_token_and_a_retained_job_keeps_its_draw() {
     let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
     compute
         .prefill_step(&[
@@ -2116,10 +2123,18 @@ fn each_prefill_hands_the_leaf_its_jobs_next_prompt_token_but_a_retained_job_non
     compute
         .prefill_step(&[PrefillJob { next_prompt_token: Some(34), ..multimodal_job(6, &prompt, 0, 18) }])
         .unwrap();
+    compute
+        .prefill_step(&[PrefillJob {
+            next_prompt_token: Some(35),
+            publish_prefix: Some(RetainedAt { tokens: 18, slot: 0 }),
+            ..multimodal_job(7, &prompt, 0, 18)
+        }])
+        .unwrap();
     let calls = leaf.calls.lock().unwrap();
-    assert_eq!(calls.prefixes_published, [2], "the publish ran");
+    assert_eq!(calls.prefixes_published, [2, 18], "the publishes ran");
     assert_eq!(calls.checkpoints_captured, [2], "the capture ran");
-    assert_eq!(calls.prefill_next_tokens, [Some(31), None, Some(0), None, None, Some(34)]);
+    assert_eq!(calls.prefill_next_tokens, [Some(31), None, Some(0), Some(32), Some(33), Some(34), Some(35)]);
+    assert_eq!(calls.prefill_kept_draws, [false, false, false, true, true, false, true]);
 }
 
 #[test]

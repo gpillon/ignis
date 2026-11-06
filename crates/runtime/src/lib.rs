@@ -782,13 +782,20 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// last 2048 positions and this. A leaf without the drafter ignores it.
     ///
     /// `next_prompt_token` (GitHub #519) is the prompt token right after the
-    /// span when nothing reads the span's draw: the leaf then runs no output
-    /// head and samples nothing, and leaves the sequence with no pending token
-    /// (Flash-Next with MTP still draws, for its head's entry). `None` draws:
-    /// the prompt's last span, and a span whose state a prefix or a prompt
-    /// checkpoint retains ([`PrefillJob::next_prompt_token`]). A span with a
-    /// next token asks for no logits, no permitted set, no redirect and no
-    /// readout, which only the prompt's last span carries.
+    /// span, `None` on the prompt's last span ([`PrefillJob::next_prompt_token`]).
+    /// With a token nothing reads the span's draw: the leaf runs no output
+    /// head and samples nothing, and leaves the sequence with no pending
+    /// token, unless `keeps_draw`. Flash-Next's MTP head builds its entry at
+    /// the span's last position from the token (GitHub #520), as from the
+    /// span's own next ids. A span with a next token asks for no logits, no
+    /// permitted set, no redirect and no readout, which only the prompt's
+    /// last span carries.
+    ///
+    /// `keeps_draw` (GitHub #520) is true on a span whose state a prefix or a
+    /// prompt checkpoint retains: it draws even with a next token, since the
+    /// image carries the draw as its pending token, which a claimant matching
+    /// the whole image emits as its first. The next token still feeds the MTP
+    /// head's entry. Without a next token the span draws anyway.
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,
@@ -798,6 +805,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         start_position: u32,
         drafter_floor: u32,
         next_prompt_token: Option<TokenId>,
+        keeps_draw: bool,
         params: DecodeParams,
         permitted: &[TokenId],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -823,7 +831,8 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// `attention` is the **attention readout** (GitHub #260), read at the
     /// span's last position; see [`AttentionRead`] for what the leaf owes
     /// it. The text path carries one too (GitHub #275). `redirect`,
-    /// `drafter_floor` and `next_prompt_token` are [`StepLeaf::prefill`]'s.
+    /// `drafter_floor`, `next_prompt_token` and `keeps_draw` are
+    /// [`StepLeaf::prefill`]'s.
     #[allow(clippy::too_many_arguments)]
     fn prefill_multimodal(
         &self,
@@ -833,6 +842,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         _start_position: u32,
         _drafter_floor: u32,
         _next_prompt_token: Option<TokenId>,
+        _keeps_draw: bool,
         _params: DecodeParams,
         _permitted: &[TokenId],
         _redirect: Option<&mut DrawRedirect<'_>>,
@@ -1338,7 +1348,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         media: &mut MediaCache<L::Media>,
         job: &PrefillJob,
         multimodal: &Multimodal,
-        next_prompt_token: Option<TokenId>,
+        keeps_draw: bool,
         redirect: Option<&mut DrawRedirect<'_>>,
         out_logits: Option<&mut [f32]>,
         attention: Option<&mut AttentionRead>,
@@ -1382,7 +1392,8 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             &job.tokens,
             start,
             job.drafter_floor,
-            next_prompt_token,
+            job.next_prompt_token,
+            keeps_draw,
             job.params,
             &permitted,
             redirect,
@@ -1635,13 +1646,14 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         stop_ids: &eos,
                         redirected: false,
                     });
-                // GitHub #519: the leaf draws only where the draw is read --
-                // the prompt's last job, and a job whose state a prefix or a
-                // prompt checkpoint retains: the image carries its pending
-                // token, which a claimant matching the whole of it emits as
-                // its first token (the empty-tail branch below).
-                let retained = job.publish_prefix.is_some() || job.capture_checkpoint.is_some();
-                let next_prompt_token = job.next_prompt_token.filter(|_| !retained);
+                // GitHub #519, #520: the leaf draws only where the draw is
+                // read -- the prompt's last job, and a job whose state a
+                // prefix or a prompt checkpoint retains: the image carries its
+                // pending token, which a claimant matching the whole of it
+                // emits as its first token (the empty-tail branch above). The
+                // retained job still gets its next prompt token, which
+                // Flash-Next's MTP entry at its last position is built from.
+                let keeps_draw = job.publish_prefix.is_some() || job.capture_checkpoint.is_some();
                 let warmed = match &job.multimodal {
                     None => self
                         .model
@@ -1652,7 +1664,8 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             &job.tokens,
                             job.start_position,
                             job.drafter_floor,
-                            next_prompt_token,
+                            job.next_prompt_token,
+                            keeps_draw,
                             job.params,
                             // GitHub #242: the set this chunk's own draw is
                             // restricted to, borrowed and not cloned — every
@@ -1669,7 +1682,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         &mut media,
                         job,
                         multimodal,
-                        next_prompt_token,
+                        keeps_draw,
                         redirect.as_mut(),
                         logits.as_deref_mut(),
                         attention.as_mut(),

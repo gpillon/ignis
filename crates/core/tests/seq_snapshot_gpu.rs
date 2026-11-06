@@ -108,6 +108,7 @@ fn prefill_multimodal_and_decode<'p>(
         0,
         0,
         None,
+        false,
         SamplingParams::greedy(),
         // No permitted set (GitHub #242): this prefills a prompt.
         &[],
