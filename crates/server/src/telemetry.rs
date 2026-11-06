@@ -165,6 +165,16 @@ struct PrefillChunks {
     solo: u32,
 }
 
+/// The prefill phase's summary as the `done` line of a request that was
+/// never dealt a lane carries it (#518): the `admitted` line's fields, since
+/// that request logs no `admitted` line.
+#[derive(Debug, Clone, Copy)]
+struct PrefillSummary {
+    prompt_tokens: u32,
+    chunks: PrefillChunks,
+    prefilled_tokens: u32,
+}
+
 /// What a request's media cost, as the `admitted`, `done` and `cancelled`
 /// lines report it (GitHub #245): what acquiring them cost (GitHub #179) and what encoding
 /// them cost during prefill (GitHub #192), which the two halves of the
@@ -324,6 +334,11 @@ pub struct Telemetry {
     /// consumer after the cancel. It was counted once, as cancelled or as
     /// completed, and must not be counted again as completed.
     recently_cancelled: VecDeque<RequestId>,
+    /// The latest requests reported done at their caller's stop sequence
+    /// ([`Telemetry::on_stopped`]), whatever `metrics` is: the engine ends a
+    /// request whose first token completes one too (#518), and that `Done`
+    /// may reach this consumer after the stop. Its line is already written.
+    recently_stopped: VecDeque<RequestId>,
     /// How long a request stays in flight, submit to release (GitHub #327):
     /// what [`Telemetry::lane_free_at_ms`] adds to the oldest request in
     /// flight, since a lane's place in `max_in_flight` frees only when its
@@ -360,6 +375,7 @@ impl Telemetry {
             metrics: None,
             counter_source: None,
             recently_cancelled: VecDeque::new(),
+            recently_stopped: VecDeque::new(),
             lane_held_ms: None,
         }
     }
@@ -505,6 +521,10 @@ impl Telemetry {
         if self.metrics.is_some() {
             self.remember_released(id);
         }
+        if self.recently_stopped.len() == RECENTLY_CANCELLED {
+            self.recently_stopped.pop_front();
+        }
+        self.recently_stopped.push_back(id);
     }
 
     /// Remember `id` for the cancel/`Done` race (`recently_cancelled`).
@@ -608,10 +628,24 @@ impl Telemetry {
         }
         let rt = self.requests.remove(&id);
         let known = rt.is_some();
+        // A `Done` behind its own stop: the stop wrote the line (#518).
+        if !known {
+            if let Some(i) = self.recently_stopped.iter().position(|&s| s == id) {
+                self.recently_stopped.remove(i);
+                return;
+            }
+        }
+        // #518: a request that ended on its first token logged no `admitted`
+        // line, so its `done` line says what the prefill phase did.
+        let prefill = rt.as_ref().filter(|rt| !rt.admitted).map(|rt| PrefillSummary {
+            prompt_tokens: rt.prompt_tokens,
+            chunks: PrefillChunks { consumed: rt.prefill_chunks, solo: rt.prefill_chunks_solo },
+            prefilled_tokens: rt.prefilled_tokens,
+        });
         let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class, reuse, budget_dropped, media) = match rt {
             Some(rt) => (
                 rt.submitted_ms,
-                rt.lane,
+                rt.admitted.then_some(rt.lane),
                 rt.itl_count,
                 rt.itl_sum_ms,
                 rt.itl_max_ms,
@@ -622,7 +656,7 @@ impl Telemetry {
             ),
             None => (
                 self.clock.now_ms(),
-                0,
+                None,
                 0,
                 0,
                 0,
@@ -665,6 +699,7 @@ impl Telemetry {
                 redirected_at: reasoning_redirected_at,
             },
             media,
+            prefill,
         );
     }
 
@@ -1132,7 +1167,7 @@ impl Telemetry {
         ms: u64,
         n: u32,
         tok_s: f64,
-        lane: LaneId,
+        lane: Option<LaneId>,
         reason: FinishReason,
         itl_ms_mean: f64,
         itl_ms_max: u64,
@@ -1142,6 +1177,7 @@ impl Telemetry {
         reuse: Option<RequestReuse>,
         thinking: ThinkingReport,
         summary: Option<MediaSummary>,
+        prefill: Option<PrefillSummary>,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         // A `None` field records nothing, so a request without speculative
@@ -1152,7 +1188,8 @@ impl Telemetry {
             name: "ignis.request.done",
             request_id = id,
             duration_ms = ms,
-            lane = lane as u64,
+            // Absent for a request never dealt a lane (#518), as on `ttft`.
+            lane = lane.map(|lane| lane as u64),
             tokens = n,
             tok_s = tok_s,
             finish_reason = finish_reason_str(reason),
@@ -1208,6 +1245,13 @@ impl Telemetry {
             media.cache_hits = media.map(|m| m.cache_hits),
             media.cache_misses = media.map(|m| m.cache_misses),
             media.encode_seconds = summary.map(|s| s.encode_seconds()),
+            // #518: the `admitted` line's prefill fields, on the `done` line
+            // of a request that never logged one: it ended on its first
+            // token, or it was a decision, and was never dealt a lane.
+            prompt_tokens = prefill.map(|p| p.prompt_tokens),
+            prefill_chunks_consumed = prefill.map(|p| p.chunks.consumed),
+            prefill_chunks_solo = prefill.map(|p| p.chunks.solo),
+            prefilled_tokens = prefill.map(|p| p.prefilled_tokens),
             "request done"
         );
     }
@@ -2357,6 +2401,12 @@ mod tests {
         assert_eq!(done[0]["attributes"]["finish_reason"], "stop");
         assert_eq!(done[0]["attributes"]["tokens"], 5);
         assert!(!done.iter().any(|e| e["attributes"]["request_id"] == 2 && e["attributes"]["tokens"] != 2));
+        // #518: a stop the first token completes ends the request in the
+        // engine as well, so its `Done` racing the stop is the common case.
+        for id in [1, 2] {
+            let lines = done.iter().filter(|e| e["attributes"]["request_id"] == id).count();
+            assert_eq!(lines, 1, "request {id}: one done line: {done:?}");
+        }
 
         let text = metrics.render();
         for line in [

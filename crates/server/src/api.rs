@@ -2557,7 +2557,21 @@ async fn chat_completions(
     let guarding = crate::loop_guard::Guarding::new(server.live().loop_guard.clone(), &input, starts_in_reasoning, server.metrics.clone());
     let rewound = guarding.rewound();
     let engine = loaded.text_engine();
-    let (request_id, stream) = match engine.submit_with_notes(input, class, notes).await {
+    // #518: the model thread asks the first token, which leaves with the
+    // prefill, of a copy of the pipeline below, so a stop sequence that token
+    // completes ends the request before its lane deal and decode round.
+    let first_stop = (!stop.is_empty()).then(|| {
+        let mut probe = AnswerPipeline::new(
+            OutputDecoder::new(loaded.template.token_decoder(), starts_in_reasoning),
+            schemas.clone(),
+            stop.clone(),
+        );
+        Box::new(move |token| {
+            probe.push(&[token]);
+            probe.fired()
+        }) as crate::engine::FirstTokenStop
+    });
+    let (request_id, stream) = match engine.submit_stopping(input, class, notes, first_stop).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };

@@ -74,7 +74,10 @@ fn the_prefill_phase_events_leave_before_the_decode_round_runs() {
     let rounds_before = mock.decode_calls().len();
 
     let early: Mutex<Vec<(Vec<SchedEvent>, usize)>> = Mutex::new(Vec::new());
-    let rest = sched.advance_with(&mut |events| early.lock().unwrap().push((events, mock.decode_calls().len())));
+    let rest = sched.advance_with(&mut |events| {
+        early.lock().unwrap().push((events, mock.decode_calls().len()));
+        Vec::new()
+    });
 
     let early = early.into_inner().unwrap();
     assert_eq!(early.len(), 1, "one hand-off, at the end of the prefill phase: {early:?}");
@@ -133,7 +136,10 @@ fn admitted(events: &[SchedEvent], id: RequestId) -> bool {
 /// One step, its prefill phase's hand-off kept apart from the rest.
 fn step(sched: &mut ConcreteScheduler) -> (Vec<SchedEvent>, Vec<SchedEvent>) {
     let mut early = Vec::new();
-    let rest = sched.advance_with(&mut |events| early.extend(events));
+    let rest = sched.advance_with(&mut |events| {
+        early.extend(events);
+        Vec::new()
+    });
     (early, rest)
 }
 
@@ -207,6 +213,36 @@ fn max_tokens_one_ends_with_no_decode_round() {
     assert!(!admitted(&rest, id), "no lane dealt: {rest:?}");
     assert!(sched.is_idle());
     assert!(mock.decode_calls().is_empty(), "no decode round, no drafter proposal");
+}
+
+/// A first token its caller ends the request on, a stop sequence the token
+/// completed, ends it there: no decode round, no drafter proposal, no lane.
+/// A request whose first token did not leave in that hand-off is not ended.
+#[test]
+fn a_first_token_the_caller_stops_on_ends_with_no_decode_round() {
+    let mock = Arc::new(MockCompute::with_runs(&[3]));
+    let mut sched = scheduler(mock.clone());
+    let running = submit(&mut sched, 100);
+    while tokens_of(&sched.advance(), running) == 0 {}
+    let rounds_before = mock.decode_calls().len();
+    let id = submit(&mut sched, 10);
+
+    let mut early = Vec::new();
+    let rest = sched.advance_with(&mut |events| {
+        let stopped = match emitted(&events, id).is_empty() {
+            true => Vec::new(),
+            false => vec![id, running],
+        };
+        early.extend(events);
+        stopped
+    });
+
+    assert_eq!(emitted(&early, id), vec![mock.token_for(id, 0)], "{early:?}");
+    assert_eq!(done(&rest, id), Some((1, FinishReason::Stop)), "{rest:?}");
+    assert!(!admitted(&rest, id), "no lane dealt: {rest:?}");
+    assert_eq!(done(&rest, running), None, "a running request is not the caller's to stop here: {rest:?}");
+    let rounds = &mock.decode_calls()[rounds_before..];
+    assert!(rounds.iter().flatten().all(|job| job.request != id), "no decode round for it: {rounds:?}");
 }
 
 /// An EOS drawn by the prefill ends the request there, emitted as no token.

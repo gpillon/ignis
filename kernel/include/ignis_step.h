@@ -336,6 +336,18 @@ struct ignis_prefill_options {
   int32_t keeps_draw;
 };
 
+#ifdef __cplusplus
+/* Beside the `size` check, both sides pin the layout (here, and
+ * crates/core/src/step_abi.rs's mirror test, on CPU): GitHub #520's
+ * `keeps_draw` filled the tail padding after `next_prompt_token`, so the size
+ * alone no longer tells that layout from the one before it. */
+static_assert(sizeof(struct ignis_prefill_options) == 224 &&
+                  offsetof(struct ignis_prefill_options, drafter_floor) == 208 &&
+                  offsetof(struct ignis_prefill_options, next_prompt_token) == 216 &&
+                  offsetof(struct ignis_prefill_options, keeps_draw) == 220,
+              "ignis_prefill_options drifted from crates/core/src/step_abi.rs IgnisPrefillOptions");
+#endif
+
 /* The most heads a readout may bring whole rows back for (GitHub #275): the
  * load reserves the rows' room for this many over `attention_text_max_keys`
  * keys. */

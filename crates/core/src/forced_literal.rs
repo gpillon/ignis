@@ -136,18 +136,24 @@ enum Phase {
 pub struct ForcedState {
     phase: Phase,
     /// Whether the last round's draw was a single forced token, so that the
-    /// token this round emits was seen when it was chosen -- or the round's
-    /// anchor was already committed when its draw is chosen
-    /// ([`ForcedState::anchor_seen`]).
+    /// token this round emits was seen when it was chosen.
     last_draw_forced: bool,
+    /// The next round draws freely: its anchor is the model's own close,
+    /// drawn by the prefill ([`ForcedState::anchor_seen`]).
+    free_draw: bool,
 }
 
 impl ForcedState {
     /// The round's anchor is a token already committed (#518): the prompt's
-    /// pending token left with its prefill, so the round that takes it as
-    /// its anchor chooses its draw having seen it, as after a forced draw.
+    /// pending token left with its prefill. When it was the model's own
+    /// `</think>`, the block closed before any round ran. The round that
+    /// committed such a close used to draw the token after it freely, and
+    /// the literal joined on after that unseen token (module docs); the round
+    /// that takes it as its anchor still draws freely, so the literal makes
+    /// the text it made before. Any other anchor changes nothing: the block
+    /// is still open, or the literal started at the generation.
     pub fn anchor_seen(&mut self) {
-        self.last_draw_forced = true;
+        self.free_draw = self.phase == (Phase::Closed { matched: 0 });
     }
 
     /// The permitted set for the draw this round makes, for a request whose
@@ -163,8 +169,10 @@ impl ForcedState {
         emitted: u32,
         budget: Option<PermittedSet>,
     ) -> Option<PermittedSet> {
+        let free = std::mem::take(&mut self.free_draw);
         let set = match budget {
             Some(budget) => Some(budget),
+            None if free => None,
             None => self.step(literal, emitted + 1),
         };
         self.last_draw_forced = set.as_ref().is_some_and(|set| set.len() == 1);

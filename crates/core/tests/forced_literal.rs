@@ -133,6 +133,34 @@ fn after_reasoning_the_models_own_close_is_followed_by_the_joiner_and_then_the_l
     assert_eq!(forced_rounds(&mock), vec![vec![NL], vec![OPEN], vec![NL], vec![902], vec![903]]);
 }
 
+/// #518: a `</think>` drawn by the prefill leaves with it, before any round
+/// runs, and the literal still follows it as it did when the first round
+/// emitted it: the token after the close is the model's own, then the
+/// joiner, then the literal.
+#[test]
+fn a_close_drawn_by_the_prefill_is_followed_by_a_free_token_the_joiner_and_the_literal() {
+    for runs in [&[][..], &[4][..]] {
+        let mock = Arc::new(MockCompute::with_runs(runs));
+        let think_end = mock.token_for(0, 0);
+        let mut sched = scheduler(mock.clone(), None);
+        let literal = ForcedLiteral::after_reasoning(OPENER.to_vec(), think_end, 4).unwrap();
+        let id = submit(&mut sched, input(20, None, Some(literal)));
+        let out = run(&mut sched, id);
+        let model = |step| mock.token_for(id, step);
+        // The round after the close commits its run and draws the token
+        // after it unseen: one token, or three accepted past the anchor and
+        // the fourth it draws, as when that round emitted the close too.
+        let free = match runs {
+            [] => vec![model(1)],
+            _ => vec![model(1), model(2), model(3), model(4)],
+        };
+        let expected: Vec<TokenId> = [vec![think_end], free.clone(), vec![NL, OPEN, NL, 902, 903]].concat();
+        assert_eq!(&out[..expected.len()], &expected[..], "runs {runs:?}: {out:?}");
+        assert_eq!(out.len(), 20, "runs {runs:?}: released, the request generates to its cap");
+        assert_eq!(forced_rounds(&mock), vec![vec![NL], vec![OPEN], vec![NL], vec![902], vec![903]], "runs {runs:?}");
+    }
+}
+
 #[test]
 fn an_unseen_token_that_opened_the_call_is_not_opened_twice() {
     // The close ends the first run (step 3); the token the joiner's round

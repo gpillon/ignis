@@ -4551,12 +4551,15 @@ impl Scheduler for ConcreteScheduler {
 
     fn advance(&mut self) -> Vec<SchedEvent> {
         let mut early = Vec::new();
-        let rest = self.advance_with(&mut |events| early.extend(events));
+        let rest = self.advance_with(&mut |events| {
+            early.extend(events);
+            Vec::new()
+        });
         early.extend(rest);
         early
     }
 
-    fn advance_with(&mut self, prefilled: &mut dyn FnMut(Vec<SchedEvent>)) -> Vec<SchedEvent> {
+    fn advance_with(&mut self, prefilled: &mut dyn FnMut(Vec<SchedEvent>) -> Vec<RequestId>) -> Vec<SchedEvent> {
         let mut events: Vec<SchedEvent> = Vec::new();
         self.last_error = None;
         // core-06: advance the scheduling tick (the LRU `use_tick` for
@@ -5610,6 +5613,7 @@ impl Scheduler for ConcreteScheduler {
         // does not end keeps the token as its next round's anchor, which that
         // round commits without emitting it again. The device stands where
         // the prefill left it, so no GDN boundary moves.
+        let mut drew_first: Vec<RequestId> = Vec::new();
         for (i, run) in first_tokens {
             let left = !run.tokens.is_empty();
             self.commit_run(i, &run, false, &mut events);
@@ -5617,6 +5621,7 @@ impl Scheduler for ConcreteScheduler {
             if left && r.state != RequestState::Done {
                 r.anchor_emitted = true;
                 r.forced_state.anchor_seen();
+                drew_first.push(r.id);
             }
         }
 
@@ -5697,9 +5702,18 @@ impl Scheduler for ConcreteScheduler {
 
         // #518: the prefill phase ends here, and what it emitted is final --
         // a prompt's chunks, a decision's answer -- so it leaves now, before
-        // the lane deal and the decode round, rather than with them.
+        // the lane deal and the decode round, rather than with them. A request
+        // its caller ends on that first token (a stop sequence the token
+        // completed) ends here, as one its budget ended: no lane, no round.
         if !events.is_empty() {
-            prefilled(std::mem::take(&mut events));
+            for stopped in prefilled(std::mem::take(&mut events)) {
+                if !drew_first.contains(&stopped) {
+                    continue;
+                }
+                if let Some(i) = self.requests.iter().position(|r| r.id == stopped && r.state != RequestState::Done) {
+                    self.mark_done(i, &mut events, FinishReason::Stop);
+                }
+            }
         }
 
         // Phase 2 — the admission state machine drives the lane deal

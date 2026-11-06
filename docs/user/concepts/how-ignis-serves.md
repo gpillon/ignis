@@ -139,9 +139,9 @@ waits.
 
 The first token leaves as soon as the prompt's last chunk is done: the server
 streams it before any decode round runs, even while every decode lane is taken.
-A request that ends on it (`max_tokens: 1`, or an end-of-sequence token) never
-takes a lane at all, and one whose first token completes a stop sequence ends
-there, its answer cut at the stop as always.
+A request that ends on it (`max_tokens: 1`, an end-of-sequence token, or a stop
+sequence the token completes) never takes a lane at all, and its answer is cut
+at the stop as always.
 
 ### 4. Decode generates, one round for every lane
 

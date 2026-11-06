@@ -228,6 +228,15 @@ impl PrefillJob {
     pub fn builds_its_sequence(&self) -> bool {
         self.start_position == 0 || self.shared_prefix.is_some() || self.checkpoint.is_some()
     }
+
+    /// Whether the leaf draws at this job's end although it has a next
+    /// prompt token (GitHub #520): a prefix it publishes or a prompt
+    /// checkpoint it captures retains its state, and the image carries the
+    /// draw as its pending token, which a claimant matching the whole of it
+    /// emits as its first token.
+    pub fn keeps_draw(&self) -> bool {
+        self.publish_prefix.is_some() || self.capture_checkpoint.is_some()
+    }
 }
 
 /// One decode job: a single lane step for a running request.
@@ -979,7 +988,13 @@ pub trait Scheduler: Send {
     /// streams them on at once makes none of them wait for the round. The
     /// default hands nothing early, so a scheduler without phases streams its
     /// step whole, as [`Scheduler::advance`] does.
-    fn advance_with(&mut self, prefilled: &mut dyn FnMut(Vec<SchedEvent>)) -> Vec<SchedEvent> {
+    ///
+    /// `prefilled` answers with the requests it ends on the first token it
+    /// was just handed, a stop sequence that token completed: each ends with
+    /// [`FinishReason::Stop`] before the lane deal, so it takes no lane and
+    /// no decode round. An id whose first token was not in that hand-off is
+    /// ignored.
+    fn advance_with(&mut self, prefilled: &mut dyn FnMut(Vec<SchedEvent>) -> Vec<RequestId>) -> Vec<SchedEvent> {
         let _ = prefilled;
         self.advance()
     }

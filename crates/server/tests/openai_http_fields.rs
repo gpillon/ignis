@@ -312,6 +312,25 @@ async fn a_stop_the_first_token_completes_ends_the_request() {
     }
 }
 
+/// #518: and it ends before the lane deal, so no decode round runs for it,
+/// and with none no drafter proposal.
+#[tokio::test]
+async fn a_stop_the_first_token_completes_runs_no_decode_round() {
+    for stream in [false, true] {
+        let mock = Arc::new(MockCompute::new());
+        let decode = ["END", " more"].iter().enumerate().map(|(step, t)| (mock.token_for(0, step as u32), *t)).collect();
+        let app = server(&Script::new(decode), SchedulerConfig::default(), mock.clone()).app();
+        let (status, text) = post(&app, CHAT, &plain(json!({ "max_tokens": 50, "stop": "END", "stream": stream }))).await;
+        assert_eq!(status, 200, "{text}");
+        assert!(!text.contains("more"), "stream {stream}: {text}");
+        // The engine's step that drew the token has finished by the time
+        // the next request is answered.
+        let next = served(&app, CHAT, &plain(json!({ "max_tokens": 1 }))).await;
+        assert_eq!(next["choices"][0]["finish_reason"], "length", "stream {stream}");
+        assert!(mock.decode_calls().is_empty(), "stream {stream}: {:?}", mock.decode_calls());
+    }
+}
+
 #[tokio::test]
 async fn stop_never_fires_inside_a_tool_call() {
     let text = [
