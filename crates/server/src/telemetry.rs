@@ -334,6 +334,11 @@ pub struct Telemetry {
     /// consumer after the cancel. It was counted once, as cancelled or as
     /// completed, and must not be counted again as completed.
     recently_cancelled: VecDeque<RequestId>,
+    /// The latest requests reported done at their caller's stop sequence
+    /// ([`Telemetry::on_stopped`]), whatever `metrics` is: the engine ends a
+    /// request whose first token completes one too (#518), and that `Done`
+    /// may reach this consumer after the stop. Its line is already written.
+    recently_stopped: VecDeque<RequestId>,
     /// How long a request stays in flight, submit to release (GitHub #327):
     /// what [`Telemetry::lane_free_at_ms`] adds to the oldest request in
     /// flight, since a lane's place in `max_in_flight` frees only when its
@@ -370,6 +375,7 @@ impl Telemetry {
             metrics: None,
             counter_source: None,
             recently_cancelled: VecDeque::new(),
+            recently_stopped: VecDeque::new(),
             lane_held_ms: None,
         }
     }
@@ -515,6 +521,10 @@ impl Telemetry {
         if self.metrics.is_some() {
             self.remember_released(id);
         }
+        if self.recently_stopped.len() == RECENTLY_CANCELLED {
+            self.recently_stopped.pop_front();
+        }
+        self.recently_stopped.push_back(id);
     }
 
     /// Remember `id` for the cancel/`Done` race (`recently_cancelled`).
@@ -618,6 +628,13 @@ impl Telemetry {
         }
         let rt = self.requests.remove(&id);
         let known = rt.is_some();
+        // A `Done` behind its own stop: the stop wrote the line (#518).
+        if !known {
+            if let Some(i) = self.recently_stopped.iter().position(|&s| s == id) {
+                self.recently_stopped.remove(i);
+                return;
+            }
+        }
         // #518: a request that ended on its first token logged no `admitted`
         // line, so its `done` line says what the prefill phase did.
         let prefill = rt.as_ref().filter(|rt| !rt.admitted).map(|rt| PrefillSummary {
@@ -2384,6 +2401,12 @@ mod tests {
         assert_eq!(done[0]["attributes"]["finish_reason"], "stop");
         assert_eq!(done[0]["attributes"]["tokens"], 5);
         assert!(!done.iter().any(|e| e["attributes"]["request_id"] == 2 && e["attributes"]["tokens"] != 2));
+        // #518: a stop the first token completes ends the request in the
+        // engine as well, so its `Done` racing the stop is the common case.
+        for id in [1, 2] {
+            let lines = done.iter().filter(|e| e["attributes"]["request_id"] == id).count();
+            assert_eq!(lines, 1, "request {id}: one done line: {done:?}");
+        }
 
         let text = metrics.render();
         for line in [
