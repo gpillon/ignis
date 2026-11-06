@@ -20,7 +20,10 @@
 //!   from the next prompt token** (#520), not from the job's draw: the whole
 //!   state at the prompt's end, the head's entries at every job boundary
 //!   included, is a one-span prefill's of the same prompt, while the first
-//!   run's differs from it; the text is the first run's.
+//!   run's differs from it; the text is the first run's. And on the shapes
+//!   the scheduler deals, cuts off the chunk grid, partial chunks and a job
+//!   that keeps its draw, a prompt whose token after each cut is the first
+//!   run's draw there leaves the two runs in one state, byte for byte.
 //!
 //! Which job gets a token, and that a job whose state a prefix or a checkpoint
 //! retains keeps its draw, is the scheduler's and `RuntimeCompute`'s
@@ -149,6 +152,28 @@ fn run<L: StepLeaf>(leaf: &L, model: &L::Model, prompt: &[TokenId], jobs: Jobs<'
     let text = greedy(leaf, model, &mut seq, label);
     leaf.release_sequence(model, seq);
     Run { pending, blob, text }
+}
+
+/// The prompt with its token after each of `cuts` but the last replaced by
+/// the greedy draw a drawing run of `cuts` makes there, built one job at a
+/// time, since a job's draw reads nothing past its span. A run handed next
+/// prompt tokens over it then builds each job boundary's entry from the token
+/// the drawing run built it from (GitHub #520).
+fn drawn_at_cuts<L: StepLeaf>(leaf: &L, model: &L::Model, cuts: &[usize], header: usize, label: &str) -> Vec<TokenId> {
+    let mut prompt = prompt();
+    let mut seq = leaf.allocate_sequence(model, MAX_CONTEXT).unwrap_or_else(|code| panic!("{label}: alloc: {code}"));
+    let mut start = 0;
+    for &end in cuts {
+        leaf.prefill(model, &mut seq, &prompt[start..end], start as u32, 0, None, false, DecodeParams::default(), &[], None, None, None)
+            .unwrap_or_else(|code| panic!("{label}: prefill [{start}, {end}): leaf code {code}"));
+        if end < prompt.len() {
+            let drawn = pending_of(&snapshot(leaf, model, &seq, label), header).expect("a drawing job draws");
+            prompt[end] = drawn as TokenId;
+        }
+        start = end;
+    }
+    leaf.release_sequence(model, seq);
+    prompt
 }
 
 /// The drawing run and the run with next tokens over [`CUTS`], each after one
@@ -359,5 +384,19 @@ fn flash_next_with_mtp_builds_each_job_boundarys_entry_from_the_next_prompt_toke
         cut.text,
         differences(&single.blob, &drawing.blob, header)
     );
+
+    // The shapes the scheduler deals ([`CUTS`]): cuts off the chunk grid,
+    // partial chunks and the kept draw's job. With each cut's next prompt
+    // token the drawing run's draw there, the entries built from the next
+    // token are the ones built from the draw, so the two runs reach one state
+    // byte for byte -- the aligned check above shows the state holds the
+    // entries, and that they move with the token they are built from.
+    let label = "Flash-Next MTP, unaligned cuts";
+    let drawn = drawn_at_cuts(&leaf, &model, &CUTS, header, label);
+    let warm = run(&leaf, &model, &drawn, Jobs::Drawing(&CUTS), header, &format!("{label}, warming the pages"));
+    let today = run(&leaf, &model, &drawn, Jobs::Drawing(&CUTS), header, &format!("{label}, drawing"));
+    assert_eq!(today.text, warm.text, "{label}: the drawing run's text reproduces");
+    let cut = run(&leaf, &model, &drawn, Jobs::Next(&CUTS, KEPT), header, &format!("{label}, next tokens"));
+    the_head_runs_only_where_read_and_leaves_todays_state(&today, &cut, header, label);
     leaf.release_model(model);
 }
