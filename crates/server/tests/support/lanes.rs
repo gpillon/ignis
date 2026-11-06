@@ -45,7 +45,9 @@ pub async fn the_only_lane_admits_a_new_request(app: &axum::Router, model: &str,
             serde_json::json!({
                 "model": model,
                 "messages": [{ "role": "user", "content": "replacement" }],
-                "max_tokens": 1,
+                // Two tokens: the first leaves with the prefill (#518), the
+                // second takes the decode step the gate holds.
+                "max_tokens": 2,
                 "stream": true
             })
             .to_string(),

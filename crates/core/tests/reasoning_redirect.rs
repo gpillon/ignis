@@ -251,6 +251,7 @@ fn the_redirect_is_reported_by_the_round_that_drew_it() {
         remaining_tokens: 1,
         permitted: None,
         reasoning_close: Some(THINK_END),
+        anchor_emitted: false,
     };
     let round = |mock: &MockCompute| mock.decode_step(std::slice::from_ref(&job)).expect("round").remove(0);
     let first = round(&mock);

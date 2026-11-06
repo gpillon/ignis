@@ -283,6 +283,35 @@ async fn the_engine_serves_on_after_a_stop() {
     assert_eq!(second["choices"][0]["finish_reason"], "length");
 }
 
+/// #518: a stop sequence the first token completes -- the token that leaves
+/// with the prefill -- ends the request there, answered whole and streamed,
+/// and the engine serves on.
+#[tokio::test]
+async fn a_stop_the_first_token_completes_ends_the_request() {
+    for stream in [false, true] {
+        let app = app_reading(&["END", " more"]);
+        let body = match stream {
+            true => plain(json!({ "max_tokens": 50, "stop": "END", "stream": true, "stream_options": { "include_usage": true } })),
+            false => plain(json!({ "max_tokens": 50, "stop": "END" })),
+        };
+        let (status, text) = post(&app, CHAT, &body).await;
+        assert_eq!(status, 200, "{text}");
+        let (content, finish, usage) = if stream {
+            let chunks = chunks(&text);
+            (streamed_content(&chunks), finish_chunk(&chunks)["choices"][0]["finish_reason"].clone(), chunks.last().unwrap()["usage"].clone())
+        } else {
+            let answer: JsonValue = serde_json::from_str(&text).unwrap();
+            (answer["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string(), answer["choices"][0]["finish_reason"].clone(), answer["usage"].clone())
+        };
+        assert_eq!(content, "", "stream {stream}: {text}");
+        assert!(!text.contains("more"), "stream {stream}: {text}");
+        assert_eq!(finish, "stop", "stream {stream}: {text}");
+        assert_eq!(usage["completion_tokens"], 1, "stream {stream}: {text}");
+        let next = served(&app, CHAT, &plain(json!({ "max_tokens": 2 }))).await;
+        assert_eq!(next["choices"][0]["finish_reason"], "length", "stream {stream}");
+    }
+}
+
 #[tokio::test]
 async fn stop_never_fires_inside_a_tool_call() {
     let text = [

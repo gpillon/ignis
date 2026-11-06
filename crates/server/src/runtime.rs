@@ -3197,6 +3197,9 @@ mod tests {
         ) -> Result<f32, i32> {
             Ok(0.0)
         }
+        fn pending_token(&self, _sequence: &Self::Sequence) -> Option<TokenId> {
+            Some(7)
+        }
         fn decode(
             &self,
             _model: &Self::Model,

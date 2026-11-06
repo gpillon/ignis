@@ -583,7 +583,10 @@ fn model_thread_loop(
             }
         }
         if !scheduler.is_idle() {
-            let events = scheduler.advance();
+            // #518: what the step's prefill phase emitted -- a prompt's first
+            // token among it -- is routed before its decode round runs.
+            let events = scheduler
+                .advance_with(&mut |prefilled| route_events(&prefilled, &mut streams, &facts, &freed));
             route_events(&events, &mut streams, &facts, &freed);
             if std::mem::take(&mut cancelled) {
                 free(&freed);
@@ -1423,6 +1426,78 @@ mod tests {
         }
         assert!(saw_token, "the batch's Token must be routed after a Protected");
         assert!(saw_done, "the batch's Done must be routed after a Protected");
+    }
+
+    /// A scheduler whose one step hands a `Token` over at the end of its
+    /// prefill phase (#518), then holds its "decode round" until the test
+    /// lets it go, and ends the request.
+    struct HandsOverBeforeItsRound {
+        submitted: bool,
+        stepped: bool,
+        round: std_mpsc::Receiver<()>,
+    }
+
+    impl Scheduler for HandsOverBeforeItsRound {
+        fn share_request_ids(&mut self, _: ignis_core::RequestIds) {}
+        fn submit(&mut self, _input: RequestInput, _class: RequestClass) -> Result<RequestId, SubmitError> {
+            self.submitted = true;
+            Ok(ProtectedBatchScheduler::ID)
+        }
+        fn cancel(&mut self, _request: RequestId) -> bool {
+            false
+        }
+        fn advance(&mut self) -> Vec<SchedEvent> {
+            unreachable!("the model thread steps through advance_with")
+        }
+        fn advance_with(&mut self, prefilled: &mut dyn FnMut(Vec<SchedEvent>)) -> Vec<SchedEvent> {
+            self.stepped = true;
+            prefilled(vec![SchedEvent::Token { request: ProtectedBatchScheduler::ID, token: 7 }]);
+            let _ = self.round.recv();
+            vec![SchedEvent::Done {
+                readout: None,
+                drawn: None,
+                request: ProtectedBatchScheduler::ID,
+                tokens: 1,
+                reason: FinishReason::Stop,
+                spec: None,
+                attention: None,
+                thinking: None,
+                reasoning_redirected_at: None,
+            }]
+        }
+        fn is_idle(&self) -> bool {
+            !self.submitted || self.stepped
+        }
+        fn model_id(&self) -> &str {
+            ProtectedBatchScheduler::MODEL
+        }
+        fn max_sequence_tokens(&self) -> u32 {
+            8192
+        }
+        fn mode(&self) -> EngineMode {
+            EngineMode::Serving
+        }
+        fn occupancy(&self) -> ignis_core::Occupancy {
+            ignis_core::Occupancy::default()
+        }
+    }
+
+    /// #518: what a step's prefill phase hands over reaches the request's
+    /// stream while the step is still running its decode round.
+    #[tokio::test]
+    async fn the_prefill_phase_events_are_routed_before_the_step_ends() {
+        let (round, held) = std_mpsc::channel();
+        let engine = Engine::new(Box::new(HandsOverBeforeItsRound { submitted: false, stepped: false, round: held }));
+        let (_id, mut rx) = engine
+            .submit(input("fake-model", vec![1], Some(1)), RequestClass::Interactive)
+            .await
+            .expect("submit");
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the token arrives while the round is still held");
+        assert!(matches!(first, Some(SchedEvent::Token { token: 7, .. })), "{first:?}");
+        round.send(()).unwrap();
+        assert!(matches!(rx.recv().await, Some(SchedEvent::Done { .. })));
     }
 
     #[test]

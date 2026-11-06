@@ -254,6 +254,7 @@ fn refused(rig: &Rig) {
             remaining_tokens: 1,
             permitted: None,
             reasoning_close: None,
+            anchor_emitted: false,
         }])
         .is_err(),
         "and no sequence was handed back for the request"

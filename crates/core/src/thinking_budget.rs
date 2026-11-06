@@ -117,9 +117,10 @@ impl BudgetState {
     /// has emitted `emitted` tokens and may spend `budget` of them
     /// reasoning — or `None` to draw freely.
     ///
-    /// The draw is for token index `emitted + 1`: this round emits index
-    /// `emitted`, which the previous round drew. Forcing starts at the first
-    /// round that finds the budget spent and the block still open.
+    /// The draw is for token index `emitted + 1`: the round's anchor is index
+    /// `emitted`, drawn by the previous round, or by the prefill that emitted
+    /// it already (#518). Forcing starts at the first round that finds the
+    /// budget spent and the block still open.
     pub fn permitted(&mut self, budget: Option<u32>, close: &ThinkingClose, emitted: u32) -> Option<PermittedSet> {
         let budget = budget?;
         let draw = emitted + 1;

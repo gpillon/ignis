@@ -178,10 +178,11 @@ fn decode_round_spans_are_shared_across_lanes_in_one_batched_round() {
     let (ids, spans) = capture_spans(|| {
         let compute = Arc::new(MockCompute::new());
         let mut sched = ConcreteScheduler::new("qwen3.8-27b", compute);
-        let a = sched.submit(input(&[1], 1), RequestClass::Agent).unwrap();
-        let b = sched.submit(input(&[2], 1), RequestClass::Agent).unwrap();
-        sched.advance(); // both prefill, get admitted, and decode their one token in this call
-        assert!(sched.is_idle(), "both requests have a 1-token budget");
+        // Two tokens each: the first leaves with the prefill (#518), so the
+        // second is what needs a round.
+        let a = sched.submit(input(&[1], 2), RequestClass::Agent).unwrap();
+        let b = sched.submit(input(&[2], 2), RequestClass::Agent).unwrap();
+        sched.advance(); // both prefill, get admitted, and run one round together in this call
         (a, b)
     });
 

@@ -255,6 +255,7 @@ fn decode_batch(
                 remaining_tokens: MAX_GENERATED - generated[i],
                 permitted: None,
                 reasoning_close: None,
+                anchor_emitted: false,
             })
             .collect();
         let outcomes = compute.decode_step(&jobs).unwrap_or_else(|e| panic!("decode_step: {e}"));
