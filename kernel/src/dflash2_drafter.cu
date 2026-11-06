@@ -73,7 +73,8 @@ void ignis_dflash2_append_context(ignis_model *model, ignis_seq_pool *pool,
                                   ninfer::DeviceArena &arena, const ninfer::Tensor &features,
                                   const ninfer::Tensor &positions, const ninfer::Tensor &counts,
                                   const ninfer::Tensor &lanes,
-                                  ninfer::ops::KVCacheAppendPrefixExecutionEnvelope envelope) {
+                                  ninfer::ops::KVCacheAppendPrefixExecutionEnvelope envelope,
+                                  IgnisA16Call call) {
   const cudaStream_t stream     = model->stream;
   const auto hidden             = static_cast<std::int32_t>(model->hidden);
   const std::int32_t head_dim   = kIgnisDflash2HeadDim;
@@ -86,7 +87,7 @@ void ignis_dflash2_append_context(ignis_model *model, ignis_seq_pool *pool,
   const Dflash2Weights &weights = model->dflash2;
 
   ninfer::Tensor projected = arena.alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
-  ninfer::ops::linear(features, weights.feature_projection, projected, stream);
+  ignis_linear_a16(features, weights.feature_projection, projected, call, stream);
   ninfer::Tensor context = arena.alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
   ninfer::ops::rmsnorm(projected, bf16_tensor(weights.context_norm, {hidden, 1, 1, 1}),
                        kDflash2RmsEps, /*unit_offset=*/false, context, stream);
@@ -95,7 +96,7 @@ void ignis_dflash2_append_context(ignis_model *model, ignis_seq_pool *pool,
     ninfer::DeviceArena::Scope layer_scope = arena.scope();
     const Dflash2LayerWeights &w = weights.layers[layer];
     ninfer::Tensor qkv = arena.alloc(ninfer::DType::BF16, {query_size + 2 * kv_width, columns, 1, 1});
-    ninfer::ops::linear(context, w.query_key_value, qkv, stream);
+    ignis_linear_a16(context, w.query_key_value, qkv, call, stream);
     ninfer::Tensor key_raw = arena.alloc(ninfer::DType::BF16, {kv_width, columns, 1, 1});
     ninfer::Tensor key     = arena.alloc(ninfer::DType::BF16, {kv_width, columns, 1, 1});
     ninfer::Tensor value   = arena.alloc(ninfer::DType::BF16, {kv_width, columns, 1, 1});
@@ -337,5 +338,5 @@ void ignis_dflash2_append_round(ignis_model *model, ignis_seq_pool *pool, std::u
   const ninfer::Tensor counts(verify.append_counts->p, ninfer::DType::I32, {batch, 1, 1, 1});
   const ninfer::Tensor lanes(model->decode_graph_slots->p, ninfer::DType::I32, {batch, 1, 1, 1});
   ignis_dflash2_append_context(model, pool, arena, features, positions, counts, lanes,
-                               {0, static_cast<std::uint32_t>(block)});
+                               {0, static_cast<std::uint32_t>(block)}, IgnisA16Call::General);
 }

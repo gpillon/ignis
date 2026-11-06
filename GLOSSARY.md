@@ -907,13 +907,21 @@ itself.
 
 **Prefill chunk**:
 The number of tokens one traversal of the model processes during chunked
-prefill: a model-load option, default 1024, a multiple of 128. The unit the
-**prefill scratch** is sized for.
+prefill while a lane is decode-ready: a model-load option, default 1024, a
+multiple of 128. The **prefill scratch** is sized for the wider of it and the
+**solo width**.
+
+**Solo width**:
+The prefill chunk a prompt takes while no lane is decode-ready, a model-load
+option beside the **prefill chunk**, never narrower, and equal to it when no
+wider one is planned. "Solo" names the absence of decoding lanes, not of
+users: two prompts prefilling at once with no lane decoding both take it.
+_Avoid_: idle chunk, burst chunk.
 
 **Prefill scratch**:
 The load's one device region for a step's transient buffers, sized at load for
-the larger of what a **prefill chunk** needs and what a **media encode** of one
-**item bound** needs (the VRAM plan's `workspace` line). The two never run at
+the larger of what a **solo width** chunk needs and what a **media encode** of
+one **item bound** needs (the VRAM plan's `workspace` line). The two never run at
 once, and nothing in it survives from one step to the next.
 _Avoid_: workspace (a user's files), arena (KV-RAM's).
 

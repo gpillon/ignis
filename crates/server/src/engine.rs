@@ -158,6 +158,9 @@ pub struct Engine {
     /// load's decode lanes, captured the same way -- what a fan-out sizes
     /// its waves by.
     max_in_flight: usize,
+    /// The scheduler's solo width (GitHub #489), captured the same way, for
+    /// `GET /v1/models`.
+    prefill_chunk_solo: Option<u32>,
     /// The content hash of the artifact the backend runs on (GitHub #260),
     /// captured the same way: what the pointing head is keyed on.
     artifact: ignis_core::ArtifactHash,
@@ -237,6 +240,7 @@ impl Clone for Engine {
             model_id: self.model_id.clone(),
             max_model_len: self.max_model_len,
             max_in_flight: self.max_in_flight,
+            prefill_chunk_solo: self.prefill_chunk_solo,
             artifact: self.artifact,
             commands: self.commands.clone(),
             facts: self.facts.clone(),
@@ -284,6 +288,7 @@ impl Engine {
         let model_id = scheduler.model_id().to_string();
         let max_model_len = scheduler.max_sequence_tokens();
         let max_in_flight = scheduler.max_in_flight();
+        let prefill_chunk_solo = scheduler.prefill_chunk_solo();
         let artifact = scheduler.artifact();
         let (command_tx, command_rx) = std_mpsc::channel();
         let (facts_tx, facts_rx) = unbounded_channel();
@@ -309,6 +314,7 @@ impl Engine {
                 model_id,
                 max_model_len,
                 max_in_flight,
+                prefill_chunk_solo,
                 artifact,
                 commands: command_tx,
                 facts: facts_tx,
@@ -361,6 +367,13 @@ impl Engine {
     /// immutable like the model id.
     pub fn max_in_flight(&self) -> usize {
         self.max_in_flight
+    }
+
+    /// The prefill chunk a prompt takes while no lane is decode-ready (GitHub
+    /// #489): the load's solo width as resolved, the prefill chunk on a load
+    /// with no wider one -- immutable like the model id.
+    pub fn prefill_chunk_solo(&self) -> Option<u32> {
+        self.prefill_chunk_solo
     }
 
     /// The content hash of the artifact this engine's backend runs on
@@ -843,8 +856,9 @@ async fn telemetry_task(
                     request,
                     prefilled_tokens,
                     encode_micros,
+                    solo,
                     ..
-                } => telemetry.on_prefill_chunk(request, prefilled_tokens, encode_micros),
+                } => telemetry.on_prefill_chunk(request, prefilled_tokens, encode_micros, solo),
                 SchedEvent::PrefixReused {
                     request,
                     tokens,
@@ -1809,6 +1823,7 @@ mod tests {
             model_id: "test-model".into(),
             max_model_len: 8192,
             max_in_flight: ignis_core::N_DECODE_LANES,
+            prefill_chunk_solo: None,
             commands: command_tx,
             facts: consumer_tx.clone(),
             counters,
@@ -1889,6 +1904,7 @@ mod tests {
             model_id: "test-model".into(),
             max_model_len: 8192,
             max_in_flight: ignis_core::N_DECODE_LANES,
+            prefill_chunk_solo: None,
             commands: command_tx,
             facts: consumer_tx.clone(),
             counters,

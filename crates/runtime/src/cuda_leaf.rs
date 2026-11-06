@@ -81,7 +81,9 @@ pub struct CudaLeafConfig {
     pub retained_device_slots: u32,
     pub retained_host_slots: u32,
     /// The prefill chunk width, in tokens: how wide a span the program's
-    /// prefill scratch must serve (`--model-prefill-chunk`, GitHub #87). A
+    /// prefill scratch must serve (`--model-prefill-chunk`, GitHub #87) --
+    /// since GitHub #489 the wider of it and the solo width, which the
+    /// scheduler narrows from while a lane is decode-ready. A
     /// nonzero multiple of 128, validated by the server's config module
     /// before any loader work starts. `ignis_model_load` reserves the
     /// program scratch for a chunk of this width at load time (P2-01,

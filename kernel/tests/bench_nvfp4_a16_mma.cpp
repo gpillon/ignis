@@ -12,7 +12,14 @@
 // largest |mma - gemv| over the output as a same-input sanity figure (both
 // are held to the A16 criterion by the CTest; this only shows they agree).
 //
-//   ignis_nvfp4_a16_mma_bench [--iters 50] [--all | --drafter | --narrow]
+//   ignis_nvfp4_a16_mma_bench [--iters 50] [--all | --drafter | --narrow | --taps]
+//
+// --taps (GitHub #521) times a prompt-reuse tail: the two problems a
+// prefill's DFlash2 feature taps call, feature_projection [5120, 25600] and
+// query_key_value [6144, 5120], at every width from 1 to 64 columns. The
+// first T from which the route's column (x, the GEMVs' time over the
+// route's) stays above 1 on both is the crossover the taps' 8.x width
+// (kPrefillTapsMinTokens8x, kernel/src/nvfp4_a16_mma.cu) is set from.
 
 #include "ignis_nvfp4_a16_mma.h"
 
@@ -149,6 +156,7 @@ int main(int argc, char** argv) {
     bool all     = false;
     bool drafter = false;
     bool narrow  = false;
+    bool taps    = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
             iters = std::atoi(argv[++i]);
@@ -158,9 +166,18 @@ int main(int argc, char** argv) {
             drafter = true;
         } else if (std::strcmp(argv[i], "--narrow") == 0) {
             narrow = true;
+        } else if (std::strcmp(argv[i], "--taps") == 0) {
+            taps = true;
         }
     }
     const std::vector<std::int32_t> widths{64, 128, 394, 1024};
+    if (taps) {
+        std::vector<std::int32_t> tail;
+        for (std::int32_t t = 1; t <= 64; ++t) { tail.push_back(t); }
+        bench_shape(5120, 25600, tail, iters);
+        bench_shape(6144, 5120, tail, iters);
+        return 0;
+    }
     if (narrow) {
         // The narrow registered problems, where M / 64 CTAs leaves the card
         // idle until T spreads the grid over several token tiles.

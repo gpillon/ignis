@@ -222,6 +222,7 @@ async fn main() {
         thinking_budget: default_thinking_budget,
         loop_guard,
         prefill_chunk: _,
+        prefill_chunk_solo: _,
         decode_share_percent: _,
         max_context: _,
         default_max_tokens,

@@ -592,11 +592,13 @@ target_link_libraries(ignis_kernel_host_mapped_embedding_bench PRIVATE ignis_ker
 
 # OURS, not vendored: the A16 NVFP4 linear's tensor-core route
 # (kernel/include/ignis_nvfp4_a16_mma.h), which takes every A16 call of 64
-# columns or more (128 below 4,096 output rows). Driven through the leaf's
-# ops::linear with the vendored linear harness's FP64 oracle and its A16
+# columns or more (128 below 4,096 output rows), and on 8.x a prefill's
+# DFlash2 feature taps from a width of their own (#521). Driven through the
+# leaf's ops::linear with the vendored linear harness's FP64 oracle and its A16
 # criterion, at prompt widths the vendored test never reaches, plus an arm
-# that pins which kernel ops::linear ran, bit for bit. No SKIP_RETURN_CODE
-# (ADR 0006).
+# that pins which kernel ops::linear ran, bit for bit, the widths per GPU
+# generation, and the route at a reuse tail's 1-63 columns against the GEMVs.
+# No SKIP_RETURN_CODE (ADR 0006).
 add_executable(ignis_kernel_nvfp4_a16_mma_test
   test_nvfp4_a16_mma.cpp
   ${IGNIS_VENDOR_DIR}/tests/ops/linear/linear_test_common.cpp

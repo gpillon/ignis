@@ -156,6 +156,15 @@ pub trait IntervalStatsProvider: Send + Sync {
 
 // ── the telemetry state ─────────────────────────────────────────────────────
 
+/// A request's prefill chunks, as the `admitted` line reports them: every
+/// one (P3-06), and those of them the scheduler ran at the solo width (GitHub
+/// #489).
+#[derive(Debug, Clone, Copy)]
+struct PrefillChunks {
+    consumed: u32,
+    solo: u32,
+}
+
 /// What a request's media cost, as the `admitted`, `done` and `cancelled`
 /// lines report it (GitHub #245): what acquiring them cost (GitHub #179) and what encoding
 /// them cost during prefill (GitHub #192), which the two halves of the
@@ -194,6 +203,8 @@ struct RequestTelemetry {
     class: RequestClass,
     /// Completed `SchedEvent::PrefillChunk`s seen for this request (P3-06).
     prefill_chunks: u32,
+    /// How many of them ran at the solo width (GitHub #489).
+    prefill_chunks_solo: u32,
     /// The most recent `prefilled_tokens` cumulative count (P3-06); equals
     /// `prompt_tokens` once prefill completes.
     prefilled_tokens: u32,
@@ -432,7 +443,7 @@ impl Telemetry {
     /// `prefill_chunks_consumed`, `prefilled_tokens`) accumulated from the
     /// `PrefillChunk` events already seen for this request.
     pub fn on_admitted(&mut self, id: RequestId, lane: LaneId) {
-        let (submitted_ms, prompt_tokens, prefill_chunks, prefilled_tokens, class, media) =
+        let (submitted_ms, prompt_tokens, (prefill_chunks, prefill_chunks_solo), prefilled_tokens, class, media) =
             match self.requests.get_mut(&id) {
                 Some(rt) => {
                     rt.admitted = true;
@@ -440,7 +451,7 @@ impl Telemetry {
                     (
                         rt.submitted_ms,
                         rt.prompt_tokens,
-                        rt.prefill_chunks,
+                        (rt.prefill_chunks, rt.prefill_chunks_solo),
                         rt.prefilled_tokens,
                         rt.class,
                         rt.media_summary(),
@@ -450,10 +461,11 @@ impl Telemetry {
                 // reached the consumer (GitHub #89). Still logged, but not
                 // re-added: no `Done` would ever remove it again, and it
                 // would count as running forever.
-                None => (self.clock.now_ms(), 0, 0, 0, RequestClass::default(), None),
+                None => (self.clock.now_ms(), 0, (0, 0), 0, RequestClass::default(), None),
             };
         let ms = self.clock.now_ms().saturating_sub(submitted_ms);
-        self.emit_admitted(id, ms, lane, prompt_tokens, prefill_chunks, prefilled_tokens, class, media);
+        let chunks = PrefillChunks { consumed: prefill_chunks, solo: prefill_chunks_solo };
+        self.emit_admitted(id, ms, lane, prompt_tokens, chunks, prefilled_tokens, class, media);
     }
 
     /// A request was cancelled, for `cause` (GitHub #89): emit its
@@ -510,9 +522,10 @@ impl Telemetry {
     /// and per-chunk log lines would be per-round logging by another name.
     /// The chunk that completes the prompt also stamps the clock, for the
     /// `ttft` line's `after_prefill_ms` (#518).
-    pub fn on_prefill_chunk(&mut self, id: RequestId, prefilled_tokens: u32, encode_micros: u64) {
+    pub fn on_prefill_chunk(&mut self, id: RequestId, prefilled_tokens: u32, encode_micros: u64, solo: bool) {
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.prefill_chunks = rt.prefill_chunks.saturating_add(1);
+            rt.prefill_chunks_solo = rt.prefill_chunks_solo.saturating_add(u32::from(solo));
             rt.prefilled_tokens = prefilled_tokens;
             rt.encode_micros = rt.encode_micros.saturating_add(encode_micros);
             if prefilled_tokens >= rt.prompt_tokens {
@@ -850,6 +863,7 @@ impl Telemetry {
     pub fn on_requeued(&mut self, id: RequestId) {
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.prefill_chunks = 0;
+            rt.prefill_chunks_solo = 0;
             rt.prefilled_tokens = 0;
             rt.prefilled_ms = None;
             // GitHub #192: a requeued multimodal request re-prefills from
@@ -943,7 +957,9 @@ impl Telemetry {
     }
 
     /// Emit the `admitted` line: the prefill phase's summary (P3-06) —
-    /// `prompt_tokens`, `prefill_chunks_consumed`, `prefilled_tokens` —
+    /// `prompt_tokens`, `prefill_chunks_consumed` (and of them
+    /// `prefill_chunks_solo`, at the solo width, GitHub #489),
+    /// `prefilled_tokens` —
     /// alongside the lane dealt, how long the request queued, and its
     /// admission `class` (GitHub #120: the request log's per-class
     /// attribution). See [`Telemetry::emit_done`] for why this runs on the
@@ -961,7 +977,7 @@ impl Telemetry {
         ms: u64,
         lane: LaneId,
         prompt_tokens: u32,
-        prefill_chunks_consumed: u32,
+        chunks: PrefillChunks,
         prefilled_tokens: u32,
         class: RequestClass,
         summary: Option<MediaSummary>,
@@ -974,7 +990,8 @@ impl Telemetry {
             duration_ms = ms,
             lane = lane as u64,
             prompt_tokens,
-            prefill_chunks_consumed,
+            prefill_chunks_consumed = chunks.consumed,
+            prefill_chunks_solo = chunks.solo,
             prefilled_tokens,
             class = class.as_extension_str(),
             media.items = media.map(|m| m.items),
@@ -1562,10 +1579,10 @@ mod tests {
             telemetry.note_media(1, media);
             // Two images, each encoded on the chunk that first covers it,
             // with a chunk that reuses a live embedding between them.
-            telemetry.on_prefill_chunk(1, 8, 300_000);
-            telemetry.on_prefill_chunk(1, 20, 0);
-            telemetry.on_prefill_chunk(1, 32, 200_000);
-            telemetry.on_prefill_chunk(1, 40, 0);
+            telemetry.on_prefill_chunk(1, 8, 300_000, false);
+            telemetry.on_prefill_chunk(1, 20, 0, false);
+            telemetry.on_prefill_chunk(1, 32, 200_000, false);
+            telemetry.on_prefill_chunk(1, 40, 0, false);
             telemetry.on_admitted(1, 0);
         });
         assert_eq!(admitted_encode_seconds(&events), 0.5);
@@ -1578,12 +1595,12 @@ mod tests {
         let events = capture_events(|| {
             telemetry.note_submit(1, 20, RequestClass::Agent);
             telemetry.note_media(1, media);
-            telemetry.on_prefill_chunk(1, 8, 250_000);
+            telemetry.on_prefill_chunk(1, 8, 250_000, false);
             // The attempt is discarded: the request re-prefills from the
             // start, so it encodes its item again.
             telemetry.on_requeued(1);
-            telemetry.on_prefill_chunk(1, 8, 125_000);
-            telemetry.on_prefill_chunk(1, 20, 0);
+            telemetry.on_prefill_chunk(1, 8, 125_000, false);
+            telemetry.on_prefill_chunk(1, 20, 0, false);
             telemetry.on_admitted(1, 0);
         });
         assert_eq!(admitted_encode_seconds(&events), 0.125);
@@ -1594,7 +1611,7 @@ mod tests {
         let mut telemetry = telemetry();
         let events = capture_events(|| {
             telemetry.note_submit(2, 5, RequestClass::Interactive);
-            telemetry.on_prefill_chunk(2, 5, 9_000);
+            telemetry.on_prefill_chunk(2, 5, 9_000, false);
             telemetry.on_admitted(2, 0);
         });
         let attributes = events
@@ -1626,12 +1643,12 @@ mod tests {
         let events = capture_events(|| {
             telemetry.note_submit(1, 20, RequestClass::Agent);
             telemetry.note_media(1, media);
-            telemetry.on_prefill_chunk(1, 20, 250_000);
+            telemetry.on_prefill_chunk(1, 20, 250_000, false);
             telemetry.on_done(1, 0, FinishReason::Stop, None, None, None);
             // A text request that never takes a lane either, whose chunk
             // reports encode time anyway: no media, so no `media.*`.
             telemetry.note_submit(2, 5, RequestClass::Agent);
-            telemetry.on_prefill_chunk(2, 5, 9_000);
+            telemetry.on_prefill_chunk(2, 5, 9_000, false);
             telemetry.on_done(2, 0, FinishReason::Stop, None, None, None);
         });
         assert!(
@@ -1670,7 +1687,7 @@ mod tests {
         let events = capture_events(|| {
             telemetry.note_submit(1, 20, RequestClass::Agent);
             telemetry.note_media(1, media);
-            telemetry.on_prefill_chunk(1, 20, 250_000);
+            telemetry.on_prefill_chunk(1, 20, 250_000, false);
             telemetry.on_admitted(1, 0);
             telemetry.on_token(1);
             telemetry.on_done(1, 1, FinishReason::Stop, None, None, None);
@@ -1711,12 +1728,12 @@ mod tests {
         let events = capture_events(|| {
             telemetry.note_submit(1, 20, RequestClass::Agent);
             telemetry.note_media(1, media);
-            telemetry.on_prefill_chunk(1, 8, 250_000);
+            telemetry.on_prefill_chunk(1, 8, 250_000, false);
             telemetry.on_cancelled(1, CancelCause::Consumer);
             telemetry.on_done(1, 0, FinishReason::Stop, None, None, None);
             // A text request cancelled mid-prefill: no media, no `media.*`.
             telemetry.note_submit(2, 5, RequestClass::Agent);
-            telemetry.on_prefill_chunk(2, 2, 9_000);
+            telemetry.on_prefill_chunk(2, 2, 9_000, false);
             telemetry.on_cancelled(2, CancelCause::Timeout);
         });
         let media_of = |name: &str, id: u64| {
@@ -1879,14 +1896,15 @@ mod tests {
         let mut telemetry = telemetry();
         let events = capture_events(|| {
             telemetry.note_submit(1, 300, RequestClass::Interactive); // a 300-token prompt
-            telemetry.on_prefill_chunk(1, 128, 0); // chunk 1: 128/300
-            telemetry.on_prefill_chunk(1, 256, 0); // chunk 2: 256/300
-            telemetry.on_prefill_chunk(1, 300, 0); // chunk 3: prefill complete
+            telemetry.on_prefill_chunk(1, 128, 0, false); // chunk 1: 128/300
+            telemetry.on_prefill_chunk(1, 256, 0, true); // chunk 2: 256/300, at the solo width
+            telemetry.on_prefill_chunk(1, 300, 0, true); // chunk 3: prefill complete
             telemetry.on_admitted(1, 4);
         });
         let admitted = events.last().unwrap();
         assert_eq!(admitted["attributes"]["prompt_tokens"], 300);
         assert_eq!(admitted["attributes"]["prefill_chunks_consumed"], 3);
+        assert_eq!(admitted["attributes"]["prefill_chunks_solo"], 2, "GitHub #489: two of them at the solo width");
         assert_eq!(admitted["attributes"]["prefilled_tokens"], 300);
         assert_eq!(admitted["attributes"]["lane"], 4);
     }
@@ -1901,10 +1919,10 @@ mod tests {
         let mut telemetry = telemetry();
         let events = capture_events(|| {
             telemetry.note_submit(1, 300, RequestClass::Interactive);
-            telemetry.on_prefill_chunk(1, 128, 0); // 1st attempt: 1 chunk, then evicted/discarded
+            telemetry.on_prefill_chunk(1, 128, 0, true); // 1st attempt: 1 chunk, then evicted/discarded
             telemetry.on_requeued(1); // re-queued: the summary resets
-            telemetry.on_prefill_chunk(1, 150, 0); // 2nd attempt, chunk 1
-            telemetry.on_prefill_chunk(1, 300, 0); // 2nd attempt, chunk 2: complete
+            telemetry.on_prefill_chunk(1, 150, 0, false); // 2nd attempt, chunk 1
+            telemetry.on_prefill_chunk(1, 300, 0, false); // 2nd attempt, chunk 2: complete
             telemetry.on_admitted(1, 4);
         });
         let admitted = events.last().unwrap();
@@ -1912,6 +1930,7 @@ mod tests {
             admitted["attributes"]["prefill_chunks_consumed"], 2,
             "only the surviving (2nd) prefill attempt's chunks are counted"
         );
+        assert_eq!(admitted["attributes"]["prefill_chunks_solo"], 0, "its solo one too");
         assert_eq!(admitted["attributes"]["prefilled_tokens"], 300);
         // `prompt_tokens` is unaffected — it is the request's own submitted
         // length, not something a prefill attempt accumulates.
@@ -1935,8 +1954,8 @@ mod tests {
         let mut telemetry = Telemetry::new(Arc::new(clock));
         let events = capture_events(|| {
             telemetry.note_submit(1, 300, RequestClass::Interactive);
-            telemetry.on_prefill_chunk(1, 150, 0);
-            telemetry.on_prefill_chunk(1, 300, 0);
+            telemetry.on_prefill_chunk(1, 150, 0, false);
+            telemetry.on_prefill_chunk(1, 300, 0, false);
             telemetry.on_admitted(1, 3);
             telemetry.on_token(1);
         });
@@ -1953,7 +1972,7 @@ mod tests {
         let mut telemetry = telemetry();
         let events = capture_events(|| {
             telemetry.note_submit(1, 3, RequestClass::Interactive);
-            telemetry.on_prefill_chunk(1, 3, 0);
+            telemetry.on_prefill_chunk(1, 3, 0, false);
             telemetry.on_token(1);
             telemetry.on_admitted(1, 2);
         });
@@ -2020,7 +2039,7 @@ mod tests {
             telemetry.on_token(1); // t=10, ttft
             telemetry.on_token(1); // t=20, 1st gap 10ms
             telemetry.note_submit(2, 32_768, RequestClass::Interactive); // t=25 (cold prefiller submitted)
-            telemetry.on_prefill_chunk(2, 32_768, 0); // t=25, the wide chunk lands, completing the prompt
+            telemetry.on_prefill_chunk(2, 32_768, 0, false); // t=25, the wide chunk lands, completing the prompt
             telemetry.on_token(1); // t=220, 2nd gap: 200ms — the stall
             telemetry.on_admitted(2, 1); // t=230, prefiller starts decoding
             telemetry.on_done(1, 3, FinishReason::Stop, None, None, None); // t=220 (clock re-read), lane 0 finishes

@@ -956,6 +956,11 @@ pub enum SchedEvent {
         /// multimodal TTFT is attributable to the encode and not only to
         /// preprocessing.
         encode_micros: u64,
+        /// Whether the scheduler chose the solo width for this chunk (GitHub
+        /// #489): no lane was decode-ready. Always `false` on a load whose
+        /// solo width is its prefill chunk. A prompt's last chunk, shorter
+        /// than either width, still says which one it was cut at.
+        solo: bool,
     },
 }
 

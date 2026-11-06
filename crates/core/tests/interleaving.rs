@@ -513,6 +513,11 @@ impl Compute for TimedCompute {
 /// A scheduler at a 4-token chunk width and `decode_share`, over a backend
 /// whose chunk takes 1000 ms and whose round takes 10 ms of its own clock.
 fn timed_sched(decode_share: f64) -> (ConcreteScheduler, Arc<TimedCompute>) {
+    timed_sched_with(decode_share, None)
+}
+
+/// [`timed_sched`] with a solo width of `solo` tokens (GitHub #489).
+fn timed_sched_with(decode_share: f64, solo: Option<u32>) -> (ConcreteScheduler, Arc<TimedCompute>) {
     let elapsed_ms = Arc::new(AtomicU64::new(0));
     let compute = Arc::new(TimedCompute {
         inner: MockCompute::new(),
@@ -527,6 +532,7 @@ fn timed_sched(decode_share: f64) -> (ConcreteScheduler, Arc<TimedCompute>) {
         SchedulerConfig {
             model: "qwen3.8-27b".into(),
             serving_chunk_tokens: 4,
+            solo_chunk_tokens: solo,
             decode_share,
             ..SchedulerConfig::default()
         },
@@ -625,4 +631,117 @@ fn without_a_decode_share_a_chunk_still_gets_exactly_one_round() {
 fn a_decode_share_of_one_is_refused() {
     // A share of 1 would hold every chunk for as long as any lane decodes.
     timed_sched(1.0);
+}
+
+/// A scheduler at a 4-token prefill chunk and an 8-token solo width
+/// (GitHub #489).
+fn solo_sched(compute: Arc<dyn Compute>) -> ConcreteScheduler {
+    ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "qwen3.8-27b".into(),
+            serving_chunk_tokens: 4,
+            solo_chunk_tokens: Some(8),
+            ..SchedulerConfig::default()
+        },
+        compute,
+    )
+}
+
+/// The prefill chunks `id` was sent, as `(width, solo)`: each chunk's
+/// tokens and whether the scheduler chose the solo width for it.
+fn chunks_of(sched: &mut ConcreteScheduler, id: u64, until_done: bool) -> Vec<(u32, bool)> {
+    let mut chunks = Vec::new();
+    while if until_done { sched.request_state(id) != Some(RequestState::Done) } else { !sched.is_idle() } {
+        for event in sched.advance() {
+            if let SchedEvent::PrefillChunk { request, chunk_tokens, solo, .. } = event
+                && request == id
+            {
+                chunks.push((chunk_tokens, solo));
+            }
+        }
+    }
+    chunks
+}
+
+#[test]
+fn with_no_lane_decoding_a_prompt_prefills_at_the_solo_width() {
+    // GitHub #489: nobody waits for a chunk while no lane decodes, so a lone
+    // prompt takes the wider of the two planned widths.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = solo_sched(compute.clone());
+    let id = sched.submit(input(&(1..=16).collect::<Vec<_>>(), 1), RequestClass::Agent).unwrap();
+    assert_eq!(chunks_of(&mut sched, id, false), vec![(8, true), (8, true)]);
+    assert!(compute.prefill_calls().iter().flatten().all(|job| job.tokens.len() <= 8));
+}
+
+#[test]
+fn while_a_lane_decodes_a_prompt_prefills_at_the_prefill_chunk() {
+    // The decoding lane waits one chunk between two rounds: the narrow width.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = solo_sched(compute);
+    let filler = sched.submit(input(&[1], 1000), RequestClass::Agent).unwrap();
+    sched.advance();
+    assert_eq!(sched.request_state(filler), Some(RequestState::Running));
+    let id = sched.submit(input(&(1..=16).collect::<Vec<_>>(), 1), RequestClass::Agent).unwrap();
+    assert_eq!(chunks_of(&mut sched, id, true), vec![(4, false); 4]);
+}
+
+#[test]
+fn the_width_widens_mid_prompt_once_the_last_decoding_lane_ends() {
+    // The scheduler decides at every chunk boundary: a prompt that starts
+    // while a lane decodes takes the solo width once that lane's request
+    // ends.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = solo_sched(compute);
+    let filler = sched.submit(input(&[1], 3), RequestClass::Agent).unwrap();
+    sched.advance();
+    assert_eq!(sched.request_state(filler), Some(RequestState::Running));
+    let id = sched.submit(input(&(1..=40).collect::<Vec<_>>(), 1), RequestClass::Agent).unwrap();
+    let chunks = chunks_of(&mut sched, id, true);
+    assert_eq!(chunks.first(), Some(&(4, false)), "narrow while the filler decodes: {chunks:?}");
+    assert_eq!(chunks.last(), Some(&(8, true)), "solo once it has ended: {chunks:?}");
+    let narrow = chunks.iter().take_while(|chunk| !chunk.1).count();
+    assert!(chunks[narrow..].iter().all(|&chunk| chunk == (8, true)), "never narrow again: {chunks:?}");
+    assert_eq!(chunks.iter().map(|chunk| chunk.0).sum::<u32>(), 40);
+}
+
+#[test]
+fn without_a_solo_width_every_chunk_is_the_prefill_chunk() {
+    // `None`, every load's before GitHub #489: the scheduler never widens.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = sched_with_chunk(4, compute);
+    let id = sched.submit(input(&(1..=8).collect::<Vec<_>>(), 1), RequestClass::Agent).unwrap();
+    assert_eq!(chunks_of(&mut sched, id, false), vec![(4, false); 2]);
+}
+
+#[test]
+fn a_solo_chunk_owes_no_decode_share_to_a_lane_that_joins_after_it() {
+    // A solo chunk ran while no lane decoded, so the decode share's hold
+    // after it is owed to nobody: a lane dealt at the end of it (a short
+    // prompt batched beside the long one's first chunk) gets one round, and
+    // the long prompt's next, narrow, chunk follows. The holds after narrow
+    // chunks are the share's own: 1000 ms of 10 ms rounds at one half.
+    let (mut sched, compute) = timed_sched_with(0.5, Some(8));
+    let short = sched.submit(input(&[1], 1000), RequestClass::Agent).unwrap();
+    let long = sched.submit(input(&(1..=16).collect::<Vec<_>>(), 1), RequestClass::Agent).unwrap();
+    let chunks = chunks_of(&mut sched, long, true);
+    assert_eq!(sched.request_state(short), Some(RequestState::Running));
+    assert_eq!(chunks, vec![(8, true), (4, false), (4, false)]);
+    let calls = compute.calls.lock().unwrap().clone();
+    let between: Vec<usize> = calls.split('P').map(str::len).collect();
+    assert_eq!(&between[1..3], &[1, 100], "rounds after the solo chunk, then after a narrow one: {calls}");
+}
+
+#[test]
+#[should_panic(expected = "solo width")]
+fn a_solo_width_narrower_than_the_prefill_chunk_is_refused() {
+    ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "qwen3.8-27b".into(),
+            serving_chunk_tokens: 8,
+            solo_chunk_tokens: Some(4),
+            ..SchedulerConfig::default()
+        },
+        Arc::new(MockCompute::new()),
+    );
 }
