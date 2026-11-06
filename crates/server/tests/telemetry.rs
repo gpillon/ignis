@@ -428,7 +428,8 @@ async fn the_admitted_line_counts_the_chunks_run_at_the_solo_width() {
     assert_eq!(engine.prefill_chunk_solo(), Some(8));
     assert_eq!(engine_with_chunk(4).prefill_chunk_solo(), Some(4), "the prefill chunk, with no wider one");
     let (_id, mut rx) = engine
-        .submit(input((1..=10).collect(), 1), RequestClass::Interactive)
+        // Two tokens, so the request takes a lane and logs `admitted` (#518).
+        .submit(input((1..=10).collect(), 2), RequestClass::Interactive)
         .await
         .expect("submit");
     collect_tokens(&mut rx, Duration::from_secs(5))
