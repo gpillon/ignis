@@ -929,6 +929,10 @@ impl StepLeaf for CudaLeaf {
         ModelConfig::qwen38_27b().vocab as u32
     }
 
+    fn pending_token(&self, sequence: &Self::Sequence) -> Option<TokenId> {
+        sequence.pending_token().map(|token| token as TokenId)
+    }
+
     fn decode(
         &self,
         model: &Self::Model,

@@ -2440,6 +2440,131 @@ impl ConcreteScheduler {
         }
     }
 
+    /// Commit `run` for request `i` (P5-06, GitHub #154): one `Token` event
+    /// per token, in order, each through the constrained trace, the thinking
+    /// budget, the forced literal and the service work; then the schedule's
+    /// terminator, the run's finish or the spent budget ends the request. A
+    /// decode round's run comes here, and so does the token a prompt's last
+    /// prefill job emits (#518). `moved`: the device advanced with the run,
+    /// so where it ends is a GDN boundary.
+    fn commit_run(&mut self, i: usize, run: &DecodeOutcome, moved: bool, events: &mut Vec<SchedEvent>) {
+        let request_id = self.requests[i].id;
+        let DecodeOutcome {
+            tokens,
+            probabilities,
+            finish,
+            spec,
+            reasoning_redirected,
+        } = run;
+        if let Some(spec) = spec {
+            let r = &mut self.requests[i];
+            r.spec = Some(r.spec.unwrap_or_default() + *spec);
+        }
+        // P5-06 (GitHub #154): the round committed a run,
+        // emitted one event per token, in order.
+        let mut run_truncated_by_budget = false;
+        // GitHub #255: a schedule may name a token that ends
+        // its run. Checked here, where the tokens the round
+        // committed are read, because that is the only place
+        // that sees *which* token was drawn — the budget
+        // below sees only how many.
+        let mut terminated = false;
+        for (n, &token) in tokens.iter().enumerate() {
+            // GitHub #242: the probability this token held
+            // inside its own step's set, which only the
+            // backend could pair with it (the round that
+            // drew it is not the round that returned it).
+            // Absent on every unconstrained lane.
+            if let Some(&probability) = probabilities.get(n) {
+                self.requests[i]
+                    .drawn
+                    .push(crate::constrained::Draw { token, probability });
+            }
+            if let Some(close) = self.config.thinking_close.as_deref() {
+                let index = self.requests[i].tokens;
+                self.requests[i].thinking.commit(close, index, token);
+            }
+            let r = &mut self.requests[i];
+            if let Some(literal) = r.input.forced_literal.as_deref() {
+                r.forced_state.commit(literal, r.tokens, token);
+            }
+            self.requests[i].tokens += 1;
+            // Service-work decay (core-05): one quantum per
+            // generated token.
+            self.requests[i].remaining_work =
+                self.requests[i].remaining_work.saturating_sub(1);
+            events.push(SchedEvent::Token { request: request_id, token });
+            // The terminator is emitted like any other token
+            // — it was generated, and `output_tokens` that
+            // hid it would under-report the round this run
+            // actually cost — and then the run is over.
+            if self.requests[i]
+                .input
+                .constrained
+                .as_ref()
+                .is_some_and(|schedule| schedule.ends_on(token))
+            {
+                terminated = true;
+                break;
+            }
+            // The reservation cap: nothing past the final
+            // reserved token is emitted, whatever the
+            // backend committed.
+            if self.requests[i].remaining_work == 0 {
+                run_truncated_by_budget = n + 1 < tokens.len();
+                break;
+            }
+        }
+        // GitHub #315: the token this round drew for the next
+        // is a redirected `</think>`, at the index the next
+        // round emits first.
+        if *reasoning_redirected {
+            let r = &mut self.requests[i];
+            r.reasoning_redirected_at = Some(r.tokens);
+        }
+        if moved {
+            // core-06: record a GDN checkpoint at the new
+            // position (the host tier may snapshot the
+            // request at this boundary — the GDN state is
+            // resumable there). Once per round, at the end
+            // of the run: the positions inside it are not
+            // boundaries the device state ever stood on. The
+            // position is absolute over the whole sequence
+            // (prompt + generated), not just the decode-token
+            // count: P3-01's chunked prefill now checkpoints
+            // at real prompt positions too
+            // (`GdnState::checkpoint` only accepts a position
+            // `>=` the current one), so a decode checkpoint
+            // that restarted counting from 0 would be
+            // silently dropped the instant it fell behind the
+            // prompt length.
+            let new_pos = self.requests[i].input.tokens.len()
+                + self.requests[i].tokens as usize;
+            self.requests[i].checkpoint(new_pos);
+        }
+        match finish {
+            // The run closed its own shape: the schedule may
+            // have steps left and none of them will be
+            // asked for.
+            _ if terminated => {
+                self.mark_done(i, events, FinishReason::Stop)
+            }
+            // Finished (EOS or the backend's own `max_tokens`
+            // enforcement) after the whole run: Done, lane
+            // released.
+            Some(reason) if !run_truncated_by_budget => {
+                self.mark_done(i, events, *reason)
+            }
+            // The request completes on its final reserved
+            // token.
+            _ if self.requests[i].remaining_work == 0 => {
+                let reason = self.budget_spent_reason(i);
+                self.mark_done(i, events, reason)
+            }
+            _ => {}
+        }
+    }
+
     /// Complete request `idx` (its lane and KV reservation are released).
     /// `reason` is why it stopped — carried into the emitted
     /// [`SchedEvent::Done`] for the server's `finish_reason` (GitHub #61).
@@ -5011,7 +5136,7 @@ impl Scheduler for ConcreteScheduler {
                         .filter(|_| start + take >= r.input.tokens.len() as u32),
                     // GitHub #242: and the run's first step, on the same
                     // chunk and for a related reason — this prefill draws the
-                    // token the first decode round emits, so step 0's set
+                    // request's first token (#518), so step 0's set
                     // belongs here and nowhere else. `reuse_reach` is what
                     // guarantees the chunk is not empty. A forced literal
                     // that starts at the generation (GitHub #286) puts its
@@ -5029,8 +5154,8 @@ impl Scheduler for ConcreteScheduler {
                         .attention()
                         .filter(|_| start + take >= r.input.tokens.len() as u32)
                         .cloned(),
-                    // GitHub #315: the prompt's last chunk draws the token the
-                    // first decode round emits, and the block is open there.
+                    // GitHub #315: the prompt's last chunk draws the
+                    // request's first token (#518), and the block is open there.
                     reasoning_close: reasoning_close(&self.config, r)
                         .filter(|_| start + take >= r.input.tokens.len() as u32),
                     // GitHub #506: the earliest image a drafter window reads
@@ -5044,9 +5169,15 @@ impl Scheduler for ConcreteScheduler {
                         ),
                         start + take,
                     ),
+                    // `None` on the prompt's last job, whose draw is the
+                    // pending token the request emits first (#518).
+                    next_prompt_token: r.input.tokens.get((start + take) as usize).copied(),
                 }
             })
             .collect();
+        // #518: each request whose prompt's last job landed, and what that
+        // job emits.
+        let mut first_tokens: Vec<(usize, DecodeOutcome)> = Vec::new();
         if !jobs.is_empty() {
             let began = self.now();
             let result = self.compute.prefill_step(&jobs);
@@ -5102,7 +5233,7 @@ impl Scheduler for ConcreteScheduler {
                         if outcome.attention.is_some() {
                             r.attention = outcome.attention.clone();
                         }
-                        // GitHub #315: the draw the first decode round emits
+                        // GitHub #315: the request's first token (#518)
                         // is a redirected `</think>`.
                         if outcome.reasoning_redirected {
                             r.reasoning_redirected_at = Some(r.tokens);
@@ -5350,6 +5481,14 @@ impl Scheduler for ConcreteScheduler {
                                 kind,
                             });
                         }
+                        // #518: the prompt's last job drew the token the
+                        // request emits first. A decision or a warm-up ends
+                        // at its prefill and emits none.
+                        if job.next_prompt_token.is_none() && !self.requests[i].input.ends_at_prefill() {
+                            if let Some(run) = outcome.emitted {
+                                first_tokens.push((i, run));
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -5414,6 +5553,22 @@ impl Scheduler for ConcreteScheduler {
                     self.report_retained_slots(&mut events);
                     return events;
                 }
+            }
+        }
+
+        // #518 — a prompt's pending token leaves here, at the end of the
+        // prefill phase that drew it, through the pipeline a round's run
+        // takes: the schedule's terminator, the budget, the EOS. A request it
+        // does not end keeps the token as its next round's anchor, which that
+        // round commits without emitting it again. The device stands where
+        // the prefill left it, so no GDN boundary moves.
+        for (i, run) in first_tokens {
+            let left = !run.tokens.is_empty();
+            self.commit_run(i, &run, false, &mut events);
+            let r = &mut self.requests[i];
+            if left && r.state != RequestState::Done {
+                r.anchor_emitted = true;
+                r.forced_state.anchor_seen();
             }
         }
 
@@ -5548,13 +5703,16 @@ impl Scheduler for ConcreteScheduler {
                     if r.input.constrained.is_some() {
                         return None;
                     }
+                    // What both count as emitted is what precedes the
+                    // round's anchor, the token before its draw (#518).
+                    let anchor = r.anchor_index();
                     let budget = self
                         .config
                         .thinking_close
                         .as_deref()
-                        .and_then(|close| r.thinking.permitted(r.input.params.thinking_budget, close, r.tokens));
+                        .and_then(|close| r.thinking.permitted(r.input.params.thinking_budget, close, anchor));
                     match r.input.forced_literal.as_deref() {
-                        Some(literal) => r.forced_state.permitted(literal, r.tokens, budget),
+                        Some(literal) => r.forced_state.permitted(literal, anchor, budget),
                         None => budget,
                     }
                 })
@@ -5568,19 +5726,20 @@ impl Scheduler for ConcreteScheduler {
                     params: self.requests[i].input.params,
                     remaining_tokens: self.requests[i].remaining_work.min(u32::MAX as u64) as u32,
                     // GitHub #242: the set for the draw this round makes,
-                    // which is the step *after* the one it emits — the
-                    // prefill drew step 0, so a request that has emitted `n`
-                    // tokens draws step `n + 1` here. The last round asks for
-                    // a step past the end and gets `None`: its draw is
+                    // which is the step *after* its anchor's — the prefill
+                    // drew step 0, so a round whose anchor is output index
+                    // `n` draws step `n + 1` here. The last round asks for a
+                    // step past the end and gets `None`: its draw is
                     // discarded with the sequence.
                     permitted: self.requests[i]
                         .input
                         .constrained
                         .as_ref()
-                        .and_then(|schedule| schedule.step(self.requests[i].tokens as usize + 1))
+                        .and_then(|schedule| schedule.step(self.requests[i].anchor_index() as usize + 1))
                         .or(forced),
                     // GitHub #315: for the draw this round makes, too.
                     reasoning_close: reasoning_close(&self.config, &self.requests[i]),
+                    anchor_emitted: self.requests[i].anchor_emitted,
                 })
                 .collect();
             match self.compute.decode_step(&jobs) {
@@ -5604,124 +5763,15 @@ impl Scheduler for ConcreteScheduler {
                             round = self.tick,
                         )
                         .entered();
-                        let DecodeOutcome {
-                            tokens,
-                            probabilities,
-                            finish,
-                            spec,
-                            reasoning_redirected,
-                        } = res;
+                        // #518: a round whose anchor left with the prefill
+                        // emits only the drafts it accepted past it, so it
+                        // may emit nothing; the device moved all the same.
+                        let anchor_emitted = std::mem::take(&mut self.requests[i].anchor_emitted);
                         debug_assert!(
-                            !tokens.is_empty() || finish.is_some(),
+                            !res.tokens.is_empty() || res.finish.is_some() || anchor_emitted,
                             "a decode outcome commits a token or finishes the request"
                         );
-                        if let Some(spec) = spec {
-                            let r = &mut self.requests[i];
-                            r.spec = Some(r.spec.unwrap_or_default() + *spec);
-                        }
-                        // P5-06 (GitHub #154): the round committed a run,
-                        // emitted one event per token, in order.
-                        let mut run_truncated_by_budget = false;
-                        // GitHub #255: a schedule may name a token that ends
-                        // its run. Checked here, where the tokens the round
-                        // committed are read, because that is the only place
-                        // that sees *which* token was drawn — the budget
-                        // below sees only how many.
-                        let mut terminated = false;
-                        for (n, &token) in tokens.iter().enumerate() {
-                            // GitHub #242: the probability this token held
-                            // inside its own step's set, which only the
-                            // backend could pair with it (the round that
-                            // drew it is not the round that returned it).
-                            // Absent on every unconstrained lane.
-                            if let Some(&probability) = probabilities.get(n) {
-                                self.requests[i]
-                                    .drawn
-                                    .push(crate::constrained::Draw { token, probability });
-                            }
-                            if let Some(close) = self.config.thinking_close.as_deref() {
-                                let index = self.requests[i].tokens;
-                                self.requests[i].thinking.commit(close, index, token);
-                            }
-                            let r = &mut self.requests[i];
-                            if let Some(literal) = r.input.forced_literal.as_deref() {
-                                r.forced_state.commit(literal, r.tokens, token);
-                            }
-                            self.requests[i].tokens += 1;
-                            // Service-work decay (core-05): one quantum per
-                            // generated token.
-                            self.requests[i].remaining_work =
-                                self.requests[i].remaining_work.saturating_sub(1);
-                            events.push(SchedEvent::Token { request: request_id, token });
-                            // The terminator is emitted like any other token
-                            // — it was generated, and `output_tokens` that
-                            // hid it would under-report the round this run
-                            // actually cost — and then the run is over.
-                            if self.requests[i]
-                                .input
-                                .constrained
-                                .as_ref()
-                                .is_some_and(|schedule| schedule.ends_on(token))
-                            {
-                                terminated = true;
-                                break;
-                            }
-                            // The reservation cap: nothing past the final
-                            // reserved token is emitted, whatever the
-                            // backend committed.
-                            if self.requests[i].remaining_work == 0 {
-                                run_truncated_by_budget = n + 1 < tokens.len();
-                                break;
-                            }
-                        }
-                        // GitHub #315: the token this round drew for the next
-                        // is a redirected `</think>`, at the index the next
-                        // round emits first.
-                        if *reasoning_redirected {
-                            let r = &mut self.requests[i];
-                            r.reasoning_redirected_at = Some(r.tokens);
-                        }
-                        if !tokens.is_empty() {
-                            // core-06: record a GDN checkpoint at the new
-                            // position (the host tier may snapshot the
-                            // request at this boundary — the GDN state is
-                            // resumable there). Once per round, at the end
-                            // of the run: the positions inside it are not
-                            // boundaries the device state ever stood on. The
-                            // position is absolute over the whole sequence
-                            // (prompt + generated), not just the decode-token
-                            // count: P3-01's chunked prefill now checkpoints
-                            // at real prompt positions too
-                            // (`GdnState::checkpoint` only accepts a position
-                            // `>=` the current one), so a decode checkpoint
-                            // that restarted counting from 0 would be
-                            // silently dropped the instant it fell behind the
-                            // prompt length.
-                            let new_pos = self.requests[i].input.tokens.len()
-                                + self.requests[i].tokens as usize;
-                            self.requests[i].checkpoint(new_pos);
-                        }
-                        match finish {
-                            // The run closed its own shape: the schedule may
-                            // have steps left and none of them will be
-                            // asked for.
-                            _ if terminated => {
-                                self.mark_done(i, &mut events, FinishReason::Stop)
-                            }
-                            // Finished (EOS or the backend's own `max_tokens`
-                            // enforcement) after the whole run: Done, lane
-                            // released.
-                            Some(reason) if !run_truncated_by_budget => {
-                                self.mark_done(i, &mut events, *reason)
-                            }
-                            // The request completes on its final reserved
-                            // token.
-                            _ if self.requests[i].remaining_work == 0 => {
-                                let reason = self.budget_spent_reason(i);
-                                self.mark_done(i, &mut events, reason)
-                            }
-                            _ => {}
-                        }
+                        self.commit_run(i, res, !res.tokens.is_empty() || anchor_emitted, &mut events);
                     }
                 }
                 Err(e) => {

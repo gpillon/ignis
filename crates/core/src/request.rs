@@ -125,6 +125,10 @@ pub struct Request {
     /// Progress through the request's forced literal
     /// ([`crate::types::RequestInput::forced_literal`], GitHub #286).
     pub forced_state: crate::forced_literal::ForcedState,
+    /// The **pending token** already left (#518): the prompt's last prefill
+    /// job emitted it, and the next decode round takes it as its anchor
+    /// without emitting it again. Cleared by that round.
+    pub anchor_emitted: bool,
     /// The resources this request reserves while it holds a lane (core-05:
     /// the admission state machine's KV reservation, charged at deal and
     /// released at completion — the pool never over-allocates).
@@ -300,6 +304,7 @@ impl Request {
             thinking: crate::thinking_budget::BudgetState::default(),
             reasoning_redirected_at: None,
             forced_state: crate::forced_literal::ForcedState::default(),
+            anchor_emitted: false,
             resources,
             remaining_work,
             backfill_epoch: 0,
@@ -817,7 +822,16 @@ impl Request {
         self.thinking = crate::thinking_budget::BudgetState::default();
         self.reasoning_redirected_at = None;
         self.forced_state = crate::forced_literal::ForcedState::default();
+        // #518: and the re-prefill emits its own first token.
+        self.anchor_emitted = false;
         true
+    }
+
+    /// The output index of the next decode round's anchor (#518): `tokens`,
+    /// or one less while the anchor is a pending token the prefill already
+    /// emitted. The round's draw is the index after it.
+    pub fn anchor_index(&self) -> u32 {
+        self.tokens - u32::from(self.anchor_emitted)
     }
 
     /// Give up the device claim of a request still waiting for its admission

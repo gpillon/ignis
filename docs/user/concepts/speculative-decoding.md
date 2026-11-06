@@ -37,7 +37,9 @@ tokens are almost equally likely, and sampling keeps its distribution. The
 drafter can only change how many tokens a round yields, called the **acceptance**.
 
 The server streams a committed run one token at a time, so a client sees no
-difference in shape.
+difference in shape. The first round after a prompt has the first token as its
+anchor, which the server already sent when the prefill ended, so that round
+sends only the drafts it accepted, between 0 and `k` tokens.
 
 ## DFlash2, for the 27B
 

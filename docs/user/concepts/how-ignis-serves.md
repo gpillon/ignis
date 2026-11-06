@@ -133,9 +133,16 @@ Flash-Next keep 15.6-18.3 tokens per second during a prefill instead of about 1
 A prompt that arrives alone, or with no lane decoding, is unaffected: nothing
 waits.
 
+The first token leaves as soon as the prompt's last chunk is done: the server
+streams it before any decode round runs, even while every decode lane is taken.
+A request that ends on it (`max_tokens: 1`, or an end-of-sequence token) never
+takes a lane at all, and one whose first token completes a stop sequence ends
+there, its answer cut at the stop as always.
+
 ### 4. Decode generates, one round for every lane
 
-Once prefilled, a request holds a decode lane. A **decode round** is one
+Once prefilled, a request holds a decode lane. Its first round starts from the
+first token, already sent, and does not send it again. A **decode round** is one
 traversal of the model for all decoding lanes together: the lanes are rows of
 one batch, so eight lanes stream the weights once instead of eight times.
 The round is replayed from a CUDA graph captured for each exact batch width
@@ -161,8 +168,9 @@ into channels:
 - **Tool calls** are parsed out of the content into the API's tool-call shape.
 
 Chat completions stream as server-sent events; the Responses API streams the
-same way over HTTP or over a WebSocket. A speculative round can commit several
-tokens at once, and the server still streams them one at a time.
+same way over HTTP or over a WebSocket. The first token arrives alone, at the
+end of the prefill; then each round's tokens follow. A speculative round can
+commit several tokens at once, and the server still streams them one at a time.
 
 Between the engine and the client, a small task watches the reasoning for a
 loop and can take it back ([reasoning and the loop guard](reasoning.md)). At

@@ -388,7 +388,9 @@ async fn a_chunked_prefill_reports_its_phase_summary_through_the_real_engine() {
     let (log_sink, _guard) = capture_events();
     let engine = engine_with_chunk(4);
     let (_id, mut rx) = engine
-        .submit(input((1..=10).collect(), 1), RequestClass::Interactive)
+        // Two tokens: a request that ends on its first, which leaves with the
+        // prefill (#518), never takes a lane and logs no `admitted` line.
+        .submit(input((1..=10).collect(), 2), RequestClass::Interactive)
         .await
         .expect("submit");
     collect_tokens(&mut rx, Duration::from_secs(5))

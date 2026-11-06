@@ -638,6 +638,10 @@ impl StepLeaf for FlashNextLeaf {
         Ok(drawn.probability)
     }
 
+    fn pending_token(&self, sequence: &Self::Sequence) -> Option<TokenId> {
+        sequence.seq.pending_token().map(|token| token as TokenId)
+    }
+
     fn decode(
         &self,
         model: &Self::Model,

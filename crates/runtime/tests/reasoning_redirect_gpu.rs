@@ -63,6 +63,7 @@ fn prefill(compute: &dyn Compute, request: u64, permitted: Option<&[TokenId]>, c
         attention: None,
         reasoning_close: close,
         drafter_floor: 0,
+        next_prompt_token: None,
     };
     let outcomes = compute.prefill_step(&[job]).unwrap_or_else(|e| panic!("prefill_step {request}: {e}"));
     outcomes[0].reasoning_redirected
@@ -76,6 +77,7 @@ fn round(compute: &dyn Compute, request: u64, permitted: Option<&[TokenId]>, clo
         remaining_tokens: MAX_TOKENS,
         permitted: permitted.map(|ids| ids.to_vec().into()),
         reasoning_close: close,
+        anchor_emitted: false,
     };
     compute
         .decode_step(&[job])

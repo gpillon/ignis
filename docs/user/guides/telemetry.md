@@ -21,7 +21,11 @@ Everything goes through one structured log on stdout, in the format
 - The `ttft` line's `duration_ms` runs from the submission to the first
   token, and `after_prefill_ms` from the prefill chunk that completed the
   prompt to that token: what the first token waited for once the prompt
-  was read.
+  was read. The first token leaves at the end of the prefill, before the
+  request is dealt a decode lane, so `ttft` comes before `admitted` and
+  names a `lane` only when one was dealt first. A request that ends on its
+  first token (`max_tokens: 1`, an end-of-sequence token) never takes a
+  lane and logs no `admitted` line.
 - A request with images says what they cost on the line it ends with,
   `done` or `cancelled`: `media.items`, `media.vision_tokens` (after any
   downscale to `--vision-max-tokens`) and `media.natural_vision_tokens`,

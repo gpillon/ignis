@@ -154,8 +154,8 @@ pub struct PrefillJob {
     ///
     /// Set for the same reason and on the same chunk as
     /// [`PrefillJob::readout`], and for one more: a prefill *draws the first
-    /// token of the run that follows it*, which the first decode round then
-    /// returns ([`crate::constrained`]). A constrained decode that constrained only its
+    /// token of the run that follows it*, which leaves with the prefill (#518)
+    /// ([`crate::constrained`]). A constrained decode that constrained only its
     /// rounds would commit the prompt's own free successor as the first
     /// token of its forced text.
     ///
@@ -185,8 +185,8 @@ pub struct PrefillJob {
     pub attention: Option<crate::pointing::AttentionQuery>,
     /// The `</think>` this chunk's own draw is redirected to when it is the
     /// request's stop id (GitHub #315, ADR 0048): set on the chunk that ends
-    /// at the prompt's last position -- whose draw the first decode round
-    /// emits -- for a request that starts inside its reasoning block. `None`
+    /// at the prompt's last position -- whose draw is the request's first
+    /// token (#518) -- for a request that starts inside its reasoning block. `None`
     /// on every other job ([`DecodeJob::reasoning_close`]).
     pub reasoning_close: Option<TokenId>,
     /// The **drafter floor** (GitHub #506): the first prompt position whose
@@ -199,6 +199,11 @@ pub struct PrefillJob {
     /// so a job whose span lies wholly below it taps nothing; 0 is the span
     /// rule alone. Unread on a load without the drafter.
     pub drafter_floor: u32,
+    /// The prompt token right after this job's span, or `None` on the job
+    /// that ends at the prompt's last position: the job whose draw is the
+    /// sequence's **pending token**. A backend reports that token on this
+    /// job's outcome ([`PrefillOutcome::emitted`], #518).
+    pub next_prompt_token: Option<TokenId>,
 }
 
 impl PrefillJob {
@@ -235,8 +240,9 @@ pub struct DecodeJob {
     /// ([`crate::constrained`]): a round returns the token the previous call
     /// drew. So a K-step run's round `i` carries step `i`'s set and
     /// returns step `i-1`'s token; its first round carries step 1 and
-    /// returns the token [`PrefillJob::permitted`] drew; and its last round
-    /// carries `None`, drawing a token nobody reads.
+    /// returns nothing, since the token [`PrefillJob::permitted`] drew left
+    /// with the prefill (#518); and its last round carries `None`, drawing a
+    /// token nobody reads.
     ///
     /// [`DecodeOutcome::probabilities`] is paired with the tokens the round
     /// *emits*, so it is the backend that holds the lag — a `Compute`
@@ -256,6 +262,12 @@ pub struct DecodeJob {
     /// yet, so the leaf also closes the block for the rest of a round that
     /// commits a `</think>`.
     pub reasoning_close: Option<TokenId>,
+    /// The round's anchor -- the sequence's pending token -- already left
+    /// with the prefill ([`PrefillOutcome::emitted`], #518). The backend
+    /// commits it as on any round but does not emit it again, and
+    /// `remaining_tokens` does not count it: a plain round then emits
+    /// nothing, a verify round its accepted drafts.
+    pub anchor_emitted: bool,
 }
 
 /// One job's result from a prefill step (GitHub #192): what the chunk cost
@@ -324,9 +336,20 @@ pub struct PrefillOutcome {
     /// point read off some other copy of the keys, and never a partial set.
     pub attention: Option<crate::pointing::AttentionScores>,
     /// The chunk's draw was a stop id the leaf turned into its
-    /// [`PrefillJob::reasoning_close`] (GitHub #315): the first decode round
-    /// emits that `</think>`.
+    /// [`PrefillJob::reasoning_close`] (GitHub #315): the pending token is
+    /// that `</think>`.
     pub reasoning_redirected: bool,
+    /// What the prompt's last job emits (#518): its **pending token** as a
+    /// run of one, with its probability within a constrained decode's set,
+    /// or no token and [`FinishReason::Stop`] when the pending token is the
+    /// EOS. `None` on every other job, and from a backend that emits nothing
+    /// at the prefill: the first decode round then emits the token.
+    ///
+    /// The scheduler emits it at the end of the prefill phase, through the
+    /// same pipeline as a round's run; the round that follows takes the
+    /// token as its anchor and does not emit it again
+    /// ([`DecodeJob::anchor_emitted`]).
+    pub emitted: Option<DecodeOutcome>,
 }
 
 impl PrefillOutcome {
@@ -347,7 +370,10 @@ impl PrefillOutcome {
 /// [`SchedEvent::Done`] it emits, which the server maps to `finish_reason` —
 /// after whatever tokens preceded it in the round: a run cut at EOS is the
 /// tokens before the EOS plus [`FinishReason::Stop`]. `tokens` is empty only
-/// on a finished outcome.
+/// on a finished outcome, and on the round after the prefill emitted its
+/// anchor ([`DecodeJob::anchor_emitted`]) when it accepted no draft (#518).
+/// The prefill's own emission takes this shape too
+/// ([`PrefillOutcome::emitted`]).
 ///
 /// `Eq` is deliberately absent: `probabilities` is `f32`, and a decode
 /// outcome is compared for equality in tests and nowhere else.

@@ -1030,9 +1030,18 @@ past the job's end where a window is read — a prefix it publishes, its
 from the later of its own last 2048 positions and its floor; a job wholly
 below its floor taps nothing (GitHub #506).
 
+**Pending token**:
+The token a sequence has drawn and not yet emitted: the next round's anchor.
+A prompt's last prefill job draws the first one, and the scheduler emits it at
+the end of the prefill phase of that step, before any decode round and whether
+or not a lane is free (#518); the round that follows takes it as its anchor
+and does not emit it again. Each round after draws the next. Not a **draw**,
+which is a constrained decode's emitted token and its probability.
+_Avoid_: pending draw, pending successor.
+
 **Verify round**:
 The speculative form of the **decode round** (P5-04): each lane contributes
-`k+1` columns — its anchor (the pending successor) followed by the drafts, the
+`k+1` columns — its anchor (the **pending token**) followed by the drafts, the
 tail padded with the anchor — and the 64 layers traverse the batch's columns
 once, the GQA layers appending every valid column and the GDN layers recording
 instead of advancing. Selected per call through the decode options at the
@@ -1048,14 +1057,16 @@ committed token.
 The tokens a verify round emits for a lane: the anchor plus the accepted
 drafts, cut at the first stop id inclusive (1..k+1). The KV frontier, the GDN
 slot and the pending token move by exactly the run, so a sequence never stands
-past the text it emitted.
+past the text it emitted. The first round after a prompt commits the anchor
+its prefill already emitted and emits only the accepted drafts (0..k, #518).
 
 **Prefill outcome**:
 What one prefill chunk cost beyond warming its KV (`PrefillOutcome`,
-GitHub #192): today the microseconds the leaf spent encoding a media item,
+GitHub #192): the microseconds the leaf spent encoding a media item,
 which is 0 on a text chunk and on one that reuses an embedding an earlier chunk
-of the same item encoded. One per job, in order, the way a committed run crosses the
-seam per lane; the request log sums them into `media.encode_seconds`.
+of the same item encoded, and on the prompt's last job the **pending token** it
+emits (#518). One per job, in order, the way a committed run crosses the
+seam per lane; the request log sums the encode into `media.encode_seconds`.
 
 **ReplaySSM record and fold**:
 How the GDN layers speculate without advancing: the verify traversal records

@@ -236,6 +236,7 @@ fn decode_batch(
             attention: None,
             reasoning_close: None,
             drafter_floor: 0,
+            next_prompt_token: None,
         })
         .collect();
     compute.prefill_step(&jobs).unwrap_or_else(|e| panic!("prefill_step: {e}"));
@@ -254,6 +255,7 @@ fn decode_batch(
                 remaining_tokens: MAX_GENERATED - generated[i],
                 permitted: None,
                 reasoning_close: None,
+                anchor_emitted: false,
             })
             .collect();
         let outcomes = compute.decode_step(&jobs).unwrap_or_else(|e| panic!("decode_step: {e}"));

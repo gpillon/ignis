@@ -169,7 +169,9 @@ fn a_run_past_the_budget_is_cut_at_the_budget_and_finishes_with_length() {
 #[test]
 fn every_decode_job_carries_the_requests_remaining_budget() {
     // The leaf clamps a lane's extent to this budget, so a sequence never
-    // commits past the text its request may emit.
+    // commits past the text its request may emit. The first token left with
+    // the prefill (#518): the first round's budget is 6, and its anchor,
+    // which it does not emit again, is not counted in it.
     let mock = Arc::new(MockCompute::with_runs(&[3]));
     let mut sched = scheduler(mock.clone());
     submit(&mut sched, 7);
@@ -181,7 +183,9 @@ fn every_decode_job_carries_the_requests_remaining_budget() {
         .iter()
         .map(|batch| batch[0].remaining_tokens)
         .collect();
-    assert_eq!(budgets, vec![7, 4, 1]);
+    assert_eq!(budgets, vec![6, 4, 1]);
+    let anchors: Vec<bool> = mock.decode_calls().iter().map(|batch| batch[0].anchor_emitted).collect();
+    assert_eq!(anchors, vec![true, false, false], "only the first round's anchor had left");
 }
 
 #[test]
