@@ -58,6 +58,13 @@ pub type EventStream = UnboundedReceiver<SchedEvent>;
 /// A request's event route (the engine's side of its stream).
 pub type EventRoute = UnboundedSender<SchedEvent>;
 
+/// What the model thread asks of a request's first token (#518): whether it
+/// completes one of the caller's stop sequences. The handler builds it from
+/// the pipeline it reads the answer with, so it answers as the handler will
+/// on the same token; a request it stops ends before the lane deal, with no
+/// decode round and no drafter proposal.
+pub type FirstTokenStop = Box<dyn FnMut(TokenId) -> bool + Send>;
+
 /// A command sent from the async/HTTP side to the model thread: `submit`
 /// (design §"the command channel") and `cancel`, the two operations that
 /// must reach the scheduler the model thread owns. `model_id` is static,
@@ -72,6 +79,9 @@ enum Command {
         /// carried with the submission so it reaches telemetry before
         /// `Admitted`.
         notes: RequestNotes,
+        /// Asked of the request's first token (#518), when it has stop
+        /// sequences.
+        first_stop: Option<FirstTokenStop>,
         reply: oneshot::Sender<Result<(RequestId, EventStream), SubmitError>>,
     },
     /// Whether the scheduler would refuse a request for good, whatever is
@@ -441,8 +451,22 @@ impl Engine {
         class: RequestClass,
         notes: RequestNotes,
     ) -> Result<(RequestId, EventStream), SubmitError> {
+        self.submit_stopping(input, class, notes, None).await
+    }
+
+    /// [`Engine::submit_with_notes`] for a request with stop sequences:
+    /// `first_stop` is asked of its first token on the model thread (#518),
+    /// and a request whose first token completes one ends there, as if its
+    /// budget had.
+    pub async fn submit_stopping(
+        &self,
+        input: RequestInput,
+        class: RequestClass,
+        notes: RequestNotes,
+        first_stop: Option<FirstTokenStop>,
+    ) -> Result<(RequestId, EventStream), SubmitError> {
         let (reply, reply_rx) = oneshot::channel();
-        if self.commands.send(Command::Submit { input, class, notes, reply }).is_err() {
+        if self.commands.send(Command::Submit { input, class, notes, first_stop, reply }).is_err() {
             return Err(SubmitError::Full);
         }
         let mut pending = Unread { engine: self, reply: reply_rx, read: false };
@@ -566,6 +590,7 @@ fn model_thread_loop(
     freed: watch::Sender<u64>,
 ) {
     let mut streams: HashMap<RequestId, EventRoute> = HashMap::new();
+    let mut first_stops: HashMap<RequestId, FirstTokenStop> = HashMap::new();
     // A request was cancelled since the last step. The scheduler releases it
     // no later than its next step, and only then does `freed` move: a
     // submission handled before that step still finds the engine full.
@@ -574,7 +599,9 @@ fn model_thread_loop(
         loop {
             match commands.try_recv() {
                 Ok(Command::Shutdown) => return end_in_flight(&mut *scheduler, &mut streams, &facts),
-                Ok(command) => cancelled |= handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
+                Ok(command) => {
+                    cancelled |= handle_command(command, &mut *scheduler, &mut streams, &mut first_stops, &facts, &freed)
+                }
                 Err(std_mpsc::TryRecvError::Empty) => break,
                 // Every Engine handle was dropped: clean shutdown (no
                 // in-flight request is silently dropped — the process is
@@ -584,9 +611,17 @@ fn model_thread_loop(
         }
         if !scheduler.is_idle() {
             // #518: what the step's prefill phase emitted -- a prompt's first
-            // token among it -- is routed before its decode round runs.
-            let events = scheduler
-                .advance_with(&mut |prefilled| route_events(&prefilled, &mut streams, &facts, &freed));
+            // token among it -- is routed before its decode round runs, and a
+            // first token that completes a stop sequence ends its request
+            // before the lane deal.
+            let events = scheduler.advance_with(&mut |prefilled| {
+                let stopped = first_token_stops(&prefilled, &mut first_stops);
+                route_events(&prefilled, &mut streams, &facts, &freed);
+                stopped
+            });
+            // A round's tokens follow the lane deal: a stop among them is the
+            // handler's to act on, as it always was.
+            let _ = first_token_stops(&events, &mut first_stops);
             route_events(&events, &mut streams, &facts, &freed);
             if std::mem::take(&mut cancelled) {
                 free(&freed);
@@ -611,7 +646,9 @@ fn model_thread_loop(
         // ~no CPU either way, but this is the tighter of the two).
         match commands.recv() {
             Ok(Command::Shutdown) => return end_in_flight(&mut *scheduler, &mut streams, &facts),
-            Ok(command) => cancelled |= handle_command(command, &mut *scheduler, &mut streams, &facts, &freed),
+            Ok(command) => {
+                cancelled |= handle_command(command, &mut *scheduler, &mut streams, &mut first_stops, &facts, &freed)
+            }
             Err(_) => return,
         }
     }
@@ -657,11 +694,12 @@ fn handle_command(
     command: Command,
     scheduler: &mut dyn Scheduler,
     streams: &mut HashMap<RequestId, EventRoute>,
+    first_stops: &mut HashMap<RequestId, FirstTokenStop>,
     facts: &UnboundedSender<TelemetryFact>,
     freed: &watch::Sender<u64>,
 ) -> bool {
     match command {
-        Command::Submit { input, class, notes, reply } => {
+        Command::Submit { input, class, notes, first_stop, reply } => {
             // P3-06: the request log's `prompt_tokens` field is read here,
             // before `input` moves into `submit` — the scheduler's own
             // `Request` is not reachable from the telemetry consumer.
@@ -669,6 +707,9 @@ fn handle_command(
             let result = scheduler.submit(input, class).map(|id| {
                 let (route, stream) = unbounded_channel();
                 streams.insert(id, route);
+                if let Some(first_stop) = first_stop {
+                    first_stops.insert(id, first_stop);
+                }
                 let _ = facts.send(TelemetryFact::Submitted(id, prompt_tokens, class, notes));
                 (id, stream)
             });
@@ -676,6 +717,7 @@ fn handle_command(
             // running: what was admitted for it is cancelled here, as its
             // own drop would have.
             if let Err(Ok((request, _))) = reply.send(result) {
+                first_stops.remove(&request);
                 if scheduler.cancel(request) {
                     streams.remove(&request);
                     let _ = facts.send(TelemetryFact::Cancelled(request, CancelCause::Consumer));
@@ -687,6 +729,7 @@ fn handle_command(
             let _ = reply.send(scheduler.refusal(&input));
         }
         Command::Cancel { request } => {
+            first_stops.remove(&request);
             if scheduler.cancel(request) {
                 streams.remove(&request);
                 return true;
@@ -703,6 +746,30 @@ fn handle_command(
         Command::Shutdown => {}
     }
     false
+}
+
+/// The requests whose first token among `events` completes a stop sequence
+/// ([`FirstTokenStop`], #518). A request's probe goes at its first token or
+/// at its end, whichever comes first: it asks of one token only.
+fn first_token_stops(events: &[SchedEvent], probes: &mut HashMap<RequestId, FirstTokenStop>) -> Vec<RequestId> {
+    let mut stopped = Vec::new();
+    if probes.is_empty() {
+        return stopped;
+    }
+    for event in events {
+        match event {
+            SchedEvent::Token { request, token } => {
+                if probes.remove(request).is_some_and(|mut probe| probe(*token)) {
+                    stopped.push(*request);
+                }
+            }
+            SchedEvent::Done { request, .. } => {
+                probes.remove(request);
+            }
+            _ => {}
+        }
+    }
+    stopped
 }
 
 /// Route one step's emitted events into their registered per-request
@@ -1449,7 +1516,7 @@ mod tests {
         fn advance(&mut self) -> Vec<SchedEvent> {
             unreachable!("the model thread steps through advance_with")
         }
-        fn advance_with(&mut self, prefilled: &mut dyn FnMut(Vec<SchedEvent>)) -> Vec<SchedEvent> {
+        fn advance_with(&mut self, prefilled: &mut dyn FnMut(Vec<SchedEvent>) -> Vec<RequestId>) -> Vec<SchedEvent> {
             self.stepped = true;
             prefilled(vec![SchedEvent::Token { request: ProtectedBatchScheduler::ID, token: 7 }]);
             let _ = self.round.recv();

@@ -979,7 +979,13 @@ pub trait Scheduler: Send {
     /// streams them on at once makes none of them wait for the round. The
     /// default hands nothing early, so a scheduler without phases streams its
     /// step whole, as [`Scheduler::advance`] does.
-    fn advance_with(&mut self, prefilled: &mut dyn FnMut(Vec<SchedEvent>)) -> Vec<SchedEvent> {
+    ///
+    /// `prefilled` answers with the requests it ends on the first token it
+    /// was just handed, a stop sequence that token completed: each ends with
+    /// [`FinishReason::Stop`] before the lane deal, so it takes no lane and
+    /// no decode round. An id whose first token was not in that hand-off is
+    /// ignored.
+    fn advance_with(&mut self, prefilled: &mut dyn FnMut(Vec<SchedEvent>) -> Vec<RequestId>) -> Vec<SchedEvent> {
         let _ = prefilled;
         self.advance()
     }
