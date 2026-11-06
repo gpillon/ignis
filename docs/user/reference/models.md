@@ -43,8 +43,8 @@ Each built-in model on each card ignis runs on, as the server decides it from th
 | `ignis-image-2.1-turbo` | loads | loads | refused (class) | refused (class, generation) | refused (class, generation) | refused (class, generation) |
 | `qwen3.8-27b-16g` | loads | loads | loads | loads | loads | loads |
 | `qwen3.8-27b-abliterated-16g` | loads | loads | loads | loads | loads | loads |
-| `swift-1.5-27b` | loads | loads | served by `swift-1.5-27b-16g` | refused (class, generation) | refused (class, generation) | refused (class, generation) |
-| `swift-1.5-27b-16g` | loads | loads | loads | refused (generation) | refused (generation) | refused (generation) |
+| `swift-1.5-27b` | loads | loads | served by `swift-1.5-27b-16g` | served by `swift-1.5-27b-16g` | served by `swift-1.5-27b-16g` | served by `swift-1.5-27b-16g` |
+| `swift-1.5-27b-16g` | loads | loads | loads | loads | loads | loads |
 
 The speech models and the diarizer (`qwen3-asr-1.7b`, `qwen3-asr-1.7b-q8`, `qwen3-asr-0.6b`, `nemotron-3-diarization`) run on the CPU, beside whichever model the card holds, on every card.
 

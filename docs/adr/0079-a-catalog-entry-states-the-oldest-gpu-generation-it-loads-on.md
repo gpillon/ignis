@@ -4,6 +4,9 @@ status: accepted
 
 # A catalog entry states the oldest GPU generation it loads on
 
+**Amended by #529** (2026-11-07): Swift 1.5's trellis build states no
+generation, as the 27B's two 16 GB entries; see the amendment at the end.
+
 On RTX 30 and RTX 40 cards (spec #474) a card's memory no longer says what it
 loads: an RTX 3090 or RTX 4090 has 24 GB, but not the FP4 tensor cores the
 NVFP4 27B prefills on nor the block-scaled FP8 the image model runs on. The
@@ -53,3 +56,24 @@ built-in profile for it, **`rtx-24gb`**, and the 16 GB profile is renamed
   still needs the alias to the 16 GB entry.
 - **The route checks alone.** Rejected: they run after a switch has torn the
   loaded model down, and the lists would offer models the card cannot run.
+
+## Amendment (2026-11-07): Swift 1.5's trellis build states no generation (#529)
+
+`swift-1.5-27b-16g` stated `blackwell` as a trellis build not yet verified
+below Blackwell. It now states none, as the 27B's two 16 GB entries do, so on
+an RTX 30 or RTX 40 card it loads and answers to `swift-1.5-27b`. Two facts
+admit it, and neither is a run of Swift on an sm_86 card:
+
+- **Its layout is the 16 GB 27B's.** Its conversion sidecar matches that
+  build's field for field once hashes, quantization errors and provenance are
+  set aside: the same trellis matrices and formats, the same copied objects,
+  the same locally quantized NVFP4 drafter, the same byte count. The engine
+  picks its routes by family and body format, never by weights id, and the
+  16 GB 27B has loaded, prefilled and decoded on an sm_86 card (#484).
+- **Its quality on the 8.x routes passed.** #513's RTX 5090 leg ran it on the
+  dense prefill and the integer band: KLD ratio against V0 1.0148
+  [0.9892, 1.0340], and 1.0143 [1.0022, 1.0264] with ignis's own GDN prefill,
+  against a limit of 1.05.
+
+A Swift run on an sm_86 card would move its numbers, not decide whether it
+loads; the 16 GB 27B's run there read the RTX 5090's quality.

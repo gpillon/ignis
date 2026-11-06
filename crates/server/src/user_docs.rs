@@ -531,14 +531,9 @@ mod tests {
             format!("| `qwen3.8-27b-abliterated` | loads | loads | {abliterated} | {abliterated} | {abliterated} | {abliterated} |")
         );
         assert_eq!(row("qwen3.8-27b-abliterated-16g"), "| `qwen3.8-27b-abliterated-16g` | loads | loads | loads | loads | loads | loads |");
-        assert_eq!(
-            row("swift-1.5-27b"),
-            "| `swift-1.5-27b` | loads | loads | served by `swift-1.5-27b-16g` | refused (class, generation) | refused (class, generation) | refused (class, generation) |"
-        );
-        assert_eq!(
-            row("swift-1.5-27b-16g"),
-            "| `swift-1.5-27b-16g` | loads | loads | loads | refused (generation) | refused (generation) | refused (generation) |"
-        );
+        let swift = "served by `swift-1.5-27b-16g`";
+        assert_eq!(row("swift-1.5-27b"), format!("| `swift-1.5-27b` | loads | loads | {swift} | {swift} | {swift} | {swift} |"));
+        assert_eq!(row("swift-1.5-27b-16g"), "| `swift-1.5-27b-16g` | loads | loads | loads | loads | loads | loads |", "GitHub #529");
         assert_eq!(
             row("qwen3.8-flash-next"),
             "| `qwen3.8-flash-next` | loads | loads | refused (class) | refused (class, generation) | refused (class, generation) | refused (class, generation) |"

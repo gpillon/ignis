@@ -96,9 +96,8 @@ An entry may also state the oldest **GPU generation** it loads on,
 The server reads the card's generation from its compute capability at start:
 8.6 is Ampere (RTX 30), 8.9 Ada (RTX 40), 12.x Blackwell (RTX 50, RTX PRO).
 An entry that states none loads on every generation the build runs on. On an
-RTX 3090 or RTX 4090, `qwen3.8-27b` and
-`qwen3.8-27b-abliterated` are served by their 16 GB entries through their
-aliases, and an entry no alias serves is refused as for the class, with
+RTX 3090 or RTX 4090, `qwen3.8-27b`, `qwen3.8-27b-abliterated` and
+`swift-1.5-27b` are served by their 16 GB entries through their aliases, and an entry no alias serves is refused as for the class, with
 `409 model_above_gpu_generation`: a switch to it, a request naming it, a start
 with no artifact that would load it and its `model download`. The message
 names what the entry needs and the card: its name, compute capability and

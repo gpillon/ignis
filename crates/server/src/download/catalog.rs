@@ -961,9 +961,9 @@ mod tests {
     /// built-in entry states its card class (ADR 0064 §1: an operator's may
     /// leave it out, a built-in one never does), the 32 GB one for each but
     /// the three 16 GB entries, and its generation by one rule (spec #474, ADR
-    /// 0079): `blackwell` for an NVFP4 artifact, Flash-Next, the image model
-    /// and a trellis build not yet verified below Blackwell (Swift 1.5's),
-    /// none for the 27B's two 16 GB entries. The three 16 GB entries are the
+    /// 0079): `blackwell` for an NVFP4 artifact, Flash-Next and the image
+    /// model, none for the three 16 GB entries (Swift 1.5's since GitHub
+    /// #529). The three 16 GB entries are the
     /// only ones with an alias: the 16 GB 27B's (GitHub #338,
     /// spec 27b-16gb/01) `qwen3.8-27b`, its uncensored variant's build's
     /// (GitHub #423, ADR 0074) `qwen3.8-27b-abliterated`, and Swift 1.5's
@@ -1115,7 +1115,7 @@ mod tests {
             "3fe94555a30b3df89a283bf61338281243642166",
             "qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer",
             16,
-            Some(GpuGeneration::Blackwell),
+            None,
             ModelFamily::Qwen38_27b,
             &["swift-1.5-27b"],
             &[
@@ -1850,20 +1850,22 @@ mod tests {
     }
 
     /// Spec #474 on an RTX 3090 and an RTX 4090 (24 GiB; 8.6 and 8.9): the
-    /// 27B's and the uncensored variant's ids are served by their 16 GB
-    /// builds, which state no generation. Every Blackwell-only entry is refused
-    /// `model_above_gpu_generation`, naming what it needs and the card — its
-    /// name, compute capability and generation — and its class as well, which
-    /// is above the card's too. Swift 1.5's trellis build states `blackwell`,
-    /// not yet verified below it, so no entry answers to Swift's id here, and
-    /// the build is refused by its generation alone.
+    /// 27B's, the uncensored variant's and Swift 1.5's ids are served by their
+    /// 16 GB builds, which state no generation (Swift's since GitHub #529).
+    /// Every Blackwell-only entry is refused `model_above_gpu_generation`,
+    /// naming what it needs and the card — its name, compute capability and
+    /// generation — and its class as well, which is above the card's too.
     #[test]
     fn on_an_rtx_3090_or_4090_the_blackwell_only_entries_are_refused_by_generation() {
         let catalog = Catalog::built_in();
         for (card, capability, generation) in [(rtx_3090(), "8.6", "Ampere"), (rtx_4090(), "8.9", "Ada")] {
             assert_eq!((card.class(), card.generation().map(|generation| generation.to_string())), (Some(CardClass::Gb24), Some(generation.to_owned())));
             let card = Some(&card);
-            for (id, answering) in [("qwen3.8-27b", "qwen3.8-27b-16g"), ("qwen3.8-27b-abliterated", "qwen3.8-27b-abliterated-16g")] {
+            for (id, answering) in [
+                ("qwen3.8-27b", "qwen3.8-27b-16g"),
+                ("qwen3.8-27b-abliterated", "qwen3.8-27b-abliterated-16g"),
+                ("swift-1.5-27b", "swift-1.5-27b-16g"),
+            ] {
                 assert_eq!(resolved(catalog, id, card), Ok(answering), "{generation}");
                 assert_eq!(catalog.answering(answering, card), Ok(None), "{answering} on {generation}: it stands as it is");
             }
@@ -1876,12 +1878,9 @@ mod tests {
                     assert!(said.contains(named), "{named}: {said}");
                 }
             }
-            for id in ["qwen3.8-flash-next", "ignis-image-2.1-turbo", "swift-1.5-27b"] {
+            for id in ["qwen3.8-flash-next", "ignis-image-2.1-turbo"] {
                 assert_eq!(catalog.answering(id, card).map_err(|refusal| refusal.code()), Err("model_above_gpu_generation"), "{id} on {generation}");
             }
-            let alone = catalog.answering("swift-1.5-27b-16g", card).unwrap_err();
-            assert_eq!(alone.code(), "model_above_gpu_generation");
-            assert!(alone.to_string().starts_with("swift-1.5-27b-16g needs a card of the Blackwell generation") && !alone.to_string().contains("card_class"), "{alone}");
         }
     }
 

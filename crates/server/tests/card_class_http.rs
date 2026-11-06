@@ -866,8 +866,8 @@ fn refused_by_generation(status: StatusCode, body: &Value, model: &str, card: &O
 }
 
 /// Spec #474 on an RTX 3090 and an RTX 4090: a switch or a request to a
-/// Blackwell-only entry — Swift 1.5's NVFP4 entry and its trellis build,
-/// Flash-Next, the image model — is refused `409 model_above_gpu_generation`
+/// Blackwell-only entry — Flash-Next, the image model, Swift 1.5's NVFP4
+/// entry by its own id's build — is refused `409 model_above_gpu_generation`
 /// before anything stops, on every route that switches, `422` with the same
 /// code on the decision endpoint; the loaded model keeps serving. Where the
 /// class is above the card's too, the message names both.
@@ -877,20 +877,20 @@ async fn on_an_rtx_3090_or_4090_a_blackwell_only_entry_is_refused_before_anythin
         let loader = MockLoader::new();
         let server = server_on(&loader, SIXTEEN, card.clone(), tag);
         let app = server.app();
-        for model in [SWIFT, SWIFT_16G, FLASH_NEXT, IMAGE] {
+        for model in [FLASH_NEXT, IMAGE] {
             let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": model }))).await;
             refused_by_generation(status, &refused, model, &card);
         }
         let tagged = format!("{FLASH_NEXT}@agent");
-        for (model, named) in [(SWIFT, SWIFT), (FLASH_NEXT, FLASH_NEXT), (tagged.as_str(), FLASH_NEXT)] {
+        for (model, named) in [(FLASH_NEXT, FLASH_NEXT), (tagged.as_str(), FLASH_NEXT)] {
             let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(model))).await;
             refused_by_generation(status, &refused, named, &card);
         }
         let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(FLASH_NEXT))).await;
         let message = refused["error"]["message"].as_str().unwrap();
         assert!(status == StatusCode::CONFLICT && message.contains("a 32 GB card or larger") && message.contains("of the 24 GB class"), "both named: {message}");
-        let (status, refused) = send(&app, Method::POST, "/v1/responses", Some(response_body(SWIFT_16G))).await;
-        refused_by_generation(status, &refused, SWIFT_16G, &card);
+        let (status, refused) = send(&app, Method::POST, "/v1/responses", Some(response_body(FLASH_NEXT))).await;
+        refused_by_generation(status, &refused, FLASH_NEXT, &card);
         let (status, refused) = send(&app, Method::POST, "/v1/images/generations", Some(json!({ "model": IMAGE, "prompt": "a fox", "size": "1024x1024" }))).await;
         refused_by_generation(status, &refused, IMAGE, &card);
         let (status, refused) = send(&app, Method::POST, "/v1/decide", Some(decision(FLASH_NEXT))).await;
@@ -899,9 +899,10 @@ async fn on_an_rtx_3090_or_4090_a_blackwell_only_entry_is_refused_before_anythin
     }
 }
 
-/// Spec #474 on an RTX 3090 and an RTX 4090: `qwen3.8-27b` and
-/// `qwen3.8-27b-abliterated` are served by their 16 GB builds, which state no
-/// generation — the loaded one with no switch, the other switched to — and
+/// Spec #474 on an RTX 3090 and an RTX 4090: `qwen3.8-27b`,
+/// `qwen3.8-27b-abliterated` and `swift-1.5-27b` (GitHub #529) are served by
+/// their 16 GB builds, which state no generation — the loaded one with no
+/// switch, the others switched to — and
 /// both lists report every Blackwell-only entry unavailable with the reason,
 /// naming the entry that serves its id here where one does; none of them is
 /// switchable.
@@ -918,25 +919,26 @@ async fn on_an_rtx_3090_or_4090_the_27bs_ids_are_served_by_their_16gb_builds_and
             models["data"].as_array().unwrap().iter().map(|entry| (entry["id"].as_str().unwrap(), entry["available"].as_bool().unwrap())).collect();
         assert_eq!(
             listed,
-            [(SIXTEEN, true), (DEFAULT_27B, false), (ABLITERATED, false), (FLASH_NEXT, false), (IMAGE, false), (ABLITERATED_16G, true), (SWIFT, false), (SWIFT_16G, false)],
+            [(SIXTEEN, true), (DEFAULT_27B, false), (ABLITERATED, false), (FLASH_NEXT, false), (IMAGE, false), (ABLITERATED_16G, true), (SWIFT, false), (SWIFT_16G, true)],
             "{tag}: {models}"
         );
         let reason = |id: &str| -> String {
             let entry = models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == id).unwrap();
             entry["reason"].as_str().unwrap_or_default().to_owned()
         };
-        for id in [DEFAULT_27B, ABLITERATED, FLASH_NEXT, IMAGE, SWIFT, SWIFT_16G] {
+        for id in [DEFAULT_27B, ABLITERATED, FLASH_NEXT, IMAGE, SWIFT] {
             let reason = reason(id);
             assert!(reason.contains(id) && reason.contains("Blackwell generation") && reason.contains(&format!("of the {generation} generation")), "{id}: {reason}");
         }
         assert!(reason(DEFAULT_27B).ends_with(&format!("served by {SIXTEEN}")), "{}", reason(DEFAULT_27B));
         assert!(reason(ABLITERATED).ends_with(&format!("served by {ABLITERATED_16G}")), "{}", reason(ABLITERATED));
-        assert!(!reason(SWIFT).contains("served by") && !reason(SWIFT_16G).contains("card_class"), "{} / {}", reason(SWIFT), reason(SWIFT_16G));
+        assert!(reason(SWIFT).ends_with(&format!("served by {SWIFT_16G}")), "{}", reason(SWIFT));
+        assert_eq!(reason(SWIFT_16G), "", "it loads here");
 
         let (_, catalog) = send(&app, Method::GET, "/v1/models/catalog", None).await;
         for row in catalog["data"].as_array().unwrap() {
             let id = row["id"].as_str().unwrap();
-            let fits = id == SIXTEEN || id == ABLITERATED_16G || CPU_MODELS.contains(&id);
+            let fits = id == SIXTEEN || id == ABLITERATED_16G || id == SWIFT_16G || CPU_MODELS.contains(&id);
             assert_eq!((row["available"].as_bool(), row.get("reason").is_some()), (Some(fits), !fits), "{tag}: {row}");
             if !fits {
                 assert_eq!(row["switchable"], false, "{row}");
@@ -950,6 +952,9 @@ async fn on_an_rtx_3090_or_4090_the_27bs_ids_are_served_by_their_16gb_builds_and
         let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(ABLITERATED))).await;
         assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(ABLITERATED_16G)), "{completion}");
         assert_eq!(loader.prepared_artifacts(), [artifact_of(&server, ABLITERATED_16G)], "the 16 GB build's artifact, not the NVFP4 entry's");
+        let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(SWIFT))).await;
+        assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(SWIFT_16G)), "{completion}");
+        assert_eq!(loader.prepared_artifacts(), [artifact_of(&server, ABLITERATED_16G), artifact_of(&server, SWIFT_16G)], "Swift's 16 GB build");
         let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": DEFAULT_27B }))).await;
         assert_eq!((status, accepted["to"].as_str()), (StatusCode::ACCEPTED, Some(SIXTEEN)), "{accepted}");
         assert_eq!(until_serving(&app).await["data"][0]["id"], SIXTEEN);
@@ -1012,17 +1017,17 @@ async fn on_an_rtx_3090_a_catalog_id_the_operator_listed_is_fitted_by_generation
     let card = Some(rtx_3090());
     let server = server_on(&loader, SIXTEEN, card.clone(), "3090-listed");
     let switcher = server.switcher.as_ref().unwrap();
-    let listed: std::collections::BTreeMap<String, std::path::PathBuf> = [(SWIFT_16G.to_owned(), switch_support::source(SWIFT_16G).artifact)].into_iter().collect();
+    let listed: std::collections::BTreeMap<String, std::path::PathBuf> = [(FLASH_NEXT.to_owned(), switch_support::source(FLASH_NEXT).artifact)].into_iter().collect();
     switcher.set_knobs(PATIENT, listed.clone(), true);
     switcher.set_listed_models(listed);
     let app = server.app();
     let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
-    let entry = models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == SWIFT_16G).cloned().unwrap();
+    let entry = models["data"].as_array().unwrap().iter().find(|entry| entry["id"] == FLASH_NEXT).cloned().unwrap();
     assert_eq!(entry["available"], false, "{models}");
     assert!(entry["reason"].as_str().unwrap().contains("Ampere generation"), "{entry}");
-    let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": SWIFT_16G }))).await;
-    refused_by_generation(status, &refused, SWIFT_16G, &card);
-    let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(SWIFT_16G))).await;
-    refused_by_generation(status, &refused, SWIFT_16G, &card);
+    let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": FLASH_NEXT }))).await;
+    refused_by_generation(status, &refused, FLASH_NEXT, &card);
+    let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(FLASH_NEXT))).await;
+    refused_by_generation(status, &refused, FLASH_NEXT, &card);
     still_serving(&app, &server, &loader, SIXTEEN).await;
 }

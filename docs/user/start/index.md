@@ -46,14 +46,13 @@ You can add models of your own with an
     16 GB, 5070 Ti, 5080) loads the 16 GB entries (the 27B, its uncensored
     variant, Swift 1.5), on a profile derived rather than measured.
   - *Ampere.* The RTX 3090 and the RTX 3090 Ti (8.6, 24 GB) are supported, on
-    the 27B's 16 GB entries.
+    the 16 GB entries (the 27B, its uncensored variant, Swift 1.5).
   - *Ada.* The RTX 4090 (24 GB) and the 16 GB RTX 40 cards (RTX 4060 Ti 16 GB,
     RTX 4080) are expected to work, on the same entries; reports are welcome.
-  - *Blackwell only.* The NVFP4 27B (`qwen3.8-27b`, `qwen3.8-27b-abliterated`),
-    the Swift 1.5 builds, Flash-Next and the image model. On an RTX 30 or RTX
-    40 card the server refuses them, and the 27B's ids are served by their 16
-    GB entries. All of them but Swift 1.5's 16 GB build also need a card of
-    32 GB or more, by their card class.
+  - *Blackwell only.* The NVFP4 builds (the 27B, its uncensored variant,
+    Swift 1.5), Flash-Next and the image model, which also need a card of
+    32 GB or more, by their card class. On an RTX 30 or RTX 40 card the server
+    refuses them, and the NVFP4 builds' ids are served by their 16 GB entries.
   - *The prefill on an RTX 30 or RTX 40 card.* Unset, the 27B reads a prompt
     through the **dense prefill** (each trellis matrix decoded once per chunk
     and multiplied on the integer MMA), the **integer band** of the prompt

@@ -723,7 +723,8 @@ mod tests {
     }
 
     /// Spec #474 on an RTX 3090 (24 GiB, 8.6): `model download qwen3.8-27b`
-    /// fetches the 16 GB entry, and so does the configured model, while a
+    /// fetches the 16 GB entry, and so does the configured model, and
+    /// `swift-1.5-27b` Swift's 16 GB build (GitHub #529), while a
     /// Blackwell-only entry is refused before any fetch, naming the card, its
     /// compute capability and its generation; `--all` too.
     #[test]
@@ -733,7 +734,10 @@ mod tests {
         let card = Some(&card);
         assert_eq!(fetched(&catalog, &["qwen3.8-27b"], false, card), Ok(vec!["qwen3.8-27b-16g".to_owned()]));
         assert_eq!(fetched(&catalog, &[], false, card), Ok(vec!["qwen3.8-27b-16g".to_owned()]), "the configured model");
-        for id in ["qwen3.8-flash-next", "ignis-image-2.1-turbo", "swift-1.5-27b", "swift-1.5-27b-16g"] {
+        for id in ["swift-1.5-27b", "swift-1.5-27b-16g"] {
+            assert_eq!(fetched(&catalog, &[id], false, card), Ok(vec!["swift-1.5-27b-16g".to_owned()]), "{id}");
+        }
+        for id in ["qwen3.8-flash-next", "ignis-image-2.1-turbo"] {
             let err = fetched(&catalog, &[id], false, card).unwrap_err();
             for said in ["nothing fetched", id, "Blackwell generation", "NVIDIA GeForce RTX 3090 (compute capability 8.6), is of the Ampere generation"] {
                 assert!(err.contains(said), "{said}: {err}");
@@ -759,15 +763,16 @@ mod tests {
             let line = lines.iter().find(|line| line.split_whitespace().next() == Some(id)).unwrap_or_else(|| panic!("{id}: {text}"));
             line.split_whitespace().rev().nth(1).unwrap()
         };
-        for id in ["qwen3.8-27b", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "swift-1.5-27b", "swift-1.5-27b-16g"] {
+        for id in ["qwen3.8-27b", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "swift-1.5-27b"] {
             assert_eq!(available(id), "no", "{id}: {text}");
         }
-        for id in ["qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "qwen3-asr-1.7b", "nemotron-3-diarization"] {
+        for id in ["qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b-16g", "qwen3-asr-1.7b", "nemotron-3-diarization"] {
             assert_eq!(available(id), "yes", "{id}: {text}");
         }
         let reason = lines.iter().find(|line| line.starts_with("qwen3.8-27b: not available on this card: ")).unwrap_or_else(|| panic!("{text}"));
         assert!(reason.contains("Ampere generation") && reason.ends_with("a request naming it is served by qwen3.8-27b-16g"), "{reason}");
-        assert!(lines.iter().any(|line| line.starts_with("swift-1.5-27b-16g: not available on this card: ")), "{text}");
+        let swift = lines.iter().find(|line| line.starts_with("swift-1.5-27b: not available on this card: ")).unwrap_or_else(|| panic!("{text}"));
+        assert!(swift.ends_with("a request naming it is served by swift-1.5-27b-16g"), "GitHub #529: {swift}");
 
         let json: Vec<Value> = serde_json::from_str(&render_list(&rows, ListFormat::Json, &unavailable)).unwrap();
         let row = |id: &str| json.iter().find(|row| row["id"] == id).unwrap().clone();

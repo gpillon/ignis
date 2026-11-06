@@ -576,9 +576,10 @@ mod tests {
 
     /// Spec #474, `main`'s start path on an RTX 3090 (24 GiB, 8.6): a start
     /// with no artifact named, under `rtx-24gb`, serves the 27B's default id
-    /// from the 16 GB entry, which states no generation, under its own id; one
-    /// naming Flash-Next or Swift 1.5 is refused before anything is fetched,
-    /// by generation, naming the card and its capability.
+    /// from the 16 GB entry, which states no generation, under its own id, and
+    /// one naming Swift 1.5 from Swift's 16 GB build (GitHub #529); one naming
+    /// Flash-Next or the image model is refused before anything is fetched, by
+    /// generation, naming the card and its capability.
     #[test]
     fn a_start_on_an_rtx_3090_serves_the_16gb_entry_and_refuses_the_blackwell_only_ones() {
         use crate::config::profile::Card;
@@ -590,7 +591,9 @@ mod tests {
         let path = PathBuf::from(DIR).join("qwen3_8_27b_trellis_sc30-v2.ninfer");
         let serving = served_start_options(options.clone(), &served, Some(&path), &catalog, options.card(), &|_| Some(ModelFamily::Qwen38_27b)).unwrap();
         assert_eq!(serving.model, "qwen3.8-27b-16g");
-        for model in ["qwen3.8-flash-next", "swift-1.5-27b"] {
+        let options = start_config_reading(&["--model-id", "swift-1.5-27b"], Card::Read(rtx_3090()));
+        assert_eq!(start_model(&catalog, &options.model, options.card()).unwrap(), "swift-1.5-27b-16g");
+        for model in ["qwen3.8-flash-next", "ignis-image-2.1-turbo"] {
             let options = start_config_reading(&["--model-id", model], Card::Read(rtx_3090()));
             let refusal = start_model(&catalog, &options.model, options.card()).unwrap_err();
             assert_eq!(refusal.code(), "model_above_gpu_generation", "{model}");

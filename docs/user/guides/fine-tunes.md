@@ -37,7 +37,8 @@ ignis-server --model-id swift-1.5-27b       # found under --download-path, fetch
 ```
 
 On a 32 GB card or larger, and on a card whose class is not known, it is served
-as `swift-1.5-27b`, so a client can tell it from the 27B. On a 16 GB card the
+as `swift-1.5-27b`, so a client can tell it from the 27B. On a 16 or 24 GB
+card, and on any RTX 30 or RTX 40 card, the
 same commands fetch and start `swift-1.5-27b-16g`, which answers to
 `swift-1.5-27b` there, as `qwen3.8-27b-16g` answers to `qwen3.8-27b`. A start,
 a switch and a request naming `swift-1.5-27b` are served by it, the answer's

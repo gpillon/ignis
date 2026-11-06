@@ -167,7 +167,7 @@ async fn a_download_is_refused_with_a_reason_and_fetches_nothing() {
         .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_catalog(built_in, true).with_card(Some(card(24, "NVIDIA GeForce RTX 3090", 8, 6))))
         .with_downloads(Downloads::of(&config(&repo, &[]), None))
         .app();
-    for model in ["qwen3.8-flash-next", "swift-1.5-27b-16g"] {
+    for model in ["qwen3.8-flash-next", "ignis-image-2.1-turbo"] {
         let (status, code, message) = refused(on_3090.clone(), model).await;
         assert_eq!((status, code.as_str()), (StatusCode::CONFLICT, "model_above_gpu_generation"), "{message}");
         assert!(message.contains("Blackwell generation") && message.contains("NVIDIA GeForce RTX 3090 (compute capability 8.6)"), "{message}");

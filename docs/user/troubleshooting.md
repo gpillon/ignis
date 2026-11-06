@@ -430,12 +430,13 @@ catalog states, are wrong ([an operator catalog](guides/operator-catalog.md#an-e
 
 The request, the switch or the download names a catalog entry that needs a
 newer GPU generation than this card's: an entry that states `generation:
-blackwell` (the NVFP4 27B, Swift 1.5, Flash-Next, the image model) on an RTX 30
+blackwell` (the NVFP4 builds, Flash-Next, the image model) on an RTX 30
 or RTX 40 card. The message names the generation the entry needs and the card,
 its name, compute capability and generation, and the entry's class as well
 when that is above the card's too; the loaded model keeps serving, and a start
-that would load it is refused. On such a card name `qwen3.8-27b` or
-`qwen3.8-27b-abliterated`, which their 16 GB entries serve there, or one of
+that would load it is refused. On such a card name `qwen3.8-27b`,
+`qwen3.8-27b-abliterated` or `swift-1.5-27b`, which their 16 GB entries serve
+there, or one of
 those entries by its own id ([Get a model](guides/models.md#the-catalog)). An
 operator entry that states a `generation` its artifact does not need is
 fixed in its catalog ([an operator catalog](guides/operator-catalog.md)).
