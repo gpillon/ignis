@@ -199,6 +199,18 @@ pub struct PrefillJob {
     /// so a job whose span lies wholly below it taps nothing; 0 is the span
     /// rule alone. Unread on a load without the drafter.
     pub drafter_floor: u32,
+    /// The **next prompt token** (GitHub #519): the request's prompt token at
+    /// `start_position + tokens.len()`, right after this job's span, or `None`
+    /// on the job that ends at the prompt's last position -- the job whose
+    /// draw is the sequence's pending token. Filled on every job.
+    ///
+    /// Only that job's draw is read, so the leaf runs the output head and
+    /// samples only where this is `None` (on the 27B, and on Flash-Next
+    /// without MTP), and a job with a next token leaves no pending token. One
+    /// exception lives in `RuntimeCompute::prefill_step`: a job whose state a
+    /// prefix or a prompt checkpoint retains keeps its draw, which the image
+    /// carries to a full-prompt claimant.
+    pub next_prompt_token: Option<TokenId>,
 }
 
 impl PrefillJob {

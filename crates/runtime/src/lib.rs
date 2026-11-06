@@ -780,6 +780,15 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// `drafter_floor` is the job's [`PrefillJob::drafter_floor`] (GitHub
     /// #506): the span taps the drafter's window from the later of its own
     /// last 2048 positions and this. A leaf without the drafter ignores it.
+    ///
+    /// `next_prompt_token` (GitHub #519) is the prompt token right after the
+    /// span when nothing reads the span's draw: the leaf then runs no output
+    /// head and samples nothing, and leaves the sequence with no pending token
+    /// (Flash-Next with MTP still draws, for its head's entry). `None` draws:
+    /// the prompt's last span, and a span whose state a prefix or a prompt
+    /// checkpoint retains ([`PrefillJob::next_prompt_token`]). A span with a
+    /// next token asks for no logits, no permitted set, no redirect and no
+    /// readout, which only the prompt's last span carries.
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,
@@ -788,6 +797,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         tokens: &[TokenId],
         start_position: u32,
         drafter_floor: u32,
+        next_prompt_token: Option<TokenId>,
         params: DecodeParams,
         permitted: &[TokenId],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -812,8 +822,8 @@ pub trait StepLeaf: Send + Sync + 'static {
     ///
     /// `attention` is the **attention readout** (GitHub #260), read at the
     /// span's last position; see [`AttentionRead`] for what the leaf owes
-    /// it. The text path carries one too (GitHub #275). `redirect` and
-    /// `drafter_floor` are [`StepLeaf::prefill`]'s.
+    /// it. The text path carries one too (GitHub #275). `redirect`,
+    /// `drafter_floor` and `next_prompt_token` are [`StepLeaf::prefill`]'s.
     #[allow(clippy::too_many_arguments)]
     fn prefill_multimodal(
         &self,
@@ -822,6 +832,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         _tokens: &[TokenId],
         _start_position: u32,
         _drafter_floor: u32,
+        _next_prompt_token: Option<TokenId>,
         _params: DecodeParams,
         _permitted: &[TokenId],
         _redirect: Option<&mut DrawRedirect<'_>>,
@@ -1320,6 +1331,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         media: &mut MediaCache<L::Media>,
         job: &PrefillJob,
         multimodal: &Multimodal,
+        next_prompt_token: Option<TokenId>,
         redirect: Option<&mut DrawRedirect<'_>>,
         out_logits: Option<&mut [f32]>,
         attention: Option<&mut AttentionRead>,
@@ -1363,6 +1375,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             &job.tokens,
             start,
             job.drafter_floor,
+            next_prompt_token,
             job.params,
             &permitted,
             redirect,
@@ -1612,6 +1625,13 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         stop_ids: &eos,
                         redirected: false,
                     });
+                // GitHub #519: the leaf draws only where the draw is read --
+                // the prompt's last job, and a job whose state a prefix or a
+                // prompt checkpoint retains: the image carries its pending
+                // token, which a claimant matching the whole of it emits as
+                // its first token (the empty-tail branch below).
+                let retained = job.publish_prefix.is_some() || job.capture_checkpoint.is_some();
+                let next_prompt_token = job.next_prompt_token.filter(|_| !retained);
                 let warmed = match &job.multimodal {
                     None => self
                         .model
@@ -1622,6 +1642,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             &job.tokens,
                             job.start_position,
                             job.drafter_floor,
+                            next_prompt_token,
                             job.params,
                             // GitHub #242: the set this chunk's own draw is
                             // restricted to, borrowed and not cloned — every
@@ -1638,6 +1659,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         &mut media,
                         job,
                         multimodal,
+                        next_prompt_token,
                         redirect.as_mut(),
                         logits.as_deref_mut(),
                         attention.as_mut(),

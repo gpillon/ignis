@@ -55,6 +55,7 @@ fn prefill_job(program: &Schedule) -> PrefillJob {
         attention: None,
         reasoning_close: None,
         drafter_floor: 0,
+        next_prompt_token: None,
     }
 }
 
