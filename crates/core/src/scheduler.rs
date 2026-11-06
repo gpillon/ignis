@@ -228,6 +228,15 @@ impl PrefillJob {
     pub fn builds_its_sequence(&self) -> bool {
         self.start_position == 0 || self.shared_prefix.is_some() || self.checkpoint.is_some()
     }
+
+    /// Whether the leaf draws at this job's end although it has a next
+    /// prompt token (GitHub #520): a prefix it publishes or a prompt
+    /// checkpoint it captures retains its state, and the image carries the
+    /// draw as its pending token, which a claimant matching the whole of it
+    /// emits as its first token.
+    pub fn keeps_draw(&self) -> bool {
+        self.publish_prefix.is_some() || self.capture_checkpoint.is_some()
+    }
 }
 
 /// One decode job: a single lane step for a running request.

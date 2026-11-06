@@ -1653,7 +1653,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 // emits as its first token (the empty-tail branch above). The
                 // retained job still gets its next prompt token, which
                 // Flash-Next's MTP entry at its last position is built from.
-                let keeps_draw = job.publish_prefix.is_some() || job.capture_checkpoint.is_some();
+                let keeps_draw = job.keeps_draw();
                 let warmed = match &job.multimodal {
                     None => self
                         .model
