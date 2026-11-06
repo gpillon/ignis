@@ -1,25 +1,25 @@
-//! GitHub #489 (ADR 0018 and ADR 0063 §3 as amended): `rtx-24gb` on an RTX 30
-//! card resolves its `auto` solo width with nothing else adapted, and serves
-//! a prompt alone at it.
+//! GitHub #489 (ADR 0018 and ADR 0063 §3 as amended): the solo width on the
+//! two built-in profiles of the RTX 30 and RTX 40 classes, as a card of theirs
+//! loads them.
 //!
 //! The simulation #508 ran the 24 GB class with: the 27B's 16 GB entry on the
-//! RTX 5090 inside the 24 GiB budget, on the routes an 8.x card runs unset
+//! RTX 5090 inside the class's budget, on the routes an 8.x card runs unset
 //! (the dense prefill, the integer band and our GDN prefill, named so the 5090
-//! runs them), with the card the start reads injected as an RTX 3090 so the
-//! load takes the 8.x solo ladder (8,192, then 4,096): it keeps 4,096. The VRAM plan keeps the
-//! profile's 1,048,576 tokens on 8 lanes with the two device retained slots,
-//! nothing adapted, and its KV pool still holds the whole context; the load
-//! line, `GET /v1/models` and the request log say the width (`GET /v1/config`
-//! keeping `auto` is `config_http.rs`'s, on the CPU).
-//!
-//! `rtx-16gb` on an RTX 40 card (16 GiB, 8.9) is the other built-in profile
-//! the ladder runs under: the same entry and routes inside the 16 GiB budget
-//! less 1 GiB the profile's 8.x note was measured in, its 262,144 tokens on
-//! two lanes kept.
+//! runs them), with the card the start reads injected as an 8.x card so the
+//! load takes the 8.x solo ladder (8,192, 4,096, 2,048 above the chunk).
+//! - `rtx-24gb` (an RTX 3090, 24 GiB) and `rtx-16gb` (an RTX 4080, 16 GiB less
+//!   1 GiB) pin the 27B's solo width to their chunk: one width, the KV pool
+//!   their profile notes measured.
+//! - `--model-prefill-chunk-solo auto` on the same loads runs the ladder: a
+//!   width is kept only with nothing adapted and the spare reservation left
+//!   beside the context. `rtx-24gb` keeps 4,096 and serves a prompt alone at
+//!   it; `rtx-16gb` steps down to 2,048.
+//! The load line, `GET /v1/models` and the request log say the width
+//! (`GET /v1/config` keeping the setting is `config_http.rs`'s, on the CPU).
 //!
 //! Its own test binary: the request log is written on the engine's telemetry
 //! task, so the capture is the process's global subscriber, installed once
-//! for both tests, each reading what its own load logged.
+//! for every test, each reading what its own load logged.
 //!
 //! Explicit GPU profile (ADR 0006): outside `IGNIS_GPU_PROFILE=1` a missing
 //! artifact or GPU is a skip; under it, a failure.
@@ -159,56 +159,106 @@ async fn complete(app: &axum::Router, prompt: &str, max_tokens: u32) -> String {
     value["choices"][0]["message"]["content"].as_str().unwrap_or_else(|| panic!("{value}")).to_owned()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
-async fn rtx_24gb_on_an_rtx_30_card_widens_its_solo_chunk_and_keeps_its_context() {
-    let _switch = OurGdnPrefill::set();
-    let flags = [
-        &["--profile", "rtx-24gb", "--vram-budget-bytes", "25769803776", "--model-idle-unload", "0", "--model-loop-guard", "off"][..],
+/// The start flags of `profile` inside `budget` bytes on the 8.x routes, and
+/// `extra`.
+fn flags_of<'a>(profile: &'a str, budget: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    [
+        &["--profile", profile, "--vram-budget-bytes", budget, "--model-idle-unload", "0", "--model-loop-guard", "off"][..],
         &ROUTES_8X[..],
+        extra,
     ]
-    .concat();
-    let options = on_card(Card::Read(card::rtx_3090()), &flags);
-    assert_eq!(options.prefill_chunk, 2048);
-    assert_eq!(options.prefill_chunk_solo, ignis_server::config::SoloWidth::Auto, "no profile names one");
-    let slots = ignis_server::config::profile::RTX_24GB_RETAINED_DEVICE_SLOTS;
-    let Some((model, start)) = load(&options, "under rtx-24gb in 24 GiB") else { return };
-    let events = || events_since(start);
-    let logged = events();
+    .concat()
+}
 
-    let plan = named(&logged, "ignis.runtime.vram_plan");
+/// One load's facts: the plan's `adapted`, its KV pool, the width the solo
+/// line says and its text, and the `ignis.model.loaded` line.
+struct Loaded {
+    adapted: String,
+    pool: u64,
+    width: u64,
+    text: String,
+    loaded: serde_json::Value,
+    retained_device_slots: serde_json::Value,
+}
+
+fn facts(logged: &[serde_json::Value]) -> Loaded {
+    let plan = named(logged, "ignis.runtime.vram_plan");
     assert_eq!(plan.len(), 1, "{logged:?}");
     println!("vram_plan: {}", plan[0]);
     let lines = &plan[0]["attributes"];
-    assert_eq!(lines["budget_bytes"], 25_769_803_776u64);
-    assert_eq!(lines["adapted"], "", "nothing adapted for the solo width");
-    assert_eq!(lines["retained_device_slots"], slots, "beside the device retained slots");
-    let pool = lines["kv_pool_tokens"].as_u64().unwrap();
-    let solo = named(&logged, "ignis.runtime.prefill_chunk_solo");
+    let solo = named(logged, "ignis.runtime.prefill_chunk_solo");
     assert_eq!(solo.len(), 1, "{logged:?}");
     println!("prefill_chunk_solo: {}", solo[0]);
-    let width = solo[0]["attributes"]["width"].as_u64().unwrap();
+    let load = named(logged, "ignis.model.loaded");
+    assert_eq!(load.len(), 1, "{logged:?}");
+    Loaded {
+        adapted: lines["adapted"].as_str().unwrap().to_owned(),
+        pool: lines["kv_pool_tokens"].as_u64().unwrap(),
+        width: solo[0]["attributes"]["width"].as_u64().unwrap(),
+        text: solo[0]["body"].as_str().unwrap().to_owned(),
+        loaded: load[0]["attributes"].clone(),
+        retained_device_slots: lines["retained_device_slots"].clone(),
+    }
+}
+
+const BUDGET_24GB: &str = "25769803776";
+
+fn budget_16gb() -> String {
+    (17_179_869_184u64 - (1 << 30)).to_string()
+}
+
+/// `rtx-24gb` on an RTX 3090 pins the 27B's solo width to its 2,048-token
+/// chunk: the plan is #508's, its pool 91,200 tokens past the context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn rtx_24gb_pins_its_solo_width_to_its_chunk() {
+    let _switch = OurGdnPrefill::set();
+    let options = on_card(Card::Read(card::rtx_3090()), &flags_of("rtx-24gb", BUDGET_24GB, &[]));
+    assert_eq!(options.prefill_chunk_solo, ignis_server::config::SoloWidth::Tokens(2048), "the profile's");
+    let Some((model, start)) = load(&options, "under rtx-24gb in 24 GiB") else { return };
+    let loaded = facts(&events_since(start));
+    assert_eq!(loaded.adapted, "");
+    assert_eq!((loaded.width, loaded.text.as_str()), (2048, "prefill_chunk_solo 2048"));
+    assert_eq!(loaded.pool, POOL_AT_THE_CHUNK, "#508's pool");
+    assert_eq!(loaded.loaded["max_context"], 1_048_576);
+    tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
+}
+
+/// `auto` on the same load keeps 4,096 (8,192 does not fit, 4,096 leaves
+/// 77,888 tokens past the context, more than the 65,536-token spare
+/// reservation), and a prompt alone runs every chunk at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn rtx_24gb_on_an_rtx_30_card_widens_its_solo_chunk_under_auto() {
+    let _switch = OurGdnPrefill::set();
+    let options = on_card(Card::Read(card::rtx_3090()), &flags_of("rtx-24gb", BUDGET_24GB, &["--model-prefill-chunk-solo", "auto"]));
+    assert_eq!(options.prefill_chunk, 2048);
+    assert_eq!(options.prefill_chunk_solo, ignis_server::config::SoloWidth::Auto);
+    let slots = ignis_server::config::profile::RTX_24GB_RETAINED_DEVICE_SLOTS;
+    let Some((model, start)) = load(&options, "under rtx-24gb in 24 GiB, solo auto") else { return };
+    let events = || events_since(start);
+    let loaded = facts(&events());
     println!(
-        "solo width {width}: kv pool {pool} tokens, {} past the context, {} fewer than at the chunk; workspace {}",
-        pool.saturating_sub(1_048_576),
-        POOL_AT_THE_CHUNK.saturating_sub(pool),
-        lines["workspace_bytes"]
+        "solo width {}: kv pool {} tokens, {} past the context, {} fewer than at the chunk",
+        loaded.width,
+        loaded.pool,
+        loaded.pool.saturating_sub(1_048_576),
+        POOL_AT_THE_CHUNK.saturating_sub(loaded.pool)
     );
-    // Measured 2026-11-06: 8,192 does not fit with nothing adapted, 4,096 does,
-    // and keeps a pool of 17,601 pages (1,126,464 tokens), 77,888 past the
-    // context, 13,312 fewer than at the chunk.
-    assert_eq!(width, 4096, "the widest of the 8.x ladder the plan holds as the profile asks");
-    assert_eq!(solo[0]["body"], format!("prefill_chunk_solo auto -> {width}"));
-    assert!(pool >= 1_048_576 + u64::from(slots + 16) * 64, "the whole context and the slots' tail pages: {pool}");
-    let load = named(&logged, "ignis.model.loaded");
-    assert_eq!(load[0]["attributes"]["max_context"], 1_048_576, "#474's context");
-    assert_eq!(load[0]["attributes"]["decode_lanes"], 8);
-    assert_eq!(load[0]["attributes"]["prefill_chunk"], 2048);
-    assert_eq!(load[0]["attributes"]["prefill_chunk_solo"], width);
+    assert_eq!(loaded.adapted, "", "nothing adapted for the solo width");
+    assert_eq!(loaded.retained_device_slots, slots, "beside the device retained slots");
+    // Measured 2026-11-06: 8,192 does not fit, 4,096 keeps a pool of 17,601
+    // pages (1,126,464 tokens), 77,888 past the context.
+    assert_eq!(loaded.width, 4096, "the widest of the 8.x ladder that keeps the spare reservation");
+    assert_eq!(loaded.text, "prefill_chunk_solo auto -> 4096");
+    assert!(loaded.pool >= 1_048_576 + 65_536, "the context and the spare reservation: {}", loaded.pool);
+    assert_eq!(loaded.loaded["max_context"], 1_048_576, "#474's context");
+    assert_eq!(loaded.loaded["decode_lanes"], 8);
+    assert_eq!(loaded.loaded["prefill_chunk_solo"], 4096);
 
     let app = Server::from_active(model.clone()).with_request_timeout(Duration::from_secs(600)).app();
     let models = get(&app, "/v1/models").await;
-    assert_eq!(models["data"][0]["prefill_chunk_solo"], width, "{models}");
+    assert_eq!(models["data"][0]["prefill_chunk_solo"], 4096, "{models}");
 
     // A prompt alone, past one solo chunk: every chunk at the solo width.
     let line = "The harbour master records each ship, its cargo and the hour it docked. ";
@@ -236,47 +286,47 @@ async fn rtx_24gb_on_an_rtx_30_card_widens_its_solo_chunk_and_keeps_its_context(
     tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
 }
 
-/// `rtx-16gb` on an RTX 4080: the ladder runs on an RTX 40 card of the 16 GB
-/// class too, and keeps a width only where the profile's 262,144 tokens on
-/// two lanes stay, nothing adapted.
+/// `rtx-16gb` on an RTX 4080 pins the 27B's solo width to its 1,024-token
+/// chunk: the pool its 8.x note measured.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
-async fn rtx_16gb_on_an_rtx_40_card_keeps_its_context_and_lanes_under_its_solo_width() {
+async fn rtx_16gb_pins_its_solo_width_to_its_chunk() {
     let _switch = OurGdnPrefill::set();
-    let budget = (17_179_869_184u64 - (1 << 30)).to_string();
-    let flags = [
-        &["--profile", "rtx-16gb", "--vram-budget-bytes", budget.as_str(), "--model-idle-unload", "0", "--model-loop-guard", "off"][..],
-        &ROUTES_8X[..],
-    ]
-    .concat();
-    let options = on_card(Card::Read(card::card(16, "NVIDIA GeForce RTX 4080", 8, 9)), &flags);
-    assert_eq!(options.prefill_chunk, 1024);
+    let budget = budget_16gb();
+    let options = on_card(Card::Read(card::card(16, "NVIDIA GeForce RTX 4080", 8, 9)), &flags_of("rtx-16gb", &budget, &[]));
+    assert_eq!(options.prefill_chunk_solo, ignis_server::config::SoloWidth::Tokens(1024), "the profile's");
     let Some((model, start)) = load(&options, "under rtx-16gb in 16 GiB less 1 GiB") else { return };
-    let logged = events_since(start);
-    let plan = named(&logged, "ignis.runtime.vram_plan");
-    assert_eq!(plan.len(), 1, "{logged:?}");
-    println!("vram_plan: {}", plan[0]);
-    let lines = &plan[0]["attributes"];
-    assert_eq!(lines["adapted"], "", "nothing adapted for the solo width");
-    let pool = lines["kv_pool_tokens"].as_u64().unwrap();
-    let solo = named(&logged, "ignis.runtime.prefill_chunk_solo");
-    assert_eq!(solo.len(), 1, "{logged:?}");
-    println!("prefill_chunk_solo: {}", solo[0]);
-    let width = solo[0]["attributes"]["width"].as_u64().unwrap();
+    let loaded = facts(&events_since(start));
+    assert_eq!(loaded.adapted, "");
+    assert_eq!((loaded.width, loaded.text.as_str()), (1024, "prefill_chunk_solo 1024"));
+    assert_eq!(loaded.pool, POOL_16GB_AT_THE_CHUNK, "the profile note's pool");
+    assert_eq!((&loaded.loaded["max_context"], &loaded.loaded["decode_lanes"]), (&262_144.into(), &2.into()));
+    tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
+}
+
+/// `auto` on the same load: 4,096 would leave less than the spare
+/// reservation past the context (40,768 tokens), so the ladder steps down to
+/// 2,048.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn rtx_16gb_on_an_rtx_40_card_steps_down_to_2048_under_auto() {
+    let _switch = OurGdnPrefill::set();
+    let budget = budget_16gb();
+    let options =
+        on_card(Card::Read(card::card(16, "NVIDIA GeForce RTX 4080", 8, 9)), &flags_of("rtx-16gb", &budget, &["--model-prefill-chunk-solo", "auto"]));
+    assert_eq!(options.prefill_chunk, 1024);
+    let Some((model, start)) = load(&options, "under rtx-16gb in 16 GiB less 1 GiB, solo auto") else { return };
+    let loaded = facts(&events_since(start));
     println!(
-        "solo width {width}: kv pool {pool} tokens, {} past the context, {} fewer than at the chunk; workspace {}",
-        pool.saturating_sub(262_144),
-        POOL_16GB_AT_THE_CHUNK.saturating_sub(pool),
-        lines["workspace_bytes"]
+        "solo width {}: kv pool {} tokens, {} past the context, {} fewer than at the chunk",
+        loaded.width,
+        loaded.pool,
+        loaded.pool.saturating_sub(262_144),
+        POOL_16GB_AT_THE_CHUNK.saturating_sub(loaded.pool)
     );
-    // Measured 2026-11-06: 4,096, with a pool of 302,912 tokens, 40,768 past
-    // the context, 83,136 fewer than at the chunk: less than the 65,536-token
-    // spare reservation an adapted context keeps for a second request.
-    assert_eq!(width, 4096, "the widest of the 8.x ladder the plan holds as the profile asks");
-    assert!(pool >= 262_144 + 4 * 64, "the whole context and the slots' tail pages: {pool}");
-    let load = named(&logged, "ignis.model.loaded");
-    assert_eq!(load[0]["attributes"]["max_context"], 262_144);
-    assert_eq!(load[0]["attributes"]["decode_lanes"], 2);
-    assert_eq!(load[0]["attributes"]["prefill_chunk_solo"], width);
+    assert_eq!(loaded.adapted, "", "nothing adapted for the solo width");
+    assert_eq!(loaded.width, 2048, "4,096 short of the spare reservation, 2,048 not");
+    assert!(loaded.pool >= 262_144 + 65_536, "the context and the spare reservation: {}", loaded.pool);
+    assert_eq!((&loaded.loaded["max_context"], &loaded.loaded["decode_lanes"]), (&262_144.into(), &2.into()));
     tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
 }

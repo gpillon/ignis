@@ -2154,6 +2154,7 @@ mod tests {
         use ignis_core::compute::ModelFamily;
         let qwen = ModelFamily::Qwen38_27b;
         assert_eq!(shape(Some(Ampere), 2048, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![8192, 4096]));
+        assert_eq!(shape(Some(Ada), 1024, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![8192, 4096, 2048]));
         assert_eq!(shape(Some(Ada), 4096, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![8192]), "above the chunk only");
         assert_eq!(shape(Some(Ampere), 16_384, 1_048_576).solo_widths(qwen), SoloCandidates::Auto(vec![]), "a chunk wider than the ladder");
         assert_eq!(shape(Some(Ampere), 2048, 6144).solo_widths(qwen), SoloCandidates::Auto(vec![4096]), "within the context");

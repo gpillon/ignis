@@ -1,43 +1,45 @@
-# The solo width: 4,096 on the 24 GB class with nothing adapted, the chunk bit-identical under it, and Flash-Next's 8,192 at 1.03 GiB of expert cache
+# The solo width: what `auto` takes on the 24 and 16 GB classes, the chunk bit-identical under it, and Flash-Next's 8,192 at 1.03 GiB of expert cache
 
 - Kind: experiment
 - Status: current
 - Observed: 2026-11-06
 - Last verified: 2026-11-06
-- Scope: serving / the solo width (ADR 0018 and ADR 0063 §3 as amended by GitHub #489): its `auto` resolution on the 24 GB class, the prefill chunk's numerics under a wider scratch, Flash-Next's prefill chunk in the built-in profiles; the RTX 5090 before and after
-- Related: [GitHub #489](https://github.com/gpillon/ignis/issues/489) and [its decisions comment](https://github.com/gpillon/ignis/issues/489#issuecomment-6672861760), [A wider prefill chunk buys the 27B at most 4%](2026-10-07-27b-prefill-chunk-width.md), [The 27B's prefill chunk at 2,048](2026-10-21-the-27b-prefill-chunk-at-2048.md), [Flash-Next's prefill chunk and the decode share](2026-10-07-flash-next-prefill-chunk-and-decode-share.md), `.scratch/489/`
+- Scope: serving / the solo width (ADR 0018 and ADR 0063 §3 as amended by GitHub #489): its `auto` resolution on the 24 and 16 GB classes, the prefill chunk's numerics under a wider scratch, Flash-Next's prefill chunk in the built-in profiles; the RTX 5090 before and after
+- Related: [GitHub #489](https://github.com/gpillon/ignis/issues/489) and [its decisions comment](https://github.com/gpillon/ignis/issues/489#issuecomment-6672861760), [GitHub #526](https://github.com/gpillon/ignis/issues/526), [A wider prefill chunk buys the 27B at most 4%](2026-10-07-27b-prefill-chunk-width.md), [The 27B's prefill chunk at 2,048](2026-10-21-the-27b-prefill-chunk-at-2048.md), [Flash-Next's prefill chunk and the decode share](2026-10-07-flash-next-prefill-chunk-and-decode-share.md), `.scratch/489/`
 - Superseded by: none
 
 ## Question
 
 #489 lets a load plan a second, wider prefill chunk for when no lane decodes, the solo width, and
-resolves its default `auto` at load: 8,192, then 4,096, on an RTX 30 or RTX 40 card, kept only where the
-VRAM plan holds it with nothing else adapted. Which width does `rtx-24gb` get, and what does it cost the
-pool? Does a load whose scratch is reserved for the solo width run the prefill chunk on the same
-kernels? What does an 8,192-token chunk cost Flash-Next's expert cache under `rtx5090`, whose profile
-now sets it? Is anything slower on the RTX 5090, where `auto` changes nothing?
+resolves its default `auto` at load on an RTX 30 or RTX 40 card. Which width would `auto` take on the 24
+and 16 GB classes, and what does it cost the KV pool? Does a load whose scratch is reserved for the solo
+width run the prefill chunk on the same kernels? What does an 8,192-token chunk cost Flash-Next's expert
+cache under `rtx5090`, whose profile now sets it? Is anything slower on the RTX 5090, where `auto`
+changes nothing?
 
 ## Evidence
 
 All on the RTX 5090 (PCIe Gen 3), branch `489-prefill-chunk-solo` over `main` `035ecff1`, under
 `IGNIS_GPU_PROFILE=1`.
 
-**The 24 GB class** (`crates/server/tests/solo_width_gpu.rs`). #508's simulation: the 27B's 16 GB
-trellis entry under `--profile rtx-24gb --vram-budget-bytes 25769803776`, on the routes an 8.x card runs
-unset (`--model-prefill-linear int8 --model-prefill-attention int8`, `IGNIS_GDN_PREFILL=ours`), with the
-card the start reads injected as an RTX 3090 so the load takes the 8.x ladder.
-- `adapted: ""`, 1,048,576 tokens on 8 lanes, 2 device retained slots, as before.
-- `prefill_chunk_solo auto -> 4096`: 8,192 is refused at the profile's values, 4,096 fits.
-- The workspace line is 1,099,301,888 B. The KV pool is 17,601 pages, 1,126,464 tokens: 77,888 past the
-  context, 13,312 fewer than #508's 1,139,776 at the 2,048-token chunk.
-- An 11,228-token prompt alone ran 4 chunks, all at the solo width (`prefill_chunks_solo: 4` on its
-  `admitted` line), and answered.
+**The two 8.x classes** (`crates/server/tests/solo_width_gpu.rs`). #508's simulation: the 27B's 16 GB
+trellis entry on the routes an 8.x card runs unset (`--model-prefill-linear int8
+--model-prefill-attention int8`, `IGNIS_GDN_PREFILL=ours`), with the card the start reads injected as an
+8.x card so the load takes the 8.x ladder: `rtx-24gb` in 24 GiB as an RTX 3090, `rtx-16gb` in 16 GiB
+less 1 GiB as an RTX 4080. Every load: `adapted: ""`, the profile's context and lanes.
 
-**The 16 GB class on an RTX 40 card** (same binary). `--profile rtx-16gb` inside 16 GiB less 1 GiB, the
-same entry and routes, the card read injected as an RTX 4080 (8.9): `adapted: ""`, 262,144 tokens on two
-lanes, `prefill_chunk_solo auto -> 4096`, workspace 1,099,252,736 B. The KV pool is 302,912 tokens, 40,768
-past the context, against 386,048 at the profile's 1,024-token chunk: 83,136 tokens (about 0.77 GB)
-fewer.
+| load | solo width | KV pool, tokens | past the context | against the chunk |
+|---|---|---|---|---|
+| `rtx-24gb`, the profile (pinned) | 2,048 | 1,139,776 | 91,200 | #508's pool |
+| `rtx-24gb`, `auto` | 4,096 (8,192 does not fit) | 1,126,464 | 77,888 | 13,312 fewer |
+| `rtx-16gb`, the profile (pinned) | 1,024 | 386,048 | 123,904 | the profile note's pool |
+| `rtx-16gb`, `auto` | 2,048 | 352,768 | 90,624 | 33,280 fewer |
+
+- `auto` keeps a width only where, at more than one lane, the pool also holds the 65,536-token spare
+  reservation an adapted context keeps. On the 16 GB class 4,096 fits but leaves 40,768 tokens past the
+  context (a pool of 302,912, 83,136 fewer than at the chunk), so the ladder steps down to 2,048.
+- Under `auto` on the 24 GB load an 11,228-token prompt alone ran 4 chunks, all at the solo width
+  (`prefill_chunks_solo: 4` on its `admitted` line), and answered.
 
 **The chunk under a solo reservation** (`crates/core/tests/solo_width_logits_gpu.rs`). The same 16 GB
 entry on the same 8.x routes, loaded twice from one materialization, its scratch reserved for 2,048 and
@@ -49,64 +51,74 @@ Flash-Next values (589,824 tokens, 3 lanes, 2 GiB of pinned experts), planned on
 host plan given a margin no host has, before anything is pinned), with 4.7 GB of the card taken by the
 desktop: the expert cache is 15,833,292,112 B (14.75 GiB) at a 1,024-token chunk, 15,361,441,360 B
 (14.31 GiB) at 4,096 and 14,732,307,024 B (13.72 GiB) at 8,192. The 8,192 scratch costs 1,100,985,088 B
-(1.03 GiB) against 1,024, at one budget.
+(1.03 GiB) against 1,024, at one budget; the planner's expected hit rate falls from 0.53 to 0.50.
 
 **The RTX 5090 before and after** (`.scratch/489/bench/`). `main`'s release binaries against the branch's,
-one after the other, make's 27B flags (the `rtx5090` profile, DFlash2/7, hq-e8-2b), on port 8489.
-`auto` resolves to the 2,048-token chunk on Blackwell, so both plan the same lines byte for byte (the
-workspace 983,876,864 B in both); only their contexts differ, the before load adapted to 720,896 tokens
-and the after one to 655,360, because 89 MB less of the card was free at its start.
+on port 8489, make's flags. `auto` resolves to the prefill chunk on Blackwell and Flash-Next has no ladder,
+so each pair plans the same lines byte for byte.
+
+The 27B (the `rtx5090` profile, DFlash2/7; the before load adapted its context to 720,896 tokens and the
+after one to 655,360, because 89 MB less of the card was free at its start):
 
 | | before | after |
 |---|---|---|
 | `ttft` 8,192, median of 5, cold | 772.6 ms | 769.2 ms |
 | `ttft` 65,536, median of 5, cold | 6,900.1 ms | 6,845.1 ms |
-| `g3` C=1 | 208.0 tok/s | 222.2 tok/s |
 | `g3` C=4 | 160.0 tok/s | 159.1 tok/s |
 | `g3` ITL p95 (4 lanes while 32K prompts prefill) | 213.07 ms | 212.34 ms |
 
-`g3`'s C=1 and C=4 samples are void as gate samples, their prompts served from the reuse cache; their
-decode rates compare.
+Flash-Next (262,144 tokens, 8,192-token chunk; `ttft` in three before/after pairs one after the other,
+each a median of 5; `g3` at 5 lanes, since at make's 3 its ITL cell's prefillers are refused while 4
+lanes decode):
+
+| | before | after |
+|---|---|---|
+| `ttft` 8,192, three runs | 2,478 / 2,469 / 2,439 ms | 2,493 / 2,433 / 2,443 ms |
+| `ttft` 65,536, three runs | 19,574 / 19,896 / 19,221 ms | 20,152 / 19,337 / 19,317 ms |
+| `g3` C=1, two runs | 102.3 / 102.4 tok/s | 100.9 / 101.3 tok/s |
+| `g3` ITL p50, two runs | 24.44 / 24.48 ms | 27.99 / 25.14 ms |
+| `g3` ITL p95, two runs | 34.77 / 36.67 ms | 41.13 / 36.59 ms |
+
+The 27B's `g3` C=1 and C=4 samples are void as gate samples, their prompts served from the reuse cache;
+their decode rates compare.
 
 ## Finding
 
-- On the 24 GB class `auto` is 4,096, not 8,192: 8,192 would take more than the 91,200 tokens the pool
-  holds past the context. 4,096 takes 13,312 of them and leaves the context, the lanes and the slots as
-  the profile asks. A desktop that needs those tokens leaves the solo width at the 2,048-token chunk.
-- On the 16 GB class `auto` is 4,096 too, but there the scratch is the chunk's, not the vision
-  encoder's, so the wider chunk costs 0.77 GB of pool: what the pool holds past the context falls from
-  123,904 tokens to 40,768, below the 65,536-token spare reservation an adapted context keeps for a
-  second request. "Nothing adapted" holds, the room for a second long request does not.
+- `auto` with the spare reservation takes 4,096 on the 24 GB class (13,312 tokens of pool) and 2,048 on
+  the 16 GB one (33,280); without the reservation it took 4,096 on both, the 16 GB pool left 40,768
+  tokens past the context. On the 24 GB class the 91,200 tokens past the context are what a real card's
+  desktop takes first, so a card with a desktop keeps the chunk under `auto`.
+- The owner pinned the 27B's solo width to the chunk on both profiles: the KV pool first. `auto` stays
+  the default for the 8.x cards no profile pins.
 - The narrow width runs the same kernels on the same cuts under a wider reservation: planning the solo
   scratch changes no logit at the prefill chunk.
 - Flash-Next's 8,192-token chunk costs its expert cache 1.03 GiB against 1,024. From the ~16.6 GiB the
-  `rtx5090` profile measured at 1,024, that keeps ~15.6 GiB, above the 15 GiB floor the owner asked for,
-  so the built-in profiles set 8,192 rather than 4,096.
-- On the RTX 5090 the change is neutral: same plan, TTFT within 1%, decode and the ITL cell unchanged.
+  `rtx5090` profile measured at 1,024, that keeps ~15.6 GiB, above the 15 GiB floor, and a narrower chunk
+  costs Flash-Next's prefill nearly in proportion, so `rtx5090` and `rtxpro6000` set 8,192.
+- On the RTX 5090 the change is neutral for both models: each first after run that read slower (64K
+  Flash-Next TTFT +3%, its ITL p50 +14%) came back level on the repeat.
 
 ## Implications
 
-- The 24 GB class's solo width is decided by the desktop of the card it runs on, in steps of a whole
-  ladder width; the load line (`ignis.runtime.prefill_chunk_solo`) and `GET /v1/models` say which.
+- The load line (`ignis.runtime.prefill_chunk_solo`) and `GET /v1/models` say which width a load runs.
 - A logits test that pins the prefill chunk can run on a load with any solo reservation.
+- A single before/after pair of Flash-Next benches on this host swings by a few percent; repeat a pair
+  before reading a difference.
 
 ## Limits and unknowns
 
-- The 24 GB numbers are a simulation on the RTX 5090; the TTFT a wider chunk buys on a real RTX 30 or RTX
-  40 card is measured in #516's session, as is whether the vendored GDN gating planner keeps a resident
-  schedule there at 4,096 and 8,192 tokens.
-- Flash-Next's before/after bench was not run: with the host's other applications open, 37.2 GiB of RAM
-  was available and Flash-Next's host plan needs 41.2 GiB at make's flags. Its serving path is unchanged
-  by construction (one width, its prefill chunk); the bench is to be run with the host free.
+- The 8.x numbers are a simulation on the RTX 5090. The TTFT a wider chunk buys on a real RTX 30 or RTX 40
+  card, and whether the vendored GDN gating planner keeps a resident schedule there at 4,096 and 8,192
+  tokens, are #516's to measure.
+- Flash-Next's chunk on the 24 and 16 GB classes (4,096 and 2,048 in the profiles) is a placeholder:
+  Flash-Next has not run on those cards ([GitHub #526](https://github.com/gpillon/ignis/issues/526)).
+- The decode cost of Flash-Next's 1.03 GiB of expert cache was not measured in tok/s at 1,024 against
+  8,192; the before/after pairs above both ran 8,192.
 - The expert-cache cost is a difference at one budget; the absolute cache depends on what the desktop
   holds of the card.
 
 ## Follow-ups
 
-- Whether `auto` should also keep the spare reservation (`vram.adapt_spare_tokens`) beside one context
-  at more than one lane, as an adapted context does: on the 16 GB class that would keep the 1,024-token
-  chunk, on the 24 GB one 4,096. An owner decision on #489.
-
-- #516: the TTFT at the resolved solo width and the gating planner on an sm_86 card.
-- Flash-Next's before/after `ttft` (8K, 64K) and `g3` on the RTX 5090, once the host has the RAM
-  (`.scratch/489/bench.sh`).
+- #516: the TTFT at 2,048 against `--model-prefill-chunk-solo 4096` on a real RTX 30 card, and the gating
+  planner on sm_86.
+- #526: Flash-Next's prefill chunk measured on a 24 GB and a 16 GB card.

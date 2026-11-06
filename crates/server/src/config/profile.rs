@@ -257,9 +257,12 @@ pub const NONE_PROFILE: &str = "none";
 /// spec #503 add the dense prefill's 89 MB buffer and take less prefill
 /// scratch: on the 5090 at a 16 GB budget less 1 GiB (2026-11-05) they left the
 /// KV pool 6,656 tokens smaller, 386,048 against 392,704, and the context
-/// loaded with nothing adapted. There `auto`'s solo width (GitHub #489) is
-/// 4,096, with nothing adapted: the pool falls to 302,912 tokens, 40,768 past
-/// the context (2026-11-06, an RTX 4080 as the card read).
+/// loaded with nothing adapted. The 27B's solo width (GitHub #489) is pinned
+/// to the chunk, the owner's call (2026-11-06): the KV pool before a wider
+/// chunk. On that load, with an RTX 4080 as the card read, `auto` would keep
+/// 2,048 (4,096 leaves less than the spare reservation past the context), its
+/// pool 352,768 tokens against 386,048. Flash-Next's `prefill_chunk` 2,048 is
+/// a placeholder no card of the class has measured (GitHub #526).
 ///
 /// `rtx-24gb` is the 24 GB class (GitHub #480, spec #474): the RTX 3090 and
 /// RTX 4090, the cards `--profile auto` finds from 20 GiB up to 28 GiB. It
@@ -293,12 +296,14 @@ pub const NONE_PROFILE: &str = "none";
 /// `--model-prefill-linear int8 --model-prefill-attention int8` and
 /// `IGNIS_GDN_PREFILL=ours`, 2026-11-05) it still loads 1,048,576 tokens on 8
 /// lanes with nothing adapted, the slots beside them, and keeps 17,809 pages
-/// (1,139,776 tokens), 91,200 past the context (~0.84 GB). It names no solo
-/// width: `auto` (GitHub #489) on that simulation, with an RTX 3090 as the card
-/// read, finds 8,192 short and keeps 4,096, its pool 17,601 pages (1,126,464
-/// tokens), 77,888 past the context (2026-11-06); a desktop that needs those
-/// 13,312 tokens leaves it at the chunk. No other card ships a profile; a
-/// config file's `profiles:` defines one for any other card.
+/// (1,139,776 tokens), 91,200 past the context (~0.84 GB). The 27B's solo
+/// width (GitHub #489) is pinned to the 2,048-token chunk, the owner's call
+/// (2026-11-06); on that simulation, with an RTX 3090 as the card read, `auto`
+/// would keep 4,096 for 13,312 of those tokens (8,192 does not fit), which
+/// #516's session can weigh on a real card. Flash-Next's `prefill_chunk` 4,096
+/// is a placeholder no card of the class has measured (GitHub #526). No other
+/// card ships a profile; a config file's `profiles:` defines one for any other
+/// card.
 const BUILT_IN: &str = r#"{
     "rtx5090": {
         "vram": {
@@ -333,7 +338,8 @@ const BUILT_IN: &str = r#"{
             "qwen38": { "headroom_bytes": "1200M" }
         },
         "model": {
-            "qwen38": { "max_context": 262144 }
+            "qwen38": { "max_context": 262144, "prefill_chunk_solo": 1024 },
+            "qwen38flashnext": { "prefill_chunk": 2048 }
         },
         "vision": { "enabled": true, "max_tokens": 4096, "residency": "host" },
         "spec": {
@@ -345,7 +351,8 @@ const BUILT_IN: &str = r#"{
             "qwen38": { "headroom_bytes": "1200M" }
         },
         "model": {
-            "qwen38": { "max_context": 1048576, "prefill_chunk": 2048 }
+            "qwen38": { "max_context": 1048576, "prefill_chunk": 2048, "prefill_chunk_solo": 2048 },
+            "qwen38flashnext": { "prefill_chunk": 4096 }
         },
         "reuse": {
             "qwen38": { "retained_device": RTX_24GB_RETAINED_DEVICE_SLOTS }
@@ -653,9 +660,11 @@ mod tests {
         let rtx24 = Sources { profile: built_in()["rtx-24gb"].clone(), ..Sources::default() };
         assert_eq!(resolve_settings(&rtx24, Some(ModelFamily::Qwen38_27b), Fit::Start).unwrap().settings.model.prefill_chunk, 2048, "the 5090's");
         let small = Sources { profile: built_in()["rtx-16gb"].clone(), ..Sources::default() };
-        for profile in [&rtx24, &small] {
+        // GitHub #489: Flash-Next's chunk on the 24 and 16 GB classes, values
+        // no card of theirs has measured yet (GitHub #526).
+        for (profile, chunk) in [(&rtx24, 4096), (&small, 2048)] {
             let flash = resolve_settings(profile, Some(ModelFamily::FlashNext), Fit::Start).unwrap();
-            assert_eq!(flash.settings.model.prefill_chunk, DEFAULT_PREFILL_CHUNK, "no Flash-Next section");
+            assert_eq!(flash.settings.model.prefill_chunk, chunk);
         }
     }
 
@@ -764,7 +773,9 @@ mod tests {
             assert_eq!(value(group, name, Some(Qwen38_27b)), None, "{group}.{name}: the 27B's default");
         }
         assert_eq!(value("vram", "headroom_bytes", None), None, "the general headroom stays the default");
-        assert!(rtx24.entries().all(|(_, family, _)| family != Some(FlashNext)), "no Flash-Next section");
+        // GitHub #489: Flash-Next's section holds its prefill chunk alone.
+        let flash: Vec<_> = rtx24.entries().filter(|(_, family, _)| *family == Some(FlashNext)).map(|(meta, _, _)| meta.name).collect();
+        assert_eq!(flash, ["prefill_chunk"], "Flash-Next's section");
         // The values the 5090's profile gives the 27B, but its context.
         let rtx5090 = &profiles["rtx5090"];
         for (group, name) in [("vram", "headroom_bytes"), ("model", "prefill_chunk"), ("spec", "backend"), ("spec", "draft_tokens"), ("spec", "decode_lanes"), ("spec", "draft_head")] {

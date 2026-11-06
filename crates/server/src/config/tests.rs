@@ -663,11 +663,20 @@ fn the_solo_width_is_auto_unless_named_and_no_profile_names_one() {
     let scoped = config(&["--qwen38-model-prefill-chunk-solo", "4096"]);
     assert_eq!(scoped.for_family(ModelFamily::Qwen38_27b).unwrap().prefill_chunk_solo, SoloWidth::Tokens(4096));
     assert_eq!(scoped.for_family(ModelFamily::FlashNext).unwrap().prefill_chunk_solo, SoloWidth::Auto, "the 27B's section");
-    for profile in ["rtx5090", "rtxpro6000", "rtx-16gb", "rtx-24gb"] {
+    // The Blackwell profiles name none: `auto`, which is the prefill chunk
+    // there. The 16 and 24 GB classes pin the 27B's to its chunk, one width,
+    // the KV pool before a wider chunk (the owner, 2026-11-06).
+    for (profile, qwen) in [
+        ("rtx5090", SoloWidth::Auto),
+        ("rtxpro6000", SoloWidth::Auto),
+        ("rtx-16gb", SoloWidth::Tokens(1024)),
+        ("rtx-24gb", SoloWidth::Tokens(2048)),
+    ] {
         let named = config(&["--profile", profile]);
-        for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
-            assert_eq!(named.for_family(family).unwrap().prefill_chunk_solo, SoloWidth::Auto, "{profile} {family:?}");
-        }
+        let s27 = named.for_family(ModelFamily::Qwen38_27b).unwrap();
+        assert_eq!(s27.prefill_chunk_solo, qwen, "{profile}");
+        assert_eq!(crate::runtime::EngineShape::from(&s27).solo_width(), s27.prefill_chunk, "{profile}: one width");
+        assert_eq!(named.for_family(ModelFamily::FlashNext).unwrap().prefill_chunk_solo, SoloWidth::Auto, "{profile} Flash-Next");
     }
 }
 
@@ -3699,10 +3708,13 @@ fn the_rtx_24gb_profile_serves_the_27b_with_the_5090s_values_at_the_measured_con
     let mut want = rtx5090.for_family(ModelFamily::Qwen38_27b).unwrap().settings().clone();
     want.model.max_context = 1_048_576;
     want.reuse.retained_device = Some(profile::RTX_24GB_RETAINED_DEVICE_SLOTS);
+    // GitHub #489: and the solo width pinned to the chunk.
+    want.model.prefill_chunk_solo = SoloWidth::Tokens(2048);
     assert_eq!(s27.settings(), &want);
 
     let flash = rtx24.for_family(ModelFamily::FlashNext).expect("Flash-Next resolves under the 27B's profile");
-    assert_eq!(flash.decode_lanes, None, "no Flash-Next section: its own default");
+    assert_eq!(flash.prefill_chunk, 4096, "its section's one value (GitHub #526)");
+    assert_eq!(flash.decode_lanes, None, "its own default lanes");
     assert_eq!(flash.settings().vram.pinned_expert_bytes, 0, "no pinned hot set");
     assert!(flash.speculation.is_none());
 }

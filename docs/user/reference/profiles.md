@@ -24,6 +24,8 @@ A profile follows the card's memory, not its generation, and what a card loads f
 | Field | Model | Value |
 |---|---|---|
 | [`model.max_context`](configuration.md#modelmax_context) | Qwen3.8-27B | `262144` |
+| [`model.prefill_chunk`](configuration.md#modelprefill_chunk) | Qwen3.8-Flash-Next | `2048` |
+| [`model.prefill_chunk_solo`](configuration.md#modelprefill_chunk_solo) | Qwen3.8-27B | `1024` |
 | [`spec.backend`](configuration.md#specbackend) | Qwen3.8-27B | `dflash2` |
 | [`spec.decode_lanes`](configuration.md#specdecode_lanes) | Qwen3.8-27B | `2` |
 | [`spec.draft_head`](configuration.md#specdraft_head) | Qwen3.8-27B | `auto` |
@@ -41,6 +43,8 @@ A profile follows the card's memory, not its generation, and what a card loads f
 |---|---|---|
 | [`model.max_context`](configuration.md#modelmax_context) | Qwen3.8-27B | `1048576` |
 | [`model.prefill_chunk`](configuration.md#modelprefill_chunk) | Qwen3.8-27B | `2048` |
+| [`model.prefill_chunk`](configuration.md#modelprefill_chunk) | Qwen3.8-Flash-Next | `4096` |
+| [`model.prefill_chunk_solo`](configuration.md#modelprefill_chunk_solo) | Qwen3.8-27B | `2048` |
 | [`reuse.retained_device`](configuration.md#reuseretained_device) | Qwen3.8-27B | `2` |
 | [`spec.backend`](configuration.md#specbackend) | Qwen3.8-27B | `dflash2` |
 | [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-27B | `7` |

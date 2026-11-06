@@ -322,7 +322,7 @@ The prefill chunk width, in tokens, while a lane is decoding.
 | Per model | `--qwen38-model-prefill-chunk-solo`, `--qwen38flashnext-model-prefill-chunk-solo` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The prefill chunk width, in tokens, while no lane is decoding (the solo width), its prefill scratch planned at load. `auto` is the widest of 8192 and 4096 the VRAM plan holds with nothing else adapted, for the 27B on an RTX 30 or RTX 40 card; otherwise `prefill_chunk`. A width below `prefill_chunk` is `prefill_chunk`, and refused when both are named.
+The prefill chunk width, in tokens, while no lane is decoding (the solo width), its prefill scratch planned at load. `auto` is the widest of 8192, 4096 and 2048 above `prefill_chunk` that the VRAM plan holds with nothing else adapted and, at more than one lane, `vram.adapt_spare_tokens` left beside the context, for the 27B on an RTX 30 or RTX 40 card; otherwise `prefill_chunk`. A width below `prefill_chunk` is `prefill_chunk`, and refused when both are named.
 
 ### `model.decode_share`
 

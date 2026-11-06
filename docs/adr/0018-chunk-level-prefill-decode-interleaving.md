@@ -188,8 +188,10 @@ load plans two, and the scheduler picks between them at every chunk boundary.
   end, or restored, takes its share of the narrow chunks that follow.
 - **`auto` is the default**, resolved at load
   ([ADR 0063](0063-the-profile-follows-the-card-class.md) §3 as amended the
-  same day): 8192, then 4096, for the 27B on an RTX 30 or RTX 40 card where
-  the plan holds it with nothing else adapted, otherwise the prefill chunk. On
+  same day): 8192, 4096 or 2048 above the prefill chunk, for the 27B on an
+  RTX 30 or RTX 40 card where the plan holds it with nothing else adapted and
+  room for a second request, otherwise the prefill chunk; the 16 GB and 24 GB
+  profiles pin it to their chunk, the KV pool first. On
   Blackwell `auto` is the prefill chunk: a wider chunk bought the 27B at most
   4% of cold TTFT there
   ([finding](../findings/2026-10-07-27b-prefill-chunk-width.md)), and the

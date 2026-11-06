@@ -174,9 +174,10 @@ LOOP_GUARD ?=
 # PREFILL_CHUNK is left to the server too: the card class's profile (`auto`):
 # 2048 on the 5090 (GitHub #341; free there, vision's encoder sizes the
 # arena), 1024 without it. So is PREFILL_CHUNK_SOLO (--model-prefill-chunk-solo,
-# GitHub #489), the chunk while no lane decodes: `auto`, 8192 or 4096 on an
-# RTX 30 or RTX 40 card where the VRAM plan holds it with nothing adapted, the
-# prefill chunk on the 5090.
+# GitHub #489), the chunk while no lane decodes: the card class's profile, the
+# chunk itself on the 16 and 24 GB classes and on the 5090; `auto` on an RTX 30
+# or RTX 40 card no profile pins, 8192, 4096 or 2048 where the VRAM plan holds
+# it with nothing adapted and room for a second request.
 MAX_CONTEXT ?=
 KV_FORMAT ?= hq-e8-2b
 PREFILL_CHUNK ?=
