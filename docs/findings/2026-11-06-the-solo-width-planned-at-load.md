@@ -128,5 +128,7 @@ their decode rates compare.
 ## Follow-ups
 
 - #516: the TTFT at 2,048 against `--model-prefill-chunk-solo 4096` on a real RTX 30 card, and the gating
-  planner on sm_86.
+  planner on sm_86. Done 2026-11-06: both widths ran on an sm_86 card, their figures private under #516's
+  rule; the planner keeps no cooperative schedule resident there at 2,048, 4,096 or 8,192
+  ([the sm_86 gate's first run](2026-11-06-sm86-gate-first-run.md)).
 - #526: Flash-Next's prefill chunk measured on a 24 GB and a 16 GB card.
