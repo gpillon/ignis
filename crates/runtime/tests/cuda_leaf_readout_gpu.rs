@@ -132,6 +132,7 @@ fn a_readout_crosses_the_real_compute_seam() {
         attention: None,
         reasoning_close: None,
         drafter_floor: 0,
+        next_prompt_token: None,
 };
 
     // ── the readout itself ───────────────────────────────────────────────
@@ -227,6 +228,7 @@ fn a_readout_crosses_the_real_compute_seam() {
             remaining_tokens: 1,
             permitted: None,
             reasoning_close: None,
+            anchor_emitted: false,
 }])
         .unwrap_or_else(|e| panic!("decode_step: {e}"));
     let committed = decoded

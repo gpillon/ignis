@@ -4,7 +4,9 @@
 //! the round's text and acceptance; this proves the runtime's side of it --
 //! the leaf loads the drafter from the model scope's handles, passes no
 //! drafts, and turns each lane's extent and committed run into the round's
-//! speculative counters.
+//! speculative counters. Since #518 also that the first token leaving with
+//! the prefill, and the first verify round not emitting it again, leave the
+//! text, the rounds and the acceptance as they were.
 //!
 //! Its own test binary rather than a second test in `cuda_leaf_gpu.rs`: each
 //! materializes the artifact, and the card fits one at a time.
@@ -18,6 +20,7 @@ use ignis_artifact::{bind_model_scope_27b, materialize, CudaDevice, DraftModule,
 use ignis_core::gpu_profile;
 use ignis_core::{
     Compute, DecodeJob, DecodeOutcome, DecodeParams, KvFormat, PrefillJob, RequestId, Speculation, SpeculativeBackend,
+    TokenId,
 };
 use ignis_runtime::{auto_kv_pool_bytes, CudaLeaf, CudaLeafConfig, Model, RuntimeCompute};
 
@@ -86,62 +89,89 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
     let model = Arc::new(Model::load(Arc::new(leaf)).unwrap_or_else(|e| panic!("model load: {e:?}")));
     let compute = RuntimeCompute::new(model, eos);
 
-    let request: RequestId = 1;
     let params = DecodeParams { max_tokens: Some(MAX_GENERATED), ..DecodeParams::default() };
-    compute
-        .prefill_step(&[PrefillJob {
-            checkpoint: None,
-            capture_checkpoint: None,
-            multimodal: None,
-            readout: None,
-            request,
-            tokens: prompt,
-            context_tokens: MAX_CONTEXT,
-            start_position: 0,
-            params,
-            shared_prefix: None,
-            publish_prefix: None,
-            permitted: None,
-            attention: None,
-            reasoning_close: None,
-            drafter_floor: 0,
-}])
-        .unwrap_or_else(|e| panic!("prefill_step: {e}"));
+    // #518: one request served the way the scheduler serves it -- its first
+    // token out of the prompt's last job, the first verify round taking it
+    // as its anchor and emitting only what it accepted -- and the same prompt
+    // served with every round returning its anchor, as before. The text, the
+    // rounds and the acceptance are the same.
+    let serve = |request: RequestId, first_with_the_prefill: bool| -> (Vec<TokenId>, u32, u32) {
+        let outcomes = compute
+            .prefill_step(&[PrefillJob {
+                checkpoint: None,
+                capture_checkpoint: None,
+                multimodal: None,
+                readout: None,
+                request,
+                tokens: prompt.clone(),
+                context_tokens: MAX_CONTEXT,
+                start_position: 0,
+                params,
+                shared_prefix: None,
+                publish_prefix: None,
+                permitted: None,
+                attention: None,
+                reasoning_close: None,
+                drafter_floor: 0,
+                next_prompt_token: None,
+            }])
+            .unwrap_or_else(|e| panic!("prefill_step: {e}"));
+        let mut text = Vec::new();
+        if first_with_the_prefill {
+            let first = outcomes[0].emitted.clone().unwrap_or_else(|| panic!("the prompt's last job emits nothing"));
+            assert_eq!((first.tokens.len(), first.finish), (1, None), "one token, the request goes on: {first:?}");
+            text.extend(first.tokens);
+        }
+        let mut accepted = 0u32;
+        let mut rounds = 0u32;
+        while (text.len() as u32) < MAX_GENERATED {
+            let anchor_emitted = first_with_the_prefill && rounds == 0;
+            let remaining = MAX_GENERATED - text.len() as u32;
+            let out = compute
+                .decode_step(&[DecodeJob {
+                    request,
+                    lane: 0,
+                    params,
+                    remaining_tokens: remaining,
+                    permitted: None,
+                    reasoning_close: None,
+                    anchor_emitted,
+                }])
+                .unwrap_or_else(|e| panic!("decode_step: {e}"));
+            let Some(DecodeOutcome { tokens, finish, spec, .. }) = out.into_iter().next() else {
+                break;
+            };
+            if tokens.is_empty() && finish.is_some() && spec.is_none() {
+                // A request already at its cap finishes without a round.
+                break;
+            }
+            let spec = spec.unwrap_or_else(|| panic!("round {rounds}: a DFlash2 leaf's round carried no counters"));
+            // The lane's budget counts the anchor it commits again.
+            let budget = remaining + u32::from(anchor_emitted);
+            assert_eq!(spec.rounds, 1, "round {rounds}: one verify round per decode step");
+            assert_eq!(spec.drafted, WINDOW.min(budget - 1), "round {rounds}: the lane's extent");
+            assert!(spec.accepted <= spec.drafted, "round {rounds}: {spec:?}");
+            if finish.is_none() {
+                // No cut: the run is the anchor, unless it left with the
+                // prefill, plus every accepted draft.
+                let anchor = u32::from(!anchor_emitted);
+                assert_eq!(tokens.len() as u32, spec.accepted + anchor, "round {rounds}: run against {spec:?}");
+            }
+            accepted += spec.accepted;
+            text.extend(tokens);
+            rounds += 1;
+            if finish.is_some() {
+                break;
+            }
+        }
+        compute.release(request);
+        (text, rounds, accepted)
+    };
 
-    // The prefill committed the first token; every decode round after it is
-    // a verify round.
-    let mut generated = 1u32;
-    let mut accepted = 0u32;
-    let mut rounds = 0u32;
-    while generated < MAX_GENERATED {
-        let remaining = MAX_GENERATED - generated;
-        let out = compute
-            .decode_step(&[DecodeJob { request, lane: 0, params, remaining_tokens: remaining, permitted: None, reasoning_close: None }])
-            .unwrap_or_else(|e| panic!("decode_step: {e}"));
-        let Some(DecodeOutcome { tokens, finish, spec, .. }) = out.into_iter().next() else {
-            break;
-        };
-        if tokens.is_empty() && finish.is_some() && spec.is_none() {
-            // A request already at its cap finishes without a round.
-            break;
-        }
-        let spec = spec.unwrap_or_else(|| panic!("round {rounds}: a DFlash2 leaf's round carried no counters"));
-        assert_eq!(spec.rounds, 1, "round {rounds}: one verify round per decode step");
-        assert_eq!(spec.drafted, WINDOW.min(remaining - 1), "round {rounds}: the lane's extent");
-        assert!(spec.accepted <= spec.drafted, "round {rounds}: {spec:?}");
-        if finish.is_none() {
-            // No cut: the run is the anchor plus every accepted draft.
-            assert_eq!(tokens.len() as u32, spec.accepted + 1, "round {rounds}: run against {spec:?}");
-        }
-        accepted += spec.accepted;
-        generated += tokens.len() as u32;
-        rounds += 1;
-        if finish.is_some() {
-            break;
-        }
-    }
+    let (text, rounds, accepted) = serve(1, true);
     assert!(rounds > 0, "no verify round ran");
     assert!(accepted > 0, "the leaf never landed a draft: the drafter is not proposing inside the round");
-    assert!(generated <= MAX_GENERATED + 1, "the runs outgrew max_tokens: {generated}");
-    compute.release(request);
+    assert!(text.len() as u32 <= MAX_GENERATED, "the runs outgrew max_tokens: {}", text.len());
+    let before = serve(2, false);
+    assert_eq!((text, rounds, accepted), before, "no token twice, none missing, the same rounds");
 }

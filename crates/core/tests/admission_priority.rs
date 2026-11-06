@@ -38,7 +38,8 @@ fn lanes_are_dealt_by_class_priority_then_fifo() {
     // two freed lanes must go to Interactives (class priority beats the
     // FIFO order in which the Agents were queued); only once all
     // Interactives are seated do the Agents take the last lanes (FIFO
-    // within a class).
+    // within a class). Each queued request asks for two tokens: its first
+    // leaves with its prefill (#518), its second needs a lane.
     let compute = Arc::new(MockCompute::new());
     let cfg = SchedulerConfig {
         model: "qwen3.8-27b".into(),
@@ -69,32 +70,32 @@ fn lanes_are_dealt_by_class_priority_then_fifo() {
     sched.advance(); // prefills the 8 fillers; they take all 8 lanes
 
     let a1 = sched
-        .submit(input("qwen3.8-27b", &[2], Some(1)), RequestClass::Agent)
+        .submit(input("qwen3.8-27b", &[2], Some(2)), RequestClass::Agent)
         .unwrap();
     let a2 = sched
-        .submit(input("qwen3.8-27b", &[2], Some(1)), RequestClass::Agent)
+        .submit(input("qwen3.8-27b", &[2], Some(2)), RequestClass::Agent)
         .unwrap();
     let i1 = sched
         .submit(
-            input("qwen3.8-27b", &[3], Some(1)),
+            input("qwen3.8-27b", &[3], Some(2)),
             RequestClass::Interactive,
         )
         .unwrap();
     let i2 = sched
         .submit(
-            input("qwen3.8-27b", &[3], Some(1)),
+            input("qwen3.8-27b", &[3], Some(2)),
             RequestClass::Interactive,
         )
         .unwrap();
     let i3 = sched
         .submit(
-            input("qwen3.8-27b", &[3], Some(1)),
+            input("qwen3.8-27b", &[3], Some(2)),
             RequestClass::Interactive,
         )
         .unwrap();
     let i4 = sched
         .submit(
-            input("qwen3.8-27b", &[3], Some(1)),
+            input("qwen3.8-27b", &[3], Some(2)),
             RequestClass::Interactive,
         )
         .unwrap();

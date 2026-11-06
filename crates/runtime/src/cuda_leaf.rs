@@ -496,6 +496,8 @@ impl StepLeaf for CudaLeaf {
         tokens: &[TokenId],
         start_position: u32,
         drafter_floor: u32,
+        next_prompt_token: Option<TokenId>,
+        keeps_draw: bool,
         params: DecodeParams,
         permitted: &[TokenId],
         mut redirect: Option<&mut DrawRedirect<'_>>,
@@ -520,6 +522,8 @@ impl StepLeaf for CudaLeaf {
             &token_ids,
             u64::from(start_position),
             u64::from(drafter_floor),
+            next_prompt_token,
+            keeps_draw,
             sampling_params(params),
             &permitted_ids,
             step_redirect(redirect.as_deref(), &stop_ids),
@@ -866,6 +870,8 @@ impl StepLeaf for CudaLeaf {
         tokens: &[TokenId],
         start_position: u32,
         drafter_floor: u32,
+        next_prompt_token: Option<TokenId>,
+        keeps_draw: bool,
         params: DecodeParams,
         permitted: &[TokenId],
         mut redirect: Option<&mut DrawRedirect<'_>>,
@@ -896,6 +902,8 @@ impl StepLeaf for CudaLeaf {
                     &token_ids,
                     u64::from(start_position),
                     u64::from(drafter_floor),
+                    next_prompt_token,
+                    keeps_draw,
                     draw,
                     out_logits,
                     readout,
@@ -911,6 +919,8 @@ impl StepLeaf for CudaLeaf {
                 &token_ids,
                 u64::from(start_position),
                 u64::from(drafter_floor),
+                next_prompt_token,
+                keeps_draw,
                 draw,
                 out_logits,
             )
@@ -929,6 +939,10 @@ impl StepLeaf for CudaLeaf {
     /// of the leaf.
     fn vocab(&self, _model: &Self::Model) -> u32 {
         ModelConfig::qwen38_27b().vocab as u32
+    }
+
+    fn pending_token(&self, sequence: &Self::Sequence) -> Option<TokenId> {
+        sequence.pending_token().map(|token| token as TokenId)
     }
 
     fn decode(

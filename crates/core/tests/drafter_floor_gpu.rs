@@ -140,7 +140,7 @@ fn drafts(model: &Model, pool: &SeqPool, seq: &Seq<'_>, label: &str) -> Vec<i32>
 
 /// The span `[start, start + tokens.len())` on `seq`, with `floor`.
 fn prefill(model: &Model, pool: &SeqPool, seq: &mut Seq<'_>, tokens: &[i32], start: u32, floor: u32, label: &str) {
-    prefill_program_draw(model, pool, seq, tokens, u64::from(start), u64::from(floor), greedy(), None)
+    prefill_program_draw(model, pool, seq, tokens, u64::from(start), u64::from(floor), None, false, greedy(), None)
         .unwrap_or_else(|e| panic!("{label}: prefill at {start}: {e}"));
 }
 

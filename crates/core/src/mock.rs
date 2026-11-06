@@ -92,7 +92,9 @@ struct Inner {
     /// what every scenario that is not about placement wants.
     arena: Option<MockHostArena>,
     /// The draw a **constrained decode** request has made and not yet emitted (GitHub
-    /// #242), per request: the token the *next* decode round returns.
+    /// #242), per request: the token the *next* decode round returns -- or,
+    /// for the prefill's draw, which leaves with the prefill (#518), the
+    /// anchor that round commits without returning it.
     ///
     /// This is the leaf's one-round lag, modelled on purpose. A mock that
     /// emitted the set it was handed in the same call would let a scheduler
@@ -742,17 +744,36 @@ impl Compute for MockCompute {
             g.prefilled.insert(job.request, job.start_position + job.tokens.len() as u32);
         }
         let mut redirected = vec![false; jobs.len()];
+        let mut emitted: Vec<Option<DecodeOutcome>> = vec![None; jobs.len()];
         for (index, job) in jobs.iter().enumerate() {
+            // #518: the prompt's last job emits the token it draws, which
+            // stays the sequence's pending token: the next round's anchor.
+            if job.next_prompt_token.is_some() {
+                continue;
+            }
+            let step = g.generated.get(&job.request).copied().unwrap_or(0);
             // GitHub #242: a prefill *draws*, and a run's first token is
-            // the one it draws. Held until a decode round asks for it.
+            // the one it draws.
             if let Some(permitted) = &job.permitted {
                 let draw = Self::draw(self.seed, &mut g, job.request, permitted);
                 g.pending.insert(job.request, draw);
-            } else if let Some(close) = job.reasoning_close {
-                // GitHub #315: a free draw of the EOS with the block open.
-                let step = g.generated.get(&job.request).copied().unwrap_or(0);
+                emitted[index] = Some(DecodeOutcome::constrained_run(vec![draw.token], vec![draw.probability]));
+                continue;
+            }
+            // GitHub #315: a free draw of the EOS with the block open.
+            if let Some(close) = job.reasoning_close {
                 redirected[index] = Self::redirect(&mut g, job.request, step, close);
             }
+            let eos = g.eos.get(&job.request).is_some_and(|steps| steps.contains(&step));
+            emitted[index] = Some(if let Some(close) = job.reasoning_close.filter(|_| redirected[index]) {
+                DecodeOutcome::token(close)
+            } else if eos {
+                // The EOS is never emitted: the request ends on it.
+                DecodeOutcome::finished(FinishReason::Stop)
+            } else {
+                let seed = g.seeds.get(&job.request).copied().unwrap_or(0);
+                DecodeOutcome::token(Self::mix(self.seed, job.request, seed, step))
+            });
         }
         g.prefill_batches.push(jobs.to_vec());
         Ok(jobs
@@ -801,6 +822,7 @@ impl Compute for MockCompute {
                     .filter(|_| !g.attention_refusals.remove(&job.request))
                     .map(|query| Self::attention(query, job.start_position + job.tokens.len() as u32)),
                 reasoning_redirected: redirected[index],
+                emitted: emitted[index].take(),
             })
             .collect())
     }
@@ -895,6 +917,10 @@ impl Compute for MockCompute {
                         g.pending.insert(job.request, next);
                     }
                     *g.generated.entry(job.request).or_insert(0) += 1;
+                    // #518: an anchor the prefill emitted is not emitted again.
+                    if job.anchor_emitted {
+                        return DecodeOutcome::run(Vec::new());
+                    }
                     return DecodeOutcome::constrained_run(
                         vec![emitted.token],
                         vec![emitted.probability],
@@ -979,6 +1005,11 @@ impl Compute for MockCompute {
                     // its stop condition is a token-count cap, reached
                     // before this round committed anything: `Length`.
                     return DecodeOutcome::finished(FinishReason::Length);
+                }
+                // #518: the run's first token is its anchor, which a prefill
+                // that emitted it already sent.
+                if job.anchor_emitted && !run.is_empty() {
+                    run.remove(0);
                 }
                 DecodeOutcome {
                     tokens: run,
@@ -1664,6 +1695,7 @@ mod tests {
             remaining_tokens: 100,
             permitted: None,
             reasoning_close: None,
+            anchor_emitted: false,
         };
         gated.arm_at(7, 2);
         for _ in 0..2 {
@@ -1693,6 +1725,7 @@ mod tests {
             remaining_tokens: 100,
             permitted: None,
             reasoning_close: None,
+            anchor_emitted: false,
         };
         gated.arm_at(7, 0);
         assert!(!controller.entered(), "nothing has reached the armed step");

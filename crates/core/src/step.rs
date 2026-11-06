@@ -17,6 +17,7 @@ use std::marker::PhantomData;
 
 use crate::model_load::Model;
 use crate::seq::{Seq, SeqPool, ffi::IgnisSeq};
+use crate::types::TokenId;
 use crate::vision::{Grid, VisionItemControl};
 
 pub(crate) mod ffi {
@@ -76,85 +77,10 @@ pub(crate) mod ffi {
     /// mirrors so its layout pin runs in the CPU suite.
     pub use crate::step_abi::IgnisDecodeOptions;
 
-    /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
-    /// #84). `size` must be `sizeof(struct ignis_prefill_options)`; the
-    /// leaf rejects a size it does not recognize.
-    #[repr(C)]
-    #[derive(Debug, Clone, Copy)]
-    pub struct IgnisPrefillOptions {
-        pub size: u32,
-        pub route: i32,
-        pub compute_policy: i32,
-        /// GitHub #178: the span's axis-major `[3, T]` positions, or null
-        /// for a text span (whose media fields are then empty).
-        pub mrope_positions: *const i32,
-        pub rope_delta: i32,
-        pub media_column_count: u32,
-        pub media: *const IgnisMediaEmbedding,
-        pub media_scatter_indices: *const i32,
-        pub media_first_column: u32,
-        /// P6-06 (GitHub #242): the span's own draw's probability within its
-        /// permitted set, or null. A constrained run's **first** token is
-        /// drawn here — a decode round returns the successor the previous
-        /// call made ready — so this is where its confidence comes back.
-        pub out_permitted_prob: *mut f32,
-        /// GitHub #260 (ADR 0038): the attention readout — none when the
-        /// ordinal is negative. One query head of one GQA layer at the
-        /// span's last position, over the keys of
-        /// `[attention_key_begin, + attention_key_count)` as that layer's
-        /// attention read them; one pre-softmax score per key into
-        /// `out_attention_scores`, and `*out_attention_read` 1 when the leaf
-        /// could read them, 0 when it could not.
-        pub attention_gqa_ordinal: i32,
-        pub attention_query_head: i32,
-        pub attention_key_begin: i64,
-        pub attention_key_count: i64,
-        pub out_attention_scores: *mut f32,
-        pub out_attention_read: *mut i32,
-        /// GitHub #263 (ADR 0039): the head set read beside the attention
-        /// readout, or none when `attention_set_count` is 0. Head `i` is
-        /// query head `attention_set_query_heads[i]` of GQA layer
-        /// `attention_set_gqa_ordinals[i]`; its argmax over the span minus
-        /// the `attention_excluded` span-relative keys lands in
-        /// `out_attention_set_argmax[i]`. Every armed layer must read, or
-        /// `*out_attention_read` is 0.
-        pub attention_set_count: u32,
-        pub attention_set_gqa_ordinals: *const i32,
-        pub attention_set_query_heads: *const i32,
-        pub attention_excluded_count: u32,
-        pub attention_excluded: *const i32,
-        pub out_attention_set_argmax: *mut i32,
-        /// GitHub #264 (ADR 0040): with the set, head `i`'s own score at its
-        /// argmax, and the four scores around it — the argmax's left, right,
-        /// up and down neighbours in an image grid of `attention_grid_cols`
-        /// columns, `NaN` for one off the grid.
-        pub attention_grid_cols: u32,
-        pub out_attention_set_peak: *mut f32,
-        pub out_attention_set_neighbours: *mut f32,
-        /// The measurement readout: every position's BF16 logits, host,
-        /// `[num_tokens][vocab]` ([`super::prefill_program_span_logits`]).
-        pub out_span_logits: *mut u16,
-        /// GitHub #275 (ADR 0041): with the set, every head's whole row,
-        /// host, `[attention_set_count][attention_key_count]`, or null. With
-        /// rows the grid's columns may be 0 and the neighbours null.
-        pub out_attention_set_rows: *mut f32,
-        /// GitHub #302: the span's n-gram table rows on a Flash-Next load,
-        /// host `[num_tokens][16][90]`; null on the 27B.
-        pub ngram_rows: *const u8,
-        /// GitHub #315 (ADR 0048): 1 when the span's draw was redirected to
-        /// its `reasoning_close_id`, else 0; null asks for nothing.
-        pub out_reasoning_redirected: *mut i32,
-        /// GitHub #506: the first absolute position whose feature taps a
-        /// later drafter window reads. The span taps from the later of its
-        /// last 2048 positions and this; 0 is that span rule alone.
-        pub drafter_floor: u64,
-    }
-
-    /// Opaque `struct ignis_media_embedding` (GitHub #178).
-    #[repr(C)]
-    pub struct IgnisMediaEmbedding {
-        _private: [u8; 0],
-    }
+    /// 1:1 with `struct ignis_prefill_options` and the opaque
+    /// `struct ignis_media_embedding` it points at, kept beside the
+    /// kernel-free mirrors so the options' layout pin runs in the CPU suite.
+    pub use crate::step_abi::{IgnisMediaEmbedding, IgnisPrefillOptions};
 
     /// 1:1 with `struct ignis_media_encode_input` (GitHub #178).
     #[repr(C)]
@@ -712,6 +638,20 @@ impl PrefillRoute {
             ngram_rows: std::ptr::null(),
             out_reasoning_redirected: std::ptr::null_mut(),
             drafter_floor: 0,
+            next_prompt_token: -1,
+            keeps_draw: 0,
+        }
+    }
+}
+
+/// The C field's value for a span's next prompt token (GitHub #519): the id,
+/// or -1 on the prompt's last span. An id past `i32` names no vocabulary
+/// entry; it is refused here rather than wrapped into one.
+fn next_prompt_token_field(what: &str, next_prompt_token: Option<TokenId>) -> Result<i32, String> {
+    match next_prompt_token {
+        None => Ok(-1),
+        Some(token) => {
+            i32::try_from(token).map_err(|_| format!("{what}: next prompt token {token} is no vocabulary id"))
         }
     }
 }
@@ -777,7 +717,7 @@ pub fn prefill_program_sampled(
     sampling: SamplingParams,
     out_logits: Option<&mut [f32]>,
 ) -> Result<(), String> {
-    prefill_program_draw(model, pool, sequence, token_ids, start_position, 0, LaneDraw::free(sampling), out_logits)
+    prefill_program_draw(model, pool, sequence, token_ids, start_position, 0, None, false, LaneDraw::free(sampling), out_logits)
         .map(|_| ())
 }
 
@@ -793,6 +733,16 @@ pub fn prefill_program_sampled(
 /// this, and a span wholly below it taps nothing while the drafter's
 /// frontier still moves to the span's end. 0 is the span rule alone, what
 /// every other prefill entry point passes.
+///
+/// `next_prompt_token` (GitHub #519) is the prompt token right after the
+/// span, or `None` on the prompt's last span. With a token the span draws
+/// nothing: no output head, no sample, and the sequence is left with no
+/// pending token. `draw` must then be a free one and `out_logits` `None`,
+/// which only the prompt's last span reads; the leaf refuses either.
+///
+/// `keeps_draw` (GitHub #520) makes a span with a next token draw anyway: a
+/// prefix image or a prompt checkpoint retains the state after it and
+/// carries the draw as its pending token.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_program_draw(
     model: &Model,
@@ -801,6 +751,8 @@ pub fn prefill_program_draw(
     token_ids: &[i32],
     start_position: u64,
     drafter_floor: u64,
+    next_prompt_token: Option<TokenId>,
+    keeps_draw: bool,
     draw: LaneDraw<'_>,
     out_logits: Option<&mut [f32]>,
 ) -> Result<SpanDraw, String> {
@@ -811,6 +763,8 @@ pub fn prefill_program_draw(
         out_permitted_prob: &mut probability,
         out_reasoning_redirected: &mut redirected,
         drafter_floor,
+        next_prompt_token: next_prompt_token_field("prefill_program_draw", next_prompt_token)?,
+        keeps_draw: i32::from(keeps_draw),
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     let logits_ptr = match out_logits {
@@ -969,6 +923,11 @@ pub fn flash_next_ngram_token_bytes() -> usize {
 /// draw's reasoning redirect (GitHub #315). Returns the drawn token's
 /// probability within its permitted set (0 without one) and whether it was
 /// redirected.
+///
+/// `next_prompt_token` and `keeps_draw` are [`prefill_program_draw`]'s
+/// (GitHub #519, #520). On an MTP load the head's entry at the span's last
+/// position is built from the next prompt token, or from the draw on the
+/// prompt's last span.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_flash_next(
     model: &Model,
@@ -976,6 +935,8 @@ pub fn prefill_flash_next(
     sequence: &mut Seq<'_>,
     token_ids: &[i32],
     start_position: u64,
+    next_prompt_token: Option<TokenId>,
+    keeps_draw: bool,
     sampling: SamplingParams,
     permitted: &[i32],
     redirect: Redirect<'_>,
@@ -1019,6 +980,8 @@ pub fn prefill_flash_next(
         out_permitted_prob: &mut probability,
         ngram_rows: ngram_rows.as_ptr(),
         out_reasoning_redirected: &mut redirected,
+        next_prompt_token: next_prompt_token_field("prefill_flash_next", next_prompt_token)?,
+        keeps_draw: i32::from(keeps_draw),
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     let params = redirect.arm(permitted_params("prefill_flash_next", sampling, permitted)?);
@@ -1320,7 +1283,7 @@ pub fn prefill_program_permitted(
         permitted,
         ..LaneDraw::free(sampling)
     };
-    prefill_program_draw(model, pool, sequence, token_ids, start_position, 0, draw, out_logits)
+    prefill_program_draw(model, pool, sequence, token_ids, start_position, 0, None, false, draw, out_logits)
         .map(|drawn| drawn.probability)
 }
 
@@ -1804,7 +1767,9 @@ pub struct SpanMediaColumns<'a> {
 /// about an image starts inside its reasoning as a text one does.
 ///
 /// `drafter_floor` is [`prefill_program_draw`]'s (GitHub #506): an image's
-/// span taps the drafter's window by the same rule as a text one.
+/// span taps the drafter's window by the same rule as a text one. So are
+/// `next_prompt_token` and `keeps_draw` (GitHub #519, #520): an image's
+/// intermediate span draws nothing either, unless an image retains it.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_program_multimodal(
     model: &Model,
@@ -1813,6 +1778,8 @@ pub fn prefill_program_multimodal(
     token_ids: &[i32],
     start_position: u64,
     drafter_floor: u64,
+    next_prompt_token: Option<TokenId>,
+    keeps_draw: bool,
     sampling: SamplingParams,
     permitted: &[i32],
     redirect: Redirect<'_>,
@@ -1828,6 +1795,8 @@ pub fn prefill_program_multimodal(
         token_ids,
         start_position,
         drafter_floor,
+        next_prompt_token,
+        keeps_draw,
         LaneDraw {
             sampling,
             permitted,
@@ -1846,7 +1815,9 @@ pub fn prefill_program_multimodal(
 ///
 /// Returns the permitted draw's probability (0 with no set) and whether it
 /// was redirected (GitHub #315), and whether the leaf could read the keys
-/// the readout names. `drafter_floor` is [`prefill_program_draw`]'s.
+/// the readout names. `drafter_floor`, `next_prompt_token` and `keeps_draw`
+/// are [`prefill_program_draw`]'s: a readout is the prompt's last span's, so
+/// the leaf refuses one with a next token.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_program_attention(
     model: &Model,
@@ -1855,6 +1826,8 @@ pub fn prefill_program_attention(
     token_ids: &[i32],
     start_position: u64,
     drafter_floor: u64,
+    next_prompt_token: Option<TokenId>,
+    keeps_draw: bool,
     draw: LaneDraw<'_>,
     out_logits: Option<&mut [f32]>,
     attention: AttentionReadout<'_>,
@@ -1867,6 +1840,8 @@ pub fn prefill_program_attention(
         token_ids,
         start_position,
         drafter_floor,
+        next_prompt_token,
+        keeps_draw,
         draw,
         None,
         out_logits,
@@ -1886,6 +1861,8 @@ fn prefill_program_reading(
     token_ids: &[i32],
     start_position: u64,
     drafter_floor: u64,
+    next_prompt_token: Option<TokenId>,
+    keeps_draw: bool,
     draw: LaneDraw<'_>,
     span: Option<MultimodalPrefill<'_>>,
     out_logits: Option<&mut [f32]>,
@@ -1900,6 +1877,8 @@ fn prefill_program_reading(
         out_permitted_prob: &mut probability,
         out_reasoning_redirected: &mut redirected,
         drafter_floor,
+        next_prompt_token: next_prompt_token_field(what, next_prompt_token)?,
+        keeps_draw: i32::from(keeps_draw),
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     if let Some(span) = span {

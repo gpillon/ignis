@@ -313,7 +313,40 @@ struct ignis_prefill_options {
    * is the span rule alone, and what a NULL options pointer means. Unread on a
    * load without the drafter, on the per-token route and on Flash-Next. */
   uint64_t drafter_floor;
+  /* GitHub #519: the next prompt token -- the prompt's token right after this
+   * span, or -1 on the prompt's last span, whose draw is the sequence's
+   * pending token; -1 is what a NULL options pointer means, and every caller
+   * sets it (0 is a real token id). With a token, nothing reads the span's
+   * draw unless `keeps_draw`: the program runs no output head and samples
+   * nothing over it, and leaves the sequence with no pending token. On
+   * Flash-Next with MTP the head's entry at the span's last position is built
+   * from this token (GitHub #520), as every other entry is from the span's
+   * next id; on the prompt's last span, from the draw. Such a span asks for
+   * no logits (`out_logits`, `out_span_logits`), no permitted set, no
+   * reasoning redirect and no attention readout, and runs the chunked route:
+   * the call is refused otherwise. A token outside the vocabulary is refused
+   * too. */
+  int32_t next_prompt_token;
+  /* GitHub #520: nonzero when a prefix image or a prompt checkpoint retains
+   * the state after this span: the span then draws with a next prompt token
+   * too, as the prompt's last span does, and leaves the draw as the pending
+   * token the image carries; the next prompt token still builds Flash-Next's
+   * MTP entry. 0 under NULL options; the prompt's last span draws either
+   * way. */
+  int32_t keeps_draw;
 };
+
+#ifdef __cplusplus
+/* Beside the `size` check, both sides pin the layout (here, and
+ * crates/core/src/step_abi.rs's mirror test, on CPU): GitHub #520's
+ * `keeps_draw` filled the tail padding after `next_prompt_token`, so the size
+ * alone no longer tells that layout from the one before it. */
+static_assert(sizeof(struct ignis_prefill_options) == 224 &&
+                  offsetof(struct ignis_prefill_options, drafter_floor) == 208 &&
+                  offsetof(struct ignis_prefill_options, next_prompt_token) == 216 &&
+                  offsetof(struct ignis_prefill_options, keeps_draw) == 220,
+              "ignis_prefill_options drifted from crates/core/src/step_abi.rs IgnisPrefillOptions");
+#endif
 
 /* The most heads a readout may bring whole rows back for (GitHub #275): the
  * load reserves the rows' room for this many over `attention_text_max_keys`

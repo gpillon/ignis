@@ -40,22 +40,47 @@
 
 #include <cuda_runtime.h>
 
-/* Whether an A16 call with this weight and column count takes the MMA route:
- * a registered NVFP4 problem at 64 columns or more, 128 or more when it has
- * fewer than 4,096 output rows. Narrower calls stay on the vendored GEMVs,
- * which win there (the thresholds are measured; see
+/* What an A16 call is, as far as the MMA route's widths go (GitHub #521): a
+ * prefill chunk's DFlash2 feature taps -- the drafter's context append in
+ * kernel/src/step.cu's prefill -- or any other call: the verify round's
+ * append, the propose forward, a carried anchor. The two differ only on
+ * compute capability 8.x. */
+enum class IgnisA16Call { General, PrefillTaps };
+
+/* The narrowest call, in columns, that takes the MMA route for a weight of
+ * `output_rows` rows on a card of compute capability `compute_major`: 64, or
+ * 128 below 4,096 rows, on every generation, except that on 8.x a prefill's
+ * feature taps take it from a width of their own. The one place the widths
+ * are chosen per GPU generation (the values and their measurements:
  * kernel/src/nvfp4_a16_mma.cu). */
+std::int32_t ignis_nvfp4_a16_mma_min_tokens(int compute_major, IgnisA16Call call,
+                                            std::int32_t output_rows);
+
+/* Whether an A16 call with this weight and column count takes the MMA route:
+ * a registered NVFP4 problem at `ignis_nvfp4_a16_mma_min_tokens` columns or
+ * more, for the current device's compute capability (read once per process).
+ * Narrower calls stay on the vendored GEMVs, which win there. */
 bool ignis_nvfp4_a16_mma_applies(std::int32_t output_rows, std::int32_t input_rows,
-                                 std::int32_t tokens);
+                                 std::int32_t tokens, IgnisA16Call call = IgnisA16Call::General);
 
 /* `out[N, T] = W[N, K] * x[K, T]` for an NVFP4 `W`, A16 compute. It checks
  * only the shape rule: the Linear semantics (contiguous, 16-byte-aligned BF16
  * `x` and `out`, matching extents) and the weight's NVFP4 layout are
  * `ops::linear`'s to validate, and this entry point assumes them. It is
- * public so the leaf's CTest can hold `ops::linear` to it bit for bit; the
- * engine reaches it only through `ops::linear`. Throws for a shape
- * `ignis_nvfp4_a16_mma_applies` rejects. */
+ * public so the leaf's CTest can hold `ops::linear` to it bit for bit and the
+ * bench can time it at any width; the engine reaches it only through
+ * `ops::linear` and `ignis_linear_a16`. It refuses only a problem the NVFP4
+ * registry does not know, or T < 1 (no column), and throws for those; since
+ * GitHub #521 a call narrower than the route's widths is computed all the
+ * same. */
 void ignis_nvfp4_a16_mma(const ninfer::Tensor &x, const ninfer::Weight &w, ninfer::Tensor &out,
                          cudaStream_t stream);
+
+/* `ops::linear(x, w, out, stream)`, the A16 convenience overload, for a call
+ * of kind `call`: the same validation and the same dispatch, the MMA route
+ * taken at `call`'s widths. The drafter's context append calls it
+ * (kernel/src/dflash2_drafter.h); defined in kernel/src/linear.cu. */
+void ignis_linear_a16(const ninfer::Tensor &x, const ninfer::Weight &w, ninfer::Tensor &out,
+                      IgnisA16Call call, cudaStream_t stream);
 
 #endif /* IGNIS_NVFP4_A16_MMA_H */

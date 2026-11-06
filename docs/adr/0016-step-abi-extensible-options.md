@@ -7,6 +7,10 @@ specifically its claim that chunked prefill would be "a leaf change, not an
 ABI change". The step-level, device-resident, opaque-handled design of ADR
 0009 is unchanged.
 
+**Amended by #520** (2026-11-06): a field appended into the struct's tail
+padding leaves `size` as it was, and a layout pin guards it; see the
+amendment at the end.
+
 Sources: `docs/specs/runtime/02-real-prefill.md` (GitHub #63).
 
 ## Context
@@ -84,3 +88,21 @@ that this is the last break of its kind.*
 - The rule generalizes: any new step-ABI call that plausibly needs per-call
   modulation should take an options pointer from its first version, even if
   the struct starts with nothing but `size`.
+
+## Amendment (2026-11-06) — an append into tail padding keeps `size` (#520)
+
+#520 appended `int32_t keeps_draw` to `struct ignis_prefill_options`, after
+`next_prompt_token`. It took the four bytes of tail padding the struct
+already had, so `sizeof` stayed 224 and the size bump the Decision promises
+for every append did not happen: the leaf's `size` check accepts the layout
+before #520 and the one after it alike.
+
+- A field that fits the tail padding keeps `size` as it was. The layout pin
+  guards it instead: a `static_assert` on `sizeof` and on each appended
+  field's `offsetof` in `kernel/include/ignis_step.h`, mirrored by an
+  `offset_of!` test in `crates/core/src/step_abi.rs`, so a drift on either
+  side fails the build or `cargo test`.
+- It costs nothing today: the Rust binding in this tree is the ABI's only
+  caller, built together with the leaf. If the ABI gains a consumer outside
+  this repository, the versioning story the Decision asks for then says
+  whether an append into padding needs a version field of its own.

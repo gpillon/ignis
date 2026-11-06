@@ -135,6 +135,8 @@ impl StepLeaf for ByteLeaf {
         tokens: &[u32],
         _start_position: u32,
         _drafter_floor: u32,
+        _next_prompt_token: Option<u32>,
+        _keeps_draw: bool,
         _params: DecodeParams,
         _permitted: &[u32],
         _redirect: Option<&mut ignis_runtime::DrawRedirect<'_>>,
@@ -144,6 +146,11 @@ impl StepLeaf for ByteLeaf {
         let seed = tokens.iter().fold(17u32, |h, &t| h.wrapping_mul(31).wrapping_add(t));
         sequence.bytes = (0..BLOB_BYTES).map(|i| (seed as usize + i * 7 + i / 977) as u8).collect();
         Ok(0.0)
+    }
+    /// None: the stub draws nothing ahead, its round emits a hash of the
+    /// bytes it flips, so its prefill emits no token (#518).
+    fn pending_token(&self, _sequence: &ByteSeq) -> Option<u32> {
+        None
     }
     fn decode(&self, _model: &(), sequences: &mut [&mut ByteSeq], _lanes: &[DecodeLane<'_>]) -> Result<Vec<LaneRun>, i32> {
         Ok(sequences
@@ -229,6 +236,7 @@ pub fn prefill(compute: &RuntimeCompute<ByteLeaf>, request: RequestId) {
         attention: None,
         reasoning_close: None,
         drafter_floor: 0,
+        next_prompt_token: None,
     };
     compute.prefill_step(&[job]).unwrap();
 }
@@ -245,6 +253,7 @@ pub fn decode(compute: &RuntimeCompute<ByteLeaf>, request: RequestId, rounds: u3
         remaining_tokens: 1,
         permitted: None,
         reasoning_close: None,
+        anchor_emitted: false,
     };
     (0..rounds)
         .flat_map(|_| compute.decode_step(std::slice::from_ref(&job)).unwrap().remove(0).tokens)

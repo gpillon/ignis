@@ -366,7 +366,7 @@ impl LaneRun {
 /// A prefill draw's **reasoning redirect** (GitHub #315, ADR 0048), in and
 /// out: the `</think>` a stop id the span draws becomes, the stop ids, and --
 /// set by the leaf -- whether it did. Passed only for the chunk whose draw the
-/// first decode round emits, in a request that starts inside its reasoning;
+/// request emits first (#518), in a request that starts inside its reasoning;
 /// `None` asks for nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrawRedirect<'a> {
@@ -764,7 +764,7 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// a readout observes the prefill, it does not change it.
     ///
     /// `permitted`, when non-empty, restricts the draw this span makes
-    /// (GitHub #242) — the successor the first decode round returns — and
+    /// (GitHub #242) — the request's first token (#518) — and
     /// the call reports its probability within that set. Empty is an
     /// ordinary prefill and reports 0.
     ///
@@ -780,6 +780,22 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// `drafter_floor` is the job's [`PrefillJob::drafter_floor`] (GitHub
     /// #506): the span taps the drafter's window from the later of its own
     /// last 2048 positions and this. A leaf without the drafter ignores it.
+    ///
+    /// `next_prompt_token` (GitHub #519) is the prompt token right after the
+    /// span, `None` on the prompt's last span ([`PrefillJob::next_prompt_token`]).
+    /// With a token nothing reads the span's draw: the leaf runs no output
+    /// head and samples nothing, and leaves the sequence with no pending
+    /// token, unless `keeps_draw`. Flash-Next's MTP head builds its entry at
+    /// the span's last position from the token (GitHub #520), as from the
+    /// span's own next ids. A span with a next token asks for no logits, no
+    /// permitted set, no redirect and no readout, which only the prompt's
+    /// last span carries.
+    ///
+    /// `keeps_draw` (GitHub #520) is true on a span whose state a prefix or a
+    /// prompt checkpoint retains: it draws even with a next token, since the
+    /// image carries the draw as its pending token, which a claimant matching
+    /// the whole image emits as its first. The next token still feeds the MTP
+    /// head's entry. Without a next token the span draws anyway.
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,
@@ -788,6 +804,8 @@ pub trait StepLeaf: Send + Sync + 'static {
         tokens: &[TokenId],
         start_position: u32,
         drafter_floor: u32,
+        next_prompt_token: Option<TokenId>,
+        keeps_draw: bool,
         params: DecodeParams,
         permitted: &[TokenId],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -812,8 +830,9 @@ pub trait StepLeaf: Send + Sync + 'static {
     ///
     /// `attention` is the **attention readout** (GitHub #260), read at the
     /// span's last position; see [`AttentionRead`] for what the leaf owes
-    /// it. The text path carries one too (GitHub #275). `redirect` and
-    /// `drafter_floor` are [`StepLeaf::prefill`]'s.
+    /// it. The text path carries one too (GitHub #275). `redirect`,
+    /// `drafter_floor`, `next_prompt_token` and `keeps_draw` are
+    /// [`StepLeaf::prefill`]'s.
     #[allow(clippy::too_many_arguments)]
     fn prefill_multimodal(
         &self,
@@ -822,6 +841,8 @@ pub trait StepLeaf: Send + Sync + 'static {
         _tokens: &[TokenId],
         _start_position: u32,
         _drafter_floor: u32,
+        _next_prompt_token: Option<TokenId>,
+        _keeps_draw: bool,
         _params: DecodeParams,
         _permitted: &[TokenId],
         _redirect: Option<&mut DrawRedirect<'_>>,
@@ -831,13 +852,17 @@ pub trait StepLeaf: Send + Sync + 'static {
     ) -> Result<f32, i32> {
         Err(-1)
     }
+    /// The sequence's **pending token** (#518): what its last prefill span
+    /// or decode round drew, the next round's anchor — or `None` for one
+    /// with nothing drawn yet. A prompt's last job emits it.
+    fn pending_token(&self, sequence: &Self::Sequence) -> Option<TokenId>;
     /// Decode one round over a batch of warmed sequences, `lanes` parallel
     /// to `sequences`. Returns each lane's committed run (P5-06, GitHub
-    /// #154): at least one token, never more than its `remaining_tokens`,
-    /// cut at its first stop id inclusive — one token on a load without
-    /// speculation. On an error, the leaf must leave every input sequence
-    /// unchanged so the scheduler can retry the round without corrupting
-    /// token order.
+    /// #154): at least one token, its anchor first, never more than its
+    /// `remaining_tokens`, cut at its first stop id inclusive — one token on
+    /// a load without speculation. On an error, the leaf must leave every
+    /// input sequence unchanged so the scheduler can retry the round without
+    /// corrupting token order.
     fn decode(
         &self,
         model: &Self::Model,
@@ -983,6 +1008,9 @@ impl<L: StepLeaf> Drop for Model<L> {
 
 struct LiveSequence<S> {
     handle: S,
+    /// The tokens its decode rounds committed, anchors included: what it
+    /// emitted, once the first round has committed the anchor its prefill
+    /// emitted (#518).
     generated: u32,
 }
 
@@ -1320,6 +1348,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         media: &mut MediaCache<L::Media>,
         job: &PrefillJob,
         multimodal: &Multimodal,
+        keeps_draw: bool,
         redirect: Option<&mut DrawRedirect<'_>>,
         out_logits: Option<&mut [f32]>,
         attention: Option<&mut AttentionRead>,
@@ -1363,6 +1392,8 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             &job.tokens,
             start,
             job.drafter_floor,
+            job.next_prompt_token,
+            keeps_draw,
             job.params,
             &permitted,
             redirect,
@@ -1584,6 +1615,9 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             // prefix's end, and of a prompt checkpoint (GitHub #186), whose
             // progress section carries the pending token the capturing
             // sequence had at its opener.
+            // GitHub #242: a constrained decode's first token's probability
+            // within its set, drawn by the span below.
+            let mut first_probability = None;
             if !job.tokens.is_empty() {
                 // GitHub #237: the full-vocabulary buffer, allocated only
                 // for a job that asked to read one out — every other job
@@ -1600,7 +1634,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 // and (GitHub #275) a row per head of a set read in rows. A
                 // text job reads one as an image job does.
                 let mut attention = job.attention.as_ref().map(AttentionRead::new);
-                // GitHub #315: the draw the first round emits, redirected
+                // GitHub #315: the request's first token (#518), redirected
                 // from the EOS while the request's reasoning block is open.
                 // `ignore_eos` has no stop id, so nothing to redirect.
                 let eos = [self.eos];
@@ -1612,6 +1646,14 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         stop_ids: &eos,
                         redirected: false,
                     });
+                // GitHub #519, #520: the leaf draws only where the draw is
+                // read -- the prompt's last job, and a job whose state a
+                // prefix or a prompt checkpoint retains: the image carries its
+                // pending token, which a claimant matching the whole of it
+                // emits as its first token (the empty-tail branch above). The
+                // retained job still gets its next prompt token, which
+                // Flash-Next's MTP entry at its last position is built from.
+                let keeps_draw = job.keeps_draw();
                 let warmed = match &job.multimodal {
                     None => self
                         .model
@@ -1622,6 +1664,8 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             &job.tokens,
                             job.start_position,
                             job.drafter_floor,
+                            job.next_prompt_token,
+                            keeps_draw,
                             job.params,
                             // GitHub #242: the set this chunk's own draw is
                             // restricted to, borrowed and not cloned — every
@@ -1638,6 +1682,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         &mut media,
                         job,
                         multimodal,
+                        keeps_draw,
                         redirect.as_mut(),
                         logits.as_deref_mut(),
                         attention.as_mut(),
@@ -1648,10 +1693,10 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     Ok((encode_micros, probability)) => {
                         outcomes[index].encode_micros = encode_micros;
                         // The first token of a run's run was just drawn
-                        // here; the first decode round returns it, and this
-                        // is the only place its probability exists.
+                        // here, and this is the only place its probability
+                        // exists: it leaves with the token (#518).
                         if job.permitted.is_some() {
-                            self.drawn.lock().unwrap().insert(job.request, probability);
+                            first_probability = Some(probability);
                         }
                     }
                     Err(code) => unwind!(RuntimeError::Leaf(code).into()),
@@ -1694,6 +1739,27 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     "a readout job whose chunk carries no tokens runs no forward pass"
                 );
                 unwind!(RuntimeError::Leaf(ignis_core::scheduler::READOUT_WITHOUT_TOKENS).into());
+            }
+            // #518: the prompt's last job emits the sequence's pending token,
+            // drawn by its span or carried by the claim a full-prompt match
+            // stood on. An EOS ends the request unemitted, as in a round's run.
+            if job.next_prompt_token.is_none() {
+                match (self.model.leaf.pending_token(&sequence.handle), first_probability) {
+                    (Some(token), _) if token == self.eos && !job.params.ignore_eos => {
+                        outcomes[index].emitted = Some(DecodeOutcome::finished(FinishReason::Stop));
+                    }
+                    (Some(token), Some(probability)) => {
+                        outcomes[index].emitted = Some(DecodeOutcome::constrained_run(vec![token], vec![probability]));
+                    }
+                    (Some(token), None) => outcomes[index].emitted = Some(DecodeOutcome::token(token)),
+                    // A leaf that reports none emits nothing here: its first
+                    // round returns the token, and the probability is held
+                    // for that round.
+                    (None, Some(probability)) => {
+                        self.drawn.lock().unwrap().insert(job.request, probability);
+                    }
+                    (None, None) => {}
+                }
             }
             if let Some(publish) = job.publish_prefix {
                 to_publish.push((job.request, publish));
@@ -1909,13 +1975,16 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 .filter(|(index, _)| active[*index])
                 .map(|(index, (job, sequence))| DecodeLane {
                     params: job.params,
-                    remaining_tokens: job
-                        .params
-                        .max_tokens
-                        .map_or(job.remaining_tokens, |max| {
-                            job.remaining_tokens.min(max.saturating_sub(sequence.generated))
-                        })
-                        .max(1),
+                    // #518: an anchor the prefill emitted is committed but not
+                    // counted in the request's remaining budget, and not yet
+                    // in `generated`, which counts what rounds committed.
+                    remaining_tokens: {
+                        let remaining = job.remaining_tokens.saturating_add(u32::from(job.anchor_emitted));
+                        job.params
+                            .max_tokens
+                            .map_or(remaining, |max| remaining.min(max.saturating_sub(sequence.generated)))
+                            .max(1)
+                    },
                     stop_ids: if job.params.ignore_eos { &[] } else { &eos },
                     permitted: permitted[index].as_deref().unwrap_or(&[]),
                     // GitHub #315: no stop id, nothing to redirect.
@@ -2004,6 +2073,12 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 job.permitted.is_none() || tokens.len() <= 1,
                 "a lane handed a permitted set commits one token"
             );
+            // #518: the run's anchor left with the prefill; the sequence
+            // committed it all the same.
+            let anchor = u32::from(job.anchor_emitted);
+            if job.anchor_emitted {
+                tokens.remove(0);
+            }
             let eos_at = (!job.params.ignore_eos)
                 .then(|| tokens.iter().position(|&token| token == self.eos))
                 .flatten();
@@ -2015,7 +2090,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     DecodeOutcome::run_then_finished(tokens, FinishReason::Stop)
                 }
                 None => {
-                    sequence.generated = sequence.generated.saturating_add(tokens.len() as u32);
+                    sequence.generated = sequence.generated.saturating_add(tokens.len() as u32 + anchor);
                     sequences.insert(job.request, sequence);
                     DecodeOutcome::run(tokens)
                 }

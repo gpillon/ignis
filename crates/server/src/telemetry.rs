@@ -165,6 +165,16 @@ struct PrefillChunks {
     solo: u32,
 }
 
+/// The prefill phase's summary as the `done` line of a request that was
+/// never dealt a lane carries it (#518): the `admitted` line's fields, since
+/// that request logs no `admitted` line.
+#[derive(Debug, Clone, Copy)]
+struct PrefillSummary {
+    prompt_tokens: u32,
+    chunks: PrefillChunks,
+    prefilled_tokens: u32,
+}
+
 /// What a request's media cost, as the `admitted`, `done` and `cancelled`
 /// lines report it (GitHub #245): what acquiring them cost (GitHub #179) and what encoding
 /// them cost during prefill (GitHub #192), which the two halves of the
@@ -208,8 +218,12 @@ struct RequestTelemetry {
     /// The most recent `prefilled_tokens` cumulative count (P3-06); equals
     /// `prompt_tokens` once prefill completes.
     prefilled_tokens: u32,
-    /// The decode lane this request holds (P3-06; set at `admitted`, valid
-    /// for `ttft`/`done` — a request never reaches those before admission).
+    /// The clock reading when the chunk that completed the prompt arrived
+    /// (#518): what the `ttft` line's `after_prefill_ms` counts from.
+    prefilled_ms: Option<u64>,
+    /// The decode lane this request holds (P3-06; set at `admitted`). A
+    /// first token can leave before it (#518), so `ttft` reads it only once
+    /// `admitted` is set.
     lane: LaneId,
     /// The clock reading at the last generated token (P3-06; the inter-
     /// token-latency anchor for the *next* token).
@@ -320,6 +334,11 @@ pub struct Telemetry {
     /// consumer after the cancel. It was counted once, as cancelled or as
     /// completed, and must not be counted again as completed.
     recently_cancelled: VecDeque<RequestId>,
+    /// The latest requests reported done at their caller's stop sequence
+    /// ([`Telemetry::on_stopped`]), whatever `metrics` is: the engine ends a
+    /// request whose first token completes one too (#518), and that `Done`
+    /// may reach this consumer after the stop. Its line is already written.
+    recently_stopped: VecDeque<RequestId>,
     /// How long a request stays in flight, submit to release (GitHub #327):
     /// what [`Telemetry::lane_free_at_ms`] adds to the oldest request in
     /// flight, since a lane's place in `max_in_flight` frees only when its
@@ -356,6 +375,7 @@ impl Telemetry {
             metrics: None,
             counter_source: None,
             recently_cancelled: VecDeque::new(),
+            recently_stopped: VecDeque::new(),
             lane_held_ms: None,
         }
     }
@@ -501,6 +521,10 @@ impl Telemetry {
         if self.metrics.is_some() {
             self.remember_released(id);
         }
+        if self.recently_stopped.len() == RECENTLY_CANCELLED {
+            self.recently_stopped.pop_front();
+        }
+        self.recently_stopped.push_back(id);
     }
 
     /// Remember `id` for the cancel/`Done` race (`recently_cancelled`).
@@ -516,12 +540,17 @@ impl Telemetry {
     /// `admitted` line reports once the request finishes prefill. Not
     /// itself logged — a request may sit `Prefilling` across many chunks,
     /// and per-chunk log lines would be per-round logging by another name.
+    /// The chunk that completes the prompt also stamps the clock, for the
+    /// `ttft` line's `after_prefill_ms` (#518).
     pub fn on_prefill_chunk(&mut self, id: RequestId, prefilled_tokens: u32, encode_micros: u64, solo: bool) {
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.prefill_chunks = rt.prefill_chunks.saturating_add(1);
             rt.prefill_chunks_solo = rt.prefill_chunks_solo.saturating_add(u32::from(solo));
             rt.prefilled_tokens = prefilled_tokens;
             rt.encode_micros = rt.encode_micros.saturating_add(encode_micros);
+            if prefilled_tokens >= rt.prompt_tokens {
+                rt.prefilled_ms = Some(self.clock.now_ms());
+            }
         }
     }
 
@@ -541,7 +570,8 @@ impl Telemetry {
             if !rt.ttft {
                 rt.ttft = true;
                 rt.last_token_ms = Some(now);
-                Some((rt.submitted_ms, rt.lane, rt.class))
+                let after_prefill_ms = rt.prefilled_ms.map(|at| now.saturating_sub(at));
+                Some((rt.submitted_ms, rt.admitted.then_some(rt.lane), rt.class, after_prefill_ms))
             } else {
                 if let Some(last) = rt.last_token_ms {
                     let gap = now.saturating_sub(last);
@@ -553,12 +583,12 @@ impl Telemetry {
                 None
             }
         };
-        if let Some((submitted_ms, lane, class)) = first {
+        if let Some((submitted_ms, lane, class, after_prefill_ms)) = first {
             let ms = now.saturating_sub(submitted_ms);
             if let Some(metrics) = &self.metrics {
                 metrics.observe_ttft_ms(ms);
             }
-            self.emit_ttft(id, ms, lane, class);
+            self.emit_ttft(id, ms, lane, class, after_prefill_ms);
         }
     }
 
@@ -598,10 +628,24 @@ impl Telemetry {
         }
         let rt = self.requests.remove(&id);
         let known = rt.is_some();
+        // A `Done` behind its own stop: the stop wrote the line (#518).
+        if !known {
+            if let Some(i) = self.recently_stopped.iter().position(|&s| s == id) {
+                self.recently_stopped.remove(i);
+                return;
+            }
+        }
+        // #518: a request that ended on its first token logged no `admitted`
+        // line, so its `done` line says what the prefill phase did.
+        let prefill = rt.as_ref().filter(|rt| !rt.admitted).map(|rt| PrefillSummary {
+            prompt_tokens: rt.prompt_tokens,
+            chunks: PrefillChunks { consumed: rt.prefill_chunks, solo: rt.prefill_chunks_solo },
+            prefilled_tokens: rt.prefilled_tokens,
+        });
         let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class, reuse, budget_dropped, media) = match rt {
             Some(rt) => (
                 rt.submitted_ms,
-                rt.lane,
+                rt.admitted.then_some(rt.lane),
                 rt.itl_count,
                 rt.itl_sum_ms,
                 rt.itl_max_ms,
@@ -612,7 +656,7 @@ impl Telemetry {
             ),
             None => (
                 self.clock.now_ms(),
-                0,
+                None,
                 0,
                 0,
                 0,
@@ -655,6 +699,7 @@ impl Telemetry {
                 redirected_at: reasoning_redirected_at,
             },
             media,
+            prefill,
         );
     }
 
@@ -855,6 +900,7 @@ impl Telemetry {
             rt.prefill_chunks = 0;
             rt.prefill_chunks_solo = 0;
             rt.prefilled_tokens = 0;
+            rt.prefilled_ms = None;
             // GitHub #192: a requeued multimodal request re-prefills from
             // the start, so it encodes its items again —
             // the encode seconds of the discarded attempt are not this
@@ -995,14 +1041,17 @@ impl Telemetry {
         );
     }
 
-    /// Emit the `ttft` line.
-    fn emit_ttft(&self, id: RequestId, ms: u64, lane: LaneId, class: RequestClass) {
+    /// Emit the `ttft` line. `lane` is absent for a first token that left
+    /// before its request was dealt one, and `after_prefill_ms` is the time
+    /// since the chunk that completed the prompt (#518).
+    fn emit_ttft(&self, id: RequestId, ms: u64, lane: Option<LaneId>, class: RequestClass, after_prefill_ms: Option<u64>) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         tracing::info!(
             name: "ignis.request.ttft",
             request_id = id,
             duration_ms = ms,
-            lane = lane as u64,
+            after_prefill_ms,
+            lane = lane.map(|lane| lane as u64),
             tokens = 1,
             tok_s = throughput(1, ms),
             class = class.as_extension_str(),
@@ -1118,7 +1167,7 @@ impl Telemetry {
         ms: u64,
         n: u32,
         tok_s: f64,
-        lane: LaneId,
+        lane: Option<LaneId>,
         reason: FinishReason,
         itl_ms_mean: f64,
         itl_ms_max: u64,
@@ -1128,6 +1177,7 @@ impl Telemetry {
         reuse: Option<RequestReuse>,
         thinking: ThinkingReport,
         summary: Option<MediaSummary>,
+        prefill: Option<PrefillSummary>,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         // A `None` field records nothing, so a request without speculative
@@ -1138,7 +1188,8 @@ impl Telemetry {
             name: "ignis.request.done",
             request_id = id,
             duration_ms = ms,
-            lane = lane as u64,
+            // Absent for a request never dealt a lane (#518), as on `ttft`.
+            lane = lane.map(|lane| lane as u64),
             tokens = n,
             tok_s = tok_s,
             finish_reason = finish_reason_str(reason),
@@ -1194,6 +1245,13 @@ impl Telemetry {
             media.cache_hits = media.map(|m| m.cache_hits),
             media.cache_misses = media.map(|m| m.cache_misses),
             media.encode_seconds = summary.map(|s| s.encode_seconds()),
+            // #518: the `admitted` line's prefill fields, on the `done` line
+            // of a request that never logged one: it ended on its first
+            // token, or it was a decision, and was never dealt a lane.
+            prompt_tokens = prefill.map(|p| p.prompt_tokens),
+            prefill_chunks_consumed = prefill.map(|p| p.chunks.consumed),
+            prefill_chunks_solo = prefill.map(|p| p.chunks.solo),
+            prefilled_tokens = prefill.map(|p| p.prefilled_tokens),
             "request done"
         );
     }
@@ -1923,6 +1981,50 @@ mod tests {
         assert_eq!(admitted["attributes"]["prompt_tokens"], 300);
     }
 
+    /// #518: the `ttft` line says how long the first token came after the
+    /// prompt's last prefill chunk, and names a lane only once one was dealt.
+    #[test]
+    fn ttft_reports_the_time_after_the_last_prefill_chunk() {
+        struct ScriptClock(std::sync::atomic::AtomicUsize, Vec<u64>);
+        impl TelemetryClock for ScriptClock {
+            fn now_ms(&self) -> u64 {
+                self.1[self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst)]
+            }
+        }
+        // Submitted at 0, a first chunk that does not complete the prompt
+        // (no clock read), the last chunk at 40, admitted at 45, the first
+        // token at 57.
+        let clock = ScriptClock(std::sync::atomic::AtomicUsize::new(0), vec![0, 40, 45, 57]);
+        let mut telemetry = Telemetry::new(Arc::new(clock));
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 300, RequestClass::Interactive);
+            telemetry.on_prefill_chunk(1, 150, 0, false);
+            telemetry.on_prefill_chunk(1, 300, 0, false);
+            telemetry.on_admitted(1, 3);
+            telemetry.on_token(1);
+        });
+        let ttft = events.iter().find(|e| e["event_name"] == "ignis.request.ttft").expect("ttft");
+        assert_eq!(ttft["attributes"]["duration_ms"], 57);
+        assert_eq!(ttft["attributes"]["after_prefill_ms"], 17);
+        assert_eq!(ttft["attributes"]["lane"], 3);
+    }
+
+    /// #518: a first token that leaves before its request holds a lane
+    /// reports none on its `ttft` line, rather than a lane it never had.
+    #[test]
+    fn ttft_before_the_lane_deal_names_no_lane() {
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 3, RequestClass::Interactive);
+            telemetry.on_prefill_chunk(1, 3, 0, false);
+            telemetry.on_token(1);
+            telemetry.on_admitted(1, 2);
+        });
+        let ttft = events.iter().find(|e| e["event_name"] == "ignis.request.ttft").expect("ttft");
+        assert!(ttft["attributes"].get("lane").is_none(), "{ttft}");
+        assert_eq!(ttft["attributes"]["after_prefill_ms"], 0);
+    }
+
     #[test]
     fn done_reports_the_per_lane_inter_token_latency_summary() {
         // A clock that advances 10 ms per read, so every generated token is
@@ -1972,7 +2074,7 @@ mod tests {
         // admitted (starts decoding) at 230.
         let clock = ScriptClock(
             std::sync::atomic::AtomicUsize::new(0),
-            vec![0, 5, 10, 20, 25, 220, 230, 220],
+            vec![0, 5, 10, 20, 25, 25, 220, 230, 220],
         );
         let mut telemetry = Telemetry::new(Arc::new(clock));
         let events = capture_events(|| {
@@ -1981,7 +2083,7 @@ mod tests {
             telemetry.on_token(1); // t=10, ttft
             telemetry.on_token(1); // t=20, 1st gap 10ms
             telemetry.note_submit(2, 32_768, RequestClass::Interactive); // t=25 (cold prefiller submitted)
-            telemetry.on_prefill_chunk(2, 32_768, 0, false); // the wide chunk lands
+            telemetry.on_prefill_chunk(2, 32_768, 0, false); // t=25, the wide chunk lands, completing the prompt
             telemetry.on_token(1); // t=220, 2nd gap: 200ms — the stall
             telemetry.on_admitted(2, 1); // t=230, prefiller starts decoding
             telemetry.on_done(1, 3, FinishReason::Stop, None, None, None); // t=220 (clock re-read), lane 0 finishes
@@ -2299,6 +2401,12 @@ mod tests {
         assert_eq!(done[0]["attributes"]["finish_reason"], "stop");
         assert_eq!(done[0]["attributes"]["tokens"], 5);
         assert!(!done.iter().any(|e| e["attributes"]["request_id"] == 2 && e["attributes"]["tokens"] != 2));
+        // #518: a stop the first token completes ends the request in the
+        // engine as well, so its `Done` racing the stop is the common case.
+        for id in [1, 2] {
+            let lines = done.iter().filter(|e| e["attributes"]["request_id"] == id).count();
+            assert_eq!(lines, 1, "request {id}: one done line: {done:?}");
+        }
 
         let text = metrics.render();
         for line in [

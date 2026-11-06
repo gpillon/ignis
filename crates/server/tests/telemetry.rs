@@ -395,7 +395,9 @@ async fn a_chunked_prefill_reports_its_phase_summary_through_the_real_engine() {
     let (log_sink, _guard) = capture_events();
     let engine = engine_with_chunk(4);
     let (_id, mut rx) = engine
-        .submit(input((1..=10).collect(), 1), RequestClass::Interactive)
+        // Two tokens: a request that ends on its first, which leaves with the
+        // prefill (#518), never takes a lane and logs no `admitted` line.
+        .submit(input((1..=10).collect(), 2), RequestClass::Interactive)
         .await
         .expect("submit");
     collect_tokens(&mut rx, Duration::from_secs(5))
@@ -426,7 +428,8 @@ async fn the_admitted_line_counts_the_chunks_run_at_the_solo_width() {
     assert_eq!(engine.prefill_chunk_solo(), Some(8));
     assert_eq!(engine_with_chunk(4).prefill_chunk_solo(), Some(4), "the prefill chunk, with no wider one");
     let (_id, mut rx) = engine
-        .submit(input((1..=10).collect(), 1), RequestClass::Interactive)
+        // Two tokens, so the request takes a lane and logs `admitted` (#518).
+        .submit(input((1..=10).collect(), 2), RequestClass::Interactive)
         .await
         .expect("submit");
     collect_tokens(&mut rx, Duration::from_secs(5))
@@ -440,4 +443,39 @@ async fn the_admitted_line_counts_the_chunks_run_at_the_solo_width() {
         .expect("an admitted event");
     assert_eq!(admitted["attributes"]["prefill_chunks_consumed"], 2, "8 + 2");
     assert_eq!(admitted["attributes"]["prefill_chunks_solo"], 2);
+}
+
+/// #518: a request that ends on its first token, which leaves with the
+/// prefill, is never dealt a lane and logs no `admitted` line; its `done`
+/// line carries the prefill phase's summary instead, and names no lane.
+#[tokio::test]
+async fn a_request_that_ends_on_its_first_token_reports_its_prefill_on_the_done_line() {
+    for (solo, chunks, at_solo) in [(None, 3, 0), (Some(8), 2, 2)] {
+        let (log_sink, _guard) = capture_events();
+        let engine = engine_with_widths(4, solo);
+        let (id, mut rx) = engine
+            .submit(input((1..=10).collect(), 1), RequestClass::Interactive)
+            .await
+            .expect("submit");
+        collect_tokens(&mut rx, Duration::from_secs(5))
+            .await
+            .expect("the request completes");
+        nudge().await;
+
+        let events = events(&log_sink);
+        assert!(
+            events.iter().all(|e| e["event_name"] != "ignis.request.admitted"),
+            "solo {solo:?}: never dealt a lane: {events:?}"
+        );
+        let done = events
+            .iter()
+            .find(|e| e["event_name"] == "ignis.request.done" && e["attributes"]["request_id"] == id)
+            .expect("a done event");
+        assert_eq!(done["attributes"]["tokens"], 1, "solo {solo:?}");
+        assert_eq!(done["attributes"]["prompt_tokens"], 10, "solo {solo:?}");
+        assert_eq!(done["attributes"]["prefill_chunks_consumed"], chunks, "solo {solo:?}");
+        assert_eq!(done["attributes"]["prefill_chunks_solo"], at_solo, "solo {solo:?}");
+        assert_eq!(done["attributes"]["prefilled_tokens"], 10, "solo {solo:?}");
+        assert!(done["attributes"]["lane"].is_null(), "solo {solo:?}: it held no lane: {done}");
+    }
 }

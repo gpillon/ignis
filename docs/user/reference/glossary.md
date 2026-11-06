@@ -58,7 +58,9 @@ rounds run between chunks. See
 [how ignis serves a request](../concepts/how-ignis-serves.md).
 
 **Committed run.** The tokens a verify round emits for one lane: the anchor plus
-the accepted drafts, between 1 and the draft count plus one. See
+the accepted drafts, between 1 and the draft count plus one. The first round
+after a prompt sends only its accepted drafts: its anchor is the first token,
+which left with the prefill. See
 [speculative decoding](../concepts/speculative-decoding.md).
 
 **Continuation.** The request a loop-guard rewind submits: the same input, extended
@@ -193,6 +195,11 @@ companion container. Off on the RTX 5090, on under the `rtxpro6000` profile. See
 **Nudge.** The sentence in the model's own voice that a rewind adds to the
 reasoning before it goes on. See
 [reasoning and the loop guard](../concepts/reasoning.md).
+
+**Pending token.** The token a sequence has drawn and not yet sent: the next
+round's anchor. A prompt's first token is one, and it is sent as soon as the
+prompt's prefill ends, before any decode round. See
+[how ignis serves a request](../concepts/how-ignis-serves.md).
 
 **Pinned hot set.** Flash-Next's calibration-hottest experts, kept in the expert
 cache for the life of the load with no copy in RAM

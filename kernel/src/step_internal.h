@@ -66,4 +66,15 @@ void redirect_penalty_move(const ninfer::ops::SamplingConfig &cfg, std::int32_t 
 int32_t redirect_span_draw(ignis_seq_pool *pool, ignis_seq *seq, const ignis_sampling_params &sampling,
                            cudaStream_t stream, int32_t *out_redirected);
 
+// GitHub #519: the span's next prompt token (`ignis_prefill_options::next_prompt_token`, -1 under
+// NULL options), and why a call naming one is refused: a token outside `vocab`, or something only the
+// prompt's last span reads -- logits, a permitted set, a reasoning redirect, an attention readout --
+// or the per-token route. Empty when the call stands.
+int32_t next_prompt_token(const ignis_prefill_options *options);
+// GitHub #520: whether the span draws -- the prompt's last span, or one whose draw a retained image
+// keeps (`ignis_prefill_options::keeps_draw`).
+bool span_draws(const ignis_prefill_options *options);
+std::string next_prompt_token_refusal(std::int32_t vocab, const ignis_sampling_params &sampling,
+                                      const ignis_prefill_options *options, const float *out_logits);
+
 }  // namespace ignis::step

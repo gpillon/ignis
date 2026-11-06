@@ -3188,6 +3188,8 @@ mod tests {
             _tokens: &[TokenId],
             _start_position: u32,
             _drafter_floor: u32,
+            _next_prompt_token: Option<TokenId>,
+            _keeps_draw: bool,
             _params: DecodeParams,
             _permitted: &[TokenId],
             _redirect: Option<&mut ignis_runtime::DrawRedirect<'_>>,
@@ -3195,6 +3197,9 @@ mod tests {
             _attention: Option<&mut ignis_runtime::AttentionRead>,
         ) -> Result<f32, i32> {
             Ok(0.0)
+        }
+        fn pending_token(&self, _sequence: &Self::Sequence) -> Option<TokenId> {
+            Some(7)
         }
         fn decode(
             &self,

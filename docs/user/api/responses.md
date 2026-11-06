@@ -15,6 +15,10 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   `response.completed`), each with a `sequence_number`. The thinking comes
   back as a `reasoning` item (`response.reasoning_text.*` when streaming),
   the answer as a `message` item, each tool call as a `function_call` item.
+  The first token is sent alone, in the first `response.reasoning_text.delta`
+  or `response.output_text.delta`, as soon as the prompt's prefill ends and
+  before any decode round, and each round's tokens follow it
+  ([how ignis serves a request](../concepts/how-ignis-serves.md)).
 - **Requests** carry `input` (a string, or `message`, `function_call`,
   `function_call_output` and `reasoning` items), `instructions`, function
   `tools`, `tool_choice`, `parallel_tool_calls`, `max_output_tokens`,

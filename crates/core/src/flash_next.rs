@@ -650,6 +650,8 @@ impl FlashNextEngine {
                 &mut seq,
                 &ids,
                 start,
+                None,
+                false,
                 SamplingParams::greedy(),
                 &[],
                 Redirect::NONE,
@@ -678,6 +680,8 @@ impl FlashNextEngine {
             &mut seq,
             &ids,
             0,
+            None,
+            false,
             SamplingParams::greedy(),
             &[],
             Redirect::NONE,
@@ -702,7 +706,7 @@ impl FlashNextEngine {
         let mut rows = vec![0u8; tokens.len() * self.table.token_bytes()];
         self.table.stage(&mut context, tokens, &mut rows)?;
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None)?;
+        prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, None, false, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None)?;
         Ok(seq)
     }
 
@@ -785,7 +789,7 @@ impl FlashNextEngine {
             let mut rows = vec![0u8; prompt.len() * self.table.token_bytes()];
             self.table.stage(&mut context, prompt, &mut rows)?;
             let ids: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None)?;
+            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, None, false, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None)?;
             seqs.push(seq);
             contexts.push(context);
         }
@@ -856,7 +860,7 @@ impl FlashNextEngine {
             let mut rows = vec![0u8; prompt.len() * self.table.token_bytes()];
             self.table.stage(&mut context, prompt, &mut rows)?;
             let ids: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None)?;
+            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, None, false, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None)?;
             seqs.push(seq);
             contexts.push(context);
         }
@@ -991,6 +995,8 @@ impl FlashNextEngine {
             seq,
             &[pending],
             position,
+            None,
+            false,
             SamplingParams::greedy(),
             &[],
             Redirect::NONE,

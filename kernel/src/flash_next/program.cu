@@ -822,6 +822,14 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
   const Geometry &g = fn.g;
   bool span_ok = false;
   if (const std::string why = prefill_options_refusal(options, span_ok); !why.empty()) return refuse(why);
+  if (const std::string why = step::next_prompt_token_refusal(g.vocab, *sampling, options, out_logits); !why.empty()) {
+    return refuse(why);
+  }
+  // GitHub #519: a span with a next prompt token draws nothing -- no head, no sample, no pending
+  // token -- unless a retained image keeps its draw. GitHub #520: the MTP head's entry at its last
+  // position takes that token, so an MTP load needs no draw there either.
+  const int32_t next_prompt_token = step::next_prompt_token(options);
+  const bool draws = step::span_draws(options);
   if (const std::string why = pool_refusal(fn, *pool); !why.empty()) return refuse(why);
   if (!ignis_seq_belongs_to(*pool, *seq)) return refuse("the sequence was not drawn from this pool");
   if (const char *why = ignis_seq_restore_refusal(*seq)) return refuse(why);
@@ -905,7 +913,7 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
           }
         }
       }
-      if (last) {
+      if (last && draws) {
         // The draw's row is computed in the span readout's own block (the 32-row block of the
         // chunk that holds its last row), so a span's row and the draw's are one computation, bit
         // for bit, whatever the linears' routes do with a row count; the head reads the weights
@@ -939,20 +947,25 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
         }
       }
       // Spec flash-next/07: the MTP head's entries for the chunk's positions, entry p from the
-      // trunk's stack at p and token p + 1 -- the span's next id, or at the span's last position
-      // the token just drawn -- so the head's frontier is the sequence's.
+      // trunk's stack at p and token p + 1 -- the span's next id, at the span's last position the
+      // prompt's next token (GitHub #520), or on the prompt's last span the token just drawn -- so
+      // the head's frontier is the sequence's.
       if (fn.mtp != nullptr) {
         auto *next = static_cast<int32_t *>(fn.mtp_tokens->p);
+        const int32_t *following = !last ? token_ids + offset + chunk
+                                   : next_prompt_token >= 0 ? &next_prompt_token
+                                                            : nullptr;
         const bool staged =
             (chunk == 1 || check_cuda(cudaMemcpyAsync(next, token_ids + offset + 1, (chunk - 1) * sizeof(int32_t),
                                                       cudaMemcpyHostToDevice, stream),
                                       "staging the head's tokens", &error)) &&
-            (last ? check_cuda(cudaMemcpyAsync(next + chunk - 1, model->sampling_single_out->p, sizeof(int32_t),
-                                               cudaMemcpyDeviceToDevice, stream),
-                               "staging the drawn token", &error)
-                  : check_cuda(cudaMemcpyAsync(next + chunk - 1, token_ids + offset + chunk, sizeof(int32_t),
-                                               cudaMemcpyHostToDevice, stream),
-                               "staging the next chunk's token", &error));
+            (following == nullptr
+                 ? check_cuda(cudaMemcpyAsync(next + chunk - 1, model->sampling_single_out->p, sizeof(int32_t),
+                                              cudaMemcpyDeviceToDevice, stream),
+                              "staging the drawn token", &error)
+                 : check_cuda(cudaMemcpyAsync(next + chunk - 1, following, sizeof(int32_t),
+                                              cudaMemcpyHostToDevice, stream),
+                              "staging the next token", &error));
         if (!staged) return false;
         Batch batch;
         batch.lanes = 1;
@@ -977,6 +990,7 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
     }
     advance_frontiers(seq, static_cast<uint32_t>(chunk));
     if (last) {
+      // -1 on a span that does not draw (GitHub #519).
       seq->pending_token = successor;
       if (out_logits != nullptr) {
         for (std::size_t v = 0; v < vocab; ++v) out_logits[v] = bf16_to_f32(host_logits[v]);
@@ -987,8 +1001,13 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
   // GitHub #315 (ADR 0048): the span's draw is the token the first round emits; a stop id drawn
   // with the reasoning block open becomes `</think>`. On an MTP load the head's entry at the span's
   // last position was made from the drawn token inside the chunk, before the host could see it: a
-  // redirect leaves that one entry (and nothing the target computes) on the stop id.
-  if (step::redirect_span_draw(pool, seq, *sampling, stream, options->out_reasoning_redirected) != 0) return -1;
+  // redirect leaves that one entry (and nothing the target computes) on the stop id. A span that
+  // drew nothing has nothing to redirect (GitHub #519).
+  if (!draws) {
+    if (options->out_reasoning_redirected != nullptr) *options->out_reasoning_redirected = 0;
+  } else if (step::redirect_span_draw(pool, seq, *sampling, stream, options->out_reasoning_redirected) != 0) {
+    return -1;
+  }
   model->last_step_micros = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - began).count());
   model->last_step_kernel_count = static_cast<uint64_t>(g.layers);

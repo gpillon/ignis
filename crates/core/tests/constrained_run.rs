@@ -55,6 +55,7 @@ fn prefill_job(program: &Schedule) -> PrefillJob {
         attention: None,
         reasoning_close: None,
         drafter_floor: 0,
+        next_prompt_token: None,
     }
 }
 
@@ -66,6 +67,7 @@ fn decode_job(permitted: Option<ignis_core::constrained::PermittedSet>) -> Decod
         remaining_tokens: 8,
         permitted,
         reasoning_close: None,
+        anchor_emitted: false,
     }
 }
 

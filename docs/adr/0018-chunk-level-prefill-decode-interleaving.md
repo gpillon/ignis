@@ -8,7 +8,9 @@ options). Does not amend either.
 
 **Amended by #306** (2026-10-07): the decode share, for Flash-Next's
 seconds-long chunk. **Amended by #489** (2026-11-06): two planned widths, the
-prefill chunk and the solo width, chosen at every chunk boundary. See the
+prefill chunk and the solo width, chosen at every chunk boundary. **Amended
+by #518** (2026-11-06): the prefill phase's events, a prompt's first token
+included, reach the engine before the lane deal and the decode round. See the
 amendments at the end.
 
 Sources: `docs/ROADMAP.md` phase 3, `docs/REVIEW-2026-09-05.md` §6.
@@ -210,3 +212,21 @@ load plans two, and the scheduler picks between them at every chunk boundary.
   load with the solo scratch reserved runs the same kernels on the same cuts
   as one without
   ([finding](../findings/2026-11-06-the-solo-width-planned-at-load.md)).
+
+## Amendment (2026-11-06) — the prefill phase hands its events over mid-tick (#518)
+
+A tick stays one call, but its prefill phase now ends with a hand-off.
+
+- **What the prefill phase emitted leaves before the lane deal and the round.**
+  Its events are final when the phase ends: a prompt's chunks, a decision's
+  answer, and the prompt's first token, which the prefill drew and which no
+  round has to emit. `Scheduler::advance_with` hands them to the engine there,
+  and the engine routes them at once; the rest of the tick follows.
+- **The hand-off answers back.** The engine names the requests it ends on the
+  first token it was just handed: a stop sequence that token completes, which
+  only the server's answer pipeline can see. The scheduler ends each with
+  `stop` before phase 2, so it takes no lane and runs no decode round, as a
+  request that ends on `max_tokens: 1` or an end-of-sequence token.
+- **The first round takes the first token as its anchor** and does not emit it
+  again, so the stream sends every token once, in order, and the first
+  token's wait is the prefill alone, not a lane deal and a round more.

@@ -600,6 +600,8 @@ impl StepLeaf for FlashNextLeaf {
         start_position: u32,
         // GitHub #506: Flash-Next carries no DFlash2 drafter to tap.
         _drafter_floor: u32,
+        next_prompt_token: Option<TokenId>,
+        keeps_draw: bool,
         params: DecodeParams,
         permitted: &[TokenId],
         mut redirect: Option<&mut DrawRedirect<'_>>,
@@ -622,6 +624,11 @@ impl StepLeaf for FlashNextLeaf {
             &mut sequence.seq,
             &ids,
             u64::from(start_position),
+            // GitHub #519, #520: an intermediate span draws nothing unless an
+            // image retains it; an MTP load's entry at its last position takes
+            // the next prompt token.
+            next_prompt_token,
+            keeps_draw,
             sampling_params(params),
             &permitted,
             step_redirect(redirect.as_deref(), &stop_ids),
@@ -636,6 +643,10 @@ impl StepLeaf for FlashNextLeaf {
             redirect.redirected = drawn.redirected;
         }
         Ok(drawn.probability)
+    }
+
+    fn pending_token(&self, sequence: &Self::Sequence) -> Option<TokenId> {
+        sequence.seq.pending_token().map(|token| token as TokenId)
     }
 
     fn decode(
