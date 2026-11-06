@@ -175,7 +175,7 @@ that entry ([Get a model](../guides/models.md)).
 | Vision | on, 4,096 tokens an image, tower and pool in host RAM |
 | Speculation | DFlash2, 7 draft tokens, the drafter's head `auto` (the full head) |
 | Decode lanes | 2 |
-| Prefill chunk | 1,024 (the default) |
+| Prefill chunk | 1,024 (the default); on an RTX 40 card 4,096 while no lane decodes, where the plan holds it ([the solo width](../configuration/context-and-speculation.md#the-solo-width)) |
 | VRAM headroom | 1,200 MiB |
 
 Why each:
@@ -190,7 +190,10 @@ Why each:
   [host RAM for the 27B](../configuration/host-ram.md#host-ram-for-the-27b).
 - **Two lanes.** Eight would leave no room for the context.
 - **The 1,024-token chunk.** The prefill scratch is sized by the chunk, and
-  2,048 would cost about 0.4 GB of KV pool.
+  2,048 would cost about 0.4 GB of KV pool. On an RTX 40 card `auto`'s
+  solo width still widens it while no lane decodes, where the plan holds that
+  with nothing adapted: in a 16 GiB budget less 1 GiB, 4,096, which takes the
+  KV pool from 386,048 tokens to 302,912, 40,768 past the context.
 - **The headroom** is the 5090's 27B value until a real card says otherwise
   ([measure yours](../guides/measure-a-16gb-card.md)).
 - **On a 16 GB RTX 40 card** the 27B prefills on the routes those cards run
