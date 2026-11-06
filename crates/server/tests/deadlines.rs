@@ -321,9 +321,11 @@ async fn a_completion_with_a_stop_sequence_its_engine_dropped_is_an_engine_error
 /// would allow still ends on its own, at its cap, with no header.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_zero_request_timeout_is_no_deadline() {
-    let rig = rig(&["Hello"], 0, |server| server.with_request_timeout(Duration::ZERO));
+    let rig = rig(&["Hello", " world"], 0, |server| server.with_request_timeout(Duration::ZERO));
     let mut body = chat(false);
-    body["max_tokens"] = json!(1);
+    // Two tokens: the first leaves with the prefill (#518), the gate holds
+    // the round the second needs.
+    body["max_tokens"] = json!(2);
     let reply = tokio::spawn(post(&rig.app, "/v1/chat/completions", body).then(read));
     rig.gate.wait_entered();
     // Time passing is the point here, not a synchronization.
@@ -332,8 +334,8 @@ async fn a_zero_request_timeout_is_no_deadline() {
     let (status, stopped_by, body) = reply.await.unwrap();
     assert_eq!((status, stopped_by), (200, None), "{body}");
     let v: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["choices"][0]["message"]["content"], "Hello", "{body}");
-    assert_eq!(v["usage"]["completion_tokens"], 1, "{body}");
+    assert_eq!(v["choices"][0]["message"]["content"], "Hello world", "{body}");
+    assert_eq!(v["usage"]["completion_tokens"], 2, "{body}");
 }
 
 // ── chat completions, streamed: `server.stream_timeout` ─────────────────
@@ -444,9 +446,9 @@ async fn a_stream_its_deadline_cut_with_its_own_end_queued_ends_once() {
 /// held past the non-streaming deadline ends on its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_zero_stream_timeout_is_no_deadline() {
-    let rig = rig(&["Hello"], 0, |server| server.with_request_timeout(Duration::from_millis(20)).with_stream_timeout(Duration::ZERO));
+    let rig = rig(&["Hello", " world"], 0, |server| server.with_request_timeout(Duration::from_millis(20)).with_stream_timeout(Duration::ZERO));
     let mut body = chat(true);
-    body["max_tokens"] = json!(1);
+    body["max_tokens"] = json!(2);
     let response = post(&rig.app, "/v1/chat/completions", body).await;
     let reply = tokio::spawn(read(response));
     rig.gate.wait_entered();
@@ -455,7 +457,7 @@ async fn a_zero_stream_timeout_is_no_deadline() {
     rig.gate.release();
     let (_, _, body) = reply.await.unwrap();
     let chunks = chunks(&body);
-    assert_eq!(streamed_text(&chunks, "content"), "Hello", "{body}");
+    assert_eq!(streamed_text(&chunks, "content"), "Hello world", "{body}");
     assert!(chunks.iter().any(|c| c["choices"][0]["finish_reason"] == "length"), "its cap: {body}");
     assert!(!body.contains("\"error\""), "{body}");
 }
@@ -564,9 +566,11 @@ async fn check_a_zero_deadline_leaves_a_response_to_its_end(stream: bool) {
         true => (Duration::from_millis(20), Duration::ZERO),
         false => (Duration::ZERO, Duration::from_millis(20)),
     };
-    let rig = rig(&["Hello"], 0, |server| server.with_request_timeout(request).with_stream_timeout(streamed));
+    let rig = rig(&["Hello", " world"], 0, |server| server.with_request_timeout(request).with_stream_timeout(streamed));
     let mut body = response_request(stream);
-    body["max_output_tokens"] = json!(1);
+    // Two tokens: the first leaves with the prefill (#518), the gate holds
+    // the round the second needs.
+    body["max_output_tokens"] = json!(2);
     let reply = tokio::spawn(post(&rig.app, "/v1/responses", body).then(read));
     rig.gate.wait_entered();
     // Time passing is the point here, not a synchronization.
@@ -583,8 +587,8 @@ async fn check_a_zero_deadline_leaves_a_response_to_its_end(stream: bool) {
         false => serde_json::from_str(&body).unwrap(),
     };
     assert_eq!(response["incomplete_details"]["reason"], "max_output_tokens", "its cap: {body}");
-    assert_eq!(output_text(&response), "Hello", "{body}");
-    assert_eq!(response["usage"]["output_tokens"], 1, "{body}");
+    assert_eq!(output_text(&response), "Hello world", "{body}");
+    assert_eq!(response["usage"]["output_tokens"], 2, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -649,10 +653,10 @@ async fn a_socket_response_its_deadline_cut_ends_failed_under_the_error_reply() 
 /// is none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_zero_stream_timeout_leaves_a_socket_response_to_its_end() {
-    let rig = rig(&["Hello"], 0, |server| server.with_request_timeout(Duration::from_millis(20)).with_stream_timeout(Duration::ZERO));
+    let rig = rig(&["Hello", " world"], 0, |server| server.with_request_timeout(Duration::from_millis(20)).with_stream_timeout(Duration::ZERO));
     let live = responses::live(rig.server.clone()).await;
     let mut socket = responses::socket(&live).await;
-    responses::send(&mut socket, create(1)).await;
+    responses::send(&mut socket, create(2)).await;
     rig.gate.wait_entered();
     // Time passing is the point here, not a synchronization.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -660,5 +664,5 @@ async fn a_zero_stream_timeout_leaves_a_socket_response_to_its_end() {
     let events = responses::events_until(&mut socket, responses::terminal).await;
     let terminal = events.last().unwrap();
     assert_eq!(terminal["type"], "response.incomplete", "its cap: {terminal}");
-    assert_eq!(output_text(&terminal["response"]), "Hello", "{terminal}");
+    assert_eq!(output_text(&terminal["response"]), "Hello world", "{terminal}");
 }

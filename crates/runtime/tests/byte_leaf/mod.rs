@@ -147,6 +147,11 @@ impl StepLeaf for ByteLeaf {
         sequence.bytes = (0..BLOB_BYTES).map(|i| (seed as usize + i * 7 + i / 977) as u8).collect();
         Ok(0.0)
     }
+    /// None: the stub draws nothing ahead, its round emits a hash of the
+    /// bytes it flips, so its prefill emits no token (#518).
+    fn pending_token(&self, _sequence: &ByteSeq) -> Option<u32> {
+        None
+    }
     fn decode(&self, _model: &(), sequences: &mut [&mut ByteSeq], _lanes: &[DecodeLane<'_>]) -> Result<Vec<LaneRun>, i32> {
         Ok(sequences
             .iter_mut()
@@ -248,6 +253,7 @@ pub fn decode(compute: &RuntimeCompute<ByteLeaf>, request: RequestId, rounds: u3
         remaining_tokens: 1,
         permitted: None,
         reasoning_close: None,
+        anchor_emitted: false,
     };
     (0..rounds)
         .flat_map(|_| compute.decode_step(std::slice::from_ref(&job)).unwrap().remove(0).tokens)

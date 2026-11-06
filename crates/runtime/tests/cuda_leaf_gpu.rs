@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use ignis_artifact::{bind_text_scope_27b, materialize, CudaDevice, FrontendSet, Reader};
 use ignis_core::gpu_profile;
-use ignis_core::{Compute, DecodeJob, DecodeOutcome, DecodeParams, PrefillJob, RequestId};
+use ignis_core::{Compute, DecodeJob, DecodeOutcome, DecodeParams, PrefillJob, RequestId, TokenId};
 use ignis_runtime::{CudaLeaf, CudaLeafConfig, Model, RuntimeCompute};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -66,57 +66,72 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
         Model::load(Arc::new(leaf)).unwrap_or_else(|e| panic!("model load: {e:?}")),
     );
     let compute = RuntimeCompute::new(model, eos);
+    let params = DecodeParams {
+        max_tokens: Some(MAX_GENERATED as u32),
+        ..DecodeParams::default()
+    };
 
-    let request: RequestId = 1;
-    compute
-        .prefill_step(&[PrefillJob {
-            checkpoint: None,
-            capture_checkpoint: None,
-            multimodal: None,
-            readout: None,
-            request,
-            tokens: prompt,
-            context_tokens: 256,
-            start_position: 0,
-            params: DecodeParams {
-                max_tokens: Some(MAX_GENERATED as u32),
-                ..DecodeParams::default()
-            },
-            shared_prefix: None,
-            publish_prefix: None,
-            permitted: None,
-            attention: None,
-            reasoning_close: None,
-            drafter_floor: 0,
-            next_prompt_token: None,
-}])
-        .unwrap_or_else(|e| panic!("prefill_step: {e}"));
-
-    let mut generated = Vec::new();
-    for _ in 0..MAX_GENERATED {
-        let out = compute
-            .decode_step(&[DecodeJob {
+    // #518: the request served the way the scheduler serves it -- its first
+    // token out of the prompt's last job, the first round committing it as
+    // its anchor without emitting it -- and the same prompt with every round
+    // returning its anchor, as before: the same text either way.
+    let serve = |request: RequestId, first_with_the_prefill: bool| -> Vec<TokenId> {
+        let outcomes = compute
+            .prefill_step(&[PrefillJob {
+                checkpoint: None,
+                capture_checkpoint: None,
+                multimodal: None,
+                readout: None,
                 request,
-                lane: 0,
-                params: DecodeParams {
-                    max_tokens: Some(MAX_GENERATED as u32),
-                    ..DecodeParams::default()
-                },
-                remaining_tokens: (MAX_GENERATED - generated.len()) as u32,
+                tokens: prompt.clone(),
+                context_tokens: 256,
+                start_position: 0,
+                params,
+                shared_prefix: None,
+                publish_prefix: None,
                 permitted: None,
+                attention: None,
                 reasoning_close: None,
-}])
-            .unwrap_or_else(|e| panic!("decode_step: {e}"));
-        let Some(DecodeOutcome { tokens, finish, .. }) = out.into_iter().next() else {
-            break;
-        };
-        generated.extend(tokens);
-        // A finish: the request hit EOS or its `max_tokens` cap and the
-        // adapter already released its leaf sequence.
-        if finish.is_some() {
-            break;
+                drafter_floor: 0,
+                next_prompt_token: None,
+            }])
+            .unwrap_or_else(|e| panic!("prefill_step: {e}"));
+        let mut generated = Vec::new();
+        if first_with_the_prefill {
+            let first = outcomes[0].emitted.clone().unwrap_or_else(|| panic!("the prompt's last job emits nothing"));
+            assert_eq!((first.tokens.len(), first.finish), (1, None), "one token, the request goes on: {first:?}");
+            generated.extend(first.tokens);
         }
-    }
+        for round in 0..MAX_GENERATED {
+            let out = compute
+                .decode_step(&[DecodeJob {
+                    request,
+                    lane: 0,
+                    params,
+                    remaining_tokens: (MAX_GENERATED - generated.len()) as u32,
+                    permitted: None,
+                    reasoning_close: None,
+                    anchor_emitted: first_with_the_prefill && round == 0,
+                }])
+                .unwrap_or_else(|e| panic!("decode_step: {e}"));
+            let Some(DecodeOutcome { tokens, finish, .. }) = out.into_iter().next() else {
+                break;
+            };
+            if first_with_the_prefill && round == 0 {
+                assert!(tokens.is_empty(), "a plain round spends the anchor the prefill emitted: {tokens:?}");
+            }
+            generated.extend(tokens);
+            // A finish: the request hit EOS or its `max_tokens` cap and the
+            // adapter already released its leaf sequence.
+            if finish.is_some() {
+                break;
+            }
+        }
+        compute.release(request);
+        generated
+    };
+
+    let generated = serve(1, true);
     assert!(
         !generated.is_empty(),
         "the real model must generate at least one token for a real prompt"
@@ -125,5 +140,5 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
         generated.len() <= MAX_GENERATED,
         "decode must stop at max_tokens even without an EOS hit"
     );
-    compute.release(request);
+    assert_eq!(generated, serve(2, false), "no token twice, none missing");
 }

@@ -513,6 +513,7 @@ fn decode_alone(compute: &RuntimeCompute<CudaLeaf>, request: RequestId, count: u
                 remaining_tokens: count - tokens.len() as u32,
                 permitted: None,
                 reasoning_close: None,
+                anchor_emitted: false,
 }])
             .unwrap_or_else(|e| panic!("decode {request}: {e:?}"))
             .remove(0);

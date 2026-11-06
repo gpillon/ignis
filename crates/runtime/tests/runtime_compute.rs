@@ -93,6 +93,11 @@ struct Calls {
     /// GitHub #260: the attention readout each multimodal span was handed,
     /// `None` for a span that asked for none.
     attention_asked: Vec<Option<AttentionQuery>>,
+    /// #518: the stub reports its pending token while set -- the token its
+    /// next round commits first, which is one sequence's anchor -- and none
+    /// while unset, so its prefill emits nothing and its first round the
+    /// token, as before the pending token left with the prefill.
+    pending_reported: bool,
     /// GitHub #260: the leaf cannot read the keys while set — it leaves the
     /// readout unread, as a real leaf does on a route that materialized none.
     attention_unreadable: bool,
@@ -570,6 +575,15 @@ impl StepLeaf for StubLeaf {
         })
     }
 
+    fn pending_token(&self, _sequence: &Self::Sequence) -> Option<u32> {
+        if !self.calls.lock().unwrap().pending_reported {
+            return None;
+        }
+        let runs = self.runs.lock().unwrap();
+        let tokens = self.tokens.lock().unwrap();
+        Some(runs.front().map(|run| run.tokens[0]).or(tokens.front().copied()).unwrap_or(7))
+    }
+
     fn decode(
         &self,
         _model: &Self::Model,
@@ -731,6 +745,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 remaining_tokens: 3,
                 permitted: None,
                 reasoning_close: None,
+                anchor_emitted: false,
             },
             DecodeJob {
                 request: 2,
@@ -739,6 +754,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 remaining_tokens: 4,
                 permitted: None,
                 reasoning_close: None,
+                anchor_emitted: false,
             },
         ])
         .unwrap();
@@ -790,6 +806,7 @@ fn the_adapter_holds_a_constrained_draw_for_the_round_that_emits_it() {
                 remaining_tokens: 8,
                 permitted,
                 reasoning_close: None,
+                anchor_emitted: false,
             }])
             .unwrap()
             .remove(0)
@@ -926,6 +943,7 @@ fn adapter_rejects_decode_batches_larger_than_the_resident_lane_bound() {
             remaining_tokens: 8,
             permitted: None,
             reasoning_close: None,
+            anchor_emitted: false,
         })
         .collect();
 
@@ -1049,6 +1067,7 @@ fn adapter_maps_allocation_and_decode_errors_without_losing_live_state() {
             remaining_tokens: 8,
             permitted: None,
             reasoning_close: None,
+            anchor_emitted: false,
 }]),
         Err(ComputeError::Kernel(-19))
     );
@@ -1086,6 +1105,7 @@ fn adapter_enforces_max_tokens_and_eos() {
         remaining_tokens: 1,
         permitted: None,
         reasoning_close: None,
+        anchor_emitted: false,
 };
     assert_eq!(
         compute.decode_step(&[job.clone()]).unwrap(),
@@ -1111,6 +1131,7 @@ fn adapter_enforces_max_tokens_and_eos() {
                 remaining_tokens: 8,
                 permitted: None,
                 reasoning_close: None,
+                anchor_emitted: false,
 }])
             .unwrap(),
         vec![DecodeOutcome::finished(FinishReason::Stop)]
@@ -1135,6 +1156,7 @@ fn adapter_can_keep_a_measurement_lane_alive_past_eos() {
         remaining_tokens: 8,
         permitted: None,
         reasoning_close: None,
+        anchor_emitted: false,
 };
 
     assert_eq!(
@@ -1164,6 +1186,7 @@ fn adapter_decodes_multiple_requests_in_one_ordered_leaf_round() {
                     remaining_tokens: 8,
                     permitted: None,
                     reasoning_close: None,
+                    anchor_emitted: false,
                 },
                 DecodeJob {
                     request: 2,
@@ -1172,6 +1195,7 @@ fn adapter_decodes_multiple_requests_in_one_ordered_leaf_round() {
                     remaining_tokens: 8,
                     permitted: None,
                     reasoning_close: None,
+                    anchor_emitted: false,
                 },
             ])
             .unwrap(),
@@ -1805,6 +1829,7 @@ fn job(request: u64, params: DecodeParams, remaining_tokens: u32) -> DecodeJob {
         remaining_tokens,
         permitted: None,
         reasoning_close: None,
+        anchor_emitted: false,
     }
 }
 
@@ -2785,4 +2810,141 @@ fn a_head_set_read_in_rows_comes_back_whole() {
     assert_eq!(attention.set_neighbours, None);
     let asked = leaf.calls.lock().unwrap().attention_asked[0].clone().expect("asked");
     assert_eq!(asked.set.map(|set| set.read), Some(SetRead::Rows));
+}
+
+/// #518: a stub that reports its pending token, behind an adapter whose EOS
+/// is 99.
+fn reporting(leaf: StubLeaf) -> (Arc<StubLeaf>, RuntimeCompute<StubLeaf>) {
+    leaf.calls.lock().unwrap().pending_reported = true;
+    let leaf = Arc::new(leaf);
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    (leaf.clone(), RuntimeCompute::new(model, 99))
+}
+
+fn round_after(anchor_emitted: bool, remaining_tokens: u32, permitted: Option<ignis_core::constrained::PermittedSet>) -> DecodeJob {
+    DecodeJob {
+        request: 1,
+        lane: 0,
+        params: DecodeParams::default(),
+        remaining_tokens,
+        permitted,
+        reasoning_close: None,
+        anchor_emitted,
+    }
+}
+
+/// #518: the prompt's last job emits the sequence's pending token, and the
+/// round that takes it as its anchor commits it without emitting it again,
+/// its budget not counting it.
+#[test]
+fn the_last_job_emits_the_pending_token_and_its_round_does_not_emit_it_again() {
+    let (leaf, compute) = reporting(StubLeaf::with_tokens([11, 12]));
+
+    let outcomes = compute.prefill_step(&[prefill(1, None)]).unwrap();
+    assert_eq!(outcomes[0].emitted, Some(DecodeOutcome::token(11)));
+
+    let first = compute.decode_step(&[round_after(true, 1, None)]).unwrap().remove(0);
+    assert_eq!(first, DecodeOutcome::run(Vec::new()), "a plain round spends its anchor and emits nothing");
+    assert_eq!(leaf.calls.lock().unwrap().decode_lanes[0][0].0, 2, "the anchor plus the one token left");
+    let second = compute.decode_step(&[round_after(false, 1, None)]).unwrap().remove(0);
+    assert_eq!(second.tokens, vec![12]);
+}
+
+/// #518: a verify round after the prefill emits only the drafts it accepted
+/// past its anchor, with the round's counters as they were.
+#[test]
+fn a_verify_round_after_the_prefill_emits_its_accepted_drafts() {
+    let run = LaneRun {
+        tokens: vec![11, 12, 13],
+        spec: Some(SpecCounters::round(3, 2)),
+        drawn_probability: None,
+        redirected: false,
+    };
+    let (_leaf, compute) = reporting(StubLeaf::with_runs([run]));
+
+    let outcomes = compute.prefill_step(&[prefill(1, None)]).unwrap();
+    assert_eq!(outcomes[0].emitted, Some(DecodeOutcome::token(11)));
+    let round = compute.decode_step(&[round_after(true, 8, None)]).unwrap().remove(0);
+    assert_eq!(round.tokens, vec![12, 13]);
+    assert_eq!(round.spec, Some(SpecCounters::round(3, 2)));
+}
+
+/// #518: only the job that ends at the prompt's last position emits.
+#[test]
+fn a_job_short_of_the_prompts_end_emits_nothing() {
+    let (_leaf, compute) = reporting(StubLeaf::with_tokens([11]));
+    let job = PrefillJob {
+        next_prompt_token: Some(6),
+        ..prefill(1, None)
+    };
+    assert_eq!(compute.prefill_step(&[job]).unwrap()[0].emitted, None);
+}
+
+/// #518: a pending token that is the EOS ends the request unemitted, as an
+/// EOS in a round's run does; under `ignore_eos` it is a token like any other.
+#[test]
+fn an_eos_pending_token_finishes_the_request_unless_eos_is_ignored() {
+    let (_leaf, compute) = reporting(StubLeaf::with_tokens([99]));
+    let outcomes = compute.prefill_step(&[prefill(1, None)]).unwrap();
+    assert_eq!(outcomes[0].emitted, Some(DecodeOutcome::finished(FinishReason::Stop)));
+
+    let (_leaf, compute) = reporting(StubLeaf::with_tokens([99]));
+    let job = PrefillJob {
+        params: DecodeParams {
+            ignore_eos: true,
+            ..DecodeParams::default()
+        },
+        ..prefill(1, None)
+    };
+    assert_eq!(compute.prefill_step(&[job]).unwrap()[0].emitted, Some(DecodeOutcome::token(99)));
+}
+
+/// #518: a constrained decode's first token leaves with its probability
+/// within the first step's set, and the round that takes it as its anchor
+/// emits neither; the round after returns that round's draw with its own.
+#[test]
+fn a_constrained_first_token_leaves_with_its_probability() {
+    let (_leaf, compute) = reporting(StubLeaf::with_tokens([3, 4]));
+    let digits: ignis_core::constrained::PermittedSet = vec![3, 4, 5].into();
+
+    let outcomes = compute
+        .prefill_step(&[PrefillJob {
+            permitted: Some(digits.clone()),
+            ..prefill(1, Some(8))
+        }])
+        .unwrap();
+    assert_eq!(
+        outcomes[0].emitted,
+        Some(DecodeOutcome::constrained_run(vec![3], vec![STUB_PERMITTED_PROBABILITY]))
+    );
+
+    let anchor = compute.decode_step(&[round_after(true, 7, Some(digits))]).unwrap().remove(0);
+    assert!(anchor.tokens.is_empty() && anchor.probabilities.is_empty(), "{anchor:?}");
+    let next = compute.decode_step(&[round_after(false, 7, None)]).unwrap().remove(0);
+    assert_eq!(next.tokens, vec![4]);
+    assert_eq!(next.probabilities, vec![STUB_PERMITTED_PROBABILITY], "the draw the anchor round made");
+}
+
+/// #518: `max_tokens` clamps the round after the prefill counting the anchor
+/// its sequence commits, and the rounds after count it as emitted.
+#[test]
+fn max_tokens_counts_the_anchor_the_prefill_emitted_once() {
+    let (leaf, compute) = reporting(StubLeaf::with_tokens([11, 12, 13, 14]));
+    compute.prefill_step(&[prefill(1, Some(3))]).unwrap();
+
+    let capped = |anchor_emitted| DecodeJob {
+        params: DecodeParams {
+            max_tokens: Some(3),
+            ..DecodeParams::default()
+        },
+        ..round_after(anchor_emitted, 8, None)
+    };
+    compute.decode_step(&[capped(true)]).unwrap();
+    compute.decode_step(&[capped(false)]).unwrap();
+    compute.decode_step(&[capped(false)]).unwrap();
+    let after = compute.decode_step(&[capped(false)]).unwrap().remove(0);
+
+    let budgets: Vec<u32> = leaf.calls.lock().unwrap().decode_lanes.iter().map(|round| round[0].0).collect();
+    assert_eq!(budgets, vec![3, 2, 1], "the anchor counted once, by the round that committed it");
+    assert_eq!(after, DecodeOutcome::finished(FinishReason::Length), "three tokens, then the cap");
 }

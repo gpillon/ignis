@@ -136,13 +136,23 @@ enum Phase {
 pub struct ForcedState {
     phase: Phase,
     /// Whether the last round's draw was a single forced token, so that the
-    /// token this round emits was seen when it was chosen.
+    /// token this round emits was seen when it was chosen -- or the round's
+    /// anchor was already committed when its draw is chosen
+    /// ([`ForcedState::anchor_seen`]).
     last_draw_forced: bool,
 }
 
 impl ForcedState {
-    /// The permitted set for the draw this round makes, for a request that
-    /// has emitted `emitted` tokens — or `None` to draw freely.
+    /// The round's anchor is a token already committed (#518): the prompt's
+    /// pending token left with its prefill, so the round that takes it as
+    /// its anchor chooses its draw having seen it, as after a forced draw.
+    pub fn anchor_seen(&mut self) {
+        self.last_draw_forced = true;
+    }
+
+    /// The permitted set for the draw this round makes, for a request whose
+    /// round anchor is output index `emitted` (the tokens emitted before it)
+    /// — or `None` to draw freely.
     ///
     /// `budget` is the set the thinking budget forces this round, and wins:
     /// the budget only forces inside the reasoning block, and nothing of the
