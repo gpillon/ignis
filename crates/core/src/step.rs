@@ -77,94 +77,10 @@ pub(crate) mod ffi {
     /// mirrors so its layout pin runs in the CPU suite.
     pub use crate::step_abi::IgnisDecodeOptions;
 
-    /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
-    /// #84). `size` must be `sizeof(struct ignis_prefill_options)`; the
-    /// leaf rejects a size it does not recognize.
-    #[repr(C)]
-    #[derive(Debug, Clone, Copy)]
-    pub struct IgnisPrefillOptions {
-        pub size: u32,
-        pub route: i32,
-        pub compute_policy: i32,
-        /// GitHub #178: the span's axis-major `[3, T]` positions, or null
-        /// for a text span (whose media fields are then empty).
-        pub mrope_positions: *const i32,
-        pub rope_delta: i32,
-        pub media_column_count: u32,
-        pub media: *const IgnisMediaEmbedding,
-        pub media_scatter_indices: *const i32,
-        pub media_first_column: u32,
-        /// P6-06 (GitHub #242): the span's own draw's probability within its
-        /// permitted set, or null. A constrained run's **first** token is
-        /// drawn here — a decode round returns the successor the previous
-        /// call made ready — so this is where its confidence comes back.
-        pub out_permitted_prob: *mut f32,
-        /// GitHub #260 (ADR 0038): the attention readout — none when the
-        /// ordinal is negative. One query head of one GQA layer at the
-        /// span's last position, over the keys of
-        /// `[attention_key_begin, + attention_key_count)` as that layer's
-        /// attention read them; one pre-softmax score per key into
-        /// `out_attention_scores`, and `*out_attention_read` 1 when the leaf
-        /// could read them, 0 when it could not.
-        pub attention_gqa_ordinal: i32,
-        pub attention_query_head: i32,
-        pub attention_key_begin: i64,
-        pub attention_key_count: i64,
-        pub out_attention_scores: *mut f32,
-        pub out_attention_read: *mut i32,
-        /// GitHub #263 (ADR 0039): the head set read beside the attention
-        /// readout, or none when `attention_set_count` is 0. Head `i` is
-        /// query head `attention_set_query_heads[i]` of GQA layer
-        /// `attention_set_gqa_ordinals[i]`; its argmax over the span minus
-        /// the `attention_excluded` span-relative keys lands in
-        /// `out_attention_set_argmax[i]`. Every armed layer must read, or
-        /// `*out_attention_read` is 0.
-        pub attention_set_count: u32,
-        pub attention_set_gqa_ordinals: *const i32,
-        pub attention_set_query_heads: *const i32,
-        pub attention_excluded_count: u32,
-        pub attention_excluded: *const i32,
-        pub out_attention_set_argmax: *mut i32,
-        /// GitHub #264 (ADR 0040): with the set, head `i`'s own score at its
-        /// argmax, and the four scores around it — the argmax's left, right,
-        /// up and down neighbours in an image grid of `attention_grid_cols`
-        /// columns, `NaN` for one off the grid.
-        pub attention_grid_cols: u32,
-        pub out_attention_set_peak: *mut f32,
-        pub out_attention_set_neighbours: *mut f32,
-        /// The measurement readout: every position's BF16 logits, host,
-        /// `[num_tokens][vocab]` ([`super::prefill_program_span_logits`]).
-        pub out_span_logits: *mut u16,
-        /// GitHub #275 (ADR 0041): with the set, every head's whole row,
-        /// host, `[attention_set_count][attention_key_count]`, or null. With
-        /// rows the grid's columns may be 0 and the neighbours null.
-        pub out_attention_set_rows: *mut f32,
-        /// GitHub #302: the span's n-gram table rows on a Flash-Next load,
-        /// host `[num_tokens][16][90]`; null on the 27B.
-        pub ngram_rows: *const u8,
-        /// GitHub #315 (ADR 0048): 1 when the span's draw was redirected to
-        /// its `reasoning_close_id`, else 0; null asks for nothing.
-        pub out_reasoning_redirected: *mut i32,
-        /// GitHub #506: the first absolute position whose feature taps a
-        /// later drafter window reads. The span taps from the later of its
-        /// last 2048 positions and this; 0 is that span rule alone.
-        pub drafter_floor: u64,
-        /// GitHub #519: the prompt token after the span, or -1 on the
-        /// prompt's last span. With a token the leaf runs no output head and
-        /// draws nothing, unless `keeps_draw`; Flash-Next's MTP head builds
-        /// its entry at the span's last position from it (GitHub #520).
-        pub next_prompt_token: i32,
-        /// GitHub #520: nonzero when a prefix image or a prompt checkpoint
-        /// retains the state after the span, which then draws with a next
-        /// prompt token too, as the image carries the draw.
-        pub keeps_draw: i32,
-    }
-
-    /// Opaque `struct ignis_media_embedding` (GitHub #178).
-    #[repr(C)]
-    pub struct IgnisMediaEmbedding {
-        _private: [u8; 0],
-    }
+    /// 1:1 with `struct ignis_prefill_options` and the opaque
+    /// `struct ignis_media_embedding` it points at, kept beside the
+    /// kernel-free mirrors so the options' layout pin runs in the CPU suite.
+    pub use crate::step_abi::{IgnisMediaEmbedding, IgnisPrefillOptions};
 
     /// 1:1 with `struct ignis_media_encode_input` (GitHub #178).
     #[repr(C)]
