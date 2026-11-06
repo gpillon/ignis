@@ -70,13 +70,15 @@ constexpr std::int32_t kNarrowRowsBelow = 4096;
 // GitHub #521: on compute capability 8.x, a prefill chunk's DFlash2 feature
 // taps take the route from this width -- both their problems, [5120, 25600]
 // and [6144, 5120], have 4,096+ rows -- so a prompt-reuse tail, 0 to 63
-// tokens, need not take the GEMVs. Measured 2026-11-06 on an sm_86 card with
-// `ignis_nvfp4_a16_mma_bench --taps --iters 50`, twice: 26 is the first width
-// from which the route stays ahead of the GEMVs on both problems, every width
-// up to 64 included. Every other call on
-// 8.x, the decode round's included, keeps kMinTokens: the route's BF16 MMAs
-// accumulate in FP32, which GeForce runs at half rate, so their crossover
-// has to come from a GeForce RTX 30 or RTX 40 card's measurement.
+// tokens, need not take the GEMVs. 26 was measured 2026-11-06 on an sm_86
+// card, for the prefill taps alone, with `ignis_nvfp4_a16_mma_bench --taps
+// --iters 50`, twice: the first width from which the route stays ahead of the
+// GEMVs on both problems, every width up to 64 included. #516's session
+// checks it on a GeForce RTX 30 card, as it checks the decode widths. Every
+// other call on 8.x, the decode round's included, keeps kMinTokens: the
+// route's BF16 MMAs accumulate in FP32, which GeForce runs at half rate, so
+// their crossover has to come from a GeForce RTX 30 or RTX 40 card's
+// measurement.
 constexpr std::int32_t kPrefillTapsMinTokens8x = 26;
 static_assert(kPrefillTapsMinTokens8x >= 1 && kPrefillTapsMinTokens8x < kMinTokens,
               "a reuse tail's width");

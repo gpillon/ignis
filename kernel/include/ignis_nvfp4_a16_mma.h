@@ -69,9 +69,10 @@ bool ignis_nvfp4_a16_mma_applies(std::int32_t output_rows, std::int32_t input_ro
  * `ops::linear`'s to validate, and this entry point assumes them. It is
  * public so the leaf's CTest can hold `ops::linear` to it bit for bit and the
  * bench can time it at any width; the engine reaches it only through
- * `ops::linear` and `ignis_linear_a16`. Throws for a problem the NVFP4
- * registry does not know, or for no column; a call narrower than the route's
- * widths is computed all the same. */
+ * `ops::linear` and `ignis_linear_a16`. It refuses only a problem the NVFP4
+ * registry does not know, or T < 1 (no column), and throws for those; since
+ * GitHub #521 a call narrower than the route's widths is computed all the
+ * same. */
 void ignis_nvfp4_a16_mma(const ninfer::Tensor &x, const ninfer::Weight &w, ninfer::Tensor &out,
                          cudaStream_t stream);
 
