@@ -165,6 +165,16 @@ struct PrefillChunks {
     solo: u32,
 }
 
+/// The prefill phase's summary as the `done` line of a request that was
+/// never dealt a lane carries it (#518): the `admitted` line's fields, since
+/// that request logs no `admitted` line.
+#[derive(Debug, Clone, Copy)]
+struct PrefillSummary {
+    prompt_tokens: u32,
+    chunks: PrefillChunks,
+    prefilled_tokens: u32,
+}
+
 /// What a request's media cost, as the `admitted`, `done` and `cancelled`
 /// lines report it (GitHub #245): what acquiring them cost (GitHub #179) and what encoding
 /// them cost during prefill (GitHub #192), which the two halves of the
@@ -608,6 +618,13 @@ impl Telemetry {
         }
         let rt = self.requests.remove(&id);
         let known = rt.is_some();
+        // #518: a request that ended on its first token logged no `admitted`
+        // line, so its `done` line says what the prefill phase did.
+        let prefill = rt.as_ref().filter(|rt| !rt.admitted).map(|rt| PrefillSummary {
+            prompt_tokens: rt.prompt_tokens,
+            chunks: PrefillChunks { consumed: rt.prefill_chunks, solo: rt.prefill_chunks_solo },
+            prefilled_tokens: rt.prefilled_tokens,
+        });
         let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class, reuse, budget_dropped, media) = match rt {
             Some(rt) => (
                 rt.submitted_ms,
@@ -665,6 +682,7 @@ impl Telemetry {
                 redirected_at: reasoning_redirected_at,
             },
             media,
+            prefill,
         );
     }
 
@@ -1142,6 +1160,7 @@ impl Telemetry {
         reuse: Option<RequestReuse>,
         thinking: ThinkingReport,
         summary: Option<MediaSummary>,
+        prefill: Option<PrefillSummary>,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         // A `None` field records nothing, so a request without speculative
@@ -1208,6 +1227,13 @@ impl Telemetry {
             media.cache_hits = media.map(|m| m.cache_hits),
             media.cache_misses = media.map(|m| m.cache_misses),
             media.encode_seconds = summary.map(|s| s.encode_seconds()),
+            // #518: the `admitted` line's prefill fields, on the `done` line
+            // of a request that never logged one: it ended on its first
+            // token, or it was a decision, and was never dealt a lane.
+            prompt_tokens = prefill.map(|p| p.prompt_tokens),
+            prefill_chunks_consumed = prefill.map(|p| p.chunks.consumed),
+            prefill_chunks_solo = prefill.map(|p| p.chunks.solo),
+            prefilled_tokens = prefill.map(|p| p.prefilled_tokens),
             "request done"
         );
     }
