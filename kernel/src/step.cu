@@ -1429,10 +1429,10 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
 // the failing one. `drafter_floor` is the call's
 // (`ignis_prefill_options::drafter_floor`, GitHub #506).
 //
-// GitHub #519: `draws` is false on a span with a next prompt token: no chunk
-// computes the output head or samples, and the span leaves the sequence with
-// no pending token (-1) rather than an earlier span's -- its draw is the
-// prompt's last span's to make.
+// GitHub #519: `draws` is false on a span with a next prompt token whose draw
+// no retained image keeps (GitHub #520): no chunk computes the output head or
+// samples, and the span leaves the sequence with no pending token (-1) rather
+// than an earlier span's -- its draw is the prompt's last span's to make.
 int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                     const int32_t *token_ids, uint64_t num_tokens,
                                     const ignis_sampling_params &sampling, float *out_logits,
@@ -1608,14 +1608,15 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     return -1;
   }
   // GitHub #519: a span with a next prompt token draws nothing -- no output
-  // head, no sample -- since only the prompt's last span's draw is read.
+  // head, no sample -- since only the prompt's last span's draw is read, and
+  // (GitHub #520) a retained image's, which keeps it.
   if (const std::string why = ignis::step::next_prompt_token_refusal(
           static_cast<std::int32_t>(model->vocab), *sampling, options, out_logits);
       !why.empty()) {
     set_error("ignis_program_prefill: " + why);
     return -1;
   }
-  const bool draws = ignis::step::next_prompt_token(options) < 0;
+  const bool draws = ignis::step::span_draws(options);
   // GitHub #260 (ADR 0038): the attention readout. A negative ordinal or a
   // null score buffer asks for none. What is refused here is only what the
   // host can never mean -- a head or layer the model does not have, a span
@@ -2881,6 +2882,10 @@ int32_t redirect_span_draw(ignis_seq_pool *pool, ignis_seq *seq, const ignis_sam
 
 int32_t next_prompt_token(const ignis_prefill_options *options) {
   return options != nullptr ? options->next_prompt_token : -1;
+}
+
+bool span_draws(const ignis_prefill_options *options) {
+  return next_prompt_token(options) < 0 || options->keeps_draw != 0;
 }
 
 std::string next_prompt_token_refusal(std::int32_t vocab, const ignis_sampling_params &sampling,

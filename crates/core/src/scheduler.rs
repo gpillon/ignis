@@ -205,11 +205,12 @@ pub struct PrefillJob {
     /// draw is the sequence's pending token. Filled on every job.
     ///
     /// Only that job's draw is read, so the leaf runs the output head and
-    /// samples only where this is `None` (on the 27B, and on Flash-Next
-    /// without MTP), and a job with a next token leaves no pending token. One
-    /// exception lives in `RuntimeCompute::prefill_step`: a job whose state a
-    /// prefix or a prompt checkpoint retains keeps its draw, which the image
-    /// carries to a full-prompt claimant.
+    /// samples only where this is `None`, and a job with a next token leaves
+    /// no pending token. Flash-Next's MTP head builds its entry at the job's
+    /// last position from this token (GitHub #520). One exception lives in
+    /// `RuntimeCompute::prefill_step`: a job whose state a prefix or a prompt
+    /// checkpoint retains keeps its draw, which the image carries to a
+    /// full-prompt claimant, and still hands the leaf this token.
     pub next_prompt_token: Option<TokenId>,
 }
 

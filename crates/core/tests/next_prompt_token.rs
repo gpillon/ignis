@@ -3,17 +3,18 @@
 //! the job that ends at the prompt's last position, whose draw is the
 //! sequence's pending token.
 //!
-//! The leaf runs the output head and samples only where that is `None`
-//! (`RuntimeCompute::prefill_step` also hands it `None` on a job whose state
-//! a prefix or a prompt checkpoint retains); every other job's draw was
-//! discarded by the next one. So what the scheduler deals here decides where
-//! the head runs.
+//! The leaf runs the output head and samples only where that is `None`, or
+//! where `RuntimeCompute::prefill_step` tells it a prefix or a prompt
+//! checkpoint retains the job's state (GitHub #520); every other job's draw
+//! was discarded by the next one. So what the scheduler deals here decides
+//! where the head runs, and which token Flash-Next's MTP entry at each job's
+//! last position is built from.
 //!
 //! What these tests can prove: which token the scheduler hands each job, on a
 //! first turn cut at its retained-image points, on a later turn resuming from
 //! the first's checkpoint, and on a full-prompt match. That the leaf then
 //! skips the head and leaves the sequence as today needs the model and lives
-//! in `crates/core/tests/next_prompt_token_gpu.rs`.
+//! in `crates/runtime/tests/next_prompt_token_gpu.rs`.
 //!
 //! Seams (ADR 0006): the `Scheduler` trait driven with a `MockCompute` that
 //! records every prefill job behind the `Compute` seam, as `drafter_floor.rs`
