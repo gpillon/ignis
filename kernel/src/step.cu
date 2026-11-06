@@ -601,10 +601,11 @@ void copy_i32_to_device(ninfer::Tensor &dst, const std::int32_t *src, std::size_
 // (kernel/src/dflash2_drafter.h, shared with the verify round since P5-05)
 // lands them in the slot's lane of the window. `host_scalars` is [count,
 // lane, positions...] and must outlive the caller's synchronize: every copy
-// here is enqueued on the model's stream.
+// here is enqueued on the model's stream. `call` names the projections' route
+// widths (GitHub #521): a prefill chunk's taps, or a carried anchor.
 void append_dflash2_context(ignis_model *model, ignis_seq_pool *pool,
                             const ninfer::Tensor &features, const std::int32_t *host_scalars,
-                            std::int32_t count) {
+                            std::int32_t count, IgnisA16Call call) {
   const cudaStream_t stream = model->stream;
   ninfer::Tensor commit_count = model->scratch->alloc(ninfer::DType::I32, {1, 1, 1, 1});
   ninfer::Tensor lane         = model->scratch->alloc(ninfer::DType::I32, {1, 1, 1, 1});
@@ -614,7 +615,7 @@ void append_dflash2_context(ignis_model *model, ignis_seq_pool *pool,
   copy_i32_to_device(positions, host_scalars + 2, static_cast<std::size_t>(count), stream);
   ignis_dflash2_append_context(
       model, pool, *model->scratch, features, positions, commit_count, lane,
-      {static_cast<std::uint32_t>(count), static_cast<std::uint32_t>(count)});
+      {static_cast<std::uint32_t>(count), static_cast<std::uint32_t>(count)}, call);
 }
 
 // GitHub #157: the anchor taps a verify round at extent 0 left on `seq`
@@ -645,7 +646,7 @@ bool append_dflash2_pending(ignis_model *model, ignis_seq_pool *pool, const igni
                              cudaGetErrorString(err));
   }
   host_scalars = {1, seq.slot, static_cast<std::int32_t>(seq.dflash2_position)};
-  append_dflash2_context(model, pool, features, host_scalars.data(), 1);
+  append_dflash2_context(model, pool, features, host_scalars.data(), 1, IgnisA16Call::General);
   return true;
 }
 
@@ -1222,7 +1223,8 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       }
     }
     if (tap_count > 0) {
-      append_dflash2_context(model, pool, features, dflash2_scalars.data(), tap_count);
+      append_dflash2_context(model, pool, features, dflash2_scalars.data(), tap_count,
+                             IgnisA16Call::PrefillTaps);
     }
     profiler.record_head_begin(model->stream);
 

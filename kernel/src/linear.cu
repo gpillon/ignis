@@ -27,7 +27,9 @@
 // 2026-09-29: an NVFP4 A16Only call wide enough goes to our own tensor-core
 // route (kernel/include/ignis_nvfp4_a16_mma.h) instead of the vendored GEMV
 // slices; every other NVFP4 call is still the vendored dispatch's
-// (docs/findings/2026-09-29-a16-nvfp4-on-the-tensor-cores.md).
+// (docs/findings/2026-09-29-a16-nvfp4-on-the-tensor-cores.md). GitHub #521:
+// how wide is the call's to say, through `ignis_linear_a16`, our own entry
+// beside the reference's overloads, which keep the general widths.
 
 #include "ninfer/ops/linear.h"
 
@@ -108,13 +110,14 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 }
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                     WorkspaceArena* workspace, cudaStream_t stream) {
+                     WorkspaceArena* workspace, IgnisA16Call call, cudaStream_t stream) {
     switch (w.qtype) {
     case QType::NVFP4:
         // A wide A16 call goes to the tensor cores instead of the vendored GEMV family's
-        // 32-column slices (kernel/include/ignis_nvfp4_a16_mma.h). AllowA4 keeps the vendored
-        // resolver, which picks W4A4 for the backbone at these widths.
-        if (policy == LinearPolicy::A16Only && ignis_nvfp4_a16_mma_applies(w.n, w.k, x.ne[1])) {
+        // 32-column slices (kernel/include/ignis_nvfp4_a16_mma.h), how wide by `call` (#521).
+        // AllowA4 keeps the vendored resolver, which picks W4A4 for the backbone at these widths.
+        if (policy == LinearPolicy::A16Only &&
+            ignis_nvfp4_a16_mma_applies(w.n, w.k, x.ne[1], call)) {
             (void)detail::validate_nvfp4_weight(w, "nvfp4 linear");
             ignis_nvfp4_a16_mma(x, w, out, stream);
             return;
@@ -190,12 +193,19 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
             WorkspaceArena& workspace, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, policy);
-    dispatch_linear(x, w, out, policy, &workspace, stream);
+    dispatch_linear(x, w, out, policy, &workspace, IgnisA16Call::General, stream);
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
-    dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
+    dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, IgnisA16Call::General, stream);
 }
 
 } // namespace ninfer::ops
+
+void ignis_linear_a16(const ninfer::Tensor& x, const ninfer::Weight& w, ninfer::Tensor& out,
+                      IgnisA16Call call, cudaStream_t stream) {
+    using ninfer::ops::LinearPolicy;
+    ninfer::ops::validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
+    ninfer::ops::dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, call, stream);
+}
