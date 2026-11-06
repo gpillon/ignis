@@ -932,6 +932,20 @@ pub trait Scheduler: Send {
     /// evictions, admissions).
     fn advance(&mut self) -> Vec<SchedEvent>;
 
+    /// [`Scheduler::advance`], handing `prefilled` the events the step has
+    /// emitted by the end of its prefill phase **before** its decode round
+    /// runs (#518), and returning the rest.
+    ///
+    /// What the prefill phase emits is final when the phase ends: a prompt's
+    /// chunks, a decision's answer, and a prompt's first token. A caller that
+    /// streams them on at once makes none of them wait for the round. The
+    /// default hands nothing early, so a scheduler without phases streams its
+    /// step whole, as [`Scheduler::advance`] does.
+    fn advance_with(&mut self, prefilled: &mut dyn FnMut(Vec<SchedEvent>)) -> Vec<SchedEvent> {
+        let _ = prefilled;
+        self.advance()
+    }
+
     /// True when no request is in flight (nothing to schedule).
     fn is_idle(&self) -> bool;
 

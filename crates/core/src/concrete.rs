@@ -4388,6 +4388,13 @@ impl Scheduler for ConcreteScheduler {
     }
 
     fn advance(&mut self) -> Vec<SchedEvent> {
+        let mut early = Vec::new();
+        let rest = self.advance_with(&mut |events| early.extend(events));
+        early.extend(rest);
+        early
+    }
+
+    fn advance_with(&mut self, prefilled: &mut dyn FnMut(Vec<SchedEvent>)) -> Vec<SchedEvent> {
         let mut events: Vec<SchedEvent> = Vec::new();
         self.last_error = None;
         // core-06: advance the scheduling tick (the LRU `use_tick` for
@@ -5483,6 +5490,13 @@ impl Scheduler for ConcreteScheduler {
                 }
             };
             self.mark_done(idx, &mut events, reason);
+        }
+
+        // #518: the prefill phase ends here, and what it emitted is final --
+        // a prompt's chunks, a decision's answer -- so it leaves now, before
+        // the lane deal and the decode round, rather than with them.
+        if !events.is_empty() {
+            prefilled(std::mem::take(&mut events));
         }
 
         // Phase 2 — the admission state machine drives the lane deal

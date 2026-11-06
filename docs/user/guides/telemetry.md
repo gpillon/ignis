@@ -18,6 +18,10 @@ Everything goes through one structured log on stdout, in the format
   response was cancelled, or a loop-guard rewind replaced it) or `shutdown`
   (a model switch stopped it), beside how long it ran, whether it had a lane
   and the tokens it generated.
+- The `ttft` line's `duration_ms` runs from the submission to the first
+  token, and `after_prefill_ms` from the prefill chunk that completed the
+  prompt to that token: what the first token waited for once the prompt
+  was read.
 - A request with images says what they cost on the line it ends with,
   `done` or `cancelled`: `media.items`, `media.vision_tokens` (after any
   downscale to `--vision-max-tokens`) and `media.natural_vision_tokens`,
