@@ -57,6 +57,16 @@ pub struct Ladder {
     pub spare_tokens: u32,
 }
 
+impl Ladder {
+    /// Whether a KV pool of `kv_tokens` keeps what a kept context needs: one
+    /// full sequence of `context` tokens and, at more than one lane, the spare
+    /// reservation beside it; at one lane, where a spare reservation has no
+    /// lane to serve, the plan's own floor, which a plan that fits holds.
+    fn keeps(&self, context: u32, lanes: u32, kv_tokens: u64) -> bool {
+        lanes <= 1 || kv_tokens >= u64::from(context) + u64::from(self.spare_tokens)
+    }
+}
+
 impl Default for Ladder {
     /// The fields' defaults ([`crate::config::DEFAULT_ADAPT_CONTEXT_STEP`],
     /// [`crate::config::DEFAULT_ADAPT_SPARE_TOKENS`]).
@@ -238,7 +248,7 @@ pub fn contexts(from: u32, context_step: u32) -> Vec<u32> {
 pub enum SoloCandidates {
     /// `auto`: these widths, widest first, each kept only if the plan fits
     /// it at the start's values with the room an adapted context keeps;
-    /// then the prefill chunk. Empty where the card's ladder is
+    /// then the prefill chunk. Empty on a card with no ladder
     /// ([`crate::config::arch::solo_ladder`]).
     Auto(Vec<u32>),
     /// A width the operator or a profile named.
@@ -262,11 +272,10 @@ pub fn adapt_solo<T, E>(
 ) -> Result<Adapted<T>, AdaptError<E>> {
     let named = match solo {
         SoloCandidates::Auto(widths) => {
-            let room = u64::from(start.max_context) + u64::from(ladder.spare_tokens);
             for &width in widths.iter().filter(|&&width| width > start.prefill_chunk_solo) {
                 let attempt = Attempt { prefill_chunk_solo: width, ..start };
                 match plan(attempt).map_err(AdaptError::Failed)? {
-                    Planned::Fits { plan, kv_tokens } if start.decode_lanes <= 1 || kv_tokens >= room => {
+                    Planned::Fits { plan, kv_tokens } if ladder.keeps(start.max_context, start.decode_lanes, kv_tokens) => {
                         return Ok(Adapted { attempt, plan, steps: Vec::new() });
                     }
                     Planned::Fits { .. } | Planned::Unfit(_) => {}
@@ -344,9 +353,7 @@ pub fn adapt<T, E>(
         for &context in &candidates[skip..] {
             let candidate = Attempt { max_context: context, ..attempt };
             match plan(candidate)? {
-                Planned::Fits { plan, kv_tokens }
-                    if room == Room::OneLane || kv_tokens >= u64::from(context) + u64::from(ladder.spare_tokens) =>
-                {
+                Planned::Fits { plan, kv_tokens } if ladder.keeps(context, attempt.decode_lanes, kv_tokens) => {
                     if context != start.max_context {
                         steps.push(context_step(context, room));
                     }

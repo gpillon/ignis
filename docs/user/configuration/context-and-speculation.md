@@ -57,8 +57,10 @@ the 27B's dense prefill decodes every matrix once per chunk. The **solo width**
   Measured on the 5090 held to those budgets, `auto` would have taken 2048 on a
   16 GB RTX 40 card (33,280 tokens of pool) and 4096 on a 24 GB one (13,312
   tokens). `auto` stays the default for the cards no profile pins: an RTX 30 or
-  RTX 40 card of 32 GB, under `rtx5090`, or a larger one, under no profile. On the 5090 a wider chunk bought the 27B at most 4% of cold prefill
-  time ([finding](../../findings/2026-10-07-27b-prefill-chunk-width.md)), not
+  RTX 40 card of 32 GB, under `rtx5090`, or a larger one, under no profile.
+- **No ladder on Blackwell or for Flash-Next.** On the 5090 a wider chunk
+  bought the 27B at most 4% of cold prefill time
+  ([finding](../../findings/2026-10-07-27b-prefill-chunk-width.md)), not
   worth its context; Flash-Next pays an expert stream per chunk, so it wants
   its widest chunk with lanes decoding too
   ([finding](../../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)),

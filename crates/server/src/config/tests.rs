@@ -654,7 +654,7 @@ fn an_invalid_prefill_chunk_env_var_is_a_usage_error_too() {
 }
 
 #[test]
-fn the_solo_width_is_auto_unless_named_and_no_profile_names_one() {
+fn the_solo_width_is_auto_unless_named_or_pinned_by_the_8x_class_profiles() {
     // GitHub #489: a flag, its env var or a family's section names a width.
     assert_eq!(config(&[]).prefill_chunk_solo, SoloWidth::Auto);
     assert_eq!(config(&["--model-prefill-chunk-solo", "8192"]).prefill_chunk_solo, SoloWidth::Tokens(8192));

@@ -117,9 +117,10 @@ recurrent state and to draw the first token. Two rules shape it:
   scheduler hands the leaf one chunk (`--model-prefill-chunk`, 1,024 tokens by
   default, 2,048 for the 27B under the built-in profiles) and runs a decode
   round for the lanes already generating before the next chunk. While no lane
-  is generating, the chunk is the wider
+  is generating, a load that planned a wider
   [solo width](../configuration/context-and-speculation.md#the-solo-width)
-  instead, decided again at every chunk boundary. Nothing runs
+  takes it instead, decided again at every chunk boundary; under the built-in
+  profiles the two are the same width. Nothing runs
   concurrently on the card: prefill and decode alternate on one stream
   ([ADR 0018](../../adr/0018-chunk-level-prefill-decode-interleaving.md)).
 

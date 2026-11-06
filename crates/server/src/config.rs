@@ -359,8 +359,9 @@ pub struct Config {
     /// [`PREFILL_CHUNK_ALIGNMENT`]).
     pub prefill_chunk: u32,
     /// The solo width as configured (`--model-prefill-chunk-solo`, GitHub
-    /// #489): `auto`, resolved at load, or a width of at least
-    /// `prefill_chunk` and at most `max_context`.
+    /// #489): `auto`, resolved at load, or a width of at most `max_context`.
+    /// Below `prefill_chunk` it is refused when both are named, and otherwise
+    /// runs as `prefill_chunk` (`runtime::EngineShape::solo_width`).
     pub prefill_chunk_solo: SoloWidth,
     /// The **decode share** (`--model-decode-share`, GitHub #306): the
     /// percent of the model's time decoding lanes keep while a prompt
@@ -596,11 +597,13 @@ impl std::fmt::Debug for Basis {
 /// #489, ADR 0018 as amended): the prefill chunk while no lane is
 /// decode-ready. `auto`, the default, is resolved at load, where the VRAM
 /// plan and the card are known ([`crate::config::arch::solo_ladder`]); a
-/// width is a nonzero multiple of 128, at least the prefill chunk.
+/// width is a nonzero multiple of 128, and a load never runs it narrower than
+/// the prefill chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SoloWidth {
     /// The widest of the card's ladder the plan holds with nothing else
-    /// adapted, else the prefill chunk.
+    /// adapted and, at more than one lane, the spare reservation left beside
+    /// the context; else the prefill chunk.
     #[default]
     Auto,
     /// This many tokens.

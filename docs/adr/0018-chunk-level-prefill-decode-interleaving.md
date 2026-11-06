@@ -201,7 +201,9 @@ load plans two, and the scheduler picks between them at every chunk boundary.
   near-constant expert stream, so it wants its widest chunk with lanes
   decoding as well
   ([finding](../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)),
-  and the built-in profiles set that chunk to 8192, as `make` already did.
+  and the Blackwell profiles set that chunk to 8192, as `make` already did
+  (`rtx-24gb` and `rtx-16gb` set 4096 and 2048, placeholders until Flash-Next
+  runs on those cards: GitHub #526).
 - **The same prompt can end in logits that differ in the last bits**,
   depending on whether lanes were decoding. The quality gates use KLD; a test
   that compares logits bit for bit pins both widths. At the prefill chunk, a

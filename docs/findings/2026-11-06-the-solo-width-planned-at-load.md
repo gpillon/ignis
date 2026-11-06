@@ -55,17 +55,21 @@ desktop: the expert cache is 15,833,292,112 B (14.75 GiB) at a 1,024-token chunk
 
 **The RTX 5090 before and after** (`.scratch/489/bench/`). `main`'s release binaries against the branch's,
 on port 8489, make's flags. `auto` resolves to the prefill chunk on Blackwell and Flash-Next has no ladder,
-so each pair plans the same lines byte for byte.
+so each pair runs the same widths and the same workspace line (983,876,864 B for the 27B).
 
-The 27B (the `rtx5090` profile, DFlash2/7; the before load adapted its context to 720,896 tokens and the
-after one to 655,360, because 89 MB less of the card was free at its start):
+The 27B (the `rtx5090` profile, DFlash2/7). The two loads differ in one way: the before load adapted its
+context to 720,896 tokens and the after one to 655,360, because 89 MB less of the card was free at its
+start, so their KV pools differ:
 
 | | before | after |
 |---|---|---|
 | `ttft` 8,192, median of 5, cold | 772.6 ms | 769.2 ms |
 | `ttft` 65,536, median of 5, cold | 6,900.1 ms | 6,845.1 ms |
+| `g3` C=1 | 208.0 tok/s | 222.2 tok/s |
 | `g3` C=4 | 160.0 tok/s | 159.1 tok/s |
 | `g3` ITL p95 (4 lanes while 32K prompts prefill) | 213.07 ms | 212.34 ms |
+
+The after ITL leg covered 9 of its 10 prefill windows: one decode lane ended on the safety cap first.
 
 Flash-Next (262,144 tokens, 8,192-token chunk; `ttft` in three before/after pairs one after the other,
 each a median of 5; `g3` at 5 lanes, since at make's 3 its ITL cell's prefillers are refused while 4
@@ -76,6 +80,7 @@ lanes decode):
 | `ttft` 8,192, three runs | 2,478 / 2,469 / 2,439 ms | 2,493 / 2,433 / 2,443 ms |
 | `ttft` 65,536, three runs | 19,574 / 19,896 / 19,221 ms | 20,152 / 19,337 / 19,317 ms |
 | `g3` C=1, two runs | 102.3 / 102.4 tok/s | 100.9 / 101.3 tok/s |
+| `g3` C=4, two runs | 48.0 / 42.0 tok/s | 47.9 / 47.7 tok/s |
 | `g3` ITL p50, two runs | 24.44 / 24.48 ms | 27.99 / 25.14 ms |
 | `g3` ITL p95, two runs | 34.77 / 36.67 ms | 41.13 / 36.59 ms |
 
@@ -95,15 +100,18 @@ their decode rates compare.
 - Flash-Next's 8,192-token chunk costs its expert cache 1.03 GiB against 1,024. From the ~16.6 GiB the
   `rtx5090` profile measured at 1,024, that keeps ~15.6 GiB, above the 15 GiB floor, and a narrower chunk
   costs Flash-Next's prefill nearly in proportion, so `rtx5090` and `rtxpro6000` set 8,192.
-- On the RTX 5090 the change is neutral for both models: each first after run that read slower (64K
-  Flash-Next TTFT +3%, its ITL p50 +14%) came back level on the repeat.
+- On the RTX 5090 the 27B reads level. Flash-Next's TTFT reads level over three pairs: the first after
+  run's +3% at 64K came back on the repeats. Its decode reads 1.1-1.4% lower at one lane in both `g3`
+  pairs, and its ITL p50 +14% then +2.7%. No code on Flash-Next's decode path changed (one width, its
+  prefill chunk; the scheduler's width check is a scan of the requests per advance), and two pairs do not
+  separate that from this host's spread; the bench was stopped there, on the owner's call.
 
 ## Implications
 
 - The load line (`ignis.runtime.prefill_chunk_solo`) and `GET /v1/models` say which width a load runs.
 - A logits test that pins the prefill chunk can run on a load with any solo reservation.
 - A single before/after pair of Flash-Next benches on this host swings by a few percent; repeat a pair
-  before reading a difference.
+  before reading a difference, and more than two to read one of about 1%.
 
 ## Limits and unknowns
 
