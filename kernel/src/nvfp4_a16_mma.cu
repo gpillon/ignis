@@ -61,10 +61,25 @@ constexpr int kStages = 2;
 // (ignis_nvfp4_a16_mma_bench): at T=33 the route ran 0.76-0.92x the GEMVs on
 // every shape; at T=64 it wins 1.38-1.50x on problems of 4,096+ rows, but
 // loses on the narrow ones ([1280, 5120] 0.70x, [256, 5120] 0.59x), which
-// win from T=128 (1.37x, 1.05x).
+// win from T=128 (1.37x, 1.05x). Those are the RTX 5090's widths, which every
+// generation keeps (`ignis_nvfp4_a16_mma_min_tokens`) but for one call on 8.x.
 constexpr std::int32_t kMinTokens = 64;
 constexpr std::int32_t kMinTokensNarrow = 128;
 constexpr std::int32_t kNarrowRowsBelow = 4096;
+
+// GitHub #521: on compute capability 8.x, a prefill chunk's DFlash2 feature
+// taps take the route from this width -- both their problems, [5120, 25600]
+// and [6144, 5120], have 4,096+ rows -- so a prompt-reuse tail, 0 to 63
+// tokens, need not take the GEMVs. PROVISIONAL until measured on an sm_86
+// card with `ignis_nvfp4_a16_mma_bench --taps`: 33, the first width at which
+// the vendored GEMVs run two 32-column launches (kNvfp4LastSmallT), each a
+// pass over the whole weight, where the route makes one. Every other call on
+// 8.x, the decode round's included, keeps kMinTokens: the route's BF16 MMAs
+// accumulate in FP32, which GeForce runs at half rate, so their crossover
+// has to come from a GeForce RTX 30 or RTX 40 card's measurement.
+constexpr std::int32_t kPrefillTapsMinTokens8x = 33;
+static_assert(kPrefillTapsMinTokens8x >= 1 && kPrefillTapsMinTokens8x < kMinTokens,
+              "a reuse tail's width");
 
 constexpr int kWarpsM = kBlockRows / kWarpRows;
 constexpr int kWarpsN = kBlockCols / kWarpCols;
@@ -324,18 +339,45 @@ void launch_geometry(const ninfer::Tensor &x, const ninfer::Weight &w, ninfer::T
   }
 }
 
+// The current device's compute capability major, read once per process: the
+// leaf drives one card. 0 when the device cannot say, which takes the widths
+// every generation keeps.
+int device_compute_major() {
+  static const int major = [] {
+    int device = 0;
+    int value = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&value, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) {
+      return 0;
+    }
+    return value;
+  }();
+  return major;
+}
+
 } // namespace
 
+std::int32_t ignis_nvfp4_a16_mma_min_tokens(int compute_major, IgnisA16Call call,
+                                            std::int32_t output_rows) {
+  if (output_rows < kNarrowRowsBelow) {
+    return kMinTokensNarrow;
+  }
+  if (compute_major == 8 && call == IgnisA16Call::PrefillTaps) {
+    return kPrefillTapsMinTokens8x;
+  }
+  return kMinTokens;
+}
+
 bool ignis_nvfp4_a16_mma_applies(std::int32_t output_rows, std::int32_t input_rows,
-                                 std::int32_t tokens) {
-  return tokens >= (output_rows >= kNarrowRowsBelow ? kMinTokens : kMinTokensNarrow) &&
+                                 std::int32_t tokens, IgnisA16Call call) {
+  return tokens >= ignis_nvfp4_a16_mma_min_tokens(device_compute_major(), call, output_rows) &&
          ninfer::ops::detail::is_nvfp4_linear_problem(output_rows, input_rows);
 }
 
 void ignis_nvfp4_a16_mma(const ninfer::Tensor &x, const ninfer::Weight &w, ninfer::Tensor &out,
                          cudaStream_t stream) {
   using namespace ninfer::ops::detail;
-  if (!ignis_nvfp4_a16_mma_applies(w.n, w.k, x.ne[1])) {
+  if (x.ne[1] < 1 || !is_nvfp4_linear_problem(w.n, w.k)) {
     throw std::invalid_argument("ignis_nvfp4_a16_mma: unsupported shape");
   }
   switch (resolve_nvfp4_problem(w.n, w.k)) {

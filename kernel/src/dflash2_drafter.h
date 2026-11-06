@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "ignis_nvfp4_a16_mma.h"
 #include "ignis_seq_internal.h"
 #include "model_internal.h"
 
@@ -32,12 +33,15 @@
 // normalized once, then every drafter layer's keys (normalized and roped at
 // their absolute positions) and values land in ring slot `p mod 2048` of the
 // lane. A lane with count 0 writes nothing. Allocations come from `arena`,
-// under the caller's scope.
+// under the caller's scope. GitHub #521: `call` names the projections' route
+// widths, `IgnisA16Call::PrefillTaps` from a prefill chunk's taps,
+// `IgnisA16Call::General` from the verify round and a carried anchor.
 void ignis_dflash2_append_context(ignis_model *model, ignis_seq_pool *pool,
                                   ninfer::DeviceArena &arena, const ninfer::Tensor &features,
                                   const ninfer::Tensor &positions, const ninfer::Tensor &counts,
                                   const ninfer::Tensor &lanes,
-                                  ninfer::ops::KVCacheAppendPrefixExecutionEnvelope envelope);
+                                  ninfer::ops::KVCacheAppendPrefixExecutionEnvelope envelope,
+                                  IgnisA16Call call);
 
 // The drafter's forward for a verify round at batch `width`: each lane's
 // anchor and `k` mask tokens at positions `base + j`, five layers of two-tap
