@@ -65,7 +65,10 @@ You can add models of your own with an
 
   Each catalog entry states the smallest card class and the oldest GPU
   generation it loads on, and the server refuses one above the card before it
-  unloads or fetches anything. A release is built for compute capabilities 8.6
+  unloads or fetches anything:
+  [Where each model loads](../reference/models.md#where-each-model-loads) is
+  the table, every built-in model on every card above. A release is built for
+  compute capabilities 8.6
   and 12.0 (`86;120a`). Other cards, including the DGX Spark, are not
   supported; [why not DGX Spark?](../guides/dgx-spark.md) gives the reasoning.
   A start on one is refused before anything loads, naming the card, its

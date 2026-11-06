@@ -94,8 +94,9 @@ the 16 GB RTX 50 cards the 16 GB entries. The **RTX 3090 and 3090 Ti** are
 supported, on the 27B's 16 GB entries; the **RTX 4090** and the 16 GB RTX 40
 cards are expected to work, and reports are welcome. An RTX 30 or RTX 40 card
 needs release 0.10.0 or the development build: the 0.9 releases are built for
-Blackwell alone. The NVFP4 27B, Flash-Next
-and the image model load on Blackwell alone, on a card of 32 GB or more. The
+Blackwell alone. The NVFP4 builds, Flash-Next
+and the image model load on Blackwell alone, on a card of 32 GB or more
+([every model on every card](docs/user/reference/models.md#where-each-model-loads)). The
 figures here are measured on an RTX 5090
 ([the guide's list](https://gpillon.github.io/ignis/start/#what-it-runs-on)).
 

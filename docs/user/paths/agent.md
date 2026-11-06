@@ -76,7 +76,9 @@ Ask before the install does anything large or visible:
    fiscal year ([its license](../guides/fine-tunes.md#its-license)); on a
    16 GB card `swift-1.5-27b-16g` serves it. `ignis-image-2.1-turbo`
    makes images and its weights are non-commercial
-   ([What it serves](../start/index.md#what-it-serves)).
+   ([What it serves](../start/index.md#what-it-serves)). Which model loads,
+   is served by another entry, or is refused on the user's card is the table
+   of [Where each model loads](../reference/models.md#where-each-model-loads).
 2. **Where the model is kept, and the download itself.** A model is tens of
    GiB. A server started with no terminal on its stdin, which is how an agent's
    shell tool usually runs a command, does not ask before fetching: it

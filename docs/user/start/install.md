@@ -16,8 +16,9 @@ Every `v*` release publishes ignis three ways, all from the same compile:
 All three are compiled for compute capabilities 8.6 and 12.0 (`86;120a`): the
 RTX 5090, the RTX PRO 6000 and the 16 GB RTX 50 class, and the RTX 3090 and
 3090 Ti; the RTX 4090 and the 16 GB RTX 40 cards are expected to work, and
-reports are welcome. The NVFP4 27B, Flash-Next and the image model load on
-Blackwell alone ([what it runs on](index.md#what-it-runs-on)); on any card
+reports are welcome. Which model loads on which of them is the table of
+[Where each model loads](../reference/models.md#where-each-model-loads)
+([what it runs on](index.md#what-it-runs-on)); on any card
 the build is not compiled for, the server refuses to start, naming it. None carries a model: the server fetches one on first start, or you point it at a
 `.ninfer` file you already have ([Get a model](../guides/models.md)). To build
 from a checkout instead, see [Building](../contributing/building.md).

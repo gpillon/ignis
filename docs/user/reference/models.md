@@ -1,6 +1,6 @@
 ---
 title: "Built-in models"
-description: "The catalog compiled into ignis-server: every model it can fetch, the repository and revision it is pinned at, and every file's size and SHA-256."
+description: "The catalog compiled into ignis-server: every model it can fetch, the repository and revision it is pinned at, the cards each loads on, and every file's size and SHA-256."
 sidebar:
   order: 3
   badge:
@@ -29,6 +29,24 @@ The models the server knows how to fetch without an operator catalog. Each is pi
 | [`qwen3-asr-1.7b-q8`](#qwen3-asr-17b-q8) | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 2.3 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE) | `Qwen3-ASR-1.7B-Q8_0.gguf` |
 | [`qwen3-asr-0.6b`](#qwen3-asr-06b) | [`gpillon/Qwen3-ASR-0.6B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis) | 0.9 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis/blob/af02916ea7a532a667a907c2a163b16a8c04b433/LICENSE) | `Qwen3-ASR-0.6B-Q8_0.gguf` |
 | [`nemotron-3-diarization`](#nemotron-3-diarization) | [`gpillon/Nemotron-3-Diarization-GGUF-ignis`](https://huggingface.co/gpillon/Nemotron-3-Diarization-GGUF-ignis) | 0.2 GiB | [`openmdw-1.1`](https://huggingface.co/gpillon/Nemotron-3-Diarization-GGUF-ignis/blob/d46d59d03be709db18e223b6bf92e8c32d14f422/LICENSE) | `Nemotron-3-Diarization-F16.gguf` |
+
+## Where each model loads
+
+Each built-in model on each card ignis runs on, as the server decides it from the entry's [card class and GPU generation](../guides/models.md#the-catalog), by the rule `model list` and a switch apply: it **loads**; it is **served by** another entry, which answers to its id on that card; or it is **refused**, by its class (`409 model_above_card_class`) or its generation (`409 model_above_gpu_generation`, also when the class refuses it too). A model that loads still has its context and lanes fitted by the [VRAM plan](../concepts/vram-plan.md). The columns are the cards [What it runs on](../start/index.md#what-it-runs-on) names, which also says how far each is verified.
+
+| Model | RTX PRO 6000 | RTX 5090 | RTX 5060 Ti 16 GB, 5070 Ti, 5080 | RTX 3090, 3090 Ti | RTX 4090 | RTX 4060 Ti 16 GB, 4080 |
+|---|---|---|---|---|---|---|
+| *Generation, class* | Blackwell (12.0), 96 GB | Blackwell (12.0), 32 GB | Blackwell (12.0), 16 GB | Ampere (8.6), 24 GB | Ada (8.9), 24 GB | Ada (8.9), 16 GB |
+| `qwen3.8-27b` | loads | loads | served by `qwen3.8-27b-16g` | served by `qwen3.8-27b-16g` | served by `qwen3.8-27b-16g` | served by `qwen3.8-27b-16g` |
+| `qwen3.8-27b-abliterated` | loads | loads | served by `qwen3.8-27b-abliterated-16g` | served by `qwen3.8-27b-abliterated-16g` | served by `qwen3.8-27b-abliterated-16g` | served by `qwen3.8-27b-abliterated-16g` |
+| `qwen3.8-flash-next` | loads | loads | refused (class) | refused (class, generation) | refused (class, generation) | refused (class, generation) |
+| `ignis-image-2.1-turbo` | loads | loads | refused (class) | refused (class, generation) | refused (class, generation) | refused (class, generation) |
+| `qwen3.8-27b-16g` | loads | loads | loads | loads | loads | loads |
+| `qwen3.8-27b-abliterated-16g` | loads | loads | loads | loads | loads | loads |
+| `swift-1.5-27b` | loads | loads | served by `swift-1.5-27b-16g` | refused (class, generation) | refused (class, generation) | refused (class, generation) |
+| `swift-1.5-27b-16g` | loads | loads | loads | refused (generation) | refused (generation) | refused (generation) |
+
+The speech models and the diarizer (`qwen3-asr-1.7b`, `qwen3-asr-1.7b-q8`, `qwen3-asr-0.6b`, `nemotron-3-diarization`) run on the CPU, beside whichever model the card holds, on every card.
 
 ## qwen3.8-27b
 

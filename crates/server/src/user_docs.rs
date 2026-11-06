@@ -15,11 +15,12 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
+use crate::config::arch::{BuiltArchitectures, GpuGeneration};
 use crate::config::cli::default_text;
 use crate::config::field::{FieldMeta, FAMILIES};
-use crate::config::profile::{built_in, CardClass, AUTO_PROFILE, DEFAULT_PROFILE, LEGACY_16GB_PROFILE, NONE_PROFILE};
+use crate::config::profile::{built_in, CardClass, CardReading, AUTO_PROFILE, DEFAULT_PROFILE, LEGACY_16GB_PROFILE, NONE_PROFILE};
 use crate::config::schema::GROUPS;
-use crate::download::catalog::Catalog;
+use crate::download::catalog::{Catalog, Unavailable};
 use crate::metrics::{LoadReservations, LocateFound, Metrics, Primitive, TokenizeRoute};
 use ignis_core::flash_next_counters::FlashNextCounters;
 use ignis_core::locate::{Compression, Kind as LocateKind, Method as LocateMethod};
@@ -142,11 +143,8 @@ pub fn profiles() -> String {
     let _ = writeln!(
         out,
         "A profile follows the card's memory, not its generation, and what a card loads follows \
-         from both. The RTX 5090 and RTX PRO 6000 run every model, and the 16 GB RTX 50 cards the \
-         16 GB entries; the RTX 3090 and 3090 Ti are supported, on the 27B's 16 GB entries; the \
-         RTX 4090 and the 16 GB RTX 40 cards are expected to work, and reports are welcome. The \
-         NVFP4 27B, Flash-Next and the image model load on Blackwell alone, on a card of 32 GB or \
-         more ([What it runs on](../start/index.md#what-it-runs-on)).\n"
+         from both: [Where each model loads](models.md#where-each-model-loads) gives each built-in \
+         model on each card ignis runs on ([What it runs on](../start/index.md#what-it-runs-on)).\n"
     );
     for (name, layer) in built_in() {
         let _ = writeln!(out, "## {name}\n");
@@ -180,7 +178,7 @@ fn anchor(file_key: &str) -> String {
 pub fn models() -> String {
     let mut out = front_matter(
         "Built-in models",
-        "The catalog compiled into ignis-server: every model it can fetch, the repository and revision it is pinned at, and every file's size and SHA-256.",
+        "The catalog compiled into ignis-server: every model it can fetch, the repository and revision it is pinned at, the cards each loads on, and every file's size and SHA-256.",
         3,
     );
     out.push_str(
@@ -205,6 +203,7 @@ pub fn models() -> String {
         );
     }
     out.push('\n');
+    where_each_model_loads(&mut out, catalog);
     for entry in catalog.entries() {
         let _ = writeln!(out, "## {}\n", entry.id);
         let _ = writeln!(
@@ -222,6 +221,91 @@ pub fn models() -> String {
         out.push('\n');
     }
     finish(out)
+}
+
+/// The cards the guide names (`docs/user/start/index.md`, What it runs on),
+/// one column each of the models page's table: their names, their GPU
+/// generation and card class. How far each is verified stays on that page
+/// alone. A card of no column gets none because the catalog alone would not
+/// refuse it (a 12 GB card reads as the 16 GB class), only the VRAM plan would.
+const CARDS: [(&str, GpuGeneration, CardClass); 6] = [
+    ("RTX PRO 6000", GpuGeneration::Blackwell, CardClass::Gb96),
+    ("RTX 5090", GpuGeneration::Blackwell, CardClass::Gb32),
+    ("RTX 5060 Ti 16 GB, 5070 Ti, 5080", GpuGeneration::Blackwell, CardClass::Gb16),
+    ("RTX 3090, 3090 Ti", GpuGeneration::Ampere, CardClass::Gb24),
+    ("RTX 4090", GpuGeneration::Ada, CardClass::Gb24),
+    ("RTX 4060 Ti 16 GB, 4080", GpuGeneration::Ada, CardClass::Gb16),
+];
+
+/// A card of `generation` and `class` as the start reads it, under the
+/// release's build (`86;120a`): the class's size in GiB, the generation's
+/// compute capability.
+fn card_of(generation: GpuGeneration, class: CardClass) -> CardReading {
+    CardReading {
+        total: u64::from(class.gb()) << 30,
+        name: format!("NVIDIA RTX ({generation}, {class})"),
+        capability: generation.capability(),
+        built_for: BuiltArchitectures::parse("86;120a").expect("the release's list parses"),
+    }
+}
+
+/// What the catalog does with a request for `id` on `card`, as `model list`
+/// says it ([`Catalog::unavailable`]): the entry loads, another entry answers
+/// to its id there, or it is refused, by class, generation or both.
+fn loads_on(catalog: &Catalog, id: &str, card: &CardReading) -> String {
+    match catalog.unavailable(id, Some(card)) {
+        None => "loads".to_owned(),
+        Some(Unavailable { served_by: Some(serving), .. }) => format!("served by `{serving}`"),
+        Some(Unavailable { refusal, served_by: None }) => match (refusal.class.is_some(), refusal.generation.is_some()) {
+            (true, true) => "refused (class, generation)".to_owned(),
+            (true, false) => "refused (class)".to_owned(),
+            _ => "refused (generation)".to_owned(),
+        },
+    }
+}
+
+/// The models page's table: each built-in text and image model on each card
+/// of [`CARDS`], as the catalog decides it from the entry's card class and
+/// GPU generation (ADR 0064, ADR 0079); the models that run on the CPU in a
+/// sentence under it.
+fn where_each_model_loads(out: &mut String, catalog: &Catalog) {
+    out.push_str(
+        "## Where each model loads\n\n\
+         Each built-in model on each card ignis runs on, as the server decides it from the entry's \
+         [card class and GPU generation](../guides/models.md#the-catalog), by the rule `model list` \
+         and a switch apply: it **loads**; it is **served by** another entry, which answers to its id \
+         on that card; or it is **refused**, by its class (`409 model_above_card_class`) or its \
+         generation (`409 model_above_gpu_generation`, also when the class refuses it too). A model \
+         that loads still has its context and lanes fitted by the [VRAM plan](../concepts/vram-plan.md). \
+         The columns are the cards [What it runs on](../start/index.md#what-it-runs-on) names, which \
+         also says how far each is verified.\n\n",
+    );
+    out.push_str("| Model |");
+    for (name, ..) in CARDS {
+        let _ = write!(out, " {name} |");
+    }
+    out.push_str("\n|---|");
+    out.push_str(&"---|".repeat(CARDS.len()));
+    out.push_str("\n| *Generation, class* |");
+    for (_, generation, class) in CARDS {
+        let _ = write!(out, " {generation} ({}), {class} |", generation.capability());
+    }
+    out.push('\n');
+    let (on_cpu, on_card): (Vec<_>, Vec<_>) = catalog.entries().iter().partition(|entry| entry.kind.is_some());
+    for entry in on_card {
+        let _ = write!(out, "| `{}` |", entry.id);
+        for (_, generation, class) in CARDS {
+            let _ = write!(out, " {} |", loads_on(catalog, &entry.id, &card_of(generation, class)));
+        }
+        out.push('\n');
+    }
+    let ids: Vec<String> = on_cpu.iter().map(|entry| format!("`{}`", entry.id)).collect();
+    let _ = writeln!(
+        out,
+        "\nThe speech models and the diarizer ({}) run on the CPU, beside whichever model the card \
+         holds, on every card.\n",
+        ids.join(", ")
+    );
 }
 
 fn thousands(n: u64) -> String {
@@ -422,13 +506,59 @@ mod tests {
         assert!(page.contains("[`openmdw-1.1`]"));
     }
 
+    /// The built-in models page says where each model loads: a row per text
+    /// and image model, a column per card the guide names, each cell the
+    /// catalog's own decision on that card, the alias's entry named where it
+    /// serves the id.
+    #[test]
+    fn the_built_in_models_page_says_where_each_model_loads() {
+        for (name, generation, class) in CARDS {
+            let card = card_of(generation, class);
+            assert_eq!((card.class(), card.generation()), (Some(class), Some(generation)), "{name}");
+        }
+        let page = models();
+        let row = |id: &str| {
+            let start = format!("| `{id}` |");
+            page.lines().find(|line| line.starts_with(&start)).unwrap_or_else(|| panic!("no row for {id}: {page}")).to_owned()
+        };
+        // PRO 6000, 5090, 16 GB RTX 50, 3090, 4090, 16 GB RTX 40.
+        let sixteen = "served by `qwen3.8-27b-16g`";
+        assert_eq!(row("qwen3.8-27b"), format!("| `qwen3.8-27b` | loads | loads | {sixteen} | {sixteen} | {sixteen} | {sixteen} |"));
+        assert_eq!(row("qwen3.8-27b-16g"), "| `qwen3.8-27b-16g` | loads | loads | loads | loads | loads | loads |");
+        let abliterated = "served by `qwen3.8-27b-abliterated-16g`";
+        assert_eq!(
+            row("qwen3.8-27b-abliterated"),
+            format!("| `qwen3.8-27b-abliterated` | loads | loads | {abliterated} | {abliterated} | {abliterated} | {abliterated} |")
+        );
+        assert_eq!(row("qwen3.8-27b-abliterated-16g"), "| `qwen3.8-27b-abliterated-16g` | loads | loads | loads | loads | loads | loads |");
+        assert_eq!(
+            row("swift-1.5-27b"),
+            "| `swift-1.5-27b` | loads | loads | served by `swift-1.5-27b-16g` | refused (class, generation) | refused (class, generation) | refused (class, generation) |"
+        );
+        assert_eq!(
+            row("swift-1.5-27b-16g"),
+            "| `swift-1.5-27b-16g` | loads | loads | loads | refused (generation) | refused (generation) | refused (generation) |"
+        );
+        assert_eq!(
+            row("qwen3.8-flash-next"),
+            "| `qwen3.8-flash-next` | loads | loads | refused (class) | refused (class, generation) | refused (class, generation) | refused (class, generation) |"
+        );
+        assert_eq!(
+            row("ignis-image-2.1-turbo"),
+            "| `ignis-image-2.1-turbo` | loads | loads | refused (class) | refused (class, generation) | refused (class, generation) | refused (class, generation) |"
+        );
+        assert!(!page.contains("| *Status* |"), "how far a card is verified stays on What it runs on: {page}");
+        assert!(page.contains("| *Generation, class* | Blackwell (12.0), 96 GB | Blackwell (12.0), 32 GB | Blackwell (12.0), 16 GB | Ampere (8.6), 24 GB | Ada (8.9), 24 GB | Ada (8.9), 16 GB |"), "{page}");
+        assert!(!page.contains("| `qwen3-asr-1.7b` |"), "a model on the CPU has no row: {page}");
+        assert!(page.contains("The speech models and the diarizer (`qwen3-asr-1.7b`, `qwen3-asr-1.7b-q8`, `qwen3-asr-0.6b`, `nemotron-3-diarization`) run on the CPU"), "{page}");
+    }
+
     /// GitHub #480: the profiles page says, under each built-in profile, the
     /// card class `auto` picks it for and the totals that class covers.
     #[test]
     fn the_profiles_page_names_the_class_auto_picks_each_profile_for() {
         let page = profiles();
-        assert!(page.contains("RTX 3090 and 3090 Ti are supported, on the 27B's 16 GB entries"), "{page}");
-        assert!(page.contains("load on Blackwell alone"), "{page}");
+        assert!(page.contains("[Where each model loads](models.md#where-each-model-loads)"), "{page}");
         assert!(page.contains("## rtx-24gb\n\n`--profile auto` picks it on a card of the 24 GB class: a total memory from 20 to under 28 GiB.\n"), "{page}");
         assert!(page.contains("## rtx-16gb\n\n`--profile auto` picks it on a card of the 16 GB class: a total memory below 20 GiB.\n"), "{page}");
         assert!(page.contains("## rtx5090\n\n`--profile auto` picks it on a card of the 32 GB class: a total memory from 28 to 40 GiB.\n"), "{page}");
