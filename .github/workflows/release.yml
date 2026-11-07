@@ -12,6 +12,13 @@
 #   ci/**        the same tests and builds and publishes nothing: the dry run
 #                for a release, so a tag is only ever cut on a pipeline
 #                already known to be green.
+#   a fork       the same tests and builds on any of the above, and nothing
+#                published (GitHub #495): every publishing job and step
+#                starts its condition with github.repository ==
+#                'gpillon/ignis', so a fork that keeps Actions on gets CI on
+#                its own changes and no image, release or prerelease under
+#                its name labelled as ignis's. A test holds every publishing
+#                point to it (crates/server/tests/fork_publishing.rs).
 #
 # A push to main or ci/** that changes only files no build, image or test
 # reads (paths-ignore below: Markdown, docs, bench data, scripts) starts no
@@ -249,7 +256,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+        if: github.repository == 'gpillon/ignis' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -322,7 +329,7 @@ jobs:
           file: ./Containerfile
           target: runtime
           platforms: linux/amd64
-          push: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+          push: ${{ github.repository == 'gpillon/ignis' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=linux-cuda
@@ -333,7 +340,7 @@ jobs:
             CUDA_REQUIRED_ARCHITECTURES=${{ env.IGNIS_CUDA_REQUIRED_ARCHITECTURES }}
 
       - name: Image published
-        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+        if: github.repository == 'gpillon/ignis' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
         run: |
           echo "### Image published" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -549,7 +556,7 @@ jobs:
   # Both hosts, or no release.
   release:
     needs: [version, linux, windows]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'gpillon/ignis' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -634,7 +641,7 @@ jobs:
   # "latest" release, which stays the newest v* tag.
   prerelease:
     needs: [version, linux, windows]
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'gpillon/ignis' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write

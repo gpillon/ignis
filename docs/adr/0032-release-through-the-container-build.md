@@ -129,6 +129,25 @@ identical build. Tags are never path-filtered: a release always runs.
   the ignore list.
 - `workflow_dispatch` still builds on demand.
 
+## Amendment (2026-11-07, GitHub #495): only gpillon/ignis publishes
+
+A fork that keeps Actions on ran this workflow on its own push to `main` and
+published a `develop` prerelease under its name, with ignis's notes, from a
+commit ignis never checked. Every publishing job and step now starts its
+condition with `github.repository == 'gpillon/ignis'`: the `release` and
+`prerelease` jobs, the `linux` job's registry login, image push and summary,
+and the guide's Pages upload and deployment in `docs.yml`.
+
+- A fork keeps `version`, `test`, `linux` and `windows`: its contributors get
+  CI on their own changes, and the archives stay as the run's artifacts.
+- On `gpillon/ignis` nothing changes: `main` moves `develop`, a `v*` tag
+  releases.
+- `crates/server/tests/fork_publishing.rs` reads every workflow and refuses a
+  publishing point (a job granting `contents` or `pages` write, a registry
+  login, a release or Pages action, a `gh release` or push command, a `push`
+  input) whose condition does not start with the guard, so a new one is held
+  to it as it lands.
+
 ## Considered Options
 
 - **Install the CUDA toolkit on the Linux runner** and build with cargo

@@ -49,6 +49,16 @@ A fork that stays close to `main` brings its changes back as they are: small
 commits, each with its test, and no wholesale reformatting
 ([`CODING_STANDARDS.md`](../../../CODING_STANDARDS.md)).
 
+## A fork's CI
+
+A fork that keeps GitHub Actions on runs ignis's workflows on its own pushes.
+A push to its `main` or to a `ci/**` branch runs the CPU-only tests on Linux
+and Windows and both builds, whose archives stay as the run's artifacts; a
+push that changes the guide builds it. Nothing is published from a fork: no
+container image, no `develop` prerelease, no release on a `v*` tag, no
+deployment of the guide. Those run on `gpillon/ignis` alone, so nothing
+built in a fork carries the label of an ignis build.
+
 ## For an agent working in a fork
 
 A coding agent working in a fork reads `AGENTS.md`, which points here. What

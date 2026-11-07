@@ -15,7 +15,10 @@
 #                         between releases.
 #
 # Only the newest v*.*.* release is ever deployed: a re-run or an edit of an
-# older one builds and stops. A tag push alone builds nothing here: the
+# older one builds and stops. A fork builds and never deploys (GitHub #495):
+# the upload and the deployment start their conditions with
+# github.repository == 'gpillon/ignis', which
+# crates/server/tests/fork_publishing.rs holds them to. A tag push alone builds nothing here: the
 # release run it starts is what deploys. docs/user/reference/ is generated
 # from the code and held equal to it by `cargo test`
 # (crates/server/tests/user_docs_reference.rs), which the release workflow
@@ -114,14 +117,14 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: npm run build
       - name: Upload the site
-        if: steps.target.outputs.deploy == 'true'
+        if: github.repository == 'gpillon/ignis' && steps.target.outputs.deploy == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs/site/dist
 
   deploy:
     needs: build
-    if: needs.build.outputs.deploy == 'true'
+    if: github.repository == 'gpillon/ignis' && needs.build.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     permissions:
       pages: write
