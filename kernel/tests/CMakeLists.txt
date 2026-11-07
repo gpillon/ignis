@@ -729,7 +729,8 @@ endforeach()
 # GitHub #509 (spec #503): OURS -- the dense prefill (kernel/include/ignis_dense_prefill.h): its
 # W8 codes against a host decode, its A8 against a host reference bit for bit, its int32
 # accumulators against an exact integer reference on the CUDA cores at every tile plan, and the
-# composed call's outputs within BF16 rounding of the fp64 epilogue; on synthetic matrices of
+# composed call's outputs within BF16 rounding of the fp64 epilogue, the tile plan's picks on the
+# host and every tile plan's BF16 bytes against the op's own (GitHub #530); on synthetic matrices of
 # every K class, and on real matrices of the base 16 GB artifact ($IGNIS_DENSE_PREFILL_ARTIFACT,
 # SKIP outside the GPU profile when absent, a failure under it). Not sm120a-only: the kernels fit
 # sm_86. The leaf-internal tile plan (dense_prefill_internal.cuh) is why it sees kernel/src.

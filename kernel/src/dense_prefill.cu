@@ -787,6 +787,19 @@ int32_t state(const char *op, State *out) {
   return 0;
 }
 
+// What a token row costs in a 128-row tile against a 256-row tile, in percent (GitHub #530). Its
+// warp tile issues 6 ldmatrix per 16 MMAs against 8 per 32 and loads 1.33x the shared-memory bytes
+// per MAC, so on a card with full-rate INT8 the shared memory and the L2 stop hiding under the
+// MMAs. Measured 2026-11-07 on the RTX 5090 with ignis_kernel_dense_prefill_bench --tokens
+// 2048,4096,8192 --sweep and --tokens 6656 --sweep: costing both tile heights alike, the plan lost
+// 4.9-5.2% of the dense body (GEMM + A8) against the fastest of the eight plans at 2048 tokens,
+// 0.7-1.0% at 4096, 2.2-2.7% at 8192 and 4.1% at 6656; at 110 the same rows put it within 1.1% at
+// every width, and the plan built with it measured within 1.2%
+// (docs/findings/2026-11-07-dense-prefill-tile-plan-weighs-a-128-row-tile.md). Not BM 256
+// everywhere: at 2048 tokens gqa k, v takes 82% longer on it.
+constexpr long long kTile128RowCostPercent = 110;
+static_assert(kTile128RowCostPercent >= 100, "a 128-row tile reuses each operand half as much as a 256-row one");
+
 Plan plan(const State &st, uint32_t tokens, uint32_t in, uint32_t out) {
   const long long nt = out / kBlockN;
   // The GEMM's time at a tile height, in units of a token row's work: its waves of resident CTAs
@@ -798,7 +811,8 @@ Plan plan(const State &st, uint32_t tokens, uint32_t in, uint32_t out) {
   };
   Plan p;
   const bool long_k = in >= 8192;
-  p.bm = cost(128, 4) < cost(256, long_k ? 4 : 3) ? 128 : 256;
+  // BM 128 only where it undercuts 256 once its rows are weighed at what they cost.
+  p.bm = cost(128, 4) * kTile128RowCostPercent < cost(256, long_k ? 4 : 3) * 100 ? 128 : 256;
   p.stages = p.bm == 128 || long_k ? 4 : 3;
   p.raster = tokens > out ? kOutputsFastest : kTokensFastest;
   return p;

@@ -14,6 +14,10 @@
 //   outputs  the composed call the engine runs (ignis_dense_prefill_linear) against the fp64
 //            epilogue of those accumulators, within |y - Y| <= 2^-8 |Y| + 2^-9 s: the store, the
 //            residual add, SwiGLU's two passes and the query/gate split.
+//   tile plan (GitHub #530)  the plan's picks on the host, for the body's shapes at 2048 to 8192
+//            tokens on 82, 128 and 170 SMs; and every tile height, depth and raster against the
+//            op's own plan, every BF16 byte, for every body shape at 1, 300, 2048 and 2049 tokens
+//            through each epilogue.
 //   shared workspace  the fused op's decode route on the workspace a dense call used gives its
 //            fresh workspace's bits: the dense call leaves the fused op's counters alone.
 //   fused producers (GitHub #511)  A8 fused into the RMSnorm that produces its input, against
@@ -869,6 +873,196 @@ void fused_producers_arm() {
   check(ignis_dense_prefill_fused_producers() == 1, "the switch turns them back on");
 }
 
+// The body's matrix shapes [out x in] (bench_dense_prefill.cu's mix): the GDN layers' qkv and z,
+// the output projection of both layer kinds (one shape), the attention's q and its k and v, the
+// MLP's gate and up (one shape) and its down; each at a K class the quant gives it.
+struct BodyShape {
+  const char *name;
+  uint32_t in, out, k2;
+};
+const BodyShape kBody[] = {
+    {"gdn qkv", 5120, 10240, 6}, {"gdn z", 5120, 6144, 6},         {"gdn out, gqa o", 6144, 5120, 6},
+    {"gqa q", 5120, 12288, 4},   {"gqa k, v", 5120, 1024, 8},      {"mlp gate, up", 5120, 17408, 6},
+    {"mlp down", 17408, 5120, 6},
+};
+
+// GitHub #530: the tile plan's picks, on the host. Each body shape at 2048, 4096, 6656 and 8192
+// tokens on 82, 128 and 170 SMs, one resident CTA per SM at every tile height and depth (what the
+// RTX 5090 reports at each). The tile heights below are worked out by hand from the plan's rule:
+// a 128-row tile weighs 1.10 times a 256-row tile per row, so BM 128 only where its waves x rows,
+// times 1.10, stay under 256's. mlp gate, up at 2048 tokens on 170 SMs: 16 x 136 = 2,176 tiles of
+// 128 rows in 13 waves, 1,664 rows, x 1.10 = 1,830, against 8 x 136 = 1,088 tiles of 256 in 7
+// waves, 1,792 rows: BM 256, where the waves x rows alone took 128.
+void plan_arm() {
+  std::printf("the tile plan: its picks on the host\n");
+  const uint32_t widths[4] = {2048, 4096, 6656, 8192};
+  const int sms[3] = {82, 128, 170};
+  // [SM count][body shape][width]: the tile height.
+  const int want[3][7][4] = {
+      {
+          {256, 256, 256, 256},  // gdn qkv
+          {256, 256, 256, 256},  // gdn z
+          {256, 256, 256, 256},  // gdn out, gqa o
+          {256, 256, 256, 256},  // gqa q
+          {256, 256, 256, 128},  // gqa k, v
+          {256, 256, 256, 256},  // mlp gate, up
+          {256, 256, 256, 256},  // mlp down
+      },
+      {
+          {256, 256, 256, 256},
+          {256, 256, 256, 256},
+          {128, 256, 256, 256},
+          {256, 256, 256, 256},
+          {128, 256, 256, 256},
+          {256, 256, 256, 256},
+          {128, 256, 256, 256},
+      },
+      {
+          {256, 256, 256, 256},
+          {128, 256, 256, 256},
+          {256, 256, 256, 256},
+          {256, 256, 256, 256},
+          {128, 256, 128, 256},
+          {256, 256, 256, 256},
+          {256, 256, 256, 256},
+      },
+  };
+  auto at = [](int sm_count, const BodyShape &s, uint32_t tokens) {
+    ignis_dense::State st;
+    st.sms = sm_count;
+    st.resident[0][0] = st.resident[0][1] = st.resident[1][0] = st.resident[1][1] = 1;
+    return ignis_dense::plan(st, tokens, s.in, s.out);
+  };
+  int wrong = 0;
+  for (int c = 0; c < 3; ++c)
+    for (int i = 0; i < 7; ++i)
+      for (int j = 0; j < 4; ++j) {
+        const BodyShape &s = kBody[i];
+        const ignis_dense::Plan p = at(sms[c], s, widths[j]);
+        // The depth follows the tile height: 4 stages for BM 128 or a K of 8192 or more.
+        const int stages = want[c][i][j] == 128 || s.in >= 8192 ? 4 : 3;
+        const bool ok = p.bm == want[c][i][j] && p.stages == stages;
+        wrong += ok ? 0 : 1;
+        check(ok, "the tile plan: " + std::string(s.name) + " at " + std::to_string(widths[j]) + " tokens on " +
+                      std::to_string(sms[c]) + " SMs takes BM " + std::to_string(want[c][i][j]) + ", " + std::to_string(stages) +
+                      " stages (got BM " + std::to_string(p.bm) + ", " + std::to_string(p.stages) + ")");
+      }
+  std::printf("  84 picks (7 shapes, 4 widths, 82, 128 and 170 SMs): %d differ from the rule's\n", wrong);
+  // The cases the RTX 5090's sweep showed (#530), on its 170 SMs.
+  check(at(170, kBody[5], 2048).bm == 256, "the tile plan: mlp gate, up at 2048 tokens on 170 SMs takes BM 256 "
+                                           "(BM 128 took 8.8-10.0% longer there)");
+  check(at(170, kBody[4], 2048).bm == 128, "the tile plan: gqa k, v at 2048 tokens on 170 SMs keeps BM 128 "
+                                           "(BM 256 took 82% longer there)");
+  check(at(170, kBody[6], 6656).bm == 256, "the tile plan: mlp down at 6656 tokens on 170 SMs takes BM 256 "
+                                           "(BM 128 took 8% longer there)");
+}
+
+bool bf16_nan(uint16_t v) { return (v & 0x7F80u) == 0x7F80u && (v & 0x007Fu) != 0; }
+
+// GitHub #530: every tile plan writes the bytes of the plan the op picks. The integer GEMM is
+// exact and the epilogue works per element on the same int32s and the same scales, so the eight
+// plans (two tile heights x two depths x two rasters) must agree to the byte. Each body shape, a
+// synthetic matrix decoded once, at 1, 300, 2048 (a multiple of 256) and 2049 tokens, through
+// every epilogue: the store, the residual add, SwiGLU's two passes (the gate pass then the up
+// pass, both of this matrix at the plan under test) and the query/gate split into 256-column
+// halves. y starts as NaN, but for the add, where it holds the same residual at every plan, and
+// the op's own output holds no NaN, so a column a plan misses differs. Each BF16 output is held
+// to the op's own (ignis_dense_prefill_gemm) with memcmp.
+void plans_arm() {
+  std::printf("tile plans: the 8 plans' BF16 outputs against the op's own plan, every body shape and epilogue\n");
+  ignis_dense::State st;
+  check(ignis_dense::state("test", &st) == 0, "the device is prepared");
+  struct Epilogue {
+    const char *name;
+    uint32_t epilogue, split;
+  };
+  const Epilogue epilogues[4] = {{"store", IGNIS_TRELLIS_STORE, 0},
+                                 {"add", IGNIS_TRELLIS_ADD, 0},
+                                 {"SwiGLU", IGNIS_DENSE_PREFILL_SWIGLU_UP, 0},
+                                 {"split", IGNIS_TRELLIS_STORE, 256}};
+  uint32_t stream = 8000;
+  for (const BodyShape &s : kBody) {
+    stream += 10;
+    Matrix m = synthetic(s.k2, s.in, s.out, stream);
+    const uint64_t dense_bytes = ignis_dense_prefill_weight_bytes(s.in, s.out);
+    DeviceBytes d_dense(dense_bytes);
+    TL_RC(ignis_dense_prefill_decode(&m.w, d_dense.p, dense_bytes, nullptr));
+    for (const int tokens : {1, 300, 2048, 2049}) {
+      const uint32_t t = static_cast<uint32_t>(tokens);
+      const std::vector<uint16_t> xh = standin_x(tokens, static_cast<int>(s.in), stream + 1);
+      DeviceBytes d_x(xh.size() * 2);
+      upload(d_x, xh);
+      DeviceA8 a(tokens, static_cast<int>(s.in));
+      const ignis_trellis_weight *wl[1] = {&m.w};
+      TL_RC(ignis_dense_prefill_quantize(d_x.p, t, wl, 1, &a.a, nullptr));
+      // y [tokens][out], or under the split its two halves [tokens][out / 2] one after the other.
+      const size_t elems = static_cast<size_t>(tokens) * s.out;
+      DeviceBytes d_y(2 * elems), d_residual(2 * elems);
+      std::vector<uint16_t> residual(elems);
+      for (size_t k = 0; k < elems; ++k) residual[k] = moe_test::f32_to_bf16(moe_test::hash_uniform(stream + 2, k, 0.8f));
+      upload(d_residual, residual);
+      // One epilogue's output: y reset, then the GEMM at `p` (the op's own plan when null).
+      auto run = [&](const Epilogue &e, const ignis_dense::Plan *p) {
+        if (e.epilogue == IGNIS_TRELLIS_ADD) {
+          MOE_CUDA(cudaMemcpy(d_y.p, d_residual.p, d_y.bytes, cudaMemcpyDeviceToDevice));
+        } else {
+          MOE_CUDA(cudaMemset(d_y.p, 0xFF, d_y.bytes));
+        }
+        auto gemm = [&](const ignis_dense_prefill_output &o) {
+          if (p == nullptr) {
+            TL_RC(ignis_dense_prefill_gemm(&m.w, d_dense.p, &a.a, t, &o, nullptr));
+          } else {
+            TL_RC(ignis_dense::gemm_at("test", *p, &m.w, d_dense.p, &a.a, t, &o, nullptr, 0, nullptr));
+          }
+        };
+        if (e.split != 0) {
+          gemm(ignis_dense_prefill_output{d_y.p, s.out / 2, e.epilogue, e.split, 0, static_cast<uint16_t *>(d_y.p) + elems / 2});
+        } else {
+          // SwiGLU's up pass reads the gate pass's output from y.
+          if (e.epilogue == IGNIS_DENSE_PREFILL_SWIGLU_UP) {
+            gemm(ignis_dense_prefill_output{d_y.p, s.out, IGNIS_TRELLIS_STORE, 0, 0, nullptr});
+          }
+          gemm(ignis_dense_prefill_output{d_y.p, s.out, e.epilogue, 0, 0, nullptr});
+        }
+        MOE_CUDA(cudaDeviceSynchronize());
+        return download<uint16_t>(d_y.p, elems);
+      };
+      const ignis_dense::Plan own = ignis_dense::plan(st, t, s.in, s.out);
+      size_t worst = 0;
+      for (const Epilogue &e : epilogues) {
+        const std::vector<uint16_t> want = run(e, nullptr);
+        const size_t nans = static_cast<size_t>(std::count_if(want.begin(), want.end(), bf16_nan));
+        const std::string what = std::string(s.name) + " [" + std::to_string(s.out) + " x " + std::to_string(s.in) + "] at T " +
+                                 std::to_string(tokens) + ", " + e.name;
+        check(nans == 0, "tile plans: " + what + ": the op's own output holds no NaN (" + std::to_string(nans) + ")");
+        for (const int bm : ignis_dense::kTileHeights)
+          for (const int stages : ignis_dense::kDepths)
+            for (const int raster : {ignis_dense::kTokensFastest, ignis_dense::kOutputsFastest}) {
+              ignis_dense::Plan p;
+              p.bm = bm;
+              p.stages = stages;
+              p.raster = raster;
+              const std::vector<uint16_t> got = run(e, &p);
+              size_t bytes = 0;
+              if (std::memcmp(got.data(), want.data(), 2 * elems) != 0) {
+                const unsigned char *g = reinterpret_cast<const unsigned char *>(got.data());
+                const unsigned char *w = reinterpret_cast<const unsigned char *>(want.data());
+                for (size_t k = 0; k < 2 * elems; ++k) bytes += g[k] != w[k];
+              }
+              worst = std::max(worst, bytes);
+              check(bytes == 0, "tile plans: " + what + ": BM " + std::to_string(bm) + ", " + std::to_string(stages) +
+                                    " stages, raster " + std::to_string(raster) + " writes the op's bytes (" +
+                                    std::to_string(bytes) + " bytes differ)");
+            }
+      }
+      std::printf("  %s [%u x %u] at T %d (the op's plan: BM %d, %d stages, %s fastest): store, add, SwiGLU and split at the "
+                  "8 plans: at most %zu bytes differ\n",
+                  s.name, s.out, s.in, tokens, own.bm, own.stages, own.raster == ignis_dense::kTokensFastest ? "tokens" : "outputs",
+                  worst);
+    }
+  }
+}
+
 void synthetic_arm() {
   std::printf("synthetic: counter-hash words at every K class\n");
   // Every K class, the 256-token tile's tail (300 = 256 + 44) and both A8 row kernels' widths.
@@ -1093,7 +1287,9 @@ int main() {
   std::printf("dense prefill vs exact references (compute capability %d.%d)\n", major, minor);
   TL_RC(ignis_trellis_prepare());
   TL_RC(ignis_dense_prefill_prepare());
+  plan_arm();
   synthetic_arm();
+  plans_arm();
   fused_producers_arm();
   shared_workspace_arm();
   rejects_arm();

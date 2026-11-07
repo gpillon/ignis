@@ -36,8 +36,9 @@ struct State {
 int32_t state(const char *op, State *out);
 
 // The tile plan of a call (the rule ignis_dense_prefill_gemm runs):
-//   bm      128 when its last wave fills the resident CTAs strictly better than 256's, else 256
-//           (the larger tile reuses each operand twice as much);
+//   bm      128 when its waves of resident CTAs times its rows, weighed at 1.10 for what a row
+//           costs in the smaller tile (GitHub #530), stay under 256's, else 256 (the larger tile
+//           reuses each operand twice as much);
 //   stages  4 for a 128-token tile or a K of 8192 or more (the longest main loops), else 3;
 //   raster  output tiles fastest when the activations outweigh the matrix (tokens > out), so
 //           the larger operand is the one each wave reads once; token tiles fastest otherwise.
