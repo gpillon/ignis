@@ -2,7 +2,7 @@
 # The behavioural test of mk/linux/doctor.sh (`make doctor-selftest`), the
 # CUDA half of `make doctor` on Linux (GitHub #498). It builds fake CUDA
 # roots in both layouts (a toolkit's lib64, an environment's
-# targets/<arch>-linux) and a fake cmake on PATH, and reads what the report
+# targets/<arch>-linux) and a fake cmake named by $CMAKE, and reads what the report
 # says of each. It needs no CUDA toolkit and no GPU, and runs under any bash.
 # It writes only under a temporary directory it removes.
 
@@ -28,8 +28,9 @@ with_cmake() {
         chmod +x "$bin/cmake"
     fi
 }
-# The report on root $1, with only the fake cmake and the base tools on PATH.
-report() { PATH="$bin:/usr/bin:/bin" bash mk/linux/doctor.sh "$1" 2>&1; }
+# The report on root $1, with the fake cmake as $CMAKE: a path that is not
+# there when there is none, so a cmake installed on the machine is not read.
+report() { CMAKE="$bin/cmake" bash mk/linux/doctor.sh "$1" 2>&1; }
 
 has() { # <label> <report> <line prefix>
     printf '%s\n' "$2" | grep -qF -- "$3" || fail "$1: no line with '$3' in:
@@ -75,6 +76,9 @@ has "bare" "$out" "  optional libcudart.so not in $bare/lib64 or $bare/targets/$
 has "bare" "$out" "  optional nvml.h not in $bare/include or $bare/targets/$arch-linux/include"
 has "bare" "$out" "  optional nvtx3/nvToolsExt.h not in $bare/include or $bare/targets/$arch-linux/include"
 has "no toolkit" "$(report "$tmp/nowhere")" "  optional nvcc not under $tmp/nowhere"
+# A directory under a file's name is not that file.
+mkdir -p "$bare/lib64/libcudart.so"
+has "a directory named libcudart.so" "$(report "$bare")" "  optional libcudart.so not in $bare/lib64"
 
 # CMake against kernel/CMakeLists.txt's minimum, whatever it is.
 minimum="$(sed -n 's/^cmake_minimum_required(VERSION \([0-9.]*\)).*/\1/p' kernel/CMakeLists.txt)"

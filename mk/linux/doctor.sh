@@ -11,7 +11,8 @@
 #   - nvml.h and nvtx3/nvToolsExt.h, which the kernel leaf includes
 #     (kernel/src/device.cu, the vendored core/nvtx.h) and an incomplete CUDA
 #     environment can lack;
-#   - cmake, against the minimum kernel/CMakeLists.txt asks for.
+#   - cmake ($CMAKE, else the one on PATH), against the minimum
+#     kernel/CMakeLists.txt asks for.
 # Every line is advice for CUDA=1, so it never fails the doctor. Tested by
 # mk/linux/doctor-selftest.sh.
 
@@ -25,7 +26,9 @@ targets="$cuda/targets/$(uname -m)-linux"
 either() {
     local what="$1" dir
     for dir in "$2" "$3"; do
-        if [ -e "$dir/$what" ]; then
+        # A file, as build.rs's cudart_dir takes it: a directory under the
+        # name is no library and no header.
+        if [ -f "$dir/$what" ]; then
             printf '  ok       %s (%s)\n' "$what" "$dir"
             return
         fi
@@ -45,7 +48,7 @@ either nvtx3/nvToolsExt.h "$cuda/include" "$targets/include"
 
 echo "cmake:"
 minimum="$(sed -n 's/^cmake_minimum_required(VERSION \([0-9.]*\)).*/\1/p' "$repo/kernel/CMakeLists.txt")"
-version="$(cmake --version 2>/dev/null | sed -n '1s/^cmake version \([0-9][0-9.]*\).*/\1/p')"
+version="$("${CMAKE:-cmake}" --version 2>/dev/null | sed -n '1s/^cmake version \([0-9][0-9.]*\).*/\1/p')"
 if [ -z "$version" ]; then
     echo "  optional cmake not found ($minimum or newer; CUDA=1 only)"
 elif [ "$(printf '%s\n' "$minimum" "$version" | sort -V | head -n 1)" = "$minimum" ]; then
