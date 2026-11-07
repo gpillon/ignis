@@ -9,7 +9,10 @@
 //! macOS, through [`std::fs::File::try_lock`], and `LockFileEx` on Windows.
 //! The kernel holds it for the open file and drops it when the file is
 //! closed — when the fetch ends, whichever way, and when the process holding
-//! it dies, killed or crashed — so a lock never outlives its holder. The file
+//! it dies, killed or crashed — so a lock never outlives its holder. A fetch
+//! that ends releases it by name before the close: on Linux and macOS a
+//! process spawned meanwhile shares the open file until its exec, and the
+//! close alone would leave the lock held that long (GitHub #492). The file
 //! itself stays, empty, for the next fetch of the entry to lock again:
 //! deleting it on the way out would let a taker that opened it just before
 //! lock a file no longer in the folder while a third locks a new one under
@@ -138,10 +141,28 @@ impl EntryLock {
 
 impl Drop for EntryLock {
     /// The note goes before the lock does: the file stays empty for the next.
+    /// Then the lock goes by name, not with the file's close (GitHub #492):
+    /// a process spawned meanwhile shares the open description `flock`
+    /// belongs to until its exec, so a close alone would leave the entry held
+    /// for that while, and a fetch right after refused.
     fn drop(&mut self) {
         let _ = self.file.set_len(0);
+        unlock(&self.file);
     }
 }
+
+/// Release `file`'s lock on its open description, whoever else holds that
+/// description: `flock(LOCK_UN)` through std.
+#[cfg(not(windows))]
+fn unlock(file: &File) {
+    let _ = file.unlock();
+}
+
+/// Windows needs no unlock by name: `LockFileEx` locks belong to the handle,
+/// which a spawned process never inherits (std opens none inheritable), and
+/// closing it releases them.
+#[cfg(windows)]
+fn unlock(_: &File) {}
 
 /// The holder's note in an open lock file, its first line: `None` when
 /// there is none to read.

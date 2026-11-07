@@ -1173,8 +1173,12 @@ async fn a_response_running_or_queued_keeps_its_socket_open_and_the_idle_time_co
 #[tokio::test]
 async fn pings_do_not_keep_an_idle_socket_open() {
     let live = live(server(&Script::new(HashMap::new()), SchedulerConfig::default(), plain()).with_socket_idle_close(IDLE)).await;
-    let mut socket = socket(&live).await;
+    // GitHub #492: before the upgrade. The server's idle time starts when it
+    // builds the socket's handler, during the upgrade and so before
+    // `socket` returns: a clock taken after it starts late, and read the
+    // close as early by the handshake's tail.
     let opened = std::time::Instant::now();
+    let mut socket = socket(&live).await;
     let frame = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             socket.send(Message::Ping(Default::default())).await.expect("ping");
