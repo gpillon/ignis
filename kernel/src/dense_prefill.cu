@@ -791,12 +791,13 @@ int32_t state(const char *op, State *out) {
 // warp tile issues 6 ldmatrix per 16 MMAs against 8 per 32 and loads 1.33x the shared-memory bytes
 // per MAC, so on a card with full-rate INT8 the shared memory and the L2 stop hiding under the
 // MMAs. Measured 2026-11-07 on the RTX 5090 with ignis_kernel_dense_prefill_bench --tokens
-// 2048,4096,8192 --sweep and --tokens 6656 --sweep: costing both tile heights alike, the plan lost
-// 4.9-5.2% of the dense body (GEMM + A8) against the fastest of the eight plans at 2048 tokens,
-// 0.7-1.0% at 4096, 2.2-2.7% at 8192 and 4.1% at 6656; at 110 the same rows put it within 1.1% at
-// every width, and the plan built with it measured within 1.2%
-// (docs/findings/2026-11-07-dense-prefill-tile-plan-weighs-a-128-row-tile.md). Not BM 256
-// everywhere: at 2048 tokens gqa k, v takes 82% longer on it.
+// 2048,4096,8192 --sweep and --tokens 6656 --sweep, two passes each, as the finding records them
+// (docs/findings/2026-11-07-dense-prefill-tile-plan-weighs-a-128-row-tile.md): costing both tile
+// heights alike, the plan lost 4.8-4.9% of the dense body (decode, GEMM and A8) against the
+// fastest of the eight plans at 2048 tokens, 0.5-1.1% at 4096, 2.2-2.5% at 8192 and 4.2% at 6656;
+// at 110 the plan measured within 1.2% at every width, and on the rows before, every weight from
+// 1.08 to 1.18 picks the same plans. Not BM 256 everywhere: at 2048 tokens gqa k, v takes 82-83%
+// longer on it.
 constexpr long long kTile128RowCostPercent = 110;
 static_assert(kTile128RowCostPercent >= 100, "a 128-row tile reuses each operand half as much as a 256-row one");
 

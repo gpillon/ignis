@@ -885,6 +885,8 @@ const BodyShape kBody[] = {
     {"gqa q", 5120, 12288, 4},   {"gqa k, v", 5120, 1024, 8},      {"mlp gate, up", 5120, 17408, 6},
     {"mlp down", 17408, 5120, 6},
 };
+// Where the shapes of the sweep's pinned cases sit in kBody.
+constexpr size_t kGqaKv = 4, kMlpGateUp = 5, kMlpDown = 6;
 
 // GitHub #530: the tile plan's picks, on the host. Each body shape at 2048, 4096, 6656 and 8192
 // tokens on 82, 128 and 170 SMs, one resident CTA per SM at every tile height and depth (what the
@@ -895,11 +897,12 @@ const BodyShape kBody[] = {
 // waves, 1,792 rows: BM 256, where the waves x rows alone took 128.
 void plan_arm() {
   std::printf("the tile plan: its picks on the host\n");
-  const uint32_t widths[4] = {2048, 4096, 6656, 8192};
-  const int sms[3] = {82, 128, 170};
+  constexpr uint32_t widths[] = {2048, 4096, 6656, 8192};
+  constexpr int sms[] = {82, 128, 170};
   // [SM count][body shape][width]: the tile height.
-  const int want[3][7][4] = {
+  const int want[std::size(sms)][std::size(kBody)][std::size(widths)] = {
       {
+          // 82 SMs
           {256, 256, 256, 256},  // gdn qkv
           {256, 256, 256, 256},  // gdn z
           {256, 256, 256, 256},  // gdn out, gqa o
@@ -909,36 +912,38 @@ void plan_arm() {
           {256, 256, 256, 256},  // mlp down
       },
       {
-          {256, 256, 256, 256},
-          {256, 256, 256, 256},
-          {128, 256, 256, 256},
-          {256, 256, 256, 256},
-          {128, 256, 256, 256},
-          {256, 256, 256, 256},
-          {128, 256, 256, 256},
+          // 128 SMs
+          {256, 256, 256, 256},  // gdn qkv
+          {256, 256, 256, 256},  // gdn z
+          {128, 256, 256, 256},  // gdn out, gqa o
+          {256, 256, 256, 256},  // gqa q
+          {128, 256, 256, 256},  // gqa k, v
+          {256, 256, 256, 256},  // mlp gate, up
+          {128, 256, 256, 256},  // mlp down
       },
       {
-          {256, 256, 256, 256},
-          {128, 256, 256, 256},
-          {256, 256, 256, 256},
-          {256, 256, 256, 256},
-          {128, 256, 128, 256},
-          {256, 256, 256, 256},
-          {256, 256, 256, 256},
+          // 170 SMs
+          {256, 256, 256, 256},  // gdn qkv
+          {128, 256, 256, 256},  // gdn z
+          {256, 256, 256, 256},  // gdn out, gqa o
+          {256, 256, 256, 256},  // gqa q
+          {128, 256, 128, 256},  // gqa k, v
+          {256, 256, 256, 256},  // mlp gate, up
+          {256, 256, 256, 256},  // mlp down
       },
   };
-  auto at = [](int sm_count, const BodyShape &s, uint32_t tokens) {
+  auto plan_at = [](int sm_count, const BodyShape &s, uint32_t tokens) {
     ignis_dense::State st;
     st.sms = sm_count;
     st.resident[0][0] = st.resident[0][1] = st.resident[1][0] = st.resident[1][1] = 1;
     return ignis_dense::plan(st, tokens, s.in, s.out);
   };
   int wrong = 0;
-  for (int c = 0; c < 3; ++c)
-    for (int i = 0; i < 7; ++i)
-      for (int j = 0; j < 4; ++j) {
+  for (size_t c = 0; c < std::size(sms); ++c)
+    for (size_t i = 0; i < std::size(kBody); ++i)
+      for (size_t j = 0; j < std::size(widths); ++j) {
         const BodyShape &s = kBody[i];
-        const ignis_dense::Plan p = at(sms[c], s, widths[j]);
+        const ignis_dense::Plan p = plan_at(sms[c], s, widths[j]);
         // The depth follows the tile height: 4 stages for BM 128 or a K of 8192 or more.
         const int stages = want[c][i][j] == 128 || s.in >= 8192 ? 4 : 3;
         const bool ok = p.bm == want[c][i][j] && p.stages == stages;
@@ -947,14 +952,16 @@ void plan_arm() {
                       std::to_string(sms[c]) + " SMs takes BM " + std::to_string(want[c][i][j]) + ", " + std::to_string(stages) +
                       " stages (got BM " + std::to_string(p.bm) + ", " + std::to_string(p.stages) + ")");
       }
-  std::printf("  84 picks (7 shapes, 4 widths, 82, 128 and 170 SMs): %d differ from the rule's\n", wrong);
-  // The cases the RTX 5090's sweep showed (#530), on its 170 SMs.
-  check(at(170, kBody[5], 2048).bm == 256, "the tile plan: mlp gate, up at 2048 tokens on 170 SMs takes BM 256 "
-                                           "(BM 128 took 8.8-10.0% longer there)");
-  check(at(170, kBody[4], 2048).bm == 128, "the tile plan: gqa k, v at 2048 tokens on 170 SMs keeps BM 128 "
-                                           "(BM 256 took 82% longer there)");
-  check(at(170, kBody[6], 6656).bm == 256, "the tile plan: mlp down at 6656 tokens on 170 SMs takes BM 256 "
-                                           "(BM 128 took 8% longer there)");
+  std::printf("  %zu picks (%zu shapes, %zu widths, 82, 128 and 170 SMs): %d differ from the rule's\n",
+              std::size(sms) * std::size(kBody) * std::size(widths), std::size(kBody), std::size(widths), wrong);
+  // The cases the RTX 5090's sweep showed (#530), on its 170 SMs, at the figures of
+  // docs/findings/2026-11-07-dense-prefill-tile-plan-weighs-a-128-row-tile.md.
+  check(plan_at(170, kBody[kMlpGateUp], 2048).bm == 256, "the tile plan: mlp gate, up at 2048 tokens on 170 SMs takes BM 256 "
+                                                         "(BM 128 took 7.8-8.9% longer there)");
+  check(plan_at(170, kBody[kGqaKv], 2048).bm == 128, "the tile plan: gqa k, v at 2048 tokens on 170 SMs keeps BM 128 "
+                                                     "(BM 256 took 82-83% longer there)");
+  check(plan_at(170, kBody[kMlpDown], 6656).bm == 256, "the tile plan: mlp down at 6656 tokens on 170 SMs takes BM 256 "
+                                                       "(BM 128 took 9.2-9.3% longer there)");
 }
 
 bool bf16_nan(uint16_t v) { return (v & 0x7F80u) == 0x7F80u && (v & 0x007Fu) != 0; }
@@ -1043,20 +1050,16 @@ void plans_arm() {
               p.stages = stages;
               p.raster = raster;
               const std::vector<uint16_t> got = run(e, &p);
-              size_t bytes = 0;
-              if (std::memcmp(got.data(), want.data(), 2 * elems) != 0) {
-                const unsigned char *g = reinterpret_cast<const unsigned char *>(got.data());
-                const unsigned char *w = reinterpret_cast<const unsigned char *>(want.data());
-                for (size_t k = 0; k < 2 * elems; ++k) bytes += g[k] != w[k];
-              }
-              worst = std::max(worst, bytes);
-              check(bytes == 0, "tile plans: " + what + ": BM " + std::to_string(bm) + ", " + std::to_string(stages) +
+              // memcmp holds every byte; on a mismatch, differing() counts the BF16 values behind it.
+              const size_t diffs = std::memcmp(got.data(), want.data(), 2 * elems) == 0 ? 0 : differing(got, want);
+              worst = std::max(worst, diffs);
+              check(diffs == 0, "tile plans: " + what + ": BM " + std::to_string(bm) + ", " + std::to_string(stages) +
                                     " stages, raster " + std::to_string(raster) + " writes the op's bytes (" +
-                                    std::to_string(bytes) + " bytes differ)");
+                                    std::to_string(diffs) + " BF16 values differ)");
             }
       }
       std::printf("  %s [%u x %u] at T %d (the op's plan: BM %d, %d stages, %s fastest): store, add, SwiGLU and split at the "
-                  "8 plans: at most %zu bytes differ\n",
+                  "8 plans: at most %zu BF16 values differ\n",
                   s.name, s.out, s.in, tokens, own.bm, own.stages, own.raster == ignis_dense::kTokensFastest ? "tokens" : "outputs",
                   worst);
     }
