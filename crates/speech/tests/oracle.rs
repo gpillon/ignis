@@ -508,6 +508,8 @@ fn our_reader_reads_every_catalog_file_and_our_q8_0_is_ggml_orgs() {
 
 /// Acceptance 4's `--ignored` leg: every kernel and tile shape within 1e-5 of the fp64 reference
 /// on the catalog files' own tensors (their first 64 rows), M = 1, 7, 104 and 512.
+/// The tile shapes are `avx2`'s, a module only an x86_64 build has (GitHub #496).
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore]
 fn kernels_match_fp64_on_the_catalog_tensors() {

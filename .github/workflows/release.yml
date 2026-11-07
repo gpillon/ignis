@@ -223,6 +223,34 @@ jobs:
           npm run typecheck
           npm run test
 
+  # The workspace compiles on a Mac (GitHub #496): arm64, the hardware a Metal
+  # backend would run on (#439). macOS is not a target, so this checks and
+  # runs nothing -- libraries, binaries, tests and examples compile without
+  # the `cuda` feature -- and it blocks nothing: no job needs it, and
+  # continue-on-error keeps a failure here from failing the run, so a `ci/**`
+  # dry run stays the signal a tag is cut on. A tag's run skips it, so the
+  # `success` docs.yml waits for before it deploys the guide never hangs on
+  # it either. It publishes nothing. A test holds it to this shape
+  # (crates/server/tests/macos_check_job.rs).
+  macos:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-macos
+
+      - name: cargo check (macOS, no CUDA)
+        shell: bash
+        run: cargo check --workspace --all-targets --locked --target aarch64-apple-darwin
+
   # Linux binaries and the container image, from one Containerfile and one
   # compile (ADR 0032, revised 2026-09-21). The `artifacts` stage holds
   # exactly the binaries the `runtime` image runs, so the tarball and the

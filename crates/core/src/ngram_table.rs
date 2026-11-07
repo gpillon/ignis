@@ -623,7 +623,8 @@ impl NgramTable {
     }
 
     /// Whether the reads bypass the page cache (false only where the file
-    /// system refuses unbuffered reads).
+    /// system refuses unbuffered reads, and on macOS, which has no
+    /// `O_DIRECT`: GitHub #496).
     pub fn is_unbuffered(&self) -> bool {
         self.pool.unbuffered
     }

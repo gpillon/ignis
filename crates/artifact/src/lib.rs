@@ -948,7 +948,10 @@ mod direct_io {
 
 #[cfg(unix)]
 mod direct_io {
+    #[cfg(target_os = "linux")]
     use libc::{close, open, pread, O_CLOEXEC, O_DIRECT, O_RDONLY};
+    #[cfg(not(target_os = "linux"))]
+    use libc::{close, open, pread, O_CLOEXEC, O_RDONLY};
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -967,7 +970,14 @@ mod direct_io {
             // what the CI test job found the first time it ran.
             let path = CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+            #[cfg(target_os = "linux")]
             let fd = unsafe { open(path.as_ptr(), O_RDONLY | O_CLOEXEC | O_DIRECT) };
+            // macOS has no O_DIRECT: any unix but Linux opens the file
+            // buffered, through the page cache, which no flag asks for
+            // (GitHub #496). A Mac loads no weights until a Metal backend
+            // exists (#439).
+            #[cfg(not(target_os = "linux"))]
+            let fd = unsafe { open(path.as_ptr(), O_RDONLY | O_CLOEXEC) };
             if fd < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -1299,7 +1309,8 @@ impl Reader {
     }
 
     /// Read `destination.len()` bytes at an absolute file offset via direct
-    /// I/O (bypasses the page cache).
+    /// I/O (bypasses the page cache; on macOS, which has no `O_DIRECT`, the
+    /// read is buffered, GitHub #496).
     ///
     /// The offset, the buffer length, and the buffer address must all be
     /// aligned to [`DIRECT_IO_ALIGNMENT`] (4096). Returns the bytes read; a

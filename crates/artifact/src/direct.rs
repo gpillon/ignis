@@ -5,7 +5,8 @@
 //! [`DirectReader`] opens its own handle that bypasses the page cache
 //! (`FILE_FLAG_NO_BUFFERING` on Windows, `O_DIRECT` on Linux, falling back to
 //! a buffered handle where the file system refuses `O_DIRECT`, as tmpfs
-//! does) and reads at an explicit offset, so any number of threads can share
+//! does; macOS has no `O_DIRECT`, so any other unix opens buffered, GitHub
+//! #496) and reads at an explicit offset, so any number of threads can share
 //! one reader or each open its own: no read moves a shared file pointer.
 //! The rules are the platform's: offset, length and buffer address on a
 //! [`crate::DIRECT_IO_ALIGNMENT`] boundary ([`AlignedBuffer`] gives such a
@@ -88,6 +89,7 @@ pub struct DirectReader {
 
 impl DirectReader {
     /// Open `path` for unbuffered reads.
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn open(path: &Path) -> Result<Self> {
         let open = |flags: Option<u32>| {
             let mut options = OpenOptions::new();
@@ -107,6 +109,14 @@ impl DirectReader {
             }),
             Err(e) => Err(fail(format!("open {} unbuffered: {e}", path.display()))),
         }
+    }
+
+    /// Open `path` for reads through the page cache: macOS has no
+    /// `O_DIRECT` (GitHub #496). The alignment rules still hold for callers.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path).map_err(|e| fail(format!("open {}: {e}", path.display())))?;
+        Ok(Self { file, unbuffered: false })
     }
 
     /// Whether reads bypass the page cache.
@@ -176,6 +186,7 @@ pub struct DirectWriter {
 
 impl DirectWriter {
     /// Create `path`, which must not exist, for unbuffered writes.
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn create(path: &Path) -> Result<Self> {
         let create = |flags: Option<u32>| {
             let mut options = OpenOptions::new();
@@ -193,6 +204,18 @@ impl DirectWriter {
             }),
             Err(e) => Err(fail(format!("create {} unbuffered: {e}", path.display()))),
         }
+    }
+
+    /// Create `path`, which must not exist, for writes through the page
+    /// cache: macOS has no `O_DIRECT` (GitHub #496).
+    #[cfg(all(unix, not(target_os = "linux")))]
+    pub fn create(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| fail(format!("create {}: {e}", path.display())))?;
+        Ok(Self { file, unbuffered: false })
     }
 
     /// Whether writes bypass the page cache.
@@ -288,7 +311,7 @@ fn write_at(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
 
 #[cfg(windows)]
 const UNBUFFERED_FLAG: u32 = windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const UNBUFFERED_FLAG: u32 = libc::O_DIRECT as u32;
 
 #[cfg(windows)]
@@ -297,7 +320,7 @@ fn set_flags(options: &mut OpenOptions, flags: u32) {
     options.custom_flags(flags);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn set_flags(options: &mut OpenOptions, flags: u32) {
     use std::os::unix::fs::OpenOptionsExt;
     options.custom_flags(flags as i32);
@@ -320,7 +343,7 @@ fn refuses_unbuffered(_: &std::io::Error) -> bool {
     false
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn refuses_unbuffered(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(libc::EINVAL)
 }

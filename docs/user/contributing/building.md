@@ -147,6 +147,11 @@ container image is built from. Some `make` targets are still Windows-only there
 — background server control (`start` / `stop` / `dev-ui`) and the GPU test
 profile; `mk/os/linux.mk` names them.
 
+macOS is not a target: a Mac compiles the workspace without `cuda`
+(`cargo check --workspace --all-targets --target aarch64-apple-darwin`) and
+runs nothing, and CI checks that on every code push to `main` or `ci/**`
+without ever blocking the run (#496).
+
 ## Tests
 
 ```
