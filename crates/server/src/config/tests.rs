@@ -2269,10 +2269,13 @@ fn a_vision_envelope_without_vision_is_refused_rather_than_ignored() {
 /// GitHub #491: `--vision-enabled false` (what `make VISION=0` passes) turns
 /// off the vision every built-in profile turns on, and a start under it fits
 /// the 27B and Flash-Next alike; the envelope beside it is refused as it is
-/// without vision.
+/// without vision. That every built-in profile turns it on is what
+/// `mk/config.mk` and the guide's make page say an empty `VISION` leaves.
 #[test]
 fn vision_enabled_false_turns_a_profiles_vision_off_on_both_models() {
-    for profile in ["rtx5090", "rtxpro6000", "rtx-24gb", "rtx-16gb"] {
+    let profiles = profile::built_in();
+    assert!(profiles.len() >= 4, "{:?}", profiles.keys());
+    for profile in profiles.keys().map(String::as_str) {
         assert!(config(&["--profile", profile]).vision.is_some(), "{profile} turns vision on");
         let off = config(&["--profile", profile, "--vision-enabled", "false"]);
         assert_eq!(off.vision, None, "{profile}");
