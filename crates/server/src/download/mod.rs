@@ -216,10 +216,7 @@ pub fn served_start_options(
 /// refusal stays as it was.
 pub fn sidecar_fetch_command(catalog: &Catalog, artifact: &Path, catalog_file: Option<&Path>) -> Option<String> {
     let name = artifact.file_name()?.to_str()?;
-    let entry = catalog.entries().iter().find(|entry| {
-        entry.artifact == name
-            && entry.files.iter().any(|file| crate::loader::SIDECAR_SUFFIXES.iter().any(|suffix| file.name == format!("{name}{suffix}")))
-    })?;
+    let entry = catalog.entries().iter().find(|entry| entry.artifact == name && entry.sidecar().is_some())?;
     // A path as a shell takes it: quoted when it holds a space.
     let shell = |path: &Path| {
         let text = path.display().to_string();

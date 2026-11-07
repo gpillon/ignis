@@ -240,7 +240,7 @@ fn a_catalog_artifact_without_its_sidecar_names_the_command_that_fetches_it() {
     let entry = ignis_server::download::Catalog::built_in()
         .entries()
         .iter()
-        .find(|entry| entry.files.iter().any(|file| file.name.starts_with(&format!("{}.", entry.artifact)) && file.name.ends_with(".json")))
+        .find(|entry| entry.sidecar().is_some())
         .expect("a built-in entry with a sidecar");
     let dir = std::env::temp_dir().join(format!("ignis-logging-test-catalog-sidecar-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("its folder");

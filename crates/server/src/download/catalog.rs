@@ -203,6 +203,13 @@ impl CatalogEntry {
         dir.join(&self.artifact)
     }
 
+    /// The file among [`CatalogEntry::files`] that is the artifact's
+    /// sidecar, as the loader looks for it; `None` for an entry that lists
+    /// none (a speech model, the diarizer).
+    pub fn sidecar(&self) -> Option<&CatalogFile> {
+        sidecar_of(&self.artifact, &self.files)
+    }
+
     /// Every file's bytes together: what a fetch of the whole entry spends.
     pub fn total_bytes(&self) -> u64 {
         self.files.iter().map(|file| file.bytes).sum()
@@ -712,16 +719,23 @@ fn read_entry(value: &Value, layer: CatalogLayer) -> Result<CatalogEntry, String
         if files.len() != 1 {
             return Err(format!("a diarizer is one GGUF: its `files` list `{artifact}` alone, with no sidecar"));
         }
-    } else {
+    } else if sidecar_of(&artifact, &files).is_none() {
         let sidecars: Vec<String> = crate::loader::SIDECAR_SUFFIXES.iter().map(|suffix| format!("{artifact}{suffix}")).collect();
-        if !files.iter().any(|file| sidecars.contains(&file.name)) {
-            return Err(format!(
-                "no file is the artifact's sidecar ({}): the loader refuses a load without one",
-                sidecars.join(" or ")
-            ));
-        }
+        return Err(format!(
+            "no file is the artifact's sidecar ({}): the loader refuses a load without one",
+            sidecars.join(" or ")
+        ));
     }
     Ok(CatalogEntry { id, repo, revision, artifact, kind, card_class, generation, family, aliases, license, files, layer })
+}
+
+/// The file of `files` that is `artifact`'s sidecar: its name the artifact's
+/// plus one of [`crate::loader::SIDECAR_SUFFIXES`], in their order, as
+/// [`crate::loader::find_sidecar`] looks for it on disk.
+fn sidecar_of<'a>(artifact: &str, files: &'a [CatalogFile]) -> Option<&'a CatalogFile> {
+    crate::loader::SIDECAR_SUFFIXES
+        .iter()
+        .find_map(|suffix| files.iter().find(|file| file.name.strip_prefix(artifact) == Some(*suffix)))
 }
 
 /// `license`, when stated: a map of `id` and `url`, both text.
