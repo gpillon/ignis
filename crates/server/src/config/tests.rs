@@ -2266,6 +2266,25 @@ fn a_vision_envelope_without_vision_is_refused_rather_than_ignored() {
     );
 }
 
+/// GitHub #491: `--vision-enabled false` (what `make VISION=0` passes) turns
+/// off the vision every built-in profile turns on, and a start under it fits
+/// the 27B and Flash-Next alike; the envelope beside it is refused as it is
+/// without vision.
+#[test]
+fn vision_enabled_false_turns_a_profiles_vision_off_on_both_models() {
+    for profile in ["rtx5090", "rtxpro6000", "rtx-24gb", "rtx-16gb"] {
+        assert!(config(&["--profile", profile]).vision.is_some(), "{profile} turns vision on");
+        let off = config(&["--profile", profile, "--vision-enabled", "false"]);
+        assert_eq!(off.vision, None, "{profile}");
+        for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
+            let fitted = off.for_family(family).unwrap_or_else(|err| panic!("{profile} on {family:?}: {}", err.0));
+            assert_eq!(fitted.vision, None, "{profile} on {family:?}");
+        }
+        let err = refused(&["--profile", profile, "--vision-enabled", "false", "--vision-max-tokens", "8192"]);
+        assert!(err.contains("--vision-enabled"), "{profile}: {err}");
+    }
+}
+
 #[test]
 fn the_embedding_pool_defaults_to_one_envelope_wide_item() {
     // GitHub #243 must not move the VRAM plan for an operator who does not

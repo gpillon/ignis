@@ -53,7 +53,11 @@ margin (empty: the server's 4G).
 `KV_DISK_BYTES` and `KV_DISK_PATH` set [KV-disk](../configuration/kv-disk.md) (`make config`
 prints its budget and directory). `SPEC=off` turns
 speculation off (`SPEC=` leaves it to the server, and the `rtx5090` profile
-speculates with dflash2). `VISION=1` loads the tower; `UNCENSORED=1` loads
+speculates with dflash2). `VISION=1` loads the vision tower, `VISION=0` leaves
+it out over a profile that loads it (`--vision-enabled false`), and an empty
+`VISION` leaves it to the profile: every built-in profile loads it for the 27B
+([Vision](../configuration/vision.md)). `VISION_MAX_TOKENS` is passed whenever
+it is set, and a load without vision refuses it; `UNCENSORED=1` loads
 [the uncensored variant](../guides/uncensored.md) in place of the default
 image, served as `qwen3.8-27b-abliterated`; `ROPE_SCALING=yarn:4` pins the
 factor (empty is `auto`, from `MAX_CONTEXT`; `none` keeps the trained table); the metrics listener is on (`METRICS=0` starts without it); `API_KEY=` and `EXPOSE=` set

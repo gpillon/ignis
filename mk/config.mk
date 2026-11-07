@@ -222,10 +222,14 @@ ALLOW_VRAM_OVERSUBSCRIPTION ?=
 # on the host. A card with VRAM to spare: RETAINED_DEVICE=16 RETAINED_HOST=0.
 RETAINED_DEVICE ?=
 RETAINED_HOST ?=
-# Vision (--vision-enabled, GitHub #179): a load that takes image parts. Without it
-# every `image_url` part is refused with `vision_disabled`, whatever the
-# artifact holds. VISION_MAX_TOKENS caps one request's vision tokens
-# (--vision-max-tokens); empty = the server's own envelope.
+# Vision (--vision-enabled, GitHub #179): a load that takes image parts.
+# VISION=1 passes --vision-enabled, VISION=0 --vision-enabled false, and empty
+# passes neither, so the profile decides: every built-in profile turns vision
+# on for the 27B (GitHub #491). A load whose vision resolves off refuses every
+# `image_url` part with `vision_disabled`, whatever the artifact holds.
+# VISION_MAX_TOKENS caps one request's vision tokens (--vision-max-tokens),
+# passed whenever it is set; empty = the server's own envelope. MODEL=image
+# passes no vision flag.
 VISION ?=
 VISION_MAX_TOKENS ?=
 # RoPE scaling (--model-rope-scaling, GitHub #227): the text rotary table.

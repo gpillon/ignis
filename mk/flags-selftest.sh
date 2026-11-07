@@ -223,6 +223,29 @@ case "$(make config CUDA=1 METRICS=0 2>/dev/null | sed -n 's/^METRICS  *//p')" i
 lacks "margin default" "$(flags MODEL=flash-next)" "--model-host-margin-bytes"
 has "HOST_MARGIN_BYTES=3G" "$(flags HOST_MARGIN_BYTES=3G)" "--model-host-margin-bytes 3G"
 
+# GitHub #491: VISION has three values. 1 turns the tower on, 0 off over a
+# profile that turns it on, and empty leaves it to the profile; the envelope
+# goes whenever it is set, for the server to refuse on a load without vision.
+out="$(flags VISION=1)"
+has "VISION=1" "$out" "--vision-enabled"
+lacks "VISION=1" "$out" "--vision-enabled false"
+has "VISION=0" "$(flags VISION=0)" "--vision-enabled false"
+lacks "VISION empty" "$(flags)" "--vision-enabled"
+has "VISION_MAX_TOKENS" "$(flags VISION_MAX_TOKENS=8192)" "--vision-max-tokens 8192"
+has "VISION=0 VISION_MAX_TOKENS" "$(flags VISION=0 VISION_MAX_TOKENS=8192)" "--vision-max-tokens 8192"
+has "VISION=1 VISION_MAX_TOKENS" "$(flags VISION=1 VISION_MAX_TOKENS=8192)" "--vision-enabled --vision-max-tokens 8192"
+has "flash-next VISION=0" "$(flags MODEL=flash-next VISION=0)" "--vision-enabled false"
+for vision in "VISION=1" "VISION=0" "VISION_MAX_TOKENS=8192"; do
+    out="$(flags MODEL=image $vision)"
+    lacks "MODEL=image $vision" "$out" "--vision-enabled"
+    lacks "MODEL=image $vision" "$out" "--vision-max-tokens"
+done
+vision_line() { make config CUDA=1 "$@" 2>/dev/null | sed -n 's/^VISION (CUDA=1) //p'; }
+case "$(vision_line VISION=1)" in "on "*) ;; *) fail "VISION=1 config line: $(vision_line VISION=1)" ;; esac
+case "$(vision_line VISION=0)" in "off "*) ;; *) fail "VISION=0 config line: $(vision_line VISION=0)" ;; esac
+case "$(vision_line)" in "the profile's "*) ;; *) fail "empty VISION config line: $(vision_line)" ;; esac
+case "$(vision_line VISION_MAX_TOKENS=8192)" in *"max_tokens=8192"*) ;; *) fail "VISION_MAX_TOKENS config line: $(vision_line VISION_MAX_TOKENS=8192)" ;; esac
+
 if [ "$failed" -ne 0 ]; then
     printf 'flags-selftest: %d failure(s)\n' "$failed" >&2
     exit 1
