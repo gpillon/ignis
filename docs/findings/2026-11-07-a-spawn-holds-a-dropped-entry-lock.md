@@ -39,12 +39,15 @@ never seen there.
 
 ## Finding
 
-The guess holds. A `flock` lock is released only by an unlock or by the close of the last descriptor of its open
-description, and every process forked while the lock is held carries such a descriptor until its exec closes it (std
-opens files close-on-exec). So on Linux and macOS a lock released only by closing its file outlives its holder's drop
-for as long as any process spawned meanwhile, by any thread, takes to exec. `posix_spawn`'s window is short, a
-`fork` with a `pre_exec` hook as long as the hook. An explicit unlock releases the description's lock whatever other
-descriptors refer to it, so the drop is the release.
+The guess holds. Observed, on Linux: a lock released only by closing its file stays held after its holder's drop
+while a process spawned meanwhile, by another thread, has forked and not yet exec'd; released with `flock(LOCK_UN)`
+first, it is free at once in the same window.
+
+Inferred from `flock`'s documented semantics, not measured: the lock belongs to the open file description, which is
+released only by an unlock or by the close of its last descriptor, and every process forked while the lock is held
+carries a descriptor of it until its exec closes it (std opens files close-on-exec). The window is therefore as long
+as the spawn takes to exec: short for `posix_spawn`, which std uses without a `pre_exec` hook, and as long as the
+hook with one. macOS documents the same semantics for `flock`.
 
 ## Implications
 

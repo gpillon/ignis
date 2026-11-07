@@ -14,6 +14,10 @@
 //! handle no child inherits, so the window is Linux's and macOS's alone.
 #![cfg(unix)]
 
+use std::fs::File;
+use std::io::{Read, Write};
+use std::mem::ManuallyDrop;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,23 +30,30 @@ fn a_dropped_lock_is_free_while_a_child_spawned_under_it_has_yet_to_exec() {
     let dir: PathBuf = std::env::temp_dir().join(format!("ignis-entry-lock-spawn-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let held = EntryLock::take(&entry, &dir, Holder::Server).expect("free");
+    // The child says it has forked, one byte down a pipe, then waits in the
+    // window: forked, holding the lock's description, not yet exec'd.
+    let (mut forked, signal) = std::io::pipe().expect("a pipe");
+    let signal_fd = signal.as_raw_fd();
     // `spawn` returns once the child has exec'd, so the window is waited out
     // on a thread of its own while this one drops and takes the lock.
-    let spawner = std::thread::spawn(|| {
+    let spawner = std::thread::spawn(move || {
         let mut command = std::process::Command::new("true");
-        // SAFETY: the closure runs in the forked child before its exec and
-        // only sleeps (nanosleep, async-signal-safe); it allocates nothing.
+        // SAFETY: the closure runs in the forked child before its exec. It
+        // writes one byte to the pipe's write end, open in the child until
+        // its exec, through a `File` it never closes, then sleeps
+        // (write and nanosleep, async-signal-safe); it allocates nothing.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
+                let mut signal = ManuallyDrop::new(File::from_raw_fd(signal_fd));
+                signal.write_all(b"f")?;
                 std::thread::sleep(Duration::from_millis(1000));
                 Ok(())
             });
         }
         command.spawn().expect("spawn").wait().expect("wait");
+        drop(signal);
     });
-    // Well inside the child's sleep: it has forked, holding the lock's
-    // description, and not yet exec'd.
-    std::thread::sleep(Duration::from_millis(250));
+    forked.read_exact(&mut [0u8; 1]).expect("the child forked");
     drop(held);
     let taken = EntryLock::take(&entry, &dir, Holder::Command);
     spawner.join().expect("the spawner");
