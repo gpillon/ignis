@@ -771,6 +771,30 @@ async fn model_download_fetches_an_entry_into_the_download_path_and_prints_its_a
 }
 
 #[tokio::test]
+async fn model_download_beside_an_artifact_placed_by_hand_fetches_its_sidecar_alone() {
+    // GitHub #497: the command a start refused for a missing sidecar names.
+    // The artifact is already there at its published size, so it is kept
+    // and not one byte of it is fetched; the sidecar alone is, and verified.
+    let (addr, state) = repo_server().await;
+    let dir = temp_dir("cli-sidecar-alone");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(ARTIFACT), artifact_bytes()).unwrap();
+    let endpoint = format!("http://{addr}");
+    let dir_text = dir.display().to_string();
+    let argv = ["model", "download", "test-model", "--download-catalog", "ops.catalog.yaml", "--download-endpoint", &endpoint, "--download-path", &dir_text];
+
+    let (stdout, progress, code) = ran(command(&argv, &operator_catalog())).await;
+
+    assert_eq!(code, 0, "{progress:?}");
+    assert_eq!(stdout.trim(), dir.join(ARTIFACT).display().to_string());
+    assert_eq!(state.requested(), [SIDECAR], "{progress:?}");
+    assert_eq!(state.sent(ARTIFACT), 0);
+    assert_eq!(std::fs::read(dir.join(SIDECAR)).unwrap(), SIDECAR_BODY);
+    assert!(progress.iter().any(|line| line.contains(ARTIFACT) && line.contains("kept")), "{progress:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn model_download_prints_the_entrys_license_and_its_link_before_it_fetches() {
     // ADR 0078: the license an entry states is printed first, as an
     // identifier and a link, with no acceptance step; an entry that states

@@ -225,7 +225,37 @@ fn a_missing_artifact_sidecar_emits_a_sidecar_missing_event() {
         record["attributes"]["artifact"], artifact.display().to_string(),
         "the artifact path should appear as a typed attribute, not only in body: {record}"
     );
+    // GitHub #497: an artifact no catalog lists has no command to name.
+    let error = record["attributes"]["error"].as_str().unwrap_or_default();
+    assert!(error.starts_with("no sidecar next to ") && !error.contains("model download"), "{record}");
     let _ = std::fs::remove_file(&artifact);
+}
+
+#[test]
+fn a_catalog_artifact_without_its_sidecar_names_the_command_that_fetches_it() {
+    // GitHub #497: a catalog entry's artifact placed by hand, its sidecar
+    // left behind. The refusal names the command that fetches the sidecar
+    // into the artifact's folder, keeping the artifact (its size is its
+    // check there).
+    let entry = ignis_server::download::Catalog::built_in()
+        .entries()
+        .iter()
+        .find(|entry| entry.files.iter().any(|file| file.name.starts_with(&format!("{}.", entry.artifact)) && file.name.ends_with(".json")))
+        .expect("a built-in entry with a sidecar");
+    let dir = std::env::temp_dir().join(format!("ignis-logging-test-catalog-sidecar-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("its folder");
+    let artifact = dir.join(&entry.artifact);
+    std::fs::write(&artifact, b"not a real container").expect("write the stand-in artifact");
+    let record = run(&["--model-artifact", artifact.to_str().unwrap()]);
+    assert_eq!(record["event_name"], "ignis.artifact.sidecar_missing", "{record}");
+    let error = record["attributes"]["error"].as_str().unwrap_or_default();
+    let fetch = format!(
+        "; the catalog lists it: `ignis-server model download {} --download-path {}` fetches the sidecar beside it and keeps the artifact",
+        entry.id,
+        dir.display()
+    );
+    assert!(error.starts_with("no sidecar next to ") && error.ends_with(&fetch), "{error}\nwanted it to end with {fetch}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

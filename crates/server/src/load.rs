@@ -164,6 +164,19 @@ impl std::fmt::Display for LoadError {
 }
 
 impl LoadError {
+    /// A missing sidecar's refusal, naming `command`, the command that
+    /// fetches it, when there is one (GitHub #497,
+    /// [`crate::download::sidecar_fetch_command`]). Every other refusal is
+    /// returned as it is.
+    pub fn naming_the_fetch(self, command: Option<String>) -> Self {
+        match (self, command) {
+            (Self::SidecarMissing(error), Some(command)) => {
+                Self::SidecarMissing(format!("{error}; the catalog lists it: `{command}` fetches the sidecar beside it and keeps the artifact"))
+            }
+            (other, _) => other,
+        }
+    }
+
     /// Log the refusal of `artifact` under the event name the start-up load
     /// has always used for it, with `outcome` (what happens next: "refusing
     /// to start") as the message. Event names are static in `tracing`, so

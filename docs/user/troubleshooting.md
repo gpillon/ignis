@@ -222,6 +222,25 @@ missing, or an artifact that does not verify against its provenance sidecar
 (`.graft.json` or `.conversion.json`), refuses the start
 ([Get a model](guides/models.md)).
 
+### `no sidecar next to … (looked for … and …)`
+
+The `--model-artifact` file is there but its provenance sidecar,
+`<artifact>.graft.json` or `<artifact>.conversion.json`, is not beside it, so
+the start is refused before the file is read. When the file is a catalog
+entry's artifact placed by hand, the refusal goes on to name the command that
+fetches the sidecar:
+
+```
+…; the catalog lists it: `ignis-server model download <id> --download-path <dir>` fetches the sidecar beside it and keeps the artifact
+```
+
+Run that command as it is written: `<dir>` is the artifact's own folder. The
+artifact, already there at its published size, is kept without being fetched
+again, and the sidecar alone is downloaded and checked against the catalog's
+pins. For an entry of an [operator catalog](guides/operator-catalog.md) the
+command names that catalog with `--download-catalog`. An artifact no catalog
+lists needs its sidecar from wherever the artifact came from.
+
 ### `… is already being downloaded into …, by … (process …)`
 
 Another fetch of the same entry into the same folder holds its lock, and the

@@ -443,7 +443,10 @@ async fn main() {
         let (loaded, running) = match loaded {
             Ok(loaded) => loaded,
             Err(err) => {
-                err.log(artifact_path, "refusing to start");
+                // GitHub #497: a catalog entry's artifact placed without its
+                // sidecar names the command that fetches it.
+                let fetch = download::sidecar_fetch_command(&catalog, artifact_path, download_catalog.as_deref());
+                err.naming_the_fetch(fetch).log(artifact_path, "refusing to start");
                 exit_after_flush(&logging_handle, 1);
             }
         };

@@ -205,6 +205,34 @@ pub fn served_start_options(
     crate::config::target_patch(path, served).and_then(|patch| options.general_with(&patch)).map_err(StartRefusal::Config)
 }
 
+/// The command that fetches the sidecar a start found missing beside
+/// `artifact` (GitHub #497): `ignis-server model download <id>
+/// --download-path <dir>` when the artifact's file name is the artifact of a
+/// `catalog` entry that lists a sidecar for it, `<dir>` the artifact's own
+/// folder, and `--download-catalog <catalog_file>` after it for an
+/// operator's entry, so the command reads the catalog that lists it. The
+/// command keeps an artifact already at its published size and fetches what
+/// is missing beside it. `None` for an artifact no catalog lists, whose
+/// refusal stays as it was.
+pub fn sidecar_fetch_command(catalog: &Catalog, artifact: &Path, catalog_file: Option<&Path>) -> Option<String> {
+    let name = artifact.file_name()?.to_str()?;
+    let entry = catalog.entries().iter().find(|entry| {
+        entry.artifact == name
+            && entry.files.iter().any(|file| crate::loader::SIDECAR_SUFFIXES.iter().any(|suffix| file.name == format!("{name}{suffix}")))
+    })?;
+    // A path as a shell takes it: quoted when it holds a space.
+    let shell = |path: &Path| {
+        let text = path.display().to_string();
+        if text.contains(char::is_whitespace) { format!("\"{text}\"") } else { text }
+    };
+    let dir = artifact.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut command = format!("ignis-server model download {} --download-path {}", entry.id, shell(dir));
+    if let (CatalogLayer::Operator, Some(file)) = (entry.layer, catalog_file) {
+        command.push_str(&format!(" --download-catalog {}", shell(file)));
+    }
+    Some(command)
+}
+
 /// Why a start fitted to the card is refused once its artifact is on disk
 /// ([`served_start_options`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +389,46 @@ mod tests {
 
     fn nothing_exists(_: &Path) -> bool {
         false
+    }
+
+    /// GitHub #497: an artifact a catalog lists, named by its entry's file
+    /// name, gets the command that fetches its sidecar beside it: the
+    /// entry's id and the artifact's folder, and the catalog file for an
+    /// operator's entry. An artifact no catalog lists, or one whose entry
+    /// lists no sidecar, gets none.
+    #[test]
+    fn a_catalog_artifact_names_the_command_that_fetches_its_sidecar() {
+        let entry = default_entry();
+        let dir = PathBuf::from(DIR).join("27b");
+        assert_eq!(
+            sidecar_fetch_command(Catalog::built_in(), &entry.artifact_path(&dir), None),
+            Some(format!("ignis-server model download {} --download-path {}", entry.id, dir.display()))
+        );
+        assert_eq!(
+            sidecar_fetch_command(Catalog::built_in(), Path::new(&entry.artifact), None),
+            Some(format!("ignis-server model download {} --download-path .", entry.id)),
+            "a bare file name is in the working directory"
+        );
+        let spaced = PathBuf::from("My Models");
+        assert_eq!(
+            sidecar_fetch_command(Catalog::built_in(), &entry.artifact_path(&spaced), None),
+            Some(format!("ignis-server model download {} --download-path \"My Models\"", entry.id))
+        );
+        assert_eq!(sidecar_fetch_command(Catalog::built_in(), &dir.join("custom.ninfer"), None), None);
+
+        let pin = |name: &str| CatalogFile { name: name.to_owned(), bytes: 1, sha256: "0".repeat(64) };
+        let mut own = entry.clone();
+        own.id = "my-27b".to_owned();
+        own.artifact = "my-27b.ninfer".to_owned();
+        own.aliases.clear();
+        own.layer = CatalogLayer::Operator;
+        own.files = vec![pin("my-27b.ninfer"), pin("my-27b.ninfer.conversion.json")];
+        assert_eq!(
+            sidecar_fetch_command(&Catalog::from_entries(vec![own.clone()]), &dir.join("my-27b.ninfer"), Some(Path::new("ops.catalog.yaml"))),
+            Some(format!("ignis-server model download my-27b --download-path {} --download-catalog ops.catalog.yaml", dir.display()))
+        );
+        own.files.truncate(1);
+        assert_eq!(sidecar_fetch_command(&Catalog::from_entries(vec![own]), &dir.join("my-27b.ninfer"), None), None, "no sidecar to fetch");
     }
 
     #[test]
