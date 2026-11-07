@@ -55,11 +55,29 @@ fn condition(value: &Value) -> String {
 }
 
 /// Whether `value` starts with the guard as a conjunct of its own: the guard
-/// alone, or the guard `&&` the rest. A guard behind an `||` guards nothing.
+/// alone, or the guard `&&` a rest with no `||` outside its parentheses. A
+/// guard behind an `||` guards nothing, and neither does one before it:
+/// `G && a || b` is `(G && a) || b`, which publishes whenever `b` holds.
 fn guarded(value: Option<&Value>) -> bool {
     let Some(value) = value else { return false };
     let condition = condition(value);
-    condition == GUARD || condition.starts_with(&format!("{GUARD} && "))
+    condition == GUARD || condition.strip_prefix(&format!("{GUARD} && ")).is_some_and(|rest| !or_outside_parentheses(rest))
+}
+
+/// Whether `text` holds an `||` outside every parenthesis and quoted string.
+fn or_outside_parentheses(text: &str) -> bool {
+    let (mut depth, mut quoted) = (0i32, false);
+    let bytes = text.as_bytes();
+    for (at, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'\'' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => depth -= 1,
+            b'|' if !quoted && depth == 0 && bytes.get(at + 1) == Some(&b'|') => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn get<'a>(map: &'a Mapping, key: &str) -> Option<&'a Value> {
@@ -170,6 +188,7 @@ fn an_unguarded_publishing_point_is_refused() {
         "      - uses: docker/build-push-action@v6\n        with:\n          push: ${{ github.ref == 'refs/heads/main' }}\n",
         "      - uses: docker/build-push-action@v6\n        with:\n          push: true\n",
         "      - if: github.repository == 'gpillon/ignis' || github.ref == 'refs/heads/main'\n        run: gh release create develop\n",
+        "      - if: github.repository == 'gpillon/ignis' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'\n        run: gh release create develop\n",
     ] {
         assert_eq!(refused(&step(body)).len(), 1, "{body}");
     }
@@ -180,6 +199,7 @@ fn an_unguarded_publishing_point_is_refused() {
     for body in [
         "      - if: github.repository == 'gpillon/ignis'\n        uses: docker/login-action@v3\n",
         "      - if: github.repository == 'gpillon/ignis' && github.ref == 'refs/heads/main'\n        run: gh release create develop\n",
+        "      - if: github.repository == 'gpillon/ignis' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')\n        run: gh release create develop\n",
         "      - uses: docker/build-push-action@v6\n        with:\n          push: ${{ github.repository == 'gpillon/ignis' && github.ref == 'refs/heads/main' }}\n",
         "      - uses: docker/build-push-action@v6\n        with:\n          push: false\n",
         "      - uses: actions/checkout@v4\n",
