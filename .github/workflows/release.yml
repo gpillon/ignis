@@ -200,6 +200,11 @@ jobs:
         shell: bash
         run: bash mk/cuda-build-check-selftest.sh
 
+      # `make doctor`'s CUDA checks on Linux (GitHub #498), on fake roots.
+      - name: Linux doctor selftest
+        shell: bash
+        run: bash mk/linux/doctor-selftest.sh
+
       # The Playground's logic is pure TypeScript with no host in it, so one
       # run answers for both (ADR 0026, docs/agents/testing.md). Linux is the
       # cheaper runner.

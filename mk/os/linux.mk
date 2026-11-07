@@ -50,7 +50,6 @@ CHANGELOG_TOOL = bash mk/changelog.sh
 OS_REQUIRED_TOOLS :=
 OS_OPTIONAL_TOOLS := cmake ninja nvidia-smi
 OS_TOOL_HINT := CUDA=1 only: CUDA Toolkit under CUDA_HOME, CMake, Ninja -- README Prerequisites
-OS_DOCTOR = echo "cuda:"; \
-  cuda="$${CUDA_HOME:-$${CUDA_PATH:-/usr/local/cuda}}"; \
-  if [ -x "$$cuda/bin/nvcc" ]; then echo "  ok       nvcc ($$cuda)"; \
-  else echo "  optional nvcc not under $$cuda (set CUDA_HOME; CUDA=1 only)"; fi;
+# nvcc, libcudart.so, nvml.h, nvtx3/ in either CUDA layout, and CMake against
+# the kernel leaf's minimum (GitHub #498).
+OS_DOCTOR = bash mk/linux/doctor.sh;

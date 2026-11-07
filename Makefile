@@ -597,6 +597,12 @@ commit-msg-selftest: ## Test the commit-message hook, .githooks/commit-msg
 cuda-build-check-selftest: ## Test the release builds' CUDA check, mk/cuda-build-check.sh
 	@bash mk/cuda-build-check-selftest.sh
 
+# Fake CUDA roots and a fake cmake under a temp directory; it runs under any
+# bash, and the release workflow's test job runs it on both hosts.
+.PHONY: doctor-selftest
+doctor-selftest: ## Test make doctor's CUDA checks on Linux, mk/linux/doctor.sh
+	@bash mk/linux/doctor-selftest.sh
+
 # ---------------------------------------------------------------------------
 ##@ GPU (one run on the card at a time -- docs/agents/testing.md)
 # ---------------------------------------------------------------------------

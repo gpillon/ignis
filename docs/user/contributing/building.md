@@ -15,9 +15,22 @@ links it.
   on Windows; GCC on Linux.
 - **The NVIDIA CUDA Toolkit** (`nvcc`), target `120a` unless you name more
   ([below](#other-card-architectures)). Set `CUDA_PATH` (`CUDA_HOME` on Linux)
-  if it is not on the default install path.
-- **CMake + Ninja** — the kernel leaf builds with the Ninja generator.
+  if it is not on the default install path. Beyond `nvcc` and the runtime, the
+  leaf includes two of the toolkit's headers, `nvml.h` and `nvtx3/` (the NVTX
+  headers), which a CUDA environment installed piecemeal (from a package
+  manager's components, or a Python environment's) can lack: check for them
+  before the compiler stops on one. On Linux the link takes the runtime,
+  `libcudart.so`, from `$CUDA_HOME/lib64`, or from
+  `$CUDA_HOME/targets/x86_64-linux/lib` where an environment's CUDA has no
+  `lib64`, and refuses naming both paths when neither holds it.
+- **CMake 3.28 or newer + Ninja** — the kernel leaf builds with the Ninja
+  generator, and `kernel/CMakeLists.txt` asks for CMake 3.28. Ubuntu 22.04's
+  packaged CMake is 3.22, too old: take a newer one from
+  [cmake.org](https://cmake.org/download/) or `pip install cmake`.
 - **Node.js**, for the Playground.
+
+On Linux, `make doctor` reports each of these: `nvcc`, `libcudart.so`,
+`nvml.h` and `nvtx3/` in either layout, and the CMake version against 3.28.
 
 ## 1. The kernel leaf
 

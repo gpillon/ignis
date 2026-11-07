@@ -710,7 +710,8 @@ Two parts, in this order: the C++/CUDA kernel leaf, then the Rust workspace that
 links it.
 
 - **Toolchain** — Rust; MSVC C++ build tools (Windows) or GCC (Linux); the CUDA
-  Toolkit (`nvcc`, target `SM120a`); CMake + Ninja; Node.js for the Playground.
+  Toolkit (`nvcc`, target `SM120a`); CMake 3.28 or newer (Ubuntu 22.04
+  packages 3.22) + Ninja; Node.js for the Playground.
 - **Kernel leaf** — `kernel/build.ps1` on Windows, `kernel/build.sh` on Linux.
   Both configure and build into `kernel/build/`, which `crates/*/build.rs` link.
 - **Workspace** — `cargo build --release -p ignis-server --features cuda` for

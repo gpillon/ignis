@@ -27,13 +27,19 @@
 //! Two hosts, one contract (GitHub #167): Windows runs `kernel/build.ps1`
 //! through powershell and links `ignis_*.lib` plus the runtime's import lib
 //! under `$CUDA_PATH/lib/x64`; Linux runs `kernel/build.sh` through bash and
-//! links `libignis_*.a` plus the runtime under `$CUDA_HOME/lib64`. Only
+//! links `libignis_*.a` plus the runtime under `$CUDA_HOME/lib64` (or an
+//! environment-installed CUDA's `targets/<arch>-linux/lib`, GitHub #498). Only
 //! the spellings differ -- the script that runs, the archives it must
 //! produce, and the staleness rule above are the same on both.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Where the Linux link finds the CUDA runtime (GitHub #498), in a file of
+/// its own so `tests/cuda_runtime_dir.rs` compiles the same choice.
+#[path = "build/cuda_runtime.rs"]
+mod cuda_runtime;
 
 /// The kernel source trees whose contents force a leaf rebuild, relative to
 /// `kernel/`. A whitelist rather than a walk of `kernel/` itself: the build
@@ -175,11 +181,13 @@ fn main() {
         let cuda = env::var("CUDA_HOME")
             .or_else(|_| env::var("CUDA_PATH"))
             .unwrap_or_else(|_| "/usr/local/cuda".into());
-        let cuda_lib = PathBuf::from(&cuda).join("lib64");
-        if cuda_lib.exists() {
-            println!("cargo:rustc-link-search=native={}", cuda_lib.display());
-            println!("cargo:rustc-link-lib=dylib=cudart");
-        }
+        // A toolkit's lib64, else an environment-installed CUDA's
+        // targets/<arch>-linux/lib; neither is refused here, naming both,
+        // where it used to surface as a link error naming neither.
+        let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".into());
+        let cuda_lib = cuda_runtime::cudart_dir(Path::new(&cuda), &arch).unwrap_or_else(|why| panic!("{why}"));
+        println!("cargo:rustc-link-search=native={}", cuda_lib.display());
+        println!("cargo:rustc-link-lib=dylib=cudart");
         // The leaf opens NVML with dlopen (kernel/src/shared_library.cu),
         // which glibc before 2.34 keeps in libdl.
         println!("cargo:rustc-link-lib=dylib=dl");
