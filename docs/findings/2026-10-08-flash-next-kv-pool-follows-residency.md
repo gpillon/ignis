@@ -5,8 +5,10 @@
 - Observed: 2026-10-08
 - Last verified: 2026-10-08
 - Scope: serving / Flash-Next VRAM plan (the KV pool policy, the expert cache), decode at one and three active lanes; the default `max_tokens`
+- Topic: flash-next
 - Related: GitHub #309, [ADR 0045](../adr/0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [spec vram-budget/03](../specs/vram-budget/03-kv-pool-policy-and-kv-disk.md) ACs 2, 7, 8, 9; [Flash-Next on the 5090](2026-10-06-flash-next-on-the-5090.md) (its lanes-at-262K update)
 - Superseded by: none
+- Summary: At the default three lanes the 524,288-token shared KV pool (ADR 0045) gives the expert cache 1.03 GiB more: decode +4.1% with one lane active and +10.1% aggregate with three (A-B-A), each agent keeping a 38,912-token default cap.
 
 ## Question
 

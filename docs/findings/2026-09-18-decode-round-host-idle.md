@@ -5,6 +5,7 @@
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
 - Scope: kernel / decode round, CUDA graph replay, device timeline
+- Topic: decode-27b
 - Related: [ADR 0019](../adr/0019-decode-cuda-graph-slot-indirection.md),
   [ADR 0020](../adr/0020-batch-wide-decode-round.md),
   [ADR 0021](../adr/0021-live-live-launch-pooling.md),
@@ -12,6 +13,7 @@
   [GQA workspace memset](2026-09-18-gqa-workspace-memset.md),
   [Drafter top-k](2026-09-18-dflash2-topk-one-warp-per-column.md)
 - Superseded by: none
+- Summary: A 27B decode round leaves the device idle ~1 ms in five host-side stalls fixed per round (4.91% of the timeline at one lane, 2.27% at eight); the 224 memcpy/memset nodes cost only their own execution.
 
 **Hardware:** RTX 5090, exclusive card (ADR 0006).
 **Engine:** production defaults — `hq-e8-2b`, `--max-context 262144`,

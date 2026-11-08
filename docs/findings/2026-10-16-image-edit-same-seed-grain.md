@@ -5,8 +5,10 @@
 - Observed: 2026-10-16
 - Last verified: 2026-10-16
 - Scope: image model / chained edits on ignis-image-2.1-turbo (W8A8, 8-step Turbo) through `/v1/images/edits`; the Playground's image sessions and the `make_image` tool
+- Topic: image
 - Related: spec [playground/06](../specs/playground/06-image-studio.md) (GitHub #326), spec [image-model/05](../specs/image-model/05-image-serving.md)
 - Superseded by: none
+- Summary: An edit sent with the seed that made its own input reinforces that noise's imprint: two such steps show grain and three turn a 2K picture to noise, while fresh seeds stay clean; the Playground never reuses an input's seed by default.
 
 ## Question
 

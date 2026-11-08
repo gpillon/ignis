@@ -5,11 +5,13 @@
 - Observed: 2026-10-18
 - Last verified: 2026-10-18
 - Scope: core / Flash-Next expert residency with a pinned hot set (`vram.pinned_expert_bytes`, 1, 2 and 4 GiB): the host plan's expert pool, the process's RAM, the expert cache's decode hit rate, decode tok/s and load time on the rtx5090 profile, and one load with MTP on
+- Topic: flash-next
 - Related: [GitHub #329](https://github.com/gpillon/ignis/issues/329) (item 12),
   [ADR 0055](../adr/0055-a-pinned-hot-set-is-opt-in.md),
   [A partially exclusive expert pool on the 5090](2026-10-18-partial-exclusive-expert-pool.md),
   [spec flash-next/03](../specs/flash-next/03-expert-residency.md)
 - Superseded by: none
+- Summary: Served on the 5090, a pinned expert hot set gives back exactly its bytes of host RAM, greedy text unchanged: 1 GiB costs nothing measurable, 2 GiB 0.1-0.2% of one-lane and 0.2-1.1% of three-lane decode, 4 GiB 4.3% and 5.9%.
 
 ## Question
 

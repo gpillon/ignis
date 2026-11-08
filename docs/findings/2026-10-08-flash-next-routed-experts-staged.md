@@ -1,12 +1,16 @@
 # Flash-Next routed experts at decode: staging each SM's work items through shared memory takes a layer from 25.4 to 20.9 µs at one token alone, but served it is within noise and moves every text, so it ships off (NO-GO)
 
 - Kind: experiment
-- Status: current
+- Status: archived
 - Observed: 2026-10-08
 - Last verified: 2026-10-08
 - Scope: kernel / Flash-Next routed-expert decode (`kernel/src/moe_decode_staged.cu`, `kernel/src/moe_decode.cu`)
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/306, [decode fusion](2026-10-08-flash-next-decode-fusion.md) (this is its roadmap's step 8), [MoE decode is structure-bound](2026-10-05-moe-decode-is-structure-bound.md), [Flash-Next decode round](2026-10-06-flash-next-decode-round.md), [ADR 0044](../adr/0044-experts-in-trellis-with-a-k-per-expert.md)
 - Superseded by: none
+- Summary: Closed as a NO-GO: staging routed-expert work through shared memory takes a layer from 25.4 to 20.9 us alone, but served it is within noise and not bit-exact, so it moves every text and ships off behind IGNIS_FN_MOE_STAGED=1.
+
+> **Archived.** A NO-GO: the staged kernel ships off behind `IGNIS_FN_MOE_STAGED=1`; the experts kernel stays open as step 8 of [the decode fusion](2026-10-08-flash-next-decode-fusion.md)'s plan.
 
 ## Question
 

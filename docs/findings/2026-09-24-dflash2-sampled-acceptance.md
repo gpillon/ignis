@@ -5,6 +5,7 @@
 - Observed: 2026-09-24
 - Last verified: 2026-09-24
 - Scope: speculative decoding / DFlash2 acceptance under agent sampling, draft selection, verify width cost
+- Topic: decode-27b
 - Related: [spec runtime/08](../specs/runtime/08-dflash2-sampled-acceptance.md) (GitHub #267),
   [copy drafting on agent traces](2026-09-24-copy-drafting-on-agent-traces.md) (the turns),
   [reasoning effort on coding tasks](2026-09-24-reasoning-effort-on-coding-tasks.md),
@@ -15,6 +16,7 @@
   `dflash2_replay` and `verify_width_cost`, `dflash2_replay_seams_gpu.rs`) on branch
   `dflash2-sampled-acceptance-267`, from 8e818f3
 - Superseded by: none
+- Summary: Replayed over 200 real agent turns, DFlash2 commits 3.46 tokens a round under sampling (1.47 lost to the drafter, 3.08 to one-hot drafting at T=1), and no lever tried (adaptive extent, sampling-aware selection, token tree) clears +8%.
 
 ## Question
 

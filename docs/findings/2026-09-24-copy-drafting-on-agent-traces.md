@@ -1,10 +1,11 @@
 # Copy drafting at width 8 buys 0–8% on real agent traffic: thinking dominates the output and DFlash2 already rides the copyable spans
 
 - Kind: experiment
-- Status: current
+- Status: archived
 - Observed: 2026-09-24
 - Last verified: 2026-09-24
 - Scope: speculative decoding / draft source selection (DFlash2 vs prompt-lookup / suffix copy)
+- Topic: decode-27b
 - Related: the 2026-09-19 n-gram study (conditional memory in hidden states, not
   prompt-lookup drafting; branch `ngram-study`,
   `docs/findings/2026-09-19-codebase-as-ngram-memory.md` there),
@@ -12,6 +13,9 @@
   `.scratch/sota-research-2026-09-24/SINTESI.md` §2.3 (items A3/B1),
   raw material in `.scratch/copy-drafting-2026-09-24/`
 - Superseded by: none
+- Summary: Closed, not built: on 13,102 real agent turns a copy drafter inside the width-8 verify buys 0-8% at one lane, under the +8% bar, because thinking is 73.5% of the output and DFlash2 already rides the copyable spans.
+
+> **Archived.** Copy drafting was not built (0-8% against a +8% bar); the DFlash2 replay over these turns is [DFlash2 sampled acceptance](2026-09-24-dflash2-sampled-acceptance.md).
 
 ## Question
 

@@ -1,15 +1,19 @@
 # What the prefill "other" class is
 
 - Kind: experiment
+- Status: current
+- Observed: 2026-09-30
+- Last verified: 2026-09-30
 - Scope: kernel / prefill TTFT; retained host slots (#281), per-layer copies,
   the vendored TMA GEMM's descriptor upload on Windows
-- Observed: 2026-09-30
-- Status: current
+- Topic: prefill
 - Related: [GPU resources: prefill vs decode](2026-09-29-gpu-resources-prefill-vs-decode.md),
   [A16 NVFP4 on the tensor cores](2026-09-29-a16-nvfp4-on-the-tensor-cores.md),
   [Retained slots on the host](2026-09-28-retained-slots-on-the-host.md),
   [Sequence snapshot transfer cost](2026-09-12-sequence-snapshot-transfer-cost.md),
   [Prompt-reuse tax on short TTFT](2026-09-18-prompt-reuse-tax-on-short-ttft.md)
+- Superseded by: none
+- Summary: The prefill "other" class is 11.3% of kernel time over ~30 small kernels; a cold ~5.5K prefill's larger non-tensor cost is between kernels: retained host-slot capture ~75 ms (~12%), launch gaps ~26, D2D copies ~16, Windows TMA upload ~12.
 
 ## Question
 

@@ -5,8 +5,10 @@
 - Observed: 2026-10-30
 - Last verified: 2026-10-30
 - Scope: serving / the 27B's vision load under `vision.residency` `host` and `device`: the VRAM plan under `rtx50-16gb` and `rtx5090`, the media encode, `/v1/decide`, decode, on the RTX 5090 (PCIe Gen 3 x16 host, Windows/WDDM)
+- Topic: vision
 - Related: [ADR 0075](../adr/0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md), [the prototype's finding](2026-10-30-vision-tower-staged-and-pool-host-mapped.md), [rope auto follows the adapted context](../user/configuration/context-and-speculation.md), https://github.com/gpillon/ignis/issues/413, https://github.com/gpillon/ignis/issues/417
 - Superseded by: none
+- Summary: ADR 0075's build passes its five criteria: under host a 16 GB vision load keeps the text-only KV pool, a 1,024-token encode costs +7.1 ms, decide answers match at the same context, and decode is 99.7-100.3% of main's.
 
 ## Question
 

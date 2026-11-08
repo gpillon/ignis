@@ -1,12 +1,17 @@
 # A wider prefill chunk buys the 27B at most 4% of cold TTFT and costs decoding lanes up to 5.6x their longest stall
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-07
 - Last verified: 2026-10-07
 - Scope: serving / 27B prefill chunk width, prefill/decode interleaving (decode share), VRAM plan; kernel / CUDA-graph prefill feasibility
+- Topic: prefill
 - Related: [#92](https://github.com/gpillon/ignis/issues/92) (criteria 2-4), [Prefill chunk wall time](2026-09-11-prefill-chunk-wall-time.md) (criterion 1), [The prefill "other" class](2026-09-30-prefill-other-class.md), [Decode round anatomy](2026-09-18-decode-round-anatomy.md), [Flash-Next prefill chunk and the decode share](2026-10-07-flash-next-prefill-chunk-and-decode-share.md), [ADR 0018](../adr/0018-chunk-level-prefill-decode-interleaving.md), [ADR 0019](../adr/0019-decode-cuda-graph-slot-indirection.md), [ADR 0020](../adr/0020-batch-wide-decode-round.md), [ADR 0037](../adr/0037-a-vendored-file-may-carry-a-correctness-patch.md), [#272](https://github.com/gpillon/ignis/issues/272), `.scratch/issue-92-2026-10-07/`
 - Superseded by: none
+- Corrected by: [The 27B's prefill chunk at 2,048](2026-10-21-the-27b-prefill-chunk-at-2048.md), [The solo width planned at load](2026-11-06-the-solo-width-planned-at-load.md)
+- Summary: Before #335 a 27B chunk wider than 1,024 saved at most 3.8% of a cold 32K TTFT while a decoding lane's longest stall grew up to 5.6x, and the decode share is the priority knob; since 2026-10-21 the rtx5090 profile prefills at 2,048.
+
+> **Corrected 2026-10-21.** After #335 the rtx5090 profile prefills the 27B at 2,048 ([the 2,048 chunk](2026-10-21-the-27b-prefill-chunk-at-2048.md)), and since #489 a load also plans a solo width ([the solo width](2026-11-06-the-solo-width-planned-at-load.md)). The stall and decode-share results stand.
 
 ## Question
 

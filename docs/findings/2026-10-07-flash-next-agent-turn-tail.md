@@ -1,12 +1,17 @@
 # A reused Flash-Next agent turn is three copy-bound traversals; a prefill lookahead at the router's top-k cuts it 12%
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-07
 - Last verified: 2026-10-07
 - Scope: serving / Flash-Next prompt reuse, the reused tail's traversals, the prefill lookahead width, expert copies
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/306 (item 5), spec [flash-next/05](../specs/flash-next/05-prompt-reuse.md) acceptance 6, spec [flash-next/03](../specs/flash-next/03-expert-residency.md), [the prefill chunk finding](2026-10-07-flash-next-prefill-chunk-and-decode-share.md), [Flash-Next on the 5090](2026-10-06-flash-next-on-the-5090.md), [the prompt reuse tax](2026-09-18-prompt-reuse-tax-on-short-ttft.md)
 - Superseded by: none
+- Corrected by: [Flash-Next pages-only link](2026-10-07-flash-next-pages-only-link.md)
+- Summary: A reused Flash-Next agent turn's ~1K-token tail is three traversals, each re-streaming its experts (~1.46 of 2.03 s is copies); a prefill lookahead at the router's top-k cuts its TTFT 2.12 to 1.86 s, and the pages-only link 1.80 to 1.46 s.
+
+> **Corrected 2026-10-07.** The pages-only link removed the traversal priced here at ~0.35 s (0.34 s measured), and spec 05 acceptance 6 now sits on its threshold ([pages-only link](2026-10-07-flash-next-pages-only-link.md)).
 
 ## Question
 

@@ -5,8 +5,10 @@
 - Observed: 2026-10-18
 - Last verified: 2026-10-18
 - Scope: expert residency on ADR 0045's resident load (`kernel/src/residency.cu` device-only mode, `crates/core/src/residency/{plan,load,device}.rs`, `crates/core/src/flash_next.rs` `build_residency`, the host plan in `crates/server/src/runtime.rs`)
+- Topic: flash-next
 - Related: [ADR 0045](../adr/0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [ADR 0054](../adr/0054-a-resident-load-keeps-its-experts-only-in-vram.md), the finding 2026-10-18-rtxpro6000-profile-measured (on its own branch), spec [flash-next/03](../specs/flash-next/03-expert-residency.md), https://github.com/gpillon/ignis/issues/329, `.scratch/rtxpro6000-profile/`
 - Superseded by: none
+- Summary: On a 96 GB card holding every expert, the 38 GB pinned host pool served 0.04-0.05% of selections; dropping it took pinned RAM from 41.1 to 3.3 GB and the host plan from 69.9 to 36.8 GB, with the same decode, TTFT and greedy text.
 
 ## Question
 

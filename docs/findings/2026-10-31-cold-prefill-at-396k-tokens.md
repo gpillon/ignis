@@ -5,8 +5,10 @@
 - Observed: 2026-10-31
 - Last verified: 2026-10-31
 - Scope: serving / the 27B's cold prefill rate at 396,032 prompt tokens and 524,288 context on the RTX 5090 (PCIe Gen 3 host), `ignis-bench ttft` with a 105,472-token calibration cell
+- Topic: prefill
 - Related: GitHub [#332](https://github.com/gpillon/ignis/issues/332) (point 1), [#342](https://github.com/gpillon/ignis/issues/342), [the prefill attention without prompt planes](2026-10-21-prefill-attention-without-prompt-planes.md), [the 2,048 chunk](2026-10-21-the-27b-prefill-chunk-at-2048.md), [cold prefill 27B vs Flash-Next](2026-10-13-cold-prefill-27b-vs-flash-next.md)
 - Superseded by: none
+- Summary: On main at the make defaults a cold 396,032-token 27B prompt reaches its first token in 98.7 s (4,012 tok/s); a two-point fit gives ~83 µs per token plus ~0.84 ns per key already seen, so attention is two thirds of it.
 
 ## Question
 

@@ -5,8 +5,10 @@
 - Observed: 2026-10-07
 - Last verified: 2026-10-07
 - Scope: serving / Flash-Next prefill at the make default: one chunk's wall time, the traversals of a cold prompt, expert copies and the VRAM expert cache, the n-gram gather
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/306, [the prefill chunk finding](2026-10-07-flash-next-prefill-chunk-and-decode-share.md), [the agent turn tail finding](2026-10-07-flash-next-agent-turn-tail.md), [Flash-Next on the 5090](2026-10-06-flash-next-on-the-5090.md), [the expert miss path](2026-10-05-expert-miss-path-sm-copy-matches-the-copy-engine.md), [residency on the study's routing](2026-10-05-expert-residency-replayed-on-the-study-s-routing.md), spec [flash-next/03](../specs/flash-next/03-expert-residency.md), spec [flash-next/05](../specs/flash-next/05-prompt-reuse.md)
 - Superseded by: none
+- Summary: At 262K x 3 lanes an 8192-token Flash-Next chunk computes ~1.75 s while streaming ~21 GB of experts at the Gen 3 link's ~12.3 GB/s, so a prompt costs its traversal count; a 12288 chunk cuts TTFT 27-30% at ~9K, 10-11% at ~30K.
 
 ## Question
 

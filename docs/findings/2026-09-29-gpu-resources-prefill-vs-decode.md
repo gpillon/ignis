@@ -1,14 +1,19 @@
 # Which GPU units prefill and decode use: tensor cores in prefill, DRAM in decode, and a fifth of prefill on CUDA cores for the drafter
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-29
 - Last verified: 2026-09-29
 - Scope: kernel / prefill and decode rounds, GPU unit utilisation; dflash2 drafter context append
+- Topic: decode-27b
 - Related: [Decode round anatomy](2026-09-18-decode-round-anatomy.md),
   [Decode round host idle](2026-09-18-decode-round-host-idle.md),
   [Prefill chunk wall time](2026-09-11-prefill-chunk-wall-time.md)
 - Superseded by: none
+- Corrected by: [A16 NVFP4 on the tensor cores](2026-09-29-a16-nvfp4-on-the-tensor-cores.md)
+- Summary: 27B prefill is tensor-core bound (71-87% of the pipe) and decode DRAM bound (83-89% of peak); the drafter's context append, 21% of prefill on CUDA cores, has since moved to the tensor cores for -12.8% TTFT, not the inferred fifth.
+
+> **Corrected 2026-09-29.** The drafter's context append now runs on the tensor cores, and it gave back 12.8% of a ~5.1K-token TTFT, not the fifth inferred below ([A16 NVFP4 on the tensor cores](2026-09-29-a16-nvfp4-on-the-tensor-cores.md)).
 
 **Hardware:** RTX 5090 (GB202, 170 SMs), exclusive card (ADR 0006), clocks not locked.
 **Engine:** `main` at fb144ac, release build, the `make config` production flags

@@ -5,8 +5,10 @@
 - Observed: 2026-10-18
 - Last verified: 2026-10-18
 - Scope: serving / the built-in `rtxpro6000` profile (`crates/server/src/config/profile.rs`) on both families: Flash-Next MTP speculation, decode lanes, n-gram hot rows; the 27B's DFlash2 draft count; retained slots on the device; the host plan's available-RAM input in a container (`crates/core/src/residency/host_memory.rs`)
+- Topic: flash-next
 - Related: [MTP on the 5090](2026-10-07-flash-next-mtp-speculation-is-pcie-bound.md), [Flash-Next prefill chunk and the decode share](2026-10-07-flash-next-prefill-chunk-and-decode-share.md), https://github.com/gpillon/ignis/issues/327, https://github.com/gpillon/ignis/issues/329, `.scratch/rtxpro6000-profile/`
 - Superseded by: none
+- Summary: On an RTX PRO 6000 the derived rtxpro6000 profile holds: Flash-Next MTP 3 pays 1.85x/1.44x at one lane, the 27B's DFlash2 7 is 1.6-3.3x, and the whole n-gram table in RAM gives 1.24x decode on a network block volume.
 
 ## Question
 

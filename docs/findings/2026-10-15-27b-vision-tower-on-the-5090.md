@@ -5,8 +5,10 @@
 - Observed: 2026-10-15
 - Last verified: 2026-10-15
 - Scope: kernel / the 27B's media encode (`ignis_media_encode`, `kernel/src/vision_encode.cu`) and the vendored Q4/Q5/Q6 row-split dispatch at the tower's shapes, RTX 5090 (sm_120)
+- Topic: vision
 - Related: GitHub #324 item 5, [The image leaf on the 5090](2026-10-14-image-model-on-the-5090.md), ADR 0031, ADR 0037
 - Superseded by: none
+- Summary: Every linear of the 27B's vision tower already runs on MMA at 160-212 TFLOPS: a 1024² image encodes in 40 ms, and from 2048² up the cost is the attention's quadratic work (88% of 3.6 s at 4096²); nothing to change.
 
 ## Question
 

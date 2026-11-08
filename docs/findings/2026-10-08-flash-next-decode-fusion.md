@@ -5,8 +5,10 @@
 - Observed: 2026-10-08
 - Last verified: 2026-10-08
 - Scope: kernel / Flash-Next decode round (graph anatomy, the hyper-connection mix's decode route and its folded inject and combine, the indexer's decode score, GDN's and QSA's grouped projections, the router's select in residency's resolve, the round's staging); core / the n-gram gather's wake; serving / one- and three-lane decode rate
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/306, [Flash-Next decode headroom](2026-10-08-flash-next-decode-headroom.md), [Flash-Next decode round](2026-10-06-flash-next-decode-round.md), [MoE decode is structure-bound](2026-10-05-moe-decode-is-structure-bound.md), [ADR 0031](../adr/0031-vendored-kernel-bottleneck-exemption.md), [ADR 0043](../adr/0043-a-second-model-without-a-ninfer-reference.md)
 - Superseded by: none
+- Summary: Flash-Next's one-lane kernels sit 4.3 ms above the bandwidth floor inside ~1,200 small launches; seven bit-exact merges remove 512 nodes and buy 0.62 ms (+6.2%), not the estimated 2 ms, since a merge pays only the serial work it removes.
 
 ## Question
 

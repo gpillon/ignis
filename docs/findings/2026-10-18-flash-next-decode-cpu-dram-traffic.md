@@ -5,8 +5,10 @@
 - Observed: 2026-10-18
 - Last verified: 2026-10-18
 - Scope: serving / Flash-Next decode on the RTX 5090 host (i9-10900K, Z490, PCIe Gen 3 x16): the host-side copies of a decode round, the n-gram gather and its file reads, the expert miss copies from the pinned host pool under CPU memory load
+- Topic: flash-next
 - Related: GitHub #329 item 13; the swap experiment's follow-up (`.scratch/residency-swap-5090/REPORT.md` in the main checkout: CPU DRAM traffic costs a copy-engine DMA up to 57% on this host); [Flash-Next decode headroom](2026-10-08-flash-next-decode-headroom.md); [KV-disk contention on the volume](2026-10-08-kv-disk-contention-on-the-volume.md); [Live moves a window at a time](2026-10-08-live-moves-windowed.md)
 - Superseded by: none
+- Summary: No host copy of a Flash-Next decode round competes with the expert-miss DMA, but other DRAM traffic on the Gen 3 host does (one memcpy thread +6/+15% ITL at 1/3 lanes, eight +46/+92%), so builds belong off the host while it decodes.
 
 ## Question
 

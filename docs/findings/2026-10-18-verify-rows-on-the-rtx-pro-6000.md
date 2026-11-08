@@ -5,8 +5,10 @@
 - Observed: 2026-10-18
 - Last verified: 2026-10-18
 - Scope: serving / the `rtxpro6000` profile's Flash-Next MTP row budget (`spec.draft_rows`, ADR 0056), the verify round's time by width on a card that holds every expert in VRAM
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/329 (item 5), [Flash-Next verify rows past 8](2026-10-18-flash-next-verify-rows-past-8.md), [the rtxpro6000 profile measured](2026-10-18-rtxpro6000-profile-measured.md), [spec flash-next/07](../specs/flash-next/07-mtp-speculation.md), `.scratch/rows-card/`
 - Superseded by: none
+- Summary: On the RTX PRO 6000 a Flash-Next verify round past 8 rows takes 64-80 ms against 19.5 ms at 8, so every wider budget loses (0.42-0.85x) and the rtxpro6000 profile keeps 8 rows and 3 draft tokens until 16 rows run under ~35 ms.
 
 ## Question
 

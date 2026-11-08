@@ -5,8 +5,10 @@
 - Observed: 2026-11-06
 - Last verified: 2026-11-06
 - Scope: serving / the solo width (ADR 0018 and ADR 0063 §3 as amended by GitHub #489): its `auto` resolution on the 24 and 16 GB classes, the prefill chunk's numerics under a wider scratch, Flash-Next's prefill chunk in the built-in profiles; the RTX 5090 before and after
+- Topic: prefill
 - Related: [GitHub #489](https://github.com/gpillon/ignis/issues/489) and [its decisions comment](https://github.com/gpillon/ignis/issues/489#issuecomment-6672861760), [GitHub #526](https://github.com/gpillon/ignis/issues/526), [A wider prefill chunk buys the 27B at most 4%](2026-10-07-27b-prefill-chunk-width.md), [The 27B's prefill chunk at 2,048](2026-10-21-the-27b-prefill-chunk-at-2048.md), [Flash-Next's prefill chunk and the decode share](2026-10-07-flash-next-prefill-chunk-and-decode-share.md), `.scratch/489/`
 - Superseded by: none
+- Summary: With the spare reservation the solo width's auto takes 4,096 on the rtx-24gb simulation and 2,048 on rtx-16gb (both profiles pin it to the chunk), logits stay bit-identical, and Flash-Next's 8,192 chunk costs 1.03 GiB of expert cache.
 
 ## Question
 

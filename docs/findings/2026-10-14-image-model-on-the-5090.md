@@ -5,8 +5,10 @@
 - Observed: 2026-10-14
 - Last verified: 2026-10-15 (the timing test again, after #324 moved the tower's K-1152 linears to MMA)
 - Scope: kernel / the image leaf's denoising step, condition encode and VAE decode on the RTX 5090 (sm_120)
+- Topic: image
 - Related: spec [image-model/04](../specs/image-model/04-the-image-leaf.md) AC 10 (GitHub #321), [Image-model kernels on the 5090](2026-10-13-image-model-kernels-on-the-5090.md), [ADR 0050](../adr/0050-ignis-serves-an-image-model.md)
 - Superseded by: none
+- Summary: The image leaf's 8-step DiT loop takes 1.20 s at 1024² and 6.11 s at 2048², at the survey's bars; at 2048² a step is 59% FP8 GEMM, at 67-73% of the literature's FP8 bar, and 33% 8-bit attention.
 
 ## Question
 

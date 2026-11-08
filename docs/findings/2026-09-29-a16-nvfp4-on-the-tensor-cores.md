@@ -5,10 +5,12 @@
 - Observed: 2026-09-29
 - Last verified: 2026-09-29
 - Scope: kernel / `ops::linear` NVFP4 A16 route; dflash2 drafter context append; prefill TTFT
+- Topic: decode-27b
 - Related: [GPU resources: prefill vs decode](2026-09-29-gpu-resources-prefill-vs-decode.md),
   [ADR 0031](../adr/0031-vendored-kernel-bottleneck-exemption.md),
   [Drafter top-k](2026-09-18-dflash2-topk-one-warp-per-column.md)
 - Superseded by: none
+- Summary: A16 NVFP4 calls of 64+ columns now run as a BF16 tensor-core MMA over weights decoded exactly in shared memory: 6.3-7.4x per call at T=1,024, CUDA-core share of prefill 21% to 1.5%, single-lane TTFT on ~5.1K tokens -12.8%.
 
 **Hardware:** RTX 5090, exclusive card (ADR 0006).
 **Code:** branch `nvfp4-a16-mma`, which adds `kernel/src/nvfp4_a16_mma.cu`,
