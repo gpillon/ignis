@@ -3,17 +3,20 @@
 //! eighteen synthetic account-planning cases, one fixed question whose
 //! `criteria` define "support" as entailment rather than plausibility.
 //!
-//! **Only `gate` cases are asserted.** A `watch` case was right when first
-//! measured but within one logit of the 0.5 line, where a quantisation or
-//! artifact change flips it without anything being broken; a
-//! `known_failure` (case 13, date arithmetic) has the right label and the
-//! model gets it wrong. Both are printed, never asserted. Every line prints
+//! **Only `gate` cases are asserted**, on the card's default route; `watch`
+//! and `known_failure` cases are printed, never asserted. Which case is which
+//! tier follows from its logits on every route measured, by the fixture's
+//! one rule (`measurement.rule`, applied by `entailment::tier_by_rule`), so a
+//! watch case flipping is the numerics moving, not a fault. Every line prints
 //! the logit too: `noul` probabilities move in steps of 0.125 logit (the
 //! logits are bf16), so a drift reads in steps rather than in decimals.
 //!
-//! The tiers come from one measurement of the fixture on this file's own
-//! stock artifact (2026-09-25, through a live server with `--spec-backend dflash2`
-//! and `--vision-enabled`): 17/18, only 13 missed.
+//! The tiers come from one measurement of five arms, recorded in the
+//! fixture's `measurement` with its date, build, card, the command that
+//! redoes each arm and every case's logit in every arm (`NOTICE.md` tells
+//! the set's provenance). The card's default route runs ignis's GDN prefill
+//! (GitHub #536); `IGNIS_GDN_PREFILL=vendored` runs this test on the vendored
+//! one, where the same gates must hold.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or an unavailable GPU is a **skip**; under the profile

@@ -4,6 +4,8 @@ status: accepted
 
 # On sm_8x the trellis prefill decodes each matrix once per chunk and multiplies on the integer MMA
 
+**Amended by #536** (2026-11-08): the GDN prefill runs our own kernels on Blackwell too, by #514's rule, once the RTX 5090 measured them faster with the KLD holding ([the finding](../findings/2026-11-08-blackwell-gdn-prefill-on-ignis-kernels.md)); see the GDN prefill below.
+
 On RTX 30 and RTX 40 cards (compute capability 8.6 and 8.9), the 27B's trellis prefill runs today's fused kernel: it decodes the trellis inside the GEMM's inner loop and multiplies in f16. On a GeForce card that kernel is bound by its decode on the CUDA cores, not by the tensor cores. On the RTX 5090 it reaches about half of its own f16 peak, and the sm_8x cards share that balance per SM.
 
 So on 8.x the body's trellis matrices take a second route, the **dense prefill**:
@@ -22,15 +24,22 @@ In a prototype on the RTX 5090 the dense route ran the body's prefill GEMMs abou
 - **Speed and quality.** On the RTX 5090 this attention runs about 2x faster than the FP16 band at 8K and 64K. Together with the dense route, its KLD stays within 1.03x of the FP16 band's.
 - **The option values.** `8bit` and `fp8` are two spellings of `--model-prefill-attention`'s 8-bit band: on Blackwell it is today's FP8 band, which reports as `fp8`; on 8.x it is the new band, which reports as `int8`. `int8` names the new band on every card, and on Blackwell it runs only when named.
 
-**The GDN prefill on 8.x** runs on our own kernels in those forms (#514).
+**The GDN prefill** runs on our own kernels in those forms (#514), on 8.x and, since #536, on Blackwell.
 - A small prepare per 32-token chunk solves the chunk's triangular system on the CUDA cores in fp32. One recurrence keeps each head's state in registers and writes the output itself, so no chunk's state goes through memory.
 - Its products are f16 MMAs with an f16 accumulator over spans of 32 products, each span folded into fp32, the operand rows on power-of-two scales that keep a span below 2^15. Against an fp64 recurrence its rows are closer than the vendored kernels' (0.93 against 2.6 bf16 roundings RMS, measured on the RTX 5090 on the leaf test's synthetic inputs).
-- It has no option: on 8.x it is the route. Blackwell keeps the vendored chunked kernels: on the RTX 5090 ours were faster by 3-4% at 8K and 64K with the KLD intact (1.0036 trellis, 0.9816 NVFP4), but two entailment gate cases and the vision verify probe moved, so the switch waits for #490. `IGNIS_GDN_PREFILL=ours|vendored` is the switch for that measurement, not a setting.
+- It has no option: it is the route on every card that runs the 27B. Blackwell took it in #536 (spec #531) by #514's rule, which replaces the vendored chunked kernels there only if the RTX 5090 measures ours faster with its KLD holding. It did, on Blackwell's default routes (the fused prefill, the FP8 band) and with one binary for both routes, as [the finding](../findings/2026-11-08-blackwell-gdn-prefill-on-ignis-kernels.md) records with its figures: the GDN prefill kernels alone ran 2.4 to 2.6 times faster; the time to first token was shorter on both 27B entries over alternated legs, on the NVFP4 entry within each regime of its legs (the finding says why its registered rule's second part failed there); and the full-vocabulary KLD against BF16 stayed within its interval on both.
+
+  #514 made the switch once and reverted it, because three tests of the GPU profile moved. None was a quality loss of ours, and each has its rule since:
+  - **Two gate cases of the entailment regression set**, 3 and 17, crossed the decision line. The set had been tiered on the vendored route alone, and any change of the numerics moves its cases: the int8 prompt-attention band, a route that passed the KLD gate, moved them more than ours did and lost a gate case of its own. Since #535 a case is a gate only when it is clear of the decision line on every route measured, so 3, 10 and 17 are watch cases.
+  - **The multimodal speculative test's near-tie probe** failed a split between the decode round's pick and the verify round's. Both its probes took the decode round's shape, while the verify round runs other activation routes at its width (ADR 0016); with both rounds on one route the text was identical. Since #534 the split is judged by the two round shapes, each computed outside the rounds.
+  - **The shared vision workspace's recorded tokens** are exact tokens, which any change of the numerics moves. They were re-recorded on the new default.
+
+  Its speed is unmeasured on the RTX PRO 6000 and the 16 GB RTX 50 cards, which run the RTX 5090's SASS. A greedy answer on Blackwell can differ from an earlier release's at a near-tie: correctness is self-checked, not byte-matched (ADR 0007). Flash-Next keeps its own vendored GDN layers. `IGNIS_GDN_PREFILL=vendored|ours` is the switch for a measurement, on every card, not a setting; the vendored kernels stay its other route and the leaf test's oracle.
 
 **What stays.**
 - The fused route stays the route on sm_120. On 8.x it is one option away, `--model-prefill-linear fp16`, as the FP16 band is with `--model-prefill-attention fp16`.
 - Only a field left to its default takes the card's own route; a profile's value, `fp16` included, is kept where the card runs it. A value the card or the build cannot run falls back when it comes from a default or a profile, and is refused, naming the option, when the operator names it (#456). The build's own answer, `prefill_route_built`, is one predicate per route, so a build that does not carry a route yet refuses it by name instead of running the other.
-- `--model-prefill-linear int8|fp16` (`model.prefill_linear`) chooses the route and `GET /v1/config` reports it, as it reports the band, with the card as its source when the card decided. On 8.x the dense prefill, the integer band and the GDN prefill below are the default since #515, after the RTX 5090's KLD legs (#513, #514) passed; the sm_86 gate (#516) confirms them on the card before 0.10.0. Blackwell's defaults do not move.
+- `--model-prefill-linear int8|fp16` (`model.prefill_linear`) chooses the route and `GET /v1/config` reports it, as it reports the band, with the card as its source when the card decided. On 8.x the dense prefill, the integer band and the GDN prefill below are the default since #515, after the RTX 5090's KLD legs (#513, #514) passed; the sm_86 gate (#516) confirms them on the card before 0.10.0. Blackwell's trellis prefill and band defaults do not move; its GDN prefill moved by the measurement above (#536).
 - One `86` cubin serves 8.6 and 8.9. A dedicated `89` path (spec C) hangs on `arch::GpuGeneration`.
 
 ## Considered options

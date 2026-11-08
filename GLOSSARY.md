@@ -543,9 +543,11 @@ MMA with an INT8 activation. The default route of the 8.x cards (GitHub #515).
 **GDN prefill**:
 A GDN layer's pass over a prefill span of 64 tokens or more: the chunked
 delta rule, which carries the sequence's GDN slot from the span's first token
-to its last. It has two routes, ignis's own (ADR 0080, the 8.x cards' route)
-and the vendored chunked kernels (sm_120's). A shorter span, a decode round
-or a verify round runs the vendored recurrent kernel on either.
+to its last. The 27B's has two routes: ignis's own (ADR 0080), every card's
+route, and the vendored chunked kernels, which run only when the measurement
+switch names them and stay the oracle of ignis's; Flash-Next's GDN layers
+keep their own vendored kernels whatever the switch says. A shorter span, a
+decode round or a verify round runs the vendored recurrent kernel on either.
 _Avoid_: GDN chunked kernel (one route's name, not the pass)
 
 **Band**:

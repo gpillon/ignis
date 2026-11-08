@@ -44,7 +44,11 @@ You can add models of your own with an
   - *Blackwell (compute capability 12.0).* One RTX 5090 (32 GB) or one RTX
     PRO 6000 Blackwell (96 GB) loads every model. The 16 GB class (RTX 5060 Ti
     16 GB, 5070 Ti, 5080) loads the 16 GB entries (the 27B, its uncensored
-    variant, Swift 1.5), on a profile derived rather than measured.
+    variant, Swift 1.5), on a profile derived rather than measured. The
+    27B's gated delta net prefill runs ignis's own kernels there, where
+    earlier releases ran the vendored ones, so a greedy answer can differ
+    from an earlier release's at a near-tie
+    ([Context and speculation](../configuration/context-and-speculation.md)).
   - *Ampere.* The RTX 3090 and the RTX 3090 Ti (8.6, 24 GB) are supported, on
     the 16 GB entries (the 27B, its uncensored variant, Swift 1.5).
   - *Ada.* The RTX 4090 (24 GB) and the 16 GB RTX 40 cards (RTX 4060 Ti 16 GB,
@@ -60,7 +64,8 @@ You can add models of your own with an
   - *The prefill on an RTX 30 or RTX 40 card.* Unset, the 27B reads a prompt
     through the **dense prefill** (each trellis matrix decoded once per chunk
     and multiplied on the integer MMA), the **integer band** of the prompt
-    attention (INT8 scores) and ignis's own gated delta net prefill kernels.
+    attention (INT8 scores) and ignis's own gated delta net prefill kernels,
+    which every card runs.
     `--model-prefill-linear fp16` and `--model-prefill-attention fp16` name
     the fused prefill and the FP16 band instead
     ([Context and speculation](../configuration/context-and-speculation.md)).

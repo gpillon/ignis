@@ -1,7 +1,8 @@
 //! Speculation past 8 verify rows against speculation off, row by row
 //! (GitHub #329 item 5, ADR 0056). Included by path from the Flash-Next GPU
 //! test that holds a wide budget to the plain decode route, and from the CPU
-//! test of these rules.
+//! test of these rules; the server's round shapes
+//! (`crates/server/tests/support/round_shapes.rs`) read its BF16 helpers.
 //!
 //! Past 8 rows a verify round's linears and mixes take their tensor-core
 //! routes, so its logits are the plain round's up to summation order, not bit

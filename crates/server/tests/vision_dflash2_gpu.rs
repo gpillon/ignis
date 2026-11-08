@@ -23,12 +23,31 @@
 //! - AC 3: greedy spec-on equals spec-off on the canary images. Spec-off here
 //!   is a plain decode round *on this same load*, which is the sharpest form
 //!   of the question: the two rounds differ only in shape, so a rotation the
-//!   verify round got wrong shows up immediately. A divergence passes only
-//!   where the engine's own two multimodal prefill routes (the whole span and
-//!   the placeholder-crossing 48-token spans) call the two candidates a
-//!   near-tie -- the same rule `crates/core/tests/support/near_tie.rs` states
-//!   for text, with the per-token route (which has no multimodal form)
-//!   replaced by the spanning one.
+//!   verify round got wrong shows up immediately. A split passes only as a
+//!   near-tie judged by the two **round shapes** (GitHub #534, glossary
+//!   Near-tie and Round shape, `support/round_shapes.rs`), each computed
+//!   outside the rounds through the prefill at the position whose logits drew
+//!   the split token:
+//!   - the *decode shape*: the prompt prefilled as both runs prefill it, then
+//!     the agreed text one token at a time, a decode round's one column;
+//!   - the *verify shape*: the speculative run's own state at the start of
+//!     the round that drew the split token, its snapshot restored into a
+//!     fresh sequence, then that round computed again, independently, in its
+//!     own shape: one span `WINDOW + 1` columns wide from its base over the
+//!     decode text, read at the split's row. The verify round's width, so its
+//!     activation routes (ADR 0016), and none of its graph, staging or
+//!     drafter.
+//!
+//!   The split is numerics when the two shapes disagree about the winner, when
+//!   the verify shape ranks the verify's pick at least as high, or when either
+//!   shape is within one BF16 ulp of a tie at its larger logit's magnitude
+//!   (the computation's own rounding, never a tuned constant). It is a fault of
+//!   the verify round only when the verify shape sides with the decode round
+//!   by more than that. Each split prints its round, row, position, both picks,
+//!   both shapes' gaps and ulps, and the verdict. What the verify shape gives
+//!   up: the rounds before the split's are the run's own computation, restored,
+//!   not rebuilt independently; only the split's round is (`verify_shape`). The
+//!   text rule of `crates/core/tests/support/near_tie.rs` is not this one.
 //! - AC 4: acceptance on the text after an image, printed per round and as
 //!   the mean committed tokens per full-window round against the reference's
 //!   3.4-5.75 band. Below the band is a finding, not a failure; never landing
@@ -47,6 +66,8 @@
 
 #[path = "support/mod.rs"]
 mod support;
+#[path = "support/round_shapes.rs"]
+mod round_shapes;
 
 use std::path::Path;
 
@@ -70,16 +91,18 @@ use ignis_core::step::{
 use ignis_core::vision::{vision_item_control, Multimodal};
 use ignis_core::{ExceptionWeights, KvFormat, RopeScaling, Speculation, SpeculativeBackend, Vision};
 
+use round_shapes::{judge, span_tokens, Picks, Shape, Verdict, VerifyRound};
 use support::vision_canary::{argmax_lowest_id, load_canaries, prefill_prompt, Canary};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 2048;
 const PREFILL_CHUNK: u32 = 1024;
-/// Narrower than every canary image's placeholder run (64..196 tokens), so
-/// the second prefill route cuts the run (`vision_canary_gpu.rs`'s "spanning").
-const SPANNING_CHUNK: u32 = 48;
 /// DFlash2-7, the reference lane G5 measures.
 const WINDOW: u32 = 7;
+/// A verify round's columns per lane, its round shape: `WINDOW + 1`
+/// whatever the round's extent, the columns past it padded with the anchor
+/// (`lane_columns` in `run_verify_round`, `kernel/src/step.cu`).
+const VERIFY_COLUMNS: u32 = WINDOW + 1;
 /// Scored teacher-forced positions per canary (ADR 0014's first 32).
 const FIRST_N: usize = 32;
 /// Tokens each canary emits in the spec-on/spec-off comparison.
@@ -195,27 +218,76 @@ fn spec_off(
     stream
 }
 
-/// What one spec-on run recorded: the text, and per round its
-/// `(extent, committed)`.
+/// What one spec-on run recorded: the text, per round its base (the
+/// sequence's own frontier before the round, where its anchor sits), its
+/// extent and the tokens it committed (its `LaneVerifyRun`), and the state the
+/// verify-shape probe starts from.
 struct SpecRun {
+    /// The prompt's end, the position of `emitted[0]`.
+    first: u64,
     emitted: Vec<i32>,
-    rounds: Vec<(u32, usize)>,
+    rounds: Vec<VerifyRound>,
+    departed: Option<Departed>,
+}
+
+impl SpecRun {
+    /// The snapshot the run kept and the row of its round's columns that drew
+    /// token `split`: `None` when the run kept none, or its round did not draw
+    /// that token.
+    fn departure(&self, split: usize) -> Option<(&Departed, usize)> {
+        let departed = self.departed.as_ref()?;
+        Some((departed, self.rounds[departed.round].row(self.first, split)?))
+    }
+}
+
+/// The snapshot blob of a spec-on sequence at the base of `rounds[round]`,
+/// the round whose columns drew the first token departing from the decode
+/// rounds' text ([`VerifyRound::drew_the_departure`]): the KV, GDN state and
+/// drafter window the verify rounds before it left. A restore is checked
+/// against the pool it writes into, so it restores into a sequence of the
+/// pool the run drew from, the one pool this test has.
+struct Departed {
+    round: usize,
+    snapshot: Vec<u8>,
 }
 
 /// The same `total` tokens through verify rounds, the drafter proposing from
 /// its window. One lane: the question is the rotation, not the batching.
+///
+/// Until a round has drawn a token departing from `decode_text`, the decode
+/// rounds' text, each round's base is snapshotted, once the previous round's
+/// commit has completed, and the snapshot kept only if the round drew the
+/// departure (`Departed`): one blob at a time. A round's last column draws its
+/// correction, the sequence's pending token, which the run commits only as
+/// the next round's anchor, so the round's draws are compared with the text it
+/// committed and its pending token after it.
 fn spec_on(
     model: &Model,
     pool: &SeqPool,
     prompt: &Prompt,
     embedding: &MediaEmbedding<'_>,
+    decode_text: &[i32],
     stop_ids: &[i32],
     logits: &mut [f32],
 ) -> SpecRun {
     let mut sequence = prefilled(model, pool, prompt, embedding, PREFILL_CHUNK, logits);
+    let first = prompt.tokens.len() as u64;
     let mut emitted: Vec<i32> = Vec::with_capacity(TOTAL);
     let mut rounds = Vec::new();
+    let mut departed = None;
     while emitted.len() < TOTAL {
+        let base = sequence.stats().position;
+        assert_eq!(
+            base,
+            (prompt.tokens.len() + emitted.len()) as u64,
+            "a round's anchor must sit right after the prompt and the text committed before it"
+        );
+        let snapshot = departed.is_none().then(|| {
+            sequence
+                .snapshot()
+                .unwrap_or_else(|e| panic!("snapshot at round {}'s base {base}: {e}", rounds.len()))
+        });
+        let anchor = sequence.pending_token();
         let remaining_tokens = (TOTAL - emitted.len()) as u32;
         let lanes = [VerifyLane { remaining_tokens, stop_ids, ..VerifyLane::greedy(&[]) }];
         let results = decode_program_verify_runs(model, pool, &mut [&mut sequence], &lanes, WINDOW)
@@ -227,71 +299,151 @@ fn spec_on(
             run.tokens.len(),
             run.extent
         );
-        rounds.push((run.extent, run.tokens.len()));
+        assert_eq!(
+            Some(run.tokens[0]),
+            anchor,
+            "a round commits first its anchor, the pending token the round before it drew"
+        );
+        let round = VerifyRound { base, extent: run.extent, committed: run.tokens.len() };
+        rounds.push(round);
         let stopped = run.tokens.iter().any(|t| stop_ids.contains(t));
         emitted.extend(run.tokens.iter().copied());
+        if let Some(snapshot) = snapshot {
+            let verify_text: Vec<i32> = emitted.iter().copied().chain(sequence.pending_token()).collect();
+            if round.drew_the_departure(first, decode_text, &verify_text) {
+                departed = Some(Departed { round: rounds.len() - 1, snapshot });
+            }
+        }
         if stopped {
             break;
         }
         assert!(rounds.len() <= TOTAL, "the run does not converge");
     }
-    SpecRun { emitted, rounds }
+    SpecRun { first, emitted, rounds, departed }
 }
 
-/// The final logits after `prompt` prefilled at `chunk` plus `agreed` fed as
-/// text, which is how teacher forcing already continues a multimodal prompt.
-fn gap_after(
+/// The decode shape: `prompt` prefilled as both runs prefill it, then
+/// `agreed` fed one token at a time, each a one-column span -- a decode
+/// round's shape -- which is how teacher forcing already continues a
+/// multimodal prompt; read at the last one, the two `picks`.
+fn decode_shape(
     model: &Model,
     pool: &SeqPool,
     prompt: &Prompt,
     embedding: &MediaEmbedding<'_>,
     agreed: &[i32],
-    chunk: u32,
-    a: i32,
-    b: i32,
-) -> f32 {
+    picks: Picks,
+) -> Shape {
     let vocab = ModelConfig::qwen38_27b().vocab as usize;
     let mut logits = vec![0f32; vocab];
-    let mut sequence = prefilled(model, pool, prompt, embedding, chunk, &mut logits);
+    let mut sequence = prefilled(model, pool, prompt, embedding, PREFILL_CHUNK, &mut logits);
     let mut position = prompt.tokens.len() as u64;
     for &token in agreed {
         step::prefill_program(model, pool, &mut sequence, &[token], position, Some(&mut logits))
-            .unwrap_or_else(|e| panic!("near-tie probe at position {position}: {e}"));
+            .unwrap_or_else(|e| panic!("decode-shape probe at position {position}: {e}"));
         position += 1;
     }
-    logits[a as usize] - logits[b as usize]
+    picks.shape(&logits)
 }
 
-/// Spec-off's pick `a` against spec-on's pick `b` after `agreed`, by the
-/// engine's own two multimodal prefill routes (the whole span, and 48-token
-/// spans that cut the placeholder run). A near-tie when the routes disagree
-/// about the winner or rate the gap no wider than the spread between them;
-/// spec-off's own drift when both prefer `b`. Panics naming both gaps
-/// otherwise. The tolerance is never a constant
-/// (`crates/core/tests/support/near_tie.rs`).
+/// The verify shape: the speculative run's own state at the start of the
+/// round that drew token `split` -- the snapshot `on` kept, restored into a
+/// fresh sequence of `pool`, the pool the run drew from -- then that round
+/// computed again, independently, in its own shape: one span
+/// [`VERIFY_COLUMNS`] wide from the round's base over the decode `text`
+/// (`text[0]` at the prompt's end), read at the row that drew the token, the
+/// two `picks`. The span takes the verify round's
+/// activation routes (ADR 0016) through the prefill, and the probe runs none
+/// of the round's graph, staging or drafter; the diagnosis of #531 found such
+/// a span's row equal to the verify column's logits at bf16 on both GDN
+/// prefill routes.
+///
+/// The span's columns up to the split's row hold the round's anchor and the
+/// drafts it accepted, the text both runs agree on. Past the row they hold
+/// the decode text, and past its end its last token, where the verify round
+/// held its own drafts and, past its extent, its anchor again: no row reads a
+/// later column (the attention and the recurrent GDN pass are causal, and the
+/// W4A4 activations quantize at each weight's static input scale, not a
+/// per-call maximum), so the row read is the same whatever fills them.
+///
+/// The history is the run's own: the KV and GDN state the earlier verify
+/// rounds left, each computed `VERIFY_COLUMNS` wide with only its committed
+/// columns kept. What this gives up: that computation is restored, not
+/// rebuilt independently; only the split's round is recomputed.
+fn verify_shape(model: &Model, pool: &SeqPool, on: &SpecRun, text: &[i32], split: usize, picks: Picks) -> Shape {
+    let (departed, row) = on.departure(split).expect("the split's round kept its snapshot (`assert_near_tie`)");
+    let base = on.rounds[departed.round].base;
+    let vocab = ModelConfig::qwen38_27b().vocab as usize;
+    let mut sequence = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("seq alloc: {e}"));
+    sequence.restore(&departed.snapshot).unwrap_or_else(|e| {
+        panic!("verify-shape probe, restoring round {}'s snapshot: {e}", departed.round)
+    });
+    assert_eq!(
+        sequence.stats().position,
+        base,
+        "the snapshot of round {} must restore to the round's base",
+        departed.round
+    );
+    let span = base..base + u64::from(VERIFY_COLUMNS);
+    let columns = span_tokens(text, on.first, span.clone());
+    let mut rows = vec![0u16; columns.len() * vocab];
+    step::prefill_program_span_logits(model, pool, &mut sequence, &columns, base, &mut rows)
+        .unwrap_or_else(|e| panic!("verify-shape probe, the split's round span {span:?}: {e}"));
+    picks.shape_bf16(&rows[row * vocab..(row + 1) * vocab])
+}
+
+/// The split at token `split` -- the decode rounds' `off[split]` against the
+/// verify rounds' `on.emitted[split]`, after the text both agree on -- judged
+/// by the two round shapes ([`judge`]), the verify shape starting from `on`'s
+/// own state at the base of the round that drew the split. Prints the
+/// judgement, then panics on a fault of the verify round, naming both shapes'
+/// gaps.
 #[allow(clippy::too_many_arguments)]
 fn assert_near_tie(
     model: &Model,
     pool: &SeqPool,
     prompt: &Prompt,
     embedding: &MediaEmbedding<'_>,
-    agreed: &[i32],
-    a: i32,
-    b: i32,
-    what: &str,
+    off: &[i32],
+    on: &SpecRun,
+    split: usize,
+    label: &str,
 ) {
-    let whole = gap_after(model, pool, prompt, embedding, agreed, PREFILL_CHUNK, a, b);
-    let spanning = gap_after(model, pool, prompt, embedding, agreed, SPANNING_CHUNK, a, b);
-    let routes_disagree = (whole > 0.0) != (spanning > 0.0) || whole == 0.0 || spanning == 0.0;
-    let within_spread = whole.abs().min(spanning.abs()) <= (whole - spanning).abs();
-    let routes_side_with_spec_on = whole < 0.0 && spanning < 0.0;
+    let picks = Picks { decode: off[split], verify: on.emitted[split] };
+    let Picks { decode: decode_pick, verify: verify_pick } = picks;
+    // The position whose logits drew the split token: the prompt's last for
+    // the first token, which the prefill draws in both runs alike.
+    let drawn_at = on.first + split as u64 - 1;
+    let (departed, row) = on.departure(split).unwrap_or_else(|| {
+        panic!(
+            "{label}: the two runs part at token {split} ({decode_pick} vs {verify_pick}), drawn at position \
+             {drawn_at}, and the run kept no snapshot of a round that drew it -- token 0 is the prompt's own \
+             draw, one computation in both runs, and a later token no round drew means the round accounting is \
+             wrong"
+        )
+    });
+    let decode = decode_shape(model, pool, prompt, embedding, &off[..split], picks);
+    let verify = verify_shape(model, pool, on, off, split, picks);
+    let verdict = judge(decode, verify);
+    let judgement = format!(
+        "{label}: round {} row {row} (position {drawn_at}, token {split}), decode picked {decode_pick}, \
+         verify picked {verify_pick}: logit[{decode_pick}] - logit[{verify_pick}] = {:+} in the decode shape \
+         ({} / {}, ulp {}), {:+} in the verify shape ({} / {}, ulp {}) -- {verdict}",
+        departed.round,
+        decode.gap(),
+        decode.decode_pick,
+        decode.verify_pick,
+        decode.ulp(),
+        verify.gap(),
+        verify.decode_pick,
+        verify.verify_pick,
+        verify.ulp(),
+    );
+    eprintln!("vision+dflash2 near-tie {judgement}");
     assert!(
-        routes_disagree || within_spread || routes_side_with_spec_on,
-        "{what}: the verify round picked {b} where the decode round picked {a} after {} tokens, it is not a \
-         near-tie, and both multimodal prefill routes side with the decode round: logit[{a}] - logit[{b}] = \
-         {whole} (whole span), {spanning} (spanning spans) -- the verify round is rotating at the wrong \
-         positions",
-        agreed.len()
+        verdict != Verdict::VerifyFault,
+        "{judgement}: the verify shape, computed outside the round, sides with the decode round beyond the \
+         computation's rounding -- the verify round computed this position wrong"
     );
 }
 
@@ -443,11 +595,11 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
         );
         for (label, prompt) in [(canary.id.clone(), &prompt), (format!("{}/detail", canary.id), &detail)] {
             assert!(
-                prompt.tokens.len() + TOTAL <= MAX_CONTEXT as usize,
-                "{label}: the prompt and its generation outgrow the context"
+                prompt.tokens.len() + TOTAL + VERIFY_COLUMNS as usize <= MAX_CONTEXT as usize,
+                "{label}: the prompt, its generation and the verify-shape probe's span outgrow the context"
             );
             let off = spec_off(&model, &pool, prompt, &embedding, &stop_ids, &mut logits);
-            let on = spec_on(&model, &pool, prompt, &embedding, &stop_ids, &mut logits);
+            let on = spec_on(&model, &pool, prompt, &embedding, &off, &stop_ids, &mut logits);
             let divergence = off
                 .iter()
                 .zip(&on.emitted)
@@ -477,14 +629,18 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
                         "vision+dflash2 {label}: the two rounds part at token {d} ({} vs {}) -- probing",
                         off[d], on.emitted[d]
                     );
-                    assert_near_tie(&model, &pool, prompt, &embedding, &off[..d], off[d], on.emitted[d], &label);
+                    assert_near_tie(&model, &pool, prompt, &embedding, &off, &on, d, &label);
                 }
             }
-            for (index, &(extent, committed)) in on.rounds.iter().enumerate() {
-                eprintln!("vision+dflash2 {label} round {index}: accepted/drafted {}/{extent}", committed - 1);
-                accepted += committed - 1;
-                if extent == WINDOW {
-                    committed_full += committed;
+            for (index, round) in on.rounds.iter().enumerate() {
+                eprintln!(
+                    "vision+dflash2 {label} round {index}: accepted/drafted {}/{}",
+                    round.committed - 1,
+                    round.extent
+                );
+                accepted += round.committed - 1;
+                if round.extent == WINDOW {
+                    committed_full += round.committed;
                     full_rounds += 1;
                 }
             }

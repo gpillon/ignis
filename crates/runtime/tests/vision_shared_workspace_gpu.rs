@@ -17,9 +17,15 @@
 //!    two prefill chunks of the same request, and the first image's run spans
 //!    several chunks.
 //!
-//! Every request's greedy tokens must equal the ones recorded on the build
-//! before the change (`fixtures/vision_shared_workspace_tokens.json`, recorded
-//! on efdcf58's sources with `IGNIS_RECORD_VISION_WORKSPACE_TOKENS=1`). The runs are
+//! Every request's greedy tokens must equal the recorded ones
+//! (`fixtures/vision_shared_workspace_tokens.json`, recorded with
+//! `IGNIS_RECORD_VISION_WORKSPACE_TOKENS=1`). They were first recorded on
+//! efdcf58's sources, the build before the change, which the shared arena
+//! matched token for token. The tokens are exact, so any change of the
+//! numerics moves them: they were recorded again on the RTX 5090 on
+//! 2026-11-08, on main 1188385c's engine under ignis's GDN prefill, when it
+//! became Blackwell's default (GitHub #536), and a second run passed on that
+//! record. The runs are
 //! single-threaded `ConcreteScheduler::advance` loops, so the same build
 //! gives the same tokens run after run; a shared arena that let an encode
 //! and a prefill chunk overlap would move them.
