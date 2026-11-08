@@ -1,6 +1,37 @@
+---
+status: accepted
+amended-by: [ADR-0075, ADR-0079]
+---
+
 # ADR 0063 — the profile follows the card class, and its defaults adapt to the budget
 
-## Status
+## Current decision
+
+`--profile` defaults to `auto`, which picks the built-in profile by the card's total memory alone: `rtx-16gb` for the
+16 GB class (`rtx50-16gb` is a permanent alias), `rtx-24gb` for the 24 GB class, 20 GiB up to 28 GiB (the RTX 3090
+and RTX 4090), `rtx5090` at ~32 GB and `rtxpro6000` at ~96 GB. Any other total is refused, naming `--profile`, and a
+named profile always wins. The GPU generation is a second axis beside the class
+([ADR 0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md)): RTX 30 and RTX 40 cards are in
+scope beside SM120, which the Status below excluded.
+
+At load, `auto` first picks the 27B's solo width on an RTX 30 or RTX 40 card: the widest of its ladder the plan holds
+with nothing else adapted and room for a second request (GitHub #489, ADR 0018). Then, only when the plan is refused
+below its minimum, a profile's defaults adapt in a fixed order, as built (2026-10-23, GitHub #336): the drafter's
+head, whose `auto` is the full head on every class, so this step never fires on a built-in profile; the context, down
+by `model.adapt_context_step`, keeping the largest whose KV pool holds one full sequence and
+`vram.adapt_spare_tokens`; then `decode_lanes` 2 → 1 and the context ladder again. A value the operator names never
+adapts, except a solo width the plan refuses, which narrows to the prefill chunk. Each step is named in
+`ignis.runtime.vram_plan`'s `adapted`.
+
+`rtx-16gb` serves the 27B's 16 GB entry at 262,144 tokens on two lanes, with DFlash2, and vision on at a 4,096-token
+envelope under `host` residency
+([ADR 0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md));
+`rtx5090` and `rtx-24gb` take `host`, `rtxpro6000` `device`. The 16 GB and 24 GB profiles pin the 27B's solo width to
+their prefill chunk, 1,024 and 2,048.
+
+## History
+
+### Status
 
 Accepted (2026-10-21, after the owner's review: "accetto tutto"). Proposed the same day. Owner decisions in the 16 GB grill:
 - the profile is `auto` by card class;
@@ -61,7 +92,7 @@ Related:
 - [ADR 0060](0060-the-27b-has-a-trellis-body-for-small-cards.md): the 16 GB body;
 - [ADR 0064](0064-a-catalog-entry-states-its-card-class.md): the catalog entry's card class.
 
-## Context
+### Context
 
 Today the profile is chosen by name only (`--profile`, `IGNIS_PROFILE`, the config file), and its default is
 `rtx5090`. Nothing reads the card:
@@ -78,7 +109,7 @@ After that:
 `max_context`, the lanes and speculation are fixed, so a short budget is refused with the byte deficit. On a 16 GB card
 the free memory at start varies with what else holds the card, and 256K with DFlash2 fits only when little else does.
 
-## Decision
+### Decision
 
 1. **`--profile` defaults to `auto`.**
    - It picks the built-in profile by the card's total memory: ~32 GB → `rtx5090`, ~96 GB → `rtxpro6000`, ~16 GB → the
@@ -222,7 +253,7 @@ on a wrong premise:
   - The spec's 17,179,869,184-byte budget (16 GiB) cannot be used: it is below today's NVFP4 27B's weights line alone,
     17,234,723,840 bytes. The 16 GB body is #337/#338.
 
-## Considered options
+### Considered options
 
 - **Detect whether the card drives a display** (NVML `display_active`) and choose the context from it. Rejected by
   the owner. The free memory at start already says what the desktop holds, and adaptation answers it.
@@ -231,7 +262,7 @@ on a wrong premise:
 - **Refuse instead of adapting.** Rejected: a 16 GB card's free memory varies run to run, and refusing what a smaller
   context would serve helps no one.
 
-## Consequences
+### Consequences
 
 - A load may run a smaller context than its profile names, and says so in the log.
 - The order (drafter head, then context, then lanes) puts speed before context length, on purpose.

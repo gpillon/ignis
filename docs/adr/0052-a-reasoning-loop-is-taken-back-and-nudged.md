@@ -1,6 +1,30 @@
+---
+status: accepted
+amended-by: [ADR-0053]
+---
+
 # ADR 0052 — a reasoning loop is taken back, the model is nudged, and the client is told
 
-## Status
+## Current decision
+
+The guard stands as decided here, and **[ADR 0053](0053-a-loop-is-acted-on-once-it-persists.md)
+holds its detection and action**: read it for when the guard acts. A tokio task between a
+reasoning request's event stream and its consumer scores the normalized reasoning every 250
+characters. It acts only once `loop_guard_persist` checks in a row (4) have scored a loop, under
+`loop_guard_ratio` (265, was 200) and the raw gate, and a cut that would keep fewer than
+`loop_guard_min_kept` characters of reasoning (1) is only logged (`too_little_kept`). The action
+is a rewind: cancel, then a continuation whose prompt is the kept text and a nudge,
+`loop_guard_nudge` then `loop_guard_nudge_again` (config fields since 2026-10-16), and the
+thinking budget's close after `loop_guard_retries` (2).
+
+The rest stands as written below: `rewind` by default, the hashed tag, history repair always on,
+holdback off by default, the Responses state storing the model's view, `usage` counting the
+rewound tokens. The code is on `main` (`crates/server/src/loop_guard.rs`), not on the branch the
+Status names. ADR 0058 extends the flush of held-back reasoning to every surface with a deadline.
+
+## History
+
+### Status
 
 Accepted (2026-10-15, owner). The owner also ratified what the implementation decided on
 the way: the junction rule (a nudge after a kept line break goes in without its own
@@ -24,7 +48,7 @@ tokens; the guard is on (`rewind`) by default; **history repair** is always acti
 Responses state stores the model's view and carries it in `encrypted_content`; a
 **holdback** can hide a rewind from the client; the guard is wired on `/v1/responses`.
 
-## Context
+### Context
 
 Qwen3.8-27B loops inside its reasoning on long enumerations. On the Playground's "whole
 history of Rome" prompt, about a third of first turns loop
@@ -57,7 +81,7 @@ What the server cannot do is step back cheaply. On the hybrid models the GDN sta
 absorbs every token it is fed, and there is no position to return to without a
 checkpoint. The only way back is a new request whose prompt is the kept text.
 
-## Decision
+### Decision
 
 **A guard sits between a request's engine event stream and its consumer.** It is a tokio
 task, so it is off the scheduler thread and adds nothing to a round. It watches only the
@@ -241,7 +265,7 @@ A server built without a config (`Live::default()`: the in-process tests, the
 output-comparing GPU tests) runs the guard `off`: only a configured server (`main`, a
 live `PATCH`) rewinds, so no test meets a rewind it did not ask for.
 
-## Alternatives rejected
+### Alternatives rejected
 
 - **Roll back in place** (truncate the KV, restore the GDN state). Attention pages could
   be truncated. The recurrent state, though, would need a checkpoint at every possible cut
@@ -273,7 +297,7 @@ live `PATCH`) rewinds, so no test meets a rewind it did not ask for.
   know an invented one would show the loop and the continuation as one text. A tag
   degrades to text in a client that does not understand it.
 
-## Consequences
+### Consequences
 
 - **Reference parity.** Output differs from the reference whenever the guard acts. Benches
   and gates set `loop_guard=off` explicitly, since the default is `rewind`.

@@ -1,6 +1,43 @@
+---
+status: accepted
+---
+
 # ADR 0032 — the Linux release is the container build, and it is one pipeline
 
-## Status
+## Current decision
+
+The Linux binaries and the container image are one build: the
+`Containerfile`'s `build` stage compiles them, CI exports the tarball from
+its `artifacts` stage, and the same job builds the `runtime` image. It is one
+workflow, `release.yml`; the two-workflow split was withdrawn on 2026-09-21.
+A `test` job runs the CPU-only suite on both hosts before anything builds,
+`release` needs `version`, `linux` and `windows`, and nothing is run on a
+runner.
+
+Since then:
+
+- **Publishing** (the amendments below). A `v*` tag releases. A push to
+  `main` publishes the `develop` image and prerelease, never a release. A
+  push that changes only Markdown, `docs/`, `bench/` or `scripts/` starts no
+  run. Only `gpillon/ignis` publishes; `ci/**` and forks build and publish
+  nothing.
+- **The release builds compile the kernel leaf for `86;120a` on both hosts**
+  (`IGNIS_CUDA_ARCHITECTURES`, GitHub #456, #482), so the image and the
+  archives run on RTX 30 and RTX 40 cards as well as on RTX 50 and RTX PRO:
+  "SM120a-only" below no longer holds, though a build from a checkout is
+  still `120a` alone. Every packaged binary first passes
+  `mk/cuda-build-check.sh` (#408, #482, #512), and none links an NVIDIA
+  driver library (#329).
+- **A `macos` job** (#496) runs `cargo check` on arm64 without CUDA. No job
+  needs it, it cannot fail the run, and a tag's run skips it.
+- **The image carries no model and no driver.** `IGNIS_MODEL_ARTIFACT`, ADR
+  0046's name for `IGNIS_ARTIFACT`, is not defaulted. Unset, the server
+  downloads its default model (ADR 0033); with `--download-enabled false` it
+  starts on the CPU mock, the image's smoke test.
+
+## History
+
+### Status
 
 Accepted (2026-09-19, owner decision — GitHub #225). **Revised (2026-09-21,
 owner decision)**: the two-workflow split below is withdrawn — one workflow,
@@ -10,7 +47,7 @@ decision (the Linux binaries *are* the container build) is unchanged.
 driver library; the driver and NVML are opened at run time, so the image runs
 its no-GPU commands (`model download`, `--help`) on a machine without a driver.
 
-## Context
+### Context
 
 Until now `--features cuda` meant Windows. `crates/artifact/build.rs` ran
 `kernel/build.ps1` through powershell, looked for `ignis_*.lib` and linked
@@ -28,7 +65,7 @@ objects for rustc's PIE link, and the fact that `ignis_vendor` and
 re-scans the archives it is handed and had been resolving that silently; `ld`
 walks its inputs once.
 
-## Decision
+### Decision
 
 **The Linux binaries and the container image are one build.** The
 `Containerfile`'s `build` stage compiles the kernel leaf and the workspace
@@ -85,7 +122,7 @@ GB, so it is mounted; the driver is injected by the container runtime.
 the CPU mock (ADR 0006), which makes running the image a smoke test on its
 own.
 
-## Amendment (2026-10-07, owner decision): main publishes a development build
+### Amendment (2026-10-07, owner decision): main publishes a development build
 
 A push to `main` (and a `workflow_dispatch` run on `main`) now publishes, in
 addition to running the tests and both builds. It is **not a release**.
@@ -112,7 +149,7 @@ addition to running the tests and both builds. It is **not a release**.
 - A `v*` tag release is unchanged: same image tags, same `release` job, same
   body.
 
-## Amendment (2026-10-12, owner decision): a push that changes no behaviour builds nothing
+### Amendment (2026-10-12, owner decision): a push that changes no behaviour builds nothing
 
 A push to `main` or `ci/**` whose changed files are all Markdown, `docs/`,
 `bench/` or `scripts/` starts no run (`paths-ignore` on the push trigger). None
@@ -129,7 +166,7 @@ identical build. Tags are never path-filtered: a release always runs.
   the ignore list.
 - `workflow_dispatch` still builds on demand.
 
-## Amendment (2026-11-07, GitHub #495): only gpillon/ignis publishes
+### Amendment (2026-11-07, GitHub #495): only gpillon/ignis publishes
 
 A fork that keeps Actions on ran this workflow on its own push to `main` and
 published a `develop` prerelease under its name, with ignis's notes, from a
@@ -148,7 +185,7 @@ and the guide's Pages upload and deployment in `docs.yml`.
   input) whose condition does not start with the guard, so a new one is held
   to it as it lands.
 
-## Considered Options
+### Considered Options
 
 - **Install the CUDA toolkit on the Linux runner** and build with cargo
   directly, as the Windows job does — rejected: a second toolchain to keep in
@@ -171,7 +208,7 @@ and the guide's Pages upload and deployment in `docs.yml`.
   deferred: it diverges from the Windows link, which ships the redistributable
   `cudart64_*.dll` instead. The image is the self-contained option.
 
-## Consequences
+### Consequences
 
 - `kernel/build.sh` is the Linux half of `kernel/build.ps1` and must stay in
   step with it: same generator, same Release + `120a` configure, same
