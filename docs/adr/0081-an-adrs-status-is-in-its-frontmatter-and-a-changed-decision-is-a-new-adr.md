@@ -44,6 +44,11 @@ in its text, which stays the record of what was decided then and why.
   invalid frontmatter, a reference to an ADR that does not exist, back-links
   that disagree, a heading from 0070 on that carries its number, and an index
   out of date.
+- The same check refuses a change to the text of an ADR that is no longer
+  `proposed`, against the merge base with `main` or the push's base: the rule
+  above, written once, did not stop two in-place amendments on the day it was
+  decided (ADR 0080 by #536, ADR 0032 by #552, both since moved into new ADRs).
+  A typo fix passes when its commit message says `[typo ADR-NNNN]`.
 - The release notes (`mk/changelog.sh`) call an ADR amended only when its text
   changed, the frontmatter and link targets aside, and say when its status
   changed.
