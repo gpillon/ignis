@@ -1,0 +1,1 @@
+Write a complete Rust module that implements a binary min-heap generic over Ord, with push, pop, peek, len and is_empty, without std::collections::BinaryHeap. Reply with the code only, in one block.

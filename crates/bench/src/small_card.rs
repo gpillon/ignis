@@ -4,7 +4,8 @@
 //!
 //! It records the card (name, total VRAM, PCIe link), the load's VRAM plan
 //! lines, the shape it ran with and what its load adapted, decode tok/s on
-//! the coding prompts and on agent-like turns, and TTFT at 8K and 64K.
+//! the coding prompts (short replies), on agent-like turns and on long
+//! replies (#542), and TTFT at 8K and 64K.
 //! Everything it reads comes from what a server already exposes:
 //!
 //! - the card: `nvidia-smi` beside the server (no server route reports it),
@@ -13,7 +14,7 @@
 //!   beside it;
 //! - the plan: the metrics listener's `ignis_vram_reserved_bytes` lines and
 //!   `ignis_vram_budget_bytes`, the KV pool gauges, the build version, and
-//!   the speculative counters read before and after the decode phase; the
+//!   the speculative counters read before and after each decode set; the
 //!   listener is where `GET /v1/config`'s `server.metrics_bind` says;
 //! - the shape: `GET /v1/models` (the context and decode lanes the load runs,
 //!   and every adaptation it took), `GET /v1/models/catalog` (the loaded
@@ -58,7 +59,7 @@ pub const DEFAULT_CELLS: [u32; 2] = [8192, 65536];
 /// Samples per TTFT cell after the warmup: three keeps the run in minutes on
 /// a 16 GB card, where a 64K prefill is tens of seconds.
 pub const DEFAULT_SAMPLES: usize = 3;
-/// The output budget of a decode request.
+/// The output budget of a coding or agent request.
 pub const DEFAULT_DECODE_TOKENS: u32 = 256;
 /// The metrics listener's port when `GET /v1/config` does not say where it
 /// is: the port of the server's `DEFAULT_METRICS_BIND`, which the server
@@ -73,6 +74,23 @@ const AGENT_TURNS: [(&str, &str); 3] = [
     ("agent-refactor", include_str!("../fixtures/small_card/agent_turn_2.json")),
     ("agent-add-feature", include_str!("../fixtures/small_card/agent_turn_3.json")),
 ];
+
+/// The long-reply prompts: coding requests for a complete piece of code, each
+/// sent as one user message, so that the model's own answer runs to several
+/// hundred tokens (460 to 760 on the 27B's 16 GB artifact, greedy, #542).
+/// Written for this preset, never real traces.
+const LONG_REPLIES: [(&str, &str); 4] = [
+    ("long-lru-cache", include_str!("../fixtures/small_card/long_reply_1.txt")),
+    ("long-min-heap", include_str!("../fixtures/small_card/long_reply_2.txt")),
+    ("long-ring-buffer", include_str!("../fixtures/small_card/long_reply_3.txt")),
+    ("long-todo-server", include_str!("../fixtures/small_card/long_reply_4.txt")),
+];
+/// The long-reply cell's cap: a guard against a reply that runs away, not a
+/// target. `--decode-tokens` does not move it.
+pub const LONG_REPLY_TOKENS: u32 = 1024;
+/// A long reply that ends under this many tokens measured less than its
+/// prompt was written for, and the record's notes name it.
+pub const LONG_REPLY_FLOOR: u32 = 256;
 
 /// Where the metrics listener is read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +115,8 @@ pub struct Options {
     pub cells: Vec<u32>,
     /// Samples per cell after the warmup.
     pub samples: usize,
-    /// The output budget of a decode request.
+    /// The output budget of a coding or agent request; the long replies run
+    /// to [`LONG_REPLY_TOKENS`].
     pub decode_tokens: u32,
 }
 
@@ -297,7 +316,7 @@ impl Metrics {
     }
 }
 
-/// What the decode phase did to the speculative counters.
+/// What a decode set, or the three of them, did to the speculative counters.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SpeculativeDelta {
     pub rounds: u64,
@@ -307,6 +326,13 @@ pub struct SpeculativeDelta {
     pub acceptance: Option<f64>,
     /// accepted / rounds: the drafts a round commits beyond its own token.
     pub accepted_per_round: Option<f64>,
+}
+
+/// The change of the speculative counters between two reads of the metrics
+/// listener: `None` when either read failed, or when the later one has no
+/// counters (no speculation, or no verify round yet).
+fn speculative_between(before: Option<&Metrics>, after: Option<&Metrics>) -> Option<SpeculativeDelta> {
+    Some(speculative_delta(before?.speculative(), after?.speculative()?))
 }
 
 /// The change of the speculative counters across a phase. `before` is `None`
@@ -519,6 +545,10 @@ pub struct DecodeSet {
     pub median_tokens_per_s: Option<f64>,
     /// Total tokens over total decode time (the pooled rate).
     pub pooled_tokens_per_s: Option<f64>,
+    /// The speculative counters' change across this set, read from the
+    /// metrics listener before and after it; `None` when either read failed
+    /// or found no counters.
+    pub speculative: Option<SpeculativeDelta>,
 }
 
 pub fn summarize_decode(max_tokens: u32, samples: Vec<DecodeSample>, errors: Vec<String>) -> DecodeSet {
@@ -532,6 +562,7 @@ pub fn summarize_decode(max_tokens: u32, samples: Vec<DecodeSample>, errors: Vec
         pooled_tokens_per_s: (seconds > 0.0).then(|| tokens / seconds),
         samples,
         errors,
+        speculative: None,
     }
 }
 
@@ -685,7 +716,11 @@ pub fn cell_does_not_fit(prompt_tokens: u32, limit: u64) -> Option<String> {
 pub struct Decode {
     pub coding: Option<DecodeSet>,
     pub agent: Option<DecodeSet>,
-    /// The speculative counters' change across both sets.
+    pub long: Option<DecodeSet>,
+    /// The speculative counters' change across the three sets, from the read
+    /// before the first to the read after the last: the sum of theirs, the
+    /// warmup before them left out. A read between two sets that failed
+    /// leaves the sets beside it `None` and this total as it is.
     pub speculative: Option<SpeculativeDelta>,
 }
 
@@ -728,14 +763,15 @@ fn ttft_cell(cell: &ttft::Cell) -> TtftCell {
     }
 }
 
-/// Thinking off for the coding prompts: a turn that ends inside its reasoning
-/// makes the server log a `generation produced reasoning but no content` WARN
-/// that a reader of the log takes for an error, and the decode work per token
-/// is the same on either channel (#340, live). Thinking on for the agent
-/// turns: without it they answer with a tool call, which the server holds back
-/// until it parses and sends in one chunk, so the stream has no time after its
-/// first token to divide by; their reasoning streams token by token (#340,
-/// live on main).
+/// Thinking off for the coding prompts and the long replies: a turn that ends
+/// inside its reasoning makes the server log a `generation produced reasoning
+/// but no content` WARN that a reader of the log takes for an error, and the
+/// decode work per token is the same on either channel (#340, live); the long
+/// replies then measure the visible code a user reads. Thinking on for the
+/// agent turns: without it they answer with a tool call, which the server
+/// holds back until it parses and sends in one chunk, so the stream has no
+/// time after its first token to divide by; their reasoning streams token by
+/// token (#340, live on main).
 fn decode_request(id: &str, prompt: String, max_tokens: u32, thinking: bool) -> Request {
     Request {
         id: id.to_string(),
@@ -760,6 +796,22 @@ fn untimed_note(label: &str, set: &DecodeSet) -> Option<String> {
             untimed.join(", ")
         )
     })
+}
+
+/// A note for each long reply that ended under [`LONG_REPLY_FLOOR`] tokens: it
+/// stays in its cell, which then measured a shorter reply than its prompt asks
+/// for.
+fn short_reply_notes(set: &DecodeSet) -> Vec<String> {
+    set.samples
+        .iter()
+        .filter(|s| s.completion_tokens < LONG_REPLY_FLOOR)
+        .map(|s| {
+            format!(
+                "decode long: {} ended after {} tokens, under {LONG_REPLY_FLOOR}: a shorter reply than the cell is written for, kept in it",
+                s.prompt, s.completion_tokens
+            )
+        })
+        .collect()
 }
 
 fn measure_decode(ep: &dyn Endpoint, prompts: Vec<(String, String)>, max_tokens: u32, thinking: bool) -> DecodeSet {
@@ -906,29 +958,41 @@ pub fn run(opts: &Options, nvidia_smi: &dyn Fn() -> Result<String, String>) -> R
             }
         }
     };
-    let before = metrics_now(&mut notes);
 
     // Decode.
     let ep = api.clone().as_recorded(true);
-    let (mut decode, mut ttft_cells) = (Decode { coding: None, agent: None, speculative: None }, Vec::new());
+    let (mut decode, mut ttft_cells) = (Decode { coding: None, agent: None, long: None, speculative: None }, Vec::new());
     if model_id.is_some() {
         // One short request first: a cold server's first request pays one-off costs.
         let _ = ep.complete(&decode_request("warmup", CANARIES[0].prompt.to_string(), 16, false));
+        // The speculative counters are read after the warmup and after each
+        // set: a set carries the change across it, and the total, the change
+        // across the three sets, is their sum.
+        let first = metrics_now(&mut notes);
+        let mut last = first.clone();
+        let mut measure = |prompts, max_tokens, thinking, notes: &mut Vec<String>| {
+            let mut set = measure_decode(&ep, prompts, max_tokens, thinking);
+            let now = metrics_now(notes);
+            set.speculative = speculative_between(last.as_ref(), now.as_ref());
+            last = now;
+            set
+        };
         let coding: Vec<(String, String)> = CANARIES.iter().map(|c| (c.id.to_string(), c.prompt.to_string())).collect();
-        let coding = measure_decode(&ep, coding, opts.decode_tokens, false);
+        let coding = measure(coding, opts.decode_tokens, false, &mut notes);
         let agent: Vec<(String, String)> =
             AGENT_TURNS.iter().map(|(id, body)| (id.to_string(), body.to_string())).collect();
-        let agent = measure_decode(&ep, agent, opts.decode_tokens, true);
+        let agent = measure(agent, opts.decode_tokens, true, &mut notes);
+        let long: Vec<(String, String)> =
+            LONG_REPLIES.iter().map(|(id, prompt)| (id.to_string(), prompt.trim().to_string())).collect();
+        let long = measure(long, LONG_REPLY_TOKENS, false, &mut notes);
         notes.extend(untimed_note("coding", &coding));
         notes.extend(untimed_note("agent", &agent));
-        (decode.coding, decode.agent) = (Some(coding), Some(agent));
-        let after = metrics_now(&mut notes);
-        match (&before, after.as_ref().and_then(Metrics::speculative)) {
-            (Some(b), Some(a)) => decode.speculative = Some(speculative_delta(b.speculative(), a)),
-            (Some(_), None) => notes.push(
-                "speculative: the server exports no speculative counters (no speculation, or no verify round ran)".into(),
-            ),
-            _ => {}
+        notes.extend(untimed_note("long", &long));
+        notes.extend(short_reply_notes(&long));
+        (decode.coding, decode.agent, decode.long) = (Some(coding), Some(agent), Some(long));
+        decode.speculative = speculative_between(first.as_ref(), last.as_ref());
+        if first.is_some() && last.as_ref().is_some_and(|m| m.speculative().is_none()) {
+            notes.push("speculative: the server exports no speculative counters (no speculation, or no verify round ran)".into());
         }
     } else {
         notes.push("no model answered at /v1/models: nothing was measured".into());
@@ -1251,6 +1315,20 @@ ignis_speculative_position_accepted_total{position=\"1\"} 90\n";
     }
 
     #[test]
+    fn a_long_reply_that_ends_under_256_tokens_is_named() {
+        let samples = vec![
+            decode_sample("long-a", Some(60), 255, 50.0, 1050.0),
+            decode_sample("long-b", Some(60), 256, 50.0, 1050.0),
+            // a reply that reached the cap is kept without a note: the cap is
+            // a guard, not a target
+            decode_sample("long-c", Some(60), 1024, 50.0, 3050.0),
+        ];
+        let notes = short_reply_notes(&summarize_decode(LONG_REPLY_TOKENS, samples, vec!["long-d: timeout".into()]));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("decode long: long-a ended after 255 tokens, under 256"), "{}", notes[0]);
+    }
+
+    #[test]
     fn a_cell_that_does_not_fit_names_the_largest_that_does() {
         // B3: the running context is 65,536, the default 64K cell reaches 8 past it
         let why = cell_does_not_fit(65_536, 65_536).expect("does not fit");
@@ -1294,7 +1372,7 @@ ignis_speculative_position_accepted_total{position=\"1\"} 90\n";
             plan: Plan { budget_bytes: None, reserved_bytes_by_line: None, kv_pool_pages: None, kv_page_bytes: None },
             config: None,
             adaptation: adaptation(&BTreeMap::new(), None),
-            decode: Decode { coding: None, agent: None, speculative: None },
+            decode: Decode { coding: None, agent: None, long: None, speculative: None },
             ttft: vec![TtftCell::unmeasured(65_536, "does not fit".into())],
             notes: Vec::new(),
         }
@@ -1310,6 +1388,9 @@ ignis_speculative_position_accepted_total{position=\"1\"} 90\n";
         assert_eq!(back["ttft"][0]["error"], "does not fit");
     }
 
+    /// What no fixture may carry: a local path, a user's directory, a key.
+    const PRIVATE: [&str; 7] = ["F:\\", "F:/", "C:\\", "/home/", "Users", "sk-", ".scratch"];
+
     #[test]
     fn the_agent_fixtures_are_synthetic_chat_bodies_with_tools_and_history() {
         for (id, body) in AGENT_TURNS {
@@ -1320,8 +1401,21 @@ ignis_speculative_position_accepted_total{position=\"1\"} 90\n";
             assert!(messages.iter().any(|m| m["role"] == "tool"), "{id}: tool-ish history");
             assert_eq!(messages.last().unwrap()["role"], "user", "{id}: ends on the coding ask");
             assert!(crate::client::is_recorded_chat_body(body), "{id}");
-            for private in ["F:\\", "F:/", "C:\\", "/home/", "Users", "sk-", ".scratch"] {
+            for private in PRIVATE {
                 assert!(!body.contains(private), "{id} mentions {private}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_long_reply_fixtures_are_plain_asks_for_a_whole_piece_of_code() {
+        for (id, prompt) in LONG_REPLIES {
+            assert!(id.starts_with("long-"), "{id}");
+            assert!(!crate::client::is_recorded_chat_body(prompt), "{id}: sent as one user message");
+            assert!(prompt.trim().starts_with("Write a complete"), "{id}: {prompt}");
+            assert!(!prompt.trim().contains('\n'), "{id}: one paragraph");
+            for private in PRIVATE {
+                assert!(!prompt.contains(private), "{id} mentions {private}");
             }
         }
     }

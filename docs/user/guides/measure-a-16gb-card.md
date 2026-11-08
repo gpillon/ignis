@@ -40,8 +40,9 @@ a note; the rest is measured as usual.
 
 The record is printed on stdout and, with `--out`, written to that file too;
 the progress goes to stderr. On the project's 5090 inside a 16 GB budget it
-took two minutes, most of it the 64K time-to-first-token cell, which a 16 GB
-card's slower prefill makes longer; `--cells 8192` leaves that cell out.
+took two and a half minutes, most of it the 64K time-to-first-token cell,
+which a 16 GB card's slower prefill makes longer; `--cells 8192` leaves that
+cell out.
 
 Measure the server with nothing else using it: the decode figures are one
 request at a time, and another client's requests would land in them.
@@ -62,14 +63,27 @@ request at a time, and another client's requests would land in them.
   to imitate a 16 GB card) took
   `max_context 262144 -> 65536 (adapt_context_step 65536, adapt_spare_tokens
   65536)` ([when a profile does not fit](../concepts/profiles.md#when-a-profile-does-not-fit)).
-- **Decode speed**: tokens per second on the coding prompts and on three
-  synthetic agent turns (a system prompt, tool calls and their results, a
-  coding request), 256 tokens each, and how many draft tokens DFlash2 got
-  accepted meanwhile. The coding prompts run with thinking off; the agent turns
-  think, because a tool call reaches the client whole and only the reasoning
-  before it streams token by token. An agent turn that is still reasoning at
-  256 tokens makes the server log `generation produced reasoning but no
-  content`, which is expected here.
+- **Decode speed**, in three cells of requests sent one at a time. Each cell
+  has every request's tokens, time to first token and rate (the tokens after
+  the first over the time after the first), the median and pooled rate, and
+  how many draft tokens DFlash2 got accepted across it (its `speculative`);
+  `decode.speculative` is the three cells' sum.
+  - `decode.long`, **long replies**: four coding requests for a complete
+    piece of code (a module with its tests, a small program), thinking off,
+    each ending on its own after several hundred tokens, with 1,024 as a cap
+    against a reply that runs away. **This is the rate to quote**: the speed
+    the card holds while it writes an answer. A reply that ends under 256
+    tokens stays in the cell and adds a note naming its prompt.
+  - `decode.coding`, **short replies**: the four coding prompts of the canary
+    suite, thinking off, 256 tokens at most. Most end within a few dozen
+    tokens, in a handful of speculative rounds, so their rate is mostly the
+    fixed cost of a request: it says how quickly a short answer comes back.
+  - `decode.agent`: three synthetic agent turns (a system prompt, tool calls
+    and their results, a coding request), 256 tokens at most. They think,
+    because a tool call reaches the client whole and only the reasoning
+    before it streams token by token. An agent turn that is still reasoning
+    at 256 tokens makes the server log `generation produced reasoning but no
+    content`, which is expected here.
 - **Time to first token** at 8,192 and 65,536 prompt tokens, three cold samples
   each after a warm-up. A cell longer than the context the load runs is not
   measured: the record says so and names the largest cell that fits, which
@@ -81,9 +95,10 @@ request at a time, and another client's requests would land in them.
 
 `--metrics` points at the metrics listener when it is not where the server's
 `server.metrics_bind` says (the endpoint's host on that port); `--metrics off`
-skips it, and the plan lines are then empty. `--samples` and
-`--decode-tokens` change the sample counts. A piece it cannot read is `null`,
-never a failed run.
+skips it, and the plan lines and the `speculative` counters are then `null`.
+`--samples` changes the time-to-first-token cells' sample count, and
+`--decode-tokens` the short replies' and agent turns' cap; the long replies
+keep theirs. A piece it cannot read is `null`, never a failed run.
 
 ## What it never records
 

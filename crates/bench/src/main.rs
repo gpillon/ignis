@@ -69,9 +69,12 @@
 //!       from `nvidia-smi`), the load's VRAM plan lines and shape (the metrics
 //!       listener, `/v1/models` with the context, lanes and adaptations the
 //!       load runs at, `/v1/models/catalog`, `/v1/config`), decode tok/s on
-//!       the coding prompts and on synthetic agent-like turns, thinking off,
-//!       and TTFT at the cells (8K and 64K; the prompts are counted through
-//!       the server's own `/v1/tokenize`, so no artifact is needed).
+//!       the coding prompts (short replies, thinking off), on synthetic
+//!       agent-like turns (thinking on) and on long replies (thinking off, a
+//!       1,024-token cap that `--decode-tokens` does not move), each set with
+//!       its own speculative counters, and TTFT at the cells (8K and 64K;
+//!       the prompts are counted through the server's own `/v1/tokenize`, so
+//!       no artifact is needed).
 //!       `--metrics` defaults to the endpoint's host on the port of the
 //!       server's `server.metrics_bind` (`/v1/config`; 9464 when it does not
 //!       say); `off` skips it. A piece that cannot be read is `null` with a

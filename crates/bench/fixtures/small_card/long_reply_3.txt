@@ -1,0 +1,1 @@
+Write a complete TypeScript module that implements a generic fixed-capacity ring buffer class with push, pop, peek, size and iteration, which overwrites the oldest item when full. Reply with the code only, in one block.

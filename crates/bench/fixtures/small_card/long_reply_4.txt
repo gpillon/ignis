@@ -1,0 +1,1 @@
+Write a complete Go program: an HTTP server holding an in-memory to-do list behind a mutex, serving GET /todos, POST /todos and DELETE /todos/{id} as JSON. Reply with the code only, in one block.
