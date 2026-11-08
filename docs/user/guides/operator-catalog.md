@@ -16,8 +16,8 @@ models:
     revision: v1                       # commit, tag or branch; required
     artifact: acme_ft.ninfer           # the file the server loads
     # kind: speech                     # optional: "speech" or "diarizer" (see below); a text or image model states none
-    card_class: 32                     # optional: the smallest card class it loads on, in GB: 16, 24 (from 0.10.0), 32 or 96
-    # generation: blackwell            # optional, from 0.10.0 (a 0.9 release refuses the key): the oldest GPU generation it loads on: ampere, ada or blackwell
+    card_class: 32                     # optional: the smallest card class it loads on, in GB: 16, 24, 32 or 96
+    # generation: blackwell            # optional: the oldest GPU generation it loads on: ampere, ada or blackwell
     # family: qwen3.8-27b              # optional: its model family, by the family's own id (see below)
     # aliases: [qwen3.8-27b]           # optional: the ids it answers to on a smaller card: its family's default id, or another entry's of its family
     # license: { id: acme-1.0, url: "https://acme.example/LICENSE" }   # optional: the license its weights are published under (see below)
@@ -43,7 +43,8 @@ an alias that is neither a model family's default id nor another entry's id
 entry's, names an entry whose family nothing states, or is already another
 entry's — a built-in one's included. A relative `--download-catalog` set in a config file is read
 from that file's directory; from a flag or an env var, from the working
-directory. An entry with no `card_class` states no class: it is never refused
+directory. The 24 GB class and the `generation` key are from 0.10.0: a 0.9
+release refuses the key. An entry with no `card_class` states no class: it is never refused
 by class, so a catalog written before card classes still starts, and only the
 VRAM plan says it does not fit. From 0.10.0 an entry with no `generation` loads on every
 GPU generation the build runs on; one that states it is refused on an older
