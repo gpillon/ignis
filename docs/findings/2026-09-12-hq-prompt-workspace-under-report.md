@@ -5,6 +5,7 @@
 - Observed: 2026-09-12
 - Last verified: 2026-10-01
 - Scope: kernel / vendored `ninfer::ops::gqa_attention` capacity query, hq-e8-2b prefill
+- Topic: kv-and-state
 - Related: [GitHub #123](https://github.com/gpillon/ignis/issues/123),
   [GitHub #296](https://github.com/gpillon/ignis/issues/296),
   [ADR 0037](../adr/0037-a-vendored-file-may-carry-a-correctness-patch.md),
@@ -12,6 +13,7 @@
   [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md),
   `kernel/include/ignis_gqa_workspace.h`
 - Superseded by: none
+- Summary: The vendored GQA capacity query under-reports an hq-e8-2b prompt call by one split-partial set at widths 9..16, corrected at the caller, and past one 262,144-key band drops the carry's padding, fixed by a vendored patch (ADR 0037).
 
 ## Question
 

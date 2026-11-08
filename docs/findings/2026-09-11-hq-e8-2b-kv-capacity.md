@@ -5,8 +5,10 @@
 - Observed: 2026-09-11
 - Last verified: 2026-09-11
 - Scope: kernel / paged KV cache, scheduler capacity
+- Topic: kv-and-state
 - Related: [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md), [spec 04](../specs/runtime/04-reference-feature-floor.md), [#65](https://github.com/gpillon/ignis/issues/65), [#112](https://github.com/gpillon/ignis/issues/112)
 - Superseded by: none
+- Summary: hq-e8-2b stores a sequence-token of the 27B in 9,216 bytes against BF16's 65,536 (7.11x denser), so 8 lanes at 40,960 context need ~3.02 GB of KV instead of 20 GiB.
 
 ## Question
 
@@ -33,7 +35,7 @@ Model geometry from `GLOSSARY.md`: 16 GQA layers, 4 KV heads of 256, K and V
 both stored.
 
 BF16 per sequence-token: `16 × 4 × 256 × 2 roles × 2 bytes = 65,536`. This
-matches the figure already recorded in `docs/DEFERRED-DECISIONS.md` item 6
+matches the figure already recorded in `docs/archive/DEFERRED-DECISIONS.md` item 6
 and in the G3 verdict.
 
 hq-e8-2b per sequence-token: `16 × 4 × 2 roles × (64 + 8) = 9,216`.

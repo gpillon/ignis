@@ -6,8 +6,10 @@
 - Last verified: 2026-11-07
 - Scope: server / model download, the entry lock (`crates/server/src/download/lock.rs`); test harness / Linux
   flakes in `model_download.rs` and `responses_socket.rs`
+- Topic: harness-and-build
 - Related: [GitHub #492](https://github.com/gpillon/ignis/issues/492), [GitHub #379](https://github.com/gpillon/ignis/issues/379)
 - Superseded by: none
+- Summary: On Linux an entry lock released only by closing its file stays held after its drop while a process forked meanwhile has not yet exec'd, as `flock`'s semantics imply, and an explicit unlock frees it at once (`model_download` 100 of 100).
 
 ## Question
 

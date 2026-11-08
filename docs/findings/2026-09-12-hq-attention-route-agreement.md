@@ -5,11 +5,13 @@
 - Observed: 2026-09-12
 - Last verified: 2026-09-12
 - Scope: kernel / GQA attention routes, hq-e8-2b KV cache
+- Topic: kv-and-state
 - Related: [GitHub #123](https://github.com/gpillon/ignis/issues/123),
   [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md),
   [hq-e8-2b KV capacity](2026-09-11-hq-e8-2b-kv-capacity.md),
   `kernel/tests/test_hq_route_agreement.cu`
 - Superseded by: none
+- Summary: hq attention agrees with the BF16 route to ~0.23 median relative L2 on identical keys and values, its few rows past 1.0 being softmax flips between near-tied keys, so the bound is the median plus a capped fraction, not a per-row maximum.
 
 ## Question
 

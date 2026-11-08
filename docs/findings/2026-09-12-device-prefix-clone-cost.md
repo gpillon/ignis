@@ -5,11 +5,13 @@
 - Observed: 2026-09-12
 - Last verified: 2026-09-12
 - Scope: kernel / device prefix reuse, sequence state transfer
+- Topic: kv-and-state
 - Related: [GitHub #126](https://github.com/gpillon/ignis/issues/126),
   [ADR 0024](../adr/0024-sequence-state-transfer.md),
   [Sequence snapshot transfer cost](2026-09-12-sequence-snapshot-transfer-cost.md),
   [Prefill chunk wall time](2026-09-11-prefill-chunk-wall-time.md)
 - Superseded by: none
+- Summary: The device-to-device clone behind prefix reuse costs ~0.25 ms for 148 MiB of mutable state on the 5090, ~8,000x cheaper than re-prefilling the head, and one strided copy per section instead of one per layer is worth 6x.
 
 ## Question
 

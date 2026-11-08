@@ -7,6 +7,7 @@
 - Scope: kernel / every CUDA translation unit of `ignis_kernel` and `ignis_vendor` and its op tests, the build's
   architecture target, the instructions each route needs; serving / `--profile auto` and the card class; models / which
   catalog entry depends on which route
+- Topic: host-and-gpu
 - Related: [GitHub #456](https://github.com/gpillon/ignis/issues/456), [GitHub #457](https://github.com/gpillon/ignis/issues/457),
   [ADR 0005](../adr/0005-performance-first-principle.md),
   [ADR 0010](../adr/0010-vendored-reference-kernels.md),
@@ -17,6 +18,7 @@
   [dense trellis kernels on the 5090](2026-10-23-dense-trellis-kernels-on-the-5090.md),
   [Metal and AMD backends](2026-10-31-metal-and-amd-backends-seam-and-roads.md)
 - Superseded by: none
+- Summary: Compiled for sm_89, 172 of the leaf's 227 CUDA translation units pass and 55 fail on five causes, 40 only on programmatic dependent launch, and only the NVFP4 W4A4 prefill and the block-scaled FP8 MMA lack an Ada or Ampere counterpart.
 
 ## Question
 

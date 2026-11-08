@@ -5,6 +5,7 @@
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
 - Scope: kernel / GQA attention workspace, prefill chunk cost, GPU A/B method
+- Topic: kv-and-state
 - Related: [#84](https://github.com/gpillon/ignis/issues/84) (where the zeroing
   was introduced), [#92](https://github.com/gpillon/ignis/issues/92) (the chunk
   profiler this reuses), [#123](https://github.com/gpillon/ignis/issues/123)
@@ -13,6 +14,7 @@
   [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md),
   [Prefill chunk wall time](2026-09-11-prefill-chunk-wall-time.md)
 - Superseded by: none
+- Summary: Under hq-e8-2b the GQA attention's output does not depend on what its workspace held, so zeroing the workspace per layer was dead work worth 2.12% of GQA layer device time on a 70K prefill; BF16 keeps the zeroing.
 
 **Hardware:** RTX 5090, exclusive card (ADR 0006).
 **Model:** `qwen3_8_27b_nvfp4full-v2.ninfer`, 64 layers — 16 GQA at indices

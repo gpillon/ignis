@@ -5,8 +5,10 @@
 - Observed: 2026-10-31
 - Last verified: 2026-10-31
 - Scope: serving / `CudaDevice::nvml_memory`, the `ignis.runtime.vram_loaded` log line, `crates/artifact/tests/nvml_memory_gpu.rs`; on the RTX 5090 (Windows/WDDM)
+- Topic: host-and-gpu
 - Related: https://github.com/gpillon/ignis/issues/424, https://github.com/gpillon/ignis/issues/210, https://github.com/gpillon/ignis/issues/324
 - Superseded by: none
+- Summary: Under WDDM on the 5090, NVML's free reading right after a 1 GiB `cudaMalloc` missed 64 to 448 MiB in 6 of 20 allocations, counted 27 to 63 ms later, so a test reading NVML after an allocation must wait for the count.
 
 ## Question
 

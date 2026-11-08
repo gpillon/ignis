@@ -5,8 +5,10 @@
 - Observed: 2026-10-21
 - Last verified: 2026-10-21
 - Scope: model / weight quantization of Qwen3.8-27B: the public EXL3 quant `turboderp/Qwen3.8-27B-exl3` branch `SC_3.00bpw_H4` (trellis, `mul1`, K per matrix 2-5, head at 4 bits), against BF16 and against ignis's served NVFP4; DFlash2 speculation on that target
+- Topic: artifacts-and-gates
 - Related: [ADR 0060](../adr/0060-the-27b-has-a-trellis-body-for-small-cards.md); spec [27b-16gb](../specs/27b-16gb/spec.md); [KLD against BF16](2026-09-24-kld-against-bf16.md); [DFlash2 sampled acceptance](2026-09-24-dflash2-sampled-acceptance.md)
 - Superseded by: none
+- Summary: On the 2026-09-24 windows the public 3.0 bpw EXL3 quant of the 27B is KLD 0.0340 against BF16 versus the served NVFP4's 0.0458, lower in 16 of 16 windows, and DFlash2's tokens per round on it equal a 5 bpw control at 8K-128K.
 
 ## Question
 

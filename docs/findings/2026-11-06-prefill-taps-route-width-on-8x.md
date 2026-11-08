@@ -5,8 +5,10 @@
 - Observed: 2026-11-06
 - Last verified: 2026-11-06
 - Scope: kernel / the NVFP4 A16 MMA route's narrowest width per GPU generation (`ignis_nvfp4_a16_mma_min_tokens`), the DFlash2 drafter's context append in a prefill chunk
+- Topic: host-and-gpu
 - Related: [GitHub #521](https://github.com/gpillon/ignis/issues/521), [GitHub #502](https://github.com/gpillon/ignis/issues/502), [GitHub #516](https://github.com/gpillon/ignis/issues/516), [ADR 0080](../adr/0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md)
 - Superseded by: none
+- Summary: Timed twice at T = 1 to 64 on an sm_86 card, the NVFP4 A16 MMA route beats the GEMVs on both DFlash2 feature-tap problems from 26 columns and loses at 25, so compute capability 8.x takes the taps' route from 26.
 
 ## Question
 

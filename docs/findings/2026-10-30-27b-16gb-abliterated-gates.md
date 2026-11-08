@@ -5,6 +5,7 @@
 - Observed: 2026-10-30
 - Last verified: 2026-10-30
 - Scope: quality / the 27B's abliterated 16 GB artifact (`qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer`, identity `qwen3.8-27b` / `trellis-sc30-abliterated`): the 70-matrix override's re-quantization and build, KLD against the abliterated BF16 (gate 1), DFlash2 tokens per round on #340's replay (gate 2), a refusal A/B (gate 3)
+- Topic: artifacts-and-gates
 - Related: [GitHub #422](https://github.com/gpillon/ignis/issues/422),
   [spec #386](https://github.com/gpillon/ignis/issues/386) (Gates),
   [GitHub #421](https://github.com/gpillon/ignis/issues/421) (the re-quantization),
@@ -12,6 +13,7 @@
   [ADR 0060](../adr/0060-the-27b-has-a-trellis-body-for-small-cards.md),
   [ADR 0074](../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md)
 - Superseded by: none
+- Summary: Re-quantizing only its 70 changed matrices, the abliterated 16 GB artifact passes all three gates on the 5090 as a 16 GB card: KLD 0.04088 against the abliterated BF16 (limit 0.0484), DFlash2 0.9986x the default's, and refusals flip.
 
 ## Question
 

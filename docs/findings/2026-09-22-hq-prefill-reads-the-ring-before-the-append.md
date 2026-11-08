@@ -5,8 +5,10 @@
 - Observed: 2026-09-22
 - Last verified: 2026-09-22
 - Scope: kernel / hq-e8-2b prompt route, residual window, vendored correctness patch; serving / tool-call decisions
+- Topic: kv-and-state
 - Related: [#258](https://github.com/gpillon/ignis/issues/258), [#257](https://github.com/gpillon/ignis/issues/257), [#173](https://github.com/gpillon/ignis/issues/173); spec [runtime/07](../specs/runtime/07-hq-prefill-ring-read-before-append.md); [ADR 0037](../adr/0037-a-vendored-file-may-carry-a-correctness-patch.md); [the residual window was the tool-call gap](2026-09-22-the-residual-window-was-the-tool-call-gap.md)
 - Superseded by: none
+- Summary: Attending a prefill chunk before appending it to the 512-key ring (#258, a vendored correctness patch) makes hq prefill bit-exactly causal at no measurable cost, and #173's tool-call count (17 to 16) reads as near-tie sensitivity.
 
 ## Question
 

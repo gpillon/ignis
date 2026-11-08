@@ -1,12 +1,16 @@
 # The codebase as an n-gram memory: the summary exists, the injection cannot use it
 
 - Kind: experiment
-- Status: current
+- Status: archived
 - Observed: 2026-09-19
 - Last verified: 2026-09-19
 - Scope: retrieval / conditional memory, hidden-state structure, PyTorch measurement vehicle
+- Topic: harness-and-build
 - Related: [`.scratch/ngram-study/02-storage.md`](../../.scratch/ngram-study/02-storage.md) (plan), [`.scratch/ngram-study/03-risultati.md`](../../.scratch/ngram-study/03-risultati.md) (full numbers), [`.scratch/ngram-study/00-fatti.md`](../../.scratch/ngram-study/00-fatti.md) (primary sources on Flash-Next / Engram)
 - Superseded by: none
+- Summary: Closed negative result: a use site picks its own definition out of 200 candidates 41.3% of the time at layer 19 of 64, but no injection made that a better prediction than a shuffled-value control, so the UVA gather fast path was not built.
+
+> **Archived.** A closed negative result: the fast path it tested should not be built, and was not.
 
 ## Question
 

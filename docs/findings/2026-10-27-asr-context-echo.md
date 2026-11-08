@@ -7,9 +7,11 @@
 - Scope: speech / Qwen3-ASR-1.7B (the `auto` entry, Q4_K_M decoder) on the CPU through
   `POST /v1/audio/transcriptions`: the text on silence, white noise, a meeting's silent gaps and short turns and the
   heads of Italian clips, under five contexts; the guard `copies_context` that answers it
+- Topic: speech
 - Related: [#362](https://github.com/gpillon/ignis/issues/362), [spec speech/07](../specs/speech/07-transcribe.md),
   [Naming the language in the context](2026-10-27-asr-language-hint.md), [Speech to text](../user/api/transcriptions.md)
 - Superseded by: none
+- Summary: Given a topic and terms in its context, Qwen3-ASR wrote the topic line as the transcript of 4 to 10 of 50 pauses and short turns, never without context, and a guard emptying a transcript that repeats a context line takes 15 of 17 copies.
 
 ## Question
 

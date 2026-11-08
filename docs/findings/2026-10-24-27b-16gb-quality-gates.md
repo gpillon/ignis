@@ -7,6 +7,7 @@
 - Scope: quality / the 27B's trellis body (`gpillon/Qwen3.8-27B-trellis-3bpw-ignis`) through ignis's engine path against
   the served NVFP4 artifact and BF16: KLD on the 2026-09-24 suite (gate 1), MMLU-Pro through the engine's logits (gate 2),
   DFlash2 tokens per round on a teacher-forced replay (gate 3), the reasoning-loop rate (gate 4), per-domain KLD
+- Topic: artifacts-and-gates
 - Related: [GitHub #340](https://github.com/gpillon/ignis/issues/340),
   [spec 27b-16gb/05](../specs/27b-16gb/05-gates-and-simulation.md) (Part B, Acceptance 1-4),
   [the 16 GB artifact: first light](2026-10-23-27b-16gb-first-light.md),
@@ -16,6 +17,7 @@
   [ADR 0052](../adr/0052-a-reasoning-loop-is-taken-back-and-nudged.md),
   [ADR 0060](../adr/0060-the-27b-has-a-trellis-body-for-small-cards.md)
 - Superseded by: none
+- Summary: The 27B's 16 GB trellis artifact passes all four gates on the 5090: KLD 0.0403, 0.77x the NVFP4's at chunk 1,024 (limit 1.2x), MMLU-Pro 65.84% against BF16's 67.97%, loops 9/32 against 14/32, DFlash2 tokens per round 0.996x.
 
 ## Question
 

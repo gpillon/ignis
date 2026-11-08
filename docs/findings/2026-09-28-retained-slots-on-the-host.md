@@ -5,12 +5,14 @@
 - Observed: 2026-09-28
 - Last verified: 2026-09-29
 - Scope: kernel / sequence pool retained slots; scheduler prompt reuse; VRAM plan
+- Topic: kv-and-state
 - Related: [GitHub #281](https://github.com/gpillon/ignis/issues/281),
   [ADR 0030](../adr/0030-device-memory-reserved-at-load.md),
   [spec vram-budget/02](../specs/vram-budget/02-retained-host.md),
   [Device prefix clone cost](2026-09-12-device-prefix-clone-cost.md),
   [Sequence snapshot transfer cost](2026-09-12-sequence-snapshot-transfer-cost.md)
 - Superseded by: none
+- Summary: For an 8-agent swarm the device retained slots did almost none of the reuse, and moving them to a pinned host block gives the KV pool 42-44% more tokens (475K to ~680K) at level throughput with 16 host slots, a claim costing ~15 ms.
 
 ## Question
 

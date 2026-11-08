@@ -5,11 +5,13 @@
 - Observed: 2026-09-12
 - Last verified: 2026-09-14
 - Scope: kernel / sequence state transfer, KV-RAM host tier
+- Topic: kv-and-state
 - Related: [GitHub #124](https://github.com/gpillon/ignis/issues/124),
   [GitHub #125](https://github.com/gpillon/ignis/issues/125),
   [ADR 0024](../adr/0024-sequence-state-transfer.md),
   [Prefill chunk wall time](2026-09-11-prefill-chunk-wall-time.md)
 - Superseded by: none
+- Summary: Sequence snapshot and restore run at ~12 GB/s (~10 GB/s at the slow end), bound by this host's PCIe Gen 3 x16 link, so a 40,960-token round trip costs ~90 ms, still ~100x cheaper than the re-prefill it replaces.
 
 ## Question
 

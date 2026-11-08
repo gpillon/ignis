@@ -5,11 +5,13 @@
 - Observed: 2026-09-24
 - Last verified: 2026-09-24
 - Scope: runtime / GPU clocks under WDDM (driver 596.36), short-request latency, warm-up mitigations
+- Topic: host-and-gpu
 - Related: the 2026-09-22 point-latency decomposition (a first request after a pause
   seen at 326 ms and 307 MHz, against 22–26 ms at 2,917 MHz),
   `.scratch/sota-research-2026-09-24/SINTESI.md` (clock floor / warm-up item), raw
   material in `.scratch/clocks-2026-09-24/`
 - Superseded by: none
+- Summary: A 300-token request after 2-60 s of GPU idle completes as fast as a warm one (224-256 against 224-249 ms) though nvidia-smi still reports a few hundred MHz, so no clock floor or warm-up is needed on the 5090 under WDDM.
 
 ## Question
 

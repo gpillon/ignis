@@ -5,8 +5,10 @@
 - Observed: 2026-10-08
 - Last verified: 2026-10-08
 - Scope: serving / live moves (ADR 0045, the fixed branch), KV-RAM and KV-disk transfers, decode ITL of the other lanes on Flash-Next
+- Topic: kv-and-state
 - Related: https://github.com/gpillon/ignis/issues/309, [ADR 0045](../adr/0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), spec [vram-budget/03](../specs/vram-budget/03-kv-pool-policy-and-kv-disk.md) (AC 37), [KV-disk contention on the volume](2026-10-08-kv-disk-contention-on-the-volume.md)
 - Superseded by: [Live moves a window at a time](2026-10-08-live-moves-windowed.md)
+- Summary: A synchronous KV-RAM move of a 1.13 GB Flash-Next sequence stalled two decoding lanes ~0.32 s each way at ~3.5 GB/s and a move in cost them +50% ITL p50; windowed moves then removed the stall and explained the slowdown.
 
 ## Question
 

@@ -1,12 +1,17 @@
 # The hq-e8-2b decode penalty is the format's, not ignis's — but ignis moves far less memory than the reference doing the same work
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-13
 - Last verified: 2026-09-13
 - Scope: runtime / KV format, decode throughput, GPU utilization
+- Topic: kv-and-state
 - Related: [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md), [ADR 0020](../adr/0020-batch-wide-decode-round.md), [hq-e8-2b KV capacity](2026-09-11-hq-e8-2b-kv-capacity.md), [hq attention route agreement](2026-09-12-hq-attention-route-agreement.md), [ITL lane terminator race](2026-09-13-itl-lane-terminator-race.md), [hq vs BF16 live/live](2026-09-13-hq-vs-bf16-live-live.md) (the same question re-measured under ADR 0015 / ADR 0021)
 - Superseded by: none
+- Corrected by: [hq vs BF16 live/live](2026-09-13-hq-vs-bf16-live-live.md), [hq attention at long context](2026-09-24-hq-attention-at-long-context.md)
+- Summary: At T=1 decode before speculation, hq-e8-2b cost both engines ~13% of ITL p95 against BF16, so the penalty is the format's (14.5% / 14.3% live/live); with DFlash2 the BF16 verify route is slower than hq at long context.
+
+> **Corrected.** Re-measured live/live, the format's cost is 14.5% / 14.3% of ITL p95 ([hq vs BF16 live/live](2026-09-13-hq-vs-bf16-live-live.md)); all of this is T=1 decode, and with DFlash2 the BF16 verify route is slower than hq at long context ([hq attention at long context](2026-09-24-hq-attention-at-long-context.md)).
 
 ## Question
 

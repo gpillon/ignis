@@ -8,10 +8,12 @@
   of three meetings' short items, cut as a Realtime session with speakers cuts them, under thirteen contexts of a
   topic and many multi-word terms; the guard `copies_context`, its near-copy rule (`speech.context_copy_edits`) and
   a same-language control of what that rule takes of real speech
+- Topic: speech
 - Related: [#442](https://github.com/gpillon/ignis/issues/442), [the first measurement](2026-10-27-asr-context-echo.md),
   [#428](https://github.com/gpillon/ignis/issues/428), [spec speech/07](../specs/speech/07-transcribe.md),
   [Speech to text](../user/api/transcriptions.md)
 - Superseded by: none
+- Summary: On 2,660 short meeting items Qwen3-ASR wrote a line of its context 402 times and the guard emptied all 396 exact copies, while a near-copy rule would also empty real speech, so `speech.context_copy_edits` defaults to 0, the exact rule.
 
 ## Question
 

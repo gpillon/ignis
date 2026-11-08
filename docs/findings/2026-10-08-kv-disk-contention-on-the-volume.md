@@ -5,8 +5,10 @@
 - Observed: 2026-10-08
 - Last verified: 2026-10-08
 - Scope: runtime / KV-disk tier, Flash-Next n-gram reads, decode ITL
+- Topic: kv-and-state
 - Related: GitHub #309, spec `vram-budget/03` AC 25, ADR 0045, ADR 0017
 - Superseded by: none
+- Summary: A ~1 GB device-to-disk spill beside two decoding Flash-Next lanes costs their ITL p50 +3-8% and no p99 at the volume's 1.5-1.6 GiB/s, and the prefill gate keeps the tier's writes from slowing an uncovered gather (+18-37% ungated).
 
 ## Question
 

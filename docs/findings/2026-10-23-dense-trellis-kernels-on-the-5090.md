@@ -6,11 +6,13 @@
 - Last verified: 2026-10-23
 - Scope: kernel / the dense trellis linear (`kernel/include/ignis_trellis_linear.h`): decode, verify and prefill
   routes at every matrix shape of the 27B's 16 GB artifact, with and without the debug SM cap
+- Topic: artifacts-and-gates
 - Related: [GitHub #337](https://github.com/gpillon/ignis/issues/337),
   [spec 27b-16gb/02](../specs/27b-16gb/02-the-dense-trellis-kernels.md) (Acceptance 4 and 5),
   [ADR 0060](../adr/0060-the-27b-has-a-trellis-body-for-small-cards.md),
   [Flash-Next's MoE decode](2026-10-05-moe-decode-is-structure-bound.md)
 - Superseded by: none
+- Summary: The 27B's dense trellis body reads at 65.0-65.4% of the 5090's DRAM roofline at one token, eight tokens costing 1.03-1.04x one, but its prefill reaches 212-238 TFLOPS at 1,024 tokens, 42-47% of the card's measured MMA rate.
 
 ## Question
 

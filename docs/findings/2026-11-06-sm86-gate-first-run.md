@@ -8,11 +8,13 @@
   quality / top-64 KLD against BF16 on the routes an 8.x card runs unset (spec #503); kernel / `ctest -LE
   sm120a-only` on the `86;120a` leaf, the vendored GDN gating planner on sm_86; serving / `--profile auto` on the card,
   DFlash2, vision
+- Topic: host-and-gpu
 - Related: [GitHub #484](https://github.com/gpillon/ignis/issues/484), [GitHub #516](https://github.com/gpillon/ignis/issues/516),
   [GitHub #503](https://github.com/gpillon/ignis/issues/503), [GitHub #478](https://github.com/gpillon/ignis/issues/478),
   [On an sm_86 card the 27B trellis entry runs at the 5090's quality](2026-11-03-first-light-on-sm86.md),
   [The solo width](2026-11-06-the-solo-width-planned-at-load.md)
 - Superseded by: none
+- Summary: On an sm_86 card `main` 6234e002 passes the sm_86 gate: top-64 KLD 0.03944 and top-1 93.33% on the default 8.x routes (limits 0.04081 and 92.85%), 127 of 127 leaf tests, and `rtx-24gb` under `auto` serving chat and images.
 
 ## Question
 
