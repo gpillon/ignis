@@ -302,7 +302,8 @@ jobs:
   # is layer hits: the kernel is compiled once per push, which is what the
   # separate image workflow needed a shared remote cache scope to approximate.
   #
-  # It runs beside the tests and publishes nothing (ADR 0086, #552): when the run will publish, the image step writes the
+  # It runs beside the tests and publishes nothing (ADR 0086, which amends
+  # ADR 0032; #552): when the run will publish, the image step writes the
   # image it built to an OCI archive, and the `image` job pushes that archive
   # once the tests have passed. The pushed image is this compile's, as the
   # tarball is.

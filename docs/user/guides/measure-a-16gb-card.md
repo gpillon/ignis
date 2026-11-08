@@ -63,18 +63,18 @@ request at a time, and another client's requests would land in them.
   to imitate a 16 GB card) took
   `max_context 262144 -> 65536 (adapt_context_step 65536, adapt_spare_tokens
   65536)` ([when a profile does not fit](../concepts/profiles.md#when-a-profile-does-not-fit)).
-- **Decode speed**, in three cells of requests sent one at a time (two in the
-  0.9 releases, which have no `decode.long`). Each cell has every request's
-  tokens, time to first token and rate (the tokens after the first over the time
-  after the first), the median and pooled rate, and how many draft tokens
-  DFlash2 got accepted across it (its `speculative`); `decode.speculative` is
-  the three cells' sum.
-  - `decode.long`, **long replies**, from 0.10.0: four coding requests for a
-    complete piece of code (a module with its tests, a small program), thinking
-    off, each ending on its own after several hundred tokens, with 1,024 as a
-    cap against a reply that runs away. **This is the rate to quote**: the speed
-    the card holds while it writes an answer. A reply that ends under 256 tokens
-    stays in the cell and adds a note naming its prompt.
+- **Decode speed**, in three cells of requests sent one at a time. Each cell
+  has every request's tokens, time to first token and rate (the tokens after
+  the first over the time after the first), the median and pooled rate, and
+  how many draft tokens DFlash2 got accepted across it (its `speculative`);
+  `decode.speculative` is the three cells' sum (a 0.9 release's `ignis-bench`
+  has no `decode.long`, which is from 0.10.0).
+  - `decode.long`, **long replies**: four coding requests for a complete
+    piece of code (a module with its tests, a small program), thinking off,
+    each ending on its own after several hundred tokens, with 1,024 as a cap
+    against a reply that runs away. **This is the rate to quote**: the speed
+    the card holds while it writes an answer. A reply that ends under 256
+    tokens stays in the cell and adds a note naming its prompt.
   - `decode.coding`, **short replies**: the four coding prompts of the canary
     suite, thinking off, 256 tokens at most. Most end within a few dozen
     tokens, in a handful of speculative rounds, so their rate is mostly the
