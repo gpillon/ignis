@@ -36,13 +36,37 @@ a sibling still under its internal name moved case 10 from p(yes) 0.996 to
   too, so that pair still differs only in the renewal date.
 
 **Tiers.** `tier` is ignis's, from one measurement of this file on the
-stock artifact `decide_entailment_gpu.rs` loads (2026-09-25, 17/18):
+RTX 5090 (2026-11-08, main 1188385c), taken over every route the card runs
+rather than one: a case near the 0.5 line falls on either side under any
+change of the numerics, and asserting it reports the change, not a fault.
+
+The rule: a case is a `gate` when it is right by at least one logit, taken
+as the minimum over every arm below, and the gate holds at least one case of
+each label. A `known_failure` is wrong on every arm. Every other case is a
+`watch` case.
+
+The measurement set, five arms:
+
+| arm | surface | GDN prefill | prompt attention |
+|-----|---------|-------------|------------------|
+| `h-vendored` | `decide_entailment_gpu.rs` | vendored | fp8 |
+| `h-ours` | `decide_entailment_gpu.rs`, `IGNIS_GDN_PREFILL=ours` | ignis's | fp8 |
+| `s-vendored` | live server, `/v1/decide` | vendored | fp8 |
+| `s-ours` | live server, `IGNIS_GDN_PREFILL=ours` | ignis's | fp8 |
+| `s-int8` | live server, `--model-prefill-attention int8` | vendored | int8 |
+
+The harness cannot select the int8 band, so that arm is the server's. The
+rule, the date, the build, the command that redoes each arm and every
+case's logit in every arm are in `cases.json`: `measurement`, and `logits`
+on each case. `decide_entailment_fixture.rs` fails when a case's tier is not
+the one the rule gives from its logits, when a case has no tier, or when a
+label has no gate case.
 
 | tier | cases | meaning |
 |------|-------|---------|
-| `gate` | 1-3, 5-11, 14, 15, 17 | right by at least one logit; asserted by `decide_entailment_gpu.rs` |
-| `watch` | 4, 12, 16, 18 | right, within one logit of 0.5; printed |
-| `known_failure` | 13 | right label, wrong answer (date arithmetic, p 0.35); printed |
+| `gate` | 1, 2, 4-9, 11, 14, 15 | asserted by `decide_entailment_gpu.rs` on the card's default route |
+| `watch` | 3, 10, 12, 16-18 | printed |
+| `known_failure` | 13 | right label, wrong answer on every arm (date arithmetic); printed |
 
 It is committed rather than fetched because `decide_entailment_gpu.rs` is
 a GPU-profile test: under `IGNIS_GPU_PROFILE=1` a missing fixture is a hard
