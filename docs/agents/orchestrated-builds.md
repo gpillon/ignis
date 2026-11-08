@@ -24,8 +24,7 @@ three agents run at once, reviews included.
 
 Implementers run the CPU-side suites only: `make ci`, or the narrower targets
 their brief names. The coordinator runs every GPU leg (the profile, a bench
-run, a gate leg) itself, one at a time, after `make gpu-status` shows that
-nothing else holds the card, another worktree's run included
+run, a gate leg) itself, under the GPU rule in `AGENTS.md`, Testing
 (`docs/agents/testing.md`, the GPU test profile).
 
 The local checks run on one host, so code behind the other host's `cfg`
