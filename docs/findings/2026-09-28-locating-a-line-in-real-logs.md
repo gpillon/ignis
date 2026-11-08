@@ -1,12 +1,23 @@
 # Locating a line in real logs: near-duplicates break one pass, copying resolves the instance, folding makes it cheap
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-28
 - Last verified: 2026-09-28
 - Scope: `/v1/decide` `locate` and the generation route over real logs (one production cluster, public LogHub samples), 16K-200K tokens; spec 21's registered hypotheses on a fresh set; the folded method (owner's idea)
+- Topic: decide-locate
 - Related: [spec 21](../specs/decide/21-locate-in-real-logs.md) (registered in `e17c5e8`, judge `c5d3386`, both before R2 was asked); [the instance is read while copying](2026-09-27-the-instance-is-read-while-copying.md) (the exploratory results judged here); [locate at length](2026-09-27-locate-at-length.md); [`compress.py`](../../tools/locate-sets/compress.py), [`folded_locate.py`](../../tools/locate-sets/folded_locate.py), [`r2_judge.py`](../../tools/locate-sets/r2_judge.py)
 - Superseded by: none
+- Corrected by: [zero-decode locate for very long logs and prose](2026-09-28-zero-decode-locate-very-long-logs-and-prose.md), [the shortlist `locate`, spec 22's acceptance](2026-09-28-locate-shortlist-acceptance-partial.md)
+- Summary: On fresh real logs one-pass attention loses the target among near-duplicates and with length, and the instance is resolved while copying; fold then copy read 94.8% (vote 34.5%), but the served fold decides with heads and a `choice`.
+
+> **Corrected 2026-09-28.** The mechanisms and the fold stand, but the copy
+> that resolves the instance here did not ship: spec 22's default became a
+> route that writes no token, the heads narrowing the folded log and a
+> labelled `choice` deciding ([zero-decode locate for very long logs and
+> prose](2026-09-28-zero-decode-locate-very-long-logs-and-prose.md), [the
+> shortlist `locate`, spec 22's
+> acceptance](2026-09-28-locate-shortlist-acceptance-partial.md)).
 
 ## Question
 

@@ -5,10 +5,12 @@
 - Observed: 2026-10-01
 - Last verified: 2026-10-01
 - Scope: server / thinking budget close text, default sampling, agent tool loops
+- Topic: reasoning-and-context
 - Related: [spec server/12](../specs/server/12-a-close-that-answers.md) (GitHub #297),
   [thinking budget default](2026-09-24-thinking-budget-default.md) (spec server/08),
   [batched decode width drift](2026-09-14-batched-decode-width-drift.md), #296
 - Superseded by: none
+- Summary: After a forced close the model defers with one more tool call and greedy repeats it; the shipped close text ("My thinking time is over...") answers under greedy and leaves no short deferral in 8 sampled runs.
 
 ## Question
 

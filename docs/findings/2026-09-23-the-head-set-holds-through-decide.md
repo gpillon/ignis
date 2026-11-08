@@ -1,10 +1,11 @@
 # The head set holds through `/v1/decide`: spec 14's acceptance
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-23
 - Last verified: 2026-09-23
 - Scope: serving / `/v1/decide` `point` and `box`, the attention readout with a head set (ADR 0039), one-pass pointing; hq-e8-2b KV
+- Topic: decide-pointing
 - Related: `docs/specs/decide/14-point-and-box-from-the-head-set.md` (#263),
   ADR 0039, `crates/server/tests/decide_point_acceptance_gpu.rs` (the run),
   `crates/server/tests/attention_readout_gpu.rs` (leaf against tap),
@@ -15,6 +16,14 @@
   `2026-09-22-the-head-points-through-decide.md` (spec 13's acceptance),
   `.scratch/head-set-263/acceptance/point-acceptance-*.json` (raw, on disk), #262
 - Superseded by: none
+- Corrected by: [the sub-cell reading holds through `/v1/decide`](2026-09-23-the-sub-cell-reading-holds-through-decide.md)
+- Summary: Spec 14's acceptance held: the anchored head set put `point` inside 231/240 buttons at 1024 px and 240/240 at 4096 px (chain 220, 197); its box missed 1024 px buttons (102/240), so `box` keeps the chain as default, as it still does.
+
+> **Corrected 2026-09-23.** The served reading is spec 15's, inside the image
+> cell: the head box goes from 102 to 183 of 240 on 1024 px buttons and the
+> point from 231 to 236 ([the sub-cell reading holds through
+> `/v1/decide`](2026-09-23-the-sub-cell-reading-holds-through-decide.md));
+> `box` still defaults to the chain.
 
 ## Question
 

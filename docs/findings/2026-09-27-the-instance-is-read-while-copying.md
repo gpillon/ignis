@@ -5,8 +5,10 @@
 - Observed: 2026-09-27
 - Last verified: 2026-09-27
 - Scope: attention over a long text state at `/v1/decide`'s `locate` scaffold and along a teacher-forced quote — all 384 GQA heads, full-prompt rows, real cluster logs (set R) and synthetic logs (set L2); **exploratory**, on sets already read
+- Topic: decide-locate
 - Related: [locate at length](2026-09-27-locate-at-length.md) (the misses this explains); [spec 20](../specs/decide/20-locate-at-length.md); [attention names the line, not the words](2026-09-27-attention-names-the-line-not-the-words.md); [`tools/locate-sets/research.py`](../../tools/locate-sets/research.py), [`research_report.py`](../../tools/locate-sets/research_report.py), [`instances.py`](../../tools/locate-sets/instances.py)
 - Superseded by: none
+- Summary: At the copy scaffold the heads name the kind of line; among near-duplicates the instance is lost more the more there are (29% misses with none, 86% past fifty) and the longer the state, and heads settle on it while it is copied.
 
 ## Question
 

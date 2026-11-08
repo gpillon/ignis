@@ -5,8 +5,10 @@
 - Observed: 2026-10-12
 - Last verified: 2026-10-12
 - Scope: serving / sampled reasoning on qwen3.8-27b (thinking budget, Playground agents), engine options (YaRN, DFlash2, KV format)
+- Topic: reasoning-and-context
 - Related: [ADR 0048](../adr/0048-an-end-of-turn-inside-the-reasoning-closes-it.md), [spec server/12](../specs/server/12-a-close-that-answers.md), [hq-e8-2b KV capacity](2026-09-11-hq-e8-2b-kv-capacity.md)
 - Superseded by: none
+- Summary: About a third of first turns on the Playground's Rome prompt loop at its defaults, with YaRN, DFlash2 and the hq codec off and on ninfer alike: the NVFP4 27B's loop at temperature 1, no penalty, `xhigh`; `presence_penalty` 1.5 halves it.
 
 ## Question
 

@@ -1,12 +1,23 @@
 # An anchored set of 96 heads points better than the pointing head and the chain, and draws a box, in one pass
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-23
 - Last verified: 2026-09-23
 - Scope: serving / `/v1/decide` `point` and `box` read from attention in one pass; kernel / attention readout cost
+- Topic: decide-pointing
 - Related: https://github.com/gpillon/ignis/issues/263, [The heads outline the object](2026-09-22-the-heads-outline-the-object.md), [spec 13](../specs/decide/13-point-by-attention-head.md), [spec 14](../specs/decide/14-point-and-box-from-the-head-set.md), [ADR 0038](../adr/0038-the-seam-carries-one-attention-head.md), `tools/pointing-scenes/` (`ensemble_score.py`, `rectangles.py`, `pointing-heads-4bdc7b13.json`, `bench_readout.cu`)
 - Superseded by: none
+- Corrected by: [the head box is quantised to the cell](2026-09-23-the-head-box-is-quantised-to-the-cell.md), [the sub-cell reading holds through `/v1/decide`](2026-09-23-the-sub-cell-reading-holds-through-decide.md)
+- Summary: 96 selective heads (L31-L63) anchored on L39.h10's point put it inside 229/240 buttons (head 223, chain 213), 58/60 large objects and 33/34 screenshot questions, in 0.14-0.4 ms; the box is now read inside the cell.
+
+> **Corrected 2026-09-23.** The head set and the point stand; the box rule
+> below (half-cell growth) was replaced by a reading inside the image cell,
+> which lifts the head box on 1024 px buttons from 102 to 183 of 240 through
+> `/v1/decide` ([the head box is quantised to the
+> cell](2026-09-23-the-head-box-is-quantised-to-the-cell.md), [the sub-cell
+> reading holds through
+> `/v1/decide`](2026-09-23-the-sub-cell-reading-holds-through-decide.md)).
 
 ## Question
 

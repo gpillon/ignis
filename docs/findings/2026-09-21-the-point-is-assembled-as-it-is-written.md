@@ -1,15 +1,22 @@
 # The point is assembled as it is written, not read out of the latent
 
 - Kind: experiment
-- Status: current
+- Status: archived
 - Observed: 2026-09-21
 - Last verified: 2026-09-21
 - Scope: serving / decision readout primitives, one-pass pointing, `/v1/decide` `point`
+- Topic: decide-pointing
 - Related: `.scratch/latent-probe/` (raw material, on disk),
   `docs/specs/decide/12-the-coordinate-in-the-latent.md`,
   `docs/specs/decide/11-point-in-one-pass.md`, ADR 0034,
   `2026-09-19-constrained-digit-readout-points.md`
 - Superseded by: none
+- Summary: Negative (spec 12): where x's first digit is written the latent holds x to about one digit (20.9 units against a 25.0 baseline), so a probe lands inside 97 of 240 against the chain's 218: each forced digit decides the point.
+
+> **Archived.** Spec 12's go/no-go fired negative: no one-position reading of
+> the residual yields a point, which closed that line. The one-pass point that
+> shipped reads attention heads ([one attention head
+> points](2026-09-21-one-attention-head-points.md)).
 
 ## Question
 

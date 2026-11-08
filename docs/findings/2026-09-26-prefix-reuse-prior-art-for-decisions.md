@@ -5,8 +5,10 @@
 - Observed: 2026-09-26
 - Last verified: 2026-09-26
 - Scope: serving / cross-request state reuse, `/v1/decide` fan-out, recurrent-state checkpoint placement, multimodal prefix keys, decision prompt layout
+- Topic: decide-options
 - Related: [GitHub #270](https://github.com/gpillon/ignis/issues/270), [#235](https://github.com/gpillon/ignis/issues/235), [#240](https://github.com/gpillon/ignis/issues/240), [#243](https://github.com/gpillon/ignis/issues/243), `docs/adr/0029-cross-request-state-reuse.md`, `docs/adr/0034-the-leaf-answers-without-generating.md`, [`2026-09-20-the-evidence-belongs-in-the-system-block.md`](2026-09-20-the-evidence-belongs-in-the-system-block.md), [`2026-09-18-prompt-reuse-tax-on-short-ttft.md`](2026-09-18-prompt-reuse-tax-on-short-ttft.md), [`2026-09-20-shared-vision-embedding-fan-out.md`](2026-09-20-shared-vision-embedding-fan-out.md), `.scratch/sota-research-2026-09-24/02-kv-longctx.md` §4 (re-checked and extended here)
 - Superseded by: none
+- Summary: No published system combines a cross-request static head, variable images and an exact shared-state fan-out on a hybrid model; engines checkpoint recurrent state by structure, observed forks or client hints, and non-prefix sharing is lossy.
 
 ## Question
 

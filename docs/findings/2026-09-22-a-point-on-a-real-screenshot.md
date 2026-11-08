@@ -5,12 +5,14 @@
 - Observed: 2026-09-22
 - Last verified: 2026-09-22
 - Scope: serving / `/v1/decide` `point`, one-pass pointing (ADR 0038), end-to-end latency over HTTP
+- Topic: decide-pointing
 - Related: `docs/specs/decide/13-point-by-attention-head.md` (#260),
   `2026-09-22-the-head-points-through-decide.md` (the acceptance, in process),
   `2026-09-22-how-the-head-map-is-read.md` (where the head's point lands),
   `.scratch/decide-point-e2e/` (the two scripts, `phases.json`, the marked
   images -- raw, on disk)
 - Superseded by: none
+- Summary: Over HTTP the first `point` about a new screenshot costs ~500 ms (encode and prefill) and each one after it 60-90 ms; the head's one pass saves the chain's nine rounds, 45-65% of the answer, and downscaling buys the head nothing.
 
 ## Question
 

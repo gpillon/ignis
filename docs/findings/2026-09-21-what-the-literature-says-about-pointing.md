@@ -1,10 +1,11 @@
 # What the literature already knew about pointing, and what it changes here
 
 - Kind: research
-- Status: current
+- Status: corrected
 - Observed: 2026-09-21
 - Last verified: 2026-09-21
 - Scope: serving / decision readout primitives, one-pass pointing, `/v1/decide` `point` and `box`
+- Topic: decide-pointing
 - Related: `docs/specs/decide/11-point-in-one-pass.md`,
   `docs/specs/decide/12-the-coordinate-in-the-latent.md`,
   `2026-09-21-the-point-is-assembled-as-it-is-written.md`,
@@ -12,6 +13,8 @@
   `2026-09-19-constrained-digit-readout-points.md`,
   [`2026-09-21-qwen-vl-grounding-primary-sources.md`](2026-09-21-qwen-vl-grounding-primary-sources.md) (corrects four claims below)
 - Superseded by: none
+- Corrected by: [Qwen-VL grounding, from the primary sources](2026-09-21-qwen-vl-grounding-primary-sources.md)
+- Summary: What holds after the primary-source reading: a one-pass point is coordinate-free grounding read from text-to-image attention, only 16 of 64 layers have attention, and the model's trained `point_2d` format is on 0-1000.
 
 > **Corrected 2026-09-21, and not superseded.** This was a first pass, read
 > largely through a web summarizer; the primary-source reading that followed
@@ -21,7 +24,7 @@
 > 0-1000, set-of-mark demoted, `mrope_interleaved: true`, attention rather
 > than the residual as the one-pass signal, and the 16-of-64 fact (whether
 > it *blocks* a one-pass readout is now for the C5 measurement to say, not
-> for this argument) — so the finding stays `current` and the four are marked where they sit
+> for this argument) — so the finding is `corrected`, not superseded, and the four are marked where they sit
 > rather than silently rewritten.
 >
 > 1. **TAG is not a one-pass method.** Its §3.3 prompts the model to

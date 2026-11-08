@@ -1,16 +1,25 @@
 # A 6,144-token thinking budget is the default: at `xhigh` it passes 26 of 32 coding runs to 8K's 23, a sixth faster, and bites on 3% of real agent turns
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-24
 - Last verified: 2026-09-24
 - Scope: server / thinking budget default, answer reserve, forced-close cost
+- Topic: reasoning-and-context
 - Related: [spec server/08](../specs/server/08-thinking-budget-default.md) (GitHub
   #265), [spec server/04](../specs/server/04-enable-thinking.md) §"Thinking budget",
   [reasoning_effort on coding tasks](2026-09-24-reasoning-effort-on-coding-tasks.md)
   (the first budget measurement), [copy drafting on agent traces](2026-09-24-copy-drafting-on-agent-traces.md)
   (the agent-turn dataset reused here), [batched decode width drift](2026-09-14-batched-decode-width-drift.md)
 - Superseded by: none
+- Corrected by: [spec server/08](../specs/server/08-thinking-budget-default.md)
+- Summary: At `xhigh` a 6,144-token budget beat 8K on coding (26/32 against 23/32, 17% faster) and the answer reserve is 2,048, but the default is 32,768 since 2026-10-09: 6,144 cost ~8-9 GPQA Diamond points.
+
+> **Corrected 2026-10-09 (owner).** The default is no longer 6,144: it is
+> 32,768, because 6,144 force-closed 63% of GPQA Diamond and cost ~8-9 points
+> ([spec server/08](../specs/server/08-thinking-budget-default.md),
+> `DEFAULT_THINKING_BUDGET`). The measurements and the 2,048-token answer
+> reserve stand.
 
 ## Question
 

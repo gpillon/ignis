@@ -1,10 +1,11 @@
 # The head points through `/v1/decide`: spec 13's acceptance holds at both sizes
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-22
 - Last verified: 2026-09-22
 - Scope: serving / `/v1/decide` `point`, the attention readout (ADR 0038), one-pass pointing; hq-e8-2b KV
+- Topic: decide-pointing
 - Related: `docs/specs/decide/13-point-by-attention-head.md` (#260),
   ADR 0038, `crates/server/tests/decide_point_acceptance_gpu.rs` (the run),
   `crates/server/tests/attention_readout_gpu.rs` (leaf against tap),
@@ -14,6 +15,14 @@
   `.scratch/pointing-acceptance/point-acceptance-scenes-d{,4096}.json` and
   `run-d.log`, `run-d4096*.log` (raw, on disk), #262
 - Superseded by: none
+- Corrected by: [the head set holds through `/v1/decide`](2026-09-23-the-head-set-holds-through-decide.md), [the sub-cell reading holds through `/v1/decide`](2026-09-23-the-sub-cell-reading-holds-through-decide.md)
+- Summary: Spec 13's acceptance held: through `/v1/decide` L39.h10 landed inside on 228/240 at 1024 px and 237/240 at 4096 px (chain 216, 182), leaf equal to tap to ~1e-6; the default point now reads the anchored head set (specs 14, 15).
+
+> **Corrected 2026-09-23.** The head-alone `point` measured here was the
+> default until spec 14; the default now reads the anchored head set inside
+> the image cell ([the sub-cell reading holds through
+> `/v1/decide`](2026-09-23-the-sub-cell-reading-holds-through-decide.md)).
+> L39.h10, its region-share confidence and the leaf-against-tap check stand.
 
 ## Question
 

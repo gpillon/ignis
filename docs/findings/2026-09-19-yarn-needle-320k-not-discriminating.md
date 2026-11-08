@@ -5,9 +5,11 @@
 - Observed: 2026-09-19
 - Last verified: 2026-09-19
 - Scope: serving / RoPE scaling, long-context evaluation method
+- Topic: reasoning-and-context
 - Related: [#227](https://github.com/gpillon/ignis/issues/227) (YaRN as a load
   option), `docs/specs/rope-scaling/01-yarn.md`
 - Superseded by: none
+- Summary: A literal needle at 320,076 tokens (1.22x the trained envelope) is recalled exactly with and without `--rope-scaling yarn:4`, so it would pass a build that ignored the flag; a discriminating probe asks about relative position.
 
 **Hardware:** RTX 5090, exclusive card (ADR 0006).
 **Engine:** `qwen3_8_27b_nvfp4full-v2`, `hq-e8-2b`, `--prefill-chunk 1024`,

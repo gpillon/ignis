@@ -6,6 +6,7 @@
 - Last verified: 2026-09-23
 - Scope: serving / `/v1/decide` `point` and `box`, the anchored head set read
   inside the image cell (ADR 0040); hq-e8-2b KV
+- Topic: decide-pointing
 - Related: `docs/specs/decide/15-the-head-box-reads-inside-the-cell.md` (#264),
   ADR 0040, `2026-09-23-the-head-box-is-quantised-to-the-cell.md` (why),
   `2026-09-23-the-head-set-holds-through-decide.md` (spec 14's acceptance,
@@ -16,6 +17,7 @@
   `crates/core/tests/anchored_reading.rs` (the host rule against the
   reference), `.scratch/subcell-264/acceptance/` (raw, on disk)
 - Superseded by: none
+- Summary: Spec 15's acceptance holds: reading inside the image cell takes the head box from 102 to 183 of 240 on 1024 px buttons and the point beats the chain on every set (236/240 against 211); `box` keeps the chain by default.
 
 ## Question
 

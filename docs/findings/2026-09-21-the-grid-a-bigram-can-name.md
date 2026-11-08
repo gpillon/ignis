@@ -1,15 +1,22 @@
 # The grid a bigram can name is 9 x 9, and that is too coarse to point with
 
 - Kind: experiment
-- Status: current
+- Status: archived
 - Observed: 2026-09-21
 - Last verified: 2026-09-21
 - Scope: serving / decision readout primitives, answer alphabet, one-pass pointing
+- Topic: decide-pointing
 - Related: `crates/core/tests/grid_label_rectangle.rs`, `crates/core/src/decision.rs`,
   `docs/specs/decide/11-point-in-one-pass.md`, ADR 0034,
   `2026-09-19-constrained-digit-readout-points.md`,
   `2026-09-21-scalar-readout-legend-width.md`
 - Superseded by: none
+- Summary: Negative (spec 11 E0): 114 of 676 uppercase bigrams are not single tokens, so a one-label grid is at most 9 x 9 contiguous (11.1% of the side per cell), far coarser than the digit chain's 2.1%; single letters have no holes.
+
+> **Archived.** Spec 11's E0 fired negative: no one-label grid is fine enough
+> to point, which closed the one-pass point through the vocabulary.
+> `crates/core/tests/grid_label_rectangle.rs` still measures the grid for any
+> artifact.
 
 ## Question
 

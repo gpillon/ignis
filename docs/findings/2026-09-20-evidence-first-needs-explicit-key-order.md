@@ -1,12 +1,21 @@
 # "Evidence first" was never in the bytes
 
 - Kind: discovery
-- Status: current
+- Status: corrected
 - Observed: 2026-09-20
 - Last verified: 2026-09-20
 - Scope: serving / decisions, the `/v1/decide` prompt, shared-prefix reuse
+- Topic: decide-options
 - Related: `docs/findings/2026-09-19-typed-option-logit-readout.md`, `crates/server/tests/classify_readout_gpu.rs`, `classify_option_ceiling_gpu.rs`, `classify_vision_readout_gpu.rs`, `crates/server/src/decide.rs`, `docs/findings/2026-09-20-the-evidence-belongs-in-the-system-block.md` (takes the re-measurement this one leaves open, and shows the byte order was not what the reuse turned on), GitHub #239, #240
 - Superseded by: none
+- Corrected by: [the evidence belongs in the system block](2026-09-20-the-evidence-belongs-in-the-system-block.md)
+- Summary: `serde_json::Map` sorted every measured decision prompt criterion-first, so its reuse claims were false; byte order was not the lever, though: only the system block is retained, and the served prompt puts the evidence there.
+
+> **Corrected 2026-09-20 (#240).** The key-order defect and its fix stand, but
+> the evidence-first payload proposed below is not what shipped: only the
+> system block is ever retained, so the served prompt puts the evidence there
+> ([the evidence belongs in the system
+> block](2026-09-20-the-evidence-belongs-in-the-system-block.md)).
 
 ## Question
 

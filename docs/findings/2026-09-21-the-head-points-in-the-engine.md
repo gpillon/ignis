@@ -1,16 +1,25 @@
 # The head points in the engine; the guard sits on its threshold
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-21
 - Last verified: 2026-09-21
 - Scope: serving / decision primitives, one-pass pointing, `/v1/decide` `point`; kernel test seams
+- Topic: decide-pointing
 - Related: `crates/server/tests/attention_head_point_gpu.rs`,
   `kernel/include/ignis_attn_tap.h`, `crates/core/src/attn_tap.rs`,
   `.scratch/latent-probe/engine_score.py` and `results/engine/` (raw, on disk),
   `2026-09-21-one-attention-head-points.md` (the vehicle result this checks),
   `2026-09-12-hq-attention-route-agreement.md`
 - Superseded by: none
+- Corrected by: [an anchored head set points and boxes](2026-09-23-an-anchored-head-set-points-and-boxes.md), [the head set holds through `/v1/decide`](2026-09-23-the-head-set-holds-through-decide.md)
+- Summary: In the engine L39.h10 lands inside on 230-236 of 240 under BF16 and hq-e8-2b (pre-codec keys) against the chain's 213-218, picked on every fold; it is the served pointing head, the point now reads the head set, the guard never shipped.
+
+> **Corrected 2026-09-23.** L39.h10's calibration rests on this check and is
+> still served (`crates/core/src/pointing.rs`); `point` is now read from the
+> anchored head set it anchors ([the head set holds through
+> `/v1/decide`](2026-09-23-the-head-set-holds-through-decide.md)), and the
+> guard was never served (spec 13, Out of Scope).
 
 ## Question
 

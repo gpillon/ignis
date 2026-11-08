@@ -5,8 +5,10 @@
 - Observed: 2026-09-27
 - Last verified: 2026-09-27
 - Scope: `/v1/decide` `locate` past `LOCATE_MAX_KEYS` — the served head vote, an end-marker reading of it, the generation route and a sibling `noul`, on synthetic logs to 212K keys and real cluster logs to 200K tokens
+- Topic: decide-locate
 - Related: [spec 20](../specs/decide/20-locate-at-length.md) (registered in commit `78e061a` before L2 and R were asked); [locate through `/v1/decide`](2026-09-27-locate-through-decide.md); [the go on set D](2026-09-27-locate-by-head-vote-go.md); [attention names the line, not the words](2026-09-27-attention-names-the-line-not-the-words.md); [`tools/locate-sets/long_judge.py`](../../tools/locate-sets/long_judge.py)
 - Superseded by: none
+- Summary: The head vote holds to 212K keys on synthetic logs (91/100) but reads 56% of real cluster logs over 4K-200K, naming the kind of line and not the instance among near-duplicates (generation 92%), so `LOCATE_MAX_KEYS` stays ~4K.
 
 ## Question
 

@@ -1,15 +1,24 @@
 # At `xhigh`, Qwen3.8 thinks twice as long as at `medium` and half its coding answers never arrive inside 16K tokens; an 8K thinking budget takes it to 15 of 16
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-24
 - Last verified: 2026-09-24
 - Scope: server / `reasoning_effort` resolution (spec `server/04`), thinking cost, DFlash2 acceptance under sampling
+- Topic: reasoning-and-context
 - Related: [spec server/04](../specs/server/04-enable-thinking.md) (amended the same day:
   an effort the template does not take rounds up), [thinking budget default](2026-09-24-thinking-budget-default.md)
   (the budget's shipped value, measured on more seeds), [copy drafting on agent traces](2026-09-24-copy-drafting-on-agent-traces.md)
   (thinking is 73.5% of real agent output), `.scratch/sota-research-2026-09-24/SINTESI.md`
 - Superseded by: none
+- Corrected by: [thinking budget default](2026-09-24-thinking-budget-default.md), [spec server/08](../specs/server/08-thinking-budget-default.md)
+- Summary: At 16K max_tokens `xhigh` passes 8/16 coding runs (7 still thinking at the cap) against 13/16 for low and medium at a fifth of the wall time; a thinking budget recovers it, 8K at 79% pooled over more runs (15/16 here).
+
+> **Corrected 2026-09-24.** The 15/16 at 8K below is one session's sample;
+> pooled over more runs 8K passes 79% ([thinking budget
+> default](2026-09-24-thinking-budget-default.md)). The shipped default budget
+> is 32,768 since 2026-10-09 ([spec
+> server/08](../specs/server/08-thinking-budget-default.md)).
 
 ## Question
 

@@ -1,12 +1,21 @@
 # A reasoning-loop guard: a normalized compression score finds the loops, a rewind ends most of them
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-14
 - Last verified: 2026-10-15
 - Scope: server / reasoning-loop guard on chat completions and `/v1/responses`, HTTP and WebSocket (`crates/server/src/loop_guard.rs`, config v2 `model.loop_guard*`); serving / sampled reasoning on qwen3.8-27b, agentic contexts of 79k and 138k tokens, cross-turn prompt reuse; Playground reasoning view and Responses WebSocket transport
+- Topic: reasoning-and-context
 - Related: [A loop persists](2026-10-16-a-loop-persists.md) (the trigger and the cut it led to, ADR 0053), [ADR 0052](../adr/0052-a-reasoning-loop-is-taken-back-and-nudged.md), [Reasoning loops are the model's](2026-10-12-reasoning-loops-are-the-models.md), [ADR 0048](../adr/0048-an-end-of-turn-inside-the-reasoning-closes-it.md), [ADR 0046](../adr/0046-one-declaration-per-config-field.md), [#288](https://github.com/gpillon/ignis/issues/288)
 - Superseded by: none
+- Corrected by: [a loop persists](2026-10-16-a-loop-persists.md)
+- Summary: A zlib score over the reasoning, code removed and digit runs folded, finds counting and template loops, and a rewind restores the prompt's checkpoint (0.08-0.10 s at 79k-138k); the guard now acts at 0.265 on 4 checks in a row.
+
+> **Corrected 2026-10-16 (ADR 0053).** The guard no longer acts at the first
+> check under 0.20: it acts at 0.265 on the fourth low check in a row, and
+> only on a rewind that keeps something ([a loop
+> persists](2026-10-16-a-loop-persists.md)). The score, the gate and the
+> rewind below stand.
 
 ## Question
 

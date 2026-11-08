@@ -5,12 +5,14 @@
 - Observed: 2026-09-21
 - Last verified: 2026-09-21
 - Scope: server / `/v1/decide` constrained decode, prompt
+- Topic: decide-options
 - Related: [ADR 0034](../adr/0034-the-leaf-answers-without-generating.md),
   [a fixed-width number is wrong at exactly one width](2026-09-20-number-width-and-decide-e2e.md)
   (whose width rule this corrects),
   [constrained digit readout](2026-09-19-constrained-digit-readout-points.md),
   [GitHub #254](https://github.com/gpillon/ignis/issues/254)
 - Superseded by: none
+- Summary: `number` came back multiplied by a power of ten on 10 of 21 widths because its prompt named no alignment; one clause (right-aligned, padded on the left with zeros) makes 21 of 21 correct, and sigma skips the padding.
 
 ## Question
 

@@ -5,8 +5,10 @@
 - Observed: 2026-09-16
 - Last verified: 2026-09-16
 - Scope: kernel / multimodal decode rotation, GPU test design
+- Topic: reasoning-and-context
 - Related: https://github.com/gpillon/ignis/issues/194, https://github.com/gpillon/ignis/issues/178, https://github.com/gpillon/ignis/issues/195, https://github.com/gpillon/ignis/issues/201
 - Superseded by: none
+- Summary: Shifting the decode rotation by -24, 0 or +400 positions left 40 greedy tokens identical on qwen3.8-27B (only +200,000 changed them), so a token-equality GPU test at a real image's delta cannot detect a dropped `rope_delta`.
 
 ## Question
 

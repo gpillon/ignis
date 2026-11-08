@@ -5,8 +5,10 @@
 - Observed: 2026-09-22
 - Last verified: 2026-09-22
 - Scope: serving / `/v1/decide` `number`; kernel / hq-e8-2b residual window, short prompts; prompt reuse
+- Topic: decide-options
 - Related: [#259](https://github.com/gpillon/ignis/issues/259), [#254](https://github.com/gpillon/ignis/issues/254), [#257](https://github.com/gpillon/ignis/issues/257), [#258](https://github.com/gpillon/ignis/issues/258); spec [runtime/07](../specs/runtime/07-hq-prefill-ring-read-before-append.md) § As built; [the number prompt declares an alignment](2026-09-21-the-number-prompt-declares-an-alignment.md); [hq prefill reads the ring before the append](2026-09-22-hq-prefill-reads-the-ring-before-the-append.md)
 - Superseded by: none
+- Summary: The one red cell of `decide_number_width_gpu` (47 read as 4 at two digits, hq with prompt reuse) is a near-tie crossed by two roundings, not a fault: BF16 reads 47 either way, and the test now asserts #254's signature.
 
 ## Question
 

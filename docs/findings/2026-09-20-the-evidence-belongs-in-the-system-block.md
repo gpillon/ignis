@@ -5,8 +5,10 @@
 - Observed: 2026-09-20
 - Last verified: 2026-09-20
 - Scope: serving / decisions, the `/v1/decide` prompt, cross-request state reuse, spec 04's fan-out
+- Topic: decide-options
 - Related: `docs/findings/2026-09-20-evidence-first-needs-explicit-key-order.md`, `docs/findings/2026-09-19-typed-option-logit-readout.md`, ADR 0029, ADR 0034, `crates/server/src/decide.rs`, `crates/server/tests/classify_readout_gpu.rs`, `crates/server/tests/decide_prompt_tail.rs`, GitHub #238, #239, #240
 - Superseded by: none
+- Summary: A decision's siblings can reuse only a retained prefix, cut at the system block's last full page, so the evidence goes there: a 388-token state retains 384, and the 144-row sweep reads 0.963 balanced accuracy against 0.934.
 
 ## Question
 

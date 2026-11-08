@@ -5,6 +5,7 @@
 - Observed: 2026-09-22
 - Last verified: 2026-09-22
 - Scope: serving / decision primitives, one-pass pointing, `/v1/decide` `point`; hq-e8-2b KV; kernel test seams
+- Topic: decide-pointing
 - Related: `crates/server/tests/attention_head_point_gpu.rs`,
   `crates/server/tests/attn_tap_hq_consumed_gpu.rs`,
   `kernel/include/ignis_attn_tap.h`, `crates/core/src/attn_tap.rs`,
@@ -14,6 +15,7 @@
   `2026-09-21-the-head-points-in-the-engine.md` (the arms this completes),
   `2026-09-12-hq-attention-route-agreement.md`, ADR 0030 (VRAM plan)
 - Superseded by: none
+- Summary: The hq codec on L39's keys cost the head its read (212/240 at 1024 px); since #257's residual window it reads 227, 236 at 4096 px, where the digit chain is the weak point: 170-175/240, drifting ~11/999 down, as the reference does.
 
 ## Question
 
