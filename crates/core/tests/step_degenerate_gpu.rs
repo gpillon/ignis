@@ -9,8 +9,8 @@
 //! a missing artifact, GPU, or kernel error is a **skip**; under the
 //! profile the same condition is a **hard failure**
 //! (`ignis_core::gpu_profile::skip_or_fail`). Run via
-//! `scripts/gpu-profile.ps1` (stops the reference `ninfer-serve` first --
-//! the RTX 5090 is exclusive, ADR 0006).
+//! `scripts/gpu-profile.ps1`, on a card nothing else holds (it stops nothing
+//! itself -- the RTX 5090 is exclusive, ADR 0006; docs/agents/testing.md).
 //!
 //! The f64 reference recomputes the full 248320-entry logits vector per
 //! token id from the container's raw W8G32 bytes, independently of
@@ -34,8 +34,8 @@ use ignis_core::gpu_profile;
 use ignis_core::model_load::load_qwen38_27b;
 use ignis_core::step::{decode_degenerate_batch, prefill_degenerate};
 
-/// The fork-local model cache (the artifact the running `ninfer-serve`
-/// loads) -- mirrors `crates/core/tests/model_load_gpu.rs`.
+/// The fork-local model cache (the artifact the reference `ninfer-serve`
+/// was served from) -- mirrors `crates/core/tests/model_load_gpu.rs`.
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const HIDDEN: usize = 5120;
 const VOCAB: usize = 248320;

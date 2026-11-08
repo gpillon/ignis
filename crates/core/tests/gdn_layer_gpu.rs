@@ -19,8 +19,8 @@
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact, GPU, or kernel error is a **skip**; under the profile
 //! the same condition is a **hard failure** (`ignis_core::gpu_profile::skip_or_fail`).
-//! Run via `scripts/gpu-profile.ps1` (stops the reference `ninfer-serve`
-//! first -- the RTX 5090 is exclusive, ADR 0006).
+//! Run via `scripts/gpu-profile.ps1`, on a card nothing else holds (it stops
+//! nothing itself; the RTX 5090 is exclusive, ADR 0006; docs/agents/testing.md).
 
 #![cfg(feature = "cuda")]
 
@@ -35,8 +35,8 @@ use ignis_core::gpu_profile;
 use ignis_core::model_load::{load_qwen38_27b, Model};
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 
-/// The fork-local model cache (the artifact the running `ninfer-serve`
-/// loads) -- mirrors `crates/core/tests/step_degenerate_gpu.rs`.
+/// The fork-local model cache (the artifact the reference `ninfer-serve`
+/// was served from) -- mirrors `crates/core/tests/step_degenerate_gpu.rs`.
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const HIDDEN: usize = 5120;
 /// The GDN layer the f64 reference records (GDN's BF16 output-projection

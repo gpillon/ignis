@@ -1,11 +1,14 @@
 # GPU preflight for the explicit GPU test profile (ADR 0006, GitHub #38).
 #
-# ignis and ninfer cannot share the RTX 5090 (ADR 0006: a single engine's
+# Two engines cannot share the RTX 5090 (ADR 0006: a single engine's
 # footprint already runs ~28 GB of the 32 GB card, so two full-size engines
 # never fit). This script refuses to start the GPU profile while another
-# process is holding a meaningful amount of GPU memory, and names the
-# offending process (ninfer first, since it is the expected culprit) so the
-# developer knows what to stop.
+# process is holding a meaningful amount of GPU memory, or while a ninfer
+# process runs (the reference engine, run only for a test that asks for it),
+# and names the holder. Who may stop it depends on whose it is: the engine
+# that serves a local agent its model is the user's to stop and restart,
+# anything else is someone else's work (docs/agents/testing.md, "Who holds
+# the card").
 #
 # Exit 0: the GPU is free. A marker file ($env:TEMP\ignis-gpu-preflight.ok) is
 #         written to record the pass -- ignis_core::gpu_profile refuses the
@@ -38,17 +41,22 @@ function Fail([string]$Message) {
     exit 1
 }
 
+# What a refusal says to do about the holder: the two cases of
+# docs/agents/testing.md, "Who holds the card".
+$WhoStopsIt = "If it is the engine that serves your agent its model, the user stops it, runs the GPU profile and restarts it; otherwise it is someone else's work: wait or ask, never stop a process you did not start (ADR 0006, docs/agents/testing.md)."
+
 $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 if (-not $nvidiaSmi) {
     Fail "GPU preflight: nvidia-smi not found on PATH -- cannot verify the GPU is free. Install the NVIDIA driver / CUDA toolkit, or check manually before running the GPU profile."
 }
 
-# The named reference engine (ADR 0006's expected culprit): if it is running,
-# name it directly rather than relying on the memory-usage heuristic below.
+# The reference engine runs here only for a test that asks for it; when one
+# runs, name it directly rather than relying on the memory-usage heuristic
+# below.
 $ninfer = Get-Process -Name "ninfer*" -ErrorAction SilentlyContinue
 if ($ninfer) {
     $names = ($ninfer | ForEach-Object { "$($_.ProcessName) (pid $($_.Id))" }) -join ", "
-    Fail "GPU preflight: ninfer is running ($names). Stop it before the GPU profile -- the runbook is 'stop ninfer -> preflight -> GPU profile -> restart ninfer' (ADR 0006, docs/agents/testing.md)."
+    Fail "GPU preflight: a ninfer process is running ($names) and holds the card. $WhoStopsIt"
 }
 
 $raw = & nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>$null
@@ -64,7 +72,7 @@ if ($usedMiB -gt $ThresholdMiB) {
         Write-Host "Processes nvidia-smi reports on the GPU:"
         $procs | ForEach-Object { Write-Host "  $_" }
     }
-    Fail "GPU preflight: $usedMiB MiB in use (> $ThresholdMiB MiB) -- another process is holding VRAM. Stop it before running the GPU profile (ADR 0006)."
+    Fail "GPU preflight: $usedMiB MiB in use (> $ThresholdMiB MiB) -- another process is holding VRAM. $WhoStopsIt"
 }
 
 [DateTimeOffset]::UtcNow.ToString("o") | Set-Content -Path $MarkerPath -Encoding ascii
