@@ -1,5 +1,12 @@
 # Benches and gate runs
 
+The gate runs below that measure ignis against the reference (G2, the KV-format
+A/B's reference legs) are the record of the phase gates: ADR 0082 replaced them
+with the KLD against BF16, DFlash2 on against off and the loop rate, and ninfer
+no longer runs on the development machine (ADR 0084). The instruments
+themselves (`ignis-bench ttft`, the multimodal cell, G3 against ignis) run on
+ignis alone.
+
 ## The G2 measurement instrument (P2-05, GitHub #87)
 
 `ignis-bench ttft` measures time to first token at an **exact** prompt

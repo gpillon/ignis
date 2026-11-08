@@ -60,8 +60,9 @@ integer band (INT8 scores, `--model-prefill-attention int8`, also what a named
 (`--model-prefill-linear int8`), and its exception tensors stay BF16;
 `--model-prefill-attention fp16` and `--model-prefill-linear fp16` name the
 FP16 band and the fused prefill instead. The gated delta net prefill runs
-ignis's own kernels there as on every card, with no option. An RTX 50 or RTX
-PRO card keeps the FP8 band and the fused prefill unless `int8` is named.
+ignis's own kernels there, as on every card from 0.10.0, with no option. An
+RTX 50 or RTX PRO card keeps the FP8 band and the fused prefill unless `int8`
+is named.
 
 ### `` `--model-prefill-linear int8` names the dense prefill, which decodes the trellis body's matrices, and this artifact's body is NVFP4 ``
 

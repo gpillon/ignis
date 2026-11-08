@@ -9,7 +9,8 @@ it cites moves.
   verdicts added until 2026-09-16.
 - `ignis-v1.md`: the v1 design summary, settled on 2026-09-02.
 - `DEFERRED-DECISIONS.md`: what three design sessions, from 2026-09-09 to
-  2026-10-13, chose not to build, and why.
+  2026-10-13, chose not to build, and why. The entries still open are parked
+  as issues, #545 to #551 (and #66).
 
 Plans live on the [project board](https://github.com/users/gpillon/projects/6),
 decisions in [`docs/adr/`](../adr/), results in

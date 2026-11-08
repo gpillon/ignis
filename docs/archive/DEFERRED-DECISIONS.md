@@ -1,4 +1,5 @@
 > Archived on 2026-11-08: a snapshot of 2026-09-09 to 2026-10-13; see [docs/archive/README.md](README.md).
+> The entries still open are parked as issues: #545 to #551, and #66 for MTP behind DFlash2.
 
 # Deferred decisions
 

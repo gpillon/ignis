@@ -83,8 +83,9 @@ of one on another card fails with CUDA's "no kernel image is available".
 Every architecture added costs another device compile of nearly every
 translation unit.
 
-**Releases are built for `86;120a`**, on Windows and on Linux, the container
-image included: `.github/workflows/release.yml` sets the variable for both
+**Releases are built for `86;120a`** from 0.10.0 (the 0.9 releases for `120a`
+alone), on Windows and on Linux, the container image included:
+`.github/workflows/release.yml` sets the variable for both
 builds. Before packaging, `mk/cuda-build-check.sh` reads each binary
 (`ignis-server`, `ignis-bench`, `ignis-artifact-inspect`) and refuses one that
 carries no machine code for an architecture of the list, or for 8.6 or 12.0,
