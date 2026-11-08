@@ -39,7 +39,7 @@ Reservations never grow and the leaf maps a sequence whole. The growth branch
 has nothing in the code (no `ignis_seq_grow`, no lane parked for want of a
 page, no `ignis_kv_lane_parks_total`), its spike was never merged, and growth
 was never re-gated at the 32-page step the finding names as the first thing to
-measure.
+measure. The owner confirmed the fixed branch as the decision on 2026-11-08.
 
 **Only an admission moves a live sequence, and no work is lost.** Short of
 pages, an admission gives up retained state first, then what lower-ranked
