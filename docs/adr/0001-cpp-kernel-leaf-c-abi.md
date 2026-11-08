@@ -1,3 +1,8 @@
+---
+status: accepted
+amended-by: [ADR-0009]
+---
+
 # ADR 0001 — C++ kernel leaf behind a C ABI
 
 ## Status

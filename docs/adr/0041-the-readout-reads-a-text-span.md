@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0041 — the attention readout reads a text span, in whole rows
 
 ## Status

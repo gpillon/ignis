@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0012 — Internal tracing spans reuse `request.id` as the OTel `trace_id`
 
 ## Status

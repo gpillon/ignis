@@ -1,3 +1,9 @@
+---
+status: accepted
+amends: [ADR-0033]
+amended-by: [ADR-0064, ADR-0074]
+---
+
 # ADR 0047 — a model catalog the operator can extend, and a `model` command to fetch from it
 
 ## Status

@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0039 — the attention readout carries a head set
 
 ## Status

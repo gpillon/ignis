@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0061 — prefill attention reads the hq-e8-2b codec: no prompt planes, on every card
 
 ## Status

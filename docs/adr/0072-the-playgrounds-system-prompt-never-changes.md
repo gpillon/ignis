@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # The Playground's system prompt never changes: what changes rides after the history
 
 Until 2026-10-28 the Playground's system prompt carried the titles of the

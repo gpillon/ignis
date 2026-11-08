@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0066 — the user guide is a Starlight site built from `docs/user/` alone, published on a release tag
 
 ## Status

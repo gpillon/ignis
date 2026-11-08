@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # The server downloads and removes models after start, from the Server view
 
 Until 2026-10-25 the server fetched a model only at start, when the model it

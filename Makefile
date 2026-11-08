@@ -507,6 +507,22 @@ docs-screenshots: $(DOCS_DEPS) $(WEB_DEPS) ## Retake the Playground's screenshot
 docs-reference: ## Regenerate docs/user/reference/ from the code: fields, profiles, catalog, metrics, routes, CLI
 	IGNIS_BLESS_USER_DOCS=1 $(CARGO) test -p ignis-server --test user_docs_reference $(CARGO_TARGET)
 
+# The ADR and findings indexes, docs/adr/README.md and docs/findings/README.md,
+# are generated from each file's frontmatter and never edited by hand
+# (ADR 0081). The scripts are the standard library alone; the records workflow
+# runs records-check on every push that touches either folder.
+.PHONY: records
+records: ## Regenerate the ADR and findings indexes from each file's frontmatter
+	$(PYTHON) mk/adr-index.py --write
+	$(PYTHON) mk/findings-index.py --write
+
+.PHONY: records-check
+records-check: ## The indexes' selftests, then their check: frontmatter, links both ways, index in sync
+	$(PYTHON) mk/adr-index.py --selftest
+	$(PYTHON) mk/findings-index.py --selftest
+	$(PYTHON) mk/adr-index.py --check
+	$(PYTHON) mk/findings-index.py --check
+
 $(DOCS_DEPS): docs/site/package.json docs/site/package-lock.json
 	$(NPM) --prefix docs/site ci
 	@touch "$@"

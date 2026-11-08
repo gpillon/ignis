@@ -1,3 +1,8 @@
+---
+status: accepted
+amends: [ADR-0011, ADR-0017]
+---
+
 # ADR 0025 — Scheduler interval counters are a DEBUG log event
 
 ## Status

@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0056 — speculation past 8 verify rows is numerically equivalent, not bit-exact
 
 ## Status

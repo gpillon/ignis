@@ -17,6 +17,7 @@
 #                          (mk/version.sh on both hosts -- see below)
 #   CHANGELOG_TOOL         draft the release notes for a commit range
 #                          (mk/changelog.sh on both hosts -- see below)
+#   PYTHON                 the Python 3 that runs mk/*.py (the record indexes)
 #   OS_REQUIRED_TOOLS      tools `make doctor` requires
 #   OS_OPTIONAL_TOOLS      tools `make doctor` only reports
 #   OS_TOOL_HINT           where those tools come from
@@ -62,6 +63,10 @@ DEV_UI = $(SERVER_CTL_ENV) $(PS) -File mk/windows/devui.ps1
 # already requires (the $(error) above) is Git for Windows', which ships bash.
 VERSION_TOOL = bash mk/version.sh
 CHANGELOG_TOOL = bash mk/changelog.sh
+
+# The python.org installer puts `python` on PATH; `python3` on Windows is the
+# Microsoft Store's stub, which answers by offering to install Python.
+PYTHON ?= python
 
 OS_REQUIRED_TOOLS := powershell
 OS_OPTIONAL_TOOLS := cmake ninja nvidia-smi

@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0048 — an end of turn drawn inside an open reasoning block closes the block instead
 
 ## Status

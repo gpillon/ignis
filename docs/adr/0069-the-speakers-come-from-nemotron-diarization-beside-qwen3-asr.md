@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0069 — the speakers come from Nemotron 3 Diarization, beside Qwen3-ASR
 
 ## Status

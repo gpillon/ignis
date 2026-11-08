@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0044 — Flash-Next's experts are trellis-coded with a bit width per expert, on our own kernels
 
 ## Status

@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0027 — make is the development entry point, with per-OS hooks
 
 ## Status

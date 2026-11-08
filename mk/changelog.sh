@@ -237,27 +237,69 @@ fi
 # Every line is "ADR NNNN — title": the older ADRs carry the number in their
 # heading, the short format's heading is the bare title and the number is in
 # the file name only, and the site's changelog links the literal "ADR NNNN".
+#
+# Since ADR 0081 an ADR whose decision changed is amended by a new one and
+# changes only in its frontmatter, so a modified ADR is "(amended)" only when
+# its text changed: the frontmatter is dropped and every link target blanked on
+# both sides first, and a status, a back-link or a moved file's path is not an
+# amendment. A status that changed is said, "(now superseded by ADR 0082)",
+# against the long form's `## Status` section when the older side has no
+# frontmatter yet. docs/adr/README.md is the generated index, not a decision.
+adr_text() { # <rev> <path>
+    git show "$1:$2" 2>/dev/null |
+        awk 'NR == 1 && $0 == "---" { front = 1; next }
+             front { if ($0 == "---") { front = 0; gap = 1 }; next }
+             gap && $0 == "" { next }
+             { gap = 0; print }' |
+        sed -E 's/\]\([^)]*\)/]()/g'
+}
+adr_status() { # <rev> <path>: the frontmatter's status, else the Status section's first word
+    git show "$1:$2" 2>/dev/null |
+        awk 'NR == 1 && $0 == "---" { front = 1; next }
+             front && $0 == "---" { front = 0; next }
+             front { if (sub(/^status: /, "")) { print; exit }; next }
+             /^## Status/ { section = 1; next }
+             section && /^## / { exit }
+             section && NF { word = tolower($1); gsub(/[^a-z]/, "", word); print word; exit }'
+}
 adrs="$(git diff --name-status "$from..$to" -- docs/adr/ 2>/dev/null | grep -E '^[AM]')"
-if [ -n "$adrs" ]; then
+decisions=""
+while IFS=$'\t' read -r status path; do
+    [ -n "$path" ] || continue
+    file="${path##*/}"
+    case "$file" in
+        [0-9][0-9][0-9][0-9]-*.md) ;;
+        *) continue ;;
+    esac
+    heading="$(git show "$to:$path" 2>/dev/null | sed -n 's/^# *//p' | head -1)"
+    [ -n "$heading" ] || heading="$path"
+    case "$heading" in
+        "ADR "[0-9][0-9][0-9][0-9]*) ;;
+        *) heading="ADR ${file%%-*} — $heading" ;;
+    esac
+    case "$status" in
+        A*) decisions="$decisions- $heading"$'\n' ;;
+        M*)
+            note=""
+            [ "$(adr_text "$from" "$path")" = "$(adr_text "$to" "$path")" ] || note="amended"
+            was="$(adr_status "$from" "$path")"
+            now="$(adr_status "$to" "$path")"
+            # "superseded" in a Status section is the same as the frontmatter's
+            # "superseded by ADR-0007"; an unknown side says nothing.
+            if [ -n "$was" ] && [ -n "$now" ]; then
+                case "$now" in
+                    "$was"|"$was "*) ;;
+                    *) note="${note:+$note, }now ${now//ADR-/ADR }" ;;
+                esac
+            fi
+            [ -n "$note" ] && decisions="$decisions- $heading ($note)"$'\n' ;;
+    esac
+done <<< "$adrs"
+if [ -n "$decisions" ]; then
     echo
     echo "### Decisions"
     echo
-    while IFS=$'\t' read -r status path; do
-        [ -n "$path" ] || continue
-        heading="$(git show "$to:$path" 2>/dev/null | sed -n 's/^# *//p' | head -1)"
-        [ -n "$heading" ] || heading="$path"
-        file="${path##*/}"
-        case "$heading" in
-            "ADR "[0-9][0-9][0-9][0-9]*) ;;
-            *) case "$file" in
-                   [0-9][0-9][0-9][0-9]-*) heading="ADR ${file%%-*} — $heading" ;;
-               esac ;;
-        esac
-        case "$status" in
-            A*) echo "- $heading" ;;
-            M*) echo "- $heading (amended)" ;;
-        esac
-    done <<< "$adrs"
+    printf '%s' "$decisions"
 fi
 
 # What the per-issue list cannot have covered: either housekeeping, or a

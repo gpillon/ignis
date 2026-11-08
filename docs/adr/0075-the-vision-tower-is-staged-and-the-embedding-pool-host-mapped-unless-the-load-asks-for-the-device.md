@@ -1,3 +1,8 @@
+---
+status: accepted
+amends: [ADR-0035, ADR-0063]
+---
+
 # The vision tower is staged and the embedding pool host-mapped, unless the load asks for the device
 
 A vision load used to reserve the 27B's vision tower (295,711,648 bytes) and its embedding pool (ADR 0035) in VRAM for

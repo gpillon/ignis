@@ -1,3 +1,8 @@
+---
+status: superseded by ADR-0009
+amended-by: [ADR-0019]
+---
+
 # ADR 0008 — CUDA-graph decode replay: persistent device staging buffers
 
 ## Status

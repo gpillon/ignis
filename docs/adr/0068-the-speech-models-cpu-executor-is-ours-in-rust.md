@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0068 — the speech model's CPU executor is ours, in Rust
 
 ## Status

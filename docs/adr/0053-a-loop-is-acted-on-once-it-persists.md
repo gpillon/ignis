@@ -1,3 +1,8 @@
+---
+status: accepted
+amends: [ADR-0052]
+---
+
 # ADR 0053 — a loop is acted on once it persists, and a rewind keeps something
 
 ## Status

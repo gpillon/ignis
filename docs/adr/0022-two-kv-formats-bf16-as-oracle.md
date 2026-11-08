@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0022 — two KV formats, with BF16 retained as the correctness oracle
 
 ## Status

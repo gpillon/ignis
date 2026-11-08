@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0042 — a locate narrows by attention heads and decides by a labelled choice, by kind of text
 
 ## Status

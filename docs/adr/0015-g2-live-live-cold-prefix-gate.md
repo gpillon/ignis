@@ -1,3 +1,8 @@
+---
+status: superseded by ADR-0082
+amended-by: [ADR-0021, ADR-0043]
+---
+
 # ADR 0015 — G2 is judged live/live against the reference, on cold-prefix samples
 
 ## Status

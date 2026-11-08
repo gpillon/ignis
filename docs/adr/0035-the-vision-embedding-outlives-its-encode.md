@@ -1,3 +1,9 @@
+---
+status: accepted
+amends: [ADR-0030]
+amended-by: [ADR-0075]
+---
+
 # ADR 0035 — the vision embedding outlives its encode
 
 ## Status

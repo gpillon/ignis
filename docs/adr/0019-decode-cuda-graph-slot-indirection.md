@@ -1,3 +1,9 @@
+---
+status: accepted
+amends: [ADR-0008]
+amended-by: [ADR-0020]
+---
+
 # ADR 0019 — decode CUDA graph replay via device-resident slot indirection
 
 ## Status

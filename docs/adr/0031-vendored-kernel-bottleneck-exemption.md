@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0031 — a vendored kernel that is measured as the bottleneck is not untouchable
 
 ## Status

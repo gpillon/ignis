@@ -1,3 +1,8 @@
+---
+status: accepted
+amended-by: [ADR-0047]
+---
+
 # ADR 0033 — the server fetches its own model, and asks first only when somebody is there
 
 ## Status

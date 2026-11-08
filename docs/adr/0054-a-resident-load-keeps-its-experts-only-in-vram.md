@@ -1,3 +1,8 @@
+---
+status: accepted
+amends: [ADR-0045]
+---
+
 # ADR 0054 — a resident Flash-Next load keeps its experts only in VRAM
 
 ## Status

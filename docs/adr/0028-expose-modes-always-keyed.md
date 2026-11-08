@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0028 — exposure is a named mode, and an exposed server always has a key
 
 ## Status

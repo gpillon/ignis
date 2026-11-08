@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # The running notes send the notes back to the text model and the recap does not
 
 The owner decided on 2026-10-31 (#428) that a transcript's notes come in two

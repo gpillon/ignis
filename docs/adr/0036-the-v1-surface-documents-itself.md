@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0036 — the `/v1` surface documents itself, and its reference needs no key
 
 ## Status

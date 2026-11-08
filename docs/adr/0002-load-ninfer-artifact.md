@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0002 — The engine loads `.ninfer` artifacts directly
 
 ## Status

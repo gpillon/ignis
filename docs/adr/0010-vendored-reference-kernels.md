@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0010 — Kernel policy: vendor the reference ops verbatim, under a manifest
 
 ## Status

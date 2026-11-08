@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # A workspace is kept by the page and ignis stores no files
 
 The owner decided on 2026-10-28 (#170) that the Playground's workspaces, the

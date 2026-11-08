@@ -1,3 +1,8 @@
+---
+status: accepted
+amends: [ADR-0047, ADR-0064]
+---
+
 # A catalog entry may state its family, and an alias may be another entry's id
 
 The 16 GB build of the uncensored variant (GitHub #386) must answer to
