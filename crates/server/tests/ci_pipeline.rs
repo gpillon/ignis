@@ -247,12 +247,13 @@ fn the_container_build_compiles_the_leaf_in_a_layer_only_kernel_invalidates() {
     let copy_all = at("\nCOPY . .\n");
     let cargo = at("cargo build --release");
     assert!(copy_kernel < build_leaf && build_leaf < copy_all, "the leaf is built from kernel/ alone, before `COPY . .`");
-    // The dependencies are compiled from the recipe alone, before the leaf and
-    // the sources, so neither invalidates them; the recipe comes from a stage
+    // The dependencies are compiled from the recipe alone, after the leaf (a
+    // lock file change must not cost the leaf's compile) and before the
+    // sources, which then never invalidate them; the recipe comes from a stage
     // of its own, and cargo-chef is a pinned version.
     let recipe = at("\nCOPY --from=planner /src/recipe.json recipe.json\n");
     let cook = at("\nRUN cargo chef cook --release --locked --target x86_64-unknown-linux-gnu --recipe-path recipe.json\n");
-    assert!(recipe < cook && cook < copy_kernel, "the dependencies are cooked from the recipe, before the leaf and `COPY . .`");
+    assert!(build_leaf < recipe && recipe < cook && cook < copy_all, "the dependencies are cooked from the recipe, after the leaf and before `COPY . .`");
     let planner = containerfile.split(" AS planner\n").nth(1).and_then(|rest| rest.split("\nFROM ").next()).expect("a planner stage");
     assert!(planner.contains("RUN cargo chef prepare --recipe-path recipe.json"), "{planner}");
     let chef = containerfile

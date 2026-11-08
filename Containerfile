@@ -83,15 +83,6 @@ RUN test -x /usr/local/cuda/bin/cuobjdump || { apt-get update \
     && test -x /usr/local/cuda/bin/cuobjdump
 ENV IGNIS_CUOBJDUMP=/usr/local/cuda/bin/cuobjdump
 
-# The dependencies, in a layer only the recipe invalidates (#552). cargo-chef
-# builds the workspace with every crate of ours replaced by an empty one and
-# every build script of ours by `fn main() {}` (so no kernel leaf here); the
-# build below finds every dependency compiled for the same target, profile and
-# features. No `--features cuda`: it turns on features of ignis's own crates
-# alone, none of a dependency's.
-COPY --from=planner /src/recipe.json recipe.json
-RUN cargo chef cook --release --locked --target x86_64-unknown-linux-gnu --recipe-path recipe.json
-
 # nvcc peaks well above 2 GB of RSS on the W4A4/TMA translation units, so a
 # builder with little memory per core needs a narrower width than its core
 # count (kernel/build.sh reads this).
@@ -115,6 +106,17 @@ ENV IGNIS_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
 # push that touches no kernel file finds this one in the cache.
 COPY kernel/ kernel/
 RUN bash kernel/build.sh --archives-only
+
+# The dependencies, in a layer only the recipe invalidates (#552), after the
+# leaf: ~15 minutes of nvcc stay cached through a change to the lock file,
+# which costs the ~2 minutes of this layer alone. cargo-chef builds the
+# workspace with every crate of ours replaced by an empty one and every build
+# script of ours by `fn main() {}` (so no leaf is built or linked here); the
+# build below finds every dependency compiled for the same target, profile
+# and features. No `--features cuda`: it turns on features of ignis's own
+# crates alone, none of a dependency's.
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --locked --target x86_64-unknown-linux-gnu --recipe-path recipe.json
 
 COPY . .
 COPY --from=web /src/web/dist ./web/dist
