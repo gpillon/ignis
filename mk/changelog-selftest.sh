@@ -25,7 +25,9 @@
 # a NOT_PLANNED issue is not a release note at all, a commit naming no issue
 # is listed rather than dropped, and every ADR is named "ADR NNNN — title"
 # whether its heading carries the number or is the bare title of the short
-# format.
+# format. Since ADR 0081 it also pins when a modified ADR is a decision: when
+# its text changed, not its frontmatter or a link's target, and when its
+# status changed, said as "(now ...)"; the generated index never is.
 
 set -uo pipefail
 
@@ -91,6 +93,19 @@ commit() {
 }
 
 printf '# ADR 0001 — a decision taken before the range\n' > docs/adr/0001-early.md
+# The ADRs whose frontmatter the range changes (ADR 0081): the long form's
+# Status section, a link, a short one's frontmatter status.
+printf '# ADR 0004 — a long-form decision\n\n## Status\n\nAccepted (2026-01-01).\n' \
+    > docs/adr/0004-long.md
+printf '# ADR 0005 — a decision that links\n\nSee [the finding](../findings/a.md).\n' \
+    > docs/adr/0005-linked.md
+printf '# ADR 0006 — a decision the range retires\n\n## Status\n\nAccepted.\n' \
+    > docs/adr/0006-retired.md
+printf '%s\n' '---' 'status: proposed' '---' '' '# A proposed decision' > docs/adr/0007-proposed.md
+printf '%s\n' '---' 'status: accepted' '---' '' '# A decision deprecated with a reason' \
+    > docs/adr/0008-deprecated.md
+printf '# ADR 0009 — a decision superseded already\n\n## Status\n\nSuperseded by ADR 0002.\n' \
+    > docs/adr/0009-superseded.md
 commit "Groundwork, and the earlier half of #20"
 git tag -a v9.9.8 -m v9.9.8
 export GIT_AUTHOR_DATE='2026-01-03T00:00:00Z' GIT_COMMITTER_DATE='2026-01-03T00:00:00Z'
@@ -111,6 +126,25 @@ printf '# A decision in the short format\n\nIts context, the decision and why.\n
 commit "A decision in the short format, recorded (#10)"
 printf '# ADR 0001 — a decision taken before the range\n\nAmended.\n' > docs/adr/0001-early.md
 commit "The earlier decision, amended (#10)"
+# Frontmatter only, as ADR 0081 changes an ADR a later one amends or replaces:
+# a status the Status section already said, a link's target, a back-link.
+printf '%s\n' '---' 'status: accepted' 'amended-by: [ADR-0002]' '---' '' \
+    '# ADR 0004 — a long-form decision' '' '## Status' '' 'Accepted (2026-01-01).' \
+    > docs/adr/0004-long.md
+printf '%s\n' '---' 'status: accepted' '---' '' '# ADR 0005 — a decision that links' '' \
+    'See [the finding](../findings/archive/a.md).' > docs/adr/0005-linked.md
+printf '%s\n' '---' 'status: superseded by ADR-0002' '---' '' \
+    '# ADR 0006 — a decision the range retires' '' '## Status' '' 'Accepted.' \
+    > docs/adr/0006-retired.md
+printf '%s\n' '---' 'status: accepted' '---' '' '# A proposed decision' > docs/adr/0007-proposed.md
+printf '%s\n' '---' 'status: deprecated' '---' '' '# A decision deprecated with a reason' '' \
+    'The reason.' > docs/adr/0008-deprecated.md
+printf '%s\n' '---' 'status: superseded by ADR-0002' '---' '' \
+    '# ADR 0009 — a decision superseded already' '' '## Status' '' 'Superseded by ADR 0002.' \
+    > docs/adr/0009-superseded.md
+# The generated index is not a decision.
+printf '# Architecture decision records\n\n| ADR |\n' > docs/adr/README.md
+commit "The frontmatter, and the index (#10)"
 commit "The duplicate, mentioned anyway (#40)"
 commit "Merge: a branch"
 commit "ignis 9.9.9"
@@ -176,6 +210,34 @@ has "ADR 0003 — A decision in the short format" "$decisions" \
 has "ADR 0002 — ADR 0002" "$decisions" \
     && fail "an ADR whose heading carries its number got it twice: $decisions"
 
+has "ADR 0004" "$decisions" \
+    && fail "a frontmatter that restates the Status section made an ADR amended: $decisions" \
+    || note "an ADR given the frontmatter its Status section already said is not listed"
+
+has "ADR 0005" "$decisions" \
+    && fail "a link's new target made an ADR amended: $decisions" \
+    || note "a link's moved target is not an amendment"
+
+has "ADR 0006 — a decision the range retires (now superseded by ADR 0002)" "$decisions" \
+    && note "a status changed from the Status section's is said, not called amended" \
+    || fail "the superseded ADR is not reported by its new status: $decisions"
+
+has "ADR 0007 — A proposed decision (now accepted)" "$decisions" \
+    && note "a frontmatter status that changed is said" \
+    || fail "the accepted ADR is not reported by its new status: $decisions"
+
+has "ADR 0008 — A decision deprecated with a reason (amended, now deprecated)" "$decisions" \
+    && note "a text and a status that both changed are both said" \
+    || fail "the deprecated ADR is not both amended and deprecated: $decisions"
+
+has "ADR 0009" "$decisions" \
+    && fail "a Status section's Superseded read as a change of status: $decisions" \
+    || note "a Status section's Superseded is the frontmatter's superseded by"
+
+has "Architecture decision records" "$decisions" \
+    && fail "the generated index reached the Decisions: $decisions" \
+    || note "docs/adr/README.md is not a decision"
+
 has "Housekeeping with no issue behind it" "$loose" \
     && note "a commit naming no issue is listed, not dropped" \
     || fail "the unreferenced commit is missing: $loose"
@@ -209,6 +271,17 @@ elif grep -q 'ADR 0002' "$work/nogh.md" && grep -q 'Housekeeping' "$work/nogh.md
 else
     fail "with a silent gh the git-derived sections are missing"
 fi
+
+# A range whose ADRs gained only a back-link has no Decisions section at all,
+# rather than a heading over nothing.
+printf '%s\n' '---' 'status: accepted' 'amended-by: [ADR-0003]' '---' '' '# A proposed decision' \
+    > docs/adr/0007-proposed.md
+commit "A back-link (#10)"
+PATH="$work/bin:$PATH" GH_FIXTURE="$work/issues.tsv" \
+    bash "$script" v9.9.9 HEAD > "$work/backlink.md" 2>/dev/null
+grep -q '^### Decisions$' "$work/backlink.md" \
+    && fail "a range of frontmatter edits alone has a Decisions section: $(cat "$work/backlink.md")" \
+    || note "a range whose ADRs changed only in their frontmatter has no Decisions section"
 
 # A range with a bad end is an error, not an empty draft that looks fine.
 PATH="$work/bin:$PATH" bash "$script" v9.9.8 no-such-ref > /dev/null 2>&1

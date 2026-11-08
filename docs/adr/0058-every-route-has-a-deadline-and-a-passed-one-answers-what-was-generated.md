@@ -1,3 +1,8 @@
+---
+status: accepted
+amends: [ADR-0017]
+---
+
 # ADR 0058 — every route has a deadline, and a passed one answers what was generated
 
 ## Status

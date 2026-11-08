@@ -1,0 +1,46 @@
+# Hold the ADRs and the findings to their frontmatter and their generated
+# indexes (ADR 0081): docs/adr/README.md and docs/findings/README.md are written
+# by mk/adr-index.py and mk/findings-index.py, never by hand. This runs what
+# `make records-check` runs, each script's selftest and then its check, on a
+# push that touches either folder or either script. Python's standard library
+# alone: nothing to install.
+
+name: records
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "docs/adr/**"
+      - "docs/findings/**"
+      - "mk/adr-index.py"
+      - "mk/findings-index.py"
+      - ".github/workflows/records.yml"
+  pull_request:
+    paths:
+      - "docs/adr/**"
+      - "docs/findings/**"
+      - "mk/adr-index.py"
+      - "mk/findings-index.py"
+      - ".github/workflows/records.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: records-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  records:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The ADR index's selftest
+        run: python3 mk/adr-index.py --selftest
+      - name: The findings index's selftest
+        run: python3 mk/findings-index.py --selftest
+      - name: The ADRs' frontmatter and their index
+        run: python3 mk/adr-index.py --check
+      - name: The findings' frontmatter and their index
+        run: python3 mk/findings-index.py --check

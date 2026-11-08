@@ -1,3 +1,8 @@
+---
+status: accepted
+amended-by: [ADR-0084]
+---
+
 # ADR 0006 — Exclusive GPU testing (no concurrent engines)
 
 ## Status

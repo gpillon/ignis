@@ -1,3 +1,10 @@
+---
+status: accepted
+amends: [ADR-0001]
+supersedes: [ADR-0008]
+amended-by: [ADR-0016]
+---
+
 # ADR 0009 — Step-level, device-resident C ABI (the forward pass lives in the leaf)
 
 ## Status

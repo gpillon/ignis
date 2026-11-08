@@ -1,3 +1,8 @@
+---
+status: accepted
+amended-by: [ADR-0081, ADR-0084]
+---
+
 # A spec is a GitHub issue and its tickets are sub-issues
 
 The first `/setup-matt-pocock-skills` ran on 2026-09-02, before the GitHub

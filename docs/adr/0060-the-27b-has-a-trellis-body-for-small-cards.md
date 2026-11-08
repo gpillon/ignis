@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0060 — the 27B gets a second body format, trellis, for the 16 GB card class
 
 ## Status

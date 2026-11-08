@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0059 — Flash-Next applies YaRN, the attention factor folded into cos and sin on q and k
 
 ## Status

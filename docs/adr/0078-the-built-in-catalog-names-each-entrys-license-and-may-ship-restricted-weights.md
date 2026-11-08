@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # The built-in catalog names each entry's license and may ship weights whose license restricts commercial use
 
 Swift 1.5 (GitHub #449) is a fine-tune of the 27B under the Swift Open License

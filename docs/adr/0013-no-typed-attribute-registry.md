@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0013 — No typed attribute registry; discipline + regression tests only
 
 ## Status

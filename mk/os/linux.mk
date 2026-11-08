@@ -47,6 +47,9 @@ DEV_UI = $(call todo,run-ui / dev-ui)
 VERSION_TOOL = bash mk/version.sh
 CHANGELOG_TOOL = bash mk/changelog.sh
 
+# Debian and Ubuntu name Python 3 `python3`, with no `python` by default.
+PYTHON ?= python3
+
 OS_REQUIRED_TOOLS :=
 OS_OPTIONAL_TOOLS := cmake ninja nvidia-smi
 OS_TOOL_HINT := CUDA=1 only: CUDA Toolkit under CUDA_HOME, CMake, Ninja -- README Prerequisites

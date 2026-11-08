@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0038 — the `Compute` seam carries one attention head's scores
 
 ## Status

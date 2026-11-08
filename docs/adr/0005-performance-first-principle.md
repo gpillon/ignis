@@ -1,3 +1,8 @@
+---
+status: accepted
+amended-by: [ADR-0050, ADR-0083, ADR-0084]
+---
+
 # ADR 0005 — Performance-first as the organizing principle
 
 ## Status

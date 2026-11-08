@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0065 — the 27B's BF16 exception tensors can be held in FP8, converted at load
 
 ## Status

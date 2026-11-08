@@ -1,3 +1,8 @@
+---
+status: accepted
+amended-by: [ADR-0025]
+---
+
 # ADR 0011 — `tracing` + `tracing-subscriber` as the structured logging foundation
 
 ## Status

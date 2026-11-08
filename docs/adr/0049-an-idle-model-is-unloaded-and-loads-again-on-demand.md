@@ -1,3 +1,8 @@
+---
+status: accepted
+amended-by: [ADR-0067]
+---
+
 # ADR 0049 — an idle model is unloaded, and the next request loads it again
 
 ## Status

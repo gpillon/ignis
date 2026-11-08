@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0040 — the attention readout carries each peak's neighbours
 
 ## Status

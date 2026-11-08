@@ -1,3 +1,7 @@
+---
+status: superseded by ADR-0007
+---
+
 # ADR 0003 — 99% token-agreement parity gate
 
 ## Status

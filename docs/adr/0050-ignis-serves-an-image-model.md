@@ -1,3 +1,9 @@
+---
+status: accepted
+amends: [ADR-0005, ADR-0007]
+amended-by: [ADR-0067]
+---
+
 # ADR 0050 — ignis serves an image model, one model at a time
 
 ## Status

@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0057 — rope scaling is `auto` by default: the YaRN factor follows the context
 
 ## Status

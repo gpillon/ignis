@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0062 — the 27B's token embedding lives in pinned host memory, on every card
 
 ## Status

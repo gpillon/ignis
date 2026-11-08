@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0037 — a vendored file may carry a patch that fixes a known correctness bug
 
 ## Status

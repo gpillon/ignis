@@ -1,3 +1,8 @@
+---
+status: accepted
+amends: [ADR-0049, ADR-0050]
+---
+
 # ADR 0067 — the speech model waits on the host and borrows free KV pages
 
 ## Status

@@ -1,3 +1,8 @@
+---
+status: superseded by ADR-0082
+amends: [ADR-0015]
+---
+
 # ADR 0021 — a live/live gate pools at least two independent process launches per engine
 
 ## Status

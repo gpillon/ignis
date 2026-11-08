@@ -1,3 +1,8 @@
+---
+status: accepted
+amends: [ADR-0019]
+---
+
 # ADR 0020 — the decode round is one batch-wide model traversal
 
 ## Status

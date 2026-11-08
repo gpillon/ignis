@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0034 — the leaf answers without generating
 
 ## Status

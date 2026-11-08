@@ -1,3 +1,9 @@
+---
+status: accepted
+amends: [ADR-0014, ADR-0015]
+amended-by: [ADR-0051, ADR-0082]
+---
+
 # ADR 0043 — a second model, Qwen3.8-Flash-Next, served without a ninfer reference
 
 ## Status

@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # ADR 0004 — Full admission state machine in v1
 
 ## Status
