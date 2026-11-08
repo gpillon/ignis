@@ -6,8 +6,8 @@ sidebar:
 ---
 
 Ignis targets NVIDIA RTX cards: every model on an **RTX 5090** or an **RTX PRO
-6000**, both compute capability 12.0, and the 27B on the 16 GB RTX 50 cards and
-the RTX 3090 too ([What it runs on](../start/index.md#what-it-runs-on)). The DGX
+6000**, both compute capability 12.0, and the 27B on the 16 GB RTX 50 cards and,
+from 0.10.0, the RTX 3090 too ([What it runs on](../start/index.md#what-it-runs-on)). The DGX
 Spark is the obvious question — a Blackwell GPU with native NVFP4, 128 GB of
 memory, on a desk. Why is it not on the list?
 

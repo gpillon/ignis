@@ -16,17 +16,19 @@ prefix was cold. A sample whose computed prefill is not the prompt's own length 
 a void sample, a missing cell, or a session that does not match its
 counterpart's.
 
-The gate run (GitHub #88) needs the GPU exclusively and the reference
-stopped and restarted around it (ADR 0006). One session, one shared
-`--session` value:
+The gate run (GitHub #88) needs the GPU exclusively, one engine at a time
+(ADR 0006): the reference runs for its own leg and is stopped before
+ignis's, on a card nothing else holds
+([who holds the card](../testing.md#who-holds-the-card)). One session, one
+shared `--session` value:
 
 ```powershell
 $Session = "g2-$(Get-Date -Format yyyyMMddTHHmmssZ)"
 $Artifact = "F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer"
 
-# 1. The reference, in the owner's production profile (hq-e8-2b KV, 1024
-#    prefill chunk, CUDA graphs) -- the bar actually experienced, measured
-#    as it is actually run (ADR 0015).
+# 1. The reference, in the profile it was served with when the gate was set
+#    (hq-e8-2b KV, 1024 prefill chunk, CUDA graphs) -- the bar as it was
+#    experienced, measured as it was run (ADR 0015).
 cargo run -p ignis-bench -- ttft `
   --endpoint http://127.0.0.1:8080 --artifact $Artifact `
   --cells 8192,32768 --label reference --profile "hq-e8-2b KV, 1024 chunk, graphs" `
@@ -46,7 +48,8 @@ cargo run -p ignis-bench -- g2 `
   --note "KV format differs: ignis BF16, reference hq-e8-2b" `
   --out .scratch/g2-verdict.json
 
-# 4. Restart the reference.
+# 4. Stop ignis-server. If the user stopped the engine that serves a local
+#    agent for this run, they restart it now.
 ```
 
 Each ignis leg of a bench or a gate runs with the loop guard off, and takes the
@@ -123,8 +126,9 @@ For the record: shrinking the hq pool from 7,281 pages to 1,024 moved ITL p50 by
 0.04% and p95 by 0.05%, so the page count is not itself a performance term —
 but that is a measured result, not an assumption to skip the matching on.
 
-Needs the GPU exclusively (ADR 0006) and `ninfer-serve` stopped for the ignis
-legs. Four runs, ~4 minutes each. Launch the legs with the explicit commands
+Needs the GPU exclusively (ADR 0006,
+[who holds the card](../testing.md#who-holds-the-card)) and `ninfer-serve`
+stopped for the ignis legs. Four runs, ~4 minutes each. Launch the legs with the explicit commands
 below: `make start` brings up the G5 configuration (262144 context, DFlash2),
 a different engine from these legs.
 

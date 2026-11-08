@@ -18,9 +18,11 @@ count, differs from run to run. Error bodies on `/v1` are OpenAI's
 The card is not one the build's kernels were compiled for. The full message
 names the card as NVML does and its compute capability, here an RTX 40 card at
 8.9, and ends with a link to the guide's
-[What it runs on](start/index.md#what-it-runs-on). A build from a checkout by
+[What it runs on](start/index.md#what-it-runs-on) (a 0.9 release names the
+cards "RTX 50, RTX PRO 6000 Blackwell" and ends "see GitHub #456"). A build from a checkout by
 default is compiled for `120a` only: compute capability 12.0, the RTX 50 and
-RTX PRO 6000 Blackwell cards. A release is compiled for `86;120a`, which adds
+RTX PRO 6000 Blackwell cards, and so is every 0.9 release. From 0.10.0 a
+release is compiled for `86;120a`, which adds
 the RTX 30 and RTX 40 cards, so it refuses a card older than those, such as an
 RTX 20. The server checks the card before anything else, whatever `--profile`
 says, because a load could only
@@ -28,7 +30,8 @@ fail at its first kernel with CUDA's own "no kernel image is available for
 execution on the device". `model download`, `model list` and the `config`
 commands load nothing and still run on such a card.
 
-On an RTX 30 or RTX 40 card, use a release, or build for it
+On an RTX 30 or RTX 40 card, use a release from 0.10.0 or the
+[development build](start/install.md#development-builds), or build for it
 ([Other card architectures](contributing/building.md#other-card-architectures)):
 the RTX 3090 and 3090 Ti are supported, and the RTX 4090 and the 16 GB RTX 40
 cards are verified for correctness: the release's sm_86 gate passed on an Ada
@@ -228,9 +231,9 @@ missing, or an artifact that does not verify against its provenance sidecar
 
 The `--model-artifact` file is there but its provenance sidecar,
 `<artifact>.graft.json` or `<artifact>.conversion.json`, is not beside it, so
-the start is refused before the file is read. When the file is a catalog
-entry's artifact placed by hand, the refusal goes on to name the command that
-fetches the sidecar:
+the start is refused before the file is read. From 0.10.0, when the file is a
+catalog entry's artifact placed by hand, the refusal goes on to name the
+command that fetches the sidecar:
 
 ```
 …; the catalog lists it: `ignis-server model download <id> --download-path <dir>` fetches the sidecar beside it and keeps the artifact

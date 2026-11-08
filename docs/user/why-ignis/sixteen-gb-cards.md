@@ -73,7 +73,8 @@ thinking budget forced a close on 15 of 32 turns against 8 of 32 on NVFP4.
 - **Swift 1.5**: `ignis-server model download swift-1.5-27b` fetches
   `swift-1.5-27b-16g` on a 16 GB card ([fine-tunes](../guides/fine-tunes.md)).
 - **The profile**: `--profile auto` (the default) or `--profile rtx-16gb`
-  ([profiles](../concepts/profiles.md#rtx-16gb)).
+  (`--profile rtx50-16gb` in the 0.9 releases;
+  [profiles](../concepts/profiles.md#rtx-16gb)).
 - **The adaptation**: [`model.adapt_context_step`](../reference/configuration.md#modeladapt_context_step)
   and [`vram.adapt_spare_tokens`](../reference/configuration.md#vramadapt_spare_tokens);
   `GET /v1/models` reports `decode_lanes` and `adapted`.

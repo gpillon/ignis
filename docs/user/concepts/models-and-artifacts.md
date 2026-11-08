@@ -147,7 +147,7 @@ three `-16g` entries, which load on 16 GB and answer to `qwen3.8-27b`,
 to `qwen3.8-27b-abliterated` and to `swift-1.5-27b` on a 16 or 24 GB card
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md),
 [ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md))
-([the catalog](../guides/models.md#the-catalog)). All but the three `-16g`
+([the catalog](../guides/models.md#the-catalog)). From 0.10.0 all but the three `-16g`
 entries also state the oldest **GPU generation** they load on, Blackwell: on an
 RTX 30 or RTX 40 card the `-16g` entries serve the ids they answer to, and the
 rest are refused

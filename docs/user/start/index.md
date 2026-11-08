@@ -6,7 +6,7 @@ sidebar:
 ---
 
 ignis is an inference engine for one family of models on NVIDIA RTX cards. It
-loads a Qwen3.8 model onto a single card, Blackwell, Ampere or Ada, and serves
+loads a Qwen3.8 model onto a single card, Blackwell, or from 0.10.0 Ampere or Ada, and serves
 it over an OpenAI-compatible HTTP API. The server is one binary (`ignis-server`): the
 API, a browser Playground and Prometheus metrics ship in it.
 
@@ -45,13 +45,14 @@ You can add models of your own with an
     PRO 6000 Blackwell (96 GB) loads every model. The 16 GB class (RTX 5060 Ti
     16 GB, 5070 Ti, 5080) loads the 16 GB entries (the 27B, its uncensored
     variant, Swift 1.5), on a profile derived rather than measured.
-  - *Ampere.* The RTX 3090 and the RTX 3090 Ti (8.6, 24 GB) are supported, on
-    the 16 GB entries (the 27B, its uncensored variant, Swift 1.5).
-  - *Ada.* The RTX 4090 (24 GB) and the 16 GB RTX 40 cards (RTX 4060 Ti 16 GB,
-    RTX 4080) are verified for correctness, on the same entries: the release's
-    [sm_86 gate](../contributing/releases.md#the-sm_86-gate) (the model's
-    quality, the kernel tests and a smoke test of the server) passed on an Ada
-    Lovelace card (sm_89)
+  - *Ampere, from 0.10.0.* The RTX 3090 and the RTX 3090 Ti (8.6, 24 GB) are
+    supported, on the 16 GB entries (the 27B, its uncensored variant, Swift
+    1.5).
+  - *Ada, from 0.10.0.* The RTX 4090 (24 GB) and the 16 GB RTX 40 cards (RTX
+    4060 Ti 16 GB, RTX 4080) are verified for correctness, on the same entries:
+    the release's [sm_86 gate](../contributing/releases.md#the-sm_86-gate) (the
+    model's quality, the kernel tests and a smoke test of the server) passed on
+    an Ada Lovelace card (sm_89)
     ([the finding](../../findings/2026-11-07-sm86-gate-passes-on-sm89.md)).
   - *Blackwell only.* The NVFP4 builds (the 27B, its uncensored variant,
     Swift 1.5), Flash-Next and the image model, which also need a card of
@@ -70,9 +71,11 @@ You can add models of your own with an
   generation it loads on, and the server refuses one above the card before it
   unloads or fetches anything:
   [Where each model loads](../reference/models.md#where-each-model-loads) is
-  the table, every built-in model on every card above. A release is built for
-  compute capabilities 8.6
-  and 12.0 (`86;120a`). Other cards, including the DGX Spark, are not
+  the table, every built-in model on every card above. From 0.10.0 a release
+  is built for compute capabilities 8.6
+  and 12.0 (`86;120a`); the 0.9 releases are built for 12.0 alone (`120a`),
+  so an RTX 30 or RTX 40 card needs 0.10.0 or a
+  [development build](install.md#development-builds). Other cards, including the DGX Spark, are not
   supported; [why not DGX Spark?](../guides/dgx-spark.md) gives the reasoning.
   A start on one is refused before anything loads, naming the card, its
   compute capability and the ones the build supports

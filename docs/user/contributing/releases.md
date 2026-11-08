@@ -175,7 +175,10 @@ The user guide follows the release. `.github/workflows/docs.yml` builds the
 site from the tag and publishes it once the release run has ended, and again
 whenever the release is edited. The guide's Changelog section is read from the
 release notes, so the notes written with `gh release edit` after publishing are
-what its page for the release shows (ADR 0066).
+what its page for the release shows (ADR 0066). The guide and the README mark
+what was merged ahead of the release with "from" and its version ("from
+0.10.0"): the version-bump commit removes the markings of the version it
+releases (`docs/agents/user-docs.md`).
 
 CI cannot run the GPU profile: no runner has an NVIDIA card. Correctness on
 the card stays on the development machine (`docs/agents/testing.md`).

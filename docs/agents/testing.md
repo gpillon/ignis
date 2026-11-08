@@ -65,9 +65,10 @@ until the test suite is green.
 
 ## The GPU test profile (ADR 0006, GitHub #38)
 
-ignis and ninfer (the reference engine, also the coding agent's own model
-runner) cannot share the RTX 5090 — a single engine's footprint already
-takes ~28 GB of the 32 GB card (ADR 0006). So every GPU-touching Rust test
+Two engines cannot share the RTX 5090 — a single engine's footprint already
+takes ~28 GB of the 32 GB card (ADR 0006), so one of them holds it at a
+time: an ignis server, a GPU test, or the engine that serves a local coding
+agent its model ([who holds the card](#who-holds-the-card)). So every GPU-touching Rust test
 is `#[ignore]`d and runs only when asked for explicitly: `cargo test` never
 touches the GPU on its own.
 
@@ -76,8 +77,8 @@ means by asking [`ignis_core::gpu_profile`] — never by returning early on
 its own:
 
 - **Outside the profile** (`IGNIS_GPU_PROFILE` unset): those conditions
-  print `SKIP: ...` and the test returns — a quick local check without
-  stopping ninfer.
+  print `SKIP: ...` and the test returns — a quick local check on a card
+  something else holds.
 - **Under the profile** (`IGNIS_GPU_PROFILE=1`): the *same* conditions are
   hard failures (`panic!`), never a skip. This is the only mode whose green
   result counts for a gate.
@@ -103,7 +104,7 @@ on record. `scripts/gpu-preflight.ps1` writes a marker file
 (`$env:TEMP\ignis-gpu-preflight.ok`) when it passes and clears it when it
 refuses; `active()` reads that marker and **panics** if the variable is set
 without a recent one. Setting the variable by hand therefore fails loudly
-instead of running un-preflighted while ninfer may hold the card.
+instead of running un-preflighted while another engine may hold the card.
 
 `crates/core` has no FFI and no GPU access of its own (GitHub #39 removed
 the flat C-ABI surface), so the GPU is inspected by the script and the
@@ -149,7 +150,8 @@ same order whatever the split, pinned by a unit test that compares schedules
 bit-for-bit and by `layer_reference_real` still matching the committed
 fixtures, which were recorded by the scalar path.
 
-**"Free" means one process on the card, not just "ninfer is stopped."** The
+**"Free" means one process on the card for the whole run, not just a free
+card at its start.** The
 preflight inspects the GPU once, before the run starts; nothing stops a
 second GPU-touching process from entering while the sweep is under way. One
 clean profile run peaks at **26.1 GiB of the 5090's 32.6 GiB** (measured
@@ -171,13 +173,34 @@ worktrees are separate, the card is not. `nvidia-smi` (or
 step; `make gpu-status` prints both, and `make gpu-guard` turns them into a
 pass/fail.
 
+### Who holds the card
+
+One run fits the card at a time, and the one that loses dies with no
+diagnostic, so `make gpu-status` and the preflight come before anything on
+the GPU. What holding the card means depends on where the agent's own model
+runs:
+
+- **A local agent.** Its model is served from this card, by ignis or another
+  engine, so the process holding the card is the agent itself. The agent
+  never launches GPU work and never stops that server: it hands the GPU step
+  to the user, who stops the engine that serves the agent, runs the step and
+  restarts the engine.
+- **A hosted agent** (its model runs elsewhere). Whatever holds the card
+  belongs to someone else: another session or worktree, a running ignis, the
+  user's own work. Wait or ask; never stop a process you did not start.
+
+An agent that does not know which case it is in asks the user.
+
 Runbook:
 
 ```powershell
 # 0. Check nobody else is already running GPU work -- another agent session
-#    in another worktree counts. nvidia-smi for held memory, tasklist for
-#    stray *_gpu-*.exe / ignis-server / ignis-bench / ninfer processes.
-# 1. Stop ninfer (frees the VRAM the GPU profile needs).
+#    in another worktree counts. make gpu-status: nvidia-smi for held memory,
+#    tasklist for stray *_gpu-*.exe / ignis-server / ignis-bench / ninfer
+#    processes.
+# 1. A local agent: the user stops the engine that serves the agent and runs
+#    steps 2-3. A hosted agent: nothing is stopped; the card is free, or you
+#    wait or ask.
 # 2. Preflight + profile in one step: refuses to proceed while the GPU is
 #    held (and names the offending process); on a free GPU, runs the leaf's
 #    op tests and the #[ignore]d Rust GPU tests under IGNIS_GPU_PROFILE=1,
@@ -186,7 +209,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gpu-profile.ps1
 # -ThresholdMiB <n>    forwarded to gpu-preflight.ps1
 # -SkipKernelBuild     Rust tests only, skip kernel/build.ps1 -Test
 # -SkipCargoTests      kernel leaf only, skip both cargo stages
-# 3. Restart ninfer.
+# 3. A local agent: the user restarts the engine that serves the agent.
 ```
 
 `make gpu-profile` runs the same script; `GPU_PROFILE_ARGS` forwards its

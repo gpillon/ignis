@@ -6,8 +6,10 @@
 # someone setting IGNIS_GPU_PROFILE=1 and running tests without ever running
 # it. This script is the fix: it *is* the harness entry point -- it runs the
 # preflight, and only sets IGNIS_GPU_PROFILE=1 and runs the GPU-gated work if
-# the preflight passes. Follow the runbook (docs/agents/testing.md) and this
-# is the only command after "stop ninfer" and before "restart ninfer".
+# the preflight passes. It stops nothing itself: run it on a card nothing else
+# holds. Follow the runbook (docs/agents/testing.md): for a local agent this
+# is the only command between stopping the engine that serves the agent and
+# restarting it.
 #
 # crates/core has no FFI and no GPU access (GitHub #39 removed the flat-C-ABI
 # surface), so the GPU itself can only be inspected from here. The guard is
@@ -175,7 +177,7 @@ try {
         }
     }
 
-    Write-Host "GPU profile: done. Restart ninfer (runbook step 4, docs/agents/testing.md)."
+    Write-Host "GPU profile: done. If you stopped the engine that serves your agent, restart it now (runbook step 3, docs/agents/testing.md)."
     exit 0
 } finally {
     # In `finally`, so a run that failed a stage still reports where its time

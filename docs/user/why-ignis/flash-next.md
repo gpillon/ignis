@@ -48,8 +48,8 @@ Where each piece sits, and why: [Models and artifacts](../concepts/models-and-ar
 
 | Figure | Measured on | Source |
 |---|---|---|
-| **101.5 tok/s**, 9.85 ms a token, one lane | RTX 5090, PCIe Gen 3 host, after decode fusion | [Flash-Next decode fusion](../../findings/2026-10-08-flash-next-decode-fusion.md) |
-| 99 tok/s at `--decode-lanes 1`; the 3-lane default costs a lone user about 10 tok/s (99 against 89 in the one measured pair) | RTX 5090 | [Flash-Next on the 5090](../../findings/2026-10-06-flash-next-on-the-5090.md) |
+| **101.5 tok/s**, 9.85 ms a token, one lane | RTX 5090, PCIe Gen 3 host, the 3-lane default, one lane decoding; the decode fusion then took a one-lane token on harder prompts from 10.49 to 9.83 ms | [Flash-Next decode fusion](../../findings/2026-10-08-flash-next-decode-fusion.md) |
+| 101.7-102.1 tok/s with one lane decoding at the 3-lane default, 109.7 tok/s across three; the shared KV pool gives the expert cache 1.03 GiB more than a pool of three full contexts (+4.1% and +10.1%) | RTX 5090, 262,144 tokens a lane, greedy prose, 2026-10-08 | [KV pool follows residency](../../findings/2026-10-08-flash-next-kv-pool-follows-residency.md) |
 | 2.5 bits a weight on average (K of 2, 2.5, 3 or 4); 37.7 GB of experts pinned | calibration-derived allocation | [ADR 0044](../../adr/0044-experts-in-trellis-with-a-k-per-expert.md) |
 | MTP on the 5090: 1.02-1.30x on one lane, 7-15% slower at two and three lanes at the default row budget | RTX 5090 | [MTP is PCIe-bound](../../findings/2026-10-07-flash-next-mtp-speculation-is-pcie-bound.md) |
 | **258.2 tok/s** one lane of code, **427.5 tok/s** across eight lanes of code (MTP, 3 drafts), 512 tokens | RTX PRO 6000 Server Edition | [RTX PRO 6000 profile](../../findings/2026-10-18-rtxpro6000-profile-measured.md) |
