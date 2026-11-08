@@ -786,9 +786,12 @@ original engine). The `.ninfer` model artifact is still NInfer's format.
 
 The vendored kernels are a starting point, not a destination: one at a time,
 where measurement shows one is the bottleneck, it is rewritten. The latest is
-the 27B's prefill attention, which no longer expands the compressed KV history
-into BF16 planes before attending: up to 1.02 GB of device memory freed and
-cold prefill up to 53% faster. The kernels added for Flash-Next and the image
+the 27B's gated delta net prefill, which now runs on ignis's own kernels on
+every card, the RTX 5090 included, where it is 2.4-2.6x faster with the KLD
+unmoved ([the finding](docs/findings/2026-11-08-blackwell-gdn-prefill-on-ignis-kernels.md)).
+An earlier one is the 27B's prefill attention, which no longer expands the
+compressed KV history into BF16 planes before attending: up to 1.02 GB of
+device memory freed and cold prefill up to 53% faster. The kernels added for Flash-Next and the image
 model, which have no NInfer reference, are our own, or adapted or vendored from
 a named, permissively licensed source recorded in `kernel/NOTICE`.
 
