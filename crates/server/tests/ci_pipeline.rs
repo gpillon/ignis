@@ -185,6 +185,46 @@ fn the_test_job_runs_every_shard_of_the_count_it_gives_the_script() {
     }
 }
 
+/// The Windows build's kernel/build cache (#552): ninja decides by date and
+/// the checkout dates every source later than the cached objects, so the
+/// cache only helped once the sources are dated back, and that is safe only
+/// where they are the very bytes the objects were built from: an exact hit,
+/// on exactly the files its key hashes, with no partial restore.
+#[test]
+fn the_windows_leaf_cache_dates_back_only_what_an_exact_hit_proves_unchanged() {
+    let workflow = workflow();
+    let jobs = jobs(&workflow);
+    let windows = steps(job(jobs, "windows"));
+    let position = |name: &str| {
+        windows.iter().position(|step| text(step, "name") == Some(name)).unwrap_or_else(|| panic!("the windows job has a `{name}` step"))
+    };
+    let cache = windows[position("Cache the kernel leaf build")];
+    assert_eq!(text(cache, "id"), Some("kernel-cache"));
+    let with = get(cache, "with").and_then(Value::as_mapping).expect("the cache step has inputs");
+    assert_eq!(text(with, "path"), Some("kernel/build"));
+    assert!(get(with, "restore-keys").is_none(), "a partial restore would date back sources the cached objects were not built from");
+    let key = text(with, "key").expect("the cache step has a key");
+    let hashed: Vec<&str> = key
+        .split("hashFiles(")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .expect("the key hashes the kernel sources")
+        .split(',')
+        .map(|path| path.trim().trim_matches('\'').trim_end_matches("/**"))
+        .collect();
+    assert!(hashed.contains(&"kernel/src") && hashed.contains(&"kernel/vendor/src"), "{hashed:?}");
+
+    let dating = windows[position("Date the kernel sources back to the cached build's")];
+    assert_eq!(get(dating, "if").map(condition).as_deref(), Some("steps.kernel-cache.outputs.cache-hit == 'true'"));
+    let run = text(dating, "run").expect("the dating step runs a command");
+    for path in &hashed {
+        assert!(run.contains(path), "the key hashes {path}, and the step does not date it back: {run}");
+    }
+    assert!(!run.contains("find kernel ") && !run.contains("find kernel\n"), "the step dates back more than the key hashes: {run}");
+    assert!(position("Cache the kernel leaf build") < position("Date the kernel sources back to the cached build's"));
+    assert!(position("Date the kernel sources back to the cached build's") < position("Build"), "the sources are dated back before the build");
+}
+
 /// The build stage of the Containerfile, up to the next stage.
 fn build_stage(containerfile: &str) -> &str {
     containerfile.split(" AS build\n").nth(1).and_then(|rest| rest.split("\nFROM ").next()).expect("a build stage")

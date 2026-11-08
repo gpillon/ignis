@@ -555,18 +555,40 @@ jobs:
           fi
           "$cuda/bin/nvcc.exe" --version | tail -2
 
-      # kernel/build.ps1 is cmake + ninja + nvcc and takes the better part of
-      # an hour on a 4-core runner. It rebuilds only what changed, so the
-      # build directory is cached on the kernel sources themselves, and on the
-      # architectures: a directory built for another list compiles every
-      # object again, and restored under an exact key it would never be saved.
+      # kernel/build.ps1 is cmake + ninja + nvcc: 274 commands and ~12.5
+      # minutes on this runner for the `86;120a` archives. The build directory
+      # is cached under the kernel sources' own hash, and on the architectures
+      # and the toolkit, so a push that changes none of them finds it.
+      #
+      # ninja decides by date, and the checkout dates every source at the
+      # moment it ran, later than the cached objects: restored as is, the
+      # directory was compiled again in full on every push (measured on the
+      # runner, #552: "output ... older than most recent input" for all 274).
+      # On an exact hit the sources are byte for byte the ones the cached
+      # objects were built from, so the step after this one dates them back
+      # and ninja finds the leaf current. There is no partial restore
+      # (restore-keys): there, sources dated back would hide the changed ones
+      # and link the old objects, the staleness crates/artifact/build.rs exists
+      # to prevent (GitHub #94). A kernel change compiles the leaf from
+      # nothing, as every push did before.
       - name: Cache the kernel leaf build
+        id: kernel-cache
         uses: actions/cache@v4
         with:
           path: kernel/build
           key: kernel-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-${{ env.IGNIS_CUDA_ARCHITECTURES }}-${{ hashFiles('kernel/CMakeLists.txt', 'kernel/build.ps1', 'kernel/src/**', 'kernel/include/**', 'kernel/tests/**', 'kernel/vendor/src/**', 'kernel/vendor/include/**') }}
-          restore-keys: |
-            kernel-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-${{ env.IGNIS_CUDA_ARCHITECTURES }}-
+
+      # Exactly the files the key hashes: anything else keeps the checkout's
+      # date, so a file that should have been in the key costs a rebuild,
+      # never a stale object.
+      - name: Date the kernel sources back to the cached build's
+        if: steps.kernel-cache.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          touch -d '2000-01-01' kernel/CMakeLists.txt kernel/build.ps1
+          find kernel/src kernel/include kernel/tests kernel/vendor/src kernel/vendor/include \
+            -type f -exec touch -d '2000-01-01' {} +
 
       # `--features cuda`, never `ignis-server/cuda`: the Containerfile's
       # build stage says why (GitHub #408).
