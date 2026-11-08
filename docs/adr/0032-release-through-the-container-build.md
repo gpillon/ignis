@@ -1,5 +1,6 @@
 ---
 status: accepted
+amended-by: [ADR-0086]
 ---
 
 # ADR 0032 — the Linux release is the container build, and it is one pipeline

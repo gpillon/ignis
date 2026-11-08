@@ -10,13 +10,13 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use common::{MockEngine, ADAPTED, DECODE_LANES, MAX_MODEL_LEN};
+use common::{MockEngine, MockState, ADAPTED, DECODE_LANES, MAX_MODEL_LEN};
 use ignis_bench::small_card::{self, MetricsAt, Options};
 use serde_json::{json, Value};
 
@@ -60,9 +60,12 @@ async fn origins() -> Json<Value> {
     ]}))
 }
 
-/// Each scrape moves the speculative counters on by 10 rounds.
-async fn metrics(State(calls): State<Arc<AtomicU64>>) -> String {
-    let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
+/// The speculative counters stand at 10 rounds, 80 drafted and 60 accepted
+/// tokens for each completion request the engine has received (recorded on
+/// arrival, so a request the bench has finished is always counted): a decode
+/// set's change counts its own requests.
+async fn metrics(State(engine): State<Arc<OnceLock<MockState>>>) -> String {
+    let n = engine.get().map_or(0, |state| state.bodies().len());
     format!(
         "ignis_build_info{{version=\"0.7.3-test\"}} 1\n\
          ignis_vram_reserved_bytes{{line=\"weights\"}} 12000000000\n\
@@ -79,17 +82,19 @@ async fn metrics(State(calls): State<Arc<AtomicU64>>) -> String {
     )
 }
 
-/// The server's routes beside the engine's, and the cell the config's
-/// metrics port is set in once the mock listens.
-fn server_routes() -> (Router, Arc<AtomicU16>) {
+/// The server's routes beside the engine's, the cell the config's metrics
+/// port is set in once the mock listens, and the one the engine's state is
+/// set in for the metrics to count its requests.
+fn server_routes() -> (Router, Arc<AtomicU16>, Arc<OnceLock<MockState>>) {
     let port = Arc::new(AtomicU16::new(0));
+    let engine = Arc::new(OnceLock::new());
     let routes = Router::new()
         .route("/v1/tokenize", post(tokenize))
         .route("/v1/models/catalog", get(catalog))
         .route("/v1/config", get(config).with_state(Arc::clone(&port)))
         .route("/v1/config/origins", get(origins))
-        .route("/metrics", get(metrics).with_state(Arc::new(AtomicU64::new(0))));
-    (routes, port)
+        .route("/metrics", get(metrics).with_state(Arc::clone(&engine)));
+    (routes, port, engine)
 }
 
 const SMI: &str = "NVIDIA GeForce RTX 5070 Ti, 16303 MiB, 4, 16, 5, 16\n";
@@ -100,9 +105,10 @@ fn opts(url: &str, metrics: MetricsAt) -> Options {
 
 #[test]
 fn the_record_is_assembled_from_what_the_server_exposes() {
-    let (routes, port) = server_routes();
+    let (routes, port, state) = server_routes();
     let engine = MockEngine::start_with(routes);
     port.store(engine.url().rsplit(':').next().unwrap().parse().unwrap(), Ordering::Relaxed);
+    state.set(engine.state.clone()).unwrap();
     // userinfo in the endpoint rides to the server and never into the record;
     // the metrics listener is found where the server's config says
     let url = engine.url().replace("http://", "http://user:secret@");
@@ -145,19 +151,51 @@ fn the_record_is_assembled_from_what_the_server_exposes() {
     let notes: Vec<&str> = json["notes"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
     assert!(notes.iter().all(|n| !n.starts_with("adaptation") && !n.starts_with("family")), "{notes:?}");
 
-    // decode: the four coding prompts and the three agent turns, all timed
-    for (set, n) in [("coding", 4), ("agent", 3)] {
+    // decode: the four coding prompts, the three agent turns and the four
+    // long replies, all timed, in that order in the record
+    let record = small_card::to_json(&report).unwrap();
+    let at: Vec<usize> = ["\"coding\": {", "\"agent\": {", "\"long\": {"]
+        .iter()
+        .map(|key| record.find(key).unwrap_or_else(|| panic!("no {key} in the record")))
+        .collect();
+    assert!(at.windows(2).all(|w| w[0] < w[1]), "decode's cells out of order: {at:?}");
+    for (set, n) in [("coding", 4), ("agent", 3), ("long", 4)] {
         let samples = json["decode"][set]["samples"].as_array().unwrap();
         assert_eq!(samples.len(), n, "{set}");
         assert!(samples.iter().all(|s| s["tokens_per_s"].as_f64().is_some_and(|r| r > 0.0)), "{set}: {samples:?}");
         assert!(json["decode"][set]["median_tokens_per_s"].as_f64().unwrap() > 0.0, "{set}");
+        assert!(json["decode"][set]["pooled_tokens_per_s"].as_f64().unwrap() > 0.0, "{set}");
         assert_eq!(json["decode"][set]["errors"], json!([]), "{set}");
     }
-    // the speculative counters moved by one scrape's worth between the two
-    // reads around the decode phase
-    assert_eq!(json["decode"]["speculative"]["rounds"], 10);
-    assert_eq!(json["decode"]["speculative"]["accepted_tokens"], 60);
-    assert_eq!(json["decode"]["speculative"]["acceptance"], 0.75);
+    // each set carries the change across its own requests (the mock's
+    // counters count requests): coding 4, agent 3, long 4; the total, across
+    // the three sets, is their sum, the warmup's request before them left out
+    for (set, requests) in [("coding", 4), ("agent", 3), ("long", 4)] {
+        let spec = &json["decode"][set]["speculative"];
+        let want = (json!(10 * requests), json!(80 * requests), json!(60 * requests));
+        assert_eq!((&spec["rounds"], &spec["drafted_tokens"], &spec["accepted_tokens"]), (&want.0, &want.1, &want.2), "{set}");
+        assert_eq!(spec["acceptance"], 0.75, "{set}");
+    }
+    // the mock stops every reply at 32 tokens: each long reply ends under 256,
+    // stays in its cell and leaves a note naming its prompt; the coding and
+    // agent prompts, shorter by design, leave none
+    let short: Vec<&str> = notes.iter().copied().filter(|n| n.starts_with("decode long:")).collect();
+    assert_eq!(short.len(), 4, "{notes:?}");
+    for (sample, note) in json["decode"]["long"]["samples"].as_array().unwrap().iter().zip(&short) {
+        assert_eq!(sample["completion_tokens"], 32, "{sample}");
+        let prompt = sample["prompt"].as_str().unwrap();
+        assert!(note.contains(prompt) && note.contains("32 tokens") && note.contains("under 256"), "{note}");
+    }
+    for set in ["coding", "agent"] {
+        for sample in json["decode"][set]["samples"].as_array().unwrap() {
+            let prompt = sample["prompt"].as_str().unwrap();
+            assert!(notes.iter().all(|n| !n.contains(prompt)), "{prompt} is not a long reply: {notes:?}");
+        }
+    }
+    let total = &json["decode"]["speculative"];
+    assert_eq!((&total["rounds"], &total["drafted_tokens"], &total["accepted_tokens"]), (&json!(110), &json!(880), &json!(660)));
+    assert_eq!(total["acceptance"], 0.75);
+    assert_eq!(total["accepted_per_round"], 6.0);
 
     // ttft: the small cell is measured cold, the large one does not fit and
     // says which cell would
@@ -172,17 +210,37 @@ fn the_record_is_assembled_from_what_the_server_exposes() {
     let why = cells[1]["error"].as_str().unwrap();
     assert!(why.contains("does not fit") && why.contains("--cells 19992"), "{why}");
 
-    // the agent turns went out as recorded bodies: tools and history intact
+    // the decode requests in the order sent: the warmup, the coding prompts,
+    // the agent turns, then the long replies, with the TTFT cells after them
     let bodies = engine.state.bodies();
-    let agent: Vec<&Value> = bodies.iter().filter(|b| b.get("tools").is_some()).collect();
-    assert_eq!(agent.len(), 3, "three agent turns sent with their tools");
+    let canaries: Vec<&str> = ignis_bench::canary::CANARIES.iter().map(|c| c.prompt).collect();
+    let (agent_at, long_at) = (1 + canaries.len(), 1 + canaries.len() + 3);
+    let (warmup, coding, agent, long) = (&bodies[0], &bodies[1..agent_at], &bodies[agent_at..long_at], &bodies[long_at..long_at + 4]);
+    assert_eq!((&warmup["max_tokens"], &warmup["enable_thinking"]), (&json!(16), &json!(false)));
+    // the coding prompts: the canaries, the --decode-tokens cap, thinking
+    // off, streaming
+    let sent: Vec<&str> = coding.iter().map(|b| b["messages"][0]["content"].as_str().unwrap()).collect();
+    assert_eq!(sent, canaries);
+    assert!(coding.iter().all(|b| b["max_tokens"] == 16 && b["stream"] == true && b["enable_thinking"] == false));
+    // the agent turns went out as recorded bodies: tools and history intact
+    assert!(agent.iter().all(|b| b.get("tools").is_some()), "three agent turns sent with their tools");
     assert!(agent.iter().all(|b| b["messages"].as_array().unwrap().iter().any(|m| m["role"] == "tool")));
     assert!(agent.iter().all(|b| b["max_tokens"] == 16 && b["stream"] == true));
     // the agent turns think, so their reasoning streams (a tool call comes
     // whole); every other request has thinking off
     assert!(agent.iter().all(|b| b["enable_thinking"] == true), "{agent:?}");
+    // the long replies: one user message each, the preset's own cap whatever
+    // --decode-tokens says, thinking off, streaming, and nothing that makes
+    // the server generate past the reply's end
+    for b in long {
+        assert_eq!(b["messages"].as_array().unwrap().len(), 1, "{b}");
+        assert_eq!(b["messages"][0]["role"], "user", "{b}");
+        assert_eq!((&b["max_tokens"], &b["stream"], &b["enable_thinking"]), (&json!(1024), &json!(true), &json!(false)), "{b}");
+        assert!(b.get("ignore_eos").is_none() && b.get("tools").is_none(), "{b}");
+    }
     let others: Vec<&Value> = bodies.iter().filter(|b| b.get("tools").is_none()).collect();
     assert!(others.iter().all(|b| b["enable_thinking"] == false), "{others:?}");
+    assert!(bodies.iter().all(|b| b.get("ignore_eos").is_none()), "no request asks for ignore_eos");
 
     // nothing private reaches the record
     let text = serde_json::to_string(&json).unwrap();
@@ -206,6 +264,10 @@ fn a_missing_piece_is_null_with_a_note_and_the_rest_is_still_measured() {
     assert_eq!(json["plan"]["budget_bytes"], Value::Null);
     assert_eq!(json["plan"]["reserved_bytes_by_line"], Value::Null);
     assert_eq!(json["decode"]["speculative"], Value::Null);
+    for set in ["coding", "agent", "long"] {
+        let cell = json["decode"][set].as_object().unwrap();
+        assert_eq!(cell.get("speculative"), Some(&Value::Null), "{set}: the key is there, null");
+    }
     assert_eq!(json["adaptation"]["configured_max_context"], Value::Null);
     // /v1/models still says what the load runs at
     assert_eq!(json["adaptation"]["running_decode_lanes"], DECODE_LANES);

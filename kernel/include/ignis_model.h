@@ -282,9 +282,10 @@ enum ignis_prefill_linear {
  * measurement switch IGNIS_GDN_PREFILL (`ours` or `vendored`) does
  * (kernel/src/gdn_prefill.h). `ignis_model_gdn_prefill` reports it. */
 enum ignis_gdn_prefill {
-  /* The vendored chunked kernels: what an RTX 50 or RTX PRO card runs. */
+  /* The vendored chunked kernels: what IGNIS_GDN_PREFILL=vendored names. */
   IGNIS_GDN_PREFILL_VENDORED = 0,
-  /* ignis's own kernels in full-rate forms: what an 8.x card runs. */
+  /* ignis's own kernels in full-rate forms: what an 8.x and a Blackwell
+   * card run unless the switch names the other. */
   IGNIS_GDN_PREFILL_OURS = 1,
 };
 

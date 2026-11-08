@@ -206,18 +206,19 @@ non-negotiable floor; above it, performance is the #1 objective and
 tie-breaker for every scope, feature, and kernel decision.
 
 **North-star**:
-The holistic objective: "the best local coding engine" — max performance
-**and** agent parallelism that saturates the GPU in prefill *and* decode.
+The holistic objective: the best local engine for coding, for agentic work (an
+agent and its subagents saturating the GPU in prefill *and* decode) and as a
+companion that listens, reads and draws (ADR 0083).
 
 **Self-bootstrapping**:
-The dev/test loop where the very runner used to build ignis (ninfer, running
-Qwen 3.8-27B) is running while we test; two engines share the 5090, so GPU
-testing is exclusive (ADR 0006).
+The dev/test loop, until 2026-11-08, in which the runner used to build ignis
+(ninfer, running Qwen 3.8-27B) shared the 5090 with the ignis under test; it
+ended when ninfer left the development machine (ADR 0084).
 
 **Reference**:
-The ninfer stack: the source of the artifact, the vendored ops, the oracle
-recordings and the speed numbers. A reference, not a target to match
-token-for-token (ADR 0005 / 0007).
+The ninfer stack: the source of the artifact, the vendored ops and the oracle
+recordings, and until ADR 0082 the speed numbers the gates were measured
+against. A reference, not a target to match token-for-token (ADR 0005 / 0007).
 
 ### Model
 
@@ -543,9 +544,11 @@ MMA with an INT8 activation. The default route of the 8.x cards (GitHub #515).
 **GDN prefill**:
 A GDN layer's pass over a prefill span of 64 tokens or more: the chunked
 delta rule, which carries the sequence's GDN slot from the span's first token
-to its last. It has two routes, ignis's own (ADR 0080, the 8.x cards' route)
-and the vendored chunked kernels (sm_120's). A shorter span, a decode round
-or a verify round runs the vendored recurrent kernel on either.
+to its last. The 27B's has two routes: ignis's own (ADR 0080), every card's
+route since ADR 0085, and the vendored chunked kernels, which run only when the measurement
+switch names them and stay the oracle of ignis's; Flash-Next's GDN layers
+keep their own vendored kernels whatever the switch says. A shorter span, a
+decode round or a verify round runs the vendored recurrent kernel on either.
 _Avoid_: GDN chunked kernel (one route's name, not the pass)
 
 **Band**:
@@ -957,8 +960,8 @@ traversal per request.
 
 **Packed prefill**:
 Several requests' prefill tokens in *one* traversal of the model (varlen
-attention, per-sequence GDN state side by side). Not built; its phase is
-decided after the per-chunk synchronization investigation reports.
+attention, per-sequence GDN state side by side). Not built: the per-chunk
+synchronization it was to remove measured 0.5% of prefill time (#92).
 _Avoid_: prefill batch (for this: naming a group of requests does not make it
 one forward pass).
 
@@ -976,8 +979,8 @@ prefill, not the gap a single chunk leaves: only the chunk width moves that.
 **True prefill/decode overlap**:
 Prefill and decode resident on the GPU at the same time, on separate streams,
 contending for SMs. Distinct from **prefill/decode interleaving** and
-deliberately not built: the north-star item (roadmap phase 6), excluded from G3
-by ADR 0018.
+deliberately not built: the old roadmap's phase 6, excluded from G3 by ADR
+0018 and parked as #545.
 
 **Chunk boundary**:
 The position between two prefill chunks: the sequence's KV pages, GDN
@@ -1631,7 +1634,10 @@ _Avoid_: context note
 **Gate**:
 A milestone acceptance measured **on the GPU**, never on CPU tests. G1
 correctness floor, G2 prefill, G3 decode + serving loop, G4 the reference
-feature floor, G5 speculative decoding (`docs/ROADMAP.md`).
+feature floor, G5 speculative decoding (`docs/archive/ROADMAP.md`). The
+phases ended with G5 (2026-09-14); an artifact or a route is now admitted by
+ADR 0082's gate: the KLD against BF16, DFlash2 on against off and the loop
+rate.
 
 **GPU profile**:
 The explicit test profile for GPU work: it requires the 5090 free and
@@ -1652,7 +1658,8 @@ mid-thought produced sane tokens, not empty output.
 **Canary oracle**:
 The recorded fixture the canary suite is checked against: the reference
 engine's greedy (exact-argmax) completions on those prompts for the same
-artifact, tokenized with the artifact's tokenizer.
+artifact, tokenized with the artifact's tokenizer. It admits no artifact
+since ADR 0082: the KLD against BF16 does.
 
 **Teacher-forced agreement**:
 How the canary oracle is scored, and the G1 correctness floor: at each of the
@@ -1698,7 +1705,8 @@ the engine ended — its own EOS, the safety cap — ends at its last token.
 How G2 is judged: ignis and the reference measured on the same TTFT cells in
 the same session on the same machine, and the ratio ignis/reference must be
 ≤ 1.5. A committed reference record exists for regression and sanity only; it
-never decides the gate.
+never decides the gate. Historical: ADR 0082 superseded the gates against the
+reference.
 
 **Measurement session**:
 The identifier both engines' TTFT records carry when they were measured back
@@ -1723,7 +1731,8 @@ The acceptance criterion at G4: ≥ 99% of the reference's performance
 correctness is self-checked (sane output, same model, greedy, fixed seed). It
 is the first of a ladder of performance gates: G5 asks ≥ 99% of the
 reference's committed tok/s under DFlash2, and the phase beyond the reference
-gates each item on its own (`docs/ROADMAP.md`).
+gates each item on its own (`docs/archive/ROADMAP.md`). Historical: ADR 0082
+superseded the gates against the reference.
 
 **Trace replay**:
 Re-sending a recorded "1 main agent + N subagents" load trace against both

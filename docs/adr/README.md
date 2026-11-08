@@ -50,7 +50,7 @@ memory of why ignis is built the way it is.
 | [0029](0029-cross-request-state-reuse.md) | cross-request state reuse: content-matched retained state across three residency tiers | accepted | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) |
 | [0030](0030-device-memory-reserved-at-load.md) | device memory reserved at load, within a VRAM budget | accepted | [0035](0035-the-vision-embedding-outlives-its-encode.md), [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) |
 | [0031](0031-vendored-kernel-bottleneck-exemption.md) | a vendored kernel that is measured as the bottleneck is not untouchable | accepted | |
-| [0032](0032-release-through-the-container-build.md) | the Linux release is the container build, and it is one pipeline | accepted | |
+| [0032](0032-release-through-the-container-build.md) | the Linux release is the container build, and it is one pipeline | accepted | [0086](0086-the-builds-run-beside-the-tests-and-nothing-is-published-before-they-pass.md) |
 | [0033](0033-the-server-fetches-its-own-model.md) | the server fetches its own model, and asks first only when somebody is there | accepted | [0047](0047-a-catalog-the-operator-can-extend.md) |
 | [0034](0034-the-leaf-answers-without-generating.md) | the leaf answers without generating | accepted | |
 | [0035](0035-the-vision-embedding-outlives-its-encode.md) | the vision embedding outlives its encode | accepted | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md) |
@@ -98,8 +98,10 @@ memory of why ignis is built the way it is.
 | [0077](0077-a-vendored-file-may-carry-a-portability-patch.md) | A vendored file may carry a portability patch | accepted | [0080](0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md) |
 | [0078](0078-the-built-in-catalog-names-each-entrys-license-and-may-ship-restricted-weights.md) | The built-in catalog names each entry's license and may ship weights whose license restricts commercial use | accepted | |
 | [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md) | A catalog entry states the oldest GPU generation it loads on | accepted | |
-| [0080](0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md) | On sm_8x the trellis prefill decodes each matrix once per chunk and multiplies on the integer MMA | accepted | |
+| [0080](0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md) | On sm_8x the trellis prefill decodes each matrix once per chunk and multiplies on the integer MMA | accepted | [0085](0085-on-blackwell-too-the-27bs-gdn-prefill-runs-ignis-own-kernels.md) |
 | [0081](0081-an-adrs-status-is-in-its-frontmatter-and-a-changed-decision-is-a-new-adr.md) | An ADR's status is in its frontmatter, and a decision that changes is recorded by a new ADR | accepted | |
 | [0082](0082-the-gate-is-kld-against-bf16-dflash2-on-against-off-and-the-loop-rate.md) | The gate is KLD against BF16, DFlash2 on against off and the loop rate | accepted | |
 | [0083](0083-the-north-star-is-the-best-local-engine-for-coding-agentic-work-and-as-a-companion.md) | The north-star is the best local engine for coding, for agentic work and as a companion | accepted | |
 | [0084](0084-ignis-stands-on-its-own.md) | ignis stands on its own | accepted | |
+| [0085](0085-on-blackwell-too-the-27bs-gdn-prefill-runs-ignis-own-kernels.md) | On Blackwell too, the 27B's GDN prefill runs ignis's own kernels | accepted | |
+| [0086](0086-the-builds-run-beside-the-tests-and-nothing-is-published-before-they-pass.md) | The builds run beside the tests, and nothing is published before they pass | accepted | |

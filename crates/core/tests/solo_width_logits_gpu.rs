@@ -1,8 +1,9 @@
 //! GitHub #489 (ADR 0018 as amended): a load whose prefill scratch is
 //! reserved for the solo width runs the prefill chunk on the same kernels as
 //! one reserved for the chunk alone. The 27B's 16 GB trellis artifact on the
-//! routes an RTX 30 or RTX 40 card runs (the dense prefill, the integer band
-//! and our GDN prefill, named so the RTX 5090 runs them), where `auto`
+//! routes an RTX 30 or RTX 40 card runs (the dense prefill and the integer
+//! band, named so the RTX 5090 runs them, and our GDN prefill, every card's
+//! since GitHub #536), where `auto`
 //! reserves a solo width: the same prompt, cut at the same 2,048-token jobs,
 //! gives bit-identical last-position logits and the same greedy tokens at a
 //! 2,048-token and at an 8,192-token reservation.
@@ -79,26 +80,6 @@ fn prefill_at_the_chunk(model: &Model, pool: &SeqPool, span: &[i32], vocab: usiz
     Ok((logits, decoded))
 }
 
-/// The GDN prefill's measurement switch set to `ours`, the route an 8.x card
-/// runs, for this binary's one test (the leaf reads it at each load).
-struct OurGdnPrefill;
-
-impl OurGdnPrefill {
-    fn set() -> Self {
-        // SAFETY: this binary's one test sets it before any load and nothing
-        // else reads or writes the environment meanwhile.
-        unsafe { std::env::set_var("IGNIS_GDN_PREFILL", "ours") };
-        OurGdnPrefill
-    }
-}
-
-impl Drop for OurGdnPrefill {
-    fn drop(&mut self) {
-        // SAFETY: as in `set`.
-        unsafe { std::env::remove_var("IGNIS_GDN_PREFILL") };
-    }
-}
-
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn the_prefill_chunk_runs_bit_identically_under_a_solo_width_reservation() {
@@ -106,7 +87,6 @@ fn the_prefill_chunk_runs_bit_identically_under_a_solo_width_reservation() {
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {TRELLIS}")) {
         return;
     }
-    let _switch = OurGdnPrefill::set();
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
     let (plan, handles) = bind_text_scope_27b(&reader).unwrap_or_else(|e| panic!("bind: {e}"));

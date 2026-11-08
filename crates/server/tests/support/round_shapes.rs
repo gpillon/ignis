@@ -1,0 +1,189 @@
+//! A split between a decode round's pick and a verify round's pick, judged by
+//! the two **round shapes** (GitHub #534, spec #531, glossary Near-tie and
+//! Round shape). Included by path from the multimodal speculative acceptance
+//! (`vision_dflash2_gpu.rs`) and from the CPU test of these rules
+//! (`round_shape_near_tie.rs`). No GPU types: the GPU test computes the two
+//! shapes' logits through the prefill, this module says what they mean, which
+//! round's snapshot the verify shape starts from and which of its rows it
+//! reads.
+//!
+//! A decode round is one column wide and a verify round `k + 1`, and the wider
+//! shape takes other activation routes (ADR 0016), so the two can rank two
+//! near-equal tokens differently. A split is therefore judged by the position
+//! computed outside the rounds in each shape ([`judge`]): numerics when the
+//! two shapes disagree about the winner, when the verify shape ranks the
+//! verify's pick at least as high, or when either shape is within one BF16
+//! ulp of a tie at its larger logit's magnitude; a fault of the verify round
+//! only when the verify shape sides with the decode round by more than that.
+//! The tolerance is the logits' own rounding, never a tuned constant.
+//!
+//! The text near-tie rule of the core speculative tests
+//! (`crates/core/tests/support/near_tie.rs`) is a different rule, unchanged.
+
+// Each including test reads the rules it needs.
+#![allow(dead_code)]
+
+use std::fmt;
+use std::ops::Range;
+
+// A BF16 logit's value and one BF16 ulp, as the core tests' logit drift reads
+// them: one copy of the rule.
+#[path = "../../../core/tests/support/logit_drift.rs"]
+mod logit_drift;
+
+pub use logit_drift::{bf16, bf16_ulp};
+
+/// The two tokens a split sets against each other: the decode round's pick
+/// and the verify round's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Picks {
+    pub decode: i32,
+    pub verify: i32,
+}
+
+impl Picks {
+    /// The shape a row of logits gives the two picks.
+    pub fn shape(self, logits: &[f32]) -> Shape {
+        Shape { decode_pick: logits[self.decode as usize], verify_pick: logits[self.verify as usize] }
+    }
+
+    /// The same from a row of BF16 bits, as a span's logits come back.
+    pub fn shape_bf16(self, row: &[u16]) -> Shape {
+        Shape { decode_pick: bf16(row[self.decode as usize]), verify_pick: bf16(row[self.verify as usize]) }
+    }
+}
+
+/// One shape's logits at the split: the decode round's pick and the verify
+/// round's pick, as the probe read them (BF16 values).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shape {
+    pub decode_pick: f32,
+    pub verify_pick: f32,
+}
+
+impl Shape {
+    /// How far the shape ranks the decode round's pick above the verify
+    /// round's: positive sides with the decode round.
+    pub fn gap(self) -> f32 {
+        self.decode_pick - self.verify_pick
+    }
+
+    /// One BF16 ulp at the larger of the two logits' magnitudes.
+    pub fn ulp(self) -> f32 {
+        bf16_ulp(self.decode_pick.abs().max(self.verify_pick.abs()))
+    }
+}
+
+/// Which of the numerics clauses held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Numerics {
+    /// One shape ranks the decode round's pick higher and the other the
+    /// verify round's. A shape at an exact tie names no winner; it is within
+    /// an ulp.
+    pub shapes_disagree: bool,
+    /// The verify shape ranks the verify round's pick at least as high.
+    pub verify_shape_sides_with_verify: bool,
+    /// Either shape's gap is within one ulp at its larger logit.
+    pub within_ulp: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Numerics(Numerics),
+    /// The verify shape sides with the decode round beyond one ulp, and so
+    /// does the decode shape: the verify round computed the position wrong.
+    VerifyFault,
+}
+
+impl fmt::Display for Verdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Verdict::Numerics(held) => {
+                let clauses = [
+                    (held.shapes_disagree, "the shapes disagree about the winner"),
+                    (held.verify_shape_sides_with_verify, "the verify shape ranks the verify's pick at least as high"),
+                    (held.within_ulp, "a shape is within one ulp of a tie"),
+                ];
+                let held: Vec<&str> = clauses.iter().filter(|(held, _)| *held).map(|(_, clause)| *clause).collect();
+                write!(f, "numerics: {}", held.join("; "))
+            }
+            Verdict::VerifyFault => {
+                write!(f, "a verify-round fault: the verify shape sides with the decode round beyond one ulp")
+            }
+        }
+    }
+}
+
+/// The split judged by its two shapes: `decode`, the position reached one
+/// token at a time, and `verify`, the position inside a span as wide as the
+/// verify round. Panics on a logit that is not finite, which no numerics
+/// explain.
+pub fn judge(decode: Shape, verify: Shape) -> Verdict {
+    for logit in [decode.decode_pick, decode.verify_pick, verify.decode_pick, verify.verify_pick] {
+        assert!(logit.is_finite(), "a probe read a logit of {logit}: decode shape {decode:?}, verify shape {verify:?}");
+    }
+    let (d, v) = (decode.gap(), verify.gap());
+    let held = Numerics {
+        shapes_disagree: (d > 0.0 && v < 0.0) || (d < 0.0 && v > 0.0),
+        verify_shape_sides_with_verify: v <= 0.0,
+        within_ulp: d.abs() <= decode.ulp() || v.abs() <= verify.ulp(),
+    };
+    if held.shapes_disagree || held.verify_shape_sides_with_verify || held.within_ulp {
+        Verdict::Numerics(held)
+    } else {
+        Verdict::VerifyFault
+    }
+}
+
+/// One verify round of a speculative run, as the run recorded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifyRound {
+    /// The sequence's frontier before the round: its anchor's position, its
+    /// first column.
+    pub base: u64,
+    pub extent: u32,
+    /// The tokens it committed: its anchor and the drafts it accepted, the
+    /// columns whose KV and GDN state it kept.
+    pub committed: usize,
+}
+
+impl VerifyRound {
+    /// The row of the round's columns whose logits drew the text's token
+    /// `split` (`text[0]` at `first`, the prompt's end). Column `j` at
+    /// `base + j` drew the token after it: an accepted draft, or at the last
+    /// committed column the correction, the sequence's pending token that the
+    /// next round takes as its anchor. `None` when another round drew it, and
+    /// for token 0, which the prompt's own prefill drew in both runs alike.
+    pub fn row(&self, first: u64, split: usize) -> Option<usize> {
+        let drawn_at = (first + split as u64).checked_sub(1)?;
+        (self.base <= drawn_at && drawn_at < self.base + self.committed as u64).then(|| (drawn_at - self.base) as usize)
+    }
+
+    /// Whether this round drew the first token at which `verify_text` -- the
+    /// speculative run's text once the round has committed, its pending token
+    /// last -- departs from the decode rounds' text `decode_text`. That round
+    /// is the one whose snapshot, taken at its base, the run keeps: the token
+    /// is the round's correction when it departs at the pending token, which
+    /// the run commits only as the next round's anchor. Past `decode_text`'s
+    /// end no token departs.
+    pub fn drew_the_departure(&self, first: u64, decode_text: &[i32], verify_text: &[i32]) -> bool {
+        decode_text
+            .iter()
+            .zip(verify_text)
+            .position(|(x, y)| x != y)
+            .is_some_and(|split| self.row(first, split).is_some())
+    }
+}
+
+/// A span's tokens: `text` at the span's positions, `text[0]` at `first`, and
+/// past the text's end its last token again. Only the judged span runs past
+/// the text, after the row it reads, and a causal span's row reads no later
+/// column.
+pub fn span_tokens(text: &[i32], first: u64, span: Range<u64>) -> Vec<i32> {
+    let last = *text.last().expect("a span over no text");
+    span.map(|position| {
+        let index = position.checked_sub(first).expect("a span before the text") as usize;
+        text.get(index).copied().unwrap_or(last)
+    })
+    .collect()
+}

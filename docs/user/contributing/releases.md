@@ -33,12 +33,16 @@ commit and the GitHub release body. It is a draft: the headings are sorted by
 what the range can prove, not by what matters most.
 
 `.github/workflows/release.yml` runs the CPU-only test suite on Linux and
-Windows, and only then builds the GPU engine for both hosts — on every push to
-`main` or a `ci/**` branch, publishing nothing. A `v*` tag — which must match
+Windows, split into four shards per host that together run every test once,
+and builds the GPU engine for both hosts beside it — on every push to `main`
+or a `ci/**` branch. Nothing is published until the tests pass: a push to
+`main` then moves the `develop` image and prerelease, and a `ci/**` branch
+publishes nothing. A `v*` tag — which must match
 `workspace.package.version`, or the job refuses it — turns the same run into a
 GitHub Release and pushes the container image. The image is built by the same
 job as the Linux tarball, out of the same compile, so the two can never carry
-different binaries (ADR 0032). Both hosts build the kernel for `86;120a`, so
+different binaries; a later job pushes it once the tests have passed (ADR
+0032). Both hosts build the kernel for `86;120a`, so
 every artifact runs on RTX 30 and RTX 40 cards as well as on Blackwell
 ([Building from source](building.md#other-card-architectures)). Neither host
 packages a server that is not a CUDA build: `mk/cuda-build-check.sh` reads the

@@ -296,11 +296,15 @@ local file and carries these fields and nothing else:
 | Smoke check | pass or fail, and the five lines |
 | The bench | its record, which carries no key, path or address ([what it never records](../guides/measure-a-16gb-card.md#what-it-never-records)) |
 
-Nothing else goes in: no user or host name, no path, no IP address, no GPU
-UUID or serial number, no process name, no environment variable. The summary
-line reads the record's `decode.coding.median_tokens_per_s`,
+Nothing else goes in: no user or host name, no path, no IP address, no GPU UUID
+or serial number, no process name, no environment variable. The summary line
+leads with the long replies' rate, `decode.long.median_tokens_per_s`, the figure
+to quote for the card (from 0.10.0: a 0.9 release's `ignis-bench` has no long
+replies, and its line leads with the short ones), then reads
+`decode.coding.median_tokens_per_s` (the short replies),
 `decode.agent.median_tokens_per_s`, `decode.speculative.acceptance` and the
-`median_ttft_ms` of each `ttft` cell:
+`median_ttft_ms` of each `ttft` cell ([what each cell
+measures](../guides/measure-a-16gb-card.md#what-it-records)):
 
 ````markdown
 ### <card> · <OS> · default: works | adapted | refused · runs with: <flags, or "the default">
@@ -325,8 +329,9 @@ line reads the record's `decode.coding.median_tokens_per_s`,
 <the first five lines>
 ```
 
-**Summary:** decode <n> tok/s on the coding prompts, <n> tok/s on the agent
-turns; DFlash2 acceptance <n>; time to first token <n> s at 8K, <n> s at 64K.
+**Summary:** decode <n> tok/s on long replies; <n> tok/s on short replies,
+<n> tok/s on the agent turns; DFlash2 acceptance <n>; time to first token
+<n> s at 8K, <n> s at 64K.
 
 <details><summary>ignis-bench small-card</summary>
 

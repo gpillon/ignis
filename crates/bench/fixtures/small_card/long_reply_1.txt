@@ -1,0 +1,1 @@
+Write a complete Python module that implements an LRU cache class with get, put and delete and a fixed capacity, followed by three unittest tests: eviction order, updating a key, deleting a key. Reply with the code only, in one block.

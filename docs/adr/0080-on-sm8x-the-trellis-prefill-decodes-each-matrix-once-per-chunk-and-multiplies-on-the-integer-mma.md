@@ -1,6 +1,7 @@
 ---
 status: accepted
 amends: [ADR-0077]
+amended-by: [ADR-0085]
 ---
 
 # On sm_8x the trellis prefill decodes each matrix once per chunk and multiplies on the integer MMA
