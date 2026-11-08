@@ -1,7 +1,7 @@
 // ignis kernel leaf: the dense prefill of the 27B's trellis body -- OURS (GitHub #509, spec #503;
 // kernel/include/ignis_dense_prefill.h), but for one ADAPTED part (ADR 0051 tier 2), the first
-// half of dense_prefill_rmsnorm_a8_kernel. Ported from the prototype's bench on the branch
-// prototype/sm8x-dense-prefill (kernel/tests/bench_sm8x_dense.cu, phase 2a's kernels with phase
+// half of dense_prefill_rmsnorm_a8_kernel. Ported from the prototype's bench kept as the tag
+// archive/prototype-sm8x-dense-prefill (kernel/tests/bench_sm8x_dense.cu, phase 2a's kernels with phase
 // 2c's levers A, one quantize launch per shared input, and D, the fragments double-buffered
 // across the stage boundary over 3 or 4 stages), written from the PTX ISA and our own kernels.
 //

@@ -122,7 +122,8 @@ curl http://127.0.0.1:8000/v1/decide \
 
 What each combination does, costs and measured
 ([spec 22](../../specs/decide/22-locate-by-copy-over-a-folded-state.md); the
-acceptance run's numbers go in ADR 0042):
+acceptance run's numbers are in
+[the shortlist's acceptance](../../findings/2026-09-28-locate-shortlist-acceptance-partial.md)):
 
 | | reads | cost | measured (exploratory) |
 |---|---|---|---|

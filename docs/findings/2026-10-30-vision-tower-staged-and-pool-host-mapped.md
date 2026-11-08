@@ -25,7 +25,7 @@ a prefill cost?
 ## Evidence
 
 **Setup.**
-- A throwaway prototype behind environment flags on branch `prototype/409-vision-host`:
+- A throwaway prototype behind environment flags on branch `prototype/409-vision-host`, kept since 2026-11-08 as the tag `archive/prototype-409-vision-host`:
   - 4aaac2d8: A1 as a whole-tower copy (H1a) and a double buffer (H1b), A2, and the harness;
   - abfafa36: a ring of K slots, block grouping, a per-stage trace, a no-copy diagnostic and a bounce page.
 

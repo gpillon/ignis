@@ -45,9 +45,10 @@ void check_launch(const char *what) {
 //
 // IgnisHqPromptPrecision::kInt8: the 8-bit band a card without the FP8 MMA runs, on the integer
 // MMAs every sm_80 card has at their full rate (s8 and u8 into s32), apart from fa_kernel's FP8
-// axis, so the 86 cubin carries it live. Ported from the prototype prototype/sm8x-dense-prefill
-// (phases 2d and 2e, its fa_i8f_kernel at the measured winner). One kernel serves the band and,
-// in the prefill pass, the residual window, so every key goes through it:
+// axis, so the 86 cubin carries it live. Ported from the prototype (the tag
+// archive/prototype-sm8x-dense-prefill, phases 2d and 2e, its fa_i8f_kernel at the measured
+// winner). One kernel serves the band and, in the prefill pass, the residual window, so every
+// key goes through it:
 //   - Q K^T in INT8, Q with one scale per row and K with one per 32-key tile (tile_kernel<true>'s
 //     K, the 8-bit band's), exact in int32 from 1.5 2^23 (|S| <= 256 127^2 < 2^22): one FADD lifts
 //     it;

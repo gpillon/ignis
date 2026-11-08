@@ -1,6 +1,6 @@
 /* ignis kernel leaf: the dense prefill of the 27B's trellis body -- OURS (GitHub #509, spec #503
- * "The dense prefill route"), ported from the prototype on the branch
- * prototype/sm8x-dense-prefill (its bench, phases 2a and 2c, levers A and D), written from the
+ * "The dense prefill route"), ported from the prototype kept as the tag
+ * archive/prototype-sm8x-dense-prefill (its bench, phases 2a and 2c, levers A and D), written from the
  * PTX ISA and our own kernels (kernel/src/trellis_linear_*, trellis_decode.cuh, moe_common.cuh).
  * No library GEMM.
  *

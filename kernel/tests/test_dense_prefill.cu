@@ -1,6 +1,6 @@
 // The dense prefill's leaf C ABI against exact references -- OURS (GitHub #509, spec #503;
 // kernel/include/ignis_dense_prefill.h). Ported from the checks of the prototype's bench
-// (prototype/sm8x-dense-prefill, kernel/tests/bench_sm8x_dense.cu), with host references where
+// (the tag archive/prototype-sm8x-dense-prefill, kernel/tests/bench_sm8x_dense.cu), with host references where
 // the bench compared against the fused route's emulation.
 //
 //   W8       the decode's codes against a host decode of the format (moe_fixture.h's restatement

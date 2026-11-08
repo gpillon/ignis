@@ -32,7 +32,7 @@ short of the target:
 
 Ignis's decode round is weight streaming at the card's bandwidth: on a 5090 it
 is 15.81 ms of device time with the backbone GEMM at roofline (see the
-[root README](../../../README.md#the-decode-round)). A round that is bound by
+[decode round](../why-ignis/decode-round.md)). A round that is bound by
 bandwidth gets slower in step with the bandwidth, so the same round on a Spark
 would take roughly **6.5× longer, around 100 ms instead of 16**. Prefill leans
 on compute, and with a bit more than a quarter of the SMs it would likely be
