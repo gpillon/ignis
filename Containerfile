@@ -35,13 +35,42 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-# --- the Rust workspace + the CUDA kernel leaf ------------------------------
-FROM docker.io/nvidia/cuda:13.1.1-devel-ubuntu24.04 AS build
+# --- the toolchain, shared by the recipe and the build ----------------------
+FROM docker.io/nvidia/cuda:13.1.1-devel-ubuntu24.04 AS toolchain
 
 # cmake 3.28 is what kernel/CMakeLists.txt asks for and what noble ships.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build pkg-config curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+ARG RUST_VERSION=1.98.0
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal \
+        --target x86_64-unknown-linux-gnu
+ENV PATH=/root/.cargo/bin:$PATH
+ENV CUDA_HOME=/usr/local/cuda
+
+# cargo-chef (GitHub #552) compiles the workspace's dependencies from its
+# manifests alone, in a layer of their own below: the crates on crates.io
+# change far less often than ignis's own files, and compiled after `COPY . .`
+# all ~290 of them were compiled again on every push.
+ARG CARGO_CHEF_VERSION=0.1.78
+RUN cargo install cargo-chef --locked --version "${CARGO_CHEF_VERSION}"
+
+WORKDIR /src
+
+# --- the dependency recipe --------------------------------------------------
+#
+# recipe.json holds what the dependencies' compile depends on: the manifests,
+# the lock file and the targets they declare, never a line of ignis's code.
+# This stage runs on every commit and takes seconds; the recipe it writes is
+# byte for byte the last one unless a manifest or the lock file changed.
+FROM toolchain AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# --- the Rust workspace + the CUDA kernel leaf ------------------------------
+FROM toolchain AS build
 
 # cuobjdump reads the binaries' 8.6 SASS for the full-rate check after the
 # build (#512). The devel image's toolkit is expected to carry it; where it
@@ -54,14 +83,14 @@ RUN test -x /usr/local/cuda/bin/cuobjdump || { apt-get update \
     && test -x /usr/local/cuda/bin/cuobjdump
 ENV IGNIS_CUOBJDUMP=/usr/local/cuda/bin/cuobjdump
 
-ARG RUST_VERSION=1.98.0
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal \
-        --target x86_64-unknown-linux-gnu
-ENV PATH=/root/.cargo/bin:$PATH
-ENV CUDA_HOME=/usr/local/cuda
-
-WORKDIR /src
+# The dependencies, in a layer only the recipe invalidates (#552). cargo-chef
+# builds the workspace with every crate of ours replaced by an empty one and
+# every build script of ours by `fn main() {}` (so no kernel leaf here); the
+# build below finds every dependency compiled for the same target, profile and
+# features. No `--features cuda`: it turns on features of ignis's own crates
+# alone, none of a dependency's.
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --locked --target x86_64-unknown-linux-gnu --recipe-path recipe.json
 
 # nvcc peaks well above 2 GB of RSS on the W4A4/TMA translation units, so a
 # builder with little memory per core needs a narrower width than its core

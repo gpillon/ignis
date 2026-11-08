@@ -179,9 +179,20 @@ leaf from nothing on every push, its layer coming after `COPY . .`.
   test --workspace` runs exactly once; a target the flags cannot select as it
   does is refused (`mk/test-shard-selftest.sh`, run in shard 1).
 - **The Linux build compiles the leaf in a layer that only `kernel/`
-  invalidates**, and keeps only the three shipped binaries from its cargo step:
-  the target directory, rewritten into the 10 GB Actions cache on every push,
-  crowded out the layers that are reused.
+  invalidates, and the dependencies in one that only the manifests and the
+  lock file invalidate** (cargo-chef, pinned), and keeps only the three
+  shipped binaries from its cargo step: the target directory, rewritten into
+  the 10 GB Actions cache on every push, crowded out the layers that are
+  reused.
+- **The Windows build's kernel cache restores only on an exact hit, and then
+  dates the sources it hashes back**: ninja decides by date, the checkout
+  dates every source later than the cached objects, and restored as is the
+  leaf was compiled again in full on every push (274 commands, ~12.5 minutes).
+  An exact hit proves the sources are the bytes the objects came from; a
+  partial restore cannot, so there is none.
+- **The test job builds with line tables only**, in place of full debuginfo:
+  the compile took about half as long on Linux and a sixth less on Windows,
+  with the suite unchanged.
 - `crates/server/tests/ci_pipeline.rs` holds the workflow and the
   Containerfile to this shape.
 

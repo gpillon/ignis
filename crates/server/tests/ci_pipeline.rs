@@ -176,6 +176,11 @@ fn the_test_job_runs_every_shard_of_the_count_it_gives_the_script() {
     );
     let name = text(test, "name").expect("the test job is named");
     assert!(name.contains(&format!("/{count})")), "the job's name gives the count: {name}");
+    // Line tables only, for every profile `cargo test` builds with.
+    let env = get(test, "env").and_then(Value::as_mapping).expect("the test job sets its environment");
+    for profile in ["CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG"] {
+        assert_eq!(text(env, profile), Some("line-tables-only"), "{profile}");
+    }
 
     // The selftests and the Playground's checks run once per host, in shard 1,
     // the shard script's own test among them.
@@ -242,6 +247,20 @@ fn the_container_build_compiles_the_leaf_in_a_layer_only_kernel_invalidates() {
     let copy_all = at("\nCOPY . .\n");
     let cargo = at("cargo build --release");
     assert!(copy_kernel < build_leaf && build_leaf < copy_all, "the leaf is built from kernel/ alone, before `COPY . .`");
+    // The dependencies are compiled from the recipe alone, before the leaf and
+    // the sources, so neither invalidates them; the recipe comes from a stage
+    // of its own, and cargo-chef is a pinned version.
+    let recipe = at("\nCOPY --from=planner /src/recipe.json recipe.json\n");
+    let cook = at("\nRUN cargo chef cook --release --locked --target x86_64-unknown-linux-gnu --recipe-path recipe.json\n");
+    assert!(recipe < cook && cook < copy_kernel, "the dependencies are cooked from the recipe, before the leaf and `COPY . .`");
+    let planner = containerfile.split(" AS planner\n").nth(1).and_then(|rest| rest.split("\nFROM ").next()).expect("a planner stage");
+    assert!(planner.contains("RUN cargo chef prepare --recipe-path recipe.json"), "{planner}");
+    let chef = containerfile
+        .lines()
+        .find_map(|line| line.strip_prefix("ARG CARGO_CHEF_VERSION="))
+        .expect("the Containerfile pins cargo-chef's version");
+    assert!(!chef.is_empty() && chef.split('.').all(|part| part.parse::<u32>().is_ok()), "cargo-chef's version is pinned: {chef}");
+    assert!(containerfile.contains("cargo install cargo-chef --locked --version \"${CARGO_CHEF_VERSION}\""));
     // What the leaf is built for is set before it is built, or the cargo
     // build's own run of kernel/build.sh would build it again for the list.
     for env in ["ENV IGNIS_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}\n", "ENV IGNIS_KERNEL_BUILD_JOBS=${KERNEL_BUILD_JOBS}\n"] {

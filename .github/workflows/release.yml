@@ -196,6 +196,16 @@ jobs:
             target: x86_64-pc-windows-msvc
     name: test (${{ matrix.host }}, ${{ matrix.shard }}/4)
     runs-on: ${{ matrix.os }}
+    # Line tables only, in place of the profiles' full debuginfo (#552): no
+    # one attaches a debugger here, and a panic still names its file and line.
+    # The suite compiled and ran the same; measured on these runners (the
+    # workspace rebuilt with its dependencies warm, two runs each), the
+    # compile went from 843/872 s to 397/483 s on Linux and from 1302 s to
+    # 1100/1090 s on Windows, the target from 59 to 19 GB and from 29 to
+    # 11 GB.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
 
