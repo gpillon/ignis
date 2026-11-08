@@ -25,8 +25,13 @@
 #
 # `--test NAME` selects that name in every crate (two crates have integration
 # tests of the same name), so a name is one unit. The units are read off
-# `cargo metadata`, never listed by hand, sorted, and unit i goes to shard
-# ((i - 1) mod count) + 1: the shards of one count hold every unit exactly
+# `cargo metadata`, never listed by hand, and sorted. With more than one
+# shard, `lib` has the last shard to itself and the others are dealt in turn
+# to the shards before it: `lib` is the heaviest unit by far and cannot be
+# split (`--lib` selects every crate's library at once, ignis-server's ~2700
+# unit tests among them), and dealt like the others it made its shard the
+# slowest of the run by a third (on the Windows runner 10m36s of compile
+# against 5-7 minutes, #552). The shards of one count hold every unit exactly
 # once, and a new test file joins a shard by itself. A target whose required
 # features the default build lacks is left out, as `cargo test` leaves it
 # out. A target the flags above cannot select as `cargo test --workspace`
@@ -95,7 +100,13 @@ if [ -n "$refused" ]; then
 fi
 [ -n "$all" ] || { echo "test-shard: the workspace has no test targets" >&2; exit 2; }
 
-mine=$(awk -v shard="$shard" -v count="$count" '(NR - 1) % count == shard - 1' <<<"$all")
+# One shard: everything. More: `lib` alone in the last, the other units in
+# turn over the shards before it.
+mine=$(awk -v shard="$shard" -v count="$count" '
+    count == 1 { print; next }
+    $0 == "lib" { if (shard == count) print; next }
+    { if (dealt % (count - 1) == shard - 1) print; dealt++ }
+' <<<"$all")
 if [ "$plan" = 1 ]; then
     [ -z "$mine" ] || printf '%s\n' "$mine"
     exit 0

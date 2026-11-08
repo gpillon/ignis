@@ -77,7 +77,20 @@ for count in 1 2 3 4 5 8 9; do
         fail "$count shards hold every unit exactly once: $(grep -v '^$' <<<"$union" | LC_ALL=C sort | tr '\n' '|')"
     fi
 done
-[ -z "$(plan good 9 9)" ] && ok "a shard past the last unit holds nothing" || fail "a shard past the last unit holds nothing"
+[ -z "$(plan good 8 9)" ] && ok "a shard past the last unit holds nothing" || fail "a shard past the last unit holds nothing"
+
+# The library unit tests are the heaviest unit and cannot be split: with more
+# than one shard they have the last one to themselves, and the other units
+# are dealt over the shards before it.
+for count in 2 3 4 9; do
+    [ "$(plan good "$count" "$count")" = lib ] \
+        && ok "of $count shards, the last holds lib alone" \
+        || fail "of $count shards, the last holds lib alone: $(plan good "$count" "$count" | tr '\n' '|')"
+done
+grep -qx lib <<<"$(plan good 1 1)" && ok "one shard holds lib too" || fail "one shard holds lib too"
+[ "$(plan good 1 4)" = "$(printf 'bins\ntest eta\ntest zeta')" ] \
+    && ok "the other units are dealt in turn over the shards before the last" \
+    || fail "the other units are dealt in turn: $(plan good 1 4 | tr '\n' '|')"
 
 # What no target flag of `cargo test --workspace` can select as it does is
 # refused, naming the target.
@@ -137,7 +150,7 @@ cargo test --workspace --no-fail-fast --locked --target x86_64-test-target --doc
 [ "$(cat "$dir/cargo.log")" = "$want" ] && [ "$status" = 0 ] \
     && ok "a shard runs only its own units" \
     || fail "a shard runs only its own units: $(tr '\n' '|' < "$dir/cargo.log") (exit $status)"
-commands 9 9
+commands 8 9
 [ ! -s "$dir/cargo.log" ] && [ "$status" = 0 ] \
     && ok "an empty shard runs nothing and passes" \
     || fail "an empty shard runs nothing and passes"
