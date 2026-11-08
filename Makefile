@@ -603,6 +603,13 @@ cuda-build-check-selftest: ## Test the release builds' CUDA check, mk/cuda-build
 doctor-selftest: ## Test make doctor's CUDA checks on Linux, mk/linux/doctor.sh
 	@bash mk/linux/doctor-selftest.sh
 
+# A hand-written `cargo metadata` and a cargo stub that only records its
+# commands, so it builds nothing; the release workflow's test job runs it
+# (shard 1 of each host) before the shards it plans are trusted.
+.PHONY: test-shard-selftest
+test-shard-selftest: ## Test the CI test job's shard plan, mk/test-shard.sh
+	@bash mk/test-shard-selftest.sh
+
 # ---------------------------------------------------------------------------
 ##@ GPU (one run on the card at a time -- docs/agents/testing.md)
 # ---------------------------------------------------------------------------

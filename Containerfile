@@ -62,8 +62,6 @@ ENV PATH=/root/.cargo/bin:$PATH
 ENV CUDA_HOME=/usr/local/cuda
 
 WORKDIR /src
-COPY . .
-COPY --from=web /src/web/dist ./web/dist
 
 # nvcc peaks well above 2 GB of RSS on the W4A4/TMA translation units, so a
 # builder with little memory per core needs a narrower width than its core
@@ -80,6 +78,17 @@ ENV IGNIS_KERNEL_BUILD_JOBS=${KERNEL_BUILD_JOBS}
 # reads the same variable.
 ARG CUDA_ARCHITECTURES=
 ENV IGNIS_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
+
+# The kernel leaf first, in a layer of its own that only kernel/ invalidates
+# (GitHub #552): `COPY . .` changes on every commit, so a leaf compiled after
+# it was compiled again on every push, ~8.5 minutes of nvcc on the release
+# runner. A layer's cache key is its files' contents, never their dates, so a
+# push that touches no kernel file finds this one in the cache.
+COPY kernel/ kernel/
+RUN bash kernel/build.sh --archives-only
+
+COPY . .
+COPY --from=web /src/web/dist ./web/dist
 
 # What the check requires of the binaries whatever list they were built for:
 # the release workflow passes `86;120a`, written apart from
@@ -101,14 +110,33 @@ ARG CUDA_REQUIRED_ARCHITECTURES=
 # of mk/full-rate-kernels.txt (with the cuobjdump above, #512), on
 # each of the three binaries the image
 # and the tarball ship.
-RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
+#
+# crates/artifact/build.rs runs kernel/build.sh again, and ninja decides by
+# date: `COPY . .` has just rewritten every kernel source with the checkout's
+# dates, later than a cached leaf's objects, which would make it compile the
+# whole leaf again. Those sources are byte for byte the ones the leaf layer
+# above was built from (one build, one context), so they are dated back to
+# 1970 first and ninja finds the leaf up to date.
+#
+# Only the three shipped binaries leave this step, in /out: the target
+# directory is several GB that no later build can reuse (the step reruns on
+# every commit), and kept in the layer it was written to the repository's
+# 10 GB Actions cache on every push, crowding out the layers that are reused,
+# the leaf's among them (#552).
+RUN find kernel -path kernel/build -prune -o -type f -exec touch -d @1 {} + \
+    && cargo build --release --locked --target x86_64-unknown-linux-gnu \
         --workspace --features cuda \
     && bash mk/cuda-build-check.sh --require "$CUDA_REQUIRED_ARCHITECTURES" target/x86_64-unknown-linux-gnu/release/ignis-server \
              target/x86_64-unknown-linux-gnu/release/ignis-bench \
              target/x86_64-unknown-linux-gnu/release/ignis-artifact-inspect \
     && strip target/x86_64-unknown-linux-gnu/release/ignis-server \
              target/x86_64-unknown-linux-gnu/release/ignis-bench \
-             target/x86_64-unknown-linux-gnu/release/ignis-artifact-inspect
+             target/x86_64-unknown-linux-gnu/release/ignis-artifact-inspect \
+    && mkdir /out \
+    && mv target/x86_64-unknown-linux-gnu/release/ignis-server \
+          target/x86_64-unknown-linux-gnu/release/ignis-bench \
+          target/x86_64-unknown-linux-gnu/release/ignis-artifact-inspect /out/ \
+    && rm -rf target
 
 # --- the release payload ----------------------------------------------------
 #
@@ -116,9 +144,9 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
 # binaries the image runs:
 #   docker buildx build --target artifacts --output type=local,dest=out .
 FROM scratch AS artifacts
-COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/ignis-server /
-COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/ignis-bench /
-COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/ignis-artifact-inspect /
+COPY --from=build /out/ignis-server /
+COPY --from=build /out/ignis-bench /
+COPY --from=build /out/ignis-artifact-inspect /
 # Apache-2.0 asks that a redistribution carry LICENSE and NOTICE; kernel/NOTICE
 # is the provenance of the vendored reference ops (ADR 0010), and travels with
 # every binary that carries them.
@@ -135,9 +163,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 ignis
 
-COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/ignis-server /usr/local/bin/
-COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/ignis-bench /usr/local/bin/
-COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/ignis-artifact-inspect /usr/local/bin/
+COPY --from=build /out/ignis-server /usr/local/bin/
+COPY --from=build /out/ignis-bench /usr/local/bin/
+COPY --from=build /out/ignis-artifact-inspect /usr/local/bin/
 
 # Apache-2.0 travels with the binaries (LICENSE and the root NOTICE), and so
 # does the vendored subtree's own provenance.

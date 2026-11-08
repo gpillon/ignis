@@ -12,8 +12,8 @@
 //! - a job granting `contents: write` or `pages: write` (a release, a tag, a
 //!   Pages deployment);
 //! - a step using a registry login, a release action or a Pages action;
-//! - a step whose `run` calls `gh release` or pushes with git, docker or
-//!   podman;
+//! - a step whose `run` calls `gh release` or pushes with git, docker,
+//!   podman or skopeo;
 //! - a `push` input that is not plainly `false`.
 
 use std::path::{Path, PathBuf};
@@ -27,8 +27,9 @@ const GUARD: &str = "github.repository == 'gpillon/ignis'";
 const PUBLISHING_ACTIONS: [&str; 4] =
     ["docker/login-action", "softprops/action-gh-release", "actions/deploy-pages", "actions/upload-pages-artifact"];
 
-/// Commands whose step publishes.
-const PUBLISHING_COMMANDS: [&str; 4] = ["gh release ", "git push", "docker push", "podman push"];
+/// Commands whose step publishes. `skopeo copy` pushes the image the `linux`
+/// job built, from its OCI archive (#552).
+const PUBLISHING_COMMANDS: [&str; 5] = ["gh release ", "git push", "docker push", "podman push", "skopeo copy"];
 
 /// Permissions whose job publishes.
 const PUBLISHING_PERMISSIONS: [&str; 2] = ["contents", "pages"];
@@ -185,6 +186,7 @@ fn an_unguarded_publishing_point_is_refused() {
         "      - uses: actions/upload-pages-artifact@v3\n",
         "      - run: gh release create develop dist/*\n",
         "      - run: |\n          git tag x\n          git push origin x\n",
+        "      - run: skopeo copy --all oci-archive:image.tar docker://ghcr.io/gpillon/ignis:develop\n",
         "      - uses: docker/build-push-action@v6\n        with:\n          push: ${{ github.ref == 'refs/heads/main' }}\n",
         "      - uses: docker/build-push-action@v6\n        with:\n          push: true\n",
         "      - if: github.repository == 'gpillon/ignis' || github.ref == 'refs/heads/main'\n        run: gh release create develop\n",
