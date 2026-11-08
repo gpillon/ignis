@@ -16,9 +16,9 @@ Infer the repo from `git remote -v`; `gh` does this automatically when run insid
 
 ## Pull requests as a triage surface
 
-**PRs as a request surface: yes.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
+**PRs as a request surface: yes.** `/triage` reads this flag: an external PR is a feature request here.
 
-When set to `yes`, PRs run through the same labels and states as issues, using the `gh pr` equivalents:
+PRs run through the same labels and states as issues, using the `gh pr` equivalents:
 
 - **Read a PR**: `gh pr view <number> --comments` and `gh pr diff <number>` for the diff.
 - **List external PRs for triage**: `gh api --paginate 'repos/{owner}/{repo}/pulls?state=open' --jq '.[] | select(.author_association | IN("OWNER","MEMBER","COLLABORATOR") | not) | {number, title, author: .user.login, author_association, labels: [.labels[].name]}'`.
@@ -51,9 +51,8 @@ Used by `/wayfinder`. The **map** is a single issue with **child** issues as tic
 Until 2026-10-25 a spec lived as a file under `docs/specs/<feature>/`, and its
 issue carried only a short body linking it (`**Spec:** [docs/specs/...](...)`).
 For those issues the linked file is the spec and the ticket's brief: read it
-after the issue body. `docs/specs/` is frozen: a new spec is an issue, and a
-spec still in flight (speech/07 and speech/08, #362 and #361) stays a file
-until its ticket closes.
+after the issue body. `docs/specs/` is frozen (`docs/specs/README.md`): a new
+spec is an issue.
 
 ## Closing work
 

@@ -14,8 +14,6 @@ When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the 
 
 A state label also sets the issue's Status on the project board: **Project board** in `docs/agents/issue-tracker.md`.
 
-Edit the "Label in our tracker" column to match whatever vocabulary you actually use.
-
 ## Category roles
 
 | Role          | Label in our tracker |
@@ -39,7 +37,7 @@ issue's other labels, and its state role and category stay as they are.
 
 ## Other labels
 
-`Bucket 1`, `Bucket 2`, `dependencies`, `javascript`, `python`, `documentation`,
-`accessibility`, `good first issue`, `help wanted`, `question`, `duplicate` and
-`invalid` are not roles: triage leaves them as they are.
+`Bucket 1`, `Bucket 2`, `dependencies`, `javascript`, `python`, `rust`,
+`documentation`, `accessibility`, `good first issue`, `help wanted`, `question`,
+`duplicate` and `invalid` are not roles: triage leaves them as they are.
 
