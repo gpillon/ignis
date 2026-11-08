@@ -19,7 +19,7 @@ until the test suite is green.
   forward pass (the kernel leaf, the step ABI, the program), a test that
   self-skips on a busy GPU or on a kernel error proves nothing; that pattern
   is what let a broken forward stay green for two tickets
-  (`docs/REVIEW-2026-09-05.md` §4.1). Those tests belong to the explicit
+  (`docs/archive/REVIEW-2026-09-05.md` §4.1). Those tests belong to the explicit
   **GPU profile** (below), which requires the GPU free and *fails* on any
   kernel error, busy GPU, or missing fixture. The default `cargo test` stays
   CPU-only (GitHub #38).

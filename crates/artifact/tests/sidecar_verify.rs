@@ -16,8 +16,8 @@ use std::path::Path;
 
 use ignis_artifact::{verify, Reader, Sidecar};
 
-/// The fork-local model cache (the artifact the running `ninfer-serve`
-/// loads).
+/// The fork-local model cache (the artifact the reference `ninfer-serve`
+/// loaded).
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 /// The v2 graft sidecar (the v1 artifact's `conversion.json` records the
 /// base-tensor provenance; the graft sidecar records the v2 graft).

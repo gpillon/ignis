@@ -98,6 +98,6 @@ Only permissively licensed code is copied.
 
 ## Read more
 
-- [The findings index](../../findings/README.md): every finding, with its scope and status.
+- [The findings index](../../findings/README.md): the current findings by topic, with the archive of the superseded and closed ones beside it.
 - [One round for every lane](decode-round.md) and [A drafter inside the artifact](dflash2.md): the speculation numbers in context.
 - [Reasoning that finishes](reasoning-that-finishes.md): a finding set with in-sample and held-out figures side by side.

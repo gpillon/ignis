@@ -135,7 +135,7 @@ These are choices, not gaps:
 - No embeddings and no generic reranker; a second model on the card is not
   planned for. Classification goes through `/v1/decide`.
 - No `/v1/completions` and no `/v1/batches`.
-- No audio in or out, and no LoRA adapters.
+- No audio out (speech is transcribed, never spoken), and no LoRA adapters.
 - No more than one model loaded at once.
 - Not a general engine: other model families are not served.
 

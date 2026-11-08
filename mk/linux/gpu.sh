@@ -89,7 +89,8 @@ guard)
     if [ "$used" -ge "$threshold" ]; then
         echo "GPU guard: refused -- $used MiB already resident (threshold $threshold MiB):"
         nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
-        echo "  stop whatever holds the card, or raise GPU_THRESHOLD_MIB; GPU_CHECK=0 skips this guard"
+        echo "  if it serves your own agent, hand this step to the user; otherwise it is someone else's: wait or ask"
+        echo "  (docs/agents/testing.md, who holds the card); GPU_THRESHOLD_MIB raises the threshold, GPU_CHECK=0 skips this guard"
         exit 1
     fi
     echo "GPU guard: card is free ($used MiB resident)"

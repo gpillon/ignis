@@ -11,8 +11,8 @@ use std::path::Path;
 
 use ignis_artifact::{ChatMessage, FrontendSet, Object, Reader, Role, FRONTEND_RESOURCES};
 
-/// The fork-local model cache (the artifact the running `ninfer-serve`
-/// loads).
+/// The fork-local model cache (the artifact the reference `ninfer-serve`
+/// loaded).
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 
 fn open_or_skip() -> Option<Reader> {

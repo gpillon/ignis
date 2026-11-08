@@ -34,8 +34,8 @@
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing GPU or artifact is a **skip**; under the profile it is a **hard
-//! failure**. Run via `scripts/gpu-profile.ps1` (stops the reference
-//! `ninfer-serve` first — the RTX 5090 is exclusive).
+//! failure**. Run via `scripts/gpu-profile.ps1`, on a card nothing else holds
+//! (it stops nothing itself; the RTX 5090 is exclusive; docs/agents/testing.md).
 
 #![cfg(feature = "cuda")]
 

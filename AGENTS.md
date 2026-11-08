@@ -56,7 +56,7 @@ One run fits the card at a time, and the loser dies with no diagnostic. Before
 anything on the GPU (the profile, a bench run, a gate leg, one `--ignored`
 test): `make gpu-status`. If your own model is served from this card (a local
 agent), the process holding it is you: never launch GPU work or stop it; hand
-the GPU step to the user (the recipe: `docs/agents/testing.md`). If you run
+the GPU step to the user (the recipe: `docs/agents/testing.md`, "Who holds the card"). If you run
 elsewhere, whatever holds the card is someone else's: wait or ask, never stop
 a process you did not start. Not sure which: ask.
 

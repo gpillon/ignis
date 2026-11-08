@@ -20,7 +20,7 @@ use ignis_artifact::{
 #[cfg(feature = "cuda")]
 use ignis_artifact::CudaDevice;
 
-/// The fork-local model cache (the artifact the running `ninfer-serve` loads).
+/// The fork-local model cache (the artifact the reference `ninfer-serve` loaded).
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 
 /// Open the real artifact, or `None` (with a skip note) when it is absent.
@@ -458,9 +458,9 @@ fn real_nvfp4full_full_cpu_materialization() {
     assert!(stats.peak_staging_bytes > 0);
 }
 
-/// `CudaDevice` upload path (feature `cuda`). The RTX 5090 is held by the
-/// reference `ninfer-serve` (ADR 0006), so this skips unless explicitly
-/// enabled with a free GPU.
+/// `CudaDevice` upload path (feature `cuda`). The RTX 5090 runs one process
+/// at a time (ADR 0006), so this skips unless explicitly enabled with a free
+/// GPU.
 #[cfg(feature = "cuda")]
 #[test]
 fn real_nvfp4full_cuda_device() {
