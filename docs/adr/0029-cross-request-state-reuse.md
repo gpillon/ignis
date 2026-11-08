@@ -1,6 +1,82 @@
+---
+status: accepted
+amends: [ADR-0023, ADR-0024]
+amended-by: [ADR-0045]
+---
+
 # ADR 0029 — cross-request state reuse: content-matched retained state across three residency tiers
 
-## Status
+## Current decision
+
+What holds today, folded from the Decision and its eight amendments below and
+checked against the code on 2026-11-08; the History keeps the reasons.
+
+**Match by content, not by session.** A request reuses the longest retained
+state whose match key, a hash of its token content and media identity, is a
+prefix of its prompt. No API field selects it, and reuse is global: there is
+one API key. It is on by default; `--reuse-prompt off` (once
+`--prompt-reuse off`) is for cold benches and correctness oracles.
+
+**Two retained objects.** A **prompt checkpoint** is a request's
+whole-sequence state at its generation opener, `<|im_start|>assistant\n`; a
+conversation keeps at most two, its latest and its turn-opening one. A
+**retained prefix** is a shared prefix kept with no claimant, published at
+each of a request's reuse boundaries, floored to whole KV pages and walked out
+of media: the end of the system-and-tools block and, on `/v1/decide`, a
+fan-out's common prefix, an observed fork and a `cache_control` marker
+(#270). A prefix may be chained over another (#187). A fan-out's head goes
+when its fan-out ends, and never to KV-RAM.
+
+**Reuse copies, never consumes**, in every tier: a claim shares the full
+pages, clones the mutable image and copies the tail page, and the entry
+stays.
+
+**Retained state is free until the room is needed.** On the device it is the
+first victim, prompt checkpoints before retained prefixes (#188), and it
+never delays or refuses an admission; since ADR 0045's #445 amendment neither
+does what a waiting request claimed of it. Its images live in retained slots
+reserved at load (ADR 0030): by default in a pinned host block (ADR 0030 as
+amended for #281), in VRAM only where `--reuse-retained-device` or a profile
+names some.
+
+**Three tiers, all built.** Below the device, KV-RAM and KV-disk (ADR 0045)
+take retained state lazily, only when the tier above would discard it, and
+give it up before any evicted live sequence. A retained prefix spills too, and
+comes back once, into a carrier sequence (#190). A restore must beat the best
+reuse still above it by a floor: 1,024 tokens from KV-RAM
+(`KV_RAM_RESTORE_FLOOR_TOKENS`), and from the disk 8,192 on Flash-Next and
+16,384 on the 27B; the disk restores straight to the device. A hit is counted
+when its claim lands (#445). KV-disk reuses nothing across a restart yet; its
+file header carries the identity below, widened by #205.
+
+**The opener's page rides the capture** on Flash-Next and, on Ampere and Ada,
+on the 27B (#306, #508): the prefill is cut once, at the opener, and the
+capture lends the pages below it to a pages-only link that is never claimed
+and takes no slot. The server decides it from the family and the card's
+generation (`config::arch::opener_page_rides_capture`). On Blackwell, and with
+no card read, the 27B keeps the imaged prefix at the opener's page floor,
+except for a request whose image spans that floor, which lends on any load
+(#249).
+
+**Multimodal.** Every match, in every tier, is by token ids and media items,
+and no claimable prefix ends inside an image's placeholders (#193). A
+multimodal claim always leaves one prompt token to prefill, until reused state
+carries `rope_delta` (#201, open).
+
+**The compatibility identity** is the artifact content hash, the KV format,
+the blob layout version and the drafter's presence and draft window. The
+content hash digests the container's declared directory, not its payload
+(#189), so an in-place re-quantization is the one hole, pinned by
+`a_rewritten_payload_alone_is_the_proxys_known_limit` in
+`crates/artifact/src/lib.rs`. Whether the container should carry a payload
+digest was left open for the owner; not re-verified since.
+
+## History
+
+The ADR as accepted on 2026-09-16 and amended in place until 2026-11-05, its
+headings one level down.
+
+### Status
 
 Accepted (2026-09-16) — GitHub #183 (absorbs #168). Spec:
 `docs/specs/kv-reuse/01-cross-request-reuse.md`. Builds on ADR 0024
@@ -16,7 +92,7 @@ its admission claimed of retained state on the device goes as retained state
 goes, for an entry ranked above it, and a claim reports its reuse and its hit
 only once it lands — see ADR 0045's amendment of that date.
 
-## Context
+### Context
 
 Prefix reuse (#126) and the KV-RAM tier (#125) both stop at request
 liveness. A shared prefix is dropped when its last claimant completes, and
@@ -38,7 +114,7 @@ Three facts shape what can be reused:
   opener**, `<|im_start|>assistant\n`.
 - The clients (qwen-code, the Playground) send no session identifier.
 
-## Decision
+### Decision
 
 **Match by content, not by session.** A request reuses the longest retained
 state whose token content, media identity included, is a prefix of its
@@ -86,7 +162,7 @@ key.
 **On by default.** `--prompt-reuse off` exists for cold benches and
 correctness oracles.
 
-## Considered options
+### Considered options
 
 - **A session id in the API** (#168 option A). Rejected for the reason above,
   and because no client sends one.
@@ -103,7 +179,7 @@ correctness oracles.
   measurement shows shared heads extending past the system block.
 - **Per-key isolation.** There is no second key to isolate.
 
-## Consequences
+### Consequences
 
 - **Equivalence.** A reused request and a cold prefill of its whole prompt
   split their chunks differently, so they can diverge at near-ties (the same
@@ -148,7 +224,7 @@ correctness oracles.
   way the reference does (tool-argument order, `preserve_thinking`); a
   rendering drift silently turns every match into a miss.
 
-## Amendment (2026-09-16) — which retained object goes first (#188)
+### Amendment (2026-09-16) — which retained object goes first (#188)
 
 The Decision says retained state is "always the first victim" on the device
 but not which of the two kinds goes first. #188 makes both kinds real at the
@@ -189,7 +265,7 @@ rather than one:
 `the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds` is the test
 that changes with it; it is written to fail when the order is flipped.
 
-## Amendment (2026-09-16) — the KV-RAM tier (#190)
+### Amendment (2026-09-16) — the KV-RAM tier (#190)
 
 What building Tier 1 decided that the Decision left open.
 
@@ -228,7 +304,7 @@ What building Tier 1 decided that the Decision left open.
   amended by #190). Since #445 a hit is counted when the claim lands, beside
   its restore, not when it is chosen (ADR 0045 as amended 2026-10-31).
 
-## Amendment (2026-09-16) — multimodal prompts (#193)
+### Amendment (2026-09-16) — multimodal prompts (#193)
 
 - **Prefix identity is the match key everywhere.** Sibling shared prefixes,
   retained prefixes, their KV-RAM copies and prompt checkpoints are all matched
@@ -243,7 +319,7 @@ What building Tier 1 decided that the Decision left open.
   rare case. Lifting it means carrying `rope_delta` with the reused state
   (#201).
 
-## Amendment (2026-09-26) — reuse boundaries (#270)
+### Amendment (2026-09-26) — reuse boundaries (#270)
 
 The Decision publishes a retained prefix at one structural point, the end of
 the system-and-tools block. A `/v1/decide` state given as content parts
@@ -330,7 +406,7 @@ which #238 rules out).
   `docs/findings/2026-09-26-decide-reuse-boundaries-live.md`: that, and each
   follower's own per-question cost, is why spec 16's `E <= 2 x D` does not hold.
 
-## Amendment (2026-10-07) — the opener's page rides the capture (#306, owner decision)
+### Amendment (2026-10-07) — the opener's page rides the capture (#306, owner decision)
 
 The Decision publishes the generation opener's page floor as a chained prefix
 (#186, #187) and captures the prompt checkpoint over it, so a request's prefill
@@ -399,7 +475,7 @@ Considered and rejected:
 - **A checkpoint that owns those pages itself.** The same ownership in a second
   structure; the prefix chain already walks, materializes and releases links.
 
-## Amendment (2026-10-07) — Tier 2 is built (ADR 0045)
+### Amendment (2026-10-07) — Tier 2 is built (ADR 0045)
 
 The Decision's "Three residency tiers, Tier 2 prepared" is superseded: KV-disk
 is built (ADR 0045, spec `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`).
@@ -421,7 +497,7 @@ is built (ADR 0045, spec `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.m
   tier is wiped, so "meant to outlive a server restart" is not yet true. The
   header is what would make it so without a format change.
 
-## Amendment (2026-10-31) — an image spanning the opener's page floor (#249, coordinator decision 2026-10-31)
+### Amendment (2026-10-31) — an image spanning the opener's page floor (#249, coordinator decision 2026-10-31)
 
 #193 keeps a claimable prefix from ending inside an image, so when a picture
 runs past the last page boundary before the generation opener, the opener's
@@ -504,7 +580,7 @@ its opener over that, and the turn after it stands on both.
   thinking-on repeat resumed 16,442 of its 16,444 tokens). Lifting the limit
   is #201's.
 
-## Amendment (2026-11-05) — the 27B's opener page rides the capture on Ampere and Ada (#508, spec #503, owner decision 2026-11-05)
+### Amendment (2026-11-05) — the 27B's opener page rides the capture on Ampere and Ada (#508, spec #503, owner decision 2026-11-05)
 
 The #306 amendment kept the 27B's imaged prefix at the opener's page floor
 because its extra cut costs ~19 ms on the RTX 5090. That cost does not hold on
