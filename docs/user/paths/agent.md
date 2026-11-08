@@ -28,7 +28,7 @@ In one paragraph, for "what is github.com/gpillon/ignis?":
 > (Blackwell, compute capability 12.0), the 27B's 16 GB builds on a 16 GB RTX
 > 50 (5060 Ti 16 GB, 5070 Ti, 5080) and on an RTX 3090 or 3090 Ti (Ampere,
 > 8.6, supported), and the same on an RTX 4090 or a 16 GB RTX 40 card (Ada,
-> 8.9, expected to work). It
+> 8.9, expected to work), the RTX 30 and RTX 40 cards from 0.10.0. It
 > serves them over an OpenAI-compatible HTTP API, with a browser Playground
 > and Prometheus metrics in the same binary, on Windows and Linux on x86-64.
 > It is shaped around the load a coding agent makes: a main agent and a few
@@ -48,7 +48,7 @@ settings. The figures hold for those, not for any card.
 
 | Check | Command | Passes when |
 |---|---|---|
-| The card | `nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv` | `compute_cap` reads `8.6`, `8.9` or `12.0` and the card is one named above: a release is built for `86;120a`, which runs on all three, and the card's memory says which models load ([What it runs on](../start/index.md#what-it-runs-on)). On any other `compute_cap` the server refuses to start, naming the card ([Troubleshooting](../troubleshooting.md#starting)). |
+| The card | `nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv` | `compute_cap` reads `8.6`, `8.9` or `12.0` and the card is one named above: from 0.10.0 a release is built for `86;120a`, which runs on all three, and the card's memory says which models load ([What it runs on](../start/index.md#what-it-runs-on)). The 0.9 releases are built for `120a`, which runs on `12.0` alone: on `8.6` or `8.9` a 0.9 release refuses to start, and the card needs 0.10.0 or the `develop` build. On any other `compute_cap` the server refuses to start, naming the card ([Troubleshooting](../troubleshooting.md#starting)). |
 | The driver | `nvidia-smi` | its header reads `CUDA Version: 13.x` or later. |
 | The system | | Windows or Linux on x86-64. The Linux archive needs glibc 2.39 or newer (`ldd --version`) and the CUDA 13 runtime; the container needs podman or docker with the NVIDIA container toolkit. |
 | Disk | | the model fits where the user wants to keep it: sizes in [What it serves](../start/index.md#what-it-serves). |
@@ -57,8 +57,8 @@ settings. The figures hold for those, not for any card.
 
 A card or a driver that fails means ignis will not run on this machine. Tell
 the user so, with the reason, rather than building it from source: a
-release's kernels are compiled for compute capabilities 8.6 and 12.0 and
-nothing else
+release's kernels are compiled for compute capabilities 8.6 and 12.0 from
+0.10.0, for 12.0 alone in the 0.9 releases, and nothing else
 ([Why not DGX Spark?](../guides/dgx-spark.md) explains it for the closest case).
 
 ## What the user decides
@@ -102,7 +102,10 @@ Ask before the install does anything large or visible:
    `gh release view --repo gpillon/ignis --json tagName --jq .tagName`, or the
    `tag_name` of `https://api.github.com/repos/gpillon/ignis/releases/latest`.
    The `develop` prerelease is a rolling development build: only when the user
-   asks for it.
+   asks for it. On an RTX 30 or RTX 40 card (`compute_cap` `8.6` or `8.9`) a
+   0.9 release refuses to start: that card needs 0.10.0 or later, and until
+   that release is out only the `develop` build runs on it, which is the
+   user's call.
 3. **Download, check, unpack**, with the commands on
    [Install](../start/install.md#release-archives) for that version: the
    SHA-256 check is part of them. On Linux,
@@ -179,8 +182,8 @@ model, set the same three in your harness's OpenAI-compatible provider.
 
 ## Testing a 16 GB card
 
-The `rtx-16gb` profile is derived from an RTX 5090 held inside a 16 GB
-budget: no real 16 GB card has run it
+The `rtx-16gb` profile (`rtx50-16gb` in the 0.9 releases) is derived from an
+RTX 5090 held inside a 16 GB budget: no real 16 GB card has run it
 ([the profile](../concepts/profiles.md#rtx-16gb)). A user who asks you to
 test ignis on their RTX 5060 Ti 16 GB, 5070 Ti or 5080 and report how it went
 gives the project its first real numbers. The reports are collected on

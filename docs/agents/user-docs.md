@@ -80,6 +80,27 @@ once a release is published (and again when its notes are edited). Specs,
 ADRs, findings and these agent docs stay in their own trees; the guide links
 to them for the reasons behind a behaviour.
 
+## Ahead of the release
+
+The guide describes the latest release: the newest `v*` tag, `git describe
+--tags --abbrev=0 --match 'v*'`, which `docs.yml` deploys. A user-visible
+change merged ahead of it is still documented in the same commit, as it will
+ship, and marked **"from X.Y.Z"** wherever a reader of the latest release
+would be misled: the sentence that introduces it on the page that owns it, the
+pages that say which cards and which build to take (`start/`,
+`paths/agent.md`), and a command or a value the release refuses. Where the
+release behaves otherwise, one clause says how ("the 0.9 releases are built
+for 12.0 alone"). Pages that only link to the owner carry no marking, and the
+generated `reference/` none.
+
+- **X.Y.Z is the next release's version**, the one the owner plans it as: the
+  markings already in the README and the guide name it
+  (`grep -rni "from 0\." README.md docs/user`). When none does, ask; never infer
+  it from the change.
+- **At release time** the version-bump commit removes that version's markings
+  and the clauses about the release before it, so the guide reads as the
+  release again (`grep -rni "from X.Y.Z" README.md docs/user`).
+
 ## How it is written
 
 - **What a user does and sees**: the command, the field, the request, the

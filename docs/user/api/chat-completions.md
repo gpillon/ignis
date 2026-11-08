@@ -96,7 +96,7 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   budget's answer reserve prevents.
 - Non-streaming returns `choices[].message.content` plus `usage`; streaming
   emits `chat.completion.chunk` SSE frames (token deltas, a final
-  `finish_reason` chunk, then `[DONE]`). The first token is sent alone as
+  `finish_reason` chunk, then `[DONE]`). From 0.10.0 the first token is sent alone as
   soon as the prompt's prefill ends, before any decode round, and each
   round's tokens follow it ([how ignis serves a request](../concepts/how-ignis-serves.md)).
   `usage.prompt_tokens_details.cached_tokens`

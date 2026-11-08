@@ -13,10 +13,14 @@ Every `v*` release publishes ignis three ways, all from the same compile:
 | **Linux `.tar.gz`** | Linux on x86-64, glibc 2.39 or newer (Ubuntu 24.04 or a distribution of its age) | an NVIDIA driver new enough for CUDA 13, and the CUDA 13 runtime (`libcudart.so.13`) |
 | **Container image** `ghcr.io/gpillon/ignis` | `linux/amd64`, under podman or docker with the NVIDIA container toolkit | the NVIDIA driver; the image carries the CUDA runtime |
 
-All three are compiled for compute capabilities 8.6 and 12.0 (`86;120a`): the
+From 0.10.0 all three are compiled for compute capabilities 8.6 and 12.0
+(`86;120a`): the
 RTX 5090, the RTX PRO 6000 and the 16 GB RTX 50 class, and the RTX 3090 and
 3090 Ti; the RTX 4090 and the 16 GB RTX 40 cards are expected to work, and
-reports are welcome. Which model loads on which of them is the table of
+reports are welcome. The 0.9 releases are compiled for 12.0 alone (`120a`),
+the RTX 50 and RTX PRO cards: an RTX 30 or RTX 40 card needs 0.10.0 or a
+[development build](#development-builds), which is compiled for `86;120a`.
+Which model loads on which of them is the table of
 [Where each model loads](../reference/models.md#where-each-model-loads)
 ([what it runs on](index.md#what-it-runs-on)); on any card
 the build is not compiled for, the server refuses to start, naming it. None carries a model: the server fetches one on first start, or you point it at a
