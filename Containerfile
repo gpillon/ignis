@@ -101,9 +101,10 @@ ENV IGNIS_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
 
 # The kernel leaf first, in a layer of its own that only kernel/ invalidates
 # (GitHub #552): `COPY . .` changes on every commit, so a leaf compiled after
-# it was compiled again on every push, ~8.5 minutes of nvcc on the release
-# runner. A layer's cache key is its files' contents, never their dates, so a
-# push that touches no kernel file finds this one in the cache.
+# it was compiled again on every push, 10 to 15 minutes of nvcc on the release
+# runner (903 s in this layer alone the first time). A layer's cache key is
+# its files' contents, never their dates, so a push that touches no kernel
+# file finds this one in the cache.
 COPY kernel/ kernel/
 RUN bash kernel/build.sh --archives-only
 
@@ -115,6 +116,11 @@ RUN bash kernel/build.sh --archives-only
 # build below finds every dependency compiled for the same target, profile
 # and features. No `--features cuda`: it turns on features of ignis's own
 # crates alone, none of a dependency's.
+#
+# The crates.io crate patched in vendor/ (Cargo.toml's [patch.crates-io]) is
+# no workspace member, and the recipe carries only the members: its sources
+# come in with the recipe, so the cook compiles it too.
+COPY vendor/ vendor/
 COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --release --locked --target x86_64-unknown-linux-gnu --recipe-path recipe.json
 

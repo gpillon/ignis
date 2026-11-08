@@ -254,6 +254,10 @@ fn the_container_build_compiles_the_leaf_in_a_layer_only_kernel_invalidates() {
     let recipe = at("\nCOPY --from=planner /src/recipe.json recipe.json\n");
     let cook = at("\nRUN cargo chef cook --release --locked --target x86_64-unknown-linux-gnu --recipe-path recipe.json\n");
     assert!(build_leaf < recipe && recipe < cook && cook < copy_all, "the dependencies are cooked from the recipe, after the leaf and before `COPY . .`");
+    // The patched crate in vendor/ is no workspace member, so the recipe does
+    // not carry it: without its sources the cook fails to read its manifest.
+    let vendor = at("\nCOPY vendor/ vendor/\n");
+    assert!(build_leaf < vendor && vendor < cook, "vendor/ is in place before the cook");
     let planner = containerfile.split(" AS planner\n").nth(1).and_then(|rest| rest.split("\nFROM ").next()).expect("a planner stage");
     assert!(planner.contains("RUN cargo chef prepare --recipe-path recipe.json"), "{planner}");
     let chef = containerfile
