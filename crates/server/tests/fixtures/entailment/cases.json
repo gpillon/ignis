@@ -12,7 +12,7 @@
     "build": "main 1188385c",
     "card": "RTX 5090",
     "rule": "A case is a gate when it is right by at least one logit taken as the minimum over every arm (signed margin = logit when expected is true, minus logit when false), and the gate holds at least one case of each label. A known failure is wrong on every arm. Every other case is a watch case.",
-    "logit": "ln(p/(1-p)) of the answer's noul, to three decimals; the logits are bf16, so they move in steps of 0.125.",
+    "logit_definition": "ln(p/(1-p)) of the answer's noul, to three decimals; the logits are bf16, so they move in steps of 0.125.",
     "arms": [
       {
         "name": "h-vendored",

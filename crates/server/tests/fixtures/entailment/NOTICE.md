@@ -40,10 +40,9 @@ RTX 5090 (2026-11-08, main 1188385c), taken over every route the card runs
 rather than one: a case near the 0.5 line falls on either side under any
 change of the numerics, and asserting it reports the change, not a fault.
 
-The rule: a case is a `gate` when it is right by at least one logit, taken
-as the minimum over every arm below, and the gate holds at least one case of
-each label. A `known_failure` is wrong on every arm. Every other case is a
-`watch` case.
+One rule gives each case its tier from its logits over the arms below:
+`measurement.rule` in `cases.json`, which `tier_by_rule` in
+`crates/server/tests/support/entailment.rs` applies.
 
 The measurement set, five arms:
 
@@ -60,13 +59,9 @@ rule, the date, the build, the command that redoes each arm and every
 case's logit in every arm are in `cases.json`: `measurement`, and `logits`
 on each case. `decide_entailment_fixture.rs` fails when a case's tier is not
 the one the rule gives from its logits, when a case has no tier, or when a
-label has no gate case.
-
-| tier | cases | meaning |
-|------|-------|---------|
-| `gate` | 1, 2, 4-9, 11, 14, 15 | asserted by `decide_entailment_gpu.rs` on the card's default route |
-| `watch` | 3, 10, 12, 16-18 | printed |
-| `known_failure` | 13 | right label, wrong answer on every arm (date arithmetic); printed |
+label has no gate case. Which case is which tier is `cases.json`'s record
+alone: `decide_entailment_gpu.rs` asserts the `gate` cases on the card's
+default route and prints the `watch` and `known_failure` ones.
 
 It is committed rather than fetched because `decide_entailment_gpu.rs` is
 a GPU-profile test: under `IGNIS_GPU_PROFILE=1` a missing fixture is a hard

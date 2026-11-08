@@ -3,20 +3,18 @@
 //! eighteen synthetic account-planning cases, one fixed question whose
 //! `criteria` define "support" as entailment rather than plausibility.
 //!
-//! **Only `gate` cases are asserted**, on the card's default route. A case
-//! is a gate when it is right by at least one logit taken as the minimum
-//! over every route measured, and the gate holds a case of each label; a
-//! `watch` case is not clear of the 0.5 line on some route, where a change
-//! of the numerics flips it without anything being broken; a `known_failure`
-//! (case 13, date arithmetic) has the right label and the model gets it
-//! wrong on every route. Both are printed, never asserted. Every line prints
+//! **Only `gate` cases are asserted**, on the card's default route; `watch`
+//! and `known_failure` cases are printed, never asserted. Which case is which
+//! tier follows from its logits on every route measured, by the fixture's
+//! one rule (`measurement.rule`, applied by `entailment::tier_by_rule`), so a
+//! watch case flipping is the numerics moving, not a fault. Every line prints
 //! the logit too: `noul` probabilities move in steps of 0.125 logit (the
 //! logits are bf16), so a drift reads in steps rather than in decimals.
 //!
 //! The tiers come from one measurement of five arms, recorded in the
 //! fixture's `measurement` with its date, build, card, the command that
-//! redoes each arm and every case's logit in every arm (`NOTICE.md` states
-//! the rule and the set). The card's default route runs ignis's GDN prefill
+//! redoes each arm and every case's logit in every arm (`NOTICE.md` tells
+//! the set's provenance). The card's default route runs ignis's GDN prefill
 //! (GitHub #536); `IGNIS_GDN_PREFILL=vendored` runs this test on the vendored
 //! one, where the same gates must hold.
 //!

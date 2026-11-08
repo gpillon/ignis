@@ -9,22 +9,22 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use ignis_core::{GdnPrefill, PrefillAttention};
+use serde::de::{Deserializer, Error as _};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
-/// What a case's label means to the GPU run.
+/// What a case's label means to the GPU run. Which tier a case takes follows
+/// from its logits by the fixture's rule ([`tier_by_rule`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
-    /// The label is asserted: right by at least one logit on every arm
-    /// the fixture's `measurement` lists.
+    /// The label is asserted.
     Gate,
-    /// Not clear of the 0.5 line on every arm, where a change of the
-    /// numerics can flip it. Printed, not asserted.
+    /// Printed, not asserted.
     Watch,
-    /// The label is right and the model gets it wrong on every arm.
-    /// Printed, not asserted; one that starts passing is a candidate for
-    /// `gate`.
+    /// The label is right and the model gets it wrong. Printed, not
+    /// asserted; one that starts passing is a candidate for `gate`.
     KnownFailure,
 }
 
@@ -41,15 +41,32 @@ pub struct Case {
     pub note: String,
 }
 
-/// One route the tiers were measured on.
+/// One route the tiers were measured on, its routes in the spellings the
+/// measurement switch and the option take.
 #[derive(Debug, Deserialize)]
 pub struct Arm {
     pub name: String,
     pub surface: String,
-    pub gdn_prefill: String,
-    pub prefill_attention: String,
+    #[serde(deserialize_with = "gdn_prefill")]
+    pub gdn_prefill: GdnPrefill,
+    #[serde(deserialize_with = "prefill_attention")]
+    pub prefill_attention: PrefillAttention,
     /// What to run to redo the arm.
     pub redo: String,
+}
+
+/// `IGNIS_GDN_PREFILL`'s two values.
+fn gdn_prefill<'de, D: Deserializer<'de>>(deserializer: D) -> Result<GdnPrefill, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    [GdnPrefill::Ours, GdnPrefill::Vendored]
+        .into_iter()
+        .find(|route| route.as_str() == name)
+        .ok_or_else(|| D::Error::custom(format!("unknown GDN prefill `{name}` (expected `ours` or `vendored`)")))
+}
+
+/// `--model-prefill-attention`'s values.
+fn prefill_attention<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PrefillAttention, D::Error> {
+    PrefillAttention::parse(&String::deserialize(deserializer)?).map_err(D::Error::custom)
 }
 
 /// The one measurement the tiers come from (see `NOTICE.md`).
@@ -58,8 +75,11 @@ pub struct Measurement {
     pub date: String,
     pub build: String,
     pub card: String,
+    /// The rule that gives each case its tier, in words: [`tier_by_rule`]
+    /// applies it.
     pub rule: String,
-    pub logit: String,
+    /// What a logit is: the quantity every case's `logits` record.
+    pub logit_definition: String,
     pub arms: Vec<Arm>,
 }
 

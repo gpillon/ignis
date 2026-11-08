@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use ignis_core::{GdnPrefill, PrefillAttention};
 use ignis_server::decide::{DecideRequest, QuestionKind};
 
 #[path = "support/entailment.rs"]
@@ -61,17 +62,29 @@ fn the_inversion_pairs_share_a_claim_and_split_the_label() {
 
 /// The tiers are what the GPU run asserts, and each follows the rule from
 /// the case's recorded logits: `load` fails on a tier the logits do not give,
-/// on a case with no tier, and on a label with no gate case. Nothing here
-/// pins which case is which tier, so a new measurement is a data change.
+/// on a case with no tier, on a case with no logit on an arm, and on a label
+/// with no gate case. Nothing here pins which case is which tier, so a new
+/// measurement is a data change; the arms must cover both GDN prefill routes
+/// and the int8 band.
 #[test]
 fn every_case_has_a_tier_the_rule_gives_and_each_label_has_a_gate_case() {
     let fixture = entailment::load();
     let arms = &fixture.measurement.arms;
-    assert!(arms.iter().any(|arm| arm.gdn_prefill == "ours"));
-    assert!(arms.iter().any(|arm| arm.gdn_prefill == "vendored"));
-    assert!(arms.iter().any(|arm| arm.prefill_attention == "int8"));
-    for case in &fixture.cases {
-        assert_eq!(case.logits.len(), arms.len(), "case {}", case.id);
+    assert!(arms.iter().any(|arm| arm.gdn_prefill == GdnPrefill::Ours));
+    assert!(arms.iter().any(|arm| arm.gdn_prefill == GdnPrefill::Vendored));
+    assert!(arms.iter().any(|arm| arm.prefill_attention == PrefillAttention::Int8));
+}
+
+/// An arm names its routes in the spellings the switch and the option take,
+/// so a route nothing runs fails the check.
+#[test]
+fn an_arm_naming_an_unknown_route_fails_the_check() {
+    let text = std::fs::read_to_string(entailment::path()).expect("the fixture");
+    for (field, route) in [("gdn_prefill", "chunked"), ("prefill_attention", "fp4")] {
+        let mut json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+        json["measurement"]["arms"][0][field] = route.into();
+        let error = entailment::parse(&json.to_string()).expect_err("an unknown route");
+        assert!(error.contains(route), "{error}");
     }
 }
 
