@@ -6,7 +6,7 @@
 #[path = "support/round_shapes.rs"]
 mod round_shapes;
 
-use round_shapes::{bf16_ulp, judge, replay, span_tokens, Numerics, Replay, Shape, Verdict, VerifyRound};
+use round_shapes::{bf16_ulp, judge, span_tokens, Numerics, Shape, Verdict, VerifyRound};
 
 fn shape(decode_pick: f32, verify_pick: f32) -> Shape {
     Shape { decode_pick, verify_pick }
@@ -127,8 +127,9 @@ fn the_verdict_names_the_clauses_that_held() {
     );
 }
 
-/// A speculative run of a 90-token prompt: round 0 commits its anchor and two
-/// drafts, round 1 every column, round 2 its anchor and one draft.
+/// A speculative run of a 90-token prompt (`text[0]` at position 90): round 0
+/// commits its anchor and two drafts, round 1 every column, round 2 its
+/// anchor and one draft.
 fn run() -> Vec<VerifyRound> {
     vec![
         VerifyRound { base: 90, extent: 7, committed: 3 },
@@ -137,39 +138,89 @@ fn run() -> Vec<VerifyRound> {
     ]
 }
 
-/// The diagnosed split: the 4th token is drawn at position 92, column 2 of
-/// the first round, whose history is the prompt alone.
+/// A round's column `j` at `base + j` drew the token after it, so the row is
+/// the drawing position's offset from the round's base. Its last committed
+/// column drew its correction, the pending token the next round takes as its
+/// anchor: the diagnosed split (`colour/detail`, token 3, drawn at position 92)
+/// is round 0's row 2, not round 1's, whose anchor it is.
 #[test]
-fn a_split_in_the_first_round_reads_its_row_after_the_prompt_alone() {
-    assert_eq!(replay(&run(), 8, 92), Some(Replay { round: 0, history: vec![], span: 90..98, row: 2 }));
-    assert_eq!(replay(&run(), 8, 90), Some(Replay { round: 0, history: vec![], span: 90..98, row: 0 }));
+fn the_row_is_the_column_of_the_round_that_drew_the_token() {
+    let rounds = run();
+    assert_eq!(rounds[0].row(90, 1), Some(0));
+    assert_eq!(rounds[0].row(90, 3), Some(2));
+    assert_eq!(rounds[0].row(90, 4), None);
+    assert_eq!(rounds[1].row(90, 3), None);
+    assert_eq!(rounds[1].row(90, 4), Some(0));
+    assert_eq!(rounds[1].row(90, 11), Some(7));
+    assert_eq!(rounds[1].row(90, 12), None);
+    assert_eq!(rounds[2].row(90, 12), Some(0));
+    assert_eq!(rounds[2].row(90, 13), Some(1));
+    assert_eq!(rounds[2].row(90, 14), None);
 }
 
-/// A later round's history is every earlier round, each one span from its
-/// base over the columns it committed; the judged round is one span of the
-/// verify's width from its own base, whatever its extent.
+/// The prompt's last position drew the first token, in both runs alike: no
+/// round drew it.
 #[test]
-fn a_split_in_a_later_round_replays_every_earlier_round_as_one_span() {
-    assert_eq!(replay(&run(), 8, 100), Some(Replay { round: 1, history: vec![90..93], span: 93..101, row: 7 }));
-    assert_eq!(
-        replay(&run(), 8, 101),
-        Some(Replay { round: 2, history: vec![90..93, 93..101], span: 101..109, row: 0 })
-    );
-    assert_eq!(
-        replay(&run(), 8, 102),
-        Some(Replay { round: 2, history: vec![90..93, 93..101], span: 101..109, row: 1 })
-    );
-    let short = [VerifyRound { base: 90, extent: 2, committed: 1 }];
-    assert_eq!(replay(&short, 8, 90), Some(Replay { round: 0, history: vec![], span: 90..98, row: 0 }));
+fn no_round_drew_token_0() {
+    for round in run() {
+        assert_eq!(round.row(90, 0), None);
+    }
 }
 
-/// The prompt's last position drew the first token, in both runs alike, and
-/// past the last round's commit no round drew anything.
+/// The decode rounds' text after the prompt: 14 tokens, `text[0]` at
+/// position 90.
+fn off() -> Vec<i32> {
+    (100..114).collect()
+}
+
+/// A speculative run's text after a round, its pending token last: the
+/// decode text before token `split`, then other tokens through token
+/// `len - 1`.
+fn departing(split: usize, len: usize) -> Vec<i32> {
+    off()[..split].iter().copied().chain((split..len).map(|i| 900 + i as i32)).collect()
+}
+
+/// The diagnosed split is round 0's correction: the run's text after round 0,
+/// its anchor, two drafts and its pending token, departs at token 3, which
+/// round 0's last column drew. Round 0 keeps its snapshot; round 1, whose
+/// anchor that token is, does not.
 #[test]
-fn a_token_no_round_drew_has_no_replay() {
-    assert_eq!(replay(&run(), 8, 89), None);
-    assert_eq!(replay(&run(), 8, 103), None);
-    assert_eq!(replay(&[], 8, 90), None);
+fn the_round_whose_correction_departs_keeps_its_snapshot() {
+    let rounds = run();
+    assert!(rounds[0].drew_the_departure(90, &off(), &departing(3, 4)));
+    assert!(!rounds[1].drew_the_departure(90, &off(), &departing(3, 12)));
+}
+
+/// A departure at an accepted draft: round 0's draws all agree, so it drops
+/// its snapshot; round 1 drew token 10 at its row 6 and keeps its own; round 2
+/// comes after it and keeps nothing.
+#[test]
+fn the_first_round_whose_draws_depart_keeps_its_snapshot() {
+    let rounds = run();
+    assert!(!rounds[0].drew_the_departure(90, &off(), &departing(4, 4)));
+    assert!(rounds[1].drew_the_departure(90, &off(), &departing(10, 12)));
+    assert_eq!(rounds[1].row(90, 10), Some(6));
+    assert!(!rounds[2].drew_the_departure(90, &off(), &departing(10, 14)));
+}
+
+/// A round whose draws all agree with the decode text drops its snapshot,
+/// also when its pending token lies past the decode text's end: the decode
+/// rounds stopped there, so no token of theirs departs.
+#[test]
+fn a_round_whose_draws_all_agree_drops_its_snapshot() {
+    let rounds = run();
+    assert!(!rounds[0].drew_the_departure(90, &off(), &off()[..4]));
+    assert!(!rounds[1].drew_the_departure(90, &off(), &off()[..12]));
+    assert!(!rounds[0].drew_the_departure(90, &off()[..3], &departing(3, 4)));
+}
+
+/// A run whose very first token departs departs at the prompt's own draw: no
+/// round keeps a snapshot for it.
+#[test]
+fn no_round_keeps_a_snapshot_for_token_0() {
+    let rounds = run();
+    assert!(!rounds[0].drew_the_departure(90, &off(), &departing(0, 4)));
+    assert!(!rounds[1].drew_the_departure(90, &off(), &departing(0, 12)));
 }
 
 /// A span's tokens are the decode text at its positions, and past the text's
