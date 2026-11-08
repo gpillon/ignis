@@ -1,6 +1,110 @@
+---
+status: accepted
+amends: [ADR-0017, ADR-0023, ADR-0024, ADR-0029, ADR-0030]
+amended-by: [ADR-0054]
+---
+
 # ADR 0045 — the KV pool is sized by whether the model is resident, and evicted state goes down to disk
 
-## Status
+## Current decision
+
+What holds today, checked against the code on 2026-11-08. The History below
+keeps the reasons, and the flag names of its time: the flags now sit in the
+configuration's sections, as `--vram-kv-pool-bytes`,
+`--model-default-max-tokens`, `--vram-allow-expert-cache-below-floor`,
+`--model-max-context` and `--reuse-kv-host-pool-bytes`
+([the configuration reference](../user/reference/configuration.md)).
+
+**The KV pool is sized by residency.** A resident load, every weight on the
+device (the 27B always, Flash-Next on a card that holds every expert
+projection beside the minimum pool), gives the pool the rest of the budget;
+since ADR 0054 a resident Flash-Next load also keeps its experts only in
+VRAM, with no host expert pool. An offloaded load, Flash-Next's experts
+streaming as on the RTX 5090, reserves the pool first, 524,288 tokens capped
+at every lane's whole context and floored at one `--model-max-context`
+sequence plus a page per retained slot (`offloaded_default_pages` in
+`crates/core/src/vram.rs`), and the expert cache takes the rest. A named
+`--vram-kv-pool-bytes`, in bytes or as `<n>tok`, replaces the policy's size on
+both models. The expert cache's 12 GiB floor refuses the start unless
+`--vram-allow-expert-cache-below-floor` (Flash-Next only).
+
+**P0 chose the fixed branch, and the fixed branch is what was built** (#309;
+[the finding](../findings/2026-10-08-kv-page-growth-gate.md): growing a page
+at a time moved the 27B's decode ITL p99 past the owner's rule). A request
+reserves its whole bound at admission: the prompt plus its explicit cap, else
+`--model-default-max-tokens` (38,912 by default, its reasoning included; `0`
+is up to the context), never past `--model-max-context`. The default lives in
+`SchedulerConfig::default_max_tokens`, read by `generation_budget`.
+Reservations never grow and the leaf maps a sequence whole. The growth branch
+has nothing in the code (no `ignis_seq_grow`, no lane parked for want of a
+page, no `ignis_kv_lane_parks_total`), its spike was never merged, and growth
+was never re-gated at the 32-page step the finding names as the first thing to
+measure.
+
+**Only an admission moves a live sequence, and no work is lost.** Short of
+pages, an admission gives up retained state first, then what lower-ranked
+waiting requests claimed (#445), then moves the lowest-ranked live sequence
+below it down a tier, KV-RAM else KV-disk, mid-generation, and only when that
+makes the whole room; the sequence resumes bit-exact. Rank is class
+(`Interactive` above `Agent`), then submission order (`Rank` in
+`crates/core/src/admission.rs`). A restore never moves anything, and entries
+onto the device, restores and admissions alike, are taken in rank order.
+KV-RAM moves go a window at a time on a transfer stream (on Flash-Next 16 MiB
+onto the device and 12 MiB off it, the 27B in one window), and a victim counts
+as freeing its reservation and the links of its prefix chain that only
+retained state and lower-ranked waiting claims hold (#444, #445).
+
+**Tier 2, KV-disk, is built** (`crates/runtime/src/kv_disk.rs`). It is on by
+default on Flash-Next at 4 GiB and off on the 27B (`--kv-disk-bytes`;
+`--kv-disk-path` takes the n-gram cache's locations). The budget is a ceiling,
+cut at start to the volume's free space less 10 GiB. One file per blob, in a
+directory the process locks and removes at shutdown, stale ones removed at
+start: v1 keeps nothing across a restart. Each file opens with a 4 KiB header
+carrying #205's identity and a CRC32 per window. Two IO threads move 32 MiB
+windows, unbuffered, through a 64 MiB pinned staging (`kv_disk_staging`), and
+yield to a prefill's n-gram gather. A blob comes back straight to the device;
+retained state only past a restore floor of 8,192 tokens on Flash-Next and
+16,384 on the 27B. With the tier on, an evicted live sequence is never
+discarded to make room, and when no tier has room the request waits. The
+disk's families (`tier="disk"`, `ignis_kv_disk_bytes`,
+`ignis_kv_disk_spills_total`, `ignis_kv_disk_failures_total`) render only on a
+load with the tier.
+
+**The *(agent proposal)* markers in the History**, each as it stands (the two
+notes in Status that explain the marker aside):
+
+- the KV-RAM move pace, 16 MiB in and 12 MiB out: built, constants
+  `MOVE_IN_WINDOW_BYTES` and `MOVE_OUT_WINDOW_BYTES` in
+  `crates/runtime/src/lib.rs`;
+- #444, a victim frees its prefix chain: built (coordinator decision);
+- #445, a waiting claim yields to an entry ranked above it: built
+  (coordinator decision);
+- the offloaded default's cap and floor: built;
+- rank gating the victim: built;
+- entry, a restore moves nothing and entries go in rank order: built, with
+  the fixed branch's entry room, the reservation;
+- the 32-page growth step, the entry room of four steps and the leaf's
+  `ignis_seq_grow`: not built, as the growth branch they belong to lost P0
+  (that section is cut to a pointer below);
+- the name `--default-max-tokens`: built, now `--model-default-max-tokens`;
+- one home, `SchedulerConfig::default_max_tokens`: built;
+- the pool flag's token form: built;
+- KV-disk's defaults: built at the owner's 4 GiB on Flash-Next, not the
+  proposed 16 GiB, and off on the 27B;
+- the budget as a ceiling: built (`effective_budget`, `VOLUME_MARGIN_BYTES`);
+- one file per blob: built;
+- the restore floors: built (`restore_floor_tokens`);
+- the IO: built;
+- restart, nothing reused: built (`DiskDir`);
+- observability: built, but for `ignis_kv_lane_parks_total`, a growth-branch
+  series.
+
+## History
+
+The ADR as accepted on 2026-10-07 and amended in place until 2026-11-01, its
+headings one level down. The growth branch, never built, is cut to a pointer.
+
+### Status
 
 Accepted (2026-10-07). The owner decided the pool policy and its 524,288-token
 default, kept the expert cache floor as a refusal with an opt-in to start below
@@ -189,7 +293,7 @@ Sources: [Flash-Next on the 5090](../findings/2026-10-06-flash-next-on-the-5090.
 (`.scratch/disk-bench/RESULTS.md`, 2026-09-29; untracked, local to the owner's
 clone), GitHub #205 (the owner's Tier 2 header decision and its RoPE comment).
 
-## Context
+### Context
 
 - **The 27B's pool takes the rest** of the VRAM budget (ADR 0030). Every weight
   is on the device, so the rest has no other use.
@@ -254,9 +358,9 @@ clone), GitHub #205 (the owner's Tier 2 header decision and its RoPE comment).
 - **Qwen recommends 38,912 tokens of output** for complex tasks, reasoning
   included.
 
-## Decision
+### Decision
 
-### The KV pool follows residency
+#### The KV pool follows residency
 
 **The pool is sized by whether every weight is on the device (owner).**
 
@@ -289,14 +393,14 @@ clone), GitHub #205 (the owner's Tier 2 header decision and its RoPE comment).
   retained slot (ADR 0030's floor, now on both models). A smaller pool refuses
   the start, naming the knobs.
 
-### Reservations: a measurement gate, then growth or a fixed reservation; live sequences move down a tier either way
+#### Reservations: a measurement gate, then growth or a fixed reservation; live sequences move down a tier either way
 
 **When the pool runs out, the lowest-ranked sequence below the requester moves
 down a tier and later resumes where it stopped: no work lost, never a 503
 (owner, 2026-10-08).** A measurement decides first whether reservations also
 grow page by page (owner). Both models, one mechanism.
 
-#### The gate: P0
+##### The gate: P0
 
 - **Why measure.** Today `ignis_seq_alloc` does everything for every page of
   a sequence at once: it reserves them, maps them, binds the block-table row
@@ -325,7 +429,7 @@ grow page by page (owner). Both models, one mechanism.
   steps, so a pass at one page covers it.
 - **P0's code is a spike.** It lands only with the growth branch, inside P3.
 
-#### Both branches
+##### Both branches
 
 - **The bound.** It is the prompt plus the request's generation cap (below),
   never past `--max-context`.
@@ -384,70 +488,16 @@ grow page by page (owner). Both models, one mechanism.
   (KV-RAM; a window at a time since AC 37's follow-up) or the disk tier's
   windowed spill (Tier 2, below). The return is `restore_pass`.
 
-#### The growth branch: P0 passes
+##### The growth branch: P0 passes
 
-**A request reserves what it has used plus a step, and takes pages as it
-generates.**
+Not built, since P0 chose the fixed branch below
+([the finding](../findings/2026-10-08-kv-page-growth-gate.md)): the branch's
+design, a reservation of the prompt plus a 32-page step that grows as the lane
+decodes, a lane that parks, an entry room of four steps, a last resort and
+`ignis_seq_grow` in the leaf, is in this file as of commit 606b5335 and in
+spec `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
 
-- **The reservation is what the pool has given the request.** At admission it
-  is the prompt (the tail past a claimed prefix, as today) plus **one growth
-  step**.
-- **The growth step is 32 pages, 2,048 tokens, on both models** *(agent
-  proposal)*.
-  - From its first round a decode lane keeps **at least one step of room
-    ahead** of its position. When its room drops below a step, it asks for one
-    more, capped at its bound.
-  - The step is small against the pool: 32 of 8,192 pages, so three lanes
-    over-reserve at most ~2.3% (two steps each).
-  - It is large against a move. A step is ~20 s of decode at ~100 tok/s, so a
-    victim's disk spill (~1 s for a whole-context Flash-Next blob) completes
-    while the lane still decodes on its room.
-  - A prompt never grows: admission reserves all of it.
-  - A request whose bound is within one step of its prompt (a decision, a
-    constrained decode, a small `max_tokens`) reserves its whole bound at
-    admission and never grows, exactly as today.
-- **A lane that runs out parks.** When its room is below one round's largest
-  append (1 token, or the draft window plus one under speculation) and no page
-  can be had yet, the lane is held out of decode rounds. It keeps its pages
-  and resumes at the first advance with room. A parked lane is not decoding,
-  so it is among the first victims of a higher-ranked need.
-- **Entry room: four growth steps** *(agent proposal)*. A sequence enters the
-  device when the free pages cover its reservation plus four growth steps
-  (8,192 tokens), for it and for every resident live sequence that ranks
-  above it. For a sequence closer than that to its bound, the room counted is
-  what it can still grow.
-  - Everyone above a returning sequence can then grow about four steps before
-    the pool is short again. Two equal sequences that cannot both fit
-    therefore swap at most once per ~8,192 tokens of the younger one's
-    progress.
-  - At the default pool there is no cycle at all. 8,192 pages are exactly two
-    262,144-token sequences, so at three lanes at most one whole-context
-    sequence is ever below the device. It returns when one of the two
-    finishes.
-- **The last resort.** Suppose every resident live sequence is parked and no
-  tier can take a victim: the disk refuses writes, or no tier exists. Then the
-  lowest-ranked parked sequence is discarded and re-queued (re-prefill,
-  today's KV-RAM loss), with an ERROR naming the tier that refused, as a
-  `SnapshotDropped`. On a load with KV-disk and room on it, this never
-  happens.
-- **The leaf** *(agent proposal)*.
-  - `ignis_seq_alloc` and its two siblings (`_shared`, `_from_checkpoint`)
-    map the reservation they are given, prompt plus a step, instead of the
-    bound.
-  - A new `ignis_seq_grow(pool, seq, context_tokens)` grows a sequence, P0's
-    operation made whole:
-    - it raises the entitlement (`set_page_entitlement`);
-    - it maps the new pages (`materialize_pages`) and zeroes them, as an
-      allocation does;
-    - it publishes the block-table range, between rounds on the model stream.
-  - It refuses with the pool unchanged when the pages are not free, past
-    `--max-context`, and on a sequence whose windowed restore is incomplete.
-  - A restore maps the blob's tokens plus one step.
-  - A sequence grown step by step is byte-identical to one mapped whole.
-- Growth is a third caller of the move path, beside admission and the head's
-  lane deal.
-
-#### The fixed branch: P0 fails
+##### The fixed branch: P0 fails
 
 **A request reserves its whole bound at admission, and only the live moves
 are added.**
@@ -469,7 +519,7 @@ are added.**
   cannot be placed waits, and every sequence on the device keeps decoding to
   its end.
 
-### A server default for `max_tokens`
+#### A server default for `max_tokens`
 
 **A request that names no cap generates at most `--default-max-tokens`
 tokens, 38,912 by default, its reasoning included (owner, 2026-10-08).**
@@ -502,7 +552,7 @@ tokens, 38,912 by default, its reasoning included (owner, 2026-10-08).**
   becomes finite. On the fixed branch, the same number also sizes the
   admission reservation.
 
-### `--kv-pool-bytes` names the pool on both models
+#### `--kv-pool-bytes` names the pool on both models
 
 **The existing flag, honoured on both models and both branches, with a token
 form *(agent proposal)*.**
@@ -524,7 +574,7 @@ form *(agent proposal)*.**
 - **Not a new flag.** One quantity gets one flag with two spellings, rather
   than two flags that must refuse each other.
 
-### The expert cache floor stays, with an opt-in
+#### The expert cache floor stays, with an opt-in
 
 **Below `EXPERT_CACHE_FLOOR_BYTES` (12 GiB) the start is refused by default
 (owner).**
@@ -538,7 +588,7 @@ form *(agent proposal)*.**
   step.
 - A 27B load refuses the flag, as it refuses `--decode-lanes`.
 
-### Tier 2: KV-disk
+#### Tier 2: KV-disk
 
 **When KV-RAM must give a blob up, the blob goes to disk instead of nowhere.
 When KV-RAM cannot take a device victim, the victim goes straight to disk
@@ -660,7 +710,7 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
     directory is the process's own. It must also keep pace with 3 GB/s reads
     on a CPU without SHA extensions.
 
-### Observability *(agent proposal)*
+#### Observability *(agent proposal)*
 
 - **`tier="disk"` is exported** on the six retained-state families
   (`ReuseSource::Disk`; request-log spelling `disk`).
@@ -689,7 +739,7 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
 - **The Playground Monitor's disk row goes live.** ADR 0017 reserved it as
   inert.
 
-## Considered options
+### Considered options
 
 - **Rest-to-pool on Flash-Next too.** It starves the expert cache, which sets
   decode speed.
@@ -756,7 +806,7 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
   would each re-derive the context clamp. `generation_budget` already does it
   once for every entry point.
 
-## Consequences
+### Consequences
 
 - **P3 waits on P0's verdict.** The spec carries both branches' criteria,
   each marked, and the branch P0 rejects is not built.
