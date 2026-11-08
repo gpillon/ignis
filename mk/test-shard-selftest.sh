@@ -122,8 +122,8 @@ commands() {
     status=$?
 }
 commands 1 1
-want='cargo test --workspace --locked --target x86_64-test-target --bins --lib --test eta --test on_by_default --test shared --test zeta
-cargo test --workspace --locked --target x86_64-test-target --doc
+want='cargo test --workspace --no-fail-fast --locked --target x86_64-test-target --bins --lib --test eta --test on_by_default --test shared --test zeta
+cargo test --workspace --no-fail-fast --locked --target x86_64-test-target --doc
 cargo build --workspace --locked --target x86_64-test-target --examples'
 [ "$(cat "$dir/cargo.log")" = "$want" ] \
     && ok "one shard is one cargo test --workspace with its target flags, the doc tests and the examples' build" \
@@ -132,8 +132,8 @@ cargo build --workspace --locked --target x86_64-test-target --examples'
     && ok "a failing command fails the shard, naming it, after the others ran" \
     || fail "a failing command fails the shard (exit $status)"
 commands 2 4
-want='cargo test --workspace --locked --target x86_64-test-target --test on_by_default
-cargo test --workspace --locked --target x86_64-test-target --doc'
+want='cargo test --workspace --no-fail-fast --locked --target x86_64-test-target --test on_by_default
+cargo test --workspace --no-fail-fast --locked --target x86_64-test-target --doc'
 [ "$(cat "$dir/cargo.log")" = "$want" ] && [ "$status" = 0 ] \
     && ok "a shard runs only its own units" \
     || fail "a shard runs only its own units: $(tr '\n' '|' < "$dir/cargo.log") (exit $status)"

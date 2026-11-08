@@ -17,7 +17,9 @@ fn repo() -> PathBuf {
 
 fn read(path: &str) -> String {
     let path = repo().join(path);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    // A checkout that turns LF into CRLF (the Windows runner's) still holds
+    // the same recipe.
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())).replace("\r\n", "\n")
 }
 
 fn workflow() -> Value {

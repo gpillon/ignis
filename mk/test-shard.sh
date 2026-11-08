@@ -35,8 +35,10 @@
 # this script has never seen) is refused, so a change to the workspace cannot
 # drop or add a test without failing here first.
 #
-# Every command of a shard runs even after one fails, and the shard fails if
-# any did.
+# Every command of a shard runs even after one fails, each runs every test
+# binary it selects even after one fails (`--no-fail-fast`: a shard holds ~80
+# of them, and plain `cargo test` stops at the first, hiding the rest), and
+# the shard fails if any did.
 #
 # IGNIS_TEST_SHARD_METADATA names a file to read in place of `cargo metadata`
 # (mk/test-shard-selftest.sh).
@@ -121,10 +123,10 @@ run() {
     "$@" || failed+=("$*")
 }
 if [ ${#flags[@]} -gt 0 ]; then
-    run cargo test --workspace --locked --target "$target" "${flags[@]}"
+    run cargo test --workspace --no-fail-fast --locked --target "$target" "${flags[@]}"
 fi
 if [ "$doc" = 1 ]; then
-    run cargo test --workspace --locked --target "$target" --doc
+    run cargo test --workspace --no-fail-fast --locked --target "$target" --doc
 fi
 if [ "$examples" = 1 ]; then
     run cargo build --workspace --locked --target "$target" --examples
