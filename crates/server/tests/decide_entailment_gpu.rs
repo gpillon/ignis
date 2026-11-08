@@ -16,8 +16,9 @@
 //! The tiers come from one measurement of five arms, recorded in the
 //! fixture's `measurement` with its date, build, card, the command that
 //! redoes each arm and every case's logit in every arm (`NOTICE.md` states
-//! the rule and the set). `IGNIS_GDN_PREFILL=ours` runs this test on ignis's
-//! GDN prefill: the same gates must hold there.
+//! the rule and the set). The card's default route runs ignis's GDN prefill
+//! (GitHub #536); `IGNIS_GDN_PREFILL=vendored` runs this test on the vendored
+//! one, where the same gates must hold.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or an unavailable GPU is a **skip**; under the profile

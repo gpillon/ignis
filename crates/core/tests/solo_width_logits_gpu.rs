@@ -80,7 +80,9 @@ fn prefill_at_the_chunk(model: &Model, pool: &SeqPool, span: &[i32], vocab: usiz
 }
 
 /// The GDN prefill's measurement switch set to `ours`, the route an 8.x card
-/// runs, for this binary's one test (the leaf reads it at each load).
+/// runs, for this binary's one test (the leaf reads it at each load). A
+/// Blackwell card runs it unset too since GitHub #536; named, the test keeps
+/// the 8.x routes whatever the card's default.
 struct OurGdnPrefill;
 
 impl OurGdnPrefill {

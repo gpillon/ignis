@@ -44,10 +44,12 @@ length of the whole prefill, a gap of about 3.8 s
 lane pauses for one chunk at a time, and `model.decode_share` sets how much of
 the card the decoding lanes keep while a prompt prefills.
 
-Prefill itself reads a cold 46K-token prompt at **9,717 tok/s** and a 105K one at
-7,865 on the 5090. Since 0.7.3 its attention reads the compressed KV directly
+Prefill itself reads a cold 46K-token prompt at **11,344 tok/s** and a 105K one at
+9,008 on the 5090. Since 0.7.3 its attention reads the compressed KV directly
 instead of expanding it into BF16 first, which made it 30% faster at 46K and
-53% at 105K, and the `rtx5090` profile prefills 2,048 tokens a chunk.
+53% at 105K, and the `rtx5090` profile prefills 2,048 tokens a chunk. ignis's
+own gated delta net prefill kernels, Blackwell's route since they measured
+faster there, add 4.8% at 46K and 3.9% at 105K against the vendored ones.
 
 The path of a request through the scheduler, step by step:
 [How ignis serves a request](../concepts/how-ignis-serves.md).
@@ -63,7 +65,8 @@ The path of a request through the scheduler, step by step:
 | Graph submission about 370 us, 2.2% of the round; device idle 4.8% (2.27% at eight lanes) | one lane | same |
 | Round **32.18 ms** at eight lanes | eight lanes, 8 s window | [Top-k, one warp per column](../../findings/2026-09-18-dflash2-topk-one-warp-per-column.md) |
 | **367 tok/s** one lane, **1,065 tok/s** the same eight prompts at once | eight coding prompts, greedy, 512 tokens, 262,144 context, DFlash2 with 7 drafts, no vision | [Quick wins A/B](../../findings/2026-09-24-upstream-quick-wins-ab.md) |
-| Cold prefill **9,717 tok/s** at 46K, 7,865 at 105K | the 27B, 2,048-token chunk, RTX 5090 | [The 27B's prefill chunk at 2,048](../../findings/2026-10-21-the-27b-prefill-chunk-at-2048.md) |
+| Cold prefill **11,344 tok/s** at 46K, 9,008 at 105K; ignis's GDN prefill +4.8% and +3.9% of it against the vendored kernels, one session | the 27B NVFP4, the `rtx5090` profile (2,048-token chunk), RTX 5090 | [The GDN prefill on Blackwell](../../findings/2026-11-08-blackwell-gdn-prefill-on-ignis-kernels.md) |
+| The 2,048-token chunk: +1.9% at 46K, +2.2% at 105K against 1,024 | the 27B, RTX 5090 | [The 27B's prefill chunk at 2,048](../../findings/2026-10-21-the-27b-prefill-chunk-at-2048.md) |
 | Prefill attention on the compressed KV: +30% at 46K, +53% at 105K against 0.7.2's kernels | one A/B session, RTX 5090 | [Prefill attention without prompt planes](../../findings/2026-10-21-prefill-attention-without-prompt-planes.md) |
 | Per-lane design at four lanes: round 70.2 ms against 17.3 ms (4.06x) | live/live gate, 32K context | [ADR 0020](../../adr/0020-batch-wide-decode-round.md) |
 | Flash-Next lanes keep 15.6-18.3 tok/s while a prompt prefills at decode share 25; the prefilling request's TTFT grows by 1.33x | Flash-Next, 8,192-token prompt, RTX 5090 | [Prefill chunk and decode share](../../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md) |

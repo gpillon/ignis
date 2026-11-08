@@ -29,7 +29,7 @@
   <tr>
     <td align="center"><b>~170-370 tok/s</b><br><sub>one lane, free prose to coding prompts</sub></td>
     <td align="center"><b>1,065 tok/s</b><br><sub>eight lanes, aggregate</sub></td>
-    <td align="center"><b>~9,700 tok/s</b><br><sub>cold prefill, 46K prompt</sub></td>
+    <td align="center"><b>~11,300 tok/s</b><br><sub>cold prefill, 46K prompt</sub></td>
     <td align="center"><b>~100 tok/s</b><br><sub>Flash-Next 125B MoE, one lane</sub></td>
     <td align="center"><b>7.11x</b><br><sub>KV capacity of BF16</sub></td>
     <td align="center"><b>~36 ms</b><br><sub>a decision, zero tokens decoded</sub></td>
@@ -188,14 +188,19 @@ Those rows are other people's runs: their prompts, their drafters, their
 context lengths. They are not a same-session benchmark, so read them as an order
 of magnitude, not a ratio. **Prefill was where ignis trailed; 0.7.3 made it
 30-53% faster on long prompts.**
-- **ignis**, measured cold: **9,717 tok/s on a 46K prompt, 7,865 on a 105K one**.
-  The prefill attention now reads the compressed KV directly, instead of
+- **ignis**, measured cold: **11,344 tok/s on a 46K prompt, 9,008 on a 105K one**
+  ([the GDN prefill on Blackwell](docs/findings/2026-11-08-blackwell-gdn-prefill-on-ignis-kernels.md)).
+  Since 0.7.3 the prefill attention reads the compressed KV directly, instead of
   expanding it into BF16 planes first: +30% at 46K and +53% at 105K against
   0.7.2's kernels in one A/B session
   ([no prompt planes](docs/findings/2026-10-21-prefill-attention-without-prompt-planes.md)).
   A 2,048-token prefill chunk adds 2% more
   ([the 2,048 chunk](docs/findings/2026-10-21-the-27b-prefill-chunk-at-2048.md)).
-  Decode is unchanged, and the KL divergence from BF16 is lower.
+  Decode is unchanged, and the KL divergence from BF16 is lower. ignis's own
+  gated delta net prefill kernels, Blackwell's route since they measured
+  faster there, add 4.8% at 46K and 3.9% at 105K against the vendored ones in
+  one session; the rest of the move from the 9,717 and 7,865 measured with
+  0.7.3 came from changes since, not measured apart.
 - **One same-session bench, someone else's**
   ([mkyt/qwen3-27b-5090](https://github.com/mkyt/qwen3-27b-5090), a 5090 at a
   400 W limit, 2026-10-11), cold 73K prompt:

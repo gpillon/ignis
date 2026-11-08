@@ -76,7 +76,9 @@ fn events_since(start: usize) -> Vec<serde_json::Value> {
 }
 
 /// The GDN prefill's measurement switch set to `ours`, the route an 8.x card
-/// runs (the leaf reads it at each load). Removed on drop.
+/// runs (the leaf reads it at each load). Removed on drop. A Blackwell card
+/// runs it unset too since GitHub #536; named, the test keeps the 8.x routes
+/// whatever the card's default.
 struct OurGdnPrefill;
 
 impl OurGdnPrefill {

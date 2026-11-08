@@ -49,11 +49,11 @@ The measurement set, five arms:
 
 | arm | surface | GDN prefill | prompt attention |
 |-----|---------|-------------|------------------|
-| `h-vendored` | `decide_entailment_gpu.rs` | vendored | fp8 |
+| `h-vendored` | `decide_entailment_gpu.rs`, `IGNIS_GDN_PREFILL=vendored` | vendored | fp8 |
 | `h-ours` | `decide_entailment_gpu.rs`, `IGNIS_GDN_PREFILL=ours` | ignis's | fp8 |
-| `s-vendored` | live server, `/v1/decide` | vendored | fp8 |
+| `s-vendored` | live server, `IGNIS_GDN_PREFILL=vendored` | vendored | fp8 |
 | `s-ours` | live server, `IGNIS_GDN_PREFILL=ours` | ignis's | fp8 |
-| `s-int8` | live server, `--model-prefill-attention int8` | vendored | int8 |
+| `s-int8` | live server, `IGNIS_GDN_PREFILL=vendored`, `--model-prefill-attention int8` | vendored | int8 |
 
 The harness cannot select the int8 band, so that arm is the server's. The
 rule, the date, the build, the command that redoes each arm and every

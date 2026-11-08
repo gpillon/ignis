@@ -28,8 +28,8 @@
 //
 // The tail of a chunk that is not a multiple of 32 is masked inside the kernels (beta = 0 and
 // zero rows), so no other kernel runs over it. The vendored path stays this op's oracle (ADR
-// 0031) and Blackwell's route (`runs_by_default`): kernel/tests/test_gdn_prefill.cu holds the two
-// to each other and to an fp64 recurrence.
+// 0031), the route of a prefill below kMinTokens and the measurement switch's other route:
+// kernel/tests/test_gdn_prefill.cu holds the two to each other and to an fp64 recurrence.
 
 #pragma once
 
@@ -46,14 +46,19 @@ namespace ignis::gdn_prefill {
 // kernel alone, on the CUDA cores (it runs no chunked kernel under 64 tokens either).
 inline constexpr std::int32_t kMinTokens = 64;
 
-// The route per GPU generation, the one switch: our kernels on Ampere and Ada (compute capability
-// 8.x), where they replace the vendored GDN prefill; Blackwell keeps the vendored kernels until the
-// RTX 5090's measurement decides (GitHub #514).
-constexpr bool runs_by_default(int compute_capability_major) { return compute_capability_major == 8; }
+// The route per GPU generation, the one switch: our kernels on the two generations the build's
+// cubins load on, Ampere and Ada (compute capability 8.x), which they were written for, and
+// Blackwell (12.x), where the RTX 5090 measured them 2.4-2.6x faster than the vendored kernels on
+// the 27B's prefill, its time to first token 3-4% shorter at 8K and 64K, and its KLD against BF16
+// unmoved within the noise on both 27B bodies (GitHub #514's rule; Blackwell's default since
+// GitHub #536, spec #531; ADR 0080).
+constexpr bool runs_by_default(int compute_capability_major) {
+  return compute_capability_major == 8 || compute_capability_major == 12;
+}
 
 // The route a load takes (true: ours): `runs_by_default`, unless the process environment's
-// IGNIS_GDN_PREFILL names one, `ours` or `vendored` -- a measurement switch (the RTX 5090's timing
-// and KLD of both routes), not an operator setting. Read from the operating system's environment
+// IGNIS_GDN_PREFILL names one, `ours` or `vendored` -- a measurement switch (timing and KLD of
+// both routes on one card), not an operator setting. Read from the operating system's environment
 // at each call (kernel/src/model.cu calls it once per load): on Windows the C runtime's getenv
 // holds a copy taken at start, which a later SetEnvironmentVariable (Rust's std::env::set_var)
 // does not reach. Throws std::invalid_argument, naming the variable, on any other value.
