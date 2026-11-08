@@ -11,9 +11,11 @@ The Linux binaries and the container image are one build: the
 `Containerfile`'s `build` stage compiles them, CI exports the tarball from
 its `artifacts` stage, and the same job builds the `runtime` image. It is one
 workflow, `release.yml`; the two-workflow split was withdrawn on 2026-09-21.
-A `test` job runs the CPU-only suite on both hosts before anything builds,
-`release` needs `version`, `linux` and `windows`, and nothing is run on a
-runner.
+A `test` job runs the CPU-only suite on both hosts, and nothing is run on a
+runner. Since ADR 0086 (#552) the builds run beside the tests and only what
+publishes waits for them: `release` and `prerelease` need `test` as well as
+`version`, `linux` and `windows`, and a job of its own, `image`, pushes the
+`linux` job's image.
 
 Since then:
 
