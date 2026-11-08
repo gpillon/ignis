@@ -1,6 +1,69 @@
+---
+status: accepted
+amended-by: [ADR-0025, ADR-0030, ADR-0045, ADR-0046, ADR-0058]
+---
+
 # ADR 0017 — Opt-in Prometheus metrics with zero inference-path work
 
-## Status
+## Current decision
+
+Metrics are **on by default** (owner decision, 2026-10-15). `server.metrics`
+(`--server-metrics`, `IGNIS_SERVER_METRICS`: ADR 0046's spellings of the
+original `--metrics`) defaults to `true`, and `false` builds neither the
+projection nor a route to it. Prometheus scrapes `GET /metrics`, text format
+0.0.4, on a listener of its own, `server.metrics_bind`
+(`--server-metrics-bind`, default `127.0.0.1:9464`): it asks for no API key,
+is never the API's `bind`, is never tunnelled by `--server-expose` (ADR 0028),
+and is refused beside an explicit `false`. A default address that cannot be
+bound (a second server on the host) is a warning,
+`ignis.server.metrics_unavailable`, and the server serves without that
+listener; an address the operator named that cannot be bound refuses the
+start. `ignis.process.started` names the address bound, `unavailable` or
+`off`. The API listener has no `/metrics`: with the Playground on, it serves
+the same exposition at `GET /ui/metrics`, behind the API key when one is set.
+
+**Metrics add no work to the inference path.** The asynchronous telemetry
+consumer owns one fixed-cardinality projection, kept in fixed atomics and
+updated from facts the model thread sends whether metrics are on or off (the
+retained-state lifecycle facts of #190, and the occupancy ADR 0030 put on the
+tick, included). Enabling metrics adds no query, branch, atomic, clock read,
+allocation, wake or channel operation to the scheduler, the model thread, the
+runtime or the kernel leaf. A scrape formats the atomics in the HTTP task and
+never waits on the model thread, and a slow scraper cannot hold back the
+facts channel. The one allowance, at most 1% on the HTTP and telemetry plane
+under a 15-second scrape, was #90's acceptance and is not re-verified here.
+
+A family that no telemetry fact carries is written into the same atomics, off
+the model thread, by whatever already holds its value: the HTTP handlers
+(rejections, decisions and `locate`s, the counting routes), the Responses
+socket queue, the image and speech jobs, and the loop guard's own task.
+Flash-Next's residency and n-gram counts are read on every tick from host
+memory the leaf and the table write anyway (`FlashNextCounterSource`), with no
+CUDA call. Logs and metrics come from the same facts and neither is parsed
+from the other's output (ADR 0011); the scheduler's interval counters are a
+DEBUG log event (ADR 0025).
+
+**Only authoritative values, under bounded labels.** A placeholder (the
+interval's `prefilling`) is not exported, and neither is a percentage. Labels
+take fixed, finite sets: request, trace, span, sequence, lane and token ids,
+prompts, completions, paths, client model strings and error text are never
+labels. Histogram buckets are fixed. A family is exported from the first
+scrape, zeros included, unless it belongs to a route or a feature most
+servers never use: those are absent until their first event (the decision,
+`locate`, counting-route, forced-close, speculative, loop-guard, image-job
+and speech families), and the Flash-Next and KV-disk families render only on
+a load that has them. Once a family is there, every series of it renders,
+zeros included, so a label value never vanishes with its count.
+
+**The catalogue is the guide's.** Every family, its type, its meaning and
+when it appears: [Metrics](../user/reference/metrics.md), generated from
+`crates/server/src/metrics.rs`, whose help text and doc comments also hold
+each family's labels and finer rules; `cargo test` fails while the page and
+the code disagree. The memory gauges are ADR 0030's (§Observability).
+
+## History
+
+### Status
 
 Accepted (2026-09-08, owner decision). The "Existing JSONL interval telemetry
 remains compatible" consequence is superseded by ADR 0025; the projection
@@ -223,7 +286,7 @@ no prefix miss without a retained slot. No new family; the rule is the note
 below the table, and the Monitor's *Retained state* card shows the count where
 it read "not measured".
 
-## Context
+### Context
 
 ADR 0011 chooses `tracing` and `tracing-subscriber` as Ignis's structured
 logging foundation. It also draws an intentional boundary around the existing
@@ -237,436 +300,18 @@ facts to one asynchronous telemetry consumer. That consumer performs request
 bookkeeping and sink I/O off the model thread and publishes its latest interval
 counters through a wait-free snapshot.
 
-## Problem Statement
-
-Operators need Prometheus-compatible visibility into request load, queue
-pressure, latency, generated work, KV evictions, and sibling-prefix reuse.
-Ignis currently has no Prometheus endpoint, and building one from rendered logs
-would create a second, fragile interpretation of operational facts.
-
-Metrics must be optional and must not tax inference when enabled. In
-particular, their acceptable regression on the scheduler, prefill, decode,
-runtime, kernel, model-thread, and GPU critical path is exactly zero. A
-percentage allowance is appropriate only for asynchronous HTTP and telemetry
-work. The current telemetry interval also exposes placeholder values for
-prefilling and KV usage, so those values cannot become authoritative metrics.
-
-## Decision
+### Decision
 
 Ignis will expose a bounded Prometheus text endpoint when the operator supplies
 `--metrics`. The endpoint will project facts already consumed asynchronously;
 it will not introduce metric work or new fact traffic on the inference path.
 
-## Solution
+The PRD sections around this Decision (Problem Statement, Solution, User
+Stories, Implementation Decisions with the metric contract table and its
+notes, Testing Decisions, Out of Scope, Further Notes) were cut on
+2026-11-08; commit `107eb757` is the last that has them.
 
-When metrics are enabled, the existing asynchronous server telemetry consumer
-maintains a fixed-cardinality aggregate projection from facts that the model
-thread already emits. `GET /metrics` renders the latest projection on a
-metrics listener of its own, and the Playground reads the same rendering at
-`/ui/metrics` on the API listener. When metrics are disabled, neither the
-projection nor any route to it exists.
-
-Prometheus remains distinct from structured logging: it does not parse rendered
-logs, and the logging subsystem does not own metric aggregation or exposition.
-Only authoritative values enter the initial metric contract. The implementation
-must demonstrate structural equality of inference-side work and no repeatable
-critical-path performance regression. The only numerical allowance is at most
-1% on the HTTP/telemetry plane under the defined scrape workload.
-
-## User Stories
-
-1. As an operator, I want to enable metrics explicitly with `--metrics`, so that a default Ignis deployment has no metrics surface or aggregation work.
-2. As an operator, I want `GET /metrics` on its own local listener, so that Prometheus can scrape it without the API key while an exposed API never publishes it.
-3. As an operator, I want the metrics route to be absent when disabled, so that opt-in behavior is unambiguous.
-4. As a Prometheus administrator, I want a standards-compatible text response, so that Prometheus can scrape Ignis without a custom adapter.
-5. As an operator, I want build identity, so that I can associate observations with the running Ignis version.
-6. As an operator, I want current waiting and running request counts, so that I can see scheduler pressure.
-7. As an operator, I want accepted, completed, cancelled, and rejected request totals, so that I can understand admission and completion behavior.
-8. As an operator, I want rejection totals split by a fixed reason set, so that I can distinguish capacity and request-shape failures without unbounded labels.
-9. As an operator, I want generated-token totals, so that I can observe delivered work.
-10. As an operator, I want KV eviction totals, so that I can identify cache pressure.
-11. As an operator, I want sibling-prefix reuse totals, so that I can quantify avoided prompt work.
-12. As an operator, I want TTFT and request-duration histograms, so that I can monitor latency distributions rather than averages alone.
-13. As a performance engineer, I want enabled metrics to add zero work to inference, so that observability cannot reduce model-thread or GPU throughput.
-14. As a performance engineer, I want any repeatable inference critical-path regression to fail acceptance, even below 1%, so that the zero-work invariant is not weakened into a budget.
-15. As a server operator, I want slow or disconnected scrapers isolated from inference, so that monitoring cannot apply backpressure to request execution.
-16. As a server operator, I want bounded labels and fixed histogram buckets, so that metric cardinality and storage cost remain predictable.
-17. As a developer, I want placeholder telemetry values omitted, so that every exported series has an authoritative meaning.
-18. As a developer, I want functional coverage without requiring a GPU, so that endpoint behavior remains fast to verify in the workspace test suite.
-19. As a release engineer, I want a real-GPU comparison in addition to structural tests, so that the zero-regression claim is supported by measured evidence.
-20. As an observability maintainer, I want logs and metrics derived independently from canonical facts, so that neither signal depends on parsing the other's rendered output.
-
-## Implementation Decisions
-
-- Prometheus metrics extend, but do not supersede, ADR 0011. A
-  `tracing::Event` remains the canonical log event; Prometheus is not a logging
-  layer, formatter, or consumer of rendered log output.
-- Metrics are disabled by default and enabled only by the boolean CLI flag
-  `--metrics`. There is no short alias, environment variable, or config-file
-  key in this scope. (Superseded: ADR 0046 gave the field its env var and
-  file key, and since 2026-10-15 metrics are on unless `--server-metrics
-  false` -- see Status.)
-- When enabled, `GET /metrics` is served by a second `ignis-server` listener
-  of its own, at `--metrics-bind <addr>` (flag only, default
-  `127.0.0.1:9464`; refused without `--metrics` or on the API's `--bind`;
-  since 2026-10-15 refused beside `--server-metrics false`, and a default
-  address that cannot be bound is a warning, not a refusal). It
-  serves nothing else and asks for no API key: it is kept private by its bind
-  address, and `--expose` (ADR 0028) only ever tunnels the API listener. One
-  shutdown stops both listeners.
-- The API listener has no `/metrics`. With the Playground on (`--ui`, ADR
-  0026), it serves the same exposition at `GET /ui/metrics` for the browser,
-  behind the same API key as `/v1` when one is set and open when none is.
-- When disabled, there is no metrics listener and normal router not-found
-  behavior applies to both paths.
-- The response uses Prometheus text exposition format 0.0.4 and content type
-  `text/plain; version=0.0.4; charset=utf-8`, with stable `HELP` and `TYPE`
-  declarations.
-- The existing asynchronous telemetry consumer is the single projection owner.
-  It updates aggregate state from facts already emitted by the model thread;
-  scrape-time encoding happens only in the HTTP task.
-- Retained prompt-checkpoint lookup and lifecycle operations emit bounded
-  domain facts for hit, miss, spill, discard and restore (#190). Those facts
-  are emitted identically with metrics off and on; only the asynchronous
-  telemetry consumer conditionally projects them. Runtime and kernel code do
-  no metrics work.
-- Enabling metrics adds no scheduler query, snapshot, event, branch, atomic
-  operation, clock read, allocation, task wake, event clone, or channel
-  operation to the inference path.
-- Rejected submissions may be recorded after the existing asynchronous
-  submission call returns its error. This is HTTP/control-plane work and does
-  not add a model-thread telemetry fact.
-- Cancelled requests are recorded the same way, from the control plane. A
-  client that goes away cancels its request, and the scheduler releases a
-  cancelled request without routing any event, so the engine's cancel call
-  tells the telemetry consumer directly; the model-thread loop and its facts
-  stay unchanged. Each accepted request is counted once, as completed or as
-  cancelled; when both happen in the same scheduler step, whichever the
-  consumer observes first wins. Once the consumer has drained, accepted equals
-  completed plus cancelled plus the requests still in flight.
-- Aggregation runs only when metrics are enabled. A disabled server installs
-  neither the Prometheus projection nor the route.
-- Two families are recorded outside the telemetry consumer, by the HTTP
-  handler that already holds their values: the rejection counter (a submit
-  error never reaches the fact stream) and the decision pair (#241 — a
-  readout's answer mass is read in the handler, and raising a fact for it
-  would put a decision's arithmetic on the inference path to observe
-  something the control plane already has). Neither touches the model
-  thread; both are the same atomics a scrape formats.
-- Aggregate state may use fixed atomics or immutable snapshots owned by the
-  asynchronous telemetry side. No lock is shared with inference, and a scrape
-  never sends a command to or waits for the model thread.
-- A scrape allocates only its response buffer and formats the latest published
-  projection. A slow or disconnected scraper cannot apply backpressure to the
-  telemetry facts channel or inference.
-- Only authoritative values are exported. Prefilling and KV usage/capacity are
-  omitted while only placeholder zeros are available. Adding them requires a
-  future ADR that preserves this ADR's zero-work invariant.
-
-The initial stable metric contract is:
-
-| Metric | Type | Labels | Meaning |
-|---|---|---|---|
-| `ignis_build_info` | gauge | `version` | Constant build identity with value 1 |
-| `ignis_scheduler_requests` | gauge | `state=waiting\|running` | Current requests by observable scheduler state |
-| `ignis_kv_cache_evictions_total` | counter | none | Cumulative host-tier evictions |
-| `ignis_kv_ram_evictions_total` | counter | none | Live host-tier snapshots dropped **out of** KV-RAM to make room; the owning request re-prefills from the start (#224) |
-| `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse — a live sibling's prefix only; a retained prefix's claim is counted below (#190) |
-| `ignis_retained_reused_tokens_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Cumulative tokens skipped through retained state: a retained prefix (`kv_ram` when its claim brought it back from KV-RAM, `device` otherwise, #325) or a prompt checkpoint, by the tier it came from and the kind it was |
-| `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained state a request resumed from, counted with the chunk that lands its claim (#445): a prompt checkpoint, a retained prefix claimed from the device (`tier=device`, #325), or a retained prefix brought back from KV-RAM for it (`tier=kv_ram`; the claim that brings it back adds no `device` hit, so one restore is at most one hit, while a later request choosing the block already back on the device is a `device` hit). A claim given up while its request waits for room, or whose prefill never lands, is no hit, and a request that chooses again counts the one it lands. A live sibling's prefix is not retained state and is no hit |
-| `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Prefill runs whose first chunk landed with nothing retained of the kind matching in a tier this load carries (a re-queued request counts again): no checkpoint, or no retained prefix (a live sibling's head is none). Each kind is counted only where it can be hit on the load: `kind=prefix` on the device and in KV-RAM, and not without a retained slot; `kind=checkpoint` not with prompt reuse off — see the note below the table (#216, #222) |
-| `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained checkpoints and prefixes written into the tier (`kv_ram`, and `disk` on a load with KV-disk) |
-| `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Retained checkpoints and prefixes that left the tier for nowhere |
-| `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram\|disk`, `kind=checkpoint\|prefix` | Prefills that landed on a checkpoint from the tier, and prefixes brought back from it; a prefix brought back for a claim that never lands is a restore with no hit |
-| `ignis_requests_accepted_total` | counter | none | Accepted submissions. A loop-guard rewind's continuation is one (#330) |
-| `ignis_requests_completed_total` | counter | none | Completed requests |
-| `ignis_requests_cancelled_total` | counter | none | Accepted requests cancelled before completion. A loop-guard rewind cancels one (#330) |
-| `ignis_requests_rejected_total` | counter | `reason=full\|unknown_model\|oversized` | Rejected submissions by fixed reason |
-| `ignis_generated_tokens_total` | counter | none | Generated tokens on completed requests |
-| `ignis_decoded_tokens_total` | counter | none | Tokens generated so far, counted as each one is emitted |
-| `ignis_request_ttft_seconds` | histogram | none | Submission-to-first-token latency |
-| `ignis_request_duration_seconds` | histogram | none | Submission-to-completion latency |
-| `ignis_decisions_total` | counter | `type=noul\|choice\|score\|scalar\|number\|point\|box\|locate` | Questions answered, by typed primitive (#241, #242, #275, ADR 0034). **Absent until the first one** — see below |
-| `ignis_decision_answer_mass` | histogram | none | Share of the next-token distribution held by a **readout's** declared options. **Readout-only**, so its `_count` is deliberately below the counter's sum — see below. **Absent until the first one** |
-| `ignis_locates_total` | counter | `kind=log\|prose\|records`, `method=shortlist\|vote`, `compression=template_fold\|none`, `found=true\|false\|unmeasured` | `locate`s answered, by the route that answered them and whether it found an answer (#278, spec 22). Only the served combinations have a series. **Absent until the first one** |
-| `ignis_thinking_forced_closes_total` | counter | none | Completed requests whose reasoning block the thinking budget closed (#265, spec server/08). The request log's `thinking_forced` says which. **Absent until the first one** |
-| `ignis_loop_guard_watched_requests_total` | counter | none | Requests the loop guard watched: `log` or `rewind`, starting in their reasoning (#330, spec server/14). Counted as each one ends. **Absent until a watched request ended or a loop was seen**, as the four below |
-| `ignis_loop_guard_looped_requests_total` | counter | none | Of those, the requests with at least one loop, whatever its outcome |
-| `ignis_loop_guard_loops_total` | counter | `outcome=rewound\|closed\|detected\|too_little_kept\|no_room\|no_tokenizer\|submit_refused` | Loops the guard saw, one per `ignis.loop_guard.*` line, by what it did about them: taken back and nudged, taken back and closed, only logged (`log` mode, or a request with images), held, or not acted on |
-| `ignis_loop_guard_rewound_tokens_total` | counter | none | Generated tokens the guard's rewinds took back, closes included: the usage's `rewound_tokens`, summed |
-| `ignis_loop_guard_min_ratio` | histogram | none | Per watched request that scored a window: the lowest normalized loop score it reached, across its rewinds. Buckets `0.1, 0.15, … 0.5` by 0.05, then `1` and `+Inf`; `le="1"` below `_count` would be a score that is not a ratio |
-| `ignis_tokenize_requests_total` | counter | `route=tokenize\|detokenize` | Calls to `POST /v1/tokenize` and `/v1/detokenize`, whatever they answered (#285, spec server/10). Not requests of the lifecycle above: they never enter the scheduler. **Absent until the first one** |
-| `ignis_image_jobs_total` | counter | `outcome=completed\|cancelled\|stopped\|refused\|failed\|timed_out` | Image jobs ended, by how (#324, spec image-model/05). A request that went away is `cancelled`, a model stopped under it `stopped`, a runner that refused its condition `refused`, a failed or panicked call `failed`, a job past its deadline `timed_out` (ADR 0058). **Absent until the image model admitted a job**, as the four below |
-| `ignis_image_images_total` | counter | none | Images the image jobs made, including those of a job that ended before its last (#324) |
-| `ignis_image_job_duration_seconds` | histogram | none | A **completed** job's time from its turn to its last image, buckets 0.1 s to 600 s (#324) |
-| `ignis_image_job_phase_seconds_total` | counter | `phase=queued\|encoding\|denoising\|decoding` | Seconds the jobs of every outcome spent waiting for their turn, encoding the condition, denoising and decoding (#324). A phase's share of the total is computed by the reader |
-| `ignis_image_queue_jobs` | gauge | `state=waiting\|running` | Image jobs waiting for their turn behind the running one, and the one running (#324); set as a job is admitted, takes its turn or ends |
-| `ignis_speech_transcriptions_total` | counter | `executor=cpu\|gpu_loan`, `outcome=completed\|cancelled\|failed\|timed_out` | Transcriptions of the speech model that ended, by where they ran and how (#352, spec speech/02). A request that went away is `cancelled`, an executor that failed a call or would not load `failed`, one past its deadline `timed_out` (ADR 0058). **Absent until the speech model was first asked for a transcription**, as the four below; then all eight series, zeros included. Counted by the request, not parsed from the `ignis.speech.transcription` log line |
-| `ignis_speech_audio_seconds_total` | counter | none | Seconds of audio the **completed** transcriptions covered (#352) |
-| `ignis_speech_commit_wait_seconds` | histogram | none | A **completed** transcription's wait from its commit to its transcript, buckets 0.1 s to 600 s; for a batch request the commit is its last byte received, so decoding the upload counts (#352) |
-| `ignis_speech_sessions_open` | gauge | none | Realtime transcription sessions open, against `speech.max_sessions` (#352; the Realtime route is spec speech/03) |
-| `ignis_speech_queue_length` | gauge | none | Batch transcriptions waiting behind the one running, against `speech.max_queue` (#352); set as one is admitted, takes its turn or ends |
-| `ignis_condition_budget_used_bytes` | gauge | none | Bytes of the condition prefixes the image model's jobs hold now, against `ignis_vram_reserved_bytes{line="condition_budget"}` (#324, the image model's VRAM); set by the job as it encodes and releases its prefix, reset by every load. **Rendered from the first scrape**, 0 on a text load |
-| `ignis_responses_sockets` | gauge | none | Open Responses API WebSocket connections (#282) |
-| `ignis_responses_queued_requests` | gauge | none | Responses WebSocket requests waiting in the server-wide **socket admission queue**; a request the engine found full is counted here rather than in `ignis_requests_rejected_total` (#282) |
-| `ignis_expert_cache_hits_total` | counter | `class`, `phase=decode\|prefill` | Flash-Next: selected expert projections already resident in the VRAM expert cache, or staged for their layer (#301). A decode hit rate is hits over hits plus misses of `phase="decode"` |
-| `ignis_expert_cache_misses_total` | counter | `class`, `phase=decode\|prefill` | Flash-Next: selected expert projections copied in from the pinned host pool by their own step (#301) |
-| `ignis_expert_prefetches_issued_total` | counter | none | Flash-Next: projections copied ahead for the next layer by the router lookahead (#301) |
-| `ignis_expert_prefetches_used_total` | counter | none | Flash-Next: prefetched projections at their first use, whenever it comes (#301) |
-| `ignis_expert_bytes_moved_total` | counter | `phase=decode\|prefill` | Flash-Next: bytes of expert projections copied host-to-device, misses and prefetches (#301) |
-| `ignis_expert_residency_stall_seconds_total` | counter | `phase=decode\|prefill` | Flash-Next: device time the expert kernels waited on their step's demand copies, the misses (#306). A step with no miss adds nothing; prefetch copies are not counted. Stall per token is the decode series over `ignis_decoded_tokens_total` |
-| `ignis_expert_cache_slots` | gauge | `class`, `state=capacity\|in_use` | Flash-Next: VRAM expert cache LRU slots per K class, reserved at load and in use (#301); a pinned hot set's slots are not counted, the load event `ignis.runtime.flash_next_pinned_experts` names them (ADR 0055) |
-| `ignis_kv_disk_bytes` | gauge | `state=capacity\|used` | KV-disk (ADR 0045, spec vram-budget/03): the tier's effective budget, `min(--kv-disk-bytes, volume free - 10 GiB)` at start, and the bytes its committed files hold, headers and padding included. **Only on a load with the tier**, from its first scrape |
-| `ignis_kv_disk_spills_total` | counter | `from=device\|kv_ram` | KV-disk: live sequences written to the disk, by the tier they left -- the device when KV-RAM had no room, KV-RAM when it gave its victim down instead of dropping it. In neither eviction counter above. **Only on a load with the tier** |
-| `ignis_kv_disk_failures_total` | counter | `op=write\|read` | KV-disk: a write refused (the margin, or an IO error: the state stays where it was) and a file refused at restore (torn, corrupt, foreign, or unreadable: never restored; a live request re-prefills). **Only on a load with the tier** |
-| `ignis_ngram_rows_total` | counter | `source=hot\|file` | Flash-Next: n-gram embedding rows staged for prefill spans and decode rounds, from the RAM hot-row cache or the artifact file (#302). A hot-row hit rate is `source="hot"` over the sum |
-| `ignis_ngram_reads_total` | counter | none | Flash-Next: reads issued to the artifact file for rows the hot-row cache did not hold (#302) |
-| `ignis_ngram_read_bytes_total` | counter | none | Flash-Next: bytes of those reads (#302) |
-| `ignis_speculative_rounds_total` | counter | none | Verify rounds run on requests that ended, summed (#307). **Absent until a request that ran one ends** |
-| `ignis_speculative_drafted_tokens_total` | counter | none | Draft tokens those rounds verified (#307). Acceptance is accepted over drafted. **Absent until the first round** |
-| `ignis_speculative_accepted_tokens_total` | counter | none | Draft tokens those rounds committed (#307). **Absent until the first round** |
-| `ignis_speculative_position_drafted_total` | counter | `position=1..k` | Rounds that proposed a draft at that position of the window (#307). **Absent until the first round** |
-| `ignis_speculative_position_accepted_total` | counter | `position=1..k` | Rounds that committed the draft at that position (#307). **Absent until the first round** |
-
-ADR 0030 §Observability adds the memory gauges to this contract: the plan's
-reserved lines (eleven, twelve since #257 added `hq_residual_window`, then
-Flash-Next's two and the image model's `condition_budget`), the budget, the KV pool's pages and page bytes, the
-pages occupied of it, the KV-RAM arena's capacity and use, the retained slots'
-capacity and use, and the retained-slot skips. Every one is bytes, pages or
-slots; no percentage is exported.
-
-**The decision family is absent when it is zero (#241)**, and so are the
-forced-close counter (#265) and the speculative family (#307), for the same reason: a load whose traffic never
-reaches its thinking budget is a normal one. Every other series is exported
-from the first scrape, zeros included, because a zero is a reading. A decision's are not exported until a
-decision has been served, and that is this ADR's other rule — *only
-authoritative values are exported* — applied to a route most loads never
-call: three permanently-zero series and an eleven-bucket histogram on every
-scrape of every server would be clutter that says nothing about the server
-it is scraped from. A series that appears mid-window is the same
-problem as a new target and Prometheus treats it the same way, with one
-consequence worth knowing: `rate()` and `increase()` cannot see the step
-from nothing to the first sample, so the very first decision a load serves
-is not in its own rate. Once the family exists, **all three `type`
-values are exported**, including the zeros: a label value that vanishes with
-its count is a series that breaks `sum by (type)` the moment traffic shifts.
-
-**The unit is the question, not the request.** `ignis_decisions_total`
-counts *decisions* in the engine's sense — one readout, one internal
-request (#238) — so a decide request of twenty questions moves it by
-twenty. A request has no single `type` to be counted under, and a single
-question's options collapsing while its nineteen siblings are fine is
-exactly what the histogram exists to show. The endpoint's own unit is on
-the request log instead, as `ignis.decide.done`.
-
-The pair is recorded by the HTTP handler, like `ignis_requests_rejected_total`
-and for the same reason: there is no fact for it on the model thread's
-stream, and inventing one would put a decision's arithmetic on the inference
-path to observe something the handler already holds. It is counted **per
-question**, not per request — twenty questions over one `state` are twenty
-readouts, and one of them collapsing while its siblings are fine is exactly
-what the histogram exists to show.
-
-`ignis_decision_answer_mass` is a ratio in `[0, 1]`, which is not the
-percentage this ADR forbids: the forbidden thing is a ratio *standing in for*
-two terms a reader needs separately, and answer mass has no second term — it
-is the quantity itself. Its buckets are 0.5, 0.9, 0.95, 0.98, 0.99, 0.995,
-0.998, 0.999, 0.9995 and 1, plus the implicit `+Inf`. The measured baseline
-is a median of 0.996 and above from 8 to 256 options, so an evenly spaced
-scale would put every healthy reading in one bucket and show a flat line
-whatever happened; the resolution is where the signal is, and the two coarse
-buckets below exist to make a collapse unmissable rather than to resolve it.
-`le="1"` equals `_count` on a correct readout, and that redundancy is the
-assertion the exposition carries.
-
-**The histogram is readout-only, and its `_count` is therefore below the
-counter's sum.** `number`, `point` and `box` (#242) are counted in
-`ignis_decisions_total` like any other question — a decision is a decision,
-whatever primitive answered it, and a `type` a panel could not see would
-make a fan-out's volume unattributable. They observe **no answer mass**,
-because they have none: their answer is a run of sampled tokens, each drawn
-from a permitted set, not a restricted softmax over one position's
-distribution, so there is no denominator for the mass to be a share *of*.
-Reporting 1 would be a lie about the arithmetic and reporting 0 would put a
-false alarm in the bucket a real collapse lands in.
-
-So `sum(ignis_decisions_total) - ignis_decision_answer_mass_count` is the
-number of programs served, and it is expected to be nonzero rather than a
-sign of a dropped observation. Stated here because the obvious reading of a
-counter and a histogram exported side by side is that they count the same
-events, and on this pair they do not. The per-digit confidence a program
-*does* produce is in its answer, not in this family: it is a resolution
-readout in the units of the value — see `crate::program::Reading::sigma` —
-and it is not comparable across primitives the way answer mass is.
-
-**`confidence` is not exported.** The endpoint reports a per-answer
-confidence, and aggregating it would produce a histogram over callers who
-each mean something different by it — a threshold is a property of a domain,
-not of a server. Answer mass is the server's own reading of the same prompt
-and is comparable across every caller.
-
-**Eviction is a departure from a tier, and there are five of them (#224), nine on a load with KV-disk.**
-The contract names each one separately rather than summing them, because they
-cost different things:
-
-| Departure | Series |
-|---|---|
-| A live sequence leaves the device for KV-RAM | `ignis_kv_cache_evictions_total` |
-| Retained state leaves the device for nowhere | `ignis_retained_state_discards_total{tier="device"}` |
-| Retained state is demoted device → KV-RAM | `ignis_retained_state_spills_total{tier="kv_ram"}` |
-| Retained state leaves KV-RAM for nowhere | `ignis_retained_state_discards_total{tier="kv_ram"}` |
-| A **live snapshot** is dropped out of KV-RAM | `ignis_kv_ram_evictions_total` |
-| A live sequence leaves the device for KV-disk (KV-RAM had no room) | `ignis_kv_disk_spills_total{from="device"}` |
-| A live snapshot is demoted KV-RAM → KV-disk | `ignis_kv_disk_spills_total{from="kv_ram"}` |
-| Retained state is demoted KV-RAM → KV-disk | `ignis_retained_state_spills_total{tier="disk"}` |
-| Retained state leaves KV-disk for nowhere | `ignis_retained_state_discards_total{tier="disk"}` |
-
-The last four exist on a load with KV-disk only (ADR 0045). With the tier on,
-a live sequence is never dropped for room -- it goes down a tier or its
-request waits -- so `ignis_kv_ram_evictions_total` stays at zero there; it
-keeps its meaning, as `ignis_kv_cache_evictions_total` keeps device → KV-RAM
-alone.
-
-The last is the most expensive event in the system — the request loses every
-prefilled token — and until #224 it was counted nowhere. It is projected from
-`SchedEvent::SnapshotDropped` and never from the `SchedEvent::Requeued` beside
-it, because requeue also follows a *failed restore*, where KV-RAM evicted
-nothing. `ignis_kv_cache_evictions_total` keeps its unlabelled identity: no
-`tier` label was retro-fitted onto a stable row.
-
-**The disk tier is exported where it exists (ADR 0045).** Until KV-disk was
-built, `tier="disk"` was reserved here and exported nowhere: a permanently-zero
-label on five per-tier families and the request log's tier spelling would
-have said nothing. Spec vram-budget/03 builds the tier, so on a load with it
-the six retained-state families carry `tier="disk"`, the request log spells
-the reuse source `disk`, and the three `ignis_kv_disk_*` families render --
-all of them from the first scrape, zeros included. A load without the tier
-(the 27B at its defaults, `--kv-disk-bytes 0`, or a volume with no room above
-the margin) renders none of them, and the Monitor's Disk row reads "off on
-this load".
-
-**Both lookups raise a miss, each under its own kind (#222).** Until #222 the
-miss family was checkpoint-only: the checkpoint pool's lookup raised the fact
-and the prefix walk beside it raised none, so `kind="prefix"` sat at zero on
-every load. Now both do, by one rule. A request's look records the tiers it
-found nothing retained in; a later look overwrites them (a request waiting for
-room looks on every tick); its first prefill chunk to land reports them. So a
-request misses a tier once per prefill run, not once per look: a re-queued
-request counts again, as checkpoint misses do. Since #445 a hit is counted at
-that chunk too, as the one that lands the claim, not at the claim: a claim given
-up while its request waits for room is no hit.
-
-- **A prefix miss means no retained prefix matched, by the hit's own test.**
-  On the device that is an entry whose publisher has finished, the test that
-  makes a claim a hit (#325): a live sibling's head, published retained or
-  not, is no hit, so it stops no miss either. It is wider than the glossary's
-  retained prefix, kept alive with no claimant at a reuse boundary: it also
-  admits a head that is no boundary, kept past its publisher by a claimant
-  still running (with prompt reuse off, the only kind there is). Hit and miss
-  read the one test, so they agree. In KV-RAM it is any blob, the copy of one
-  already back on the device included. Each tier then records at most one of
-  hit or miss, and its rate reads chosen / (chosen + nothing there), as the
-  checkpoint family's does. State that is there but not chosen (a KV-RAM
-  block short of the restore floor) is neither.
-- **The prefix tiers are the device and KV-RAM.** Nothing demotes a prefix to
-  the disk and no restore brings one back, so `tier="disk",kind="prefix"`
-  renders on a load with KV-disk and stays zero: a disk prefix miss would be a
-  series that can never hit.
-- **A miss is counted only where a hit can be.** A checkpoint is captured
-  only with prompt reuse on, so `--reuse-prompt off` records no checkpoint
-  miss; before #222 every request on such a load counted a device one. That
-  gate is the switch alone: a load with reuse on and no retained slot
-  captures nothing either, and still counts a checkpoint miss. A
-  prefix is published only into a retained slot, prompt reuse on or off. Off,
-  the head a claimant keeps past its publisher is a hit when claimed, so the
-  device misses a prefix there too; a load with no retained slot, which is
-  what the server resolves `off` to unless the operator names slots, records
-  none.
-- **What it costs.** No pass of its own. The look already walks the device
-  entries for the longest match a KV-RAM checkpoint is weighed against, and
-  the KV-RAM blobs for one to bring back, on the match keys the one walk of
-  the prompt computed; those two walks also note whether a match is retained:
-  one flag per entry and per blob they visit, a blob with a device copy now
-  keyed too. A device entry's flag asks its publisher's liveness of a sorted
-  list of the live requests, built once per look (one pass over the
-  requests), which the claim's hit now reads too instead of scanning them.
-  The result is a tier set on the request beside the checkpoint's. All of it
-  runs with metrics off and on alike, as #190's lifecycle facts do, so
-  enabling metrics adds none of it to the inference path.
-
-Histogram buckets are fixed. TTFT uses 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
-10, 30, 60, 120, and 300 seconds. Request duration uses 0.1, 0.25, 0.5, 1,
-2.5, 5, 10, 30, 60, 120, 300, and 600 seconds. Both include Prometheus's
-implicit positive-infinity bucket.
-
-Labels are limited to the finite sets above. Request IDs, trace/span IDs,
-prompts, completions, artifact paths, client-provided model strings, arbitrary
-error text, sequence IDs, lane IDs, and token IDs are forbidden as labels.
-ADR 0012's request identity is for log/span correlation, not a metric
-dimension.
-
-## Testing Decisions
-
-- Functional tests assert external behavior rather than private aggregation
-  structure. The primary seam is the public server router backed by a concrete
-  scheduler over deterministic `MockCompute`; the secondary seam is pure CLI
-  configuration resolution.
-- CLI coverage proves that metrics default to disabled, that `--metrics`
-  enables them on the default metrics address, that `--metrics-bind` moves
-  that address and is refused without `--metrics` or on the API's `--bind`,
-  and that no alias, environment variable, or configuration-file path is
-  introduced for either flag.
-- Router coverage proves route absence when disabled, valid exposition and
-  content type when enabled, lifecycle-driven value changes, bounded labels,
-  concurrent scrapes, and slow-scraper isolation; which listener serves which
-  path; and `/ui/metrics` following the API key.
-- Structural review and tests prove there is no metrics dependency or
-  flag-dependent code in core, runtime, the kernel leaf, or the model-thread
-  loop. Core emits canonical retained-state lifecycle facts independent of
-  Prometheus, and flag-off and flag-on produce identical inference-side fact
-  traffic.
-- A real-GPU trace replay compares metrics disabled, enabled but unscraped, and
-  enabled with a 15-second scrape cadence. There must be no repeatable
-  regression in GPU step timings or model-thread throughput. Any repeatable
-  critical-path regression is a failure, even below 1%.
-- The only permitted 1% budget applies to asynchronous HTTP/telemetry behavior:
-  under a 15-second scrape cadence, per-class HTTP-observed TTFT is at most
-  1.01 times the disabled baseline and delivered generation throughput is at
-  least 0.99 times the disabled baseline.
-- A one-second scrape cadence is recorded as a stress diagnostic. Slow and
-  disconnected scraper scenarios must not perturb inference-side fact traffic
-  or block telemetry consumption.
-- The existing G4 performance gate remains independently mandatory.
-- `cargo test` must pass workspace-wide. Functional Prometheus tests require no
-  GPU and follow the existing CLI resolution, telemetry, and OpenAI HTTP test
-  patterns.
-
-## Out of Scope
-
-- Pushgateway, remote write, OTLP metrics, and StatsD.
-- Dashboards, alerting rules, and deployment manifests.
-- Metrics-specific authentication or TLS (the metrics listener has none; the
-  Playground's copy reuses the API key).
-- Prefilling and KV usage/capacity metrics without authoritative zero-work
-  sources.
-- Request-, trace-, token-, sequence-, lane-, prompt-, or error-derived labels.
-- Replacing structured logging or reconstructing either observability signal
-  from the other's rendered output.
-
-## Further Notes
-
-- Work is delivered through two tracer-bullet implementation tickets.
-- #89 delivers a minimal end-to-end Prometheus surface: opt-in CLI behavior,
-  route presence, valid exposition, and core request/scheduler metrics backed
-  by the asynchronous projection, cancellations included.
-- #90 is blocked by #89 and completes the operational metric contract,
-  slow/concurrent scraper isolation, and all structural and measured
-  performance acceptance.
-- Performance wording is intentionally asymmetric: zero repeatable regression
-  is required on the inference critical path; the 1% budget exists only for
-  asynchronous HTTP/telemetry behavior.
-
-## Consequences
+### Consequences
 
 - Operators gain a standard pull-based monitoring surface without introducing
   a second observability path through inference.
@@ -681,7 +326,7 @@ dimension.
   affect HTTP-plane latency; that is why the explicit 1% HTTP budget exists.
   They cannot consume inference-path time by design.
 
-## Proposed amendment (2026-09-16) — the prefix-reuse counter widens (#188) — superseded
+### Proposed amendment (2026-09-16) — the prefix-reuse counter widens (#188) — superseded
 
 **Superseded by #190 (2026-09-16).** The owner chose the decline path below:
 `SchedEvent::PrefixReused` carries whether the claimed entry's publisher had

@@ -1,6 +1,73 @@
+---
+status: accepted
+amends: [ADR-0017]
+amended-by: [ADR-0035, ADR-0045]
+---
+
 # ADR 0030 — device memory reserved at load, within a VRAM budget
 
-## Status
+## Current decision
+
+**Serving allocates nothing on the device.** Every device reservation is made
+at load, and a request only takes and returns places inside them. What a load
+pins in host memory is reserved at load too, as lines of a host plan that
+refuses a start it cannot hold (`crates/core/src/residency/plan.rs`): the
+KV-RAM arena (`--reuse-kv-host-pool-bytes`, one pinned block held from start,
+blobs placed inside it), the host retained slots, the 27B's token embedding
+(ADR 0062) and, under the default `host` vision residency, its vision tower
+and embedding pool (ADR 0075), and Flash-Next's expert pool, n-gram hot rows
+and KV-disk staging.
+
+**One VRAM budget for the whole process**, weights and CUDA context included,
+as Task Manager counts it. It is derived by default, the memory free at start
+less `--vram-headroom-bytes` (1,536 MiB since 2026-10-09; 1 GiB when this was
+decided), or explicit, `--vram-budget-bytes`, which is refused above free
+memory unless `--vram-allow-oversubscription` (explicit budgets only) makes
+that a warning. A later load in the same process (a switch, the reload after
+an idle unload) adds back what the process already holds, so the CUDA context
+and the 27B's per-process state are not charged twice (#324).
+
+**The plan is printed, and a plan that does not fit refuses the start.**
+`ignis.runtime.vram_plan` names its lines in a fixed order (`VramLines` in
+`crates/core/src/vram.rs`): weights, CUDA context, the workspace that prefill
+and the vision encoder share, the 27B trellis body's workspace and dense
+prefill buffer, the media embedding pool, sampling, the decode, verify and
+drafter rounds, lane state, the device retained slots, the hq residual window
+of every lane and device slot, and the measured residual. Flash-Next adds
+residency's fixed bytes and the expert cache (`ignis.runtime.flash_next_plan`),
+refused below 12 GiB unless `--vram-allow-expert-cache-below-floor`; the image
+model's plan is its weights, one arena and its condition budget. The KV pool
+follows ADR 0045's policy: the rest of the budget on a resident load, 524,288
+tokens reserved first when experts stream. Its floor is one
+`--model-max-context` sequence plus a KV page per retained slot of either
+kind; below it the start is refused, naming the shortfall and the knobs that
+shrink it, except that the 27B first lowers a `max_context` its profile or
+the default gave (ADR 0063's adaptation).
+
+**Retained state lives in retained slots** fixed at load (#281). Device slots
+(`--reuse-retained-device`, 0 unless a profile names some) are the plan's
+`retained_slots` line and are handed out first; host slots
+(`--reuse-retained-host`, by default two per decode lane on the 27B and eight
+on Flash-Next) live in one pinned host block. When none is free, the
+lowest-ranked retained state gives its slot up in ADR 0023's order; when
+nothing can, the publish or capture is skipped and the request runs without
+leaving reuse behind. With prompt reuse off, no slot is reserved unless one
+is named.
+
+**Observability.** Every memory series is a gauge in bytes, pages or slots,
+never a percentage. The plan's lines and capacities are load-time constants,
+slot use and skips are projections of facts the model thread already sends,
+and the KV pool's and the KV-RAM arena's use ride the tick, read from the
+scheduler's own host-side accounting. No series polls the leaf or the driver
+while serving, so ADR 0017's zero-work invariant holds: this is the ADR it
+asked for before KV usage could be exported, and it splits ADR 0017's six
+retained-state families by `kind`. The series are on
+[Metrics](../user/reference/metrics.md), and what each plan line holds is on
+[The VRAM plan](../user/concepts/vram-plan.md).
+
+## History
+
+### Status
 
 Accepted (2026-09-17). Spec: `docs/specs/vram-budget/01-vram-budget.md`.
 Clarifies ADR 0029 (its device pool of retained images is physical: retained
@@ -56,7 +123,7 @@ follows the **KV pool policy** — see the amendment at the end.
 back the device memory the process already holds, and the image model's load
 reports its plan into the memory gauges — see the amendment at the end.
 
-## Context
+### Context
 
 On the owner's box (RTX 5090, 31.84 GiB; the desktop holds 1.6–3 GiB), Task
 Manager shows ninfer at a fixed dedicated and a fixed "Shared GPU memory"
@@ -100,7 +167,7 @@ ninfer reserves everything once:
 
 Its `request_memory.h` forbids request-time device allocation outright.
 
-## Decision
+### Decision
 
 **Serving allocates nothing on the device.** Every device reservation is
 made at load, and a request only takes and returns places inside them.
@@ -154,7 +221,7 @@ the whole `--kv-host-pool-bytes`, with blobs placed first-fit inside it.
 - Windows counts the arena as the process's shared GPU memory, which is what
   makes that figure fixed.
 
-## Observability
+### Observability
 
 ADR 0017 left KV usage and capacity out of the Prometheus contract because
 the only values available were the interval line's placeholder zeros, and it
@@ -167,21 +234,20 @@ Every series below is a **gauge in bytes, pages or slots**. No percentage is
 exported: a ratio hides which of its two terms moved, and both terms are
 themselves series here.
 
-### Load-time constants
+#### Load-time constants
 
 Computed once during the load that already builds the plan, then never read
 again. They add no serving work of any kind.
 
-| Metric | Type | Labels | Source |
-|---|---|---|---|
-| `ignis_vram_reserved_bytes` | gauge | `line=weights\|cuda_context\|workspace\|trellis_workspace\|trellis_dense\|media_embedding\|sampling\|decode_graph\|verify_round\|drafter_round\|lane_state\|retained_slots\|hq_residual_window\|residual\|residency\|expert_cache\|condition_budget` | the plan's fourteen lines (`hq_residual_window` since #257, `trellis_workspace`, the 27B trellis body's, since #339, `trellis_dense`, its dense prefill's buffer, since #509), the same set and spelling the `ignis.runtime.vram_plan` event carries, then Flash-Next's two (#306): `residency`, the expert residency's fixed bytes (its tables, plus the prefill staging ring on an offloaded load: a device-only one has none, ADR 0054), and `expert_cache`, the VRAM expert cache that takes the budget the weights, program, pool and residency leave (the `residency_fixed_bytes` and `expert_cache_bytes` of `ignis.runtime.flash_next_plan`). Both are 0 on the 27B, and the KV pool is no line, so the budget less every line is the pool plus its page rounding. Then the image model's `condition_budget` (#324): the bytes its plan sets aside for its jobs' condition prefixes, 0 on a text load; its weights are `weights` and its arena `workspace` |
-| `ignis_vram_budget_bytes` | gauge | none | the budget the plan was laid out inside, derived or explicit |
-| `ignis_kv_pool_pages` | gauge | none | the pool's page count, leaf-verified at load |
-| `ignis_kv_page_bytes` | gauge | none | one page's bytes |
-| `ignis_kv_ram_arena_bytes` | gauge | `state="capacity"` | `--kv-host-pool-bytes`, pinned whole at start |
-| `ignis_retained_slots` | gauge | `state="capacity"` | the retained slots the scheduler hands out (#216) |
-| `ignis_retained_host_slots` | gauge | none | of those, the host ones (#281) |
-| `ignis_retained_host_bytes` | gauge | none | the pinned host block holding their images (#281) |
+The series are the plan's lines, as `ignis_vram_reserved_bytes{line}` in the
+plan's own spellings (the fields of `ignis.runtime.vram_plan`, then
+Flash-Next's `residency` and `expert_cache` and the image model's
+`condition_budget`), the budget, the KV pool's pages and page bytes, and the
+capacities of the KV-RAM arena and the retained slots, with the host slots and
+their block since #281. The KV pool is no line, so the budget less every line
+is the pool plus its page rounding. Each series, with its meaning, is on
+[Metrics](../user/reference/metrics.md), and what each line holds is on
+[The VRAM plan](../user/concepts/vram-plan.md).
 
 A load that refuses to start exports nothing: there is no process to scrape.
 
@@ -191,23 +257,23 @@ at all (#215), so the flag's value would be a capacity nothing can ever fill —
 and `{state="in_use"}` would be measured against a bound that is not its own.
 The gauge exports `ConcreteScheduler::retained_slot_count()`.
 
-### Projections of facts that already cross
+#### Projections of facts that already cross
 
 The model thread already emits these, unconditionally, with metrics off. Only
 the projection is new, which is exactly the exemption #190 took for the
 retained-state families.
 
-| Metric | Type | Labels | Source |
-|---|---|---|---|
-| `ignis_retained_slots` | gauge | `state="in_use"` | `SchedEvent::RetainedSlots` |
-| `ignis_retained_slot_skips_total` | counter | `reason=publish_skipped_no_slot\|capture_skipped_no_slot\|capture_skipped_no_page` | `SchedEvent::RetainedSlotSkipped`, the same bounded spellings the log uses |
+The two series are `ignis_retained_slots{state="in_use"}`, projected from
+`SchedEvent::RetainedSlots`, and `ignis_retained_slot_skips_total{reason}`,
+from `SchedEvent::RetainedSlotSkipped` with the log's own bounded spellings
+([Metrics](../user/reference/metrics.md)).
 
 The skip counter is the one that says a load has run out of room to leave
 reuse behind. Consequences already names that state ("a long tool loop stops
 leaving reuse once its chain holds every slot, and it runs on without it");
 until now it was invisible.
 
-### The retained-state families say which kind of state moved
+#### The retained-state families say which kind of state moved
 
 ADR 0017's six retained-state families are split by `tier` alone. A
 **prompt checkpoint** and a **shared prefix** are therefore counted together,
@@ -247,16 +313,15 @@ either way.
 meaning #190 gave it: a live sibling's claim is not retained state and takes
 no `kind`.
 
-### The interval tick carries what is occupied
+#### The interval tick carries what is occupied
 
 The model thread sends one `TelemetryFact::Tick` after every `advance()`.
 **That tick widens** to carry the scheduler's live occupancy, read from
-fields it already maintains for admission:
-
-| Metric | Type | Labels | Source |
-|---|---|---|---|
-| `ignis_kv_pool_used_pages` | gauge | none | the main pool's pages in use: running requests, shared prefixes and retained tail pages together (#216) |
-| `ignis_kv_ram_arena_bytes` | gauge | `state="used"` | the host tier's used bytes: live evicted snapshots and retained blobs together (#216) |
+fields it already maintains for admission: `ignis_kv_pool_used_pages`, the
+main pool's pages in use (running requests, shared prefixes and retained tail
+pages together, #216), and `ignis_kv_ram_arena_bytes{state="used"}`, the host
+tier's used bytes (live evicted snapshots and retained blobs together, #216),
+both on [Metrics](../user/reference/metrics.md).
 
 **Both count everything the pool and the arena hold, not one kind of claimant**
 (#216). The pool's charge is one counter for the whole load, and the host
@@ -281,7 +346,7 @@ The same widening retires the interval line's `kv_used_pct` placeholder: the
 line reports the real figure, and `prefilling` stays a placeholder and stays
 unexported.
 
-### Not taken
+#### Not taken
 
 - **Polling the leaf while serving.** `ignis_seq_pool_stats` and
   `ignis_seq_stats` report page-exact occupancy, per pool and per sequence,
@@ -302,7 +367,7 @@ unexported.
   image holds a slot by construction, so `ignis_retained_slots{state="in_use"}`
   already is that count. A second series would restate it and could disagree.
 
-## Considered options
+### Considered options
 
 - **Keep request-time allocation and charge every image to a hard byte
   budget.** It bounds growth, but it still asks the driver for memory while
@@ -319,7 +384,7 @@ unexported.
 - **Lazy pinned KV-RAM** (today). Cheaper when idle, but the shared figure
   moves and every spill pays a `cudaHostAlloc`. Rejected.
 
-## Consequences
+### Consequences
 
 - **`--kv-host-pool-bytes` is locked in RAM from start**, even when idle:
   8 GiB of 63.8 with the Makefile default.
@@ -361,7 +426,7 @@ unexported.
 - **`kv_used_pct` stops being a placeholder**, so the interval line's
   documented caveat about it narrows to `prefilling` alone.
 
-## Amendment (2026-09-29) — retained slots on the host (GitHub #281)
+### Amendment (2026-09-29) — retained slots on the host (GitHub #281)
 
 Spec: `docs/specs/vram-budget/02-retained-host.md`.
 
@@ -405,7 +470,7 @@ checkpoint hits). Meanwhile the eight slots and their residual window held
   `N_DECODE_LANES`" and the consequence that retained slots are
   sequence-pool slots: the device ones still are, the host ones are not.
 
-## Amendment (2026-10-07) — the KV pool policy (ADR 0045)
+### Amendment (2026-10-07) — the KV pool policy (ADR 0045)
 
 Spec: `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
 
@@ -431,7 +496,7 @@ Spec: `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
   `ignis_kv_disk_bytes{state="capacity"|"used"}`, beside the KV-RAM arena's. It
   renders only on a load with the tier.
 
-## Amendment (2026-10-15) — a later load in the same process (GitHub #324)
+### Amendment (2026-10-15) — a later load in the same process (GitHub #324)
 
 - **The derived budget still starts from what was free before this process
   held anything.** A first load reads NVML before its context exists, as #210
