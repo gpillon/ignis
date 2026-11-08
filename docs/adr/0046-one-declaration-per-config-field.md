@@ -1,5 +1,6 @@
 ---
 status: accepted
+amends: [ADR-0017]
 ---
 
 # ADR 0046 — one declaration per config field: flag, env, file key, default, validator

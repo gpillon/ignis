@@ -8,12 +8,14 @@
   sm_89 card; quality / top-64 KLD against BF16 on the routes an 8.x card runs unset (spec #503); kernel / `ctest -LE
   sm120a-only` on the `86;120a` leaf, the vendored GDN gating planner on sm_89; build / an `86;89;120a` leaf against
   the release's `86;120a`; serving / `--profile auto` on the card, DFlash2, vision
+- Topic: host-and-gpu
 - Related: [GitHub #532](https://github.com/gpillon/ignis/issues/532), [GitHub #484](https://github.com/gpillon/ignis/issues/484),
   [GitHub #516](https://github.com/gpillon/ignis/issues/516), [GitHub #503](https://github.com/gpillon/ignis/issues/503),
   [GitHub #474](https://github.com/gpillon/ignis/issues/474),
   [The sm_86 gate's first run passes on `main` 6234e002](2026-11-06-sm86-gate-first-run.md),
   [ADR 0080](../adr/0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md)
 - Superseded by: none
+- Summary: An Ada Lovelace card (sm_89) passes the sm_86 gate at main b13dbc05 with the release's 86;120a build: its quality figures equal the sm_86 card's in every digit, and an 89 cubin changes no logit.
 
 ## Question
 

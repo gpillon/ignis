@@ -3,7 +3,7 @@
 - Kind: experiment
 - Status: corrected
 - Observed: 2026-10-05
-- Last verified: 2026-10-06 (on the converter's traces)
+- Last verified: 2026-10-06
 - Scope: core / Flash-Next expert residency, the CPU policy model and its pool split, prefetch and prefill admission
 - Topic: flash-next
 - Related: [GitHub #301](https://github.com/gpillon/ignis/issues/301),

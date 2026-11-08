@@ -3,7 +3,7 @@
 - Kind: experiment
 - Status: current
 - Observed: 2026-10-14
-- Last verified: 2026-10-15 (the timing test again, after #324 moved the tower's K-1152 linears to MMA)
+- Last verified: 2026-10-15
 - Scope: kernel / the image leaf's denoising step, condition encode and VAE decode on the RTX 5090 (sm_120)
 - Topic: image
 - Related: spec [image-model/04](../specs/image-model/04-the-image-leaf.md) AC 10 (GitHub #321), [Image-model kernels on the 5090](2026-10-13-image-model-kernels-on-the-5090.md), [ADR 0050](../adr/0050-ignis-serves-an-image-model.md)

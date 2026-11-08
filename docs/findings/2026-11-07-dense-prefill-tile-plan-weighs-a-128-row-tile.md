@@ -5,8 +5,10 @@
 - Observed: 2026-11-07
 - Last verified: 2026-11-07
 - Scope: kernel / the dense prefill's tile plan (`plan()` in `kernel/src/dense_prefill.cu`, `kTile128RowCostPercent`), the 27B trellis body's GEMMs at chunk widths 2048 to 8192
+- Topic: prefill
 - Related: [GitHub #530](https://github.com/gpillon/ignis/issues/530), [GitHub #509](https://github.com/gpillon/ignis/issues/509), [spec #503](https://github.com/gpillon/ignis/issues/503), [ADR 0080](../adr/0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md)
 - Superseded by: none
+- Summary: On the RTX 5090 the dense prefill's tile plan weighs a 128-row tile's rows at 1.10 and comes within 1.2% of the fastest of eight tile plans at chunk widths 2048 to 8192, where costing rows alike lost up to 4.9% (#530).
 
 ## Question
 
