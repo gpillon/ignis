@@ -3,6 +3,8 @@
 
     python3 mk/adr-index.py --write      regenerate docs/adr/README.md
     python3 mk/adr-index.py --check      fail on a wrong frontmatter or a stale index
+    python3 mk/adr-index.py --check --since REV
+                                         and on an earlier ADR's text changed since REV
     python3 mk/adr-index.py --selftest   the check's own test, on fixtures in a temp directory
 
 `make records` and `make records-check` run it with the host's Python
@@ -30,11 +32,28 @@ that is not the bare title, and an index that is not what --write would write.
 
 --write writes the index even when the check would fail, so the table shows
 what the files say, and prints the problems it found; --check is the gate.
+
+With --since, the check also holds every ADR that existed at the merge base of
+REV and HEAD, and was no longer `proposed` there, to its text at that base: a
+decision that changes is a new ADR, and the old one changes only in its
+frontmatter (ADR 0081). The text is compared as mk/changelog.sh compares it, the
+frontmatter dropped and every link target and every path in backticks blanked,
+so a status, a back-link or a moved file's path is not a change; the working
+tree is compared, so an edit is refused before it is committed. A typo fix
+passes when every commit since the base that changes the ADR's text names it in
+its message, `[typo ADR-0032]` (or `[typo ADR-0032, ADR-0045]`), and nothing on
+top of them is left uncommitted; the release notes then do not call it amended. An
+ADR that existed at the base is never deleted.
+`--since auto` is the merge base with origin/main, which `make records-check`
+uses, and is skipped with a note in a clone with no origin/main or no git; the
+records workflow passes the push's or the pull request's base.
 """
 
 import argparse
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -49,6 +68,9 @@ BARE_TITLE_FROM = 70
 NUMBERED = re.compile(r"ADR[ -]?\d{4}\b")
 # "ADR 0001 — title" in the long form; the index shows the title alone.
 NUMBER_PREFIX = re.compile(r"ADR[ -]?\d{4}\s*(?:—|–|-|:)\s*")
+# --since: the commit message's mark of a typo fix, and a frontmatter's status.
+TYPO = re.compile(r"\[typo (ADR-\d{4}(?:, ADR-\d{4})*)\]")
+FRONT_STATUS = re.compile(r"^status: (\S+)", re.MULTILINE)
 
 INDEX = "README.md"
 
@@ -68,6 +90,8 @@ memory of why ignis is built the way it is.
 - **A decision that changes** is recorded by a new ADR that amends or
   supersedes the old one, whose text then stays as it was: only its
   frontmatter changes (`amended-by`, or a status of `superseded by`).
+  `make records-check` refuses any other change to an ADR that is no longer
+  `proposed`, a typo fix aside when its commit message says `[typo ADR-NNNN]`.
 - **This file is generated** from the frontmatter by `mk/adr-index.py`
   (`make records`), and `make records-check` fails when it is out of date:
   never edit it by hand.
@@ -79,6 +103,7 @@ memory of why ignis is built the way it is.
 
 class Adr:
     def __init__(self, path):
+        self.path = path
         self.name = path.name
         self.number = path.name[:4]
         self.has_frontmatter = False
@@ -233,6 +258,113 @@ def load(adr_dir):
     return adrs, problems
 
 
+def decision_text(text):
+    """An ADR's text as mk/changelog.sh's adr_text compares it: the frontmatter
+    and the blank lines after it dropped, every link target and every path in
+    backticks blanked, and the trailing newlines gone, as `$(...)` drops them."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    start = 0
+    if lines and lines[0] == "---" and "---" in lines[1:]:
+        start = lines.index("---", 1) + 1
+        while start < len(lines) and lines[start] == "":
+            start += 1
+    body = "\n".join(lines[start:])
+    body = re.sub(r"\]\([^)\n]*\)", "]()", body)
+    return re.sub(r"`[^` \n]*/[^` \n]*`", "``", body).rstrip("\n")
+
+
+def marked(message):
+    """The ADRs a commit message names as typo fixes, as ADR-NNNN."""
+    return {item for match in TYPO.finditer(message) for item in match.group(1).split(", ")}
+
+
+def git(root, *args, data=None):
+    """git in `root`; the completed process, its output as bytes."""
+    return subprocess.run(["git", "-C", str(root), *args], input=data, capture_output=True)
+
+
+def frozen(adr_dir, adrs, since):
+    """--since: the problems and the notes of holding the ADRs that existed at the
+    merge base of `since` and HEAD to their text there (ADR 0081)."""
+    root = adr_dir.parent.parent
+    if shutil.which("git") is None or git(root, "rev-parse", "--git-dir").returncode:
+        return [], ["adr-index: not a git checkout, so no earlier ADR's text was compared"]
+    if since == "auto":
+        if git(root, "rev-parse", "--verify", "--quiet", "origin/main^{commit}").returncode:
+            return [], ["adr-index: no origin/main here, so no earlier ADR's text was compared"]
+        since = "origin/main"
+    found = git(root, "merge-base", since, "HEAD")
+    if found.returncode:
+        return [f"--since {since}: no merge base with HEAD "
+                f"({found.stderr.decode('utf-8', 'replace').strip() or 'not a commit'})"], []
+    base = found.stdout.decode().strip()
+    folder = adr_dir.relative_to(root).as_posix()
+    if git(root, "diff", "--quiet", base, "--", folder).returncode == 0:
+        return [], []
+
+    paths = [path for path in git(root, "ls-tree", "--name-only", base, f"{folder}/")
+             .stdout.decode("utf-8").split("\n") if ADR_FILE.fullmatch(path.rsplit("/", 1)[-1])]
+    # One git process for every blob at the base: `cat-file --batch` answers
+    # each "<rev>:<path>" line with "<sha> blob <size>", the bytes and a newline.
+    out = git(root, "cat-file", "--batch",
+              data="".join(f"{base}:{path}\n" for path in paths).encode("utf-8")).stdout
+    texts, at = {}, 0
+    for path in paths:
+        end = out.index(b"\n", at)
+        header, at = out[at:end].split(), end + 1
+        if len(header) == 3 and header[1] == b"blob":
+            size = int(header[2])
+            texts[path] = out[at:at + size].decode("utf-8", "replace")
+            at += size + 1
+
+    def typo_fix(number):
+        """Whether every commit since the base that changes ADR `number`'s text
+        names it as a typo fix: a commit that changes its frontmatter alone needs
+        no mark, one marked commit does not cover another's rewrite, and an edit
+        not committed yet is no fix."""
+        pathspec = f":(glob){folder}/{number}-*.md"
+        if git(root, "diff", "--quiet", "HEAD", "--", pathspec).returncode:
+            return False
+        log = git(root, "log", "--format=%x1e%H%x1f%B%x1f", "--name-only",
+                  f"{base}..HEAD", "--", pathspec).stdout.decode("utf-8", "replace")
+        def text_at(rev, name):
+            blob = git(root, "show", f"{rev}:{name}").stdout
+            return decision_text(blob.decode("utf-8", "replace"))
+
+        fixed = False
+        for entry in log.split("\x1e")[1:]:
+            sha, message, names = entry.split("\x1f", 2)
+            if all(text_at(f"{sha}^", name) == text_at(sha, name) for name in names.split()):
+                continue
+            if ref(number) not in marked(message):
+                return False
+            fixed = True
+        return fixed
+
+    problems, notes = [], []
+    for path, was in texts.items():
+        number = path.rsplit("/", 1)[-1][:4]
+        front = was.replace("\r\n", "\n").split("\n---", 1)[0] if was.startswith("---") else ""
+        status = FRONT_STATUS.search(front)
+        if status and status.group(1) == "proposed":
+            continue
+        adr = adrs.get(number)
+        if adr is None:
+            problems.append(f"{path}: ADR {number} existed at {base[:8]} and is gone: an ADR "
+                            "is never deleted, a later one supersedes it (ADR 0081)")
+        elif decision_text(was) != decision_text(adr.path.read_text(encoding="utf-8")):
+            if typo_fix(number):
+                notes.append(f"adr-index: ADR {number}'s text changed since {base[:8]}, "
+                             "as a typo fix its commit names")
+            else:
+                problems.append(
+                    f"docs/adr/{adr.name}: its text changed since {base[:8]}, but an ADR "
+                    "changes only in its frontmatter: a decision that changes is a new ADR "
+                    "that amends or supersedes it (ADR 0081). A typo fix names it in its "
+                    f"commit message, [typo ADR-{number}]")
+    return problems, notes
+
+
 def render(adrs):
     def link(number):
         other = adrs.get(number)
@@ -252,7 +384,7 @@ def render(adrs):
     return HEADER + "\n".join(rows) + "\n"
 
 
-def run(adr_dir, mode, out=sys.stdout, err=sys.stderr):
+def run(adr_dir, mode, out=sys.stdout, err=sys.stderr, since=None):
     """--write or --check against one docs/adr directory; returns the exit status."""
     adrs, problems = load(adr_dir)
     index = adr_dir / INDEX
@@ -271,6 +403,11 @@ def run(adr_dir, mode, out=sys.stdout, err=sys.stderr):
     elif index.read_text(encoding="utf-8") != expected:
         problems.append(f"docs/adr/{INDEX} is not what the frontmatter generates: "
                         "run make records (never edit it by hand)")
+    if since:
+        more, notes = frozen(adr_dir, adrs, since)
+        problems += more
+        for line in notes:
+            print(line, file=out)
     for line in problems:
         print(line, file=err)
     if problems:
@@ -368,6 +505,61 @@ CASES = [
      "not an ADR file name"),
 ]
 
+# --since, in a git repo whose first commit is GOOD and an accepted ADR with a
+# link and a path: what the second commit changes (None deletes the file), its
+# message (None leaves the change uncommitted), whether the check passes, and a
+# fragment it must print. A list of changes and a list of messages are commits
+# made in turn.
+THIRD = "---\nstatus: accepted\n---\n\n# ADR 0003 — the third\n\nSee [the finding]({}) and `{}`.\n"
+SINCE_BASE = {**GOOD, "0003-the-third.md": THIRD.format("../findings/a.md", "docs/a.md")}
+CHANGED = THIRD.format("../findings/a.md", "docs/a.md").replace("See", "Now see")
+SINCE_CASES = [
+    ("a new ADR that amends an earlier one, whose frontmatter alone changes",
+     {"0003-the-third.md": THIRD.format("../findings/a.md", "docs/a.md").replace(
+         "accepted\n", "deprecated\namended-by: [ADR-0071]\n"),
+      "0071-a-new-one.md": "---\nstatus: accepted\namends: [ADR-0003]\n---\n\n# A new one\n"},
+     "The third, amended by a new decision (#1)", True, "index in sync"),
+    ("a link's target and a path in backticks that moved",
+     {"0003-the-third.md": THIRD.format("../findings/archive/a.md", "docs/archive/a.md")},
+     "The finding, archived (#1)", True, "index in sync"),
+    ("an earlier ADR's text changed", {"0003-the-third.md": CHANGED},
+     "The third, rewritten (#1)", False, "its text changed since"),
+    ("an edit not committed yet", {"0003-the-third.md": CHANGED},
+     None, False, "its text changed since"),
+    ("a typo fix its commit names", {"0003-the-third.md": CHANGED},
+     "A typo in the third, fixed [typo ADR-0003] (#1)", True, "as a typo fix its commit names"),
+    ("a typo fix named in a list", {"0003-the-third.md": CHANGED},
+     "Two typos, fixed [typo ADR-0002, ADR-0003] (#1)", True, "as a typo fix its commit names"),
+    ("a typo fix among two marks of one message", {"0003-the-third.md": CHANGED},
+     "Typos, fixed [typo ADR-0002] [typo ADR-0003] (#1)", True, "as a typo fix its commit names"),
+    ("a typo mark that names another ADR", {"0003-the-third.md": CHANGED},
+     "A typo, fixed [typo ADR-0002] (#1)", False, "its text changed since"),
+    ("a typo mark on one commit and a rewrite in the next",
+     [{"0003-the-third.md": CHANGED}, {"0003-the-third.md": CHANGED.replace("Now", "Then")}],
+     ["A typo, fixed [typo ADR-0003] (#1)", "The third, rewritten (#1)"], False,
+     "its text changed since"),
+    ("a typo fix with an edit on top not committed yet",
+     [{"0003-the-third.md": CHANGED}, {"0003-the-third.md": CHANGED.replace("Now", "Then")}],
+     ["A typo, fixed [typo ADR-0003] (#1)", None], False, "its text changed since"),
+    ("a typo fix beside a commit that changes the frontmatter alone",
+     [{"0003-the-third.md": THIRD.format("../findings/a.md", "docs/a.md").replace(
+         "accepted\n", "deprecated\namended-by: [ADR-0071]\n"),
+       "0071-a-new-one.md": "---\nstatus: accepted\namends: [ADR-0003]\n---\n\n# A new one\n"},
+      {"0003-the-third.md": CHANGED.replace("accepted\n", "deprecated\namended-by: [ADR-0071]\n")}],
+     ["The third, amended by a new decision (#1)",
+      "A typo in the third, fixed [typo ADR-0003] (#1)"],
+     True, "as a typo fix its commit names"),
+    ("a blank line at the end", {"0003-the-third.md": SINCE_BASE["0003-the-third.md"] + "\n"},
+     "A blank line (#1)", True, "index in sync"),
+    ("a proposed ADR's text, still being written",
+     {"0070-a-short-one.md": GOOD["0070-a-short-one.md"] + "\nSharpened.\n"},
+     "The proposal, sharpened (#1)", True, "index in sync"),
+    ("an earlier ADR deleted", {"0003-the-third.md": None},
+     "The third, gone (#1)", False, "is gone"),
+    ("auto, in a clone with no origin/main", {"0003-the-third.md": CHANGED},
+     "The third, rewritten (#1)", True, "no origin/main here"),
+]
+
 
 def selftest():
     failed = 0
@@ -440,6 +632,43 @@ def selftest():
             check(run(adr_dir, "write", out, err) == 0 and expected in err.text,
                   f"--write still writes, naming it: {what}")
 
+    if shutil.which("git") is None:
+        print("  (no git on PATH: the --since cases are skipped)")
+    else:
+        for what, change, message, passes, expected in SINCE_CASES:
+            with tempfile.TemporaryDirectory() as root:
+                adr_dir = fixture(root, SINCE_BASE)
+                run(adr_dir, "write", Sink(), Sink())
+                hooks = pathlib.Path(root) / "no-hooks"
+                hooks.mkdir()
+                config = ["-c", "user.name=selftest", "-c", "user.email=selftest@invalid",
+                          "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false",
+                          "-c", f"core.hooksPath={hooks.as_posix()}"]
+                git(root, "init", "-q")
+                git(root, *config, "add", "-A")
+                git(root, *config, "commit", "-q", "-m", "The base")
+                steps = (list(zip(change, message)) if isinstance(change, list)
+                         else [(change, message)])
+                for step, step_message in steps:
+                    for name, text in step.items():
+                        if text is None:
+                            (adr_dir / name).unlink()
+                        else:
+                            (adr_dir / name).write_text(text, encoding="utf-8", newline="\n")
+                    run(adr_dir, "write", Sink(), Sink())
+                    if step_message:
+                        git(root, *config, "add", "-A")
+                        git(root, *config, "commit", "-q", "-m", step_message)
+                commits = sum(1 for _, step_message in steps if step_message)
+                since = ("auto" if what.startswith("auto")
+                         else f"HEAD~{commits}" if commits else "HEAD")
+                out, err = Sink(), Sink()
+                status = run(adr_dir, "check", out, err, since=since)
+                said = out.text + err.text
+                ok = (status == 0) == passes and expected in said
+                check(ok, f"{'passes' if passes else 'refused'}: {what}"
+                      + ("" if ok else f" -- got {status}: {said.strip()}"))
+
     print()
     if failed:
         print(f"adr-index selftest: {failed} failed", file=sys.stderr)
@@ -454,11 +683,16 @@ def main(argv=None):
     mode.add_argument("--write", action="store_const", const="write", dest="mode")
     mode.add_argument("--check", action="store_const", const="check", dest="mode")
     mode.add_argument("--selftest", action="store_const", const="selftest", dest="mode")
+    parser.add_argument("--since", metavar="REV",
+                        help="with --check: refuse a change to the text of an ADR that existed "
+                             "at the merge base of REV and HEAD ('auto': origin/main)")
     args = parser.parse_args(argv)
+    if args.since and args.mode != "check":
+        parser.error("--since goes with --check")
     if args.mode == "selftest":
         return selftest()
     adr_dir = pathlib.Path(__file__).resolve().parent.parent / "docs" / "adr"
-    return run(adr_dir, args.mode)
+    return run(adr_dir, args.mode, since=args.since)
 
 
 if __name__ == "__main__":

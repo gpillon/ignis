@@ -4,6 +4,14 @@
 # `make records-check` runs, each script's selftest and then its check, on a
 # push that touches either folder or either script. Python's standard library
 # alone: nothing to install.
+#
+# The ADR check also refuses a change to the text of an ADR that existed
+# before the push (--since): a decision that changes is a new ADR, and the old
+# one changes only in its frontmatter. Its base is the push's previous tip, a
+# new branch's merge base with main, or a pull request's base, so the checkout
+# takes the history (commits and trees, no blobs until one is read). No
+# concurrency group: a run cancelled by the next push would leave its push's
+# range unchecked, and a run takes seconds.
 
 name: records
 
@@ -27,20 +35,28 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: records-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   records:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
       - name: The ADR index's selftest
         run: python3 mk/adr-index.py --selftest
       - name: The findings index's selftest
         run: python3 mk/findings-index.py --selftest
-      - name: The ADRs' frontmatter and their index
-        run: python3 mk/adr-index.py --check
+      - name: The ADRs' frontmatter and their index, and no earlier ADR's text changed
+        env:
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          since="${PR_BASE:-$BEFORE}"
+          if [ -z "$since" ] || [ "$since" = 0000000000000000000000000000000000000000 ] ||
+              ! git cat-file -e "$since^{commit}" 2>/dev/null; then
+              since=auto
+          fi
+          python3 mk/adr-index.py --check --since "$since"
       - name: The findings' frontmatter and their index
         run: python3 mk/findings-index.py --check

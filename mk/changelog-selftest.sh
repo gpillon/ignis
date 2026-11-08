@@ -106,6 +106,8 @@ printf '%s\n' '---' 'status: accepted' '---' '' '# A decision deprecated with a 
     > docs/adr/0008-deprecated.md
 printf '# ADR 0009 — a decision superseded already\n\n## Status\n\nSuperseded by ADR 0002.\n' \
     > docs/adr/0009-superseded.md
+printf '%s\n' '---' 'status: accepted' '---' '' '# A decision with a typo' '' 'Its reasno.' \
+    > docs/adr/0010-typo.md
 commit "Groundwork, and the earlier half of #20"
 git tag -a v9.9.8 -m v9.9.8
 export GIT_AUTHOR_DATE='2026-01-03T00:00:00Z' GIT_COMMITTER_DATE='2026-01-03T00:00:00Z'
@@ -145,6 +147,10 @@ printf '%s\n' '---' 'status: superseded by ADR-0002' '---' '' \
 # The generated index is not a decision.
 printf '# Architecture decision records\n\n| ADR |\n' > docs/adr/README.md
 commit "The frontmatter, and the index (#10)"
+# A typo fix its commit names is not an amendment (mk/adr-index.py --since).
+printf '%s\n' '---' 'status: accepted' '---' '' '# A decision with a typo' '' 'Its reason.' \
+    > docs/adr/0010-typo.md
+commit "A typo in a decision, fixed [typo ADR-0010] (#10)"
 commit "The duplicate, mentioned anyway (#40)"
 commit "Merge: a branch"
 commit "ignis 9.9.9"
@@ -233,6 +239,10 @@ has "ADR 0008 — A decision deprecated with a reason (amended, now deprecated)"
 has "ADR 0009" "$decisions" \
     && fail "a Status section's Superseded read as a change of status: $decisions" \
     || note "a Status section's Superseded is the frontmatter's superseded by"
+
+has "ADR 0010" "$decisions" \
+    && fail "a typo fix its commit names made an ADR amended: $decisions" \
+    || note "a typo fix its commit names is not an amendment"
 
 has "Architecture decision records" "$decisions" \
     && fail "the generated index reached the Decisions: $decisions" \

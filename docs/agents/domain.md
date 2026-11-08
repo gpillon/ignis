@@ -15,6 +15,9 @@ set of decisions, `docs/adr/`, listed in its generated index
 - An ADR takes the next free number when it merges into `main`; if `main` took
   that number first, the ADR is renumbered with every line that cites it
   (b61a224f).
-- An ADR changes through a new ADR that amends it (ADR 0081).
+- An ADR changes through a new ADR that amends it (ADR 0081): once it is no
+  longer `proposed`, its text stays as written and only its frontmatter
+  changes. `make records-check` and the records workflow refuse anything else;
+  a typo fix says `[typo ADR-NNNN]` in its commit message.
 - Where a skill's convention and the repo's disagree, ADR 0070 lists where the
   repo differs.

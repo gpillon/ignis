@@ -240,11 +240,14 @@ fi
 #
 # Since ADR 0081 an ADR whose decision changed is amended by a new one and
 # changes only in its frontmatter, so a modified ADR is "(amended)" only when
-# its text changed: the frontmatter is dropped, and every link target and every
-# path in backticks blanked, on both sides first, and a status, a back-link or a moved file's path is not an
-# amendment. A status that changed is said, "(now superseded by ADR 0082)",
-# against the long form's `## Status` section when the older side has no
-# frontmatter yet. docs/adr/README.md is the generated index, not a decision.
+# its text changed: the frontmatter is dropped, and every link target and
+# every path in backticks blanked, on both sides first, so a status, a
+# back-link or a moved file's path is not an amendment; nor is a typo fix that
+# a commit in the range names, `[typo ADR-0032]`, the one change to an earlier
+# ADR's text `mk/adr-index.py --since` lets through. A status that changed is
+# said, "(now superseded by ADR 0082)", against the long form's `## Status`
+# section when the older side has no frontmatter yet. docs/adr/README.md is
+# the generated index, not a decision.
 adr_text() { # <rev> <path>
     git show "$1:$2" 2>/dev/null |
         awk 'NR == 1 && $0 == "---" { front = 1; next }
@@ -263,6 +266,8 @@ adr_status() { # <rev> <path>: the frontmatter's status, else the Status section
              section && NF { word = tolower($1); gsub(/[^a-z]/, "", word); print word; exit }'
 }
 adrs="$(git diff --name-status "$from..$to" -- docs/adr/ 2>/dev/null | grep -E '^[AM]')"
+typos="$(git log --format=%B "$from..$to" |
+    grep -oE '\[typo ADR-[0-9]{4}(, ADR-[0-9]{4})*\]' | grep -oE '[0-9]{4}' | sort -u)"
 decisions=""
 while IFS=$'\t' read -r status path; do
     [ -n "$path" ] || continue
@@ -281,7 +286,8 @@ while IFS=$'\t' read -r status path; do
         A*) decisions="$decisions- $heading"$'\n' ;;
         M*)
             note=""
-            [ "$(adr_text "$from" "$path")" = "$(adr_text "$to" "$path")" ] || note="amended"
+            [ "$(adr_text "$from" "$path")" = "$(adr_text "$to" "$path")" ] ||
+                printf '%s\n' "$typos" | grep -qx "${file%%-*}" || note="amended"
             was="$(adr_status "$from" "$path")"
             now="$(adr_status "$to" "$path")"
             # "superseded" in a Status section is the same as the frontmatter's

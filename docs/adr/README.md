@@ -13,6 +13,8 @@ memory of why ignis is built the way it is.
 - **A decision that changes** is recorded by a new ADR that amends or
   supersedes the old one, whose text then stays as it was: only its
   frontmatter changes (`amended-by`, or a status of `superseded by`).
+  `make records-check` refuses any other change to an ADR that is no longer
+  `proposed`, a typo fix aside when its commit message says `[typo ADR-NNNN]`.
 - **This file is generated** from the frontmatter by `mk/adr-index.py`
   (`make records`), and `make records-check` fails when it is out of date:
   never edit it by hand.
