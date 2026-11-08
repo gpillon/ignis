@@ -35,8 +35,37 @@ a sibling still under its internal name moved case 10 from p(yes) 0.996 to
   needs a today, and `retrieved` is the extraction date. It went into 14
   too, so that pair still differs only in the renewal date.
 
+**Owner's review (2026-11-08, #537).** The owner read every case and decided
+by one reading rule, then case by case. The rule: arithmetic on numbers the
+evidence states is a direct reading; a conversion that needs the calendar is
+outside knowledge. The evidence and the labels of every case are unchanged;
+the claim lines of five cases and the notes of two were:
+
+- **3, 4**: "more than three months" became "more than 90 days". Three months
+  in days is a calendar fact the evidence lacks; 118 > 90 and 12 < 90 read
+  straight from it. Owner's decision, 2026-11-08, #537.
+- **12**: "No economic buyer has been identified on the account map" became
+  "No node on the account map has the role Economic Buyer". The first also
+  asked that a buyer would appear as a node role; the second says what the
+  list shows. Owner's decision, 2026-11-08, #537.
+- **16**: "has not been modified since March 2026" became "was last modified in
+  March 2026". "Since March" reads two ways, one of them contradicted by the
+  4 March date. Owner's decision, 2026-11-08, #537.
+- **18**: "currently" was dropped. The evidence is a snapshot of 2026-09-20 and
+  "currently" asks that it still holds. Owner's decision, 2026-11-08, #537.
+- **11, 13** (notes only): 11 says that neither "stale" follows without a
+  threshold, so its "no" has two reasons; 13 says that under the strict
+  criteria the model's "no" is a defensible reading, not only an error, since
+  counting days between dates is a calendar conversion. Owner's decision,
+  2026-11-08, #537.
+
+Every other case is kept as it was. The set stays 18 cases, 8 "yes" and 10
+"no". The two ignis-written "yes" cases the review allowed for were not
+added: the re-measurement left two "yes" gate cases (1 and 18), so the gate
+holds a case of each label without them.
+
 **Tiers.** `tier` is ignis's, from one measurement of this file on the
-RTX 5090 (2026-11-08, main 1188385c), taken over every route the card runs
+RTX 5090 (2026-11-08, main 86c2f8ff, taken again after the review above), taken over every route the card runs
 rather than one: a case near the 0.5 line falls on either side under any
 change of the numerics, and asserting it reports the change, not a fault.
 
