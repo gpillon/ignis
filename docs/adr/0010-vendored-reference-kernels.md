@@ -19,7 +19,7 @@ correctness bug may also carry a recorded patch, with a test that fails
 without it; the behaviour it changes is **Ignis patched**, everything else
 **reference parity**.
 
-Sources: `docs/REVIEW-2026-09-05.md` §3.2, §4.2, §5.4; spec
+Sources: `docs/archive/REVIEW-2026-09-05.md` §3.2, §4.2, §5.4; spec
 `docs/specs/runtime/01-device-resident-forward.md` (GitHub #36).
 
 ## Context

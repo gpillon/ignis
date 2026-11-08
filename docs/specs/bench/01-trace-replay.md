@@ -3,7 +3,7 @@
 GitHub: #19
 
 Re-send a recorded "1 main agent + N subagents" load trace (JSONL) against
-the running engine (`docs/design/ignis-v1.md` §4, §6). Drive the scheduler
+the running engine (`docs/archive/ignis-v1.md` §4, §6). Drive the scheduler
 with a realistic concurrent load; collect per-request ttft / tok-s. The
 reference is recorded with the **same** harness so comparisons are
 apples-to-apples (eager CUDA graph on both sides).

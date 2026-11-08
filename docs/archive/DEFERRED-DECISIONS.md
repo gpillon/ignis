@@ -1,3 +1,5 @@
+> Archived on 2026-11-08: a snapshot of 2026-09-09 to 2026-10-13; see [docs/archive/README.md](README.md).
+
 # Deferred decisions
 
 Things considered and deliberately **not** built, with the reasoning that
@@ -60,7 +62,7 @@ loop frozen around "a prefill call runs to completion" would have to be
 rewritten, not extended, to reach either of the other two.
 
 **Note for the future reader:** the reference does not overlap prefill and
-decode at all. This is named in `docs/REVIEW-2026-09-05.md` §6 as the
+decode at all. This is named in `docs/archive/REVIEW-2026-09-05.md` §6 as the
 real differentiator for subagent bursts.
 
 ### 3. More than one active prefill, and multi-prefill chunk interleaving

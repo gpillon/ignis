@@ -15,10 +15,8 @@ ignis.http.request                 (crates/server/src/api.rs, tower-http TraceLa
   │
   ├── ignis.admission               (crates/core/src/concrete.rs, try_admit)
   ├── ignis.prefill                 (concrete.rs, per prefill_step call)
-  ├── ignis.decode.round  (× N)     (concrete.rs, per decode_step call)
-  │     └── ignis.decode.mtp_verify  ← attach point for a future MTP/
-  │                                    speculative-decoding verify span
-  │                                    (not built yet — see "Future stages")
+  ├── ignis.decode.round  (× N)     (concrete.rs, per decode_step call,
+  │                                   a speculative verify round included)
   ├── ignis.completion              (concrete.rs, mark_done)
   └── ignis.telemetry.emit          (server/src/telemetry.rs, emit_request —
                                       backs the `ignis.request.admitted` /
@@ -75,16 +73,16 @@ by construction, and that is deliberate rather than an oversight:
 
 `ignis.decode.round` is opened once per request per `Compute::decode_step`
 call — the same unit a decode CUDA graph is captured over (`GLOSSARY.md`,
-**Decode round**). A round can only ever advance a sequence by one token
-today (the leaf has no host-visible sub-round hook — "device-resident, no
-host activation pointer crosses it," ADR 0009), so for the current
-codebase "one span per round" and "one span per token" coincide for any
-single request. The distinction is intentionally forward-looking: DFlash2 /
-MTP verify (not built yet) may resolve *more than one* token per round.
-When it lands, its span (`ignis.decode.mtp_verify`, attaching as a child of
-the same round's outcome-processing scope) must stay **one span per
-request per round**, exactly like `ignis.decode.round` itself — never one
-per verified token. That is the failure mode ADR 0012 and spec §26 call
+**Decode round**). Without speculation a round advances a sequence by one
+token, so "one span per round" and "one span per token" coincide. With
+speculation (DFlash2 on the 27B, MTP on Flash-Next) a round is a verify
+round: the leaf verifies the drafts inside the same `decode_step` call (it
+has no host-visible sub-round hook — "device-resident, no host activation
+pointer crosses it," ADR 0009) and returns the run it committed, with the
+round's `SpecCounters` on its `DecodeOutcome`. Such a round still opens the
+one `ignis.decode.round` span per request, and no verify span opens beside
+it or under it: **one span per request per round**, never one per verified
+or committed token. That is the failure mode ADR 0012 and spec §26 call
 out explicitly, and why a reviewer should treat any finer subdivision as a
 defect, not a style choice.
 
@@ -111,6 +109,6 @@ A future stage's span should:
 3. Stay at the coarsest unit that loop naturally provides — never finer
    than "once per request per existing iteration."
 
-`ignis.decode.mtp_verify` (MTP verify, spec's example) is one span per
-request per round, a child of the same scope `ignis.decode.round` opens in,
-right where a verify step's result would be applied to the outcome.
+Speculative verify, the spec's example of such a stage, needed no span of
+its own: it runs inside the leaf's decode step, so `ignis.decode.round`
+covers it (**Granularity**, above).

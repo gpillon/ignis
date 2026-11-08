@@ -1,7 +1,7 @@
 # runtime — the device-resident inference runtime (the reset)
 
 Feature area created 2026-09-05 from the project review
-(`docs/REVIEW-2026-09-05.md`). It replaces the `kernel-abi` feature area:
+(`docs/archive/REVIEW-2026-09-05.md`). It replaces the `kernel-abi` feature area:
 the per-op, host-pointer C ABI and the host-resident compute adapter are
 superseded by a **step-level, device-resident** runtime whose forward pass
 lives in the kernel leaf.
@@ -16,4 +16,4 @@ prefill (G2), batched decode rounds + per-width CUDA graphs + sampling (G3),
 the ninfer feature floor — hq-e8-2b, device prefix reuse, KV-RAM tier, tagged
 lanes (G4), speculative decoding (G5).
 
-Roadmap and ticket map: `docs/ROADMAP.md` (G1 master #36, tickets #37–#62; masters #63–#66 for G2–G5).
+Roadmap and ticket map: `docs/archive/ROADMAP.md` (G1 master #36, tickets #37–#62; masters #63–#66 for G2–G5).

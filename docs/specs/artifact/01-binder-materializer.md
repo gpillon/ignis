@@ -32,7 +32,7 @@ Port the reference's per-model **binder** (`binder.h`), **materializer**
 
 ## References
 
-- Design: `docs/design/ignis-v1.md` §2 (Artifact loader), §7 (frontend
+- Design: `docs/archive/ignis-v1.md` §2 (Artifact loader), §7 (frontend
   risk).
 - ADRs: 0001 (flat C ABI), 0002 (load failure on unconsumed objects), 0006
   (exclusive GPU).

@@ -5,7 +5,7 @@ GitHub: #20
 Run the **canary suite** (fixed, high-signal prompts) for divergence
 detection; produce the **performance report** (tok-s, ttft vs reference) +
 a self-consistency check. This is the **v1 acceptance gate**
-(`docs/design/ignis-v1.md` §4, ADR 0007):
+(`docs/archive/ignis-v1.md` §4, ADR 0007):
 
 - **≥ 99% of the reference's performance** (throughput / latency) on the
   trace-replay load, with a per-class ttft / tok-s check.

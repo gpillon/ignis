@@ -3,7 +3,7 @@
 The Rust bench crate (`ignis-bench`) is the trace-replay harness + the
 v1 acceptance gate. It re-sends a recorded "1 main agent + N subagents"
 load trace (JSONL) against the running engine and produces the performance
-report. Per `docs/design/ignis-v1.md` §4 (acceptance) and §6 (bench crate).
+report. Per `docs/archive/ignis-v1.md` §4 (acceptance) and §6 (bench crate).
 
 The reference is recorded with the **same** harness so comparisons are
 apples-to-apples (eager CUDA graph on both sides). The reference is a
@@ -34,7 +34,7 @@ apples-to-apples (eager CUDA graph on both sides). The reference is a
 
 ## References
 
-- Design: `docs/design/ignis-v1.md` §4 (acceptance), §6 (bench crate).
+- Design: `docs/archive/ignis-v1.md` §4 (acceptance), §6 (bench crate).
 - ADRs: 0005 (performance-first, reference = speed-only), 0006 (exclusive
   GPU testing), 0007 (performance gate, not parity).
 - Upstream: `server-01` (HTTP to replay against), the full v1 feature set

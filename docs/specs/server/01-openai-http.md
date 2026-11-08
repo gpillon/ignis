@@ -3,7 +3,7 @@
 GitHub: #14
 
 OpenAI-compatible HTTP on **localhost, no auth, configurable bind**
-(`docs/design/ignis-v1.md` §1). Route requests into the core scheduler and
+(`docs/archive/ignis-v1.md` §1). Route requests into the core scheduler and
 stream tokens back:
 
 - `GET /v1/models` — list the loaded model(s).

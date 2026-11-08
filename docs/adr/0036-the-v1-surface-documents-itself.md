@@ -12,7 +12,7 @@ Accepted (2026-09-21, owner decision — GitHub #250 / #251).
 
 An ignis server served an OpenAI-compatible surface and one endpoint that is
 its own (`POST /v1/decide`, ADR 0034) and said nothing about either. The
-contract lived in `docs/design/ignis-v1.md` §2 and in doc comments: in the
+contract lived in `docs/archive/ignis-v1.md` §2 and in doc comments: in the
 repo, not on the wire, and free to drift from the handlers it described. A
 client author had to read Rust to learn a field name; `/v1/decide`, which no
 external documentation covers, was the least guessable shape on the server.
@@ -63,7 +63,7 @@ cost the binary no more than the crate's own embed and build with any
 toolchain, offline, on every platform. `utoipa` and `utoipa-axum` themselves
 are pure Rust and are taken as crates.
 
-**The narrative doc stays.** `docs/design/ignis-v1.md` §2 keeps describing
+**The narrative doc stays.** `docs/archive/ignis-v1.md` §2 keeps describing
 the surface in prose; the generated document is the machine-readable
 contract. Neither is regenerated from the other.
 

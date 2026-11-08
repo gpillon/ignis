@@ -4,7 +4,7 @@ The Rust core (`ignis-core`) owns everything above the kernel leaf: the
 scheduler, the KV cache, the GDN state, and the request state machine. It
 sits between the HTTP server (above) and the flat C ABI kernel leaf (below).
 This feature builds the v1 core, layer by layer, per
-`docs/design/ignis-v1.md` §2 (Scheduler, Paged KV, KV-RAM host tier, GDN
+`docs/archive/ignis-v1.md` §2 (Scheduler, Paged KV, KV-RAM host tier, GDN
 state).
 
 The core is the highest-risk module of v1 (the design doc says so explicitly),
@@ -51,7 +51,7 @@ prefix → sibling-prefix reuse).
 
 ## References
 
-- Design: `docs/design/ignis-v1.md` §2 (Scheduler, Paged KV, KV-RAM, GDN),
+- Design: `docs/archive/ignis-v1.md` §2 (Scheduler, Paged KV, KV-RAM, GDN),
   §3 (milestones).
 - Glossary: `GLOSSARY.md` (Scheduling & cache, Engine & process).
 - Upstream: `artifact-01` (device materialization) for KV tensor geometry.

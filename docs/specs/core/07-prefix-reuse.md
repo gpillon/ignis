@@ -2,7 +2,7 @@
 
 GitHub: #18
 
-**Prefix reuse** (`docs/design/ignis-v1.md` §2, `GLOSSARY.md` "Prefix
+**Prefix reuse** (`docs/archive/ignis-v1.md` §2, `GLOSSARY.md` "Prefix
 reuse"):
 
 - Concurrent requests sharing a prefix skip the redundant prefill — siblings

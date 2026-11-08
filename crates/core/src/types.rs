@@ -3,7 +3,7 @@
 //! This is the **stable public contract** between the engine (`ignis-core`)
 //! and its consumers (the server crate, tests, the kernel leaf). The types
 //! here are deliberately small and `Send + Sync` friendly. See
-//! `docs/design/ignis-v1.md` §2 and `GLOSSARY.md` for the domain vocabulary.
+//! `docs/archive/ignis-v1.md` §2 and `GLOSSARY.md` for the domain vocabulary.
 
 /// Opaque id for a request admitted by the scheduler.
 pub type RequestId = u64;

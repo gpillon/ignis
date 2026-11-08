@@ -22,6 +22,6 @@ Define and implement the first C ABI surface (the decode step):
 
 ## References
 
-- Design: `docs/design/ignis-v1.md` §2 (Kernel leaf), §3.
+- Design: `docs/archive/ignis-v1.md` §2 (Kernel leaf), §3.
 - ADRs: 0001 (flat C ABI), 0003 (divergence report), 0006 (exclusive GPU).
 - Surface: `kernel/include/ignis_kernel.h`; Rust FFI: `crates/core/src/ffi.rs`.

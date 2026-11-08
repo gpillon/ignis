@@ -1,6 +1,6 @@
 //! ignis-core: the engine's scheduling and state layer.
 //!
-//! v1 scope (`docs/design/ignis-v1.md` §2):
+//! v1 scope (`docs/archive/ignis-v1.md` §2):
 //! - scheduler: 1 global prefill lane + N decode lanes, full admission state
 //!   machine (ADR 0004)
 //! - paged KV cache in VRAM + block tables
@@ -9,7 +9,7 @@
 //! - the model topology config (`compute::ModelConfig`) the forward pass
 //!   will be parameterized by, once the vendored compute adapter lands
 //!   (GitHub #39 deleted the superseded flat-C-ABI forward; the
-//!   replacement is tracked at `docs/ROADMAP.md`, P1-24 / #60)
+//!   replacement is tracked at `docs/archive/ROADMAP.md`, P1-24 / #60)
 //! - the model-load step ABI call (`model_load`, feature `cuda`, GitHub
 //!   #53 / ADR 0009): builds the bound-tensor + topology descriptors the
 //!   kernel leaf's `ignis_model_load` consumes

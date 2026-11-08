@@ -3,7 +3,7 @@
 GitHub: #7
 
 Extract and verify the **frontend object set** carried inside the artifact
-container (confirming the `docs/design/ignis-v1.md` §7 risk that the
+container (confirming the `docs/archive/ignis-v1.md` §7 risk that the
 frontend is carried by the container):
 
 - `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`,
@@ -22,7 +22,7 @@ frontend is carried by the container):
 
 ## References
 
-- Design: `docs/design/ignis-v1.md` §7 (frontend risk).
+- Design: `docs/archive/ignis-v1.md` §7 (frontend risk).
 - ADR: 0002 (load failure on unconsumed / ambiguous objects).
 - Server wiring: `crates/server/src/artifact_template.rs`
   (`ArtifactTemplateProvider`, `Server::with_artifact_template`).

@@ -1,7 +1,7 @@
 //! The concrete scheduler — `core-04` (N=8 decode lanes + batched
 //! prefill) + `core-05` (the full admission state machine, ADR 0004).
 //!
-//! The v1 scheduler (`docs/design/ignis-v1.md` §2) driving the [`Compute`]
+//! The v1 scheduler (`docs/archive/ignis-v1.md` §2) driving the [`Compute`]
 //! seam (production: the kernel leaf via FFI, tests: [`crate::mock::MockCompute`])
 //! in three phases per advance:
 //!
@@ -294,7 +294,7 @@ pub struct SchedulerConfig {
 pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// The serving prefill chunk width's default, in tokens (ADR 0018): the
-/// measured 1,024-token chunk from the G2 gate run (`docs/ROADMAP.md`).
+/// measured 1,024-token chunk from the G2 gate run (`docs/archive/ROADMAP.md`).
 /// P3-01 is CPU-only (driven through the `Compute` seam with `MockCompute`),
 /// so this is the value CPU tests and this config's [`Default`] use; wiring
 /// a real `--features cuda` load's actual reserved width through

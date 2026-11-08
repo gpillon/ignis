@@ -34,6 +34,6 @@ starting point per ADR 0005 (re-implement later, guided by the north-star).
 
 ## References
 
-- Design: `docs/design/ignis-v1.md` §2 (Kernel leaf), §3.
+- Design: `docs/archive/ignis-v1.md` §2 (Kernel leaf), §3.
 - ADRs: 0001 (C++ kernel leaf, C ABI), 0005 (performance-first), 0007 (gate).
 - Decode C ABI: ticket kernel-port 03 (open, `#3`).

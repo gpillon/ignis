@@ -2,7 +2,7 @@
 
 GitHub: #63 (phase 2 master; blocked by #36, gate G1)
 
-Source: `docs/REVIEW-2026-09-05.md` §6 (Phase 2), `docs/ROADMAP.md`
+Source: `docs/archive/REVIEW-2026-09-05.md` §6 (Phase 2), `docs/archive/ROADMAP.md`
 (the G2 row and the phase 2–5 candidate decomposition), and the grilling
 session of 2026-09-07 that turned them into this spec. Builds directly on
 `docs/specs/runtime/01-device-resident-forward.md` (G1).

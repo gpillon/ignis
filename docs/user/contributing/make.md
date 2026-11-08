@@ -16,7 +16,7 @@ Git for Windows' `usr\bin` on `PATH`). `make` alone lists every target.
 | `make run` | Run the last build; fails, naming the changed files, if it is stale. |
 | `make mock` | `make dev` on the CPU mock: no GPU, no kernel leaf, no artifact. |
 | `make start` / `stop` / `restart` / `status` / `logs` | The background server; it outlives the terminal. Log and pid under `.scratch/serve/`. |
-| `make redeploy` | Build, and only if it succeeds: stop + start. On Windows the build fails while the server runs, since Windows locks a running exe: `stop`, `build`, `start` instead. |
+| `make redeploy` | Build, and only if it succeeds: stop + start. On Windows the build fails while the server runs, since Windows locks a running exe: `stop`, `build`, `start` instead, each once the one before it succeeded. |
 | `make dev-ui` / `run-ui` | Server plus Playground hot reload as one session; Ctrl+C stops both. |
 | `make web-dev` / `web-mock` | Vite alone, against a running engine or an in-process fake one. |
 | `make smoke` / `canary` | One `/v1/models` + a short completion / the canary suite. |
@@ -69,3 +69,15 @@ verbatim.
 
 A CUDA `run` or `start` first runs a GPU guard (the preflight plus a check for
 other Ignis GPU work), skippable with `GPU_CHECK=0`.
+
+`start`, like `run`, launches the last build and refuses a stale one, naming
+the files changed since: `make build` is the fix. It rewrites
+`ignis-server.log` and its `.err` in `.scratch/serve/`, so before restarting a
+server whose log holds an incident, copy both out. A script runs `make start`
+with its output sent to a file (`make start > file 2>&1` from bash): the
+server inherits a pipe (`| Tee-Object`, `| tail`) and holds it open for as long
+as it runs.
+
+A change to the `Makefile` starts from
+[ADR 0027](../../adr/0027-make-as-the-dev-entrypoint.md), the decision that
+made `make` the entry point.

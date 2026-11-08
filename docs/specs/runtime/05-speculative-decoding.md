@@ -2,10 +2,10 @@
 
 GitHub: #66 (phase 5 master; blocked by #65, gate G4 — closed 2026-09-13)
 
-Source: `docs/REVIEW-2026-09-05.md` §6 (Phase 5), `docs/ROADMAP.md`
+Source: `docs/archive/REVIEW-2026-09-05.md` §6 (Phase 5), `docs/archive/ROADMAP.md`
 (the G5 row), the G3 constraints recorded on #66 (2026-09-09), and the
 grilling session of 2026-09-13 whose decisions are in
-`docs/DEFERRED-DECISIONS.md` ("From the G5 grilling session"). Builds
+`docs/archive/DEFERRED-DECISIONS.md` ("From the G5 grilling session"). Builds
 directly on `docs/specs/runtime/04-reference-feature-floor.md` (G4).
 
 ADRs respected: 0005 (performance-first above a sane-output floor; the

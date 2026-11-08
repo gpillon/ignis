@@ -3,7 +3,7 @@
 GitHub: #9
 
 The paged KV cache (VRAM) + block table for `ignis-core`
-(`docs/design/ignis-v1.md` §2):
+(`docs/archive/ignis-v1.md` §2):
 
 - The KV pool is **auto-sized from free VRAM** (~12–13 GB budget after
   weights + graphs + runtime).
