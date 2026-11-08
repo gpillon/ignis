@@ -3,8 +3,9 @@
 //! Round shape). Included by path from the multimodal speculative acceptance
 //! (`vision_dflash2_gpu.rs`) and from the CPU test of these rules
 //! (`round_shape_near_tie.rs`). No GPU types: the GPU test computes the two
-//! shapes' logits through the prefill, this module says what they mean and
-//! which spans the verify shape replays.
+//! shapes' logits through the prefill, this module says what they mean, which
+//! round's snapshot the verify shape starts from and which of its rows it
+//! reads.
 //!
 //! A decode round is one column wide and a verify round `k + 1`, and the wider
 //! shape takes other activation routes (ADR 0016), so the two can rank two
@@ -131,36 +132,28 @@ pub struct VerifyRound {
     pub committed: usize,
 }
 
-/// The spans the verify-shape probe writes after the prompt.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Replay {
-    /// The round that drew the split token.
-    pub round: usize,
-    /// Every earlier round, one span from its base over the columns it
-    /// committed, in positions.
-    pub history: Vec<Range<u64>>,
-    /// The split's round: one span as wide as the verify round from its base.
-    pub span: Range<u64>,
-    /// The row of `span` whose logits drew the split token.
-    pub row: usize,
-}
+impl VerifyRound {
+    /// The row of the round's columns whose logits drew the text's token
+    /// `split` (`text[0]` at `first`, the prompt's end). Column `j` at
+    /// `base + j` drew the token after it: an accepted draft, or at the last
+    /// committed column the correction, the sequence's pending token that the
+    /// next round takes as its anchor. `None` when another round drew it, and
+    /// for token 0, which the prompt's own prefill drew in both runs alike.
+    pub fn row(&self, first: u64, split: usize) -> Option<usize> {
+        let drawn_at = (first + split as u64).checked_sub(1)?;
+        (self.base <= drawn_at && drawn_at < self.base + self.committed as u64).then(|| (drawn_at - self.base) as usize)
+    }
 
-/// The replay of `rounds` that reaches the position `drawn_at`, whose logits
-/// drew the split token, in a span `columns` wide: the verify round's width
-/// whatever the round's extent. A round's column `j` at `base + j` drew the
-/// token after it -- an accepted draft or the correction -- so the round
-/// that drew the split covers `drawn_at` among its committed columns. `None`
-/// when no round does: before the first round's base the prompt's own prefill
-/// drew it.
-pub fn replay(rounds: &[VerifyRound], columns: u32, drawn_at: u64) -> Option<Replay> {
-    let round = rounds.iter().position(|r| r.base <= drawn_at && drawn_at < r.base + r.committed as u64)?;
-    let base = rounds[round].base;
-    Some(Replay {
-        round,
-        history: rounds[..round].iter().map(|r| r.base..r.base + r.committed as u64).collect(),
-        span: base..base + u64::from(columns),
-        row: (drawn_at - base) as usize,
-    })
+    /// Whether this round drew the first token at which `known` -- the
+    /// speculative run's text once the round has committed, its pending token
+    /// last -- departs from the decode rounds' text `off`. That round is the
+    /// one whose snapshot, taken at its base, the run keeps: the token is the
+    /// round's correction when it departs at the pending token, which the run
+    /// commits only as the next round's anchor. Past `off`'s end no token
+    /// departs.
+    pub fn drew_the_departure(&self, first: u64, off: &[i32], known: &[i32]) -> bool {
+        off.iter().zip(known).position(|(x, y)| x != y).is_some_and(|split| self.row(first, split).is_some())
+    }
 }
 
 /// A span's tokens: `text` at the span's positions, `text[0]` at `first`, and
