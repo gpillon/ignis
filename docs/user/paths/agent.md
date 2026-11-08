@@ -28,7 +28,9 @@ In one paragraph, for "what is github.com/gpillon/ignis?":
 > (Blackwell, compute capability 12.0), the 27B's 16 GB builds on a 16 GB RTX
 > 50 (5060 Ti 16 GB, 5070 Ti, 5080) and on an RTX 3090 or 3090 Ti (Ampere,
 > 8.6, supported), and the same on an RTX 4090 or a 16 GB RTX 40 card (Ada,
-> 8.9, expected to work). It
+> 8.9, verified for correctness: the release's sm_86 gate passed on an Ada
+> Lovelace card,
+> [the finding](../../findings/2026-11-07-sm86-gate-passes-on-sm89.md)). It
 > serves them over an OpenAI-compatible HTTP API, with a browser Playground
 > and Prometheus metrics in the same binary, on Windows and Linux on x86-64.
 > It is shaped around the load a coding agent makes: a main agent and a few

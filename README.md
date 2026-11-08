@@ -92,7 +92,9 @@ non-commercial use only.
 **What it runs on.** The RTX 5090 and the RTX PRO 6000 run every model, and
 the 16 GB RTX 50 cards the 16 GB entries. The **RTX 3090 and 3090 Ti** are
 supported, on the 27B's 16 GB entries; the **RTX 4090** and the 16 GB RTX 40
-cards are expected to work, and reports are welcome. An RTX 30 or RTX 40 card
+cards are verified for correctness: the release's sm_86 gate passed on an Ada
+Lovelace card (sm_89)
+([the finding](docs/findings/2026-11-07-sm86-gate-passes-on-sm89.md)). An RTX 30 or RTX 40 card
 needs release 0.10.0 or the development build: the 0.9 releases are built for
 Blackwell alone. The NVFP4 builds, Flash-Next
 and the image model load on Blackwell alone, on a card of 32 GB or more

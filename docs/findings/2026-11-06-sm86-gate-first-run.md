@@ -95,3 +95,5 @@ other flag:
 
 - [GitHub #485](https://github.com/gpillon/ignis/issues/485): the 0.10.0 release, which this gate and #516's
   speed gate were waiting for.
+- [The sm_86 gate passes on an Ada Lovelace card (sm_89)](2026-11-07-sm86-gate-passes-on-sm89.md): the same gate
+  on sm_89 at `main` b13dbc05, 2026-11-07.
