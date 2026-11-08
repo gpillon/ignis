@@ -3,17 +3,21 @@
 //! eighteen synthetic account-planning cases, one fixed question whose
 //! `criteria` define "support" as entailment rather than plausibility.
 //!
-//! **Only `gate` cases are asserted.** A `watch` case was right when first
-//! measured but within one logit of the 0.5 line, where a quantisation or
-//! artifact change flips it without anything being broken; a
-//! `known_failure` (case 13, date arithmetic) has the right label and the
-//! model gets it wrong. Both are printed, never asserted. Every line prints
+//! **Only `gate` cases are asserted**, on the card's default route. A case
+//! is a gate when it is right by at least one logit taken as the minimum
+//! over every route measured, and the gate holds a case of each label; a
+//! `watch` case is not clear of the 0.5 line on some route, where a change
+//! of the numerics flips it without anything being broken; a `known_failure`
+//! (case 13, date arithmetic) has the right label and the model gets it
+//! wrong on every route. Both are printed, never asserted. Every line prints
 //! the logit too: `noul` probabilities move in steps of 0.125 logit (the
 //! logits are bf16), so a drift reads in steps rather than in decimals.
 //!
-//! The tiers come from one measurement of the fixture on this file's own
-//! stock artifact (2026-09-25, through a live server with `--spec-backend dflash2`
-//! and `--vision-enabled`): 17/18, only 13 missed.
+//! The tiers come from one measurement of five arms, recorded in the
+//! fixture's `measurement` with its date, build, card, the command that
+//! redoes each arm and every case's logit in every arm (`NOTICE.md` states
+//! the rule and the set). `IGNIS_GDN_PREFILL=ours` runs this test on ignis's
+//! GDN prefill: the same gates must hold there.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or an unavailable GPU is a **skip**; under the profile

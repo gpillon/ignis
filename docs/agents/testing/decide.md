@@ -36,7 +36,15 @@ questions on the card through `/v1/decide`, one of them past a window.
 `crates/server/tests/fixtures/entailment/` is a contributed set of 18
 synthetic "does the cited evidence support the claim?" cases for `noul`
 (provenance, ignis's corrections and the tiers in its `NOTICE.md`).
-`decide_entailment_gpu.rs` asserts the label of the `gate` cases only and
-prints every case's p(yes) and logit; `watch` and `known_failure` cases are
-printed, never asserted. `decide_entailment_fixture.rs` checks the set's
-shape on CPU, including that every cited name is a public one.
+A case is a `gate` when it is right by at least one logit as the minimum
+over five measured arms (the harness under each GDN prefill, the live server
+under each and under the int8 prompt-attention band), and the gate holds a
+case of each label; the fixture records the rule, the date, the build and
+every case's logit in every arm. `decide_entailment_gpu.rs` asserts the label
+of the `gate` cases only, on the card's default route, and prints every
+case's p(yes) and logit; `watch` and `known_failure` cases are printed, never
+asserted. `decide_entailment_fixture.rs` checks the set's shape on CPU: every
+tier is the one the rule gives from the case's logits, every label has a gate
+case, and every cited name is a public one. A change of the numerics that
+moves a watch case is not a fault; re-measure the five arms and the tiers
+follow.

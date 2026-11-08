@@ -10,8 +10,6 @@ use ignis_server::decide::{DecideRequest, QuestionKind};
 #[path = "support/entailment.rs"]
 mod entailment;
 
-use entailment::Tier;
-
 #[test]
 fn the_set_is_the_contributed_eighteen_cases_with_their_labels() {
     let fixture = entailment::load();
@@ -61,18 +59,63 @@ fn the_inversion_pairs_share_a_claim_and_split_the_label() {
     assert!(by_id[&14].state.contains("as_of_date = 2026-09-20"));
 }
 
-/// The tiers are what the GPU run asserts; case 13 is a known failure of
-/// the model, kept at its correct label rather than relabelled.
+/// The tiers are what the GPU run asserts, and each follows the rule from
+/// the case's recorded logits: `load` fails on a tier the logits do not give,
+/// on a case with no tier, and on a label with no gate case. Nothing here
+/// pins which case is which tier, so a new measurement is a data change.
 #[test]
-fn only_gate_cases_are_asserted_and_thirteen_is_a_known_failure() {
+fn every_case_has_a_tier_the_rule_gives_and_each_label_has_a_gate_case() {
     let fixture = entailment::load();
-    let tier = |tier| -> Vec<u32> {
-        fixture.cases.iter().filter(|case| case.tier == tier).map(|case| case.id).collect()
-    };
-    assert_eq!(tier(Tier::KnownFailure), [13]);
-    assert_eq!(tier(Tier::Watch), [4, 12, 16, 18]);
-    assert_eq!(tier(Tier::Gate).len(), 13);
-    assert!(fixture.cases.iter().all(|case| !case.starred || case.tier == Tier::Gate));
+    let arms = &fixture.measurement.arms;
+    assert!(arms.iter().any(|arm| arm.gdn_prefill == "ours"));
+    assert!(arms.iter().any(|arm| arm.gdn_prefill == "vendored"));
+    assert!(arms.iter().any(|arm| arm.prefill_attention == "int8"));
+    for case in &fixture.cases {
+        assert_eq!(case.logits.len(), arms.len(), "case {}", case.id);
+    }
+}
+
+#[test]
+fn a_case_without_a_known_tier_fails_the_check() {
+    let text = std::fs::read_to_string(entailment::path()).expect("the fixture");
+    let mut json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert!(entailment::parse(&text).is_ok());
+    json["cases"][0].as_object_mut().expect("a case").remove("tier");
+    let error = entailment::parse(&json.to_string()).expect_err("a case with no tier");
+    assert!(error.contains("tier"), "{error}");
+    json["cases"][0]["tier"] = "gold".into();
+    assert!(entailment::parse(&json.to_string()).is_err());
+}
+
+#[test]
+fn a_label_without_a_gate_case_fails_the_check() {
+    let text = std::fs::read_to_string(entailment::path()).expect("the fixture");
+    for label in [true, false] {
+        let mut json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+        // Pull every case of the label to the line on every arm and make it
+        // a watch case, so the tiers stay the rule's own.
+        for case in json["cases"].as_array_mut().expect("cases") {
+            if case["expected"] == label {
+                case["tier"] = "watch".into();
+                for logit in case["logits"].as_object_mut().expect("logits").values_mut() {
+                    *logit = if label { 0.5 } else { -0.5 }.into();
+                }
+            }
+        }
+        let error = entailment::parse(&json.to_string()).expect_err("no gate for a label");
+        assert!(error.contains(&format!("no gate case has the label {label}")), "{error}");
+    }
+}
+
+#[test]
+fn a_tier_the_logits_do_not_give_fails_the_check() {
+    let text = std::fs::read_to_string(entailment::path()).expect("the fixture");
+    let mut json: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    // Case 3 sits below the gate margin on an arm, so it cannot be a gate.
+    assert_eq!(json["cases"][2]["id"], 3);
+    json["cases"][2]["tier"] = "gate".into();
+    let error = entailment::parse(&json.to_string()).expect_err("a tier against the rule");
+    assert!(error.contains("case 3"), "{error}");
 }
 
 /// Every mart, key and field a case cites is one of the public names. The
