@@ -540,6 +540,14 @@ The 27B trellis body's other prefill route (spec #503, ADR 0080,
 dense INT8 buffer, sized for the largest matrix, and multiplied on the integer
 MMA with an INT8 activation. The default route of the 8.x cards (GitHub #515).
 
+**GDN prefill**:
+A GDN layer's pass over a prefill span of 64 tokens or more: the chunked
+delta rule, which carries the sequence's GDN slot from the span's first token
+to its last. It has two routes, ignis's own (ADR 0080, the 8.x cards' route)
+and the vendored chunked kernels (sm_120's). A shorter span, a decode round
+or a verify round runs the vendored recurrent kernel on either.
+_Avoid_: GDN chunked kernel (one route's name, not the pass)
+
 **Band**:
 The fixed buffer the prompt attention decodes the codec's keys into, once per
 chunk and layer: 32,768 keys of INT8 K and E4M3 V^T (64 MiB) with a scale per
@@ -1054,6 +1062,25 @@ tail padded with the anchor — and the 64 layers traverse the batch's columns
 once, the GQA layers appending every valid column and the GDN layers recording
 instead of advancing. Selected per call through the decode options at the
 load's draft window, never padded to it; window 0 is today's round.
+
+**Round shape**:
+How wide a round's batch is per lane: one column in a **decode round**,
+`k+1` in a **verify round**. A wider shape takes other activation routes
+(ADR 0016), so the two shapes can rank two near-equal tokens differently: a
+speculative and a plain decode of the same prompt are not byte-identical,
+by design.
+
+**Near-tie**:
+A split between the token a **decode round** picked and the one a **verify
+round** picked at the same position that the numerics explain. The position
+is computed outside the rounds in a narrow shape (one token at a time) and a
+wide one (a chunked span at least as wide as the verify round): it is a
+near-tie when the two disagree about the winner, when the wide one sides with
+the verify round, or when the margin is within the computation's own rounding.
+Only a wide-shape computation that sides with the decode round beyond that
+margin names a fault of the verify round.
+_Avoid_: two probes that both reach the position one token at a time as the
+judge (neither takes the verify's shape)
 
 **Extent (verify round)**:
 The draft columns a lane actually verifies in a round: `min(k, proposed,
@@ -1638,6 +1665,17 @@ The older scoring, where the engine generates its own continuation and the two
 token streams are diffed. **Diagnostic only** (ADR 0014): after the first
 divergence the engines no longer share a prefix, so it measures continuation
 similarity, not forward-pass health.
+
+**Regression set**:
+A fixed set of cases, written or contributed, run through a public endpoint
+in the GPU profile, each with a **tier**: a **gate** case is asserted, a
+**watch** case and a **known failure** (the right label, which the model
+answers wrong) are printed. A case is a gate only when it sits clear of the
+decision line on every route the card runs, not on one: a case near the line
+falls on either side under any change of the numerics, and asserting it
+reports the change, not a fault. The KLD gate judges the numerics; a
+regression set catches a feature that broke.
+_Avoid_: entailment gate (the set is not a gate)
 
 **TTFT cell**:
 One fixed prompt length (8K, 32K) at which time to first token is measured
