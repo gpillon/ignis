@@ -118,3 +118,5 @@ flag:
 ## Follow-ups
 
 - A byte diff of the sm_86 and sm_89 dumps, where both are kept. It needs no GPU.
+- [The sm_86 gate on 0.10.0's range](2026-11-08-sm86-gate-on-the-release-range.md): the gate again at `main`
+  adb5ed2b, after #530, on an sm_89 card, 2026-11-08.
