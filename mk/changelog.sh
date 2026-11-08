@@ -240,8 +240,8 @@ fi
 #
 # Since ADR 0081 an ADR whose decision changed is amended by a new one and
 # changes only in its frontmatter, so a modified ADR is "(amended)" only when
-# its text changed: the frontmatter is dropped and every link target blanked on
-# both sides first, and a status, a back-link or a moved file's path is not an
+# its text changed: the frontmatter is dropped, and every link target and every
+# path in backticks blanked, on both sides first, and a status, a back-link or a moved file's path is not an
 # amendment. A status that changed is said, "(now superseded by ADR 0082)",
 # against the long form's `## Status` section when the older side has no
 # frontmatter yet. docs/adr/README.md is the generated index, not a decision.
@@ -251,7 +251,7 @@ adr_text() { # <rev> <path>
              front { if ($0 == "---") { front = 0; gap = 1 }; next }
              gap && $0 == "" { next }
              { gap = 0; print }' |
-        sed -E 's/\]\([^)]*\)/]()/g'
+        sed -E 's/\]\([^)]*\)/]()/g; s/`[^` ]*\/[^` ]*`/``/g'
 }
 adr_status() { # <rev> <path>: the frontmatter's status, else the Status section's first word
     git show "$1:$2" 2>/dev/null |

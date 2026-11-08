@@ -97,7 +97,7 @@ printf '# ADR 0001 — a decision taken before the range\n' > docs/adr/0001-earl
 # Status section, a link, a short one's frontmatter status.
 printf '# ADR 0004 — a long-form decision\n\n## Status\n\nAccepted (2026-01-01).\n' \
     > docs/adr/0004-long.md
-printf '# ADR 0005 — a decision that links\n\nSee [the finding](../findings/a.md).\n' \
+printf '# ADR 0005 — a decision that links\n\nSee [the finding](../findings/a.md) and `docs/a.md`.\n' \
     > docs/adr/0005-linked.md
 printf '# ADR 0006 — a decision the range retires\n\n## Status\n\nAccepted.\n' \
     > docs/adr/0006-retired.md
@@ -132,7 +132,7 @@ printf '%s\n' '---' 'status: accepted' 'amended-by: [ADR-0002]' '---' '' \
     '# ADR 0004 — a long-form decision' '' '## Status' '' 'Accepted (2026-01-01).' \
     > docs/adr/0004-long.md
 printf '%s\n' '---' 'status: accepted' '---' '' '# ADR 0005 — a decision that links' '' \
-    'See [the finding](../findings/archive/a.md).' > docs/adr/0005-linked.md
+    'See [the finding](../findings/archive/a.md) and `docs/archive/a.md`.' > docs/adr/0005-linked.md
 printf '%s\n' '---' 'status: superseded by ADR-0002' '---' '' \
     '# ADR 0006 — a decision the range retires' '' '## Status' '' 'Accepted.' \
     > docs/adr/0006-retired.md

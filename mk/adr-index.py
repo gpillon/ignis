@@ -63,8 +63,8 @@ memory of why ignis is built the way it is.
   its heading the bare title, with the frontmatter
   [ADR 0081](0081-an-adrs-status-is-in-its-frontmatter-and-a-changed-decision-is-a-new-adr.md)
   describes. [ADR 0070](0070-a-spec-is-a-github-issue-and-its-tickets-are-sub-issues.md)
-  lists where the repo differs from the skill, and [AGENTS.md](../../AGENTS.md)
-  ("ADRs") gives the numbering rule.
+  lists where the repo differs from the skill, and
+  [docs/agents/domain.md](../agents/domain.md) gives the numbering rule.
 - **A decision that changes** is recorded by a new ADR that amends or
   supersedes the old one, whose text then stays as it was: only its
   frontmatter changes (`amended-by`, or a status of `superseded by`).
