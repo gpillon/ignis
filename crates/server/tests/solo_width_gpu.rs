@@ -4,8 +4,9 @@
 //!
 //! The simulation #508 ran the 24 GB class with: the 27B's 16 GB entry on the
 //! RTX 5090 inside the class's budget, on the routes an 8.x card runs unset
-//! (the dense prefill, the integer band and our GDN prefill, named so the 5090
-//! runs them), with the card the start reads injected as an 8.x card so the
+//! (the dense prefill and the integer band, named so the 5090 runs them, and
+//! our GDN prefill, every card's since GitHub #536), with the card the start
+//! reads injected as an 8.x card so the
 //! load takes the 8.x solo ladder (8,192, 4,096, 2,048 above the chunk).
 //! - `rtx-24gb` (an RTX 3090, 24 GiB) and `rtx-16gb` (an RTX 4080, 16 GiB less
 //!   1 GiB) pin the 27B's solo width to their chunk: one width, the KV pool
@@ -73,28 +74,6 @@ fn sink() -> &'static Arc<ignis_logging::MemorySink> {
 /// Every event logged since the sink held `start` lines.
 fn events_since(start: usize) -> Vec<serde_json::Value> {
     sink().lines()[start..].iter().map(|line| serde_json::from_str(line).expect("json")).collect()
-}
-
-/// The GDN prefill's measurement switch set to `ours`, the route an 8.x card
-/// runs (the leaf reads it at each load). Removed on drop. A Blackwell card
-/// runs it unset too since GitHub #536; named, the test keeps the 8.x routes
-/// whatever the card's default.
-struct OurGdnPrefill;
-
-impl OurGdnPrefill {
-    fn set() -> Self {
-        // SAFETY: this binary's one test sets it before its load and nothing
-        // else reads or writes the environment meanwhile.
-        unsafe { std::env::set_var("IGNIS_GDN_PREFILL", "ours") };
-        OurGdnPrefill
-    }
-}
-
-impl Drop for OurGdnPrefill {
-    fn drop(&mut self) {
-        // SAFETY: as in `set`.
-        unsafe { std::env::remove_var("IGNIS_GDN_PREFILL") };
-    }
 }
 
 fn named<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a serde_json::Value> {
@@ -214,7 +193,6 @@ fn budget_16gb() -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn rtx_24gb_pins_its_solo_width_to_its_chunk() {
-    let _switch = OurGdnPrefill::set();
     let options = on_card(Card::Read(card::rtx_3090()), &flags_of("rtx-24gb", BUDGET_24GB, &[]));
     assert_eq!(options.prefill_chunk_solo, ignis_server::config::SoloWidth::Tokens(2048), "the profile's");
     let Some((model, start)) = load(&options, "under rtx-24gb in 24 GiB") else { return };
@@ -232,7 +210,6 @@ async fn rtx_24gb_pins_its_solo_width_to_its_chunk() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn rtx_24gb_on_an_rtx_30_card_widens_its_solo_chunk_under_auto() {
-    let _switch = OurGdnPrefill::set();
     let options = on_card(Card::Read(card::rtx_3090()), &flags_of("rtx-24gb", BUDGET_24GB, &["--model-prefill-chunk-solo", "auto"]));
     assert_eq!(options.prefill_chunk, 2048);
     assert_eq!(options.prefill_chunk_solo, ignis_server::config::SoloWidth::Auto);
@@ -293,7 +270,6 @@ async fn rtx_24gb_on_an_rtx_30_card_widens_its_solo_chunk_under_auto() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn rtx_16gb_pins_its_solo_width_to_its_chunk() {
-    let _switch = OurGdnPrefill::set();
     let budget = budget_16gb();
     let options = on_card(Card::Read(card::card(16, "NVIDIA GeForce RTX 4080", 8, 9)), &flags_of("rtx-16gb", &budget, &[]));
     assert_eq!(options.prefill_chunk_solo, ignis_server::config::SoloWidth::Tokens(1024), "the profile's");
@@ -312,7 +288,6 @@ async fn rtx_16gb_pins_its_solo_width_to_its_chunk() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn rtx_16gb_on_an_rtx_40_card_steps_down_to_2048_under_auto() {
-    let _switch = OurGdnPrefill::set();
     let budget = budget_16gb();
     let options =
         on_card(Card::Read(card::card(16, "NVIDIA GeForce RTX 4080", 8, 9)), &flags_of("rtx-16gb", &budget, &["--model-prefill-chunk-solo", "auto"]));
