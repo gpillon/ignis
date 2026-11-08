@@ -117,6 +117,17 @@ fn the_builds_run_beside_the_tests_and_whatever_publishes_waits_for_them() {
         steps(image).iter().all(|step| !text(step, "uses").unwrap_or("").starts_with("docker/build-push-action@")),
         "the image job builds an image of its own instead of pushing the linux job's"
     );
+    // The archive is written without tags: given several, it holds one image
+    // per tag, and `skopeo copy` refuses an archive holding more than one.
+    let archive = steps(job(jobs, "linux"))
+        .into_iter()
+        .filter(|step| text(step, "uses").unwrap_or("").starts_with("docker/build-push-action@"))
+        .find_map(|step| {
+            let with = get(step, "with").and_then(Value::as_mapping)?;
+            text(with, "outputs").filter(|outputs| outputs.contains("type=oci")).map(|_| with)
+        })
+        .expect("the linux job writes the image to an OCI archive");
+    assert!(get(archive, "tags").is_none(), "the OCI archive is given tags, and would hold one image per tag");
 }
 
 /// The publishing check reads what it must: a job that pushes from its own

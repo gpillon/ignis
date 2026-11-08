@@ -389,6 +389,11 @@ jobs:
       # image's index with its provenance attestation, which the registry
       # held when this step pushed itself. Otherwise the image stays in the
       # builder: the dry run checks that it builds.
+      #
+      # No `tags` here: the archive holds one image per tag it is given, and
+      # skopeo refuses an archive that holds more than one ("more than one
+      # image in oci, choose an image"; a release has three tags). The
+      # `image` job names the tags, from this job's `image-tags` output.
       - name: Build the container image
         uses: docker/build-push-action@v6
         env:
@@ -399,7 +404,6 @@ jobs:
           target: runtime
           platforms: linux/amd64
           outputs: ${{ github.repository == 'gpillon/ignis' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main') && format('type=oci,dest={0}/ignis-image.tar', runner.temp) || '' }}
-          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=linux-cuda
           cache-to: type=gha,mode=max,scope=linux-cuda
