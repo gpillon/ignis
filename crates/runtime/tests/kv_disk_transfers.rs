@@ -138,6 +138,19 @@ fn files_once_deleted(rig: &Rig) -> Vec<String> {
     }
 }
 
+/// Advances the disk queue until `done` holds or 5 s pass, then returns so the
+/// test asserts the end state: a fixed count of rounds is too few when a sleep
+/// of 1 ms lasts 15 ms and work is still queued on the IO thread. 5 s is the
+/// deadline of `files_once_deleted`, far past any drain and short enough that
+/// an end state that never comes fails the assertion after it, not a hang.
+fn advance_until(rig: &Rig, done: impl Fn(&Rig) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !done(rig) && std::time::Instant::now() < deadline {
+        rig.compute.disk_advance();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn file_of(rig: &Rig, name: &str) -> std::path::PathBuf {
     let root = rig.location.join(kv_disk::DIR_NAME);
     let dir = std::fs::read_dir(root).unwrap().flatten().next().unwrap().path();
@@ -313,10 +326,7 @@ fn a_discarded_spill_deletes_its_file_and_frees_its_source() {
     rig.compute.disk_spill(blob, DiskSource::KvRam, live_meta()).unwrap();
     rig.compute.disk_advance();
     rig.compute.disk_discard(blob);
-    for _ in 0..200 {
-        rig.compute.disk_advance();
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    advance_until(&rig, |rig| files_in(rig).is_empty());
     assert!(files_in(&rig).is_empty(), "its file is deleted once its writes drained");
     assert!(rig.compute.restore(1, 64).is_err(), "the KV-RAM span went with the discard, not back to the map");
 }
@@ -503,10 +513,7 @@ fn a_spill_abandoned_mid_window_gives_its_staging_back() {
     rig.compute.disk_discard(blob);
     let waited = rig.leaf.calls.lock().unwrap().waits;
     rig.leaf.release_fences();
-    for _ in 0..200 {
-        rig.compute.disk_advance();
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    advance_until(&rig, |rig| rig.compute.disk_staging_busy() == 0 && files_in(rig).is_empty());
     assert!(busy > 0, "a window was half copied");
     assert_eq!(waited, 0, "the model thread did not wait for the slice on the link");
     assert_eq!(rig.compute.disk_staging_busy(), 0, "every staging window came back once its slice landed");
@@ -524,10 +531,7 @@ fn a_spill_failing_mid_window_gives_its_staging_back() {
     let (outcome, _) = run(&rig.compute, blob);
     rig.leaf.fail_windows(false);
     assert!(matches!(outcome, DiskOutcome::Failed { op: DiskOp::Write }), "{outcome:?}");
-    for _ in 0..200 {
-        rig.compute.disk_advance();
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    advance_until(&rig, |rig| rig.compute.disk_staging_busy() == 0);
     assert_eq!(rig.compute.disk_staging_busy(), 0, "the half-copied window's slot came back");
     assert_eq!(decode(&rig.compute, 1, 1).len(), 1, "and the sequence is still the request's");
 }
@@ -547,10 +551,7 @@ fn a_restore_abandoned_mid_feed_gives_its_staging_back() {
     assert!(rig.compute.disk_staging_busy() > 0, "a window is on its way");
     rig.compute.disk_discard(blob);
     assert!(rig.leaf.calls.lock().unwrap().waits >= 1, "the slice on the link was waited for");
-    for _ in 0..200 {
-        rig.compute.disk_advance();
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    advance_until(&rig, |rig| rig.compute.disk_staging_busy() == 0 && files_in(rig).is_empty());
     assert_eq!(rig.compute.disk_staging_busy(), 0, "every staging window came back");
     assert!(files_in(&rig).is_empty(), "and the file went");
 }
