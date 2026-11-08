@@ -1,6 +1,43 @@
+---
+status: accepted
+amends: [ADR-0016]
+amended-by: [ADR-0029, ADR-0045]
+---
+
 # ADR 0024 — sequence state transfer: an opaque versioned blob, and device-to-device cloning for prefix reuse
 
-## Status
+## Current decision
+
+The section table is leaf-internal, and the ABI exposes a snapshot size and
+a format version, not a layout. The blob is opaque; its header names its
+compatibility identity (artifact content hash, KV format, layout version,
+drafter configuration: ADR 0029), and restore refuses a stale or foreign
+one. Prefix reuse clones on the device: KV pages shared by refcount, the
+mutable sections copied device-to-device. The state-transfer and prefix
+calls are entry points, which amends ADR 0016 for this family.
+
+Changed since, by ADR 0029, ADR 0045 and GitHub issues:
+
+- **A transfer may move a blob a window at a time** (ADR 0045), through the
+  options struct this ADR reserved for "a partial extent". KV-disk moves
+  32 MiB windows; the windows laid end to end are the blob's bytes, and a
+  null options pointer is the whole-blob call.
+- **A sequence holding a shared prefix is snapshotted, not refused** (ADR
+  0029): its blob materializes the shared pages. Restoring into a sequence
+  that holds a shared prefix is still refused (`IGNIS_SEQ_ERR_SHARED_PREFIX`,
+  #190). Chained blobs stay deferred: every blob, a disk one included, is
+  materialized (ADR 0045).
+- **A prompt checkpoint publishes at its generation opener** (ADR 0029);
+  shared and retained prefixes keep the whole-page point. A claim never
+  consumes. A retained checkpoint or prefix spills as the blob its sequence
+  would have written (#190).
+- **The progress section carries the multimodal `rope_delta`** (#194), which
+  a clone does not. Each model family has its own layout version (GitHub
+  #303).
+
+## History
+
+### Status
 
 Accepted (2026-09-11) — GitHub #65, phase 4. Spec:
 `docs/specs/runtime/04-reference-feature-floor.md`. Applies ADR 0009
@@ -10,7 +47,7 @@ through the options struct this ADR reserved for "a partial extent". KV-disk
 moves blobs in 32 MiB windows. The blob's bytes are unchanged, and a null
 options pointer is the whole-blob call.
 
-## Context
+### Context
 
 Two phase-4 features move a sequence's state, and both were written above an
 ABI that cannot: `ignis_seq_snapshot` and `ignis_seq_restore` are declared and
@@ -23,7 +60,7 @@ conv taps, a position and last token, and since #99 a penalty-count row. The
 G3 session established that all of these are consistent together at a completed
 chunk boundary, and recorded a caveat with it: a *new* state section does not
 inherit that snapshot-point permission and must re-earn it
-(`docs/DEFERRED-DECISIONS.md` item 5).
+(`docs/archive/DEFERRED-DECISIONS.md` item 5).
 
 Two questions followed. First, how much of that structure crosses the C ABI.
 Exposing a section table to Rust would let the host tier compute layouts, and
@@ -33,7 +70,7 @@ as "restore a sibling's snapshot" reuses one mechanism, but it would move the
 mutable sections host-ward and back — two PCIe crossings for bytes that never
 needed to leave the card — while the read-only KV pages can simply be shared.
 
-## Decision
+### Decision
 
 **The section table is leaf-internal.** One place in the leaf knows what a
 sequence is made of, what each section costs, and whether it is shareable
@@ -78,7 +115,7 @@ What ADR 0016 still governs, unchanged: a *snapshot control* — a policy, a
 stream, a partial extent — goes in an options struct when a phase needs one,
 and is not a fifth entry point.
 
-## Consequences
+### Consequences
 
 - The two parallel page ledgers end. The leaf owns physical pages and their
   refcounts; `KvPool`'s refcounts in Rust become admission accounting, not
@@ -155,7 +192,7 @@ and is not a fifth entry point.
     wider margin than the estimate claimed. See
     [Device prefix clone cost](../findings/2026-09-12-device-prefix-clone-cost.md).
 
-## Amendment (2026-09-16) — cross-request reuse (ADR 0029)
+### Amendment (2026-09-16) — cross-request reuse (ADR 0029)
 
 - **A snapshot of a sequence holding a shared prefix materializes the shared
   pages into its blob** instead of being refused. This replaces the
@@ -176,7 +213,7 @@ and is not a fifth entry point.
   hash, the KV format, the layout version, and the drafter configuration. A
   blob taken under another load is refused like a stale layout.
 
-## Amendment (2026-09-16) — the materialized checkpoint (#190)
+### Amendment (2026-09-16) — the materialized checkpoint (#190)
 
 - **A retained prompt checkpoint is spilled as the blob its capturing sequence
   would have written** (`ignis_seq_checkpoint_snapshot`): the prefix chain's
@@ -196,7 +233,7 @@ and is not a fifth entry point.
   pins that the returned prefix, and a claimant of it, are byte-identical to
   the original's.
 
-## Amendment (2026-09-16) — the multimodal rope delta (#194)
+### Amendment (2026-09-16) — the multimodal rope delta (#194)
 
 - **A sequence's `rope_delta` is a progress scalar**, in the progress
   section's former reserved word, so snapshot and restore carry it with the

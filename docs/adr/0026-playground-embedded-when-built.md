@@ -1,12 +1,34 @@
+---
+status: accepted
+---
+
 # ADR 0026 — The Playground is embedded when built, served by default
 
-## Status
+## Current decision
+
+The Playground's source lives in `web/`, and `web/dist/` is not committed.
+`ignis-server` embeds the build at compile time when it exists, and a page
+saying how to build it otherwise. It is served under `/ui/` by default
+(amended 2026-09-19) and talks only to surfaces ignis already exposes,
+`/ui/metrics` being ADR 0017's route.
+
+The switch is one field of the `server` group, renamed with every other flag
+by ADR 0046: `--server-ui <bool>`, `IGNIS_SERVER_UI`, `server.ui` in a config
+file. `--server-ui false` turns the Playground off. `--ui`, `--no-ui` and
+`IGNIS_UI`, which the amendment below names, no longer exist, and a leftover
+`--no-ui` is refused. `/ui/metrics` is served when the Playground and
+metrics are both on, and metrics are on by default (ADR 0017). The image has
+no `CMD`.
+
+## History
+
+### Status
 
 Accepted (2026-09-14, owner decision). **Amended 2026-09-19** (owner
 decision): the Playground is served by default. Everything else below stands;
 only the opt-in half is superseded, by the Amendment section at the end.
 
-## Decision
+### Decision
 
 The **Playground** (a React + TypeScript page built with Vite) lives as source
 in `web/`. Its build output `web/dist/` is not committed; the `ignis-server`
@@ -19,7 +41,7 @@ already exposes (`/v1/*`, and `/ui/metrics` when metrics are enabled — ADR
 the browser; it adds no endpoint of its own, no fact, and no work on the
 inference path, so it needs no GPU run or G4 gate for acceptance.
 
-## Considered Options
+### Considered Options
 
 - **`build.rs` runs `npm run build`** — rejected: every Rust build and
   `cargo test` would require node, breaking the node-free workspace.
@@ -27,7 +49,7 @@ inference path, so it needs no GPU run or G4 gate for acceptance.
 - **Serve a directory from disk (`--ui-dir`)** — rejected: loses the single
   self-contained binary.
 
-## Consequences
+### Consequences
 
 - Two binaries from the same commit can differ: one built after the frontend
   build carries the Playground, one built before carries the fallback. This is
@@ -36,7 +58,7 @@ inference path, so it needs no GPU run or G4 gate for acceptance.
   same text exposition Prometheus reads on the metrics listener — parsed
   client-side, not a JSON endpoint made for the UI.
 
-## Amendment (2026-09-19): served by default
+### Amendment (2026-09-19): served by default
 
 `--ui` was opt-in because it was shaped after `--metrics` (ADR 0017), and that
 was the wrong sibling. Metrics open a second listener and build a projection

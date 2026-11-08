@@ -1,6 +1,43 @@
+---
+status: accepted
+amended-by: [ADR-0029, ADR-0045]
+---
+
 # ADR 0023 — one eviction priority across GPU residency and the host tier
 
-## Status
+## Current decision
+
+One priority model across the tiers, its shared key the request class
+(`Agent` before `Interactive`). Eviction stays reactive, on the path where a
+need finds no room. ADR 0029, GitHub #190 and ADR 0045 amended the
+orderings; what leaves each tier today:
+
+- **The card.** Retained state (prompt checkpoints, retained prefixes) goes
+  before any live sequence. It spills to KV-RAM, displacing there only
+  retained entries that rank below it, and the device discards it when even
+  those are not enough. A live sequence is then a victim only at a chunk or
+  round boundary, protection still ranking first. A lane shortage takes a
+  lane holder before a lane-less request, then follows this ADR's order:
+  class, least-recently-used, lane id. A page shortage moves only state that
+  ranks below its requester (class, then submission order): `Agent` before
+  `Interactive`, then what is not in the decode round before lane holders,
+  then the latest-submitted. A moved sequence goes to KV-RAM, else KV-disk.
+- **KV-RAM.** Retained entries before evicted live sequences, then class,
+  then probation before protected, then least-recently-used. An
+  `Interactive` entry idle past `--reuse-retained-interactive-ttl` (300 s)
+  ranks as an `Agent`'s probation entry. With KV-disk on (by default on
+  Flash-Next, not on the 27B), a live sequence leaving KV-RAM moves to the
+  disk, which follows KV-RAM's order, and is never discarded; without it, it
+  can still be discarded there.
+
+Reservations do not grow: P0 picked ADR 0045's fixed branch
+([finding](../findings/2026-10-08-kv-page-growth-gate.md)), so the growth
+case the Status names never arises. One structured retention score in place
+of these orderings is still open (GitHub #199).
+
+## History
+
+### Status
 
 Accepted (2026-09-11) — GitHub #65, phase 4. Spec:
 `docs/specs/runtime/04-reference-feature-floor.md`. Extends ADR 0004 (the
@@ -23,7 +60,7 @@ its P0 gate passes):
   carry the same use tick, so least-recently-used among them was only the
   lane id.
 
-## Context
+### Context
 
 Two eviction policies exist in the tree and were written years apart in spirit.
 `admission.rs` decides which resident lane is the better victim: request class
@@ -48,7 +85,7 @@ not a victim because its owner is an agent. In the host tier nothing is being
 served, so protection has no meaning there, and class is the only thing left
 that says whose work costs most to lose.
 
-## Decision
+### Decision
 
 One priority model, expressed as two orderings that share a class definition.
 
@@ -71,7 +108,7 @@ When both tiers are full, admission refuses, as it does today.
 This ordering is expected to change as workloads teach us more; it is recorded
 here so that a change is a decision rather than a drift.
 
-## Consequences
+### Consequences
 
 - `host.rs`'s two-tier machinery keeps its structure and gains the class it
   never had. The probation and protected tiers become the *second* key, not the
@@ -86,7 +123,7 @@ here so that a change is a decision rather than a drift.
 - A third request class, if one is ever added, changes two orderings rather than
   one.
 
-## Amendment (2026-09-16) — retained state goes first (ADR 0029)
+### Amendment (2026-09-16) — retained state goes first (ADR 0029)
 
 **Retained state** — prompt checkpoints and retained prefixes, which no live
 request needs — is placed ahead of both orderings.
@@ -102,7 +139,7 @@ request needs — is placed ahead of both orderings.
 The reason is asymmetry of loss. An evicted live sequence is work that will
 certainly be redone; a retained entry is a bet that it will be needed.
 
-## Amendment (2026-09-16) — spill admission and the Interactive TTL (#190)
+### Amendment (2026-09-16) — spill admission and the Interactive TTL (#190)
 
 Owner decision, replacing "discarded otherwise" in the device bullet above.
 

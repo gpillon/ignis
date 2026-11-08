@@ -1,6 +1,44 @@
+---
+status: accepted
+---
+
 # ADR 0018 — Prefill and decode interleave at chunk granularity, driven by the Rust scheduler
 
-## Status
+## Current decision
+
+Prefill and decode take turns on the one model stream at chunk granularity,
+and the Rust scheduler drives the chunk loop, with no callback from the leaf.
+One `advance()` runs at most one prefill call and one decode round. Exactly
+one request at a time holds multi-chunk prefill progress, `Prefilling` is
+durable, and cancel is abort. True prefill/decode overlap on separate streams
+is still not built.
+
+Three GitHub issues amended this ADR in place:
+
+- **The decode share replaces K = 1** (#306). After a chunk that took `t`,
+  the prompt's next chunk waits until the decoding lanes have had
+  `t * s / (1 - s)` of wall time. `--model-decode-share` defaults to 25 on
+  both families; 0 is this ADR's one round per chunk. The longest gap a lane
+  sees is still one chunk's wall time, which only the width moves.
+- **Two planned widths, chosen at every chunk boundary** (#489). The prefill
+  chunk (`model.prefill_chunk`) runs while a lane is decode-ready, the solo
+  width (`model.prefill_chunk_solo`) while none is, and the scratch is
+  reserved at load for the wider (ADR 0030). The solo width's `auto` default
+  tries 8192, 4096 and 2048 above the prefill chunk for the 27B on RTX 30 and
+  RTX 40 cards, unless the 16 GB or 24 GB profile pins it to the chunk; on
+  Blackwell and for Flash-Next it is the prefill chunk
+  ([ADR 0063](0063-the-profile-follows-the-card-class.md) as amended).
+- **The prefill phase hands its events over mid-tick** (#518), before the
+  lane deal and the decode round, so a prompt's first token waits for the
+  prefill alone.
+
+The host tier the Consequences wait for exists: a lane-less `Prefilling`
+request is an eviction candidate at a chunk boundary (ADR 0023, GitHub
+#127).
+
+## History
+
+### Status
 
 Accepted (2026-09-09, grilling session for GitHub #64 / G3). Builds on ADR
 0009 (step-level device-resident ABI) and ADR 0016 (extensible per-call
@@ -13,9 +51,10 @@ by #518** (2026-11-06): the prefill phase's events, a prompt's first token
 included, reach the engine before the lane deal and the decode round. See the
 amendments at the end.
 
-Sources: `docs/ROADMAP.md` phase 3, `docs/REVIEW-2026-09-05.md` §6.
+Sources: `docs/archive/ROADMAP.md` phase 3,
+`docs/archive/REVIEW-2026-09-05.md` §6.
 
-## Context
+### Context
 
 Until G3 the serving loop had no opinion about what decode does while a
 prefill runs, because there was nothing to have an opinion about: the
@@ -57,7 +96,7 @@ Three options:
   built for two writers, and a direct conflict with capturing decode CUDA
   graphs while another stream is live.
 
-## Decision
+### Decision
 
 - **(b).** Prefill and decode interleave at **chunk granularity on the single
   model stream**. One `advance()` performs at most one prefill chunk and one
@@ -97,7 +136,7 @@ Three options:
   its KV pages, GDN slot and conv taps are released. G3 ships no explicit
   suspend/resume; priority preemption of a prefill is G4.
 
-## Consequences
+### Consequences
 
 - The p95 inter-token latency under a prefill is floored by the chunk time
   plus a decode round, and by nothing else. K, the number of decode rounds
@@ -132,7 +171,7 @@ Three options:
   a request mid-prefill. `model_thread_loop` already ticks while anything is
   in flight, so this is a state question, not a threading change.
 
-## Amendment (2026-10-07) — the decode share (#306)
+### Amendment (2026-10-07) — the decode share (#306)
 
 Flash-Next breaks the "one decode round per chunk" premise. Its 8192-token
 chunk takes ~3.2 s of wall time (a ~1.3 s host n-gram gather, then ~1.9 s on
@@ -163,7 +202,7 @@ at 1.0-1.1 tok/s while a 34K prompt prefilled.
   28.3-28.7 s of TTFT even with nobody decoding
   ([finding](../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)).
 
-## Amendment (2026-11-06) — two planned widths, chosen at every chunk boundary (#489)
+### Amendment (2026-11-06) — two planned widths, chosen at every chunk boundary (#489)
 
 The serving width stops being one number fixed for the scheduler's life. A
 load plans two, and the scheduler picks between them at every chunk boundary.
@@ -213,7 +252,7 @@ load plans two, and the scheduler picks between them at every chunk boundary.
   as one without
   ([finding](../findings/2026-11-06-the-solo-width-planned-at-load.md)).
 
-## Amendment (2026-11-06) — the prefill phase hands its events over mid-tick (#518)
+### Amendment (2026-11-06) — the prefill phase hands its events over mid-tick (#518)
 
 A tick stays one call, but its prefill phase now ends with a hand-off.
 
