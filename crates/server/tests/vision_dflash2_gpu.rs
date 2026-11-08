@@ -91,7 +91,7 @@ use ignis_core::step::{
 use ignis_core::vision::{vision_item_control, Multimodal};
 use ignis_core::{ExceptionWeights, KvFormat, RopeScaling, Speculation, SpeculativeBackend, Vision};
 
-use round_shapes::{bf16, judge, span_tokens, Shape, Verdict, VerifyRound};
+use round_shapes::{judge, span_tokens, Picks, Shape, Verdict, VerifyRound};
 use support::vision_canary::{argmax_lowest_id, load_canaries, prefill_prompt, Canary};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -223,9 +223,21 @@ fn spec_off(
 /// extent and the tokens it committed (its `LaneVerifyRun`), and the state the
 /// verify-shape probe starts from.
 struct SpecRun {
+    /// The prompt's end, the position of `emitted[0]`.
+    first: u64,
     emitted: Vec<i32>,
     rounds: Vec<VerifyRound>,
     departed: Option<Departed>,
+}
+
+impl SpecRun {
+    /// The snapshot the run kept and the row of its round's columns that drew
+    /// token `split`: `None` when the run kept none, or its round did not draw
+    /// that token.
+    fn departure(&self, split: usize) -> Option<(&Departed, usize)> {
+        let departed = self.departed.as_ref()?;
+        Some((departed, self.rounds[departed.round].row(self.first, split)?))
+    }
 }
 
 /// The snapshot blob of a spec-on sequence at the base of `rounds[round]`,
@@ -242,10 +254,10 @@ struct Departed {
 /// The same `total` tokens through verify rounds, the drafter proposing from
 /// its window. One lane: the question is the rotation, not the batching.
 ///
-/// Until a round has drawn a token departing from `off`, the decode rounds'
-/// text, each round's base is snapshotted, once the previous round's commit
-/// has completed, and the snapshot kept only if the round drew the departure
-/// (`Departed`): one blob at a time. A round's last column draws its
+/// Until a round has drawn a token departing from `decode_text`, the decode
+/// rounds' text, each round's base is snapshotted, once the previous round's
+/// commit has completed, and the snapshot kept only if the round drew the
+/// departure (`Departed`): one blob at a time. A round's last column draws its
 /// correction, the sequence's pending token, which the run commits only as
 /// the next round's anchor, so the round's draws are compared with the text it
 /// committed and its pending token after it.
@@ -254,7 +266,7 @@ fn spec_on(
     pool: &SeqPool,
     prompt: &Prompt,
     embedding: &MediaEmbedding<'_>,
-    off: &[i32],
+    decode_text: &[i32],
     stop_ids: &[i32],
     logits: &mut [f32],
 ) -> SpecRun {
@@ -297,8 +309,8 @@ fn spec_on(
         let stopped = run.tokens.iter().any(|t| stop_ids.contains(t));
         emitted.extend(run.tokens.iter().copied());
         if let Some(snapshot) = snapshot {
-            let known: Vec<i32> = emitted.iter().copied().chain(sequence.pending_token()).collect();
-            if round.drew_the_departure(first, off, &known) {
+            let verify_text: Vec<i32> = emitted.iter().copied().chain(sequence.pending_token()).collect();
+            if round.drew_the_departure(first, decode_text, &verify_text) {
                 departed = Some(Departed { round: rounds.len() - 1, snapshot });
             }
         }
@@ -307,22 +319,20 @@ fn spec_on(
         }
         assert!(rounds.len() <= TOTAL, "the run does not converge");
     }
-    SpecRun { emitted, rounds, departed }
+    SpecRun { first, emitted, rounds, departed }
 }
 
 /// The decode shape: `prompt` prefilled as both runs prefill it, then
 /// `agreed` fed one token at a time, each a one-column span -- a decode
 /// round's shape -- which is how teacher forcing already continues a
-/// multimodal prompt; read at the last one, `a` (the decode round's pick)
-/// against `b` (the verify round's).
+/// multimodal prompt; read at the last one, the two `picks`.
 fn decode_shape(
     model: &Model,
     pool: &SeqPool,
     prompt: &Prompt,
     embedding: &MediaEmbedding<'_>,
     agreed: &[i32],
-    a: i32,
-    b: i32,
+    picks: Picks,
 ) -> Shape {
     let vocab = ModelConfig::qwen38_27b().vocab as usize;
     let mut logits = vec![0f32; vocab];
@@ -333,16 +343,16 @@ fn decode_shape(
             .unwrap_or_else(|e| panic!("decode-shape probe at position {position}: {e}"));
         position += 1;
     }
-    Shape { decode_pick: logits[a as usize], verify_pick: logits[b as usize] }
+    picks.shape(&logits)
 }
 
 /// The verify shape: the speculative run's own state at the start of the
-/// round that drew the split token -- its snapshot (`departed`), restored into
-/// a fresh sequence of `pool`, the pool the run drew from -- then that round
+/// round that drew token `split` -- the snapshot `on` kept, restored into a
+/// fresh sequence of `pool`, the pool the run drew from -- then that round
 /// computed again, independently, in its own shape: one span
-/// [`VERIFY_COLUMNS`] wide from its `base` over the decode `text` (`text[0]`
-/// at `first`, the prompt's end), read at `row`; `a` (the decode round's
-/// pick) against `b` (the verify round's). The span takes the verify round's
+/// [`VERIFY_COLUMNS`] wide from the round's base over the decode `text`
+/// (`text[0]` at the prompt's end), read at the row that drew the token, the
+/// two `picks`. The span takes the verify round's
 /// activation routes (ADR 0016) through the prefill, and the probe runs none
 /// of the round's graph, staging or drafter; the diagnosis of #531 found such
 /// a span's row equal to the verify column's logits at bf16 on both GDN
@@ -360,18 +370,9 @@ fn decode_shape(
 /// rounds left, each computed `VERIFY_COLUMNS` wide with only its committed
 /// columns kept. What this gives up: that computation is restored, not
 /// rebuilt independently; only the split's round is recomputed.
-#[allow(clippy::too_many_arguments)]
-fn verify_shape(
-    model: &Model,
-    pool: &SeqPool,
-    departed: &Departed,
-    base: u64,
-    text: &[i32],
-    first: u64,
-    row: usize,
-    a: i32,
-    b: i32,
-) -> Shape {
+fn verify_shape(model: &Model, pool: &SeqPool, on: &SpecRun, text: &[i32], split: usize, picks: Picks) -> Shape {
+    let (departed, row) = on.departure(split).expect("the split's round kept its snapshot (`assert_near_tie`)");
+    let base = on.rounds[departed.round].base;
     let vocab = ModelConfig::qwen38_27b().vocab as usize;
     let mut sequence = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("seq alloc: {e}"));
     sequence.restore(&departed.snapshot).unwrap_or_else(|e| {
@@ -384,12 +385,11 @@ fn verify_shape(
         departed.round
     );
     let span = base..base + u64::from(VERIFY_COLUMNS);
-    let columns = span_tokens(text, first, span.clone());
+    let columns = span_tokens(text, on.first, span.clone());
     let mut rows = vec![0u16; columns.len() * vocab];
     step::prefill_program_span_logits(model, pool, &mut sequence, &columns, base, &mut rows)
         .unwrap_or_else(|e| panic!("verify-shape probe, the split's round span {span:?}: {e}"));
-    let row = &rows[row * vocab..(row + 1) * vocab];
-    Shape { decode_pick: bf16(row[a as usize]), verify_pick: bf16(row[b as usize]) }
+    picks.shape_bf16(&rows[row * vocab..(row + 1) * vocab])
 }
 
 /// The split at token `split` -- the decode rounds' `off[split]` against the
@@ -409,30 +409,26 @@ fn assert_near_tie(
     split: usize,
     label: &str,
 ) {
-    let (a, b) = (off[split], on.emitted[split]);
-    let first = prompt.tokens.len() as u64;
+    let picks = Picks { decode: off[split], verify: on.emitted[split] };
+    let Picks { decode: decode_pick, verify: verify_pick } = picks;
     // The position whose logits drew the split token: the prompt's last for
     // the first token, which the prefill draws in both runs alike.
-    let drawn_at = first + split as u64 - 1;
-    let (departed, row) = on
-        .departed
-        .as_ref()
-        .and_then(|departed| Some((departed, on.rounds[departed.round].row(first, split)?)))
-        .unwrap_or_else(|| {
-            panic!(
-                "{label}: the two runs part at token {split} ({a} vs {b}), drawn at position {drawn_at}, and the \
-                 run kept no snapshot of a round that drew it -- token 0 is the prompt's own draw, one \
-                 computation in both runs, and a later token no round drew means the round accounting is wrong"
-            )
-        });
-    let base = on.rounds[departed.round].base;
-    let decode = decode_shape(model, pool, prompt, embedding, &off[..split], a, b);
-    let verify = verify_shape(model, pool, departed, base, off, first, row, a, b);
+    let drawn_at = on.first + split as u64 - 1;
+    let (departed, row) = on.departure(split).unwrap_or_else(|| {
+        panic!(
+            "{label}: the two runs part at token {split} ({decode_pick} vs {verify_pick}), drawn at position \
+             {drawn_at}, and the run kept no snapshot of a round that drew it -- token 0 is the prompt's own \
+             draw, one computation in both runs, and a later token no round drew means the round accounting is \
+             wrong"
+        )
+    });
+    let decode = decode_shape(model, pool, prompt, embedding, &off[..split], picks);
+    let verify = verify_shape(model, pool, on, off, split, picks);
     let verdict = judge(decode, verify);
     let judgement = format!(
-        "{label}: round {} row {row} (position {drawn_at}, token {split}), decode picked {a}, verify picked {b}: \
-         logit[{a}] - logit[{b}] = {:+} in the decode shape ({} / {}, ulp {}), {:+} in the verify shape \
-         ({} / {}, ulp {}) -- {verdict}",
+        "{label}: round {} row {row} (position {drawn_at}, token {split}), decode picked {decode_pick}, \
+         verify picked {verify_pick}: logit[{decode_pick}] - logit[{verify_pick}] = {:+} in the decode shape \
+         ({} / {}, ulp {}), {:+} in the verify shape ({} / {}, ulp {}) -- {verdict}",
         departed.round,
         decode.gap(),
         decode.decode_pick,

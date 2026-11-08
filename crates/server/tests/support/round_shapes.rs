@@ -26,6 +26,33 @@
 use std::fmt;
 use std::ops::Range;
 
+// A BF16 logit's value and one BF16 ulp, as the core tests' logit drift reads
+// them: one copy of the rule.
+#[path = "../../../core/tests/support/logit_drift.rs"]
+mod logit_drift;
+
+pub use logit_drift::{bf16, bf16_ulp};
+
+/// The two tokens a split sets against each other: the decode round's pick
+/// and the verify round's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Picks {
+    pub decode: i32,
+    pub verify: i32,
+}
+
+impl Picks {
+    /// The shape a row of logits gives the two picks.
+    pub fn shape(self, logits: &[f32]) -> Shape {
+        Shape { decode_pick: logits[self.decode as usize], verify_pick: logits[self.verify as usize] }
+    }
+
+    /// The same from a row of BF16 bits, as a span's logits come back.
+    pub fn shape_bf16(self, row: &[u16]) -> Shape {
+        Shape { decode_pick: bf16(row[self.decode as usize]), verify_pick: bf16(row[self.verify as usize]) }
+    }
+}
+
 /// One shape's logits at the split: the decode round's pick and the verify
 /// round's pick, as the probe read them (BF16 values).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -87,18 +114,6 @@ impl fmt::Display for Verdict {
     }
 }
 
-pub fn bf16(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
-}
-
-/// One BF16 ulp at `x`'s magnitude: the step between two BF16 values in its
-/// binade, `2^(exponent - 7)` for BF16's 8 significant bits
-/// (`crates/core/tests/support/logit_drift.rs`'s rule).
-pub fn bf16_ulp(x: f32) -> f32 {
-    let exponent = ((x.abs().to_bits() >> 23) & 0xff) as i32 - 127;
-    2f32.powi(exponent - 7)
-}
-
 /// The split judged by its two shapes: `decode`, the position reached one
 /// token at a time, and `verify`, the position inside a span as wide as the
 /// verify round. Panics on a logit that is not finite, which no numerics
@@ -144,15 +159,19 @@ impl VerifyRound {
         (self.base <= drawn_at && drawn_at < self.base + self.committed as u64).then(|| (drawn_at - self.base) as usize)
     }
 
-    /// Whether this round drew the first token at which `known` -- the
+    /// Whether this round drew the first token at which `verify_text` -- the
     /// speculative run's text once the round has committed, its pending token
-    /// last -- departs from the decode rounds' text `off`. That round is the
-    /// one whose snapshot, taken at its base, the run keeps: the token is the
-    /// round's correction when it departs at the pending token, which the run
-    /// commits only as the next round's anchor. Past `off`'s end no token
-    /// departs.
-    pub fn drew_the_departure(&self, first: u64, off: &[i32], known: &[i32]) -> bool {
-        off.iter().zip(known).position(|(x, y)| x != y).is_some_and(|split| self.row(first, split).is_some())
+    /// last -- departs from the decode rounds' text `decode_text`. That round
+    /// is the one whose snapshot, taken at its base, the run keeps: the token
+    /// is the round's correction when it departs at the pending token, which
+    /// the run commits only as the next round's anchor. Past `decode_text`'s
+    /// end no token departs.
+    pub fn drew_the_departure(&self, first: u64, decode_text: &[i32], verify_text: &[i32]) -> bool {
+        decode_text
+            .iter()
+            .zip(verify_text)
+            .position(|(x, y)| x != y)
+            .is_some_and(|split| self.row(first, split).is_some())
     }
 }
 

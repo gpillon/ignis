@@ -6,10 +6,21 @@
 #[path = "support/round_shapes.rs"]
 mod round_shapes;
 
-use round_shapes::{bf16_ulp, judge, span_tokens, Numerics, Shape, Verdict, VerifyRound};
+use round_shapes::{bf16_ulp, judge, span_tokens, Numerics, Picks, Shape, Verdict, VerifyRound};
 
 fn shape(decode_pick: f32, verify_pick: f32) -> Shape {
     Shape { decode_pick, verify_pick }
+}
+
+/// A probe reads the two picks' logits out of one row, in either form the
+/// probes read: the decode round's pick first, whatever their order in the
+/// vocabulary.
+#[test]
+fn the_picks_read_their_shape_from_a_row() {
+    let picks = Picks { decode: 2, verify: 0 };
+    assert_eq!(picks.shape(&[25.25, 7.0, 28.75]), shape(28.75, 25.25));
+    // 25.25 and 28.75 in BF16.
+    assert_eq!(picks.shape_bf16(&[0x41CA, 0x40E0, 0x41E6]), shape(28.75, 25.25));
 }
 
 /// One BF16 step at the value's binade: 8 significant bits.
