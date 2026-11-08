@@ -7,11 +7,13 @@
 - Scope: speech / Qwen3-ASR 0.6B and 1.7B (bf16, Q8_0, Q4_K_M) on llama.cpp b11840, CPU only, on the owner's
   i9-10900K (Windows) and a 4-core podman container: time per clip, threads, memory, FLEURS WER, the owner's eleven
   dictations with and without context, language ID
+- Topic: speech
 - Related: [ADR 0067](../adr/0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md),
   [ADR 0068](../adr/0068-the-speech-models-cpu-executor-is-ours-in-rust.md),
   [spec speech](../specs/speech/spec.md), [spec speech/01](../specs/speech/01-cpu-executor.md),
   [Rust quantized matmul matches ggml on the CPU](2026-10-24-rust-quantized-matmul-matches-ggml.md)
 - Superseded by: none
+- Summary: Warm at 10 threads on an i9-10900K every Qwen3-ASR variant runs 2-10x real time (1.7B Q4_K_M 4.8x), so the CPU works only through incremental transcription, and on the owner's Italian 1.7B Q4_K_M has 3.7% WER, 2.4% with context.
 
 ## Question
 

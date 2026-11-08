@@ -6,6 +6,7 @@
 - Last verified: 2026-10-24
 - Scope: serving / the 27B's trellis body decode round on the RTX 5090 (PCIe Gen 3), uncapped and under the debug SM cap
   (84 / 70 / 36), its bytes and achieved bandwidth, and an ESTIMATE for the RTX 5060 Ti 16 GB, RTX 5070 Ti and RTX 5080
+- Topic: artifacts-and-gates
 - Related: [GitHub #340](https://github.com/gpillon/ignis/issues/340),
   [spec 27b-16gb/05](../specs/27b-16gb/05-gates-and-simulation.md) (Part B, Acceptance 6),
   [the dense trellis kernels on the 5090](2026-10-23-dense-trellis-kernels-on-the-5090.md),
@@ -13,6 +14,7 @@
   [capacity on the 5090](2026-10-24-27b-16gb-capacity-on-the-5090.md),
   [ADR 0060](../adr/0060-the-27b-has-a-trellis-body-for-small-cards.md)
 - Superseded by: none
+- Summary: The 27B's trellis body decodes 416 tokens/s at one lane and 8K on the 5090, and a rule applied to that, not a measurement on any 16 GB card, estimates 243-307 on a 5080, 204-270 on a 5070 Ti and 103-153 on a 5060 Ti.
 
 **This is an estimate. Nothing here was measured on a 16 GB card; the 5090 measurements are real, the per-card numbers are
 a rule applied to them.**

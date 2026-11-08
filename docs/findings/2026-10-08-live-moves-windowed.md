@@ -5,8 +5,10 @@
 - Observed: 2026-10-08
 - Last verified: 2026-10-08
 - Scope: serving / live moves (ADR 0045, fixed branch), KV-RAM and KV-disk transfers, the leaf's whole-blob snapshot, Flash-Next's expert residency during and after a move
+- Topic: kv-and-state
 - Related: https://github.com/gpillon/ignis/issues/309, [ADR 0045](../adr/0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), spec [vram-budget/03](../specs/vram-budget/03-kv-pool-policy-and-kv-disk.md) (AC 37), supersedes [live move PCIe contention](2026-10-08-live-move-pcie-contention.md)
 - Superseded by: [expert misses after a live move are the text's](2026-10-08-expert-misses-after-a-move-are-the-text.md)
+- Summary: Windowed at 12 MiB out and 16 MiB in, a live move stalls no lane (max +3-11 ms, was +314 ms) and the copies cost the rounds almost nothing; the move in's +45-58% ITL p50 was later shown to be the lanes' text, not the move.
 
 ## Question
 

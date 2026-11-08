@@ -5,6 +5,7 @@
 - Observed: 2026-11-03
 - Last verified: 2026-11-03
 - Scope: models / the `qwen3.8-27b/trellis-sc30-swift-1.5` artifact built by `tools/27b-16gb-converter/` from a local exllamav3 conversion of `ukisai/Swift-1.5-Qwen3.8-27b` (`tools/27b-16gb-converter/local_quant.py`) and the Swift NVFP4 artifact, measured on the RTX 5090 loaded as a 16 GB card (budget 17,179,869,184, `--profile rtx50-16gb`, 2 lanes, chunk 1,024, DFlash2 7, vision off) with `tools/kld-gate`
+- Topic: artifacts-and-gates
 - Related: [GitHub #472](https://github.com/gpillon/ignis/issues/472), [GitHub #471](https://github.com/gpillon/ignis/issues/471),
   [GitHub #449](https://github.com/gpillon/ignis/issues/449), [GitHub #470](https://github.com/gpillon/ignis/issues/470),
   [Swift 1.5 as NVFP4 passes the fine-tune gates](2026-11-03-swift-1-5-nvfp4-passes-the-27b-gates.md) (#470, the artifact this one copies from),
@@ -15,6 +16,7 @@
   [ADR 0074](../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md),
   [ADR 0078](../adr/0078-the-built-in-catalog-names-each-entrys-license-and-may-ship-restricted-weights.md)
 - Superseded by: none
+- Summary: Swift 1.5 as a 16 GB trellis artifact passes the fine-tune gates on the 5090 loaded as a 16 GB card: KLD 0.04255 against a limit of 0.0484 with its whole CI under it, DFlash2 on beats off in all nine cells, replay 1.003.
 
 ## Question
 

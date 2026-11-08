@@ -5,10 +5,12 @@
 - Observed: 2026-09-24
 - Last verified: 2026-09-24
 - Scope: artifact quality (`qwen3_8_27b_nvfp4full-v2`, spec `artifact/04`), KV format (hq-e8-2b vs BF16), prefill chunk width
+- Topic: kv-and-state
 - Related: [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md), [the residual window was the tool-call gap](2026-09-22-the-residual-window-was-the-tool-call-gap.md),
   `.scratch/sota-research-2026-09-24/04-quant-model.md` (third-party KLD tables),
   raw material in `.scratch/kld-2026-09-24/`
 - Superseded by: none
+- Summary: Teacher-forced against the BF16 checkpoint, the all-FP4 27B artifact's weights are KLD 0.046 (top-1 92.9%), and hq-e8-2b KV adds +0.006 at 4K but +0.018-0.022 at 32K-64K context; the prefill chunk width does not move the mean.
 
 ## Question
 

@@ -5,10 +5,12 @@
 - Observed: 2026-09-19
 - Last verified: 2026-09-19
 - Scope: kernel / build time, nvcc translation units, vendored subtree policy
+- Topic: harness-and-build
 - Related: [ADR 0010](../adr/0010-vendored-reference-kernels.md),
   [ADR 0031](../adr/0031-vendored-kernel-bottleneck-exemption.md),
   [ninfer upstream perf survey](2026-09-18-ninfer-upstream-perf-survey.md)
 - Superseded by: none
+- Summary: The kernel build's last 95 s are one vendored unit, `w8_small_t.cu` (221.6 s, 280 of its 313 kernels for models ignis does not serve), and `--split-compile` on the five heaviest units cuts a clean build from 327.2 s to 268.8 s.
 
 ## Question
 

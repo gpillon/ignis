@@ -5,8 +5,10 @@
 - Observed: 2026-09-22
 - Last verified: 2026-09-22
 - Scope: kernel / hq-e8-2b attention, residual window, sequence state; serving / tool-call decisions
+- Topic: kv-and-state
 - Related: [#257](https://github.com/gpillon/ignis/issues/257), [#173](https://github.com/gpillon/ignis/issues/173), [#160](https://github.com/gpillon/ignis/issues/160), [#161](https://github.com/gpillon/ignis/issues/161); spec [runtime/06](../specs/runtime/06-hq-residual-window.md); [hq attention route agreement](2026-09-12-hq-attention-route-agreement.md), [the codec costs the head its read](2026-09-22-the-codec-costs-the-head-its-read.md), [hq prefill reads the ring before the append](2026-09-22-hq-prefill-reads-the-ring-before-the-append.md) (#258)
 - Superseded by: none
+- Summary: Wiring the hq residual window the reference keeps (exact sinks and a 512-key ring) takes #173's agentic prompts ending in a tool call from 4 to 17 of 20 (reference 18), though its prompt route read the ring after its append until #258.
 
 ## Question
 

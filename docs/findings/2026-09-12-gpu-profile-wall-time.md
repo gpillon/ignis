@@ -5,11 +5,13 @@
 - Observed: 2026-09-12
 - Last verified: 2026-09-12
 - Scope: test harness / GPU profile, f64 layer oracle, artifact materialization
+- Topic: harness-and-build
 - Related: [GitHub #135](https://github.com/gpillon/ignis/issues/135),
   [ADR 0006](../adr/0006-exclusive-gpu-testing.md),
   [testing](../agents/testing.md),
   spec `docs/specs/gpu-profile-speed/01-gpu-profile-speed.md`
 - Superseded by: none
+- Summary: The GPU profile's dominant host cost was an unoptimized single-threaded f64 oracle (123.94 s to 3.86 s once optimized, bit-identical), and what remains is one ~8.4 s artifact upload per test binary, too small to justify one process.
 
 ## Question
 

@@ -5,8 +5,10 @@
 - Observed: 2026-10-08
 - Last verified: 2026-10-08
 - Scope: kernel / paged KV mapping, `ignis_seq_grow`; serving / decode round latency, spec vram-budget/03 P0 (ACs 26-27)
+- Topic: kv-and-state
 - Related: https://github.com/gpillon/ignis/issues/309, [ADR 0045](../adr/0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), spec [vram-budget/03](../specs/vram-budget/03-kv-pool-policy-and-kv-disk.md) (P0, ACs 26-27), [Flash-Next on the 5090](2026-10-06-flash-next-on-the-5090.md) (its lanes-at-262K harness)
 - Superseded by: none
+- Summary: Growing a sequence's KV one page at a time leaves decode tok/s and the greedy text unchanged, but its ~450 µs per call moves the 27B's 1-lane ITL p99 0.07-0.23 ms above the whole legs, so P0 picks the fixed branch.
 
 ## Question
 

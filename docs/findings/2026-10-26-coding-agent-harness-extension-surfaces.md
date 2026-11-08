@@ -1,16 +1,20 @@
 # Coding-agent harness extension surfaces: one skill folder and one MCP server reach opencode, pi, DeepSeek Harness and qwen-code; their code plugins are three different APIs, and qwen-code has none
 
 - Kind: research
-- Status: current
+- Status: archived
 - Observed: 2026-10-26
 - Last verified: 2026-10-26
 - Scope: connectors / plugin and extension APIs, MCP clients, Agent Skills, permissions, provider configuration and
   distribution of opencode v1.19.4, pi 1.4.0 (`main` `b84d5d1`), DeepSeek Harness 0.2.1-rc.3 and qwen-code 0.26.1
   (installed 0.23.0), for reaching `/v1/systemone`, `/v1/images/*`, `/v1/audio/transcriptions` and `PATCH /v1/config`
+- Topic: harness-and-build
 - Related: [#383](https://github.com/gpillon/ignis/issues/383), [System One decisions](../user/api/decide.md),
   [Connect a client](../user/start/connect-a-client.md), [the agent path](../user/paths/agent.md),
   [ADR 0071](../adr/0071-the-server-downloads-and-removes-models-from-the-server-view.md)
 - Superseded by: none
+- Summary: Research not followed (no connector was built, #383's design unsettled): opencode, pi, DeepSeek Harness and qwen-code all read Agent Skills and are MCP clients, while three have code plugins on three different TypeScript APIs.
+
+> **Archived.** Research not followed: no connector was built and the design on [#383](https://github.com/gpillon/ignis/issues/383) is unsettled; the facts hold for the versions named in Scope.
 
 ## Question
 

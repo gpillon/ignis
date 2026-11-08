@@ -5,8 +5,10 @@
 - Observed: 2026-10-08
 - Last verified: 2026-10-08
 - Scope: serving / live moves (ADR 0045, fixed branch), Flash-Next's expert residency during and after a move, AC 37's and AC 43's measurement, the KV-disk spill's pace
+- Topic: kv-and-state
 - Related: https://github.com/gpillon/ignis/issues/310, [ADR 0045](../adr/0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), spec [vram-budget/03](../specs/vram-budget/03-kv-pool-policy-and-kv-disk.md) (AC 37, AC 43), supersedes [live moves a window at a time](2026-10-08-live-moves-windowed.md)
 - Superseded by: none
+- Summary: Forced to generate the same text, the rounds after a 236K-token sequence's restore miss the expert cache as an unmoved run's do (-1.2% to +0.6%) after a ~20-round transient, so the doubling once read as the move's was the lanes' text.
 
 ## Question
 

@@ -5,8 +5,10 @@
 - Observed: 2026-09-13
 - Last verified: 2026-09-13
 - Scope: bench / G4 per-class cell, trace replay, SSE reader
+- Topic: harness-and-build
 - Related: [#147](https://github.com/gpillon/ignis/issues/147), [#137](https://github.com/gpillon/ignis/issues/137), [#128](https://github.com/gpillon/ignis/issues/128), [spec 04](../specs/runtime/04-reference-feature-floor.md)
 - Superseded by: none
+- Summary: The G4 run's empty `main` request was an `ignis-bench` reader built before #137's reasoning-channel fix, not the engine: replayed with the current reader it counts 15,613 tokens on ignis and 16,000 on ninfer.
 
 ## Question
 

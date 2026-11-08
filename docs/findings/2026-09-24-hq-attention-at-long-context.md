@@ -1,15 +1,20 @@
 # hq-e8-2b attention costs 0.09 ms per 1K context tokens per lane per round, ~85% of it the codec's decode, so an INT8/FP8 MMA would buy under 10%
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-24
 - Last verified: 2026-09-24
 - Scope: kernel / verify-round attention (`gqa_attention_small_t_tc_partial_bf16_kernel` with `GqaTcKVHq`; BF16 route), decode throughput vs context
+- Topic: kv-and-state
 - Related: [hq vs BF16 decode cost](2026-09-13-hq-vs-bf16-decode-cost.md) (pre-speculation),
   [KLD against BF16](2026-09-24-kld-against-bf16.md) (the same format's quality cost at long context),
   [upstream quick wins](2026-09-24-upstream-quick-wins-ab.md), `.scratch/sota-research-2026-09-24/SINTESI.md` §2.2,
   raw material in `.scratch/longctx-2026-09-24/`
 - Superseded by: none
+- Corrected by: [hq verify decode cost](2026-09-24-hq-verify-decode-cost.md)
+- Summary: hq-e8-2b verify attention grew ~0.09 ms per 1K context tokens per lane per round and a narrower MMA is not the lever, but the kernel proved register-latency-bound, and a bit-exact rewrite cut it 44-48% to ~3.9x its MMA floor.
+
+> **Corrected.** The kernel was latency-bound on registers rather than on the codec's instructions: a bit-exact rewrite cut it 44-48%, to ~3.9x its MMA floor with the decode ~60% of it ([hq verify decode cost](2026-09-24-hq-verify-decode-cost.md)).
 
 ## Question
 

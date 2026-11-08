@@ -5,8 +5,10 @@
 - Observed: 2026-10-21
 - Last verified: 2026-10-21
 - Scope: kernel / the vendored W8 gather reading `text/token_embedding` from mapped pinned host memory; serving / the 27B's VRAM plan, host plan, decode and cold prefill on the RTX 5090 (PCIe Gen 3 host)
+- Topic: artifacts-and-gates
 - Related: [ADR 0062](../adr/0062-the-token-embedding-lives-in-host-memory.md), [spec 27b-16gb/03](../specs/27b-16gb/03-vram-recovered-on-every-card.md) (ACs 6, 7), GitHub #335, [cold prefill 27B vs Flash-Next](2026-10-13-cold-prefill-27b-vs-flash-next.md) (the prefill driver and prompts), [HQ verify decode cost](2026-09-24-hq-verify-decode-cost.md) (the decode driver), [VRAM headroom and WDDM paging](2026-10-09-vram-headroom-wddm-paging.md)
 - Superseded by: none
+- Summary: Moving the 27B's token embedding to mapped pinned host memory frees its 1,350,860,800 bytes of VRAM for ~146K more hq KV tokens (+18.5%), at ~1 µs per prompt token over PCIe Gen 3, with decode and cold prefill within main's spread.
 
 ## Question
 

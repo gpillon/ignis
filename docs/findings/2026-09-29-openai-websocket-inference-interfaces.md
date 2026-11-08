@@ -5,11 +5,13 @@
 - Observed: 2026-09-29
 - Last verified: 2026-09-29
 - Scope: serving / the `/v1` surface, `POST /v1/responses`, a WebSocket transport; clients Codex CLI, openai-python, openai-node, openai-agents
+- Topic: harness-and-build
 - Related: [ADR 0029](../adr/0029-cross-request-state-reuse.md) (content-matched reuse, no session id),
   [ADR 0036](../adr/0036-the-v1-surface-documents-itself.md) (the `/v1` path set),
   [spec server/01](../specs/server/01-openai-http.md) (`/v1/responses` non-streaming in v1),
   raw source copies in `.scratch/openai-websocket-research-2026-09-29/raw/` (untracked)
 - Superseded by: none
+- Summary: OpenAI's WebSocket standard for text inference is the Responses API's WebSocket mode, `response.create` carrying the `POST /v1/responses` body answered by its SSE events, so ignis needs streaming Responses with function tools first.
 
 ## Question
 

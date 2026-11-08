@@ -5,8 +5,10 @@
 - Observed: 2026-10-09
 - Last verified: 2026-10-09
 - Scope: server / the derived VRAM budget's default headroom (`--vram-headroom-bytes`, `DEFAULT_VRAM_HEADROOM_BYTES`); make / Flash-Next's `VRAM_HEADROOM`; serving / one-lane decode on the 27B and Flash-Next under Windows (WDDM) with desktop GPU clients
+- Topic: host-and-gpu
 - Related: [ADR 0030](../adr/0030-device-memory-reserved-at-load.md), spec [vram-budget/01](../specs/vram-budget/01-vram-budget.md), spec [flash-next/04](../specs/flash-next/04-the-flash-next-forward-and-serving.md) (story 11, AC 10)
 - Superseded by: none
+- Summary: At a 1 GiB VRAM headroom a browser drawing a page makes WDDM page the model out (the 27B from 19 to 70 ms a round), while at 1.5 GiB neither the 27B nor Flash-Next moves, so the server's default headroom is 1.5 GiB.
 
 ## Question
 

@@ -5,8 +5,10 @@
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
 - Scope: serving / device memory reservation, KV-RAM pinned arena, retained slots, WDDM paging
+- Topic: host-and-gpu
 - Related: https://github.com/gpillon/ignis/issues/214, https://github.com/gpillon/ignis/issues/207, [ADR 0030](../adr/0030-device-memory-reserved-at-load.md), [ADR 0029](../adr/0029-cross-request-state-reuse.md), [spec](../specs/vram-budget/01-vram-budget.md), [run record](../../.scratch/vram-budget/gate-214/FINDINGS.md), https://github.com/gpillon/ignis/issues/218, https://github.com/gpillon/ignis/issues/219
 - Superseded by: none
+- Summary: With #207's slices in, the agent load that grew the process 2,734 MiB in 14 minutes grows it 6 MiB in 24.5, shared memory stays on the 8 GiB pinned KV-RAM arena, and the printed `vram_plan` matches Task Manager's dedicated figure to 16 MiB.
 
 ## Question
 

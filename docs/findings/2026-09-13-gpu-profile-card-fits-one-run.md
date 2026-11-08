@@ -5,11 +5,13 @@
 - Observed: 2026-09-13
 - Last verified: 2026-09-13
 - Scope: test harness / GPU profile, GPU exclusivity
+- Topic: harness-and-build
 - Related: [GitHub #145](https://github.com/gpillon/ignis/issues/145),
   [GitHub #128](https://github.com/gpillon/ignis/issues/128),
   [GPU profile wall time](2026-09-12-gpu-profile-wall-time.md),
   `docs/agents/testing.md`, ADR 0006
 - Superseded by: none
+- Summary: The serialized GPU profile is green 3 of 3 on an exclusive 5090 but one run peaks at 26.1 of 32.6 GiB, too little room for a second GPU process, whose loser dies with `exit code: 1` and no panic text, as #145's crashes did.
 
 ## Question
 

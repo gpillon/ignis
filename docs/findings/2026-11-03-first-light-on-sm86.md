@@ -1,18 +1,23 @@
 # On an sm_86 card the 27B trellis entry runs at the 5090's quality: the leaf built for `86;120a` loads, prefills on the FP16 band and decodes
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-11-03
 - Last verified: 2026-11-04
 - Scope: kernel / the leaf built for `86;120a` (`IGNIS_CUDA_ARCHITECTURES`), its CTest suite on an sm_86 card, the
   dense trellis decode body; serving / the start-up architecture check, the routes keyed on compute capability, the
   27B trellis entry (`qwen3.8-27b-16g`) end to end; quality / top-64 KLD against the BF16 checkpoint
+- Topic: host-and-gpu
 - Related: [GitHub #456](https://github.com/gpillon/ignis/issues/456), [GitHub #457](https://github.com/gpillon/ignis/issues/457),
   [ADR 0077](../adr/0077-a-vendored-file-may-carry-a-portability-patch.md),
   [RTX 20, 30 and 40 cards](2026-11-02-rtx-20-30-40-what-blocks-the-leaf.md),
   [27B on 16 GB: the quality gates](2026-10-24-27b-16gb-quality-gates.md),
   [dense trellis kernels on the 5090](2026-10-23-dense-trellis-kernels-on-the-5090.md)
 - Superseded by: none
+- Corrected by: [the sm_86 gate's first run](2026-11-06-sm86-gate-first-run.md), [GitHub #478](https://github.com/gpillon/ignis/issues/478)
+- Summary: On an sm_86 card the 27B trellis entry runs end to end at the 5090's quality (top-64 KLD 0.03777 against 0.03825 on the FP16 band), and since #478 the GDN gating planner sizes its cooperative grids from CUDA's occupancy query.
+
+> **Corrected 2026-11-04 (#478).** The GDN gating planner did admit cooperative grids an sm_86 card cannot hold resident; it now takes each schedule's figure from CUDA's occupancy query (marked below; measured in [the sm_86 gate's first run](2026-11-06-sm86-gate-first-run.md)).
 
 ## Question
 

@@ -6,11 +6,13 @@
 - Last verified: 2026-11-03
 - Scope: models / `tools/27b-nvfp4-converter/` run on the base BF16 `Qwen/Qwen3.8-27B` and the DFlash2 drafter,
   packed with `ignis-artifact-pack` and compared object by object with the served `qwen3_8_27b_nvfp4full-v2.ninfer`
+- Topic: artifacts-and-gates
 - Related: [GitHub #469](https://github.com/gpillon/ignis/issues/469), [GitHub #449](https://github.com/gpillon/ignis/issues/449),
   [GitHub #468](https://github.com/gpillon/ignis/issues/468), [GitHub #470](https://github.com/gpillon/ignis/issues/470),
   [ADR 0074](../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md),
   [ADR 0078](../adr/0078-the-built-in-catalog-names-each-entrys-license-and-may-ship-restricted-weights.md)
 - Superseded by: none
+- Summary: Run from the base BF16 checkpoint, the NVFP4 converter reproduces the served 27B's 831 tier-1 objects and 135 locally encoded weights byte for byte, but 68 of the 135 activation divisors differ (median 3.97e-3, max 0.2675).
 
 ## Question
 

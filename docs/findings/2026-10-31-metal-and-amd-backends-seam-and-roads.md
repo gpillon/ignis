@@ -1,12 +1,13 @@
 # A Metal or AMD backend for the leaf: the roads, a seam at the segment, and trellis decode's ALU budget on an M4 Pro
 
 - Kind: discovery
-- Status: current
+- Status: archived
 - Observed: 2026-10-31
 - Last verified: 2026-10-31
 - Scope: kernel / the leaf's structure (orchestration, layer bodies, kernels) and where a hardware seam can go for a
   Metal backend (the owner's M4 Pro laptop, 48 GB unified memory) and a later AMD consumer backend (RDNA3/4 through
   HIP); serving / the card class and memory plan on unified memory; quality / the reference a non-CUDA backend gates on
+- Topic: host-and-gpu
 - Related: [GitHub #439](https://github.com/gpillon/ignis/issues/439), [ADR 0001](../adr/0001-cpp-kernel-leaf-c-abi.md), [ADR 0009](../adr/0009-step-level-device-resident-abi.md),
   [ADR 0010](../adr/0010-vendored-reference-kernels.md), [ADR 0016](../adr/0016-step-abi-extensible-options.md),
   [ADR 0019](../adr/0019-decode-cuda-graph-slot-indirection.md),
@@ -21,6 +22,9 @@
   [dense trellis kernels on the 5090](2026-10-23-dense-trellis-kernels-on-the-5090.md),
   [Flash-Next decode fusion](2026-10-08-flash-next-decode-fusion.md)
 - Superseded by: none
+- Summary: Exploration not followed (#439 parked as an idea, nothing run on Apple or AMD): a Metal or AMD backend would be native kernels behind today's C ABI, seamed at the segment, after a spike tests trellis decode on an M4 Pro.
+
+> **Archived.** Exploration not followed: the work is parked as an idea on [#439](https://github.com/gpillon/ignis/issues/439), and no spike has run.
 
 ## Question
 

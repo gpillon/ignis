@@ -1,12 +1,17 @@
 # The hq-e8-2b decode penalty measured live/live: both engines pay 14% of ITL p95 for the format, and ignis is 3.1x the reference at C=4 under it
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-13
 - Last verified: 2026-09-13
 - Scope: runtime / KV format, decode throughput, GPU utilization
+- Topic: kv-and-state
 - Related: [ADR 0015](../adr/0015-g2-live-live-cold-prefix-gate.md), [ADR 0021](../adr/0021-live-live-launch-pooling.md), [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md), [hq vs BF16 decode cost](2026-09-13-hq-vs-bf16-decode-cost.md) (the same question, measured in separate sessions), [hq-e8-2b KV capacity](2026-09-11-hq-e8-2b-kv-capacity.md), [ITL lane terminator race](2026-09-13-itl-lane-terminator-race.md), [GitHub #65](https://github.com/gpillon/ignis/issues/65)
 - Superseded by: none
+- Corrected by: [hq attention at long context](2026-09-24-hq-attention-at-long-context.md)
+- Summary: At T=1 decode before speculation, measured live/live, hq-e8-2b cost 14.5% of ITL p95 on ignis and 14.3% on the reference, so the penalty is the format's; with DFlash2 the BF16 verify round is slower than hq at 1 lane and 59K.
+
+> **Corrected.** These are T=1 decode numbers from before speculation: with DFlash2 the BF16 verify round runs the prefill attention kernel and is slower than hq at 1 lane and 59K ([hq attention at long context](2026-09-24-hq-attention-at-long-context.md)).
 
 ## Question
 

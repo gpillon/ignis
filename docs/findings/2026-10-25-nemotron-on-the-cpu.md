@@ -8,12 +8,14 @@
   Q8_0 nightly `caa3f47`, Transformers FP32), on the owner's i9-10900K (Windows, WSL) and a 4-core podman container:
   WER on the owner's eleven dictations and the FLEURS clips of the Qwen3-ASR study, x real time, latency to the
   final text, DER on synthetic Italian conversations, speaker attribution per word, CPU share
+- Topic: speech
 - Related: [ADR 0067](../adr/0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md),
   [ADR 0068](../adr/0068-the-speech-models-cpu-executor-is-ours-in-rust.md),
   [ADR 0069](../adr/0069-the-speakers-come-from-nemotron-diarization-beside-qwen3-asr.md),
   [spec speech/07](../specs/speech/07-transcribe.md), [spec speech/08](../specs/speech/08-diarization.md),
   [Qwen3-ASR on the CPU](2026-10-24-qwen3-asr-on-cpu.md)
 - Superseded by: none
+- Summary: Nemotron's streaming ASR loses the owner's Italian to Qwen3-ASR (best WER 13.2% against 3.2-3.4%), while Nemotron 3 Diarization tells Italian speakers apart at DER 3.6-4.0%, at half of a 4-core machine at its low geometry.
 
 ## Question
 

@@ -5,8 +5,10 @@
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
 - Scope: Playground transport / parallel agents, Monitor scraping, anything the page requests while streams run
+- Topic: harness-and-build
 - Related: https://github.com/gpillon/ignis/issues/220, [ADR 0017](../adr/0017-prometheus-metrics.md), [ADR 0026](../adr/0026-playground-embedded-when-built.md), [ADR 0028](../adr/0028-expose-modes-always-keyed.md)
 - Superseded by: none
+- Summary: Over HTTP/1.1 six Playground agent streams take all six connections a browser opens per origin, so the Monitor scrape and other same-origin requests queue until an agent ends and two of eight lanes are unreachable; h2 or h3 lifts it.
 
 ## Question
 

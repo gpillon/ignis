@@ -7,6 +7,7 @@
 - Scope: serving / the 27B's trellis body (`gpillon/Qwen3.8-27B-trellis-3bpw-ignis`) under a 16 GiB VRAM budget and
   the `rtx50-16gb` profile on the RTX 5090 (PCIe Gen 3): VRAM plan, greedy serving at two lanes with DFlash2, the
   131,072-token leg, a two-window KLD against BF16; the served NVFP4 artifact on the same build
+- Topic: artifacts-and-gates
 - Related: [GitHub #339](https://github.com/gpillon/ignis/issues/339),
   [GitHub #340](https://github.com/gpillon/ignis/issues/340),
   [spec 27b-16gb/05](../specs/27b-16gb/05-gates-and-simulation.md) (Part A, "As built: acceptance"),
@@ -14,6 +15,7 @@
   [ADR 0060](../adr/0060-the-27b-has-a-trellis-body-for-small-cards.md),
   [the dense trellis kernels on the 5090](2026-10-23-dense-trellis-kernels-on-the-5090.md)
 - Superseded by: none
+- Summary: Under a 16 GiB budget on the 5090 the 27B's trellis artifact plans to its closed forms (a 509,184-token pool, nothing adapted), is KLD 0.0419 against BF16 to the NVFP4's 0.0534, and commits 4.41 tokens per round at 12.83 ms.
 
 ## Question
 

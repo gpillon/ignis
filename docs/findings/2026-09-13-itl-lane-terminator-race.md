@@ -5,8 +5,10 @@
 - Observed: 2026-09-13
 - Last verified: 2026-09-13
 - Scope: bench / G3 ITL cell, EOS suppression, reference engine capabilities
+- Topic: harness-and-build
 - Related: [#139](https://github.com/gpillon/ignis/issues/139), [#146](https://github.com/gpillon/ignis/issues/146), [#114](https://github.com/gpillon/ignis/issues/114), [ADR 0015](../adr/0015-g2-live-live-cold-prefix-gate.md), [ADR 0021](../adr/0021-live-live-launch-pooling.md), [spec 03 serving loop](../specs/runtime/03-serving-loop.md), [GLOSSARY.md glossary](../../GLOSSARY.md)
 - Superseded by: none
+- Summary: A G3 ITL lane can be ended by the harness, its own EOS or the safety cap, and the reference honours neither `ignore_eos` nor `logit_bias`, so the cell measures inside the span every lane shared (p95 within 0.7% of the accepted leg).
 
 ## Question
 

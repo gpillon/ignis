@@ -5,12 +5,14 @@
 - Observed: 2026-11-03
 - Last verified: 2026-11-03
 - Scope: models / the `qwen3.8-27b/nvfp4full-swift-1.5` artifact built by `tools/27b-nvfp4-converter/` from `ukisai/Swift-1.5-Qwen3.8-27b`, measured on the RTX 5090 as served (8 lanes, chunk 2,048, DFlash2 7) with `tools/kld-gate`
+- Topic: artifacts-and-gates
 - Related: [GitHub #470](https://github.com/gpillon/ignis/issues/470), [GitHub #449](https://github.com/gpillon/ignis/issues/449),
   [GitHub #469](https://github.com/gpillon/ignis/issues/469), [GitHub #468](https://github.com/gpillon/ignis/issues/468),
   [2026-11-03 converter finding](2026-11-03-nvfp4-converter-reproduces-the-served-27b.md),
   [ADR 0074](../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md),
   [ADR 0078](../adr/0078-the-built-in-catalog-names-each-entrys-license-and-may-ship-restricted-weights.md)
 - Superseded by: none
+- Summary: Swift 1.5 as NVFP4 passes the fine-tune gates on the 5090 as served: KLD 0.05355 against a limit of 0.0590 on the point estimate (its CI crosses it), DFlash2 on beats off in all nine cells, loops 11 of 32 against 14.
 
 ## Question
 

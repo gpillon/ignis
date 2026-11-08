@@ -1,10 +1,11 @@
 # What upstream ninfer's last month of perf work offers ignis: six prefill candidates with low-single-digit ceilings, and one KV-format axis worth more than all of them
 
 - Kind: research
-- Status: current
+- Status: corrected
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
 - Scope: kernel / vendored subtree currency, NVFP4 linear and SwiGLU routes, GDN convolution output, KV formats, artifact container v2/v3, build time
+- Topic: harness-and-build
 - Related: [ADR 0010](../adr/0010-vendored-reference-kernels.md),
   [Decode round anatomy](2026-09-18-decode-round-anatomy.md),
   [Decode round host idle](2026-09-18-decode-round-host-idle.md),
@@ -17,6 +18,10 @@
   [GQA workspace memset](2026-09-18-gqa-workspace-memset.md),
   [hq prompt workspace under-report](2026-09-12-hq-prompt-workspace-under-report.md)
 - Superseded by: none
+- Corrected by: [Upstream quick wins A/B](2026-09-24-upstream-quick-wins-ab.md)
+- Summary: Six of upstream ninfer's month of changes apply to ignis's routes and a pin bump is blocked by the fork, not the v3 migration, but the survey's inference that none moves decode was revised: the fused SwiGLU later bought +8% at eight lanes.
+
+> **Corrected.** Measured, the fused SwiGLU registered through T=128 bought +8.0% aggregate decode at eight lanes, at the verify round's width, where the Finding below infers that none of the six moves decode ([Upstream quick wins A/B](2026-09-24-upstream-quick-wins-ab.md)).
 
 ## Question
 
