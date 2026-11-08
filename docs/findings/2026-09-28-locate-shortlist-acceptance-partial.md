@@ -5,8 +5,10 @@
 - Observed: 2026-09-28
 - Last verified: 2026-09-28
 - Scope: `/v1/decide` `locate` as served on the NVFP4 27B under `make start`'s defaults (hq-e8-2b, 262,144 context, dflash2), the defaults of [spec 22](../specs/decide/22-locate-by-copy-over-a-folded-state.md) (GitHub #278) on its registered sets R3 (real logs), P3 (prose) and J3 (JSON records), and set F under both methods. **Partial**: runs 1, 2, 5 and 6 whole; run 3 on P3's present questions to 200K tokens and 2 of its 12 questions at ~1M; run 4 on J3's 1,000- and 3,500-record arrays; P3's absent questions, J3's 10,000-record arrays and R3's Apache and Proxifier windows after a fix are not run (the owner stopped the runs to save GPU time).
+- Topic: decide-locate
 - Related: [spec 22](../specs/decide/22-locate-by-copy-over-a-folded-state.md), [ADR 0042](../adr/0042-locate-copies-over-a-folded-state.md) (stays Proposed until the acceptance is whole), [very long logs and prose](2026-09-28-zero-decode-locate-very-long-logs-and-prose.md), [paragraphs, not found, records](2026-09-28-zero-decode-locate-paragraphs-not-found-records.md), [locate through `/v1/decide`](2026-09-27-locate-through-decide.md); tools `accept22.py`, `r3_judge.py`, `r3set.py`
 - Superseded by: none
+- Summary: On sets registered in advance the shortlist defaults hold every rule judged: logs 107/120 (89.2%), prose 83/96 to 200K, records 57/60, and "not found" flags 101/120 removed targets; P3's absent questions and J3's largest arrays went unrun.
 
 ## Question
 

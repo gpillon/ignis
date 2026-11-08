@@ -5,8 +5,10 @@
 - Observed: 2026-10-16
 - Last verified: 2026-10-16
 - Scope: server / reasoning-loop guard trigger and cut (`crates/server/src/loop_guard.rs`, config v2 `model.loop_guard*`); sampled reasoning on qwen3.8-27b, the Playground's Rome prompt and the owner's opencode and qwen-code agentic sessions
+- Topic: reasoning-and-context
 - Related: [ADR 0053](../adr/0053-a-loop-is-acted-on-once-it-persists.md), [ADR 0052](../adr/0052-a-reasoning-loop-is-taken-back-and-nudged.md), [Reasoning-loop guard](2026-10-14-reasoning-loop-guard.md), [Reasoning loops are the model's](2026-10-12-reasoning-loops-are-the-models.md)
 - Superseded by: none
+- Summary: Duration separates loops from legitimate enumerations where depth does not (legitimate text at most 6 low checks in a row, harmful loops mostly 9+): ratio 0.265 on 4 checks in a row catches 25/25 harmful loops with 0 agentic fires.
 
 ## Question
 

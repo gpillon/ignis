@@ -5,8 +5,10 @@
 - Observed: 2026-09-27
 - Last verified: 2026-09-27
 - Scope: `/v1/decide` / attention readout over a text state — spec 19 phase 0 on spec 18's development dumps (sets A+B), replicated on set C
+- Topic: decide-locate
 - Related: [GitHub #276](https://github.com/gpillon/ignis/issues/276); [spec 19](../specs/decide/19-a-span-read-from-attention.md); [spec 18's no-go](2026-09-26-locate-attention-no-go.md); [the literature pass](2026-09-27-span-from-attention-literature.md); [`tools/locate-sets/profiles.py`](../../tools/locate-sets/profiles.py), [`score.py`](../../tools/locate-sets/score.py)
 - Superseded by: none
+- Summary: A majority vote of the heads with most training hits, read at the copy scaffold less the content-free prefill, finds the line on 90.0-91.5% of A+B's questions (single head 70.4%), lexical and paraphrase alike, and ties labels on C.
 
 ## Question
 

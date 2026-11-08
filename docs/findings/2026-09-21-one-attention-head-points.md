@@ -1,10 +1,11 @@
 # One attention head points, in the prefill, and guards the chain
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-21
 - Last verified: 2026-09-21
 - Scope: serving / decision primitives, one-pass pointing, `/v1/decide` `point` and `box`
+- Topic: decide-pointing
 - Related: `.scratch/latent-probe/c5*.py` (raw material, on disk),
   `docs/specs/decide/11-point-in-one-pass.md` (C5),
   `2026-09-21-qwen-vl-grounding-primary-sources.md` (the mechanism and its precedents),
@@ -12,6 +13,16 @@
   `2026-09-21-a-declared-grid-is-read-to-one-part-in-ten.md`,
   `2026-09-19-constrained-digit-readout-points.md`
 - Superseded by: none
+- Corrected by: [an anchored head set points and boxes](2026-09-23-an-anchored-head-set-points-and-boxes.md), [the head set holds through `/v1/decide`](2026-09-23-the-head-set-holds-through-decide.md)
+- Summary: L39.h10, read after the forced `{"x":` in the prefill, points in one pass (inside on 236 and 233 of 240, chain 218 and 213) and is the served pointing head; the point now reads the anchored head set around it, and the guard never shipped.
+
+> **Corrected 2026-09-23.** L39.h10 is still the served pointing head and its
+> calibration rests on this finding (`crates/core/src/pointing.rs`), but
+> `point` is now read from the anchored head set around it ([an anchored head
+> set points and boxes](2026-09-23-an-anchored-head-set-points-and-boxes.md),
+> [the head set holds through
+> `/v1/decide`](2026-09-23-the-head-set-holds-through-decide.md)), and the
+> chain guard was never served (spec 13, Out of Scope).
 
 ## Question
 

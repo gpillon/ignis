@@ -1,12 +1,21 @@
 # Typed option logits are readable from one prefill
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-19
 - Last verified: 2026-09-19
 - Scope: serving / classification readout, prefill logits, `Compute` seam
+- Topic: decide-options
 - Related: `crates/server/tests/classify_readout_gpu.rs`, `classify_vision_readout_gpu.rs`, `slot_alphabet.rs`, GitHub #72 (`out_logits`), #178 (multimodal prefill), #191/#193 (prompt reuse), #235 (shared-suffix study), SemIf (github.com/TheoLeeCJ/SemIf), TypeSafe Jev `POST /v1/systemone`
 - Superseded by: none
+- Corrected by: [the evidence belongs in the system block](2026-09-20-the-evidence-belongs-in-the-system-block.md)
+- Summary: A typed-option readout is signal, not noise: on the served 27B the declared options hold a median 99.8% of the next token, and the served system-block layout reads 0.963 balanced accuracy (0.934 as first measured), zero tokens decoded.
+
+> **Corrected 2026-09-20 (#240).** The accuracy below was measured on a
+> criterion-first prompt; the served layout, the evidence in the system block,
+> reads 0.963 balanced accuracy on the same 144 rows ([the evidence belongs in
+> the system block](2026-09-20-the-evidence-belongs-in-the-system-block.md)).
+> The mechanism and the calibration stand.
 
 ## Question
 

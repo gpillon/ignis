@@ -5,8 +5,10 @@
 - Observed: 2026-09-26
 - Last verified: 2026-09-26
 - Scope: `/v1/decide` primitives, readout / attention readout / constrained decode / fan-out, answer-space design
+- Topic: decide-options
 - Related: `docs/adr/0034-the-leaf-answers-without-generating.md`, `docs/adr/0038-the-seam-carries-one-attention-head.md`, `docs/specs/decide/` (03, 06, 08, 10, 12, 13, 17), [`2026-09-19-typed-option-logit-readout.md`](2026-09-19-typed-option-logit-readout.md), [`2026-09-21-the-point-is-assembled-as-it-is-written.md`](2026-09-21-the-point-is-assembled-as-it-is-written.md), [`2026-09-21-scalar-readout-legend-width.md`](2026-09-21-scalar-readout-legend-width.md), `docs/specs/decide/18-locate-by-attention.md`
 - Superseded by: none
+- Summary: The answer shapes `/v1/decide` lacked are `multi`, `rank`, `locate`/`cite`, `points`/`count` and `record`: `multi` and top-k `rank` compose today's readouts (per-label yes/no NLL 3.60 vs 23.93), `locate` reads attention over text.
 
 ## Question
 

@@ -5,8 +5,10 @@
 - Observed: 2026-09-28
 - Last verified: 2026-09-28
 - Scope: `/v1/decide` `locate` with no token generated, after [spec 23](../specs/decide/23-zero-decode-locate-confirmatory.md): the paragraph as the prose pointer at ~1M tokens; an answer that the text does not hold, for logs, prose and records; long JSON arrays of records as a kind of their own. **Exploratory throughout**: P and P2 were read before (P2 is spec 23's judged set), R/R2/R4 are earlier sets, and the new sets (P2abs, J, J2) were built and read in this round.
+- Topic: decide-locate
 - Related: [very long logs and prose](2026-09-28-zero-decode-locate-very-long-logs-and-prose.md) (round 2, spec 23); [zero-decode locate on real logs](2026-09-28-zero-decode-locate-exploration.md) (round 1); tools `zd_para.py`, `zd_notfound.py`, `zd_verify.py`, `zd_prose_nf.py`, `zd_records.py`
 - Superseded by: none
+- Summary: Past 500K tokens a `choice` over the heads' first 8 paragraphs picks a gold one 35/36; "not found" works when the last `choice` sees checkable candidates (16/20 authored absent log questions); JSON records read 58/60 to 3,500 records.
 
 ## Question
 

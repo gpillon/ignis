@@ -1,16 +1,18 @@
 # A scalar reads its legend, and only while the legend is narrow
 
 - Kind: experiment
-- Status: current
+- Status: archived
 - Observed: 2026-09-21
 - Last verified: 2026-09-21
 - Scope: server / `/v1/decide` readout primitives, prompt width
+- Topic: decide-options
 - Related: [ADR 0034](../adr/0034-the-leaf-answers-without-generating.md),
   [typed option logit readout](2026-09-19-typed-option-logit-readout.md),
   [constrained digit readout](2026-09-19-constrained-digit-readout-points.md),
   [number width and decide e2e](2026-09-20-number-width-and-decide-e2e.md),
   [GitHub #252](https://github.com/gpillon/ignis/issues/252)
 - Superseded by: none
+- Summary: Not implemented (spec 08): a grid readout reads its legend only while it is narrow (4/5 at 20 and 32 cells, 0/6 at 100), which is why the `scalar` that shipped generates and closes its own object instead.
 
 > **The primitive is superseded; this measurement is not** (GitHub #255,
 > 2026-09-21). The `scalar` that shipped is a constrained decode that closes
@@ -18,7 +20,7 @@
 > [a number that closes its own object](2026-09-21-a-number-that-closes-its-own-object.md)
 > — and the readout measured here was never merged
 > ([spec 08](../specs/decide/08-scalar-readout.md), marked NOT IMPLEMENTED).
-> The status stays `current` because what is below is a result about grids
+> The status is `archived`, not `superseded`, because what is below is a result about grids
 > and legend width, and it is the reason the primitive that shipped generates
 > rather than reads. A finding is superseded when later evidence replaces its
 > *conclusion*; here later evidence took its conclusion and acted on it.

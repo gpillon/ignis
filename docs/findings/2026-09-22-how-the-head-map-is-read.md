@@ -1,16 +1,20 @@
 # How the head's map is read: where its error comes from
 
 - Kind: experiment
-- Status: current (pre-registration committed in da587d2, before any number below)
+- Status: current
 - Observed: 2026-09-22
 - Last verified: 2026-09-22
 - Scope: serving / decision primitives, one-pass pointing, `/v1/decide` `point` (spec 13)
+- Topic: decide-pointing
 - Related: `docs/specs/decide/13-point-by-attention-head.md` (#260),
   `2026-09-22-the-codec-costs-the-head-its-read.md`,
   `2026-09-21-one-attention-head-points.md`,
   `.scratch/latent-probe/map_reading.py`, `map_explore.py`, `results/engine*/`,
   `results/map-reading.{log,json}`, `results/map-explore.log` (raw, on disk)
 - Superseded by: none
+- Summary: TAG's region rule stays: 28 of L39.h10's 30 misses are the map's own (an adjacent cell or another element), its peak marks the start of the target's label, the region's mass share is a confidence (AUC 0.65-0.84), and several heads beat one.
+
+> Pre-registration committed in da587d2, before any number below.
 
 ## Question
 

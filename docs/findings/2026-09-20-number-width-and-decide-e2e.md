@@ -1,14 +1,16 @@
 # A fixed-width `number` is wrong at exactly one width, and an image `state` shares nothing
 
 - Kind: experiment
-- Status: current
+- Status: superseded
 - Observed: 2026-09-20
 - Last verified: 2026-09-20
 - Scope: serving / `POST /v1/decide`, constrained decode, fan-out cost
+- Topic: decide-options
 - Related: `2026-09-19-constrained-digit-readout-points.md`,
   `2026-09-19-typed-option-logit-readout.md`, `crates/server/src/numbers.rs`,
   GitHub #240 (fan-out), #242 (number/point/box)
-- Superseded by: none
+- Superseded by: [the number prompt declares an alignment](2026-09-21-the-number-prompt-declares-an-alignment.md), [a shared vision embedding](2026-09-20-shared-vision-embedding-fan-out.md)
+- Summary: Both halves are replaced: a fixed-width `number` is wrong at many widths until the prompt names an alignment (47 read 4700 at five digits), and an image fan-out no longer re-encodes its image per question.
 
 > **Corrected 2026-09-21 (#254).** The width rule below — that a width two or
 > more past the value's own makes the model pad on the left and is safe — does
@@ -17,6 +19,12 @@
 > never named, and `number_system` names it now; see
 > [the number prompt declares an alignment](2026-09-21-the-number-prompt-declares-an-alignment.md).
 > Everything else here stands.
+
+> **Superseded.** The image half went too: since #243 a fan-out over one image
+> shares its vision embedding ([a shared vision
+> embedding](2026-09-20-shared-vision-embedding-fan-out.md)), so the 6.9 s per
+> question below is the baseline that change was measured against. The `box`
+> measurement still stands.
 
 ## Question
 

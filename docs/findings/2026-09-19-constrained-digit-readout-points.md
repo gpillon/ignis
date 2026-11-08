@@ -1,12 +1,22 @@
 # A constrained digit readout points at a button on a 4096px screenshot
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-19
-- Last verified: 2026-09-20 (through the served endpoint)
+- Last verified: 2026-09-20
 - Scope: serving / constrained decode, multimodal grounding, decision endpoint primitives
+- Topic: decide-pointing
 - Related: `crates/server/tests/classify_pointing_gpu.rs`, `slot_alphabet.rs`, `crates/server/tests/decide_point_gpu.rs`, `2026-09-19-typed-option-logit-readout.md`, GitHub #178 (multimodal prefill), #235, #242
 - Superseded by: none
+- Corrected by: [the codec costs the head its read](2026-09-22-the-codec-costs-the-head-its-read.md), [the head points through `/v1/decide`](2026-09-22-the-head-points-through-decide.md)
+- Summary: A digit-constrained decode points on the model's own 0-999 scale, inside the button on 3 of 3 scenes at 4096 px; on 240-scene sets it later landed inside 170-182 at 4096 px, drifting ~11-14/999 down, as the reference model does.
+
+> **Corrected 2026-09-22.** Its 4096 px accuracy is three scenes; on 240-scene
+> sets the chain lands inside 170-182 of 240 at 4096 px, drifting ~11-14/999
+> down, the model's drift and not the engine's ([the codec costs the head its
+> read](2026-09-22-the-codec-costs-the-head-its-read.md), [the head points
+> through `/v1/decide`](2026-09-22-the-head-points-through-decide.md)). Last
+> verified on 2026-09-20 through the served endpoint.
 
 ## Question
 

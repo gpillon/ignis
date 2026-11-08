@@ -1,15 +1,22 @@
 # A declared grid is read to one part in ten, however finely it is declared
 
 - Kind: experiment
-- Status: current
+- Status: archived
 - Observed: 2026-09-21
 - Last verified: 2026-09-21
 - Scope: serving / decision readout primitives, one-pass pointing, answer mass
+- Topic: decide-pointing
 - Related: `.scratch/latent-probe/strips.py` (raw material, on disk),
   `docs/specs/decide/11-point-in-one-pass.md` (C1b, C4, E1, E2),
   `2026-09-21-the-point-is-assembled-as-it-is-written.md`,
   `2026-09-21-the-grid-a-bigram-can-name.md`, ADR 0034
 - Superseded by: none
+- Summary: Negative (spec 11 E1): asked which of N strips holds the target, the model errs by 9-15% of the axis at every width (11-26 strips) against the chain's 0.08%; and answer mass (0.98) certifies an answer's shape, not its correctness.
+
+> **Archived.** Spec 11's E1 fired negative: no strip width points, which
+> closed the one-pass point through the vocabulary. The one-pass point that
+> shipped reads attention heads ([one attention head
+> points](2026-09-21-one-attention-head-points.md)).
 
 ## Question
 

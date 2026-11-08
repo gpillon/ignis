@@ -1,12 +1,20 @@
 # Attention finds the paraphrased line and loses the quoted one: `locate` is a no-go
 
 - Kind: experiment
-- Status: current
+- Status: superseded
 - Observed: 2026-09-26
 - Last verified: 2026-09-26
 - Scope: `/v1/decide` / attention readout over a text state (spec 18 phase A), labelled `choice` route
+- Topic: decide-locate
 - Related: [GitHub #274](https://github.com/gpillon/ignis/issues/274) (phase A), [#275](https://github.com/gpillon/ignis/issues/275) (phase B); [spec 18](../specs/decide/18-locate-by-attention.md); [decision classes beyond the seven](2026-09-26-decision-classes-beyond-the-seven.md); [ADR 0038](../adr/0038-the-seam-carries-one-attention-head.md); [`tools/locate-sets/`](../../tools/locate-sets/README.md); [`attention_head_locate_gpu.rs`](../../crates/server/tests/attention_head_locate_gpu.rs)
-- Superseded by: none
+- Superseded by: [locate by a head vote is a go](2026-09-27-locate-by-head-vote-go.md), [the shortlist `locate`, spec 22's acceptance](2026-09-28-locate-shortlist-acceptance-partial.md)
+- Summary: Replaced by the head vote: one head (L39.h12) at the copy scaffold found paraphrased lines better than labels (91.0% against 87.2%) but missed 43% of lexical questions, 73.3% to 91.3% overall, so spec 18 said no-go.
+
+> **Superseded 2026-09-27.** A vote of heads reads the lexical questions this
+> single head lost, and spec 18's rule 2 said go on set D ([locate by a head
+> vote is a go](2026-09-27-locate-by-head-vote-go.md)); `locate` now defaults
+> to the shortlist ([the shortlist `locate`, spec 22's
+> acceptance](2026-09-28-locate-shortlist-acceptance-partial.md)).
 
 ## Question
 

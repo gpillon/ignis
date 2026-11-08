@@ -6,6 +6,7 @@
 - Last verified: 2026-09-23
 - Scope: serving / `/v1/decide` `box` with `"method": "head"` and `point`,
   the anchored head set (ADR 0039); hq-e8-2b and BF16 KV, 1024 px and 4096 px
+- Topic: decide-pointing
 - Related: `docs/specs/decide/14-point-and-box-from-the-head-set.md` (#263),
   `docs/specs/decide/15-the-head-box-reads-inside-the-cell.md`,
   `2026-09-23-the-head-set-holds-through-decide.md` (the acceptance this explains),
@@ -13,6 +14,7 @@
   `tools/pointing-scenes/ensemble_score.py`,
   `.scratch/head-box-study/` (the sweeps, raw, on disk)
 - Superseded by: none
+- Summary: The head box lost 1024 px buttons (43% against the chain's 79%) because a button is 1.44 image cells tall; reading inside the cell, with a (0.05 + 4.5/n_distinct)-cell allowance, takes held-out box IoU >= 0.5 from 57.7% to 86.0%.
 
 ## Question
 

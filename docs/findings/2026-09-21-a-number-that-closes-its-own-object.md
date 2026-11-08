@@ -5,11 +5,13 @@
 - Observed: 2026-09-21
 - Last verified: 2026-09-21
 - Scope: server / `/v1/decide` constrained decode, engine / schedule stopping condition
+- Topic: decide-options
 - Related: [ADR 0034](../adr/0034-the-leaf-answers-without-generating.md),
   [the number prompt declares an alignment](2026-09-21-the-number-prompt-declares-an-alignment.md),
   [a scalar reads its legend](2026-09-21-scalar-readout-legend-width.md),
   [GitHub #255](https://github.com/gpillon/ignis/issues/255)
 - Superseded by: none
+- Summary: Permitting the closing brace from the second step lets a constrained decode end itself: with no `digits` from the caller it read six truths exactly, `2.5` and `-0.75` included, in 2-6 rounds instead of 6; `scalar` ships this way.
 
 ## Question
 

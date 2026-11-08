@@ -5,8 +5,10 @@
 - Observed: 2026-09-27
 - Last verified: 2026-09-27
 - Scope: `/v1/decide` `locate` (spec 18 phase B, GitHub #275) — the served head vote over a text state, on the served artifact, set F
+- Topic: decide-locate
 - Related: [GitHub #275](https://github.com/gpillon/ignis/issues/275); [spec 18](../specs/decide/18-locate-by-attention.md) (its acceptance 8, registered before set F existed); [ADR 0041](../adr/0041-the-readout-reads-a-text-span.md); [the go on set D](2026-09-27-locate-by-head-vote-go.md); [how the vote was found](2026-09-27-a-head-vote-finds-the-line.md); [`tools/locate-sets/served.py`](../../tools/locate-sets/served.py)
 - Superseded by: none
+- Summary: Served through `/v1/decide` on fresh set F, the head vote reads 146 of 156 present questions within 4,554 keys (the labelled `choice` 143), passing spec 18's acceptance 8, and refuses longer targets before any prefill.
 
 ## Question
 

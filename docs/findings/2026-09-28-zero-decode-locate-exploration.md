@@ -5,8 +5,10 @@
 - Observed: 2026-09-28
 - Last verified: 2026-09-28
 - Scope: `/v1/decide` `locate` over long text states with no token generated — other readings of the same attention rows, other heads, other read positions, the labelled `choice` over a folded or shortened text, text rewrites; real logs (cluster set R, public+cluster set R2) at 4K-200K tokens and the short sets A-D; **exploratory** (R2 was already read by spec 21, and several choices below were made looking at it)
+- Topic: decide-locate
 - Related: [locating a line in real logs](2026-09-28-locating-a-line-in-real-logs.md) (the failure this starts from: the served vote 34.5% on R2); [the literature](2026-09-28-zero-decode-locate-literature.md) (the candidate list this tests); [the instance is read while copying](2026-09-27-the-instance-is-read-while-copying.md); [locate at length](2026-09-27-locate-at-length.md) (the end-marking heads); tools `tools/locate-sets/zd_*.py`, `folded_locate.py --route choice`
 - Superseded by: none
+- Summary: At length an asked line is marked at its end: 32 end heads read 72-74% of real logs in one pass (the served vote 34.5-56%), and a labelled `choice` over their first 16 lines reads 93-98% with no token written.
 
 ## Question
 

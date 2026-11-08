@@ -5,8 +5,10 @@
 - Observed: 2026-09-27
 - Last verified: 2026-09-27
 - Scope: `/v1/decide` / attention readout over a text state — spec 19 track L, spec 18's rule 2 on set D
+- Topic: decide-locate
 - Related: [GitHub #276](https://github.com/gpillon/ignis/issues/276), [#275](https://github.com/gpillon/ignis/issues/275) (spec 18 phase B); [spec 19](../specs/decide/19-a-span-read-from-attention.md) § Phase 3, track L; [spec 18](../specs/decide/18-locate-by-attention.md); [phase 0: a vote of heads finds the line](2026-09-27-a-head-vote-finds-the-line.md); [spec 18's no-go](2026-09-26-locate-attention-no-go.md)
 - Superseded by: none
+- Summary: The registered 32-head vote read set D's comparable questions 146/155 (94.2%) against the labelled `choice`'s 142 (91.6%), so spec 18's rule 2 said go; `LOCATE_MAX_KEYS` is 4,554, and absent questions separate at AUC 0.73.
 
 ## Question
 

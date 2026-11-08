@@ -5,6 +5,7 @@
 - Observed: 2026-09-21
 - Last verified: 2026-09-21
 - Scope: serving / decision readout primitives, one-pass pointing (spec 11 C5), the two-pass box, `/v1/decide` `point` and `box`
+- Topic: decide-pointing
 - Related: [`2026-09-21-what-the-literature-says-about-pointing.md`](2026-09-21-what-the-literature-says-about-pointing.md)
   (the shallow first pass this deepens; four corrections to it are listed below),
   [spec 11](../specs/decide/11-point-in-one-pass.md),
@@ -14,6 +15,7 @@
   [`2026-09-21-a-declared-grid-is-read-to-one-part-in-ten.md`](2026-09-21-a-declared-grid-is-read-to-one-part-in-ten.md),
   [`2026-09-19-constrained-digit-readout-points.md`](2026-09-19-constrained-digit-readout-points.md)
 - Superseded by: none
+- Summary: In dense Qwen-VL models the localizing text-to-image attention peaks at 0.5-0.9 of depth, so six of this hybrid's 16 attention layers sit there (no hybrid measured); the chain's 22 misses are wrong-element errors, not what zoom fixes.
 
 ## Question
 

@@ -5,8 +5,10 @@
 - Observed: 2026-09-28
 - Last verified: 2026-09-28
 - Scope: `/v1/decide` `locate` with no token generated over logs to ~1M tokens (compressed, then attention heads and a labelled `choice` at each level) and prose to 1M tokens (heads in windows, a labelled `choice` over their shortlist, several pointers); a `kind` switch (`log` / `prose` / `auto`); exploratory on R, R2, RX, P, then **confirmatory** on fresh sets R4 and P2 ([spec 23](../specs/decide/23-zero-decode-locate-confirmatory.md))
+- Topic: decide-locate
 - Related: [zero-decode locate on real logs](2026-09-28-zero-decode-locate-exploration.md) (round 1: end heads, shortlist + choice); [locating a line in real logs](2026-09-28-locating-a-line-in-real-logs.md) (the fold); tools `zd_logpipe.py`, `zd_windows.py`, `zd_prose.py`, `zd_hop.py`, `prosehay.py`, `zd_rx.py`, `zd_rxq.py`, `z23_r4.py`, `z23_judge.py`
 - Superseded by: none
+- Summary: Folding a log, with end heads keeping 5 templates and 16 rows and a `choice` deciding, finds the line 21/23 on a fresh 100K-1M cluster capture (median 2.6 s); in prose the `choice` picks a gold sentence 91.7% to 200K, 7/12 at 1M.
 
 ## Question
 

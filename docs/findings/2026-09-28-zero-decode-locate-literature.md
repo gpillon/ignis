@@ -5,8 +5,10 @@
 - Observed: 2026-09-28
 - Last verified: 2026-09-28
 - Scope: `/v1/decide` `locate` over long text states (real logs, 16K-200K tokens), read in one prefill with no token generated: attention-based retrieval and re-ranking, KV-selection scores, separators and landmarks, readouts and query placement, probes and labelled one-pass routes; log parsing and log QA for the method paper
+- Topic: decide-locate
 - Related: [Locating a line in real logs](2026-09-28-locating-a-line-in-real-logs.md) (the failure this pass reads against); [The instance is read while copying](2026-09-27-the-instance-is-read-while-copying.md); [Locate at length](2026-09-27-locate-at-length.md); [A span from attention: the literature](2026-09-27-span-from-attention-literature.md) (the previous pass: its verified numbers are reused here, marked *(verified 09-27)*); [spec 21](../specs/decide/21-locate-in-real-logs.md)
 - Superseded by: none
+- Summary: Zero-decode relevance readings that work at length pool more than the last position and return a region, never one instance among near-duplicates; sources separate instances only by shortening, question-aware rendering or copying.
 
 ## Question
 

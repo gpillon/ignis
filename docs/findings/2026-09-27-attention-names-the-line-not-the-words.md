@@ -5,8 +5,10 @@
 - Observed: 2026-09-27
 - Last verified: 2026-09-27
 - Scope: `/v1/decide` / attention readout over a text state — spec 19 phases 1 and 2 (spans, profiles, the full row), development sets E1+E2
+- Topic: decide-locate
 - Related: [GitHub #276](https://github.com/gpillon/ignis/issues/276); [spec 19](../specs/decide/19-a-span-read-from-attention.md); [phase 0: a vote of heads finds the line](2026-09-27-a-head-vote-finds-the-line.md); [the literature pass](2026-09-27-span-from-attention-literature.md); [`attention_span_locate_gpu.rs`](../../crates/server/tests/attention_span_locate_gpu.rs), [`tools/locate-sets/`](../../tools/locate-sets/README.md) (`spans.py`, `generation.py`, `spanscore.py`)
 - Superseded by: none
+- Summary: One prefill's attention at the copy scaffold names the segment holding an answer on 89.9% of span questions but the answer's own key on only 56.3% (generation 85.2%, span F1 22 against 74), so spec 19's span tracks stopped.
 
 ## Question
 

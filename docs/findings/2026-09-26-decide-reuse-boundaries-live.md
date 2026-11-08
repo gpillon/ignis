@@ -5,8 +5,10 @@
 - Observed: 2026-09-26
 - Last verified: 2026-09-26
 - Scope: serving / `/v1/decide` parts-state reuse, fan-out, retained slots
+- Topic: decide-options
 - Related: GitHub #270, spec `docs/specs/decide/16-reuse-boundaries.md` (acceptance 7), ADR 0029 (amendment 2026-09-26), `docs/findings/2026-09-26-prefix-reuse-prior-art-for-decisions.md`
 - Superseded by: none
+- Summary: With #270's boundaries a parts `state` is reused like a JSON one: a repeated ~2.7K-token head drops from ~500 to under 100 ms, a 4-question image fan-out ~10x (1,958 to ~205 ms); spec 16's E <= 2 x D misses by ~50 ms.
 
 ## Question
 

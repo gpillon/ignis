@@ -5,8 +5,10 @@
 - Observed: 2026-09-22
 - Last verified: 2026-09-23
 - Scope: model / how the served 27B's attention reads image tokens at the `point` scaffold; `/v1/decide` pointing
+- Topic: decide-pointing
 - Related: https://github.com/gpillon/ignis/issues/263, [spec 13](../specs/decide/13-point-by-attention-head.md) (GitHub #260), [ADR 0038](../adr/0038-the-seam-carries-one-attention-head.md), [How the head map is read](2026-09-22-how-the-head-map-is-read.md), [An anchored head set points and boxes](2026-09-23-an-anchored-head-set-points-and-boxes.md), [spec 14](../specs/decide/14-point-and-box-from-the-head-set.md)
 - Superseded by: none
+- Summary: Heads that find an object weight its boundary 3-4x its interior and each reads a fixed part, so L39.h10's corner is the object's; the peak follows content, not token order, and the question binds to the asked object from GQA layer 31.
 
 ## Question
 
