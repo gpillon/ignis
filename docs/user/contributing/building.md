@@ -119,15 +119,12 @@ On a card below compute capability 12.0 the server picks what the card runs:
   trellis artifact (`--model-id qwen3.8-27b-16g`).
 
 On every card the 27B's 48 linear-attention (GDN) layers prefill on ignis's
-own kernels, in the tensor-core forms a GeForce card runs at full rate. They
-were written for the RTX 30 and RTX 40 cards; a Blackwell card runs them too,
-since on the RTX 5090 they took the 27B's GDN prefill 2.4 to 2.6 times faster
-than the vendored kernels, with its KLD against BF16 unchanged within the
-measurement's noise
-([the finding](../../findings/2026-11-08-blackwell-gdn-prefill-on-ignis-kernels.md)).
+own kernels, in the tensor-core forms a GeForce card runs at full rate
+([Context and speculation](../configuration/context-and-speculation.md)).
 That route has no option; the load logs which one runs
 (`ignis.runtime.prefill_routes`), and the measurement switch that compares
-the two is a contributor's ([Testing](testing.md#measurement-switches)).
+it with the vendored kernels is a contributor's
+([Testing](testing.md#measurement-switches)).
 
 ## 2. The Rust workspace
 

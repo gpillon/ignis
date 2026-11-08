@@ -5,7 +5,7 @@
 - Observed: 2026-11-08
 - Last verified: 2026-11-08
 - Scope: kernel / the 27B's GDN prefill route per GPU generation (`ignis::gdn_prefill::runs_by_default`, `IGNIS_GDN_PREFILL`); tests / the entailment regression set's tiers, the multimodal speculative near-tie, the shared vision workspace's recorded tokens, the VRAM plan's pin; speed / cold prefill and TTFT of the 27B on the RTX 5090
-- Related: [spec #531](https://github.com/gpillon/ignis/issues/531), [GitHub #536](https://github.com/gpillon/ignis/issues/536), [GitHub #535](https://github.com/gpillon/ignis/issues/535), [GitHub #534](https://github.com/gpillon/ignis/issues/534), [GitHub #514](https://github.com/gpillon/ignis/issues/514), [ADR 0080](../adr/0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md), [ADR 0016](../adr/0016-step-abi-extensible-options.md), [ADR 0003](../adr/0003-parity-gate-99pct.md)
+- Related: [spec #531](https://github.com/gpillon/ignis/issues/531), [GitHub #536](https://github.com/gpillon/ignis/issues/536), [GitHub #535](https://github.com/gpillon/ignis/issues/535), [GitHub #534](https://github.com/gpillon/ignis/issues/534), [GitHub #514](https://github.com/gpillon/ignis/issues/514), [ADR 0080](../adr/0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md), [ADR 0016](../adr/0016-step-abi-extensible-options.md), [ADR 0007](../adr/0007-performance-gate-not-parity.md)
 - Superseded by: none
 
 ## Question
@@ -78,8 +78,8 @@ checkout's untracked `.scratch/`.
   step between O1 and O2, the same for both routes (vendored +31 and +172 ms,
   ours +41 and +189 ms at 8K and 64K), flat inside each half. The two pairs
   that each sit inside one half, V1-O1 and O2-V2, agree within 10 ms (8K 43.7
-  and 33.9, 64K 311.2 and 294.3) and match the leaf bench's saving (39 ms
-  and 312 ms). The second part counted a shift both routes shared as noise;
+  and 33.9, 5.7% and 4.3% of their vendored leg; 64K 311.2 and 294.3, 4.6%
+  and 4.2%) and match the leaf bench's saving (39 ms and 312 ms). The second part counted a shift both routes shared as noise;
   it should have been written on the pairs (`.scratch/gdn-blackwell/results.md`,
   `speed/`).
 - **This change's legs** (2026-11-08, the spec's integration branch at
@@ -242,10 +242,11 @@ and their analyses).
 Observed:
 
 - On the RTX 5090 ours is faster than the vendored kernels: the GDN prefill
-  kernels 2.4-2.6x, the time to first token 3-4% shorter at 8K and 64K on the
-  16 GB trellis entry and, within each regime of the alternated legs, on the
-  NVFP4 entry; the cold prefill of the README's cells 5.4%, 4.8% and 3.9%
-  faster at 14K, 46K and 105K on the NVFP4 default.
+  kernels 2.4-2.6x; the time to first token at 8K and 64K 3-4% shorter on the
+  16 GB trellis entry, and 4.2-5.7% on the NVFP4 entry within each regime of
+  the alternated legs (pooled over the four legs, 4.5% at 8K and 3.9% at 64K);
+  the cold prefill of the README's cells 5.4%, 4.8% and 3.9% faster at 14K,
+  46K and 105K on the NVFP4 default.
 - The full-vocabulary KLD against BF16 does not move outside its interval on
   either 27B body, and ours is closer to an fp64 recurrence.
 - The entailment regression set moves under any change of the numerics that
@@ -286,7 +287,8 @@ Inferred:
 - A split between a decode round's pick and a verify round's is judged by the
   two round shapes (#534, `GLOSSARY.md`: Near-tie, Round shape).
 - On Blackwell a greedy answer can differ from an earlier release's at a
-  near-tie (ADR 0003); the full GPU profile is what shows nothing else moved.
+  near-tie, since correctness is self-checked, not byte-matched (ADR 0007);
+  the full GPU profile is what shows nothing else moved.
 - The README's cold prefill reads 11,344 tok/s at 46K and 9,008 at 105K; this
   change adds 4.8% and 3.9% of it, and the rest of the move from 9,717 and
   7,865 came from earlier changes on `main`, not measured apart.

@@ -49,7 +49,8 @@ inline constexpr std::int32_t kMinTokens = 64;
 // The route per GPU generation, the one switch: our kernels on the two generations the build's
 // cubins load on, Ampere and Ada (compute capability 8.x), which they were written for, and
 // Blackwell (12.x), where the RTX 5090 measured them 2.4-2.6x faster than the vendored kernels on
-// the 27B's prefill, its time to first token 3-4% shorter at 8K and 64K, and its KLD against BF16
+// the 27B's prefill, its time to first token at 8K and 64K 3-4% shorter on the 16 GB trellis entry
+// and 4.2-5.7% on the NVFP4 one, within each regime of alternated legs, and its KLD against BF16
 // unmoved within the noise on both 27B bodies (GitHub #514's rule; Blackwell's default since
 // GitHub #536, spec #531; ADR 0080).
 constexpr bool runs_by_default(int compute_capability_major) {

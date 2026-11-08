@@ -127,7 +127,7 @@ beyond the best match above it (for KV-disk, 8,192 on Flash-Next and
 
 - **Time to first token.** A request that resumes skips prefilling the part it
   matched. At the 27B's cold rate of about 11,300 tokens per second on a 46K
-  prompt, reading such a prompt cold takes roughly 4.0 seconds (arithmetic from
+  prompt, reading such a prompt cold takes roughly 4.1 seconds (arithmetic from
   the README's figure); the resumed part costs a copy instead. A
   device-to-device clone of 148 MiB of state measured 0.25 ms, and a full-context
   snapshot and restore round trip through host RAM about 90 ms, both far below
