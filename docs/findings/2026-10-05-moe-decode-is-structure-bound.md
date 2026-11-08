@@ -5,10 +5,12 @@
 - Observed: 2026-10-05
 - Last verified: 2026-10-06
 - Scope: kernel / Flash-Next routed-expert decode (`kernel/src/moe_decode.cu`)
+- Topic: flash-next
 - Related: [GitHub #300](https://github.com/gpillon/ignis/issues/300),
   [spec flash-next/02](../specs/flash-next/02-the-moe-kernels.md) (Acceptance 6),
   [ADR 0044](../adr/0044-experts-in-trellis-with-a-k-per-expert.md)
 - Superseded by: none
+- Summary: Flash-Next's one-launch decode of ten trellis experts reads 15.4 MB at 33.5% of the DRAM roofline (25.6 us) and still takes ~21 us L2-resident; doubling the bytes costs 1.26x, so the launch is bound by its two-stage structure, not DRAM.
 
 ## Question
 

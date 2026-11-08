@@ -6,6 +6,7 @@
 - Last verified: 2026-09-21
 - Scope: serving / vision encode (`kernel/src/vision_encode.cu`,
   `crates/core/src/vision.rs`, `crates/server/src/media.rs`)
+- Topic: vision
 - Related: [GitHub #244](https://github.com/gpillon/ignis/issues/244),
   `docs/specs/vision-fanout/02-the-towers-cost-at-width.md`,
   [`2026-09-20-number-width-and-decide-e2e.md`](2026-09-20-number-width-and-decide-e2e.md),
@@ -15,6 +16,7 @@
   [GitHub #249](https://github.com/gpillon/ignis/issues/249),
   [ADR 0010](../adr/0010-vendored-reference-kernels.md)
 - Superseded by: none
+- Summary: The vision tower is quadratic because the checkpoint attends over every patch: attention is 88.2% of a 16,384-column encode, already at the card's rate, so 3.67 s is the worst case per image and a smaller image the only lever.
 
 ## Question
 

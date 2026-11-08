@@ -5,8 +5,10 @@
 - Observed: 2026-10-13
 - Last verified: 2026-10-13
 - Scope: kernel / the image model's GEMM, attention, convolution and fused DiT ops on sm_120; licences of the candidate sources
+- Topic: image
 - Related: [ADR 0050](../adr/0050-ignis-serves-an-image-model.md), [ADR 0051](../adr/0051-kernel-code-is-ours-adapted-or-vendored.md), spec [image-model/02](../specs/image-model/02-the-image-kernels.md)
 - Superseded by: none
+- Summary: Published kernels reach ~100% of nominal on the 5090 for bf16 attention and GEMM, FP8 GEMM 693-738 TFLOPS and 8-bit attention 618-643 TOPS (3x bf16); at ~2K the attention decides an image's time (~5.5 s bf16, ~1.8 s 8-bit).
 
 ## Question
 

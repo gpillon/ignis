@@ -1,12 +1,17 @@
 # A one-lane Flash-Next decode round is launch-bound, not bandwidth-bound: single-CTA kernels and host time between rounds own the gap to the simulation
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-06
 - Last verified: 2026-10-07
 - Scope: kernel / Flash-Next decode round, CUDA graph replay, expert residency on the critical path, host time between rounds
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/306, [Flash-Next on the 5090](2026-10-06-flash-next-on-the-5090.md), [27B decode round host idle](2026-09-18-decode-round-host-idle.md), [MoE decode is structure-bound](2026-10-05-moe-decode-is-structure-bound.md), [expert miss path](2026-10-05-expert-miss-path-sm-copy-matches-the-copy-engine.md)
 - Superseded by: none
+- Corrected by: [Flash-Next decode headroom](2026-10-08-flash-next-decode-headroom.md)
+- Summary: A one-lane Flash-Next decode round was latency-bound (single-CTA kernels, residency on the critical path, a serialized n-gram gather); fixing those took one lane from 64 to ~98 tok/s, and main measured 101.5 tok/s on 2026-10-08.
+
+> **Corrected 2026-10-08.** At `main` one lane decodes at 101.5 tok/s with a 1.84 ms demand-copy stall a token ([Flash-Next decode headroom](2026-10-08-flash-next-decode-headroom.md)).
 
 ## Question
 

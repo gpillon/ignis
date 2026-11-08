@@ -5,8 +5,10 @@
 - Observed: 2026-10-07
 - Last verified: 2026-10-07
 - Scope: serving / Flash-Next prompt reuse, the reused tail's traversals, where the opener's page is published (ADR 0029)
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/306 (item 5), [ADR 0029](../adr/0029-cross-request-state-reuse.md) (amendment 2026-10-07), spec [flash-next/05](../specs/flash-next/05-prompt-reuse.md) acceptance 3 and 6, [the agent turn tail](2026-10-07-flash-next-agent-turn-tail.md)
 - Superseded by: none
+- Summary: Handing the pages below the opener over with the checkpoint drops a reused turn's middle traversal: 1.80 to 1.46 s at a ~9K history, 1.94 to 1.58 s at 30K, putting spec 05 AC6 (1.6 s) on its threshold, reuse still bit-exact.
 
 ## Question
 

@@ -5,8 +5,10 @@
 - Observed: 2026-10-21
 - Last verified: 2026-10-21
 - Scope: kernel / ignis's hq-e8-2b prompt attention (`kernel/src/hq_prompt_attention.cu`, ADR 0061) against the vendored A1 prompt route; serving / the 27B's VRAM plan, KLD, decode and cold prefill on the RTX 5090 (PCIe Gen 3 host)
+- Topic: prefill
 - Related: [ADR 0061](../adr/0061-prefill-attention-reads-the-hq-codec.md), [spec 27b-16gb/03](../specs/27b-16gb/03-vram-recovered-on-every-card.md) (ACs 1-5), GitHub #335, [the token embedding in host memory](2026-10-21-token-embedding-in-host-memory.md) (the same A/B, ACs 6-7), [KLD against BF16](2026-09-24-kld-against-bf16.md) (the suite and the 0.0513), [cold prefill 27B vs Flash-Next](2026-10-13-cold-prefill-27b-vs-flash-next.md) (the prefill driver and prompts), [hq attention route agreement](2026-09-12-hq-attention-route-agreement.md)
 - Superseded by: none
+- Summary: The 27B's 8-bit-band prefill attention (INT8 Q·Kᵀ, E4M3 P·V) frees 1.02 GB at 524K and speeds cold prefill +30% at 46K and +53% at 105K, KLD within noise (0.0522 vs 0.0513); with the host embedding the 5090 fits 917,504 tokens.
 
 ## Question
 

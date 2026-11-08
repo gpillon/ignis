@@ -5,8 +5,10 @@
 - Observed: 2026-10-18
 - Last verified: 2026-10-18
 - Scope: kernel / the Flash-Next verify round's row budget (`verify::kMaxRows`, `--spec-draft-rows`), MTP speculation's losslessness seam (`crates/core/tests/flash_next_speculative_gpu.rs`, `crates/core/tests/support/logit_drift.rs`)
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/329 (item 5), [ADR 0056](../adr/0056-speculation-past-eight-verify-rows-is-numerically-equivalent.md), [spec flash-next/07](../specs/flash-next/07-mtp-speculation.md), [the rtxpro6000 profile measured](2026-10-18-rtxpro6000-profile-measured.md), [verify rows on the RTX PRO 6000](2026-10-18-verify-rows-on-the-rtx-pro-6000.md), [batched decode width drift](2026-09-14-batched-decode-width-drift.md), `.scratch/verify-rows/` (branch `verify-rows`)
 - Superseded by: none
+- Summary: A Flash-Next verify round past 8 rows agrees with itself bit for bit but drifts from speculation off past the near-tie rule (up to 58 BF16 ulps, against 40 at 8), so ADR 0056 holds it numerically equivalent; on the 5090 it is 0.74-0.80x.
 
 ## Question
 

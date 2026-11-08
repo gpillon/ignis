@@ -5,11 +5,13 @@
 - Observed: 2026-10-05
 - Last verified: 2026-10-05
 - Scope: kernel / Flash-Next expert residency, the miss path from the pinned host expert pool to the VRAM expert cache
+- Topic: flash-next
 - Related: [GitHub #301](https://github.com/gpillon/ignis/issues/301),
   [spec flash-next/03](../specs/flash-next/03-expert-residency.md),
   [ADR 0044](../adr/0044-experts-in-trellis-with-a-k-per-expert.md),
   [Sequence snapshot transfer cost](2026-09-12-sequence-snapshot-transfer-cost.md)
 - Superseded by: none
+- Summary: On this PCIe Gen 3 x16 host a kernel copying 0.5-3 MiB expert projections out of mapped pinned memory reaches 88-112% of the copy engine (~12-13 GB/s) with 8-16 blocks, so Flash-Next's miss path is device-resident and graph-capturable.
 
 ## Question
 

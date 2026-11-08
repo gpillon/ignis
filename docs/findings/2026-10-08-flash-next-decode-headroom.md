@@ -5,8 +5,10 @@
 - Observed: 2026-10-08
 - Last verified: 2026-10-08
 - Scope: serving / Flash-Next decode round at the 262K x 3-lane default, the PCIe link's timeline in decode and prefill; core / expert residency prediction (the router lookahead, the prefetch budget); a CPU path for routed experts
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/306, [Flash-Next decode round](2026-10-06-flash-next-decode-round.md), [KV pool follows residency](2026-10-08-flash-next-kv-pool-follows-residency.md), [Expert residency replayed on the study's routing](2026-10-05-expert-residency-replayed-on-the-study-s-routing.md), [An SM-driven copy matches the copy engine](2026-10-05-expert-miss-path-sm-copy-matches-the-copy-engine.md), [MoE decode is structure-bound](2026-10-05-moe-decode-is-structure-bound.md), [spec flash-next/03](../specs/flash-next/03-expert-residency.md)
 - Superseded by: none
+- Summary: At main a one-lane Flash-Next token is 9.85 ms (101.5 tok/s), kernel-bound with the link 44% busy, while three lanes and prefill are link-bound; a perfect predictor at today's budget is worth +5%/+17.5%, CPU experts ~0% at one lane.
 
 ## Question
 

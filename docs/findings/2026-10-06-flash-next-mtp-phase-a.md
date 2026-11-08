@@ -1,12 +1,17 @@
 # Flash-Next's MTP head accepts 0.83 of first drafts on the engine's own states, and one lane's verify column costs ~2 ms: phase A is a GO
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-06
 - Last verified: 2026-10-06
 - Scope: Flash-Next MTP speculation (spec flash-next/07 phase A): the draft head's input convention and acceptance, the decode round's cost per extra row at 1-3 lanes
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/306, [spec 07](../specs/flash-next/07-mtp-speculation.md), [Flash-Next decode round](2026-10-06-flash-next-decode-round.md), [Flash-Next on the 5090](2026-10-06-flash-next-on-the-5090.md)
 - Superseded by: none
+- Corrected by: [Flash-Next's MTP speculation is PCIe-bound](2026-10-07-flash-next-mtp-speculation-is-pcie-bound.md)
+- Summary: Flash-Next's BF16 MTP head accepts 0.83/0.80/0.81/0.82 of drafts on the engine's own states (phase A GO), but its ~2 ms verify column was a warm-cache number: ~5 ms with fresh tokens, and MTP gains 1.02-1.30x at one lane on the 5090.
+
+> **Corrected 2026-10-07.** The ~2 ms verify column was a warm-cache number: with fresh tokens a column costs ~5 ms and MTP gains 1.02-1.30x at one lane on the 5090 ([MTP speculation is PCIe-bound](2026-10-07-flash-next-mtp-speculation-is-pcie-bound.md)). The head's input convention and acceptance stand.
 
 ## Question
 

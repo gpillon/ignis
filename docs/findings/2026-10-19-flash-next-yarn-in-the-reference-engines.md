@@ -5,8 +5,10 @@
 - Observed: 2026-10-19
 - Last verified: 2026-10-19
 - Scope: kernel / Flash-Next rope sites (`kernel/src/flash_next/qsa.cu`, `indexer.cu`, `rope.cuh`), the shared YaRN table builder (`kernel/src/rope_scaling.h`, `crates/core/src/rope_scaling.rs`)
+- Topic: flash-next
 - Related: [ADR 0059](../adr/0059-flash-next-applies-yarn-on-q-and-k.md), [ADR 0057](../adr/0057-rope-scaling-is-auto-by-default.md), [spec rope-scaling/02](../specs/rope-scaling/02-flash-next.md), `.scratch/orchestra-2026-10-18/fn-yarn/research.md` (the full read, with every line cited), `.scratch/fn-needle/RESULTS-5090.md` (the ~500K probe), `.scratch/cluster-072/REPORT.md` (the 1M probe)
 - Superseded by: none
+- Summary: HF, vLLM and SGLang run plain static YaRN on Flash-Next's 64-dim partial rotary, 0.1·ln f + 1 folded into cos/sin on q and k, one table for attention, indexer and MTP head; ignis's ~499K and 1M needle probes separate nothing.
 
 ## Question
 

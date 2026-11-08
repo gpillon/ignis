@@ -5,12 +5,14 @@
 - Observed: 2026-09-24
 - Last verified: 2026-09-25
 - Scope: kernel / hq-e8-2b verify-round attention (`gqa_attention_small_t_tc_partial_bf16_kernel` with `GqaTcKVHq`), the 8-lane group decode (`hq_codec.cuh`)
+- Topic: decode-27b
 - Related: GitHub #268, [spec runtime/09](../specs/runtime/09-hq-verify-decode-cost.md),
   [hq attention at long context](2026-09-24-hq-attention-at-long-context.md) (the baseline),
   [ADR 0031](../adr/0031-vendored-kernel-bottleneck-exemption.md),
   [hq-e8-2b KV capacity](2026-09-11-hq-e8-2b-kv-capacity.md),
   [Batched decode width drift](2026-09-14-batched-decode-width-drift.md)
 - Superseded by: none
+- Summary: The hq-e8-2b verify attention was latency-bound on registers, not on its Rice walk: cp.async staging and q in shared memory cut it 44-48% bit-exactly (+20.5% rounds/s at 8x33K), and it still runs ~3.9x its MMA floor.
 
 ## Question
 

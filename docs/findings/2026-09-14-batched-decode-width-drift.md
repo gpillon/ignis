@@ -5,8 +5,10 @@
 - Observed: 2026-09-14
 - Last verified: 2026-09-14
 - Scope: kernel / window-0 batched decode, batch invariance
+- Topic: decode-27b
 - Related: https://github.com/gpillon/ignis/issues/155, https://github.com/gpillon/ignis/issues/153, https://github.com/gpillon/ignis/issues/158
 - Superseded by: none
+- Summary: Greedy batched decode at M=4 picks tokens 0.75-0.875 logits behind where M=1/M=2 and every verify round agree, so spec-off is itself a drifting route at width > 2 and cannot serve as bit-exact ground truth.
 
 ## Question
 

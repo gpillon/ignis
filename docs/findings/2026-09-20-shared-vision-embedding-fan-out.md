@@ -5,9 +5,11 @@
 - Observed: 2026-09-20
 - Last verified: 2026-09-20
 - Scope: serving / multimodal fan-out, vision encode cost, device memory reservation
+- Topic: vision
 - Related: `2026-09-20-number-width-and-decide-e2e.md` (the baseline this
   measures against), ADR 0035, ADR 0030, GitHub #243, #240, #246
 - Superseded by: none
+- Summary: Keying the vision encoder's output by content digest and grid and keeping it past its request turns 1/2/4 questions over one 4096x4096 screenshot from 6.84/13.50/27.92 s into 6.27/8.46/13.24 s, the plan's 320 MiB line unmoved.
 
 ## Question
 

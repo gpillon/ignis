@@ -1,12 +1,17 @@
 # A Flash-Next prefill chunk hides its expert stream under compute; the host n-gram gather and one decode round per chunk own the rest
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-07
 - Last verified: 2026-10-07
 - Scope: serving / Flash-Next prefill chunk, link/compute overlap, the n-gram gather, prefill/decode interleaving (decode share)
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/306 (items 3, 4), [Flash-Next on the 5090](2026-10-06-flash-next-on-the-5090.md), [Flash-Next decode round](2026-10-06-flash-next-decode-round.md), [ADR 0018](../adr/0018-chunk-level-prefill-decode-interleaving.md), spec [flash-next/03](../specs/flash-next/03-expert-residency.md)
 - Superseded by: none
+- Corrected by: [Flash-Next prefill chunk decomposition](2026-10-07-flash-next-prefill-chunk-decomposition.md)
+- Summary: An 8192-token Flash-Next chunk was compute-bound (1.9 s, 89% of copies hidden) and 16 n-gram readers cut its TTFT 3.72 to 2.87 s; the decode share (default 25) sets the lanes' rate; at 262K x 3 lanes the link is exposed again.
+
+> **Corrected 2026-10-07.** At the later 262K x 3-lane default a chunk's expert stream is no longer hidden under compute ([the prefill chunk decomposition](2026-10-07-flash-next-prefill-chunk-decomposition.md)), and the decode share's default is 25, not 50.
 
 ## Question
 

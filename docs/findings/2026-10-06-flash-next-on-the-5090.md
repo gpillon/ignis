@@ -1,12 +1,17 @@
 # Flash-Next on the 5090: what the built engine serves
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-06
 - Last verified: 2026-10-06
 - Scope: serving / Flash-Next quality, decode and prefill speed, prompt reuse, VRAM and host memory, load time
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/304, https://github.com/gpillon/ignis/issues/302, https://github.com/gpillon/ignis/issues/303, https://github.com/gpillon/ignis/issues/300, [spec 04](../specs/flash-next/04-the-flash-next-forward-and-serving.md), [spec 05](../specs/flash-next/05-prompt-reuse.md), [spec 06](../specs/flash-next/06-measurements.md), [expert residency replay](2026-10-05-expert-residency-replayed-on-the-study-s-routing.md), [expert miss path](2026-10-05-expert-miss-path-sm-copy-matches-the-copy-engine.md), [MoE decode is structure-bound](2026-10-05-moe-decode-is-structure-bound.md)
 - Superseded by: none
+- Corrected by: [Flash-Next decode headroom](2026-10-08-flash-next-decode-headroom.md), [Flash-Next prefill chunk and the decode share](2026-10-07-flash-next-prefill-chunk-and-decode-share.md), [Flash-Next expert pool parallel read](2026-10-09-flash-next-expert-pool-parallel-read.md), [Flash-Next pages-only link](2026-10-07-flash-next-pages-only-link.md)
+- Summary: The built Flash-Next holds quality (G1 100%, every KLD under its limit, MMLU 70.1% as the artifact); its 65/130 tok/s decode, 112 s load and prefill inferences were since revised: 101.5 tok/s at one lane, a ~32 s load.
+
+> **Corrected 2026-10-07 to 2026-10-09.** One lane now decodes at 101.5 tok/s ([decode headroom](2026-10-08-flash-next-decode-headroom.md)), a load takes ~31.9 s ([parallel read](2026-10-09-flash-next-expert-pool-parallel-read.md)), and the prefill inferences below do not hold ([prefill chunk](2026-10-07-flash-next-prefill-chunk-and-decode-share.md)). The quality results stand.
 
 ## Question
 

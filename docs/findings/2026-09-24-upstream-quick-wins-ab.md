@@ -5,11 +5,13 @@
 - Observed: 2026-09-24
 - Last verified: 2026-09-24
 - Scope: kernel / vendored NVFP4 SwiGLU, W4A4 TMA GEMM, RMSNorm and hq-e8-2b prompt scratch; DFlash2 proposal head
+- Topic: decode-27b
 - Related: [ADR 0031](../adr/0031-vendored-kernel-bottleneck-exemption.md),
   [upstream perf survey](2026-09-18-ninfer-upstream-perf-survey.md),
   [Decode round anatomy](2026-09-18-decode-round-anatomy.md),
   [hq vs BF16 decode cost](2026-09-13-hq-vs-bf16-decode-cost.md)
 - Superseded by: none
+- Summary: Four bit-exact upstream kernel ports buy +8.0% decode at eight lanes, +1.4% at one and +10/+13/+16% cold prefill at 14K/46K/105K, greedy text unchanged; the Q4 shortlist draft head loses 7.4% of tokens a round and stays opt-in.
 
 ## Question
 

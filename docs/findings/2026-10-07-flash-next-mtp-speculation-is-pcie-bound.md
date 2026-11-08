@@ -5,8 +5,10 @@
 - Observed: 2026-10-06
 - Last verified: 2026-10-07
 - Scope: Flash-Next speculative decoding (spec flash-next/07 phases C-D): the verify round's and the MTP head's correctness on the card, tok/s at one to three lanes against spec-off, the expert traffic per round
+- Topic: flash-next
 - Related: https://github.com/gpillon/ignis/issues/307, [spec 07](../specs/flash-next/07-mtp-speculation.md), [MTP phase A](2026-10-06-flash-next-mtp-phase-a.md), [Flash-Next decode round](2026-10-06-flash-next-decode-round.md), [Flash-Next on the 5090](2026-10-06-flash-next-on-the-5090.md)
 - Superseded by: none
+- Summary: On the 5090's Gen 3 host Flash-Next's MTP keeps text and state bit for bit but gains only 1.02-1.30x at one lane and loses 7-15% at two and three: decode is bound by expert copies, which speculation barely reduces per token.
 
 ## Question
 

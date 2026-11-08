@@ -1,15 +1,20 @@
 # Expert residency replayed on the study's routing: one-LRU pools, a budgeted lookahead
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-05
 - Last verified: 2026-10-06 (on the converter's traces)
 - Scope: core / Flash-Next expert residency, the CPU policy model and its pool split, prefetch and prefill admission
+- Topic: flash-next
 - Related: [GitHub #301](https://github.com/gpillon/ignis/issues/301),
   [spec flash-next/03](../specs/flash-next/03-expert-residency.md) (its
   "Departures" section),
   [An SM-driven copy matches the copy engine](2026-10-05-expert-miss-path-sm-copy-matches-the-copy-engine.md)
 - Superseded by: none
+- Corrected by: [Flash-Next decode round](2026-10-06-flash-next-decode-round.md)
+- Summary: Expert pools sized as one LRU of the cache match the study's simulation (3.77 against 3.8 ms of one-lane stall, 1.11x at three on the converter's traces); under the rows-scaled budget the replay gives 95.9% hits and 2.90 ms at one lane.
+
+> **Corrected 2026-10-07.** Under the rows-scaled prefetch budget the replay gives 95.9% hits and a 2.90 ms demand cost at one lane, and its bounds moved: see "The budget follows the rows" in [the Flash-Next decode round](2026-10-06-flash-next-decode-round.md).
 
 ## Question
 

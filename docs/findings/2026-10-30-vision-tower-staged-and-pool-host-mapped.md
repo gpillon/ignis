@@ -1,12 +1,16 @@
 # The 27B's vision tower staged per encode and its embedding pool host-mapped: a text-only load's KV, bit-identical embeddings, +3 to +8 ms a 1,024-token encode under WDDM
 
 - Kind: experiment
-- Status: current
+- Status: superseded
 - Observed: 2026-10-30
 - Last verified: 2026-10-30
 - Scope: kernel / the vision encode (`kernel/src/vision_encode.cu`) staging the tower's weights into the prefill scratch, and the embedding pool in mapped pinned host memory; serving / the 27B's VRAM plan under `rtx50-16gb` and `rtx5090` on the RTX 5090 (PCIe Gen 3 x16 host, Windows/WDDM)
+- Topic: vision
 - Related: [ADR 0075](../adr/0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md), [ADR 0062](../adr/0062-the-token-embedding-lives-in-host-memory.md), [ADR 0035](../adr/0035-the-vision-embedding-outlives-its-encode.md), [token embedding in host memory](2026-10-21-token-embedding-in-host-memory.md), https://github.com/gpillon/ignis/issues/409, branch `prototype/409-vision-host` (abfafa36)
-- Superseded by: none
+- Superseded by: [The vision residency's acceptance](2026-10-30-vision-residency-acceptance.md)
+- Summary: The prototype that staged the 27B's vision tower per encode and host-mapped its pool kept a 16 GB load's text-only KV pool, bit-identical, at +3 to +8 ms a 1,024-token encode; the built residency's acceptance replaces it.
+
+> **Superseded 2026-10-30.** The built residency (ADR 0075) is measured in [the vision residency's acceptance](2026-10-30-vision-residency-acceptance.md): the text-only KV pool kept, +7.1 ms a 1,024-token encode under `host`.
 
 ## Question
 

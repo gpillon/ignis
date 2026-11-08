@@ -1,16 +1,21 @@
 # A partially exclusive expert pool on the 5090: pinning the calibration-hottest 1-2 GB of experts gives that much host RAM back for under 1% of decode; past 4 GB the cost climbs steeply
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-18
 - Last verified: 2026-10-18
 - Scope: core / Flash-Next expert residency, the CPU policy model with experts pinned in VRAM outside the LRU; the host plan's pinned expert pool on the rtx5090 profile
+- Topic: flash-next
 - Related: [GitHub #329](https://github.com/gpillon/ignis/issues/329) (item 12),
   [spec flash-next/03](../specs/flash-next/03-expert-residency.md),
   [Expert residency replayed on the study's routing](2026-10-05-expert-residency-replayed-on-the-study-s-routing.md),
   [Flash-Next decode headroom](2026-10-08-flash-next-decode-headroom.md),
   [ADR 0030](../adr/0030-device-memory-reserved-at-load.md)
 - Superseded by: none
+- Corrected by: [A pinned hot set measured on the 5090](2026-10-18-pinned-hot-set-measured-on-the-5090.md)
+- Summary: Replayed, pinning the calibration-hottest 1-2 GB of Flash-Next experts outside the LRU frees that host RAM for under 1% of decode; measured on the 5090, 4 GiB costs 4.3%/5.9% at one/three lanes, above the replay's bracket.
+
+> **Corrected 2026-10-18.** Measured on the 5090, 2 GiB costs 0.2-1.1% of three-lane decode and 4 GiB 4.3% of one-lane and 5.9% of three-lane decode, above this replay's bracket ([the pinned hot set measured](2026-10-18-pinned-hot-set-measured-on-the-5090.md)).
 
 ## Question
 

@@ -5,8 +5,10 @@
 - Observed: 2026-10-21
 - Last verified: 2026-10-21
 - Scope: serving / the 27B's prefill chunk width on the RTX 5090 (PCIe Gen 3): VRAM plan, cold prefill, decode, a decoding lane's pauses under interleaving (ADR 0018), 4K KLD; kernel / ignis's prompt attention (ADR 0061) at W = 2,048 / 4,096
+- Topic: prefill
 - Related: GitHub #341 (spec [prefill-5090/01](../specs/prefill-5090/01-the-prefill-fixed-part.md), lever 2), [A wider prefill chunk buys the 27B at most 4%](2026-10-07-27b-prefill-chunk-width.md) (the same sweep before #335), [The prefill attention without prompt planes](2026-10-21-prefill-attention-without-prompt-planes.md) (the A/B driver, the 917,504 probe, the KLD baseline), [KLD against BF16](2026-09-24-kld-against-bf16.md) (the suite), `.scratch/341/`
 - Superseded by: none
+- Summary: With vision on, the 27B's 2,048-token prefill chunk costs no VRAM, prefills +1.9%/+2.2% at 46K/105K, lowers 4K KLD (0.0492 vs 0.0522) and lengthens a decoding lane's longest pause 184 to 307 ms; the rtx5090 profile adopts it.
 
 ## Question
 

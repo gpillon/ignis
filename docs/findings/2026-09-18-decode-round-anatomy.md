@@ -5,12 +5,14 @@
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
 - Scope: kernel / decode round, CUDA graph submission cost, roofline accounting
+- Topic: decode-27b
 - Related: [ADR 0019](../adr/0019-decode-cuda-graph-slot-indirection.md),
   [ADR 0020](../adr/0020-batch-wide-decode-round.md),
   [ADR 0021](../adr/0021-live-live-launch-pooling.md),
   [Decode round host idle](2026-09-18-decode-round-host-idle.md),
   [Drafter top-k](2026-09-18-dflash2-topk-one-warp-per-column.md)
 - Superseded by: none
+- Summary: A 27B decode round is 1,166 graph nodes and 15.81 ms of weight streaming at the card's bandwidth (backbone GEMM at 100% of roofline); graph submission is 2.2%, and the headroom left is the 4.8% idle from two host syncs a round.
 
 **Hardware:** RTX 5090, exclusive card (ADR 0006).
 **Engine:** production defaults, with the drafter top-k already replaced.

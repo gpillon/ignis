@@ -1,12 +1,17 @@
 # Early unmapping and a persistent n-gram cache shorten Flash-Next startup
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-07
 - Last verified: 2026-10-07
 - Scope: core / Flash-Next engine startup and n-gram hot-row loading on Windows
+- Topic: flash-next
 - Related: [previous startup measurement](2026-10-06-flash-next-on-the-5090.md), [mapped-file read slowdown](2026-10-06-flash-next-decode-round.md)
 - Superseded by: none
+- Corrected by: [Flash-Next expert pool parallel read](2026-10-09-flash-next-expert-pool-parallel-read.md)
+- Summary: Unmapping the artifact early cuts Flash-Next startup from 111-114 s to 64-72 s and a persistent n-gram hot-row cache to 41-44 s, smoke tokens identical; parallel pool reads later took a real server's load from 46.4 to ~31.9 s.
+
+> **Corrected 2026-10-09.** Parallel reads of the expert pool took a real server's load from this finding's 46.4 s to ~31.9 s ([parallel read](2026-10-09-flash-next-expert-pool-parallel-read.md)).
 
 ## Question
 

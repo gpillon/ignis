@@ -5,6 +5,7 @@
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
 - Scope: serving / prefill chunking, cross-request state reuse, the G2 TTFT cell
+- Topic: prefill
 - Related: [ADR 0018](../adr/0018-chunk-level-prefill-decode-interleaving.md),
   [ADR 0029](../adr/0029-cross-request-state-reuse.md),
   [ADR 0015](../adr/0015-g2-live-live-cold-prefix-gate.md),
@@ -14,6 +15,7 @@
   bears on),
   [Decode round anatomy](2026-09-18-decode-round-anatomy.md)
 - Superseded by: none
+- Summary: Cross-request reuse cuts a 27B prompt into three traversals of ~19 ms fixed each: +74.7 ms (37%) on a 1,024-token TTFT, but 6.8% of prefill on a recorded agent session, too little to pay for interior snapshots.
 
 **Hardware:** RTX 5090, exclusive card (ADR 0006).
 **Engine:** production defaults otherwise — `hq-e8-2b`, `--prefill-chunk 1024`,

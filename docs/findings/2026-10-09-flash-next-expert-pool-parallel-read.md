@@ -5,8 +5,10 @@
 - Observed: 2026-10-09
 - Last verified: 2026-10-09
 - Scope: core / Flash-Next host expert pool fill at load (`residency::load::fill_expert_pool`, spec flash-next/03 acceptance 1, GitHub #301); serving / Flash-Next load time
+- Topic: flash-next
 - Related: [early unmap and n-gram cache](2026-10-07-flash-next-startup-early-unmap.md)
 - Superseded by: none
+- Summary: Four reader workers fill the 35.2 GiB host expert pool at ~2.6-2.9 GiB/s against one handle's ~1.2-1.3 (8+ regresses), taking a real Flash-Next load from 46.4 to ~31.9 s; overlapping it with weight placement was slower (NO-GO).
 
 ## Question
 

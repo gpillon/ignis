@@ -1,12 +1,17 @@
 # Cold prefill on the same text: the 27B at 5.2-9.7K tok/s, Flash-Next at 3.1-3.4K, held by the experts it streams over PCIe Gen 3
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-13
 - Last verified: 2026-10-13
 - Scope: serving / cold prefill rate at the make defaults, the 27B and Flash-Next on the same prompts; Flash-Next's expert bytes per prompt
+- Topic: flash-next
 - Related: [upstream quick wins](2026-09-24-upstream-quick-wins-ab.md) (the README's 27B cells), [Flash-Next prefill chunk decomposition](2026-10-07-flash-next-prefill-chunk-decomposition.md), [Flash-Next on the 5090](2026-10-06-flash-next-on-the-5090.md)
 - Superseded by: none
+- Corrected by: [The 27B's prefill attention without prompt planes](2026-10-21-prefill-attention-without-prompt-planes.md), [The 27B's cold prefill at 396K tokens](2026-10-31-cold-prefill-at-396k-tokens.md)
+- Summary: On the same cold text Flash-Next prefills a flat 3.1-3.4K tok/s, held by 2.2-2.4 MB of experts per token over PCIe Gen 3; the 27B's 9.6K/7.6K/5.2K tok/s at 14K/46K/105K rose after #335 (7,853 at 105K on 2026-10-31).
+
+> **Corrected 2026-10-21.** The 27B's cold prefill rose after #335, +30% at 46K and +53% at 105K ([prefill attention without prompt planes](2026-10-21-prefill-attention-without-prompt-planes.md)), 7,853 tok/s at 105K on 2026-10-31 ([cold prefill at 396K](2026-10-31-cold-prefill-at-396k-tokens.md)). The Flash-Next side stands.
 
 ## Question
 

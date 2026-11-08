@@ -5,6 +5,7 @@
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
 - Scope: kernel / DFlash2 drafter, speculative decode round, vendored op replacement
+- Topic: decode-27b
 - Related: [ADR 0005](../adr/0005-performance-first-principle.md),
   [ADR 0010](../adr/0010-vendored-reference-kernels.md),
   [ADR 0031](../adr/0031-vendored-kernel-bottleneck-exemption.md) (the policy this
@@ -13,6 +14,7 @@
   [Decode round host idle](2026-09-18-decode-round-host-idle.md),
   [hq vs BF16 live/live](2026-09-13-hq-vs-bf16-live-live.md)
 - Superseded by: none
+- Summary: The vendored DFlash2 top-k gave one warp per column and took 3,145 us of every decode round (16.4% of kernel time); our row-split replacement takes 44 us, bit-identical: +21% decode throughput at one lane, 4.1% at eight.
 
 **Hardware:** RTX 5090 (170 SMs), exclusive card (ADR 0006).
 **Engine:** production defaults — `hq-e8-2b`, `--max-context 262144`,
