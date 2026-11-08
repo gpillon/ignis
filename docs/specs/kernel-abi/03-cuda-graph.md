@@ -5,7 +5,7 @@
 GitHub: #10
 
 Eager **CUDA graph capture** at startup (v1 decision; lazy capture = a later
-optimization, `docs/design/ignis-v1.md` §3). Capture the prefill + decode
+optimization, `docs/archive/ignis-v1.md` §3). Capture the prefill + decode
 kernels into a graph and replay on each step; verify the capture at startup.
 
 ## Acceptance

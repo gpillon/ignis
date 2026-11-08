@@ -1,6 +1,6 @@
 # bench/traces — recorded traces + gate artifacts (the v1 gate input)
 
-Repo-root layout per `docs/design/ignis-v1.md` §6: the *recorded* load
+Repo-root layout per `docs/archive/ignis-v1.md` §6: the *recorded* load
 traces (JSONL) and the artifacts the `ignis-bench` harness produces from
 them. The v1 99% performance gate (ADR 0007) is only runnable on
 **recorded** data: a trace recorded against the reference stack + a

@@ -4,7 +4,7 @@ GitHub: #36 (supersedes kernel-abi specs 01–10 + ADR 0008; replaces #35)
 
 Supersedes: kernel-abi specs 01–10 (the per-op host-pointer surface, the
 compute adapter's forward, the batched-prefill pass, the staging-buffer decode
-graph) and ADR 0008. Source: `docs/REVIEW-2026-09-05.md` §2, §3, §5, §6
+graph) and ADR 0008. Source: `docs/archive/REVIEW-2026-09-05.md` §2, §3, §5, §6
 (Phase 0 + Phase 1). ADRs respected: 0002 (the artifact is loaded directly),
 0005 (performance-first above a sane-output floor), 0006 (exclusive GPU
 testing), 0007 (the 99% gate is a performance gate, correctness is

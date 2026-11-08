@@ -1,6 +1,6 @@
 //! ignis-server: the OpenAI-compatible HTTP surface (localhost, no auth).
 //!
-//! v1 endpoints (server-01, `docs/design/ignis-v1.md` §2):
+//! v1 endpoints (server-01, `docs/archive/ignis-v1.md` §2):
 //! - `GET /v1/models` — the loaded model, and whether it is serving or
 //!   being switched; `POST /v1/models/switch` replaces it on the running
 //!   process (spec model-switch/01, `model_switch.rs`).

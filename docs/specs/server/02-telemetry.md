@@ -2,7 +2,7 @@
 
 GitHub: #15
 
-v1 telemetry (JSONL, `docs/design/ignis-v1.md` §5): one line per event, one
+v1 telemetry (JSONL, `docs/archive/ignis-v1.md` §5): one line per event, one
 line per interval.
 
 - `{"kind":"interval", waiting, prefilling, running, kv_used_pct,

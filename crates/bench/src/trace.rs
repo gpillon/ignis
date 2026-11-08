@@ -8,7 +8,7 @@
 //! performance gate, not token parity).
 //!
 //! The load shape is a "1 main agent + ~N subagents" concurrent coding
-//! workload (docs/design/ignis-v1.md §4): the main agent and the subagents
+//! workload (docs/archive/ignis-v1.md §4): the main agent and the subagents
 //! share a large, near-identical prefix (sibling-prefix reuse), and their
 //! arrivals are staggered over time (`t_arrive_ms`) so the scheduler sees a
 //! realistic concurrency profile.

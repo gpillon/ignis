@@ -2,7 +2,7 @@
 
 GitHub: #17
 
-The **KV-RAM host tier** (`docs/design/ignis-v1.md` §2, `GLOSSARY.md`
+The **KV-RAM host tier** (`docs/archive/ignis-v1.md` §2, `GLOSSARY.md`
 "KV-RAM"):
 
 - Snapshots GPU lanes to host RAM so sibling requests **restore** instead of

@@ -31,6 +31,6 @@ sidecars.
 
 ## References
 
-- Design: `docs/design/ignis-v1.md` §2 (Artifact loader), §7 (frontend risk).
+- Design: `docs/archive/ignis-v1.md` §2 (Artifact loader), §7 (frontend risk).
 - ADRs: 0002 (load `.ninfer` artifact), 0005/0007 (performance-first, gate).
 - Reader: `crates/artifact/src/lib.rs` (ticket kernel-port 02, closed).

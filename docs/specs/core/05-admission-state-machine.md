@@ -2,7 +2,7 @@
 
 GitHub: #16
 
-The full **admission state machine** (`docs/design/ignis-v1.md` §2,
+The full **admission state machine** (`docs/archive/ignis-v1.md` §2,
 `GLOSSARY.md` "Admission state machine") — the fairness machinery that
 decides which request gets which lane:
 

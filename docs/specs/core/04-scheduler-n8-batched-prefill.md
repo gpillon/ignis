@@ -2,7 +2,7 @@
 
 GitHub: #13
 
-The v1 scheduler (`docs/design/ignis-v1.md` §2):
+The v1 scheduler (`docs/archive/ignis-v1.md` §2):
 
 - **N=8 resident decode lanes** (with host-tier overflow).
 - **Batched (concurrent) prefill** to saturate the GPU in prefill and cut

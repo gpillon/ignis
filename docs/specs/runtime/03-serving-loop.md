@@ -2,7 +2,7 @@
 
 GitHub: #64 (phase 3 master; blocked by #63, gate G2 — closed 2026-09-09)
 
-Source: `docs/REVIEW-2026-09-05.md` §6 (Phase 3), `docs/ROADMAP.md`
+Source: `docs/archive/REVIEW-2026-09-05.md` §6 (Phase 3), `docs/archive/ROADMAP.md`
 (the G3 row and the phase 3–5 candidate decomposition), and the grilling
 session of 2026-09-09 that turned them into this spec. Builds directly on
 `docs/specs/runtime/02-real-prefill.md` (G2).

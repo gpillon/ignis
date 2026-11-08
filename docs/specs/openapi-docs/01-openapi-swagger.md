@@ -9,7 +9,7 @@ ignis serves an OpenAI-compatible API plus one endpoint that is its own
 it. A caller who points a client at `http://host:8080` can reach `/ui/` and
 type into the Playground, but there is no machine-readable contract and no
 page that answers "what can this server do, with what body, and what comes
-back". The narrative description lives in `docs/design/ignis-v1.md` §2 and
+back". The narrative description lives in `docs/archive/ignis-v1.md` §2 and
 in doc comments — both in the repo, neither served, and both free to drift
 from the handlers they describe. An agent author writing a client, an
 operator behind an `--expose` tunnel (ADR 0028) and the owner checking what
@@ -185,7 +185,7 @@ compile-time document; no handler body changes, and no per-request work is
 added.
 
 **ADR.** ADR 0036 records the decisions that outlive this change: the generated document is the machine-readable contract of the
-`/v1` surface (with `docs/design/ignis-v1.md` §2 staying the narrative),
+`/v1` surface (with `docs/archive/ignis-v1.md` §2 staying the narrative),
 and the reference is served without a key even on a keyed server — a
 carve-out from ADR 0028's "an exposed server must not publish its load",
 justified by shape-not-load.
@@ -251,7 +251,7 @@ alone.
 - A `--docs` / `--no-docs` flag.
 - Restyling the Swagger page in the Playground's kiln/ember tokens. The
   stock theme ships; a themed page can follow if the owner wants one.
-- Regenerating `docs/design/ignis-v1.md` from the document, or deleting it.
+- Regenerating `docs/archive/ignis-v1.md` from the document, or deleting it.
 - Publishing the document as a build artifact or to the release (ADR 0032).
 - A client generated from the document, in any language.
 

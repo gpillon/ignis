@@ -2,9 +2,9 @@
 
 GitHub: #65 (phase 4 master; blocked by #64, gate G3 — closed 2026-09-10)
 
-Source: `docs/REVIEW-2026-09-05.md` §6 (Phase 4), `docs/ROADMAP.md`
+Source: `docs/archive/REVIEW-2026-09-05.md` §6 (Phase 4), `docs/archive/ROADMAP.md`
 (the G4 row and the phase 3–5 candidate decomposition),
-`docs/DEFERRED-DECISIONS.md` (the ten items the G3 session deferred here),
+`docs/archive/DEFERRED-DECISIONS.md` (the ten items the G3 session deferred here),
 and the grilling session of 2026-09-11 that turned them into this spec. Builds
 directly on `docs/specs/runtime/03-serving-loop.md` (G3).
 

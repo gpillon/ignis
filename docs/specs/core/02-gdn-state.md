@@ -3,7 +3,7 @@
 GitHub: #11
 
 GDN (linear-attention) state management in `ignis-core`
-(`docs/design/ignis-v1.md` §2, `GLOSSARY.md` "GDN state"):
+(`docs/archive/ignis-v1.md` §2, `GLOSSARY.md` "GDN state"):
 
 - The recurrent state of the linear-attention (GDN) layers is resumable
   **only** at checkpoint / frontier boundaries.

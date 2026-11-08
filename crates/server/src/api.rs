@@ -1,7 +1,7 @@
 //! The OpenAI-compatible HTTP surface (server-01): routes, request /
 //! response schemas, handlers.
 //!
-//! Endpoints (`docs/design/ignis-v1.md` §2; open unless `--server-api-key` is set,
+//! Endpoints (`docs/archive/ignis-v1.md` §2; open unless `--server-api-key` is set,
 //! then each needs `Authorization: Bearer <key>` or answers `401`):
 //! - `GET /v1/models` — the loaded model, and whether it is serving or
 //!   being switched; `POST /v1/models/switch` replaces it (spec

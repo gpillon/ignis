@@ -1,3 +1,5 @@
+> Archived on 2026-11-08: a snapshot of 2026-09-15, the phase and gate plan G1-G5; see [docs/archive/README.md](README.md).
+
 # ignis roadmap — from "no working forward" to "≥ ninfer" (tracked)
 
 Source: `REVIEW-2026-09-05.md` §6. Status and blocking live on GitHub
@@ -88,7 +90,7 @@ ignis on `4d03d40` (BF16 KV, 1024 chunk, eager, 40,960 context) against
 CUDA graphs, speculative MTP). The KV-format difference is a recorded
 inequality, uncorrected, and it runs against ignis. Full verdict, the three
 deviations recorded with it, and the records:
-`docs/REVIEW-2026-09-05.md` §6 Phase 2.
+`docs/archive/REVIEW-2026-09-05.md` §6 Phase 2.
 
 The GPU profile is green in one run on the same tree: 32/32 kernel op tests,
 25 Rust GPU tests, zero failures. Getting there took **#96** — a stream
@@ -102,7 +104,7 @@ Tracer bullets from `docs/specs/runtime/03-serving-loop.md`, cut in the grilling
 session of 2026-09-09. That session also introduced **ADR 0018**
 (scheduler-driven chunk-level prefill/decode interleaving on the single model
 stream; true GPU overlap explicitly excluded) and recorded ten deferred
-decisions in `docs/DEFERRED-DECISIONS.md`.
+decisions in `docs/archive/DEFERRED-DECISIONS.md`.
 
 | # | Ticket | Blocked by | Delivers (verifiable) |
 |---|---|---|---|
@@ -141,7 +143,7 @@ The anti-serialization property, G2 correctness, and the GPU profile are all
 green on this tree. The ITL gap is **#110**, not waived — and it may share a
 root cause with the still-open **#92** (per-chunk synchronization overhead):
 both point at fixed per-chunk-boundary cost rather than chunk-proportional
-cost. Full verdict and records: `docs/REVIEW-2026-09-05.md` §6 Phase 3,
+cost. Full verdict and records: `docs/archive/REVIEW-2026-09-05.md` §6 Phase 3,
 `.scratch/g3-logs/`. #64 is closed on this verdict per its own text.
 
 ## Phase 4 decomposition (G4, master #65)
@@ -166,7 +168,7 @@ for prefix reuse). Ticket numbers go in this table when they are published.
 | P4-09 (#120) | Tagged lanes: the class as an ignis extension field, mapped to `RequestClass`, echoed in the request log and carried by the trace | — | Every request's class is attributable in the log; unknown maps to `Interactive` |
 | P4-10 (#126) | Device prefix reuse: leaf-owned page refcount and sharing, device-to-device clone of the mutable sections through the section machinery | P4-06 (#124) | A sibling claiming a prefix produces the same tokens as one that prefilled it; shared pages charged once |
 | P4-11 (#121) | Tool-call stream hardening and preserve-thinking against a real agent session | — | A recorded session's tool-call and thinking streams survive round-trip |
-| P4-12 (#128) | G4 gate run and verdict | all | **Run 2 (2026-09-13, session `g4-20260913T163557Z`): the gate reaches a verdict on real numbers and fails one cell.** `main` 1.264 PASS, `sub` **0.969 FAIL** (filed **#148**), `aggregate` 1.013 PASS; needle@64K and @128K retrieved on 8 of 8 launch-cells; canary PASS at the serving default (thinking on); dogfood streams intact; the G3-under-hq cells inside their band on both pairs (C=1 0.990/0.982, C=4 3.197/3.836, ITL p95 0.986/1.028). Every gap run 1 filed is closed and was exercised here: #137, #138, #139, #143, #144, #146, #147. A live/live 2x2 over engine and format (8 legs, 2 launches per cell) retires the KV-format inequality with a measurement: `docs/findings/2026-09-13-hq-vs-bf16-live-live.md`. Records: `.scratch/g4-run2/`; full verdict: `docs/REVIEW-2026-09-05.md` §6 Phase 4. **Run 1 (2026-09-12): gaps filed (#137, #138, #139, #143, #144, #145), not a waiver** — the per-class cell was unverifiable (#137), needle@128K failed on both engines (#138) and the reference's second G3 leg was unscorable (#139). |
+| P4-12 (#128) | G4 gate run and verdict | all | **Run 2 (2026-09-13, session `g4-20260913T163557Z`): the gate reaches a verdict on real numbers and fails one cell.** `main` 1.264 PASS, `sub` **0.969 FAIL** (filed **#148**), `aggregate` 1.013 PASS; needle@64K and @128K retrieved on 8 of 8 launch-cells; canary PASS at the serving default (thinking on); dogfood streams intact; the G3-under-hq cells inside their band on both pairs (C=1 0.990/0.982, C=4 3.197/3.836, ITL p95 0.986/1.028). Every gap run 1 filed is closed and was exercised here: #137, #138, #139, #143, #144, #146, #147. A live/live 2x2 over engine and format (8 legs, 2 launches per cell) retires the KV-format inequality with a measurement: `docs/findings/2026-09-13-hq-vs-bf16-live-live.md`. Records: `.scratch/g4-run2/`; full verdict: `docs/archive/REVIEW-2026-09-05.md` §6 Phase 4. **Run 1 (2026-09-12): gaps filed (#137, #138, #139, #143, #144, #145), not a waiver** — the per-class cell was unverifiable (#137), needle@128K failed on both engines (#138) and the reference's second G3 leg was unscorable (#139). |
 
 Frontier at start: **#117**, **#118**, **#119**, **#120**, **#121** in
 parallel (P4-01 and P4-09 are Rust only, no GPU; P4-02 needs the owner and the
@@ -183,7 +185,7 @@ if long-context retrieval under hq comes back short); a third request class.
 
 Tracer bullets from `docs/specs/runtime/05-speculative-decoding.md`, cut
 in the grilling session of 2026-09-13 (decisions in
-`docs/DEFERRED-DECISIONS.md`, "From the G5 grilling session"). No ADR
+`docs/archive/DEFERRED-DECISIONS.md`, "From the G5 grilling session"). No ADR
 introduced: the round is an options struct on the existing decode entry
 point (ADR 0016), the drafter's state is two sections in ADR 0024's table,
 the backend is a load flag. The session reversed the roadmap's order — the

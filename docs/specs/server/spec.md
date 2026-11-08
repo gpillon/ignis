@@ -3,7 +3,7 @@
 The Rust server crate (`ignis-server`) exposes an OpenAI-compatible HTTP
 API over localhost (no auth, configurable bind) and emits the v1 telemetry
 stream. It routes requests into the core scheduler and streams back tokens.
-Per `docs/design/ignis-v1.md` §1 (OpenAI-compatible HTTP) and §5 (telemetry).
+Per `docs/archive/ignis-v1.md` §1 (OpenAI-compatible HTTP) and §5 (telemetry).
 
 ## v1 scope (priority order)
 
@@ -37,7 +37,7 @@ Per `docs/design/ignis-v1.md` §1 (OpenAI-compatible HTTP) and §5 (telemetry).
 
 ## References
 
-- Design: `docs/design/ignis-v1.md` §1 (OpenAI-compatible HTTP), §5
+- Design: `docs/archive/ignis-v1.md` §1 (OpenAI-compatible HTTP), §5
   (telemetry).
 - Upstream: `core-04` (scheduler to route into), `artifact-02` (frontend
   objects for the chat template + tokenizer).
