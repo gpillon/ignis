@@ -165,10 +165,11 @@ def reference_model(source):
 
 def reference_rows(model, patches, grid):
     """The merger's output, float32 `[tokens][out_hidden]`, of `model` on one item's BF16 patch rows."""
-    pixels = torch.from_numpy(bf16_to_f32(patches).copy())
+    device = next(model.parameters()).device
+    pixels = torch.from_numpy(bf16_to_f32(patches).copy()).to(device)
     with torch.no_grad():
-        out = model(pixels, grid_thw=torch.tensor([list(grid)], dtype=torch.long))
-    return out.pooler_output.float().numpy()
+        out = model(pixels, grid_thw=torch.tensor([list(grid)], dtype=torch.long, device=device))
+    return out.pooler_output.float().cpu().numpy()
 
 
 # ---------------------------------------------------------------------------------------------- the measure
