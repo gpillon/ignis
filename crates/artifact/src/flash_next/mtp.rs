@@ -35,28 +35,7 @@ pub struct MtpPlan {
 /// `Ok` when its `model_id`, `weights_id` and `content_hash` are the main
 /// container's, else the first field that differs, both values named.
 pub fn check_pair(sidecar: &serde_json::Value, main: &Reader) -> Result<()> {
-    let pair = sidecar
-        .pointer("/pair/main")
-        .ok_or_else(|| fail("the MTP companion's sidecar records no pair.main"))?;
-    let hash: String = main.content_hash().iter().map(|b| format!("{b:02x}")).collect();
-    let identity = main.identity();
-    for (field, actual) in [
-        ("model_id", identity.model_id.as_str()),
-        ("weights_id", identity.weights_id.as_str()),
-        ("content_hash", hash.as_str()),
-    ] {
-        let recorded = pair
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| fail(format!("the MTP companion's pair.main records no {field}")))?;
-        if recorded != actual {
-            return Err(fail(format!(
-                "the MTP companion is pinned to another main container: pair.main.{field} is {recorded}, the \
-                 main container's is {actual}"
-            )));
-        }
-    }
-    Ok(())
+    super::check_companion_pair(sidecar, main, "MTP")
 }
 
 /// Bind the companion: its identity, then every head object required with

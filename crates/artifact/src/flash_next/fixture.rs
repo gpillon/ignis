@@ -23,7 +23,7 @@ use super::{
     FlashNextGeometry, Projection, ShapeRule, TrellisK, FRONTEND_FILES,
 };
 use crate::packer::{pack, PackOptions, PackOutcome};
-use crate::{fail, tensor_encoded_size, Result};
+use crate::{fail, tensor_encoded_size, NumericFormat, Result, StorageLayout};
 
 /// The fixture's stand-in payload for `name`: its bytes, repeated to `len`.
 pub fn pattern(name: &str, len: u64) -> Vec<u8> {
@@ -126,6 +126,59 @@ impl WorkTree {
         mark_done(&self.mtp_work_dir().join("mtp"))
     }
 
+    /// The vision companion's work tree (flash-next-layout.md §14.1).
+    pub fn vision_work_dir(&self) -> PathBuf {
+        self.root.join("work-vision")
+    }
+
+    pub fn vision_artifact_path(&self) -> PathBuf {
+        self.root.join("qwen3_8_flash_next_vision_fixture-v2.ninfer")
+    }
+
+    /// The packer options for the vision companion at the fixture's tower,
+    /// paired with `main`.
+    pub fn vision_pack_options(&self, main: PathBuf) -> PackOptions {
+        let mut options = PackOptions::flash_next_vision(
+            self.vision_work_dir(),
+            self.vision_artifact_path(),
+            main,
+            super::vision::fixture_geometry(),
+        );
+        options.delete_batch_bytes = 1;
+        options
+    }
+
+    /// Write the vision unit (every object of the fixture tower's inventory,
+    /// `DONE`) and its `converter.json`, recording `main` (its name and
+    /// SHA-256) as the main container.
+    pub fn write_vision(&self, main: &Path) -> Result<()> {
+        let main_file = main.file_name().and_then(|n| n.to_str()).ok_or_else(|| fail("main has no file name"))?;
+        let main_sha256 = hex_digest(&std::fs::read(main).map_err(io(main))?);
+        let dir = self.vision_work_dir().join("vision");
+        std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+        let mut records = Vec::new();
+        for entry in super::vision::entries(&super::vision::fixture_geometry()) {
+            let crate::nvfp4_27b::Entry::Tensor { name, format, layout, shape } = entry else {
+                return Err(fail(format!("{} is a resource", entry.name())));
+            };
+            records.push(tensor_record(&dir, &name, format, layout, &shape)?);
+        }
+        write(&dir.join("tensors.json"), json!({"tensors": records}).to_string().as_bytes())?;
+        mark_done(&dir)?;
+        let record = json!({
+            "schema": "flash-next-vision-converter-v1",
+            "status": "complete",
+            "source": {"repo": "fixture", "revision": "fixture"},
+            "pair": {"main": {"file": main_file, "file_sha256": main_sha256}},
+        });
+        write(&self.vision_work_dir().join("converter.json"), record.to_string().as_bytes())
+    }
+
+    /// Mark the vision unit complete again (after a test edited it).
+    pub fn mark_vision_done(&self) -> Result<()> {
+        mark_done(&self.vision_work_dir().join("vision"))
+    }
+
     /// Write every unit and `converter.json`.
     pub fn write_all(&self) -> Result<()> {
         for unit in crate::packer::unit_names(self.geometry.layers) {
@@ -217,7 +270,7 @@ impl WorkTree {
             .map_err(|e| fail(format!("{}: {e}", path.display())))?;
         let entry = super::bf16(name.to_owned(), &[4]);
         let tensors = value["tensors"].as_array_mut().ok_or_else(|| fail("tensors.json has no tensors"))?;
-        tensors.push(tensor_record(&dir, &entry)?);
+        tensors.push(entry_record(&dir, &entry)?);
         write(&path, value.to_string().as_bytes())
     }
 
@@ -300,25 +353,31 @@ fn experts_files(
 fn write_tensors(dir: &Path, entries: &[Entry]) -> Result<()> {
     let records = entries
         .iter()
-        .map(|entry| tensor_record(dir, entry))
+        .map(|entry| entry_record(dir, entry))
         .collect::<Result<Vec<_>>>()?;
     write(&dir.join("tensors.json"), json!({"tensors": records}).to_string().as_bytes())
 }
 
-/// Write one tensor's payload file and return its `tensors.json` record.
-fn tensor_record(dir: &Path, entry: &Entry) -> Result<Value> {
+/// Write one entry's payload file and return its `tensors.json` record.
+fn entry_record(dir: &Path, entry: &Entry) -> Result<Value> {
     let ShapeRule::Exact(shape) = &entry.shape else {
         return Err(fail(format!("{} has no fixed shape", entry.name)));
     };
-    let bytes = tensor_encoded_size(entry.layout, entry.format, shape)?;
-    let payload = pattern(&entry.name, bytes);
-    let file = format!("{}.bin", entry.name);
+    tensor_record(dir, &entry.name, entry.format, entry.layout, shape)
+}
+
+/// Write one tensor's payload file (its name, each `/` a `.`, then `.bin`)
+/// and return its `tensors.json` record.
+fn tensor_record(dir: &Path, name: &str, format: NumericFormat, layout: StorageLayout, shape: &[u64]) -> Result<Value> {
+    let bytes = tensor_encoded_size(layout, format, shape)?;
+    let payload = pattern(name, bytes);
+    let file = format!("{}.bin", name.replace('/', "."));
     write(&dir.join(&file), &payload)?;
     Ok(json!({
-        "name": entry.name,
+        "name": name,
         "file": file,
-        "format": entry.format.name(),
-        "layout": entry.layout.name(),
+        "format": format.name(),
+        "layout": layout.name(),
         "shape": shape,
         "bytes": bytes,
         "sha256": hex_digest(&payload),
