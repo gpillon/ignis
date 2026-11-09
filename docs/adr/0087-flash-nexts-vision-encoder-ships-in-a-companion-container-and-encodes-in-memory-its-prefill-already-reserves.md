@@ -39,7 +39,7 @@ takes images with the 27B's feature set, and how:
   three checks: the encoded tower against the BF16 tower, run from shard 1
   alone, with the 27B tower's error under the same recipe as its bar; the
   three-axis positions in the attention and the indexer, exact against the
-  reference implementation on a small synthetic model; and accuracy on images
+  reference implementation on synthetic tensors; and accuracy on images
   with known answers, reported beside the 27B's. A KLD against BF16 on image
   prompts runs only if those raise an alarm.
 
