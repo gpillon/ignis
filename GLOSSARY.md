@@ -327,8 +327,10 @@ the trunk's pre-mixer streams with the next token's embedding and drafts the
 token after it.
 
 **Companion container**:
-A small `.ninfer` beside the main one that holds only the MTP head
-(flash-next-layout.md §13), with its own identity; bound only when MTP is on.
+A small `.ninfer` beside the main one that holds one optional part of the
+model, with its own identity, bound only when that part is on: Flash-Next's
+MTP head (flash-next-layout.md §13), bound with MTP, and its **vision
+encoder**, bound with **vision** (#555).
 
 **Pair pin**:
 The companion's record of the one main container it belongs to (`model_id`,
