@@ -1191,7 +1191,9 @@ The most **vision tokens** one **media item** may take: the smaller of the
 request's envelope and the artifact's pixel bound (16,384 for the 27B and for
 Flash-Next), so an envelope of 32,768 still bounds each image at 16,384. On
 Flash-Next it is also no larger than the item whose **media encode** its
-**prefill scratch** holds on its own (#557, ADR 0087). An image over it is
+**prefill scratch** and its expert staging ring hold, both idle while an item
+encodes (#557, #558, ADR 0087); on a card that holds every expert there is no
+ring, and the scratch alone bounds it. An image over it is
 downscaled onto a smaller grid, not refused (#248).
 _Avoid_: envelope (the request's total).
 

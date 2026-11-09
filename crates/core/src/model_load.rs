@@ -213,6 +213,7 @@ pub(crate) mod ffi {
             max_context_tokens: u32,
             kv_format: i32,
             options: *const IgnisModelLoadOptions,
+            staging_ring_bytes: u64,
             out_tokens: *mut u32,
         ) -> i32;
 
@@ -254,8 +255,8 @@ impl Model {
     /// The most merged tokens one media item may hold on this load (GitHub
     /// #557): what its encoder's share of the scratch was sized for, and so
     /// the item bound its processor serves. Flash-Next's is the largest item
-    /// its prefill scratch holds on its own, at most the bound it was loaded
-    /// with (ADR 0087). 0 without vision.
+    /// its prefill scratch and its expert staging ring hold (GitHub #558), at
+    /// most the bound it was loaded with (ADR 0087). 0 without vision.
     pub fn vision_item_max_tokens(&self) -> u32 {
         unsafe { ffi::ignis_model_vision_item_max_tokens(self.handle) }
     }
@@ -1162,7 +1163,7 @@ pub fn load_flash_next(
 /// first and then checks the geometry its program runs, so a reduced
 /// fixture's refusal still says its descriptors bind. With vision (GitHub
 /// #557), `tower` is its companion's bind, whose descriptors the leaf binds
-/// beside the trunk's.
+/// beside the trunk's; the item bound moves no line of the plan (ADR 0087).
 pub fn plan_flash_next_reservations(
     fn_plan: &FlashNextPlan,
     geometry: &FlashNextGeometry,
@@ -1170,100 +1171,147 @@ pub fn plan_flash_next_reservations(
     mtp: Option<&ignis_artifact::flash_next::mtp::MtpPlan>,
     tower: Option<&crate::flash_next_vision::TowerPlan>,
 ) -> Result<IgnisModelReservations, String> {
-    plan_flash_next(fn_plan, geometry, shape, mtp, tower).map(|(reservations, _)| reservations)
+    FlashNextPlanCall::new(fn_plan, geometry, shape, mtp, tower)?.reservations()
 }
 
-/// [`plan_flash_next_reservations`], and with vision (GitHub #557) the item
-/// bound the load would hold ([`Model::vision_item_max_tokens`]): the
-/// largest item its prefill scratch holds on its own, at most the one
-/// `shape`'s vision asks for (ADR 0087); 0 without vision.
-pub fn plan_flash_next(
+/// With vision (GitHub #557, #558), the item bound a load of the same
+/// arguments would hold ([`Model::vision_item_max_tokens`]): the largest
+/// item whose encode fits its prefill scratch and the expert staging ring of
+/// `staging_ring_bytes` -- the one the VRAM plan places, 0 on a card that
+/// holds every expert, which stages nothing -- at most the one `shape`'s
+/// vision asks for (ADR 0087); 0 without vision.
+pub fn plan_flash_next_item_bound(
     fn_plan: &FlashNextPlan,
     geometry: &FlashNextGeometry,
     shape: FlashNextLoadShape,
     mtp: Option<&ignis_artifact::flash_next::mtp::MtpPlan>,
     tower: Option<&crate::flash_next_vision::TowerPlan>,
-) -> Result<(IgnisModelReservations, u32), String> {
-    let FlashNextLoadShape {
-        prefill_chunk_tokens,
-        max_context_tokens,
-        kv_format,
-        decode_lanes,
-        speculation,
-        rope_scaling,
-        vision,
-    } = shape;
-    validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
-    let placement = |handle: ObjectHandle| {
-        fn_plan
-            .plan
-            .device_objects
-            .iter()
-            .find(|placed| placed.handle == handle)
-            .map(|placed| (placed.bytes, std::ptr::null()))
-            .ok_or_else(|| "a Flash-Next tensor is not a device object of the plan".to_string())
-    };
-    let (_names, mut tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
-    // Spec flash-next/07: the MTP head's descriptors, placed nowhere yet (a plan reads no data).
-    let (_head_names, head) = match mtp {
-        Some(plan) => mtp_bound_tensors(plan, geometry, |handle| {
-            plan.plan
+    staging_ring_bytes: u64,
+) -> Result<u32, String> {
+    if shape.vision.is_none() {
+        return Ok(0);
+    }
+    FlashNextPlanCall::new(fn_plan, geometry, shape, mtp, tower)?.item_bound(staging_ring_bytes)
+}
+
+/// The descriptors, the topology and the options both Flash-Next plan calls
+/// hand the leaf, with the names the descriptors point into (kept alive
+/// beside them).
+struct FlashNextPlanCall {
+    _names: [Vec<CString>; 3],
+    tensors: Vec<ffi::IgnisBoundTensor>,
+    topology: crate::compute::TopologyAbi,
+    options: ffi::IgnisModelLoadOptions,
+    prefill_chunk_tokens: u32,
+    max_context_tokens: u32,
+    kv_format: KvFormat,
+}
+
+impl FlashNextPlanCall {
+    fn new(
+        fn_plan: &FlashNextPlan,
+        geometry: &FlashNextGeometry,
+        shape: FlashNextLoadShape,
+        mtp: Option<&ignis_artifact::flash_next::mtp::MtpPlan>,
+        tower: Option<&crate::flash_next_vision::TowerPlan>,
+    ) -> Result<Self, String> {
+        let FlashNextLoadShape {
+            prefill_chunk_tokens,
+            max_context_tokens,
+            kv_format,
+            decode_lanes,
+            speculation,
+            rope_scaling,
+            vision,
+        } = shape;
+        validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
+        let placement = |handle: ObjectHandle| {
+            fn_plan
+                .plan
                 .device_objects
                 .iter()
                 .find(|placed| placed.handle == handle)
                 .map(|placed| (placed.bytes, std::ptr::null()))
-                .ok_or_else(|| "an MTP tensor is not a device object of its plan".to_string())
-        })?,
-        None => (Vec::new(), Vec::new()),
-    };
-    tensors.extend(head);
-    // GitHub #557: the vision companion's tower, placed nowhere yet.
-    let (_tower_names, tower) = match (vision, tower) {
-        (Some(_), Some(tower)) => vision_bound_tensors(&tower.entries, &tower.plan.handles, planned_placement(&tower.plan.plan))?,
-        (Some(_), None) => return Err("a Flash-Next plan with vision needs its vision companion's tower".into()),
-        (None, Some(_)) => return Err("a vision tower on a Flash-Next plan without vision".into()),
-        (None, None) => (Vec::new(), Vec::new()),
-    };
-    tensors.extend(tower);
-    let topology = ModelConfig::flash_next_from(geometry).topology_abi();
-    let options = flash_next_options(decode_lanes, std::ptr::null_mut(), speculation, rope_scaling, vision);
-    let mut reservations = IgnisModelReservations::default();
-    let rc = unsafe {
-        ffi::ignis_model_plan_reservations(
-            tensors.as_ptr(),
-            tensors.len() as u64,
-            topology.raw(),
+                .ok_or_else(|| "a Flash-Next tensor is not a device object of the plan".to_string())
+        };
+        let (names, mut tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
+        // Spec flash-next/07: the MTP head's descriptors, placed nowhere yet (a plan reads no data).
+        let (head_names, head) = match mtp {
+            Some(plan) => mtp_bound_tensors(plan, geometry, |handle| {
+                plan.plan
+                    .device_objects
+                    .iter()
+                    .find(|placed| placed.handle == handle)
+                    .map(|placed| (placed.bytes, std::ptr::null()))
+                    .ok_or_else(|| "an MTP tensor is not a device object of its plan".to_string())
+            })?,
+            None => (Vec::new(), Vec::new()),
+        };
+        tensors.extend(head);
+        // GitHub #557: the vision companion's tower, placed nowhere yet.
+        let (tower_names, tower) = match (vision, tower) {
+            (Some(_), Some(tower)) => vision_bound_tensors(&tower.entries, &tower.plan.handles, planned_placement(&tower.plan.plan))?,
+            (Some(_), None) => return Err("a Flash-Next plan with vision needs its vision companion's tower".into()),
+            (None, Some(_)) => return Err("a vision tower on a Flash-Next plan without vision".into()),
+            (None, None) => (Vec::new(), Vec::new()),
+        };
+        tensors.extend(tower);
+        Ok(Self {
+            _names: [names, head_names, tower_names],
+            tensors,
+            topology: ModelConfig::flash_next_from(geometry).topology_abi(),
+            options: flash_next_options(decode_lanes, std::ptr::null_mut(), speculation, rope_scaling, vision),
             prefill_chunk_tokens,
             max_context_tokens,
-            kv_format.abi_code(),
-            &options,
-            &mut reservations,
-        )
-    };
-    if rc != 0 {
-        let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
-        return Err(message.to_string_lossy().into_owned());
+            kv_format,
+        })
     }
-    let mut item_max_tokens = 0u32;
-    if vision.is_some() {
+
+    fn refused() -> String {
+        let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
+        message.to_string_lossy().into_owned()
+    }
+
+    fn reservations(&self) -> Result<IgnisModelReservations, String> {
+        let mut reservations = IgnisModelReservations::default();
+        let rc = unsafe {
+            ffi::ignis_model_plan_reservations(
+                self.tensors.as_ptr(),
+                self.tensors.len() as u64,
+                self.topology.raw(),
+                self.prefill_chunk_tokens,
+                self.max_context_tokens,
+                self.kv_format.abi_code(),
+                &self.options,
+                &mut reservations,
+            )
+        };
+        if rc != 0 {
+            return Err(Self::refused());
+        }
+        Ok(reservations)
+    }
+
+    fn item_bound(&self, staging_ring_bytes: u64) -> Result<u32, String> {
+        let mut item_max_tokens = 0u32;
         let rc = unsafe {
             ffi::ignis_model_plan_vision_item_max_tokens(
-                tensors.as_ptr(),
-                tensors.len() as u64,
-                topology.raw(),
-                prefill_chunk_tokens,
-                max_context_tokens,
-                kv_format.abi_code(),
-                &options,
+                self.tensors.as_ptr(),
+                self.tensors.len() as u64,
+                self.topology.raw(),
+                self.prefill_chunk_tokens,
+                self.max_context_tokens,
+                self.kv_format.abi_code(),
+                &self.options,
+                staging_ring_bytes,
                 &mut item_max_tokens,
             )
         };
         if rc != 0 {
-            let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
-            return Err(message.to_string_lossy().into_owned());
+            return Err(Self::refused());
         }
+        Ok(item_max_tokens)
     }
-    Ok((reservations, item_max_tokens))
 }
 
 // ---------------------------------------------------------------------------

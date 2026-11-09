@@ -123,16 +123,16 @@ struct FlashNextModel {
   std::unique_ptr<ninfer::DeviceBuffer> shared_out;
   // GitHub #557: a vision load's embedding pool -- its bytes and whether it is in mapped host
   // memory (the vision residency), allocated by finish_load as the handle's `vision_pool`
-  // (model_internal.h, the 27B's) -- and the forward's vision inputs, at stable addresses: a
-  // chunk's three axes (I32 [3][prefill_chunk_tokens]) and its media rows (I32
-  // [prefill_chunk_tokens], on an MTP load the head's entries' after them, GitHub #564), and a
-  // round's rope deltas (I32 [decode_lanes], staged with the positions). A text load holds none
-  // of them, so its reservations are as they were.
+  // (model_internal.h, the 27B's) -- and a round's rope deltas (I32 [decode_lanes], staged with
+  // the positions, read by the round graphs at this stable address). GitHub #558 (ADR 0087): a
+  // vision load reserves nothing a text load does not. The rope deltas sit after the positions
+  // in `positions`' own 256-byte reservation; a prefill chunk's three axes and media rows are
+  // carved, per chunk, from the decode graph scratch, idle while a chunk runs (prefill_vision_
+  // inputs_bytes); the verify round's axis records live at the prefill scratch's base, idle
+  // while a round runs (verify::State::axis_record_words). Null without vision.
   uint64_t vision_pool_bytes = 0;
   bool vision_pool_host = false;
-  std::unique_ptr<ninfer::DeviceBuffer> rope_positions;
-  std::unique_ptr<ninfer::DeviceBuffer> media_rows;
-  std::unique_ptr<ninfer::DeviceBuffer> rope_deltas;
+  int32_t *rope_deltas = nullptr;
   bool vision() const { return vision_pool_bytes != 0; }
   // Recorded on residency's lookahead branch once the lookahead router has read `x`; the
   // layer's stream waits on it before the next sublayer's mix rewrites `x`.

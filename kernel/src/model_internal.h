@@ -655,6 +655,12 @@ struct ignis_model {
   // `vision` points into mapped host memory and each encode stages it into
   // `scratch`; `staged()` is false on a device load.
   VisionStaging vision_staging{};
+  // GitHub #558 (ADR 0087): on a Flash-Next vision load, the expert residency
+  // whose staging ring an encode may take beside `scratch` -- idle between
+  // forwards (ignis_residency.h), and counted on by the item bound -- borrowed
+  // as the load borrows it; null on the 27B and when the residency holds every
+  // expert, which stages nothing and has no ring.
+  struct ignis_residency *vision_ring_lender = nullptr;
   // GitHub #178: the decode round's per-lane rope positions (I32 x
   // decode_lanes), `position + rope_delta`, staged beside
   // `sampling_decode_positions` and read by the graphs from this stable
@@ -715,6 +721,28 @@ struct VisionStagedShare {
   std::size_t bytes = 0;
 };
 VisionStagedShare ignis_vision_staged_share(std::size_t workspace_bytes, std::size_t slot_bytes);
+
+// GitHub #558 (ADR 0087): where one item's encode lays its two parts -- the
+// encoder's workspace (`workspace_bytes`) and under IGNIS_VISION_RESIDENCY_HOST
+// the tower's staging slots (`slots_bytes`, all IGNIS_VISION_STAGING_SLOTS of
+// them; 0 under device) -- over the two areas a Flash-Next load holds idle
+// while an item encodes: its prefill scratch (`scratch_bytes`) and its expert
+// staging ring (`ring_bytes`; 0 when the residency holds every expert and
+// stages nothing). Tried in this order: both in the scratch (the workspace
+// aligned, then the slots, as ignis_vision_staged_share lays them), the
+// workspace in the scratch and the slots in the ring, the workspace in the
+// ring and the slots in the scratch, both in the ring; `fits` is false when
+// none holds them. An area holding both lays them out as the scratch does.
+// Shared by the item bound the load and its plan compute (kernel/src/model.cu)
+// and the encode that lays its share out (kernel/src/vision_encode.cu), so the
+// two cannot drift.
+struct VisionEncodePlacement {
+  bool fits = false;
+  bool workspace_in_ring = false;
+  bool slots_in_ring = false;
+};
+VisionEncodePlacement ignis_vision_encode_placement(std::size_t scratch_bytes, std::size_t ring_bytes,
+                                                    std::size_t workspace_bytes, std::size_t slots_bytes);
 
 // GitHub #414: throws, naming the stage, unless every stage of `weights` --
 // as the binder laid it out in host memory -- fits a slot of `slot_bytes`,

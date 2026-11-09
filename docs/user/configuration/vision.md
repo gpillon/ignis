@@ -37,16 +37,22 @@ container, refuses the start before anything loads, naming the file
 
 What it costs:
 
-- **No VRAM of its own under `host`.** An image is encoded in the prefill
-  scratch Flash-Next already reserves for its text, the tower copied through
-  three slots of it, so a vision load plans the expert cache a text-only load
-  plans, but for the image positions each prefill chunk carries (131 KB at the
-  8,192-token chunk, a little more with the MTP head on). The largest image
-  one encode holds is what that scratch holds on its own, at most the
-  processor's 16,384 tokens (4096 x 4096 pixels); a larger image is shrunk to
-  it, aspect kept, as `--vision-max-tokens` shrinks one, and refused only when
-  its aspect ratio cannot fit. The
-  `ignis.runtime.flash_next_plan` event names it as `vision_item_max_tokens`.
+- **No VRAM of its own under `host`.** An image is encoded in memory
+  Flash-Next already reserves and leaves idle while an image encodes: the
+  prefill scratch it reserves for its text and, on a card that cannot hold
+  every expert, the staging ring that prefill's expert misses pass through
+  (1.5 GB on an RTX 5090), which holds nothing between two prefill chunks.
+  The tower is copied through three 25 MB slots of them. The positions an
+  image's tokens are read at ride in buffers a text load reserves too, so a
+  vision load plans the same expert cache as a text-only load at the same
+  settings, with the MTP head on or off. The largest image one encode holds
+  is what the scratch and the ring hold together, at most the processor's
+  16,384 tokens (4096 x 4096 pixels): the RTX 5090's ring alone holds that
+  one's encode. On a card that holds every expert there is no ring, and the
+  scratch alone bounds it. A larger image is shrunk to the bound, aspect
+  kept, as `--vision-max-tokens` shrinks one, and refused only when its
+  aspect ratio cannot fit. The `ignis.runtime.flash_next_plan` event names
+  the bound as `vision_item_max_tokens`, beside `vision_residency`.
   Under `device` the tower (283 MB) and the embedding pool are VRAM lines:
   on a card that holds every expert they come out of the KV pool, on a 32 GB
   card out of the expert cache.

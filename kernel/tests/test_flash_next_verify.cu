@@ -371,13 +371,22 @@ void axis_records_arm(const fn::Geometry &g, uint32_t k, const std::vector<int32
                            std::to_string(k) + " c = {" + std::to_string(commit[0]) + ", " + std::to_string(commit[1]) +
                            "}";
   std::string error;
-  auto state = fn::verify::create(g, IGNIS_KV_FORMAT_BF16, kLanes, k, 0, kAttention, 1, true, &error, true);
-  check(state != nullptr && state->axis_records, name + ": verify::create: " + error);
+  // GitHub #558 (ADR 0087): the records take room the load lends (program.cu: the prefill scratch,
+  // idle while a round runs), never a line of the plan; a state with none is refused by name.
+  check(fn::verify::create(g, IGNIS_KV_FORMAT_BF16, kLanes, k, 0, kAttention, 1, true, &error, true) == nullptr &&
+            error.find("lent room") != std::string::npos,
+        name + ": axis records without lent room are refused: got \"" + error + "\"");
+  const fn::verify::Plan sizes = fn::verify::plan(g, IGNIS_KV_FORMAT_BF16, kLanes, k, 0, kAttention, 1, true, true);
+  DeviceBytes room(sizes.axis_records);
+  auto state = fn::verify::create(g, IGNIS_KV_FORMAT_BF16, kLanes, k, 0, kAttention, 1, true, &error, true, room.p,
+                                  room.bytes);
+  check(state != nullptr && state->axis_records && state->axis_record_words == room.p,
+        name + ": verify::create: " + error);
   if (state == nullptr) return;
   auto plain = fn::verify::create(g, IGNIS_KV_FORMAT_BF16, kLanes, k, 0, kAttention, 1, true, &error);
-  check(plain != nullptr && state->sizes.saved > plain->sizes.saved &&
-            state->sizes.total() - plain->sizes.total() == state->sizes.saved - plain->sizes.saved,
-        name + ": the records are a line of the saved state's plan, and only a vision load's");
+  check(plain != nullptr && state->sizes.total() == plain->sizes.total() && plain->sizes.axis_records == 0 &&
+            sizes.axis_records >= static_cast<std::size_t>(kAttention) * kLanes * 5 * sizeof(int32_t),
+        name + ": the records take lent room, a vision load's alone, and no line of the plan");
   HeadPool pool(g, false);
   const int32_t slot_of[kLanes] = {2, 0};
   const int32_t deltas[kLanes] = {-37, 412};

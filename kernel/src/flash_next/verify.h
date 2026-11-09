@@ -93,10 +93,15 @@ struct Plan {
   std::size_t gdn_records = 0;
   std::size_t indexer_records = 0;
   std::size_t saved = 0;     // the lane state the pass saves for the commit
+  // `axis_records` below: the room their saved records take, outside every line (the load lends
+  // it, create's `axis_record_room`); 0 without them.
+  std::size_t axis_records = 0;
   std::size_t total() const { return staging + accept + gdn_records + indexer_records + saved; }
 };
 // `axis_records`: a vision load's sections (GitHub #558, indexer.h AxisRecord), whose saved state
-// also holds each (attention layer, lane)'s record of the block its frontier is inside.
+// also holds each (attention layer, lane)'s record of the block its frontier is inside -- in room
+// the load lends the round, not in a line of its own (ADR 0087: a vision load reserves nothing a
+// text load does not), so `total()` is a text load's.
 Plan plan(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_tokens, uint32_t row_budget,
           int32_t attention_layers, int32_t gdn_layers, bool mtp, bool axis_records = false);
 
@@ -112,6 +117,9 @@ struct State {
   // load), which the pass may replace with a key the commit then rejects: save keeps it, restore
   // puts the new frontier's back.
   bool axis_records = false;
+  // Where the pass saves them: [attention layer][lane] AxisRecord words, in the room create was
+  // lent (null without axis records). Read and written by the pass and the commit of one round.
+  int32_t *axis_record_words = nullptr;
   Plan sizes;
 
   // Host-staged per round: I32 [lanes] each, drafts I32 [lanes][k] (lane-major, the accept's [k, B]).
@@ -164,10 +172,14 @@ struct State {
 std::string refusal(const Geometry &g, uint32_t lanes, uint32_t draft_tokens, uint32_t row_budget,
                     int32_t attention_layers, int32_t gdn_layers);
 
-// Allocates the state for a load (`lanes` decode lanes), or null and *error.
+// Allocates the state for a load (`lanes` decode lanes), or null and *error. With
+// `axis_records`, `axis_record_room` is device memory of `axis_record_room_bytes` (at least the
+// plan's `axis_records`, 16-byte aligned) the caller keeps for the state's life, which nothing else
+// touches during a round: the records are saved there.
 std::unique_ptr<State> create(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_tokens,
                               uint32_t row_budget, int32_t attention_layers, int32_t gdn_layers, bool mtp,
-                              std::string *error, bool axis_records = false);
+                              std::string *error, bool axis_records = false, void *axis_record_room = nullptr,
+                              std::size_t axis_record_room_bytes = 0);
 
 // The lane-state addresses the save, restore and fold kernels read and write: one pool's sections.
 struct Sections {

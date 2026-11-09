@@ -51,6 +51,43 @@ int main() {
               std::to_string(bytes));
   }
 
+  // --- 2. an encode over Flash-Next's prefill scratch and expert staging ring --
+  // GitHub #558 (ADR 0087): a Flash-Next load lends an item's encode two areas
+  // idle while it runs, its prefill scratch and, on a card that cannot hold
+  // every expert, its expert staging ring. The workspace and a host tower's
+  // three staging slots go where they fit, both in the scratch first.
+  {
+    constexpr std::size_t kMiB = 1 << 20;
+    constexpr std::size_t kSlots = 3 * 25 * kMiB;
+    const auto placed = [](std::size_t scratch, std::size_t ring, std::size_t workspace, std::size_t slots,
+                           bool workspace_in_ring, bool slots_in_ring) {
+      const VisionEncodePlacement p = ignis_vision_encode_placement(scratch, ring, workspace, slots);
+      return p.fits && p.workspace_in_ring == workspace_in_ring && p.slots_in_ring == slots_in_ring;
+    };
+    const auto refused = [](std::size_t scratch, std::size_t ring, std::size_t workspace, std::size_t slots) {
+      return !ignis_vision_encode_placement(scratch, ring, workspace, slots).fits;
+    };
+    // The slots follow the workspace at the next 256-byte boundary.
+    check(placed(1024 + kSlots, 0, 1000, kSlots, false, false), "both in a scratch of the aligned workspace and the slots");
+    check(refused(1023 + kSlots, 0, 1000, kSlots), "a scratch one byte short, and no ring, holds no encode");
+    check(placed(1000, kSlots, 1000, kSlots, false, true), "the slots in the ring when the scratch holds the workspace alone");
+    check(placed(80 * kMiB, 1500 * kMiB, 100 * kMiB, kSlots, true, false),
+          "the workspace in the ring when the scratch holds the slots alone");
+    check(placed(10 * kMiB, 1500 * kMiB, 100 * kMiB, kSlots, true, true), "both in the ring when the scratch holds neither");
+    check(refused(10 * kMiB, 100 * kMiB, 100 * kMiB, kSlots), "neither area holds the workspace and the slots");
+    // A tower in VRAM stages nothing: the workspace alone, in the scratch, else the ring.
+    check(placed(100, 0, 100, 0, false, false), "device: the scratch");
+    check(placed(99, 100, 100, 0, true, false), "device: the ring when the scratch is short");
+    check(refused(99, 99, 100, 0), "device: neither");
+    // ADR 0087's figure: the RTX 5090's ring at the 2026-11-09 start holds a
+    // 16,384-token item's workspace -- the processor's largest -- on its own.
+    constexpr std::size_t kRtx5090Ring = 1'574'895'616;
+    const std::size_t largest = ignis_vision_workspace_bytes(16384, kVisionMaxSegments);
+    check(placed(kSlots, kRtx5090Ring, largest, kSlots, true, false),
+          "a 16,384-token item's workspace fits the RTX 5090's ring, the slots a 75 MiB scratch: workspace " +
+              std::to_string(largest));
+  }
+
   if (g_failed != 0) {
     std::fprintf(stderr, "vision workspace test: %d check(s) failed\n", g_failed);
     return 1;

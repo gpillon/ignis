@@ -645,9 +645,9 @@ impl FlashNextEngine {
         self.model.stats().reserved
     }
 
-    /// The item bound this load's encode holds (GitHub #557): the largest
-    /// item its prefill scratch takes on its own, at most the bound it was
-    /// loaded with; 0 without vision.
+    /// The item bound this load's encode holds (GitHub #557, #558): the
+    /// largest item its prefill scratch and its expert staging ring take, at
+    /// most the bound it was loaded with; 0 without vision.
     pub fn vision_item_max_tokens(&self) -> u32 {
         self.model.vision_item_max_tokens()
     }

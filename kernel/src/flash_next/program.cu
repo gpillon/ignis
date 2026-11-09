@@ -145,6 +145,24 @@ std::size_t media_row_count(const FlashNextModel &fn) {
   return static_cast<std::size_t>(fn.prefill_chunk_tokens) * (fn.mtp != nullptr ? 2 : 1);
 }
 
+// GitHub #558 (ADR 0087): a round's positions [lanes], and on a vision load its rope deltas
+// [lanes] after them, in one buffer: the deltas sit in the positions' own 256-byte alignment, so
+// a vision load's line is a text load's.
+std::size_t positions_bytes(const FlashNextModel &fn) {
+  static_assert(2 * IGNIS_DECODE_MAX_BATCH * sizeof(int32_t) <= 256,
+                "a round's rope deltas fit in its positions' alignment (max_decode_lanes)");
+  return static_cast<std::size_t>(std::max<uint32_t>(fn.decode_lanes, 1)) * sizeof(int32_t) * (fn.vision() ? 2 : 1);
+}
+
+// GitHub #557, #558 (ADR 0087): a vision load's prefill chunk inputs -- its three axes (I32
+// [3][prefill_chunk_tokens]) and its media rows (media_row_count) -- carved per chunk from the
+// decode graph scratch, which no prefill reads: a chunk and a round never overlap (both run on
+// the model's stream, and a prefill call synchronizes it before it returns).
+std::size_t prefill_vision_inputs_bytes(const FlashNextModel &fn) {
+  return aligned(3 * static_cast<std::size_t>(fn.prefill_chunk_tokens) * sizeof(int32_t)) +
+         aligned(media_row_count(fn) * sizeof(int32_t));
+}
+
 Sizes plan_sizes(const FlashNextModel &fn) {
   const Geometry &g = fn.g;
   Sizes s;
@@ -160,15 +178,8 @@ Sizes plan_sizes(const FlashNextModel &fn) {
   const auto rows = static_cast<std::size_t>(fn.rows());
   s.activations = aligned(rows * g.residual_width() * 2) + 2 * aligned(rows * g.hidden * 2) +
                   aligned(2 * rows * g.streams * sizeof(float)) + aligned(rows * sizeof(int32_t)) +
-                  2 * aligned(static_cast<std::size_t>(std::max(lanes, 1)) * sizeof(int32_t)) +
-                  aligned(rows * g.ngram_heads * g.ngram_row_bytes());
-  if (fn.vision()) {
-    // GitHub #557: a chunk's three axes and media rows (#564: and the MTP head's), and a round's
-    // rope deltas.
-    s.activations += aligned(3 * static_cast<std::size_t>(chunk) * sizeof(int32_t)) +
-                     aligned(media_row_count(fn) * sizeof(int32_t)) +
-                     aligned(static_cast<std::size_t>(std::max(lanes, 1)) * sizeof(int32_t));
-  }
+                  aligned(static_cast<std::size_t>(std::max(lanes, 1)) * sizeof(int32_t)) +
+                  aligned(positions_bytes(fn)) + aligned(rows * g.ngram_heads * g.ngram_row_bytes());
   const std::size_t router = aligned(rows * g.experts_per_token * sizeof(int32_t)) +
                              aligned(rows * g.experts_per_token * sizeof(float)) +
                              aligned(rows * g.experts * sizeof(float));
@@ -181,7 +192,8 @@ Sizes plan_sizes(const FlashNextModel &fn) {
   s.sampling_workspace =
       std::max<std::size_t>(ninfer::ops::sampling_workspace_capacity_bytes(g.vocab, 1, IGNIS_DECODE_MAX_BATCH), 256);
   if (fn.speculative_backend != IGNIS_SPECULATIVE_NONE) {
-    // GitHub #558: a vision load's commit also restores its blocks' axis records.
+    // GitHub #558: a vision load's commit also restores its blocks' axis records, whose room the
+    // prefill scratch lends (finish_load): the line is a text load's.
     s.verify = verify::plan(g, fn.kv_format, fn.decode_lanes, fn.draft_tokens, fn.draft_row_budget,
                             attention_sections(fn), gdn_layers(fn), fn.mtp != nullptr, fn.vision())
                    .total();
@@ -193,6 +205,11 @@ Sizes plan_sizes(const FlashNextModel &fn) {
     s.prefill_scratch = std::max(s.prefill_scratch, mtp::combine_scratch_bytes(g, chunk) + 4096);
     s.decode_scratch = std::max(s.decode_scratch, mtp::combine_scratch_bytes(g, decode_rows) + 4096);
   }
+  // GitHub #558 (ADR 0087): a vision load's prefill chunk inputs ride in the decode graph scratch,
+  // which already holds them at any chunk a card serves (a round's scratch is megabytes, the
+  // inputs 160 KiB at an 8,192-token chunk with MTP), so the line is a text load's; past that it
+  // grows to them.
+  if (fn.vision()) s.decode_scratch = std::max(s.decode_scratch, prefill_vision_inputs_bytes(fn));
   return s;
 }
 
@@ -771,8 +788,7 @@ ignis_model_reservations reserved(const ignis_model &model) {
   for (const auto *buffer : {&fn.residual, &fn.x, &fn.y, &fn.injections, &fn.token_ids, &fn.slots, &fn.positions,
                              &fn.ngram_rows, &fn.moe_workspace, &fn.moe_acc, &fn.router_ids, &fn.router_weights,
                              &fn.router_logits, &fn.lookahead_ids, &fn.lookahead_weights, &fn.lookahead_logits,
-                             &fn.shared_h, &fn.shared_out, &fn.mtp_tokens, &fn.mtp_slots, &fn.rope_positions,
-                             &fn.media_rows, &fn.rope_deltas}) {
+                             &fn.shared_h, &fn.shared_out, &fn.mtp_tokens, &fn.mtp_slots}) {
     out.activation_bytes += bytes(*buffer);
   }
   out.verify_round_bytes = fn.verify != nullptr ? fn.verify->device_bytes() : 0;
@@ -843,7 +859,7 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     fn.injections = buffer(2 * rows * g.streams * sizeof(float));  // two mixes' (forward)
     fn.token_ids = buffer(rows * sizeof(int32_t));
     fn.slots = buffer(lanes * sizeof(int32_t));
-    fn.positions = buffer(lanes * sizeof(int32_t));
+    fn.positions = buffer(positions_bytes(fn));
     fn.ngram_rows = buffer(rows * g.ngram_heads * g.ngram_row_bytes());
     fn.moe_workspace = buffer(ignis_moe_workspace_bytes(moe_decode_tokens(fn), fn.prefill_chunk_tokens));
     fn.moe_acc = buffer(rows * g.hidden * sizeof(int64_t));
@@ -856,12 +872,8 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     fn.shared_h = buffer(rows * g.shared_intermediate * sizeof(__nv_bfloat16));
     fn.shared_out = buffer(rows * g.hidden * sizeof(float));
     fn.round_inputs = std::make_unique<ninfer::PinnedHostBuffer>(round_inputs_layout(fn).total);
-    if (fn.vision()) {
-      const auto chunk = static_cast<std::size_t>(fn.prefill_chunk_tokens);
-      fn.rope_positions = buffer(3 * chunk * sizeof(int32_t));
-      fn.media_rows = buffer(media_row_count(fn) * sizeof(int32_t));
-      fn.rope_deltas = buffer(lanes * sizeof(int32_t));
-    }
+    // GitHub #558 (ADR 0087): a vision load's rope deltas, after the positions (positions_bytes).
+    if (fn.vision()) fn.rope_deltas = static_cast<int32_t *>(fn.positions->p) + lanes;
   } catch (const std::exception &e) {
     *error = std::string("Flash-Next's reservations: ") + e.what();
     return -1;
@@ -888,13 +900,18 @@ int32_t finish_load(ignis_model &model, std::string *error) {
       return -1;
     }
     pool.owner.assign(bytes / pool.page_bytes, nullptr);
-    if (!check_cuda(cudaMemset(fn.rope_deltas->p, 0, fn.rope_deltas->bytes), "zeroing the rope deltas", error)) {
+    if (!check_cuda(cudaMemset(fn.rope_deltas, 0, std::max<uint32_t>(fn.decode_lanes, 1) * sizeof(int32_t)),
+                    "zeroing the rope deltas", error)) {
       return -1;
     }
   }
   if (fn.speculative_backend != IGNIS_SPECULATIVE_NONE) {
+    // GitHub #558 (ADR 0087): a vision load's axis records at the prefill scratch's base, which
+    // no round reads: only a prefill call and an encode take the prefill scratch, and neither runs
+    // while a round does (program_verify checks it is free).
     fn.verify = verify::create(g, fn.kv_format, fn.decode_lanes, fn.draft_tokens, fn.draft_row_budget,
-                               attention_sections(fn), gdn_layers(fn), fn.mtp != nullptr, error, fn.vision());
+                               attention_sections(fn), gdn_layers(fn), fn.mtp != nullptr, error, fn.vision(),
+                               fn.vision() ? model.scratch->base() : nullptr, model.scratch->capacity());
     if (fn.verify == nullptr) {
       *error = "Flash-Next's verify round: " + *error;
       return -1;
@@ -1021,9 +1038,16 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
       batch.max_visible = position + chunk;
       // GitHub #557: the chunk's slice of the span's three axes (axis-major [3][chunk]), or the
       // sequence's rope delta; and its media columns, a run per pool page they sit in (the 27B's
-      // run_program_chunk, step.cu).
+      // run_program_chunk, step.cu). GitHub #558 (ADR 0087): the axes and the media rows are
+      // carved from the decode graph scratch, free while a chunk runs (prefill_vision_inputs_bytes).
+      ninfer::DeviceArena &inputs = *model->decode_graph_scratch;
+      if (fn.vision() && inputs.used() != 0) {
+        error = "the decode graph scratch, which holds a vision chunk's inputs, is in use";
+        return false;
+      }
+      auto inputs_scope = inputs.scope();
       if (multimodal) {
-        auto *axes = static_cast<int32_t *>(fn.rope_positions->p);
+        auto *axes = static_cast<int32_t *>(inputs.alloc_bytes(3 * static_cast<std::size_t>(chunk) * sizeof(int32_t)).data);
         for (uint64_t axis = 0; axis < 3; ++axis) {
           if (!check_cuda(cudaMemcpyAsync(axes + axis * static_cast<uint64_t>(chunk),
                                           options->mrope_positions + axis * num_tokens + offset,
@@ -1034,12 +1058,12 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
         }
         batch.rope_positions = axes;
       } else if (shifted) {
-        if (!check_cuda(cudaMemcpyAsync(fn.rope_deltas->p, &seq->rope_delta, sizeof(int32_t), cudaMemcpyHostToDevice,
+        if (!check_cuda(cudaMemcpyAsync(fn.rope_deltas, &seq->rope_delta, sizeof(int32_t), cudaMemcpyHostToDevice,
                                         stream),
                         "staging the rope delta", &error)) {
           return false;
         }
-        batch.rope_deltas = static_cast<const int32_t *>(fn.rope_deltas->p);
+        batch.rope_deltas = fn.rope_deltas;
       }
       // GitHub #564: and the MTP head's -- its entry r takes token r + 1, so the columns of the
       // span's placeholders at offset + 1 .. offset + chunk over the rows before theirs, and on the
@@ -1071,7 +1095,7 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
             head_rows.push_back(chunk - 1);
           }
         }
-        auto *rows = static_cast<int32_t *>(fn.media_rows->p);
+        auto *rows = static_cast<int32_t *>(inputs.alloc_bytes(media_row_count(fn) * sizeof(int32_t)).data);
         int32_t *head_at = rows + fn.prefill_chunk_tokens;
         if ((!media_rows.empty() &&
              !check_cuda(cudaMemcpyAsync(rows, media_rows.data(), media_rows.size() * sizeof(int32_t),
@@ -1252,7 +1276,7 @@ int32_t run_round(ignis_model *model, FlashNextModel &fn, const Context &ctx, ui
   batch.max_visible = decode_max_visible(fn);
   // GitHub #557: a vision load's lanes rotate at their positions plus their rope deltas (0 for a
   // lane that never saw an image), staged with the positions.
-  batch.rope_deltas = fn.vision() ? static_cast<const int32_t *>(fn.rope_deltas->p) : nullptr;
+  batch.rope_deltas = fn.rope_deltas;
   if (forward(fn, ctx, batch, IGNIS_RESIDENCY_DECODE, scratch, stream, error) != 0) {
     return -1;
   }
@@ -1418,7 +1442,7 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
                  "staging the positions", &error) &&
       check_cuda(cudaMemcpyAsync(fn.ngram_rows->p, src_ngram, batch_size * row_bytes, cudaMemcpyHostToDevice, stream),
                  "staging the n-gram rows", &error) &&
-      (!fn.vision() || check_cuda(cudaMemcpyAsync(fn.rope_deltas->p, src_rope_deltas, lane_bytes,
+      (!fn.vision() || check_cuda(cudaMemcpyAsync(fn.rope_deltas, src_rope_deltas, lane_bytes,
                                                   cudaMemcpyHostToDevice, stream),
                                   "staging the rope deltas", &error)) &&
       (!constrained ||

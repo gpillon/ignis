@@ -182,6 +182,27 @@ std::size_t index_of(const std::vector<Named> &named, const std::string &name) {
   return named.size();
 }
 
+// Spec flash-next/07: the MTP head's 29 tensors (its companion's `mtp.*`): an attention layer's,
+// named as layer 3's under `mtp.layers.0.`, its two input norms and projections, and its mixer.
+std::vector<Named> mtp_head_tensors() {
+  std::vector<Named> out{
+      {"mtp.fc_embedding.weight", {H, H}, true},
+      {"mtp.fc_hidden.weight", {H, H}, true},
+      {"mtp.pre_fc_norm_embedding.weight", {H}, false},
+      {"mtp.pre_fc_norm_hidden.weight", {HC}, false},
+      {"mtp.hyper_connection_mixer.hc_norm.weight", {HC}, false},
+      {"mtp.hyper_connection_mixer.input_mix_weight_down.weight", {RANK, HC}, true},
+      {"mtp.hyper_connection_mixer.input_mix_weight_up.weight", {HC, RANK}, true},
+  };
+  const std::string layer = "layers.3.";
+  for (const Named &t : flash_next_tensors()) {
+    if (t.name.compare(0, layer.size(), layer) == 0) {
+      out.push_back({"mtp.layers.0." + t.name.substr(layer.size()), t.shape, t.linear});
+    }
+  }
+  return out;
+}
+
 // GitHub #557 (ADR 0087): the vision companion's tower, the 27B's 333
 // `vision/*` tensors with the merger writing Flash-Next's 2,560 rows, each in
 // its stored format (Q6 patch embedding, Q4 qkv and fc1, Q5 output and fc2,
@@ -383,10 +404,9 @@ int main() {
           "a load without its residency is refused by name: got \"" + unresident + "\"");
     // GitHub #557: vision on a Flash-Next load plans its embedding pool, as the 27B's: floored at
     // the envelope's own output (8,192 columns of 2,560 BF16, 64 pages of 128 columns) and rounded
-    // up to whole pages, in VRAM under the device residency and none of it under the host's; and
-    // its activations grow by the forward's vision inputs alone (a chunk's three axes and media
-    // rows, a round's rope deltas: 98,304 + 32,768 + 256 bytes). The attention readouts stay the
-    // 27B's.
+    // up to whole pages, in VRAM under the device residency and none of it under the host's.
+    // GitHub #558 (ADR 0087): and nothing else -- the forward's vision inputs ride in memory the
+    // text load reserves (below). The attention readouts stay the 27B's.
     check(plan(nullptr) == "(planned)", "the text load plans again");
     const uint64_t text_activations = out.activation_bytes;
     const uint64_t text_workspace = out.workspace_bytes;
@@ -408,11 +428,10 @@ int main() {
     check(unasked.find("extra bound tensor: vision/") != std::string::npos,
           "a text plan handed the tower refuses it: got \"" + unasked + "\"");
     const std::string pooled = plan(&vision);
-    check(pooled == "(planned)" && out.media_embedding_bytes == 41943040 &&
-              out.activation_bytes == text_activations + 131328,
-          "vision on a Flash-Next load plans the envelope's pool and the vision inputs: got \"" + pooled + "\", " +
-              std::to_string(out.media_embedding_bytes) + " pool bytes, " +
-              std::to_string(out.activation_bytes - text_activations) + " more activation bytes");
+    check(pooled == "(planned)" && out.media_embedding_bytes == 41943040 && out.activation_bytes == text_activations,
+          "vision on a Flash-Next load plans the envelope's pool and no other byte: got \"" + pooled + "\", " +
+              std::to_string(out.media_embedding_bytes) + " pool bytes, activations " +
+              std::to_string(out.activation_bytes) + " against " + std::to_string(text_activations));
     vision.vision_embedding_pool_bytes = 50000000;
     const std::string asked = plan(&vision);
     check(asked == "(planned)" && out.media_embedding_bytes == 50462720,
@@ -420,20 +439,86 @@ int main() {
               std::to_string(out.media_embedding_bytes));
     vision.vision_residency = IGNIS_VISION_RESIDENCY_HOST;
     const std::string hosted = plan(&vision);
-    check(hosted == "(planned)" && out.media_embedding_bytes == 0 && out.activation_bytes == text_activations + 131328,
+    check(hosted == "(planned)" && out.media_embedding_bytes == 0 && out.activation_bytes == text_activations,
           "a host-resident pool leaves the VRAM plan: got \"" + hosted + "\", " +
               std::to_string(out.media_embedding_bytes));
-    // GitHub #557 (ADR 0087): the encode takes no VRAM of its own. Its share
-    // -- the encoder's workspace for one item, and under the host residency
-    // the tower's staging ring after it -- is held by the prefill scratch the
-    // text sizes, whose line does not move; the item bound is the largest item
-    // that fits there, at most the one asked for, and a host tower's ring
-    // leaves it no larger. Printed for the plan's record.
+    // GitHub #558 (ADR 0087): a vision load reserves nothing a text load does not -- a chunk's
+    // three axes and media rows ride in the decode graph scratch, a round's rope deltas in its
+    // positions' alignment, the verify round's axis records in the prefill scratch -- so on the
+    // RTX 5090 profile's settings (8,192-token chunks, 589,824 tokens of context, three lanes,
+    // hq-e8-2b), with the MTP head drafting 3 and without, every line of a vision load is the text
+    // load's but a VRAM-resident embedding pool: the plan leaves the expert cache the same bytes.
+    {
+      const std::vector<Named> head_named = mtp_head_tensors();
+      const std::vector<ignis_bound_tensor> head = descriptors(head_named);
+      const auto lines = [&](bool mtp, bool with_vision, uint32_t residency, ignis_model_reservations *r) {
+        std::vector<ignis_bound_tensor> set = text_tensors;
+        if (mtp) set.insert(set.end(), head.begin(), head.end());
+        if (with_vision) {
+          for (const ignis_bound_tensor &t : tower_descriptors(tower)) set.push_back(t);
+        }
+        ignis_model_load_options o{};
+        o.size = sizeof(o);
+        o.decode_lanes = 3;
+        if (mtp) {
+          o.speculative_backend = IGNIS_SPECULATIVE_MTP;
+          o.draft_tokens = 3;
+        }
+        if (with_vision) {
+          o.vision_max_tokens = 32768;
+          o.vision_residency = residency;
+        }
+        *r = ignis_model_reservations{};
+        const int32_t rc = ignis_model_plan_reservations(set.data(), set.size(), &topology, 8192, 589824,
+                                                         IGNIS_KV_FORMAT_HQ_E8_2B, &o, r);
+        return rc == 0 ? std::string("(planned)") : std::string(ignis_model_last_error());
+      };
+      for (const bool mtp : {false, true}) {
+        ignis_model_reservations text{}, host{}, device{};
+        const std::string a = lines(mtp, false, 0, &text);
+        const std::string b = lines(mtp, true, IGNIS_VISION_RESIDENCY_HOST, &host);
+        const std::string c = lines(mtp, true, IGNIS_VISION_RESIDENCY_DEVICE, &device);
+        const auto same = [&](const ignis_model_reservations &v) {
+          return v.workspace_bytes == text.workspace_bytes && v.sampling_bytes == text.sampling_bytes &&
+                 v.decode_graph_bytes == text.decode_graph_bytes && v.activation_bytes == text.activation_bytes &&
+                 v.verify_round_bytes == text.verify_round_bytes && v.drafter_round_bytes == text.drafter_round_bytes;
+        };
+        const std::string at = std::string(mtp ? "MTP" : "no speculation") + " at the RTX 5090's settings";
+        check(a == "(planned)" && b == "(planned)" && c == "(planned)",
+              at + ": planned: \"" + a + "\", \"" + b + "\", \"" + c + "\"");
+        check(same(host) && host.media_embedding_bytes == 0,
+              at + ": a host vision load plans every line of the text load's: activations " +
+                  std::to_string(host.activation_bytes) + " against " + std::to_string(text.activation_bytes) +
+                  ", decode graph " + std::to_string(host.decode_graph_bytes) + " against " +
+                  std::to_string(text.decode_graph_bytes) + ", verify round " +
+                  std::to_string(host.verify_round_bytes) + " against " + std::to_string(text.verify_round_bytes));
+        // The pool of a 32,768-token envelope at 2,560 BF16 columns: 256 pages of 128.
+        check(same(device) && device.media_embedding_bytes == 167772160,
+              at + ": a device vision load adds its embedding pool alone: " +
+                  std::to_string(device.media_embedding_bytes));
+        check(!mtp || text.verify_round_bytes > 0, at + ": the MTP load plans its verify round");
+        std::printf("  %s: workspace %llu, decode graph %llu, activations %llu, verify round %llu bytes, "
+                    "vision on or off\n",
+                    at.c_str(), static_cast<unsigned long long>(text.workspace_bytes),
+                    static_cast<unsigned long long>(text.decode_graph_bytes),
+                    static_cast<unsigned long long>(text.activation_bytes),
+                    static_cast<unsigned long long>(text.verify_round_bytes));
+      }
+    }
+    // GitHub #557, #558 (ADR 0087): the encode takes no VRAM of its own. Its
+    // share -- the encoder's workspace for one item, and under the host
+    // residency the tower's three staging slots -- is held by the prefill
+    // scratch the text sizes, whose line does not move, and by the expert
+    // staging ring the plan places, idle between forwards; the item bound is
+    // the largest item that fits there, at most the one asked for. With no
+    // ring (a card that holds every expert) the scratch alone bounds it, and a
+    // host tower's slots leave it no larger. Printed for the plan's record.
     uint32_t item = 0;
-    const auto item_bound = [&](const ignis_model_load_options *options) {
+    const auto item_bound = [&](const ignis_model_load_options *options, uint64_t ring = 0, uint32_t chunk = 8192) {
       item = 0;
-      const int32_t rc = ignis_model_plan_vision_item_max_tokens(tensors.data(), tensors.size(), &topology, 8192,
-                                                                 131072, IGNIS_KV_FORMAT_HQ_E8_2B, options, &item);
+      const int32_t rc = ignis_model_plan_vision_item_max_tokens(tensors.data(), tensors.size(), &topology, chunk,
+                                                                 131072, IGNIS_KV_FORMAT_HQ_E8_2B, options, ring,
+                                                                 &item);
       return rc == 0 ? std::string("(planned)") : std::string(ignis_model_last_error());
     };
     vision.vision_embedding_pool_bytes = 0;
@@ -457,7 +542,25 @@ int main() {
                   static_cast<unsigned long long>(text_workspace));
     }
     check(bounds[IGNIS_VISION_RESIDENCY_HOST] <= bounds[IGNIS_VISION_RESIDENCY_DEVICE],
-          "a staged tower's ring leaves the item no larger");
+          "a staged tower's slots leave the item no larger");
+    // ADR 0087's RTX 5090 ring (1,574,895,616 bytes at the 2026-11-09 start)
+    // holds the processor's largest item under either residency, where a
+    // 1,024-token chunk's scratch alone holds no larger one.
+    constexpr uint64_t kRtx5090Ring = 1574895616;
+    for (const uint32_t residency : {IGNIS_VISION_RESIDENCY_DEVICE, IGNIS_VISION_RESIDENCY_HOST}) {
+      vision.vision_residency = residency;
+      const std::string alone = item_bound(&vision, 0, 1024);
+      const uint32_t scratch_alone = item;
+      const std::string lent = item_bound(&vision, kRtx5090Ring, 1024);
+      check(alone == "(planned)" && lent == "(planned)" && item == 16384 && scratch_alone <= item,
+            "the ring lends a 1,024-token chunk's encode the largest item, residency " + std::to_string(residency) +
+                ": got \"" + alone + "\", \"" + lent + "\", " + std::to_string(scratch_alone) + " then " +
+                std::to_string(item) + " tokens");
+      std::printf("  item bound at a 1,024-token chunk, residency %u: %u merged tokens in its prefill scratch alone, "
+                  "%u with the RTX 5090's expert staging ring\n",
+                  residency, scratch_alone, item);
+    }
+    vision.vision_residency = IGNIS_VISION_RESIDENCY_HOST;
     vision.vision_item_max_tokens = 64;
     check(item_bound(&vision) == "(planned)" && item == 64, "an item bound the scratch holds is kept");
     tensors = text_tensors;

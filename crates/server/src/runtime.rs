@@ -689,10 +689,10 @@ pub fn flash_next_vision_host_bytes(
 /// under the `device` residency the companion's tower, `tower_device_bytes`,
 /// on the weights line and the embedding pool the leaf's plan places in VRAM,
 /// `media_embedding_bytes`, on a line of its own; under `host` both are 0,
-/// and the encode's share is held by the prefill scratch the text sizes. So
-/// a host vision load plans the expert cache a text-only load does, but for
-/// the forward's vision inputs among the activations (a chunk's three axes
-/// and media rows, a round's rope deltas).
+/// and the encode's share is held by the prefill scratch the text sizes and
+/// the expert staging ring (GitHub #558). The leaf's reservations are a text
+/// load's line for line, so a host vision load plans the expert cache a
+/// text-only load does.
 pub fn with_flash_next_vision(
     lines: ignis_core::VramLines, tower_device_bytes: u64, media_embedding_bytes: u64,
 ) -> ignis_core::VramLines {
@@ -966,7 +966,8 @@ pub fn log_vram_warnings(plan: &ignis_core::VramPlan) {
 /// rate its split expects, the lanes and the speculation, and what of the free
 /// memory this process already held (GitHub #324). With vision (GitHub #557,
 /// ADR 0087), where it keeps its tower and pool, the pool's VRAM line, and
-/// the item bound the prefill scratch holds, which the processor serves.
+/// the item bound the prefill scratch and the staging ring hold (GitHub
+/// #558), which the processor serves.
 pub fn log_flash_next_plan(
     plan: &ignis_core::VramPlan, expected_hit_rate: f64, lanes: u32, speculation: &str, process_held_bytes: u64,
     vision: Option<ignis_core::Vision>,
@@ -1584,18 +1585,13 @@ pub(crate) fn flash_next_load(
     // expert cache, which the plan below decides: one budget for the pool the
     // plan charges and the pool the leaf builds.
     let mut options = flash_next_engine_options(&shape, lanes, speculation, ngram_cache);
-    let (reserved, item_max_tokens) = ignis_core::model_load::plan_flash_next(
+    let reserved = ignis_core::model_load::plan_flash_next_reservations(
         &plan,
         &geometry,
         options.load_shape(),
         mtp_plan.as_ref(),
         tower.as_ref().map(|(tower, _)| tower),
     )?;
-    // GitHub #557 (ADR 0087): the encode runs in the prefill scratch the
-    // text sizes, so the item bound is the largest item that holds on its
-    // own, at most the processor's: the load runs at it, and serves it.
-    let shape = EngineShape { vision: shape.vision.map(|vision| vision.with_item_max_tokens(item_max_tokens)), ..shape };
-    options.vision = shape.vision;
     // The sequence pool at any page count (ADR 0045): the lanes' state, the
     // retained slots, the residual window and the n-gram state do not move
     // with it; the arena its pages take -- KV and the indexer's keys, both
@@ -1655,6 +1651,21 @@ pub(crate) fn flash_next_load(
     })
     .map_err(|e| e.to_string())?;
     let indexer_bytes = pool_plan_at(vram.kv_page_count)?.indexer_bytes;
+    // GitHub #557, #558 (ADR 0087): the encode runs in the prefill scratch
+    // the text sizes and the expert staging ring this plan placed (none on
+    // the resident branch), both idle while an item encodes, so the item
+    // bound is the largest item those hold, at most the processor's: the
+    // load runs at it, and serves it. It moves no line of the plan.
+    let item_max_tokens = ignis_core::model_load::plan_flash_next_item_bound(
+        &plan,
+        &geometry,
+        options.load_shape(),
+        mtp_plan.as_ref(),
+        tower.as_ref().map(|(tower, _)| tower),
+        vram.staging_ring_bytes,
+    )?;
+    let shape = EngineShape { vision: shape.vision.map(|vision| vision.with_item_max_tokens(item_max_tokens)), ..shape };
+    options.vision = shape.vision;
     // The expert cache's floor and class minimum, at plan time: what the
     // plan left it, split by the calibration traffic as the leaf will split
     // it. Below the floor only with --vram-allow-expert-cache-below-floor; below
@@ -3126,55 +3137,83 @@ mod tests {
         assert_eq!(field("kv_pool_pages"), (rest - 4_096) / PAGE);
     }
 
-    /// GitHub #557 (ADR 0087): a Flash-Next vision load plans the expert cache
-    /// a text-only load at the same settings does. Under the host residency
-    /// the tower and the embedding pool are host lines and the encode runs in
-    /// the prefill scratch the text sizes, so the only VRAM vision adds is
-    /// the forward's vision inputs among the activations -- a chunk's three
-    /// axes and media rows, a round's rope deltas: 131,328 bytes at an
-    /// 8,192-token chunk and three lanes (the leaf's bind test pins them) --
-    /// which the offloaded branch's cache gives up; under the device
-    /// residency the tower's weights and the pool are VRAM lines too.
+    /// GitHub #557, #558 (ADR 0087): on the RTX 5090 profile's settings a
+    /// Flash-Next vision load plans the expert cache a text-only load does,
+    /// with the MTP head and without. Vision moves nothing the plan reads:
+    /// the shapes differ in their vision alone, the leaf's reservations are a
+    /// text load's line for line (the leaf's bind test pins them at these
+    /// settings: a chunk's vision inputs ride in the decode graph scratch, a
+    /// round's rope deltas in the positions' alignment, the verify round's
+    /// axis records in the prefill scratch), and under the host residency the
+    /// tower and the embedding pool are host lines. Under the device residency
+    /// the tower's weights and the pool are VRAM lines, out of the cache.
     #[test]
-    fn a_flash_next_vision_load_plans_the_text_loads_expert_cache_but_for_the_vision_inputs() {
+    fn a_flash_next_vision_load_plans_the_text_loads_expert_cache_on_the_rtx5090_profile() {
+        use ignis_core::compute::ModelFamily;
         const PAGE: u64 = 4_224 * 64;
-        const VISION_INPUTS: u64 = 3 * 8_192 * 4 + 8_192 * 4 + 256;
         let arena = |pages: u32| 4_096 + u64::from(pages) * PAGE;
-        let text = ignis_core::VramLines { weights: 5 << 30, workspace: 2 << 30, lane_state: 400 << 20, ..Default::default() };
-        let plan = |lines: ignis_core::VramLines| {
-            ignis_core::plan_vram(&ignis_core::VramRequest {
-                mode: ignis_core::VramMode::Derived { headroom_bytes: 1536 << 20 },
-                free_at_start_bytes: 31 << 30,
-                lines,
-                kv_page_bytes: PAGE,
-                max_context_tokens: 262_144,
-                retained_slots: 8,
-                kv_pool: None,
-                residency: ignis_core::Residency::Experts(ignis_core::ExpertResidency {
-                    expert_pool_bytes: 37 << 30,
-                    staging_ring_bytes: 1_497 << 20,
-                    table_bytes: 3 << 20,
-                    decode_lanes: 3,
-                }),
-                embedding_pool_named: false,
-                kv_arena_bytes: &arena,
-                can_page: true,
-            })
-            .expect("fits")
+        let shape_of = |flags: &[&str]| {
+            let args: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
+            let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).expect("resolve") else {
+                panic!("expected a runnable config");
+            };
+            EngineShape::from(&config.for_family(ModelFamily::FlashNext).expect("Flash-Next")).for_family(ModelFamily::FlashNext)
         };
-        let text_only = plan(text);
-        assert_eq!(text_only.kv_pool_policy.as_str(), "offloaded");
-        let with_inputs = ignis_core::VramLines { workspace: text.workspace + VISION_INPUTS, ..text };
-        let host = plan(with_flash_next_vision(with_inputs, 0, 0));
-        assert_eq!(host.lines.weights, text.weights, "the tower is a host line");
-        assert_eq!(host.lines.media_embedding, 0, "and so is the pool");
-        assert_eq!((host.kv_page_count, host.staging_ring_bytes), (text_only.kv_page_count, text_only.staging_ring_bytes));
-        assert_eq!(text_only.expert_cache_bytes - host.expert_cache_bytes, VISION_INPUTS, "the vision inputs alone");
-        const TOWER: u64 = 280 << 20;
-        const POOL: u64 = 160 << 20;
-        let device = plan(with_flash_next_vision(with_inputs, TOWER, POOL));
-        assert_eq!((device.lines.weights, device.lines.media_embedding), (text.weights + TOWER, POOL));
-        assert_eq!(text_only.expert_cache_bytes - device.expert_cache_bytes, VISION_INPUTS + TOWER + POOL);
+        for mtp in [false, true] {
+            let spec: &[&str] = if mtp { &["--qwen38flashnext-spec-backend", "mtp"] } else { &[] };
+            let text = shape_of(spec);
+            let vision = shape_of(&[spec, &["--qwen38flashnext-vision-enabled"]].concat());
+            assert!(text.vision.is_none(), "every built-in profile leaves Flash-Next's vision off");
+            let on = vision.vision.expect("vision on");
+            assert_eq!(on.residency(), ignis_core::VisionResidency::Host, "the rtx5090 profile's residency");
+            assert_eq!(EngineShape { vision: None, ..vision }, text, "MTP {mtp}: the shapes differ in their vision alone");
+            assert_eq!((text.max_context, text.prefill_chunk), (589_824, 8_192), "the profile's settings");
+            let lanes = text.decode_lanes_for(ModelFamily::FlashNext);
+            assert_eq!(lanes, 3);
+            // A text load's lines at these settings, the MTP head's weights and verify round with it.
+            let lines = ignis_core::VramLines {
+                weights: (5 << 30) + if mtp { 900 << 20 } else { 0 },
+                workspace: 2 << 30,
+                verify_round: if mtp { 6 << 20 } else { 0 },
+                lane_state: 400 << 20,
+                ..Default::default()
+            };
+            let plan = |shape: &EngineShape, lines: ignis_core::VramLines| {
+                ignis_core::plan_vram(&ignis_core::VramRequest {
+                    mode: shape.vram,
+                    free_at_start_bytes: 31 << 30,
+                    lines,
+                    kv_page_bytes: PAGE,
+                    max_context_tokens: shape.max_context,
+                    retained_slots: 8,
+                    kv_pool: shape.kv_pool,
+                    residency: ignis_core::Residency::Experts(ignis_core::ExpertResidency {
+                        expert_pool_bytes: 37 << 30,
+                        staging_ring_bytes: 1_497 << 20,
+                        table_bytes: 3 << 20,
+                        decode_lanes: lanes,
+                    }),
+                    embedding_pool_named: false,
+                    kv_arena_bytes: &arena,
+                    can_page: true,
+                })
+                .expect("fits")
+            };
+            let text_only = plan(&text, lines);
+            assert_eq!(text_only.kv_pool_policy.as_str(), "offloaded", "a 32 GB card offloads");
+            let host = plan(&vision, with_flash_next_vision(lines, 0, 0));
+            assert_eq!(host.lines, text_only.lines, "MTP {mtp}: no VRAM line of its own");
+            assert_eq!(
+                (host.expert_cache_bytes, host.kv_page_count, host.staging_ring_bytes),
+                (text_only.expert_cache_bytes, text_only.kv_page_count, text_only.staging_ring_bytes),
+                "MTP {mtp}: the same expert cache, KV pool and ring"
+            );
+            const TOWER: u64 = 283_180_544;
+            const POOL: u64 = 160 << 20;
+            let device = plan(&vision, with_flash_next_vision(lines, TOWER, POOL));
+            assert_eq!((device.lines.weights, device.lines.media_embedding), (lines.weights + TOWER, POOL));
+            assert_eq!(text_only.expert_cache_bytes - device.expert_cache_bytes, TOWER + POOL, "MTP {mtp}: device");
+        }
     }
 
     /// GitHub #557 (ADR 0087): what a Flash-Next vision load pins in host
