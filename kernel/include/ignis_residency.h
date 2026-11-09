@@ -27,6 +27,15 @@
  * forward restarted at that layer), the step treats them as released before it classifies, as
  * the policy would. No outcome differs either way.
  *
+ * Between forwards the staging ring holds nothing live (GitHub #558, ADR 0087), so a caller may
+ * write it then -- Flash-Next's media encode does: only a prefill step stages (a decode step's
+ * miss takes a victim, its prefetch a victim or nothing), a staged projection is read only by the
+ * step of its own layer that follows the step that staged it, and a forward's last layer looks
+ * ahead at nothing; what that layer staged is released by whichever step runs next, before it
+ * classifies. Once the caller's stream has passed the last layer's expert op and
+ * `ignis_residency_join` (a step joins its predecessor's fork itself), no copy into the ring is
+ * in flight and none of its bytes is read again.
+ *
  * Slot-table rule: a projection that is neither resident nor staged for its layer has the entry
  * `{NULL, 0}` (ignis_moe.h's ABSENT): at creation, after an eviction (written in the same step
  * that hands the slot on) and after its staging is released. The expert ops trap on a selected

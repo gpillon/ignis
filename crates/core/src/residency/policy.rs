@@ -350,6 +350,14 @@ impl ResidencyModel {
         self.catalog.contains(id) && self.pinned_at(&id)
     }
 
+    /// The projections the staging ring holds between steps: within a
+    /// prefill forward, the next layer's its lookahead staged; none once a
+    /// forward's last layer ran (it looks ahead at nothing), so an image
+    /// encode may borrow the ring between forwards (GitHub #558, ADR 0087).
+    pub fn staged_len(&self) -> usize {
+        self.staged.len()
+    }
+
     /// Pinned projections per class, indexed like [`KClass::ALL`]: the
     /// slots each class's pool holds past the LRU's capacity.
     pub fn pinned_counts(&self) -> [u32; KClass::COUNT] {
