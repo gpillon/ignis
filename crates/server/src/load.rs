@@ -412,7 +412,7 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
 /// [`ignis_core::flash_next_vision::Companion::open`]): its pair pin, its
 /// identity and the width its merger writes, against Flash-Next's hidden
 /// width. Nothing of the tower is read.
-fn check_vision_companion(artifact: &std::path::Path) -> Result<(), LoadError> {
+pub(crate) fn check_vision_companion(artifact: &std::path::Path) -> Result<(), LoadError> {
     let main = ignis_artifact::Reader::open(artifact).map_err(|e| LoadError::ArtifactInvalid(e.to_string()))?;
     let geometry = ignis_artifact::flash_next::FlashNextGeometry::qwen38_flash_next();
     let hidden = ignis_core::compute::ModelConfig::flash_next_from(&geometry).hidden;

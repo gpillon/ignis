@@ -119,6 +119,17 @@ pub trait ModelLoader: Send + Sync {
     fn family_of(&self, target: &ModelSource) -> Option<ModelFamily> {
         ModelFamily::of_model_id(&target.model)
     }
+
+    /// Why a switch to `target` cannot succeed for want of a file beside its
+    /// artifact, when that can be told by looking at the files alone (#563):
+    /// with vision on, Flash-Next's vision companion missing or not its
+    /// own. What `POST /v1/models/switch` answers `409` with, naming the
+    /// file, before anything is prepared or torn down. `None` when the
+    /// switch lacks nothing, and by default.
+    fn companion_refusal(&self, target: &ModelSource) -> Option<String> {
+        let _ = target;
+        None
+    }
 }
 
 /// A target [`ModelLoader::prepare`] accepted: what is left is the load
@@ -198,6 +209,19 @@ impl ModelLoader for ArtifactLoader {
     /// be read, or one of no family.
     fn family_of(&self, target: &ModelSource) -> Option<ModelFamily> {
         crate::loader::artifact_family(&target.artifact).ok().flatten()
+    }
+
+    /// The load's own prepare-time check of the vision companion, asked
+    /// early: Flash-Next with vision on in the configuration this switch
+    /// would load it with ([`load_options`]).
+    fn companion_refusal(&self, target: &ModelSource) -> Option<String> {
+        let family = crate::loader::artifact_family(&target.artifact).ok().flatten()?;
+        if family != ModelFamily::FlashNext {
+            return None;
+        }
+        let options = load_options(&self.state.current(), target, family, None).ok()?;
+        options.vision.as_ref()?;
+        crate::load::check_vision_companion(&target.artifact).err().map(|refusal| refusal.to_string())
     }
 }
 
@@ -735,6 +759,13 @@ impl Switcher {
         self.settled.store(true, Ordering::SeqCst);
         *self.last.lock().expect("last switch lock") =
             Some(LastSwitch { from: from.to_owned(), to: to.to_owned(), outcome: outcome.clone(), host_plan });
+    }
+
+    /// Why a switch to `target` is refused for a file missing beside its
+    /// artifact ([`ModelLoader::companion_refusal`]). Reads files: called on
+    /// `spawn_blocking`.
+    pub fn companion_refusal(&self, target: &ModelSource) -> Option<String> {
+        self.loader.companion_refusal(target)
     }
 
     /// The kind of the model a request naming `model` would be served by, if
@@ -2081,6 +2112,31 @@ mod tests {
             "materialize weights: out of memory".to_owned(),
         )));
         assert_eq!(other, LoadFailure { reason: "materialize weights: out of memory".to_owned(), host_plan: None });
+    }
+
+    /// GitHub #563: the production loader's early refusal names the vision
+    /// companion's file for a Flash-Next target with vision on and none
+    /// beside it, and nothing otherwise: not with vision off, not once the
+    /// companion is there (its width is the load's own check, still asked at
+    /// prepare), not for a target that is not Flash-Next.
+    #[test]
+    fn the_artifact_loader_refuses_a_flash_next_target_without_its_companion_by_name() {
+        use ignis_artifact::packer::VISION_ARTIFACT_FILE_NAME;
+        let loader = |vision: bool| {
+            let args: Vec<String> = ["--profile", "none"].into_iter().chain(vision.then_some("--vision-enabled")).map(String::from).collect();
+            let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).unwrap() else { panic!("a config") };
+            ArtifactLoader::new(config)
+        };
+        let main = ignis_artifact::flash_next::fixture::build("switch-vision-companion").expect("the main fixture");
+        let target = ModelSource { artifact: main.path.clone(), model: "qwen3.8-flash-next".to_owned() };
+        assert_eq!(loader(false).companion_refusal(&target), None, "vision off asks for no companion");
+        let refusal = loader(true).companion_refusal(&target).expect("no companion is refused");
+        assert!(refusal.contains(VISION_ARTIFACT_FILE_NAME), "{refusal}");
+        main.with_vision_companion().expect("its vision companion");
+        let width = loader(true).companion_refusal(&target).expect("the fixture's merger is not Flash-Next's width");
+        assert!(width.contains(VISION_ARTIFACT_FILE_NAME) && !width.contains("is missing"), "{width}");
+        let missing = ModelSource { artifact: main.path.with_file_name("not-there.ninfer"), model: "other".to_owned() };
+        assert_eq!(loader(true).companion_refusal(&missing), None, "a file that is no artifact lacks nothing here; prepare says so");
     }
 
     fn logged(run: impl FnOnce()) -> Vec<serde_json::Value> {

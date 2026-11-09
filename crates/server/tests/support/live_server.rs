@@ -242,6 +242,12 @@ impl SwitchingLiveServer {
         started.elapsed()
     }
 
+    /// Drive `future` on the server's own runtime, for a client call a test
+    /// makes itself.
+    pub fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.runtime.as_ref().expect("serving").block_on(future)
+    }
+
     /// One short chat completion on the loaded model, answered `200`.
     pub fn completes(&self, model: &str) {
         let status = self.runtime.as_ref().expect("serving").block_on(async {

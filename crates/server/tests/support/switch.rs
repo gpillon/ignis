@@ -91,6 +91,11 @@ struct State {
     /// How many times [`ModelLoader::kind_of`] was asked: what a production
     /// loader answers by opening the artifact.
     kind_of_calls: AtomicUsize,
+    /// What each id's model takes images with ([`MockLoader::vision`]): the
+    /// model is built with this acquirer, as a load with vision on is.
+    media: Mutex<std::collections::HashMap<String, Arc<ignis_server::media::MediaAcquirer>>>,
+    /// Ids whose vision companion is missing ([`MockLoader::without_companion`]).
+    without_companion: Mutex<HashSet<String>>,
     /// The family each id's artifact header names ([`MockLoader::header`]);
     /// an id not here is of the family whose own id it is, or of none.
     headers: Mutex<std::collections::HashMap<String, ModelFamily>>,
@@ -155,6 +160,18 @@ impl MockLoader {
     /// Refuse `id` at prepare, as a path with no file would be.
     pub fn refuse(&self, id: &str) {
         self.state.refused.lock().unwrap().insert(id.to_owned());
+    }
+
+    /// Build `id`'s model, whenever it is loaded, taking images with
+    /// `acquirer`: a load with vision on.
+    pub fn vision(&self, id: &str, acquirer: Arc<ignis_server::media::MediaAcquirer>) {
+        self.state.media.lock().unwrap().insert(id.to_owned(), acquirer);
+    }
+
+    /// Leave `id`'s vision companion missing: a switch to it is refused for
+    /// the file ([`ModelLoader::companion_refusal`]).
+    pub fn without_companion(&self, id: &str) {
+        self.state.without_companion.lock().unwrap().insert(id.to_owned());
     }
 
     /// Fail `id`'s load after prepare accepted it, as a kernel load error
@@ -308,7 +325,11 @@ fn build(state: &State, id: &str, compute: Arc<dyn Compute>) -> ActiveModel {
         Box::new(scheduler)
     };
     let (engine, driver) = Engine::with_clock_and_driver(scheduler, Arc::new(SystemClock));
-    ActiveModel::new(engine, Arc::new(SimpleTemplateProvider)).with_driver(driver).with_source(source(id))
+    let model = ActiveModel::new(engine, Arc::new(SimpleTemplateProvider)).with_driver(driver).with_source(source(id));
+    match state.media.lock().unwrap().get(id) {
+        Some(acquirer) => model.with_media(Arc::clone(acquirer)),
+        None => model,
+    }
 }
 
 /// The mock's scheduler, except that every request it takes ends with
@@ -392,6 +413,12 @@ impl ModelLoader for MockLoader {
     fn kind_of(&self, target: &ModelSource) -> Option<ignis_core::compute::ModelKind> {
         self.state.kind_of_calls.fetch_add(1, Ordering::SeqCst);
         ModelFamily::of_model_id(&target.model).map(ModelFamily::kind)
+    }
+
+    /// The file a switch to an id with no companion lacks.
+    fn companion_refusal(&self, target: &ModelSource) -> Option<String> {
+        let missing = self.state.without_companion.lock().unwrap().contains(&target.model);
+        missing.then(|| format!("{}: the vision companion {}.vision is not beside it", target.model, target.artifact.display()))
     }
 
     /// The family [`MockLoader::header`] gave the id, else the default's.

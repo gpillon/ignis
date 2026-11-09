@@ -136,7 +136,7 @@ pub(crate) async fn connect(
         .map(str::to_owned)
         .collect();
     // A frame may carry what a request body may.
-    let limit = if server.active().media.is_some() { api::MEDIA_REQUEST_BODY_LIMIT } else { api::TEXT_REQUEST_BODY_LIMIT };
+    let limit = api::request_body_limit(server.active().media.is_some());
     upgrade
         .protocols(protocols)
         .max_message_size(limit)
