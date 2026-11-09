@@ -13,6 +13,9 @@
 //!   The first row attends to itself alone, and a softmax over one key is 1
 //!   whatever the table makes of its score, so it must stay the capture's.
 //!   The argmax agreement with `none` is printed, not judged.
+//! - **Vision on is the capture too** (GitHub #557): the same prompt on a
+//!   load with Flash-Next's embedding pool, host and device, a text span
+//!   taking the text path -- every row's hash the capture's.
 //!
 //! The capture is per row: the SHA-256 of the row's BF16 logits and its
 //! argmax. It is committed, `tests/fixtures/flash_next/none_logits_2560.txt`,
@@ -46,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ignis_core::flash_next::{EngineOptions, FlashNextEngine};
-use ignis_core::{gpu_profile, KvFormat, RopeScaling};
+use ignis_core::{gpu_profile, KvFormat, RopeScaling, Vision, VisionResidency};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -274,6 +277,25 @@ fn a_none_load_gives_the_logits_recorded_before_the_change() {
     let differing: Vec<usize> = (0..none.len()).filter(|&i| none[i] != recorded[i]).collect();
     println!("none against the capture: {} of {} rows differ", differing.len(), none.len());
     assert!(differing.is_empty(), "a none load moved rows {:?}", &differing[..differing.len().min(16)]);
+}
+
+/// GitHub #557: vision on (its embedding pool, host and device) moves no row
+/// of a text span from the capture: a span without media takes the text path.
+#[test]
+#[ignore = "GPU, logits-capture feature: bit-exact on the recording card and driver only"]
+fn a_vision_load_gives_the_none_capture() {
+    let dir = model_dir();
+    let Some(tokens) = prompt(&dir) else { return };
+    let Some(recorded) = recorded_capture() else { return };
+    for residency in [VisionResidency::Host, VisionResidency::Device] {
+        let vision = Vision::new(8192).expect("an envelope").with_residency(residency);
+        let options = EngineOptions { vision: Some(vision), ..options() };
+        let Some(rows) = rows(&dir, options, &tokens) else { return };
+        assert_eq!(recorded.len(), rows.len(), "the capture's rows");
+        let differing: Vec<usize> = (0..rows.len()).filter(|&i| rows[i] != recorded[i]).collect();
+        println!("vision ({residency:?}) against the capture: {} of {} rows differ", differing.len(), rows.len());
+        assert!(differing.is_empty(), "a vision load ({residency:?}) moved rows {:?}", &differing[..differing.len().min(16)]);
+    }
 }
 
 #[test]

@@ -18,8 +18,12 @@
 //! prefix and a checkpoint keep the context at their end, and every blob
 //! carries it in a block before the pool's own bytes.
 //!
-//! What it does not serve (spec flash-next/04): vision and attention
-//! readouts.
+//! A span of a multimodal prompt (GitHub #557, ADR 0087) runs on a load
+//! with vision: its three-axis positions, its rope delta and the media
+//! columns over its placeholders. The media encode is the vision
+//! companion's, which this leaf does not bind yet: `encode_media` refuses.
+//!
+//! What it does not serve (spec flash-next/04): attention readouts.
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -42,7 +46,10 @@ use ignis_core::types::{DecodeParams, SpecCounters, TokenId};
 use ignis_core::{ArtifactHash, BlobIdentity};
 
 use crate::cuda_leaf::{close_id, redirect_stop_ids, step_redirect};
-use crate::{AttentionRead, DecodeLane, DrawRedirect, LaneRun, ReservedBytes, RuntimeStats, StepLeaf, TransferWindow};
+use crate::{
+    AttentionRead, DecodeLane, DrawRedirect, LaneRun, MultimodalSpan, ReservedBytes, RuntimeStats, StepLeaf,
+    TransferWindow,
+};
 
 /// The block before the pool's bytes in a Flash-Next blob: the n-gram
 /// context's token count and tokens, `u32` little-endian, zero-padded to
@@ -345,6 +352,58 @@ impl FlashNextLeaf {
         Ok(rows)
     }
 
+    /// One prefill span, a text one or (GitHub #557, `span`) one of a
+    /// multimodal prompt: its n-gram rows staged on the sequence's context,
+    /// which moves only with a span that ran -- a failed one leaves the
+    /// sequence as it was.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_span(
+        &self,
+        model: &FlashNextModel,
+        sequence: &mut FlashNextSequence,
+        tokens: &[TokenId],
+        start_position: u32,
+        next_prompt_token: Option<TokenId>,
+        keeps_draw: bool,
+        params: DecodeParams,
+        permitted: &[TokenId],
+        mut redirect: Option<&mut DrawRedirect<'_>>,
+        span: Option<step::MultimodalPrefill<'_>>,
+        out_logits: Option<&mut [f32]>,
+    ) -> Result<f32, i32> {
+        let mut context = sequence.context.clone();
+        let rows = self.rows_for(&mut context, tokens).map_err(|e| leaf_error("n-gram rows", e))?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let permitted: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
+        let stop_ids = redirect_stop_ids(redirect.as_deref());
+        let drawn = step::prefill_flash_next(
+            &model.model,
+            &model.pool,
+            &mut sequence.seq,
+            &ids,
+            u64::from(start_position),
+            // GitHub #519, #520: an intermediate span draws nothing unless an
+            // image retains it; an MTP load's entry at its last position takes
+            // the next prompt token.
+            next_prompt_token,
+            keeps_draw,
+            sampling_params(params),
+            &permitted,
+            step_redirect(redirect.as_deref(), &stop_ids),
+            &rows,
+            span,
+            None,
+            out_logits,
+        )
+        .map_err(|e| leaf_error("prefill", e))?;
+        sequence.context = context;
+        sequence.drafts.clear();
+        if let Some(redirect) = redirect.as_deref_mut() {
+            redirect.redirected = drawn.redirected;
+        }
+        Ok(drawn.probability)
+    }
+
     /// A blob's bytes: the context block, then the pool's `pool_bytes`.
     fn blob_bytes(pool_bytes: u64) -> u64 {
         CONTEXT_BLOCK_BYTES as u64 + pool_bytes
@@ -402,7 +461,9 @@ impl StepLeaf for FlashNextLeaf {
     type Prefix = FlashNextPrefix;
     type Checkpoint = FlashNextCheckpoint;
     type SnapshotBuf = ArenaBuffer;
-    type Media = ();
+    // GitHub #557: an embedding in the load's pool, the 27B's handle; its
+    // encode is the vision companion's (`encode_media` refuses until it binds).
+    type Media = step::MediaEmbedding<'static>;
 
     fn load_model(&self) -> Result<Self::Model, i32> {
         let o = &self.options;
@@ -604,45 +665,74 @@ impl StepLeaf for FlashNextLeaf {
         keeps_draw: bool,
         params: DecodeParams,
         permitted: &[TokenId],
-        mut redirect: Option<&mut DrawRedirect<'_>>,
+        redirect: Option<&mut DrawRedirect<'_>>,
         out_logits: Option<&mut [f32]>,
         attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32> {
         if attention.is_some() {
             return Err(leaf_error("prefill", "Qwen3.8-Flash-Next serves no attention readouts".to_string()));
         }
-        // The context moves only with a span that ran: a failed one leaves
-        // the sequence as it was.
-        let mut context = sequence.context.clone();
-        let rows = self.rows_for(&mut context, tokens).map_err(|e| leaf_error("n-gram rows", e))?;
-        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let permitted: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
-        let stop_ids = redirect_stop_ids(redirect.as_deref());
-        let drawn = step::prefill_flash_next(
-            &model.model,
-            &model.pool,
-            &mut sequence.seq,
-            &ids,
-            u64::from(start_position),
-            // GitHub #519, #520: an intermediate span draws nothing unless an
-            // image retains it; an MTP load's entry at its last position takes
-            // the next prompt token.
+        self.prefill_span(
+            model,
+            sequence,
+            tokens,
+            start_position,
             next_prompt_token,
             keeps_draw,
-            sampling_params(params),
-            &permitted,
-            step_redirect(redirect.as_deref(), &stop_ids),
-            &rows,
+            params,
+            permitted,
+            redirect,
             None,
             out_logits,
         )
-        .map_err(|e| leaf_error("prefill", e))?;
-        sequence.context = context;
-        sequence.drafts.clear();
-        if let Some(redirect) = redirect.as_deref_mut() {
-            redirect.redirected = drawn.redirected;
+    }
+
+    /// GitHub #557: a span of a multimodal prompt, on a load with vision --
+    /// its three-axis positions, its rope delta and the media columns over
+    /// its placeholders (the n-gram rows hash the placeholders' ids, as the
+    /// checkpoint's own does). The drafter floor is the 27B's, the readouts
+    /// stay the 27B's.
+    fn prefill_multimodal(
+        &self,
+        model: &Self::Model,
+        sequence: &mut Self::Sequence,
+        tokens: &[TokenId],
+        start_position: u32,
+        _drafter_floor: u32,
+        next_prompt_token: Option<TokenId>,
+        keeps_draw: bool,
+        params: DecodeParams,
+        permitted: &[TokenId],
+        redirect: Option<&mut DrawRedirect<'_>>,
+        span: MultimodalSpan<'_, Self::Media>,
+        out_logits: Option<&mut [f32]>,
+        attention: Option<&mut AttentionRead>,
+    ) -> Result<f32, i32> {
+        if attention.is_some() {
+            return Err(leaf_error("prefill", "Qwen3.8-Flash-Next serves no attention readouts".to_string()));
         }
-        Ok(drawn.probability)
+        let span = step::MultimodalPrefill {
+            positions: span.positions,
+            rope_delta: span.rope_delta,
+            media: span.media.map(|media| step::SpanMediaColumns {
+                embedding: media.embedding,
+                first_column: media.first_column,
+                scatter_indices: media.scatter_indices,
+            }),
+        };
+        self.prefill_span(
+            model,
+            sequence,
+            tokens,
+            start_position,
+            next_prompt_token,
+            keeps_draw,
+            params,
+            permitted,
+            redirect,
+            Some(span),
+            out_logits,
+        )
     }
 
     fn pending_token(&self, sequence: &Self::Sequence) -> Option<TokenId> {

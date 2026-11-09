@@ -976,37 +976,44 @@ pub struct FlashNextLoadShape {
     pub speculation: Option<FlashNextSpeculation>,
     /// The text rotary table (ADR 0059).
     pub rope_scaling: RopeScaling,
+    /// Vision (GitHub #557, ADR 0087): the media embedding pool the forward
+    /// reads image rows from, sized and placed as the 27B's; `None`: a text
+    /// load, exactly as before.
+    pub vision: Option<Vision>,
 }
 
 /// A Flash-Next load's options: its decode lanes, its borrowed residency
-/// (null when only planning), its speculation (spec flash-next/07) and its
-/// rotary table (ADR 0059); nothing else of the 27B's.
+/// (null when only planning), its speculation (spec flash-next/07), its
+/// rotary table (ADR 0059) and its vision (GitHub #557: the envelope, the
+/// pool, the item bound and the residency, crossed as the 27B's
+/// `load_options` crosses them); nothing else of the 27B's.
 fn flash_next_options(
     decode_lanes: u32,
     residency: *mut c_void,
     speculation: Option<FlashNextSpeculation>,
     rope_scaling: RopeScaling,
+    vision: Option<Vision>,
 ) -> ffi::IgnisModelLoadOptions {
     ffi::IgnisModelLoadOptions {
         size: std::mem::size_of::<ffi::IgnisModelLoadOptions>() as u32,
         speculative_backend: speculation.map_or(0, |s| s.backend().abi_code()),
         draft_tokens: speculation.map_or(0, |s| s.draft_tokens()),
-        vision_max_tokens: 0,
-        vision_embedding_pool_bytes: 0,
+        vision_max_tokens: vision.map_or(0, |v| v.max_tokens()),
+        vision_embedding_pool_bytes: vision.map_or(0, |v| v.requested_pool_bytes()),
         // As the 27B's `load_options` crosses them: `none` is the factor 0
         // the leaf reads as its linear table.
         rope_scaling_factor: rope_scaling.factor(),
         rope_scaling_temperature: rope_scaling.temperature(),
         rope_scaling_beta_fast: rope_scaling.beta_fast(),
         rope_scaling_beta_slow: rope_scaling.beta_slow(),
-        vision_item_max_tokens: 0,
+        vision_item_max_tokens: vision.map_or(0, |v| v.item_max_tokens()),
         attention_text_max_keys: 0,
         decode_lanes,
         residency,
         draft_row_budget: speculation.map_or(0, |s| s.row_budget()),
         mtp_expert_slots: std::ptr::null(),
         prefill_attention: PrefillAttention::default().abi_code(),
-        vision_residency: 0,
+        vision_residency: vision.map_or(0, |v| v.residency().abi_code()),
         prefill_linear: PrefillLinear::default().abi_code(),
     }
 }
@@ -1025,8 +1032,15 @@ pub fn load_flash_next(
     residency: &crate::residency::device::DeviceResidency,
     mtp: Option<&crate::flash_next_mtp::MtpHead>,
 ) -> Result<Model, String> {
-    let FlashNextLoadShape { prefill_chunk_tokens, max_context_tokens, kv_format, decode_lanes, speculation, rope_scaling } =
-        shape;
+    let FlashNextLoadShape {
+        prefill_chunk_tokens,
+        max_context_tokens,
+        kv_format,
+        decode_lanes,
+        speculation,
+        rope_scaling,
+        vision,
+    } = shape;
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
     let placement = |handle: ObjectHandle| {
         let view = artifact.device_view(handle).map_err(|e| e.to_string())?;
@@ -1034,7 +1048,7 @@ pub fn load_flash_next(
     };
     let (_names, tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
     let topology = ModelConfig::flash_next_from(geometry).topology_abi();
-    let mut options = flash_next_options(decode_lanes, residency.as_raw(), speculation, rope_scaling);
+    let mut options = flash_next_options(decode_lanes, residency.as_raw(), speculation, rope_scaling, vision);
     // Spec flash-next/07: the MTP head's tensors beside the trunk's, and its expert slots.
     let mut tensors = tensors;
     if let Some(head) = mtp {
@@ -1074,8 +1088,15 @@ pub fn plan_flash_next_reservations(
     shape: FlashNextLoadShape,
     mtp: Option<&ignis_artifact::flash_next::mtp::MtpPlan>,
 ) -> Result<IgnisModelReservations, String> {
-    let FlashNextLoadShape { prefill_chunk_tokens, max_context_tokens, kv_format, decode_lanes, speculation, rope_scaling } =
-        shape;
+    let FlashNextLoadShape {
+        prefill_chunk_tokens,
+        max_context_tokens,
+        kv_format,
+        decode_lanes,
+        speculation,
+        rope_scaling,
+        vision,
+    } = shape;
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
     let placement = |handle: ObjectHandle| {
         fn_plan
@@ -1101,7 +1122,7 @@ pub fn plan_flash_next_reservations(
     };
     tensors.extend(head);
     let topology = ModelConfig::flash_next_from(geometry).topology_abi();
-    let options = flash_next_options(decode_lanes, std::ptr::null_mut(), speculation, rope_scaling);
+    let options = flash_next_options(decode_lanes, std::ptr::null_mut(), speculation, rope_scaling, vision);
     let mut reservations = IgnisModelReservations::default();
     let rc = unsafe {
         ffi::ignis_model_plan_reservations(
@@ -1155,6 +1176,7 @@ mod tests {
                 decode_lanes: 3,
                 speculation: None,
                 rope_scaling: scaling,
+                vision: None,
             };
             let err = plan_flash_next_reservations(&fn_plan, &tree.geometry, shape, None)
                 .expect_err("the fixture's geometry is not one the program runs");
@@ -1425,10 +1447,10 @@ mod tests {
             [o.rope_scaling_factor, o.rope_scaling_temperature, o.rope_scaling_beta_fast, o.rope_scaling_beta_slow]
         };
         let scaling = RopeScaling::parse("yarn:2.25,t=0.25,bf=16,bs=2").unwrap();
-        let options = flash_next_options(3, std::ptr::null_mut(), None, scaling);
+        let options = flash_next_options(3, std::ptr::null_mut(), None, scaling, None);
         assert_eq!(scalars(&options), [2.25, 0.25, 16.0, 2.0]);
         assert_eq!(scalars(&options), scalars(&load_options(None, None, scaling, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options")), "the 27B's");
-        let none = flash_next_options(3, std::ptr::null_mut(), None, RopeScaling::NONE);
+        let none = flash_next_options(3, std::ptr::null_mut(), None, RopeScaling::NONE, None);
         assert_eq!(scalars(&none), [0.0, 0.1, 32.0, 1.0], "the factor 0 is the leaf's linear table");
         assert_eq!((none.decode_lanes, none.speculative_backend), (3, 0));
     }
@@ -1467,8 +1489,30 @@ mod tests {
         let with_vision = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
             .expect("options");
         assert_eq!(with_vision.prefill_attention, 0);
-        let flash = flash_next_options(3, std::ptr::null_mut(), None, RopeScaling::NONE);
+        let flash = flash_next_options(3, std::ptr::null_mut(), None, RopeScaling::NONE, None);
         assert_eq!(flash.prefill_attention, 0, "Flash-Next's attention is QSA");
+    }
+
+    /// GitHub #557: a Flash-Next load's vision crosses its envelope, pool,
+    /// item bound and residency as the 27B's `load_options` crosses them;
+    /// a text load crosses none of them.
+    #[test]
+    fn a_flash_next_load_crosses_its_vision_as_the_27bs() {
+        let vision = Vision::new(8192)
+            .unwrap()
+            .with_pool_bytes(50_000_000)
+            .with_item_max_tokens(4096)
+            .with_residency(VisionResidency::Host);
+        let fields = |o: &ffi::IgnisModelLoadOptions| {
+            (o.vision_max_tokens, o.vision_embedding_pool_bytes, o.vision_item_max_tokens, o.vision_residency)
+        };
+        let flash = flash_next_options(3, std::ptr::null_mut(), None, RopeScaling::NONE, Some(vision));
+        assert_eq!(fields(&flash), (8192, 50_000_000, 4096, 1));
+        let ours = load_options(None, Some(vision), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+            .expect("options");
+        assert_eq!(fields(&flash), fields(&ours), "the 27B's");
+        let text = flash_next_options(3, std::ptr::null_mut(), None, RopeScaling::NONE, None);
+        assert_eq!(fields(&text), (0, 0, 0, 0));
     }
 
     /// GitHub #336: fewer lanes than the leaf's eight cross the options
