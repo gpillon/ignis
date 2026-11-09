@@ -522,6 +522,9 @@ int main() {
       return rc == 0 ? std::string("(planned)") : std::string(ignis_model_last_error());
     };
     vision.vision_embedding_pool_bytes = 0;
+    // The envelope at its default (32,768 merged tokens), as a served load has it: the 8,192 asked
+    // above for the pool's floor would bound every item below the processor's largest.
+    vision.vision_max_tokens = 32768;
     vision.vision_item_max_tokens = 16384;
     uint32_t bounds[2] = {0, 0};
     for (const uint32_t residency : {IGNIS_VISION_RESIDENCY_DEVICE, IGNIS_VISION_RESIDENCY_HOST}) {
