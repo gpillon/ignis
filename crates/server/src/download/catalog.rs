@@ -1034,6 +1034,11 @@ mod tests {
             &[],
             &[
                 (
+                    "qwen3_8_flash_next_vision-v2.ninfer.conversion.json",
+                    1_834,
+                    "963c833ec590e0f188900f86d31f348b5f934c8eeef2485e51263ef930f3c6b5",
+                ),
+                (
                     "qwen3_8_flash_next_mtp_3p0-v2.ninfer.conversion.json",
                     179_029,
                     "a5b2c10fe0745cfe6b8e2914135e44903cfb80acb3f0db21e549e76641f14127",
@@ -1043,6 +1048,7 @@ mod tests {
                     1_183_942,
                     "9858d9fb03dd66fa2558b5dc6aa6463ee70f00024ffbd746545b231c9514f7a0",
                 ),
+                ("qwen3_8_flash_next_vision-v2.ninfer", 284_229_120, "d97353d4d8d2a3caeb61c58052e50f47019b84a4667d07701c84ce2acede52b9"),
                 ("qwen3_8_flash_next_mtp_3p0-v2.ninfer", 1_037_905_920, "432fe5c0838027047c5b46c4fde526f3d3ef3d126f00fed1213921f8705988d2"),
                 ("qwen3_8_flash_next_trellis_a25-v2.ninfer", 71_760_711_680, "12e3b265b0678ba935a4b05d1b612ba4b68b3a96c3026d818ad65838985fd864"),
             ],
@@ -1355,12 +1361,16 @@ mod tests {
         assert_eq!(image.id, "ignis-image-2.1-turbo");
         assert_eq!(image.artifact, "ignis_image_2_1_turbo-v2.ninfer");
         assert_eq!(image.files.len(), 2);
-        // The loader finds Flash-Next's companion beside the main container
-        // under its fixed name, so the entry must land it under that name.
+        // The loader finds Flash-Next's companions beside the main container
+        // under their fixed names, so the entry must land them under those
+        // names: the MTP head and the vision encoder (ADR 0087).
         let flash = catalog.entry("qwen3.8-flash-next").expect("Flash-Next");
-        assert!(flash.files.iter().any(|f| f.name == ignis_artifact::packer::MTP_ARTIFACT_FILE_NAME));
+        for companion in [ignis_artifact::packer::MTP_ARTIFACT_FILE_NAME, ignis_artifact::packer::VISION_ARTIFACT_FILE_NAME] {
+            assert!(flash.files.iter().any(|f| f.name == companion), "{companion}");
+            assert!(flash.files.iter().any(|f| f.name == format!("{companion}.conversion.json")), "{companion}'s sidecar");
+        }
         assert_eq!(flash.artifact, ignis_artifact::packer::ARTIFACT_FILE_NAME);
-        assert_eq!(format!("{:.1}", flash.gib()), "67.8", "72.8 GB, the four files together");
+        assert_eq!(format!("{:.1}", flash.gib()), "68.1", "73.1 GB, the six files together");
         for entry in catalog.entries() {
             for file in &entry.files {
                 assert!(plain_name(&file.name), "{}", file.name);

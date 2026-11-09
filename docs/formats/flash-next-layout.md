@@ -743,7 +743,9 @@ in the same format and layout. The authority is
   is encoded on the CPU, its group scales computed on the host (the 27B encoder's rule).
 - The image preprocessor's settings are not in the companion: the main container already
   carries `frontend/preprocessor_config.json` (§8).
-- Payload: 283,172,768 bytes (the 27B's tower, 5,120 wide, is 295,711,648).
+- Payload: 283,172,768 bytes (the 27B's tower, 5,120 wide, is 295,711,648). The companion
+  built from the pinned revision is 284,229,120 bytes, SHA-256 `d97353d4…52b9`, its sidecar
+  1,834 bytes.
 
 ### 14.4 The sidecar
 

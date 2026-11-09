@@ -38,17 +38,22 @@ A few facts about an artifact are read from the file, never configured:
   written into another
   ([the KV cache and prompt reuse](kv-cache-and-prompt-reuse.md)).
 
-Flash-Next has a second container, the **MTP companion** (about 1 GB), that
-holds only the multi-token-prediction head. It records which main container it
-belongs to, and a mismatched pair is refused by name. It is bound only when MTP
-speculation is on ([speculative decoding](speculative-decoding.md)).
+Flash-Next has two **companion containers** beside the main one, each holding
+one optional part of the model. The **MTP companion** (about 1 GB) holds the
+multi-token-prediction head, and is bound only when MTP speculation is on
+([speculative decoding](speculative-decoding.md)). The **vision companion**
+(about 0.3 GB) holds the checkpoint's vision encoder: its tower, encoded the
+way the 27B's is, and the merger that writes Flash-Next's 2,560-wide
+embeddings. Each records which main container it belongs to, and a mismatched
+pair is refused by name. The catalog downloads both with the model, whether
+or not the part is used.
 
 ## The families
 
 | Family | What it is | Artifact | Where it runs |
 |---|---|---|---|
 | Qwen3.8-27B | Dense, 64 layers: 16 full-attention layers and 48 linear-attention (GDN) layers | 18.1 GiB | Entirely in VRAM |
-| Qwen3.8-Flash-Next | 125B mixture of experts, 6B active per token, 48 layers, 512 routed experts per layer, 10 chosen per token | 67.8 GiB with the MTP companion | Trunk in VRAM; experts in a VRAM cache backed by host RAM |
+| Qwen3.8-Flash-Next | 125B mixture of experts, 6B active per token, 48 layers, 512 routed experts per layer, 10 chosen per token | 68.1 GiB with its two companions | Trunk in VRAM; experts in a VRAM cache backed by host RAM |
 | Qwen-Image-2.1-Turbo | Image model: a Qwen3-VL text encoder, a 7B diffusion transformer and a VAE | 15.6 GiB | Reached by a switch; never loaded beside a text model |
 
 The family is not the same thing as the model name. Several artifacts can
