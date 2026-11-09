@@ -513,6 +513,17 @@ target_include_directories(ignis_kernel_vision_workspace_test
 target_link_libraries(ignis_kernel_vision_workspace_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_vision_workspace_test COMMAND ignis_kernel_vision_workspace_test)
 
+# GitHub #557 (ADR 0087): OURS -- the media encode at both text models' merger widths, 2,560
+# (Flash-Next) and 5,120 (the 27B): every linear of an encode routed at every width it runs, for
+# every item up to 32,768 merged tokens (host-only, `--cases routes`), and ignis_media_encode end to
+# end through a no-layer load of each width, the companion's tower in its stored formats under each
+# vision residency, against fp64 and host against device bit for bit. GPU (ADR 0006: no
+# SKIP_RETURN_CODE); not sm120a-only, the tower's and the merger's routes build for every target.
+add_executable(ignis_kernel_media_encode_test test_media_encode.cu)
+target_include_directories(ignis_kernel_media_encode_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_media_encode_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_media_encode_test COMMAND ignis_kernel_media_encode_test)
+
 # GitHub #296 / #335: OURS -- the GQA attention's arena: ignis's prompt
 # attention's, flat in the context past one band and at least 1.0e9 bytes
 # under A1's at 524,288 keys (spec 27b-16gb/03 acceptance 1), and the vendored

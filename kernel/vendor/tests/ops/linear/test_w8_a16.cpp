@@ -183,6 +183,15 @@ int w8_a16_conformance() {
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {4096, 4608, 331U, Comparison::Sampled, false, kN4096K4608});
 
+    // ignis #557: Flash-Next's merger fc2, 2,560 wide, which the media encode runs once per
+    // 128-column pool page (T 1 to 128): 4 and 16 end the SIMT arms, 128 runs the full-tile MMA
+    // kernel, 64 and 129 the partial one; 16384 is the processor's largest item in one call.
+    constexpr std::array kN2560K4608{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(64), a16(128), a16(129), a16(1024), a16(16384),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {2560, 4608, 337U, Comparison::Sampled, false, kN2560K4608});
+
     return failures;
 }
 

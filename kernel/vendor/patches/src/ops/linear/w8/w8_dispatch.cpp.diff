@@ -1,13 +1,15 @@
 diff --git a/reference/src/ops/linear/w8/w8_dispatch.cpp b/vendor/src/ops/linear/w8/w8_dispatch.cpp
-index 712a40a..6379556 100644
+index 712a40a..efbc623 100644
 --- a/reference/src/ops/linear/w8/w8_dispatch.cpp
 +++ b/vendor/src/ops/linear/w8/w8_dispatch.cpp
-@@ -94,10 +94,40 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+@@ -94,10 +94,42 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
              if (t <= 4) { return launch_w8_simt_r8_c4; }
              if (t == 5) { return launch_w8_simt_r8_c8; }
              return launch_w8_mma_r64_c128;
 +        case 4096:
 +            // ignis #320: the image model's merger and DeepStack fc2.
++        case 2560:
++            // ignis #557: Flash-Next's merger fc2 (its vision companion's), one call per pool page.
 +            if (t <= 4) { return launch_w8_simt_r8_c4; }
 +            if (t <= 16) { return launch_w8_simt_r8_c8; }
 +            return launch_w8_mma_r64_c128;

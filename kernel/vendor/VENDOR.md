@@ -123,7 +123,9 @@ more than the 48 KiB of static shared memory per block an sm_8x build allows.
 One patch has neither reason and says so: the W8 dispatch's arms for the
 image model's vision tower (`src/ops/linear/w8/w8_dispatch.cpp` and its test
 cases, spec image-model/03, GitHub #320), a registry extension sanctioned as
-that ticket's one vendor edit. Its `reason` names the new problems and the
+that ticket's one vendor edit, and since GitHub #557 (ADR 0087) the arm for
+Flash-Next's merger fc2 [2560, 4608], the same kind of extension on the image
+model's [4096, 4608] routes. Its `reason` names the new problems and the
 test cases that throw without it; whether such extensions become a third
 standing reason is the owner's call. Its K-1152 arms (the tower's qkv,
 output and fc1) reach the MMA route through an ADR 0031 patch of
@@ -251,8 +253,9 @@ P1-10 (GitHub #46) vendors the BF16 and W8G32 linear families:
   reference's one dispatcher for the whole W8 family), so the family is
   vendored whole rather than picking out only the shapes G1 needs.
   `w8_dispatch.cpp` is **patched** (and `tests/ops/linear/test_w8_a16.cpp`,
-  below): the six W8 problems of the image model's vision tower, see the
-  patch policy above. `w8_rowsplit_gemm_mma.cuh` is **patched** for the
+  below): the six W8 problems of the image model's vision tower and
+  Flash-Next's merger fc2 (GitHub #557), see the patch policy above.
+  `w8_rowsplit_gemm_mma.cuh` is **patched** for the
   tower's K-1152 problems (GitHub #324, ADR 0031), same place.
 - **their reference op tests** — `tests/ops/linear/test_bf16_a16.cpp` +
   `tests/ops/direct_bf16_weight.h`, and `tests/ops/linear/test_w8_a16.cpp` +
