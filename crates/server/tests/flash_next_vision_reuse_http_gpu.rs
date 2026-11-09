@@ -16,10 +16,12 @@
 //!   than the first turn holds beside the image's placeholders, which no
 //!   claim stopping before the picture reaches -- so it prefills none of the
 //!   image and encodes nothing; and its answer still names the colour.
-//! - **The fan-out.** Four questions about the number canary, sent together,
+//! - **The fan-out.** Three questions about the number canary, sent together (Flash-Next decodes
+//!   three lanes by default, and a fourth request at once is refused
+//!   `engine_full` by design),
 //!   each putting its own text before the picture, so no prompt shares
 //!   another's past its first tokens and each prefills the image: exactly one
-//!   encodes it, the other three find its embedding in the cache. Every
+//!   encodes it, the other two find its embedding in the cache. Every
 //!   answer names the number.
 //!
 //! The canary images are the 27B's (`fixtures/vision_canary/`), each answer
@@ -214,14 +216,15 @@ fn a_follow_up_turn_resumes_past_the_picture(live: &SwitchingLiveServer) {
     assert!(next.to_lowercase().contains("red"), "turn 2 still reads the picture: {next:?}");
 }
 
-/// Four questions over the number canary, sent together.
+/// Three questions over the number canary, sent together: as many as the
+/// load's default decode lanes (a request past the lanes is a 503
+/// `engine_full`, by design).
 fn a_fan_out_encodes_the_picture_once(live: &SwitchingLiveServer) {
     let image = canary("number.png");
     let questions = [
         "Read the number in the picture below and answer with the number only.",
         "Which number does this image show? Answer with the number only.",
         "Look at the following image. What number is written in it? Answer with the number only.",
-        "Tell me the number shown in the image that follows, with the number only.",
     ];
     let from = events().lines().len();
     let answers = live.block_on(futures_util::future::join_all(questions.iter().map(|question| {
