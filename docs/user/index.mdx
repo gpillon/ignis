@@ -1,9 +1,9 @@
 ---
 title: ignis
-description: A CUDA inference engine for Qwen3.8 on RTX 50-series and RTX PRO 6000 cards, and RTX 30 cards from 0.10.0. Install it, configure it, call it, extend it.
+description: A CUDA inference engine for Qwen3.8 on RTX 50-series and RTX PRO 6000 cards, and RTX 30 cards. Install it, configure it, call it, extend it.
 template: splash
 hero:
-  tagline: A CUDA inference engine for Qwen3.8 on RTX 50 and RTX PRO 6000 cards, and RTX 30 cards from 0.10.0. OpenAI-compatible API, a Playground in the browser, one binary.
+  tagline: A CUDA inference engine for Qwen3.8 on RTX 50 and RTX PRO 6000 cards, and RTX 30 cards. OpenAI-compatible API, a Playground in the browser, one binary.
   image:
     file: ../../web/src/brand/flame.webp
     alt: The ignis flame
@@ -39,9 +39,9 @@ the 16 GB RTX 50 cards with the 16 GB entries. The RTX 3090 and 3090 Ti are
 supported, on the 27B's 16 GB entries. The RTX 4090 and the 16 GB RTX 40 cards
 are verified for correctness: the release's sm_86 gate passed on an Ada
 Lovelace card (sm_89)
-([the finding](../findings/2026-11-07-sm86-gate-passes-on-sm89.md)). An RTX 30
-or RTX 40 card needs release 0.10.0 or the development build: the 0.9 releases
-are built for Blackwell alone. The NVFP4 builds, Flash-Next and the
+([the finding](../findings/2026-11-07-sm86-gate-passes-on-sm89.md)). The releases
+are built for compute capabilities 8.6 and 12.0, so RTX 30 and RTX 40 cards run
+them. The NVFP4 builds, Flash-Next and the
 image model load on Blackwell alone, on a card of 32 GB or more
 ([the details](start/#what-it-runs-on), and
 [every model on every card](reference/models.md#where-each-model-loads)).

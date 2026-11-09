@@ -43,10 +43,9 @@ an alias that is neither a model family's default id nor another entry's id
 entry's, names an entry whose family nothing states, or is already another
 entry's — a built-in one's included. A relative `--download-catalog` set in a config file is read
 from that file's directory; from a flag or an env var, from the working
-directory. The 24 GB class and the `generation` key are from 0.10.0: a 0.9
-release refuses the key. An entry with no `card_class` states no class: it is never refused
+directory. An entry with no `card_class` states no class: it is never refused
 by class, so a catalog written before card classes still starts, and only the
-VRAM plan says it does not fit. From 0.10.0 an entry with no `generation` loads on every
+VRAM plan says it does not fit. An entry with no `generation` loads on every
 GPU generation the build runs on; one that states it is refused on an older
 card, `409 model_above_gpu_generation`, and its alias may serve its id there
 ([ADR 0079](../../adr/0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md)):

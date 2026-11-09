@@ -45,7 +45,7 @@ positions to the context; `MAX_CONTEXT=524288` names a context, `yarn:2`, that
 never adapts; the gate legs ran at `MAX_CONTEXT=262144 ROPE_SCALING=none`) --
 `KV_FORMAT=hq-e8-2b`,
 `SPEC=dflash2` with
-`DRAFT_TOKENS=7`, `PREFILL_CHUNK` empty (the server's: the `rtx5090` profile's 2048), `PREFILL_CHUNK_SOLO` (from 0.10.0) empty (the server's `auto`, [the solo width](../configuration/context-and-speculation.md#the-solo-width)), `KV_HOST_POOL_BYTES=8G` (the 27B's; Flash-Next's own arena
+`DRAFT_TOKENS=7`, `PREFILL_CHUNK` empty (the server's: the `rtx5090` profile's 2048), `PREFILL_CHUNK_SOLO` empty (the server's `auto`, [the solo width](../configuration/context-and-speculation.md#the-solo-width)), `KV_HOST_POOL_BYTES=8G` (the 27B's; Flash-Next's own arena
 is `FN_KV_HOST_POOL_BYTES=2G`, passed on every start so a switch to it gets it
 too). `REQUEST_TIMEOUT` and `STREAM_TIMEOUT` are empty: the server's 2400 s
 deadlines ([Deadlines](../api/deadlines.md)). `HOST_MARGIN_BYTES` sets Flash-Next's host
@@ -53,8 +53,8 @@ margin (empty: the server's 4G).
 `KV_DISK_BYTES` and `KV_DISK_PATH` set [KV-disk](../configuration/kv-disk.md) (`make config`
 prints its budget and directory). `SPEC=off` turns
 speculation off (`SPEC=` leaves it to the server, and the `rtx5090` profile
-speculates with dflash2). `VISION=1` loads the vision tower, `VISION=0` (from
-0.10.0) leaves it out over a profile that loads it (`--vision-enabled false`), and an empty
+speculates with dflash2). `VISION=1` loads the vision tower, `VISION=0`
+leaves it out over a profile that loads it (`--vision-enabled false`), and an empty
 `VISION` leaves it to the profile: every built-in profile loads it for the 27B
 ([Vision](../configuration/vision.md)). `VISION_MAX_TOKENS` is passed whenever
 it is set, and a load without vision refuses it; `UNCENSORED=1` loads

@@ -48,7 +48,7 @@ Prefill itself reads a cold 46K-token prompt at **11,344 tok/s** and a 105K one 
 9,008 on the 5090. Since 0.7.3 its attention reads the compressed KV directly
 instead of expanding it into BF16 first, which made it 30% faster at 46K and
 53% at 105K, and the `rtx5090` profile prefills 2,048 tokens a chunk. ignis's
-own gated delta net prefill kernels, Blackwell's route from 0.10.0 since they
+own gated delta net prefill kernels, Blackwell's route because they
 measured faster there, add 4.8% at 46K and 3.9% at 105K against the vendored ones.
 
 The path of a request through the scheduler, step by step:

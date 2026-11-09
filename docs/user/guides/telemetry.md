@@ -19,9 +19,9 @@ Everything goes through one structured log on stdout, in the format
   (a model switch stopped it), beside how long it ran, whether it had a lane
   and the tokens it generated.
 - The `ttft` line's `duration_ms` runs from the submission to the first
-  token, and from 0.10.0 `after_prefill_ms` from the prefill chunk that completed the
+  token, and `after_prefill_ms` from the prefill chunk that completed the
   prompt to that token: what the first token waited for once the prompt
-  was read. From 0.10.0 the first token leaves at the end of the prefill, before the
+  was read. The first token leaves at the end of the prefill, before the
   request is dealt a decode lane, so `ttft` comes before `admitted` and
   names a `lane` only when one was dealt first. A request that ends on its
   first token (`max_tokens: 1`, an end-of-sequence token, a stop sequence

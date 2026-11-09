@@ -94,9 +94,9 @@ the 16 GB RTX 50 cards the 16 GB entries. The **RTX 3090 and 3090 Ti** are
 supported, on the 27B's 16 GB entries; the **RTX 4090** and the 16 GB RTX 40
 cards are verified for correctness: the release's sm_86 gate passed on an Ada
 Lovelace card (sm_89)
-([the finding](docs/findings/2026-11-07-sm86-gate-passes-on-sm89.md)). An RTX 30 or RTX 40 card
-needs release 0.10.0 or the development build: the 0.9 releases are built for
-Blackwell alone. The NVFP4 builds, Flash-Next
+([the finding](docs/findings/2026-11-07-sm86-gate-passes-on-sm89.md)). The releases
+are built for compute capabilities 8.6 and 12.0, so RTX 30 and RTX 40 cards run
+them. The NVFP4 builds, Flash-Next
 and the image model load on Blackwell alone, on a card of 32 GB or more
 ([every model on every card](docs/user/reference/models.md#where-each-model-loads)). The
 figures here are measured on an RTX 5090
@@ -129,8 +129,8 @@ that build it, and the rest of that is what the remaining work is for.
 Take a build from **[Releases](https://github.com/gpillon/ignis/releases)** — a
 Windows `.zip`, a Linux `.tar.gz`, or the `linux/amd64` container image on
 `ghcr.io/gpillon/ignis`. Run it on an RTX 50, RTX PRO 6000 or RTX 30 card; the
-releases from 0.10.0 are built for compute capabilities 8.6 and 12.0, the 0.9
-ones for 12.0 alone. (Every push to `main` that
+releases are built for compute capabilities 8.6 and 12.0.
+(Every push to `main` that
 changes code also publishes a rolling development build, **not a release**: the image
 `ghcr.io/gpillon/ignis:develop` and the `develop` prerelease.)
 

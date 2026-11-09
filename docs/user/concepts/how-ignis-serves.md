@@ -119,7 +119,7 @@ recurrent state and to draw the first token. Two rules shape it:
   round for the lanes already generating before the next chunk. While no lane
   is generating, a load that planned a wider
   [solo width](../configuration/context-and-speculation.md#the-solo-width)
-  (from 0.10.0) takes it instead, decided again at every chunk boundary; under the built-in
+  takes it instead, decided again at every chunk boundary; under the built-in
   profiles the two are the same width. Nothing runs
   concurrently on the card: prefill and decode alternate on one stream
   ([ADR 0018](../../adr/0018-chunk-level-prefill-decode-interleaving.md)).
@@ -137,7 +137,7 @@ Flash-Next keep 15.6-18.3 tokens per second during a prefill instead of about 1
 A prompt that arrives alone, or with no lane decoding, is unaffected: nothing
 waits.
 
-From 0.10.0 the first token leaves as soon as the prompt's last chunk is done: the server
+The first token leaves as soon as the prompt's last chunk is done: the server
 streams it before any decode round runs, even while every decode lane is taken.
 A request that ends on it (`max_tokens: 1`, an end-of-sequence token, or a stop
 sequence the token completes) never takes a lane at all, and its answer is cut
@@ -172,7 +172,7 @@ into channels:
 - **Tool calls** are parsed out of the content into the API's tool-call shape.
 
 Chat completions stream as server-sent events; the Responses API streams the
-same way over HTTP or over a WebSocket. From 0.10.0 the first token arrives
+same way over HTTP or over a WebSocket. The first token arrives
 alone, at the end of the prefill; then each round's tokens follow. A speculative round can
 commit several tokens at once, and the server still streams them one at a time.
 

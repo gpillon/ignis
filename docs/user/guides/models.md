@@ -90,7 +90,7 @@ catalog id you also list in `--switch-known-models` is fitted all the same:
 the class is its catalog entry's. A model id no entry holds has no class, and
 a card whose class is not known refuses nothing.
 
-From 0.10.0 an entry may also state the oldest **GPU generation** it loads on,
+An entry may also state the oldest **GPU generation** it loads on,
 `generation: ampere`, `ada` or `blackwell`
 ([ADR 0079](../../adr/0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md)).
 The server reads the card's generation from its compute capability at start:
@@ -118,7 +118,7 @@ ignis-server model list                 # id, built-in or operator, repo@revisio
 ignis-server model list --format json
 ```
 
-The `AVAILABLE` column is from 0.10.0 (the 0.9 releases print none). `AVAILABLE` is `no` for an entry the card cannot load, by class or by
+`AVAILABLE` is `no` for an entry the card cannot load, by class or by
 generation, and each such entry's reason follows the table, naming the entry
 that serves its id on this card when one does; `--format json` gives
 `available` and `reason`, as `GET /v1/models/catalog` does. On a machine with

@@ -51,10 +51,9 @@ ignis-server config patch --model-max-context 131072   # change the file in plac
 
 **Profiles.** `--profile <name>` / `IGNIS_PROFILE` / the file's `profile:`
 names a bundle of hardware-shaped defaults, below the file and above the
-built-in defaults. Four are built in from 0.10.0 (three in the 0.9 releases,
-without `rtx-24gb`), and the default, `--profile auto`,
+built-in defaults. Four are built in, and the default, `--profile auto`,
 picks one by the card's total memory as NVML reports it: under 20 GiB
-(a 16 GB card) `rtx-16gb` (`rtx50-16gb` in the 0.9 releases), from 20 GiB up
+(a 16 GB card) `rtx-16gb`, from 20 GiB up
 to 28 GiB (an RTX 3090 or RTX 4090)
 `rtx-24gb`, 28 to 40 GiB (a 5090) `rtx5090`, 88 to 104 GiB
 (an RTX PRO 6000) `rtxpro6000`. A card of any other size, or a total NVML
@@ -75,7 +74,7 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   turns it off. The 27B prefills 2,048 tokens a chunk (`--model-prefill-chunk`):
   with vision on that costs no VRAM, and long prompts prefill ~2% faster
   ([finding](../../findings/2026-10-21-the-27b-prefill-chunk-at-2048.md)).
-  From 0.10.0 Flash-Next prefills 8,192, as `make` always started it: each of its chunks
+  Flash-Next prefills 8,192, as `make` always started it: each of its chunks
   streams its experts once
   ([finding](../../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)).
 - `rtxpro6000` is the RTX PRO 6000 Blackwell series (Workstation, Max-Q,
@@ -88,8 +87,8 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   ([Flash-Next n-gram startup cache](ngram-cache.md)). Everything else is as on the
   5090, except that the 27B's VRAM headroom stays at its default. `--profile
   auto` picks it on this card; `--profile rtxpro6000` names it.
-- `rtx-16gb` is the 16 GB class (RTX 5060 Ti 16 GB, 5070 Ti, 5080, and from
-  0.10.0 RTX 4060 Ti 16 GB, RTX 4080): derived,
+- `rtx-16gb` is the 16 GB class (RTX 5060 Ti 16 GB, 5070 Ti, 5080, and the
+  RTX 4060 Ti 16 GB and RTX 4080): derived,
   not measured, since no 16 GB card exists in the project. The 27B at
   262,144 tokens of context on two decode lanes, with DFlash2 at 7 draft
   tokens and the drafter's head `auto`, vision on at 4,096 tokens an image (the tower and pool in host RAM, so
@@ -99,7 +98,7 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   pinned to it).
   It names no model: a start with no artifact takes the catalog's 16 GB entry
   of the default id.
-- `rtx-24gb`, from 0.10.0, is the 24 GB class (RTX 3090, RTX 4090): the 5090 profile's
+- `rtx-24gb` is the 24 GB class (RTX 3090, RTX 4090): the 5090 profile's
   values for the 27B (VRAM headroom 1200M, a 2,048-token prefill chunk,
   DFlash2 at 7 draft tokens, vision on with the tower and pool in host RAM,
   the default lanes and drafter's head) at 1,048,576 tokens of context (YaRN
@@ -114,7 +113,7 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
 27B asks for, not what it insists on: when the VRAM plan cannot hold them in
 the memory the start finds free, the load lowers them, in this order, and
 plans again after each step. Before any of them it settles
-[the solo width](context-and-speculation.md#the-solo-width) (from 0.10.0): `auto` keeps a
+[the solo width](context-and-speculation.md#the-solo-width): `auto` keeps a
 wider chunk only where the plan holds it with nothing below adapted and room
 for a second request, else the prefill chunk, and a width you named falls to
 the prefill chunk as the first step (`prefill_chunk_solo 8192 -> 2048`), the
@@ -196,7 +195,7 @@ a change is live, needs a reload, or can only be made at start — the same
 declarations as `ignis-server help --fields --format json`, minus the fields
 `GET /v1/config` hides. `GET /v1/config/origins` says where each value in force
 comes from, for the shared value and for each model family: the default, the
-profile, the card (from 0.10.0), the file, an env var, a flag or a live change, whether it
+profile, the card, the file, an env var, a flag or a live change, whether it
 was set for that family itself, and the flag, env var, file key or profile
 that set it, or the card that decided it (the prompt attention's integer band
 and the dense prefill on a card below compute capability 12.0).

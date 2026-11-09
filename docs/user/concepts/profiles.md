@@ -28,8 +28,8 @@ counts as unset.
 Choose a profile with `--profile <name>`, `IGNIS_PROFILE`, or `profile:` in the
 config file. With none of them the profile is `auto`: the start reads the
 card's total memory from NVML and takes the built-in profile of its class,
-`rtx-16gb` under 20 GiB (`rtx50-16gb` in the 0.9 releases), `rtx-24gb` from
-20 GiB up to 28 GiB (from 0.10.0), `rtx5090` from
+`rtx-16gb` under 20 GiB, `rtx-24gb` from
+20 GiB up to 28 GiB, `rtx5090` from
 28 to 40 GiB, `rtxpro6000` from 88 to 104 GiB. The log line
 `ignis.config.source` names the profile chosen and
 the total it was chosen by. To skip the layer entirely and run on the hardcoded
@@ -73,7 +73,7 @@ The default: a 32 GB RTX 5090.
 | Vision | on, tower and pool in host RAM (`vision.residency: host`) | not applicable |
 | Speculation | DFlash2, 7 draft tokens | off |
 | Decode lanes | 8 (the default) | 3 |
-| Prefill chunk | 2,048 | 8,192 from 0.10.0; 1,024 (the default) in the 0.9 releases |
+| Prefill chunk | 2,048 | 8,192 |
 | VRAM headroom | 1,200 MiB | 1,536 MiB (the default) |
 | Pinned hot experts | not applicable | 2 GiB |
 
@@ -103,8 +103,8 @@ Why each:
   Neither Blackwell profile names a
   [solo width](../configuration/context-and-speculation.md#the-solo-width):
   `auto` is the prefill chunk on these cards.
-- **Flash-Next's prefill chunk.** 8,192 under `rtx5090` and `rtxpro6000` from
-  0.10.0, as `make` always started it: each chunk streams the experts once, so a narrower
+- **Flash-Next's prefill chunk.** 8,192 under `rtx5090` and `rtxpro6000`, as
+  `make` always started it: each chunk streams the experts once, so a narrower
   one costs its TTFT nearly in proportion (2,048 took 1.86 times as long at
   34K) and under load only halves a decoding lane's longest pause, which the
   decode share already paces
@@ -137,7 +137,7 @@ Linux ([finding](../../findings/2026-10-18-rtxpro6000-profile-measured.md)).
 | Vision | on, tower and pool in VRAM (`vision.residency: device`) | not applicable |
 | Speculation | DFlash2, 7 draft tokens | MTP, 3 draft tokens |
 | Decode lanes | 8 (the default) | 8 |
-| Prefill chunk | 2,048 | 8,192 from 0.10.0; 1,024 (the default) in the 0.9 releases |
+| Prefill chunk | 2,048 | 8,192 |
 | VRAM headroom | default | default |
 | N-gram hot rows | not applicable | `auto` |
 
@@ -166,8 +166,8 @@ Why each:
 ### `rtx-16gb`
 
 The 16 GB class: the RTX 5060 Ti 16 GB, 5070 Ti and 5080, and the RTX 4060 Ti
-16 GB and RTX 4080 (from 0.10.0). The 0.9 releases name it `rtx50-16gb`, a name
-0.10.0 keeps as an alias of `rtx-16gb`. It serves the 27B
+16 GB and RTX 4080. `rtx50-16gb`, its former name, is accepted as an alias of
+`rtx-16gb`. It serves the 27B
 from the catalog's 16 GB entry, `qwen3.8-27b-16g`; the profile names no
 model, and a start with no artifact resolves the default id `qwen3.8-27b` to
 that entry ([Get a model](../guides/models.md)).
@@ -208,7 +208,7 @@ Why each:
 
 ### `rtx-24gb`
 
-From 0.10.0. The 24 GB class: the RTX 3090 and the RTX 4090, from 20 GiB up to 28 GiB of
+The 24 GB class: the RTX 3090 and the RTX 4090, from 20 GiB up to 28 GiB of
 total memory. No catalog entry states this class: the 32 GB entries stay above
 it and the 16 GB entries fit it, so it serves the 27B from `qwen3.8-27b-16g`,
 as `rtx-16gb` does. The profile names no model, and a start with no artifact

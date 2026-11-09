@@ -68,7 +68,7 @@ request at a time, and another client's requests would land in them.
   the first over the time after the first), the median and pooled rate, and
   how many draft tokens DFlash2 got accepted across it (its `speculative`);
   `decode.speculative` is the three cells' sum (a 0.9 release's `ignis-bench`
-  has no `decode.long`, which is from 0.10.0).
+  has no `decode.long`).
   - `decode.long`, **long replies**: four coding requests for a complete
     piece of code (a module with its tests, a small program), thinking off,
     each ending on its own after several hundred tokens, with 1,024 as a cap
