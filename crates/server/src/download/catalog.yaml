@@ -60,11 +60,11 @@ models:
   # when MTP or vision is off.
   - id: qwen3.8-flash-next
     repo: gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis
-    revision: "8d94db83cd8e58d6be31e796723e5e35b960638c"
+    revision: "1f4f85c4a1b3a41854881f2eba5a022a1ad5126f"
     artifact: qwen3_8_flash_next_trellis_a25-v2.ninfer
     card_class: 32
     generation: blackwell
-    license: { id: qwen-community-1.0, url: "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/8d94db83cd8e58d6be31e796723e5e35b960638c/LICENSE" }
+    license: { id: qwen-community-1.0, url: "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/1f4f85c4a1b3a41854881f2eba5a022a1ad5126f/LICENSE" }
     files:
       - { name: qwen3_8_flash_next_vision-v2.ninfer.conversion.json, bytes: 1834, sha256: "963c833ec590e0f188900f86d31f348b5f934c8eeef2485e51263ef930f3c6b5" }
       - { name: qwen3_8_flash_next_mtp_3p0-v2.ninfer.conversion.json, bytes: 179029, sha256: "a5b2c10fe0745cfe6b8e2914135e44903cfb80acb3f0db21e549e76641f14127" }

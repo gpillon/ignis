@@ -19,7 +19,7 @@ The models the server knows how to fetch without an operator catalog. Each is pi
 |---|---|---|---|---|
 | [`qwen3.8-27b`](#qwen38-27b) | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer) | 18.1 GiB | [`apache-2.0`](https://www.apache.org/licenses/LICENSE-2.0) | `qwen3_8_27b_nvfp4full-v2.ninfer` |
 | [`qwen3.8-27b-abliterated`](#qwen38-27b-abliterated) | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer) | 18.1 GiB | [`apache-2.0`](https://www.apache.org/licenses/LICENSE-2.0) | `qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer` |
-| [`qwen3.8-flash-next`](#qwen38-flash-next) | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | 68.1 GiB | [`qwen-community-1.0`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/8d94db83cd8e58d6be31e796723e5e35b960638c/LICENSE) | `qwen3_8_flash_next_trellis_a25-v2.ninfer` |
+| [`qwen3.8-flash-next`](#qwen38-flash-next) | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | 68.1 GiB | [`qwen-community-1.0`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/1f4f85c4a1b3a41854881f2eba5a022a1ad5126f/LICENSE) | `qwen3_8_flash_next_trellis_a25-v2.ninfer` |
 | [`ignis-image-2.1-turbo`](#ignis-image-21-turbo) | [`gpillon/ignis-image-2.1-turbo`](https://huggingface.co/gpillon/ignis-image-2.1-turbo) | 15.6 GiB | [`qwen-research`](https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/LICENSE) | `ignis_image_2_1_turbo-v2.ninfer` |
 | [`qwen3.8-27b-16g`](#qwen38-27b-16g) | [`gpillon/Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis/blob/f5bbd2cc14c9ca573ef5553c100ac69410f1fe58/LICENSE) | `qwen3_8_27b_trellis_sc30-v2.ninfer` |
 | [`qwen3.8-27b-abliterated-16g`](#qwen38-27b-abliterated-16g) | [`gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis) | 12.5 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis/blob/94a8bfc0f47ce86403f274be03e2c0f79500727c/LICENSE) | `qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer` |
@@ -68,7 +68,7 @@ The speech models and the diarizer (`qwen3-asr-1.7b`, `qwen3-asr-1.7b-q8`, `qwen
 
 ## qwen3.8-flash-next
 
-[`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) at revision `8d94db83cd8e58d6be31e796723e5e35b960638c`, 73,084,211,525 bytes in 6 files.
+[`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) at revision `1f4f85c4a1b3a41854881f2eba5a022a1ad5126f`, 73,084,211,525 bytes in 6 files.
 
 | File | Bytes | SHA-256 |
 |---|---|---|
