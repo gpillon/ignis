@@ -5,12 +5,10 @@
 # and the GPU status/guard pair (mk/linux/gpu.sh). Those are what a CUDA=1
 # build and the container image need.
 #
+# Background server control uses mk/linux/server.py, with a detached session,
+# a PID + process identity, and /ready 200 after warmup (GitHub #129, #493).
 # Still to do (each is a hook below that fails with a clear message today):
-#   - background server control: pid file + setsid/nohup and a /v1/models
-#     readiness loop (the Windows version is mk/windows/server.ps1), and the
-#     run-ui/dev-ui process group on top of it. The loop must wait for a 200
-#     (curl -f), not any answer: /v1 answers 503 while the warm-up runs
-#     (GitHub #129)
+#   - the run-ui/dev-ui process group
 #   - scripts/gpu-profile.sh, the three-stage explicit GPU test profile
 #     (scripts/gpu-profile.ps1's counterpart), which writes the marker
 #     ignis_core::gpu_profile reads
@@ -35,9 +33,10 @@ GPU_STATUS = bash mk/linux/gpu.sh status
 GPU_GUARD = bash mk/linux/gpu.sh guard $(GPU_THRESHOLD_MIB)
 GPU_PROFILE = $(call todo,the GPU profile)
 
-SERVER_START = $(call todo,background start)
-SERVER_STOP = $(call todo,background stop)
-SERVER_STATUS = $(call todo,background status)
+SERVER_CTL_ARGS = --pid '$(SERVER_PID)' --log '$(SERVER_LOG)' --url '$(SERVER_URL)' --timeout '$(READY_TIMEOUT)'
+SERVER_START = $(PYTHON) mk/linux/server.py start $(SERVER_CTL_ARGS) -- '$(SERVER_BIN)' $(SERVER_FLAGS)
+SERVER_STOP = $(PYTHON) mk/linux/server.py stop $(SERVER_CTL_ARGS) $(if $(filter 1,$(FORCE)),--force)
+SERVER_STATUS = $(PYTHON) mk/linux/server.py status $(SERVER_CTL_ARGS)
 # sh: start the server and vite in one process group, `trap 'kill 0' INT TERM EXIT`.
 DEV_UI = $(call todo,run-ui / dev-ui)
 
@@ -50,7 +49,7 @@ CHANGELOG_TOOL = bash mk/changelog.sh
 # Debian and Ubuntu name Python 3 `python3`, with no `python` by default.
 PYTHON ?= python3
 
-OS_REQUIRED_TOOLS :=
+OS_REQUIRED_TOOLS := $(PYTHON)
 OS_OPTIONAL_TOOLS := cmake ninja nvidia-smi
 OS_TOOL_HINT := CUDA=1 only: CUDA Toolkit under CUDA_HOME, CMake, Ninja -- README Prerequisites
 # nvcc, libcudart.so, nvml.h, nvtx3/ in either CUDA layout, and CMake against

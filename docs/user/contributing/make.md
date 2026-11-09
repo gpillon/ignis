@@ -78,6 +78,17 @@ with its output sent to a file (`make start > file 2>&1` from bash): the
 server inherits a pipe (`| Tee-Object`, `| tail`) and holds it open for as long
 as it runs.
 
+On Linux `start`, `stop` and `status` run `mk/linux/server.py` (Python 3,
+`PYTHON`). `start` refuses while the server it recorded is alive or something
+already listens on `BIND`, waits for `/ready` rather than `/v1/models`, and
+stops the server again if it is not ready within `READY_TIMEOUT`, where Windows
+leaves it running. It keeps the previous log and `.err` beside the new ones,
+with a timestamp suffix, instead of rewriting them, and does not repeat a
+generated API key or public URL on the console: they are in the log. `stop`
+sends SIGTERM and waits up to 30 seconds; `FORCE=1` also stops your other
+`ignis-server` processes. `dev-ui` / `run-ui` and `gpu-profile` are still
+Windows-only.
+
 A change to the `Makefile` starts from
 [ADR 0027](../../adr/0027-make-as-the-dev-entrypoint.md), the decision that
 made `make` the entry point.

@@ -147,8 +147,7 @@ binary lands in `target/x86_64-pc-windows-msvc/release/`.
 
 Windows is the development host; Linux builds the same engine and is what the
 container image is built from. Some `make` targets are still Windows-only there
-— background server control (`start` / `stop` / `dev-ui`) and the GPU test
-profile; `mk/os/linux.mk` names them.
+— `dev-ui` / `run-ui` and the GPU test profile; `mk/os/linux.mk` names them.
 
 macOS is not a target: a Mac compiles the workspace without `cuda`
 (`cargo check --workspace --all-targets --target aarch64-apple-darwin`) and

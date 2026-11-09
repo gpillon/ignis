@@ -23,7 +23,15 @@ threshold="${2:-8192}"
 # script itself, and `make` invoking it.
 holders() {
     pgrep -a -f '(^|/)(ninfer[^/ ]*|ignis-server|ignis-bench|[^ ]*_gpu-[^ ]*)( |$)' 2>/dev/null |
-        grep -v "$$" || true
+        while read -r pid command; do
+            [ "$pid" = "$$" ] && continue
+            # stop can return after exit but before init reaps the child. A
+            # zombie holds no GPU resources and must not block the next start.
+            IFS= read -r process_stat < "/proc/$pid/stat" 2>/dev/null || continue
+            state="${process_stat##*) }"
+            case "$state" in Z\ *|X\ *) continue ;; esac
+            printf '%s %s\n' "$pid" "$command"
+        done || true
 }
 
 ignis_holders() {
