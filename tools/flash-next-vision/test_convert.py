@@ -143,10 +143,13 @@ def test_one_build_makes_the_companion_of_the_towers_objects_in_the_27b_recipes_
     assert all(a[1] == b[0] for a, b in zip(ranges[2:], ranges[3:])), "the span is read once, in parts"
 
 
-def test_a_second_build_gives_the_same_bytes_from_the_cached_source(tmp_path, sources, pack_exe):
+def test_a_second_build_gives_the_same_bytes_from_the_cached_source(tmp_path, sources, pack_exe, monkeypatch):
     checkpoint, _, _ = sources
     assert convert.main(argv(tmp_path, "one", pack_exe), hub=LocalHub(checkpoint)) == 0
-    assert convert.main(argv(tmp_path, "two", pack_exe), hub=OfflineHub()) == 0
+    # the second run names the packer as a relative path with forward slashes, as a shell does
+    monkeypatch.chdir(convert.REPO_ROOT)
+    relative = os.path.relpath(pack_exe, convert.REPO_ROOT).replace("\\", "/")
+    assert convert.main(argv(tmp_path, "two", relative), hub=OfflineHub()) == 0
     for suffix in ("", ".conversion.json", ".sha256"):
         one, two = tmp_path / "one" / (COMPANION + suffix), tmp_path / "two" / (COMPANION + suffix)
         assert open(one, "rb").read() == open(two, "rb").read(), suffix

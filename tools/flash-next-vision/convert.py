@@ -365,7 +365,8 @@ def read_back(path, digests):
 def run_build(args, hub):
     tower = GEOMETRIES[args.geometry]
     args.out = args.out or os.path.join(os.path.dirname(os.path.abspath(args.main)), "qwen3_8_flash_next_vision-v2.ninfer")
-    args.packer = args.packer or default_packer()
+    # absolute: Windows does not start a relative path with forward slashes
+    args.packer = os.path.abspath(args.packer) if args.packer else default_packer()
     check_outputs(args)
     t0 = time.time()
     data, record = fetch(hub, args.source, tower)
