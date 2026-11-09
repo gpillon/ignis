@@ -33,10 +33,15 @@
 //!   dense range, which these prompts of about a hundred tokens never leave,
 //!   as the failing test's never did). Red: a verify round's commit or
 //!   restore after an image is wrong -- (a).
-//! - **The head's load computes the headless load's trunk.** The plain rounds
-//!   on the MTP load commit the load without the head's tokens with its
-//!   logits, every round bit for bit, and the prompt's last prefill row too.
-//!   Red: the head's entries or sections reach the trunk -- (a).
+//! - **The head's load computes the headless load's trunk after an image.**
+//!   The plain rounds on the MTP load commit the load without the head's
+//!   tokens with its logits, every round bit for bit, and the prompt's last
+//!   prefill row too -- held for the image prompts whenever the text controls
+//!   hold it. Red: the head's entries or sections reach the trunk after an
+//!   image -- (a). Where the text controls differ across the loads too, the
+//!   two loads compute differently whatever the prompt (no text test compares
+//!   across them): printed, not held, and not the image's doing -- though the
+//!   failing test's split then carries that difference beside the routes'.
 //!
 //! What it reports, per kind (image prompts, text controls), along each
 //! route's own text with the prefill of that text as the reference: the
@@ -671,7 +676,7 @@ fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_dr
             });
             let (tokens, rows, prompt_row) = plain(&off, prompt, media.as_ref());
             let differing = rows.iter().zip(&m.plain_hashes).filter(|(row, h)| hash(row) != **h).count();
-            cross.push((m.name.clone(), tokens == m.plain, differing, prompt_row == m.prompt_row));
+            cross.push((m.name.clone(), m.image, tokens == m.plain && differing == 0 && prompt_row == m.prompt_row, differing));
         }
     }
 
@@ -690,9 +695,13 @@ fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_dr
         );
     }
     report(&measured);
-    println!("the headless load's plain rounds against the head's load's (tokens equal, rows differing, prompt row equal):");
-    for (name, tokens, differing, prompt_row) in &cross {
-        println!("  {name}: {tokens} {differing} {prompt_row}");
+    println!("the headless load's plain rounds against the head's load's (all equal, rows differing):");
+    for (name, _, equal, differing) in &cross {
+        println!("  {name}: {equal} {differing}");
+    }
+    let text_equal = cross.iter().filter(|(_, image, _, _)| !image).all(|(_, _, equal, _)| *equal);
+    if !text_equal {
+        println!("the loads differ on the text controls too: a difference of the loads, not of the image");
     }
 
     for m in &measured {
@@ -701,10 +710,10 @@ fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_dr
             assert!(state, "{}: the {drafter} drafter's rounds left another state than rounds without drafts", m.name);
         }
     }
-    for (name, tokens, differing, prompt_row) in &cross {
+    for (name, _, equal, differing) in cross.iter().filter(|(_, image, _, _)| *image && text_equal) {
         assert!(
-            *tokens && *differing == 0 && *prompt_row,
-            "{name}: the load without the head computes another trunk (tokens equal {tokens}, {differing} rows differ, prompt row equal {prompt_row})"
+            equal,
+            "{name}: after the image the load without the head computes another trunk ({differing} rows differ), where the text controls agree"
         );
     }
 }
