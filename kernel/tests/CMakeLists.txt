@@ -924,6 +924,16 @@ target_compile_definitions(ignis_kernel_flash_next_indexer_test PRIVATE
   IGNIS_FLASH_NEXT_INDEXER_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next_indexer/indexer_ref.bin")
 target_link_libraries(ignis_kernel_flash_next_indexer_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_flash_next_indexer_test COMMAND ignis_kernel_flash_next_indexer_test)
+# GitHub #558 (spec #555): OURS -- the attention's and the indexer's rotations over prompts with
+# images (three-axis positions, decode at the rope delta, a block key at its first token's axes
+# across calls through its AxisRecord) against the checkpoint's own transformers code, recorded once
+# on CPU by fixtures/flash_next_mrope/record_mrope.py. GPU, same no-SKIP_RETURN_CODE rule (ADR 0006).
+add_executable(ignis_kernel_flash_next_mrope_test test_flash_next_mrope.cu)
+target_include_directories(ignis_kernel_flash_next_mrope_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_definitions(ignis_kernel_flash_next_mrope_test PRIVATE
+  IGNIS_FLASH_NEXT_MROPE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next_mrope/mrope_ref.bin")
+target_link_libraries(ignis_kernel_flash_next_mrope_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_mrope_test COMMAND ignis_kernel_flash_next_mrope_test)
 foreach(name IN ITEMS sparse_attention sparse_attention_hq)
   add_executable(ignis_kernel_flash_next_${name}_test test_flash_next_${name}.cu)
   target_link_libraries(ignis_kernel_flash_next_${name}_test PRIVATE ignis_kernel ignis_vendor)

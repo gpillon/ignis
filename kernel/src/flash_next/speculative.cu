@@ -130,7 +130,9 @@ int32_t run_drafts(ignis_model *model, FlashNextModel &fn, const Context &ctx, c
     *error = fn_last_error();
     return -1;
   }
-  if (k > 1 && verify::restore_head(state, sections, fn.g, width, window, batch.slots, batch.positions, stream, error) != 0) {
+  // GitHub #558: the head's section's axis record too, at the round's rotation (its rope deltas).
+  if (k > 1 && verify::restore_head(state, sections, fn.g, width, window, batch.slots, batch.positions, stream, error,
+                                    batch.rope_deltas) != 0) {
     return -1;
   }
   const std::size_t stack_bytes = static_cast<std::size_t>(lanes) * fn.g.residual_width() * 2;
@@ -171,7 +173,8 @@ int32_t run_commit(ignis_model *model, FlashNextModel &fn, const Context &ctx, c
   if (verify::fold(state, sections, width, window, slots, model->stream, error) != 0) return -1;
   if (fn.mtp != nullptr && run_drafts(model, fn, ctx, sections, width, error) != 0) return -1;
   return verify::restore(state, sections, fn.g, width, window, slots, static_cast<const int32_t *>(fn.positions->p),
-                         model->stream, error);
+                         model->stream, error,
+                         fn.vision() ? static_cast<const int32_t *>(fn.rope_deltas->p) : nullptr);
 }
 
 // Begins a capture, runs `body`, ends it and instantiates. A failure leaves *exec null.

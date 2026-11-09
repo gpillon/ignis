@@ -349,6 +349,10 @@ struct IndexerLayerState {
   // The incomplete block's raw keys, per slot: [slot][compress_ratio - 1]
   // [indexer_head_dim] BF16; how many are valid is position % compress_ratio.
   void *tail_keys = nullptr;
+  // GitHub #558: a vision load's. Until a block completes, its key slot
+  // holds its first token's three-axis position (indexer.h AxisRecord), the
+  // rotation its key takes when a later call completes it.
+  bool axis_records = false;
 };
 
 // The n-gram embedding's per-lane state: its dilated conv's past input

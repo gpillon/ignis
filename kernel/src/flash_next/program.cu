@@ -174,8 +174,9 @@ Sizes plan_sizes(const FlashNextModel &fn) {
   s.sampling_workspace =
       std::max<std::size_t>(ninfer::ops::sampling_workspace_capacity_bytes(g.vocab, 1, IGNIS_DECODE_MAX_BATCH), 256);
   if (fn.speculative_backend != IGNIS_SPECULATIVE_NONE) {
+    // GitHub #558: a vision load's commit also restores its blocks' axis records.
     s.verify = verify::plan(g, fn.kv_format, fn.decode_lanes, fn.draft_tokens, fn.draft_row_budget,
-                            attention_sections(fn), gdn_layers(fn), fn.mtp != nullptr)
+                            attention_sections(fn), gdn_layers(fn), fn.mtp != nullptr, fn.vision())
                    .total();
   }
   if (fn.mtp != nullptr) {
@@ -269,6 +270,7 @@ Views views_of(const FlashNextModel &fn, ignis_seq_pool *pool) {
     state.block_keys = pool->indexer_block_keys(layer);
     state.blocks_per_page = static_cast<int32_t>(ninfer::kPagedKVPageSize) / pool->indexer_compress_tokens;
     state.tail_keys = pool->indexer_tail_keys(layer);
+    state.axis_records = fn.vision();  // GitHub #558
     v.indexer.push_back(state);
   }
   v.ctx.g = fn.g;
@@ -850,7 +852,7 @@ int32_t finish_load(ignis_model &model, std::string *error) {
   }
   if (fn.speculative_backend != IGNIS_SPECULATIVE_NONE) {
     fn.verify = verify::create(g, fn.kv_format, fn.decode_lanes, fn.draft_tokens, fn.draft_row_budget,
-                               attention_sections(fn), gdn_layers(fn), fn.mtp != nullptr, error);
+                               attention_sections(fn), gdn_layers(fn), fn.mtp != nullptr, error, fn.vision());
     if (fn.verify == nullptr) {
       *error = "Flash-Next's verify round: " + *error;
       return -1;

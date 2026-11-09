@@ -12,6 +12,7 @@
 
 #include "gdn.h"
 #include "ignis_seq_internal.h"
+#include "rope.cuh"
 
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/gqa_attention.h"
@@ -87,16 +88,20 @@ GdnRecordLayout gdn_layout(uint32_t rows) {
 }
 
 // What the pass saves, per lane: every attention layer's tail, the n-gram conv columns, the ring
-// words and, per attention layer, column and role, the side rows the column's position overwrites.
+// words and, per attention layer, column and role, the side rows the column's position overwrites;
+// on a vision load (GitHub #558) also, per attention layer, the AxisRecord of the block the lane's
+// frontier is inside.
 struct SavedLayout {
-  std::size_t tails = 0, ngram = 0, words = 0, rows = 0;
+  std::size_t tails = 0, ngram = 0, words = 0, rows = 0, records = 0;
   int32_t tail_elements = 0;  // per (layer, lane)
   int32_t ngram_elements = 0; // per lane
   int32_t columns = 0;        // the rows section's columns per lane
-  std::size_t bytes() const { return tails + ngram + words + rows; }
+  std::size_t bytes() const { return tails + ngram + words + rows + records; }
+  // The regions, in this order from the saved buffer's start.
+  std::size_t records_at() const { return tails + ngram + words + rows; }
 };
 SavedLayout saved_layout(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t columns,
-                         int32_t attention_layers) {
+                         int32_t attention_layers, bool axis_records) {
   SavedLayout s;
   const auto n = static_cast<std::size_t>(lanes);
   s.tail_elements = (g.compress_ratio - 1) * g.indexer_kv_heads * g.indexer_head_dim;
@@ -109,6 +114,7 @@ SavedLayout saved_layout(const Geometry &g, int32_t kv_format, uint32_t lanes, u
     s.rows = aligned(static_cast<std::size_t>(attention_layers) * n * columns * 2 * RingGeometry::KVHeads * kRowDim *
                      sizeof(__nv_bfloat16));
   }
+  if (axis_records) s.records = aligned(static_cast<std::size_t>(attention_layers) * n * sizeof(indexer::AxisRecord));
   return s;
 }
 
@@ -128,9 +134,13 @@ struct SaveArgs {
   int32_t row_columns;  // the rows section's columns per lane
   int32_t tail_elements;
   int32_t ngram_elements;
+  int32_t *records;  // GitHub #558: [layer][lane] AxisRecord words, or null (no axis records)
 };
 
-// One CTA per (attention layer, lane): the lane's tail keys.
+constexpr int32_t kRecordWords = static_cast<int32_t>(sizeof(indexer::AxisRecord) / sizeof(int32_t));
+
+// One CTA per (attention layer, lane): the lane's tail keys, and (GitHub #558) the record words in
+// the key slot of the block its frontier p is inside -- whatever they are, copied as they lie.
 __global__ void save_tails_kernel(SaveArgs a) {
   const int32_t layer = static_cast<int32_t>(blockIdx.x);
   const int32_t lane = static_cast<int32_t>(blockIdx.y);
@@ -138,6 +148,13 @@ __global__ void save_tails_kernel(SaveArgs a) {
                     static_cast<int64_t>(a.slots[lane]) * a.s.tail_slot_elements;
   __nv_bfloat16 *dst = a.tails + (static_cast<int64_t>(layer) * a.lanes + lane) * a.tail_elements;
   for (int32_t i = static_cast<int32_t>(threadIdx.x); i < a.tail_elements; i += blockDim.x) dst[i] = src[i];
+  const int32_t p = a.positions[lane];
+  if (a.records != nullptr && p % indexer::kCompress != 0 && threadIdx.x < kRecordWords) {
+    const auto *slot_words = reinterpret_cast<const int32_t *>(
+        indexer::block_key_slot(static_cast<__nv_bfloat16 *>(a.s.block_keys[layer]), a.s.block_tables,
+                                a.s.logical_pages, a.slots[lane], p / indexer::kCompress));
+    a.records[(static_cast<int64_t>(layer) * a.lanes + lane) * kRecordWords + threadIdx.x] = slot_words[threadIdx.x];
+  }
 }
 
 // The lane's n-gram conv columns, 16 bytes per thread.
@@ -204,11 +221,18 @@ struct RestoreArgs {
   int32_t tail_elements;
   int32_t ngram_columns;
   int32_t ngram_channels;
+  // GitHub #558: the saved records ([layer][lane] AxisRecord words, null without axis records) and
+  // the round's rope deltas (DEVICE [lanes], null: 0).
+  const int32_t *records;
+  const int32_t *rope_deltas;
 };
 
 // One CTA per (attention layer, lane), one thread per key element: the tail of the new frontier
 // f = p + c holds the raw keys of [f / compress * compress, f): the saved tail's below p, the
-// call's recorded keys from p on.
+// call's recorded keys from p on. GitHub #558: and, with axis records, the key slot of the block f
+// is inside holds that block's record again -- the saved one when the block began before p (the
+// pass may have completed it with columns the commit rejects), else that of its first column,
+// whose rotation is its position plus the lane's rope delta on all three axes.
 __global__ void restore_tails_kernel(RestoreArgs a) {
   const int32_t layer = a.layer_base + static_cast<int32_t>(blockIdx.x);
   const int32_t lane = static_cast<int32_t>(blockIdx.y);
@@ -225,6 +249,19 @@ __global__ void restore_tails_kernel(RestoreArgs a) {
     const __nv_bfloat16 v = q < p ? saved[(q - first_old) * a.key_dim + d]
                                   : keys[(static_cast<int64_t>(lane) * a.columns + (q - p)) * a.key_dim + d];
     tail[(q - first_new) * a.key_dim + d] = v;
+  }
+  if (a.records != nullptr && d == 0 && first_new < f) {
+    auto *slot_words = reinterpret_cast<int32_t *>(
+        indexer::block_key_slot(static_cast<__nv_bfloat16 *>(a.s.block_keys[layer]), a.s.block_tables,
+                                a.s.logical_pages, a.slots[lane], first_new / indexer::kCompress));
+    if (first_new < p) {
+      const int32_t *record = a.records + (static_cast<int64_t>(layer) * a.lanes + lane) * kRecordWords;
+      for (int32_t w = 0; w < kRecordWords; ++w) slot_words[w] = record[w];
+    } else {
+      const int32_t at = first_new + (a.rope_deltas != nullptr ? a.rope_deltas[lane] : 0);
+      const int32_t axes[3] = {at, at, at};
+      indexer::write_axis_record(reinterpret_cast<__nv_bfloat16 *>(slot_words), first_new, axes);
+    }
   }
 }
 
@@ -406,10 +443,10 @@ __global__ void __launch_bounds__(ninfer::ops::kWarpSize *gd::kNumWarps, 2) fold
 // positions past each lane's frontier.
 RestoreArgs restore_args(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes,
                          uint32_t window, const int32_t *slots, const int32_t *positions, int32_t ring_columns,
-                         int32_t layer_base) {
+                         int32_t layer_base, const int32_t *rope_deltas) {
   const uint32_t row_columns = max_ring_columns_of(state.lanes, state.draft_tokens, state.row_budget, state.mtp);
   const SavedLayout layout = saved_layout(g, sections.ring != nullptr ? IGNIS_KV_FORMAT_HQ_E8_2B : IGNIS_KV_FORMAT_BF16,
-                                          state.lanes, row_columns, sections.attention_layers);
+                                          state.lanes, row_columns, sections.attention_layers, state.axis_records);
   const auto *saved = static_cast<const unsigned char *>(state.saved->p);
   return RestoreArgs{sections,
                      slots,
@@ -430,7 +467,9 @@ RestoreArgs restore_args(const State &state, const Sections &sections, const Geo
                      static_cast<int32_t>(row_columns),
                      layout.tail_elements,
                      sections.ngram_columns,
-                     sections.ngram_channels};
+                     sections.ngram_channels,
+                     state.axis_records ? reinterpret_cast<const int32_t *>(saved + layout.records_at()) : nullptr,
+                     rope_deltas};
 }
 
 bool launched(const char *what, std::string *error) {
@@ -454,6 +493,13 @@ bool fits(const State &state, uint32_t lanes, uint32_t window, const char *what,
   return false;
 }
 
+// GitHub #558: a state with axis records reads and writes them in the sections' block keys.
+bool records_fit(const State &state, const Sections &sections, const char *what, std::string *error) {
+  if (!state.axis_records || sections.block_tables != nullptr) return true;
+  *error = std::string(what) + ": a state with axis records needs the sections' block keys and tables";
+  return false;
+}
+
 }  // namespace
 
 uint32_t written_positions(uint32_t window, bool mtp) { return mtp ? 2 * window : window + 1; }
@@ -470,7 +516,7 @@ uint32_t decode_rows(uint32_t decode_lanes, uint32_t draft_tokens, uint32_t row_
 }
 
 Plan plan(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_tokens, uint32_t row_budget,
-          int32_t attention_layers, int32_t gdn_layers, bool mtp) {
+          int32_t attention_layers, int32_t gdn_layers, bool mtp, bool axis_records) {
   Plan p;
   const uint32_t rows = max_rows_of(lanes, draft_tokens, row_budget);
   const uint32_t ring_columns = max_ring_columns_of(lanes, draft_tokens, row_budget, mtp);
@@ -491,7 +537,7 @@ Plan plan(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_t
   p.gdn_records = static_cast<std::size_t>(gdn_layers) * gdn_layout(rows).layer();
   p.indexer_records = static_cast<std::size_t>(attention_layers) *
                       aligned(static_cast<std::size_t>(rows) * g.indexer_kv_heads * g.indexer_head_dim * sizeof(__nv_bfloat16));
-  p.saved = saved_layout(g, kv_format, lanes, ring_columns, attention_layers).bytes();
+  p.saved = saved_layout(g, kv_format, lanes, ring_columns, attention_layers, axis_records).bytes();
   return p;
 }
 
@@ -551,20 +597,25 @@ std::string refusal(const Geometry &g, uint32_t lanes, uint32_t draft_tokens, ui
 
 std::unique_ptr<State> create(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_tokens,
                               uint32_t row_budget, int32_t attention_layers, int32_t gdn_layers, bool mtp,
-                              std::string *error) {
+                              std::string *error, bool axis_records) {
   if (std::string why = refusal(g, lanes, draft_tokens, row_budget, attention_layers, gdn_layers);
       !why.empty()) {
     *error = why;
+    return nullptr;
+  }
+  if (axis_records && g.compress_ratio != indexer::kCompress) {
+    *error = "the verify round's axis records are written for the indexer's blocks of 4 tokens";
     return nullptr;
   }
   auto st = std::make_unique<State>();
   st->draft_tokens = draft_tokens;
   st->row_budget = row_budget;
   st->lanes = lanes;
+  st->axis_records = axis_records;
   st->attention_layers = attention_layers;
   st->gdn_layers = gdn_layers;
   st->mtp = mtp;
-  st->sizes = plan(g, kv_format, lanes, draft_tokens, row_budget, attention_layers, gdn_layers, mtp);
+  st->sizes = plan(g, kv_format, lanes, draft_tokens, row_budget, attention_layers, gdn_layers, mtp, axis_records);
   const uint32_t rows = max_rows_of(lanes, draft_tokens, row_budget);
   try {
     const auto buffer = [](std::size_t bytes) { return std::make_unique<ninfer::DeviceBuffer>(aligned(bytes)); };
@@ -623,8 +674,11 @@ bool sections_of(const ignis_seq_pool &pool, const Geometry &g, int32_t gdn_laye
   s.attention_layers = pool.kv_num_layers;
   s.gdn_layers = gdn_layers;
   s.tail_slot_elements = static_cast<int64_t>(pool.indexer_tail_slot_bytes / sizeof(__nv_bfloat16));
+  s.block_tables = static_cast<const int32_t *>(pool.kv_pool.block_tables().data);
+  s.logical_pages = static_cast<int32_t>(pool.kv_pool.logical_page_capacity());
   for (int32_t a = 0; a < s.attention_layers; ++a) {
     s.tails[a] = pool.indexer_tail_keys(a);
+    s.block_keys[a] = pool.indexer_block_keys(a);
     if (pool.has_hq_residual()) {
       s.residual_k[a] = pool.hq_residual_plane(false, a, 0);
       s.residual_v[a] = pool.hq_residual_plane(true, a, 0);
@@ -654,10 +708,12 @@ bool sections_of(const ignis_seq_pool &pool, const Geometry &g, int32_t gdn_laye
 
 int32_t save(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
              const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error) {
-  if (!fits(state, lanes, window, "verify save", error)) return -1;
+  if (!fits(state, lanes, window, "verify save", error) || !records_fit(state, sections, "verify save", error)) {
+    return -1;
+  }
   const uint32_t row_columns = max_ring_columns_of(state.lanes, state.draft_tokens, state.row_budget, state.mtp);
   const SavedLayout layout = saved_layout(g, sections.ring != nullptr ? IGNIS_KV_FORMAT_HQ_E8_2B : IGNIS_KV_FORMAT_BF16,
-                                          state.lanes, row_columns, sections.attention_layers);
+                                          state.lanes, row_columns, sections.attention_layers, state.axis_records);
   const auto ring_columns = static_cast<int32_t>(written_positions(window, state.mtp));
   auto *saved = static_cast<unsigned char *>(state.saved->p);
   SaveArgs a{sections,
@@ -671,7 +727,8 @@ int32_t save(const State &state, const Sections &sections, const Geometry &g, ui
              ring_columns,
              static_cast<int32_t>(row_columns),
              layout.tail_elements,
-             layout.ngram_elements};
+             layout.ngram_elements,
+             state.axis_records ? reinterpret_cast<int32_t *>(saved + layout.records_at()) : nullptr};
   const auto n = static_cast<unsigned>(lanes);
   save_tails_kernel<<<dim3(static_cast<unsigned>(sections.attention_layers), n), kThreads, 0, stream>>>(a);
   if (!launched("verify save: tails", error)) return -1;
@@ -740,11 +797,16 @@ int32_t fold(const State &state, const Sections &sections, uint32_t lanes, uint3
 }
 
 int32_t restore(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
-                const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error) {
-  if (!fits(state, lanes, window, "verify commit: restore", error)) return -1;
+                const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error,
+                const int32_t *rope_deltas) {
+  if (!fits(state, lanes, window, "verify commit: restore", error) ||
+      !records_fit(state, sections, "verify commit: restore", error)) {
+    return -1;
+  }
   const auto n = static_cast<unsigned>(lanes);
   const auto ring_columns = static_cast<int32_t>(written_positions(window, state.mtp));
-  const RestoreArgs r = restore_args(state, sections, g, lanes, window, slots, positions, ring_columns, 0);
+  const RestoreArgs r =
+      restore_args(state, sections, g, lanes, window, slots, positions, ring_columns, 0, rope_deltas);
   restore_tails_kernel<<<dim3(static_cast<unsigned>(sections.attention_layers), n), static_cast<unsigned>(g.indexer_head_dim), 0,
                          stream>>>(r);
   if (!launched("verify commit: indexer tails", error)) return -1;
@@ -760,16 +822,20 @@ int32_t restore(const State &state, const Sections &sections, const Geometry &g,
 }
 
 int32_t restore_head(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
-                     const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error) {
+                     const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error,
+                     const int32_t *rope_deltas) {
   if (!state.mtp) {
     *error = "verify restore_head: this load has no MTP head";
     return -1;
   }
-  if (!fits(state, lanes, window, "verify restore_head", error)) return -1;
+  if (!fits(state, lanes, window, "verify restore_head", error) ||
+      !records_fit(state, sections, "verify restore_head", error)) {
+    return -1;
+  }
   const auto n = static_cast<unsigned>(lanes);
   const auto columns = static_cast<int32_t>(window + 1);
   const RestoreArgs r = restore_args(state, sections, g, lanes, window, slots, positions, columns,
-                                     sections.attention_layers - 1);
+                                     sections.attention_layers - 1, rope_deltas);
   restore_tails_kernel<<<dim3(1, n), static_cast<unsigned>(g.indexer_head_dim), 0, stream>>>(r);
   if (!launched("verify drafting: the head's indexer tail", error)) return -1;
   if (sections.ring != nullptr) {
