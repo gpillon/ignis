@@ -773,7 +773,7 @@ jobs:
             - RTX 30 cards (Ampere): the RTX 3090 and 3090 Ti are supported,
               on the 27B's 16 GB entries;
             - RTX 40 cards (Ada), on the 8.6 code: the RTX 4090 and the 16 GB
-              cards are expected to work, and reports are welcome;
+              cards are verified for correctness, and reports are welcome;
             - RTX 50 and RTX PRO 6000 cards (Blackwell).
 
             The NVFP4 27B, Flash-Next and the image model load on Blackwell
