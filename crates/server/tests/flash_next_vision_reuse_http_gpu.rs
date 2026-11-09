@@ -28,7 +28,7 @@
 //! answer and every count is printed.
 //!
 //! ```text
-//! cargo test -p ignis-server --features cuda --test flash_next_vision_reuse_gpu -- --ignored --nocapture
+//! cargo test -p ignis-server --features cuda --test flash_next_vision_reuse_http_gpu -- --ignored --nocapture
 //! ```
 //!
 //! Run under `scripts/gpu-profile.ps1` only (`IGNIS_GPU_PROFILE=1`): it needs
