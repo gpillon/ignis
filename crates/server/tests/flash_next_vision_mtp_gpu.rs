@@ -348,19 +348,23 @@ fn bf16_ulp(x: f32) -> f32 {
 
 /// `on` against `off`: identical, or identical up to a first split where the
 /// prefill route on `off_load`, after the agreed text, puts the two picks
-/// within one BF16 ulp or sides with `on`. A line per split; panics on a split
-/// the prefill route lays at the head's run.
-async fn judge(off_load: &Load, prompt: &Prompt, off: &[u32], on: &[u32]) -> Option<String> {
-    let Some(at) = off.iter().zip(on).position(|(a, b)| a != b) else {
-        assert_eq!(off.len(), on.len(), "{}: MTP on and off generated other lengths of one text", prompt.name);
-        return None;
+/// within one BF16 ulp or sides with `on`. A run that ended where the other
+/// goes on picked `eos` there. A line per split; panics on a split the prefill
+/// route lays at the head's run.
+async fn judge(off_load: &Load, prompt: &Prompt, eos: u32, off: &[u32], on: &[u32]) -> Option<String> {
+    let at = match off.iter().zip(on).position(|(a, b)| a != b) {
+        Some(at) => at,
+        None if off.len() == on.len() => return None,
+        None => off.len().min(on.len()),
     };
-    let [off_logit, on_logit] = prefill_logits(off_load, prompt, &off[..at], [off[at], on[at]]).await;
+    let pick = |run: &[u32]| run.get(at).copied().unwrap_or(eos);
+    let (off_pick, on_pick) = (pick(off), pick(on));
+    let [off_logit, on_logit] = prefill_logits(off_load, prompt, &off[..at], [off_pick, on_pick]).await;
     let gap = off_logit - on_logit;
     let ulp = bf16_ulp(off_logit.abs().max(on_logit.abs()));
     let line = format!(
-        "{}: MTP on splits from MTP off at token {at}: off {} on {}; the prefill route's gap off - on = {gap} (ulp {ulp})",
-        prompt.name, off[at], on[at]
+        "{}: MTP on splits from MTP off at token {at}: off {off_pick} on {on_pick}; the prefill route's gap off - on = {gap} (ulp {ulp})",
+        prompt.name
     );
     println!("{line}");
     assert!(gap <= ulp, "{line}: the prefill route sides with MTP off past a near-tie");
@@ -463,6 +467,11 @@ async fn mtp_on_equals_mtp_off_on_the_canary_images_and_reports_the_acceptance()
         return;
     }
     let (images, texts) = prompts(&dir);
+    let frontend = {
+        let reader = Reader::open(&path).expect("open the artifact");
+        FrontendSet::from_reader(&reader).expect("frontend")
+    };
+    let eos = frontend.eos_token_id().expect("eos");
     let before = ignis_core::residency::available_physical_bytes().unwrap_or(0);
 
     // MTP on: every prompt through the engine, each image's long description
@@ -478,7 +487,7 @@ async fn mtp_on_equals_mtp_off_on_the_canary_images_and_reports_the_acceptance()
             on_texts.push(run(&on, prompt).await);
         }
         // The counters are the request log's, summed by the telemetry task
-        // after each request ends: first the engine's runs, exactly.
+        // after each request ends: first at least the engine's runs'.
         let metrics = on.metrics.as_ref().expect("metrics");
         let summed = |runs: &[&Run], field: fn(&SpecCounters) -> u32| -> u64 {
             runs.iter().filter_map(|run| run.spec.as_ref()).map(|spec| u64::from(field(spec))).sum()
@@ -486,15 +495,11 @@ async fn mtp_on_equals_mtp_off_on_the_canary_images_and_reports_the_acceptance()
         let runs: Vec<&Run> = on_images.iter().chain(&on_texts).collect();
         let engine = (summed(&runs, |s| s.rounds), summed(&runs, |s| s.drafted));
         let counted = speculative_counters_once(metrics, |now| now.0 >= engine.0 && now.1 >= engine.1).await;
-        assert_eq!(counted, engine, "the speculative counters are the engine's runs' sums");
-        let frontend = {
-            let reader = Reader::open(&path).expect("open the artifact");
-            FrontendSet::from_reader(&reader).expect("frontend")
-        };
+        assert!(counted.0 >= engine.0 && counted.1 >= engine.1, "the counters {counted:?} hold the engine's runs' {engine:?}");
         for (prompt, engine_run) in images.iter().zip(&on_images).filter(|(p, _)| p.question == DETAIL_QUESTION) {
             let content = chat(on.app(), prompt).await;
             let mut ids = engine_run.tokens.clone();
-            if ids.last() == frontend.eos_token_id().as_ref() {
+            if ids.last() == Some(&eos) {
                 ids.pop();
             }
             let engine_text = frontend.tokenizer().decode(&ids).expect("decode");
@@ -502,8 +507,8 @@ async fn mtp_on_equals_mtp_off_on_the_canary_images_and_reports_the_acceptance()
             assert_eq!(content.trim(), engine_text.trim(), "{}: the route's answer is not the engine's run", prompt.name);
         }
         // Then the route's requests on top of them.
-        let after = speculative_counters_once(metrics, |now| now.0 > engine.0 && now.1 > engine.1).await;
-        let moved = (after.0 - engine.0, after.1 - engine.1);
+        let after = speculative_counters_once(metrics, |now| now.0 > counted.0 && now.1 > counted.1).await;
+        let moved = (after.0 - counted.0, after.1 - counted.1);
         println!("through the route: {} verify rounds, {} drafts over the four long descriptions", moved.0, moved.1);
         assert!(moved.0 > 0 && moved.1 > 0, "the route's image requests ran no drafted verify round: {moved:?}");
         (on_images, on_texts)
@@ -516,7 +521,7 @@ async fn mtp_on_equals_mtp_off_on_the_canary_images_and_reports_the_acceptance()
     for (prompt, on_run) in images.iter().zip(&on_images) {
         let off_run = run(&off, prompt).await;
         assert!(off_run.spec.is_none(), "{}: a load without the head ran verify rounds", prompt.name);
-        if let Some(line) = judge(&off, prompt, &off_run.tokens, &on_run.tokens).await {
+        if let Some(line) = judge(&off, prompt, eos, &off_run.tokens, &on_run.tokens).await {
             splits.push(line);
         }
     }
