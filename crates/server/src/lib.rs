@@ -518,8 +518,9 @@ impl Server {
     }
 
     /// The content-part check every endpoint runs before admission (GitHub
-    /// #175, #179): an image is refused on a load without vision, and on
-    /// Flash-Next, which has no vision tower, the refusal names the model.
+    /// #175, #179): an image is refused on a load without vision, and on a
+    /// model with no vision tower ([`ignis_core::compute::ModelFamily::takes_images`]) the
+    /// refusal names the model. Both text models have one since GitHub #557.
     pub fn check_content_parts(
         &self,
         messages: &[template::ChatMessage],

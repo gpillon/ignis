@@ -46,17 +46,19 @@ pub struct HostPlanRequest {
     /// of the load (ADR 0062); 0 on Flash-Next, whose embedding is on the
     /// device.
     pub token_embedding_bytes: u64,
-    /// The 27B's vision tower in the same mapped pinned allocation, staged
-    /// into the prefill scratch for each media encode (ADR 0075): its spans,
-    /// with their 4 KiB padding. 0 when the tower is on the device, without
-    /// vision, and on Flash-Next.
+    /// The vision tower in mapped pinned host memory, staged into the
+    /// prefill scratch for each media encode (ADR 0075): its spans, with
+    /// their 4 KiB padding -- the 27B's in the token embedding's allocation,
+    /// Flash-Next's vision companion's in one of its own, made before its
+    /// residency phase (GitHub #557, ADR 0087). 0 when the tower is on the
+    /// device, and without vision.
     pub vision_tower_bytes: u64,
-    /// The 27B's embedding pool in a mapped pinned allocation of its own,
-    /// made by the model's load, which the encode writes and the prefill
-    /// chunk's scatter reads in place (ADR 0075, GitHub #415): the load's
-    /// `--vision-embedding-pool-mib`, floored and rounded to column pages
-    /// ([`crate::Vision::pool_bytes`]). 0 when the pool is on the device,
-    /// without vision, and on Flash-Next.
+    /// The embedding pool in a mapped pinned allocation of its own, made by
+    /// the model's load, which the encode writes and the prefill chunk's
+    /// scatter reads in place (ADR 0075, GitHub #415): the load's
+    /// `--vision-embedding-pool-mib`, floored and rounded to column pages at
+    /// the model's hidden width ([`crate::Vision::pool_bytes`]). 0 when the
+    /// pool is on the device, and without vision.
     pub vision_pool_bytes: u64,
     /// The expert pool, pinned for the life of the load: every expert
     /// projection ([`ExpertCatalog::total_bytes`] of the artifact) but a
@@ -111,9 +113,10 @@ pub const HOST_PLAN_LINES: usize = 9;
 
 /// When a line holds its bytes, in the order a Flash-Next load allocates
 /// them (`FlashNextLeaf::open`, then the server's load): the residency phase
-/// (the 27B's token embedding and vision tower, which a Flash-Next load has
-/// none of, and the expert pool, or a device-only load's layer buffers); then
-/// the 27B's embedding pool, which its model load makes; then the n-gram
+/// (the 27B's token embedding, which a Flash-Next load has none of, the
+/// vision tower -- Flash-Next's placed before its residency phase, GitHub
+/// #557 -- and the expert pool, or a device-only load's layer buffers); then
+/// the embedding pool, which the model load makes; then the n-gram
 /// hot rows and the KV-RAM arena; the model's sequence pool with the retained
 /// host slots; KV-disk's staging last. Nothing the plan holds is freed before
 /// the model drops but the layer buffers, which are gone when the residency
@@ -249,31 +252,53 @@ impl std::fmt::Display for HostPlanError {
             ),
             // ADR 0075: a `host` start never falls back to the device, so the
             // refusal names both ways out, for the tower and the pool together.
-            "vision_tower" => match line("vision_pool") {
+            // GitHub #557: Flash-Next's tower is its vision companion's, with
+            // no token embedding to fit before it.
+            "vision_tower" => {
+                let fits = if line("token_embedding") > 0 { "The token embedding fits, the" } else { "The" };
+                match line("vision_pool") {
+                    0 => write!(
+                        f,
+                        "{fits} vision tower ({}) does not: keep it in VRAM {VISION_WAYS_OUT}",
+                        human_bytes(line("vision_tower"))
+                    ),
+                    pool => write!(
+                        f,
+                        "{fits} vision tower ({}) and its embedding pool ({}) do not: keep them in VRAM \
+                         {VISION_WAYS_OUT}",
+                        human_bytes(line("vision_tower")),
+                        human_bytes(pool)
+                    ),
+                }
+            }
+            "vision_pool" => {
+                let fits = if line("token_embedding") > 0 {
+                    "The token embedding and the vision tower fit"
+                } else {
+                    "The vision tower fits"
+                };
+                write!(
+                    f,
+                    "{fits}, the embedding pool ({}) does not: keep them in VRAM {VISION_WAYS_OUT}",
+                    human_bytes(line("vision_pool"))
+                )
+            }
+            // GitHub #557: a Flash-Next vision load's tower and pool come
+            // before its experts, and dropping them is a way out.
+            "expert_pool" => match line("vision_tower") + line("vision_pool") {
                 0 => write!(
                     f,
-                    "The token embedding fits, the vision tower ({}) does not: keep it in VRAM {VISION_WAYS_OUT}",
-                    human_bytes(line("vision_tower"))
+                    "Even the experts alone ({}) do not fit: close other applications",
+                    human_bytes(line("expert_pool"))
                 ),
-                pool => write!(
+                vision => write!(
                     f,
-                    "The token embedding fits, the vision tower ({}) and its embedding pool ({}) do not: keep them \
-                     in VRAM {VISION_WAYS_OUT}",
-                    human_bytes(line("vision_tower")),
-                    human_bytes(pool)
+                    "The experts ({}) do not fit beside the vision tower and its embedding pool ({}): keep those in \
+                     VRAM {VISION_WAYS_OUT}",
+                    human_bytes(line("expert_pool")),
+                    human_bytes(vision)
                 ),
             },
-            "vision_pool" => write!(
-                f,
-                "The token embedding and the vision tower fit, the embedding pool ({}) does not: keep them in VRAM \
-                 {VISION_WAYS_OUT}",
-                human_bytes(line("vision_pool"))
-            ),
-            "expert_pool" => write!(
-                f,
-                "Even the experts alone ({}) do not fit: close other applications",
-                human_bytes(line("expert_pool"))
-            ),
             "load_staging" => f.write_str(
                 "The experts' layer buffers do not fit while the load reads them into VRAM: close other applications",
             ),

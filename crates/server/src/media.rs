@@ -177,9 +177,16 @@ pub fn load_processor(
 /// `processor` at a load's context `max_context` rather than the one it was
 /// built at: the context a 27B load runs, which its adaptation may have
 /// lowered (ADR 0063 §3). Its request budget, and so its item bound, follow
-/// the envelope the leaf planned.
+/// the envelope the leaf planned; and an item bound the load holds below the
+/// artifact's (`vision`'s, GitHub #557: Flash-Next's encode in its prefill
+/// scratch, ADR 0087) lowers the pixel bound to its area, so a larger image
+/// is shrunk to fit, aspect kept, as the request budget shrinks one.
 pub fn processor_at(processor: VisionProcessor, vision: ignis_core::Vision, max_context: u32) -> VisionProcessor {
-    let options = bounded_options(processor.options().clone(), vision, max_context);
+    let mut options = bounded_options(processor.options().clone(), vision, max_context);
+    if vision.item_max_tokens() > 0 {
+        let factor = ignis_artifact::vision::FACTOR as u64;
+        options.max_pixels = options.max_pixels.min(u64::from(vision.item_max_tokens()) * factor * factor);
+    }
     processor.with_options(options)
 }
 
@@ -1019,6 +1026,38 @@ mod tests {
         assert_eq!((options.min_pixels, options.max_pixels), (artifact.min_pixels, artifact.max_pixels));
         let wider = processor_at(adapted, vision, 196_608);
         assert_eq!(wider.options().max_vision_tokens, 131_072, "the vision envelope below the context");
+    }
+
+    /// GitHub #557 (ADR 0087): a load whose encoder holds a smaller item than
+    /// the artifact's bound -- Flash-Next's, in its prefill scratch -- serves
+    /// that bound: the processor's pixel bound lowered to its area, so an
+    /// image at the artifact's bound is shrunk to fit, aspect kept, never
+    /// refused. A bound at or past the artifact's changes nothing.
+    #[test]
+    fn a_processor_serves_the_item_bound_its_load_holds() {
+        let artifact = ProcessorOptions {
+            min_pixels: 256 * 256,
+            max_pixels: 4096 * 4096,
+            max_encoded_media_bytes: 1 << 20,
+            max_decoded_pixels: 1 << 28,
+            max_raw_patches: 1 << 17,
+            max_vision_tokens: 1 << 15,
+        };
+        let vision = ignis_core::Vision::default();
+        let unbounded = processor_at(processor(artifact.clone()), vision, 262_144);
+        assert_eq!(unbounded.options().max_item_tokens(), 16_384, "the artifact's 4096 x 4096");
+        let at_the_artifacts = processor_at(processor(artifact.clone()), vision.with_item_max_tokens(16_384), 262_144);
+        assert_eq!(at_the_artifacts.options(), unbounded.options());
+
+        let held = processor_at(processor(artifact.clone()), vision.with_item_max_tokens(5_000), 262_144);
+        let options = held.options();
+        assert_eq!(options.max_item_tokens(), 5_000);
+        assert_eq!((options.min_pixels, options.max_vision_tokens), (artifact.min_pixels, artifact.max_vision_tokens));
+        let size = options.resize_target(4096, 2048).expect("shrunk, not refused");
+        let tokens = u64::from(size.height / 32) * u64::from(size.width / 32);
+        assert!(tokens <= 5_000 && tokens > 4_000, "{size:?}: {tokens} tokens");
+        let aspect = f64::from(size.height) / f64::from(size.width);
+        assert!((aspect - 2.0).abs() < 0.05, "aspect kept: {size:?}");
     }
 
     fn b64(bytes: &[u8]) -> String {

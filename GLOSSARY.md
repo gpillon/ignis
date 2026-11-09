@@ -935,8 +935,9 @@ _Avoid_: idle chunk, burst chunk.
 **Prefill scratch**:
 The load's one device region for a step's transient buffers, sized at load for
 the larger of what a **solo width** chunk needs and what a **media encode** of
-one **item bound** needs (the VRAM plan's `workspace` line). The two never run at
-once, and nothing in it survives from one step to the next.
+one **item bound** needs (the VRAM plan's `workspace` line); on Flash-Next for
+the chunk alone, the **item bound** being what it holds (ADR 0087). The two
+never run at once, and nothing in it survives from one step to the next.
 _Avoid_: workspace (a user's files), arena (KV-RAM's).
 
 **Per-token prefill route**:
@@ -1187,8 +1188,10 @@ counted in.
 
 **Item bound**:
 The most **vision tokens** one **media item** may take: the smaller of the
-request's envelope and the artifact's pixel bound (16,384 for the 27B), so an
-envelope of 32,768 still bounds each image at 16,384. An image over it is
+request's envelope and the artifact's pixel bound (16,384 for the 27B and for
+Flash-Next), so an envelope of 32,768 still bounds each image at 16,384. On
+Flash-Next it is also no larger than the item whose **media encode** its
+**prefill scratch** holds on its own (#557, ADR 0087). An image over it is
 downscaled onto a smaller grid, not refused (#248).
 _Avoid_: envelope (the request's total).
 

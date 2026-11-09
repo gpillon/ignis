@@ -1023,8 +1023,11 @@ async fn under_auto_a_24gb_card_runs_rtx_24gb_and_the_config_says_so() {
         assert_eq!(qwen.0["prefill_chunk_solo"], 2048, "the profile pins the 27B's to its chunk: {document}");
         assert_eq!((&qwen.1["backend"], &qwen.1["draft_tokens"]), (&json!("dflash2"), &json!(7)), "{band}: {document}");
         assert_eq!(qwen.2["headroom_bytes"], "1200M", "{band}: {document}");
-        let vision = &document["vision"]["qwen38"];
-        assert_eq!((&vision["enabled"], &vision["residency"], &vision["max_tokens"]), (&json!(true), &json!("host"), &json!(32768)), "{band}: {document}");
+        // GitHub #557: vision is both models' and on for the 27B alone; its
+        // envelope and residency are both models'.
+        let vision = &document["vision"];
+        assert_eq!((&vision["qwen38"]["enabled"], &vision["residency"], &vision["max_tokens"]), (&json!(true), &json!("host"), &json!(32768)), "{band}: {document}");
+        assert_eq!(vision["enabled"], false, "Flash-Next's stays off: {document}");
         assert_eq!(qwen.0["prefill_attention"], band, "{document}");
         // Spec #503 (GitHub #505): the prefill route is reported as the load resolves it.
         assert_eq!(qwen.0["prefill_linear"], route, "{document}");
@@ -1033,7 +1036,7 @@ async fn under_auto_a_24gb_card_runs_rtx_24gb_and_the_config_says_so() {
         let (status, origins) = send(&app, Method::GET, "/v1/config/origins", None).await;
         assert_eq!(status, StatusCode::OK, "{origins}");
         let profile = |key: &str| origins_of(&origins, key).into_iter().find(|(scope, ..)| scope == "qwen38").unwrap();
-        for key in ["model.max_context", "model.prefill_chunk", "spec.backend", "spec.draft_tokens", "vram.headroom_bytes"] {
+        for key in ["model.max_context", "model.prefill_chunk", "spec.backend", "spec.draft_tokens", "vram.headroom_bytes", "vision.enabled"] {
             assert_eq!(profile(key), (json!("qwen38"), "profile".to_owned(), true, Some("rtx-24gb".to_owned())), "{band}: {key}");
         }
         for key in ["model.prefill_linear", "model.prefill_attention"] {

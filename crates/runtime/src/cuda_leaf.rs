@@ -707,6 +707,7 @@ impl StepLeaf for CudaLeaf {
             // GitHub #210: read off the model's and the pool's own buffers,
             // for the load to check against its VRAM plan.
             reserved: loaded_reserved_bytes(&model.model, &model.pool),
+            vision_item_max_tokens: model.model.vision_item_max_tokens(),
         })
     }
 

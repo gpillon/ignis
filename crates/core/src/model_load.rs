@@ -205,9 +205,22 @@ pub(crate) mod ffi {
             out: *mut IgnisModelReservations,
         ) -> i32;
 
+        pub fn ignis_model_plan_vision_item_max_tokens(
+            tensors: *const IgnisBoundTensor,
+            count: u64,
+            topology: *const IgnisTopology,
+            prefill_chunk_tokens: u32,
+            max_context_tokens: u32,
+            kv_format: i32,
+            options: *const IgnisModelLoadOptions,
+            out_tokens: *mut u32,
+        ) -> i32;
+
         pub fn ignis_model_stats(model: *const IgnisModel, out_stats: *mut IgnisModelStats) -> i32;
 
         pub fn ignis_model_gdn_prefill(model: *const IgnisModel) -> u32;
+
+        pub fn ignis_model_vision_item_max_tokens(model: *const IgnisModel) -> u32;
 
         pub fn ignis_model_free(model: *mut IgnisModel);
 
@@ -236,6 +249,15 @@ impl Model {
     pub fn gdn_prefill(&self) -> crate::GdnPrefill {
         let code = unsafe { ffi::ignis_model_gdn_prefill(self.handle) };
         crate::GdnPrefill::from_abi(code).unwrap_or_else(|| panic!("ignis_model_gdn_prefill: unknown route {code}"))
+    }
+
+    /// The most merged tokens one media item may hold on this load (GitHub
+    /// #557): what its encoder's share of the scratch was sized for, and so
+    /// the item bound its processor serves. Flash-Next's is the largest item
+    /// its prefill scratch holds on its own, at most the bound it was loaded
+    /// with (ADR 0087). 0 without vision.
+    pub fn vision_item_max_tokens(&self) -> u32 {
+        unsafe { ffi::ignis_model_vision_item_max_tokens(self.handle) }
     }
 
     /// The raw handle the step ABI (`crate::step`, GitHub #54) passes to
@@ -604,35 +626,72 @@ fn build_bound_tensors(
             (0.0, 0.0)
         };
 
-        if view.shape.len() > 4 {
-            return Err(format!("{}: rank {} exceeds the ABI's rank-4 shape", entry.name, view.shape.len()));
-        }
-        let mut shape = [1i32; 4];
-        for (dst, &dim) in shape.iter_mut().zip(view.shape.iter()) {
-            *dst = i32::try_from(dim)
-                .map_err(|_| format!("{}: dimension {dim} overflows i32", entry.name))?;
-        }
-        // No distinct padded shape is tracked by `TensorView` today (every
-        // text-scope tensor's stored shape is already the padded one, per
-        // the container's own geometry); carry the same value until a
-        // padded-vs-logical distinction is needed.
-        let padded_shape = shape;
+        let (name, tensor) = placed_descriptor(entry.name, &view, weight_scale_divisor, input_scale_divisor)?;
+        tensors.push(tensor);
+        names.push(name);
+    }
+    Ok((names, tensors))
+}
 
-        let name = CString::new(entry.name).map_err(|e| e.to_string())?;
-        tensors.push(ffi::IgnisBoundTensor {
-            name: name.as_ptr(),
-            qtype: qtype_code(view.format),
-            layout: layout_code(view.layout),
-            qdata: view.qdata,
-            qhigh: view.qhigh,
-            scales: view.scales,
-            bytes: view.bytes,
-            shape,
-            padded_shape,
-            ndim: view.shape.len() as u32,
-            weight_scale_divisor,
-            input_scale_divisor,
-        });
+/// One bound-tensor descriptor: `name` at `view`, with its NVFP4 divisors
+/// (0 for any other format). The returned name is what the descriptor
+/// points into.
+fn placed_descriptor(
+    name: &str,
+    view: &TensorPlacement,
+    weight_scale_divisor: f32,
+    input_scale_divisor: f32,
+) -> Result<(CString, ffi::IgnisBoundTensor), String> {
+    if view.shape.len() > 4 {
+        return Err(format!("{name}: rank {} exceeds the ABI's rank-4 shape", view.shape.len()));
+    }
+    let mut shape = [1i32; 4];
+    for (dst, &dim) in shape.iter_mut().zip(view.shape.iter()) {
+        *dst = i32::try_from(dim).map_err(|_| format!("{name}: dimension {dim} overflows i32"))?;
+    }
+    // No distinct padded shape is tracked by `TensorView` today (every
+    // text-scope tensor's stored shape is already the padded one, per
+    // the container's own geometry); carry the same value until a
+    // padded-vs-logical distinction is needed.
+    let padded_shape = shape;
+
+    let name = CString::new(name).map_err(|e| e.to_string())?;
+    let tensor = ffi::IgnisBoundTensor {
+        name: name.as_ptr(),
+        qtype: qtype_code(view.format),
+        layout: layout_code(view.layout),
+        qdata: view.qdata,
+        qhigh: view.qhigh,
+        scales: view.scales,
+        bytes: view.bytes,
+        shape,
+        padded_shape,
+        ndim: view.shape.len() as u32,
+        weight_scale_divisor,
+        input_scale_divisor,
+    };
+    Ok((name, tensor))
+}
+
+/// Flash-Next's vision tower descriptors (GitHub #557, ADR 0087): every
+/// object of its companion, `entries` in the order `handles` were bound in
+/// ([`ignis_artifact::flash_next::vision::bind`], the
+/// [`ignis_artifact::vision_scope`] at its merger's width), at the addresses
+/// `placement` gives -- the 27B's tower schema, which the leaf binds with the
+/// merger at the text model's hidden width.
+fn vision_bound_tensors(
+    entries: &[InventoryEntry],
+    handles: &[ObjectHandle],
+    placement: impl Fn(ObjectHandle, &InventoryEntry) -> Result<TensorPlacement, String>,
+) -> Result<(Vec<CString>, Vec<ffi::IgnisBoundTensor>), String> {
+    if entries.len() != handles.len() {
+        return Err(format!("the vision tower bound {} objects of {}", handles.len(), entries.len()));
+    }
+    let mut names = Vec::with_capacity(entries.len());
+    let mut tensors = Vec::with_capacity(entries.len());
+    for (entry, &handle) in entries.iter().zip(handles) {
+        let (name, tensor) = placed_descriptor(entry.name, &placement(handle, entry)?, 0.0, 0.0)?;
+        tensors.push(tensor);
         names.push(name);
     }
     Ok((names, tensors))
@@ -953,6 +1012,16 @@ fn bound_tensors(
     Ok((names, tensors))
 }
 
+/// Flash-Next's vision tower descriptors at the addresses its materialized
+/// companion `artifact` gives (GitHub #557): what a load with vision hands
+/// the leaf beside the trunk's.
+pub(crate) fn vision_tower_tensors(
+    plan: &crate::flash_next_vision::TowerPlan,
+    artifact: &MaterializedArtifact,
+) -> Result<(Vec<CString>, Vec<ffi::IgnisBoundTensor>), String> {
+    vision_bound_tensors(&plan.entries, &plan.plan.handles, device_placement(artifact))
+}
+
 /// The MTP head's 29 non-expert descriptors (flash-next-layout.md §13.3), each placed
 /// through `placement`: what an MTP load hands the leaf beside the trunk's.
 pub fn mtp_bound_tensors(
@@ -1022,8 +1091,9 @@ fn flash_next_options(
 /// the device (`fn_plan` and `geometry` as
 /// [`ignis_artifact::flash_next::bind`] took them), under `shape` (its
 /// decode lanes, its speculation and its rotary table among them), with the
-/// expert residency it borrows. The returned model must be dropped before
-/// `residency` and `artifact` (GitHub #302).
+/// expert residency it borrows, and with vision (GitHub #557) its
+/// companion's `tower`. The returned model must be dropped before
+/// `residency`, `tower` and `artifact` (GitHub #302).
 pub fn load_flash_next(
     fn_plan: &FlashNextPlan,
     geometry: &FlashNextGeometry,
@@ -1031,6 +1101,7 @@ pub fn load_flash_next(
     shape: FlashNextLoadShape,
     residency: &crate::residency::device::DeviceResidency,
     mtp: Option<&crate::flash_next_mtp::MtpHead>,
+    tower: Option<&crate::flash_next_vision::Tower>,
 ) -> Result<Model, String> {
     let FlashNextLoadShape {
         prefill_chunk_tokens,
@@ -1054,6 +1125,14 @@ pub fn load_flash_next(
     if let Some(head) = mtp {
         tensors.extend_from_slice(head.bound_tensors());
         options.mtp_expert_slots = head.slots().as_ptr();
+    }
+    // GitHub #557: the vision companion's tower, which the leaf binds into
+    // the 27B's tower schema; a load with vision needs it.
+    match (vision, tower) {
+        (Some(_), Some(tower)) => tensors.extend_from_slice(tower.bound_tensors()),
+        (Some(_), None) => return Err("a Flash-Next load with vision needs its vision companion's tower".into()),
+        (None, Some(_)) => return Err("a vision tower on a Flash-Next load without vision".into()),
+        (None, None) => {}
     }
     let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
     let rc = unsafe {
@@ -1081,13 +1160,30 @@ pub fn load_flash_next(
 /// `geometry`. The topology is the geometry's
 /// ([`ModelConfig::flash_next_from`]). The leaf binds the descriptors
 /// first and then checks the geometry its program runs, so a reduced
-/// fixture's refusal still says its descriptors bind.
+/// fixture's refusal still says its descriptors bind. With vision (GitHub
+/// #557), `tower` is its companion's bind, whose descriptors the leaf binds
+/// beside the trunk's.
 pub fn plan_flash_next_reservations(
     fn_plan: &FlashNextPlan,
     geometry: &FlashNextGeometry,
     shape: FlashNextLoadShape,
     mtp: Option<&ignis_artifact::flash_next::mtp::MtpPlan>,
+    tower: Option<&crate::flash_next_vision::TowerPlan>,
 ) -> Result<IgnisModelReservations, String> {
+    plan_flash_next(fn_plan, geometry, shape, mtp, tower).map(|(reservations, _)| reservations)
+}
+
+/// [`plan_flash_next_reservations`], and with vision (GitHub #557) the item
+/// bound the load would hold ([`Model::vision_item_max_tokens`]): the
+/// largest item its prefill scratch holds on its own, at most the one
+/// `shape`'s vision asks for (ADR 0087); 0 without vision.
+pub fn plan_flash_next(
+    fn_plan: &FlashNextPlan,
+    geometry: &FlashNextGeometry,
+    shape: FlashNextLoadShape,
+    mtp: Option<&ignis_artifact::flash_next::mtp::MtpPlan>,
+    tower: Option<&crate::flash_next_vision::TowerPlan>,
+) -> Result<(IgnisModelReservations, u32), String> {
     let FlashNextLoadShape {
         prefill_chunk_tokens,
         max_context_tokens,
@@ -1121,6 +1217,14 @@ pub fn plan_flash_next_reservations(
         None => (Vec::new(), Vec::new()),
     };
     tensors.extend(head);
+    // GitHub #557: the vision companion's tower, placed nowhere yet.
+    let (_tower_names, tower) = match (vision, tower) {
+        (Some(_), Some(tower)) => vision_bound_tensors(&tower.entries, &tower.plan.handles, planned_placement(&tower.plan.plan))?,
+        (Some(_), None) => return Err("a Flash-Next plan with vision needs its vision companion's tower".into()),
+        (None, Some(_)) => return Err("a vision tower on a Flash-Next plan without vision".into()),
+        (None, None) => (Vec::new(), Vec::new()),
+    };
+    tensors.extend(tower);
     let topology = ModelConfig::flash_next_from(geometry).topology_abi();
     let options = flash_next_options(decode_lanes, std::ptr::null_mut(), speculation, rope_scaling, vision);
     let mut reservations = IgnisModelReservations::default();
@@ -1140,7 +1244,26 @@ pub fn plan_flash_next_reservations(
         let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
         return Err(message.to_string_lossy().into_owned());
     }
-    Ok(reservations)
+    let mut item_max_tokens = 0u32;
+    if vision.is_some() {
+        let rc = unsafe {
+            ffi::ignis_model_plan_vision_item_max_tokens(
+                tensors.as_ptr(),
+                tensors.len() as u64,
+                topology.raw(),
+                prefill_chunk_tokens,
+                max_context_tokens,
+                kv_format.abi_code(),
+                &options,
+                &mut item_max_tokens,
+            )
+        };
+        if rc != 0 {
+            let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
+            return Err(message.to_string_lossy().into_owned());
+        }
+    }
+    Ok((reservations, item_max_tokens))
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,7 +1301,7 @@ mod tests {
                 rope_scaling: scaling,
                 vision: None,
             };
-            let err = plan_flash_next_reservations(&fn_plan, &tree.geometry, shape, None)
+            let err = plan_flash_next_reservations(&fn_plan, &tree.geometry, shape, None, None)
                 .expect_err("the fixture's geometry is not one the program runs");
             assert!(err.contains("does not run this geometry (its weights bind)"), "{scaling}: {err}");
         }

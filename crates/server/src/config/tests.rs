@@ -1891,7 +1891,7 @@ fn a_switch_resolves_each_familys_rope_table_against_its_own_context() {
 // ── the loaded model's family (spec flash-next/04, GitHub #302) ──────────
 
 #[test]
-fn flash_next_refuses_speculation_and_vision_at_start_naming_itself() {
+fn flash_next_refuses_the_27bs_drafter_at_start_naming_itself() {
     let spec = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7"]);
     let err = served_model_for(&spec, ModelFamily::FlashNext).expect_err("the 27B's drafter").0;
     assert!(err.contains("--spec-backend dflash2") && err.contains("Qwen3.8-Flash-Next"), "{err}");
@@ -1903,9 +1903,32 @@ fn flash_next_refuses_speculation_and_vision_at_start_naming_itself() {
     let mtp_alone = config(&["--spec-backend", "mtp"]);
     let err = served_model_for(&mtp_alone, ModelFamily::Qwen38_27b).expect_err("Flash-Next's head").0;
     assert!(err.contains("--spec-backend mtp") && err.contains("drafts with dflash2"), "{err}");
-    let vision = config(&["--vision-enabled"]);
-    let err = served_model_for(&vision, ModelFamily::FlashNext).expect_err("no vision").0;
-    assert!(err.contains("--vision-enabled") && err.contains("Qwen3.8-Flash-Next"), "{err}");
+}
+
+/// GitHub #557 (ADR 0087): Flash-Next takes images, with vision off unless
+/// the operator turns it on. `--vision-enabled` (what `make VISION=1` passes)
+/// turns it on for either model; a built-in profile turns it on for the 27B
+/// alone, in its own family section, while the profile's residency is both
+/// models': host on the RTX 5090's, device on the RTX PRO 6000's.
+#[test]
+fn vision_is_off_on_flash_next_unless_named_and_takes_the_profiles_residency() {
+    use ignis_core::VisionResidency::{Device, Host};
+    for (profile, residency) in [("rtx5090", Host), ("rtxpro6000", Device), ("rtx-16gb", Host), ("rtx-24gb", Host)] {
+        let started = config(&["--profile", profile]);
+        let the_27b = started.for_family(ModelFamily::Qwen38_27b).unwrap_or_else(|e| panic!("{profile}: {}", e.0));
+        assert_eq!(the_27b.vision.map(|v| v.residency()), Some(residency), "{profile} turns vision on for the 27B");
+        let flash_next = started.for_family(ModelFamily::FlashNext).unwrap_or_else(|e| panic!("{profile}: {}", e.0));
+        assert_eq!(flash_next.vision, None, "{profile} leaves vision off on Flash-Next");
+        let named = config(&["--profile", profile, "--vision-enabled"]);
+        let flash_next = named.for_family(ModelFamily::FlashNext).unwrap_or_else(|e| panic!("{profile}: {}", e.0));
+        assert_eq!(flash_next.vision.map(|v| v.residency()), Some(residency), "{profile}: --vision-enabled on Flash-Next");
+    }
+    let media = config(&["--profile", "none", "--vision-enabled", "--media-cache-mib", "64", "--media-allow-private-network"]);
+    let fitted = media.for_family(ModelFamily::FlashNext).expect("the media settings apply to Flash-Next");
+    assert_eq!((fitted.media.cache_bytes, fitted.media.allow_private_network), (64 << 20, true));
+    let scoped = config(&["--profile", "none", "--qwen38flashnext-vision-enabled"]);
+    assert!(scoped.for_family(ModelFamily::FlashNext).unwrap().vision.is_some(), "Flash-Next's own spelling");
+    assert!(scoped.for_family(ModelFamily::Qwen38_27b).unwrap().vision.is_none(), "not the 27B's");
 }
 
 /// The image model (ADR 0050) decodes no tokens: any speculative backend is
@@ -2101,8 +2124,10 @@ fn a_bad_family_scoped_value_is_refused_at_start() {
 fn a_switch_drops_the_values_only_the_other_model_takes_and_names_them() {
     let started = config(&["--vision-enabled", "--vision-max-tokens", "8192", "--spec-backend", "dflash2", "--spec-draft-tokens", "7"]);
     let (fitted, dropped) = fit_to_family(&started, ModelFamily::FlashNext).unwrap();
-    assert_eq!(dropped, ["--vision-enabled", "--vision-max-tokens", "--spec-backend", "--spec-draft-tokens"]);
-    assert!(fitted.vision.is_none() && fitted.speculation.is_none());
+    assert_eq!(dropped, ["--spec-backend", "--spec-draft-tokens"]);
+    assert!(fitted.speculation.is_none());
+    // GitHub #557: vision is both models' since Flash-Next takes images.
+    assert_eq!(fitted.vision.map(|v| v.max_tokens()), Some(8192), "a switch keeps vision");
     assert_eq!(fitted.model, "qwen3.8-flash-next");
 
     let flash = config(&["--spec-decode-lanes", "1", "--ngram-hot-bytes", "4G", "--vram-allow-expert-cache-below-floor", "--spec-draft-rows", "6"]);
@@ -2174,28 +2199,28 @@ fn patch_of(entries: &[(&str, &str, &str)]) -> source::Layer {
 /// A config a switch fitted (dropping what the new family cannot take) can
 /// be patched: the start's own values keep the switch's drop semantics,
 /// while the patch's entries are held to the active family as a start's
-/// would be — the owner's path, the 27B started with vision and switched to
-/// Flash-Next, then a timeout changed live.
+/// would be — the owner's path, the 27B started with its drafter and switched
+/// to Flash-Next, then a timeout changed live.
 #[test]
 fn a_patch_on_a_switched_config_keeps_its_drops_and_judges_only_its_own_entries() {
-    let started = config(&["--vision-enabled"]).for_family(ModelFamily::Qwen38_27b).unwrap();
+    let started = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7"]).for_family(ModelFamily::Qwen38_27b).unwrap();
     let (switched, dropped) = fit_to_family(&started, ModelFamily::FlashNext).unwrap();
-    assert_eq!(dropped, ["--vision-enabled"]);
+    assert_eq!(dropped, ["--spec-backend", "--spec-draft-tokens"]);
     let patched = switched.with_patch(&patch_of(&[("server", "request_timeout", "90")])).unwrap();
     assert_eq!(patched.request_timeout_secs, 90);
-    assert!(patched.vision.is_none());
+    assert!(patched.speculation.is_none());
     assert_eq!(patched.basis.family(), Some(ModelFamily::FlashNext));
-    let err = switched.with_patch(&patch_of(&[("vision", "enabled", "true")])).unwrap_err().0;
-    assert!(err.contains("vision.enabled") && err.contains("Qwen3.8-Flash-Next"), "{err}");
     let err = switched
         .with_patch(&patch_of(&[("spec", "backend", "dflash2"), ("spec", "draft_tokens", "7")]))
         .unwrap_err()
         .0;
     assert!(err.contains("spec.backend") && err.contains("drafts with mtp"), "{err}");
-    assert!(switched.with_patch(&patch_of(&[("vision", "enabled", "false")])).is_ok(), "naming the default is harmless");
-    // Switching back after the patch: the patch stays, the start's vision returns.
+    // GitHub #557: Flash-Next takes images, so a patch may turn its vision on.
+    let seeing = switched.with_patch(&patch_of(&[("vision", "enabled", "true")])).expect("Flash-Next takes vision");
+    assert!(seeing.vision.is_some());
+    // Switching back after the patch: the patch stays, the start's drafter returns.
     let (back, _) = fit_to_family(&patched, ModelFamily::Qwen38_27b).unwrap();
-    assert_eq!((back.request_timeout_secs, back.vision.is_some()), (90, true));
+    assert_eq!((back.request_timeout_secs, back.speculation.is_some()), (90, true));
 }
 
 /// A value an earlier patch set for the family then running is the switch's
@@ -2269,14 +2294,15 @@ fn a_vision_envelope_without_vision_is_refused_rather_than_ignored() {
 /// GitHub #491: `--vision-enabled false` (what `make VISION=0` passes) turns
 /// off the vision every built-in profile turns on, and a start under it fits
 /// the 27B and Flash-Next alike; the envelope beside it is refused as it is
-/// without vision. That every built-in profile turns it on is what
-/// `mk/config.mk` and the guide's make page say an empty `VISION` leaves.
+/// without vision. That every built-in profile turns it on for the 27B is
+/// what `mk/config.mk` and the guide's make page say an empty `VISION` leaves.
 #[test]
 fn vision_enabled_false_turns_a_profiles_vision_off_on_both_models() {
     let profiles = profile::built_in();
     assert!(profiles.len() >= 4, "{:?}", profiles.keys());
     for profile in profiles.keys().map(String::as_str) {
-        assert!(config(&["--profile", profile]).vision.is_some(), "{profile} turns vision on");
+        let started = config(&["--profile", profile]);
+        assert!(started.for_family(ModelFamily::Qwen38_27b).unwrap().vision.is_some(), "{profile} turns vision on");
         let off = config(&["--profile", profile, "--vision-enabled", "false"]);
         assert_eq!(off.vision, None, "{profile}");
         for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
@@ -2387,7 +2413,7 @@ fn the_built_in_profiles_pick_the_vision_residency() {
     assert_eq!(at("rtxpro6000"), Some(VisionResidency::Device));
     assert_eq!(at("rtx-16gb"), Some(VisionResidency::Host), "GitHub #418: written in the profile");
     assert_eq!(at("rtx50-16gb"), Some(VisionResidency::Host), "the old name is the same profile");
-    let flag = config(&["--profile", "rtxpro6000", "--vision-residency", "host"]);
+    let flag = config(&["--profile", "rtxpro6000", "--vision-residency", "host"]).for_family(ModelFamily::Qwen38_27b).unwrap();
     assert_eq!(flag.vision.map(|v| v.residency()), Some(VisionResidency::Host), "a flag wins over the profile");
 }
 
@@ -2447,14 +2473,31 @@ fn help_lists_the_vision_residency_and_both_values() {
     assert!(block.contains("host") && block.contains("device"), "{block}");
 }
 
-/// The residency is the 27B's, as vision is: a switch to Flash-Next drops it
-/// with the rest of the vision group.
+/// The residency is both models', as vision is (GitHub #557): a switch to
+/// Flash-Next keeps it with the rest of the vision group.
 #[test]
-fn a_flash_next_switch_drops_the_vision_residency_with_vision() {
+fn a_flash_next_switch_keeps_the_vision_residency_with_vision() {
     let started = config(&["--profile", "none", "--vision-enabled", "--vision-residency", "device"]);
     let (fitted, dropped) = fit_to_family(&started, ModelFamily::FlashNext).unwrap();
-    assert_eq!(dropped, ["--vision-enabled", "--vision-residency"]);
-    assert!(fitted.vision.is_none());
+    assert!(dropped.is_empty(), "{dropped:?}");
+    assert_eq!(fitted.vision.map(|v| v.residency()), Some(VisionResidency::Device));
+}
+
+/// GitHub #557: a built-in profile turns vision on for the 27B alone, so a
+/// vision or media knob named beside it is the 27B's, not a mistake: the
+/// start takes it, the 27B's load runs it, and Flash-Next's, whose vision
+/// stays off, leaves it unused. With vision off for both models it is
+/// refused as before.
+#[test]
+fn a_vision_knob_named_beside_the_27bs_profile_vision_is_the_27bs() {
+    let started = config(&["--profile", "rtx5090", "--vision-max-tokens", "8192", "--media-cache-mib", "64"]);
+    let the_27b = started.for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert_eq!(the_27b.vision.map(|v| v.max_tokens()), Some(8192));
+    assert_eq!(the_27b.media.cache_bytes, 64 << 20);
+    let flash_next = started.for_family(ModelFamily::FlashNext).unwrap();
+    assert_eq!(flash_next.vision, None, "Flash-Next's vision stays off");
+    let err = refused(&["--profile", "rtx5090", "--vision-enabled", "false", "--media-cache-mib", "64"]);
+    assert!(err.contains("--media-cache-mib") && err.contains("--vision-enabled"), "{err}");
 }
 
 /// GitHub #195: the two are independent load options again.

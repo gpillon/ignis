@@ -304,6 +304,11 @@ pub const NONE_PROFILE: &str = "none";
 /// is a placeholder no card of the class has measured (GitHub #526). No other
 /// card ships a profile; a config file's `profiles:` defines one for any other
 /// card.
+///
+/// Every built-in profile turns vision on for the 27B alone, in its `qwen38`
+/// section (GitHub #557, ADR 0087): Flash-Next takes images only when the
+/// operator turns vision on, and then with the profile's residency and
+/// envelope, which are both models'.
 const BUILT_IN: &str = r#"{
     "rtx5090": {
         "vram": {
@@ -315,7 +320,7 @@ const BUILT_IN: &str = r#"{
             "qwen38": { "max_context": 917504, "prefill_chunk": 2048 },
             "qwen38flashnext": { "max_context": 589824, "prefill_chunk": 8192 }
         },
-        "vision": { "enabled": true, "residency": "host" },
+        "vision": { "residency": "host", "qwen38": { "enabled": true } },
         "spec": {
             "qwen38": { "backend": "dflash2", "draft_tokens": 7 },
             "qwen38flashnext": { "decode_lanes": 3 }
@@ -326,7 +331,7 @@ const BUILT_IN: &str = r#"{
             "qwen38": { "max_context": 1048576, "prefill_chunk": 2048 },
             "qwen38flashnext": { "max_context": 1048576, "prefill_chunk": 8192 }
         },
-        "vision": { "enabled": true, "residency": "device" },
+        "vision": { "residency": "device", "qwen38": { "enabled": true } },
         "spec": {
             "qwen38": { "backend": "dflash2", "draft_tokens": 7 },
             "qwen38flashnext": { "backend": "mtp", "draft_tokens": 3, "decode_lanes": 8 }
@@ -341,7 +346,7 @@ const BUILT_IN: &str = r#"{
             "qwen38": { "max_context": 262144, "prefill_chunk_solo": 1024 },
             "qwen38flashnext": { "prefill_chunk": 2048 }
         },
-        "vision": { "enabled": true, "max_tokens": 4096, "residency": "host" },
+        "vision": { "max_tokens": 4096, "residency": "host", "qwen38": { "enabled": true } },
         "spec": {
             "qwen38": { "backend": "dflash2", "draft_tokens": 7, "decode_lanes": 2, "draft_head": "auto" }
         }
@@ -357,7 +362,7 @@ const BUILT_IN: &str = r#"{
         "reuse": {
             "qwen38": { "retained_device": RTX_24GB_RETAINED_DEVICE_SLOTS }
         },
-        "vision": { "enabled": true, "residency": "host" },
+        "vision": { "residency": "host", "qwen38": { "enabled": true } },
         "spec": {
             "qwen38": { "backend": "dflash2", "draft_tokens": 7 }
         }
@@ -577,8 +582,10 @@ mod tests {
         let rope = field("model", "rope_scaling").unwrap();
         assert!(rtx5090.get(rope, None).is_none(), "unset: `auto` follows the 27B's own context");
 
+        // GitHub #557: vision on for the 27B alone, its residency both models'.
         let vision = field("vision", "enabled").unwrap();
-        assert_eq!(rtx5090.get(vision, None).unwrap().raw, "true");
+        assert_eq!(rtx5090.get(vision, Some(ModelFamily::Qwen38_27b)).unwrap().raw, "true");
+        assert!(rtx5090.get(vision, None).is_none(), "Flash-Next keeps vision off here");
         let residency = field("vision", "residency").unwrap();
         assert_eq!(rtx5090.get(residency, None).unwrap().raw, "host", "ADR 0075: the 5090 stages the tower");
 
@@ -713,7 +720,8 @@ mod tests {
 
         // The 5090's choices the card's memory does not change.
         let vision = field("vision", "enabled").unwrap();
-        assert_eq!(pro.get(vision, None).unwrap().raw, "true");
+        assert_eq!(pro.get(vision, Some(ModelFamily::Qwen38_27b)).unwrap().raw, "true");
+        assert!(pro.get(vision, None).is_none(), "GitHub #557: Flash-Next keeps vision off here");
         let residency = field("vision", "residency").unwrap();
         assert_eq!(pro.get(residency, None).unwrap().raw, "device", "ADR 0075: 96 GB keeps the tower resident");
         let backend = field("spec", "backend").unwrap();
@@ -757,7 +765,8 @@ mod tests {
         assert_eq!(value("model", "prefill_chunk", Some(Qwen38_27b)).as_deref(), Some("2048"));
         assert_eq!(value("spec", "backend", Some(Qwen38_27b)).as_deref(), Some("dflash2"));
         assert_eq!(value("spec", "draft_tokens", Some(Qwen38_27b)).as_deref(), Some("7"));
-        assert_eq!(value("vision", "enabled", None).as_deref(), Some("true"));
+        assert_eq!(value("vision", "enabled", Some(Qwen38_27b)).as_deref(), Some("true"));
+        assert_eq!(value("vision", "enabled", None), None, "GitHub #557: the 27B's alone");
         assert_eq!(value("vision", "residency", None).as_deref(), Some("host"));
         // GitHub #508: one or two device retained slots, the 27B's alone.
         assert!((1..=2).contains(&RTX_24GB_RETAINED_DEVICE_SLOTS), "one or two slots (spec #503)");
@@ -783,9 +792,9 @@ mod tests {
             let raw = |layer: &Layer| layer.get(meta, Some(Qwen38_27b)).map(|candidate| candidate.raw.clone());
             assert_eq!(raw(rtx24), raw(rtx5090), "{group}.{name}");
         }
-        for (group, name) in [("vision", "enabled"), ("vision", "residency"), ("vision", "max_tokens")] {
+        for (group, name, family) in [("vision", "enabled", Some(Qwen38_27b)), ("vision", "residency", None), ("vision", "max_tokens", None)] {
             let meta = field(group, name).unwrap();
-            let raw = |layer: &Layer| layer.get(meta, None).map(|candidate| candidate.raw.clone());
+            let raw = |layer: &Layer| layer.get(meta, family).map(|candidate| candidate.raw.clone());
             assert_eq!(raw(rtx24), raw(rtx5090), "{group}.{name}");
         }
     }

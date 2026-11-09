@@ -506,6 +506,8 @@ pub struct FlashNextEngine {
     pool: SeqPool,
     // An MTP load's head (spec flash-next/07): the model points into it.
     _mtp: Option<crate::flash_next_mtp::MtpHead>,
+    // A vision load's tower (GitHub #557): the model points into it too.
+    _tower: Option<crate::flash_next_vision::Tower>,
     residency: DeviceResidency,
     table: NgramTable,
     _weights: DeviceWeights,
@@ -535,8 +537,23 @@ impl FlashNextEngine {
             )?),
             None => None,
         };
-        let planned =
-            plan_flash_next_reservations(&plan, &geometry, options.load_shape(), mtp.as_ref().map(|head| head.plan()))?;
+        // GitHub #557: a vision load's tower, from the companion held to this
+        // container before any byte of it is read.
+        let tower = match options.vision {
+            Some(vision) => {
+                let companion = crate::flash_next_vision::Companion::open(&path, &reader, config.hidden)
+                    .map_err(|e| e.to_string())?;
+                Some(crate::flash_next_vision::Tower::load(&companion, vision.residency())?)
+            }
+            None => None,
+        };
+        let planned = plan_flash_next_reservations(
+            &plan,
+            &geometry,
+            options.load_shape(),
+            mtp.as_ref().map(|head| head.plan()),
+            tower.as_ref().map(|tower| tower.plan()),
+        )?;
 
         let weights = DeviceWeights::place(&reader, &plan)?;
         let residency = build_residency(&path, &plan, &options)?;
@@ -544,7 +561,15 @@ impl FlashNextEngine {
         let table = NgramTable::from_cached_artifact(
             &path, reader, &plan, ngram, options.ngram, &options.ngram_cache,
         )?;
-        let model = load_flash_next(&plan, &geometry, weights.artifact(), options.load_shape(), &residency, mtp.as_ref())?;
+        let model = load_flash_next(
+            &plan,
+            &geometry,
+            weights.artifact(),
+            options.load_shape(),
+            &residency,
+            mtp.as_ref(),
+            tower.as_ref(),
+        )?;
         // The pool is planned against what is free before it is created, so a
         // context the card cannot hold is a refusal naming it, not an
         // allocation failure.
@@ -572,6 +597,7 @@ impl FlashNextEngine {
             model,
             pool,
             _mtp: mtp,
+            _tower: tower,
             residency,
             table,
             _weights: weights,
@@ -617,6 +643,13 @@ impl FlashNextEngine {
 
     pub fn reserved(&self) -> IgnisModelReservations {
         self.model.stats().reserved
+    }
+
+    /// The item bound this load's encode holds (GitHub #557): the largest
+    /// item its prefill scratch takes on its own, at most the bound it was
+    /// loaded with; 0 without vision.
+    pub fn vision_item_max_tokens(&self) -> u32 {
+        self.model.vision_item_max_tokens()
     }
 
     pub fn residency(&self) -> &DeviceResidency {

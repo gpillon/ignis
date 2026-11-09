@@ -2096,7 +2096,8 @@ mod tests {
     /// returned — the list each field's own applicability produces.
     #[test]
     fn a_switch_names_what_it_dropped_and_says_nothing_when_nothing_was() {
-        let started = match crate::config::resolve(&["--vision-enabled".to_owned()], |_| None).unwrap() {
+        let flags = ["--spec-backend", "dflash2", "--spec-draft-tokens", "7"].map(str::to_owned);
+        let started = match crate::config::resolve(&flags, |_| None).unwrap() {
             crate::config::ConfigOutcome::Config(config) => config,
             other => panic!("{other:?}"),
         };
@@ -2106,7 +2107,7 @@ mod tests {
         let event = &records[0];
         assert_eq!(event["event_name"], "ignis.model.switch_flags_dropped", "{event}");
         let field = |name: &str| event.get(name).or_else(|| event["attributes"].get(name)).cloned();
-        assert_eq!(field("flags"), Some("--vision-enabled".into()), "{event}");
+        assert_eq!(field("flags"), Some("--spec-backend,--spec-draft-tokens".into()), "{event}");
         assert_eq!(field("to"), Some("qwen3.8-flash-next".into()), "{event}");
         assert!(logged(|| log_flags_dropped("qwen3.8-27b", ModelFamily::Qwen38_27b, &[])).is_empty());
     }

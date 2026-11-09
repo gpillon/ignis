@@ -6,7 +6,9 @@
 // real geometry (48 layers), carrying no planes: the binder only reads names,
 // formats and shapes. A complete set binds and every weight lands where the
 // program reads it; a linear re-converted to BF16 binds as BF16; a missing,
-// extra, mis-shaped or mis-formatted tensor is refused by name.
+// extra, mis-shaped or mis-formatted tensor is refused by name. Through the
+// load ABI, GitHub #557: a vision plan binds the vision companion's tower
+// beside the trunk and holds its encode in the prefill scratch.
 //
 // Host-only. ADR 0006: no SKIP_RETURN_CODE.
 
@@ -15,7 +17,9 @@
 
 #include "ignis_model.h"
 #include "ignis_seq.h"
+#include "model_internal.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -178,6 +182,70 @@ std::size_t index_of(const std::vector<Named> &named, const std::string &name) {
   return named.size();
 }
 
+// GitHub #557 (ADR 0087): the vision companion's tower, the 27B's 333
+// `vision/*` tensors with the merger writing Flash-Next's 2,560 rows, each in
+// its stored format (Q6 patch embedding, Q4 qkv and fc1, Q5 output and fc2,
+// W8 merger, BF16 the rest) with about its stored bytes: row-split rows of K
+// padded to 128, an F16 scale per group. The plan reads no plane.
+struct TowerTensor {
+  std::string name;
+  std::vector<int32_t> shape;
+  int32_t qtype;
+};
+
+std::vector<TowerTensor> vision_tower() {
+  const int32_t q4 = IGNIS_QTYPE_Q4G64_F16S, q5 = IGNIS_QTYPE_Q5G64_F16S, q6 = IGNIS_QTYPE_Q6G64_F16S,
+                w8 = IGNIS_QTYPE_W8G32_F16S, bf16 = IGNIS_QTYPE_BF16_CTRL;
+  std::vector<TowerTensor> t{{"vision/patch_embedding", {1152, 1536}, q6},
+                             {"vision/patch_embedding_bias", {1152}, bf16},
+                             {"vision/position_embedding", {2304, 1152}, bf16}};
+  for (int b = 0; b < 27; ++b) {
+    const std::string p = "vision/layers/" + std::to_string(b) + "/";
+    for (const TowerTensor &n : std::vector<TowerTensor>{
+             {"attention/qkv", {3456, 1152}, q4},  {"attention/qkv_bias", {3456}, bf16},
+             {"attention/output", {1152, 1152}, q5}, {"attention/output_bias", {1152}, bf16},
+             {"mlp/fc1", {4304, 1152}, q4},       {"mlp/fc1_bias", {4304}, bf16},
+             {"mlp/fc2", {1152, 4304}, q5},       {"mlp/fc2_bias", {1152}, bf16},
+             {"norm1/weight", {1152}, bf16},      {"norm1/bias", {1152}, bf16},
+             {"norm2/weight", {1152}, bf16},      {"norm2/bias", {1152}, bf16}}) {
+      t.push_back({p + n.name, n.shape, n.qtype});
+    }
+  }
+  t.push_back({"vision/merger/fc1", {4608, 4608}, w8});
+  t.push_back({"vision/merger/fc1_bias", {4608}, bf16});
+  t.push_back({"vision/merger/fc2", {H, 4608}, w8});
+  t.push_back({"vision/merger/fc2_bias", {H}, bf16});
+  t.push_back({"vision/merger/norm/weight", {1152}, bf16});
+  t.push_back({"vision/merger/norm/bias", {1152}, bf16});
+  return t;
+}
+
+std::vector<ignis_bound_tensor> tower_descriptors(const std::vector<TowerTensor> &tower) {
+  std::vector<ignis_bound_tensor> out;
+  for (const TowerTensor &n : tower) {
+    ignis_bound_tensor t{};
+    t.name = n.name.c_str();
+    t.qtype = n.qtype;
+    t.layout = n.qtype == IGNIS_QTYPE_BF16_CTRL ? IGNIS_LAYOUT_CONTIGUOUS : IGNIS_LAYOUT_ROW_SPLIT;
+    t.ndim = static_cast<uint32_t>(n.shape.size());
+    for (std::size_t d = 0; d < 4; ++d) {
+      t.shape[d] = d < n.shape.size() ? n.shape[d] : 1;
+      t.padded_shape[d] = t.shape[d];
+    }
+    const uint64_t rows = static_cast<uint64_t>(n.shape[0]);
+    const uint64_t k = n.shape.size() > 1 ? (static_cast<uint64_t>(n.shape[1]) + 127) / 128 * 128 : 1;
+    switch (n.qtype) {
+      case IGNIS_QTYPE_Q4G64_F16S: t.bytes = rows * (k / 2 + k / 64 * 2); break;
+      case IGNIS_QTYPE_Q5G64_F16S: t.bytes = rows * (k * 5 / 8 + k / 64 * 2); break;
+      case IGNIS_QTYPE_Q6G64_F16S: t.bytes = rows * (k * 6 / 8 + k / 64 * 2); break;
+      case IGNIS_QTYPE_W8G32_F16S: t.bytes = rows * (k + k / 32 * 2); break;
+      default: t.bytes = rows * (n.shape.size() > 1 ? static_cast<uint64_t>(n.shape[1]) : 1) * 2; break;
+    }
+    out.push_back(t);
+  }
+  return out;
+}
+
 }  // namespace
 
 int main() {
@@ -321,9 +389,24 @@ int main() {
     // 27B's.
     check(plan(nullptr) == "(planned)", "the text load plans again");
     const uint64_t text_activations = out.activation_bytes;
+    const uint64_t text_workspace = out.workspace_bytes;
     ignis_model_load_options vision{};
     vision.size = sizeof(vision);
     vision.vision_max_tokens = 8192;
+    // The tower is the vision companion's (ADR 0087): a vision plan without
+    // it is refused naming its first tensor, and a text plan handed it
+    // refuses it as an extra.
+    const std::string towerless = plan(&vision);
+    check(towerless.find("missing bound tensor: vision/patch_embedding") != std::string::npos,
+          "a vision plan without the companion's tower is refused by name: got \"" + towerless + "\"");
+    const std::vector<TowerTensor> tower = vision_tower();
+    const std::vector<ignis_bound_tensor> text_tensors = tensors;
+    for (const ignis_bound_tensor &t : tower_descriptors(tower)) {
+      tensors.push_back(t);
+    }
+    const std::string unasked = plan(nullptr);
+    check(unasked.find("extra bound tensor: vision/") != std::string::npos,
+          "a text plan handed the tower refuses it: got \"" + unasked + "\"");
     const std::string pooled = plan(&vision);
     check(pooled == "(planned)" && out.media_embedding_bytes == 41943040 &&
               out.activation_bytes == text_activations + 131328,
@@ -340,6 +423,45 @@ int main() {
     check(hosted == "(planned)" && out.media_embedding_bytes == 0 && out.activation_bytes == text_activations + 131328,
           "a host-resident pool leaves the VRAM plan: got \"" + hosted + "\", " +
               std::to_string(out.media_embedding_bytes));
+    // GitHub #557 (ADR 0087): the encode takes no VRAM of its own. Its share
+    // -- the encoder's workspace for one item, and under the host residency
+    // the tower's staging ring after it -- is held by the prefill scratch the
+    // text sizes, whose line does not move; the item bound is the largest item
+    // that fits there, at most the one asked for, and a host tower's ring
+    // leaves it no larger. Printed for the plan's record.
+    uint32_t item = 0;
+    const auto item_bound = [&](const ignis_model_load_options *options) {
+      item = 0;
+      const int32_t rc = ignis_model_plan_vision_item_max_tokens(tensors.data(), tensors.size(), &topology, 8192,
+                                                                 131072, IGNIS_KV_FORMAT_HQ_E8_2B, options, &item);
+      return rc == 0 ? std::string("(planned)") : std::string(ignis_model_last_error());
+    };
+    vision.vision_embedding_pool_bytes = 0;
+    vision.vision_item_max_tokens = 16384;
+    uint32_t bounds[2] = {0, 0};
+    for (const uint32_t residency : {IGNIS_VISION_RESIDENCY_DEVICE, IGNIS_VISION_RESIDENCY_HOST}) {
+      vision.vision_residency = residency;
+      const std::string planned = plan(&vision);
+      check(planned == "(planned)" && out.workspace_bytes == text_workspace,
+            "the encode is held by the text's prefill scratch, residency " + std::to_string(residency) + ": got \"" +
+                planned + "\", workspace " + std::to_string(out.workspace_bytes) + " against " +
+                std::to_string(text_workspace));
+      const std::string bounded = item_bound(&vision);
+      const auto t = static_cast<std::int32_t>(item);
+      const std::size_t workspace = item == 0 ? 0 : ignis_vision_workspace_bytes(t, std::min(t, kVisionMaxSegments));
+      check(bounded == "(planned)" && item > 0 && item <= 16384 && workspace <= text_workspace,
+            "the item bound is what the prefill scratch holds, residency " + std::to_string(residency) + ": got \"" +
+                bounded + "\", " + std::to_string(item) + " tokens");
+      bounds[residency] = item;
+      std::printf("  item bound, residency %u: %u merged tokens in a %llu-byte prefill scratch\n", residency, item,
+                  static_cast<unsigned long long>(text_workspace));
+    }
+    check(bounds[IGNIS_VISION_RESIDENCY_HOST] <= bounds[IGNIS_VISION_RESIDENCY_DEVICE],
+          "a staged tower's ring leaves the item no larger");
+    vision.vision_item_max_tokens = 64;
+    check(item_bound(&vision) == "(planned)" && item == 64, "an item bound the scratch holds is kept");
+    tensors = text_tensors;
+    check(item_bound(nullptr) == "(planned)" && item == 0, "no vision, no item bound");
     ignis_model_load_options readouts{};
     readouts.size = sizeof(readouts);
     readouts.attention_text_max_keys = 4096;

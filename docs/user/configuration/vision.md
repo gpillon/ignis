@@ -1,18 +1,61 @@
 ---
 title: "Vision"
-description: "The 27B's vision tower: on, off, and its token budget."
+description: "The vision tower of either text model: on, off, its token budget, and where it lives."
 sidebar:
   order: 10
 ---
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--vision-enabled` | `IGNIS_VISION_ENABLED` | off; on under the `rtx5090`, `rtxpro6000`, `rtx-16gb` and `rtx-24gb` profiles (`--vision-enabled false` turns it off) | Load the vision tower and reserve its workspace. Without it every `image_url` part is refused with `vision_disabled`, whatever the artifact holds. |
+| `--vision-enabled` | `IGNIS_VISION_ENABLED` | off; on for the 27B under the `rtx5090`, `rtxpro6000`, `rtx-16gb` and `rtx-24gb` profiles, off for Flash-Next under every one (`--vision-enabled` turns it on for both, `--qwen38flashnext-vision-enabled` for Flash-Next alone, `--vision-enabled false` off for both) | Load the vision tower and reserve its workspace. Flash-Next's tower is its vision companion's, beside the artifact ([Flash-Next](#flash-next)). Without it every `image_url` part is refused with `vision_disabled`, whatever the artifact holds. |
 | `--vision-max-tokens <n>` | `IGNIS_VISION_MAX_TOKENS` | `32768` with `--vision-enabled` (`4096` under the `rtx-16gb` profile) | Merged vision tokens per request, 1..1,048,576. An image whose natural size is past the cap is downscaled to fit (aspect ratio kept, one token = 32 x 32 pixels), not refused, unless its aspect ratio is too extreme for the cap (a side cannot go below 32 pixels); the request log reports both sizes, `media.vision_tokens` (admitted) and `media.natural_vision_tokens` ([telemetry](../guides/telemetry.md)). Several images whose total is past the cap are still refused with `media_budget_exceeded`. |
 | `--vision-embedding-pool-mib <n>` | `IGNIS_VISION_EMBEDDING_POOL_MIB` | one envelope-wide embedding | Encoded images kept for reuse across requests, 1..65536, counted where `--vision-residency` puts the pool ([below](#where-the-vision-tower-and-the-embedding-pool-live)). |
 | `--vision-residency <host\|device>` | `IGNIS_VISION_RESIDENCY` | `host`; `device` under `rtxpro6000` | Needs `--vision-enabled`. Where the vision tower's weights and the embedding pool live: `device` in VRAM, `host` in pinned host RAM, the weights copied to the GPU for each image ([below](#where-the-vision-tower-and-the-embedding-pool-live)). Read at load: a change takes effect at the next one. |
 | `--media-cache-mib <n>` | `IGNIS_MEDIA_CACHE_MIB` | `1024` with `--vision-enabled` | Prepared images kept for reuse; `0` disables, max 65536. |
 | `--media-allow-private-network` | `IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK` | off | Needs `--vision-enabled`. Fetch image URLs on private, loopback and link-local addresses. |
+
+## Flash-Next
+
+Flash-Next takes images as the 27B does, through the same requests, limits and
+media cache. Its vision tower is not in its 72 GB container: it ships in a
+**vision companion** beside it, `qwen3_8_flash_next_vision-v2.ninfer` (284 MB),
+which `ignis-server model download qwen3.8-flash-next` fetches with the model.
+The tower has the 27B's shape, retrained with Flash-Next, its merger writing
+Flash-Next's 2,560 columns. Vision stays off on Flash-Next unless you turn it
+on: every built-in profile turns it on for the 27B alone, so a Flash-Next load
+holds nothing for it until `--vision-enabled` (or `make MODEL=flash-next
+VISION=1`). The profile's residency is both models': `host` under `rtx5090`,
+`device` under `rtxpro6000`.
+
+With vision on, a Flash-Next start opens the companion and holds it to the main
+container it was built for (the pair its sidecar records), its merger's width to
+the model's. A companion that is missing, or that belongs to another main
+container, refuses the start before anything loads, naming the file
+([troubleshooting](../troubleshooting.md#flash-next-refuses-the-start-for-its-vision-companion)).
+
+What it costs:
+
+- **No VRAM of its own under `host`.** An image is encoded in the prefill
+  scratch Flash-Next already reserves for its text, the tower copied through
+  three slots of it, so a vision load plans the expert cache a text-only load
+  plans, but for the image positions each prefill chunk carries (131 KB at the
+  8,192-token chunk). The largest image one encode holds is what that scratch
+  holds on its own, at most the processor's 16,384 tokens (4096 x 4096
+  pixels); a larger image is shrunk to it, aspect kept, never refused. The
+  `ignis.runtime.flash_next_plan` event names it as `vision_item_max_tokens`.
+  Under `device` the tower (283 MB) and the embedding pool are VRAM lines:
+  on a card that holds every expert they come out of the KV pool, on a 32 GB
+  card out of the expert cache.
+- **Host RAM under `host`**: the tower's 284 MB (284,454,912 bytes with its
+  page padding) and the embedding pool, an envelope-wide image at Flash-Next's
+  2,560 columns, half the 27B's: 5 MiB at a 1,024-token envelope, 20 MiB at
+  4,096, 160 MiB at the default 32,768. Both are lines of Flash-Next's host
+  plan ([Host RAM for Flash-Next](host-ram.md#host-ram-for-flash-next)), and a
+  start short of RAM for them is refused naming them and the same two ways out
+  as the 27B's.
+
+The reasons are in
+[ADR 0087](../../adr/0087-flash-nexts-vision-encoder-ships-in-a-companion-container-and-encodes-in-memory-its-prefill-already-reserves.md).
 
 ## Where the vision tower and the embedding pool live
 

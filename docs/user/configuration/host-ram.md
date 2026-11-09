@@ -7,7 +7,8 @@ sidebar:
 
 ## Host RAM for Flash-Next
 
-Serving Flash-Next needs about **46-47 GB of available RAM**: 38 GB of pinned
+Serving Flash-Next needs about **46-47 GB of available RAM** (about 0.45 GB more with
+vision on, below): 38 GB of pinned
 experts (2.1 GB less under the `rtx5090` profile's pinned hot set, below), 1 GB of n-gram hot rows, ~0.5 GB of staging (KV-disk's 64 MiB
 included: `--qwen38flashnext-kv-disk-bytes 0` drops it), ~1 GB of retained host
 slots, the 2 GiB KV-RAM arena and the 4 GiB margin the load refuses to dip into
@@ -53,6 +54,16 @@ A device-only load lists its layer buffers apart, as `expert layer buffers
 4.4 GiB (while the experts load)`, and one that cannot hold them is refused
 naming them (`crossing_line: load_staging`): no flag shrinks them, so close
 other applications.
+
+With vision on under `--vision-residency host`, the vision companion's tower
+(284 MB with its page padding) and the embedding pool (160 MiB at the default
+envelope) are two lines more, `vision_tower` and `vision_pool`, ahead of the
+experts (`vision_tower_bytes`, `vision_pool_bytes` and `vision_residency` in
+both events). A start that cannot hold them is refused naming them and the
+ways out: `--vision-residency device`, vision off, or other applications
+closed; when the experts are what no longer fits beside them, the refusal
+says so
+([Flash-Next's vision](vision.md#flash-next)).
 
 The same refusal in exact bytes is the `ignis.runtime.flash_next_host_plan_refused`
 log event (every line, the plan's peak as `planned_bytes`, `available_bytes`,

@@ -115,6 +115,12 @@ the machine it needs.
   28.8 GB. It is never put on the device: rows are read from NVMe through a
   RAM cache of hot rows (1 GiB by default), or the whole table is held in RAM
   when `--ngram-hot-bytes` covers it ([n-gram cache](../configuration/ngram-cache.md)).
+- **Images**: Flash-Next takes image input when `--vision-enabled` is set,
+  from a vision companion beside its artifact (284 MB, fetched with the
+  model). Under the default `host` residency the tower and its embedding pool
+  sit in host RAM and an image is encoded in the prefill scratch the text
+  already reserves, so a vision load keeps the expert cache of a text-only one
+  ([Flash-Next's vision](../configuration/vision.md#flash-next)).
 
 Because the two layouts differ so much, a few knobs exist for one family only.
 A field only one family takes is refused at start when set for the other, and
@@ -189,8 +195,8 @@ acceptance rate ([the uncensored variant](../guides/uncensored.md)).
 
 | | Qwen3.8-27B | Flash-Next on a 32 GB card | Flash-Next on 96 GB |
 |---|---|---|---|
-| Weights in VRAM | All but the token embedding; the vision tower only under `device` | Trunk, plus an expert cache | Trunk and every expert |
-| Weights in host RAM | Token embedding (1.35 GB); the vision tower (297 MB) under `host` | Experts (~38 GB), n-gram rows | No expert pool |
+| Weights in VRAM | All but the token embedding; the vision tower only under `device` | Trunk, plus an expert cache; the vision tower only under `device` | Trunk and every expert; the vision tower only under `device` |
+| Weights in host RAM | Token embedding (1.35 GB); the vision tower (297 MB) under `host` | Experts (~38 GB), n-gram rows; the vision tower (284 MB) under `host` | No expert pool; the vision tower under `host` |
 | The KV pool is | What VRAM leaves | Reserved first, 524,288 tokens | What VRAM leaves |
 | Decode is bound by | Streaming the weights | Copying experts over PCIe | Few PCIe copies |
 | Available RAM to start | ~18.6 GB under `make` defaults on a 32 GB card | ~46-47 GB | ~9 GB |

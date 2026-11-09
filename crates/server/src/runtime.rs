@@ -632,9 +632,12 @@ pub fn log_draft_head_auto(head: ignis_core::ProposalHead) {
 /// A Flash-Next load the host plan refused (spec flash-next/03), as an agent
 /// reads it: one `ignis.runtime.flash_next_host_plan_refused` event with
 /// every line, the memory available, the margin, what the plan needed and how
-/// far short it fell, in exact bytes. Its message is the refusal as a person
-/// reads it, the text the load then fails with.
-pub fn log_host_plan_refused(refusal: &ignis_core::residency::HostPlanError) {
+/// far short it fell, in exact bytes, and where a vision load keeps its
+/// tower (GitHub #557). Its message is the refusal as a person reads it, the
+/// text the load then fails with.
+pub fn log_host_plan_refused(
+    refusal: &ignis_core::residency::HostPlanError, vision: Option<ignis_core::VisionResidency>,
+) {
     let ignis_core::residency::HostPlanError::BelowMargin {
         available_bytes,
         planned_bytes,
@@ -653,6 +656,9 @@ pub fn log_host_plan_refused(refusal: &ignis_core::residency::HostPlanError) {
         needed_bytes = refusal.needed_bytes(),
         short_bytes = refusal.short_bytes(),
         crossing_line = *crossing_line,
+        vision_tower_bytes = line("vision_tower"),
+        vision_pool_bytes = line("vision_pool"),
+        vision_residency = vision.map(ignis_core::VisionResidency::as_str),
         expert_pool_bytes = line("expert_pool"),
         load_staging_bytes = line("load_staging"),
         ngram_hot_rows_bytes = line("ngram_hot_rows"),
@@ -660,6 +666,85 @@ pub fn log_host_plan_refused(refusal: &ignis_core::residency::HostPlanError) {
         retained_host_slots_bytes = line("retained_host_slots"),
         kv_ram_arena_bytes = line("kv_ram_arena"),
         "{refusal}"
+    );
+}
+
+/// What a Flash-Next vision load pins in host memory (GitHub #557, ADR
+/// 0087): under the `host` residency, the companion's tower -- its spans,
+/// `tower_host_mapped_bytes` -- and the embedding pool at the shape's context
+/// and the merger's `width`, as the 27B's (ADR 0075, GitHub #415); `(0, 0)`
+/// under `device`, whose tower and pool are VRAM lines, and without vision.
+pub fn flash_next_vision_host_bytes(
+    shape: &EngineShape, tower_host_mapped_bytes: u64, width: ignis_core::EmbeddingWidth,
+) -> (u64, u64) {
+    match shape.vision {
+        Some(vision) if vision.residency() == ignis_core::VisionResidency::Host => {
+            (tower_host_mapped_bytes, vision.pool_bytes(shape.max_context, width))
+        }
+        _ => (0, 0),
+    }
+}
+
+/// A Flash-Next load's VRAM `lines` with its vision (GitHub #557, ADR 0087):
+/// under the `device` residency the companion's tower, `tower_device_bytes`,
+/// on the weights line and the embedding pool the leaf's plan places in VRAM,
+/// `media_embedding_bytes`, on a line of its own; under `host` both are 0,
+/// and the encode's share is held by the prefill scratch the text sizes. So
+/// a host vision load plans the expert cache a text-only load does, but for
+/// the forward's vision inputs among the activations (a chunk's three axes
+/// and media rows, a round's rope deltas).
+pub fn with_flash_next_vision(
+    lines: ignis_core::VramLines, tower_device_bytes: u64, media_embedding_bytes: u64,
+) -> ignis_core::VramLines {
+    ignis_core::VramLines {
+        weights: lines.weights + tower_device_bytes,
+        media_embedding: lines.media_embedding + media_embedding_bytes,
+        ..lines
+    }
+}
+
+/// The `ignis.runtime.flash_next_host_plan` fields no [`ignis_core::residency::HostPlanRequest`]
+/// line carries: how the n-gram hot rows were sized, the host retained
+/// slots, and where a vision load keeps its tower.
+pub struct FlashNextHostDetails {
+    pub ngram_hot_budget: ignis_core::ngram_table::HotBudget,
+    pub ngram_hot_budget_bytes: u64,
+    pub ngram_whole_table: bool,
+    pub retained_host_slots: u32,
+    pub vision: Option<ignis_core::VisionResidency>,
+}
+
+/// Flash-Next's host plan as its load carries it out (spec flash-next/03):
+/// one `ignis.runtime.flash_next_host_plan` event with every line it pins in
+/// bytes -- under the `host` vision residency the tower's and the embedding
+/// pool's among them (GitHub #557) -- what was available and what the plan
+/// leaves.
+pub fn log_flash_next_host_plan(
+    request: &ignis_core::residency::HostPlanRequest, host: &ignis_core::residency::HostPlan,
+    details: FlashNextHostDetails,
+) {
+    // hotpath-lint-allow: one line per model load.
+    tracing::info!(
+        name: "ignis.runtime.flash_next_host_plan",
+        available_bytes = request.available_physical_bytes,
+        planned_bytes = host.total_bytes,
+        left_bytes = host.left_bytes,
+        margin_bytes = request.margin_bytes,
+        ngram_hot_budget = %details.ngram_hot_budget,
+        ngram_hot_budget_bytes = details.ngram_hot_budget_bytes,
+        ngram_hot_rows_bytes = request.ngram_hot_rows_bytes,
+        ngram_whole_table = details.ngram_whole_table,
+        retained_host_slots = details.retained_host_slots,
+        retained_host_bytes = request.retained_host_slots_bytes,
+        kv_ram_arena_bytes = request.kv_ram_arena_bytes,
+        vision_tower_bytes = request.vision_tower_bytes,
+        vision_pool_bytes = request.vision_pool_bytes,
+        vision_residency = details.vision.map(ignis_core::VisionResidency::as_str),
+        expert_pool_bytes = request.expert_pool_bytes,
+        load_staging_bytes = request.load_staging_bytes,
+        staging_bytes = request.staging_bytes,
+        kv_disk_staging_bytes = request.staging_bytes,
+        "flash-next host plan"
     );
 }
 
@@ -879,9 +964,12 @@ pub fn log_vram_warnings(plan: &ignis_core::VramPlan) {
 /// ring (0 on the resident branch, whose residency never stages: GitHub #329),
 /// the expert cache and the hit
 /// rate its split expects, the lanes and the speculation, and what of the free
-/// memory this process already held (GitHub #324).
+/// memory this process already held (GitHub #324). With vision (GitHub #557,
+/// ADR 0087), where it keeps its tower and pool, the pool's VRAM line, and
+/// the item bound the prefill scratch holds, which the processor serves.
 pub fn log_flash_next_plan(
     plan: &ignis_core::VramPlan, expected_hit_rate: f64, lanes: u32, speculation: &str, process_held_bytes: u64,
+    vision: Option<ignis_core::Vision>,
 ) {
     let lines = plan.lines;
     // hotpath-lint-allow: one line per model load.
@@ -905,6 +993,9 @@ pub fn log_flash_next_plan(
         verify_round_bytes = lines.verify_round,
         speculation,
         process_held_bytes,
+        vision_residency = vision.map(|vision| vision.residency().as_str()),
+        vision_item_max_tokens = vision.map_or(0, |vision| vision.item_max_tokens()),
+        media_embedding_bytes = lines.media_embedding,
         "flash-next vram plan"
     );
 }
@@ -1379,6 +1470,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
     kv_disk_location: &ignis_core::ngram_cache::CacheLocation,
 ) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), String> {
     flash_next_load(artifact_path, model_id, eos, shape, thinking_close, ngram_cache, kv_disk_location)
+        .map(|(scheduler, reserved, _)| (scheduler, reserved))
         .map_err(|e| e.to_string())
 }
 
@@ -1410,19 +1502,23 @@ fn flash_next_engine_options(
         kv_ram_arena_bytes: shape.host_pool_bytes,
         speculation,
         rope_scaling: shape.rope_scaling,
+        // GitHub #557: its embedding pool, and the companion's tower.
+        vision: shape.vision,
         ..ignis_core::flash_next::EngineOptions::default()
     }
 }
 
 /// [`flash_next_scheduler_with_ngram_cache`], with a host plan's refusal
 /// kept whole ([`FlashNextLoadError::HostPlan`]): the server's load reads it.
+/// Beside the scheduler and what the load reserved, the shape it runs: with
+/// vision (GitHub #557), at the item bound its encoder holds.
 #[cfg(feature = "cuda")]
 pub(crate) fn flash_next_load(
     artifact_path: &std::path::Path, model_id: String, eos: TokenId, shape: EngineShape,
     thinking_close: Option<Arc<ignis_core::thinking_budget::ThinkingClose>>,
     ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
     kv_disk_location: &ignis_core::ngram_cache::CacheLocation,
-) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), FlashNextLoadError> {
+) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations, EngineShape), FlashNextLoadError> {
     use ignis_artifact::flash_next::{self, FlashNextGeometry};
     use ignis_artifact::{CudaDevice, Reader};
     use ignis_core::compute::ModelConfig;
@@ -1471,13 +1567,35 @@ pub(crate) fn flash_next_load(
         (Some(_), None) => return Err("the MTP head: the artifact path has no directory".into()),
         (None, _) => None,
     };
+    let config = ModelConfig::flash_next_from(&geometry);
+    // GitHub #557 (ADR 0087): with vision, the companion's tower, held to
+    // this container and bound for the plan where its residency keeps it --
+    // its descriptors in the reservation plan, its bytes a host line (host)
+    // or a weights line (device).
+    let tower = match shape.vision {
+        Some(vision) => {
+            let companion = ignis_core::flash_next_vision::Companion::open(artifact_path, &reader, config.hidden)
+                .map_err(|refused| refused.to_string())?;
+            Some((companion.bind(vision.residency())?, companion.width()))
+        }
+        None => None,
+    };
     // The options the leaf loads with, but for the KV pool's pages and the
     // expert cache, which the plan below decides: one budget for the pool the
     // plan charges and the pool the leaf builds.
     let mut options = flash_next_engine_options(&shape, lanes, speculation, ngram_cache);
-    let reserved =
-        ignis_core::model_load::plan_flash_next_reservations(&plan, &geometry, options.load_shape(), mtp_plan.as_ref())?;
-    let config = ModelConfig::flash_next_from(&geometry);
+    let (reserved, item_max_tokens) = ignis_core::model_load::plan_flash_next(
+        &plan,
+        &geometry,
+        options.load_shape(),
+        mtp_plan.as_ref(),
+        tower.as_ref().map(|(tower, _)| tower),
+    )?;
+    // GitHub #557 (ADR 0087): the encode runs in the prefill scratch the
+    // text sizes, so the item bound is the largest item that holds on its
+    // own, at most the processor's: the load runs at it, and serves it.
+    let shape = EngineShape { vision: shape.vision.map(|vision| vision.with_item_max_tokens(item_max_tokens)), ..shape };
+    options.vision = shape.vision;
     // The sequence pool at any page count (ADR 0045): the lanes' state, the
     // retained slots, the residual window and the n-gram state do not move
     // with it; the arena its pages take -- KV and the indexer's keys, both
@@ -1494,18 +1612,22 @@ pub(crate) fn flash_next_load(
         u64::from(max_tokens),
         u64::from(LOOKAHEAD_WIDTH),
     );
-    let lines = ignis_core::VramLines {
-        weights: plan.plan.device_capacity_bytes + mtp_plan.as_ref().map_or(0, |p| p.plan.device_capacity_bytes),
-        cuda_context: ignis_runtime::CUDA_CONTEXT_BYTES,
-        workspace: reserved.workspace_bytes + reserved.activation_bytes,
-        sampling: reserved.sampling_bytes,
-        decode_graph: reserved.decode_graph_bytes,
-        verify_round: reserved.verify_round_bytes,
-        lane_state: pool_plan.lane_state_bytes + pool_plan.ngram_conv_bytes,
-        retained_slots: pool_plan.retained_state_bytes,
-        hq_residual_window: pool_plan.hq_residual_bytes,
-        ..ignis_core::VramLines::default()
-    };
+    let lines = with_flash_next_vision(
+        ignis_core::VramLines {
+            weights: plan.plan.device_capacity_bytes + mtp_plan.as_ref().map_or(0, |p| p.plan.device_capacity_bytes),
+            cuda_context: ignis_runtime::CUDA_CONTEXT_BYTES,
+            workspace: reserved.workspace_bytes + reserved.activation_bytes,
+            sampling: reserved.sampling_bytes,
+            decode_graph: reserved.decode_graph_bytes,
+            verify_round: reserved.verify_round_bytes,
+            lane_state: pool_plan.lane_state_bytes + pool_plan.ngram_conv_bytes,
+            retained_slots: pool_plan.retained_state_bytes,
+            hq_residual_window: pool_plan.hq_residual_bytes,
+            ..ignis_core::VramLines::default()
+        },
+        tower.as_ref().map_or(0, |(tower, _)| tower.device_bytes()),
+        reserved.media_embedding_bytes,
+    );
     // ADR 0045: the KV pool follows residency -- offloaded on a card that
     // cannot hold every expert, 524,288 tokens reserved first and the rest to
     // the expert cache; resident on one that can, the pool taking the rest,
@@ -1557,7 +1679,7 @@ pub(crate) fn flash_next_load(
         |s| format!("mtp draft tokens {} rows {} (k at 1/2/3 lanes: {}/{}/{})", s.draft_tokens(), s.row_budget(),
                     s.window(1), s.window(2), s.window(3)),
     );
-    log_flash_next_plan(&vram, plan_split.expected_hit_rate, lanes, &speculation_text, process_held_bytes);
+    log_flash_next_plan(&vram, plan_split.expected_hit_rate, lanes, &speculation_text, process_held_bytes, shape.vision);
     options.kv_pool_pages = Some(vram.kv_page_count);
     options.expert_cache_bytes = vram.expert_cache_bytes;
     // GitHub #329 item 12: the load's pools and pinned hot set, from the call
@@ -1614,12 +1736,17 @@ pub(crate) fn flash_next_load(
             pinned_staging_bytes(&plan.experts, &by_key).map_err(|e| e.to_string())?,
         )
     };
+    // GitHub #557: under the host residency, the tower's spans and the
+    // embedding pool, each a line of its own.
+    let (vision_tower_bytes, vision_pool_bytes) = tower.as_ref().map_or((0, 0), |(tower, width)| {
+        flash_next_vision_host_bytes(&shape, tower.host_mapped_bytes(), *width)
+    });
     let mut host_request = available_physical_bytes().map(|available| HostPlanRequest {
         available_physical_bytes: available,
         scope: crate::config::field::scope(ignis_core::compute::ModelFamily::FlashNext),
         token_embedding_bytes: 0,
-        vision_tower_bytes: 0,
-        vision_pool_bytes: 0,
+        vision_tower_bytes,
+        vision_pool_bytes,
         expert_pool_bytes,
         load_staging_bytes,
         ngram_hot_rows_bytes: 0,
@@ -1646,29 +1773,21 @@ pub(crate) fn flash_next_load(
     }
     if let Some(request) = host_request.as_mut() {
         request.ngram_hot_rows_bytes = ngram_hot_rows_bytes;
+        let vision = shape.vision.map(|vision| vision.residency());
         let host = plan_host(request).map_err(|refusal| {
-            log_host_plan_refused(&refusal);
+            log_host_plan_refused(&refusal, vision);
             FlashNextLoadError::HostPlan(refusal)
         })?;
-        // hotpath-lint-allow: one line per model load.
-        tracing::info!(
-            name: "ignis.runtime.flash_next_host_plan",
-            available_bytes = request.available_physical_bytes,
-            planned_bytes = host.total_bytes,
-            left_bytes = host.left_bytes,
-            margin_bytes = request.margin_bytes,
-            ngram_hot_budget = %shape.ngram_hot_bytes,
-            ngram_hot_budget_bytes = options.ngram.hot_bytes,
-            ngram_hot_rows_bytes,
-            ngram_whole_table = footprint.is_whole(options.ngram.hot_bytes),
-            retained_host_slots = options.retained_host_slots,
-            retained_host_bytes = pool_plan.retained_host_bytes,
-            kv_ram_arena_bytes = options.kv_ram_arena_bytes,
-            expert_pool_bytes = request.expert_pool_bytes,
-            load_staging_bytes = request.load_staging_bytes,
-            staging_bytes = request.staging_bytes,
-            kv_disk_staging_bytes,
-            "flash-next host plan"
+        log_flash_next_host_plan(
+            request,
+            &host,
+            FlashNextHostDetails {
+                ngram_hot_budget: shape.ngram_hot_bytes,
+                ngram_hot_budget_bytes: options.ngram.hot_bytes,
+                ngram_whole_table: footprint.is_whole(options.ngram.hot_bytes),
+                retained_host_slots: options.retained_host_slots,
+                vision,
+            },
         );
     }
     drop(reader);
@@ -1683,6 +1802,16 @@ pub(crate) fn flash_next_load(
     let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
     let stats = model.stats().map_err(|e| format!("runtime stats: {e:?}"))?;
     let capacity_pages = stats.kv_page_count;
+    // GitHub #557: the item bound the load holds is the one its plan named,
+    // or the plan no longer describes the load (and the processor would
+    // serve an item the encoder refuses).
+    if stats.vision_item_max_tokens != item_max_tokens {
+        return Err(format!(
+            "the load holds a vision item bound of {} merged tokens, not the {item_max_tokens} its plan named",
+            stats.vision_item_max_tokens
+        )
+        .into());
+    }
     // The 27B's reuse configuration (prompt reuse, retained slots, the
     // KV-RAM tier's bytes), over this load's lanes, and KV-disk below it.
     let kv_disk = KvDiskLoad {
@@ -1724,7 +1853,7 @@ pub(crate) fn flash_next_load(
         kv_disk_bytes,
         flash_next: Some(counters),
     };
-    Ok((sched, reserved))
+    Ok((sched, reserved, shape))
 }
 
 #[cfg(test)]
@@ -2487,7 +2616,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
         let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
         let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
-        tracing::subscriber::with_default(subscriber, || log_host_plan_refused(refusal));
+        tracing::subscriber::with_default(subscriber, || log_host_plan_refused(refusal, None));
         let mut events: Vec<serde_json::Value> =
             sink.lines().iter().map(|line| serde_json::from_str(line).expect("valid json")).collect();
         assert_eq!(events.len(), 1, "{events:?}");
@@ -2960,7 +3089,7 @@ mod tests {
             use tracing_subscriber::layer::SubscriberExt;
             let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
             let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
-            tracing::subscriber::with_default(subscriber, || log_flash_next_plan(plan, 0.5, 3, "off", held));
+            tracing::subscriber::with_default(subscriber, || log_flash_next_plan(plan, 0.5, 3, "off", held, None));
             let records: Vec<serde_json::Value> =
                 sink.lines().iter().map(|line| serde_json::from_str(line).expect("json")).collect();
             assert_eq!(records.len(), 1, "{records:?}");
@@ -2995,6 +3124,146 @@ mod tests {
         assert_eq!(field("residency_fixed_bytes"), 3u64 << 20);
         let rest = (92u64 << 30) - lines.total() - (3 << 20) - (37 << 30);
         assert_eq!(field("kv_pool_pages"), (rest - 4_096) / PAGE);
+    }
+
+    /// GitHub #557 (ADR 0087): a Flash-Next vision load plans the expert cache
+    /// a text-only load at the same settings does. Under the host residency
+    /// the tower and the embedding pool are host lines and the encode runs in
+    /// the prefill scratch the text sizes, so the only VRAM vision adds is
+    /// the forward's vision inputs among the activations -- a chunk's three
+    /// axes and media rows, a round's rope deltas: 131,328 bytes at an
+    /// 8,192-token chunk and three lanes (the leaf's bind test pins them) --
+    /// which the offloaded branch's cache gives up; under the device
+    /// residency the tower's weights and the pool are VRAM lines too.
+    #[test]
+    fn a_flash_next_vision_load_plans_the_text_loads_expert_cache_but_for_the_vision_inputs() {
+        const PAGE: u64 = 4_224 * 64;
+        const VISION_INPUTS: u64 = 3 * 8_192 * 4 + 8_192 * 4 + 256;
+        let arena = |pages: u32| 4_096 + u64::from(pages) * PAGE;
+        let text = ignis_core::VramLines { weights: 5 << 30, workspace: 2 << 30, lane_state: 400 << 20, ..Default::default() };
+        let plan = |lines: ignis_core::VramLines| {
+            ignis_core::plan_vram(&ignis_core::VramRequest {
+                mode: ignis_core::VramMode::Derived { headroom_bytes: 1536 << 20 },
+                free_at_start_bytes: 31 << 30,
+                lines,
+                kv_page_bytes: PAGE,
+                max_context_tokens: 262_144,
+                retained_slots: 8,
+                kv_pool: None,
+                residency: ignis_core::Residency::Experts(ignis_core::ExpertResidency {
+                    expert_pool_bytes: 37 << 30,
+                    staging_ring_bytes: 1_497 << 20,
+                    table_bytes: 3 << 20,
+                    decode_lanes: 3,
+                }),
+                embedding_pool_named: false,
+                kv_arena_bytes: &arena,
+                can_page: true,
+            })
+            .expect("fits")
+        };
+        let text_only = plan(text);
+        assert_eq!(text_only.kv_pool_policy.as_str(), "offloaded");
+        let with_inputs = ignis_core::VramLines { workspace: text.workspace + VISION_INPUTS, ..text };
+        let host = plan(with_flash_next_vision(with_inputs, 0, 0));
+        assert_eq!(host.lines.weights, text.weights, "the tower is a host line");
+        assert_eq!(host.lines.media_embedding, 0, "and so is the pool");
+        assert_eq!((host.kv_page_count, host.staging_ring_bytes), (text_only.kv_page_count, text_only.staging_ring_bytes));
+        assert_eq!(text_only.expert_cache_bytes - host.expert_cache_bytes, VISION_INPUTS, "the vision inputs alone");
+        const TOWER: u64 = 280 << 20;
+        const POOL: u64 = 160 << 20;
+        let device = plan(with_flash_next_vision(with_inputs, TOWER, POOL));
+        assert_eq!((device.lines.weights, device.lines.media_embedding), (text.weights + TOWER, POOL));
+        assert_eq!(text_only.expert_cache_bytes - device.expert_cache_bytes, VISION_INPUTS + TOWER + POOL);
+    }
+
+    /// GitHub #557 (ADR 0087): what a Flash-Next vision load pins in host
+    /// memory under the host residency -- the companion tower's spans and the
+    /// embedding pool, one envelope-wide item of Flash-Next's 2,560 BF16 rows
+    /// at the shape's context unless named -- and nothing under the device
+    /// residency or without vision.
+    #[test]
+    fn a_flash_next_vision_loads_host_lines_are_its_towers_and_its_pools_under_host() {
+        const TOWER: u64 = 280 << 20;
+        let width = ignis_core::EmbeddingWidth::from_inventory(&ignis_artifact::vision_scope(2560), 2560).expect("2,560 rows");
+        let shape = |vision: Option<ignis_core::Vision>| EngineShape { vision, max_context: 262_144, ..EngineShape::default() };
+        let envelope = ignis_core::Vision::new(8192).unwrap();
+        let host = shape(Some(envelope.with_residency(ignis_core::VisionResidency::Host)));
+        assert_eq!(flash_next_vision_host_bytes(&host, TOWER, width), (TOWER, 8192 * 2560 * 2), "one 8,192-token item");
+        let named = shape(Some(envelope.with_residency(ignis_core::VisionResidency::Host).with_pool_bytes(160 << 20)));
+        assert_eq!(flash_next_vision_host_bytes(&named, TOWER, width), (TOWER, 160 << 20));
+        let device = shape(Some(envelope.with_residency(ignis_core::VisionResidency::Device)));
+        assert_eq!(flash_next_vision_host_bytes(&device, TOWER, width), (0, 0), "VRAM lines under device");
+        assert_eq!(flash_next_vision_host_bytes(&shape(None), TOWER, width), (0, 0), "no vision, no lines");
+    }
+
+    /// GitHub #557: Flash-Next's host plan event carries the vision lines and
+    /// where the tower lives; a start short of RAM for them is refused with
+    /// the bytes short and their ways out, its event naming the lines too.
+    #[test]
+    fn a_flash_next_host_plan_shows_its_vision_lines_and_a_short_one_names_their_ways_out() {
+        use tracing_subscriber::layer::SubscriberExt;
+        const TOWER: u64 = 280 << 20;
+        const POOL: u64 = 160 << 20;
+        let request = |available: u64| ignis_core::residency::HostPlanRequest {
+            available_physical_bytes: available,
+            scope: "qwen38flashnext",
+            token_embedding_bytes: 0,
+            vision_tower_bytes: TOWER,
+            vision_pool_bytes: POOL,
+            expert_pool_bytes: 38 << 30,
+            load_staging_bytes: 0,
+            ngram_hot_rows_bytes: 1 << 30,
+            staging_bytes: 0,
+            retained_host_slots_bytes: 1 << 30,
+            kv_ram_arena_bytes: 2 << 30,
+            margin_bytes: 4 << 30,
+        };
+        let capture = |run: &dyn Fn()| {
+            let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+            let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+            tracing::subscriber::with_default(subscriber, run);
+            let events: Vec<serde_json::Value> =
+                sink.lines().iter().map(|line| serde_json::from_str(line).expect("valid json")).collect();
+            assert_eq!(events.len(), 1, "{events:?}");
+            events[0].clone()
+        };
+        let fits = request(64 << 30);
+        let host = ignis_core::residency::plan_host(&fits).expect("64 GiB holds it");
+        let details = || FlashNextHostDetails {
+            ngram_hot_budget: ignis_core::ngram_table::HotBudget::default(),
+            ngram_hot_budget_bytes: 1 << 30,
+            ngram_whole_table: false,
+            retained_host_slots: 8,
+            vision: Some(ignis_core::VisionResidency::Host),
+        };
+        let event = capture(&|| log_flash_next_host_plan(&fits, &host, details()));
+        assert_eq!(event["event_name"], "ignis.runtime.flash_next_host_plan");
+        let attributes = &event["attributes"];
+        assert_eq!((attributes["vision_tower_bytes"].as_u64(), attributes["vision_pool_bytes"].as_u64()), (Some(TOWER), Some(POOL)));
+        assert_eq!(attributes["vision_residency"], "host");
+        assert_eq!(attributes["planned_bytes"].as_u64(), Some(host.total_bytes));
+        assert_eq!(host.total_bytes, TOWER + POOL + (38 << 30) + (1 << 30) + (1 << 30) + (2 << 30));
+
+        // The tower alone does not fit beside the margin.
+        let short = ignis_core::residency::plan_host(&request((4 << 30) + (100 << 20))).expect_err("short");
+        let message = short.to_string();
+        assert!(message.contains("The vision tower (280 MiB) and its embedding pool (160 MiB) do not: keep them in VRAM"), "{message}");
+        assert!(message.contains("--vision-residency device") && message.contains("turn vision off"), "{message}");
+        assert!(!message.contains("token embedding"), "Flash-Next has none: {message}");
+        // The tower and the pool fit, the experts beside them do not.
+        let short = ignis_core::residency::plan_host(&request((4 << 30) + (20 << 30))).expect_err("short of the experts");
+        let ignis_core::residency::HostPlanError::BelowMargin { crossing_line, .. } = &short;
+        assert_eq!(*crossing_line, "expert_pool");
+        let message = short.to_string();
+        assert!(message.contains("do not fit beside the vision tower and its embedding pool (440 MiB)"), "{message}");
+        assert!(message.contains("--vision-residency device") && message.contains("turn vision off"), "{message}");
+        let event = capture(&|| log_host_plan_refused(&short, Some(ignis_core::VisionResidency::Host)));
+        let attributes = &event["attributes"];
+        assert_eq!(event["event_name"], "ignis.runtime.flash_next_host_plan_refused");
+        assert_eq!((attributes["vision_tower_bytes"].as_u64(), attributes["vision_pool_bytes"].as_u64()), (Some(TOWER), Some(POOL)));
+        assert_eq!(attributes["short_bytes"].as_u64(), Some(short.short_bytes()));
+        assert_eq!(attributes["vision_residency"], "host");
     }
 
     /// GitHub #329 item 12: a load that asked for a pinned hot set says what

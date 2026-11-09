@@ -279,6 +279,10 @@ pub struct RuntimeStats {
     /// What the loaded model and its pool hold beside the weights (GitHub
     /// #210); all zero for a leaf with no device.
     pub reserved: ReservedBytes,
+    /// The most merged tokens one media item may hold on this load (GitHub
+    /// #557): the item bound its encoder was sized for, which the processor
+    /// it serves must not pass. 0 without vision.
+    pub vision_item_max_tokens: u32,
 }
 
 impl From<RuntimeError> for ComputeError {

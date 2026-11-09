@@ -10,9 +10,13 @@
 //! sidecar pins the one main container it belongs to (`pair.main`, the MTP
 //! companion's shape, flash-next-layout.md §13.2).
 
-use super::VISION_MODEL_ID;
+use super::{fail, VISION_MODEL_ID};
+use crate::binder::{Binder, MaterializationPlan, ObjectHandle};
 use crate::nvfp4_27b::{vision_tower, Entry, VisionTower};
-use crate::{ArtifactIdentity, Reader, Result};
+use crate::{ArtifactIdentity, Object, Reader, Result, VisionResidency};
+
+/// The merger's output object, whose rows are the width the tower writes.
+const MERGER_OUTPUT: &str = "vision/merger/fc2";
 
 /// The companion's identity: the vision `model_id` and the build's weights
 /// id (the 27B tower's grouped formats, from revision `de4b8e4`).
@@ -58,10 +62,81 @@ pub fn check_identity(reader: &Reader) -> Result<()> {
     Ok(())
 }
 
+/// The rows the companion's merger writes, as its directory records them:
+/// the first dimension of `vision/merger/fc2` (GitHub #557). What a load
+/// holds against the text model's hidden width before it binds anything.
+pub fn merger_width(reader: &Reader) -> Result<u64> {
+    match reader.find(MERGER_OUTPUT) {
+        Some(Object::Tensor(tensor)) if !tensor.shape.is_empty() => Ok(tensor.shape[0]),
+        _ => Err(fail(format!("the vision companion has no {MERGER_OUTPUT} tensor"))),
+    }
+}
+
+/// What [`bind`] placed: every object of the tower, in [`entries`] order.
+pub struct VisionPlan {
+    pub plan: MaterializationPlan,
+    pub handles: Vec<ObjectHandle>,
+}
+
+/// Bind the companion (GitHub #557): its identity, then every object of
+/// `tower`'s [`entries`] with its exact format, layout and shape, placed
+/// where `residency` keeps the tower -- on the device, or in mapped pinned
+/// host memory, staged for each encode (ADR 0075) -- and any object the
+/// inventory does not name refused (ADR 0002).
+pub fn bind(reader: &Reader, tower: &VisionTower, residency: VisionResidency) -> Result<VisionPlan> {
+    check_identity(reader)?;
+    let mut binder = Binder::new(reader);
+    let mut handles = Vec::new();
+    for entry in entries(tower) {
+        let Entry::Tensor { name, format, layout, shape } = entry else {
+            return Err(fail(format!("{}: the tower holds tensors only", entry.name())));
+        };
+        let handle = binder.require_tensor(&name, format, layout, &shape)?;
+        match residency {
+            VisionResidency::Host => binder.place_in_host_mapped(handle)?,
+            VisionResidency::Device => binder.materialize_on_device(handle)?,
+        }
+        handles.push(handle);
+    }
+    Ok(VisionPlan { plan: binder.finish()?, handles })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::inventory::{vision_scope, vision_scope_27b};
+    use crate::packer::{pack, PackOutcome};
+
+    /// GitHub #557: a load reads the merger's width off the companion's
+    /// directory and binds every object where the residency keeps the tower
+    /// -- in mapped host memory under `host`, on the device under `device`;
+    /// the main container is no companion, and a tower of other shapes
+    /// fails naming the object.
+    #[test]
+    fn the_companion_binds_where_the_residency_keeps_the_tower() {
+        let main = super::super::fixture::build("vision-bind").expect("the main fixture");
+        main.tree.write_vision(&main.path).expect("the vision work tree");
+        let outcome = pack(&main.tree.vision_pack_options(main.path.clone()), &mut |_| {}).expect("pack the tower");
+        assert!(matches!(outcome, PackOutcome::Finished { .. }), "{outcome:?}");
+        let companion = Reader::open(&main.tree.vision_artifact_path()).expect("open the companion");
+        let tower = fixture_geometry();
+        assert_eq!(merger_width(&companion).expect("the merger's width"), tower.out_hidden);
+
+        let host = bind(&companion, &tower, VisionResidency::Host).expect("bind in host memory");
+        assert_eq!(host.handles.len(), entries(&tower).len());
+        assert!(host.plan.device_objects.is_empty(), "nothing on the device");
+        assert_eq!(host.plan.host_mapped_objects.len(), host.handles.len());
+        let device = bind(&companion, &tower, VisionResidency::Device).expect("bind on the device");
+        assert!(device.plan.host_mapped_objects.is_empty(), "nothing in host memory");
+        assert_eq!(device.plan.device_objects.len(), device.handles.len());
+
+        let main_reader = Reader::open(&main.path).expect("open the main container");
+        let err = bind(&main_reader, &tower, VisionResidency::Host).err().expect("no companion").to_string();
+        assert!(err.contains("not a vision companion"), "{err}");
+        assert!(merger_width(&main_reader).is_err(), "the main container has no merger");
+        let err = bind(&companion, &geometry(), VisionResidency::Host).err().expect("other shapes").to_string();
+        assert!(err.contains("vision/"), "{err}");
+    }
 
     /// What the packer holds the companion to is what a load binds: at
     /// Flash-Next's widths the inventory is `vision_scope(2560)` object for

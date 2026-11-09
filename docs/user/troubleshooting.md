@@ -351,8 +351,10 @@ margin; each costs something
 
 When it names `crossing_line: load_staging`, no flag shrinks those layer
 buffers: close other applications. When it names `crossing_line:
-vision_tower` or `vision_pool`, the 27B's vision tower or its embedding pool
-does not fit in pinned RAM under `--vision-residency host`: start with
+vision_tower` or `vision_pool`, a vision tower or its embedding pool (the
+27B's, or Flash-Next's companion's) does not fit in pinned RAM under
+`--vision-residency host`, and when Flash-Next's experts no longer fit beside
+them its message says so: start with
 `--vision-residency device` to keep both in VRAM, or without vision
 ([Where the vision tower and the embedding pool live](configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live)).
 
@@ -363,10 +365,20 @@ Flash-Next's MTP head needs its companion container
 qwen3.8-flash-next` fetches both
 ([Flash-Next speculation](configuration/flash-next-mtp.md)).
 
+### Flash-Next refuses the start for its vision companion
+
+With vision on, Flash-Next's start opens its vision companion
+(`qwen3_8_flash_next_vision-v2.ninfer`) beside the artifact and refuses the
+start, naming the file, when it is missing (`model download
+qwen3.8-flash-next` fetches it, or start without vision) or is not this
+artifact's: built for another main container, or a merger of another width.
+Download the model again, so the pair is one revision's
+([Flash-Next's vision](configuration/vision.md#flash-next)).
+
 ### A flag is refused for this model
 
 A field only one model takes is refused at start when set for the other
-(`--vision-enabled` and Flash-Next, the n-gram flags and the 27B,
+(`--model-prefill-attention` and Flash-Next, the n-gram flags and the 27B,
 `--spec-decode-lanes` and the 27B). Remove it, or give it in the model's own
 family section of the config file. On a model switch it is dropped instead,
 with a log line ([Configuration](configuration/index.md)).

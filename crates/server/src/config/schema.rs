@@ -223,6 +223,9 @@ pub fn field(group: &str, name: &str) -> Option<&'static FieldMeta> {
 const ALL: Applicability = Applicability::AllFamilies;
 const FLASH_NEXT_ONLY: Applicability = Applicability::Only(&[ModelFamily::FlashNext]);
 const QWEN38_ONLY: Applicability = Applicability::Only(&[ModelFamily::Qwen38_27b]);
+/// The two text models with a vision tower: the 27B's in its container,
+/// Flash-Next's in its vision companion (ADR 0087).
+const VISION_MODELS: Applicability = Applicability::Only(&[ModelFamily::Qwen38_27b, ModelFamily::FlashNext]);
 const NEMOTRON_DIARIZATION_ONLY: Applicability = Applicability::Only(&[ModelFamily::Nemotron3Diarization]);
 const NO_RULE: Validator = Validator::None;
 
@@ -608,20 +611,24 @@ config_group! {
 }
 
 config_group! {
-    /// The 27B's vision tower.
+    /// The vision tower: the 27B's, in its container, and Flash-Next's, in
+    /// the vision companion beside its container (ADR 0087).
     VisionGroup = "vision" {
-        /// Load the vision tower and reserve its workspace.
-        enabled: Bool = false, NO_RULE, QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
+        /// Load the vision tower and reserve its workspace. Flash-Next's needs
+        /// its vision companion beside the artifact, and a start without it
+        /// is refused naming the file. Per family: the built-in profiles turn
+        /// it on for the 27B alone.
+        enabled: Bool = false, NO_RULE, VISION_MODELS, [Visible, Patchable, ReloadRequired, Scoped];
         /// Merged vision tokens per request. An image over it is shrunk to
         /// fit, aspect kept; refused only when its aspect ratio cannot fit, or
         /// when several images total over it. Needs vision on.
-        max_tokens: Tokens = ignis_core::DEFAULT_VISION_MAX_TOKENS, between(1, ignis_core::VISION_MAX_TOKENS_LIMIT as i64), QWEN38_ONLY,
+        max_tokens: Tokens = ignis_core::DEFAULT_VISION_MAX_TOKENS, between(1, ignis_core::VISION_MAX_TOKENS_LIMIT as i64), VISION_MODELS,
             [Visible, Patchable, ReloadRequired];
         /// Encoded images kept for reuse, in MiB, where `vision.residency`
         /// puts the pool: VRAM, or pinned host RAM under `host`. Unset, one
         /// envelope-wide embedding; a pool below that is raised to it. Needs
         /// vision on.
-        embedding_pool_mib: Opt<Mib> = None, between(1, super::MAX_VISION_EMBEDDING_POOL_MIB as i64), QWEN38_ONLY,
+        embedding_pool_mib: Opt<Mib> = None, between(1, super::MAX_VISION_EMBEDDING_POOL_MIB as i64), VISION_MODELS,
             [Visible, Patchable, ReloadRequired];
         /// Where the vision tower's weights and the embedding pool live:
         /// `device`, in VRAM for the life of the load (today's encode
@@ -629,7 +636,7 @@ config_group! {
         /// GPU for each image encode (~300 MB and the pool less VRAM, so more
         /// KV pool, a few ms more an encode). A `host` start the host RAM
         /// cannot hold is refused, never moved to the device. Needs vision on.
-        residency: VisionResidencyKind = ignis_core::VisionResidency::default(), Validator::OneOf(&ignis_core::VisionResidency::NAMES), QWEN38_ONLY,
+        residency: VisionResidencyKind = ignis_core::VisionResidency::default(), Validator::OneOf(&ignis_core::VisionResidency::NAMES), VISION_MODELS,
             [Visible, Patchable, ReloadRequired];
     }
 }
@@ -640,10 +647,10 @@ config_group! {
         /// Fetch image URLs on private, loopback, link-local, multicast and
         /// CGNAT addresses. Off, so an exposed server cannot be used to probe
         /// the operator's LAN. Needs vision on.
-        allow_private_network: Bool = false, NO_RULE, QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
+        allow_private_network: Bool = false, NO_RULE, VISION_MODELS, [Visible, Patchable, ReloadRequired];
         /// Prepared images kept for reuse, in MiB; 0 keeps none. Needs vision
         /// on.
-        cache_mib: Mib = super::DEFAULT_MEDIA_CACHE_MIB as u64, between(0, super::MEDIA_CACHE_MIB_LIMIT as i64), QWEN38_ONLY,
+        cache_mib: Mib = super::DEFAULT_MEDIA_CACHE_MIB as u64, between(0, super::MEDIA_CACHE_MIB_LIMIT as i64), VISION_MODELS,
             [Visible, Patchable, ReloadRequired];
     }
 }

@@ -199,7 +199,8 @@ async fn chat(server: &Arc<Server>, req: TokenizeRequest) -> Result<(Vec<u32>, O
     }
     check_roles(&messages).map_err(template_rejection)?;
     // A model with no vision tower refuses an image for that, naming itself
-    // (spec flash-next/04), before this route's own reason below.
+    // (spec flash-next/04), before this route's own reason below; both text
+    // models have one since GitHub #557.
     if !server.active().family.takes_images() {
         server.check_content_parts(&messages).map_err(content_rejection)?;
     }

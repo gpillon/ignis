@@ -21,7 +21,9 @@
 //! A span of a multimodal prompt (GitHub #557, ADR 0087) runs on a load
 //! with vision: its three-axis positions, its rope delta and the media
 //! columns over its placeholders. The media encode is the vision
-//! companion's, which this leaf does not bind yet: `encode_media` refuses.
+//! companion's tower, opened at load beside the artifact and held to it; an
+//! item encodes into the load's embedding pool in the prefill scratch, as
+//! the 27B's does in its own scratch.
 //!
 //! What it does not serve (spec flash-next/04): attention readouts.
 
@@ -65,8 +67,8 @@ fn leaf_error(context: &str, message: String) -> i32 {
 }
 
 /// One phase of [`FlashNextLeaf::open`] (`docs/findings/2026-10-09-flash-next-expert-pool-parallel-read.md`):
-/// `"bind"`, `"device_weights"`, `"residency"`, `"mtp"` and `"ngram"` run in
-/// that order on the opening thread. An earlier attempt ran `"residency"`
+/// `"bind"`, `"device_weights"`, `"vision"` (GitHub #557), `"residency"`,
+/// `"mtp"` and `"ngram"` run in that order on the opening thread. An earlier attempt ran `"residency"`
 /// concurrently with the rest on a second thread; it measured slower (the
 /// finding's "overlapped load, NO-GO"), so every phase is sequential.
 fn log_load_phase(phase: &'static str, elapsed: std::time::Duration) {
@@ -144,6 +146,9 @@ pub struct FlashNextLeaf {
     /// An MTP load's head (spec flash-next/07), its companion pinned to this
     /// artifact at open; the model points into it.
     mtp: Option<ignis_core::flash_next_mtp::MtpHead>,
+    /// A vision load's tower (GitHub #557), its companion pinned to this
+    /// artifact at open; the model points into it.
+    tower: Option<ignis_core::flash_next_vision::Tower>,
     /// The weight arena and the device, freed together (`DeviceWeights`).
     weights: DeviceWeights,
 }
@@ -182,6 +187,20 @@ impl FlashNextLeaf {
         let start = Instant::now();
         let weights = DeviceWeights::place(&reader, &plan)?;
         log_load_phase("device_weights", start.elapsed());
+
+        // GitHub #557: a vision load's tower, its companion held to this
+        // artifact before any byte of it is read; placed before the residency
+        // phase, whose peak the host plan charges it to (`vision_tower`).
+        let start = Instant::now();
+        let tower = match options.vision {
+            Some(vision) => {
+                let companion = ignis_core::flash_next_vision::Companion::open(path, &reader, config.hidden)
+                    .map_err(|e| e.to_string())?;
+                Some(ignis_core::flash_next_vision::Tower::load(&companion, vision.residency())?)
+            }
+            None => None,
+        };
+        log_load_phase("vision", start.elapsed());
 
         // A device-only residency's layer buffers are gone when this
         // returns, and every host-plan line but the expert pool is allocated
@@ -234,6 +253,7 @@ impl FlashNextLeaf {
             options,
             artifact_hash,
             mtp,
+            tower,
             weights,
         })
     }
@@ -461,8 +481,8 @@ impl StepLeaf for FlashNextLeaf {
     type Prefix = FlashNextPrefix;
     type Checkpoint = FlashNextCheckpoint;
     type SnapshotBuf = ArenaBuffer;
-    // GitHub #557: an embedding in the load's pool, the 27B's handle; its
-    // encode is the vision companion's (`encode_media` refuses until it binds).
+    // GitHub #557: an embedding in the load's pool, the 27B's handle,
+    // encoded by the vision companion's tower.
     type Media = step::MediaEmbedding<'static>;
 
     fn load_model(&self) -> Result<Self::Model, i32> {
@@ -474,6 +494,7 @@ impl StepLeaf for FlashNextLeaf {
             o.load_shape(),
             &self.residency,
             self.mtp.as_ref(),
+            self.tower.as_ref(),
         )
         .map_err(|e| leaf_error("model load", e))?;
         let pool =
@@ -494,6 +515,28 @@ impl StepLeaf for FlashNextLeaf {
     }
 
     fn release_model(&self, _model: Self::Model) {}
+
+    /// GitHub #557: the vision companion's tower encodes the item into the
+    /// load's embedding pool, in the prefill scratch, as the 27B's leaf
+    /// encodes in its own. A full pool is the caller's to act on (it
+    /// releases an embedding and calls again), never a leaf error.
+    fn encode_media(&self, model: &Self::Model, item: &ignis_core::vision::MediaItem) -> Result<Self::Media, i32> {
+        let control = ignis_core::vision::vision_item_control(item.grid);
+        let embedding = step::encode_media(&model.model, item.grid, &item.patches, &control).map_err(|(rc, message)| {
+            if rc == step::MEDIA_ENCODE_POOL_FULL {
+                rc
+            } else {
+                leaf_error("media encode", message)
+            }
+        })?;
+        // Safety: as for sequences -- `RuntimeCompute` releases every live
+        // embedding before its `Arc<Model<L>>` (and so this model) can drop.
+        Ok(unsafe { embedding.into_static() })
+    }
+
+    fn release_media(&self, _model: &Self::Model, _media: Self::Media) {
+        // Drops here: `MediaEmbedding::drop` calls `ignis_media_embedding_release`.
+    }
 
     fn decode_lanes(&self) -> u32 {
         self.options.decode_lanes
@@ -523,6 +566,7 @@ impl StepLeaf for FlashNextLeaf {
                 kv_pool: pool_stats.kv_arena_bytes,
                 ..ReservedBytes::default()
             },
+            vision_item_max_tokens: model.model.vision_item_max_tokens(),
         })
     }
 

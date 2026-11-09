@@ -330,6 +330,7 @@ impl StepLeaf for StubLeaf {
             graph_launches: 0,
             free_vram_bytes: 0,
             reserved: Default::default(),
+            vision_item_max_tokens: 0,
         })
     }
 

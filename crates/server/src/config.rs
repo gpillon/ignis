@@ -1194,8 +1194,8 @@ fn derive(
     }
 
     let (speculation, speculation_off) = derive_speculation(&resolution, &spelled)?;
-    let vision = derive_vision(&resolution, &spelled)?;
-    let media = derive_media(&resolution, vision.is_some(), &spelled)?;
+    let vision = derive_vision(&resolution, sources, &spelled)?;
+    let media = derive_media(&resolution, sources, vision.is_some(), &spelled)?;
 
     // `--server-metrics` (GitHub #89, ADR 0017, on by default) opens its own
     // listener; naming its address while turning metrics off is refused
@@ -1633,13 +1633,19 @@ fn derive_speculation(
 /// `--vision-embedding-pool-mib` and `--vision-residency` (GitHub #177,
 /// #243, #414). Vision is off unless asked for; none of the other three has
 /// anything to size or place with it off, so naming one is refused rather
-/// than ignored. With vision on, the envelope
+/// than ignored -- unless vision is on for the other model that takes it
+/// ([`vision_on_for_a_model`], GitHub #557), whose knob it then is. With
+/// vision on, the envelope
 /// defaults to [`DEFAULT_VISION_MAX_TOKENS`] and the pool to one
 /// envelope-wide embedding — exactly what GitHub #177 always reserved, so a
 /// load that says nothing does not move the VRAM plan. The pool's floor is
 /// the leaf's: a pool below one envelope-wide embedding is raised there
 /// rather than refused here.
-fn derive_vision(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> String) -> Result<Option<Vision>, ConfigError> {
+fn derive_vision(
+    resolution: &Resolution,
+    sources: &Sources,
+    spelled: &impl Fn(&str, &str) -> String,
+) -> Result<Option<Vision>, ConfigError> {
     let s = &resolution.settings.vision;
     if !s.enabled {
         for (name, value) in [
@@ -1647,7 +1653,7 @@ fn derive_vision(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> Strin
             ("embedding_pool_mib", s.embedding_pool_mib.filter(|_| resolution.explicit("vision", "embedding_pool_mib")).map(|n| n.to_string())),
             ("residency", resolution.explicit("vision", "residency").then(|| s.residency.as_str().to_owned())),
         ] {
-            if let Some(value) = value {
+            if let Some(value) = value.filter(|_| !vision_on_for_a_model(sources)) {
                 return Err(ConfigError(format!(
                     "`{} {value}` requires `--vision-enabled` (vision is off without it)",
                     spelled("vision", name)
@@ -1670,16 +1676,33 @@ fn derive_vision(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> Strin
     }))
 }
 
+/// Whether vision resolves on for a load of either model that takes it
+/// (GitHub #557, ADR 0087): a built-in profile turns it on for the 27B alone,
+/// so a vision or media knob named beside it -- which a resolution for
+/// Flash-Next, or for no family, sees with vision off -- is the 27B's, not a
+/// mistake to refuse.
+fn vision_on_for_a_model(sources: &Sources) -> bool {
+    [ModelFamily::Qwen38_27b, ModelFamily::FlashNext].into_iter().any(|family| {
+        source::resolve_settings(sources, Some(family), Fit::Switch).is_ok_and(|resolved| resolved.settings.vision.enabled)
+    })
+}
+
 /// `--media-allow-private-network` and `--media-cache-mib` (GitHub #179).
 /// Without vision there is no media to acquire, so turning the private
 /// network on or sizing the cache is refused rather than ignored, as the
-/// vision envelope is.
+/// vision envelope is -- unless vision is on for the other model
+/// ([`vision_on_for_a_model`]).
 fn derive_media(
     resolution: &Resolution,
+    sources: &Sources,
     vision: bool,
     spelled: &impl Fn(&str, &str) -> String,
 ) -> Result<MediaOptions, ConfigError> {
     let s = &resolution.settings.media;
+    let named = resolution.explicit("media", "allow_private_network") || resolution.explicit("media", "cache_mib");
+    if !vision && named && vision_on_for_a_model(sources) {
+        return Ok(MediaOptions::default());
+    }
     if !vision {
         if s.allow_private_network && resolution.explicit("media", "allow_private_network") {
             return Err(ConfigError(format!(

@@ -314,6 +314,25 @@ pub fn build(tag: &str) -> Result<FixtureArtifact> {
     build_from(tree)
 }
 
+impl FixtureArtifact {
+    /// Its vision companion (GitHub #557), packed from the fixture tower and
+    /// put where a load looks for it: beside the main container under the
+    /// companion's file name, its sidecar beside it. Returns its path.
+    pub fn with_vision_companion(&self) -> Result<PathBuf> {
+        self.tree.write_vision(&self.path)?;
+        match pack(&self.tree.vision_pack_options(self.path.clone()), &mut |_| {})? {
+            PackOutcome::Finished { .. } => {}
+            other => return Err(fail(format!("the fixture vision tree did not pack: {other:?}"))),
+        }
+        let packed = self.tree.vision_artifact_path();
+        let beside = self.path.with_file_name(crate::packer::VISION_ARTIFACT_FILE_NAME);
+        std::fs::rename(&packed, &beside).map_err(io(&packed))?;
+        let sidecar = crate::packer::sidecar_path(&packed);
+        std::fs::rename(&sidecar, crate::packer::sidecar_path(&beside)).map_err(io(&sidecar))?;
+        Ok(beside)
+    }
+}
+
 /// Pack an already written work tree.
 pub fn build_from(tree: WorkTree) -> Result<FixtureArtifact> {
     match pack(&tree.pack_options(), &mut |_| {})? {
