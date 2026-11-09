@@ -41,7 +41,7 @@ What it costs:
   Flash-Next already reserves and leaves idle while an image encodes: the
   prefill scratch it reserves for its text and, on a card that cannot hold
   every expert, the staging ring that prefill's expert misses pass through
-  (1.5 GB on an RTX 5090), which holds nothing between two prefill chunks.
+  (1.57 GB on an RTX 5090), which holds nothing between two prefill chunks.
   The tower is copied through three 25 MB slots of them. The positions an
   image's tokens are read at ride in buffers a text load reserves too, so a
   vision load plans the same expert cache as a text-only load at the same
