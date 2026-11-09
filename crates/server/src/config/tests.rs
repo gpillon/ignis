@@ -1931,6 +1931,31 @@ fn vision_is_off_on_flash_next_unless_named_and_takes_the_profiles_residency() {
     assert!(scoped.for_family(ModelFamily::Qwen38_27b).unwrap().vision.is_none(), "not the 27B's");
 }
 
+/// GitHub #557: every vision and media field keeps a section per model, so a
+/// config file written while they were the 27B's alone (`vision.qwen38.*`,
+/// where a live patch wrote them) still starts, its values the 27B's, and
+/// Flash-Next gets sections of its own.
+#[test]
+fn the_vision_and_media_fields_keep_a_section_per_model() {
+    let files = MemFiles::with(&[(
+        "c.yaml",
+        "profile: none\nvision:\n  qwen38:\n    enabled: true\n    max_tokens: 16384\n    residency: device\n    embedding_pool_mib: 640\n  \
+         qwen38flashnext:\n    enabled: true\n    max_tokens: 4096\nmedia:\n  qwen38:\n    cache_mib: 64\n    allow_private_network: true\n",
+    )]);
+    let started = with_files(&["--config", "c.yaml"], no_env, &files).expect("the file's family sections are keys");
+    let the_27b = started.for_family(ModelFamily::Qwen38_27b).unwrap();
+    let vision = the_27b.vision.expect("on for the 27B");
+    assert_eq!((vision.max_tokens(), vision.residency(), vision.requested_pool_bytes()), (16384, VisionResidency::Device, 640 << 20));
+    assert_eq!((the_27b.media.cache_bytes, the_27b.media.allow_private_network), (64 << 20, true));
+    let flash_next = started.for_family(ModelFamily::FlashNext).unwrap();
+    let vision = flash_next.vision.expect("on for Flash-Next");
+    assert_eq!((vision.max_tokens(), vision.residency()), (4096, VisionResidency::Host), "its own envelope, the default residency");
+    assert!(!flash_next.media.allow_private_network, "the 27B's media section is not Flash-Next's");
+    // And flags of their own.
+    let flagged = config(&["--profile", "none", "--qwen38flashnext-vision-enabled", "--qwen38flashnext-vision-max-tokens", "2048"]);
+    assert_eq!(flagged.for_family(ModelFamily::FlashNext).unwrap().vision.map(|v| v.max_tokens()), Some(2048));
+}
+
 /// The image model (ADR 0050) decodes no tokens: any speculative backend is
 /// refused at start, saying it has no drafter.
 #[test]
@@ -2438,7 +2463,8 @@ fn the_vision_residency_is_set_by_flag_env_and_file() {
 #[test]
 fn the_vision_residency_is_patched_and_takes_effect_at_the_next_load() {
     let meta = schema::field("vision", "residency").expect("declared");
-    assert!(meta.visible && meta.patchable && meta.reload_required && !meta.scoped, "{meta:?}");
+    // GitHub #557: per model, as vision is.
+    assert!(meta.visible && meta.patchable && meta.reload_required && meta.scoped, "{meta:?}");
     // A patch reaches the running 27B, whose next load it is.
     let started = config(&["--profile", "none", "--vision-enabled"]).for_family(ModelFamily::Qwen38_27b).unwrap();
     let patched = started.with_patch(&patch_of(&[("vision", "residency", "device")])).unwrap();

@@ -623,13 +623,13 @@ config_group! {
         /// fit, aspect kept; refused only when its aspect ratio cannot fit, or
         /// when several images total over it. Needs vision on.
         max_tokens: Tokens = ignis_core::DEFAULT_VISION_MAX_TOKENS, between(1, ignis_core::VISION_MAX_TOKENS_LIMIT as i64), VISION_MODELS,
-            [Visible, Patchable, ReloadRequired];
+            [Visible, Patchable, ReloadRequired, Scoped];
         /// Encoded images kept for reuse, in MiB, where `vision.residency`
         /// puts the pool: VRAM, or pinned host RAM under `host`. Unset, one
         /// envelope-wide embedding; a pool below that is raised to it. Needs
         /// vision on.
         embedding_pool_mib: Opt<Mib> = None, between(1, super::MAX_VISION_EMBEDDING_POOL_MIB as i64), VISION_MODELS,
-            [Visible, Patchable, ReloadRequired];
+            [Visible, Patchable, ReloadRequired, Scoped];
         /// Where the vision tower's weights and the embedding pool live:
         /// `device`, in VRAM for the life of the load (today's encode
         /// latency), or `host`, in pinned host RAM, the weights copied to the
@@ -637,7 +637,7 @@ config_group! {
         /// KV pool, a few ms more an encode). A `host` start the host RAM
         /// cannot hold is refused, never moved to the device. Needs vision on.
         residency: VisionResidencyKind = ignis_core::VisionResidency::default(), Validator::OneOf(&ignis_core::VisionResidency::NAMES), VISION_MODELS,
-            [Visible, Patchable, ReloadRequired];
+            [Visible, Patchable, ReloadRequired, Scoped];
     }
 }
 
@@ -647,11 +647,11 @@ config_group! {
         /// Fetch image URLs on private, loopback, link-local, multicast and
         /// CGNAT addresses. Off, so an exposed server cannot be used to probe
         /// the operator's LAN. Needs vision on.
-        allow_private_network: Bool = false, NO_RULE, VISION_MODELS, [Visible, Patchable, ReloadRequired];
+        allow_private_network: Bool = false, NO_RULE, VISION_MODELS, [Visible, Patchable, ReloadRequired, Scoped];
         /// Prepared images kept for reuse, in MiB; 0 keeps none. Needs vision
         /// on.
         cache_mib: Mib = super::DEFAULT_MEDIA_CACHE_MIB as u64, between(0, super::MEDIA_CACHE_MIB_LIMIT as i64), VISION_MODELS,
-            [Visible, Patchable, ReloadRequired];
+            [Visible, Patchable, ReloadRequired, Scoped];
     }
 }
 

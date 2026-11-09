@@ -25,7 +25,9 @@ Flash-Next's 2,560 columns. Vision stays off on Flash-Next unless you turn it
 on: every built-in profile turns it on for the 27B alone, so a Flash-Next load
 holds nothing for it until `--vision-enabled` (or `make MODEL=flash-next
 VISION=1`). The profile's residency is both models': `host` under `rtx5090`,
-`device` under `rtxpro6000`.
+`device` under `rtxpro6000`. Every vision and media field also has a form for
+one model alone: `--qwen38flashnext-vision-residency device`, or
+`vision: { qwen38flashnext: { residency: device } }` in a config file.
 
 With vision on, a Flash-Next start opens the companion and holds it to the main
 container it was built for (the pair its sidecar records), its merger's width to
@@ -39,9 +41,11 @@ What it costs:
   scratch Flash-Next already reserves for its text, the tower copied through
   three slots of it, so a vision load plans the expert cache a text-only load
   plans, but for the image positions each prefill chunk carries (131 KB at the
-  8,192-token chunk). The largest image one encode holds is what that scratch
-  holds on its own, at most the processor's 16,384 tokens (4096 x 4096
-  pixels); a larger image is shrunk to it, aspect kept, never refused. The
+  8,192-token chunk, a little more with the MTP head on). The largest image
+  one encode holds is what that scratch holds on its own, at most the
+  processor's 16,384 tokens (4096 x 4096 pixels); a larger image is shrunk to
+  it, aspect kept, as `--vision-max-tokens` shrinks one, and refused only when
+  its aspect ratio cannot fit. The
   `ignis.runtime.flash_next_plan` event names it as `vision_item_max_tokens`.
   Under `device` the tower (283 MB) and the embedding pool are VRAM lines:
   on a card that holds every expert they come out of the KV pool, on a 32 GB
