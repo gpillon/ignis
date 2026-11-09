@@ -64,6 +64,16 @@ What it costs:
   start short of RAM for them is refused naming them and the same two ways out
   as the 27B's.
 
+A conversation about an image reuses it as on the 27B. The next turn resumes
+from the [prompt checkpoint](../concepts/kv-cache-and-prompt-reuse.md#what-is-kept)
+the turn before it left at its generation opener, past the picture, so it
+neither prefills nor encodes the picture again: its
+`usage.prompt_tokens_details.cached_tokens` covers the picture, and the request
+log's `media.encode_seconds` is 0. Questions fanned out over one image encode
+it once; the others read its encoding from the embedding pool. The positions
+the picture's tokens are read at travel with the conversation's state, into a
+retained slot, to KV-RAM and back.
+
 The reasons are in
 [ADR 0087](../../adr/0087-flash-nexts-vision-encoder-ships-in-a-companion-container-and-encodes-in-memory-its-prefill-already-reserves.md).
 

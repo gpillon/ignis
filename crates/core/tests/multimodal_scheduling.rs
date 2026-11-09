@@ -7,12 +7,24 @@
 //! under an identity that is its token ids **and** its images: a sibling
 //! sending another picture of the same size never matches past it, and no
 //! prefix ever ends inside an image.
+//!
+//! GitHub #559: `flash_next_reuse.rs` mounts this suite at Flash-Next's blob
+//! sizes, as it mounts the text reuse suites.
 
 use std::sync::Arc;
 
 use ignis_core::types::{DecodeParams, RequestClass, RequestInput, RequestState, SchedEvent};
 use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
+
+/// What the mock charges a KV-RAM blob: one nominal byte in this suite's own
+/// run; Flash-Next's image and per-token bytes when `flash_next_reuse.rs`
+/// mounts it (GitHub #559), which is why every mock and every KV-RAM
+/// capacity below goes through it.
+#[allow(dead_code)]
+fn sections() -> ignis_core::MockSections {
+    ignis_core::MockSections::NOMINAL
+}
 
 const MODEL: &str = "qwen3.8-27b";
 
@@ -58,9 +70,11 @@ fn text_input(tokens: usize, max: u32) -> RequestInput {
     }
 }
 
+/// A scheduler over `compute` with `config`, whose KV-RAM capacity is stated
+/// in blobs ([`ignis_core::MockSections::scale`]).
 fn scheduler(compute: Arc<MockCompute>, config: SchedulerConfig) -> ConcreteScheduler {
     ConcreteScheduler::with_config(
-        SchedulerConfig { model: MODEL.into(), ..config },
+        SchedulerConfig { model: MODEL.into(), ..crate::sections().scale(config) },
         compute,
     )
 }
@@ -75,7 +89,7 @@ fn run_to_idle(sched: &mut ConcreteScheduler) -> Vec<SchedEvent> {
 
 #[test]
 fn a_prefill_chunk_carries_at_most_one_media_item() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(
         compute.clone(),
         SchedulerConfig { serving_chunk_tokens: 64, ..SchedulerConfig::default() },
@@ -102,7 +116,7 @@ fn a_prefill_chunk_carries_at_most_one_media_item() {
 
 #[test]
 fn a_capped_multimodal_request_ends_a_fresh_batch() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(
         compute.clone(),
         SchedulerConfig { serving_chunk_tokens: 64, ..SchedulerConfig::default() },
@@ -144,7 +158,7 @@ fn chunks(compute: &MockCompute, request: u64) -> Vec<(u32, usize)> {
 
 #[test]
 fn a_sibling_sending_the_same_image_claims_the_prefix_and_another_image_never_does() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), SchedulerConfig::default());
     // Four whole pages with an image inside them, then a sibling's own tail.
     let prompt = |digest: u8, tail: usize| {
@@ -176,7 +190,7 @@ fn siblings_in_one_batch_with_different_images_each_publish_their_own_head() {
     // *identical* heads is published. Same-size images make the token ids
     // identical, but not the heads: each publishes, and a later sibling
     // sending either image claims that one.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), SchedulerConfig::default());
     let prompt = |digest: u8| multimodal_input(72, vec![image_with_digest(20, 16, digest)], 4);
     let a = sched.submit(prompt(0xAA), RequestClass::Agent).unwrap();
@@ -206,7 +220,7 @@ fn a_multimodal_claim_always_leaves_a_tail_to_prefill() {
     // A claim reaching the prompt's end would prefill nothing, and nothing
     // else hands the leaf the request's rope_delta: the identical prompt is
     // not given the whole-prompt head.
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), SchedulerConfig::default());
     let prompt = || multimodal_input(64, vec![image_with_digest(20, 16, 0xAA)], 4);
     sched.submit(prompt(), RequestClass::Agent).unwrap();
@@ -227,7 +241,7 @@ fn a_multimodal_claim_always_leaves_a_tail_to_prefill() {
 
 #[test]
 fn a_multimodal_prefix_is_never_published_inside_an_image() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), SchedulerConfig::default());
     // 72 tokens floor to a 64-token head, which is inside the image at
     // 40..70: the head walks back to the page holding its first placeholder.
@@ -257,7 +271,7 @@ fn a_multimodal_prefix_is_never_published_inside_an_image() {
 
 #[test]
 fn an_evicted_multimodal_request_is_snapshotted_and_restored_not_reprefilled() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(
         compute.clone(),
         SchedulerConfig {
@@ -318,7 +332,7 @@ fn an_evicted_multimodal_request_is_snapshotted_and_restored_not_reprefilled() {
 /// request left its patch payload behind for the life of the process.
 #[test]
 fn a_finished_request_lets_go_of_its_image() {
-    let compute = Arc::new(MockCompute::new());
+    let compute = Arc::new(MockCompute::with_sections(crate::sections()));
     let mut sched = scheduler(compute.clone(), SchedulerConfig::default());
     let input = multimodal_input(40, vec![image(5, 10)], 2);
     let multimodal = Arc::clone(input.multimodal.as_ref().unwrap());
