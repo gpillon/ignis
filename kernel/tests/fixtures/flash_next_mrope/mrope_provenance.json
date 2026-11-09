@@ -1,0 +1,217 @@
+{
+  "cases": {
+    "decode_after_image": {
+      "blocks": 4,
+      "calls": [
+        [
+          0,
+          11
+        ]
+      ],
+      "decode_steps": 6,
+      "grids_thw": [
+        [
+          1,
+          4,
+          6
+        ]
+      ],
+      "index": 4,
+      "input_checksums": [
+        711771061831552,
+        1243949142464,
+        1921537100544
+      ],
+      "rope_delta": -3,
+      "streams": {
+        "index_qk_proj": 21954,
+        "k_proj": 21953,
+        "q_proj": 21952
+      },
+      "tokens": 11
+    },
+    "image_across_blocks": {
+      "blocks": 6,
+      "calls": [
+        [
+          0,
+          9
+        ],
+        [
+          9,
+          13
+        ],
+        [
+          13,
+          24
+        ]
+      ],
+      "decode_steps": 0,
+      "grids_thw": [
+        [
+          1,
+          6,
+          6
+        ]
+      ],
+      "index": 3,
+      "input_checksums": [
+        1419899705179264,
+        2468271152576,
+        3876019295744
+      ],
+      "rope_delta": -6,
+      "streams": {
+        "index_qk_proj": 21938,
+        "k_proj": 21937,
+        "q_proj": 21936
+      },
+      "tokens": 24
+    },
+    "one_image": {
+      "blocks": 6,
+      "calls": [
+        [
+          0,
+          7
+        ],
+        [
+          7,
+          26
+        ]
+      ],
+      "decode_steps": 0,
+      "grids_thw": [
+        [
+          1,
+          6,
+          8
+        ]
+      ],
+      "index": 1,
+      "input_checksums": [
+        1666221148048768,
+        2886359072640,
+        4510835031104
+      ],
+      "rope_delta": -8,
+      "streams": {
+        "index_qk_proj": 21906,
+        "k_proj": 21905,
+        "q_proj": 21904
+      },
+      "tokens": 26
+    },
+    "text": {
+      "blocks": 5,
+      "calls": [
+        [
+          0,
+          10
+        ],
+        [
+          10,
+          23
+        ]
+      ],
+      "decode_steps": 0,
+      "grids_thw": [],
+      "index": 0,
+      "input_checksums": [
+        1305990314657664,
+        2262222703616,
+        3567889246400
+      ],
+      "rope_delta": 0,
+      "streams": {
+        "index_qk_proj": 21890,
+        "k_proj": 21889,
+        "q_proj": 21888
+      },
+      "tokens": 23
+    },
+    "two_images": {
+      "blocks": 7,
+      "calls": [
+        [
+          0,
+          13
+        ],
+        [
+          13,
+          28
+        ]
+      ],
+      "decode_steps": 0,
+      "grids_thw": [
+        [
+          1,
+          4,
+          4
+        ],
+        [
+          1,
+          8,
+          6
+        ]
+      ],
+      "index": 2,
+      "input_checksums": [
+        1932034610166592,
+        3329147101056,
+        5269159707712
+      ],
+      "rope_delta": -10,
+      "streams": {
+        "index_qk_proj": 21922,
+        "k_proj": 21921,
+        "q_proj": 21920
+      },
+      "tokens": 28
+    }
+  },
+  "checkpoint": {
+    "config_sha256": "889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b",
+    "repo": "Qwen/Qwen3.8-Flash-Next",
+    "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540"
+  },
+  "date_utc": "2026-11-09T17:12:03Z",
+  "geometry": {
+    "compress": 4,
+    "head_dim": 256,
+    "hidden": 2560,
+    "indexer_head_dim": 128,
+    "indexer_heads": 4,
+    "kv_heads": 2,
+    "q_heads": 24,
+    "rope_parameters": {
+      "mrope_interleaved": true,
+      "mrope_section": [
+        11,
+        11,
+        10
+      ],
+      "partial_rotary_factor": 0.25,
+      "rope_theta": 10000000,
+      "rope_type": "default"
+    },
+    "spatial_merge_size": 2
+  },
+  "modeling_sha256": "ca9f00bbd73cfcfbad7ba6073b5ecc23ca27bdace58b746fe6ead6ab175efc0c",
+  "norm_streams": {
+    "ix_k_norm": 22003,
+    "ix_q_norm": 22002,
+    "k_norm": 22001,
+    "q_norm": 22000
+  },
+  "oracle": "transformers models/qwen4_exp: Qwen4ExpModel.get_rope_index and compute_3d_position_ids (positions); Qwen4ExpTextAttention layer 3 with its Qwen4ExpTextQSAIndexer, Qwen4ExpTextRotaryEmbedding and DynamicCache (rotations), CPU, bf16",
+  "positions_json": "crates/artifact/tests/fixtures/flash_next_mrope/positions.json",
+  "python": "3.12.6",
+  "recorded_by": "kernel/tests/fixtures/flash_next_mrope/record_mrope.py",
+  "recorded_q_heads": [
+    0,
+    13
+  ],
+  "torch": "2.13.0+cu130",
+  "transformers": "5.17.0"
+}
