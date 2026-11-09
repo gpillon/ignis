@@ -741,6 +741,16 @@ impl FlashNextEngine {
             .map_err(|(rc, message)| format!("place the media columns ({rc}): {message}"))
     }
 
+    /// GitHub #564: `item` encoded by a vision load's tower into its
+    /// embedding pool, as the leaf encodes a request's image
+    /// (`FlashNextLeaf::encode_media`): the columns [`FlashNextEngine::span`]
+    /// puts over the item's placeholders.
+    pub fn encode_media(&self, item: &crate::vision::MediaItem) -> Result<MediaEmbedding<'_>, String> {
+        let control = crate::vision::vision_item_control(item.grid);
+        crate::step::encode_media(&self.model, item.grid, &item.patches, &control)
+            .map_err(|(rc, message)| format!("encode the media item ({rc}): {message}"))
+    }
+
     /// GitHub #557: `tokens` prefilled from position 0 on a fresh sequence as
     /// one span -- of a multimodal prompt with `multimodal`, a text one
     /// without -- its n-gram rows hashing `ngram_tokens` (the span's own ids
@@ -883,10 +893,54 @@ impl FlashNextEngine {
             seqs.push(seq);
             contexts.push(context);
         }
-        let mut out = vec![Vec::with_capacity(count); prompts.len()];
+        self.rounds_on(seqs, contexts, count, on_round)
+    }
+
+    /// GitHub #564: [`generate_with_logits`](Self::generate_with_logits) on
+    /// sequences [`FlashNextEngine::span`] left standing (`contexts` theirs)
+    /// -- a multimodal prompt's, which the generate paths cannot prefill --
+    /// rather than on prompts it prefills itself: `count` one-token rounds,
+    /// each lane's tokens returned.
+    ///
+    /// Test-only, as [`decode_standing`](Self::decode_standing) is: its
+    /// caller, `tests/flash_next_vision_speculative_gpu.rs`, is an
+    /// integration test outside the crate. No serving path calls it.
+    #[doc(hidden)]
+    pub fn generate_standing(
+        &self,
+        sequences: Vec<crate::seq::Seq<'_>>,
+        contexts: Vec<NgramContext>,
+        count: usize,
+        on_round: Option<&mut dyn FnMut(RoundLogits<'_>)>,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.check_standing(sequences.len(), contexts.len())?;
+        self.rounds_on(sequences, contexts, count, on_round).map(|(tokens, _)| tokens)
+    }
+
+    /// Standing lanes a round can take: at least one, at most the load's
+    /// lanes, a context each.
+    fn check_standing(&self, sequences: usize, contexts: usize) -> Result<(), String> {
+        if sequences == 0 || sequences > self.options.decode_lanes as usize || contexts != sequences {
+            return Err(format!(
+                "{sequences} standing sequences with {contexts} contexts on {} lanes",
+                self.options.decode_lanes
+            ));
+        }
+        Ok(())
+    }
+
+    /// `count` one-token rounds over standing sequences, all lanes at once.
+    fn rounds_on(
+        &self,
+        mut seqs: Vec<crate::seq::Seq<'_>>,
+        mut contexts: Vec<NgramContext>,
+        count: usize,
+        on_round: Option<&mut dyn FnMut(RoundLogits<'_>)>,
+    ) -> Result<(Vec<Vec<u32>>, Vec<std::time::Duration>), String> {
+        let mut out = vec![Vec::with_capacity(count); seqs.len()];
         let mut times = Vec::with_capacity(count);
-        let mut rows = vec![0u8; prompts.len() * self.table.token_bytes()];
-        let all: Vec<usize> = (0..prompts.len()).collect();
+        let mut rows = vec![0u8; seqs.len() * self.table.token_bytes()];
+        let all: Vec<usize> = (0..seqs.len()).collect();
         let mut logits = LogitsSink::new(on_round, self.vocab());
         for _ in 0..count {
             let began = std::time::Instant::now();
@@ -935,10 +989,10 @@ impl FlashNextEngine {
         &self,
         prompts: &[Vec<u32>],
         count: usize,
-        mut drafter: Option<&mut dyn FnMut(usize, &[u32], u32) -> Vec<u32>>,
+        drafter: Option<&mut dyn FnMut(usize, &[u32], u32) -> Vec<u32>>,
         on_round: Option<&mut dyn FnMut(RoundLogits<'_>)>,
     ) -> Result<SpeculativeRun<'_>, String> {
-        let speculation = self.options.speculation.ok_or("this engine was loaded without speculation")?;
+        self.options.speculation.ok_or("this engine was loaded without speculation")?;
         if prompts.is_empty() || prompts.len() > self.options.decode_lanes as usize {
             return Err(format!("{} prompts on {} lanes", prompts.len(), self.options.decode_lanes));
         }
@@ -954,17 +1008,54 @@ impl FlashNextEngine {
             seqs.push(seq);
             contexts.push(context);
         }
-        let mut out = vec![Vec::with_capacity(count); prompts.len()];
+        self.speculative_on(seqs, contexts, count, drafter, on_round)
+    }
+
+    /// GitHub #564: [`generate_speculative_with_logits`](Self::generate_speculative_with_logits)
+    /// on sequences [`FlashNextEngine::span`] left standing (`contexts`
+    /// theirs) -- a multimodal prompt's, which the generate paths cannot
+    /// prefill -- rather than on prompts it prefills itself.
+    ///
+    /// Test-only, as [`decode_standing`](Self::decode_standing) is: its
+    /// caller, `tests/flash_next_vision_speculative_gpu.rs`, is an
+    /// integration test outside the crate. No serving path calls it.
+    #[doc(hidden)]
+    pub fn generate_speculative_standing<'p>(
+        &'p self,
+        sequences: Vec<crate::seq::Seq<'p>>,
+        contexts: Vec<NgramContext>,
+        count: usize,
+        drafter: Option<&mut dyn FnMut(usize, &[u32], u32) -> Vec<u32>>,
+        on_round: Option<&mut dyn FnMut(RoundLogits<'_>)>,
+    ) -> Result<SpeculativeRun<'p>, String> {
+        self.options.speculation.ok_or("this engine was loaded without speculation")?;
+        self.check_standing(sequences.len(), contexts.len())?;
+        self.speculative_on(sequences, contexts, count, drafter, on_round)
+    }
+
+    /// The speculative rounds over standing sequences until every lane has
+    /// `count` tokens.
+    fn speculative_on<'p>(
+        &'p self,
+        mut seqs: Vec<crate::seq::Seq<'p>>,
+        mut contexts: Vec<NgramContext>,
+        count: usize,
+        mut drafter: Option<&mut dyn FnMut(usize, &[u32], u32) -> Vec<u32>>,
+        on_round: Option<&mut dyn FnMut(RoundLogits<'_>)>,
+    ) -> Result<SpeculativeRun<'p>, String> {
+        let speculation = self.options.speculation.ok_or("this engine was loaded without speculation")?;
+        let lanes = seqs.len();
+        let mut out = vec![Vec::with_capacity(count); lanes];
         let mut rounds = Vec::new();
         let mut proposals = Vec::new();
         let mut times = Vec::new();
         let context_tokens = self.table.new_context().recent().len();
         let mtp = speculation.backend() == SpeculativeBackend::Mtp;
         // An MTP load's drafts for each lane's next round: none after a prefill or a one-token round.
-        let mut head_drafts: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+        let mut head_drafts: Vec<Vec<u32>> = vec![Vec::new(); lanes];
         let mut logits = LogitsSink::new(on_round, self.vocab());
         loop {
-            let active: Vec<usize> = (0..prompts.len()).filter(|&i| out[i].len() < count).collect();
+            let active: Vec<usize> = (0..lanes).filter(|&i| out[i].len() < count).collect();
             if active.is_empty() {
                 break;
             }
