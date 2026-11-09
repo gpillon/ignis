@@ -30,7 +30,7 @@ In one paragraph, for "what is github.com/gpillon/ignis?":
 > 8.6, supported), and the same on an RTX 4090 or a 16 GB RTX 40 card (Ada,
 > 8.9, verified for correctness: the release's sm_86 gate passed on an Ada
 > Lovelace card,
-> [the finding](../../findings/2026-11-07-sm86-gate-passes-on-sm89.md)). It
+> [the finding](../../findings/2026-11-08-sm86-gate-on-the-release-range.md)). It
 > serves them over an OpenAI-compatible HTTP API, with a browser Playground
 > and Prometheus metrics in the same binary, on Windows and Linux on x86-64.
 > It is shaped around the load a coding agent makes: a main agent and a few

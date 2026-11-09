@@ -1,4 +1,4 @@
-# The sm_86 gate on 0.10.0's range passes at `main` adb5ed2b on an Ada Lovelace card (sm_89): every earlier run's scores in every digit, the leaf's 127 tests with #530's tile-plan test, both images
+# The sm_86 gate on 0.10.0's range passes at `main` adb5ed2b on an Ada Lovelace card (sm_89): the earlier runs' scores in every printed digit, the leaf's 127 tests with #530's tile-plan test, both images
 
 - Kind: experiment
 - Status: current
@@ -7,7 +7,7 @@
 - Scope: release procedure / the sm_86 gate (`docs/agents/testing.md`, `docs/user/contributing/releases.md`) for
   release 0.10.0, run on an sm_89 card; quality / top-64 KLD against BF16 on the routes an 8.x card runs unset;
   kernel / `ctest -LE sm120a-only` on the `86;120a` leaf, the dense prefill's tile plans (#530) on an 8.x card;
-  serving / `--profile auto` on the card, DFlash2, vision
+  serving / `--profile auto` on the card, vision
 - Topic: host-and-gpu
 - Related: [GitHub #485](https://github.com/gpillon/ignis/issues/485), [GitHub #484](https://github.com/gpillon/ignis/issues/484),
   [GitHub #530](https://github.com/gpillon/ignis/issues/530), [GitHub #536](https://github.com/gpillon/ignis/issues/536),
@@ -15,7 +15,7 @@
   [The sm_86 gate passes on an Ada Lovelace card (sm_89) at `main` b13dbc05](2026-11-07-sm86-gate-passes-on-sm89.md),
   [The dense prefill's tile plan weighs a 128-row tile's rows at 1.10](2026-11-07-dense-prefill-tile-plan-weighs-a-128-row-tile.md)
 - Superseded by: none
-- Summary: At main adb5ed2b, which 0.10.0 is cut from, an Ada Lovelace card (sm_89) passes the sm_86 gate with the 86;120a build, its quality figures the sm_86 card's in every digit, and #530's tile-plan test passes on 8.x.
+- Summary: At main adb5ed2b, the last code commit before 0.10.0, an Ada Lovelace card (sm_89) passes the sm_86 gate with the 86;120a build, its quality figures the sm_86 card's in every printed digit, and #530's tile-plan test passes on 8.x.
 
 ## Question
 
@@ -51,7 +51,8 @@ and scored by `tools/kld-gate/score_top64.py` against the BF16 top-64 reference 
 | the gate's limits | ≤ 0.04081 | | | | ≥ 92.85% |
 
 - The dump is this session's own: `span_logits` wrote the 16 windows, and the scorer read them afresh.
-- The per-kind top-1 figures equal the earlier runs' too: chat 96.04%, code 93.25%, prose 89.40%.
+- The per-kind top-1 figures: chat 96.04%, code 93.25%, prose 89.40%. The earlier findings do not print them, so
+  they are not compared here.
 
 **The leaf's tests.** `ctest -LE sm120a-only`: 127 of 127 pass.
 
@@ -66,8 +67,8 @@ the artifact, the bind, idle unload off and the UI off, and no other flag:
 - `GET /v1/config` gives `prefill_linear` and `prefill_attention` as `int8`. The load's log reads
   `prefill_linear: int8`, `prefill_attention: int8` and `gdn_prefill: ours`.
 - A greedy chat completion ("What is the capital of France? One word.") answers `Paris`.
-- A 32 x 32 red image answers `red` (`media.vision_tokens: 64`), a 4096 x 4096 blue image `Blue`
-  (`media.vision_tokens: 16384`).
+- A 32 x 32 red image answers `red` (`media.vision_tokens: 64`: the processor's 65,536-pixel floor, 256 patches at
+  the vision tower), a 4096 x 4096 blue image `Blue` (`media.vision_tokens: 16384`).
 - The log holds no `ERROR` line.
 
 ## Finding
@@ -75,7 +76,7 @@ the artifact, the bind, idle unload off and the UI off, and no other flag:
 - Observed: `main` adb5ed2b passes the sm_86 gate on an Ada Lovelace card (sm_89), all three parts, with the
   release's `86;120a` build.
 - Observed: the quality figures equal the sm_86 card's at 6234e002 and the sm_89 card's at b13dbc05, in every digit of
-  the `all` row and of the three kinds' rows.
+  the five figures the table above prints.
 - Observed: on an 8.x card each of the dense prefill's eight tile plans gives the op's own output byte for byte.
 - Inferred: #530 changes no logit on 8.x. The plan picks a tile height from the card's SM count, every height gives
   the same bytes, and the dense GEMM accumulates in int32 over the whole K.
@@ -85,7 +86,6 @@ the artifact, the bind, idle unload off and the UI off, and no other flag:
 - The gate holds for release 0.10.0 as long as the range from adb5ed2b to the release commit touches neither
   `kernel/` nor `crates/server/src/config/arch.rs`. The version bump, the changelog and the guide's markings touch
   neither.
-- 0.10.0's release notes cite this finding as the gate's run, and say that it ran on sm_89.
 - Whether the procedure should name "an 8.x card that runs the `86` cubin" in place of an sm_86 card is the owner's
   decision. This finding does not change the procedure.
 - The gate records correctness only. The session's speed figures stay private, as #516's do.

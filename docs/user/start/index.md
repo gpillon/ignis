@@ -53,7 +53,7 @@ You can add models of your own with an
     the release's [sm_86 gate](../contributing/releases.md#the-sm_86-gate) (the
     model's quality, the kernel tests and a smoke test of the server) passed on
     an Ada Lovelace card (sm_89)
-    ([the finding](../../findings/2026-11-07-sm86-gate-passes-on-sm89.md)).
+    ([the finding](../../findings/2026-11-08-sm86-gate-on-the-release-range.md)).
   - *Blackwell only.* The NVFP4 builds (the 27B, its uncensored variant,
     Swift 1.5), Flash-Next and the image model, which also need a card of
     32 GB or more, by their card class. On an RTX 30 or RTX 40 card the server

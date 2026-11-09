@@ -28,13 +28,12 @@ fail at its first kernel with CUDA's own "no kernel image is available for
 execution on the device". `model download`, `model list` and the `config`
 commands load nothing and still run on such a card.
 
-On an RTX 30 or RTX 40 card, use a release or the
-[development build](start/install.md#development-builds), or build for it
+On an RTX 30 or RTX 40 card, use the latest release, or build for it
 ([Other card architectures](contributing/building.md#other-card-architectures)):
 the RTX 3090 and 3090 Ti are supported, and the RTX 4090 and the 16 GB RTX 40
 cards are verified for correctness: the release's sm_86 gate passed on an Ada
 Lovelace card (sm_89)
-([the finding](../findings/2026-11-07-sm86-gate-passes-on-sm89.md)). On a machine with more
+([the finding](../findings/2026-11-08-sm86-gate-on-the-release-range.md)). On a machine with more
 than one card, ignis uses CUDA device 0; when that is the other card,
 `CUDA_VISIBLE_DEVICES` names the supported one.
 
