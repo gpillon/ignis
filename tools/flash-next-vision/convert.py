@@ -208,16 +208,17 @@ def shard_header(hub, shard):
 
 
 # ---------------------------------------------------------------------------------------------- the source cache
-def fetch(hub, source, tower):
+def fetch(hub, source, tower, repo=REPO, revision=REVISION):
     """The visual range as bytes and its record, from the cache or (once) from the hub, held to the record
     and the pin. The cache is `visual.bin` and `visual.json` (the revision, the shard, the range, its
-    SHA-256 and every tensor's place in it)."""
+    SHA-256 and every tensor's place in it). `repo` and `revision` name the checkpoint `hub` reads: Flash-Next's
+    pin by default; `tower_check.py` caches the 27B's tower the same way, as the bar its check sets."""
     os.makedirs(source, exist_ok=True)
     data_path, record_path = os.path.join(source, "visual.bin"), os.path.join(source, "visual.json")
     if os.path.isfile(record_path):
         record = json.load(open(record_path, encoding="utf-8"))
-        if (record["repo"], record["revision"]) != (REPO, REVISION):
-            raise Refused(f"{record_path} caches {record['repo']}@{record['revision']}, not {REPO}@{REVISION}")
+        if (record["repo"], record["revision"]) != (repo, revision):
+            raise Refused(f"{record_path} caches {record['repo']}@{record['revision']}, not {repo}@{revision}")
         data = open(data_path, "rb").read() if os.path.isfile(data_path) else b""
         digest = hashlib.sha256(data).hexdigest()
         if len(data) != record["bytes"] or digest != record["sha256"]:
@@ -243,7 +244,7 @@ def fetch(hub, source, tower):
         with ThreadPoolExecutor(WORKERS) as pool:
             data = b"".join(pool.map(lambda p: hub.range(shard, *p), parts))
         digest = hashlib.sha256(data).hexdigest()
-        record = {"repo": REPO, "revision": REVISION, "file": shard, "offset": lo, "bytes": hi - lo, "sha256": digest,
+        record = {"repo": repo, "revision": revision, "file": shard, "offset": lo, "bytes": hi - lo, "sha256": digest,
                   "config": {"vision_config": cfg["vision_config"]},
                   "tensors": {name: {"dtype": t[0], "shape": list(t[1]), "start": t[2] - lo, "end": t[3] - lo}
                               for name, t in sorted(tensors.items())}}

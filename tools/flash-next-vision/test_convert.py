@@ -232,3 +232,16 @@ def test_the_pinned_revisions_tower_is_pinned_by_its_bytes():
     pin = convert.GEOMETRIES["qwen3.8-flash-next"]
     assert pin.shard == "model-00001-of-00131.safetensors"
     assert (pin.span_bytes, len(pin.span_sha256)) == (897_862_112, 64)
+
+
+def test_the_cache_holds_the_checkpoint_it_was_read_from_and_refuses_another(tmp_path, sources):
+    # GitHub #560: the 27B's tower is cached the same way, as the bar Flash-Next's is checked against.
+    checkpoint, tensors, _ = sources
+    other = ("Qwen/Another", "0123456789abcdef0123456789abcdef01234567")
+    data, record = convert.fetch(LocalHub(checkpoint), str(tmp_path / "source"), convert.GEOMETRIES["fixture"], *other)
+    assert (record["repo"], record["revision"]) == other
+    assert len(data) == sum(t.numel() * 2 for t in tensors.values())
+    _, again = convert.fetch(OfflineHub(), str(tmp_path / "source"), convert.GEOMETRIES["fixture"], *other)
+    assert again == record
+    with pytest.raises(convert.Refused, match="caches Qwen/Another@0123456789abcdef"):
+        convert.fetch(OfflineHub(), str(tmp_path / "source"), convert.GEOMETRIES["fixture"])
