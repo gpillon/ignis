@@ -9,14 +9,17 @@
 //! suites state in blobs is that many of those. A policy that leaned on the
 //! 27B's sizes, or on every blob being the same size, fails here.
 //!
-//! Below them, blob identity across the two models, and the host plan's two
-//! reuse lines.
+//! Below them, blob identity across the two models, the host plan's two
+//! reuse lines, and an image conversation on Flash-Next's own capture shape
+//! (GitHub #559).
 
 use std::sync::Arc;
 
 use ignis_core::compute::{ModelConfig, ModelFamily};
 use ignis_core::residency::{DEFAULT_HOST_MARGIN_BYTES, HostPlanError, HostPlanRequest, plan_host};
-use ignis_core::types::{DecodeParams, RequestClass, RequestInput};
+use ignis_core::checkpoint::ReuseSource;
+use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
+use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
 use ignis_core::{
     ArtifactHash, BlobIdentity, ConcreteScheduler, IdentityField, KvFormat, MockCompute,
     MockSections, Scheduler, SchedulerConfig, Speculation, SpeculativeBackend,
@@ -45,6 +48,12 @@ mod retained_slots;
 
 #[path = "reuse_boundaries.rs"]
 mod reuse_boundaries;
+
+// GitHub #559: ADR 0029's rules for multimodal prompts -- an image's identity
+// in the match, no publish point inside its placeholders, a claim leaving a
+// tail to prefill, an evicted image request restored from its blob.
+#[path = "multimodal_scheduling.rs"]
+mod multimodal_scheduling;
 
 /// The mounted suites really run at Flash-Next's sizes: a blob is ~124 MiB
 /// of image plus its tokens, not a byte.
@@ -311,4 +320,138 @@ fn prompt_reuse_off_charges_the_host_plan_nothing() {
     let on = plan_host(&spec_host_plan(53_000_000_000)).unwrap();
     let plan = plan_host(&off).unwrap();
     assert_eq!(on.total_bytes - plan.total_bytes, 8 * 130_014_464 + 2 * GIB);
+}
+
+// ── An image conversation on Flash-Next (GitHub #559) ───────────────────
+
+/// Flash-Next's capture shape: 64-token pages, and the whole pages below a
+/// request's opener handed over by its capture as a pages-only link (GitHub
+/// #306) -- where the 27B on Blackwell publishes an imaged prefix at the
+/// opener's page floor whenever that floor lies outside the picture.
+fn flash_next_config() -> SchedulerConfig {
+    SchedulerConfig {
+        model: MODEL.into(),
+        kv_page_tokens: 64,
+        max_sequence_tokens: 40_960,
+        kv_capacity_pages: 8 * 40_960 / 64,
+        opener_page_rides_capture: true,
+        ..sections().scale(SchedulerConfig::default())
+    }
+}
+
+/// A single-turn image request as the server renders one: four opening
+/// tokens, `count` placeholders of the picture `digest`, `<|vision_end|>`, a
+/// `question`-token question and the five tokens that close the turn and
+/// open the assistant's -- the generation opener -- then `after` tokens past
+/// it (four with thinking off, the empty think block).
+fn image_turn(count: u32, digest: u8, question: u32, after: u32) -> RequestInput {
+    let opener = 4 + count + 1 + question + 5;
+    let len = opener + after;
+    RequestInput {
+        tokens: (1..=len).collect(),
+        opener_tokens: Some(opener),
+        user_turn_tokens: Some(0),
+        multimodal: Some(Arc::new(Multimodal {
+            positions: (0..3).flat_map(|_| 0..len as i32).collect(),
+            rope_delta: -(count as i32),
+            media: vec![MediaItem {
+                grid: Grid { t: 1, h: 2, w: 2 * count },
+                token_span: TokenSpan { begin: 4, count: count as usize },
+                patches: Vec::new(),
+                content_digest: [digest; 32],
+            }],
+        })),
+        params: DecodeParams { max_tokens: Some(1), ..DecodeParams::default() },
+        ..turn()
+    }
+}
+
+/// `turn`'s next turn: its prompt up to its opener, a 20-token answer and the
+/// two tokens closing it, a new user message of eight tokens with its own
+/// opener, and the empty think block past that.
+fn next_image_turn(turn: &RequestInput) -> RequestInput {
+    let mut next = turn.clone();
+    next.tokens.truncate(turn.opener_tokens.unwrap() as usize);
+    next.tokens.extend(900_000..900_022);
+    next.user_turn_tokens = Some(next.tokens.len() as u32);
+    next.tokens.extend(910_000..910_013);
+    next.opener_tokens = Some(next.tokens.len() as u32);
+    next.tokens.extend(920_000..920_004);
+    let len = next.tokens.len();
+    Arc::make_mut(next.multimodal.as_mut().unwrap()).positions = (0..3).flat_map(|_| 0..len as i32).collect();
+    next
+}
+
+/// What one request's prefill was: its chunk widths, and the retained state
+/// it resumed from.
+#[derive(Debug, PartialEq)]
+struct Served {
+    widths: Vec<usize>,
+    reused: Vec<(ReuseSource, u32)>,
+}
+
+/// Submit `inputs` one after another on one scheduler of Flash-Next's capture
+/// shape and blob sizes, each run to completion before the next arrives.
+fn served_on_flash_next<const N: usize>(inputs: [RequestInput; N]) -> [Served; N] {
+    let compute = Arc::new(MockCompute::with_sections(sections()));
+    let mut sched = ConcreteScheduler::with_config(flash_next_config(), compute.clone());
+    inputs.map(|input| {
+        let id: RequestId = sched.submit(input, RequestClass::Interactive).unwrap();
+        let mut reused = Vec::new();
+        while !sched.is_idle() {
+            for event in sched.advance() {
+                if let SchedEvent::StateReused { request, source, tokens, .. } = event {
+                    if request == id {
+                        reused.push((source, tokens));
+                    }
+                }
+            }
+        }
+        let widths =
+            compute.prefill_calls().iter().flatten().filter(|job| job.request == id).map(|job| job.tokens.len()).collect();
+        Served { widths, reused }
+    })
+}
+
+#[test]
+fn an_image_turn_is_cut_once_at_its_opener_and_its_repeat_and_next_turn_resume_there() {
+    // A 1,024-token picture whose run crosses the opener's page floor, 1,024,
+    // and one that ends below it (a 70-token question puts the floor at
+    // 1,088): either way the prefill is cut once, at the opener, the pages
+    // below it ride the capture, and the identical repeat and the
+    // conversation's next turn resume from the checkpoint there, image and
+    // all, each leaving the empty think block to prefill.
+    for (question, opener) in [(6, 1_040), (70, 1_104)] {
+        let turn = image_turn(1_024, 0xAA, question, 4);
+        let next = next_image_turn(&turn);
+        let [first, repeat, following] = served_on_flash_next([turn.clone(), turn, next]);
+        let label = format!("a {question}-token question");
+        assert_eq!(first.widths, [1024, opener as usize - 1024, 4], "{label}: one cut, at the opener");
+        assert!(first.reused.is_empty(), "{label}");
+        assert_eq!(repeat.reused, [(ReuseSource::Device, opener)], "{label}: the repeat resumes at the opener");
+        assert_eq!(repeat.widths, [4], "{label}: and prefills the think block alone");
+        assert_eq!(following.reused, [(ReuseSource::Device, opener)], "{label}: the next turn resumes there too");
+        assert_eq!(following.widths, [35, 4], "{label}: from the first opener to its own, then the think block");
+    }
+}
+
+#[test]
+fn another_picture_of_the_same_size_resumes_nothing_of_an_image_turn() {
+    // The same token ids, another picture: the checkpoint is keyed by its
+    // image as well, and the link below it is never claimed on its own.
+    let [first, other] = served_on_flash_next([image_turn(1_024, 0xAA, 6, 4), image_turn(1_024, 0xBB, 6, 4)]);
+    assert_eq!(first.widths, [1024, 16, 4]);
+    assert!(other.reused.is_empty(), "{:?}", other.reused);
+    assert_eq!(other.widths, first.widths, "it prefills its whole prompt, cut where the first was");
+}
+
+#[test]
+fn an_image_prompt_ending_at_a_checkpoint_opener_re_prefills_on_flash_next() {
+    // A multimodal claim leaves a tail to prefill (ADR 0029 as amended
+    // 2026-09-16): only a prefill hands the leaf its rope delta. A prompt
+    // ending exactly where a longer one left its checkpoint claims nothing.
+    let [first, shorter] = served_on_flash_next([image_turn(1_024, 0xAA, 6, 4), image_turn(1_024, 0xAA, 6, 0)]);
+    assert_eq!(first.widths, [1024, 16, 4], "the longer prompt captured at 1,040");
+    assert!(shorter.reused.is_empty(), "{:?}", shorter.reused);
+    assert_eq!(shorter.widths.iter().sum::<usize>(), 1_040);
 }
