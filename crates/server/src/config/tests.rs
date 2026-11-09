@@ -2293,15 +2293,17 @@ fn the_embedding_pool_defaults_to_one_envelope_wide_item() {
     // GitHub #243 must not move the VRAM plan for an operator who does not
     // ask: the default pool is the reservation vision always took.
     let vision = config(&["--vision-enabled"]).vision.expect("vision on");
-    assert_eq!(vision.pool_bytes(262_144), vision.output_transient_bytes(262_144));
+    let width = ignis_core::EmbeddingWidth::qwen38_27b();
+    assert_eq!(vision.pool_bytes(262_144, width), vision.output_transient_bytes(262_144, width));
 }
 
 #[test]
 fn the_embedding_pool_can_be_widened() {
     let vision = config(&["--vision-enabled", "--vision-embedding-pool-mib", "1280"]).vision.expect("vision on");
-    assert_eq!(vision.pool_bytes(262_144), 1280 * 1024 * 1024);
+    let width = ignis_core::EmbeddingWidth::qwen38_27b();
+    assert_eq!(vision.pool_bytes(262_144, width), 1280 * 1024 * 1024);
     let env = env_map(&[("IGNIS_VISION_ENABLED", "1"), ("IGNIS_VISION_EMBEDDING_POOL_MIB", "640")]);
-    assert_eq!(expect_config(resolve(&[], env).expect("resolve")).vision.unwrap().pool_bytes(262_144), 640 * 1024 * 1024);
+    assert_eq!(expect_config(resolve(&[], env).expect("resolve")).vision.unwrap().pool_bytes(262_144, width), 640 * 1024 * 1024);
 }
 
 #[test]
@@ -2311,7 +2313,8 @@ fn an_embedding_pool_below_the_envelope_is_raised_not_refused() {
     // the plan reports what was actually reserved.
     let vision = config(&["--vision-enabled", "--vision-embedding-pool-mib", "1"]).vision.expect("vision on");
     assert_eq!(vision.requested_pool_bytes(), 1024 * 1024);
-    assert_eq!(vision.pool_bytes(262_144), vision.output_transient_bytes(262_144));
+    let width = ignis_core::EmbeddingWidth::qwen38_27b();
+    assert_eq!(vision.pool_bytes(262_144, width), vision.output_transient_bytes(262_144, width));
 }
 
 #[test]

@@ -153,8 +153,8 @@ pub use rope_scaling::{
 };
 pub use speculation::{MAX_DRAFT_TOKENS, ProposalHead, ProposalHeadSetting, Speculation, SpeculativeBackend};
 pub use vision::{
-    DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, VISION_OBJECTS, Vision,
-    VisionEnvelopeOutOfRange, VisionResidency,
+    DEFAULT_VISION_MAX_TOKENS, EmbeddingWidth, VISION_MAX_TOKENS_LIMIT, VISION_OBJECTS, Vision,
+    VisionEnvelopeOutOfRange, VisionResidency, VisionWidthMismatch,
 };
 pub use vram::{
     ExpertResidency, KvPoolPolicy, KvPoolSize, OFFLOADED_KV_POOL_TOKENS, Residency, VramLines, VramMode, VramPlan,
