@@ -70,3 +70,49 @@ takes images with the 27B's feature set, and how:
   block's key at its first token's position.
 - With the main container unchanged, a text-only user downloads 0.3 GB more
   and loads exactly what loads today.
+
+**As built** (2026-11-09, GitHub #556-#559 and #562-#564), where the decision left a choice. Draft: the status stays
+`proposed` until #560's figures are in.
+
+- **The companion** (#556): `qwen3_8_flash_next_vision-v2.ninfer`, 284,229,120 bytes, its own identity
+  (`qwen3.8-flash-next-vision`, weights `vision-w8q4q5q6-bf16-de4b8e4`) and a pair pin to the main container,
+  built by `tools/flash-next-vision/convert.py` from the first shard's visual range alone (897,862,112 bytes) in the
+  27B tower's formats: the patch embedding Q6, the blocks' projections Q4 and Q5, the merger W8, the norms, biases and
+  position embedding BF16. It is published beside the main container in Flash-Next's model repository, and the
+  catalog, pinned at the hub commit that added it (1f4f85c4), fetches it with the model.
+- **Vision and media settings per family** (#557): the vision and media fields apply to both text families, each
+  family its own; the four built-in profiles turn vision on for the 27B only, so a Flash-Next start loads no tower
+  unless it asks (`--vision-enabled`, `VISION=1`). The residency and the envelope are shared. The host plan shows
+  the tower (284,454,912 bytes of host spans) and the pool as their own lines.
+- **The item bound** is computed when the tower is bound: the largest item whose encode fits the prefill scratch
+  first, then the `host` residency's staging slots in the expert staging ring, then the encode's workspace there,
+  then both, at most 16,384 merged tokens (#557, #558). The ring was shown first to hold nothing live while an item
+  encodes: only a prefill stages into it, a decode miss takes an LRU victim, and the encode joins the residency
+  before it writes there. A card that holds every expert has no ring, and the prefill scratch alone bounds the item,
+  as on the 27B. The VRAM plan logs the bound, and the server lowers the processor's pixel bound to its area.
+- **The same expert cache** (#558): the forward's per-chunk vision inputs, the chunk's three axes and its media
+  rows, are carved from the decode graphs' scratch, idle in a prefill; the rope deltas sit in the positions buffer's
+  alignment; a verify round's axis records sit at the prefill scratch's base, idle in a round. A vision prefill
+  refuses while the decode graphs' scratch is in use, and a verify round while the prefill scratch is. At the RTX
+  5090's settings every reservation line equals the text-only load's, MTP on and off.
+- **A sequence keeps the three axes its indexer still needs, not every token's** (#558), against the second point of
+  Consequences: a compressed block's key is computed when its block completes, so the one position a sequence must
+  carry is its incomplete block's first token's. It is kept in that block's own key slot, an axis record (a magic, the
+  first token's KV position, its three axes), written when a call begins a block and leaves it incomplete, read and
+  overwritten by the key when a later call completes the block. It travels with its page through snapshots,
+  checkpoints and spills, at no VRAM and with no change of the blob layout; a verify round saves and restores each
+  lane's. The rope delta rides the progress image; a checkpoint's capture zeroes it, and its claimant takes its own
+  from the span it prefills (#559).
+- **The MTP head** (#564): its prefill entry before an image placeholder takes the vision column the trunk took, and
+  a span ending inside its image the image's next column; decode, verify and the chain embed generated tokens by id,
+  unchanged. The entry before an image that starts a new span takes the placeholder's id, the image not being encoded
+  yet: it costs acceptance, never the output.
+- **The merger's width needed a route** (#557): the vendored W8 dispatch had none for the merger's second linear at
+  [2560, 4608]. It takes the routes the image model's [4096, 4608] takes, a recorded patch of the vendored dispatch
+  with its op test, on the standing reason ADR 0088 gives a vendored registry that lacks a case ignis needs.
+- **A switch keeps vision** (#563): the vision settings carry across families. `POST /v1/models/switch` to a family
+  whose companion is missing answers 409 `vision_companion_missing`, naming the file, before the active model is torn
+  down; an implicit switch meets the same check when it prepares, before teardown. The request size cap follows the
+  active model's media.
+- **Measured** ([finding](../findings/2026-11-09-flash-next-images-checked-without-the-bf16-checkpoint.md)): [TBD:
+  the encoded tower against the BF16 tower beside the 27B's, the known answers, the decode gate].
