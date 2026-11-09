@@ -840,7 +840,9 @@ add_test(NAME ignis_kernel_flash_next_embed_head_test COMMAND ignis_kernel_flash
 # ADR 0059 (spec rope-scaling/02): the two rope sites (qsa.cu prepare_kernel, indexer.cu rope_row)
 # under a factor-4 YaRN table up to position 1,048,575, and the indexer's selection over it,
 # against a host restatement. GPU.
-foreach(name IN ITEMS gdn qsa side_branch verify moe_rows rope)
+# GitHub #564: the MTP head's combine takes the vision rows an image's placeholders took, bit for
+# bit the entries of the ids those rows embed, from a VRAM and a mapped host page. GPU.
+foreach(name IN ITEMS gdn qsa side_branch verify moe_rows rope mtp)
   add_executable(ignis_kernel_flash_next_${name}_test test_flash_next_${name}.cu)
   target_include_directories(ignis_kernel_flash_next_${name}_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)

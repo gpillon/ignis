@@ -15,11 +15,13 @@
 // Every RMSNorm is x * rsqrt(mean(x^2) + eps) * (1 + w) in fp32, rounded once (the prototype's
 // `rms`, tools/flash-next-mtp/mtp.py). A chained draft feeds S' back as the next step's stack
 // (convention chain a). The layer is the trunk's layer sequence (flash_next_internal.h) with the
-// experts' slot table fixed at load, so no residency step runs.
+// experts' slot table fixed at load, so no residency step runs. GitHub #564: where t is an image
+// placeholder of the prompt, embed_tokens(t) is the vision row the trunk took for it (combine).
 
 #pragma once
 
 #include "bind.h"
+#include "embed_head.h"
 #include "flash_next_internal.h"
 
 #include "ignis_moe.h"
@@ -28,6 +30,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace ignis::flash_next::mtp {
 
@@ -54,8 +57,14 @@ std::size_t combine_scratch_bytes(const Geometry &g, int32_t rows);
 
 // X = the head's input for `batch.rows()` entries: `tokens` DEVICE [rows], the stacks in
 // `b.residual` (overwritten by X).
+//
+// GitHub #564 (ADR 0087; the reference has no MTP head, so the rule is ours): `media` (or null)
+// the runs of vision columns over the entries whose token is an image placeholder -- each such
+// entry's e embeds the column the trunk took for that placeholder in place of the placeholder
+// id's row, as the trunk's embedding does (fn_embed_columns). Rows no run names embed their ids.
 int32_t combine(const Geometry &g, const MtpWeights &w, const Linear &embed, const int32_t *tokens,
-                const Batch &batch, const Buffers &b, ninfer::DeviceArena &scratch, cudaStream_t stream);
+                const Batch &batch, const Buffers &b, ninfer::DeviceArena &scratch, cudaStream_t stream,
+                const std::vector<MediaRun> *media = nullptr);
 
 // The head's layer over X in `b.residual`, in place, on attention section `attention_ordinal`.
 // `experts`: DEVICE [experts * 2] slots, every projection resident. Decode route up to the
