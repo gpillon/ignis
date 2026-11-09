@@ -20,7 +20,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::types::ComputeError;
 
@@ -31,11 +32,34 @@ fn marker_path() -> PathBuf {
     env::temp_dir().join("ignis-gpu-preflight.ok")
 }
 
-/// How long a passed preflight authorizes the profile for. The marker is
-/// removed when a `gpu-profile.ps1` run ends, so this bound only matters
-/// when a run was killed: it stops a stale pass from authorizing a later
-/// run that never checked whether the reference engine had come back.
+/// How long a passed preflight authorizes the profile for, counted from the
+/// marker's last stamp: the preflight's, or a GPU test's under the profile
+/// ([`refresh_marker`]), so a profile of several hours stays authorized
+/// (GitHub #517). The marker is removed when a `gpu-profile.ps1` run ends,
+/// so this bound only matters when a run was killed: it stops a stale pass
+/// from authorizing a later run that never checked whether the reference
+/// engine had come back.
 const PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+
+/// How often a process under the profile restamps the marker at most:
+/// [`active`] is asked on every kernel return code, so not every call.
+const REFRESH_EVERY: Duration = Duration::from_secs(60);
+
+/// Restamps an existing marker at `now`, unless this process did so less
+/// than [`REFRESH_EVERY`] ago (`last`, seconds since the epoch). A missing
+/// marker stays missing: a run that ended removed it, and a test must not
+/// hand a later run the pass back.
+fn refresh_marker(path: &Path, now: SystemTime, last: &AtomicU64) {
+    let secs = now.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    if secs.saturating_sub(last.load(Ordering::Relaxed)) < REFRESH_EVERY.as_secs() {
+        return;
+    }
+    last.store(secs, Ordering::Relaxed);
+    // Best effort: a marker that cannot be restamped ages out as before.
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(now);
+    }
+}
 
 /// Whether the preflight marker at `path` records a pass recent enough to
 /// authorize a profile run at `now`.
@@ -53,15 +77,22 @@ fn preflight_passed(path: &Path, now: SystemTime) -> bool {
 /// Whether the explicit GPU test profile is active.
 ///
 /// Decided once per process: a GPU run must not start under the profile and
-/// then slide out of it when the marker ages out mid-suite.
+/// then slide out of it when the marker ages out mid-suite. Under the
+/// profile each call also keeps the marker fresh for the test binaries that
+/// follow (GitHub #517).
 pub fn active() -> bool {
     static ACTIVE: OnceLock<bool> = OnceLock::new();
-    *ACTIVE.get_or_init(|| {
+    static LAST_REFRESH: AtomicU64 = AtomicU64::new(0);
+    let on = *ACTIVE.get_or_init(|| {
         active_impl(
             env::var("IGNIS_GPU_PROFILE").ok(),
             preflight_passed(&marker_path(), SystemTime::now()),
         )
-    })
+    });
+    if on {
+        refresh_marker(&marker_path(), SystemTime::now(), &LAST_REFRESH);
+    }
+    on
 }
 
 fn active_impl(var: Option<String>, preflight_passed: bool) -> bool {
@@ -190,6 +221,37 @@ mod tests {
         let passed = preflight_passed(&marker, later);
         let _ = std::fs::remove_file(&marker);
         assert!(!passed, "a pass older than PREFLIGHT_MAX_AGE must not authorize a run");
+    }
+
+    #[test]
+    fn a_marker_refreshed_by_a_test_counts_from_the_refresh() {
+        let marker = temp_marker("refreshed");
+        // A test still running past the bound restamps the pass, so the
+        // next test binary finds it fresh (GitHub #517).
+        let later = SystemTime::now() + PREFLIGHT_MAX_AGE + Duration::from_secs(60);
+        refresh_marker(&marker, later, &AtomicU64::new(0));
+        let passed = preflight_passed(&marker, later);
+        let _ = std::fs::remove_file(&marker);
+        assert!(passed, "a marker restamped at `later` must authorize the profile at `later`");
+    }
+
+    #[test]
+    fn a_refresh_within_a_minute_of_the_last_leaves_the_marker_as_it_is() {
+        let marker = temp_marker("throttled");
+        let later = SystemTime::now() + PREFLIGHT_MAX_AGE + Duration::from_secs(60);
+        let secs = later.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        refresh_marker(&marker, later, &AtomicU64::new(secs - 10));
+        let passed = preflight_passed(&marker, later);
+        let _ = std::fs::remove_file(&marker);
+        assert!(!passed, "a refresh 10 s after the last one must not restamp the marker");
+    }
+
+    #[test]
+    fn a_refresh_does_not_recreate_a_removed_marker() {
+        let removed = env::temp_dir().join("ignis-gpu-profile-test-removed.ok");
+        let _ = std::fs::remove_file(&removed);
+        refresh_marker(&removed, SystemTime::now(), &AtomicU64::new(0));
+        assert!(!removed.exists(), "a run's end removes the pass; a test must not hand it back");
     }
 
     #[test]

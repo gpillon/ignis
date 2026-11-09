@@ -116,8 +116,11 @@ verdict is carried across to Rust by that marker.
 the preflight, and only on a pass sets `IGNIS_GPU_PROFILE=1` and runs the
 GPU-gated work. It consumes the marker — both it and
 the env var are cleared before the script exits, pass or fail — so one
-preflight authorizes exactly one run. A pass also ages out after 30 minutes,
-which only matters if a run was killed before it could clean up.
+preflight authorizes exactly one run. A pass also ages out 30 minutes after
+its last stamp: a GPU test under the profile restamps the marker (at most once
+a minute), so a profile of several hours stays authorized, and a run killed
+before it could clean up loses its pass 30 minutes after its last test
+(GitHub #517).
 **This script is the normal, documented way to run the GPU profile.**
 
 It runs three stages and reports each one's wall time at the end, so a slow
