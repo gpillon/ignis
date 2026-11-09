@@ -1,0 +1,710 @@
+//! After an image, Flash-Next's verify round keeps the text path's state and
+//! its routes drift as they do on text (GitHub #564, spec #555, ADR 0087): the
+//! diagnosis of `crates/server/tests/flash_next_vision_mtp_gpu.rs`'s split.
+//!
+//! That test generated the four vision canaries' prompts greedily on a load
+//! with the MTP head and on one without it, and judged each split by the
+//! prefill route of the load without it, after the agreed text: the two picks
+//! within one BF16 ulp, or the prefill siding with the head's run. One split
+//! failed (circles, detail: the prefill route 0.75 logits, six ulps, on the
+//! headless run's side), and another passed only because the prefill sided
+//! with the head's run by the same 0.75 -- there the plain decode round, with
+//! no speculation in it at all, was the one six ulps off the prefill. Either
+//! (a) something an image leaves in a sequence's state is not kept by a
+//! verify round as a plain round keeps it, or (b) after an image the three
+//! routes -- the plain round, the verify round's k + 1 columns, the prefill's
+//! chunk -- differ by summation order as on text, and the image prompts'
+//! long descriptions meet more near-ties for that drift to split at.
+//!
+//! One test, two loads with vision (the tower in host memory, BF16 KV, one
+//! lane, 128-token chunks, MTP-3 -- the failing test's settings), and the
+//! canary prompts beside text controls of the same length, each image's
+//! placeholder run (with its vision start and end) replaced by a sentence
+//! describing it, repeated to the run's length: the same positions, no image.
+//! 64 greedy tokens a prompt. What it holds (exact, BF16 KV):
+//!
+//! - **A rejected draft after an image is a draft never made.** On the MTP
+//!   load, from the same standing prompt: rounds without drafts (`none`), a
+//!   drafter whose every draft is rejected, one whose every draft is
+//!   accepted (none's own text), and the head's own drafts commit none's
+//!   text, and leave the state none leaves -- the next token prefilled at the
+//!   frontier, its logits bit for bit (KV, GDN states, conv taps, the n-gram
+//!   conv; the indexer's tail and axis records reach a logit only past its
+//!   dense range, which these prompts of about a hundred tokens never leave,
+//!   as the failing test's never did). Red: a verify round's commit or
+//!   restore after an image is wrong -- (a).
+//! - **The head's load computes the headless load's trunk.** The plain rounds
+//!   on the MTP load commit the load without the head's tokens with its
+//!   logits, every round bit for bit, and the prompt's last prefill row too.
+//!   Red: the head's entries or sections reach the trunk -- (a).
+//!
+//! What it reports, per kind (image prompts, text controls), along each
+//! route's own text with the prefill of that text as the reference: the
+//! largest logit drift a row (BF16 ulps at the row's largest magnitude, as
+//! `support/logit_drift.rs` measures it) for the plain round against the
+//! prefill, the verify round against the prefill, and the verify round
+//! against the plain round teacher-forced -- the plain text offered as the
+//! drafts, ADR 0056's measure, which it put at up to 40.2 ulps on text at
+//! this round's 8 rows; the picks each moved, at what gap in the
+//! reference row; the near-ties along the plain text; and every split of the
+//! verify round from the plain round on this one load, judged by the failing
+//! test's rule (the prefill's gap within one ulp at the two picks' magnitude,
+//! or on the verify round's side) and by ADR 0056's moved-pick rule (the
+//! plain row's gap within `PICK_GAP_ULPS`).
+//!
+//! Reading it: a red assertion is (a), and names where. All green, with the
+//! image prompts' drift on a route pair well past the text controls' (twice
+//! their median or p99, say), is (a) too: an image-dependent numeric defect
+//! in that route (the rope delta's rotation, attention over the image's keys),
+//! the pair naming which. All green, the image drift within the text
+//! controls', and the splits at gaps the plain row calls near-ties, is (b):
+//! the failing rule asks the prefill route to referee two routes it sits as
+//! far from as they sit from each other. The rule is the owner's to change.
+//!
+//! ```text
+//! cargo test -p ignis-core --features cuda --test flash_next_vision_speculative_gpu -- --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! Machine-local: `F:/ai/models/Qwen3.8-Flash-Next-ignis/` (or
+//! `IGNIS_FLASH_NEXT_DIR`) with its MTP and vision companions; the canary
+//! images are the server's fixture (`crates/server/tests/fixtures/vision_canary/`).
+//! Explicit GPU profile (ADR 0006): outside `IGNIS_GPU_PROFILE=1` a missing
+//! artifact, companion or GPU is a skip, under it a failure. Two loads one
+//! after the other, each pinning the ~38 GB expert pool.
+
+#![cfg(feature = "cuda")]
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+
+use ignis_artifact::packer::ARTIFACT_FILE_NAME;
+use ignis_artifact::vision::VisionProcessor;
+use ignis_artifact::{ChatMessage, ChatRenderOptions, ContentPart, FrontendSet, MessageContent, Reader, Role};
+use ignis_core::flash_next::{EngineOptions, FlashNextEngine, LaneRound, RoundLogits};
+use ignis_core::kv_format::KvFormat;
+use ignis_core::ngram::NgramContext;
+use ignis_core::seq::Seq;
+use ignis_core::speculation::{FlashNextSpeculation, SpeculativeBackend};
+use ignis_core::step::{MediaEmbedding, MultimodalPrefill, SpanMediaColumns};
+use ignis_core::vision::Multimodal;
+use ignis_core::{gpu_profile, Vision, VisionResidency};
+
+#[path = "support/logit_drift.rs"]
+mod logit_drift;
+
+use logit_drift::{bf16, bf16_ulp, row_drift, RowDrift, PICK_GAP_ULPS};
+
+const MODEL_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
+const MAX_CONTEXT: u32 = 8192;
+/// Narrower than a canary image's placeholder run, as the failing test's.
+const PREFILL_CHUNK: u32 = 128;
+/// The head's draft tokens, the failing test's.
+const DRAFT_TOKENS: u32 = 3;
+/// Tokens each prompt generates.
+const TOKENS: usize = 64;
+/// A draft no greedy step picks: the vocabulary's last id, a reserved token.
+const REJECTED: u32 = 248_319;
+/// The failing test's second question per canary.
+const DETAIL_QUESTION: &str = "Describe everything you can see in this image, in detail.";
+/// What each canary image shows, for its text control.
+const DESCRIPTIONS: [(&str, &str); 4] = [
+    ("number", "A white picture with the number 47 printed in bold black digits in its centre."),
+    ("colour", "A plain light picture with one solid red square in its centre."),
+    ("circles", "A white picture with three solid blue circles of the same size side by side."),
+    ("text", "A white picture with one line of black text that reads: error: config.yaml not found."),
+];
+
+fn model_dir() -> PathBuf {
+    std::env::var_os("IGNIS_FLASH_NEXT_DIR").map_or_else(|| PathBuf::from(MODEL_DIR), PathBuf::from)
+}
+
+/// The vision both loads take: the context's envelope, the tower in host
+/// memory (the RTX 5090 profile's residency).
+fn vision() -> Vision {
+    Vision::new(MAX_CONTEXT).expect("an envelope").with_residency(VisionResidency::Host)
+}
+
+/// A vision load with the MTP head (`mtp`) or without speculation, or `None`
+/// through `skip_or_fail`.
+fn engine(mtp: bool) -> Option<FlashNextEngine> {
+    let dir = model_dir();
+    let speculation = mtp.then(|| FlashNextSpeculation::new(SpeculativeBackend::Mtp, DRAFT_TOKENS, 0).expect("mtp-3"));
+    let options = EngineOptions {
+        prefill_chunk_tokens: PREFILL_CHUNK,
+        max_context_tokens: MAX_CONTEXT,
+        kv_format: KvFormat::Bf16,
+        decode_lanes: 1,
+        speculation,
+        vision: Some(vision()),
+        ..EngineOptions::default()
+    };
+    match FlashNextEngine::load(&dir, options) {
+        Ok(engine) => Some(engine),
+        Err(e) => {
+            gpu_profile::skip_or_fail(&format!("load Flash-Next with vision (MTP {mtp}): {e}"));
+            None
+        }
+    }
+}
+
+/// A load's pinned expert pool may come back to the host after its drop:
+/// wait, bounded, until the host has back what it had before the load
+/// (`flash_next_vision_mtp_gpu.rs`'s wait).
+fn wait_for_host_memory(before: u64) {
+    use ignis_core::residency::available_physical_bytes;
+    for _ in 0..60 {
+        if available_physical_bytes().unwrap_or(0) + (1 << 30) >= before {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+// ── the prompts ─────────────────────────────────────────────────────────────
+
+/// A prompt: its ids, and an image's positions, rope delta and media item.
+struct Prompt {
+    name: String,
+    tokens: Vec<u32>,
+    multimodal: Option<Multimodal>,
+}
+
+/// `ignis_server::media::load_processor`'s processor at this load's context.
+fn processor(frontend: &FrontendSet) -> VisionProcessor {
+    let mut options = frontend.vision_processor().expect("the vision processor").options().clone();
+    options.max_vision_tokens = u64::from(vision().envelope_tokens(MAX_CONTEXT));
+    options.max_raw_patches = options.max_vision_tokens * 4;
+    VisionProcessor::new(frontend.tokenizer(), options).expect("the bounded processor")
+}
+
+/// The one id `text` tokenizes to.
+fn single_id(frontend: &FrontendSet, text: &str) -> u32 {
+    let ids = frontend.tokenizer().encode(text).unwrap_or_else(|e| panic!("tokenize {text}: {e}"));
+    assert_eq!(ids.len(), 1, "{text} is one token: {ids:?}");
+    ids[0]
+}
+
+/// The canaries (`id`, image bytes, own question), off the server's fixture.
+fn canaries() -> Vec<(String, Vec<u8>, String)> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../server/tests/fixtures/vision_canary");
+    let text = std::fs::read_to_string(dir.join("fixture.json")).expect("read the vision canary fixture");
+    let fixture: serde_json::Value = serde_json::from_str(&text).expect("fixture json");
+    fixture["canaries"]
+        .as_array()
+        .expect("canaries")
+        .iter()
+        .map(|canary| {
+            let field = |name: &str| canary[name].as_str().unwrap_or_else(|| panic!("{name}")).to_owned();
+            (field("id"), std::fs::read(dir.join(field("image"))).expect("a canary image"), field("question"))
+        })
+        .collect()
+}
+
+/// Each canary with its own question and the long one, thinking off and the
+/// image first (`flash_next_vision_mtp_gpu.rs`'s `prepare`), then the text
+/// controls: each prompt with the image's run -- its vision start, its
+/// placeholders, its vision end -- replaced by its description's ids,
+/// repeated to the run's length.
+fn prompts(dir: &Path) -> (Vec<Prompt>, Vec<Prompt>) {
+    let reader = Reader::open(&dir.join(ARTIFACT_FILE_NAME)).expect("open the artifact");
+    let frontend = FrontendSet::from_reader(&reader).expect("frontend");
+    let processor = processor(&frontend);
+    let (start, end) = (single_id(&frontend, "<|vision_start|>"), single_id(&frontend, "<|vision_end|>"));
+    let (mut images, mut texts) = (Vec::new(), Vec::new());
+    for (id, image, own) in canaries() {
+        let description = DESCRIPTIONS
+            .iter()
+            .find(|(canary, _)| *canary == id)
+            .unwrap_or_else(|| panic!("no description of canary {id}"))
+            .1;
+        let described = frontend.tokenizer().encode(&format!(" {description}")).expect("tokenize the description");
+        for (kind, question) in [("own", own.as_str()), ("detail", DETAIL_QUESTION)] {
+            let name = format!("{id} ({kind})");
+            let messages = [ChatMessage {
+                role: Role::User,
+                content: MessageContent::Parts(vec![ContentPart::Image { url: None }, ContentPart::Text(question.to_owned())]),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            }];
+            let options = ChatRenderOptions { enable_thinking: false, ..Default::default() };
+            let prepared = frontend
+                .prepare_prompt(&processor, &messages, &[image.as_slice()], options, None)
+                .unwrap_or_else(|e| panic!("{name}: prepare the prompt: {e}"));
+            let (tokens, multimodal) = Multimodal::from_prepared(prepared);
+            assert_eq!(multimodal.media.len(), 1, "{name}: one image");
+            assert_ne!(multimodal.rope_delta, 0, "{name}: an image's rope delta");
+            let span = multimodal.media[0].token_span;
+            let (first, last) = (span.begin - 1, span.begin + span.count);
+            assert_eq!((tokens[first], tokens[last]), (start, end), "{name}: the image's run is wrapped in its vision start and end");
+            let run: Vec<u32> = described.iter().cycle().take(last + 1 - first).copied().collect();
+            let text = [&tokens[..first], &run[..], &tokens[last + 1..]].concat();
+            assert_eq!(text.len(), tokens.len(), "{name}: the text control's length");
+            texts.push(Prompt { name: format!("{name} as text"), tokens: text, multimodal: None });
+            images.push(Prompt { name, tokens, multimodal: Some(multimodal) });
+        }
+    }
+    (images, texts)
+}
+
+/// `prompt` and `appended` (text after it) prefilled from position 0 as one
+/// span -- at the image's three axes with its columns over its placeholders,
+/// or as text: the standing sequence, its context, and every row's logits.
+fn standing<'e>(
+    engine: &'e FlashNextEngine,
+    prompt: &Prompt,
+    media: Option<&'e MediaEmbedding<'e>>,
+    appended: &[u32],
+) -> (Seq<'e>, NgramContext, Vec<u16>) {
+    let mut tokens = prompt.tokens.clone();
+    tokens.extend_from_slice(appended);
+    let result = match &prompt.multimodal {
+        None => engine.span(&tokens, None, None),
+        Some(multimodal) => {
+            let mut multimodal = multimodal.clone();
+            assert!(multimodal.append_text(appended.len()), "{}: the text continues the prompt's positions", prompt.name);
+            let span = multimodal.media[0].token_span;
+            let scatter: Vec<i32> = (span.begin as i32..(span.begin + span.count) as i32).collect();
+            let columns = SpanMediaColumns {
+                embedding: media.expect("an image prompt's columns"),
+                first_column: 0,
+                scatter_indices: &scatter,
+            };
+            let span = MultimodalPrefill {
+                positions: &multimodal.positions,
+                rope_delta: multimodal.rope_delta,
+                media: Some(columns),
+            };
+            engine.span(&tokens, None, Some(span))
+        }
+    };
+    result.unwrap_or_else(|e| panic!("{}: the span: {e}", prompt.name))
+}
+
+// ── the runs ────────────────────────────────────────────────────────────────
+
+/// Collects every round's first column -- the row that picks the token after
+/// the round's anchor -- or, `all`, every column (one lane).
+struct Columns {
+    vocab: usize,
+    all: bool,
+    rows: Vec<Vec<u16>>,
+}
+
+impl Columns {
+    fn new(vocab: usize, all: bool) -> Self {
+        Self { vocab, all, rows: Vec::new() }
+    }
+
+    fn take(&mut self, round: RoundLogits<'_>) {
+        assert_eq!(round.lanes.len(), 1, "one lane");
+        let width = if self.all { round.columns } else { 1 };
+        self.rows.push(round.rows[..width * self.vocab].to_vec());
+    }
+}
+
+/// One speculative run from the standing prompt: its tokens, its rounds, the
+/// first column (or every column) of each, the head's acceptance (rounds,
+/// drafted, accepted), and the probe after it.
+struct SpecRun {
+    tokens: Vec<u32>,
+    rounds: Vec<LaneRound>,
+    rows: Vec<Vec<u16>>,
+    acceptance: (u32, u32, u32),
+    probe: Vec<f32>,
+}
+
+fn speculative(
+    engine: &FlashNextEngine,
+    prompt: &Prompt,
+    media: Option<&MediaEmbedding<'_>>,
+    all: bool,
+    drafter: Option<&mut dyn FnMut(usize, &[u32], u32) -> Vec<u32>>,
+) -> SpecRun {
+    let (seq, context, _) = standing(engine, prompt, media, &[]);
+    let mut columns = Columns::new(engine.vocab(), all);
+    let mut run = engine
+        .generate_speculative_standing(
+            vec![seq],
+            vec![context],
+            TOKENS,
+            drafter,
+            Some(&mut |round: RoundLogits<'_>| columns.take(round)),
+        )
+        .unwrap_or_else(|e| panic!("{}: speculative rounds: {e}", prompt.name));
+    let probe = {
+        let (seq, context) = (&mut run.sequences[0], &mut run.contexts[0]);
+        engine.probe_logits(seq, context).unwrap_or_else(|e| panic!("{}: the probe: {e}", prompt.name))
+    };
+    let rounds: Vec<LaneRound> = run.rounds.iter().flatten().copied().collect();
+    let acceptance = rounds.iter().fold((0, 0, 0), |(r, d, a), lane| (r + 1, d + lane.extent, a + lane.committed - 1));
+    SpecRun { tokens: run.tokens.remove(0), rounds, rows: columns.rows, acceptance, probe }
+}
+
+/// ADR 0056's teacher-forced comparison: `forced` verified `plain`'s own
+/// text as its drafts, so while its committed text is `plain`'s, each
+/// drafted column holds `plain`'s token and its row reads what the plain
+/// round at the same index read. Every such row against that plain row, up
+/// to `len`; a run whose pick moved leaves after that round.
+fn teacher_forced(forced: &SpecRun, plain: &[u32], plain_rows: &[Vec<u16>], len: usize, vocab: usize) -> Vec<RowDrift> {
+    let mut drifts = Vec::new();
+    let mut anchor = 0usize;
+    for (round, rows) in forced.rounds.iter().zip(&forced.rows) {
+        if anchor >= len || forced.tokens[..=anchor] != plain[..=anchor] {
+            break;
+        }
+        let columns = (rows.len() / vocab).min(round.extent as usize + 1);
+        for j in 0..columns {
+            let r = anchor + j;
+            if r < len {
+                drifts.push(row_drift(&plain_rows[r], &rows[j * vocab..(j + 1) * vocab]));
+            }
+        }
+        anchor += round.committed as usize;
+    }
+    drifts
+}
+
+/// `count` plain rounds from the standing prompt: tokens and every row.
+fn plain(engine: &FlashNextEngine, prompt: &Prompt, media: Option<&MediaEmbedding<'_>>) -> (Vec<u32>, Vec<Vec<u16>>, u64) {
+    let (seq, context, rows) = standing(engine, prompt, media, &[]);
+    let last = hash(&rows[rows.len() - engine.vocab()..]);
+    drop(rows);
+    let mut columns = Columns::new(engine.vocab(), false);
+    let mut tokens = engine
+        .generate_standing(vec![seq], vec![context], TOKENS, Some(&mut |round: RoundLogits<'_>| columns.take(round)))
+        .unwrap_or_else(|e| panic!("{}: plain rounds: {e}", prompt.name));
+    (tokens.remove(0), columns.rows, last)
+}
+
+/// The prefill route along `text`: the rows that pick `text[1..]` and the
+/// one after it -- `rows[r]` reads what round `r` read.
+fn prefill_route(engine: &FlashNextEngine, prompt: &Prompt, media: Option<&MediaEmbedding<'_>>, text: &[u32]) -> Vec<Vec<u16>> {
+    let (seq, _, rows) = standing(engine, prompt, media, text);
+    drop(seq);
+    let vocab = engine.vocab();
+    let first = prompt.tokens.len();
+    (0..text.len()).map(|r| rows[(first + r) * vocab..(first + r + 1) * vocab].to_vec()).collect()
+}
+
+fn hash(row: &[u16]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    row.hash(&mut hasher);
+    hasher.finish()
+}
+
+// ── the measurements ────────────────────────────────────────────────────────
+
+/// The verify round's first split from the plain round on one load.
+struct Split {
+    at: usize,
+    plain: u32,
+    verify: u32,
+    /// The prefill's `logit(plain) - logit(verify)` and the failing test's
+    /// ulp (at the larger of the two picks' magnitudes).
+    prefill_gap: f32,
+    ulp: f32,
+    /// ADR 0056's measure: the plain row's gap between the picks, in ulps at
+    /// its largest magnitude.
+    plain_row_gap_ulps: f32,
+}
+
+/// What one prompt measured on the MTP load.
+struct Measured {
+    name: String,
+    image: bool,
+    plain: Vec<u32>,
+    plain_hashes: Vec<u64>,
+    prompt_row: u64,
+    plain_vs_prefill: Vec<RowDrift>,
+    verify_vs_prefill: Vec<RowDrift>,
+    verify_vs_plain: Vec<RowDrift>,
+    /// The prefill's top-two margin along the plain text, in ulps at the
+    /// row's largest magnitude.
+    margins: Vec<f32>,
+    split: Option<Split>,
+    /// (drafter, commits none's text, leaves none's state).
+    drafters: Vec<(&'static str, bool, bool)>,
+    head: (u32, u32, u32),
+}
+
+/// The rows of `text` up to its first `eos`, inclusive (a run past the stop
+/// it would have ended at is not the failing test's).
+fn until_eos(text: &[u32], eos: u32) -> usize {
+    text.iter().position(|&t| t == eos).map_or(text.len(), |at| at + 1)
+}
+
+fn top_two_margin_ulps(row: &[u16]) -> f32 {
+    let (mut first, mut second) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut scale = 0f32;
+    for &bits in row {
+        let v = bf16(bits);
+        scale = scale.max(v.abs());
+        if v > first {
+            second = first;
+            first = v;
+        } else if v > second {
+            second = v;
+        }
+    }
+    (first - second) / bf16_ulp(scale)
+}
+
+fn measure(engine: &FlashNextEngine, prompt: &Prompt, eos: u32) -> Measured {
+    let media = prompt.multimodal.as_ref().map(|m| {
+        engine.encode_media(&m.media[0]).unwrap_or_else(|e| panic!("{}: encode the image: {e}", prompt.name))
+    });
+    let media = media.as_ref();
+    let (plain_text, plain_rows, prompt_row) = plain(engine, prompt, media);
+    let none = speculative(engine, prompt, media, false, Some(&mut |_, _, _| Vec::new()));
+    assert!(none.acceptance.1 == 0 && none.acceptance.0 > 0, "{}: none verified drafts", prompt.name);
+    let reference = none.tokens.clone();
+    let oracle = speculative(
+        engine,
+        prompt,
+        media,
+        false,
+        Some(&mut |_, emitted: &[u32], w| {
+            let next = emitted.len() + 1;
+            reference[next.min(TOKENS)..(next + w as usize).min(TOKENS)].to_vec()
+        }),
+    );
+    let reject = speculative(engine, prompt, media, false, Some(&mut |_, _, w| vec![REJECTED; w as usize]));
+    let head = speculative(engine, prompt, media, false, None);
+    // ADR 0056's teacher-forced run: the plain rounds' own text as drafts.
+    let forced = speculative(
+        engine,
+        prompt,
+        media,
+        true,
+        Some(&mut |_, emitted: &[u32], w| {
+            let next = emitted.len() + 1;
+            plain_text[next.min(TOKENS)..(next + w as usize).min(TOKENS)].to_vec()
+        }),
+    );
+    let same = |run: &SpecRun| {
+        (run.tokens == none.tokens, run.probe.iter().zip(&none.probe).all(|(a, b)| a.to_bits() == b.to_bits()))
+    };
+    let drafters = [("oracle", &oracle), ("reject", &reject), ("head", &head)]
+        .into_iter()
+        .map(|(name, run)| {
+            let (text, state) = same(run);
+            (name, text, state)
+        })
+        .collect();
+
+    let along_plain = prefill_route(engine, prompt, media, &plain_text);
+    let along_none = prefill_route(engine, prompt, media, &none.tokens);
+    let plain_len = until_eos(&plain_text, eos);
+    let none_len = until_eos(&none.tokens, eos);
+    let plain_vs_prefill: Vec<RowDrift> =
+        (0..plain_len).map(|r| row_drift(&along_plain[r], &plain_rows[r])).collect();
+    let verify_vs_prefill: Vec<RowDrift> = (0..none_len).map(|r| row_drift(&along_none[r], &none.rows[r])).collect();
+    let margins = (0..plain_len).map(|r| top_two_margin_ulps(&along_plain[r])).collect();
+    let at = plain_text.iter().zip(&none.tokens).position(|(a, b)| a != b);
+    // Both runs' first token is the prompt's one prefill draw.
+    assert_ne!(at, Some(0), "{}: one load's prefill drew two tokens", prompt.name);
+    let verify_vs_plain = teacher_forced(&forced, &plain_text, &plain_rows, plain_len, engine.vocab());
+    drop(forced);
+    // A split past either run's stop is not one the failing test met.
+    let split = at.filter(|&at| at < plain_len.min(none_len)).map(|at| {
+        let (p, v) = (plain_text[at], none.tokens[at]);
+        let row = &along_plain[at - 1];
+        let (a, b) = (bf16(row[p as usize]), bf16(row[v as usize]));
+        Split {
+            at,
+            plain: p,
+            verify: v,
+            prefill_gap: a - b,
+            ulp: bf16_ulp(a.abs().max(b.abs())),
+            plain_row_gap_ulps: row_drift(&plain_rows[at - 1], &none.rows[at - 1]).gap_ulps,
+        }
+    });
+    Measured {
+        name: prompt.name.clone(),
+        image: prompt.multimodal.is_some(),
+        plain_hashes: plain_rows.iter().map(|row| hash(row)).collect(),
+        plain: plain_text,
+        prompt_row,
+        plain_vs_prefill,
+        verify_vs_prefill,
+        verify_vs_plain,
+        margins,
+        split,
+        drafters,
+        head: head.acceptance,
+    }
+}
+
+// ── the report ──────────────────────────────────────────────────────────────
+
+/// `values`' quantile `q`, nearest rank.
+fn quantile(values: &mut [f32], q: f64) -> f32 {
+    if values.is_empty() {
+        return f32::NAN;
+    }
+    values.sort_by(f32::total_cmp);
+    values[((values.len() - 1) as f64 * q).round() as usize]
+}
+
+/// A route pair's drift over `rows`: median, p90, p99, max ulps, and its
+/// moved picks with their gaps in the reference row.
+fn drift_line(what: &str, rows: &[&RowDrift]) -> (String, f32, f32) {
+    let mut ulps: Vec<f32> = rows.iter().map(|d| d.ulps).collect();
+    let (median, p90, p99, max) =
+        (quantile(&mut ulps, 0.5), quantile(&mut ulps, 0.9), quantile(&mut ulps, 0.99), quantile(&mut ulps, 1.0));
+    let moved: Vec<f32> = rows.iter().filter(|d| d.pick_off != d.pick_on).map(|d| d.gap_ulps).collect();
+    let line = format!(
+        "{what:30} {:4} rows  drift ulps median {median:6.2} p90 {p90:6.2} p99 {p99:6.2} max {max:6.2}  picks moved {} at gaps {moved:?}",
+        rows.len(),
+        moved.len()
+    );
+    (line, median, p99)
+}
+
+/// The route pairs a prompt's drifts are reported for.
+const PAIRS: [&str; 3] = ["plain round vs prefill", "verify round vs prefill", "verify vs plain, teacher-forced"];
+
+fn pair(m: &Measured, index: usize) -> &[RowDrift] {
+    match index {
+        0 => &m.plain_vs_prefill,
+        1 => &m.verify_vs_prefill,
+        _ => &m.verify_vs_plain,
+    }
+}
+
+fn report(measured: &[Measured]) {
+    let mut medians = Vec::new();
+    for (kind, image) in [("image prompts", true), ("text controls", false)] {
+        let of: Vec<&Measured> = measured.iter().filter(|m| m.image == image).collect();
+        println!("{kind}:");
+        let mut stats = Vec::new();
+        for (index, what) in PAIRS.iter().enumerate() {
+            let all: Vec<&RowDrift> = of.iter().flat_map(|m| pair(m, index)).collect();
+            let (line, median, p99) = drift_line(what, &all);
+            println!("  {line}");
+            stats.push((median, p99));
+        }
+        let margins: Vec<f32> = of.iter().flat_map(|m| m.margins.iter().copied()).collect();
+        println!(
+            "  near-ties along the plain text: {} of {} rows within 1 ulp, {} within 8",
+            margins.iter().filter(|&&m| m <= 1.0).count(),
+            margins.len(),
+            margins.iter().filter(|&&m| m <= 8.0).count()
+        );
+        let splits: Vec<(&str, &Split)> = of.iter().filter_map(|m| m.split.as_ref().map(|s| (m.name.as_str(), s))).collect();
+        println!("  {} of {} prompts split (verify round from plain round, one load):", splits.len(), of.len());
+        for (name, s) in splits {
+            println!(
+                "    {name}: at token {}: plain {} verify {}; prefill gap plain - verify = {} (ulp {}): the failing rule {}; plain row's gap {:.2} ulps: ADR 0056's rule ({PICK_GAP_ULPS}) {}",
+                s.at,
+                s.plain,
+                s.verify,
+                s.prefill_gap,
+                s.ulp,
+                if s.prefill_gap <= s.ulp { "passes" } else { "FAILS" },
+                s.plain_row_gap_ulps,
+                if s.plain_row_gap_ulps <= PICK_GAP_ULPS { "passes" } else { "FAILS" },
+            );
+        }
+        let head = of.iter().fold((0, 0, 0), |t, m| (t.0 + m.head.0, t.1 + m.head.1, t.2 + m.head.2));
+        println!("  the head's drafts: {} rounds, {} drafted, {} accepted", head.0, head.1, head.2);
+        medians.push(stats);
+    }
+    for (i, name) in PAIRS.iter().enumerate() {
+        let (image, text) = (medians[0][i], medians[1][i]);
+        println!(
+            "image / text drift, {name}: median {:.2}x, p99 {:.2}x",
+            image.0 / text.0.max(f32::MIN_POSITIVE),
+            image.1 / text.1.max(f32::MIN_POSITIVE)
+        );
+    }
+}
+
+// ── the test ────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "GPU profile only: Flash-Next with its MTP and vision companions on the RTX 5090"]
+fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_drift_as_on_text() {
+    let dir = model_dir();
+    let path = dir.join(ARTIFACT_FILE_NAME);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("no Flash-Next artifact at {}", path.display())) {
+        return;
+    }
+    for (what, companion) in [
+        ("MTP", ignis_core::flash_next_mtp::companion_path(&dir)),
+        ("vision", ignis_core::flash_next_vision::companion_path(&dir)),
+    ] {
+        if !companion.exists() && gpu_profile::skip_or_fail(&format!("no {what} companion at {}", companion.display())) {
+            return;
+        }
+    }
+    let (images, texts) = prompts(&dir);
+    let eos = {
+        let reader = Reader::open(&path).expect("open the artifact");
+        FrontendSet::from_reader(&reader).expect("frontend").eos_token_id().expect("eos")
+    };
+    let all: Vec<&Prompt> = images.iter().chain(&texts).collect();
+    for prompt in &all {
+        println!("{}: {} prompt tokens", prompt.name, prompt.tokens.len());
+    }
+    let before = ignis_core::residency::available_physical_bytes().unwrap_or(0);
+
+    let measured: Vec<Measured> = {
+        let Some(on) = engine(true) else { return };
+        println!(
+            "the head's load: round graphs {:#b}, verify graphs {:?} ({:?})",
+            on.graphs_ready(),
+            on.verify_graphs_ready(),
+            on.graph_error()
+        );
+        all.iter().map(|prompt| measure(&on, prompt, eos)).collect()
+    };
+    wait_for_host_memory(before);
+    // The load without the head: its plain rounds against the head's load's.
+    let mut cross = Vec::new();
+    {
+        let Some(off) = engine(false) else { return };
+        for (prompt, m) in all.iter().zip(&measured) {
+            let media = prompt.multimodal.as_ref().map(|mm| {
+                off.encode_media(&mm.media[0]).unwrap_or_else(|e| panic!("{}: encode the image: {e}", prompt.name))
+            });
+            let (tokens, rows, prompt_row) = plain(&off, prompt, media.as_ref());
+            let differing = rows.iter().zip(&m.plain_hashes).filter(|(row, h)| hash(row) != **h).count();
+            cross.push((m.name.clone(), tokens == m.plain, differing, prompt_row == m.prompt_row));
+        }
+    }
+
+    for m in &measured {
+        let medians: Vec<String> = (0..PAIRS.len())
+            .map(|index| {
+                let mut ulps: Vec<f32> = pair(m, index).iter().map(|d| d.ulps).collect();
+                format!("{:.2}", quantile(&mut ulps, 0.5))
+            })
+            .collect();
+        println!(
+            "{}: plain {:?}... split {:?}; median drift ulps (plain/prefill, verify/prefill, verify/plain) {medians:?}",
+            m.name,
+            &m.plain[..8.min(m.plain.len())],
+            m.split.as_ref().map(|s| (s.at, s.plain, s.verify, s.prefill_gap))
+        );
+    }
+    report(&measured);
+    println!("the headless load's plain rounds against the head's load's (tokens equal, rows differing, prompt row equal):");
+    for (name, tokens, differing, prompt_row) in &cross {
+        println!("  {name}: {tokens} {differing} {prompt_row}");
+    }
+
+    for m in &measured {
+        for (drafter, text, state) in &m.drafters {
+            assert!(text, "{}: the {drafter} drafter committed other text than rounds without drafts", m.name);
+            assert!(state, "{}: the {drafter} drafter's rounds left another state than rounds without drafts", m.name);
+        }
+    }
+    for (name, tokens, differing, prompt_row) in &cross {
+        assert!(
+            *tokens && *differing == 0 && *prompt_row,
+            "{name}: the load without the head computes another trunk (tokens equal {tokens}, {differing} rows differ, prompt row equal {prompt_row})"
+        );
+    }
+}
