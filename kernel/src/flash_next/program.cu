@@ -139,6 +139,12 @@ int32_t gdn_layers(const FlashNextModel &fn) {
 // The pool's attention sections: the trunk's, and an MTP load's head one past them.
 int32_t attention_sections(const FlashNextModel &fn) { return attention_layers(fn) + (fn.mtp != nullptr ? 1 : 0); }
 
+// GitHub #557: the media rows a vision load stages for a prefill chunk -- the trunk's, and on an
+// MTP load (GitHub #564) the head's entries' after them.
+std::size_t media_row_count(const FlashNextModel &fn) {
+  return static_cast<std::size_t>(fn.prefill_chunk_tokens) * (fn.mtp != nullptr ? 2 : 1);
+}
+
 Sizes plan_sizes(const FlashNextModel &fn) {
   const Geometry &g = fn.g;
   Sizes s;
@@ -157,9 +163,10 @@ Sizes plan_sizes(const FlashNextModel &fn) {
                   2 * aligned(static_cast<std::size_t>(std::max(lanes, 1)) * sizeof(int32_t)) +
                   aligned(rows * g.ngram_heads * g.ngram_row_bytes());
   if (fn.vision()) {
-    // GitHub #557: a chunk's three axes and media rows, and a round's rope deltas.
+    // GitHub #557: a chunk's three axes and media rows (#564: and the MTP head's), and a round's
+    // rope deltas.
     s.activations += aligned(3 * static_cast<std::size_t>(chunk) * sizeof(int32_t)) +
-                     aligned(static_cast<std::size_t>(chunk) * sizeof(int32_t)) +
+                     aligned(media_row_count(fn) * sizeof(int32_t)) +
                      aligned(static_cast<std::size_t>(std::max(lanes, 1)) * sizeof(int32_t));
   }
   const std::size_t router = aligned(rows * g.experts_per_token * sizeof(int32_t)) +
@@ -513,7 +520,8 @@ int32_t fn_moe_experts_decode(const void *x, uint32_t rows, const int32_t *ids, 
 }
 
 int32_t mtp_entries(FlashNextModel &fn, const Context &ctx, const Batch &batch, const int32_t *tokens,
-                    ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error) {
+                    ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error,
+                    const std::vector<MediaRun> *media) {
   mtp::Buffers b;
   b.residual = fn.residual->p;
   b.x = fn.x->p;
@@ -527,7 +535,7 @@ int32_t mtp_entries(FlashNextModel &fn, const Context &ctx, const Batch &batch, 
   b.router_logits = static_cast<float *>(fn.router_logits->p);
   b.shared_h = fn.shared_h->p;
   b.shared_out = static_cast<float *>(fn.shared_out->p);
-  if (mtp::combine(fn.g, *fn.mtp, fn.weights->embed, tokens, batch, b, scratch, stream) != 0 ||
+  if (mtp::combine(fn.g, *fn.mtp, fn.weights->embed, tokens, batch, b, scratch, stream, media) != 0 ||
       mtp::layer(ctx, attention_layers(fn), *fn.mtp, static_cast<const ignis_moe_slot *>(fn.mtp_slots->p), batch, b,
                  scratch, stream) != 0) {
     *error = std::string("the MTP head: ") + fn_last_error();
@@ -598,6 +606,40 @@ std::string prefill_options_refusal(const ignis_prefill_options *options, bool &
   if (options->ngram_rows == nullptr) return "a Flash-Next prefill needs the span's n-gram rows";
   span_logits_ok = true;
   return {};
+}
+
+// GitHub #557: `count` consecutive columns of `media` from `column` on, over the rows `rows`
+// (DEVICE [count]), as a run per pool page they sit in.
+std::vector<MediaRun> media_runs(const VisionEmbeddingPool &pool, const Geometry &g, const ignis_media_embedding &media,
+                                 int32_t column, int32_t count, const int32_t *rows) {
+  std::vector<MediaRun> runs;
+  for (int32_t done = 0; done < count;) {
+    const int32_t at = column + done;
+    const int32_t within = at % pool.page_columns;
+    const int32_t take = std::min(count - done, pool.page_columns - within);
+    runs.push_back(MediaRun{pool.page_ptr(media.pages[static_cast<std::size_t>(at / pool.page_columns)]) +
+                                static_cast<std::size_t>(within) * g.hidden * sizeof(std::uint16_t),
+                            rows + done, take});
+    done += take;
+  }
+  return runs;
+}
+
+// GitHub #564: whether the MTP head's entry at the span's last position -- built from the next
+// prompt token, outside the span -- takes the media's next column. It does when the span ends
+// inside its image: its last token a placeholder of an item with columns past the span's, the
+// next prompt token the same placeholder id. An item's placeholders are consecutive and take its
+// columns in order, so that token is the item's next placeholder, and the next span puts that
+// column over it. (An image that starts the next span is not encoded yet: the entry before it
+// embeds the placeholder id, the one entry of an image without its vision row; the trunk
+// verifies every draft, so speculation stays lossless.)
+bool head_continues_media(const ignis_prefill_options &options, const int32_t *token_ids, uint64_t num_tokens,
+                          int32_t next_prompt_token) {
+  return options.media != nullptr && next_prompt_token >= 0 && num_tokens > 0 &&
+         static_cast<uint64_t>(options.media_scatter_indices[options.media_column_count - 1]) == num_tokens - 1 &&
+         next_prompt_token == token_ids[num_tokens - 1] &&
+         static_cast<uint64_t>(options.media_first_column) + options.media_column_count <
+             static_cast<uint64_t>(options.media->columns);
 }
 
 }  // namespace
@@ -815,7 +857,7 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     if (fn.vision()) {
       const auto chunk = static_cast<std::size_t>(fn.prefill_chunk_tokens);
       fn.rope_positions = buffer(3 * chunk * sizeof(int32_t));
-      fn.media_rows = buffer(chunk * sizeof(int32_t));
+      fn.media_rows = buffer(media_row_count(fn) * sizeof(int32_t));
       fn.rope_deltas = buffer(lanes * sizeof(int32_t));
     }
   } catch (const std::exception &e) {
@@ -997,33 +1039,52 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
         }
         batch.rope_deltas = static_cast<const int32_t *>(fn.rope_deltas->p);
       }
+      // GitHub #564: and the MTP head's -- its entry r takes token r + 1, so the columns of the
+      // span's placeholders at offset + 1 .. offset + chunk over the rows before theirs, and on the
+      // span's last chunk the media's next column at its last row when the span ends inside its
+      // image (head_continues_media); staged after the trunk's rows, both before the forward.
       std::vector<MediaRun> media;
+      std::vector<MediaRun> head_media;
       std::vector<int32_t> media_rows;
+      std::vector<int32_t> head_rows;
       if (options->media != nullptr) {
         const int32_t *scatter = options->media_scatter_indices;
         const int32_t *scatter_end = scatter + options->media_column_count;
-        const int32_t *first = std::lower_bound(scatter, scatter_end, static_cast<int32_t>(offset));
-        const int32_t *past = std::lower_bound(first, scatter_end, static_cast<int32_t>(offset) + chunk);
-        const auto count = static_cast<int32_t>(past - first);
-        for (int32_t i = 0; i < count; ++i) media_rows.push_back(first[i] - static_cast<int32_t>(offset));
-        if (count > 0 &&
-            !check_cuda(cudaMemcpyAsync(fn.media_rows->p, media_rows.data(), media_rows.size() * sizeof(int32_t),
-                                        cudaMemcpyHostToDevice, stream),
-                        "staging the chunk's media rows", &error)) {
+        const auto from = [&](uint64_t index) {
+          return std::lower_bound(scatter, scatter_end, static_cast<int32_t>(index));
+        };
+        const auto column_of = [&](const int32_t *at) {
+          return static_cast<int32_t>(options->media_first_column) + static_cast<int32_t>(at - scatter);
+        };
+        const int32_t *first = from(offset);
+        const int32_t *past = from(offset + static_cast<uint64_t>(chunk));
+        for (const int32_t *at = first; at < past; ++at) media_rows.push_back(*at - static_cast<int32_t>(offset));
+        const int32_t *head_first = from(offset + 1);
+        if (fn.mtp != nullptr) {
+          const int32_t *head_past = from(offset + static_cast<uint64_t>(chunk) + 1);
+          for (const int32_t *at = head_first; at < head_past; ++at) {
+            head_rows.push_back(*at - static_cast<int32_t>(offset) - 1);
+          }
+          if (last && head_continues_media(*options, token_ids, num_tokens, next_prompt_token)) {
+            head_rows.push_back(chunk - 1);
+          }
+        }
+        auto *rows = static_cast<int32_t *>(fn.media_rows->p);
+        int32_t *head_at = rows + fn.prefill_chunk_tokens;
+        if ((!media_rows.empty() &&
+             !check_cuda(cudaMemcpyAsync(rows, media_rows.data(), media_rows.size() * sizeof(int32_t),
+                                         cudaMemcpyHostToDevice, stream),
+                         "staging the chunk's media rows", &error)) ||
+            (!head_rows.empty() &&
+             !check_cuda(cudaMemcpyAsync(head_at, head_rows.data(), head_rows.size() * sizeof(int32_t),
+                                         cudaMemcpyHostToDevice, stream),
+                         "staging the MTP head's media rows", &error))) {
           return false;
         }
-        const VisionEmbeddingPool &vision_pool = model->vision_pool;
-        const auto column = static_cast<int32_t>(options->media_first_column) + static_cast<int32_t>(first - scatter);
-        for (int32_t done = 0; done < count;) {
-          const int32_t at = column + done;
-          const int32_t within = at % vision_pool.page_columns;
-          const int32_t take = std::min(count - done, vision_pool.page_columns - within);
-          media.push_back(MediaRun{
-              vision_pool.page_ptr(options->media->pages[static_cast<std::size_t>(at / vision_pool.page_columns)]) +
-                  static_cast<std::size_t>(within) * g.hidden * sizeof(std::uint16_t),
-              static_cast<const int32_t *>(fn.media_rows->p) + done, take});
-          done += take;
-        }
+        media = media_runs(model->vision_pool, g, *options->media, column_of(first),
+                           static_cast<int32_t>(media_rows.size()), rows);
+        head_media = media_runs(model->vision_pool, g, *options->media, column_of(head_first),
+                                static_cast<int32_t>(head_rows.size()), head_at);
       }
       if (forward(fn, views.ctx, batch, IGNIS_RESIDENCY_PREFILL, *model->scratch, stream, &error, &media) != 0) {
         return false;
@@ -1118,10 +1179,14 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
         batch.slots = static_cast<const int32_t *>(fn.slots->p);
         batch.positions = static_cast<const int32_t *>(fn.positions->p);
         batch.max_visible = position + chunk;
-        // GitHub #557: the head rotates where the trunk did (its vision rows are #564's).
+        // GitHub #557: the head rotates where the trunk did; GitHub #564: an entry whose token is
+        // an image placeholder embeds the vision row the trunk took for it (ADR 0087).
         batch.rope_positions = trunk.rope_positions;
         batch.rope_deltas = trunk.rope_deltas;
-        if (mtp_entries(fn, views.ctx, batch, next, *model->scratch, stream, &error) != 0) return false;
+        if (mtp_entries(fn, views.ctx, batch, next, *model->scratch, stream, &error,
+                        head_media.empty() ? nullptr : &head_media) != 0) {
+          return false;
+        }
       }
       return check_cuda(cudaStreamSynchronize(stream), "the chunk's synchronize", &error);
     }();

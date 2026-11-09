@@ -125,8 +125,9 @@ struct FlashNextModel {
   // memory (the vision residency), allocated by finish_load as the handle's `vision_pool`
   // (model_internal.h, the 27B's) -- and the forward's vision inputs, at stable addresses: a
   // chunk's three axes (I32 [3][prefill_chunk_tokens]) and its media rows (I32
-  // [prefill_chunk_tokens]), and a round's rope deltas (I32 [decode_lanes], staged with the
-  // positions). A text load holds none of them, so its reservations are as they were.
+  // [prefill_chunk_tokens], on an MTP load the head's entries' after them, GitHub #564), and a
+  // round's rope deltas (I32 [decode_lanes], staged with the positions). A text load holds none
+  // of them, so its reservations are as they were.
   uint64_t vision_pool_bytes = 0;
   bool vision_pool_host = false;
   std::unique_ptr<ninfer::DeviceBuffer> rope_positions;
@@ -193,15 +194,9 @@ struct Views {
 Views views_of(const FlashNextModel &fn, ignis_seq_pool *pool);
 // The KV positions a decode round's indexer and attention are sized for.
 int32_t decode_max_visible(const FlashNextModel &fn);
-// GitHub #557: a prefill chunk's media columns -- one run of a pool page's: `count` contiguous
-// BF16 [hidden] columns at `columns`, over the chunk's rows `rows` (DEVICE [count]).
-struct MediaRun {
-  const void *columns = nullptr;
-  const int32_t *rows = nullptr;
-  int32_t count = 0;
-};
 // The call's whole forward to the final residual: embed (and, GitHub #557, the `media` runs over
-// their rows' embeddings, in every stream), every layer. `phase` is residency's.
+// their rows' embeddings, in every stream; MediaRun is embed_head.h's), every layer. `phase` is
+// residency's.
 int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint32_t phase,
                 ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error,
                 const std::vector<MediaRun> *media = nullptr);
@@ -209,9 +204,12 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
 void advance_frontiers(ignis_seq *seq, uint32_t tokens);
 // The MTP head's entries for a call's rows (spec flash-next/07): entry r from the stack the trunk
 // (or the head's previous step) left in the residual and tokens[r] (DEVICE), at the batch's
-// positions, in the head's own attention section; S' is left in the residual.
+// positions, in the head's own attention section; S' is left in the residual. GitHub #564:
+// `media` (or null) the runs of vision columns over the entries whose token is an image
+// placeholder, each embedding the column the trunk took for it (mtp::combine).
 int32_t mtp_entries(FlashNextModel &fn, const Context &ctx, const Batch &batch, const int32_t *tokens,
-                    ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error);
+                    ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error,
+                    const std::vector<MediaRun> *media = nullptr);
 
 // The verify round (spec flash-next/07, speculative.cu): ignis_program_decode with a speculative
 // window on a load with one, after program_decode's own checks.
