@@ -156,6 +156,12 @@ Sizes plan_sizes(const FlashNextModel &fn) {
                   aligned(2 * rows * g.streams * sizeof(float)) + aligned(rows * sizeof(int32_t)) +
                   2 * aligned(static_cast<std::size_t>(std::max(lanes, 1)) * sizeof(int32_t)) +
                   aligned(rows * g.ngram_heads * g.ngram_row_bytes());
+  if (fn.vision()) {
+    // GitHub #557: a chunk's three axes and media rows, and a round's rope deltas.
+    s.activations += aligned(3 * static_cast<std::size_t>(chunk) * sizeof(int32_t)) +
+                     aligned(static_cast<std::size_t>(chunk) * sizeof(int32_t)) +
+                     aligned(static_cast<std::size_t>(std::max(lanes, 1)) * sizeof(int32_t));
+  }
   const std::size_t router = aligned(rows * g.experts_per_token * sizeof(int32_t)) +
                              aligned(rows * g.experts_per_token * sizeof(float)) +
                              aligned(rows * g.experts * sizeof(float));
@@ -192,10 +198,11 @@ std::size_t sampling_staging_bytes(const Sizes &s) {
 }
 
 // A decode round's inputs in FlashNextModel::round_inputs (GitHub #306, step 7): byte offsets of
-// its sampling configs, positions, ids, slots, n-gram rows, permitted sets and their counts, each
-// 64-byte aligned, at the load's lane count.
+// its sampling configs, positions, ids, slots, n-gram rows, permitted sets and their counts, and
+// on a vision load its rope deltas (GitHub #557), each 64-byte aligned, at the load's lane count.
 struct RoundInputs {
-  std::size_t configs = 0, positions = 0, ids = 0, slots = 0, ngram = 0, permitted = 0, counts = 0, total = 0;
+  std::size_t configs = 0, positions = 0, ids = 0, slots = 0, ngram = 0, permitted = 0, counts = 0, rope_deltas = 0,
+              total = 0;
 };
 
 RoundInputs round_inputs_layout(const FlashNextModel &fn) {
@@ -214,6 +221,7 @@ RoundInputs round_inputs_layout(const FlashNextModel &fn) {
   at.ngram = take(lanes * static_cast<std::size_t>(fn.g.ngram_heads) * fn.g.ngram_row_bytes());
   at.permitted = take(lanes * IGNIS_MAX_PERMITTED_TOKENS * sizeof(int32_t));
   at.counts = take(lanes * sizeof(int32_t));
+  at.rope_deltas = take(fn.vision() ? lanes * sizeof(int32_t) : 0);
   at.total = end;
   return at;
 }
@@ -282,9 +290,11 @@ bool check_cuda(cudaError_t err, const std::string &what, std::string *error) {
 
 }  // namespace
 
-// The call's whole forward to the final residual: embed, every layer. `phase` is residency's.
+// The call's whole forward to the final residual: embed (and the media runs over their rows),
+// every layer. `phase` is residency's.
 int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint32_t phase,
-                ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error) {
+                ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error,
+                const std::vector<MediaRun> *media) {
   const Geometry &g = fn.g;
   const Weights &w = *fn.weights;
   const int32_t rows = batch.rows();
@@ -315,6 +325,14 @@ int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint
 
   if (fn_embed(g, w.embed, static_cast<const int32_t *>(fn.token_ids->p), rows, residual, stream) != 0) {
     return fail("the embedding", fn_last_error());
+  }
+  // GitHub #557: the vision rows replace their placeholders' embeddings before the first layer.
+  if (media != nullptr) {
+    for (const MediaRun &run : *media) {
+      if (fn_embed_columns(g, run.columns, run.rows, run.count, rows, residual, stream) != 0) {
+        return fail("the media columns", fn_last_error());
+      }
+    }
   }
   int32_t attention_ordinal = 0;
   int32_t gdn_ordinal = 0;
@@ -527,9 +545,43 @@ float bf16_to_f32(std::uint16_t bits) {
   return value;
 }
 
+// GitHub #557: a span of a multimodal prompt's inputs, as the 27B's validate_span_multimodal
+// (step.cu) admits them: its three axes on a vision load, and with media an embedding of this
+// load's whose columns cover the span's strictly increasing placeholder indices. A text span names
+// none of them (its rotation is its positions, or its sequence's rope delta).
+std::string multimodal_refusal(const ignis_model &model, const ignis_prefill_options &options, uint64_t num_tokens) {
+  if (options.mrope_positions == nullptr) {
+    if (options.media != nullptr || options.media_column_count != 0 || options.rope_delta != 0) {
+      return "media columns and a rope delta need the span's multimodal positions";
+    }
+    return {};
+  }
+  if (!model.flash_next->vision()) return "a multimodal span on a Qwen3.8-Flash-Next load without vision";
+  if (options.media == nullptr) {
+    return options.media_column_count == 0 ? std::string{} : "scatter indices without a media embedding";
+  }
+  if (options.media->model != &model) return "the media embedding was encoded by another model";
+  if (options.media_column_count == 0 || options.media_scatter_indices == nullptr) {
+    return "a media embedding needs at least one scatter index";
+  }
+  if (static_cast<uint64_t>(options.media_first_column) + options.media_column_count >
+      static_cast<uint64_t>(options.media->columns)) {
+    return "columns " + std::to_string(options.media_first_column) + "+" + std::to_string(options.media_column_count) +
+           " exceed the embedding's " + std::to_string(options.media->columns);
+  }
+  for (uint32_t i = 0; i < options.media_column_count; ++i) {
+    const int32_t index = options.media_scatter_indices[i];
+    if (index < 0 || static_cast<uint64_t>(index) >= num_tokens ||
+        (i > 0 && index <= options.media_scatter_indices[i - 1])) {
+      return "scatter index " + std::to_string(i) + " (" + std::to_string(index) + ") is out of order or outside the span";
+    }
+  }
+  return {};
+}
+
 // What a Flash-Next prefill's options may ask for: the chunked route at the engine's policy, the
-// span's n-gram rows, its permitted draw's probability and the span-logits readout -- nothing
-// multimodal, no attention readout.
+// span's n-gram rows, its permitted draw's probability and the span-logits readout, and (GitHub
+// #557, multimodal_refusal's to admit) a multimodal span's inputs -- no attention readout.
 std::string prefill_options_refusal(const ignis_prefill_options *options, bool &span_logits_ok) {
   if (options == nullptr) return "a Flash-Next prefill needs its options: the span's n-gram rows";
   if (options->size != sizeof(ignis_prefill_options)) {
@@ -538,10 +590,6 @@ std::string prefill_options_refusal(const ignis_prefill_options *options, bool &
   if (options->route != IGNIS_PREFILL_ROUTE_CHUNKED) return "Flash-Next runs the chunked route only";
   if (options->compute_policy != IGNIS_PREFILL_COMPUTE_POLICY_ENGINE_DEFAULT) {
     return "Flash-Next has no NVFP4 projection for a compute policy to choose";
-  }
-  if (options->mrope_positions != nullptr || options->media != nullptr || options->media_column_count != 0 ||
-      options->rope_delta != 0) {
-    return "Qwen3.8-Flash-Next serves no images";
   }
   if ((options->attention_gqa_ordinal >= 0 && options->out_attention_scores != nullptr) ||
       options->attention_set_count != 0 || options->out_attention_set_rows != nullptr) {
@@ -573,12 +621,14 @@ std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, ui
                                            const ignis_topology &topology, uint32_t prefill_chunk_tokens,
                                            uint32_t max_context_tokens, int32_t kv_format,
                                            const ignis_model_load_options *options, const RopeScaling &rope_scaling,
-                                           std::string *error) {
+                                           uint64_t vision_pool_bytes, bool vision_pool_host, std::string *error) {
   auto fn = std::make_unique<FlashNextModel>();
   fn->g = Geometry::from(topology);
   fn->kv_format = kv_format;
   fn->prefill_chunk_tokens = prefill_chunk_tokens;
   fn->max_context_tokens = max_context_tokens;
+  fn->vision_pool_bytes = vision_pool_bytes;
+  fn->vision_pool_host = vision_pool_bytes != 0 && vision_pool_host;
   fn->decode_lanes = options != nullptr && options->decode_lanes != 0 ? options->decode_lanes : kDefaultDecodeLanes;
   fn->residency = options != nullptr ? options->residency : nullptr;
   if (options != nullptr) {
@@ -651,6 +701,8 @@ ignis_model_reservations reservations(const FlashNextModel &fn) {
   out.decode_graph_bytes = fn.sizes.decode_scratch;
   out.activation_bytes = fn.sizes.activations + fn.sizes.moe;
   out.verify_round_bytes = fn.sizes.verify;
+  // GitHub #557: the embedding pool where it takes VRAM; a host-resident one is not in the plan.
+  out.media_embedding_bytes = fn.vision_pool_host ? 0 : fn.vision_pool_bytes;
   return out;
 }
 
@@ -675,10 +727,12 @@ ignis_model_reservations reserved(const ignis_model &model) {
   for (const auto *buffer : {&fn.residual, &fn.x, &fn.y, &fn.injections, &fn.token_ids, &fn.slots, &fn.positions,
                              &fn.ngram_rows, &fn.moe_workspace, &fn.moe_acc, &fn.router_ids, &fn.router_weights,
                              &fn.router_logits, &fn.lookahead_ids, &fn.lookahead_weights, &fn.lookahead_logits,
-                             &fn.shared_h, &fn.shared_out, &fn.mtp_tokens, &fn.mtp_slots}) {
+                             &fn.shared_h, &fn.shared_out, &fn.mtp_tokens, &fn.mtp_slots, &fn.rope_positions,
+                             &fn.media_rows, &fn.rope_deltas}) {
     out.activation_bytes += bytes(*buffer);
   }
   out.verify_round_bytes = fn.verify != nullptr ? fn.verify->device_bytes() : 0;
+  out.media_embedding_bytes = model.vision_pool.device_bytes();
   return out;
 }
 
@@ -758,9 +812,41 @@ int32_t finish_load(ignis_model &model, std::string *error) {
     fn.shared_h = buffer(rows * g.shared_intermediate * sizeof(__nv_bfloat16));
     fn.shared_out = buffer(rows * g.hidden * sizeof(float));
     fn.round_inputs = std::make_unique<ninfer::PinnedHostBuffer>(round_inputs_layout(fn).total);
+    if (fn.vision()) {
+      const auto chunk = static_cast<std::size_t>(fn.prefill_chunk_tokens);
+      fn.rope_positions = buffer(3 * chunk * sizeof(int32_t));
+      fn.media_rows = buffer(chunk * sizeof(int32_t));
+      fn.rope_deltas = buffer(lanes * sizeof(int32_t));
+    }
   } catch (const std::exception &e) {
     *error = std::string("Flash-Next's reservations: ") + e.what();
     return -1;
+  }
+  // GitHub #557: the embedding pool, the 27B's pages at this model's width: in VRAM, or under the
+  // host residency in mapped pinned host memory, which the host plan counted -- a host that will
+  // not pin it fails the load, never moving the pool to the device.
+  if (fn.vision()) {
+    VisionEmbeddingPool &pool = model.vision_pool;
+    pool.page_columns = IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS;
+    pool.page_bytes = static_cast<std::size_t>(g.hidden) * IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS * sizeof(std::uint16_t);
+    const auto bytes = static_cast<std::size_t>(fn.vision_pool_bytes);
+    try {
+      if (fn.vision_pool_host) {
+        pool.mapped = std::make_unique<MappedHostRegion>(bytes);
+      } else {
+        pool.buffer = std::make_unique<ninfer::DeviceBuffer>(bytes);
+      }
+    } catch (const std::exception &e) {
+      *error = std::string("the embedding pool of ") + std::to_string(bytes) + " bytes in " +
+               (fn.vision_pool_host ? "mapped host memory" : "VRAM") + ": " + e.what() +
+               (fn.vision_pool_host ? " -- keep it in VRAM (--vision-residency device) or turn vision off"
+                                    : " -- lower --vision-embedding-pool or --vision-max-tokens");
+      return -1;
+    }
+    pool.owner.assign(bytes / pool.page_bytes, nullptr);
+    if (!check_cuda(cudaMemset(fn.rope_deltas->p, 0, fn.rope_deltas->bytes), "zeroing the rope deltas", error)) {
+      return -1;
+    }
   }
   if (fn.speculative_backend != IGNIS_SPECULATIVE_NONE) {
     fn.verify = verify::create(g, fn.kv_format, fn.decode_lanes, fn.draft_tokens, fn.draft_row_budget,
@@ -846,6 +932,14 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
                     " is outside the vocabulary");
     }
   }
+  // GitHub #557: what the span rotates at -- a multimodal span's three axes, a text span on a
+  // sequence after an image its positions plus the sequence's rope delta (the 27B's three-way
+  // pick, gqa_layer.cu), every other span its positions, as before -- and the media columns its
+  // placeholder rows take.
+  if (const std::string why = multimodal_refusal(*model, *options, num_tokens); !why.empty()) return refuse(why);
+  const bool multimodal = options->mrope_positions != nullptr;
+  const bool shifted = !multimodal && seq->rope_delta != 0;
+  if (shifted && !fn.vision()) return refuse("a sequence with a rope delta on a load without vision");
   const auto began = std::chrono::steady_clock::now();
   cudaStream_t stream = model->stream;
   Views views = views_of(fn, pool);
@@ -881,7 +975,57 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
       batch.slots = static_cast<const int32_t *>(fn.slots->p);
       batch.positions = static_cast<const int32_t *>(fn.positions->p);
       batch.max_visible = position + chunk;
-      if (forward(fn, views.ctx, batch, IGNIS_RESIDENCY_PREFILL, *model->scratch, stream, &error) != 0) {
+      // GitHub #557: the chunk's slice of the span's three axes (axis-major [3][chunk]), or the
+      // sequence's rope delta; and its media columns, a run per pool page they sit in (the 27B's
+      // run_program_chunk, step.cu).
+      if (multimodal) {
+        auto *axes = static_cast<int32_t *>(fn.rope_positions->p);
+        for (uint64_t axis = 0; axis < 3; ++axis) {
+          if (!check_cuda(cudaMemcpyAsync(axes + axis * static_cast<uint64_t>(chunk),
+                                          options->mrope_positions + axis * num_tokens + offset,
+                                          chunk * sizeof(int32_t), cudaMemcpyHostToDevice, stream),
+                          "staging the chunk's three axes", &error)) {
+            return false;
+          }
+        }
+        batch.rope_positions = axes;
+      } else if (shifted) {
+        if (!check_cuda(cudaMemcpyAsync(fn.rope_deltas->p, &seq->rope_delta, sizeof(int32_t), cudaMemcpyHostToDevice,
+                                        stream),
+                        "staging the rope delta", &error)) {
+          return false;
+        }
+        batch.rope_deltas = static_cast<const int32_t *>(fn.rope_deltas->p);
+      }
+      std::vector<MediaRun> media;
+      std::vector<int32_t> media_rows;
+      if (options->media != nullptr) {
+        const int32_t *scatter = options->media_scatter_indices;
+        const int32_t *scatter_end = scatter + options->media_column_count;
+        const int32_t *first = std::lower_bound(scatter, scatter_end, static_cast<int32_t>(offset));
+        const int32_t *past = std::lower_bound(first, scatter_end, static_cast<int32_t>(offset) + chunk);
+        const auto count = static_cast<int32_t>(past - first);
+        for (int32_t i = 0; i < count; ++i) media_rows.push_back(first[i] - static_cast<int32_t>(offset));
+        if (count > 0 &&
+            !check_cuda(cudaMemcpyAsync(fn.media_rows->p, media_rows.data(), media_rows.size() * sizeof(int32_t),
+                                        cudaMemcpyHostToDevice, stream),
+                        "staging the chunk's media rows", &error)) {
+          return false;
+        }
+        const VisionEmbeddingPool &vision_pool = model->vision_pool;
+        const auto column = static_cast<int32_t>(options->media_first_column) + static_cast<int32_t>(first - scatter);
+        for (int32_t done = 0; done < count;) {
+          const int32_t at = column + done;
+          const int32_t within = at % vision_pool.page_columns;
+          const int32_t take = std::min(count - done, vision_pool.page_columns - within);
+          media.push_back(MediaRun{
+              vision_pool.page_ptr(options->media->pages[static_cast<std::size_t>(at / vision_pool.page_columns)]) +
+                  static_cast<std::size_t>(within) * g.hidden * sizeof(std::uint16_t),
+              static_cast<const int32_t *>(fn.media_rows->p) + done, take});
+          done += take;
+        }
+      }
+      if (forward(fn, views.ctx, batch, IGNIS_RESIDENCY_PREFILL, *model->scratch, stream, &error, &media) != 0) {
         return false;
       }
       // Test-only residual-stack tap (kernel/include/ignis_fn_residual_tap.h): one flag load when
@@ -967,12 +1111,16 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
                                               cudaMemcpyHostToDevice, stream),
                               "staging the next token", &error));
         if (!staged) return false;
+        const Batch &trunk = batch;
         Batch batch;
         batch.lanes = 1;
         batch.tokens = chunk;
         batch.slots = static_cast<const int32_t *>(fn.slots->p);
         batch.positions = static_cast<const int32_t *>(fn.positions->p);
         batch.max_visible = position + chunk;
+        // GitHub #557: the head rotates where the trunk did (its vision rows are #564's).
+        batch.rope_positions = trunk.rope_positions;
+        batch.rope_deltas = trunk.rope_deltas;
         if (mtp_entries(fn, views.ctx, batch, next, *model->scratch, stream, &error) != 0) return false;
       }
       return check_cuda(cudaStreamSynchronize(stream), "the chunk's synchronize", &error);
@@ -1008,6 +1156,9 @@ int32_t program_prefill(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq
   } else if (step::redirect_span_draw(pool, seq, *sampling, stream, options->out_reasoning_redirected) != 0) {
     return -1;
   }
+  // GitHub #557: a multimodal span's rope delta is the sequence's: every later round, and every
+  // later text span, rotates at its position plus it.
+  if (multimodal) seq->rope_delta = options->rope_delta;
   model->last_step_micros = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - began).count());
   model->last_step_kernel_count = static_cast<uint64_t>(g.layers);
@@ -1032,6 +1183,9 @@ int32_t run_round(ignis_model *model, FlashNextModel &fn, const Context &ctx, ui
   batch.slots = static_cast<const int32_t *>(fn.slots->p);
   batch.positions = static_cast<const int32_t *>(fn.positions->p);
   batch.max_visible = decode_max_visible(fn);
+  // GitHub #557: a vision load's lanes rotate at their positions plus their rope deltas (0 for a
+  // lane that never saw an image), staged with the positions.
+  batch.rope_deltas = fn.vision() ? static_cast<const int32_t *>(fn.rope_deltas->p) : nullptr;
   if (forward(fn, ctx, batch, IGNIS_RESIDENCY_DECODE, scratch, stream, error) != 0) {
     return -1;
   }
@@ -1107,7 +1261,7 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
   const auto width = static_cast<uint32_t>(batch_size);
   const auto vocab = static_cast<int32_t>(g.vocab);
   std::vector<ninfer::ops::SamplingConfig> configs(batch_size);
-  std::vector<int32_t> ids(batch_size), slots(batch_size), positions(batch_size);
+  std::vector<int32_t> ids(batch_size), slots(batch_size), positions(batch_size), rope_deltas(batch_size);
   std::vector<int32_t> permitted(batch_size * IGNIS_MAX_PERMITTED_TOKENS, -1), permitted_counts(batch_size, 0);
   bool constrained = false;
   for (uint64_t i = 0; i < batch_size; ++i) {
@@ -1119,6 +1273,8 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
     if (seq->position >= ignis_seq_token_capacity(*seq) || seq->position >= fn.max_context_tokens) {
       return refuse("sequence reached its KV capacity" + at);
     }
+    if (seq->rope_delta != 0 && !fn.vision()) return refuse("a sequence with a rope delta on a load without vision" + at);
+    rope_deltas[i] = seq->rope_delta;
     if (!step::sampling_size_ok(sampling[i])) return refuse("unrecognized ignis_sampling_params size" + at);
     if (!step::redirect_inputs_ok(sampling[i])) return refuse("stop_ids is null with a count" + at);
     const ignis_sampling_params &lane = sampling[i];
@@ -1157,6 +1313,7 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
   const void *src_ngram = options->ngram_rows;
   const void *src_permitted = permitted.data();
   const void *src_counts = permitted_counts.data();
+  const void *src_rope_deltas = rope_deltas.data();
   // GitHub #306, step 7: the copies' sources gathered into page-locked memory first, so each
   // copy is queued without the driver's pageable staging pass (fusion.h's Staging). The buffer
   // is rewritten only after the previous round's synchronize.
@@ -1176,6 +1333,7 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
       src_permitted = put(at.permitted, permitted.data(), permitted_bytes);
       src_counts = put(at.counts, permitted_counts.data(), lane_bytes);
     }
+    if (fn.vision()) src_rope_deltas = put(at.rope_deltas, rope_deltas.data(), lane_bytes);
   }
   std::string error;
   const bool staged =
@@ -1193,6 +1351,9 @@ int32_t program_decode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
                  "staging the positions", &error) &&
       check_cuda(cudaMemcpyAsync(fn.ngram_rows->p, src_ngram, batch_size * row_bytes, cudaMemcpyHostToDevice, stream),
                  "staging the n-gram rows", &error) &&
+      (!fn.vision() || check_cuda(cudaMemcpyAsync(fn.rope_deltas->p, src_rope_deltas, lane_bytes,
+                                                  cudaMemcpyHostToDevice, stream),
+                                  "staging the rope deltas", &error)) &&
       (!constrained ||
        (check_cuda(cudaMemcpyAsync(model->sampling_decode_permitted->p, src_permitted, permitted_bytes,
                                    cudaMemcpyHostToDevice, stream),

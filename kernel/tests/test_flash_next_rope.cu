@@ -6,7 +6,11 @@
 //   queries   indexer::prepare_queries (rope_row on the 4 query heads) at the same positions;
 //   keys      indexer::append_keys (rope_row on a pooled block key, at its block's first
 //             position) for the blocks starting at 0, 262,140, 262,144, 589,820 and 1,048,572;
-//   select    indexer::select over a 2,600-token prefill: every sparse row's 512 blocks.
+//   select    indexer::select over a 2,600-token prefill: every sparse row's 512 blocks;
+//   sources   (GitHub #557) qsa::prepare at a span's three axes (pair i at axis i % 3, the
+//             checkpoint's interleaved M-RoPE), at a lane's position plus its rope delta (decode
+//             and verify after an image), and -- bit for bit the plain call -- at three equal
+//             axes and at a delta of 0.
 //
 // Each against a host restatement of the checkpoint's arithmetic: the (1 + w) RMSNorm in fp32
 // rounded once to BF16 -- exact here, since the inputs sit on a half-integer grid whose squares
@@ -36,6 +40,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -143,12 +148,16 @@ struct Restated {
   int ambiguous_pairs = 0;
 };
 
-Restated restate(const std::vector<float> &normed, const ix::Rope &rope, int32_t position) {
+// GitHub #557: a row roped at three axes' positions, pair i (dims i, i + 32) at axis i % 3 -- the
+// checkpoint's interleaved M-RoPE (Qwen4ExpTextRotaryEmbedding's recomposition of mrope_section
+// [11, 11, 10], checked against transformers 5.17: one frequency table, and YaRN's attention factor
+// on every axis alike). A text row is the same position on all three.
+Restated restate_axes(const std::vector<float> &normed, const ix::Rope &rope, const std::array<int32_t, 3> &axes) {
   Restated out;
   out.allowed.resize(normed.size());
   for (std::size_t d = 64; d < normed.size(); ++d) out.allowed[d] = {f32_to_bf16(normed[d])};
   for (int i = 0; i < 32; ++i) {
-    const float phi = static_cast<float>(position) * rope.inv_freq[i];
+    const float phi = static_cast<float>(axes[i % 3]) * rope.inv_freq[i];
     const std::vector<float> cs = trig_candidates(std::cos(static_cast<double>(phi)), rope.scale);
     const std::vector<float> sn = trig_candidates(std::sin(static_cast<double>(phi)), rope.scale);
     out.ambiguous_pairs += cs.size() > 1 || sn.size() > 1;
@@ -167,6 +176,10 @@ Restated restate(const std::vector<float> &normed, const ix::Rope &rope, int32_t
   return out;
 }
 
+Restated restate(const std::vector<float> &normed, const ix::Rope &rope, int32_t position) {
+  return restate_axes(normed, rope, {position, position, position});
+}
+
 // What the device rows say against their restatements, over a whole arm.
 struct Tally {
   long values = 0, mismatches = 0, rotary = 0, rotary_as_linear = 0, ambiguous_pairs = 0;
@@ -183,12 +196,14 @@ struct Tally {
       }
     }
   }
-  void report(const std::string &arm) const {
-    std::printf("  %s: %ld values, %ld outside the restatement, %ld/%ld rotary values the linear table's, %ld "
+  // `linear`: what the alternative restatement add() was handed is (GitHub #557's arms hand it
+  // another position, not another table).
+  void report(const std::string &arm, const std::string &linear = "the linear table's") const {
+    std::printf("  %s: %ld values, %ld outside the restatement, %ld/%ld rotary values %s, %ld "
                 "ambiguous pairs\n",
-                arm.c_str(), values, mismatches, rotary_as_linear, rotary, ambiguous_pairs);
+                arm.c_str(), values, mismatches, rotary_as_linear, rotary, linear.c_str(), ambiguous_pairs);
     check(values > 0 && mismatches == 0, arm + ": every value is the restatement's");
-    check(rotary_as_linear * 10 < rotary, arm + ": the rotary values are not the linear table's");
+    check(rotary_as_linear * 10 < rotary, arm + ": the rotary values are not " + linear);
   }
 };
 
@@ -278,6 +293,160 @@ int main() {
       }
     }
     tally.report("prepare (q and k)");
+  }
+
+  // ---- prepare's rotation sources (GitHub #557): three axes, a rope delta, neither -----------
+  // A span with an image rotates each token at its three axes (batch.rope_positions, axis-major
+  // [3][rows]); a lane after an image at its position plus its rope delta (batch.rope_deltas
+  // [lanes]: decode and verify); every other call at its positions, as before. The positions stay
+  // the KV index and rotate nothing once a source is named. The axes and deltas are far apart, so
+  // they move the rotary pairs they reach (the YaRN table throughout).
+  {
+    constexpr int D = qsa::kHeadDim;
+    constexpr int kRows = 8;
+    const std::vector<uint16_t> qg = grid(31, static_cast<std::size_t>(kRows) * qsa::kQProjWidth);
+    const std::vector<uint16_t> k = grid(32, static_cast<std::size_t>(kRows) * qsa::kKvWidth);
+    const std::vector<uint16_t> q_norm = norm_weights(33, D), k_norm = norm_weights(34, D);
+    auto d_q_norm = device_copy(q_norm);
+    auto d_k_norm = device_copy(k_norm);
+    DeviceBytes d_axes(3 * kRows * 4), d_deltas(kRows * 4);
+    struct Out {
+      std::vector<uint16_t> q, k;
+      bool operator==(const Out &o) const { return q == o.q && k == o.k; }
+    };
+    // prepare over the kRows rows at `batch` (lane-major); k is normed in place, so every call
+    // starts from the same inputs.
+    const auto run = [&](const fn::Batch &batch) {
+      auto d_qg = device_copy(qg);
+      auto d_k = device_copy(k);
+      DeviceBytes d_q(static_cast<std::size_t>(kRows) * qsa::kOutWidth * 2);
+      IX_OK(qsa::prepare(g, rope, d_q_norm->p, d_k_norm->p, batch, d_qg->as<__nv_bfloat16>(),
+                         d_q.as<__nv_bfloat16>(), d_k->as<__nv_bfloat16>(), stream));
+      MOE_CUDA(cudaStreamSynchronize(stream));
+      return Out{download<uint16_t>(d_q.p, static_cast<std::size_t>(kRows) * qsa::kOutWidth),
+                 download<uint16_t>(d_k->p, static_cast<std::size_t>(kRows) * qsa::kKvWidth)};
+    };
+    // Every head of row r against its restatement at `want` and, for the tally's bar, at `other`.
+    const auto tally_row = [&](Tally &tally, const Out &out, int r, const std::array<int32_t, 3> &want,
+                               const std::array<int32_t, 3> &other) {
+      for (int h = 0; h < qsa::kQHeads; ++h) {
+        const std::vector<float> n = norm(widen(&qg[(static_cast<std::size_t>(r) * qsa::kQHeads + h) * 2 * D], D), q_norm);
+        tally.add(&out.q[(static_cast<std::size_t>(r) * qsa::kQHeads + h) * D], restate_axes(n, rope, want),
+                  restate_axes(n, rope, other));
+      }
+      for (int h = 0; h < qsa::kKvHeads; ++h) {
+        const std::vector<float> n = norm(widen(&k[(static_cast<std::size_t>(r) * qsa::kKvHeads + h) * D], D), k_norm);
+        tally.add(&out.k[(static_cast<std::size_t>(r) * qsa::kKvHeads + h) * D], restate_axes(n, rope, want),
+                  restate_axes(n, rope, other));
+      }
+    };
+    const auto flat = [](int32_t p) { return std::array<int32_t, 3>{p, p, p}; };
+
+    // Three axes: one lane's span at KV positions 1000.., every token's (t, h, w) distinct.
+    const std::array<int32_t, 3> axes[kRows] = {{0, 17, 589823},       {262143, 5, 70000},  {300000, 1048575, 3},
+                                                {99999, 524288, 42},   {123456, 654321, 7}, {42, 262145, 1000000},
+                                                {2, 524287, 262144},   {777777, 1, 31337}};
+    std::vector<int32_t> axis_major(3 * kRows);
+    for (int r = 0; r < kRows; ++r) {
+      for (int a = 0; a < 3; ++a) axis_major[static_cast<std::size_t>(a) * kRows + r] = axes[r][a];
+    }
+    upload(d_axes, axis_major);
+    upload(d_positions, std::vector<int32_t>{1000});
+    fn::Batch span;
+    span.lanes = 1;
+    span.tokens = kRows;
+    span.positions = d_positions.as<int32_t>();
+    span.rope_positions = d_axes.as<int32_t>();
+    const Out three = run(span);
+    Tally tally;
+    long off_axis = 0, off_axis_as_t = 0;
+    for (int r = 0; r < kRows; ++r) {
+      tally_row(tally, three, r, axes[r], flat(1000 + r));
+      // The pairs on axes 1 and 2 (i % 3 != 0) are not where axis 0's position puts them.
+      for (int h = 0; h < qsa::kQHeads; ++h) {
+        const std::vector<float> n = norm(widen(&qg[(static_cast<std::size_t>(r) * qsa::kQHeads + h) * 2 * D], D), q_norm);
+        const Restated t_only = restate_axes(n, rope, flat(axes[r][0]));
+        const uint16_t *got = &three.q[(static_cast<std::size_t>(r) * qsa::kQHeads + h) * D];
+        for (int i = 0; i < 32; ++i) {
+          if (i % 3 == 0) continue;
+          for (int d : {i, i + 32}) {
+            ++off_axis;
+            const auto &set = t_only.allowed[d];
+            off_axis_as_t += std::find(set.begin(), set.end(), got[d]) != set.end();
+          }
+        }
+      }
+    }
+    tally.report("prepare at three axes", "the KV position's");
+    std::printf("  prepare at three axes: %ld/%ld values of the pairs on axes 1 and 2 axis 0's\n", off_axis_as_t,
+                off_axis);
+    check(off_axis_as_t * 10 < off_axis, "prepare at three axes: pair i rotates at axis i % 3, not at axis 0");
+
+    // Neither, three equal axes, and deltas of zero: the same bytes -- the text path, bit for bit.
+    const int32_t first = 262140;
+    upload(d_positions, std::vector<int32_t>{first});
+    fn::Batch plain;
+    plain.lanes = 1;
+    plain.tokens = kRows;
+    plain.positions = d_positions.as<int32_t>();
+    const Out text = run(plain);
+    for (int r = 0; r < kRows; ++r) {
+      for (int a = 0; a < 3; ++a) axis_major[static_cast<std::size_t>(a) * kRows + r] = first + r;
+    }
+    upload(d_axes, axis_major);
+    fn::Batch equal = plain;
+    equal.rope_positions = d_axes.as<int32_t>();
+    check(run(equal) == text, "three equal axes rotate bit for bit as the positions do");
+    upload(d_deltas, std::vector<int32_t>{0});
+    fn::Batch zero = plain;
+    zero.rope_deltas = d_deltas.as<int32_t>();
+    check(run(zero) == text, "a rope delta of 0 rotates bit for bit as the positions do");
+    Tally text_tally;
+    for (int r = 0; r < kRows; ++r) tally_row(text_tally, text, r, flat(first + r), flat(first + r + 600000));
+    text_tally.report("prepare at the positions", "another position's");
+
+    // A rope delta: 8 decode lanes of one token, and 4 verify lanes of 2 columns.
+    const int32_t decode_positions[kRows] = {0, 9, 64, 262143, 600000, 500000, 1048000, 77};
+    const int32_t decode_deltas[kRows] = {400000, 600000, 900000, 500000, -450000, -480000, -1000000, 1500000};
+    upload(d_positions, std::vector<int32_t>(decode_positions, decode_positions + kRows));
+    upload(d_deltas, std::vector<int32_t>(decode_deltas, decode_deltas + kRows));
+    fn::Batch decode;
+    decode.lanes = kRows;
+    decode.tokens = 1;
+    decode.positions = d_positions.as<int32_t>();
+    decode.rope_deltas = d_deltas.as<int32_t>();
+    const Out decoded = run(decode);
+    Tally decode_tally;
+    for (int r = 0; r < kRows; ++r) {
+      tally_row(decode_tally, decoded, r, flat(decode_positions[r] + decode_deltas[r]), flat(decode_positions[r]));
+    }
+    decode_tally.report("prepare at a rope delta (decode)", "the position's alone");
+    const int32_t verify_positions[4] = {1000, 300, 262143, 7000};
+    const int32_t verify_deltas[4] = {499000, 700000, -262000, 1200000};
+    upload(d_positions, std::vector<int32_t>(verify_positions, verify_positions + 4));
+    upload(d_deltas, std::vector<int32_t>(verify_deltas, verify_deltas + 4));
+    fn::Batch verify;
+    verify.lanes = 4;
+    verify.tokens = 2;
+    verify.positions = d_positions.as<int32_t>();
+    verify.rope_deltas = d_deltas.as<int32_t>();
+    const Out verified = run(verify);
+    Tally verify_tally;
+    for (int r = 0; r < kRows; ++r) {
+      const int32_t position = verify_positions[r / 2] + r % 2;
+      tally_row(verify_tally, verified, r, flat(position + verify_deltas[r / 2]), flat(position));
+    }
+    verify_tally.report("prepare at a rope delta (verify)", "the position's alone");
+
+    // One source at a time: a batch naming both is refused.
+    fn::Batch both = span;
+    both.rope_deltas = d_deltas.as<int32_t>();
+    DeviceBytes d_q(static_cast<std::size_t>(kRows) * qsa::kOutWidth * 2);
+    auto d_qg = device_copy(qg);
+    auto d_k = device_copy(k);
+    check(qsa::prepare(g, rope, d_q_norm->p, d_k_norm->p, both, d_qg->as<__nv_bfloat16>(), d_q.as<__nv_bfloat16>(),
+                       d_k->as<__nv_bfloat16>(), stream) != nullptr,
+          "a batch naming three axes and a rope delta is refused");
   }
 
   const std::vector<uint16_t> ix_q_norm = norm_weights(21, kIxHd), ix_k_norm = norm_weights(22, kIxHd);

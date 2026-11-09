@@ -297,8 +297,20 @@ struct Batch {
   // GDN, indexer and n-gram sections).
   const int32_t *slots = nullptr;
   // DEVICE [lanes]: each sequence's position of its first token in the call
-  // (its frontier before the call). Token t of a lane is at positions[l] + t.
+  // (its frontier before the call). Token t of a lane is at positions[l] + t:
+  // its KV index, its causal frontier and its hq dither row, and -- unless
+  // one of the two below is named -- what the attention rotates it at.
   const int32_t *positions = nullptr;
+  // GitHub #557: where the attention rotates instead, at most one of the two
+  // (the 27B's three-way pick, gqa_layer.cu). DEVICE, axis-major [3][rows]: a
+  // span of a multimodal prompt's three axes per token, pair i of the rotary
+  // quarter at axis i % 3 (the checkpoint's interleaved M-RoPE) -- an image's
+  // tokens at its start plus their row and column, text equal on all three.
+  const int32_t *rope_positions = nullptr;
+  // DEVICE [lanes]: each lane's rope delta, its tokens rotated at their
+  // positions plus it on all three axes -- decode and verify after an image
+  // (ignis_seq::rope_delta), staged beside the positions.
+  const int32_t *rope_deltas = nullptr;
   // HOST: an upper bound of positions[l] + tokens over the call's lanes. Exact
   // in prefill (eager: a call may branch on it, e.g. skip the indexer while
   // dense); in decode the graph's own bound, so a decode call never branches

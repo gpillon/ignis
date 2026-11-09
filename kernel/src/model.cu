@@ -1380,8 +1380,11 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
 
   // GitHub #302: Flash-Next binds its own schema (kernel/src/flash_next/
   // bind.cu) into its own program (kernel/src/flash_next/program.h), and has
-  // no drafter, vision tower or attention readouts. Its decode lanes and its
-  // residency are its options alone.
+  // no drafter or attention readouts. Its decode lanes and its residency are
+  // its options alone. GitHub #557: with vision, its embedding pool is the
+  // 27B's rule -- floored at the envelope's own output, whole pages, in VRAM
+  // or mapped host memory by the vision residency -- at its own hidden width;
+  // its encoder is the vision companion's (ADR 0087).
   if (flash_next) {
     if (prefill_attention != IGNIS_PREFILL_ATTENTION_FP8) {
       set_error("ignis_model_load: prefill_attention is the 27B's; Qwen3.8-Flash-Next's attention is QSA");
@@ -1391,10 +1394,16 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
       set_error("ignis_model_load: prefill_linear is the 27B's; Qwen3.8-Flash-Next has its own prefill");
       return nullptr;
     }
-    if (vision_max_tokens != 0 || attention_text_max_keys != 0) {
-      set_error("ignis_model_load: Qwen3.8-Flash-Next has no vision or attention readouts");
+    if (attention_text_max_keys != 0) {
+      set_error("ignis_model_load: Qwen3.8-Flash-Next has no attention readouts");
       return nullptr;
     }
+    const uint64_t vision_pool_bytes =
+        vision_max_tokens == 0
+            ? 0
+            : vision_embedding_pool_bytes(static_cast<std::int64_t>(topology->hidden),
+                                          static_cast<std::int32_t>(std::min(vision_max_tokens, max_context_tokens)),
+                                          vision_embedding_pool_request);
     // GitHub #307 (spec flash-next/07): MTP, or the verify round alone for a
     // test's drafts; DFlash2 is the 27B's.
     if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
@@ -1404,7 +1413,8 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     std::string error;
     auto program = ignis::flash_next::bind_model(tensors, count, *topology, prefill_chunk_tokens,
                                                  max_context_tokens, kv_format, options, rope_scaling,
-                                                 &error);
+                                                 vision_pool_bytes,
+                                                 vision_residency == IGNIS_VISION_RESIDENCY_HOST, &error);
     if (program == nullptr) {
       set_error("ignis_model_load: " + error);
       return nullptr;

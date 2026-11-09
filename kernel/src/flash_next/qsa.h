@@ -74,6 +74,8 @@ Status check_geometry(const Geometry &g);
 
 // qg: the q_proj output, BF16 [rows][kQHeads][512]; k: the k_proj output, BF16 [rows][kKvHeads]
 // [256], normed and roped in place; q: BF16 [rows][kQHeads][256], the normed, roped queries.
+// Roped at the batch's rotation source (GitHub #557): its rope_positions' three axes, its
+// positions plus its rope_deltas, or its positions; a batch naming both sources is refused.
 // Graph-safe.
 Status prepare(const Geometry &g, const indexer::Rope &rope, const void *q_norm, const void *k_norm,
                const Batch &batch, const __nv_bfloat16 *qg, __nv_bfloat16 *q, __nv_bfloat16 *k,

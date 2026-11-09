@@ -815,6 +815,12 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     set_error("ignis_media_encode: the model was loaded without vision");
     return -1;
   }
+  // GitHub #557: a pool is not an encoder -- a Flash-Next load holds its pool before its vision
+  // companion's tower is bound to it.
+  if (model->vision.patch_embedding.qdata == nullptr) {
+    set_error("ignis_media_encode: the load bound no vision tower");
+    return -1;
+  }
   if (input->patches == nullptr || input->position_ids == nullptr || input->cu_seqlens == nullptr ||
       input->position_table_indices == nullptr || input->position_table_weights == nullptr) {
     set_error("ignis_media_encode: null input array");
@@ -970,6 +976,64 @@ extern "C" int32_t ignis_media_embedding_read(const struct ignis_media_embedding
       return -1;
     }
   }
+  return 0;
+}
+
+// GitHub #557: the pool's rules as the encode keeps them -- the pages claimed before anything is
+// written and given back on any exit but the successful one, the columns in order, page_columns
+// a page -- with the caller's columns where the merger would write.
+extern "C" int32_t ignis_media_embedding_place(struct ignis_model *model, const void *columns, uint64_t columns_bytes,
+                                               struct ignis_media_embedding **out_embedding) {
+  if (out_embedding != nullptr) {
+    *out_embedding = nullptr;
+  }
+  if (model == nullptr || columns == nullptr || out_embedding == nullptr) {
+    set_error("ignis_media_embedding_place: null argument");
+    return -1;
+  }
+  VisionEmbeddingPool &pool = model->vision_pool;
+  if (!pool.present()) {
+    set_error("ignis_media_embedding_place: the model was loaded without vision");
+    return -1;
+  }
+  const std::size_t column_bytes = static_cast<std::size_t>(model->hidden) * sizeof(std::uint16_t);
+  if (columns_bytes == 0 || columns_bytes % column_bytes != 0) {
+    set_error("ignis_media_embedding_place: " + std::to_string(columns_bytes) + " bytes are no whole number of " +
+              std::to_string(column_bytes) + "-byte columns");
+    return -1;
+  }
+  const std::uint64_t count = columns_bytes / column_bytes;
+  const std::uint64_t want_pages = (count + static_cast<std::uint64_t>(pool.page_columns) - 1) / pool.page_columns;
+  if (want_pages > static_cast<std::uint64_t>(pool.pages())) {
+    set_error("ignis_media_embedding_place: " + std::to_string(count) + " columns need " + std::to_string(want_pages) +
+              " pages, and the pool holds " + std::to_string(pool.pages()));
+    return -1;
+  }
+  const auto wanted = static_cast<std::int32_t>(count);
+  const auto want = static_cast<std::int32_t>(want_pages);
+  auto embedding = std::make_unique<ignis_media_embedding>();
+  embedding->model = model;
+  embedding->columns = wanted;
+  embedding->pages = pool.take(want, embedding.get());
+  if (embedding->pages.empty()) {
+    set_error("ignis_media_embedding_place: " + std::to_string(want) + " pages wanted, " +
+              std::to_string(pool.free_pages()) + " free -- release an embedding first");
+    return IGNIS_MEDIA_ENCODE_POOL_FULL;
+  }
+  for (std::size_t p = 0; p < embedding->pages.size(); ++p) {
+    const auto first = static_cast<std::int32_t>(p) * pool.page_columns;
+    const std::int32_t take = std::min(pool.page_columns, wanted - first);
+    const cudaError_t err = cudaMemcpy(pool.page_ptr(embedding->pages[p]),
+                                       reinterpret_cast<const unsigned char *>(columns) +
+                                           static_cast<std::size_t>(first) * column_bytes,
+                                       static_cast<std::size_t>(take) * column_bytes, cudaMemcpyDefault);
+    if (err != cudaSuccess) {
+      pool.give(embedding->pages);
+      set_error(std::string("ignis_media_embedding_place: ") + cudaGetErrorString(err));
+      return -1;
+    }
+  }
+  *out_embedding = embedding.release();
   return 0;
 }
 
