@@ -720,9 +720,10 @@ python tools/flash-next-vision/convert.py build --main <main .ninfer> --work <ab
 
 The 27B tower's recipe (`tools/27b-nvfp4-converter`: its inventory, routes and encoders, run
 unchanged at Flash-Next's widths): the same 333 objects under the same names, each object kind
-in the same format and layout. The authority is
-`ignis_artifact::nvfp4_27b::vision_tower`, which both the 27B's NVFP4 inventory and
-`flash_next::vision::entries` call.
+in the same format and layout. The packer holds the work tree to
+`ignis_artifact::flash_next::vision::entries` (built by `nvfp4_27b::vision_tower`, which the
+27B's NVFP4 inventory calls too), and a test holds it, object for object, to what a load
+binds: `ignis_artifact::inventory::vision_scope(2560)`.
 
 | object | format | shape |
 |---|---|---|

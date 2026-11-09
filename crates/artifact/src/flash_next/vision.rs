@@ -34,7 +34,9 @@ pub fn fixture_geometry() -> VisionTower {
     VisionTower { hidden: 32, intermediate: 64, patch: 3 * 2 * 4 * 4, positions: 4 * 4, out_hidden: 64 }
 }
 
-/// The companion's objects in container order, at `tower`.
+/// The companion's objects in container order, at `tower`: what the packer
+/// holds the work tree to. At [`geometry`] they are the objects a load binds,
+/// [`crate::inventory::vision_scope`]`(2560)`, which a test holds them to.
 pub fn entries(tower: &VisionTower) -> Vec<Entry> {
     vision_tower(tower)
 }
@@ -59,28 +61,26 @@ pub fn check_identity(reader: &Reader) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inventory::vision_scope_27b;
+    use crate::inventory::{vision_scope, vision_scope_27b};
 
-    /// The 27B recipe at Flash-Next's widths: the served 27B tower's 333
-    /// objects, name for name and format for format, and every shape the
-    /// 27B's but the merger's output, 2,560 wide.
+    /// What the packer holds the companion to is what a load binds: at
+    /// Flash-Next's widths the inventory is `vision_scope(2560)` object for
+    /// object (name, format, layout, shape), the 27B tower's 333 objects with
+    /// the merger writing 2,560 rows where the 27B's writes 5,120.
     #[test]
-    fn the_companion_holds_the_27b_towers_objects_with_the_merger_2560_wide() {
+    fn the_companion_holds_the_objects_a_load_binds_with_the_merger_2560_wide() {
         let ours = entries(&geometry());
-        let served = vision_scope_27b();
+        let bound = vision_scope(2560);
         assert_eq!(ours.len(), 333);
-        assert_eq!(ours.len(), served.len());
-        for (entry, served) in ours.iter().zip(&served) {
+        assert_eq!(ours.len(), bound.len());
+        for (entry, bound) in ours.iter().zip(&bound) {
             let Entry::Tensor { name, format, layout, shape } = entry else {
                 panic!("{} is a resource", entry.name());
             };
-            assert_eq!((name.as_str(), *format, *layout), (served.name, served.format, served.layout));
-            let expected: &[u64] = match served.name {
-                "vision/merger/fc2" => &[2560, 4608],
-                "vision/merger/fc2_bias" => &[2560],
-                _ => served.shape,
-            };
-            assert_eq!(shape.as_slice(), expected, "{name}");
+            assert_eq!((name.as_str(), *format, *layout, shape.as_slice()), (bound.name, bound.format, bound.layout, bound.shape));
         }
+        let served = vision_scope_27b();
+        let differ: Vec<&str> = bound.iter().zip(&served).filter(|(f, s)| f.shape != s.shape).map(|(f, _)| f.name).collect();
+        assert_eq!(differ, ["vision/merger/fc2", "vision/merger/fc2_bias"]);
     }
 }
