@@ -79,6 +79,39 @@ pub const MEDIA_REQUEST_BODY_LIMIT: usize = 384 << 20;
 /// axum's own 2 MiB default sat *under* one max-context prompt.
 pub const TEXT_REQUEST_BODY_LIMIT: usize = 16 << 20;
 
+/// The request body limit of the model serving now: [`MEDIA_REQUEST_BODY_LIMIT`]
+/// while it takes images, [`TEXT_REQUEST_BODY_LIMIT`] otherwise.
+pub fn request_body_limit(media: bool) -> usize {
+    if media {
+        MEDIA_REQUEST_BODY_LIMIT
+    } else {
+        TEXT_REQUEST_BODY_LIMIT
+    }
+}
+
+/// Cap the request's body at the limit of the model serving when it arrives.
+/// A body past it fails as axum's own limit does, `413`, and a declared length
+/// past it is refused before a byte is read.
+async fn limit_request_body(State(server): State<Arc<Server>>, request: Request, next: Next) -> Response {
+    // The two forms that set the media limit on every load, whatever model
+    // serves, keep their own.
+    if matches!(request.uri().path(), "/v1/images/edits" | "/v1/audio/transcriptions") {
+        return next.run(request).await;
+    }
+    let limit = request_body_limit(server.active().media.is_some());
+    let declared = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if declared.is_some_and(|declared| declared > limit) {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let (parts, body) = request.into_parts();
+    let body = axum::body::Body::new(http_body_util::Limited::new(body, limit));
+    next.run(Request::from_parts(parts, body)).await
+}
+
 /// Build the OpenAI router for `server` (the axum state it serves behind).
 ///
 /// `TraceLayer` (GitHub #81, ADR 0012) is the HTTP-ingress root span for
@@ -101,17 +134,17 @@ pub fn router(state: Arc<Server>) -> Router {
         // Outermost (GitHub #129): a keyed server's readiness probe, which
         // sends no key, must see 503 until the warm-up has run, not a 401.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_serving));
-    // The body cap, enforced before JSON parsing: wider with `--vision-enabled`,
-    // which takes images inline as base64 data URIs (GitHub #179), than for
-    // a text-only load, which only ever carries a prompt (GitHub #230).
-    // Both are past what their own load can use, so the refusal an operator
-    // meets is the one that names the real limit -- the context, or the
-    // media budget -- rather than a byte count.
-    router = router.layer(axum::extract::DefaultBodyLimit::max(if state.active().media.is_some() {
-        MEDIA_REQUEST_BODY_LIMIT
-    } else {
-        TEXT_REQUEST_BODY_LIMIT
-    }));
+    // The body cap, enforced before JSON parsing: wider while the active model
+    // takes images inline as base64 data URIs (GitHub #179), than for a
+    // text-only one, which only ever carries a prompt (GitHub #230). It is
+    // read per request, off the model serving then, not once at router build:
+    // a switch changes which model that is, and with it whether images may
+    // arrive (#563). Both are past what their own load can use, so the
+    // refusal an operator meets is the one that names the real limit -- the
+    // context, or the media budget -- rather than a byte count.
+    router = router
+        .layer(middleware::from_fn_with_state(state.clone(), limit_request_body))
+        .layer(axum::extract::DefaultBodyLimit::disable());
     // The Playground (GitHub #163): present unless `--server-ui false` withheld the
     // assets -- served by default since ADR 0026's 2026-09-19 amendment.
     if let Some(assets) = state.playground {
@@ -2156,14 +2189,14 @@ struct SwitchAccepted {
     tag = "models",
     operation_id = "switch_model",
     summary = "Replace the loaded model",
-    description = "Unloads the model being served and loads `artifact` in its place under the id `model` — or, with `model` alone, the artifact the server knows it by: the `switch.known_models` entry for the id (which wins), else a catalog entry whose artifact is under `download.path` (`GET /v1/models/catalog` lists them, with whether each is switchable). `switch.allow_implicit` does not apply to that: it gates the switch a request triggers by naming a model. An id that is neither, or whose artifact is not on disk, is `404 model_not_found`; a switch never starts a download. An id sent alone is fitted to the card's class and GPU generation first (ADR 0064, ADR 0079), whether or not `switch.known_models` lists it, since both are its catalog entry's: a catalog entry whose `card_class` is above the card's is refused `409 model_above_card_class`, and one whose `generation` is newer than the card's `409 model_above_gpu_generation`, before anything is unloaded, unless another entry of its family answers to the id as an alias, fits, and holds an artifact whose header names that family — on a 16 GB card or an RTX 3090 `qwen3.8-27b` switches to `qwen3.8-27b-16g`, and `to` names it. A switch naming its `artifact` is the operator's word and is not fitted: only the VRAM plan guards it. The switch is on the same process: a full reload, the two models never resident together, every flag the server started with applied to the new load except one the new model does not take (`--vision-enabled` on Qwen3.8-Flash-Next, the other model's `--spec-backend` backend, the Flash-Next-only knobs), which is left off for it.\n\nAnswers `202` at once; the switch runs behind it. Meanwhile every other `/v1` route answers `503 model_switching` with `Retry-After`, and `GET /v1/models` reports `status: switching`. Requests already running on the old model get `--switch-drain-timeout` (30 s by default) to finish; any still running then ends with an `engine_error`. A target that can be refused without unloading anything — a path with no file, a checksum that is not clean, a model id of the other model, a flag it cannot take — leaves the old model serving. A target that fails to load after the old model was unloaded has the old model reloaded from its artifact; `GET /v1/models` reports `status: failed` until one of them serves.",
+    description = "Unloads the model being served and loads `artifact` in its place under the id `model` — or, with `model` alone, the artifact the server knows it by: the `switch.known_models` entry for the id (which wins), else a catalog entry whose artifact is under `download.path` (`GET /v1/models/catalog` lists them, with whether each is switchable). `switch.allow_implicit` does not apply to that: it gates the switch a request triggers by naming a model. An id that is neither, or whose artifact is not on disk, is `404 model_not_found`; a switch never starts a download. An id sent alone is fitted to the card's class and GPU generation first (ADR 0064, ADR 0079), whether or not `switch.known_models` lists it, since both are its catalog entry's: a catalog entry whose `card_class` is above the card's is refused `409 model_above_card_class`, and one whose `generation` is newer than the card's `409 model_above_gpu_generation`, before anything is unloaded, unless another entry of its family answers to the id as an alias, fits, and holds an artifact whose header names that family — on a 16 GB card or an RTX 3090 `qwen3.8-27b` switches to `qwen3.8-27b-16g`, and `to` names it. A switch naming its `artifact` is the operator's word and is not fitted: only the VRAM plan guards it. The switch is on the same process: a full reload, the two models never resident together, every flag the server started with applied to the new load except one the new model does not take (the other model's `--spec-backend` backend, the Flash-Next-only knobs), which is left off for it. Vision crosses the switch: a server started with `--vision-enabled` serves images on Qwen3.8-Flash-Next as on the 27B, and a switch to Flash-Next whose vision companion is missing beside its artifact, or is not its own, is refused `409 vision_companion_missing` naming the file, before anything is unloaded.\n\nAnswers `202` at once; the switch runs behind it. Meanwhile every other `/v1` route answers `503 model_switching` with `Retry-After`, and `GET /v1/models` reports `status: switching`. Requests already running on the old model get `--switch-drain-timeout` (30 s by default) to finish; any still running then ends with an `engine_error`. A target that can be refused without unloading anything — a path with no file, a checksum that is not clean, a model id of the other model, a flag it cannot take — leaves the old model serving. A target that fails to load after the old model was unloaded has the old model reloaded from its artifact; `GET /v1/models` reports `status: failed` until one of them serves.",
     request_body = SwitchRequest,
     responses(
         (status = 202, description = "The switch began.", body = SwitchAccepted),
         (status = 400, description = "`artifact` (when given) or `model` is empty.", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "`model` was sent alone and is not a known model or a catalog entry on disk (`model_not_found`); for a catalog entry not yet fetched the message names the `model download` command.", body = ApiError),
-        (status = 409, description = "A switch is already under way (`switch_in_progress`): switches are not queued. Or `model`, sent alone, is a catalog entry this card cannot load, and no entry that answers to it can: by its class (`model_above_card_class`, naming the entry's class and the card's) or by its GPU generation, alone or with its class (`model_above_gpu_generation`, naming the generation the entry needs and the card's name, compute capability and generation, ADR 0079): refused before anything is unloaded.", body = ApiError),
+        (status = 409, description = "A switch is already under way (`switch_in_progress`): switches are not queued. Or `model`, sent alone, is a catalog entry this card cannot load, and no entry that answers to it can: by its class (`model_above_card_class`, naming the entry's class and the card's) or by its GPU generation, alone or with its class (`model_above_gpu_generation`, naming the generation the entry needs and the card's name, compute capability and generation, ADR 0079): refused before anything is unloaded. Or the target is Flash-Next, vision is on and its vision companion is missing or not its own (`vision_companion_missing`, naming the file), refused before anything is unloaded.", body = ApiError),
         (status = 501, description = "This server was built without a model loader (`switch_unavailable`).", body = ApiError),
         (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`); or the server is stopping (`server_stopping`, with `Retry-After`): no switch begins, since the process would end under it.", body = ApiError),
     ),
@@ -2195,6 +2228,16 @@ async fn switch_model(State(server): State<Arc<Server>>, Json(req): Json<SwitchR
         }
     };
     let target = ModelSource { artifact, model };
+    // A companion the target needs and does not have (#563): refused here,
+    // naming the file, before the switch takes its slot or anything stops --
+    // the active model serves on. The load's own prepare asks again.
+    if let Some(switcher) = server.switcher.clone() {
+        let asked = target.clone();
+        let refusal = tokio::task::spawn_blocking(move || switcher.companion_refusal(&asked)).await.ok().flatten();
+        if let Some(reason) = refusal {
+            return error_response_naming(StatusCode::CONFLICT, "invalid_request_error", "vision_companion_missing", reason, Some("model"));
+        }
+    }
     match crate::model_switch::begin(&server, target) {
         Ok((started, _task)) => (
             StatusCode::ACCEPTED,

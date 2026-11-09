@@ -2509,6 +2509,21 @@ fn a_flash_next_switch_keeps_the_vision_residency_with_vision() {
     assert_eq!(fitted.vision.map(|v| v.residency()), Some(VisionResidency::Device));
 }
 
+/// GitHub #563: vision crosses a switch from the 27B to Flash-Next and back
+/// with its values and the media options, each fit made from the sources
+/// the server started with.
+#[test]
+fn vision_and_media_cross_a_switch_to_flash_next_and_back_unchanged() {
+    let started = config(&["--profile", "none", "--vision-enabled", "--vision-max-tokens", "8192", "--media-cache-mib", "64"]);
+    let (flash_next, dropped) = fit_to_family(&started, ModelFamily::FlashNext).unwrap();
+    assert!(dropped.is_empty(), "{dropped:?}");
+    assert_eq!(flash_next.vision.map(|v| v.max_tokens()), Some(8192));
+    assert_eq!(flash_next.media.cache_bytes, 64 << 20);
+    let (back, dropped) = fit_to_family(&flash_next, ModelFamily::Qwen38_27b).unwrap();
+    assert!(dropped.is_empty(), "{dropped:?}");
+    assert_eq!((back.vision, back.media), (started.vision, started.media));
+}
+
 /// GitHub #557: a built-in profile turns vision on for the 27B alone, so a
 /// vision or media knob named beside it is the 27B's, not a mistake: the
 /// start takes it, the 27B's load runs it, and Flash-Next's, whose vision
