@@ -410,6 +410,17 @@ uint32_t ignis_media_embedding_columns(const struct ignis_media_embedding *embed
 int32_t ignis_media_embedding_read(const struct ignis_media_embedding *embedding, void *out,
                                    uint64_t out_bytes);
 
+/* GitHub #557: read's inverse -- host `columns`, `columns_bytes` of them, a
+ * whole number of the model's `[hidden]` BF16 columns in column order, placed
+ * in the load's embedding pool as an embedding, where ignis_media_encode would
+ * write the tower's. Synchronous. What lets a test drive a multimodal prefill
+ * with columns it knows (a token's own embedding row over a placeholder, say)
+ * on a load whose tower is not bound. 0 and the handle,
+ * IGNIS_MEDIA_ENCODE_POOL_FULL as an encode's, or -1 with
+ * ignis_media_last_error. */
+int32_t ignis_media_embedding_place(struct ignis_model *model, const void *columns, uint64_t columns_bytes,
+                                    struct ignis_media_embedding **out_embedding);
+
 /* Release an embedding, freeing the load's reservation for the next item.
  * NULL is a no-op; the model must still be live. */
 void ignis_media_embedding_release(struct ignis_media_embedding *embedding);

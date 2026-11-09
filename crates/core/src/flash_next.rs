@@ -36,8 +36,8 @@ use crate::rope_scaling::RopeScaling;
 use crate::seq::{SeqPool, SeqPoolBudget};
 use crate::speculation::{FlashNextSpeculation, SpeculativeBackend};
 use crate::step::{
-    capture_decode_graphs, decode_flash_next, decode_flash_next_verify, prefill_flash_next, Redirect, SamplingParams,
-    VerifyLane,
+    capture_decode_graphs, decode_flash_next, decode_flash_next_verify, prefill_flash_next, MediaEmbedding,
+    MultimodalPrefill, Redirect, SamplingParams, VerifyLane,
 };
 
 /// The prefetch lookahead residency ranks per lane: the next layer's top 16.
@@ -96,6 +96,9 @@ pub struct EngineOptions {
     /// positions -- on attention, the indexer and the MTP head alike. The
     /// plan and the load are handed this one value.
     pub rope_scaling: RopeScaling,
+    /// Vision (GitHub #557, ADR 0087): the media embedding pool the forward
+    /// reads image rows from; `None`, a text load as before.
+    pub vision: Option<crate::vision::Vision>,
 }
 
 impl EngineOptions {
@@ -119,6 +122,7 @@ impl EngineOptions {
             decode_lanes: self.decode_lanes,
             speculation: self.speculation,
             rope_scaling: self.rope_scaling,
+            vision: self.vision,
         }
     }
 
@@ -209,6 +213,7 @@ impl Default for EngineOptions {
             kv_ram_arena_bytes: 0,
             speculation: None,
             rope_scaling: RopeScaling::NONE,
+            vision: None,
         }
     }
 }
@@ -656,6 +661,7 @@ impl FlashNextEngine {
                 &[],
                 Redirect::NONE,
                 &rows,
+                None,
                 Some(&mut logits),
                 None,
             )?;
@@ -687,9 +693,60 @@ impl FlashNextEngine {
             Redirect::NONE,
             &rows,
             None,
+            None,
             Some(&mut logits),
         )?;
         Ok(logits)
+    }
+
+    /// GitHub #557: `columns` (BF16 bits, `[count][hidden]`) placed in a
+    /// vision load's embedding pool as an embedding
+    /// ([`crate::step::MediaEmbedding::place`]): rows a test knows, for
+    /// [`FlashNextEngine::span`] to put over its placeholders.
+    pub fn place_media(&self, columns: &[u16]) -> Result<MediaEmbedding<'_>, String> {
+        MediaEmbedding::place(&self.model, columns)
+            .map_err(|(rc, message)| format!("place the media columns ({rc}): {message}"))
+    }
+
+    /// GitHub #557: `tokens` prefilled from position 0 on a fresh sequence as
+    /// one span -- of a multimodal prompt with `multimodal`, a text one
+    /// without -- its n-gram rows hashing `ngram_tokens` (the span's own ids
+    /// when `None`: a test's reference may embed other ids than it hashes).
+    /// Returns every position's BF16 logits, `[tokens][vocab]`, with the
+    /// standing sequence and its context, for rounds after it.
+    pub fn span(
+        &self,
+        tokens: &[u32],
+        ngram_tokens: Option<&[u32]>,
+        multimodal: Option<MultimodalPrefill<'_>>,
+    ) -> Result<(crate::seq::Seq<'_>, NgramContext, Vec<u16>), String> {
+        let hashed = ngram_tokens.unwrap_or(tokens);
+        if hashed.len() != tokens.len() {
+            return Err(format!("{} n-gram ids for {} tokens", hashed.len(), tokens.len()));
+        }
+        let mut seq = self.pool.alloc(self.options.max_context_tokens)?;
+        let mut context = self.table.new_context();
+        let mut rows = vec![0u8; tokens.len() * self.table.token_bytes()];
+        self.table.stage(&mut context, hashed, &mut rows)?;
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let mut logits = vec![0u16; tokens.len() * self.vocab()];
+        prefill_flash_next(
+            &self.model,
+            &self.pool,
+            &mut seq,
+            &ids,
+            0,
+            None,
+            false,
+            SamplingParams::greedy(),
+            &[],
+            Redirect::NONE,
+            &rows,
+            multimodal,
+            Some(&mut logits),
+            None,
+        )?;
+        Ok((seq, context, logits))
     }
 
     /// `tokens` prefilled from position 0 on a fresh sequence, returned so a
@@ -706,7 +763,7 @@ impl FlashNextEngine {
         let mut rows = vec![0u8; tokens.len() * self.table.token_bytes()];
         self.table.stage(&mut context, tokens, &mut rows)?;
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, None, false, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None)?;
+        prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, None, false, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None, None)?;
         Ok(seq)
     }
 
@@ -789,7 +846,7 @@ impl FlashNextEngine {
             let mut rows = vec![0u8; prompt.len() * self.table.token_bytes()];
             self.table.stage(&mut context, prompt, &mut rows)?;
             let ids: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, None, false, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None)?;
+            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, None, false, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None, None)?;
             seqs.push(seq);
             contexts.push(context);
         }
@@ -860,7 +917,7 @@ impl FlashNextEngine {
             let mut rows = vec![0u8; prompt.len() * self.table.token_bytes()];
             self.table.stage(&mut context, prompt, &mut rows)?;
             let ids: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, None, false, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None)?;
+            prefill_flash_next(&self.model, &self.pool, &mut seq, &ids, 0, None, false, SamplingParams::greedy(), &[], Redirect::NONE, &rows, None, None, None)?;
             seqs.push(seq);
             contexts.push(context);
         }
@@ -1002,21 +1059,25 @@ impl FlashNextEngine {
             Redirect::NONE,
             &rows,
             None,
+            None,
             Some(&mut logits),
         )?;
         Ok(logits)
     }
 
     /// One plain round over sequences [`generate_speculative`](Self::generate_speculative)
-    /// left standing (`contexts` theirs), each lane drawn under its own
-    /// sampling and permitted set, its logits copied to `out_logits` if `Some`
-    /// ([`decode_flash_next`]): a round no generate path runs, for a test of
-    /// what the leaf refuses (GitHub #329 item 5). Moves each sequence and
-    /// its context one token on, or neither when the round is refused.
+    /// (or [`FlashNextEngine::span`]) left standing (`contexts` theirs), each
+    /// lane drawn under its own sampling and permitted set, its logits copied
+    /// to `out_logits` if `Some` ([`decode_flash_next`]): a round no generate
+    /// path runs, for a test of what the leaf refuses (GitHub #329 item 5) or
+    /// of the round after an image (GitHub #557). Moves each sequence and its
+    /// context one token on, or neither when the round is refused.
     ///
-    /// Test-only: public because its one caller,
+    /// Test-only: public because its callers,
     /// `a_permitted_set_refuses_the_logits_copy` in
-    /// `tests/flash_next_speculative_gpu.rs`, is an integration test outside
+    /// `tests/flash_next_speculative_gpu.rs` and
+    /// `the_axes_and_the_rope_delta_reach_the_forward` in
+    /// `tests/flash_next_vision_forward_gpu.rs`, are integration tests outside
     /// the crate, and it reads the engine's private model, pool and n-gram
     /// table. No serving path calls it.
     #[doc(hidden)]

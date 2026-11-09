@@ -7,6 +7,9 @@
 // - The head is the final mixer then lm_head: bit for bit the two steps run
 //   apart (fn_hc_mix, fn_linear), so its wiring of rows and buffers is right;
 //   both steps have their own numeric tests.
+// - GitHub #557: a media item's columns replace their rows' embeddings in
+//   every stream, bit for bit, the other rows untouched, from a VRAM page and
+//   from a page in mapped host memory.
 //
 // GPU test (ADR 0006): no SKIP_RETURN_CODE, a missing device fails.
 
@@ -178,6 +181,63 @@ void head_case() {
   check(logits == apart, "the head is the final mixer then lm_head, bit for bit");
 }
 
+// GitHub #557: a media item's vision rows over its placeholders' embeddings -- each column into
+// every stream of its row, every other row as it was; from a VRAM page and from a page in mapped
+// host memory (the host residency's pool), read in place.
+void media_case(bool mapped) {
+  const std::string label = mapped ? "media columns (mapped host page)" : "media columns (VRAM page)";
+  const auto g = geometry();
+  uint32_t seed = mapped ? 31U : 32U;
+  const int32_t residual_rows = 7;
+  const std::size_t row_elems = static_cast<std::size_t>(kStreams) * kHidden;
+  std::vector<uint16_t> before(residual_rows * row_elems);
+  for (auto &x : before) x = bf16_bits(static_cast<float>(static_cast<int32_t>(lcg(seed) >> 20) - 2048) / 4096.0F);
+  // A page of 5 columns; the call takes the 3 from column 2 on.
+  constexpr int32_t kPage = 5, kFirst = 2, kCount = 3;
+  std::vector<uint16_t> page(static_cast<std::size_t>(kPage) * kHidden);
+  for (auto &x : page) x = bf16_bits(static_cast<float>(static_cast<int32_t>(lcg(seed) >> 20) - 2048) / 1024.0F);
+  const std::vector<int32_t> rows = {1, 4, 6};
+  void *host = nullptr;
+  const uint16_t *d_page = nullptr;
+  if (mapped) {
+    cuda_ok(cudaHostAlloc(&host, page.size() * 2, cudaHostAllocMapped | cudaHostAllocPortable), "cudaHostAlloc");
+    std::memcpy(host, page.data(), page.size() * 2);
+    void *device = nullptr;
+    cuda_ok(cudaHostGetDevicePointer(&device, host, 0), "cudaHostGetDevicePointer");
+    d_page = static_cast<const uint16_t *>(device);
+  } else {
+    d_page = upload(page);
+  }
+  auto *d_residual = upload(before);
+  auto *d_rows = upload(rows);
+  check(ignis::flash_next::fn_embed_columns(g, d_page + static_cast<std::size_t>(kFirst) * kHidden, d_rows, kCount,
+                                            residual_rows, d_residual, nullptr) == 0,
+        label + ": runs: " + ignis::flash_next::fn_last_error());
+  cuda_ok(cudaDeviceSynchronize(), "sync");
+  std::vector<uint16_t> after(before.size());
+  cuda_ok(cudaMemcpy(after.data(), d_residual, after.size() * 2, cudaMemcpyDeviceToHost), "download");
+  std::vector<uint16_t> want = before;
+  for (int32_t i = 0; i < kCount; ++i) {
+    for (int32_t s = 0; s < kStreams; ++s) {
+      std::memcpy(&want[static_cast<std::size_t>(rows[i]) * row_elems + static_cast<std::size_t>(s) * kHidden],
+                  &page[static_cast<std::size_t>(kFirst + i) * kHidden], static_cast<std::size_t>(kHidden) * 2);
+    }
+  }
+  int mismatched = 0;
+  for (std::size_t i = 0; i < want.size(); ++i) mismatched += after[i] != want[i] ? 1 : 0;
+  check(mismatched == 0, label + ": " + std::to_string(mismatched) +
+                             " elements differ from the columns in every stream of their rows, the rest untouched");
+  check(ignis::flash_next::fn_embed_columns(g, d_page, d_rows, 0, residual_rows, d_residual, nullptr) != 0,
+        label + ": a call of no columns is refused");
+  if (mapped) {
+    cudaFreeHost(host);
+  } else {
+    cudaFree(const_cast<uint16_t *>(d_page));
+  }
+  cudaFree(d_residual);
+  cudaFree(d_rows);
+}
+
 }  // namespace
 
 int main() {
@@ -194,6 +254,8 @@ int main() {
   embed_case(true);
   embed_case(false);
   head_case();
+  media_case(false);
+  media_case(true);
   if (g_failed != 0) {
     std::fprintf(stderr, "flash-next embed/head test: %d check(s) failed\n", g_failed);
     return 1;

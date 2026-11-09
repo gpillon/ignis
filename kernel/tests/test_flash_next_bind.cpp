@@ -313,12 +313,39 @@ int main() {
     const std::string unresident = ignis_model_last_error();
     check(loaded != 0 && model == nullptr && unresident.find("needs its expert residency") != std::string::npos,
           "a load without its residency is refused by name: got \"" + unresident + "\"");
+    // GitHub #557: vision on a Flash-Next load plans its embedding pool, as the 27B's: floored at
+    // the envelope's own output (8,192 columns of 2,560 BF16, 64 pages of 128 columns) and rounded
+    // up to whole pages, in VRAM under the device residency and none of it under the host's; and
+    // its activations grow by the forward's vision inputs alone (a chunk's three axes and media
+    // rows, a round's rope deltas: 98,304 + 32,768 + 256 bytes). The attention readouts stay the
+    // 27B's.
+    check(plan(nullptr) == "(planned)", "the text load plans again");
+    const uint64_t text_activations = out.activation_bytes;
     ignis_model_load_options vision{};
     vision.size = sizeof(vision);
     vision.vision_max_tokens = 8192;
-    const std::string refused = plan(&vision);
-    check(refused.find("Qwen3.8-Flash-Next has no vision or attention readouts") != std::string::npos,
-          "vision on a Flash-Next load is refused by name: got \"" + refused + "\"");
+    const std::string pooled = plan(&vision);
+    check(pooled == "(planned)" && out.media_embedding_bytes == 41943040 &&
+              out.activation_bytes == text_activations + 131328,
+          "vision on a Flash-Next load plans the envelope's pool and the vision inputs: got \"" + pooled + "\", " +
+              std::to_string(out.media_embedding_bytes) + " pool bytes, " +
+              std::to_string(out.activation_bytes - text_activations) + " more activation bytes");
+    vision.vision_embedding_pool_bytes = 50000000;
+    const std::string asked = plan(&vision);
+    check(asked == "(planned)" && out.media_embedding_bytes == 50462720,
+          "a pool asked past the floor is rounded up to whole pages: got \"" + asked + "\", " +
+              std::to_string(out.media_embedding_bytes));
+    vision.vision_residency = IGNIS_VISION_RESIDENCY_HOST;
+    const std::string hosted = plan(&vision);
+    check(hosted == "(planned)" && out.media_embedding_bytes == 0 && out.activation_bytes == text_activations + 131328,
+          "a host-resident pool leaves the VRAM plan: got \"" + hosted + "\", " +
+              std::to_string(out.media_embedding_bytes));
+    ignis_model_load_options readouts{};
+    readouts.size = sizeof(readouts);
+    readouts.attention_text_max_keys = 4096;
+    const std::string refused = plan(&readouts);
+    check(refused.find("Qwen3.8-Flash-Next has no attention readouts") != std::string::npos,
+          "the attention readouts on a Flash-Next load are refused by name: got \"" + refused + "\"");
     // GitHub #335: the prompt attention's precision is the 27B's; Flash-Next's QSA has no band.
     ignis_model_load_options fp16{};
     fp16.size = sizeof(fp16);

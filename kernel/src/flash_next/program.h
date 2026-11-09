@@ -121,6 +121,18 @@ struct FlashNextModel {
   std::unique_ptr<ninfer::DeviceBuffer> lookahead_logits;
   std::unique_ptr<ninfer::DeviceBuffer> shared_h;
   std::unique_ptr<ninfer::DeviceBuffer> shared_out;
+  // GitHub #557: a vision load's embedding pool -- its bytes and whether it is in mapped host
+  // memory (the vision residency), allocated by finish_load as the handle's `vision_pool`
+  // (model_internal.h, the 27B's) -- and the forward's vision inputs, at stable addresses: a
+  // chunk's three axes (I32 [3][prefill_chunk_tokens]) and its media rows (I32
+  // [prefill_chunk_tokens]), and a round's rope deltas (I32 [decode_lanes], staged with the
+  // positions). A text load holds none of them, so its reservations are as they were.
+  uint64_t vision_pool_bytes = 0;
+  bool vision_pool_host = false;
+  std::unique_ptr<ninfer::DeviceBuffer> rope_positions;
+  std::unique_ptr<ninfer::DeviceBuffer> media_rows;
+  std::unique_ptr<ninfer::DeviceBuffer> rope_deltas;
+  bool vision() const { return vision_pool_bytes != 0; }
   // Recorded on residency's lookahead branch once the lookahead router has read `x`; the
   // layer's stream waits on it before the next sublayer's mix rewrites `x`.
   cudaEvent_t lookahead_read = nullptr;
@@ -141,12 +153,14 @@ struct FlashNextModel {
 // runs, allocating nothing: the half of a load ignis_model_plan_reservations
 // shares. `rope_scaling` is the load's rotary table (ADR 0059), already read
 // off `options` and refused by name if it builds none (validate_and_bind,
-// model.cu). Null and *error on any refusal.
+// model.cu). `vision_pool_bytes` is a vision load's embedding pool, already
+// floored and rounded to whole pages there (0 without vision), in mapped host
+// memory when `vision_pool_host`. Null and *error on any refusal.
 std::unique_ptr<FlashNextModel> bind_model(const ignis_bound_tensor *tensors, uint64_t count,
                                            const ignis_topology &topology, uint32_t prefill_chunk_tokens,
                                            uint32_t max_context_tokens, int32_t kv_format,
                                            const ignis_model_load_options *options, const RopeScaling &rope_scaling,
-                                           std::string *error);
+                                           uint64_t vision_pool_bytes, bool vision_pool_host, std::string *error);
 
 // The load's plan lines, from a bound model.
 ignis_model_reservations reservations(const FlashNextModel &fn);
@@ -179,9 +193,18 @@ struct Views {
 Views views_of(const FlashNextModel &fn, ignis_seq_pool *pool);
 // The KV positions a decode round's indexer and attention are sized for.
 int32_t decode_max_visible(const FlashNextModel &fn);
-// The call's whole forward to the final residual: embed, every layer. `phase` is residency's.
+// GitHub #557: a prefill chunk's media columns -- one run of a pool page's: `count` contiguous
+// BF16 [hidden] columns at `columns`, over the chunk's rows `rows` (DEVICE [count]).
+struct MediaRun {
+  const void *columns = nullptr;
+  const int32_t *rows = nullptr;
+  int32_t count = 0;
+};
+// The call's whole forward to the final residual: embed (and, GitHub #557, the `media` runs over
+// their rows' embeddings, in every stream), every layer. `phase` is residency's.
 int32_t forward(FlashNextModel &fn, const Context &ctx, const Batch &batch, uint32_t phase,
-                ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error);
+                ninfer::DeviceArena &scratch, cudaStream_t stream, std::string *error,
+                const std::vector<MediaRun> *media = nullptr);
 // Every per-layer frontier of the sequence moves with its program frontier.
 void advance_frontiers(ignis_seq *seq, uint32_t tokens);
 // The MTP head's entries for a call's rows (spec flash-next/07): entry r from the stack the trunk

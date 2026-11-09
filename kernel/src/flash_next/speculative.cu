@@ -70,6 +70,8 @@ int32_t run_pass(ignis_model *model, FlashNextModel &fn, const Context &ctx, con
   batch.positions = positions;
   batch.max_visible = decode_max_visible(fn);
   batch.verify = &state.records;
+  // GitHub #557: a vision load's columns rotate at their positions plus their lane's rope delta.
+  batch.rope_deltas = fn.vision() ? static_cast<const int32_t *>(fn.rope_deltas->p) : nullptr;
   if (forward(fn, ctx, batch, IGNIS_RESIDENCY_DECODE, scratch, stream, error) != 0) return -1;
   if (fn_head(fn.g, fn.weights->final_mixer, fn.weights->head, fn.residual->p, batch.rows(),
               model->sampling_decode_logits->p, scratch, stream) != 0) {
@@ -102,6 +104,8 @@ int32_t run_drafts(ignis_model *model, FlashNextModel &fn, const Context &ctx, c
   batch.positions = static_cast<const int32_t *>(fn.positions->p);
   batch.max_visible = decode_max_visible(fn);
   batch.verify = &state.records;
+  // GitHub #557: the head rotates where the trunk does (its vision rows are #564's).
+  batch.rope_deltas = fn.vision() ? static_cast<const int32_t *>(fn.rope_deltas->p) : nullptr;
   auto *picks = static_cast<int32_t *>(state.picks->p);
   auto *chain_tokens = static_cast<int32_t *>(state.chain_tokens->p);
   auto *drafts = static_cast<int32_t *>(state.drafts_out->p);
@@ -137,6 +141,7 @@ int32_t run_drafts(ignis_model *model, FlashNextModel &fn, const Context &ctx, c
     chain.slots = batch.slots;
     chain.positions = static_cast<const int32_t *>(state.chain_positions->p) + (step - 1) * lanes;
     chain.max_visible = batch.max_visible;
+    chain.rope_deltas = batch.rope_deltas;
     if (cudaMemcpyAsync(fn.residual->p, state.chain_stack->p, stack_bytes, cudaMemcpyDeviceToDevice, stream) !=
         cudaSuccess) {
       *error = std::string("the MTP chain's stacks: ") + cudaGetErrorString(cudaGetLastError());
@@ -250,7 +255,8 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
 
   std::vector<ninfer::ops::SamplingConfig> configs(batch_size);
   std::vector<int32_t> ids(rows, 0), slots(batch_size), positions(batch_size), extents(batch_size),
-      valid(batch_size), anchors(batch_size), drafts(static_cast<std::size_t>(width) * k, 0);
+      valid(batch_size), anchors(batch_size), drafts(static_cast<std::size_t>(width) * k, 0),
+      rope_deltas(batch_size);
   for (uint64_t i = 0; i < batch_size; ++i) {
     ignis_seq *seq = sequences[i];
     const std::string at = " at index " + std::to_string(i);
@@ -276,6 +282,8 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
     anchors[i] = seq->pending_token;
     slots[i] = seq->slot;
     positions[i] = static_cast<int32_t>(seq->position);
+    if (seq->rope_delta != 0 && !fn.vision()) return refuse("a sequence with a rope delta on a load without vision" + at);
+    rope_deltas[i] = seq->rope_delta;
     extents[i] = static_cast<int32_t>(extent);
     valid[i] = static_cast<int32_t>(extent + 1);
     for (uint32_t j = 0; j < columns; ++j) {
@@ -302,6 +310,7 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
             stage(fn.token_ids->p, ids.data(), rows * sizeof(int32_t), "the ids") &&
             stage(fn.slots->p, slots.data(), lane_bytes, "the slots") &&
             stage(fn.positions->p, positions.data(), lane_bytes, "the positions") &&
+            (!fn.vision() || stage(fn.rope_deltas->p, rope_deltas.data(), lane_bytes, "the rope deltas")) &&
             stage(fn.ngram_rows->p, options->ngram_rows, rows * row_bytes, "the n-gram rows") &&
             stage(state.valid_columns->p, valid.data(), lane_bytes, "the valid columns") &&
             stage(state.extents->p, extents.data(), lane_bytes, "the extents") &&
