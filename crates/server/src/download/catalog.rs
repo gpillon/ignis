@@ -1026,7 +1026,7 @@ mod tests {
         (
             "qwen3.8-flash-next",
             "gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis",
-            "8d94db83cd8e58d6be31e796723e5e35b960638c",
+            "1f4f85c4a1b3a41854881f2eba5a022a1ad5126f",
             "qwen3_8_flash_next_trellis_a25-v2.ninfer",
             32,
             Some(GpuGeneration::Blackwell),
@@ -1565,7 +1565,7 @@ mod tests {
         let pinned = [
             ("qwen3.8-27b", "apache-2.0", "https://www.apache.org/licenses/LICENSE-2.0"),
             ("qwen3.8-27b-abliterated", "apache-2.0", "https://www.apache.org/licenses/LICENSE-2.0"),
-            ("qwen3.8-flash-next", "qwen-community-1.0", "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/8d94db83cd8e58d6be31e796723e5e35b960638c/LICENSE"),
+            ("qwen3.8-flash-next", "qwen-community-1.0", "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/1f4f85c4a1b3a41854881f2eba5a022a1ad5126f/LICENSE"),
             ("ignis-image-2.1-turbo", "qwen-research", "https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/LICENSE"),
             ("qwen3.8-27b-16g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis/blob/f5bbd2cc14c9ca573ef5553c100ac69410f1fe58/LICENSE"),
             ("qwen3.8-27b-abliterated-16g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis/blob/94a8bfc0f47ce86403f274be03e2c0f79500727c/LICENSE"),

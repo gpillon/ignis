@@ -85,7 +85,7 @@ From then on `verify` expects the *patched* hash locally and the *reference's*
 hash upstream, so both an unrecorded edit and upstream drift are caught. `sync`
 will not overwrite a patched file unless it is told to.
 
-A patch is admitted for one of three reasons, and its `reason` says which: a
+A patch is admitted for one of four reasons, and its `reason` says which: a
 measured bottleneck (ADR 0031); a demonstrated correctness bug (ADR 0037),
 in which case the `reason` also names the test that fails without the patch;
 or portability to a CUDA architecture the build targets, or to a card smaller
@@ -120,14 +120,14 @@ verbatim, for the arch-specific Blackwell targets alone (`ignis_vendor_sm120a`
 in `kernel/CMakeLists.txt`) -- the seven NVFP4 W4A4 prefill GEMMs, and the W8
 small-T and split-K routes and the i8 decode attention, whose kernels declare
 more than the 48 KiB of static shared memory per block an sm_8x build allows.
-One patch has neither reason and says so: the W8 dispatch's arms for the
-image model's vision tower (`src/ops/linear/w8/w8_dispatch.cpp` and its test
-cases, spec image-model/03, GitHub #320), a registry extension sanctioned as
-that ticket's one vendor edit, and since GitHub #557 (ADR 0087) the arm for
-Flash-Next's merger fc2 [2560, 4608], the same kind of extension on the image
-model's [4096, 4608] routes. Its `reason` names the new problems and the
-test cases that throw without it; whether such extensions become a third
-standing reason is the owner's call. Its K-1152 arms (the tower's qkv,
+A fourth reason is a vendored registry that lacks a case ignis needs
+(ADR 0088): its `reason` names the shapes added, why the routes fit them and
+the test cases that throw without it, and a small registry may instead be
+rewritten as ignis's own code. One patch stands on it: the W8 dispatch's arms
+for the image model's vision tower (`src/ops/linear/w8/w8_dispatch.cpp` and
+its test cases, spec image-model/03, GitHub #320), and since GitHub #557
+(ADR 0087) the arm for Flash-Next's merger fc2 [2560, 4608] on the image
+model's [4096, 4608] routes. Its K-1152 arms (the tower's qkv,
 output and fc1) reach the MMA route through an ADR 0031 patch of
 `src/ops/linear/w8/w8_rowsplit_gemm_mma.cuh` (GitHub #324): a row of scales
 that is a multiple of 8 bytes but not of 16 is staged in two 8-byte halves.
