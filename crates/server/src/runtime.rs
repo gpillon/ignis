@@ -669,7 +669,8 @@ pub fn log_host_plan_refused(refusal: &ignis_core::residency::HostPlanError) {
 /// (`vision_tower_bytes`, ADR 0075; the two make the plan's mapped
 /// allocation), the embedding pool the model's load maps under the same
 /// residency (GitHub #415: the shape's [`ignis_core::Vision::pool_bytes`] at
-/// its context, the leaf's own sizing), KV-disk's staging windows when the
+/// its context, the leaf's own sizing, as wide as the vision objects the 27B
+/// binds write, GitHub #562), KV-disk's staging windows when the
 /// tier is on, the host retained slots and the KV-RAM arena -- against the
 /// shape's margin (`model.host_margin_bytes`). No experts and no n-gram table.
 pub fn qwen27b_host_request(
@@ -684,7 +685,7 @@ pub fn qwen27b_host_request(
     let vision_pool_bytes = shape
         .vision
         .filter(|vision| vision.residency() == ignis_core::VisionResidency::Host)
-        .map_or(0, |vision| vision.pool_bytes(shape.max_context));
+        .map_or(0, |vision| vision.pool_bytes(shape.max_context, ignis_core::EmbeddingWidth::qwen38_27b()));
     ignis_core::residency::HostPlanRequest {
         available_physical_bytes,
         scope: crate::config::field::scope(family),

@@ -37,7 +37,7 @@ use ignis_core::model_load::{
 use ignis_core::step::encode_media;
 use ignis_core::vision::vision_item_control;
 use ignis_core::{
-    ExceptionWeights, KvFormat, PrefillAttention, PrefillLinear, RopeScaling, Speculation, SpeculativeBackend, Vision,
+    EmbeddingWidth, ExceptionWeights, KvFormat, PrefillAttention, PrefillLinear, RopeScaling, Speculation, SpeculativeBackend, Vision,
     VisionResidency, N_DECODE_LANES,
 };
 
@@ -169,7 +169,7 @@ fn under_host_the_leaf_holds_the_tower_in_host_mapped_bytes_and_not_in_vram_byte
     // mapped allocation: the same bytes, the leaf's own figure, which the
     // server's host plan sizes with the Rust mirror of its rule.
     let pool = device_load.reserved.media_embedding_bytes;
-    assert_eq!(pool, vision_at(VisionResidency::Host).pool_bytes(CONTEXT), "the host plan's pool line is the leaf's pool");
+    assert_eq!(pool, vision_at(VisionResidency::Host).pool_bytes(CONTEXT, EmbeddingWidth::qwen38_27b()), "the host plan's pool line is the leaf's pool");
     assert_eq!(host_load.reserved.media_embedding_bytes, 0, "the host load holds no pool in VRAM");
     assert_eq!(
         host_load.host_mapped_bytes - device_load.host_mapped_bytes,
@@ -234,7 +234,7 @@ fn on_the_16_gb_profile_the_ring_fits_the_prefill_scratch_and_the_pool_leaves_vr
         assert_eq!(host.workspace_bytes, device.workspace_bytes, "the encode of a {envelope}-token item and the ring fit the scratch");
         // GitHub #415: and the pool is host-mapped, no VRAM line.
         assert_eq!(host.media_embedding_bytes, 0, "the pool leaves the VRAM plan at {envelope}");
-        assert_eq!(device.media_embedding_bytes, at(VisionResidency::Device).pool_bytes(262_144), "a VRAM line under device");
+        assert_eq!(device.media_embedding_bytes, at(VisionResidency::Device).pool_bytes(262_144, EmbeddingWidth::qwen38_27b()), "a VRAM line under device");
     }
     // Where the encoder's share sets the scratch's size, the ring is what it grows by.
     let at = |residency| Vision::new(ITEM_BOUND).unwrap().with_item_max_tokens(ITEM_BOUND).with_residency(residency);

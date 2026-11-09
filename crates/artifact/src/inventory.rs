@@ -342,7 +342,6 @@ const SH_V_FC1_BIAS: [u64; 1] = [4304];
 const SH_V_FC2: [u64; 2] = [1152, 4304];
 const SH_V_MERGER: [u64; 2] = [4608, 4608]; // the 2 x 2 merge block
 const SH_V_MERGER_BIAS: [u64; 1] = [4608];
-const SH_V_MERGER_OUT: [u64; 2] = [5120, 4608]; // into the target's hidden width
 
 /// The 333 `vision/*` objects in the artifact's directory order (the
 /// reference's `qwen3.8-27b-artifact.md` §vision): patch embedding, bias and
@@ -351,6 +350,18 @@ const SH_V_MERGER_OUT: [u64; 2] = [5120, 4608]; // into the target's hidden widt
 /// norms, every quantized one row-split. The `tests/real_artifact` cross-check
 /// pins this table against the container (ADR 0002).
 pub fn vision_scope_27b() -> Vec<InventoryEntry> {
+    vision_scope(SH_HIDDEN[0])
+}
+
+/// The vision tower's objects with a merger writing `merger_width` rows: the
+/// hidden width of the text model it feeds (GitHub #562), 5,120 on the 27B
+/// ([`vision_scope_27b`]) and 2,560 on Flash-Next, whose tower is the 27B's
+/// objects in the 27B's formats (ADR 0087). Only the merger's `fc2` and its
+/// bias carry the width; the rest of the tower is the same table.
+pub fn vision_scope(merger_width: u64) -> Vec<InventoryEntry> {
+    // Leaked like the templated names (`mk`): two shapes per table.
+    let merger_out: &'static [u64] = Box::leak(Box::new([merger_width, SH_V_MERGER[1]]));
+    let merger_out_bias: &'static [u64] = Box::leak(Box::new([merger_width]));
     let row_split = StorageLayout::RowSplitK128V1;
     let q4 = (NumericFormat::Q4G64F16S, row_split);
     let q5 = (NumericFormat::Q5G64F16S, row_split);
@@ -381,8 +392,8 @@ pub fn vision_scope_27b() -> Vec<InventoryEntry> {
     }
     push("vision/merger/fc1", w8, &SH_V_MERGER);
     push("vision/merger/fc1_bias", bf16, &SH_V_MERGER_BIAS);
-    push("vision/merger/fc2", w8, &SH_V_MERGER_OUT);
-    push("vision/merger/fc2_bias", bf16, &SH_HIDDEN);
+    push("vision/merger/fc2", w8, merger_out);
+    push("vision/merger/fc2_bias", bf16, merger_out_bias);
     push("vision/merger/norm/weight", bf16, &SH_V_HIDDEN);
     push("vision/merger/norm/bias", bf16, &SH_V_HIDDEN);
     entries
@@ -1052,6 +1063,26 @@ mod tests {
         assert_eq!(by_format["BF16"], 222);
         let names: std::collections::BTreeSet<_> = vision.iter().map(|e| e.name).collect();
         assert_eq!(names.len(), 333, "no duplicate name");
+    }
+
+    /// GitHub #562 (ADR 0087): Flash-Next's tower is the 27B's objects, in
+    /// the same formats under the same names, with a merger writing its
+    /// 2,560-wide hidden; nothing else in the table moves with the width.
+    #[test]
+    fn a_vision_scope_differs_from_the_27bs_only_in_the_mergers_output_width() {
+        assert_eq!(vision_scope(5120), vision_scope_27b());
+        let narrow = vision_scope(2560);
+        assert_eq!(narrow.len(), 333);
+        for (entry, wide) in narrow.iter().zip(vision_scope_27b()) {
+            assert_eq!((entry.name, entry.format, entry.layout), (wide.name, wide.format, wide.layout));
+            tensor_encoded_size(entry.layout, entry.format, entry.shape)
+                .unwrap_or_else(|e| panic!("{}: {e}", entry.name));
+            match entry.name {
+                "vision/merger/fc2" => assert_eq!(entry.shape, &[2560, 4608]),
+                "vision/merger/fc2_bias" => assert_eq!(entry.shape, &[2560]),
+                _ => assert_eq!(entry.shape, wide.shape, "{}", entry.name),
+            }
+        }
     }
 
     #[test]
