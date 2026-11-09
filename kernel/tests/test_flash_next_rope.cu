@@ -18,8 +18,8 @@
 // and the same for s with m the table's attention factor, and the BF16 rotation. CUDA's cosf and
 // sinf are within 2 ulps of the correctly rounded value, so where a BF16 rounding boundary falls
 // within those ulps of cos(phi) * m the restatement takes either side (counted and printed).
-// Every value must match it; and the rotary values must not match the same restatement under
-// the linear table (attention factor 1), so YaRN is what the outputs carry.
+// Every value must match it; and the restatement under the linear table (attention factor 1) must
+// differ from it on most rotary values, so a kernel without YaRN would fail there.
 //
 // select: every sparse row's blocks are the documented rule -- the 512 largest scores, the
 // lowest blocks among equal ones -- over the queries and block keys restated above, scored in
@@ -182,7 +182,7 @@ Restated restate(const std::vector<float> &normed, const ix::Rope &rope, int32_t
 
 // What the device rows say against their restatements, over a whole arm.
 struct Tally {
-  long values = 0, mismatches = 0, rotary = 0, rotary_as_linear = 0, ambiguous_pairs = 0;
+  long values = 0, mismatches = 0, rotary = 0, rotary_as_linear = 0, rotary_overlap = 0, ambiguous_pairs = 0;
   void add(const uint16_t *got, const Restated &want, const Restated &linear) {
     ambiguous_pairs += want.ambiguous_pairs;
     for (std::size_t d = 0; d < want.allowed.size(); ++d) {
@@ -193,17 +193,26 @@ struct Tally {
         ++rotary;
         const auto &lin = linear.allowed[d];
         rotary_as_linear += std::find(lin.begin(), lin.end(), got[d]) != lin.end();
+        rotary_overlap += std::any_of(set.begin(), set.end(),
+                                      [&](uint16_t v) { return std::find(lin.begin(), lin.end(), v) != lin.end(); });
       }
     }
   }
   // `linear`: what the alternative restatement add() was handed is (GitHub #557's arms hand it
   // another position, not another table).
   void report(const std::string &arm, const std::string &linear = "the linear table's") const {
-    std::printf("  %s: %ld values, %ld outside the restatement, %ld/%ld rotary values %s, %ld "
-                "ambiguous pairs\n",
-                arm.c_str(), values, mismatches, rotary_as_linear, rotary, linear.c_str(), ambiguous_pairs);
+    std::printf("  %s: %ld values, %ld outside the restatement, %ld/%ld rotary values %s (%ld where the two "
+                "restatements share a value), %ld ambiguous pairs\n",
+                arm.c_str(), values, mismatches, rotary_as_linear, rotary, linear.c_str(), rotary_overlap,
+                ambiguous_pairs);
     check(values > 0 && mismatches == 0, arm + ": every value is the restatement's");
-    check(rotary_as_linear * 10 < rotary, arm + ": the rotary values are not " + linear);
+    // With every value the restatement's, a value can be the alternative's only where the two
+    // restatements share one: near angle zero (a low-frequency pair, or the small image coordinates
+    // of GitHub #557's three-axis arm) bf16 cannot tell two angles apart. What an arm must show is
+    // that its inputs tell the two apart on most rotary values, so that a kernel rotating at the
+    // alternative fails the check above there.
+    check(rotary_as_linear <= rotary_overlap, arm + ": the rotary values are " + linear + " only where both agree");
+    check(rotary_overlap * 2 < rotary, arm + ": the inputs tell the restatement from " + linear);
   }
 };
 
