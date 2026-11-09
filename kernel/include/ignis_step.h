@@ -321,7 +321,10 @@ struct ignis_prefill_options {
    * nothing over it, and leaves the sequence with no pending token. On
    * Flash-Next with MTP the head's entry at the span's last position is built
    * from this token (GitHub #520), as every other entry is from the span's
-   * next id; on the prompt's last span, from the draw. Such a span asks for
+   * next id; on the prompt's last span, from the draw. (GitHub #564: an entry
+   * whose token is an image placeholder embeds the column the trunk takes for
+   * it -- for this token, the media's next column when the span ends inside
+   * its item and this token is the same placeholder id.) Such a span asks for
    * no logits (`out_logits`, `out_span_logits`), no permitted set, no
    * reasoning redirect and no attention readout, and runs the chunked route:
    * the call is refused otherwise. A token outside the vocabulary is refused

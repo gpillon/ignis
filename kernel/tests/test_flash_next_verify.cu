@@ -343,6 +343,110 @@ void restore_head_arm(const fn::Geometry &g, bool hq, uint32_t k, const std::vec
         name + ": restore_head refuses three lanes on a two-lane load by name");
 }
 
+// ---- axis records (GitHub #558) ---------------------------------------------------------------
+
+constexpr int kRecordWords = 5;  // indexer.h AxisRecord
+constexpr int kLogicalPages = 66;
+constexpr int kBlocksPerPage = 16;
+constexpr std::size_t kSectionKeyElements = static_cast<std::size_t>(kHeadSlots) * kLogicalPages * kBlocksPerPage * kKeyDim;
+
+// Slot s's logical page l is physical page s * kLogicalPages + l.
+std::size_t key_slot_at(int slot, int32_t block) {
+  const int32_t first = block * kCompress;
+  const std::size_t page = static_cast<std::size_t>(slot) * kLogicalPages + first / 64;
+  return (page * kBlocksPerPage + (first % 64) / kCompress) * kKeyDim;
+}
+
+// A vision load's round on a state with axis records: the pass's save over key slots that hold, for
+// each lane and section, the AxisRecord of the block its frontier p is inside (a block an image
+// began: three different axes); then every key slot overwritten (what the pass writes when its
+// columns complete blocks); then restore_head (the head's section) or restore (every section) with
+// each lane's commit count c and the round's rope deltas. The block the new frontier f = p + c is
+// inside holds its record again -- the saved one when it began before p, else its first column's at
+// that position plus the lane's delta on all three axes -- and every other key byte is as the
+// overwrite left it.
+void axis_records_arm(const fn::Geometry &g, uint32_t k, const std::vector<int32_t> &commit, bool head_only,
+                      cudaStream_t stream) {
+  const std::string name = std::string(head_only ? "restore_head" : "restore") + " with axis records k = " +
+                           std::to_string(k) + " c = {" + std::to_string(commit[0]) + ", " + std::to_string(commit[1]) +
+                           "}";
+  std::string error;
+  auto state = fn::verify::create(g, IGNIS_KV_FORMAT_BF16, kLanes, k, 0, kAttention, 1, true, &error, true);
+  check(state != nullptr && state->axis_records, name + ": verify::create: " + error);
+  if (state == nullptr) return;
+  auto plain = fn::verify::create(g, IGNIS_KV_FORMAT_BF16, kLanes, k, 0, kAttention, 1, true, &error);
+  check(plain != nullptr && state->sizes.saved > plain->sizes.saved &&
+            state->sizes.total() - plain->sizes.total() == state->sizes.saved - plain->sizes.saved,
+        name + ": the records are a line of the saved state's plan, and only a vision load's");
+  HeadPool pool(g, false);
+  const int32_t slot_of[kLanes] = {2, 0};
+  const int32_t deltas[kLanes] = {-37, 412};
+  DeviceBytes d_slots(kLanes * 4), d_positions(kLanes * 4), d_deltas(kLanes * 4);
+  upload(d_slots, std::vector<int32_t>(slot_of, slot_of + kLanes));
+  upload(d_positions, std::vector<int32_t>(kHeadPositions, kHeadPositions + kLanes));
+  upload(d_deltas, std::vector<int32_t>(deltas, deltas + kLanes));
+  std::vector<int32_t> tables(static_cast<std::size_t>(kHeadSlots) * kLogicalPages);
+  for (std::size_t i = 0; i < tables.size(); ++i) tables[i] = static_cast<int32_t>(i);
+  DeviceBytes d_tables(tables.size() * 4);
+  upload(d_tables, tables);
+  pool.sections.block_tables = d_tables.as<int32_t>();
+  pool.sections.logical_pages = kLogicalPages;
+  std::vector<uint16_t> pre[kAttention], post[kAttention];
+  std::unique_ptr<DeviceBytes> keys[kAttention];
+  for (int a = 0; a < kAttention; ++a) {
+    pre[a] = bf16_vector(5000 + 100 * k + a, kSectionKeyElements, -2.0, 2.0);
+    post[a] = bf16_vector(6000 + 100 * k + a, kSectionKeyElements, -2.0, 2.0);
+    for (int lane = 0; lane < kLanes; ++lane) {
+      const int32_t p = kHeadPositions[lane], first = p / kCompress * kCompress;
+      const int32_t record[kRecordWords] = {0x33584931, first, first - 30, first - 25 + a, first - 20 + lane};
+      std::memcpy(&pre[a][key_slot_at(slot_of[lane], p / kCompress)], record, sizeof(record));
+    }
+    keys[a] = device_copy(pre[a]);
+    pool.sections.block_keys[a] = keys[a]->p;
+  }
+  fn::verify::Sections bare = pool.sections;
+  bare.block_tables = nullptr;
+  check(fn::verify::save(*state, bare, g, kLanes, k, d_slots.as<int32_t>(), d_positions.as<int32_t>(), stream,
+                         &error) != 0 &&
+            error.find("axis records") != std::string::npos,
+        name + ": a state with axis records refuses sections without block keys by name");
+  check(fn::verify::save(*state, pool.sections, g, kLanes, k, d_slots.as<int32_t>(), d_positions.as<int32_t>(), stream,
+                         &error) == 0,
+        name + ": the save launches: " + error);
+  MOE_CUDA(cudaStreamSynchronize(stream));
+  for (int a = 0; a < kAttention; ++a) upload(*keys[a], post[a]);
+  upload_to(*state->commit, commit);
+  const int rc = head_only ? fn::verify::restore_head(*state, pool.sections, g, kLanes, k, d_slots.as<int32_t>(),
+                                                      d_positions.as<int32_t>(), stream, &error, d_deltas.as<int32_t>())
+                           : fn::verify::restore(*state, pool.sections, g, kLanes, k, d_slots.as<int32_t>(),
+                                                 d_positions.as<int32_t>(), stream, &error, d_deltas.as<int32_t>());
+  check(rc == 0, name + ": the restore launches: " + error);
+  MOE_CUDA(cudaStreamSynchronize(stream));
+
+  long restored = 0;
+  for (int a = 0; a < kAttention; ++a) {
+    std::vector<uint16_t> want = post[a];
+    if (!head_only || a == kHead) {
+      for (int lane = 0; lane < kLanes; ++lane) {
+        const int32_t p = kHeadPositions[lane], f = p + commit[lane], first = f / kCompress * kCompress;
+        if (first == f) continue;
+        const std::size_t at = key_slot_at(slot_of[lane], f / kCompress);
+        if (first < p) {
+          std::copy_n(&pre[a][at], 2 * kRecordWords, &want[at]);
+        } else {
+          const int32_t axis = first + deltas[lane];
+          const int32_t record[kRecordWords] = {0x33584931, first, axis, axis, axis};
+          std::memcpy(&want[at], record, sizeof(record));
+        }
+        ++restored;
+      }
+    }
+    check(download<uint16_t>(keys[a]->p, kSectionKeyElements) == want,
+          name + ": section " + std::to_string(a) + "'s key slots hold the new frontier's record, the rest as left");
+  }
+  check(restored > 0, name + ": some lane's new frontier is inside a block");
+}
+
 }  // namespace
 
 int main() {
@@ -569,6 +673,16 @@ int main() {
       restore_head_arm(g, hq, k, {1, c}, stream);
       restore_head_arm(g, hq, k, {c, 1}, stream);
       restore_head_arm(g, hq, k, {c + 1, 1}, stream);
+    }
+  }
+  // GitHub #558: a vision load's commit puts back each frontier's AxisRecord: from the saved one
+  // (lane 1 at c = 1, lane 0 at c = 1), and from its first column's position plus the delta (lane 0
+  // at c = k + 1, lane 1 at c = k).
+  for (const uint32_t k : {2U, 3U}) {
+    const auto c = static_cast<int32_t>(k);
+    for (const bool head_only : {true, false}) {
+      axis_records_arm(g, k, {1, c}, head_only, stream);
+      axis_records_arm(g, k, {c + 1, 1}, head_only, stream);
     }
   }
 

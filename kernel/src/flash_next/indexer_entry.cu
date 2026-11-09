@@ -60,6 +60,7 @@ int32_t fn_indexer_select(const Context &ctx, int32_t attn_ordinal, const Indexe
   paged.logical_pages = static_cast<int32_t>(ctx.pool->kv_pool.logical_page_capacity());
   paged.block_keys = static_cast<__nv_bfloat16 *>(state.block_keys);
   paged.tail_keys = static_cast<__nv_bfloat16 *>(state.tail_keys);
+  paged.axis_records = state.axis_records;
   const ix::Rope rope = ix::rope_from(ctx.rope);
   ix::Status st = ix::append_keys(g, paged, rope, w.k_norm, batch, qk, stream);
   if (st == nullptr) st = ix::select(g, paged, rope, w.q_norm, batch, qk, out, scratch, stream);

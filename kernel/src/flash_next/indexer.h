@@ -13,6 +13,13 @@
 //   score(row, b) = sum_h relu(q_h . k_b) / sqrt(head_dim)             for every complete visible b
 //   selection(row) = the min(512, blocks) best blocks + the row's incomplete block's tokens
 //
+// GitHub #558: a token's "position" in rope() is its rotation, the attention's (qsa.h): on a span
+// of a multimodal prompt its three axes (pair i of the rotary quarter at axis i % 3), after an
+// image its KV position plus the lane's rope delta, else its KV position ("4b" is the block's first
+// token's). A block's key rotates at its first token's, which may sit in an earlier call: a vision
+// load keeps that token's three axes in the block's own key slot until the key replaces it
+// (AxisRecord below). Scoring, selection and causality count KV positions.
+//
 // Numerics kept from the checkpoint: every RMSNorm in fp32 rounded once to BF16; rope in BF16
 // arithmetic as torch runs it (cos/sin times the table's YaRN attention factor rounded to BF16,
 // each product rounded to BF16, then their sum), with the checkpoint's fp32 frequency table (1.0f / (float)theta^(2i/rotary), which is not
@@ -52,7 +59,30 @@ struct Paged {
   int32_t logical_pages = 0;              // a block-table row's length
   __nv_bfloat16 *block_keys = nullptr;    // [physical page][kBlocksPerPage][kHeadDim]
   __nv_bfloat16 *tail_keys = nullptr;     // [slot][kCompress - 1][kHeadDim]
+  // GitHub #558: a vision load's section. An incomplete block's key slot holds its first token's
+  // AxisRecord -- written by the call that appends that token, read and then replaced by the key
+  // in the call that completes the block -- so a block whose first token sits in an earlier call
+  // rotates at that token's three axes. Off (a text load): nothing is written there, and every
+  // block rotates at its first token's KV position, as before.
+  bool axis_records = false;
 };
+
+// GitHub #558: what an incomplete block's key slot holds on a vision load, in its first bytes,
+// until the block completes. Nothing reads a key slot before its block completes (a row's scores
+// stop at its complete blocks), and the slot moves with its KV page wherever the page goes (a
+// checkpoint's copied tail page, a snapshot's or a spill's indexer keys), so the record does too.
+// Each attention layer keeps its own, in its own section: a call reads a layer's record before
+// that layer's key replaces it. A slot that holds none -- its magic or its block's first position
+// is not this one's, as in a section written before records existed -- rotates the block at that
+// KV position on all three axes, a text history's rotation.
+struct AxisRecord {
+  int32_t magic = 0;  // kAxisRecordMagic
+  int32_t first = 0;  // the block's first token's KV position (4b)
+  int32_t axes[3] = {};
+};
+inline constexpr int32_t kAxisRecordMagic = 0x33584931;  // "1IX3" little-endian
+static_assert(sizeof(AxisRecord) == 5 * sizeof(int32_t) && sizeof(AxisRecord) <= kHeadDim * 2,
+              "an AxisRecord is five words, inside one block key's slot");
 
 // The checkpoint's rope frequencies, fp32, one per rotary pair, and the YaRN attention factor
 // that multiplies cos and sin on queries and keys alike (HF's `attention_scaling`, ADR 0059):
@@ -74,14 +104,19 @@ Status check_geometry(const Geometry &g);
 
 // Every call, dense or not: for each lane, the keys of the blocks this call completes (their
 // earlier tokens' raw keys from the lane's tail) written to their pages, then the raw keys of its
-// incomplete last block written to the tail. qk: BF16 [rows][(heads + 1) * kHeadDim], the key at
-// column heads * kHeadDim. Graph-safe: grids from batch.lanes / batch.tokens only.
+// incomplete last block written to the tail -- and with paged.axis_records, when this call begins
+// that block, its first token's AxisRecord to the block's key slot. A block key rotates at its
+// first token's rotation: the batch's source (its three axes, its positions plus its rope deltas,
+// or its positions) for a token of this call, the block's record for an earlier one. qk: BF16
+// [rows][(heads + 1) * kHeadDim], the key at column heads * kHeadDim. A batch naming both rope
+// sources is refused. Graph-safe: grids from batch.lanes / batch.tokens only.
 Status append_keys(const Geometry &g, const Paged &paged, const Rope &rope, const void *k_norm,
                    const Batch &batch, const void *qk, cudaStream_t stream);
 
 // The row-local parts of selection for rows [row_begin, row_begin + rows) of the batch, each
 // written at its local row index (0 .. rows):
-//   prepare_queries: q [rows][heads][kHeadDim] BF16, normed and roped at the row's position;
+//   prepare_queries: q [rows][heads][kHeadDim] BF16, normed and roped at the row's rotation (the
+//          batch's three axes, its position plus its lane's rope delta, or its position);
 //   score: scores [rows][score_stride] fp32 for every complete visible block of the row (columns
 //          past the row's block count are not written); max_blocks bounds the grid (host);
 //   select_blocks: the row's token list into tokens[row][selection_width] / counts[row]: every
