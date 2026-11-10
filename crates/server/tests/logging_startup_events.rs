@@ -441,6 +441,25 @@ fn no_artifact_emits_placeholder_template_then_process_started() {
     );
 }
 
+/// GitHub #557: a vision option named for every model beside a profile that
+/// turns vision on for the 27B alone is taken, and the start says, before
+/// anything is loaded, which models it applies to and which have vision off.
+#[test]
+fn the_start_names_the_models_a_vision_option_applies_to() {
+    let records = run_until(&["--profile", "rtx5090", "--vision-max-tokens", "4096"], &[], &["ignis.process.started"]);
+    let at = |name: &str| records.iter().position(|record| record["event_name"] == name);
+    let options = at("ignis.config.vision_options").expect("ignis.config.vision_options is logged");
+    for later in ["ignis.model.placeholder_template", "ignis.process.started"] {
+        if let Some(index) = at(later) {
+            assert!(options < index, "the vision options before {later}: {records:?}");
+        }
+    }
+    let record = &records[options];
+    assert_eq!(record["attributes"]["options"], "--vision-max-tokens", "{record}");
+    assert_eq!(record["attributes"]["applies_to"], "qwen3.8-27b", "{record}");
+    assert_eq!(record["attributes"]["vision_off"], "qwen3.8-flash-next", "{record}");
+}
+
 /// Spec config-v2/02 AC 12: where the configuration came from is said at
 /// every start, before anything is loaded.
 #[test]
