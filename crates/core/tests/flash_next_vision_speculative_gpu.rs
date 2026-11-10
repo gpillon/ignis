@@ -363,8 +363,9 @@ fn canaries() -> Vec<(String, Vec<u8>, String)> {
 /// with their text controls' embedding rows placed over the placeholders;
 /// then the text controls: each prompt with the image's run -- its vision
 /// start, its placeholders, its vision end -- replaced by its description's
-/// ids, repeated to the run's length; then the piece arms D, E, F. In arm
-/// order, each arm's prompts in the canaries' order.
+/// ids, repeated to the run's length; and the piece arms D, E, F. The piece
+/// arms first, so a span they ask for and a load refuses shows a minute into
+/// the run, then A, B, C; each arm's prompts in the canaries' order.
 fn prompts(dir: &Path) -> Vec<Prompt> {
     let reader = Reader::open(&dir.join(ARTIFACT_FILE_NAME)).expect("open the artifact");
     let frontend = FrontendSet::from_reader(&reader).expect("frontend");
@@ -433,7 +434,7 @@ fn prompts(dir: &Path) -> Vec<Prompt> {
         }
     }
     // Stable: each arm's prompts stay in the canaries' order.
-    all.sort_by_key(|prompt| prompt.arm as usize);
+    all.sort_by_key(|prompt| (prompt.arm.checks_drafters(), prompt.arm as usize));
     all
 }
 
