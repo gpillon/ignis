@@ -104,6 +104,45 @@
 //! rows' rounding into the four streams. Otherwise inconclusive, and reported
 //! so. Whether B sits nearer C or A on a pair is printed beside.
 //!
+//! **Which piece of the path (GitHub #565).** That run read past 1.6x on
+//! every pair (B over C 1.87x, 2.00x, 1.80x). The reference's multimodal
+//! forward differs from its text forward only in the columns it scatters over
+//! the placeholders and the three axes they rotate at: its n-gram rows hash
+//! the placeholder ids as any text (`ple_input_ids` is the input ids, taken
+//! before the scatter), and the scattered rows enter every stream. So B
+//! shares with A, and not with C, three pieces: the three-axis positions with
+//! the rope delta, the n-gram rows hashing the placeholders, and the scatter
+//! of its columns out of the pool -- beside the vision start and end, whose
+//! two rows every arm but C keeps. Three more arms, each B with one piece
+//! taken back to C's, measured as B (the drafter checks, held on A, B and C,
+//! left out):
+//!
+//! - D, B at text positions: its three axes its index on all three, as C's,
+//!   and no rope delta, so its rounds rotate at their positions;
+//! - E, B with the text's n-gram rows: they hash the text control's ids
+//!   (`FlashNextEngine::span`'s `ngram_tokens`), B's columns and positions;
+//! - F, B through the lookup: its placeholders' ids replaced by the text ids
+//!   its columns are the rows of, embedded by the lookup, no pool and no
+//!   scatter; its n-gram rows still hash the placeholders, its positions B's.
+//!
+//! The placed columns are the lookup's own decode of the table, so where the
+//! scatter writes what the lookup writes F computes B bit for bit: held
+//! prompt by prompt, the plain rounds' text and rows and the prompt's last
+//! prefill row. Red: the scatter is the defect.
+//!
+//! The reading, fixed before any run, on each arm's median drift over C on
+//! each route pair: within 1.3x on all three pairs the arm is back, and the
+//! piece it takes away carries the drift; past 1.6x on any pair it is not.
+//! One arm back names the piece; two or more, the pieces carry it only
+//! together; none, no one piece does -- the drift is the multimodal span's as
+//! a whole (or its vision start and end's), the issue closes on that, and the
+//! MTP test keeps ADR 0056's rule.
+//! A piece named is a defect only where a route computes it otherwise than
+//! the reference: every route rotates through one `rope_pair` at the
+//! reference's positions and the n-gram ids are the reference's hashing, so
+//! D or E back names a property of the input; F apart from B is a defect of
+//! the scatter.
+//!
 //! ```text
 //! cargo test -p ignis-core --features cuda --test flash_next_vision_speculative_gpu -- --ignored --nocapture --test-threads=1
 //! ```
@@ -113,7 +152,8 @@
 //! images are the server's fixture (`crates/server/tests/fixtures/vision_canary/`).
 //! Explicit GPU profile (ADR 0006): outside `IGNIS_GPU_PROFILE=1` a missing
 //! artifact, companion or GPU is a skip, under it a failure. Two loads one
-//! after the other, each pinning the ~38 GB expert pool.
+//! after the other, each pinning the ~38 GB expert pool; 48 prompts, the
+//! piece arms' without the drafter checks: about 13 minutes on the RTX 5090.
 
 #![cfg(feature = "cuda")]
 
@@ -221,29 +261,70 @@ enum Arm {
     Placed,
     /// C: the text control.
     Text,
+    /// D (GitHub #565): B at its index on all three axes, no rope delta.
+    TextPositions,
+    /// E: B with its n-gram rows hashing the text control's ids.
+    TextNgram,
+    /// F: B with its placeholders' text ids embedded by the lookup, no
+    /// pool and no scatter.
+    Lookup,
 }
 
 impl Arm {
-    const ALL: [Arm; 3] = [Arm::Image, Arm::Placed, Arm::Text];
+    const ALL: [Arm; 6] = [Arm::Image, Arm::Placed, Arm::Text, Arm::TextPositions, Arm::TextNgram, Arm::Lookup];
+    /// The arms that each take one piece of B's path back to C's.
+    const PIECES: [Arm; 3] = [Arm::TextPositions, Arm::TextNgram, Arm::Lookup];
 
     fn label(self) -> &'static str {
         match self {
             Arm::Image => "image prompts",
             Arm::Placed => "placed text rows",
             Arm::Text => "text controls",
+            Arm::TextPositions => "D, placed at text positions",
+            Arm::TextNgram => "E, placed with the text's n-gram rows",
+            Arm::Lookup => "F, placed through the lookup",
         }
+    }
+
+    /// The piece of B's path the arm takes back to C's.
+    fn piece(self) -> &'static str {
+        match self {
+            Arm::TextPositions => "the three-axis positions and the rope delta (a property of the input)",
+            Arm::TextNgram => "the n-gram rows hashing the placeholders (a property of the input)",
+            Arm::Lookup => "the scatter out of the pool (a defect: it writes what the lookup writes)",
+            Arm::Image | Arm::Placed | Arm::Text => "no piece",
+        }
+    }
+
+    /// Whether the prompt's run holds the drafter checks (A, B, C: the
+    /// module's doc), which the piece arms leave out.
+    fn checks_drafters(self) -> bool {
+        matches!(self, Arm::Image | Arm::Placed | Arm::Text)
     }
 }
 
-/// A prompt: its ids, and an image's positions, rope delta and media item,
-/// with the columns placed over its placeholders where the tower's are not.
+/// What an image prompt's placeholders take (the module's doc).
+enum Placeholders {
+    /// The tower's columns, encoded into the pool (A).
+    Tower,
+    /// Columns placed in the pool, BF16 bits `[placeholders][hidden]` (B, D, E).
+    Placed(Vec<u16>),
+    /// Their ids' rows through the embedding lookup, no pool and no scatter
+    /// (F; and a text prompt's every id).
+    Lookup,
+}
+
+/// A prompt: its ids, the ids its n-gram rows hash where they are not its
+/// own, and an image's positions, rope delta and media item, with what its
+/// placeholders take.
 struct Prompt {
     name: String,
     arm: Arm,
     tokens: Vec<u32>,
+    /// The ids the n-gram rows hash in `tokens`' place (E, F).
+    hashed: Option<Vec<u32>>,
     multimodal: Option<Multimodal>,
-    /// BF16 bits, `[placeholders][hidden]`.
-    placed: Option<Vec<u16>>,
+    placeholders: Placeholders,
 }
 
 /// `ignis_server::media::load_processor`'s processor at this load's context.
@@ -282,13 +363,14 @@ fn canaries() -> Vec<(String, Vec<u8>, String)> {
 /// with their text controls' embedding rows placed over the placeholders;
 /// then the text controls: each prompt with the image's run -- its vision
 /// start, its placeholders, its vision end -- replaced by its description's
-/// ids, repeated to the run's length.
-fn prompts(dir: &Path) -> (Vec<Prompt>, Vec<Prompt>, Vec<Prompt>) {
+/// ids, repeated to the run's length; then the piece arms D, E, F. In arm
+/// order, each arm's prompts in the canaries' order.
+fn prompts(dir: &Path) -> Vec<Prompt> {
     let reader = Reader::open(&dir.join(ARTIFACT_FILE_NAME)).expect("open the artifact");
     let frontend = FrontendSet::from_reader(&reader).expect("frontend");
     let processor = processor(&frontend);
     let (start, end) = (single_id(&frontend, "<|vision_start|>"), single_id(&frontend, "<|vision_end|>"));
-    let (mut images, mut placed, mut texts) = (Vec::new(), Vec::new(), Vec::new());
+    let mut all = Vec::new();
     for (id, image, own) in canaries() {
         let description = DESCRIPTIONS
             .iter()
@@ -317,31 +399,60 @@ fn prompts(dir: &Path) -> (Vec<Prompt>, Vec<Prompt>, Vec<Prompt>) {
             let run: Vec<u32> = described.iter().cycle().take(last + 1 - first).copied().collect();
             let text = [&tokens[..first], &run[..], &tokens[last + 1..]].concat();
             assert_eq!(text.len(), tokens.len(), "{name}: the text control's length");
-            let rows = embedding_rows(&reader, &text[span.begin..span.begin + span.count]);
-            placed.push(Prompt {
-                name: format!("{name} placed"),
-                arm: Arm::Placed,
-                tokens: tokens.clone(),
+            let placeholders = span.begin..span.begin + span.count;
+            let rows = embedding_rows(&reader, &text[placeholders.clone()]);
+            // D: the text control's positions, its index on all three axes, and no rope delta.
+            let linear = Multimodal {
+                positions: (0..3).flat_map(|_| 0..tokens.len() as i32).collect(),
+                rope_delta: 0,
+                media: multimodal.media.clone(),
+            };
+            // F: the ids whose rows B places, where B has its placeholders.
+            let looked_up = [&tokens[..span.begin], &text[placeholders.clone()], &tokens[placeholders.end..]].concat();
+            let prompt = |suffix: &str, arm, tokens: &[u32], hashed: Option<&[u32]>, multimodal: &Multimodal, placeholders| Prompt {
+                name: format!("{name} {suffix}"),
+                arm,
+                tokens: tokens.to_vec(),
+                hashed: hashed.map(<[u32]>::to_vec),
                 multimodal: Some(multimodal.clone()),
-                placed: Some(rows),
+                placeholders,
+            };
+            all.push(prompt("placed", Arm::Placed, &tokens, None, &multimodal, Placeholders::Placed(rows.clone())));
+            all.push(prompt("at text positions", Arm::TextPositions, &tokens, None, &linear, Placeholders::Placed(rows.clone())));
+            all.push(prompt("with text n-gram rows", Arm::TextNgram, &tokens, Some(text.as_slice()), &multimodal, Placeholders::Placed(rows)));
+            all.push(prompt("through the lookup", Arm::Lookup, &looked_up, Some(tokens.as_slice()), &multimodal, Placeholders::Lookup));
+            all.push(Prompt {
+                name: format!("{name} as text"),
+                arm: Arm::Text,
+                tokens: text,
+                hashed: None,
+                multimodal: None,
+                placeholders: Placeholders::Lookup,
             });
-            texts.push(Prompt { name: format!("{name} as text"), arm: Arm::Text, tokens: text, multimodal: None, placed: None });
-            images.push(Prompt { name, arm: Arm::Image, tokens, multimodal: Some(multimodal), placed: None });
+            all.push(Prompt { name, arm: Arm::Image, tokens, hashed: None, multimodal: Some(multimodal), placeholders: Placeholders::Tower });
         }
     }
-    (images, placed, texts)
+    // Stable: each arm's prompts stay in the canaries' order.
+    all.sort_by_key(|prompt| prompt.arm as usize);
+    all
 }
 
 /// The columns `prompt`'s placeholders take on `engine`: its image encoded by
-/// the tower, or the rows placed for it; `None` for a text prompt.
+/// the tower, or the rows placed for it; `None` for a text prompt and for
+/// placeholders taking the lookup's rows.
 fn embedding<'e>(engine: &'e FlashNextEngine, prompt: &Prompt) -> Option<MediaEmbedding<'e>> {
     let multimodal = prompt.multimodal.as_ref()?;
-    Some(match &prompt.placed {
-        Some(rows) => engine.place_media(rows).unwrap_or_else(|e| panic!("{}: place the rows: {e}", prompt.name)),
-        None => engine
-            .encode_media(&multimodal.media[0])
-            .unwrap_or_else(|e| panic!("{}: encode the image: {e}", prompt.name)),
-    })
+    match &prompt.placeholders {
+        Placeholders::Placed(rows) => {
+            Some(engine.place_media(rows).unwrap_or_else(|e| panic!("{}: place the rows: {e}", prompt.name)))
+        }
+        Placeholders::Tower => Some(
+            engine
+                .encode_media(&multimodal.media[0])
+                .unwrap_or_else(|e| panic!("{}: encode the image: {e}", prompt.name)),
+        ),
+        Placeholders::Lookup => None,
+    }
 }
 
 /// A media embedding's columns, as its pool holds them: each one's L2 norm,
@@ -365,7 +476,9 @@ impl ColumnNorms {
 
 /// `prompt` and `appended` (text after it) prefilled from position 0 as one
 /// span -- at the image's three axes with its columns over its placeholders,
-/// or as text: the standing sequence, its context, and every row's logits.
+/// or as text -- its n-gram rows hashing `prompt.hashed` then `appended`
+/// where it names other ids: the standing sequence, its context, and every
+/// row's logits.
 fn standing<'e>(
     engine: &'e FlashNextEngine,
     prompt: &Prompt,
@@ -374,24 +487,22 @@ fn standing<'e>(
 ) -> (Seq<'e>, NgramContext, Vec<u16>) {
     let mut tokens = prompt.tokens.clone();
     tokens.extend_from_slice(appended);
+    let hashed = prompt.hashed.as_ref().map(|ids| [ids.as_slice(), appended].concat());
     let result = match &prompt.multimodal {
-        None => engine.span(&tokens, None, None),
+        None => engine.span(&tokens, hashed.as_deref(), None),
         Some(multimodal) => {
             let mut multimodal = multimodal.clone();
             assert!(multimodal.append_text(appended.len()), "{}: the text continues the prompt's positions", prompt.name);
             let span = multimodal.media[0].token_span;
             let scatter: Vec<i32> = (span.begin as i32..(span.begin + span.count) as i32).collect();
-            let columns = SpanMediaColumns {
-                embedding: media.expect("an image prompt's columns"),
-                first_column: 0,
-                scatter_indices: &scatter,
-            };
+            // None where the placeholders take the lookup's rows (F).
+            let columns = media.map(|embedding| SpanMediaColumns { embedding, first_column: 0, scatter_indices: &scatter });
             let span = MultimodalPrefill {
                 positions: &multimodal.positions,
                 rope_delta: multimodal.rope_delta,
-                media: Some(columns),
+                media: columns,
             };
-            engine.span(&tokens, None, Some(span))
+            engine.span(&tokens, hashed.as_deref(), Some(span))
         }
     };
     result.unwrap_or_else(|e| panic!("{}: the span: {e}", prompt.name))
@@ -576,18 +687,22 @@ fn measure(engine: &FlashNextEngine, prompt: &Prompt, eos: u32) -> Measured {
     let none = speculative(engine, prompt, media, false, Some(&mut |_, _, _| Vec::new()));
     assert!(none.acceptance.1 == 0 && none.acceptance.0 > 0, "{}: none verified drafts", prompt.name);
     let reference = none.tokens.clone();
-    let oracle = speculative(
-        engine,
-        prompt,
-        media,
-        false,
-        Some(&mut |_, emitted: &[u32], w| {
-            let next = emitted.len() + 1;
-            reference[next.min(TOKENS)..(next + w as usize).min(TOKENS)].to_vec()
-        }),
-    );
-    let reject = speculative(engine, prompt, media, false, Some(&mut |_, _, w| vec![REJECTED; w as usize]));
-    let head = speculative(engine, prompt, media, false, None);
+    // The drafter checks, where the arm holds them (the module's doc).
+    let checked = prompt.arm.checks_drafters().then(|| {
+        let oracle = speculative(
+            engine,
+            prompt,
+            media,
+            false,
+            Some(&mut |_, emitted: &[u32], w| {
+                let next = emitted.len() + 1;
+                reference[next.min(TOKENS)..(next + w as usize).min(TOKENS)].to_vec()
+            }),
+        );
+        let reject = speculative(engine, prompt, media, false, Some(&mut |_, _, w| vec![REJECTED; w as usize]));
+        let head = speculative(engine, prompt, media, false, None);
+        [("oracle", oracle), ("reject", reject), ("head", head)]
+    });
     // ADR 0056's teacher-forced run: the plain rounds' own text as drafts.
     let forced = speculative(
         engine,
@@ -602,13 +717,16 @@ fn measure(engine: &FlashNextEngine, prompt: &Prompt, eos: u32) -> Measured {
     let same = |run: &SpecRun| {
         (run.tokens == none.tokens, run.probe.iter().zip(&none.probe).all(|(a, b)| a.to_bits() == b.to_bits()))
     };
-    let drafters = [("oracle", &oracle), ("reject", &reject), ("head", &head)]
-        .into_iter()
+    let drafters = checked
+        .iter()
+        .flatten()
         .map(|(name, run)| {
             let (text, state) = same(run);
-            (name, text, state)
+            (*name, text, state)
         })
         .collect();
+    let head_acceptance = checked.as_ref().map_or((0, 0, 0), |runs| runs[2].1.acceptance);
+    drop(checked);
 
     let along_plain = prefill_route(engine, prompt, media, &plain_text);
     let along_none = prefill_route(engine, prompt, media, &none.tokens);
@@ -650,7 +768,7 @@ fn measure(engine: &FlashNextEngine, prompt: &Prompt, eos: u32) -> Measured {
         margins,
         split,
         drafters,
-        head: head.acceptance,
+        head: head_acceptance,
     }
 }
 
@@ -765,8 +883,10 @@ fn report(measured: &[Measured]) {
                 if s.plain_row_gap_ulps <= PICK_GAP_ULPS { "passes" } else { "FAILS" },
             );
         }
-        let head = of.iter().fold((0, 0, 0), |t, m| (t.0 + m.head.0, t.1 + m.head.1, t.2 + m.head.2));
-        println!("  the head's drafts: {} rounds, {} drafted, {} accepted", head.0, head.1, head.2);
+        if arm.checks_drafters() {
+            let head = of.iter().fold((0, 0, 0), |t, m| (t.0 + m.head.0, t.1 + m.head.1, t.2 + m.head.2));
+            println!("  the head's drafts: {} rounds, {} drafted, {} accepted", head.0, head.1, head.2);
+        }
         stats.push(pairs);
     }
     let (image, placed, text) = (&stats[0], &stats[1], &stats[2]);
@@ -789,6 +909,77 @@ fn report(measured: &[Measured]) {
         "the reading (placed / text medians {placed_over_text:.2?}, cuts {PATH_AS_TEXT}x and {PATH_DRIFTS}x): {}",
         reading(&placed_over_text)
     );
+    // GitHub #565: each piece arm over C, and over B beside.
+    let (mut back, mut between) = (Vec::new(), Vec::new());
+    for arm in Arm::PIECES {
+        let of = &stats[arm as usize];
+        let over_text: Vec<f32> = (0..PAIRS.len()).map(|i| ratio(of[i], text[i]).0).collect();
+        let over_placed: Vec<f32> = (0..PAIRS.len()).map(|i| ratio(of[i], placed[i]).0).collect();
+        let verdict = piece_reading(&over_text);
+        println!(
+            "{} / text drift, medians (plain/prefill, verify/prefill, verify/plain) {over_text:.2?}, over the placed text rows {over_placed:.2?}: {}",
+            arm.label(),
+            match verdict {
+                Some(true) => "back",
+                Some(false) => "not back",
+                None => "between the cuts",
+            }
+        );
+        match verdict {
+            Some(true) => back.push(arm),
+            None => between.push(arm),
+            Some(false) => {}
+        }
+    }
+    println!(
+        "the pieces' reading (cuts {PATH_AS_TEXT}x and {PATH_DRIFTS}x on each arm over the text controls): {}",
+        pieces_reading(&back, &between)
+    );
+}
+
+/// A piece arm's reading on its median over C, each route pair (the module's
+/// doc): back within the first cut on every pair (`Some(true)`), not back past
+/// the second on any (`Some(false)`), else between the cuts.
+fn piece_reading(over_text: &[f32]) -> Option<bool> {
+    if over_text.iter().all(|&r| r <= PATH_AS_TEXT) {
+        Some(true)
+    } else if over_text.iter().any(|&r| r >= PATH_DRIFTS) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// What the piece arms back, and between the cuts, read as (the module's doc).
+fn pieces_reading(back: &[Arm], between: &[Arm]) -> String {
+    let pieces = |arms: &[Arm]| arms.iter().map(|arm| arm.piece()).collect::<Vec<_>>().join("; ");
+    let reading = match back {
+        [] if between.is_empty() => "no one piece carries the drift: it is the multimodal span's as a whole \
+                                     (or its vision start and end's) -- #565 closes on that, the MTP test keeps \
+                                     ADR 0056's rule"
+            .to_owned(),
+        [] => "inconclusive: no arm back".to_owned(),
+        [arm] => format!("one piece carries the drift: {}", arm.piece()),
+        _ => format!("the pieces carry it only together: {}", pieces(back)),
+    };
+    if between.is_empty() {
+        reading
+    } else {
+        format!("{reading}; between the cuts: {}", pieces(between))
+    }
+}
+
+/// F against B, prompt by prompt (the canaries' order in both): whether the
+/// lookup's prompt computes the placed prompt's plain rounds -- their text and
+/// every row -- and its prompt's last prefill row, bit for bit.
+fn lookup_against_placed(measured: &[Measured]) -> Vec<(String, bool)> {
+    let of = move |arm| measured.iter().filter(move |m: &&Measured| m.arm == arm);
+    of(Arm::Lookup)
+        .zip(of(Arm::Placed))
+        .map(|(f, b)| {
+            (f.name.clone(), f.plain == b.plain && f.plain_hashes == b.plain_hashes && f.prompt_row == b.prompt_row)
+        })
+        .collect()
 }
 
 // ── the test ────────────────────────────────────────────────────────────────
@@ -809,12 +1000,12 @@ fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_dr
             return;
         }
     }
-    let (images, placed, texts) = prompts(&dir);
+    let prompts = prompts(&dir);
     let eos = {
         let reader = Reader::open(&path).expect("open the artifact");
         FrontendSet::from_reader(&reader).expect("frontend").eos_token_id().expect("eos")
     };
-    let all: Vec<&Prompt> = images.iter().chain(&placed).chain(&texts).collect();
+    let all: Vec<&Prompt> = prompts.iter().collect();
     for prompt in &all {
         println!("{}: {} prompt tokens", prompt.name, prompt.tokens.len());
     }
@@ -863,6 +1054,11 @@ fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_dr
         );
     }
     report(&measured);
+    let lookup = lookup_against_placed(&measured);
+    println!("F against B, the plain rounds' text and rows and the prompt's last row bit for bit (the scatter writes what the lookup writes):");
+    for (name, equal) in &lookup {
+        println!("  {name}: {equal}");
+    }
     println!("the headless load's plain rounds against the head's load's (all equal, rows differing):");
     for (name, _, equal, differing) in &cross {
         println!("  {name}: {equal} {differing}");
@@ -883,5 +1079,8 @@ fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_dr
             equal,
             "{name}: after the image the load without the head computes another trunk ({differing} rows differ), where the text controls agree"
         );
+    }
+    for (name, equal) in &lookup {
+        assert!(equal, "{name}: the lookup's rows compute other logits than the same rows scattered out of the pool");
     }
 }
