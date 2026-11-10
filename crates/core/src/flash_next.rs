@@ -736,6 +736,12 @@ impl FlashNextEngine {
     /// vision load's embedding pool as an embedding
     /// ([`crate::step::MediaEmbedding::place`]): rows a test knows, for
     /// [`FlashNextEngine::span`] to put over its placeholders.
+    ///
+    /// Test-only, as [`decode_standing`](Self::decode_standing) is: its
+    /// callers, `tests/flash_next_vision_forward_gpu.rs` and
+    /// `tests/flash_next_vision_speculative_gpu.rs`, are integration tests
+    /// outside the crate. No serving path calls it.
+    #[doc(hidden)]
     pub fn place_media(&self, columns: &[u16]) -> Result<MediaEmbedding<'_>, String> {
         MediaEmbedding::place(&self.model, columns)
             .map_err(|(rc, message)| format!("place the media columns ({rc}): {message}"))
@@ -745,6 +751,12 @@ impl FlashNextEngine {
     /// embedding pool, as the leaf encodes a request's image
     /// (`FlashNextLeaf::encode_media`): the columns [`FlashNextEngine::span`]
     /// puts over the item's placeholders.
+    ///
+    /// Test-only, as [`decode_standing`](Self::decode_standing) is: its
+    /// caller, `tests/flash_next_vision_speculative_gpu.rs`, is an
+    /// integration test outside the crate; a request's image is encoded by
+    /// the leaf. No serving path calls it.
+    #[doc(hidden)]
     pub fn encode_media(&self, item: &crate::vision::MediaItem) -> Result<MediaEmbedding<'_>, String> {
         let control = crate::vision::vision_item_control(item.grid);
         crate::step::encode_media(&self.model, item.grid, &item.patches, &control)
@@ -757,6 +769,12 @@ impl FlashNextEngine {
     /// when `None`: a test's reference may embed other ids than it hashes).
     /// Returns every position's BF16 logits, `[tokens][vocab]`, with the
     /// standing sequence and its context, for rounds after it.
+    ///
+    /// Test-only, as [`decode_standing`](Self::decode_standing) is: its
+    /// callers, `tests/flash_next_vision_forward_gpu.rs` and
+    /// `tests/flash_next_vision_speculative_gpu.rs`, are integration tests
+    /// outside the crate. No serving path calls it.
+    #[doc(hidden)]
     pub fn span(
         &self,
         tokens: &[u32],

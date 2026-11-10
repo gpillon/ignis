@@ -1657,6 +1657,11 @@ impl<'m> MediaEmbedding<'m> {
     /// drive a multimodal prefill with columns it knows on a load whose tower
     /// is not bound. The error carries the leaf's code beside its message,
     /// [`MEDIA_ENCODE_POOL_FULL`] as an encode's.
+    ///
+    /// Test-only, as `FlashNextEngine::decode_standing` is: its one caller is
+    /// `FlashNextEngine::place_media`, which integration tests outside the
+    /// crate call. No serving path places columns.
+    #[doc(hidden)]
     pub fn place(model: &'m Model, columns: &[u16]) -> Result<Self, (i32, String)> {
         let mut handle = std::ptr::null_mut();
         let bytes = std::mem::size_of_val(columns) as u64;

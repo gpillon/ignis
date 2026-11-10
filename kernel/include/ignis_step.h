@@ -420,7 +420,8 @@ int32_t ignis_media_embedding_read(const struct ignis_media_embedding *embedding
  * with columns it knows (a token's own embedding row over a placeholder, say)
  * on a load whose tower is not bound. 0 and the handle,
  * IGNIS_MEDIA_ENCODE_POOL_FULL as an encode's, or -1 with
- * ignis_media_last_error. */
+ * ignis_media_last_error. Test-only: no serving path places columns; its one
+ * caller is ignis-core's MediaEmbedding::place, which tests call. */
 int32_t ignis_media_embedding_place(struct ignis_model *model, const void *columns, uint64_t columns_bytes,
                                     struct ignis_media_embedding **out_embedding);
 
