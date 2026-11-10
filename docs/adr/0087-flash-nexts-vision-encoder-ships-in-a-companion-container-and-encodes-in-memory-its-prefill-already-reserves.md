@@ -147,5 +147,6 @@ takes images with the 27B's feature set, and how:
   VRAM line the text-only load plans, and the item bound is 16,384 at an 8,192-token chunk, from the prefill scratch
   alone, and at a 1,024-token chunk, with the ring. MTP-3 on image prompts splits from MTP off only at one-ulp near
   ties and accepts 66.0% of its drafts, against 54.2% on text. The decode gate, vision on with no image in flight
-  against vision off:
-  [GATE: coordinator fills]
+  against vision off: at C=1 99.87% and 100.02% (pooled 99.95%), at C=3 100.04% and 99.99% (pooled 100.01%), the
+  expert cache equal in every leg (16,531,515,984 bytes at a pinned 27 GiB budget) and the texts identical, so the
+  99% gate passes.

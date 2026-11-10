@@ -199,7 +199,10 @@ Paired: Flash-Next only 0, the 27B only 0; difference 0.0, 95% interval [0.0, 0.
   planned four different expert caches because the card's free VRAM moved between legs
   (`H:/fn-vision-560/gate-attempt2-budget-drift/`), so the run below pins `VRAM_BUDGET=27G` in every leg.
 
-[GATE: coordinator fills]
+- The result (`H:/fn-vision-560/gate/verdict.json`; the release build of f749cea0, 2026-11-10): C=1, tokens per
+  second 92.5 (off-1), 92.4 (on-1), 92.5 (on-2), 92.5 (off-2), the pairs 99.87% and 100.02%, pooled 99.95%; C=3,
+  100.9, 100.9, 101.0, 101.0, the pairs 100.04% and 99.99%, pooled 100.01%. The expert cache 16,531,515,984 bytes
+  in every leg; every prompt's text the same in every leg. **The gate passes.**
 
 **4. MTP on image prompts** (#564, #565).
 - `flash_next_vision_mtp_gpu` on the W8 companion (`.scratch/555/gpu/f_mtp.log`): greedy MTP-3 on against off on the
