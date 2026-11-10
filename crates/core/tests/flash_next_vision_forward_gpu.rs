@@ -56,11 +56,16 @@ use std::path::PathBuf;
 
 use ignis_artifact::packer::ARTIFACT_FILE_NAME;
 use ignis_artifact::vision::IMAGE_PAD_ID;
-use ignis_artifact::{NumericFormat, Object, Reader};
+use ignis_artifact::Reader;
 use ignis_core::compute::ModelConfig;
 use ignis_core::flash_next::{EngineOptions, FlashNextEngine};
 use ignis_core::step::{MultimodalPrefill, SamplingParams, SpanMediaColumns};
 use ignis_core::{gpu_profile, EmbeddingWidth, Vision, VisionResidency};
+
+#[path = "support/embedding_rows.rs"]
+mod embedding_rows;
+
+use embedding_rows::embedding_rows;
 
 const MODEL_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
 const MAX_CONTEXT: u32 = 8192;
@@ -107,6 +112,12 @@ fn prompt(count: usize) -> Option<Vec<u32>> {
     Some(tokens[..count].to_vec())
 }
 
+/// The artifact, for its embedding table.
+fn artifact() -> Reader {
+    let path = model_dir().join(ARTIFACT_FILE_NAME);
+    Reader::open(&path).unwrap_or_else(|e| panic!("open {}: {e:?}", path.display()))
+}
+
 fn bf16(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
@@ -115,59 +126,6 @@ fn bf16(bits: u16) -> f32 {
 fn bf16_ulp(x: f32) -> f32 {
     let exponent = ((x.abs().to_bits() >> 23) & 0xff) as i32 - 127;
     2f32.powi(exponent - 7)
-}
-
-/// `v` rounded to BF16, to nearest even: CUDA's `__float2bfloat16`.
-fn to_bf16(v: f32) -> u16 {
-    let bits = v.to_bits();
-    if v.is_nan() {
-        return 0x7FC0;
-    }
-    ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
-}
-
-/// An FP8 E4M3FN code's value (bias 7, subnormals below exponent 1, no
-/// infinities; 0x7F and 0xFF are NaN).
-fn e4m3(code: u8) -> f32 {
-    let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };
-    let exponent = i32::from((code >> 3) & 0x0F);
-    let mantissa = f32::from(code & 0x07);
-    if code & 0x7F == 0x7F {
-        return f32::NAN;
-    }
-    sign * if exponent == 0 { mantissa / 8.0 * 2f32.powi(-6) } else { (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7) }
-}
-
-/// The embedding rows of `tokens` as the leaf's embedding writes them into
-/// every stream (`fn_embed`): an FP8 row-scale table decoded as
-/// bf16(e4m3(code) * scale), a BF16 table copied. BF16 bits, `[tokens][hidden]`:
-/// the columns a placeholder of each token's place takes.
-fn embedding_rows(tokens: &[u32]) -> Vec<u16> {
-    let path = model_dir().join(ARTIFACT_FILE_NAME);
-    let reader = Reader::open(&path).unwrap_or_else(|e| panic!("open {}: {e:?}", path.display()));
-    let name = "embed_tokens.weight";
-    let Some(Object::Tensor(tensor)) = reader.find(name) else { panic!("the artifact has no tensor {name}") };
-    let (rows, hidden) = (tensor.shape[0] as usize, tensor.shape[1] as usize);
-    let data = reader.payload(name).unwrap_or_else(|e| panic!("{name}'s payload: {e:?}")).data;
-    let mut out = Vec::with_capacity(tokens.len() * hidden);
-    for &token in tokens {
-        let token = token as usize;
-        assert!(token < rows, "token {token} past the table's {rows} rows");
-        match tensor.format {
-            NumericFormat::Bf16 => {
-                let row = &data[token * hidden * 2..(token + 1) * hidden * 2];
-                out.extend(row.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])));
-            }
-            NumericFormat::Fp8E4M3FnRowBf16S => {
-                let geometry = ignis_artifact::row_scale_geometry(tensor.format, &tensor.shape).expect("row-scale geometry");
-                let at = geometry.scale_plane_offset as usize + token * 2;
-                let scale = bf16(u16::from_le_bytes([data[at], data[at + 1]]));
-                out.extend(data[token * hidden..(token + 1) * hidden].iter().map(|&code| to_bf16(e4m3(code) * scale)));
-            }
-            format => panic!("{name} is {format:?}, which this test does not decode"),
-        }
-    }
-    out
 }
 
 /// Three axes equal to positions 0.., axis-major `[3][count]`: a text span
@@ -220,7 +178,7 @@ fn media_columns_replace_their_placeholders_in_every_stream() {
     let Some(tokens) = prompt(300) else { return };
     let (first, count) = (100usize, 150usize);
     let placeholders = with_placeholders(&tokens, first, count);
-    let columns = embedding_rows(&tokens[first..first + count]);
+    let columns = embedding_rows(&artifact(), &tokens[first..first + count]);
     let scatter: Vec<i32> = (first as i32..(first + count) as i32).collect();
     let axes = equal_axes(tokens.len());
     let config = ModelConfig::qwen38_flash_next();
@@ -270,7 +228,7 @@ fn the_axes_and_the_rope_delta_reach_the_forward() {
     let Some(tokens) = prompt(N) else { return };
     let count = SIDE * SIDE;
     let placeholders = with_placeholders(&tokens, FIRST, count);
-    let columns = embedding_rows(&tokens[FIRST..FIRST + count]);
+    let columns = embedding_rows(&artifact(), &tokens[FIRST..FIRST + count]);
     let scatter: Vec<i32> = (FIRST as i32..(FIRST + count) as i32).collect();
     // The reference's rule (Qwen3.5's get_rope_index): text on all three
     // axes; the image's tokens at its start plus their row and column; the

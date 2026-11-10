@@ -20,8 +20,9 @@
 //! lane, 128-token chunks, MTP-3 -- the failing test's settings), and the
 //! canary prompts beside text controls of the same length, each image's
 //! placeholder run (with its vision start and end) replaced by a sentence
-//! describing it, repeated to the run's length: the same positions, no image.
-//! 64 greedy tokens a prompt. What it holds (exact, BF16 KV):
+//! describing it, repeated to the run's length: the same positions, no image
+//! (and beside themselves with a text's rows for the image's, the arms
+//! below). 64 greedy tokens a prompt. What it holds (exact, BF16 KV):
 //!
 //! - **A rejected draft after an image is a draft never made.** On the MTP
 //!   load, from the same standing prompt: rounds without drafts (`none`), a
@@ -36,15 +37,17 @@
 //! - **The head's load computes the headless load's trunk after an image.**
 //!   The plain rounds on the MTP load commit the load without the head's
 //!   tokens with its logits, every round bit for bit, and the prompt's last
-//!   prefill row too -- held for the image prompts whenever the text controls
-//!   hold it. Red: the head's entries or sections reach the trunk after an
-//!   image -- (a). Where the text controls differ across the loads too, the
-//!   two loads compute differently whatever the prompt (no text test compares
-//!   across them): printed, not held, and not the image's doing -- though the
-//!   failing test's split then carries that difference beside the routes'.
+//!   prefill row too -- held for the image prompts and the placed ones
+//!   whenever the text controls hold it. Red: the head's entries or sections
+//!   reach the trunk after an image -- (a). Where the text controls differ
+//!   across the loads too, the two loads compute differently whatever the
+//!   prompt (no text test compares across them): printed, not held, and not
+//!   the image's doing -- though the failing test's split then carries that
+//!   difference beside the routes'.
 //!
-//! What it reports, per kind (image prompts, text controls), along each
-//! route's own text with the prefill of that text as the reference: the
+//! What it reports, per kind (image prompts, placed text rows, text
+//! controls: the arms below), along each route's own text with the prefill
+//! of that text as the reference: the
 //! largest logit drift a row (BF16 ulps at the row's largest magnitude, as
 //! `support/logit_drift.rs` measures it) for the plain round against the
 //! prefill, the verify round against the prefill, and the verify round
@@ -66,6 +69,80 @@
 //! the failing rule asks the prefill route to referee two routes it sits as
 //! far from as they sit from each other. The rule is the owner's to change.
 //!
+//! **Whether the image's rows or the multimodal path doubles the drift.** The
+//! first run was all green, every route pair about twice as far on the image
+//! prompts as on their text controls; the owner's call (2026-11-09): one
+//! decisive experiment, then the fix or the rule. So each image prompt runs a
+//! second time with its columns placed, not encoded
+//! (`FlashNextEngine::place_media`, the forward test's placed columns): its
+//! text control's own embedding rows at the placeholders' places. All else
+//! is the image prompt's -- its ids, its three-axis positions and rope delta,
+//! the pool and the scatter of its columns over the placeholders, its n-gram
+//! rows hashing the placeholders, its vision start and end. Three arms:
+//!
+//! - A, the image prompts: the multimodal path, the tower's rows.
+//! - B, the placed text rows: the multimodal path, a text's rows.
+//! - C, the text controls: a text's rows and no multimodal path. Its rows are
+//!   B's but at the run's two ends (the description where B has the vision
+//!   start and end), and its n-gram rows hash the description where B's hash
+//!   the placeholders.
+//!
+//! Beside the drifts, each arm's columns as the pool holds them, read back:
+//! their per-row L2 norm (median, p90, max) and largest |x|, the tower's
+//! rows against a text's; and each pair's drift in logits beside the ulp it
+//! is counted in (the reference row's largest magnitude's, which doubles at
+//! each power of two).
+//!
+//! The reading, fixed before any run, on each route pair's median drift, B
+//! over C. Within 1.3x on all three pairs: the multimodal path drifts as text
+//! does, and A's extra drift is its rows' statistics (the norms beside) -- no
+//! fix, and the MTP test's split takes ADR 0056's rule. Past 1.6x on any
+//! pair: the path itself drifts, a fix, test first, where the pair points --
+//! plain round against prefill, the decode's rotation at its position plus
+//! the delta against the prefill's three axes; a verify pair, the verify
+//! round's columns over the image's keys; any pair, the scatter or the media
+//! rows' rounding into the four streams. Otherwise inconclusive, and reported
+//! so. Whether B sits nearer C or A on a pair is printed beside.
+//!
+//! **Which piece of the path (GitHub #565).** That run read past 1.6x on
+//! every pair (B over C 1.87x, 2.00x, 1.80x). The reference's multimodal
+//! forward differs from its text forward only in the columns it scatters over
+//! the placeholders and the three axes they rotate at: its n-gram rows hash
+//! the placeholder ids as any text (`ple_input_ids` is the input ids, taken
+//! before the scatter), and the scattered rows enter every stream. So B
+//! shares with A, and not with C, three pieces: the three-axis positions with
+//! the rope delta, the n-gram rows hashing the placeholders, and the scatter
+//! of its columns out of the pool -- beside the vision start and end, whose
+//! two rows every arm but C keeps. Three more arms, each B with one piece
+//! taken back to C's, measured as B (the drafter checks, held on A, B and C,
+//! left out):
+//!
+//! - D, B at text positions: its three axes its index on all three, as C's,
+//!   and no rope delta, so its rounds rotate at their positions;
+//! - E, B with the text's n-gram rows: they hash the text control's ids
+//!   (`FlashNextEngine::span`'s `ngram_tokens`), B's columns and positions;
+//! - F, B through the lookup: its placeholders' ids replaced by the text ids
+//!   its columns are the rows of, embedded by the lookup, no pool and no
+//!   scatter; its n-gram rows still hash the placeholders, its positions B's.
+//!
+//! The placed columns are the lookup's own decode of the table, so where the
+//! scatter writes what the lookup writes F computes B bit for bit: held
+//! prompt by prompt, the plain rounds' text and rows and the prompt's last
+//! prefill row. Red: the scatter is the defect.
+//!
+//! The reading, fixed before any run, on each arm's median drift over C on
+//! each route pair: within 1.3x on all three pairs the arm is back, and the
+//! piece it takes away carries the drift; past 1.6x on any pair it is not.
+//! One arm back names the piece; two or more, the pieces carry it only
+//! together; none, no one piece does -- the drift is the multimodal span's as
+//! a whole (or its vision start and end's), the issue closes on that, and the
+//! MTP test keeps ADR 0056's rule.
+//! A piece named is a defect only where a route computes it otherwise than
+//! the reference: every route rotates through one `rope_pair` at the
+//! reference's positions and the n-gram ids are the reference's hashing, so
+//! D or E back names a property of the input; F apart from B is a defect of
+//! the scatter.
+//!
 //! ```text
 //! cargo test -p ignis-core --features cuda --test flash_next_vision_speculative_gpu -- --ignored --nocapture --test-threads=1
 //! ```
@@ -75,7 +152,8 @@
 //! images are the server's fixture (`crates/server/tests/fixtures/vision_canary/`).
 //! Explicit GPU profile (ADR 0006): outside `IGNIS_GPU_PROFILE=1` a missing
 //! artifact, companion or GPU is a skip, under it a failure. Two loads one
-//! after the other, each pinning the ~38 GB expert pool.
+//! after the other, each pinning the ~38 GB expert pool; 48 prompts, the
+//! piece arms' without the drafter checks: about 13 minutes on the RTX 5090.
 
 #![cfg(feature = "cuda")]
 
@@ -86,6 +164,7 @@ use std::path::{Path, PathBuf};
 use ignis_artifact::packer::ARTIFACT_FILE_NAME;
 use ignis_artifact::vision::VisionProcessor;
 use ignis_artifact::{ChatMessage, ChatRenderOptions, ContentPart, FrontendSet, MessageContent, Reader, Role};
+use ignis_core::compute::ModelConfig;
 use ignis_core::flash_next::{EngineOptions, FlashNextEngine, LaneRound, RoundLogits};
 use ignis_core::kv_format::KvFormat;
 use ignis_core::ngram::NgramContext;
@@ -99,6 +178,11 @@ use ignis_core::{gpu_profile, Vision, VisionResidency};
 mod logit_drift;
 
 use logit_drift::{bf16, bf16_ulp, row_drift, RowDrift, PICK_GAP_ULPS};
+
+#[path = "support/embedding_rows.rs"]
+mod embedding_rows;
+
+use embedding_rows::embedding_rows;
 
 const MODEL_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
 const MAX_CONTEXT: u32 = 8192;
@@ -168,11 +252,79 @@ fn wait_for_host_memory(before: u64) {
 
 // ── the prompts ─────────────────────────────────────────────────────────────
 
-/// A prompt: its ids, and an image's positions, rope delta and media item.
+/// Which arm of the drift experiment a prompt is (the module's doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arm {
+    /// A: a canary image, its columns the tower's.
+    Image,
+    /// B: the same prompt, its columns its text control's embedding rows.
+    Placed,
+    /// C: the text control.
+    Text,
+    /// D (GitHub #565): B at its index on all three axes, no rope delta.
+    TextPositions,
+    /// E: B with its n-gram rows hashing the text control's ids.
+    TextNgram,
+    /// F: B with its placeholders' text ids embedded by the lookup, no
+    /// pool and no scatter.
+    Lookup,
+}
+
+impl Arm {
+    const ALL: [Arm; 6] = [Arm::Image, Arm::Placed, Arm::Text, Arm::TextPositions, Arm::TextNgram, Arm::Lookup];
+    /// The arms that each take one piece of B's path back to C's.
+    const PIECES: [Arm; 3] = [Arm::TextPositions, Arm::TextNgram, Arm::Lookup];
+
+    fn label(self) -> &'static str {
+        match self {
+            Arm::Image => "image prompts",
+            Arm::Placed => "placed text rows",
+            Arm::Text => "text controls",
+            Arm::TextPositions => "D, placed at text positions",
+            Arm::TextNgram => "E, placed with the text's n-gram rows",
+            Arm::Lookup => "F, placed through the lookup",
+        }
+    }
+
+    /// The piece of B's path the arm takes back to C's.
+    fn piece(self) -> &'static str {
+        match self {
+            Arm::TextPositions => "the three-axis positions and the rope delta (a property of the input)",
+            Arm::TextNgram => "the n-gram rows hashing the placeholders (a property of the input)",
+            Arm::Lookup => "the scatter out of the pool (a defect: it writes what the lookup writes)",
+            Arm::Image | Arm::Placed | Arm::Text => "no piece",
+        }
+    }
+
+    /// Whether the prompt's run holds the drafter checks (A, B, C: the
+    /// module's doc), which the piece arms leave out.
+    fn checks_drafters(self) -> bool {
+        matches!(self, Arm::Image | Arm::Placed | Arm::Text)
+    }
+}
+
+/// What an image prompt's placeholders take (the module's doc).
+enum Placeholders {
+    /// The tower's columns, encoded into the pool (A).
+    Tower,
+    /// Columns placed in the pool, BF16 bits `[placeholders][hidden]` (B, D, E).
+    Placed(Vec<u16>),
+    /// Their ids' rows through the embedding lookup, no pool and no scatter
+    /// (F; and a text prompt's every id).
+    Lookup,
+}
+
+/// A prompt: its ids, the ids its n-gram rows hash where they are not its
+/// own, and an image's positions, rope delta and media item, with what its
+/// placeholders take.
 struct Prompt {
     name: String,
+    arm: Arm,
     tokens: Vec<u32>,
+    /// The ids the n-gram rows hash in `tokens`' place (E, F).
+    hashed: Option<Vec<u32>>,
     multimodal: Option<Multimodal>,
+    placeholders: Placeholders,
 }
 
 /// `ignis_server::media::load_processor`'s processor at this load's context.
@@ -207,16 +359,19 @@ fn canaries() -> Vec<(String, Vec<u8>, String)> {
 }
 
 /// Each canary with its own question and the long one, thinking off and the
-/// image first (`flash_next_vision_mtp_gpu.rs`'s `prepare`), then the text
-/// controls: each prompt with the image's run -- its vision start, its
-/// placeholders, its vision end -- replaced by its description's ids,
-/// repeated to the run's length.
-fn prompts(dir: &Path) -> (Vec<Prompt>, Vec<Prompt>) {
+/// image first (`flash_next_vision_mtp_gpu.rs`'s `prepare`); the same prompts
+/// with their text controls' embedding rows placed over the placeholders;
+/// then the text controls: each prompt with the image's run -- its vision
+/// start, its placeholders, its vision end -- replaced by its description's
+/// ids, repeated to the run's length; and the piece arms D, E, F. The piece
+/// arms first, so a span they ask for and a load refuses shows a minute into
+/// the run, then A, B, C; each arm's prompts in the canaries' order.
+fn prompts(dir: &Path) -> Vec<Prompt> {
     let reader = Reader::open(&dir.join(ARTIFACT_FILE_NAME)).expect("open the artifact");
     let frontend = FrontendSet::from_reader(&reader).expect("frontend");
     let processor = processor(&frontend);
     let (start, end) = (single_id(&frontend, "<|vision_start|>"), single_id(&frontend, "<|vision_end|>"));
-    let (mut images, mut texts) = (Vec::new(), Vec::new());
+    let mut all = Vec::new();
     for (id, image, own) in canaries() {
         let description = DESCRIPTIONS
             .iter()
@@ -245,16 +400,86 @@ fn prompts(dir: &Path) -> (Vec<Prompt>, Vec<Prompt>) {
             let run: Vec<u32> = described.iter().cycle().take(last + 1 - first).copied().collect();
             let text = [&tokens[..first], &run[..], &tokens[last + 1..]].concat();
             assert_eq!(text.len(), tokens.len(), "{name}: the text control's length");
-            texts.push(Prompt { name: format!("{name} as text"), tokens: text, multimodal: None });
-            images.push(Prompt { name, tokens, multimodal: Some(multimodal) });
+            let placeholders = span.begin..span.begin + span.count;
+            let rows = embedding_rows(&reader, &text[placeholders.clone()]);
+            // D: the text control's positions, its index on all three axes, and no rope delta.
+            let linear = Multimodal {
+                positions: (0..3).flat_map(|_| 0..tokens.len() as i32).collect(),
+                rope_delta: 0,
+                media: multimodal.media.clone(),
+            };
+            // F: the ids whose rows B places, where B has its placeholders.
+            let looked_up = [&tokens[..span.begin], &text[placeholders.clone()], &tokens[placeholders.end..]].concat();
+            let prompt = |suffix: &str, arm, tokens: &[u32], hashed: Option<&[u32]>, multimodal: &Multimodal, placeholders| Prompt {
+                name: format!("{name} {suffix}"),
+                arm,
+                tokens: tokens.to_vec(),
+                hashed: hashed.map(<[u32]>::to_vec),
+                multimodal: Some(multimodal.clone()),
+                placeholders,
+            };
+            all.push(prompt("placed", Arm::Placed, &tokens, None, &multimodal, Placeholders::Placed(rows.clone())));
+            all.push(prompt("at text positions", Arm::TextPositions, &tokens, None, &linear, Placeholders::Placed(rows.clone())));
+            all.push(prompt("with text n-gram rows", Arm::TextNgram, &tokens, Some(text.as_slice()), &multimodal, Placeholders::Placed(rows)));
+            all.push(prompt("through the lookup", Arm::Lookup, &looked_up, Some(tokens.as_slice()), &multimodal, Placeholders::Lookup));
+            all.push(Prompt {
+                name: format!("{name} as text"),
+                arm: Arm::Text,
+                tokens: text,
+                hashed: None,
+                multimodal: None,
+                placeholders: Placeholders::Lookup,
+            });
+            all.push(Prompt { name, arm: Arm::Image, tokens, hashed: None, multimodal: Some(multimodal), placeholders: Placeholders::Tower });
         }
     }
-    (images, texts)
+    // Stable: each arm's prompts stay in the canaries' order.
+    all.sort_by_key(|prompt| (prompt.arm.checks_drafters(), prompt.arm as usize));
+    all
+}
+
+/// The columns `prompt`'s placeholders take on `engine`: its image encoded by
+/// the tower, or the rows placed for it; `None` for a text prompt and for
+/// placeholders taking the lookup's rows.
+fn embedding<'e>(engine: &'e FlashNextEngine, prompt: &Prompt) -> Option<MediaEmbedding<'e>> {
+    let multimodal = prompt.multimodal.as_ref()?;
+    match &prompt.placeholders {
+        Placeholders::Placed(rows) => {
+            Some(engine.place_media(rows).unwrap_or_else(|e| panic!("{}: place the rows: {e}", prompt.name)))
+        }
+        Placeholders::Tower => Some(
+            engine
+                .encode_media(&multimodal.media[0])
+                .unwrap_or_else(|e| panic!("{}: encode the image: {e}", prompt.name)),
+        ),
+        Placeholders::Lookup => None,
+    }
+}
+
+/// A media embedding's columns, as its pool holds them: each one's L2 norm,
+/// and the largest |x| of any.
+struct ColumnNorms {
+    l2: Vec<f32>,
+    max_abs: f32,
+}
+
+impl ColumnNorms {
+    fn of(media: &MediaEmbedding<'_>) -> Self {
+        let hidden = ModelConfig::qwen38_flash_next().hidden;
+        let bits = media.read_bits(hidden).expect("read the columns back");
+        let l2 = bits
+            .chunks_exact(hidden as usize)
+            .map(|column| column.iter().map(|&b| f64::from(bf16(b)).powi(2)).sum::<f64>().sqrt() as f32)
+            .collect();
+        Self { l2, max_abs: bits.iter().map(|&b| bf16(b).abs()).fold(0f32, f32::max) }
+    }
 }
 
 /// `prompt` and `appended` (text after it) prefilled from position 0 as one
 /// span -- at the image's three axes with its columns over its placeholders,
-/// or as text: the standing sequence, its context, and every row's logits.
+/// or as text -- its n-gram rows hashing `prompt.hashed` then `appended`
+/// where it names other ids: the standing sequence, its context, and every
+/// row's logits.
 fn standing<'e>(
     engine: &'e FlashNextEngine,
     prompt: &Prompt,
@@ -263,24 +488,22 @@ fn standing<'e>(
 ) -> (Seq<'e>, NgramContext, Vec<u16>) {
     let mut tokens = prompt.tokens.clone();
     tokens.extend_from_slice(appended);
+    let hashed = prompt.hashed.as_ref().map(|ids| [ids.as_slice(), appended].concat());
     let result = match &prompt.multimodal {
-        None => engine.span(&tokens, None, None),
+        None => engine.span(&tokens, hashed.as_deref(), None),
         Some(multimodal) => {
             let mut multimodal = multimodal.clone();
             assert!(multimodal.append_text(appended.len()), "{}: the text continues the prompt's positions", prompt.name);
             let span = multimodal.media[0].token_span;
             let scatter: Vec<i32> = (span.begin as i32..(span.begin + span.count) as i32).collect();
-            let columns = SpanMediaColumns {
-                embedding: media.expect("an image prompt's columns"),
-                first_column: 0,
-                scatter_indices: &scatter,
-            };
+            // None where the placeholders take the lookup's rows (F).
+            let columns = media.map(|embedding| SpanMediaColumns { embedding, first_column: 0, scatter_indices: &scatter });
             let span = MultimodalPrefill {
                 positions: &multimodal.positions,
                 rope_delta: multimodal.rope_delta,
-                media: Some(columns),
+                media: columns,
             };
-            engine.span(&tokens, None, Some(span))
+            engine.span(&tokens, hashed.as_deref(), Some(span))
         }
     };
     result.unwrap_or_else(|e| panic!("{}: the span: {e}", prompt.name))
@@ -417,7 +640,9 @@ struct Split {
 /// What one prompt measured on the MTP load.
 struct Measured {
     name: String,
-    image: bool,
+    arm: Arm,
+    /// The columns the image's placeholders took (`None` on text).
+    norms: Option<ColumnNorms>,
     plain: Vec<u32>,
     plain_hashes: Vec<u64>,
     prompt_row: u64,
@@ -456,26 +681,29 @@ fn top_two_margin_ulps(row: &[u16]) -> f32 {
 }
 
 fn measure(engine: &FlashNextEngine, prompt: &Prompt, eos: u32) -> Measured {
-    let media = prompt.multimodal.as_ref().map(|m| {
-        engine.encode_media(&m.media[0]).unwrap_or_else(|e| panic!("{}: encode the image: {e}", prompt.name))
-    });
+    let media = embedding(engine, prompt);
+    let norms = media.as_ref().map(ColumnNorms::of);
     let media = media.as_ref();
     let (plain_text, plain_rows, prompt_row) = plain(engine, prompt, media);
     let none = speculative(engine, prompt, media, false, Some(&mut |_, _, _| Vec::new()));
     assert!(none.acceptance.1 == 0 && none.acceptance.0 > 0, "{}: none verified drafts", prompt.name);
     let reference = none.tokens.clone();
-    let oracle = speculative(
-        engine,
-        prompt,
-        media,
-        false,
-        Some(&mut |_, emitted: &[u32], w| {
-            let next = emitted.len() + 1;
-            reference[next.min(TOKENS)..(next + w as usize).min(TOKENS)].to_vec()
-        }),
-    );
-    let reject = speculative(engine, prompt, media, false, Some(&mut |_, _, w| vec![REJECTED; w as usize]));
-    let head = speculative(engine, prompt, media, false, None);
+    // The drafter checks, where the arm holds them (the module's doc).
+    let checked = prompt.arm.checks_drafters().then(|| {
+        let oracle = speculative(
+            engine,
+            prompt,
+            media,
+            false,
+            Some(&mut |_, emitted: &[u32], w| {
+                let next = emitted.len() + 1;
+                reference[next.min(TOKENS)..(next + w as usize).min(TOKENS)].to_vec()
+            }),
+        );
+        let reject = speculative(engine, prompt, media, false, Some(&mut |_, _, w| vec![REJECTED; w as usize]));
+        let head = speculative(engine, prompt, media, false, None);
+        [("oracle", oracle), ("reject", reject), ("head", head)]
+    });
     // ADR 0056's teacher-forced run: the plain rounds' own text as drafts.
     let forced = speculative(
         engine,
@@ -490,13 +718,16 @@ fn measure(engine: &FlashNextEngine, prompt: &Prompt, eos: u32) -> Measured {
     let same = |run: &SpecRun| {
         (run.tokens == none.tokens, run.probe.iter().zip(&none.probe).all(|(a, b)| a.to_bits() == b.to_bits()))
     };
-    let drafters = [("oracle", &oracle), ("reject", &reject), ("head", &head)]
-        .into_iter()
+    let drafters = checked
+        .iter()
+        .flatten()
         .map(|(name, run)| {
             let (text, state) = same(run);
-            (name, text, state)
+            (*name, text, state)
         })
         .collect();
+    let head_acceptance = checked.as_ref().map_or((0, 0, 0), |runs| runs[2].1.acceptance);
+    drop(checked);
 
     let along_plain = prefill_route(engine, prompt, media, &plain_text);
     let along_none = prefill_route(engine, prompt, media, &none.tokens);
@@ -527,7 +758,8 @@ fn measure(engine: &FlashNextEngine, prompt: &Prompt, eos: u32) -> Measured {
     });
     Measured {
         name: prompt.name.clone(),
-        image: prompt.multimodal.is_some(),
+        arm: prompt.arm,
+        norms,
         plain_hashes: plain_rows.iter().map(|row| hash(row)).collect(),
         plain: plain_text,
         prompt_row,
@@ -537,7 +769,7 @@ fn measure(engine: &FlashNextEngine, prompt: &Prompt, eos: u32) -> Measured {
         margins,
         split,
         drafters,
-        head: head.acceptance,
+        head: head_acceptance,
     }
 }
 
@@ -553,16 +785,25 @@ fn quantile(values: &mut [f32], q: f64) -> f32 {
 }
 
 /// A route pair's drift over `rows`: median, p90, p99, max ulps, and its
-/// moved picks with their gaps in the reference row.
+/// moved picks with their gaps in the reference row; then the same drift in
+/// logits (median, p99) and the ulp it was counted in (median).
 fn drift_line(what: &str, rows: &[&RowDrift]) -> (String, f32, f32) {
     let mut ulps: Vec<f32> = rows.iter().map(|d| d.ulps).collect();
     let (median, p90, p99, max) =
         (quantile(&mut ulps, 0.5), quantile(&mut ulps, 0.9), quantile(&mut ulps, 0.99), quantile(&mut ulps, 1.0));
     let moved: Vec<f32> = rows.iter().filter(|d| d.pick_off != d.pick_on).map(|d| d.gap_ulps).collect();
+    let mut logits: Vec<f32> = rows.iter().map(|d| d.max_abs).collect();
+    // A row that did not move says nothing of its ulp.
+    let mut ulp: Vec<f32> = rows.iter().filter(|d| d.ulps > 0.0).map(|d| d.max_abs / d.ulps).collect();
     let line = format!(
-        "{what:30} {:4} rows  drift ulps median {median:6.2} p90 {p90:6.2} p99 {p99:6.2} max {max:6.2}  picks moved {} at gaps {moved:?}",
+        "{what:30} {:4} rows  drift ulps median {median:6.2} p90 {p90:6.2} p99 {p99:6.2} max {max:6.2}  picks moved {} at gaps {moved:?}\n\
+         {:32}in logits median {:.4} p99 {:.4}, at an ulp of median {}",
         rows.len(),
-        moved.len()
+        moved.len(),
+        "",
+        quantile(&mut logits, 0.5),
+        quantile(&mut logits, 0.99),
+        quantile(&mut ulp, 0.5)
     );
     (line, median, p99)
 }
@@ -578,17 +819,48 @@ fn pair(m: &Measured, index: usize) -> &[RowDrift] {
     }
 }
 
+/// The reading's cuts on B over C, each route pair's median drift (the
+/// module's doc): within the first on every pair, the path drifts as text
+/// does; past the second on any, the path drifts.
+const PATH_AS_TEXT: f32 = 1.3;
+const PATH_DRIFTS: f32 = 1.6;
+
+/// The reading of B over C's median ratio on each route pair.
+fn reading(placed_over_text: &[f32]) -> &'static str {
+    if placed_over_text.iter().all(|&r| r <= PATH_AS_TEXT) {
+        "the multimodal path drifts as text does: the image's extra drift is its rows' statistics -- \
+         no fix, the MTP test's split takes ADR 0056's rule"
+    } else if placed_over_text.iter().any(|&r| r >= PATH_DRIFTS) {
+        "the multimodal path itself drifts, on the pairs past the cut: look for the cause and fix it, test first"
+    } else {
+        "inconclusive: a pair between the cuts, none past them"
+    }
+}
+
 fn report(measured: &[Measured]) {
-    let mut medians = Vec::new();
-    for (kind, image) in [("image prompts", true), ("text controls", false)] {
-        let of: Vec<&Measured> = measured.iter().filter(|m| m.image == image).collect();
-        println!("{kind}:");
-        let mut stats = Vec::new();
+    // Per arm, each pair's (median, p99) drift ulps.
+    let mut stats = Vec::new();
+    for arm in Arm::ALL {
+        let of: Vec<&Measured> = measured.iter().filter(|m| m.arm == arm).collect();
+        println!("{}:", arm.label());
+        let mut pairs = Vec::new();
         for (index, what) in PAIRS.iter().enumerate() {
             let all: Vec<&RowDrift> = of.iter().flat_map(|m| pair(m, index)).collect();
             let (line, median, p99) = drift_line(what, &all);
             println!("  {line}");
-            stats.push((median, p99));
+            pairs.push((median, p99));
+        }
+        let norms: Vec<&ColumnNorms> = of.iter().filter_map(|m| m.norms.as_ref()).collect();
+        if !norms.is_empty() {
+            let mut l2: Vec<f32> = norms.iter().flat_map(|n| n.l2.iter().copied()).collect();
+            let max_abs = norms.iter().map(|n| n.max_abs).fold(0f32, f32::max);
+            println!(
+                "  the columns: {} (with repeats), L2 median {:.3} p90 {:.3} max {:.3}; largest |x| {max_abs}",
+                l2.len(),
+                quantile(&mut l2, 0.5),
+                quantile(&mut l2, 0.9),
+                quantile(&mut l2, 1.0)
+            );
         }
         let margins: Vec<f32> = of.iter().flat_map(|m| m.margins.iter().copied()).collect();
         println!(
@@ -612,18 +884,103 @@ fn report(measured: &[Measured]) {
                 if s.plain_row_gap_ulps <= PICK_GAP_ULPS { "passes" } else { "FAILS" },
             );
         }
-        let head = of.iter().fold((0, 0, 0), |t, m| (t.0 + m.head.0, t.1 + m.head.1, t.2 + m.head.2));
-        println!("  the head's drafts: {} rounds, {} drafted, {} accepted", head.0, head.1, head.2);
-        medians.push(stats);
+        if arm.checks_drafters() {
+            let head = of.iter().fold((0, 0, 0), |t, m| (t.0 + m.head.0, t.1 + m.head.1, t.2 + m.head.2));
+            println!("  the head's drafts: {} rounds, {} drafted, {} accepted", head.0, head.1, head.2);
+        }
+        stats.push(pairs);
     }
+    let (image, placed, text) = (&stats[0], &stats[1], &stats[2]);
+    let ratio = |a: (f32, f32), b: (f32, f32)| (a.0 / b.0.max(f32::MIN_POSITIVE), a.1 / b.1.max(f32::MIN_POSITIVE));
+    let mut placed_over_text = Vec::new();
     for (i, name) in PAIRS.iter().enumerate() {
-        let (image, text) = (medians[0][i], medians[1][i]);
+        let (ac, bc, ab) = (ratio(image[i], text[i]), ratio(placed[i], text[i]), ratio(image[i], placed[i]));
+        println!("image / text drift, {name}: median {:.2}x, p99 {:.2}x", ac.0, ac.1);
         println!(
-            "image / text drift, {name}: median {:.2}x, p99 {:.2}x",
-            image.0 / text.0.max(f32::MIN_POSITIVE),
-            image.1 / text.1.max(f32::MIN_POSITIVE)
+            "placed / text drift, {name}: median {:.2}x, p99 {:.2}x; image / placed median {:.2}x, p99 {:.2}x: the placed rows sit nearer {}",
+            bc.0,
+            bc.1,
+            ab.0,
+            ab.1,
+            if bc.0.ln().abs() <= ab.0.ln().abs() { "the text controls" } else { "the image prompts" }
         );
+        placed_over_text.push(bc.0);
     }
+    println!(
+        "the reading (placed / text medians {placed_over_text:.2?}, cuts {PATH_AS_TEXT}x and {PATH_DRIFTS}x): {}",
+        reading(&placed_over_text)
+    );
+    // GitHub #565: each piece arm over C, and over B beside.
+    let (mut back, mut between) = (Vec::new(), Vec::new());
+    for arm in Arm::PIECES {
+        let of = &stats[arm as usize];
+        let over_text: Vec<f32> = (0..PAIRS.len()).map(|i| ratio(of[i], text[i]).0).collect();
+        let over_placed: Vec<f32> = (0..PAIRS.len()).map(|i| ratio(of[i], placed[i]).0).collect();
+        let verdict = piece_reading(&over_text);
+        println!(
+            "{} / text drift, medians (plain/prefill, verify/prefill, verify/plain) {over_text:.2?}, over the placed text rows {over_placed:.2?}: {}",
+            arm.label(),
+            match verdict {
+                Some(true) => "back",
+                Some(false) => "not back",
+                None => "between the cuts",
+            }
+        );
+        match verdict {
+            Some(true) => back.push(arm),
+            None => between.push(arm),
+            Some(false) => {}
+        }
+    }
+    println!(
+        "the pieces' reading (cuts {PATH_AS_TEXT}x and {PATH_DRIFTS}x on each arm over the text controls): {}",
+        pieces_reading(&back, &between)
+    );
+}
+
+/// A piece arm's reading on its median over C, each route pair (the module's
+/// doc): back within the first cut on every pair (`Some(true)`), not back past
+/// the second on any (`Some(false)`), else between the cuts.
+fn piece_reading(over_text: &[f32]) -> Option<bool> {
+    if over_text.iter().all(|&r| r <= PATH_AS_TEXT) {
+        Some(true)
+    } else if over_text.iter().any(|&r| r >= PATH_DRIFTS) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// What the piece arms back, and between the cuts, read as (the module's doc).
+fn pieces_reading(back: &[Arm], between: &[Arm]) -> String {
+    let pieces = |arms: &[Arm]| arms.iter().map(|arm| arm.piece()).collect::<Vec<_>>().join("; ");
+    let reading = match back {
+        [] if between.is_empty() => "no one piece carries the drift: it is the multimodal span's as a whole \
+                                     (or its vision start and end's) -- #565 closes on that, the MTP test keeps \
+                                     ADR 0056's rule"
+            .to_owned(),
+        [] => "inconclusive: no arm back".to_owned(),
+        [arm] => format!("one piece carries the drift: {}", arm.piece()),
+        _ => format!("the pieces carry it only together: {}", pieces(back)),
+    };
+    if between.is_empty() {
+        reading
+    } else {
+        format!("{reading}; between the cuts: {}", pieces(between))
+    }
+}
+
+/// F against B, prompt by prompt (the canaries' order in both): whether the
+/// lookup's prompt computes the placed prompt's plain rounds -- their text and
+/// every row -- and its prompt's last prefill row, bit for bit.
+fn lookup_against_placed(measured: &[Measured]) -> Vec<(String, bool)> {
+    let of = move |arm| measured.iter().filter(move |m: &&Measured| m.arm == arm);
+    of(Arm::Lookup)
+        .zip(of(Arm::Placed))
+        .map(|(f, b)| {
+            (f.name.clone(), f.plain == b.plain && f.plain_hashes == b.plain_hashes && f.prompt_row == b.prompt_row)
+        })
+        .collect()
 }
 
 // ── the test ────────────────────────────────────────────────────────────────
@@ -644,12 +1001,12 @@ fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_dr
             return;
         }
     }
-    let (images, texts) = prompts(&dir);
+    let prompts = prompts(&dir);
     let eos = {
         let reader = Reader::open(&path).expect("open the artifact");
         FrontendSet::from_reader(&reader).expect("frontend").eos_token_id().expect("eos")
     };
-    let all: Vec<&Prompt> = images.iter().chain(&texts).collect();
+    let all: Vec<&Prompt> = prompts.iter().collect();
     for prompt in &all {
         println!("{}: {} prompt tokens", prompt.name, prompt.tokens.len());
     }
@@ -671,12 +1028,10 @@ fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_dr
     {
         let Some(off) = engine(false) else { return };
         for (prompt, m) in all.iter().zip(&measured) {
-            let media = prompt.multimodal.as_ref().map(|mm| {
-                off.encode_media(&mm.media[0]).unwrap_or_else(|e| panic!("{}: encode the image: {e}", prompt.name))
-            });
+            let media = embedding(&off, prompt);
             let (tokens, rows, prompt_row) = plain(&off, prompt, media.as_ref());
             let differing = rows.iter().zip(&m.plain_hashes).filter(|(row, h)| hash(row) != **h).count();
-            cross.push((m.name.clone(), m.image, tokens == m.plain && differing == 0 && prompt_row == m.prompt_row, differing));
+            cross.push((m.name.clone(), m.arm, tokens == m.plain && differing == 0 && prompt_row == m.prompt_row, differing));
         }
     }
 
@@ -687,19 +1042,29 @@ fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_dr
                 format!("{:.2}", quantile(&mut ulps, 0.5))
             })
             .collect();
+        let norms = m.norms.as_ref().map(|n| {
+            let mut l2 = n.l2.clone();
+            format!("; its columns' L2 median {:.3}, largest |x| {}", quantile(&mut l2, 0.5), n.max_abs)
+        });
         println!(
-            "{}: plain {:?}... split {:?}; median drift ulps (plain/prefill, verify/prefill, verify/plain) {medians:?}",
+            "{}: plain {:?}... split {:?}; median drift ulps (plain/prefill, verify/prefill, verify/plain) {medians:?}{}",
             m.name,
             &m.plain[..8.min(m.plain.len())],
-            m.split.as_ref().map(|s| (s.at, s.plain, s.verify, s.prefill_gap))
+            m.split.as_ref().map(|s| (s.at, s.plain, s.verify, s.prefill_gap)),
+            norms.unwrap_or_default()
         );
     }
     report(&measured);
+    let lookup = lookup_against_placed(&measured);
+    println!("F against B, the plain rounds' text and rows and the prompt's last row bit for bit (the scatter writes what the lookup writes):");
+    for (name, equal) in &lookup {
+        println!("  {name}: {equal}");
+    }
     println!("the headless load's plain rounds against the head's load's (all equal, rows differing):");
     for (name, _, equal, differing) in &cross {
         println!("  {name}: {equal} {differing}");
     }
-    let text_equal = cross.iter().filter(|(_, image, _, _)| !image).all(|(_, _, equal, _)| *equal);
+    let text_equal = cross.iter().filter(|(_, arm, _, _)| *arm == Arm::Text).all(|(_, _, equal, _)| *equal);
     if !text_equal {
         println!("the loads differ on the text controls too: a difference of the loads, not of the image");
     }
@@ -710,10 +1075,13 @@ fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_dr
             assert!(state, "{}: the {drafter} drafter's rounds left another state than rounds without drafts", m.name);
         }
     }
-    for (name, _, equal, differing) in cross.iter().filter(|(_, image, _, _)| *image && text_equal) {
+    for (name, _, equal, differing) in cross.iter().filter(|(_, arm, _, _)| *arm != Arm::Text && text_equal) {
         assert!(
             equal,
             "{name}: after the image the load without the head computes another trunk ({differing} rows differ), where the text controls agree"
         );
+    }
+    for (name, equal) in &lookup {
+        assert!(equal, "{name}: the lookup's rows compute other logits than the same rows scattered out of the pool");
     }
 }
