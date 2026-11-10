@@ -34,9 +34,11 @@ fn model_dir() -> Option<PathBuf> {
 /// The companion opens against the main container at Flash-Next's hidden
 /// width, and binds every one of its 333 objects: under `host` all in mapped
 /// host memory, its spans the host plan's `vision_tower` line and no VRAM;
-/// under `device` all on the device, a weights line and no host line. The
-/// tower is the 27B's but for the merger's 2,560 rows, so it is smaller than
-/// the 27B's 297,000,960 bytes of spans (ADR 0075).
+/// under `device` all on the device, a weights line and no host line. Every
+/// matrix is W8 (GitHub #556), and the plan the leaf's descriptors read
+/// carries the companion's formats: the tower is larger than the 27B's
+/// grouped one, 297,000,960 bytes of spans (ADR 0075), though its merger
+/// writes half the rows.
 #[test]
 fn the_shipped_companion_binds_under_either_residency() {
     let Some(dir) = model_dir() else { return };
@@ -62,11 +64,16 @@ fn the_shipped_companion_binds_under_either_residency() {
         host.host_mapped_bytes(),
         device.device_bytes()
     );
-    // The companion #556 shipped (sha256 d97353d4...): its spans, each padded
-    // to 4 KiB, and its device arena. The 27B's spans are 297,000,960 bytes
-    // (ADR 0075): its merger writes twice the rows.
-    assert_eq!(host.host_mapped_bytes(), 284_454_912, "the host plan's vision_tower line");
-    assert_eq!(device.device_bytes(), 283_180_544, "the weights line under device");
+    let formats: std::collections::BTreeMap<&str, usize> = host.entries.iter().fold(Default::default(), |mut n, e| {
+        *n.entry(e.format.name()).or_default() += 1;
+        n
+    });
+    assert_eq!(formats, [("BF16", 222), ("W8G32_F16S", 111)].into_iter().collect(), "every matrix W8");
+    // The companion re-encoded with every matrix W8 (#556, sha256 0110bb79...):
+    // its spans, each padded to 4 KiB, and its device arena. The grouped one
+    // first shipped had 284,454,912 and 283,180,544.
+    assert_eq!(host.host_mapped_bytes(), 482_705_408, "the host plan's vision_tower line");
+    assert_eq!(device.device_bytes(), 481_451_264, "the weights line under device");
 }
 
 /// A Flash-Next load with vision prepares images with the processor its own

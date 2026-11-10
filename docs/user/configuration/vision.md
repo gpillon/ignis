@@ -18,7 +18,7 @@ sidebar:
 
 Flash-Next takes images as the 27B does, through the same requests, limits and
 media cache. Its vision tower is not in its 72 GB container: it ships in a
-**vision companion** beside it, `qwen3_8_flash_next_vision-v2.ninfer` (284 MB),
+**vision companion** beside it, `qwen3_8_flash_next_vision-v2.ninfer` (482 MB),
 which `ignis-server model download qwen3.8-flash-next` fetches with the model.
 The tower has the 27B's shape, retrained with Flash-Next, its merger writing
 Flash-Next's 2,560 columns. Vision stays off on Flash-Next unless you turn it
@@ -42,7 +42,7 @@ What it costs:
   prefill scratch it reserves for its text and, on a card that cannot hold
   every expert, the staging ring that prefill's expert misses pass through
   (1.57 GB on an RTX 5090), which holds nothing between two prefill chunks.
-  The tower is copied through three 25 MB slots of them. The positions an
+  The tower is copied through three 23 MB slots of them. The positions an
   image's tokens are read at ride in buffers a text load reserves too, so a
   vision load plans the same expert cache as a text-only load at the same
   settings, with the MTP head on or off. The largest image one encode holds
@@ -53,10 +53,10 @@ What it costs:
   kept, as `--vision-max-tokens` shrinks one, and refused only when its
   aspect ratio cannot fit. The `ignis.runtime.flash_next_plan` event names
   the bound as `vision_item_max_tokens`, beside `vision_residency`.
-  Under `device` the tower (283 MB) and the embedding pool are VRAM lines:
+  Under `device` the tower (481 MB) and the embedding pool are VRAM lines:
   on a card that holds every expert they come out of the KV pool, on a 32 GB
   card out of the expert cache.
-- **Host RAM under `host`**: the tower's 284 MB (284,454,912 bytes with its
+- **Host RAM under `host`**: the tower's 483 MB (482,705,408 bytes with its
   page padding) and the embedding pool, an envelope-wide image at Flash-Next's
   2,560 columns, half the 27B's: 5 MiB at a 1,024-token envelope, 20 MiB at
   4,096, 160 MiB at the default 32,768. Both are lines of Flash-Next's host
