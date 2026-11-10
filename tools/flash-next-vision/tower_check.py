@@ -5,6 +5,8 @@ seam 2, ADR 0087).
     python tools/flash-next-vision/tower_check.py reference --family <family> --source <dir> --dump <dir>
                                                   [--threads 6] [--device cpu]
     python tools/flash-next-vision/tower_check.py compare --dump <dir> [--out <json>] [--csv <csv>]
+    python tools/flash-next-vision/tower_check.py diagnose --family <family> --source <dir> --container <.ninfer>
+                                                  --dump <dir> --out <json> [--variant <v> ...] [--items <id,...>]
 
 The served side is a dump: `crates/server/tests/vision_tower_dump_gpu.rs` encodes each image through the
 family's own vision processor and media encode, the way the server does, and writes `<dump>/<family>/`:
@@ -36,10 +38,34 @@ the tower: its stored formats and the encode's arithmetic.
   with a paired bootstrap interval (images resampled); Flash-Next's tower is "at most the 27B's" when that mean
   is not above zero. An excess is the owner's to weigh, with the interval saying whether it is beyond noise.
 
+`diagnose` says where an encoded tower's error comes from (GitHub #560: Flash-Next's was above the 27B's). It
+runs the reference tower of `reference` with its matrices taken, kind by kind, from one of three sources: the
+BF16 checkpoint (`bf16`), the container's stored words decoded as the kernels decode them (`stored`: a code times
+its group's binary16 scale), or the BF16 tensor re-encoded by the recipe's own encoder in another format the
+kernels serve (`Q4`, `Q5`, `Q6`, `W8`, `BF16`). The kinds are the seven matrices: `patch_embedding`, the blocks'
+`qkv`, `attention_output`, `fc1` and `fc2`, `merger_fc1` and `merger_fc2`; every other object (biases, norms,
+the position table) is BF16 and exact. A variant names a base source and its exceptions, later ones winning,
+each over a kind (`block` for the four block matrices) and optionally a range of blocks: `stored+qkv=W8`,
+`bf16+block@26=stored` (`Variant`). The default set is `bf16`, `stored`, and `bf16+<kind>=stored` for each
+kind. Per variant, on the dump's items:
+- each stage's error against the BF16 tower's (`embedding`, the patches with their positions; `block <b>`;
+  `merger norm`, `merger fc1` before its GELU, `merger fc2`, the rows): the relative L2, the same error over
+  the BF16 rows centred on their set mean (`centred_rel_l2`; a column every row shares is reproduced for free
+  and inflates the plain one's denominator), and the share of the error's energy in one vector every row
+  shares (`constant_error_share`);
+- the served rows against the variant's (`vs_served_rel_l2`): with `stored`, near the kernels' rounding when
+  the encode computes what the stored words say;
+- its cost: the tower's bytes and the staging slot (the largest stage, `ignis_vision_staging_slot_bytes`);
+- with `--against` another diagnosis (the 27B's), `compare`'s bar against that one's stored tower, item for
+  item, plain and centred.
+The record also holds the recipe check (each stored payload against the recipe's encoding of its BF16 tensor,
+byte for byte, the differing objects named) and each source's weight error per kind (relative Frobenius).
+
 Exit status: 0 done, 2 refused (a missing or mismatched input, named).
 """
 import argparse
 import csv
+import gc
 import json
 import os
 import sys
@@ -51,6 +77,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import convert  # noqa: E402  (its hub, its cache and, through it, the 27B recipe's modules)
+import container  # noqa: E402  (the 27B NVFP4 converter's, on the path through `convert`)
+import encode  # noqa: E402
+import inventory  # noqa: E402
 import torch  # noqa: E402
 
 DUMP_SCHEMA = "ignis-vision-tower-dump/1"
@@ -67,6 +96,14 @@ TOWER_27B = convert.Tower("qwen3.8-27b", 1152, 4304, 16, 48 * 48, 5120, shard="m
                           span_sha256="c623c5ec68429f48689a011872157782c85508517faaa66de38250e0ad4b145b")
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_SEED = 560
+DIAGNOSIS_SCHEMA = "ignis-vision-tower-diagnosis/1"
+TOWERS = {FLASH_NEXT: convert.GEOMETRIES[FLASH_NEXT], QWEN27B: TOWER_27B, "fixture": convert.GEOMETRIES["fixture"]}
+KINDS = ("patch_embedding", "qkv", "attention_output", "fc1", "fc2", "merger_fc1", "merger_fc2")
+FORMATS = {"Q4": inventory.Q4, "Q5": inventory.Q5, "Q6": inventory.Q6, "W8": inventory.W8, "BF16": inventory.BF16}
+DEFAULT_VARIANTS = ("bf16", "stored") + tuple(f"bf16+{kind}=stored" for kind in KINDS)
+# kernel/src/vision_encode.cu: a staged tensor's span slack and the slot's alignment.
+STAGING_SPAN_SLACK = 2 * 4096 + 256
+STAGING_ALIGNMENT = 256
 
 
 class Refused(Exception):
@@ -336,6 +373,387 @@ def run_compare(args):
     return 0
 
 
+# ---------------------------------------------------------------------------------------------- the diagnosis
+def dequantize(payload, fmt, shape):
+    """The values a stored `[N, K]` payload holds, float32, as the kernels decode it: BF16 words as they are; a
+    row-split W8/Q4/Q5/Q6 matrix's code (two's complement, its low four bits in the code plane, a Q5's fifth and
+    a Q6's fifth and sixth in the high plane, element-major) times its group's binary16 scale, the K padding
+    cut away (`kernel/vendor/tests/ops/quantized_weight.h`, `unpack_lowbit_code`)."""
+    if fmt == inventory.BF16:
+        return torch.frombuffer(bytearray(payload), dtype=torch.bfloat16).float().reshape(shape)
+    if fmt not in inventory.GROUP:
+        raise Refused(f"no decoder for {fmt}")
+    n, k = shape
+    group, width = inventory.GROUP[fmt]
+    k_pad, groups, base_row, high_row, scale_row, high_offset, scale_offset, size = \
+        inventory.row_split_geometry(fmt, (n, k))
+    if len(payload) != size:
+        raise Refused(f"a {fmt} {list(shape)} payload is {size} bytes, not {len(payload)}")
+    words = np.frombuffer(payload, dtype=np.uint8)
+    base = words[: n * base_row].reshape(n * groups, -1)
+    if width == 8:
+        codes = base.view(np.int8).astype(np.int32)
+    else:
+        codes = np.stack((base & 0x0F, base >> 4), axis=-1).reshape(n * groups, group).astype(np.int32)
+        if width > 4:
+            high_bits = width - 4
+            high = words[high_offset: high_offset + n * high_row].reshape(n * groups, -1)
+            planes = np.unpackbits(high, axis=1, bitorder="little").reshape(n * groups, group, high_bits)
+            codes |= sum(planes[..., b].astype(np.int32) << (4 + b) for b in range(high_bits))
+        codes = np.where(codes >= 1 << (width - 1), codes - (1 << width), codes)
+    scales = words[scale_offset: scale_offset + n * scale_row].view("<f2").astype(np.float32)
+    values = codes.reshape(n, groups, group).astype(np.float32) * scales.reshape(n, groups, 1)
+    return torch.from_numpy(np.ascontiguousarray(values.reshape(n, k_pad)[:, :k]))
+
+
+def object_kind(name):
+    """The matrix kind of a tower object, None for the BF16 vectors and the position table."""
+    if name.startswith("vision/layers/"):
+        return {"attention/qkv": "qkv", "attention/output": "attention_output", "mlp/fc1": "fc1",
+                "mlp/fc2": "fc2"}.get(name.split("/", 3)[3])
+    return {"vision/patch_embedding": "patch_embedding", "vision/merger/fc1": "merger_fc1",
+            "vision/merger/fc2": "merger_fc2"}.get(name)
+
+
+def staging_stage(name):
+    """The staging stage of a tower object (`visit_vision_stages`): the pre-block weights, one per block, the
+    merger's norm and fc1, then its fc2."""
+    if name.startswith("vision/layers/"):
+        return 1 + int(name.split("/")[2])
+    if name in ("vision/merger/fc2", "vision/merger/fc2_bias"):
+        return 2 + inventory.VISION_LAYERS
+    return 1 + inventory.VISION_LAYERS if name.startswith("vision/merger/") else 0
+
+
+BLOCK_KINDS = ("qkv", "attention_output", "fc1", "fc2")
+
+
+class Variant:
+    """Where each matrix comes from: `<base>[+<rule>]...`, the base `bf16` or `stored`, a rule
+    `<kind>[@<b>[-<b>]]=<source>`: a kind of KINDS or `block` (the four block matrices), the blocks it covers
+    (all if none), and a source, `bf16`, `stored` or a format of FORMATS. A later rule wins over an earlier."""
+
+    def __init__(self, text):
+        self.text = text
+        base, *rules = text.split("+")
+        if base not in ("bf16", "stored"):
+            raise Refused(f"variant {text!r}: its base is {base!r}, not bf16 or stored")
+        self.base, self.rules = base, []
+        for rule in rules:
+            target, _, source = rule.partition("=")
+            kind, _, span = target.partition("@")
+            kinds = BLOCK_KINDS if kind == "block" else (kind,)
+            blocks = None
+            try:
+                if span:
+                    first, _, last = span.partition("-")
+                    blocks = (int(first), int(last or first))
+            except ValueError:
+                blocks = (1, 0)
+            if (not set(kinds) <= set(KINDS) or not (source in ("bf16", "stored") or source in FORMATS)
+                    or blocks is not None and (not set(kinds) <= set(BLOCK_KINDS)
+                                               or not 0 <= blocks[0] <= blocks[1] < inventory.VISION_LAYERS)):
+                raise Refused(f"variant {text!r}: {rule!r} is not <kind>[@<b>[-<b>]]=<bf16|stored|"
+                              f"{'|'.join(FORMATS)}>, a kind of {', '.join(KINDS)} or block, blocks of a "
+                              f"block kind 0 to {inventory.VISION_LAYERS - 1}")
+            self.rules.append((kinds, blocks, "bf16" if source == "BF16" else source))
+
+    def source(self, name):
+        """The source of object `name`: BF16 for the vectors and the position table, which no source changes."""
+        kind = object_kind(name)
+        if kind is None:
+            return "bf16"
+        block = int(name.split("/")[2]) if name.startswith("vision/layers/") else None
+        out = self.base
+        for kinds, blocks, source in self.rules:
+            if kind in kinds and (blocks is None or blocks[0] <= block <= blocks[1]):
+                out = source
+        return out
+
+
+class TowerWeights:
+    """A tower's objects from each source: the BF16 checkpoint's tensors, the container's stored words decoded,
+    or the BF16 tensors re-encoded by the recipe's encoder (decoded ones cached)."""
+
+    def __init__(self, tower, tensors, stored):
+        self.objects = convert.tower_objects(tower)
+        self.routes = convert.tower_routes(tower)
+        self.tensors, self.stored, self.cache = tensors, stored, {}
+        for o in self.objects:
+            entry = stored.by_name.get(o.name)
+            if entry is None or tuple(entry["shape"]) != o.shape:
+                raise Refused(f"{stored.path}: {o.name} is {'absent' if entry is None else entry['shape']}, "
+                              f"the tower's is {list(o.shape)}")
+
+    def param(self, o):
+        return self.routes[o.name][0][len(convert.PREFIX):]
+
+    def bf16(self, o):
+        name, _, transform = self.routes[o.name]
+        return self.tensors[name].reshape(o.shape) if transform == "flatten" else self.tensors[name]
+
+    def format(self, o, source):
+        return {"bf16": inventory.BF16, "stored": self.stored.by_name[o.name]["format"]}.get(source) or FORMATS[source]
+
+    def bytes(self, o, source):
+        if source == "stored":
+            return self.stored.by_name[o.name]["bytes"]
+        return inventory.encoded_size(inventory.Obj(o.name, self.format(o, source), o.shape))
+
+    def value(self, o, source):
+        """The object's float32 values from `source`."""
+        if source == "bf16":
+            return self.bf16(o).float()
+        key = (o.name, source)
+        if key not in self.cache:
+            if source == "stored":
+                payload = self.stored.read(o.name)
+            else:
+                payload = encode.encode(inventory.Obj(o.name, FORMATS[source], o.shape), self.bf16(o), "cpu")[0]
+            self.cache[key] = dequantize(payload, self.format(o, source), o.shape)
+        return self.cache[key]
+
+    def recipe_check(self):
+        """Each stored payload against the recipe's encoding of its BF16 tensor, byte for byte."""
+        differ = [o.name for o in self.objects
+                  if self.stored.read(o.name) != encode.encode(o, self.bf16(o), "cpu")[0]]
+        return {"objects": len(self.objects), "equal": len(self.objects) - len(differ), "differ": differ}
+
+    def weight_error(self, source, kinds=KINDS):
+        """Per kind: the format, the objects, the pooled relative Frobenius error of `source` against BF16."""
+        out = {}
+        for kind in kinds:
+            objs = [o for o in self.objects if object_kind(o.name) == kind]
+            err = ref = worst = 0.0
+            for o in objs:
+                w = self.bf16(o).double()
+                e = float(((self.value(o, source).double() - w) ** 2).sum())
+                r = float((w ** 2).sum())
+                err, ref, worst = err + e, ref + r, max(worst, (e / r) ** 0.5)
+            out[kind] = {"format": self.format(objs[0], source), "objects": len(objs),
+                         "rel_frobenius": (err / ref) ** 0.5, "max_object_rel_frobenius": worst}
+        return out
+
+    def cost(self, variant):
+        """The tower's bytes and its staging slot under `variant`."""
+        stages = [0] * (3 + inventory.VISION_LAYERS)
+        total = 0
+        for o in self.objects:
+            if object_kind(o.name):
+                size = self.bytes(o, variant.source(o.name))
+            else:
+                size = self.stored.by_name[o.name]["bytes"]
+            total += size
+            stages[staging_stage(o.name)] += size + STAGING_SPAN_SLACK
+        largest = max(range(len(stages)), key=stages.__getitem__)
+        slot = (stages[largest] + STAGING_ALIGNMENT - 1) // STAGING_ALIGNMENT * STAGING_ALIGNMENT
+        return {"tower_bytes": total, "slot_bytes": slot, "largest_stage": largest}
+
+    def formats(self, variant):
+        """{kind: the formats `variant` gives its objects}."""
+        out = {}
+        for o in self.objects:
+            if object_kind(o.name):
+                out.setdefault(object_kind(o.name), set()).add(self.format(o, variant.source(o.name)))
+        return {kind: sorted(f) for kind, f in out.items()}
+
+    def assign(self, model, variant, current):
+        """`model`'s matrices from `variant`; `current` ({object: source}) names what each holds now."""
+        with torch.no_grad():
+            for o in self.objects:
+                source = variant.source(o.name)
+                if current.get(o.name, "bf16") != source:
+                    p = model.get_parameter(self.param(o))
+                    p.copy_(self.value(o, source).reshape(p.shape))
+                    current[o.name] = source
+
+
+def stage_names():
+    return (["embedding"] + [f"block {b}" for b in range(inventory.VISION_LAYERS)]
+            + ["merger norm", "merger fc1", "merger fc2"])
+
+
+def stage_rows(model, patches, grid, sink=None):
+    """(every stage's output in `stage_names`' order, the rows), float32, of one forward of `model` on one item;
+    with `sink`, each stage's output goes to `sink(stage, output)` as it is made and the list is empty, so an
+    item's stages are never all held twice."""
+    out, count = [], [0]
+
+    def put(output):
+        if sink is None:
+            out.append(output.detach())
+        else:
+            sink(count[0], output.detach())
+        count[0] += 1
+    hooks = [model.blocks[0].register_forward_pre_hook(
+        lambda _m, args, kwargs: put(args[0] if args else kwargs["hidden_states"]), with_kwargs=True)]
+    hooks += [m.register_forward_hook(lambda _m, _i, output: put(output))
+              for m in (*model.blocks, model.merger.norm, model.merger.linear_fc1)]
+    try:
+        rows = torch.from_numpy(reference_rows(model, patches, grid))
+    finally:
+        for h in hooks:
+            h.remove()
+    put(rows)
+    return out, rows
+
+
+class Tally:
+    """Sums of one variant's error against the BF16 rows, per stage and per item, from which the record's
+    measures are read once every item has run."""
+
+    def __init__(self, stages):
+        self.stages = [{"sq_err": 0.0, "sq_ref": 0.0, "sum_err": 0.0, "sum_ref": 0.0, "rows": 0} for _ in stages]
+        self.items = {}
+
+    def add_stage(self, stage, base, rows):
+        """One item's output of one stage, against the BF16 tower's."""
+        s, b = self.stages[stage], base.double()
+        e = rows.double() - b
+        s["sq_err"] += float((e * e).sum())
+        s["sq_ref"] += float((b * b).sum())
+        s["sum_err"] = s["sum_err"] + e.sum(0)
+        s["sum_ref"] = s["sum_ref"] + b.sum(0)
+        s["rows"] += b.shape[0]
+
+    def add_item(self, item, base, rows, served):
+        """One item's rows against the BF16 tower's and the served ones."""
+        b, r = base.double(), rows.double()
+        self.items[item] = {"sq_err": float(((r - b) ** 2).sum()), "sq_ref": float((b * b).sum()),
+                            "sq_served": float(((served - r) ** 2).sum()), "sum_ref": b.sum(0), "rows": b.shape[0]}
+
+    @staticmethod
+    def _ratio(a, b):
+        return float(np.sqrt(a / b)) if b > 0 else 0.0
+
+    def record(self, names):
+        stages = []
+        for name, s in zip(names, self.stages):
+            centre = s["sum_ref"] / s["rows"]
+            centred = s["sq_ref"] - s["rows"] * float((centre * centre).sum())
+            constant = float((s["sum_err"] * s["sum_err"]).sum()) / s["rows"]
+            stages.append({"stage": name, "rel_l2": self._ratio(s["sq_err"], s["sq_ref"]),
+                           "centred_rel_l2": self._ratio(s["sq_err"], centred),
+                           "constant_error_share": constant / s["sq_err"] if s["sq_err"] > 0 else 0.0})
+        last = self.stages[-1]
+        centre = last["sum_ref"] / last["rows"]
+        items = {}
+        for item, m in self.items.items():
+            centred = (m["sq_ref"] - 2 * float((centre * m["sum_ref"]).sum())
+                       + m["rows"] * float((centre * centre).sum()))
+            items[item] = {"rel_l2": self._ratio(m["sq_err"], m["sq_ref"]),
+                           "centred_rel_l2": self._ratio(m["sq_err"], centred),
+                           "vs_served_rel_l2": self._ratio(m["sq_served"], m["sq_ref"]),
+                           "sq_err": m["sq_err"], "sq_ref": m["sq_ref"], "sq_ref_centred": centred}
+        final = dict(stages[-1])
+        del final["stage"]
+        final["vs_served_rel_l2"] = self._ratio(sum(m["sq_served"] for m in self.items.values()),
+                                                sum(m["sq_ref"] for m in self.items.values()))
+        return {"final": final, "items": items, "stages": stages}
+
+
+def against_bar(items, other):
+    """`bar` of a variant's per-item errors against another diagnosis's stored tower's, plain and centred."""
+    def centred(m):
+        return {i: {"rel_l2": v["centred_rel_l2"], "sq_err": v["sq_err"], "sq_ref": v["sq_ref_centred"]}
+                for i, v in m.items()}
+    plain = bar(items, other)
+    return {"images": plain["images"], "rel_l2": plain, "centred_rel_l2": bar(centred(items), centred(other))}
+
+
+def run_diagnose(args):
+    directory = os.path.join(args.dump, args.family)
+    manifest = read_manifest(directory)
+    if manifest["family"] != args.family:
+        raise Refused(f"{directory} holds a {manifest['family']} dump, not {args.family}")
+    items = manifest["items"]
+    if args.items:
+        wanted = args.items.split(",")
+        unknown = sorted(set(wanted) - {i["id"] for i in items})
+        if unknown:
+            raise Refused(f"{directory} has no item {', '.join(unknown)}")
+        items = [i for i in items if i["id"] in wanted]
+    variants = {v: Variant(v) for v in (args.variant or DEFAULT_VARIANTS)}
+    against = None
+    if args.against:
+        other = json.load(open(args.against, encoding="utf-8"))
+        if other.get("schema") != DIAGNOSIS_SCHEMA or "stored" not in other.get("variants", {}):
+            raise Refused(f"{args.against} is not a diagnosis with a stored variant")
+        against = other["variants"]["stored"]["items"]
+    torch.set_num_threads(args.threads)
+    model = reference_model(args.source)
+    if model.config.out_hidden_size != manifest["hidden"]:
+        raise Refused(f"the tower in {args.source} writes {model.config.out_hidden_size} columns, "
+                      f"the dump's {manifest['hidden']}")
+    gc.collect()  # the model's build leaves its float32 copies of the tensors to the collector
+    tensors = convert.source_tensors(open(os.path.join(args.source, "visual.bin"), "rb").read(),
+                                     json.load(open(os.path.join(args.source, "visual.json"), encoding="utf-8")))
+    weights = TowerWeights(TOWERS[args.geometry or args.family], tensors, container.Container(args.container))
+    started = time.perf_counter()
+    record = {"schema": DIAGNOSIS_SCHEMA, "family": args.family, "container": os.path.basename(args.container),
+              "identity": weights.stored.identity, "source": model.source, "items": [i["id"] for i in items],
+              "threads": args.threads, "torch": torch.__version__,
+              "transformers": __import__("transformers").__version__}
+    record["recipe"] = weights.recipe_check()
+    log(f"recipe check: {record['recipe']['equal']} of {record['recipe']['objects']} objects equal"
+        + (f"; differ: {', '.join(record['recipe']['differ'])}" if record["recipe"]["differ"] else ""))
+    used = {}
+    for v in variants.values():
+        for o in weights.objects:
+            if v.source(o.name) != "bf16":
+                used.setdefault(v.source(o.name), set()).add(object_kind(o.name))
+    used["stored"] = set(KINDS)
+    record["weights"] = {source: weights.weight_error(source, [k for k in KINDS if k in kinds])
+                         for source, kinds in sorted(used.items())}
+    needed = {(o.name, v.source(o.name)) for v in variants.values() for o in weights.objects}
+    weights.cache = {key: values for key, values in weights.cache.items() if key in needed}
+    names = stage_names()
+    tallies = {v: Tally(names) for v in variants}
+    harness = [0.0, 0.0]
+    current = {}
+    for item in items:
+        t0 = time.perf_counter()
+        patches, grid = item_patches(directory, manifest, item), item["grid"]
+        served = torch.from_numpy(item_served(directory, manifest, item)).double()
+        weights.assign(model, Variant("bf16"), current)
+        base, base_rows = stage_rows(model, patches, grid)
+        if os.path.isfile(os.path.join(directory, f"{item['id']}.reference.f32")):
+            ref = torch.from_numpy(item_reference(directory, manifest, item)).double()
+            harness[0] += float(((base_rows.double() - ref) ** 2).sum())
+            harness[1] += float((ref * ref).sum())
+        for name, variant in variants.items():
+            tally = tallies[name]
+            if all(variant.source(o.name) == "bf16" for o in weights.objects):
+                for stage, rows in enumerate(base):
+                    tally.add_stage(stage, rows, rows)
+                rows = base_rows
+            else:
+                weights.assign(model, variant, current)
+                _, rows = stage_rows(model, patches, grid,
+                                     lambda stage, out, tally=tally: tally.add_stage(stage, base[stage], out))
+            tally.add_item(item["id"], base_rows, rows, served)
+        del base
+        log(f"{args.family} {item['id']}: {item['tokens']} tokens, {len(variants)} variants, "
+            f"{time.perf_counter() - t0:.1f} s")
+    if harness[1] > 0:
+        record["harness"] = {"bf16_vs_reference_rel_l2": float(np.sqrt(harness[0] / harness[1]))}
+    if against is not None:
+        record["against"] = {"file": os.path.basename(args.against), "family": other["family"], "variant": "stored"}
+    record["variants"] = {}
+    for name, variant in variants.items():
+        record["variants"][name] = {"formats": weights.formats(variant), **tallies[name].record(names),
+                                    "cost": weights.cost(variant)}
+        if against is not None:
+            record["variants"][name]["bar"] = against_bar(record["variants"][name]["items"], against)
+        f = record["variants"][name]["final"]
+        log(f"{name}: rel L2 {f['rel_l2']:.4g}, centred {f['centred_rel_l2']:.4g}, constant share "
+            f"{f['constant_error_share']:.3g}, served {f['vs_served_rel_l2']:.4g}")
+    record["seconds"] = round(time.perf_counter() - started, 1)
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=1)
+    return 0
+
+
 def parser():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
@@ -354,6 +772,21 @@ def parser():
     c.add_argument("--out")
     c.add_argument("--csv")
     c.set_defaults(fn=run_compare)
+    d = sub.add_parser("diagnose", help="where the encoded tower's error comes from: variants of the matrices' "
+                                        "sources, stage by stage")
+    d.add_argument("--family", required=True, choices=FAMILIES)
+    d.add_argument("--geometry", choices=sorted(TOWERS), help="the tower's widths (default: the family's)")
+    d.add_argument("--source", required=True, help="the family's cache of its BF16 tower")
+    d.add_argument("--container", required=True, help="the container holding the served tower's vision/ objects")
+    d.add_argument("--dump", required=True)
+    d.add_argument("--out", required=True)
+    d.add_argument("--variant", action="append",
+                   help=f"a variant (repeatable; default: {', '.join(DEFAULT_VARIANTS)})")
+    d.add_argument("--items", help="the dump's items to run, by id, comma-separated (default: all)")
+    d.add_argument("--against", help="another diagnosis (the 27B's): each variant's paired bar against its "
+                                     "stored tower, on the items both ran")
+    d.add_argument("--threads", type=int, default=6)
+    d.set_defaults(fn=run_diagnose)
     return ap
 
 
