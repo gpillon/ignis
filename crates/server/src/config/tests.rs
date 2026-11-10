@@ -2295,6 +2295,18 @@ fn vision_is_off_by_default() {
     assert_eq!(config(&["--profile", "none"]).vision, None);
 }
 
+/// GitHub #557: the vision and media fields apply to the models that take
+/// images, and only to them -- one list, `ModelFamily::WITH_VISION`.
+#[test]
+fn the_vision_and_media_fields_apply_to_the_models_that_take_images() {
+    for meta in schema::all_fields().filter(|meta| meta.group == "vision" || meta.group == "media") {
+        for family in ModelFamily::ALL {
+            assert_eq!(meta.applies.to(family), family.takes_images(), "{}.{} on {family:?}", meta.group, meta.name);
+        }
+    }
+    assert_eq!(ModelFamily::WITH_VISION, [ModelFamily::Qwen38_27b, ModelFamily::FlashNext]);
+}
+
 #[test]
 fn the_vision_flag_loads_the_default_envelope() {
     let config = config(&["--vision-enabled"]);

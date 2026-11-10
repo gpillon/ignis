@@ -806,6 +806,12 @@ impl ModelFamily {
     /// a family added here reaches every one of them.
     pub const ALL: [ModelFamily; 4] = [ModelFamily::Qwen38_27b, ModelFamily::FlashNext, ModelFamily::QwenImage21, ModelFamily::Nemotron3Diarization];
 
+    /// The models with a vision tower to take image parts with, the one list
+    /// of them: the 27B's in its container, Flash-Next's in its vision
+    /// companion (GitHub #557, ADR 0087). What the vision and media config
+    /// fields apply to.
+    pub const WITH_VISION: &'static [ModelFamily] = &[ModelFamily::Qwen38_27b, ModelFamily::FlashNext];
+
     /// The family an artifact's identity `model_id` names, or `None` for an
     /// artifact of no family (a test fixture).
     pub fn of_model_id(model_id: &str) -> Option<Self> {
@@ -890,11 +896,10 @@ impl ModelFamily {
         }
     }
 
-    /// Whether the model has a vision tower to take image parts with: the
-    /// 27B's in its container, Flash-Next's in its vision companion (GitHub
-    /// #557, ADR 0087).
+    /// Whether the model has a vision tower to take image parts with
+    /// ([`ModelFamily::WITH_VISION`]).
     pub fn takes_images(self) -> bool {
-        matches!(self, ModelFamily::Qwen38_27b | ModelFamily::FlashNext)
+        Self::WITH_VISION.contains(&self)
     }
 
     /// Whether the model serves `/v1/decide`'s readouts.

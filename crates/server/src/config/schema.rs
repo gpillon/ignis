@@ -223,9 +223,8 @@ pub fn field(group: &str, name: &str) -> Option<&'static FieldMeta> {
 const ALL: Applicability = Applicability::AllFamilies;
 const FLASH_NEXT_ONLY: Applicability = Applicability::Only(&[ModelFamily::FlashNext]);
 const QWEN38_ONLY: Applicability = Applicability::Only(&[ModelFamily::Qwen38_27b]);
-/// The two text models with a vision tower: the 27B's in its container,
-/// Flash-Next's in its vision companion (ADR 0087).
-const VISION_MODELS: Applicability = Applicability::Only(&[ModelFamily::Qwen38_27b, ModelFamily::FlashNext]);
+/// The models with a vision tower ([`ModelFamily::WITH_VISION`]).
+const VISION_MODELS: Applicability = Applicability::Only(ModelFamily::WITH_VISION);
 const NEMOTRON_DIARIZATION_ONLY: Applicability = Applicability::Only(&[ModelFamily::Nemotron3Diarization]);
 const NO_RULE: Validator = Validator::None;
 

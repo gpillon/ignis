@@ -1682,7 +1682,7 @@ fn derive_vision(
 /// Flash-Next, or for no family, sees with vision off -- is the 27B's, not a
 /// mistake to refuse.
 fn vision_on_for_a_model(sources: &Sources) -> bool {
-    [ModelFamily::Qwen38_27b, ModelFamily::FlashNext].into_iter().any(|family| {
+    ModelFamily::WITH_VISION.iter().copied().any(|family| {
         source::resolve_settings(sources, Some(family), Fit::Switch).is_ok_and(|resolved| resolved.settings.vision.enabled)
     })
 }
