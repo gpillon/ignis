@@ -415,10 +415,18 @@ impl ModelLoader for MockLoader {
         ModelFamily::of_model_id(&target.model).map(ModelFamily::kind)
     }
 
-    /// The file a switch to an id with no companion lacks.
+    /// The file a switch to an id with no companion lacks. With every load
+    /// fitted from the running configuration ([`MockLoader::fit_from`]), only
+    /// a load whose vision is on asks for it, as the production loader's.
     fn companion_refusal(&self, target: &ModelSource) -> Option<String> {
-        let missing = self.state.without_companion.lock().unwrap().contains(&target.model);
-        missing.then(|| format!("{}: the vision companion {}.vision is not beside it", target.model, target.artifact.display()))
+        if !self.state.without_companion.lock().unwrap().contains(&target.model) {
+            return None;
+        }
+        if let Some((config, families)) = &*self.state.fitting.lock().unwrap() {
+            let family = families.iter().find(|(id, _)| *id == target.model).map_or(ModelFamily::Qwen38_27b, |(_, family)| *family);
+            load_options(&config.current(), target, family, None).ok()?.vision?;
+        }
+        Some(format!("{}: the vision companion {}.vision is not beside it", target.model, target.artifact.display()))
     }
 
     /// The family [`MockLoader::header`] gave the id, else the default's.

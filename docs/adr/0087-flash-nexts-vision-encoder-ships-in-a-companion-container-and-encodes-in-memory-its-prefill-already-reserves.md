@@ -137,9 +137,15 @@ takes images with the 27B's feature set, and how:
 - **A switch keeps vision** (#563): the vision settings carry across families. `POST /v1/models/switch` to a family
   whose companion is missing answers 409 `vision_companion_missing`, naming the file, before the active model is torn
   down; an implicit switch meets the same check when it prepares, before teardown. The request size cap follows the
-  active model's media. Vision is each family's, so a built-in profile's, on for the 27B alone, does not cross to
-  Flash-Next, whose vision stays off by default: the switch logs it (`ignis.model.switch_vision_off`, what left it
-  off and how to turn it on).
+  active model's media. A switch carries the vision of the model it replaces (the owner's call of 2026-11-10): with
+  the model serving on vision, a built-in profile's on the 27B alone among it, the target loads with vision on at its
+  own vision settings, unless vision is named off for the target itself (its own flag, env var, config file section
+  or live value), which wins; `--vision-enabled false`, naming it off for every model, does not stop the carry. A
+  model serving without vision carries nothing, and a start is unchanged: Flash-Next's vision stays off unless named
+  on. The carried value is the target's own live value, decided again at every switch and never written to the
+  config file. So a 27B on its profile's vision switching to a Flash-Next without its companion is refused 409, and
+  Flash-Next's host plan then counts the tower and the pool. A switch that leaves vision named off logs it
+  (`ignis.model.switch_vision_off`, `by: named`, the value that names it).
 - **Measured** ([finding](../findings/2026-11-10-flash-next-images-checked-without-the-bf16-checkpoint.md)): with
   every matrix W8 the tower's served rows are 0.0586 in relative L2 from the BF16 tower's, the 27B's 0.183, lower on
   32 of 32 images (the grouped encoding's 0.305 was the alarm); the known answers 66 of 66, the 27B's 66 of 66, no

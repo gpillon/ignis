@@ -7,7 +7,7 @@ sidebar:
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--vision-enabled` | `IGNIS_VISION_ENABLED` | off; on for the 27B under the `rtx5090`, `rtxpro6000`, `rtx-16gb` and `rtx-24gb` profiles, off for Flash-Next under every one (from 0.11.0, `--vision-enabled` turns it on for both and `--qwen38flashnext-vision-enabled` for Flash-Next alone; `--vision-enabled false` turns it off for both) | Load the vision tower and reserve its workspace. Flash-Next's tower is its vision companion's, beside the artifact ([Flash-Next](#flash-next), from 0.11.0). Without it every `image_url` part is refused with `vision_disabled`, whatever the artifact holds. |
+| `--vision-enabled` | `IGNIS_VISION_ENABLED` | off; on for the 27B under the `rtx5090`, `rtxpro6000`, `rtx-16gb` and `rtx-24gb` profiles, off for Flash-Next under every one (from 0.11.0, `--vision-enabled` turns it on for both and `--qwen38flashnext-vision-enabled` for Flash-Next alone; `--vision-enabled false` turns it off for both; a switch carries the vision of the model it replaces, [Flash-Next](#flash-next)) | Load the vision tower and reserve its workspace. Flash-Next's tower is its vision companion's, beside the artifact ([Flash-Next](#flash-next), from 0.11.0). Without it every `image_url` part is refused with `vision_disabled`, whatever the artifact holds. |
 | `--vision-max-tokens <n>` | `IGNIS_VISION_MAX_TOKENS` | `32768` with `--vision-enabled` (`4096` under the `rtx-16gb` profile) | Merged vision tokens per request, 1..1,048,576. An image whose natural size is past the cap is downscaled to fit (aspect ratio kept, one token = 32 x 32 pixels), not refused, unless its aspect ratio is too extreme for the cap (a side cannot go below 32 pixels); the request log reports both sizes, `media.vision_tokens` (admitted) and `media.natural_vision_tokens` ([telemetry](../guides/telemetry.md)). Several images whose total is past the cap are still refused with `media_budget_exceeded`. |
 | `--vision-embedding-pool-mib <n>` | `IGNIS_VISION_EMBEDDING_POOL_MIB` | one envelope-wide embedding | Encoded images kept for reuse across requests, 1..65536, counted where `--vision-residency` puts the pool ([below](#where-the-vision-tower-and-the-embedding-pool-live)). |
 | `--vision-residency <host\|device>` | `IGNIS_VISION_RESIDENCY` | `host`; `device` under `rtxpro6000` | Needs `--vision-enabled`. Where the vision tower's weights and the embedding pool live: `device` in VRAM, `host` in pinned host RAM, the weights copied to the GPU for each image ([below](#where-the-vision-tower-and-the-embedding-pool-live)). Read at load: a change takes effect at the next one. |
@@ -23,10 +23,16 @@ not in its 72 GB container: it ships in a
 **vision companion** beside it, `qwen3_8_flash_next_vision-v2.ninfer` (482 MB),
 which `ignis-server model download qwen3.8-flash-next` fetches with the model.
 The tower has the 27B's shape, retrained with Flash-Next, its merger writing
-Flash-Next's 2,560 columns. Vision stays off on Flash-Next unless you turn it
-on: every built-in profile turns it on for the 27B alone, so a Flash-Next load
-holds nothing for it until `--vision-enabled` (or `make MODEL=flash-next
-VISION=1`). The profile's residency is both models': `host` under `rtx5090`,
+Flash-Next's 2,560 columns. Vision stays off on a Flash-Next start unless you
+turn it on: every built-in profile turns it on for the 27B alone, so a
+Flash-Next start holds nothing for it until `--vision-enabled` (or `make
+MODEL=flash-next VISION=1`). A switch is not a start: it carries the vision of
+the model it replaces (from 0.11.0), so a 27B serving images on its profile's
+vision switches to Flash-Next with vision on, at Flash-Next's own vision
+settings, unless vision is named off for Flash-Next itself
+(`--qwen38flashnext-vision-enabled false`, its env var or its section of the
+config file), which wins ([Model switching](../api/model-switching.md)).
+The profile's residency is both models': `host` under `rtx5090`,
 `device` under `rtxpro6000`. Every vision and media field also has a form for
 one model alone (from 0.11.0), which needs that model's vision on:
 `--qwen38flashnext-vision-enabled --qwen38flashnext-vision-residency device`,
@@ -42,7 +48,9 @@ With vision on, a Flash-Next start opens the companion and holds it to the main
 container it was built for (the pair its sidecar records), its merger's width to
 the model's. A companion that is missing, or that belongs to another main
 container, refuses the start before anything loads, naming the file
-([troubleshooting](../troubleshooting.md#flash-next-refuses-the-start-for-its-vision-companion)).
+([troubleshooting](../troubleshooting.md#flash-next-refuses-the-start-for-its-vision-companion)),
+and a switch to Flash-Next with vision on, its own or carried, with a
+`409 vision_companion_missing` before the model serving is unloaded.
 
 What it costs:
 

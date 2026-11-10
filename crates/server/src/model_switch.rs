@@ -122,10 +122,11 @@ pub trait ModelLoader: Send + Sync {
 
     /// Why a switch to `target` cannot succeed for want of a file beside its
     /// artifact, when that can be told by looking at the files alone (#563):
-    /// with vision on, Flash-Next's vision companion missing or not its
-    /// own. What `POST /v1/models/switch` answers `409` with, naming the
-    /// file, before anything is prepared or torn down. `None` when the
-    /// switch lacks nothing, and by default.
+    /// with vision on -- its own, or carried from the model it replaces (ADR
+    /// 0087) -- Flash-Next's vision companion missing or not its own. What
+    /// `POST /v1/models/switch` answers `409` with, naming the file, before
+    /// anything is prepared or torn down. `None` when the switch lacks
+    /// nothing, and by default.
     fn companion_refusal(&self, target: &ModelSource) -> Option<String> {
         let _ = target;
         None
@@ -217,7 +218,9 @@ impl ModelLoader for ArtifactLoader {
     /// which says nothing: the prepare after it logs the fit). Only a
     /// Flash-Next load with vision on has a companion to check, so the target's
     /// artifact is read only then: a switch that needs none answers its 202
-    /// without touching the file, which may be slow or never end.
+    /// without touching the file, which may be slow or never end. A switch
+    /// from a model serving images carries its vision (ADR 0087), so from
+    /// one the header is read to tell a Flash-Next target.
     fn companion_refusal(&self, target: &ModelSource) -> Option<String> {
         let (options, _) = fit_options(&self.state.current(), target, ModelFamily::FlashNext, None).ok()?;
         options.vision.as_ref()?;
@@ -229,8 +232,10 @@ impl ModelLoader for ArtifactLoader {
 /// The configuration a load of `target`, an artifact of `family`, runs
 /// with: `given` as it is when it was fitted to that family (a reload with a
 /// changed config, patched, validated and fitted by the caller), else
-/// `given` or `running` with the target's artifact and id over it, fitted to
-/// `family` as a switch fits it. What [`ArtifactLoader`] loads with, apart
+/// `given` or `running` with the target's artifact and id over it, and the
+/// vision of the model `running` serves carried to it (ADR 0087,
+/// [`crate::config::switch_target`]), fitted to `family` as a switch fits
+/// it. What [`ArtifactLoader`] loads with, apart
 /// from the load itself so a test's loader fits a switch the same way: a
 /// value a live `PATCH /v1/config` set for a family not loaded reaches that
 /// family's load through here (spec playground/05 AC 19).
@@ -247,14 +252,14 @@ pub fn load_options(
 }
 
 /// Say that a switch from a model serving images leaves `to`, a model of
-/// `family` that takes them, with vision off (GitHub #563): vision is each
-/// model's, and a built-in profile turns it on for the 27B alone, so a 27B
-/// started with its profile's vision switches to Flash-Next without it, its
-/// default (ADR 0087), and its image parts are refused `vision_disabled`.
-/// `ignis.model.switch_vision_off` names the target's vision (`off`), what
-/// left it off (`by`: `default`, `profile` or `named`) and, in `why`, how to
-/// turn it on. Nothing when the target keeps vision or the running model had
-/// none.
+/// `family` that takes them, with vision off (GitHub #563): a switch carries
+/// the vision of the model it replaces (ADR 0087), so this is a target whose
+/// vision is named off for it, a named value winning over the carry, and its
+/// image parts are refused `vision_disabled`. `ignis.model.switch_vision_off`
+/// names the target's vision (`off`), what left it off (`by`: `named`) and,
+/// in `why`, the value that names it and how to carry vision. Nothing when
+/// the target has vision, the running model had none, or no one named the
+/// value that leaves it off (a reload that took a carried vision away).
 fn log_vision_off(
     running: &crate::config::Config,
     to: &str,
@@ -264,27 +269,21 @@ fn log_vision_off(
     if running.vision.is_none() || options.vision.is_some() || !family.takes_images() {
         return;
     }
-    let turn_on = crate::config::schema::field("vision", "enabled").expect("declared").scoped_flag(family);
-    let (by, why) = match options.basis.resolution().origin("vision", "enabled") {
-        Some(origin) if origin.source.explicit() => {
-            ("named", format!("vision is named off for it ({}); --vision-enabled or {turn_on} turns it on", origin.spelling))
-        }
-        Some(origin) => ("profile", format!("the profile turns it off ({}); --vision-enabled or {turn_on} turns it on", origin.spelling)),
-        None => (
-            "default",
-            format!(
-                "{} has vision off unless it is named on for it (ADR 0087); --vision-enabled turns it on for both \
-                 models, {turn_on} for it alone",
-                family.name()
-            ),
-        ),
+    let Some(named) = options.basis.resolution().origin("vision", "enabled").filter(|origin| origin.source.explicit()) else {
+        return;
     };
+    let why = format!(
+        "vision is named off for it ({}), and a named value wins over the vision a switch carries (ADR 0087); set it \
+         true, or take it out, for {} to take images",
+        named.spelling,
+        family.name()
+    );
     tracing::info!(
         name: "ignis.model.switch_vision_off",
         to = %to,
         family = family.name(),
         vision = "off",
-        by,
+        by = "named",
         why = %why,
         "the model switched to loads with vision off: its image parts are refused with vision_disabled"
     );
@@ -301,12 +300,12 @@ fn fit_options(
     if let Some(options) = given.filter(|options| options.basis.family() == Some(family)) {
         return Ok((options.clone(), Vec::new()));
     }
-    // The target's artifact and id over the running options, as a patch:
-    // the options are resolved again from their sources, so a value set on
-    // the struct would not survive the fit.
+    // The target's artifact and id over the running options, and the
+    // running model's vision (ADR 0087), as a patch: the options are
+    // resolved again from their sources, so a value set on the struct would
+    // not survive the fit.
     let base = given.unwrap_or(running);
-    let named = crate::config::target_patch(&target.artifact, &target.model)
-        .and_then(|patch| base.general_with(&patch))
+    let named = crate::config::switch_target(base, running.vision.is_some(), &target.artifact, &target.model, family)
         .map_err(|e| e.to_string())?;
     crate::config::fit_to_family(&named, family).map_err(|e| e.to_string())
 }
@@ -2196,41 +2195,138 @@ mod tests {
         assert_eq!(loader(true).companion_refusal(&missing), None, "a file that is no artifact lacks nothing here; prepare says so");
     }
 
-    /// GitHub #563: under a built-in profile, which turns vision on for the
-    /// 27B alone, a 27B serving images switches to Flash-Next with vision off,
-    /// its default (ADR 0087), and the switch says so, with why and how to
-    /// turn it on; named off, it says that. A switch that keeps vision, or one
-    /// from a model without it, says nothing of it.
+    /// `flags` started, fitted to the 27B: the options a 27B serves with.
+    fn running_27b(flags: &[&str]) -> crate::config::Config {
+        let args: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
+        let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).unwrap() else { panic!("a config") };
+        config.for_family(ModelFamily::Qwen38_27b).unwrap()
+    }
+
+    fn flash_next_target() -> ModelSource {
+        ModelSource { artifact: std::path::PathBuf::from("flash-next.ninfer"), model: "qwen3.8-flash-next".to_owned() }
+    }
+
+    /// ADR 0087: a switch carries the vision of the model it replaces. A 27B
+    /// serving images on its built-in profile's vision switches to Flash-Next
+    /// with vision on, Flash-Next's own vision settings fitted as a start
+    /// with vision on fits them.
+    #[test]
+    fn a_27b_serving_images_on_its_profiles_vision_switches_to_flash_next_with_vision_on() {
+        let running = running_27b(&["--profile", "rtx5090"]);
+        assert!(running.vision.is_some(), "the profile's vision, on the 27B");
+        let flash_next = load_options(&running, &flash_next_target(), ModelFamily::FlashNext, None).expect("the switch's options");
+        let named = running_27b(&["--profile", "rtx5090", "--qwen38flashnext-vision-enabled"]);
+        let started = named.for_family(ModelFamily::FlashNext).unwrap();
+        assert!(flash_next.vision.is_some(), "the 27B's vision is carried");
+        assert_eq!((flash_next.vision, flash_next.media), (started.vision, started.media), "Flash-Next's own vision settings");
+    }
+
+    /// ADR 0087: the carry is each switch's, decided from the model it
+    /// replaces. Back to the 27B, vision stays on; a model with vision off
+    /// carries nothing, so the target keeps its own setting, and a vision an
+    /// earlier switch carried to that target is not its own: a 27B whose
+    /// vision a live change turned off switches to Flash-Next without
+    /// vision. The image model takes no vision, and a switch to it carries
+    /// none.
+    #[test]
+    fn a_switch_carries_the_vision_of_the_model_it_replaces_and_nothing_else() {
+        let switch = |running: &crate::config::Config, family: ModelFamily| {
+            let target = ModelSource { artifact: std::path::PathBuf::from("target.ninfer"), model: family.model_id().to_owned() };
+            load_options(running, &target, family, None).expect("the switch's options")
+        };
+        let flash_next = switch(&running_27b(&["--profile", "rtx5090"]), ModelFamily::FlashNext);
+        let back = switch(&flash_next, ModelFamily::Qwen38_27b);
+        assert!(back.vision.is_some(), "back on the 27B");
+        assert!(switch(&back, ModelFamily::FlashNext).vision.is_some(), "and to Flash-Next again");
+        for flags in [&["--profile", "none"][..], &["--profile", "rtx5090", "--qwen38-vision-enabled", "false"]] {
+            assert!(switch(&running_27b(flags), ModelFamily::FlashNext).vision.is_none(), "{flags:?}: nothing to carry");
+        }
+        let mut patch = crate::config::source::Layer::default();
+        let enabled = crate::config::schema::field("vision", "enabled").unwrap();
+        let off = crate::config::source::Candidate { raw: "false".into(), spelling: "vision.qwen38.enabled".into() };
+        patch.set(enabled, Some(ModelFamily::Qwen38_27b), off).unwrap();
+        let without = back.with_patch(&patch).expect("a live change, reloaded");
+        assert!(without.vision.is_none(), "the 27B's vision named off");
+        assert!(switch(&without, ModelFamily::FlashNext).vision.is_none(), "the earlier carry is not Flash-Next's own");
+        assert!(switch(&back, ModelFamily::QwenImage21).vision.is_none(), "the image model");
+    }
+
+    /// ADR 0087: the vision a switch carries asks for Flash-Next's companion
+    /// as vision named on does. A 27B on its built-in profile's vision, the
+    /// companion missing beside the Flash-Next artifact, is refused by the
+    /// file's name before anything is prepared; with Flash-Next's vision
+    /// named off, the switch asks for no companion.
+    #[test]
+    fn a_carried_vision_without_flash_nexts_companion_is_refused_by_name() {
+        use ignis_artifact::packer::VISION_ARTIFACT_FILE_NAME;
+        let main = ignis_artifact::flash_next::fixture::build("switch-carried-companion").expect("the main fixture");
+        let target = ModelSource { artifact: main.path.clone(), model: "qwen3.8-flash-next".to_owned() };
+        let carried = ArtifactLoader::new(running_27b(&["--profile", "rtx5090"]));
+        let refusal = carried.companion_refusal(&target).expect("the carried vision needs the companion");
+        assert!(refusal.contains(VISION_ARTIFACT_FILE_NAME), "{refusal}");
+        let named_off = ArtifactLoader::new(running_27b(&["--profile", "rtx5090", "--qwen38flashnext-vision-enabled", "false"]));
+        assert_eq!(named_off.companion_refusal(&target), None, "named off, no companion to check");
+    }
+
+    /// ADR 0087: vision ends off across a switch from a model serving images
+    /// only where it is named off for the target itself, and the switch says
+    /// so, naming the value that left it off and how to carry vision. A
+    /// switch that carries vision, one to a target with vision of its own,
+    /// and one from a model without it say nothing of it.
     #[test]
     fn a_switch_that_leaves_its_target_without_vision_says_so() {
-        let running = |flags: &[&str]| {
-            let args: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
-            let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).unwrap() else { panic!("a config") };
-            config.for_family(ModelFamily::Qwen38_27b).unwrap()
-        };
-        let target = ModelSource { artifact: std::path::PathBuf::from("flash-next.ninfer"), model: "qwen3.8-flash-next".to_owned() };
-        let vision_off =|running: &crate::config::Config| -> Vec<serde_json::Value> {
+        let vision_off = |running: &crate::config::Config| -> Vec<serde_json::Value> {
             let records = logged(|| {
-                load_options(running, &target, ModelFamily::FlashNext, None).expect("the switch's options");
+                load_options(running, &flash_next_target(), ModelFamily::FlashNext, None).expect("the switch's options");
             });
             records.into_iter().filter(|event| event["event_name"] == "ignis.model.switch_vision_off").collect()
         };
         let field = |event: &serde_json::Value, name: &str| event.get(name).or_else(|| event["attributes"].get(name)).cloned();
-        let profile = running(&["--profile", "rtx5090"]);
-        assert!(profile.vision.is_some(), "the profile's vision, on the 27B");
-        let events = vision_off(&profile);
-        assert_eq!(events.len(), 1, "{events:?}");
-        let event = &events[0];
+        let named = vision_off(&running_27b(&["--profile", "rtx5090", "--qwen38flashnext-vision-enabled", "false"]));
+        assert_eq!(named.len(), 1, "{named:?}");
+        let event = &named[0];
         assert_eq!(field(event, "to"), Some("qwen3.8-flash-next".into()), "{event}");
         assert_eq!(field(event, "vision"), Some("off".into()), "{event}");
-        assert_eq!(field(event, "by"), Some("default".into()), "{event}");
+        assert_eq!(field(event, "by"), Some("named".into()), "{event}");
         let why = field(event, "why").and_then(|why| why.as_str().map(str::to_owned)).unwrap_or_default();
-        assert!(why.contains("--vision-enabled") && why.contains("--qwen38flashnext-vision-enabled"), "{event}");
-        let named = vision_off(&running(&["--profile", "rtx5090", "--qwen38flashnext-vision-enabled", "false"]));
-        assert_eq!(field(&named[0], "by"), Some("named".into()), "{named:?}");
-        assert!(field(&named[0], "why").is_some_and(|why| why.to_string().contains("--qwen38flashnext-vision-enabled")), "{named:?}");
-        assert!(vision_off(&running(&["--profile", "rtx5090", "--vision-enabled"])).is_empty(), "vision crosses the switch");
-        assert!(vision_off(&running(&["--profile", "none"])).is_empty(), "no vision to leave");
+        assert!(why.contains("--qwen38flashnext-vision-enabled") && why.contains("ADR 0087"), "{event}");
+        assert!(vision_off(&running_27b(&["--profile", "rtx5090"])).is_empty(), "the profile's vision is carried");
+        assert!(vision_off(&running_27b(&["--profile", "rtx5090", "--vision-enabled"])).is_empty(), "Flash-Next's own vision");
+        assert!(vision_off(&running_27b(&["--profile", "none"])).is_empty(), "no vision to leave");
+    }
+
+    /// A reload that takes a carried vision away (a `null` in the target's
+    /// own section) names nothing off: the line is said only for a value
+    /// someone named.
+    #[test]
+    fn a_reload_that_takes_a_carried_vision_away_names_nothing_off() {
+        let carried = load_options(&running_27b(&["--profile", "rtx5090"]), &flash_next_target(), ModelFamily::FlashNext, None).unwrap();
+        assert!(carried.vision.is_some(), "carried");
+        let mut patch = crate::config::source::Layer::default();
+        let enabled = crate::config::schema::field("vision", "enabled").unwrap();
+        patch.remove(enabled, Some(ModelFamily::FlashNext), "vision.qwen38flashnext.enabled".to_owned()).unwrap();
+        let reloaded = carried.with_patch(&patch).expect("the null, patched");
+        assert!(reloaded.vision.is_none(), "the carry taken away");
+        let records = logged(|| {
+            load_options(&carried, &flash_next_target(), ModelFamily::FlashNext, Some(&reloaded)).expect("the reload's options");
+        });
+        assert!(records.iter().all(|event| event["event_name"] != "ignis.model.switch_vision_off"), "{records:?}");
+    }
+
+    /// The placeholder start (no artifact) runs options resolved for no
+    /// family, where a built-in profile's vision, the 27B's alone, is not on:
+    /// it carries no vision, so its early companion check reads no target
+    /// file before the `202` (155f6304; `start_load`'s switch to a FIFO).
+    #[test]
+    fn the_placeholder_start_carries_no_vision_to_a_switch() {
+        for profile in ["none", "rtx5090", "rtxpro6000", "rtx-16gb", "rtx-24gb"] {
+            let args: Vec<String> = ["--profile", profile].map(String::from).to_vec();
+            let crate::config::ConfigOutcome::Config(placeholder) = crate::config::resolve(&args, |_| None).unwrap() else { panic!("a config") };
+            assert_eq!(placeholder.basis.family(), None, "{profile}");
+            let target = ModelSource { artifact: std::path::PathBuf::from("stalled.ninfer"), model: "stalled".to_owned() };
+            let (options, _) = fit_options(&placeholder, &target, ModelFamily::FlashNext, None).unwrap();
+            assert!(options.vision.is_none(), "{profile}");
+        }
     }
 
     /// The early companion check fits the switch's options as its prepare
