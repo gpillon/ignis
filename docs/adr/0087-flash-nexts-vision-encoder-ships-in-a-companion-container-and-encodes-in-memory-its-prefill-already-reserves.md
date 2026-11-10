@@ -130,5 +130,5 @@ takes images with the 27B's feature set, and how:
   active model's media. Vision is each family's, so a built-in profile's, on for the 27B alone, does not cross to
   Flash-Next, whose vision stays off by default: the switch logs it (`ignis.model.switch_vision_off`, what left it
   off and how to turn it on).
-- **Measured** ([finding](../findings/2026-11-09-flash-next-images-checked-without-the-bf16-checkpoint.md)): [TBD:
+- **Measured** ([finding](../findings/2026-11-10-flash-next-images-checked-without-the-bf16-checkpoint.md)): [TBD:
   the encoded tower against the BF16 tower beside the 27B's, the known answers, the decode gate].

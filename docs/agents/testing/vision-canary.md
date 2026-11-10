@@ -43,7 +43,7 @@ the never-evicted tokens (GitHub #194).
 
 ADR 0087 admits Flash-Next's images without the 335 GiB BF16 checkpoint on
 three checks, whose method and rules are fixed in
-[the finding](../../findings/2026-11-09-flash-next-images-checked-without-the-bf16-checkpoint.md)
+[the finding](../../findings/2026-11-10-flash-next-images-checked-without-the-bf16-checkpoint.md)
 before any run:
 
 - **The encoded tower against the BF16 tower**, with the 27B's as the bar:
@@ -99,9 +99,11 @@ $PY -I tools/vision-known-answers/score.py compare --flash-next $W/known-runs/fl
   --qwen27b $W/known-runs/qwen27b.jsonl --out $W/known-runs/compare.json
 
 # 4. The decode gate (GPU, ~30 minutes): four legs, vision the only difference,
-#    the context pinned so no leg adapts it. HOST_MARGIN_BYTES=0 joins KNOBS, in
-#    every leg alike, only when a start is refused for host memory.
-G=$W/gate; KNOBS="MODEL=flash-next IDLE_UNLOAD=0 LOOP_GUARD=off MAX_CONTEXT=589824"
+#    the context pinned so no leg adapts it and the VRAM budget so no leg plans
+#    another expert cache when the card's free VRAM moves between legs (a run
+#    without it planned four). HOST_MARGIN_BYTES=0 joins KNOBS, in every leg
+#    alike, only when a start is refused for host memory.
+G=$W/gate; KNOBS="MODEL=flash-next IDLE_UNLOAD=0 LOOP_GUARD=off MAX_CONTEXT=589824 VRAM_BUDGET=27G"
 for leg in off-1:0 on-1:1 on-2:1 off-2:0; do
   label=${leg%:*}; vision=${leg#*:}
   make gpu-status
