@@ -205,3 +205,29 @@ async fn vision_named_off_for_flash_next_wins_over_the_carried_vision() {
     switch_and_settle(&app, "mock-fn").await;
     assert!(loader.fitted_options().last().expect("the Flash-Next load, fitted").vision.is_none());
 }
+
+/// ADR 0087: the carried vision is Flash-Next's own live value while it
+/// serves, so a `null` in its section takes it away: a reload, after which
+/// Flash-Next serves without vision and the origin is no longer `live`.
+#[tokio::test]
+async fn a_null_in_flash_nexts_section_takes_the_carried_vision_away() {
+    let loader = MockLoader::new();
+    let app = fitted_27b(&loader, &["--profile", "rtx5090"]).app();
+    switch_and_settle(&app, "mock-fn").await;
+    let loads = loader.fitted_options().len();
+    assert!(loader.fitted_options()[loads - 1].vision.is_some(), "carried");
+    let body = json!({ "vision": { "qwen38flashnext": { "enabled": null } } });
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+    assert_eq!((status, applied["applied"].clone()), (StatusCode::ACCEPTED, json!("reload")), "{applied}");
+    for _ in 0..10_000 {
+        let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+        if loader.fitted_options().len() > loads && models["status"] == "serving" && models["data"][0]["id"] == "mock-fn" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(loader.fitted_options().last().unwrap().vision.is_none(), "the reload runs without the carried vision");
+    let (_, origins) = send(&app, Method::GET, "/v1/config/origins", None).await;
+    let row = origins["data"].as_array().unwrap().iter().find(|row| row["key"] == "vision.enabled" && row["scope"] == "qwen38flashnext");
+    assert_ne!(row.map(|row| row["source"].clone()), Some(json!("live")), "{origins}");
+}

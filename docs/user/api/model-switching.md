@@ -39,12 +39,14 @@ Vision named off for the target itself wins over the carry: its own flag
 (`--qwen38flashnext-vision-enabled false`), its env var
 (`IGNIS_QWEN38FLASHNEXT_VISION_ENABLED=false`), its section of the config file
 (`vision.qwen38flashnext.enabled: false`) or a live change of that key.
-`--vision-enabled false` names vision off for every model, not for one, so it
-does not stop the carry (a file `config generate` wrote holds
-`vision.enabled: false`). The switch then says so in the log,
-`ignis.model.switch_vision_off`, with what left vision off (`by: named`) and
-the value that names it (`why`), and an image part is refused with
-`vision_disabled`.
+Vision named off for every model is not named off for the target: a model
+whose own value turns its vision on beside `vision.enabled: false` (a file
+`config generate` wrote holds that line) still carries it. On the command
+line, `--vision-enabled false` turns a profile's 27B vision off too, so there
+is nothing to carry. Where vision is named off for the target, the switch
+says so in the log, `ignis.model.switch_vision_off`, with what left vision off
+(`by: named`) and the value that names it (`why`), and an image part is
+refused with `vision_disabled`.
 
 Flash-Next sees through its [vision companion](../configuration/vision.md#flash-next),
 a file beside its artifact: a switch to Flash-Next with vision on, its own or
