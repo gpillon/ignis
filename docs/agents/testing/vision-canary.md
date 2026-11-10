@@ -121,3 +121,33 @@ KLD against BF16 on image prompts runs. `verdict` exits non-zero on a failed
 gate and names the pair, the expert cache or the prompts that failed it. The
 tools' own tests are CPU-only: `$PY -m pytest tools/flash-next-vision` and
 `$PY -m pytest tools/vision-known-answers`.
+
+When the tower's bar is above the 27B's, `tower_check.py diagnose` says where
+the excess comes from (GitHub #560), on the CPU from the same dump: the
+reference tower with its matrices taken from the BF16 checkpoint, from the
+container's stored words decoded as the kernels decode them, or re-encoded in
+another format the kernels serve, kind by kind and block by block (the
+variant grammar is in the script's docstring). The `stored` variant against
+the served rows says whether the encode computes what the stored words say,
+the recipe check whether the stored words are the recipe's encoding of the
+BF16 tensors, and the stages where the error grows. One forward per variant
+per item, plus the BF16 one: about three minutes a pass per family over the
+32 items at 6 threads, and up to ~10 GB of RAM at the largest item (its
+stages held beside the model and the decoded words; each further source
+another ~1.8 GB), so one run at a time and none beside a Flash-Next load.
+
+```bash
+D=$W/tower-diagnosis
+$PY tools/flash-next-vision/tower_check.py diagnose --family qwen3.8-27b --source $W/27b-visual \
+  --container F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer --dump $W/tower-dump \
+  --out $D/qwen27b-stored.json --variant stored
+FN="diagnose --family qwen3.8-flash-next --source H:/fn-vision-556/source --dump $W/tower-dump \
+  --container F:/ai/models/Qwen3.8-Flash-Next-ignis/qwen3_8_flash_next_vision-v2.ninfer --against $D/qwen27b-stored.json"
+$PY tools/flash-next-vision/tower_check.py $FN --out $D/flash-next-stored.json --variant stored
+# Every matrix W8 (the merger's stored words already are):
+$PY tools/flash-next-vision/tower_check.py $FN --out $D/flash-next-w8.json --variant stored+patch_embedding=W8+block=W8
+```
+
+Without `--variant` it runs `bf16`, `stored` and each kind's stored words
+alone (`bf16+qkv=stored`, ...); `--against` adds each variant's paired bar
+against the other family's stored tower.
