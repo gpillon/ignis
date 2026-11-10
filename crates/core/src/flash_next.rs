@@ -539,14 +539,7 @@ impl FlashNextEngine {
         };
         // GitHub #557: a vision load's tower, from the companion held to this
         // container before any byte of it is read.
-        let tower = match options.vision {
-            Some(vision) => {
-                let companion = crate::flash_next_vision::Companion::open(&path, &reader, config.hidden)
-                    .map_err(|e| e.to_string())?;
-                Some(crate::flash_next_vision::Tower::load(&companion, vision.residency())?)
-            }
-            None => None,
-        };
+        let tower = crate::flash_next_vision::Tower::for_load(options.vision, &path, &reader, config.hidden)?;
         let planned = plan_flash_next_reservations(
             &plan,
             &geometry,

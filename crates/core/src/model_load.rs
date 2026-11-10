@@ -1129,11 +1129,8 @@ pub fn load_flash_next(
     }
     // GitHub #557: the vision companion's tower, which the leaf binds into
     // the 27B's tower schema; a load with vision needs it.
-    match (vision, tower) {
-        (Some(_), Some(tower)) => tensors.extend_from_slice(tower.bound_tensors()),
-        (Some(_), None) => return Err("a Flash-Next load with vision needs its vision companion's tower".into()),
-        (None, Some(_)) => return Err("a vision tower on a Flash-Next load without vision".into()),
-        (None, None) => {}
+    if let Some(tower) = paired_tower(vision, tower, "load")? {
+        tensors.extend_from_slice(tower.bound_tensors());
     }
     let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
     let rc = unsafe {
@@ -1194,6 +1191,16 @@ pub fn plan_flash_next_item_bound(
     FlashNextPlanCall::new(fn_plan, geometry, shape, mtp, tower)?.item_bound(staging_ring_bytes)
 }
 
+/// The vision companion's `tower` a Flash-Next `call` (a load, a plan) binds
+/// (GitHub #557): one exactly when `vision` is on, refused otherwise.
+fn paired_tower<T>(vision: Option<Vision>, tower: Option<T>, call: &str) -> Result<Option<T>, String> {
+    match (vision, tower) {
+        (Some(_), None) => Err(format!("a Flash-Next {call} with vision needs its vision companion's tower")),
+        (None, Some(_)) => Err(format!("a vision tower on a Flash-Next {call} without vision")),
+        (_, tower) => Ok(tower),
+    }
+}
+
 /// The descriptors, the topology and the options both Flash-Next plan calls
 /// hand the leaf, with the names the descriptors point into (kept alive
 /// beside them).
@@ -1249,11 +1256,9 @@ impl FlashNextPlanCall {
         };
         tensors.extend(head);
         // GitHub #557: the vision companion's tower, placed nowhere yet.
-        let (tower_names, tower) = match (vision, tower) {
-            (Some(_), Some(tower)) => vision_bound_tensors(&tower.entries, &tower.plan.handles, planned_placement(&tower.plan.plan))?,
-            (Some(_), None) => return Err("a Flash-Next plan with vision needs its vision companion's tower".into()),
-            (None, Some(_)) => return Err("a vision tower on a Flash-Next plan without vision".into()),
-            (None, None) => (Vec::new(), Vec::new()),
+        let (tower_names, tower) = match paired_tower(vision, tower, "plan")? {
+            Some(tower) => vision_bound_tensors(&tower.entries, &tower.plan.handles, planned_placement(&tower.plan.plan))?,
+            None => (Vec::new(), Vec::new()),
         };
         tensors.extend(tower);
         Ok(Self {

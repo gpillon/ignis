@@ -466,27 +466,7 @@ impl StepLeaf for CudaLeaf {
     type Media = step::MediaEmbedding<'static>;
 
     fn encode_media(&self, model: &Self::Model, item: &MediaItem) -> Result<Self::Media, i32> {
-        let control = ignis_core::vision::vision_item_control(item.grid);
-        let embedding = step::encode_media(&model.model, item.grid, &item.patches, &control)
-            // GitHub #243: a full pool is not a leaf error — it is the leaf
-            // telling the caller to release an embedding and call again, and
-            // `RuntimeCompute` does exactly that. Logging it as an error
-            // would put a line in the log for every cache miss under
-            // pressure.
-            .map_err(|(rc, message)| {
-                if rc == step::MEDIA_ENCODE_POOL_FULL {
-                    rc
-                } else {
-                    leaf_error("media encode", message)
-                }
-            })?;
-        // Safety: as for sequences -- `RuntimeCompute` releases every live
-        // embedding before its `Arc<Model<L>>` (and so this model) can drop.
-        Ok(unsafe { embedding.into_static() })
-    }
-
-    fn release_media(&self, _model: &Self::Model, _media: Self::Media) {
-        // Drops here: `MediaEmbedding::drop` calls `ignis_media_embedding_release`.
+        encode_into_pool(&model.model, item, leaf_error)
     }
 
     fn prefill_multimodal(
@@ -1132,6 +1112,35 @@ impl StepLeaf for CudaLeaf {
     fn transfer_wait(&self, model: &Self::Model, fence: u64) -> Result<(), i32> {
         model.pool.fence_wait(fence).map_err(|e| leaf_error("transfer fence", e))
     }
+}
+
+/// `item` encoded by `model`'s vision tower into its embedding pool (GitHub
+/// #178): both CUDA leaves' media encode, the 27B's and Flash-Next's (GitHub
+/// #557). A refusal is reported through the leaf's own `leaf_error`.
+pub(crate) fn encode_into_pool(
+    model: &CoreModel,
+    item: &MediaItem,
+    leaf_error: fn(&str, String) -> i32,
+) -> Result<step::MediaEmbedding<'static>, i32> {
+    let control = ignis_core::vision::vision_item_control(item.grid);
+    let embedding = step::encode_media(model, item.grid, &item.patches, &control)
+        // GitHub #243: a full pool is not a leaf error — it is the leaf
+        // telling the caller to release an embedding and call again, and
+        // `RuntimeCompute` does exactly that. Logging it as an error
+        // would put a line in the log for every cache miss under
+        // pressure.
+        .map_err(|(rc, message)| {
+            if rc == step::MEDIA_ENCODE_POOL_FULL {
+                rc
+            } else {
+                leaf_error("media encode", message)
+            }
+        })?;
+    // Safety: as for sequences -- `RuntimeCompute` releases every live
+    // embedding before its `Arc<Model<L>>` (and so this model) can drop.
+    // Dropping the embedding releases it (`ignis_media_embedding_release`),
+    // which the leaves' `release_media`, the trait's default, does.
+    Ok(unsafe { embedding.into_static() })
 }
 
 /// A KV-disk window as the seq ABI's.

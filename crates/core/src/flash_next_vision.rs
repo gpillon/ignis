@@ -144,8 +144,9 @@ pub use device::Tower;
 #[cfg(feature = "cuda")]
 mod device {
     use std::ffi::CString;
+    use std::path::Path;
 
-    use ignis_artifact::{materialize, CudaDevice, MaterializedArtifact, VisionResidency};
+    use ignis_artifact::{materialize, CudaDevice, MaterializedArtifact, Reader, VisionResidency};
 
     use super::{Companion, TowerPlan};
     use crate::model_load::ffi;
@@ -163,6 +164,24 @@ mod device {
     }
 
     impl Tower {
+        /// A Flash-Next load's tower, `None` without `vision`: the companion
+        /// beside the main container at `main_path` (opened as `main`), held
+        /// to it and to the model's `model_hidden` width before any byte of
+        /// it is read ([`Companion::open`]), then bound and placed where
+        /// `vision`'s residency keeps it.
+        pub fn for_load(
+            vision: Option<crate::vision::Vision>,
+            main_path: &Path,
+            main: &Reader,
+            model_hidden: u64,
+        ) -> Result<Option<Self>, String> {
+            let Some(vision) = vision else {
+                return Ok(None);
+            };
+            let companion = Companion::open(main_path, main, model_hidden).map_err(|e| e.to_string())?;
+            Self::load(&companion, vision.residency()).map(Some)
+        }
+
         /// `companion`'s tower, bound and placed under `residency`.
         pub fn load(companion: &Companion, residency: VisionResidency) -> Result<Self, String> {
             let plan = companion.bind(residency)?;

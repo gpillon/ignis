@@ -821,7 +821,8 @@ pub trait StepLeaf: Send + Sync + 'static {
     fn encode_media(&self, _model: &Self::Model, _item: &MediaItem) -> Result<Self::Media, i32> {
         Err(-1)
     }
-    /// Release a media embedding.
+    /// Release a media embedding. By default it is dropped, which is the
+    /// release for an embedding whose drop frees it (the CUDA leaves').
     fn release_media(&self, _model: &Self::Model, _media: Self::Media) {}
     /// [`StepLeaf::prefill`] over a span of a multimodal prompt: rotated at
     /// the span's three-axis positions, its placeholder columns taking the

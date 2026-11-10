@@ -47,7 +47,7 @@ use ignis_core::step;
 use ignis_core::types::{DecodeParams, SpecCounters, TokenId};
 use ignis_core::{ArtifactHash, BlobIdentity};
 
-use crate::cuda_leaf::{close_id, redirect_stop_ids, step_redirect};
+use crate::cuda_leaf::{close_id, encode_into_pool, redirect_stop_ids, step_redirect};
 use crate::{
     AttentionRead, DecodeLane, DrawRedirect, LaneRun, MultimodalSpan, ReservedBytes, RuntimeStats, StepLeaf,
     TransferWindow,
@@ -192,14 +192,7 @@ impl FlashNextLeaf {
         // artifact before any byte of it is read; placed before the residency
         // phase, whose peak the host plan charges it to (`vision_tower`).
         let start = Instant::now();
-        let tower = match options.vision {
-            Some(vision) => {
-                let companion = ignis_core::flash_next_vision::Companion::open(path, &reader, config.hidden)
-                    .map_err(|e| e.to_string())?;
-                Some(ignis_core::flash_next_vision::Tower::load(&companion, vision.residency())?)
-            }
-            None => None,
-        };
+        let tower = ignis_core::flash_next_vision::Tower::for_load(options.vision, path, &reader, config.hidden)?;
         log_load_phase("vision", start.elapsed());
 
         // A device-only residency's layer buffers are gone when this
@@ -521,21 +514,7 @@ impl StepLeaf for FlashNextLeaf {
     /// encodes in its own. A full pool is the caller's to act on (it
     /// releases an embedding and calls again), never a leaf error.
     fn encode_media(&self, model: &Self::Model, item: &ignis_core::vision::MediaItem) -> Result<Self::Media, i32> {
-        let control = ignis_core::vision::vision_item_control(item.grid);
-        let embedding = step::encode_media(&model.model, item.grid, &item.patches, &control).map_err(|(rc, message)| {
-            if rc == step::MEDIA_ENCODE_POOL_FULL {
-                rc
-            } else {
-                leaf_error("media encode", message)
-            }
-        })?;
-        // Safety: as for sequences -- `RuntimeCompute` releases every live
-        // embedding before its `Arc<Model<L>>` (and so this model) can drop.
-        Ok(unsafe { embedding.into_static() })
-    }
-
-    fn release_media(&self, _model: &Self::Model, _media: Self::Media) {
-        // Drops here: `MediaEmbedding::drop` calls `ignis_media_embedding_release`.
+        encode_into_pool(&model.model, item, leaf_error)
     }
 
     fn decode_lanes(&self) -> u32 {
