@@ -30,12 +30,14 @@ what MTP does on image prompts (#564, #565).
 
 ## Evidence
 
-The tools, the method and the rules below were fixed on 2026-11-09, before any run; the runs landed on 2026-11-10.
+The measures, the bars and the alarm rules of checks 1 to 3 were fixed on 2026-11-09, before any run; the runs
+landed on 2026-11-10. The image MTP test's rule (section 4) and the decode gate's VRAM budget were set on 2026-11-10,
+after the runs that called for them, and say so where they appear.
 
 **Setup.**
 - Trees: the tower check, the GPU suite and Flash-Next's known answers on `555-integration` at 3fae18c5, the W8
   companion pinned (#560's comment of 2026-11-10); the 27B's known answers on the release build made before the
-  re-encode, which changes neither the 27B's tower nor its path; the bind CTest's item bounds at f749cea0.
+  re-encode, at ef632ec3, the 27B's tower and recipe the same in both; the bind CTest's item bounds at f749cea0.
 - The vision companion `qwen3_8_flash_next_vision-v2.ninfer`, every matrix W8 (482,499,840 B, sha256 `0110bb79…`,
   weights id `vision-w8-bf16-de4b8e4`, #556), pinned to the main container `12e3b265…`; the 27B
   `qwen3_8_27b_nvfp4full-v2.ninfer`.
@@ -253,8 +255,9 @@ Inferred:
 
 ## Implications
 
-- ADR 0087 is accepted on these figures: Flash-Next's companion ships with every matrix W8, and the KLD against BF16
-  on image prompts does not run. The 27B's tower and its recipe stay as they are.
+- Neither quality check raises an alarm on the W8 companion: Flash-Next's companion ships with every matrix W8, and
+  the KLD against BF16 on image prompts does not run. The 27B's tower and its recipe stay as they are. ADR 0087's
+  acceptance rests on these and on the decode gate's line above.
 - A new tower, or a tower's new recipe, gets the same check against its BF16 tower before it ships, on the same
   pre-registered bar; a sibling's recipe is evidence for nothing.
 - The image MTP test holds a split to ADR 0056's near tie, as the text path's wide verify rounds are held; speculation
