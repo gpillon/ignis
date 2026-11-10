@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Flash-Next's vision encoder ships in a companion container and encodes in memory its prefill already reserves
