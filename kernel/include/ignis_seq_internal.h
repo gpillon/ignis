@@ -115,7 +115,7 @@ enum ignis_kv_plane_role {
  * `ignis_kv_fill_layer_planes` below does. */
 inline std::size_t ignis_kv_plane_index(int32_t kv_format, int32_t gqa_layer,
                                         ignis_kv_plane_role role) {
-  const bool wants_meta = role == IGNIS_KV_PLANE_K_META || role == IGNIS_KV_PLANE_V_META;
+  [[maybe_unused]] const bool wants_meta = role == IGNIS_KV_PLANE_K_META || role == IGNIS_KV_PLANE_V_META;
   assert((!wants_meta || kv_format == IGNIS_KV_FORMAT_HQ_E8_2B) &&
          "a BF16 KV pool has no metadata planes");
   const bool is_v      = role == IGNIS_KV_PLANE_V || role == IGNIS_KV_PLANE_V_META;
