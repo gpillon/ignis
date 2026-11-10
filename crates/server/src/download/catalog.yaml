@@ -60,16 +60,16 @@ models:
   # when MTP or vision is off.
   - id: qwen3.8-flash-next
     repo: gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis
-    revision: "1f4f85c4a1b3a41854881f2eba5a022a1ad5126f"
+    revision: "6457921d4e2d4869452b373053b0374381046ba2"
     artifact: qwen3_8_flash_next_trellis_a25-v2.ninfer
     card_class: 32
     generation: blackwell
-    license: { id: qwen-community-1.0, url: "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/1f4f85c4a1b3a41854881f2eba5a022a1ad5126f/LICENSE" }
+    license: { id: qwen-community-1.0, url: "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/6457921d4e2d4869452b373053b0374381046ba2/LICENSE" }
     files:
-      - { name: qwen3_8_flash_next_vision-v2.ninfer.conversion.json, bytes: 1834, sha256: "963c833ec590e0f188900f86d31f348b5f934c8eeef2485e51263ef930f3c6b5" }
+      - { name: qwen3_8_flash_next_vision-v2.ninfer.conversion.json, bytes: 1795, sha256: "a1f3f7afd0c58586b11c2e8a15d5e6f85d886570334f11a785c343796173c03c" }
       - { name: qwen3_8_flash_next_mtp_3p0-v2.ninfer.conversion.json, bytes: 179029, sha256: "a5b2c10fe0745cfe6b8e2914135e44903cfb80acb3f0db21e549e76641f14127" }
       - { name: qwen3_8_flash_next_trellis_a25-v2.ninfer.conversion.json, bytes: 1183942, sha256: "9858d9fb03dd66fa2558b5dc6aa6463ee70f00024ffbd746545b231c9514f7a0" }
-      - { name: qwen3_8_flash_next_vision-v2.ninfer, bytes: 284229120, sha256: "d97353d4d8d2a3caeb61c58052e50f47019b84a4667d07701c84ce2acede52b9" }
+      - { name: qwen3_8_flash_next_vision-v2.ninfer, bytes: 482499840, sha256: "0110bb795ddf70a6f9f3a73efd4a0d2094140e8d4bac2bdf28bf89d229ee1724" }
       - { name: qwen3_8_flash_next_mtp_3p0-v2.ninfer, bytes: 1037905920, sha256: "432fe5c0838027047c5b46c4fde526f3d3ef3d126f00fed1213921f8705988d2" }
       - { name: qwen3_8_flash_next_trellis_a25-v2.ninfer, bytes: 71760711680, sha256: "12e3b265b0678ba935a4b05d1b612ba4b68b3a96c3026d818ad65838985fd864" }
 

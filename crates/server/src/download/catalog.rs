@@ -1026,7 +1026,7 @@ mod tests {
         (
             "qwen3.8-flash-next",
             "gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis",
-            "1f4f85c4a1b3a41854881f2eba5a022a1ad5126f",
+            "6457921d4e2d4869452b373053b0374381046ba2",
             "qwen3_8_flash_next_trellis_a25-v2.ninfer",
             32,
             Some(GpuGeneration::Blackwell),
@@ -1035,8 +1035,8 @@ mod tests {
             &[
                 (
                     "qwen3_8_flash_next_vision-v2.ninfer.conversion.json",
-                    1_834,
-                    "963c833ec590e0f188900f86d31f348b5f934c8eeef2485e51263ef930f3c6b5",
+                    1_795,
+                    "a1f3f7afd0c58586b11c2e8a15d5e6f85d886570334f11a785c343796173c03c",
                 ),
                 (
                     "qwen3_8_flash_next_mtp_3p0-v2.ninfer.conversion.json",
@@ -1048,7 +1048,7 @@ mod tests {
                     1_183_942,
                     "9858d9fb03dd66fa2558b5dc6aa6463ee70f00024ffbd746545b231c9514f7a0",
                 ),
-                ("qwen3_8_flash_next_vision-v2.ninfer", 284_229_120, "d97353d4d8d2a3caeb61c58052e50f47019b84a4667d07701c84ce2acede52b9"),
+                ("qwen3_8_flash_next_vision-v2.ninfer", 482_499_840, "0110bb795ddf70a6f9f3a73efd4a0d2094140e8d4bac2bdf28bf89d229ee1724"),
                 ("qwen3_8_flash_next_mtp_3p0-v2.ninfer", 1_037_905_920, "432fe5c0838027047c5b46c4fde526f3d3ef3d126f00fed1213921f8705988d2"),
                 ("qwen3_8_flash_next_trellis_a25-v2.ninfer", 71_760_711_680, "12e3b265b0678ba935a4b05d1b612ba4b68b3a96c3026d818ad65838985fd864"),
             ],
@@ -1565,7 +1565,7 @@ mod tests {
         let pinned = [
             ("qwen3.8-27b", "apache-2.0", "https://www.apache.org/licenses/LICENSE-2.0"),
             ("qwen3.8-27b-abliterated", "apache-2.0", "https://www.apache.org/licenses/LICENSE-2.0"),
-            ("qwen3.8-flash-next", "qwen-community-1.0", "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/1f4f85c4a1b3a41854881f2eba5a022a1ad5126f/LICENSE"),
+            ("qwen3.8-flash-next", "qwen-community-1.0", "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/6457921d4e2d4869452b373053b0374381046ba2/LICENSE"),
             ("ignis-image-2.1-turbo", "qwen-research", "https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/LICENSE"),
             ("qwen3.8-27b-16g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis/blob/f5bbd2cc14c9ca573ef5553c100ac69410f1fe58/LICENSE"),
             ("qwen3.8-27b-abliterated-16g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis/blob/94a8bfc0f47ce86403f274be03e2c0f79500727c/LICENSE"),
