@@ -47,6 +47,12 @@ async fn send(app: &axum::Router, method: Method, uri: &str, body: Option<Value>
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
+/// Switch to `model` and wait until it serves: the whole end state the tests
+/// read after it. The request size cap is the serving model's `media`, a
+/// field of the model a switch publishes before it stores `serving`, and
+/// `GET /v1/models` reads the status before the model, so a `serving` read
+/// beside the new id is never paired with the old cap. The status leaves
+/// `serving` before the `202`, so the wait never ends on the model replaced.
 async fn switch_and_settle(app: &axum::Router, model: &str) {
     let (status, accepted) = send(app, Method::POST, "/v1/models/switch", Some(json!({ "artifact": format!("{model}.ninfer"), "model": model }))).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
