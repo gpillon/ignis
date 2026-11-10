@@ -51,7 +51,7 @@ pub const MEDIA_ENCODE_POOL_FULL: i32 = -2;
 pub const EMBEDDING_PAGE_COLUMNS: u64 = 128;
 
 /// The merger object whose rows are a media embedding's width, and its bias.
-const MERGER_OUTPUT: [&str; 2] = ["vision/merger/fc2", "vision/merger/fc2_bias"];
+const MERGER_OUTPUT: [&str; 2] = ignis_artifact::nvfp4_27b::VISION_MERGER_OUTPUT;
 
 /// How wide a media embedding is (GitHub #562): the rows the vision tower's
 /// merger writes, which are the hidden width of the text model it feeds --

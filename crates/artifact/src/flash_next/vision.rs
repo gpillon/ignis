@@ -15,17 +15,16 @@ use std::sync::{Mutex, PoisonError};
 
 use super::{fail, VISION_MODEL_ID};
 use crate::binder::{Binder, DeviceEncoding, MaterializationPlan, ObjectHandle, Residence};
-use crate::inventory::{InventoryEntry, VISION_LAYERS};
-use crate::nvfp4_27b::{Entry, VisionTower};
+use crate::inventory::InventoryEntry;
+use crate::nvfp4_27b::{vision_objects, Entry, VisionFormats, VisionTower, VISION_MERGER_OUTPUT};
 use crate::{ArtifactIdentity, NumericFormat, Object, Reader, Result, StorageLayout, VisionResidency};
 
 /// The merger's output object, whose rows are the width the tower writes.
-const MERGER_OUTPUT: &str = "vision/merger/fc2";
+const MERGER_OUTPUT: &str = VISION_MERGER_OUTPUT[0];
 
-/// Every matrix of the tower: W8G32 with binary16 scales, row-split.
-const MATRIX: (NumericFormat, StorageLayout) = (NumericFormat::W8G32F16S, StorageLayout::RowSplitK128V1);
-/// The biases, the norms and the position table.
-const VECTOR: (NumericFormat, StorageLayout) = (NumericFormat::Bf16, StorageLayout::ContiguousLeV1);
+/// The tower's formats: every matrix W8G32 with binary16 scales, row-split.
+pub const FORMATS: VisionFormats =
+    VisionFormats::every_matrix((NumericFormat::W8G32F16S, StorageLayout::RowSplitK128V1));
 
 /// The companion's identity: the vision `model_id` and the build's weights
 /// id (every matrix W8, the rest BF16, from revision `de4b8e4`).
@@ -48,42 +47,12 @@ pub fn fixture_geometry() -> VisionTower {
 }
 
 /// The companion's objects in container order, at `tower`: what the packer
-/// holds the work tree to, and ([`scope`]) what a load binds. The patch
+/// holds the work tree to, and ([`scope`]) what a load binds. The 27B
+/// tower's objects ([`vision_objects`]) in [`FORMATS`]: the patch
 /// embedding, the blocks' attention input and output and MLP linears and
-/// the 2 x 2 merger's linears are W8; the biases, norms and position table
-/// BF16.
+/// the 2 x 2 merger's linears W8; the biases, norms and position table BF16.
 pub fn entries(tower: &VisionTower) -> Vec<Entry> {
-    let (vh, vi) = (tower.hidden, tower.intermediate);
-    let merged = 4 * vh;
-    let mut out = Vec::with_capacity(3 + VISION_LAYERS * 12 + 6);
-    let mut tensor = |name: String, (format, layout): (NumericFormat, StorageLayout), shape: &[u64]| {
-        out.push(Entry::Tensor { name, format, layout, shape: shape.to_vec() });
-    };
-    tensor("vision/patch_embedding".into(), MATRIX, &[vh, tower.patch]);
-    tensor("vision/patch_embedding_bias".into(), VECTOR, &[vh]);
-    tensor("vision/position_embedding".into(), VECTOR, &[tower.positions, vh]);
-    for b in 0..VISION_LAYERS {
-        let n = |suffix: &str| format!("vision/layers/{b}/{suffix}");
-        tensor(n("attention/qkv"), MATRIX, &[3 * vh, vh]);
-        tensor(n("attention/qkv_bias"), VECTOR, &[3 * vh]);
-        tensor(n("attention/output"), MATRIX, &[vh, vh]);
-        tensor(n("attention/output_bias"), VECTOR, &[vh]);
-        tensor(n("mlp/fc1"), MATRIX, &[vi, vh]);
-        tensor(n("mlp/fc1_bias"), VECTOR, &[vi]);
-        tensor(n("mlp/fc2"), MATRIX, &[vh, vi]);
-        tensor(n("mlp/fc2_bias"), VECTOR, &[vh]);
-        for norm in ["norm1", "norm2"] {
-            tensor(n(&format!("{norm}/weight")), VECTOR, &[vh]);
-            tensor(n(&format!("{norm}/bias")), VECTOR, &[vh]);
-        }
-    }
-    tensor("vision/merger/fc1".into(), MATRIX, &[merged, merged]);
-    tensor("vision/merger/fc1_bias".into(), VECTOR, &[merged]);
-    tensor("vision/merger/fc2".into(), MATRIX, &[tower.out_hidden, merged]);
-    tensor("vision/merger/fc2_bias".into(), VECTOR, &[tower.out_hidden]);
-    tensor("vision/merger/norm/weight".into(), VECTOR, &[vh]);
-    tensor("vision/merger/norm/bias".into(), VECTOR, &[vh]);
-    out
+    vision_objects(tower, &FORMATS)
 }
 
 /// [`entries`] as the inventory a load binds the tower by and hands the

@@ -316,36 +316,71 @@ impl Geometry {
     }
 }
 
+/// The merger's output linear and its bias, whose rows are the width the
+/// tower writes: the text model's hidden width.
+pub const VISION_MERGER_OUTPUT: [&str; 2] = ["vision/merger/fc2", "vision/merger/fc2_bias"];
+
+/// A tower's matrix formats, by object kind; the biases, norms and position
+/// table are BF16 in every tower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisionFormats {
+    pub patch_embedding: (NumericFormat, StorageLayout),
+    /// The blocks' attention input (`qkv`) and MLP first linear (`fc1`).
+    pub block_input: (NumericFormat, StorageLayout),
+    /// The blocks' attention output and MLP second linear (`fc2`).
+    pub block_output: (NumericFormat, StorageLayout),
+    /// The 2 x 2 merger's two linears.
+    pub merger: (NumericFormat, StorageLayout),
+}
+
+impl VisionFormats {
+    /// The 27B recipe's: the patch embedding Q6, the blocks' input linears
+    /// Q4, their output linears Q5, the merger's W8.
+    pub const QWEN38_27B: Self = Self { patch_embedding: Q6, block_input: Q4, block_output: Q5, merger: W8 };
+
+    /// Every matrix in `format`.
+    pub const fn every_matrix(format: (NumericFormat, StorageLayout)) -> Self {
+        Self { patch_embedding: format, block_input: format, block_output: format, merger: format }
+    }
+}
+
 /// The tower's objects in container order, each object kind in the 27B
-/// recipe's format: the patch embedding Q6, the blocks' attention input and
-/// MLP first linear Q4, their output linears Q5, the 2 x 2 merger's linears
-/// W8; the biases, norms and position table BF16.
+/// recipe's format ([`VisionFormats::QWEN38_27B`]).
 pub fn vision_tower(t: &VisionTower) -> Vec<Entry> {
+    vision_objects(t, &VisionFormats::QWEN38_27B)
+}
+
+/// A tower's objects in container order at `t`'s widths, its matrices in
+/// `formats`: the 27B's ([`vision_tower`]) or Flash-Next's companion
+/// ([`crate::flash_next::vision::entries`]), the same objects under the same
+/// names.
+pub fn vision_objects(t: &VisionTower, formats: &VisionFormats) -> Vec<Entry> {
     let (vh, vi) = (t.hidden, t.intermediate);
     let merged = 4 * vh;
+    let [merger_output, merger_output_bias] = VISION_MERGER_OUTPUT;
     let mut o = Objects(Vec::with_capacity(3 + VISION_LAYERS * 12 + 6));
-    o.tensor("vision/patch_embedding", Q6, &[vh, t.patch]);
+    o.tensor("vision/patch_embedding", formats.patch_embedding, &[vh, t.patch]);
     o.tensor("vision/patch_embedding_bias", BF16, &[vh]);
     o.tensor("vision/position_embedding", BF16, &[t.positions, vh]);
     for b in 0..VISION_LAYERS {
         let n = |suffix: &str| format!("vision/layers/{b}/{suffix}");
-        o.tensor(n("attention/qkv"), Q4, &[3 * vh, vh]);
+        o.tensor(n("attention/qkv"), formats.block_input, &[3 * vh, vh]);
         o.tensor(n("attention/qkv_bias"), BF16, &[3 * vh]);
-        o.tensor(n("attention/output"), Q5, &[vh, vh]);
+        o.tensor(n("attention/output"), formats.block_output, &[vh, vh]);
         o.tensor(n("attention/output_bias"), BF16, &[vh]);
-        o.tensor(n("mlp/fc1"), Q4, &[vi, vh]);
+        o.tensor(n("mlp/fc1"), formats.block_input, &[vi, vh]);
         o.tensor(n("mlp/fc1_bias"), BF16, &[vi]);
-        o.tensor(n("mlp/fc2"), Q5, &[vh, vi]);
+        o.tensor(n("mlp/fc2"), formats.block_output, &[vh, vi]);
         o.tensor(n("mlp/fc2_bias"), BF16, &[vh]);
         for norm in ["norm1", "norm2"] {
             o.tensor(n(&format!("{norm}/weight")), BF16, &[vh]);
             o.tensor(n(&format!("{norm}/bias")), BF16, &[vh]);
         }
     }
-    o.tensor("vision/merger/fc1", W8, &[merged, merged]);
+    o.tensor("vision/merger/fc1", formats.merger, &[merged, merged]);
     o.tensor("vision/merger/fc1_bias", BF16, &[merged]);
-    o.tensor("vision/merger/fc2", W8, &[t.out_hidden, merged]);
-    o.tensor("vision/merger/fc2_bias", BF16, &[t.out_hidden]);
+    o.tensor(merger_output, formats.merger, &[t.out_hidden, merged]);
+    o.tensor(merger_output_bias, BF16, &[t.out_hidden]);
     o.tensor("vision/merger/norm/weight", BF16, &[vh]);
     o.tensor("vision/merger/norm/bias", BF16, &[vh]);
     o.0
