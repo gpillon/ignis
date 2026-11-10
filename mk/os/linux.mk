@@ -7,8 +7,9 @@
 #
 # Background server control uses mk/linux/server.py, with a detached session,
 # a PID + process identity, and /ready 200 after warmup (GitHub #129, #493).
-# Still to do (each is a hook below that fails with a clear message today):
-#   - the run-ui/dev-ui process group
+# run-ui/dev-ui's foreground session, mk/linux/devui.py, writes the same
+# record with its helpers (GitHub #226).
+# Still to do (a hook below that fails with a clear message today):
 #   - scripts/gpu-profile.sh, the three-stage explicit GPU test profile
 #     (scripts/gpu-profile.ps1's counterpart), which writes the marker
 #     ignis_core::gpu_profile reads
@@ -37,8 +38,11 @@ SERVER_CTL_ARGS = --pid '$(SERVER_PID)' --log '$(SERVER_LOG)' --url '$(SERVER_UR
 SERVER_START = $(PYTHON) mk/linux/server.py start $(SERVER_CTL_ARGS) -- '$(SERVER_BIN)' $(SERVER_FLAGS)
 SERVER_STOP = $(PYTHON) mk/linux/server.py stop $(SERVER_CTL_ARGS) $(if $(filter 1,$(FORCE)),--force)
 SERVER_STATUS = $(PYTHON) mk/linux/server.py status $(SERVER_CTL_ARGS)
-# sh: start the server and vite in one process group, `trap 'kill 0' INT TERM EXIT`.
-DEV_UI = $(call todo,run-ui / dev-ui)
+# The server and Vite as one foreground session (mk/linux/devui.py's header
+# says how each dies with it). `exec` makes the script make's own child, with
+# no shell between: it watches its parent, to stop both when make is killed
+# by a signal make cannot pass on (kill -9).
+DEV_UI = exec $(PYTHON) mk/linux/devui.py $(SERVER_CTL_ARGS) -- '$(SERVER_BIN)' $(SERVER_FLAGS)
 
 # Not a todo, and not OS-specific either: mk/version.sh is text editing over
 # four files and serves both hosts, so mk/os/windows.mk names the same one.

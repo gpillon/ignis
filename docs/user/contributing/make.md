@@ -86,8 +86,13 @@ leaves it running. It keeps the previous log and `.err` beside the new ones,
 with a timestamp suffix, instead of rewriting them, and does not repeat a
 generated API key or public URL on the console: they are in the log. `stop`
 sends SIGTERM and waits up to 30 seconds; `FORCE=1` also stops your other
-`ignis-server` processes. `dev-ui` / `run-ui` and `gpu-profile` are still
-Windows-only.
+`ignis-server` processes. `dev-ui` / `run-ui` run `mk/linux/devui.py`, which
+refuses, waits and keeps the logs as `start` does, but repeats a generated API
+key and public URL on the console, as Windows does. However the session ends
+(Ctrl+C, Vite exiting, the terminal closed, make killed, even with `kill -9`),
+the server gets SIGTERM, its graceful shutdown, and is killed if it still runs
+20 seconds later; a second Ctrl+C ends it at once. `gpu-profile` is the one
+target still Windows-only.
 
 A change to the `Makefile` starts from
 [ADR 0027](../../adr/0027-make-as-the-dev-entrypoint.md), the decision that

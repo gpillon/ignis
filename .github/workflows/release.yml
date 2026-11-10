@@ -246,6 +246,13 @@ jobs:
         shell: bash
         run: bash mk/linux/doctor-selftest.sh
 
+      # `make run-ui` / `dev-ui`'s session on Linux (GitHub #226), on a stub
+      # server and a stub Vite. Linux only: it needs /proc and process groups.
+      - name: Linux dev-ui selftest
+        if: matrix.host == 'linux' && matrix.shard == 1
+        shell: bash
+        run: bash mk/linux/devui-selftest.sh
+
       # The Playground's logic is pure TypeScript with no host in it, so one
       # run answers for both (ADR 0026, docs/agents/testing.md). Linux is the
       # cheaper runner.
