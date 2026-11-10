@@ -53,7 +53,7 @@ or not the part is used.
 | Family | What it is | Artifact | Where it runs |
 |---|---|---|---|
 | Qwen3.8-27B | Dense, 64 layers: 16 full-attention layers and 48 linear-attention (GDN) layers | 18.1 GiB | Entirely in VRAM |
-| Qwen3.8-Flash-Next | 125B mixture of experts, 6B active per token, 48 layers, 512 routed experts per layer, 10 chosen per token | 68.1 GiB with its two companions | Trunk in VRAM; experts in a VRAM cache backed by host RAM |
+| Qwen3.8-Flash-Next | 125B mixture of experts, 6B active per token, 48 layers, 512 routed experts per layer, 10 chosen per token | 68.2 GiB with its two companions | Trunk in VRAM; experts in a VRAM cache backed by host RAM |
 | Qwen-Image-2.1-Turbo | Image model: a Qwen3-VL text encoder, a 7B diffusion transformer and a VAE | 15.6 GiB | Reached by a switch; never loaded beside a text model |
 
 The family is not the same thing as the model name. Several artifacts can

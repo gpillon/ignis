@@ -193,7 +193,7 @@ it).
 
 With no `--model-artifact`, a GPU build looks for the model under
 `--download-path` (default `./models`) and fetches the whole entry when it is
-not there: 18.1 GiB for the default 27B, 68.1 GiB for Flash-Next. On a terminal
+not there: 18.1 GiB for the default 27B, 68.2 GiB for Flash-Next. On a terminal
 it asks first; in a container, a daemon or CI nobody can answer, so it
 downloads. Every file is checked against its pinned size and SHA-256, an
 interrupted download resumes from its `.part`, and a failed fetch refuses the

@@ -1370,7 +1370,7 @@ mod tests {
             assert!(flash.files.iter().any(|f| f.name == format!("{companion}.conversion.json")), "{companion}'s sidecar");
         }
         assert_eq!(flash.artifact, ignis_artifact::packer::ARTIFACT_FILE_NAME);
-        assert_eq!(format!("{:.1}", flash.gib()), "68.1", "73.1 GB, the six files together");
+        assert_eq!(format!("{:.1}", flash.gib()), "68.2", "73.3 GB, the six files together");
         for entry in catalog.entries() {
             for file in &entry.files {
                 assert!(plain_name(&file.name), "{}", file.name);
