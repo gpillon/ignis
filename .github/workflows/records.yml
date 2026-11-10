@@ -12,6 +12,13 @@
 # takes the history (commits and trees, no blobs until one is read). No
 # concurrency group: a run cancelled by the next push would leave its push's
 # range unchecked, and a run takes seconds.
+#
+# It also runs the selftest of mk/board-status.py, the board-status
+# workflow's script (#524), which `make records-check` does not: it is the
+# same kind of check, the standard library alone and seconds, and this is the
+# workflow that runs on every branch and pull request. The selftest compares
+# the script's mapping with the table in docs/agents/issue-tracker.md, so a
+# change to either starts it.
 
 name: records
 
@@ -23,6 +30,8 @@ on:
       - "docs/findings/**"
       - "mk/adr-index.py"
       - "mk/findings-index.py"
+      - "mk/board-status.py"
+      - "docs/agents/issue-tracker.md"
       - ".github/workflows/records.yml"
   pull_request:
     paths:
@@ -30,6 +39,8 @@ on:
       - "docs/findings/**"
       - "mk/adr-index.py"
       - "mk/findings-index.py"
+      - "mk/board-status.py"
+      - "docs/agents/issue-tracker.md"
       - ".github/workflows/records.yml"
 
 permissions:
@@ -47,6 +58,8 @@ jobs:
         run: python3 mk/adr-index.py --selftest
       - name: The findings index's selftest
         run: python3 mk/findings-index.py --selftest
+      - name: The board status's selftest
+        run: python3 mk/board-status.py --selftest
       - name: The ADRs' frontmatter and their index, and no earlier ADR's text changed
         env:
           BEFORE: ${{ github.event.before }}

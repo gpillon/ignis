@@ -77,10 +77,12 @@ agents leave the board alone, as they leave the issue.
 - **Area**: on every new issue, the one area it touches.
 - **Release**: when the spec or the owner names one. A ticket takes its
   spec's Release and Area.
-- **Status**, from the state label: `idea` Parked, `needs-triage` and
-  `needs-info` Inbox, `ready-for-agent` and `ready-for-human` Ready. The
-  coordinating session moves a ticket to In progress when work starts, and
-  to Waiting on owner when it merges with the owner's acceptance still open.
+- **Status**: the labels set it, through a workflow, once the owner has set
+  up its credential (**Status from the labels** below; `gh secret list` names
+  `BOARD_TOKEN` or `BOARD_APP_KEY` once one is). Until then the session sets
+  it by hand from the table there. The coordinating session moves a ticket to
+  In progress when work starts, and to Waiting on owner when it merges with
+  the owner's acceptance still open.
 - **Start date** and **Target date**: on release work only, estimates along
   the blocking edges that the coordinating session moves when the plan moves.
 
@@ -91,7 +93,70 @@ a date takes `--value YYYY-MM-DD`, and the option names of Area, Release and
 Status come from `gh project field-list 6 --owner gpillon --format json`.
 An issue not on the board yet joins with
 `gh project item-add 6 --owner gpillon --url <issue-url>`. The board sets a
-newly added issue's Status to Inbox, so Status is the last field set.
+newly added issue's Status to Inbox and no label event follows an
+`item-add`, so a session that adds an issue by hand sets its Status last,
+from the table below.
+
+### Status from the labels
+
+`.github/workflows/board-status.yml` sets an issue's Status from its labels
+whenever the issue is opened, reopened, labeled or unlabeled, with this table,
+which stays the authority (`mk/board-status.py` holds the rules, and its
+selftest refuses the script's copy of the table once it differs from this
+one):
+
+| Label | Status |
+|---|---|
+| `idea` | Parked |
+| `needs-triage`, `needs-info` | Inbox |
+| `ready-for-agent`, `ready-for-human` | Ready |
+
+`idea` wins over any state label beside it. The run reads the issue as it is
+when the run starts, not as the event saw it, and leaves the Status alone
+when:
+
+- it is In progress or Waiting on owner, which the coordinating session sets;
+- the issue is closed: the board moves it to Done itself;
+- the issue is not on the board, or its item there is archived;
+- no label names a Status: `wontfix`, a category or a marker alone;
+- its state labels name two Statuses, which the run reports as a warning:
+  the label event that leaves one of them sets it;
+- it already is the one the labels name.
+
+On a new or a reopened issue the run first waits, up to a minute, for the
+board's own workflows to add the issue, give it Inbox and take it out of Done,
+so that they do not overwrite the Status it sets. A run on a fork is skipped.
+Until the owner sets up its credential (below) the workflow does nothing and
+says so in one notice per run.
+
+### What the owner sets up
+
+The Actions `GITHUB_TOKEN` cannot reach a project, so the workflow takes its
+credential from the repository's settings (Secrets and variables, Actions):
+
+- **The board**: the variables `BOARD_OWNER`, the user or organization that
+  owns it, and `BOARD_NUMBER`, the project's number; unset, they are
+  `gpillon` and `6`. The Status field and its options are found by name, so
+  a board rebuilt elsewhere needs only these two values, and the options
+  Inbox, Parked, Ready, In progress, Waiting on owner and Done: a board
+  missing one fails the run, naming it.
+- **The credential, today**: a classic personal access token with the
+  `project` and `repo` scopes, as the secret `BOARD_TOKEN`: the credential
+  GitHub's guide gives a user's board, where it gives an organization's a
+  GitHub App.
+- **After the move to an organization (#523)**: a GitHub App installed on
+  the organization, with read and write on its projects and read on issues;
+  its Client ID as the variable `BOARD_APP_ID` and a private key as the
+  secret `BOARD_APP_KEY`. With both credentials set the App is used, and
+  `BOARD_TOKEN` can go.
+
+To check it, with a token in `GH_TOKEN` (`gh auth token`) and the board in
+`BOARD_OWNER` and `BOARD_NUMBER`,
+`python mk/board-status.py --repo gpillon/ignis --issue <n> --dry-run`
+says what a run would set and sets nothing.
+Live, on a test issue on the board, adding and removing each state label and
+`idea` moves its Status within a minute, and each run of the workflow
+(`gh run list --workflow board-status.yml`) says what it did.
 
 ## Auth
 

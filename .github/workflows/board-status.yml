@@ -1,0 +1,92 @@
+# Keep the project board's Status in step with an issue's labels (GitHub
+# #524). On every issue opened, reopened, labeled or unlabeled,
+# mk/board-status.py reads the issue's labels, state and board item and sets
+# the Status its labels name. The mapping and the cases it leaves alone (In
+# progress, Waiting on owner, a closed issue, an issue not on the board, no
+# label that names a Status) are docs/agents/issue-tracker.md's, Project
+# board, which stays the authority; the script's selftest runs in the records
+# workflow.
+#
+# The Actions GITHUB_TOKEN cannot reach a project, so the run takes a
+# credential the owner creates, either one:
+#   a GitHub App      vars.BOARD_APP_ID (its Client ID) and secrets.BOARD_APP_KEY
+#                     (a private key), with read and write on the
+#                     organization's projects and read on issues: the auth for
+#                     an organization's board (#523);
+#   a classic token   secrets.BOARD_TOKEN, scopes `project` and `repo`: the
+#                     auth GitHub's guide gives a user's board, today's.
+# The App wins when both are set. With neither, the job does nothing and says
+# so in one notice. The board is vars.BOARD_OWNER's project vars.BOARD_NUMBER
+# (gpillon and 6 when unset), a user's or an organization's, and its Status
+# field and options are found by name: moving the board changes these values,
+# not this file.
+#
+# A fork's run is skipped by the job's guard. The concurrency group queues one
+# issue's runs: an issue created with labels sends `opened` and one `labeled`
+# per label, and each run reads the issue afresh, so the last one leaves the
+# Status its last labels name. No issue text reaches a shell: the run takes
+# the issue's number alone.
+
+name: board-status
+
+on:
+  issues:
+    types: [opened, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: board-status-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  status:
+    if: github.repository == 'gpillon/ignis'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BOARD_OWNER: ${{ vars.BOARD_OWNER || 'gpillon' }}
+      BOARD_NUMBER: ${{ vars.BOARD_NUMBER || '6' }}
+    steps:
+      # A secret cannot appear in an `if`: this step turns which ones exist
+      # into an output the steps below test.
+      - name: The credential the owner set up
+        id: credential
+        env:
+          APP_ID: ${{ vars.BOARD_APP_ID }}
+          HAS_APP_KEY: ${{ secrets.BOARD_APP_KEY != '' }}
+          HAS_TOKEN: ${{ secrets.BOARD_TOKEN != '' }}
+        run: |
+          if [ -n "$APP_ID" ] && [ "$HAS_APP_KEY" = true ]; then
+            echo "kind=app" >> "$GITHUB_OUTPUT"
+          elif [ "$HAS_TOKEN" = true ]; then
+            echo "kind=token" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=board-status::No board credential (vars.BOARD_APP_ID with secrets.BOARD_APP_KEY, or secrets.BOARD_TOKEN): the board is left alone. docs/agents/issue-tracker.md, Project board, says what to set up."
+            echo "kind=none" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: A token from the GitHub App
+        id: app
+        if: steps.credential.outputs.kind == 'app'
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BOARD_APP_ID }}
+          private-key: ${{ secrets.BOARD_APP_KEY }}
+          owner: ${{ env.BOARD_OWNER }}
+          permission-organization-projects: write
+          permission-issues: read
+
+      - uses: actions/checkout@v4
+        if: steps.credential.outputs.kind != 'none'
+        with:
+          sparse-checkout: mk/board-status.py
+          sparse-checkout-cone-mode: false
+
+      - name: The Status from the issue's labels
+        if: steps.credential.outputs.kind != 'none'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.BOARD_TOKEN }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: python3 mk/board-status.py --repo "$GITHUB_REPOSITORY" --issue "$ISSUE"
