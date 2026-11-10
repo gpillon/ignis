@@ -437,6 +437,20 @@ idle unload was tearing the model down. Wait until `GET /v1/models` says
 `serving` (or `unloaded`) and send it again
 ([Idle unload](api/idle-unload.md)).
 
+### `409 vision_companion_missing`
+
+From 0.11.0, a `POST /v1/models/switch` to Flash-Next with vision on lacks its
+vision companion (`qwen3_8_flash_next_vision-v2.ninfer`) beside the artifact,
+or the one there is not its own; the message names the file. Vision is on for
+Flash-Next when it is named on for it, or when the switch carries it from the
+model serving: a 27B on a built-in profile serves images, so a switch from it
+needs the companion. Nothing was unloaded, and the old model serves on. Fetch
+the companion (`ignis-server model download qwen3.8-flash-next`), or name
+Flash-Next's vision off (`--qwen38flashnext-vision-enabled false`) to switch
+without images ([Model switching](api/model-switching.md)). A switch a request
+begins by naming Flash-Next is refused for the same reason before anything is
+unloaded, as `503 model_switch_failed` below.
+
 ### `503 model_switch_failed` or `503 model_load_failed`
 
 `model_switch_failed`: the switch a request began did not land. There is no
@@ -580,9 +594,11 @@ produces) is not decoded yet: send WAV, or convert it. A clip longer than
 `vision is disabled for this server`: an `image_url` part was sent and the
 server runs without `--vision-enabled`, whatever the artifact holds. Start with
 `--vision-enabled` (on Flash-Next from 0.11.0; 0.10.0 serves Flash-Next without images).
-From 0.11.0, after a switch from the 27B to Flash-Next under a built-in
-profile, which turns vision on for the 27B alone, Flash-Next serves without it,
-and the switch's `ignis.model.switch_vision_off` line says so
+From 0.11.0, a switch carries the vision of the model it replaces, so after a
+switch a model serves without vision only when the model before it had none,
+or when vision is named off for it (`--qwen38flashnext-vision-enabled false`,
+its env var or its config file section), which the switch's
+`ignis.model.switch_vision_off` line names
 ([Model switching](api/model-switching.md)). `media_budget_exceeded`: several images together are past
 `--vision-max-tokens` (32,768 by default); a single oversized image is
 downscaled instead ([Vision](configuration/vision.md)).

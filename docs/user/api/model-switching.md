@@ -23,20 +23,39 @@ off for it and named in the log (the 27B's `--spec-backend` on Flash-Next;
 Flash-Next's own knobs on the 27B).
 
 **Vision crosses the switch** (from 0.11.0; 0.10.0 drops vision on a switch
-to Flash-Next). A server started with `--vision-enabled` serves
-images on Flash-Next as on the 27B, from the 27B to Flash-Next and back, and
-the request size cap follows the model that is serving. Flash-Next sees
-through its [vision companion](../configuration/vision.md#flash-next), a file beside its
-artifact: a switch to Flash-Next with vision on and the companion missing, or
-not its own, is a `409 vision_companion_missing` that names the file. It is
-answered before anything is unloaded, so the old model keeps serving. Vision
-is each model's, though: every built-in profile turns it on for the 27B alone,
-so a 27B serving images on its profile's vision switches to Flash-Next with
-vision off, and an image part is then refused with `vision_disabled`. The
-switch says so in the log, `ignis.model.switch_vision_off`, with what left it
-off (`by`: `default`, `profile` or `named`) and how to turn it on (`why`):
-`--vision-enabled` for both models, `--qwen38flashnext-vision-enabled` for
-Flash-Next alone.
+to Flash-Next). A switch carries the vision of the model it replaces: when
+the model serving takes images, whether `--vision-enabled`, its own flag or a
+built-in profile turned vision on (every profile turns it on for the 27B
+alone), the model switched to loads with vision on too, with its own vision
+settings (envelope, residency, media cache), from the 27B to Flash-Next and
+back. The request size cap follows the model that is serving. A model serving
+without vision carries nothing: the target keeps its own setting, and
+Flash-Next's is off unless named on. The carried value is the target's own
+while it serves: `GET /v1/config/origins` shows it as `live` in that model's
+scope, and a `null` there takes it away (a reload). It is never written to
+the config file.
+
+Vision named off for the target itself wins over the carry: its own flag
+(`--qwen38flashnext-vision-enabled false`), its env var
+(`IGNIS_QWEN38FLASHNEXT_VISION_ENABLED=false`), its section of the config file
+(`vision.qwen38flashnext.enabled: false`) or a live change of that key.
+`--vision-enabled false` names vision off for every model, not for one, so it
+does not stop the carry (a file `config generate` wrote holds
+`vision.enabled: false`). The switch then says so in the log,
+`ignis.model.switch_vision_off`, with what left vision off (`by: named`) and
+the value that names it (`why`), and an image part is refused with
+`vision_disabled`.
+
+Flash-Next sees through its [vision companion](../configuration/vision.md#flash-next),
+a file beside its artifact: a switch to Flash-Next with vision on, its own or
+carried, and the companion missing, or not its own, is a
+`409 vision_companion_missing` that names the file. It is answered before
+anything is unloaded, so the old model keeps serving. Fetch the companion
+(`ignis-server model download qwen3.8-flash-next`), or name Flash-Next's
+vision off. A switch that a request begins by naming Flash-Next meets the same
+check before anything is unloaded, and is refused as any target that cannot
+load (**By naming the model**, below). With vision carried, Flash-Next's start
+counts its tower and embedding pool in its [host RAM plan](../configuration/host-ram.md#host-ram-for-flash-next).
 
 A target that can be refused without unloading anything — no file at the path,
 a checksum that is not clean, a model id of the other model — leaves the old

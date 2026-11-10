@@ -70,7 +70,7 @@ The default: a 32 GB RTX 5090.
 | Field | 27B | Flash-Next |
 |---|---|---|
 | Context (`model.max_context`) | 917,504 | 589,824 |
-| Vision | on, tower and pool in host RAM (`vision.residency: host`) | off; from 0.11.0, with `--vision-enabled`, tower and pool in host RAM ([Flash-Next](../configuration/vision.md#flash-next)) |
+| Vision | on, tower and pool in host RAM (`vision.residency: host`) | off; from 0.11.0, with `--vision-enabled` or after a switch from the 27B serving images, tower and pool in host RAM ([Flash-Next](../configuration/vision.md#flash-next)) |
 | Speculation | DFlash2, 7 draft tokens | off |
 | Decode lanes | 8 (the default) | 3 |
 | Prefill chunk | 2,048 | 8,192 |
@@ -134,7 +134,7 @@ Linux ([finding](../../findings/2026-10-18-rtxpro6000-profile-measured.md)).
 | Field | 27B | Flash-Next |
 |---|---|---|
 | Context | 1,048,576 | 1,048,576 |
-| Vision | on, tower and pool in VRAM (`vision.residency: device`) | off; from 0.11.0, with `--vision-enabled`, tower and pool in VRAM |
+| Vision | on, tower and pool in VRAM (`vision.residency: device`) | off; from 0.11.0, with `--vision-enabled` or after a switch from the 27B serving images, tower and pool in VRAM |
 | Speculation | DFlash2, 7 draft tokens | MTP, 3 draft tokens |
 | Decode lanes | 8 (the default) | 8 |
 | Prefill chunk | 2,048 | 8,192 |

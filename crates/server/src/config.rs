@@ -1034,18 +1034,7 @@ impl Config {
     /// config file is written: so the configuration running and a start from
     /// the rewritten file agree on it (spec playground/05 follow-up 2).
     pub fn general_with(&self, patch: &source::Layer) -> Result<Config, ConfigError> {
-        let patch = patch.homed();
-        let mut sources = self.basis.sources().clone();
-        sources.patch.overlay(&patch);
-        // A removal (`null`) takes the key out of the config file as well as
-        // out of the patches before it, as the rewritten file will not hold
-        // it: what runs after it is what a start from that file resolves —
-        // the profile or the default, or a flag or an env var that sets the
-        // field, which outranks the file (spec playground/05 §Decisions).
-        for (meta, family, _) in patch.removals() {
-            sources.file.unset(meta, family);
-        }
-        Config::from_sources(sources)
+        patched(self.basis.sources().clone(), patch)
     }
 
     /// This config with `patch`'s values over everything else, and its
@@ -1076,6 +1065,22 @@ impl Config {
             None => Ok(config),
         }
     }
+}
+
+/// `sources` with `patch` over them, resolved for no family in particular
+/// ([`Config::general_with`]).
+fn patched(mut sources: Sources, patch: &source::Layer) -> Result<Config, ConfigError> {
+    let patch = patch.homed();
+    sources.patch.overlay(&patch);
+    // A removal (`null`) takes the key out of the config file as well as
+    // out of the patches before it, as the rewritten file will not hold
+    // it: what runs after it is what a start from that file resolves —
+    // the profile or the default, or a flag or an env var that sets the
+    // field, which outranks the file (spec playground/05 §Decisions).
+    for (meta, family, _) in patch.removals() {
+        sources.file.unset(meta, family);
+    }
+    Config::from_sources(sources)
 }
 
 /// Refuse `patch` if one of its own entries is one `family` cannot take — a
@@ -1134,6 +1139,59 @@ pub fn target_patch(artifact: &std::path::Path, model: &str) -> Result<source::L
     patch.set(field("artifact"), None, source::Candidate { raw: artifact.display().to_string(), spelling: "the switch target's artifact".to_owned() })?;
     patch.set(field("id"), None, source::Candidate { raw: model.to_owned(), spelling: "the switch target's model".to_owned() })?;
     Ok(patch)
+}
+
+/// The spelling a switch's carried vision is given under (ADR 0087): what
+/// tells it from a value the operator set. `GET /v1/config/origins` shows it
+/// as the target's own `live` value, as it shows the target's artifact and id.
+const CARRIED_VISION: &str = "the vision of the model switched from";
+
+/// `base` with a model switch's target over it (spec model-switch/01): its
+/// artifact and id ([`target_patch`]) and, when the model switched from has
+/// vision on (`carry_vision`), vision on for `family`, the target's (ADR
+/// 0087). Vision is each model's, and a built-in profile turns it on for the
+/// 27B alone: a switch from a model serving images would otherwise leave a
+/// target whose own vision is off without it. Vision named off for the
+/// target itself wins ([`named_off_for`]). The carry is a value of the
+/// target's own section, as a live change would set it, so it survives
+/// [`fit_to_family`], which resolves the options again from their sources,
+/// and the target's own vision settings (envelope, residency, media) apply
+/// with it.
+pub fn switch_target(
+    base: &Config,
+    carry_vision: bool,
+    artifact: &std::path::Path,
+    model: &str,
+    family: ModelFamily,
+) -> Result<Config, ConfigError> {
+    let enabled = schema::field("vision", "enabled").expect("a declared field");
+    let mut sources = base.basis.sources().clone();
+    // A vision an earlier switch carried was that switch's, not the model's
+    // own: this one decides again, from the model it replaces.
+    for carried in ModelFamily::WITH_VISION.iter().copied() {
+        if sources.patch.get(enabled, Some(carried)).is_some_and(|candidate| candidate.spelling == CARRIED_VISION) {
+            sources.patch.unset(enabled, Some(carried));
+        }
+    }
+    let mut patch = target_patch(artifact, model)?;
+    if carry_vision && family.takes_images() {
+        let resolved = source::resolve_settings(&sources, Some(family), Fit::Switch)?;
+        if !resolved.settings.vision.enabled && !named_off_for(&resolved) {
+            patch.set(enabled, Some(family), source::Candidate { raw: "true".to_owned(), spelling: CARRIED_VISION.to_owned() })?;
+        }
+    }
+    patched(sources, &patch)
+}
+
+/// Whether `resolution`'s vision is off because the operator named it off
+/// for the family resolved for itself (ADR 0087): its own flag
+/// (`--qwen38flashnext-vision-enabled false`), env var, config file section
+/// or live value. Off for every model is not that: a file `config generate`
+/// wrote names `vision.enabled: false` whatever the profile turns on, and
+/// naming the default says nothing ([`source::Origin::at_default`]).
+fn named_off_for(resolution: &Resolution) -> bool {
+    !resolution.settings.vision.enabled
+        && resolution.origin("vision", "enabled").is_some_and(|origin| origin.source.explicit() && origin.scoped)
 }
 
 /// The id a load of `family` is served under, or why `config` cannot start

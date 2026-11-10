@@ -2536,6 +2536,39 @@ fn vision_and_media_cross_a_switch_to_flash_next_and_back_unchanged() {
     assert_eq!((back.vision, back.media), (started.vision, started.media));
 }
 
+/// ADR 0087: a switch from a model serving images carries vision to its
+/// target unless vision is named off for the target itself -- by its own
+/// flag, env var, config file section or live value -- and a named value
+/// wins. Vision named off for every model is not named off for it: a file
+/// `config generate` wrote names `vision.enabled: false` beside the 27B's
+/// own `true`, and a switch from that 27B carries its vision.
+#[test]
+fn a_switch_carries_vision_unless_it_is_named_off_for_the_target_itself() {
+    let switched = |running: &Config| -> Option<Vision> {
+        let running = running.for_family(ModelFamily::Qwen38_27b).expect("a 27B start");
+        assert!(running.vision.is_some(), "the 27B serves images");
+        let target = switch_target(&running, true, std::path::Path::new("fn.ninfer"), "qwen3.8-flash-next", ModelFamily::FlashNext)
+            .expect("the target over the running options");
+        fit_to_family(&target, ModelFamily::FlashNext).expect("the fit").0.vision
+    };
+    assert!(switched(&config(&["--profile", "rtx5090"])).is_some(), "the profile's 27B vision is carried");
+    assert!(switched(&config(&["--profile", "rtx5090", "--qwen38flashnext-vision-enabled", "false"])).is_none(), "the flag");
+    let env = env_map(&[("IGNIS_QWEN38FLASHNEXT_VISION_ENABLED", "false")]);
+    assert!(switched(&expect_config(resolve(&args(&["--profile", "rtx5090"]), env).unwrap())).is_none(), "the env var");
+    let files = MemFiles::with(&[("c.yaml", "vision:\n  qwen38flashnext:\n    enabled: false\n")]);
+    let from_file = with_files(&["--profile", "rtx5090", "--config", "c.yaml"], no_env, &files).unwrap();
+    assert!(switched(&from_file).is_none(), "the file's section");
+    let mut patch = source::Layer::default();
+    let enabled = schema::field("vision", "enabled").unwrap();
+    let off = source::Candidate { raw: "false".into(), spelling: "vision.qwen38flashnext.enabled".into() };
+    patch.set(enabled, Some(ModelFamily::FlashNext), off).unwrap();
+    let live = config(&["--profile", "rtx5090"]).for_family(ModelFamily::Qwen38_27b).unwrap().with_patch(&patch).unwrap();
+    assert!(switched(&live).is_none(), "a live value");
+    let generated = MemFiles::with(&[("g.yaml", "profile: none\nvision:\n  enabled: false\n  qwen38:\n    enabled: true\n")]);
+    let from_generated = with_files(&["--config", "g.yaml"], no_env, &generated).unwrap();
+    assert!(switched(&from_generated).is_some(), "named off for every model, on for the 27B: carried");
+}
+
 /// GitHub #557: a built-in profile turns vision on for the 27B alone, so a
 /// vision or media knob named beside it is the 27B's, not a mistake: the
 /// start takes it, the 27B's load runs it, and Flash-Next's, whose vision
