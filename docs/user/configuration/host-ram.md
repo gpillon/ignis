@@ -8,7 +8,7 @@ sidebar:
 ## Host RAM for Flash-Next
 
 Serving Flash-Next needs about **46-47 GB of available RAM** (about 0.65 GB more with
-vision on, below: the tower's 482,705,408 bytes and the pool's 160 MiB at the
+vision on from 0.11.0, below: the tower's 482,705,408 bytes and the pool's 160 MiB at the
 default envelope): 38 GB of pinned
 experts (2.1 GB less under the `rtx5090` profile's pinned hot set, below), 1 GB of n-gram hot rows, ~0.5 GB of staging (KV-disk's 64 MiB
 included: `--qwen38flashnext-kv-disk-bytes 0` drops it), ~1 GB of retained host
@@ -56,7 +56,7 @@ A device-only load lists its layer buffers apart, as `expert layer buffers
 naming them (`crossing_line: load_staging`): no flag shrinks them, so close
 other applications.
 
-With vision on under `--vision-residency host`, the vision companion's tower
+From 0.11.0, with vision on under `--vision-residency host`, the vision companion's tower
 (483 MB with its page padding) and the embedding pool (160 MiB at the default
 envelope) are two lines more, `vision_tower` and `vision_pool`, ahead of the
 experts (`vision_tower_bytes`, `vision_pool_bytes` and `vision_residency` in

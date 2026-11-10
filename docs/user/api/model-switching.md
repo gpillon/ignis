@@ -22,7 +22,8 @@ flags the server started with, except the ones it cannot take, which are left
 off for it and named in the log (the 27B's `--spec-backend` on Flash-Next;
 Flash-Next's own knobs on the 27B).
 
-**Vision crosses the switch.** A server started with `--vision-enabled` serves
+**Vision crosses the switch** (from 0.11.0; 0.10.0 drops vision on a switch
+to Flash-Next). A server started with `--vision-enabled` serves
 images on Flash-Next as on the 27B, from the 27B to Flash-Next and back, and
 the request size cap follows the model that is serving. Flash-Next sees
 through its [vision companion](../configuration/vision.md#flash-next), a file beside its

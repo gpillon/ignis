@@ -42,7 +42,7 @@ Flash-Next has two **companion containers** beside the main one, each holding
 one optional part of the model. The **MTP companion** (about 1 GB) holds the
 multi-token-prediction head, and is bound only when MTP speculation is on
 ([speculative decoding](speculative-decoding.md)). The **vision companion**
-(about 0.5 GB) holds the checkpoint's vision encoder: its tower, every
+(about 0.5 GB, from 0.11.0) holds the checkpoint's vision encoder: its tower, every
 matrix at 8 bits, and the merger that writes Flash-Next's 2,560-wide
 embeddings. Each records which main container it belongs to, and a mismatched
 pair is refused by name. The catalog downloads both with the model, whether
@@ -115,7 +115,7 @@ the machine it needs.
   28.8 GB. It is never put on the device: rows are read from NVMe through a
   RAM cache of hot rows (1 GiB by default), or the whole table is held in RAM
   when `--ngram-hot-bytes` covers it ([n-gram cache](../configuration/ngram-cache.md)).
-- **Images**: Flash-Next takes image input when `--vision-enabled` is set,
+- **Images**: from 0.11.0, Flash-Next takes image input when `--vision-enabled` is set,
   from a vision companion beside its artifact (482 MB, fetched with the
   model). Under the default `host` residency the tower and its embedding pool
   sit in host RAM and an image is encoded in the prefill scratch the text

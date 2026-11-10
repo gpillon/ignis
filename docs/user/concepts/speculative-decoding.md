@@ -87,7 +87,8 @@ percent of the first four drafts on the engine's own states
 It costs about 1.1 GB of VRAM, taken from the expert cache rather than the
 context, whatever the number of drafts.
 
-MTP stays on for prompts with images, with nothing to set. Where the next token
+From 0.11.0, which gives Flash-Next images, MTP stays on for prompts with
+images, with nothing to set. Where the next token
 is an image placeholder, the head takes the image's row that the model itself
 took there, and it reads the image's positions as the model does. Greedy output
 with MTP on is the same as with it off, up to near-ties, as for text.

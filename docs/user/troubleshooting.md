@@ -367,7 +367,7 @@ qwen3.8-flash-next` fetches both
 
 ### Flash-Next refuses the start for its vision companion
 
-With vision on, Flash-Next's start opens its vision companion
+From 0.11.0, with vision on, Flash-Next's start opens its vision companion
 (`qwen3_8_flash_next_vision-v2.ninfer`) beside the artifact and refuses the
 start, naming the file, when it is missing (`model download
 qwen3.8-flash-next` fetches it, or start without vision) or is not this
@@ -380,7 +380,7 @@ move the companion and its `.conversion.json` aside first
 
 ### `` `--qwen38flashnext-vision-max-tokens …` requires vision on for Qwen3.8-Flash-Next ``
 
-A vision or media option named for one model (a `--qwen38flashnext-…` or
+From 0.11.0, a vision or media option named for one model (a `--qwen38flashnext-…` or
 `--qwen38-…` flag, its `IGNIS_QWEN38FLASHNEXT_…` variable, a
 `vision.qwen38flashnext` section of the config file) is that model's alone,
 and that model's vision is off: every built-in profile turns vision on for the
@@ -579,7 +579,8 @@ produces) is not decoded yet: send WAV, or convert it. A clip longer than
 
 `vision is disabled for this server`: an `image_url` part was sent and the
 server runs without `--vision-enabled`, whatever the artifact holds. Start with
-`--vision-enabled`. After a switch from the 27B to Flash-Next under a built-in
+`--vision-enabled` (on Flash-Next from 0.11.0; 0.10.0 serves Flash-Next without images).
+From 0.11.0, after a switch from the 27B to Flash-Next under a built-in
 profile, which turns vision on for the 27B alone, Flash-Next serves without it,
 and the switch's `ignis.model.switch_vision_off` line says so
 ([Model switching](api/model-switching.md)). `media_budget_exceeded`: several images together are past

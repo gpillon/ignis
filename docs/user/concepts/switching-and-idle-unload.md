@@ -83,7 +83,7 @@ checksum that is not clean, a model id that belongs to the other model) leaves t
 serving. One that fails after the old model was unloaded loads the old model
 again, and `GET /v1/models` says `failed` with a reason until one serves.
 
-Vision crosses a switch: with `--vision-enabled` the server takes images on
+From 0.11.0, vision crosses a switch: with `--vision-enabled` the server takes images on
 the 27B and on Flash-Next, and its request size cap follows the model that is
 serving. A switch to Flash-Next whose vision companion is missing beside its
 artifact is a `409 vision_companion_missing` naming the file, answered before
