@@ -70,7 +70,8 @@ libc = "0.2"
 
 [patch.crates-io]
 # 0.3.1 forwards a chunked response (every streamed axum body: SSE) with its
-# chunk framing inside the body and never ends it on a keep-alive socket.
-# vendor/cloudflare-quick-tunnel/IGNIS-PATCH.md has the fix; drop this once
-# upstream carries it.
+# chunk framing inside the body and never ends it on a keep-alive socket, and
+# asks for capnp 0.20 and hickory-resolver 0.24, which carry security alerts.
+# vendor/cloudflare-quick-tunnel/IGNIS-PATCH.md has the fix and the bump to
+# capnp 0.27 and hickory-resolver 0.26; drop this once upstream carries both.
 cloudflare-quick-tunnel = { path = "vendor/cloudflare-quick-tunnel" }

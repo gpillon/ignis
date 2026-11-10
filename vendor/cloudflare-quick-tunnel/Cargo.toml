@@ -11,7 +11,7 @@
 
 [package]
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.88"
 name = "cloudflare-quick-tunnel"
 version = "0.3.1"
 build = false
@@ -58,22 +58,22 @@ version = "0.22"
 version = "1"
 
 [dependencies.capnp]
-version = "0.20"
+version = "0.27"
 
 [dependencies.capnp-futures]
-version = "0.20"
+version = "0.27"
 
 [dependencies.capnp-rpc]
-version = "0.20"
+version = "0.27"
 
 [dependencies.futures]
 version = "0.3"
 
 [dependencies.hickory-resolver]
-version = "0.24"
+version = "0.26.2"
 features = [
-    "dns-over-rustls",
-    "tokio-runtime",
+    "tokio",
+    "tls-ring",
 ]
 default-features = false
 
@@ -148,6 +148,9 @@ features = [
     "v4",
     "serde",
 ]
+
+[dependencies.webpki-roots]
+version = "1"
 
 [dev-dependencies.anyhow]
 version = "1"
