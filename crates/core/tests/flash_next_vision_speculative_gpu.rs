@@ -143,8 +143,33 @@
 //! D or E back names a property of the input; F apart from B is a defect of
 //! the scatter.
 //!
+//! **The vision start and end alone (GitHub #565).** That run (log
+//! `.scratch/555/gpu/s_arms.log` of the integration worktree) read every arm
+//! but C at about twice C's drift, none of D, E, F back within the cut. What
+//! every arm but C keeps is the vision start and end (ids 248053 and 248054)
+//! around the image's run; C replaced the whole run by a description. One
+//! more arm, measured as C:
+//!
+//! - G, C with only the vision start and end put where the image's run sits
+//!   in A: the run's content stays the text control's tokens (so G's ids are
+//!   F's), the text positions, the text's n-gram rows, the lookup -- no media,
+//!   no three-axis positions. Only the measure runs on it (no drafter checks).
+//!
+//! The reading, fixed before any run, on G's median drift over C on each route
+//! pair: within 1.3x on all three pairs, the two special tokens do not carry
+//! the drift (and the doubling belongs to the multimodal span as a whole);
+//! 1.6x or more on any pair, the two special tokens carry it (a property of
+//! the model's inputs, not a defect); between the cuts, inconclusive. One
+//! reading line is printed, and beside it the L2 norm of the two special
+//! tokens' embedding rows against the text rows' median.
+//!
+//! `IGNIS_VISION_ARMS=g` runs only C and G (16 prompts, the drafter checks
+//! only on C: about 5 minutes instead of about 15); the report then leaves
+//! out the readings that need the other arms. Unset, every arm runs.
+//!
 //! ```text
 //! cargo test -p ignis-core --features cuda --test flash_next_vision_speculative_gpu -- --ignored --nocapture --test-threads=1
+//! IGNIS_VISION_ARMS=g cargo test -p ignis-core --features cuda --test flash_next_vision_speculative_gpu -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Machine-local: `F:/ai/models/Qwen3.8-Flash-Next-ignis/` (or
@@ -153,7 +178,7 @@
 //! Explicit GPU profile (ADR 0006): outside `IGNIS_GPU_PROFILE=1` a missing
 //! artifact, companion or GPU is a skip, under it a failure. Two loads one
 //! after the other, each pinning the ~38 GB expert pool; 48 prompts, the
-//! piece arms' without the drafter checks: about 13 minutes on the RTX 5090.
+//! piece arms' and G's without the drafter checks: about 15 minutes on the RTX 5090.
 
 #![cfg(feature = "cuda")]
 
@@ -268,10 +293,14 @@ enum Arm {
     /// F: B with its placeholders' text ids embedded by the lookup, no
     /// pool and no scatter.
     Lookup,
+    /// G (GitHub #565): C with only the vision start and end where the
+    /// image's run sits in A.
+    Specials,
 }
 
 impl Arm {
-    const ALL: [Arm; 6] = [Arm::Image, Arm::Placed, Arm::Text, Arm::TextPositions, Arm::TextNgram, Arm::Lookup];
+    const ALL: [Arm; 7] =
+        [Arm::Image, Arm::Placed, Arm::Text, Arm::TextPositions, Arm::TextNgram, Arm::Lookup, Arm::Specials];
     /// The arms that each take one piece of B's path back to C's.
     const PIECES: [Arm; 3] = [Arm::TextPositions, Arm::TextNgram, Arm::Lookup];
 
@@ -283,6 +312,7 @@ impl Arm {
             Arm::TextPositions => "D, placed at text positions",
             Arm::TextNgram => "E, placed with the text's n-gram rows",
             Arm::Lookup => "F, placed through the lookup",
+            Arm::Specials => "G, text with the vision start and end",
         }
     }
 
@@ -292,7 +322,7 @@ impl Arm {
             Arm::TextPositions => "the three-axis positions and the rope delta (a property of the input)",
             Arm::TextNgram => "the n-gram rows hashing the placeholders (a property of the input)",
             Arm::Lookup => "the scatter out of the pool (a defect: it writes what the lookup writes)",
-            Arm::Image | Arm::Placed | Arm::Text => "no piece",
+            Arm::Image | Arm::Placed | Arm::Text | Arm::Specials => "no piece",
         }
     }
 
@@ -325,6 +355,11 @@ struct Prompt {
     hashed: Option<Vec<u32>>,
     multimodal: Option<Multimodal>,
     placeholders: Placeholders,
+}
+
+/// Whether `IGNIS_VISION_ARMS=g` asks for C and G alone.
+fn arms_only_g() -> bool {
+    std::env::var("IGNIS_VISION_ARMS").is_ok_and(|v| v.eq_ignore_ascii_case("g"))
 }
 
 /// `ignis_server::media::load_processor`'s processor at this load's context.
@@ -430,8 +465,22 @@ fn prompts(dir: &Path) -> Vec<Prompt> {
                 multimodal: None,
                 placeholders: Placeholders::Lookup,
             });
+            // G: the text control with only the run's two ends the vision start and end: F's
+            // ids (`looked_up`), hashed as themselves, no media and no three-axis positions.
+            all.push(Prompt {
+                name: format!("{name} as text with the vision start and end"),
+                arm: Arm::Specials,
+                tokens: looked_up,
+                hashed: None,
+                multimodal: None,
+                placeholders: Placeholders::Lookup,
+            });
             all.push(Prompt { name, arm: Arm::Image, tokens, hashed: None, multimodal: Some(multimodal), placeholders: Placeholders::Tower });
         }
+    }
+    // IGNIS_VISION_ARMS=g: only C and G (the module's doc).
+    if arms_only_g() {
+        all.retain(|prompt| matches!(prompt.arm, Arm::Text | Arm::Specials));
     }
     // Stable: each arm's prompts stay in the canaries' order.
     all.sort_by_key(|prompt| (prompt.arm.checks_drafters(), prompt.arm as usize));
@@ -842,6 +891,11 @@ fn report(measured: &[Measured]) {
     let mut stats = Vec::new();
     for arm in Arm::ALL {
         let of: Vec<&Measured> = measured.iter().filter(|m| m.arm == arm).collect();
+        if of.is_empty() {
+            // An arm left out (IGNIS_VISION_ARMS).
+            stats.push(Vec::new());
+            continue;
+        }
         println!("{}:", arm.label());
         let mut pairs = Vec::new();
         for (index, what) in PAIRS.iter().enumerate() {
@@ -892,6 +946,21 @@ fn report(measured: &[Measured]) {
     }
     let (image, placed, text) = (&stats[0], &stats[1], &stats[2]);
     let ratio = |a: (f32, f32), b: (f32, f32)| (a.0 / b.0.max(f32::MIN_POSITIVE), a.1 / b.1.max(f32::MIN_POSITIVE));
+    if !text.is_empty() && !stats[Arm::Specials as usize].is_empty() {
+        let specials = &stats[Arm::Specials as usize];
+        let over_text: Vec<f32> = (0..PAIRS.len()).map(|i| ratio(specials[i], text[i]).0).collect();
+        println!(
+            "{} / text drift, medians (plain/prefill, verify/prefill, verify/plain) {over_text:.2?}",
+            Arm::Specials.label()
+        );
+        println!(
+            "the vision start and end's reading (cuts {PATH_AS_TEXT}x and {PATH_DRIFTS}x on G over the text controls): {}",
+            specials_reading(&over_text)
+        );
+    }
+    if image.is_empty() || placed.is_empty() || text.is_empty() {
+        return;
+    }
     let mut placed_over_text = Vec::new();
     for (i, name) in PAIRS.iter().enumerate() {
         let (ac, bc, ab) = (ratio(image[i], text[i]), ratio(placed[i], text[i]), ratio(image[i], placed[i]));
@@ -914,6 +983,9 @@ fn report(measured: &[Measured]) {
     let (mut back, mut between) = (Vec::new(), Vec::new());
     for arm in Arm::PIECES {
         let of = &stats[arm as usize];
+        if of.is_empty() {
+            continue;
+        }
         let over_text: Vec<f32> = (0..PAIRS.len()).map(|i| ratio(of[i], text[i]).0).collect();
         let over_placed: Vec<f32> = (0..PAIRS.len()).map(|i| ratio(of[i], placed[i]).0).collect();
         let verdict = piece_reading(&over_text);
@@ -936,6 +1008,17 @@ fn report(measured: &[Measured]) {
         "the pieces' reading (cuts {PATH_AS_TEXT}x and {PATH_DRIFTS}x on each arm over the text controls): {}",
         pieces_reading(&back, &between)
     );
+}
+
+/// G's reading on its median over C, each route pair (the module's doc).
+fn specials_reading(over_text: &[f32]) -> &'static str {
+    if over_text.iter().all(|&r| r <= PATH_AS_TEXT) {
+        "the vision start and end do not carry the drift: the doubling belongs to the multimodal span as a whole"
+    } else if over_text.iter().any(|&r| r >= PATH_DRIFTS) {
+        "the two special tokens carry the drift, on the pairs past the cut: a property of the model's inputs, not a defect"
+    } else {
+        "inconclusive: a pair between the cuts, none past them"
+    }
 }
 
 /// A piece arm's reading on its median over C, each route pair (the module's
@@ -1055,6 +1138,33 @@ fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_dr
         );
     }
     report(&measured);
+    if all.iter().any(|prompt| prompt.arm == Arm::Specials) {
+        let reader = Reader::open(&path).expect("open the artifact");
+        let frontend = FrontendSet::from_reader(&reader).expect("frontend");
+        let specials = [single_id(&frontend, "<|vision_start|>"), single_id(&frontend, "<|vision_end|>")];
+        let mut ids: Vec<u32> = all
+            .iter()
+            .filter(|prompt| prompt.arm == Arm::Specials)
+            .flat_map(|prompt| prompt.tokens.iter().copied())
+            .filter(|id| !specials.contains(id))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let hidden = ModelConfig::qwen38_flash_next().hidden as usize;
+        let l2 = |rows: &[u16]| -> Vec<f32> {
+            rows.chunks_exact(hidden)
+                .map(|row| row.iter().map(|&b| f64::from(bf16(b)).powi(2)).sum::<f64>().sqrt() as f32)
+                .collect()
+        };
+        let mut text_l2 = l2(&embedding_rows(&reader, &ids));
+        println!(
+            "embedding rows' L2: vision start {:?}, vision end {:?}; the text rows' median {:.3} over {} distinct ids",
+            l2(&embedding_rows(&reader, &specials[..1])),
+            l2(&embedding_rows(&reader, &specials[1..])),
+            quantile(&mut text_l2, 0.5),
+            ids.len()
+        );
+    }
     let lookup = lookup_against_placed(&measured);
     println!("F against B, the plain rounds' text and rows and the prompt's last row bit for bit (the scatter writes what the lookup writes):");
     for (name, equal) in &lookup {
@@ -1075,7 +1185,10 @@ fn after_an_image_a_verify_round_keeps_the_plain_round_s_state_and_its_routes_dr
             assert!(state, "{}: the {drafter} drafter's rounds left another state than rounds without drafts", m.name);
         }
     }
-    for (name, _, equal, differing) in cross.iter().filter(|(_, arm, _, _)| *arm != Arm::Text && text_equal) {
+    // G is a text prompt with two special tokens: printed above, not held.
+    for (name, _, equal, differing) in
+        cross.iter().filter(|(_, arm, _, _)| !matches!(arm, Arm::Text | Arm::Specials) && text_equal)
+    {
         assert!(
             equal,
             "{name}: after the image the load without the head computes another trunk ({differing} rows differ), where the text controls agree"

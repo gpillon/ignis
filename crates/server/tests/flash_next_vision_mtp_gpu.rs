@@ -14,12 +14,26 @@
 //!   description that runs to the token budget, so the acceptance has a
 //!   sample -- generated on a load with the head and on one without it, token
 //!   for token. A verify round runs `k + 1` columns through other kernel
-//!   shapes than a plain round, so a split passes only as a near-tie: the
-//!   prefill route of the load without the head, after the agreed text, puts
-//!   the two picks within one BF16 ulp or sides with the head's run -- the
-//!   rule the text path's spec-on against spec-off is held to
-//!   (`crates/core/tests/flash_next_speculative_gpu.rs`, `assert_near_tie`).
-//!   Read through a decision readout of the two picks' logits at that position.
+//!   shapes than a plain round, so a split passes only as a near tie: the
+//!   prefill route of the load without the head, after the agreed text (the
+//!   same tokens through both runs up to the split, teacher-forced), puts the
+//!   head's pick within `PICK_GAP_ULPS` (16) BF16 ulps under the headless
+//!   run's, or above it -- ADR 0056's near-tie bound
+//!   (`crates/core/tests/support/logit_drift.rs`). Counted at the larger
+//!   pick's magnitude, at most the row's largest, so never fewer ulps than ADR
+//!   0056 counts; on the prefill route, the one row a readout gives, where
+//!   ADR 0056 reads the plain round's. The owner's call (2026-11-10, #564,
+//!   #565): after an image every route pair drifts about twice as far as on
+//!   text (`crates/core/tests/flash_next_vision_speculative_gpu.rs`), with no
+//!   state a verify round fails to keep; text with only the vision start and
+//!   end tokens around it drifts as far, with no image, no three-axis
+//!   positions and no pool, so the two special tokens carry it: a property of
+//!   the model's inputs, not a defect. The one-ulp rule this test held first,
+//!   the text path's (`crates/core/tests/flash_next_speculative_gpu.rs`,
+//!   `assert_near_tie`), is narrower than that drift; making the routes agree
+//!   bit for bit is GitHub #567.
+//!   That rule's verdict is printed beside each split. Read through a
+//!   decision readout of the two picks' logits at that position.
 //! - **Nothing refuses or silently disables the head with vision on.** Every
 //!   image run on the head's load reports verify rounds, and the long ones
 //!   drafts; through `/v1/chat/completions`, each image's long description is
@@ -76,6 +90,13 @@ use ignis_server::Server;
 
 use support::media::data_uri;
 use support::vision_canary::load_canaries;
+
+// ADR 0056's near-tie bound and one BF16 ulp, as the core tests' logit drift
+// reads them: one copy of the rule.
+#[path = "../../core/tests/support/logit_drift.rs"]
+mod logit_drift;
+
+use logit_drift::{bf16_ulp, PICK_GAP_ULPS};
 
 const MODEL_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
 const MODEL: &str = "qwen3.8-flash-next";
@@ -340,17 +361,12 @@ async fn prefill_logits(load: &Load, prompt: &Prompt, agreed: &[u32], picks: [u3
     [readout.logits[0], readout.logits[1]]
 }
 
-/// One BF16 ulp at `x`'s magnitude: 2^(exponent - 7).
-fn bf16_ulp(x: f32) -> f32 {
-    let exponent = ((x.abs().to_bits() >> 23) & 0xff) as i32 - 127;
-    2f32.powi(exponent - 7)
-}
-
 /// `on` against `off`: identical, or identical up to a first split where the
-/// prefill route on `off_load`, after the agreed text, puts the two picks
-/// within one BF16 ulp or sides with `on`. A run that ended where the other
-/// goes on picked `eos` there. A line per split; panics on a split the prefill
-/// route lays at the head's run.
+/// prefill route on `off_load`, after the agreed text, rates the two picks
+/// within ADR 0056's near tie: `on`'s pick at most `PICK_GAP_ULPS` BF16 ulps
+/// under `off`'s at the larger pick's magnitude, or above it. A run that
+/// ended where the other goes on picked `eos` there. A line per split, the
+/// one-ulp rule's verdict beside; panics on a split past the near tie.
 async fn judge(off_load: &Load, prompt: &Prompt, eos: u32, off: &[u32], on: &[u32]) -> Option<String> {
     let at = match off.iter().zip(on).position(|(a, b)| a != b) {
         Some(at) => at,
@@ -362,12 +378,16 @@ async fn judge(off_load: &Load, prompt: &Prompt, eos: u32, off: &[u32], on: &[u3
     let [off_logit, on_logit] = prefill_logits(off_load, prompt, &off[..at], [off_pick, on_pick]).await;
     let gap = off_logit - on_logit;
     let ulp = bf16_ulp(off_logit.abs().max(on_logit.abs()));
+    let ulps = gap / ulp;
     let line = format!(
-        "{}: MTP on splits from MTP off at token {at}: off {off_pick} on {on_pick}; the prefill route's gap off - on = {gap} (ulp {ulp})",
-        prompt.name
+        "{}: MTP on splits from MTP off at token {at}: off {off_pick} on {on_pick}; the prefill route's gap off - on = {gap} \
+         ({ulps} ulps of {ulp}): ADR 0056's near tie ({PICK_GAP_ULPS} ulps) {}, the one-ulp rule {}",
+        prompt.name,
+        if ulps <= PICK_GAP_ULPS { "holds" } else { "FAILS" },
+        if gap <= ulp { "holds" } else { "would refuse it" }
     );
     println!("{line}");
-    assert!(gap <= ulp, "{line}: the prefill route sides with MTP off past a near-tie");
+    assert!(ulps <= PICK_GAP_ULPS, "{line}: the prefill route sides with MTP off past ADR 0056's near tie");
     Some(line)
 }
 
