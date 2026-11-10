@@ -211,17 +211,14 @@ impl ModelLoader for ArtifactLoader {
         crate::loader::artifact_family(&target.artifact).ok().flatten()
     }
 
-    /// The load's own prepare-time check of the vision companion, asked
-    /// early: Flash-Next with vision on in the configuration this switch
-    /// would load it with ([`load_options`]).
+    /// The load's own prepare-time check of the vision companion
+    /// ([`crate::load::check_vision_companion`]), asked early, on the
+    /// configuration this switch would load the target with ([`fit_options`],
+    /// which says nothing: the prepare after it logs the fit).
     fn companion_refusal(&self, target: &ModelSource) -> Option<String> {
         let family = crate::loader::artifact_family(&target.artifact).ok().flatten()?;
-        if family != ModelFamily::FlashNext {
-            return None;
-        }
-        let options = load_options(&self.state.current(), target, family, None).ok()?;
-        options.vision.as_ref()?;
-        crate::load::check_vision_companion(&target.artifact).err().map(|refusal| refusal.to_string())
+        let (options, _) = fit_options(&self.state.current(), target, family, None).ok()?;
+        crate::load::check_vision_companion(&options, Some(family), &target.artifact).err().map(|refusal| refusal.to_string())
     }
 }
 
@@ -239,8 +236,21 @@ pub fn load_options(
     family: ignis_core::compute::ModelFamily,
     given: Option<&crate::config::Config>,
 ) -> Result<crate::config::Config, String> {
+    let (options, dropped) = fit_options(running, target, family, given)?;
+    log_flags_dropped(&target.model, family, &dropped);
+    Ok(options)
+}
+
+/// [`load_options`] without its log line, with the flags the fit dropped
+/// (none for `given` already fitted).
+fn fit_options(
+    running: &crate::config::Config,
+    target: &ModelSource,
+    family: ignis_core::compute::ModelFamily,
+    given: Option<&crate::config::Config>,
+) -> Result<(crate::config::Config, Vec<String>), String> {
     if let Some(options) = given.filter(|options| options.basis.family() == Some(family)) {
-        return Ok(options.clone());
+        return Ok((options.clone(), Vec::new()));
     }
     // The target's artifact and id over the running options, as a patch:
     // the options are resolved again from their sources, so a value set on
@@ -249,9 +259,7 @@ pub fn load_options(
     let named = crate::config::target_patch(&target.artifact, &target.model)
         .and_then(|patch| base.general_with(&patch))
         .map_err(|e| e.to_string())?;
-    let (options, dropped) = crate::config::fit_to_family(&named, family).map_err(|e| e.to_string())?;
-    log_flags_dropped(&target.model, family, &dropped);
-    Ok(options)
+    crate::config::fit_to_family(&named, family).map_err(|e| e.to_string())
 }
 
 /// Say which of the running options a switch to `to`, a model of `family`,
@@ -2137,6 +2145,24 @@ mod tests {
         assert!(width.contains(VISION_ARTIFACT_FILE_NAME) && !width.contains("is missing"), "{width}");
         let missing = ModelSource { artifact: main.path.with_file_name("not-there.ninfer"), model: "other".to_owned() };
         assert_eq!(loader(true).companion_refusal(&missing), None, "a file that is no artifact lacks nothing here; prepare says so");
+    }
+
+    /// The early companion check fits the switch's options as its prepare
+    /// will, and says nothing: the prepare after it logs what the fit
+    /// dropped, once per switch.
+    #[test]
+    fn the_early_companion_check_logs_nothing_of_the_fit() {
+        let args: Vec<String> = ["--profile", "none", "--vision-enabled", "--spec-backend", "dflash2", "--spec-draft-tokens", "7"]
+            .map(String::from)
+            .to_vec();
+        let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).unwrap() else { panic!("a config") };
+        let loader = ArtifactLoader::new(config);
+        let main = ignis_artifact::flash_next::fixture::build("switch-companion-quiet").expect("the main fixture");
+        let target = ModelSource { artifact: main.path.clone(), model: "qwen3.8-flash-next".to_owned() };
+        let mut refusal = None;
+        let records = logged(|| refusal = loader.companion_refusal(&target));
+        assert!(refusal.is_some_and(|refusal| refusal.contains(ignis_artifact::packer::VISION_ARTIFACT_FILE_NAME)));
+        assert!(records.is_empty(), "{records:?}");
     }
 
     fn logged(run: impl FnOnce()) -> Vec<serde_json::Value> {

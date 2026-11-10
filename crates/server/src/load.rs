@@ -323,13 +323,9 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
             }
         }
     }
-    // GitHub #557 (ADR 0087): Flash-Next sees with its vision companion's
-    // tower, so a start with vision on is refused, naming the file, when the
-    // companion is not beside the artifact or is not its own -- before the
-    // checksum is read and before anything loads.
-    if named == Some(ModelFamily::FlashNext) && fitted(config, ModelFamily::FlashNext).is_ok_and(|c| c.vision.is_some()) {
-        check_vision_companion(artifact)?;
-    }
+    // GitHub #557 (ADR 0087): before the checksum is read and before anything
+    // loads.
+    check_vision_companion(config, named, artifact)?;
     // The image model's container holds no text frontend (spec
     // image-model/01): it is verified, and its runner reads the rest.
     if named.map(ModelFamily::kind) == Some(ModelKind::Image) {
@@ -408,11 +404,23 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
     })
 }
 
-/// Flash-Next's vision companion beside `artifact`, held to it (GitHub #557,
-/// [`ignis_core::flash_next_vision::Companion::open`]): its pair pin, its
-/// identity and the width its merger writes, against Flash-Next's hidden
-/// width. Nothing of the tower is read.
-pub(crate) fn check_vision_companion(artifact: &std::path::Path) -> Result<(), LoadError> {
+/// GitHub #557 (ADR 0087): Flash-Next sees with its vision companion's tower,
+/// so a load of `artifact`, of `family`, under `config` with vision on for
+/// Flash-Next is refused, naming the file, when the companion is not beside
+/// the artifact or is not its own -- held to it by its pair pin, its identity
+/// and the width its merger writes, against Flash-Next's hidden width
+/// ([`ignis_core::flash_next_vision::Companion::open`]). Nothing of the
+/// tower is read. Any other load asks for no companion. What a start's and
+/// a switch's prepare check, and what `POST /v1/models/switch` asks before
+/// it begins (GitHub #563).
+pub(crate) fn check_vision_companion(
+    config: &crate::config::Config,
+    family: Option<ModelFamily>,
+    artifact: &std::path::Path,
+) -> Result<(), LoadError> {
+    if family != Some(ModelFamily::FlashNext) || !fitted(config, ModelFamily::FlashNext).is_ok_and(|c| c.vision.is_some()) {
+        return Ok(());
+    }
     let main = ignis_artifact::Reader::open(artifact).map_err(|e| LoadError::ArtifactInvalid(e.to_string()))?;
     let geometry = ignis_artifact::flash_next::FlashNextGeometry::qwen38_flash_next();
     let hidden = ignis_core::compute::ModelConfig::flash_next_from(&geometry).hidden;
