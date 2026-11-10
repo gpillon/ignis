@@ -7,8 +7,9 @@ sidebar:
 
 ## Host RAM for Flash-Next
 
-Serving Flash-Next needs about **46-47 GB of available RAM** (about 0.45 GB more with
-vision on, below): 38 GB of pinned
+Serving Flash-Next needs about **46-47 GB of available RAM** (about 0.65 GB more with
+vision on, below: the tower's 482,705,408 bytes and the pool's 160 MiB at the
+default envelope): 38 GB of pinned
 experts (2.1 GB less under the `rtx5090` profile's pinned hot set, below), 1 GB of n-gram hot rows, ~0.5 GB of staging (KV-disk's 64 MiB
 included: `--qwen38flashnext-kv-disk-bytes 0` drops it), ~1 GB of retained host
 slots, the 2 GiB KV-RAM arena and the 4 GiB margin the load refuses to dip into
