@@ -193,7 +193,7 @@ it).
 
 With no `--model-artifact`, a GPU build looks for the model under
 `--download-path` (default `./models`) and fetches the whole entry when it is
-not there: 18.1 GiB for the default 27B, 67.8 GiB for Flash-Next. On a terminal
+not there: 18.1 GiB for the default 27B, 68.2 GiB for Flash-Next. On a terminal
 it asks first; in a container, a daemon or CI nobody can answer, so it
 downloads. Every file is checked against its pinned size and SHA-256, an
 interrupted download resumes from its `.part`, and a failed fetch refuses the
@@ -351,8 +351,10 @@ margin; each costs something
 
 When it names `crossing_line: load_staging`, no flag shrinks those layer
 buffers: close other applications. When it names `crossing_line:
-vision_tower` or `vision_pool`, the 27B's vision tower or its embedding pool
-does not fit in pinned RAM under `--vision-residency host`: start with
+vision_tower` or `vision_pool`, a vision tower or its embedding pool (the
+27B's, or Flash-Next's companion's) does not fit in pinned RAM under
+`--vision-residency host`, and when Flash-Next's experts no longer fit beside
+them its message says so: start with
 `--vision-residency device` to keep both in VRAM, or without vision
 ([Where the vision tower and the embedding pool live](configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live)).
 
@@ -363,10 +365,36 @@ Flash-Next's MTP head needs its companion container
 qwen3.8-flash-next` fetches both
 ([Flash-Next speculation](configuration/flash-next-mtp.md)).
 
+### Flash-Next refuses the start for its vision companion
+
+From 0.11.0, with vision on, Flash-Next's start opens its vision companion
+(`qwen3_8_flash_next_vision-v2.ninfer`) beside the artifact and refuses the
+start, naming the file, when it is missing (`model download
+qwen3.8-flash-next` fetches it, or start without vision) or is not this
+artifact's: built for another main container, a merger of another width, or
+another encoding of the tower than the build reads (the reason names both
+weights ids; an older download leaves one). Download the model again, so the
+pair is one revision's: a file already there at another size is left alone, so
+move the companion and its `.conversion.json` aside first
+([Flash-Next's vision](configuration/vision.md#flash-next)).
+
+### `` `--qwen38flashnext-vision-max-tokens …` requires vision on for Qwen3.8-Flash-Next ``
+
+From 0.11.0, a vision or media option named for one model (a `--qwen38flashnext-…` or
+`--qwen38-…` flag, its `IGNIS_QWEN38FLASHNEXT_…` variable, a
+`vision.qwen38flashnext` section of the config file) is that model's alone,
+and that model's vision is off: every built-in profile turns vision on for the
+27B and leaves it off on Flash-Next. Turn it on for that model
+(`--qwen38flashnext-vision-enabled`, or `--vision-enabled` for both), or drop
+the option. The same option named for both models (`--vision-max-tokens`) is
+taken while one has vision on, and the start's `ignis.config.vision_options`
+line names the models it applies to
+([Flash-Next's vision](configuration/vision.md#flash-next)).
+
 ### A flag is refused for this model
 
 A field only one model takes is refused at start when set for the other
-(`--vision-enabled` and Flash-Next, the n-gram flags and the 27B,
+(`--model-prefill-attention` and Flash-Next, the n-gram flags and the 27B,
 `--spec-decode-lanes` and the 27B). Remove it, or give it in the model's own
 family section of the config file. On a model switch it is dropped instead,
 with a log line ([Configuration](configuration/index.md)).
@@ -551,7 +579,11 @@ produces) is not decoded yet: send WAV, or convert it. A clip longer than
 
 `vision is disabled for this server`: an `image_url` part was sent and the
 server runs without `--vision-enabled`, whatever the artifact holds. Start with
-`--vision-enabled`. `media_budget_exceeded`: several images together are past
+`--vision-enabled` (on Flash-Next from 0.11.0; 0.10.0 serves Flash-Next without images).
+From 0.11.0, after a switch from the 27B to Flash-Next under a built-in
+profile, which turns vision on for the 27B alone, Flash-Next serves without it,
+and the switch's `ignis.model.switch_vision_off` line says so
+([Model switching](api/model-switching.md)). `media_budget_exceeded`: several images together are past
 `--vision-max-tokens` (32,768 by default); a single oversized image is
 downscaled instead ([Vision](configuration/vision.md)).
 

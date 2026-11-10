@@ -806,6 +806,12 @@ impl ModelFamily {
     /// a family added here reaches every one of them.
     pub const ALL: [ModelFamily; 4] = [ModelFamily::Qwen38_27b, ModelFamily::FlashNext, ModelFamily::QwenImage21, ModelFamily::Nemotron3Diarization];
 
+    /// The models with a vision tower to take image parts with, the one list
+    /// of them: the 27B's in its container, Flash-Next's in its vision
+    /// companion (GitHub #557, ADR 0087). What the vision and media config
+    /// fields apply to.
+    pub const WITH_VISION: &'static [ModelFamily] = &[ModelFamily::Qwen38_27b, ModelFamily::FlashNext];
+
     /// The family an artifact's identity `model_id` names, or `None` for an
     /// artifact of no family (a test fixture).
     pub fn of_model_id(model_id: &str) -> Option<Self> {
@@ -890,9 +896,10 @@ impl ModelFamily {
         }
     }
 
-    /// Whether the model has a vision tower to take image parts with.
+    /// Whether the model has a vision tower to take image parts with
+    /// ([`ModelFamily::WITH_VISION`]).
     pub fn takes_images(self) -> bool {
-        self == ModelFamily::Qwen38_27b
+        Self::WITH_VISION.contains(&self)
     }
 
     /// Whether the model serves `/v1/decide`'s readouts.
@@ -1473,17 +1480,17 @@ mod tests {
         assert_eq!(ModelFamily::FlashNext.default_retained_host_slots(0), 8);
     }
 
-    /// What each model can serve beyond text: Flash-Next has no vision
-    /// tower and no readouts (spec flash-next/04, Out of Scope), and drafts
-    /// with its own MTP head where the 27B drafts with DFlash2 (spec
-    /// flash-next/07).
+    /// What each model can serve beyond text: Flash-Next takes images with
+    /// its vision companion's tower (GitHub #557, ADR 0087) but has no
+    /// readouts (spec flash-next/04, Out of Scope), and drafts with its own
+    /// MTP head where the 27B drafts with DFlash2 (spec flash-next/07).
     #[test]
-    fn flash_next_serves_text_only() {
+    fn flash_next_takes_images_and_serves_no_readouts() {
         let dense = ModelFamily::Qwen38_27b;
         assert!(dense.takes_images() && dense.serves_readouts());
         assert_eq!(dense.drafter(), Some(crate::SpeculativeBackend::Dflash2));
         let flash = ModelFamily::FlashNext;
-        assert!(!flash.takes_images() && !flash.serves_readouts());
+        assert!(flash.takes_images() && !flash.serves_readouts());
         assert_eq!(flash.drafter(), Some(crate::SpeculativeBackend::Mtp));
     }
 

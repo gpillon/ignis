@@ -110,6 +110,7 @@ impl StepLeaf for ByteLeaf {
             graph_launches: 0,
             free_vram_bytes: 0,
             reserved: Default::default(),
+            vision_item_max_tokens: 0,
         })
     }
     fn vocab(&self, _model: &()) -> u32 {

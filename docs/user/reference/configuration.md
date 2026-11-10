@@ -968,10 +968,11 @@ The drafter's proposal head: `full` (the target's output head), `shortlist` (the
 | Env var | `IGNIS_VISION_ENABLED` |
 | Kind | `bool` |
 | Default | `false` |
-| Models | Qwen3.8-27B |
+| Models | Qwen3.8-27B, Qwen3.8-Flash-Next |
+| Per model | `--qwen38-vision-enabled`, `--qwen38flashnext-vision-enabled` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-Load the vision tower and reserve its workspace.
+Load the vision tower and reserve its workspace. Flash-Next's needs its vision companion beside the artifact, and a start without it is refused naming the file. Per family: the built-in profiles turn it on for the 27B alone.
 
 ### `vision.max_tokens`
 
@@ -982,7 +983,8 @@ Load the vision tower and reserve its workspace.
 | Kind | `tokens` |
 | Default | `32768` |
 | Rule | 1..=1048576 |
-| Models | Qwen3.8-27B |
+| Models | Qwen3.8-27B, Qwen3.8-Flash-Next |
+| Per model | `--qwen38-vision-max-tokens`, `--qwen38flashnext-vision-max-tokens` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
 Merged vision tokens per request. An image over it is shrunk to fit, aspect kept; refused only when its aspect ratio cannot fit, or when several images total over it. Needs vision on.
@@ -996,7 +998,8 @@ Merged vision tokens per request. An image over it is shrunk to fit, aspect kept
 | Kind | `MiB` |
 | Default | `unset` |
 | Rule | 1..=65536 |
-| Models | Qwen3.8-27B |
+| Models | Qwen3.8-27B, Qwen3.8-Flash-Next |
+| Per model | `--qwen38-vision-embedding-pool-mib`, `--qwen38flashnext-vision-embedding-pool-mib` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
 Encoded images kept for reuse, in MiB, where `vision.residency` puts the pool: VRAM, or pinned host RAM under `host`. Unset, one envelope-wide embedding; a pool below that is raised to it. Needs vision on.
@@ -1010,10 +1013,11 @@ Encoded images kept for reuse, in MiB, where `vision.residency` puts the pool: V
 | Kind | `vision residency` |
 | Default | `host` |
 | Rule | one of host, device |
-| Models | Qwen3.8-27B |
+| Models | Qwen3.8-27B, Qwen3.8-Flash-Next |
+| Per model | `--qwen38-vision-residency`, `--qwen38flashnext-vision-residency` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-Where the vision tower's weights and the embedding pool live: `device`, in VRAM for the life of the load (today's encode latency), or `host`, in pinned host RAM, the weights copied to the GPU for each image encode (~300 MB and the pool less VRAM, so more KV pool, a few ms more an encode). A `host` start the host RAM cannot hold is refused, never moved to the device. Needs vision on.
+Where the vision tower's weights and the embedding pool live: `device`, in VRAM for the life of the load (today's encode latency), or `host`, in pinned host RAM, the weights copied to the GPU for each image encode (the tower, ~300 MB on the 27B and ~480 MB on Flash-Next, and the pool less VRAM, so more KV pool, a few ms more an encode). A `host` start the host RAM cannot hold is refused, never moved to the device. Needs vision on.
 
 ## media
 
@@ -1025,7 +1029,8 @@ Where the vision tower's weights and the embedding pool live: `device`, in VRAM 
 | Env var | `IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK` |
 | Kind | `bool` |
 | Default | `false` |
-| Models | Qwen3.8-27B |
+| Models | Qwen3.8-27B, Qwen3.8-Flash-Next |
+| Per model | `--qwen38-media-allow-private-network`, `--qwen38flashnext-media-allow-private-network` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
 Fetch image URLs on private, loopback, link-local, multicast and CGNAT addresses. Off, so an exposed server cannot be used to probe the operator's LAN. Needs vision on.
@@ -1039,7 +1044,8 @@ Fetch image URLs on private, loopback, link-local, multicast and CGNAT addresses
 | Kind | `MiB` |
 | Default | `1024` |
 | Rule | 0..=65536 |
-| Models | Qwen3.8-27B |
+| Models | Qwen3.8-27B, Qwen3.8-Flash-Next |
+| Per model | `--qwen38-media-cache-mib`, `--qwen38flashnext-media-cache-mib` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
 Prepared images kept for reuse, in MiB; 0 keeps none. Needs vision on.

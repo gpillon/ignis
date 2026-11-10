@@ -44,15 +44,19 @@ owner. ADR 0069 applies the rule.
 ## Vendored ops
 
 A vendored op stays the upstream's file byte for byte, or a recorded patch of
-it, under its manifest (ADR 0010, `kernel/vendor/VENDOR.md`). Three reasons
+it, under its manifest (ADR 0010, `kernel/vendor/VENDOR.md`). Four reasons
 admit a recorded patch, made with `scripts/vendor-ninfer.ps1 record-patch`: a
 measurement that shows the op is the bottleneck (ADR 0031); a demonstrated
 correctness bug, whose patch ships with a test that fails without it and a
-`reason` naming the bug and the test (ADR 0037); or portability to a CUDA
+`reason` naming the bug and the test (ADR 0037); portability to a CUDA
 architecture the build targets, or to a card smaller than the RTX 5090, whose
 patch leaves the default `120a` build's device code unchanged and whose
 `reason` names the CUDA architecture or the card size and what it fixes: a
-compile, or a launch that fails at run time there (ADR 0077). An op rewritten
+compile, or a launch that fails at run time there (ADR 0077); or a vendored
+registry that lacks a case ignis needs, whose `reason` names the shapes
+added, why the routes fit them and the test cases that throw without it, and
+which a small registry may instead meet by being rewritten as ignis's own
+code (ADR 0088). An op rewritten
 as ours, or
 changed beyond a recorded patch, leaves the vendored tree and
 makes no parity claim (ADR 0031, ADR 0051). A comparison with the reference

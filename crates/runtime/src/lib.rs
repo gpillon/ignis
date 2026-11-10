@@ -279,6 +279,10 @@ pub struct RuntimeStats {
     /// What the loaded model and its pool hold beside the weights (GitHub
     /// #210); all zero for a leaf with no device.
     pub reserved: ReservedBytes,
+    /// The most merged tokens one media item may hold on this load (GitHub
+    /// #557): the item bound its encoder was sized for, which the processor
+    /// it serves must not pass. 0 without vision.
+    pub vision_item_max_tokens: u32,
 }
 
 impl From<RuntimeError> for ComputeError {
@@ -817,7 +821,8 @@ pub trait StepLeaf: Send + Sync + 'static {
     fn encode_media(&self, _model: &Self::Model, _item: &MediaItem) -> Result<Self::Media, i32> {
         Err(-1)
     }
-    /// Release a media embedding.
+    /// Release a media embedding. By default it is dropped, which is the
+    /// release for an embedding whose drop frees it (the CUDA leaves').
     fn release_media(&self, _model: &Self::Model, _media: Self::Media) {}
     /// [`StepLeaf::prefill`] over a span of a multimodal prompt: rotated at
     /// the span's three-axis positions, its placeholder columns taking the

@@ -22,6 +22,7 @@
 
 #include "ignis_model.h"
 #include "ignis_fp8_linear.h"
+#include "ignis_residency.h"
 #include "ignis_image_gemm.h"
 #include "ignis_step.h"
 
@@ -59,6 +60,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <memory>
 #include <stdexcept>
@@ -1041,6 +1043,50 @@ std::size_t vision_output_transient_bytes(std::int64_t hidden, std::int32_t toke
   return layout.finish(kVisionWorkspaceAlignment, "vision item output transient layout");
 }
 
+// GitHub #558 (ADR 0087): the expert staging ring of the residency a load
+// borrows (ignis_model_load_options::residency) -- 0 without one, and when it
+// holds every expert and stages nothing -- read before the options are
+// validated, so only from options of a recognized size.
+uint64_t lent_staging_ring_bytes(const struct ignis_model_load_options *options) {
+  if (options == nullptr || options->size != sizeof(struct ignis_model_load_options) ||
+      options->residency == nullptr) {
+    return 0;
+  }
+  ignis_residency_layout layout{};
+  return ignis_residency_get_layout(options->residency, &layout) == 0 ? layout.ring_bytes : 0;
+}
+
+// GitHub #557, #558 (ADR 0087): the most merged tokens one media item may
+// hold when its encode runs in what a Flash-Next load lends it, idle while
+// the item encodes -- `scratch_bytes` of its prefill scratch and its expert
+// staging ring of `ring_bytes` (0 when the residency holds every expert) --
+// the encoder's workspace for the item (ignis_vision_workspace_bytes, at the
+// segments the encode checks) and with a staged tower (`staging_slot_bytes`
+// nonzero) its slots, laid out as ignis_vision_encode_placement lays them, at
+// most `cap`; 0 when not even a one-token item fits. The share grows with the
+// item, so the largest that fits is found by bisection.
+uint32_t vision_item_bound(std::size_t scratch_bytes, std::size_t ring_bytes, std::size_t staging_slot_bytes,
+                           uint32_t cap) {
+  const auto fits_in = [&](uint32_t tokens) {
+    const auto t = static_cast<std::int32_t>(tokens);
+    const std::size_t workspace = ignis_vision_workspace_bytes(t, std::min(t, kVisionMaxSegments));
+    return ignis_vision_encode_placement(scratch_bytes, ring_bytes, workspace,
+                                         IGNIS_VISION_STAGING_SLOTS * staging_slot_bytes)
+        .fits;
+  };
+  uint32_t fits = 0;
+  uint32_t past = cap + 1;
+  while (past - fits > 1) {
+    const uint32_t mid = fits + (past - fits) / 2;
+    if (fits_in(mid)) {
+      fits = mid;
+    } else {
+      past = mid;
+    }
+  }
+  return fits;
+}
+
 // The load options `ignis_model_load` and `ignis_model_plan_reservations`
 // both run under, once validated.
 struct LoadOptions {
@@ -1144,13 +1190,17 @@ const char *flash_next_block_in(const ignis_topology &t) {
 // The argument checks and the tensor binding of a load, shared by the load
 // itself and by its plan (GitHub #210) so the two refuse the same calls with
 // the same messages. Allocates nothing on the device. Null (error set) on
-// any refusal.
+// any refusal. GitHub #558 (ADR 0087): `staging_ring_bytes` is a Flash-Next
+// load's expert staging ring, which its item bound counts on -- the plan's,
+// or at load the residency's -- and null where no bound is asked for (a
+// reservation plan, whose lines the bound does not move); the 27B's bound is
+// its own scratch's, so it reads none.
 std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *tensors,
                                                uint64_t count, const struct ignis_topology *topology,
                                                uint32_t prefill_chunk_tokens,
                                                uint32_t max_context_tokens, int32_t kv_format,
                                                const struct ignis_model_load_options *options,
-                                               LoadOptions &out) {
+                                               LoadOptions &out, const uint64_t *staging_ring_bytes) {
   if (topology->num_layers > 0 && topology->layer_kinds == nullptr) {
     set_error("ignis_model_load: topology.layer_kinds is null");
     return nullptr;
@@ -1380,8 +1430,14 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
 
   // GitHub #302: Flash-Next binds its own schema (kernel/src/flash_next/
   // bind.cu) into its own program (kernel/src/flash_next/program.h), and has
-  // no drafter, vision tower or attention readouts. Its decode lanes and its
-  // residency are its options alone.
+  // no drafter or attention readouts. Its decode lanes and its residency are
+  // its options alone. GitHub #557: with vision, its embedding pool is the
+  // 27B's rule -- floored at the envelope's own output, whole pages, in VRAM
+  // or mapped host memory by the vision residency -- at its own hidden width;
+  // its encoder is the vision companion's (ADR 0087): the `vision/*` tensors
+  // bind into the 27B's tower schema at the merger's 2,560 rows, and an item
+  // encodes in the prefill scratch and the expert staging ring (GitHub #558),
+  // so the item bound is what those hold.
   if (flash_next) {
     if (prefill_attention != IGNIS_PREFILL_ATTENTION_FP8) {
       set_error("ignis_model_load: prefill_attention is the 27B's; Qwen3.8-Flash-Next's attention is QSA");
@@ -1391,26 +1447,74 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
       set_error("ignis_model_load: prefill_linear is the 27B's; Qwen3.8-Flash-Next has its own prefill");
       return nullptr;
     }
-    if (vision_max_tokens != 0 || attention_text_max_keys != 0) {
-      set_error("ignis_model_load: Qwen3.8-Flash-Next has no vision or attention readouts");
+    if (attention_text_max_keys != 0) {
+      set_error("ignis_model_load: Qwen3.8-Flash-Next has no attention readouts");
       return nullptr;
     }
+    const uint64_t vision_pool_bytes =
+        vision_max_tokens == 0
+            ? 0
+            : vision_embedding_pool_bytes(static_cast<std::int64_t>(topology->hidden),
+                                          static_cast<std::int32_t>(std::min(vision_max_tokens, max_context_tokens)),
+                                          vision_embedding_pool_request);
     // GitHub #307 (spec flash-next/07): MTP, or the verify round alone for a
     // test's drafts; DFlash2 is the 27B's.
     if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
       set_error("ignis_model_load: DFlash2 is the 27B's drafter; Qwen3.8-Flash-Next drafts with its MTP head");
       return nullptr;
     }
+    // Without vision a `vision/*` tensor stays among the program's, whose
+    // binder refuses it as an extra.
+    std::vector<ignis_bound_tensor> text;
+    std::vector<ignis_bound_tensor> tower;
+    for (uint64_t i = 0; i < count; ++i) {
+      const bool is_tower = vision_max_tokens > 0 && tensors[i].name != nullptr &&
+                            std::strncmp(tensors[i].name, "vision/", 7) == 0;
+      (is_tower ? tower : text).push_back(tensors[i]);
+    }
     std::string error;
-    auto program = ignis::flash_next::bind_model(tensors, count, *topology, prefill_chunk_tokens,
+    auto program = ignis::flash_next::bind_model(text.data(), text.size(), *topology, prefill_chunk_tokens,
                                                  max_context_tokens, kv_format, options, rope_scaling,
-                                                 &error);
+                                                 vision_pool_bytes,
+                                                 vision_residency == IGNIS_VISION_RESIDENCY_HOST, &error);
     if (program == nullptr) {
       set_error("ignis_model_load: " + error);
       return nullptr;
     }
     auto model = std::make_unique<ignis_model>();
     model->flash_next.reset(program.release());
+    if (vision_max_tokens > 0) {
+      ModelBinder binder(tower.data(), tower.size());
+      if (!binder.build_index(tower.size()) ||
+          !bind_vision(binder, Geometry::from(*topology), model->vision) || !binder.require_no_extras()) {
+        return nullptr;
+      }
+      model->vision_max_tokens = vision_max_tokens;
+      // GitHub #558 (ADR 0087): the encode also takes the expert staging
+      // ring, idle between forwards (ignis_residency.h), so the item bound is
+      // what the two hold.
+      if (staging_ring_bytes != nullptr) {
+        const std::size_t scratch = ignis::flash_next::reservations(*model->flash_next).workspace_bytes;
+        const std::size_t ring = *staging_ring_bytes;
+        const std::size_t slot =
+            vision_residency == IGNIS_VISION_RESIDENCY_HOST ? ignis_vision_staging_slot_bytes(model->vision) : 0;
+        const uint32_t bound =
+            vision_item_bound(scratch, ring, slot, std::min(out.vision_item_max_tokens, max_context_tokens));
+        if (bound == 0) {
+          set_error("ignis_model_load: Qwen3.8-Flash-Next's prefill scratch of " + std::to_string(scratch) +
+                    " bytes" +
+                    (ring == 0 ? std::string(" holds")
+                               : " and its expert staging ring of " + std::to_string(ring) + " bytes hold") +
+                    " no media item's encode" +
+                    (slot == 0 ? std::string() : " with the vision tower's staging slots") +
+                    " -- a wider --model-prefill-chunk" +
+                    (slot == 0 ? std::string() : ", or the tower in VRAM (--vision-residency device)"));
+          return nullptr;
+        }
+        out.vision_item_max_tokens = bound;
+        model->vision_item_max_tokens = bound;
+      }
+    }
     return model;
   }
   if (options != nullptr && (options->residency != nullptr || options->draft_row_budget != 0 ||
@@ -1935,6 +2039,53 @@ MappedHostRegion::MappedHostRegion(std::size_t size_bytes) {
   bytes = size_bytes;
 }
 
+// GitHub #414 (ADR 0075): a loaded vision tower must be where the residency
+// says -- the plan sized the scratch by the option, and a tower read from
+// host memory in place would be a load that neither plan describes -- and,
+// under host, every stage must fit a slot of the plan's ring before an encode
+// needs it. Then the ring's own copy stream and events. Both models' loads
+// (GitHub #557: Flash-Next's tower is its vision companion's), after the
+// embedding pool; throws naming what failed.
+static void prepare_vision_tower(ignis_model &model, bool host) {
+  std::size_t tensors = 0;
+  std::size_t in_host = 0;
+  visit_vision_stages(model.vision, [&](std::size_t, const ninfer::Weight &w) {
+    ++tensors;
+    in_host += in_host_memory(w.qdata) ? 1 : 0;
+  });
+  if (in_host != (host ? tensors : 0)) {
+    throw std::runtime_error(std::string("the vision residency is ") + (host ? "host" : "device") + " but " +
+                             std::to_string(in_host) + " of the tower's " + std::to_string(tensors) +
+                             " tensors are bound in host memory: bind the tower where the residency puts it");
+  }
+  if (!host) {
+    return;
+  }
+  VisionStaging &staging = model.vision_staging;
+  staging.slot_bytes = ignis_vision_staging_slot_bytes(model.vision);
+  ignis_vision_staging_check(model.vision, staging.slot_bytes);
+  // GitHub #415: the merger writes each host-mapped pool page through a
+  // device page in a slot of the ring (vision_encode.cu).
+  if (model.vision_pool.page_bytes > staging.slot_bytes) {
+    throw std::runtime_error("an embedding pool page of " + std::to_string(model.vision_pool.page_bytes) +
+                             " bytes does not fit a staging slot of " + std::to_string(staging.slot_bytes));
+  }
+  const auto event = [](cudaEvent_t &e) {
+    if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+      throw std::runtime_error("creating a staging event failed");
+    }
+  };
+  event(staging.head);
+  for (std::size_t slot = 0; slot < IGNIS_VISION_STAGING_SLOTS; ++slot) {
+    event(staging.copied[slot]);
+    event(staging.consumed[slot]);
+  }
+  if (cudaStreamCreateWithFlags(&staging.copy, cudaStreamNonBlocking) != cudaSuccess) {
+    staging.copy = nullptr;
+    throw std::runtime_error("creating the staging copy stream failed");
+  }
+}
+
 extern "C" int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor *tensors,
                                                  uint64_t count,
                                                  const struct ignis_topology *topology,
@@ -1950,8 +2101,9 @@ extern "C" int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor
     return -1;
   }
   LoadOptions load{};
+  // No item bound: it moves no line of the plan (ADR 0087).
   const auto model = validate_and_bind(tensors, count, topology, prefill_chunk_tokens,
-                                       max_context_tokens, kv_format, options, load);
+                                       max_context_tokens, kv_format, options, load, nullptr);
   if (model == nullptr) {
     return -1;
   }
@@ -1965,6 +2117,40 @@ extern "C" int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor
   } catch (const std::exception &e) {
     set_error(std::string("ignis_model_plan_reservations: ") + e.what());
     return -1;
+  }
+  return 0;
+}
+
+extern "C" int32_t ignis_model_plan_vision_item_max_tokens(const struct ignis_bound_tensor *tensors,
+                                                           uint64_t count,
+                                                           const struct ignis_topology *topology,
+                                                           uint32_t prefill_chunk_tokens,
+                                                           uint32_t max_context_tokens, int32_t kv_format,
+                                                           const struct ignis_model_load_options *options,
+                                                           uint64_t staging_ring_bytes, uint32_t *out_tokens) {
+  if (out_tokens != nullptr) {
+    *out_tokens = 0;
+  }
+  if (tensors == nullptr || topology == nullptr || out_tokens == nullptr) {
+    set_error("ignis_model_plan_vision_item_max_tokens: null argument");
+    return -1;
+  }
+  LoadOptions load{};
+  const auto model = validate_and_bind(tensors, count, topology, prefill_chunk_tokens,
+                                       max_context_tokens, kv_format, options, load, &staging_ring_bytes);
+  if (model == nullptr) {
+    return -1;
+  }
+  if (!model->flash_next && staging_ring_bytes != 0) {
+    set_error("ignis_model_plan_vision_item_max_tokens: an expert staging ring is Qwen3.8-Flash-Next's; the 27B's "
+              "encode has its own share of the scratch");
+    return -1;
+  }
+  // What the load would hold: the bound as validated (on Flash-Next, what
+  // its prefill scratch and its expert staging ring hold), within the
+  // context, as ignis_model_vision_item_max_tokens reports it.
+  if (load.vision_max_tokens > 0) {
+    *out_tokens = std::min(load.vision_item_max_tokens, max_context_tokens);
   }
   return 0;
 }
@@ -1983,8 +2169,11 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     return -1;
   }
   LoadOptions load{};
+  // GitHub #558 (ADR 0087): the expert staging ring of the residency a
+  // Flash-Next load borrows, which its encode borrows in turn.
+  const uint64_t staging_ring_bytes = lent_staging_ring_bytes(options);
   auto model = validate_and_bind(tensors, count, topology, prefill_chunk_tokens,
-                                 max_context_tokens, kv_format, options, load);
+                                 max_context_tokens, kv_format, options, load, &staging_ring_bytes);
   if (model == nullptr) {
     return -1;
   }
@@ -2009,16 +2198,31 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   model->vram_bytes = vram_bytes;
   model->host_mapped_bytes = host_mapped_bytes;
 
-  // GitHub #302: a Flash-Next load reserves and prepares its own program.
+  // GitHub #302: a Flash-Next load reserves and prepares its own program;
+  // GitHub #557: and with vision, its companion's tower as the 27B's is.
   if (model->flash_next) {
     std::string error;
-    if (ignis::flash_next::finish_load(*model, &error) != 0) {
+    int32_t rc = ignis::flash_next::finish_load(*model, &error);
+    if (rc == 0 && vision_max_tokens > 0) {
+      try {
+        prepare_vision_tower(*model, load.vision_residency == IGNIS_VISION_RESIDENCY_HOST);
+      } catch (const std::exception &e) {
+        error = std::string("the vision tower's residency: ") + e.what();
+        rc = -1;
+      }
+    }
+    if (rc != 0) {
       set_error("ignis_model_load: " + error);
       if (model->stream != nullptr) {
         cudaStreamDestroy(model->stream);
         model->stream = nullptr;
       }
       return -1;
+    }
+    // GitHub #558 (ADR 0087): an encode may also take the expert staging
+    // ring, which the item bound above counted on.
+    if (vision_max_tokens > 0 && staging_ring_bytes > 0) {
+      model->vision_ring_lender = options->residency;
     }
     *out_model = model.release();
     return 0;
@@ -2204,49 +2408,10 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       model->stream = nullptr;
       return -1;
     }
-    // GitHub #414 (ADR 0075): the tower must be where the residency says --
-    // the plan sized the scratch by the option, and a tower read from host
-    // memory in place would be a load that neither plan describes -- and,
-    // under host, every stage must fit a slot of the plan's ring before an
-    // encode needs it. Then the ring's own copy stream and events.
+    // GitHub #414 (ADR 0075): the tower where the residency says, and under
+    // host its staging ring (prepare_vision_tower).
     try {
-      const bool host = load.vision_residency == IGNIS_VISION_RESIDENCY_HOST;
-      std::size_t tensors = 0;
-      std::size_t in_host = 0;
-      visit_vision_stages(model->vision, [&](std::size_t, const ninfer::Weight &w) {
-        ++tensors;
-        in_host += in_host_memory(w.qdata) ? 1 : 0;
-      });
-      if (in_host != (host ? tensors : 0)) {
-        throw std::runtime_error(std::string("the vision residency is ") + (host ? "host" : "device") + " but " +
-                                 std::to_string(in_host) + " of the tower's " + std::to_string(tensors) +
-                                 " tensors are bound in host memory: bind the tower where the residency puts it");
-      }
-      if (host) {
-        VisionStaging &staging = model->vision_staging;
-        staging.slot_bytes = ignis_vision_staging_slot_bytes(model->vision);
-        ignis_vision_staging_check(model->vision, staging.slot_bytes);
-        // GitHub #415: the merger writes each host-mapped pool page through a
-        // device page in a slot of the ring (vision_encode.cu).
-        if (model->vision_pool.page_bytes > staging.slot_bytes) {
-          throw std::runtime_error("an embedding pool page of " + std::to_string(model->vision_pool.page_bytes) +
-                                   " bytes does not fit a staging slot of " + std::to_string(staging.slot_bytes));
-        }
-        const auto event = [](cudaEvent_t &e) {
-          if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
-            throw std::runtime_error("creating a staging event failed");
-          }
-        };
-        event(staging.head);
-        for (std::size_t slot = 0; slot < IGNIS_VISION_STAGING_SLOTS; ++slot) {
-          event(staging.copied[slot]);
-          event(staging.consumed[slot]);
-        }
-        if (cudaStreamCreateWithFlags(&staging.copy, cudaStreamNonBlocking) != cudaSuccess) {
-          staging.copy = nullptr;
-          throw std::runtime_error("creating the staging copy stream failed");
-        }
-      }
+      prepare_vision_tower(*model, load.vision_residency == IGNIS_VISION_RESIDENCY_HOST);
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: the vision tower's residency: ") + e.what());
       cudaStreamDestroy(model->stream);
@@ -2362,6 +2527,13 @@ extern "C" int32_t ignis_model_stats(const struct ignis_model *model,
   out_stats->vision_reserved_bytes = model->vision_reserved_bytes();
   out_stats->reserved = model->flash_next ? ignis::flash_next::reserved(*model) : reserved_of(*model);
   return 0;
+}
+
+extern "C" uint32_t ignis_model_vision_item_max_tokens(const struct ignis_model *model) {
+  if (model == nullptr || model->vision_max_tokens == 0) {
+    return 0;
+  }
+  return std::min(model->vision_item_max_tokens, model->max_context_tokens);
 }
 
 extern "C" uint32_t ignis_model_gdn_prefill(const struct ignis_model *model) {

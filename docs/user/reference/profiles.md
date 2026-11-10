@@ -30,7 +30,7 @@ A profile follows the card's memory, not its generation, and what a card loads f
 | [`spec.decode_lanes`](configuration.md#specdecode_lanes) | Qwen3.8-27B | `2` |
 | [`spec.draft_head`](configuration.md#specdraft_head) | Qwen3.8-27B | `auto` |
 | [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-27B | `7` |
-| [`vision.enabled`](configuration.md#visionenabled) | every model | `true` |
+| [`vision.enabled`](configuration.md#visionenabled) | Qwen3.8-27B | `true` |
 | [`vision.max_tokens`](configuration.md#visionmax_tokens) | every model | `4096` |
 | [`vision.residency`](configuration.md#visionresidency) | every model | `host` |
 | [`vram.headroom_bytes`](configuration.md#vramheadroom_bytes) | Qwen3.8-27B | `1200M` |
@@ -48,7 +48,7 @@ A profile follows the card's memory, not its generation, and what a card loads f
 | [`reuse.retained_device`](configuration.md#reuseretained_device) | Qwen3.8-27B | `2` |
 | [`spec.backend`](configuration.md#specbackend) | Qwen3.8-27B | `dflash2` |
 | [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-27B | `7` |
-| [`vision.enabled`](configuration.md#visionenabled) | every model | `true` |
+| [`vision.enabled`](configuration.md#visionenabled) | Qwen3.8-27B | `true` |
 | [`vision.residency`](configuration.md#visionresidency) | every model | `host` |
 | [`vram.headroom_bytes`](configuration.md#vramheadroom_bytes) | Qwen3.8-27B | `1200M` |
 
@@ -65,7 +65,7 @@ A profile follows the card's memory, not its generation, and what a card loads f
 | [`spec.backend`](configuration.md#specbackend) | Qwen3.8-27B | `dflash2` |
 | [`spec.decode_lanes`](configuration.md#specdecode_lanes) | Qwen3.8-Flash-Next | `3` |
 | [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-27B | `7` |
-| [`vision.enabled`](configuration.md#visionenabled) | every model | `true` |
+| [`vision.enabled`](configuration.md#visionenabled) | Qwen3.8-27B | `true` |
 | [`vision.residency`](configuration.md#visionresidency) | every model | `host` |
 | [`vram.headroom_bytes`](configuration.md#vramheadroom_bytes) | Qwen3.8-27B | `1200M` |
 | [`vram.headroom_bytes`](configuration.md#vramheadroom_bytes) | every model | `1536M` |
@@ -87,5 +87,5 @@ A profile follows the card's memory, not its generation, and what a card loads f
 | [`spec.decode_lanes`](configuration.md#specdecode_lanes) | Qwen3.8-Flash-Next | `8` |
 | [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-27B | `7` |
 | [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-Flash-Next | `3` |
-| [`vision.enabled`](configuration.md#visionenabled) | every model | `true` |
+| [`vision.enabled`](configuration.md#visionenabled) | Qwen3.8-27B | `true` |
 | [`vision.residency`](configuration.md#visionresidency) | every model | `device` |

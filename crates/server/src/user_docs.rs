@@ -502,7 +502,7 @@ mod tests {
     fn the_built_in_models_page_links_each_entrys_license() {
         let page = models();
         assert!(page.contains("| License |"), "{page}");
-        assert!(page.contains("[`qwen-community-1.0`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/8d94db83cd8e58d6be31e796723e5e35b960638c/LICENSE)"));
+        assert!(page.contains("[`qwen-community-1.0`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/6457921d4e2d4869452b373053b0374381046ba2/LICENSE)"));
         assert!(page.contains("[`openmdw-1.1`]"));
     }
 

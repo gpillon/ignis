@@ -513,6 +513,17 @@ target_include_directories(ignis_kernel_vision_workspace_test
 target_link_libraries(ignis_kernel_vision_workspace_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_vision_workspace_test COMMAND ignis_kernel_vision_workspace_test)
 
+# GitHub #557 (ADR 0087): OURS -- the media encode at both text models' merger widths, 2,560
+# (Flash-Next) and 5,120 (the 27B): every linear of an encode routed at every width it runs, for
+# every item up to 32,768 merged tokens (host-only, `--cases routes`), and ignis_media_encode end to
+# end through a no-layer load of each width, the companion's tower in its stored formats under each
+# vision residency, against fp64 and host against device bit for bit. GPU (ADR 0006: no
+# SKIP_RETURN_CODE); not sm120a-only, the tower's and the merger's routes build for every target.
+add_executable(ignis_kernel_media_encode_test test_media_encode.cu)
+target_include_directories(ignis_kernel_media_encode_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_media_encode_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_media_encode_test COMMAND ignis_kernel_media_encode_test)
+
 # GitHub #296 / #335: OURS -- the GQA attention's arena: ignis's prompt
 # attention's, flat in the context past one band and at least 1.0e9 bytes
 # under A1's at 524,288 keys (spec 27b-16gb/03 acceptance 1), and the vendored
@@ -840,7 +851,9 @@ add_test(NAME ignis_kernel_flash_next_embed_head_test COMMAND ignis_kernel_flash
 # ADR 0059 (spec rope-scaling/02): the two rope sites (qsa.cu prepare_kernel, indexer.cu rope_row)
 # under a factor-4 YaRN table up to position 1,048,575, and the indexer's selection over it,
 # against a host restatement. GPU.
-foreach(name IN ITEMS gdn qsa side_branch verify moe_rows rope)
+# GitHub #564: the MTP head's combine takes the vision rows an image's placeholders took, bit for
+# bit the entries of the ids those rows embed, from a VRAM and a mapped host page. GPU.
+foreach(name IN ITEMS gdn qsa side_branch verify moe_rows rope mtp)
   add_executable(ignis_kernel_flash_next_${name}_test test_flash_next_${name}.cu)
   target_include_directories(ignis_kernel_flash_next_${name}_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
@@ -924,6 +937,16 @@ target_compile_definitions(ignis_kernel_flash_next_indexer_test PRIVATE
   IGNIS_FLASH_NEXT_INDEXER_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next_indexer/indexer_ref.bin")
 target_link_libraries(ignis_kernel_flash_next_indexer_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_flash_next_indexer_test COMMAND ignis_kernel_flash_next_indexer_test)
+# GitHub #558 (spec #555): OURS -- the attention's and the indexer's rotations over prompts with
+# images (three-axis positions, decode at the rope delta, a block key at its first token's axes
+# across calls through its AxisRecord) against the checkpoint's own transformers code, recorded once
+# on CPU by fixtures/flash_next_mrope/record_mrope.py. GPU, same no-SKIP_RETURN_CODE rule (ADR 0006).
+add_executable(ignis_kernel_flash_next_mrope_test test_flash_next_mrope.cu)
+target_include_directories(ignis_kernel_flash_next_mrope_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_definitions(ignis_kernel_flash_next_mrope_test PRIVATE
+  IGNIS_FLASH_NEXT_MROPE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/flash_next_mrope/mrope_ref.bin")
+target_link_libraries(ignis_kernel_flash_next_mrope_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_flash_next_mrope_test COMMAND ignis_kernel_flash_next_mrope_test)
 foreach(name IN ITEMS sparse_attention sparse_attention_hq)
   add_executable(ignis_kernel_flash_next_${name}_test test_flash_next_${name}.cu)
   target_link_libraries(ignis_kernel_flash_next_${name}_test PRIVATE ignis_kernel ignis_vendor)

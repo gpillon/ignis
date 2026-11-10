@@ -6,7 +6,9 @@
 // real geometry (48 layers), carrying no planes: the binder only reads names,
 // formats and shapes. A complete set binds and every weight lands where the
 // program reads it; a linear re-converted to BF16 binds as BF16; a missing,
-// extra, mis-shaped or mis-formatted tensor is refused by name.
+// extra, mis-shaped or mis-formatted tensor is refused by name. Through the
+// load ABI, GitHub #557: a vision plan binds the vision companion's tower
+// beside the trunk and holds its encode in the prefill scratch.
 //
 // Host-only. ADR 0006: no SKIP_RETURN_CODE.
 
@@ -15,7 +17,9 @@
 
 #include "ignis_model.h"
 #include "ignis_seq.h"
+#include "model_internal.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -178,6 +182,90 @@ std::size_t index_of(const std::vector<Named> &named, const std::string &name) {
   return named.size();
 }
 
+// Spec flash-next/07: the MTP head's 29 tensors (its companion's `mtp.*`): an attention layer's,
+// named as layer 3's under `mtp.layers.0.`, its two input norms and projections, and its mixer.
+std::vector<Named> mtp_head_tensors() {
+  std::vector<Named> out{
+      {"mtp.fc_embedding.weight", {H, H}, true},
+      {"mtp.fc_hidden.weight", {H, H}, true},
+      {"mtp.pre_fc_norm_embedding.weight", {H}, false},
+      {"mtp.pre_fc_norm_hidden.weight", {HC}, false},
+      {"mtp.hyper_connection_mixer.hc_norm.weight", {HC}, false},
+      {"mtp.hyper_connection_mixer.input_mix_weight_down.weight", {RANK, HC}, true},
+      {"mtp.hyper_connection_mixer.input_mix_weight_up.weight", {HC, RANK}, true},
+  };
+  const std::string layer = "layers.3.";
+  for (const Named &t : flash_next_tensors()) {
+    if (t.name.compare(0, layer.size(), layer) == 0) {
+      out.push_back({"mtp.layers.0." + t.name.substr(layer.size()), t.shape, t.linear});
+    }
+  }
+  return out;
+}
+
+// GitHub #557 (ADR 0087): the vision companion's tower, the 27B's 333
+// `vision/*` tensors with the merger writing Flash-Next's 2,560 rows, each in
+// its stored format (every matrix W8 since GitHub #556, BF16 the rest) with
+// about its stored bytes: row-split rows of K padded to 128, an F16 scale per
+// group. The plan reads no plane.
+struct TowerTensor {
+  std::string name;
+  std::vector<int32_t> shape;
+  int32_t qtype;
+};
+
+std::vector<TowerTensor> vision_tower() {
+  const int32_t w8 = IGNIS_QTYPE_W8G32_F16S, bf16 = IGNIS_QTYPE_BF16_CTRL;
+  std::vector<TowerTensor> t{{"vision/patch_embedding", {1152, 1536}, w8},
+                             {"vision/patch_embedding_bias", {1152}, bf16},
+                             {"vision/position_embedding", {2304, 1152}, bf16}};
+  for (int b = 0; b < 27; ++b) {
+    const std::string p = "vision/layers/" + std::to_string(b) + "/";
+    for (const TowerTensor &n : std::vector<TowerTensor>{
+             {"attention/qkv", {3456, 1152}, w8},  {"attention/qkv_bias", {3456}, bf16},
+             {"attention/output", {1152, 1152}, w8}, {"attention/output_bias", {1152}, bf16},
+             {"mlp/fc1", {4304, 1152}, w8},       {"mlp/fc1_bias", {4304}, bf16},
+             {"mlp/fc2", {1152, 4304}, w8},       {"mlp/fc2_bias", {1152}, bf16},
+             {"norm1/weight", {1152}, bf16},      {"norm1/bias", {1152}, bf16},
+             {"norm2/weight", {1152}, bf16},      {"norm2/bias", {1152}, bf16}}) {
+      t.push_back({p + n.name, n.shape, n.qtype});
+    }
+  }
+  t.push_back({"vision/merger/fc1", {4608, 4608}, w8});
+  t.push_back({"vision/merger/fc1_bias", {4608}, bf16});
+  t.push_back({"vision/merger/fc2", {H, 4608}, w8});
+  t.push_back({"vision/merger/fc2_bias", {H}, bf16});
+  t.push_back({"vision/merger/norm/weight", {1152}, bf16});
+  t.push_back({"vision/merger/norm/bias", {1152}, bf16});
+  return t;
+}
+
+std::vector<ignis_bound_tensor> tower_descriptors(const std::vector<TowerTensor> &tower) {
+  std::vector<ignis_bound_tensor> out;
+  for (const TowerTensor &n : tower) {
+    ignis_bound_tensor t{};
+    t.name = n.name.c_str();
+    t.qtype = n.qtype;
+    t.layout = n.qtype == IGNIS_QTYPE_BF16_CTRL ? IGNIS_LAYOUT_CONTIGUOUS : IGNIS_LAYOUT_ROW_SPLIT;
+    t.ndim = static_cast<uint32_t>(n.shape.size());
+    for (std::size_t d = 0; d < 4; ++d) {
+      t.shape[d] = d < n.shape.size() ? n.shape[d] : 1;
+      t.padded_shape[d] = t.shape[d];
+    }
+    const uint64_t rows = static_cast<uint64_t>(n.shape[0]);
+    const uint64_t k = n.shape.size() > 1 ? (static_cast<uint64_t>(n.shape[1]) + 127) / 128 * 128 : 1;
+    switch (n.qtype) {
+      case IGNIS_QTYPE_Q4G64_F16S: t.bytes = rows * (k / 2 + k / 64 * 2); break;
+      case IGNIS_QTYPE_Q5G64_F16S: t.bytes = rows * (k * 5 / 8 + k / 64 * 2); break;
+      case IGNIS_QTYPE_Q6G64_F16S: t.bytes = rows * (k * 6 / 8 + k / 64 * 2); break;
+      case IGNIS_QTYPE_W8G32_F16S: t.bytes = rows * (k + k / 32 * 2); break;
+      default: t.bytes = rows * (n.shape.size() > 1 ? static_cast<uint64_t>(n.shape[1]) : 1) * 2; break;
+    }
+    out.push_back(t);
+  }
+  return out;
+}
+
 }  // namespace
 
 int main() {
@@ -313,12 +401,178 @@ int main() {
     const std::string unresident = ignis_model_last_error();
     check(loaded != 0 && model == nullptr && unresident.find("needs its expert residency") != std::string::npos,
           "a load without its residency is refused by name: got \"" + unresident + "\"");
+    // GitHub #557: vision on a Flash-Next load plans its embedding pool, as the 27B's: floored at
+    // the envelope's own output (8,192 columns of 2,560 BF16, 64 pages of 128 columns) and rounded
+    // up to whole pages, in VRAM under the device residency and none of it under the host's.
+    // GitHub #558 (ADR 0087): and nothing else -- the forward's vision inputs ride in memory the
+    // text load reserves (below). The attention readouts stay the 27B's.
+    check(plan(nullptr) == "(planned)", "the text load plans again");
+    const uint64_t text_activations = out.activation_bytes;
+    const uint64_t text_workspace = out.workspace_bytes;
     ignis_model_load_options vision{};
     vision.size = sizeof(vision);
     vision.vision_max_tokens = 8192;
-    const std::string refused = plan(&vision);
-    check(refused.find("Qwen3.8-Flash-Next has no vision or attention readouts") != std::string::npos,
-          "vision on a Flash-Next load is refused by name: got \"" + refused + "\"");
+    // The tower is the vision companion's (ADR 0087): a vision plan without
+    // it is refused naming its first tensor, and a text plan handed it
+    // refuses it as an extra.
+    const std::string towerless = plan(&vision);
+    check(towerless.find("missing bound tensor: vision/patch_embedding") != std::string::npos,
+          "a vision plan without the companion's tower is refused by name: got \"" + towerless + "\"");
+    const std::vector<TowerTensor> tower = vision_tower();
+    const std::vector<ignis_bound_tensor> text_tensors = tensors;
+    for (const ignis_bound_tensor &t : tower_descriptors(tower)) {
+      tensors.push_back(t);
+    }
+    const std::string unasked = plan(nullptr);
+    check(unasked.find("extra bound tensor: vision/") != std::string::npos,
+          "a text plan handed the tower refuses it: got \"" + unasked + "\"");
+    const std::string pooled = plan(&vision);
+    check(pooled == "(planned)" && out.media_embedding_bytes == 41943040 && out.activation_bytes == text_activations,
+          "vision on a Flash-Next load plans the envelope's pool and no other byte: got \"" + pooled + "\", " +
+              std::to_string(out.media_embedding_bytes) + " pool bytes, activations " +
+              std::to_string(out.activation_bytes) + " against " + std::to_string(text_activations));
+    vision.vision_embedding_pool_bytes = 50000000;
+    const std::string asked = plan(&vision);
+    check(asked == "(planned)" && out.media_embedding_bytes == 50462720,
+          "a pool asked past the floor is rounded up to whole pages: got \"" + asked + "\", " +
+              std::to_string(out.media_embedding_bytes));
+    vision.vision_residency = IGNIS_VISION_RESIDENCY_HOST;
+    const std::string hosted = plan(&vision);
+    check(hosted == "(planned)" && out.media_embedding_bytes == 0 && out.activation_bytes == text_activations,
+          "a host-resident pool leaves the VRAM plan: got \"" + hosted + "\", " +
+              std::to_string(out.media_embedding_bytes));
+    // GitHub #558 (ADR 0087): a vision load reserves nothing a text load does not -- a chunk's
+    // three axes and media rows ride in the decode graph scratch, a round's rope deltas in its
+    // positions' alignment, the verify round's axis records in the prefill scratch -- so on the
+    // RTX 5090 profile's settings (8,192-token chunks, 589,824 tokens of context, three lanes,
+    // hq-e8-2b), with the MTP head drafting 3 and without, every line of a vision load is the text
+    // load's but a VRAM-resident embedding pool: the plan leaves the expert cache the same bytes.
+    {
+      const std::vector<Named> head_named = mtp_head_tensors();
+      const std::vector<ignis_bound_tensor> head = descriptors(head_named);
+      const auto lines = [&](bool mtp, bool with_vision, uint32_t residency, ignis_model_reservations *r) {
+        std::vector<ignis_bound_tensor> set = text_tensors;
+        if (mtp) set.insert(set.end(), head.begin(), head.end());
+        if (with_vision) {
+          for (const ignis_bound_tensor &t : tower_descriptors(tower)) set.push_back(t);
+        }
+        ignis_model_load_options o{};
+        o.size = sizeof(o);
+        o.decode_lanes = 3;
+        if (mtp) {
+          o.speculative_backend = IGNIS_SPECULATIVE_MTP;
+          o.draft_tokens = 3;
+        }
+        if (with_vision) {
+          o.vision_max_tokens = 32768;
+          o.vision_residency = residency;
+        }
+        *r = ignis_model_reservations{};
+        const int32_t rc = ignis_model_plan_reservations(set.data(), set.size(), &topology, 8192, 589824,
+                                                         IGNIS_KV_FORMAT_HQ_E8_2B, &o, r);
+        return rc == 0 ? std::string("(planned)") : std::string(ignis_model_last_error());
+      };
+      for (const bool mtp : {false, true}) {
+        ignis_model_reservations text{}, host{}, device{};
+        const std::string a = lines(mtp, false, 0, &text);
+        const std::string b = lines(mtp, true, IGNIS_VISION_RESIDENCY_HOST, &host);
+        const std::string c = lines(mtp, true, IGNIS_VISION_RESIDENCY_DEVICE, &device);
+        const auto same = [&](const ignis_model_reservations &v) {
+          return v.workspace_bytes == text.workspace_bytes && v.sampling_bytes == text.sampling_bytes &&
+                 v.decode_graph_bytes == text.decode_graph_bytes && v.activation_bytes == text.activation_bytes &&
+                 v.verify_round_bytes == text.verify_round_bytes && v.drafter_round_bytes == text.drafter_round_bytes;
+        };
+        const std::string at = std::string(mtp ? "MTP" : "no speculation") + " at the RTX 5090's settings";
+        check(a == "(planned)" && b == "(planned)" && c == "(planned)",
+              at + ": planned: \"" + a + "\", \"" + b + "\", \"" + c + "\"");
+        check(same(host) && host.media_embedding_bytes == 0,
+              at + ": a host vision load plans every line of the text load's: activations " +
+                  std::to_string(host.activation_bytes) + " against " + std::to_string(text.activation_bytes) +
+                  ", decode graph " + std::to_string(host.decode_graph_bytes) + " against " +
+                  std::to_string(text.decode_graph_bytes) + ", verify round " +
+                  std::to_string(host.verify_round_bytes) + " against " + std::to_string(text.verify_round_bytes));
+        // The pool of a 32,768-token envelope at 2,560 BF16 columns: 256 pages of 128.
+        check(same(device) && device.media_embedding_bytes == 167772160,
+              at + ": a device vision load adds its embedding pool alone: " +
+                  std::to_string(device.media_embedding_bytes));
+        check(!mtp || text.verify_round_bytes > 0, at + ": the MTP load plans its verify round");
+        std::printf("  %s: workspace %llu, decode graph %llu, activations %llu, verify round %llu bytes, "
+                    "vision on or off\n",
+                    at.c_str(), static_cast<unsigned long long>(text.workspace_bytes),
+                    static_cast<unsigned long long>(text.decode_graph_bytes),
+                    static_cast<unsigned long long>(text.activation_bytes),
+                    static_cast<unsigned long long>(text.verify_round_bytes));
+      }
+    }
+    // GitHub #557, #558 (ADR 0087): the encode takes no VRAM of its own. Its
+    // share -- the encoder's workspace for one item, and under the host
+    // residency the tower's three staging slots -- is held by the prefill
+    // scratch the text sizes, whose line does not move, and by the expert
+    // staging ring the plan places, idle between forwards; the item bound is
+    // the largest item that fits there, at most the one asked for. With no
+    // ring (a card that holds every expert) the scratch alone bounds it, and a
+    // host tower's slots leave it no larger. Printed for the plan's record.
+    uint32_t item = 0;
+    const auto item_bound = [&](const ignis_model_load_options *options, uint64_t ring = 0, uint32_t chunk = 8192) {
+      item = 0;
+      const int32_t rc = ignis_model_plan_vision_item_max_tokens(tensors.data(), tensors.size(), &topology, chunk,
+                                                                 131072, IGNIS_KV_FORMAT_HQ_E8_2B, options, ring,
+                                                                 &item);
+      return rc == 0 ? std::string("(planned)") : std::string(ignis_model_last_error());
+    };
+    vision.vision_embedding_pool_bytes = 0;
+    // The envelope at its default (32,768 merged tokens), as a served load has it: the 8,192 asked
+    // above for the pool's floor would bound every item below the processor's largest.
+    vision.vision_max_tokens = 32768;
+    vision.vision_item_max_tokens = 16384;
+    uint32_t bounds[2] = {0, 0};
+    for (const uint32_t residency : {IGNIS_VISION_RESIDENCY_DEVICE, IGNIS_VISION_RESIDENCY_HOST}) {
+      vision.vision_residency = residency;
+      const std::string planned = plan(&vision);
+      check(planned == "(planned)" && out.workspace_bytes == text_workspace,
+            "the encode is held by the text's prefill scratch, residency " + std::to_string(residency) + ": got \"" +
+                planned + "\", workspace " + std::to_string(out.workspace_bytes) + " against " +
+                std::to_string(text_workspace));
+      const std::string bounded = item_bound(&vision);
+      const auto t = static_cast<std::int32_t>(item);
+      const std::size_t workspace = item == 0 ? 0 : ignis_vision_workspace_bytes(t, std::min(t, kVisionMaxSegments));
+      check(bounded == "(planned)" && item > 0 && item <= 16384 && workspace <= text_workspace,
+            "the item bound is what the prefill scratch holds, residency " + std::to_string(residency) + ": got \"" +
+                bounded + "\", " + std::to_string(item) + " tokens");
+      bounds[residency] = item;
+      std::printf("  item bound, residency %u: %u merged tokens in a %llu-byte prefill scratch\n", residency, item,
+                  static_cast<unsigned long long>(text_workspace));
+    }
+    check(bounds[IGNIS_VISION_RESIDENCY_HOST] <= bounds[IGNIS_VISION_RESIDENCY_DEVICE],
+          "a staged tower's slots leave the item no larger");
+    // ADR 0087's RTX 5090 ring (1,574,895,616 bytes at the 2026-11-09 start)
+    // holds the processor's largest item under either residency, where a
+    // 1,024-token chunk's scratch alone holds no larger one.
+    constexpr uint64_t kRtx5090Ring = 1574895616;
+    for (const uint32_t residency : {IGNIS_VISION_RESIDENCY_DEVICE, IGNIS_VISION_RESIDENCY_HOST}) {
+      vision.vision_residency = residency;
+      const std::string alone = item_bound(&vision, 0, 1024);
+      const uint32_t scratch_alone = item;
+      const std::string lent = item_bound(&vision, kRtx5090Ring, 1024);
+      check(alone == "(planned)" && lent == "(planned)" && item == 16384 && scratch_alone <= item,
+            "the ring lends a 1,024-token chunk's encode the largest item, residency " + std::to_string(residency) +
+                ": got \"" + alone + "\", \"" + lent + "\", " + std::to_string(scratch_alone) + " then " +
+                std::to_string(item) + " tokens");
+      std::printf("  item bound at a 1,024-token chunk, residency %u: %u merged tokens in its prefill scratch alone, "
+                  "%u with the RTX 5090's expert staging ring\n",
+                  residency, scratch_alone, item);
+    }
+    vision.vision_residency = IGNIS_VISION_RESIDENCY_HOST;
+    vision.vision_item_max_tokens = 64;
+    check(item_bound(&vision) == "(planned)" && item == 64, "an item bound the scratch holds is kept");
+    tensors = text_tensors;
+    check(item_bound(nullptr) == "(planned)" && item == 0, "no vision, no item bound");
+    ignis_model_load_options readouts{};
+    readouts.size = sizeof(readouts);
+    readouts.attention_text_max_keys = 4096;
+    const std::string refused = plan(&readouts);
+    check(refused.find("Qwen3.8-Flash-Next has no attention readouts") != std::string::npos,
+          "the attention readouts on a Flash-Next load are refused by name: got \"" + refused + "\"");
     // GitHub #335: the prompt attention's precision is the 27B's; Flash-Next's QSA has no band.
     ignis_model_load_options fp16{};
     fp16.size = sizeof(fp16);

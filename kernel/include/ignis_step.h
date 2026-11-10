@@ -321,7 +321,10 @@ struct ignis_prefill_options {
    * nothing over it, and leaves the sequence with no pending token. On
    * Flash-Next with MTP the head's entry at the span's last position is built
    * from this token (GitHub #520), as every other entry is from the span's
-   * next id; on the prompt's last span, from the draw. Such a span asks for
+   * next id; on the prompt's last span, from the draw. (GitHub #564: an entry
+   * whose token is an image placeholder embeds the column the trunk takes for
+   * it -- for this token, the media's next column when the span ends inside
+   * its item and this token is the same placeholder id.) Such a span asks for
    * no logits (`out_logits`, `out_span_logits`), no permitted set, no
    * reasoning redirect and no attention readout, and runs the chunked route:
    * the call is refused otherwise. A token outside the vocabulary is refused
@@ -409,6 +412,18 @@ uint32_t ignis_media_embedding_columns(const struct ignis_media_embedding *embed
  * ignis_media_last_error. */
 int32_t ignis_media_embedding_read(const struct ignis_media_embedding *embedding, void *out,
                                    uint64_t out_bytes);
+
+/* GitHub #557: read's inverse -- host `columns`, `columns_bytes` of them, a
+ * whole number of the model's `[hidden]` BF16 columns in column order, placed
+ * in the load's embedding pool as an embedding, where ignis_media_encode would
+ * write the tower's. Synchronous. What lets a test drive a multimodal prefill
+ * with columns it knows (a token's own embedding row over a placeholder, say)
+ * on a load whose tower is not bound. 0 and the handle,
+ * IGNIS_MEDIA_ENCODE_POOL_FULL as an encode's, or -1 with
+ * ignis_media_last_error. Test-only: no serving path places columns; its one
+ * caller is ignis-core's MediaEmbedding::place, which tests call. */
+int32_t ignis_media_embedding_place(struct ignis_model *model, const void *columns, uint64_t columns_bytes,
+                                    struct ignis_media_embedding **out_embedding);
 
 /* Release an embedding, freeing the load's reservation for the next item.
  * NULL is a no-op; the model must still be live. */

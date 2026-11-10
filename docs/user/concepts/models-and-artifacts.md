@@ -38,17 +38,22 @@ A few facts about an artifact are read from the file, never configured:
   written into another
   ([the KV cache and prompt reuse](kv-cache-and-prompt-reuse.md)).
 
-Flash-Next has a second container, the **MTP companion** (about 1 GB), that
-holds only the multi-token-prediction head. It records which main container it
-belongs to, and a mismatched pair is refused by name. It is bound only when MTP
-speculation is on ([speculative decoding](speculative-decoding.md)).
+Flash-Next has two **companion containers** beside the main one, each holding
+one optional part of the model. The **MTP companion** (about 1 GB) holds the
+multi-token-prediction head, and is bound only when MTP speculation is on
+([speculative decoding](speculative-decoding.md)). The **vision companion**
+(about 0.5 GB, from 0.11.0) holds the checkpoint's vision encoder: its tower, every
+matrix at 8 bits, and the merger that writes Flash-Next's 2,560-wide
+embeddings. Each records which main container it belongs to, and a mismatched
+pair is refused by name. The catalog downloads both with the model, whether
+or not the part is used.
 
 ## The families
 
 | Family | What it is | Artifact | Where it runs |
 |---|---|---|---|
 | Qwen3.8-27B | Dense, 64 layers: 16 full-attention layers and 48 linear-attention (GDN) layers | 18.1 GiB | Entirely in VRAM |
-| Qwen3.8-Flash-Next | 125B mixture of experts, 6B active per token, 48 layers, 512 routed experts per layer, 10 chosen per token | 67.8 GiB with the MTP companion | Trunk in VRAM; experts in a VRAM cache backed by host RAM |
+| Qwen3.8-Flash-Next | 125B mixture of experts, 6B active per token, 48 layers, 512 routed experts per layer, 10 chosen per token | 68.2 GiB with its two companions | Trunk in VRAM; experts in a VRAM cache backed by host RAM |
 | Qwen-Image-2.1-Turbo | Image model: a Qwen3-VL text encoder, a 7B diffusion transformer and a VAE | 15.6 GiB | Reached by a switch; never loaded beside a text model |
 
 The family is not the same thing as the model name. Several artifacts can
@@ -110,6 +115,12 @@ the machine it needs.
   28.8 GB. It is never put on the device: rows are read from NVMe through a
   RAM cache of hot rows (1 GiB by default), or the whole table is held in RAM
   when `--ngram-hot-bytes` covers it ([n-gram cache](../configuration/ngram-cache.md)).
+- **Images**: from 0.11.0, Flash-Next takes image input when `--vision-enabled` is set,
+  from a vision companion beside its artifact (482 MB, fetched with the
+  model). Under the default `host` residency the tower and its embedding pool
+  sit in host RAM and an image is encoded in the prefill scratch the text
+  already reserves, so a vision load keeps the expert cache of a text-only one
+  ([Flash-Next's vision](../configuration/vision.md#flash-next)).
 
 Because the two layouts differ so much, a few knobs exist for one family only.
 A field only one family takes is refused at start when set for the other, and
@@ -184,8 +195,8 @@ acceptance rate ([the uncensored variant](../guides/uncensored.md)).
 
 | | Qwen3.8-27B | Flash-Next on a 32 GB card | Flash-Next on 96 GB |
 |---|---|---|---|
-| Weights in VRAM | All but the token embedding; the vision tower only under `device` | Trunk, plus an expert cache | Trunk and every expert |
-| Weights in host RAM | Token embedding (1.35 GB); the vision tower (297 MB) under `host` | Experts (~38 GB), n-gram rows | No expert pool |
+| Weights in VRAM | All but the token embedding; the vision tower only under `device` | Trunk, plus an expert cache; the vision tower only under `device` | Trunk and every expert; the vision tower only under `device` |
+| Weights in host RAM | Token embedding (1.35 GB); the vision tower (297 MB) under `host` | Experts (~38 GB), n-gram rows; the vision tower (483 MB) under `host` | No expert pool; the vision tower under `host` |
 | The KV pool is | What VRAM leaves | Reserved first, 524,288 tokens | What VRAM leaves |
 | Decode is bound by | Streaming the weights | Copying experts over PCIe | Few PCIe copies |
 | Available RAM to start | ~18.6 GB under `make` defaults on a 32 GB card | ~46-47 GB | ~9 GB |

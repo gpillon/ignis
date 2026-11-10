@@ -4,10 +4,12 @@
 // indexer_entry.cu).
 //
 //   append_blocks  one warp per block the call completes: pool its four raw keys (the earlier
-//                  ones from the lane's tail), k_layernorm, rope at the block's first position,
+//                  ones from the lane's tail), k_layernorm, rope at the block's first token's
+//                  rotation (the batch's, or for an earlier call's token the block's AxisRecord),
 //                  write the key to its page.
-//   append_tail    one CTA per lane: the raw keys of the lane's incomplete last block.
-//   queries        one warp per (row, head): q_layernorm and rope at the row's position.
+//   append_tail    one CTA per lane: the raw keys of the lane's incomplete last block, and the
+//                  block's AxisRecord when this call begins it (axis_records).
+//   queries        one warp per (row, head): q_layernorm and rope at the row's rotation.
 //   score          a CTA per (row tile, 64 blocks): the tile's block keys and queries in shared
 //                  memory, sum_h relu(q_h . k) in fp32 per (row, block). A decode call (one token
 //                  per lane) takes score_decode instead: each key staged in 16-byte loads behind
@@ -52,9 +54,10 @@ __device__ __forceinline__ void rms_norm_row(float (&x)[4], const __nv_bfloat16 
 }
 
 // Rope on dims [0, 64) of a 128-wide row (pair i = (i, i + 32), held by lane i as x[0], x[1]), as
-// the attention's q and k rotate (rope.cuh).
-__device__ __forceinline__ void rope_row(float (&x)[4], const Rope &rope, int32_t position, int lane) {
-  rope_pair(x[0], x[1], rope, position, lane);
+// the attention's q and k rotate (rope.cuh): pair i at axis i % 3 of the row's three (GitHub #558),
+// one position when the three are equal.
+__device__ __forceinline__ void rope_row(float (&x)[4], const Rope &rope, const int32_t (&axes)[3], int lane) {
+  rope_pair(x[0], x[1], rope, axis_of(axes, lane), lane);
 }
 
 struct KeysArgs {
@@ -62,7 +65,7 @@ struct KeysArgs {
   Rope rope;
   const __nv_bfloat16 *k_norm;
   const int32_t *slots;
-  const int32_t *positions;
+  RotationSource source;  // its positions are also the KV positions
   const __nv_bfloat16 *qk;
   int32_t qk_stride;
   int32_t key_col;
@@ -74,11 +77,23 @@ __global__ void append_blocks_kernel(KeysArgs a) {
   const int seq = blockIdx.y;
   const int lane = threadIdx.x & 31;
   const int j = blockIdx.x * kKeysWarps + static_cast<int>(threadIdx.x >> 5);
-  const int32_t p0 = a.positions[seq];
+  const int32_t p0 = a.source.positions[seq];
   const int32_t end = p0 + a.tokens;
   const int32_t b = p0 / kCompress + j;  // blocks completed by this call: [p0 / 4, end / 4)
   if (b >= end / kCompress) return;
   const int32_t slot = a.slots[seq];
+  const int32_t first = b * kCompress;
+  __nv_bfloat16 *dst = block_key_slot(a.paged.block_keys, a.paged.block_tables, a.paged.logical_pages, slot, b);
+
+  // GitHub #558: the rotation of the block's first token -- this call's, or (a block an earlier
+  // call began) its record in the slot the key replaces below, read before any lane writes there
+  // (the norm's shuffles converge the warp in between).
+  int32_t axes[3] = {first, first, first};
+  if (first >= p0) {
+    rotation_axes(a.source, seq * a.tokens + (first - p0), axes);
+  } else if (a.paged.axis_records) {
+    read_axis_record(dst, first, axes);
+  }
 
   float x[4];
   for (int t = 0; t < kCompress; ++t) {
@@ -95,19 +110,14 @@ __global__ void append_blocks_kernel(KeysArgs a) {
 #pragma unroll
   for (int i = 0; i < 4; ++i) x[i] = round_bf16(x[i] / static_cast<float>(kCompress));
   rms_norm_row(x, a.k_norm, a.eps, lane);
-  rope_row(x, a.rope, b * kCompress, lane);
-
-  const int32_t first = b * kCompress;
-  const int32_t page = a.paged.block_tables[static_cast<size_t>(slot) * a.paged.logical_pages + first / kPageTokens];
-  __nv_bfloat16 *dst =
-      a.paged.block_keys + (static_cast<size_t>(page) * kBlocksPerPage + (first % kPageTokens) / kCompress) * kHeadDim;
+  rope_row(x, a.rope, axes, lane);
 #pragma unroll
   for (int i = 0; i < 4; ++i) dst[lane + 32 * i] = __float2bfloat16_rn(x[i]);
 }
 
 __global__ void append_tail_kernel(KeysArgs a) {
   const int seq = blockIdx.x;
-  const int32_t p0 = a.positions[seq];
+  const int32_t p0 = a.source.positions[seq];
   const int32_t end = p0 + a.tokens;
   const int32_t first = end / kCompress * kCompress;  // the incomplete last block's first position
   const int32_t slot = a.slots[seq];
@@ -115,6 +125,15 @@ __global__ void append_tail_kernel(KeysArgs a) {
     const __nv_bfloat16 *src = a.qk + static_cast<size_t>(seq * a.tokens + (pos - p0)) * a.qk_stride + a.key_col;
     a.paged.tail_keys[(static_cast<size_t>(slot) * (kCompress - 1) + (pos - first)) * kHeadDim + threadIdx.x] =
         src[threadIdx.x];
+  }
+  // GitHub #558: a block this call begins and leaves incomplete keeps its first token's rotation in
+  // its key slot (indexer.h AxisRecord); one an earlier call began keeps the record it has.
+  if (a.paged.axis_records && threadIdx.x == 0 && first < end && first >= p0) {
+    int32_t axes[3];
+    rotation_axes(a.source, seq * a.tokens + (first - p0), axes);
+    write_axis_record(
+        block_key_slot(a.paged.block_keys, a.paged.block_tables, a.paged.logical_pages, slot, first / kCompress),
+        first, axes);
   }
 }
 
@@ -124,6 +143,7 @@ struct RowArgs {
   int32_t tokens;
   int32_t row_begin;
   int32_t rows;
+  RotationSource source;  // GitHub #558: where the queries rotate
 };
 
 __device__ __forceinline__ int32_t row_seq(const RowArgs &r, int32_t local) { return (r.row_begin + local) / r.tokens; }
@@ -143,7 +163,9 @@ __global__ void queries_kernel(RowArgs r, Rope rope, const __nv_bfloat16 *q_norm
 #pragma unroll
   for (int i = 0; i < 4; ++i) x[i] = __bfloat162float(src[lane + 32 * i]);
   rms_norm_row(x, q_norm, eps, lane);
-  rope_row(x, rope, row_position(r, local), lane);
+  int32_t axes[3];
+  rotation_axes(r.source, r.row_begin + local, axes);
+  rope_row(x, rope, axes, lane);
   __nv_bfloat16 *dst = q + (static_cast<size_t>(local) * heads + h) * kHeadDim;
 #pragma unroll
   for (int i = 0; i < 4; ++i) dst[lane + 32 * i] = __float2bfloat16_rn(x[i]);
@@ -428,8 +450,25 @@ __global__ void __launch_bounds__(kSelectThreads) select_kernel(SelectArgs a) {
 
 Status launched(const char *what) { return cudaPeekAtLastError() == cudaSuccess ? nullptr : what; }
 
+RotationSource source_of(const Batch &batch) {
+  RotationSource s;
+  s.positions = batch.positions;
+  s.rope_positions = batch.rope_positions;
+  s.rope_deltas = batch.rope_deltas;
+  s.tokens = batch.tokens;
+  s.rows = batch.rows();
+  return s;
+}
+
 RowArgs row_args(const Batch &batch, int32_t row_begin, int32_t rows) {
-  return RowArgs{batch.slots, batch.positions, batch.tokens, row_begin, rows};
+  return RowArgs{batch.slots, batch.positions, batch.tokens, row_begin, rows, source_of(batch)};
+}
+
+// GitHub #557, #558: one rotation source at a time, as qsa::prepare refuses it.
+Status source_refusal(const Batch &batch) {
+  return batch.rope_positions != nullptr && batch.rope_deltas != nullptr
+             ? "indexer: a batch names both three axes and rope deltas"
+             : nullptr;
 }
 
 size_t align256(size_t v) { return (v + 255) / 256 * 256; }
@@ -459,11 +498,12 @@ Status append_keys(const Geometry &g, const Paged &paged, const Rope &rope, cons
                    const Batch &batch, const void *qk, cudaStream_t stream) {
   if (const Status st = check_geometry(g)) return st;
   if (batch.lanes <= 0 || batch.tokens <= 0) return "indexer: empty batch";
+  if (const Status st = source_refusal(batch)) return st;
   KeysArgs a{paged,
              rope,
              static_cast<const __nv_bfloat16 *>(k_norm),
              batch.slots,
-             batch.positions,
+             source_of(batch),
              static_cast<const __nv_bfloat16 *>(qk),
              (g.indexer_heads + g.indexer_kv_heads) * kHeadDim,
              g.indexer_heads * kHeadDim,
@@ -482,6 +522,7 @@ Status prepare_queries(const Geometry &g, const Rope &rope, const void *q_norm, 
                        cudaStream_t stream) {
   if (const Status st = check_geometry(g)) return st;
   if (rows <= 0) return nullptr;
+  if (const Status st = source_refusal(batch)) return st;
   queries_kernel<<<rows, g.indexer_heads * 32, 0, stream>>>(
       row_args(batch, row_begin, rows), rope, static_cast<const __nv_bfloat16 *>(q_norm),
       static_cast<const __nv_bfloat16 *>(qk), (g.indexer_heads + g.indexer_kv_heads) * kHeadDim, g.indexer_heads,

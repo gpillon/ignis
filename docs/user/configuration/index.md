@@ -31,8 +31,8 @@ for Qwen3.8-Flash-Next: `--qwen38flashnext-reuse-kv-host-pool-bytes 1G`,
 `IGNIS_QWEN38FLASHNEXT_REUSE_KV_HOST_POOL_BYTES`, or in the file
 `reuse: { qwen38flashnext: { kv_host_pool_bytes: 1G } }`. Within each source
 the family's value wins over the general one, and a model switch takes the
-target model's own. A field only one model has (`--vision-enabled`, the
-Flash-Next knobs) is refused at start when set for the other model, and
+target model's own. A field only one model has (`--model-prefill-attention`,
+the Flash-Next knobs) is refused at start when set for the other model, and
 dropped with a log line when a switch moves to the other model.
 
 **The config file.** JSON or YAML, named by `--config <path>` /

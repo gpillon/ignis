@@ -96,6 +96,8 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_w8_mma_r64_c128;
         case 4096:
             // ignis #320: the image model's merger and DeepStack fc2.
+        case 2560:
+            // ignis #557: Flash-Next's merger fc2 (its vision companion's), one call per pool page.
             if (t <= 4) { return launch_w8_simt_r8_c4; }
             if (t <= 16) { return launch_w8_simt_r8_c8; }
             return launch_w8_mma_r64_c128;

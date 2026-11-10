@@ -110,7 +110,8 @@ std::size_t combine_scratch_bytes(const Geometry &g, int32_t rows) {
 }
 
 int32_t combine(const Geometry &g, const MtpWeights &w, const Linear &embed, const int32_t *tokens,
-                const Batch &batch, const Buffers &b, ninfer::DeviceArena &scratch, cudaStream_t stream) {
+                const Batch &batch, const Buffers &b, ninfer::DeviceArena &scratch, cudaStream_t stream,
+                const std::vector<MediaRun> *media) {
   const int32_t rows = batch.rows();
   const auto r = static_cast<std::size_t>(rows);
   try {
@@ -122,6 +123,13 @@ int32_t combine(const Geometry &g, const MtpWeights &w, const Linear &embed, con
     auto *n_proj = static_cast<__nv_bfloat16 *>(scratch.alloc_bytes(r * g.residual_width() * 2).data);
     // The token embedding (fn_embed writes it into every stream; stream 0 is read).
     if (fn_embed(g, embed, tokens, rows, embedded, stream) != 0) return -1;
+    // GitHub #564: an entry whose token is an image placeholder takes the vision row the trunk
+    // took for it.
+    if (media != nullptr) {
+      for (const MediaRun &run : *media) {
+        if (fn_embed_columns(g, run.columns, run.rows, run.count, rows, embedded, stream) != 0) return -1;
+      }
+    }
     rms_kernel<<<rows, kThreads, 0, stream>>>(embedded, g.residual_width(),
                                               static_cast<const __nv_bfloat16 *>(w.norm_embedding), g.rms_norm_eps, 1,
                                               g.hidden, e, g.hidden);

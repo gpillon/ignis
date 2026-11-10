@@ -70,6 +70,8 @@ int32_t run_pass(ignis_model *model, FlashNextModel &fn, const Context &ctx, con
   batch.positions = positions;
   batch.max_visible = decode_max_visible(fn);
   batch.verify = &state.records;
+  // GitHub #557: a vision load's columns rotate at their positions plus their lane's rope delta.
+  batch.rope_deltas = fn.rope_deltas;
   if (forward(fn, ctx, batch, IGNIS_RESIDENCY_DECODE, scratch, stream, error) != 0) return -1;
   if (fn_head(fn.g, fn.weights->final_mixer, fn.weights->head, fn.residual->p, batch.rows(),
               model->sampling_decode_logits->p, scratch, stream) != 0) {
@@ -102,6 +104,8 @@ int32_t run_drafts(ignis_model *model, FlashNextModel &fn, const Context &ctx, c
   batch.positions = static_cast<const int32_t *>(fn.positions->p);
   batch.max_visible = decode_max_visible(fn);
   batch.verify = &state.records;
+  // GitHub #557: the head rotates where the trunk does (its vision rows are #564's).
+  batch.rope_deltas = fn.rope_deltas;
   auto *picks = static_cast<int32_t *>(state.picks->p);
   auto *chain_tokens = static_cast<int32_t *>(state.chain_tokens->p);
   auto *drafts = static_cast<int32_t *>(state.drafts_out->p);
@@ -126,7 +130,9 @@ int32_t run_drafts(ignis_model *model, FlashNextModel &fn, const Context &ctx, c
     *error = fn_last_error();
     return -1;
   }
-  if (k > 1 && verify::restore_head(state, sections, fn.g, width, window, batch.slots, batch.positions, stream, error) != 0) {
+  // GitHub #558: the head's section's axis record too, at the round's rotation (its rope deltas).
+  if (k > 1 && verify::restore_head(state, sections, fn.g, width, window, batch.slots, batch.positions, stream, error,
+                                    batch.rope_deltas) != 0) {
     return -1;
   }
   const std::size_t stack_bytes = static_cast<std::size_t>(lanes) * fn.g.residual_width() * 2;
@@ -137,6 +143,7 @@ int32_t run_drafts(ignis_model *model, FlashNextModel &fn, const Context &ctx, c
     chain.slots = batch.slots;
     chain.positions = static_cast<const int32_t *>(state.chain_positions->p) + (step - 1) * lanes;
     chain.max_visible = batch.max_visible;
+    chain.rope_deltas = batch.rope_deltas;
     if (cudaMemcpyAsync(fn.residual->p, state.chain_stack->p, stack_bytes, cudaMemcpyDeviceToDevice, stream) !=
         cudaSuccess) {
       *error = std::string("the MTP chain's stacks: ") + cudaGetErrorString(cudaGetLastError());
@@ -166,7 +173,8 @@ int32_t run_commit(ignis_model *model, FlashNextModel &fn, const Context &ctx, c
   if (verify::fold(state, sections, width, window, slots, model->stream, error) != 0) return -1;
   if (fn.mtp != nullptr && run_drafts(model, fn, ctx, sections, width, error) != 0) return -1;
   return verify::restore(state, sections, fn.g, width, window, slots, static_cast<const int32_t *>(fn.positions->p),
-                         model->stream, error);
+                         model->stream, error,
+                         fn.rope_deltas);
 }
 
 // Begins a capture, runs `body`, ends it and instantiates. A failure leaves *exec null.
@@ -235,6 +243,11 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
   const Geometry &g = fn.g;
   if (fn.verify == nullptr) return refuse("this Flash-Next load has no speculative decoding");
   verify::State &state = *fn.verify;
+  // GitHub #558 (ADR 0087): a vision load's round saves its axis records at the prefill scratch's
+  // base (finish_load), which only a prefill call or an encode takes, never during a round.
+  if (state.axis_records && model->scratch->used() != 0) {
+    return refuse("the prefill scratch, where a vision load's round keeps its axis records, is in use");
+  }
   const auto width = static_cast<uint32_t>(batch_size);
   const uint32_t k = state.window(width);
   if (options->speculative_window != k) {
@@ -250,7 +263,8 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
 
   std::vector<ninfer::ops::SamplingConfig> configs(batch_size);
   std::vector<int32_t> ids(rows, 0), slots(batch_size), positions(batch_size), extents(batch_size),
-      valid(batch_size), anchors(batch_size), drafts(static_cast<std::size_t>(width) * k, 0);
+      valid(batch_size), anchors(batch_size), drafts(static_cast<std::size_t>(width) * k, 0),
+      rope_deltas(batch_size);
   for (uint64_t i = 0; i < batch_size; ++i) {
     ignis_seq *seq = sequences[i];
     const std::string at = " at index " + std::to_string(i);
@@ -276,6 +290,8 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
     anchors[i] = seq->pending_token;
     slots[i] = seq->slot;
     positions[i] = static_cast<int32_t>(seq->position);
+    if (seq->rope_delta != 0 && !fn.vision()) return refuse("a sequence with a rope delta on a load without vision" + at);
+    rope_deltas[i] = seq->rope_delta;
     extents[i] = static_cast<int32_t>(extent);
     valid[i] = static_cast<int32_t>(extent + 1);
     for (uint32_t j = 0; j < columns; ++j) {
@@ -302,6 +318,7 @@ int32_t program_verify(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
             stage(fn.token_ids->p, ids.data(), rows * sizeof(int32_t), "the ids") &&
             stage(fn.slots->p, slots.data(), lane_bytes, "the slots") &&
             stage(fn.positions->p, positions.data(), lane_bytes, "the positions") &&
+            (!fn.vision() || stage(fn.rope_deltas, rope_deltas.data(), lane_bytes, "the rope deltas")) &&
             stage(fn.ngram_rows->p, options->ngram_rows, rows * row_bytes, "the n-gram rows") &&
             stage(state.valid_columns->p, valid.data(), lane_bytes, "the valid columns") &&
             stage(state.extents->p, extents.data(), lane_bytes, "the extents") &&

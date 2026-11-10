@@ -19,6 +19,24 @@ namespace ignis::flash_next {
 int32_t fn_embed(const Geometry &g, const Linear &embed, const int32_t *ids, int32_t rows,
                  void *residual, cudaStream_t stream);
 
+// GitHub #557: a media item's vision rows over its placeholders' embeddings
+// (transformers: inputs_embeds.masked_scatter(image_mask, image_embeds), before
+// the repeat into the streams): column i of `columns` (BF16 [count][hidden],
+// contiguous -- one run of an embedding pool page, in VRAM or mapped host
+// memory, read in place) into every stream of residual row `rows[i]` (DEVICE
+// [count], each in [0, residual_rows)). Every other row is left as it is.
+int32_t fn_embed_columns(const Geometry &g, const void *columns, const int32_t *rows, int32_t count,
+                         int32_t residual_rows, void *residual, cudaStream_t stream);
+
+// GitHub #557: one run of a pool page's media columns, fn_embed_columns' operands:
+// `count` contiguous BF16 [hidden] columns at `columns`, over the rows `rows`
+// (DEVICE [count]) -- a prefill chunk's, or (GitHub #564) the MTP head's entries'.
+struct MediaRun {
+  const void *columns = nullptr;
+  const int32_t *rows = nullptr;
+  int32_t count = 0;
+};
+
 // logits (BF16 [rows][vocab]) = lm_head(final_mix(residual)) for `rows`
 // residual rows (prefill passes each lane's last token only).
 int32_t fn_head(const Geometry &g, const HcWeights &final_mixer, const Linear &head,

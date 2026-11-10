@@ -107,4 +107,5 @@ memory of why ignis is built the way it is.
 | [0084](0084-ignis-stands-on-its-own.md) | ignis stands on its own | accepted | |
 | [0085](0085-on-blackwell-too-the-27bs-gdn-prefill-runs-ignis-own-kernels.md) | On Blackwell too, the 27B's GDN prefill runs ignis's own kernels | accepted | |
 | [0086](0086-the-builds-run-beside-the-tests-and-nothing-is-published-before-they-pass.md) | The builds run beside the tests, and nothing is published before they pass | accepted | |
-| [0087](0087-flash-nexts-vision-encoder-ships-in-a-companion-container-and-encodes-in-memory-its-prefill-already-reserves.md) | Flash-Next's vision encoder ships in a companion container and encodes in memory its prefill already reserves | proposed | |
+| [0087](0087-flash-nexts-vision-encoder-ships-in-a-companion-container-and-encodes-in-memory-its-prefill-already-reserves.md) | Flash-Next's vision encoder ships in a companion container and encodes in memory its prefill already reserves | accepted | |
+| [0088](0088-a-vendored-registry-that-lacks-a-case-ignis-needs-may-be-extended-or-rewritten-when-small.md) | A vendored registry that lacks a case ignis needs may be extended, or rewritten when it is small | accepted | |

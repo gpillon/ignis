@@ -31,6 +31,7 @@ use crate::{fail, NumericFormat, Object, Reader, ResourceEncoding, Result, Stora
 
 pub mod fixture;
 pub mod mtp;
+pub mod vision;
 
 /// The container identity's `model_id` for every Flash-Next artifact.
 pub const MODEL_ID: &str = "qwen3.8-flash-next";
@@ -38,6 +39,10 @@ pub const MODEL_ID: &str = "qwen3.8-flash-next";
 /// The MTP companion container's `model_id` (flash-next-layout.md §13.2): never the
 /// main container's, so neither binds as the other.
 pub const MTP_MODEL_ID: &str = "qwen3.8-flash-next-mtp";
+
+/// The vision companion container's `model_id` (flash-next-layout.md §14,
+/// ADR 0087): neither the main container's nor the MTP companion's.
+pub const VISION_MODEL_ID: &str = "qwen3.8-flash-next-vision";
 
 /// The MTP head's names keep the checkpoint's own prefix (flash-next-layout.md §13.3).
 pub const MTP_PREFIX: &str = "mtp.";
@@ -272,6 +277,36 @@ pub fn expert_name(layer: usize, expert: u64, projection: Projection) -> String 
 /// An MTP expert projection's object name (flash-next-layout.md §13.3).
 pub fn mtp_expert_name(expert: u64, projection: Projection) -> String {
     format!("{MTP_PREFIX}layers.0.mlp.experts.{expert}.{}", projection.suffix())
+}
+
+/// The pair pin of a companion container (flash-next-layout.md §13.2, §14):
+/// its sidecar's `pair.main` against the opened main container `main`. `Ok`
+/// when its `model_id`, `weights_id` and `content_hash` are the main
+/// container's, else the first field that differs, both values named;
+/// `companion` names the companion in the refusal (`MTP`, `vision`).
+pub(crate) fn check_companion_pair(sidecar: &serde_json::Value, main: &Reader, companion: &str) -> Result<()> {
+    let pair = sidecar
+        .pointer("/pair/main")
+        .ok_or_else(|| fail(format!("the {companion} companion's sidecar records no pair.main")))?;
+    let hash: String = main.content_hash().iter().map(|b| format!("{b:02x}")).collect();
+    let identity = main.identity();
+    for (field, actual) in [
+        ("model_id", identity.model_id.as_str()),
+        ("weights_id", identity.weights_id.as_str()),
+        ("content_hash", hash.as_str()),
+    ] {
+        let recorded = pair
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| fail(format!("the {companion} companion's pair.main records no {field}")))?;
+        if recorded != actual {
+            return Err(fail(format!(
+                "the {companion} companion is pinned to another main container: pair.main.{field} is {recorded}, \
+                 the main container's is {actual}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The bytes one expert projection of `projection`'s shape stores at `k`:

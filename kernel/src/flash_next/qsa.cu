@@ -53,12 +53,24 @@ struct PrepareArgs {
   const __nv_bfloat16 *q_norm;
   const __nv_bfloat16 *k_norm;
   const int32_t *positions;
+  // GitHub #557: the batch's rotation source, at most one (flash_next_internal.h's Batch).
+  const int32_t *rope_positions;
+  const int32_t *rope_deltas;
+  int32_t rows;
   int32_t tokens;
   float eps;
   const __nv_bfloat16 *qg;
   __nv_bfloat16 *q;
   __nv_bfloat16 *k;
 };
+
+// The position rope pair `pair` of row `row` rotates at: its axis's (pair % 3) under a span's three
+// axes, its position plus its lane's delta, or (every text call) its position.
+__device__ __forceinline__ int32_t rotation_position(const PrepareArgs &a, int32_t row, int pair) {
+  if (a.rope_positions != nullptr) return a.rope_positions[static_cast<int64_t>(pair % 3) * a.rows + row];
+  const int32_t position = row_position(a.positions, a.tokens, row);
+  return a.rope_deltas != nullptr ? position + a.rope_deltas[row / a.tokens] : position;
+}
 
 // One warp per (row, head) of the 24 query heads and the 2 key heads; lane l holds elements
 // l + 32 s, so rope pair (i, i + 32) is lane i's x[0], x[1].
@@ -81,7 +93,7 @@ __global__ void __launch_bounds__((kQHeads + kKvHeads) * 32) prepare_kernel(Prep
   const float r = 1.0F / sqrtf(warp_sum(ss) / static_cast<float>(kHeadDim) + a.eps);
 #pragma unroll
   for (int s = 0; s < 8; ++s) x[s] = round_bf16((x[s] * r) * (1.0F + __bfloat162float(w[s * 32 + lane])));
-  indexer::rope_pair(x[0], x[1], a.rope, row_position(a.positions, a.tokens, row), lane);
+  indexer::rope_pair(x[0], x[1], a.rope, rotation_position(a, row, lane), lane);
   __nv_bfloat16 *dst = is_q ? a.q + (static_cast<int64_t>(row) * kQHeads + head) * kHeadDim
                             : a.k + (static_cast<int64_t>(row) * kKvHeads + head) * kHeadDim;
 #pragma unroll
@@ -216,8 +228,12 @@ Status prepare(const Geometry &g, const indexer::Rope &rope, const void *q_norm,
                const Batch &batch, const __nv_bfloat16 *qg, __nv_bfloat16 *q, __nv_bfloat16 *k,
                cudaStream_t stream) {
   if (batch.rows() <= 0 || batch.positions == nullptr) return "qsa prepare: an empty batch or no positions";
+  if (batch.rope_positions != nullptr && batch.rope_deltas != nullptr) {
+    return "qsa prepare: a batch rotates at a span's three axes or at a rope delta, not both";
+  }
   PrepareArgs a{rope, static_cast<const __nv_bfloat16 *>(q_norm), static_cast<const __nv_bfloat16 *>(k_norm),
-                batch.positions, batch.tokens, g.rms_norm_eps, qg, q, k};
+                batch.positions, batch.rope_positions, batch.rope_deltas, batch.rows(), batch.tokens,
+                g.rms_norm_eps, qg, q, k};
   prepare_kernel<<<batch.rows(), (kQHeads + kKvHeads) * 32, 0, stream>>>(a);
   return launched("qsa prepare: launch failed");
 }

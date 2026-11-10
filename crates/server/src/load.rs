@@ -89,6 +89,10 @@ pub enum LoadError {
     /// The artifact's vision processor does not fit the model contract
     /// (`ignis.vision.processor_invalid`, GitHub #179).
     VisionProcessorInvalid(String),
+    /// Vision is on, and Flash-Next's vision companion is missing beside the
+    /// artifact or is not its own (`ignis.vision.companion_refused`, GitHub
+    /// #557, ADR 0087): the refusal names the file.
+    VisionCompanion(ignis_core::flash_next_vision::CompanionRefused),
     /// `generation_config.json` carries no `eos_token_id`
     /// (`ignis.model.eos_missing`): a backend that can never stop on EOS
     /// would run every request to its cap.
@@ -158,6 +162,7 @@ impl std::fmt::Display for LoadError {
             | Self::VisionProcessorInvalid(message)
             | Self::RouteUnsupported(message)
             | Self::LoadFailed(message) => write!(f, "{message}"),
+            Self::VisionCompanion(refusal) => write!(f, "{refusal}"),
             Self::HostPlan(refusal) => write!(f, "{refusal}"),
         }
     }
@@ -202,6 +207,9 @@ impl LoadError {
             Self::ThinkingInvalid(error) => tracing::error!(name: "ignis.config.thinking_invalid", %error, "{outcome}"),
             Self::VisionProcessorInvalid(error) => {
                 tracing::error!(name: "ignis.vision.processor_invalid", %error, "{outcome}")
+            }
+            Self::VisionCompanion(error) => {
+                tracing::error!(name: "ignis.vision.companion_refused", %artifact, %error, "{outcome}")
             }
             Self::EosMissing => tracing::error!(
                 name: "ignis.model.eos_missing",
@@ -315,6 +323,9 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
             }
         }
     }
+    // GitHub #557 (ADR 0087): before the checksum is read and before anything
+    // loads.
+    check_vision_companion(config, named, artifact)?;
     // The image model's container holds no text frontend (spec
     // image-model/01): it is verified, and its runner reads the rest.
     if named.map(ModelFamily::kind) == Some(ModelKind::Image) {
@@ -393,6 +404,29 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
     })
 }
 
+/// GitHub #557 (ADR 0087): Flash-Next sees with its vision companion's tower,
+/// so a load of `artifact`, of `family`, under `config` with vision on for
+/// Flash-Next is refused, naming the file, when the companion is not beside
+/// the artifact or is not its own -- held to it by its pair pin, its identity
+/// and the width its merger writes, against Flash-Next's hidden width
+/// ([`ignis_core::flash_next_vision::Companion::open`]). Nothing of the
+/// tower is read. Any other load asks for no companion. What a start's and
+/// a switch's prepare check, and what `POST /v1/models/switch` asks before
+/// it begins (GitHub #563).
+pub(crate) fn check_vision_companion(
+    config: &crate::config::Config,
+    family: Option<ModelFamily>,
+    artifact: &std::path::Path,
+) -> Result<(), LoadError> {
+    if family != Some(ModelFamily::FlashNext) || !fitted(config, ModelFamily::FlashNext).is_ok_and(|c| c.vision.is_some()) {
+        return Ok(());
+    }
+    let main = ignis_artifact::Reader::open(artifact).map_err(|e| LoadError::ArtifactInvalid(e.to_string()))?;
+    let geometry = ignis_artifact::flash_next::FlashNextGeometry::qwen38_flash_next();
+    let hidden = ignis_core::compute::ModelConfig::flash_next_from(&geometry).hidden;
+    ignis_core::flash_next_vision::Companion::open(artifact, &main, hidden).map(drop).map_err(LoadError::VisionCompanion)
+}
+
 /// The options fitted to `family` (spec config-v2/01): at start, its scoped
 /// values applied and anything the family cannot take refused; a switch
 /// hands over options it already fitted (`config::fit_to_family`, which
@@ -438,22 +472,22 @@ pub fn load_model(prepared: PreparedModel) -> Result<LoadedModel, LoadError> {
         return load_image_model(artifact, model, &config);
     };
     #[cfg(feature = "cuda")]
-    let (scheduler, reservations, max_context, adapted) = {
+    let (scheduler, reservations, max_context, adapted, vision) = {
         let eos = eos.ok_or(LoadError::EosMissing)?;
-        let (scheduler, reserved, max_context, adapted) =
+        let (scheduler, reserved, shape, adapted) =
             cuda_scheduler_for(&artifact, &model, family, eos, &config, item_bound, thinking_close)?;
-        (scheduler, Some(reserved), max_context, adapted)
+        (scheduler, Some(reserved), shape.max_context, adapted, shape.vision)
     };
     #[cfg(not(feature = "cuda"))]
-    let (scheduler, reservations, max_context, adapted) = {
+    let (scheduler, reservations, max_context, adapted, vision) = {
         let _ = (item_bound, thinking_close, eos);
         tracing::warn!(
             name: "ignis.model.mock_compute",
             "built without --features cuda — MockCompute despite --model-artifact/IGNIS_MODEL_ARTIFACT (the templated text is real, the completions are not)"
         );
-        (mock_scheduler(&model, config.default_max_tokens), None, config.max_context, String::new())
+        (mock_scheduler(&model, config.default_max_tokens), None, config.max_context, String::new(), config.vision)
     };
-    let (provider, acquirer) = serve_vision(provider, processor, &config, max_context);
+    let (provider, acquirer) = serve_vision(provider, processor, vision, &config, max_context);
     let (engine, driver) = start_engine(scheduler);
     let mut active = crate::ActiveModel::new(engine, Arc::new(provider))
         .with_driver(driver)
@@ -471,14 +505,17 @@ pub fn load_model(prepared: PreparedModel) -> Result<LoadedModel, LoadError> {
 /// the context the load runs, which its adaptation may have lowered from
 /// the configured one (ADR 0063 §3). So the processor's request budget and
 /// item bound are the envelope the leaf planned, never the configured
-/// context's.
+/// context's; `vision` is the load's, its item bound what the encoder holds
+/// (GitHub #557: Flash-Next's, in its prefill scratch, may be below the
+/// processor's).
 fn serve_vision(
     provider: crate::artifact_template::ArtifactTemplateProvider,
     processor: Option<ignis_artifact::vision::VisionProcessor>,
+    vision: Option<ignis_core::Vision>,
     config: &crate::config::Config,
     max_context: u32,
 ) -> (crate::artifact_template::ArtifactTemplateProvider, Option<Arc<crate::media::MediaAcquirer>>) {
-    let Some((processor, vision)) = processor.zip(config.vision) else {
+    let Some((processor, vision)) = processor.zip(vision) else {
         return (provider, None);
     };
     let processor = crate::media::processor_at(processor, vision, max_context);
@@ -590,9 +627,10 @@ fn cuda_image_runner(
 
 /// The GPU-backed scheduler for `artifact` (GitHub #61 / P1-25), logged as
 /// `ignis.model.loaded` with the shape it runs: the 27B's at the values its
-/// adaptation kept (ADR 0063 §3). Beside it, what the load reserved, the
-/// context it runs and the adaptations it took, as `ignis.runtime.vram_plan`
-/// spells them (empty on Flash-Next, which adapts nothing).
+/// adaptation kept (ADR 0063 §3), Flash-Next's at the item bound its encoder
+/// holds (GitHub #557). Beside it, what the load reserved, that shape and
+/// the adaptations it took, as `ignis.runtime.vram_plan` spells them (empty
+/// on Flash-Next, which adapts nothing).
 #[cfg(feature = "cuda")]
 fn cuda_scheduler_for(
     artifact: &std::path::Path,
@@ -602,7 +640,7 @@ fn cuda_scheduler_for(
     config: &crate::config::Config,
     vision_item_bound: Option<u64>,
     thinking_close: Option<Arc<ignis_core::thinking_budget::ThinkingClose>>,
-) -> Result<(Box<dyn ignis_core::Scheduler>, crate::metrics::LoadReservations, u32, String), LoadError> {
+) -> Result<(Box<dyn ignis_core::Scheduler>, crate::metrics::LoadReservations, EngineShape, String), LoadError> {
     let shape = load_shape(config, vision_item_bound);
     // GitHub #302: a Flash-Next artifact runs its own program and leaf.
     let loaded = match family {
@@ -615,7 +653,7 @@ fn cuda_scheduler_for(
             config.ngram_cache.clone(),
             &config.kv_disk_location,
         )
-        .map(|(scheduler, reserved)| (scheduler, reserved, shape, Vec::new()))
+        .map(|(scheduler, reserved, shape)| (scheduler, reserved, shape, Vec::new()))
         .map_err(|error| LoadError::from_flash_next(error, config)),
         ModelFamily::Qwen38_27b => crate::runtime::qwen27b_load(
             artifact,
@@ -671,7 +709,7 @@ fn cuda_scheduler_for(
         rope_scaling_setting = %config.settings().model.rope_scaling,
         "model loaded on the GPU"
     );
-    Ok((Box::new(scheduler), reserved, shape.max_context, crate::adaptation::steps_text(&adapted)))
+    Ok((Box::new(scheduler), reserved, shape, crate::adaptation::steps_text(&adapted)))
 }
 
 #[cfg(all(test, not(feature = "cuda")))]
@@ -899,5 +937,47 @@ mod tests {
         let flagged = message(&resolved(&["--vram-pinned-expert-bytes", "2G"]), FlashNextLoadError::PinnedExperts(refused));
         assert!(flagged.starts_with("`--vram-pinned-expert-bytes` asks for"), "{flagged}");
         assert_eq!(message(&resolved(&[]), FlashNextLoadError::from("no MTP head")), "no MTP head");
+    }
+
+    /// GitHub #557 (ADR 0087): a Flash-Next start with vision on is refused
+    /// before anything loads, naming the file, when its vision companion is
+    /// not beside the artifact or is not its own -- pinned to another main
+    /// container, or a merger of another width than Flash-Next's (the
+    /// fixture's tower writes 64 rows, which the pin and the identity let
+    /// through). With vision off nothing asks for the companion.
+    #[test]
+    fn a_flash_next_start_with_vision_refuses_a_missing_or_mismatched_companion_by_name() {
+        use ignis_artifact::packer::{sidecar_path, VISION_ARTIFACT_FILE_NAME};
+        use ignis_core::flash_next_vision::CompanionRefused;
+        let config = |vision: bool| {
+            let args: Vec<String> = ["--profile", "none"].into_iter().chain(vision.then_some("--vision-enabled")).map(String::from).collect();
+            let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).expect("the options resolve") else {
+                panic!("a config")
+            };
+            config
+        };
+        let refusal = |vision: bool, artifact: &std::path::Path| prepare_model(&config(vision), artifact).err();
+        let main = ignis_artifact::flash_next::fixture::build("load-vision-companion").expect("the main fixture");
+        let off = refusal(false, &main.path);
+        assert!(!matches!(off, Some(LoadError::VisionCompanion(_))), "vision off asks for no companion: {off:?}");
+
+        let Some(LoadError::VisionCompanion(missing)) = refusal(true, &main.path) else {
+            panic!("no companion is refused by it")
+        };
+        assert!(matches!(missing, CompanionRefused::Missing { .. }), "{missing:?}");
+        assert!(missing.to_string().contains(VISION_ARTIFACT_FILE_NAME), "{missing}");
+
+        let companion = main.with_vision_companion().expect("its vision companion");
+        let Some(LoadError::VisionCompanion(width)) = refusal(true, &main.path) else { panic!("refused for its width") };
+        let width = width.to_string();
+        assert!(width.contains(VISION_ARTIFACT_FILE_NAME) && width.contains("vision/merger/fc2") && width.contains("2560"), "{width}");
+
+        let sidecar = sidecar_path(&companion);
+        let mut pinned: serde_json::Value = serde_json::from_slice(&std::fs::read(&sidecar).expect("the sidecar")).expect("json");
+        pinned["pair"]["main"]["content_hash"] = serde_json::json!("00");
+        std::fs::write(&sidecar, pinned.to_string()).expect("pin it elsewhere");
+        let Some(LoadError::VisionCompanion(elsewhere)) = refusal(true, &main.path) else { panic!("refused for its pin") };
+        let elsewhere = elsewhere.to_string();
+        assert!(elsewhere.contains(VISION_ARTIFACT_FILE_NAME) && elsewhere.contains("pair.main.content_hash is 00"), "{elsewhere}");
     }
 }

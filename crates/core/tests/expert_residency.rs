@@ -434,6 +434,50 @@ fn a_prefill_lookahead_stages_the_next_layer_and_its_use_moves_nothing_more() {
     assert_eq!(later.misses, vec![(down(1, 0), Admission::Staging)]);
 }
 
+/// GitHub #558 (ADR 0087): the staging ring holds nothing between forwards,
+/// which is what lets an image encode borrow it. A prefill forward stages
+/// misses and the next layer's prefetches layer by layer, and a layer's
+/// staged projections go once its kernel ran; the last layer looks ahead at
+/// nothing, so after it the ring is empty. A decode step never stages.
+#[test]
+fn the_staging_ring_holds_nothing_after_a_forward_and_a_decode_step_never_stages() {
+    let mut m = model(tight_downs(0), 16);
+    let lane: &[u16] = &[0];
+    let first = m.step(&LayerStep::prefill(0, &[3]).lookahead(&[lane])).expect("step");
+    assert!(first.misses.contains(&(down(0, 3), Admission::Staging)));
+    assert!(first.prefetches.contains(&(down(1, 0), Admission::Staging)));
+    assert_eq!(m.staged_len(), 1, "layer 0's own down went once its kernel ran; layer 1's prefetched one waits");
+    let last = prefill(&mut m, 1, &[0, 2]);
+    assert!(last.misses.contains(&(down(1, 2), Admission::Staging)), "the last layer stages too");
+    assert_eq!(m.staged_len(), 0, "after the last layer the ring holds nothing");
+    let mut m = model(tight_downs(1), 16);
+    for layer in 0..2 {
+        let step = m.step(&LayerStep::decode(layer, &[1]).lookahead(&[lane])).expect("step");
+        assert!(!step.misses.is_empty() && step.misses.iter().all(|(_, at)| *at == Admission::Slot), "{step:?}");
+        assert_eq!(m.staged_len(), 0, "decode layer {layer}");
+    }
+
+    // Over random traces of whole forwards: empty after every last layer and
+    // every decode step, and something staged mid-forward.
+    let mut staged_mid_forward = false;
+    for seed in 0..40 {
+        let mut rng = Rng(seed);
+        let catalog = random_catalog(&mut rng);
+        let capacity = random_capacity(&mut rng);
+        let config = PolicyConfig { capacity, prefetch_width: WIDTH, prefill_prefetch_width: WIDTH, prefetch_budget: None };
+        let mut m = ResidencyModel::new(catalog, config);
+        for s in &random_trace(&mut rng, 60) {
+            run(&mut m, s);
+            if !s.prefill || s.layer + 1 == LAYERS {
+                assert_eq!(m.staged_len(), 0, "seed {seed}: layer {} ({})", s.layer, if s.prefill { "prefill" } else { "decode" });
+            } else {
+                staged_mid_forward |= m.staged_len() > 0;
+            }
+        }
+    }
+    assert!(staged_mid_forward, "the traces stage something mid-forward");
+}
+
 #[test]
 fn a_warm_start_fills_each_class_hottest_first_and_the_least_hot_goes_first() {
     let mut m = model(tight_downs(2), 0);

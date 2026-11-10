@@ -83,6 +83,15 @@ checksum that is not clean, a model id that belongs to the other model) leaves t
 serving. One that fails after the old model was unloaded loads the old model
 again, and `GET /v1/models` says `failed` with a reason until one serves.
 
+From 0.11.0, vision crosses a switch: with `--vision-enabled` the server takes images on
+the 27B and on Flash-Next, and its request size cap follows the model that is
+serving. A switch to Flash-Next whose vision companion is missing beside its
+artifact is a `409 vision_companion_missing` naming the file, answered before
+anything is torn down. Vision is each model's: a built-in profile turns it on
+for the 27B alone, so a switch from the 27B to Flash-Next under it leaves
+Flash-Next without vision, its default, and says so
+(`ignis.model.switch_vision_off`, [Model switching](../api/model-switching.md)).
+
 How the last one ended is kept on `GET /v1/models` as `last_switch`: `switched`,
 `refused` (nothing was torn down), `restored` (the old model was loaded again) or
 `failed` (nothing serves), with a reason. For a refusal by the host RAM plan, the

@@ -41,6 +41,11 @@
 //! pins the main container it belongs to (`pair.main`, read from the main
 //! container itself, so its hash is the one the binder computes).
 //!
+//! And Flash-Next's vision companion ([`Family::FlashNextVision`],
+//! flash-next-layout.md §14, ADR 0087): one unit, `vision/`, planned from
+//! [`crate::flash_next::vision::entries`] as the 27B NVFP4 family's units are
+//! from theirs, and the MTP companion's pin of its main container.
+//!
 //! And the image model's container ([`Family::QwenImage21`], spec
 //! image-model/01): `frontend/`, then four units of tensors.json tensors
 //! ([`crate::qwen_image::WORK_UNITS`]), with no Flash-Next geometry.
@@ -97,6 +102,13 @@ pub const MTP_ARTIFACT_FILE_NAME: &str = "qwen3_8_flash_next_mtp_3p0-v2.ninfer";
 
 /// The companion's header reservation: its directory is ~0.2 MB.
 pub const MTP_HEADER_BYTES: u64 = 1 << 20;
+
+/// The vision companion container's file name, beside the main one
+/// (flash-next-layout.md §14.1).
+pub const VISION_ARTIFACT_FILE_NAME: &str = "qwen3_8_flash_next_vision-v2.ninfer";
+
+/// The vision companion's header reservation: its directory is ~0.1 MB.
+pub const VISION_HEADER_BYTES: u64 = 1 << 20;
 
 /// Room a `keep_work` run leaves free beyond its second copy.
 const KEEP_WORK_MARGIN_BYTES: u64 = 2 << 30;
@@ -164,6 +176,10 @@ pub enum Family {
     /// The MTP head's companion (flash-next-layout.md §13): the one unit `mtp/`,
     /// pinned to the main container `pair_main`.
     Mtp { pair_main: PathBuf },
+    /// Flash-Next's vision companion (flash-next-layout.md §14): the one unit
+    /// `vision/`, holding the inventory at `tower`, pinned to the main
+    /// container `pair_main`.
+    FlashNextVision { pair_main: PathBuf, tower: crate::nvfp4_27b::VisionTower },
     /// The image model (spec image-model/01): `frontend/` and the four
     /// tensor units of [`crate::qwen_image::WORK_UNITS`].
     QwenImage21,
@@ -222,6 +238,28 @@ impl PackOptions {
             header_bytes: MTP_HEADER_BYTES,
             family: Family::Mtp { pair_main },
             ..Self::new(work_dir, artifact, geometry)
+        }
+    }
+
+    /// The defaults for Flash-Next's vision companion: `work_dir` →
+    /// `artifact`, the inventory at `tower`, pinned to the main container
+    /// `pair_main`.
+    pub fn flash_next_vision(
+        work_dir: PathBuf,
+        artifact: PathBuf,
+        pair_main: PathBuf,
+        tower: crate::nvfp4_27b::VisionTower,
+    ) -> Self {
+        Self {
+            work_dir,
+            artifact,
+            geometry: None,
+            identity: crate::flash_next::vision::identity(),
+            header_bytes: VISION_HEADER_BYTES,
+            keep_work: false,
+            delete_batch_bytes: DEFAULT_DELETE_BATCH_BYTES,
+            accept_status: vec!["complete".into()],
+            family: Family::FlashNextVision { pair_main, tower },
         }
     }
 
@@ -318,6 +356,7 @@ pub fn family_units(family: &Family, layers: usize) -> Vec<String> {
     match family {
         Family::Main => unit_names(layers),
         Family::Mtp { .. } => vec!["mtp".into()],
+        Family::FlashNextVision { .. } => vec!["vision".into()],
         Family::QwenImage21 => {
             std::iter::once("frontend").chain(crate::qwen_image::WORK_UNITS).map(String::from).collect()
         }
@@ -354,7 +393,7 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
     let state_file = state_path(&options.artifact);
     let units = family_units(&options.family, options.layers());
     let pair = match &options.family {
-        Family::Mtp { pair_main } => Some(pair_record(pair_main)?),
+        Family::Mtp { pair_main } | Family::FlashNextVision { pair_main, .. } => Some(pair_record(pair_main)?),
         Family::Main | Family::QwenImage21 | Family::Qwen27bTrellis | Family::Qwen27bNvfp4 { .. } => None,
     };
 
@@ -428,7 +467,8 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
     if converter.exists() {
         check_status(&converter, &read_json(&converter)?, &options.accept_status)?;
         if let Some(pair) = &pair {
-            check_pair(&read_json(&converter)?, pair)?;
+            let paired = if let Family::FlashNextVision { .. } = options.family { "vision tower" } else { "head" };
+            check_pair(&read_json(&converter)?, pair, paired)?;
         }
     }
     if options.keep_work && !state.finished {
@@ -732,9 +772,15 @@ fn plan_unit(
     };
     let flash_next = || geometry.ok_or_else(|| fail(format!("unit {unit} needs Flash-Next's geometry")));
     let mut plan = UnitPlan::new(dir);
-    // Every unit of this family, the frontend included, is the inventory's.
+    // Every unit of these families, the frontend included, is the inventory's.
     if let Family::Qwen27bNvfp4 { geometry } = family {
-        plan_nvfp4_27b(&mut plan, &done, unit, geometry)?;
+        let expected = crate::nvfp4_27b::inventory(geometry).into_iter().filter(|e| e.unit() == unit).collect();
+        plan_inventory(&mut plan, &done, unit, expected, "the 27B NVFP4 inventory")?;
+        return Ok(Some(plan));
+    }
+    if let Family::FlashNextVision { tower, .. } = family {
+        let expected = crate::flash_next::vision::entries(tower).into_iter().filter(|e| e.unit() == unit).collect();
+        plan_inventory(&mut plan, &done, unit, expected, "the Flash-Next vision inventory")?;
         return Ok(Some(plan));
     }
     // Only the files flash-next-layout.md names are read; anything else in a unit
@@ -840,17 +886,23 @@ fn plan_tensors_json(plan: &mut UnitPlan, done: &Done, prefix: Option<&str>) -> 
     Ok(())
 }
 
-/// A unit of [`Family::Qwen27bNvfp4`], planned from the inventory: the
-/// objects it gives `unit`, in its order, each with the inventory's exact
-/// format, layout and shape. A missing object, one described otherwise, and
-/// one the inventory does not give the unit are refused by name.
-fn plan_nvfp4_27b(plan: &mut UnitPlan, done: &Done, unit: &str, geometry: &crate::nvfp4_27b::Geometry) -> Result<()> {
-    use crate::nvfp4_27b::{inventory, Entry};
-    let expected: Vec<Entry> = inventory(geometry).into_iter().filter(|e| e.unit() == unit).collect();
+/// A unit of an inventory-planned family ([`Family::Qwen27bNvfp4`],
+/// [`Family::FlashNextVision`]): `expected`, the objects the inventory gives
+/// `unit`, in its order, each with the inventory's exact format, layout and
+/// shape. A missing object, one described otherwise, and one the inventory
+/// does not give the unit are refused by name, `inventory` naming it.
+fn plan_inventory(
+    plan: &mut UnitPlan,
+    done: &Done,
+    unit: &str,
+    expected: Vec<crate::nvfp4_27b::Entry>,
+    inventory: &str,
+) -> Result<()> {
+    use crate::nvfp4_27b::Entry;
     let names: BTreeSet<&str> = expected.iter().map(Entry::name).collect();
     if unit == "frontend" {
         if let Some(file) = done.keys().find(|file| !names.contains(format!("frontend/{file}").as_str())) {
-            return Err(fail(format!("frontend/{file} is not an object of the 27B NVFP4 inventory")));
+            return Err(fail(format!("frontend/{file} is not an object of {inventory}")));
         }
         for entry in &expected {
             let file = &entry.name()["frontend/".len()..];
@@ -871,7 +923,7 @@ fn plan_nvfp4_27b(plan: &mut UnitPlan, done: &Done, unit: &str, geometry: &crate
     for tensor in read_tensors_json(plan, done)? {
         if !names.contains(tensor.name.as_str()) {
             return Err(fail(format!(
-                "{unit}/tensors.json lists {}, which is not a {unit}/ object of the 27B NVFP4 inventory",
+                "{unit}/tensors.json lists {}, which is not a {unit}/ object of {inventory}",
                 tensor.name
             )));
         }
@@ -888,7 +940,7 @@ fn plan_nvfp4_27b(plan: &mut UnitPlan, done: &Done, unit: &str, geometry: &crate
         };
         if (tensor.format, tensor.layout, &tensor.shape) != (format, layout, &shape) {
             return Err(fail(format!(
-                "{name} is {} {} {:?} in {unit}/tensors.json; the 27B NVFP4 inventory has {} {} {shape:?}",
+                "{name} is {} {} {:?} in {unit}/tensors.json; {inventory} has {} {} {shape:?}",
                 tensor.format.name(),
                 tensor.layout.name(),
                 tensor.shape,
@@ -1533,24 +1585,28 @@ fn pair_record(main: &Path) -> Result<Value> {
     }))
 }
 
-/// The companion's `converter.json` records the main container the head was
-/// calibrated on (its whole-file SHA-256), and it must be the one this run
-/// pins: the hashes are compared, not the names.
-fn check_pair(converter: &Value, pair: &Value) -> Result<()> {
+/// The companion's `converter.json` records the main container its `paired`
+/// part belongs to (its whole-file SHA-256: the one the MTP head was
+/// calibrated on, the one the vision tower was converted for), and it must
+/// be the one this run pins: the hashes are compared, not the names.
+fn check_pair(converter: &Value, pair: &Value, paired: &str) -> Result<()> {
     let ours = pair["file_sha256"].as_str().unwrap_or_default();
+    let file = pair["file"].as_str().unwrap_or_default();
     match converter.pointer("/pair/main/file_sha256").and_then(Value::as_str) {
         Some(theirs) if theirs == ours => Ok(()),
-        Some(theirs) => Err(fail(format!(
-            "converter.json calibrated the head on a main container with SHA-256 {theirs}; {} has {ours}",
-            pair["file"].as_str().unwrap_or_default()
+        Some(theirs) if paired == "head" => Err(fail(format!(
+            "converter.json calibrated the head on a main container with SHA-256 {theirs}; {file} has {ours}"
         ))),
-        None => Err(fail("converter.json does not record the head's main container (pair.main.file_sha256)")),
+        Some(theirs) => Err(fail(format!(
+            "converter.json pairs the {paired} with a main container with SHA-256 {theirs}; {file} has {ours}"
+        ))),
+        None => Err(fail(format!("converter.json does not record the {paired}'s main container (pair.main.file_sha256)"))),
     }
 }
 
 /// Write the sidecar: its existing keys, then `converter.json`'s (when the
-/// converter has written it), then the whole-file invariants and, for an
-/// MTP companion, `pair.main`'s fields read from the main container.
+/// converter has written it), then the whole-file invariants and, for a
+/// companion, `pair.main`'s fields read from the main container.
 /// Returns whether `converter.json` was merged.
 fn write_sidecar(
     artifact: &Path,
@@ -2026,5 +2082,117 @@ mod tests {
         tree.mark_mtp_done().unwrap();
         let err = pack(&tree.mtp_pack_options(main.path.clone()), &mut quiet()).unwrap_err().to_string();
         assert!(err.contains("lists fc_hidden.weight, outside mtp."), "{err}");
+    }
+
+    /// The main fixture container and, in its tree, the vision companion's
+    /// work unit naming it.
+    fn vision_tree(tag: &str) -> fixture::FixtureArtifact {
+        let main = fixture::build(tag).unwrap();
+        main.tree.write_vision(&main.path).unwrap();
+        main
+    }
+
+    /// Rewrite the vision unit's `tensors.json` through `edit`, then its
+    /// `DONE`, as a converter that wrote it so would have.
+    fn edit_vision_listing(tree: &fixture::WorkTree, edit: impl FnOnce(&mut Vec<Value>)) {
+        let unit = tree.vision_work_dir().join("vision");
+        let listing = unit.join("tensors.json");
+        let mut value = read_json(&listing).unwrap();
+        edit(value["tensors"].as_array_mut().unwrap());
+        std::fs::write(&listing, value.to_string()).unwrap();
+        std::fs::remove_file(unit.join("DONE")).unwrap();
+        tree.mark_vision_done().unwrap();
+    }
+
+    #[test]
+    fn a_vision_companion_holds_the_towers_objects_and_pins_its_main_container() {
+        let main = vision_tree("vision-pack");
+        let tree = &main.tree;
+        let (file_bytes, object_count, merged) =
+            finished(pack(&tree.vision_pack_options(main.path.clone()), &mut quiet()).unwrap());
+        assert!(merged);
+        assert!(!tree.vision_work_dir().join("vision").exists(), "the unit is deleted once appended");
+
+        let companion = Reader::open(&tree.vision_artifact_path()).unwrap();
+        assert_eq!(companion.identity(), &crate::flash_next::vision::identity());
+        assert_eq!(companion.identity().model_id, "qwen3.8-flash-next-vision");
+        let entries = crate::flash_next::vision::entries(&crate::flash_next::vision::fixture_geometry());
+        assert_eq!(object_count, entries.len());
+        for (object, entry) in companion.objects().iter().zip(&entries) {
+            let (Object::Tensor(t), crate::nvfp4_27b::Entry::Tensor { name, format, layout, shape }) = (object, entry)
+            else {
+                panic!("{} is not a tensor", entry.name())
+            };
+            assert_eq!((&t.name, t.format, t.layout, &t.shape), (name, *format, *layout, shape));
+        }
+        let Some(Object::Tensor(fc2)) = companion.find("vision/merger/fc2") else { panic!("no merger") };
+        assert_eq!(fc2.shape, vec![64, 128], "the merger writes the fixture's text width, not 4 x the tower's");
+
+        // pair.main is the main container as the reader sees it, beside what
+        // the converter recorded of it.
+        let reader = Reader::open(&main.path).unwrap();
+        let record = read_json(&sidecar_path(&tree.vision_artifact_path())).unwrap();
+        let pinned = &record["pair"]["main"];
+        assert_eq!(pinned["content_hash"], hex(&reader.content_hash()));
+        assert_eq!(pinned["model_id"], reader.identity().model_id);
+        assert_eq!(pinned["weights_id"], reader.identity().weights_id);
+        assert_eq!(pinned["bytes"], reader.file_bytes());
+        assert_eq!(pinned["objects"], reader.objects().len());
+        assert_eq!(pinned["file_sha256"], hex(&Sha256::digest(std::fs::read(&main.path).unwrap())));
+        assert_eq!(pinned["file"], main.path.file_name().unwrap().to_str().unwrap());
+        assert_eq!(record["schema"], "flash-next-vision-converter-v1");
+        assert_eq!((record["artifact"]["bytes"].as_u64(), record["objects"]["count"].as_u64()),
+                   (Some(file_bytes), Some(object_count as u64)));
+        crate::flash_next::vision::check_pair(&record, &reader).expect("the companion's pin holds against its main");
+    }
+
+    #[test]
+    fn a_vision_companion_is_refused_when_its_converter_records_another_main_container_or_none() {
+        let main = vision_tree("vision-refused");
+        let tree = &main.tree;
+        let converter = tree.vision_work_dir().join("converter.json");
+        let mut record = read_json(&converter).unwrap();
+        record["pair"]["main"]["file_sha256"] = json!("00".repeat(32));
+        std::fs::write(&converter, record.to_string()).unwrap();
+        let err = pack(&tree.vision_pack_options(main.path.clone()), &mut quiet()).unwrap_err().to_string();
+        assert!(err.contains(&format!("pairs the vision tower with a main container with SHA-256 {}", "00".repeat(32))), "{err}");
+
+        record["pair"]["main"].as_object_mut().unwrap().remove("file_sha256");
+        std::fs::write(&converter, record.to_string()).unwrap();
+        let err = pack(&tree.vision_pack_options(main.path.clone()), &mut quiet()).unwrap_err().to_string();
+        assert!(err.contains("does not record the vision tower's main container"), "{err}");
+        assert!(tree.vision_work_dir().join("vision").exists(), "nothing is consumed");
+    }
+
+    /// The unit is planned from the inventory: a merger the 27B's width, a
+    /// tensor it does not name and a missing one are each refused by name,
+    /// before any byte of the unit is appended.
+    #[test]
+    fn a_vision_unit_that_is_not_the_inventory_is_refused_by_name() {
+        let main = vision_tree("vision-inventory");
+        let tree = &main.tree;
+        let options = tree.vision_pack_options(main.path.clone());
+        edit_vision_listing(tree, |tensors| {
+            let fc2 = tensors.iter_mut().find(|t| t["name"] == "vision/merger/fc2").unwrap();
+            fc2["shape"] = json!([128, 128]);
+        });
+        let err = pack(&options, &mut quiet()).unwrap_err().to_string();
+        assert!(err.contains("vision/merger/fc2 is W8G32_F16S row-split-k128-v1 [128, 128] in vision/tensors.json; \
+                              the Flash-Next vision inventory has W8G32_F16S row-split-k128-v1 [64, 128]"), "{err}");
+
+        edit_vision_listing(tree, |tensors| {
+            let fc2 = tensors.iter_mut().find(|t| t["name"] == "vision/merger/fc2").unwrap();
+            fc2["shape"] = json!([64, 128]);
+            let mut stray = fc2.clone();
+            stray["name"] = json!("vision/merger/fc3");
+            tensors.push(stray);
+        });
+        let err = pack(&options, &mut quiet()).unwrap_err().to_string();
+        assert!(err.contains("lists vision/merger/fc3, which is not a vision/ object of the Flash-Next vision inventory"), "{err}");
+
+        edit_vision_listing(tree, |tensors| tensors.retain(|t| t["name"] != "vision/merger/fc3" && t["name"] != "vision/layers/26/norm2/bias"));
+        let err = pack(&options, &mut quiet()).unwrap_err().to_string();
+        assert!(err.contains("the work tree has no vision/layers/26/norm2/bias"), "{err}");
+        assert!(tree.vision_work_dir().join("vision").exists(), "nothing is consumed");
     }
 }

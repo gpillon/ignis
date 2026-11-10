@@ -19,8 +19,24 @@ reports `status: "switching"` with `switching: {from, to}`. Requests already
 running on the old model get `--switch-drain-timeout` (30 s) to finish; one
 still running then ends with an `engine_error`. The new model loads on the
 flags the server started with, except the ones it cannot take, which are left
-off for it and named in the log (`--vision-enabled` and the 27B's `--spec-backend` on
-Flash-Next; Flash-Next's own knobs on the 27B).
+off for it and named in the log (the 27B's `--spec-backend` on Flash-Next;
+Flash-Next's own knobs on the 27B).
+
+**Vision crosses the switch** (from 0.11.0; 0.10.0 drops vision on a switch
+to Flash-Next). A server started with `--vision-enabled` serves
+images on Flash-Next as on the 27B, from the 27B to Flash-Next and back, and
+the request size cap follows the model that is serving. Flash-Next sees
+through its [vision companion](../configuration/vision.md#flash-next), a file beside its
+artifact: a switch to Flash-Next with vision on and the companion missing, or
+not its own, is a `409 vision_companion_missing` that names the file. It is
+answered before anything is unloaded, so the old model keeps serving. Vision
+is each model's, though: every built-in profile turns it on for the 27B alone,
+so a 27B serving images on its profile's vision switches to Flash-Next with
+vision off, and an image part is then refused with `vision_disabled`. The
+switch says so in the log, `ignis.model.switch_vision_off`, with what left it
+off (`by`: `default`, `profile` or `named`) and how to turn it on (`why`):
+`--vision-enabled` for both models, `--qwen38flashnext-vision-enabled` for
+Flash-Next alone.
 
 A target that can be refused without unloading anything — no file at the path,
 a checksum that is not clean, a model id of the other model — leaves the old

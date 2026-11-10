@@ -40,7 +40,8 @@ ifeq ($(MODEL_FAMILY),flash-next)
   # 262,144 tokens per lane under hq-e8-2b, the checkpoint's whole trained
   # envelope (so no YaRN): the user always keeps that context, and speed
   # never takes VRAM from the KV pool (LANES=1, below, is the one that trades); 8192-token prefill chunks amortize a
-  # chunk's expert transfer (spec flash-next/03); no vision. No speculation
+  # chunk's expert transfer (spec flash-next/03); vision off unless VISION=1
+  # (its vision companion beside the artifact, ADR 0087). No speculation
   # by default: on the 5090 the MTP head is PCIe-bound (finding 2026-10-07).
   # SPEC=mtp turns it on, its companion container beside the artifact (spec
   # flash-next/07); DRAFT_TOKENS=k forces at most k drafts per lane;
@@ -225,8 +226,10 @@ RETAINED_HOST ?=
 # Vision (--vision-enabled, GitHub #179): a load that takes image parts.
 # VISION=1 passes --vision-enabled, VISION=0 --vision-enabled false, and empty
 # passes neither, so the profile decides: every built-in profile turns vision
-# on for the 27B (GitHub #491). A load whose vision resolves off refuses every
-# `image_url` part with `vision_disabled`, whatever the artifact holds.
+# on for the 27B (GitHub #491) and leaves it off on Flash-Next, which VISION=1
+# turns on (GitHub #557: its vision companion beside the artifact). A load
+# whose vision resolves off refuses every `image_url` part with
+# `vision_disabled`, whatever the artifact holds.
 # VISION_MAX_TOKENS caps one request's vision tokens (--vision-max-tokens),
 # passed whenever it is set; empty = the server's own envelope. MODEL=image
 # passes no vision flag.

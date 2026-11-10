@@ -487,6 +487,18 @@ int main(int argc, char **argv) {
     }
     prev_layer = s.layer;
   };
+  // GitHub #558 (ADR 0087): between forwards -- after a step of the last layer, which looks ahead
+  // at nothing -- the ring is lent to an image encode, which leaves its own bytes there. What the
+  // forward's last layer staged is never read again: every check, from the next step on, holds
+  // with the ring overwritten. `last` is the step just run (remember_staging has taken its
+  // staging).
+  uint32_t lent_over_staging = 0;
+  auto lend_ring = [&](const Step &last) {
+    if (last.layer + 1 != f.layers || layout.ring_bytes == 0) return;
+    CUDA_OK(cudaMemsetAsync(const_cast<void *>(layout.ring), 0xA5, layout.ring_bytes, stream));
+    CUDA_OK(cudaStreamSynchronize(stream));
+    if (last.phase == IGNIS_RESIDENCY_PREFILL && !staged_prev.empty()) ++lent_over_staging;
+  };
   // A whole decode round from `si`: every layer in order, one token count.
   auto is_round = [&](size_t si) {
     if (si + f.layers > f.steps.size()) return false;
@@ -614,6 +626,7 @@ int main(int argc, char **argv) {
       check_table("round from step " + std::to_string(si), nullptr);
       if (f.steps[si + f.layers - 1].expect.status == 0) check_mirror("round from step " + std::to_string(si));
       remember_staging(f.steps[si + f.layers - 1]);
+      lend_ring(f.steps[si + f.layers - 1]);
       ++graph_rounds;
       si += f.layers;
       continue;
@@ -632,8 +645,11 @@ int main(int argc, char **argv) {
     check_table("step " + std::to_string(si) + " (layer " + std::to_string(s.layer) + ")", &s);
     if (s.layer + 1 == f.layers && s.expect.status == 0) check_mirror("step " + std::to_string(si));
     remember_staging(s);
+    lend_ring(s);
     ++si;
   }
+  std::printf("the ring lent between forwards %u times over a last layer's staging\n", lent_over_staging);
+  check(lent_over_staging > 0, "the trace ends some prefill forward with its last layer's staging in the ring");
 
   ignis_residency_counters counters{};
   RES_OK(ignis_residency_read_counters(r, &counters));

@@ -8,6 +8,9 @@
 //!                       [--accept-status STATUS] [--keep-work] [--weights-id ID]
 //!                       [--geometry qwen3.8-flash-next|fixture]
 //!                       [--family main|mtp --pair-main <main.ninfer>]
+//!   ignis-artifact-pack --family flash-next-vision --work <work dir> --pair-main <main.ninfer>
+//!                       [--out <artifact.ninfer>] [--geometry qwen3.8-flash-next|fixture]
+//!                       [--header-mib N] [--accept-status STATUS] [--keep-work]
 //!   ignis-artifact-pack --family qwen-image --work <work dir> [--out <artifact.ninfer>]
 //!                       [--header-mib N] [--accept-status STATUS] [--keep-work]
 //!   ignis-artifact-pack --family qwen3.8-27b-trellis --work <work dir> [--out <artifact.ninfer>]
@@ -35,6 +38,15 @@
 //! main container `--pair-main`; `--out` then defaults to
 //! `<work>/../qwen3_8_flash_next_mtp_3p0-v2.ninfer`, the identity and the
 //! 1 MiB header are the companion's.
+//!
+//! `--family flash-next-vision` packs Flash-Next's vision companion
+//! (flash-next-layout.md §14, ADR 0087) from `tools/flash-next-vision`'s work
+//! tree (its one unit `vision/`, holding exactly the objects of
+//! `ignis_artifact::flash_next::vision::entries`), pinned to the main
+//! container `--pair-main`; `--out` then defaults to
+//! `<work>/../qwen3_8_flash_next_vision-v2.ninfer`, the identity and the
+//! 1 MiB header are the companion's. `--geometry fixture` packs the tool's
+//! synthetic tower; `--layers` and `--experts` are refused.
 //!
 //! `--family qwen-image` packs the image model's container (spec
 //! image-model/01) from `tools/image-converter`'s work tree: `frontend/` and
@@ -64,13 +76,15 @@ use ignis_artifact::flash_next::FlashNextGeometry;
 use ignis_artifact::nvfp4_27b;
 use ignis_artifact::packer::{
     pack, Family, PackOptions, PackOutcome, ARTIFACT_FILE_NAME, MTP_ARTIFACT_FILE_NAME, QWEN_IMAGE_ARTIFACT_FILE_NAME,
-    TRELLIS_27B_ARTIFACT_FILE_NAME,
+    TRELLIS_27B_ARTIFACT_FILE_NAME, VISION_ARTIFACT_FILE_NAME,
 };
+use ignis_artifact::flash_next::vision;
 
 const USAGE: &str = "usage: ignis-artifact-pack --work <dir> [--out <artifact.ninfer>] [--layers N] \
                      [--experts N] [--header-mib N] [--accept-status STATUS] [--keep-work] \
                      [--weights-id ID] [--geometry qwen3.8-flash-next|qwen3.8-27b|fixture] \
-                     [--family main|mtp|qwen-image|qwen3.8-27b-trellis|qwen3.8-27b-nvfp4 --pair-main <main.ninfer>]\n\
+                     [--family main|mtp|flash-next-vision|qwen-image|qwen3.8-27b-trellis|qwen3.8-27b-nvfp4 \
+                     --pair-main <main.ninfer>]\n\
                      --family qwen3.8-27b-nvfp4: --work <NVFP4 work tree: frontend/ text/ mtp/ vision/ dflash2/ \
                      converter.json> --out <artifact.ninfer> --weights-id ID (docs/formats/27b-nvfp4-work-tree.md)";
 
@@ -117,6 +131,15 @@ fn main() {
         (None | Some("main"), None) => Family::Main,
         (Some("mtp"), Some(pair_main)) => Family::Mtp { pair_main },
         (Some("mtp"), None) => usage_error("--family mtp needs --pair-main"),
+        (Some("flash-next-vision"), Some(pair_main)) => Family::FlashNextVision {
+            pair_main,
+            tower: match geometry_name.as_deref() {
+                None | Some("qwen3.8-flash-next") => vision::geometry(),
+                Some("fixture") => vision::fixture_geometry(),
+                Some(_) => usage_error("--geometry takes qwen3.8-flash-next or fixture for --family flash-next-vision"),
+            },
+        },
+        (Some("flash-next-vision"), None) => usage_error("--family flash-next-vision needs --pair-main"),
         (Some("qwen-image"), None) => Family::QwenImage21,
         (Some("qwen3.8-27b-trellis"), None) => Family::Qwen27bTrellis,
         (Some("qwen3.8-27b-nvfp4"), None) => Family::Qwen27bNvfp4 {
@@ -127,9 +150,9 @@ fn main() {
             },
         },
         (None | Some("main") | Some("qwen-image") | Some("qwen3.8-27b-trellis") | Some("qwen3.8-27b-nvfp4"), Some(_)) => {
-            usage_error("--pair-main is for --family mtp")
+            usage_error("--pair-main is for --family mtp or flash-next-vision")
         }
-        _ => usage_error("--family takes main, mtp, qwen-image, qwen3.8-27b-trellis or qwen3.8-27b-nvfp4"),
+        _ => usage_error("--family takes main, mtp, flash-next-vision, qwen-image, qwen3.8-27b-trellis or qwen3.8-27b-nvfp4"),
     };
     let mut geometry = match (&family, geometry_name.as_deref()) {
         (Family::Main | Family::Mtp { .. }, None | Some("qwen3.8-flash-next")) => FlashNextGeometry::qwen38_flash_next(),
@@ -142,7 +165,7 @@ fn main() {
     if layers.is_some() || experts.is_some() {
         match family {
             Family::Main | Family::Mtp { .. } => {}
-            Family::Qwen27bNvfp4 { .. } => not_flash_next("--layers and --experts"),
+            Family::Qwen27bNvfp4 { .. } | Family::FlashNextVision { .. } => not_flash_next("--layers and --experts"),
             _ => not_flash_next(FLASH_NEXT_FLAGS),
         }
     }
@@ -152,6 +175,7 @@ fn main() {
             Some(model_dir) => model_dir.join(match family {
                 Family::Main => ARTIFACT_FILE_NAME,
                 Family::Mtp { .. } => MTP_ARTIFACT_FILE_NAME,
+                Family::FlashNextVision { .. } => VISION_ARTIFACT_FILE_NAME,
                 Family::QwenImage21 => QWEN_IMAGE_ARTIFACT_FILE_NAME,
                 Family::Qwen27bTrellis => TRELLIS_27B_ARTIFACT_FILE_NAME,
                 Family::Qwen27bNvfp4 { .. } => usage_error("--family qwen3.8-27b-nvfp4 needs --out: the build's own file name"),
@@ -168,6 +192,7 @@ fn main() {
 
     let mut options = match family {
         Family::Mtp { pair_main } => PackOptions::mtp(work_dir, artifact, geometry, pair_main),
+        Family::FlashNextVision { pair_main, tower } => PackOptions::flash_next_vision(work_dir, artifact, pair_main, tower),
         Family::Main => PackOptions::new(work_dir, artifact, geometry),
         Family::QwenImage21 => PackOptions::qwen_image(work_dir, artifact),
         Family::Qwen27bTrellis => PackOptions::trellis_27b(work_dir, artifact),

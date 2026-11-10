@@ -119,6 +119,17 @@ pub trait ModelLoader: Send + Sync {
     fn family_of(&self, target: &ModelSource) -> Option<ModelFamily> {
         ModelFamily::of_model_id(&target.model)
     }
+
+    /// Why a switch to `target` cannot succeed for want of a file beside its
+    /// artifact, when that can be told by looking at the files alone (#563):
+    /// with vision on, Flash-Next's vision companion missing or not its
+    /// own. What `POST /v1/models/switch` answers `409` with, naming the
+    /// file, before anything is prepared or torn down. `None` when the
+    /// switch lacks nothing, and by default.
+    fn companion_refusal(&self, target: &ModelSource) -> Option<String> {
+        let _ = target;
+        None
+    }
 }
 
 /// A target [`ModelLoader::prepare`] accepted: what is left is the load
@@ -199,6 +210,20 @@ impl ModelLoader for ArtifactLoader {
     fn family_of(&self, target: &ModelSource) -> Option<ModelFamily> {
         crate::loader::artifact_family(&target.artifact).ok().flatten()
     }
+
+    /// The load's own prepare-time check of the vision companion
+    /// ([`crate::load::check_vision_companion`]), asked early, on the
+    /// configuration this switch would load the target with ([`fit_options`],
+    /// which says nothing: the prepare after it logs the fit). Only a
+    /// Flash-Next load with vision on has a companion to check, so the target's
+    /// artifact is read only then: a switch that needs none answers its 202
+    /// without touching the file, which may be slow or never end.
+    fn companion_refusal(&self, target: &ModelSource) -> Option<String> {
+        let (options, _) = fit_options(&self.state.current(), target, ModelFamily::FlashNext, None).ok()?;
+        options.vision.as_ref()?;
+        let family = crate::loader::artifact_family(&target.artifact).ok().flatten()?;
+        crate::load::check_vision_companion(&options, Some(family), &target.artifact).err().map(|refusal| refusal.to_string())
+    }
 }
 
 /// The configuration a load of `target`, an artifact of `family`, runs
@@ -215,8 +240,66 @@ pub fn load_options(
     family: ignis_core::compute::ModelFamily,
     given: Option<&crate::config::Config>,
 ) -> Result<crate::config::Config, String> {
+    let (options, dropped) = fit_options(running, target, family, given)?;
+    log_flags_dropped(&target.model, family, &dropped);
+    log_vision_off(running, &target.model, family, &options);
+    Ok(options)
+}
+
+/// Say that a switch from a model serving images leaves `to`, a model of
+/// `family` that takes them, with vision off (GitHub #563): vision is each
+/// model's, and a built-in profile turns it on for the 27B alone, so a 27B
+/// started with its profile's vision switches to Flash-Next without it, its
+/// default (ADR 0087), and its image parts are refused `vision_disabled`.
+/// `ignis.model.switch_vision_off` names the target's vision (`off`), what
+/// left it off (`by`: `default`, `profile` or `named`) and, in `why`, how to
+/// turn it on. Nothing when the target keeps vision or the running model had
+/// none.
+fn log_vision_off(
+    running: &crate::config::Config,
+    to: &str,
+    family: ignis_core::compute::ModelFamily,
+    options: &crate::config::Config,
+) {
+    if running.vision.is_none() || options.vision.is_some() || !family.takes_images() {
+        return;
+    }
+    let turn_on = crate::config::schema::field("vision", "enabled").expect("declared").scoped_flag(family);
+    let (by, why) = match options.basis.resolution().origin("vision", "enabled") {
+        Some(origin) if origin.source.explicit() => {
+            ("named", format!("vision is named off for it ({}); --vision-enabled or {turn_on} turns it on", origin.spelling))
+        }
+        Some(origin) => ("profile", format!("the profile turns it off ({}); --vision-enabled or {turn_on} turns it on", origin.spelling)),
+        None => (
+            "default",
+            format!(
+                "{} has vision off unless it is named on for it (ADR 0087); --vision-enabled turns it on for both \
+                 models, {turn_on} for it alone",
+                family.name()
+            ),
+        ),
+    };
+    tracing::info!(
+        name: "ignis.model.switch_vision_off",
+        to = %to,
+        family = family.name(),
+        vision = "off",
+        by,
+        why = %why,
+        "the model switched to loads with vision off: its image parts are refused with vision_disabled"
+    );
+}
+
+/// [`load_options`] without its log line, with the flags the fit dropped
+/// (none for `given` already fitted).
+fn fit_options(
+    running: &crate::config::Config,
+    target: &ModelSource,
+    family: ignis_core::compute::ModelFamily,
+    given: Option<&crate::config::Config>,
+) -> Result<(crate::config::Config, Vec<String>), String> {
     if let Some(options) = given.filter(|options| options.basis.family() == Some(family)) {
-        return Ok(options.clone());
+        return Ok((options.clone(), Vec::new()));
     }
     // The target's artifact and id over the running options, as a patch:
     // the options are resolved again from their sources, so a value set on
@@ -225,9 +308,7 @@ pub fn load_options(
     let named = crate::config::target_patch(&target.artifact, &target.model)
         .and_then(|patch| base.general_with(&patch))
         .map_err(|e| e.to_string())?;
-    let (options, dropped) = crate::config::fit_to_family(&named, family).map_err(|e| e.to_string())?;
-    log_flags_dropped(&target.model, family, &dropped);
-    Ok(options)
+    crate::config::fit_to_family(&named, family).map_err(|e| e.to_string())
 }
 
 /// Say which of the running options a switch to `to`, a model of `family`,
@@ -735,6 +816,13 @@ impl Switcher {
         self.settled.store(true, Ordering::SeqCst);
         *self.last.lock().expect("last switch lock") =
             Some(LastSwitch { from: from.to_owned(), to: to.to_owned(), outcome: outcome.clone(), host_plan });
+    }
+
+    /// Why a switch to `target` is refused for a file missing beside its
+    /// artifact ([`ModelLoader::companion_refusal`]). Reads files: called on
+    /// `spawn_blocking`.
+    pub fn companion_refusal(&self, target: &ModelSource) -> Option<String> {
+        self.loader.companion_refusal(target)
     }
 
     /// The kind of the model a request naming `model` would be served by, if
@@ -2083,6 +2171,86 @@ mod tests {
         assert_eq!(other, LoadFailure { reason: "materialize weights: out of memory".to_owned(), host_plan: None });
     }
 
+    /// GitHub #563: the production loader's early refusal names the vision
+    /// companion's file for a Flash-Next target with vision on and none
+    /// beside it, and nothing otherwise: not with vision off, not once the
+    /// companion is there (its width is the load's own check, still asked at
+    /// prepare), not for a target that is not Flash-Next.
+    #[test]
+    fn the_artifact_loader_refuses_a_flash_next_target_without_its_companion_by_name() {
+        use ignis_artifact::packer::VISION_ARTIFACT_FILE_NAME;
+        let loader = |vision: bool| {
+            let args: Vec<String> = ["--profile", "none"].into_iter().chain(vision.then_some("--vision-enabled")).map(String::from).collect();
+            let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).unwrap() else { panic!("a config") };
+            ArtifactLoader::new(config)
+        };
+        let main = ignis_artifact::flash_next::fixture::build("switch-vision-companion").expect("the main fixture");
+        let target = ModelSource { artifact: main.path.clone(), model: "qwen3.8-flash-next".to_owned() };
+        assert_eq!(loader(false).companion_refusal(&target), None, "vision off asks for no companion");
+        let refusal = loader(true).companion_refusal(&target).expect("no companion is refused");
+        assert!(refusal.contains(VISION_ARTIFACT_FILE_NAME), "{refusal}");
+        main.with_vision_companion().expect("its vision companion");
+        let width = loader(true).companion_refusal(&target).expect("the fixture's merger is not Flash-Next's width");
+        assert!(width.contains(VISION_ARTIFACT_FILE_NAME) && !width.contains("is missing"), "{width}");
+        let missing = ModelSource { artifact: main.path.with_file_name("not-there.ninfer"), model: "other".to_owned() };
+        assert_eq!(loader(true).companion_refusal(&missing), None, "a file that is no artifact lacks nothing here; prepare says so");
+    }
+
+    /// GitHub #563: under a built-in profile, which turns vision on for the
+    /// 27B alone, a 27B serving images switches to Flash-Next with vision off,
+    /// its default (ADR 0087), and the switch says so, with why and how to
+    /// turn it on; named off, it says that. A switch that keeps vision, or one
+    /// from a model without it, says nothing of it.
+    #[test]
+    fn a_switch_that_leaves_its_target_without_vision_says_so() {
+        let running = |flags: &[&str]| {
+            let args: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
+            let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).unwrap() else { panic!("a config") };
+            config.for_family(ModelFamily::Qwen38_27b).unwrap()
+        };
+        let target = ModelSource { artifact: std::path::PathBuf::from("flash-next.ninfer"), model: "qwen3.8-flash-next".to_owned() };
+        let vision_off =|running: &crate::config::Config| -> Vec<serde_json::Value> {
+            let records = logged(|| {
+                load_options(running, &target, ModelFamily::FlashNext, None).expect("the switch's options");
+            });
+            records.into_iter().filter(|event| event["event_name"] == "ignis.model.switch_vision_off").collect()
+        };
+        let field = |event: &serde_json::Value, name: &str| event.get(name).or_else(|| event["attributes"].get(name)).cloned();
+        let profile = running(&["--profile", "rtx5090"]);
+        assert!(profile.vision.is_some(), "the profile's vision, on the 27B");
+        let events = vision_off(&profile);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(field(event, "to"), Some("qwen3.8-flash-next".into()), "{event}");
+        assert_eq!(field(event, "vision"), Some("off".into()), "{event}");
+        assert_eq!(field(event, "by"), Some("default".into()), "{event}");
+        let why = field(event, "why").and_then(|why| why.as_str().map(str::to_owned)).unwrap_or_default();
+        assert!(why.contains("--vision-enabled") && why.contains("--qwen38flashnext-vision-enabled"), "{event}");
+        let named = vision_off(&running(&["--profile", "rtx5090", "--qwen38flashnext-vision-enabled", "false"]));
+        assert_eq!(field(&named[0], "by"), Some("named".into()), "{named:?}");
+        assert!(field(&named[0], "why").is_some_and(|why| why.to_string().contains("--qwen38flashnext-vision-enabled")), "{named:?}");
+        assert!(vision_off(&running(&["--profile", "rtx5090", "--vision-enabled"])).is_empty(), "vision crosses the switch");
+        assert!(vision_off(&running(&["--profile", "none"])).is_empty(), "no vision to leave");
+    }
+
+    /// The early companion check fits the switch's options as its prepare
+    /// will, and says nothing: the prepare after it logs what the fit
+    /// dropped, once per switch.
+    #[test]
+    fn the_early_companion_check_logs_nothing_of_the_fit() {
+        let args: Vec<String> = ["--profile", "none", "--vision-enabled", "--spec-backend", "dflash2", "--spec-draft-tokens", "7"]
+            .map(String::from)
+            .to_vec();
+        let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).unwrap() else { panic!("a config") };
+        let loader = ArtifactLoader::new(config);
+        let main = ignis_artifact::flash_next::fixture::build("switch-companion-quiet").expect("the main fixture");
+        let target = ModelSource { artifact: main.path.clone(), model: "qwen3.8-flash-next".to_owned() };
+        let mut refusal = None;
+        let records = logged(|| refusal = loader.companion_refusal(&target));
+        assert!(refusal.is_some_and(|refusal| refusal.contains(ignis_artifact::packer::VISION_ARTIFACT_FILE_NAME)));
+        assert!(records.is_empty(), "{records:?}");
+    }
+
     fn logged(run: impl FnOnce()) -> Vec<serde_json::Value> {
         use tracing_subscriber::layer::SubscriberExt;
         let sink = Arc::new(ignis_logging::MemorySink::new());
@@ -2096,7 +2264,8 @@ mod tests {
     /// returned — the list each field's own applicability produces.
     #[test]
     fn a_switch_names_what_it_dropped_and_says_nothing_when_nothing_was() {
-        let started = match crate::config::resolve(&["--vision-enabled".to_owned()], |_| None).unwrap() {
+        let flags = ["--spec-backend", "dflash2", "--spec-draft-tokens", "7"].map(str::to_owned);
+        let started = match crate::config::resolve(&flags, |_| None).unwrap() {
             crate::config::ConfigOutcome::Config(config) => config,
             other => panic!("{other:?}"),
         };
@@ -2106,7 +2275,7 @@ mod tests {
         let event = &records[0];
         assert_eq!(event["event_name"], "ignis.model.switch_flags_dropped", "{event}");
         let field = |name: &str| event.get(name).or_else(|| event["attributes"].get(name)).cloned();
-        assert_eq!(field("flags"), Some("--vision-enabled".into()), "{event}");
+        assert_eq!(field("flags"), Some("--spec-backend,--spec-draft-tokens".into()), "{event}");
         assert_eq!(field("to"), Some("qwen3.8-flash-next".into()), "{event}");
         assert!(logged(|| log_flags_dropped("qwen3.8-27b", ModelFamily::Qwen38_27b, &[])).is_empty());
     }

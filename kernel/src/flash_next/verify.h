@@ -24,7 +24,9 @@
 //
 // What needs no commit: KV rows and pooled indexer blocks at positions past the new frontier sit
 // where nothing reads them until the frontier reaches them again, and that append rewrites them
-// (positions are never read past a lane's frontier); residency is a cache.
+// (positions are never read past a lane's frontier); residency is a cache. The one exception is a
+// vision load's block the new frontier is inside (GitHub #558): its key slot must hold its first
+// token's AxisRecord again, which the commit restores beside the tail.
 //
 // On an MTP load (phase D, mtp.h) the commit also drafts the next round, between the fold and the
 // restore: the head's alignment over the pass's k + 1 stacks and licensed tokens (its entries at
@@ -91,10 +93,17 @@ struct Plan {
   std::size_t gdn_records = 0;
   std::size_t indexer_records = 0;
   std::size_t saved = 0;     // the lane state the pass saves for the commit
+  // `axis_records` below: the room their saved records take, outside every line (the load lends
+  // it, create's `axis_record_room`); 0 without them.
+  std::size_t axis_records = 0;
   std::size_t total() const { return staging + accept + gdn_records + indexer_records + saved; }
 };
+// `axis_records`: a vision load's sections (GitHub #558, indexer.h AxisRecord), whose saved state
+// also holds each (attention layer, lane)'s record of the block its frontier is inside -- in room
+// the load lends the round, not in a line of its own (ADR 0087: a vision load reserves nothing a
+// text load does not), so `total()` is a text load's.
 Plan plan(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_tokens, uint32_t row_budget,
-          int32_t attention_layers, int32_t gdn_layers, bool mtp);
+          int32_t attention_layers, int32_t gdn_layers, bool mtp, bool axis_records = false);
 
 // The round's buffers, at stable addresses (a captured graph replays them). Allocated once at load.
 struct State {
@@ -104,6 +113,13 @@ struct State {
   int32_t attention_layers = 0;
   int32_t gdn_layers = 0;
   bool mtp = false;
+  // GitHub #558: the sections keep an incomplete block's AxisRecord in its key slot (a vision
+  // load), which the pass may replace with a key the commit then rejects: save keeps it, restore
+  // puts the new frontier's back.
+  bool axis_records = false;
+  // Where the pass saves them: [attention layer][lane] AxisRecord words, in the room create was
+  // lent (null without axis records). Read and written by the pass and the commit of one round.
+  int32_t *axis_record_words = nullptr;
   Plan sizes;
 
   // Host-staged per round: I32 [lanes] each, drafts I32 [lanes][k] (lane-major, the accept's [k, B]).
@@ -156,10 +172,14 @@ struct State {
 std::string refusal(const Geometry &g, uint32_t lanes, uint32_t draft_tokens, uint32_t row_budget,
                     int32_t attention_layers, int32_t gdn_layers);
 
-// Allocates the state for a load (`lanes` decode lanes), or null and *error.
+// Allocates the state for a load (`lanes` decode lanes), or null and *error. With
+// `axis_records`, `axis_record_room` is device memory of `axis_record_room_bytes` (at least the
+// plan's `axis_records`, 16-byte aligned) the caller keeps for the state's life, which nothing else
+// touches during a round: the records are saved there.
 std::unique_ptr<State> create(const Geometry &g, int32_t kv_format, uint32_t lanes, uint32_t draft_tokens,
                               uint32_t row_budget, int32_t attention_layers, int32_t gdn_layers, bool mtp,
-                              std::string *error);
+                              std::string *error, bool axis_records = false, void *axis_record_room = nullptr,
+                              std::size_t axis_record_room_bytes = 0);
 
 // The lane-state addresses the save, restore and fold kernels read and write: one pool's sections.
 struct Sections {
@@ -167,6 +187,11 @@ struct Sections {
   int32_t gdn_layers = 0;
   void *tails[kMaxAttentionLayers] = {};       // the layer's tail keys, slot 0
   int64_t tail_slot_elements = 0;              // BF16 elements per slot ((compress - 1) * key dim)
+  // GitHub #558: the layer's block keys, [physical page][blocks per page][key dim] BF16, and the
+  // KV block tables that page them (a state with axis_records reads and writes their records).
+  void *block_keys[kMaxAttentionLayers] = {};
+  const int32_t *block_tables = nullptr;       // DEVICE [slots][logical_pages]
+  int32_t logical_pages = 0;
   void *residual_k[kMaxAttentionLayers] = {};  // the layer's hq side plane, slot 0 (null: none)
   void *residual_v[kMaxAttentionLayers] = {};
   uint32_t *ring = nullptr;                    // ring words, slot 0 (null: none)
@@ -184,7 +209,9 @@ bool sections_of(const ignis_seq_pool &pool, const Geometry &g, int32_t gdn_laye
 // for: more lanes than the load's, a window past its widest (window(1)), or more rows than its
 // records hold. (The ops that write the records refuse the last too: VerifyRecords::rows.)
 
-// The pass's first step: every lane's state the forward advances in place, into `state.saved`.
+// The pass's first step: every lane's state the forward advances in place, into `state.saved` --
+// with state.axis_records also every attention layer's AxisRecord of the block the lane's frontier
+// is inside, which the pass replaces with a key when its columns complete that block (GitHub #558).
 // `slots`, `positions`: DEVICE [lanes] (the round's staged rows). Graph-safe.
 int32_t save(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
              const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error);
@@ -199,16 +226,24 @@ int32_t accept(State &state, const Geometry &g, uint32_t lanes, uint32_t window,
 // Graph-safe.
 int32_t fold(const State &state, const Sections &sections, uint32_t lanes, uint32_t window, const int32_t *slots,
              cudaStream_t stream, std::string *error);
+// GitHub #558: with state.axis_records the restore also puts back the AxisRecord of the block each
+// lane's new frontier f = p + c is inside (none when f is a block boundary): the saved one when the
+// block began before the round, else its first column's, at its position plus the lane's rope
+// delta (`rope_deltas`, DEVICE [lanes], the round's; null: 0) -- the rotation every column of a
+// round takes.
 int32_t restore(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
-                const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error);
+                const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error,
+                const int32_t *rope_deltas = nullptr);
 
 // An MTP load's drafting, between the head's alignment and its chain: the head's section (the
-// pool's last attention section) at each lane's new frontier -- its indexer tail, and under
-// hq-e8-2b the ring words and the ring rows of the alignment's rejected columns. Without it a
-// chain step at q reads a rejected column's ring row as position q - 512 + i (a ring slot carries
-// no position) and pools a block from the alignment's tail. The restore after the chain puts the
-// section back again, over the chain's positions too. Graph-safe.
+// pool's last attention section) at each lane's new frontier -- its indexer tail (and with
+// state.axis_records its record, as restore puts it), and under hq-e8-2b the ring words and the
+// ring rows of the alignment's rejected columns. Without it a chain step at q reads a rejected
+// column's ring row as position q - 512 + i (a ring slot carries no position) and pools a block from
+// the alignment's tail. The restore after the chain puts the section back again, over the chain's
+// positions too. Graph-safe.
 int32_t restore_head(const State &state, const Sections &sections, const Geometry &g, uint32_t lanes, uint32_t window,
-                     const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error);
+                     const int32_t *slots, const int32_t *positions, cudaStream_t stream, std::string *error,
+                     const int32_t *rope_deltas = nullptr);
 
 }  // namespace ignis::flash_next::verify

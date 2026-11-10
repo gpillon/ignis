@@ -203,6 +203,13 @@ pub(crate) mod ffi {
             out_bytes: u64,
         ) -> i32;
 
+        pub fn ignis_media_embedding_place(
+            model: *mut IgnisModel,
+            columns: *const u16,
+            columns_bytes: u64,
+            out_embedding: *mut *mut IgnisMediaEmbedding,
+        ) -> i32;
+
         pub fn ignis_media_embedding_release(embedding: *mut IgnisMediaEmbedding);
 
         pub fn ignis_media_last_error() -> *const c_char;
@@ -928,6 +935,12 @@ pub fn flash_next_ngram_token_bytes() -> usize {
 /// (GitHub #519, #520). On an MTP load the head's entry at the span's last
 /// position is built from the next prompt token, or from the draw on the
 /// prompt's last span.
+///
+/// `span` (GitHub #557), on a load with vision, is a span of a multimodal
+/// prompt, as [`prefill_program_multimodal`]'s: rotated at its three-axis
+/// positions, its placeholder rows taking the media columns, its rope delta
+/// the sequence's for every later round. The n-gram rows still hash the
+/// placeholders' ids. `None` is a text span.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_flash_next(
     model: &Model,
@@ -941,6 +954,7 @@ pub fn prefill_flash_next(
     permitted: &[i32],
     redirect: Redirect<'_>,
     ngram_rows: &[u8],
+    span: Option<MultimodalPrefill<'_>>,
     out_span_logits: Option<&mut [u16]>,
     out_logits: Option<&mut [f32]>,
 ) -> Result<SpanDraw, String> {
@@ -975,7 +989,7 @@ pub fn prefill_flash_next(
         Some(rows) => rows.as_mut_ptr(),
         None => std::ptr::null_mut(),
     };
-    let options = ffi::IgnisPrefillOptions {
+    let mut options = ffi::IgnisPrefillOptions {
         out_span_logits: span_logits,
         out_permitted_prob: &mut probability,
         ngram_rows: ngram_rows.as_ptr(),
@@ -984,6 +998,9 @@ pub fn prefill_flash_next(
         keeps_draw: i32::from(keeps_draw),
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
+    if let Some(span) = span {
+        arm_multimodal("prefill_flash_next", &mut options, span, token_ids.len())?;
+    }
     let params = redirect.arm(permitted_params("prefill_flash_next", sampling, permitted)?);
     let logits = match out_logits {
         Some(row) => row.as_mut_ptr(),
@@ -1632,6 +1649,33 @@ impl MediaEmbedding<'_> {
     }
 }
 
+impl<'m> MediaEmbedding<'m> {
+    /// [`MediaEmbedding::read_bits`]' inverse (GitHub #557): `columns` --
+    /// BF16 bits, `[count][hidden]` at the model's hidden width, which the
+    /// leaf holds them to -- placed in the load's embedding pool as an
+    /// embedding, where an encode would write the tower's: what lets a test
+    /// drive a multimodal prefill with columns it knows on a load whose tower
+    /// is not bound. The error carries the leaf's code beside its message,
+    /// [`MEDIA_ENCODE_POOL_FULL`] as an encode's.
+    ///
+    /// Test-only, as `FlashNextEngine::decode_standing` is: its one caller is
+    /// `FlashNextEngine::place_media`, which integration tests outside the
+    /// crate call. No serving path places columns.
+    #[doc(hidden)]
+    pub fn place(model: &'m Model, columns: &[u16]) -> Result<Self, (i32, String)> {
+        let mut handle = std::ptr::null_mut();
+        let bytes = std::mem::size_of_val(columns) as u64;
+        let rc = unsafe { ffi::ignis_media_embedding_place(model.handle(), columns.as_ptr(), bytes, &mut handle) };
+        if rc != 0 {
+            return Err((rc, media_last_error()));
+        }
+        Ok(MediaEmbedding {
+            handle,
+            _model: PhantomData,
+        })
+    }
+}
+
 impl Drop for MediaEmbedding<'_> {
     fn drop(&mut self) {
         unsafe { ffi::ignis_media_embedding_release(self.handle) }
@@ -1849,6 +1893,37 @@ pub fn prefill_program_attention(
     )
 }
 
+/// A span of a multimodal prompt in `options` (GitHub #178; GitHub #557
+/// shares it with Flash-Next's prefill): its axis-major `[3, tokens]`
+/// positions, its rope delta and its media columns. The positions must be
+/// the span's own, three per token: the leaf reads them by the span's count.
+fn arm_multimodal(
+    what: &str,
+    options: &mut ffi::IgnisPrefillOptions,
+    span: MultimodalPrefill<'_>,
+    tokens: usize,
+) -> Result<(), String> {
+    if span.positions.len() != 3 * tokens {
+        return Err(format!("{what}: {} positions for {} tokens", span.positions.len(), tokens));
+    }
+    let (media, scatter, count, first_column) = match span.media {
+        Some(columns) => (
+            columns.embedding.handle as *const ffi::IgnisMediaEmbedding,
+            columns.scatter_indices.as_ptr(),
+            columns.scatter_indices.len() as u32,
+            columns.first_column,
+        ),
+        None => (std::ptr::null(), std::ptr::null(), 0, 0),
+    };
+    options.mrope_positions = span.positions.as_ptr();
+    options.rope_delta = span.rope_delta;
+    options.media_column_count = count;
+    options.media = media;
+    options.media_scatter_indices = scatter;
+    options.media_first_column = first_column;
+    Ok(())
+}
+
 /// The one prefill both readout entry points share: a text span (`span`
 /// `None`) or a multimodal one, with the attention readout armed from
 /// `attention` when it names one.
@@ -1882,24 +1957,7 @@ fn prefill_program_reading(
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     if let Some(span) = span {
-        if span.positions.len() != 3 * token_ids.len() {
-            return Err(format!("{what}: {} positions for {} tokens", span.positions.len(), token_ids.len()));
-        }
-        let (media, scatter, count, first_column) = match span.media {
-            Some(columns) => (
-                columns.embedding.handle as *const ffi::IgnisMediaEmbedding,
-                columns.scatter_indices.as_ptr(),
-                columns.scatter_indices.len() as u32,
-                columns.first_column,
-            ),
-            None => (std::ptr::null(), std::ptr::null(), 0, 0),
-        };
-        options.mrope_positions = span.positions.as_ptr();
-        options.rope_delta = span.rope_delta;
-        options.media_column_count = count;
-        options.media = media;
-        options.media_scatter_indices = scatter;
-        options.media_first_column = first_column;
+        arm_multimodal(what, &mut options, span, token_ids.len())?;
     }
     // GitHub #263: the head set's inputs and results, as the ABI's i32s.
     // Built only for a readout that names one; everything else passes

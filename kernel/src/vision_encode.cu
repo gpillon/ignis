@@ -31,6 +31,7 @@
 // it there (`VisionEncodeCall::page_bounce`).
 
 #include "ignis_image_vision.h"
+#include "ignis_residency.h"
 #include "ignis_step.h"
 
 #include "model_internal.h"
@@ -790,6 +791,17 @@ VisionStagedShare ignis_vision_staged_share(std::size_t workspace_bytes, std::si
   return {ring_offset, ring_offset + IGNIS_VISION_STAGING_SLOTS * slot_bytes};
 }
 
+VisionEncodePlacement ignis_vision_encode_placement(std::size_t scratch_bytes, std::size_t ring_bytes,
+                                                    std::size_t workspace_bytes, std::size_t slots_bytes) {
+  const std::size_t together =
+      slots_bytes == 0 ? workspace_bytes : align_up(workspace_bytes, kVisionWorkspaceAlignment) + slots_bytes;
+  if (together <= scratch_bytes) return {true, false, false};
+  if (workspace_bytes <= scratch_bytes && slots_bytes <= ring_bytes) return {true, false, true};
+  if (workspace_bytes <= ring_bytes && slots_bytes <= scratch_bytes) return {true, true, false};
+  if (together <= ring_bytes) return {true, true, true};
+  return {};
+}
+
 void ignis_vision_staging_check(const VisionWeights &weights, std::size_t slot_bytes) {
   VisionWeights copy = weights;
   auto stages = stage_tensors(copy);
@@ -813,6 +825,12 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
   }
   if (!model->vision_pool.present()) {
     set_error("ignis_media_encode: the model was loaded without vision");
+    return -1;
+  }
+  // GitHub #557: a pool is not an encoder -- a Flash-Next load holds its pool before its vision
+  // companion's tower is bound to it.
+  if (model->vision.patch_embedding.qdata == nullptr) {
+    set_error("ignis_media_encode: the load bound no vision tower");
     return -1;
   }
   if (input->patches == nullptr || input->position_ids == nullptr || input->cu_seqlens == nullptr ||
@@ -846,16 +864,37 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     const auto patches = static_cast<std::int32_t>(tokens * kVisionMergeUnit);
     const VisionWorkspaceLayout layout = build_workspace_layout(
         patches, static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(t));
-    // GitHub #414: a staged tower's ring follows the workspace, as the load
-    // sized the scratch for (`plan_load_sizes`).
+    // GitHub #414: a staged tower's slots follow the workspace, as the load
+    // sized the scratch for (`plan_load_sizes`). GitHub #558 (ADR 0087): a
+    // Flash-Next load also lends its expert staging ring, idle between
+    // forwards (ignis_residency.h); the workspace and the slots go where
+    // ignis_vision_encode_placement puts them, as its item bound counted.
     const VisionStaging &staging = model->vision_staging;
-    const VisionStagedShare share = ignis_vision_staged_share(layout.bytes, staging.slot_bytes);
-    const std::size_t need = staging.staged() ? share.bytes : layout.bytes;
-    if (need > model->scratch->capacity()) {
-      throw std::runtime_error("the item needs " + std::to_string(need) +
-                               " workspace bytes, the load reserved " +
-                               std::to_string(model->scratch->capacity()));
+    const std::size_t slots = staging.staged() ? IGNIS_VISION_STAGING_SLOTS * staging.slot_bytes : 0;
+    ignis_residency_layout lent{};
+    if (model->vision_ring_lender != nullptr && ignis_residency_get_layout(model->vision_ring_lender, &lent) != 0) {
+      throw std::runtime_error(std::string("the expert staging ring: ") + ignis_residency_last_error());
     }
+    const VisionEncodePlacement at =
+        ignis_vision_encode_placement(model->scratch->capacity(), lent.ring_bytes, layout.bytes, slots);
+    if (!at.fits) {
+      const std::size_t need = staging.staged() ? ignis_vision_staged_share(layout.bytes, staging.slot_bytes).bytes
+                                                : layout.bytes;
+      throw std::runtime_error("the item needs " + std::to_string(need) + " workspace bytes, the load reserved " +
+                               std::to_string(model->scratch->capacity()) +
+                               (lent.ring_bytes == 0 ? std::string()
+                                                     : " and lends an expert staging ring of " +
+                                                           std::to_string(lent.ring_bytes)));
+    }
+    const bool takes_ring = at.workspace_in_ring || (slots != 0 && at.slots_in_ring);
+    // What each area holds, laid out as the scratch lays both: the workspace,
+    // then the slots at the next aligned byte.
+    const auto area_bytes = [&](bool ring) {
+      const bool workspace = at.workspace_in_ring == ring;
+      const bool staged = slots != 0 && at.slots_in_ring == ring;
+      if (workspace && staged) return ignis_vision_staged_share(layout.bytes, staging.slot_bytes).bytes;
+      return (workspace ? layout.bytes : 0) + (staged ? slots : 0);
+    };
     // GitHub #243: the item's pages, claimed before any kernel runs. The
     // embedding owns them, so it is built first and named as their owner.
     auto embedding = std::make_unique<ignis_media_embedding>();
@@ -892,15 +931,30 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     // Held until the stream has drained: nothing else may take these bytes
     // while the encoder's kernels still run on them.
     ninfer::DeviceArena::Scope scope = model->scratch->scope();
-    const ninfer::DeviceSpan backing = model->scratch->alloc_bytes(need, kVisionWorkspaceAlignment);
+    const std::size_t in_scratch = area_bytes(false);
+    auto *scratch_at = in_scratch == 0 ? nullptr
+                                       : static_cast<unsigned char *>(
+                                             model->scratch->alloc_bytes(in_scratch, kVisionWorkspaceAlignment).data);
+    auto *ring_at = static_cast<unsigned char *>(const_cast<void *>(lent.ring));
+    // GitHub #558: the ring's last prefetch copies, if any were left forked,
+    // land before the encode writes it (its demand copies and expert ops are
+    // already behind on this stream: every prefill call synchronizes it).
+    if (takes_ring && ignis_residency_join(model->vision_ring_lender, model->stream) != 0) {
+      throw std::runtime_error(std::string("the expert staging ring's join: ") + ignis_residency_last_error());
+    }
+    const ninfer::DeviceSpan backing{at.workspace_in_ring ? ring_at : scratch_at, layout.bytes};
+    unsigned char *slots_at = at.slots_in_ring ? ring_at : scratch_at;
+    if (slots != 0 && at.slots_in_ring == at.workspace_in_ring) {
+      slots_at += ignis_vision_staged_share(layout.bytes, staging.slot_bytes).ring_offset;
+    }
     // GitHub #414: the encode's own copy of the tower's weights, rebased onto
-    // the ring. Destroyed before `scope`, so every copy has landed before the
-    // scratch is given back.
+    // its slots. Destroyed before `scope`, so every copy has landed before the
+    // scratch (or the ring) is given back.
     VisionWeights staged_weights;
     std::optional<TowerStager> stager;
     if (staging.staged()) {
       staged_weights = model->vision;
-      stager.emplace(staging, staged_weights, static_cast<unsigned char *>(backing.data) + share.ring_offset);
+      stager.emplace(staging, staged_weights, slots_at);
     }
     VisionEncodeCall call;
     call.patches = input->patches;
@@ -970,6 +1024,64 @@ extern "C" int32_t ignis_media_embedding_read(const struct ignis_media_embedding
       return -1;
     }
   }
+  return 0;
+}
+
+// GitHub #557: the pool's rules as the encode keeps them -- the pages claimed before anything is
+// written and given back on any exit but the successful one, the columns in order, page_columns
+// a page -- with the caller's columns where the merger would write.
+extern "C" int32_t ignis_media_embedding_place(struct ignis_model *model, const void *columns, uint64_t columns_bytes,
+                                               struct ignis_media_embedding **out_embedding) {
+  if (out_embedding != nullptr) {
+    *out_embedding = nullptr;
+  }
+  if (model == nullptr || columns == nullptr || out_embedding == nullptr) {
+    set_error("ignis_media_embedding_place: null argument");
+    return -1;
+  }
+  VisionEmbeddingPool &pool = model->vision_pool;
+  if (!pool.present()) {
+    set_error("ignis_media_embedding_place: the model was loaded without vision");
+    return -1;
+  }
+  const std::size_t column_bytes = static_cast<std::size_t>(model->hidden) * sizeof(std::uint16_t);
+  if (columns_bytes == 0 || columns_bytes % column_bytes != 0) {
+    set_error("ignis_media_embedding_place: " + std::to_string(columns_bytes) + " bytes are no whole number of " +
+              std::to_string(column_bytes) + "-byte columns");
+    return -1;
+  }
+  const std::uint64_t count = columns_bytes / column_bytes;
+  const std::uint64_t want_pages = (count + static_cast<std::uint64_t>(pool.page_columns) - 1) / pool.page_columns;
+  if (want_pages > static_cast<std::uint64_t>(pool.pages())) {
+    set_error("ignis_media_embedding_place: " + std::to_string(count) + " columns need " + std::to_string(want_pages) +
+              " pages, and the pool holds " + std::to_string(pool.pages()));
+    return -1;
+  }
+  const auto wanted = static_cast<std::int32_t>(count);
+  const auto want = static_cast<std::int32_t>(want_pages);
+  auto embedding = std::make_unique<ignis_media_embedding>();
+  embedding->model = model;
+  embedding->columns = wanted;
+  embedding->pages = pool.take(want, embedding.get());
+  if (embedding->pages.empty()) {
+    set_error("ignis_media_embedding_place: " + std::to_string(want) + " pages wanted, " +
+              std::to_string(pool.free_pages()) + " free -- release an embedding first");
+    return IGNIS_MEDIA_ENCODE_POOL_FULL;
+  }
+  for (std::size_t p = 0; p < embedding->pages.size(); ++p) {
+    const auto first = static_cast<std::int32_t>(p) * pool.page_columns;
+    const std::int32_t take = std::min(pool.page_columns, wanted - first);
+    const cudaError_t err = cudaMemcpy(pool.page_ptr(embedding->pages[p]),
+                                       reinterpret_cast<const unsigned char *>(columns) +
+                                           static_cast<std::size_t>(first) * column_bytes,
+                                       static_cast<std::size_t>(take) * column_bytes, cudaMemcpyDefault);
+    if (err != cudaSuccess) {
+      pool.give(embedding->pages);
+      set_error(std::string("ignis_media_embedding_place: ") + cudaGetErrorString(err));
+      return -1;
+    }
+  }
+  *out_embedding = embedding.release();
   return 0;
 }
 

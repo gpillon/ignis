@@ -37,6 +37,7 @@ F:/ai/models/Qwen3.8-Flash-Next-ignis/
   report.txt                    the plain end-of-run report
   convert.log                   one progress line per layer
   qwen3_8_flash_next_mtp_3p0-v2.ninfer (+ .conversion.json), work-mtp/   the MTP companion (§13)
+  qwen3_8_flash_next_vision-v2.ninfer (+ .conversion.json, .sha256)    the vision companion (§14)
 ```
 
 - The container's identity is `model_id` `qwen3.8-flash-next`, `weights_id`
@@ -664,3 +665,134 @@ converter's (§13.2). The converter writes the rest:
   phase A's texts is within 0.03 of the BF16 head's (`acceptance.pass`).
 - The binder (spec 07's Rust seam) checks the identity and the pair pin of §13.2, and every
   one of the 1053 objects with its format and shape, nothing more (ADR 0002).
+
+## 14. The vision companion container (ADR 0087)
+
+The checkpoint is multimodal: its first shard holds the vision tower, 333 `model.visual.*`
+tensors (897,862,112 bytes of BF16) that the main container left out. They are converted into
+a **third container beside the main one**, as the MTP head is (§13), so the main container and
+its content hash stay as they are. The tower has the 27B's shape and its own weights, and its
+merger writes Flash-Next's hidden width, 2,560 columns, where the 27B's writes 5,120.
+
+### 14.1 Files and the one command
+
+```
+F:/ai/models/Qwen3.8-Flash-Next-ignis/
+  qwen3_8_flash_next_vision-v2.ninfer                   the companion container (the packer's)
+  qwen3_8_flash_next_vision-v2.ninfer.conversion.json   its sidecar (§14.4)
+  qwen3_8_flash_next_vision-v2.ninfer.sha256            its SHA-256, in sha256sum format
+<work>/                                                 the tool's work tree, consumed by the packer
+  converter.json                                        the converter half of the sidecar
+  vision/                                               the one unit: tensors.json, one file per object, DONE
+<source>/                                               the cache of the checkpoint's visual range
+  visual.bin, visual.json                               the range's bytes; its revision, shard, offset, SHA-256 and tensors
+```
+
+```
+python tools/flash-next-vision/convert.py build --main <main .ninfer> --work <absent or empty> --source <cache>
+```
+
+- `build` reads the index, `config.json`, the first shard's header (by HTTP range) and then
+  the tower's own range of that shard, `[142,293,832, 1,040,155,944)`: the 333 tensors are
+  contiguous there, and no other byte of the checkpoint is read. The range is cached in
+  `<source>` and pinned by its SHA-256 (`665127be…4eb0`, in the tool); a later run reads the
+  cache and nothing from the hub.
+- It encodes the tower (§14.3) into `vision/`, writes `converter.json`, runs the packer
+  (`ignis-artifact-pack --family flash-next-vision --pair-main <main>`, 1 MiB header), reads the
+  companion back against the bytes it encoded and writes the `.sha256`.
+- A second run gives the same bytes, the sidecar and the checksum included: the record holds
+  no clock and no local path (`converter.command` names the containers by file name and the
+  directories by placeholders).
+
+### 14.2 Identity and the pair pin
+
+- `model_id` **`qwen3.8-flash-next-vision`**, `weights_id` **`vision-w8-bf16-de4b8e4`**:
+  neither the main container's nor the MTP companion's, so none binds as another. The weights
+  id names the encoding (§14.3): `check_identity` refuses a companion of another one, such as
+  the grouped `vision-w8q4q5q6-bf16-de4b8e4` first shipped, naming both ids.
+- **The pair pin is §13.2's**, field for field. The tool records the whole-file `file_sha256`
+  of the main container it is given (`pair.main`); the packer hashes the main container it is
+  pointed at, refuses a different or missing value, and writes `model_id`, `weights_id`,
+  `bytes`, `objects`, `content_hash` and `file_sha256` from it. At load,
+  `ignis_artifact::flash_next::vision::check_pair` compares `model_id`, `weights_id` and
+  `content_hash` with the opened main container's and refuses a mismatch by name, and
+  `check_identity` refuses a container that is not a vision companion.
+
+### 14.3 Objects
+
+The 27B tower's 333 objects under the same names, at Flash-Next's widths, in Flash-Next's own
+recipe (GitHub #556): **every matrix W8**, the norms, biases and position table BF16. The
+owner chose it on #560's alarm (2026-11-10): in the 27B's grouped formats (Q6 patch embedding,
+Q4 qkv and fc1, Q5 output and fc2) the served tower's rows sat 0.305 in relative L2 from its
+BF16 tower's against the 27B's 0.183, the error growing at its retrained merger; with every
+matrix W8 the CPU simulation gave 0.029. The tool builds the objects itself
+(`flash_next_objects`) and encodes them with the 27B converter's routes and encoders
+(`tools/27b-nvfp4-converter`, unchanged). The packer holds the work tree to
+`ignis_artifact::flash_next::vision::entries`,
+and a load binds the tower by the same table (`flash_next::vision::scope`), which a test holds
+to `ignis_artifact::inventory::vision_scope(2560)` (the 27B's table at Flash-Next's width) in
+names, layouts and shapes, every matrix W8.
+
+| object | format | shape |
+|---|---|---|
+| `vision/patch_embedding` (the checkpoint's `[1152, 3, 2, 16, 16]`, flattened) | W8G32_F16S | [1152, 1536] |
+| `vision/patch_embedding_bias` | BF16 | [1152] |
+| `vision/position_embedding` | BF16 | [2304, 1152] |
+| `vision/layers/{0..26}/attention/qkv` | W8G32_F16S | [3456, 1152] |
+| `vision/layers/{b}/attention/output` | W8G32_F16S | [1152, 1152] |
+| `vision/layers/{b}/mlp/fc1` | W8G32_F16S | [4304, 1152] |
+| `vision/layers/{b}/mlp/fc2` (K stored 4,352 wide, the padded path) | W8G32_F16S | [1152, 4304] |
+| `vision/layers/{b}/` the four biases, `norm1/` and `norm2/` `weight` and `bias` | BF16 | their vectors |
+| `vision/merger/fc1` | W8G32_F16S | [4608, 4608] |
+| `vision/merger/fc2` | W8G32_F16S | **[2560, 4608]** |
+| `vision/merger/fc2_bias` | BF16 | **[2560]** |
+| `vision/merger/fc1_bias`, `norm/weight`, `norm/bias` | BF16 | [4608], [1152], [1152] |
+
+- W8G32_F16S is `row-split-k128-v1` (one int8 code per weight, a binary16 scale per group of
+  32, each row K-padded to 128), BF16 `contiguous-le-v1`; every matrix is encoded on the CPU,
+  its group scales computed on the host (the 27B encoder's rule). Every (format, shape) has a
+  W8 route the image model's tower (#320) and the merger (#557) already take: no new kernel
+  route, and the `host` residency's staging slot stays the merger's norm and fc1 stage.
+- The image preprocessor's settings are not in the companion: the main container already
+  carries `frontend/preprocessor_config.json` (§8).
+- Payload: 481,445,216 bytes (the 27B's tower, 5,120 wide and grouped, is 295,711,648; the
+  grouped companion first shipped held 283,172,768). The companion built from the pinned
+  revision is 482,499,840 bytes, SHA-256 `0110bb79…1724`, its sidecar 1,795 bytes.
+
+### 14.4 The sidecar
+
+`<companion>.conversion.json` is the tool's `converter.json` merged with the packer's keys
+(`recipe_id`, `artifact.bytes`, `objects.count`, `pair.main`'s fields from the main
+container). Measured values only: no verdict, no limit.
+
+```jsonc
+{
+  "schema": "flash-next-vision-converter-v1",
+  "status": "complete",
+  "source": {"repo": "Qwen/Qwen3.8-Flash-Next", "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+             "file": "model-00001-of-00131.safetensors", "prefix": "model.visual.", "tensors": 333,
+             "offset": 142293832, "bytes": 897862112, "sha256": "<the range's>"},
+  "pair": {"main": {"file": "qwen3_8_flash_next_trellis_a25-v2.ninfer", "file_sha256": "...",
+                    "model_id": "...", "weights_id": "...", "bytes": n, "objects": n, "content_hash": "..."}},
+  "tower": {"layers": 27, "hidden": 1152, "intermediate": 4304, "patch": 1536, "positions": 2304, "out_hidden": 2560},
+  "recipe": {"of": "Flash-Next's own: every matrix W8G32_F16S, ...", "objects": 333,
+             "formats": {"BF16": 222, "W8G32_F16S": 111}, "payload_bytes": 481445216},
+  "converter": {"commit": "...", "dirty": false, "command": "<argv, no local path>"},
+  "versions": {"python": "...", "torch": "...", "numpy": "..."},
+  "recipe_id": "qwen3_8_flash_next_vision-v2", "artifact": {"bytes": n}, "objects": {"count": 333}
+}
+```
+
+### 14.5 Checks
+
+- The tool refuses, before it writes anything to the work tree or the companion: a
+  `vision_config` that is not the tower's (each member named), a visual tensor missing, extra,
+  of another shape or not BF16, a tower over two shards or not one contiguous range, a range
+  whose size or SHA-256 is not the pin's, a cache that does not match its own record, a work
+  tree that is not empty and a companion that exists.
+- The packer plans `vision/` from the inventory: a missing object, one of another format,
+  layout or shape (a merger 5,120 wide among them), and one the inventory does not name are
+  refused by name before a byte of the unit is appended; so is a `converter.json` whose
+  `pair.main.file_sha256` is missing or is not the main container's.
+- The load binds the companion only with vision on (GitHub #557): the identity, the pair pin of
+  §14.2, then every object with its format and shape.

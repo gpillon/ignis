@@ -16,6 +16,9 @@
 pub use ignis_artifact::vision::{Grid, MediaItem, PreparedPrompt, TokenSpan};
 pub use ignis_artifact::VisionResidency;
 
+use ignis_artifact::InventoryEntry;
+
+use crate::compute::ModelConfig;
 use crate::types::TokenId;
 
 /// The default vision envelope, in merged vision tokens per request (131,072
@@ -30,9 +33,6 @@ pub const VISION_MAX_TOKENS_LIMIT: u32 = 1 << 20;
 /// blocks of twelve, and the merger's six.
 pub const VISION_OBJECTS: usize = 3 + 27 * 12 + 6;
 
-/// The target's hidden width, which the encoder's merged output carries.
-const HIDDEN: u64 = 5120;
-
 /// The leaf's vision allocation alignment (`kVisionWorkspaceAlignment`).
 const VISION_ALIGN: u64 = 256;
 
@@ -46,11 +46,92 @@ const VISION_ALIGN: u64 = 256;
 pub const MEDIA_ENCODE_POOL_FULL: i32 = -2;
 
 /// Merged columns per embedding pool page (`IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS`,
-/// GitHub #243). At [`HIDDEN`] a page is 1,280 KiB.
+/// GitHub #243): a page is [`EmbeddingWidth::page_bytes`], 1,280 KiB on the
+/// 27B.
 pub const EMBEDDING_PAGE_COLUMNS: u64 = 128;
 
-/// One embedding pool page, in bytes.
-pub const EMBEDDING_PAGE_BYTES: u64 = HIDDEN * EMBEDDING_PAGE_COLUMNS * 2;
+/// The merger object whose rows are a media embedding's width, and its bias.
+const MERGER_OUTPUT: [&str; 2] = ignis_artifact::nvfp4_27b::VISION_MERGER_OUTPUT;
+
+/// How wide a media embedding is (GitHub #562): the rows the vision tower's
+/// merger writes, which are the hidden width of the text model it feeds --
+/// 5,120 on the 27B, 2,560 on Flash-Next (ADR 0087). Read off the `vision/*`
+/// objects a load binds and checked against the model they are bound to
+/// ([`Self::from_inventory`]), so the plans size the embedding pool the way
+/// the leaf does, from the model's hidden width, and never from one family's
+/// constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingWidth {
+    hidden: u64,
+}
+
+/// Vision objects bound to a text model whose hidden width their merger does
+/// not write, or that hold no merger at all (GitHub #562).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisionWidthMismatch {
+    /// The merger object that disagrees, or that the objects lack.
+    pub object: &'static str,
+    /// The rows it writes; `None` when the objects hold no such object.
+    pub width: Option<u64>,
+    /// The hidden width of the text model they are bound to.
+    pub model_hidden: u64,
+}
+
+impl std::fmt::Display for VisionWidthMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { object, width, model_hidden } = self;
+        match width {
+            Some(width) => write!(
+                f,
+                "vision object `{object}` is {width} wide, but the text model it is bound to is {model_hidden} wide"
+            ),
+            None => write!(
+                f,
+                "the vision objects have no `{object}`, which must write the {model_hidden}-wide hidden of the text model they are bound to"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VisionWidthMismatch {}
+
+impl EmbeddingWidth {
+    /// The width `objects` (the inventory a load binds its vision tower by)
+    /// write into a text model `model_hidden` wide ([`ModelConfig::hidden`]):
+    /// the merger's `fc2` rows, refused unless they and its bias's are the
+    /// model's.
+    pub fn from_inventory(objects: &[InventoryEntry], model_hidden: u64) -> Result<Self, VisionWidthMismatch> {
+        for object in MERGER_OUTPUT {
+            let width = objects.iter().find(|entry| entry.name == object).and_then(|entry| entry.shape.first().copied());
+            if width != Some(model_hidden) {
+                return Err(VisionWidthMismatch { object, width, model_hidden });
+            }
+        }
+        Ok(Self { hidden: model_hidden })
+    }
+
+    /// The 27B's: the vision objects it binds
+    /// ([`ignis_artifact::vision_scope_27b`]) on its text model.
+    pub fn qwen38_27b() -> Self {
+        Self::from_inventory(&ignis_artifact::vision_scope_27b(), ModelConfig::qwen38_27b().hidden)
+            .expect("the 27B's vision objects write its hidden width")
+    }
+
+    /// The rows of one merged column: the bound model's hidden width.
+    pub fn hidden(self) -> u64 {
+        self.hidden
+    }
+
+    /// One merged column, in BF16 bytes.
+    fn column_bytes(self) -> u64 {
+        self.hidden * 2
+    }
+
+    /// One embedding pool page, in bytes.
+    pub fn page_bytes(self) -> u64 {
+        self.column_bytes() * EMBEDDING_PAGE_COLUMNS
+    }
+}
 
 /// The embedding pool a load that names none asks for (GitHub #243): zero,
 /// which [`Vision::pool_bytes`] raises to its floor — one envelope-wide
@@ -163,16 +244,17 @@ impl Vision {
     }
 
     /// The embedding pool the leaf reserves, in bytes: whole pages, never
-    /// below one envelope-wide item (GitHub #243).
-    pub fn pool_bytes(&self, max_context_tokens: u32) -> u64 {
-        let floor = self.output_transient_bytes(max_context_tokens);
+    /// below one envelope-wide item (GitHub #243), of embeddings `width`
+    /// wide (GitHub #562).
+    pub fn pool_bytes(&self, max_context_tokens: u32, width: EmbeddingWidth) -> u64 {
+        let floor = self.output_transient_bytes(max_context_tokens, width);
         let want = self.pool_bytes.max(floor);
-        want.div_ceil(EMBEDDING_PAGE_BYTES) * EMBEDDING_PAGE_BYTES
+        want.div_ceil(width.page_bytes()) * width.page_bytes()
     }
 
     /// The pool's pages at `max_context_tokens`.
-    pub fn pool_pages(&self, max_context_tokens: u32) -> u64 {
-        self.pool_bytes(max_context_tokens) / EMBEDDING_PAGE_BYTES
+    pub fn pool_pages(&self, max_context_tokens: u32, width: EmbeddingWidth) -> u64 {
+        self.pool_bytes(max_context_tokens, width) / width.page_bytes()
     }
 
     /// What the operator asked for, before the floor and the rounding — what
@@ -187,11 +269,11 @@ impl Vision {
         self.max_tokens.min(max_context_tokens)
     }
 
-    /// One item's `[5120, V]` BF16 encoder output at the envelope, rounded to
-    /// the leaf's alignment — the widest single embedding, and so (GitHub
-    /// #243) the floor under [`Self::pool_bytes`].
-    pub fn output_transient_bytes(&self, max_context_tokens: u32) -> u64 {
-        let bytes = HIDDEN * u64::from(self.envelope_tokens(max_context_tokens)) * 2;
+    /// One item's `[hidden, V]` BF16 encoder output at the envelope, `width`
+    /// wide, rounded to the leaf's alignment — the widest single embedding,
+    /// and so (GitHub #243) the floor under [`Self::pool_bytes`].
+    pub fn output_transient_bytes(&self, max_context_tokens: u32, width: EmbeddingWidth) -> u64 {
+        let bytes = width.column_bytes() * u64::from(self.envelope_tokens(max_context_tokens));
         bytes.div_ceil(VISION_ALIGN) * VISION_ALIGN
     }
 }
@@ -482,6 +564,12 @@ pub fn vision_item_control(grid: Grid) -> VisionItemControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ignis_artifact::flash_next::vision as flash_next_vision;
+
+    /// The objects a Flash-Next load binds its tower by, its merger 2,560 wide.
+    fn flash_next_tower() -> Vec<InventoryEntry> {
+        flash_next_vision::scope(&flash_next_vision::geometry())
+    }
 
     fn item(begin: usize, count: usize) -> MediaItem {
         // A grid of `count` merged tokens laid out in one row.
@@ -676,8 +764,9 @@ mod tests {
     #[test]
     fn the_output_transient_is_one_items_bf16_hidden_columns() {
         // 5120 x 32768 x 2 bytes, already a multiple of 256.
-        assert_eq!(Vision::default().output_transient_bytes(262_144), 335_544_320);
-        assert_eq!(Vision::new(1).unwrap().output_transient_bytes(4096), 10_240);
+        let width = EmbeddingWidth::qwen38_27b();
+        assert_eq!(Vision::default().output_transient_bytes(262_144, width), 335_544_320);
+        assert_eq!(Vision::new(1).unwrap().output_transient_bytes(4096, width), 10_240);
     }
 
     #[test]
@@ -691,9 +780,11 @@ mod tests {
         // boundary is a 256-aligned address whatever the page width is —
         // which is what lets the encoder write and the prefill read at a
         // page pointer with the same ops they used on one flat buffer.
-        assert_eq!(EMBEDDING_PAGE_BYTES, 1_310_720);
-        assert_eq!(EMBEDDING_PAGE_BYTES % VISION_ALIGN, 0);
-        assert_eq!(HIDDEN * 2 % VISION_ALIGN, 0);
+        let width = EmbeddingWidth::qwen38_27b();
+        assert_eq!(width.hidden(), 5120, "the 27B's merger writes its hidden");
+        assert_eq!(width.page_bytes(), 1_310_720);
+        assert_eq!(width.page_bytes() % VISION_ALIGN, 0);
+        assert_eq!(width.hidden() * 2 % VISION_ALIGN, 0);
     }
 
     #[test]
@@ -702,14 +793,15 @@ mod tests {
         // nothing: the default pool is one envelope-wide embedding, which is
         // the reservation GitHub #177 took.
         let vision = Vision::default();
+        let width = EmbeddingWidth::qwen38_27b();
         assert_eq!(DEFAULT_EMBEDDING_POOL_BYTES, 0, "zero asks for the floor");
-        assert_eq!(vision.pool_bytes(262_144), vision.output_transient_bytes(262_144));
-        assert_eq!(vision.pool_bytes(262_144), 335_544_320);
-        assert_eq!(vision.pool_pages(262_144), 256);
+        assert_eq!(vision.pool_bytes(262_144, width), vision.output_transient_bytes(262_144, width));
+        assert_eq!(vision.pool_bytes(262_144, width), 335_544_320);
+        assert_eq!(vision.pool_pages(262_144, width), 256);
         // And at a short context the floor moves with the envelope, rather
         // than reserving 320 MiB for tokens this load can never carry.
-        assert_eq!(vision.pool_bytes(2048), vision.output_transient_bytes(2048));
-        assert_eq!(vision.pool_bytes(2048), 16 * EMBEDDING_PAGE_BYTES);
+        assert_eq!(vision.pool_bytes(2048, width), vision.output_transient_bytes(2048, width));
+        assert_eq!(vision.pool_bytes(2048, width), 16 * width.page_bytes());
     }
 
     #[test]
@@ -719,13 +811,14 @@ mod tests {
         // everything else is released, or "release something and retry"
         // never ends. Asking for less is raised, not refused.
         let vision = Vision::default().with_pool_bytes(1024);
+        let width = EmbeddingWidth::qwen38_27b();
         assert_eq!(vision.requested_pool_bytes(), 1024);
-        assert_eq!(vision.pool_bytes(262_144), 335_544_320);
+        assert_eq!(vision.pool_bytes(262_144, width), 335_544_320);
 
         // Above the floor it is the request, rounded up to whole pages.
         let big = Vision::default().with_pool_bytes(335_544_320 + 1);
-        assert_eq!(big.pool_bytes(262_144), 335_544_320 + EMBEDDING_PAGE_BYTES);
-        assert_eq!(big.pool_pages(262_144), 257);
+        assert_eq!(big.pool_bytes(262_144, width), 335_544_320 + width.page_bytes());
+        assert_eq!(big.pool_pages(262_144, width), 257);
     }
 
     #[test]
@@ -736,7 +829,8 @@ mod tests {
         assert_eq!(bounded.max_tokens(), 32_768, "the request's envelope does not move");
         // The pool holds a request's items, so its floor stays one
         // envelope-wide item whatever one item may be.
-        assert_eq!(bounded.pool_bytes(262_144), Vision::default().pool_bytes(262_144));
+        let width = EmbeddingWidth::qwen38_27b();
+        assert_eq!(bounded.pool_bytes(262_144, width), Vision::default().pool_bytes(262_144, width));
     }
 
     #[test]
@@ -745,9 +839,57 @@ mod tests {
         // floors the pool far lower — and a pool asked for in bytes is then
         // as many items as fit, not one.
         let vision = Vision::new(1024).unwrap().with_pool_bytes(0);
-        assert_eq!(vision.pool_bytes(4096), 8 * EMBEDDING_PAGE_BYTES);
-        assert_eq!(vision.output_transient_bytes(4096), 1024 * HIDDEN * 2);
-        assert_eq!(vision.pool_bytes(4096), vision.output_transient_bytes(4096));
+        let width = EmbeddingWidth::qwen38_27b();
+        assert_eq!(vision.pool_bytes(4096, width), 8 * width.page_bytes());
+        assert_eq!(vision.output_transient_bytes(4096, width), 1024 * 5120 * 2);
+        assert_eq!(vision.pool_bytes(4096, width), vision.output_transient_bytes(4096, width));
+    }
+
+    /// GitHub #562: the pool's page is as wide as the vision objects a load
+    /// binds write. Flash-Next's tower, its merger 2,560 wide (ADR 0087),
+    /// plans pages of half the 27B's 1,280 KiB, and at the default envelope a
+    /// pool of 2,560 x 32,768 BF16 = 160 MiB (#555).
+    #[test]
+    fn a_2560_wide_inventory_plans_a_pool_of_half_the_27bs_page_bytes() {
+        let width = EmbeddingWidth::from_inventory(&flash_next_tower(), 2560).expect("the merger writes the model's hidden");
+        assert_eq!(width.hidden(), 2560);
+        assert_eq!(width.page_bytes(), 655_360);
+        assert_eq!(2 * width.page_bytes(), EmbeddingWidth::qwen38_27b().page_bytes());
+        assert_eq!(width.page_bytes() % VISION_ALIGN, 0, "a page boundary stays a 256-aligned address");
+
+        let vision = Vision::default();
+        assert_eq!(vision.output_transient_bytes(262_144, width), 160 << 20);
+        assert_eq!(vision.pool_bytes(262_144, width), 160 << 20);
+        assert_eq!(vision.pool_pages(262_144, width), 256);
+        // A named pool is rounded up to the narrower pages.
+        let named = Vision::default().with_pool_bytes((160 << 20) + 1);
+        assert_eq!(named.pool_bytes(262_144, width), (160 << 20) + 655_360);
+        assert_eq!(named.pool_pages(262_144, width), 257);
+    }
+
+    /// GitHub #562: an inventory is bound to a text model only when its
+    /// merger writes that model's hidden width, both the projection and its
+    /// bias; otherwise the load is refused naming the object and both widths.
+    #[test]
+    fn an_inventory_whose_widths_disagree_with_its_model_is_refused() {
+        let refusal = EmbeddingWidth::from_inventory(&flash_next_tower(), 5120).expect_err("Flash-Next's tower on the 27B");
+        assert_eq!(refusal, VisionWidthMismatch { object: "vision/merger/fc2", width: Some(2560), model_hidden: 5120 });
+        let message = refusal.to_string();
+        assert!(message.contains("vision/merger/fc2") && message.contains("2560") && message.contains("5120"), "{message}");
+        let refusal = EmbeddingWidth::from_inventory(&ignis_artifact::vision_scope_27b(), 2560).expect_err("the 27B's tower on Flash-Next");
+        assert_eq!(refusal, VisionWidthMismatch { object: "vision/merger/fc2", width: Some(5120), model_hidden: 2560 });
+
+        // A bias as wide as another model is refused though the projection agrees.
+        let mut torn = flash_next_tower();
+        torn.iter_mut().find(|e| e.name == "vision/merger/fc2_bias").expect("the bias").shape = &[5120];
+        let refusal = EmbeddingWidth::from_inventory(&torn, 2560).expect_err("the bias disagrees");
+        assert_eq!(refusal, VisionWidthMismatch { object: "vision/merger/fc2_bias", width: Some(5120), model_hidden: 2560 });
+
+        // Objects with no merger name no width at all.
+        let text = ignis_artifact::text_scope_27b();
+        let refusal = EmbeddingWidth::from_inventory(&text, 5120).expect_err("no vision objects");
+        assert_eq!(refusal, VisionWidthMismatch { object: "vision/merger/fc2", width: None, model_hidden: 5120 });
+        assert!(refusal.to_string().contains("vision/merger/fc2"), "{refusal}");
     }
 
     /// ADR 0075 (GitHub #414): the residency rides the load option beside the

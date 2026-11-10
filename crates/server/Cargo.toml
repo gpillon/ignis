@@ -28,6 +28,9 @@ axum = { workspace = true, features = ["ws", "multipart"] }
 # body that holds its request's in-flight count until it ends, for idle
 # unload (spec model-switch/02, `idle.rs`). Already in the tree under axum.
 http-body = "1"
+# `Limited`: the request body cap, read per request off the model serving then
+# (`api::limit_request_body`, #563). Already in the tree under axum.
+http-body-util = { workspace = true }
 tokio = { workspace = true }
 futures-core = { workspace = true }
 utoipa = { workspace = true }
@@ -75,7 +78,6 @@ windows-sys = { workspace = true }
 # below): this crate again, with the feature on, so a shipped build has none.
 ignis-server = { path = ".", features = ["fake-speech"] }
 tower = { workspace = true }
-http-body-util = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The G1 canary gate (ADR 0014, GitHub #76): the teacher-forced agreement
 # scoring + the >= 95% floor live in `ignis_bench::oracle` so the arithmetic

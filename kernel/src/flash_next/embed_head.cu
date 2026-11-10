@@ -47,7 +47,40 @@ __global__ void embed_rows(const uint8_t *__restrict__ weight, bool fp8, int64_t
   }
 }
 
+// One block per column: its row, written to every stream. A row outside the residual traps rather
+// than writing another call's activations.
+__global__ void embed_columns(const __nv_bfloat16 *__restrict__ columns, const int32_t *__restrict__ rows,
+                              int32_t residual_rows, int32_t hidden, int32_t streams,
+                              __nv_bfloat16 *__restrict__ residual) {
+  const int64_t column = blockIdx.x;
+  const int32_t row = rows[column];
+  if (row < 0 || row >= residual_rows) {
+    __trap();
+  }
+  for (int32_t h = static_cast<int32_t>(threadIdx.x); h < hidden; h += kThreads) {
+    const __nv_bfloat16 value = columns[column * hidden + h];
+    for (int32_t s = 0; s < streams; ++s) {
+      residual[(static_cast<int64_t>(row) * streams + s) * hidden + h] = value;
+    }
+  }
+}
+
 }  // namespace
+
+int32_t fn_embed_columns(const Geometry &g, const void *columns, const int32_t *rows, int32_t count,
+                         int32_t residual_rows, void *residual, cudaStream_t stream) {
+  if (columns == nullptr || rows == nullptr || residual == nullptr || count <= 0 || residual_rows <= 0) {
+    fn_set_error("fn_embed_columns: null operand or no columns");
+    return -1;
+  }
+  embed_columns<<<count, kThreads, 0, stream>>>(static_cast<const __nv_bfloat16 *>(columns), rows, residual_rows,
+                                                g.hidden, g.streams, static_cast<__nv_bfloat16 *>(residual));
+  if (const cudaError_t err = cudaGetLastError(); err != cudaSuccess) {
+    fn_set_error(std::string("fn_embed_columns: launch failed: ") + cudaGetErrorString(err));
+    return -1;
+  }
+  return 0;
+}
 
 int32_t fn_embed(const Geometry &g, const Linear &embed, const int32_t *ids, int32_t rows,
                  void *residual, cudaStream_t stream) {

@@ -337,7 +337,11 @@ struct ignis_model_load_options {
    * IGNIS_VISION_MAX_TOKENS_LIMIT. Independent of the backend above
    * (GitHub #195): a load may ask for both, and then the verify round
    * rotates its columns at `position + rope_delta` the way a decode round
-   * already does. */
+   * already does. GitHub #557 (ADR 0087): on Flash-Next the `vision/*`
+   * tensors are its vision companion's, the encoder runs in the prefill
+   * scratch as sized for the text and (GitHub #558) in the expert staging
+   * ring of the residency below, and the item bound shrinks to what those
+   * hold (ignis_model_vision_item_max_tokens). */
   uint32_t vision_max_tokens;
   /* GitHub #243: bytes reserved for the media embedding pool, carved into
    * fixed-width column pages (IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS columns of
@@ -536,6 +540,25 @@ int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor *tensors, 
                                       const struct ignis_model_load_options *options,
                                       struct ignis_model_reservations *out);
 
+/* GitHub #557: the item bound a load of the same arguments would hold
+ * (ignis_model_vision_item_max_tokens), without allocating anything, as
+ * `ignis_model_plan_reservations` plans: 0 without vision. On Flash-Next it
+ * is what the plan's VRAM report names when the prefill scratch and the
+ * expert staging ring hold a smaller item than the one asked for (ADR 0087).
+ * GitHub #558: `staging_ring_bytes` is the expert staging ring the plan
+ * places (0 on a card that holds every expert, which stages nothing), which
+ * the load reads off its residency instead; the 27B, whose encode has its
+ * own share of the scratch, is refused one.
+ *
+ * Returns 0 and fills `*out_tokens` on success, -1 otherwise (see
+ * ignis_model_last_error). */
+int32_t ignis_model_plan_vision_item_max_tokens(const struct ignis_bound_tensor *tensors, uint64_t count,
+                                                const struct ignis_topology *topology,
+                                                uint32_t prefill_chunk_tokens, uint32_t max_context_tokens,
+                                                int32_t kv_format,
+                                                const struct ignis_model_load_options *options,
+                                                uint64_t staging_ring_bytes, uint32_t *out_tokens);
+
 /* Build the leaf's per-layer weight structures from `tensors` (`count`
  * entries) against `topology`. `prefill_chunk_tokens` is the widest prefill
  * chunk the caller will ever hand `ignis_program_prefill` (P2-01, GitHub
@@ -602,6 +625,17 @@ int32_t ignis_model_stats(const struct ignis_model *model, struct ignis_model_st
  * also sized its scratch. IGNIS_GDN_PREFILL_VENDORED for NULL and for
  * Flash-Next, whose GDN layers are its own. */
 uint32_t ignis_model_gdn_prefill(const struct ignis_model *model);
+
+/* GitHub #557: the most merged vision tokens one media item may hold on a
+ * loaded model -- what its encoder's share of the scratch was sized for, and
+ * what `ignis_media_encode` checks an item against. On the 27B the load's
+ * `vision_item_max_tokens` within the envelope and the context. On
+ * Flash-Next (ADR 0087) the largest item whose encode -- its workspace, and
+ * under IGNIS_VISION_RESIDENCY_HOST the tower's staging slots -- fits the
+ * prefill scratch and the expert staging ring (GitHub #558: idle between
+ * forwards, ignis_residency.h), at most that bound: its encode takes no VRAM
+ * of its own. 0 for NULL and without vision. */
+uint32_t ignis_model_vision_item_max_tokens(const struct ignis_model *model);
 
 /* Release a model handle. NULL is a no-op. */
 void ignis_model_free(struct ignis_model *model);

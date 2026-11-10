@@ -27,7 +27,7 @@ use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_artifact::vision::{Grid, PATCH_FEATURES};
 use ignis_core::step::{encode_media, program_stats};
 use ignis_core::vision::vision_item_control;
-use ignis_core::{ExceptionWeights, KvFormat, Vision, VISION_OBJECTS};
+use ignis_core::{EmbeddingWidth, ExceptionWeights, KvFormat, Vision, VISION_OBJECTS};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 
@@ -134,7 +134,7 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
     // encoder's workspace for 1024 tokens is larger than the prefill scratch
     // it shares (GitHub #212); where the scratch is the larger, it grows by 0.
     assert!(
-        vision_reserved > vision.output_transient_bytes(SMALL_CONTEXT),
+        vision_reserved > vision.output_transient_bytes(SMALL_CONTEXT, EmbeddingWidth::qwen38_27b()),
         "the reservation is the output transient plus the encoder's growth of the shared scratch"
     );
     assert_eq!(
@@ -168,11 +168,12 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
     let (_, _, bounded_reserved) = load(&handles, SERVING_CONTEXT, Some(bounded));
     let (_, _, small_reserved) = load(&handles, SERVING_CONTEXT, Some(small));
     assert_eq!(
-        bounded_reserved - bounded.pool_bytes(SERVING_CONTEXT),
-        small_reserved - small.pool_bytes(SERVING_CONTEXT),
+        bounded_reserved - bounded.pool_bytes(SERVING_CONTEXT, EmbeddingWidth::qwen38_27b()),
+        small_reserved - small.pool_bytes(SERVING_CONTEXT, EmbeddingWidth::qwen38_27b()),
         "an item bound grows the scratch like an envelope that small"
     );
-    assert_eq!(bounded.pool_bytes(SERVING_CONTEXT), vision.pool_bytes(SERVING_CONTEXT));
+    let width = EmbeddingWidth::qwen38_27b();
+    assert_eq!(bounded.pool_bytes(SERVING_CONTEXT, width), vision.pool_bytes(SERVING_CONTEXT, width));
     assert!(bounded_reserved < default_reserved, "the item bound shrinks the reservation");
     println!(
         "vision reservation with a {ITEM_BOUND}-token item bound: {bounded_reserved} bytes ({:.1} MiB)",

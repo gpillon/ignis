@@ -935,8 +935,10 @@ _Avoid_: idle chunk, burst chunk.
 **Prefill scratch**:
 The load's one device region for a step's transient buffers, sized at load for
 the larger of what a **solo width** chunk needs and what a **media encode** of
-one **item bound** needs (the VRAM plan's `workspace` line). The two never run at
-once, and nothing in it survives from one step to the next.
+one **item bound** needs (the VRAM plan's `workspace` line); on Flash-Next for
+the chunk alone, the **item bound** being what it holds with the expert
+staging ring (ADR 0087). The two
+never run at once, and nothing in it survives from one step to the next.
 _Avoid_: workspace (a user's files), arena (KV-RAM's).
 
 **Per-token prefill route**:
@@ -1187,8 +1189,14 @@ counted in.
 
 **Item bound**:
 The most **vision tokens** one **media item** may take: the smaller of the
-request's envelope and the artifact's pixel bound (16,384 for the 27B), so an
-envelope of 32,768 still bounds each image at 16,384. An image over it is
+request's envelope and the artifact's pixel bound (16,384 for the 27B and for
+Flash-Next), so an envelope of 32,768 still bounds each image at 16,384. On
+Flash-Next it is also no larger than the item whose **media encode** its
+**prefill scratch** and its expert staging ring hold, both idle while an item
+encodes (#557, #558, ADR 0087); on a card that holds every expert there is no
+ring, and the scratch alone bounds it. On the RTX 5090 Flash-Next's is the
+full 16,384: an 8,192-token chunk's scratch holds it alone, a 1,024-token
+chunk's with the ring (#560). An image over it is
 downscaled onto a smaller grid, not refused (#248).
 _Avoid_: envelope (the request's total).
 

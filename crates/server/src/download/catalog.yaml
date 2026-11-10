@@ -54,19 +54,22 @@ models:
       - { name: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer.graft.json, bytes: 41707, sha256: "09b0df892c314563192b0a4f102139939d4ef6261fcd210439d4e2636d12e6fe" }
       - { name: qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer, bytes: 19406942468, sha256: "18954280c794cb2ff1fc24ada8158de1df11bf0a0a2ea63f109045af48905ef1" }
 
-  # Flash-Next with its MTP companion container, which the loader finds
-  # beside the main one under its fixed name: an entry is the release, so the
-  # companion comes with it even when MTP is off.
+  # Flash-Next with its two companion containers, the MTP head and the vision
+  # encoder (ADR 0087), which the loader finds beside the main one under their
+  # fixed names: an entry is the release, so the companions come with it even
+  # when MTP or vision is off.
   - id: qwen3.8-flash-next
     repo: gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis
-    revision: "8d94db83cd8e58d6be31e796723e5e35b960638c"
+    revision: "6457921d4e2d4869452b373053b0374381046ba2"
     artifact: qwen3_8_flash_next_trellis_a25-v2.ninfer
     card_class: 32
     generation: blackwell
-    license: { id: qwen-community-1.0, url: "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/8d94db83cd8e58d6be31e796723e5e35b960638c/LICENSE" }
+    license: { id: qwen-community-1.0, url: "https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis/blob/6457921d4e2d4869452b373053b0374381046ba2/LICENSE" }
     files:
+      - { name: qwen3_8_flash_next_vision-v2.ninfer.conversion.json, bytes: 1795, sha256: "a1f3f7afd0c58586b11c2e8a15d5e6f85d886570334f11a785c343796173c03c" }
       - { name: qwen3_8_flash_next_mtp_3p0-v2.ninfer.conversion.json, bytes: 179029, sha256: "a5b2c10fe0745cfe6b8e2914135e44903cfb80acb3f0db21e549e76641f14127" }
       - { name: qwen3_8_flash_next_trellis_a25-v2.ninfer.conversion.json, bytes: 1183942, sha256: "9858d9fb03dd66fa2558b5dc6aa6463ee70f00024ffbd746545b231c9514f7a0" }
+      - { name: qwen3_8_flash_next_vision-v2.ninfer, bytes: 482499840, sha256: "0110bb795ddf70a6f9f3a73efd4a0d2094140e8d4bac2bdf28bf89d229ee1724" }
       - { name: qwen3_8_flash_next_mtp_3p0-v2.ninfer, bytes: 1037905920, sha256: "432fe5c0838027047c5b46c4fde526f3d3ef3d126f00fed1213921f8705988d2" }
       - { name: qwen3_8_flash_next_trellis_a25-v2.ninfer, bytes: 71760711680, sha256: "12e3b265b0678ba935a4b05d1b612ba4b68b3a96c3026d818ad65838985fd864" }
 
