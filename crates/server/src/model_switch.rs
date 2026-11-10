@@ -214,10 +214,14 @@ impl ModelLoader for ArtifactLoader {
     /// The load's own prepare-time check of the vision companion
     /// ([`crate::load::check_vision_companion`]), asked early, on the
     /// configuration this switch would load the target with ([`fit_options`],
-    /// which says nothing: the prepare after it logs the fit).
+    /// which says nothing: the prepare after it logs the fit). Only a
+    /// Flash-Next load with vision on has a companion to check, so the target's
+    /// artifact is read only then: a switch that needs none answers its 202
+    /// without touching the file, which may be slow or never end.
     fn companion_refusal(&self, target: &ModelSource) -> Option<String> {
+        let (options, _) = fit_options(&self.state.current(), target, ModelFamily::FlashNext, None).ok()?;
+        options.vision.as_ref()?;
         let family = crate::loader::artifact_family(&target.artifact).ok().flatten()?;
-        let (options, _) = fit_options(&self.state.current(), target, family, None).ok()?;
         crate::load::check_vision_companion(&options, Some(family), &target.artifact).err().map(|refusal| refusal.to_string())
     }
 }
