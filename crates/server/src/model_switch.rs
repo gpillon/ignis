@@ -238,7 +238,52 @@ pub fn load_options(
 ) -> Result<crate::config::Config, String> {
     let (options, dropped) = fit_options(running, target, family, given)?;
     log_flags_dropped(&target.model, family, &dropped);
+    log_vision_off(running, &target.model, family, &options);
     Ok(options)
+}
+
+/// Say that a switch from a model serving images leaves `to`, a model of
+/// `family` that takes them, with vision off (GitHub #563): vision is each
+/// model's, and a built-in profile turns it on for the 27B alone, so a 27B
+/// started with its profile's vision switches to Flash-Next without it, its
+/// default (ADR 0087), and its image parts are refused `vision_disabled`.
+/// `ignis.model.switch_vision_off` names the target's vision (`off`), what
+/// left it off (`by`: `default`, `profile` or `named`) and, in `why`, how to
+/// turn it on. Nothing when the target keeps vision or the running model had
+/// none.
+fn log_vision_off(
+    running: &crate::config::Config,
+    to: &str,
+    family: ignis_core::compute::ModelFamily,
+    options: &crate::config::Config,
+) {
+    if running.vision.is_none() || options.vision.is_some() || !family.takes_images() {
+        return;
+    }
+    let turn_on = crate::config::schema::field("vision", "enabled").expect("declared").scoped_flag(family);
+    let (by, why) = match options.basis.resolution().origin("vision", "enabled") {
+        Some(origin) if origin.source.explicit() => {
+            ("named", format!("vision is named off for it ({}); --vision-enabled or {turn_on} turns it on", origin.spelling))
+        }
+        Some(origin) => ("profile", format!("the profile turns it off ({}); --vision-enabled or {turn_on} turns it on", origin.spelling)),
+        None => (
+            "default",
+            format!(
+                "{} has vision off unless it is named on for it (ADR 0087); --vision-enabled turns it on for both \
+                 models, {turn_on} for it alone",
+                family.name()
+            ),
+        ),
+    };
+    tracing::info!(
+        name: "ignis.model.switch_vision_off",
+        to = %to,
+        family = family.name(),
+        vision = "off",
+        by,
+        why = %why,
+        "the model switched to loads with vision off: its image parts are refused with vision_disabled"
+    );
 }
 
 /// [`load_options`] without its log line, with the flags the fit dropped
@@ -2145,6 +2190,43 @@ mod tests {
         assert!(width.contains(VISION_ARTIFACT_FILE_NAME) && !width.contains("is missing"), "{width}");
         let missing = ModelSource { artifact: main.path.with_file_name("not-there.ninfer"), model: "other".to_owned() };
         assert_eq!(loader(true).companion_refusal(&missing), None, "a file that is no artifact lacks nothing here; prepare says so");
+    }
+
+    /// GitHub #563: under a built-in profile, which turns vision on for the
+    /// 27B alone, a 27B serving images switches to Flash-Next with vision off,
+    /// its default (ADR 0087), and the switch says so, with why and how to
+    /// turn it on; named off, it says that. A switch that keeps vision, or one
+    /// from a model without it, says nothing of it.
+    #[test]
+    fn a_switch_that_leaves_its_target_without_vision_says_so() {
+        let running = |flags: &[&str]| {
+            let args: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
+            let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).unwrap() else { panic!("a config") };
+            config.for_family(ModelFamily::Qwen38_27b).unwrap()
+        };
+        let target = ModelSource { artifact: std::path::PathBuf::from("flash-next.ninfer"), model: "qwen3.8-flash-next".to_owned() };
+        let vision_off =|running: &crate::config::Config| -> Vec<serde_json::Value> {
+            let records = logged(|| {
+                load_options(running, &target, ModelFamily::FlashNext, None).expect("the switch's options");
+            });
+            records.into_iter().filter(|event| event["event_name"] == "ignis.model.switch_vision_off").collect()
+        };
+        let field = |event: &serde_json::Value, name: &str| event.get(name).or_else(|| event["attributes"].get(name)).cloned();
+        let profile = running(&["--profile", "rtx5090"]);
+        assert!(profile.vision.is_some(), "the profile's vision, on the 27B");
+        let events = vision_off(&profile);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(field(event, "to"), Some("qwen3.8-flash-next".into()), "{event}");
+        assert_eq!(field(event, "vision"), Some("off".into()), "{event}");
+        assert_eq!(field(event, "by"), Some("default".into()), "{event}");
+        let why = field(event, "why").and_then(|why| why.as_str().map(str::to_owned)).unwrap_or_default();
+        assert!(why.contains("--vision-enabled") && why.contains("--qwen38flashnext-vision-enabled"), "{event}");
+        let named = vision_off(&running(&["--profile", "rtx5090", "--qwen38flashnext-vision-enabled", "false"]));
+        assert_eq!(field(&named[0], "by"), Some("named".into()), "{named:?}");
+        assert!(field(&named[0], "why").is_some_and(|why| why.to_string().contains("--qwen38flashnext-vision-enabled")), "{named:?}");
+        assert!(vision_off(&running(&["--profile", "rtx5090", "--vision-enabled"])).is_empty(), "vision crosses the switch");
+        assert!(vision_off(&running(&["--profile", "none"])).is_empty(), "no vision to leave");
     }
 
     /// The early companion check fits the switch's options as its prepare

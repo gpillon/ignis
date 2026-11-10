@@ -28,7 +28,14 @@ the request size cap follows the model that is serving. Flash-Next sees
 through its [vision companion](../configuration/vision.md#flash-next), a file beside its
 artifact: a switch to Flash-Next with vision on and the companion missing, or
 not its own, is a `409 vision_companion_missing` that names the file. It is
-answered before anything is unloaded, so the old model keeps serving.
+answered before anything is unloaded, so the old model keeps serving. Vision
+is each model's, though: every built-in profile turns it on for the 27B alone,
+so a 27B serving images on its profile's vision switches to Flash-Next with
+vision off, and an image part is then refused with `vision_disabled`. The
+switch says so in the log, `ignis.model.switch_vision_off`, with what left it
+off (`by`: `default`, `profile` or `named`) and how to turn it on (`why`):
+`--vision-enabled` for both models, `--qwen38flashnext-vision-enabled` for
+Flash-Next alone.
 
 A target that can be refused without unloading anything — no file at the path,
 a checksum that is not clean, a model id of the other model — leaves the old

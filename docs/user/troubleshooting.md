@@ -579,7 +579,10 @@ produces) is not decoded yet: send WAV, or convert it. A clip longer than
 
 `vision is disabled for this server`: an `image_url` part was sent and the
 server runs without `--vision-enabled`, whatever the artifact holds. Start with
-`--vision-enabled`. `media_budget_exceeded`: several images together are past
+`--vision-enabled`. After a switch from the 27B to Flash-Next under a built-in
+profile, which turns vision on for the 27B alone, Flash-Next serves without it,
+and the switch's `ignis.model.switch_vision_off` line says so
+([Model switching](api/model-switching.md)). `media_budget_exceeded`: several images together are past
 `--vision-max-tokens` (32,768 by default); a single oversized image is
 downscaled instead ([Vision](configuration/vision.md)).
 
