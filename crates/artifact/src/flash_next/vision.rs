@@ -11,6 +11,8 @@
 //! belongs to (`pair.main`, the MTP companion's shape, flash-next-layout.md
 //! §13.2).
 
+use std::sync::{Mutex, PoisonError};
+
 use super::{fail, VISION_MODEL_ID};
 use crate::binder::{Binder, DeviceEncoding, MaterializationPlan, ObjectHandle, Residence};
 use crate::inventory::{InventoryEntry, VISION_LAYERS};
@@ -86,10 +88,16 @@ pub fn entries(tower: &VisionTower) -> Vec<Entry> {
 
 /// [`entries`] as the inventory a load binds the tower by and hands the
 /// leaf's descriptors (`ignis_core::flash_next_vision`), each on the device
-/// as stored. The names and shapes are leaked, as
-/// [`crate::inventory::vision_scope`]'s are.
+/// as stored. Its names and shapes are `'static`: built once per tower and
+/// kept for the process, so a load asking at every switch leaks nothing
+/// more (a companion's merger width picks the tower, one per file).
 pub fn scope(tower: &VisionTower) -> Vec<InventoryEntry> {
-    entries(tower)
+    static BUILT: Mutex<Vec<(VisionTower, &'static [InventoryEntry])>> = Mutex::new(Vec::new());
+    let mut built = BUILT.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, scope)) = built.iter().find(|(of, _)| of == tower) {
+        return scope.to_vec();
+    }
+    let scope: Vec<InventoryEntry> = entries(tower)
         .into_iter()
         .filter_map(|entry| match entry {
             Entry::Tensor { name, format, layout, shape } => Some(InventoryEntry {
@@ -102,7 +110,9 @@ pub fn scope(tower: &VisionTower) -> Vec<InventoryEntry> {
             }),
             Entry::Resource { .. } => None,
         })
-        .collect()
+        .collect();
+    built.push((tower.clone(), Box::leak(scope.clone().into_boxed_slice())));
+    scope
 }
 
 /// The companion's sidecar `pair.main` against the opened main container
@@ -204,6 +214,23 @@ mod tests {
         assert!(merger_width(&main_reader).is_err(), "the main container has no merger");
         let err = bind(&companion, &geometry(), VisionResidency::Host).err().expect("other shapes").to_string();
         assert!(err.contains("vision/"), "{err}");
+    }
+
+    /// A load asks for the tower's inventory at every open of the companion,
+    /// once per switch request: its names and shapes are built once per
+    /// tower, every call handing out the same memory, so a long-running
+    /// server's switches leak nothing.
+    #[test]
+    fn the_scope_is_built_once_per_tower() {
+        let (first, again) = (scope(&geometry()), scope(&geometry()));
+        assert_eq!(first, again);
+        for (built, asked) in first.iter().zip(&again) {
+            assert!(std::ptr::eq(built.name, asked.name) && std::ptr::eq(built.shape, asked.shape), "{} built again", built.name);
+        }
+        let narrow = scope(&VisionTower { out_hidden: 5120, ..geometry() });
+        assert_eq!(narrow.len(), first.len());
+        assert_ne!(narrow, first, "another merger width is another tower");
+        assert!(std::ptr::eq(narrow[0].name, scope(&VisionTower { out_hidden: 5120, ..geometry() })[0].name));
     }
 
     /// GitHub #556: a companion of another encoding of the tower -- the
