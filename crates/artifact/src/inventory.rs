@@ -355,9 +355,11 @@ pub fn vision_scope_27b() -> Vec<InventoryEntry> {
 
 /// The vision tower's objects with a merger writing `merger_width` rows: the
 /// hidden width of the text model it feeds (GitHub #562), 5,120 on the 27B
-/// ([`vision_scope_27b`]) and 2,560 on Flash-Next, whose tower is the 27B's
-/// objects in the 27B's formats (ADR 0087). Only the merger's `fc2` and its
-/// bias carry the width; the rest of the tower is the same table.
+/// ([`vision_scope_27b`]) and 2,560 on Flash-Next, each object kind in the
+/// 27B's format. Only the merger's `fc2` and its bias carry the width; the
+/// rest of the tower is the same table. Flash-Next's own tower holds these
+/// objects with every matrix W8 ([`crate::flash_next::vision::scope`],
+/// GitHub #556).
 pub fn vision_scope(merger_width: u64) -> Vec<InventoryEntry> {
     // Leaked like the templated names (`mk`): two shapes per table.
     let merger_out: &'static [u64] = Box::leak(Box::new([merger_width, SH_V_MERGER[1]]));
@@ -1065,9 +1067,9 @@ mod tests {
         assert_eq!(names.len(), 333, "no duplicate name");
     }
 
-    /// GitHub #562 (ADR 0087): Flash-Next's tower is the 27B's objects, in
-    /// the same formats under the same names, with a merger writing its
-    /// 2,560-wide hidden; nothing else in the table moves with the width.
+    /// GitHub #562 (ADR 0087): the 27B's tower with a merger writing
+    /// Flash-Next's 2,560-wide hidden is the same objects in the same formats
+    /// under the same names; nothing else in the table moves with the width.
     #[test]
     fn a_vision_scope_differs_from_the_27bs_only_in_the_mergers_output_width() {
         assert_eq!(vision_scope(5120), vision_scope_27b());

@@ -3224,7 +3224,7 @@ mod tests {
     #[test]
     fn a_flash_next_vision_loads_host_lines_are_its_towers_and_its_pools_under_host() {
         const TOWER: u64 = 280 << 20;
-        let width = ignis_core::EmbeddingWidth::from_inventory(&ignis_artifact::vision_scope(2560), 2560).expect("2,560 rows");
+        let width = ignis_core::EmbeddingWidth::from_inventory(&ignis_artifact::flash_next::vision::scope(&ignis_artifact::flash_next::vision::geometry()), 2560).expect("2,560 rows");
         let shape = |vision: Option<ignis_core::Vision>| EngineShape { vision, max_context: 262_144, ..EngineShape::default() };
         let envelope = ignis_core::Vision::new(8192).unwrap();
         let host = shape(Some(envelope.with_residency(ignis_core::VisionResidency::Host)));

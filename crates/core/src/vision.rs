@@ -564,7 +564,12 @@ pub fn vision_item_control(grid: Grid) -> VisionItemControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ignis_artifact::vision_scope;
+    use ignis_artifact::flash_next::vision as flash_next_vision;
+
+    /// The objects a Flash-Next load binds its tower by, its merger 2,560 wide.
+    fn flash_next_tower() -> Vec<InventoryEntry> {
+        flash_next_vision::scope(&flash_next_vision::geometry())
+    }
 
     fn item(begin: usize, count: usize) -> MediaItem {
         // A grid of `count` merged tokens laid out in one row.
@@ -846,7 +851,7 @@ mod tests {
     /// pool of 2,560 x 32,768 BF16 = 160 MiB (#555).
     #[test]
     fn a_2560_wide_inventory_plans_a_pool_of_half_the_27bs_page_bytes() {
-        let width = EmbeddingWidth::from_inventory(&vision_scope(2560), 2560).expect("the merger writes the model's hidden");
+        let width = EmbeddingWidth::from_inventory(&flash_next_tower(), 2560).expect("the merger writes the model's hidden");
         assert_eq!(width.hidden(), 2560);
         assert_eq!(width.page_bytes(), 655_360);
         assert_eq!(2 * width.page_bytes(), EmbeddingWidth::qwen38_27b().page_bytes());
@@ -867,7 +872,7 @@ mod tests {
     /// bias; otherwise the load is refused naming the object and both widths.
     #[test]
     fn an_inventory_whose_widths_disagree_with_its_model_is_refused() {
-        let refusal = EmbeddingWidth::from_inventory(&vision_scope(2560), 5120).expect_err("Flash-Next's tower on the 27B");
+        let refusal = EmbeddingWidth::from_inventory(&flash_next_tower(), 5120).expect_err("Flash-Next's tower on the 27B");
         assert_eq!(refusal, VisionWidthMismatch { object: "vision/merger/fc2", width: Some(2560), model_hidden: 5120 });
         let message = refusal.to_string();
         assert!(message.contains("vision/merger/fc2") && message.contains("2560") && message.contains("5120"), "{message}");
@@ -875,7 +880,7 @@ mod tests {
         assert_eq!(refusal, VisionWidthMismatch { object: "vision/merger/fc2", width: Some(5120), model_hidden: 2560 });
 
         // A bias as wide as another model is refused though the projection agrees.
-        let mut torn = vision_scope(2560);
+        let mut torn = flash_next_tower();
         torn.iter_mut().find(|e| e.name == "vision/merger/fc2_bias").expect("the bias").shape = &[5120];
         let refusal = EmbeddingWidth::from_inventory(&torn, 2560).expect_err("the bias disagrees");
         assert_eq!(refusal, VisionWidthMismatch { object: "vision/merger/fc2_bias", width: Some(5120), model_hidden: 2560 });

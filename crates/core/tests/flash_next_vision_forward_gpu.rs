@@ -182,7 +182,8 @@ fn media_columns_replace_their_placeholders_in_every_stream() {
     let scatter: Vec<i32> = (first as i32..(first + count) as i32).collect();
     let axes = equal_axes(tokens.len());
     let config = ModelConfig::qwen38_flash_next();
-    let width = EmbeddingWidth::from_inventory(&ignis_artifact::vision_scope(config.hidden), config.hidden)
+    let tower = ignis_artifact::flash_next::vision::geometry();
+    let width = EmbeddingWidth::from_inventory(&ignis_artifact::flash_next::vision::scope(&tower), config.hidden)
         .expect("Flash-Next's merger writes its hidden width");
     let mut placed_by_residency = Vec::new();
     for residency in [VisionResidency::Host, VisionResidency::Device] {

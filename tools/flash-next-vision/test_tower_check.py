@@ -175,11 +175,15 @@ def test_stored_bf16_words_decode_to_their_values():
     assert tower_check.dequantize(payload, inventory.BF16, (2, 2)).tolist() == [[1.0, -2.0], [0.25, 3.5]]
 
 
-def write_container(path, payloads):
-    """A `.ninfer` v2 container of the fixture tower's objects: `payloads` {object: bytes}, in the
-    recipe's order."""
+# The fixture widths in each family's recipe: Flash-Next's own (every matrix W8) and the 27B's grouped one.
+FIXTURE_FAMILY = {"fixture": "qwen3.8-flash-next", "fixture-27b": "qwen3.8-27b"}
+
+
+def write_container(path, payloads, tower):
+    """A `.ninfer` v2 container of a fixture tower's objects: `payloads` {object: bytes}, in its recipe's
+    order and formats."""
     objects, at = [], 0
-    for o in convert.tower_objects(convert.GEOMETRIES["fixture"]):
+    for o in convert.tower_objects(tower):
         data = payloads[o.name]
         objects.append({"name": o.name, "kind": "tensor", "format": o.format, "layout": o.layout,
                         "shape": list(o.shape), "offset": at, "bytes": len(data)})
@@ -196,26 +200,28 @@ def write_container(path, payloads):
         f.write(bytes(blob))
 
 
-def fixture_diagnosis(tmp_path, alter=None):
-    """The fixture tower's cache, its recipe-encoded companion (`alter`ed: {object: payload} changed in
-    place), and a dump of two items whose served rows are the BF16 tower's own."""
+def fixture_diagnosis(tmp_path, alter=None, geometry="fixture"):
+    """The fixture tower's cache, its companion encoded in `geometry`'s recipe (`alter`ed: {object: payload}
+    changed in place), and for each family a dump of two items whose served rows are the BF16 tower's own."""
     tensors = fixture_record(tmp_path)
-    payloads = {o.name: p for o, p in convert.encode_tower(tensors, convert.GEOMETRIES["fixture"])}
+    tower = tower_check.TOWERS[geometry]
+    payloads = {o.name: p for o, p in convert.encode_tower(tensors, tower)}
     if alter is not None:
         alter(payloads)
-    write_container(tmp_path / "vision.ninfer", payloads)
+    write_container(tmp_path / "vision.ninfer", payloads, tower)
     model = tower_check.reference_model(str(tmp_path / "source"))
     items = {}
     for item_id, grid in {"a": (1, 4, 4), "b": (1, 2, 6)}.items():
         patches = bits(np.random.default_rng(grid[2]).uniform(-1, 1, (int(np.prod(grid)), 96)))
         items[item_id] = (grid, patches, tower_check.reference_rows(model, patches, grid))
-    write_dump(tmp_path / "dump" / "qwen3.8-flash-next", "qwen3.8-flash-next", items, OUT)
+    for family in tower_check.FAMILIES:
+        write_dump(tmp_path / "dump" / family, family, items, OUT)
     return tensors, payloads
 
 
-def diagnose(tmp_path, *variants):
+def diagnose(tmp_path, *variants, geometry="fixture"):
     out = tmp_path / "diagnosis.json"
-    argv = ["diagnose", "--family", "qwen3.8-flash-next", "--geometry", "fixture", "--source",
+    argv = ["diagnose", "--family", FIXTURE_FAMILY[geometry], "--geometry", geometry, "--source",
             str(tmp_path / "source"), "--container", str(tmp_path / "vision.ninfer"), "--dump", str(tmp_path / "dump"),
             "--out", str(out), "--threads", "2"]
     for v in variants:
@@ -228,9 +234,45 @@ def stage(record, variant, name):
     return next(s for s in record["variants"][variant]["stages"] if s["stage"] == name)
 
 
-def test_a_companion_of_the_recipe_is_its_bf16_tower_encoded_and_the_bf16_variant_has_no_error(tmp_path):
+def test_each_family_has_its_own_recipe_flash_next_every_matrix_w8_the_27b_its_grouped_formats():
+    # GitHub #556: Flash-Next's tower is re-encoded with every matrix W8; the 27B's served tower keeps the
+    # grouped recipe its container was built with, which its recipe check reads.
+    grouped = [o for o in inventory.objects(inventory.Geometry.qwen3_8_27b()) if o.unit == "vision"]
+    ours = convert.tower_objects(tower_check.TOWER_27B)
+    assert [(o.name, o.format, o.shape) for o in ours] == [(o.name, o.format, o.shape) for o in grouped]
+    flash_next = convert.tower_objects(tower_check.TOWERS["qwen3.8-flash-next"])
+    assert [o.format for o in flash_next] == [inventory.BF16 if o.format == inventory.BF16 else inventory.W8
+                                             for o in grouped]
+
+
+def test_a_companion_of_flash_nexts_recipe_is_its_bf16_tower_encoded_every_matrix_in_w8(tmp_path):
     fixture_diagnosis(tmp_path)
-    record = diagnose(tmp_path, "bf16", "stored")
+    record = diagnose(tmp_path, "stored", "bf16+qkv=W8", "bf16+merger_fc1=Q4")
+    assert record["recipe"] == {"objects": 333, "equal": 333, "differ": []}
+    stored = record["weights"]["stored"]
+    assert {kind: w["format"] for kind, w in stored.items()} == {kind: inventory.W8 for kind in tower_check.KINDS}
+    # The stored words are the W8 encoding of the BF16 tensors: the same error as W8 re-encoded, below Q4's.
+    assert stored["qkv"]["rel_frobenius"] == record["weights"]["W8"]["qkv"]["rel_frobenius"] > 0
+    assert stored["merger_fc1"]["rel_frobenius"] < record["weights"]["Q4"]["merger_fc1"]["rel_frobenius"]
+
+
+def test_a_companion_checked_against_another_familys_recipe_differs_in_every_matrix_that_recipe_moves(tmp_path):
+    fixture_diagnosis(tmp_path, geometry="fixture-27b")
+    record = diagnose(tmp_path, "stored", geometry="fixture-27b")
+    assert record["recipe"] == {"objects": 333, "equal": 333, "differ": []}
+    # Flash-Next's W8 companion where the 27B's grouped recipe is asked for: every matrix differs but the
+    # merger's two, W8 in both recipes.
+    fixture_diagnosis(tmp_path / "w8")
+    os.replace(tmp_path / "w8" / "vision.ninfer", tmp_path / "vision.ninfer")
+    record = diagnose(tmp_path, "stored", geometry="fixture-27b")
+    assert record["recipe"]["equal"] == 333 - (1 + 27 * 4)
+    assert "vision/patch_embedding" in record["recipe"]["differ"]
+    assert "vision/merger/fc1" not in record["recipe"]["differ"]
+
+
+def test_a_companion_of_the_27b_recipe_is_its_bf16_tower_encoded_and_the_bf16_variant_has_no_error(tmp_path):
+    fixture_diagnosis(tmp_path, geometry="fixture-27b")
+    record = diagnose(tmp_path, "bf16", "stored", geometry="fixture-27b")
     assert record["recipe"] == {"objects": 333, "equal": 333, "differ": []}
     bf16, stored = record["variants"]["bf16"], record["variants"]["stored"]
     assert bf16["final"]["rel_l2"] == 0 and all(s["rel_l2"] == 0 for s in bf16["stages"])
@@ -287,11 +329,11 @@ def test_a_rule_over_a_range_of_blocks_moves_the_stages_from_its_first_block_on(
     assert stage(record, "bf16+fc1@3-4=stored", "block 3")["rel_l2"] > 0
     # Later rules win: every block in BF16 leaves the patch embedding's error alone before block 0.
     assert stage(record, "stored+block@0-25=bf16", "embedding")["rel_l2"] > 0
-    # The rule's blocks alone change their format: two fixture fc1 [64, 32], Q4 (4,352 bytes each: 64 rows of
-    # 64 code bytes, then of two binary16 scales) for BF16 (4,096 each).
-    q4 = record["variants"]["bf16+fc1@3-4=stored"]["cost"]["tower_bytes"]
+    # The rule's blocks alone change their format: two fixture fc1 [64, 32], W8 (8,704 bytes each: 64 rows of
+    # 128 code bytes, K padded to 128, then of four binary16 scales) for BF16 (4,096 each).
+    w8 = record["variants"]["bf16+fc1@3-4=stored"]["cost"]["tower_bytes"]
     bf16 = diagnose(tmp_path, "bf16")["variants"]["bf16"]["cost"]["tower_bytes"]
-    assert q4 - bf16 == 2 * (4352 - 4096)
+    assert w8 - bf16 == 2 * (8704 - 4096)
 
 
 def test_a_variant_that_names_no_kind_or_a_merger_block_is_refused():
@@ -301,11 +343,11 @@ def test_a_variant_that_names_no_kind_or_a_merger_block_is_refused():
 
 
 def test_against_another_diagnosis_each_variant_gets_the_bar_on_the_others_stored_tower(tmp_path):
-    fixture_diagnosis(tmp_path)
+    fixture_diagnosis(tmp_path, geometry="fixture-27b")
     first = tmp_path / "first.json"
-    diagnose(tmp_path, "stored")
+    diagnose(tmp_path, "stored", geometry="fixture-27b")
     os.replace(tmp_path / "diagnosis.json", first)
-    argv = ["diagnose", "--family", "qwen3.8-flash-next", "--geometry", "fixture", "--source",
+    argv = ["diagnose", "--family", "qwen3.8-27b", "--geometry", "fixture-27b", "--source",
             str(tmp_path / "source"), "--container", str(tmp_path / "vision.ninfer"), "--dump", str(tmp_path / "dump"),
             "--out", str(tmp_path / "second.json"), "--threads", "2", "--against", str(first),
             "--variant", "stored", "--variant", "stored+qkv=W8"]
@@ -316,4 +358,4 @@ def test_against_another_diagnosis_each_variant_gets_the_bar_on_the_others_store
     better = record["variants"]["stored+qkv=W8"]["bar"]
     assert better["rel_l2"]["mean_difference"] < 0 and better["rel_l2"]["flash_next_at_most_27b"] is True
     assert better["centred_rel_l2"]["mean_difference"] < 0
-    assert record["against"] == {"file": "first.json", "family": "qwen3.8-flash-next", "variant": "stored"}
+    assert record["against"] == {"file": "first.json", "family": "qwen3.8-27b", "variant": "stored"}

@@ -15,9 +15,8 @@ from conftest import OUT, PATCH, SHARDS, VH, make_checkpoint, visual_shapes, vis
 
 MAIN = "qwen3_8_flash_next_fixture-v2.ninfer"
 COMPANION = "qwen3_8_flash_next_vision-v2.ninfer"
-FORMAT_OF_KIND = {"patch_embedding": "Q6G64_F16S", "attention/qkv": "Q4G64_F16S", "attention/output": "Q5G64_F16S",
-                  "mlp/fc1": "Q4G64_F16S", "mlp/fc2": "Q5G64_F16S", "merger/fc1": "W8G32_F16S",
-                  "merger/fc2": "W8G32_F16S"}
+# Flash-Next's own recipe (GitHub #556, the owner's decision on #560's alarm): every matrix W8, the rest BF16.
+MATRICES = ("patch_embedding", "attention/qkv", "attention/output", "mlp/fc1", "mlp/fc2", "merger/fc1", "merger/fc2")
 
 
 class LocalHub:
@@ -97,17 +96,17 @@ def sources(tmp_path):
     return str(tmp_path / "checkpoint"), tensors, write_main(str(tmp_path / "main" / MAIN))
 
 
-def test_one_build_makes_the_companion_of_the_towers_objects_in_the_27b_recipes_formats(tmp_path, sources, pack_exe):
+def test_one_build_makes_the_companion_of_the_towers_objects_with_every_matrix_in_w8(tmp_path, sources, pack_exe):
     checkpoint, tensors, main_sha = sources
     hub = LocalHub(checkpoint)
     assert convert.main(argv(tmp_path, "run", pack_exe), hub=hub) == 0
     out = tmp_path / "run" / COMPANION
     c = container.Container(out)
-    assert c.identity == {"model_id": "qwen3.8-flash-next-vision", "weights_id": "vision-w8q4q5q6-bf16-de4b8e4"}
+    assert c.identity == {"model_id": "qwen3.8-flash-next-vision", "weights_id": "vision-w8-bf16-de4b8e4"}
     assert [o["name"] for o in c.objects] == expected_names()
     for o in c.objects:
         name = o["name"]
-        assert o["format"] == FORMAT_OF_KIND.get(kind(name), "BF16"), name
+        assert o["format"] == ("W8G32_F16S" if kind(name) in MATRICES else "BF16"), name
         source = tensors[source_name(name)]
         if o["format"] == "BF16":
             assert c.read(name) == source.contiguous().view(torch.uint8).numpy().tobytes(), name
@@ -125,6 +124,8 @@ def test_one_build_makes_the_companion_of_the_towers_objects_in_the_27b_recipes_
     assert side["pair"]["main"]["file"] == MAIN
     assert side["pair"]["main"]["file_sha256"] == main_sha
     assert side["pair"]["main"]["model_id"] == "qwen3.8-flash-next"
+    assert side["recipe"]["formats"] == {"BF16": 222, "W8G32_F16S": 111}
+    assert side["recipe"]["payload_bytes"] == sum(o["bytes"] for o in c.objects)
     span = b"".join(t.contiguous().view(torch.uint8).numpy().tobytes() for t in tensors.values())
     src = side["source"]
     assert (src["repo"], src["revision"]) == (convert.REPO, convert.REVISION)
@@ -155,14 +156,17 @@ def test_a_second_build_gives_the_same_bytes_from_the_cached_source(tmp_path, so
         assert open(one, "rb").read() == open(two, "rb").read(), suffix
 
 
-def test_the_tower_at_flash_nexts_widths_is_the_27b_towers_but_its_merger(tmp_path):
+def test_the_tower_at_flash_nexts_widths_is_the_27b_towers_objects_every_matrix_w8_and_its_merger_2560_wide():
     ours = convert.tower_objects(convert.GEOMETRIES["qwen3.8-flash-next"])
     served = [o for o in inventory.objects(inventory.Geometry.qwen3_8_27b()) if o.unit == "vision"]
     assert len(ours) == len(served) == 333
     for o, s in zip(ours, served):
-        assert (o.name, o.format) == (s.name, s.format)
+        assert o.name == s.name
+        assert o.format == (inventory.BF16 if s.format == inventory.BF16 else inventory.W8), o.name
         expected = {"vision/merger/fc2": (2560, 4608), "vision/merger/fc2_bias": (2560,)}.get(o.name, s.shape)
         assert o.shape == expected, o.name
+    # #560's diagnosis costed the all-W8 tower at 481,445,216 bytes of payload.
+    assert sum(inventory.encoded_size(o) for o in ours) == 481_445_216
 
 
 def refuse(tmp_path, exe, capsys, hub=None):

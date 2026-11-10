@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 
 use ignis_artifact::flash_next::vision;
 use ignis_artifact::packer::{sidecar_path, VISION_ARTIFACT_FILE_NAME};
-use ignis_artifact::{vision_scope, InventoryEntry, Reader, VisionResidency};
+use ignis_artifact::nvfp4_27b::VisionTower;
+use ignis_artifact::{InventoryEntry, Reader, VisionResidency};
 
 use crate::vision::EmbeddingWidth;
 
@@ -63,8 +64,9 @@ pub struct Companion {
 impl Companion {
     /// The companion beside the main container at `main_path` (opened as
     /// `main`), for a text model `model_hidden` wide: its sidecar's pair pin
-    /// against `main`, its identity, then its merger's width against the
-    /// model's, each refused naming the file.
+    /// against `main`, its identity (a vision companion of the encoding this
+    /// build binds), then its merger's width against the model's, each
+    /// refused naming the file.
     pub fn open(main_path: &Path, main: &Reader, model_hidden: u64) -> Result<Self, CompanionRefused> {
         let path = companion_path(main_path.parent().unwrap_or_else(|| Path::new(".")));
         if !path.exists() {
@@ -79,7 +81,7 @@ impl Companion {
         let reader = Reader::open(&path).map_err(|e| mismatched(format!("open: {e}")))?;
         vision::check_identity(&reader).map_err(|e| mismatched(e.to_string()))?;
         let rows = vision::merger_width(&reader).map_err(|e| mismatched(e.to_string()))?;
-        let width = EmbeddingWidth::from_inventory(&vision_scope(rows), model_hidden).map_err(|e| mismatched(e.to_string()))?;
+        let width = EmbeddingWidth::from_inventory(&vision::scope(&tower_at(rows)), model_hidden).map_err(|e| mismatched(e.to_string()))?;
         Ok(Self { path, reader, width })
     }
 
@@ -97,14 +99,19 @@ impl Companion {
     }
 
     /// Bind the tower where `residency` keeps it, every object of the
-    /// companion consumed.
+    /// companion consumed, in the companion's own formats.
     pub fn bind(&self, residency: VisionResidency) -> Result<TowerPlan, String> {
-        let tower = ignis_artifact::nvfp4_27b::VisionTower { out_hidden: self.width.hidden(), ..vision::geometry() };
+        let tower = tower_at(self.width.hidden());
         let plan = vision::bind(&self.reader, &tower, residency)
             .map_err(|e| format!("bind the vision companion {}: {e}", self.path.display()))?;
         let host_mapped_bytes = ignis_artifact::vision_host_mapped_bytes(&self.reader, &plan.plan);
-        Ok(TowerPlan { entries: vision_scope(self.width.hidden()), plan, host_mapped_bytes })
+        Ok(TowerPlan { entries: vision::scope(&tower), plan, host_mapped_bytes })
     }
+}
+
+/// Flash-Next's tower with its merger writing `rows`.
+fn tower_at(rows: u64) -> VisionTower {
+    VisionTower { out_hidden: rows, ..vision::geometry() }
 }
 
 /// The tower's bind: what the reservation plan, the host plan and the load
@@ -216,5 +223,25 @@ mod tests {
         let other = Reader::open(companion.path()).expect("another container");
         let err = Companion::open(&paired.path, &other, tower.out_hidden).err().expect("pinned elsewhere").to_string();
         assert!(err.contains("pair.main.model_id") && err.contains(VISION_ARTIFACT_FILE_NAME), "{err}");
+    }
+
+    /// GitHub #556: a companion of the grouped encoding first shipped,
+    /// pinned to this main container, is refused when it opens, naming its
+    /// file and both weights ids: a start or a switch refuses it before
+    /// anything loads, not when the tower binds.
+    #[test]
+    fn a_companion_of_another_encoding_is_refused_when_it_opens() {
+        let stale = fixture::build("vision-companion-stale").expect("the main fixture");
+        let beside = stale
+            .with_vision_companion_of(ignis_artifact::ArtifactIdentity {
+                model_id: ignis_artifact::flash_next::VISION_MODEL_ID.into(),
+                weights_id: "vision-w8q4q5q6-bf16-de4b8e4".into(),
+            })
+            .expect("a companion of the grouped encoding");
+        let main = Reader::open(&stale.path).expect("open the main container");
+        let err = Companion::open(&stale.path, &main, vision::fixture_geometry().out_hidden).err().expect("another encoding");
+        assert!(matches!(err, CompanionRefused::Mismatched { ref path, .. } if *path == beside), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("vision-w8q4q5q6-bf16-de4b8e4") && text.contains("vision-w8-bf16-de4b8e4"), "{text}");
     }
 }

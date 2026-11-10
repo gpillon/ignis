@@ -2,26 +2,33 @@
 //! §14): the checkpoint's vision tower and its merger, beside the main
 //! container, bound only when vision is on.
 //!
-//! The tower is encoded with the 27B tower's recipe: the same objects under
-//! the same names, each object kind in the same format
-//! ([`crate::nvfp4_27b::vision_tower`]), at Flash-Next's widths, where the
-//! merger writes 2,560 columns (the text model's hidden width), not the
-//! 27B's 5,120. Its identity is its own ([`VISION_MODEL_ID`]), and its
-//! sidecar pins the one main container it belongs to (`pair.main`, the MTP
-//! companion's shape, flash-next-layout.md §13.2).
+//! The tower holds the 27B tower's objects under the same names, at
+//! Flash-Next's widths, where the merger writes 2,560 columns (the text
+//! model's hidden width), not the 27B's 5,120; its formats are its own
+//! ([`entries`]): every matrix W8G32, the rest BF16 (GitHub #556, the
+//! owner's decision on #560's alarm). Its identity is its own
+//! ([`VISION_MODEL_ID`]), and its sidecar pins the one main container it
+//! belongs to (`pair.main`, the MTP companion's shape, flash-next-layout.md
+//! §13.2).
 
 use super::{fail, VISION_MODEL_ID};
-use crate::binder::{Binder, MaterializationPlan, ObjectHandle};
-use crate::nvfp4_27b::{vision_tower, Entry, VisionTower};
-use crate::{ArtifactIdentity, Object, Reader, Result, VisionResidency};
+use crate::binder::{Binder, DeviceEncoding, MaterializationPlan, ObjectHandle, Residence};
+use crate::inventory::{InventoryEntry, VISION_LAYERS};
+use crate::nvfp4_27b::{Entry, VisionTower};
+use crate::{ArtifactIdentity, NumericFormat, Object, Reader, Result, StorageLayout, VisionResidency};
 
 /// The merger's output object, whose rows are the width the tower writes.
 const MERGER_OUTPUT: &str = "vision/merger/fc2";
 
+/// Every matrix of the tower: W8G32 with binary16 scales, row-split.
+const MATRIX: (NumericFormat, StorageLayout) = (NumericFormat::W8G32F16S, StorageLayout::RowSplitK128V1);
+/// The biases, the norms and the position table.
+const VECTOR: (NumericFormat, StorageLayout) = (NumericFormat::Bf16, StorageLayout::ContiguousLeV1);
+
 /// The companion's identity: the vision `model_id` and the build's weights
-/// id (the 27B tower's grouped formats, from revision `de4b8e4`).
+/// id (every matrix W8, the rest BF16, from revision `de4b8e4`).
 pub fn identity() -> ArtifactIdentity {
-    ArtifactIdentity { model_id: VISION_MODEL_ID.into(), weights_id: "vision-w8q4q5q6-bf16-de4b8e4".into() }
+    ArtifactIdentity { model_id: VISION_MODEL_ID.into(), weights_id: "vision-w8-bf16-de4b8e4".into() }
 }
 
 /// Flash-Next's tower (the checkpoint's `vision_config`): 1,152 wide, 4,304
@@ -39,10 +46,63 @@ pub fn fixture_geometry() -> VisionTower {
 }
 
 /// The companion's objects in container order, at `tower`: what the packer
-/// holds the work tree to. At [`geometry`] they are the objects a load binds,
-/// [`crate::inventory::vision_scope`]`(2560)`, which a test holds them to.
+/// holds the work tree to, and ([`scope`]) what a load binds. The patch
+/// embedding, the blocks' attention input and output and MLP linears and
+/// the 2 x 2 merger's linears are W8; the biases, norms and position table
+/// BF16.
 pub fn entries(tower: &VisionTower) -> Vec<Entry> {
-    vision_tower(tower)
+    let (vh, vi) = (tower.hidden, tower.intermediate);
+    let merged = 4 * vh;
+    let mut out = Vec::with_capacity(3 + VISION_LAYERS * 12 + 6);
+    let mut tensor = |name: String, (format, layout): (NumericFormat, StorageLayout), shape: &[u64]| {
+        out.push(Entry::Tensor { name, format, layout, shape: shape.to_vec() });
+    };
+    tensor("vision/patch_embedding".into(), MATRIX, &[vh, tower.patch]);
+    tensor("vision/patch_embedding_bias".into(), VECTOR, &[vh]);
+    tensor("vision/position_embedding".into(), VECTOR, &[tower.positions, vh]);
+    for b in 0..VISION_LAYERS {
+        let n = |suffix: &str| format!("vision/layers/{b}/{suffix}");
+        tensor(n("attention/qkv"), MATRIX, &[3 * vh, vh]);
+        tensor(n("attention/qkv_bias"), VECTOR, &[3 * vh]);
+        tensor(n("attention/output"), MATRIX, &[vh, vh]);
+        tensor(n("attention/output_bias"), VECTOR, &[vh]);
+        tensor(n("mlp/fc1"), MATRIX, &[vi, vh]);
+        tensor(n("mlp/fc1_bias"), VECTOR, &[vi]);
+        tensor(n("mlp/fc2"), MATRIX, &[vh, vi]);
+        tensor(n("mlp/fc2_bias"), VECTOR, &[vh]);
+        for norm in ["norm1", "norm2"] {
+            tensor(n(&format!("{norm}/weight")), VECTOR, &[vh]);
+            tensor(n(&format!("{norm}/bias")), VECTOR, &[vh]);
+        }
+    }
+    tensor("vision/merger/fc1".into(), MATRIX, &[merged, merged]);
+    tensor("vision/merger/fc1_bias".into(), VECTOR, &[merged]);
+    tensor("vision/merger/fc2".into(), MATRIX, &[tower.out_hidden, merged]);
+    tensor("vision/merger/fc2_bias".into(), VECTOR, &[tower.out_hidden]);
+    tensor("vision/merger/norm/weight".into(), VECTOR, &[vh]);
+    tensor("vision/merger/norm/bias".into(), VECTOR, &[vh]);
+    out
+}
+
+/// [`entries`] as the inventory a load binds the tower by and hands the
+/// leaf's descriptors (`ignis_core::flash_next_vision`), each on the device
+/// as stored. The names and shapes are leaked, as
+/// [`crate::inventory::vision_scope`]'s are.
+pub fn scope(tower: &VisionTower) -> Vec<InventoryEntry> {
+    entries(tower)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Entry::Tensor { name, format, layout, shape } => Some(InventoryEntry {
+                name: Box::leak(name.into_boxed_str()),
+                format,
+                layout,
+                shape: Box::leak(shape.into_boxed_slice()),
+                residence: Residence::Device,
+                encoding: DeviceEncoding::Stored,
+            }),
+            Entry::Resource { .. } => None,
+        })
+        .collect()
 }
 
 /// The companion's sidecar `pair.main` against the opened main container
@@ -53,11 +113,19 @@ pub fn check_pair(sidecar: &serde_json::Value, main: &Reader) -> Result<()> {
 }
 
 /// Refuse a container that is not a vision companion, by its `model_id`
-/// (the main container or the MTP companion handed in its place).
+/// (the main container or the MTP companion handed in its place), or one of
+/// another encoding of the tower than [`entries`], by its `weights_id` (the
+/// grouped tower first shipped, left by an older download).
 pub fn check_identity(reader: &Reader) -> Result<()> {
-    let model_id = &reader.identity().model_id;
+    let ArtifactIdentity { model_id, weights_id } = reader.identity();
     if model_id != VISION_MODEL_ID {
         return Err(super::fail(format!("artifact model_id {model_id} is not a vision companion ({VISION_MODEL_ID})")));
+    }
+    let ours = identity().weights_id;
+    if *weights_id != ours {
+        return Err(super::fail(format!(
+            "the vision companion's weights_id is {weights_id}, another encoding of the tower than the one this build binds ({ours})"
+        )));
     }
     Ok(())
 }
@@ -138,14 +206,41 @@ mod tests {
         assert!(err.contains("vision/"), "{err}");
     }
 
-    /// What the packer holds the companion to is what a load binds: at
-    /// Flash-Next's widths the inventory is `vision_scope(2560)` object for
-    /// object (name, format, layout, shape), the 27B tower's 333 objects with
-    /// the merger writing 2,560 rows where the 27B's writes 5,120.
+    /// GitHub #556: a companion of another encoding of the tower -- the
+    /// grouped one first shipped, weights `vision-w8q4q5q6-bf16-de4b8e4`,
+    /// left beside an artifact by an older download -- is refused by its
+    /// identity, both weights ids named, before any of its objects is read.
     #[test]
-    fn the_companion_holds_the_objects_a_load_binds_with_the_merger_2560_wide() {
+    fn a_companion_of_another_encoding_is_refused_by_its_weights_id() {
+        assert_eq!(identity().weights_id, "vision-w8-bf16-de4b8e4");
+        let main = super::super::fixture::build("vision-other-encoding").expect("the main fixture");
+        main.tree.write_vision(&main.path).expect("the vision work tree");
+        let mut options = main.tree.vision_pack_options(main.path.clone());
+        options.identity.weights_id = "vision-w8q4q5q6-bf16-de4b8e4".into();
+        let outcome = pack(&options, &mut |_| {}).expect("pack the tower");
+        assert!(matches!(outcome, PackOutcome::Finished { .. }), "{outcome:?}");
+        let companion = Reader::open(&main.tree.vision_artifact_path()).expect("open the companion");
+        for err in [
+            check_identity(&companion).err().expect("another encoding").to_string(),
+            bind(&companion, &fixture_geometry(), VisionResidency::Host).err().expect("another encoding").to_string(),
+        ] {
+            assert!(err.contains("vision-w8q4q5q6-bf16-de4b8e4") && err.contains("vision-w8-bf16-de4b8e4"), "{err}");
+        }
+    }
+
+    /// What the packer holds the companion to is what a load binds: at
+    /// Flash-Next's widths [`scope`] is [`entries`] object for object (name,
+    /// format, layout, shape). The objects are the 27B tower's 333, under the
+    /// same names and shapes but for the merger's 2,560 rows where the 27B's
+    /// writes 5,120, and every matrix is W8G32 (GitHub #556, the owner's
+    /// decision on #560's alarm): the patch embedding, the 27 blocks' four
+    /// linears and the merger's two, 111 in all; the biases, norms and
+    /// position table stay BF16. Its payload is the 481,445,216 bytes #560's
+    /// diagnosis costed for the all-W8 tower.
+    #[test]
+    fn the_companion_holds_every_matrix_in_w8_and_a_load_binds_what_the_packer_holds() {
         let ours = entries(&geometry());
-        let bound = vision_scope(2560);
+        let bound = scope(&geometry());
         assert_eq!(ours.len(), 333);
         assert_eq!(ours.len(), bound.len());
         for (entry, bound) in ours.iter().zip(&bound) {
@@ -154,8 +249,25 @@ mod tests {
             };
             assert_eq!((name.as_str(), *format, *layout, shape.as_slice()), (bound.name, bound.format, bound.layout, bound.shape));
         }
+        let grouped = vision_scope(2560);
+        let mut matrices = 0;
+        for (ours, grouped) in bound.iter().zip(&grouped) {
+            assert_eq!((ours.name, ours.layout, ours.shape), (grouped.name, grouped.layout, grouped.shape));
+            if grouped.format == NumericFormat::Bf16 {
+                assert_eq!(ours.format, NumericFormat::Bf16, "{}", ours.name);
+            } else {
+                assert_eq!(ours.format, NumericFormat::W8G32F16S, "{}", ours.name);
+                matrices += 1;
+            }
+        }
+        assert_eq!(matrices, 1 + 27 * 4 + 2);
         let served = vision_scope_27b();
-        let differ: Vec<&str> = bound.iter().zip(&served).filter(|(f, s)| f.shape != s.shape).map(|(f, _)| f.name).collect();
+        let differ: Vec<&str> = grouped.iter().zip(&served).filter(|(f, s)| f.shape != s.shape).map(|(f, _)| f.name).collect();
         assert_eq!(differ, ["vision/merger/fc2", "vision/merger/fc2_bias"]);
+        let payload: u64 = bound
+            .iter()
+            .map(|e| crate::tensor_encoded_size(e.layout, e.format, e.shape).unwrap_or_else(|err| panic!("{}: {err}", e.name)))
+            .sum();
+        assert_eq!(payload, 481_445_216);
     }
 }
