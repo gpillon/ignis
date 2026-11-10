@@ -26,8 +26,15 @@ on: every built-in profile turns it on for the 27B alone, so a Flash-Next load
 holds nothing for it until `--vision-enabled` (or `make MODEL=flash-next
 VISION=1`). The profile's residency is both models': `host` under `rtx5090`,
 `device` under `rtxpro6000`. Every vision and media field also has a form for
-one model alone: `--qwen38flashnext-vision-residency device`, or
-`vision: { qwen38flashnext: { residency: device } }` in a config file.
+one model alone, which needs that model's vision on:
+`--qwen38flashnext-vision-enabled --qwen38flashnext-vision-residency device`,
+or `vision: { qwen38flashnext: { enabled: true, residency: device } }` in a
+config file. Named for a model whose vision is off, such a form is refused,
+naming the model. One named for both models (`--vision-max-tokens`, `make
+VISION_MAX_TOKENS=…`) is refused only when vision is off for both; otherwise
+it applies to the models with vision on, which the start's
+`ignis.config.vision_options` line names (`applies_to`, and `vision_off` for
+the others): under a built-in profile, the 27B alone.
 
 With vision on, a Flash-Next start opens the companion and holds it to the main
 container it was built for (the pair its sidecar records), its merger's width to

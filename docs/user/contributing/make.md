@@ -58,7 +58,9 @@ leaves it out over a profile that loads it (`--vision-enabled false`), and an em
 `VISION` leaves it to the profile: every built-in profile loads it for the 27B
 and leaves it out on Flash-Next, where `VISION=1` loads its vision companion's
 tower ([Vision](../configuration/vision.md)). `VISION_MAX_TOKENS` is passed whenever
-it is set, and a start with vision off for both models refuses it; `UNCENSORED=1` loads
+it is set, and a start with vision off for both models refuses it; with an
+empty `VISION` under a built-in profile it applies to the 27B alone, and the start's
+`ignis.config.vision_options` line says so; `UNCENSORED=1` loads
 [the uncensored variant](../guides/uncensored.md) in place of the default
 image, served as `qwen3.8-27b-abliterated`; `ROPE_SCALING=yarn:4` pins the
 factor (empty is `auto`, from `MAX_CONTEXT`; `none` keeps the trained table); the metrics listener is on (`METRICS=0` starts without it); `API_KEY=` and `EXPOSE=` set

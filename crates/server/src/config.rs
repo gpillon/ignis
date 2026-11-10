@@ -1194,8 +1194,8 @@ fn derive(
     }
 
     let (speculation, speculation_off) = derive_speculation(&resolution, &spelled)?;
-    let vision = derive_vision(&resolution, sources, &spelled)?;
-    let media = derive_media(&resolution, sources, vision.is_some(), &spelled)?;
+    let vision = derive_vision(&resolution, sources, family, &spelled)?;
+    let media = derive_media(&resolution, sources, family, vision.is_some())?;
 
     // `--server-metrics` (GitHub #89, ADR 0017, on by default) opens its own
     // listener; naming its address while turning metrics off is refused
@@ -1633,9 +1633,9 @@ fn derive_speculation(
 /// `--vision-embedding-pool-mib` and `--vision-residency` (GitHub #177,
 /// #243, #414). Vision is off unless asked for; none of the other three has
 /// anything to size or place with it off, so naming one is refused rather
-/// than ignored -- unless vision is on for the other model that takes it
-/// ([`vision_on_for_a_model`], GitHub #557), whose knob it then is. With
-/// vision on, the envelope
+/// than ignored ([`refuse_without_vision`], GitHub #557: unless it is named
+/// for every model and another model's vision is on). With vision on, the
+/// envelope
 /// defaults to [`DEFAULT_VISION_MAX_TOKENS`] and the pool to one
 /// envelope-wide embedding — exactly what GitHub #177 always reserved, so a
 /// load that says nothing does not move the VRAM plan. The pool's floor is
@@ -1644,6 +1644,7 @@ fn derive_speculation(
 fn derive_vision(
     resolution: &Resolution,
     sources: &Sources,
+    family: Option<ModelFamily>,
     spelled: &impl Fn(&str, &str) -> String,
 ) -> Result<Option<Vision>, ConfigError> {
     let s = &resolution.settings.vision;
@@ -1653,11 +1654,8 @@ fn derive_vision(
             ("embedding_pool_mib", s.embedding_pool_mib.filter(|_| resolution.explicit("vision", "embedding_pool_mib")).map(|n| n.to_string())),
             ("residency", resolution.explicit("vision", "residency").then(|| s.residency.as_str().to_owned())),
         ] {
-            if let Some(value) = value.filter(|_| !vision_on_for_a_model(sources)) {
-                return Err(ConfigError(format!(
-                    "`{} {value}` requires `--vision-enabled` (vision is off without it)",
-                    spelled("vision", name)
-                )));
+            if let Some(value) = value {
+                refuse_without_vision(resolution, sources, family, ("vision", name), &value)?;
             }
         }
         return Ok(None);
@@ -1676,50 +1674,115 @@ fn derive_vision(
     }))
 }
 
+/// A vision or media knob (`group`, `name`) the operator named at `value`
+/// (empty for a flag that takes none) for a load of `family` whose vision is
+/// off (GitHub #177, #179, #557): refused rather than ignored unless it
+/// reaches a model whose vision is on. One named for a model alone
+/// (`--qwen38flashnext-vision-max-tokens`, `vision.qwen38flashnext.*`) is
+/// that model's, so it is refused naming the model and how to turn its
+/// vision on. One named for every model is refused only when no model that
+/// takes images has vision on; otherwise it applies where vision is on --
+/// the 27B alone under a built-in profile -- and the start says so
+/// ([`log_vision_options`]). A profile's own values are never named.
+fn refuse_without_vision(
+    resolution: &Resolution,
+    sources: &Sources,
+    family: Option<ModelFamily>,
+    (group, name): (&str, &str),
+    value: &str,
+) -> Result<(), ConfigError> {
+    let spelling = resolution.spelled(group, name);
+    let shown = if value.is_empty() { format!("`{spelling}`") } else { format!("`{spelling} {value}`") };
+    let scoped = resolution.origin(group, name).is_some_and(|origin| origin.scoped);
+    match family.filter(|_| scoped) {
+        Some(family) => Err(ConfigError(format!(
+            "{shown} requires vision on for {} (`--vision-enabled`, or `{}` for it alone): its vision is off",
+            family.name(),
+            schema::field("vision", "enabled").expect("declared").scoped_flag(family)
+        ))),
+        None if !vision_on_for_a_model(sources) => {
+            Err(ConfigError(format!("{shown} requires `--vision-enabled` (vision is off without it)")))
+        }
+        None => Ok(()),
+    }
+}
+
 /// Whether vision resolves on for a load of either model that takes it
 /// (GitHub #557, ADR 0087): a built-in profile turns it on for the 27B alone,
-/// so a vision or media knob named beside it -- which a resolution for
-/// Flash-Next, or for no family, sees with vision off -- is the 27B's, not a
-/// mistake to refuse.
+/// so a vision or media knob named for every model beside it -- which a
+/// resolution for Flash-Next, or for no family, sees with vision off -- is
+/// the 27B's, not a mistake to refuse.
 fn vision_on_for_a_model(sources: &Sources) -> bool {
-    ModelFamily::WITH_VISION.iter().copied().any(|family| {
-        source::resolve_settings(sources, Some(family), Fit::Switch).is_ok_and(|resolved| resolved.settings.vision.enabled)
+    !vision_by_model(sources).0.is_empty()
+}
+
+/// The models that take images with vision on for `sources`, and those with
+/// it off, in [`ModelFamily::WITH_VISION`]'s order.
+fn vision_by_model(sources: &Sources) -> (Vec<ModelFamily>, Vec<ModelFamily>) {
+    ModelFamily::WITH_VISION.iter().copied().partition(|family| {
+        source::resolve_settings(sources, Some(*family), Fit::Switch).is_ok_and(|resolved| resolved.settings.vision.enabled)
     })
 }
 
 /// `--media-allow-private-network` and `--media-cache-mib` (GitHub #179).
 /// Without vision there is no media to acquire, so turning the private
 /// network on or sizing the cache is refused rather than ignored, as the
-/// vision envelope is -- unless vision is on for the other model
-/// ([`vision_on_for_a_model`]).
+/// vision envelope is ([`refuse_without_vision`]).
 fn derive_media(
     resolution: &Resolution,
     sources: &Sources,
+    family: Option<ModelFamily>,
     vision: bool,
-    spelled: &impl Fn(&str, &str) -> String,
 ) -> Result<MediaOptions, ConfigError> {
     let s = &resolution.settings.media;
-    let named = resolution.explicit("media", "allow_private_network") || resolution.explicit("media", "cache_mib");
-    if !vision && named && vision_on_for_a_model(sources) {
-        return Ok(MediaOptions::default());
+    if vision {
+        return Ok(MediaOptions { allow_private_network: s.allow_private_network, cache_bytes: s.cache_mib << 20 });
     }
-    if !vision {
-        if s.allow_private_network && resolution.explicit("media", "allow_private_network") {
-            return Err(ConfigError(format!(
-                "`{}` requires `--vision-enabled` (vision is off without it)",
-                spelled("media", "allow_private_network")
-            )));
+    for (name, value) in [
+        ("allow_private_network", (s.allow_private_network && resolution.explicit("media", "allow_private_network")).then(String::new)),
+        ("cache_mib", resolution.explicit("media", "cache_mib").then(|| s.cache_mib.to_string())),
+    ] {
+        if let Some(value) = value {
+            refuse_without_vision(resolution, sources, family, ("media", name), &value)?;
         }
-        if resolution.explicit("media", "cache_mib") {
-            return Err(ConfigError(format!(
-                "`{} {}` requires `--vision-enabled` (vision is off without it)",
-                spelled("media", "cache_mib"),
-                s.cache_mib
-            )));
-        }
-        return Ok(MediaOptions::default());
     }
-    Ok(MediaOptions { allow_private_network: s.allow_private_network, cache_bytes: s.cache_mib << 20 })
+    Ok(MediaOptions::default())
+}
+
+/// Say which models the vision and media knobs named for every model apply
+/// to (GitHub #557): `ignis.config.vision_options`, naming the knobs as the
+/// operator spelled them, the models with vision on (`applies_to`) and those
+/// with it off (`vision_off`, `none` when every one has it on), which leave
+/// them unused. Such a knob is taken when some model has vision on
+/// ([`refuse_without_vision`]): under a built-in profile, which turns vision
+/// on for the 27B alone, a Flash-Next start says it applies to the 27B.
+/// Nothing is said when none is named; a knob named for one model is that
+/// model's. `main` logs it beside [`log_source`], before the load begins.
+pub fn log_vision_options(config: &Config) {
+    let sources = config.basis.sources();
+    let Ok(general) = source::resolve_settings(sources, None, Fit::Switch) else {
+        return;
+    };
+    let options: Vec<String> = schema::all_fields()
+        .filter(|meta| matches!(meta.group, "vision" | "media") && meta.name != "enabled")
+        .filter(|meta| general.explicit(meta.group, meta.name))
+        .map(|meta| general.spelled(meta.group, meta.name))
+        .collect();
+    if options.is_empty() {
+        return;
+    }
+    let (on, off) = vision_by_model(sources);
+    let ids = |families: &[ModelFamily]| match families {
+        [] => "none".to_owned(),
+        families => families.iter().map(|family| family.model_id()).collect::<Vec<_>>().join(","),
+    };
+    tracing::info!(
+        name: "ignis.config.vision_options",
+        options = %options.join(","),
+        applies_to = %ids(&on),
+        vision_off = %ids(&off),
+        "vision and media options named for every model apply to the models with vision on"
+    );
 }
 
 /// What an artifact's family decides about a config (spec flash-next/04),

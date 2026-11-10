@@ -2553,6 +2553,72 @@ fn a_vision_knob_named_beside_the_27bs_profile_vision_is_the_27bs() {
     assert!(err.contains("--media-cache-mib") && err.contains("--vision-enabled"), "{err}");
 }
 
+/// GitHub #557: a vision or media knob named for one model is that model's
+/// alone, so with its vision off it is refused rather than ignored, whatever
+/// the other model's vision, in every source an operator writes; with its
+/// vision on, by either spelling, the model takes it.
+#[test]
+fn a_vision_knob_named_for_a_model_whose_vision_is_off_is_refused() {
+    // The 5090's profile turns vision on for the 27B alone.
+    for flags in [
+        &["--profile", "rtx5090", "--qwen38flashnext-vision-max-tokens", "4096"][..],
+        &["--profile", "rtx5090", "--qwen38flashnext-vision-residency", "device"],
+        &["--profile", "rtx5090", "--qwen38flashnext-vision-embedding-pool-mib", "640"],
+        &["--profile", "rtx5090", "--qwen38flashnext-media-cache-mib", "64"],
+        &["--profile", "rtx5090", "--qwen38flashnext-media-allow-private-network"],
+    ] {
+        let err = refused(flags);
+        assert!(
+            err.contains(flags[2]) && err.contains("Qwen3.8-Flash-Next") && err.contains("--qwen38flashnext-vision-enabled"),
+            "{flags:?}: {err}"
+        );
+    }
+    let env = env_map(&[("IGNIS_QWEN38FLASHNEXT_VISION_MAX_TOKENS", "4096")]);
+    let err = resolve(&args(&["--profile", "rtx5090"]), env).expect_err("the env form").0;
+    assert!(err.contains("IGNIS_QWEN38FLASHNEXT_VISION_MAX_TOKENS 4096"), "{err}");
+    let files = MemFiles::with(&[("c.yaml", "vision:\n  qwen38flashnext:\n    residency: device\n")]);
+    let err = with_files(&["--profile", "rtx5090", "--config", "c.yaml"], no_env, &files).expect_err("the file form").0;
+    assert!(err.contains("vision.qwen38flashnext.residency") && err.contains("Qwen3.8-Flash-Next"), "{err}");
+    // The 27B's own, with only Flash-Next's vision on.
+    let err = refused(&["--profile", "none", "--qwen38flashnext-vision-enabled", "--qwen38-vision-max-tokens", "4096"]);
+    assert!(err.contains("--qwen38-vision-max-tokens 4096") && err.contains("Qwen3.8-27B"), "{err}");
+    // With the model's vision on, it is the model's.
+    for on in ["--vision-enabled", "--qwen38flashnext-vision-enabled"] {
+        let started = config(&["--profile", "rtx5090", on, "--qwen38flashnext-vision-max-tokens", "4096"]);
+        assert_eq!(started.for_family(ModelFamily::FlashNext).unwrap().vision.map(|v| v.max_tokens()), Some(4096), "{on}");
+    }
+}
+
+/// GitHub #557: a vision or media knob named for every model, taken because
+/// some model has vision on, is said at start: `ignis.config.vision_options`
+/// names the knobs, the models they apply to (those with vision on) and the
+/// ones whose vision is off. Nothing is said when none is named, or when one
+/// is named for a model alone, which is that model's.
+#[test]
+fn the_start_says_which_models_a_vision_knob_named_for_every_model_applies_to() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let logged = |config: &Config| -> Vec<serde_json::Value> {
+        let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+        let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+        tracing::subscriber::with_default(subscriber, || log_vision_options(config));
+        sink.lines().iter().map(|line| serde_json::from_str(line).unwrap()).collect()
+    };
+    let field = |event: &serde_json::Value, name: &str| event.get(name).or_else(|| event["attributes"].get(name)).cloned();
+    let lines = logged(&config(&["--profile", "rtx5090", "--vision-max-tokens", "8192", "--media-cache-mib", "64"]));
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let event = &lines[0];
+    assert_eq!(event["event_name"], "ignis.config.vision_options", "{event}");
+    assert_eq!(field(event, "options"), Some("--vision-max-tokens,--media-cache-mib".into()), "{event}");
+    assert_eq!(field(event, "applies_to"), Some("qwen3.8-27b".into()), "{event}");
+    assert_eq!(field(event, "vision_off"), Some("qwen3.8-flash-next".into()), "{event}");
+    let both = logged(&config(&["--profile", "rtx5090", "--vision-enabled", "--vision-residency", "device"]));
+    assert_eq!(field(&both[0], "options"), Some("--vision-residency".into()), "{both:?}");
+    assert_eq!(field(&both[0], "applies_to"), Some("qwen3.8-27b,qwen3.8-flash-next".into()), "{both:?}");
+    assert_eq!(field(&both[0], "vision_off"), Some("none".into()), "{both:?}");
+    assert!(logged(&config(&["--profile", "rtx5090"])).is_empty());
+    assert!(logged(&config(&["--profile", "rtx5090", "--qwen38-vision-max-tokens", "8192"])).is_empty(), "the 27B's own");
+}
+
 /// GitHub #195: the two are independent load options again.
 #[test]
 fn vision_and_dflash2_resolve_together_as_two_independent_load_options() {

@@ -185,6 +185,9 @@ async fn main() {
     // before anything is loaded, so it is in the log even when the load then
     // fails.
     config::log_source(&config);
+    // GitHub #557: which models a vision or media option named for every
+    // model applies to, when one is named.
+    config::log_vision_options(&config);
     // The start options a load reads (`load::prepare_model`), which fits
     // them to the artifact's family once it names one (`Config::for_family`,
     // spec flash-next/04 and config-v2/01): a value scoped to that family is

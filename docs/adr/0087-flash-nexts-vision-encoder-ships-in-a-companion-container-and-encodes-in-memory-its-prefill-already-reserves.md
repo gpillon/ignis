@@ -92,8 +92,12 @@ takes images with the 27B's feature set, and how:
   weights ids, so a start or a switch refuses it before anything loads.
 - **Vision and media settings per family** (#557): the vision and media fields apply to both text families, each
   family its own; the four built-in profiles turn vision on for the 27B only, so a Flash-Next start loads no tower
-  unless it asks (`--vision-enabled`, `VISION=1`). The residency and the envelope are shared. The host plan shows
-  the tower (482,705,408 bytes of host spans) and the pool as their own lines.
+  unless it asks (`--vision-enabled`, `VISION=1`). Each field, the residency and the envelope among them, has a
+  value for both models (`--vision-residency`, a profile's `vision.residency`) and one for a model alone
+  (`--qwen38flashnext-vision-residency`); a profile sets the residency and the envelope for both. A knob an operator
+  names for one model whose vision is off is refused; one named for both is refused only when vision is off for
+  both, and otherwise applies to the models with vision on, which the start logs (`ignis.config.vision_options`).
+  The host plan shows the tower (482,705,408 bytes of host spans) and the pool as their own lines.
 - **The item bound** is computed when the tower is bound: the largest item whose encode fits the prefill scratch
   first, then the `host` residency's staging slots in the expert staging ring, then the encode's workspace there,
   then both, at most 16,384 merged tokens (#557, #558). The ring was shown first to hold nothing live while an item

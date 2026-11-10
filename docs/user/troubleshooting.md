@@ -378,6 +378,19 @@ pair is one revision's: a file already there at another size is left alone, so
 move the companion and its `.conversion.json` aside first
 ([Flash-Next's vision](configuration/vision.md#flash-next)).
 
+### `` `--qwen38flashnext-vision-max-tokens …` requires vision on for Qwen3.8-Flash-Next ``
+
+A vision or media option named for one model (a `--qwen38flashnext-…` or
+`--qwen38-…` flag, its `IGNIS_QWEN38FLASHNEXT_…` variable, a
+`vision.qwen38flashnext` section of the config file) is that model's alone,
+and that model's vision is off: every built-in profile turns vision on for the
+27B and leaves it off on Flash-Next. Turn it on for that model
+(`--qwen38flashnext-vision-enabled`, or `--vision-enabled` for both), or drop
+the option. The same option named for both models (`--vision-max-tokens`) is
+taken while one has vision on, and the start's `ignis.config.vision_options`
+line names the models it applies to
+([Flash-Next's vision](configuration/vision.md#flash-next)).
+
 ### A flag is refused for this model
 
 A field only one model takes is refused at start when set for the other
