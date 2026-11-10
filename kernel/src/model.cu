@@ -1302,7 +1302,6 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   uint32_t vision_item_max_tokens = 0;
   uint64_t vision_embedding_pool_request = 0;
   uint32_t attention_text_max_keys = 0;
-  uint32_t draft_row_budget = 0;
   uint32_t prefill_attention = 0;
   uint32_t prefill_linear = IGNIS_PREFILL_LINEAR_FUSED;
   uint32_t vision_residency = IGNIS_VISION_RESIDENCY_DEVICE;
@@ -1323,7 +1322,6 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     rope_scaling.beta_fast = options->rope_scaling_beta_fast;
     rope_scaling.beta_slow = options->rope_scaling_beta_slow;
     attention_text_max_keys = options->attention_text_max_keys;
-    draft_row_budget = options->draft_row_budget;
     prefill_attention = options->prefill_attention;
     prefill_linear = options->prefill_linear;
     vision_residency = options->vision_residency;

@@ -136,7 +136,6 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
   constexpr std::int32_t kHeadDim = 256;
   constexpr std::int32_t kQHeads = kIgnisGqaQHeads;
   constexpr std::int32_t kKvHeads = 4;
-  constexpr std::int32_t kRotaryDim = ignis::kTextRotaryDim;
 
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto tokens = static_cast<std::int32_t>(num_tokens);
@@ -417,7 +416,6 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
   constexpr std::int32_t kHeadDim = 256;
   constexpr std::int32_t kQHeads = kIgnisGqaQHeads;
   constexpr std::int32_t kKvHeads = 4;
-  constexpr std::int32_t kRotaryDim = ignis::kTextRotaryDim;
 
   // The batch's rows are the lanes; every row carries `lane_tokens`
   // columns, lane-major, so the activations are `columns` wide.
