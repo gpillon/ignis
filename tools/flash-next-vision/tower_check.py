@@ -58,13 +58,15 @@ kind. Per variant, on the dump's items:
 - its cost: the tower's bytes and the staging slot (the largest stage, `ignis_vision_staging_slot_bytes`);
 - with `--against` another diagnosis (the 27B's), `compare`'s bar against that one's stored tower, item for
   item, plain and centred.
-The record also holds the recipe check (each stored payload against the recipe's encoding of its BF16 tensor,
-byte for byte, the differing objects named) and each source's weight error per kind (relative Frobenius).
+The record also holds the recipe check (each stored payload against the encoding of its BF16 tensor in the
+family's recipe, byte for byte, the differing objects named: Flash-Next's own, every matrix W8 since GitHub #556,
+or the 27B's grouped one) and each source's weight error per kind (relative Frobenius).
 
 Exit status: 0 done, 2 refused (a missing or mismatched input, named).
 """
 import argparse
 import csv
+import dataclasses
 import gc
 import json
 import os
@@ -93,11 +95,15 @@ REPO_27B = "Qwen/Qwen3.8-27B"
 REVISION_27B = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
 TOWER_27B = convert.Tower("qwen3.8-27b", 1152, 4304, 16, 48 * 48, 5120, shard="model-00001-of-00018.safetensors",
                           span_bytes=921_460_192,
-                          span_sha256="c623c5ec68429f48689a011872157782c85508517faaa66de38250e0ad4b145b")
+                          span_sha256="c623c5ec68429f48689a011872157782c85508517faaa66de38250e0ad4b145b",
+                          recipe=convert.GROUPED_27B)
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_SEED = 560
 DIAGNOSIS_SCHEMA = "ignis-vision-tower-diagnosis/1"
-TOWERS = {FLASH_NEXT: convert.GEOMETRIES[FLASH_NEXT], QWEN27B: TOWER_27B, "fixture": convert.GEOMETRIES["fixture"]}
+# Each family's tower in its own recipe (GitHub #556: Flash-Next's every matrix W8, the 27B's grouped), and the
+# tests' narrow widths in each.
+TOWERS = {FLASH_NEXT: convert.GEOMETRIES[FLASH_NEXT], QWEN27B: TOWER_27B, "fixture": convert.GEOMETRIES["fixture"],
+          "fixture-27b": dataclasses.replace(convert.GEOMETRIES["fixture"], recipe=convert.GROUPED_27B)}
 KINDS = ("patch_embedding", "qkv", "attention_output", "fc1", "fc2", "merger_fc1", "merger_fc2")
 FORMATS = {"Q4": inventory.Q4, "Q5": inventory.Q5, "Q6": inventory.Q6, "W8": inventory.W8, "BF16": inventory.BF16}
 DEFAULT_VARIANTS = ("bf16", "stored") + tuple(f"bf16+{kind}=stored" for kind in KINDS)
@@ -775,7 +781,7 @@ def parser():
     d = sub.add_parser("diagnose", help="where the encoded tower's error comes from: variants of the matrices' "
                                         "sources, stage by stage")
     d.add_argument("--family", required=True, choices=FAMILIES)
-    d.add_argument("--geometry", choices=sorted(TOWERS), help="the tower's widths (default: the family's)")
+    d.add_argument("--geometry", choices=sorted(TOWERS), help="the tower's widths and recipe (default: the family's)")
     d.add_argument("--source", required=True, help="the family's cache of its BF16 tower")
     d.add_argument("--container", required=True, help="the container holding the served tower's vision/ objects")
     d.add_argument("--dump", required=True)

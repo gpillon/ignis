@@ -1017,7 +1017,7 @@ Encoded images kept for reuse, in MiB, where `vision.residency` puts the pool: V
 | Per model | `--qwen38-vision-residency`, `--qwen38flashnext-vision-residency` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-Where the vision tower's weights and the embedding pool live: `device`, in VRAM for the life of the load (today's encode latency), or `host`, in pinned host RAM, the weights copied to the GPU for each image encode (~300 MB and the pool less VRAM, so more KV pool, a few ms more an encode). A `host` start the host RAM cannot hold is refused, never moved to the device. Needs vision on.
+Where the vision tower's weights and the embedding pool live: `device`, in VRAM for the life of the load (today's encode latency), or `host`, in pinned host RAM, the weights copied to the GPU for each image encode (the tower, ~300 MB on the 27B and ~480 MB on Flash-Next, and the pool less VRAM, so more KV pool, a few ms more an encode). A `host` start the host RAM cannot hold is refused, never moved to the device. Needs vision on.
 
 ## media
 

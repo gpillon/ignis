@@ -17,9 +17,10 @@ takes images with the 27B's feature set, and how:
 - **The tower and its merger ship in a companion container of their own**,
   beside the main one, as the MTP head does (flash-next-layout.md §13): their
   own identity, a pair pin to the main container, bound only when vision is
-  on. They are encoded from the pinned revision's BF16 tensors with the 27B
-  tower's recipe. The 72 GB main container and its content hash stay as they
-  are; the download grows by about 0.3 GB, which the catalog always fetches,
+  on. They are encoded from the pinned revision's BF16 tensors, every matrix
+  in W8 (the 27B tower's recipe until #560's alarm, see As built). The 72 GB
+  main container and its content hash stay as they are; the download grows by
+  about 0.5 GB, which the catalog always fetches,
   as it fetches the MTP companion. A later packaging of ignis's own may fold
   the companions back into one file.
 - **The encoder works in memory the prefill already reserves**: Flash-Next's
@@ -46,7 +47,7 @@ takes images with the 27B's feature set, and how:
 ## Considered Options
 
 - **A new revision of the main container with the visual tensors**: 72 GB
-  uploaded and downloaded again for 0.3 GB of tower, a new content hash, and
+  uploaded and downloaded again for 0.5 GB of tower, a new content hash, and
   the MTP companion's pair pin cut again.
 - **The 27B's encoder rule, its own share sized for the item bound** (the
   larger of the prefill's share and the encoder's, ADR 0030): up to ~0.9 GiB
@@ -68,22 +69,31 @@ takes images with the 27B's feature set, and how:
 - A Flash-Next sequence keeps the three-axis position of every token it holds,
   in its snapshots and checkpoints too, since the indexer rotates a compressed
   block's key at its first token's position.
-- With the main container unchanged, a text-only user downloads 0.3 GB more
+- With the main container unchanged, a text-only user downloads 0.5 GB more
   and loads exactly what loads today.
 
 **As built** (2026-11-09, GitHub #556-#559 and #562-#564), where the decision left a choice. Draft: the status stays
 `proposed` until #560's figures are in.
 
-- **The companion** (#556): `qwen3_8_flash_next_vision-v2.ninfer`, 284,229,120 bytes, its own identity
-  (`qwen3.8-flash-next-vision`, weights `vision-w8q4q5q6-bf16-de4b8e4`) and a pair pin to the main container,
-  built by `tools/flash-next-vision/convert.py` from the first shard's visual range alone (897,862,112 bytes) in the
-  27B tower's formats: the patch embedding Q6, the blocks' projections Q4 and Q5, the merger W8, the norms, biases and
-  position embedding BF16. It is published beside the main container in Flash-Next's model repository, and the
-  catalog, pinned at the hub commit that added it (1f4f85c4), fetches it with the model.
+- **The companion** (#556): `qwen3_8_flash_next_vision-v2.ninfer`, 482,499,840 bytes, its own identity
+  (`qwen3.8-flash-next-vision`, weights `vision-w8-bf16-de4b8e4`) and a pair pin to the main container,
+  built by `tools/flash-next-vision/convert.py` from the first shard's visual range alone (897,862,112 bytes), every
+  matrix W8 (groups of 32, binary16 scales), the norms, biases and position embedding BF16. It is published beside the
+  main container in Flash-Next's model repository, and the catalog, pinned at the hub commit that added it, fetches it
+  with the model.
+- **Every matrix W8, not the 27B tower's recipe** (#560, the owner's decision of 2026-11-10). The companion first
+  shipped (284,229,120 bytes, weights `vision-w8q4q5q6-bf16-de4b8e4`) held the 27B's formats: the patch embedding Q6,
+  the blocks' projections Q4 and Q5, the merger W8. #560's tower check put its served rows 0.305 in relative L2 from
+  the BF16 tower's against the 27B's 0.183; the diagnosis found the encode computing what the stored words say, the
+  weights quantizing alike in both towers, and the error growing at Flash-Next's retrained merger, where 31% of it was
+  one vector every row shares. With every matrix W8 the CPU simulation gave 0.029, for 198,272,448 bytes more of
+  tower (481,445,216 in place of 283,172,768), the same staging slot (22,608,384 bytes) and no new kernel route.
+  The 27B's tower and recipe do not change. A companion of the grouped encoding is refused when it opens, naming both
+  weights ids, so a start or a switch refuses it before anything loads.
 - **Vision and media settings per family** (#557): the vision and media fields apply to both text families, each
   family its own; the four built-in profiles turn vision on for the 27B only, so a Flash-Next start loads no tower
   unless it asks (`--vision-enabled`, `VISION=1`). The residency and the envelope are shared. The host plan shows
-  the tower (284,454,912 bytes of host spans) and the pool as their own lines.
+  the tower (482,705,408 bytes of host spans) and the pool as their own lines.
 - **The item bound** is computed when the tower is bound: the largest item whose encode fits the prefill scratch
   first, then the `host` residency's staging slots in the expert staging ring, then the encode's workspace there,
   then both, at most 16,384 merged tokens (#557, #558). The ring was shown first to hold nothing live while an item

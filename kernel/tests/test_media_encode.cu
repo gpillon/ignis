@@ -1,24 +1,26 @@
 // GitHub #557 (ADR 0087): the media encode at both text models' merger widths -- OURS, not vendored.
 //
-// Flash-Next's vision companion is the 27B's tower with a merger that writes Flash-Next's 2,560
-// rows. Its canary's first image failed in the encode, on the merger's fc2 [2560, 4608], which the
-// W8 dispatch had no route for: no test ran an encode at any width but the 27B's. Here:
+// Flash-Next's vision companion holds the 27B's tower objects with a merger that writes Flash-Next's
+// 2,560 rows. Its canary's first image failed in the encode, on the merger's fc2 [2560, 4608], which
+// the W8 dispatch had no route for: no test ran an encode at any width but the 27B's. Since GitHub
+// #556 every matrix of Flash-Next's companion is W8; the 27B's keeps its grouped formats (Q6 patch
+// embedding, Q4 qkv and fc1, Q5 output and fc2, W8 merger). Here, each family in its own formats:
 //
-//   routes   every linear an encode runs (kernel/src/vision_encode.cu's `encode`), in the
-//            companion's stored formats (Q6 patch embedding, Q4 qkv and fc1, Q5 output and fc2, W8
-//            merger), has a route at every width it runs at, for every item up to 32,768 merged
-//            tokens (the ceiling the tower's Q arms and the W8 K-4608 arm share): the tower's
+//   routes   every linear an encode runs (kernel/src/vision_encode.cu's `encode`), in the family's
+//            stored formats, has a route at every width it runs at, for every item up to 32,768
+//            merged tokens (the ceiling the tower's Q arms and the W8 K-4608 arm share): the tower's
 //            linears at 4 x tokens patches, the merger's fc1 at the tokens, its fc2 once per
 //            embedding pool page at the page's width (1 .. IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS), at
-//            2,560 (Flash-Next) and 5,120 (the 27B). Asked of ops::linear_workspace_capacity_bytes,
-//            which asks the dispatch the op takes. Negative control: a 3,072-wide merger, which the
-//            dispatch does not register, has no route. Host-only: no device call.
+//            2,560 (Flash-Next, every matrix W8) and 5,120 (the 27B, grouped). Asked of
+//            ops::linear_workspace_capacity_bytes, which asks the dispatch the op takes. Negative
+//            control: a 3,072-wide merger, which the dispatch does not register, has no route.
+//            Host-only: no device call.
 //   encode   ignis_media_encode end to end, through ignis_model_load: the 27B program with no text
 //            layers at hidden 2,560 and 5,120 (bind_vision binds the merger's fc2 at the model's
 //            hidden, the pool's pages and the encode take it from there, as a Flash-Next load
-//            does), under each vision residency. The tower is the companion's: its 333 tensors in
-//            their stored formats, each a 4 KiB-aligned span of one allocation (VRAM, or mapped
-//            pinned host memory staged per encode), the 27 blocks and the patch embedding all
+//            does), under each vision residency. The tower is the family's companion's: its 333
+//            tensors in their stored formats, each a 4 KiB-aligned span of one allocation (VRAM, or
+//            mapped pinned host memory staged per encode), the 27 blocks and the patch embedding all
 //            zero (each block adds exactly 0 to the residual), the merger random. Items of 1, 5,
 //            16, 17 and 133 merged tokens put each route of the fc2 under a page (T 1, 5, 16, 17,
 //            then 128 and 5 over two pages). Each embedding against fp64 that rounds to BF16
@@ -57,7 +59,19 @@ namespace {
 
 constexpr int32_t kFlashNextHidden = 2560;
 constexpr int32_t k27bHidden = 5120;
-constexpr std::array<int32_t, 2> kWidths{kFlashNextHidden, k27bHidden};
+
+// A family's companion: its merger's width and its tower's stored formats (crates/artifact's
+// `flash_next::vision::entries` and `inventory::vision_scope_27b`); both mergers are W8.
+struct Family {
+  const char *name;
+  int32_t hidden;
+  ninfer::QType patch, qkv, output, fc1, fc2;
+};
+constexpr Family kFlashNext{"Flash-Next", kFlashNextHidden, ninfer::QType::W8G32_F16S, ninfer::QType::W8G32_F16S,
+                            ninfer::QType::W8G32_F16S, ninfer::QType::W8G32_F16S, ninfer::QType::W8G32_F16S};
+constexpr Family k27b{"27B", k27bHidden, ninfer::QType::Q6G64_F16S, ninfer::QType::Q4G64_F16S,
+                      ninfer::QType::Q5G64_F16S, ninfer::QType::Q4G64_F16S, ninfer::QType::Q5G64_F16S};
+constexpr std::array<Family, 2> kFamilies{kFlashNext, k27b};
 // The most merged tokens an item may hold: past it the tower's Q arms (131,072 patches) and the
 // W8 K-4608 arm (the merger's fc1) have no route.
 constexpr int32_t kMaxItemTokens = 32768;
@@ -68,8 +82,18 @@ struct Problem {
   int32_t n, k;
 };
 
+const char *format_name(ninfer::QType qtype) {
+  switch (qtype) {
+    case ninfer::QType::W8G32_F16S: return "W8";
+    case ninfer::QType::Q4G64_F16S: return "Q4";
+    case ninfer::QType::Q5G64_F16S: return "Q5";
+    case ninfer::QType::Q6G64_F16S: return "Q6";
+    default: return "?";
+  }
+}
+
 std::string shape(const Problem &p) {
-  return std::string(p.name) + " [" + std::to_string(p.n) + ", " + std::to_string(p.k) + "]";
+  return std::string(p.name) + " (" + format_name(p.qtype) + ") [" + std::to_string(p.n) + ", " + std::to_string(p.k) + "]";
 }
 
 // The first T of first, first + step, .. last at which `p` has no route, or 0.
@@ -95,22 +119,23 @@ void case_routes() {
   std::printf("routes: every linear of an encode at every width it runs, items of 1 .. %d merged tokens\n",
               kMaxItemTokens);
   using ninfer::QType;
-  const Problem tower[] = {
-      {"patch embedding (Q6)", QType::Q6G64_F16S, kVisionHidden, kVisionPatchDim},
-      {"block qkv (Q4)", QType::Q4G64_F16S, 3 * kVisionHidden, kVisionHidden},
-      {"block output (Q5)", QType::Q5G64_F16S, kVisionHidden, kVisionHidden},
-      {"block fc1 (Q4)", QType::Q4G64_F16S, kVisionIntermediate, kVisionHidden},
-      {"block fc2 (Q5)", QType::Q5G64_F16S, kVisionHidden, kVisionIntermediate},
-  };
-  for (const Problem &p : tower) {
-    expect_routed(p, kVisionMergeUnit, kMaxItemTokens * kVisionMergeUnit, kVisionMergeUnit);
-  }
-  expect_routed({"merger fc1 (W8)", QType::W8G32_F16S, kVisionMergerHidden, kVisionMergerHidden}, 1, kMaxItemTokens, 1);
-  for (const int32_t hidden : kWidths) {
-    expect_routed({"merger fc2 (W8)", QType::W8G32_F16S, hidden, kVisionMergerHidden}, 1,
+  for (const Family &f : kFamilies) {
+    std::printf(" %s, the merger %d wide:\n", f.name, f.hidden);
+    const Problem tower[] = {
+        {"patch embedding", f.patch, kVisionHidden, kVisionPatchDim},
+        {"block qkv", f.qkv, 3 * kVisionHidden, kVisionHidden},
+        {"block output", f.output, kVisionHidden, kVisionHidden},
+        {"block fc1", f.fc1, kVisionIntermediate, kVisionHidden},
+        {"block fc2", f.fc2, kVisionHidden, kVisionIntermediate},
+    };
+    for (const Problem &p : tower) {
+      expect_routed(p, kVisionMergeUnit, kMaxItemTokens * kVisionMergeUnit, kVisionMergeUnit);
+    }
+    expect_routed({"merger fc1", QType::W8G32_F16S, kVisionMergerHidden, kVisionMergerHidden}, 1, kMaxItemTokens, 1);
+    expect_routed({"merger fc2", QType::W8G32_F16S, f.hidden, kVisionMergerHidden}, 1,
                   IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS, 1);
   }
-  const Problem unregistered{"merger fc2 (W8)", QType::W8G32_F16S, 3072, kVisionMergerHidden};
+  const Problem unregistered{"merger fc2", QType::W8G32_F16S, 3072, kVisionMergerHidden};
   check(first_unrouted(unregistered, 1, 1, 1) == 1,
         "routes: the negative control (" + shape(unregistered) + ", unregistered) has no route");
 }
@@ -237,24 +262,25 @@ struct Image {
   }
 };
 
-// The companion's 333 tensors (crates/artifact's vision inventory, bind_vision's shapes) for a
-// model `hidden` wide.
-Image tower_image(const Tower &t, int32_t hidden) {
-  const int32_t h = kVisionHidden, inter = kVisionIntermediate, merged = kVisionMergerHidden;
+// Family `f`'s companion's 333 tensors (crates/artifact's vision inventory, bind_vision's shapes),
+// in its stored formats, for a model `f.hidden` wide.
+Image tower_image(const Tower &t, const Family &f) {
+  const int32_t h = kVisionHidden, inter = kVisionIntermediate, merged = kVisionMergerHidden, hidden = f.hidden;
+  const auto code = [](ninfer::QType qtype) { return static_cast<int32_t>(qtype); };
   Image im;
-  im.add("vision/patch_embedding", {h, kVisionPatchDim}, IGNIS_QTYPE_Q6G64_F16S);
+  im.add("vision/patch_embedding", {h, kVisionPatchDim}, code(f.patch));
   im.add_bf16("vision/patch_embedding_bias", t.patch_bias, h);
   std::memcpy(im.add("vision/position_embedding", {kVisionPositionEmbeddings, h}, IGNIS_QTYPE_BF16_CTRL),
               t.table.data(), t.table.size() * 2);
   for (int32_t b = 0; b < kVisionLayers; ++b) {
     const std::string p = "vision/layers/" + std::to_string(b) + "/";
-    im.add(p + "attention/qkv", {3 * h, h}, IGNIS_QTYPE_Q4G64_F16S);
+    im.add(p + "attention/qkv", {3 * h, h}, code(f.qkv));
     im.add(p + "attention/qkv_bias", {3 * h}, IGNIS_QTYPE_BF16_CTRL);
-    im.add(p + "attention/output", {h, h}, IGNIS_QTYPE_Q5G64_F16S);
+    im.add(p + "attention/output", {h, h}, code(f.output));
     im.add(p + "attention/output_bias", {h}, IGNIS_QTYPE_BF16_CTRL);
-    im.add(p + "mlp/fc1", {inter, h}, IGNIS_QTYPE_Q4G64_F16S);
+    im.add(p + "mlp/fc1", {inter, h}, code(f.fc1));
     im.add(p + "mlp/fc1_bias", {inter}, IGNIS_QTYPE_BF16_CTRL);
-    im.add(p + "mlp/fc2", {h, inter}, IGNIS_QTYPE_Q5G64_F16S);
+    im.add(p + "mlp/fc2", {h, inter}, code(f.fc2));
     im.add(p + "mlp/fc2_bias", {h}, IGNIS_QTYPE_BF16_CTRL);
     for (const char *norm : {"norm1/weight", "norm1/bias", "norm2/weight", "norm2/bias"}) {
       im.add(p + norm, {h}, IGNIS_QTYPE_BF16_CTRL);
@@ -520,12 +546,14 @@ void case_encode(double bound) {
     calls.push_back(make_call(item.h, item.w, item.stream));
     refs.push_back(reference(t, calls.back(), checked_columns(calls.back().tokens())));
   }
-  for (const int32_t hidden : kWidths) {
-    const Image im = tower_image(t, hidden);
+  for (const Family &f : kFamilies) {
+    const int32_t hidden = f.hidden;
+    const Image im = tower_image(t, f);
     const auto device = encode_items(im, hidden, false, calls);
     const auto host = encode_items(im, hidden, true, calls);
     for (std::size_t i = 0; i < calls.size(); ++i) {
-      const std::string item = std::to_string(hidden) + " wide, " + std::to_string(calls[i].tokens()) + " merged tokens";
+      const std::string item = std::string(f.name) + ", " + std::to_string(hidden) + " wide, " +
+                               std::to_string(calls[i].tokens()) + " merged tokens";
       if (device[i].empty() || host[i].empty()) {
         continue;
       }

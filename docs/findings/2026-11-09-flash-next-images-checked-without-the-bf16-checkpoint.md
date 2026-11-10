@@ -32,8 +32,17 @@ the owner, who decides whether a KLD against BF16 on image prompts runs.
 
 **Setup.**
 - Build: `555-integration` at [TBD], `make build CUDA=1` in [TBD]; the vision companion
-  `qwen3_8_flash_next_vision-v2.ninfer` (284,229,120 B, sha256 `d97353d4…`, weights id `vision-w8q4q5q6-bf16-de4b8e4`),
-  pinned to the main container `12e3b265…`; the 27B `qwen3_8_27b_nvfp4full-v2.ninfer`.
+  `qwen3_8_flash_next_vision-v2.ninfer` re-encoded with every matrix W8 (482,499,840 B, sha256 `0110bb79…`, weights id
+  `vision-w8-bf16-de4b8e4`, #556), pinned to the main container `12e3b265…`; the 27B `qwen3_8_27b_nvfp4full-v2.ninfer`.
+- The first run of check 1, on the companion first shipped in the 27B tower's grouped formats (284,229,120 B, sha256
+  `d97353d4…`, weights id `vision-w8q4q5q6-bf16-de4b8e4`, kept in `H:/fn-vision-560/companion-q4q5/`), raised the
+  alarm: pooled relative L2 0.3046 against the 27B's 0.1834, the bar +0.123 [+0.112, +0.134], both controls 1.1-1.5
+  (`H:/fn-vision-560/tower-check.json`). `tower_check.py diagnose` (`H:/fn-vision-560/tower-diagnosis/`) found the
+  stored words the recipe's encoding of the BF16 tensors (333 of 333 objects), the served rows 0.051 from the
+  stored-weight rows (the 27B's 0.033), the weights quantizing alike in both towers and Flash-Next's excess growing at
+  its own merger, 31% of its error one vector every row shares (the 27B's 4%); with every matrix W8 its simulation gave
+  0.029, lower than the 27B's stored tower on 32 of 32 images. The owner had the companion re-encoded so (2026-11-10);
+  the tables below are the re-encoded companion's.
 - The BF16 towers, each the first shard's 333 `model.visual.*` tensors fetched by HTTP range, no other byte of either
   checkpoint read:
   - Flash-Next: `Qwen/Qwen3.8-Flash-Next` at `de4b8e4d`, `model-00001-of-00131.safetensors`, 897,862,112 bytes from
@@ -51,11 +60,12 @@ the owner, who decides whether a KLD against BF16 on image prompts runs.
 | expert cache bytes (`ignis.runtime.flash_next_plan`) | [TBD] | [TBD], equal |
 | prefill staging bytes (the expert staging ring) | [TBD] | [TBD] |
 | item bound (`vision_item_max_tokens`) | -- | 16,384 [TBD: as logged] |
-| tower in host memory (`flash_next_host_plan` `vision_tower_bytes`) | -- | 284,454,912 |
+| tower in host memory (`flash_next_host_plan` `vision_tower_bytes`) | -- | 482,705,408 |
 | embedding pool in host memory at 16,384 context (`vision_pool_bytes`) | -- | 83,886,080 |
 
-The tower's two sizes: 284,454,912 bytes are its host spans (each object's span padded to 4 KiB, what the host plan
-charges); 283,180,544 bytes are its payload, what a `device` residency places. The 27B's are 297,000,960 and 295,711,648.
+The tower's two sizes: 482,705,408 bytes are its host spans (each object's span padded to 4 KiB, what the host plan
+charges); 481,451,264 bytes are its payload, what a `device` residency places (the grouped companion's were
+284,454,912 and 283,180,544). The 27B's are 297,000,960 and 295,711,648.
 The pool is 2,560 columns of BF16 per token of the envelope: 83,886,080 bytes at 16,384 tokens, 167,772,160 at the
 default 32,768. The item bound is the largest item whose encode fits the prefill scratch and the staging ring, at most
 16,384: before the ring was lent to the encode (#558), the prefill scratch alone held 8,192 (1,016,074,496 bytes, the

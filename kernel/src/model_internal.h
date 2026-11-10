@@ -177,7 +177,9 @@ struct VisionWeights {
 // the order the encode reads them: the pre-block weights (the patch
 // embedding, its bias and the position table, ~6.7 MB), each of the 27 blocks
 // (~8.94 MB), the merger's norm and fc1 (~22.6 MB), then its fc2 (~25.1 MB,
-// the largest). `visit(stage, weight)` once per tensor, in stage order.
+// the largest) on the 27B; Flash-Next's companion, every matrix W8 (GitHub
+// #556), ~7.2 MB, ~16.4 MB a block, ~22.6 MB (its largest) and ~12.6 MB.
+// `visit(stage, weight)` once per tensor, in stage order.
 inline constexpr std::size_t kVisionStagingStages = 1 + kVisionLayers + 2;
 
 template <class Weights, class Visit> void visit_vision_stages(Weights &w, Visit visit) {

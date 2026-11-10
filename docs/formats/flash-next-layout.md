@@ -706,8 +706,10 @@ python tools/flash-next-vision/convert.py build --main <main .ninfer> --work <ab
 
 ### 14.2 Identity and the pair pin
 
-- `model_id` **`qwen3.8-flash-next-vision`**, `weights_id` **`vision-w8q4q5q6-bf16-de4b8e4`**:
-  neither the main container's nor the MTP companion's, so none binds as another.
+- `model_id` **`qwen3.8-flash-next-vision`**, `weights_id` **`vision-w8-bf16-de4b8e4`**:
+  neither the main container's nor the MTP companion's, so none binds as another. The weights
+  id names the encoding (§14.3): `check_identity` refuses a companion of another one, such as
+  the grouped `vision-w8q4q5q6-bf16-de4b8e4` first shipped, naming both ids.
 - **The pair pin is §13.2's**, field for field. The tool records the whole-file `file_sha256`
   of the main container it is given (`pair.main`); the packer hashes the main container it is
   pointed at, refuses a different or missing value, and writes `model_id`, `weights_id`,
@@ -718,35 +720,44 @@ python tools/flash-next-vision/convert.py build --main <main .ninfer> --work <ab
 
 ### 14.3 Objects
 
-The 27B tower's recipe (`tools/27b-nvfp4-converter`: its inventory, routes and encoders, run
-unchanged at Flash-Next's widths): the same 333 objects under the same names, each object kind
-in the same format and layout. The packer holds the work tree to
-`ignis_artifact::flash_next::vision::entries` (built by `nvfp4_27b::vision_tower`, which the
-27B's NVFP4 inventory calls too), and a test holds it, object for object, to what a load
-binds: `ignis_artifact::inventory::vision_scope(2560)`.
+The 27B tower's 333 objects under the same names, at Flash-Next's widths, in Flash-Next's own
+recipe (GitHub #556): **every matrix W8**, the norms, biases and position table BF16. The
+owner chose it on #560's alarm (2026-11-10): in the 27B's grouped formats (Q6 patch embedding,
+Q4 qkv and fc1, Q5 output and fc2) the served tower's rows sat 0.305 in relative L2 from its
+BF16 tower's against the 27B's 0.183, the error growing at its retrained merger; with every
+matrix W8 the CPU simulation gave 0.029. The tool builds the objects itself
+(`flash_next_objects`) and encodes them with the 27B converter's routes and encoders
+(`tools/27b-nvfp4-converter`, unchanged). The packer holds the work tree to
+`ignis_artifact::flash_next::vision::entries`,
+and a load binds the tower by the same table (`flash_next::vision::scope`), which a test holds
+to `ignis_artifact::inventory::vision_scope(2560)` (the 27B's table at Flash-Next's width) in
+names, layouts and shapes, every matrix W8.
 
 | object | format | shape |
 |---|---|---|
-| `vision/patch_embedding` (the checkpoint's `[1152, 3, 2, 16, 16]`, flattened) | Q6G64_F16S | [1152, 1536] |
+| `vision/patch_embedding` (the checkpoint's `[1152, 3, 2, 16, 16]`, flattened) | W8G32_F16S | [1152, 1536] |
 | `vision/patch_embedding_bias` | BF16 | [1152] |
 | `vision/position_embedding` | BF16 | [2304, 1152] |
-| `vision/layers/{0..26}/attention/qkv` | Q4G64_F16S | [3456, 1152] |
-| `vision/layers/{b}/attention/output` | Q5G64_F16S | [1152, 1152] |
-| `vision/layers/{b}/mlp/fc1` | Q4G64_F16S | [4304, 1152] |
-| `vision/layers/{b}/mlp/fc2` | Q5G64_F16S | [1152, 4304] |
+| `vision/layers/{0..26}/attention/qkv` | W8G32_F16S | [3456, 1152] |
+| `vision/layers/{b}/attention/output` | W8G32_F16S | [1152, 1152] |
+| `vision/layers/{b}/mlp/fc1` | W8G32_F16S | [4304, 1152] |
+| `vision/layers/{b}/mlp/fc2` (K stored 4,352 wide, the padded path) | W8G32_F16S | [1152, 4304] |
 | `vision/layers/{b}/` the four biases, `norm1/` and `norm2/` `weight` and `bias` | BF16 | their vectors |
 | `vision/merger/fc1` | W8G32_F16S | [4608, 4608] |
 | `vision/merger/fc2` | W8G32_F16S | **[2560, 4608]** |
 | `vision/merger/fc2_bias` | BF16 | **[2560]** |
 | `vision/merger/fc1_bias`, `norm/weight`, `norm/bias` | BF16 | [4608], [1152], [1152] |
 
-- The grouped formats are `row-split-k128-v1`, BF16 `contiguous-le-v1`; every grouped matrix
-  is encoded on the CPU, its group scales computed on the host (the 27B encoder's rule).
+- W8G32_F16S is `row-split-k128-v1` (one int8 code per weight, a binary16 scale per group of
+  32, each row K-padded to 128), BF16 `contiguous-le-v1`; every matrix is encoded on the CPU,
+  its group scales computed on the host (the 27B encoder's rule). Every (format, shape) has a
+  W8 route the image model's tower (#320) and the merger (#557) already take: no new kernel
+  route, and the `host` residency's staging slot stays the merger's norm and fc1 stage.
 - The image preprocessor's settings are not in the companion: the main container already
   carries `frontend/preprocessor_config.json` (§8).
-- Payload: 283,172,768 bytes (the 27B's tower, 5,120 wide, is 295,711,648). The companion
-  built from the pinned revision is 284,229,120 bytes, SHA-256 `d97353d4…52b9`, its sidecar
-  1,834 bytes.
+- Payload: 481,445,216 bytes (the 27B's tower, 5,120 wide and grouped, is 295,711,648; the
+  grouped companion first shipped held 283,172,768). The companion built from the pinned
+  revision is 482,499,840 bytes, SHA-256 `0110bb79…1724`, its sidecar 1,795 bytes.
 
 ### 14.4 The sidecar
 
@@ -764,7 +775,8 @@ container). Measured values only: no verdict, no limit.
   "pair": {"main": {"file": "qwen3_8_flash_next_trellis_a25-v2.ninfer", "file_sha256": "...",
                     "model_id": "...", "weights_id": "...", "bytes": n, "objects": n, "content_hash": "..."}},
   "tower": {"layers": 27, "hidden": 1152, "intermediate": 4304, "patch": 1536, "positions": 2304, "out_hidden": 2560},
-  "recipe": {"of": "the 27B tower's: ...", "objects": 333, "formats": {"BF16": 222, ...}, "payload_bytes": 283172768},
+  "recipe": {"of": "Flash-Next's own: every matrix W8G32_F16S, ...", "objects": 333,
+             "formats": {"BF16": 222, "W8G32_F16S": 111}, "payload_bytes": 481445216},
   "converter": {"commit": "...", "dirty": false, "command": "<argv, no local path>"},
   "versions": {"python": "...", "torch": "...", "numpy": "..."},
   "recipe_id": "qwen3_8_flash_next_vision-v2", "artifact": {"bytes": n}, "objects": {"count": 333}

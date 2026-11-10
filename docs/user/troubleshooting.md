@@ -371,8 +371,11 @@ With vision on, Flash-Next's start opens its vision companion
 (`qwen3_8_flash_next_vision-v2.ninfer`) beside the artifact and refuses the
 start, naming the file, when it is missing (`model download
 qwen3.8-flash-next` fetches it, or start without vision) or is not this
-artifact's: built for another main container, or a merger of another width.
-Download the model again, so the pair is one revision's
+artifact's: built for another main container, a merger of another width, or
+another encoding of the tower than the build reads (the reason names both
+weights ids; an older download leaves one). Download the model again, so the
+pair is one revision's: a file already there at another size is left alone, so
+move the companion and its `.conversion.json` aside first
 ([Flash-Next's vision](configuration/vision.md#flash-next)).
 
 ### A flag is refused for this model

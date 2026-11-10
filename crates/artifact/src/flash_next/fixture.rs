@@ -319,8 +319,16 @@ impl FixtureArtifact {
     /// put where a load looks for it: beside the main container under the
     /// companion's file name, its sidecar beside it. Returns its path.
     pub fn with_vision_companion(&self) -> Result<PathBuf> {
+        self.with_vision_companion_of(super::vision::identity())
+    }
+
+    /// [`Self::with_vision_companion`] under `identity`: a companion of
+    /// another encoding of the tower, as an older download leaves one
+    /// (GitHub #556).
+    pub fn with_vision_companion_of(&self, identity: crate::ArtifactIdentity) -> Result<PathBuf> {
         self.tree.write_vision(&self.path)?;
-        match pack(&self.tree.vision_pack_options(self.path.clone()), &mut |_| {})? {
+        let options = PackOptions { identity, ..self.tree.vision_pack_options(self.path.clone()) };
+        match pack(&options, &mut |_| {})? {
             PackOutcome::Finished { .. } => {}
             other => return Err(fail(format!("the fixture vision tree did not pack: {other:?}"))),
         }

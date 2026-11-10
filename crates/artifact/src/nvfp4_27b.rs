@@ -289,8 +289,8 @@ pub fn inventory(g: &Geometry) -> Vec<Entry> {
 }
 
 /// A vision tower's widths: the 27B's ([`Geometry::vision_tower`]), or
-/// another model's tower encoded with the 27B's recipe (Flash-Next's,
-/// [`crate::flash_next::vision::geometry`]).
+/// another model's tower of the 27B's objects (Flash-Next's,
+/// [`crate::flash_next::vision::geometry`], in its own formats).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisionTower {
     pub hidden: u64,

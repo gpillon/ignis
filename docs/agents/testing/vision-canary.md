@@ -151,3 +151,17 @@ $PY tools/flash-next-vision/tower_check.py $FN --out $D/flash-next-w8.json --var
 Without `--variant` it runs `bf16`, `stored` and each kind's stored words
 alone (`bf16+qkv=stored`, ...); `--against` adds each variant's paired bar
 against the other family's stored tower.
+
+On that diagnosis the owner had Flash-Next's companion re-encoded with every
+matrix W8 (GitHub #556, 2026-11-10); the grouped one is kept in
+`H:/fn-vision-560/companion-q4q5/`. The recipe check reads each family's own
+recipe: Flash-Next's every matrix W8, the 27B's grouped (`tower_check.py`'s
+`TOWERS`). The re-encoded companion is checked by the same commands: step 1
+again (the dump of the new companion; the 27B's rows do not change), step 2
+and `compare`, then the stored variant alone, whose recipe check holds all
+333 objects equal and whose served rows sit at the kernels' rounding from the
+stored-weight rows:
+
+```bash
+$PY tools/flash-next-vision/tower_check.py $FN --out $D/flash-next-w8-stored.json --variant stored
+```

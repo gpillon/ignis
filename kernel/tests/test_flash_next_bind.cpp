@@ -205,9 +205,9 @@ std::vector<Named> mtp_head_tensors() {
 
 // GitHub #557 (ADR 0087): the vision companion's tower, the 27B's 333
 // `vision/*` tensors with the merger writing Flash-Next's 2,560 rows, each in
-// its stored format (Q6 patch embedding, Q4 qkv and fc1, Q5 output and fc2,
-// W8 merger, BF16 the rest) with about its stored bytes: row-split rows of K
-// padded to 128, an F16 scale per group. The plan reads no plane.
+// its stored format (every matrix W8 since GitHub #556, BF16 the rest) with
+// about its stored bytes: row-split rows of K padded to 128, an F16 scale per
+// group. The plan reads no plane.
 struct TowerTensor {
   std::string name;
   std::vector<int32_t> shape;
@@ -215,18 +215,17 @@ struct TowerTensor {
 };
 
 std::vector<TowerTensor> vision_tower() {
-  const int32_t q4 = IGNIS_QTYPE_Q4G64_F16S, q5 = IGNIS_QTYPE_Q5G64_F16S, q6 = IGNIS_QTYPE_Q6G64_F16S,
-                w8 = IGNIS_QTYPE_W8G32_F16S, bf16 = IGNIS_QTYPE_BF16_CTRL;
-  std::vector<TowerTensor> t{{"vision/patch_embedding", {1152, 1536}, q6},
+  const int32_t w8 = IGNIS_QTYPE_W8G32_F16S, bf16 = IGNIS_QTYPE_BF16_CTRL;
+  std::vector<TowerTensor> t{{"vision/patch_embedding", {1152, 1536}, w8},
                              {"vision/patch_embedding_bias", {1152}, bf16},
                              {"vision/position_embedding", {2304, 1152}, bf16}};
   for (int b = 0; b < 27; ++b) {
     const std::string p = "vision/layers/" + std::to_string(b) + "/";
     for (const TowerTensor &n : std::vector<TowerTensor>{
-             {"attention/qkv", {3456, 1152}, q4},  {"attention/qkv_bias", {3456}, bf16},
-             {"attention/output", {1152, 1152}, q5}, {"attention/output_bias", {1152}, bf16},
-             {"mlp/fc1", {4304, 1152}, q4},       {"mlp/fc1_bias", {4304}, bf16},
-             {"mlp/fc2", {1152, 4304}, q5},       {"mlp/fc2_bias", {1152}, bf16},
+             {"attention/qkv", {3456, 1152}, w8},  {"attention/qkv_bias", {3456}, bf16},
+             {"attention/output", {1152, 1152}, w8}, {"attention/output_bias", {1152}, bf16},
+             {"mlp/fc1", {4304, 1152}, w8},       {"mlp/fc1_bias", {4304}, bf16},
+             {"mlp/fc2", {1152, 4304}, w8},       {"mlp/fc2_bias", {1152}, bf16},
              {"norm1/weight", {1152}, bf16},      {"norm1/bias", {1152}, bf16},
              {"norm2/weight", {1152}, bf16},      {"norm2/bias", {1152}, bf16}}) {
       t.push_back({p + n.name, n.shape, n.qtype});

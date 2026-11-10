@@ -8,10 +8,12 @@
 contiguous byte range of the checkpoint's first shard: the index and `config.json`, that shard's header by
 HTTP range, then the range itself. No other byte of the checkpoint is read. The range is cached in
 `--source` (`visual.bin`, its record `visual.json`) and held to its pin, the range's SHA-256; a later run
-reads the cache and nothing from the hub. The tower is encoded with the 27B tower's recipe
-(`tools/27b-nvfp4-converter`: its inventory, routes and encoders, unchanged) at Flash-Next's widths, where
-the merger writes 2,560 columns, into the work tree's one unit `vision/`; `converter.json` records the
-source range, the pair with `--main` (its whole-file SHA-256) and the tool's commit. Then the packer
+reads the cache and nothing from the hub. The tower is encoded in Flash-Next's own recipe (GitHub #556, the
+owner's decision on #560's alarm): the 27B served tower's objects under their names, at Flash-Next's widths,
+where the merger writes 2,560 columns, every matrix W8G32_F16S and the norms, biases and position table BF16
+(`flash_next_objects`), through the 27B converter's routes and encoders (`tools/27b-nvfp4-converter`,
+unchanged), into the work tree's one unit `vision/`; `converter.json` records the source range, the pair with
+`--main` (its whole-file SHA-256) and the tool's commit. Then the packer
 (`ignis-artifact-pack --family flash-next-vision`) assembles the companion, pins it to `--main` and merges
 the record into `<companion>.conversion.json`; the build reads the companion back against the bytes it
 encoded and writes `<companion>.sha256`.
@@ -52,16 +54,24 @@ REPO = "Qwen/Qwen3.8-Flash-Next"
 REVISION = "de4b8e4d43b917e7706784d8bb445c9af86a3540"
 PREFIX = "model.visual."
 SCHEMA = "flash-next-vision-converter-v1"
-IDENTITY = {"model_id": "qwen3.8-flash-next-vision", "weights_id": "vision-w8q4q5q6-bf16-de4b8e4"}
+IDENTITY = {"model_id": "qwen3.8-flash-next-vision", "weights_id": "vision-w8-bf16-de4b8e4"}
 PART = 32 << 20
 WORKERS = 8
 DTYPE = {"BF16": torch.bfloat16}
 WORD = {"BF16": 2}
+# A tower's recipe: Flash-Next's own (every matrix W8, `flash_next_objects`), or the 27B's grouped one (its
+# inventory's formats: Q6 patch embedding, Q4 qkv and fc1, Q5 output and fc2, W8 merger), which
+# `tower_check.py` reads the 27B's served tower by.
+FLASH_NEXT_W8, GROUPED_27B = "flash-next-w8", "27b-grouped"
+RECIPE_OF = {FLASH_NEXT_W8: "Flash-Next's own: every matrix W8G32_F16S, the rest BF16; "
+                            "tools/27b-nvfp4-converter's routes and encoders",
+             GROUPED_27B: "the 27B tower's: tools/27b-nvfp4-converter's inventory, routes and encoders"}
 
 
 @dataclasses.dataclass(frozen=True)
 class Tower:
-    """A tower's widths (the packer's `--geometry`) and, for the real one, the pin of its source range."""
+    """A tower's widths (the packer's `--geometry`), its recipe and, for the real one, the pin of its source
+    range."""
     name: str
     hidden: int
     intermediate: int
@@ -71,6 +81,7 @@ class Tower:
     shard: str = None
     span_bytes: int = None
     span_sha256: str = None
+    recipe: str = FLASH_NEXT_W8
 
     def config(self):
         """The `vision_config` members the checkpoint must state."""
@@ -79,7 +90,7 @@ class Tower:
                 "num_position_embeddings": self.positions, "out_hidden_size": self.out_hidden}
 
     def geometry(self):
-        """The 27B recipe's geometry with this tower: its `vision/` objects are the companion's."""
+        """The 27B converter's geometry with this tower: its routes, and under the 27B's recipe its objects."""
         return dataclasses.replace(inventory.Geometry.qwen3_8_27b(), name=self.name, hidden=self.out_hidden,
                                    vision_hidden=self.hidden, vision_intermediate=self.intermediate,
                                    vision_patch_size=self.patch_size, vision_positions=self.positions)
@@ -132,8 +143,33 @@ class HttpHub:
 
 # ---------------------------------------------------------------------------------------------- the tower
 def tower_objects(tower):
-    """The companion's objects, in container order: the 27B recipe's `vision/` objects at `tower`'s widths."""
-    return [o for o in inventory.objects(tower.geometry()) if o.unit == "vision"]
+    """The companion's objects, in container order, at `tower`'s widths and in its recipe's formats."""
+    if tower.recipe == GROUPED_27B:
+        return [o for o in inventory.objects(tower.geometry()) if o.unit == "vision"]
+    return flash_next_objects(tower)
+
+
+def flash_next_objects(tower):
+    """Flash-Next's own tower: the 27B served tower's objects under the same names, the patch embedding, the
+    27 blocks' attention input and output and MLP linears and the 2 x 2 merger's linears W8G32_F16S, the
+    biases, norms and position table BF16 (`ignis_artifact::flash_next::vision::entries`)."""
+    Obj, W8, BF16 = inventory.Obj, inventory.W8, inventory.BF16
+    vh, vi, merged = tower.hidden, tower.intermediate, 4 * tower.hidden
+    out = [Obj("vision/patch_embedding", W8, (vh, 3 * 2 * tower.patch_size ** 2)),
+           Obj("vision/patch_embedding_bias", BF16, (vh,)),
+           Obj("vision/position_embedding", BF16, (tower.positions, vh))]
+    for b in range(inventory.VISION_LAYERS):
+        p = f"vision/layers/{b}/"
+        out += [Obj(p + "attention/qkv", W8, (3 * vh, vh)), Obj(p + "attention/qkv_bias", BF16, (3 * vh,)),
+                Obj(p + "attention/output", W8, (vh, vh)), Obj(p + "attention/output_bias", BF16, (vh,)),
+                Obj(p + "mlp/fc1", W8, (vi, vh)), Obj(p + "mlp/fc1_bias", BF16, (vi,)),
+                Obj(p + "mlp/fc2", W8, (vh, vi)), Obj(p + "mlp/fc2_bias", BF16, (vh,))]
+        out += [Obj(p + n, BF16, (vh,)) for n in ("norm1/weight", "norm1/bias", "norm2/weight", "norm2/bias")]
+    out += [Obj("vision/merger/fc1", W8, (merged, merged)), Obj("vision/merger/fc1_bias", BF16, (merged,)),
+            Obj("vision/merger/fc2", W8, (tower.out_hidden, merged)),
+            Obj("vision/merger/fc2_bias", BF16, (tower.out_hidden,)),
+            Obj("vision/merger/norm/weight", BF16, (vh,)), Obj("vision/merger/norm/bias", BF16, (vh,))]
+    return out
 
 
 def tower_routes(tower):
@@ -145,7 +181,7 @@ def tower_routes(tower):
         r = table[o.name]
         (name, rows), = r.parts
         if r.route != "official" or rows is not None:
-            raise Refused(f"{o.name}: the 27B recipe routes it {r.route}, not straight from one checkpoint tensor")
+            raise Refused(f"{o.name}: the 27B converter routes it {r.route}, not straight from one checkpoint tensor")
         shape = (g.vision_hidden, 3, 2, g.vision_patch_size, g.vision_patch_size) if r.transform == "flatten" else o.shape
         out[o.name] = (name, shape, r.transform)
     return out
@@ -271,7 +307,7 @@ def source_tensors(data, record):
 # ---------------------------------------------------------------------------------------------- the build
 def tool_commit():
     """(commit, dirty): the commit the tool ran from, and whether the files that make the companion (this
-    tool, the 27B recipe it runs, the packer's crate) differed from it."""
+    tool, the 27B converter's routes and encoders it runs, the packer's crate) differed from it."""
     def git(*args):
         return subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout.strip()
     try:
@@ -322,7 +358,7 @@ def check_outputs(args):
 
 
 def encode_tower(tensors, tower):
-    """(object, payload) of every companion object, in container order: the 27B recipe's encoders on the
+    """(object, payload) of every companion object, in container order: the 27B converter's encoders on the
     CPU, each matrix's group scales computed on the host (`encode.grouped`)."""
     routes = tower_routes(tower)
     for o in tower_objects(tower):
@@ -395,8 +431,7 @@ def run_build(args, hub):
         "tower": {"layers": inventory.VISION_LAYERS, "hidden": tower.hidden, "intermediate": tower.intermediate,
                   "patch": tower.geometry().vision_patch, "positions": tower.positions,
                   "out_hidden": tower.out_hidden},
-        "recipe": {"of": "the 27B tower's: tools/27b-nvfp4-converter's inventory, routes and encoders",
-                   "objects": len(objs), "formats": dict(sorted(formats.items())),
+        "recipe": {"of": RECIPE_OF[tower.recipe], "objects": len(objs), "formats": dict(sorted(formats.items())),
                    "payload_bytes": sum(inventory.encoded_size(o) for o in objs)},
         "converter": {"commit": commit, "dirty": dirty, "command": command(args)},
         "versions": versions(),

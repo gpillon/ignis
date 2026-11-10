@@ -56,7 +56,7 @@ naming them (`crossing_line: load_staging`): no flag shrinks them, so close
 other applications.
 
 With vision on under `--vision-residency host`, the vision companion's tower
-(284 MB with its page padding) and the embedding pool (160 MiB at the default
+(483 MB with its page padding) and the embedding pool (160 MiB at the default
 envelope) are two lines more, `vision_tower` and `vision_pool`, ahead of the
 experts (`vision_tower_bytes`, `vision_pool_bytes` and `vision_residency` in
 both events). A start that cannot hold them is refused naming them and the
