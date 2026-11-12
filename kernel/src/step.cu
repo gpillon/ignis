@@ -234,6 +234,57 @@ int32_t sample_single(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
   return 0;
 }
 
+// GitHub #586 (spec #287): the device row of `column` in the scores a repair
+// reads -- the model's decode logits, `[vocab, decode_lanes]` BF16.
+void *kept_row(ignis_model *model, std::int32_t column) {
+  return static_cast<std::uint8_t *>(model->sampling_decode_logits->p) +
+         static_cast<std::size_t>(column) * static_cast<std::size_t>(model->vocab) *
+             sizeof(std::uint16_t);
+}
+
+// GitHub #586: `column` has just been written; its new stamp.
+std::uint64_t stamp_kept_column(ignis_model *model, std::int32_t column) {
+  const std::uint64_t epoch = ++model->kept_epoch;
+  model->kept_column_epochs[static_cast<std::size_t>(column)] = epoch;
+  return epoch;
+}
+
+// GitHub #586: whether a draw under `sampling` added one to its token's
+// penalty count -- the vendored sampler counts in its temperature branch
+// only, and the program always hands it the sequence's row.
+bool draw_counts(const ignis_sampling_params &sampling) {
+  return to_sampling_config(sampling, nullptr).temperature > 0.0f;
+}
+
+// GitHub #586: a prefill's draw keeps the row it came from (`logits`, the
+// chunk's scratch, about to go) for a repair, in the decode logits' column of
+// the sequence's slot -- free between the rounds that use it as a lane column,
+// and one 485 KiB device copy on the stream before the chunk's synchronize. A
+// slot past the load's lanes, which no serving pool has, keeps nothing, and a
+// repair of its draw is refused. `*out_kept` says what was kept.
+int32_t keep_draw_scores(ignis_model *model, const ignis_seq *seq, const void *logits,
+                         std::int32_t position, const ignis_sampling_params &sampling,
+                         ignis_kept_scores *out_kept) {
+  *out_kept = ignis_kept_scores{};
+  if (seq->slot < 0 || static_cast<std::uint32_t>(seq->slot) >= model->decode_lanes) {
+    return 0;
+  }
+  const cudaError_t err =
+      cudaMemcpyAsync(kept_row(model, seq->slot), logits,
+                      static_cast<std::size_t>(model->vocab) * sizeof(std::uint16_t),
+                      cudaMemcpyDeviceToDevice, model->stream);
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_program_prefill: cudaMemcpyAsync(kept scores) failed: ") +
+              cudaGetErrorString(err));
+    return -1;
+  }
+  out_kept->column = seq->slot;
+  out_kept->epoch = stamp_kept_column(model, seq->slot);
+  out_kept->position = position;
+  out_kept->counted = draw_counts(sampling);
+  return 0;
+}
+
 // GitHub #315 (ADR 0048): a lane whose reasoning redirect is armed reads its
 // stop ids wherever its successor is assigned, not only in a verify round, so
 // a count without its ids is refused there too.
@@ -316,6 +367,9 @@ int32_t redirect_span_draw(ignis_seq_pool *pool, ignis_seq *seq, const ignis_sam
       return -1;
     }
     seq->pending_token = cut.next_pending;
+    // GitHub #586: the pending token is the close, not the draw the kept
+    // scores were sampled for.
+    seq->kept = ignis_kept_scores{};
   }
   if (out_redirected != nullptr) {
     *out_redirected = cut.redirected ? 1 : 0;
@@ -947,6 +1001,10 @@ bool validate_span_multimodal(const ignis_model *model, int32_t route, const Spa
 // `dflash2_tap_from` into chunk-scoped scratch and appends their projected
 // context to the drafter's window before the same synchronization, so the
 // window and the sequence's other sections complete together.
+//
+// GitHub #586: with `compute_output`, `*out_kept` (when non-null) says where
+// the draw's scores are kept for a repair -- the caller makes it the
+// sequence's only where it makes the draw its pending token.
 int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                           const int32_t *token_ids, uint64_t num_tokens, uint64_t chunk_offset,
                           uint64_t dflash2_tap_from, bool compute_output,
@@ -954,7 +1012,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                           float *out_logits, LinearPolicyMode mode,
                           const SpanMultimodal &multimodal, float *permitted_prob_out,
                           const ArmedAttentionReadout *attention_readout,
-                          std::uint16_t *span_logits_out) {
+                          std::uint16_t *span_logits_out, ignis_kept_scores *out_kept) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto T = static_cast<std::int32_t>(num_tokens);
@@ -1286,6 +1344,11 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                         last_position, out_token_id, permitted_prob_out) != 0) {
         return -1;
       }
+      // GitHub #586: the row this draw came from, kept for a repair.
+      if (out_kept != nullptr && keep_draw_scores(model, seq, logits.data, last_position, sampling,
+                                                  out_kept) != 0) {
+        return -1;
+      }
       if (out_logits != nullptr) {
         host_logits_bits.resize(static_cast<std::size_t>(vocab));
         err = cudaMemcpyAsync(host_logits_bits.data(), logits.data,
@@ -1451,6 +1514,7 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
     const uint64_t chunk_len = std::min<uint64_t>(chunk_width, num_tokens - offset);
     const bool is_last_chunk = (offset + chunk_len == num_tokens);
     int32_t successor = -1;
+    ignis_kept_scores kept;
     float *slot_logits = is_last_chunk ? out_logits : nullptr;
     if (run_program_chunk(model, pool, seq, token_ids + offset, chunk_len, offset, tap_from,
                           is_last_chunk && draws, sampling, &successor, slot_logits, mode, multimodal,
@@ -1458,13 +1522,16 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
                           is_last_chunk ? attention_readout : nullptr,
                           span_logits == nullptr
                               ? nullptr
-                              : span_logits + offset * static_cast<uint64_t>(model->vocab)) != 0) {
+                              : span_logits + offset * static_cast<uint64_t>(model->vocab),
+                          &kept) != 0) {
       return -1;
     }
     seq->position += chunk_len;
     if (is_last_chunk) {
-      // `successor` stays -1 on a span that does not draw (GitHub #519).
+      // `successor` stays -1 on a span that does not draw (GitHub #519), and
+      // `kept` then keeps nothing (GitHub #586).
       seq->pending_token = successor;
+      seq->kept = kept;
     }
     offset += chunk_len;
   }
@@ -1769,6 +1836,8 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
         break;
       }
       seq->pending_token = successor;
+      // GitHub #586: the test-only route keeps no scores for a repair.
+      seq->kept = ignis_kept_scores{};
       ++seq->position;
     }
   } else {
@@ -2291,6 +2360,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     uncommitted.armed = false;
     for (uint64_t i = 0; i < batch_size; ++i) {
       sequences[i]->pending_token = next_pending[i];
+      // GitHub #586: a verify round's successor keeps no scores a repair
+      // reads yet -- the verify commit whose cut the host decides does (#590).
+      sequences[i]->kept = ignis_kept_scores{};
       advance_frontiers(model, sequences[i], static_cast<std::uint32_t>(committed[i]));
       options.out_committed_counts[i] = committed[i];
       if (options.out_reasoning_redirected != nullptr) {
@@ -2590,6 +2662,16 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       return -1;
     }
 
+    // GitHub #586: the round writes its lanes' rows into the decode logits'
+    // first `batch_size` columns, which a repair reads as the scores each
+    // lane's draw came from. Stamped before the work is enqueued, so a round
+    // that fails after writing them still leaves no sequence believing the
+    // scores it kept there are its own.
+    std::array<std::uint64_t, IGNIS_DECODE_MAX_BATCH> kept_epochs{};
+    for (uint64_t i = 0; i < batch_size; ++i) {
+      kept_epochs[i] = stamp_kept_column(model, static_cast<std::int32_t>(i));
+    }
+
     if (use_graph) {
       err = cudaGraphLaunch(model->decode_graph_exec[batch_size - 1], model->stream);
       if (err != cudaSuccess) {
@@ -2713,6 +2795,15 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
     for (uint64_t i = 0; i < batch_size; ++i) {
       out_token_ids[i] = emitted[i];
       sequences[i]->pending_token = cuts[i].next_pending;
+      // GitHub #586: where this draw's scores are kept -- none for a draw the
+      // redirect replaced, whose pending token is the close.
+      sequences[i]->kept = ignis_kept_scores{};
+      if (!cuts[i].redirected) {
+        sequences[i]->kept.column = static_cast<std::int32_t>(i);
+        sequences[i]->kept.epoch = kept_epochs[i];
+        sequences[i]->kept.position = positions[i];
+        sequences[i]->kept.counted = draw_counts(sampling[i]);
+      }
       ++sequences[i]->position;
       // Only once the synchronize above confirms the round's device work
       // completed (mirrors `ignis_gqa_layer_step`'s own ordering, and the
@@ -2749,6 +2840,172 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
   model->last_step_micros = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - began).count());
+  return 0;
+}
+
+// GitHub #586 (spec #287): a **repair** of a sequence's waiting draw -- the
+// contract is in ignis_step.h. Fail-closed everywhere: a repair it cannot make
+// exactly is refused with the sequence as it was, never approximated.
+extern "C" int32_t ignis_program_repair(struct ignis_model *model, struct ignis_seq_pool *pool,
+                                          struct ignis_seq *seq,
+                                          const struct ignis_sampling_params *sampling,
+                                          const uint64_t *permitted_mask,
+                                          uint64_t permitted_mask_words, int32_t *out_token_id) {
+  if (model == nullptr || pool == nullptr || seq == nullptr || sampling == nullptr ||
+      permitted_mask == nullptr || out_token_id == nullptr) {
+    set_error("ignis_program_repair: null argument");
+    return -1;
+  }
+  if (model->flash_next) {
+    set_error("ignis_program_repair: a Flash-Next load keeps no scores for a repair (GitHub #581)");
+    return -1;
+  }
+  if (!sampling_size_ok(*sampling)) {
+    set_error("ignis_program_repair: unrecognized ignis_sampling_params size " +
+              std::to_string(sampling->size));
+    return -1;
+  }
+  if (!ignis_seq_belongs_to(*pool, *seq)) {
+    set_error("ignis_program_repair: the sequence was not drawn from this pool");
+    return -1;
+  }
+  if (const char *refusal = ignis_seq_restore_refusal(*seq)) {
+    set_error(std::string("ignis_program_repair: ") + refusal);
+    return -1;
+  }
+  // The short form rides the call that draws (a prefill or a round); a
+  // repair's permitted set is its mask, and two sets for one draw would leave
+  // the caller to guess which one held.
+  if (!unconstrained(*sampling)) {
+    set_error("ignis_program_repair: a repair's permitted set is its mask; permitted_ids rides a "
+              "prefill or a round");
+    return -1;
+  }
+  // A repair draws inside an answer, after the reasoning block: its token is
+  // the mask's, and nothing turns it into a `</think>`.
+  if (sampling->reasoning_close_id >= 0) {
+    set_error("ignis_program_repair: a repair redirects nothing (reasoning_close_id must be -1)");
+    return -1;
+  }
+  if (seq->pending_token < 0) {
+    set_error("ignis_program_repair: the sequence has no waiting draw to repair");
+    return -1;
+  }
+  const auto vocab = static_cast<std::int32_t>(model->vocab);
+  const uint64_t words = (static_cast<uint64_t>(vocab) + 63) / 64;
+  if (permitted_mask_words != words) {
+    set_error("ignis_program_repair: a mask of " + std::to_string(permitted_mask_words) +
+              " words for a vocabulary of " + std::to_string(vocab) + " columns, which takes " +
+              std::to_string(words));
+    return -1;
+  }
+  const auto tail_bits = static_cast<std::uint32_t>(vocab % 64);
+  if (tail_bits != 0 && (permitted_mask[words - 1] >> tail_bits) != 0) {
+    set_error("ignis_program_repair: the mask permits a column past the vocabulary");
+    return -1;
+  }
+  bool permits_any = false;
+  for (uint64_t w = 0; w < words && !permits_any; ++w) {
+    permits_any = permitted_mask[w] != 0;
+  }
+  if (!permits_any) {
+    set_error("ignis_program_repair: the mask permits no token");
+    return -1;
+  }
+  const ignis_kept_scores kept = seq->kept;
+  if (kept.column < 0) {
+    set_error("ignis_program_repair: the waiting draw kept no scores (a verify round's, a "
+              "redirected one, or a sequence restored or claimed since its draw)");
+    return -1;
+  }
+  if (static_cast<std::uint32_t>(kept.column) >= model->decode_lanes ||
+      model->kept_column_epochs[static_cast<std::size_t>(kept.column)] != kept.epoch) {
+    set_error("ignis_program_repair: the scores the waiting draw came from were written over by a "
+              "later round or prefill; a repair follows the call that drew");
+    return -1;
+  }
+
+  std::int32_t *counts = pool->token_counts_for(seq->slot);
+  const std::int32_t drawn = seq->pending_token;
+  // The miss's count is taken back first, so the repair reads the counts the
+  // draw read; the sampler then counts the repaired token itself, in its
+  // temperature branch, and the position counts once.
+  if (kept.counted) {
+    const cudaError_t err = adjust_penalty_counts({{counts + drawn, -1}}, model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_repair: taking back the draw's penalty count failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+  }
+  std::int32_t repaired = -1;
+  bool sampled = false;
+  {
+    ninfer::DeviceArena::Scope scope = model->scratch->scope();
+    try {
+      // The kept row is copied rather than masked in place, so a second
+      // repair of the same position reads the scores the draw read.
+      ninfer::Tensor row = model->scratch->alloc(ninfer::DType::BF16, {vocab, 1, 1, 1});
+      ninfer::Tensor mask = model->scratch->alloc(ninfer::DType::I64,
+                                                  {static_cast<std::int32_t>(words), 1, 1, 1});
+      cudaError_t err = cudaMemcpyAsync(row.data, kept_row(model, kept.column),
+                                        static_cast<std::size_t>(vocab) * sizeof(std::uint16_t),
+                                        cudaMemcpyDeviceToDevice, model->stream);
+      if (err == cudaSuccess) {
+        err = cudaMemcpyAsync(mask.data, permitted_mask, words * sizeof(std::uint64_t),
+                              cudaMemcpyHostToDevice, model->stream);
+      }
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_repair: cudaMemcpyAsync(kept scores, mask) failed: ") +
+                  cudaGetErrorString(err));
+      } else if (ignis_permit_mask_bits(row.data, vocab, static_cast<const std::uint64_t *>(mask.data),
+                                        model->stream) != 0) {
+        set_error("ignis_program_repair: mask launch failed");
+      } else if (sample_single(model, pool, seq, row, *sampling, kIgnisSamplePurposeRepair,
+                               kept.position, &repaired, nullptr) == 0) {
+        err = cudaStreamSynchronize(model->stream);
+        if (err != cudaSuccess) {
+          set_error(std::string("ignis_program_repair: cudaStreamSynchronize failed: ") +
+                    cudaGetErrorString(err));
+        } else {
+          sampled = true;
+        }
+      }
+    } catch (const std::exception &e) {
+      set_error(std::string("ignis_program_repair: ") + e.what());
+    }
+  }
+  const bool in_vocab = repaired >= 0 && repaired < vocab;
+  const bool permitted =
+      sampled && in_vocab &&
+      ((permitted_mask[static_cast<std::size_t>(repaired) / 64] >> (repaired % 64)) & 1ull) != 0;
+  if (!permitted) {
+    // The sequence goes back to what the draw left: its count, and nothing of
+    // the repaired token's (the sampler counted it if it drew at all).
+    std::vector<std::pair<std::int32_t *, std::int32_t>> moves;
+    if (kept.counted) {
+      moves.emplace_back(counts + drawn, 1);
+    }
+    if (sampled && in_vocab && draw_counts(*sampling)) {
+      moves.emplace_back(counts + repaired, -1);
+    }
+    const cudaError_t err = moves.empty() ? cudaSuccess : adjust_penalty_counts(moves, model->stream);
+    if (sampled) {
+      // Only a row with no permitted column in reach draws outside its mask:
+      // the short form the drawing call carried and this mask do not meet.
+      set_error("ignis_program_repair: the repair drew " + std::to_string(repaired) +
+                ", which its mask does not permit -- the scores it was kept from leave no "
+                "permitted column in reach (a short permitted set the draw carried and this "
+                "mask do not meet)");
+    }
+    if (err != cudaSuccess) {
+      set_error(g_last_error + "; restoring the penalty counts failed: " + cudaGetErrorString(err));
+    }
+    return -1;
+  }
+  seq->pending_token = repaired;
+  seq->kept.counted = draw_counts(*sampling);
+  *out_token_id = repaired;
   return 0;
 }
 

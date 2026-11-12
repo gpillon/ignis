@@ -425,6 +425,9 @@ inline void ignis_seq_apply_progress(ignis_seq &seq, const ignis_seq_progress_im
   // taps left from this handle's previous life belong to another position.
   seq.dflash2_pending = false;
   seq.dflash2_pending_features.clear();
+  // GitHub #586: and so are the kept scores of its pending draw -- the image's
+  // pending token was drawn from scores no column holds for this handle.
+  seq.kept = ignis_kept_scores{};
   for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
     seq.gqa_positions[i] = image.gqa_positions[i];
   }

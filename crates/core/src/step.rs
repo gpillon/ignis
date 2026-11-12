@@ -174,6 +174,17 @@ pub(crate) mod ffi {
             options: *const IgnisDecodeOptions,
         ) -> i32;
 
+        /// GitHub #586: a repair of `seq`'s waiting draw (`ignis_step.h`).
+        pub fn ignis_program_repair(
+            model: *mut IgnisModel,
+            pool: *mut IgnisSeqPool,
+            seq: *mut IgnisSeq,
+            sampling: *const IgnisSamplingParams,
+            permitted_mask: *const u64,
+            permitted_mask_words: u64,
+            out_token_id: *mut i32,
+        ) -> i32;
+
         pub fn ignis_program_stats(
             model: *const IgnisModel,
             pool: *const IgnisSeqPool,
@@ -1351,6 +1362,47 @@ pub fn decode_program_batch_permitted(
         .into_iter()
         .map(|drawn| (drawn.token, drawn.probability))
         .unzip())
+}
+
+/// **Repair** `sequence`'s waiting draw (GitHub #586, spec #287): its pending
+/// token is drawn again from the scores the call that drew it kept -- its
+/// last prefill span's draw or its last plain round's -- restricted to
+/// `permitted`, under `sampling`, and the result replaces it. Returns the
+/// repaired token, which the next round consumes as if it had been drawn.
+///
+/// Greedy takes the mask's argmax over the kept scores; a temperature draws
+/// from them restricted to the mask with a random stream of its own. The
+/// draw's penalty count is taken back and the repaired token's counted, so
+/// the position counts once. Refused, with the sequence as it was, when the
+/// draw kept no scores (a verify round's, a redirected one, the per-token
+/// route's, a restored or claimed sequence's) or a later round or prefill
+/// draw has written over them, and on a Flash-Next load (#581). The mask
+/// must be built for the model's vocabulary (248,320 columns on the 27B).
+pub fn repair_program(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    sampling: SamplingParams,
+    permitted: &crate::constrained::PermittedMask,
+) -> Result<i32, String> {
+    let params = sampling.to_ffi();
+    let words = permitted.words();
+    let mut token = -1;
+    let rc = unsafe {
+        ffi::ignis_program_repair(
+            model.handle(),
+            pool.handle(),
+            sequence.handle(),
+            &params,
+            words.as_ptr(),
+            words.len() as u64,
+            &mut token,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(token)
 }
 
 /// One verify round over `sequences` at the load's draft `window` (P5-04,

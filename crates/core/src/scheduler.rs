@@ -291,6 +291,24 @@ pub struct DecodeJob {
     pub anchor_emitted: bool,
 }
 
+/// One **repair** handed to the compute backend (GitHub #586, spec #287): the
+/// position of `request`'s **waiting draw** — what its last prefill or plain
+/// round drew, which the next round consumes as its anchor — drawn again
+/// from the scores that call kept, restricted to `permitted`
+/// ([`Compute::repair`]).
+#[derive(Debug, Clone)]
+pub struct RepairJob {
+    /// The request whose waiting draw is repaired.
+    pub request: RequestId,
+    /// The sampler the draw was made under, and the repair is: greedy takes
+    /// the mask's argmax, a temperature draws from the mask with a random
+    /// stream of its own, and the penalties read the counts the draw read.
+    pub params: DecodeParams,
+    /// What the position may be: the permitted set's second form, a mask over
+    /// the whole vocabulary — every token the grammar allows there.
+    pub permitted: crate::constrained::PermittedMask,
+}
+
 /// One job's result from a prefill step (GitHub #192): what the chunk cost
 /// beyond warming its KV. Today that is the media encode alone — everything
 /// else a prefill does is already attributable from the chunk event itself.
@@ -658,6 +676,34 @@ pub trait Compute: Send + Sync {
     /// lane (one, or a run under speculation) and, when the request finished
     /// (EOS or `max_tokens`), why.
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError>;
+
+    /// **Repair** a request's position (GitHub #586, spec #287): its waiting
+    /// draw — what its last prefill (the prompt's last job, whose draw
+    /// [`PrefillOutcome::emitted`] reports) or its last plain round drew, and
+    /// the next round consumes as its anchor — is drawn again from the scores
+    /// that call kept, restricted to [`RepairJob::permitted`], and the result
+    /// **replaces** it. The next round consumes the repaired token exactly as
+    /// if it had been drawn, and the request's penalty counts count the
+    /// position once. Returns the repaired token, the request's waiting draw
+    /// from now on.
+    ///
+    /// This is check-first's other half: the scheduler checks each draw with
+    /// its grammar on the host and calls this on a **miss** only. Greedy
+    /// takes the mask's argmax over the kept scores; a temperature draws from
+    /// the model's distribution restricted to the mask (but for the sampler's
+    /// top-k cut) with a random stream of its own. Only a mask goes down; no
+    /// logits come up (ADR 0034).
+    ///
+    /// The kept scores last until the backend's next prefill or round, so a
+    /// caller repairs right after the call that drew. A verify round's draw
+    /// keeps none a repair reads (a verify commit whose cut the host decides
+    /// repairs those, #590), and neither does a redirected draw. Refused
+    /// then, as on a request with no waiting draw and on a backend that keeps
+    /// no scores — the default, and Flash-Next's for now (#581) — with the
+    /// request's state as it was.
+    fn repair(&self, _job: &RepairJob) -> Result<TokenId, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
 
     /// Release leaf-owned state for a request that completed or was
     /// cancelled (never a request being evicted to the host tier — that

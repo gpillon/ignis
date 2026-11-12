@@ -20,12 +20,28 @@
 //     lane, not a logits row: the per-digit confidence a number's uncertainty
 //     is summed from (spec 06) has to come from somewhere, and this is the
 //     cheapest thing that is not the host reading logits.
+//
+// GitHub #586 (spec #287) adds the permitted set's **second form**: a mask
+// over the whole vocabulary, one bit per column, which is what a **repair**
+// restricts a position to (`ignis_program_repair`). A grammar's permitted set
+// runs to any number of ids, so it cannot ride the fixed 32-id row above; the
+// short form stays for schedules and forced literals. Either form only drives
+// columns down: no logits come up (ADR 0034).
 #ifndef IGNIS_PERMITTED_TOKENS_H
 #define IGNIS_PERMITTED_TOKENS_H
 
 #include <cstdint>
 
 #include <cuda_runtime.h>
+
+// GitHub #586: the sampler's RNG purpose key of a repair's draw. The vendored
+// sampler keys its counter-based RNG by (seed, position, purpose) and names
+// purposes 0..4 (`ninfer::ops::SamplePurpose`); a repair draws a position the
+// prefill or the round already drew at, so it needs a key of its own to be a
+// fresh draw rather than the miss's own uniform again, which would bias the
+// repaired token towards what missed. Far past the vendored values, so a
+// purpose the vendored enum adds later cannot take it.
+inline constexpr int32_t kIgnisSamplePurposeRepair = 16;
 
 // Drive every non-permitted column of each constrained lane's logits to
 // `-1e30`. `logits` is the round's BF16 `[vocab, lanes]` staging buffer in the
@@ -53,5 +69,14 @@ int32_t ignis_permit_probability(const void *logits, int32_t vocab, uint32_t lan
                                  const int32_t *permitted, const int32_t *counts,
                                  int32_t max_permitted, const int32_t *chosen, float *out,
                                  cudaStream_t stream);
+
+// GitHub #586: drive every column of one BF16 `[vocab]` row whose bit in
+// `mask` is clear to the same `-1e30` the short form uses, and leave every
+// other column exactly as it was. `mask` is device memory, `ceil(vocab / 64)`
+// words: column `v` is bit `v % 64` (least significant first) of word
+// `v / 64`, so a host bitset of 64-bit words crosses as it is. Bits past
+// `vocab` in the last word are never read.
+int32_t ignis_permit_mask_bits(void *logits, int32_t vocab, const uint64_t *mask,
+                               cudaStream_t stream);
 
 #endif  // IGNIS_PERMITTED_TOKENS_H
