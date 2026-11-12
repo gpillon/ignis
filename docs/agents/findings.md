@@ -139,6 +139,7 @@ capture and the report derived from it, and leave the capture on disk;
 | `decide-pointing` | `/v1/decide`: point and box, attention heads |
 | `decide-locate` | `/v1/decide`: locate |
 | `reasoning-and-context` | reasoning, loops and long context |
+| `structured-output` | structured output: the grammar, its check and repair |
 | `vision` | vision encode and fan-out |
 | `speech` | speech: ASR, diarization, notes |
 | `image` | the image model |

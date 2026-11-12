@@ -54,7 +54,7 @@ memory of why ignis is built the way it is.
 | [0031](0031-vendored-kernel-bottleneck-exemption.md) | a vendored kernel that is measured as the bottleneck is not untouchable | accepted | |
 | [0032](0032-release-through-the-container-build.md) | the Linux release is the container build, and it is one pipeline | accepted | [0086](0086-the-builds-run-beside-the-tests-and-nothing-is-published-before-they-pass.md) |
 | [0033](0033-the-server-fetches-its-own-model.md) | the server fetches its own model, and asks first only when somebody is there | accepted | [0047](0047-a-catalog-the-operator-can-extend.md) |
-| [0034](0034-the-leaf-answers-without-generating.md) | the leaf answers without generating | accepted | |
+| [0034](0034-the-leaf-answers-without-generating.md) | the leaf answers without generating | accepted | [0089](0089-a-grammar-checks-each-sampled-token-and-repairs-a-miss-and-the-model-is-told-the-schema.md) |
 | [0035](0035-the-vision-embedding-outlives-its-encode.md) | the vision embedding outlives its encode | accepted | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md) |
 | [0036](0036-the-v1-surface-documents-itself.md) | the `/v1` surface documents itself, and its reference needs no key | accepted | |
 | [0037](0037-a-vendored-file-may-carry-a-correctness-patch.md) | a vendored file may carry a patch that fixes a known correctness bug | accepted | |
@@ -109,3 +109,4 @@ memory of why ignis is built the way it is.
 | [0086](0086-the-builds-run-beside-the-tests-and-nothing-is-published-before-they-pass.md) | The builds run beside the tests, and nothing is published before they pass | accepted | |
 | [0087](0087-flash-nexts-vision-encoder-ships-in-a-companion-container-and-encodes-in-memory-its-prefill-already-reserves.md) | Flash-Next's vision encoder ships in a companion container and encodes in memory its prefill already reserves | accepted | |
 | [0088](0088-a-vendored-registry-that-lacks-a-case-ignis-needs-may-be-extended-or-rewritten-when-small.md) | A vendored registry that lacks a case ignis needs may be extended, or rewritten when it is small | accepted | |
+| [0089](0089-a-grammar-checks-each-sampled-token-and-repairs-a-miss-and-the-model-is-told-the-schema.md) | A grammar checks each sampled token and repairs a miss, and the model is told the schema | proposed | |

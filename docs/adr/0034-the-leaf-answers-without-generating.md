@@ -1,5 +1,6 @@
 ---
 status: accepted
+amended-by: [ADR-0089]
 ---
 
 # ADR 0034 — the leaf answers without generating

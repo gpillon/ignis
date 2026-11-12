@@ -175,6 +175,10 @@ edited by hand.
 - 2026-09-19 [An exact-string needle at 320K tokens is recalled with or without YaRN](2026-09-19-yarn-needle-320k-not-discriminating.md): A literal needle at 320,076 tokens (1.22x the trained envelope) is recalled exactly with and without `--rope-scaling yarn:4`, so it would pass a build that ignored the flag; a discriminating probe asks about relative position.
 - 2026-09-16 [Decode rope delta barely moves greedy tokens](2026-09-16-decode-rope-delta-token-insensitivity.md): Shifting the decode rotation by -24, 0 or +400 positions left 40 greedy tokens identical on qwen3.8-27B (only +200,000 changed them), so a token-equality GPU test at a real image's delta cannot detect a dropped `rope_delta`.
 
+## Structured output: the grammar, its check and repair (`structured-output`)
+
+- 2026-11-12 [Structured output's grammar on the 27B: a check costs 0.2 µs and a repair's permitted set 34 µs, exact to a per-token reference and an independent validator, and the model must be told the schema](2026-11-12-structured-output-grammar-measured-on-the-27b.md): On the 27B's 248,320-token vocabulary a grammar check takes 0.2 µs (1.0 µs p99) and a first-visit permitted set 34 µs (0.71 ms p99); misses fall from 4.2 to 0.04 per 100 tokens when the prompt describes the schema.
+
 ## Vision (`vision`)
 
 - 2026-11-10 [Flash-Next's images checked without the BF16 checkpoint: the encoded tower against its BF16 tower, known answers beside the 27B's, and the decode gate](2026-11-10-flash-next-images-checked-without-the-bf16-checkpoint.md): With every matrix W8, Flash-Next's tower is 0.059 in relative L2 from its BF16 tower, the 27B's 0.183, on 32 images (the grouped Q4/Q5 encoding's 0.305 was the alarm); known answers 66/66 beside the 27B's 66/66; RTX 5090.

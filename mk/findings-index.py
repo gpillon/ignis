@@ -47,6 +47,7 @@ TOPICS = (
     ("decide-pointing", "Decide: point and box, attention heads"),
     ("decide-locate", "Decide: locate"),
     ("reasoning-and-context", "Reasoning, loops and long context"),
+    ("structured-output", "Structured output: the grammar, its check and repair"),
     ("vision", "Vision"),
     ("speech", "Speech"),
     ("image", "Image"),
