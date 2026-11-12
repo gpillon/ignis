@@ -607,6 +607,18 @@ pub trait TemplateProvider: Send + Sync {
     ///
     /// The default is `true`: a provider with no real tokenizer (the
     /// placeholder hashes words into ids) has no vocabulary to be outside of.
+    /// The grammars **structured output** holds an answer to (GitHub #587,
+    /// ADR 0089), compiled against this provider's vocabulary as bytes: one
+    /// cache per loaded tokenizer, whose vocabulary is read on first use and
+    /// kept, and one compiled grammar per distinct shape.
+    ///
+    /// `None` for a provider whose vocabulary cannot be read as bytes (the
+    /// placeholder has none), and structured output is then refused rather
+    /// than held to a grammar over ids nobody can spell.
+    fn grammars(&self) -> Option<std::sync::Arc<ignis_grammar::GrammarCache>> {
+        None
+    }
+
     fn is_token(&self, id: TokenId) -> bool {
         let _ = id;
         true

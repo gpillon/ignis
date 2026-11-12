@@ -7,6 +7,9 @@ license.workspace = true
 
 [dependencies]
 ignis-artifact = { path = "../artifact" }
+# Structured output's grammar (GitHub #587, ADR 0089): the scheduler checks
+# each draw of a constrained answer against it and repairs a miss. CPU-only.
+ignis-grammar = { path = "../grammar" }
 # Request-lifecycle span tree (GitHub #81, ADR 0012): admission / prefill /
 # decode-round / completion spans, all keyed by `request_id`. No call site
 # here decides how spans are rendered or where they go — that stays

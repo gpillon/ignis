@@ -101,6 +101,7 @@ pub mod scheduler;
 #[cfg(feature = "cuda")]
 pub mod seq;
 pub mod speculation;
+pub mod structured;
 pub mod thinking_budget;
 #[cfg(feature = "cuda")]
 pub mod step;
@@ -147,7 +148,7 @@ pub use retained_slot::{
 pub use scheduler::{
     Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome, DiskSource,
     DiskTarget, KvRamEvent, KvRamMove, KvRamOutcome, Occupancy, PrefillJob, PrefillOutcome, RepairJob, RetainedAt,
-    Scheduler,
+    Scheduler, WaitingDraw,
 };
 pub use rope_scaling::{
     DEFAULT_YARN_BETA_FAST, DEFAULT_YARN_BETA_SLOW, DEFAULT_YARN_TEMPERATURE,

@@ -90,6 +90,7 @@ fn serve(compute: &RuntimeCompute<FlashNextLeaf>, request: RequestId, first_with
                 permitted: None,
                 reasoning_close: None,
                 anchor_emitted: first_with_the_prefill && round == 0,
+                checked: false,
             }])
             .unwrap_or_else(|e| panic!("decode_step round {round}: {e}"));
         let DecodeOutcome { tokens, finish, spec: counters, .. } = out.into_iter().next().expect("one outcome");

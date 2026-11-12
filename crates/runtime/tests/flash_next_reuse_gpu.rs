@@ -133,6 +133,7 @@ impl Run<'_> {
             stop_ids: &[],
             permitted: &[],
             reasoning_close: None,
+            checked: false,
         };
         (0..rounds)
             .map(|round| {

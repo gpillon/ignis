@@ -610,6 +610,15 @@ does not do; `invalid_sampling_parameter` an out-of-range sampling value, which
 is never clamped. Fix or remove the field the `param` names
 ([Chat completions](api/chat-completions.md)).
 
+### A `400` naming `response_format`
+
+`json_object` is served on the 27B from 0.11.0; `json_schema` is not served
+yet. Flash-Next answers `model_unsupported` naming itself, and a forced tool
+call (`tool_choice: "required"` or a named function) beside it is refused
+until a turn may choose between a call and the object. Send
+`{"type": "json_object"}` to the 27B, or `{"type": "text"}`
+([Structured output](api/structured-output.md)).
+
 ### The answer stops short with `finish_reason: "length"`
 
 Either the `max_tokens` you sent was reached, or, with none sent, the
@@ -617,7 +626,8 @@ Either the `max_tokens` you sent was reached, or, with none sent, the
 larger `max_tokens`, or start with `--model-default-max-tokens 0` for none. The
 reasoning spends the same budget as the answer, and the thinking budget always
 leaves 2,048 tokens for the answer ([Chat completions](api/chat-completions.md),
-[Prompting](configuration/prompting.md)).
+[Prompting](configuration/prompting.md)). A structured answer cut this way is
+an unfinished object ([Structured output](api/structured-output.md#cuts)).
 
 The deadline can also cut an answer short: it is then a `200` with
 `finish_reason: "length"` and the header `ignis-stopped-by: request_timeout`.

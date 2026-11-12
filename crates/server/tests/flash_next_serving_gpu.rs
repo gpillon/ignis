@@ -42,6 +42,7 @@ fn input(prompt: Vec<u32>) -> RequestInput {
         reuse_boundaries: Vec::new(),
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }

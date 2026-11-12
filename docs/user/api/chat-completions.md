@@ -94,7 +94,14 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   way out). With thinking on the reasoning spends the same `max_tokens`: a
   block that never closes ends `length` with no call, which the thinking
   budget's answer reserve prevents.
-- Non-streaming returns `choices[].message.content` plus `usage`; streaming
+- `response_format: {"type": "json_object"}` holds the answer to a valid JSON
+  object, streamed or not (from 0.11.0, on the 27B; 0.10.0 refuses it): each
+  sampled token is checked and a miss repaired. `{"type": "text"}` is a free
+  answer, `json_schema` is refused while it is being built, and Flash-Next
+  refuses structured output naming itself
+  ([Structured output](structured-output.md)).
+- Non-streaming returns `choices[].message.content` plus `usage`, and
+  `message.refusal`, always `null` (from 0.11.0); streaming
   emits `chat.completion.chunk` SSE frames (token deltas, a final
   `finish_reason` chunk, then `[DONE]`). The first token is sent alone as
   soon as the prompt's prefill ends, before any decode round, and each
@@ -104,6 +111,6 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   prefilling (0 when none).
 - Every other OpenAI field is accepted as inert when its value asks for what
   the server already does (`n: 1`, `store: false`, `logprobs: false`,
-  `response_format: {"type": "text"}`, `metadata`, `user`, ...) and refused
+  `metadata`, `user`, ...) and refused
   with a 400 `unsupported_value` naming it in `param` otherwise. The full
   table is in the API reference at `/v1/docs/`; a field outside it is ignored.

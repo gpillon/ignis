@@ -39,6 +39,7 @@ fn input(model: &str, max_tokens: u32) -> RequestInput {
         decision: None,
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
         multimodal: None,
         opener_tokens: None,

@@ -66,6 +66,7 @@ fn input(prompt: Vec<u32>, boundaries: Vec<ReuseBoundary>) -> RequestInput {
         reuse_boundaries: boundaries,
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }

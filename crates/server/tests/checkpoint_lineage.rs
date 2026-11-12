@@ -116,6 +116,7 @@ fn request_input(rendered: RenderedPrompt) -> RequestInput {
         reuse_boundaries: Vec::new(),
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }

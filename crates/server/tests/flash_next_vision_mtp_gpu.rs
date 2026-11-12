@@ -302,6 +302,7 @@ fn input(tokens: Vec<u32>, multimodal: Option<Multimodal>, decision: Option<Deci
         reuse_boundaries: Vec::new(),
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }

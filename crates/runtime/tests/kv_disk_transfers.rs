@@ -268,6 +268,7 @@ fn refused(rig: &Rig) {
             permitted: None,
             reasoning_close: None,
             anchor_emitted: false,
+            checked: false,
         }])
         .is_err(),
         "and no sequence was handed back for the request"

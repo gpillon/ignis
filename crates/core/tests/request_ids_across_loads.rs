@@ -25,6 +25,7 @@ fn input() -> RequestInput {
         params: DecodeParams { max_tokens: Some(1), ..Default::default() },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }

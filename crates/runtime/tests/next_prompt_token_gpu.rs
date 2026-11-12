@@ -111,6 +111,7 @@ fn greedy<L: StepLeaf>(leaf: &L, model: &L::Model, seq: &mut L::Sequence, label:
             stop_ids: &[],
             permitted: &[],
             reasoning_close: None,
+            checked: false,
         };
         let runs = leaf
             .decode(model, &mut [&mut *seq], std::slice::from_ref(&lane))

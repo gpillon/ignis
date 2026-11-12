@@ -136,6 +136,7 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
                     permitted: None,
                     reasoning_close: None,
                     anchor_emitted,
+                    checked: false,
                 }])
                 .unwrap_or_else(|e| panic!("decode_step: {e}"));
             let Some(DecodeOutcome { tokens, finish, spec, .. }) = out.into_iter().next() else {

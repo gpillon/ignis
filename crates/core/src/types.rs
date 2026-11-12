@@ -183,6 +183,17 @@ pub struct RequestInput {
     /// Never set together with [`RequestInput::constrained`], whose schedule
     /// owns every draw of its run.
     pub forced_literal: Option<std::sync::Arc<crate::forced_literal::ForcedLiteral>>,
+    /// The **grammar** this request's answer is held to (GitHub #587, spec
+    /// #287, ADR 0089): **structured output**. The model samples freely, the
+    /// scheduler checks each draw of the answer before the next round
+    /// consumes it, and a **miss** is **repaired** ([`crate::structured`]).
+    /// `None` for every request whose answer is free.
+    ///
+    /// Never set together with [`RequestInput::constrained`] nor with
+    /// [`RequestInput::forced_literal`]: each of those owns the draws it
+    /// forces, and the server refuses a forced tool call beside structured
+    /// output until a turn may open one under the grammar (#592).
+    pub grammar: Option<crate::structured::AnswerGrammar>,
     /// Whether this request is a **warm-up** (GitHub #282, the Responses
     /// WebSocket mode's `generate: false`): like a decision it ends where its
     /// prefill ends and generates nothing; unlike one it reads nothing out,
@@ -299,11 +310,25 @@ impl RequestInput {
     pub fn prefill_tail(&self) -> usize {
         if self.attention().is_some() {
             crate::pointing::ATTENTION_MIN_CHUNK_TOKENS as usize
-        } else if self.is_decision() || self.draws_forced_at_prefill() || self.multimodal.is_some() {
+        } else if self.is_decision()
+            || self.draws_forced_at_prefill()
+            || self.checks_prefill_draw()
+            || self.multimodal.is_some()
+        {
             1
         } else {
             0
         }
+    }
+
+    /// Whether this request's grammar checks the draw its prefill makes
+    /// (GitHub #587): the answer starts at the generation's first token,
+    /// which the prefill draws, and a repair of it reads the scores that
+    /// draw kept. A claimed state that covered the whole prompt would carry
+    /// a draw with none, so such a request is left a token to prefill, for
+    /// the reason [`RequestInput::reuse_reach`] gives.
+    pub fn checks_prefill_draw(&self) -> bool {
+        self.grammar.is_some() && !self.params.starts_in_reasoning
     }
 
     /// Whether this request is a **constrained decode** (GitHub #242,

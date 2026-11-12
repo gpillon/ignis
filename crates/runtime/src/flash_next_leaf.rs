@@ -787,7 +787,7 @@ impl StepLeaf for FlashNextLeaf {
                 .min()
                 .unwrap_or(0);
             let window = flash_next_window_within(window, mtp, room);
-            if window > 0 && lanes.iter().all(|lane| lane.permitted.is_empty()) {
+            if window > 0 && lanes.iter().all(|lane| lane.permitted.is_empty() && !lane.checked) {
                 return self.verify(model, sequences, lanes, window);
             }
         }

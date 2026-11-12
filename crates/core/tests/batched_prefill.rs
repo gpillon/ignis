@@ -26,6 +26,7 @@ fn input(model: &str, tokens: &[u32], max_tokens: Option<u32>) -> RequestInput {
         },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }
@@ -106,6 +107,7 @@ fn token_stream_is_deterministic_and_seed_sensitive() {
                     params,
                     constrained: None,
                     forced_literal: None,
+                    grammar: None,
                     warm_up: false,
                 },
                 RequestClass::Agent,
@@ -155,6 +157,7 @@ fn token_stream_depends_on_the_request_seed() {
                 params: mk(7),
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
             },
             RequestClass::Agent,
@@ -174,6 +177,7 @@ fn token_stream_depends_on_the_request_seed() {
                 params: mk(8),
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
             },
             RequestClass::Agent,

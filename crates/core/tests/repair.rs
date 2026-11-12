@@ -57,6 +57,7 @@ fn round(anchor_emitted: bool) -> DecodeJob {
         permitted: None,
         reasoning_close: None,
         anchor_emitted,
+        checked: false,
     }
 }
 

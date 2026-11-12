@@ -125,6 +125,10 @@ pub struct Request {
     /// Progress through the request's forced literal
     /// ([`crate::types::RequestInput::forced_literal`], GitHub #286).
     pub forced_state: crate::forced_literal::ForcedState,
+    /// Progress through the request's **grammar**
+    /// ([`crate::types::RequestInput::grammar`], GitHub #587): `None` for a
+    /// request whose answer is free.
+    pub grammar: Option<crate::structured::GrammarState>,
     /// The **pending token** already left (#518): the prompt's last prefill
     /// job emitted it, and the next decode round takes it as its anchor
     /// without emitting it again. Cleared by that round.
@@ -289,6 +293,10 @@ impl Request {
         resources: AdmissionResources,
         remaining_work: u64,
     ) -> Self {
+        let grammar = input
+            .grammar
+            .as_ref()
+            .map(|grammar| crate::structured::GrammarState::new(grammar, input.params.starts_in_reasoning));
         Self {
             id,
             class,
@@ -304,6 +312,7 @@ impl Request {
             thinking: crate::thinking_budget::BudgetState::default(),
             reasoning_redirected_at: None,
             forced_state: crate::forced_literal::ForcedState::default(),
+            grammar,
             anchor_emitted: false,
             resources,
             remaining_work,
@@ -834,6 +843,12 @@ impl Request {
         self.thinking = crate::thinking_budget::BudgetState::default();
         self.reasoning_redirected_at = None;
         self.forced_state = crate::forced_literal::ForcedState::default();
+        // GitHub #587: and its answer, which the re-prefill writes again.
+        self.grammar = self
+            .input
+            .grammar
+            .as_ref()
+            .map(|grammar| crate::structured::GrammarState::new(grammar, self.input.params.starts_in_reasoning));
         // #518: and the re-prefill emits its own first token.
         self.anchor_emitted = false;
         true
@@ -952,6 +967,7 @@ mod tests {
                 decision: None,
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2, 3],

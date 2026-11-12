@@ -78,6 +78,7 @@ fn round(compute: &dyn Compute, request: u64, permitted: Option<&[TokenId]>, clo
         permitted: permitted.map(|ids| ids.to_vec().into()),
         reasoning_close: close,
         anchor_emitted: false,
+        checked: false,
     };
     compute
         .decode_step(&[job])

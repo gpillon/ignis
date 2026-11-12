@@ -54,3 +54,27 @@ or a corpus document it refused that the standard accepts, except the
 `outside_subset` ones (keys out of schema order, valid but never generated).
 The measured figures are in
 [the finding](../../findings/2026-11-12-structured-output-grammar-measured-on-the-27b.md).
+
+## The served path (`json_object`, GitHub #587)
+
+- **Over the mock engine** (`cargo test -p ignis-server --test
+  structured_output_http`, about 1 s): the `/v1` surface with a test
+  vocabulary and a scripted model (`MockCompute::script`). The script misses
+  on purpose -- a preamble, a fence, a remark after the object, an early stop,
+  only whitespace -- and each answer comes back a valid object, streamed and
+  whole alike; the reasoning stays unchecked with thinking on, and after a
+  thinking budget's forced close the answer is held; cuts by `max_tokens` and
+  by the deadline; the refusals (`json_schema`, Flash-Next, a forced tool
+  call). The mock refuses a repair made after a later call, so a scheduler
+  that checks a draw late fails here first. Its repair ranks a script's later
+  tokens before the vocabulary in order, and the test vocabulary puts the
+  tokens that close a value first.
+- **The adapter** (`cargo test -p ignis-runtime --test runtime_compute
+  a_checked_lane`): a checked lane reports its waiting draw, the EOS as a stop.
+- **On the GPU** (27B, speculation off, greedy): the served `json_object`
+  answers equal the per-token masked argmax of the prefill route's readouts,
+  up to a near-tie both routes call one. Ignored outside the GPU profile:
+
+  ```sh
+  cargo test -p ignis-server --features cuda --test structured_output_gpu -- --ignored --nocapture
+  ```

@@ -42,6 +42,7 @@ fn submit(sched: &mut ConcreteScheduler, max_tokens: u32) -> RequestId {
                 },
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
             },
             RequestClass::Interactive,

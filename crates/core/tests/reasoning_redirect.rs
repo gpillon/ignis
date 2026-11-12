@@ -49,6 +49,7 @@ fn submit(sched: &mut ConcreteScheduler, params: DecodeParams) -> RequestId {
                 params,
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
             },
             RequestClass::Interactive,
@@ -252,6 +253,7 @@ fn the_redirect_is_reported_by_the_round_that_drew_it() {
         permitted: None,
         reasoning_close: Some(THINK_END),
         anchor_emitted: false,
+        checked: false,
     };
     let round = |mock: &MockCompute| mock.decode_step(std::slice::from_ref(&job)).expect("round").remove(0);
     let first = round(&mock);

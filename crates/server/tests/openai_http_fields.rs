@@ -100,7 +100,6 @@ fn rows() -> Vec<(&'static str, JsonValue, Option<JsonValue>)> {
         ("n", json!(1), Some(json!(2))),
         ("logprobs", json!(false), Some(json!(true))),
         ("top_logprobs", json!(null), Some(json!(3))),
-        ("response_format", json!({ "type": "text" }), Some(json!({ "type": "json_object" }))),
         ("logit_bias", json!({}), Some(json!({ "7": 5 }))),
         ("parallel_tool_calls", json!(true), Some(json!(false))),
         ("store", json!(false), Some(json!(true))),
@@ -617,7 +616,9 @@ async fn a_request_without_stop_is_served_as_before() {
         "message": {
             "role": "assistant",
             "content": "one two???",
-            "tool_calls": [{ "id": "call_0", "type": "function", "function": { "name": "a", "arguments": "{}" } }]
+            "tool_calls": [{ "id": "call_0", "type": "function", "function": { "name": "a", "arguments": "{}" } }],
+            // GitHub #587: OpenAI's `refusal`, always null here.
+            "refusal": null
         },
         "finish_reason": "length"
     });

@@ -52,6 +52,7 @@ fn input(model: &str, prompt: Vec<u32>, max: u32) -> RequestInput {
         },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }

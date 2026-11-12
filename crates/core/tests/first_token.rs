@@ -39,6 +39,7 @@ fn input(max_tokens: u32) -> RequestInput {
         },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }

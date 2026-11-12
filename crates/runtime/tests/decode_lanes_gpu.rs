@@ -256,6 +256,7 @@ fn decode_batch(
                 permitted: None,
                 reasoning_close: None,
                 anchor_emitted: false,
+                checked: false,
             })
             .collect();
         let outcomes = compute.decode_step(&jobs).unwrap_or_else(|e| panic!("decode_step: {e}"));

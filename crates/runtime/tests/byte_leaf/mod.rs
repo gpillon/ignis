@@ -255,6 +255,7 @@ pub fn decode(compute: &RuntimeCompute<ByteLeaf>, request: RequestId, rounds: u3
         permitted: None,
         reasoning_close: None,
         anchor_emitted: false,
+        checked: false,
     };
     (0..rounds)
         .flat_map(|_| compute.decode_step(std::slice::from_ref(&job)).unwrap().remove(0).tokens)

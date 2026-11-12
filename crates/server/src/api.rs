@@ -924,6 +924,7 @@ fn request_input(
         reuse_boundaries: Vec::new(),
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
 };
     Ok(PreparedRequest { input, model, prompt_tokens, media: None, part_ends: rendered.part_ends, text })
@@ -1555,6 +1556,94 @@ pub(crate) fn forced_tool_call(
         }
     };
     literal.map(|literal| Some(Arc::new(literal))).map_err(|message| unsupported(&message))
+}
+
+/// What `response_format` asks of a chat completion (GitHub #587, spec
+/// #287, ADR 0089): a free answer (absent, `null`, `{"type": "text"}`), or
+/// one held to a grammar -- `{"type": "json_object"}`, any valid JSON
+/// object. The prompt need not mention JSON.
+///
+/// Refused with a 400 naming `response_format`: `json_schema`, which is
+/// being built (#588), and any other type; a model that does not serve
+/// structured output, naming it (Flash-Next, #581); a provider whose
+/// vocabulary cannot be read as bytes; with thinking on, a tokenizer with
+/// no single-token `</think>` to start the answer after; and a forced tool
+/// call beside it, until a turn may open a call under the grammar (#592).
+pub(crate) fn structured_output(
+    server: &Server,
+    format: Option<&JsonValue>,
+    thinking: &ThinkingOptions,
+    tool_choice: &ToolChoice,
+) -> Result<Option<ignis_core::structured::AnswerGrammar>, Response> {
+    let refused = |code: &str, message: String| {
+        error_response_naming(StatusCode::BAD_REQUEST, "invalid_request_error", code, message, Some("response_format"))
+    };
+    let kind = match format {
+        None | Some(JsonValue::Null) => return Ok(None),
+        Some(format) => format.get("type").and_then(JsonValue::as_str),
+    };
+    match kind {
+        Some("text") => return Ok(None),
+        Some("json_object") => {}
+        Some("json_schema") => {
+            return Err(refused(
+                "unsupported_value",
+                "response_format: json_schema is not served yet, structured output is being built (GitHub #287) and json_object is served; send {\"type\": \"json_object\"} or {\"type\": \"text\"}, or omit it".to_owned(),
+            ));
+        }
+        _ => {
+            return Err(refused(
+                "unsupported_value",
+                format!(
+                    "response_format: {} is not a format this server serves; send {{\"type\": \"json_object\"}} or {{\"type\": \"text\"}}, or omit it",
+                    format.map(JsonValue::to_string).unwrap_or_default()
+                ),
+            ));
+        }
+    }
+    let active = server.active();
+    if !active.family.serves_structured_output() {
+        return Err(refused(
+            "model_unsupported",
+            format!(
+                "response_format: structured output is not served by {} yet (GitHub #581); send {{\"type\": \"text\"}} or omit it",
+                active.family.name()
+            ),
+        ));
+    }
+    if matches!(tool_choice, ToolChoice::Required | ToolChoice::Function(_)) {
+        return Err(refused(
+            "unsupported_value",
+            "response_format: a forced tool call beside structured output is not served yet (GitHub #592); send tool_choice \"auto\", or omit response_format".to_owned(),
+        ));
+    }
+    let Some(grammars) = active.template.grammars() else {
+        return Err(refused(
+            "unsupported_value",
+            "response_format: this server's tokenizer cannot be read as bytes, so no answer can be held to a grammar here; omit response_format".to_owned(),
+        ));
+    };
+    let grammar = ignis_core::structured::AnswerGrammar::new(
+        grammars.json_object(),
+        ignis_core::structured::StructuredKind::JsonObject,
+    );
+    if !active.template.decoder_starts_in_reasoning(thinking) {
+        return Ok(Some(grammar));
+    }
+    // With thinking on the reasoning stays free, and the answer is held from
+    // the token after the block's `</think>`, which the scheduler sees as
+    // one token.
+    match active
+        .template
+        .encode_literal(crate::thinking::THINK_END_TEXT)
+        .filter(|ids| ids.len() == 1)
+    {
+        Some(ids) => Ok(Some(grammar.after(ids[0]))),
+        None => Err(refused(
+            "unsupported_value",
+            "response_format: with thinking on, the answer is held from the token after the reasoning's </think>, and this tokenizer has no single-token </think>; send enable_thinking: false".to_owned(),
+        )),
+    }
 }
 
 /// The reference's tool normalization (GitHub #172, ninfer
@@ -2445,6 +2534,12 @@ struct ChatCompletionsRequest {
     /// force the call's opening (GitHub #286): from the first token with
     /// thinking off, right after the reasoning block with it on.
     tool_choice: Option<JsonValue>,
+    /// Structured output (GitHub #587, spec #287): `{"type": "json_object"}`
+    /// holds the answer to a valid JSON object, each sampled token checked
+    /// and a miss repaired; `{"type": "text"}`, `null` or absent is a free
+    /// answer. `json_schema` is refused while it is being built (#588).
+    #[schema(value_type = Object)]
+    response_format: Option<JsonValue>,
     /// The Lane tag (GitHub #120, `GLOSSARY.md`): an ignis extension, not an
     /// OpenAI parameter (the way `top_k` went in at #101). `"interactive"`
     /// (default) or `"agent"`, the admission class `admission.rs` schedules
@@ -2486,6 +2581,8 @@ Every request has a deadline from its admission (ADR 0058): `--server-request-ti
 
 Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text. `tool_choice` takes `\"auto\"` (the default), `\"none\"`, `\"required\"` and a named function. The last two force the call's opening -- `<tool_call>` and the function tag, with the name when one is named -- and the model writes the rest: with thinking off the opening is the first thing generated, with thinking on the first thing after the reasoning block closes. A forced call that never closes is dropped like any other, and `finish_reason` says why.
 
+`response_format: {\"type\": \"json_object\"}` holds the answer to a valid JSON object, streamed or not: each sampled token is checked against the grammar before the model consumes it, and a miss is repaired from the same scores restricted to the tokens that keep the object valid. With thinking on the reasoning stays free and the answer is held from the token after its `</think>`. Whitespace runs are bounded, the prompt need not mention JSON, a cut by `max_tokens` returns the object as generated with `finish_reason: \"length\"`, and `message.refusal` is always null. `{\"type\": \"text\"}` is a free answer; `json_schema` is refused while it is being built.
+
 `max_completion_tokens` is `max_tokens` under its current name: the one cap on generated tokens, reasoning included; both sent with different values is a 400. `stop` (a string, or 1 to 4 strings) ends the answer before the first sequence to appear in its content, with `finish_reason: \"stop\"`; the sequence is never emitted, a stream holds back a possible prefix until the next delta resolves it, and it is never matched in the reasoning nor inside a tool call. `usage.prompt_tokens_details.cached_tokens` is the prompt this request resumed from retained state instead of prefilling, the quantity `/v1/responses` reports.
 
 `model` absent, or the loaded model's id, is served as it is. An id another catalog entry answers to on this card is that entry's (ADR 0064): on a 16 GB card `qwen3.8-27b` is served by `qwen3.8-27b-16g`, loaded or switched to, and the answer's `model` names it. Another model this server lists (`--switch-known-models`, the model it started on always among them) switches the server to it first, unless `--switch-allow-implicit false`: the same switch `POST /v1/models/switch` runs, during which every other request is refused `503 model_switching`, and this one is held until the named model serves and is then answered by it. A switch that does not land refuses it `503 model_switch_failed` with the reason. Any other model is a 404.",
@@ -2495,7 +2592,7 @@ Tool calls come back whole -- one complete `tool_calls` delta per call, never a 
             (ChatCompletion = "application/json"),
             (Chunk = "text/event-stream"),
         ), headers(("ignis-stopped-by" = String, description = "`request_timeout` on an answer its deadline cut, answered whole under `--server-timeout-reply partial` (ADR 0058); absent otherwise.")),),
-        (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take.", body = ApiError),
+        (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take. Or `response_format` asks for what this model does not serve (`param: response_format`): `json_schema`, any type but `text` and `json_object`, `json_object` beside a forced tool call, and on Qwen3.8-Flash-Next any structured output (`model_unsupported`, naming the model).", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 409, description = "The model that would serve the request is the image model: the one loaded, with no `model` naming a text model to switch to, or the one `model` names (`model_kind_mismatch`, naming both kinds and the loaded id). Or `model` names a catalog entry this card cannot load, and no entry that answers to it can: by its class (`model_above_card_class`, naming the entry's class and the card's, ADR 0064) or by its GPU generation, alone or with its class (`model_above_gpu_generation`, naming the generation the entry needs and the card's name, compute capability and generation, ADR 0079): refused before anything loads or switches, the loaded model serving on.", body = ApiError),
@@ -2579,6 +2676,10 @@ async fn chat_completions(
         Ok(forced) => forced,
         Err(response) => return response,
     };
+    let grammar = match structured_output(&server, req.response_format.as_ref(), &thinking, &tool_choice) {
+        Ok(grammar) => grammar,
+        Err(response) => return response,
+    };
     let (model, class) = match resolve_model_and_class(req.model, req.class) {
         Ok(x) => x,
         Err(message) => return bad_request(&message),
@@ -2590,6 +2691,7 @@ async fn chat_completions(
             Err(response) => return response,
         };
     input.forced_literal = forced;
+    input.grammar = grammar;
     let notes = RequestNotes { media, thinking_budget_dropped: budget_dropped, ..RequestNotes::default() };
     // The model the request runs on: its engine's cancel guard and its
     // template's decoder must be the ones it was submitted to.
@@ -2816,7 +2918,7 @@ fn completion_body(
         model,
         choices: vec![CompletionChoice {
             index: 0,
-            message: AssistantMessage { role: "assistant", reasoning_content, content, tool_calls },
+            message: AssistantMessage { role: "assistant", reasoning_content, content, tool_calls, refusal: None },
             finish_reason,
             thinking_budget_forced_at,
         }],
@@ -3129,6 +3231,10 @@ struct AssistantMessage {
     /// when the generation made none.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCallOut>>,
+    /// Always `null` (GitHub #587): this server never answers with a refusal
+    /// in place of the content, structured output included, so an SDK's
+    /// refusal handling stays quiet.
+    refusal: Option<String>,
 }
 
 /// One tool call, non-streaming wire shape (OpenAI: `message.tool_calls[]`).
@@ -4406,9 +4512,12 @@ mod tests {
             reasoning_content: None,
             content: "hi".into(),
             tool_calls: None,
+            refusal: None,
         };
         let json = serde_json::to_value(&message).expect("message serializes");
         assert!(json.as_object().unwrap().get("tool_calls").is_none());
+        // GitHub #587: OpenAI's `refusal` is there, and null.
+        assert!(json.as_object().unwrap().get("refusal").is_some_and(JsonValue::is_null));
     }
 
     // ── GitHub #132: tools / tool_choice validation ─────────────────────

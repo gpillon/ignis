@@ -266,6 +266,7 @@ fn a_real_load_names_itself_and_refuses_a_blob_from_any_other() {
                     permitted: None,
                     reasoning_close: None,
                     anchor_emitted: false,
+                    checked: false,
 }])
                 .is_err(),
             "{}: the refused restore left the sequence unrestored",
@@ -338,6 +339,7 @@ fn decode_once(
             permitted: None,
             reasoning_close: None,
             anchor_emitted: false,
+            checked: false,
 }])
         .unwrap_or_else(|e| panic!("{label}: decode_step: {e}"))
         .into_iter()

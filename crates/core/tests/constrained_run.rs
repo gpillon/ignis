@@ -68,6 +68,7 @@ fn decode_job(permitted: Option<ignis_core::constrained::PermittedSet>) -> Decod
         permitted,
         reasoning_close: None,
         anchor_emitted: false,
+        checked: false,
     }
 }
 
@@ -268,6 +269,7 @@ mod scheduler {
             decision: None,
             constrained: Some(Arc::new(Schedule::new(steps).expect("a legal program"))),
             forced_literal: None,
+            grammar: None,
             warm_up: false,
         }
     }
@@ -475,6 +477,7 @@ mod terminator {
             decision: None,
             constrained: Some(Arc::new(schedule)),
             forced_literal: None,
+            grammar: None,
             warm_up: false,
         }
     }

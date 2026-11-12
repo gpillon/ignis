@@ -47,6 +47,7 @@ fn input(max: u32) -> RequestInput {
         },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }
@@ -350,6 +351,7 @@ fn a_burst_on_one_prefix_overflows_through_materialized_snapshots_without_repref
         },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
 };
 
@@ -469,6 +471,7 @@ fn a_request_holding_a_shared_prefix_is_evicted_with_its_prefix_materialized() {
         },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
 };
 
@@ -579,6 +582,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                 },
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
             },
             RequestClass::Interactive,
@@ -604,6 +608,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                 },
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
             },
             RequestClass::Agent,

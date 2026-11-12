@@ -47,6 +47,29 @@ pub struct ArtifactTemplateProvider {
     /// The vision processor on a `--vision-enabled` load (GitHub #179); `None`
     /// renders no images.
     vision: Option<VisionProcessor>,
+    /// What structured output's grammars are compiled against (GitHub #587),
+    /// on a load that serves it; `None` refuses structured output.
+    structured: Option<GrammarVocabulary>,
+}
+
+/// The vocabulary a load's grammars read (GitHub #587): the logits row's
+/// width, the id that ends an answer, and the grammar cache built over them
+/// on the first structured request -- about 160 ms and 13 MiB on the 27B's
+/// tokenizer, which a load that never serves one does not pay.
+struct GrammarVocabulary {
+    width: usize,
+    stop: TokenId,
+    cache: std::sync::OnceLock<Option<Arc<ignis_grammar::GrammarCache>>>,
+}
+
+impl std::fmt::Debug for GrammarVocabulary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrammarVocabulary")
+            .field("width", &self.width)
+            .field("stop", &self.stop)
+            .field("built", &self.cache.get().is_some())
+            .finish()
+    }
 }
 
 impl ArtifactTemplateProvider {
@@ -58,7 +81,16 @@ impl ArtifactTemplateProvider {
         Self {
             set: Arc::new(frontend),
             vision: None,
+            structured: None,
         }
+    }
+
+    /// Serve structured output (GitHub #587): an answer's grammar reads the
+    /// tokenizer's first `width` ids as bytes -- the load's logits row --
+    /// and `stop`, the model's EOS, is the token that ends a complete answer.
+    pub fn with_grammar_vocabulary(mut self, width: usize, stop: TokenId) -> Self {
+        self.structured = Some(GrammarVocabulary { width, stop, cache: std::sync::OnceLock::new() });
+        self
     }
 
     /// Render image prompts with `processor` (a `--vision-enabled` load).
@@ -416,6 +448,36 @@ impl TemplateProvider for ArtifactTemplateProvider {
 
     fn is_token(&self, id: TokenId) -> bool {
         self.set.tokenizer().knows(id)
+    }
+
+    fn grammars(&self) -> Option<Arc<ignis_grammar::GrammarCache>> {
+        let vocabulary = self.structured.as_ref()?;
+        vocabulary
+            .cache
+            .get_or_init(|| {
+                let table = match self.set.tokenizer().token_bytes_table(vocabulary.width) {
+                    Ok(table) => table,
+                    Err(error) => {
+                        tracing::warn!(
+                            name: "ignis.structured.vocabulary_unreadable",
+                            %error,
+                            "the tokenizer's vocabulary cannot be read as bytes: structured output is refused"
+                        );
+                        return None;
+                    }
+                };
+                let entries = table
+                    .into_iter()
+                    .map(|entry| match entry {
+                        ignis_artifact::TokenBytes::Text(bytes) => ignis_grammar::VocabEntry::Text(bytes),
+                        ignis_artifact::TokenBytes::Added { .. } => ignis_grammar::VocabEntry::Control,
+                        ignis_artifact::TokenBytes::Absent => ignis_grammar::VocabEntry::Absent,
+                    })
+                    .collect();
+                let vocab = ignis_grammar::Vocab::new(entries, &[vocabulary.stop]);
+                Some(Arc::new(ignis_grammar::GrammarCache::new(vocab, ignis_grammar::DEFAULT_CACHE_BYTES)))
+            })
+            .clone()
     }
 
     fn render_tokens(&self, tokens: &[TokenId]) -> String {

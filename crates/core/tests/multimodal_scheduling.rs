@@ -59,6 +59,7 @@ fn multimodal_input(tokens: usize, media: Vec<MediaItem>, max: u32) -> RequestIn
         reuse_boundaries: Vec::new(),
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }

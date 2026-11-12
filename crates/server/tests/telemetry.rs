@@ -72,6 +72,7 @@ fn input(tokens: Vec<u32>, max_tokens: u32) -> RequestInput {
         },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }

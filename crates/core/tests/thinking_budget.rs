@@ -56,6 +56,7 @@ fn submit(sched: &mut ConcreteScheduler, budget: Option<u32>, max_tokens: u32) -
                 },
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
             },
             RequestClass::Interactive,

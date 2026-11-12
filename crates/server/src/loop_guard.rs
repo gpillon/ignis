@@ -2184,6 +2184,7 @@ mod tests {
             decision: None,
             constrained: None,
             forced_literal: None,
+            grammar: None,
             warm_up: false,
             multimodal: None,
             opener_tokens: None,

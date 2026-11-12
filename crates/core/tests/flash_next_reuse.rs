@@ -117,6 +117,7 @@ fn turn() -> RequestInput {
         reuse_boundaries: Vec::new(),
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }

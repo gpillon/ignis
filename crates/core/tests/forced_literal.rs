@@ -44,6 +44,7 @@ fn input(max_tokens: u32, budget: Option<u32>, forced: Option<ForcedLiteral>) ->
         params: DecodeParams { max_tokens: Some(max_tokens), thinking_budget: budget, ..DecodeParams::default() },
         constrained: None,
         forced_literal: forced.map(Arc::new),
+        grammar: None,
         warm_up: false,
     }
 }

@@ -53,6 +53,8 @@ struct Calls {
     /// ids), `None` for a draw handed none, and each round's lanes' close.
     prefill_redirects: Vec<Option<(u32, Vec<u32>)>>,
     decode_closes: Vec<Vec<Option<u32>>>,
+    /// GitHub #587: whether each lane of each round was checked, in order.
+    decode_checked: Vec<Vec<bool>>,
     /// P4-10 (GitHub #126): the prefixes published (their token counts) and
     /// the claims served (the context each claimant reserved), so a test can
     /// see that a claimant was allocated *against* a prefix rather than
@@ -625,6 +627,7 @@ impl StepLeaf for StubLeaf {
             .decode_permitted
             .push(lanes.iter().map(|lane| lane.permitted.to_vec()).collect());
         calls.decode_closes.push(lanes.iter().map(|lane| lane.reasoning_close).collect());
+        calls.decode_checked.push(lanes.iter().map(|lane| lane.checked).collect());
         drop(calls);
         let mut runs = self.runs.lock().unwrap();
         let mut tokens = self.tokens.lock().unwrap();
@@ -765,6 +768,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 permitted: None,
                 reasoning_close: None,
                 anchor_emitted: false,
+                checked: false,
             },
             DecodeJob {
                 request: 2,
@@ -774,6 +778,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 permitted: None,
                 reasoning_close: None,
                 anchor_emitted: false,
+                checked: false,
             },
         ])
         .unwrap();
@@ -826,6 +831,7 @@ fn the_adapter_holds_a_constrained_draw_for_the_round_that_emits_it() {
                 permitted,
                 reasoning_close: None,
                 anchor_emitted: false,
+                checked: false,
             }])
             .unwrap()
             .remove(0)
@@ -890,6 +896,33 @@ fn a_repair_reaches_the_requests_own_sequence_and_drops_the_draws_probability() 
 
     assert_eq!(compute.repair(&repair(2)), Err(ComputeError::Kernel(-1)), "no sequence, no repair");
     assert_eq!(leaf.calls.lock().unwrap().repairs.len(), 1, "and the leaf was not asked");
+}
+
+/// GitHub #587 (spec #287): a checked lane hands the leaf its flag -- the
+/// round a plain one -- and its outcome reports the draw waiting for the
+/// next round, the EOS by name as a stop, so the scheduler can check it
+/// before it is consumed. An unchecked lane reports none.
+#[test]
+fn a_checked_lane_reports_its_waiting_draw_and_the_eos_as_a_stop() {
+    let leaf = Arc::new(StubLeaf::with_tokens([11, 12, 13, 99]));
+    leaf.calls.lock().unwrap().pending_reported = true;
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    compute.prefill_step(&[prefill(1, Some(8))]).unwrap();
+    let round = |checked: bool| {
+        compute
+            .decode_step(&[DecodeJob { checked, ..job(1, DecodeParams::default(), 8) }])
+            .unwrap()
+            .remove(0)
+    };
+    let free = round(false);
+    assert_eq!((free.tokens, free.waiting), (vec![11], None), "an unchecked lane reports no draw");
+    let checked = round(true);
+    assert_eq!((checked.tokens, checked.waiting), (vec![12], Some(ignis_core::WaitingDraw::Token(13))));
+    let before_eos = round(true);
+    assert_eq!(before_eos.tokens, vec![13]);
+    assert_eq!(before_eos.waiting, Some(ignis_core::WaitingDraw::Stop), "the waiting EOS, by name");
+    assert_eq!(leaf.calls.lock().unwrap().decode_checked, vec![vec![false], vec![true], vec![true]]);
 }
 
 /// GitHub #286: the round after a forced run's last set carries none, so a
@@ -995,6 +1028,7 @@ fn adapter_rejects_decode_batches_larger_than_the_resident_lane_bound() {
             permitted: None,
             reasoning_close: None,
             anchor_emitted: false,
+            checked: false,
         })
         .collect();
 
@@ -1119,6 +1153,7 @@ fn adapter_maps_allocation_and_decode_errors_without_losing_live_state() {
             permitted: None,
             reasoning_close: None,
             anchor_emitted: false,
+            checked: false,
 }]),
         Err(ComputeError::Kernel(-19))
     );
@@ -1157,6 +1192,7 @@ fn adapter_enforces_max_tokens_and_eos() {
         permitted: None,
         reasoning_close: None,
         anchor_emitted: false,
+        checked: false,
 };
     assert_eq!(
         compute.decode_step(&[job.clone()]).unwrap(),
@@ -1183,6 +1219,7 @@ fn adapter_enforces_max_tokens_and_eos() {
                 permitted: None,
                 reasoning_close: None,
                 anchor_emitted: false,
+                checked: false,
 }])
             .unwrap(),
         vec![DecodeOutcome::finished(FinishReason::Stop)]
@@ -1208,6 +1245,7 @@ fn adapter_can_keep_a_measurement_lane_alive_past_eos() {
         permitted: None,
         reasoning_close: None,
         anchor_emitted: false,
+        checked: false,
 };
 
     assert_eq!(
@@ -1238,6 +1276,7 @@ fn adapter_decodes_multiple_requests_in_one_ordered_leaf_round() {
                     permitted: None,
                     reasoning_close: None,
                     anchor_emitted: false,
+                    checked: false,
                 },
                 DecodeJob {
                     request: 2,
@@ -1247,6 +1286,7 @@ fn adapter_decodes_multiple_requests_in_one_ordered_leaf_round() {
                     permitted: None,
                     reasoning_close: None,
                     anchor_emitted: false,
+                    checked: false,
                 },
             ])
             .unwrap(),
@@ -1285,6 +1325,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_completes() {
                 },
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
             },
             RequestClass::Interactive,
@@ -1322,6 +1363,7 @@ fn scheduler_passes_the_full_sequence_reservation_to_first_prefill() {
                 params: DecodeParams::default(),
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
             },
             RequestClass::Interactive,
@@ -1370,6 +1412,7 @@ fn scheduler_passes_the_shared_prefix_boundary_to_prefill() {
         },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
 };
     scheduler
@@ -1431,6 +1474,7 @@ fn a_full_prompt_match_is_allocated_against_the_prefix_and_never_prefilled() {
         },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
 };
     scheduler
@@ -1491,6 +1535,7 @@ fn checkpoint_input(tokens: Vec<u32>, opener: Option<u32>) -> RequestInput {
         },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }
@@ -1827,6 +1872,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
         },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     };
     for token in 0..8 {
@@ -1881,6 +1927,7 @@ fn job(request: u64, params: DecodeParams, remaining_tokens: u32) -> DecodeJob {
         permitted: None,
         reasoning_close: None,
         anchor_emitted: false,
+        checked: false,
     }
 }
 
@@ -2284,6 +2331,7 @@ fn a_scheduled_multimodal_request_encodes_and_releases_every_item() {
                 reuse_boundaries: Vec::new(),
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
             },
             RequestClass::Agent,
@@ -2881,6 +2929,7 @@ fn round_after(anchor_emitted: bool, remaining_tokens: u32, permitted: Option<ig
         permitted,
         reasoning_close: None,
         anchor_emitted,
+        checked: false,
     }
 }
 

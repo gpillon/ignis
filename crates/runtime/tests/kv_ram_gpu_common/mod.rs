@@ -209,6 +209,7 @@ impl Loaded {
             reuse_boundaries: Vec::new(),
             constrained: None,
             forced_literal: None,
+            grammar: None,
             warm_up: false,
         }
     }
@@ -514,6 +515,7 @@ fn decode_alone(compute: &RuntimeCompute<CudaLeaf>, request: RequestId, count: u
                 permitted: None,
                 reasoning_close: None,
                 anchor_emitted: false,
+                checked: false,
 }])
             .unwrap_or_else(|e| panic!("decode {request}: {e:?}"))
             .remove(0);

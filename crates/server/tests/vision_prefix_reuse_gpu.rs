@@ -100,6 +100,7 @@ fn request(provider: &ArtifactTemplateProvider, processor: &ignis_artifact::visi
         decision: None,
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
         model: MODEL.into(),
         tokens: rendered.tokens,

@@ -60,6 +60,7 @@ fn request(prompt: u32, max_tokens: Option<u32>) -> RequestInput {
         params: DecodeParams { max_tokens, ..DecodeParams::default() },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }

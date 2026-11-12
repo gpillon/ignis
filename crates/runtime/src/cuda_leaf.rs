@@ -971,7 +971,12 @@ impl StepLeaf for CudaLeaf {
             .iter()
             .map(|lane| lane.stop_ids.iter().map(|&id| id as i32).collect())
             .collect();
-        let speculation = self.config.speculation.filter(|_| lanes.iter().all(|lane| lane.permitted.is_empty()));
+        // GitHub #587: so does a lane whose draw the host checks, which a
+        // repair can read the scores of only after a plain round (#590).
+        let speculation = self
+            .config
+            .speculation
+            .filter(|_| lanes.iter().all(|lane| lane.permitted.is_empty() && !lane.checked));
         let Some(speculation) = speculation else {
             // One plain round, constrained lanes or none: each lane's draw
             // under its sampling, its set and its reasoning redirect (GitHub

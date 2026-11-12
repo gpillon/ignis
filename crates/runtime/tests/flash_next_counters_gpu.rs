@@ -75,6 +75,7 @@ fn the_leaf_publishes_its_counts_after_every_step() {
         stop_ids: &[],
         permitted: &[],
         reasoning_close: None,
+        checked: false,
     };
     for round in 0..DECODED {
         leaf.decode(&model, &mut [&mut seq], std::slice::from_ref(&lane))

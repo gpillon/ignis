@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use ignis_core::vision::{MEDIA_ENCODE_POOL_FULL, MediaItem, Multimodal};
 use ignis_core::{
     BlobIdentity, Compute, ComputeError, DecodeJob, DecodeOutcome, DecodeParams, FinishReason,
-    N_DECODE_LANES, PrefillJob, PrefillOutcome, Readout, RepairJob, RequestId, RetainedAt, SpecCounters,
+    N_DECODE_LANES, PrefillJob, PrefillOutcome, Readout, RepairJob, RequestId, RetainedAt, SpecCounters, WaitingDraw,
     TokenId,
 };
 
@@ -318,6 +318,11 @@ pub struct DecodeLane<'a> {
     /// -- becomes while its reasoning block is open (GitHub #315, ADR 0048),
     /// or `None`. [`LaneRun::redirected`] says it happened.
     pub reasoning_close: Option<TokenId>,
+    /// The host checks the draw this lane makes before the next round
+    /// consumes it (GitHub #587, [`ignis_core::scheduler::DecodeJob::checked`]):
+    /// the round is a plain one, for the whole batch as for a permitted set,
+    /// so the draw keeps the scores a repair reads (until #590).
+    pub checked: bool,
 }
 
 /// One lane's committed run from a decode round (P5-06, GitHub #154).
@@ -2009,6 +2014,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     permitted: permitted[index].as_deref().unwrap_or(&[]),
                     // GitHub #315: no stop id, nothing to redirect.
                     reasoning_close: job.reasoning_close.filter(|_| !job.params.ignore_eos),
+                    checked: job.checked,
                 })
                 .collect();
             let mut handles: Vec<&mut L::Sequence> = batch
@@ -2111,8 +2117,20 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 }
                 None => {
                     sequence.generated = sequence.generated.saturating_add(tokens.len() as u32 + anchor);
+                    // GitHub #587: a checked lane's waiting draw, as the
+                    // leaf holds it -- the EOS by name, which the next
+                    // round would end the request on.
+                    let waiting = match job.checked {
+                        true => self.model.leaf.pending_token(&sequence.handle).map(|token| {
+                            match token == self.eos && !job.params.ignore_eos {
+                                true => WaitingDraw::Stop,
+                                false => WaitingDraw::Token(token),
+                            }
+                        }),
+                        false => None,
+                    };
                     sequences.insert(job.request, sequence);
-                    DecodeOutcome::run(tokens)
+                    DecodeOutcome { waiting, ..DecodeOutcome::run(tokens) }
                 }
             };
             outcomes[index] = Some(DecodeOutcome {

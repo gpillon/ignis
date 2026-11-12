@@ -117,6 +117,7 @@ fn input(tokens: Vec<u32>, max_tokens: u32, forced: Option<Vec<u32>>) -> Request
         forced_literal: forced.map(|tokens| {
             std::sync::Arc::new(ignis_core::forced_literal::ForcedLiteral::at_generation(tokens).expect("a forced text"))
         }),
+        grammar: None,
         warm_up: false,
     }
 }

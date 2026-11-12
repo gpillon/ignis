@@ -151,9 +151,10 @@ use crate::request::{CaptureLink, PrefixReuse, Request};
 use crate::retained_slot::{RetainedHolder, RetainedSkip, RetainedSlotLedger};
 use crate::scheduler::{
     CheckpointClaim, Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome,
-    DiskSource, DiskTarget, KvRamEvent, KvRamMove, KvRamOutcome, Occupancy, PrefillJob, PrefillOutcome, RetainedAt,
-    Scheduler, SharedPrefixClaim,
+    DiskSource, DiskTarget, KvRamEvent, KvRamMove, KvRamOutcome, Occupancy, PrefillJob, PrefillOutcome, RepairJob,
+    RetainedAt, Scheduler, SharedPrefixClaim, WaitingDraw,
 };
+use crate::structured::Verdict;
 use crate::types::{
     BackfillClass, BoundaryLifetime, ComputeError, DecisionRead, DecodeParams, EngineMode,
     FanOutId, FinishReason, LaneId, N_DECODE_LANES, RequestClass, RequestId, RequestIds, RequestInput,
@@ -350,6 +351,17 @@ fn chunk_take(r: &Request, serving_chunk: u32) -> u32 {
     } else {
         take
     }
+}
+
+/// What holding a waiting draw to its grammar did (GitHub #587).
+enum Held {
+    /// The draw passed: it waits as it was drawn.
+    Kept,
+    /// A miss, repaired: this token waits in the draw's place.
+    Repaired(TokenId),
+    /// The request ends: a stop where the answer is complete, or a miss the
+    /// engine could not repair.
+    Ended(FinishReason),
 }
 
 /// The `</think>` the leaf redirects an EOS to for `r`'s next draw (GitHub
@@ -2461,6 +2473,108 @@ impl ConcreteScheduler {
         (request_id, tokens)
     }
 
+    /// Hold request `i`'s waiting draw to its **grammar** (GitHub #587, ADR
+    /// 0089): right after the call that drew it, before the next call
+    /// consumes it -- or overwrites the scores it kept. A draw that passes is
+    /// the grammar's from then on; a **miss** is **repaired**, the position
+    /// drawn again from those scores restricted to the grammar's permitted
+    /// set, and the repaired token waits in its place.
+    ///
+    /// The one place a miss and a repair happen, which is where their counts
+    /// and the repair's time are taken (#593).
+    fn hold_to_grammar(&mut self, i: usize, draw: WaitingDraw) -> Held {
+        let r = &mut self.requests[i];
+        let Some(state) = r.grammar.as_mut() else {
+            return Held::Kept;
+        };
+        match state.check(draw) {
+            Verdict::Passed => return Held::Kept,
+            Verdict::Finished => return Held::Ended(FinishReason::Stop),
+            Verdict::Miss => {}
+        }
+        let request = r.id;
+        let params = r.input.params;
+        let repaired = state
+            .permitted()
+            .and_then(|permitted| {
+                let job = RepairJob { request, params, permitted };
+                self.compute.repair(&job).map_err(|error| error.to_string())
+            })
+            .and_then(|token| {
+                let state = self.requests[i].grammar.as_mut().expect("checked above");
+                state.repaired(token).map(|stop| (token, stop))
+            });
+        match repaired {
+            Ok((_, true)) => Held::Ended(FinishReason::Stop),
+            Ok((token, false)) => Held::Repaired(token),
+            Err(error) => {
+                // hotpath-lint-allow: failure-only path (a miss the engine could not repair ends its request), reviewed exception (GitHub #587).
+                tracing::error!(
+                    name: "ignis.structured.repair_failed",
+                    request_id = request,
+                    %error,
+                    "a miss in a structured answer could not be repaired"
+                );
+                Held::Ended(FinishReason::Error)
+            }
+        }
+    }
+
+    /// GitHub #587: the prompt's last job drew request `i`'s first token,
+    /// held to its grammar when its answer starts there. Returns the run the
+    /// request emits: the draw, the token that repaired it, or the request's
+    /// end.
+    fn hold_first_draw(&mut self, i: usize, run: DecodeOutcome) -> DecodeOutcome {
+        if !self.requests[i].grammar.as_ref().is_some_and(|state| state.holds()) {
+            return run;
+        }
+        let draw = match (run.tokens.as_slice(), run.finish) {
+            ([token], None) => WaitingDraw::Token(*token),
+            ([], Some(FinishReason::Stop)) => WaitingDraw::Stop,
+            // Nothing else is a draw: hold nothing back from the ending.
+            _ => return run,
+        };
+        match self.hold_to_grammar(i, draw) {
+            Held::Kept => run,
+            Held::Repaired(token) => DecodeOutcome::token(token),
+            Held::Ended(reason) => DecodeOutcome::finished(reason),
+        }
+    }
+
+    /// GitHub #587: after a round, request `i`'s waiting draw held to its
+    /// grammar, once the answer has started (the round's own run may be what
+    /// started it). A draw a permitted set forced is the server's text, not
+    /// the model's, and is left alone. Ends the request when the draw or its
+    /// repair is a stop where the answer is complete, and when a lane whose
+    /// draw must be checked reports none.
+    fn hold_round_draw(&mut self, i: usize, run: &DecodeOutcome, forced: bool, events: &mut Vec<SchedEvent>) {
+        let r = &mut self.requests[i];
+        let request = r.id;
+        let done = r.state == RequestState::Done;
+        let Some(state) = r.grammar.as_mut() else {
+            return;
+        };
+        state.commit(&run.tokens);
+        if done || !state.holds() || forced {
+            return;
+        }
+        let held = match run.waiting {
+            Some(draw) => self.hold_to_grammar(i, draw),
+            None => {
+                // hotpath-lint-allow: failure-only path (a backend that did not report a draw it was asked for), reviewed exception (GitHub #587).
+                tracing::error!(
+                    name: "ignis.structured.no_waiting_draw",
+                    request_id = request,
+                    "a round left a structured answer's draw unreported, so it cannot be checked"
+                );
+                Held::Ended(FinishReason::Error)
+            }
+        };
+        if let Held::Ended(reason) = held {
+            self.mark_done(i, events, reason);
+        }
+    }
+
     /// Why a request whose generation budget is spent stopped.
     ///
     /// [`FinishReason::Length`] for every ordinary request: it had more to
@@ -2492,6 +2606,8 @@ impl ConcreteScheduler {
             finish,
             spec,
             reasoning_redirected,
+            // GitHub #587: read after the run, by `hold_round_draw`.
+            waiting: _,
         } = run;
         if let Some(spec) = spec {
             let r = &mut self.requests[i];
@@ -5536,8 +5652,15 @@ impl Scheduler for ConcreteScheduler {
                         // request emits first. A decision or a warm-up ends
                         // at its prefill and emits none.
                         if job.next_prompt_token.is_none() && !self.requests[i].input.ends_at_prefill() {
-                            if let Some(run) = outcome.emitted {
-                                first_tokens.push((i, run));
+                            match outcome.emitted {
+                                Some(run) => first_tokens.push((i, run)),
+                                // GitHub #587: a draw its grammar must check
+                                // that the backend did not report would
+                                // leave with the first round unchecked.
+                                None if self.requests[i].input.checks_prefill_draw() => {
+                                    first_tokens.push((i, DecodeOutcome::finished(FinishReason::Error)));
+                                }
+                                None => {}
                             }
                         }
                     }
@@ -5615,8 +5738,15 @@ impl Scheduler for ConcreteScheduler {
         // the prefill left it, so no GDN boundary moves.
         let mut drew_first: Vec<RequestId> = Vec::new();
         for (i, run) in first_tokens {
+            // GitHub #587: an answer held to a grammar from its first token
+            // has that token checked, and repaired on a miss, before it
+            // leaves.
+            let run = self.hold_first_draw(i, run);
             let left = !run.tokens.is_empty();
             self.commit_run(i, &run, false, &mut events);
+            if let Some(state) = self.requests[i].grammar.as_mut() {
+                state.commit(&run.tokens);
+            }
             let r = &mut self.requests[i];
             if left && r.state != RequestState::Done {
                 r.anchor_emitted = true;
@@ -5802,11 +5932,15 @@ impl Scheduler for ConcreteScheduler {
                     // GitHub #315: for the draw this round makes, too.
                     reasoning_close: reasoning_close(&self.config, &self.requests[i]),
                     anchor_emitted: self.requests[i].anchor_emitted,
+                    // GitHub #587: a request held to a grammar has each draw
+                    // checked before the next round consumes it -- for now
+                    // in plain rounds, the reasoning's included (#590).
+                    checked: self.requests[i].grammar.is_some(),
                 })
                 .collect();
             match self.compute.decode_step(&jobs) {
                 Ok(results) => {
-                    for (&i, res) in to_decode.iter().zip(&results) {
+                    for ((&i, res), job) in to_decode.iter().zip(&results).zip(&jobs) {
                         // GitHub #81 / ADR 0012: the decode-round span —
                         // one per request per `decode_step` call (the unit
                         // a decode CUDA graph is captured over), opened
@@ -5834,6 +5968,11 @@ impl Scheduler for ConcreteScheduler {
                             "a decode outcome commits a token or finishes the request"
                         );
                         self.commit_run(i, res, !res.tokens.is_empty() || anchor_emitted, &mut events);
+                        // GitHub #587: and the draw it left waiting, held to
+                        // the request's grammar before the next round.
+                        if job.checked {
+                            self.hold_round_draw(i, res, job.permitted.is_some(), &mut events);
+                        }
                     }
                 }
                 Err(e) => {

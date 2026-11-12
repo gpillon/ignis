@@ -384,6 +384,12 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
 
     let item_bound = processor.as_ref().map(|p| p.options().max_item_tokens());
     let provider = crate::artifact_template::ArtifactTemplateProvider::new(frontend);
+    // GitHub #587: a model that serves structured output reads its grammars'
+    // vocabulary over its logits row, the EOS ending a complete answer.
+    let provider = match eos.filter(|_| family.serves_structured_output()) {
+        Some(eos) => provider.with_grammar_vocabulary(ignis_core::compute::ModelConfig::qwen38_27b().vocab as usize, eos),
+        None => provider,
+    };
 
     // A default the template cannot honour is a refusal (a model swap must
     // not silently change behaviour), as a missing EOS token or an unclean
@@ -731,6 +737,7 @@ mod tests {
             params: ignis_core::DecodeParams { max_tokens: Some(1), ..Default::default() },
             constrained: None,
             forced_literal: None,
+            grammar: None,
             warm_up: false,
         };
         engine.submit(input, ignis_core::RequestClass::Interactive).await.expect("admitted").0

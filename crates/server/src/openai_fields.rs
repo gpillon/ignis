@@ -89,13 +89,6 @@ fn null_or_empty_object(value: &JsonValue) -> bool {
     value.is_null() || value.as_object().is_some_and(Map::is_empty)
 }
 
-fn null_or_text_format(value: &JsonValue) -> bool {
-    value.is_null()
-        || value
-            .as_object()
-            .is_some_and(|o| o.len() == 1 && o.get("type").and_then(JsonValue::as_str) == Some("text"))
-}
-
 fn null_or_standard_tier(value: &JsonValue) -> bool {
     value.is_null() || matches!(value.as_str(), Some("auto" | "default"))
 }
@@ -139,12 +132,6 @@ pub const CHAT: &[FieldRule] = &[
         inert: null,
         inert_when: "`null`",
         refusal: Some("log probabilities are not served; omit top_logprobs (GitHub #288)"),
-    },
-    FieldRule {
-        name: "response_format",
-        inert: null_or_text_format,
-        inert_when: "`{\"type\": \"text\"}`",
-        refusal: Some("structured output is not served, this server returns plain text only; send {\"type\": \"text\"} or omit it (GitHub #287)"),
     },
     FieldRule {
         name: "logit_bias",
@@ -442,22 +429,6 @@ mod tests {
         refused(Surface::Chat, "logprobs", &[json!(true)], "#288");
         accepted(Surface::Chat, "top_logprobs", &[json!(null)]);
         refused(Surface::Chat, "top_logprobs", &[json!(0), json!(5)], "#288");
-    }
-
-    #[test]
-    fn response_format_is_inert_only_as_text() {
-        accepted(Surface::Chat, "response_format", &[json!(null), json!({ "type": "text" })]);
-        refused(
-            Surface::Chat,
-            "response_format",
-            &[
-                json!({ "type": "json_object" }),
-                json!({ "type": "json_schema", "json_schema": { "name": "x" } }),
-                json!({ "type": "grammar" }),
-                json!("text"),
-            ],
-            "#287",
-        );
     }
 
     #[test]

@@ -28,7 +28,9 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   both endpoints.
 - **What it cannot do is refused**, with OpenAI's error and a `param`, never
   ignored where ignoring it would change the answer: tools that are not
-  functions, `text.format` other than `text` (no structured output),
+  functions, `text.format` other than `text` (no structured output on this
+  route yet; chat completions serve `json_object` from 0.11.0,
+  [Structured output](structured-output.md)),
   `background: true`, and an input item of another type. `store`,
   `metadata`, `prompt_cache_key`, `service_tier` and the like are accepted
   and change nothing; `include: ["reasoning.encrypted_content"]` adds the

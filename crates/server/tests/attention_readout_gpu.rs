@@ -202,6 +202,7 @@ fn the_leaf_reads_what_the_tap_sees(kv_format: KvFormat) {
             })),
             constrained: None,
             forced_literal: None,
+            grammar: None,
             warm_up: false,
         };
 

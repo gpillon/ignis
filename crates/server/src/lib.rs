@@ -293,6 +293,7 @@ pub async fn warm_up_engine(engine: &Engine) -> Result<Duration, String> {
         decision: None,
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
         multimodal: None,
         opener_tokens: None,
@@ -541,10 +542,15 @@ impl Server {
     /// tokenized by the container's HuggingFace tokenizer
     /// (`artifact_template.rs`).
     pub fn with_artifact_template(engine: Engine, frontend: ignis_artifact::FrontendSet) -> Self {
-        Self::new(
-            engine,
-            Box::new(artifact_template::ArtifactTemplateProvider::new(frontend)),
-        )
+        // GitHub #587: the 27B's logits row and EOS, for structured output.
+        let eos = frontend.eos_token_id();
+        let provider = artifact_template::ArtifactTemplateProvider::new(frontend);
+        let provider = match eos {
+            Some(eos) => provider
+                .with_grammar_vocabulary(ignis_core::compute::ModelConfig::qwen38_27b().vocab as usize, eos),
+            None => provider,
+        };
+        Self::new(engine, Box::new(provider))
     }
 
     /// Set the deadline of a request answered whole (`main` wires this to

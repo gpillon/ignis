@@ -47,6 +47,7 @@ fn input(tokens: &[u32], max: u32) -> RequestInput {
         },
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }
@@ -373,6 +374,7 @@ fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_l
                 params: DecodeParams::default(),
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
             },
             RequestClass::Agent,
@@ -398,6 +400,7 @@ fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_l
                 params: DecodeParams::default(),
                 constrained: None,
                 forced_literal: None,
+                grammar: None,
                 warm_up: false,
             },
             RequestClass::Agent,

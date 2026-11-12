@@ -9,6 +9,9 @@ license.workspace = true
 ignis-core = { path = "../core" }
 ignis-artifact = { path = "../artifact" }
 ignis-runtime = { path = "../runtime" }
+# Structured output's grammar (GitHub #587, ADR 0089): a request's
+# `response_format` compiled against the loaded tokenizer's vocabulary.
+ignis-grammar = { path = "../grammar" }
 ignis-logging = { path = "../logging" }
 # The speech model's CPU executor (spec speech/01, ADR 0068): pure Rust, in every build.
 ignis-speech = { path = "../speech" }

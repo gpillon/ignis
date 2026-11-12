@@ -77,6 +77,7 @@ fn text_input(frontend: &FrontendSet, question: &str) -> RequestInput {
         reuse_boundaries: Vec::new(),
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }
@@ -110,6 +111,7 @@ fn image_question(frontend: &FrontendSet, image: &[u8], question: &str) -> Reque
         reuse_boundaries: Vec::new(),
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     }
 }

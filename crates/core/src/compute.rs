@@ -902,6 +902,13 @@ impl ModelFamily {
         Self::WITH_VISION.contains(&self)
     }
 
+    /// Whether the model serves **structured output** (GitHub #587, ADR
+    /// 0089): the 27B, whose leaf repairs a miss from the scores its round
+    /// kept. Flash-Next's keeps none yet (#581).
+    pub fn serves_structured_output(self) -> bool {
+        self == ModelFamily::Qwen38_27b
+    }
+
     /// Whether the model serves `/v1/decide`'s readouts.
     pub fn serves_readouts(self) -> bool {
         self == ModelFamily::Qwen38_27b

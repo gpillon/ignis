@@ -128,6 +128,7 @@ fn locate_input(
         })),
         constrained: None,
         forced_literal: None,
+        grammar: None,
         warm_up: false,
     };
     (input, span)

@@ -229,6 +229,7 @@ fn a_readout_crosses_the_real_compute_seam() {
             permitted: None,
             reasoning_close: None,
             anchor_emitted: false,
+            checked: false,
 }])
         .unwrap_or_else(|e| panic!("decode_step: {e}"));
     let committed = decoded

@@ -19,7 +19,7 @@ use std::time::Duration;
 use crate::decision::{Readout, argmax, log_sum_exp};
 use crate::scheduler::{
     Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome, DiskSource, DiskTarget,
-    KvRamEvent, KvRamMove, KvRamOutcome, PrefillJob, PrefillOutcome, RepairJob, NO_HOST_ROOM,
+    KvRamEvent, KvRamMove, KvRamOutcome, PrefillJob, PrefillOutcome, RepairJob, WaitingDraw, NO_HOST_ROOM,
 };
 use crate::types::{ComputeError, FinishReason, RequestId, SpecCounters, TokenId};
 
@@ -141,6 +141,27 @@ struct Inner {
     repaired: HashMap<RequestId, (u32, TokenId, Option<TokenId>)>,
     /// Every repair the mock received, in order.
     repairs: Vec<RepairJob>,
+    /// What a request writes, step by step (GitHub #587): its token at step
+    /// `i` is `script[i]` instead of the mix, and every step past the
+    /// script is its EOS ([`MockCompute::script`]).
+    scripts: HashMap<RequestId, Vec<TokenId>>,
+}
+
+impl Inner {
+    /// Whether `request`'s token at `step` is its EOS: named by `eos_after`,
+    /// or past the end of its script.
+    fn is_eos(&self, request: RequestId, step: u32) -> bool {
+        self.eos.get(&request).is_some_and(|steps| steps.contains(&step))
+            || self.scripts.get(&request).is_some_and(|script| step as usize >= script.len())
+    }
+
+    /// `request`'s free token at `step`: its script's, else the mix.
+    fn free_token(&self, seed: u64, request: RequestId, step: u32) -> TokenId {
+        match self.scripts.get(&request).and_then(|script| script.get(step as usize)) {
+            Some(&token) => token,
+            None => MockCompute::mix(seed, request, self.seeds.get(&request).copied().unwrap_or(0), step),
+        }
+    }
 }
 
 /// How the mock moves a live sequence through KV-RAM a window at a time
@@ -749,7 +770,18 @@ impl MockCompute {
     /// (pure function of the seeds — exposed so tests can pin a stream
     /// without running the scheduler).
     pub fn token_for(&self, request: RequestId, step: u32) -> TokenId {
-        Self::mix(self.seed, request, 0, step)
+        match self.inner.lock().unwrap().scripts.get(&request).and_then(|script| script.get(step as usize)) {
+            Some(&token) => token,
+            None => Self::mix(self.seed, request, 0, step),
+        }
+    }
+
+    /// Make `request` write `tokens`, one a step, and then stop (GitHub
+    /// #587): a scripted model, so a test chooses what the model writes --
+    /// a preamble, a fence, a remark after the answer -- instead of reading
+    /// it off the mix. Every step past the script is the request's EOS.
+    pub fn script(&self, request: RequestId, tokens: &[TokenId]) {
+        self.inner.lock().unwrap().scripts.insert(request, tokens.to_vec());
     }
 }
 
@@ -801,15 +833,14 @@ impl Compute for MockCompute {
                     g.kept.remove(&job.request);
                 }
             }
-            let eos = g.eos.get(&job.request).is_some_and(|steps| steps.contains(&step));
+            let eos = g.is_eos(job.request, step);
             emitted[index] = Some(if let Some(close) = job.reasoning_close.filter(|_| redirected[index]) {
                 DecodeOutcome::token(close)
             } else if eos {
                 // The EOS is never emitted: the request ends on it.
                 DecodeOutcome::finished(FinishReason::Stop)
             } else {
-                let seed = g.seeds.get(&job.request).copied().unwrap_or(0);
-                DecodeOutcome::token(Self::mix(self.seed, job.request, seed, step))
+                DecodeOutcome::token(g.free_token(self.seed, job.request, step))
             });
         }
         g.prefill_batches.push(jobs.to_vec());
@@ -943,11 +974,13 @@ impl Compute for MockCompute {
     }
 
     // GitHub #586: the mock's kept scores are a ranking, deterministic by
-    // construction -- the draw itself first, then every id in ascending
-    // order. So a repair returns the draw when the mask permits it (greedy's
-    // masked argmax is the argmax when that is allowed) and the mask's lowest
-    // id otherwise, under any temperature; an EOS draw, which the mock has no
-    // id for, is never permitted. It refuses what the leaf refuses: a request
+    // construction -- the draw itself first, then (#587) a scripted
+    // request's later tokens in order, then every id in ascending order. So
+    // a repair returns the draw when the mask permits it (greedy's masked
+    // argmax is the argmax when that is allowed), else the first later token
+    // of a script the mask permits, else the mask's lowest id, under any
+    // temperature; an EOS draw, which the mock has no id for, is never
+    // permitted. It refuses what the leaf refuses: a request
     // whose waiting draw kept no scores, or whose scores a later call wrote
     // over (`Inner::kept`). A constrained run's held draw is replaced too, and
     // the round that emits it then reports no probability for it, as the
@@ -959,17 +992,23 @@ impl Compute for MockCompute {
             return Err(ComputeError::Kernel(-1));
         }
         let step = g.generated.get(&job.request).copied().unwrap_or(0);
-        let seed = g.seeds.get(&job.request).copied().unwrap_or(0);
         // A second repair of the step reads the scores the draw read.
         let draw = match g.repaired.get(&job.request).filter(|repaired| repaired.0 == step) {
             Some(&(_, _, drawn)) => drawn,
             None => match g.pending.remove(&job.request) {
                 Some(held) => Some(held.token),
-                None if g.eos.get(&job.request).is_some_and(|steps| steps.contains(&step)) => None,
-                None => Some(Self::mix(self.seed, job.request, seed, step)),
+                None if g.is_eos(job.request, step) => None,
+                None => Some(g.free_token(self.seed, job.request, step)),
             },
         };
-        let token = match draw.filter(|&token| job.permitted.permits(token)) {
+        // GitHub #587: a scripted request ranks what it was going to write
+        // next above the rest, so a miss resumes the script where it can.
+        let later = g
+            .scripts
+            .get(&job.request)
+            .and_then(|script| script.get(step as usize + 1..))
+            .and_then(|rest| rest.iter().copied().find(|&token| job.permitted.permits(token)));
+        let token = match draw.filter(|&token| job.permitted.permits(token)).or(later) {
             Some(token) => token,
             None => job.permitted.ids().next().expect("a mask permits at least one token"),
         };
@@ -1012,8 +1051,10 @@ impl Compute for MockCompute {
                 // forced close): the leaf runs it as a plain round — one
                 // token, the free draw it already holds — and the set's draw
                 // is what the *next* round returns, the same lag as above.
+                // GitHub #587: so is a lane whose draw the host checks.
                 let length = match (&job.permitted, g.run_lengths.len()) {
                     (Some(_), _) | (None, 0) => 1,
+                    (None, _) if job.checked => 1,
                     (None, n) => g.run_lengths[round % n],
                 };
                 // An explicit stop_after overrides the learned limit; an
@@ -1024,8 +1065,6 @@ impl Compute for MockCompute {
                     .get(&job.request)
                     .copied()
                     .or_else(|| g.limits.get(&job.request).copied().flatten());
-                let eos = g.eos.get(&job.request).cloned().unwrap_or_default();
-                let seed = g.seeds.get(&job.request).copied().unwrap_or(0);
                 let mut run = Vec::new();
                 let mut committed = 0;
                 let mut finish = None;
@@ -1057,7 +1096,7 @@ impl Compute for MockCompute {
                         closed = true;
                         continue;
                     }
-                    if eos.contains(&step) {
+                    if g.is_eos(job.request, step) {
                         // An accepted draft (not the anchor, which the
                         // previous round drew) that is the EOS, with the
                         // block open: cut before it, `</think>` next.
@@ -1070,7 +1109,7 @@ impl Compute for MockCompute {
                         finish = Some(FinishReason::Stop);
                         break;
                     }
-                    run.push(Self::mix(self.seed, job.request, seed, step));
+                    run.push(g.free_token(self.seed, job.request, step));
                 }
                 // The draw this round made is the next step's token.
                 if let Some(close) = job.reasoning_close.filter(|_| !redirected && !closed && finish.is_none()) {
@@ -1100,9 +1139,10 @@ impl Compute for MockCompute {
                     tokens: run,
                     finish,
                     probabilities: Vec::new(),
-                    spec: (!g.run_lengths.is_empty())
+                    spec: (!g.run_lengths.is_empty() && !job.checked)
                         .then(|| SpecCounters::round(length - 1, committed - 1)),
                     reasoning_redirected: redirected,
+                    waiting: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -1120,6 +1160,26 @@ impl Compute for MockCompute {
                 g.kept.remove(&job.request);
             }
         }
+        // GitHub #587: a checked lane that goes on reports the draw its next
+        // round would commit -- a set's held draw, a redirected close, the
+        // EOS, or its free token -- as the leaf reports its pending token.
+        let outcomes = jobs
+            .iter()
+            .zip(outcomes)
+            .map(|(job, outcome)| match job.checked && outcome.finish.is_none() {
+                true => {
+                    let step = g.generated.get(&job.request).copied().unwrap_or(0);
+                    let draw = match (g.pending.get(&job.request), g.redirects.get(&job.request)) {
+                        (Some(held), _) => WaitingDraw::Token(held.token),
+                        (None, Some(&(at, close))) if at == step => WaitingDraw::Token(close),
+                        _ if g.is_eos(job.request, step) => WaitingDraw::Stop,
+                        _ => WaitingDraw::Token(g.free_token(self.seed, job.request, step)),
+                    };
+                    outcome.waiting_on(draw)
+                }
+                false => outcome,
+            })
+            .collect();
         Ok(outcomes)
     }
 
@@ -1565,7 +1625,7 @@ impl MockCompute {
     /// block open, redirected to `close` when that token is an EOS -- held
     /// until the round that emits it. Whether it was.
     fn redirect(state: &mut Inner, request: RequestId, step: u32, close: TokenId) -> bool {
-        let eos = state.eos.get(&request).is_some_and(|steps| steps.contains(&step));
+        let eos = state.is_eos(request, step);
         if eos {
             state.redirects.insert(request, (step, close));
         }
@@ -1800,6 +1860,7 @@ mod tests {
             permitted: None,
             reasoning_close: None,
             anchor_emitted: false,
+            checked: false,
         };
         gated.arm_at(7, 2);
         for _ in 0..2 {
@@ -1830,6 +1891,7 @@ mod tests {
             permitted: None,
             reasoning_close: None,
             anchor_emitted: false,
+            checked: false,
         };
         gated.arm_at(7, 0);
         assert!(!controller.entered(), "nothing has reached the armed step");

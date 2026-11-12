@@ -289,6 +289,29 @@ pub struct DecodeJob {
     /// `remaining_tokens` does not count it: a plain round then emits
     /// nothing, a verify round its accepted drafts.
     pub anchor_emitted: bool,
+    /// The host **checks** the draw this round makes before the next round
+    /// consumes it (GitHub #587, spec #287): the request's answer is held to
+    /// a **grammar** ([`crate::structured`]). The lane runs a plain round --
+    /// one token, no drafts -- so the draw keeps the scores a repair reads,
+    /// and [`DecodeOutcome::waiting`] reports the draw.
+    ///
+    /// A plain round is the rule for now, as a permitted set's is: the
+    /// verify commit whose cut the host decides (#590) lifts it. `false` on
+    /// every other lane, which pays nothing for the field.
+    pub checked: bool,
+}
+
+/// A request's **waiting draw**, as a round reports it for a
+/// [`DecodeJob::checked`] lane (GitHub #587): the token the round drew for
+/// the next one, which the next round consumes as its anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitingDraw {
+    /// An ordinary token.
+    Token(TokenId),
+    /// The model's EOS: the next round would end the request on it. The
+    /// prefill's own reports it the way it always has, as an emitted
+    /// [`FinishReason::Stop`] ([`PrefillOutcome::emitted`]).
+    Stop,
 }
 
 /// One **repair** handed to the compute backend (GitHub #586, spec #287): the
@@ -438,6 +461,12 @@ pub struct DecodeOutcome {
     /// turned into the job's [`DecodeJob::reasoning_close`] (GitHub #315): the
     /// next round's first token is that `</think>`.
     pub reasoning_redirected: bool,
+    /// The round's **waiting draw** (GitHub #587), reported for a
+    /// [`DecodeJob::checked`] lane that goes on running: what the host checks
+    /// before the next round consumes it, and repairs on a miss
+    /// ([`Compute::repair`]). `None` on every other lane, and on an outcome
+    /// that finished the request.
+    pub waiting: Option<WaitingDraw>,
 }
 
 impl DecodeOutcome {
@@ -455,6 +484,7 @@ impl DecodeOutcome {
             finish: None,
             spec: None,
             reasoning_redirected: false,
+            waiting: None,
         }
     }
 
@@ -489,6 +519,15 @@ impl DecodeOutcome {
     pub fn with_spec(self, spec: SpecCounters) -> Self {
         Self {
             spec: Some(spec),
+            ..self
+        }
+    }
+
+    /// The same outcome, reporting `draw` as the round's waiting draw
+    /// (GitHub #587).
+    pub fn waiting_on(self, draw: WaitingDraw) -> Self {
+        Self {
+            waiting: Some(draw),
             ..self
         }
     }
