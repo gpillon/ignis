@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use ignis_core::vision::{MEDIA_ENCODE_POOL_FULL, MediaItem, Multimodal};
 use ignis_core::{
     BlobIdentity, Compute, ComputeError, DecodeJob, DecodeOutcome, DecodeParams, FinishReason,
-    N_DECODE_LANES, PrefillJob, PrefillOutcome, Readout, RequestId, RetainedAt, SpecCounters,
+    N_DECODE_LANES, PrefillJob, PrefillOutcome, Readout, RepairJob, RequestId, RetainedAt, SpecCounters,
     TokenId,
 };
 
@@ -874,6 +874,21 @@ pub trait StepLeaf: Send + Sync + 'static {
         sequences: &mut [&mut Self::Sequence],
         lanes: &[DecodeLane<'_>],
     ) -> Result<Vec<LaneRun>, i32>;
+    /// **Repair** `sequence`'s pending token (GitHub #586, spec #287): drawn
+    /// again under `params` from the scores the call that drew it kept,
+    /// restricted to `permitted`; the result replaces it and is returned.
+    /// The leaf's contract is [`ignis_core::scheduler::Compute::repair`]'s;
+    /// on a refusal `sequence` is left as it was. The default is a leaf that
+    /// keeps no scores (Flash-Next's for now, #581), which refuses.
+    fn repair(
+        &self,
+        _model: &Self::Model,
+        _sequence: &mut Self::Sequence,
+        _params: DecodeParams,
+        _permitted: &ignis_core::constrained::PermittedMask,
+    ) -> Result<TokenId, i32> {
+        Err(-1)
+    }
 
     // ── state transfer (P4-07, GitHub #125, ADR 0024) ────────────────────
 
@@ -2118,6 +2133,24 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             .into_iter()
             .map(|o| o.expect("every job index is filled by one of the branches above"))
             .collect())
+    }
+
+    // GitHub #586 (spec #287): the leaf repairs the request's own sequence.
+    fn repair(&self, job: &RepairJob) -> Result<TokenId, ComputeError> {
+        let mut sequences = self.sequences.lock().unwrap();
+        let Some(sequence) = sequences.get_mut(&job.request) else {
+            return Err(ComputeError::Kernel(-1));
+        };
+        let token = self
+            .model
+            .leaf
+            .repair(self.model.handle(), &mut sequence.handle, job.params, &job.permitted)
+            .map_err(RuntimeError::Leaf)?;
+        drop(sequences);
+        // GitHub #242: a probability held for the draw belongs to a token the
+        // repair replaced; the token that is waiting now has none.
+        self.drawn.lock().unwrap().remove(&job.request);
+        Ok(token)
     }
 
     fn release(&self, request: RequestId) {

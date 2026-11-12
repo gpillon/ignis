@@ -19,7 +19,7 @@ use std::time::Duration;
 use crate::decision::{Readout, argmax, log_sum_exp};
 use crate::scheduler::{
     Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome, DiskSource, DiskTarget,
-    KvRamEvent, KvRamMove, KvRamOutcome, PrefillJob, PrefillOutcome, NO_HOST_ROOM,
+    KvRamEvent, KvRamMove, KvRamOutcome, PrefillJob, PrefillOutcome, RepairJob, NO_HOST_ROOM,
 };
 use crate::types::{ComputeError, FinishReason, RequestId, SpecCounters, TokenId};
 
@@ -119,6 +119,28 @@ struct Inner {
     /// Live moves through KV-RAM a window at a time (GitHub #309), or `None`:
     /// moves in one call, the default.
     ram: Option<FakeRamState>,
+    /// Prefill and decode calls served so far (GitHub #586): the clock the
+    /// kept scores below are stamped with.
+    steps_served: u64,
+    /// The requests whose **waiting draw** kept the scores it came from
+    /// (GitHub #586), each with the call that drew it. The leaf keeps them
+    /// only until a later round or prefill draw writes their column, so the
+    /// mock keeps them only until the next call of either kind: a repair is
+    /// made right after the call that drew, and a scheduler that waited any
+    /// longer fails here before it fails on the card. A prefill's draw (an
+    /// EOS too, which a repair turns into a token) and a plain round's keep
+    /// them; a speculative round's, a redirected draw and a finished
+    /// request keep none.
+    kept: HashMap<RequestId, u64>,
+    /// A waiting draw a **repair** replaced (GitHub #586), per request: the
+    /// step it stands at, the repaired token, which the round committing that
+    /// step commits in place of the draw -- the way `redirects` holds a draw
+    /// the leaf replaced itself -- and the draw it replaced (`None` for an
+    /// EOS), which a second repair of the step ranks first, as the leaf reads
+    /// the scores the draw read.
+    repaired: HashMap<RequestId, (u32, TokenId, Option<TokenId>)>,
+    /// Every repair the mock received, in order.
+    repairs: Vec<RepairJob>,
 }
 
 /// How the mock moves a live sequence through KV-RAM a window at a time
@@ -568,6 +590,12 @@ impl MockCompute {
         self.inner.lock().unwrap().decode_batches.clone()
     }
 
+    /// The repairs the mock received (GitHub #586), in order -- refused ones
+    /// excluded.
+    pub fn repair_calls(&self) -> Vec<RepairJob> {
+        self.inner.lock().unwrap().repairs.clone()
+    }
+
     /// The publishers whose shared prefix the scheduler released (P4-10,
     /// GitHub #126), in order.
     pub fn released_prefixes(&self) -> Vec<RequestId> {
@@ -734,6 +762,9 @@ impl Default for MockCompute {
 impl Compute for MockCompute {
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         let mut g = self.inner.lock().unwrap();
+        // GitHub #586: whatever this call draws, no earlier draw's scores
+        // survive it.
+        g.steps_served += 1;
         if jobs.iter().any(|job| g.prefill_failures.remove(&job.request)) {
             return Err(ComputeError::Kernel(-1));
         }
@@ -751,6 +782,9 @@ impl Compute for MockCompute {
             if job.next_prompt_token.is_some() {
                 continue;
             }
+            // GitHub #586: the draw keeps its scores, unless redirected below.
+            let call = g.steps_served;
+            g.kept.insert(job.request, call);
             let step = g.generated.get(&job.request).copied().unwrap_or(0);
             // GitHub #242: a prefill *draws*, and a run's first token is
             // the one it draws.
@@ -763,6 +797,9 @@ impl Compute for MockCompute {
             // GitHub #315: a free draw of the EOS with the block open.
             if let Some(close) = job.reasoning_close {
                 redirected[index] = Self::redirect(&mut g, job.request, step, close);
+                if redirected[index] {
+                    g.kept.remove(&job.request);
+                }
             }
             let eos = g.eos.get(&job.request).is_some_and(|steps| steps.contains(&step));
             emitted[index] = Some(if let Some(close) = job.reasoning_close.filter(|_| redirected[index]) {
@@ -898,13 +935,53 @@ impl Compute for MockCompute {
     }
 
     fn release(&self, request: RequestId) {
-        self.inner.lock().unwrap().released.push(request);
+        let mut g = self.inner.lock().unwrap();
+        g.released.push(request);
+        // GitHub #586: a released request has nothing left to repair.
+        g.kept.remove(&request);
+        g.repaired.remove(&request);
+    }
+
+    // GitHub #586: the mock's kept scores are a ranking, deterministic by
+    // construction -- the draw itself first, then every id in ascending
+    // order. So a repair returns the draw when the mask permits it (greedy's
+    // masked argmax is the argmax when that is allowed) and the mask's lowest
+    // id otherwise, under any temperature; an EOS draw, which the mock has no
+    // id for, is never permitted. It refuses what the leaf refuses: a request
+    // whose waiting draw kept no scores, or whose scores a later call wrote
+    // over (`Inner::kept`). A constrained run's held draw is replaced too, and
+    // the round that emits it then reports no probability for it, as the
+    // runtime does: the set's share of a token the set did not draw is
+    // nobody's number.
+    fn repair(&self, job: &RepairJob) -> Result<TokenId, ComputeError> {
+        let mut g = self.inner.lock().unwrap();
+        if g.kept.get(&job.request) != Some(&g.steps_served) {
+            return Err(ComputeError::Kernel(-1));
+        }
+        let step = g.generated.get(&job.request).copied().unwrap_or(0);
+        let seed = g.seeds.get(&job.request).copied().unwrap_or(0);
+        // A second repair of the step reads the scores the draw read.
+        let draw = match g.repaired.get(&job.request).filter(|repaired| repaired.0 == step) {
+            Some(&(_, _, drawn)) => drawn,
+            None => match g.pending.remove(&job.request) {
+                Some(held) => Some(held.token),
+                None if g.eos.get(&job.request).is_some_and(|steps| steps.contains(&step)) => None,
+                None => Some(Self::mix(self.seed, job.request, seed, step)),
+            },
+        };
+        let token = match draw.filter(|&token| job.permitted.permits(token)) {
+            Some(token) => token,
+            None => job.permitted.ids().next().expect("a mask permits at least one token"),
+        };
+        g.repaired.insert(job.request, (step, token, draw));
+        g.repairs.push(job.clone());
+        Ok(token)
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
         let mut g = self.inner.lock().unwrap();
         g.decode_batches.push(jobs.to_vec());
-        Ok(jobs
+        let outcomes = jobs
             .iter()
             .map(|job| {
                 // GitHub #242 — a constrained lane, which is a different round
@@ -964,6 +1041,14 @@ impl Compute for MockCompute {
                     }
                     *g.generated.get_mut(&job.request).unwrap() += 1;
                     committed += 1;
+                    // GitHub #586: the token a repair put in place of this
+                    // step's draw -- an EOS's too, which is how an early stop
+                    // is repaired.
+                    if let Some(token) = g.repaired.get(&job.request).filter(|r| r.0 == step).map(|r| r.1) {
+                        g.repaired.remove(&job.request);
+                        run.push(token);
+                        continue;
+                    }
                     // The close an earlier round drew in place of this
                     // step's EOS.
                     if let Some(close) = g.redirects.get(&job.request).filter(|r| r.0 == step).map(|r| r.1) {
@@ -1020,7 +1105,22 @@ impl Compute for MockCompute {
                     reasoning_redirected: redirected,
                 }
             })
-            .collect())
+            .collect::<Vec<_>>();
+        // GitHub #586: the draws this round made keep their scores until the
+        // next call -- a plain round's, that is: a speculative lane's (one
+        // handed no set while the mock commits runs), a redirected one and a
+        // finished request's keep none.
+        g.steps_served += 1;
+        let call = g.steps_served;
+        for (job, outcome) in jobs.iter().zip(&outcomes) {
+            let speculative = outcome.spec.is_some() && job.permitted.is_none();
+            if outcome.finish.is_none() && !outcome.reasoning_redirected && !speculative {
+                g.kept.insert(job.request, call);
+            } else {
+                g.kept.remove(&job.request);
+            }
+        }
+        Ok(outcomes)
     }
 
     // core-06 (P4-07, GitHub #125): the mock holds no real GPU sequence, so
@@ -1617,6 +1717,10 @@ impl Compute for GatedCompute {
             let _ = self.release_rx.lock().unwrap().recv();
         }
         self.inner.decode_step(jobs)
+    }
+
+    fn repair(&self, job: &RepairJob) -> Result<TokenId, ComputeError> {
+        self.inner.repair(job)
     }
 
     fn release(&self, request: RequestId) {

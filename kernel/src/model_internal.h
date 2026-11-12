@@ -555,6 +555,16 @@ struct ignis_model {
   // sampling is one `ninfer::ops::sample` call over every lane, not one call
   // per lane.
   std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_logits;
+  // GitHub #586 (spec #287): the same buffer is where a repair reads the
+  // scores a draw came from (`ignis_kept_scores`, ignis_seq_internal.h): a
+  // plain round leaves each lane's row in its lane column, and a 27B
+  // prefill's draw copies its row into the column of its sequence's slot.
+  // Every write stamps the column with the next epoch, so a sequence whose
+  // column has been written since its draw knows its scores are gone. No
+  // allocation of its own: the rows a round already leaves here are the
+  // scores, and a slot's column is free between the rounds that use it.
+  std::uint64_t kept_epoch = 0;
+  std::array<std::uint64_t, IGNIS_DECODE_MAX_BATCH> kept_column_epochs{};
   // P6-06 (GitHub #242): the round's per-lane permitted token sets, staged
   // like the configs above and at stable addresses for the same reason.
   // `permitted` is I32 [decode_lanes][IGNIS_MAX_PERMITTED_TOKENS],

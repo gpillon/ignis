@@ -51,6 +51,112 @@ pub const MAX_PERMITTED_TOKENS: usize = 32;
 /// carries it, and a step's set is the same handful of digit ids each time.
 pub type PermittedSet = Arc<[TokenId]>;
 
+/// The permitted set's **second form** (GitHub #586, spec #287): a mask over
+/// the whole vocabulary, one bit per logits column, which is what a **repair**
+/// restricts a position to ([`crate::scheduler::Compute::repair`]).
+///
+/// A grammar's permitted set runs to any number of ids — almost the whole
+/// vocabulary inside a free string — so it cannot be a [`PermittedSet`], whose
+/// cap is what lets the leaf stage it in a fixed row. The short form stays for
+/// schedules and forced literals; this one crosses the seam only on a repair.
+/// Either way only a mask goes down, and no logits come up (ADR 0034).
+///
+/// Column `v` is bit `v % 64`, least significant first, of word `v / 64` —
+/// the leaf's layout (`ignis_program_repair`), so the words cross as they
+/// are. A mask is built for one vocabulary and never permits a column past
+/// it, and it permits at least one token: a set that permits nothing is a
+/// grammar that stranded its answer, and is refused here rather than handed
+/// to the leaf to refuse.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PermittedMask {
+    vocab: u32,
+    words: Arc<[u64]>,
+}
+
+impl PermittedMask {
+    /// The mask whose words are `words` over a vocabulary of `vocab` columns,
+    /// or why it is not one: `ceil(vocab / 64)` words, no bit past the
+    /// vocabulary, at least one bit set.
+    pub fn from_words(vocab: u32, words: Vec<u64>) -> Result<Self, String> {
+        let expected = (vocab as usize).div_ceil(64);
+        if words.len() != expected {
+            return Err(format!(
+                "a mask of {} words for a vocabulary of {vocab} columns, which takes {expected}",
+                words.len()
+            ));
+        }
+        let tail = vocab % 64;
+        if tail != 0 && words[expected - 1] >> tail != 0 {
+            return Err(format!("the mask permits a column past the vocabulary of {vocab}"));
+        }
+        if words.iter().all(|&word| word == 0) {
+            return Err("the mask permits no token".to_owned());
+        }
+        Ok(Self {
+            vocab,
+            words: words.into(),
+        })
+    }
+
+    /// The mask permitting exactly `ids` over a vocabulary of `vocab`
+    /// columns, or why it is not one (an id past the vocabulary, or none).
+    pub fn from_ids(vocab: u32, ids: &[TokenId]) -> Result<Self, String> {
+        let mut words = vec![0u64; (vocab as usize).div_ceil(64)];
+        for &id in ids {
+            if id >= vocab {
+                return Err(format!("token {id} is outside the vocabulary of {vocab}"));
+            }
+            words[id as usize / 64] |= 1 << (id % 64);
+        }
+        Self::from_words(vocab, words)
+    }
+
+    /// The vocabulary the mask was built for.
+    pub fn vocab(&self) -> u32 {
+        self.vocab
+    }
+
+    /// The words as the leaf reads them.
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// Whether the mask permits `id`; never an id past its vocabulary.
+    pub fn permits(&self, id: TokenId) -> bool {
+        id < self.vocab && self.words[id as usize / 64] >> (id % 64) & 1 == 1
+    }
+
+    /// The permitted ids, in ascending order.
+    pub fn ids(&self) -> impl Iterator<Item = TokenId> + '_ {
+        self.words.iter().enumerate().flat_map(|(index, &word)| {
+            let mut rest = word;
+            std::iter::from_fn(move || {
+                (rest != 0).then(|| {
+                    let bit = rest.trailing_zeros();
+                    rest &= rest - 1;
+                    index as TokenId * 64 + bit
+                })
+            })
+        })
+    }
+
+    /// How many ids the mask permits.
+    pub fn count(&self) -> usize {
+        self.words.iter().map(|word| word.count_ones() as usize).sum()
+    }
+}
+
+/// A mask's 3,880 words would bury every log line it appears in; its size
+/// says what a reader needs.
+impl std::fmt::Debug for PermittedMask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PermittedMask")
+            .field("vocab", &self.vocab)
+            .field("permitted", &self.count())
+            .finish()
+    }
+}
+
 /// The schedule of permitted sets a **constrained request** generates under:
 /// one set per token it will emit, in order.
 ///
@@ -213,6 +319,39 @@ mod tests {
     #[test]
     fn the_cap_is_the_leafs_cap() {
         assert_eq!(MAX_PERMITTED_TOKENS, crate::step::ffi::MAX_PERMITTED_TOKENS);
+    }
+
+    /// GitHub #586: the second form's layout is the leaf's, bit `v % 64` of
+    /// word `v / 64`, at the edges a word index gets wrong.
+    #[test]
+    fn a_mask_permits_exactly_its_ids_in_the_leafs_layout() {
+        let mask = PermittedMask::from_ids(130, &[0, 63, 64, 129]).expect("four ids inside 130 columns");
+        assert_eq!(mask.words(), &[1 | 1 << 63, 1, 1 << 1]);
+        assert_eq!(mask.ids().collect::<Vec<_>>(), vec![0, 63, 64, 129]);
+        assert_eq!(mask.count(), 4);
+        assert!(mask.permits(64) && !mask.permits(65));
+        assert!(!mask.permits(130) && !mask.permits(TokenId::MAX), "nothing past the vocabulary");
+        assert_eq!(
+            format!("{mask:?}"),
+            "PermittedMask { vocab: 130, permitted: 4 }",
+            "a log line says its size, not its words"
+        );
+        let full = PermittedMask::from_words(128, vec![u64::MAX; 2]).expect("every column");
+        assert_eq!(full.count(), 128);
+    }
+
+    /// GitHub #586: what the leaf would refuse is refused before it gets there.
+    #[test]
+    fn a_mask_refuses_what_the_leaf_would_refuse() {
+        let short = PermittedMask::from_words(130, vec![1, 0]).expect_err("130 columns take 3 words");
+        assert!(short.contains("takes 3"), "{short}");
+        let past = PermittedMask::from_words(130, vec![0, 0, 1 << 2]).expect_err("bit 130 is past the row");
+        assert!(past.contains("past the vocabulary"), "{past}");
+        let none = PermittedMask::from_words(130, vec![0; 3]).expect_err("an empty mask");
+        assert!(none.contains("permits no token"), "{none}");
+        assert!(PermittedMask::from_ids(130, &[]).is_err(), "no ids is an empty mask");
+        let outside = PermittedMask::from_ids(130, &[130]).expect_err("an id past the vocabulary");
+        assert!(outside.contains("outside the vocabulary"), "{outside}");
     }
 
     #[test]

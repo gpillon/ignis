@@ -89,6 +89,19 @@ __global__ void permit_probability_kernel(const __nv_bfloat16 *logits, int32_t v
   out[lane] = (total > 0.0f) ? (own / total) : 0.0f;
 }
 
+/// The second form's mask (GitHub #586): one row, a grid-stride walk of the
+/// vocabulary, one 64-bit word read per column -- consecutive columns read the
+/// same word, which the cache serves.
+__global__ void permit_mask_bits_kernel(__nv_bfloat16 *row, int32_t vocab, const uint64_t *mask) {
+  const int stride = blockDim.x * gridDim.x;
+  for (int v = blockIdx.x * blockDim.x + threadIdx.x; v < vocab; v += stride) {
+    const uint64_t word = mask[v >> 6];
+    if (((word >> (v & 63)) & 1ull) == 0ull) {
+      row[v] = __float2bfloat16(kMasked);
+    }
+  }
+}
+
 int32_t launched(const char *what, cudaStream_t stream) {
   (void)what;
   (void)stream;
@@ -126,4 +139,16 @@ int32_t ignis_permit_probability(const void *logits, int32_t vocab, uint32_t lan
       static_cast<const __nv_bfloat16 *>(logits), vocab, lanes, permitted, counts, max_permitted,
       chosen, out);
   return launched("ignis_permit_probability", stream);
+}
+
+int32_t ignis_permit_mask_bits(void *logits, int32_t vocab, const uint64_t *mask,
+                               cudaStream_t stream) {
+  if (logits == nullptr || mask == nullptr || vocab <= 0) {
+    return -1;
+  }
+  constexpr int kThreads = 256;
+  const int columns = (vocab + kThreads - 1) / kThreads;
+  permit_mask_bits_kernel<<<columns > 512 ? 512 : columns, kThreads, 0, stream>>>(
+      static_cast<__nv_bfloat16 *>(logits), vocab, mask);
+  return launched("ignis_permit_mask_bits", stream);
 }

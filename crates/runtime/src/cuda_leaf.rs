@@ -926,6 +926,20 @@ impl StepLeaf for CudaLeaf {
         sequence.pending_token().map(|token| token as TokenId)
     }
 
+    // GitHub #586 (spec #287): the leaf's repair, under the request's own
+    // sampler.
+    fn repair(
+        &self,
+        model: &Self::Model,
+        sequence: &mut Self::Sequence,
+        params: DecodeParams,
+        permitted: &ignis_core::constrained::PermittedMask,
+    ) -> Result<TokenId, i32> {
+        step::repair_program(&model.model, &model.pool, sequence, sampling_params(params), permitted)
+            .map(|token| token as TokenId)
+            .map_err(|e| leaf_error("repair", e))
+    }
+
     fn decode(
         &self,
         model: &Self::Model,

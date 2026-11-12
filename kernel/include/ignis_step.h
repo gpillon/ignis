@@ -703,6 +703,50 @@ int32_t ignis_program_decode(struct ignis_model *model, struct ignis_seq_pool *p
                              int32_t *out_token_ids,
                              const struct ignis_decode_options *options);
 
+/* GitHub #586 (spec #287): a **repair** of `seq`'s waiting draw -- its
+ * pending token, which the next round consumes and the scheduler has not let
+ * it consume yet. The position is drawn again from the scores the call that
+ * drew it kept, restricted to `permitted_mask`, and the result **replaces**
+ * the waiting draw: the next round consumes it exactly as if it had been
+ * drawn. `*out_token_id` receives it. A check-first caller (a grammar)
+ * checks each draw on the host and repairs only a miss.
+ *
+ * The mask is the permitted set's second form (the short form, at most
+ * IGNIS_MAX_PERMITTED_TOKENS ids, stays for schedules and forced literals and
+ * is refused here): host memory, `ceil(vocab / 64)` 64-bit words, column `v`
+ * permitted when bit `v % 64` (least significant first) of word `v / 64` is
+ * set. A mask that permits nothing, or a column past the vocabulary, is
+ * refused. It only drives columns down; no logits cross this ABI (ADR 0034).
+ *
+ * Which draws keep their scores: a 27B prefill's draw (its row is copied into
+ * the decode logits' column of the sequence's slot, on a slot inside the
+ * load's decode lanes) and a plain round's (its lane column, as the round
+ * left it -- a lane the round masked with a short set keeps the masked row,
+ * so a repair there draws from both sets' meeting). Not a verify round's
+ * draw, nor a redirected one, nor that of a sequence restored, cloned or
+ * claimed since: a repair of those is refused. The scores last until a later
+ * round or prefill draw writes their column, after which a repair is refused
+ * as well -- a caller repairs right after the call that drew, before the
+ * next call on the model. A Flash-Next load refuses every repair (#581).
+ *
+ * `sampling` is the lane's own (`permitted_count` 0, `reasoning_close_id`
+ * -1; stop ids and the budget are unread): greedy takes the mask's argmax
+ * over the kept scores, lower id on a tie. Under a temperature the repair
+ * draws with a random stream of its own (the sampler's RNG keyed by the
+ * draw's position and a repair purpose), so the result follows the model's
+ * distribution restricted to the mask, except for the sampler's top-k cut,
+ * which here falls after the mask; the penalties read the counts the draw
+ * read. Penalty counts stay right: a draw that counted its token has that
+ * count taken back, and the repaired token is counted in its place, so the
+ * position counts once. A second repair of the same position reads the same
+ * scores. On any refusal or error the sequence is left as it was (a CUDA
+ * failure while restoring the counts is named in the message). Returns 0 or
+ * -1 (see ignis_step_last_error). */
+int32_t ignis_program_repair(struct ignis_model *model, struct ignis_seq_pool *pool,
+                             struct ignis_seq *seq, const struct ignis_sampling_params *sampling,
+                             const uint64_t *permitted_mask, uint64_t permitted_mask_words,
+                             int32_t *out_token_id);
+
 /* Read program counters and allocated device footprint. */
 int32_t ignis_program_stats(const struct ignis_model *model,
                             const struct ignis_seq_pool *pool,

@@ -381,6 +381,26 @@ struct ignis_seq_pool {
  * includes this header -- a pointer is all `ignis_seq` needs. */
 struct ignis_seq_prefix;
 
+/* GitHub #586 (spec #287): where the scores a sequence's pending token was
+ * drawn from are kept, so a **repair** (`ignis_program_repair`) can draw that
+ * position again from them. The scores are a column of the 27B model's
+ * `sampling_decode_logits`: the lane column a plain round sampled, or the
+ * column of the sequence's own slot, which a prefill's draw copies its row
+ * into. A column holds them only until the next round, or the next prefill
+ * draw of that slot, writes it, so the model stamps every write with an epoch
+ * (`ignis_model::kept_column_epochs`) and a repair refuses a stamp that moved.
+ *
+ * Host-only and never a section: a sequence restored, claimed or cloned keeps
+ * no scores, and neither does one whose pending token a verify round, a
+ * reasoning redirect or a span that drew nothing assigned -- its pending token
+ * is not the draw those scores were sampled for. */
+struct ignis_kept_scores {
+  std::int32_t column = -1;  /* the column, or -1: no scores kept */
+  std::uint64_t epoch = 0;   /* the column's stamp when the draw was made */
+  std::int32_t position = 0; /* the logical position the draw was keyed at */
+  bool counted = false;      /* the draw added one to its token's penalty count */
+};
+
 struct ignis_seq {
   /* This sequence's OWN KV pages: the tail it writes itself. A sequence
    * holding a shared prefix does not own its leading pages, so this
@@ -409,6 +429,8 @@ struct ignis_seq {
   // consumes the complete prompt and computes this greedy successor; decode
   // returns it while consuming it to prepare the following round.
   std::int32_t pending_token = -1;
+  // GitHub #586: where the scores `pending_token` was drawn from are kept.
+  ignis_kept_scores kept;
   // One program-wide frontier, distinct from the per-GQA cache frontiers
   // above.  It pins span prefill's start_position contract even for GDN-only
   // prefixes.

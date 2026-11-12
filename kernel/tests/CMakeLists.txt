@@ -556,6 +556,16 @@ add_executable(ignis_kernel_dflash2_topk_test test_dflash2_topk.cu)
 target_link_libraries(ignis_kernel_dflash2_topk_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_dflash2_topk_test COMMAND ignis_kernel_dflash2_topk_test)
 
+# GitHub #586 (spec #287): OURS -- the permitted set's second form, the mask
+# over the whole vocabulary a repair restricts a position to
+# (kernel/src/permitted_tokens.h, leaf-internal). Bit-exact against the host
+# walking the same bits. Not sm120a-only; no SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_permit_mask_bits_test test_permit_mask_bits.cu)
+target_include_directories(ignis_kernel_permit_mask_bits_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_permit_mask_bits_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_permit_mask_bits_test COMMAND ignis_kernel_permit_mask_bits_test)
+
 # GitHub #507: OURS, an adapted op -- the GDN prefill's split conv (kernel/src/gdn_conv_split.h,
 # leaf-internal) against what the layer body ran before it, the vendored causal conv and the three
 # strided copies that split its plane, at every form the vendored wrapper switches between and the

@@ -101,6 +101,9 @@ struct Calls {
     /// GitHub #260: the leaf cannot read the keys while set — it leaves the
     /// readout unread, as a real leaf does on a route that materialized none.
     attention_unreadable: bool,
+    /// GitHub #586: each repair the leaf was asked for -- its sampler and the
+    /// ids its mask permits -- in order.
+    repairs: Vec<(DecodeParams, Vec<u32>)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -576,6 +579,21 @@ impl StepLeaf for StubLeaf {
         })
     }
 
+    /// GitHub #586: the stub records the repair and answers the mask's lowest
+    /// id -- what reached it is the claim, not what a real leaf would draw.
+    fn repair(
+        &self,
+        _model: &Self::Model,
+        _sequence: &mut Self::Sequence,
+        params: DecodeParams,
+        permitted: &ignis_core::constrained::PermittedMask,
+    ) -> Result<u32, i32> {
+        let ids: Vec<u32> = permitted.ids().collect();
+        let lowest = ids[0];
+        self.calls.lock().unwrap().repairs.push((params, ids));
+        Ok(lowest)
+    }
+
     fn pending_token(&self, _sequence: &Self::Sequence) -> Option<u32> {
         if !self.calls.lock().unwrap().pending_reported {
             return None;
@@ -840,6 +858,38 @@ fn the_adapter_holds_a_constrained_draw_for_the_round_that_emits_it() {
         vec![vec![vec![3, 4, 5]], vec![Vec::<u32>::new()], vec![Vec::<u32>::new()]],
         "and each round carried its own step's set, not the one before it"
     );
+}
+
+/// GitHub #586 (spec #287): a repair reaches the request's own sequence with
+/// the request's sampler and its mask, and the probability the adapter held
+/// for the draw goes with the draw -- the token waiting now was not drawn
+/// under the set that number describes. A request with no sequence is
+/// refused before the leaf is asked.
+#[test]
+fn a_repair_reaches_the_requests_own_sequence_and_drops_the_draws_probability() {
+    let leaf = Arc::new(StubLeaf::with_tokens([11, 12]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    let digits: ignis_core::constrained::PermittedSet = vec![3, 4, 5].into();
+    compute
+        .prefill_step(&[PrefillJob { permitted: Some(digits), ..prefill(1, Some(8)) }])
+        .unwrap();
+
+    let params = DecodeParams { temperature: 0.7, seed: 586, ..DecodeParams::default() };
+    let mask = ignis_core::constrained::PermittedMask::from_ids(STUB_VOCAB, &[9, 2]).unwrap();
+    let repair = |request| ignis_core::RepairJob { request, params, permitted: mask.clone() };
+    assert_eq!(compute.repair(&repair(1)), Ok(2), "the leaf's answer comes back");
+    assert_eq!(leaf.calls.lock().unwrap().repairs, vec![(params, vec![2, 9])]);
+
+    let first = compute.decode_step(&[job(1, DecodeParams::default(), 8)]).unwrap().remove(0);
+    assert!(
+        first.probabilities.is_empty(),
+        "the held probability described the draw the repair replaced: {:?}",
+        first.probabilities
+    );
+
+    assert_eq!(compute.repair(&repair(2)), Err(ComputeError::Kernel(-1)), "no sequence, no repair");
+    assert_eq!(leaf.calls.lock().unwrap().repairs.len(), 1, "and the leaf was not asked");
 }
 
 /// GitHub #286: the round after a forced run's last set carries none, so a
