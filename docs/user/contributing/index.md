@@ -39,6 +39,7 @@ them.
 | `crates/runtime` | The safe wrapper over the kernel leaf's step ABI, and the scheduler's compute adapter |
 | `crates/artifact` | The `.ninfer` container reader; its build script builds the kernel leaf for `--features cuda` |
 | `crates/logging` | The structured-logging event model |
+| `crates/grammar` | `ignis-grammar`: structured output's grammar, pure Rust: `json_object` and JSON schemas compiled to an automaton over the vocabulary's bytes, which checks each sampled token and gives the permitted set a repair samples from |
 | `crates/speech` | `ignis-speech`: the speech model's CPU executor (Qwen3-ASR), pure Rust: the GGUF reader, the quantized AVX2 kernels, the encoder and decoder graphs, the mel front end and the incremental transcription API; and `server_vad`'s voice activity detection, Silero VAD ported, its weights built in |
 | `crates/bench` | `ignis-bench`: the trace-replay harness, the canary suite, TTFT and gate measurements |
 | `crates/vendor` | The kernel-leaf vendoring tool, and the integrity check of the vendored subtree |

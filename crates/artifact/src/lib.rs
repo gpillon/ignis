@@ -67,7 +67,7 @@ pub use kv_budget::{paged_kv_page_budget, PagedKvBudget, PagedKvPlane};
 pub use frontend::{
     ChatMessage, ChatRenderOptions, ChatTemplate, ContentPart, DecodeStreamState,
     FRONTEND_RESOURCES, FrontendSet,
-    MessageContent, ReasoningEffort, Role, ThinkingCapabilities, ToolCall, Tokenizer,
+    MessageContent, ReasoningEffort, Role, ThinkingCapabilities, ToolCall, TokenBytes, Tokenizer,
 };
 pub use writer::{directory_json, ContainerWriter, WriterState};
 pub use materializer::{materialize, MaterializationStats, MaterializedArtifact, TensorView};

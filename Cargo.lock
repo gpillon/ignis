@@ -1117,6 +1117,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignis-grammar"
+version = "0.10.0"
+dependencies = [
+ "ignis-artifact",
+ "regex-automata",
+ "serde_json",
+]
+
+[[package]]
 name = "ignis-logging"
 version = "0.10.0"
 dependencies = [

@@ -1,0 +1,416 @@
+[
+  {
+    "name": "novel_record",
+    "kind": "json_object",
+    "prompt": "A library is cataloguing Moby-Dick. Reply with a JSON object holding title, author (itself an object with first and last), first_published (the year, as a number) and public_domain (a boolean).",
+    "reference": {"title": {"$contains": "Moby"}, "author": {"last": "Melville"}, "first_published": 1851, "public_domain": true},
+    "valid": [
+      {"title": "Moby-Dick; or, The Whale", "author": {"first": "Herman", "last": "Melville"}, "first_published": 1851, "public_domain": true},
+      {"title": "Les Misérables", "author": {"first": "Victor", "last": "Hugo"}, "first_published": 1.862e3, "public_domain": true, "shelf": {}, "tags": [], "remarks": [null, "a \"quoted\" word and a back\\slash",-0.25, false, {"volumes": [1, 2, 3, 4, 5]}]}
+    ],
+    "invalid": [],
+    "invalid_text": ["\"Moby-Dick\"", "{\"title\": \"Moby-Dick\" \"first_published\": 1851}", "{\"first_published\": 1851.}", "{\"first_published\": +1851}", "{\"public_domain\": True}", "{\"title\": \"Moby\tDick\"}", "{\"author\": {\"last\": \"Melville\"}"]
+  },
+  {
+    "name": "calendar_event",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "name": {"type": "string"}, "date": {"type": "string", "format": "date"},
+      "participants": {"type": "array", "items": {"type": "string"}}},
+      "required": ["name", "date", "participants"], "additionalProperties": false},
+    "prompt": "Alice and Bob are going to a science fair on Friday, 2026-11-20. Extract the event.",
+    "reference": {"date": "2026-11-20", "participants": {"$len": 2}},
+    "valid": [
+      {"name": "Science fair", "date": "2026-11-20", "participants": ["Alice", "Bob"]},
+      {"name": "Leap day", "date": "2028-02-29", "participants": []}
+    ],
+    "invalid": [
+      {"name": "Science fair", "date": "2026-02-30", "participants": ["Alice"]},
+      {"name": "Science fair", "date": "20 November 2026", "participants": ["Alice"]},
+      {"name": "Science fair", "date": "2026-11-20", "participants": "Alice"}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "math_reasoning",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "steps": {"type": "array", "items": {"type": "object", "properties": {
+        "explanation": {"type": "string"}, "output": {"type": "string"}},
+        "required": ["explanation", "output"], "additionalProperties": false}},
+      "final_answer": {"type": "string"}},
+      "required": ["steps", "final_answer"], "additionalProperties": false},
+    "prompt": "Solve 8x + 7 = -23 step by step.",
+    "reference": {"final_answer": {"$any_contains": ["-15/4", "-3.75", "−15/4", "-\\frac{15}{4}"]}},
+    "valid": [
+      {"steps": [{"explanation": "Subtract 7 from both sides.", "output": "8x = -30"}, {"explanation": "Divide by 8.", "output": "x = -30/8 = -15/4"}], "final_answer": "x = -15/4"}
+    ],
+    "invalid": [
+      {"steps": [{"explanation": "Subtract 7.", "result": "8x = -30"}], "final_answer": "-15/4"},
+      {"steps": [], "final_answer": -3.75}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "sentiment",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "sentiment": {"type": "string", "enum": ["positive", "negative", "neutral"]},
+      "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+      "keywords": {"type": "array", "maxItems": 5, "items": {"type": "string"}}},
+      "required": ["sentiment", "confidence", "keywords"], "additionalProperties": false},
+    "prompt": "Classify the sentiment of this review: \"The battery died after two days and support never answered. Terrible.\"",
+    "reference": {"sentiment": "negative"},
+    "valid": [
+      {"sentiment": "negative", "confidence": 0.97, "keywords": ["battery", "support", "terrible"]},
+      {"sentiment": "neutral", "confidence": 1, "keywords": []},
+      {"sentiment": "positive", "confidence": 0, "keywords": ["a", "b", "c", "d", "e"]}
+    ],
+    "invalid": [
+      {"sentiment": "mixed", "confidence": 0.5, "keywords": []},
+      {"sentiment": "negative", "confidence": 1.2, "keywords": []},
+      {"sentiment": "negative", "confidence": -0.1, "keywords": []},
+      {"sentiment": "negative", "confidence": 0.5, "keywords": ["a", "b", "c", "d", "e", "f"]}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "user_profile",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "name": {"type": "string"}, "email": {"type": "string", "format": "email"},
+      "age": {"type": "integer", "minimum": 0, "maximum": 150},
+      "website": {"type": ["string", "null"]}, "id": {"type": "string", "format": "uuid"}},
+      "required": ["name", "email", "age", "website", "id"], "additionalProperties": false},
+    "prompt": "Create a user profile for Jane Doe, 34 years old, email jane.doe@example.com, no website, with id 3f2b8c1e-9d4a-4e6f-8b2a-1c3d5e7f9a0b.",
+    "reference": {"name": "Jane Doe", "email": "jane.doe@example.com", "age": 34, "website": null, "id": "3f2b8c1e-9d4a-4e6f-8b2a-1c3d5e7f9a0b"},
+    "valid": [
+      {"name": "Jane Doe", "email": "jane.doe@example.com", "age": 34, "website": null, "id": "3f2b8c1e-9d4a-4e6f-8b2a-1c3d5e7f9a0b"},
+      {"name": "Zoë", "email": "z+tag@mail.example.org", "age": 150, "website": "https://example.org/~zoe", "id": "00000000-0000-0000-0000-000000000000"}
+    ],
+    "invalid": [
+      {"name": "Jane", "email": "jane.doe", "age": 34, "website": null, "id": "3f2b8c1e-9d4a-4e6f-8b2a-1c3d5e7f9a0b"},
+      {"name": "Jane", "email": "jane@example.com", "age": 151, "website": null, "id": "3f2b8c1e-9d4a-4e6f-8b2a-1c3d5e7f9a0b"},
+      {"name": "Jane", "email": "jane@example.com", "age": 34, "website": null, "id": "3f2b8c1e9d4a4e6f8b2a1c3d5e7f9a0b"},
+      {"name": "Jane", "email": "jane@example.com", "age": 34, "id": "3f2b8c1e-9d4a-4e6f-8b2a-1c3d5e7f9a0b"}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "file_tree",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {"root": {"$ref": "#/$defs/node"}}, "required": ["root"], "additionalProperties": false,
+      "$defs": {"node": {"type": "object", "properties": {
+        "name": {"type": "string"}, "kind": {"type": "string", "enum": ["file", "folder"]},
+        "children": {"type": "array", "items": {"$ref": "#/$defs/node"}}},
+        "required": ["name", "kind", "children"], "additionalProperties": false}}},
+    "prompt": "Represent this file system as a tree: a folder named src that contains a file main.rs and a folder util, which contains a file math.rs.",
+    "reference": {"root": {"name": "src", "kind": "folder", "children": {"$len": 2}}},
+    "valid": [
+      {"root": {"name": "src", "kind": "folder", "children": [{"name": "main.rs", "kind": "file", "children": []}, {"name": "util", "kind": "folder", "children": [{"name": "math.rs", "kind": "file", "children": []}]}]}}
+    ],
+    "invalid": [
+      {"root": {"name": "src", "kind": "folder", "children": [{"name": "main.rs", "kind": "file"}]}},
+      {"root": {"name": "src", "kind": "directory", "children": []}}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "ui_component",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "type": {"type": "string", "enum": ["div", "button", "header", "section", "field", "form"]},
+      "label": {"type": "string"},
+      "children": {"type": "array", "items": {"$ref": "#"}},
+      "attributes": {"type": "array", "items": {"type": "object", "properties": {
+        "name": {"type": "string"}, "value": {"type": "string"}}, "required": ["name", "value"], "additionalProperties": false}}},
+      "required": ["type", "label", "children", "attributes"], "additionalProperties": false},
+    "prompt": "Make a UI for a login form with a username field, a password field and a submit button.",
+    "reference": {"type": "form"},
+    "valid": [
+      {"type": "form", "label": "Login", "children": [{"type": "field", "label": "Username", "children": [], "attributes": [{"name": "type", "value": "text"}]}, {"type": "field", "label": "Password", "children": [], "attributes": [{"name": "type", "value": "password"}]}, {"type": "button", "label": "Submit", "children": [], "attributes": []}], "attributes": []}
+    ],
+    "invalid": [
+      {"type": "input", "label": "Login", "children": [], "attributes": []},
+      {"type": "form", "label": "Login", "children": [{"type": "button", "label": "Go"}], "attributes": []}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "catalogue_item",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "item": {"anyOf": [
+        {"type": "object", "properties": {"kind": {"type": "string", "const": "book"}, "title": {"type": "string"}, "author": {"type": "string"}}, "required": ["kind", "title", "author"], "additionalProperties": false},
+        {"type": "object", "properties": {"kind": {"type": "string", "const": "film"}, "title": {"type": "string"}, "director": {"type": "string"}, "year": {"type": "integer", "minimum": 1888, "maximum": 2100}}, "required": ["kind", "title", "director", "year"], "additionalProperties": false}]}},
+      "required": ["item"], "additionalProperties": false},
+    "prompt": "Describe the 1927 film Metropolis by Fritz Lang as a catalogue item.",
+    "reference": {"item": {"kind": "film", "year": 1927, "director": "Fritz Lang"}},
+    "valid": [
+      {"item": {"kind": "film", "title": "Metropolis", "director": "Fritz Lang", "year": 1927}},
+      {"item": {"kind": "book", "title": "Frankenstein", "author": "Mary Shelley"}}
+    ],
+    "invalid": [
+      {"item": {"kind": "film", "title": "Metropolis", "author": "Fritz Lang"}},
+      {"item": {"kind": "film", "title": "Metropolis", "director": "Fritz Lang", "year": 1800}},
+      {"item": {"kind": "song", "title": "x", "author": "y"}}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "weather_report",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "location": {"type": "string"},
+      "temperature_c": {"type": "number", "minimum": -90, "maximum": 60},
+      "conditions": {"type": "string", "enum": ["sunny", "cloudy", "rain", "snow", "storm", "fog"]},
+      "forecast": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "object", "properties": {
+        "day": {"type": "string", "format": "date"}, "high_c": {"type": "number"}, "low_c": {"type": "number"}},
+        "required": ["day", "high_c", "low_c"], "additionalProperties": false}}},
+      "required": ["location", "temperature_c", "conditions", "forecast"], "additionalProperties": false},
+    "prompt": "Give a plausible weather report for Oslo on 2026-01-15, with a three-day forecast starting that day.",
+    "reference": {"location": {"$contains": "Oslo"}, "forecast": {"$len": 3}},
+    "valid": [
+      {"location": "Oslo", "temperature_c": -6.5, "conditions": "snow", "forecast": [{"day": "2026-01-15", "high_c": -4, "low_c": -9}, {"day": "2026-01-16", "high_c": -2, "low_c": -7.5}, {"day": "2026-01-17", "high_c": 0, "low_c": -5}]}
+    ],
+    "invalid": [
+      {"location": "Oslo", "temperature_c": -95, "conditions": "snow", "forecast": [{"day": "2026-01-15", "high_c": -4, "low_c": -9}, {"day": "2026-01-16", "high_c": -2, "low_c": -7}, {"day": "2026-01-17", "high_c": 0, "low_c": -5}]},
+      {"location": "Oslo", "temperature_c": -6, "conditions": "snow", "forecast": [{"day": "2026-01-15", "high_c": -4, "low_c": -9}]},
+      {"location": "Oslo", "temperature_c": -6, "conditions": "blizzard", "forecast": [{"day": "2026-01-15", "high_c": -4, "low_c": -9}, {"day": "2026-01-16", "high_c": -2, "low_c": -7}, {"day": "2026-01-17", "high_c": 0, "low_c": -5}]}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "support_ticket",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "ticket_id": {"type": "string", "pattern": "^TCK-[0-9]{6}$"},
+      "priority": {"type": "string", "enum": ["low", "medium", "high", "urgent"]},
+      "category": {"type": "string", "enum": ["billing", "technical", "account", "other"]},
+      "summary": {"type": "string"},
+      "customer_email": {"type": ["string", "null"], "format": "email"},
+      "created_at": {"type": "string", "format": "date-time"}},
+      "required": ["ticket_id", "priority", "category", "summary", "customer_email", "created_at"], "additionalProperties": false},
+    "prompt": "Open ticket TCK-004211 for this message, received 2026-11-12T09:30:00Z from luca@example.org: \"I was charged twice for my November subscription.\"",
+    "reference": {"ticket_id": "TCK-004211", "category": "billing", "customer_email": "luca@example.org", "created_at": "2026-11-12T09:30:00Z"},
+    "valid": [
+      {"ticket_id": "TCK-004211", "priority": "high", "category": "billing", "summary": "Charged twice for the November subscription.", "customer_email": "luca@example.org", "created_at": "2026-11-12T09:30:00Z"},
+      {"ticket_id": "TCK-000001", "priority": "low", "category": "other", "summary": "", "customer_email": null, "created_at": "2026-11-12T09:30:00.123+01:00"}
+    ],
+    "invalid": [
+      {"ticket_id": "TCK-4211", "priority": "high", "category": "billing", "summary": "x", "customer_email": null, "created_at": "2026-11-12T09:30:00Z"},
+      {"ticket_id": "TCK-004211", "priority": "critical", "category": "billing", "summary": "x", "customer_email": null, "created_at": "2026-11-12T09:30:00Z"},
+      {"ticket_id": "TCK-004211", "priority": "high", "category": "billing", "summary": "x", "customer_email": "luca", "created_at": "2026-11-12T09:30:00Z"},
+      {"ticket_id": "TCK-004211", "priority": "high", "category": "billing", "summary": "x", "customer_email": null, "created_at": "2026-11-12 09:30"}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "server_inventory",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "servers": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {
+        "hostname": {"type": "string", "format": "hostname"},
+        "ipv4": {"type": "string", "format": "ipv4"},
+        "ipv6": {"type": ["string", "null"], "format": "ipv6"},
+        "cpu_cores": {"type": "integer", "minimum": 1, "maximum": 256},
+        "memory_gb": {"type": "number", "minimum": 0.5, "multipleOf": 0.5}},
+        "required": ["hostname", "ipv4", "ipv6", "cpu_cores", "memory_gb"], "additionalProperties": false}}},
+      "required": ["servers"], "additionalProperties": false},
+    "prompt": "List these servers: web-01.example.com at 10.0.0.11 with 8 cores and 32 GB of memory; db-01.example.com at 10.0.0.21, IPv6 2001:db8::21, with 16 cores and 128 GB.",
+    "reference": {"servers": {"$len": 2}},
+    "valid": [
+      {"servers": [{"hostname": "web-01.example.com", "ipv4": "10.0.0.11", "ipv6": null, "cpu_cores": 8, "memory_gb": 32}, {"hostname": "db-01.example.com", "ipv4": "10.0.0.21", "ipv6": "2001:db8::21", "cpu_cores": 16, "memory_gb": 128.0}]},
+      {"servers": [{"hostname": "a", "ipv4": "255.255.255.255", "ipv6": "::1", "cpu_cores": 256, "memory_gb": 0.5}]}
+    ],
+    "invalid": [
+      {"servers": [{"hostname": "web-01.example.com", "ipv4": "10.0.0.256", "ipv6": null, "cpu_cores": 8, "memory_gb": 32}]},
+      {"servers": [{"hostname": "web-01.example.com", "ipv4": "10.0.0.11", "ipv6": null, "cpu_cores": 0, "memory_gb": 32}]},
+      {"servers": [{"hostname": "web-01.example.com", "ipv4": "10.0.0.11", "ipv6": null, "cpu_cores": 8, "memory_gb": 32.3}]},
+      {"servers": [{"hostname": "web_01!", "ipv4": "10.0.0.11", "ipv6": null, "cpu_cores": 8, "memory_gb": 32}]},
+      {"servers": [{"hostname": "web-01", "ipv4": "10.0.0.11", "ipv6": "2001:db8:::21", "cpu_cores": 8, "memory_gb": 32}]}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "meeting_notes",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "title": {"type": "string"},
+      "attendees": {"type": "array", "items": {"type": "object", "properties": {
+        "name": {"type": "string"}, "role": {"type": ["string", "null"]}}, "required": ["name", "role"], "additionalProperties": false}},
+      "decisions": {"type": "array", "items": {"type": "string"}},
+      "action_items": {"type": "array", "items": {"type": "object", "properties": {
+        "owner": {"type": "string"}, "task": {"type": "string"}, "due": {"type": ["string", "null"], "format": "date"}},
+        "required": ["owner", "task", "due"], "additionalProperties": false}},
+      "duration": {"type": "string", "format": "duration"}},
+      "required": ["title", "attendees", "decisions", "action_items", "duration"], "additionalProperties": false},
+    "prompt": "Write notes for this meeting: a 45-minute planning meeting with Ana (product lead) and Ben. They decided to ship version 2 in March. Ben will write the release plan by 2026-12-05.",
+    "reference": {"duration": "PT45M", "attendees": {"$len": 2}},
+    "valid": [
+      {"title": "Planning", "attendees": [{"name": "Ana", "role": "product lead"}, {"name": "Ben", "role": null}], "decisions": ["Ship version 2 in March."], "action_items": [{"owner": "Ben", "task": "Write the release plan", "due": "2026-12-05"}], "duration": "PT45M"},
+      {"title": "Long one", "attendees": [], "decisions": [], "action_items": [], "duration": "P1DT2H30M5S"}
+    ],
+    "invalid": [
+      {"title": "Planning", "attendees": [], "decisions": [], "action_items": [], "duration": "45 minutes"},
+      {"title": "Planning", "attendees": [], "decisions": [], "action_items": [{"owner": "Ben", "task": "x", "due": "next week"}], "duration": "PT45M"},
+      {"title": "Planning", "attendees": [{"name": "Ana"}], "decisions": [], "action_items": [], "duration": "PT45M"}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "product_listing",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "sku": {"type": "string", "pattern": "^[A-Z]{3}-\\d{4}$"},
+      "name": {"type": "string"},
+      "price": {"type": "number", "exclusiveMinimum": 0},
+      "currency": {"type": "string", "enum": ["USD", "EUR", "JPY"]},
+      "tags": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "string"}},
+      "in_stock": {"type": "boolean"},
+      "rating": {"type": ["number", "null"], "minimum": 0, "maximum": 5}},
+      "required": ["sku", "name", "price", "currency", "tags", "in_stock", "rating"], "additionalProperties": false},
+    "prompt": "Create a product listing for a stainless steel water bottle, SKU BTL-0750, priced 24.90 euros, in stock, not yet rated.",
+    "reference": {"sku": "BTL-0750", "price": 24.9, "currency": "EUR", "in_stock": true, "rating": null},
+    "valid": [
+      {"sku": "BTL-0750", "name": "Stainless steel water bottle 750 ml", "price": 24.9, "currency": "EUR", "tags": ["bottle", "steel"], "in_stock": true, "rating": null},
+      {"sku": "ABC-0001", "name": "x", "price": 0.01, "currency": "JPY", "tags": ["a"], "in_stock": false, "rating": 5}
+    ],
+    "invalid": [
+      {"sku": "BTL-75", "name": "x", "price": 24.9, "currency": "EUR", "tags": ["a"], "in_stock": true, "rating": null},
+      {"sku": "BTL-0750", "name": "x", "price": 0, "currency": "EUR", "tags": ["a"], "in_stock": true, "rating": null},
+      {"sku": "BTL-0750", "name": "x", "price": 24.9, "currency": "GBP", "tags": ["a"], "in_stock": true, "rating": null},
+      {"sku": "BTL-0750", "name": "x", "price": 24.9, "currency": "EUR", "tags": [], "in_stock": true, "rating": null},
+      {"sku": "BTL-0750", "name": "x", "price": 24.9, "currency": "EUR", "tags": ["a"], "in_stock": "yes", "rating": null},
+      {"sku": "BTL-0750", "name": "x", "price": 24.9, "currency": "EUR", "tags": ["a"], "in_stock": true, "rating": 5.5}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "entity_extraction",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "entities": {"type": "array", "items": {"type": "object", "properties": {
+        "text": {"type": "string"}, "type": {"type": "string", "enum": ["PERSON", "ORG", "LOCATION", "DATE"]},
+        "start": {"type": "integer", "minimum": 0}, "end": {"type": "integer", "minimum": 0}},
+        "required": ["text", "type", "start", "end"], "additionalProperties": false}}},
+      "required": ["entities"], "additionalProperties": false},
+    "prompt": "Extract the named entities, with character offsets, from: \"Marie Curie moved to Paris in 1891 and later taught at the University of Paris.\"",
+    "reference": {"entities": {"$min_len": 3}},
+    "valid": [
+      {"entities": [{"text": "Marie Curie", "type": "PERSON", "start": 0, "end": 11}, {"text": "Paris", "type": "LOCATION", "start": 21, "end": 26}, {"text": "1891", "type": "DATE", "start": 30, "end": 34}, {"text": "University of Paris", "type": "ORG", "start": 59, "end": 78}]}
+    ],
+    "invalid": [
+      {"entities": [{"text": "Marie Curie", "type": "PER", "start": 0, "end": 11}]},
+      {"entities": [{"text": "Marie Curie", "type": "PERSON", "start": -1, "end": 11}]}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "issue_triage",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "label": {"type": "string", "enum": ["bug", "feature", "question"]},
+      "reason": {"type": "string"},
+      "alternative": {"anyOf": [
+        {"type": "object", "properties": {"label": {"type": "string", "enum": ["bug", "feature", "question"]}, "score": {"type": "number", "minimum": 0, "maximum": 1}}, "required": ["label", "score"], "additionalProperties": false},
+        {"type": "null"}]}},
+      "required": ["label", "reason", "alternative"], "additionalProperties": false},
+    "prompt": "Triage this issue: \"The app crashes when I upload a 2 GB file.\"",
+    "reference": {"label": "bug"},
+    "valid": [
+      {"label": "bug", "reason": "A crash on upload is a defect.", "alternative": null},
+      {"label": "question", "reason": "x", "alternative": {"label": "feature", "score": 0.25}}
+    ],
+    "invalid": [
+      {"label": "bug", "reason": "x", "alternative": {"label": "feature"}},
+      {"label": "bug", "reason": "x", "alternative": "none"},
+      {"label": "crash", "reason": "x", "alternative": null}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "recipe",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "title": {"type": "string"},
+      "servings": {"type": "integer", "minimum": 1, "maximum": 20},
+      "ingredients": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {
+        "name": {"type": "string"}, "amount": {"type": "number", "exclusiveMinimum": 0},
+        "unit": {"type": "string", "enum": ["g", "kg", "ml", "l", "tsp", "tbsp", "cup", "piece"]}},
+        "required": ["name", "amount", "unit"], "additionalProperties": false}},
+      "steps": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+      "vegetarian": {"type": "boolean"}},
+      "required": ["title", "servings", "ingredients", "steps", "vegetarian"], "additionalProperties": false},
+    "prompt": "Give me a simple recipe for pancakes for 4 people.",
+    "reference": {"servings": 4, "vegetarian": true},
+    "valid": [
+      {"title": "Pancakes", "servings": 4, "ingredients": [{"name": "flour", "amount": 250, "unit": "g"}, {"name": "milk", "amount": 500, "unit": "ml"}, {"name": "eggs", "amount": 2, "unit": "piece"}, {"name": "sugar", "amount": 1.5, "unit": "tbsp"}], "steps": ["Whisk everything.", "Cook on a hot pan."], "vegetarian": true}
+    ],
+    "invalid": [
+      {"title": "Pancakes", "servings": 0, "ingredients": [{"name": "flour", "amount": 250, "unit": "g"}], "steps": ["x"], "vegetarian": true},
+      {"title": "Pancakes", "servings": 4, "ingredients": [{"name": "flour", "amount": 0, "unit": "g"}], "steps": ["x"], "vegetarian": true},
+      {"title": "Pancakes", "servings": 4, "ingredients": [{"name": "flour", "amount": 2, "unit": "cups"}], "steps": ["x"], "vegetarian": true}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "inner_planets",
+    "kind": "json_object",
+    "prompt": "List the four inner planets of the solar system as a JSON object that maps each planet's name to its number of moons.",
+    "reference": {"Mercury": 0, "Venus": 0, "Earth": 1, "Mars": 2},
+    "valid": [
+      {"Mercury": 0, "Venus": 0, "Earth": 1, "Mars": 2}
+    ],
+    "invalid": [],
+    "invalid_text": ["{\"Mercury\": 0, \"Venus\": 0,, \"Earth\": 1}", "{Mercury: 0}"]
+  },
+  {
+    "name": "invoice",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "invoice_number": {"type": "string", "pattern": "^INV-\\d{4}-\\d{3}$"},
+      "issue_date": {"type": "string", "format": "date"},
+      "lines": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {
+        "description": {"type": "string"}, "quantity": {"type": "integer", "minimum": 1},
+        "unit_price": {"type": "number", "minimum": 0, "multipleOf": 0.01}},
+        "required": ["description", "quantity", "unit_price"], "additionalProperties": false}},
+      "total": {"type": "number", "minimum": 0, "multipleOf": 0.01},
+      "paid": {"type": "boolean"}},
+      "required": ["invoice_number", "issue_date", "lines", "total", "paid"], "additionalProperties": false},
+    "prompt": "Make invoice INV-2026-017, dated 2026-11-10, for 2 hours of consulting at 95.00 per hour and one travel fee of 40.50. It is not paid yet.",
+    "reference": {"invoice_number": "INV-2026-017", "issue_date": "2026-11-10", "total": 230.5, "paid": false, "lines": {"$len": 2}},
+    "valid": [
+      {"invoice_number": "INV-2026-017", "issue_date": "2026-11-10", "lines": [{"description": "Consulting (hours)", "quantity": 2, "unit_price": 95.0}, {"description": "Travel fee", "quantity": 1, "unit_price": 40.5}], "total": 230.5, "paid": false}
+    ],
+    "invalid": [
+      {"invoice_number": "INV-26-017", "issue_date": "2026-11-10", "lines": [{"description": "x", "quantity": 1, "unit_price": 1}], "total": 1, "paid": false},
+      {"invoice_number": "INV-2026-017", "issue_date": "2026-11-10", "lines": [{"description": "x", "quantity": 1, "unit_price": 1.005}], "total": 1, "paid": false},
+      {"invoice_number": "INV-2026-017", "issue_date": "2026-11-10", "lines": [{"description": "x", "quantity": 1, "unit_price": 1}], "total": -1, "paid": false}
+    ],
+    "invalid_text": []
+  },
+  {
+    "name": "task_list",
+    "kind": "json_schema",
+    "schema": {"type": "object", "properties": {
+      "tasks": {"type": "array", "items": {"type": "object", "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "title": {"type": "string"},
+        "status": {"type": "string", "enum": ["todo", "doing", "done"]},
+        "due_time": {"type": ["string", "null"], "format": "time"}},
+        "required": ["id", "title", "status", "due_time"], "additionalProperties": false}}},
+      "required": ["tasks"], "additionalProperties": false},
+    "prompt": "Turn this into a task list: buy milk (done), call the plumber at 17:00 UTC (todo), write the report (in progress).",
+    "reference": {"tasks": {"$len": 3}},
+    "valid": [
+      {"tasks": [{"id": 1, "title": "Buy milk", "status": "done", "due_time": null}, {"id": 2, "title": "Call the plumber", "status": "todo", "due_time": "17:00:00Z"}, {"id": 3, "title": "Write the report", "status": "doing", "due_time": null}]}
+    ],
+    "invalid": [
+      {"tasks": [{"id": 0, "title": "x", "status": "done", "due_time": null}]},
+      {"tasks": [{"id": 1, "title": "x", "status": "in progress", "due_time": null}]},
+      {"tasks": [{"id": 1, "title": "x", "status": "todo", "due_time": "25:00:00Z"}]}
+    ],
+    "invalid_text": []
+  }
+]

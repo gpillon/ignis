@@ -372,6 +372,32 @@ impl Tokenizer {
         self.inner.id_to_token(id).is_some()
     }
 
+    /// Every logits column `0..width` as bytes (GitHub #287): what a grammar
+    /// checks a sampled token against. A vocabulary token is spelled in the
+    /// byte-level alphabet (one character for each of the 256 bytes) and comes back as
+    /// its exact bytes, decoded once here; an added token (`<|im_end|>`,
+    /// `<think>`, ...) comes back as such; a column with no token as absent.
+    pub fn token_bytes_table(&self, width: usize) -> Result<Vec<TokenBytes>> {
+        let map = byte_level_chars();
+        let added = self.inner.get_added_tokens_decoder();
+        (0..width as u32)
+            .map(|id| {
+                if let Some(t) = added.get(&id) {
+                    return Ok(TokenBytes::Added { special: t.special });
+                }
+                let Some(spelled) = self.inner.id_to_token(id) else {
+                    return Ok(TokenBytes::Absent);
+                };
+                spelled
+                    .chars()
+                    .map(|c| map.get(&c).copied())
+                    .collect::<Option<Vec<u8>>>()
+                    .map(TokenBytes::Text)
+                    .ok_or_else(|| fail(format!("token {id} ({spelled:?}) is not spelled in the byte-level alphabet")))
+            })
+            .collect()
+    }
+
     /// Decode token ids to text.
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         self.inner
@@ -419,6 +445,33 @@ impl Tokenizer {
             .map_err(|e| fail(format!("streaming detokenize: {e}")))?;
         Ok(full[state.prefix.len()..].to_string())
     }
+}
+
+/// One logits column as [`Tokenizer::token_bytes_table`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenBytes {
+    /// A vocabulary token's exact bytes.
+    Text(Vec<u8>),
+    /// An added token; `special` as the tokenizer marks it.
+    Added { special: bool },
+    /// A column the tokenizer has no token for.
+    Absent,
+}
+
+/// Byte-level BPE's byte-to-character map inverted: the alphabet such a
+/// vocabulary spells its tokens in, back to bytes.
+fn byte_level_chars() -> std::collections::HashMap<char, u8> {
+    let mut bytes: Vec<u32> = (b'!' as u32..=b'~' as u32).chain(0xA1..=0xAC).chain(0xAE..=0xFF).collect();
+    let mut chars = bytes.clone();
+    let mut extra = 0;
+    for b in 0..256u32 {
+        if !bytes.contains(&b) {
+            bytes.push(b);
+            chars.push(256 + extra);
+            extra += 1;
+        }
+    }
+    bytes.iter().zip(&chars).map(|(&b, &c)| (char::from_u32(c).unwrap(), b as u8)).collect()
 }
 
 /// The owned state an incremental [`Tokenizer::decode_step`] carries across
@@ -1236,6 +1289,52 @@ mod tests {
         // `decode` skips an id it has no token for; `knows` is what says so.
         let text = tokenizer.decode(&[ids[0], u32::MAX]).expect("decode");
         assert_eq!(text, tokenizer.decode(&ids[..1]).expect("decode"));
+    }
+
+    /// A byte-level BPE tokenizer (the 27B's kind) with `vocab` and one added
+    /// special token after it.
+    fn byte_level_tokenizer(vocab: &str) -> Result<Tokenizer> {
+        let json = format!(
+            r#"{{"version":"1.0","added_tokens":[{{"id":6,"content":"<|im_end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}}],
+            "normalizer":null,"pre_tokenizer":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}},"post_processor":null,
+            "decoder":{{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true}},
+            "model":{{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,
+            "vocab":{{{vocab}}},"merges":[]}}}}"#
+        );
+        Tokenizer::from_bytes(json.as_bytes())
+    }
+
+    #[test]
+    fn token_bytes_table_gives_every_column_its_exact_bytes() {
+        // `Ġ` spells a space, `Ċ` a newline, `Ã©` the two bytes of `é`, `Ã`
+        // alone a lone UTF-8 lead byte; column 7 has no token.
+        let tok = byte_level_tokenizer(r#""a":0,"Ġ":1,"Ġb":2,"Ċ":3,"Ã©":4,"Ã":5"#).expect("parse");
+        let table = tok.token_bytes_table(8).expect("table");
+        assert_eq!(
+            table,
+            vec![
+                TokenBytes::Text(b"a".to_vec()),
+                TokenBytes::Text(b" ".to_vec()),
+                TokenBytes::Text(b" b".to_vec()),
+                TokenBytes::Text(b"\n".to_vec()),
+                TokenBytes::Text("é".as_bytes().to_vec()),
+                TokenBytes::Text(vec![0xC3]),
+                TokenBytes::Added { special: true },
+                TokenBytes::Absent,
+            ]
+        );
+        // Where the bytes are whole UTF-8, they are the tokenizer's decode.
+        for id in 0..5u32 {
+            let TokenBytes::Text(b) = &table[id as usize] else { panic!() };
+            assert_eq!(tok.decode(&[id]).unwrap().as_bytes(), &b[..], "token {id}");
+        }
+    }
+
+    #[test]
+    fn token_bytes_table_refuses_a_token_outside_the_byte_level_alphabet() {
+        let tok = byte_level_tokenizer(r#""a":0,"€":1"#).expect("parse");
+        let err = tok.token_bytes_table(2).unwrap_err().to_string();
+        assert!(err.contains("token 1") && err.contains("byte-level alphabet"), "{err}");
     }
 
     #[test]

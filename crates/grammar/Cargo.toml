@@ -1,0 +1,24 @@
+[package]
+name = "ignis-grammar"
+description = "ignis: structured output's grammar (#287): a JSON / JSON-schema pushdown automaton over the token vocabulary, checked per token and masked on a miss; CPU-only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# `pattern` and `format` (#287): a schema's regular expression is compiled to a
+# dense DFA, walked as our own byte table. Already in the lock through `regex`.
+regex-automata = "0.4"
+
+[dev-dependencies]
+# Random documents of a grammar's language are parsed by an independent JSON
+# parser, and the bench writes its summary.
+serde_json = { workspace = true }
+# The real tokenizer's per-token byte table, read the way the server reads it
+# (the bench example and the machine-local test). CPU-only without `cuda`.
+ignis-artifact = { path = "../artifact" }
+
+# The grammar measured on the real 27B tokenizer (#585): timings, the
+# reference, and the documents for the independent validator.
+[[example]]
+name = "grammar_bench"

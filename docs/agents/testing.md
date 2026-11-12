@@ -6,8 +6,9 @@ until the test suite is green.
 
 ## The gate
 
-- `cargo test` from the workspace root — all five crates
-  (`artifact`, `core`, `server`, `bench`, `vendor`). CI runs exactly this on
+- `cargo test` from the workspace root — every crate under `crates/`
+  (`artifact`, `bench`, `core`, `grammar`, `logging`, `runtime`, `server`,
+  `speech`, `vendor`). CI runs exactly this on
   Linux and on Windows, in four shards per host that together run every test
   target once (`mk/test-shard.sh`, `make test-shard-selftest`), and nothing
   is published until both legs are green; the release builds run beside them
@@ -237,6 +238,9 @@ that doesn't run anything.
   WebP condition image): [testing/image-model.md](testing/image-model.md).
 - Testing the speech model (the speech oracle, `server_vad`'s VAD oracle, their
   legs on the study disk): [testing/speech.md](testing/speech.md).
+- Testing structured output's grammar (the per-token reference on the real
+  tokenizer, the independent validator, the bench's bounds):
+  [testing/structured-output.md](testing/structured-output.md).
 - Running a bench or a gate leg (TTFT and G2, the multimodal TTFT cell, the
   KV-format A/B, the harness's request deadline):
   [testing/bench.md](testing/bench.md).

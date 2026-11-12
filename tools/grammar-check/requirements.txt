@@ -1,0 +1,6 @@
+# The independent validator of tools/grammar-check/validate.py (#585, spec #287):
+# Draft 2020-12 with format checking. rfc3339-validator checks date-time and
+# time, fqdn hostname; validate.py checks the other formats itself.
+jsonschema==4.26.0
+rfc3339-validator==0.1.4
+fqdn==1.5.1
