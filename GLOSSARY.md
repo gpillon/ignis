@@ -1251,13 +1251,14 @@ exactly one token that decodes back to itself, which rejects 114 of the 676
 uppercase bigrams in the 27B's tokenizer.
 
 **Constrained decode**:
-A decode whose sampling is restricted, per lane, to a declared set of tokens.
+A decode whose every emitted token lies, per lane, in a declared set of tokens.
 What a **readout** is to one position, this is to a run of them: the answer's
 shape is the caller's, so no parser has to survive a shape the model chose.
 
 **Permitted set**:
-The vocabulary entries one step of a **constrained decode** may draw from, at
-most 32 of them. The leaf drives every other column of the logits row to
+The vocabulary entries one step of a **constrained decode** may draw from: at
+most 32 for a **schedule** or a **forced literal**, any number for a
+**repair**. The leaf drives every other column of the logits row to
 `-1e30` before the vendored sampler runs, so the constraint composes with
 temperature, top-k, seeds and penalties instead of replacing them, and what
 comes back is a token id like any other.
@@ -1290,6 +1291,27 @@ ends its run when spent. `tool_choice: "required"` or a named function forces
 the opening of a tool call this way (GitHub #286), from the first token with
 thinking off and right after the reasoning block with it on; the thinking
 budget's forced close is the same shape.
+
+**Grammar**:
+The shape a caller gives a whole answer, as rules that say which continuations
+of what has been written so far are valid. The third kind of **constrained
+decode**, beside a **schedule** and a **forced literal**, and the only one that
+depends on what the model wrote: it checks each sampled token instead of
+restricting the sampling.
+
+**Miss**:
+A sampled token the **grammar** rejects, caught before the model consumes it.
+
+**Repair**:
+Sampling a **miss**'s position again from the same scores, restricted to the
+**permitted set** the **grammar** allows there: the only step of a
+grammar-constrained decode that sends a permitted set down.
+_Avoid_: retry, resample
+
+**Structured output**:
+An answer a **grammar** holds to valid JSON, or to a JSON schema the caller
+sent. OpenAI's name, kept because the field is OpenAI's.
+_Avoid_: JSON mode, guided decoding
 
 **Answer mass**:
 How much of the whole next-token distribution the answer tokens hold,
