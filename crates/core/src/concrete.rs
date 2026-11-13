@@ -2480,9 +2480,9 @@ impl ConcreteScheduler {
     /// drawn again from those scores restricted to the grammar's permitted
     /// set, and the repaired token waits in its place.
     ///
-    /// The one place a miss and a repair happen, which is where their counts
-    /// and the repair's time are taken (#593).
-    fn hold_to_grammar(&mut self, i: usize, draw: WaitingDraw) -> Held {
+    /// The one place a miss and a repair happen, which is where each is
+    /// reported, with the repair's time ([`SchedEvent::Miss`], #593).
+    fn hold_to_grammar(&mut self, i: usize, draw: WaitingDraw, events: &mut Vec<SchedEvent>) -> Held {
         let r = &mut self.requests[i];
         let Some(state) = r.grammar.as_mut() else {
             return Held::Kept;
@@ -2496,7 +2496,6 @@ impl ConcreteScheduler {
         }
         let request = r.id;
         let params = r.input.params;
-        r.tally.misses = r.tally.misses.saturating_add(1);
         // #593: the clock is read here only, where a repair happens.
         let began = self.now();
         let repaired = self.requests[i]
@@ -2512,10 +2511,11 @@ impl ConcreteScheduler {
                 let state = self.requests[i].grammar.as_mut().expect("checked above");
                 state.repaired(token).map(|stop| (token, stop))
             });
-        if repaired.is_ok() {
+        let repair_micros = repaired.is_ok().then(|| {
             let micros = self.now().saturating_duration_since(began).as_micros();
-            self.requests[i].tally.repair_micros.push(micros.min(u32::MAX as u128) as u32);
-        }
+            micros.min(u32::MAX as u128) as u32
+        });
+        events.push(SchedEvent::Miss { request, repair_micros });
         match repaired {
             Ok((_, true)) => Held::Ended(FinishReason::Stop),
             Ok((token, false)) => Held::Repaired(token),
@@ -2536,7 +2536,7 @@ impl ConcreteScheduler {
     /// held to its grammar when its answer starts there. Returns the run the
     /// request emits: the draw, the token that repaired it, or the request's
     /// end.
-    fn hold_first_draw(&mut self, i: usize, run: DecodeOutcome) -> DecodeOutcome {
+    fn hold_first_draw(&mut self, i: usize, run: DecodeOutcome, events: &mut Vec<SchedEvent>) -> DecodeOutcome {
         if !self.requests[i].grammar.as_ref().is_some_and(|state| state.holds()) {
             return run;
         }
@@ -2546,7 +2546,7 @@ impl ConcreteScheduler {
             // Nothing else is a draw: hold nothing back from the ending.
             _ => return run,
         };
-        match self.hold_to_grammar(i, draw) {
+        match self.hold_to_grammar(i, draw, events) {
             Held::Kept => run,
             Held::Repaired(token) => DecodeOutcome::token(token),
             Held::Ended(reason) => DecodeOutcome::finished(reason),
@@ -2577,7 +2577,7 @@ impl ConcreteScheduler {
             return;
         }
         let held = match run.waiting {
-            Some(draw) => self.hold_to_grammar(i, draw),
+            Some(draw) => self.hold_to_grammar(i, draw, events),
             None => {
                 // hotpath-lint-allow: failure-only path (a backend that did not report a draw it was asked for), reviewed exception (GitHub #587).
                 tracing::error!(
@@ -2785,16 +2785,6 @@ impl ConcreteScheduler {
             let r = &self.requests[idx];
             r.reasoning_redirected_at.filter(|&at| at < r.tokens)
         };
-        // #593: a grammar's type, misses and repair times, moved out.
-        let structured = {
-            let r = &mut self.requests[idx];
-            let tally = std::mem::take(&mut r.tally);
-            r.input.grammar.as_ref().map(|grammar| crate::structured::StructuredSummary {
-                kind: grammar.kind(),
-                misses: tally.misses,
-                repair_micros: tally.repair_micros,
-            })
-        };
         let (request_id, tokens) = self.release_request(idx);
         events.push(SchedEvent::Done {
             request: request_id,
@@ -2806,7 +2796,6 @@ impl ConcreteScheduler {
             drawn,
             thinking,
             reasoning_redirected_at,
-            structured,
         });
     }
 
@@ -5770,7 +5759,7 @@ impl Scheduler for ConcreteScheduler {
             // GitHub #587: an answer held to a grammar from its first token
             // has that token checked, and repaired on a miss, before it
             // leaves.
-            let run = self.hold_first_draw(i, run);
+            let run = self.hold_first_draw(i, run, &mut events);
             let left = !run.tokens.is_empty();
             self.commit_run(i, &run, false, &mut events);
             if let Some(state) = self.requests[i].grammar.as_mut() {

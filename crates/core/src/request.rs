@@ -129,9 +129,6 @@ pub struct Request {
     /// ([`crate::types::RequestInput::grammar`], GitHub #587): `None` for a
     /// request whose answer is free.
     pub grammar: Option<crate::structured::GrammarState>,
-    /// What the grammar did so far (#593): misses and repair times. Kept
-    /// across a requeue, whose misses were real.
-    pub tally: crate::structured::StructuredTally,
     /// The **pending token** already left (#518): the prompt's last prefill
     /// job emitted it, and the next decode round takes it as its anchor
     /// without emitting it again. Cleared by that round.
@@ -316,7 +313,6 @@ impl Request {
             reasoning_redirected_at: None,
             forced_state: crate::forced_literal::ForcedState::default(),
             grammar,
-            tally: Default::default(),
             anchor_emitted: false,
             resources,
             remaining_work,

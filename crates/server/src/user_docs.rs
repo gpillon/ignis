@@ -343,7 +343,7 @@ const ACTIVATIONS: &[Activation] = &[
     Activation {
         when: "once a request held to a grammar (`response_format`) has ended",
         activate: |m| {
-            m.record_structured(&ignis_core::structured::StructuredSummary {
+            m.record_structured(&crate::telemetry::StructuredSummary {
                 kind: ignis_core::structured::StructuredKind::JsonObject,
                 misses: 1,
                 repair_micros: vec![100],

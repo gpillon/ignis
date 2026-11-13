@@ -151,6 +151,10 @@ pub struct RequestNotes {
     /// consumer drops every fact about it — no request log line, no counter,
     /// no histogram sample.
     pub internal: bool,
+    /// The type a request held to a **grammar** asked for (#593), read off
+    /// its input where it is submitted: its line, `done` or `cancelled`,
+    /// says it and what the grammar did. `None` for every other request.
+    pub structured: Option<ignis_core::structured::StructuredKind>,
 }
 
 /// The server-side engine: a cheap, cloneable handle onto the model thread
@@ -682,7 +686,6 @@ fn end_in_flight(
             drawn: None,
             thinking: None,
             reasoning_redirected_at: None,
-            structured: None,
         });
         scheduler.cancel(request);
     }
@@ -705,6 +708,7 @@ fn handle_command(
             // before `input` moves into `submit` — the scheduler's own
             // `Request` is not reachable from the telemetry consumer.
             let prompt_tokens = input.tokens.len() as u32;
+            let notes = RequestNotes { structured: input.grammar.as_ref().map(|grammar| grammar.kind()), ..notes };
             let result = scheduler.submit(input, class).map(|id| {
                 let (route, stream) = unbounded_channel();
                 streams.insert(id, route);
@@ -789,8 +793,10 @@ fn route_events(
         // batch (which may follow it) still is.
         if let Some(request) = event_request(event) {
             // The route may be gone (the handler already reaped the
-            // stream): a failed send is a no-op, not an error.
-            if let Some(route) = streams.get(&request) {
+            // stream): a failed send is a no-op, not an error. A miss (#593)
+            // is the request log's alone: its handler has nothing to do with
+            // one, and a reader batching a round's tokens would stop at it.
+            if let Some(route) = streams.get(&request).filter(|_| !matches!(event, SchedEvent::Miss { .. })) {
                 let _ = route.send(event.clone());
             }
             if let SchedEvent::Done { .. } = event {
@@ -825,7 +831,8 @@ fn event_request(event: &SchedEvent) -> Option<RequestId> {
         | SchedEvent::StateReused { request, .. }
         | SchedEvent::PrefillChunk { request, .. }
         | SchedEvent::RetainedSlotSkipped { request, .. }
-        | SchedEvent::DiskSpilled { request, .. } => Some(*request),
+        | SchedEvent::DiskSpilled { request, .. }
+        | SchedEvent::Miss { request, .. } => Some(*request),
         SchedEvent::Protected { .. }
         | SchedEvent::RetainedState { .. }
         | SchedEvent::RetainedSlots { .. }
@@ -884,6 +891,9 @@ async fn telemetry_task(
                 if notes.thinking_budget_dropped {
                     telemetry.note_thinking_budget_dropped(id);
                 }
+                if let Some(kind) = notes.structured {
+                    telemetry.note_structured(id, kind);
+                }
             }
             TelemetryFact::Routed(event) => match event {
                 SchedEvent::Admitted { request, lane, .. } => telemetry.on_admitted(request, lane),
@@ -919,8 +929,8 @@ async fn telemetry_task(
                     drawn: _,
                     thinking,
                     reasoning_redirected_at,
-                    structured,
-                } => telemetry.on_done(request, tokens, reason, spec, thinking, reasoning_redirected_at, structured),
+                } => telemetry.on_done(request, tokens, reason, spec, thinking, reasoning_redirected_at),
+                SchedEvent::Miss { request, repair_micros } => telemetry.on_miss(request, repair_micros),
                 SchedEvent::PrefillChunk {
                     request,
                     prefilled_tokens,
@@ -1348,7 +1358,6 @@ mod tests {
                     attention: None,
                     thinking: None,
                     reasoning_redirected_at: None,
-                    structured: None,
                 },
             ]
         }
@@ -1425,7 +1434,6 @@ mod tests {
                     attention: None,
                     thinking: None,
                     reasoning_redirected_at: None,
-                    structured: None,
                 },
             ]
         }
@@ -1535,7 +1543,6 @@ mod tests {
                 attention: None,
                 thinking: None,
                 reasoning_redirected_at: None,
-                structured: None,
             }]
         }
         fn is_idle(&self) -> bool {

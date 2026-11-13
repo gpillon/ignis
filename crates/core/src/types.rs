@@ -808,9 +808,18 @@ pub enum SchedEvent {
         /// and `None` on every request it did not happen to. Apart from
         /// `thinking`, which only a budget has: a redirect needs none.
         reasoning_redirected_at: Option<u32>,
-        /// What a request held to a **grammar** did (#593): its type, its
-        /// misses and the time of each repair. `None` for every other request.
-        structured: Option<crate::structured::StructuredSummary>,
+    },
+    /// A **miss** of a request held to a **grammar** (#593): a sampled token
+    /// the grammar rejected, reported where the scheduler repairs it, with the
+    /// **repair**'s time in microseconds -- `None` when the miss could not be
+    /// repaired, and the request then ends with an error. The telemetry
+    /// consumer sums them per request, so the line a request ends with --
+    /// `done`, or `cancelled` for one cut by its deadline or let go -- says
+    /// what its grammar did, whichever way it ended. A request with no grammar
+    /// never has one.
+    Miss {
+        request: RequestId,
+        repair_micros: Option<u32>,
     },
     /// A request was admitted onto a decode lane. `backfill` is the class
     /// the admission state machine admitted it under (ADR 0004): `None` for

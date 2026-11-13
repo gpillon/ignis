@@ -1043,7 +1043,7 @@ impl Metrics {
 
     /// A completed request held to a grammar (#593): counted by its type,
     /// with the draws the grammar rejected and the time of each repair.
-    pub(crate) fn record_structured(&self, summary: &ignis_core::structured::StructuredSummary) {
+    pub(crate) fn record_structured(&self, summary: &crate::telemetry::StructuredSummary) {
         let slot = STRUCTURED_KINDS.iter().position(|&kind| kind == summary.kind).unwrap_or(0);
         for &us in &summary.repair_micros {
             self.structured_repair_time.observe(u64::from(us));
@@ -2230,7 +2230,7 @@ mod tests {
 
     #[test]
     fn structured_output_is_absent_until_a_request_held_to_a_grammar_ends() {
-        use ignis_core::structured::StructuredSummary;
+        use crate::telemetry::StructuredSummary;
         let metrics = Metrics::new();
         assert!(!metrics.render().contains("ignis_structured_"));
         metrics.record_structured(&StructuredSummary {

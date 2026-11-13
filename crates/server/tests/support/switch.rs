@@ -367,7 +367,6 @@ impl Scheduler for Failing {
                     drawn: None,
                     thinking: None,
                     reasoning_redirected_at: None,
-                    structured: None,
                 }
             })
             .collect()

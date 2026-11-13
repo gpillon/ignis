@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use ignis_core::structured::{AnswerGrammar, StructuredKind, StructuredSummary};
+use ignis_core::structured::{AnswerGrammar, StructuredKind};
 use ignis_core::{
     ConcreteScheduler, DecodeParams, FinishReason, MockCompute, RequestClass, RequestId, RequestInput, SchedEvent,
     Scheduler, SchedulerConfig, SpecCounters, TokenId, WaitingDraw,
@@ -100,14 +100,16 @@ fn done(events: &[SchedEvent], id: RequestId) -> (FinishReason, Option<SpecCount
         .unwrap_or_else(|| panic!("request {id} never finished: {events:?}"))
 }
 
-fn structured(events: &[SchedEvent], id: RequestId) -> StructuredSummary {
-    events
+/// The request's misses, and how many of them were repaired (#593).
+fn misses(events: &[SchedEvent], id: RequestId) -> (usize, usize) {
+    let repairs: Vec<Option<u32>> = events
         .iter()
-        .find_map(|e| match e {
-            SchedEvent::Done { request, structured, .. } if *request == id => structured.clone(),
+        .filter_map(|e| match e {
+            SchedEvent::Miss { request, repair_micros } if *request == id => Some(*repair_micros),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("request {id} finished with no structured summary: {events:?}"))
+        .collect();
+    (repairs.len(), repairs.iter().flatten().count())
 }
 
 fn draws(text: &str) -> Vec<WaitingDraw> {
@@ -145,8 +147,7 @@ fn a_miss_in_the_middle_of_a_verified_run_is_cut_there_and_repaired_and_the_toke
         !repairs[0].permitted.permits(TokenId::from(b'x')) && repairs[0].permitted.permits(TokenId::from(b'}')),
         "the x is repaired where the object stands after the 7"
     );
-    let summary = structured(&events, id);
-    assert_eq!((summary.misses, summary.repairs()), (2, 2), "the miss inside the run is counted, as any miss is");
+    assert_eq!(misses(&events, id), (2, 2), "the miss inside the run is reported, as any miss is");
     let spec = spec.expect("the request's rounds were verify rounds");
     assert!(spec.drafted > 0 && spec.accepted > 0, "speculation stayed on for the checked request: {spec:?}");
 }

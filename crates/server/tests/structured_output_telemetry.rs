@@ -1,9 +1,10 @@
 //! Structured output on the metrics and the request log (GitHub #593, spec
 //! #287, ADR 0089, amending ADR 0017): a request held to a grammar
 //! moves the `ignis_structured_*` series by its misses and repairs, records
-//! each repair's time, and says its type and counts on its `done` line --
-//! over the real router on `MockCompute` (ADR 0006), whose scripted model
-//! misses on purpose.
+//! each repair's time, and says its type and counts on its `done` line,
+//! whether it ended on its own or at its caller's stop sequence -- over the
+//! real router on `MockCompute` (ADR 0006), whose scripted model misses on
+//! purpose.
 //!
 //! Its own binary, like `thinking_budget_request_log.rs`: tracing caches a
 //! callsite's interest process-wide, so a test running beside it without a
@@ -105,12 +106,13 @@ impl TemplateProvider for Vocabulary {
     }
 }
 
-/// A server with metrics on whose second and third requests write their
-/// scripts (the first is unscripted and unconstrained).
-fn apps(scripts: [&str; 2]) -> (axum::Router, axum::Router, Arc<MockCompute>) {
+/// A server with metrics on whose second, third and fourth requests write
+/// their scripts (the first is unscripted and unconstrained).
+fn apps(scripts: [&str; 3]) -> (axum::Router, axum::Router, Arc<MockCompute>) {
     let mock = Arc::new(MockCompute::new());
-    mock.script(1, &encode(scripts[0]));
-    mock.script(2, &encode(scripts[1]));
+    for (request, script) in (1..).zip(scripts) {
+        mock.script(request, &encode(script));
+    }
     let scheduler =
         ConcreteScheduler::with_config(SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() }, mock.clone());
     let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(Vocabulary::new()))
@@ -121,7 +123,7 @@ fn apps(scripts: [&str; 2]) -> (axum::Router, axum::Router, Arc<MockCompute>) {
     (server.app(), metrics, mock)
 }
 
-async fn chat(app: &axum::Router, structured: bool) {
+async fn chat(app: &axum::Router, structured: bool, stop: Option<&str>) {
     let mut body = json!({
         "model": MODEL,
         "messages": [{ "role": "user", "content": "describe a cat" }],
@@ -131,6 +133,9 @@ async fn chat(app: &axum::Router, structured: bool) {
     });
     if structured {
         body["response_format"] = json!({ "type": "json_object" });
+    }
+    if let Some(stop) = stop {
+        body["stop"] = json!([stop]);
     }
     let request = Request::builder()
         .method("POST")
@@ -196,20 +201,26 @@ async fn scripted_misses_move_the_structured_series_and_the_done_line() {
     let sink = Arc::new(MemorySink::new());
     let _guard =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone())));
-    let (api, metrics, mock) = apps(["Sure! Here it is:\n{\"a\": 1}", "{\"a\": 1}"]);
+    // The fourth writes an `x` where the object needs a comma or its close,
+    // then the comma: two misses, before its caller's stop sequence `"b"`.
+    let (api, metrics, mock) = apps(["Sure! Here it is:\n{\"a\": 1}", "{\"a\": 1}", "{\"a\": 1x, \"b\": 2}"]);
+    let misses_of = |request: u64| mock.repair_calls().iter().filter(|job| job.request == request).count();
+    let object = r#"type="json_object""#;
+    // `ignis_structured_requests_total` is the series a request's end writes
+    // last, so a scrape that shows it moved shows every other series moved.
+    let structured_requests = |t: &str| value(t, "ignis_structured_requests_total", object);
 
     // A request with a free answer adds nothing: the family is absent.
-    chat(&api, false).await;
+    chat(&api, false, None).await;
     let text = scrape_until(&metrics, |t| value(t, "ignis_requests_completed_total", "") == Some(1.0)).await;
     assert!(!text.contains("ignis_structured_"), "{text}");
 
     // A request whose script misses: every miss repaired, each repair timed.
-    chat(&api, true).await;
-    let text = scrape_until(&metrics, |t| value(t, "ignis_requests_completed_total", "") == Some(2.0)).await;
-    let misses = mock.repair_calls().len();
+    chat(&api, true, None).await;
+    let text = scrape_until(&metrics, |t| structured_requests(t) == Some(1.0)).await;
+    let misses = misses_of(1);
     assert!(misses >= 2, "the preamble misses more than once: {misses}");
-    let object = r#"type="json_object""#;
-    assert_eq!(value(&text, "ignis_structured_requests_total", object), Some(1.0), "{text}");
+    assert_eq!(value(&text, "ignis_requests_completed_total", ""), Some(2.0), "{text}");
     assert_eq!(value(&text, "ignis_structured_requests_total", r#"type="json_schema""#), Some(0.0), "{text}");
     assert_eq!(value(&text, "ignis_structured_misses_total", object), Some(misses as f64), "{text}");
     assert_eq!(value(&text, "ignis_structured_repairs_total", object), Some(misses as f64), "{text}");
@@ -218,14 +229,22 @@ async fn scripted_misses_move_the_structured_series_and_the_done_line() {
     assert!(text.contains("# TYPE ignis_structured_repair_seconds histogram"), "{text}");
 
     // A request that never misses is counted and moves neither count.
-    chat(&api, true).await;
-    let text = scrape_until(&metrics, |t| value(t, "ignis_requests_completed_total", "") == Some(3.0)).await;
-    assert_eq!(value(&text, "ignis_structured_requests_total", object), Some(2.0), "{text}");
+    chat(&api, true, None).await;
+    let text = scrape_until(&metrics, |t| structured_requests(t) == Some(2.0)).await;
     assert_eq!(value(&text, "ignis_structured_misses_total", object), Some(misses as f64), "{text}");
     assert_eq!(value(&text, "ignis_structured_repair_seconds_count", ""), Some(misses as f64), "{text}");
 
+    // A request its caller's stop sequence ends completed, with its misses:
+    // the engine releases it with no finish of its own (spec server/09).
+    chat(&api, true, Some("\"b\"")).await;
+    let text = scrape_until(&metrics, |t| structured_requests(t) == Some(3.0)).await;
+    let stopped = misses_of(3);
+    assert_eq!(stopped, 2, "the x and the comma after the repaired one");
+    assert_eq!(value(&text, "ignis_structured_misses_total", object), Some((misses + stopped) as f64), "{text}");
+    assert_eq!(value(&text, "ignis_structured_repairs_total", object), Some((misses + stopped) as f64), "{text}");
+
     // The log: the type and counts on the structured requests' lines only.
-    let lines = done_lines(&sink, 3).await;
+    let lines = done_lines(&sink, 4).await;
     assert!(lines[0].get("structured.type").is_none() && lines[0].get("structured.misses").is_none(), "{}", lines[0]);
     assert_eq!(lines[1]["structured.type"], "json_object", "{}", lines[1]);
     assert_eq!(lines[1]["structured.misses"], misses, "{}", lines[1]);
@@ -233,4 +252,8 @@ async fn scripted_misses_move_the_structured_series_and_the_done_line() {
     assert_eq!(lines[2]["structured.type"], "json_object", "{}", lines[2]);
     assert_eq!(lines[2]["structured.misses"], 0, "{}", lines[2]);
     assert_eq!(lines[2]["structured.repairs"], 0, "{}", lines[2]);
+    assert_eq!(lines[3]["finish_reason"], "stop", "{}", lines[3]);
+    assert_eq!(lines[3]["structured.type"], "json_object", "{}", lines[3]);
+    assert_eq!(lines[3]["structured.misses"], stopped, "{}", lines[3]);
+    assert_eq!(lines[3]["structured.repairs"], stopped, "{}", lines[3]);
 }

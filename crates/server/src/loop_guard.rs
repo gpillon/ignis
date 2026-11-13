@@ -2176,7 +2176,6 @@ mod tests {
             drawn: None,
             thinking,
             reasoning_redirected_at,
-            structured: None,
         }
     }
 

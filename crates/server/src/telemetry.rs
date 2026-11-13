@@ -39,7 +39,7 @@ use std::sync::Arc;
 use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
 use ignis_core::scheduler::{DiskOp, DiskSource};
 use ignis_core::flash_next_counters::FlashNextCounterSource;
-use ignis_core::structured::StructuredSummary;
+use ignis_core::structured::StructuredKind;
 use ignis_core::thinking_budget::BudgetOutcome;
 use ignis_core::{
     FinishReason, LaneId, Occupancy, RequestClass, RequestId, RetainedSkip, SpecCounters,
@@ -251,6 +251,33 @@ struct RequestTelemetry {
     /// would otherwise have run under (spec server/08), read off the
     /// submission since the scheduler never sees it.
     thinking_budget_dropped: bool,
+    /// What the request's grammar did so far (#593), for a request held to
+    /// one: its type from the submission, its misses and repair times summed
+    /// from the scheduler's [`SchedEvent::Miss`](ignis_core::SchedEvent::Miss)
+    /// as they come. `None` for every other request.
+    structured: Option<StructuredSummary>,
+}
+
+/// What a request held to a **grammar** did (#593): the type it asked for,
+/// its misses, and how long each repair took. Its line, `done` or
+/// `cancelled`, says the type and the counts; a completed request's adds them
+/// to the `ignis_structured_*` series.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredSummary {
+    /// The type the request's `response_format` named.
+    pub kind: StructuredKind,
+    /// Sampled tokens the grammar rejected.
+    pub misses: u32,
+    /// How long each repair took, in microseconds, in order. A miss the
+    /// engine could not repair has no entry.
+    pub repair_micros: Vec<u32>,
+}
+
+impl StructuredSummary {
+    /// Misses the engine repaired.
+    pub fn repairs(&self) -> u32 {
+        self.repair_micros.len() as u32
+    }
 }
 
 impl RequestTelemetry {
@@ -455,6 +482,23 @@ impl Telemetry {
         }
     }
 
+    /// A submitted request is held to a grammar of `kind` (#593): its line
+    /// will say so, and what the grammar did, however the request ends.
+    pub fn note_structured(&mut self, id: RequestId, kind: StructuredKind) {
+        if let Some(rt) = self.requests.get_mut(&id) {
+            rt.structured = Some(StructuredSummary { kind, misses: 0, repair_micros: Vec::new() });
+        }
+    }
+
+    /// A request held to a grammar missed (#593): one more miss, and the
+    /// repair's time when it was repaired.
+    pub fn on_miss(&mut self, id: RequestId, repair_micros: Option<u32>) {
+        if let Some(structured) = self.requests.get_mut(&id).and_then(|rt| rt.structured.as_mut()) {
+            structured.misses = structured.misses.saturating_add(1);
+            structured.repair_micros.extend(repair_micros);
+        }
+    }
+
     /// A request was admitted (dealt `lane`): emit the `admitted` line,
     /// carrying the prefill phase's summary fields (P3-06: `prompt_tokens`,
     /// `prefill_chunks_consumed`, `prefilled_tokens`) accumulated from the
@@ -518,7 +562,7 @@ impl Telemetry {
             // Its own `Done` came first: already reported.
             return;
         }
-        self.on_done(id, n, FinishReason::Stop, None, None, None, None);
+        self.on_done(id, n, FinishReason::Stop, None, None, None);
         if self.metrics.is_some() {
             self.remember_released(id);
         }
@@ -598,10 +642,9 @@ impl Telemetry {
     /// phase's per-lane inter-token-latency summary (P3-06), its
     /// speculative counters when it ran any rounds (P5-06, GitHub #154),
     /// what its thinking budget did when it had one (spec server/08), where
-    /// its EOS became `</think>` when it did (GitHub #315) and what its media
-    /// cost when it had any (GitHub #245) — and drop the request from the
-    /// in-flight set.
-    #[allow(clippy::too_many_arguments)]
+    /// its EOS became `</think>` when it did (GitHub #315), what its media
+    /// cost when it had any (GitHub #245) and what its grammar did when it
+    /// was held to one (#593) — and drop the request from the in-flight set.
     pub fn on_done(
         &mut self,
         id: RequestId,
@@ -610,8 +653,8 @@ impl Telemetry {
         spec: Option<SpecCounters>,
         thinking: Option<BudgetOutcome>,
         reasoning_redirected_at: Option<u32>,
-        structured: Option<StructuredSummary>,
     ) {
+        let structured = self.requests.get_mut(&id).and_then(|rt| rt.structured.take());
         if let Some(metrics) = &self.metrics {
             if let Some(spec) = spec.as_ref() {
                 metrics.record_speculation(spec);
@@ -1073,11 +1116,14 @@ impl Telemetry {
     /// nothing in the request log past its `admitted`. `media.*` (GitHub
     /// #245) are the `done` line's, for what the request's media cost before
     /// the cancel: a question past its deadline, or let go when its client
-    /// left, paid for its encode all the same.
+    /// left, paid for its encode all the same. So are `structured.*` (#593),
+    /// for what its grammar did before the cancel; a cancelled request moves
+    /// none of the `ignis_structured_*` series, which count completed ones.
     fn emit_cancelled(&self, id: RequestId, cause: CancelCause, ms: u64, rt: &RequestTelemetry) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         let summary = rt.media_summary();
         let media = summary.map(|s| s.stats);
+        let structured = rt.structured.as_ref();
         tracing::info!(
             name: "ignis.request.cancelled",
             request_id = id,
@@ -1095,6 +1141,9 @@ impl Telemetry {
             media.cache_hits = media.map(|m| m.cache_hits),
             media.cache_misses = media.map(|m| m.cache_misses),
             media.encode_seconds = summary.map(|s| s.encode_seconds()),
+            structured.type = structured.map(|s| s.kind.name()),
+            structured.misses = structured.map(|s| s.misses),
+            structured.repairs = structured.map(|s| s.repairs()),
             "request cancelled"
         );
     }
@@ -1436,7 +1485,7 @@ mod tests {
         assert!(busy.contains("\nignis_kv_pool_used_pages 64\n"), "{busy}");
         assert!(busy.contains("\nignis_kv_ram_arena_bytes{state=\"used\"} 1073741824\n"), "{busy}");
 
-        telemetry.on_done(1, 3, FinishReason::Stop, None, None, None, None);
+        telemetry.on_done(1, 3, FinishReason::Stop, None, None, None);
         telemetry.emit_interval(Occupancy {
             kv_used_pages: 0,
             kv_pool_pages: 256,
@@ -1480,7 +1529,7 @@ mod tests {
             for _ in 0..3 {
                 returned.push(telemetry.emit_interval(Occupancy::default()));
             }
-            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None, None);
+            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None);
             returned.push(telemetry.emit_interval(Occupancy::default()));
         });
         let intervals = intervals(&events);
@@ -1521,7 +1570,7 @@ mod tests {
             telemetry.on_admitted(7, 2);
             telemetry.on_token(7); // first token → ttft
             telemetry.on_token(7); // subsequent tokens are not re-emitted
-            telemetry.on_done(7, 4, FinishReason::Stop, None, None, None, None);
+            telemetry.on_done(7, 4, FinishReason::Stop, None, None, None);
         });
 
         let event_names: Vec<&str> = events.iter().map(|e| e["event_name"].as_str().unwrap()).collect();
@@ -1563,7 +1612,6 @@ mod tests {
                 12,
                 FinishReason::Stop,
                 Some(SpecCounters::round(7, 7) + SpecCounters::round(7, 2) + SpecCounters::round(7, 0)),
-                None,
                 None,
                 None,
             );
@@ -1702,12 +1750,12 @@ mod tests {
             telemetry.note_submit(1, 20, RequestClass::Agent);
             telemetry.note_media(1, media);
             telemetry.on_prefill_chunk(1, 20, 250_000, false);
-            telemetry.on_done(1, 0, FinishReason::Stop, None, None, None, None);
+            telemetry.on_done(1, 0, FinishReason::Stop, None, None, None);
             // A text request that never takes a lane either, whose chunk
             // reports encode time anyway: no media, so no `media.*`.
             telemetry.note_submit(2, 5, RequestClass::Agent);
             telemetry.on_prefill_chunk(2, 5, 9_000, false);
-            telemetry.on_done(2, 0, FinishReason::Stop, None, None, None, None);
+            telemetry.on_done(2, 0, FinishReason::Stop, None, None, None);
         });
         assert!(
             events.iter().all(|e| e["event_name"] != "ignis.request.admitted"),
@@ -1748,7 +1796,7 @@ mod tests {
             telemetry.on_prefill_chunk(1, 20, 250_000, false);
             telemetry.on_admitted(1, 0);
             telemetry.on_token(1);
-            telemetry.on_done(1, 1, FinishReason::Stop, None, None, None, None);
+            telemetry.on_done(1, 1, FinishReason::Stop, None, None, None);
         });
         let media_of = |name: &str| {
             let attributes = events
@@ -1788,7 +1836,7 @@ mod tests {
             telemetry.note_media(1, media);
             telemetry.on_prefill_chunk(1, 8, 250_000, false);
             telemetry.on_cancelled(1, CancelCause::Consumer);
-            telemetry.on_done(1, 0, FinishReason::Stop, None, None, None, None);
+            telemetry.on_done(1, 0, FinishReason::Stop, None, None, None);
             // A text request cancelled mid-prefill: no media, no `media.*`.
             telemetry.note_submit(2, 5, RequestClass::Agent);
             telemetry.on_prefill_chunk(2, 2, 9_000, false);
@@ -1825,7 +1873,7 @@ mod tests {
         let events = capture_events(|| {
             telemetry.note_submit(1, 3, RequestClass::Interactive);
             telemetry.on_admitted(1, 0);
-            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None, None);
+            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None);
         });
         let done = events.last().unwrap();
         // FixedClock(0): a zero elapsed span → `duration_ms` and `tok_s` are 0.
@@ -1853,7 +1901,7 @@ mod tests {
             }));
         let events = capture_events(|| {
             telemetry.note_submit(1, 5, RequestClass::Interactive); // read #1 → 100 ms
-            telemetry.on_done(1, 5, FinishReason::Length, None, None, None, None); // read #2 → 200 ms, so ms = 100
+            telemetry.on_done(1, 5, FinishReason::Length, None, None, None); // read #2 → 200 ms, so ms = 100
         });
         let done = events.last().unwrap();
         assert_eq!(done["attributes"]["duration_ms"], 100, "200 - 100 = 100 ms elapsed");
@@ -2057,7 +2105,7 @@ mod tests {
             telemetry.on_token(1); // ttft — no ITL sample yet
             telemetry.on_token(1); // 1st gap: 10ms
             telemetry.on_token(1); // 2nd gap: 10ms
-            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None, None);
+            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None);
         });
         let done = events.last().unwrap();
         assert_eq!(done["attributes"]["itl_samples"], 2);
@@ -2100,7 +2148,7 @@ mod tests {
             telemetry.on_prefill_chunk(2, 32_768, 0, false); // t=25, the wide chunk lands, completing the prompt
             telemetry.on_token(1); // t=220, 2nd gap: 200ms — the stall
             telemetry.on_admitted(2, 1); // t=230, prefiller starts decoding
-            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None, None); // t=220 (clock re-read), lane 0 finishes
+            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None); // t=220 (clock re-read), lane 0 finishes
         });
 
         // Request 2's `admitted` line shows the wide cold-prefill chunk
@@ -2152,7 +2200,7 @@ mod tests {
         has("ignis_requests_completed_total 0");
 
         telemetry.on_token(2);
-        telemetry.on_done(2, 5, FinishReason::Stop, None, None, None, None);
+        telemetry.on_done(2, 5, FinishReason::Stop, None, None, None);
         telemetry.emit_interval(Occupancy::default());
         has("ignis_requests_completed_total 1");
         has("ignis_generated_tokens_total 5");
@@ -2182,7 +2230,7 @@ mod tests {
         has("ignis_decoded_tokens_total 3");
         has("ignis_generated_tokens_total 0");
 
-        telemetry.on_done(1, 3, FinishReason::Stop, None, None, None, None);
+        telemetry.on_done(1, 3, FinishReason::Stop, None, None, None);
         has("ignis_decoded_tokens_total 3");
         has("ignis_generated_tokens_total 3");
 
@@ -2229,10 +2277,10 @@ mod tests {
         telemetry.note_submit(1, 3, RequestClass::Interactive);
         telemetry.on_admitted(1, 0);
         telemetry.on_cancelled(1, CancelCause::Consumer);
-        telemetry.on_done(1, 4, FinishReason::Stop, None, None, None, None);
+        telemetry.on_done(1, 4, FinishReason::Stop, None, None, None);
         // A `Done` for a request that was never cancelled still counts.
         telemetry.note_submit(2, 3, RequestClass::Interactive);
-        telemetry.on_done(2, 3, FinishReason::Length, None, None, None, None);
+        telemetry.on_done(2, 3, FinishReason::Length, None, None, None);
 
         let text = metrics.render();
         for line in [
@@ -2267,7 +2315,7 @@ mod tests {
         telemetry.on_evicted(1, 450);
         telemetry.on_token(1);
         telemetry.on_token(1);
-        telemetry.on_done(1, 2, FinishReason::Stop, None, None, None, None);
+        telemetry.on_done(1, 2, FinishReason::Stop, None, None, None);
 
         let text = metrics.render();
         for line in [
@@ -2405,9 +2453,9 @@ mod tests {
             telemetry.note_submit(1, 3, RequestClass::Interactive);
             telemetry.on_admitted(1, 0);
             telemetry.on_stopped(1, 5);
-            telemetry.on_done(1, 6, FinishReason::Stop, None, None, None, None); // raced the release
+            telemetry.on_done(1, 6, FinishReason::Stop, None, None, None); // raced the release
             telemetry.note_submit(2, 3, RequestClass::Interactive);
-            telemetry.on_done(2, 2, FinishReason::Stop, None, None, None, None);
+            telemetry.on_done(2, 2, FinishReason::Stop, None, None, None);
             telemetry.on_stopped(2, 2); // its `Done` came first
         });
         let done: Vec<_> = events.iter().filter(|e| e["event_name"] == "ignis.request.done").collect();
@@ -2432,6 +2480,78 @@ mod tests {
         }
     }
 
+    /// #593: a request held to a grammar says its type and what its grammar
+    /// did on the line it ends with, however it ends: `done` for its EOS or
+    /// its caller's stop sequence, `cancelled` for its deadline or a client
+    /// gone. The `ignis_structured_*` series count the completed ones, as
+    /// the decision family counts only answered questions: a cancelled
+    /// request's misses stay on its line.
+    #[test]
+    fn a_held_request_reports_its_grammar_however_it_ends() {
+        use serde_json::json;
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        let events = capture_events(|| {
+            // Ended by its caller's stop sequence: two misses, one repaired.
+            telemetry.note_submit(1, 3, RequestClass::Interactive);
+            telemetry.note_structured(1, StructuredKind::JsonSchema);
+            telemetry.on_miss(1, Some(120));
+            telemetry.on_miss(1, None);
+            telemetry.on_stopped(1, 5);
+            // Cut by its deadline after one repaired miss.
+            telemetry.note_submit(2, 3, RequestClass::Interactive);
+            telemetry.note_structured(2, StructuredKind::JsonObject);
+            telemetry.on_miss(2, Some(80));
+            telemetry.on_cancelled(2, CancelCause::Timeout);
+            // Its client gone before any miss.
+            telemetry.note_submit(3, 3, RequestClass::Interactive);
+            telemetry.note_structured(3, StructuredKind::JsonObject);
+            telemetry.on_cancelled(3, CancelCause::Consumer);
+            // Not held: no field, whatever ends it.
+            telemetry.note_submit(4, 3, RequestClass::Interactive);
+            telemetry.on_miss(4, Some(1));
+            telemetry.on_cancelled(4, CancelCause::Consumer);
+        });
+        let line = |name: &str, id: u64| {
+            events
+                .iter()
+                .find(|e| e["event_name"] == name && e["attributes"]["request_id"] == id)
+                .map(|e| e["attributes"].clone())
+                .unwrap_or_else(|| panic!("no {name} line for {id}: {events:?}"))
+        };
+        let stopped = line("ignis.request.done", 1);
+        assert_eq!(stopped["finish_reason"], "stop");
+        assert_eq!(
+            (&stopped["structured.type"], &stopped["structured.misses"], &stopped["structured.repairs"]),
+            (&json!("json_schema"), &json!(2), &json!(1)),
+            "{stopped}"
+        );
+        let cut = line("ignis.request.cancelled", 2);
+        assert_eq!(cut["cause"], "timeout");
+        assert_eq!(
+            (&cut["structured.type"], &cut["structured.misses"], &cut["structured.repairs"]),
+            (&json!("json_object"), &json!(1), &json!(1)),
+            "{cut}"
+        );
+        let gone = line("ignis.request.cancelled", 3);
+        assert_eq!((&gone["structured.misses"], &gone["structured.repairs"]), (&json!(0), &json!(0)), "{gone}");
+        let free = line("ignis.request.cancelled", 4);
+        assert!(free.get("structured.type").is_none() && free.get("structured.misses").is_none(), "{free}");
+
+        let text = metrics.render();
+        for line in [
+            "ignis_structured_requests_total{type=\"json_schema\"} 1",
+            "ignis_structured_requests_total{type=\"json_object\"} 0",
+            "ignis_structured_misses_total{type=\"json_schema\"} 2",
+            "ignis_structured_misses_total{type=\"json_object\"} 0",
+            "ignis_structured_repairs_total{type=\"json_schema\"} 1",
+            "ignis_structured_repair_seconds_count 1",
+        ] {
+            assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
+        }
+    }
+
     /// A cancelled request never completed: its late `Done` is not a
     /// request-duration observation, and one never seen submitted has no span.
     #[test]
@@ -2441,8 +2561,8 @@ mod tests {
         telemetry.with_metrics(Arc::clone(&metrics));
         telemetry.note_submit(1, 3, RequestClass::Interactive);
         telemetry.on_cancelled(1, CancelCause::Consumer);
-        telemetry.on_done(1, 4, FinishReason::Stop, None, None, None, None);
-        telemetry.on_done(99, 4, FinishReason::Stop, None, None, None, None);
+        telemetry.on_done(1, 4, FinishReason::Stop, None, None, None);
+        telemetry.on_done(99, 4, FinishReason::Stop, None, None, None);
 
         let text = metrics.render();
         assert!(text.contains("\nignis_request_duration_seconds_count 0\n"), "{text}");
@@ -2462,7 +2582,7 @@ mod tests {
             telemetry.on_state_reused(2, ReuseSource::KvRam, RetainedKind::Checkpoint, 1536, 42);
             telemetry.on_prefix_reused(4, 32, false, ReuseSource::Device); // a live sibling's
             for id in 1..=4 {
-                telemetry.on_done(id, 1, FinishReason::Stop, None, None, None, None);
+                telemetry.on_done(id, 1, FinishReason::Stop, None, None, None);
             }
         });
         let done = |id: u64| {
@@ -2572,7 +2692,7 @@ mod tests {
         let mut telemetry = Telemetry::new(clock.clone());
         telemetry.note_submit(1, 5, RequestClass::Interactive);
         clock.set(3_000);
-        telemetry.on_done(1, 5, FinishReason::Stop, None, None, None, None);
+        telemetry.on_done(1, 5, FinishReason::Stop, None, None, None);
         clock.set(10_000);
         telemetry.note_submit(2, 5, RequestClass::Interactive);
         clock.set(11_000);
@@ -2588,10 +2708,10 @@ mod tests {
         let mut telemetry = Telemetry::new(clock.clone());
         telemetry.note_submit(1, 5, RequestClass::Interactive);
         clock.set(1_000);
-        telemetry.on_done(1, 5, FinishReason::Stop, None, None, None, None); // held 1 s: the first sample
+        telemetry.on_done(1, 5, FinishReason::Stop, None, None, None); // held 1 s: the first sample
         telemetry.note_submit(2, 5, RequestClass::Interactive);
         clock.set(10_000);
-        telemetry.on_done(2, 5, FinishReason::Stop, None, None, None, None); // held 9 s: 1 + (9 - 1) / 8 = 2 s
+        telemetry.on_done(2, 5, FinishReason::Stop, None, None, None); // held 9 s: 1 + (9 - 1) / 8 = 2 s
         clock.set(20_000);
         telemetry.note_submit(3, 5, RequestClass::Interactive);
         assert_eq!(telemetry.lane_free_at_ms(), Some(22_000));
@@ -2668,9 +2788,9 @@ mod tests {
             telemetry.note_submit(1, 5, RequestClass::Interactive);
             telemetry.on_cancelled(1, CancelCause::Timeout);
             telemetry.on_cancelled(1, CancelCause::Consumer);
-            telemetry.on_done(1, 2, FinishReason::Stop, None, None, None, None);
+            telemetry.on_done(1, 2, FinishReason::Stop, None, None, None);
             telemetry.note_submit(2, 5, RequestClass::Interactive);
-            telemetry.on_done(2, 2, FinishReason::Stop, None, None, None, None);
+            telemetry.on_done(2, 2, FinishReason::Stop, None, None, None);
             telemetry.on_cancelled(2, CancelCause::Consumer);
         });
 
