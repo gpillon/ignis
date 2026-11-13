@@ -78,7 +78,7 @@ snapshot of one date, so check it before you repeat it.
 
 ## Limits
 
-- Function tools only. `text.format` other than text, `background: true`,
+- Function tools only. `background: true`,
   non-function tools and other input item types are refused with OpenAI's
   error and a `param`. `store`, `metadata` and `prompt_cache_key` are accepted
   and change nothing.

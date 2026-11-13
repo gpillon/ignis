@@ -848,9 +848,10 @@ pub(crate) fn render_prompt(
     thinking: &ThinkingOptions,
     tools: &[JsonValue],
     structure: Structure,
+    description: Option<&str>,
 ) -> Result<PreparedRequest, Response> {
     let messages = &conversation(server, messages)?;
-    build_request(server, None, messages, DecodeParams::default(), thinking, tools, structure, None)
+    build_request(server, None, messages, DecodeParams::default(), thinking, tools, structure, description)
         .map_err(template_rejection)
 }
 
@@ -1705,6 +1706,44 @@ fn chat_answer_format(format: Option<&RawValue>) -> Result<AnswerFormat<'_>, Res
             "unsupported_value",
             format!(
                 "response_format: {} is not a format this server serves; send {{\"type\": \"json_schema\", ...}}, {{\"type\": \"json_object\"}} or {{\"type\": \"text\"}}, or omit it",
+                raw.get()
+            ),
+            Some(PARAM),
+        )),
+    }
+}
+
+/// The Responses API's `text`: `{"format": F, "verbosity": ...}`, where `F`
+/// is `{"type": "text"}` (or absent, or `null`), `{"type": "json_object"}`,
+/// or `{"type": "json_schema", "name", "description", "schema", "strict"}`,
+/// the schema's members flat beside the type (GitHub #591). Anything else is
+/// a 400 naming `text.format`; a `text` that is not an object, or names no
+/// format, asks for a free answer, as it always has.
+pub(crate) fn text_answer_format(text: Option<&RawValue>) -> Result<AnswerFormat<'_>, Response> {
+    const PARAM: &str = "text.format";
+    #[derive(Deserialize)]
+    struct Text<'a> {
+        #[serde(borrow)]
+        format: Option<&'a RawValue>,
+    }
+    let Some(raw) = text else { return Ok(AnswerFormat::Free) };
+    let Some(raw) = serde_json::from_str::<Text<'_>>(raw.get()).ok().and_then(|text| text.format) else {
+        return Ok(AnswerFormat::Free);
+    };
+    let value: JsonValue = serde_json::from_str(raw.get()).unwrap_or(JsonValue::Null);
+    if value.is_null() {
+        return Ok(AnswerFormat::Free);
+    }
+    match value.get("type").and_then(JsonValue::as_str) {
+        Some("text") => Ok(AnswerFormat::Free),
+        Some("json_object") => Ok(AnswerFormat::JsonObject),
+        Some("json_schema") => schema_format(raw, PARAM, PARAM).map(AnswerFormat::JsonSchema),
+        _ => Err(error_response_naming(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "unsupported_value",
+            format!(
+                "text.format: {} is not a format this server serves; send {{\"type\": \"json_schema\", \"name\": ..., \"schema\": {{...}}, \"strict\": true}}, {{\"type\": \"json_object\"}} or {{\"type\": \"text\"}}, or omit it",
                 raw.get()
             ),
             Some(PARAM),

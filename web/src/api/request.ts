@@ -74,8 +74,8 @@ export type ConversationRequest = { settings: Settings; turns: Turn[]; extras?: 
 
 /**
  * A reply held to a JSON schema (`response_format`, spec #287): the page's own
- * callers ask for one where they read the reply as data. It goes over chat
- * completions, since the socket has no `text.format` yet (#591).
+ * callers ask for one where they read the reply as data. Over chat completions
+ * it is `response_format`; on the socket, `text.format` (#591).
  */
 export type ResponseFormat = { name: string; schema: object };
 

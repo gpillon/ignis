@@ -226,8 +226,7 @@ pub const CHAT: &[FieldRule] = &[
     },
 ];
 
-/// The Responses body's fields past what the handler reads. `text.format`,
-/// hosted `tools`, `background` and `previous_response_id` are refused where
+/// The Responses body's fields past what the handler reads. Hosted `tools`, `background` and `previous_response_id` are refused where
 /// they are read (`responses::input`).
 ///
 /// `parallel_tool_calls`, `store` and `service_tier` are inert at every

@@ -297,6 +297,11 @@ pub async fn send(socket: &mut Socket, event: JsonValue) {
     socket.send(Message::Text(event.to_string().into())).await.expect("send");
 }
 
+/// Send one frame as written: a JSON event's text, its key order kept.
+pub async fn send_text(socket: &mut Socket, frame: String) {
+    socket.send(Message::Text(frame.into())).await.expect("send");
+}
+
 /// The next text frame, raw, within a generous bound (a hang fails loudly).
 pub async fn next_frame(socket: &mut Socket) -> String {
     loop {

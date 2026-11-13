@@ -38,7 +38,7 @@ use ignis_core::DecodeParams;
 
 use crate::api::{
     bad_request, bad_request_param, content_rejection, error_response, error_response_naming, render_prompt, resolve_model_and_class,
-    forced_tool_call, resolve_thinking, resolve_tools, template_rejection, with_thinking_budget, ApiError, Structure,
+    forced_tool_call, resolve_thinking, resolve_tools, structured_output, template_rejection, with_thinking_budget, ApiError, Structure,
     check_served_kind, split_model_lane, unknown_model,
 };
 use crate::media::has_media;
@@ -82,6 +82,15 @@ pub(crate) struct TokenizeRequest {
     thinking_budget: Option<JsonValue>,
     tools: Option<Vec<JsonValue>>,
     tool_choice: Option<JsonValue>,
+    /// A `json_schema` format's schema is described to the model after the
+    /// conversation, so the count includes that block, as the same body
+    /// served counts it (GitHub #589). The format is validated as chat
+    /// validates it; `json_object` and `text` add nothing.
+    #[schema(value_type = Object)]
+    response_format: Option<Box<serde_json::value::RawValue>>,
+    /// `false` counts the prompt without the schema's description, as chat
+    /// completions would serve it.
+    ignis_describe_schema: Option<JsonValue>,
 }
 
 /// What a body costs before it is served.
@@ -240,14 +249,35 @@ async fn chat(server: &Arc<Server>, req: TokenizeRequest) -> Result<(Vec<u32>, O
     // A forced call changes no render either, but one chat could not force
     // is refused here as it is there. The cap is a sampling field, inert.
     forced_tool_call(server, &tool_choice, &thinking, None)?;
+    // The schema's description is part of the prompt the same body is served
+    // with (GitHub #589), and a format chat would refuse is refused here.
+    let description = structured_output(
+        server,
+        req.response_format.as_deref(),
+        req.ignis_describe_schema.as_ref(),
+        &thinking,
+        &tools,
+        &tool_choice,
+    )?
+    .and_then(|held| held.description);
     let (model, _) = resolve_model_and_class(req.model, None).map_err(|message| bad_request(&message))?;
     if let Some(model) = model.filter(|model| !model.is_empty() && *model != server.active().model_id()) {
         return Err(unknown_model(server, &model));
     }
-    let structure = if req.return_text { Structure::Text } else { Structure::Tokens };
+    // A described render reports no text structure: its text is its ids
+    // spelled back.
+    let structure = if req.return_text && description.is_none() { Structure::Text } else { Structure::Tokens };
+    let return_text = req.return_text;
+    let spelled = Arc::clone(&server.active().template);
     let server = Arc::clone(server);
-    let prepared = blocking(move || render_prompt(&server, &messages, &thinking, &tools, structure)).await??;
-    Ok((prepared.input.tokens, prepared.text.map(|text| text.text)))
+    let prepared =
+        blocking(move || render_prompt(&server, &messages, &thinking, &tools, structure, description.as_deref())).await??;
+    let text = match prepared.text {
+        Some(text) => Some(text.text),
+        None if return_text => Some(spelled.render_tokens(&prepared.input.tokens)),
+        None => None,
+    };
+    Ok((prepared.input.tokens, text))
 }
 
 /// Runs CPU work proportional to a prompt on the blocking pool, so a

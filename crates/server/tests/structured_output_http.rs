@@ -43,6 +43,10 @@ use ignis_server::Server;
 
 const MODEL: &str = "test-model";
 const CHAT: &str = "/v1/chat/completions";
+const RESPONSES: &str = "/v1/responses";
+
+#[path = "support/responses.rs"]
+mod responses;
 
 // ── the test vocabulary ─────────────────────────────────────────────────
 //
@@ -287,9 +291,14 @@ async fn post(app: &axum::Router, body: &JsonValue) -> (u16, Option<String>, Str
 
 /// `body` as written: a schema's keys keep their order.
 async fn post_text(app: &axum::Router, body: &str) -> (u16, Option<String>, String) {
+    post_to(app, CHAT, body).await
+}
+
+/// [`post_text`] to `path`.
+async fn post_to(app: &axum::Router, path: &str, body: &str) -> (u16, Option<String>, String) {
     let request = Request::builder()
         .method("POST")
-        .uri(CHAT)
+        .uri(path)
         .header("content-type", "application/json")
         .body(Body::from(body.to_owned()))
         .unwrap();
@@ -1325,4 +1334,329 @@ async fn a_forced_calls_turn_is_not_told_the_schema() {
         let render = render_of(&agent_turn(question(), tool_choice.clone(), false, false), over_mock).await;
         assert_eq!(render.description.is_some(), described, "{tool_choice}: {render:?}");
     }
+}
+
+// ── text.format on the Responses API (#591) ──────────────────────────────
+
+/// A Responses request holding its answer to `format` (the `text.format`
+/// object as JSON text, sent as written), thinking off, greedy.
+fn responses_body(format: &str, stream: bool, max_output_tokens: u32) -> String {
+    json!({
+        "model": MODEL,
+        "input": "describe a cat",
+        "text": { "format": "FORMAT" },
+        "enable_thinking": false,
+        "temperature": 0,
+        "max_output_tokens": max_output_tokens,
+        "stream": stream,
+    })
+    .to_string()
+    .replace("\"FORMAT\"", format)
+}
+
+/// `body` as a `response.create` frame: the same text, a `type` first, so a
+/// schema's keys keep the order they were sent in.
+fn create_frame(body: &str) -> String {
+    body.replacen('{', "{\"type\":\"response.create\",", 1)
+}
+
+/// `text.format` for a schema, its members flat beside the type.
+fn schema_format_text(schema: &str, strict: bool) -> String {
+    format!(r#"{{"type":"json_schema","name":"answer","strict":{strict},"schema":{schema}}}"#)
+}
+
+/// What a Responses answer says, whole or streamed, over HTTP or the socket.
+#[derive(Debug, PartialEq)]
+struct Reply {
+    text: String,
+    status: String,
+    incomplete: Option<String>,
+}
+
+fn output_text(response: &JsonValue) -> String {
+    response["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "message")
+        .flat_map(|item| item["content"].as_array().unwrap())
+        .filter_map(|part| part["text"].as_str())
+        .collect()
+}
+
+/// The reply in a terminal event's `response`; with `deltas`, the text the
+/// stream's deltas added up to, which must be the response's own.
+fn reply_of(response: &JsonValue, deltas: Option<String>) -> Reply {
+    let text = output_text(response);
+    if let Some(deltas) = deltas {
+        assert_eq!(deltas, text, "the streamed deltas add up to the response's text");
+    }
+    Reply {
+        text,
+        status: response["status"].as_str().unwrap().to_owned(),
+        incomplete: response["incomplete_details"]["reason"].as_str().map(str::to_owned),
+    }
+}
+
+/// The reply to `body` over HTTP, whole or streamed as `stream` says.
+async fn responses_reply(app: &axum::Router, body: &str, stream: bool) -> Reply {
+    let (status, _, text) = post_to(app, RESPONSES, body).await;
+    assert_eq!(status, 200, "{body}: {text}");
+    if !stream {
+        return reply_of(&serde_json::from_str::<JsonValue>(&text).unwrap(), None);
+    }
+    let events = responses::sse_events(&text);
+    let deltas = events
+        .iter()
+        .filter(|(name, _)| name == "response.output_text.delta")
+        .map(|(_, event)| event["delta"].as_str().unwrap())
+        .collect();
+    let (_, last) = events.last().expect("a terminal event");
+    reply_of(&last["response"], Some(deltas))
+}
+
+/// The reply to `body` as a `response.create` on the WebSocket mode.
+async fn socket_reply(live: &responses::Live, body: &str) -> Reply {
+    let mut socket = responses::socket(live).await;
+    responses::send_text(&mut socket, create_frame(body)).await;
+    let events = responses::events_until(&mut socket, responses::terminal).await;
+    let deltas = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_text.delta")
+        .map(|event| event["delta"].as_str().unwrap())
+        .collect();
+    let last = events.last().unwrap();
+    assert!(last["type"] == "response.completed" || last["type"] == "response.incomplete", "{last}");
+    reply_of(&last["response"], Some(deltas))
+}
+
+/// A server over the test vocabulary whose request 0 writes `script`,
+/// serving on a socket.
+async fn live_over(script: &str) -> (responses::Live, Arc<MockCompute>) {
+    let mock = Arc::new(MockCompute::new());
+    mock.script(0, &encode(script));
+    (responses::live(server(mock.clone(), SchedulerConfig::default())).await, mock)
+}
+
+/// Acceptance 1 and 4: whatever the model misses, the answer under
+/// `text.format` is valid under the schema over HTTP, streamed or whole, and
+/// over the WebSocket mode, and all three carry the same answer.
+#[tokio::test]
+async fn responses_text_format_json_schema_answers_validate_under_scripted_misses() {
+    for miss in misses() {
+        let format = schema_format_text(miss.schema, true);
+        let (app, mock) = app(miss.script);
+        let whole = responses_reply(&app, &responses_body(&format, false, 256), false).await;
+        assert_eq!(whole.status, "completed", "{}: {whole:?}", miss.what);
+        let value: JsonValue =
+            serde_json::from_str(&whole.text).unwrap_or_else(|e| panic!("{}: not JSON ({e}): {whole:?}", miss.what));
+        assert!((miss.holds)(&value), "{}: {}", miss.what, whole.text);
+        assert!(!mock.repair_calls().is_empty(), "{}: the scripted misses were repaired", miss.what);
+        let (app, _) = self::app(miss.script);
+        let streamed = responses_reply(&app, &responses_body(&format, true, 256), true).await;
+        assert_eq!(streamed, whole, "{}: streamed and whole", miss.what);
+        let (live, mock) = live_over(miss.script).await;
+        let socket = socket_reply(&live, &responses_body(&format, false, 256)).await;
+        assert_eq!(socket, whole, "{}: the socket and HTTP", miss.what);
+        assert!(!mock.repair_calls().is_empty(), "{}: repaired on the socket", miss.what);
+    }
+}
+
+/// `text.format` keeps the schema's key order over HTTP and over the socket,
+/// whose frame is parsed into a value that sorts them.
+#[tokio::test]
+async fn responses_text_format_writes_keys_in_the_schemas_order() {
+    const SCHEMA: &str = r#"{"type":"object","properties":{"zeta":{"type":"integer"},"alpha":{"type":"integer"}},"required":["zeta","alpha"],"additionalProperties":false}"#;
+    let format = schema_format_text(SCHEMA, true);
+    let (app, _) = app(r#"{"alpha": 1, "zeta": 2}"#);
+    let http = responses_reply(&app, &responses_body(&format, false, 128), false).await;
+    let (live, _) = live_over(r#"{"alpha": 1, "zeta": 2}"#).await;
+    let socket = socket_reply(&live, &responses_body(&format, false, 128)).await;
+    for got in [&http, &socket] {
+        assert!(got.text.starts_with("{\"zeta\"") && got.text.find("\"alpha\"") > got.text.find("\"zeta\""), "{got:?}");
+    }
+}
+
+/// `json_object` on Responses: the misses the chat test scripts.
+#[tokio::test]
+async fn responses_text_format_json_object_answers_a_valid_object_under_scripted_misses() {
+    let cases: [(&str, &str, JsonValue); 4] = [
+        ("a prose preamble", "Sure! Here it is:\n{\"a\": 1}", json!({ "a": 1 })),
+        ("a code fence", "```json\n{\"a\": 1}\n```", json!({ "a": 1 })),
+        ("a remark after the object", "{\"a\": 1}\nThat is all.", json!({ "a": 1 })),
+        ("an early stop", "{\"a\": [1, 2", json!({ "a": [1, 2] })),
+    ];
+    let format = r#"{"type":"json_object"}"#;
+    for (what, script, expected) in cases {
+        let (app, mock) = app(script);
+        let whole = responses_reply(&app, &responses_body(format, false, 64), false).await;
+        assert_eq!(whole.status, "completed", "{what}: {whole:?}");
+        assert_eq!(JsonValue::Object(object(&whole.text)), expected, "{what}: {whole:?}");
+        assert!(!mock.repair_calls().is_empty(), "{what}: repaired");
+        let (app, _) = self::app(script);
+        assert_eq!(responses_reply(&app, &responses_body(format, true, 64), true).await, whole, "{what}: streamed");
+        let (live, _) = live_over(script).await;
+        assert_eq!(socket_reply(&live, &responses_body(format, false, 64)).await, whole, "{what}: socket");
+    }
+}
+
+/// Acceptance 3: a cut by `max_output_tokens` is `incomplete` with
+/// `incomplete_details.reason: "max_output_tokens"` and the text as
+/// generated, as a free answer's cut is, over HTTP and the socket.
+#[tokio::test]
+async fn a_cut_by_max_output_tokens_is_incomplete_as_a_free_answers_is() {
+    let script = "{\"a\": \"hello world\"}";
+    let expected = Reply { text: "{\"a\": ".into(), status: "incomplete".into(), incomplete: Some("max_output_tokens".into()) };
+    for stream in [false, true] {
+        let (app, _) = app(script);
+        let held = responses_body(r#"{"type":"json_object"}"#, stream, 6);
+        assert_eq!(responses_reply(&app, &held, stream).await, expected, "stream {stream}");
+    }
+    let (live, _) = live_over(script).await;
+    assert_eq!(socket_reply(&live, &responses_body(r#"{"type":"json_object"}"#, false, 6)).await, expected, "socket");
+    // A free answer is cut the same way.
+    let (app, _) = app(script);
+    let free = responses_body(r#"{"type":"text"}"#, false, 6);
+    assert_eq!(responses_reply(&app, &free, false).await, expected, "a free answer");
+}
+
+/// Acceptance 2: every refusal is a 400 naming `text.format` and the keyword
+/// or limit, before anything is generated, over HTTP and over the socket.
+#[tokio::test]
+async fn text_format_refusals_name_the_field_and_the_keyword_or_limit() {
+    let object = |inner: &str| {
+        format!(r#"{{"type":"object","properties":{{"a":{inner}}},"required":["a"],"additionalProperties":false}}"#)
+    };
+    let properties: Vec<String> = (0..=5000).map(|i| format!(r#""p{i}":{{"type":"null"}}"#)).collect();
+    let cases: Vec<(&str, String, &str, &str)> = vec![
+        ("a keyword outside the subset", schema_format_text(&object(r#"{"type":"string","allOf":[]}"#), true), "unsupported_keyword", "`allOf`"),
+        ("a root that is not an object", schema_format_text(r#"{"type":"string"}"#, true), "root_not_object", "`type`"),
+        (
+            "too many properties",
+            schema_format_text(&format!(r#"{{"type":"object","properties":{{{}}}}}"#, properties.join(",")), false),
+            "too_many_properties",
+            "`properties`",
+        ),
+        ("no schema", r#"{"type":"json_schema","name":"x"}"#.into(), "invalid_request_error", "`schema` is required"),
+        ("a strict that is not a boolean", r#"{"type":"json_schema","name":"x","strict":"yes","schema":{}}"#.into(), "invalid_request_error", "`strict`"),
+        ("another type", r#"{"type":"xml"}"#.into(), "unsupported_value", "xml"),
+    ];
+    for (what, format, code, mention) in cases {
+        let body = responses_body(&format, false, 64);
+        let mock = Arc::new(MockCompute::new());
+        let app = server(mock.clone(), SchedulerConfig::default()).app();
+        let (status, _, text) = post_to(&app, RESPONSES, &body).await;
+        assert_eq!(status, 400, "{what}: {}", &text[..text.len().min(300)]);
+        let v: JsonValue = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["error"]["code"], code, "{what}: {text}");
+        assert_eq!(v["error"]["param"], "text.format", "{what}: {text}");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("text.format"), "{what}: {message}");
+        assert!(message.contains(mention), "{what}: the message names {mention}: {message}");
+        assert!(mock.prefill_calls().is_empty() && mock.decode_calls().is_empty(), "{what}: nothing was generated");
+
+        let (live, _) = live_over("").await;
+        let mut socket = responses::socket(&live).await;
+        responses::send_text(&mut socket, create_frame(&body)).await;
+        let event = responses::next_event(&mut socket).await;
+        assert_eq!(event["type"], "error", "{what}: {event}");
+        assert_eq!(event["error"]["param"], "text.format", "{what}: {event}");
+        assert_eq!(event["error"]["code"], code, "{what}: {event}");
+    }
+}
+
+/// The response echoes `text.format` as sent, and a free request's `text`.
+#[tokio::test]
+async fn the_response_echoes_its_text_format() {
+    let (app, _) = app("{}");
+    let (_, _, text) = post_to(&app, RESPONSES, &responses_body(r#"{"type":"json_object"}"#, false, 8)).await;
+    let v: JsonValue = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["text"]["format"], json!({ "type": "json_object" }), "{text}");
+    let (app, _) = self::app("hi");
+    let free = json!({ "model": MODEL, "input": "hi", "max_output_tokens": 4 }).to_string();
+    let (_, _, text) = post_to(&app, RESPONSES, &free).await;
+    let v: JsonValue = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["text"]["format"], json!({ "type": "text" }), "{text}");
+}
+
+/// The renders a Responses request for [`CAT`] (described as "A cat.") makes,
+/// with `extra` fields beside it.
+async fn responses_renders(extra: JsonValue) -> Vec<Render> {
+    let format = format!(r#"{{"type":"json_schema","name":"cat","description":"A cat.","strict":true,"schema":{CAT}}}"#);
+    let mut body: JsonValue = serde_json::from_str(&responses_body(r#"{"type":"text"}"#, false, 16)).unwrap();
+    for (field, value) in extra.as_object().unwrap() {
+        body[field] = value.clone();
+    }
+    let body = body.to_string().replace(r#"{"type":"text"}"#, &format);
+    let vocabulary = Vocabulary::new();
+    let app = over_mock(vocabulary.clone()).app();
+    let (status, _, text) = post_to(&app, RESPONSES, &body).await;
+    assert_eq!(status, 200, "{text}");
+    vocabulary.renders()
+}
+
+/// The schema is described to the model after the conversation on the
+/// Responses API too, with the format's `description`, and
+/// `ignis_describe_schema: false` leaves the prompt as sent.
+#[tokio::test]
+async fn a_responses_json_schema_is_described_unless_the_request_says_not() {
+    let on = responses_renders(json!({})).await;
+    assert_eq!(on.len(), 1, "{on:?}");
+    assert_eq!(on[0].description.as_deref(), Some(CAT_DESCRIBED));
+    let off = responses_renders(json!({ "ignis_describe_schema": false })).await;
+    assert_eq!(off[0].description, None, "{off:?}");
+    assert!(on[0].tokens.len() > off[0].tokens.len());
+}
+
+// ── /v1/tokenize counts the description (#589, #591) ─────────────────────
+
+async fn tokenize(app: &axum::Router, body: JsonValue) -> JsonValue {
+    let (status, _, text) = post_to(app, "/v1/tokenize", &body.to_string().replace("\"SCHEMA\"", CAT)).await;
+    assert_eq!(status, 200, "{text}");
+    serde_json::from_str(&text).unwrap()
+}
+
+/// `usage.prompt_tokens` of a served chat completion of `messages` held to
+/// `format`.
+async fn served_prompt_tokens(app: &axum::Router, messages: &JsonValue, format: &JsonValue) -> u64 {
+    let body = json!({
+        "model": MODEL, "messages": messages, "response_format": format,
+        "enable_thinking": false, "max_tokens": 4, "temperature": 0,
+    })
+    .to_string()
+    .replace("\"SCHEMA\"", CAT);
+    let (status, _, text) = post_text(app, &body).await;
+    assert_eq!(status, 200, "{text}");
+    serde_json::from_str::<JsonValue>(&text).unwrap()["usage"]["prompt_tokens"].as_u64().unwrap()
+}
+
+/// The count of a `json_schema` body includes the description, and is the
+/// `usage.prompt_tokens` the same body reports when served.
+#[tokio::test]
+async fn tokenize_counts_the_schema_description_chat_serves_the_body_with() {
+    let app = over_mock(Vocabulary::new()).app();
+    let messages = json!([{ "role": "user", "content": "describe a cat" }]);
+    let format = json!({ "type": "json_schema", "json_schema": { "name": "cat", "description": "A cat.", "strict": true, "schema": "SCHEMA" } });
+    let count = |v: &JsonValue| v["count"].as_u64().unwrap();
+    let described =
+        tokenize(&app, json!({ "messages": messages, "response_format": format, "enable_thinking": false, "return_text": true })).await;
+    let off = tokenize(
+        &app,
+        json!({ "messages": messages, "response_format": format, "ignis_describe_schema": false, "enable_thinking": false }),
+    )
+    .await;
+    let free = tokenize(&app, json!({ "messages": messages, "enable_thinking": false })).await;
+    let object =
+        tokenize(&app, json!({ "messages": messages, "response_format": { "type": "json_object" }, "enable_thinking": false })).await;
+    assert_eq!(count(&off), count(&free), "off counts the conversation");
+    assert_eq!(count(&object), count(&free), "json_object adds nothing");
+    // The placeholder template is one token per word: the sentence alone is eleven.
+    assert!(count(&described) >= count(&free) + 11, "{described} vs {free}");
+    assert_eq!(described["text"].as_str().unwrap().chars().count() as u64, count(&described), "the text spells the ids: {described}");
+    assert_eq!(served_prompt_tokens(&app, &messages, &format).await, count(&described), "the count is the served prompt");
+    // A schema chat refuses is refused here, naming the field.
+    let refused = json!({ "messages": messages, "response_format": { "type": "json_schema", "json_schema": { "name": "x", "schema": { "type": "string" }, "strict": true } } });
+    let (status, _, text) = post_to(&app, "/v1/tokenize", &refused.to_string()).await;
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("\"param\":\"response_format\""), "{text}");
 }

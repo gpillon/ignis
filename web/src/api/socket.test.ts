@@ -250,6 +250,25 @@ describe("streamChat and the transport", () => {
   });
 });
 
+describe("a reply held to a schema", () => {
+  it("goes over the socket as text.format, not over HTTP", async () => {
+    const h = harness();
+    const streamChat = createStreamChat(h.socket);
+    const sent: string[] = [];
+    const responseFormat = { name: "verdict", schema: { type: "object" } };
+    void streamChat({
+      request: { ...request([user("a")]), responseFormat },
+      fetch: (async (url: string) => (sent.push(url), new Response("", { status: 200 }))) as typeof fetch,
+      onEvent: () => {},
+    });
+    await tick();
+    h.sockets[0].accept();
+    await tick();
+    expect(sent).toEqual([]);
+    expect(h.sockets[0].creates()[0]).toMatchObject({ text: { format: { type: "json_schema", name: "verdict", strict: true } } });
+  });
+});
+
 describe("a reply on the socket", () => {
   it("is the same events and figures as the same reply over HTTP", async () => {
     const h = harness();

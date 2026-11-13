@@ -5,6 +5,7 @@
 //! completions — and ADR 0029's content-matched reuse hits across both.
 
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::{json, Value as JsonValue};
 use utoipa::ToSchema;
 
@@ -60,10 +61,20 @@ pub(crate) struct CreateResponse {
     /// `summary` is accepted and produces nothing.
     #[schema(value_type = Object)]
     reasoning: Option<JsonValue>,
-    /// `{format: {type: "text"}, verbosity}`: only the `text` format is
-    /// served (structured output is not); `verbosity` is ignored.
+    /// `{format, verbosity}`: `format` is `{type: "text"}` (the default),
+    /// `{type: "json_object"}`, or `{type: "json_schema", name, schema,
+    /// strict, description}`, which hold the answer to a valid JSON object or
+    /// to the schema as `response_format` does on chat completions (GitHub
+    /// #591); `verbosity` is ignored. Kept as the text the client sent: the
+    /// answer writes a schema's keys in the order it names them, which a
+    /// parsed value loses.
     #[schema(value_type = Object)]
-    text: Option<JsonValue>,
+    pub(crate) text: Option<Box<RawValue>>,
+    /// An ignis extension, as on chat completions: `false` leaves the prompt
+    /// as sent instead of describing a `json_schema` to the model after the
+    /// conversation; absent or `null` takes the server's default.
+    #[schema(value_type = bool)]
+    ignis_describe_schema: Option<JsonValue>,
     /// `true` is a 400: ignis serves no background responses.
     #[schema(value_type = bool)]
     background: Option<JsonValue>,
@@ -201,15 +212,6 @@ pub(crate) async fn prepare(
     api::check_served_kind(server, ModelKind::Text, api::split_model_lane(req.model.clone()).0.as_deref())?;
     crate::openai_fields::check(&req.other, crate::openai_fields::Surface::Responses)
         .map_err(api::refused_field)?;
-    if let Some(text) = &req.text {
-        let format = text.get("format").and_then(|f| f.get("type"));
-        if format.is_some_and(|f| f != "text") {
-            return Err(api::bad_request_param(
-                &format!("text.format {} is not served: this server returns plain text only (no structured output)", format.unwrap()),
-                "text.format",
-            ));
-        }
-    }
     if req.background.as_ref().is_some_and(|b| b == &JsonValue::Bool(true)) {
         return Err(api::bad_request_param("background responses are not supported", "background"));
     }
@@ -261,12 +263,24 @@ pub(crate) async fn prepare(
         api::with_thinking_budget(server, params, req.thinking_budget.as_ref(), effort.as_ref(), &thinking)?;
     let cap = req.max_output_tokens.map(|cap| (cap, "max_output_tokens"));
     let forced = api::forced_tool_call(server, &tool_choice, &thinking, cap)?;
+    // `text.format`, read as chat reads `response_format` (GitHub #591): a
+    // refusal comes before anything is rendered or generated. A warm-up
+    // generates nothing, so it is told no schema and holds no grammar.
+    let describe = api::describe_schema(server, req.ignis_describe_schema.as_ref())?;
+    let format = api::text_answer_format(req.text.as_deref())?;
+    let held = api::hold_answer(server, format, describe, &thinking, &tools, &tool_choice, "text.format")?
+        .filter(|_| !warm_up);
+    let (grammar, description) = match held {
+        Some(held) => (Some(held.grammar), held.description.filter(|_| !system_only)),
+        None => (None, None),
+    };
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
         .map_err(|message| api::bad_request(&message))?;
     let schemas = ToolSchemas::from_tools(&tools);
     let (mut input, model, mut prompt_tokens, media) =
-        api::prepare_request(server, model, &messages, params, &thinking, &tools, None).await?;
+        api::prepare_request(server, model, &messages, params, &thinking, &tools, description.as_deref()).await?;
     input.warm_up = warm_up;
+    input.grammar = grammar;
     // A warm-up generates nothing, so it has no call to force.
     input.forced_literal = forced.filter(|_| !warm_up);
     if system_only {
@@ -303,7 +317,7 @@ pub(crate) async fn prepare(
         reasoning: json!({ "effort": effort, "summary": null }),
         store: req.store.as_ref().and_then(JsonValue::as_bool).unwrap_or(true),
         temperature: wire_number(params.temperature),
-        text: json!({ "format": { "type": "text" } }),
+        text: echoed_text(req.text.as_deref()),
         tool_choice: req.tool_choice.clone().unwrap_or_else(|| json!("auto")),
         tools: req.tools.clone().unwrap_or_default(),
         top_p: wire_number(params.top_p),
@@ -331,6 +345,26 @@ pub(crate) async fn prepare(
         },
         starts_in_reasoning,
     })
+}
+
+/// The `text` a response reports: the request's `format` as sent, or `text`
+/// when it named none.
+fn echoed_text(text: Option<&RawValue>) -> JsonValue {
+    let format = text
+        .and_then(|raw| serde_json::from_str::<JsonValue>(raw.get()).ok())
+        .and_then(|text| text.get("format").filter(|format| !format.is_null()).cloned());
+    json!({ "format": format.unwrap_or_else(|| json!({ "type": "text" })) })
+}
+
+/// A `response.create` frame's `text`, as the client sent it: a frame is
+/// parsed into a value to be read field by field, and a value has lost its
+/// schema's key order ([`CreateResponse::text`]).
+pub(crate) fn frame_text(frame: &str) -> Option<Box<RawValue>> {
+    #[derive(Deserialize)]
+    struct Frame {
+        text: Option<Box<RawValue>>,
+    }
+    serde_json::from_str::<Frame>(frame).ok().and_then(|frame| frame.text)
 }
 
 /// The Responses `tools` in the shape chat completions takes (spec
