@@ -722,8 +722,8 @@ fn speculation_text(speculation: Option<ignis_core::Speculation>) -> String {
                 s.draft_tokens(),
                 s.proposal_head().as_str(),
                 s.draft_rule().as_str(),
-                f64::from(drafter.temperature_factor_milli) / 1000.0,
-                f64::from(drafter.top_p_milli) / 1000.0
+                crate::config::decimal_text(drafter.temperature_factor_milli),
+                crate::config::decimal_text(drafter.top_p_milli)
             )
         },
     )

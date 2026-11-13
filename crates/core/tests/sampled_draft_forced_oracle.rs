@@ -23,20 +23,11 @@
 #[path = "support/draft_oracle.rs"]
 mod draft_oracle;
 
-use draft_oracle::{draw_share, grid, lane_tolerance, verdict_share};
+use draft_oracle::{draw_share, grid, lane_tolerance, verdict_share, CELLS, DRAFT_CELLS, TARGET_IDS, TARGET_PROBS};
 use ignis_core::sampled_draft::{accept_verdict, draw_draft, forced_verdict, ColumnUniforms, Distribution, Verdict};
 
-/// Cells per uniform of the accept and the refusal, and of the draft's own
-/// (the rule's oracle test's).
-const CELLS: usize = 1024;
-const DRAFT_CELLS: usize = 1 << 20;
 /// Cells of the coin's uniform.
 const COIN_CELLS: usize = 1 << 12;
-
-/// The rule's oracle target: 24, 16, 10, 6, 4, 2, 1 and 1 sixty-fourths, in
-/// the sampler's order.
-const TARGET_IDS: [i32; 8] = [501, 77, 9030, 12, 4410, 365, 2048, 88];
-const TARGET_PROBS: [f32; 8] = [0.375, 0.25, 0.15625, 0.09375, 0.0625, 0.03125, 0.015625, 0.015625];
 
 /// A token neither distribution holds.
 const STRANGER: i32 = 999_999;

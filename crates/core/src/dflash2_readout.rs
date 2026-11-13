@@ -71,8 +71,7 @@ impl Dflash2Proposal {
 
     /// The probability q gives column `column`'s draft.
     pub fn draft_q(&self, column: usize) -> f32 {
-        let candidates = self.candidates(column);
-        self.q(column).iter().zip(candidates).filter(|&(_, &id)| id == self.drafts[column]).map(|(&q, _)| q).sum()
+        crate::sampled_draft::Distribution::new(self.candidates(column), self.q(column)).prob(self.drafts[column])
     }
 
     /// The transition score of successor `succ` at `column` after predecessor

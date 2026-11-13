@@ -28,6 +28,17 @@ use std::collections::BTreeMap;
 
 use ignis_core::sampled_draft::Verdict;
 
+/// Cells per uniform of the accept and the refusal.
+pub const CELLS: usize = 1024;
+/// Cells of the draft's own uniform.
+pub const DRAFT_CELLS: usize = 1 << 20;
+
+/// The target's sampling distribution at the column every test of the rule
+/// holds its lanes to, in the sampler's order: 24, 16, 10, 6, 4, 2, 1 and 1
+/// sixty-fourths.
+pub const TARGET_IDS: [i32; 8] = [501, 77, 9030, 12, 4410, 365, 2048, 88];
+pub const TARGET_PROBS: [f32; 8] = [0.375, 0.25, 0.15625, 0.09375, 0.0625, 0.03125, 0.015625, 0.015625];
+
 /// The grid of one uniform: the midpoints of `cells` equal cells of [0, 1),
 /// exact in f32 for a power of two up to 2^23.
 pub fn grid(cells: usize) -> Vec<f32> {
@@ -143,5 +154,16 @@ pub fn assert_emits_target(case: &str, target_ids: &[i32], target_probs: &[f32],
             target_ids.iter().zip(target_probs).any(|(&id, &p)| id == token && p > 0.0),
             "{case}: token {token} is outside the target's support and was emitted on {share:.6} of the grid"
         );
+    }
+}
+
+/// A draft [`TARGET_IDS`] gives no probability to is refused on every point
+/// of the accept's grid, whatever the refusal's uniform: `accepted` holds each
+/// drawn draft and the share of the grid on which it was taken.
+pub fn assert_outside_drafts_always_refused(case: &str, accepted: &[(i32, f64)]) {
+    let outside: Vec<_> = accepted.iter().filter(|(draft, _)| !TARGET_IDS.contains(draft)).collect();
+    assert!(!outside.is_empty(), "{case}: no draft outside the support was drawn");
+    for (draft, share) in outside {
+        assert_eq!(*share, 0.0, "{case}: draft {draft}, outside the target's support, was taken on {share} of the grid");
     }
 }

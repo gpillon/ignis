@@ -1133,6 +1133,15 @@ the 27B's, ADR 0090): the **fixed draft**, the selector walk's one draft per
 column taken with the target's probability of it (the vendored accept), or
 the **sampled draft**. Greedy lanes draft and accept the same way under both.
 
+**Fixed draft**:
+The **draft rule** under which a sampling lane's drafts are the drafter's single
+best per column (under DFlash2 the selector walk's), each taken with the
+target's probability of it and, on a refusal, replaced by a draw from the
+target's distribution without it: the vendored accept's rule, the rule of
+speculative sampling for a drafter whose distribution is one-hot. Every round
+of the releases before 0.11.0 drafted by it, Flash-Next's MTP rounds draft by
+it, and `--spec-draft-rule fixed` selects it on the 27B.
+
 **Sampled draft**:
 The **draft rule** under which a sampling lane draws each draft from the
 drafter's distribution q over the column's 16 candidates (the selector's

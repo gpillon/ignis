@@ -55,9 +55,10 @@
 //! One `#[test]`, several `Model`/`SeqPool` loads against one shared
 //! `materialize()` (see `decode_graph_gpu.rs`: materialized weights are
 //! never freed until the artifact drops, so a second `materialize()` in
-//! this process would exhaust VRAM). GitHub #576 adds a second, the same
-//! round under the sampled draft (ADR 0090), which runs first and frees its
-//! weights when it is done.
+//! this process would exhaust VRAM). GitHub #576 adds two more, the same
+//! round under the sampled draft (ADR 0090) and its lanes at extent 0 or cut
+//! by their budget, which run first and free their weights when they are
+//! done.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact, GPU, or kernel error is a **skip**; under the profile
@@ -938,6 +939,131 @@ fn sampled_draft_rounds_commit_what_todays_rule_commits() {
         assert_eq!(eager.emitted, graph.emitted, "sampled draft, width {width}: verify graph replay diverged from eager");
         assert_eq!(eager.rounds, graph.rounds, "sampled draft, width {width}: replay accepted differently from eager");
     }
+    // The test after this one in the binary materializes its own.
+    let _ = artifact.release_arena(&mut device);
+}
+
+/// One verify round on a fresh sequence: `prompt` prefilled under
+/// `sampling`, then `drafts` offered under a budget of `budget` tokens. The
+/// run it commits, and the frontier after it.
+fn budgeted_round(model: &Model, pool: &SeqPool, prompt: &[i32], sampling: SamplingParams, drafts: &[i32], budget: u32) -> (Vec<i32>, u64) {
+    let mut seq = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
+    prefill_program_sampled(model, pool, &mut seq, prompt, 0, sampling, None).unwrap_or_else(|e| panic!("prefill: {e}"));
+    let lanes = [VerifyLane { sampling, remaining_tokens: budget, stop_ids: &[], drafts, reasoning_close: -1 }];
+    let run = decode_program_verify(model, pool, &mut [&mut seq], &lanes, WINDOW)
+        .unwrap_or_else(|e| panic!("verify round, budget {budget}: {e}"))
+        .remove(0);
+    (run, seq.stats().position)
+}
+
+/// What one draft rule's rounds commit for
+/// [`sampled_draft_lanes_at_extent_0_or_cut_by_their_budget_commit_what_the_fixed_draft_commits`].
+#[derive(Debug, PartialEq)]
+struct ExtentRuns {
+    /// Sampled lanes at a wide support offered no drafts, a whole run of them
+    /// in one batch: each lane's text, and the rounds it took.
+    extent0: (Vec<Vec<i32>>, usize),
+    /// A lane at a one-candidate support offered the whole window under each
+    /// budget from 1 to the window and one: its run and its frontier.
+    cut: Vec<(Vec<i32>, u64)>,
+    /// Each sampled lane at a wide support offered the whole window under a
+    /// budget of 1: its run and its frontier.
+    cut_to_0: Vec<(Vec<i32>, u64)>,
+}
+
+fn extent_runs(model: &Model, prompts: &[Vec<i32>], wide: &[SamplingParams], peaked: SamplingParams, drafts: &[i32]) -> ExtentRuns {
+    let pool = verify_pool(prompts.len() as u32);
+    let _ = capture_decode_graphs(model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    let nothing = run_verify_lanes(model, &pool, prompts, wide, Drafter::Nothing, &[], TOTAL, true);
+    let cut = (1..=WINDOW + 1).map(|budget| budgeted_round(model, &pool, &prompts[0], peaked, drafts, budget)).collect();
+    let cut_to_0 = prompts.iter().zip(wide).map(|(prompt, &sampling)| budgeted_round(model, &pool, prompt, sampling, drafts, 1)).collect();
+    ExtentRuns { extent0: (nothing.emitted, nothing.rounds.len()), cut, cut_to_0 }
+}
+
+/// GitHub #576 (spec #574, ADR 0090): a sampled lane at extent 0, and a
+/// sampled lane whose budget cuts the window it is offered, commit under the
+/// sampled draft exactly what they commit under the fixed draft. At extent 0
+/// a round draws only the token after its pending one, which both rules draw
+/// from the same target distribution, by the same purpose at the same
+/// position: a whole run of such rounds at a wide support, penalties on,
+/// writes the same text under both, one token a round, and so does a budget
+/// of one token offered the whole window. A budget of b tokens cuts the
+/// window to b - 1 drafts; at a one-candidate support (top_k = 1) every
+/// verdict and every draw of either rule is the target's one token, so each
+/// cut commits the same run under both, never past the budget, the frontier
+/// at its end.
+///
+/// Named to run before the test that keeps its materialized weights to the
+/// end of the binary: this one frees its own when it is done.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn sampled_draft_lanes_at_extent_0_or_cut_by_their_budget_commit_what_the_fixed_draft_commits() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let (plan, handles) = bind_text_scope_27b(&reader).unwrap_or_else(|e| panic!("bind: {e}"));
+    let mut device = match CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let prompts: Vec<Vec<i32>> = (0..4).map(prompt_for).collect();
+    let wide: Vec<SamplingParams> = (0..4)
+        .map(|i| SamplingParams { temperature: 1.0, top_k: 20, top_p: 0.95, presence_penalty: 0.1, frequency_penalty: 0.1, seed: 5150 + i })
+        .collect();
+    let peaked = SamplingParams { temperature: 0.9, top_k: 1, top_p: 1.0, presence_penalty: 0.0, frequency_penalty: 0.0, seed: 77 };
+
+    // The drafts a cut is offered: the spec-off text at top_k = 1, so the
+    // round takes them and the budget is what cuts the run.
+    let model = load_plain(&reader, &artifact, &handles);
+    let pool = new_pool(1);
+    let stream = spec_off_streams(&model, &pool, &prompts[..1], peaked, WINDOW as usize + 1).remove(0);
+    drop(pool);
+    drop(model);
+    let drafts = stream[1..=WINDOW as usize].to_vec();
+
+    let fixed = {
+        let model = load_verify(&reader, &artifact, &handles);
+        extent_runs(&model, &prompts, &wide, peaked, &drafts)
+    };
+    let sampled = {
+        let model = load_verify_sampled(&reader, &artifact, &handles);
+        extent_runs(&model, &prompts, &wide, peaked, &drafts)
+    };
+
+    assert_eq!(fixed.extent0.1, TOTAL, "extent 0 commits one token per round");
+    assert_eq!(sampled.extent0, fixed.extent0, "sampled lanes at extent 0 wrote another text under the sampled draft than under the fixed draft");
+    for (rule, runs) in [("fixed", &fixed), ("sampled", &sampled)] {
+        for (budget, (run, position)) in (1..).zip(&runs.cut) {
+            assert!(!run.is_empty() && run.len() <= budget, "{rule} draft, budget {budget}: a run of {}", run.len());
+            assert_eq!(*position, (prompts[0].len() + run.len()) as u64, "{rule} draft, budget {budget}: the frontier is not at the run's end");
+        }
+        for (lane, (run, _)) in runs.cut_to_0.iter().enumerate() {
+            assert_eq!(run.len(), 1, "{rule} draft, lane {lane}: a budget of one commits one token");
+        }
+    }
+    assert!(
+        (1..).zip(&fixed.cut).any(|(budget, (run, _))| budget > 1 && budget <= WINDOW as usize && run.len() == budget),
+        "no budget cut a run the drafts would have made longer: {:?}",
+        fixed.cut
+    );
+    assert_eq!(sampled.cut, fixed.cut, "a sampled lane cut by its budget committed another run under the sampled draft");
+    assert_eq!(sampled.cut_to_0, fixed.cut_to_0, "a sampled lane cut to extent 0 by its budget drew another token under the sampled draft");
     // The test after this one in the binary materializes its own.
     let _ = artifact.release_arena(&mut device);
 }

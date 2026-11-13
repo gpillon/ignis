@@ -118,6 +118,12 @@ served id, published under its own license. The abliterated variant and Swift
 1.5 (`swift-1.5-27b`) are fine-tunes of the 27B. See
 [fine-tunes](../guides/fine-tunes.md).
 
+**Fixed draft.** The way the releases before 0.11.0 drafted for a request that
+samples, and Flash-Next's MTP head always does: the drafter proposes its single
+best draft and the round takes it with the model's probability of it. On the 27B
+`--spec-draft-rule fixed` selects it. See
+[speculative decoding](../concepts/speculative-decoding.md#acceptance-under-sampling).
+
 **Flash-Next.** Qwen3.8-Flash-Next, the 125B mixture-of-experts model with 6B
 active parameters. See [models and artifacts](../concepts/models-and-artifacts.md).
 

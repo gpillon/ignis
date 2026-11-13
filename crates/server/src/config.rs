@@ -1744,8 +1744,9 @@ fn derive_speculation(
     Ok((Some(speculation.with_proposal_head(head).with_draft_rule(rule, drafter)), false))
 }
 
-/// A decimal field's value as its flag would spell it (thousandths to `0.9`).
-fn decimal_text(thousandths: u32) -> String {
+/// A decimal field's value as its flag would spell it (thousandths to `0.9`):
+/// what an error and the load's log write.
+pub(crate) fn decimal_text(thousandths: u32) -> String {
     (f64::from(thousandths) / 1000.0).to_string()
 }
 

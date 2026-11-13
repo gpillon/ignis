@@ -22,19 +22,12 @@
 #[path = "support/draft_oracle.rs"]
 mod draft_oracle;
 
-use draft_oracle::{assert_emits_target, column_share, draw_share, grid, lane_share, lane_tolerance};
+use draft_oracle::{
+    assert_emits_target, assert_outside_drafts_always_refused, column_share, draw_share, grid, lane_share, lane_tolerance,
+    CELLS, DRAFT_CELLS, TARGET_IDS, TARGET_PROBS,
+};
 use ignis_core::dflash2_readout::{Dflash2Proposal, TOP_K};
 use ignis_core::sampled_draft::{accept_verdict, drafter_distribution, draw_draft, ColumnUniforms, Distribution};
-
-/// Cells per uniform of the accept and the refusal.
-const CELLS: usize = 1024;
-/// Cells of the draft's own uniform.
-const DRAFT_CELLS: usize = 1 << 20;
-
-/// The target's sampling distribution at the column, in the sampler's order:
-/// 24, 16, 10, 6, 4, 2, 1 and 1 sixty-fourths.
-const TARGET_IDS: [i32; 8] = [501, 77, 9030, 12, 4410, 365, 2048, 88];
-const TARGET_PROBS: [f32; 8] = [0.375, 0.25, 0.15625, 0.09375, 0.0625, 0.03125, 0.015625, 0.015625];
 
 /// A lane under the rule over the whole grid, its draft drawn from
 /// `drafter` by the reference: each token's share, and the share of the
@@ -102,16 +95,6 @@ fn a_flat_drafter_emits_the_target() {
     let ids = [88, 640, 501, 9031, 12, 3, 4410, 70000, 77, 1999, 365, 248000, 2048, 5, 9030, 42];
     let accepted = assert_lane_emits_target("q flat over sixteen", &ids, &[1.0 / 16.0; 16]);
     assert_outside_drafts_always_refused("q flat over sixteen", &accepted);
-}
-
-/// A draft the target gives no probability to is refused on every point of
-/// the accept's grid, whatever the refusal's uniform.
-fn assert_outside_drafts_always_refused(case: &str, accepted: &[(i32, f64)]) {
-    let outside: Vec<_> = accepted.iter().filter(|(draft, _)| !TARGET_IDS.contains(draft)).collect();
-    assert!(!outside.is_empty(), "{case}: no draft outside the support was drawn");
-    for (draft, share) in outside {
-        assert_eq!(*share, 0.0, "{case}: draft {draft}, outside the target's support, was taken on {share} of the grid");
-    }
 }
 
 /// A column's scores whose softmax at temperature 1 is 1, 8, 2, 4 and 1

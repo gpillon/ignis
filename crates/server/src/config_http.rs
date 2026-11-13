@@ -555,9 +555,13 @@ fn drop_draft_options_under_off(patch: &mut Layer) -> Result<(), ConfigError> {
     for family in off {
         for name in ["draft_tokens", "draft_head", "draft_rule", "drafter_temperature_factor", "drafter_top_p"] {
             let meta = schema::field("spec", name).expect("a declared field");
-            // GitHub #576: the draft rule's three have no family scope, so
-            // only a general `off` takes them out.
-            if (family.is_some() && !meta.scoped) || patch.named().any(|(named, scoped)| std::ptr::eq(named, meta) && scoped == family) {
+            // GitHub #576: the draft rule's three are the 27B's alone, held in
+            // its section, where a patch homes their group key: the 27B's own
+            // `off` takes them out there, Flash-Next's has none to take, and
+            // either key of theirs names the same value.
+            let home = |scope: Option<ModelFamily>| scope.or(meta.home_family());
+            let named = patch.named().any(|(named, scoped)| std::ptr::eq(named, meta) && home(scoped) == home(family));
+            if family.is_some_and(|family| !meta.takes_scope(family)) || named {
                 continue;
             }
             let spelling = family.map_or_else(|| meta.file_key(), |family| meta.scoped_file_key(family));
@@ -934,6 +938,44 @@ mod tests {
         let group_on = read_patch(&json!({ "spec": { "backend": "mtp", "draft_tokens": 3 } })).unwrap();
         let group_off = read_patch(&json!({ "spec": { "backend": "off" } })).unwrap();
         assert!(bare.with_patch(&group_on).unwrap().with_patch(&group_off).unwrap().speculation.is_none());
+    }
+
+    /// GitHub #329 item 15 for the 27B's draft rule (#576): the rule and the
+    /// drafter's settings are the 27B's alone, so a file holds them in its
+    /// section, where `config generate` and a patch write them. Turning the
+    /// 27B's speculation off in its own section is one step with them there
+    /// too, and naming one beside `off` is still a refusal, at either key.
+    #[test]
+    fn a_patch_turning_the_27bs_speculation_off_drops_its_draft_rule_too() {
+        let files = MemFiles::with(&[(
+            "c.yaml",
+            "spec:
+  qwen38:
+    backend: dflash2
+    draft_tokens: 7
+    draft_rule: fixed
+    drafter_top_p: 0.9
+",
+        )]);
+        let running = on_file(&files, &["--config", "c.yaml"], &[]).for_family(ModelFamily::Qwen38_27b).unwrap();
+        assert_eq!(running.speculation.map(|s| s.draft_rule()), Some(ignis_core::DraftRule::Fixed));
+        let off = json!({ "spec": { "qwen38": { "backend": "off" } } });
+        let patch = read_patch(&off).unwrap();
+        let next = running.with_patch(&patch).unwrap_or_else(|e| panic!("one step: {e}"));
+        assert!(next.speculation.is_none() && next.speculation_off);
+        for name in ["draft_tokens", "draft_rule", "drafter_top_p"] {
+            assert!(
+                patch.removals().any(|(meta, family, _)| meta.name == name && family == Some(ModelFamily::Qwen38_27b)),
+                "{name} goes with the backend"
+            );
+        }
+        for named in [
+            json!({ "spec": { "qwen38": { "backend": "off", "draft_rule": "fixed" } } }),
+            json!({ "spec": { "draft_rule": "fixed", "qwen38": { "backend": "off" } } }),
+        ] {
+            let err = running.with_patch(&read_patch(&named).unwrap()).unwrap_err().0;
+            assert!(err.contains("draft_rule") && err.contains("off"), "{named}: {err}");
+        }
     }
 
     #[test]
