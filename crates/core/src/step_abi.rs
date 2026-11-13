@@ -136,6 +136,9 @@ pub struct IgnisPrefillOptions {
     /// retains the state after the span, which then draws with a next
     /// prompt token too, as the image carries the draw.
     pub keeps_draw: i32,
+    /// GitHub #287: nonzero when the span's draw keeps its scores for a
+    /// repair -- a request held to a grammar; 0 keeps none.
+    pub keeps_scores: i32,
 }
 
 /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -164,14 +167,16 @@ mod tests {
 
     /// GitHub #520: `keeps_draw` filled the tail padding after
     /// `next_prompt_token`, so `size` alone no longer tells the layout before
-    /// it from the layout after. The leaf pins the same numbers
-    /// (kernel/include/ignis_step.h), as for the decode options.
+    /// it from the layout after; GitHub #287's `keeps_scores` follows it. The
+    /// leaf pins the same numbers (kernel/include/ignis_step.h), as for the
+    /// decode options.
     #[test]
     fn the_prefill_options_mirror_is_the_leaf_structs_layout() {
-        assert_eq!(std::mem::size_of::<IgnisPrefillOptions>(), 224);
+        assert_eq!(std::mem::size_of::<IgnisPrefillOptions>(), 232);
         assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, out_reasoning_redirected), 200);
         assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, drafter_floor), 208);
         assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, next_prompt_token), 216);
         assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, keeps_draw), 220);
+        assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, keeps_scores), 224);
     }
 }

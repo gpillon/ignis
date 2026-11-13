@@ -64,6 +64,7 @@ fn prefill(compute: &dyn Compute, request: u64, permitted: Option<&[TokenId]>, c
         reasoning_close: close,
         drafter_floor: 0,
         next_prompt_token: None,
+        checked: false,
     };
     let outcomes = compute.prefill_step(&[job]).unwrap_or_else(|e| panic!("prefill_step {request}: {e}"));
     outcomes[0].reasoning_redirected

@@ -807,6 +807,10 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// image carries the draw as its pending token, which a claimant matching
     /// the whole image emits as its first. The next token still feeds the MTP
     /// head's entry. Without a next token the span draws anyway.
+    ///
+    /// `keeps_scores` (GitHub #287) is the job's [`PrefillJob::checked`]: the
+    /// span's draw keeps its scores for [`StepLeaf::repair`]. Without it the
+    /// leaf keeps none and does no device work for them.
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,
@@ -817,6 +821,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         drafter_floor: u32,
         next_prompt_token: Option<TokenId>,
         keeps_draw: bool,
+        keeps_scores: bool,
         params: DecodeParams,
         permitted: &[TokenId],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -843,8 +848,8 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// `attention` is the **attention readout** (GitHub #260), read at the
     /// span's last position; see [`AttentionRead`] for what the leaf owes
     /// it. The text path carries one too (GitHub #275). `redirect`,
-    /// `drafter_floor`, `next_prompt_token` and `keeps_draw` are
-    /// [`StepLeaf::prefill`]'s.
+    /// `drafter_floor`, `next_prompt_token`, `keeps_draw` and `keeps_scores`
+    /// are [`StepLeaf::prefill`]'s.
     #[allow(clippy::too_many_arguments)]
     fn prefill_multimodal(
         &self,
@@ -855,6 +860,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         _drafter_floor: u32,
         _next_prompt_token: Option<TokenId>,
         _keeps_draw: bool,
+        _keeps_scores: bool,
         _params: DecodeParams,
         _permitted: &[TokenId],
         _redirect: Option<&mut DrawRedirect<'_>>,
@@ -1439,6 +1445,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             job.drafter_floor,
             job.next_prompt_token,
             keeps_draw,
+            job.checked,
             job.params,
             &permitted,
             redirect,
@@ -1944,6 +1951,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             job.drafter_floor,
                             job.next_prompt_token,
                             keeps_draw,
+                            job.checked,
                             job.params,
                             // GitHub #242: the set this chunk's own draw is
                             // restricted to, borrowed and not cloned — every

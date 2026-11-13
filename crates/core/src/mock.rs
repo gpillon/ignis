@@ -127,10 +127,11 @@ struct Inner {
     /// only until a later round or prefill draw writes their column, so the
     /// mock keeps them only until the next call of either kind: a repair is
     /// made right after the call that drew, and a scheduler that waited any
-    /// longer fails here before it fails on the card. A prefill's draw (an
-    /// EOS too, which a repair turns into a token) and a plain round's keep
-    /// them; a speculative round's, a redirected draw and a finished
-    /// request keep none.
+    /// longer fails here before it fails on the card. A checked prefill job's
+    /// draw ([`PrefillJob::checked`], an EOS too, which a repair turns into a
+    /// token) and a plain round's keep them; any other prefill's, a
+    /// speculative round's, a redirected draw and a finished request keep
+    /// none.
     kept: HashMap<RequestId, u64>,
     /// A pending token a **repair** replaced (GitHub #586), per request: the
     /// step it stands at, the repaired token, which the round committing that
@@ -1056,9 +1057,13 @@ impl Compute for MockCompute {
             if job.next_prompt_token.is_some() {
                 continue;
             }
-            // GitHub #586: the draw keeps its scores, unless redirected below.
+            // GitHub #586: a checked job's draw keeps its scores (#287), as
+            // the leaf keeps them only when asked, unless redirected below.
             let call = g.steps_served;
-            g.kept.insert(job.request, call);
+            match job.checked {
+                true => g.kept.insert(job.request, call),
+                false => g.kept.remove(&job.request),
+            };
             let step = g.generated.get(&job.request).copied().unwrap_or(0);
             // GitHub #242: a prefill *draws*, and a run's first token is
             // the one it draws.

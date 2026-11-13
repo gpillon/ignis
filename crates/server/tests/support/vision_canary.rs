@@ -100,6 +100,7 @@ pub fn prefill_prompt(
             0,
             None,
             false,
+            false,
             SamplingParams::greedy(),
             // GitHub #242: no permitted set — this helper prefills a prompt,
             // it does not force a run.

@@ -114,6 +114,7 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
                 reasoning_close: None,
                 drafter_floor: 0,
                 next_prompt_token: None,
+                checked: false,
             }])
             .unwrap_or_else(|e| panic!("prefill_step: {e}"));
         let mut text = Vec::new();

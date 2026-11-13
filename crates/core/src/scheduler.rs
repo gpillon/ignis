@@ -216,6 +216,13 @@ pub struct PrefillJob {
     /// request to emit at the end of the prefill phase
     /// ([`PrefillOutcome::emitted`], #518).
     pub next_prompt_token: Option<TokenId>,
+    /// The host **checks** the draw this job makes before the first round
+    /// consumes it (GitHub #587, #287): the job ends the prompt of a request
+    /// whose answer, held to a **grammar**, starts at its first token. The
+    /// draw keeps the scores a repair reads ([`Compute::repair`]). `false` on
+    /// every other job, whose prefill keeps none and does no device work for
+    /// them -- the [`DecodeJob::checked`] of a prefill.
+    pub checked: bool,
 }
 
 impl PrefillJob {

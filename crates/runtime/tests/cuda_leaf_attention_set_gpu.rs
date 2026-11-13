@@ -141,6 +141,7 @@ fn a_head_set_no_armed_layer_can_read_comes_back_unread_and_a_readable_one_whole
         reasoning_close: None,
         drafter_floor: 0,
         next_prompt_token: None,
+        checked: false,
     };
 
     for (request, tail) in [(1u64, 16u32), (2, 4)] {

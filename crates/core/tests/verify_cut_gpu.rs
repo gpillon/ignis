@@ -48,8 +48,8 @@ use ignis_core::gpu_profile;
 use ignis_core::model_load::{load_qwen38_27b_with_speculation, Model};
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step::{
-    capture_decode_graphs, decode_program_verify_cut, decode_program_verify_runs, prefill_program_sampled,
-    program_stats, repair_program, LaneVerifyRun, SamplingParams, VerifyLane,
+    capture_decode_graphs, decode_program_verify_cut, decode_program_verify_runs, prefill_program_draw,
+    program_stats, repair_program, LaneDraw, LaneVerifyRun, SamplingParams, VerifyLane,
 };
 use ignis_core::{KvFormat, Speculation, SpeculativeBackend};
 use ignis_grammar::{Grammar, Matcher, TokenSet, Vocab, VocabEntry};
@@ -216,8 +216,12 @@ fn run(model: &Model, prompts: &[Vec<i32>], mut held: Option<&mut Held>) -> Free
     assert!(capture.is_ready(LANES as u32), "width {LANES}: no decode graph");
     let mut seqs: Vec<Seq<'_>> =
         (0..LANES).map(|_| pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"))).collect();
-    for (seq, prompt) in seqs.iter_mut().zip(prompts) {
-        prefill_program_sampled(model, &pool, seq, prompt, 0, SamplingParams::greedy(), None)
+    for (lane, (seq, prompt)) in seqs.iter_mut().zip(prompts).enumerate() {
+        // #287: the held lane's prefill keeps its draw's scores, as a checked
+        // job's does; the free lanes' keep none.
+        let keeps_scores = held.is_some() && lane == HELD;
+        let draw = LaneDraw::free(SamplingParams::greedy());
+        prefill_program_draw(model, &pool, seq, prompt, 0, 0, None, false, keeps_scores, draw, None)
             .unwrap_or_else(|e| panic!("prefill: {e}"));
     }
     let mut done = false;

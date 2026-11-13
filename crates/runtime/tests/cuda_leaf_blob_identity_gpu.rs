@@ -171,6 +171,7 @@ fn a_real_load_names_itself_and_refuses_a_blob_from_any_other() {
                 reasoning_close: None,
                 drafter_floor: 0,
                 next_prompt_token: None,
+                checked: false,
 }])
             .unwrap_or_else(|e| panic!("prefill_step {request}: {e}"));
     }

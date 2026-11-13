@@ -36,6 +36,9 @@ struct Calls {
     prefill_next_tokens: Vec<Option<u32>>,
     /// GitHub #520: whether each prefill call keeps its span's draw, in order.
     prefill_kept_draws: Vec<bool>,
+    /// GitHub #287: whether each prefill call was asked to keep its draw's
+    /// scores for a repair.
+    prefill_kept_scores: Vec<bool>,
     prefill_params: Vec<DecodeParams>,
     /// The permitted set of each prefill call, in order (GitHub #242).
     prefill_permitted: Vec<Vec<u32>>,
@@ -300,6 +303,7 @@ impl StepLeaf for StubLeaf {
         drafter_floor: u32,
         next_prompt_token: Option<u32>,
         keeps_draw: bool,
+        keeps_scores: bool,
         params: DecodeParams,
         permitted: &[u32],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -315,7 +319,7 @@ impl StepLeaf for StubLeaf {
                 .media
                 .map(|media| (*media.embedding, media.first_column, media.scatter_indices.to_vec())),
         });
-        self.prefill(model, sequence, tokens, start_position, drafter_floor, next_prompt_token, keeps_draw, params, permitted, redirect, out_logits, attention)
+        self.prefill(model, sequence, tokens, start_position, drafter_floor, next_prompt_token, keeps_draw, keeps_scores, params, permitted, redirect, out_logits, attention)
     }
 
     fn release_model(&self, _model: Self::Model) {
@@ -487,6 +491,7 @@ impl StepLeaf for StubLeaf {
         drafter_floor: u32,
         next_prompt_token: Option<u32>,
         keeps_draw: bool,
+        keeps_scores: bool,
         params: DecodeParams,
         permitted: &[u32],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -552,6 +557,7 @@ impl StepLeaf for StubLeaf {
             calls.prefill_floors.push(drafter_floor);
             calls.prefill_next_tokens.push(next_prompt_token);
             calls.prefill_kept_draws.push(keeps_draw);
+            calls.prefill_kept_scores.push(keeps_scores);
             calls.prefill_params.push(params);
             calls.prefill_permitted.push(permitted.to_vec());
             calls
@@ -764,6 +770,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 reasoning_close: None,
                 drafter_floor: 0,
                 next_prompt_token: None,
+                checked: false,
             },
             PrefillJob {
                 checkpoint: None,
@@ -782,6 +789,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 reasoning_close: None,
                 drafter_floor: 0,
                 next_prompt_token: None,
+                checked: false,
             },
         ])
         .unwrap();
@@ -1144,6 +1152,7 @@ fn prefill(request: u64, max_tokens: Option<u32>) -> PrefillJob {
         reasoning_close: None,
         drafter_floor: 0,
         next_prompt_token: None,
+        checked: false,
     }
 }
 
@@ -1831,6 +1840,7 @@ fn a_spill_the_leaf_fails_leaves_the_device_image_to_discard() {
             reasoning_close: None,
             drafter_floor: 0,
             next_prompt_token: None,
+            checked: false,
 }])
         .unwrap();
 
@@ -1870,6 +1880,7 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
             reasoning_close: None,
             drafter_floor: 0,
             next_prompt_token: None,
+            checked: false,
 }])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().capture_slots, vec![2], "the slot the job named");
@@ -1898,6 +1909,7 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
                 reasoning_close: None,
                 drafter_floor: 0,
                 next_prompt_token: None,
+                checked: false,
 }])
             .unwrap();
     }
@@ -2185,6 +2197,7 @@ fn multimodal_job(request: u64, prompt: &Arc<Multimodal>, start: u32, len: u32) 
         reasoning_close: None,
         drafter_floor: 0,
         next_prompt_token: None,
+        checked: false,
     }
 }
 
@@ -2301,6 +2314,24 @@ fn each_prefill_hands_the_leaf_its_jobs_next_prompt_token_and_a_retained_job_kee
     assert_eq!(calls.checkpoints_captured, [2], "the capture ran");
     assert_eq!(calls.prefill_next_tokens, [Some(31), None, Some(0), Some(32), Some(33), Some(34), Some(35)]);
     assert_eq!(calls.prefill_kept_draws, [false, false, false, true, true, false, true]);
+}
+
+/// #287: a checked job (a request held to a grammar) asks the leaf to keep its
+/// draw's scores for a repair, on the text path and on the multimodal one;
+/// every other job asks for none, so its prefill does the device work it did
+/// before structured output.
+#[test]
+fn only_a_checked_prefill_job_asks_the_leaf_to_keep_its_draws_scores() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    compute
+        .prefill_step(&[PrefillJob { checked: true, ..prefill(1, Some(8)) }, prefill(2, Some(8))])
+        .unwrap();
+    let prompt = multimodal(40, vec![image(10, 4)]);
+    compute
+        .prefill_step(&[PrefillJob { checked: true, ..multimodal_job(3, &prompt, 0, 40) }])
+        .unwrap();
+    compute.prefill_step(&[multimodal_job(4, &prompt, 0, 40)]).unwrap();
+    assert_eq!(leaf.calls.lock().unwrap().prefill_kept_scores, [true, false, true, false]);
 }
 
 #[test]
@@ -2563,6 +2594,7 @@ fn a_request_that_publishes_a_block_and_chains_over_it_keeps_both_heads_claimabl
         reasoning_close: None,
         drafter_floor: 0,
         next_prompt_token: None,
+        checked: false,
 };
     compute.prefill_step(&[job(1, vec![1, 2, 3, 4], 0, Some(4))]).unwrap();
     compute.prefill_step(&[job(1, vec![5, 6, 7, 8], 4, Some(8))]).unwrap();
@@ -2608,6 +2640,7 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             reasoning_close: None,
             drafter_floor: 0,
             next_prompt_token: None,
+            checked: false,
 }])
         .unwrap();
     compute.release(1);
@@ -2650,6 +2683,7 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             reasoning_close: None,
             drafter_floor: 0,
             next_prompt_token: None,
+            checked: false,
 }])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().claimed_prefixes, vec![4], "claimable by name");

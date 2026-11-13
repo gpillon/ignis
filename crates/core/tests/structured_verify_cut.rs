@@ -116,6 +116,24 @@ fn draws(text: &str) -> Vec<PendingToken> {
     encode(text).into_iter().map(PendingToken::Token).collect()
 }
 
+/// #287: the prompt's last job of a request held to a grammar is checked --
+/// its draw keeps the scores a repair reads -- and no other job is: a free
+/// request's prefill does no work for a repair.
+#[test]
+fn only_a_held_requests_last_prefill_job_is_checked() {
+    let grammar = json_object();
+    let mock = Arc::new(MockCompute::new());
+    let mut sched = scheduler(&mock);
+    let held = submit(&mut sched, Some(&grammar), 8);
+    let free = submit(&mut sched, None, 8);
+    mock.script(held, &encode("{}"));
+    run_to_idle(&mut sched);
+    let jobs: Vec<_> = mock.prefill_calls().into_iter().flatten().collect();
+    let checked = |id: RequestId| jobs.iter().filter(|job| job.request == id).map(|job| job.checked).collect::<Vec<_>>();
+    assert_eq!(checked(held), [true], "{jobs:?}");
+    assert_eq!(checked(free), [false], "{jobs:?}");
+}
+
 /// The script writes `{"a": 7` and then an `x` where the object needs a
 /// comma or its close: with runs of four, the round whose anchor is the
 /// colon proposes ` `, `7` and the `x`. The host keeps the run up to the

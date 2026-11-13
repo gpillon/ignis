@@ -286,7 +286,9 @@ bool draw_counts(const ignis_sampling_params &sampling) {
 // GitHub #586: a prefill's draw keeps the row it came from (`logits`, the
 // chunk's scratch, about to go) for a repair, in the decode logits' column of
 // the sequence's slot -- free between the rounds that use it as a lane column,
-// and one 485 KiB device copy on the stream before the chunk's synchronize. A
+// and one 485 KiB device copy on the stream before the chunk's synchronize.
+// Only for a request held to a grammar (`keeps_scores`, GitHub #287): every
+// other prefill makes no copy. A
 // slot past the load's lanes, which no serving pool has, keeps nothing, and a
 // repair of its draw is refused. `*out_kept` says what was kept.
 int32_t keep_draw_scores(ignis_model *model, const ignis_seq *seq, const void *logits,
@@ -1525,6 +1527,9 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
 // no retained image keeps (GitHub #520): no chunk computes the output head or
 // samples, and the span leaves the sequence with no pending token (-1) rather
 // than an earlier span's -- its draw is the prompt's last span's to make.
+//
+// GitHub #287: `keeps_scores` keeps the last chunk's draw's scores for a
+// repair; without it the draw keeps none.
 int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                     const int32_t *token_ids, uint64_t num_tokens,
                                     const ignis_sampling_params &sampling, float *out_logits,
@@ -1532,7 +1537,7 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
                                     float *permitted_prob,
                                     const ArmedAttentionReadout *attention_readout,
                                     std::uint16_t *span_logits, uint64_t drafter_floor,
-                                    bool draws) {
+                                    bool draws, bool keeps_scores) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
   ChunkProfiler::instance().begin_span(num_tokens, model->prefill_chunk_tokens);
   const uint64_t tap_from = dflash2_tap_from(seq->position, num_tokens, drafter_floor);
@@ -1550,13 +1555,14 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
                           span_logits == nullptr
                               ? nullptr
                               : span_logits + offset * static_cast<uint64_t>(model->vocab),
-                          &kept) != 0) {
+                          keeps_scores ? &kept : nullptr) != 0) {
       return -1;
     }
     seq->position += chunk_len;
     if (is_last_chunk) {
       // `successor` stays -1 on a span that does not draw (GitHub #519), and
-      // `kept` then keeps nothing (GitHub #586).
+      // `kept` then keeps nothing (GitHub #586), as it does without
+      // `keeps_scores` (GitHub #287).
       seq->pending_token = successor;
       seq->kept = kept;
     }
@@ -1871,7 +1877,8 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, *sampling,
                                      out_logits, mode, multimodal, permitted_prob,
                                      arms_readout ? &attention_readout : nullptr, span_logits,
-                                     options != nullptr ? options->drafter_floor : 0, draws);
+                                     options != nullptr ? options->drafter_floor : 0, draws,
+                                     options != nullptr && options->keeps_scores != 0);
   }
   if (rc != 0) {
     return rc;

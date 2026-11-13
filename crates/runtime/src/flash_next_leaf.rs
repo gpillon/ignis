@@ -686,6 +686,8 @@ impl StepLeaf for FlashNextLeaf {
         _drafter_floor: u32,
         next_prompt_token: Option<TokenId>,
         keeps_draw: bool,
+        // #581: Flash-Next repairs nothing, so its draws keep no scores.
+        _keeps_scores: bool,
         params: DecodeParams,
         permitted: &[TokenId],
         redirect: Option<&mut DrawRedirect<'_>>,
@@ -724,6 +726,8 @@ impl StepLeaf for FlashNextLeaf {
         _drafter_floor: u32,
         next_prompt_token: Option<TokenId>,
         keeps_draw: bool,
+        // #581: Flash-Next repairs nothing, so its draws keep no scores.
+        _keeps_scores: bool,
         params: DecodeParams,
         permitted: &[TokenId],
         redirect: Option<&mut DrawRedirect<'_>>,

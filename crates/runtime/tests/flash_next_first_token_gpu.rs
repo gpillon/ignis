@@ -70,6 +70,7 @@ fn serve(compute: &RuntimeCompute<FlashNextLeaf>, request: RequestId, first_with
             reasoning_close: None,
             drafter_floor: 0,
             next_prompt_token: None,
+            checked: false,
         }])
         .unwrap_or_else(|e| panic!("prefill_step: {e}"));
     let mut text = Vec::new();

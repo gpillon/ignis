@@ -15,7 +15,8 @@
 //! - an early stop is a draw like any other, and a repaired one does not end
 //!   the request;
 //! - what the leaf refuses, the mock refuses: a request with no pending token,
-//!   and a draw the leaf redirected itself.
+//!   a draw the leaf redirected itself, and the draw of a prefill job that
+//!   was not checked (#287: the leaf keeps scores only when asked).
 
 use ignis_core::constrained::PermittedMask;
 use ignis_core::mock::MockCompute;
@@ -45,6 +46,8 @@ fn prefill_job(permitted: Option<Vec<TokenId>>, reasoning_close: Option<TokenId>
         reasoning_close,
         drafter_floor: 0,
         next_prompt_token: None,
+        // A request held to a grammar's last job: its draw is checked.
+        checked: true,
     }
 }
 
@@ -207,6 +210,21 @@ fn a_speculative_rounds_draw_keeps_no_scores() {
     prefill(&compute);
     assert_eq!(emitted(&compute, true).len(), 2, "a run of three, its anchor sent with the prefill");
     assert!(compute.repair(&repair_to(&[1])).is_err());
+}
+
+/// #287: a prefill keeps its draw's scores only for a job the host checks
+/// ([`PrefillJob::checked`]), as the leaf copies them only when asked: an
+/// unchecked job's draw cannot be repaired, and the round after it keeps its
+/// own as always.
+#[test]
+fn an_unchecked_prefill_jobs_draw_keeps_no_scores() {
+    let compute = MockCompute::new();
+    compute
+        .prefill_step(&[PrefillJob { checked: false, ..prefill_job(None, None) }])
+        .expect("an unchecked prefill");
+    assert!(compute.repair(&repair_to(&[1])).is_err(), "no scores were kept for its draw");
+    emitted(&compute, true);
+    assert!(compute.repair(&repair_to(&[1])).is_ok(), "a plain round's draw keeps its own");
 }
 
 #[test]

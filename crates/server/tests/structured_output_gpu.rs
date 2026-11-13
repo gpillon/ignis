@@ -79,8 +79,8 @@ use ignis_core::gpu_profile;
 use ignis_core::model_load::{load_qwen38_27b_with_speculation, Model};
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step::{
-    capture_decode_graphs, decode_program_verify_forced, prefill_program, prefill_program_sampled, repair_program,
-    SamplingParams, VerifyLane,
+    capture_decode_graphs, decode_program_verify_forced, prefill_program, prefill_program_draw, repair_program,
+    LaneDraw, SamplingParams, VerifyLane,
 };
 use ignis_core::structured::{AnswerGrammar, StructuredKind};
 use ignis_core::{
@@ -356,7 +356,9 @@ fn hold_to_verify_route(
     let _graphs = capture_decode_graphs(model, &pool).unwrap_or_else(|e| panic!("{what}: capture: {e}"));
     let mut sequence = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
     let mut readout = vec![0f32; vocab()];
-    prefill_program_sampled(model, &pool, &mut sequence, &as_i32(&case.prompt), 0, SamplingParams::greedy(), Some(&mut readout))
+    // A held request's prefill (#287): its draw keeps the scores a repair reads.
+    let draw = LaneDraw::free(SamplingParams::greedy());
+    prefill_program_draw(model, &pool, &mut sequence, &as_i32(&case.prompt), 0, 0, None, false, true, draw, Some(&mut readout))
         .unwrap_or_else(|e| panic!("{what}: prompt prefill: {e}"));
     // The recording: the served tokens, then the stop a finished answer
     // ended on, or -- after an answer cut at its cap -- a last token only

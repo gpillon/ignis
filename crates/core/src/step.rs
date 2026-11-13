@@ -658,6 +658,7 @@ impl PrefillRoute {
             drafter_floor: 0,
             next_prompt_token: -1,
             keeps_draw: 0,
+            keeps_scores: 0,
         }
     }
 }
@@ -735,7 +736,7 @@ pub fn prefill_program_sampled(
     sampling: SamplingParams,
     out_logits: Option<&mut [f32]>,
 ) -> Result<(), String> {
-    prefill_program_draw(model, pool, sequence, token_ids, start_position, 0, None, false, LaneDraw::free(sampling), out_logits)
+    prefill_program_draw(model, pool, sequence, token_ids, start_position, 0, None, false, false, LaneDraw::free(sampling), out_logits)
         .map(|_| ())
 }
 
@@ -761,6 +762,10 @@ pub fn prefill_program_sampled(
 /// `keeps_draw` (GitHub #520) makes a span with a next token draw anyway: a
 /// prefix image or a prompt checkpoint retains the state after it and
 /// carries the draw as its pending token.
+///
+/// `keeps_scores` (GitHub #287) keeps the draw's scores for
+/// [`repair_program`]: a request held to a grammar's. Without it a repair of
+/// the draw is refused, and the prefill makes no copy for one.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_program_draw(
     model: &Model,
@@ -771,6 +776,7 @@ pub fn prefill_program_draw(
     drafter_floor: u64,
     next_prompt_token: Option<TokenId>,
     keeps_draw: bool,
+    keeps_scores: bool,
     draw: LaneDraw<'_>,
     out_logits: Option<&mut [f32]>,
 ) -> Result<SpanDraw, String> {
@@ -783,6 +789,7 @@ pub fn prefill_program_draw(
         drafter_floor,
         next_prompt_token: next_prompt_token_field("prefill_program_draw", next_prompt_token)?,
         keeps_draw: i32::from(keeps_draw),
+        keeps_scores: i32::from(keeps_scores),
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     let logits_ptr = match out_logits {
@@ -1314,7 +1321,7 @@ pub fn prefill_program_permitted(
         permitted,
         ..LaneDraw::free(sampling)
     };
-    prefill_program_draw(model, pool, sequence, token_ids, start_position, 0, None, false, draw, out_logits)
+    prefill_program_draw(model, pool, sequence, token_ids, start_position, 0, None, false, false, draw, out_logits)
         .map(|drawn| drawn.probability)
 }
 
@@ -1961,7 +1968,9 @@ pub struct SpanMediaColumns<'a> {
 /// `drafter_floor` is [`prefill_program_draw`]'s (GitHub #506): an image's
 /// span taps the drafter's window by the same rule as a text one. So are
 /// `next_prompt_token` and `keeps_draw` (GitHub #519, #520): an image's
-/// intermediate span draws nothing either, unless an image retains it.
+/// intermediate span draws nothing either, unless an image retains it. So is
+/// `keeps_scores` (GitHub #287): a request about an image may be held to a
+/// grammar.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_program_multimodal(
     model: &Model,
@@ -1972,6 +1981,7 @@ pub fn prefill_program_multimodal(
     drafter_floor: u64,
     next_prompt_token: Option<TokenId>,
     keeps_draw: bool,
+    keeps_scores: bool,
     sampling: SamplingParams,
     permitted: &[i32],
     redirect: Redirect<'_>,
@@ -1989,6 +1999,7 @@ pub fn prefill_program_multimodal(
         drafter_floor,
         next_prompt_token,
         keeps_draw,
+        keeps_scores,
         LaneDraw {
             sampling,
             permitted,
@@ -2034,6 +2045,8 @@ pub fn prefill_program_attention(
         drafter_floor,
         next_prompt_token,
         keeps_draw,
+        // A readout's question is never held to a grammar.
+        false,
         draw,
         None,
         out_logits,
@@ -2086,6 +2099,7 @@ fn prefill_program_reading(
     drafter_floor: u64,
     next_prompt_token: Option<TokenId>,
     keeps_draw: bool,
+    keeps_scores: bool,
     draw: LaneDraw<'_>,
     span: Option<MultimodalPrefill<'_>>,
     out_logits: Option<&mut [f32]>,
@@ -2102,6 +2116,7 @@ fn prefill_program_reading(
         drafter_floor,
         next_prompt_token: next_prompt_token_field(what, next_prompt_token)?,
         keeps_draw: i32::from(keeps_draw),
+        keeps_scores: i32::from(keeps_scores),
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     if let Some(span) = span {

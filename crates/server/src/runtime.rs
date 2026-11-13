@@ -3499,6 +3499,7 @@ mod tests {
             _drafter_floor: u32,
             _next_prompt_token: Option<TokenId>,
             _keeps_draw: bool,
+            _keeps_scores: bool,
             _params: DecodeParams,
             _permitted: &[TokenId],
             _redirect: Option<&mut ignis_runtime::DrawRedirect<'_>>,

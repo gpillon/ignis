@@ -337,17 +337,27 @@ struct ignis_prefill_options {
    * MTP entry. 0 under NULL options; the prompt's last span draws either
    * way. */
   int32_t keeps_draw;
+  /* GitHub #287 (ADR 0089): nonzero on the prompt's last span of a request
+   * held to a grammar, whose host checks the span's draw and may repair it
+   * (ignis_program_repair): the draw's logits row is then kept in the decode
+   * logits' column of the sequence's slot. 0 keeps none, and a repair of the
+   * draw is refused: a prefill for any other request does no device work for
+   * it. 0 under NULL options. Unread on the per-token route, which keeps
+   * none, and on Flash-Next, which repairs nothing (#581). */
+  int32_t keeps_scores;
 };
 
 #ifdef __cplusplus
 /* Beside the `size` check, both sides pin the layout (here, and
  * crates/core/src/step_abi.rs's mirror test, on CPU): GitHub #520's
  * `keeps_draw` filled the tail padding after `next_prompt_token`, so the size
- * alone no longer tells that layout from the one before it. */
-static_assert(sizeof(struct ignis_prefill_options) == 224 &&
+ * alone no longer tells that layout from the one before it; GitHub #287's
+ * `keeps_scores` follows it. */
+static_assert(sizeof(struct ignis_prefill_options) == 232 &&
                   offsetof(struct ignis_prefill_options, drafter_floor) == 208 &&
                   offsetof(struct ignis_prefill_options, next_prompt_token) == 216 &&
-                  offsetof(struct ignis_prefill_options, keeps_draw) == 220,
+                  offsetof(struct ignis_prefill_options, keeps_draw) == 220 &&
+                  offsetof(struct ignis_prefill_options, keeps_scores) == 224,
               "ignis_prefill_options drifted from crates/core/src/step_abi.rs IgnisPrefillOptions");
 #endif
 
@@ -749,9 +759,10 @@ int32_t ignis_program_decode(struct ignis_model *model, struct ignis_seq_pool *p
  * set. A mask that permits nothing, or a column past the vocabulary, is
  * refused. It only drives columns down; no logits cross this ABI (ADR 0034).
  *
- * Which draws keep their scores: a 27B prefill's draw (its row is copied into
- * the decode logits' column of the sequence's slot, on a slot inside the
- * load's decode lanes) and a plain round's (its lane column, as the round
+ * Which draws keep their scores: a 27B prefill's draw whose options ask for it
+ * (`ignis_prefill_options::keeps_scores`: its row is copied into the decode
+ * logits' column of the sequence's slot, on a slot inside the load's decode
+ * lanes) and a plain round's (its lane column, as the round
  * left it -- a lane the round masked with a short set keeps the masked row,
  * so a repair there draws from both sets' meeting). GitHub #590: and the
  * draw a verify round left pending on a lane whose commit the host cut

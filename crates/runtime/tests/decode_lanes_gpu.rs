@@ -237,6 +237,7 @@ fn decode_batch(
             reasoning_close: None,
             drafter_floor: 0,
             next_prompt_token: None,
+            checked: false,
         })
         .collect();
     compute.prefill_step(&jobs).unwrap_or_else(|e| panic!("prefill_step: {e}"));

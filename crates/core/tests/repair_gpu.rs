@@ -30,8 +30,13 @@
 //!    sampler, not an argmax.
 //! 4. **The prefill's own draw** is repaired in 1, 2 and 3 alike.
 //! 5. **The refusals**: scores a later round wrote over, a draw the
-//!    test-only per-token route made (it keeps none), a sequence with no
-//!    pending token, and a mask built for another vocabulary.
+//!    test-only per-token route made (it keeps none), a prefill that was not
+//!    asked to keep its draw's scores (#287: a request with no grammar, whose
+//!    prefill makes no copy), a sequence with no pending token, and a mask
+//!    built for another vocabulary.
+//!
+//! The prefill draws repaired here are a held request's: the prefill keeps
+//! their scores (`keeps_scores`, [`held_prefill`]).
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a skip; under the profile it is a failure.
@@ -49,8 +54,8 @@ use ignis_core::gpu_profile;
 use ignis_core::model_load::{Model, load_qwen38_27b};
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step::{
-    PermittedLane, PrefillRoute, SamplingParams, decode_program_batch, decode_program_batch_permitted,
-    decode_program_batch_sampled, prefill_program_permitted, prefill_program_sampled,
+    LaneDraw, PermittedLane, PrefillRoute, SamplingParams, decode_program_batch, decode_program_batch_permitted,
+    decode_program_batch_sampled, prefill_program_draw, prefill_program_permitted, prefill_program_sampled,
     prefill_program_with_route, repair_program,
 };
 
@@ -78,6 +83,19 @@ fn new_pool(slot_count: u32) -> Result<SeqPool, String> {
 
 fn prompt() -> Vec<i32> {
     (0..6).map(|i| 11 + i).collect()
+}
+
+/// The prompt's prefill for a request held to a grammar (#287): its draw keeps
+/// the scores a repair reads, as the serving path asks for a checked job.
+fn held_prefill(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    sampling: SamplingParams,
+    logits: Option<&mut [f32]>,
+) -> Result<(), String> {
+    prefill_program_draw(model, pool, sequence, &prompt(), 0, 0, None, false, true, LaneDraw::free(sampling), logits)
+        .map(|_| ())
 }
 
 fn vocab() -> u32 {
@@ -214,7 +232,7 @@ fn a_repair_draws_the_waiting_position_again_from_the_scores_its_call_kept() {
     };
     let subject = {
         let mut sequence = alloc();
-        prefill_program_sampled(&model, &pool, &mut sequence, &prompt(), 0, SamplingParams::greedy(), None)
+        held_prefill(&model, &pool, &mut sequence, SamplingParams::greedy(), None)
             .unwrap_or_else(|e| panic!("subject prefill: {e}"));
         assert_eq!(sequence.pending_token(), Some(free));
         let repaired = repair_program(&model, &pool, &mut sequence, SamplingParams::greedy(), &mask_of(&[forced]))
@@ -265,7 +283,7 @@ fn a_repair_draws_the_waiting_position_again_from_the_scores_its_call_kept() {
     {
         let mut sequence = alloc();
         let mut logits = vec![0f32; vocab];
-        prefill_program_sampled(&model, &pool, &mut sequence, &prompt(), 0, SamplingParams::greedy(), Some(&mut logits))
+        held_prefill(&model, &pool, &mut sequence, SamplingParams::greedy(), Some(&mut logits))
             .unwrap_or_else(|e| panic!("prefill: {e}"));
         // Sparse, across the whole vocabulary, without the free draw: a miss.
         let sparse: Vec<i32> = (0..vocab as i32).filter(|&id| id % 7 == 3 && id != free).collect();
@@ -319,7 +337,7 @@ fn a_repair_draws_the_waiting_position_again_from_the_scores_its_call_kept() {
         let sampling = hot(0x586_0000 + seed);
         // The prefill's draw.
         let mut sequence = alloc();
-        prefill_program_sampled(&model, &pool, &mut sequence, &prompt(), 0, sampling, None)
+        held_prefill(&model, &pool, &mut sequence, sampling, None)
             .unwrap_or_else(|e| panic!("hot prefill: {e}"));
         let drawn = sequence.pending_token().expect("the prefill drew");
         let before = penalty_counts(&sequence);
@@ -387,6 +405,15 @@ fn a_repair_draws_the_waiting_position_again_from_the_scores_its_call_kept() {
             .unwrap_or_else(|e| panic!("per-token prefill: {e}"));
         let error = repair_program(&model, &pool, &mut per_token, SamplingParams::greedy(), &mask_of(&[forced]))
             .expect_err("the per-token route keeps no scores");
+        assert!(error.contains("kept no scores"), "{error}");
+
+        // #287: a prefill not asked to keep its draw's scores -- a request
+        // with no grammar -- keeps none.
+        let mut unheld = alloc();
+        prefill_program_sampled(&model, &pool, &mut unheld, &prompt(), 0, SamplingParams::greedy(), None)
+            .unwrap_or_else(|e| panic!("unheld prefill: {e}"));
+        let error = repair_program(&model, &pool, &mut unheld, SamplingParams::greedy(), &mask_of(&[forced]))
+            .expect_err("an unheld prefill keeps no scores");
         assert!(error.contains("kept no scores"), "{error}");
 
         let mut fresh = alloc();
