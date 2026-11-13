@@ -663,10 +663,17 @@ struct ignis_decode_options {
    * any run is. That token is the run's successor, the sequence's pending
    * token, so it must be a vocabulary id; the pad -1 is taken only after a
    * recording that ends at a stop id, and leaves the sequence with no pending
-   * token until a prefill gives it one (kernel/src/teacher_forcing.h). Only
-   * greedy lanes may be forced (the round draws nothing), only a verify round,
-   * and only on the 27B: a Flash-Next load refuses it. NULL: the accept kernel
-   * decides, as always. */
+   * token until a prefill gives it one (kernel/src/teacher_forcing.h). Under
+   * the fixed draft only greedy lanes may be forced (the round draws
+   * nothing). GitHub #577: under the sampled draft a sampling lane may be
+   * forced too, on the device: its drafter drafts each recorded token that is
+   * one of its candidates, and its accept takes it with probability
+   * min(p, q) / p -- a live round's, and the live round's own verdict on a
+   * recording of the lane's own rounds -- emitting the recorded token where
+   * its run stops; that round runs eagerly, and every lane's successors up
+   * to its extent are checked before the pass. Only a verify round, and only
+   * on the 27B: a Flash-Next load refuses it. NULL: the accept kernel decides,
+   * as always. */
   const int32_t *forced_tokens; /* [batch_size][speculative_window + 1], or NULL */
   /* GitHub #590 (spec #287, ADR 0089): a **verify commit whose cut the host
    * decides**, for the lanes `host_cut_lanes` names (1; 0 for every other).

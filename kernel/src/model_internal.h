@@ -450,6 +450,14 @@ struct IgnisVerifyRound {
   std::unique_ptr<ninfer::DeviceBuffer> draft_candidates; // I32 [16, k, B]
   std::unique_ptr<ninfer::DeviceBuffer> draft_q;          // F32 [16, k, B]
 
+  // GitHub #577 (test-only): during a teacher-forced round under the sampled
+  // draft, the device copy of its recorded tokens (I32 [k + 1, B]), which the
+  // draw drafts along and the accept takes by the forced verdict. Set by that
+  // round alone (kernel/src/step.cu), which runs eagerly and clears it before
+  // it returns; null in every serving round and while the verify graphs are
+  // captured, so no graph carries it.
+  const std::int32_t *forced_tokens = nullptr;
+
   // GitHub #590 (spec #287): `logits` is also where a repair reads the
   // scores of a lane whose commit the host cut (`ignis_kept_scores`, source
   // kVerifyLogits). Every round writes the whole buffer, so each round stamps

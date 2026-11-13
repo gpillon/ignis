@@ -31,6 +31,10 @@
 //! `crates/core/tests/sampled_draft_oracle.rs` holds this reference to a
 //! double-precision oracle over a grid of the draft's, the accept's and the
 //! refusal's uniforms.
+//!
+//! The replay of recorded turns forces a recording through rounds under the
+//! rule; [`forced_verdict`] is that round's verdict (GitHub #577), held to the
+//! same oracle by `crates/core/tests/sampled_draft_forced_oracle.rs`.
 
 /// A column's distribution over token ids, in the order a draw from it walks
 /// them: the target's support in the sampler's order, or the drafter's
@@ -101,6 +105,51 @@ pub fn accept_verdict(target: Distribution<'_>, drafter: Distribution<'_>, draft
         .or_else(|| inverse_cdf(target.ids.len(), |j| target.probs[j], uniforms.refusal))
         .expect("the target's support holds positive mass");
     Verdict::Refused(target.ids[j])
+}
+
+/// The **teacher-forced** verdict under the sampled draft (GitHub #577): at a
+/// column whose recorded token is `recorded` and whose draft is that token
+/// (the forced round drafts the recording wherever it is one of the
+/// drafter's candidates), whether the round takes it.
+///
+/// A live round that emits a token x has drafted x, and taken it, with
+/// probability min(p(x), q(x)) / p(x): the rest of the time it refused
+/// another draft and drew x from what p has left over q. The forced verdict
+/// takes the recorded token with that probability, so the run a replay
+/// commits is the recording's and the rounds it walks are distributed as live
+/// rounds are. It gets there through the live round's own draws first:
+/// `live` is the [`accept_verdict`] on `live_draft`, the draft the lane's
+/// draw would have proposed, under the column's own uniforms. When that live
+/// column emits the recorded token, the forced verdict is the live one --
+/// taken when it took its draft, refused when it drew the token on a refusal
+/// -- so a recording of the lane's own rounds is forced back into exactly
+/// those rounds. When it emits another token, which is what a recording made
+/// elsewhere mostly meets, the `coin`, a uniform of its own, takes the
+/// recorded token when `coin·p(x) < q(x)`. Over the live draws and the coin
+/// the token is taken with probability min(p, q)(x) + (1 − p(x))·min(1,
+/// q(x)/p(x)) = min(p(x), q(x)) / p(x). A recorded token the target gives no
+/// probability to (a recording sampled by other numerics) is taken with the
+/// drafter's own probability of it, `coin < q(x)`.
+///
+/// `target` and `drafter` are the column's p and q, as [`accept_verdict`]
+/// takes them; q is the drafter's distribution after the recorded token
+/// before (the forced round drafts along the recording).
+pub fn forced_verdict(
+    target: Distribution<'_>,
+    drafter: Distribution<'_>,
+    recorded: i32,
+    live_draft: i32,
+    live: Verdict,
+    coin: f32,
+) -> bool {
+    match live {
+        Verdict::Accepted if live_draft == recorded => return true,
+        Verdict::Refused(token) if token == recorded => return false,
+        _ => {}
+    }
+    let p = target.prob(recorded);
+    let q = drafter.prob(recorded);
+    if p > 0.0 { coin * p < q } else { coin < q }
 }
 
 /// The drafter's distribution q over a column's candidates: the softmax of
@@ -216,6 +265,21 @@ pub mod device {
                 cells: u32,
                 out_tokens: *mut i32,
             ) -> i32;
+            pub fn ignis_sampled_draft_forced_verdicts(
+                target_ids: *const i32,
+                target_probs: *const f32,
+                target_count: u32,
+                drafter_ids: *const i32,
+                drafter_probs: *const f32,
+                drafter_count: u32,
+                recorded: i32,
+                live_draft: i32,
+                live_taken: i32,
+                live_token: i32,
+                grid: *const f32,
+                cells: u32,
+                out_taken: *mut u8,
+            ) -> i32;
             pub fn ignis_sampled_draft_draws(q: *const f32, count: u32, grid: *const f32, cells: u32, out_candidates: *mut i32) -> i32;
             pub fn ignis_sampled_drafter_distribution(scores: *const f32, count: u32, temperature: f32, top_p: f32, out_q: *mut f32) -> i32;
             pub fn ignis_sampled_draft_last_error() -> *const c_char;
@@ -262,6 +326,49 @@ pub mod device {
             )
         })?;
         Ok(tokens.into_iter().map(|token| if token == ACCEPTED { Verdict::Accepted } else { Verdict::Refused(token) }).collect())
+    }
+
+    /// GitHub #577: the device's teacher-forced verdict on `recorded` at each
+    /// coin uniform of `grid`, the live column's verdict on `live_draft`
+    /// being `live` ([`super::forced_verdict`]); the distributions as
+    /// [`verdicts`] takes them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forced_verdicts(
+        target_ids: &[i32],
+        target_probs: &[f32],
+        drafter_ids: &[i32],
+        drafter_probs: &[f32],
+        recorded: i32,
+        live_draft: i32,
+        live: Verdict,
+        grid: &[f32],
+    ) -> Result<Vec<bool>, String> {
+        if target_ids.len() != target_probs.len() || drafter_ids.len() != drafter_probs.len() {
+            return Err("a distribution pairs each id with its probability".to_owned());
+        }
+        let (live_taken, live_token) = match live {
+            Verdict::Accepted => (1, live_draft),
+            Verdict::Refused(token) => (0, token),
+        };
+        let mut taken = vec![0u8; grid.len()];
+        check(unsafe {
+            ffi::ignis_sampled_draft_forced_verdicts(
+                target_ids.as_ptr(),
+                target_probs.as_ptr(),
+                target_ids.len() as u32,
+                drafter_ids.as_ptr(),
+                drafter_probs.as_ptr(),
+                drafter_ids.len() as u32,
+                recorded,
+                live_draft,
+                live_taken,
+                live_token,
+                grid.as_ptr(),
+                grid.len() as u32,
+                taken.as_mut_ptr(),
+            )
+        })?;
+        Ok(taken.into_iter().map(|t| t != 0).collect())
     }
 
     /// The candidate the device draws from `q` at each uniform of `grid`

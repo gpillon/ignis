@@ -280,7 +280,7 @@ impl SamplingParams {
         }
     }
 
-    fn to_ffi(self) -> ffi::IgnisSamplingParams {
+    pub(crate) fn to_ffi(self) -> ffi::IgnisSamplingParams {
         ffi::IgnisSamplingParams {
             size: std::mem::size_of::<ffi::IgnisSamplingParams>() as u32,
             greedy: 0,
@@ -1576,8 +1576,20 @@ unsafe extern "C" fn host_cut_trampoline(
 /// anchor, so the leaf refuses one outside the vocabulary: the `-1` pad is
 /// taken only after a run that ends at a stop id, and leaves the sequence
 /// with no pending token until a prefill gives it one -- a recording that
-/// ends without a stop must carry the token after it. Every lane must be
-/// greedy: the round draws nothing. A Flash-Next load refuses the forcing.
+/// ends without a stop must carry the token after it. Under the fixed draft
+/// every lane must be greedy: the round draws nothing. A Flash-Next load
+/// refuses the forcing.
+///
+/// GitHub #577: under the sampled draft (ADR 0090) a lane that samples may be
+/// forced too, as the lane that sampled: its drafter drafts each recorded
+/// token that is one of its column's candidates, and the round takes it with
+/// the probability a live round under the rule takes the token it emits,
+/// min(p, q) / p ([`crate::sampled_draft::forced_verdict`]) -- exactly the live
+/// round's verdict where the lane's own draws emit the recorded token, so a
+/// recording of the lane's own rounds is forced back into them. Its run is
+/// the recorded tokens taken, then the recorded token after them. Such a round
+/// runs eagerly, and refuses before its pass a recording whose run could stop
+/// at a successor outside the vocabulary (a pad that follows no stop).
 pub fn decode_program_verify_forced(
     model: &Model,
     pool: &SeqPool,

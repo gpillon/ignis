@@ -27,6 +27,22 @@ target logits (`dflash2_readout::verify_logits`). Every turn must end at a stop 
 (`<|im_end|>`): past a turn's end the driver forces the pad `-1`, which the leaf takes
 as a run's successor only after a stop (all 200 of the 2026-09-24 turns end at one).
 
+**Under a draft rule** (GitHub #577, spec #574, ADR 0090). `--draft-rule sampled` replays
+the same turns under the sampled draft at its default drafter settings (temperature
+factor 0.9, top-p 0.95); without it, today's fixed draft. Each turn's lane then samples as
+the recorded traffic did (temperature 1, top-k 20, top-p 0.95) under a seed of the turn's
+own. The forced round drafts along the recording -- each recorded token that is one of
+its column's 16 candidates -- and takes it with the probability a live round under the
+rule takes the token it emits, min(p, q) / p: the live round's own verdict where the
+lane's draws emit the recorded token, a coin of its own elsewhere
+(`sampled_draft::forced_verdict`, held to the rule's double-precision oracle). So the
+rounds a replay walks are distributed as live rounds under the rule are, over the same
+text, and the replay seams test holds forced rounds to live ones bit for bit under the
+sampled draft too (`dflash2_replay_seams_sampled_gpu.rs`). The record is the same 9,520
+bytes; its `drafts` are the lane's draws, and its `agreed` says the forced run took only
+recorded tokens among their column's candidates. The rule lands in `OUT_DIR/rule.json`
+(none: today's rule, as the 2026-09-24 run); one directory keeps one rule.
+
 | File | What it is |
 |---|---|
 | `select.py` | Picks the turns from the copy-drafting dataset (`.scratch/copy-drafting-2026-09-24/` in the main checkout: 13,102 rendered, tokenized qwen-code/opencode turns): source x kind strata, joined to their ninfer request-log DFlash2 stats. Writes `manifest.json` and one `<job>.tok` / `<job>.cat` per stream. Fixed seed. |
@@ -36,6 +52,7 @@ as a run's successor only after a stop (all 200 of the 2026-09-24 turns end at o
 | `analyze.py` | Per round: the realized coupling walk, the exact expected accepted length from the draft-conditioned verify columns, the greedy verdict, and one-hot/multi-candidate ceilings along the recorded chain; per column and per output kind: p(draft), p(argmax), top-2/4/16 mass; the expected-length lattice walk (lever 2). Writes `analysis.json` and `per_round.npz`. |
 | `tree.py` | Lever 3: a best-first token tree of N nodes from the drafter's own lattice, its expected accepted length along the recorded chain. |
 | `lever1.py` | Lever 1: adaptive extent at 8 lanes from `per_round.npz` and the width-cost curve (`crates/runtime/examples/verify_width_cost.rs`). |
+| `draft_rule.py` | GitHub #577: one or more replay directories, each under its rule (`rule.json`), in the form spec #574's study printed: tok/round realized and expected (the Rao-Blackwellized expectation at the same anchors), traffic-weighted and per cell; the survival P(accepted >= i) and the probability a reached draft column is taken, per column; the same per kind of output; for today's rule also the sampled draft priced offline at its anchors (the study's estimate, 3.738 against 3.461 on the 2026-09-24 rounds, which it reproduces); with `--reference` a run of today's rule turn by turn. `test_draft_rule.py` holds its q to the host reference's closed forms. |
 
 ## Running it
 
@@ -48,6 +65,9 @@ target/x86_64-pc-windows-msvc/debug/examples/dflash2_replay.exe \
 python tools/dflash2-replay/validate.py .scratch/replay/out .scratch/replay/input/manifest.json
 python tools/dflash2-replay/analyze.py  .scratch/replay/out .scratch/replay/input/manifest.json
 python tools/dflash2-replay/tree.py     .scratch/replay/out .scratch/replay/input/manifest.json
+# GitHub #577: the same turns under the sampled draft, into a directory of its own
+target/x86_64-pc-windows-msvc/debug/examples/dflash2_replay.exe --draft-rule sampled     F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer     .scratch/replay/input/manifest.json .scratch/replay/input .scratch/replay/out-sampled [FIRST [LAST]]
+python tools/dflash2-replay/draft_rule.py .scratch/replay/input/manifest.json     .scratch/replay/out .scratch/replay/out-sampled [--reference OUT_DIR_OF_AN_EARLIER_RUN]
 target/x86_64-pc-windows-msvc/debug/examples/verify_width_cost.exe ARTIFACT TEXT.bin 4096,16384,32768 30 cost.jsonl
 python tools/dflash2-replay/lever1.py   .scratch/replay/out cost.jsonl 32768 .scratch/replay/input/manifest.json
 ```

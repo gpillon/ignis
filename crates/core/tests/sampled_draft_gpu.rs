@@ -174,3 +174,103 @@ fn the_device_kernels_emit_the_targets_distribution_and_draw_the_drafters() {
     let Some(drawn) = on_device(device::draws(&walk, &[0.0, 0.5, 1.0 - f32::EPSILON / 2.0]), "the device draw") else { return };
     assert_eq!(drawn, vec![1, 1, 1], "at temperature 0 every uniform draws the walk's draft");
 }
+
+/// GitHub #577: the device's teacher-forced verdict
+/// (`ignis_forced_sampled_verdict`) held to the oracle the host reference is
+/// held to (`sampled_draft_forced_oracle.rs`): over the device's own live
+/// column -- its draw on the draft's grid, its verdicts on the accept's and
+/// the refusal's -- and the coin's grid, each recorded token of the target's
+/// support and of the drafter's candidates is taken on min(p, q) / p of the
+/// product grid (q where p gives it nothing), within the rule's lane
+/// tolerance plus `2 / COIN_CELLS`; and a recording of the live column's own
+/// token is forced back into the live verdict at every coin.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn the_device_forced_verdict_takes_a_recorded_token_as_a_live_round_does() {
+    const COIN_CELLS: usize = 1 << 12;
+    if let Err(e) = CudaDevice::create(0) {
+        if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+            return;
+        }
+    }
+    let coins = grid(COIN_CELLS);
+    let g = grid(CELLS);
+    let draft_grid = grid(DRAFT_CELLS);
+    let flat = [88, 640, 501, 9031, 12, 3, 4410, 70000, 77, 1999, 365, 248000, 2048, 5, 9030, 42];
+    let cases: [(&str, &[i32], &[f32]); 4] = [
+        ("q = p", &TARGET_IDS, &TARGET_PROBS),
+        ("q on three of the eight", &[9030, 501, 77], &[0.5, 0.25, 0.25]),
+        ("q half outside the support", &[31337, 12, 501], &[0.5, 0.25, 0.25]),
+        ("q flat over sixteen", &flat, &[1.0 / 16.0; 16]),
+    ];
+    for (case, drafter_ids, drafter_probs) in cases {
+        // The device's live column: each draft's share of its draw, and the
+        // share of each of its verdicts.
+        let Some(drawn) = on_device(device::draws(drafter_probs, &draft_grid), "the device draw") else { return };
+        let shares = draw_share(drafter_ids.len(), DRAFT_CELLS, |i| drawn[i]);
+        let mut live: Vec<(i32, f64, Vec<(Verdict, f64)>)> = Vec::new();
+        for (&draft, &share) in drafter_ids.iter().zip(&shares).filter(|&(_, &s)| s > 0.0) {
+            let Some(verdicts) = on_device(
+                device::verdicts(&TARGET_IDS, &TARGET_PROBS, drafter_ids, drafter_probs, draft, &g),
+                "the device verdicts",
+            ) else {
+                return;
+            };
+            let mut counts: Vec<(Verdict, u64)> = Vec::new();
+            for verdict in verdicts {
+                match counts.iter_mut().find(|(v, _)| *v == verdict) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((verdict, 1)),
+                }
+            }
+            let total = (CELLS * CELLS) as f64;
+            live.push((draft, share, counts.into_iter().map(|(v, n)| (v, n as f64 / total)).collect()));
+        }
+        let tolerance = lane_tolerance(CELLS, DRAFT_CELLS, drafter_ids.len()) + 2.0 / COIN_CELLS as f64;
+        let mut tokens: Vec<i32> = TARGET_IDS.iter().chain(drafter_ids).copied().collect();
+        tokens.sort_unstable();
+        tokens.dedup();
+        for recorded in tokens {
+            let mut taken = 0f64;
+            for (draft, draft_share, verdicts) in &live {
+                for &(verdict, verdict_share) in verdicts {
+                    let Some(on_coin) = on_device(
+                        device::forced_verdicts(
+                            &TARGET_IDS,
+                            &TARGET_PROBS,
+                            drafter_ids,
+                            drafter_probs,
+                            recorded,
+                            *draft,
+                            verdict,
+                            &coins,
+                        ),
+                        "the device forced verdicts",
+                    ) else {
+                        return;
+                    };
+                    let emitted = match verdict {
+                        Verdict::Accepted => *draft,
+                        Verdict::Refused(token) => token,
+                    };
+                    if emitted == recorded {
+                        let live_took = verdict == Verdict::Accepted;
+                        assert!(
+                            on_coin.iter().all(|&t| t == live_took),
+                            "device, {case}: the live column's own token {recorded} is not forced back into its verdict {verdict:?}"
+                        );
+                    }
+                    taken += draft_share * verdict_share * on_coin.iter().filter(|&&t| t).count() as f64 / COIN_CELLS as f64;
+                }
+            }
+            let p: f64 = TARGET_IDS.iter().zip(TARGET_PROBS).filter(|&(&id, _)| id == recorded).map(|(_, p)| p as f64).sum();
+            let q: f64 = drafter_ids.iter().zip(drafter_probs).filter(|&(&id, _)| id == recorded).map(|(_, &q)| q as f64).sum();
+            let expected = if p > 0.0 { p.min(q) / p } else { q };
+            assert!(
+                (taken - expected).abs() <= tolerance,
+                "device, {case}: recorded token {recorded} taken on {taken:.6} of the grid, a live round takes it with \
+                 {expected:.6} (tolerance {tolerance:.2e})"
+            );
+        }
+    }
+}

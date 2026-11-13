@@ -49,6 +49,14 @@ static_assert(kIgnisSamplePurposeDraft > ninfer::ops::kSamplePurposeSpeculativeB
                   kIgnisSamplePurposeSampledRefusal != kIgnisSamplePurposeRepair,
               "the sampled draft's purposes must be distinct from the vendored ones and the repair's");
 
+// GitHub #577 (test-only): the teacher-forced round's coin under the sampled
+// draft (`ignis_forced_sampled_verdict`), keyed like the three above. Only a
+// forced round draws it, and no serving path forces one.
+inline constexpr std::int32_t kIgnisSamplePurposeForcedCoin = 20;
+static_assert(kIgnisSamplePurposeForcedCoin > kIgnisSamplePurposeSampledRefusal &&
+                  kIgnisSamplePurposeForcedCoin != kIgnisSamplePurposeRepair,
+              "the forced coin's purpose must be its own");
+
 // The probability of `token` in a distribution of `n` (id, probability)
 // entries: the sum over the entries that hold it, 0 when none does
 // (`Distribution::prob`).
@@ -188,4 +196,32 @@ IGNIS_SAMPLED_DRAFT_FN bool ignis_sampled_verdict(const std::int32_t *target_ids
   }
   *token = target_ids[j < 0 ? 0 : j];
   return false;
+}
+
+// GitHub #577 (test-only): the teacher-forced verdict under the sampled draft
+// (`forced_verdict`, crates/core/src/sampled_draft.rs) at a column whose
+// recorded token is `recorded` and whose draft is that token. `live_taken`
+// and `live_token` are `ignis_sampled_verdict` on `live_draft`, the draft the
+// lane's own draw proposes there, under the column's own uniforms. Where that
+// live column emits the recorded token the verdict is the live one, so a
+// recording of the lane's own rounds is forced back into them; elsewhere the
+// coin `u_coin` takes the recorded token when `u_coin x p(x) < q(x)` (or
+// `u_coin < q(x)` where p gives it nothing). Taken with probability
+// min(p(x), q(x)) / p(x), a live round's.
+IGNIS_SAMPLED_DRAFT_FN bool ignis_forced_sampled_verdict(const std::int32_t *target_ids,
+                                                    const float *target_probs, int n_target,
+                                                    const std::int32_t *drafter_ids,
+                                                    const float *drafter_probs, int n_drafter,
+                                                    std::int32_t recorded, std::int32_t live_draft,
+                                                    bool live_taken, std::int32_t live_token,
+                                                    float u_coin) {
+  if (live_taken && live_draft == recorded) {
+    return true;
+  }
+  if (!live_taken && live_token == recorded) {
+    return false;
+  }
+  const float p = ignis_distribution_prob(target_ids, target_probs, n_target, recorded);
+  const float q = ignis_distribution_prob(drafter_ids, drafter_probs, n_drafter, recorded);
+  return p > 0.0f ? u_coin * p < q : u_coin < q;
 }

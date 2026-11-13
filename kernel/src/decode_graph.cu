@@ -273,7 +273,10 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
                                ? static_cast<const std::int32_t *>(verify.draft_candidates->p)
                                : nullptr,
                            verify.draft_q != nullptr ? static_cast<const float *>(verify.draft_q->p) : nullptr,
-                           *verify.accept_workspace, model->stream);
+                           *verify.accept_workspace, model->stream,
+                           // GitHub #577 (test-only): a teacher-forced round's
+                           // recording, set only while one runs eagerly.
+                           verify.forced_tokens);
     } else {
       ninfer::ops::speculative_accept_greedy_drafts(targets_rows, logits_rows, drafts, extents, lengths,
                                                     anchors_out, licensed_tokens, licensed_counts, accepted,
@@ -294,6 +297,12 @@ namespace {
 int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, uint32_t width,
                                    cudaGraphExec_t *out_exec) {
   *out_exec = nullptr;
+  // GitHub #577: a teacher-forced round's recording is set only while that
+  // round runs eagerly; a graph that baked it in would force serving rounds.
+  if (model->verify->forced_tokens != nullptr) {
+    set_error("ignis_verify_graph_capture: a teacher-forced round's recording is set");
+    return -1;
+  }
   cudaError_t err = cudaStreamBeginCapture(model->stream, cudaStreamCaptureModeThreadLocal);
   if (err != cudaSuccess) {
     set_error(std::string("ignis_verify_graph_capture: cudaStreamBeginCapture failed: ") +

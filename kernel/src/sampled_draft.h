@@ -29,11 +29,19 @@
 // `[top_k, k, B]` token ids. Each sampling lane's q is kept for the accept:
 // `q_ids` and `q_probs` are `[top_k, k, B]`, the candidates' ids and their
 // probabilities (a greedy lane's are left as they were).
+//
+// GitHub #577 (test-only): `forced`, device I32 `[k + 1, B]`, is a
+// teacher-forced round's recorded tokens after each lane's anchor. A sampling
+// lane then drafts each column's recorded token wherever it is one of the
+// column's candidates (its draw elsewhere), and its next column's q follows
+// that draft: the q a live round that drew the recording read. Null in every
+// serving round and in every verify graph.
 void ignis_sampled_draft_draw(const ninfer::Tensor &scores, const ninfer::Tensor &candidates,
                               const ninfer::ops::SamplingConfig *configs,
                               const std::int32_t *base_positions, float temperature_factor,
                               float top_p, ninfer::Tensor &drafts, std::int32_t *q_ids,
-                              float *q_probs, cudaStream_t stream);
+                              float *q_probs, cudaStream_t stream,
+                              const std::int32_t *forced = nullptr);
 
 // Whether the accept below serves a `token_domain`-wide vocabulary at window
 // `k`: it builds each column's target distribution on the vendored sampler's
@@ -61,10 +69,22 @@ std::size_t ignis_sampled_accept_workspace_bytes(std::int32_t token_domain, std:
 // vendored accept does. `q_ids`/`q_probs` are the draw's `[top_k, k, B]`
 // (ignis_sampled_draft_draw); null, q is one-hot on each lane's draft (a
 // verify-only load's drafts, which come per call).
+//
+// GitHub #577 (test-only): `forced` is the draw's (the same `[k + 1, B]`
+// recorded tokens, drafted along the recording). A sampling lane then takes
+// each recorded token by the teacher-forced verdict
+// (`ignis_forced_sampled_verdict`: the live verdict of the lane's own draw
+// where it emits the recorded token, else a coin of its own, taken with
+// probability min(p, q) / p either way), emits the recorded token where it
+// stops and the recorded one after a whole run in place of the bonus draw, so
+// its licensed run is the recording's. A recorded id outside the vocabulary
+// (the pad after a stop) is never counted. Greedy lanes are as without it.
+// Null in every serving round and in every verify graph.
 void ignis_sampled_accept(const ninfer::Tensor &target_tokens, const ninfer::Tensor &logits,
                           const ninfer::Tensor &drafts, const ninfer::Tensor &current_extents,
                           ninfer::Tensor &lengths, ninfer::Tensor &anchors,
                           ninfer::Tensor &licensed_tokens, ninfer::Tensor &licensed_counts,
                           ninfer::Tensor &accepted, std::int32_t token_domain,
                           const ninfer::ops::SamplingConfig *configs, const std::int32_t *q_ids,
-                          const float *q_probs, ninfer::DeviceArena &workspace, cudaStream_t stream);
+                          const float *q_probs, ninfer::DeviceArena &workspace, cudaStream_t stream,
+                          const std::int32_t *forced = nullptr);

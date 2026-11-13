@@ -47,6 +47,20 @@ int32_t ignis_sampled_draft_verdicts(const int32_t *target_ids, const float *tar
 int32_t ignis_sampled_draft_draws(const float *q, uint32_t count, const float *grid,
                                   uint32_t cells, int32_t *out_candidates);
 
+/* GitHub #577: the teacher-forced verdict (`ignis_forced_sampled_verdict`)
+ * on the recorded token `recorded` at each of `cells` coin uniforms `grid`:
+ * `out_taken[i]` is 1 where the recorded token is taken with the coin
+ * `grid[i]`, else 0. `live_taken` (0 or 1) and `live_token` are the live
+ * column's verdict on `live_draft`, as `ignis_sampled_draft_verdicts` writes
+ * it (`live_token` is the draft where it was taken). The distributions as
+ * there. */
+int32_t ignis_sampled_draft_forced_verdicts(const int32_t *target_ids, const float *target_probs,
+                                            uint32_t target_count, const int32_t *drafter_ids,
+                                            const float *drafter_probs, uint32_t drafter_count,
+                                            int32_t recorded, int32_t live_draft, int32_t live_taken,
+                                            int32_t live_token, const float *grid, uint32_t cells,
+                                            uint8_t *out_taken);
+
 /* The drafter's distribution over `count` candidates from their transition
  * scores, at `temperature` and `top_p`, into `out_q[count]`. */
 int32_t ignis_sampled_drafter_distribution(const float *scores, uint32_t count, float temperature,

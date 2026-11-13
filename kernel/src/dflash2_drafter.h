@@ -65,12 +65,18 @@ void ignis_dflash2_append_context(ignis_model *model, ignis_seq_pool *pool,
 // model's stream (the caller synchronizes). Test-only: only
 // `ignis_dflash2_readout` (kernel/include/ignis_dflash2_readout.h) passes
 // one, eagerly; the verify round and its graphs pass none, so what they run
-// and record is unchanged. A null member skips that copy.
+// and record is unchanged. A null member skips that copy. GitHub #577: under
+// the sampled draft the readout draws as the round does, and `q` receives the
+// distribution each sampling lane's draft was drawn from.
+//
+// GitHub #577 (test-only): with `model->verify->forced_tokens` set (a
+// teacher-forced round, eagerly), the draw drafts along the recording.
 struct Dflash2ProposalReadout {
   std::int32_t *candidate_ids = nullptr; // I32 [width][k][top_k]
   float *candidate_logits     = nullptr; // F32 [width][k][top_k]
   float *scores               = nullptr; // F32 [width][k][top_k (pred)][top_k (succ)]
   std::uint16_t *head_logits  = nullptr; // BF16 [width * k][head rows]
+  float *q                    = nullptr; // F32 [width][k][top_k], under the sampled draft
 };
 void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, std::uint32_t width,
                            const Dflash2ProposalReadout *readout = nullptr);

@@ -2,7 +2,9 @@
 // draw and the verify round's accept for a load under the sampled draft
 // (kernel/src/sampled_draft.h), and the test-only entries over explicit
 // uniforms (kernel/include/ignis_sampled_draft.h). The arithmetic is
-// kernel/src/sampled_draft.cuh's.
+// kernel/src/sampled_draft.cuh's. GitHub #577 adds the teacher-forced round's
+// mode of the draw and the accept (test-only, null in every serving round)
+// and its verdict's sweep.
 //
 // The accept builds each column's target distribution with the vendored
 // sampler's device primitives (ops/kernel/sampling_device.cuh) on its
@@ -73,12 +75,17 @@ __device__ inline int clamped_extent(const std::int32_t *current_extents, int ro
 }
 
 // One thread per lane: the draws of a sampling lane, column by column, each
-// from q given the draft drawn before it.
+// from q given the draft drawn before it. GitHub #577 (test-only): with
+// `forced` (`[k + 1, B]`, a teacher-forced round's recorded tokens) a column
+// whose recorded token is one of its candidates drafts that token instead of
+// the draw, and the next column's q follows it: the forced round drafts along
+// the recording, keeping the q a live round that drew it would have read.
 __global__ void sampled_draft_draw_kernel(const float *scores, const std::int32_t *candidates,
                                           const SamplingConfig *configs,
                                           const std::int32_t *base_positions, std::int32_t k,
                                           std::int32_t lanes, float temperature_factor, float top_p,
-                                          std::int32_t *drafts, std::int32_t *q_ids, float *q_probs) {
+                                          const std::int32_t *forced, std::int32_t *drafts,
+                                          std::int32_t *q_ids, float *q_probs) {
   const int lane = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (lane >= lanes) {
     return;
@@ -95,10 +102,19 @@ __global__ void sampled_draft_draw_kernel(const float *scores, const std::int32_
     float q[kTopK];
     ignis_drafter_distribution(scores + kTopK * (pred + kTopK * slot), kTopK, temperature, top_p, q);
     const float u = ninfer::ops::sampling_uniform(cfg.seed, base + s + 1, kIgnisSamplePurposeDraft, 0u);
-    const int picked = ignis_draw_draft(q, kTopK, u);
+    int picked = ignis_draw_draft(q, kTopK, u);
     for (int i = 0; i < kTopK; ++i) {
       q_ids[kTopK * slot + i] = candidates[kTopK * slot + i];
       q_probs[kTopK * slot + i] = q[i];
+    }
+    if (forced != nullptr) {
+      const std::int32_t recorded = forced[static_cast<std::int64_t>(lane) * (k + 1) + s];
+      for (int i = 0; i < kTopK; ++i) {
+        if (candidates[kTopK * slot + i] == recorded) {
+          picked = i;
+          break;
+        }
+      }
     }
     drafts[slot] = candidates[kTopK * slot + picked];
     pred = picked;
@@ -249,13 +265,19 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampled_target_finalize_ke
 }
 
 // One thread per lane: the verdicts of the round, then its outputs, as the
-// vendored accept writes them.
+// vendored accept writes them. GitHub #577 (test-only): with `forced`
+// (`[k + 1, B]`, a teacher-forced round's recorded tokens, drafted along the
+// recording by the draw) a sampling lane takes each recorded token by the
+// forced verdict (`ignis_forced_sampled_verdict`) and emits the recorded token
+// where it stops, so its run is the recording's; a token outside the
+// vocabulary (the pad after a stop) is never counted in the penalty row.
 __global__ void sampled_accept_kernel(const std::int32_t *target_tokens, const std::int32_t *drafts,
                                       const std::int32_t *current_extents, std::int32_t *lengths,
                                       std::int32_t *anchors, std::int32_t *licensed_tokens,
                                       std::int32_t *licensed_counts, std::int32_t *accepted,
                                       const SamplingConfig *configs, const std::int32_t *q_ids,
-                                      const float *q_probs, std::int32_t k, std::int32_t batch,
+                                      const float *q_probs, const std::int32_t *forced,
+                                      std::int32_t token_domain, std::int32_t k, std::int32_t batch,
                                       SamplingWorkspace workspace, std::size_t row_stride) {
   const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   if (row >= batch) {
@@ -265,6 +287,7 @@ __global__ void sampled_accept_kernel(const std::int32_t *target_tokens, const s
   const int extent = clamped_extent(current_extents, row, k);
   const SamplingConfig cfg = configs[row];
   const std::int32_t *row_drafts = drafts + row * k;
+  const std::int32_t *row_forced = forced == nullptr ? nullptr : forced + static_cast<std::int64_t>(row) * cols;
   std::int32_t *row_tokens = licensed_tokens + row * cols;
   int a = 0;
   int tstar = 0;
@@ -284,6 +307,11 @@ __global__ void sampled_accept_kernel(const std::int32_t *target_tokens, const s
       const int *support = workspace.dist_idx + ninfer::ops::sampling_dist_offset(i, 0);
       const float *probs = workspace.dist_prob + ninfer::ops::sampling_dist_offset(i, 0);
       if (i == extent) {
+        if (row_forced != nullptr) {
+          // Every recorded token taken: the recorded one after them.
+          tstar = row_forced[extent];
+          break;
+        }
         // Every draft taken: the bonus token from the last column, the
         // vendored accept's draw.
         const float u = ninfer::ops::sampling_uniform(cfg.seed, length + extent + 1,
@@ -306,6 +334,32 @@ __global__ void sampled_accept_kernel(const std::int32_t *target_tokens, const s
           ninfer::ops::sampling_uniform(cfg.seed, length + i + 1, kIgnisSamplePurposeSampledAccept, 0u);
       const float u_refusal =
           ninfer::ops::sampling_uniform(cfg.seed, length + i + 1, kIgnisSamplePurposeSampledRefusal, 0u);
+      if (row_forced != nullptr) {
+        // The draw drafted the recorded token wherever it is a candidate; the
+        // live draft there is the one the lane's own stream draws from the q
+        // it kept.
+        const std::int32_t recorded = row_forced[i];
+        bool taken = false;
+        if (draft == recorded) {
+          const float u_draft =
+              ninfer::ops::sampling_uniform(cfg.seed, length + i + 1, kIgnisSamplePurposeDraft, 0u);
+          const std::int32_t live_draft =
+              q_ids == nullptr ? draft : drafter_ids[ignis_draw_draft(drafter_probs, n_drafter, u_draft)];
+          std::int32_t live_token = 0;
+          const bool live_taken = ignis_sampled_verdict(support, probs, n, drafter_ids, drafter_probs, n_drafter,
+                                                        live_draft, u_accept, u_refusal, &live_token);
+          const float u_coin =
+              ninfer::ops::sampling_uniform(cfg.seed, length + i + 1, kIgnisSamplePurposeForcedCoin, 0u);
+          taken = ignis_forced_sampled_verdict(support, probs, n, drafter_ids, drafter_probs, n_drafter, recorded,
+                                               live_draft, live_taken, live_token, u_coin);
+        }
+        if (taken) {
+          a = i + 1;
+          continue;
+        }
+        tstar = recorded;
+        break;
+      }
       std::int32_t token = 0;
       if (ignis_sampled_verdict(support, probs, n, drafter_ids, drafter_probs, n_drafter, draft, u_accept,
                                 u_refusal, &token)) {
@@ -330,7 +384,9 @@ __global__ void sampled_accept_kernel(const std::int32_t *target_tokens, const s
   lengths[row] = length + produced;
   if (cfg.temperature > 0.0f && cfg.token_counts != nullptr) {
     for (int i = 0; i < produced; ++i) {
-      atomicAdd(&cfg.token_counts[row_tokens[i]], 1);
+      if (row_tokens[i] >= 0 && row_tokens[i] < token_domain) {
+        atomicAdd(&cfg.token_counts[row_tokens[i]], 1);
+      }
     }
   }
 }
@@ -349,6 +405,20 @@ __global__ void verdict_sweep_kernel(const std::int32_t *target_ids, const float
   const bool taken = ignis_sampled_verdict(target_ids, target_probs, n_target, drafter_ids, drafter_probs,
                                            n_drafter, draft, grid[point / cells], grid[point % cells], &token);
   out[point] = taken ? IGNIS_SAMPLED_DRAFT_ACCEPTED : token;
+}
+
+__global__ void forced_sweep_kernel(const std::int32_t *target_ids, const float *target_probs, int n_target,
+                                    const std::int32_t *drafter_ids, const float *drafter_probs, int n_drafter,
+                                    std::int32_t recorded, std::int32_t live_draft, bool live_taken,
+                                    std::int32_t live_token, const float *grid, std::uint32_t cells,
+                                    std::uint8_t *out) {
+  const std::uint32_t point = blockIdx.x * blockDim.x + threadIdx.x;
+  if (point < cells) {
+    out[point] = ignis_forced_sampled_verdict(target_ids, target_probs, n_target, drafter_ids, drafter_probs,
+                                              n_drafter, recorded, live_draft, live_taken, live_token, grid[point])
+                     ? 1
+                     : 0;
+  }
 }
 
 __global__ void draw_sweep_kernel(const float *q, int n, const float *grid, std::uint32_t cells,
@@ -394,7 +464,8 @@ void synchronize(const char *what) {
 void ignis_sampled_draft_draw(const ninfer::Tensor &scores, const ninfer::Tensor &candidates,
                               const ninfer::ops::SamplingConfig *configs, const std::int32_t *base_positions,
                               float temperature_factor, float top_p, ninfer::Tensor &drafts,
-                              std::int32_t *q_ids, float *q_probs, cudaStream_t stream) {
+                              std::int32_t *q_ids, float *q_probs, cudaStream_t stream,
+                              const std::int32_t *forced) {
   const std::int32_t k = drafts.ne[0];
   const std::int32_t lanes = drafts.ne[1];
   if (scores.ne[0] != kTopK || scores.ne[1] != kTopK || scores.ne[2] != k || scores.ne[3] != lanes ||
@@ -407,8 +478,8 @@ void ignis_sampled_draft_draw(const ninfer::Tensor &scores, const ninfer::Tensor
   constexpr int kBlock = 32;
   sampled_draft_draw_kernel<<<div_up(lanes, kBlock), kBlock, 0, stream>>>(
       static_cast<const float *>(scores.data), static_cast<const std::int32_t *>(candidates.data), configs,
-      base_positions, k, lanes, temperature_factor, top_p, static_cast<std::int32_t *>(drafts.data), q_ids,
-      q_probs);
+      base_positions, k, lanes, temperature_factor, top_p, forced, static_cast<std::int32_t *>(drafts.data),
+      q_ids, q_probs);
   check_launch("ignis_sampled_draft_draw");
 }
 
@@ -427,7 +498,8 @@ void ignis_sampled_accept(const ninfer::Tensor &target_tokens, const ninfer::Ten
                           ninfer::Tensor &lengths, ninfer::Tensor &anchors, ninfer::Tensor &licensed_tokens,
                           ninfer::Tensor &licensed_counts, ninfer::Tensor &accepted, std::int32_t token_domain,
                           const ninfer::ops::SamplingConfig *configs, const std::int32_t *q_ids,
-                          const float *q_probs, ninfer::DeviceArena &workspace, cudaStream_t stream) {
+                          const float *q_probs, ninfer::DeviceArena &workspace, cudaStream_t stream,
+                          const std::int32_t *forced) {
   const std::int32_t k = drafts.ne[0];
   const std::int32_t batch = drafts.ne[1];
   const std::int32_t cols = k + 1;
@@ -467,7 +539,8 @@ void ignis_sampled_accept(const ninfer::Tensor &target_tokens, const ninfer::Ten
       static_cast<const std::int32_t *>(target_tokens.data), static_cast<const std::int32_t *>(drafts.data),
       extents, static_cast<std::int32_t *>(lengths.data), static_cast<std::int32_t *>(anchors.data),
       static_cast<std::int32_t *>(licensed_tokens.data), static_cast<std::int32_t *>(licensed_counts.data),
-      static_cast<std::int32_t *>(accepted.data), configs, q_ids, q_probs, k, batch, scratch, layout.bytes);
+      static_cast<std::int32_t *>(accepted.data), configs, q_ids, q_probs, forced, token_domain, k, batch, scratch,
+      layout.bytes);
   check_launch("ignis_sampled_accept: the verdicts");
 }
 
@@ -504,6 +577,43 @@ extern "C" int32_t ignis_sampled_draft_verdicts(const int32_t *target_ids, const
     return 0;
   } catch (const std::exception &e) {
     return fail(std::string("ignis_sampled_draft_verdicts: ") + e.what());
+  }
+}
+
+extern "C" int32_t ignis_sampled_draft_forced_verdicts(const int32_t *target_ids, const float *target_probs,
+                                                       uint32_t target_count, const int32_t *drafter_ids,
+                                                       const float *drafter_probs, uint32_t drafter_count,
+                                                       int32_t recorded, int32_t live_draft, int32_t live_taken,
+                                                       int32_t live_token, const float *grid, uint32_t cells,
+                                                       uint8_t *out_taken) {
+  if (target_ids == nullptr || target_probs == nullptr || drafter_ids == nullptr || drafter_probs == nullptr ||
+      grid == nullptr || out_taken == nullptr) {
+    return fail("ignis_sampled_draft_forced_verdicts: null argument");
+  }
+  if (target_count == 0 || drafter_count == 0 || drafter_count > IGNIS_SAMPLED_DRAFT_MAX_CANDIDATES ||
+      cells == 0) {
+    return fail("ignis_sampled_draft_forced_verdicts: an empty distribution or grid, or a drafter past " +
+                std::to_string(IGNIS_SAMPLED_DRAFT_MAX_CANDIDATES) + " candidates");
+  }
+  try {
+    ninfer::DeviceBuffer d_target_ids = to_device(target_ids, target_count);
+    ninfer::DeviceBuffer d_target_probs = to_device(target_probs, target_count);
+    ninfer::DeviceBuffer d_drafter_ids = to_device(drafter_ids, drafter_count);
+    ninfer::DeviceBuffer d_drafter_probs = to_device(drafter_probs, drafter_count);
+    ninfer::DeviceBuffer d_grid = to_device(grid, cells);
+    ninfer::DeviceBuffer d_out(static_cast<std::size_t>(cells));
+    constexpr int kBlock = 256;
+    forced_sweep_kernel<<<div_up(static_cast<int>(cells), kBlock), kBlock>>>(
+        static_cast<const std::int32_t *>(d_target_ids.p), static_cast<const float *>(d_target_probs.p),
+        static_cast<int>(target_count), static_cast<const std::int32_t *>(d_drafter_ids.p),
+        static_cast<const float *>(d_drafter_probs.p), static_cast<int>(drafter_count), recorded, live_draft,
+        live_taken != 0, live_token, static_cast<const float *>(d_grid.p), cells,
+        static_cast<std::uint8_t *>(d_out.p));
+    synchronize("ignis_sampled_draft_forced_verdicts");
+    d_out.copy_to_host(out_taken, static_cast<std::size_t>(cells));
+    return 0;
+  } catch (const std::exception &e) {
+    return fail(std::string("ignis_sampled_draft_forced_verdicts: ") + e.what());
   }
 }
 

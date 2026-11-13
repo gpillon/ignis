@@ -18,7 +18,11 @@
 //! accept's share, `R` the refusal draw's), so each token's share is within
 //! `4 / cells` of exact. A lane first draws its draft on its own grid of
 //! `draft_cells`, each candidate's share within `2 / draft_cells`, and the
-//! drafts' errors add: [`lane_tolerance`].
+//! drafts' errors add: [`lane_tolerance`]. The teacher-forced verdict (GitHub
+//! #577) reads one more uniform, its coin, on a grid of its own: its share
+//! is within that lane tolerance plus `2 / coin_cells`.
+
+#![allow(dead_code)] // each test that includes the oracle uses its own part of it
 
 use std::collections::BTreeMap;
 
@@ -63,6 +67,30 @@ pub fn column_share(draft: i32, cells: usize, mut verdict_at: impl FnMut(usize, 
         emitted: counts.into_iter().map(|(token, n)| (token, n as f64 / total)).collect(),
         accepted: accepted as f64 / total,
     }
+}
+
+/// Sweeps one column's two uniforms over `cells` x `cells` points, as
+/// [`column_share`] does, keeping each verdict whole (GitHub #577): the share
+/// of the grid on which the column took its draft, and on which it refused it
+/// and drew each token. The teacher-forced verdict reads the live column's
+/// verdict, so its share over the column's grid is a sum over these.
+pub fn verdict_share(cells: usize, mut verdict_at: impl FnMut(usize, usize) -> Verdict) -> Vec<(Verdict, f64)> {
+    let mut accepted = 0u64;
+    let mut refused: BTreeMap<i32, u64> = BTreeMap::new();
+    for i in 0..cells {
+        for j in 0..cells {
+            match verdict_at(i, j) {
+                Verdict::Accepted => accepted += 1,
+                Verdict::Refused(token) => *refused.entry(token).or_default() += 1,
+            }
+        }
+    }
+    let total = (cells * cells) as f64;
+    std::iter::once((Verdict::Accepted, accepted))
+        .chain(refused.into_iter().map(|(token, n)| (Verdict::Refused(token), n)))
+        .filter(|&(_, n)| n > 0)
+        .map(|(verdict, n)| (verdict, n as f64 / total))
+        .collect()
 }
 
 /// Sweeps the draft's own uniform over `cells` points: each candidate

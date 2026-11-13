@@ -2023,13 +2023,24 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
   // recorded text, so it draws nothing -- and a lane at temperature > 0
   // would have had the accept kernel count its own draw in the lane's
   // penalty row, which the forced text then contradicts.
+  //
+  // GitHub #577 (test-only): under the sampled draft a sampling lane is
+  // forced on the device instead. Its draw drafts along the recording and its
+  // accept takes each recorded token by the teacher-forced verdict -- with
+  // probability min(p, q) / p, a live round's, and as the live round itself
+  // on a recording of the lane's own rounds -- counting in the penalty row
+  // the recorded tokens it licenses. Such a round runs eagerly, the
+  // recording at `verify.forced_tokens` while it runs.
+  const auto samples = [&](uint64_t i) { return sampling[i].greedy == 0 && sampling[i].temperature > 0.0f; };
+  bool forced_on_device = false;
   if (options.forced_tokens != nullptr) {
     for (uint64_t i = 0; i < batch_size; ++i) {
-      if (sampling[i].greedy == 0 && sampling[i].temperature > 0.0f) {
+      if (samples(i) && !verify.sampled_draft) {
         set_error("ignis_program_decode: a teacher-forced round is greedy; lane " +
                   std::to_string(i) + " samples at temperature > 0");
         return -1;
       }
+      forced_on_device = forced_on_device || samples(i);
     }
   }
 
@@ -2098,6 +2109,24 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
               seq->rope_delta;
         }
       }
+      // GitHub #577 (test-only): a sampling lane forced on the device may stop
+      // at any column, so every successor up to its extent is checked now,
+      // before anything is enqueued (kernel/src/teacher_forcing.h) -- every
+      // lane's in such a round, so that no refusal after the pass leaves a
+      // penalty row the device already counted in.
+      if (forced_on_device) {
+        const std::int32_t *forced = options.forced_tokens + i * lane_columns;
+        const std::int32_t bad = ignis_teacher_forced_first_bad_successor(
+            anchors[i], forced, extents[i], static_cast<std::int32_t>(model->vocab), sampling[i].stop_ids,
+            sampling[i].stop_id_count);
+        if (bad >= 0) {
+          set_error("ignis_program_decode: lane " + std::to_string(i) + "'s forced token " +
+                    std::to_string(forced[bad]) + " after its first " + std::to_string(bad) +
+                    " recorded tokens is outside the vocabulary (the pad -1 ends a recording only after a "
+                    "stop id)");
+          return -1;
+        }
+      }
     }
 
     // GitHub #157: each lane's carried anchor taps, into its window before
@@ -2146,8 +2175,30 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       return -1;
     }
 
+    // GitHub #577 (test-only): the recording the device forces, at
+    // `verify.forced_tokens` for this round only. The verify graphs were
+    // captured without it, so the round runs eagerly.
+    std::unique_ptr<ninfer::DeviceBuffer> forced_device;
+    struct ClearForcedTokens {
+      IgnisVerifyRound *verify = nullptr;
+      ~ClearForcedTokens() {
+        if (verify != nullptr) {
+          verify->forced_tokens = nullptr;
+        }
+      }
+    } clear_forced_tokens;
+    if (forced_on_device) {
+      const std::size_t forced_bytes = static_cast<std::size_t>(lane_columns) * batch_size * sizeof(std::int32_t);
+      forced_device = std::make_unique<ninfer::DeviceBuffer>(forced_bytes);
+      if (!stage(*forced_device, options.forced_tokens, forced_bytes, "forced tokens")) {
+        return -1;
+      }
+      verify.forced_tokens = static_cast<const std::int32_t *>(forced_device->p);
+      clear_forced_tokens.verify = &verify;
+    }
+
     UncommittedRingColumns uncommitted{pool, model->stream, &base_positions, &extents, &slots};
-    const bool use_graph = verify.graph_ready[batch_size - 1];
+    const bool use_graph = !forced_on_device && verify.graph_ready[batch_size - 1];
     // GitHub #590: the pass writes the verify logits, which a repair reads for
     // a lane whose commit the host cuts. Stamped before the work is enqueued,
     // so a round that fails part way leaves no earlier record believing them
@@ -2215,6 +2266,19 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       }
       for (uint64_t i = 0; i < batch_size; ++i) {
         const std::int32_t *forced = options.forced_tokens + i * lane_columns;
+        // GitHub #577 (test-only): a sampling lane forced on the device has
+        // its verdict already, the recording's run by the forced coin; one
+        // that is not the recording's is the device's fault, and refused.
+        if (forced_on_device && samples(i)) {
+          if (!ignis_teacher_forced_run_is_recorded(licensed.data() + i * lane_columns, forced, accepted[i],
+                                                   extents[i])) {
+            set_error("ignis_program_decode: lane " + std::to_string(i) + "'s forced verdict on the device "
+                      "licensed a run that is not its recording (" + std::to_string(accepted[i]) +
+                      " taken of an extent of " + std::to_string(extents[i]) + ")");
+            return -1;
+          }
+          continue;
+        }
         const IgnisForcedVerdict verdict = ignis_teacher_forced_verdict(
             anchors[i], drafts.data() + i * k, forced, extents[i], static_cast<std::int32_t>(model->vocab),
             sampling[i].stop_ids, sampling[i].stop_id_count, licensed.data() + i * lane_columns);
@@ -2399,6 +2463,11 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       const std::int32_t produced = accepted[i] + 1;
       const std::int32_t *lane_licensed = licensed.data() + i * lane_columns;
       for (std::int32_t j = committed[i]; j < produced; ++j) {
+        // GitHub #577: a forced lane's pad after a stop (-1) was never
+        // counted; every other licensed token is a vocabulary id.
+        if (lane_licensed[j] < 0 || lane_licensed[j] >= static_cast<std::int32_t>(model->vocab)) {
+          continue;
+        }
         rollback.emplace_back(configs[i].token_counts + lane_licensed[j], -1);
       }
       if (redirected[i]) {

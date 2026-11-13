@@ -1149,13 +1149,20 @@ which no serving path sets). The pass is any round's — under **DFlash2** the
 drafter proposes from the lane's **drafter window** — but the lane accepts the
 leading drafts the recording agrees with, at most its **extent**, and takes the
 recorded token after them as its correction, so the **committed run** is the
-recording's.
+recording's. Under the **sampled draft** (GitHub #577) a sampling lane is forced
+too: its drafter drafts the recorded tokens that are among its candidates, and
+its accept takes each with the probability a live round under the rule takes
+the token it emits, min(p, q)/p — the live round's own verdict where the lane's
+draws emit the recorded token, a coin of its own elsewhere — so the rounds a
+replay walks are distributed as live rounds under the rule are.
 
 **Proposal readout**:
 The drafter's proposals at a sequence's frontier, read without running a round
 (GitHub #267, test-only): the drafts, each draft column's 16 candidates, their
 proposal-head logits and the selector's transition scores, the lattice the
-replay walks other selection rules over. Named after the **readout**'s
+replay walks other selection rules over; under the **sampled draft** a sampling
+lane's drawn drafts, with the distribution q each was drawn from (GitHub #577).
+Named after the **readout**'s
 precedent — a measurement beside the program, never a second way to generate —
 but not one: a **readout** reads named tokens' target logits at one position
 and costs a prefill; this reads the drafter's lattice and costs one eager

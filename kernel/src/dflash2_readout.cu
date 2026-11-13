@@ -8,6 +8,7 @@
 #include "ignis_seq_internal.h"
 #include "ignis_step.h"
 #include "model_internal.h"
+#include "step_internal.h"
 
 #include <cuda_runtime.h>
 
@@ -82,6 +83,10 @@ extern "C" int32_t ignis_dflash2_readout(struct ignis_model *model, struct ignis
     return fail("ignis_dflash2_readout: the drafter logits are read over the full head; this "
                 "load proposes through the shortlist head");
   }
+  if (readout->sampling != nullptr && !ignis::step::sampling_size_ok(*readout->sampling)) {
+    return fail("ignis_dflash2_readout: unrecognized ignis_sampling_params size " +
+                std::to_string(readout->sampling->size));
+  }
 
   // Lane 0 of a width-1 round, staged where the forward reads it. Host
   // values outlive the synchronize below.
@@ -111,10 +116,30 @@ extern "C" int32_t ignis_dflash2_readout(struct ignis_model *model, struct ignis
                   ") failed: " + cudaGetErrorString(err));
     }
   }
+  // GitHub #577: under the sampled draft the lane's draw reads its sampling
+  // config -- its temperature and seed -- at lane 0, as the round stages it;
+  // a NULL `sampling` is a greedy lane, which draws nothing. No penalty row:
+  // the readout runs no accept.
+  const bool draws = verify.sampled_draft && readout->sampling != nullptr &&
+                     readout->sampling->greedy == 0 && readout->sampling->temperature > 0.0f;
+  ignis_sampling_params greedy{};
+  greedy.size = sizeof(greedy);
+  greedy.greedy = 1;
+  const ninfer::ops::SamplingConfig config =
+      ignis::step::to_sampling_config(readout->sampling != nullptr ? *readout->sampling : greedy, nullptr);
+  if (verify.sampled_draft) {
+    const cudaError_t err = cudaMemcpyAsync(model->sampling_decode_configs->p, &config, sizeof(config),
+                                            cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) {
+      return fail(std::string("ignis_dflash2_readout: cudaMemcpyAsync(sampling config) failed: ") +
+                  cudaGetErrorString(err));
+    }
+  }
 
   try {
     const Dflash2ProposalReadout sink{readout->out_candidate_ids, readout->out_candidate_logits,
-                                      readout->out_scores, readout->out_drafter_logits};
+                                      readout->out_scores, readout->out_drafter_logits,
+                                      draws ? readout->out_q : nullptr};
     ignis_dflash2_propose(model, pool, 1, &sink);
   } catch (const std::exception &e) {
     (void)cudaStreamSynchronize(stream);
@@ -131,6 +156,17 @@ extern "C" int32_t ignis_dflash2_readout(struct ignis_model *model, struct ignis
   if (err != cudaSuccess) {
     return fail(std::string("ignis_dflash2_readout: cudaStreamSynchronize failed: ") +
                 cudaGetErrorString(err));
+  }
+  // GitHub #577: where nothing was drawn, q is one-hot on each walk draft,
+  // the fixed draft's distribution.
+  if (readout->out_q != nullptr && !draws) {
+    constexpr std::uint32_t top_k = IGNIS_DFLASH2_READOUT_TOP_K;
+    for (std::uint32_t s = 0; s < k; ++s) {
+      float *row = readout->out_q + s * top_k;
+      for (std::uint32_t i = 0; i < top_k; ++i) {
+        row[i] = readout->out_candidate_ids[s * top_k + i] == readout->out_drafts[s] ? 1.0f : 0.0f;
+      }
+    }
   }
   return 0;
 }

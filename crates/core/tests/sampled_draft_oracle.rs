@@ -178,6 +178,7 @@ fn lattice() -> Dflash2Proposal {
         candidate_logits: vec![0.0; k * TOP_K],
         scores,
         drafter_logits: None,
+        q: vec![0.0; k * TOP_K],
     }
 }
 

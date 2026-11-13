@@ -54,3 +54,44 @@ inline IgnisForcedVerdict ignis_teacher_forced_verdict(int32_t anchor, const int
   licensed[n] = successor;
   return {n, false};
 }
+
+// GitHub #577 (test-only): under the sampled draft a forced sampling lane's
+// verdict is the device's -- the teacher-forced coin of the accept kernel
+// (kernel/src/sampled_draft.cuh, `ignis_forced_sampled_verdict`) -- so its
+// run may stop at any column up to its extent, and the round checks every
+// successor it could stop at before the pass: `forced[n]` for each n in
+// 0..extent must be a vocabulary id, or the pad -1 after a stop id among the
+// anchor and `forced[0..n)`, the rule above for every n. Returns the first n
+// that breaks it, or -1. A well-formed recording passes whole: its pads
+// follow its stop.
+inline int32_t ignis_teacher_forced_first_bad_successor(int32_t anchor, const int32_t *forced,
+                                                        int32_t extent, int32_t vocab,
+                                                        const int32_t *stop_ids, uint32_t stop_count) {
+  bool stopped = ignis_is_stop_id(anchor, stop_ids, stop_count);
+  for (int32_t n = 0; n <= extent; ++n) {
+    const int32_t successor = forced[n];
+    const bool in_vocabulary = successor >= 0 && successor < vocab;
+    if (!in_vocabulary && !(successor == -1 && stopped)) {
+      return n;
+    }
+    stopped = stopped || ignis_is_stop_id(successor, stop_ids, stop_count);
+  }
+  return -1;
+}
+
+// GitHub #577 (test-only): whether a forced sampling lane's licensed run --
+// what the device's forced verdict wrote, `accepted` recorded tokens then the
+// one after them -- is the recording's. The round refuses one that is not:
+// the device took something other than the recorded text.
+inline bool ignis_teacher_forced_run_is_recorded(const int32_t *licensed, const int32_t *forced,
+                                                 int32_t accepted, int32_t extent) {
+  if (accepted < 0 || accepted > extent) {
+    return false;
+  }
+  for (int32_t j = 0; j <= accepted; ++j) {
+    if (licensed[j] != forced[j]) {
+      return false;
+    }
+  }
+  return true;
+}

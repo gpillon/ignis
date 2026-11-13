@@ -5,7 +5,8 @@
 //!
 //! ```text
 //! cargo run --release -p ignis-runtime --features cuda --example dflash2_replay -- \
-//!     [--lanes N] [--prefill-chunk N] ARTIFACT MANIFEST_JSON INPUT_DIR OUT_DIR [FIRST_JOB [LAST_JOB]]
+//!     [--lanes N] [--prefill-chunk N] [--draft-rule fixed|sampled] \
+//!     ARTIFACT MANIFEST_JSON INPUT_DIR OUT_DIR [FIRST_JOB [LAST_JOB]]
 //! ```
 //!
 //! The manifest (`tools/dflash2-replay/select.py`) lists jobs: a token stream
@@ -33,6 +34,23 @@
 //!   reduced to each column's top 20 (the sampler's cap), its full-vocabulary
 //!   log-sum-exp and the forced token's logit.
 //!
+//! GitHub #577: `--draft-rule sampled` replays the same turns under the
+//! sampled draft (spec #574, ADR 0090) at its default drafter settings. Each
+//! turn's lane then samples as the recorded traffic did -- temperature 1,
+//! top-k 20, top-p 0.95 -- under a seed of the turn's own, the readout reads
+//! the drafts that lane would draw (`dflash2_readout::propose_sampled`), and
+//! the forced round drafts along the recording and takes each recorded token
+//! with the probability a live round under the rule takes it, min(p, q) / p
+//! (`sampled_draft::forced_verdict`): its rounds are distributed as live
+//! rounds under the rule are, over the same text. The record is the same; its
+//! `drafts` are the lane's draws, and its `agreed` says the forced run took
+//! only recorded tokens among their column's candidates. The rule and its
+//! settings land in `OUT_DIR/rule.json`, which one directory keeps to one
+//! rule; a directory without it is today's rule. The readers
+//! (`tools/dflash2-replay/draft_rule.py`) print tokens per round, the survival
+//! per draft column and the split per kind of output for each directory's
+//! rule, beside each other.
+//!
 //! One fixed-size little-endian record per round lands in
 //! `OUT_DIR/<job>.rounds` (layout: [`Record`]); a summary line per turn in
 //! `OUT_DIR/turns.jsonl`; a job with `OUT_DIR/<job>.done` is skipped, so a run
@@ -50,6 +68,7 @@ use ignis_artifact::{body_27b, FrontendSet, Reader};
 use ignis_core::compute::ModelConfig;
 use ignis_core::dflash2_readout;
 use ignis_core::step::{decode_program_verify_forced, prefill_program_permitted, SamplingParams, VerifyLane};
+use ignis_core::{DraftRule, DrafterSampling};
 
 #[path = "support/replay_shape.rs"]
 mod replay_shape;
@@ -185,13 +204,41 @@ fn row_lse(row: &[u16], max: f32) -> f32 {
     max + sum.ln() as f32
 }
 
+/// GitHub #577: the recorded traffic's sampling (the agent harnesses':
+/// temperature 1, top-k 20, top-p 0.95), the lane a turn replays as under the
+/// sampled draft.
+fn recorded_sampling(seed: u64) -> SamplingParams {
+    SamplingParams { temperature: 1.0, top_k: 20, top_p: 0.95, seed, ..SamplingParams::greedy() }
+}
+
+/// A turn's own seed: fixed, so a replay reproduces, and the turn's alone.
+fn turn_seed(job_index: usize, turn: u32) -> u64 {
+    0x577_0000_0000 ^ ((job_index as u64) << 20) ^ u64::from(turn)
+}
+
+/// `OUT_DIR/rule.json`: what the directory's records were replayed under.
+fn rule_document(rule: DraftRule) -> serde_json::Value {
+    let drafter = DrafterSampling::default();
+    let lane = recorded_sampling(0);
+    match rule {
+        DraftRule::Fixed => serde_json::json!({ "draft_rule": "fixed", "lane": "greedy (the recording decides)" }),
+        DraftRule::Sampled => serde_json::json!({
+            "draft_rule": "sampled",
+            "drafter_temperature_factor": drafter.temperature_factor(),
+            "drafter_top_p": drafter.top_p(),
+            "temperature": lane.temperature, "top_k": lane.top_k, "top_p": lane.top_p,
+            "seed": "turn_seed(job, turn) in crates/runtime/examples/dflash2_replay.rs",
+        }),
+    }
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
     let flags = ShapeFlags::take(&mut args).unwrap_or_else(|e| panic!("{e}"));
     if !(5..=7).contains(&args.len()) {
         eprintln!(
-            "usage: dflash2_replay [--lanes N] [--prefill-chunk N] ARTIFACT MANIFEST_JSON INPUT_DIR OUT_DIR \
-             [FIRST_JOB [LAST_JOB]]"
+            "usage: dflash2_replay [--lanes N] [--prefill-chunk N] [--draft-rule fixed|sampled] ARTIFACT MANIFEST_JSON \
+             INPUT_DIR OUT_DIR [FIRST_JOB [LAST_JOB]]"
         );
         std::process::exit(2);
     }
@@ -211,6 +258,30 @@ fn main() {
     let reader = Reader::open(Path::new(&args[1])).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let shape = LoadShape::new(body_27b(&reader), flags).unwrap_or_else(|e| panic!("load shape: {e}"));
     assert_eq!(shape.window as usize, WINDOW, "the record's window is the load's");
+    // One directory, one rule: records of two rules in one directory would
+    // read as one replay.
+    let rule = shape.draft_rule;
+    let rule_path = out_dir.join("rule.json");
+    let document = rule_document(rule);
+    match std::fs::read_to_string(&rule_path) {
+        Ok(existing) => {
+            let existing: serde_json::Value =
+                serde_json::from_str(&existing).unwrap_or_else(|e| panic!("parse {}: {e}", rule_path.display()));
+            assert_eq!(existing, document, "{} holds another rule's replay", out_dir.display());
+        }
+        Err(_) => {
+            let finished = std::fs::read_dir(&out_dir)
+                .unwrap_or_else(|e| panic!("read {}: {e}", out_dir.display()))
+                .any(|e| e.unwrap().path().extension().is_some_and(|x| x == "done"));
+            assert!(
+                !finished || rule == DraftRule::Fixed,
+                "{} holds a replay of today's rule (no rule.json): replay the sampled draft into another directory",
+                out_dir.display()
+            );
+            std::fs::write(&rule_path, serde_json::to_string_pretty(&document).unwrap() + "\n")
+                .unwrap_or_else(|e| panic!("write {}: {e}", rule_path.display()));
+        }
+    }
     // A round at the turn's end still runs its whole window.
     let max_context = shape.max_context;
     assert!(
@@ -227,7 +298,7 @@ fn main() {
     let loaded = replay_load::load(&reader, shape).unwrap_or_else(|e| panic!("load: {e}"));
     let (model, pool) = (&loaded.model, &loaded.pool);
     let vocab = ModelConfig::qwen38_27b().vocab as usize;
-    println!("replaying {} jobs at max context {max_context}", jobs.len());
+    println!("replaying {} jobs at max context {max_context} under the {} draft", jobs.len(), rule.as_str());
 
     let mut summary = std::fs::OpenOptions::new()
         .create(true)
@@ -265,10 +336,21 @@ fn main() {
             let prefill_s = began.elapsed().as_secs_f64();
             let began = Instant::now();
             let (mut rounds, mut disagreements, mut round_s) = (0usize, 0usize, 0f64);
+            // Today's rule: a greedy lane, whose forced verdict is the
+            // agreement. The sampled draft: the recorded traffic's lane.
+            let lane_sampling = match rule {
+                DraftRule::Fixed => SamplingParams::greedy(),
+                DraftRule::Sampled => recorded_sampling(turn_seed(job_index, turn_id)),
+            };
             let mut at = start;
             while at < end {
-                let proposal = dflash2_readout::propose(model, pool, &seq, WINDOW as u32, WINDOW as u32, true)
-                    .unwrap_or_else(|e| panic!("{name} turn {turn_id} at {at}: readout: {e}"));
+                let proposal = match rule {
+                    DraftRule::Fixed => dflash2_readout::propose(model, pool, &seq, WINDOW as u32, WINDOW as u32, true),
+                    DraftRule::Sampled => {
+                        dflash2_readout::propose_sampled(model, pool, &seq, WINDOW as u32, WINDOW as u32, true, lane_sampling)
+                    }
+                }
+                .unwrap_or_else(|e| panic!("{name} turn {turn_id} at {at}: readout: {e}"));
                 let mut forced = [-1i32; COLUMNS];
                 for (j, slot) in forced.iter_mut().enumerate() {
                     if at + 1 + j < end {
@@ -280,7 +362,7 @@ fn main() {
                     model,
                     pool,
                     &mut [&mut seq],
-                    &[VerifyLane { stop_ids: &stop_ids, ..VerifyLane::greedy(&[]) }],
+                    &[VerifyLane { sampling: lane_sampling, stop_ids: &stop_ids, ..VerifyLane::greedy(&[]) }],
                     WINDOW as u32,
                     &[&forced],
                 )
@@ -289,9 +371,22 @@ fn main() {
                 round_s += round_began.elapsed().as_secs_f64();
                 let committed = run.tokens.len();
                 assert_eq!(run.tokens[..], tokens[at..at + committed], "{name} turn {turn_id} at {at}: the committed run");
-                let agreement = proposal.drafts.iter().zip(&forced).take_while(|(d, f)| d == f).count();
                 let cut = run.tokens.iter().position(|t| stop_ids.contains(t)).map_or(usize::MAX, |p| p + 1);
-                let agreed = committed == (agreement.min(run.extent as usize) + 1).min(cut);
+                let agreed = match rule {
+                    // The forced run is the read drafts' agreement with the
+                    // recording.
+                    DraftRule::Fixed => {
+                        let agreement = proposal.drafts.iter().zip(&forced).take_while(|(d, f)| d == f).count();
+                        committed == (agreement.min(run.extent as usize) + 1).min(cut)
+                    }
+                    // The forced run took recorded tokens among their
+                    // column's candidates only.
+                    DraftRule::Sampled => {
+                        let reachable =
+                            (0..WINDOW).take_while(|&s| proposal.candidates(s).contains(&forced[s])).count();
+                        committed <= (reachable.min(run.extent as usize) + 1).min(cut)
+                    }
+                };
                 disagreements += usize::from(!agreed);
 
                 let logits = dflash2_readout::verify_logits(model, 1, WINDOW as u32)
@@ -346,7 +441,7 @@ fn main() {
             cursor = end;
             let walk_s = began.elapsed().as_secs_f64();
             let line = serde_json::json!({
-                "job": name, "turn": turn_id, "source": turn["source"], "kind": turn["kind"],
+                "job": name, "turn": turn_id, "source": turn["source"], "kind": turn["kind"], "draft_rule": rule.as_str(),
                 "context": start, "output": end - start, "rounds": rounds,
                 "tok_per_round": (end - start) as f64 / rounds.max(1) as f64,
                 "readout_disagreements": disagreements,

@@ -29,6 +29,14 @@
 //   draw          the draft kernel: a sampling lane's drafts and its kept q are
 //                 the host walk's over the lattice, each column after the
 //                 draft drawn before it; a greedy lane keeps the walk's drafts.
+//   forced        GitHub #577 (test-only): a teacher-forced round's mode of
+//                 both. The draw drafts each recorded token that is one of its
+//                 column's candidates (its draw elsewhere) and keeps the q
+//                 after it; the accept takes recorded tokens by the forced
+//                 verdict (ignis_forced_sampled_verdict) exactly as the host
+//                 walk of the same functions does, licenses the recording's
+//                 run, counts the recorded tokens and never the pad, and
+//                 leaves greedy lanes as without the recording.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE, so a missing or busy
 // GPU fails this test rather than skipping it. Not sm120a-only: an RTX 30 or
@@ -295,7 +303,11 @@ enum class Accept { Vendored, Ours };
 // One accept over a fresh copy of `round`. `q_ids`/`q_probs` are ours' kept q
 // ([16, k, B]), or empty for a one-hot q.
 Outputs run_accept(const Round &round, Accept which, const std::vector<std::int32_t> &q_ids = {},
-                   const std::vector<float> &q_probs = {}) {
+                   const std::vector<float> &q_probs = {}, const std::vector<std::int32_t> &forced = {}) {
+  std::unique_ptr<Device<std::int32_t>> d_forced;
+  if (!forced.empty()) {
+    d_forced = std::make_unique<Device<std::int32_t>>(forced);
+  }
   Device<std::uint16_t> logits(round.logits);
   Device<std::int32_t> targets(round.targets);
   Device<std::int32_t> drafts(round.drafts);
@@ -343,7 +355,7 @@ Outputs run_accept(const Round &round, Accept which, const std::vector<std::int3
           "our accept fits the vendored accept's workspace");
     ignis_sampled_accept(t_targets, t_logits, t_drafts, t_extents, t_lengths, t_anchors, t_licensed, t_counts,
                          t_accepted, kVocab, d_configs.p, d_q_ids ? d_q_ids->p : nullptr,
-                         d_q_probs ? d_q_probs->p : nullptr, arena, nullptr);
+                         d_q_probs ? d_q_probs->p : nullptr, arena, nullptr, d_forced ? d_forced->p : nullptr);
   }
   CUDA_FATAL(cudaDeviceSynchronize());
   Outputs out;
@@ -618,6 +630,185 @@ void draw_arm() {
   check(moved > 0, "no draw left the walk's draft: the draw went unexercised");
 }
 
+
+// --- arm 7: the teacher-forced round (GitHub #577) -----------------------------
+
+// The draw drafts along a recording: each recorded token that is one of its
+// column's candidates, its draw elsewhere, the next column's q after it.
+void forced_draw_arm() {
+  constexpr int kLanesDraw = 2;
+  std::mt19937 rng(5770);
+  std::normal_distribution<float> noise(0.0f, 1.5f);
+  std::vector<float> scores(kTopK * kTopK * kWindow * kLanesDraw);
+  for (float &s : scores) {
+    s = noise(rng);
+  }
+  std::vector<std::int32_t> candidates(kTopK * kWindow * kLanesDraw);
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    candidates[i] = static_cast<std::int32_t>(2000 + 5 * i);
+  }
+  const std::vector<std::int32_t> walk(kWindow * kLanesDraw, -5);
+  std::vector<SamplingConfig> configs(kLanesDraw);
+  configs[0] = SamplingConfig{1.0f, 20, 0.95f, 0.0f, 0.0f, 0.0f, 303ull, nullptr};
+  configs[1].temperature = 0.0f; // greedy: keeps the walk's drafts, forced or not
+  const std::vector<std::int32_t> base_positions = {41, 9};
+  const float factor = 0.9f;
+  const float top_p = 0.95f;
+  // Lane 0 records candidate 3 of column 0, candidate 9 of column 1, then a
+  // token no candidate of column 2 holds; lane 1's recording is the same.
+  std::vector<std::int32_t> forced(kCols * kLanesDraw, -1);
+  for (int b = 0; b < kLanesDraw; ++b) {
+    forced[b * kCols + 0] = candidates[kTopK * (0 * kWindow + 0) + 3];
+    forced[b * kCols + 1] = candidates[kTopK * (0 * kWindow + 1) + 9];
+    forced[b * kCols + 2] = 77777;
+    forced[b * kCols + 3] = 88888;
+  }
+
+  Device<float> d_scores(scores);
+  Device<std::int32_t> d_candidates(candidates);
+  Device<std::int32_t> d_drafts(walk);
+  Device<SamplingConfig> d_configs(configs);
+  Device<std::int32_t> d_base(base_positions);
+  Device<std::int32_t> d_forced(forced);
+  Device<std::int32_t> d_q_ids(std::vector<std::int32_t>(kTopK * kWindow * kLanesDraw, -9));
+  Device<float> d_q(std::vector<float>(kTopK * kWindow * kLanesDraw, -1.0f));
+  const ninfer::Tensor t_scores = tensor(d_scores.p, ninfer::DType::FP32, {kTopK, kTopK, kWindow, kLanesDraw});
+  const ninfer::Tensor t_candidates = tensor(d_candidates.p, ninfer::DType::I32, {kTopK, kWindow, kLanesDraw, 1});
+  ninfer::Tensor t_drafts = tensor(d_drafts.p, ninfer::DType::I32, {kWindow, kLanesDraw, 1, 1});
+  ignis_sampled_draft_draw(t_scores, t_candidates, d_configs.p, d_base.p, factor, top_p, t_drafts, d_q_ids.p, d_q.p,
+                           nullptr, d_forced.p);
+  CUDA_FATAL(cudaDeviceSynchronize());
+  const std::vector<std::int32_t> drafts = d_drafts.download();
+  const std::vector<float> q = d_q.download();
+
+  for (int s = 0; s < kWindow; ++s) {
+    check(drafts[1 * kWindow + s] == -5, "forced: a greedy lane keeps the walk's drafts");
+  }
+  int pred = 0;
+  for (int s = 0; s < kWindow; ++s) {
+    const int slot = s;
+    float want[kTopK];
+    ignis_drafter_distribution(scores.data() + kTopK * (pred + kTopK * slot), kTopK, configs[0].temperature * factor,
+                               top_p, want);
+    int picked = ignis_draw_draft(want, kTopK, uniform(configs[0].seed, base_positions[0] + s + 1,
+                                                       kIgnisSamplePurposeDraft));
+    for (int i = 0; i < kTopK; ++i) {
+      if (candidates[kTopK * slot + i] == forced[s]) {
+        picked = i;
+      }
+    }
+    const std::string where = "forced: column " + std::to_string(s);
+    check(drafts[slot] == candidates[kTopK * slot + picked], where + ": not the recording's draft (or the draw)");
+    for (int i = 0; i < kTopK; ++i) {
+      check(std::fabs(q[kTopK * slot + i] - want[i]) <= 1e-6f, where + ": the kept q is not the one after the draft before");
+    }
+    pred = picked;
+  }
+  check(drafts[0] == forced[0] && drafts[1] == forced[1], "forced: the recorded candidates are drafted");
+  check(drafts[2] != forced[2], "forced: a recorded token no candidate holds cannot be drafted");
+}
+
+// The accept's forced verdicts, walked on the host with the same functions.
+Lane host_forced_lane(const Round &round, const Outputs &ours, int b, const std::vector<std::int32_t> &q_ids,
+                      const std::vector<float> &q_probs, const std::vector<std::int32_t> &forced) {
+  const SamplingConfig &cfg = round.configs[b];
+  const int extent = round.extents[b];
+  const int length = round.lengths[b];
+  Lane lane;
+  lane.licensed.assign(kCols, 0);
+  int a = 0;
+  std::int32_t tstar = 0;
+  for (int i = 0; i <= extent; ++i) {
+    const std::int32_t recorded = forced[b * kCols + i];
+    if (i == extent) {
+      tstar = recorded;
+      break;
+    }
+    const std::vector<std::int32_t> &ids = ours.p_ids[b][i];
+    const std::vector<float> &probs = ours.p_probs[b][i];
+    const std::int32_t draft = round.drafts[b * kWindow + i];
+    bool taken = false;
+    if (draft == recorded) {
+      const std::int32_t *drafter_ids = q_ids.data() + kTopK * (b * kWindow + i);
+      const float *drafter_probs = q_probs.data() + kTopK * (b * kWindow + i);
+      const int pos = length + i + 1;
+      const std::int32_t live_draft =
+          drafter_ids[ignis_draw_draft(drafter_probs, kTopK, uniform(cfg.seed, pos, kIgnisSamplePurposeDraft))];
+      std::int32_t live_token = 0;
+      const bool live_taken = ignis_sampled_verdict(
+          ids.data(), probs.data(), static_cast<int>(ids.size()), drafter_ids, drafter_probs, kTopK, live_draft,
+          uniform(cfg.seed, pos, kIgnisSamplePurposeSampledAccept), uniform(cfg.seed, pos, kIgnisSamplePurposeSampledRefusal),
+          &live_token);
+      taken = ignis_forced_sampled_verdict(ids.data(), probs.data(), static_cast<int>(ids.size()), drafter_ids,
+                                           drafter_probs, kTopK, recorded, live_draft, live_taken, live_token,
+                                           uniform(cfg.seed, pos, kIgnisSamplePurposeForcedCoin));
+    }
+    if (!taken) {
+      tstar = recorded;
+      break;
+    }
+    a = i + 1;
+  }
+  for (int i = 0; i < a; ++i) {
+    lane.licensed[i] = forced[b * kCols + i];
+  }
+  lane.licensed[a] = tstar;
+  lane.accepted = a;
+  return lane;
+}
+
+void forced_accept_arm(const Round &round, const std::vector<std::int32_t> &q_ids, const std::vector<float> &q_probs) {
+  // Each lane records its own drafts, then: lane 2 (extent 0) one token;
+  // lane 3 (penalties) its three drafts and the pad after them, as after a
+  // stop; lane 4 a token at its second column no draft holds; lane 5 its
+  // drafts and a token after them.
+  std::vector<std::int32_t> forced(kCols * kLanes, 0);
+  for (int b = 0; b < kLanes; ++b) {
+    for (int i = 0; i < kWindow; ++i) {
+      forced[b * kCols + i] = round.drafts[b * kWindow + i];
+    }
+    forced[b * kCols + kWindow] = 321 + b;
+  }
+  forced[2 * kCols + 0] = 123;
+  forced[3 * kCols + 3] = -1;
+  forced[4 * kCols + 1] = 999;
+  const Outputs plain = run_accept(round, Accept::Ours, q_ids, q_probs);
+  const Outputs ours = run_accept(round, Accept::Ours, q_ids, q_probs, forced);
+  for (const int b : {0, 1}) {
+    check(std::vector<std::int32_t>(ours.licensed.begin() + b * kCols, ours.licensed.begin() + (b + 1) * kCols) ==
+                  std::vector<std::int32_t>(plain.licensed.begin() + b * kCols,
+                                            plain.licensed.begin() + (b + 1) * kCols) &&
+              ours.accepted[b] == plain.accepted[b],
+          "forced: greedy lane " + std::to_string(b) + " is not as without the recording");
+  }
+  int taken_any = 0;
+  for (const int b : {2, 3, 4, 5}) {
+    const Lane want = host_forced_lane(round, ours, b, q_ids, q_probs, forced);
+    const std::string where = "forced lane " + std::to_string(b);
+    check(std::vector<std::int32_t>(ours.licensed.begin() + b * kCols,
+                                    ours.licensed.begin() + b * kCols + want.accepted + 1) ==
+              std::vector<std::int32_t>(want.licensed.begin(), want.licensed.begin() + want.accepted + 1),
+          where + ": the licensed run is not the host walk's");
+    check(ours.accepted[b] == want.accepted && ours.counts[b] == want.accepted + 1, where + ": accepted and licensed counts");
+    for (int i = 0; i <= want.accepted; ++i) {
+      check(want.licensed[i] == forced[b * kCols + i], where + ": the run is not the recording's");
+    }
+    taken_any += want.accepted;
+    if (!round.counts[b].empty()) {
+      std::vector<std::int32_t> counted = round.counts[b];
+      for (int i = 0; i <= want.accepted; ++i) {
+        if (want.licensed[i] >= 0) {
+          ++counted[want.licensed[i]];
+        }
+      }
+      check(ours.penalty[b] == counted, where + ": every recorded token counted once, the pad never");
+    }
+  }
+  check(ours.accepted[2] == 0 && ours.licensed[2 * kCols] == 123, "forced lane 2: extent 0 emits its recorded token");
+  check(ours.accepted[4] <= 1, "forced lane 4: no draft holds its second recorded token, so the run stops there");
+  check(taken_any > 0, "forced: no lane took a recorded token, so the walk past column 0 went unexercised");
+}
+
 } // namespace
 
 int main() {
@@ -674,8 +865,10 @@ int main() {
     }
   }
   verdict_arm(round, q_ids, q_probs, "explicit q");
+  forced_accept_arm(round, q_ids, q_probs);
 
   draw_arm();
+  forced_draw_arm();
 
   if (g_failed != 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failed);

@@ -15,6 +15,12 @@
 //! draft column's 16 candidates, their proposal-head logits and the lattice's
 //! transition scores -- so a different selection rule can be walked over the
 //! same lattice on the host ([`Dflash2Proposal::walk`] is today's rule).
+//!
+//! GitHub #577: under the sampled draft (ADR 0090) a sampling lane draws its
+//! drafts, so [`propose_sampled`] reads them as the lane's next round draws
+//! them, with the distribution q each was drawn from
+//! ([`Dflash2Proposal::q`]); [`propose`] reads a greedy lane's, the walk's,
+//! with q one-hot on them.
 
 /// The selector's candidates per draft column (`kDflash2SelectorTopK`).
 pub const TOP_K: usize = 16;
@@ -24,7 +30,8 @@ pub const TOP_K: usize = 16;
 /// load's draft window; every per-column table has `k` rows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dflash2Proposal {
-    /// The selector walk's drafts, `[k]`.
+    /// The drafts the round verifies, `[k]`: the selector walk's, or a
+    /// sampling lane's drawn ones under the sampled draft.
     pub drafts: Vec<i32>,
     /// Each draft column's top-16 token ids, `[k][16]`, in the proposal
     /// head's descending order.
@@ -38,6 +45,12 @@ pub struct Dflash2Proposal {
     /// The proposal head's logits over the vocabulary, BF16 `[k][vocab]`,
     /// when asked for.
     pub drafter_logits: Option<Vec<u16>>,
+    /// GitHub #577: the drafter's distribution q over each column's 16
+    /// candidates, `[k][16]` in the candidates' order, that the column's
+    /// draft was drawn from (after the draft drawn at the column before it);
+    /// one-hot on the draft where nothing is drawn -- the fixed draft, a
+    /// greedy lane.
+    pub q: Vec<f32>,
 }
 
 impl Dflash2Proposal {
@@ -49,6 +62,17 @@ impl Dflash2Proposal {
     /// Column `column`'s 16 candidate ids.
     pub fn candidates(&self, column: usize) -> &[i32] {
         &self.candidate_ids[column * TOP_K..(column + 1) * TOP_K]
+    }
+
+    /// Column `column`'s q over its 16 candidates ([`Self::q`]).
+    pub fn q(&self, column: usize) -> &[f32] {
+        &self.q[column * TOP_K..(column + 1) * TOP_K]
+    }
+
+    /// The probability q gives column `column`'s draft.
+    pub fn draft_q(&self, column: usize) -> f32 {
+        let candidates = self.candidates(column);
+        self.q(column).iter().zip(candidates).filter(|&(_, &id)| id == self.drafts[column]).map(|(&q, _)| q).sum()
     }
 
     /// The transition score of successor `succ` at `column` after predecessor
@@ -97,6 +121,10 @@ mod abi {
         pub out_candidate_logits: *mut f32,
         pub out_scores: *mut f32,
         pub out_drafter_logits: *mut u16,
+        /// GitHub #577: a `struct ignis_sampling_params` (the step ABI's,
+        /// `crate::step`), or null: a greedy lane.
+        pub sampling: *const std::ffi::c_void,
+        pub out_q: *mut f32,
     }
 }
 
@@ -127,8 +155,8 @@ fn last_error() -> String {
 }
 
 /// The drafter's proposals for `sequence` at its frontier, as its next verify
-/// round with `extent` draft columns would compute them: the proposals that
-/// round verifies.
+/// round with `extent` draft columns would compute them for a greedy lane:
+/// the proposals that round verifies.
 ///
 /// `window` is the load's draft window ([`crate::Speculation::draft_tokens`]),
 /// which sizes the outputs; the leaf refuses any other. `extent` is at most
@@ -145,6 +173,38 @@ pub fn propose(
     window: u32,
     with_logits: bool,
 ) -> Result<Dflash2Proposal, String> {
+    read(model, pool, sequence, extent, window, with_logits, None)
+}
+
+/// [`propose`] for a lane that samples with `sampling` (GitHub #577): under
+/// the sampled draft its next round draws its drafts, from the drafter's
+/// distribution at its temperature times the load's factor with the uniforms
+/// of its seed at its frontier, and these are those draws, each with its q.
+/// Under the fixed draft, or at temperature 0, the walk's drafts, as
+/// [`propose`] reads them.
+#[cfg(feature = "cuda")]
+pub fn propose_sampled(
+    model: &crate::model_load::Model,
+    pool: &crate::seq::SeqPool,
+    sequence: &crate::seq::Seq<'_>,
+    extent: u32,
+    window: u32,
+    with_logits: bool,
+    sampling: crate::step::SamplingParams,
+) -> Result<Dflash2Proposal, String> {
+    read(model, pool, sequence, extent, window, with_logits, Some(sampling))
+}
+
+#[cfg(feature = "cuda")]
+fn read(
+    model: &crate::model_load::Model,
+    pool: &crate::seq::SeqPool,
+    sequence: &crate::seq::Seq<'_>,
+    extent: u32,
+    window: u32,
+    with_logits: bool,
+    sampling: Option<crate::step::SamplingParams>,
+) -> Result<Dflash2Proposal, String> {
     let k = window as usize;
     let vocab = crate::compute::ModelConfig::qwen38_27b().vocab as usize;
     let mut drafts = vec![-1i32; k];
@@ -152,6 +212,8 @@ pub fn propose(
     let mut candidate_logits = vec![0f32; k * TOP_K];
     let mut scores = vec![0f32; k * TOP_K * TOP_K];
     let mut drafter_logits = with_logits.then(|| vec![0u16; k * vocab]);
+    let mut q = vec![0f32; k * TOP_K];
+    let sampling = sampling.map(crate::step::SamplingParams::to_ffi);
     let readout = abi::IgnisDflash2Readout {
         size: std::mem::size_of::<abi::IgnisDflash2Readout>() as u32,
         window,
@@ -161,6 +223,8 @@ pub fn propose(
         out_candidate_logits: candidate_logits.as_mut_ptr(),
         out_scores: scores.as_mut_ptr(),
         out_drafter_logits: drafter_logits.as_mut().map_or(std::ptr::null_mut(), |v| v.as_mut_ptr()),
+        sampling: sampling.as_ref().map_or(std::ptr::null(), |s| (s as *const crate::step::ffi::IgnisSamplingParams).cast()),
+        out_q: q.as_mut_ptr(),
     };
     if extent > window {
         return Err(format!("dflash2 readout: extent {extent} is past the window {window}"));
@@ -175,6 +239,7 @@ pub fn propose(
         candidate_logits,
         scores,
         drafter_logits,
+        q,
     })
 }
 
@@ -215,6 +280,7 @@ mod tests {
             candidate_logits: vec![0.0; 2 * TOP_K],
             scores,
             drafter_logits: None,
+            q: vec![0.0; 2 * TOP_K],
         }
     }
 
@@ -234,14 +300,26 @@ mod tests {
         assert_eq!(proposal.walk(), vec![0, 0]);
     }
 
-    /// uint32 size, window and extent, padding, then five pointers; the
-    /// leaf pins the same numbers (kernel/include/ignis_dflash2_readout.h)
-    /// and refuses any other `size`.
+    /// uint32 size, window and extent, padding, then five pointers, and
+    /// GitHub #577's two after them; the leaf pins the same numbers
+    /// (kernel/include/ignis_dflash2_readout.h) and refuses any other `size`.
     #[test]
     fn the_readout_mirror_is_the_leaf_structs_layout() {
-        assert_eq!(std::mem::size_of::<abi::IgnisDflash2Readout>(), 56);
+        assert_eq!(std::mem::size_of::<abi::IgnisDflash2Readout>(), 72);
         assert_eq!(std::mem::offset_of!(abi::IgnisDflash2Readout, window), 4);
         assert_eq!(std::mem::offset_of!(abi::IgnisDflash2Readout, out_drafts), 16);
         assert_eq!(std::mem::offset_of!(abi::IgnisDflash2Readout, out_drafter_logits), 48);
+        assert_eq!(std::mem::offset_of!(abi::IgnisDflash2Readout, sampling), 56);
+        assert_eq!(std::mem::offset_of!(abi::IgnisDflash2Readout, out_q), 64);
+    }
+
+    #[test]
+    fn a_drafts_q_is_its_candidates_entry() {
+        let mut proposal = two_column_lattice();
+        proposal.q[3] = 0.75;
+        proposal.q[4] = 0.25;
+        proposal.q[TOP_K + 5] = 1.0;
+        assert_eq!((proposal.draft_q(0), proposal.draft_q(1)), (0.75, 1.0));
+        assert_eq!(proposal.q(1)[5], 1.0);
     }
 }

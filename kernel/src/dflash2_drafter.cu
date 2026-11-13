@@ -306,15 +306,17 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, std::uint32
   // GitHub #576 (ADR 0090): under the sampled draft each sampling lane draws
   // its drafts from the drafter's distribution over the same lattice instead,
   // and keeps that distribution for the round's accept; a greedy lane keeps
-  // the walk's. The proposal readout reads the walk's drafts, so it draws
-  // nothing.
-  if (verify.sampled_draft && readout == nullptr) {
+  // the walk's. GitHub #577: the proposal readout draws as the round does,
+  // from the lane's config it staged, so it reads the drafts the round would
+  // verify; a teacher-forced round (test-only, eager) drafts along its
+  // recording (`forced_tokens`, null otherwise).
+  if (verify.sampled_draft) {
     ignis_sampled_draft_draw(scores, candidates,
                              static_cast<const ninfer::ops::SamplingConfig *>(model->sampling_decode_configs->p),
                              static_cast<const std::int32_t *>(verify.base_positions->p),
                              verify.drafter_temperature_factor, verify.drafter_top_p, drafts,
                              static_cast<std::int32_t *>(verify.draft_candidates->p),
-                             static_cast<float *>(verify.draft_q->p), stream);
+                             static_cast<float *>(verify.draft_q->p), stream, verify.forced_tokens);
   }
 
   // GitHub #267: the measurement's readout, device to host on this stream.
@@ -335,6 +337,12 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, std::uint32
     copy_out(readout->candidate_logits, unary, "candidate logits");
     copy_out(readout->scores, scores, "scores");
     copy_out(readout->head_logits, logits, "head logits");
+    if (verify.sampled_draft) {
+      // The draw's q: a sampling lane's rows; a greedy lane's are stale (the
+      // readout's caller writes its own one-hot rows for one).
+      const ninfer::Tensor kept_q(verify.draft_q->p, ninfer::DType::FP32, {top_k, k, batch, 1});
+      copy_out(readout->q, kept_q, "drafter distribution");
+    }
   }
 }
 

@@ -115,6 +115,33 @@ int main() {
   expect(!verdict({10, 11, 12, 13}, {10, 11, kVocab - 1, 41, 42}, 4).verdict.refused,
          "the last vocabulary id is one");
 
+  // ---- GitHub #577: a forced sampling lane under the sampled draft ----------
+  // Its run may stop at any column, so every successor up to its extent is
+  // held to the rule above before the pass.
+  const auto first_bad = [](std::vector<int32_t> forced, int32_t extent, int32_t anchor = kAnchor) {
+    return ignis_teacher_forced_first_bad_successor(anchor, forced.data(), extent, kVocab, kStops.data(),
+                                                    static_cast<uint32_t>(kStops.size()));
+  };
+  expect(first_bad({10, 11, 12, 13, 14}, 4) == -1, "a recording of vocabulary ids passes whole");
+  expect(first_bad({10, kImEnd, -1, -1, -1}, 4) == -1, "pads after a recorded stop pass");
+  expect(first_bad({-1, -1, -1, -1, -1}, 4, kImEnd) == -1, "pads after a stop anchor pass");
+  expect(first_bad({10, 11, -1, -1, -1}, 4) == 2, "a pad with no stop before it is the first bad successor");
+  expect(first_bad({10, 11, 12, kVocab, -1}, 4) == 3, "an id past the vocabulary is a bad successor");
+  expect(first_bad({10, 11, -1, -1, -1}, 1) == -1, "successors past the extent are not the lane's");
+  expect(first_bad({kImEnd, kVocab, -1, -1, -1}, 4) == 1, "an id past the vocabulary is bad after a stop too");
+
+  // The device's licensed run is the recording's, or the round is refused.
+  {
+    const std::vector<int32_t> forced = {10, 11, 12, 13, 14};
+    const auto recorded = [&](std::vector<int32_t> licensed, int32_t accepted, int32_t extent) {
+      return ignis_teacher_forced_run_is_recorded(licensed.data(), forced.data(), accepted, extent);
+    };
+    expect(recorded({10, 11, 12, 0, 0}, 2, 4), "two recorded tokens taken, the third after them");
+    expect(recorded({10, 11, 12, 13, 14}, 4, 4), "a whole run, the recorded token after it");
+    expect(!recorded({10, 11, 40, 0, 0}, 2, 4), "a token after the run other than the recorded one is refused");
+    expect(!recorded({10, 11, 12, 13, 14}, 4, 3), "more taken than the extent is refused");
+  }
+
   if (failures != 0) {
     std::fprintf(stderr, "teacher forcing test: %d check(s) failed\n", failures);
     return 1;
