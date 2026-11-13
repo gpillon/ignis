@@ -192,6 +192,29 @@ fn the_test_job_runs_every_shard_of_the_count_it_gives_the_script() {
     }
 }
 
+/// Spec #287 (the owner's call of 2026-11-13): every shard of both hosts
+/// installs the independent validator structured output's served answers are
+/// checked with, before the suite, and hands its Python to the tests, which
+/// fail on CI without it.
+#[test]
+fn every_test_shard_installs_the_grammar_validator_before_the_suite() {
+    let workflow = workflow();
+    let test = job(jobs(&workflow), "test");
+    let steps = steps(test);
+    let at = |find: &dyn Fn(&Mapping) -> bool, what: &str| {
+        steps.iter().position(|step| find(step)).unwrap_or_else(|| panic!("the test job has {what}"))
+    };
+    let install = at(&|step| text(step, "run").is_some_and(|run| run.contains("tools/grammar-check/requirements.txt")), "the validator's install");
+    let suite = at(&|step| text(step, "run").is_some_and(|run| run.contains("mk/test-shard.sh")), "the suite");
+    let python = at(&|step| text(step, "uses").is_some_and(|uses| uses.starts_with("actions/setup-python@")), "a Python");
+    assert!(python < install && install < suite, "Python, then the validator, then the suite: {python} {install} {suite}");
+    for step in [steps[python], steps[install]] {
+        assert!(get(step, "if").is_none(), "on every shard of both hosts: {step:?}");
+    }
+    let run = text(steps[install], "run").unwrap();
+    assert!(run.contains("IGNIS_GRAMMAR_CHECK_PYTHON=") && run.contains("GITHUB_ENV"), "the tests are handed its Python: {run}");
+}
+
 /// The Windows build's kernel/build cache (#552): ninja decides by date and
 /// the checkout dates every source later than the cached objects, so the
 /// cache only helped once the sources are dated back, and that is safe only

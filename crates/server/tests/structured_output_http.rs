@@ -617,9 +617,8 @@ fn repo() -> PathBuf {
 }
 
 /// The Python that runs `tools/grammar-check/validate.py` with its pinned
-/// `jsonschema`: `IGNIS_GRAMMAR_CHECK_PYTHON`, else the venv
-/// `docs/agents/testing/structured-output.md` makes under
-/// `.scratch/grammar-venv`.
+/// `jsonschema`: `IGNIS_GRAMMAR_CHECK_PYTHON` (what CI sets), else the venv
+/// `make grammar-venv` makes under `.scratch/grammar-venv`.
 fn validator_python() -> Option<PathBuf> {
     if let Some(python) = std::env::var_os("IGNIS_GRAMMAR_CHECK_PYTHON") {
         return Some(PathBuf::from(python));
@@ -630,11 +629,14 @@ fn validator_python() -> Option<PathBuf> {
 
 /// Every answer, `(case, schema, text)`, valid under its schema by an
 /// independent validator: `jsonschema` (Draft 2020-12, formats checked,
-/// numbers as exact decimals) through `validate.py`. Machine-local: where no
-/// Python has it, a skip that says so.
+/// numbers as exact decimals) through `validate.py`. On CI (`CI` set, as
+/// every CI service sets it) a missing validator fails the test, the owner's
+/// call of 2026-11-13; on a machine without one, a skip that says so.
 fn assert_independently_valid(answers: &[(&str, &str, String)]) {
     let Some(python) = validator_python() else {
-        eprintln!("skip: no Python with tools/grammar-check/requirements.txt (IGNIS_GRAMMAR_CHECK_PYTHON, .scratch/grammar-venv)");
+        let missing = "no Python with tools/grammar-check/requirements.txt (IGNIS_GRAMMAR_CHECK_PYTHON, or `make grammar-venv`)";
+        assert!(std::env::var_os("CI").is_none(), "{missing}: on CI the independent validator must run");
+        eprintln!("skip: {missing}");
         return;
     };
     let rows: String = answers

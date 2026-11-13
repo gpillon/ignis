@@ -40,8 +40,7 @@ cargo build --release -p ignis-grammar --example grammar_bench
 target/x86_64-pc-windows-msvc/release/examples/grammar_bench.exe \
     F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer \
     crates/grammar/tests/corpus/cases.json .scratch/grammar-bench
-python -m venv .scratch/grammar-venv
-.scratch/grammar-venv/Scripts/pip install -r tools/grammar-check/requirements.txt
+make grammar-venv
 .scratch/grammar-venv/Scripts/python -I tools/grammar-check/validate.py .scratch/grammar-bench/crosscheck.jsonl
 ```
 
@@ -90,8 +89,11 @@ The measured figures are in
 - **The independent validator in the served tests**: the schema answers go
   through `tools/grammar-check/validate.py` with the Python of
   `IGNIS_GRAMMAR_CHECK_PYTHON`, else the venv at `.scratch/grammar-venv`
-  (made as above). Where neither exists the validation is skipped with a
-  line saying so, and the hand checks still run.
+  (`make grammar-venv`). Where neither exists the validation is skipped with
+  a line saying so, and the hand checks still run; on CI (`CI` set) it fails
+  instead. CI's test jobs install the requirements on every shard and set
+  `IGNIS_GRAMMAR_CHECK_PYTHON` (`release.yml`, held by
+  `ci_pipeline::every_test_shard_installs_the_grammar_validator_before_the_suite`).
 - **The generated reference** (`docs/user/reference/json-schema.md`,
   `user_docs::json_schema`): its lists come from the grammar crate's, and the
   page compiles each inert keyword (refused under `strict`, inert without)

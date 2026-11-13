@@ -224,6 +224,24 @@ jobs:
         shell: bash
         run: bash mk/test-shard-selftest.sh
 
+      # The independent JSON Schema validator structured output's served
+      # answers are checked with (spec #287, tools/grammar-check), on every
+      # shard: the tests that need it fail on CI when it is missing, where
+      # they skip on a machine without it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the grammar validator
+        shell: bash
+        run: |
+          venv="$RUNNER_TEMP/grammar-venv"
+          python -m venv "$venv"
+          py="$venv/bin/python"
+          [ -x "$py" ] || py="$venv/Scripts/python.exe"
+          "$py" -m pip install --quiet --disable-pip-version-check -r tools/grammar-check/requirements.txt
+          echo "IGNIS_GRAMMAR_CHECK_PYTHON=$py" >> "$GITHUB_ENV"
+
       # `web/dist` is deliberately not built first: `crates/server/build.rs`
       # embeds it only when it exists and the server serves its build-me page
       # when it does not, so the suite is green either way (the assertion in

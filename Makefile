@@ -553,6 +553,18 @@ check: ## cargo check, every target of every crate
 clippy: ## cargo clippy, every target of every crate
 	$(CARGO) clippy --workspace --all-targets $(CARGO_TARGET) $(WORKSPACE_FEATURES)
 
+# The independent JSON Schema validator structured output's served answers are
+# checked with (tools/grammar-check, spec #287), in the venv the tests look
+# for. Without it they skip that check, saying so; CI installs the same
+# requirements, and there a missing validator fails them.
+GRAMMAR_VENV := .scratch/grammar-venv
+
+.PHONY: grammar-venv
+grammar-venv: ## The Python venv the structured-output tests validate answers with (.scratch/grammar-venv)
+	$(PYTHON) -m venv $(GRAMMAR_VENV)
+	@py=$(GRAMMAR_VENV)/bin/python; [ -x "$$py" ] || py=$(GRAMMAR_VENV)/Scripts/python.exe; \
+	  "$$py" -m pip install --quiet --disable-pip-version-check -r tools/grammar-check/requirements.txt && echo "$$py"
+
 .PHONY: test-all
 test-all: test typecheck-web test-web docs-test docs-build ## Everything CPU-side: cargo test + web typecheck + vitest + the guide's build
 
