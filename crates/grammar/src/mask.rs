@@ -20,24 +20,31 @@ use crate::string::{self, StrState, StrStep};
 use crate::vocab::{StrTable, Trie, Vocab};
 use crate::TokenSet;
 
-/// How many whole masks a grammar keeps (31 KB each at 248,320).
-pub const MASK_CACHE_ENTRIES: usize = 512;
-/// How many pattern-string tables a grammar keeps (one per DFA state and
-/// UTF-8 debt reached; each about the size of a mask).
-pub const STR_TABLE_ENTRIES: usize = 512;
-
-/// What a grammar remembers between requests: pattern-string tables and
-/// whole masks, each bounded in entries.
+/// What a grammar remembers between requests: pattern-string tables (one
+/// per DFA state and UTF-8 debt reached) and whole masks (31 KB each at
+/// 248,320), together in at most the grammar's
+/// [`GrammarLimits::cache_bytes`](crate::GrammarLimits::cache_bytes): past
+/// it, what is built is used and not kept.
 #[derive(Default)]
 pub(crate) struct Memo {
     pub str_tables: HashMap<(u32, StrState), Arc<StrTable>>,
     pub masks: HashMap<Vec<Config>, Arc<TokenSet>>,
+    /// What the two hold, counted as they are filled.
+    bytes: usize,
 }
 
 impl Memo {
     pub fn heap_bytes(&self) -> usize {
-        self.str_tables.values().map(|t| t.heap_bytes()).sum::<usize>()
-            + self.masks.values().map(|m| m.heap_bytes() + 64).sum::<usize>()
+        self.bytes
+    }
+
+    /// Whether `bytes` more fit in `budget`; counted when they do.
+    fn keeps(&mut self, bytes: usize, budget: usize) -> bool {
+        let kept = self.bytes.saturating_add(bytes) <= budget;
+        if kept {
+            self.bytes += bytes;
+        }
+        kept
     }
 }
 
@@ -114,7 +121,7 @@ impl Grammar {
     /// The lexer-only table of a string state, or `None` when the state has
     /// none and the trie is walked instead. A free string's come from the
     /// vocabulary (built at load, never grown); a pattern's are built on the
-    /// state's first visit and kept, up to [`STR_TABLE_ENTRIES`].
+    /// state's first visit and kept while the grammar's caches have room.
     pub(crate) fn str_table(&self, re: u32, st: StrState) -> Option<Arc<StrTable>> {
         if re == NO_RE {
             return self.vocab.free_tables.get(&st).cloned();
@@ -124,7 +131,7 @@ impl Grammar {
         }
         let t = Arc::new(build_str_table(&self.vocab, Some(&self.core.dfas[re as usize]), st));
         let mut memo = self.memo.lock().unwrap();
-        if memo.str_tables.len() < STR_TABLE_ENTRIES {
+        if !memo.str_tables.contains_key(&(re, st)) && memo.keeps(t.heap_bytes(), self.memo_budget) {
             memo.str_tables.insert((re, st), t.clone());
         }
         Some(t)
@@ -163,7 +170,7 @@ impl Grammar {
             }
         }
         let mut memo = self.memo.lock().unwrap();
-        if memo.masks.len() < MASK_CACHE_ENTRIES {
+        if !memo.masks.contains_key(&state.configs) && memo.keeps(out.heap_bytes() + 64, self.memo_budget) {
             memo.masks.insert(state.configs.clone(), Arc::new(out.clone()));
         }
         false

@@ -18,7 +18,7 @@
 //! What the grammar generates is a subset of the valid documents: keys in
 //! schema order, literals in canonical spelling, integers as digits only,
 //! bounded numbers in plain decimal, whitespace in short runs, nesting
-//! bounded by [`MAX_STACK`].
+//! bounded by [`GrammarLimits::max_depth`].
 
 use std::collections::HashMap;
 use std::fmt;
@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::json::{write_string, Json};
 use crate::number::{parse_scaled, NumError, NumSpec, SCALE};
-use crate::regex::{format_pattern, translate_ecma, ByteDfa};
+use crate::regex::{format_pattern, translate_ecma, ByteDfa, DfaError, DEFAULT_MAX_PATTERN_STATES};
 use crate::vocab::Vocab;
 
 pub(crate) type NodeId = u32;
@@ -39,18 +39,54 @@ pub const MAX_PROPERTIES: usize = 5000;
 pub const MAX_NESTING: usize = 10;
 pub const MAX_ENUM_VALUES: usize = 1000;
 pub const MAX_SCHEMA_CHARS: usize = 120_000;
-/// How deep `$ref`s may chain while compiling (a bound on the compiler's own
-/// recursion, far beyond any real schema).
-pub const MAX_REF_CHAIN: usize = 256;
-
-/// The longest whitespace run the grammar lets the model write between two
-/// structural bytes: enough for pretty-printed JSON at depth ~15, few enough
-/// that an endless whitespace stream is impossible.
+/// [`GrammarLimits::max_ref_chain`]'s default: far beyond any real schema.
+pub const DEFAULT_MAX_REF_CHAIN: usize = 256;
+/// [`GrammarLimits::max_whitespace`]'s default: enough for pretty-printed
+/// JSON at depth ~15, few enough that an endless whitespace stream is
+/// impossible.
 pub const DEFAULT_MAX_WS_RUN: u8 = 48;
-/// The deepest the automaton's stack may grow (a recursive schema or a free
-/// object nests about one frame per level). A value is entered only where
-/// the stack has room to finish it, so the bound never strands the model.
-pub const MAX_STACK: usize = 128;
+/// [`GrammarLimits::max_depth`]'s default.
+pub const DEFAULT_MAX_DEPTH: usize = 128;
+
+/// The grammar's own limits: what a schema may compile to, what the model may
+/// write, and the memory compiled grammars keep (CODING_STANDARDS: limits are
+/// config fields; the server sets them from `model.grammar_*`). The defaults
+/// are the measured ones. OpenAI's four limits ([`MAX_PROPERTIES`],
+/// [`MAX_NESTING`], [`MAX_ENUM_VALUES`], [`MAX_SCHEMA_CHARS`]) are the
+/// contract's and stay constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrammarLimits {
+    /// The most states a `pattern` or a `format` may compile to: a larger one
+    /// is refused under `strict` (`pattern_too_large`) and inert without it.
+    pub max_pattern_states: usize,
+    /// The deepest the automaton's stack may grow, about one frame per level
+    /// of nesting. A value is entered only where the stack has room to finish
+    /// it, so the bound never strands the model, and a schema whose shortest
+    /// answer nests deeper is refused (`exceeds_max_depth`).
+    pub max_depth: usize,
+    /// How deep the compiler may recurse through a schema's subschemas and
+    /// `$ref`s: deeper is refused (`references_too_deep`).
+    pub max_ref_chain: usize,
+    /// The longest whitespace run the model may write between two
+    /// structural bytes.
+    pub max_whitespace: u8,
+    /// The memory a cache's compiled grammars may hold
+    /// ([`crate::GrammarCache`]), their masks and string tables included:
+    /// one grammar's own caches stop growing at this many bytes.
+    pub cache_bytes: usize,
+}
+
+impl Default for GrammarLimits {
+    fn default() -> Self {
+        Self {
+            max_pattern_states: DEFAULT_MAX_PATTERN_STATES,
+            max_depth: DEFAULT_MAX_DEPTH,
+            max_ref_chain: DEFAULT_MAX_REF_CHAIN,
+            max_whitespace: DEFAULT_MAX_WS_RUN,
+            cache_bytes: crate::DEFAULT_CACHE_BYTES,
+        }
+    }
+}
 
 /// The keywords of OpenAI's strict subset: the ones the grammar enforces.
 pub const STRICT_SUBSET: &[&str] = &[
@@ -177,6 +213,8 @@ pub(crate) struct Core {
     pub dfas: Vec<ByteDfa>,
     pub nums: Vec<NumSpec>,
     pub max_ws: u8,
+    /// [`GrammarLimits::max_depth`].
+    pub max_stack: usize,
 }
 
 impl Core {
@@ -261,6 +299,10 @@ pub struct Grammar {
     pub(crate) core: Core,
     pub(crate) vocab: Arc<Vocab>,
     pub(crate) memo: Mutex<crate::mask::Memo>,
+    /// The most bytes `memo` keeps ([`GrammarLimits::cache_bytes`]).
+    pub(crate) memo_budget: usize,
+    /// The compiled tables' own memory, `memo` aside: fixed once compiled.
+    tables_bytes: usize,
     inert: Vec<Inert>,
 }
 
@@ -274,7 +316,12 @@ impl Grammar {
     /// `response_format: {"type": "json_object"}`: any JSON object, values
     /// of any type, whitespace in bounded runs.
     pub fn json_object(vocab: Arc<Vocab>) -> Arc<Grammar> {
-        let mut c = Compiler::new(vocab, false);
+        Self::json_object_within(vocab, &GrammarLimits::default())
+    }
+
+    /// [`Grammar::json_object`] within `limits`.
+    pub fn json_object_within(vocab: Arc<Vocab>, limits: &GrammarLimits) -> Arc<Grammar> {
+        let mut c = Compiler::new(vocab, false, limits);
         let any = c.any_value();
         let root = c.push(Node::FreeObject { value: any });
         c.core.any = any;
@@ -284,8 +331,13 @@ impl Grammar {
     /// `response_format: {"type": "json_schema", ...}`: the schema text (its
     /// `schema` member) and its `strict` flag.
     pub fn json_schema(vocab: Arc<Vocab>, schema: &str, strict: bool) -> Result<Arc<Grammar>, Refusal> {
+        Self::json_schema_within(vocab, schema, strict, &GrammarLimits::default())
+    }
+
+    /// [`Grammar::json_schema`] within `limits`.
+    pub fn json_schema_within(vocab: Arc<Vocab>, schema: &str, strict: bool, limits: &GrammarLimits) -> Result<Arc<Grammar>, Refusal> {
         let doc = Json::parse(schema).map_err(|e| refuse("invalid_json", "schema", "#", format!("the schema is not JSON: {e}")))?;
-        let mut c = Compiler::new(vocab, strict);
+        let mut c = Compiler::new(vocab, strict, limits);
         if strict {
             if doc.get("anyOf").is_some() {
                 return Err(refuse("root_anyof", "anyOf", "#", "the root schema must be an object, not `anyOf`"));
@@ -300,12 +352,21 @@ impl Grammar {
         c.resolve_literals()?;
         let refs = c.refs;
         let g = c.finish(root);
-        if g.core.alts[root as usize].is_empty() || g.core.need[root as usize] as usize + 2 > MAX_STACK {
+        if g.core.alts[root as usize].is_empty() {
             return Err(refuse(
                 "no_finite_value",
                 if refs { "$ref" } else { "schema" },
                 "#",
                 "no finite document satisfies the schema (a recursion through required keys, or a `false` schema)",
+            ));
+        }
+        // The root's own two frames, then what its shortest answer nests.
+        if g.core.need[root as usize] as usize + 2 > g.core.max_stack {
+            return Err(refuse(
+                "exceeds_max_depth",
+                "depth",
+                "#",
+                format!("the schema's shortest answer nests deeper than the grammar's {} levels", g.core.max_stack),
             ));
         }
         Ok(Arc::new(g))
@@ -332,9 +393,7 @@ impl Grammar {
     /// Memory held by the compiled grammar (DFAs, literal tries) and its
     /// caches.
     pub fn heap_bytes(&self) -> usize {
-        let dfas: usize = self.core.dfas.iter().map(|d| d.heap_bytes()).sum();
-        let lits: usize = self.core.lits.iter().map(|l| l.edges.iter().map(|e| e.len() * 8 + 24).sum::<usize>()).sum();
-        dfas + lits + self.core.nodes.len() * 48 + self.memo.lock().unwrap().heap_bytes()
+        self.tables_bytes + self.memo.lock().unwrap().heap_bytes()
     }
 
     /// Memory held by the caches alone (string tables, whole masks).
@@ -346,6 +405,7 @@ impl Grammar {
 struct Compiler {
     vocab: Arc<Vocab>,
     strict: bool,
+    limits: GrammarLimits,
     doc: Option<Json>,
     core: Core,
     dfa_ids: HashMap<String, u32>,
@@ -395,7 +455,7 @@ fn holder(path: &str) -> &str {
 }
 
 impl Compiler {
-    fn new(vocab: Arc<Vocab>, strict: bool) -> Self {
+    fn new(vocab: Arc<Vocab>, strict: bool, limits: &GrammarLimits) -> Self {
         let mut bool_set = LitTrie::new();
         bool_set.add(b"true");
         bool_set.add(b"false");
@@ -404,6 +464,7 @@ impl Compiler {
         Self {
             vocab,
             strict,
+            limits: *limits,
             doc: None,
             core: Core {
                 nodes: Vec::new(),
@@ -414,7 +475,8 @@ impl Compiler {
                 lits: vec![bool_set, null_set],
                 dfas: Vec::new(),
                 nums: vec![NumSpec::unconstrained(false), NumSpec::unconstrained(true)],
-                max_ws: DEFAULT_MAX_WS_RUN,
+                max_ws: limits.max_whitespace,
+                max_stack: limits.max_depth,
             },
             dfa_ids: HashMap::new(),
             compiled: HashMap::new(),
@@ -435,7 +497,17 @@ impl Compiler {
         self.core.analyse();
         self.core.root = root;
         self.inert.sort();
-        Grammar { core: self.core, vocab: self.vocab, memo: Mutex::new(crate::mask::Memo::default()), inert: self.inert }
+        let dfas: usize = self.core.dfas.iter().map(|d| d.heap_bytes()).sum();
+        let lits: usize = self.core.lits.iter().map(|l| l.edges.iter().map(|e| e.len() * 8 + 24).sum::<usize>()).sum();
+        let tables_bytes = dfas + lits + self.core.nodes.len() * 48;
+        Grammar {
+            core: self.core,
+            vocab: self.vocab,
+            memo: Mutex::new(crate::mask::Memo::default()),
+            memo_budget: self.limits.cache_bytes,
+            tables_bytes,
+            inert: self.inert,
+        }
     }
 
     /// What strict refuses and the rest leaves inert: `Err` under strict,
@@ -489,8 +561,9 @@ impl Compiler {
         if let Some(&n) = self.compiled.get(path) {
             return Ok(n);
         }
-        if self.depth >= MAX_REF_CHAIN {
-            return Err(refuse("references_too_deep", "$ref", path, format!("references chain deeper than {MAX_REF_CHAIN}")));
+        if self.depth >= self.limits.max_ref_chain {
+            let most = self.limits.max_ref_chain;
+            return Err(refuse("references_too_deep", "$ref", path, format!("references chain deeper than {most}")));
         }
         let id = self.push(Node::Union(Vec::new()));
         self.compiled.insert(path.to_string(), id);
@@ -684,7 +757,11 @@ impl Compiler {
             };
             return match self.dfa(&translated) {
                 Ok(id) => Ok(id),
-                Err(e) => {
+                Err(DfaError::TooLarge(most)) => {
+                    self.give_up("pattern_too_large", "pattern", path, format!("`pattern` compiles to more than {most} states"))?;
+                    Ok(NO_RE)
+                }
+                Err(DfaError::Invalid(e)) => {
                     self.give_up("pattern_invalid", "pattern", path, format!("`pattern` cannot be enforced: {e}"))?;
                     Ok(NO_RE)
                 }
@@ -695,8 +772,16 @@ impl Compiler {
             self.give_up("unsupported_format", "format", path, format!("`format` \"{f}\" is not supported"))?;
             return Ok(NO_RE);
         };
-        // The nine formats' own patterns (regex::tests builds every one).
-        Ok(self.dfa(&p).expect("a format's pattern compiles"))
+        // The nine formats' own patterns compile (regex::tests builds every
+        // one), though not always within a lowered state bound.
+        match self.dfa(&p) {
+            Ok(id) => Ok(id),
+            Err(DfaError::TooLarge(most)) => {
+                self.give_up("pattern_too_large", "format", path, format!("`format` \"{f}\" compiles to more than {most} states"))?;
+                Ok(NO_RE)
+            }
+            Err(DfaError::Invalid(e)) => unreachable!("a format's pattern compiles: {e}"),
+        }
     }
 
     /// A number's spec: its bounds and `multipleOf`, held exactly.
@@ -877,11 +962,11 @@ impl Compiler {
         Ok(id)
     }
 
-    fn dfa(&mut self, pattern: &str) -> Result<u32, String> {
+    fn dfa(&mut self, pattern: &str) -> Result<u32, DfaError> {
         if let Some(&id) = self.dfa_ids.get(pattern) {
             return Ok(id);
         }
-        let d = ByteDfa::build(pattern)?;
+        let d = ByteDfa::build(pattern, self.limits.max_pattern_states)?;
         self.core.dfas.push(d);
         let id = (self.core.dfas.len() - 1) as u32;
         self.dfa_ids.insert(pattern.to_string(), id);
@@ -999,6 +1084,16 @@ mod tests {
         let many_enums = obj(&format!(r#"{{"type":"string","enum":[{}]}}"#, vals.join(",")));
         let long = obj(&format!(r#"{{"type":"string","enum":["{}"]}}"#, "x".repeat(MAX_SCHEMA_CHARS)));
         let endless = r##"{"type":"object","properties":{"child":{"$ref":"#"}},"required":["child"],"additionalProperties":false}"##;
+        // A chain of required objects through `$defs`: OpenAI's nesting
+        // limit reads the schema's text, the grammar's depth its answer.
+        let chain = |levels: usize| {
+            let defs: Vec<String> = (0..levels)
+                .map(|i| format!(r##""d{i}":{{"type":"object","properties":{{"x":{{"$ref":"#/$defs/d{}"}}}},"required":["x"],"additionalProperties":false}}"##, i + 1))
+                .collect();
+            format!(r##"{{"type":"object","properties":{{"a":{{"$ref":"#/$defs/d0"}}}},"required":["a"],"additionalProperties":false,"$defs":{{{},"d{levels}":{{"type":"null"}}}}}}"##, defs.join(","))
+        };
+        // Exponential in its DFA: 2^17 states for a match 16 bytes back.
+        let wide = obj(r#"{"type":"string","pattern":"a[ab]{16}$"}"#);
         let s = |x: &str| x.to_string();
         vec![
             (s("{"), true, "invalid_json", "schema"),
@@ -1007,6 +1102,9 @@ mod tests {
             (s(endless), true, "no_finite_value", "$ref"),
             (s(r#"{"type":"object","required":["x"],"additionalProperties":false}"#), false, "no_finite_value", "required"),
             (deep_refs, true, "references_too_deep", "$ref"),
+            // 126 levels: the root's two frames past the default 128, before
+            // the compiler's recursion reaches its own default bound.
+            (chain(DEFAULT_MAX_DEPTH - 2), true, "exceeds_max_depth", "depth"),
             (obj(r##"{"$ref":"#/$defs/missing"}"##), true, "unresolved_ref", "$ref"),
             (obj(r#"{"description":"no type"}"#), true, "missing_type", "type"),
             (obj("true"), true, "missing_type", "type"),
@@ -1036,6 +1134,7 @@ mod tests {
             (obj(r#"{"type":"string","pattern":"^a","format":"email"}"#), true, "pattern_with_format", "format"),
             (obj(r#"{"type":"string","pattern":"(a)\\1"}"#), true, "pattern_not_regular", "pattern"),
             (obj(r#"{"type":"string","pattern":"(a"}"#), true, "pattern_invalid", "pattern"),
+            (wide, true, "pattern_too_large", "pattern"),
             (obj(r#"{"type":"string","format":"uri"}"#), true, "unsupported_format", "format"),
             (obj(r#"{"type":"number","exclusiveMinimum":true}"#), true, "boolean_exclusive_bound", "exclusiveMinimum"),
             (obj(r#"{"type":"number","minimum":1e300}"#), true, "number_not_representable", "minimum"),

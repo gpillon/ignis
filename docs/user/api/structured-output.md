@@ -188,9 +188,14 @@ all of them valid:
   spells them;
 - an integer as digits alone (no fraction, no exponent), and a bounded number
   in plain decimal;
-- whitespace in runs of at most 48, as above;
-- nesting at most about 128 levels deep: a recursive schema's answer closes
-  before it.
+- whitespace in runs of at most 48, as above (`--model-grammar-max-whitespace`);
+- nesting at most about 128 levels deep (`--model-grammar-max-depth`): a
+  recursive schema's answer closes before it, and a schema whose shortest
+  answer nests deeper is refused.
+
+These bounds, the size a `pattern` may compile to and how deep a schema may
+chain its `$ref`s are the server's, set at start
+([Prompting](../configuration/prompting.md)).
 
 ### Compiled once
 
@@ -302,6 +307,8 @@ anything is generated. A schema the grammar refuses carries the refusal's own
 | under `strict: true`, a non-regular `pattern`, a `format` outside the nine, a `$ref` that is not local, a schema with neither a `type` nor an `enum` or `const` | `pattern_not_regular`, `unsupported_format`, `unsupported_ref`, `missing_type`; the other inert cases above have codes of their own |
 | a schema past one of OpenAI's limits, `strict` or not | `too_many_properties`, `too_deeply_nested`, `too_many_enum_values`, `too_many_characters` |
 | a schema no finite answer satisfies (a recursion through required keys, a `false` schema), `strict` or not | `no_finite_value` |
+| a schema whose shortest answer nests deeper than `--model-grammar-max-depth` (128), or that chains its subschemas and `$ref`s deeper than `--model-grammar-max-ref-chain` (256), `strict` or not | `exceeds_max_depth`, `references_too_deep` |
+| under `strict: true`, a `pattern` or `format` whose automaton has more than `--model-grammar-max-pattern-states` (20,000) states; inert without `strict` | `pattern_too_large` |
 | a malformed schema (an `enum` that is not an array, an unknown `type`, a `minItems` above `maxItems`, a `$ref` that names nothing), `strict` or not | a code of its own, naming the keyword |
 | `json_schema` without its `json_schema` object or its `schema`, a `strict` that is not a boolean, a `name` or `description` that is not a string | `invalid_request_error` |
 | any other `type`, or no object | `unsupported_value`. `{"type": "text"}`, `null` and absent are a free answer. |

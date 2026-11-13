@@ -240,7 +240,7 @@ async fn main() {
         // Read through `EngineShape`, like the other load-shape knobs.
         host_margin_bytes: _,
         // Read by the load, for its template's grammars.
-        grammar_cache_bytes: _,
+        grammar: _,
         prompt_reuse: _,
         retained_device_slots: _,
         retained_host_slots: _,

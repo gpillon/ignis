@@ -682,6 +682,62 @@ What a text model's host plan must leave of the physical memory available at loa
 
 The memory structured output's compiled grammars may hold, for the loaded model: one per distinct `json_schema` and `strict` flag, so a schema sent again is not compiled again, and past this the least recently used are dropped (a request still holding one keeps it). Ordinary RAM, taken as schemas arrive. 0 keeps only the last one.
 
+### `model.grammar_max_pattern_states`
+
+| | |
+|---|---|
+| Flag | `--model-grammar-max-pattern-states` |
+| Env var | `IGNIS_MODEL_GRAMMAR_MAX_PATTERN_STATES` |
+| Kind | `states` |
+| Default | `20000` |
+| Rule | 1..=1000000 |
+| Models | all |
+| `/v1/config` | shown by `GET`, not patchable |
+
+The most states a `json_schema`'s `pattern` or `format` may compile to: a larger one is refused under `strict` (`pattern_too_large`) and left inert without it. Each state is 1 KiB of the compiled grammar.
+
+### `model.grammar_max_depth`
+
+| | |
+|---|---|
+| Flag | `--model-grammar-max-depth` |
+| Env var | `IGNIS_MODEL_GRAMMAR_MAX_DEPTH` |
+| Kind | `levels` |
+| Default | `128` |
+| Rule | 3..=4096 |
+| Models | all |
+| `/v1/config` | shown by `GET`, not patchable |
+
+How deep structured output's answer may nest, in levels: a value is opened only where it can still be closed within it, and a schema whose shortest answer nests deeper is refused (`exceeds_max_depth`).
+
+### `model.grammar_max_ref_chain`
+
+| | |
+|---|---|
+| Flag | `--model-grammar-max-ref-chain` |
+| Env var | `IGNIS_MODEL_GRAMMAR_MAX_REF_CHAIN` |
+| Kind | `levels` |
+| Default | `256` |
+| Rule | 1..=1024 |
+| Models | all |
+| `/v1/config` | shown by `GET`, not patchable |
+
+How deep a `json_schema` may chain its subschemas and `$ref`s while it compiles: deeper is refused (`references_too_deep`).
+
+### `model.grammar_max_whitespace`
+
+| | |
+|---|---|
+| Flag | `--model-grammar-max-whitespace` |
+| Env var | `IGNIS_MODEL_GRAMMAR_MAX_WHITESPACE` |
+| Kind | `chars` |
+| Default | `48` |
+| Rule | 1..=255 |
+| Models | all |
+| `/v1/config` | shown by `GET`, not patchable |
+
+The longest run of whitespace structured output lets the model write between two of the answer's tokens, so an answer never streams whitespace without end.
+
 ### `model.adapt_context_step`
 
 | | |

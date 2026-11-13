@@ -55,13 +55,13 @@ pub struct ArtifactTemplateProvider {
 /// The vocabulary a load's grammars read (GitHub #587): the logits row's
 /// width, the id that ends an answer, and the grammar cache built over them
 /// on the first structured request -- about 160 ms and 13 MiB on the 27B's
-/// tokenizer, which a load that never serves one does not pay -- holding at
-/// most `cache_bytes` of compiled grammars (`model.grammar_cache_bytes`,
-/// #588).
+/// tokenizer, which a load that never serves one does not pay -- compiling
+/// within `limits` and holding at most their `cache_bytes` of compiled
+/// grammars (`model.grammar_*`, #588).
 struct GrammarVocabulary {
     width: usize,
     stop: TokenId,
-    cache_bytes: usize,
+    limits: ignis_grammar::GrammarLimits,
     cache: std::sync::OnceLock<Option<Arc<ignis_grammar::GrammarCache>>>,
 }
 
@@ -70,7 +70,7 @@ impl std::fmt::Debug for GrammarVocabulary {
         f.debug_struct("GrammarVocabulary")
             .field("width", &self.width)
             .field("stop", &self.stop)
-            .field("cache_bytes", &self.cache_bytes)
+            .field("limits", &self.limits)
             .field("built", &self.cache.get().is_some())
             .finish()
     }
@@ -89,13 +89,28 @@ impl ArtifactTemplateProvider {
         }
     }
 
+    /// The provider a load of `family` serves: the artifact's tokenizer and
+    /// template, and, for a model that serves structured output (GitHub
+    /// #587) and whose artifact names its EOS, the grammars' vocabulary over
+    /// its logits row, the EOS ending a complete answer, compiled within
+    /// `limits` (`model.grammar_*`, #588). The one place a load's provider
+    /// gets its grammars.
+    pub fn serving(frontend: FrontendSet, family: ignis_core::compute::ModelFamily, limits: ignis_grammar::GrammarLimits) -> Self {
+        let eos = frontend.eos_token_id();
+        let provider = Self::new(frontend);
+        match eos.filter(|_| family.serves_structured_output()) {
+            Some(eos) => provider.with_grammar_vocabulary(ignis_core::compute::ModelConfig::qwen38_27b().vocab as usize, eos, limits),
+            None => provider,
+        }
+    }
+
     /// Serve structured output (GitHub #587): an answer's grammar reads the
     /// tokenizer's first `width` ids as bytes -- the load's logits row --
     /// and `stop`, the model's EOS, is the token that ends a complete answer.
-    /// The compiled grammars, one per distinct schema, hold at most about
-    /// `cache_bytes` (`model.grammar_cache_bytes`, GitHub #588).
-    pub fn with_grammar_vocabulary(mut self, width: usize, stop: TokenId, cache_bytes: usize) -> Self {
-        self.structured = Some(GrammarVocabulary { width, stop, cache_bytes, cache: std::sync::OnceLock::new() });
+    /// Its grammars are compiled within `limits`, and hold at most about their
+    /// `cache_bytes`, one per distinct schema (`model.grammar_*`, GitHub #588).
+    pub fn with_grammar_vocabulary(mut self, width: usize, stop: TokenId, limits: ignis_grammar::GrammarLimits) -> Self {
+        self.structured = Some(GrammarVocabulary { width, stop, limits, cache: std::sync::OnceLock::new() });
         self
     }
 
@@ -512,7 +527,7 @@ impl TemplateProvider for ArtifactTemplateProvider {
                     })
                     .collect();
                 let vocab = ignis_grammar::Vocab::new(entries, &[vocabulary.stop]);
-                Some(Arc::new(ignis_grammar::GrammarCache::new(vocab, vocabulary.cache_bytes)))
+                Some(Arc::new(ignis_grammar::GrammarCache::within(vocab, vocabulary.limits)))
             })
             .clone()
     }
@@ -802,7 +817,9 @@ mod tests {
 
     /// GitHub #588: the compiled grammars hold what the load gives them
     /// (`model.grammar_cache_bytes`): with nothing, only the schema last sent
-    /// is kept; with the default, both.
+    /// is kept; with the default, both. And they are compiled within the
+    /// load's limits (`model.grammar_max_*`): a depth of 3 opens no object
+    /// past the root.
     #[test]
     fn the_compiled_grammars_hold_what_the_load_gives_them() {
         let schema = |key: &str| {
@@ -811,12 +828,19 @@ mod tests {
         for (bytes, kept) in [(0, 1), (ignis_grammar::DEFAULT_CACHE_BYTES, 2)] {
             let (_fixture, _reader, provider) = build_provider();
             // The fixture's five words, the last its stop.
-            let grammars = provider.with_grammar_vocabulary(5, 4, bytes).grammars().expect("the words read as bytes");
+            let limits = ignis_grammar::GrammarLimits { cache_bytes: bytes, ..Default::default() };
+            let grammars = provider.with_grammar_vocabulary(5, 4, limits).grammars().expect("the words read as bytes");
             for key in ["a", "b"] {
                 grammars.json_schema(&schema(key), true).expect("a strict schema");
             }
             assert_eq!(grammars.len(), kept, "{bytes} bytes");
         }
+        let (_fixture, _reader, provider) = build_provider();
+        let limits = ignis_grammar::GrammarLimits { max_depth: 3, ..Default::default() };
+        let grammars = provider.with_grammar_vocabulary(5, 4, limits).grammars().expect("the words read as bytes");
+        assert_eq!(grammars.limits(), &limits);
+        let nested = r#"{"type":"object","properties":{"a":{"type":"object","properties":{"b":{"type":"string"}},"required":["b"],"additionalProperties":false}},"required":["a"],"additionalProperties":false}"#;
+        assert_eq!(grammars.json_schema(nested, true).unwrap_err().code, "exceeds_max_depth");
     }
 
     #[test]

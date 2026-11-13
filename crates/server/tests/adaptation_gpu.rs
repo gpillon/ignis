@@ -176,7 +176,7 @@ fn harness(shape: EngineShape, eos: u32, frontend: FrontendSet) -> Option<Harnes
     // #340: the steps the load hands back are the ones its plan event logs.
     assert_eq!(vram_plan["attributes"]["adapted"], ignis_server::adaptation::steps_text(&steps).as_str());
     let (engine, driver) = Engine::with_clock_and_driver(Box::new(scheduler), Arc::new(SystemClock));
-    let server = Server::with_artifact_template(engine, frontend).with_request_timeout(Duration::from_secs(300));
+    let server = Server::with_artifact_template(engine, frontend, ignis_grammar::GrammarLimits::default()).with_request_timeout(Duration::from_secs(300));
     Some(Harness { app: Some(server.app()), driver: Some(driver), vram_plan, kept })
 }
 

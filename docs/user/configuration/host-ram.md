@@ -166,6 +166,7 @@ vocabulary as bytes (about 13 MiB, once per load), and each distinct
 ([Structured output](../api/structured-output.md#compiled-once)). They live in
 ordinary RAM, outside the host plan, taken as schemas arrive.
 `--model-grammar-cache-bytes` (`IGNIS_MODEL_GRAMMAR_CACHE_BYTES`, default
-`256M`) bounds them: past it the least recently used schemas are dropped, and
-sent again are compiled again; a request still running keeps its own. `0`
-keeps only the last one. Set at start; not patchable.
+`256M`) bounds them, each grammar's masks included, which stop being kept once
+one grammar holds that much: past it the least recently used schemas are
+dropped, and sent again are compiled again; a request still running keeps its
+own. `0` keeps only the last one, and no masks. Set at start; not patchable.

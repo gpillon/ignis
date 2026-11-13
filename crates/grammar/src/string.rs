@@ -214,7 +214,7 @@ pub(crate) fn step(dfa: Option<&ByteDfa>, st: StrState, b: u8) -> StrStep {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::regex::{translate_ecma, ByteDfa};
+    use crate::regex::{translate_ecma, ByteDfa, DEFAULT_MAX_PATTERN_STATES};
 
     fn run(dfa: Option<&ByteDfa>, body: &[u8]) -> bool {
         let mut s = StrState::start(dfa);
@@ -240,10 +240,10 @@ mod tests {
 
     #[test]
     fn a_pattern_sees_the_decoded_value() {
-        let d = ByteDfa::build(&translate_ecma("^[A-Z]{3}-\\d{4}$").unwrap()).unwrap();
+        let d = ByteDfa::build(&translate_ecma("^[A-Z]{3}-\\d{4}$").unwrap(), DEFAULT_MAX_PATTERN_STATES).unwrap();
         assert!(run(Some(&d), b"ABC-1234\""));
         assert!(!run(Some(&d), b"\\u0041BC-1234\""), "no \\u escape inside a pattern");
-        let nl = ByteDfa::build(&translate_ecma("^a\\nb$").unwrap()).unwrap();
+        let nl = ByteDfa::build(&translate_ecma("^a\\nb$").unwrap(), DEFAULT_MAX_PATTERN_STATES).unwrap();
         assert!(run(Some(&nl), b"a\\nb\""), "a short escape is decoded for the pattern");
         assert!(!run(Some(&nl), b"a\\tb\""));
         assert!(!run(Some(&d), b"ABC-123\""), "closing before the match is refused");

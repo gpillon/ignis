@@ -36,10 +36,10 @@ use std::sync::Arc;
 
 pub use bitset::TokenSet;
 pub use cache::{GrammarCache, DEFAULT_CACHE_BYTES};
-pub use mask::{MASK_CACHE_ENTRIES, STR_TABLE_ENTRIES};
+pub use regex::DEFAULT_MAX_PATTERN_STATES;
 pub use schema::{
-    Grammar, Inert, Refusal, ANNOTATIONS, DEFAULT_MAX_WS_RUN, FORMATS, MAX_ENUM_VALUES, MAX_NESTING, MAX_PROPERTIES,
-    MAX_REF_CHAIN, MAX_SCHEMA_CHARS, MAX_STACK, STRICT_SUBSET,
+    Grammar, GrammarLimits, Inert, Refusal, ANNOTATIONS, DEFAULT_MAX_DEPTH, DEFAULT_MAX_REF_CHAIN, DEFAULT_MAX_WS_RUN,
+    FORMATS, MAX_ENUM_VALUES, MAX_NESTING, MAX_PROPERTIES, MAX_SCHEMA_CHARS, STRICT_SUBSET,
 };
 pub use vocab::{Vocab, VocabEntry};
 

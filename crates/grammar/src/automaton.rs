@@ -4,7 +4,7 @@
 //! one). Bytes go in one at a time.
 
 use crate::number::{NumState, NumStep};
-use crate::schema::{Core, Node, NodeId, MAX_STACK, NO_RE};
+use crate::schema::{Core, Node, NodeId, NO_RE};
 use crate::string::{self, StrState, StrStep};
 
 pub(crate) const OPEN: u8 = 0;
@@ -123,12 +123,12 @@ fn set_top(c: &mut Config, f: Frame) {
 /// leaves room on the stack to finish.
 #[inline]
 fn fits(core: &Core, c: &Config, above: usize, node: NodeId) -> bool {
-    c.frames.len() + above + core.need[node as usize] as usize <= MAX_STACK
+    c.frames.len() + above + core.need[node as usize] as usize <= core.max_stack
 }
 
 #[inline]
-fn push(c: &mut Config, f: Frame) -> bool {
-    if c.frames.len() >= MAX_STACK {
+fn push(core: &Core, c: &mut Config, f: Frame) -> bool {
+    if c.frames.len() >= core.max_stack {
         return false;
     }
     c.frames.push(f);
@@ -226,7 +226,7 @@ pub(crate) fn advance(core: &Core, c: &mut Config, b: u8, forks: &mut Vec<Config
                             return false;
                         }
                         set_top(c, Frame::Obj { node, idx, phase: AFTER_KEY });
-                        if !push(c, Frame::Lit { set: keys[idx as usize], pos: 0 }) {
+                        if !push(core, c, Frame::Lit { set: keys[idx as usize], pos: 0 }) {
                             return false;
                         }
                     }
@@ -235,7 +235,7 @@ pub(crate) fn advance(core: &Core, c: &mut Config, b: u8, forks: &mut Vec<Config
                             return false;
                         }
                         set_top(c, Frame::Obj { node, idx, phase: AFTER_VALUE });
-                        if !push(c, Frame::Value { node: values[idx as usize] }) {
+                        if !push(core, c, Frame::Value { node: values[idx as usize] }) {
                             return false;
                         }
                         consume!();
@@ -262,7 +262,7 @@ pub(crate) fn advance(core: &Core, c: &mut Config, b: u8, forks: &mut Vec<Config
                         // A key, then its value: one frame above this one.
                         if b == b'"' && fits(core, c, 1, value) {
                             set_top(c, Frame::FreeObj { value, phase: AFTER_KEY });
-                            if !push(c, Frame::Str { re: NO_RE, st: StrState::start(None) }) {
+                            if !push(core, c, Frame::Str { re: NO_RE, st: StrState::start(None) }) {
                                 return false;
                             }
                             consume!();
@@ -278,7 +278,7 @@ pub(crate) fn advance(core: &Core, c: &mut Config, b: u8, forks: &mut Vec<Config
                             return false;
                         }
                         set_top(c, Frame::FreeObj { value, phase: AFTER_VALUE });
-                        if !push(c, Frame::Value { node: value }) {
+                        if !push(core, c, Frame::Value { node: value }) {
                             return false;
                         }
                         consume!();
@@ -314,7 +314,7 @@ pub(crate) fn advance(core: &Core, c: &mut Config, b: u8, forks: &mut Vec<Config
                             return false;
                         }
                         set_top(c, Frame::Arr { node, count: count + 1, phase: AFTER_VALUE });
-                        if !push(c, Frame::Value { node: item }) {
+                        if !push(core, c, Frame::Value { node: item }) {
                             return false;
                         }
                     }
@@ -343,7 +343,7 @@ pub(crate) fn advance(core: &Core, c: &mut Config, b: u8, forks: &mut Vec<Config
                             consume!();
                         }
                         set_top(c, Frame::FreeArr { phase: AFTER_VALUE });
-                        if !push(c, Frame::Value { node: core.any }) {
+                        if !push(core, c, Frame::Value { node: core.any }) {
                             return false;
                         }
                     }

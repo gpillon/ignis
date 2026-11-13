@@ -424,10 +424,11 @@ async fn constrained_answers_equal_the_per_token_masked_argmax_with_dflash2_off_
     let eos = frontend.eos_token_id().expect("the 27B's generation config names its EOS");
     // The grammars as the server compiles them: the provider's own cache
     // over the logits row, the EOS ending a complete answer.
-    let provider = ArtifactTemplateProvider::new(
+    let provider = ArtifactTemplateProvider::serving(
         FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}")),
-    )
-    .with_grammar_vocabulary(vocab(), eos, ignis_grammar::DEFAULT_CACHE_BYTES);
+        ignis_core::compute::ModelFamily::Qwen38_27b,
+        ignis_grammar::GrammarLimits::default(),
+    );
     let cases = cases(&provider);
     let Some(off) = serve(&frontend, &cases, eos, false).await else { return };
     let Some(on) = serve(&frontend, &cases, eos, true).await else { return };

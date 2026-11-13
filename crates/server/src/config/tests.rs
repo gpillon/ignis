@@ -1157,12 +1157,46 @@ fn help_lists_the_host_pool_budget_flag() {
 /// are config fields), 256 MiB unless named, 0 the operator's call.
 #[test]
 fn the_grammar_cache_holds_256_mib_unless_named() {
-    assert_eq!(config(&["--profile", "none"]).grammar_cache_bytes, 256 << 20);
-    assert_eq!(config(&["--model-grammar-cache-bytes", "64M"]).grammar_cache_bytes, 64 << 20);
-    assert_eq!(config(&["--model-grammar-cache-bytes", "0"]).grammar_cache_bytes, 0, "only the last schema kept");
+    assert_eq!(config(&["--profile", "none"]).grammar.cache_bytes, 256 << 20);
+    assert_eq!(config(&["--model-grammar-cache-bytes", "64M"]).grammar.cache_bytes, 64 << 20);
+    assert_eq!(config(&["--model-grammar-cache-bytes", "0"]).grammar.cache_bytes, 0, "only the last schema kept");
     let env = env_map(&[("IGNIS_MODEL_GRAMMAR_CACHE_BYTES", "1G")]);
-    assert_eq!(expect_config(resolve(&[], env).expect("resolve")).grammar_cache_bytes, GIB);
+    assert_eq!(expect_config(resolve(&[], env).expect("resolve")).grammar.cache_bytes, GIB as usize);
     assert!(refused(&["--model-grammar-cache-bytes", "lots"]).contains("--model-grammar-cache-bytes"));
+}
+
+/// The grammar's own limits are fields too (spec #287): the measured values
+/// unless named, each refused outside its range, by flag or environment.
+#[test]
+fn the_grammars_limits_are_the_measured_ones_unless_named() {
+    let defaults = config(&["--profile", "none"]).grammar;
+    assert_eq!(defaults, ignis_grammar::GrammarLimits::default());
+    assert_eq!(
+        (defaults.max_pattern_states, defaults.max_depth, defaults.max_ref_chain, defaults.max_whitespace),
+        (20_000, 128, 256, 48)
+    );
+    let named = config(&[
+        "--model-grammar-max-pattern-states",
+        "5000",
+        "--model-grammar-max-depth",
+        "64",
+        "--model-grammar-max-ref-chain",
+        "32",
+        "--model-grammar-max-whitespace",
+        "8",
+    ])
+    .grammar;
+    assert_eq!((named.max_pattern_states, named.max_depth, named.max_ref_chain, named.max_whitespace), (5000, 64, 32, 8));
+    let env = env_map(&[("IGNIS_MODEL_GRAMMAR_MAX_WHITESPACE", "255")]);
+    assert_eq!(expect_config(resolve(&[], env).expect("resolve")).grammar.max_whitespace, 255);
+    for (flag, past) in [
+        ("--model-grammar-max-pattern-states", "0"),
+        ("--model-grammar-max-depth", "2"),
+        ("--model-grammar-max-ref-chain", "1025"),
+        ("--model-grammar-max-whitespace", "256"),
+    ] {
+        assert!(refused(&[flag, past]).contains(flag), "{flag} {past}");
+    }
 }
 
 // ── GitHub #186: cross-request state reuse (ADR 0029) ────────────────────

@@ -546,20 +546,16 @@ impl Server {
     /// artifact-02, GitHub #7) in place of the built-in placeholder: the
     /// conversation is templated by the container's chat template and
     /// tokenized by the container's HuggingFace tokenizer
-    /// (`artifact_template.rs`).
-    pub fn with_artifact_template(engine: Engine, frontend: ignis_artifact::FrontendSet) -> Self {
-        // GitHub #587: the 27B's logits row and EOS, for structured output.
-        let eos = frontend.eos_token_id();
-        let provider = artifact_template::ArtifactTemplateProvider::new(frontend);
-        let provider = match eos {
-            Some(eos) => provider.with_grammar_vocabulary(
-                ignis_core::compute::ModelConfig::qwen38_27b().vocab as usize,
-                eos,
-                ignis_grammar::DEFAULT_CACHE_BYTES,
-            ),
-            None => provider,
-        };
-        Self::new(engine, Box::new(provider))
+    /// (`artifact_template.rs`), for the 27B: structured output's grammars
+    /// are compiled within `grammar`, the config's `model.grammar_*`
+    /// (GitHub #587, #588).
+    pub fn with_artifact_template(
+        engine: Engine,
+        frontend: ignis_artifact::FrontendSet,
+        grammar: ignis_grammar::GrammarLimits,
+    ) -> Self {
+        let family = ignis_core::compute::ModelFamily::Qwen38_27b;
+        Self::new(engine, Box::new(artifact_template::ArtifactTemplateProvider::serving(frontend, family, grammar)))
     }
 
     /// Set the deadline of a request answered whole (`main` wires this to

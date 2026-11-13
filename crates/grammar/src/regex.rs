@@ -25,8 +25,27 @@ pub(crate) const DEAD: u32 = u32::MAX;
 /// A match has been seen: every further byte keeps the value valid.
 pub(crate) const FREE: u32 = 0;
 
-/// The largest DFA a pattern may compile to.
-const MAX_STATES: usize = 20_000;
+/// [`crate::GrammarLimits::max_pattern_states`]'s default: the largest DFA a
+/// pattern may compile to.
+pub const DEFAULT_MAX_PATTERN_STATES: usize = 20_000;
+
+/// Why a pattern has no DFA.
+#[derive(Debug)]
+pub(crate) enum DfaError {
+    /// It compiles to more states than the bound, named.
+    TooLarge(usize),
+    /// It does not compile, or matches nothing.
+    Invalid(String),
+}
+
+impl std::fmt::Display for DfaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DfaError::TooLarge(most) => write!(f, "the pattern's automaton exceeds {most} states"),
+            DfaError::Invalid(e) => f.write_str(e),
+        }
+    }
+}
 
 pub(crate) struct ByteDfa {
     trans: Vec<u32>,
@@ -50,8 +69,17 @@ impl ByteDfa {
         self.trans.len() * 4 + self.eoi_accept.len()
     }
 
-    /// Compile a regex-syntax pattern (already translated) to our table.
-    pub fn build(pattern: &str) -> Result<Self, String> {
+    /// Compile a regex-syntax pattern (already translated) to our table, of
+    /// at most `max_states` states.
+    pub fn build(pattern: &str, max_states: usize) -> Result<Self, DfaError> {
+        Self::build_table(pattern, max_states).map_err(|e| match e {
+            None => DfaError::TooLarge(max_states),
+            Some(e) => DfaError::Invalid(e),
+        })
+    }
+
+    /// [`ByteDfa::build`]: `Err(None)` past `max_states`.
+    fn build_table(pattern: &str, max_states: usize) -> Result<Self, Option<String>> {
         let dfa = dense::Builder::new()
             .configure(
                 dense::DFA::config()
@@ -63,10 +91,10 @@ impl ByteDfa {
             .syntax(syntax::Config::new().unicode(true).utf8(true))
             .thompson(thompson::Config::new().utf8(true))
             .build(pattern)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Some(e.to_string()))?;
         let start_rs = dfa
             .start_state(&start::Config::new().anchored(Anchored::No))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Some(e.to_string()))?;
 
         // Our ids: 0 = FREE, then every live regex-automata state reached.
         let mut ids: HashMap<regex_automata::util::primitives::StateID, u32> = HashMap::new();
@@ -96,8 +124,8 @@ impl ByteDfa {
             raw.push(row);
             eoi.push(dfa.is_match_state(dfa.next_eoi_state(s)));
             i += 1;
-            if order.len() > MAX_STATES {
-                return Err(format!("the pattern's automaton exceeds {MAX_STATES} states"));
+            if order.len() > max_states {
+                return Err(None);
             }
         }
         // Liveness: a state is kept when a match is still reachable from it,
@@ -132,7 +160,7 @@ impl ByteDfa {
             }
         }
         if !live[1] {
-            return Err("the pattern matches no string".into());
+            return Err(Some("the pattern matches no string".into()));
         }
         let mut trans = vec![FREE; 256];
         for row in &raw {
@@ -315,7 +343,7 @@ mod tests {
     }
 
     fn compile(p: &str) -> ByteDfa {
-        ByteDfa::build(&translate_ecma(p).unwrap()).unwrap()
+        ByteDfa::build(&translate_ecma(p).unwrap(), DEFAULT_MAX_PATTERN_STATES).unwrap()
     }
 
     #[test]
@@ -339,7 +367,7 @@ mod tests {
 
     #[test]
     fn formats_hold_their_rfc_subsets() {
-        let f = |name: &str| ByteDfa::build(&format_pattern(name).unwrap()).unwrap();
+        let f = |name: &str| ByteDfa::build(&format_pattern(name).unwrap(), DEFAULT_MAX_PATTERN_STATES).unwrap();
         let date = f("date");
         assert!(matches(&date, "2024-02-29") && !matches(&date, "2023-02-29") && !matches(&date, "2000-13-01"));
         assert!(matches(&date, "2000-02-29") && !matches(&date, "1900-02-29") && !matches(&date, "0000-01-01"));

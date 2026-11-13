@@ -105,7 +105,7 @@ fn harness(vision: Option<Vision>) -> Option<Harness> {
         }
     };
     let (engine, driver) = Engine::with_clock_and_driver(Box::new(scheduler), Arc::new(SystemClock));
-    let server = Server::with_artifact_template(engine, frontend)
+    let server = Server::with_artifact_template(engine, frontend, ignis_grammar::GrammarLimits::default())
         .with_request_timeout(Duration::from_secs(120));
     Some(Harness {
         app: Some(server.app()),

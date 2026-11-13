@@ -420,3 +420,127 @@ fn the_answer_starts_at_its_first_byte_past_leading_whitespace() {
         assert!(m.answer_started());
     }
 }
+
+// ── The grammar's own limits are the caller's (`model.grammar_*`) ─────────
+
+fn within(max: impl FnOnce(&mut GrammarLimits)) -> GrammarLimits {
+    let mut limits = GrammarLimits::default();
+    max(&mut limits);
+    limits
+}
+
+#[test]
+fn a_lowered_whitespace_bound_holds_the_model_to_it() {
+    let v = vocab();
+    let g = Grammar::json_object_within(v.clone(), &within(|l| l.max_whitespace = 4));
+    assert!(accepts(&g, "{    }"));
+    assert!(!accepts(&g, "{     }"), "five is past the bound of four");
+    let g = Grammar::json_schema_within(v, TRAIN, true, &within(|l| l.max_whitespace = 1)).unwrap();
+    let mut m = Matcher::new(g);
+    assert!(m.accept_bytes(b"{ "));
+    assert!(!m.accept_bytes(b" "), "a schema's grammar holds the same bound");
+}
+
+#[test]
+fn a_pattern_past_the_state_bound_is_refused_under_strict_and_inert_without() {
+    let v = vocab();
+    let wide = r#"{"type":"object","properties":{"code":{"type":"string","pattern":"^[a-z]{40}$"}},"required":["code"],"additionalProperties":false}"#;
+    let date = r#"{"type":"object","properties":{"day":{"type":"string","format":"date"}},"required":["day"],"additionalProperties":false}"#;
+    let tight = within(|l| l.max_pattern_states = 8);
+    for (schema, keyword) in [(wide, "pattern"), (date, "format")] {
+        let refusal = Grammar::json_schema_within(v.clone(), schema, true, &tight).unwrap_err();
+        assert_eq!((refusal.code, refusal.keyword.as_str()), ("pattern_too_large", keyword), "{refusal}");
+        assert!(refusal.detail.contains("more than 8 states"), "{refusal}");
+        let g = Grammar::json_schema_within(v.clone(), schema, false, &tight).unwrap();
+        assert_eq!(g.inert().iter().map(|i| i.keyword.as_str()).collect::<Vec<_>>(), [keyword]);
+        // Within the default bound both are held.
+        assert!(Grammar::json_schema(v.clone(), schema, true).is_ok());
+    }
+}
+
+#[test]
+fn a_schema_deeper_than_the_depth_bound_is_refused_by_its_own_code() {
+    let v = vocab();
+    let nested = |levels: usize| {
+        (0..levels).fold(r#"{"type":"string"}"#.to_owned(), |inner, _| {
+            format!(r#"{{"type":"object","properties":{{"a":{inner}}},"required":["a"],"additionalProperties":false}}"#)
+        })
+    };
+    let shallow = within(|l| l.max_depth = 6);
+    let refusal = Grammar::json_schema_within(v.clone(), &nested(8), true, &shallow).unwrap_err();
+    assert_eq!((refusal.code, refusal.keyword.as_str()), ("exceeds_max_depth", "depth"), "{refusal}");
+    assert!(refusal.detail.contains("6 levels"), "{refusal}");
+    assert!(Grammar::json_schema_within(v.clone(), &nested(2), true, &shallow).is_ok());
+    assert!(Grammar::json_schema(v.clone(), &nested(8), true).is_ok(), "the default bound holds it");
+    // A schema no finite answer satisfies keeps its own code.
+    let endless = r##"{"type":"object","properties":{"child":{"$ref":"#"}},"required":["child"],"additionalProperties":false}"##;
+    assert_eq!(Grammar::json_schema_within(v.clone(), endless, true, &shallow).unwrap_err().code, "no_finite_value");
+    // And the automaton opens no value it has no room to finish.
+    let g = Grammar::json_object_within(v, &within(|l| l.max_depth = 6));
+    let mut m = Matcher::new(g);
+    let mut opened = 0;
+    while m.accept_bytes(b"{\"a\":") {
+        opened += 1;
+        assert!(opened < 10, "the bound of 6 never closed in");
+    }
+    assert!((2..6).contains(&opened), "{opened} objects open under a bound of 6");
+    assert_completes(&m, &b"{\"a\":".repeat(opened), 7);
+}
+
+#[test]
+fn the_compilers_recursion_is_bounded_by_the_ref_chain_limit() {
+    let v = vocab();
+    let nested = (0..4).fold(r#"{"type":"string"}"#.to_owned(), |inner, _| {
+        format!(r#"{{"type":"object","properties":{{"a":{inner}}},"required":["a"],"additionalProperties":false}}"#)
+    });
+    let refusal = Grammar::json_schema_within(v.clone(), &nested, true, &within(|l| l.max_ref_chain = 3)).unwrap_err();
+    assert_eq!(refusal.code, "references_too_deep", "{refusal}");
+    assert!(refusal.detail.contains("deeper than 3"), "{refusal}");
+    assert!(Grammar::json_schema_within(v, &nested, true, &within(|l| l.max_ref_chain = 16)).is_ok());
+}
+
+/// The server's widest bounds (`model.grammar_max_ref_chain` 1024,
+/// `model.grammar_max_depth` 4096) compile a schema at the edge of both on a
+/// thread's default stack, as a request's handler does.
+#[test]
+fn the_widest_bounds_the_server_allows_compile_on_a_default_stack() {
+    let v = vocab();
+    let levels = 500;
+    let defs: Vec<String> = (0..levels)
+        .map(|i| format!(r##""d{i}":{{"type":"object","properties":{{"x":{{"$ref":"#/$defs/d{}"}}}},"required":["x"],"additionalProperties":false}}"##, i + 1))
+        .collect();
+    let schema = format!(
+        r##"{{"type":"object","properties":{{"a":{{"$ref":"#/$defs/d0"}}}},"required":["a"],"additionalProperties":false,"$defs":{{{},"d{levels}":{{"type":"null"}}}}}}"##,
+        defs.join(",")
+    );
+    let widest = within(|l| {
+        l.max_ref_chain = 1024;
+        l.max_depth = 4096;
+    });
+    let compiled = std::thread::spawn(move || Grammar::json_schema_within(v, &schema, true, &widest).map(|_| ()))
+        .join()
+        .expect("no stack overflow");
+    assert_eq!(compiled, Ok(()));
+}
+
+#[test]
+fn a_grammars_own_caches_stop_growing_at_the_cache_bytes() {
+    let v = vocab();
+    let doc = br#"{"train":"AB123","stops":[{"station":"x","platform":1,"wait_min":2}],"operator":"y"}"#;
+    let grow = |limits: &GrammarLimits| {
+        let g = Grammar::json_schema_within(v.clone(), TRAIN, true, limits).unwrap();
+        let mut m = Matcher::new(g.clone());
+        let mut out = TokenSet::new(v.len());
+        for b in doc {
+            m.mask(&mut out);
+            assert!(m.accept_bytes(&[*b]));
+        }
+        g.cache_bytes()
+    };
+    let grown = grow(&GrammarLimits::default());
+    assert!(grown > 0, "masks and tables are kept by default");
+    assert_eq!(grow(&within(|l| l.cache_bytes = 0)), 0, "nothing is kept in no room");
+    let half = grown / 2;
+    let kept = grow(&within(|l| l.cache_bytes = half));
+    assert!(kept > 0 && kept <= half, "{kept} of {half}");
+}

@@ -247,6 +247,14 @@ count_kind!(
     /// A count of the diarizer's 80 ms frames.
     Frames: u32, "frames", "frame count"
 );
+count_kind!(
+    /// A count of automaton states.
+    States: u32, "states", "state count"
+);
+count_kind!(
+    /// A count of nesting levels.
+    Levels: u32, "levels", "level count"
+);
 
 /// The speech model's compute threads (spec speech/01): a count, or `auto`,
 /// the physical cores less one. Rendered `auto` when unset, so a file written

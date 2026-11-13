@@ -104,7 +104,7 @@ impl LiveServer {
 
         let (engine, driver) =
             Engine::with_clock_and_driver(Box::new(scheduler), Arc::new(SystemClock));
-        let app = Server::with_artifact_template(engine, frontend)
+        let app = Server::with_artifact_template(engine, frontend, ignis_grammar::GrammarLimits::default())
             .with_request_timeout(request_timeout)
             .app();
 

@@ -490,6 +490,22 @@ config_group! {
         /// recently used are dropped (a request still holding one keeps it).
         /// Ordinary RAM, taken as schemas arrive. 0 keeps only the last one.
         grammar_cache_bytes: Bytes = super::DEFAULT_GRAMMAR_CACHE_BYTES, NO_RULE, ALL, [Visible];
+        /// The most states a `json_schema`'s `pattern` or `format` may compile
+        /// to: a larger one is refused under `strict` (`pattern_too_large`)
+        /// and left inert without it. Each state is 1 KiB of the compiled
+        /// grammar.
+        grammar_max_pattern_states: States = super::DEFAULT_GRAMMAR_MAX_PATTERN_STATES, between(1, 1_000_000), ALL, [Visible];
+        /// How deep structured output's answer may nest, in levels: a value is
+        /// opened only where it can still be closed within it, and a schema
+        /// whose shortest answer nests deeper is refused (`exceeds_max_depth`).
+        grammar_max_depth: Levels = super::DEFAULT_GRAMMAR_MAX_DEPTH, between(3, 4096), ALL, [Visible];
+        /// How deep a `json_schema` may chain its subschemas and `$ref`s while
+        /// it compiles: deeper is refused (`references_too_deep`).
+        grammar_max_ref_chain: Levels = super::DEFAULT_GRAMMAR_MAX_REF_CHAIN, between(1, 1024), ALL, [Visible];
+        /// The longest run of whitespace structured output lets the model
+        /// write between two of the answer's tokens, so an answer never
+        /// streams whitespace without end.
+        grammar_max_whitespace: Chars = super::DEFAULT_GRAMMAR_MAX_WHITESPACE, between(1, 255), ALL, [Visible];
         /// The 27B's adaptation (ADR 0063): when its VRAM plan refuses a
         /// `max_context` the profile or the default gave, the load lowers it
         /// this many tokens at a time, never below this many -- a start whose

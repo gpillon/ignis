@@ -7,27 +7,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::json::Json;
-use crate::schema::{Grammar, Refusal};
+use crate::schema::{Grammar, GrammarLimits, Refusal};
 use crate::vocab::Vocab;
 
 /// The memory a [`GrammarCache`] keeps its grammars in by default: room for
 /// hundreds of SDK-sized schemas with their masks.
 pub const DEFAULT_CACHE_BYTES: usize = 256 << 20;
 
-/// The most schemas a cache keeps, whatever their size (each lookup walks
-/// them to account their memory).
-const MAX_ENTRIES: usize = 4096;
-
 /// The grammars compiled against one tokenizer's [`Vocab`].
 ///
 /// A schema is the same schema when its JSON is, whitespace aside, with the
-/// same `strict` flag; its refusal is kept too. Past the capacity, the least
-/// recently used schemas are dropped; a request still holding one keeps it
-/// alive. A grammar's own caches grow while requests use it (each bounded in
-/// entries), and the bound is applied again at every lookup.
+/// same `strict` flag; its refusal is kept too. Past the capacity
+/// ([`GrammarLimits::cache_bytes`]), the least recently used schemas are
+/// dropped; a request still holding one keeps it alive. A grammar's own
+/// caches grow while requests use it, never past the capacity, and the bound
+/// is applied again at every lookup.
 pub struct GrammarCache {
     vocab: Arc<Vocab>,
-    capacity: usize,
+    limits: GrammarLimits,
     json_object: OnceLock<Arc<Grammar>>,
     inner: Mutex<Inner>,
     compiles: AtomicU64,
@@ -56,9 +53,20 @@ impl Entry {
 
 impl GrammarCache {
     /// A cache over `vocab` keeping at most about `capacity_bytes` of
-    /// compiled grammars.
+    /// compiled grammars, each compiled within the default limits.
     pub fn new(vocab: Arc<Vocab>, capacity_bytes: usize) -> Self {
-        Self { vocab, capacity: capacity_bytes, json_object: OnceLock::new(), inner: Mutex::default(), compiles: AtomicU64::new(0) }
+        Self::within(vocab, GrammarLimits { cache_bytes: capacity_bytes, ..GrammarLimits::default() })
+    }
+
+    /// A cache over `vocab` whose grammars are compiled within `limits`, and
+    /// hold at most about its `cache_bytes`.
+    pub fn within(vocab: Arc<Vocab>, limits: GrammarLimits) -> Self {
+        Self { vocab, limits, json_object: OnceLock::new(), inner: Mutex::default(), compiles: AtomicU64::new(0) }
+    }
+
+    /// The limits its grammars are compiled within.
+    pub fn limits(&self) -> &GrammarLimits {
+        &self.limits
     }
 
     pub fn vocab(&self) -> &Arc<Vocab> {
@@ -70,7 +78,7 @@ impl GrammarCache {
         self.json_object
             .get_or_init(|| {
                 self.compiles.fetch_add(1, Ordering::Relaxed);
-                Grammar::json_object(self.vocab.clone())
+                Grammar::json_object_within(self.vocab.clone(), &self.limits)
             })
             .clone()
     }
@@ -103,7 +111,7 @@ impl GrammarCache {
         // Compiled outside the lock: a slow schema does not hold up the
         // lookups of others.
         self.compiles.fetch_add(1, Ordering::Relaxed);
-        let result = Grammar::json_schema(self.vocab.clone(), schema, strict);
+        let result = Grammar::json_schema_within(self.vocab.clone(), schema, strict, &self.limits);
         let mut inner = self.inner.lock().unwrap();
         inner.clock += 1;
         let used = inner.clock;
@@ -113,10 +121,11 @@ impl GrammarCache {
     }
 
     /// Drop the least recently used schemas until the cache fits, keeping
-    /// the most recent one.
+    /// the most recent one. Each grammar counts its own memory as it grows,
+    /// so the walk reads one number per schema.
     fn evict(&self, inner: &mut Inner) {
         let mut total: usize = inner.entries.iter().map(|((k, _), e)| e.heap_bytes(k)).sum();
-        while inner.entries.len() > 1 && (total > self.capacity || inner.entries.len() > MAX_ENTRIES) {
+        while inner.entries.len() > 1 && total > self.limits.cache_bytes {
             let oldest = inner.entries.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| k.clone()).unwrap();
             let e = inner.entries.remove(&oldest).unwrap();
             total -= e.heap_bytes(&oldest.0);
