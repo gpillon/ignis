@@ -2494,7 +2494,13 @@ impl ConcreteScheduler {
         }
         let request = r.id;
         let params = r.input.params;
-        let repaired = state
+        r.tally.misses = r.tally.misses.saturating_add(1);
+        // #593: the clock is read here only, where a repair happens.
+        let began = self.now();
+        let repaired = self.requests[i]
+            .grammar
+            .as_mut()
+            .expect("checked above")
             .permitted()
             .and_then(|permitted| {
                 let job = RepairJob { request, params, permitted };
@@ -2504,6 +2510,10 @@ impl ConcreteScheduler {
                 let state = self.requests[i].grammar.as_mut().expect("checked above");
                 state.repaired(token).map(|stop| (token, stop))
             });
+        if repaired.is_ok() {
+            let micros = self.now().saturating_duration_since(began).as_micros();
+            self.requests[i].tally.repair_micros.push(micros.min(u32::MAX as u128) as u32);
+        }
         match repaired {
             Ok((_, true)) => Held::Ended(FinishReason::Stop),
             Ok((token, false)) => Held::Repaired(token),
@@ -2767,6 +2777,16 @@ impl ConcreteScheduler {
             let r = &self.requests[idx];
             r.reasoning_redirected_at.filter(|&at| at < r.tokens)
         };
+        // #593: a grammar's type, misses and repair times, moved out.
+        let structured = {
+            let r = &mut self.requests[idx];
+            let tally = std::mem::take(&mut r.tally);
+            r.input.grammar.as_ref().map(|grammar| crate::structured::StructuredSummary {
+                kind: grammar.kind(),
+                misses: tally.misses,
+                repair_micros: tally.repair_micros,
+            })
+        };
         let (request_id, tokens) = self.release_request(idx);
         events.push(SchedEvent::Done {
             request: request_id,
@@ -2778,6 +2798,7 @@ impl ConcreteScheduler {
             drawn,
             thinking,
             reasoning_redirected_at,
+            structured,
         });
     }
 

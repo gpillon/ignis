@@ -682,6 +682,7 @@ fn end_in_flight(
             drawn: None,
             thinking: None,
             reasoning_redirected_at: None,
+            structured: None,
         });
         scheduler.cancel(request);
     }
@@ -918,7 +919,8 @@ async fn telemetry_task(
                     drawn: _,
                     thinking,
                     reasoning_redirected_at,
-                } => telemetry.on_done(request, tokens, reason, spec, thinking, reasoning_redirected_at),
+                    structured,
+                } => telemetry.on_done(request, tokens, reason, spec, thinking, reasoning_redirected_at, structured),
                 SchedEvent::PrefillChunk {
                     request,
                     prefilled_tokens,
@@ -1346,6 +1348,7 @@ mod tests {
                     attention: None,
                     thinking: None,
                     reasoning_redirected_at: None,
+                    structured: None,
                 },
             ]
         }
@@ -1422,6 +1425,7 @@ mod tests {
                     attention: None,
                     thinking: None,
                     reasoning_redirected_at: None,
+                    structured: None,
                 },
             ]
         }
@@ -1531,6 +1535,7 @@ mod tests {
                 attention: None,
                 thinking: None,
                 reasoning_redirected_at: None,
+                structured: None,
             }]
         }
         fn is_idle(&self) -> bool {

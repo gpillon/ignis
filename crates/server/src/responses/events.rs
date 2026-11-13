@@ -753,6 +753,7 @@ pub(crate) mod testing {
             drawn: None,
             thinking: None,
             reasoning_redirected_at: None,
+            structured: None,
         }
     }
 }

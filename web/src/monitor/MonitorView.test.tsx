@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, IMAGE_EXPOSITION, IMAGE_LOAD_EXPOSITION, KV_DISK_EXPOSITION, LOOP_GUARD_EXPOSITION, SPEECH_EXPOSITION, THINKING_FORCED_CLOSES } from "./fixture.ts";
+import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, IMAGE_EXPOSITION, IMAGE_LOAD_EXPOSITION, KV_DISK_EXPOSITION, LOOP_GUARD_EXPOSITION, SPEECH_EXPOSITION, STRUCTURED_EXPOSITION, THINKING_FORCED_CLOSES } from "./fixture.ts";
 import { MonitorView } from "./MonitorView.tsx";
 import { applyScrape, initialMonitor } from "./scrape.ts";
 
@@ -187,6 +187,25 @@ describe("MonitorView", () => {
     expect(html).toContain("Time denoising");
     const text = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now, 2)} />);
     expect(text).not.toContain("Image jobs");
+  });
+
+  // #593: the Structured output card, only once a request held to a grammar ended.
+  it("draws the Structured output card once a request was held to a grammar, and not before", () => {
+    const now = Date.now();
+    // Ten seconds on: ten more requests and four more misses, each repaired.
+    const later = STRUCTURED_EXPOSITION.replace('requests_total{type="json_object"} 20', 'requests_total{type="json_object"} 30')
+      .replace('misses_total{type="json_object"} 6', 'misses_total{type="json_object"} 10')
+      .replace('repairs_total{type="json_object"} 6', 'repairs_total{type="json_object"} 10')
+      .replaceAll('seconds_bucket{le="0.0005"} 6', 'seconds_bucket{le="0.0005"} 10')
+      .replaceAll(/seconds_bucket\{le="(0\.001|0\.0025|0\.005|0\.01|0\.05|0\.25|\+Inf)"\} 6/g, 'seconds_bucket{le="$1"} 10')
+      .replace("seconds_count 6", "seconds_count 10");
+    const state = applyScrape(applyScrape(initialMonitor(), { kind: "ok", text: STRUCTURED_EXPOSITION }, now - 10_000, 2), { kind: "ok", text: later }, now, 2);
+    const html = renderToStaticMarkup(<MonitorView state={state} />);
+    expect(html).toContain("Structured output");
+    expect(html).toContain("Misses per request");
+    expect(html).toContain("0.40");
+    const text = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now, 2)} />);
+    expect(text).not.toContain("Structured output");
   });
 
   // Spec speech/02: the Transcriptions card, only once the speech model was asked.

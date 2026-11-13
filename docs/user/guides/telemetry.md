@@ -29,6 +29,14 @@ Everything goes through one structured log on stdout, in the format
   `done` line names no `lane` and carries the prefill fields instead, `prompt_tokens`,
   `prefill_chunks_consumed`, `prefill_chunks_solo` and `prefilled_tokens`,
   as does a decision's.
+- From 0.11.0, a request held to a grammar (`response_format`, see
+  [Structured output](../api/structured-output.md)) says so on its `done`
+  line: `structured.type` (`json_object` or `json_schema`), `structured.misses`
+  (the draws the grammar rejected) and `structured.repairs` (the rejected draws
+  sampled again under the grammar). Any other request carries none of them,
+  and a miss the engine could not repair is a miss with no repair, on a request
+  that ends `error`. The server's totals are the `ignis_structured_*` series in
+  the [metrics reference](../reference/metrics.md).
 - A request with images says what they cost on the line it ends with,
   `done` or `cancelled`: `media.items`, `media.vision_tokens` (after any
   downscale to `--vision-max-tokens`) and `media.natural_vision_tokens`,

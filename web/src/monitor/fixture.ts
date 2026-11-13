@@ -389,6 +389,38 @@ export const THINKING_FORCED_CLOSES = `# HELP ignis_thinking_forced_closes_total
 ignis_thinking_forced_closes_total 3
 `;
 
+// Structured output (#593): the first request held to a grammar renders every series.
+export const STRUCTURED_FAMILIES = `# HELP ignis_structured_requests_total Completed requests held to a grammar, by the response_format type.
+# TYPE ignis_structured_requests_total counter
+ignis_structured_requests_total{type="json_object"} 20
+ignis_structured_requests_total{type="json_schema"} 0
+# HELP ignis_structured_misses_total Draws of a structured answer the grammar rejected, by type.
+# TYPE ignis_structured_misses_total counter
+ignis_structured_misses_total{type="json_object"} 6
+ignis_structured_misses_total{type="json_schema"} 0
+# HELP ignis_structured_repairs_total Rejected draws sampled again under the grammar, by type.
+# TYPE ignis_structured_repairs_total counter
+ignis_structured_repairs_total{type="json_object"} 6
+ignis_structured_repairs_total{type="json_schema"} 0
+# HELP ignis_structured_repair_seconds Time to repair one rejected draw of a structured answer.
+# TYPE ignis_structured_repair_seconds histogram
+ignis_structured_repair_seconds_bucket{le="0.00005"} 0
+ignis_structured_repair_seconds_bucket{le="0.0001"} 2
+ignis_structured_repair_seconds_bucket{le="0.00025"} 5
+ignis_structured_repair_seconds_bucket{le="0.0005"} 6
+ignis_structured_repair_seconds_bucket{le="0.001"} 6
+ignis_structured_repair_seconds_bucket{le="0.0025"} 6
+ignis_structured_repair_seconds_bucket{le="0.005"} 6
+ignis_structured_repair_seconds_bucket{le="0.01"} 6
+ignis_structured_repair_seconds_bucket{le="0.05"} 6
+ignis_structured_repair_seconds_bucket{le="0.25"} 6
+ignis_structured_repair_seconds_bucket{le="+Inf"} 6
+ignis_structured_repair_seconds_sum 0.0011
+ignis_structured_repair_seconds_count 6
+`;
+
+export const STRUCTURED_EXPOSITION = `${IGNIS_EXPOSITION}${STRUCTURED_FAMILIES}`;
+
 export const LOOP_GUARD_EXPOSITION = `${IGNIS_EXPOSITION}${LOOP_GUARD_FAMILIES}${THINKING_FORCED_CLOSES}`;
 
 // The speech families (spec speech/02, ADR 0017's amendment of 2026-10-24),
