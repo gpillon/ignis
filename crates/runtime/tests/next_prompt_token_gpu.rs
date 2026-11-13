@@ -144,7 +144,7 @@ fn run<L: StepLeaf>(leaf: &L, model: &L::Model, prompt: &[TokenId], jobs: Jobs<'
         let next = if hands_next { prompt.get(end).copied() } else { None };
         let keeps_draw = kept == Some(job);
         // Greedy, as the scheduler deals every job but the prompt's last.
-        leaf.prefill(model, &mut seq, &prompt[start..end], start as u32, 0, next, keeps_draw, DecodeParams::default(), &[], None, None, None)
+        leaf.prefill(model, &mut seq, &prompt[start..end], start as u32, 0, next, keeps_draw, false, DecodeParams::default(), &[], None, None, None)
             .unwrap_or_else(|code| panic!("{label}: prefill [{start}, {end}): leaf code {code}"));
         pending.push(pending_of(&snapshot(leaf, model, &seq, label), header));
         start = end;
@@ -165,7 +165,7 @@ fn drawn_at_cuts<L: StepLeaf>(leaf: &L, model: &L::Model, cuts: &[usize], header
     let mut seq = leaf.allocate_sequence(model, MAX_CONTEXT).unwrap_or_else(|code| panic!("{label}: alloc: {code}"));
     let mut start = 0;
     for &end in cuts {
-        leaf.prefill(model, &mut seq, &prompt[start..end], start as u32, 0, None, false, DecodeParams::default(), &[], None, None, None)
+        leaf.prefill(model, &mut seq, &prompt[start..end], start as u32, 0, None, false, false, DecodeParams::default(), &[], None, None, None)
             .unwrap_or_else(|code| panic!("{label}: prefill [{start}, {end}): leaf code {code}"));
         if end < prompt.len() {
             let drawn = pending_of(&snapshot(leaf, model, &seq, label), header).expect("a drawing job draws");
@@ -312,14 +312,14 @@ fn the_27b_runs_the_head_only_on_the_prompts_last_job() {
     let next = Some(prompt[CUTS[0]]);
     let mut logits = vec![0f32; leaf.vocab(&model) as usize];
     assert!(
-        leaf.prefill(&model, &mut seq, span, 0, 0, next, false, DecodeParams::default(), &[], None, Some(&mut logits), None).is_err(),
+        leaf.prefill(&model, &mut seq, span, 0, 0, next, false, false, DecodeParams::default(), &[], None, Some(&mut logits), None).is_err(),
         "a logits readout beside a next token"
     );
     assert!(
-        leaf.prefill(&model, &mut seq, span, 0, 0, next, false, DecodeParams::default(), &[prompt[0]], None, None, None).is_err(),
+        leaf.prefill(&model, &mut seq, span, 0, 0, next, false, false, DecodeParams::default(), &[prompt[0]], None, None, None).is_err(),
         "a permitted set beside a next token"
     );
-    leaf.prefill(&model, &mut seq, span, 0, 0, next, false, DecodeParams::default(), &[], None, None, None)
+    leaf.prefill(&model, &mut seq, span, 0, 0, next, false, false, DecodeParams::default(), &[], None, None, None)
         .expect("the refusals left the sequence at position 0");
     leaf.release_sequence(&model, seq);
     leaf.release_model(model);

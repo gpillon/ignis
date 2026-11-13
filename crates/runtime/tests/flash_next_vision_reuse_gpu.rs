@@ -198,6 +198,7 @@ impl Run<'_> {
                 0,
                 None,
                 false,
+                false,
                 DecodeParams::default(),
                 &[],
                 None,
@@ -237,7 +238,7 @@ impl Run<'_> {
         let position = (self.tokens.len() + DECODED) as u32;
         let mut logits = self.logits();
         self.leaf
-            .prefill(self.model, seq, &[pending], position, 0, None, false, DecodeParams::default(), &[], None, Some(&mut logits), None)
+            .prefill(self.model, seq, &[pending], position, 0, None, false, false, DecodeParams::default(), &[], None, Some(&mut logits), None)
             .unwrap_or_else(|code| panic!("the probe at {position}: leaf code {code}"));
         logits.iter().map(|v| v.to_bits()).collect()
     }
