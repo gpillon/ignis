@@ -68,8 +68,10 @@ schema misses on nearly every key.
 - **Four metric families join ADR 0017's set** (#593): `ignis_structured_requests_total{type}`,
   `ignis_structured_misses_total{type}`, `ignis_structured_repairs_total{type}` (`type` is
   `json_object|json_schema`) and the histogram `ignis_structured_repair_seconds` (50 µs to 250 ms). The scheduler
-  counts a request's misses and times each repair where the repair happens, the one place a request held to a
-  grammar reads the clock, and reports them on the request's `Done` fact, so a round with no grammar adds nothing.
-  They take the decision family's exception: absent until a request held to a grammar has ended, then every series,
-  zeros included. The request's `done` line carries `structured.type`, `structured.misses` and `structured.repairs`,
-  and the Monitor shows them in a *Structured output* card.
+  times each repair where the repair happens, the one place a request held to a grammar reads the clock, and
+  reports each miss with its repair time as a fact of its own, so a round with no grammar adds nothing; the
+  consumer sums them per request. They take the decision family's exception: absent until a request held to a
+  grammar has completed, then every series, zeros included; like the decision family, they count completed
+  requests only. The request's `done` line, and its `cancelled` line after a deadline cut or a client cancel, carry
+  `structured.type`, `structured.misses` and `structured.repairs`, and the Monitor shows them in a *Structured
+  output* card.
