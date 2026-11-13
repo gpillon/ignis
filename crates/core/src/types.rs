@@ -806,6 +806,9 @@ pub enum SchedEvent {
         /// and `None` on every request it did not happen to. Apart from
         /// `thinking`, which only a budget has: a redirect needs none.
         reasoning_redirected_at: Option<u32>,
+        /// What a request held to a **grammar** did (#593): its type, its
+        /// misses and the time of each repair. `None` for every other request.
+        structured: Option<crate::structured::StructuredSummary>,
     },
     /// A request was admitted onto a decode lane. `backfill` is the class
     /// the admission state machine admitted it under (ADR 0004): `None` for

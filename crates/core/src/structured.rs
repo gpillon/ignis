@@ -56,6 +56,36 @@ impl StructuredKind {
     }
 }
 
+/// What a request's grammar did over its life, kept on the request and
+/// reported on its finish ([`StructuredSummary`], #593).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StructuredTally {
+    /// Draws the grammar rejected.
+    pub misses: u32,
+    /// How long each repair took, in microseconds, in order. A miss the
+    /// engine could not repair has no entry.
+    pub repair_micros: Vec<u32>,
+}
+
+/// What a constrained request's finish reports about its grammar (#593): the
+/// type it asked for, its misses, and the time of each repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredSummary {
+    /// The type the request's `response_format` named.
+    pub kind: StructuredKind,
+    /// Draws the grammar rejected.
+    pub misses: u32,
+    /// How long each repair took, in microseconds.
+    pub repair_micros: Vec<u32>,
+}
+
+impl StructuredSummary {
+    /// Misses the engine repaired.
+    pub fn repairs(&self) -> u32 {
+        self.repair_micros.len() as u32
+    }
+}
+
 /// The grammar a request's answer is held to
 /// ([`crate::types::RequestInput::grammar`]): a compiled grammar, shared by
 /// every request that sent the same shape, and where the answer starts.

@@ -61,6 +61,14 @@ export function formatSeconds(s: number | null): string {
   return rest ? `${Math.floor(total / 60)}m ${rest}s` : `${total / 60}m`;
 }
 
+/** `40 us`, `850 us`, `2.5 ms`, then as `formatSeconds`: a duration of microseconds to seconds. */
+export function formatShortSeconds(s: number | null): string {
+  if (s === null || !Number.isFinite(s)) return DASH;
+  if (s < 0.001) return `${Math.round(s * 1e6)} us`;
+  if (s < 0.01) return `${(s * 1000).toFixed(1)} ms`;
+  return formatSeconds(s);
+}
+
 /** A histogram bucket's upper bound: `50ms`, `2.5s`, `2m`, `+Inf`. */
 export function formatBound(le: number): string {
   if (le === Infinity) return "+Inf";

@@ -24,6 +24,7 @@ use axum::routing::get;
 use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
 use ignis_core::scheduler::{DiskOp, DiskSource};
 use ignis_core::flash_next_counters::{FlashNextCounterSource, FlashNextCounters};
+use ignis_core::structured::StructuredKind;
 use ignis_core::ngram_table::NgramCounters;
 use ignis_core::residency::{KClass, Phase, ResidencyCounters};
 use ignis_core::{RetainedSkip, SubmitError};
@@ -589,6 +590,41 @@ fn decimal(value: u64, scale: u64) -> String {
     format!("{whole}.{}", frac.trim_end_matches('0'))
 }
 
+/// `ignis_structured_repair_seconds`' bucket boundaries (ADR 0017 as amended
+/// by #593), in microseconds: a repair is one draw over the round's own
+/// scores, tens of microseconds to a few milliseconds, which the latency
+/// scales above (from 50 ms) would put in one bucket.
+const REPAIR_BOUNDS_US: [u64; 10] = [50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 50_000, 250_000];
+
+/// A fixed-bucket histogram over microsecond observations.
+#[derive(Debug)]
+struct Micros {
+    bounds: &'static [u64; 10],
+    /// Observations per bucket, not cumulative; the last is `+Inf`'s own.
+    buckets: [AtomicU64; 11],
+    sum_us: AtomicU64,
+}
+
+impl Micros {
+    fn new(bounds: &'static [u64; 10]) -> Self {
+        Self { bounds, buckets: Default::default(), sum_us: AtomicU64::new(0) }
+    }
+
+    fn observe(&self, us: u64) {
+        let bucket = self.bounds.iter().position(|&bound| us <= bound).unwrap_or(self.bounds.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    fn render(&self, out: &mut String, name: &str, help: &str) {
+        render_buckets(out, name, help, self.bounds, &self.buckets, &self.sum_us, MILLIONTHS);
+    }
+}
+
+/// The two types `response_format` can ask for, in the order of the
+/// `type` label's series (#593).
+const STRUCTURED_KINDS: [StructuredKind; 2] = [StructuredKind::JsonObject, StructuredKind::JsonSchema];
+
 /// A fixed-bucket histogram over millisecond observations.
 #[derive(Debug)]
 struct Histogram {
@@ -682,6 +718,14 @@ pub struct Metrics {
     /// server/08). Absent from the exposition until the first one, like the
     /// decision family.
     thinking_forced_closes: AtomicU64,
+    /// Structured output (#593), per [`STRUCTURED_KINDS`]: the completed
+    /// requests held to a grammar, the draws it rejected and the repairs
+    /// that answered them. Absent until the first such request ends, then
+    /// whole, with the repair-time histogram.
+    structured_requests: [AtomicU64; STRUCTURED_KINDS.len()],
+    structured_misses: [AtomicU64; STRUCTURED_KINDS.len()],
+    structured_repairs: [AtomicU64; STRUCTURED_KINDS.len()],
+    structured_repair_time: Micros,
     /// The loop guard (GitHub #330): the requests it watched and those that
     /// looped, its loops per [`LoopOutcome::ALL`], the tokens its rewinds
     /// took back, and each watched request's lowest score. Absent from the
@@ -875,6 +919,10 @@ impl Metrics {
             decisions: Default::default(),
             answer_mass: Ratio::new(&ANSWER_MASS_BOUNDS),
             thinking_forced_closes: AtomicU64::new(0),
+            structured_requests: Default::default(),
+            structured_misses: Default::default(),
+            structured_repairs: Default::default(),
+            structured_repair_time: Micros::new(&REPAIR_BOUNDS_US),
             loop_guard_watched: AtomicU64::new(0),
             loop_guard_looped: AtomicU64::new(0),
             loop_guard_loops: Default::default(),
@@ -991,6 +1039,20 @@ impl Metrics {
     /// server/08).
     pub(crate) fn record_thinking_forced_close(&self) {
         self.thinking_forced_closes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A completed request held to a grammar (#593): counted by its type,
+    /// with the draws the grammar rejected and the time of each repair.
+    pub(crate) fn record_structured(&self, summary: &ignis_core::structured::StructuredSummary) {
+        let slot = STRUCTURED_KINDS.iter().position(|&kind| kind == summary.kind).unwrap_or(0);
+        for &us in &summary.repair_micros {
+            self.structured_repair_time.observe(u64::from(us));
+        }
+        self.structured_misses[slot].fetch_add(u64::from(summary.misses), Ordering::Relaxed);
+        self.structured_repairs[slot].fetch_add(u64::from(summary.repairs()), Ordering::Relaxed);
+        // The request counts last: a scrape between the writes never reads a
+        // miss of a request not yet counted as one.
+        self.structured_requests[slot].fetch_add(1, Ordering::Relaxed);
     }
 
     /// A request the loop guard watched ended (GitHub #330). Recorded by the
@@ -1593,6 +1655,37 @@ impl Metrics {
             );
             let _ = writeln!(out, "ignis_thinking_forced_closes_total {forced}");
         }
+        // #593: structured output, absent until a request held to a grammar
+        // ended, for the decision family's reason, then every series of it.
+        if self.structured_requests.iter().map(read).sum::<u64>() > 0 {
+            for (name, help, series) in [
+                (
+                    "ignis_structured_requests_total",
+                    "Completed requests held to a grammar, by the response_format type.",
+                    &self.structured_requests,
+                ),
+                (
+                    "ignis_structured_misses_total",
+                    "Draws of a structured answer the grammar rejected, by type.",
+                    &self.structured_misses,
+                ),
+                (
+                    "ignis_structured_repairs_total",
+                    "Rejected draws sampled again under the grammar, by type.",
+                    &self.structured_repairs,
+                ),
+            ] {
+                declare(&mut out, name, "counter", help);
+                for (kind, series) in STRUCTURED_KINDS.iter().zip(series) {
+                    let _ = writeln!(out, "{name}{{type=\"{}\"}} {}", kind.name(), read(series));
+                }
+            }
+            self.structured_repair_time.render(
+                &mut out,
+                "ignis_structured_repair_seconds",
+                "Time to repair one rejected draw of a structured answer.",
+            );
+        }
         // GitHub #330: the loop guard, absent until a request it watched
         // ended or it saw a loop (a load that runs it `off` exports nothing
         // of it), then the whole family: its zeros are what a quiet guard
@@ -2133,6 +2226,36 @@ mod tests {
         assert_eq!(value(&text, "ignis_retained_state_spills_total", "tier=\"disk\",kind=\"checkpoint\""), "1");
         assert_eq!(value(&text, "ignis_retained_reused_tokens_total", "tier=\"disk\",kind=\"checkpoint\""), "9000");
         assert_eq!(value(&text, "ignis_kv_disk_bytes", "state=\"used\""), "5368709120");
+    }
+
+    #[test]
+    fn structured_output_is_absent_until_a_request_held_to_a_grammar_ends() {
+        use ignis_core::structured::StructuredSummary;
+        let metrics = Metrics::new();
+        assert!(!metrics.render().contains("ignis_structured_"));
+        metrics.record_structured(&StructuredSummary {
+            kind: StructuredKind::JsonObject,
+            misses: 3,
+            repair_micros: vec![40, 300, 2_000],
+        });
+        let text = metrics.render();
+        declared_once(
+            &text,
+            &[
+                ("ignis_structured_requests_total", "counter"),
+                ("ignis_structured_misses_total", "counter"),
+                ("ignis_structured_repairs_total", "counter"),
+                ("ignis_structured_repair_seconds", "histogram"),
+            ],
+        );
+        assert_eq!(value(&text, "ignis_structured_requests_total", "type=\"json_object\""), "1");
+        assert_eq!(value(&text, "ignis_structured_requests_total", "type=\"json_schema\""), "0");
+        assert_eq!(value(&text, "ignis_structured_misses_total", "type=\"json_object\""), "3");
+        assert_eq!(value(&text, "ignis_structured_repairs_total", "type=\"json_object\""), "3");
+        assert_eq!(value(&text, "ignis_structured_repair_seconds_count", ""), "3");
+        assert_eq!(value(&text, "ignis_structured_repair_seconds_sum", ""), "0.00234");
+        assert_eq!(value(&text, "ignis_structured_repair_seconds_bucket", "le=\"0.00005\""), "1");
+        assert_eq!(value(&text, "ignis_structured_repair_seconds_bucket", "le=\"0.0005\""), "2");
     }
 
     #[test]

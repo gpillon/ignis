@@ -340,6 +340,16 @@ const ACTIVATIONS: &[Activation] = &[
         activate: |m| m.record_locate(LocateKind::Prose, LocateMethod::Shortlist, Compression::None, LocateFound::False),
     },
     Activation { when: "once the thinking budget has closed a reasoning block", activate: |m| m.record_thinking_forced_close() },
+    Activation {
+        when: "once a request held to a grammar (`response_format`) has ended",
+        activate: |m| {
+            m.record_structured(&ignis_core::structured::StructuredSummary {
+                kind: ignis_core::structured::StructuredKind::JsonObject,
+                misses: 1,
+                repair_micros: vec![100],
+            })
+        },
+    },
     Activation { when: "once the loop guard has watched a request", activate: |m| m.record_loop_guard_watched() },
     Activation {
         when: "after the first request that ran speculative verify rounds",

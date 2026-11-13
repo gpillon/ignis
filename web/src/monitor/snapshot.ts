@@ -246,6 +246,23 @@ export type LoopGuard = {
   minRatio: Histogram | null;
 };
 
+/** The types a `response_format` can ask for (#593): `ignis_structured_*`'s `type` label. */
+export const STRUCTURED_TYPES = ["json_object", "json_schema"] as const;
+export type StructuredType = (typeof STRUCTURED_TYPES)[number];
+
+/**
+ * Structured output (#593, ADR 0017's amendment of 2026-11-13): the completed
+ * requests held to a grammar, the draws it rejected and the repairs that
+ * answered them, by type, and how long a repair took. Absent until the first
+ * such request ended, so null on a server that never served one.
+ */
+export type StructuredOutput = {
+  requests: Record<StructuredType, number | null>;
+  misses: Record<StructuredType, number | null>;
+  repairs: Record<StructuredType, number | null>;
+  repairTime: Histogram | null;
+};
+
 /** A histogram: upper bounds in seconds ending in +Inf, their cumulative counts, the sum and the count. */
 export type Histogram = { bounds: number[]; cumulative: number[]; sum: number; count: number };
 
@@ -282,6 +299,8 @@ export type Snapshot = {
   speech: SpeechTranscriptions | null;
   /** Null until the guard watched a request, or with `loop_guard: off`. */
   loopGuard: LoopGuard | null;
+  /** Null until a request held to a grammar ended. */
+  structured: StructuredOutput | null;
   /** The thinking budget's own closes (GitHub #330); null until the first. Not the guard's `closed`. */
   thinkingForcedCloses: number | null;
   ttft: Histogram | null;
@@ -369,6 +388,14 @@ const LOOP_FAMILIES = {
   minRatio: "ignis_loop_guard_min_ratio",
 } as const;
 
+/** The structured-output families (#593). */
+const STRUCTURED_FAMILIES = {
+  requests: "ignis_structured_requests_total",
+  misses: "ignis_structured_misses_total",
+  repairs: "ignis_structured_repairs_total",
+  repairTime: "ignis_structured_repair_seconds",
+} as const;
+
 /** The thinking budget's forced closes (GitHub #330): absent until the first. */
 const THINKING_FORCED_CLOSES = "ignis_thinking_forced_closes_total";
 
@@ -401,6 +428,7 @@ const KNOWN = new Set<string>([
   ...Object.values(IMAGE_FAMILIES),
   ...Object.values(SPEECH_FAMILIES),
   ...Object.values(LOOP_FAMILIES),
+  ...Object.values(STRUCTURED_FAMILIES),
   THINKING_FORCED_CLOSES,
 ]);
 
@@ -441,6 +469,7 @@ export function emptySnapshot(): Snapshot {
     images: null,
     speech: null,
     loopGuard: null,
+    structured: null,
     thinkingForcedCloses: null,
     ttft: null,
     duration: null,
@@ -571,6 +600,17 @@ export function readSnapshot({ families }: Exposition): Snapshot {
       minRatio: readHistogram(samples(LOOP_FAMILIES.minRatio), LOOP_FAMILIES.minRatio),
     };
   }
+  // Structured output, all or nothing: the first request held to a grammar renders every series.
+  if (families.has(STRUCTURED_FAMILIES.requests)) {
+    const byType = (family: string) =>
+      Object.fromEntries(STRUCTURED_TYPES.map((type) => [type, valueOf(family, ["type", type])])) as Record<StructuredType, number | null>;
+    snap.structured = {
+      requests: byType(STRUCTURED_FAMILIES.requests),
+      misses: byType(STRUCTURED_FAMILIES.misses),
+      repairs: byType(STRUCTURED_FAMILIES.repairs),
+      repairTime: readHistogram(samples(STRUCTURED_FAMILIES.repairTime), STRUCTURED_FAMILIES.repairTime),
+    };
+  }
   snap.thinkingForcedCloses = valueOf(THINKING_FORCED_CLOSES);
 
   snap.ttft = readHistogram(samples("ignis_request_ttft_seconds"), "ignis_request_ttft_seconds");
@@ -601,7 +641,12 @@ function inContract(family: string, s: Sample): boolean {
     case IMAGE_FAMILIES.duration:
     case SPEECH_FAMILIES.wait:
     case LOOP_FAMILIES.minRatio:
+    case STRUCTURED_FAMILIES.repairTime:
       return true;
+    case STRUCTURED_FAMILIES.requests:
+    case STRUCTURED_FAMILIES.misses:
+    case STRUCTURED_FAMILIES.repairs:
+      return oneOf(STRUCTURED_TYPES, s.labels.type) && Object.keys(s.labels).length === 1;
     case LOOP_FAMILIES.loops:
       return oneOf(LOOP_OUTCOMES, s.labels.outcome) && Object.keys(s.labels).length === 1;
     case IMAGE_FAMILIES.jobs:
@@ -685,6 +730,8 @@ export function counterValues(s: Snapshot): (number | null)[] {
     ...LOOP_OUTCOMES.map((outcome) => s.loopGuard?.loops[outcome] ?? null),
     s.loopGuard?.rewoundTokens ?? null,
     s.loopGuard?.minRatio?.count ?? null,
+    ...STRUCTURED_TYPES.flatMap((type) => [s.structured?.requests[type] ?? null, s.structured?.misses[type] ?? null, s.structured?.repairs[type] ?? null]),
+    s.structured?.repairTime?.count ?? null,
     s.thinkingForcedCloses,
     s.ttft?.count ?? null,
     s.duration?.count ?? null,

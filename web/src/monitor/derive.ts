@@ -31,6 +31,7 @@ import {
   SLOT_SKIP_REASONS,
   type SlotSkipReason,
   type Snapshot,
+  STRUCTURED_TYPES,
   VRAM_LINES,
   type VramLine,
 } from "./snapshot.ts";
@@ -228,6 +229,24 @@ export type Speech = {
 };
 
 /**
+ * The Structured output card's figures (#593): the requests held to a grammar,
+ * the draws it rejected and the repairs, over the window, and how long a repair
+ * took. Misses per request is a plain ratio, which a sloppy prompt can push
+ * above one.
+ */
+export type StructuredOutputCard = {
+  requests: Tally;
+  misses: Tally;
+  repairs: Tally;
+  /** Misses over requests in the window; null with no request in it. */
+  missesPerRequest: number | null;
+  /** Repair times over the window, in seconds. */
+  repairTime: Histogram | null;
+  repairP50: number | null;
+  repairP95: number | null;
+};
+
+/**
  * The reasoning's two ways of being cut short over the window (GitHub #330):
  * the loop guard's rewinds and the thinking budget's forced closes. Shares are
  * computed here from the counters, since the server exports none. The guard's
@@ -302,6 +321,8 @@ export type Dashboard = {
   speech: Speech | null;
   /** Null until the loop guard watched a request or the thinking budget closed one. */
   reasoning: Reasoning | null;
+  /** Null until a request held to a grammar ended. */
+  structured: StructuredOutputCard | null;
   health: Health;
 };
 
@@ -530,6 +551,7 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
         }
       : null,
     reasoning: last.loopGuard || last.thinkingForcedCloses !== null ? deriveReasoning(points, from) : null,
+    structured: last.structured ? deriveStructured(points, from) : null,
     health: { level: "idle", summary: "", notes: [] },
   };
   dash.health = assessHealth({
@@ -630,6 +652,27 @@ export function deriveNgram(points: Point[], since: number): Ngram {
     readBytes: tally((s) => s.ngram?.readBytes ?? null),
     readBytesPerSec: readBytesRate.at(-1) ?? null,
     readBytesPerSecSeries: readBytesRate,
+  };
+}
+
+/** The Structured output card's figures (#593). */
+export function deriveStructured(points: Point[], since: number): StructuredOutputCard {
+  const last = points.at(-1)?.snap ?? emptySnapshot();
+  const tally = (pick: CounterPick): Tally => ({ total: pick(last), window: increaseOver(points, pick, since) });
+  const sum = (family: "requests" | "misses" | "repairs"): CounterPick => (s) =>
+    s.structured ? sumKnown(STRUCTURED_TYPES.map((type) => s.structured![family][type])) : null;
+  const requests = tally(sum("requests"));
+  const misses = tally(sum("misses"));
+  const repairTime = windowHistogram(points, (s) => s.structured?.repairTime ?? null, since);
+  const has = repairTime !== null && repairTime.count > 0;
+  return {
+    requests,
+    misses,
+    repairs: tally(sum("repairs")),
+    missesPerRequest: misses.window !== null && requests.window ? misses.window / requests.window : null,
+    repairTime,
+    repairP50: has ? histogramQuantile(0.5, repairTime) : null,
+    repairP95: has ? histogramQuantile(0.95, repairTime) : null,
   };
 }
 
