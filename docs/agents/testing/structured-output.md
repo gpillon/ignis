@@ -104,9 +104,17 @@ The measured figures are in
   job, the EOS as a stop, and is committed as far as the host kept it.
 - **On the GPU** (27B, greedy): the served answers -- three `json_object`
   prompts and every case of the corpus, each schema compiled strict and not
-  described in the prompt -- with DFlash2 off and on equal each other and the
-  per-token masked argmax of the prefill route's readouts, up to a near-tie
-  both routes call one. Ignored outside the GPU profile:
+  described in the prompt. With DFlash2 off each equals the per-token masked
+  argmax of the prefill route's readouts, up to a near-tie both prefill
+  routes call one. With DFlash2 on each equals the answer with it off, or
+  parts from it at such a near-tie, and equals exactly the per-token masked
+  argmax of the verify route's own scores: the answer teacher-forced through
+  verify rounds at width 1 (`step::decode_program_verify_forced`), each
+  column read (`dflash2_readout::verify_logits`). A verify column's scores
+  are the same bit for bit whichever round it falls in, but they part from
+  both prefill routes' by more than a near-tie, so a speculative answer is
+  never held to the prefill routes past the point where it parts from the
+  answer with speculation off. Ignored outside the GPU profile:
 
   ```sh
   cargo test -p ignis-server --features cuda --test structured_output_gpu -- --ignored --nocapture
@@ -129,10 +137,12 @@ repaired from the verify pass's scores, as a plain round's draw is.
   `kernel/tests/test_reasoning_redirect.cpp`):
   `ctest --test-dir kernel/build -R ignis_kernel_reasoning_redirect_test`.
 - **On the GPU**, beside the served test above (`verify_cut_gpu`): three
-  DFlash2 lanes, one held to `json_object`. The free lanes verify and commit
-  what they do beside a free lane, every round replays its verify graph, each
-  repair after a cut is the masked argmax of the verify column that drew it,
-  and a run was cut inside:
+  DFlash2 lanes, one held to a strict schema whose keys the model does not
+  guess (under `json_object` its own object passes draft after draft, and no
+  run is cut inside). The free lanes verify and commit what they do beside a
+  free lane, every round replays its verify graph, each repair after a cut
+  is the masked argmax of the verify column that drew it, and a run was cut
+  inside:
 
   ```sh
   cargo test -p ignis-core --features cuda --test verify_cut_gpu -- --ignored --nocapture
