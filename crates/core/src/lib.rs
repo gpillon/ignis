@@ -97,6 +97,9 @@ pub mod residency;
 pub mod residual_tap;
 pub mod retained_slot;
 pub mod rope_scaling;
+// GitHub #575 (spec #574): the sampled draft's rule as a host reference, no
+// GPU in it, for the device kernels to be held to.
+pub mod sampled_draft;
 pub mod scheduler;
 #[cfg(feature = "cuda")]
 pub mod seq;
