@@ -56,7 +56,8 @@ use crate::scheduler::PendingToken;
 use crate::types::TokenId;
 
 /// What a request asked its answer to be: the type its `response_format`
-/// named, and the label its metrics and its log event carry (#593).
+/// named, and the label the server's telemetry and its log event carry
+/// (#593).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructuredKind {
     /// Any JSON object (`json_object`).
