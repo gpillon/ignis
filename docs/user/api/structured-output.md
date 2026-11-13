@@ -70,11 +70,19 @@ way: the close is the server's text, and the answer after it is held. With
 
 ## Speed and speculation
 
-While a structured request decodes, its rounds run without speculation, as a
-forced tool call's do, and so do the rounds of the requests decoding beside
-it. Each token of the answer is checked before the next round, and that needs
-the round's own scores, which only a plain round keeps. A later release keeps
-speculation on for structured output (GitHub #590).
+[Speculative decoding](../concepts/speculative-decoding.md) stays on for a
+structured request. In each verify round the drafts the model accepted are
+checked against the grammar before the round commits them: the run is kept up
+to its first miss, and that token is repaired from the scores the round has
+already computed for it. The drafts before the miss are kept, and only the
+ones after it are lost, to be drafted again in the next round. Greedy answers
+are the same with speculation on and off, up to the near-ties any request
+has.
+
+The requests decoding beside a structured one are not touched: they keep
+every draft they would have kept, and the round runs as it does without the
+structured request. The only extra work is the check on the structured
+request's own tokens, and a round with no structured request in it does none.
 
 ## What is refused
 

@@ -72,4 +72,18 @@ inline IgnisRoundCut ignis_cut_and_redirect(const int32_t *run, int32_t run_coun
   return {run_count, draw, false};
 }
 
+/* GitHub #590 (spec #287): a verify commit whose cut the host decides
+ * (`ignis_decode_options::host_cut`). The host keeps the first `keep` tokens
+ * of the run (1..run_count): the run is cut there, with `licensed[keep - 1]`
+ * -- the draft `run[keep]`, or the round's correction or bonus token when the
+ * host keeps it whole -- as its draw, and then cut as any run is, so a stop id
+ * or the redirect before the host's cut still cuts first. `licensed[j]` is
+ * the successor of `run[j]`, the verify round's licensed row. A keep of
+ * `run_count` is the cut the round makes without the host. */
+inline IgnisRoundCut ignis_cut_host_kept_run(const int32_t *run, const int32_t *licensed, int32_t keep,
+                                             const int32_t *stop_ids, uint32_t stop_count,
+                                             int32_t close_id) {
+  return ignis_cut_and_redirect(run, keep, licensed[keep - 1], stop_ids, stop_count, close_id);
+}
+
 #endif /* IGNIS_REASONING_REDIRECT_H */

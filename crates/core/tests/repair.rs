@@ -198,8 +198,9 @@ fn the_scores_last_until_the_next_call_on_the_backend() {
     assert!(compute.repair(&repair_to(&[2])).is_ok(), "and again, from the same scores, before the next call");
 }
 
-/// A verify round's draw keeps no scores a repair reads: the verify commit
-/// whose cut the host decides repairs those (#590).
+/// A verify round's draw keeps no scores a repair reads -- unless the host
+/// decided its cut (#590, `structured_verify_cut.rs`), which this round's
+/// unchecked lane did not.
 #[test]
 fn a_speculative_rounds_draw_keeps_no_scores() {
     let compute = MockCompute::with_runs(&[3]);

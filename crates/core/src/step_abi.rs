@@ -44,6 +44,15 @@ pub struct IgnisDecodeOptions {
     /// `[batch][window + 1]`, or null -- see
     /// `step::decode_program_verify_forced`.
     pub forced_tokens: *const i32,
+    /// GitHub #590: per lane, 1 when the verify commit's cut is the host's
+    /// (`host_cut`), else 0; null with `host_cut` for none.
+    pub host_cut_lanes: *const u8,
+    /// GitHub #590: the host's cut of a lane's verified run -- `run` is its
+    /// anchor and accepted drafts, `run_count` of them -- returning how many
+    /// of them the commit keeps (1..=run_count), negative on a failure. See
+    /// `step::decode_program_verify_cut`.
+    pub host_cut: Option<unsafe extern "C" fn(*mut std::ffi::c_void, u64, *const i32, i32) -> i32>,
+    pub host_cut_context: *mut std::ffi::c_void,
 }
 
 /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
@@ -145,9 +154,12 @@ mod tests {
     /// (kernel/include/ignis_step.h) and refuses any other `size`.
     #[test]
     fn the_decode_options_mirror_is_the_leaf_structs_layout() {
-        assert_eq!(std::mem::size_of::<IgnisDecodeOptions>(), 88);
+        assert_eq!(std::mem::size_of::<IgnisDecodeOptions>(), 112);
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, out_logits), 72);
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, forced_tokens), 80);
+        assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, host_cut_lanes), 88);
+        assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, host_cut), 96);
+        assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, host_cut_context), 104);
     }
 
     /// GitHub #520: `keeps_draw` filled the tail padding after

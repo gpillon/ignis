@@ -55,6 +55,9 @@ struct Calls {
     decode_closes: Vec<Vec<Option<u32>>>,
     /// GitHub #587: whether each lane of each round was checked, in order.
     decode_checked: Vec<Vec<bool>>,
+    /// GitHub #590: each run the host cut -- the lane, the run it was shown,
+    /// and what it kept -- in order.
+    host_cuts: Vec<(usize, Vec<u32>, usize)>,
     /// P4-10 (GitHub #126): the prefixes published (their token counts) and
     /// the claims served (the context each claimant reserved), so a test can
     /// see that a claimant was allocated *against* a prefix rather than
@@ -649,6 +652,31 @@ impl StepLeaf for StubLeaf {
             .collect())
     }
 
+    // GitHub #590: a leaf with a host cut shows each checked lane its run --
+    // the run this stub commits -- and commits as much of it as the host keeps.
+    fn decode_cut(
+        &self,
+        model: &Self::Model,
+        sequences: &mut [&mut Self::Sequence],
+        lanes: &[DecodeLane<'_>],
+        cut: &mut dyn FnMut(usize, &[u32]) -> usize,
+    ) -> Result<Vec<LaneRun>, i32> {
+        let runs = self.decode(model, sequences, lanes)?;
+        Ok(runs
+            .into_iter()
+            .zip(lanes)
+            .enumerate()
+            .map(|(lane, (mut run, decoded))| {
+                if decoded.checked {
+                    let keep = cut(lane, &run.tokens);
+                    self.calls.lock().unwrap().host_cuts.push((lane, run.tokens.clone(), keep));
+                    run.tokens.truncate(keep);
+                }
+                run
+            })
+            .collect())
+    }
+
     fn alloc_snapshot_buf(&self, bytes: u64) -> Result<Self::SnapshotBuf, i32> {
         Ok(vec![0u8; bytes as usize])
     }
@@ -923,6 +951,46 @@ fn a_checked_lane_reports_its_waiting_draw_and_the_eos_as_a_stop() {
     assert_eq!(before_eos.tokens, vec![13]);
     assert_eq!(before_eos.waiting, Some(ignis_core::WaitingDraw::Stop), "the waiting EOS, by name");
     assert_eq!(leaf.calls.lock().unwrap().decode_checked, vec![vec![false], vec![true], vec![true]]);
+}
+
+/// GitHub #590 (spec #287): through `decode_step_cut` the leaf cuts a checked
+/// lane's verified run where the host says. The host reads the run by its
+/// job -- not by the leaf's lane, which skips a job already at its cap --
+/// with the EOS as a stop; it is never shown an unchecked lane, and the lane
+/// emits as much of the run as it kept.
+#[test]
+fn a_checked_lanes_verified_run_is_cut_where_the_host_says() {
+    let run = |tokens: &[u32]| LaneRun { tokens: tokens.to_vec(), spec: None, drawn_probability: None, redirected: false };
+    let leaf = Arc::new(StubLeaf::with_runs([run(&[11]), run(&[12]), run(&[21, 22]), run(&[41]), run(&[31, 32, 99, 33])]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    compute.prefill_step(&[prefill(1, Some(1)), prefill(2, Some(8)), prefill(3, Some(8))]).unwrap();
+    let jobs = |params_1: DecodeParams| {
+        vec![
+            job(1, params_1, 8),
+            job(2, DecodeParams::default(), 8),
+            DecodeJob { checked: true, ..job(3, DecodeParams::default(), 8) },
+        ]
+    };
+    // The first round has no cut: the checked lane's run is the leaf's own.
+    let first = compute.decode_step(&jobs(DecodeParams { max_tokens: Some(1), ..DecodeParams::default() })).unwrap();
+    assert_eq!(first.iter().map(|o| o.tokens.clone()).collect::<Vec<_>>(), vec![vec![11], vec![12], vec![21, 22]]);
+    assert!(leaf.calls.lock().unwrap().host_cuts.is_empty(), "no host cut without decode_step_cut");
+
+    // Request 1 is at its cap: the leaf's lane 1 is job 2.
+    let mut shown = Vec::new();
+    let second = compute
+        .decode_step_cut(&jobs(DecodeParams { max_tokens: Some(1), ..DecodeParams::default() }), &mut |job, run| {
+            shown.push((job, run.to_vec()));
+            2
+        })
+        .unwrap();
+    use ignis_core::WaitingDraw::{Stop, Token};
+    assert_eq!(shown, vec![(2, vec![Token(31), Token(32), Stop, Token(33)])], "job 2's run, the EOS as a stop");
+    assert_eq!(second[0].finish, Some(FinishReason::Length));
+    assert_eq!(second[1].tokens, vec![41], "an unchecked lane's run, untouched");
+    assert_eq!(second[2].tokens, vec![31, 32], "the run as far as the host kept it");
+    assert_eq!(leaf.calls.lock().unwrap().host_cuts, vec![(1, vec![31, 32, 99, 33], 2)]);
 }
 
 /// GitHub #286: the round after a forced run's last set carries none, so a

@@ -13,6 +13,14 @@
 //! one masking every step gives; a check costs about a microsecond and only
 //! a miss sends anything down.
 //!
+//! # Speculation stays on
+//!
+//! A verify round's drafts are checked before they are committed (GitHub
+//! #590, [`GrammarState::check_run`]): the host's cut keeps the run up to its
+//! first draft that does not pass, which then waits as the round's draw and
+//! is held like any other -- repaired from the verify pass's scores on a
+//! miss, or the request ended on a stop where the answer is complete.
+//!
 //! # Where the answer starts
 //!
 //! With the generation starting inside the reasoning block, at the token
@@ -154,6 +162,40 @@ impl GrammarState {
         if !self.open && self.think_end.is_some_and(|close| tokens.contains(&close)) {
             self.open = true;
         }
+    }
+
+    /// Check a verify round's run before it is committed (GitHub #590): its
+    /// anchor -- the last waiting draw, already held -- then the drafts the
+    /// target accepted. Returns how many of the run's tokens the commit
+    /// keeps, at least the anchor: every draft that passes as an ordinary
+    /// token is the grammar's from then on, and the first that does not --
+    /// a miss, or a stop -- is where the run is cut. That draft then waits
+    /// as the round's draw, and is held as every waiting draw is
+    /// ([`GrammarState::check`]): repaired, or the request ended.
+    ///
+    /// Before the answer starts nothing is checked, but a reasoning close in
+    /// the run opens it at the token after; a stop there is the leaf's to cut
+    /// or redirect, and the rest of the run is left to it whole.
+    pub fn check_run(&mut self, run: &[WaitingDraw]) -> usize {
+        for (index, &draw) in run.iter().enumerate() {
+            let token = match draw {
+                WaitingDraw::Token(token) => token,
+                WaitingDraw::Stop if self.open && index > 0 => return index,
+                WaitingDraw::Stop => return run.len(),
+            };
+            if !self.open {
+                self.open = self.think_end == Some(token);
+                continue;
+            }
+            // The anchor was held when it was drawn.
+            if index == 0 {
+                continue;
+            }
+            if self.matcher.grammar().vocab().is_stop(token) || !self.matcher.accept(token) {
+                return index;
+            }
+        }
+        run.len()
     }
 
     /// Check a waiting draw of the answer, and take it when it passes.

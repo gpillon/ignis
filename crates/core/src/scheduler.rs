@@ -291,13 +291,15 @@ pub struct DecodeJob {
     pub anchor_emitted: bool,
     /// The host **checks** the draw this round makes before the next round
     /// consumes it (GitHub #587, spec #287): the request's answer is held to
-    /// a **grammar** ([`crate::structured`]). The lane runs a plain round --
-    /// one token, no drafts -- so the draw keeps the scores a repair reads,
-    /// and [`DecodeOutcome::waiting`] reports the draw.
+    /// a **grammar** ([`crate::structured`]), and [`DecodeOutcome::waiting`]
+    /// reports the draw, which keeps the scores a repair reads.
     ///
-    /// A plain round is the rule for now, as a permitted set's is: the
-    /// verify commit whose cut the host decides (#590) lifts it. `false` on
-    /// every other lane, which pays nothing for the field.
+    /// Through [`Compute::decode_step_cut`] the lane keeps speculation
+    /// (GitHub #590): a verify round's run is checked before it is committed,
+    /// cut at its first draft that does not pass, and that draft waits. Through
+    /// [`Compute::decode_step`], or on a backend with no host cut, the lane
+    /// runs a plain round -- one token, no drafts. `false` on every other
+    /// lane, which pays nothing for the field.
     pub checked: bool,
 }
 
@@ -716,6 +718,32 @@ pub trait Compute: Send + Sync {
     /// (EOS or `max_tokens`), why.
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError>;
 
+    /// [`Compute::decode_step`] with a **verify commit whose cut the host
+    /// decides** (GitHub #590, spec #287, ADR 0089) on every
+    /// [`DecodeJob::checked`] lane, which then keeps speculation. After a
+    /// verify round's pass and before anything is committed, `cut(job, run)`
+    /// sees that lane's run -- its anchor, then the drafts the target
+    /// accepted, each as the host checks a draw (the EOS as
+    /// [`WaitingDraw::Stop`]) -- and returns how many of its tokens the commit
+    /// keeps, `1..=run.len()`. The draft after them is the round's waiting
+    /// draw ([`DecodeOutcome::waiting`]), kept with the scores of its column,
+    /// so [`Compute::repair`] repairs it as it repairs a plain round's; kept
+    /// whole, the run's own successor waits. A stop or the reasoning redirect
+    /// still cut where they fall. `job` indexes `jobs`.
+    ///
+    /// A checked lane in a plain round is never shown to `cut`. No other
+    /// lane's round changes: an unchecked lane keeps its drafts and the round
+    /// its graph. The default is a backend with no host cut, whose
+    /// [`Compute::decode_step`] runs a checked lane's round plain (the mock
+    /// wrappers', and Flash-Next's for now, #581).
+    fn decode_step_cut(
+        &self,
+        jobs: &[DecodeJob],
+        _cut: &mut dyn FnMut(usize, &[WaitingDraw]) -> usize,
+    ) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        self.decode_step(jobs)
+    }
+
     /// **Repair** a request's position (GitHub #586, spec #287): its waiting
     /// draw — what its last prefill (the prompt's last job, whose draw
     /// [`PrefillOutcome::emitted`] reports) or its last plain round drew, and
@@ -735,11 +763,11 @@ pub trait Compute: Send + Sync {
     ///
     /// The kept scores last until the backend's next prefill or round, so a
     /// caller repairs right after the call that drew. A verify round's draw
-    /// keeps none a repair reads (a verify commit whose cut the host decides
-    /// repairs those, #590), and neither does a redirected draw. Refused
-    /// then, as on a request with no waiting draw and on a backend that keeps
-    /// no scores — the default, and Flash-Next's for now (#581) — with the
-    /// request's state as it was.
+    /// keeps them only on a lane whose cut the host decided
+    /// ([`Compute::decode_step_cut`], #590), and a redirected draw never
+    /// does. Refused then, as on a request with no waiting draw and on a
+    /// backend that keeps no scores — the default, and Flash-Next's for now
+    /// (#581) — with the request's state as it was.
     fn repair(&self, _job: &RepairJob) -> Result<TokenId, ComputeError> {
         Err(ComputeError::Kernel(-1))
     }

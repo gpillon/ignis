@@ -1,7 +1,8 @@
 // GitHub #315 (ADR 0048): the reasoning redirect's cut -- OURS. The one host
 // function both leaves call wherever they assign a successor
 // (kernel/include/ignis_reasoning_redirect.h): the prefill's draw, the plain
-// round, the verify round's commit.
+// round, the verify round's commit -- and (GitHub #590) the verify commit
+// whose cut the host decides.
 //
 // Pure host arithmetic over token ids, and built without any CUDA library
 // (kernel/tests/CMakeLists.txt links nothing), so this test can create no
@@ -107,6 +108,36 @@ int main() {
       const IgnisRoundCut want = today(run, draw);
       expect(is(got, want.committed, want.next_pending, false), "reasoning_close_id -1 is today's cut");
     }
+  }
+
+  // ---- GitHub #590: a verify commit whose cut the host decides ---------------
+  // The run `{anchor, d1, d2, d3}` and its licensed row `{d1, d2, d3, t}`: the
+  // host keeps a prefix, and the draft after it waits as the pending token.
+  {
+    const std::vector<int32_t> run = {5, 6, 7, 8};
+    const std::vector<int32_t> licensed = {6, 7, 8, 40};
+    const auto kept = [&](int32_t keep, int32_t close_id) {
+      return ignis_cut_host_kept_run(run.data(), licensed.data(), keep, kStops.data(),
+                                     static_cast<uint32_t>(kStops.size()), close_id);
+    };
+    expect(is(kept(4, -1), 4, 40, false), "a host keeping the whole run is the round's own cut");
+    expect(is(kept(2, -1), 2, 7, false), "a host cut at 2 commits the anchor and d1, and d2 waits");
+    expect(is(kept(1, -1), 1, 6, false), "a host cut at 1 commits the anchor alone, and d1 waits");
+    expect(is(kept(2, kThinkEnd), 2, 7, false), "a host cut with the block open and no stop redirects nothing");
+  }
+  {
+    // A stop before the host's cut still cuts first; one at the cut waits.
+    const std::vector<int32_t> run = {5, kEos, 7, 8};
+    const std::vector<int32_t> licensed = {kEos, 7, 8, 40};
+    const auto kept = [&](int32_t keep, int32_t close_id) {
+      return ignis_cut_host_kept_run(run.data(), licensed.data(), keep, kStops.data(),
+                                     static_cast<uint32_t>(kStops.size()), close_id);
+    };
+    expect(is(kept(4, -1), 2, 7, false), "a stop draft inside the kept run cuts inclusively");
+    expect(is(kept(1, -1), 1, kEos, false), "a host cut just before a stop draft leaves the stop waiting");
+    expect(is(kept(1, kThinkEnd), 1, kThinkEnd, true),
+           "with the block open, a stop the host left waiting is still redirected");
+    expect(is(kept(4, kThinkEnd), 1, kThinkEnd, true), "with the block open, the stop draft still cuts before");
   }
 
   if (failures != 0) {

@@ -658,15 +658,46 @@ struct ignis_decode_options {
    * and only on the 27B: a Flash-Next load refuses it. NULL: the accept kernel
    * decides, as always. */
   const int32_t *forced_tokens; /* [batch_size][speculative_window + 1], or NULL */
+  /* GitHub #590 (spec #287, ADR 0089): a **verify commit whose cut the host
+   * decides**, for the lanes `host_cut_lanes` names (1; 0 for every other).
+   * After the pass, and before anything is committed, the leaf hands
+   * `host_cut` each such lane's run -- its anchor, then the drafts the target
+   * accepted, `run_count` tokens -- and the host returns how many of them the
+   * commit keeps, 1..run_count. The run is cut there as any run is
+   * (ignis_reasoning_redirect.h): kept whole, its successor (the correction
+   * or bonus token) is the lane's pending token as always; cut at `j`, the
+   * draft at `run[j]` is. The first stop id and the reasoning redirect still
+   * cut where they fall, so a host keep only ever shortens the run. A
+   * check-first caller (a grammar) keeps the run up to its first **miss**, and
+   * the miss waits as the pending token to be repaired.
+   *
+   * Such a lane's pending token keeps the scores it was drawn from -- the
+   * verify logits' column the cut ended at -- so `ignis_program_repair` draws
+   * it again from them, as a plain round's draw (the redirect's `</think>`
+   * keeps none). Every other lane's round is the one it always was: no call,
+   * no copy, no synchronize, and the round replays its verify graph as it
+   * would without the host. `host_cut` is called on the calling thread,
+   * synchronously, between the round's two synchronizes; it must not call
+   * back into the leaf. A negative return, or one outside 1..run_count, fails
+   * the round with every lane as it was. Only a 27B verify round takes a
+   * host cut: a plain round, a teacher-forced one and a Flash-Next load
+   * refuse it (#581). All three NULL: no host cut. */
+  const uint8_t *host_cut_lanes; /* [batch_size], or NULL */
+  int32_t (*host_cut)(void *context, uint64_t lane, const int32_t *run, int32_t run_count);
+  void *host_cut_context;
 };
 
 #ifdef __cplusplus
 /* Beside the `size` check, both sides pin the layout (here, and
  * crates/core/src/step_abi.rs's mirror test, on CPU): GitHub #267 appended
- * `forced_tokens` last, after every field the serving path sets. */
-static_assert(sizeof(struct ignis_decode_options) == 88 &&
+ * `forced_tokens` after every field the serving path sets, and GitHub #590
+ * the host cut after it. */
+static_assert(sizeof(struct ignis_decode_options) == 112 &&
                   offsetof(struct ignis_decode_options, out_logits) == 72 &&
-                  offsetof(struct ignis_decode_options, forced_tokens) == 80,
+                  offsetof(struct ignis_decode_options, forced_tokens) == 80 &&
+                  offsetof(struct ignis_decode_options, host_cut_lanes) == 88 &&
+                  offsetof(struct ignis_decode_options, host_cut) == 96 &&
+                  offsetof(struct ignis_decode_options, host_cut_context) == 104,
               "ignis_decode_options drifted from crates/core/src/step_abi.rs IgnisDecodeOptions");
 #endif
 
@@ -722,12 +753,15 @@ int32_t ignis_program_decode(struct ignis_model *model, struct ignis_seq_pool *p
  * the decode logits' column of the sequence's slot, on a slot inside the
  * load's decode lanes) and a plain round's (its lane column, as the round
  * left it -- a lane the round masked with a short set keeps the masked row,
- * so a repair there draws from both sets' meeting). Not a verify round's
- * draw, nor a redirected one, nor that of a sequence restored, cloned or
- * claimed since: a repair of those is refused. The scores last until a later
- * round or prefill draw writes their column, after which a repair is refused
- * as well -- a caller repairs right after the call that drew, before the
- * next call on the model. A Flash-Next load refuses every repair (#581).
+ * so a repair there draws from both sets' meeting). GitHub #590: and the
+ * draw a verify round left pending on a lane whose commit the host cut
+ * (`ignis_decode_options::host_cut`), from the verify logits' column the cut
+ * ended at. Not another verify round's draw, nor a redirected one, nor that
+ * of a sequence restored, cloned or claimed since: a repair of those is
+ * refused. The scores last until a later round or prefill draw writes their
+ * column (a verify round's: the next verify round), after which a repair is
+ * refused as well -- a caller repairs right after the call that drew, before
+ * the next call on the model. A Flash-Next load refuses every repair (#581).
  *
  * `sampling` is the lane's own (`permitted_count` 0, `reasoning_close_id`
  * -1; stop ids and the budget are unread): greedy takes the mask's argmax

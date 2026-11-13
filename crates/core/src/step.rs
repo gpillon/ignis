@@ -1152,6 +1152,9 @@ fn program_round(
         out_reasoning_redirected: redirected.as_mut_ptr(),
         out_logits,
         forced_tokens: std::ptr::null(),
+        host_cut_lanes: std::ptr::null(),
+        host_cut: None,
+        host_cut_context: std::ptr::null_mut(),
     };
     let mut tokens = vec![-1; handles.len()];
     let rc = unsafe {
@@ -1462,7 +1465,93 @@ pub fn decode_program_verify_runs(
     lanes: &[VerifyLane<'_>],
     window: u32,
 ) -> Result<Vec<LaneVerifyRun>, String> {
-    verify_round(model, pool, sequences, lanes, window, std::ptr::null(), std::ptr::null_mut(), std::ptr::null())
+    verify_round(model, pool, sequences, lanes, window, std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), None)
+}
+
+/// [`decode_program_verify_runs`] with a **verify commit whose cut the host
+/// decides** (GitHub #590, spec #287, ADR 0089) on every lane `host_cut_lanes`
+/// marks. After the pass, before anything is committed, `cut(lane, run)` sees
+/// that lane's run -- its anchor, then the drafts the target accepted -- and
+/// returns how many of its tokens the commit keeps, `1..=run.len()`. The
+/// draft after them waits as the lane's pending token (the round's correction
+/// or bonus token when the run is kept whole), and keeps the scores of the
+/// column it was drawn at, so [`repair_program`] draws it again from them as
+/// it does a plain round's draw. A stop id or the reasoning redirect still
+/// cut where they fall: the host only ever shortens a run.
+///
+/// A check-first caller keeps each run up to its grammar's first **miss**
+/// and repairs the miss, which then waits. Every lane the host does not cut
+/// runs the round it always did, and the round replays its verify graph as
+/// it would without the host. `cut` runs on this thread, inside the leaf's
+/// call; a keep outside the range, or a panic in `cut`, fails the round with
+/// every lane as it was (the panic resumes here). Only a 27B load with a
+/// draft window takes a host cut; Flash-Next refuses it (#581).
+pub fn decode_program_verify_cut(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    lanes: &[VerifyLane<'_>],
+    window: u32,
+    host_cut_lanes: &[bool],
+    cut: &mut dyn FnMut(usize, &[i32]) -> usize,
+) -> Result<Vec<LaneVerifyRun>, String> {
+    if host_cut_lanes.len() != sequences.len() {
+        return Err(format!(
+            "decode_program_verify_cut: {} host-cut flags for {} sequences",
+            host_cut_lanes.len(),
+            sequences.len()
+        ));
+    }
+    let flags: Vec<u8> = host_cut_lanes.iter().map(|&cut| u8::from(cut)).collect();
+    let mut context = HostCutContext { cut, panic: None };
+    let runs = verify_round(
+        model,
+        pool,
+        sequences,
+        lanes,
+        window,
+        std::ptr::null(),
+        std::ptr::null_mut(),
+        std::ptr::null(),
+        Some((&flags, &mut context)),
+    );
+    if let Some(payload) = context.panic.take() {
+        std::panic::resume_unwind(payload);
+    }
+    runs
+}
+
+/// GitHub #590: what the leaf's host-cut callback reaches -- the caller's
+/// cut, and a panic it raised, which must not unwind through the leaf and is
+/// resumed once the leaf has returned.
+struct HostCutContext<'a> {
+    cut: &'a mut dyn FnMut(usize, &[i32]) -> usize,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+/// GitHub #590: `ignis_decode_options::host_cut`, calling the
+/// [`HostCutContext`] the options carry.
+unsafe extern "C" fn host_cut_trampoline(
+    context: *mut std::ffi::c_void,
+    lane: u64,
+    run: *const i32,
+    run_count: i32,
+) -> i32 {
+    // SAFETY: the leaf hands back the context `decode_program_verify_cut`
+    // put in the options, alive for the call, on the calling thread.
+    let context = unsafe { &mut *(context as *mut HostCutContext<'_>) };
+    if context.panic.is_some() || run.is_null() || run_count < 1 {
+        return -1;
+    }
+    // SAFETY: the leaf's run is `run_count` tokens, alive for this call.
+    let run = unsafe { std::slice::from_raw_parts(run, run_count as usize) };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (context.cut)(lane as usize, run))) {
+        Ok(keep) => i32::try_from(keep).unwrap_or(-1),
+        Err(payload) => {
+            context.panic = Some(payload);
+            -1
+        }
+    }
 }
 
 /// [`decode_program_verify_runs`], **teacher-forced** (GitHub #267): the
@@ -1505,7 +1594,7 @@ pub fn decode_program_verify_forced(
         ));
     }
     let flat: Vec<i32> = forced.iter().flat_map(|run| run.iter().copied()).collect();
-    verify_round(model, pool, sequences, lanes, window, std::ptr::null(), std::ptr::null_mut(), flat.as_ptr())
+    verify_round(model, pool, sequences, lanes, window, std::ptr::null(), std::ptr::null_mut(), flat.as_ptr(), None)
 }
 
 /// GitHub #307 (spec flash-next/07): one Flash-Next verify round at the
@@ -1539,7 +1628,7 @@ pub fn decode_flash_next_verify(
     }
     let out_logits =
         out_logits_ptr(out_logits, sequences.len() * columns, flash_next_vocab(), "decode_flash_next_verify")?;
-    verify_round(model, pool, sequences, lanes, window, ngram_rows.as_ptr(), out_logits, std::ptr::null())
+    verify_round(model, pool, sequences, lanes, window, ngram_rows.as_ptr(), out_logits, std::ptr::null(), None)
 }
 
 fn verify_round(
@@ -1551,6 +1640,7 @@ fn verify_round(
     ngram_rows: *const u8,
     out_logits: *mut u16,
     forced_tokens: *const i32,
+    host_cut: Option<(&[u8], &mut HostCutContext<'_>)>,
 ) -> Result<Vec<LaneVerifyRun>, String> {
     if lanes.len() != sequences.len() {
         return Err(format!(
@@ -1619,6 +1709,12 @@ fn verify_round(
         out_reasoning_redirected: redirected.as_mut_ptr(),
         out_logits,
         forced_tokens,
+        // GitHub #590: none on every round no lane of which the host cuts.
+        host_cut_lanes: host_cut.as_ref().map_or(std::ptr::null(), |(flags, _)| flags.as_ptr()),
+        host_cut: host_cut.as_ref().map(|_| host_cut_trampoline as unsafe extern "C" fn(_, _, _, _) -> _),
+        host_cut_context: host_cut.map_or(std::ptr::null_mut(), |(_, context)| {
+            context as *mut HostCutContext<'_> as *mut std::ffi::c_void
+        }),
     };
     let rc = unsafe {
         ffi::ignis_program_decode(
