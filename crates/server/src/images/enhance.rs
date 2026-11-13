@@ -18,6 +18,10 @@ use crate::template::{ChatMessage, ContentPart, MessageContent};
 use crate::thinking::ThinkingOptions;
 use crate::Server;
 
+/// An edit's answer: the one field upstream's prompt asks for.
+const EDIT_ANSWER_SCHEMA: &str =
+    r#"{"type":"object","properties":{"Rewritten":{"type":"string"}},"required":["Rewritten"],"additionalProperties":false}"#;
+
 /// What a rewrite is asked to do, which picks its system prompt and its
 /// user turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +93,26 @@ impl Task {
         vec![ChatMessage::text("system", self.system_prompt()), user]
     }
 
-    /// The rewritten prompt in the model's answer `content`, as upstream
+    /// The schema an answer is held to (`response_format: json_schema`,
+    /// strict, spec #287), for the task whose answer is an object: an edit's
+    /// `{"Rewritten": ...}`. A generation's answer is the prompt itself.
+    pub fn answer_schema(self) -> Option<&'static str> {
+        (self == Self::Edit).then_some(EDIT_ANSWER_SCHEMA)
+    }
+
+    /// The rewritten prompt in an answer held to [`Task::answer_schema`]:
+    /// the object's `Rewritten`, trimmed and its lines joined with spaces.
+    /// `None` when the answer is no such object (a cut one) or nothing is
+    /// left.
+    pub fn read_structured(content: &str) -> Option<String> {
+        let answer: serde_json::Value = serde_json::from_str(content).ok()?;
+        let text = answer.get("Rewritten")?.as_str()?.trim().replace('\n', " ");
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// The rewritten prompt in the model's answer `content` when it was not
+    /// held to a schema (a model that does not serve structured output, a
+    /// generation's plain prompt), as upstream
     /// reads it: an edit's from the `{"Rewritten": ...}` object it is asked
     /// for (fenced as JSON or not; an answer that is not one is taken as the
     /// prompt itself), each trimmed and its lines joined with spaces. `None`
@@ -181,12 +204,22 @@ pub async fn rewrite(server: &Server, prompt: &str, images: &[RgbaImage], seed: 
         task.messages(prompt, &[])
     };
     let thinking = ThinkingOptions { enable_thinking: false, ..ThinkingOptions::default() };
+    // An edit's answer is held to its schema where the model serves
+    // structured output; one that does not (Flash-Next, #581) is asked as
+    // before and its answer read as before, so no rewrite newly fails there.
+    let grammar = task.answer_schema().and_then(|schema| {
+        let schema = serde_json::value::RawValue::from_string(schema.to_owned()).ok()?;
+        let format = crate::api::AnswerFormat::JsonSchema(crate::api::SchemaFormat { schema: &schema, strict: true });
+        crate::api::hold_answer(server, format, &thinking, &crate::api::ToolChoice::Auto, "response_format").ok().flatten()
+    });
     let limits = server.live();
     let params = crate::api::SamplingRequestFields::default().resolve(Some(limits.image.prompt_enhancer_max_tokens), false, false, Some(seed))?;
-    let (input, _, _, media) = match crate::api::prepare_request(server, None, &messages, params, &thinking, &[]).await {
+    let (mut input, _, _, media) = match crate::api::prepare_request(server, None, &messages, params, &thinking, &[]).await {
         Ok(prepared) => prepared,
         Err(refused) => return Err(format!("{enhancer} refused the rewrite: {}", error_message(refused).await)),
     };
+    let constrained = grammar.is_some();
+    input.grammar = grammar;
     let notes = crate::engine::RequestNotes { media, ..crate::engine::RequestNotes::default() };
     let (request, mut events) = engine
         .submit_with_notes(input, RequestClass::Interactive, notes)
@@ -209,7 +242,15 @@ pub async fn rewrite(server: &Server, prompt: &str, images: &[RgbaImage], seed: 
         return Err(format!("{enhancer}'s engine failed the rewrite"));
     }
     let (_, content) = crate::api::split_reasoning(loaded.template.as_ref(), &completion.tokens, &thinking);
-    let prompt = task.read(&content).ok_or_else(|| format!("{enhancer} answered no prompt"))?;
+    let prompt = if constrained {
+        if completion.reason == FinishReason::Length {
+            return Err(format!("{enhancer}'s rewrite was cut by image.prompt_enhancer_max_tokens"));
+        }
+        Task::read_structured(&content)
+    } else {
+        task.read(&content)
+    }
+    .ok_or_else(|| format!("{enhancer} answered no prompt"))?;
     Ok(Rewritten { prompt, warnings })
 }
 
@@ -281,6 +322,10 @@ mod tests {
         assert_eq!(Task::Edit.read("{\"Rewritten\": \"Add a cat\"}"), Some("Add a cat".to_owned()));
         assert_eq!(Task::Edit.read("Add a light-gray cat"), Some("Add a light-gray cat".to_owned()), "not the object: the answer itself");
         assert_eq!(Task::GenerationZh.read(" \n "), None);
+        assert_eq!(Task::read_structured("{\"Rewritten\": \" Make it blue.\\nKeep the rest. \"}"), Some("Make it blue. Keep the rest.".to_owned()));
+        assert_eq!(Task::read_structured("```json\n{\"Rewritten\": \"x\"}\n```"), None, "a held answer is never fenced");
+        assert_eq!(Task::read_structured("{\"Rewritten\": \"  \"}"), None);
+        assert!(Task::Edit.answer_schema().is_some() && Task::GenerationEn.answer_schema().is_none());
         assert_eq!(Task::Edit.read("{\"Rewritten\": \"  \"}"), None);
     }
 }

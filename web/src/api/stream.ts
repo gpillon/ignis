@@ -47,13 +47,14 @@ export type StreamResult = { ok: true; timeline: Timeline } | { ok: false; messa
 /** `streamChat` over `socket`; the page's own is below, a test makes one on a fake. */
 export function createStreamChat(socket: ResponsesSocket) {
   return async (options: StreamOptions): Promise<StreamResult> => {
-    if (activeTransport() === "websocket") {
+    // A reply held to a schema goes over HTTP until the socket carries `text.format` (#591).
+    if (activeTransport() === "websocket" && !options.request.responseFormat) {
       const result = await socket.stream(options);
       if (result !== "unavailable") return result;
       fallBackToHttp();
     }
     const { request, streamId: _stream, onQueued: _queued, ...http } = options;
-    return streamChatCompletions({ ...http, body: buildChatRequest(request.settings, request.turns, request.extras) });
+    return streamChatCompletions({ ...http, body: buildChatRequest(request.settings, request.turns, request.extras, request.responseFormat) });
   };
 }
 

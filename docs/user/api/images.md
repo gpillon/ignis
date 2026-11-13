@@ -98,7 +98,10 @@ All of them are live: `PATCH /v1/config` changes them without a reload.
 **Prompt enhancement.** With `prompt_enhancement: true` on a request (or the
 setting on), a text model rewrites the prompt with Qwen's own system prompts
 before the image model reads it; the result comes back as `data[].revised_prompt`.
-It is not free:
+An edit's rewrite is held to its `{"Rewritten": ...}` object with
+[structured output](structured-output.md), so the answer is the object and a
+cut one fails the rewrite instead of passing as the prompt; a model that does
+not serve structured output is read as before. It is not free:
 
 - With a text model loaded, the job is rewritten first when that model is the
   enhancer; otherwise the server switches to the enhancer, rewrites, then

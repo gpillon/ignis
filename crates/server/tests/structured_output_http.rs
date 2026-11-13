@@ -779,3 +779,28 @@ async fn a_schema_sent_again_is_not_compiled_again() {
     assert_eq!(status, 200, "{text}");
     assert_eq!(grammars.compiles() - before, 2, "without strict, a grammar of its own");
 }
+
+// ── ignis's own callers (#594) ──────────────────────────────────────────
+
+/// An edit's rewrite on the loaded model: one condition image.
+async fn edit_rewrite(script: &str) -> (Result<ignis_server::images::enhance::Rewritten, String>, Arc<MockCompute>) {
+    use ignis_core::image::{ImageSize, RgbaImage};
+    let mock = Arc::new(MockCompute::new());
+    mock.script(0, &encode(script));
+    let server = server(mock.clone(), SchedulerConfig::default());
+    let image = RgbaImage { size: ImageSize::new(1, 1), pixels: vec![255, 0, 0, 255] };
+    (ignis_server::images::enhance::rewrite(&server, "make it blue", &[image], 1).await, mock)
+}
+
+/// The edit enhancer's request carries a strict `json_schema`: a fenced
+/// answer's first token is a miss, caught and repaired like any held answer.
+/// And the answer, held, is the object itself: no fence is stripped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_edit_enhancer_holds_its_answer_to_a_schema_and_reads_it_as_is() {
+    let (rewritten, mock) = edit_rewrite("{\"Rewritten\": \"Make the car blue.\"}").await;
+    assert_eq!(rewritten.unwrap().prompt, "Make the car blue.");
+    assert!(mock.repair_calls().is_empty(), "a conforming answer needs no repair");
+
+    let (_, mock) = edit_rewrite("```json\n{\"Rewritten\": \"Make the car blue.\"}\n```").await;
+    assert!(!mock.repair_calls().is_empty(), "the fence was refused by the grammar, so the request carried one");
+}

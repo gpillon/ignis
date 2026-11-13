@@ -1,4 +1,4 @@
-import type { ConversationRequest, Settings } from "../../api/request.ts";
+import type { ConversationRequest, ResponseFormat, Settings } from "../../api/request.ts";
 import { abortableSleep, isEngineFull } from "../../api/busy.ts";
 import { streamChat } from "../../api/stream.ts";
 import { computeFigures, type Figures } from "../../metrics/figures.ts";
@@ -130,9 +130,35 @@ export const JS_CHECK_SYSTEM_PROMPT = `You review JavaScript that an AI assistan
 Call it unsafe if it tries to reach the network or load code (fetch, XMLHttpRequest, WebSocket, EventSource, import(), importScripts), use browser storage (indexedDB, caches, localStorage), probe or escape the sandbox, hide what it does (obfuscation, eval or Function on built strings), or waste resources on purpose (endless loops, huge allocations, mining).
 Reply with only a JSON object: {"verdict": "safe" or "unsafe", "reason": "one short sentence"}.`;
 
+/** The verdict's shape, the schema its reply is held to: exactly the two fields `readVerdict` reads. */
+export const JS_CHECK_FORMAT: ResponseFormat = {
+  name: "js_safety_verdict",
+  schema: {
+    type: "object",
+    properties: { verdict: { type: "string", enum: ["safe", "unsafe"] }, reason: { type: "string" } },
+    required: ["verdict", "reason"],
+    additionalProperties: false,
+  },
+};
+
 export type JsCheck = { verdict: "safe" | "unsafe"; reason: string };
 
-/** The reviewer's reply as a verdict. Anything but a clear "safe" is unsafe. */
+/** A reply held to `JS_CHECK_FORMAT`: its verdict and reason as written. A reply that is not one (a cut one) is unsafe. */
+export function readVerdict(text: string): JsCheck {
+  try {
+    const { verdict, reason } = JSON.parse(text) as { verdict: "safe" | "unsafe"; reason: string };
+    if (verdict === "safe" || verdict === "unsafe") return { verdict, reason: reason.trim() || "No reason given." };
+  } catch {
+    // Cut before its end, or not an object: no verdict.
+  }
+  return { verdict: "unsafe", reason: "The safety check gave no clear verdict." };
+}
+
+/**
+ * The reviewer's reply as a verdict when it was not held to a schema: a model
+ * that does not serve structured output (Flash-Next, #581) answers as its
+ * prompt asks, maybe fenced. Anything but a clear "safe" is unsafe.
+ */
 export function parseVerdict(text: string): JsCheck {
   const json = /\{[\s\S]*\}/.exec(text)?.[0];
   if (json) {
@@ -149,6 +175,8 @@ export function parseVerdict(text: string): JsCheck {
   }
   return { verdict: "unsafe", reason: "The safety check gave no clear verdict." };
 }
+
+const CUT: JsCheck = { verdict: "unsafe", reason: "The safety check was cut short before its verdict." };
 
 /** Asks the model whether `code` is safe to run: greedy, thinking off, on an agent lane; a full engine is waited out. */
 export async function checkJs(
@@ -174,10 +202,13 @@ export async function checkJs(
     },
     turns: [{ role: "user", content: `Review this code:\n\n\`\`\`js\n${code}\n\`\`\`` }],
   };
+  // The reply is held to the verdict's schema, until a model answers 400 for it
+  // (Flash-Next, #581): then the check is asked as it was, without one.
+  let held = true;
   for (let attempt = 0; ; attempt++) {
     let content = "";
     const result = await stream({
-      request,
+      request: held ? { ...request, responseFormat: JS_CHECK_FORMAT } : request,
       signal: options.signal,
       onEvent: (event) => {
         if (event.kind === "content") content += event.text;
@@ -187,9 +218,14 @@ export async function checkJs(
       await sleep(1000, options.signal);
       continue;
     }
+    if (!result.ok && held && /^400: response_format/.test(result.message)) {
+      held = false;
+      continue;
+    }
     if (!result.ok) {
       return { verdict: "unsafe", reason: `The safety check could not run: ${result.message}`, figures: null, error: result.message };
     }
-    return { ...parseVerdict(content), figures: computeFigures(result.timeline) };
+    const verdict = !held ? parseVerdict(content) : result.timeline.finishReason === "length" ? CUT : readVerdict(content);
+    return { ...verdict, figures: computeFigures(result.timeline) };
   }
 }

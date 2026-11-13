@@ -75,7 +75,10 @@ after the conversation, instead.
 with no network, no page and no storage, a 10 s limit and 10,000 characters of
 output. With **Safety check** on (the default), a request on an agent lane
 reviews each piece of code first, greedy and without thinking, and code it
-does not call safe is blocked. A row under **Tool calls** shows the code, the
+does not call safe is blocked. The verdict is held to a schema
+([structured output](../api/structured-output.md)): a reply the model cut or
+garbled can no longer pass as a verdict, and a model that does not serve
+structured output is asked as before. A row under **Tool calls** shows the code, the
 check's verdict, the result and the console.
 
 ## Plan

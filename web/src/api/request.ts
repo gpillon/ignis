@@ -70,7 +70,14 @@ export type Turn = {
 };
 
 /** What the page asks a transport for: one reply to `turns`, with these settings and tools. */
-export type ConversationRequest = { settings: Settings; turns: Turn[]; extras?: ToolExtras };
+export type ConversationRequest = { settings: Settings; turns: Turn[]; extras?: ToolExtras; responseFormat?: ResponseFormat };
+
+/**
+ * A reply held to a JSON schema (`response_format`, spec #287): the page's own
+ * callers ask for one where they read the reply as data. It goes over chat
+ * completions, since the socket has no `text.format` yet (#591).
+ */
+export type ResponseFormat = { name: string; schema: object };
 
 /** An OpenAI function tool, as `tools[]` declares it. */
 export type ToolDefinition = {
@@ -104,6 +111,7 @@ export type ChatRequest = {
   reasoning_effort: ReasoningEffort;
   thinking_budget?: number;
   class: LaneTag;
+  response_format?: { type: "json_schema"; json_schema: { name: string; schema: object; strict: true } };
 };
 
 /** One message already in the Playground's conversation. */
@@ -194,7 +202,7 @@ export function systemPromptOf(settings: Settings, extras: ToolExtras = {}): str
   return [extras.ignisPrompt ?? "", settings.systemPrompt].filter((part) => part.trim() !== "").join("\n\n");
 }
 
-export function buildChatRequest(settings: Settings, turns: Turn[], extras: ToolExtras = {}): ChatRequest {
+export function buildChatRequest(settings: Settings, turns: Turn[], extras: ToolExtras = {}, responseFormat?: ResponseFormat): ChatRequest {
   const system = systemPromptOf(settings, extras);
   const thinkingBudget = thinkingBudgetOf(settings);
   return {
@@ -208,5 +216,6 @@ export function buildChatRequest(settings: Settings, turns: Turn[], extras: Tool
     reasoning_effort: settings.reasoningEffort,
     ...(thinkingBudget !== undefined ? { thinking_budget: thinkingBudget } : {}),
     class: settings.laneTag,
+    ...(responseFormat ? { response_format: { type: "json_schema" as const, json_schema: { ...responseFormat, strict: true as const } } } : {}),
   };
 }
