@@ -310,6 +310,39 @@ fn sampling_options(args: &[String]) -> Result<Option<Sampling>, String> {
     Sampling::from_flags(t.as_deref(), p.as_deref(), k.as_deref(), s.as_deref())
 }
 
+/// [`sampling_options`] for a command that sends them (`replay`, `g5`): what
+/// it will send said on stderr, a greedy run saying nothing, and a refused
+/// flag said and returned as the command's exit.
+fn sampling_or_exit(args: &[String]) -> Result<Option<Sampling>, ExitCode> {
+    let sampling = sampling_options(args).map_err(|e| {
+        eprintln!("error: {e}");
+        ExitCode::FAILURE
+    })?;
+    if let Some(sampling) = &sampling {
+        eprintln!("{}", sampling.describe());
+    }
+    Ok(sampling)
+}
+
+/// `g5`'s cell (GitHub #578): the depths it measures, in order (`--depths`,
+/// K tokens, comma-separated; the gate's [`g5::DEPTHS`] unset), and the
+/// sequences fired at once per depth (`--lanes`, from 1; 1 unset).
+fn g5_cell_options(args: &[String]) -> Result<(Vec<u32>, usize), String> {
+    let depths = match opt(args, "depths") {
+        None => g5::DEPTHS.to_vec(),
+        Some(list) => list
+            .split(',')
+            .map(|k| k.trim().parse::<u32>().ok().filter(|k| *k >= 1).and_then(|k| k.checked_mul(1024)))
+            .collect::<Option<Vec<u32>>>()
+            .ok_or_else(|| format!("--depths {list}: a comma-separated list of depths in K tokens (e.g. 24,98,196)"))?,
+    };
+    let lanes = match opt(args, "lanes") {
+        None => 1,
+        Some(v) => v.parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(|| format!("--lanes {v}: not a whole number from 1"))?,
+    };
+    Ok((depths, lanes))
+}
+
 /// `replay`'s opt-in fidelity options: `--as-recorded`, and
 /// `--retry-engine-full` with its `--retry-max` / `--retry-max-wait` /
 /// `--retry-total-wait` bounds. A bound without the switch it tunes is
@@ -386,17 +419,11 @@ fn cmd_replay(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let sampling = match sampling_options(args) {
+    let sampling = match sampling_or_exit(args) {
         Ok(sampling) => sampling,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
     let mut ep = endpoint_for(&endpoint).as_recorded(as_recorded).with_sampling(sampling);
-    if let Some(sampling) = &sampling {
-        eprintln!("{}", sampling.describe());
-    }
     if let Some(policy) = retry {
         ep = ep.with_retry(policy);
     }
@@ -1367,7 +1394,8 @@ fn cmd_g4_gate(args: &[String]) -> ExitCode {
 
 /// `g5` (P5-07, GitHub #151): g3's C=1 throughput cell (and its
 /// committed-token counter), measured at three prompt depths (24K/98K/196K)
-/// against one OpenAI-compatible endpoint. The record it writes is one
+/// against one OpenAI-compatible endpoint, or at `--depths` with `--lanes`
+/// sequences each (GitHub #578). The record it writes is one
 /// *launch* of one engine; `g5-gate` pools at least two of them per engine
 /// (ADR 0021) into a per-depth verdict.
 fn cmd_g5(args: &[String]) -> ExitCode {
@@ -1410,41 +1438,18 @@ fn cmd_g5(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let sampling = match sampling_options(args) {
-        Ok(sampling) => sampling,
+    let (depths, lanes) = match g5_cell_options(args) {
+        Ok(cell) => cell,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let depths = match opt(args, "depths") {
-        None => g5::DEPTHS.to_vec(),
-        Some(list) => match list
-            .split(',')
-            .map(|k| k.trim().parse::<u32>().ok().filter(|k| *k >= 1).map(|k| k * 1024))
-            .collect::<Option<Vec<u32>>>()
-        {
-            Some(depths) if !depths.is_empty() => depths,
-            _ => {
-                eprintln!("error: --depths {list}: a comma-separated list of depths in K tokens (e.g. 24,98,196)");
-                return ExitCode::FAILURE;
-            }
-        },
-    };
-    let lanes = match opt(args, "lanes") {
-        None => 1,
-        Some(v) => match v.parse::<usize>() {
-            Ok(n) if n >= 1 => n,
-            _ => {
-                eprintln!("error: --lanes {v}: not a whole number from 1");
-                return ExitCode::FAILURE;
-            }
-        },
+    let sampling = match sampling_or_exit(args) {
+        Ok(sampling) => sampling,
+        Err(code) => return code,
     };
     let ep = endpoint_for(&endpoint).with_sampling(sampling);
-    if let Some(sampling) = &sampling {
-        eprintln!("{}", sampling.describe());
-    }
     let engine = match ep.list_models() {
         Ok(models) if !models.is_empty() => {
             eprintln!("engine {endpoint}: {}", models.join(", "));
@@ -1459,7 +1464,9 @@ fn cmd_g5(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("g5 session {session}: committed tok/s @24K/98K/196K against {label}");
+    let at: Vec<String> = depths.iter().map(|depth| format!("{}K", depth / 1024)).collect();
+    let per_depth = if lanes == 1 { String::new() } else { format!(", {lanes} lanes a depth") };
+    eprintln!("g5 session {session}: committed tok/s @{}{per_depth} against {label}", at.join("/"));
 
     let cfg = g5::G5Config { label, profile, artifact, session, committed_tokens, corpus, depths, lanes, sampling };
     let record = g5::measure(&ep, &frontend, engine, endpoint, &cfg);
@@ -1933,6 +1940,30 @@ mod tests {
             .unwrap();
         assert_eq!((s.temperature, s.top_p, s.top_k, s.base_seed), (0.6, 0.95, 20, 9));
         assert!(sampling_options(&argv(&["--temperature", "1"])).is_err());
+    }
+
+    /// GitHub #578: `g5`'s `--depths` are K tokens (each times 1024), a
+    /// comma-separated list in the order measured, and `--lanes` the
+    /// sequences per depth; unset, the gate's three depths at one lane.
+    #[test]
+    fn g5_reads_its_depths_in_k_tokens_and_its_lanes() {
+        let gate = (vec![24_576, 100_352, 200_704], 1);
+        assert_eq!(g5_cell_options(&argv(&["--endpoint", "e"])).unwrap(), gate);
+        assert_eq!(g5_cell_options(&argv(&["--depths", "64,100", "--lanes", "4"])).unwrap(), (vec![65_536, 102_400], 4));
+        assert_eq!(g5_cell_options(&argv(&["--depths", "100, 64"])).unwrap(), (vec![102_400, 65_536], 1));
+        assert_eq!(g5_cell_options(&argv(&["--lanes", "8"])).unwrap(), (gate.0, 8));
+        for bad in [
+            ["--depths", ""],
+            ["--depths", "0"],
+            ["--depths", "24,,98"],
+            ["--depths", "24K"],
+            ["--depths", "4194304"],
+            ["--lanes", "0"],
+            ["--lanes", "two"],
+        ] {
+            let err = g5_cell_options(&argv(&bad)).unwrap_err();
+            assert!(err.contains(&format!("{} {}", bad[0], bad[1])), "{bad:?}: {err}");
+        }
     }
 
     #[test]

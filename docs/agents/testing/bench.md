@@ -211,10 +211,11 @@ which on stderr.
 A `ttft`, `g3` or `g5` run generates all its prompts before its first request,
 numbered across the run: `ttft`'s a set per cell in `--cells` order, the image
 cell's last (`small-card`'s TTFT cells are such a run, of the cells that fit);
-`g3`'s C=1, C=4, the ITL lanes, then the ITL prefillers; `g5`'s one per depth.
-Each prompt starts with its own nonce and seed or, cut from a corpus,
-its own window, the run's windows spread evenly over the bank (a `g5` depth
-opens in its own third of it); a window that starts with another prompt's
+`g3`'s C=1, C=4, the ITL lanes, then the ITL prefillers; `g5`'s `--lanes` per
+depth (one unset), the depths in order. Each prompt starts with its own nonce
+and seed or, cut from a corpus, its own window, the run's windows spread evenly
+over the bank (at `g5`'s three gate depths and one lane, each depth opens in its
+own third of it); a window that starts with another prompt's
 content is passed over for the next rotation. Then the run is proven: no two
 prompts share more than the chat template's own tokens, its header and footer
 together, nor a whole KV page of them, or it refuses to start, every cell

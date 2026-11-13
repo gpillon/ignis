@@ -27,7 +27,8 @@
 //! same `XK` convention [`crate::g4::NEEDLE_CONTEXT_64K`] uses), 512
 //! committed tokens ([`COMMITTED_TOKENS`]), cold, greedy (this crate's
 //! `HttpEndpoint` fixes `temperature: 0` / `seed: 0` on every request — the
-//! same contract every other gate in this crate measures under). At
+//! same contract every other gate in this crate measures under — unless a
+//! run asks for sampling, which a gate launch never does, GitHub #578). At
 //! 24K–196K a corpus is required in practice ([`G5Config::corpus`]) for the
 //! same reason G4's 64K/128K needle cells need one: the filler word-growth
 //! path's O(n²) re-encoding is impractical at this scale
@@ -106,10 +107,11 @@ fn require_committed_budget(mut cell: ThroughputCell, committed_tokens: u32, ins
 
 /// The prompts one `g5` run sends, `lanes` per depth, the depths in order,
 /// generated together before the first is sent (GitHub #443) and numbered
-/// across the run ([`ttft::generate_run_prompts`]): each depth's prompt
-/// starts with its own nonce, or its window in its own third of `corpus`,
-/// so an engine with prompt reuse has nothing a shallower depth left behind
-/// to serve a deeper one from, and a run whose prompts would share more is
+/// across the run ([`ttft::generate_run_prompt_sets`]): each prompt starts
+/// with its own nonce, or its window in its own share of `corpus` (a third
+/// at the gate's three depths and one lane), so an engine with prompt reuse
+/// has nothing another depth or lane left behind to serve it from, and a run
+/// whose prompts would share more is
 /// refused before it starts. Each prompt ends with `instruction` when the
 /// run sends one. A prompt that cannot be generated fails its own depth.
 fn depth_prompts(
