@@ -640,9 +640,10 @@ config_group! {
         /// from the drafter's own distribution and taken by the ratio of the
         /// two distributions. Both keep the text distributed as the model's
         /// sampler draws it; a seed's text differs between them. Greedy
-        /// requests draft and accept the same way under either. Needs
-        /// `dflash2`.
-        draft_rule: DraftRuleKind = DraftRule::default(), Validator::OneOf(&DraftRule::NAMES), QWEN38_ONLY,
+        /// requests draft and accept the same way under either. The default
+        /// is `sampled` (GitHub #578); `fixed` is today's rule, for a
+        /// comparison or a way back. Needs `dflash2`.
+        draft_rule: DraftRuleKind = DraftRule::Sampled, Validator::OneOf(&DraftRule::NAMES), QWEN38_ONLY,
             [Visible, Patchable, ReloadRequired];
         /// Under `sampled`, the drafter's temperature as a factor of the
         /// request's: a request at temperature T drafts at this times T, so

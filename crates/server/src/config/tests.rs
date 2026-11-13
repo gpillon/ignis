@@ -1693,7 +1693,8 @@ fn known_models_come_from_repeated_flags_or_the_env_var_and_a_flag_replaces_the_
 fn spec_dflash2_with_a_window_in_range_parses() {
     for n in 1..=7u32 {
         let config = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", &n.to_string()]);
-        assert_eq!(config.speculation, Some(Speculation::new(SpeculativeBackend::Dflash2, n).unwrap()));
+        let sampled = Speculation::new(SpeculativeBackend::Dflash2, n).unwrap().with_draft_rule(DraftRule::Sampled, DrafterSampling::default());
+        assert_eq!(config.speculation, Some(sampled));
     }
 }
 
@@ -1790,12 +1791,20 @@ fn a_draft_head_without_spec_or_with_an_unknown_name_is_refused() {
 /// flag or env var, each a reload, and the effective configuration writes
 /// them in the 27B's section, from which a start reads them back.
 #[test]
-fn the_draft_rule_is_fixed_unless_named_and_rides_the_speculation() {
+fn the_draft_rule_is_sampled_unless_fixed_is_named_and_rides_the_speculation() {
     use ignis_core::{DraftRule, DrafterSampling};
     let drafter = |factor, top_p| DrafterSampling { temperature_factor_milli: factor, top_p_milli: top_p };
     let rule = |config: &Config| config.speculation.map(|s| (s.draft_rule(), s.drafter_sampling()));
     let default = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7"]);
-    assert_eq!(rule(&default), Some((DraftRule::Fixed, drafter(900, 950))));
+    assert_eq!(rule(&default), Some((DraftRule::Sampled, drafter(900, 950))));
+    // GitHub #578: today's rule stays selectable, by flag and by env, and the
+    // MTP head of Flash-Next drafts the one rule it has.
+    let fixed = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7", "--spec-draft-rule", "fixed"]);
+    assert_eq!(rule(&fixed), Some((DraftRule::Fixed, drafter(900, 950))));
+    let env = env_map(&[("IGNIS_SPEC_BACKEND", "dflash2"), ("IGNIS_SPEC_DRAFT_TOKENS", "7"), ("IGNIS_SPEC_DRAFT_RULE", "fixed")]);
+    assert_eq!(rule(&expect_config(resolve(&[], env).expect("resolve"))), Some((DraftRule::Fixed, drafter(900, 950))));
+    let mtp = config(&["--spec-backend", "mtp"]);
+    assert_eq!(rule(&mtp).map(|r| r.0), Some(DraftRule::Fixed));
     let flags = [
         "--spec-backend", "dflash2", "--spec-draft-tokens", "7", "--spec-draft-rule", "sampled",
         "--spec-drafter-temperature-factor", "0.8", "--spec-drafter-top-p", "1",
@@ -1827,7 +1836,9 @@ fn the_draft_rule_is_fixed_unless_named_and_rides_the_speculation() {
 fn the_draft_rule_is_refused_by_name_where_no_dflash2_drafts() {
     let named = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7", "--spec-draft-rule", "sampled"]);
     assert!(served_model_for(&named, ModelFamily::Qwen38_27b).is_ok());
-    let mtp = config(&["--spec-backend", "mtp", "--spec-draft-rule", "sampled"]);
+    // The default (GitHub #578) is `sampled`, so on Flash-Next it is the value
+    // the framework passes as unnamed; `fixed` is the one it refuses.
+    let mtp = config(&["--spec-backend", "mtp", "--spec-draft-rule", "fixed"]);
     let err = served_model_for(&mtp, ModelFamily::FlashNext).expect_err("the 27B's").0;
     assert!(err.contains("--spec-draft-rule") && err.contains("Qwen3.8-Flash-Next"), "{err}");
     let factor = config(&["--spec-backend", "mtp", "--spec-drafter-temperature-factor", "0.5"]);
@@ -1835,7 +1846,7 @@ fn the_draft_rule_is_refused_by_name_where_no_dflash2_drafts() {
     assert!(err.contains("--spec-drafter-temperature-factor") && err.contains("Qwen3.8-Flash-Next"), "{err}");
     assert!(served_model_for(&config(&[]), ModelFamily::FlashNext).is_ok(), "unnamed, it is no one's business");
 
-    for flag in [["--spec-draft-rule", "sampled"], ["--spec-drafter-top-p", "0.9"], ["--spec-drafter-temperature-factor", "1"]] {
+    for flag in [["--spec-draft-rule", "fixed"], ["--spec-drafter-top-p", "0.9"], ["--spec-drafter-temperature-factor", "1"]] {
         let err = refused(&["--profile", "none", flag[0], flag[1]]);
         assert!(err.contains(flag[0]) && err.contains("--spec-backend"), "{err}");
         let err = refused(&["--spec-backend", "off", flag[0], flag[1]]);
@@ -2769,7 +2780,8 @@ fn the_start_says_which_models_a_vision_knob_named_for_every_model_applies_to() 
 fn vision_and_dflash2_resolve_together_as_two_independent_load_options() {
     let both = config(&["--profile", "none", "--vision-enabled", "--spec-backend", "dflash2", "--spec-draft-tokens", "4"]);
     assert_eq!(both.vision, Some(Vision::default()));
-    assert_eq!(both.speculation, Speculation::new(SpeculativeBackend::Dflash2, 4).ok());
+    let sampled = Speculation::new(SpeculativeBackend::Dflash2, 4).unwrap().with_draft_rule(DraftRule::Sampled, DrafterSampling::default());
+    assert_eq!(both.speculation, Some(sampled));
     let env = env_map(&[("IGNIS_VISION_ENABLED", "true"), ("IGNIS_SPEC_BACKEND", "dflash2"), ("IGNIS_SPEC_DRAFT_TOKENS", "4")]);
     let from_env = expect_config(resolve(&args(&["--profile", "none"]), env).expect("the env form too"));
     assert_eq!((from_env.vision, from_env.speculation), (both.vision, both.speculation));

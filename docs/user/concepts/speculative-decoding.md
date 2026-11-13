@@ -52,15 +52,16 @@ request's temperature, top-k, top-p and penalties. So the round takes a draft
 by chance, in a way that leaves every token the lane emits distributed exactly
 as the sampler would have drawn it, whatever the drafter proposed.
 
-- **The fixed draft** (`--spec-draft-rule fixed`, the default). The drafter
+- **The fixed draft** (`--spec-draft-rule fixed`, the rule of earlier
+  releases). The drafter
   proposes its single best token d, and the round takes it with the model's
   probability of it, p(d). When it refuses, the lane's token is drawn from the
   model's distribution without d, and the run ends there. Even a drafter that
   always proposed the model's most likely token would see it refused whenever
   the sampler picks another one: on recorded agent turns at temperature 1, 18
   percent of first drafts.
-- **The sampled draft** (`--spec-draft-rule sampled`, from 0.11.0, the 27B
-  only). The drafter draws d from its own distribution q over its 16
+- **The sampled draft** (`--spec-draft-rule sampled`, the default from
+  0.11.0, the 27B only). The drafter draws d from its own distribution q over its 16
   candidates, at 0.9 times the request's temperature and top-p 0.95, and the
   round takes it with probability min(1, p(d)/q(d)). When it refuses, the
   lane's token is drawn from what the model's distribution has left over the
@@ -74,8 +75,9 @@ as the sampler would have drawn it, whatever the drafter proposed.
 A greedy request drafts and accepts the same way under both rules, so its text
 does not change. A sampled request's text keeps its distribution under both,
 but not its draws: a fixed seed reproduces a lane's text on one build, and
-under `sampled` that text is not the one the same seed gives under `fixed`, or
-gave in an earlier release. Neither rule changes what a stop sequence, the
+under `sampled`, the default, that text is not the one the same seed gives under
+`fixed`, or gave in an earlier release: the distribution of the text is the
+same, a seed's text is not. Neither rule changes what a stop sequence, the
 reasoning budget or a JSON schema does to the run the round commits.
 
 ## DFlash2, for the 27B

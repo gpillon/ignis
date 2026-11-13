@@ -1047,12 +1047,12 @@ The drafter's proposal head: `full` (the target's output head), `shortlist` (the
 | Flag | `--spec-draft-rule` |
 | Env var | `IGNIS_SPEC_DRAFT_RULE` |
 | Kind | `draft rule` |
-| Default | `fixed` |
+| Default | `sampled` |
 | Rule | one of fixed, sampled |
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-How the 27B's DFlash2 rounds draft and accept for a request that samples (ADR 0090): `fixed`, the drafter's single best draft taken with the target's probability of it, or `sampled`, a draft drawn from the drafter's own distribution and taken by the ratio of the two distributions. Both keep the text distributed as the model's sampler draws it; a seed's text differs between them. Greedy requests draft and accept the same way under either. Needs `dflash2`.
+How the 27B's DFlash2 rounds draft and accept for a request that samples (ADR 0090): `fixed`, the drafter's single best draft taken with the target's probability of it, or `sampled`, a draft drawn from the drafter's own distribution and taken by the ratio of the two distributions. Both keep the text distributed as the model's sampler draws it; a seed's text differs between them. Greedy requests draft and accept the same way under either. The default is `sampled` (GitHub #578); `fixed` is today's rule, for a comparison or a way back. Needs `dflash2`.
 
 ### `spec.drafter_temperature_factor`
 

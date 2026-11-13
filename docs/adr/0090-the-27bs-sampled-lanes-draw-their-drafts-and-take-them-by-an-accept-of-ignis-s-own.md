@@ -34,8 +34,8 @@ vendored accept's to the bit; only the verdict is ours.
 
 ## Consequences
 
-- **Three settings in the speculation group, the 27B's alone**: `spec.draft_rule` (`fixed`, today's rule
-  and the default until the rule's gate on the RTX 5090 passes, or `sampled`), `spec.drafter_temperature_factor`
+- **Three settings in the speculation group, the 27B's alone**: `spec.draft_rule` (`sampled`, the default
+  since the rule's gate on the RTX 5090 passed, or `fixed`, today's rule, selectable), `spec.drafter_temperature_factor`
   (0.9) and `spec.drafter_top_p` (0.95). Each needs a reload and `--spec-backend dflash2`; Flash-Next
   refuses them by name. The load's log names the rule and both settings.
 - **A round under the sampled draft runs our accept for every lane.** A sampling lane takes the ratio; a

@@ -226,7 +226,7 @@ use ignis_core::compute::ModelFamily;
 /// neither moved (finding 2026-10-09-vram-headroom-wddm-paging).
 pub const DEFAULT_VRAM_HEADROOM_BYTES: u64 = 1536 * 1024 * 1024;
 pub use ignis_core::{MAX_DRAFT_TOKENS, ProposalHead, ProposalHeadSetting, Speculation, SpeculativeBackend};
-use ignis_core::DrafterSampling;
+use ignis_core::{DraftRule, DrafterSampling};
 use ignis_core::speculation::FLASH_NEXT_DEFAULT_DRAFT_TOKENS;
 
 pub use ignis_core::{MAX_YARN_FACTOR, RopeScaling};
@@ -1737,7 +1737,11 @@ fn derive_speculation(
         temperature_factor_milli: s.drafter_temperature_factor,
         top_p_milli: s.drafter_top_p,
     };
-    Ok((Some(speculation.with_proposal_head(head).with_draft_rule(s.draft_rule, drafter)), false))
+    // The rule's default is the 27B's: Flash-Next's MTP head drafts one rule
+    // only, and a value other than the default named there was refused by its
+    // scope before this ran.
+    let rule = if backend == SpeculativeBackend::Mtp { DraftRule::Fixed } else { s.draft_rule };
+    Ok((Some(speculation.with_proposal_head(head).with_draft_rule(rule, drafter)), false))
 }
 
 /// A decimal field's value as its flag would spell it (thousandths to `0.9`).
