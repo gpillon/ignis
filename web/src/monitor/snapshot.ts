@@ -251,7 +251,7 @@ export const STRUCTURED_TYPES = ["json_object", "json_schema"] as const;
 export type StructuredType = (typeof STRUCTURED_TYPES)[number];
 
 /**
- * Structured output (#593, ADR 0017's amendment of 2026-11-13): the completed
+ * Structured output (#593, ADR 0089, amending ADR 0017): the completed
  * requests held to a grammar, the draws it rejected and the repairs that
  * answered them, by type, and how long a repair took. Absent until the first
  * such request ended, so null on a server that never served one.

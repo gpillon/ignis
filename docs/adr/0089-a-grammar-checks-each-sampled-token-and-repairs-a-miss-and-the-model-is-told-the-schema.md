@@ -1,6 +1,6 @@
 ---
 status: accepted
-amends: [ADR-0034]
+amends: [ADR-0017, ADR-0034]
 ---
 
 # A grammar checks each sampled token and repairs a miss, and the model is told the schema
@@ -65,3 +65,11 @@ schema misses on nearly every key.
 - **A constrained answer can loop**, and today only `max_tokens` stops it (#584). The loop guard watches only the
   reasoning.
 - **Flash-Next comes later (#581).** Its MTP verify round overwrites the scores inside the round.
+- **Four metric families join ADR 0017's set** (#593): `ignis_structured_requests_total{type}`,
+  `ignis_structured_misses_total{type}`, `ignis_structured_repairs_total{type}` (`type` is
+  `json_object|json_schema`) and the histogram `ignis_structured_repair_seconds` (50 µs to 250 ms). The scheduler
+  counts a request's misses and times each repair where the repair happens, the one place a request held to a
+  grammar reads the clock, and reports them on the request's `Done` fact, so a round with no grammar adds nothing.
+  They take the decision family's exception: absent until a request held to a grammar has ended, then every series,
+  zeros included. The request's `done` line carries `structured.type`, `structured.misses` and `structured.repairs`,
+  and the Monitor shows them in a *Structured output* card.

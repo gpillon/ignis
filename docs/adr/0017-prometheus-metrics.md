@@ -1,6 +1,6 @@
 ---
 status: accepted
-amended-by: [ADR-0025, ADR-0030, ADR-0045, ADR-0046, ADR-0058]
+amended-by: [ADR-0025, ADR-0030, ADR-0045, ADR-0046, ADR-0058, ADR-0089]
 ---
 
 # ADR 0017 — Opt-in Prometheus metrics with zero inference-path work
@@ -285,19 +285,6 @@ where it can be hit on the load: no checkpoint miss with `--reuse-prompt off`,
 no prefix miss without a retained slot. No new family; the rule is the note
 below the table, and the Monitor's *Retained state* card shows the count where
 it read "not measured".
-Amended 2026-11-13 (#593, spec #287, ADR 0089): four families for **structured
-output**, `ignis_structured_requests_total{type}`,
-`ignis_structured_misses_total{type}`, `ignis_structured_repairs_total{type}`
-(`type` is `json_object|json_schema`) and the histogram
-`ignis_structured_repair_seconds` (50 us to 250 ms). The scheduler counts a
-request's misses and times each repair where the repair happens, the one place
-a request held to a grammar reads the clock, and reports them on the request's
-`Done` fact; the consumer projects them when the request completes, so a
-round with no grammar adds nothing. They take the decision family's exception:
-absent until a request held to a grammar has ended, then every series,
-zeros included. The request's `done` line carries `structured.type`,
-`structured.misses` and `structured.repairs`. The Monitor shows them in a
-*Structured output* card.
 
 ### Context
 

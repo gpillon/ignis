@@ -1,5 +1,5 @@
 //! Structured output on the metrics and the request log (GitHub #593, spec
-//! #287, ADR 0017's amendment of 2026-11-13): a request held to a grammar
+//! #287, ADR 0089, amending ADR 0017): a request held to a grammar
 //! moves the `ignis_structured_*` series by its misses and repairs, records
 //! each repair's time, and says its type and counts on its `done` line --
 //! over the real router on `MockCompute` (ADR 0006), whose scripted model
