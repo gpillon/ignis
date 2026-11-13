@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 amends: [ADR-0034]
 ---
 
@@ -17,8 +17,11 @@ vocabulary, to **repair** that one position from the scores the round left on th
 describes the schema to the model by default, at the end of the prompt, because a model that has not seen the
 schema misses on nearly every key.
 
-- **Same result as masking every step.** Identical under greedy; under temperature, the same distribution except
-  for the top-k cut the vendored sampler applies (llama.cpp's check-first default accepts the same).
+- **Same result as masking every step.** Identical under greedy to masking every step of the route that drew each
+  token; under temperature, the same distribution except for the top-k cut the vendored sampler applies
+  (llama.cpp's check-first default accepts the same). With DFlash2 on, a token is drawn from a verify column, whose
+  numerics can part from a plain round's at a near-tie, as they do for an unconstrained answer: a constrained
+  answer equals the speculation-off answer up to that near-tie rule, never further.
 - **Speculation stays on for a constrained request.** The host cuts a verified run at its first miss and repairs
   that position. No sibling's round loses its drafts or its graph because one request is constrained.
 - **Two forms of permitted set.** The short set (at most 32) stays for schedules and forced literals; the mask is
