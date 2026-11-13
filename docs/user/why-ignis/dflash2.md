@@ -55,15 +55,18 @@ The full round, draft by draft:
 | **367 tok/s** one lane, geometric mean over eight coding prompts; **1,065 tok/s** the same eight at once | greedy, 512 tokens, 262,144 context, no vision, full proposal head | [Quick wins A/B](../../findings/2026-09-24-upstream-quick-wins-ab.md) |
 | 5.43 committed tokens a round at one lane (full head) | same | same |
 | 491 tok/s on predictable code, 167 tok/s on free prose, one lane, greedy | retained-slots build | [Retained slots on the host](../../findings/2026-09-28-retained-slots-on-the-host.md) |
-| **3.46 tokens a round** on 200 recorded agent turns | teacher-forced replay, T=1.0, top_p 0.95, top_k 20, 7 drafts | [Sampled acceptance](../../findings/2026-09-24-dflash2-sampled-acceptance.md) |
+| **3.46 tokens a round** on 200 recorded agent turns, the fixed draft | teacher-forced replay, T=1.0, top_p 0.95, top_k 20, 7 drafts | [Sampled acceptance](../../findings/2026-09-24-dflash2-sampled-acceptance.md) |
+| **3.83 tokens a round** on the same turns under the sampled draft, the default from 0.11.0, against 3.45 under the fixed draft (+10.9%) | the same replay on the RTX 5090 | [The sampled draft served](../../findings/2026-11-13-the-sampled-draft-served-on-the-27b.md) |
 
 :::caution[Greedy coding is the best case]
 The 367 and 1,065 tok/s are greedy coding numbers. Agent traffic samples, and
 under sampling a draft is accepted less often: on recorded agent turns the
-round commits about 3.5 tokens, against about 5.4 on greedy coding prompts.
-The finding splits the loss from a perfect 8-token run into 3.08 tokens to
-one-hot drafting under sampling and 1.47 to the drafter. Plan for the lower
-figure when you size an agent workload.
+round commits about 3.8 tokens under the sampled draft, the default from
+0.11.0, and about 3.5 under the fixed draft, against about 5.4 on greedy
+coding prompts. The sampled-acceptance finding splits the fixed draft's loss
+from a perfect 8-token run into 3.08 tokens to one-hot drafting under sampling
+and 1.47 to the drafter. Plan for the lower figure when you size an agent
+workload.
 :::
 
 ## See it, control it

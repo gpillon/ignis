@@ -91,9 +91,11 @@ when a turn rewrites text past its chat template's rewrite boundary; ignis
 never read one and retired it (snapshot format 5), because a prompt checkpoint
 taken at the opener already carries the window as it stood there.
 
-- **Acceptance.** On a replay of 200 real agent turns it averaged 3.46 tokens a
-  round (one is the anchor), at 7 draft tokens
-  ([DFlash2 sampled acceptance](../../findings/2026-09-24-dflash2-sampled-acceptance.md)).
+- **Acceptance.** On a replay of 200 real agent turns, sampled at temperature
+  1, it averaged 3.83 tokens a round under the sampled draft, the default from
+  0.11.0, and 3.45 under the fixed draft (one is the anchor), at 7 draft tokens
+  ([the sampled draft served](../../findings/2026-11-13-the-sampled-draft-served-on-the-27b.md),
+  [DFlash2 sampled acceptance](../../findings/2026-09-24-dflash2-sampled-acceptance.md)).
   Code is more predictable than prose: on one RTX 5090 lane the 27B ran about
   491 tokens per second on predictable code and 167 on free prose, 367 as the
   geometric mean over eight coding prompts, and 1,065 aggregate across eight

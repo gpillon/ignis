@@ -46,8 +46,10 @@ greedy coding prompts DFlash2 commits 5.43 tokens a round, which is the 367
 tok/s at one lane and the 1,065 tok/s across eight
 ([Four upstream kernel ports](../../findings/2026-09-24-upstream-quick-wins-ab.md)).
 On 200 recorded agent turns replayed with the sampling an agent uses (T=1.0,
-top_p 0.95, top_k 20) it commits 3.46 tokens a round
-([DFlash2 sampled acceptance](../../findings/2026-09-24-dflash2-sampled-acceptance.md)).
+top_p 0.95, top_k 20) it commits 3.46 tokens a round under the fixed draft
+([DFlash2 sampled acceptance](../../findings/2026-09-24-dflash2-sampled-acceptance.md))
+and 3.83 under the sampled draft, the default from 0.11.0
+([The sampled draft served](../../findings/2026-11-13-the-sampled-draft-served-on-the-27b.md)).
 The gap is the predictability of the text and the sampling, not a regression.
 Expect the first figure on code written from a clear instruction and the second
 on an agent's mixed output.
