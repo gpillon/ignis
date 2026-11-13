@@ -56,3 +56,9 @@ vendored accept's to the bit; only the verdict is ours.
   read the accept's outputs as they did.
 - **The drafter's q is kept from the draw to the accept**: its candidates' ids and probabilities, 896 bytes
   a lane at seven drafts, on the drafter's line of the VRAM plan.
+- **Measured** ([finding](../findings/2026-11-13-the-sampled-draft-served-on-the-27b.md)), #578's gate on the
+  RTX 5090: replayed teacher-forced over the recorded agent rounds, the sampled draft commits 3.825 tokens a
+  round against the fixed draft's 3.450, +10.9%. Served, sampled requests decode at 1.15 times the fixed
+  draft's rate at one lane and 1.27 at eight on recorded agent bodies at temperature 1, 1.05 at temperature
+  0.6, and 1.17 and 1.07 at 64K tokens of context; no decode cell is slower, greedy text and prefill are
+  unchanged, and the gate passes.

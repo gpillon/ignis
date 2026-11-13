@@ -329,3 +329,6 @@ Inferred:
   from the branch, then `lever1.py` and the tree net-of-width estimate.
 - Any drafter change (retraining is out of scope here): measure it with the same replay.
   The drafter's 1.47 tokens a round is its ceiling.
+- The one-hot loss is what spec #574's sampled draft takes on: on these rounds, replayed on
+  the card, it commits 3.825 tokens a round against the fixed draft's 3.450, +10.9%
+  ([the sampled draft served](2026-11-13-the-sampled-draft-served-on-the-27b.md)).
