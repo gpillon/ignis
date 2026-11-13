@@ -63,7 +63,11 @@ Two kinds of **retained state** outlive their request:
   state after generation never matches; the opener is the last point every later
   turn provably shares, and costs two or three tokens to re-prefill. A
   conversation keeps at most two: its latest, and the one right after its last
-  real user message.
+  real user message. A `json_schema` request whose schema is
+  [described to the model](../api/structured-output.md#the-schema-described-to-the-model)
+  takes its checkpoint where its conversation ends, before the description:
+  the next turn writes this turn's answer there, so the description is
+  prefilled again with each turn and the conversation before it is not.
 - **A retained prefix** is a shared prefix kept alive with no request holding
   it, published at the end of the system and tools block (rounded down to whole
   KV pages). It serves the next subagent of a burst, which starts with the same

@@ -102,6 +102,14 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   without it the rest is inert. `{"type": "text"}` is a free answer, and
   Flash-Next refuses structured output naming itself
   ([Structured output](structured-output.md)).
+- `ignis_describe_schema` is an **Ignis extension** (from 0.11.0): with
+  `json_schema`, the server describes the schema to the model in a block after
+  the conversation, where the assistant's turn opens, and `false` leaves the
+  prompt as you sent it, for a client whose own prompt already describes the
+  schema. Absent or `null` takes `--model-describe-schema` (on by default);
+  a value that is not a boolean is a 400 naming it. `json_object` adds
+  nothing either way
+  ([the schema, described to the model](structured-output.md#the-schema-described-to-the-model)).
 - Non-streaming returns `choices[].message.content` plus `usage`, and
   `message.refusal`, always `null` (from 0.11.0); streaming
   emits `chat.completion.chunk` SSE frames (token deltas, a final

@@ -183,7 +183,7 @@ pub async fn rewrite(server: &Server, prompt: &str, images: &[RgbaImage], seed: 
     let thinking = ThinkingOptions { enable_thinking: false, ..ThinkingOptions::default() };
     let limits = server.live();
     let params = crate::api::SamplingRequestFields::default().resolve(Some(limits.image.prompt_enhancer_max_tokens), false, false, Some(seed))?;
-    let (input, _, _, media) = match crate::api::prepare_request(server, None, &messages, params, &thinking, &[]).await {
+    let (input, _, _, media) = match crate::api::prepare_request(server, None, &messages, params, &thinking, &[], None).await {
         Ok(prepared) => prepared,
         Err(refused) => return Err(format!("{enhancer} refused the rewrite: {}", error_message(refused).await)),
     };

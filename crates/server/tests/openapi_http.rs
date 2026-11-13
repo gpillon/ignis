@@ -298,6 +298,32 @@ fn every_refused_field_is_named_in_its_operation_description() {
     }
 }
 
+/// GitHub #589: the schema description's off switch is an ignis extension
+/// of the chat contract -- an `ignis_` name, listed with what ignis adds to
+/// OpenAI's fields, a boolean in the request's schema -- and no row of the
+/// OpenAI field table, which classifies OpenAI's own fields.
+#[test]
+fn the_schema_descriptions_switch_is_an_ignis_extension_of_the_chat_contract() {
+    use ignis_server::openai_fields::{table, Surface};
+    let document = document();
+    let chat = document["paths"]["/v1/chat/completions"]["post"]["description"].as_str().unwrap();
+    let (_, added) = chat.split_once("plus what ignis adds to it:").expect("the sentence listing the extensions");
+    let (added, _) = added.split_once('\n').unwrap();
+    assert!(added.contains("`ignis_describe_schema`"), "{added}");
+    assert!(chat.contains("`ignis_describe_schema: false`"), "what the switch does is described: {chat}");
+    // The flattened sampling fields make the request an `allOf`.
+    let request = &document["components"]["schemas"]["ChatCompletionsRequest"];
+    let field = std::iter::once(request)
+        .chain(request["allOf"].as_array().into_iter().flatten())
+        .map(|part| &part["properties"]["ignis_describe_schema"])
+        .find(|field| field.is_object())
+        .unwrap_or_else(|| panic!("a property of the request: {request}"));
+    assert!(field.to_string().contains("boolean"), "{field}");
+    let description = field["description"].as_str().unwrap_or_default();
+    assert!(description.contains("An ignis extension") && description.contains("--model-describe-schema"), "{field}");
+    assert!(table(Surface::Chat).iter().all(|rule| !rule.name.starts_with("ignis_")), "the OpenAI table holds OpenAI's fields");
+}
+
 #[test]
 fn the_document_names_what_the_server_does_not_serve() {
     let description = document()["info"]["description"].as_str().unwrap_or_default().to_owned();

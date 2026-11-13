@@ -357,6 +357,10 @@ pub struct Config {
     /// [`DEFAULT_THINKING_BUDGET`]): the reasoning tokens a request may spend
     /// before the model's close is forced. `None` = no budget (`off`).
     pub thinking_budget: Option<u32>,
+    /// Whether a `json_schema` request's schema is described to the model
+    /// unless the request says otherwise (`--model-describe-schema`, GitHub
+    /// #589).
+    pub describe_schema: bool,
     /// The loop guard (`--model-loop-guard` and its knobs, ADR 0052).
     pub loop_guard: crate::loop_guard::LoopGuardParams,
     /// The prefill chunk width, in tokens (a nonzero multiple of
@@ -1345,6 +1349,7 @@ fn derive(
         enable_thinking: s.model.enable_thinking,
         reasoning_effort: s.model.reasoning_effort,
         thinking_budget: s.model.thinking_budget,
+        describe_schema: s.model.describe_schema,
         loop_guard: crate::loop_guard::LoopGuardParams {
             mode: s.model.loop_guard,
             ratio_permille: s.model.loop_guard_ratio,

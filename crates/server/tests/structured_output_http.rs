@@ -13,9 +13,14 @@
 //! the tokens that close a JSON value first, so a repair with nothing better
 //! to go on moves the answer toward its end, as a model that has to stop
 //! would.
+//!
+//! A `json_schema` request's schema is described to the model after the
+//! conversation (GitHub #589): the template double records what it was asked
+//! to render, and can report the conversation's end as the checkpoint
+//! boundary, as the real template does.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
@@ -30,7 +35,7 @@ use ignis_grammar::{GrammarCache, Vocab, VocabEntry, DEFAULT_CACHE_BYTES, DEFAUL
 use ignis_server::decoder::TokenDecoder;
 use ignis_server::engine::Engine;
 use ignis_server::template::{
-    ChatMessage, RenderedPrompt, SimpleTemplateProvider, TemplateProvider, TemplateRejection,
+    described, ChatMessage, RenderedPrompt, SimpleTemplateProvider, TemplateProvider, TemplateRejection,
 };
 use ignis_server::thinking::{ThinkingCapabilities, ThinkingOptions, THINKING_CLOSE_TEXT};
 use ignis_server::Server;
@@ -100,7 +105,26 @@ fn encode(text: &str) -> Vec<TokenId> {
 #[derive(Clone)]
 struct Vocabulary {
     grammars: Arc<GrammarCache>,
+    /// Every render, in order: the schema description it was asked to put
+    /// after the conversation, and the prompt it made.
+    renders: Arc<Mutex<Vec<Render>>>,
+    /// Report the conversation's end as the real provider does (GitHub
+    /// #589): after the conversation's words come the description's, then a
+    /// generation opener, and the checkpoint boundary is where the
+    /// conversation ends.
+    boundaries: bool,
 }
+
+/// One render the template made.
+#[derive(Clone, Debug)]
+struct Render {
+    description: Option<String>,
+    tokens: Vec<TokenId>,
+}
+
+/// The generation opener [`Vocabulary::with_boundaries`] ends a prompt with:
+/// no text of the vocabulary.
+const GENERATION_OPENER: TokenId = 11;
 
 impl Vocabulary {
     fn new() -> Self {
@@ -111,7 +135,45 @@ impl Vocabulary {
                 (_, None) => VocabEntry::Absent,
             })
             .collect();
-        Self { grammars: Arc::new(GrammarCache::new(Vocab::new(entries, &[STOP]), DEFAULT_CACHE_BYTES)) }
+        Self {
+            grammars: Arc::new(GrammarCache::new(Vocab::new(entries, &[STOP]), DEFAULT_CACHE_BYTES)),
+            renders: Arc::default(),
+            boundaries: false,
+        }
+    }
+
+    /// [`Vocabulary::new`], reporting where the conversation ends.
+    fn with_boundaries() -> Self {
+        Self { boundaries: true, ..Self::new() }
+    }
+
+    fn renders(&self) -> Vec<Render> {
+        self.renders.lock().unwrap().clone()
+    }
+
+    /// The prompt of `messages`, with `description` after them when there is
+    /// one, as the placeholder renders them.
+    fn render(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        description: Option<&str>,
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        let conversation = SimpleTemplateProvider.apply_chat_template(messages, options, tools)?;
+        let mut rendered = match description {
+            Some(description) => SimpleTemplateProvider.apply_chat_template(&described(messages, description), options, tools)?,
+            None => conversation.clone(),
+        };
+        if self.boundaries {
+            rendered.opener_tokens = Some(conversation.tokens.len() as u32);
+            rendered.tokens.push(GENERATION_OPENER);
+        }
+        self.renders
+            .lock()
+            .unwrap()
+            .push(Render { description: description.map(str::to_owned), tokens: rendered.tokens.clone() });
+        Ok(rendered)
     }
 }
 
@@ -122,7 +184,17 @@ impl TemplateProvider for Vocabulary {
         options: &ThinkingOptions,
         tools: &[JsonValue],
     ) -> Result<RenderedPrompt, TemplateRejection> {
-        SimpleTemplateProvider.apply_chat_template(messages, options, tools)
+        self.render(messages, options, tools, None)
+    }
+
+    fn apply_chat_template_described(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        description: &str,
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        self.render(messages, options, tools, Some(description))
     }
 
     fn encode_literal(&self, text: &str) -> Option<Vec<TokenId>> {
@@ -778,4 +850,148 @@ async fn a_schema_sent_again_is_not_compiled_again() {
     let (status, _, text) = post_text(&app, &schema_chat(SCHEMA, false, false, 16)).await;
     assert_eq!(status, 200, "{text}");
     assert_eq!(grammars.compiles() - before, 2, "without strict, a grammar of its own");
+}
+
+// ── the schema description (#589) ────────────────────────────────────────
+
+/// A strict schema, sent with spaces and its keys out of alphabetical order.
+const CAT: &str = r#"{ "type": "object", "properties": { "name": { "type": "string" }, "age": { "type": "integer" } }, "required": ["name", "age"], "additionalProperties": false }"#;
+
+/// What the model is told of [`CAT`] under a format whose `description` is
+/// "A cat.": that description, then the spike's measured sentence and the
+/// schema, compact, its keys in the order sent.
+const CAT_DESCRIBED: &str = "A cat.\n\nRespond with a JSON object that matches this JSON schema:\n\
+{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"age\":{\"type\":\"integer\"}},\"required\":[\"name\",\"age\"],\"additionalProperties\":false}";
+
+/// A chat request for [`CAT`], its format described as "A cat.", with
+/// `extra` fields beside it.
+fn cat_chat(extra: JsonValue) -> String {
+    let mut body = chat(false, 16);
+    body["response_format"] = json!({
+        "type": "json_schema",
+        "json_schema": { "name": "cat", "description": "A cat.", "strict": true, "schema": "SCHEMA" }
+    });
+    for (field, value) in extra.as_object().unwrap() {
+        body[field] = value.clone();
+    }
+    body.to_string().replace("\"SCHEMA\"", CAT)
+}
+
+/// The one render a server over a fresh vocabulary made for `body`.
+async fn render_of(body: &str, server: impl FnOnce(Vocabulary) -> Server) -> Render {
+    let vocabulary = Vocabulary::new();
+    let app = server(vocabulary.clone()).app();
+    let (status, _, text) = post_text(&app, body).await;
+    assert_eq!(status, 200, "{body}: {text}");
+    let renders = vocabulary.renders();
+    assert_eq!(renders.len(), 1, "{renders:?}");
+    renders[0].clone()
+}
+
+fn over_mock(vocabulary: Vocabulary) -> Server {
+    server_over(Arc::new(MockCompute::new()), SchedulerConfig::default(), vocabulary)
+}
+
+/// The prompt the same conversation renders with no `response_format`.
+async fn free_prompt() -> Vec<TokenId> {
+    let mut body = chat(false, 16);
+    body.as_object_mut().unwrap().remove("response_format");
+    render_of(&body.to_string(), over_mock).await.tokens
+}
+
+#[tokio::test]
+async fn a_json_schema_request_describes_its_schema_after_the_conversation() {
+    let render = render_of(&cat_chat(json!({})), over_mock).await;
+    assert_eq!(render.description.as_deref(), Some(CAT_DESCRIBED));
+    // The conversation is the client's, as sent: the description comes after
+    // its last message, never inside it.
+    let free = free_prompt().await;
+    assert!(render.tokens.starts_with(&free) && render.tokens.len() > free.len(), "{render:?}");
+}
+
+#[tokio::test]
+async fn with_the_description_off_the_prompt_is_the_one_rendered_before() {
+    let render = render_of(&cat_chat(json!({ "ignis_describe_schema": false })), over_mock).await;
+    assert_eq!(render.description, None);
+    assert_eq!(render.tokens, free_prompt().await, "byte for byte the free request's prompt");
+}
+
+#[tokio::test]
+async fn json_object_appends_nothing() {
+    for describe in [json!(null), json!(true)] {
+        let mut body = chat(false, 16);
+        body["ignis_describe_schema"] = describe.clone();
+        let render = render_of(&body.to_string(), over_mock).await;
+        assert_eq!(render.description, None, "{describe}");
+        assert_eq!(render.tokens, free_prompt().await, "{describe}");
+    }
+}
+
+/// `--model-describe-schema false` turns the description off for a request
+/// that says nothing, and a request's own field wins over it.
+#[tokio::test]
+async fn the_server_default_is_overridden_by_the_request() {
+    let off = |vocabulary: Vocabulary| over_mock(vocabulary).with_describe_schema(false);
+    assert_eq!(render_of(&cat_chat(json!({})), off).await.description, None);
+    let asked = render_of(&cat_chat(json!({ "ignis_describe_schema": true })), off).await;
+    assert_eq!(asked.description.as_deref(), Some(CAT_DESCRIBED));
+    let on = render_of(&cat_chat(json!({ "ignis_describe_schema": null })), over_mock).await;
+    assert_eq!(on.description.as_deref(), Some(CAT_DESCRIBED), "null is the server's default");
+}
+
+#[tokio::test]
+async fn a_switch_that_is_not_a_boolean_is_refused_naming_it() {
+    let mock = Arc::new(MockCompute::new());
+    let app = server(mock.clone(), SchedulerConfig::default()).app();
+    for value in [json!("false"), json!(0), json!({})] {
+        let (status, _, text) = post_text(&app, &cat_chat(json!({ "ignis_describe_schema": value }))).await;
+        assert_eq!(status, 400, "{value}: {text}");
+        let v: JsonValue = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["error"]["param"], "ignis_describe_schema", "{text}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("boolean"), "{text}");
+    }
+    assert!(mock.prefill_calls().is_empty(), "nothing was generated");
+}
+
+/// Acceptance 2: the description sits after the conversation, so the next
+/// turn resumes from the first turn's checkpoint, taken where its
+/// conversation ended, as its reported cached tokens show.
+#[tokio::test]
+async fn the_next_turn_reuses_the_described_turns_conversation() {
+    const SCHEMA: &str = r#"{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}"#;
+    let mock = Arc::new(MockCompute::new());
+    for request in 0..2 {
+        mock.script(request, &encode("{\"ok\": true}"));
+    }
+    let vocabulary = Vocabulary::with_boundaries();
+    let app = server_over(mock, SchedulerConfig::default(), vocabulary.clone()).app();
+    // Twenty words: past one whole 16-token page, where a checkpoint is taken.
+    let words = (0..20).map(|n| format!("w{n}")).collect::<Vec<_>>().join(" ");
+    let turn = |messages: JsonValue| {
+        json!({
+            "model": MODEL, "messages": messages, "max_tokens": 16, "enable_thinking": false, "temperature": 0,
+            "response_format": { "type": "json_schema", "json_schema": { "name": "ok", "strict": true, "schema": "SCHEMA" } }
+        })
+        .to_string()
+        .replace("\"SCHEMA\"", SCHEMA)
+    };
+    let usage = |text: &str| serde_json::from_str::<JsonValue>(text).unwrap()["usage"].clone();
+    let (status, _, first) = post_text(&app, &turn(json!([{ "role": "user", "content": words }]))).await;
+    assert_eq!(status, 200, "{first}");
+    let first = usage(&first);
+    assert_eq!(first["prompt_tokens_details"]["cached_tokens"], 0);
+    let (status, _, second) = post_text(
+        &app,
+        &turn(json!([
+            { "role": "user", "content": words },
+            { "role": "assistant", "content": "{\"ok\": true}" },
+            { "role": "user", "content": "again" }
+        ])),
+    )
+    .await;
+    assert_eq!(status, 200, "{second}");
+    let renders = vocabulary.renders();
+    assert!(renders.iter().all(|render| render.description.is_some()), "both turns described: {renders:?}");
+    assert!(first["prompt_tokens"].as_u64().unwrap() > 21, "the first prompt carries its description: {first}");
+    assert_eq!(usage(&second)["prompt_tokens_details"]["cached_tokens"], 20, "the first turn's conversation, and only it");
 }

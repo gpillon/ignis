@@ -77,10 +77,53 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
 
 `json_schema` takes the `schema` (required), `strict` (a boolean, `false` when
 absent or `null`), and a `name` and a `description` (strings, both optional).
-The prompt reaches the model as you sent it: ignis does not yet describe the
-schema to the model (GitHub #589). A prompt that names the fields lets the
-model write them itself; the keys and values it gets wrong are repaired into
-place, at some cost in speed.
+The model is told the schema at the end of the prompt, as the next section
+says.
+
+### The schema, described to the model
+
+From 0.11.0, ignis tells the model the schema it answers to. After the
+conversation, where the assistant's turn opens, the prompt gains one block,
+the one a system message after the first renders as:
+
+```text
+<|im_start|>system
+A cat.
+
+Respond with a JSON object that matches this JSON schema:
+{"type":"object","properties":{"name":{"type":"string"}, ...},"required":[...],"additionalProperties":false}<|im_end|>
+<|im_start|>assistant
+```
+
+The block opens with the format's `description` when you send one ("A cat."
+above), then that sentence and the schema, compact, its keys in the order you
+sent them. A schema whose root is not an object (served without `strict`) is
+"a JSON value" instead.
+
+- **Why.** A model that has not read the schema writes key names of its own,
+  and the grammar then repairs nearly every key. Measured on the 27B: 4.2
+  misses per 100 tokens without the description against 0.04 with it, an
+  estimated 8 to 18% of speculative decode speed lost against 1 to 2%, and one
+  recursive schema that ran away to `max_tokens`
+  ([finding](../../findings/2026-11-12-structured-output-grammar-measured-on-the-27b.md)).
+- **Where.** After your last message, never inside it, and before the
+  assistant's turn opens: with thinking on, the model reads the schema before
+  it reasons, and the reasoning stays its own. Your messages render exactly as
+  they would without it.
+- **Reuse across turns.** The checkpoint the next turn resumes from is taken
+  where your conversation ends, before the block
+  ([prompt reuse](../concepts/kv-cache-and-prompt-reuse.md#what-is-kept)): the
+  next turn reuses the whole conversation, and only the block, about as long as
+  the schema, is prefilled again with each turn. `usage.prompt_tokens` counts
+  it.
+- **Turning it off.** A client whose own prompt already describes the schema
+  sends `"ignis_describe_schema": false`, an ignis extension, and its prompt
+  reaches the model byte for byte as sent. `--model-describe-schema false`
+  turns the description off for every request that does not send the field,
+  and a request's `true` turns it back on
+  ([Prompting](../configuration/prompting.md)). A value that is not a boolean
+  is a `400` naming `ignis_describe_schema`.
+- **`json_object`** adds nothing: there is no schema to describe.
 
 ### With `strict: true`
 

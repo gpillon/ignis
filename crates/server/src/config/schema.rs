@@ -391,6 +391,12 @@ config_group! {
         /// is forced; `off` = no budget. A request's own thinking_budget
         /// overrides it.
         thinking_budget: ThinkingBudget = Some(super::DEFAULT_THINKING_BUDGET), NO_RULE, ALL, [Visible, Patchable];
+        /// Whether structured output describes a `json_schema` request's
+        /// schema to the model, in a block after the conversation where the
+        /// assistant's turn opens (ADR 0089): a model that has not read the
+        /// schema misses on nearly every key. A request's own
+        /// ignis_describe_schema overrides it.
+        describe_schema: Bool = true, NO_RULE, ALL, [Visible, Patchable];
         /// The loop guard (ADR 0052): `rewind`, a loop in a request's
         /// reasoning (chat completions, `/v1/responses`) is taken back and
         /// the model nudged, then closed after `loop_guard_retries` nudges;

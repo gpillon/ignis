@@ -265,7 +265,7 @@ pub(crate) async fn prepare(
         .map_err(|message| api::bad_request(&message))?;
     let schemas = ToolSchemas::from_tools(&tools);
     let (mut input, model, mut prompt_tokens, media) =
-        api::prepare_request(server, model, &messages, params, &thinking, &tools).await?;
+        api::prepare_request(server, model, &messages, params, &thinking, &tools, None).await?;
     input.warm_up = warm_up;
     // A warm-up generates nothing, so it has no call to force.
     input.forced_literal = forced.filter(|_| !warm_up);
