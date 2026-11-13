@@ -78,7 +78,8 @@ reviews each piece of code first, greedy and without thinking, and code it
 does not call safe is blocked. The verdict is held to a schema
 ([structured output](../api/structured-output.md)): a reply the model cut or
 garbled can no longer pass as a verdict, and a model that does not serve
-structured output is asked as before. A row under **Tool calls** shows the code, the
+structured output (Flash-Next) is asked as before, over the Responses socket as
+over HTTP. A row under **Tool calls** shows the code, the
 check's verdict, the result and the console.
 
 ## Plan

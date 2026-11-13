@@ -122,7 +122,7 @@ type Outcome =
   | { kind: "completed"; id: string; output: InputItem[] }
   | { kind: "ended" }
   | { kind: "stopped" }
-  | { kind: "failed"; message: string; notFound?: boolean; idleClosed?: boolean };
+  | { kind: "failed"; message: string; code?: string; notFound?: boolean; idleClosed?: boolean };
 
 /** Resolves "stopped" once `signal` aborts, so a wait can give way to a stop. */
 const whenStopped = (signal?: AbortSignal) =>
@@ -317,13 +317,14 @@ export function createResponsesSocket(deps: SocketDeps = {}): ResponsesSocket {
           return end({
             kind: "failed",
             message: event.status !== undefined ? `${event.status}: ${message}` : message,
+            ...(event.error?.code ? { code: event.error.code } : {}),
             notFound: event.error?.code === "previous_response_not_found",
           });
         }
         if (event.type === "response.failed") {
           const error = event.response?.error;
           const message = error?.message ?? "the engine failed the reply";
-          return end({ kind: "failed", message: error?.code ? `${error.code}: ${message}` : message });
+          return end({ kind: "failed", message: error?.code ? `${error.code}: ${message}` : message, ...(error?.code ? { code: error.code } : {}) });
         }
         if (event.type === "response.completed" && event.response) {
           return end({ kind: "completed", id: responseId ?? event.response.id, output: outputItems(event.response) });
@@ -424,7 +425,7 @@ export function createResponsesSocket(deps: SocketDeps = {}): ResponsesSocket {
       if (outcome.kind === "completed") connection.latest.set(streamId, { id: outcome.id, items: [...items, ...outcome.output] });
       if (outcome.kind === "stopped") return stopped();
       timeline.endedAt ??= now();
-      if (outcome.kind === "failed") return { ok: false, message: outcome.message, timeline };
+      if (outcome.kind === "failed") return { ok: false, message: outcome.message, ...(outcome.code ? { code: outcome.code } : {}), timeline };
       return { ok: true, timeline };
     } finally {
       leave(connection);

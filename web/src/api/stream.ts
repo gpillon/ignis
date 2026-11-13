@@ -1,6 +1,6 @@
 import { authHeaders, keyRequired } from "./auth.ts";
 import { withStreamPermit } from "./connections.ts";
-import { apiErrorMessage } from "./errors.ts";
+import { apiErrorCode, apiErrorMessage } from "./errors.ts";
 import { recordEvent, type Timeline } from "../metrics/figures.ts";
 import { buildChatRequest, CHAT_PATH, type ConversationRequest } from "./request.ts";
 import { createResponsesSocket, type ResponsesSocket } from "./socket.ts";
@@ -42,7 +42,12 @@ export type StreamOptions = {
   onQueued?: () => void;
 };
 
-export type StreamResult = { ok: true; timeline: Timeline } | { ok: false; message: string; timeline: Timeline };
+/**
+ * How a reply ended. A failure carries the server's error `code` when it named
+ * one, the same on either wire: what a caller decides by, the message being
+ * for a person.
+ */
+export type StreamResult = { ok: true; timeline: Timeline } | { ok: false; message: string; code?: string; timeline: Timeline };
 
 /** `streamChat` over `socket`; the page's own is below, a test makes one on a fake. */
 export function createStreamChat(socket: ResponsesSocket) {
@@ -82,7 +87,8 @@ async function sendChat(options: ChatStreamOptions): Promise<StreamResult> {
     if (!response.ok) {
       const text = await response.text();
       timeline.endedAt = now();
-      return { ok: false, message: apiErrorMessage(response.status, text), timeline };
+      const code = apiErrorCode(text);
+      return { ok: false, message: apiErrorMessage(response.status, text), ...(code ? { code } : {}), timeline };
     }
     if (!response.body) throw new Error("the response has no body");
 

@@ -146,6 +146,13 @@ describe("streamChatCompletions", () => {
     const body = JSON.stringify({ error: { message: "messages must be non-empty", type: "invalid_request_error", code: null } });
     const result = await streamChatCompletions({ body: {}, fetch: fakeFetch([body], 400), now: ticking(), onEvent: () => {} });
     expect(result).toMatchObject({ ok: false, message: "400: messages must be non-empty" });
+    expect(result).not.toHaveProperty("code");
+  });
+
+  it("carries the error's code, what a caller decides by", async () => {
+    const body = JSON.stringify({ error: { message: "response_format: not served", type: "invalid_request_error", code: "model_unsupported" } });
+    const result = await streamChatCompletions({ body: {}, fetch: fakeFetch([body], 400), now: ticking(), onEvent: () => {} });
+    expect(result).toMatchObject({ ok: false, code: "model_unsupported" });
   });
 
   it("ends a stopped request as partial rather than as an error", async () => {

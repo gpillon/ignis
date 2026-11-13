@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { apiErrorMessage } from "./errors.ts";
+import { apiErrorCode, apiErrorMessage } from "./errors.ts";
+
+describe("apiErrorCode", () => {
+  it("reads the code an OpenAI error names, and nothing else", () => {
+    const body = (code: unknown) => JSON.stringify({ error: { message: "m", type: "invalid_request_error", code } });
+    expect(apiErrorCode(body("model_unsupported"))).toBe("model_unsupported");
+    expect(apiErrorCode(body(null))).toBeUndefined();
+    expect(apiErrorCode("Bad Gateway")).toBeUndefined();
+  });
+});
 
 describe("apiErrorMessage", () => {
   it("shows the OpenAI error message with its status", () => {

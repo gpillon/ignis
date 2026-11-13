@@ -565,6 +565,31 @@ async fn flash_next_refuses_structured_output_naming_the_model() {
     assert!(v["error"]["message"].as_str().unwrap().contains("Qwen3.8-Flash-Next"), "{text}");
 }
 
+/// #594: a client that falls back when the model does not serve structured
+/// output (the Playground's run_js check) decides by the refusal's code, which
+/// is the same on chat completions, on `/v1/responses` over HTTP and over its
+/// WebSocket mode, where the message's words differ (`response_format`,
+/// `text.format`).
+#[tokio::test]
+async fn flash_next_refuses_text_format_with_the_same_code_over_http_and_the_socket() {
+    let flash_next = || server(Arc::new(MockCompute::new()), SchedulerConfig::default()).with_family(ModelFamily::FlashNext);
+    let body = responses_body(r#"{"type":"json_object"}"#, false, 8);
+    let (status, _, text) = post_to(&flash_next().app(), RESPONSES, &body).await;
+    assert_eq!(status, 400, "{text}");
+    let refused: JsonValue = serde_json::from_str(&text).unwrap();
+    assert_eq!((&refused["error"]["code"], &refused["error"]["param"]), (&json!("model_unsupported"), &json!("text.format")), "{text}");
+
+    let live = responses::live(flash_next()).await;
+    let mut socket = responses::socket(&live).await;
+    responses::send_text(&mut socket, create_frame(&body)).await;
+    let events = responses::events_until(&mut socket, responses::terminal).await;
+    let error = events.last().unwrap();
+    assert_eq!(error["type"], "error", "{error}");
+    assert_eq!(error["status"], 400, "{error}");
+    assert_eq!(error["error"]["code"], "model_unsupported", "{error}");
+    assert!(error["error"]["message"].as_str().unwrap().starts_with("text.format:"), "{error}");
+}
+
 #[tokio::test]
 async fn any_other_format_is_refused_and_text_is_a_free_answer() {
     let (app, _) = app("{}");

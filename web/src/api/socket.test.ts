@@ -343,7 +343,7 @@ describe("a reply on the socket", () => {
       status: 400,
       error: { type: "invalid_request_error", code: "context_length_exceeded", message: "the prompt is too long", param: null },
     });
-    expect(await result).toMatchObject({ ok: false, message: "400: the prompt is too long" });
+    expect(await result).toMatchObject({ ok: false, message: "400: the prompt is too long", code: "context_length_exceeded" });
   });
 
   it("fails visibly when the engine fails the response", async () => {
@@ -358,7 +358,7 @@ describe("a reply on the socket", () => {
       stream_id: "s",
       response: { id: "r", status: "failed", error: { code: "request_timeout", message: "the request timed out" } },
     });
-    expect(await result).toMatchObject({ ok: false, message: "request_timeout: the request timed out" });
+    expect(await result).toMatchObject({ ok: false, message: "request_timeout: the request timed out", code: "request_timeout" });
   });
 
   // ADR 0058: under `server.timeout_reply: partial`, the default, a reply its

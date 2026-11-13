@@ -124,17 +124,35 @@ describe("run_js", () => {
     expect((await checkJs("1 + 1", { settings, signal: new AbortController().signal, stream: cut })).verdict).toBe("unsafe");
   });
 
-  it("asks again without the schema where the model answers 400 for it, so Flash-Next sees no new failure", async () => {
-    const bodies: ChatRequest[] = [];
-    const unsupported = async (o: StreamOptions): Promise<StreamResult> => {
-      bodies.push(chatBody(o.request));
-      if (o.request.responseFormat) return { ok: false, message: "400: response_format: structured output is not served by Flash-Next yet (GitHub #581)", timeline };
-      o.onEvent({ kind: "content", text: 'Sure: {"verdict":"safe","reason":"ok"}' });
-      return { ok: true, timeline };
+  // Flash-Next's refusal, as each wire words it: chat completions names
+  // `response_format`, the Responses socket (the default transport) `text.format`.
+  for (const [wire, message] of [
+    ["HTTP", "400: response_format: structured output is not served by Qwen3.8-Flash-Next yet (GitHub #581); send {\"type\": \"text\"} or omit it"],
+    ["the socket", "400: text.format: structured output is not served by Qwen3.8-Flash-Next yet (GitHub #581); send {\"type\": \"text\"} or omit it"],
+  ]) {
+    it(`asks again without the schema where the model does not serve one, over ${wire}, so Flash-Next sees no new failure`, async () => {
+      const bodies: ChatRequest[] = [];
+      const unsupported = async (o: StreamOptions): Promise<StreamResult> => {
+        bodies.push(chatBody(o.request));
+        if (o.request.responseFormat) return { ok: false, message, code: "model_unsupported", timeline };
+        o.onEvent({ kind: "content", text: 'Sure: {"verdict":"safe","reason":"ok"}' });
+        return { ok: true, timeline };
+      };
+      const check = await checkJs("1 + 1", { settings, signal: new AbortController().signal, stream: unsupported });
+      expect(check).toMatchObject({ verdict: "safe", reason: "ok" });
+      expect(bodies.map((body) => "response_format" in body)).toEqual([true, false]);
+    });
+  }
+
+  it("asks nothing again for any other refusal of the held check", async () => {
+    let asked = 0;
+    const refused = async (): Promise<StreamResult> => {
+      asked += 1;
+      return { ok: false, message: "400: response_format: json_schema refused, `allOf` at #: ...", code: "unsupported_keyword", timeline };
     };
-    const check = await checkJs("1 + 1", { settings, signal: new AbortController().signal, stream: unsupported });
-    expect(check).toMatchObject({ verdict: "safe", reason: "ok" });
-    expect(bodies.map((body) => "response_format" in body)).toEqual([true, false]);
+    const check = await checkJs("1 + 1", { settings, signal: new AbortController().signal, stream: refused });
+    expect(check.verdict).toBe("unsafe");
+    expect(asked).toBe(1);
   });
 
   it("reads anything but a clear safe verdict as unsafe", () => {

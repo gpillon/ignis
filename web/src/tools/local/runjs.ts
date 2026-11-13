@@ -202,8 +202,9 @@ export async function checkJs(
     },
     turns: [{ role: "user", content: `Review this code:\n\n\`\`\`js\n${code}\n\`\`\`` }],
   };
-  // The reply is held to the verdict's schema, until a model answers 400 for it
-  // (Flash-Next, #581): then the check is asked as it was, without one.
+  // The reply is held to the verdict's schema, until a model refuses it as one
+  // that does not serve structured output (Flash-Next, #581: `model_unsupported`,
+  // on either wire): then the check is asked as it was, without one.
   let held = true;
   for (let attempt = 0; ; attempt++) {
     let content = "";
@@ -218,7 +219,7 @@ export async function checkJs(
       await sleep(1000, options.signal);
       continue;
     }
-    if (!result.ok && held && /^400: response_format/.test(result.message)) {
+    if (!result.ok && held && result.code === "model_unsupported") {
       held = false;
       continue;
     }
