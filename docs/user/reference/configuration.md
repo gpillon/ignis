@@ -379,6 +379,19 @@ The reasoning_effort of a request that names none. Unset, the template's own def
 
 The reasoning tokens a request may spend before the model's close is forced; `off` = no budget. A request's own thinking_budget overrides it.
 
+### `model.describe_schema`
+
+| | |
+|---|---|
+| Flag | `--model-describe-schema` (may stand bare: `true`) |
+| Env var | `IGNIS_MODEL_DESCRIBE_SCHEMA` |
+| Kind | `bool` |
+| Default | `true` |
+| Models | all |
+| `/v1/config` | shown by `GET`, patchable live |
+
+Whether structured output describes a `json_schema` request's schema to the model, in a block after the conversation where the assistant's turn opens (ADR 0089): a model that has not read the schema misses on nearly every key. A request's own ignis_describe_schema overrides it.
+
 ### `model.loop_guard`
 
 | | |

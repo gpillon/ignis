@@ -850,7 +850,7 @@ pub(crate) fn render_prompt(
     structure: Structure,
 ) -> Result<PreparedRequest, Response> {
     let messages = &conversation(server, messages)?;
-    build_request(server, None, messages, DecodeParams::default(), thinking, tools, structure)
+    build_request(server, None, messages, DecodeParams::default(), thinking, tools, structure, None)
         .map_err(template_rejection)
 }
 
@@ -866,7 +866,10 @@ fn conversation(server: &Server, messages: &[ChatMessage]) -> Result<Vec<ChatMes
 
 /// The request's model, the templated prompt tokens, and the prompt-token
 /// count (the usage figures) — one shared build path for both completion
-/// endpoints.
+/// endpoints. A schema `description` (GitHub #589) is rendered after the
+/// conversation; only a plain [`Structure::Tokens`] render carries one,
+/// since only a completion holds its answer to a schema.
+#[allow(clippy::too_many_arguments)]
 fn build_request(
     server: &Server,
     model: Option<String>,
@@ -875,6 +878,7 @@ fn build_request(
     thinking: &ThinkingOptions,
     tools: &[JsonValue],
     structure: Structure,
+    description: Option<&str>,
 ) -> Result<PreparedRequest, TemplateRejection> {
     // `model` is the model the request names; `None` (or a blank) falls
     // back to the loaded model. A model the engine does not load is
@@ -882,10 +886,15 @@ fn build_request(
     // The template seam: the artifact's frontend object set (artifact-02)
     // replaces this built-in provider through the same constructor
     // injection (v1 placeholder: deterministic word-hash tokens).
-    let rendered = match structure {
-        Structure::PartEnds => server.active().template.apply_chat_template_with_part_ends(messages, thinking, tools)?,
-        Structure::Text => server.active().template.apply_chat_template_with_text(messages, thinking, tools)?,
-        Structure::Tokens => server.active().template.apply_chat_template(messages, thinking, tools)?,
+    let active = server.active();
+    let template = &active.template;
+    let rendered = match (structure, description) {
+        (Structure::Tokens, Some(description)) => {
+            template.apply_chat_template_described(messages, thinking, tools, description)?
+        }
+        (Structure::PartEnds, _) => template.apply_chat_template_with_part_ends(messages, thinking, tools)?,
+        (Structure::Text, _) => template.apply_chat_template_with_text(messages, thinking, tools)?,
+        (Structure::Tokens, None) => template.apply_chat_template(messages, thinking, tools)?,
     };
     request_input(server, model, rendered, params, None)
 }
@@ -947,6 +956,11 @@ pub(crate) enum Structure {
 /// disconnect) stops that work before anything is submitted — then its
 /// placeholders expanded, so `prompt_tokens` counts the image tokens. The
 /// fourth value is the acquisition summary the request's events carry.
+///
+/// A schema `description` ([`HeldAnswer::description`], GitHub #589) is
+/// rendered after the conversation, where the assistant's turn opens, and
+/// the checkpoint the next turn resumes from is cut where the conversation
+/// ends ([`TemplateProvider::apply_chat_template_described`]).
 pub(crate) async fn prepare_request(
     server: &Server,
     model: Option<String>,
@@ -954,13 +968,16 @@ pub(crate) async fn prepare_request(
     params: DecodeParams,
     thinking: &ThinkingOptions,
     tools: &[JsonValue],
+    description: Option<&str>,
 ) -> Result<(RequestInput, String, u32, Option<MediaStats>), Response> {
-    let prepared = prepare_input(server, model, messages, params, thinking, tools, Structure::Tokens).await?;
+    let prepared =
+        prepare_input(server, model, messages, params, thinking, tools, Structure::Tokens, description).await?;
     Ok((prepared.input, prepared.model, prepared.prompt_tokens, prepared.media))
 }
 
 /// [`prepare_request`], reporting the last message's part ends (GitHub #270)
 /// or the rendered text (GitHub #275) too when `structure` asks for them.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_input(
     server: &Server,
     model: Option<String>,
@@ -969,16 +986,18 @@ async fn prepare_input(
     thinking: &ThinkingOptions,
     tools: &[JsonValue],
     structure: Structure,
+    description: Option<&str>,
 ) -> Result<PreparedRequest, Response> {
     // GitHub #209: instruction messages are placed under the server's
     // policies before any template sees the conversation, on both paths;
-    // ADR 0052: assistant reasoning is repaired.
+    // ADR 0052: assistant reasoning is repaired. A schema description is
+    // added after them, by the template, so no policy moves it.
     let messages = &conversation(server, messages)?;
     // One model for the whole render: the acquirer and the template that
     // expands its placeholders must be the same load's.
     let model_loaded = server.active();
     let Some(acquirer) = model_loaded.media.as_ref().filter(|_| has_media(messages)) else {
-        return build_request(server, model, messages, params, thinking, tools, structure)
+        return build_request(server, model, messages, params, thinking, tools, structure, description)
             .map_err(template_rejection);
     };
     // The request's own deadline (ADR 0058): at 0, none, and only each
@@ -987,9 +1006,13 @@ async fn prepare_input(
     let acquired = acquirer.acquire(messages, deadline).await.map_err(media_rejection)?;
     // A media prompt reports no text: a `locate` refuses a parts `state`
     // before it renders one.
-    let prepared = match structure {
-        Structure::PartEnds => model_loaded.template.prepare_multimodal_with_part_ends(messages, thinking, tools, acquired.media),
-        Structure::Tokens | Structure::Text => model_loaded.template.prepare_multimodal(messages, thinking, tools, acquired.media),
+    let template = &model_loaded.template;
+    let prepared = match (structure, description) {
+        (Structure::Tokens, Some(description)) => {
+            template.prepare_multimodal_described(messages, thinking, tools, acquired.media, description)
+        }
+        (Structure::PartEnds, _) => template.prepare_multimodal_with_part_ends(messages, thinking, tools, acquired.media),
+        (Structure::Tokens | Structure::Text, _) => template.prepare_multimodal(messages, thinking, tools, acquired.media),
     };
     let (rendered, multimodal) = prepared.map_err(content_rejection)?;
     let prepared =
@@ -1019,7 +1042,7 @@ pub(crate) async fn prepare_decision_request(
     thinking: &ThinkingOptions,
     structure: Structure,
 ) -> Result<PreparedRequest, (&'static str, String)> {
-    prepare_input(server, model, messages, params, thinking, &[], structure)
+    prepare_input(server, model, messages, params, thinking, &[], structure, None)
         .await
         .map_err(|response| {
             // The shared path answers with a rendered `Response`, which is
@@ -1573,8 +1596,8 @@ pub(crate) enum AnswerFormat<'a> {
     JsonSchema(SchemaFormat<'a>),
 }
 
-/// A `json_schema` format: the schema as the client sent it, and its
-/// `strict` flag.
+/// A `json_schema` format: the schema as the client sent it, its `strict`
+/// flag, and its `description`.
 pub(crate) struct SchemaFormat<'a> {
     /// The schema's own text. A `serde_json::Value` sorts an object's keys,
     /// and the answer writes its keys in the schema's order, so the grammar
@@ -1584,6 +1607,70 @@ pub(crate) struct SchemaFormat<'a> {
     /// else refused; `false`, absent or `null`: what can be enforced is, the
     /// rest is inert.
     pub strict: bool,
+    /// What the answer is for, in the client's words: OpenAI's field, which
+    /// the model reads ([`SchemaFormat::describe`]).
+    pub description: Option<String>,
+}
+
+impl SchemaFormat<'_> {
+    /// What the prompt tells the model of the answer (GitHub #589, ADR
+    /// 0089): the format's `description` when it sent one, then the sentence
+    /// the #287 spike measured -- 0.04 misses per 100 tokens against 4.2 with
+    /// no description -- and the schema, compact, its keys in the order sent.
+    pub(crate) fn describe(&self) -> String {
+        let parsed = ignis_grammar::json::Json::parse(self.schema.get()).ok();
+        let schema = match &parsed {
+            Some(json) => {
+                let mut compact = Vec::new();
+                json.write_canonical(&mut compact);
+                String::from_utf8_lossy(&compact).into_owned()
+            }
+            None => self.schema.get().trim().to_owned(),
+        };
+        let shape = match parsed.as_ref().and_then(|json| json.get("type")).and_then(|kind| kind.as_str()) {
+            Some("object") => "a JSON object",
+            _ => "a JSON value",
+        };
+        let instruction = format!("Respond with {shape} that matches this JSON schema:\n{schema}");
+        match self.description.as_deref().map(str::trim).filter(|purpose| !purpose.is_empty()) {
+            Some(purpose) => format!("{purpose}\n\n{instruction}"),
+            None => instruction,
+        }
+    }
+}
+
+/// The request field that turns the schema description off (GitHub #589):
+/// an ignis extension, so an ignis name.
+pub(crate) const DESCRIBE_SCHEMA: &str = "ignis_describe_schema";
+
+/// Whether a request's schema is described to the model (GitHub #589, ADR
+/// 0089): its [`DESCRIBE_SCHEMA`] field, a boolean, or the server's
+/// `--model-describe-schema` when the field is absent or `null`. Anything
+/// else is a 400 naming the field. Read on every request, as every field the
+/// handler reads is validated whatever else the request asks for.
+pub(crate) fn describe_schema(server: &Server, field: Option<&JsonValue>) -> Result<bool, Response> {
+    match field {
+        None | Some(JsonValue::Null) => Ok(server.live().default_describe_schema),
+        Some(JsonValue::Bool(describe)) => Ok(*describe),
+        Some(other) => Err(bad_request_param(
+            &format!(
+                "{DESCRIBE_SCHEMA} is an ignis extension and must be a boolean: false leaves a json_schema request's schema out of the prompt (got {other})"
+            ),
+            DESCRIBE_SCHEMA,
+        )),
+    }
+}
+
+/// A request's answer held to a grammar, and what its prompt says of it
+/// (GitHub #587, #589): what [`hold_answer`] answers a format that is not
+/// free with.
+pub(crate) struct HeldAnswer {
+    /// The grammar each sampled token of the answer is checked against.
+    pub grammar: ignis_core::structured::AnswerGrammar,
+    /// The schema description the prompt carries after the conversation
+    /// ([`SchemaFormat::describe`]); `None` for `json_object`, and when the
+    /// request or the server turned it off.
+    pub description: Option<String>,
 }
 
 /// `response_format`'s format: `{"type": "text"}` (or absent, or `null`),
@@ -1652,28 +1739,45 @@ pub(crate) fn schema_format<'a>(members: &'a RawValue, at: &str, param: &str) ->
         Some(JsonValue::Bool(strict)) => strict,
         Some(_) => return Err(refused("`strict` must be a boolean".to_owned())),
     };
+    let description = members.description.and_then(|description| description.as_str().map(str::to_owned));
     match members.schema {
-        Some(schema) => Ok(SchemaFormat { schema, strict }),
+        Some(schema) => Ok(SchemaFormat { schema, strict, description }),
         None => Err(refused("`schema` is required: the JSON Schema the answer is held to".to_owned())),
     }
 }
 
 /// What `response_format` asks of a chat completion (GitHub #587, #588,
-/// spec #287, ADR 0089): a free answer, or one held to a grammar. The
-/// prompt need not mention JSON, and nothing is added to it.
+/// #589, spec #287, ADR 0089): a free answer, or one held to a grammar, beside
+/// the request's resolved `tools` and `tool_choice` (#592). The prompt need
+/// not mention JSON; a `json_schema` request's schema is described after the
+/// conversation unless `describe` (the request's [`DESCRIBE_SCHEMA`]) or the
+/// server turns it off.
 pub(crate) fn structured_output(
     server: &Server,
     format: Option<&RawValue>,
+    describe: Option<&JsonValue>,
     thinking: &ThinkingOptions,
+    tools: &[JsonValue],
     tool_choice: &ToolChoice,
-) -> Result<Option<ignis_core::structured::AnswerGrammar>, Response> {
-    hold_answer(server, chat_answer_format(format)?, thinking, tool_choice, "response_format")
+) -> Result<Option<HeldAnswer>, Response> {
+    let describe = describe_schema(server, describe)?;
+    hold_answer(server, chat_answer_format(format)?, describe, thinking, tools, tool_choice, "response_format")
 }
 
 /// The grammar a request's answer is held to, for a format read from the
 /// request's `param` (`response_format`, or `text.format` on the Responses
 /// API, #591): `json_object`'s, or the schema's, compiled once per distinct
-/// schema and kept (`model.grammar_cache_bytes`).
+/// schema and kept (`model.grammar_cache_bytes`). With `describe`, a
+/// `json_schema` answer comes with its schema description, which the prompt
+/// carries after the conversation ([`prepare_request`]'s `description`).
+///
+/// Beside `tools` (resolved: none under `tool_choice: "none"`) each turn
+/// either calls a tool or answers under the grammar (GitHub #592). Under
+/// `"auto"` the grammar admits the tool call's opener until the answer
+/// starts, and a turn that opens a call is released from it; under
+/// `"required"` or a named function the turn is the call the forced literal
+/// opens ([`forced_tool_call`]), held to nothing, so no grammar is returned.
+/// The format is checked all the same: the next turn is held to it.
 ///
 /// Refused with a 400 naming `param`, before anything is generated: a
 /// schema the grammar refuses, with the refusal's own code and a message
@@ -1681,15 +1785,18 @@ pub(crate) fn structured_output(
 /// `strict`, OpenAI's four limits always); a model that does not serve
 /// structured output, naming it (Flash-Next, #581); a provider whose
 /// vocabulary cannot be read as bytes; with thinking on, a tokenizer with
-/// no single-token `</think>` to start the answer after; and a forced tool
-/// call beside it, until a turn may open a call under the grammar (#592).
+/// no single-token `</think>` to start the answer after; and tools a turn
+/// may call on a tokenizer whose `<tool_call>` is not one token, which the
+/// grammar could not admit.
 pub(crate) fn hold_answer(
     server: &Server,
     format: AnswerFormat<'_>,
+    describe: bool,
     thinking: &ThinkingOptions,
+    tools: &[JsonValue],
     tool_choice: &ToolChoice,
     param: &str,
-) -> Result<Option<ignis_core::structured::AnswerGrammar>, Response> {
+) -> Result<Option<HeldAnswer>, Response> {
     use ignis_core::structured::{AnswerGrammar, StructuredKind};
     let refused = |code: &str, message: String| {
         error_response_naming(StatusCode::BAD_REQUEST, "invalid_request_error", code, message, Some(param))
@@ -1707,23 +1814,17 @@ pub(crate) fn hold_answer(
             ),
         ));
     }
-    if matches!(tool_choice, ToolChoice::Required | ToolChoice::Function(_)) {
-        return Err(refused(
-            "unsupported_value",
-            format!("{param}: a forced tool call beside structured output is not served yet (GitHub #592); send tool_choice \"auto\", or omit {param}"),
-        ));
-    }
     let Some(grammars) = active.template.grammars() else {
         return Err(refused(
             "unsupported_value",
             format!("{param}: this server's tokenizer cannot be read as bytes, so no answer can be held to a grammar here; omit {param}"),
         ));
     };
-    let grammar = match format {
+    let (grammar, description) = match format {
         AnswerFormat::Free => return Ok(None),
-        AnswerFormat::JsonObject => AnswerGrammar::new(grammars.json_object(), StructuredKind::JsonObject),
+        AnswerFormat::JsonObject => (AnswerGrammar::new(grammars.json_object(), StructuredKind::JsonObject), None),
         AnswerFormat::JsonSchema(schema) => match grammars.json_schema(schema.schema.get(), schema.strict) {
-            Ok(grammar) => AnswerGrammar::new(grammar, StructuredKind::JsonSchema),
+            Ok(grammar) => (AnswerGrammar::new(grammar, StructuredKind::JsonSchema), describe.then(|| schema.describe())),
             Err(refusal) => {
                 return Err(refused(
                     refusal.code,
@@ -1732,22 +1833,37 @@ pub(crate) fn hold_answer(
             }
         },
     };
-    if !active.template.decoder_starts_in_reasoning(thinking) {
-        return Ok(Some(grammar));
-    }
     // With thinking on the reasoning stays free, and the answer is held from
     // the token after the block's `</think>`, which the scheduler sees as
     // one token.
-    match active
-        .template
-        .encode_literal(crate::thinking::THINK_END_TEXT)
-        .filter(|ids| ids.len() == 1)
-    {
-        Some(ids) => Ok(Some(grammar.after(ids[0]))),
-        None => Err(refused(
-            "unsupported_value",
-            format!("{param}: with thinking on, the answer is held from the token after the reasoning's </think>, and this tokenizer has no single-token </think>; send enable_thinking: false"),
-        )),
+    let grammar = match active.template.decoder_starts_in_reasoning(thinking) {
+        false => grammar,
+        true => match active.template.encode_literal(crate::thinking::THINK_END_TEXT).filter(|ids| ids.len() == 1) {
+            Some(ids) => grammar.after(ids[0]),
+            None => {
+                return Err(refused(
+                    "unsupported_value",
+                    format!("{param}: with thinking on, the answer is held from the token after the reasoning's </think>, and this tokenizer has no single-token </think>; send enable_thinking: false"),
+                ));
+            }
+        },
+    };
+    // A forced call's turn writes no answer, so it is told no schema.
+    match tool_choice {
+        ToolChoice::Required | ToolChoice::Function(_) => Ok(None),
+        ToolChoice::None => Ok(Some(HeldAnswer { grammar, description })),
+        ToolChoice::Auto if tools.is_empty() => Ok(Some(HeldAnswer { grammar, description })),
+        ToolChoice::Auto => {
+            // The grammar never accepts the opener, a control token, so it can
+            // tell the opener from the answer's first token only when it is one.
+            match active.template.encode_literal(crate::toolcall::OPEN_TAG).filter(|ids| ids.len() == 1) {
+                Some(ids) => Ok(Some(HeldAnswer { grammar: grammar.admitting_tool_call(ids[0]), description })),
+                None => Err(refused(
+                    "unsupported_value",
+                    format!("{param}: beside tools, a turn may open a tool call instead of the answer, and this tokenizer has no single-token <tool_call> to admit; send tool_choice \"none\", or omit {param}"),
+                )),
+            }
+        }
     }
 }
 
@@ -2647,6 +2763,14 @@ struct ChatCompletionsRequest {
     /// schema's keys keep their order, which the answer's follow.
     #[schema(value_type = Object)]
     response_format: Option<Box<RawValue>>,
+    /// An ignis extension (GitHub #589, ADR 0089): whether a `json_schema`
+    /// request's schema is described to the model, in a block after the
+    /// conversation where the assistant's turn opens. `false` leaves the
+    /// prompt as sent, for a client whose own prompt already describes the
+    /// schema; absent or `null` takes `--model-describe-schema` (on by
+    /// default). `json_object` and a free answer add nothing either way.
+    #[schema(value_type = Option<bool>)]
+    ignis_describe_schema: Option<JsonValue>,
     /// The Lane tag (GitHub #120, `GLOSSARY.md`): an ignis extension, not an
     /// OpenAI parameter (the way `top_k` went in at #101). `"interactive"`
     /// (default) or `"agent"`, the admission class `admission.rs` schedules
@@ -2680,7 +2804,7 @@ struct StreamOptions {
     tag = "chat",
     operation_id = "chat_completions",
     summary = "A chat completion, streaming or not",
-    description = "The OpenAI chat-completions contract, plus what ignis adds to it: `top_k`, `ignore_eos`, the thinking controls (`enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs`, `thinking_budget`), and the `class` lane tag the scheduler admits under.
+    description = "The OpenAI chat-completions contract, plus what ignis adds to it: `top_k`, `ignore_eos`, the thinking controls (`enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs`, `thinking_budget`), `ignis_describe_schema`, and the `class` lane tag the scheduler admits under.
 
 `stream: false` answers one JSON body. `stream: true` answers `text/event-stream`: one `data:` line per chunk in the `chat.completion.chunk` shape, a final chunk carrying `finish_reason` and an empty `delta`, then a literal `data: [DONE]` line. With `stream_options.include_usage: true` a usage-only chunk (empty `choices`) precedes it. A request the engine could not run ends instead with one `{\"error\": {message, type, code}}` chunk (type and code `engine_error`) and then `[DONE]`: the status is already 200 by then.
 
@@ -2688,7 +2812,7 @@ Every request has a deadline from its admission (ADR 0058): `--server-request-ti
 
 Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text. `tool_choice` takes `\"auto\"` (the default), `\"none\"`, `\"required\"` and a named function. The last two force the call's opening -- `<tool_call>` and the function tag, with the name when one is named -- and the model writes the rest: with thinking off the opening is the first thing generated, with thinking on the first thing after the reasoning block closes. A forced call that never closes is dropped like any other, and `finish_reason` says why.
 
-`response_format: {\"type\": \"json_object\"}` holds the answer to a valid JSON object, streamed or not: each sampled token is checked against the grammar before the model consumes it, and a miss is repaired from the same scores restricted to the tokens that keep the object valid. With thinking on the reasoning stays free and the answer is held from the token after its `</think>`. Whitespace runs are bounded, the prompt need not mention JSON, a cut by `max_tokens` returns the object as generated with `finish_reason: \"length\"`, and `message.refusal` is always null. `{\"type\": \"json_schema\", \"json_schema\": {\"name\", \"schema\", \"strict\"}}` holds it to the schema the same way: under `strict: true` OpenAI's strict subset, all of it enforced, keys in the schema's order; without it what can be enforced is and the rest is inert. A schema already seen is not compiled again. `{\"type\": \"text\"}` is a free answer.
+`response_format: {\"type\": \"json_object\"}` holds the answer to a valid JSON object, streamed or not: each sampled token is checked against the grammar before the model consumes it, and a miss is repaired from the same scores restricted to the tokens that keep the object valid. With thinking on the reasoning stays free and the answer is held from the token after its `</think>`. Whitespace runs are bounded, the prompt need not mention JSON, a cut by `max_tokens` returns the object as generated with `finish_reason: \"length\"`, and `message.refusal` is always null. `{\"type\": \"json_schema\", \"json_schema\": {\"name\", \"schema\", \"strict\"}}` holds it to the schema the same way: under `strict: true` OpenAI's strict subset, all of it enforced, keys in the schema's order; without it what can be enforced is and the rest is inert. A schema already seen is not compiled again. The schema is described to the model in a block after the conversation, where the assistant's turn opens, before any reasoning: the format's `description`, then `Respond with a JSON object that matches this JSON schema:` and the schema, compact. `ignis_describe_schema: false` (an ignis extension; absent or `null` takes `--model-describe-schema`, on by default) leaves the prompt as sent; `json_object` adds nothing. The next turn resumes from where this turn's conversation ended. `{\"type\": \"text\"}` is a free answer. Beside `tools` each turn either calls a tool or answers under the grammar: until the answer starts the grammar also admits `<tool_call>`, and a turn that opens a call is released from it for that turn, its call written and parsed as any other; `tool_choice: \"required\"` or a named function forces the call, and that turn is not held, nor told the schema.
 
 `max_completion_tokens` is `max_tokens` under its current name: the one cap on generated tokens, reasoning included; both sent with different values is a 400. `stop` (a string, or 1 to 4 strings) ends the answer before the first sequence to appear in its content, with `finish_reason: \"stop\"`; the sequence is never emitted, a stream holds back a possible prefix until the next delta resolves it, and it is never matched in the reasoning nor inside a tool call. `usage.prompt_tokens_details.cached_tokens` is the prompt this request resumed from retained state instead of prefilling, the quantity `/v1/responses` reports.
 
@@ -2699,7 +2823,7 @@ Tool calls come back whole -- one complete `tool_calls` delta per call, never a 
             (ChatCompletion = "application/json"),
             (Chunk = "text/event-stream"),
         ), headers(("ignis-stopped-by" = String, description = "`request_timeout` on an answer its deadline cut, answered whole under `--server-timeout-reply partial` (ADR 0058); absent otherwise.")),),
-        (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take. Or `response_format` asks for what this model does not serve (`param: response_format`): a schema the grammar refuses, with the refusal's own code (`unsupported_keyword`, `too_many_properties`, ...) and a message naming the keyword or the limit and where; a `json_schema` with no `schema`; any type but `text`, `json_object` and `json_schema`; structured output beside a forced tool call; and on Qwen3.8-Flash-Next any structured output (`model_unsupported`, naming the model).", body = ApiError),
+        (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take, an `ignis_describe_schema` that is not a boolean. Or `response_format` asks for what this model does not serve (`param: response_format`): a schema the grammar refuses, with the refusal's own code (`unsupported_keyword`, `too_many_properties`, ...) and a message naming the keyword or the limit and where; a `json_schema` with no `schema`; any type but `text`, `json_object` and `json_schema`; `tools` a turn may call on a tokenizer whose `<tool_call>` is not one token; and on Qwen3.8-Flash-Next any structured output (`model_unsupported`, naming the model).", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 409, description = "The model that would serve the request is the image model: the one loaded, with no `model` naming a text model to switch to, or the one `model` names (`model_kind_mismatch`, naming both kinds and the loaded id). Or `model` names a catalog entry this card cannot load, and no entry that answers to it can: by its class (`model_above_card_class`, naming the entry's class and the card's, ADR 0064) or by its GPU generation, alone or with its class (`model_above_gpu_generation`, naming the generation the entry needs and the card's name, compute capability and generation, ADR 0079): refused before anything loads or switches, the loaded model serving on.", body = ApiError),
@@ -2783,9 +2907,20 @@ async fn chat_completions(
         Ok(forced) => forced,
         Err(response) => return response,
     };
-    let grammar = match structured_output(&server, req.response_format.as_deref(), &thinking, &tool_choice) {
-        Ok(grammar) => grammar,
+    let held = match structured_output(
+        &server,
+        req.response_format.as_deref(),
+        req.ignis_describe_schema.as_ref(),
+        &thinking,
+        &tools,
+        &tool_choice,
+    ) {
+        Ok(held) => held,
         Err(response) => return response,
+    };
+    let (grammar, description) = match held {
+        Some(held) => (Some(held.grammar), held.description),
+        None => (None, None),
     };
     let (model, class) = match resolve_model_and_class(req.model, req.class) {
         Ok(x) => x,
@@ -2793,7 +2928,7 @@ async fn chat_completions(
     };
     let schemas = ToolSchemas::from_tools(&tools);
     let (mut input, model, prompt_tokens, media) =
-        match prepare_request(&server, model, &req.messages, params, &thinking, &tools).await {
+        match prepare_request(&server, model, &req.messages, params, &thinking, &tools, description.as_deref()).await {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
@@ -3961,6 +4096,27 @@ pub(crate) struct ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GitHub #589: the description is the spike's sentence and the schema,
+    /// compact and in the order sent; a root that is not an object is a JSON
+    /// value, and a blank `description` adds nothing.
+    #[test]
+    fn a_schema_is_described_compact_and_in_its_own_order() {
+        let described = |format: &str| {
+            let members = RawValue::from_string(format.to_owned()).unwrap();
+            schema_format(&members, "response_format.json_schema", "response_format")
+                .unwrap_or_else(|_| panic!("a format: {format}"))
+                .describe()
+        };
+        assert_eq!(
+            described(r#"{"schema": {"type": "object", "properties": {"z": {"type": "number", "minimum": 1.50}}}}"#),
+            "Respond with a JSON object that matches this JSON schema:\n{\"type\":\"object\",\"properties\":{\"z\":{\"type\":\"number\",\"minimum\":1.5}}}"
+        );
+        assert_eq!(
+            described(r#"{"description": "  ", "schema": {"type": "array", "items": {"type": "string"}}}"#),
+            "Respond with a JSON value that matches this JSON schema:\n{\"type\":\"array\",\"items\":{\"type\":\"string\"}}"
+        );
+    }
 
     /// Spec model-switch/02: every `/v1` operation the reference documents
     /// is classified for idle unload — it uses the model ([`uses_the_model`],

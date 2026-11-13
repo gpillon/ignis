@@ -414,7 +414,10 @@ pub struct RenderedPrompt {
     /// The templated prompt tokens.
     pub tokens: Vec<TokenId>,
     /// How many leading tokens end at the **generation opener**, the
-    /// rendered prompt's last `<|im_start|>assistant\n`.
+    /// rendered prompt's last `<|im_start|>assistant\n`. With a schema
+    /// description (GitHub #589), where the description begins instead: the
+    /// end of the conversation, which is the last point the next turn shares
+    /// ([`TemplateProvider::apply_chat_template_described`]).
     ///
     /// `None` when the render has no opener, or when the opener's byte
     /// offset does not tokenize to an exact token prefix of the whole prompt
@@ -561,6 +564,31 @@ pub trait TemplateProvider: Send + Sync {
         self.apply_chat_template(messages, options, tools)
     }
 
+    /// [`TemplateProvider::apply_chat_template`] with a **schema
+    /// description** (GitHub #589, ADR 0089) between the conversation and
+    /// the generation opener: the server's own instruction block, rendered as
+    /// an instruction message after the last one ([`described`]), so the
+    /// model reads the schema before its turn opens.
+    ///
+    /// The prompt's checkpoint boundary, [`RenderedPrompt::opener_tokens`],
+    /// is then where the description begins: the end of the conversation,
+    /// the last point the next turn shares, since the next turn renders this
+    /// turn's answer where the description stood.
+    ///
+    /// The default renders [`described`] and reports no such boundary, which
+    /// fails closed: a provider that cannot say where its conversation ends
+    /// takes no checkpoint, rather than one its next turn never matches.
+    fn apply_chat_template_described(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        description: &str,
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        let rendered = self.apply_chat_template(&described(messages, description), options, tools)?;
+        Ok(RenderedPrompt { opener_tokens: None, ..rendered })
+    }
+
     /// The **answer alphabet** this provider's tokenizer can name (GitHub
     /// #237, #239): the labels `/v1/decide` gives a decision's options.
     ///
@@ -696,6 +724,31 @@ pub trait TemplateProvider: Send + Sync {
     ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
         self.prepare_multimodal(messages, options, tools, media)
     }
+
+    /// [`TemplateProvider::prepare_multimodal`] with a schema description,
+    /// as [`TemplateProvider::apply_chat_template_described`] places it and
+    /// with the same default.
+    fn prepare_multimodal_described(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        media: Vec<PreparedMedia>,
+        description: &str,
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
+        let (rendered, multimodal) = self.prepare_multimodal(&described(messages, description), options, tools, media)?;
+        Ok((RenderedPrompt { opener_tokens: None, ..rendered }, multimodal))
+    }
+}
+
+/// `messages` with `description` after them as an instruction message: what
+/// a provider renders for a schema description (GitHub #589). The server adds
+/// it after the instruction policies have placed the client's own messages
+/// (`crate::instruction`), so no policy moves it.
+pub fn described(messages: &[ChatMessage], description: &str) -> Vec<ChatMessage> {
+    let mut described = messages.to_vec();
+    described.push(ChatMessage::text("system", description));
+    described
 }
 
 /// A prepared prompt's refusal as a content rejection: the processor's own

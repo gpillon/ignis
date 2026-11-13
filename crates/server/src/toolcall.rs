@@ -64,7 +64,9 @@ use std::collections::HashMap;
 
 use serde_json::Value as JsonValue;
 
-const OPEN_TAG: &str = "<tool_call>";
+/// The tool-call dialect's opening tag: one token on the Qwen tokenizers, which
+/// a turn may write instead of a structured answer (GitHub #592).
+pub(crate) const OPEN_TAG: &str = "<tool_call>";
 const CLOSE_TAG: &str = "</tool_call>";
 const FUNCTION_PREFIX: &str = "<function=";
 const FUNCTION_CLOSE: &str = "</function>";

@@ -283,6 +283,35 @@ pub const RESPONSES: &[FieldRule] = &[
     FieldRule { name: "client_metadata", inert: always, inert_when: ALWAYS, refusal: None },
 ];
 
+/// A member of a field the handler reads (`tools`) that is accepted at any
+/// value and inert: it asks for something this server does not do yet, and
+/// changes nothing it does. The template still renders it as sent.
+pub struct InertMember {
+    /// Where it sits in the body, as the document names it.
+    pub path: &'static str,
+    /// What it would ask for, and the issue that will serve it.
+    pub why: &'static str,
+}
+
+/// `strict` on a function tool (spec #287): the call's arguments are the
+/// model's own text, parsed as they come.
+const TOOL_STRICT: &str = "a call's arguments are not held to the function's `parameters` yet (GitHub #582)";
+
+/// The chat body's inert members.
+pub const CHAT_MEMBERS: &[InertMember] = &[InertMember { path: "tools[].function.strict", why: TOOL_STRICT }];
+
+/// The Responses body's inert members: its function tools are flat.
+pub const RESPONSES_MEMBERS: &[InertMember] = &[InertMember { path: "tools[].strict", why: TOOL_STRICT }];
+
+/// The inert members of `surface`'s body.
+pub fn members(surface: Surface) -> &'static [InertMember] {
+    match surface {
+        Surface::Chat => CHAT_MEMBERS,
+        Surface::Responses => RESPONSES_MEMBERS,
+        Surface::Images | Surface::Transcriptions => &[],
+    }
+}
+
 /// The Images API's fields past what the image routes read
 /// (`crate::images::routes`): `response_format`, `output_format`,
 /// `background`, `size`, `n` and `mask` are refused where they are read.
@@ -386,6 +415,13 @@ pub fn describe(surface: Surface) -> String {
             rule.inert_when,
             rule.refusal.expect("filtered")
         ));
+    }
+    let members = members(surface);
+    if !members.is_empty() {
+        text.push_str("\nInert at any value inside a field the server reads:\n\n");
+        for member in members {
+            text.push_str(&format!("- `{}`: {}.\n", member.path, member.why));
+        }
     }
     text
 }
@@ -521,5 +557,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Spec #287: `strict` on a function tool is declared inert where the
+    /// document lists the fields, on both completion surfaces, naming #582.
+    #[test]
+    fn the_description_declares_a_function_tools_strict_inert() {
+        for (surface, path) in [(Surface::Chat, "`tools[].function.strict`"), (Surface::Responses, "`tools[].strict`")] {
+            let text = describe(surface);
+            let line = text.lines().find(|line| line.contains(path)).unwrap_or_else(|| panic!("{surface:?}: {text}"));
+            assert!(line.contains("#582") && line.contains("`parameters`"), "{surface:?}: {line}");
+        }
+        assert!(!describe(Surface::Images).contains("strict"));
     }
 }

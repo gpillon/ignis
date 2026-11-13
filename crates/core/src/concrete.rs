@@ -2488,7 +2488,9 @@ impl ConcreteScheduler {
             return Held::Kept;
         };
         match state.check(draw) {
-            Verdict::Passed => return Held::Kept,
+            // GitHub #592: a tool call's opener before the answer started;
+            // the turn is the call's, and nothing after it is checked.
+            Verdict::Passed | Verdict::Released => return Held::Kept,
             Verdict::Finished => return Held::Ended(FinishReason::Stop),
             Verdict::Miss => {}
         }
@@ -5961,8 +5963,9 @@ impl Scheduler for ConcreteScheduler {
                     anchor_emitted: self.requests[i].anchor_emitted,
                     // GitHub #587: a request held to a grammar has each draw
                     // checked before the next round consumes it, the
-                    // reasoning's included.
-                    checked: self.requests[i].grammar.is_some(),
+                    // reasoning's included -- until its turn opens a tool
+                    // call (#592), which releases it.
+                    checked: self.requests[i].grammar.as_ref().is_some_and(|state| !state.released()),
                 })
                 .collect();
             // GitHub #590: a round with a lane held to a grammar keeps

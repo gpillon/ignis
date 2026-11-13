@@ -204,7 +204,9 @@ impl ArtifactTemplateProvider {
     }
 
     /// [`TemplateProvider::apply_chat_template`], and the last message's part
-    /// ends when `part_ends` asks for them.
+    /// ends when `part_ends` asks for them; with a schema `description`
+    /// after the conversation, and the checkpoint boundary where it begins
+    /// (GitHub #589).
     fn render_prompt(
         &self,
         messages: &[ChatMessage],
@@ -212,9 +214,14 @@ impl ArtifactTemplateProvider {
         tools: &[JsonValue],
         part_ends: bool,
         text: bool,
+        description: Option<&str>,
     ) -> Result<RenderedPrompt, TemplateRejection> {
         Self::validate_roles(messages)?;
-        let prompt = match self.render(messages, options, tools) {
+        let rendered = match description {
+            Some(description) => self.render(&crate::template::described(messages, description), options, tools),
+            None => self.render(messages, options, tools),
+        };
+        let prompt = match rendered {
             Ok(prompt) => prompt,
             Err(err) => return Err(TemplateRejection { code: "render_failed", message: err }),
         };
@@ -225,7 +232,12 @@ impl ArtifactTemplateProvider {
             false => self.set.tokenizer().encode(&prompt).map(|ids| (ids, None)),
         }
         .map_err(|err| TemplateRejection { code: "render_failed", message: err.to_string() })?;
-        let opener_tokens = self.opener_tokens(&prompt, &tokens);
+        let opener_tokens = match description {
+            Some(description) => {
+                description_offset(&prompt, description).and_then(|at| self.exact_token_prefix(&prompt, at, &tokens))
+            }
+            None => self.opener_tokens(&prompt, &tokens),
+        };
         let user_turn_tokens = self.user_turn_tokens(&prompt, &tokens);
         let system_block_tokens = self.system_block_tokens(messages, &prompt, &tokens);
         let part_ends = match part_ends {
@@ -248,7 +260,8 @@ impl ArtifactTemplateProvider {
 
     /// [`TemplateProvider::prepare_multimodal`], and the last message's part
     /// ends when `part_ends` asks for them, carried across the placeholder
-    /// expansion with the other boundaries.
+    /// expansion with the other boundaries; with a schema `description` as
+    /// [`Self::render_prompt`] places it.
     fn prepare_prompt(
         &self,
         messages: &[ChatMessage],
@@ -256,6 +269,7 @@ impl ArtifactTemplateProvider {
         tools: &[JsonValue],
         media: Vec<PreparedMedia>,
         part_ends: bool,
+        description: Option<&str>,
     ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
         let Some(processor) = &self.vision else {
             return Err(ContentRejection {
@@ -267,7 +281,11 @@ impl ArtifactTemplateProvider {
             code: rejection.code,
             message: rejection.message,
         })?;
-        let rendered = self.render(messages, options, tools).map_err(|err| ContentRejection {
+        let rendered = match description {
+            Some(description) => self.render(&crate::template::described(messages, description), options, tools),
+            None => self.render(messages, options, tools),
+        }
+        .map_err(|err| ContentRejection {
             code: "render_failed",
             message: format!("chat template render failed: {err}"),
         })?;
@@ -277,7 +295,10 @@ impl ArtifactTemplateProvider {
         // `exact_token_prefix` does for a text one.
         let user_query = ChatTemplate::last_user_query_offset(&rendered);
         let offsets = [
-            ChatTemplate::generation_opener_offset(&rendered),
+            match description {
+                Some(description) => description_offset(&rendered, description),
+                None => ChatTemplate::generation_opener_offset(&rendered),
+            },
             retained_prefix_offset(messages, &rendered),
             user_query,
         ];
@@ -354,7 +375,7 @@ impl ArtifactTemplateProvider {
                     let stand_in = format!("<tool_response>\u{1}ignis:instruction:{index}\u{1}</tool_response>");
                     blocks.push((
                         format!("<|im_start|>user\n{stand_in}<|im_end|>\n"),
-                        format!("<|im_start|>system\n{}<|im_end|>\n", message.content.text().trim()),
+                        instruction_block(&message.content.text()),
                     ));
                     return Ok(ignis_artifact::ChatMessage::text(Role::User, stand_in));
                 }
@@ -423,7 +444,7 @@ impl TemplateProvider for ArtifactTemplateProvider {
         options: &ThinkingOptions,
         tools: &[JsonValue],
     ) -> Result<RenderedPrompt, TemplateRejection> {
-        self.render_prompt(messages, options, tools, false, false)
+        self.render_prompt(messages, options, tools, false, false, None)
     }
 
     fn apply_chat_template_with_part_ends(
@@ -432,7 +453,7 @@ impl TemplateProvider for ArtifactTemplateProvider {
         options: &ThinkingOptions,
         tools: &[JsonValue],
     ) -> Result<RenderedPrompt, TemplateRejection> {
-        self.render_prompt(messages, options, tools, true, false)
+        self.render_prompt(messages, options, tools, true, false, None)
     }
 
     fn apply_chat_template_with_text(
@@ -441,7 +462,17 @@ impl TemplateProvider for ArtifactTemplateProvider {
         options: &ThinkingOptions,
         tools: &[JsonValue],
     ) -> Result<RenderedPrompt, TemplateRejection> {
-        self.render_prompt(messages, options, tools, false, true)
+        self.render_prompt(messages, options, tools, false, true, None)
+    }
+
+    fn apply_chat_template_described(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        description: &str,
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        self.render_prompt(messages, options, tools, false, false, Some(description))
     }
 
     fn answer_alphabet(&self) -> ignis_core::decision::AnswerAlphabet {
@@ -525,7 +556,7 @@ impl TemplateProvider for ArtifactTemplateProvider {
         tools: &[JsonValue],
         media: Vec<PreparedMedia>,
     ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
-        self.prepare_prompt(messages, options, tools, media, false)
+        self.prepare_prompt(messages, options, tools, media, false, None)
     }
 
     fn prepare_multimodal_with_part_ends(
@@ -535,8 +566,39 @@ impl TemplateProvider for ArtifactTemplateProvider {
         tools: &[JsonValue],
         media: Vec<PreparedMedia>,
     ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
-        self.prepare_prompt(messages, options, tools, media, true)
+        self.prepare_prompt(messages, options, tools, media, true, None)
     }
+
+    fn prepare_multimodal_described(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        media: Vec<PreparedMedia>,
+        description: &str,
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
+        self.prepare_prompt(messages, options, tools, media, false, Some(description))
+    }
+}
+
+/// The block an instruction message past the first renders as, in place
+/// (GitHub #209): the reference's rendering, which the Qwen 3.8 template
+/// itself refuses.
+fn instruction_block(text: &str) -> String {
+    format!("{}{}{}", ChatTemplate::SYSTEM_BLOCK_OPENER, text.trim(), ChatTemplate::BLOCK_CLOSER)
+}
+
+/// The byte offset in `rendered` where a schema description's block begins
+/// (GitHub #589): the end of the conversation, the last point the next turn
+/// shares. The description renders as an instruction block after the last
+/// message ([`crate::template::described`]), and the block must end where
+/// the generation opener begins; a render that put it anywhere else reports
+/// `None`, and no checkpoint is taken.
+fn description_offset(rendered: &str, description: &str) -> Option<usize> {
+    let opener = ChatTemplate::generation_opener_offset(rendered)? - ChatTemplate::GENERATION_OPENER.len();
+    let block = instruction_block(description);
+    let start = opener.checked_sub(block.len())?;
+    (rendered.get(start..opener) == Some(block.as_str())).then_some(start)
 }
 
 /// The real tokenizer's incremental decoder (GitHub #68): wraps the
@@ -1070,8 +1132,17 @@ You are a careful assistant.<|im_end|>
     fn build_thinking_provider(
         template: &str,
     ) -> (fixture::TempArtifact, Reader, ArtifactTemplateProvider) {
+        provider_over(THINKING_TOKENIZER_JSON, template, "server-thinking-template")
+    }
+
+    /// A provider over a fixture artifact carrying `tokenizer` and `template`.
+    fn provider_over(
+        tokenizer: &str,
+        template: &str,
+        label: &str,
+    ) -> (fixture::TempArtifact, Reader, ArtifactTemplateProvider) {
         let resources: [(&'static str, &[u8]); 6] = [
-            ("frontend/tokenizer.json", THINKING_TOKENIZER_JSON.as_bytes()),
+            ("frontend/tokenizer.json", tokenizer.as_bytes()),
             ("frontend/tokenizer_config.json", b"{}"),
             ("frontend/chat_template.jinja", template.as_bytes()),
             ("frontend/generation_config.json", b"{}"),
@@ -1089,11 +1160,109 @@ You are a careful assistant.<|im_end|>
             });
             payload.extend_from_slice(bytes);
         }
-        let fixture =
-            fixture::write_fixture(&objects, &payload, "server-thinking-template").expect("fixture");
+        let fixture = fixture::write_fixture(&objects, &payload, label).expect("fixture");
         let reader = Reader::open(&fixture.path).expect("open fixture artifact");
         let frontend = FrontendSet::from_reader(&reader).expect("frontend set");
         (fixture, reader, ArtifactTemplateProvider::new(frontend))
+    }
+
+    // -- the schema description (GitHub #589, ADR 0089) ---------------------
+
+    /// The real template's shape where a schema description lands: the system
+    /// block, user and assistant turns, then the generation opener and its
+    /// think block, left open with thinking on and closed empty with it off.
+    const QWEN_SHAPED_TEMPLATE: &str = r#"
+{%- if messages[0].role == "system" %}{{- "<|im_start|>system\n" + messages[0].content|trim + "<|im_end|>\n" }}{%- endif %}
+{%- for message in messages %}
+{%- if message.role == "user" %}{{- "<|im_start|>user\n" + message.content|trim + "<|im_end|>\n" }}
+{%- elif message.role == "assistant" %}{{- "<|im_start|>assistant\n" + message.content|trim + "<|im_end|>\n" }}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}{{- "<|im_start|>assistant\n<think>\n" }}{%- if enable_thinking is false %}{{- "\n</think>\n\n" }}{%- endif %}{%- endif %}"#;
+
+    /// One token per character (the line break and printable ASCII), so a
+    /// prompt's ids say its bytes exactly.
+    fn char_tokenizer() -> String {
+        let mut vocab = serde_json::Map::new();
+        for (id, c) in std::iter::once('\n').chain((b' '..=b'~').map(char::from)).enumerate() {
+            vocab.insert(c.to_string(), json!(id));
+        }
+        vocab.insert("<unk>".to_owned(), json!(vocab.len()));
+        json!({
+            "version": "1.0",
+            "pre_tokenizer": { "type": "Split", "pattern": { "Regex": "[\\s\\S]" }, "behavior": "Isolated", "invert": false },
+            "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" }
+        })
+        .to_string()
+    }
+
+    fn described_provider() -> (fixture::TempArtifact, Reader, ArtifactTemplateProvider) {
+        provider_over(&char_tokenizer(), QWEN_SHAPED_TEMPLATE, "server-described-template")
+    }
+
+    /// `text`'s ids: its characters, one each.
+    fn ids(provider: &ArtifactTemplateProvider, text: &str) -> Vec<TokenId> {
+        let ids = provider.encode_literal(text).expect("a tokenizer");
+        assert_eq!(ids.len(), text.len(), "one id per character: {text:?}");
+        ids
+    }
+
+    const SYSTEM_BLOCK: &str = "<|im_start|>system\nYou are terse.<|im_end|>\n";
+    const CONVERSATION: &str = "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nDescribe a cat.<|im_end|>\n";
+    const DESCRIPTION: &str = "Respond with a JSON object that matches this JSON schema:\n{\"type\":\"object\"}";
+
+    fn first_turn() -> Vec<ChatMessage> {
+        vec![ChatMessage::text("system", "You are terse."), ChatMessage::text("user", "Describe a cat.")]
+    }
+
+    #[test]
+    fn a_description_sits_after_the_conversation_and_before_the_assistants_opener() {
+        let (_fixture, _reader, provider) = described_provider();
+        let block = format!("<|im_start|>system\n{DESCRIPTION}<|im_end|>\n");
+        for (enable_thinking, opener) in
+            [(false, "<|im_start|>assistant\n<think>\n\n</think>\n\n"), (true, "<|im_start|>assistant\n<think>\n")]
+        {
+            let options = ThinkingOptions { enable_thinking, ..opts() };
+            let rendered = provider
+                .apply_chat_template_described(&first_turn(), &options, no_tools(), DESCRIPTION)
+                .expect("render");
+            assert_eq!(rendered.tokens, ids(&provider, &format!("{CONVERSATION}{block}{opener}")), "thinking {enable_thinking}");
+            // Cut where the conversation ends: the next turn writes this
+            // turn's answer where the description stands.
+            assert_eq!(rendered.opener_tokens, Some(CONVERSATION.len() as u32), "thinking {enable_thinking}");
+            // The other boundaries do not move.
+            assert_eq!(rendered.system_block_tokens, Some(SYSTEM_BLOCK.len() as u32));
+            assert_eq!(rendered.user_turn_tokens, Some(SYSTEM_BLOCK.len() as u32));
+        }
+    }
+
+    #[test]
+    fn without_a_description_the_prompt_is_the_conversation_and_the_opener() {
+        let (_fixture, _reader, provider) = described_provider();
+        let options = ThinkingOptions { enable_thinking: false, ..opts() };
+        let rendered = provider.apply_chat_template(&first_turn(), &options, no_tools()).expect("render");
+        let opener = "<|im_start|>assistant\n";
+        assert_eq!(rendered.tokens, ids(&provider, &format!("{CONVERSATION}{opener}<think>\n\n</think>\n\n")));
+        assert_eq!(rendered.opener_tokens, Some((CONVERSATION.len() + opener.len()) as u32));
+    }
+
+    #[test]
+    fn the_next_turn_extends_a_described_turn_up_to_the_end_of_its_conversation() {
+        let (_fixture, _reader, provider) = described_provider();
+        let options = ThinkingOptions { enable_thinking: false, ..opts() };
+        let first = provider
+            .apply_chat_template_described(&first_turn(), &options, no_tools(), DESCRIPTION)
+            .expect("first turn");
+        let mut next = first_turn();
+        next.push(ChatMessage::text("assistant", "{\"name\":\"Tom\"}"));
+        next.push(ChatMessage::text("user", "And a dog."));
+        let second = provider
+            .apply_chat_template_described(&next, &options, no_tools(), DESCRIPTION)
+            .expect("second turn");
+        let shared = first.opener_tokens.expect("a boundary") as usize;
+        assert!(second.tokens.starts_with(&first.tokens[..shared]), "the conversation is the next turn's history");
+        assert!(!second.tokens.starts_with(&first.tokens), "the description is not");
+        assert_eq!(second.opener_tokens, Some(second.tokens.len() as u32 - (first.tokens.len() - shared) as u32));
     }
 
     #[test]

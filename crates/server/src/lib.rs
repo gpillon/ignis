@@ -192,6 +192,10 @@ pub struct Live {
     /// The thinking budget a request's unset `thinking_budget` falls back to
     /// (`--model-thinking-budget`, 2026-09-24). `None` = no budget.
     pub default_thinking_budget: Option<u32>,
+    /// Whether a `json_schema` request whose `ignis_describe_schema` is unset
+    /// has its schema described to the model after the conversation
+    /// (`--model-describe-schema`, GitHub #589, ADR 0089).
+    pub default_describe_schema: bool,
     /// Where `system` and `developer` messages go before the conversation is
     /// templated (`--server-system-message-policy` /
     /// `--server-developer-message-policy`, GitHub #209).
@@ -238,6 +242,7 @@ impl Default for Live {
             default_enable_thinking: true,
             default_reasoning_effort: None,
             default_thinking_budget: None,
+            default_describe_schema: true,
             instruction_policy: instruction::InstructionPolicy::default(),
             idle_unload: Duration::ZERO,
             socket_idle_close: Duration::ZERO,
@@ -259,6 +264,7 @@ impl Live {
             default_enable_thinking: config.enable_thinking,
             default_reasoning_effort: config.reasoning_effort,
             default_thinking_budget: config.thinking_budget,
+            default_describe_schema: config.describe_schema,
             instruction_policy: config.instruction_policy,
             idle_unload: Duration::from_secs(u64::from(config.idle_unload_secs)),
             socket_idle_close: Duration::from_secs(u64::from(config.socket_idle_close_secs)),
@@ -602,6 +608,13 @@ impl Server {
     /// Set the server-wide thinking budget (`--model-thinking-budget`).
     pub fn with_thinking_budget(self, budget: Option<u32>) -> Self {
         self.update_live(|live| live.default_thinking_budget = budget);
+        self
+    }
+
+    /// Describe a `json_schema` request's schema to the model unless the
+    /// request says otherwise (`--model-describe-schema`, GitHub #589).
+    pub fn with_describe_schema(self, describe: bool) -> Self {
+        self.update_live(|live| live.default_describe_schema = describe);
         self
     }
 

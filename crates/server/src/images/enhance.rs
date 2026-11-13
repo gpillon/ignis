@@ -207,14 +207,18 @@ pub async fn rewrite(server: &Server, prompt: &str, images: &[RgbaImage], seed: 
     // An edit's answer is held to its schema where the model serves
     // structured output; one that does not (Flash-Next, #581) is asked as
     // before and its answer read as before, so no rewrite newly fails there.
+    // Its prompt already shows the object it answers with, so the schema is
+    // not described to the model as well (#589): the prompt stays as before.
     let grammar = task.answer_schema().and_then(|schema| {
         let schema = serde_json::value::RawValue::from_string(schema.to_owned()).ok()?;
-        let format = crate::api::AnswerFormat::JsonSchema(crate::api::SchemaFormat { schema: &schema, strict: true });
-        crate::api::hold_answer(server, format, &thinking, &crate::api::ToolChoice::Auto, "response_format").ok().flatten()
+        let format =
+            crate::api::AnswerFormat::JsonSchema(crate::api::SchemaFormat { schema: &schema, strict: true, description: None });
+        let held = crate::api::hold_answer(server, format, false, &thinking, &[], &crate::api::ToolChoice::Auto, "response_format");
+        held.ok().flatten().map(|held| held.grammar)
     });
     let limits = server.live();
     let params = crate::api::SamplingRequestFields::default().resolve(Some(limits.image.prompt_enhancer_max_tokens), false, false, Some(seed))?;
-    let (mut input, _, _, media) = match crate::api::prepare_request(server, None, &messages, params, &thinking, &[]).await {
+    let (mut input, _, _, media) = match crate::api::prepare_request(server, None, &messages, params, &thinking, &[], None).await {
         Ok(prepared) => prepared,
         Err(refused) => return Err(format!("{enhancer} refused the rewrite: {}", error_message(refused).await)),
     };

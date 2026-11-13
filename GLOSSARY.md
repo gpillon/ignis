@@ -799,7 +799,9 @@ The whole-sequence state of a request at its generation opener, the point
 where the rendered prompt hands over to the model, retained after the request
 ends so a later request whose prompt extends it (the next turn of a chat or of
 an agent loop) resumes there instead of re-prefilling. Matched by prompt
-content, never by a session identifier.
+content, never by a session identifier. A request whose schema is described
+for **structured output** takes it where its conversation ends, before the
+description, which the next turn does not share.
 
 **Retained prefix**:
 A **shared prefix** kept alive with no claimant, so a later, non-concurrent
