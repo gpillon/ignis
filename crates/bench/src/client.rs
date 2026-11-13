@@ -508,6 +508,9 @@ pub struct HttpEndpoint {
     /// Resend a `503` `engine_full` (`--retry-engine-full`); `None`: record
     /// the refusal as a failure.
     retry: Option<RetryPolicy>,
+    /// Sampling sent in place of the greedy contract (`--temperature` ...);
+    /// `None`: `temperature: 0`, `seed: 0` on every body.
+    sampling: Option<crate::sampling::Sampling>,
     /// The EOS control this endpoint's engine is sent, once learned
     /// ([`HttpEndpoint::eos_control`]).
     eos_control: std::sync::OnceLock<EosControl>,
@@ -537,6 +540,7 @@ impl HttpEndpoint {
             request_timeout,
             as_recorded: false,
             retry: None,
+            sampling: None,
             eos_control: std::sync::OnceLock::new(),
         }
     }
@@ -547,6 +551,14 @@ impl HttpEndpoint {
     /// flat message is only comparable to a replay that sends it.
     pub fn as_recorded(mut self, on: bool) -> Self {
         self.as_recorded = on;
+        self
+    }
+
+    /// Send `sampling` on every request (a seed of its own per request id)
+    /// instead of the greedy contract. Off by default: a baseline recorded
+    /// greedy is only comparable to a run that sends greedy.
+    pub fn with_sampling(mut self, sampling: Option<crate::sampling::Sampling>) -> Self {
+        self.sampling = sampling;
         self
     }
 
@@ -825,11 +837,14 @@ impl HttpEndpoint {
         // prompt is a recorded chat body. `temperature: 0` + `seed: 0` pin
         // the greedy + fixed-seed contract of the v1 gate (ADR 0007 — the
         // server's defaults, sent explicitly).
-        let base = self
+        let mut base = self
             .as_recorded
             .then(|| as_recorded_body(req))
             .flatten()
             .unwrap_or_else(|| request_body(req));
+        if let Some(sampling) = &self.sampling {
+            sampling.apply(&mut base, &req.id);
+        }
         // A request that suppresses nothing never asks the engine which
         // control it takes.
         if suppress_eos.is_empty() {
@@ -1415,6 +1430,28 @@ mod tests {
         let body = as_recorded_body(&streaming).unwrap();
         assert_eq!(body["stream_options"], serde_json::json!({ "include_usage": true }));
         assert_eq!(body["enable_thinking"], false);
+    }
+
+    #[test]
+    fn a_sampling_endpoint_sends_the_sampling_and_a_seed_per_request_and_the_default_stays_greedy() {
+        let req = measurement_lane();
+        let greedy = HttpEndpoint::new("http://unused").wire_body(&req, &[]).unwrap();
+        assert_eq!(greedy["temperature"], 0);
+        assert_eq!(greedy["seed"], 0);
+        assert!(greedy.get("top_p").is_none() && greedy.get("top_k").is_none());
+
+        let sampling = crate::sampling::Sampling { temperature: 1.0, top_p: 0.95, top_k: 20, base_seed: 3 };
+        let ep = HttpEndpoint::new("http://unused").with_sampling(Some(sampling));
+        let body = ep.wire_body(&req, &[]).unwrap();
+        assert_eq!((body["temperature"].clone(), body["top_p"].clone(), body["top_k"].clone()), (1.0.into(), 0.95.into(), 20.into()));
+        assert_eq!(body["seed"], sampling.seed_for(&req.id));
+        assert_eq!(body["max_tokens"], greedy["max_tokens"]);
+        assert_eq!(body, ep.wire_body(&req, &[]).unwrap(), "two launches send one body");
+        // A recorded body's own sampling is replaced as its temperature and seed are.
+        let recorded = recorded_request(r#"{"messages":[{"role":"user","content":"hi"}],"top_p":0.5,"top_k":3}"#);
+        let ep = ep.as_recorded(true);
+        let body = ep.wire_body(&recorded, &[]).unwrap();
+        assert_eq!((body["top_p"].clone(), body["top_k"].clone()), (0.95.into(), 20.into()));
     }
 
     #[test]

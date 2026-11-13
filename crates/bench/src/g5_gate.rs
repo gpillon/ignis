@@ -436,6 +436,7 @@ mod tests {
             profile: format!("{label}-profile"),
             date: "2026-09-13T12:00:00Z".into(),
             cells: tok_s_by_depth.iter().map(|&(depth, tok_s)| cell(depth, tok_s)).collect(),
+            sampling: None,
         }
     }
 
@@ -538,6 +539,7 @@ mod tests {
             profile: format!("{label}-profile"),
             date: "2026-09-13T12:00:00Z".into(),
             cells: Vec::new(),
+            sampling: None,
         };
         let ours = vec![mk("ignis"), mk("ignis")];
         let reference = vec![mk("reference"), mk("reference")];

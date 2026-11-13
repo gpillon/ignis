@@ -104,6 +104,10 @@ pub struct ClassStats {
 pub struct Run {
     pub label: String,
     pub metrics: Vec<RequestMetrics>,
+    /// The sampling the run sent (`--temperature` ...); absent for the
+    /// greedy contract every recorded baseline was measured under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<crate::sampling::Sampling>,
 }
 
 impl Run {
@@ -112,7 +116,14 @@ impl Run {
         Self {
             label: label.into(),
             metrics,
+            sampling: None,
         }
+    }
+
+    /// This run, recording the sampling it sent.
+    pub fn with_sampling(mut self, sampling: Option<crate::sampling::Sampling>) -> Self {
+        self.sampling = sampling;
+        self
     }
 
     /// The per-class stats for a class present in the run.

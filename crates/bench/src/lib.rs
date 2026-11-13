@@ -87,6 +87,7 @@ pub mod metrics;
 pub mod oracle;
 pub mod record;
 pub mod report;
+pub mod sampling;
 pub mod small_card;
 #[cfg(test)]
 pub(crate) mod testutil;

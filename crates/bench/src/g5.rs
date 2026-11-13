@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::client::Endpoint;
+use crate::sampling::Sampling;
 use crate::g3::{measure_throughput_cell_with, ThroughputCell, C1_CONCURRENCY};
 use crate::time::{unix_now, utc_timestamp};
 use crate::ttft::{self, load_corpus, PromptSet, PromptSetSpec, PromptTemplate};
@@ -59,11 +60,11 @@ pub const COMMITTED_TOKENS: u32 = 512;
 /// A failed cell (corpus load error, or an unreachable fixture) — built
 /// directly from [`ThroughputCell`]'s public fields rather than a new
 /// constructor, since every field it needs is already `pub`.
-fn failed_cell(depth_tokens: u32, max_tokens: u32, error: String) -> ThroughputCell {
+fn failed_cell(depth_tokens: u32, max_tokens: u32, lanes: usize, error: String) -> ThroughputCell {
     ThroughputCell {
         prompt_tokens: depth_tokens,
         max_tokens,
-        concurrency: C1_CONCURRENCY,
+        concurrency: lanes,
         samples: Vec::new(),
         aggregate_tok_s: 0.0,
         error: Some(error),
@@ -103,7 +104,7 @@ fn require_committed_budget(mut cell: ThroughputCell, committed_tokens: u32, ins
     cell
 }
 
-/// The prompts one `g5` run sends, one per depth in [`DEPTHS`] order,
+/// The prompts one `g5` run sends, `lanes` per depth, the depths in order,
 /// generated together before the first is sent (GitHub #443) and numbered
 /// across the run ([`ttft::generate_run_prompts`]): each depth's prompt
 /// starts with its own nonce, or its window in its own third of `corpus`,
@@ -115,19 +116,17 @@ fn depth_prompts(
     template: &dyn PromptTemplate,
     corpus: Option<&[u32]>,
     instruction: Option<&str>,
-) -> Result<[Result<PromptSet, String>; DEPTHS.len()], String> {
-    let labels = DEPTHS.map(|depth| format!("{depth}-token depth"));
+    depths: &[u32],
+    lanes: usize,
+) -> Result<Vec<Result<PromptSet, String>>, String> {
+    let labels: Vec<String> = depths.iter().map(|depth| format!("{depth}-token depth")).collect();
     let suffix = instruction.unwrap_or("");
-    ttft::generate_run_prompts(
-        template,
-        corpus,
-        std::array::from_fn(|index| PromptSetSpec {
-            label: &labels[index],
-            count: C1_CONCURRENCY,
-            target_tokens: DEPTHS[index] as usize,
-            suffix,
-        }),
-    )
+    let specs: Vec<PromptSetSpec<'_>> = depths
+        .iter()
+        .zip(&labels)
+        .map(|(&depth, label)| PromptSetSpec { label, count: lanes, target_tokens: depth as usize, suffix })
+        .collect();
+    ttft::generate_run_prompt_sets(template, corpus, &specs)
 }
 
 /// A G5 record: what one engine measured at the three depths, in which
@@ -155,6 +154,10 @@ pub struct Record {
     /// [`ThroughputCell::prompt_tokens`] *is* the depth it was measured at
     /// — no separate depth field to keep in sync with it.
     pub cells: Vec<ThroughputCell>,
+    /// The sampling the run sent (`--temperature` ...); absent for the
+    /// greedy contract every recorded launch was measured under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<Sampling>,
 }
 
 impl Record {
@@ -239,6 +242,17 @@ pub struct G5Config {
     /// doc comment makes the same tradeoff at 64K/128K). Absent, the filler
     /// generator is used (fine at the small depths a unit test measures).
     pub corpus: Option<PathBuf>,
+    /// The depths to measure, in order (the `--depths` flag, in K tokens);
+    /// [`DEPTHS`] by default. A depth that is not one of them is a cell the
+    /// pooled `g5-gate` has no verdict for: the flag is for a decode cell
+    /// read with the speculative counters, not for the gate.
+    pub depths: Vec<u32>,
+    /// Sequences fired at once per depth (the `--lanes` flag): 1 by default,
+    /// the cell `g5-gate` pools; each sequence has its own prompt.
+    pub lanes: usize,
+    /// The sampling the endpoint was given, recorded in the run's record
+    /// (the endpoint sends it: `HttpEndpoint::with_sampling`).
+    pub sampling: Option<Sampling>,
 }
 
 impl Default for G5Config {
@@ -250,6 +264,9 @@ impl Default for G5Config {
             session: String::new(),
             committed_tokens: COMMITTED_TOKENS,
             corpus: None,
+            depths: DEPTHS.to_vec(),
+            lanes: C1_CONCURRENCY,
+            sampling: None,
         }
     }
 }
@@ -274,13 +291,20 @@ pub fn measure(
     // Only the corpus path's prompts carry the decode instruction (#162), and
     // only a prompt that carried it holds the engine to the budget.
     let instruction = cfg.corpus.is_some().then(|| decode_instruction(cfg.committed_tokens));
-    let cells = match corpus.and_then(|bank| depth_prompts(template, bank.as_deref(), instruction.as_deref())) {
-        Err(error) => DEPTHS.iter().map(|&depth| failed_cell(depth, cfg.committed_tokens, error.clone())).collect(),
-        Ok(sets) => DEPTHS
+    let cells = match corpus
+        .and_then(|bank| depth_prompts(template, bank.as_deref(), instruction.as_deref(), &cfg.depths, cfg.lanes))
+    {
+        Err(error) => cfg
+            .depths
+            .iter()
+            .map(|&depth| failed_cell(depth, cfg.committed_tokens, cfg.lanes, error.clone()))
+            .collect(),
+        Ok(sets) => cfg
+            .depths
             .iter()
             .zip(sets)
             .map(|(&depth, set)| {
-                let cell = measure_throughput_cell_with(ep, depth, cfg.committed_tokens, C1_CONCURRENCY, || set);
+                let cell = measure_throughput_cell_with(ep, depth, cfg.committed_tokens, cfg.lanes, || set);
                 require_committed_budget(cell, cfg.committed_tokens, instruction.is_some())
             })
             .collect(),
@@ -294,6 +318,7 @@ pub fn measure(
         profile: cfg.profile.clone(),
         date: utc_timestamp(unix_now()),
         cells,
+        sampling: cfg.sampling,
     }
 }
 
@@ -403,6 +428,7 @@ mod tests {
             session: "S1".into(),
             committed_tokens: COMMITTED_TOKENS,
             corpus: Some(corpus),
+            ..G5Config::default()
         };
         let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg);
         std::fs::remove_dir_all(&dir).ok();
@@ -425,6 +451,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_decode_cell_takes_its_depths_and_lanes_and_records_the_sampling() {
+        let ep = DeterministicEndpoint { ttft_ms: 40.0, interval_ms: 8.0 };
+        let (dir, corpus) = write_corpus_file(&corpus_bank());
+        let sampling = Sampling { temperature: 1.0, top_p: 0.95, top_k: 20, base_seed: 0 };
+        let cfg = G5Config {
+            depths: vec![DEPTH_24K],
+            lanes: 3,
+            sampling: Some(sampling),
+            corpus: Some(corpus),
+            ..G5Config::default()
+        };
+        let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(record.cells.len(), 1);
+        let cell = &record.cells[0];
+        assert_eq!((cell.prompt_tokens, cell.concurrency, cell.samples.len()), (DEPTH_24K, 3, 3));
+        assert!(cell.all_cold(), "{cell:?}");
+        assert_eq!(record.sampling, Some(sampling));
+        let json = record.to_json().unwrap();
+        assert_eq!(Record::from_json(&json).unwrap(), record);
+        // A greedy record names no sampling at all.
+        let greedy = Record { sampling: None, ..record };
+        assert!(!greedy.to_json().unwrap().contains("sampling"));
+    }
+
     fn cfg_with(corpus: PathBuf) -> G5Config {
         G5Config {
             label: "ignis".into(),
@@ -433,6 +485,7 @@ mod tests {
             session: "S1".into(),
             committed_tokens: COMMITTED_TOKENS,
             corpus: Some(corpus),
+            ..G5Config::default()
         }
     }
 
@@ -570,6 +623,7 @@ mod tests {
             session: "S1".into(),
             committed_tokens: COMMITTED_TOKENS,
             corpus: Some(PathBuf::from("/does/not/exist/bank.ids")),
+            ..G5Config::default()
         };
         let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg);
         assert_eq!(record.cells.len(), 3);
@@ -588,6 +642,7 @@ mod tests {
             session: "S1".into(),
             committed_tokens: COMMITTED_TOKENS,
             corpus: Some(corpus),
+            ..G5Config::default()
         };
         let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg);
         std::fs::remove_dir_all(&dir).ok();
@@ -606,6 +661,7 @@ mod tests {
             session: "S1".into(),
             committed_tokens: COMMITTED_TOKENS,
             corpus: Some(corpus),
+            ..G5Config::default()
         };
         let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg);
         std::fs::remove_dir_all(&dir).ok();

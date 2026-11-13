@@ -3,11 +3,22 @@
 //! Subcommands:
 //!   `replay  --trace <trace.jsonl> --endpoint <url> [--conc N] [--scale F]
 //!             [--out <run.json>] [--label L] [--as-recorded]
+//!             [--temperature T --top-p P --top-k K [--sample-seed S]]
 //!             [--retry-engine-full [--retry-max N] [--retry-max-wait S]
 //!                                  [--retry-total-wait S]]`
 //!       Re-send the JSONL trace against a running endpoint and write the run
-//!       (per-request metrics) as JSON. Both options are opt-in; without them
+//!       (per-request metrics) as JSON. Every option is opt-in; without them
 //!       a replay is what every recorded baseline was measured with.
+//!       `--temperature T --top-p P --top-k K [--sample-seed S]`: send these
+//!       sampling settings on every request instead of the greedy contract
+//!       (GitHub #578: a decode cell "sampled as agents sample" is
+//!       `--temperature 1 --top-p 0.95 --top-k 20`). The three go together.
+//!       Each request's `seed` derives from `--sample-seed` (default 0) and
+//!       the line's id, so two launches send the same bodies and each line
+//!       draws its own stream. The run's JSON names what was sent in its
+//!       `sampling` field (absent for a greedy run). With `--as-recorded` the
+//!       recorded body's own sampling fields are replaced as `temperature`
+//!       and `seed` are.
 //!       `--as-recorded`: a line whose `prompt` is a recorded chat request
 //!       body (a JSON object with `messages`, what a real agent client sent)
 //!       is sent as that body: its messages, `tools`, `tool_choice` and every
@@ -114,10 +125,18 @@
 //!       per side.
 //!   `g5      --endpoint <url> --artifact <artifact.ninfer> [--label ignis]
 //!             [--profile P] [--session S] [--committed-tokens 512]
-//!             [--corpus <bank.ids>] [--out <record.json>]`
+//!             [--corpus <bank.ids>] [--out <record.json>]
+//!             [--depths 24,98,196] [--lanes N]
+//!             [--temperature T --top-p P --top-k K [--sample-seed S]]`
 //!       The G5 measurement instrument (P5-07, ADR 0015/0021): g3's C=1
 //!       throughput cell (and its committed-token counter) at three prompt
 //!       depths (24K/98K/196K). Writes one *launch* of one engine's record.
+//!       `--depths` (K tokens, comma-separated) and `--lanes` (sequences per
+//!       depth, each its own prompt) make it a long-context decode cell for
+//!       the speculative counters (#578), and the sampling flags are
+//!       `replay`'s; the record's `sampling` names what was sent. A depth
+//!       other than the three, or lanes other than 1, is a cell `g5-gate`
+//!       has no pooled verdict for.
 //!   `g5-gate --ours <launch1.json> --ours <launch2.json> [...]
 //!             --ref <launch1.json> --ref <launch2.json> [...]
 //!             [--note <text>] [--out <verdict.json>]`
@@ -157,6 +176,7 @@ use ignis_bench::{
     g2, g3, g3_gate, g4, g4_gate, g5, g5_gate,
     gate::GateReport,
     metrics::Run,
+    sampling::Sampling,
     oracle::{self, Fixture},
     record::{ClassPolicy, RecordConfig, RecordServer},
     report::PerformanceReport,
@@ -197,6 +217,7 @@ fn print_usage() {
         "usage:
   ignis-bench replay --trace <trace.jsonl> --endpoint <url> [--conc N] [--scale F] [--out <run.json>] [--label L]
                      [--as-recorded] [--retry-engine-full [--retry-max N] [--retry-max-wait S] [--retry-total-wait S]]
+                     [--temperature T --top-p P --top-k K [--sample-seed S]]
   ignis-bench canary --endpoint <url> [--out <canary.json>]
   ignis-bench report --ours <ours.json> --ref <ref.json>
   ignis-bench gate --ours <ours.json> --ref <ref.json> --canary <canary.json> [--out <gate.json>]
@@ -218,6 +239,7 @@ fn print_usage() {
   ignis-bench g4-gate --ours <launch.json> [--ours <launch2.json> ...] --ref <launch.json> [--ref <launch2.json> ...]
                       [--note <text>] [--out <verdict.json>]
   ignis-bench g5 --endpoint <url> --artifact <artifact.ninfer> [--label ignis] [--profile <text>]
+                 [--depths 24,98,196] [--lanes N] [--temperature T --top-p P --top-k K [--sample-seed S]]
                  [--session <id>] [--committed-tokens 512] [--corpus <bank.ids>] [--out <record.json>]
   ignis-bench g5-gate --ours <launch.json> [--ours <launch2.json> ...] --ref <launch.json> [--ref <launch2.json> ...]
                       [--note <text>] [--out <verdict.json>]
@@ -279,6 +301,13 @@ fn endpoint_for(base_url: &str) -> HttpEndpoint {
         None => eprintln!("request deadline: none (waiting as long as the engine takes)"),
     }
     ep
+}
+
+/// The sampling the command line asked for (`--temperature`, `--top-p`,
+/// `--top-k`, `--sample-seed`), `None` for the greedy contract.
+fn sampling_options(args: &[String]) -> Result<Option<Sampling>, String> {
+    let (t, p, k, s) = (opt(args, "temperature"), opt(args, "top-p"), opt(args, "top-k"), opt(args, "sample-seed"));
+    Sampling::from_flags(t.as_deref(), p.as_deref(), k.as_deref(), s.as_deref())
 }
 
 /// `replay`'s opt-in fidelity options: `--as-recorded`, and
@@ -357,7 +386,17 @@ fn cmd_replay(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut ep = endpoint_for(&endpoint).as_recorded(as_recorded);
+    let sampling = match sampling_options(args) {
+        Ok(sampling) => sampling,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut ep = endpoint_for(&endpoint).as_recorded(as_recorded).with_sampling(sampling);
+    if let Some(sampling) = &sampling {
+        eprintln!("{}", sampling.describe());
+    }
     if let Some(policy) = retry {
         ep = ep.with_retry(policy);
     }
@@ -391,7 +430,7 @@ fn cmd_replay(args: &[String]) -> ExitCode {
         time_scale: scale,
     };
     let metrics = replay(ep, &trace, &cfg);
-    let run = Run::new(label, metrics);
+    let run = Run::new(label, metrics).with_sampling(sampling);
     let json = serde_json::to_string_pretty(&run).expect("serialize run");
 
     match out {
@@ -1371,7 +1410,41 @@ fn cmd_g5(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let ep = endpoint_for(&endpoint);
+    let sampling = match sampling_options(args) {
+        Ok(sampling) => sampling,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let depths = match opt(args, "depths") {
+        None => g5::DEPTHS.to_vec(),
+        Some(list) => match list
+            .split(',')
+            .map(|k| k.trim().parse::<u32>().ok().filter(|k| *k >= 1).map(|k| k * 1024))
+            .collect::<Option<Vec<u32>>>()
+        {
+            Some(depths) if !depths.is_empty() => depths,
+            _ => {
+                eprintln!("error: --depths {list}: a comma-separated list of depths in K tokens (e.g. 24,98,196)");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let lanes = match opt(args, "lanes") {
+        None => 1,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n >= 1 => n,
+            _ => {
+                eprintln!("error: --lanes {v}: not a whole number from 1");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let ep = endpoint_for(&endpoint).with_sampling(sampling);
+    if let Some(sampling) = &sampling {
+        eprintln!("{}", sampling.describe());
+    }
     let engine = match ep.list_models() {
         Ok(models) if !models.is_empty() => {
             eprintln!("engine {endpoint}: {}", models.join(", "));
@@ -1388,7 +1461,7 @@ fn cmd_g5(args: &[String]) -> ExitCode {
     };
     eprintln!("g5 session {session}: committed tok/s @24K/98K/196K against {label}");
 
-    let cfg = g5::G5Config { label, profile, artifact, session, committed_tokens, corpus };
+    let cfg = g5::G5Config { label, profile, artifact, session, committed_tokens, corpus, depths, lanes, sampling };
     let record = g5::measure(&ep, &frontend, engine, endpoint, &cfg);
     print!("{}", record.render());
 
@@ -1850,6 +1923,16 @@ mod tests {
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn sampling_options_are_opt_in_and_read_from_the_flags() {
+        assert_eq!(sampling_options(&argv(&["--trace", "t"])).unwrap(), None);
+        let s = sampling_options(&argv(&["--temperature", "0.6", "--top-p", "0.95", "--top-k", "20", "--sample-seed", "9"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!((s.temperature, s.top_p, s.top_k, s.base_seed), (0.6, 0.95, 20, 9));
+        assert!(sampling_options(&argv(&["--temperature", "1"])).is_err());
     }
 
     #[test]

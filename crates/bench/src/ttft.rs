@@ -398,8 +398,19 @@ pub fn generate_run_prompts<const N: usize>(
     corpus: Option<&[u32]>,
     sets: [PromptSetSpec<'_>; N],
 ) -> Result<[Result<PromptSet, String>; N], String> {
+    let generated = generate_run_prompt_sets(template, corpus, &sets)?;
+    Ok(<[_; N]>::try_from(generated).unwrap_or_else(|_| unreachable!("one result per set")))
+}
+
+/// [`generate_run_prompts`] for a number of sets known at run time (a `g5`
+/// run's `--depths`): one result per set, in order.
+pub fn generate_run_prompt_sets(
+    template: &dyn PromptTemplate,
+    corpus: Option<&[u32]>,
+    sets: &[PromptSetSpec<'_>],
+) -> Result<Vec<Result<PromptSet, String>>, String> {
     let mut run = RunNumbering::of(sets.iter().map(|set| set.count).sum());
-    let generated = sets.map(|set| run.generate(template, corpus, &set));
+    let generated = sets.iter().map(|set| run.generate(template, corpus, set)).collect();
     run.prove(template)?;
     Ok(generated)
 }
