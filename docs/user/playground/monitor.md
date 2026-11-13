@@ -47,7 +47,7 @@ arrow keys once focused.
 | **Retained state** | Tokens reused, hits, misses, spills, discards and restores, per tier and kind | `ignis_retained_*` |
 | **Speculation** | Acceptance, tokens per verify round, how often each draft position is kept | `ignis_speculative_*` |
 | **Reasoning** | Turns the loop guard saw loop, tokens taken back, closes the thinking budget forced | `ignis_loop_guard_*`, `ignis_thinking_forced_closes_total` |
-| **Structured output** | From 0.11.0: requests held to a grammar, the draws it rejected, the repairs, and the median and p95 time of a repair | `ignis_structured_*` |
+| **Structured output** | From 0.11.0: requests held to a grammar, the sampled tokens it rejected, the repairs, and the median and p95 time of a repair | `ignis_structured_*` |
 | **Image jobs** | Jobs, pictures made, their duration and the time in each phase | `ignis_image_*` |
 | **Transcriptions** | Transcriptions that ended and how, the audio they covered, the median wait from commit, sessions open and the queue | `ignis_speech_*` |
 | **Expert residency** | Flash-Next's expert cache: hit rates, copies from host RAM, stalls | `ignis_expert_*` |

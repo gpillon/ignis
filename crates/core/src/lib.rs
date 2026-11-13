@@ -148,7 +148,7 @@ pub use retained_slot::{
 pub use scheduler::{
     Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome, DiskSource,
     DiskTarget, KvRamEvent, KvRamMove, KvRamOutcome, Occupancy, PrefillJob, PrefillOutcome, RepairJob, RetainedAt,
-    Scheduler, WaitingDraw,
+    Scheduler, PendingToken,
 };
 pub use rope_scaling::{
     DEFAULT_YARN_BETA_FAST, DEFAULT_YARN_BETA_SLOW, DEFAULT_YARN_TEMPERATURE,

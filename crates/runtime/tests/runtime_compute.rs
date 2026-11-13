@@ -944,12 +944,12 @@ fn a_checked_lane_reports_its_waiting_draw_and_the_eos_as_a_stop() {
             .remove(0)
     };
     let free = round(false);
-    assert_eq!((free.tokens, free.waiting), (vec![11], None), "an unchecked lane reports no draw");
+    assert_eq!((free.tokens, free.pending), (vec![11], None), "an unchecked lane reports no draw");
     let checked = round(true);
-    assert_eq!((checked.tokens, checked.waiting), (vec![12], Some(ignis_core::WaitingDraw::Token(13))));
+    assert_eq!((checked.tokens, checked.pending), (vec![12], Some(ignis_core::PendingToken::Token(13))));
     let before_eos = round(true);
     assert_eq!(before_eos.tokens, vec![13]);
-    assert_eq!(before_eos.waiting, Some(ignis_core::WaitingDraw::Stop), "the waiting EOS, by name");
+    assert_eq!(before_eos.pending, Some(ignis_core::PendingToken::Stop), "the waiting EOS, by name");
     assert_eq!(leaf.calls.lock().unwrap().decode_checked, vec![vec![false], vec![true], vec![true]]);
 }
 
@@ -985,7 +985,7 @@ fn a_checked_lanes_verified_run_is_cut_where_the_host_says() {
             2
         })
         .unwrap();
-    use ignis_core::WaitingDraw::{Stop, Token};
+    use ignis_core::PendingToken::{Stop, Token};
     assert_eq!(shown, vec![(2, vec![Token(31), Token(32), Stop, Token(33)])], "job 2's run, the EOS as a stop");
     assert_eq!(second[0].finish, Some(FinishReason::Length));
     assert_eq!(second[1].tokens, vec![41], "an unchecked lane's run, untouched");

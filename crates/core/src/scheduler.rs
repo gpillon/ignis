@@ -291,7 +291,7 @@ pub struct DecodeJob {
     pub anchor_emitted: bool,
     /// The host **checks** the draw this round makes before the next round
     /// consumes it (GitHub #587, spec #287): the request's answer is held to
-    /// a **grammar** ([`crate::structured`]), and [`DecodeOutcome::waiting`]
+    /// a **grammar** ([`crate::structured`]), and [`DecodeOutcome::pending`]
     /// reports the draw, which keeps the scores a repair reads.
     ///
     /// Through [`Compute::decode_step_cut`] the lane keeps speculation
@@ -303,11 +303,11 @@ pub struct DecodeJob {
     pub checked: bool,
 }
 
-/// A request's **waiting draw**, as a round reports it for a
+/// A request's **pending token**, as a round reports it for a
 /// [`DecodeJob::checked`] lane (GitHub #587): the token the round drew for
 /// the next one, which the next round consumes as its anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitingDraw {
+pub enum PendingToken {
     /// An ordinary token.
     Token(TokenId),
     /// The model's EOS: the next round would end the request on it. The
@@ -317,13 +317,13 @@ pub enum WaitingDraw {
 }
 
 /// One **repair** handed to the compute backend (GitHub #586, spec #287): the
-/// position of `request`'s **waiting draw** — what its last prefill or plain
+/// position of `request`'s **pending token** — what its last prefill or plain
 /// round drew, which the next round consumes as its anchor — drawn again
 /// from the scores that call kept, restricted to `permitted`
 /// ([`Compute::repair`]).
 #[derive(Debug, Clone)]
 pub struct RepairJob {
-    /// The request whose waiting draw is repaired.
+    /// The request whose pending token is repaired.
     pub request: RequestId,
     /// The sampler the draw was made under, and the repair is: greedy takes
     /// the mask's argmax, a temperature draws from the mask with a random
@@ -463,12 +463,12 @@ pub struct DecodeOutcome {
     /// turned into the job's [`DecodeJob::reasoning_close`] (GitHub #315): the
     /// next round's first token is that `</think>`.
     pub reasoning_redirected: bool,
-    /// The round's **waiting draw** (GitHub #587), reported for a
+    /// The round's **pending token** (GitHub #587), reported for a
     /// [`DecodeJob::checked`] lane that goes on running: what the host checks
     /// before the next round consumes it, and repairs on a miss
     /// ([`Compute::repair`]). `None` on every other lane, and on an outcome
     /// that finished the request.
-    pub waiting: Option<WaitingDraw>,
+    pub pending: Option<PendingToken>,
 }
 
 impl DecodeOutcome {
@@ -486,7 +486,7 @@ impl DecodeOutcome {
             finish: None,
             spec: None,
             reasoning_redirected: false,
-            waiting: None,
+            pending: None,
         }
     }
 
@@ -525,11 +525,11 @@ impl DecodeOutcome {
         }
     }
 
-    /// The same outcome, reporting `draw` as the round's waiting draw
+    /// The same outcome, reporting `token` as the round's pending token
     /// (GitHub #587).
-    pub fn waiting_on(self, draw: WaitingDraw) -> Self {
+    pub fn with_pending(self, token: PendingToken) -> Self {
         Self {
-            waiting: Some(draw),
+            pending: Some(token),
             ..self
         }
     }
@@ -723,10 +723,10 @@ pub trait Compute: Send + Sync {
     /// [`DecodeJob::checked`] lane, which then keeps speculation. After a
     /// verify round's pass and before anything is committed, `cut(job, run)`
     /// sees that lane's run -- its anchor, then the drafts the target
-    /// accepted, each as the host checks a draw (the EOS as
-    /// [`WaitingDraw::Stop`]) -- and returns how many of its tokens the commit
-    /// keeps, `1..=run.len()`. The draft after them is the round's waiting
-    /// draw ([`DecodeOutcome::waiting`]), kept with the scores of its column,
+    /// accepted, each as the host checks a pending token (the EOS as
+    /// [`PendingToken::Stop`]) -- and returns how many of its tokens the commit
+    /// keeps, `1..=run.len()`. The draft after them is the round's pending
+    /// token ([`DecodeOutcome::pending`]), kept with the scores of its column,
     /// so [`Compute::repair`] repairs it as it repairs a plain round's; kept
     /// whole, the run's own successor waits. A stop or the reasoning redirect
     /// still cut where they fall. `job` indexes `jobs`.
@@ -739,19 +739,19 @@ pub trait Compute: Send + Sync {
     fn decode_step_cut(
         &self,
         jobs: &[DecodeJob],
-        _cut: &mut dyn FnMut(usize, &[WaitingDraw]) -> usize,
+        _cut: &mut dyn FnMut(usize, &[PendingToken]) -> usize,
     ) -> Result<Vec<DecodeOutcome>, ComputeError> {
         self.decode_step(jobs)
     }
 
-    /// **Repair** a request's position (GitHub #586, spec #287): its waiting
-    /// draw — what its last prefill (the prompt's last job, whose draw
+    /// **Repair** a request's position (GitHub #586, spec #287): its pending
+    /// token — what its last prefill (the prompt's last job, whose draw
     /// [`PrefillOutcome::emitted`] reports) or its last plain round drew, and
     /// the next round consumes as its anchor — is drawn again from the scores
     /// that call kept, restricted to [`RepairJob::permitted`], and the result
     /// **replaces** it. The next round consumes the repaired token exactly as
     /// if it had been drawn, and the request's penalty counts count the
-    /// position once. Returns the repaired token, the request's waiting draw
+    /// position once. Returns the repaired token, the request's pending token
     /// from now on.
     ///
     /// This is check-first's other half: the scheduler checks each draw with
@@ -765,7 +765,7 @@ pub trait Compute: Send + Sync {
     /// caller repairs right after the call that drew. A verify round's draw
     /// keeps them only on a lane whose cut the host decided
     /// ([`Compute::decode_step_cut`], #590), and a redirected draw never
-    /// does. Refused then, as on a request with no waiting draw and on a
+    /// does. Refused then, as on a request with no pending token and on a
     /// backend that keeps no scores — the default, and Flash-Next's for now
     /// (#581) — with the request's state as it was.
     fn repair(&self, _job: &RepairJob) -> Result<TokenId, ComputeError> {

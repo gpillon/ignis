@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use ignis_core::vision::{MEDIA_ENCODE_POOL_FULL, MediaItem, Multimodal};
 use ignis_core::{
     BlobIdentity, Compute, ComputeError, DecodeJob, DecodeOutcome, DecodeParams, FinishReason,
-    N_DECODE_LANES, PrefillJob, PrefillOutcome, Readout, RepairJob, RequestId, RetainedAt, SpecCounters, WaitingDraw,
+    N_DECODE_LANES, PrefillJob, PrefillOutcome, Readout, RepairJob, RequestId, RetainedAt, SpecCounters, PendingToken,
     TokenId,
 };
 
@@ -1509,7 +1509,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     fn decode_round(
         &self,
         jobs: &[DecodeJob],
-        cut: Option<&mut dyn FnMut(usize, &[WaitingDraw]) -> usize>,
+        cut: Option<&mut dyn FnMut(usize, &[PendingToken]) -> usize>,
     ) -> Result<Vec<DecodeOutcome>, ComputeError> {
         // The load's own lanes (GitHub #336), which the scheduler never
         // batches past and the leaf refuses past too.
@@ -1599,12 +1599,12 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                     // it checks a draw -- the lane's stop id as a stop.
                     Some(cut) => {
                         let job_of: Vec<usize> = (0..active.len()).filter(|&index| active[index]).collect();
-                        let mut shown: Vec<WaitingDraw> = Vec::new();
+                        let mut shown: Vec<PendingToken> = Vec::new();
                         let mut leaf_cut = |lane: usize, run: &[TokenId]| -> usize {
                             shown.clear();
                             shown.extend(run.iter().map(|&token| match lanes[lane].stop_ids.contains(&token) {
-                                true => WaitingDraw::Stop,
-                                false => WaitingDraw::Token(token),
+                                true => PendingToken::Stop,
+                                false => PendingToken::Token(token),
                             }));
                             cut(job_of[lane], &shown)
                         };
@@ -1697,20 +1697,20 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                 }
                 None => {
                     sequence.generated = sequence.generated.saturating_add(tokens.len() as u32 + anchor);
-                    // GitHub #587: a checked lane's waiting draw, as the
+                    // GitHub #587: a checked lane's pending token, as the
                     // leaf holds it -- the EOS by name, which the next
                     // round would end the request on.
-                    let waiting = match job.checked {
+                    let pending = match job.checked {
                         true => self.model.leaf.pending_token(&sequence.handle).map(|token| {
                             match token == self.eos && !job.params.ignore_eos {
-                                true => WaitingDraw::Stop,
-                                false => WaitingDraw::Token(token),
+                                true => PendingToken::Stop,
+                                false => PendingToken::Token(token),
                             }
                         }),
                         false => None,
                     };
                     sequences.insert(job.request, sequence);
-                    DecodeOutcome { waiting, ..DecodeOutcome::run(tokens) }
+                    DecodeOutcome { pending, ..DecodeOutcome::run(tokens) }
                 }
             };
             outcomes[index] = Some(DecodeOutcome {
@@ -2208,7 +2208,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
     fn decode_step_cut(
         &self,
         jobs: &[DecodeJob],
-        cut: &mut dyn FnMut(usize, &[WaitingDraw]) -> usize,
+        cut: &mut dyn FnMut(usize, &[PendingToken]) -> usize,
     ) -> Result<Vec<DecodeOutcome>, ComputeError> {
         self.decode_round(jobs, Some(cut))
     }

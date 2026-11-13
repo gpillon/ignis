@@ -591,9 +591,9 @@ fn decimal(value: u64, scale: u64) -> String {
 }
 
 /// `ignis_structured_repair_seconds`' bucket boundaries (ADR 0017 as amended by ADR 0089,
-/// #593), in microseconds: a repair is one draw over the round's own
-/// scores, tens of microseconds to a few milliseconds, which the latency
-/// scales above (from 50 ms) would put in one bucket.
+/// #593), in microseconds: a repair samples one position again from the
+/// round's own scores, tens of microseconds to a few milliseconds, which the
+/// latency scales above (from 50 ms) would put in one bucket.
 const REPAIR_BOUNDS_US: [u64; 10] = [50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 50_000, 250_000];
 
 /// A fixed-bucket histogram over microsecond observations.
@@ -719,9 +719,9 @@ pub struct Metrics {
     /// decision family.
     thinking_forced_closes: AtomicU64,
     /// Structured output (#593), per [`STRUCTURED_KINDS`]: the completed
-    /// requests held to a grammar, the draws it rejected and the repairs
-    /// that answered them. Absent until the first such request ends, then
-    /// whole, with the repair-time histogram.
+    /// requests held to a grammar, the sampled tokens it rejected and the
+    /// repairs that answered them. Absent until the first such request ends,
+    /// then whole, with the repair-time histogram.
     structured_requests: [AtomicU64; STRUCTURED_KINDS.len()],
     structured_misses: [AtomicU64; STRUCTURED_KINDS.len()],
     structured_repairs: [AtomicU64; STRUCTURED_KINDS.len()],
@@ -1042,7 +1042,7 @@ impl Metrics {
     }
 
     /// A completed request held to a grammar (#593): counted by its type,
-    /// with the draws the grammar rejected and the time of each repair.
+    /// with the sampled tokens the grammar rejected and the time of each repair.
     pub(crate) fn record_structured(&self, summary: &crate::telemetry::StructuredSummary) {
         let slot = STRUCTURED_KINDS.iter().position(|&kind| kind == summary.kind).unwrap_or(0);
         for &us in &summary.repair_micros {
@@ -1666,12 +1666,12 @@ impl Metrics {
                 ),
                 (
                     "ignis_structured_misses_total",
-                    "Draws of a structured answer the grammar rejected, by type.",
+                    "Sampled tokens of a structured answer the grammar rejected, by type.",
                     &self.structured_misses,
                 ),
                 (
                     "ignis_structured_repairs_total",
-                    "Rejected draws sampled again under the grammar, by type.",
+                    "Rejected tokens sampled again under the grammar, by type.",
                     &self.structured_repairs,
                 ),
             ] {
@@ -1683,7 +1683,7 @@ impl Metrics {
             self.structured_repair_time.render(
                 &mut out,
                 "ignis_structured_repair_seconds",
-                "Time to repair one rejected draw of a structured answer.",
+                "Time to repair one rejected token of a structured answer.",
             );
         }
         // GitHub #330: the loop guard, absent until a request it watched

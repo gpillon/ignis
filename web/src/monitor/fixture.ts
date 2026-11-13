@@ -394,15 +394,15 @@ export const STRUCTURED_FAMILIES = `# HELP ignis_structured_requests_total Compl
 # TYPE ignis_structured_requests_total counter
 ignis_structured_requests_total{type="json_object"} 20
 ignis_structured_requests_total{type="json_schema"} 0
-# HELP ignis_structured_misses_total Draws of a structured answer the grammar rejected, by type.
+# HELP ignis_structured_misses_total Sampled tokens of a structured answer the grammar rejected, by type.
 # TYPE ignis_structured_misses_total counter
 ignis_structured_misses_total{type="json_object"} 6
 ignis_structured_misses_total{type="json_schema"} 0
-# HELP ignis_structured_repairs_total Rejected draws sampled again under the grammar, by type.
+# HELP ignis_structured_repairs_total Rejected tokens sampled again under the grammar, by type.
 # TYPE ignis_structured_repairs_total counter
 ignis_structured_repairs_total{type="json_object"} 6
 ignis_structured_repairs_total{type="json_schema"} 0
-# HELP ignis_structured_repair_seconds Time to repair one rejected draw of a structured answer.
+# HELP ignis_structured_repair_seconds Time to repair one rejected token of a structured answer.
 # TYPE ignis_structured_repair_seconds histogram
 ignis_structured_repair_seconds_bucket{le="0.00005"} 0
 ignis_structured_repair_seconds_bucket{le="0.0001"} 2

@@ -31,7 +31,7 @@ use tower::ServiceExt;
 
 use ignis_core::compute::ModelFamily;
 use ignis_core::mock::GatedCompute;
-use ignis_core::{Compute, ConcreteScheduler, MockCompute, SchedulerConfig, TokenId, WaitingDraw};
+use ignis_core::{Compute, ConcreteScheduler, MockCompute, SchedulerConfig, TokenId, PendingToken};
 use ignis_grammar::{GrammarCache, Vocab, VocabEntry, DEFAULT_CACHE_BYTES, DEFAULT_MAX_WS_RUN};
 use ignis_server::decoder::TokenDecoder;
 use ignis_server::engine::Engine;
@@ -1179,7 +1179,7 @@ async fn a_turn_that_opens_a_tool_call_is_released_and_the_next_turn_answers_und
                 let cuts: Vec<_> = mock.cut_calls().into_iter().filter(|(request, ..)| *request == 0).collect();
                 assert!(cuts.iter().all(|(_, shown, kept)| *kept == shown.len()), "{case}: {cuts:?}");
                 if runs && thinking {
-                    let opened = cuts.iter().any(|(_, shown, _)| shown[1..].contains(&WaitingDraw::Token(TOOL_CALL)));
+                    let opened = cuts.iter().any(|(_, shown, _)| shown[1..].contains(&PendingToken::Token(TOOL_CALL)));
                     assert!(opened, "{case}: a verified run opened the call: {cuts:?}");
                 }
 

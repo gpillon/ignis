@@ -14,7 +14,7 @@ use std::sync::Arc;
 use ignis_core::structured::{AnswerGrammar, StructuredKind};
 use ignis_core::{
     ConcreteScheduler, DecodeParams, FinishReason, MockCompute, RequestClass, RequestId, RequestInput, SchedEvent,
-    Scheduler, SchedulerConfig, SpecCounters, TokenId, WaitingDraw,
+    Scheduler, SchedulerConfig, SpecCounters, TokenId, PendingToken,
 };
 use ignis_grammar::{Grammar, GrammarCache, Vocab, VocabEntry, DEFAULT_CACHE_BYTES};
 
@@ -112,8 +112,8 @@ fn misses(events: &[SchedEvent], id: RequestId) -> (usize, usize) {
     (repairs.len(), repairs.iter().flatten().count())
 }
 
-fn draws(text: &str) -> Vec<WaitingDraw> {
-    encode(text).into_iter().map(WaitingDraw::Token).collect()
+fn draws(text: &str) -> Vec<PendingToken> {
+    encode(text).into_iter().map(PendingToken::Token).collect()
 }
 
 /// The script writes `{"a": 7` and then an `x` where the object needs a

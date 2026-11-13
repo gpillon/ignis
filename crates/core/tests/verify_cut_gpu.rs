@@ -174,7 +174,7 @@ impl Held {
     /// row that drew it, when a verify round did. Returns whether the answer
     /// is complete.
     fn hold(&mut self, model: &Model, pool: &SeqPool, seq: &mut Seq<'_>, column: Option<&[f32]>) -> bool {
-        let pending = seq.pending_token().expect("a waiting draw");
+        let pending = seq.pending_token().expect("a pending token");
         if self.stops.contains(&pending) && self.matcher.is_accepting() {
             return true;
         }

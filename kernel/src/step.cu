@@ -2929,7 +2929,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
   return 0;
 }
 
-// GitHub #586 (spec #287): a **repair** of a sequence's waiting draw -- the
+// GitHub #586 (spec #287): a **repair** of a sequence's pending token -- the
 // contract is in ignis_step.h. Fail-closed everywhere: a repair it cannot make
 // exactly is refused with the sequence as it was, never approximated.
 extern "C" int32_t ignis_program_repair(struct ignis_model *model, struct ignis_seq_pool *pool,
@@ -2974,7 +2974,7 @@ extern "C" int32_t ignis_program_repair(struct ignis_model *model, struct ignis_
     return -1;
   }
   if (seq->pending_token < 0) {
-    set_error("ignis_program_repair: the sequence has no waiting draw to repair");
+    set_error("ignis_program_repair: the sequence has no pending token to repair");
     return -1;
   }
   const auto vocab = static_cast<std::int32_t>(model->vocab);
@@ -3000,12 +3000,12 @@ extern "C" int32_t ignis_program_repair(struct ignis_model *model, struct ignis_
   }
   const ignis_kept_scores kept = seq->kept;
   if (kept.column < 0) {
-    set_error("ignis_program_repair: the waiting draw kept no scores (a verify round's the host "
+    set_error("ignis_program_repair: the pending token kept no scores (a verify round's the host "
               "did not cut, a redirected one, or a sequence restored or claimed since its draw)");
     return -1;
   }
   if (!kept_scores_current(model, kept)) {
-    set_error("ignis_program_repair: the scores the waiting draw came from were written over by a "
+    set_error("ignis_program_repair: the scores the pending token came from were written over by a "
               "later round or prefill; a repair follows the call that drew");
     return -1;
   }

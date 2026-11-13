@@ -252,9 +252,9 @@ export type StructuredType = (typeof STRUCTURED_TYPES)[number];
 
 /**
  * Structured output (#593, ADR 0089, amending ADR 0017): the completed
- * requests held to a grammar, the draws it rejected and the repairs that
- * answered them, by type, and how long a repair took. Absent until the first
- * such request ended, so null on a server that never served one.
+ * requests held to a grammar, the sampled tokens it rejected and the repairs
+ * that answered them, by type, and how long a repair took. Absent until the
+ * first such request ended, so null on a server that never served one.
  */
 export type StructuredOutput = {
   requests: Record<StructuredType, number | null>;

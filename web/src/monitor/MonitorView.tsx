@@ -1216,7 +1216,7 @@ function ReasoningCard({ reasoning, win }: { reasoning: Reasoning; win: string }
   );
 }
 
-/** Structured output (#593): the requests held to a grammar, the draws it rejected, and how long a repair took. */
+/** Structured output (#593): the requests held to a grammar, the sampled tokens it rejected, and how long a repair took. */
 function StructuredCard({ structured, win }: { structured: StructuredOutputCard; win: string }) {
   return (
     <Card title="Structured output" subtitle={`Answers held to a grammar · last ${win}`}>

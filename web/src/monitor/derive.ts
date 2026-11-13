@@ -230,9 +230,9 @@ export type Speech = {
 
 /**
  * The Structured output card's figures (#593): the requests held to a grammar,
- * the draws it rejected and the repairs, over the window, and how long a repair
- * took. Misses per request is a plain ratio, which a sloppy prompt can push
- * above one.
+ * the sampled tokens it rejected and the repairs, over the window, and how
+ * long a repair took. Misses per request is a plain ratio, which a sloppy
+ * prompt can push above one.
  */
 export type StructuredOutputCard = {
   requests: Tally;

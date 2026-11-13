@@ -31,7 +31,7 @@
 //! 4. **The prefill's own draw** is repaired in 1, 2 and 3 alike.
 //! 5. **The refusals**: scores a later round wrote over, a draw the
 //!    test-only per-token route made (it keeps none), a sequence with no
-//!    waiting draw, and a mask built for another vocabulary.
+//!    pending token, and a mask built for another vocabulary.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a skip; under the profile it is a failure.
@@ -220,7 +220,7 @@ fn a_repair_draws_the_waiting_position_again_from_the_scores_its_call_kept() {
         let repaired = repair_program(&model, &pool, &mut sequence, SamplingParams::greedy(), &mask_of(&[forced]))
             .unwrap_or_else(|e| panic!("repair of the prefill's draw: {e}"));
         assert_eq!(repaired, forced, "a mask of one is that one token");
-        assert_eq!(sequence.pending_token(), Some(forced), "the repaired token is the waiting draw now");
+        assert_eq!(sequence.pending_token(), Some(forced), "the repaired token is the pending token now");
         decode_n(&model, &pool, &mut sequence, FOLLOWING, "subject")
     };
     eprintln!("ignis repair gpu: prefill draw {free} -> {forced}, then {subject:?}");
@@ -392,7 +392,7 @@ fn a_repair_draws_the_waiting_position_again_from_the_scores_its_call_kept() {
         let mut fresh = alloc();
         let error = repair_program(&model, &pool, &mut fresh, SamplingParams::greedy(), &mask_of(&[forced]))
             .expect_err("nothing drawn yet");
-        assert!(error.contains("no waiting draw"), "{error}");
+        assert!(error.contains("no pending token"), "{error}");
 
         let narrow = PermittedMask::from_ids(1000, &[1]).expect("a mask over 1000 columns");
         let error = repair_program(&model, &pool, &mut right, SamplingParams::greedy(), &narrow)

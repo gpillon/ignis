@@ -734,11 +734,11 @@ int32_t ignis_program_decode(struct ignis_model *model, struct ignis_seq_pool *p
                              int32_t *out_token_ids,
                              const struct ignis_decode_options *options);
 
-/* GitHub #586 (spec #287): a **repair** of `seq`'s waiting draw -- its
- * pending token, which the next round consumes and the scheduler has not let
- * it consume yet. The position is drawn again from the scores the call that
- * drew it kept, restricted to `permitted_mask`, and the result **replaces**
- * the waiting draw: the next round consumes it exactly as if it had been
+/* GitHub #586 (spec #287): a **repair** of `seq`'s pending token, which the
+ * next round consumes and the scheduler has not let it consume yet. The
+ * position is drawn again from the scores the call that drew it kept,
+ * restricted to `permitted_mask`, and the result **replaces**
+ * the pending token: the next round consumes it exactly as if it had been
  * drawn. `*out_token_id` receives it. A check-first caller (a grammar)
  * checks each draw on the host and repairs only a miss.
  *

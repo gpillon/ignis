@@ -3,7 +3,7 @@
 //! What is pinned here is the contract [`Compute::repair`] states, as
 //! [`MockCompute`] models it:
 //!
-//! - a repair acts on the **waiting draw** — what the prefill or the last
+//! - a repair acts on the **pending token** — what the prefill or the last
 //!   plain round drew, which the next round consumes as its anchor — and the
 //!   repaired token **replaces** it: the next round commits the repaired
 //!   token where the draw would have been, and the stream after it goes on;
@@ -14,7 +14,7 @@
 //!   say which token a miss becomes;
 //! - an early stop is a draw like any other, and a repaired one does not end
 //!   the request;
-//! - what the leaf refuses, the mock refuses: a request with no waiting draw,
+//! - what the leaf refuses, the mock refuses: a request with no pending token,
 //!   and a draw the leaf redirected itself.
 
 use ignis_core::constrained::PermittedMask;
@@ -88,7 +88,7 @@ fn a_repair_replaces_the_waiting_draw_the_next_round_consumes() {
 
     // The round drew step 1's token, which the next round would emit: a miss
     // against this mask, so the repair takes the mask's lowest id.
-    let repaired = compute.repair(&repair_to(&[300, 41, 2048])).expect("a waiting draw to repair");
+    let repaired = compute.repair(&repair_to(&[300, 41, 2048])).expect("a pending token to repair");
     assert_eq!(repaired, 41, "the mock's pick on a miss is the mask's lowest id");
     assert_eq!(emitted(&compute, false), vec![41], "the next round consumes the repaired token as its anchor");
     assert_eq!(
@@ -126,7 +126,7 @@ fn a_repair_keeps_a_draw_its_mask_permits_and_its_run_reports_no_probability() {
     assert!([10, 11, 12].contains(&draw));
     let all: Vec<TokenId> = (0..64).collect();
     assert_eq!(
-        compute.repair(&repair_to(&all)).expect("a waiting draw"),
+        compute.repair(&repair_to(&all)).expect("a pending token"),
         draw,
         "a draw the mask permits is its own masked argmax"
     );
@@ -214,7 +214,7 @@ fn a_repair_is_refused_where_the_leaf_refuses_it() {
     let compute = MockCompute::new();
     assert!(
         compute.repair(&repair_to(&[1])).is_err(),
-        "a request never prefilled has no waiting draw"
+        "a request never prefilled has no pending token"
     );
 
     // A draw the leaf redirected (GitHub #315) keeps no scores.

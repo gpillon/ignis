@@ -99,7 +99,7 @@ The measured figures are in
   disagrees. `cargo test -p ignis-server --test user_docs_reference` holds
   the committed page to it.
 - **The adapter** (`cargo test -p ignis-runtime --test runtime_compute
-  a_checked_lane`): a checked lane reports its waiting draw, the EOS as a stop;
+  a_checked_lane`): a checked lane reports its pending token, the EOS as a stop;
   through `decode_step_cut` (#590) its verified run reaches the host by its
   job, the EOS as a stop, and is committed as far as the host kept it.
 - **On the GPU** (27B, greedy): the served answers -- three `json_object`

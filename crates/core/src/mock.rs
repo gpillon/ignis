@@ -19,7 +19,7 @@ use std::time::Duration;
 use crate::decision::{Readout, argmax, log_sum_exp};
 use crate::scheduler::{
     Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome, DiskSource, DiskTarget,
-    KvRamEvent, KvRamMove, KvRamOutcome, PrefillJob, PrefillOutcome, RepairJob, WaitingDraw, NO_HOST_ROOM,
+    KvRamEvent, KvRamMove, KvRamOutcome, PrefillJob, PrefillOutcome, RepairJob, PendingToken, NO_HOST_ROOM,
 };
 use crate::types::{ComputeError, FinishReason, RequestId, SpecCounters, TokenId};
 
@@ -122,7 +122,7 @@ struct Inner {
     /// Prefill and decode calls served so far (GitHub #586): the clock the
     /// kept scores below are stamped with.
     steps_served: u64,
-    /// The requests whose **waiting draw** kept the scores it came from
+    /// The requests whose **pending token** kept the scores it came from
     /// (GitHub #586), each with the call that drew it. The leaf keeps them
     /// only until a later round or prefill draw writes their column, so the
     /// mock keeps them only until the next call of either kind: a repair is
@@ -132,7 +132,7 @@ struct Inner {
     /// them; a speculative round's, a redirected draw and a finished
     /// request keep none.
     kept: HashMap<RequestId, u64>,
-    /// A waiting draw a **repair** replaced (GitHub #586), per request: the
+    /// A pending token a **repair** replaced (GitHub #586), per request: the
     /// step it stands at, the repaired token, which the round committing that
     /// step commits in place of the draw -- the way `redirects` holds a draw
     /// the leaf replaced itself -- and the draw it replaced (`None` for an
@@ -143,7 +143,7 @@ struct Inner {
     repairs: Vec<RepairJob>,
     /// Every verify commit the host cut (GitHub #590), in order: the request,
     /// the run it was shown, and how many of its tokens the host kept.
-    cuts: Vec<(RequestId, Vec<WaitingDraw>, usize)>,
+    cuts: Vec<(RequestId, Vec<PendingToken>, usize)>,
     /// What a request writes, step by step (GitHub #587): its token at step
     /// `i` is `script[i]` instead of the mix, and every step past the
     /// script is its EOS ([`MockCompute::script`]).
@@ -170,16 +170,16 @@ impl Inner {
     /// host's cut is shown it (GitHub #590): a repair's token, a redirect's
     /// close, the EOS as a stop, else the free token -- the order a round's
     /// run takes them in.
-    fn draw_at(&self, seed: u64, request: RequestId, step: u32) -> WaitingDraw {
+    fn draw_at(&self, seed: u64, request: RequestId, step: u32) -> PendingToken {
         if let Some(&(_, token, _)) = self.repaired.get(&request).filter(|r| r.0 == step) {
-            return WaitingDraw::Token(token);
+            return PendingToken::Token(token);
         }
         if let Some(&(_, close)) = self.redirects.get(&request).filter(|r| r.0 == step) {
-            return WaitingDraw::Token(close);
+            return PendingToken::Token(close);
         }
         match self.is_eos(request, step) {
-            true => WaitingDraw::Stop,
-            false => WaitingDraw::Token(self.free_token(seed, request, step)),
+            true => PendingToken::Stop,
+            false => PendingToken::Token(self.free_token(seed, request, step)),
         }
     }
 }
@@ -640,7 +640,7 @@ impl MockCompute {
     /// The verify commits the host cut (GitHub #590), in order: the request,
     /// the run the host was shown -- its anchor, then the drafts -- and how
     /// many of its tokens the host kept.
-    pub fn cut_calls(&self) -> Vec<(RequestId, Vec<WaitingDraw>, usize)> {
+    pub fn cut_calls(&self) -> Vec<(RequestId, Vec<PendingToken>, usize)> {
         self.inner.lock().unwrap().cuts.clone()
     }
 
@@ -821,7 +821,7 @@ impl MockCompute {
     fn decode_round(
         &self,
         jobs: &[DecodeJob],
-        mut cut: Option<&mut dyn FnMut(usize, &[WaitingDraw]) -> usize>,
+        mut cut: Option<&mut dyn FnMut(usize, &[PendingToken]) -> usize>,
     ) -> Result<Vec<DecodeOutcome>, ComputeError> {
         let mut g = self.inner.lock().unwrap();
         g.decode_batches.push(jobs.to_vec());
@@ -891,7 +891,7 @@ impl MockCompute {
                         }
                         let draw = g.draw_at(self.seed, job.request, step);
                         shown.push(draw);
-                        if draw == WaitingDraw::Stop {
+                        if draw == PendingToken::Stop {
                             break;
                         }
                     }
@@ -983,7 +983,7 @@ impl MockCompute {
                     spec: (!g.run_lengths.is_empty() && (!job.checked || host_cut[index]))
                         .then(|| SpecCounters::round(length - 1, committed - 1)),
                     reasoning_redirected: redirected,
-                    waiting: None,
+                    pending: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -991,7 +991,7 @@ impl MockCompute {
         // next call -- a plain round's, that is: a speculative lane's (one
         // handed no set while the mock commits runs), a redirected one and a
         // finished request's keep none. GitHub #590: but a lane whose commit
-        // the host cut keeps its waiting draw's, as the leaf keeps the verify
+        // the host cut keeps its pending token's, as the leaf keeps the verify
         // column the cut ended at.
         g.steps_served += 1;
         let call = g.steps_served;
@@ -1013,12 +1013,12 @@ impl MockCompute {
                 true => {
                     let step = g.generated.get(&job.request).copied().unwrap_or(0);
                     let draw = match (g.pending.get(&job.request), g.redirects.get(&job.request)) {
-                        (Some(held), _) => WaitingDraw::Token(held.token),
-                        (None, Some(&(at, close))) if at == step => WaitingDraw::Token(close),
-                        _ if g.is_eos(job.request, step) => WaitingDraw::Stop,
-                        _ => WaitingDraw::Token(g.free_token(self.seed, job.request, step)),
+                        (Some(held), _) => PendingToken::Token(held.token),
+                        (None, Some(&(at, close))) if at == step => PendingToken::Token(close),
+                        _ if g.is_eos(job.request, step) => PendingToken::Stop,
+                        _ => PendingToken::Token(g.free_token(self.seed, job.request, step)),
                     };
-                    outcome.waiting_on(draw)
+                    outcome.with_pending(draw)
                 }
                 false => outcome,
             })
@@ -1223,7 +1223,7 @@ impl Compute for MockCompute {
     // of a script the mask permits, else the mask's lowest id, under any
     // temperature; an EOS draw, which the mock has no id for, is never
     // permitted. It refuses what the leaf refuses: a request
-    // whose waiting draw kept no scores, or whose scores a later call wrote
+    // whose pending token kept no scores, or whose scores a later call wrote
     // over (`Inner::kept`). A constrained run's held draw is replaced too, and
     // the round that emits it then reports no probability for it, as the
     // runtime does: the set's share of a token the set did not draw is
@@ -1267,7 +1267,7 @@ impl Compute for MockCompute {
     fn decode_step_cut(
         &self,
         jobs: &[DecodeJob],
-        cut: &mut dyn FnMut(usize, &[WaitingDraw]) -> usize,
+        cut: &mut dyn FnMut(usize, &[PendingToken]) -> usize,
     ) -> Result<Vec<DecodeOutcome>, ComputeError> {
         self.decode_round(jobs, Some(cut))
     }
@@ -1878,7 +1878,7 @@ impl Compute for GatedCompute {
     fn decode_step_cut(
         &self,
         jobs: &[DecodeJob],
-        cut: &mut dyn FnMut(usize, &[crate::scheduler::WaitingDraw]) -> usize,
+        cut: &mut dyn FnMut(usize, &[crate::scheduler::PendingToken]) -> usize,
     ) -> Result<Vec<DecodeOutcome>, ComputeError> {
         self.hold_at_gate(jobs);
         self.inner.decode_step_cut(jobs, cut)

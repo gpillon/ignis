@@ -152,7 +152,7 @@ use crate::retained_slot::{RetainedHolder, RetainedSkip, RetainedSlotLedger};
 use crate::scheduler::{
     CheckpointClaim, Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome,
     DiskSource, DiskTarget, KvRamEvent, KvRamMove, KvRamOutcome, Occupancy, PrefillJob, PrefillOutcome, RepairJob,
-    RetainedAt, Scheduler, SharedPrefixClaim, WaitingDraw,
+    RetainedAt, Scheduler, SharedPrefixClaim, PendingToken,
 };
 use crate::structured::Verdict;
 use crate::types::{
@@ -353,7 +353,7 @@ fn chunk_take(r: &Request, serving_chunk: u32) -> u32 {
     }
 }
 
-/// What holding a waiting draw to its grammar did (GitHub #587).
+/// What holding a pending token to its grammar did (GitHub #587).
 enum Held {
     /// The draw passed: it waits as it was drawn.
     Kept,
@@ -2473,7 +2473,7 @@ impl ConcreteScheduler {
         (request_id, tokens)
     }
 
-    /// Hold request `i`'s waiting draw to its **grammar** (GitHub #587, ADR
+    /// Hold request `i`'s pending token to its **grammar** (GitHub #587, ADR
     /// 0089): right after the call that drew it, before the next call
     /// consumes it -- or overwrites the scores it kept. A draw that passes is
     /// the grammar's from then on; a **miss** is **repaired**, the position
@@ -2482,7 +2482,7 @@ impl ConcreteScheduler {
     ///
     /// The one place a miss and a repair happen, which is where each is
     /// reported, with the repair's time ([`SchedEvent::Miss`], #593).
-    fn hold_to_grammar(&mut self, i: usize, draw: WaitingDraw, events: &mut Vec<SchedEvent>) -> Held {
+    fn hold_to_grammar(&mut self, i: usize, draw: PendingToken, events: &mut Vec<SchedEvent>) -> Held {
         let r = &mut self.requests[i];
         let Some(state) = r.grammar.as_mut() else {
             return Held::Kept;
@@ -2536,13 +2536,13 @@ impl ConcreteScheduler {
     /// held to its grammar when its answer starts there. Returns the run the
     /// request emits: the draw, the token that repaired it, or the request's
     /// end.
-    fn hold_first_draw(&mut self, i: usize, run: DecodeOutcome, events: &mut Vec<SchedEvent>) -> DecodeOutcome {
+    fn hold_first_token(&mut self, i: usize, run: DecodeOutcome, events: &mut Vec<SchedEvent>) -> DecodeOutcome {
         if !self.requests[i].grammar.as_ref().is_some_and(|state| state.holds()) {
             return run;
         }
         let draw = match (run.tokens.as_slice(), run.finish) {
-            ([token], None) => WaitingDraw::Token(*token),
-            ([], Some(FinishReason::Stop)) => WaitingDraw::Stop,
+            ([token], None) => PendingToken::Token(*token),
+            ([], Some(FinishReason::Stop)) => PendingToken::Stop,
             // Nothing else is a draw: hold nothing back from the ending.
             _ => return run,
         };
@@ -2553,7 +2553,7 @@ impl ConcreteScheduler {
         }
     }
 
-    /// GitHub #587: after a round, request `i`'s waiting draw held to its
+    /// GitHub #587: after a round, request `i`'s pending token held to its
     /// grammar, once the answer has started (the round's own run may be what
     /// started it). A draw a permitted set forced is the server's text, not
     /// the model's, and is left alone. Ends the request when the draw or its
@@ -2562,10 +2562,10 @@ impl ConcreteScheduler {
     ///
     /// GitHub #590: after a verify round the drafts the commit kept were
     /// checked before it ([`crate::structured::GrammarState::check_run`]); the
-    /// waiting draw is the draft the host cut at, or the run's own successor,
+    /// pending token is the draft the host cut at, or the run's own successor,
     /// held here as a plain round's is -- so a miss inside a run is counted
     /// and repaired in [`ConcreteScheduler::hold_to_grammar`] like any other.
-    fn hold_round_draw(&mut self, i: usize, run: &DecodeOutcome, forced: bool, events: &mut Vec<SchedEvent>) {
+    fn hold_round_token(&mut self, i: usize, run: &DecodeOutcome, forced: bool, events: &mut Vec<SchedEvent>) {
         let r = &mut self.requests[i];
         let request = r.id;
         let done = r.state == RequestState::Done;
@@ -2576,12 +2576,12 @@ impl ConcreteScheduler {
         if done || !state.holds() || forced {
             return;
         }
-        let held = match run.waiting {
+        let held = match run.pending {
             Some(draw) => self.hold_to_grammar(i, draw, events),
             None => {
                 // hotpath-lint-allow: failure-only path (a backend that did not report a draw it was asked for), reviewed exception (GitHub #587).
                 tracing::error!(
-                    name: "ignis.structured.no_waiting_draw",
+                    name: "ignis.structured.no_pending_token",
                     request_id = request,
                     "a round left a structured answer's draw unreported, so it cannot be checked"
                 );
@@ -2624,8 +2624,8 @@ impl ConcreteScheduler {
             finish,
             spec,
             reasoning_redirected,
-            // GitHub #587: read after the run, by `hold_round_draw`.
-            waiting: _,
+            // GitHub #587: read after the run, by `hold_round_token`.
+            pending: _,
         } = run;
         if let Some(spec) = spec {
             let r = &mut self.requests[i];
@@ -5759,7 +5759,7 @@ impl Scheduler for ConcreteScheduler {
             // GitHub #587: an answer held to a grammar from its first token
             // has that token checked, and repaired on a miss, before it
             // leaves.
-            let run = self.hold_first_draw(i, run, &mut events);
+            let run = self.hold_first_token(i, run, &mut events);
             let left = !run.tokens.is_empty();
             self.commit_run(i, &run, false, &mut events);
             if let Some(state) = self.requests[i].grammar.as_mut() {
@@ -5965,7 +5965,7 @@ impl Scheduler for ConcreteScheduler {
                 false => self.compute.decode_step(&jobs),
                 true => {
                     let requests = &mut self.requests;
-                    let mut cut = |job: usize, run: &[WaitingDraw]| -> usize {
+                    let mut cut = |job: usize, run: &[PendingToken]| -> usize {
                         match requests[to_decode[job]].grammar.as_mut() {
                             Some(state) => state.check_run(run),
                             None => run.len(),
@@ -6007,7 +6007,7 @@ impl Scheduler for ConcreteScheduler {
                         // GitHub #587: and the draw it left waiting, held to
                         // the request's grammar before the next round.
                         if job.checked {
-                            self.hold_round_draw(i, res, job.permitted.is_some(), &mut events);
+                            self.hold_round_token(i, res, job.permitted.is_some(), &mut events);
                         }
                     }
                 }

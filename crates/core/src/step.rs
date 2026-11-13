@@ -174,7 +174,7 @@ pub(crate) mod ffi {
             options: *const IgnisDecodeOptions,
         ) -> i32;
 
-        /// GitHub #586: a repair of `seq`'s waiting draw (`ignis_step.h`).
+        /// GitHub #586: a repair of `seq`'s pending token (`ignis_step.h`).
         pub fn ignis_program_repair(
             model: *mut IgnisModel,
             pool: *mut IgnisSeqPool,
@@ -1367,8 +1367,8 @@ pub fn decode_program_batch_permitted(
         .unzip())
 }
 
-/// **Repair** `sequence`'s waiting draw (GitHub #586, spec #287): its pending
-/// token is drawn again from the scores the call that drew it kept -- its
+/// **Repair** `sequence`'s pending token (GitHub #586, spec #287): its
+/// position is drawn again from the scores the call that drew it kept -- its
 /// last prefill span's draw or its last plain round's -- restricted to
 /// `permitted`, under `sampling`, and the result replaces it. Returns the
 /// repaired token, which the next round consumes as if it had been drawn.

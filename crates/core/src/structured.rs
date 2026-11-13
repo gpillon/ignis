@@ -5,7 +5,7 @@
 //! sequence's pending token until the next round consumes it, and the
 //! scheduler **checks** it against the request's grammar in between: the
 //! prefill's own draw right after the prefill, a plain round's right after
-//! the round ([`crate::scheduler::DecodeOutcome::waiting`]). A **miss** is
+//! the round ([`crate::scheduler::DecodeOutcome::pending`]). A **miss** is
 //! **repaired** there and then: the position is drawn again from the scores
 //! the call kept, restricted to the grammar's permitted set
 //! ([`crate::scheduler::Compute::repair`]), and the next round consumes the
@@ -52,7 +52,7 @@ use std::sync::Arc;
 use ignis_grammar::{Grammar, Matcher, TokenSet};
 
 use crate::constrained::PermittedMask;
-use crate::scheduler::WaitingDraw;
+use crate::scheduler::PendingToken;
 use crate::types::TokenId;
 
 /// What a request asked its answer to be: the type its `response_format`
@@ -143,7 +143,7 @@ impl std::fmt::Debug for AnswerGrammar {
     }
 }
 
-/// What the grammar says of a waiting draw.
+/// What the grammar says of a pending token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     /// Valid where the answer stands; the grammar has taken it.
@@ -213,12 +213,12 @@ impl GrammarState {
     }
 
     /// Check a verify round's run before it is committed (GitHub #590): its
-    /// anchor -- the last waiting draw, already held -- then the drafts the
+    /// anchor -- the last pending token, already held -- then the drafts the
     /// target accepted. Returns how many of the run's tokens the commit
     /// keeps, at least the anchor: every draft that passes as an ordinary
     /// token is the grammar's from then on, and the first that does not --
     /// a miss, or a stop -- is where the run is cut. That draft then waits
-    /// as the round's draw, and is held as every waiting draw is
+    /// as the round's draw, and is held as every pending token is
     /// ([`GrammarState::check`]): repaired, or the request ended.
     ///
     /// Before the answer starts nothing is checked, but a reasoning close in
@@ -226,15 +226,15 @@ impl GrammarState {
     /// or redirect, and the rest of the run is left to it whole. So is the
     /// rest of a run whose draft opens a tool call before the answer started
     /// (GitHub #592), which releases the turn, and every run after.
-    pub fn check_run(&mut self, run: &[WaitingDraw]) -> usize {
+    pub fn check_run(&mut self, run: &[PendingToken]) -> usize {
         if self.released {
             return run.len();
         }
         for (index, &draw) in run.iter().enumerate() {
             let token = match draw {
-                WaitingDraw::Token(token) => token,
-                WaitingDraw::Stop if self.open && index > 0 => return index,
-                WaitingDraw::Stop => return run.len(),
+                PendingToken::Token(token) => token,
+                PendingToken::Stop if self.open && index > 0 => return index,
+                PendingToken::Stop => return run.len(),
             };
             if !self.open {
                 self.open = self.think_end == Some(token);
@@ -255,19 +255,19 @@ impl GrammarState {
         run.len()
     }
 
-    /// Check a waiting draw of the answer, and take it when it passes. The
+    /// Check a pending token of the answer, and take it when it passes. The
     /// tool call's opener before the answer started releases the turn.
-    pub fn check(&mut self, draw: WaitingDraw) -> Verdict {
+    pub fn check(&mut self, draw: PendingToken) -> Verdict {
         match draw {
-            WaitingDraw::Token(token) if self.opens_tool_call(token) => {
+            PendingToken::Token(token) if self.opens_tool_call(token) => {
                 self.released = true;
                 Verdict::Released
             }
-            WaitingDraw::Stop if self.matcher.is_accepting() => Verdict::Finished,
-            WaitingDraw::Stop => Verdict::Miss,
-            WaitingDraw::Token(token) if !self.matcher.accept(token) => Verdict::Miss,
-            WaitingDraw::Token(_) if self.matcher.is_finished() => Verdict::Finished,
-            WaitingDraw::Token(_) => Verdict::Passed,
+            PendingToken::Stop if self.matcher.is_accepting() => Verdict::Finished,
+            PendingToken::Stop => Verdict::Miss,
+            PendingToken::Token(token) if !self.matcher.accept(token) => Verdict::Miss,
+            PendingToken::Token(_) if self.matcher.is_finished() => Verdict::Finished,
+            PendingToken::Token(_) => Verdict::Passed,
         }
     }
 
