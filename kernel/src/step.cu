@@ -249,6 +249,33 @@ std::uint64_t stamp_kept_column(ignis_model *model, std::int32_t column) {
   return epoch;
 }
 
+// GitHub #590: whether the scores `kept` names are still the ones its draw
+// was made from -- a decode-logits column no later round or prefill draw has
+// written, or the verify logits of the last verify round, the one that cut
+// the lane's commit.
+bool kept_scores_current(const ignis_model *model, const ignis_kept_scores &kept) {
+  if (kept.source == IgnisKeptSource::kVerifyLogits) {
+    const IgnisVerifyRound *verify = model->verify.get();
+    return verify != nullptr &&
+           static_cast<std::uint64_t>(kept.column) <
+               static_cast<std::uint64_t>(model->decode_lanes) * (verify->window + 1) &&
+           verify->kept_epoch == kept.epoch;
+  }
+  return static_cast<std::uint32_t>(kept.column) < model->decode_lanes &&
+         model->kept_column_epochs[static_cast<std::size_t>(kept.column)] == kept.epoch;
+}
+
+// GitHub #590: the device row `kept` names, in whichever buffer holds it --
+// the verify logits are `[vocab, k + 1, decode_lanes]` BF16, one row a column.
+const void *kept_scores_row(ignis_model *model, const ignis_kept_scores &kept) {
+  if (kept.source == IgnisKeptSource::kVerifyLogits) {
+    return static_cast<const std::uint8_t *>(model->verify->logits->p) +
+           static_cast<std::size_t>(kept.column) * static_cast<std::size_t>(model->vocab) *
+               sizeof(std::uint16_t);
+  }
+  return kept_row(model, kept.column);
+}
+
 // GitHub #586: whether a draw under `sampling` added one to its token's
 // penalty count -- the vendored sampler counts in its temperature branch
 // only, and the program always hands it the sequence's row.
@@ -1954,6 +1981,9 @@ struct UncommittedRingColumns {
 //   accept   -> `n` accepted drafts (n <= extent), licensed = [d_1..d_n, t*]
 //               where t* is the correction/bonus token
 //   run      = [a, d_1 .. d_n], cut at the first stop id inclusive -> c tokens
+//              (GitHub #590: on a lane whose cut the host decides, first
+//              shortened to the prefix the host keeps, its pending token the
+//              draft after that prefix)
 //   commit   = the first c columns: KV frontier p -> p + c (the columns'
 //              K/V were appended in place at p..p+c-1 and the rest are
 //              overwritten by the next round), fold records[0..c) into the
@@ -2111,6 +2141,11 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
 
     UncommittedRingColumns uncommitted{pool, model->stream, &base_positions, &extents, &slots};
     const bool use_graph = verify.graph_ready[batch_size - 1];
+    // GitHub #590: the pass writes the verify logits, which a repair reads for
+    // a lane whose commit the host cuts. Stamped before the work is enqueued,
+    // so a round that fails part way leaves no earlier record believing them
+    // its own.
+    verify.kept_epoch = ++model->kept_epoch;
     // Armed before the launch: a pass that fails part way may still have
     // appended some of its columns.
     uncommitted.armed = true;
@@ -2192,6 +2227,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     std::vector<std::int32_t> committed(batch_size, 0);
     std::vector<std::int32_t> next_pending(batch_size, -1);
     std::vector<bool> redirected(batch_size, false);
+    // GitHub #590: the lanes whose cut the host decides (`host_cut`), read
+    // once; NULL on every round no lane of which is held to a grammar.
+    const std::uint8_t *host_cut_lanes = options.host_cut != nullptr ? options.host_cut_lanes : nullptr;
     std::vector<ninfer::ops::GdnReplayFoldRow> fold_rows(batch_size);
     std::vector<std::int32_t> selectors(batch_size, 0);
     std::vector<std::int32_t> run(lane_columns, 0);
@@ -2210,14 +2248,28 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       for (std::int32_t j = 0; j < n; ++j) {
         run[static_cast<std::size_t>(j) + 1] = lane_licensed[j];
       }
+      // GitHub #590: a lane whose cut the host decides keeps the prefix of
+      // its run the host returns -- a grammar's, up to its first miss -- and
+      // the draft after that prefix waits as its pending token. Every other
+      // lane keeps its run whole, which is the cut below as it always was.
+      std::int32_t keep = n + 1;
+      if (host_cut_lanes != nullptr && host_cut_lanes[i] != 0) {
+        keep = options.host_cut(options.host_cut_context, i, run.data(), n + 1);
+        if (keep < 1 || keep > n + 1) {
+          set_error("ignis_program_decode: the host's cut of lane " + std::to_string(i) + " kept " +
+                    std::to_string(keep) + " tokens of a run of " + std::to_string(n + 1) +
+                    " (1.." + std::to_string(n + 1) + ", or the host failed)");
+          return -1;
+        }
+      }
       // The cut at the first stop id inclusive, and the successor of the
       // run's last committed token: the draft after it when the target agreed
       // with that draft, else the correction/bonus token. GitHub #315 (ADR
       // 0048): with the lane's reasoning block open, a stop id is cut before
       // instead and `</think>` is pending in its place.
       const IgnisRoundCut cut =
-          ignis_cut_and_redirect(run.data(), n + 1, lane_licensed[n], sampling[i].stop_ids,
-                                 sampling[i].stop_id_count, sampling[i].reasoning_close_id);
+          ignis_cut_host_kept_run(run.data(), lane_licensed, keep, sampling[i].stop_ids,
+                                  sampling[i].stop_id_count, sampling[i].reasoning_close_id);
       const std::int32_t c = cut.committed;
       committed[i] = c;
       next_pending[i] = cut.next_pending;
@@ -2361,8 +2413,19 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     for (uint64_t i = 0; i < batch_size; ++i) {
       sequences[i]->pending_token = next_pending[i];
       // GitHub #586: a verify round's successor keeps no scores a repair
-      // reads yet -- the verify commit whose cut the host decides does (#590).
+      // reads -- but (#590) a lane whose cut the host decided keeps its pending
+      // token's: the verify logits' column the cut ended at, `committed - 1`,
+      // whose draw it is (none for a redirected `</think>`). Its penalty count
+      // is the accept kernel's, kept by the rollback above.
       sequences[i]->kept = ignis_kept_scores{};
+      if (host_cut_lanes != nullptr && host_cut_lanes[i] != 0 && !redirected[i]) {
+        ignis_kept_scores &kept = sequences[i]->kept;
+        kept.source = IgnisKeptSource::kVerifyLogits;
+        kept.column = static_cast<std::int32_t>(i * lane_columns) + committed[i] - 1;
+        kept.epoch = verify.kept_epoch;
+        kept.position = base_positions[i] + committed[i] - 1;
+        kept.counted = configs[i].temperature > 0.0f && configs[i].token_counts != nullptr;
+      }
       advance_frontiers(model, sequences[i], static_cast<std::uint32_t>(committed[i]));
       options.out_committed_counts[i] = committed[i];
       if (options.out_reasoning_redirected != nullptr) {
@@ -2419,6 +2482,14 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       set_error("ignis_program_decode: forced_tokens is the 27B verify round's; a Flash-Next load has none");
       return -1;
     }
+    // GitHub #590: so is a host cut -- Flash-Next keeps no scores a repair
+    // reads (#581), so a cut there would leave a miss nobody can repair.
+    if (options != nullptr && options->size == sizeof(struct ignis_decode_options) &&
+        (options->host_cut != nullptr || options->host_cut_lanes != nullptr)) {
+      set_error("ignis_program_decode: a host cut is the 27B verify round's; a Flash-Next load has none "
+                "(GitHub #581)");
+      return -1;
+    }
     return ignis::flash_next::program_decode(model, pool, sequences, batch_size, sampling, out_token_ids,
                                              options);
   }
@@ -2462,6 +2533,21 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
     // round has none to replace.
     if (options->speculative_window == 0 && options->forced_tokens != nullptr) {
       set_error("ignis_program_decode: forced_tokens needs a verify round (speculative_window > 0)");
+      return -1;
+    }
+    // GitHub #590: a host cut names its lanes and its callback together, cuts
+    // a verify round's run (a plain round's run is its anchor alone), and
+    // never a teacher-forced one, whose run is the recording's.
+    if ((options->host_cut == nullptr) != (options->host_cut_lanes == nullptr)) {
+      set_error("ignis_program_decode: host_cut and host_cut_lanes are set together or not at all");
+      return -1;
+    }
+    if (options->host_cut != nullptr && options->speculative_window == 0) {
+      set_error("ignis_program_decode: a host cut needs a verify round (speculative_window > 0)");
+      return -1;
+    }
+    if (options->host_cut != nullptr && options->forced_tokens != nullptr) {
+      set_error("ignis_program_decode: a teacher-forced round commits its recording; it takes no host cut");
       return -1;
     }
     if (options->speculative_window != 0) {
@@ -2914,12 +3000,11 @@ extern "C" int32_t ignis_program_repair(struct ignis_model *model, struct ignis_
   }
   const ignis_kept_scores kept = seq->kept;
   if (kept.column < 0) {
-    set_error("ignis_program_repair: the waiting draw kept no scores (a verify round's, a "
-              "redirected one, or a sequence restored or claimed since its draw)");
+    set_error("ignis_program_repair: the waiting draw kept no scores (a verify round's the host "
+              "did not cut, a redirected one, or a sequence restored or claimed since its draw)");
     return -1;
   }
-  if (static_cast<std::uint32_t>(kept.column) >= model->decode_lanes ||
-      model->kept_column_epochs[static_cast<std::size_t>(kept.column)] != kept.epoch) {
+  if (!kept_scores_current(model, kept)) {
     set_error("ignis_program_repair: the scores the waiting draw came from were written over by a "
               "later round or prefill; a repair follows the call that drew");
     return -1;
@@ -2948,7 +3033,7 @@ extern "C" int32_t ignis_program_repair(struct ignis_model *model, struct ignis_
       ninfer::Tensor row = model->scratch->alloc(ninfer::DType::BF16, {vocab, 1, 1, 1});
       ninfer::Tensor mask = model->scratch->alloc(ninfer::DType::I64,
                                                   {static_cast<std::int32_t>(words), 1, 1, 1});
-      cudaError_t err = cudaMemcpyAsync(row.data, kept_row(model, kept.column),
+      cudaError_t err = cudaMemcpyAsync(row.data, kept_scores_row(model, kept),
                                         static_cast<std::size_t>(vocab) * sizeof(std::uint16_t),
                                         cudaMemcpyDeviceToDevice, model->stream);
       if (err == cudaSuccess) {

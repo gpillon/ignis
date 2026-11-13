@@ -292,6 +292,39 @@ async fn a_preamble_a_fence_a_remark_and_an_early_stop_each_come_back_a_valid_ob
     }
 }
 
+/// Speculation stays on for a held answer (GitHub #590): over a mock that
+/// commits runs as verify rounds do, each run is checked before it is
+/// committed and cut at its first miss, and every answer, its repairs and
+/// its finish are the ones the same model gives one token a round.
+#[tokio::test]
+async fn with_speculation_each_answer_is_the_one_without() {
+    let scripts = [
+        "Sure! Here it is:
+{\"a\": 1}",
+        "```json
+{\"a\": 1}
+```",
+        "{\"a\": 1}
+That is all.",
+        "{\"a\": [1, 2",
+        "{\"name\": \"Tom\", \"legs\": 4x, \"toys\": [1, 2]}",
+    ];
+    for script in scripts {
+        let served = |mock: MockCompute| {
+            let mock = Arc::new(mock);
+            mock.script(0, &encode(script));
+            (server(mock.clone(), SchedulerConfig::default()).app(), mock)
+        };
+        let (app, plain) = served(MockCompute::new());
+        let without = answer(&app, &chat(false, 64)).await;
+        let (app, runs) = served(MockCompute::with_runs(&[4, 2, 6]));
+        let with = answer(&app, &chat(false, 64)).await;
+        assert_eq!(with, without, "{script:?}: the same answer with speculation");
+        assert_eq!(runs.repair_calls().len(), plain.repair_calls().len(), "{script:?}: the same repairs");
+        assert!(!runs.cut_calls().is_empty(), "{script:?}: the held lane's runs went to the host's cut");
+    }
+}
+
 /// A model that writes a valid object is never repaired: what it wrote is
 /// what comes back, byte for byte.
 #[tokio::test]

@@ -972,7 +972,6 @@ mod tests {
                 constrained: None,
                 forced_literal: None,
                 grammar: None,
-                tally: Default::default(),
                 warm_up: false,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2, 3],

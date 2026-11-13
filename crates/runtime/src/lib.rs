@@ -319,9 +319,11 @@ pub struct DecodeLane<'a> {
     /// or `None`. [`LaneRun::redirected`] says it happened.
     pub reasoning_close: Option<TokenId>,
     /// The host checks the draw this lane makes before the next round
-    /// consumes it (GitHub #587, [`ignis_core::scheduler::DecodeJob::checked`]):
+    /// consumes it (GitHub #587, [`ignis_core::scheduler::DecodeJob::checked`]).
+    /// Through [`StepLeaf::decode_cut`] a verify round keeps going and the
+    /// host cuts this lane's run (GitHub #590); through [`StepLeaf::decode`]
     /// the round is a plain one, for the whole batch as for a permitted set,
-    /// so the draw keeps the scores a repair reads (until #590).
+    /// so the draw keeps the scores a repair reads.
     pub checked: bool,
 }
 
@@ -879,6 +881,24 @@ pub trait StepLeaf: Send + Sync + 'static {
         sequences: &mut [&mut Self::Sequence],
         lanes: &[DecodeLane<'_>],
     ) -> Result<Vec<LaneRun>, i32>;
+    /// [`StepLeaf::decode`] with a **verify commit whose cut the host
+    /// decides** (GitHub #590, spec #287) on every [`DecodeLane::checked`]
+    /// lane: a verify round's pass shows `cut(lane, run)` that lane's run --
+    /// its anchor, then the drafts the target accepted -- and commits the
+    /// `1..=run.len()` tokens it returns, the draft after them pending with
+    /// the scores of its column kept for [`StepLeaf::repair`]. `lane` indexes
+    /// `lanes`. Every other lane's round is unchanged. The default is a leaf
+    /// with no host cut: [`StepLeaf::decode`], which runs a round with a
+    /// checked lane plain (Flash-Next's for now, #581).
+    fn decode_cut(
+        &self,
+        model: &Self::Model,
+        sequences: &mut [&mut Self::Sequence],
+        lanes: &[DecodeLane<'_>],
+        _cut: &mut dyn FnMut(usize, &[TokenId]) -> usize,
+    ) -> Result<Vec<LaneRun>, i32> {
+        self.decode(model, sequences, lanes)
+    }
     /// **Repair** `sequence`'s pending token (GitHub #586, spec #287): drawn
     /// again under `params` from the scores the call that drew it kept,
     /// restricted to `permitted`; the result replaces it and is returned.
@@ -1481,6 +1501,239 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     }
 }
 
+impl<L: StepLeaf> RuntimeCompute<L> {
+    /// One decode round over `jobs` ([`Compute::decode_step`]), with the
+    /// host's cut of every checked lane's verified run when `cut` is given
+    /// ([`Compute::decode_step_cut`], GitHub #590). Without it the round is
+    /// the one it always was.
+    fn decode_round(
+        &self,
+        jobs: &[DecodeJob],
+        cut: Option<&mut dyn FnMut(usize, &[WaitingDraw]) -> usize>,
+    ) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        // The load's own lanes (GitHub #336), which the scheduler never
+        // batches past and the leaf refuses past too.
+        if jobs.len() > self.model.leaf.decode_lanes() as usize {
+            return Err(ComputeError::Kernel(-1));
+        }
+        let mut sequences = self.sequences.lock().unwrap();
+        let mut batch: Vec<(DecodeJob, LiveSequence<L::Sequence>)> = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let Some(sequence) = sequences.remove(&job.request) else {
+                for (job, sequence) in batch {
+                    sequences.insert(job.request, sequence);
+                }
+                return Err(ComputeError::Kernel(-1));
+            };
+            batch.push((job.clone(), sequence));
+        }
+
+        // `None` until filled below; every index is either already-finished
+        // (a prior round's `max_tokens`, `Length`), gets a fresh run, or
+        // finishes this round (EOS, `Stop`) — so every slot is set once.
+        let mut outcomes: Vec<Option<DecodeOutcome>> = vec![None; jobs.len()];
+        let mut active = vec![false; jobs.len()];
+        for (index, (job, sequence)) in batch.iter().enumerate() {
+            if job
+                .params
+                .max_tokens
+                .is_some_and(|max| sequence.generated >= max)
+            {
+                outcomes[index] = Some(DecodeOutcome::finished(FinishReason::Length));
+            } else {
+                active[index] = true;
+            }
+        }
+        // P5-06 (GitHub #154): the leaf cuts each lane's run at its budget
+        // and at the EOS, so the sequence never commits past the text its
+        // request emits.
+        let eos = [self.eos];
+        // GitHub #242: cloned out of `batch` before the lanes borrow it,
+        // because the handles below take it mutably. An `Option<Arc>` clone
+        // is a refcount bump for a constrained lane and nothing at all for
+        // any other — an ordinary round allocates no more than it did before
+        // this ticket, which is the bar for anything on this path.
+        let permitted: Vec<Option<ignis_core::constrained::PermittedSet>> = batch
+            .iter()
+            .map(|(job, _)| job.permitted.clone())
+            .collect();
+        let decoded = {
+            let lanes: Vec<DecodeLane<'_>> = batch
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| active[*index])
+                .map(|(index, (job, sequence))| DecodeLane {
+                    params: job.params,
+                    // #518: an anchor the prefill emitted is committed but not
+                    // counted in the request's remaining budget, and not yet
+                    // in `generated`, which counts what rounds committed.
+                    remaining_tokens: {
+                        let remaining = job.remaining_tokens.saturating_add(u32::from(job.anchor_emitted));
+                        job.params
+                            .max_tokens
+                            .map_or(remaining, |max| remaining.min(max.saturating_sub(sequence.generated)))
+                            .max(1)
+                    },
+                    stop_ids: if job.params.ignore_eos { &[] } else { &eos },
+                    permitted: permitted[index].as_deref().unwrap_or(&[]),
+                    // GitHub #315: no stop id, nothing to redirect.
+                    reasoning_close: job.reasoning_close.filter(|_| !job.params.ignore_eos),
+                    checked: job.checked,
+                })
+                .collect();
+            let mut handles: Vec<&mut L::Sequence> = batch
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, _)| active[*index])
+                .map(|(_, (_, sequence))| &mut sequence.handle)
+                .collect();
+            // Every job was already capped: nothing for the leaf to run, and
+            // it refuses an empty batch.
+            if lanes.is_empty() {
+                Ok(Vec::new())
+            } else {
+                match cut {
+                    None => self.model.leaf.decode(self.model.handle(), &mut handles, &lanes),
+                    // GitHub #590: the leaf shows a checked lane's run by its
+                    // lane; the scheduler reads it by its job, each token as
+                    // it checks a draw -- the lane's stop id as a stop.
+                    Some(cut) => {
+                        let job_of: Vec<usize> = (0..active.len()).filter(|&index| active[index]).collect();
+                        let mut shown: Vec<WaitingDraw> = Vec::new();
+                        let mut leaf_cut = |lane: usize, run: &[TokenId]| -> usize {
+                            shown.clear();
+                            shown.extend(run.iter().map(|&token| match lanes[lane].stop_ids.contains(&token) {
+                                true => WaitingDraw::Stop,
+                                false => WaitingDraw::Token(token),
+                            }));
+                            cut(job_of[lane], &shown)
+                        };
+                        self.model.leaf.decode_cut(self.model.handle(), &mut handles, &lanes, &mut leaf_cut)
+                    }
+                }
+            }
+        };
+        let decoded = match decoded {
+            Ok(runs)
+                if runs.len() == active.iter().filter(|&&active| active).count()
+                    && runs.iter().all(|run| !run.tokens.is_empty()) =>
+            {
+                runs
+            }
+            Ok(_) => {
+                for (job, sequence) in batch {
+                    sequences.insert(job.request, sequence);
+                }
+                return Err(ComputeError::Kernel(-1));
+            }
+            Err(code) => {
+                for (job, sequence) in batch {
+                    sequences.insert(job.request, sequence);
+                }
+                return Err(RuntimeError::Leaf(code).into());
+            }
+        };
+
+        let mut decoded = decoded.into_iter();
+        let mut released = Vec::new();
+        // GitHub #242: taken once for the whole round rather than per lane.
+        // The map is empty unless a constrained run is in flight, and this
+        // is the decode path — one uncontended lock per round is a cost an
+        // ordinary round can carry; eight of them would be a cost this
+        // ticket added to every request the engine serves.
+        let mut drawn_probabilities = self.drawn.lock().unwrap();
+        for (index, (job, mut sequence)) in batch.into_iter().enumerate() {
+            if !active[index] {
+                released.push(sequence);
+                continue;
+            }
+            let LaneRun {
+                mut tokens,
+                spec,
+                drawn_probability,
+                redirected,
+            } = decoded.next().expect("decoded result length was checked");
+            // GitHub #242 — the one-round lag, closed here. The round
+            // returns the token drawn *last* time, so its probability is the
+            // one held from then; what this round drew is held for the next.
+            // A lane that drew unconstrained leaves nothing behind, so the
+            // entry disappears on the round after a run's last set and
+            // never outlives the request.
+            let probabilities = match drawn_probabilities.is_empty() {
+                true => Vec::new(),
+                false => match drawn_probabilities.remove(&job.request) {
+                    Some(probability) => vec![probability],
+                    None => Vec::new(),
+                },
+            };
+            if let Some(probability) = drawn_probability {
+                drawn_probabilities.insert(job.request, probability);
+            }
+            // A lane handed a set runs a plain round, one token. The round
+            // after a run's last set carries none and may commit a
+            // speculative run — every forced tool-call opening ends so
+            // (GitHub #286), as the thinking budget's close does — and the
+            // probability held is its first token's, the one drawn under
+            // the set.
+            debug_assert!(
+                job.permitted.is_none() || tokens.len() <= 1,
+                "a lane handed a permitted set commits one token"
+            );
+            // #518: the run's anchor left with the prefill; the sequence
+            // committed it all the same.
+            let anchor = u32::from(job.anchor_emitted);
+            if job.anchor_emitted {
+                tokens.remove(0);
+            }
+            let eos_at = (!job.params.ignore_eos)
+                .then(|| tokens.iter().position(|&token| token == self.eos))
+                .flatten();
+            let outcome = match eos_at {
+                // The EOS itself is never emitted.
+                Some(at) => {
+                    tokens.truncate(at);
+                    released.push(sequence);
+                    DecodeOutcome::run_then_finished(tokens, FinishReason::Stop)
+                }
+                None => {
+                    sequence.generated = sequence.generated.saturating_add(tokens.len() as u32 + anchor);
+                    // GitHub #587: a checked lane's waiting draw, as the
+                    // leaf holds it -- the EOS by name, which the next
+                    // round would end the request on.
+                    let waiting = match job.checked {
+                        true => self.model.leaf.pending_token(&sequence.handle).map(|token| {
+                            match token == self.eos && !job.params.ignore_eos {
+                                true => WaitingDraw::Stop,
+                                false => WaitingDraw::Token(token),
+                            }
+                        }),
+                        false => None,
+                    };
+                    sequences.insert(job.request, sequence);
+                    DecodeOutcome { waiting, ..DecodeOutcome::run(tokens) }
+                }
+            };
+            outcomes[index] = Some(DecodeOutcome {
+                spec,
+                probabilities,
+                // GitHub #315: the leaf's lag, which the scheduler holds -- the
+                // redirected `</think>` is the next round's first token.
+                reasoning_redirected: redirected,
+                ..outcome
+            });
+        }
+        drop(drawn_probabilities);
+        drop(sequences);
+        for sequence in released {
+            self.release_sequence(sequence.handle);
+        }
+        Ok(outcomes
+            .into_iter()
+            .map(|o| o.expect("every job index is filled by one of the branches above"))
+            .collect())
+    }
+}
+
 impl<L: StepLeaf> Compute for RuntimeCompute<L> {
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         let mut outcomes = PrefillOutcome::nothing_encoded(jobs.len());
@@ -1947,210 +2200,17 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
-        // The load's own lanes (GitHub #336), which the scheduler never
-        // batches past and the leaf refuses past too.
-        if jobs.len() > self.model.leaf.decode_lanes() as usize {
-            return Err(ComputeError::Kernel(-1));
-        }
-        let mut sequences = self.sequences.lock().unwrap();
-        let mut batch: Vec<(DecodeJob, LiveSequence<L::Sequence>)> = Vec::with_capacity(jobs.len());
-        for job in jobs {
-            let Some(sequence) = sequences.remove(&job.request) else {
-                for (job, sequence) in batch {
-                    sequences.insert(job.request, sequence);
-                }
-                return Err(ComputeError::Kernel(-1));
-            };
-            batch.push((job.clone(), sequence));
-        }
+        self.decode_round(jobs, None)
+    }
 
-        // `None` until filled below; every index is either already-finished
-        // (a prior round's `max_tokens`, `Length`), gets a fresh run, or
-        // finishes this round (EOS, `Stop`) — so every slot is set once.
-        let mut outcomes: Vec<Option<DecodeOutcome>> = vec![None; jobs.len()];
-        let mut active = vec![false; jobs.len()];
-        for (index, (job, sequence)) in batch.iter().enumerate() {
-            if job
-                .params
-                .max_tokens
-                .is_some_and(|max| sequence.generated >= max)
-            {
-                outcomes[index] = Some(DecodeOutcome::finished(FinishReason::Length));
-            } else {
-                active[index] = true;
-            }
-        }
-        // P5-06 (GitHub #154): the leaf cuts each lane's run at its budget
-        // and at the EOS, so the sequence never commits past the text its
-        // request emits.
-        let eos = [self.eos];
-        // GitHub #242: cloned out of `batch` before the lanes borrow it,
-        // because the handles below take it mutably. An `Option<Arc>` clone
-        // is a refcount bump for a constrained lane and nothing at all for
-        // any other — an ordinary round allocates no more than it did before
-        // this ticket, which is the bar for anything on this path.
-        let permitted: Vec<Option<ignis_core::constrained::PermittedSet>> = batch
-            .iter()
-            .map(|(job, _)| job.permitted.clone())
-            .collect();
-        let decoded = {
-            let lanes: Vec<DecodeLane<'_>> = batch
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| active[*index])
-                .map(|(index, (job, sequence))| DecodeLane {
-                    params: job.params,
-                    // #518: an anchor the prefill emitted is committed but not
-                    // counted in the request's remaining budget, and not yet
-                    // in `generated`, which counts what rounds committed.
-                    remaining_tokens: {
-                        let remaining = job.remaining_tokens.saturating_add(u32::from(job.anchor_emitted));
-                        job.params
-                            .max_tokens
-                            .map_or(remaining, |max| remaining.min(max.saturating_sub(sequence.generated)))
-                            .max(1)
-                    },
-                    stop_ids: if job.params.ignore_eos { &[] } else { &eos },
-                    permitted: permitted[index].as_deref().unwrap_or(&[]),
-                    // GitHub #315: no stop id, nothing to redirect.
-                    reasoning_close: job.reasoning_close.filter(|_| !job.params.ignore_eos),
-                    checked: job.checked,
-                })
-                .collect();
-            let mut handles: Vec<&mut L::Sequence> = batch
-                .iter_mut()
-                .enumerate()
-                .filter(|(index, _)| active[*index])
-                .map(|(_, (_, sequence))| &mut sequence.handle)
-                .collect();
-            // Every job was already capped: nothing for the leaf to run, and
-            // it refuses an empty batch.
-            if lanes.is_empty() {
-                Ok(Vec::new())
-            } else {
-                self.model
-                    .leaf
-                    .decode(self.model.handle(), &mut handles, &lanes)
-            }
-        };
-        let decoded = match decoded {
-            Ok(runs)
-                if runs.len() == active.iter().filter(|&&active| active).count()
-                    && runs.iter().all(|run| !run.tokens.is_empty()) =>
-            {
-                runs
-            }
-            Ok(_) => {
-                for (job, sequence) in batch {
-                    sequences.insert(job.request, sequence);
-                }
-                return Err(ComputeError::Kernel(-1));
-            }
-            Err(code) => {
-                for (job, sequence) in batch {
-                    sequences.insert(job.request, sequence);
-                }
-                return Err(RuntimeError::Leaf(code).into());
-            }
-        };
-
-        let mut decoded = decoded.into_iter();
-        let mut released = Vec::new();
-        // GitHub #242: taken once for the whole round rather than per lane.
-        // The map is empty unless a constrained run is in flight, and this
-        // is the decode path — one uncontended lock per round is a cost an
-        // ordinary round can carry; eight of them would be a cost this
-        // ticket added to every request the engine serves.
-        let mut drawn_probabilities = self.drawn.lock().unwrap();
-        for (index, (job, mut sequence)) in batch.into_iter().enumerate() {
-            if !active[index] {
-                released.push(sequence);
-                continue;
-            }
-            let LaneRun {
-                mut tokens,
-                spec,
-                drawn_probability,
-                redirected,
-            } = decoded.next().expect("decoded result length was checked");
-            // GitHub #242 — the one-round lag, closed here. The round
-            // returns the token drawn *last* time, so its probability is the
-            // one held from then; what this round drew is held for the next.
-            // A lane that drew unconstrained leaves nothing behind, so the
-            // entry disappears on the round after a run's last set and
-            // never outlives the request.
-            let probabilities = match drawn_probabilities.is_empty() {
-                true => Vec::new(),
-                false => match drawn_probabilities.remove(&job.request) {
-                    Some(probability) => vec![probability],
-                    None => Vec::new(),
-                },
-            };
-            if let Some(probability) = drawn_probability {
-                drawn_probabilities.insert(job.request, probability);
-            }
-            // A lane handed a set runs a plain round, one token. The round
-            // after a run's last set carries none and may commit a
-            // speculative run — every forced tool-call opening ends so
-            // (GitHub #286), as the thinking budget's close does — and the
-            // probability held is its first token's, the one drawn under
-            // the set.
-            debug_assert!(
-                job.permitted.is_none() || tokens.len() <= 1,
-                "a lane handed a permitted set commits one token"
-            );
-            // #518: the run's anchor left with the prefill; the sequence
-            // committed it all the same.
-            let anchor = u32::from(job.anchor_emitted);
-            if job.anchor_emitted {
-                tokens.remove(0);
-            }
-            let eos_at = (!job.params.ignore_eos)
-                .then(|| tokens.iter().position(|&token| token == self.eos))
-                .flatten();
-            let outcome = match eos_at {
-                // The EOS itself is never emitted.
-                Some(at) => {
-                    tokens.truncate(at);
-                    released.push(sequence);
-                    DecodeOutcome::run_then_finished(tokens, FinishReason::Stop)
-                }
-                None => {
-                    sequence.generated = sequence.generated.saturating_add(tokens.len() as u32 + anchor);
-                    // GitHub #587: a checked lane's waiting draw, as the
-                    // leaf holds it -- the EOS by name, which the next
-                    // round would end the request on.
-                    let waiting = match job.checked {
-                        true => self.model.leaf.pending_token(&sequence.handle).map(|token| {
-                            match token == self.eos && !job.params.ignore_eos {
-                                true => WaitingDraw::Stop,
-                                false => WaitingDraw::Token(token),
-                            }
-                        }),
-                        false => None,
-                    };
-                    sequences.insert(job.request, sequence);
-                    DecodeOutcome { waiting, ..DecodeOutcome::run(tokens) }
-                }
-            };
-            outcomes[index] = Some(DecodeOutcome {
-                spec,
-                probabilities,
-                // GitHub #315: the leaf's lag, which the scheduler holds -- the
-                // redirected `</think>` is the next round's first token.
-                reasoning_redirected: redirected,
-                ..outcome
-            });
-        }
-        drop(drawn_probabilities);
-        drop(sequences);
-        for sequence in released {
-            self.release_sequence(sequence.handle);
-        }
-        Ok(outcomes
-            .into_iter()
-            .map(|o| o.expect("every job index is filled by one of the branches above"))
-            .collect())
+    // GitHub #590 (spec #287): a checked lane keeps speculation, its verified
+    // run cut where the scheduler's grammar says.
+    fn decode_step_cut(
+        &self,
+        jobs: &[DecodeJob],
+        cut: &mut dyn FnMut(usize, &[WaitingDraw]) -> usize,
+    ) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        self.decode_round(jobs, Some(cut))
     }
 
     // GitHub #586 (spec #287): the leaf repairs the request's own sequence.

@@ -457,6 +457,143 @@ fn step_readout(read: &mut AttentionRead) -> (step::AttentionReadout<'_>, &mut b
     )
 }
 
+impl CudaLeaf {
+    /// One decode round ([`StepLeaf::decode`]), with the host's cut of every
+    /// checked lane's verified run when `cut` is given
+    /// ([`StepLeaf::decode_cut`], GitHub #590).
+    fn decode_round(
+        &self,
+        model: &<Self as StepLeaf>::Model,
+        sequences: &mut [&mut <Self as StepLeaf>::Sequence],
+        lanes: &[DecodeLane<'_>],
+        cut: Option<&mut dyn FnMut(usize, &[TokenId]) -> usize>,
+    ) -> Result<Vec<LaneRun>, i32> {
+        // GitHub #336: the load's lanes, which the leaf refuses past too.
+        if lanes.len() > self.config.slot_count as usize {
+            return Err(leaf_error(
+                "decode",
+                format!(
+                    "batch has {} sampling parameter sets; the load's decode lanes are {}",
+                    lanes.len(),
+                    self.config.slot_count
+                ),
+            ));
+        }
+        // GitHub #242: a **constrained** round, which is a different round
+        // in two ways. It commits one token per lane — no drafts, because a
+        // draft is proposed by a second model that knows nothing of a set,
+        // and the leaf refuses a constrained lane in a verify round outright
+        // rather than accepting one it cannot honour. And it takes the plain
+        // path for the *whole batch*: a speculative load runs every round as
+        // a verify round, so one `number` in flight would otherwise fail
+        // every lane's round. The siblings lose that round's drafts, which
+        // is a number's six rounds' worth and not a mode the engine stays
+        // in.
+        let stop_ids: Vec<Vec<i32>> = lanes
+            .iter()
+            .map(|lane| lane.stop_ids.iter().map(|&id| id as i32).collect())
+            .collect();
+        // GitHub #587: so does a lane whose draw the host checks -- unless
+        // (GitHub #590) the host cuts its verified run, whose pending draft
+        // then keeps the scores a repair reads. Such a lane costs its
+        // neighbours nothing: they keep their drafts and the round its graph.
+        let cut = cut.filter(|_| lanes.iter().any(|lane| lane.checked));
+        let speculation = self.config.speculation.filter(|_| {
+            lanes.iter().all(|lane| lane.permitted.is_empty() && (cut.is_some() || !lane.checked))
+        });
+        let Some(speculation) = speculation else {
+            // One plain round, constrained lanes or none: each lane's draw
+            // under its sampling, its set and its reasoning redirect (GitHub
+            // #315), which reads the lane's stop ids.
+            let permitted: Vec<Vec<i32>> = lanes
+                .iter()
+                .map(|lane| lane.permitted.iter().map(|&id| id as i32).collect())
+                .collect();
+            let draws: Vec<step::LaneDraw<'_>> = lanes
+                .iter()
+                .zip(&permitted)
+                .zip(&stop_ids)
+                .map(|((lane, ids), stops)| step::LaneDraw {
+                    sampling: sampling_params(lane.params),
+                    permitted: ids,
+                    redirect: step::Redirect {
+                        stop_ids: stops,
+                        close_id: close_id(lane.reasoning_close),
+                    },
+                })
+                .collect();
+            let drawn = step::decode_program_round(&model.model, &model.pool, sequences, &draws, None)
+                .map_err(|e| leaf_error("decode", e))?;
+            return Ok(drawn
+                .into_iter()
+                .zip(lanes)
+                .map(|(drawn, lane)| LaneRun {
+                    redirected: drawn.redirected,
+                    ..LaneRun::drawn(drawn.token as TokenId, (!lane.permitted.is_empty()).then_some(drawn.probability))
+                })
+                .collect());
+        };
+        // P5-06 (GitHub #154, spec 05): a speculative load runs every round
+        // as a verify round at the window it was loaded with. The DFlash2
+        // drafter proposes inside the leaf (P5-05, GitHub #155), so no lane
+        // passes drafts here; the leaf reports what each lane verified.
+        let verify: Vec<step::VerifyLane<'_>> = lanes
+            .iter()
+            .zip(&stop_ids)
+            .map(|(lane, stops)| step::VerifyLane {
+                sampling: sampling_params(lane.params),
+                remaining_tokens: lane.remaining_tokens,
+                stop_ids: stops,
+                drafts: &[],
+                reasoning_close: close_id(lane.reasoning_close),
+            })
+            .collect();
+        let runs = match cut {
+            None => step::decode_program_verify_runs(
+                &model.model,
+                &model.pool,
+                sequences,
+                &verify,
+                speculation.draft_tokens(),
+            ),
+            // GitHub #590: the checked lanes' commits are the host's to cut.
+            Some(cut) => {
+                let checked: Vec<bool> = lanes.iter().map(|lane| lane.checked).collect();
+                let mut ids: Vec<TokenId> = Vec::new();
+                let mut host_cut = |lane: usize, run: &[i32]| -> usize {
+                    ids.clear();
+                    ids.extend(run.iter().map(|&id| id as TokenId));
+                    cut(lane, &ids)
+                };
+                step::decode_program_verify_cut(
+                    &model.model,
+                    &model.pool,
+                    sequences,
+                    &verify,
+                    speculation.draft_tokens(),
+                    &checked,
+                    &mut host_cut,
+                )
+            }
+        }
+        .map_err(|e| leaf_error("decode", e))?;
+        Ok(runs
+            .into_iter()
+            .map(|run| {
+                // Committed drafts: the run past its anchor, which a stop cut
+                // may leave shorter than what the target accepted.
+                let accepted = (run.tokens.len() as u32).saturating_sub(1).min(run.extent);
+                LaneRun {
+                    tokens: run.tokens.into_iter().map(|id| id as TokenId).collect(),
+                    spec: Some(SpecCounters::round(run.extent, accepted)),
+                    drawn_probability: None,
+                    redirected: run.redirected,
+                }
+            })
+            .collect())
+    }
+}
+
 impl StepLeaf for CudaLeaf {
     type Model = CudaModel;
     type Sequence = Seq<'static>;
@@ -946,106 +1083,19 @@ impl StepLeaf for CudaLeaf {
         sequences: &mut [&mut Self::Sequence],
         lanes: &[DecodeLane<'_>],
     ) -> Result<Vec<LaneRun>, i32> {
-        // GitHub #336: the load's lanes, which the leaf refuses past too.
-        if lanes.len() > self.config.slot_count as usize {
-            return Err(leaf_error(
-                "decode",
-                format!(
-                    "batch has {} sampling parameter sets; the load's decode lanes are {}",
-                    lanes.len(),
-                    self.config.slot_count
-                ),
-            ));
-        }
-        // GitHub #242: a **constrained** round, which is a different round
-        // in two ways. It commits one token per lane — no drafts, because a
-        // draft is proposed by a second model that knows nothing of a set,
-        // and the leaf refuses a constrained lane in a verify round outright
-        // rather than accepting one it cannot honour. And it takes the plain
-        // path for the *whole batch*: a speculative load runs every round as
-        // a verify round, so one `number` in flight would otherwise fail
-        // every lane's round. The siblings lose that round's drafts, which
-        // is a number's six rounds' worth and not a mode the engine stays
-        // in.
-        let stop_ids: Vec<Vec<i32>> = lanes
-            .iter()
-            .map(|lane| lane.stop_ids.iter().map(|&id| id as i32).collect())
-            .collect();
-        // GitHub #587: so does a lane whose draw the host checks, which a
-        // repair can read the scores of only after a plain round (#590).
-        let speculation = self
-            .config
-            .speculation
-            .filter(|_| lanes.iter().all(|lane| lane.permitted.is_empty() && !lane.checked));
-        let Some(speculation) = speculation else {
-            // One plain round, constrained lanes or none: each lane's draw
-            // under its sampling, its set and its reasoning redirect (GitHub
-            // #315), which reads the lane's stop ids.
-            let permitted: Vec<Vec<i32>> = lanes
-                .iter()
-                .map(|lane| lane.permitted.iter().map(|&id| id as i32).collect())
-                .collect();
-            let draws: Vec<step::LaneDraw<'_>> = lanes
-                .iter()
-                .zip(&permitted)
-                .zip(&stop_ids)
-                .map(|((lane, ids), stops)| step::LaneDraw {
-                    sampling: sampling_params(lane.params),
-                    permitted: ids,
-                    redirect: step::Redirect {
-                        stop_ids: stops,
-                        close_id: close_id(lane.reasoning_close),
-                    },
-                })
-                .collect();
-            let drawn = step::decode_program_round(&model.model, &model.pool, sequences, &draws, None)
-                .map_err(|e| leaf_error("decode", e))?;
-            return Ok(drawn
-                .into_iter()
-                .zip(lanes)
-                .map(|(drawn, lane)| LaneRun {
-                    redirected: drawn.redirected,
-                    ..LaneRun::drawn(drawn.token as TokenId, (!lane.permitted.is_empty()).then_some(drawn.probability))
-                })
-                .collect());
-        };
-        // P5-06 (GitHub #154, spec 05): a speculative load runs every round
-        // as a verify round at the window it was loaded with. The DFlash2
-        // drafter proposes inside the leaf (P5-05, GitHub #155), so no lane
-        // passes drafts here; the leaf reports what each lane verified.
-        let verify: Vec<step::VerifyLane<'_>> = lanes
-            .iter()
-            .zip(&stop_ids)
-            .map(|(lane, stops)| step::VerifyLane {
-                sampling: sampling_params(lane.params),
-                remaining_tokens: lane.remaining_tokens,
-                stop_ids: stops,
-                drafts: &[],
-                reasoning_close: close_id(lane.reasoning_close),
-            })
-            .collect();
-        let runs = step::decode_program_verify_runs(
-            &model.model,
-            &model.pool,
-            sequences,
-            &verify,
-            speculation.draft_tokens(),
-        )
-        .map_err(|e| leaf_error("decode", e))?;
-        Ok(runs
-            .into_iter()
-            .map(|run| {
-                // Committed drafts: the run past its anchor, which a stop cut
-                // may leave shorter than what the target accepted.
-                let accepted = (run.tokens.len() as u32).saturating_sub(1).min(run.extent);
-                LaneRun {
-                    tokens: run.tokens.into_iter().map(|id| id as TokenId).collect(),
-                    spec: Some(SpecCounters::round(run.extent, accepted)),
-                    drawn_probability: None,
-                    redirected: run.redirected,
-                }
-            })
-            .collect())
+        self.decode_round(model, sequences, lanes, None)
+    }
+
+    // GitHub #590 (spec #287): a checked lane keeps speculation, and the
+    // leaf's verify commit takes the host's cut of its run.
+    fn decode_cut(
+        &self,
+        model: &Self::Model,
+        sequences: &mut [&mut Self::Sequence],
+        lanes: &[DecodeLane<'_>],
+        cut: &mut dyn FnMut(usize, &[TokenId]) -> usize,
+    ) -> Result<Vec<LaneRun>, i32> {
+        self.decode_round(model, sequences, lanes, Some(cut))
     }
 
     fn alloc_snapshot_buf(&self, bytes: u64) -> Result<Self::SnapshotBuf, i32> {

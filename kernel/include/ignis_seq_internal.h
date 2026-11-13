@@ -390,15 +390,27 @@ struct ignis_seq_prefix;
  * draw of that slot, writes it, so the model stamps every write with an epoch
  * (`ignis_model::kept_column_epochs`) and a repair refuses a stamp that moved.
  *
+ * GitHub #590: or a column of the verify round's own logits, `[vocab, k + 1,
+ * lanes]`, for a lane whose commit the host cut (`ignis_decode_options::
+ * host_cut`): its pending token is the draw of the column the cut ended at,
+ * and the verify logits hold that column's scores until the next verify
+ * round, which stamps the whole buffer (`IgnisVerifyRound::kept_epoch`).
+ *
  * Host-only and never a section: a sequence restored, claimed or cloned keeps
- * no scores, and neither does one whose pending token a verify round, a
- * reasoning redirect or a span that drew nothing assigned -- its pending token
- * is not the draw those scores were sampled for. */
+ * no scores, and neither does one whose pending token a verify round the host
+ * did not cut, a reasoning redirect or a span that drew nothing assigned --
+ * its pending token is not the draw those scores were sampled for. */
+enum class IgnisKeptSource : std::uint8_t {
+  kDecodeLogits = 0, /* `ignis_model::sampling_decode_logits`, a lane column */
+  kVerifyLogits = 1, /* `IgnisVerifyRound::logits`, column `lane * (k + 1) + j` */
+};
+
 struct ignis_kept_scores {
   std::int32_t column = -1;  /* the column, or -1: no scores kept */
   std::uint64_t epoch = 0;   /* the column's stamp when the draw was made */
   std::int32_t position = 0; /* the logical position the draw was keyed at */
   bool counted = false;      /* the draw added one to its token's penalty count */
+  IgnisKeptSource source = IgnisKeptSource::kDecodeLogits; /* the buffer `column` indexes */
 };
 
 struct ignis_seq {
