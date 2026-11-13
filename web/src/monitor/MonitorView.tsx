@@ -18,12 +18,13 @@ import {
   type Images,
   type Speech,
   type Reasoning,
+  type StructuredOutputCard,
   type Speculation,
   RATE_SPAN_MS,
   TOKENS_PER_KV_PAGE,
   TREND_SPAN_MS,
 } from "./derive.ts";
-import { formatAgo, formatBound, formatBytes, formatCount, formatMs, formatNumber, formatSeconds, formatShare, formatWindow } from "./format.ts";
+import { formatAgo, formatBound, formatBytes, formatCount, formatMs, formatNumber, formatSeconds, formatShortSeconds, formatShare, formatWindow } from "./format.ts";
 import { bucketCounts } from "./quantile.ts";
 import type { MonitorState } from "./scrape.ts";
 import {
@@ -272,6 +273,9 @@ function Board({ dash, state }: { dash: Dashboard; state: MonitorState }) {
 
       {/* GitHub #330: only once the loop guard watched a request or the thinking budget closed a reasoning. */}
       {dash.reasoning && <ReasoningCard reasoning={dash.reasoning} win={win} />}
+
+      {/* #593: only once a request held to a grammar ended. */}
+      {dash.structured && <StructuredCard structured={dash.structured} win={win} />}
 
       {/* GitHub #324: only once the image model admitted a job -- a text-only server shows nothing of it. */}
       {dash.images && <ImagesCard images={dash.images} win={win} />}
@@ -1208,6 +1212,28 @@ function ReasoningCard({ reasoning, win }: { reasoning: Reasoning; win: string }
           </p>
         </>
       )}
+    </Card>
+  );
+}
+
+/** Structured output (#593): the requests held to a grammar, the draws it rejected, and how long a repair took. */
+function StructuredCard({ structured, win }: { structured: StructuredOutputCard; win: string }) {
+  return (
+    <Card title="Structured output" subtitle={`Answers held to a grammar · last ${win}`}>
+      <Figures
+        items={[
+          ["Requests", formatCount(structured.requests.window)],
+          ["Misses", formatCount(structured.misses.window)],
+          ["Repairs", formatCount(structured.repairs.window)],
+          ["Misses per request", structured.missesPerRequest === null ? "-" : structured.missesPerRequest.toFixed(2)],
+          ["Median repair", formatShortSeconds(structured.repairP50)],
+          ["p95 repair", formatShortSeconds(structured.repairP95)],
+        ]}
+      />
+      <p className="text-[11px] text-ash">
+        A miss is a sampled token the grammar rejected; a repair samples that position again from the same scores, restricted to what the grammar
+        allows. A request that sampled no miss costs nothing extra.
+      </p>
     </Card>
   );
 }

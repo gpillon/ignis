@@ -39,6 +39,7 @@ use std::sync::Arc;
 use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
 use ignis_core::scheduler::{DiskOp, DiskSource};
 use ignis_core::flash_next_counters::FlashNextCounterSource;
+use ignis_core::structured::StructuredSummary;
 use ignis_core::thinking_budget::BudgetOutcome;
 use ignis_core::{
     FinishReason, LaneId, Occupancy, RequestClass, RequestId, RetainedSkip, SpecCounters,
@@ -517,7 +518,7 @@ impl Telemetry {
             // Its own `Done` came first: already reported.
             return;
         }
-        self.on_done(id, n, FinishReason::Stop, None, None, None);
+        self.on_done(id, n, FinishReason::Stop, None, None, None, None);
         if self.metrics.is_some() {
             self.remember_released(id);
         }
@@ -600,6 +601,7 @@ impl Telemetry {
     /// its EOS became `</think>` when it did (GitHub #315) and what its media
     /// cost when it had any (GitHub #245) — and drop the request from the
     /// in-flight set.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_done(
         &mut self,
         id: RequestId,
@@ -608,6 +610,7 @@ impl Telemetry {
         spec: Option<SpecCounters>,
         thinking: Option<BudgetOutcome>,
         reasoning_redirected_at: Option<u32>,
+        structured: Option<StructuredSummary>,
     ) {
         if let Some(metrics) = &self.metrics {
             if let Some(spec) = spec.as_ref() {
@@ -622,6 +625,9 @@ impl Telemetry {
                     metrics.record_completed(n);
                     if thinking.is_some_and(|t| t.forced_at.is_some()) {
                         metrics.record_thinking_forced_close();
+                    }
+                    if let Some(structured) = structured.as_ref() {
+                        metrics.record_structured(structured);
                     }
                 }
             }
@@ -700,6 +706,7 @@ impl Telemetry {
             },
             media,
             prefill,
+            structured.as_ref(),
         );
     }
 
@@ -1178,6 +1185,7 @@ impl Telemetry {
         thinking: ThinkingReport,
         summary: Option<MediaSummary>,
         prefill: Option<PrefillSummary>,
+        structured: Option<&StructuredSummary>,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         // A `None` field records nothing, so a request without speculative
@@ -1252,6 +1260,11 @@ impl Telemetry {
             prefill_chunks_consumed = prefill.map(|p| p.chunks.consumed),
             prefill_chunks_solo = prefill.map(|p| p.chunks.solo),
             prefilled_tokens = prefill.map(|p| p.prefilled_tokens),
+            // #593: a request held to a grammar says its type and what the
+            // grammar did; absent on every other request.
+            structured.type = structured.map(|s| s.kind.name()),
+            structured.misses = structured.map(|s| s.misses),
+            structured.repairs = structured.map(|s| s.repairs()),
             "request done"
         );
     }
@@ -1423,7 +1436,7 @@ mod tests {
         assert!(busy.contains("\nignis_kv_pool_used_pages 64\n"), "{busy}");
         assert!(busy.contains("\nignis_kv_ram_arena_bytes{state=\"used\"} 1073741824\n"), "{busy}");
 
-        telemetry.on_done(1, 3, FinishReason::Stop, None, None, None);
+        telemetry.on_done(1, 3, FinishReason::Stop, None, None, None, None);
         telemetry.emit_interval(Occupancy {
             kv_used_pages: 0,
             kv_pool_pages: 256,
@@ -1467,7 +1480,7 @@ mod tests {
             for _ in 0..3 {
                 returned.push(telemetry.emit_interval(Occupancy::default()));
             }
-            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None);
+            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None, None);
             returned.push(telemetry.emit_interval(Occupancy::default()));
         });
         let intervals = intervals(&events);
@@ -1508,7 +1521,7 @@ mod tests {
             telemetry.on_admitted(7, 2);
             telemetry.on_token(7); // first token → ttft
             telemetry.on_token(7); // subsequent tokens are not re-emitted
-            telemetry.on_done(7, 4, FinishReason::Stop, None, None, None);
+            telemetry.on_done(7, 4, FinishReason::Stop, None, None, None, None);
         });
 
         let event_names: Vec<&str> = events.iter().map(|e| e["event_name"].as_str().unwrap()).collect();
@@ -1550,6 +1563,7 @@ mod tests {
                 12,
                 FinishReason::Stop,
                 Some(SpecCounters::round(7, 7) + SpecCounters::round(7, 2) + SpecCounters::round(7, 0)),
+                None,
                 None,
                 None,
             );
@@ -1688,12 +1702,12 @@ mod tests {
             telemetry.note_submit(1, 20, RequestClass::Agent);
             telemetry.note_media(1, media);
             telemetry.on_prefill_chunk(1, 20, 250_000, false);
-            telemetry.on_done(1, 0, FinishReason::Stop, None, None, None);
+            telemetry.on_done(1, 0, FinishReason::Stop, None, None, None, None);
             // A text request that never takes a lane either, whose chunk
             // reports encode time anyway: no media, so no `media.*`.
             telemetry.note_submit(2, 5, RequestClass::Agent);
             telemetry.on_prefill_chunk(2, 5, 9_000, false);
-            telemetry.on_done(2, 0, FinishReason::Stop, None, None, None);
+            telemetry.on_done(2, 0, FinishReason::Stop, None, None, None, None);
         });
         assert!(
             events.iter().all(|e| e["event_name"] != "ignis.request.admitted"),
@@ -1734,7 +1748,7 @@ mod tests {
             telemetry.on_prefill_chunk(1, 20, 250_000, false);
             telemetry.on_admitted(1, 0);
             telemetry.on_token(1);
-            telemetry.on_done(1, 1, FinishReason::Stop, None, None, None);
+            telemetry.on_done(1, 1, FinishReason::Stop, None, None, None, None);
         });
         let media_of = |name: &str| {
             let attributes = events
@@ -1774,7 +1788,7 @@ mod tests {
             telemetry.note_media(1, media);
             telemetry.on_prefill_chunk(1, 8, 250_000, false);
             telemetry.on_cancelled(1, CancelCause::Consumer);
-            telemetry.on_done(1, 0, FinishReason::Stop, None, None, None);
+            telemetry.on_done(1, 0, FinishReason::Stop, None, None, None, None);
             // A text request cancelled mid-prefill: no media, no `media.*`.
             telemetry.note_submit(2, 5, RequestClass::Agent);
             telemetry.on_prefill_chunk(2, 2, 9_000, false);
@@ -1811,7 +1825,7 @@ mod tests {
         let events = capture_events(|| {
             telemetry.note_submit(1, 3, RequestClass::Interactive);
             telemetry.on_admitted(1, 0);
-            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None);
+            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None, None);
         });
         let done = events.last().unwrap();
         // FixedClock(0): a zero elapsed span → `duration_ms` and `tok_s` are 0.
@@ -1839,7 +1853,7 @@ mod tests {
             }));
         let events = capture_events(|| {
             telemetry.note_submit(1, 5, RequestClass::Interactive); // read #1 → 100 ms
-            telemetry.on_done(1, 5, FinishReason::Length, None, None, None); // read #2 → 200 ms, so ms = 100
+            telemetry.on_done(1, 5, FinishReason::Length, None, None, None, None); // read #2 → 200 ms, so ms = 100
         });
         let done = events.last().unwrap();
         assert_eq!(done["attributes"]["duration_ms"], 100, "200 - 100 = 100 ms elapsed");
@@ -2043,7 +2057,7 @@ mod tests {
             telemetry.on_token(1); // ttft — no ITL sample yet
             telemetry.on_token(1); // 1st gap: 10ms
             telemetry.on_token(1); // 2nd gap: 10ms
-            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None);
+            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None, None);
         });
         let done = events.last().unwrap();
         assert_eq!(done["attributes"]["itl_samples"], 2);
@@ -2086,7 +2100,7 @@ mod tests {
             telemetry.on_prefill_chunk(2, 32_768, 0, false); // t=25, the wide chunk lands, completing the prompt
             telemetry.on_token(1); // t=220, 2nd gap: 200ms — the stall
             telemetry.on_admitted(2, 1); // t=230, prefiller starts decoding
-            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None); // t=220 (clock re-read), lane 0 finishes
+            telemetry.on_done(1, 3, FinishReason::Stop, None, None, None, None); // t=220 (clock re-read), lane 0 finishes
         });
 
         // Request 2's `admitted` line shows the wide cold-prefill chunk
@@ -2138,7 +2152,7 @@ mod tests {
         has("ignis_requests_completed_total 0");
 
         telemetry.on_token(2);
-        telemetry.on_done(2, 5, FinishReason::Stop, None, None, None);
+        telemetry.on_done(2, 5, FinishReason::Stop, None, None, None, None);
         telemetry.emit_interval(Occupancy::default());
         has("ignis_requests_completed_total 1");
         has("ignis_generated_tokens_total 5");
@@ -2168,7 +2182,7 @@ mod tests {
         has("ignis_decoded_tokens_total 3");
         has("ignis_generated_tokens_total 0");
 
-        telemetry.on_done(1, 3, FinishReason::Stop, None, None, None);
+        telemetry.on_done(1, 3, FinishReason::Stop, None, None, None, None);
         has("ignis_decoded_tokens_total 3");
         has("ignis_generated_tokens_total 3");
 
@@ -2215,10 +2229,10 @@ mod tests {
         telemetry.note_submit(1, 3, RequestClass::Interactive);
         telemetry.on_admitted(1, 0);
         telemetry.on_cancelled(1, CancelCause::Consumer);
-        telemetry.on_done(1, 4, FinishReason::Stop, None, None, None);
+        telemetry.on_done(1, 4, FinishReason::Stop, None, None, None, None);
         // A `Done` for a request that was never cancelled still counts.
         telemetry.note_submit(2, 3, RequestClass::Interactive);
-        telemetry.on_done(2, 3, FinishReason::Length, None, None, None);
+        telemetry.on_done(2, 3, FinishReason::Length, None, None, None, None);
 
         let text = metrics.render();
         for line in [
@@ -2253,7 +2267,7 @@ mod tests {
         telemetry.on_evicted(1, 450);
         telemetry.on_token(1);
         telemetry.on_token(1);
-        telemetry.on_done(1, 2, FinishReason::Stop, None, None, None);
+        telemetry.on_done(1, 2, FinishReason::Stop, None, None, None, None);
 
         let text = metrics.render();
         for line in [
@@ -2391,9 +2405,9 @@ mod tests {
             telemetry.note_submit(1, 3, RequestClass::Interactive);
             telemetry.on_admitted(1, 0);
             telemetry.on_stopped(1, 5);
-            telemetry.on_done(1, 6, FinishReason::Stop, None, None, None); // raced the release
+            telemetry.on_done(1, 6, FinishReason::Stop, None, None, None, None); // raced the release
             telemetry.note_submit(2, 3, RequestClass::Interactive);
-            telemetry.on_done(2, 2, FinishReason::Stop, None, None, None);
+            telemetry.on_done(2, 2, FinishReason::Stop, None, None, None, None);
             telemetry.on_stopped(2, 2); // its `Done` came first
         });
         let done: Vec<_> = events.iter().filter(|e| e["event_name"] == "ignis.request.done").collect();
@@ -2427,8 +2441,8 @@ mod tests {
         telemetry.with_metrics(Arc::clone(&metrics));
         telemetry.note_submit(1, 3, RequestClass::Interactive);
         telemetry.on_cancelled(1, CancelCause::Consumer);
-        telemetry.on_done(1, 4, FinishReason::Stop, None, None, None);
-        telemetry.on_done(99, 4, FinishReason::Stop, None, None, None);
+        telemetry.on_done(1, 4, FinishReason::Stop, None, None, None, None);
+        telemetry.on_done(99, 4, FinishReason::Stop, None, None, None, None);
 
         let text = metrics.render();
         assert!(text.contains("\nignis_request_duration_seconds_count 0\n"), "{text}");
@@ -2448,7 +2462,7 @@ mod tests {
             telemetry.on_state_reused(2, ReuseSource::KvRam, RetainedKind::Checkpoint, 1536, 42);
             telemetry.on_prefix_reused(4, 32, false, ReuseSource::Device); // a live sibling's
             for id in 1..=4 {
-                telemetry.on_done(id, 1, FinishReason::Stop, None, None, None);
+                telemetry.on_done(id, 1, FinishReason::Stop, None, None, None, None);
             }
         });
         let done = |id: u64| {
@@ -2558,7 +2572,7 @@ mod tests {
         let mut telemetry = Telemetry::new(clock.clone());
         telemetry.note_submit(1, 5, RequestClass::Interactive);
         clock.set(3_000);
-        telemetry.on_done(1, 5, FinishReason::Stop, None, None, None);
+        telemetry.on_done(1, 5, FinishReason::Stop, None, None, None, None);
         clock.set(10_000);
         telemetry.note_submit(2, 5, RequestClass::Interactive);
         clock.set(11_000);
@@ -2574,10 +2588,10 @@ mod tests {
         let mut telemetry = Telemetry::new(clock.clone());
         telemetry.note_submit(1, 5, RequestClass::Interactive);
         clock.set(1_000);
-        telemetry.on_done(1, 5, FinishReason::Stop, None, None, None); // held 1 s: the first sample
+        telemetry.on_done(1, 5, FinishReason::Stop, None, None, None, None); // held 1 s: the first sample
         telemetry.note_submit(2, 5, RequestClass::Interactive);
         clock.set(10_000);
-        telemetry.on_done(2, 5, FinishReason::Stop, None, None, None); // held 9 s: 1 + (9 - 1) / 8 = 2 s
+        telemetry.on_done(2, 5, FinishReason::Stop, None, None, None, None); // held 9 s: 1 + (9 - 1) / 8 = 2 s
         clock.set(20_000);
         telemetry.note_submit(3, 5, RequestClass::Interactive);
         assert_eq!(telemetry.lane_free_at_ms(), Some(22_000));
@@ -2654,9 +2668,9 @@ mod tests {
             telemetry.note_submit(1, 5, RequestClass::Interactive);
             telemetry.on_cancelled(1, CancelCause::Timeout);
             telemetry.on_cancelled(1, CancelCause::Consumer);
-            telemetry.on_done(1, 2, FinishReason::Stop, None, None, None);
+            telemetry.on_done(1, 2, FinishReason::Stop, None, None, None, None);
             telemetry.note_submit(2, 5, RequestClass::Interactive);
-            telemetry.on_done(2, 2, FinishReason::Stop, None, None, None);
+            telemetry.on_done(2, 2, FinishReason::Stop, None, None, None, None);
             telemetry.on_cancelled(2, CancelCause::Consumer);
         });
 

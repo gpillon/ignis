@@ -4029,6 +4029,7 @@ mod tests {
                 drawn: None,
                 thinking: None,
                 reasoning_redirected_at: None,
+                structured: None,
             })
             .unwrap();
         drop(route);
@@ -4209,6 +4210,7 @@ mod tests {
                 drawn: None,
                 thinking: None,
                 reasoning_redirected_at: None,
+                structured: None,
             })
             .unwrap();
         drop(route);
