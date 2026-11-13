@@ -1785,6 +1785,70 @@ fn a_draft_head_without_spec_or_with_an_unknown_name_is_refused() {
     assert!(err.contains("--spec-draft-head") && err.contains("tiny"), "{err}");
 }
 
+/// GitHub #576 (ADR 0090): the draft rule and the drafter's two settings ride
+/// the load's speculation: the fixed draft at 0.9 and 0.95 unless named, by
+/// flag or env var, each a reload, and the effective configuration writes
+/// them in the 27B's section, from which a start reads them back.
+#[test]
+fn the_draft_rule_is_fixed_unless_named_and_rides_the_speculation() {
+    use ignis_core::{DraftRule, DrafterSampling};
+    let drafter = |factor, top_p| DrafterSampling { temperature_factor_milli: factor, top_p_milli: top_p };
+    let rule = |config: &Config| config.speculation.map(|s| (s.draft_rule(), s.drafter_sampling()));
+    let default = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7"]);
+    assert_eq!(rule(&default), Some((DraftRule::Fixed, drafter(900, 950))));
+    let flags = [
+        "--spec-backend", "dflash2", "--spec-draft-tokens", "7", "--spec-draft-rule", "sampled",
+        "--spec-drafter-temperature-factor", "0.8", "--spec-drafter-top-p", "1",
+    ];
+    let sampled = config(&flags);
+    assert_eq!(rule(&sampled), Some((DraftRule::Sampled, drafter(800, 1000))));
+    assert_eq!(sampled.speculation.map(|s| (s.backend(), s.draft_tokens())), Some((SpeculativeBackend::Dflash2, 7)));
+    let env = env_map(&[("IGNIS_SPEC_BACKEND", "dflash2"), ("IGNIS_SPEC_DRAFT_TOKENS", "7"), ("IGNIS_SPEC_DRAFT_RULE", "sampled")]);
+    assert_eq!(rule(&expect_config(resolve(&[], env).expect("resolve"))), Some((DraftRule::Sampled, drafter(900, 950))));
+    for name in ["draft_rule", "drafter_temperature_factor", "drafter_top_p"] {
+        let meta = schema::field("spec", name).unwrap();
+        assert!(meta.reload_required && meta.visible && meta.patchable, "spec.{name}: a visible, patchable reload");
+        assert!(meta.applies.refused_by(ModelFamily::FlashNext) && !meta.applies.refused_by(ModelFamily::Qwen38_27b), "spec.{name}: the 27B's");
+    }
+    let document = file::effective_document(&sampled);
+    let section = &document["spec"][field::scope(ModelFamily::Qwen38_27b)];
+    assert_eq!((section["draft_rule"].clone(), section["drafter_temperature_factor"].clone(), section["drafter_top_p"].clone()), (serde_json::json!("sampled"), serde_json::json!(0.8), serde_json::json!(1.0)), "{document}");
+    for (name, format) in [("c.yaml", Format::Yaml), ("c.json", Format::Json)] {
+        let files = MemFiles::with(&[(name, &format.write(&document))]);
+        let read = with_files(&["--config", name], no_env, &files).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let read = read.for_family(ModelFamily::Qwen38_27b).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(rule(&read), Some((DraftRule::Sampled, drafter(800, 1000))), "{name}");
+    }
+}
+
+/// GitHub #576: the three are refused by name where no DFlash2 drafts -- on
+/// Flash-Next, with no backend and with `off` -- and out of their ranges.
+#[test]
+fn the_draft_rule_is_refused_by_name_where_no_dflash2_drafts() {
+    let named = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7", "--spec-draft-rule", "sampled"]);
+    assert!(served_model_for(&named, ModelFamily::Qwen38_27b).is_ok());
+    let mtp = config(&["--spec-backend", "mtp", "--spec-draft-rule", "sampled"]);
+    let err = served_model_for(&mtp, ModelFamily::FlashNext).expect_err("the 27B's").0;
+    assert!(err.contains("--spec-draft-rule") && err.contains("Qwen3.8-Flash-Next"), "{err}");
+    let factor = config(&["--spec-backend", "mtp", "--spec-drafter-temperature-factor", "0.5"]);
+    let err = served_model_for(&factor, ModelFamily::FlashNext).expect_err("the 27B's").0;
+    assert!(err.contains("--spec-drafter-temperature-factor") && err.contains("Qwen3.8-Flash-Next"), "{err}");
+    assert!(served_model_for(&config(&[]), ModelFamily::FlashNext).is_ok(), "unnamed, it is no one's business");
+
+    for flag in [["--spec-draft-rule", "sampled"], ["--spec-drafter-top-p", "0.9"], ["--spec-drafter-temperature-factor", "1"]] {
+        let err = refused(&["--profile", "none", flag[0], flag[1]]);
+        assert!(err.contains(flag[0]) && err.contains("--spec-backend"), "{err}");
+        let err = refused(&["--spec-backend", "off", flag[0], flag[1]]);
+        assert!(err.contains(flag[0]) && err.contains("off"), "{err}");
+    }
+    let err = refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7", "--spec-draft-rule", "coupled"]);
+    assert!(err.contains("--spec-draft-rule") && err.contains("coupled"), "{err}");
+    for (flag, raw) in [("--spec-drafter-top-p", "1.5"), ("--spec-drafter-temperature-factor", "5"), ("--spec-drafter-top-p", "-0.1")] {
+        let err = refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7", flag, raw]);
+        assert!(err.contains(flag) && err.contains(raw), "{err}");
+    }
+}
+
 #[test]
 fn mtp_takes_no_proposal_head_and_spec_off_takes_no_draft_options() {
     let err = refused(&["--spec-backend", "mtp", "--spec-draft-head", "shortlist"]);

@@ -55,7 +55,9 @@
 //! One `#[test]`, several `Model`/`SeqPool` loads against one shared
 //! `materialize()` (see `decode_graph_gpu.rs`: materialized weights are
 //! never freed until the artifact drops, so a second `materialize()` in
-//! this process would exhaust VRAM).
+//! this process would exhaust VRAM). GitHub #576 adds a second, the same
+//! round under the sampled draft (ADR 0090), which runs first and frees its
+//! weights when it is done.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact, GPU, or kernel error is a **skip**; under the profile
@@ -77,7 +79,7 @@ use ignis_core::step::{
     SamplingParams, VerifyLane, capture_decode_graphs, decode_program_batch_sampled, decode_program_verify,
     prefill_program_sampled, program_stats,
 };
-use ignis_core::{KvFormat, Speculation, SpeculativeBackend};
+use ignis_core::{DraftRule, DrafterSampling, KvFormat, Speculation, SpeculativeBackend};
 
 use near_tie::assert_equivalent;
 
@@ -155,6 +157,15 @@ fn load_verify_in(kv_format: KvFormat, reader: &Reader, artifact: &MaterializedA
         Some(spec),
     )
     .unwrap_or_else(|e| panic!("model load (verify-only, {}, window {WINDOW}): {e}", kv_format.as_str()))
+}
+
+/// GitHub #576 (ADR 0090): the verify-only load under the sampled draft.
+fn load_verify_sampled(reader: &Reader, artifact: &MaterializedArtifact, handles: &[ObjectHandle]) -> Model {
+    let spec = Speculation::new(SpeculativeBackend::VerifyOnly, WINDOW)
+        .unwrap()
+        .with_draft_rule(DraftRule::Sampled, DrafterSampling::default());
+    load_qwen38_27b_with_speculation(reader, artifact, handles, MAX_CONTEXT, MAX_CONTEXT, KvFormat::Bf16, Some(spec))
+        .unwrap_or_else(|e| panic!("model load (verify-only, the sampled draft, window {WINDOW}): {e}"))
 }
 
 /// The spec-off stream: `total` tokens per lane, one per round, every lane
@@ -242,11 +253,25 @@ fn run_verify(
     total: usize,
     expect_graph: bool,
 ) -> VerifyRun {
+    run_verify_lanes(model, pool, prompts, &vec![sampling; prompts.len()], drafter, stop_ids, total, expect_graph)
+}
+
+/// [`run_verify`] with each lane under its own sampling (GitHub #576).
+fn run_verify_lanes(
+    model: &Model,
+    pool: &SeqPool,
+    prompts: &[Vec<i32>],
+    samplings: &[SamplingParams],
+    drafter: Drafter<'_>,
+    stop_ids: &[i32],
+    total: usize,
+    expect_graph: bool,
+) -> VerifyRun {
     let mut sequences: Vec<Seq<'_>> = prompts
         .iter()
         .map(|_| pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}")))
         .collect();
-    for (seq, prompt) in sequences.iter_mut().zip(prompts) {
+    for ((seq, prompt), &sampling) in sequences.iter_mut().zip(prompts).zip(samplings) {
         prefill_program_sampled(model, pool, seq, prompt, 0, sampling, None)
             .unwrap_or_else(|e| panic!("prefill: {e}"));
     }
@@ -264,7 +289,7 @@ fn run_verify(
             .iter()
             .zip(&drafts)
             .map(|(&i, drafts)| VerifyLane {
-                sampling,
+                sampling: samplings[i],
                 remaining_tokens: (total - emitted[i].len()) as u32,
                 stop_ids,
                 drafts,
@@ -690,4 +715,229 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
         assert_eq!(eager.emitted, graph.emitted, "hq width {width}: verify graph replay diverged from eager");
         assert_eq!(eager.rounds, graph.rounds, "hq width {width}: replay accepted differently from eager");
     }
+}
+
+/// GitHub #576: `rounds` verify rounds over every lane at once, none budgeted
+/// and none stopping, each lane under its own sampling with the random
+/// drafter's proposals: every round as wide as the batch and every lane at
+/// the window, so two runs that differ only in another lane's request run the
+/// same shapes. Each lane's emitted text.
+fn fixed_rounds(model: &Model, pool: &SeqPool, prompts: &[Vec<i32>], samplings: &[SamplingParams], rounds: usize) -> Vec<Vec<i32>> {
+    let mut sequences: Vec<Seq<'_>> =
+        prompts.iter().map(|_| pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"))).collect();
+    for ((seq, prompt), &sampling) in sequences.iter_mut().zip(prompts).zip(samplings) {
+        prefill_program_sampled(model, pool, seq, prompt, 0, sampling, None).unwrap_or_else(|e| panic!("prefill: {e}"));
+    }
+    let mut emitted = vec![Vec::new(); prompts.len()];
+    for round in 0..rounds {
+        let drafts: Vec<Vec<i32>> = (0..prompts.len()).map(|i| propose(Drafter::Random, i, 0, round, TOTAL)).collect();
+        let lanes: Vec<VerifyLane<'_>> = drafts
+            .iter()
+            .zip(samplings)
+            .map(|(drafts, &sampling)| VerifyLane { sampling, ..VerifyLane::greedy(drafts) })
+            .collect();
+        let mut refs: Vec<&mut Seq<'_>> = sequences.iter_mut().collect();
+        let runs = decode_program_verify(model, pool, &mut refs, &lanes, WINDOW).unwrap_or_else(|e| panic!("round {round}: {e}"));
+        for (text, run) in emitted.iter_mut().zip(runs) {
+            text.extend(run);
+        }
+    }
+    emitted
+}
+
+/// GitHub #576 (spec #574, ADR 0090): the same round under the sampled draft.
+/// A verify-only load's drafts come per call, so q is one-hot on each and the
+/// rule takes a draft with the target's probability of it, as today's does,
+/// but through ignis's accept: its greedy branch, its own random streams and
+/// its refusal's draw. What the round holds under today's rule it holds under
+/// this one: greedy text is the spec-off text under any drafter, up to the
+/// near-tie rule; a one-candidate support samples the spec-off text; at a
+/// wide support a fixed seed reproduces a lane's stream, which depends on
+/// neither its row nor its neighbours' requests; a greedy lane beside sampled
+/// ones writes exactly what it writes under today's rule; a run cut at a stop
+/// id commits through the stop and no further; and a graph replay equals the
+/// eager rounds at every width, greedy and sampled lanes together.
+///
+/// Named to run before the test above, which keeps its materialized weights
+/// to the end of the binary: this one frees its own when it is done.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn sampled_draft_rounds_commit_what_todays_rule_commits() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let (plan, handles) = bind_text_scope_27b(&reader).unwrap_or_else(|e| panic!("bind: {e}"));
+    let mut device = match CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let greedy = SamplingParams::greedy();
+    let prompts8: Vec<Vec<i32>> = (0..8).map(prompt_for).collect();
+    let probe = || verify_pool(1);
+    let peaked = SamplingParams {
+        temperature: 0.9,
+        top_k: 1,
+        top_p: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed: 77,
+    };
+    let wide = |seed: u64| SamplingParams {
+        temperature: 1.0,
+        top_k: 20,
+        top_p: 0.95,
+        presence_penalty: 0.1,
+        frequency_penalty: 0.1,
+        seed,
+    };
+
+    // --- the spec-off oracles ---------------------------------------------
+    let model = load_plain(&reader, &artifact, &handles);
+    let mut streams_at = std::collections::HashMap::new();
+    for width in [1usize, 4] {
+        let pool = new_pool(width as u32);
+        streams_at.insert(width, spec_off_streams(&model, &pool, &prompts8[..width], greedy, TOTAL));
+        drop(pool);
+    }
+    let pool = new_pool(4);
+    let peaked_streams = spec_off_streams(&model, &pool, &prompts8[..4], peaked, TOTAL);
+    drop(pool);
+    drop(model);
+
+    // --- today's rule: a mixed batch's fixed rounds, for the greedy lanes ----
+    const ROUNDS: usize = 10;
+    let mixed: Vec<SamplingParams> = (0..4).map(|i| if i % 2 == 0 { greedy } else { wide(600 + i as u64) }).collect();
+    let fixed_rule_mixed = {
+        let model = load_verify(&reader, &artifact, &handles);
+        let pool = verify_pool(4);
+        let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+        fixed_rounds(&model, &pool, &prompts8[..4], &mixed, ROUNDS)
+    };
+
+    let model = load_verify_sampled(&reader, &artifact, &handles);
+    // --- greedy text under any drafter, widths 1 and 4 ----------------------
+    for width in [1usize, 4] {
+        let pool = verify_pool(width as u32);
+        let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+        let stats = program_stats(&model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
+        assert!(stats.verify_graph_ready_mask & (1 << (width - 1)) != 0, "width {width}: no verify graph under the sampled draft");
+        let prompts = &prompts8[..width];
+        let off = &streams_at[&width];
+        let oracle = run_verify(&model, &pool, prompts, greedy, Drafter::Oracle(off), &[], TOTAL, true);
+        let agreed = assert_equivalent(&model, &probe, MAX_CONTEXT, prompts, off, &oracle.emitted, &format!("sampled draft, width {width} oracle"));
+        assert_oracle_accepts(&oracle, &agreed, &format!("sampled draft, width {width}"));
+        let random = run_verify(&model, &pool, prompts, greedy, Drafter::Random, &[], TOTAL, true);
+        assert_equivalent(&model, &probe, MAX_CONTEXT, prompts, off, &random.emitted, &format!("sampled draft, width {width} random drafter"));
+        for (round, lanes) in random.rounds.iter().enumerate() {
+            for &(lane, _, _, accepted) in lanes {
+                assert!(accepted <= 1, "sampled draft, width {width} round {round} lane {lane}: {accepted} random drafts accepted");
+            }
+        }
+        let nothing = run_verify(&model, &pool, prompts, greedy, Drafter::Nothing, &[], TOTAL, true);
+        assert_equivalent(&model, &probe, MAX_CONTEXT, prompts, off, &nothing.emitted, &format!("sampled draft, width {width} extent 0"));
+        assert_eq!(nothing.rounds.len(), TOTAL, "sampled draft, width {width}: extent 0 commits one token per round");
+        drop(pool);
+    }
+
+    // --- a one-candidate support samples the spec-off text ------------------
+    let pool = verify_pool(4);
+    let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    let oracle = run_verify(&model, &pool, &prompts8[..4], peaked, Drafter::Oracle(&peaked_streams), &[], TOTAL, true);
+    let agreed = assert_equivalent(&model, &probe, MAX_CONTEXT, &prompts8[..4], &peaked_streams, &oracle.emitted, "sampled draft, top_k=1");
+    assert_oracle_accepts(&oracle, &agreed, "sampled draft, top_k=1");
+    let random = run_verify(&model, &pool, &prompts8[..4], peaked, Drafter::Random, &[], TOTAL, true);
+    assert_equivalent(&model, &probe, MAX_CONTEXT, &prompts8[..4], &peaked_streams, &random.emitted, "sampled draft, top_k=1, random drafts");
+
+    // --- a wide support: a seed's stream, whatever its row ------------------
+    let wide4: Vec<SamplingParams> = (0..4).map(|i| wide(4242 + i as u64)).collect();
+    let together = run_verify_lanes(&model, &pool, &prompts8[..4], &wide4, Drafter::Oracle(&streams_at[&4]), &[], TOTAL, true);
+    let again = run_verify_lanes(&model, &pool, &prompts8[..4], &wide4, Drafter::Oracle(&streams_at[&4]), &[], TOTAL, true);
+    assert_eq!(together.emitted, again.emitted, "sampled draft: a fixed seed must reproduce the stream");
+    assert_ne!(together.emitted, streams_at[&4], "sampled draft: the wide support never reached the accept");
+    let reversed_prompts: Vec<Vec<i32>> = prompts8[..4].iter().rev().cloned().collect();
+    let reversed_oracle: Vec<Vec<i32>> = streams_at[&4].iter().rev().cloned().collect();
+    let reversed_wide: Vec<SamplingParams> = wide4.iter().rev().copied().collect();
+    let reversed = run_verify_lanes(&model, &pool, &reversed_prompts, &reversed_wide, Drafter::Oracle(&reversed_oracle), &[], TOTAL, true);
+    let unreversed: Vec<Vec<i32>> = reversed.emitted.into_iter().rev().collect();
+    assert_eq!(unreversed, together.emitted, "sampled draft: a lane's stream changed with the row it occupied");
+
+    // --- greedy and sampled lanes in one round -------------------------------
+    // The same fixed rounds as under today's rule: each greedy lane writes
+    // exactly what it wrote there, and each sampled lane what it writes when
+    // its neighbours sample too -- the same shapes, other lanes' requests.
+    let sampled_rule_mixed = fixed_rounds(&model, &pool, &prompts8[..4], &mixed, ROUNDS);
+    for lane in [0, 2] {
+        assert_eq!(
+            sampled_rule_mixed[lane], fixed_rule_mixed[lane],
+            "greedy lane {lane} beside sampled ones wrote another text than under today's rule"
+        );
+    }
+    let neighbours: Vec<SamplingParams> = (0..4).map(|i| if i % 2 == 0 { wide(900 + i as u64) } else { mixed[i] }).collect();
+    let sampled_neighbours = fixed_rounds(&model, &pool, &prompts8[..4], &neighbours, ROUNDS);
+    for lane in [1, 3] {
+        assert_eq!(sampled_neighbours[lane], sampled_rule_mixed[lane], "sampled lane {lane}'s stream changed with its neighbours' requests");
+    }
+
+    // --- the stop-aware commit, on a sampled lane ----------------------------
+    // A probe round with no stop id yields its run R; the identical round with
+    // a stop id at R[s] draws the same and commits R[..=s].
+    let drafts = peaked_streams[0][1..=WINDOW as usize].to_vec();
+    let run_with = |stops: &[i32]| {
+        let mut seq = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
+        prefill_program_sampled(&model, &pool, &mut seq, &prompts8[0], 0, peaked, None).unwrap_or_else(|e| panic!("prefill: {e}"));
+        let lanes = [VerifyLane { sampling: peaked, remaining_tokens: TOTAL as u32, stop_ids: stops, drafts: &drafts, reasoning_close: -1 }];
+        let run = decode_program_verify(&model, &pool, &mut [&mut seq], &lanes, WINDOW)
+            .unwrap_or_else(|e| panic!("verify round: {e}"))
+            .remove(0);
+        (run, seq.stats().position)
+    };
+    let (probe_run, _) = run_with(&[]);
+    let stop_at = (1..probe_run.len().saturating_sub(1))
+        .find(|&s| !probe_run[..s].contains(&probe_run[s]))
+        .expect("sampled draft, top_k=1: the oracle's run is too short to hold a stop inside it");
+    let (cut, position) = run_with(&[probe_run[stop_at]]);
+    assert_eq!(cut, probe_run[..=stop_at], "sampled draft: the run must commit through the stop id and no further");
+    assert_eq!(position, (prompts8[0].len() + cut.len()) as u64, "sampled draft: the frontier stands at the emitted text");
+    drop(pool);
+    drop(model);
+
+    // --- graph replay == eager at every width, greedy and sampled lanes ------
+    for width in 1..=8usize {
+        let prompts = &prompts8[..width];
+        let lanes: Vec<SamplingParams> = (0..width).map(|i| if i % 2 == 0 { wide(70 + i as u64) } else { greedy }).collect();
+        let model = load_verify_sampled(&reader, &artifact, &handles);
+        let eager_pool = verify_pool(width as u32);
+        let eager = run_verify_lanes(&model, &eager_pool, prompts, &lanes, Drafter::Random, &[], TOTAL, false);
+        drop(eager_pool);
+        drop(model);
+
+        let model = load_verify_sampled(&reader, &artifact, &handles);
+        let graph_pool = verify_pool(width as u32);
+        let _ = capture_decode_graphs(&model, &graph_pool).unwrap_or_else(|e| panic!("capture: {e}"));
+        let stats = program_stats(&model, &graph_pool).unwrap_or_else(|e| panic!("stats: {e}"));
+        assert!(stats.verify_graph_ready_mask & (1 << (width - 1)) != 0, "sampled draft, width {width}: no verify graph");
+        let graph = run_verify_lanes(&model, &graph_pool, prompts, &lanes, Drafter::Random, &[], TOTAL, true);
+        drop(graph_pool);
+        drop(model);
+        assert_eq!(eager.emitted, graph.emitted, "sampled draft, width {width}: verify graph replay diverged from eager");
+        assert_eq!(eager.rounds, graph.rounds, "sampled draft, width {width}: replay accepted differently from eager");
+    }
+    // The test after this one in the binary materializes its own.
+    let _ = artifact.release_arena(&mut device);
 }

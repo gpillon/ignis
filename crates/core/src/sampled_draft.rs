@@ -1,7 +1,9 @@
 //! The **sampled draft**'s rule (spec #574, GitHub #575): the host reference
 //! of the arithmetic a sampling lane of the 27B's DFlash2 verify round
-//! follows, which the device kernels are held to. Nothing in the engine calls
-//! it yet.
+//! follows, which the device kernels are held to. The engine never calls it:
+//! a round under the sampled draft runs the leaf's kernels
+//! (`kernel/src/sampled_draft.cuh`, GitHub #576, ADR 0090), which a GPU test
+//! holds to the same oracle through the `device` module.
 //!
 //! Under sampling the drafter draws each column's draft d from its own
 //! distribution q over the column's candidates, instead of proposing a fixed
@@ -183,4 +185,97 @@ fn inverse_cdf(len: usize, weight: impl Fn(usize) -> f32, uniform: f32) -> Optio
         }
     }
     picked
+}
+
+/// The leaf's device kernels of the same rule over explicit uniforms (GitHub
+/// #576, `kernel/include/ignis_sampled_draft.h`): **test-only**, the seam a
+/// GPU test sweeps over the oracle's grid
+/// (`crates/core/tests/sampled_draft_gpu.rs`), as the CPU suite sweeps the
+/// functions above. No serving path calls it: the verify round draws its
+/// uniforms from the sampler's counter-based RNG on the device.
+#[cfg(feature = "cuda")]
+pub mod device {
+    use super::Verdict;
+
+    /// What the leaf writes at a grid point where the draft was taken.
+    const ACCEPTED: i32 = -1;
+
+    mod ffi {
+        use std::os::raw::c_char;
+
+        unsafe extern "C" {
+            pub fn ignis_sampled_draft_verdicts(
+                target_ids: *const i32,
+                target_probs: *const f32,
+                target_count: u32,
+                drafter_ids: *const i32,
+                drafter_probs: *const f32,
+                drafter_count: u32,
+                draft: i32,
+                grid: *const f32,
+                cells: u32,
+                out_tokens: *mut i32,
+            ) -> i32;
+            pub fn ignis_sampled_draft_draws(q: *const f32, count: u32, grid: *const f32, cells: u32, out_candidates: *mut i32) -> i32;
+            pub fn ignis_sampled_drafter_distribution(scores: *const f32, count: u32, temperature: f32, top_p: f32, out_q: *mut f32) -> i32;
+            pub fn ignis_sampled_draft_last_error() -> *const c_char;
+        }
+    }
+
+    fn last_error() -> String {
+        let message = unsafe { std::ffi::CStr::from_ptr(ffi::ignis_sampled_draft_last_error()) };
+        message.to_string_lossy().into_owned()
+    }
+
+    fn check(rc: i32) -> Result<(), String> {
+        if rc == 0 { Ok(()) } else { Err(last_error()) }
+    }
+
+    /// The device accept's verdict on `draft` at every point of `grid` x
+    /// `grid`, the accept's uniform `grid[i]` and the refusal's `grid[j]` at
+    /// `[i * grid.len() + j]`; the target's and the drafter's distributions as
+    /// [`super::accept_verdict`] takes them.
+    pub fn verdicts(
+        target_ids: &[i32],
+        target_probs: &[f32],
+        drafter_ids: &[i32],
+        drafter_probs: &[f32],
+        draft: i32,
+        grid: &[f32],
+    ) -> Result<Vec<Verdict>, String> {
+        if target_ids.len() != target_probs.len() || drafter_ids.len() != drafter_probs.len() {
+            return Err("a distribution pairs each id with its probability".to_owned());
+        }
+        let mut tokens = vec![0i32; grid.len() * grid.len()];
+        check(unsafe {
+            ffi::ignis_sampled_draft_verdicts(
+                target_ids.as_ptr(),
+                target_probs.as_ptr(),
+                target_ids.len() as u32,
+                drafter_ids.as_ptr(),
+                drafter_probs.as_ptr(),
+                drafter_ids.len() as u32,
+                draft,
+                grid.as_ptr(),
+                grid.len() as u32,
+                tokens.as_mut_ptr(),
+            )
+        })?;
+        Ok(tokens.into_iter().map(|token| if token == ACCEPTED { Verdict::Accepted } else { Verdict::Refused(token) }).collect())
+    }
+
+    /// The candidate the device draws from `q` at each uniform of `grid`
+    /// ([`super::draw_draft`]).
+    pub fn draws(q: &[f32], grid: &[f32]) -> Result<Vec<usize>, String> {
+        let mut drawn = vec![0i32; grid.len()];
+        check(unsafe { ffi::ignis_sampled_draft_draws(q.as_ptr(), q.len() as u32, grid.as_ptr(), grid.len() as u32, drawn.as_mut_ptr()) })?;
+        Ok(drawn.into_iter().map(|i| i as usize).collect())
+    }
+
+    /// The device's drafter distribution ([`super::drafter_distribution`]).
+    pub fn drafter_distribution(scores: &[f32], temperature: f32, top_p: f32) -> Result<Vec<f32>, String> {
+        let mut q = vec![0f32; scores.len()];
+        check(unsafe { ffi::ignis_sampled_drafter_distribution(scores.as_ptr(), scores.len() as u32, temperature, top_p, q.as_mut_ptr()) })?;
+        Ok(q)
+    }
 }

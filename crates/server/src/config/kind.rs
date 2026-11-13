@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use ignis_core::image::ImageSize;
 use ignis_core::ngram_cache::CacheLocation;
 use ignis_core::ngram_table::HotBudget;
-use ignis_core::{ExceptionWeights, KvFormat, KvPoolSize, PrefillAttention, PrefillLinear, ProposalHeadSetting, RopeSetting, SpeculativeBackend, VisionResidency};
+use ignis_core::{DraftRule, ExceptionWeights, KvFormat, KvPoolSize, PrefillAttention, PrefillLinear, ProposalHeadSetting, RopeSetting, SpeculativeBackend, VisionResidency};
 use serde_json::Value;
 
 use super::{ApiKey, ApiKeySetting, Expose, SoloWidth, SpecChoice};
@@ -874,6 +874,23 @@ impl FieldKind for DraftHead {
     }
 }
 
+/// How a verify round's sampling lanes draft and accept (GitHub #576, ADR
+/// 0090): `fixed`, today's rule, or `sampled`, the sampled draft.
+pub struct DraftRuleKind;
+
+impl FieldKind for DraftRuleKind {
+    type Value = DraftRule;
+    const TAG: &'static str = "draft rule";
+
+    fn parse(raw: &str) -> Result<DraftRule, String> {
+        DraftRule::parse(&raw.to_ascii_lowercase())
+    }
+
+    fn render(value: &DraftRule) -> Value {
+        Value::String(value.as_str().to_owned())
+    }
+}
+
 /// Flash-Next's draft row budget (GitHub #307, #329): `0` (the default's
 /// [`ignis_core::speculation::FLASH_NEXT_DEFAULT_VERIFY_ROWS`]) or
 /// `2..=`[`ignis_core::speculation::FLASH_NEXT_MAX_VERIFY_ROWS`]. One row is
@@ -1209,6 +1226,8 @@ mod tests {
         assert!(SpecBackend::parse("eagle").unwrap_err().contains("eagle"));
         assert_eq!(DraftHead::parse("shortlist"), Ok(ProposalHeadSetting::Fixed(ignis_core::ProposalHead::Shortlist)));
         assert_eq!(DraftHead::parse("Auto"), Ok(ProposalHeadSetting::Auto));
+        assert_eq!(DraftRuleKind::parse("Sampled"), Ok(DraftRule::Sampled));
+        assert!(DraftRuleKind::parse("coupled").unwrap_err().contains("fixed or sampled"));
         assert_eq!(ExposeKind::parse("cloudflare-quick"), Ok(Expose::CloudflareQuick));
         assert_eq!(TimeoutReplyKind::parse("Partial"), Ok(crate::deadline::TimeoutReply::Partial));
         round_trips::<KvFormatKind>(KvFormat::Bf16);
@@ -1221,6 +1240,8 @@ mod tests {
         round_trips::<TimeoutReplyKind>(crate::deadline::TimeoutReply::Error);
         round_trips::<Rope>(RopeSetting::Auto);
         round_trips::<DraftHead>(ProposalHeadSetting::Auto);
+        round_trips::<DraftRuleKind>(DraftRule::Sampled);
+        round_trips::<DraftRuleKind>(DraftRule::Fixed);
         round_trips::<DraftHead>(ProposalHeadSetting::Fixed(ignis_core::ProposalHead::Shortlist));
         round_trips::<Rope>(RopeSetting::Fixed(RopeScaling::NONE));
         round_trips::<Rope>(RopeSetting::parse("yarn:4,t=0.25").unwrap());

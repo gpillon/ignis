@@ -431,6 +431,25 @@ struct IgnisVerifyRound {
   std::unique_ptr<ninfer::DeviceBuffer> append_counts; // I32 [B]
   std::unique_ptr<ninfer::DeviceArena> drafter_scratch;
 
+  // GitHub #576 (spec #574, ADR 0090): the load's draft rule. Under the
+  // sampled draft a sampling lane draws its drafts from the drafter's
+  // distribution q (`ignis_sampled_draft_draw`, inside the drafter's
+  // forward) and the round's accept is ignis's (`ignis_sampled_accept`); a
+  // greedy lane keeps the walk's drafts and today's rule. Under the fixed
+  // draft, the default, the round is exactly what it was: the walk's drafts
+  // and the vendored accept. The drafter's temperature is the lane's times
+  // `drafter_temperature_factor`, its top-p `drafter_top_p`. With the
+  // drafter, `draft_candidates` and `draft_q` keep each sampling lane's q --
+  // its candidates' ids and probabilities -- from the draw to the accept;
+  // counted on the drafter's plan line. Null under the fixed draft and on a
+  // verify-only load, whose drafts come per call and whose q is one-hot on
+  // them.
+  bool sampled_draft = false;
+  float drafter_temperature_factor = 0.0f;
+  float drafter_top_p = 1.0f;
+  std::unique_ptr<ninfer::DeviceBuffer> draft_candidates; // I32 [16, k, B]
+  std::unique_ptr<ninfer::DeviceBuffer> draft_q;          // F32 [16, k, B]
+
   // GitHub #590 (spec #287): `logits` is also where a repair reads the
   // scores of a lane whose commit the host cut (`ignis_kept_scores`, source
   // kVerifyLogits). Every round writes the whole buffer, so each round stamps
@@ -451,7 +470,8 @@ struct IgnisVerifyRound {
           lengths.get(), rope_positions.get(), verify_ids.get(), positions.get(),
           target_tokens.get(), logits.get(), hidden.get(), licensed_tokens.get(),
           licensed_counts.get(), accepted.get(), selectors.get(), selected_hidden.get(),
-          records_backing.get(), features.get(), append_counts.get()}) {
+          records_backing.get(), features.get(), append_counts.get(), draft_candidates.get(),
+          draft_q.get()}) {
       if (buffer != nullptr) {
         bytes += buffer->bytes;
       }

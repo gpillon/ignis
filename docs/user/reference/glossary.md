@@ -254,6 +254,12 @@ text before the loop, with a nudge. See
 lanes (`--spec-draft-rows`, 8 by default). See
 [speculative decoding](../concepts/speculative-decoding.md).
 
+**Sampled draft.** A way for the 27B's DFlash2 to draft for a request that
+samples (`--spec-draft-rule sampled`, from 0.11.0): the drafter draws each draft
+from its own distribution and the round takes it by the ratio of the model's
+probability to the drafter's, so the text keeps the model's distribution. See
+[speculative decoding](../concepts/speculative-decoding.md#acceptance-under-sampling).
+
 **Scope.** A model family's own section of a field: `qwen38` for the 27B,
 `qwen38flashnext` for Flash-Next. A value in a scope wins over the general one
 for that family. See [configuration](../configuration/index.md).

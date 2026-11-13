@@ -57,7 +57,7 @@ use ignis_core::step::{
     capture_decode_graphs, decode_program_batch_sampled, decode_program_verify_runs, prefill_program_sampled,
     program_stats, SamplingParams, VerifyLane, LaneVerifyRun,
 };
-use ignis_core::{KvFormat, ProposalHead, Speculation, SpeculativeBackend};
+use ignis_core::{DraftRule, DrafterSampling, KvFormat, ProposalHead, Speculation, SpeculativeBackend};
 
 use near_tie::assert_equivalent;
 use snapshot_blob::{hq_ring_words, section, read_u64, PROGRESS_DRAFTER_FRONTIER, SECTION_DFLASH_WINDOW, SECTION_PROGRESS};
@@ -151,9 +151,30 @@ fn round(
     budgets: &[u32],
     stop_ids: &[i32],
 ) -> Vec<LaneVerifyRun> {
+    round_with(model, pool, sequences, &vec![SamplingParams::greedy(); budgets.len()], budgets, stop_ids, -1)
+}
+
+/// [`round`] with each lane under its own sampling, and `reasoning_close`
+/// as every lane's redirect (-1 for none) (GitHub #576).
+fn round_with(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    samplings: &[SamplingParams],
+    budgets: &[u32],
+    stop_ids: &[i32],
+    reasoning_close: i32,
+) -> Vec<LaneVerifyRun> {
     let lanes: Vec<VerifyLane<'_>> = budgets
         .iter()
-        .map(|&remaining_tokens| VerifyLane { remaining_tokens, stop_ids, ..VerifyLane::greedy(&[]) })
+        .zip(samplings)
+        .map(|(&remaining_tokens, &sampling)| VerifyLane {
+            sampling,
+            remaining_tokens,
+            stop_ids,
+            reasoning_close,
+            ..VerifyLane::greedy(&[])
+        })
         .collect();
     decode_program_verify_runs(model, pool, sequences, &lanes, WINDOW).unwrap_or_else(|e| panic!("verify round: {e}"))
 }
@@ -177,6 +198,19 @@ fn spec_on(
     total: usize,
     expect_graph: bool,
 ) -> SpecRun {
+    spec_on_with(model, pool, prompts, &vec![SamplingParams::greedy(); prompts.len()], stop_ids, total, expect_graph)
+}
+
+/// [`spec_on`] with each lane under its own sampling (GitHub #576).
+fn spec_on_with(
+    model: &Model,
+    pool: &SeqPool,
+    prompts: &[Vec<i32>],
+    samplings: &[SamplingParams],
+    stop_ids: &[i32],
+    total: usize,
+    expect_graph: bool,
+) -> SpecRun {
     let mut sequences: Vec<Seq<'_>> =
         prompts.iter().map(|_| pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"))).collect();
     prefill_all(model, pool, &mut sequences, prompts);
@@ -189,7 +223,8 @@ fn spec_on(
         let mut remaining: Vec<Option<&mut Seq<'_>>> = sequences.iter_mut().map(Some).collect();
         let mut refs: Vec<&mut Seq<'_>> =
             active.iter().map(|&i| remaining[i].take().expect("each active lane once")).collect();
-        let results = round(model, pool, &mut refs, &budgets, stop_ids);
+        let lane_samplings: Vec<SamplingParams> = active.iter().map(|&i| samplings[i]).collect();
+        let results = round_with(model, pool, &mut refs, &lane_samplings, &budgets, stop_ids, -1);
         let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("stats: {e}"));
         assert_eq!(stats.graph_launches, u64::from(expect_graph), "round {} at width {}: graph replay", rounds.len(), active.len());
         let mut this_round = Vec::new();
@@ -882,5 +917,339 @@ fn with_fp8_exception_tensors_the_verify_graphs_replay_the_eager_rounds() {
             assert_eq!(eager, graph, "width {width}: the verify graph's replay diverged from eager");
         }
     }
+    let _ = artifact.release_arena(&mut device);
+}
+
+/// The snapshot section kind of a lane's penalty counts (`ignis_seq_sections.h`).
+const SECTION_PENALTY_COUNTS: i32 = 3;
+
+/// `sequence`'s penalty-count row, read from its snapshot (GitHub #576).
+fn penalty_counts(sequence: &Seq<'_>) -> Vec<i32> {
+    let blob = sequence.snapshot().unwrap_or_else(|e| panic!("snapshot: {e:?}"));
+    let (at, bytes) = section(&blob, SECTION_PENALTY_COUNTS);
+    blob[at..at + bytes].chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect()
+}
+
+/// GitHub #576: `rounds` drafter rounds over every lane at once, none
+/// budgeted and none stopping, each lane under its own sampling: every round
+/// as wide as the batch and every lane at the window, so two runs that differ
+/// only in another lane's request run the same shapes. Each lane's text.
+fn fixed_rounds(model: &Model, pool: &SeqPool, prompts: &[Vec<i32>], samplings: &[SamplingParams], rounds: usize) -> Vec<Vec<i32>> {
+    let mut sequences: Vec<Seq<'_>> =
+        prompts.iter().map(|_| pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"))).collect();
+    prefill_all(model, pool, &mut sequences, prompts);
+    let mut emitted = vec![Vec::new(); prompts.len()];
+    for _ in 0..rounds {
+        let mut refs: Vec<&mut Seq<'_>> = sequences.iter_mut().collect();
+        let results = round_with(model, pool, &mut refs, samplings, &vec![0; prompts.len()], &[], -1);
+        for (text, result) in emitted.iter_mut().zip(results) {
+            assert_eq!(result.extent, WINDOW, "a fixed round's lane must draft the whole window");
+            text.extend(result.tokens);
+        }
+    }
+    emitted
+}
+
+/// The sampling a coding agent sends: temperature 1, top-k 20, top-p 0.95.
+fn agent(seed: u64) -> SamplingParams {
+    SamplingParams {
+        temperature: 1.0,
+        top_k: 20,
+        top_p: 0.95,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        seed,
+    }
+}
+
+/// GitHub #576 (spec #574, ADR 0090): the drafter under the sampled draft. A
+/// sampling lane draws its drafts from the drafter's distribution and the
+/// round's accept takes them by the ratio of the target's probability to the
+/// drafter's; a greedy lane drafts and accepts as under today's rule. So:
+///
+/// - greedy text is the spec-off text at widths 1 and 4, up to the near-tie
+///   rule, as under today's rule;
+/// - sampled lanes land drafts, a fixed seed reproduces the run, and a lane's
+///   run is the same in another row;
+/// - in fixed rounds of greedy and sampled lanes together, each greedy lane
+///   writes exactly what it writes beside the same lanes under today's rule,
+///   and each sampled lane what it writes when its neighbours sample too;
+/// - the penalty rows hold the emitted text and the pending token once each,
+///   through runs cut at a stop id and runs whose stop was redirected to
+///   `</think>`: the accept counts every token it produces, the commit gives
+///   back what a cut run did not emit;
+/// - the draws run inside the captured verify graphs: at every width 1..8 the
+///   replay of greedy and sampled lanes together is the eager run bit for bit.
+///
+/// Each rule's mean committed tokens per full-window round on the same
+/// sampled lanes is printed, a reading and not a gate.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn under_the_sampled_draft_the_drafter_draws_and_each_lane_keeps_its_text() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let (canaries, stop_ids) = chat_canaries(&reader);
+    let prompts8: Vec<Vec<i32>> = canaries.iter().chain(&canaries).cloned().collect();
+    assert!(prompts8.iter().all(|p| p.len() + TOTAL <= MAX_CONTEXT as usize), "a canary outgrows the context");
+    assert_eq!(snapshot_format_version(), 5, "this test reads the version-5 blob layout");
+    let think_end = {
+        let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
+        let ids = frontend.tokenizer().encode("</think>").unwrap_or_else(|e| panic!("tokenize: {e}"));
+        assert_eq!(ids.len(), 1, "`</think>` must tokenize as one special token");
+        i32::try_from(ids[0]).expect("token id fits i32")
+    };
+
+    let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
+        .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));
+    let text_len = text_scope_27b().len();
+    let mut device = match CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let greedy = SamplingParams::greedy();
+    let load_sampled = || {
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, WINDOW)
+            .unwrap()
+            .with_draft_rule(DraftRule::Sampled, DrafterSampling::default());
+        load_qwen38_27b_with_speculation(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT, KvFormat::Bf16, Some(spec))
+            .unwrap_or_else(|e| panic!("model load (dflash2, the sampled draft): {e}"))
+    };
+
+    // --- the spec-off text at widths 1 and 4 --------------------------------
+    let widths = [1usize, 4];
+    let off: Vec<Vec<Vec<i32>>> = {
+        let model = load_qwen38_27b(&reader, &artifact, &handles[..text_len], MAX_CONTEXT, MAX_CONTEXT, KvFormat::Bf16)
+            .unwrap_or_else(|e| panic!("model load (spec-off): {e}"));
+        widths
+            .iter()
+            .map(|&width| {
+                let pool = pool_for(None, width as u32);
+                spec_off(&model, &pool, &prompts8[..width], &stop_ids, TOTAL)
+            })
+            .collect()
+    };
+
+    // --- today's rule: the fixed rounds of a mixed batch, and the reading ----
+    const ROUNDS: usize = 5;
+    let mixed: Vec<SamplingParams> = (0..4).map(|i| if i % 2 == 0 { greedy } else { agent(600 + i as u64) }).collect();
+    let agents: Vec<SamplingParams> = (0..4).map(|i| agent(4242 + i as u64)).collect();
+    let fixed_rule_mixed = {
+        let model = load_drafter(&reader, &artifact, &handles);
+        let pool = drafter_pool(4);
+        let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+        let run = spec_on_with(&model, &pool, &canaries, &agents, &stop_ids, TOTAL, true);
+        report_acceptance("today's rule, sampled lanes", &run);
+        fixed_rounds(&model, &pool, &canaries, &mixed, ROUNDS)
+    };
+
+    let model = load_sampled();
+    // --- greedy text, widths 1 and 4 ------------------------------------------
+    let probe = || drafter_pool(1);
+    for (&width, off) in widths.iter().zip(&off) {
+        let pool = drafter_pool(width as u32);
+        let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+        let stats = program_stats(&model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
+        assert!(stats.verify_graph_ready_mask & (1 << (width - 1)) != 0, "width {width}: no verify graph under the sampled draft");
+        let run = spec_on(&model, &pool, &prompts8[..width], &stop_ids, TOTAL, true);
+        assert_equivalent(&model, &probe, MAX_CONTEXT, &prompts8[..width], off, &run.emitted, &format!("sampled draft, width {width}, greedy"));
+        report_acceptance(&format!("the sampled draft, width {width} greedy"), &run);
+    }
+
+    // --- sampled lanes: drafts land, a seed reproduces, a row is a row -------
+    let pool = drafter_pool(4);
+    let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    let together = spec_on_with(&model, &pool, &canaries, &agents, &stop_ids, TOTAL, true);
+    let accepted = report_acceptance("the sampled draft, sampled lanes", &together);
+    assert!(accepted > 0, "the sampled draft never landed a draft on a sampled lane");
+    let again = spec_on_with(&model, &pool, &canaries, &agents, &stop_ids, TOTAL, true);
+    assert_eq!(together, again, "the sampled draft: a fixed seed must reproduce the run");
+    let reversed_prompts: Vec<Vec<i32>> = canaries.iter().rev().cloned().collect();
+    let reversed_agents: Vec<SamplingParams> = agents.iter().rev().copied().collect();
+    let reversed = spec_on_with(&model, &pool, &reversed_prompts, &reversed_agents, &stop_ids, TOTAL, true);
+    let unreversed: Vec<Vec<i32>> = reversed.emitted.into_iter().rev().collect();
+    assert_eq!(unreversed, together.emitted, "the sampled draft: a lane's run changed with the row it occupied");
+
+    // --- greedy and sampled lanes in one round ---------------------------------
+    let sampled_rule_mixed = fixed_rounds(&model, &pool, &canaries, &mixed, ROUNDS);
+    for lane in [0, 2] {
+        assert_eq!(
+            sampled_rule_mixed[lane], fixed_rule_mixed[lane],
+            "greedy lane {lane} beside sampled ones wrote another text than under today's rule"
+        );
+    }
+    let neighbours: Vec<SamplingParams> = (0..4).map(|i| if i % 2 == 0 { agent(900 + i as u64) } else { mixed[i] }).collect();
+    let sampled_neighbours = fixed_rounds(&model, &pool, &canaries, &neighbours, ROUNDS);
+    for lane in [1, 3] {
+        assert_eq!(sampled_neighbours[lane], sampled_rule_mixed[lane], "sampled lane {lane}'s run changed with its neighbours' requests");
+    }
+
+    // --- the penalty rows, through a stop cut and a reasoning redirect -------
+    let penalized = |seed: u64| SamplingParams { presence_penalty: 0.5, frequency_penalty: 0.5, ..agent(seed) };
+    for (close, label) in [(-1, "a stop cut"), (think_end, "a reasoning redirect")] {
+        let mut sequences: Vec<Seq<'_>> =
+            (0..4).map(|_| pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"))).collect();
+        prefill_all(&model, &pool, &mut sequences, &canaries);
+        let before: Vec<Vec<i32>> = sequences.iter().map(penalty_counts).collect();
+        let samplings: Vec<SamplingParams> = (0..4).map(|i| penalized(77 + i as u64)).collect();
+        let mut emitted: Vec<Vec<i32>> = vec![Vec::new(); 4];
+        let mut done = [false; 4];
+        let (mut stopped, mut redirected, mut rounds) = (0usize, 0usize, 0usize);
+        while done.iter().any(|d| !d) {
+            let active: Vec<usize> = (0..4).filter(|&i| !done[i]).collect();
+            let budgets: Vec<u32> = active.iter().map(|&i| (TOTAL - emitted[i].len()) as u32).collect();
+            let lane_samplings: Vec<SamplingParams> = active.iter().map(|&i| samplings[i]).collect();
+            let mut remaining: Vec<Option<&mut Seq<'_>>> = sequences.iter_mut().map(Some).collect();
+            let mut refs: Vec<&mut Seq<'_>> =
+                active.iter().map(|&i| remaining[i].take().expect("each active lane once")).collect();
+            let results = round_with(&model, &pool, &mut refs, &lane_samplings, &budgets, &stop_ids, close);
+            for (&i, result) in active.iter().zip(results) {
+                redirected += usize::from(result.redirected);
+                let ended = result.tokens.iter().any(|t| stop_ids.contains(t));
+                stopped += usize::from(ended);
+                emitted[i].extend(result.tokens);
+                done[i] = ended || emitted[i].len() >= TOTAL;
+            }
+            rounds += 1;
+            assert!(rounds <= TOTAL, "{label}: the run does not converge");
+        }
+        for (lane, sequence) in sequences.iter().enumerate() {
+            // The prefill's greedy draw counts nothing; every token emitted
+            // after it was produced by a round and counted, and so was the
+            // pending token the last round left.
+            let mut expected = before[lane].clone();
+            for &token in &emitted[lane][1..] {
+                expected[token as usize] += 1;
+            }
+            let after = penalty_counts(sequence);
+            let off_by: Vec<(usize, i32)> =
+                after.iter().zip(&expected).enumerate().filter(|(_, (a, e))| a != e).map(|(id, (a, e))| (id, a - e)).collect();
+            assert!(
+                off_by.len() == 1 && off_by[0].1 == 1,
+                "{label}, lane {lane}: the penalty row is not the emitted text and the pending token once each (off by {off_by:?})"
+            );
+            if close >= 0 {
+                assert!(!emitted[lane].iter().any(|t| stop_ids.contains(t)), "{label}, lane {lane}: a redirected stop id was emitted");
+            }
+        }
+        if close < 0 {
+            assert!(stopped > 0, "{label}: no lane reached a stop id, so the cut went unexercised");
+        } else {
+            assert!(redirected > 0, "{label}: no lane's stop was redirected, so the redirect went unexercised");
+        }
+    }
+    drop(pool);
+    drop(model);
+
+    // --- the draws inside the verify graphs, every width ------------------------
+    let lanes_at = |width: usize| -> Vec<SamplingParams> {
+        (0..width).map(|i| if i % 2 == 0 { agent(70 + i as u64) } else { greedy }).collect()
+    };
+    let eager: Vec<SpecRun> = {
+        let model = load_sampled();
+        (1..=8usize)
+            .map(|width| {
+                let pool = drafter_pool(width as u32);
+                spec_on_with(&model, &pool, &prompts8[..width], &lanes_at(width), &stop_ids, TOTAL, false)
+            })
+            .collect()
+    };
+    {
+        let model = load_sampled();
+        for (width, eager) in (1..=8usize).zip(eager) {
+            let pool = drafter_pool(width as u32);
+            let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+            let graph = spec_on_with(&model, &pool, &prompts8[..width], &lanes_at(width), &stop_ids, TOTAL, true);
+            assert_eq!(eager, graph, "width {width}: the sampled draft's graph replay diverged from eager");
+        }
+    }
+    let _ = artifact.release_arena(&mut device);
+}
+
+/// GitHub #576: the shortlist proposal head under the sampled draft. Its
+/// candidates are mapped back to token ids before the selector scores them,
+/// so the draw reads token ids as with the full head: greedy text stays the
+/// spec-off text up to the near-tie rule, sampled lanes land drafts, and the
+/// graph replay of greedy and sampled lanes together is the eager run.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn under_the_sampled_draft_the_shortlist_head_drafts_too() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let (canaries, stop_ids) = chat_canaries(&reader);
+    let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2ShortlistHead))
+        .unwrap_or_else(|e| panic!("bind with the shortlist head: {e}"));
+    let text_len = text_scope_27b().len();
+    let mut device = match CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2 + shortlist head: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    const WIDTH: usize = 4;
+    let off = {
+        let model = load_qwen38_27b(&reader, &artifact, &handles[..text_len], MAX_CONTEXT, MAX_CONTEXT, KvFormat::Bf16)
+            .unwrap_or_else(|e| panic!("model load (spec-off): {e}"));
+        let pool = pool_for(None, WIDTH as u32);
+        spec_off(&model, &pool, &canaries[..WIDTH], &stop_ids, TOTAL)
+    };
+    let load_shortlist = || {
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, WINDOW)
+            .unwrap()
+            .with_proposal_head(ProposalHead::Shortlist)
+            .with_draft_rule(DraftRule::Sampled, DrafterSampling::default());
+        load_qwen38_27b_with_speculation(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT, KvFormat::Bf16, Some(spec))
+            .unwrap_or_else(|e| panic!("model load (dflash2, shortlist head, the sampled draft): {e}"))
+    };
+    let lanes: Vec<SamplingParams> =
+        (0..WIDTH).map(|i| if i % 2 == 0 { agent(31 + i as u64) } else { SamplingParams::greedy() }).collect();
+    let eager = {
+        let model = load_shortlist();
+        let pool = drafter_pool(WIDTH as u32);
+        spec_on_with(&model, &pool, &canaries[..WIDTH], &lanes, &stop_ids, TOTAL, false)
+    };
+    let model = load_shortlist();
+    let pool = drafter_pool(WIDTH as u32);
+    let capture = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    assert!(capture.is_ready(WIDTH as u32), "no decode graph at width {WIDTH}");
+    let mixed = spec_on_with(&model, &pool, &canaries[..WIDTH], &lanes, &stop_ids, TOTAL, true);
+    assert_eq!(eager, mixed, "the shortlist head's graph replay under the sampled draft diverged from eager");
+    let accepted = report_acceptance("shortlist head, the sampled draft, mixed lanes", &mixed);
+    assert!(accepted > 0, "no draft from the shortlist head ever landed under the sampled draft");
+    let run = spec_on(&model, &pool, &canaries[..WIDTH], &stop_ids, TOTAL, true);
+    let probe = || drafter_pool(1);
+    assert_equivalent(&model, &probe, MAX_CONTEXT, &canaries[..WIDTH], &off, &run.emitted, "shortlist head, the sampled draft, greedy");
+    drop(model);
     let _ = artifact.release_arena(&mut device);
 }

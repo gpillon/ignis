@@ -325,13 +325,95 @@ impl ProposalHeadSetting {
     }
 }
 
-/// A validated speculation option: a backend, its draft window and the
-/// drafter's proposal head.
+/// How a verify round's sampling lanes draft and accept (GitHub #576, spec
+/// #574, ADR 0090). A greedy lane drafts the selector walk's draft and takes
+/// it where the target's argmax agrees under either rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DraftRule {
+    /// Today's rule: the selector walk's fixed draft, taken with the target's
+    /// probability of it (the vendored accept).
+    #[default]
+    Fixed,
+    /// The sampled draft: a sampling lane draws each draft from the drafter's
+    /// distribution q over its candidates ([`crate::sampled_draft`]), and the
+    /// accept takes it with probability min(1, p/q), drawing from
+    /// max(p − q, 0) on a refusal. The text keeps the target's distribution;
+    /// a seed's text is not the fixed rule's.
+    Sampled,
+}
+
+impl DraftRule {
+    /// The operator's spellings (`--spec-draft-rule`).
+    pub const NAMES: [&'static str; 2] = ["fixed", "sampled"];
+
+    /// Parse the operator's spelling, naming both on a refusal.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "fixed" => Ok(Self::Fixed),
+            "sampled" => Ok(Self::Sampled),
+            other => Err(format!("unknown draft rule `{other}` (expected fixed or sampled)")),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Sampled => "sampled",
+        }
+    }
+
+    /// `enum ignis_draft_rule` (`kernel/include/ignis_model.h`).
+    pub fn abi_code(&self) -> u32 {
+        match self {
+            Self::Fixed => 0,
+            Self::Sampled => 1,
+        }
+    }
+}
+
+/// The drafter's own sampling under [`DraftRule::Sampled`], in thousandths as
+/// the configuration states them: its temperature as a factor of the lane's
+/// (a lane at temperature T drafts at factor × T) and its top-p over its
+/// candidates. Speed settings only: whatever they are, the text keeps the
+/// target's distribution (ADR 0090).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrafterSampling {
+    pub temperature_factor_milli: u32,
+    pub top_p_milli: u32,
+}
+
+impl Default for DrafterSampling {
+    /// The study's optimum at request temperature 1 (spec #574): 0.9 × T,
+    /// top-p 0.95.
+    fn default() -> Self {
+        Self {
+            temperature_factor_milli: 900,
+            top_p_milli: 950,
+        }
+    }
+}
+
+impl DrafterSampling {
+    /// The temperature factor as the leaf takes it.
+    pub fn temperature_factor(&self) -> f32 {
+        self.temperature_factor_milli as f32 / 1000.0
+    }
+
+    /// The top-p as the leaf takes it.
+    pub fn top_p(&self) -> f32 {
+        self.top_p_milli as f32 / 1000.0
+    }
+}
+
+/// A validated speculation option: a backend, its draft window, the
+/// drafter's proposal head and the rounds' draft rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Speculation {
     backend: SpeculativeBackend,
     draft_tokens: u32,
     proposal_head: ProposalHead,
+    draft_rule: DraftRule,
+    drafter_sampling: DrafterSampling,
 }
 
 impl Speculation {
@@ -347,6 +429,8 @@ impl Speculation {
             backend,
             draft_tokens,
             proposal_head: ProposalHead::Full,
+            draft_rule: DraftRule::Fixed,
+            drafter_sampling: DrafterSampling::default(),
         })
     }
 
@@ -357,6 +441,24 @@ impl Speculation {
 
     pub fn proposal_head(&self) -> ProposalHead {
         self.proposal_head
+    }
+
+    /// The same option with its rounds under `draft_rule`, the drafter
+    /// sampling by `drafter_sampling` where the rule draws.
+    pub fn with_draft_rule(self, draft_rule: DraftRule, drafter_sampling: DrafterSampling) -> Self {
+        Self {
+            draft_rule,
+            drafter_sampling,
+            ..self
+        }
+    }
+
+    pub fn draft_rule(&self) -> DraftRule {
+        self.draft_rule
+    }
+
+    pub fn drafter_sampling(&self) -> DrafterSampling {
+        self.drafter_sampling
     }
 
     pub fn backend(&self) -> SpeculativeBackend {
@@ -423,7 +525,10 @@ impl Speculation {
     /// drafter's forward activations and the round's context append, each
     /// rounded to the arena's alignment (the top-k's row-split partials
     /// excepted, added as the leaf adds them), plus the fixed allowance for
-    /// the vendored workspaces the forward calls into.
+    /// the vendored workspaces the forward calls into. Under
+    /// [`DraftRule::Sampled`], also the drafter's distribution kept from the
+    /// draw to the accept: each draft column's candidate ids and their
+    /// probabilities (GitHub #576, `dflash2_draw_bytes`).
     pub fn round_scratch_bytes(&self, decode_lanes: u32) -> u64 {
         match self.backend {
             // The fake drafter proposes from the host: nothing to reserve
@@ -470,7 +575,11 @@ impl Speculation {
 
                 let features = DFLASH2_FEATURE_TAPS * HIDDEN * columns * 2;
                 let append_counts = lanes * 4;
-                features + append_counts + forward.max(append) + DFLASH2_ROUND_WORKSPACE_BYTES
+                let draws = match self.draft_rule {
+                    DraftRule::Fixed => 0,
+                    DraftRule::Sampled => 2 * DFLASH2_SELECTOR_TOP_K * drafts * 4,
+                };
+                features + append_counts + draws + forward.max(append) + DFLASH2_ROUND_WORKSPACE_BYTES
             }
         }
     }
@@ -733,5 +842,45 @@ mod tests {
             assert!((5_559_300 - 1024..=5_559_300).contains(&step), "lane {lanes} adds {step}");
         }
         assert_eq!(spec.round_scratch_bytes(crate::N_DECODE_LANES as u32), 78_027_552);
+    }
+
+    /// GitHub #576 (ADR 0090): the fixed draft is the default, the drafter
+    /// samples at 0.9 x T and top-p 0.95, and both spellings cross the ABI
+    /// as `enum ignis_draft_rule`.
+    #[test]
+    fn the_draft_rule_is_fixed_unless_the_sampled_draft_is_named() {
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
+        assert_eq!(spec.draft_rule(), DraftRule::Fixed);
+        assert_eq!(spec.drafter_sampling(), DrafterSampling { temperature_factor_milli: 900, top_p_milli: 950 });
+        assert_eq!((spec.drafter_sampling().temperature_factor(), spec.drafter_sampling().top_p()), (0.9, 0.95));
+        for (raw, rule, code) in [("fixed", DraftRule::Fixed, 0), ("sampled", DraftRule::Sampled, 1)] {
+            assert_eq!(DraftRule::parse(raw), Ok(rule));
+            assert_eq!((rule.as_str(), rule.abi_code()), (raw, code));
+        }
+        assert_eq!(DraftRule::NAMES, ["fixed", "sampled"]);
+        let err = DraftRule::parse("coupled").unwrap_err();
+        assert!(err.contains("`coupled`") && err.contains("fixed or sampled"), "{err}");
+        let drafter = DrafterSampling { temperature_factor_milli: 750, top_p_milli: 1000 };
+        let sampled = spec.with_draft_rule(DraftRule::Sampled, drafter);
+        assert_eq!((sampled.draft_rule(), sampled.drafter_sampling()), (DraftRule::Sampled, drafter));
+        assert_eq!((sampled.backend(), sampled.draft_tokens(), sampled.proposal_head()), (spec.backend(), 7, spec.proposal_head()));
+    }
+
+    /// GitHub #576: under the sampled draft the drafter's round line also
+    /// holds q from the draw to the accept, the 16 candidates' ids and
+    /// probabilities of every draft column (`dflash2_draw_bytes`); no drafter,
+    /// nothing.
+    #[test]
+    fn the_sampled_draft_keeps_the_drafters_distribution_on_the_round_line() {
+        let fixed = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
+        let sampled = fixed.with_draft_rule(DraftRule::Sampled, DrafterSampling::default());
+        // 2 buffers x 16 candidates x 7 columns x 4 bytes = 896 per lane.
+        for lanes in 1..=8u32 {
+            assert_eq!(sampled.round_scratch_bytes(lanes) - fixed.round_scratch_bytes(lanes), 896 * u64::from(lanes));
+        }
+        for backend in [SpeculativeBackend::VerifyOnly, SpeculativeBackend::Mtp] {
+            let spec = Speculation::new(backend, 7).unwrap().with_draft_rule(DraftRule::Sampled, DrafterSampling::default());
+            assert_eq!(spec.round_scratch_bytes(8), 0, "{}: no drafter, no draws", backend.as_str());
+        }
     }
 }

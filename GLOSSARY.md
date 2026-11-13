@@ -1127,6 +1127,21 @@ pass that verifies them, or a fake drafter in the substrate's own tests
 (`verify-only` load: the verify substrate with nothing bound, the drafts passed
 per call).
 
+**Draft rule**:
+How a **verify round**'s sampling lanes draft and accept (`--spec-draft-rule`,
+the 27B's, ADR 0090): the **fixed draft**, the selector walk's one draft per
+column taken with the target's probability of it (the vendored accept), or
+the **sampled draft**. Greedy lanes draft and accept the same way under both.
+
+**Sampled draft**:
+The **draft rule** under which a sampling lane draws each draft from the
+drafter's distribution q over the column's 16 candidates (the selector's
+transition scores at the lane's temperature times a factor, cut by a top-p),
+and the accept takes it with probability min(1, p/q), drawing from
+max(p − q, 0) on a refusal: the rule of speculative sampling, so the text keeps
+the target's distribution whatever q is. Its host reference is
+`ignis_core::sampled_draft`, its kernels the leaf's own.
+
 **Teacher-forced round**:
 A **verify round** whose accept verdict is a recorded text's instead of the
 target's draw (GitHub #267; test-only, the decode options' `forced_tokens`,

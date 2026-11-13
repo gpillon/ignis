@@ -226,6 +226,7 @@ use ignis_core::compute::ModelFamily;
 /// neither moved (finding 2026-10-09-vram-headroom-wddm-paging).
 pub const DEFAULT_VRAM_HEADROOM_BYTES: u64 = 1536 * 1024 * 1024;
 pub use ignis_core::{MAX_DRAFT_TOKENS, ProposalHead, ProposalHeadSetting, Speculation, SpeculativeBackend};
+use ignis_core::DrafterSampling;
 use ignis_core::speculation::FLASH_NEXT_DEFAULT_DRAFT_TOKENS;
 
 pub use ignis_core::{MAX_YARN_FACTOR, RopeScaling};
@@ -1659,6 +1660,9 @@ fn derive_diarizer(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> Str
 /// ignored; `off` refuses them too. `dflash2` requires its window — there is
 /// no default to guess — while `mtp` has a measured one. The MTP head
 /// proposes from its own logits: there is no second head to choose.
+/// GitHub #576 (ADR 0090): `--spec-draft-rule` and the drafter's two
+/// settings ride the speculation the same way; Flash-Next refuses them by
+/// their scope (the 27B's alone) before this runs.
 fn derive_speculation(
     resolution: &Resolution,
     spelled: &impl Fn(&str, &str) -> String,
@@ -1668,9 +1672,19 @@ fn derive_speculation(
     let shown = |name: &str, value: String| format!("`{} {value}`", spelled("spec", name));
     let draft_tokens = s.draft_tokens.filter(|_| named("draft_tokens"));
     let draft_head = s.draft_head.filter(|_| named("draft_head"));
+    // GitHub #576: the draft rule and the drafter's settings, where named.
+    let rule_options = [
+        ("draft_rule", Some(s.draft_rule.as_str().to_owned())),
+        ("drafter_temperature_factor", Some(decimal_text(s.drafter_temperature_factor))),
+        ("drafter_top_p", Some(decimal_text(s.drafter_top_p))),
+    ]
+    .map(|(name, value)| (name, value.filter(|_| named(name))));
     let backend = match s.backend {
         Some(SpecChoice::Off) => {
-            for (name, value) in [("draft_tokens", draft_tokens.map(|n| n.to_string())), ("draft_head", draft_head.map(|h| h.as_str().to_owned()))] {
+            for (name, value) in [("draft_tokens", draft_tokens.map(|n| n.to_string())), ("draft_head", draft_head.map(|h| h.as_str().to_owned()))]
+                .into_iter()
+                .chain(rule_options.clone())
+            {
                 if let Some(value) = value {
                     return Err(ConfigError(format!(
                         "{} has nothing to configure under `--spec-backend off`",
@@ -1681,7 +1695,10 @@ fn derive_speculation(
             return Ok((None, true));
         }
         None => {
-            for (name, value) in [("draft_head", draft_head.map(|h| h.as_str().to_owned())), ("draft_tokens", draft_tokens.map(|n| n.to_string()))] {
+            for (name, value) in [("draft_head", draft_head.map(|h| h.as_str().to_owned())), ("draft_tokens", draft_tokens.map(|n| n.to_string()))]
+                .into_iter()
+                .chain(rule_options.clone())
+            {
                 if let Some(value) = value {
                     return Err(ConfigError(format!(
                         "{} requires `--spec-backend` (speculation is off without it)",
@@ -1716,7 +1733,16 @@ fn derive_speculation(
     };
     let speculation = Speculation::new(backend, tokens)
         .map_err(|_| ConfigError(format!("`{}` must be in 1..={MAX_DRAFT_TOKENS}, got {tokens}", spelled("spec", "draft_tokens"))))?;
-    Ok((Some(speculation.with_proposal_head(head)), false))
+    let drafter = DrafterSampling {
+        temperature_factor_milli: s.drafter_temperature_factor,
+        top_p_milli: s.drafter_top_p,
+    };
+    Ok((Some(speculation.with_proposal_head(head).with_draft_rule(s.draft_rule, drafter)), false))
+}
+
+/// A decimal field's value as its flag would spell it (thousandths to `0.9`).
+fn decimal_text(thousandths: u32) -> String {
+    (f64::from(thousandths) / 1000.0).to_string()
 }
 
 /// `--vision-enabled`, `--vision-max-tokens`,
@@ -1911,7 +1937,7 @@ fn fit_family(
         }
         *fitted.speculation = None;
         fitted.dropped.push(schema::field("spec", "backend").expect("declared").flag());
-        for name in ["draft_tokens", "draft_head"] {
+        for name in ["draft_tokens", "draft_head", "draft_rule", "drafter_temperature_factor", "drafter_top_p"] {
             if resolution.explicit("spec", name) {
                 fitted.dropped.push(schema::field("spec", name).expect("declared").flag());
             }

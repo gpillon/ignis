@@ -566,6 +566,18 @@ target_include_directories(ignis_kernel_permit_mask_bits_test
 target_link_libraries(ignis_kernel_permit_mask_bits_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_permit_mask_bits_test COMMAND ignis_kernel_permit_mask_bits_test)
 
+# GitHub #576 (spec #574, ADR 0090): OURS -- the sampled draft's kernels
+# (kernel/src/sampled_draft.h, leaf-internal): the drafter's distribution, the
+# draft's draw, and the accept, whose target distribution is the vendored
+# sampler builder's bit for bit and whose greedy lanes and extent-0 lanes write
+# the vendored accept's outputs. Links ignis_kernel for ours and ignis_vendor
+# for the oracles. Not sm120a-only: the rule runs on every generation the 27B
+# does. No SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_sampled_draft_test test_sampled_draft.cu)
+target_include_directories(ignis_kernel_sampled_draft_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_sampled_draft_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_sampled_draft_test COMMAND ignis_kernel_sampled_draft_test)
+
 # GitHub #507: OURS, an adapted op -- the GDN prefill's split conv (kernel/src/gdn_conv_split.h,
 # leaf-internal) against what the layer body ran before it, the vendored causal conv and the three
 # strided copies that split its plane, at every form the vendored wrapper switches between and the

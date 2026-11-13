@@ -51,7 +51,7 @@
 //! rule governs where a checkpoint is cut.
 
 use crate::kv_format::KvFormat;
-use crate::speculation::Speculation;
+use crate::speculation::{DraftRule, DrafterSampling, Speculation};
 use crate::types::TokenId;
 use crate::vision::MediaItem;
 
@@ -138,7 +138,9 @@ pub struct BlobIdentity {
     /// The drafter bound at load: its backend and its draft window, or `None`
     /// for a load with no drafter. Both halves matter — a blob taken on a pool
     /// with per-slot drafter sections cannot be written into one without them,
-    /// and a different window is a different section.
+    /// and a different window is a different section. The rounds' draft rule
+    /// is not part of it (GitHub #576): it decides how a round drafts and
+    /// accepts, and leaves the state a round writes as it was.
     pub drafter: Option<Speculation>,
 }
 
@@ -176,7 +178,7 @@ impl BlobIdentity {
             artifact,
             kv_format,
             layout_version,
-            drafter,
+            drafter: drafter.map(|spec| spec.with_draft_rule(DraftRule::Fixed, DrafterSampling::default())),
         }
     }
 
@@ -993,6 +995,21 @@ mod tests {
             refused.expected.contains('4') && refused.found.contains('6'),
             "the refusal spells both windows: {refused}"
         );
+    }
+
+    /// GitHub #576: the draft rule decides how a round drafts and accepts, not
+    /// what state it leaves, so a blob taken under one rule restores under the
+    /// other.
+    #[test]
+    fn a_blob_from_another_draft_rule_is_accepted() {
+        let sampled = dflash2(7).with_draft_rule(
+            DraftRule::Sampled,
+            DrafterSampling { temperature_factor_milli: 500, top_p_milli: 1000 },
+        );
+        let fixed = BlobIdentity::of_load(artifact(1), KvFormat::HqE8_2b, Some(dflash2(7)), 2);
+        let other = BlobIdentity::of_load(artifact(1), KvFormat::HqE8_2b, Some(sampled), 2);
+        assert_eq!(fixed.accepts(&other), Ok(()));
+        assert_eq!(other.accepts(&fixed), Ok(()));
     }
 
     #[test]

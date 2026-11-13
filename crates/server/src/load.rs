@@ -692,15 +692,7 @@ fn cuda_scheduler_for(
         // GitHub #336: the 27B's are a load setting too.
         decode_lanes = shape.decode_lanes_for(family),
         kv_format = shape.kv_format.as_str(),
-        speculation = %shape.speculation.map_or_else(
-            || "off".to_owned(),
-            |s| format!(
-                "{} draft_tokens={} draft_head={}",
-                s.backend().as_str(),
-                s.draft_tokens(),
-                s.proposal_head().as_str()
-            )
-        ),
+        speculation = %speculation_text(shape.speculation),
         vision = %shape.vision.map_or_else(
             || "off".to_owned(),
             |v| format!("max_tokens={} item_max_tokens={}", v.max_tokens(), v.item_max_tokens())
@@ -712,6 +704,29 @@ fn cuda_scheduler_for(
         "model loaded on the GPU"
     );
     Ok((Box::new(scheduler), reserved, shape, crate::adaptation::steps_text(&adapted)))
+}
+
+/// A load's speculation as `ignis.model.loaded` spells it: the backend, the
+/// draft window and the proposal head, then (GitHub #576, ADR 0090) the
+/// draft rule and the drafter's two settings, which a report of what was
+/// measured names; `off` without one.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn speculation_text(speculation: Option<ignis_core::Speculation>) -> String {
+    speculation.map_or_else(
+        || "off".to_owned(),
+        |s| {
+            let drafter = s.drafter_sampling();
+            format!(
+                "{} draft_tokens={} draft_head={} draft_rule={} drafter_temperature_factor={} drafter_top_p={}",
+                s.backend().as_str(),
+                s.draft_tokens(),
+                s.proposal_head().as_str(),
+                s.draft_rule().as_str(),
+                f64::from(drafter.temperature_factor_milli) / 1000.0,
+                f64::from(drafter.top_p_milli) / 1000.0
+            )
+        },
+    )
 }
 
 #[cfg(all(test, not(feature = "cuda")))]
@@ -982,5 +997,23 @@ mod tests {
         let Some(LoadError::VisionCompanion(elsewhere)) = refusal(true, &main.path) else { panic!("refused for its pin") };
         let elsewhere = elsewhere.to_string();
         assert!(elsewhere.contains(VISION_ARTIFACT_FILE_NAME) && elsewhere.contains("pair.main.content_hash is 00"), "{elsewhere}");
+    }
+
+    /// GitHub #576: the load's log names the draft rule and the drafter's
+    /// settings after what it named before, whichever rule runs.
+    #[test]
+    fn the_load_log_names_the_draft_rule_and_the_drafter_settings() {
+        use ignis_core::{DraftRule, DrafterSampling, Speculation, SpeculativeBackend};
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
+        assert_eq!(
+            speculation_text(Some(spec)),
+            "dflash2 draft_tokens=7 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
+        );
+        let sampled = spec.with_draft_rule(DraftRule::Sampled, DrafterSampling { temperature_factor_milli: 1000, top_p_milli: 875 });
+        assert_eq!(
+            speculation_text(Some(sampled)),
+            "dflash2 draft_tokens=7 draft_head=full draft_rule=sampled drafter_temperature_factor=1 drafter_top_p=0.875"
+        );
+        assert_eq!(speculation_text(None), "off");
     }
 }

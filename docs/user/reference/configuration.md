@@ -1040,6 +1040,48 @@ The decode lanes: the sequences a model decodes at once. On the 27B each lane re
 
 The drafter's proposal head: `full` (the target's output head), `shortlist` (the artifact's Q4 head over the 131,072 most frequent tokens, ~357 MB more VRAM) or `auto` (`full` on every card class: the shortlist frees no VRAM and measured slower). Needs a backend; `mtp` has only `full`. Unset, `full`.
 
+### `spec.draft_rule`
+
+| | |
+|---|---|
+| Flag | `--spec-draft-rule` |
+| Env var | `IGNIS_SPEC_DRAFT_RULE` |
+| Kind | `draft rule` |
+| Default | `fixed` |
+| Rule | one of fixed, sampled |
+| Models | Qwen3.8-27B |
+| `/v1/config` | shown by `GET`, patchable, with a model reload |
+
+How the 27B's DFlash2 rounds draft and accept for a request that samples (ADR 0090): `fixed`, the drafter's single best draft taken with the target's probability of it, or `sampled`, a draft drawn from the drafter's own distribution and taken by the ratio of the two distributions. Both keep the text distributed as the model's sampler draws it; a seed's text differs between them. Greedy requests draft and accept the same way under either. Needs `dflash2`.
+
+### `spec.drafter_temperature_factor`
+
+| | |
+|---|---|
+| Flag | `--spec-drafter-temperature-factor` |
+| Env var | `IGNIS_SPEC_DRAFTER_TEMPERATURE_FACTOR` |
+| Kind | `number` |
+| Default | `0.9` |
+| Rule | 0..=4 |
+| Models | Qwen3.8-27B |
+| `/v1/config` | shown by `GET`, patchable, with a model reload |
+
+Under `sampled`, the drafter's temperature as a factor of the request's: a request at temperature T drafts at this times T, so the draft sharpens as the request does. A speed setting only.
+
+### `spec.drafter_top_p`
+
+| | |
+|---|---|
+| Flag | `--spec-drafter-top-p` |
+| Env var | `IGNIS_SPEC_DRAFTER_TOP_P` |
+| Kind | `number` |
+| Default | `0.95` |
+| Rule | 0..=1 |
+| Models | Qwen3.8-27B |
+| `/v1/config` | shown by `GET`, patchable, with a model reload |
+
+Under `sampled`, the drafter's top-p over its candidates: the smallest set of them holding this share of its probability. A speed setting only.
+
 ## vision
 
 ### `vision.enabled`

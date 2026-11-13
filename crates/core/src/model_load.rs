@@ -120,6 +120,15 @@ pub(crate) mod ffi {
         /// fused prefill, 1 = the dense prefill (GitHub #509; the NVFP4 body
         /// refuses it). Flash-Next takes 0.
         pub prefill_linear: u32,
+        /// GitHub #576 (ADR 0090): the verify round's draft rule,
+        /// [`crate::speculation::DraftRule::abi_code`]: 0 = the fixed draft,
+        /// 1 = the sampled draft, which needs a draft window and which
+        /// Flash-Next refuses.
+        pub draft_rule: u32,
+        /// Read under the sampled draft only: the drafter's temperature as a
+        /// factor of the lane's, and its top-p.
+        pub drafter_temperature_factor: f32,
+        pub drafter_top_p: f32,
     }
 
     /// 1:1 with `struct ignis_moe_slot` (`kernel/include/ignis_moe.h`): an
@@ -456,6 +465,11 @@ fn load_options(
             prefill_attention: prefill_attention.abi_code(),
             vision_residency: vision.map_or(0, |v| v.residency().abi_code()),
             prefill_linear: prefill_linear.abi_code(),
+            // GitHub #576: the fixed draft crosses as 0 with its settings
+            // beside it, which the leaf reads under the sampled draft only.
+            draft_rule: speculation.map_or(0, |s| s.draft_rule().abi_code()),
+            drafter_temperature_factor: speculation.map_or(0.0, |s| s.drafter_sampling().temperature_factor()),
+            drafter_top_p: speculation.map_or(1.0, |s| s.drafter_sampling().top_p()),
         }
     })
 }
@@ -1085,6 +1099,10 @@ fn flash_next_options(
         prefill_attention: PrefillAttention::default().abi_code(),
         vision_residency: vision.map_or(0, |v| v.residency().abi_code()),
         prefill_linear: PrefillLinear::default().abi_code(),
+        // GitHub #576: Flash-Next's MTP keeps its own rule.
+        draft_rule: 0,
+        drafter_temperature_factor: 0.0,
+        drafter_top_p: 1.0,
     }
 }
 
@@ -1646,6 +1664,22 @@ mod tests {
         assert_eq!(text.vision_item_max_tokens, 0, "no vision, no item bound");
     }
 
+    /// GitHub #576: a speculation's draft rule and its drafter settings
+    /// cross beside its backend; the fixed draft is 0.
+    #[test]
+    fn the_draft_rule_and_the_drafters_settings_cross_with_the_speculation() {
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
+        let fixed = load_options(Some(spec), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+            .expect("options");
+        assert_eq!((fixed.draft_rule, fixed.drafter_temperature_factor, fixed.drafter_top_p), (0, 0.9, 0.95));
+        let drafter = crate::speculation::DrafterSampling { temperature_factor_milli: 1250, top_p_milli: 800 };
+        let sampled = spec.with_draft_rule(crate::speculation::DraftRule::Sampled, drafter);
+        let options = load_options(Some(sampled), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+            .expect("options");
+        assert_eq!((options.draft_rule, options.drafter_temperature_factor, options.drafter_top_p), (1, 1.25, 0.8));
+        assert_eq!(options.speculative_backend, 1);
+    }
+
     #[test]
     fn the_prefill_linear_and_the_integer_band_cross_as_their_abi_codes() {
         let dense = load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::Int8, LANES).expect("options");
@@ -1726,8 +1760,13 @@ mod tests {
         // the size did not move again.
         // GitHub #505: then the uint32 prefill linear, appended at the end and
         // padded to the pointer's alignment.
-        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 96);
+        // GitHub #576: then the uint32 draft rule, in that padding, and the
+        // drafter's two float settings, appended at the end.
+        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 104);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, prefill_linear), 88);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, draft_rule), 92);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, drafter_temperature_factor), 96);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, drafter_top_p), 100);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, prefill_attention), 80);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, vision_residency), 84);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, decode_lanes), 48);

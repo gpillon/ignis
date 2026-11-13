@@ -580,6 +580,17 @@ int main() {
     const std::string qsa = plan(&fp16);
     check(qsa.find("prefill_attention is the 27B's") != std::string::npos,
           "an FP16 prefill attention on a Flash-Next load is refused by name: got \"" + qsa + "\"");
+    // GitHub #576 (ADR 0090): the sampled draft is the 27B's; Flash-Next's MTP keeps its own rule.
+    ignis_model_load_options sampled{};
+    sampled.size = sizeof(sampled);
+    sampled.speculative_backend = IGNIS_SPECULATIVE_MTP;
+    sampled.draft_tokens = 2;
+    sampled.draft_rule = IGNIS_DRAFT_RULE_SAMPLED;
+    sampled.drafter_temperature_factor = 0.9f;
+    sampled.drafter_top_p = 0.95f;
+    const std::string rule = plan(&sampled);
+    check(rule.find("draft_rule is the 27B's") != std::string::npos,
+          "the sampled draft on a Flash-Next load is refused by name: got \"" + rule + "\"");
     // GitHub #307 (spec flash-next/07): Flash-Next drafts with its MTP head; the 27B's drafter is
     // refused by name, and so is a row budget no verify round fits.
     ignis_model_load_options dflash2{};

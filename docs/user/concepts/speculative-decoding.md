@@ -1,6 +1,6 @@
 ---
 title: "Speculative decoding"
-description: "How DFlash2 and Flash-Next's MTP head draft tokens that the model then verifies, what acceptance means, how the row budget is shared across lanes, and why MTP is off on the RTX 5090."
+description: "How DFlash2 and Flash-Next's MTP head draft tokens that the model then verifies, what acceptance means, how a draft is accepted under sampling, how the row budget is shared across lanes, and why MTP is off on the RTX 5090."
 sidebar:
   order: 5
 ---
@@ -25,7 +25,9 @@ A speculative **verify round** replaces the plain decode round
    lane) through the model's layers once.
 4. For each lane, the longest run of drafts that the model itself would have
    chosen is accepted, plus the model's own token after it. That run is the
-   lane's **committed run**, between 1 and `k + 1` tokens.
+   lane's **committed run**, between 1 and `k + 1` tokens. A request that
+   samples accepts its drafts by chance instead
+   ([acceptance under sampling](#acceptance-under-sampling)).
 5. The state moves forward by exactly the committed run. The attention layers
    keep the keys of every column; the recurrent layers record what each column
    would do and replay only the committed prefix, so a rejected draft leaves no
@@ -40,6 +42,41 @@ The server streams a committed run one token at a time, so a client sees no
 difference in shape. The first round after a prompt has the first token as its
 anchor, which the server already sent when the prefill ended, so that round
 sends only the drafts it accepted, between 0 and `k` tokens.
+
+## Acceptance under sampling
+
+A greedy request accepts a draft when it is the model's own top token. A
+request that samples has no single token the model would have chosen: its
+sampler draws from a distribution, the model's probabilities after the
+request's temperature, top-k, top-p and penalties. So the round takes a draft
+by chance, in a way that leaves every token the lane emits distributed exactly
+as the sampler would have drawn it, whatever the drafter proposed.
+
+- **The fixed draft** (`--spec-draft-rule fixed`, the default). The drafter
+  proposes its single best token d, and the round takes it with the model's
+  probability of it, p(d). When it refuses, the lane's token is drawn from the
+  model's distribution without d, and the run ends there. Even a drafter that
+  always proposed the model's most likely token would see it refused whenever
+  the sampler picks another one: on recorded agent turns at temperature 1, 18
+  percent of first drafts.
+- **The sampled draft** (`--spec-draft-rule sampled`, from 0.11.0, the 27B
+  only). The drafter draws d from its own distribution q over its 16
+  candidates, at 0.9 times the request's temperature and top-p 0.95, and the
+  round takes it with probability min(1, p(d)/q(d)). When it refuses, the
+  lane's token is drawn from what the model's distribution has left over the
+  drafter's, max(p − q, 0). This is the standard rule of speculative sampling:
+  whatever q is, the emitted token is distributed as p, so the drafter's two
+  settings move only how often a draft is taken. Where the drafter's
+  distribution is close to the model's, it takes drafts the fixed draft would
+  refuse. The reasons it is ignis's own code and not the vendored accept are
+  in [ADR 0090](../../adr/0090-the-27bs-sampled-lanes-draw-their-drafts-and-take-them-by-an-accept-of-ignis-s-own.md).
+
+A greedy request drafts and accepts the same way under both rules, so its text
+does not change. A sampled request's text keeps its distribution under both,
+but not its draws: a fixed seed reproduces a lane's text on one build, and
+under `sampled` that text is not the one the same seed gives under `fixed`, or
+gave in an earlier release. Neither rule changes what a stop sequence, the
+reasoning budget or a JSON schema does to the run the round commits.
 
 ## DFlash2, for the 27B
 
@@ -145,8 +182,10 @@ turns, four agents generated 1.21 times the tokens and eight 1.05 times
 
 ## Where the knobs are
 
-`--spec-backend`, `--spec-draft-tokens`, `--spec-draft-rows` and
-`--spec-draft-head` are in [context, KV and speculation](../configuration/context-and-speculation.md);
+`--spec-backend`, `--spec-draft-tokens`, `--spec-draft-rows`,
+`--spec-draft-head`, `--spec-draft-rule` and the sampled draft's
+`--spec-drafter-temperature-factor` and `--spec-drafter-top-p` are in
+[context, KV and speculation](../configuration/context-and-speculation.md);
 the choice of when to turn Flash-Next's MTP on is worked through in
 [Flash-Next speculation](../configuration/flash-next-mtp.md). The profiles set
 them per card ([profiles](profiles.md)).

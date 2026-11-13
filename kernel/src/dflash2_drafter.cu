@@ -2,6 +2,7 @@
 // verify round -- see kernel/src/dflash2_drafter.h for the contract.
 
 #include "dflash2_drafter.h"
+#include "sampled_draft.h"
 #include "trellis_body.h"
 
 #include "ignis_dflash2_topk.h"
@@ -302,6 +303,19 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, std::uint32
                                        scores, stream);
   ninfer::Tensor drafts(verify.drafts->p, ninfer::DType::I32, {k, batch, 1, 1});
   ninfer::ops::dflash2_selector_walk(scores, candidates, drafts, stream);
+  // GitHub #576 (ADR 0090): under the sampled draft each sampling lane draws
+  // its drafts from the drafter's distribution over the same lattice instead,
+  // and keeps that distribution for the round's accept; a greedy lane keeps
+  // the walk's. The proposal readout reads the walk's drafts, so it draws
+  // nothing.
+  if (verify.sampled_draft && readout == nullptr) {
+    ignis_sampled_draft_draw(scores, candidates,
+                             static_cast<const ninfer::ops::SamplingConfig *>(model->sampling_decode_configs->p),
+                             static_cast<const std::int32_t *>(verify.base_positions->p),
+                             verify.drafter_temperature_factor, verify.drafter_top_p, drafts,
+                             static_cast<std::int32_t *>(verify.draft_candidates->p),
+                             static_cast<float *>(verify.draft_q->p), stream);
+  }
 
   // GitHub #267: the measurement's readout, device to host on this stream.
   // Every tensor is contiguous with the lane outermost, so each is one copy.

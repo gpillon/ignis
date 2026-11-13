@@ -19,6 +19,7 @@
 #include "ignis_gqa_layer.h"
 #include "layer_internal.h"
 #include "model_internal.h"
+#include "sampled_draft.h"
 #include "trellis_body.h"
 #include "flash_next/program.h"
 
@@ -260,11 +261,24 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
     ninfer::Tensor licensed_counts(verify.licensed_counts->p, ninfer::DType::I32, {batch, 1, 1, 1});
     ninfer::Tensor accepted(verify.accepted->p, ninfer::DType::I32, {batch, 1, 1, 1});
     ninfer::DeviceArena::Scope accept_scope = verify.accept_workspace->scope();
-    ninfer::ops::speculative_accept_greedy_drafts(
-        targets_rows, logits_rows, drafts, extents, lengths, anchors_out, licensed_tokens,
-        licensed_counts, accepted, vocab,
-        static_cast<const ninfer::ops::SamplingConfig *>(model->sampling_decode_configs->p),
-        *verify.accept_workspace, model->stream);
+    const auto *configs = static_cast<const ninfer::ops::SamplingConfig *>(model->sampling_decode_configs->p);
+    if (verify.sampled_draft) {
+      // GitHub #576 (ADR 0090): under the sampled draft the accept is ours
+      // -- the sampling lanes take their drafts by the ratio of p to the q
+      // their draw kept (one-hot on a verify-only load's drafts), the greedy
+      // lanes by today's rule -- with the vendored accept's outputs.
+      ignis_sampled_accept(targets_rows, logits_rows, drafts, extents, lengths, anchors_out, licensed_tokens,
+                           licensed_counts, accepted, vocab, configs,
+                           verify.draft_candidates != nullptr
+                               ? static_cast<const std::int32_t *>(verify.draft_candidates->p)
+                               : nullptr,
+                           verify.draft_q != nullptr ? static_cast<const float *>(verify.draft_q->p) : nullptr,
+                           *verify.accept_workspace, model->stream);
+    } else {
+      ninfer::ops::speculative_accept_greedy_drafts(targets_rows, logits_rows, drafts, extents, lengths,
+                                                    anchors_out, licensed_tokens, licensed_counts, accepted,
+                                                    vocab, configs, *verify.accept_workspace, model->stream);
+    }
     return 0;
   } catch (const std::exception &e) {
     set_error("ignis_verify_graph: width " + std::to_string(width) + ": " + e.what());

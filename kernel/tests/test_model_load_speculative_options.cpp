@@ -26,11 +26,14 @@
 #include "ignis_model.h"
 #include "ignis_seq.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -223,6 +226,53 @@ int main() {
     fused.prefill_linear = IGNIS_PREFILL_LINEAR_FUSED;
     const std::string f = load_error({}, &fused);
     check(contains(f, "text/token_embedding"), "the fused prefill reaches the binding: " + f);
+  }
+  // GitHub #576 (ADR 0090): the draft rule needs a window, an unknown rule is
+  // refused by value, and the sampled draft's two drafter settings are
+  // refused when the draw cannot use them -- read only under that rule, so a
+  // fixed draft with them zeroed reaches the binding, as does a sampled one
+  // under either windowed backend.
+  {
+    ignis_model_load_options unknown = dflash2(7);
+    unknown.draft_rule = 2;
+    const std::string u = load_error({}, &unknown);
+    check(contains(u, "draft_rule 2"), "an unknown draft_rule is refused by value: " + u);
+    ignis_model_load_options windowless{};
+    windowless.size = sizeof(windowless);
+    windowless.draft_rule = IGNIS_DRAFT_RULE_SAMPLED;
+    windowless.drafter_temperature_factor = 0.9f;
+    windowless.drafter_top_p = 0.95f;
+    const std::string w = load_error({}, &windowless);
+    check(contains(w, "draft_rule 1") && contains(w, "draft window"),
+          "the sampled draft without a window is refused: " + w);
+    for (const auto &[factor, top_p, named] :
+         {std::tuple{-0.5f, 0.95f, "drafter_temperature_factor"}, std::tuple{0.9f, 1.5f, "drafter_top_p"},
+          std::tuple{0.9f, -0.1f, "drafter_top_p"}, std::tuple{NAN, 0.95f, "drafter_temperature_factor"},
+          std::tuple{0.9f, INFINITY, "drafter_top_p"}}) {
+      ignis_model_load_options bad = dflash2(7);
+      bad.draft_rule = IGNIS_DRAFT_RULE_SAMPLED;
+      bad.drafter_temperature_factor = factor;
+      bad.drafter_top_p = top_p;
+      const std::string m = load_error({}, &bad);
+      check(contains(m, named), std::string("a sampled draft's unusable ") + named + " is refused: " + m);
+    }
+    ignis_model_load_options fixed = dflash2(7);
+    fixed.draft_rule = IGNIS_DRAFT_RULE_FIXED;
+    const std::string f = load_error({}, &fixed);
+    check(contains(f, "text/token_embedding"), "the fixed draft with its settings zeroed reaches the binding: " + f);
+    for (const int32_t backend : {static_cast<int32_t>(IGNIS_SPECULATIVE_DFLASH2),
+                                  static_cast<int32_t>(IGNIS_SPECULATIVE_VERIFY_ONLY)}) {
+      for (const auto &[factor, top_p] : {std::pair{0.9f, 0.95f}, std::pair{0.0f, 0.0f}, std::pair{4.0f, 1.0f}}) {
+        ignis_model_load_options sampled = dflash2(7);
+        sampled.speculative_backend = backend;
+        sampled.draft_rule = IGNIS_DRAFT_RULE_SAMPLED;
+        sampled.drafter_temperature_factor = factor;
+        sampled.drafter_top_p = top_p;
+        const std::string m = load_error({}, &sampled);
+        check(contains(m, "text/token_embedding"),
+              "the sampled draft under backend " + std::to_string(backend) + " reaches the binding: " + m);
+      }
+    }
   }
   // The control arm for the checks above: every valid window gets past them
   // and fails on binding instead.

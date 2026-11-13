@@ -48,9 +48,13 @@ void ignis_dflash2_append_context(ignis_model *model, ignis_seq_pool *pool,
 // dynamic conv and sliding-window attention over the lane's window, the
 // target's output head over the `k` draft columns, the per-column top-k and
 // the selector lattice walk -- writing the round's drafts straight into
-// `model->verify->drafts` (`[k, width]`). Reads the round's staged anchors,
-// base positions, valid columns and pool slots; writes nothing but the
-// drafts and its own scratch, so a lane's window is read, never written.
+// `model->verify->drafts` (`[k, width]`). GitHub #576: on a load under the
+// sampled draft, each sampling lane's drafts are drawn from the drafter's
+// distribution over the same lattice instead (`ignis_sampled_draft_draw`),
+// which it keeps in `draft_candidates`/`draft_q` for the accept. Reads the
+// round's staged anchors, base positions, valid columns, sampling configs and
+// pool slots; writes nothing but the drafts, that distribution and its own
+// scratch, so a lane's window is read, never written.
 // Every address is model- or pool-owned and the attention envelope is the
 // load's whole context, so the same call runs eagerly and records into a
 // verify graph.

@@ -553,9 +553,11 @@ fn drop_draft_options_under_off(patch: &mut Layer) -> Result<(), ConfigError> {
         .map(|(_, family, _)| family)
         .collect();
     for family in off {
-        for name in ["draft_tokens", "draft_head"] {
+        for name in ["draft_tokens", "draft_head", "draft_rule", "drafter_temperature_factor", "drafter_top_p"] {
             let meta = schema::field("spec", name).expect("a declared field");
-            if patch.named().any(|(named, scoped)| std::ptr::eq(named, meta) && scoped == family) {
+            // GitHub #576: the draft rule's three have no family scope, so
+            // only a general `off` takes them out.
+            if (family.is_some() && !meta.scoped) || patch.named().any(|(named, scoped)| std::ptr::eq(named, meta) && scoped == family) {
                 continue;
             }
             let spelling = family.map_or_else(|| meta.file_key(), |family| meta.scoped_file_key(family));

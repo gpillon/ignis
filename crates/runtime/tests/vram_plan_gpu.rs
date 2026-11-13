@@ -15,7 +15,7 @@ use std::sync::Arc;
 use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b_with, materialize};
 use ignis_core::gpu_profile;
 use ignis_core::lane_lines::lane_lines;
-use ignis_core::{ExceptionWeights, KvFormat, KvGeometry, N_DECODE_LANES, Speculation, SpeculativeBackend, Vision, VisionResidency, model_load};
+use ignis_core::{DraftRule, DrafterSampling, ExceptionWeights, KvFormat, KvGeometry, N_DECODE_LANES, Speculation, SpeculativeBackend, Vision, VisionResidency, model_load};
 use ignis_runtime::{CudaLeaf, CudaLeafConfig, Model, ReservedBytes};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -459,5 +459,46 @@ fn the_round_lines_follow_the_loads_lanes() {
         let (per_lane, fixed) = (rounds[1] - rounds[0], 2 * rounds[0] - rounds[1]);
         assert!(per_lane.abs_diff(35_000_000) <= 500_000, "{}: the round lines cost {per_lane} B a lane", shape.label);
         assert!(fixed.abs_diff(34_000_000) <= 500_000, "{}: {fixed} B of round lines do not move", shape.label);
+    }
+}
+
+/// GitHub #576 (ADR 0090): under the sampled draft the drafter's line also
+/// holds its distribution from the draw to the accept, on both sides of the
+/// plan: the leaf's plan is the CPU's line at 1, 2 and 8 lanes, the fixed
+/// draft's plus 896 bytes a lane (16 candidates' ids and probabilities at 7
+/// drafts), and no other line moves. Asked of the leaf's plan only, so
+/// nothing here touches the device.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn the_sampled_draft_keeps_its_draws_on_the_drafters_line() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let fixed = Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7");
+    let sampled = fixed.with_draft_rule(DraftRule::Sampled, DrafterSampling::default());
+    let topology = ignis_core::ModelConfig::qwen38_27b();
+    let scope = model_load::model_scope(Some(sampled), None, ExceptionWeights::Bf16);
+    let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
+    let planned = |speculation: Speculation, lanes: u32| {
+        let config = CudaLeafConfig {
+            max_context_tokens: 262_144,
+            kv_format: KvFormat::HqE8_2b,
+            slot_count: lanes,
+            prefill_chunk_tokens: 1024,
+            speculation: Some(speculation),
+            retained_device_slots: 2,
+            retained_host_slots: 16,
+            ..CudaLeafConfig::default()
+        };
+        config.plan_reservations(&reader, &plan, &handles).unwrap_or_else(|e| panic!("plan at {lanes} lanes: {e}")).reserved
+    };
+    for lanes in [1, 2, N_DECODE_LANES as u32] {
+        let (at_fixed, at_sampled) = (planned(fixed, lanes), planned(sampled, lanes));
+        let lines = lane_lines(&topology, KvFormat::HqE8_2b, Some(sampled), false, lanes, 2);
+        assert_eq!(at_sampled.drafter_round, lines.drafter_round, "{lanes} lanes: the leaf's drafter line is the CPU's");
+        assert_eq!(at_sampled.drafter_round - at_fixed.drafter_round, 896 * u64::from(lanes), "{lanes} lanes: the draws");
+        assert_eq!(ReservedBytes { drafter_round: at_fixed.drafter_round, ..at_sampled }, at_fixed, "{lanes} lanes: another line moved");
     }
 }

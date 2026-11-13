@@ -434,6 +434,34 @@ struct ignis_model_load_options {
    * the load. IGNIS_PREFILL_LINEAR_FUSED on Flash-Next and the NVFP4 body.
    * Appended at the end: the struct grew by one padded word. */
   uint32_t prefill_linear;
+  /* enum ignis_draft_rule (GitHub #576, ADR 0090); anything else is refused,
+   * SAMPLED without a draft window, and SAMPLED on Flash-Next, whose MTP
+   * speculation keeps its own rule. In the padding after `prefill_linear`.
+   * Fixed for the life of the load: it decides what the verify graphs
+   * record. */
+  uint32_t draft_rule;
+  /* Read only under IGNIS_DRAFT_RULE_SAMPLED, where both must be finite: the
+   * drafter's temperature as a factor of the lane's (at least 0; 0 drafts
+   * the selector walk's draft), and its top-p (0..1, the sampler's inclusive
+   * cut over the drafter's candidates). Appended at the end: the struct grew
+   * by one word. */
+  float drafter_temperature_factor;
+  float drafter_top_p;
+};
+
+/* GitHub #576 (spec #574, ADR 0090): how a verify round's sampling lanes
+ * draft and accept. A greedy lane drafts the selector walk's draft and
+ * accepts it when the target's argmax agrees under either rule. */
+enum ignis_draft_rule {
+  /* Today's rule: the selector walk's fixed draft, taken with the target's
+   * probability of it (the vendored accept). A zeroed option's rule. */
+  IGNIS_DRAFT_RULE_FIXED = 0,
+  /* The sampled draft: a sampling lane draws each draft from the drafter's
+   * distribution q over its candidates, and the accept takes it with
+   * probability min(1, p/q), drawing from max(p - q, 0) on a refusal. The
+   * text is distributed as the target's sampler draws it, as under the fixed
+   * rule; a seed's text is not the fixed rule's. */
+  IGNIS_DRAFT_RULE_SAMPLED = 1,
 };
 
 /* The widest vision envelope a load accepts, in merged tokens: 4x that many

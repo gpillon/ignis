@@ -31,6 +31,7 @@
 #include "gdn_prefill.h"
 #include "layer_internal.h"
 #include "model_internal.h"
+#include "sampled_draft.h"
 #include "trellis_body.h"
 
 #include "ignis_dflash2_topk.h"
@@ -59,6 +60,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -993,6 +995,14 @@ std::size_t dflash2_round_activation_bytes(const ignis_topology &topology, std::
   return std::max(forward, append);
 }
 
+// GitHub #576: what the sampled draft keeps of the drafter's q from the draw
+// to the accept at window `k` across `lanes`: each draft column's candidate
+// ids (I32) and their probabilities (F32), two buffers of
+// `[kDflash2SelectorTopK, k, lanes]`.
+std::size_t dflash2_draw_bytes(uint32_t window, uint32_t lanes) {
+  return 2 * static_cast<std::size_t>(kDflash2SelectorTopK) * window * lanes * sizeof(std::int32_t);
+}
+
 // GitHub #177: the vision tower's 333 objects, shapes from the reference's
 // `impl/vision/bindings.cpp` and (merger fc2, the 27B's own out width)
 // `qwen3_6_27b/impl/load/bindings.cpp`.
@@ -1118,6 +1128,12 @@ struct LoadOptions {
   uint32_t vision_residency = IGNIS_VISION_RESIDENCY_DEVICE;
   // GitHub #514: the GDN prefill's route (`gdn_prefill_route`).
   bool gdn_prefill_ours = false;
+  // GitHub #576 (ADR 0090): the verify round's draft rule (enum
+  // ignis_draft_rule) and, under the sampled draft, the drafter's
+  // temperature factor and top-p.
+  uint32_t draft_rule = IGNIS_DRAFT_RULE_FIXED;
+  float drafter_temperature_factor = 0.0f;
+  float drafter_top_p = 1.0f;
 };
 
 // GitHub #514: the GDN prefill on our full-rate kernels (kernel/src/gdn_prefill.h)
@@ -1305,6 +1321,9 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   uint32_t prefill_attention = 0;
   uint32_t prefill_linear = IGNIS_PREFILL_LINEAR_FUSED;
   uint32_t vision_residency = IGNIS_VISION_RESIDENCY_DEVICE;
+  uint32_t draft_rule = IGNIS_DRAFT_RULE_FIXED;
+  float drafter_temperature_factor = 0.0f;
+  float drafter_top_p = 1.0f;
   ignis::RopeScaling rope_scaling{};
   if (options != nullptr) {
     if (options->size != sizeof(struct ignis_model_load_options)) {
@@ -1325,6 +1344,9 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     prefill_attention = options->prefill_attention;
     prefill_linear = options->prefill_linear;
     vision_residency = options->vision_residency;
+    draft_rule = options->draft_rule;
+    drafter_temperature_factor = options->drafter_temperature_factor;
+    drafter_top_p = options->drafter_top_p;
   }
   // GitHub #335: a value the leaf does not know is refused rather than run as
   // one of the three.
@@ -1402,6 +1424,35 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
               " must be in 1.." + std::to_string(IGNIS_DFLASH2_MAX_DRAFT_TOKENS));
     return nullptr;
   }
+  // GitHub #576 (ADR 0090): the draft rule decides what a verify round's
+  // sampling lanes draft and accept, so it needs a draft window; the
+  // sampled draft's two drafter settings are read only under it, and a value
+  // the draw cannot use is refused rather than run as some other one.
+  if (draft_rule != IGNIS_DRAFT_RULE_FIXED && draft_rule != IGNIS_DRAFT_RULE_SAMPLED) {
+    set_error("ignis_model_load: draft_rule " + std::to_string(draft_rule) + " is not 0 (fixed) or 1 (sampled)");
+    return nullptr;
+  }
+  if (draft_rule == IGNIS_DRAFT_RULE_SAMPLED) {
+    if (draft_tokens == 0) {
+      set_error("ignis_model_load: draft_rule 1 (sampled) needs a draft window");
+      return nullptr;
+    }
+    if (!std::isfinite(drafter_temperature_factor) || drafter_temperature_factor < 0.0f) {
+      set_error("ignis_model_load: drafter_temperature_factor " + std::to_string(drafter_temperature_factor) +
+                " is not a finite factor of at least 0");
+      return nullptr;
+    }
+    if (!std::isfinite(drafter_top_p) || drafter_top_p < 0.0f || drafter_top_p > 1.0f) {
+      set_error("ignis_model_load: drafter_top_p " + std::to_string(drafter_top_p) + " is not in 0..1");
+      return nullptr;
+    }
+    if (!ignis_sampled_accept_serves(static_cast<std::int32_t>(topology->vocab),
+                                     static_cast<std::int32_t>(draft_tokens))) {
+      set_error("ignis_model_load: draft_rule 1 (sampled) builds the target's distribution on the sampler's "
+                "multi-block route, which a vocabulary of " + std::to_string(topology->vocab) + " does not take");
+      return nullptr;
+    }
+  }
   // GitHub #195: vision and a speculative backend are two independent load
   // options. #178's fence stood until the verify round learned the sequence's
   // `rope_delta` (`IgnisVerifyRound::rope_positions`, staged per round); the
@@ -1422,6 +1473,9 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.prefill_attention = prefill_attention;
   out.vision_residency = vision_residency;
   out.prefill_linear = prefill_linear;
+  out.draft_rule = draft_rule;
+  out.drafter_temperature_factor = drafter_temperature_factor;
+  out.drafter_top_p = drafter_top_p;
   if (!gdn_prefill_route(out.gdn_prefill_ours)) {
     return nullptr;
   }
@@ -1443,6 +1497,10 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     }
     if (prefill_linear != IGNIS_PREFILL_LINEAR_FUSED) {
       set_error("ignis_model_load: prefill_linear is the 27B's; Qwen3.8-Flash-Next has its own prefill");
+      return nullptr;
+    }
+    if (draft_rule != IGNIS_DRAFT_RULE_FIXED) {
+      set_error("ignis_model_load: draft_rule is the 27B's; Qwen3.8-Flash-Next's MTP speculation keeps its own rule");
       return nullptr;
     }
     if (attention_text_max_keys != 0) {
@@ -1663,6 +1721,9 @@ struct LoadSizes {
   std::size_t verify_round = 0;
   std::size_t drafter_features = 0;
   std::size_t drafter_scratch = 0;
+  // GitHub #576: under the sampled draft, the drafter's q kept from the draw
+  // to the accept -- its candidates' ids and probabilities (0 otherwise).
+  std::size_t drafter_draws = 0;
   std::size_t sampling_logits = 0;
   // GitHub #339: the trellis body's one workspace (0 on the NVFP4 body).
   std::size_t trellis_workspace = 0;
@@ -1699,7 +1760,8 @@ struct LoadSizes {
         decode_graph_scratch + (vision ? 3 : 2) * sizeof(int32_t) * lanes;
     out.verify_round_bytes = verify_round;
     out.drafter_round_bytes =
-        drafter_scratch == 0 ? 0 : drafter_features + sizeof(std::int32_t) * lanes + drafter_scratch;
+        drafter_scratch == 0 ? 0
+                             : drafter_features + sizeof(std::int32_t) * lanes + drafter_draws + drafter_scratch;
     out.trellis_workspace_bytes = trellis_workspace;
     out.trellis_dense_bytes = trellis_dense;
     return out;
@@ -1968,6 +2030,9 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
     sizes.drafter_scratch =
         dflash2_round_activation_bytes(topology, static_cast<std::int32_t>(options.draft_tokens), lanes) +
         kDflash2RoundWorkspaceBytes;
+    if (options.draft_rule == IGNIS_DRAFT_RULE_SAMPLED) {
+      sizes.drafter_draws = dflash2_draw_bytes(options.draft_tokens, lanes);
+    }
   }
 
   // GitHub #339: the trellis body's workspace, whose head runs at most a
@@ -2013,6 +2078,7 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
   out.trellis_dense_bytes = bytes(model.trellis_dense_buffer);
   if (model.verify != nullptr) {
     out.drafter_round_bytes = bytes(model.verify->features) + bytes(model.verify->append_counts) +
+                              bytes(model.verify->draft_candidates) + bytes(model.verify->draft_q) +
                               capacity(model.verify->drafter_scratch);
     out.verify_round_bytes = model.verify->device_bytes() - out.drafter_round_bytes;
   }
@@ -2484,6 +2550,18 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   if (draft_tokens > 0) {
     try {
       model->verify = build_verify_round(*topology, draft_tokens, vision_max_tokens > 0, load.decode_lanes);
+      // GitHub #576 (ADR 0090): the round's draft rule. The sampled draft's
+      // accept takes the same workspace the vendored one does.
+      model->verify->sampled_draft = load.draft_rule == IGNIS_DRAFT_RULE_SAMPLED;
+      model->verify->drafter_temperature_factor = load.drafter_temperature_factor;
+      model->verify->drafter_top_p = load.drafter_top_p;
+      if (model->verify->sampled_draft &&
+          ignis_sampled_accept_workspace_bytes(static_cast<std::int32_t>(topology->vocab),
+                                               static_cast<std::int32_t>(draft_tokens),
+                                               static_cast<std::int32_t>(load.decode_lanes)) >
+              model->verify->accept_workspace->capacity()) {
+        throw std::runtime_error("the sampled draft's accept outgrows the accept workspace");
+      }
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: verify round allocation failed: ") + e.what());
       cudaStreamDestroy(model->stream);
@@ -2500,6 +2578,12 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       model->verify->features = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_features);
       model->verify->append_counts = std::make_unique<ninfer::DeviceBuffer>(lanes * sizeof(std::int32_t));
       model->verify->drafter_scratch = std::make_unique<ninfer::DeviceArena>(sizes.drafter_scratch);
+      // GitHub #576: under the sampled draft, the drafter's q from the draw
+      // to the accept, one half of `drafter_draws` each.
+      if (sizes.drafter_draws != 0) {
+        model->verify->draft_candidates = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_draws / 2);
+        model->verify->draft_q = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_draws / 2);
+      }
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: drafter round allocation failed: ") + e.what());
       cudaStreamDestroy(model->stream);

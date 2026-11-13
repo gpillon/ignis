@@ -31,7 +31,7 @@ use std::path::PathBuf;
 
 use ignis_core::compute::ModelFamily;
 use ignis_core::ngram_cache::CacheLocation;
-use ignis_core::{ExceptionWeights, KvFormat, PrefillAttention, PrefillLinear, RopeSetting};
+use ignis_core::{DraftRule, ExceptionWeights, KvFormat, PrefillAttention, PrefillLinear, RopeSetting};
 use serde_json::{Map, Value};
 
 use super::field::{Applicability, Attr, FieldMeta, Validator};
@@ -634,6 +634,24 @@ config_group! {
         /// shortlist frees no VRAM and measured slower). Needs a backend; `mtp`
         /// has only `full`. Unset, `full`.
         draft_head: Opt<DraftHead> = None, Validator::OneOf(&["full", "shortlist", "auto"]), ALL, [Visible, Patchable, ReloadRequired, Scoped];
+        /// How the 27B's DFlash2 rounds draft and accept for a request that
+        /// samples (ADR 0090): `fixed`, the drafter's single best draft taken
+        /// with the target's probability of it, or `sampled`, a draft drawn
+        /// from the drafter's own distribution and taken by the ratio of the
+        /// two distributions. Both keep the text distributed as the model's
+        /// sampler draws it; a seed's text differs between them. Greedy
+        /// requests draft and accept the same way under either. Needs
+        /// `dflash2`.
+        draft_rule: DraftRuleKind = DraftRule::default(), Validator::OneOf(&DraftRule::NAMES), QWEN38_ONLY,
+            [Visible, Patchable, ReloadRequired];
+        /// Under `sampled`, the drafter's temperature as a factor of the
+        /// request's: a request at temperature T drafts at this times T, so
+        /// the draft sharpens as the request does. A speed setting only.
+        drafter_temperature_factor: Decimal = 900, decimal(0.0, 4.0), QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
+        /// Under `sampled`, the drafter's top-p over its candidates: the
+        /// smallest set of them holding this share of its probability. A
+        /// speed setting only.
+        drafter_top_p: Decimal = 950, decimal(0.0, 1.0), QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
     }
 }
 
