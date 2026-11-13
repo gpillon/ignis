@@ -1659,15 +1659,17 @@ pub(crate) fn schema_format<'a>(members: &'a RawValue, at: &str, param: &str) ->
 }
 
 /// What `response_format` asks of a chat completion (GitHub #587, #588,
-/// spec #287, ADR 0089): a free answer, or one held to a grammar. The
-/// prompt need not mention JSON, and nothing is added to it.
+/// spec #287, ADR 0089): a free answer, or one held to a grammar, beside
+/// the request's resolved `tools` and `tool_choice` (#592). The prompt need
+/// not mention JSON, and nothing is added to it.
 pub(crate) fn structured_output(
     server: &Server,
     format: Option<&RawValue>,
     thinking: &ThinkingOptions,
+    tools: &[JsonValue],
     tool_choice: &ToolChoice,
 ) -> Result<Option<ignis_core::structured::AnswerGrammar>, Response> {
-    hold_answer(server, chat_answer_format(format)?, thinking, tool_choice, "response_format")
+    hold_answer(server, chat_answer_format(format)?, thinking, tools, tool_choice, "response_format")
 }
 
 /// The grammar a request's answer is held to, for a format read from the
@@ -1675,18 +1677,28 @@ pub(crate) fn structured_output(
 /// API, #591): `json_object`'s, or the schema's, compiled once per distinct
 /// schema and kept (`model.grammar_cache_bytes`).
 ///
+/// Beside `tools` (resolved: none under `tool_choice: "none"`) each turn
+/// either calls a tool or answers under the grammar (GitHub #592). Under
+/// `"auto"` the grammar admits the tool call's opener until the answer
+/// starts, and a turn that opens a call is released from it; under
+/// `"required"` or a named function the turn is the call the forced literal
+/// opens ([`forced_tool_call`]), held to nothing, so no grammar is returned.
+/// The format is checked all the same: the next turn is held to it.
+///
 /// Refused with a 400 naming `param`, before anything is generated: a
 /// schema the grammar refuses, with the refusal's own code and a message
 /// naming its keyword or limit and where (OpenAI's strict subset under
 /// `strict`, OpenAI's four limits always); a model that does not serve
 /// structured output, naming it (Flash-Next, #581); a provider whose
 /// vocabulary cannot be read as bytes; with thinking on, a tokenizer with
-/// no single-token `</think>` to start the answer after; and a forced tool
-/// call beside it, until a turn may open a call under the grammar (#592).
+/// no single-token `</think>` to start the answer after; and tools a turn
+/// may call on a tokenizer whose `<tool_call>` is not one token, which the
+/// grammar could not admit.
 pub(crate) fn hold_answer(
     server: &Server,
     format: AnswerFormat<'_>,
     thinking: &ThinkingOptions,
+    tools: &[JsonValue],
     tool_choice: &ToolChoice,
     param: &str,
 ) -> Result<Option<ignis_core::structured::AnswerGrammar>, Response> {
@@ -1705,12 +1717,6 @@ pub(crate) fn hold_answer(
                 "{param}: structured output is not served by {} yet (GitHub #581); send {{\"type\": \"text\"}} or omit it",
                 active.family.name()
             ),
-        ));
-    }
-    if matches!(tool_choice, ToolChoice::Required | ToolChoice::Function(_)) {
-        return Err(refused(
-            "unsupported_value",
-            format!("{param}: a forced tool call beside structured output is not served yet (GitHub #592); send tool_choice \"auto\", or omit {param}"),
         ));
     }
     let Some(grammars) = active.template.grammars() else {
@@ -1732,22 +1738,36 @@ pub(crate) fn hold_answer(
             }
         },
     };
-    if !active.template.decoder_starts_in_reasoning(thinking) {
-        return Ok(Some(grammar));
-    }
     // With thinking on the reasoning stays free, and the answer is held from
     // the token after the block's `</think>`, which the scheduler sees as
     // one token.
-    match active
-        .template
-        .encode_literal(crate::thinking::THINK_END_TEXT)
-        .filter(|ids| ids.len() == 1)
-    {
-        Some(ids) => Ok(Some(grammar.after(ids[0]))),
-        None => Err(refused(
-            "unsupported_value",
-            format!("{param}: with thinking on, the answer is held from the token after the reasoning's </think>, and this tokenizer has no single-token </think>; send enable_thinking: false"),
-        )),
+    let grammar = match active.template.decoder_starts_in_reasoning(thinking) {
+        false => grammar,
+        true => match active.template.encode_literal(crate::thinking::THINK_END_TEXT).filter(|ids| ids.len() == 1) {
+            Some(ids) => grammar.after(ids[0]),
+            None => {
+                return Err(refused(
+                    "unsupported_value",
+                    format!("{param}: with thinking on, the answer is held from the token after the reasoning's </think>, and this tokenizer has no single-token </think>; send enable_thinking: false"),
+                ));
+            }
+        },
+    };
+    match tool_choice {
+        ToolChoice::Required | ToolChoice::Function(_) => Ok(None),
+        ToolChoice::None => Ok(Some(grammar)),
+        ToolChoice::Auto if tools.is_empty() => Ok(Some(grammar)),
+        ToolChoice::Auto => {
+            // The grammar never accepts the opener, a control token, so it can
+            // tell the opener from the answer's first token only when it is one.
+            match active.template.encode_literal(crate::toolcall::OPEN_TAG).filter(|ids| ids.len() == 1) {
+                Some(ids) => Ok(Some(grammar.admitting_tool_call(ids[0]))),
+                None => Err(refused(
+                    "unsupported_value",
+                    format!("{param}: beside tools, a turn may open a tool call instead of the answer, and this tokenizer has no single-token <tool_call> to admit; send tool_choice \"none\", or omit {param}"),
+                )),
+            }
+        }
     }
 }
 
@@ -2688,7 +2708,7 @@ Every request has a deadline from its admission (ADR 0058): `--server-request-ti
 
 Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text. `tool_choice` takes `\"auto\"` (the default), `\"none\"`, `\"required\"` and a named function. The last two force the call's opening -- `<tool_call>` and the function tag, with the name when one is named -- and the model writes the rest: with thinking off the opening is the first thing generated, with thinking on the first thing after the reasoning block closes. A forced call that never closes is dropped like any other, and `finish_reason` says why.
 
-`response_format: {\"type\": \"json_object\"}` holds the answer to a valid JSON object, streamed or not: each sampled token is checked against the grammar before the model consumes it, and a miss is repaired from the same scores restricted to the tokens that keep the object valid. With thinking on the reasoning stays free and the answer is held from the token after its `</think>`. Whitespace runs are bounded, the prompt need not mention JSON, a cut by `max_tokens` returns the object as generated with `finish_reason: \"length\"`, and `message.refusal` is always null. `{\"type\": \"json_schema\", \"json_schema\": {\"name\", \"schema\", \"strict\"}}` holds it to the schema the same way: under `strict: true` OpenAI's strict subset, all of it enforced, keys in the schema's order; without it what can be enforced is and the rest is inert. A schema already seen is not compiled again. `{\"type\": \"text\"}` is a free answer.
+`response_format: {\"type\": \"json_object\"}` holds the answer to a valid JSON object, streamed or not: each sampled token is checked against the grammar before the model consumes it, and a miss is repaired from the same scores restricted to the tokens that keep the object valid. With thinking on the reasoning stays free and the answer is held from the token after its `</think>`. Whitespace runs are bounded, the prompt need not mention JSON, a cut by `max_tokens` returns the object as generated with `finish_reason: \"length\"`, and `message.refusal` is always null. `{\"type\": \"json_schema\", \"json_schema\": {\"name\", \"schema\", \"strict\"}}` holds it to the schema the same way: under `strict: true` OpenAI's strict subset, all of it enforced, keys in the schema's order; without it what can be enforced is and the rest is inert. A schema already seen is not compiled again. `{\"type\": \"text\"}` is a free answer. Beside `tools` each turn either calls a tool or answers under the grammar: until the answer starts the grammar also admits `<tool_call>`, and a turn that opens a call is released from it for that turn, its call written and parsed as any other; `tool_choice: \"required\"` or a named function forces the call, and that turn is not held.
 
 `max_completion_tokens` is `max_tokens` under its current name: the one cap on generated tokens, reasoning included; both sent with different values is a 400. `stop` (a string, or 1 to 4 strings) ends the answer before the first sequence to appear in its content, with `finish_reason: \"stop\"`; the sequence is never emitted, a stream holds back a possible prefix until the next delta resolves it, and it is never matched in the reasoning nor inside a tool call. `usage.prompt_tokens_details.cached_tokens` is the prompt this request resumed from retained state instead of prefilling, the quantity `/v1/responses` reports.
 
@@ -2699,7 +2719,7 @@ Tool calls come back whole -- one complete `tool_calls` delta per call, never a 
             (ChatCompletion = "application/json"),
             (Chunk = "text/event-stream"),
         ), headers(("ignis-stopped-by" = String, description = "`request_timeout` on an answer its deadline cut, answered whole under `--server-timeout-reply partial` (ADR 0058); absent otherwise.")),),
-        (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take. Or `response_format` asks for what this model does not serve (`param: response_format`): a schema the grammar refuses, with the refusal's own code (`unsupported_keyword`, `too_many_properties`, ...) and a message naming the keyword or the limit and where; a `json_schema` with no `schema`; any type but `text`, `json_object` and `json_schema`; structured output beside a forced tool call; and on Qwen3.8-Flash-Next any structured output (`model_unsupported`, naming the model).", body = ApiError),
+        (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take. Or `response_format` asks for what this model does not serve (`param: response_format`): a schema the grammar refuses, with the refusal's own code (`unsupported_keyword`, `too_many_properties`, ...) and a message naming the keyword or the limit and where; a `json_schema` with no `schema`; any type but `text`, `json_object` and `json_schema`; `tools` a turn may call on a tokenizer whose `<tool_call>` is not one token; and on Qwen3.8-Flash-Next any structured output (`model_unsupported`, naming the model).", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 409, description = "The model that would serve the request is the image model: the one loaded, with no `model` naming a text model to switch to, or the one `model` names (`model_kind_mismatch`, naming both kinds and the loaded id). Or `model` names a catalog entry this card cannot load, and no entry that answers to it can: by its class (`model_above_card_class`, naming the entry's class and the card's, ADR 0064) or by its GPU generation, alone or with its class (`model_above_gpu_generation`, naming the generation the entry needs and the card's name, compute capability and generation, ADR 0079): refused before anything loads or switches, the loaded model serving on.", body = ApiError),
@@ -2783,7 +2803,7 @@ async fn chat_completions(
         Ok(forced) => forced,
         Err(response) => return response,
     };
-    let grammar = match structured_output(&server, req.response_format.as_deref(), &thinking, &tool_choice) {
+    let grammar = match structured_output(&server, req.response_format.as_deref(), &thinking, &tools, &tool_choice) {
         Ok(grammar) => grammar,
         Err(response) => return response,
     };

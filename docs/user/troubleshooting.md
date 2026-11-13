@@ -620,9 +620,9 @@ OpenAI's strict subset (`unsupported_keyword`), an object that is not closed
 (`not_all_required`); `strict` or not, a schema past one of OpenAI's limits
 (`too_many_properties`, ...). Fix the schema, or send it without `strict` to
 have the keyword served inert. Flash-Next answers `model_unsupported` naming
-itself, and a forced tool call (`tool_choice: "required"` or a named function)
-beside structured output is refused until a turn may choose between a call
-and the answer. Send it to the 27B, or `{"type": "text"}`
+itself: send it to the 27B, or `{"type": "text"}`. A tokenizer whose
+`<tool_call>` is not one token refuses `tools` a turn may call beside
+structured output; send `tool_choice: "none"`
 ([Structured output](api/structured-output.md#what-is-refused)).
 
 ### The answer stops short with `finish_reason: "length"`

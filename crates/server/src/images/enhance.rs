@@ -210,7 +210,7 @@ pub async fn rewrite(server: &Server, prompt: &str, images: &[RgbaImage], seed: 
     let grammar = task.answer_schema().and_then(|schema| {
         let schema = serde_json::value::RawValue::from_string(schema.to_owned()).ok()?;
         let format = crate::api::AnswerFormat::JsonSchema(crate::api::SchemaFormat { schema: &schema, strict: true });
-        crate::api::hold_answer(server, format, &thinking, &crate::api::ToolChoice::Auto, "response_format").ok().flatten()
+        crate::api::hold_answer(server, format, &thinking, &[], &crate::api::ToolChoice::Auto, "response_format").ok().flatten()
     });
     let limits = server.live();
     let params = crate::api::SamplingRequestFields::default().resolve(Some(limits.image.prompt_enhancer_max_tokens), false, false, Some(seed))?;

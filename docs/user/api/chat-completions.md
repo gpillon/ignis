@@ -101,7 +101,11 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   strict subset is held exactly and a schema outside it is refused by name;
   without it the rest is inert. `{"type": "text"}` is a free answer, and
   Flash-Next refuses structured output naming itself
-  ([Structured output](structured-output.md)).
+  ([Structured output](structured-output.md)). Beside `tools`, each turn
+  either calls a tool or answers under the schema: a turn that opens a call
+  before its answer starts is released from the schema, and
+  `tool_choice: "required"` or a named function still forces the call
+  ([Tools beside structured output](structured-output.md#tools-beside-structured-output)).
 - Non-streaming returns `choices[].message.content` plus `usage`, and
   `message.refusal`, always `null` (from 0.11.0); streaming
   emits `chat.completion.chunk` SSE frames (token deltas, a final
@@ -116,3 +120,5 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   `metadata`, `user`, ...) and refused
   with a 400 `unsupported_value` naming it in `param` otherwise. The full
   table is in the API reference at `/v1/docs/`; a field outside it is ignored.
+  `strict` on a function tool is accepted at any value and inert: the call's
+  arguments are not held to the tool's `parameters` (GitHub #582).

@@ -628,3 +628,56 @@ async fn a_request_without_stop_is_served_as_before() {
     let (_, streamed) = post(&app_reading(&text), CHAT, &plain(json!({ "max_tokens": 6, "stream": true }))).await;
     assert_eq!(streamed_content(&chunks(&streamed)), "one two???");
 }
+
+// ── `strict` on a function tool (spec #287, GitHub #582) ─────────────────
+
+/// A call that breaks its tool's closed `parameters`: a parameter they do
+/// not name, and the required one missing.
+const OFF_SCHEMA_CALL: &str = "<tool_call>\n<function=read_file>\n<parameter=depth>\n3\n</parameter>\n</function>\n</tool_call>";
+
+/// A server whose request 0 writes [`OFF_SCHEMA_CALL`] and stops, and the
+/// script that records what the template received.
+fn calling_app() -> (axum::Router, Arc<Script>) {
+    let mock = MockCompute::new();
+    mock.eos_after(0, 1);
+    let script = Script::new(HashMap::from([(mock.token_for(0, 0), OFF_SCHEMA_CALL)]));
+    (server(&script, SchedulerConfig::default(), Arc::new(mock)).app(), script)
+}
+
+fn read_file_parameters() -> JsonValue {
+    json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"], "additionalProperties": false })
+}
+
+/// `strict` on a function tool is accepted at any value and inert, on chat
+/// completions and on the Responses API: the call comes back as the model
+/// wrote it, its arguments not held to the tool's `parameters`, and the
+/// template receives the tool as sent. The document declares it so
+/// (`openai_fields::members`); honouring it is #582.
+#[tokio::test]
+async fn strict_on_a_function_tool_is_accepted_and_inert() {
+    for strict in [json!(true), json!(false), json!(null)] {
+        let (app, script) = calling_app();
+        let tool = json!({ "type": "function", "function": { "name": "read_file", "parameters": read_file_parameters(), "strict": strict } });
+        let answer = served(&app, CHAT, &plain(json!({ "tools": [tool] }))).await;
+        let calls = &answer["choices"][0]["message"]["tool_calls"];
+        assert_eq!(calls[0]["function"]["name"], "read_file", "strict {strict}: {answer}");
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"depth":3}"#, "strict {strict}: {answer}");
+        assert_eq!(answer["choices"][0]["finish_reason"], "tool_calls", "strict {strict}: {answer}");
+        let sent = script.seen()[0].tools[0]["function"]["strict"].clone();
+        assert_eq!(sent, if strict.is_null() { json!(false) } else { strict.clone() }, "the template's tool");
+
+        let (app, _) = calling_app();
+        let tool = json!({ "type": "function", "name": "read_file", "parameters": read_file_parameters(), "strict": strict });
+        let body = json!({ "model": MODEL, "input": "read it", "tools": [tool], "max_output_tokens": 8, "enable_thinking": false });
+        let response = served(&app, "/v1/responses", &body).await;
+        let call = response["output"].as_array().unwrap().iter().find(|item| item["type"] == "function_call").cloned();
+        let call = call.unwrap_or_else(|| panic!("strict {strict}: no call: {response}"));
+        assert_eq!(call["name"], "read_file", "strict {strict}: {response}");
+        assert_eq!(call["arguments"], r#"{"depth":3}"#, "strict {strict}: {response}");
+    }
+    for (surface, path) in [(openai_fields::Surface::Chat, "tools[].function.strict"), (openai_fields::Surface::Responses, "tools[].strict")] {
+        let member = openai_fields::members(surface).iter().find(|member| member.path == path);
+        assert!(member.is_some_and(|member| member.why.contains("#582")), "{surface:?} declares {path} inert");
+        assert!(openai_fields::describe(surface).contains(&format!("`{path}`")), "{surface:?}: the document lists it");
+    }
+}

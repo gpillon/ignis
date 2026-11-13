@@ -64,7 +64,16 @@ The measured figures are in
   only whitespace -- and each answer comes back a valid object, streamed and
   whole alike; the reasoning stays unchecked with thinking on, and after a
   thinking budget's forced close the answer is held; cuts by `max_tokens` and
-  by the deadline; the refusals (Flash-Next, a forced tool call). Against a
+  by the deadline; the refusals (Flash-Next, tools beside a split
+  `<tool_call>`). Tools beside the schema (#592, the test vocabulary's
+  `<tool_call>` one control token): a turn that opens a call is released and
+  its call comes back as written, with no repair, no miss on the series and
+  its later rounds unchecked, also with thinking on and inside a verified run
+  that keeps every draft; the next turn is held again; an opener inside the
+  answer is a miss; a repair's permitted set holds the opener until the
+  answer starts and never after; a forced `tool_choice` forces the call.
+  `openai_http_fields strict_on_a_function_tool` pins `strict` on a function
+  tool inert, on chat completions and the Responses API. Against a
   strict schema the script writes key names of its own, an enum in the wrong
   case, numbers out of range, a missing key, an extra key, a string its
   pattern refuses and a date in words: each answer is checked by hand and by
