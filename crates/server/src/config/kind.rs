@@ -875,7 +875,7 @@ impl FieldKind for DraftHead {
 }
 
 /// How a verify round's sampling lanes draft and accept (GitHub #576, ADR
-/// 0090): `fixed`, today's rule, or `sampled`, the sampled draft.
+/// 0090): `fixed`, the fixed draft, or `sampled`, the sampled draft.
 pub struct DraftRuleKind;
 
 impl FieldKind for DraftRuleKind {

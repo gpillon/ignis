@@ -435,13 +435,14 @@ struct IgnisVerifyRound {
   // sampled draft a sampling lane draws its drafts from the drafter's
   // distribution q (`ignis_sampled_draft_draw`, inside the drafter's
   // forward) and the round's accept is ignis's (`ignis_sampled_accept`); a
-  // greedy lane keeps the walk's drafts and today's rule. Under the fixed
-  // draft, the default, the round is exactly what it was: the walk's drafts
-  // and the vendored accept. The drafter's temperature is the lane's times
-  // `drafter_temperature_factor`, its top-p `drafter_top_p`. With the
-  // drafter, `draft_candidates` and `draft_q` keep each sampling lane's q --
-  // its candidates' ids and probabilities -- from the draw to the accept;
-  // counted on the drafter's plan line. Null under the fixed draft and on a
+  // greedy lane keeps the walk's drafts and takes them as under the fixed
+  // draft. Under the fixed draft, the rule of earlier releases, the round is
+  // exactly what it was: the walk's drafts and the vendored accept. The
+  // drafter's temperature is the lane's times `drafter_temperature_factor`,
+  // its top-p `drafter_top_p`. With the drafter, `draft_candidates` and
+  // `draft_q` keep each sampling lane's q -- its candidates' ids and
+  // probabilities -- from the draw to the accept; counted on the drafter's
+  // plan line. Null under the fixed draft and on a
   // verify-only load, whose drafts come per call and whose q is one-hot on
   // them.
   bool sampled_draft = false;

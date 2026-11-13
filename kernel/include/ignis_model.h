@@ -453,8 +453,9 @@ struct ignis_model_load_options {
  * draft and accept. A greedy lane drafts the selector walk's draft and
  * accepts it when the target's argmax agrees under either rule. */
 enum ignis_draft_rule {
-  /* Today's rule: the selector walk's fixed draft, taken with the target's
-   * probability of it (the vendored accept). A zeroed option's rule. */
+  /* The fixed draft, the rule of earlier releases: the selector walk's
+   * draft, taken with the target's probability of it (the vendored accept).
+   * A zeroed option's rule; the server's default is the sampled draft. */
   IGNIS_DRAFT_RULE_FIXED = 0,
   /* The sampled draft: a sampling lane draws each draft from the drafter's
    * distribution q over its candidates, and the accept takes it with

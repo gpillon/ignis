@@ -635,14 +635,15 @@ config_group! {
         /// has only `full`. Unset, `full`.
         draft_head: Opt<DraftHead> = None, Validator::OneOf(&["full", "shortlist", "auto"]), ALL, [Visible, Patchable, ReloadRequired, Scoped];
         /// How the 27B's DFlash2 rounds draft and accept for a request that
-        /// samples (ADR 0090): `fixed`, the drafter's single best draft taken
-        /// with the target's probability of it, or `sampled`, a draft drawn
-        /// from the drafter's own distribution and taken by the ratio of the
-        /// two distributions. Both keep the text distributed as the model's
-        /// sampler draws it; a seed's text differs between them. Greedy
-        /// requests draft and accept the same way under either. The default
-        /// is `sampled` (GitHub #578); `fixed` is today's rule, for a
-        /// comparison or a way back. Needs `dflash2`.
+        /// samples (ADR 0090): `fixed`, the fixed draft, the drafter's single
+        /// best draft taken with the target's probability of it, or
+        /// `sampled`, the sampled draft, a draft drawn from the drafter's own
+        /// distribution and taken by the ratio of the two distributions. Both
+        /// keep the text distributed as the model's sampler draws it; a
+        /// seed's text differs between them. Greedy requests draft and accept
+        /// the same way under either. The default is `sampled` (GitHub #578);
+        /// `fixed`, the rule of earlier releases, stays for a comparison or a
+        /// way back. Needs `dflash2`.
         draft_rule: DraftRuleKind = DraftRule::Sampled, Validator::OneOf(&DraftRule::NAMES), QWEN38_ONLY,
             [Visible, Patchable, ReloadRequired];
         /// Under `sampled`, the drafter's temperature as a factor of the

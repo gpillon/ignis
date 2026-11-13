@@ -330,8 +330,10 @@ impl ProposalHeadSetting {
 /// it where the target's argmax agrees under either rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DraftRule {
-    /// Today's rule: the selector walk's fixed draft, taken with the target's
-    /// probability of it (the vendored accept).
+    /// The fixed draft, the rule of earlier releases: the selector walk's
+    /// draft, taken with the target's probability of it (the vendored
+    /// accept). A [`Speculation`]'s rule until one is named; the server's
+    /// `spec.draft_rule` defaults to the sampled draft (GitHub #578).
     #[default]
     Fixed,
     /// The sampled draft: a sampling lane draws each draft from the drafter's
@@ -844,7 +846,8 @@ mod tests {
         assert_eq!(spec.round_scratch_bytes(crate::N_DECODE_LANES as u32), 78_027_552);
     }
 
-    /// GitHub #576 (ADR 0090): the fixed draft is the default, the drafter
+    /// GitHub #576 (ADR 0090): the fixed draft is a speculation's rule until
+    /// one is named (the server names its own default), the drafter
     /// samples at 0.9 x T and top-p 0.95, and both spellings cross the ABI
     /// as `enum ignis_draft_rule`.
     #[test]

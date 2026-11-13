@@ -35,9 +35,13 @@ vendored accept's to the bit; only the verdict is ours.
 ## Consequences
 
 - **Three settings in the speculation group, the 27B's alone**: `spec.draft_rule` (`sampled`, the default
-  since the rule's gate on the RTX 5090 passed, or `fixed`, today's rule, selectable), `spec.drafter_temperature_factor`
-  (0.9) and `spec.drafter_top_p` (0.95). Each needs a reload and `--spec-backend dflash2`; Flash-Next
-  refuses them by name. The load's log names the rule and both settings.
+  since the rule's gate on the RTX 5090 passed, or `fixed`, the fixed draft, the rule of earlier releases, one
+  option away), `spec.drafter_temperature_factor` (0.9) and `spec.drafter_top_p` (0.95). Each needs a reload and
+  `--spec-backend dflash2`. Where no round drafts with DFlash2 (Flash-Next, whose MTP rounds draft the fixed
+  draft, and the 27B with no backend or `off`) a value other than the default is refused by name, and the
+  default is accepted and does nothing: the configuration's rule that naming a default names nothing, which a
+  file `config generate` wrote with every default needs to start either model. The load's log names the rule
+  and both settings.
 - **A round under the sampled draft runs our accept for every lane.** A sampling lane takes the ratio; a
   greedy lane drafts the selector walk's draft and takes the longest prefix the target's argmax agrees
   with, the vendored greedy branch's rule, so its text does not change. A verify-only load's drafts come
