@@ -629,12 +629,6 @@ pub trait TemplateProvider: Send + Sync {
         None
     }
 
-    /// Whether `id` names a token of the loaded tokenizer (GitHub #285): what
-    /// `/v1/detokenize` checks its ids against, since a decode would skip one
-    /// with no token rather than refuse it.
-    ///
-    /// The default is `true`: a provider with no real tokenizer (the
-    /// placeholder hashes words into ids) has no vocabulary to be outside of.
     /// The grammars **structured output** holds an answer to (GitHub #587,
     /// ADR 0089), compiled against this provider's vocabulary as bytes: one
     /// cache per loaded tokenizer, whose vocabulary is read on first use and
@@ -647,6 +641,12 @@ pub trait TemplateProvider: Send + Sync {
         None
     }
 
+    /// Whether `id` names a token of the loaded tokenizer (GitHub #285): what
+    /// `/v1/detokenize` checks its ids against, since a decode would skip one
+    /// with no token rather than refuse it.
+    ///
+    /// The default is `true`: a provider with no real tokenizer (the
+    /// placeholder hashes words into ids) has no vocabulary to be outside of.
     fn is_token(&self, id: TokenId) -> bool {
         let _ = id;
         true
