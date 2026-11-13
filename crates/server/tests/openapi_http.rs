@@ -324,6 +324,20 @@ fn the_schema_descriptions_switch_is_an_ignis_extension_of_the_chat_contract() {
     assert!(table(Surface::Chat).iter().all(|rule| !rule.name.starts_with("ignis_")), "the OpenAI table holds OpenAI's fields");
 }
 
+/// Spec #287: `/v1/responses` serves `text.format`, so its `400` no longer
+/// lists structured output among what is not served, and says what a
+/// refused `text.format` answers instead.
+#[test]
+fn the_responses_400_names_text_format_refusals_not_structured_output_as_unserved() {
+    let document = document();
+    let refused = document["paths"]["/v1/responses"]["post"]["responses"]["400"]["description"].as_str().unwrap();
+    let (unserved, rest) = refused.split_once("Or `text.format`").unwrap_or_else(|| panic!("{refused}"));
+    assert!(!unserved.contains("structured output"), "{refused}");
+    for named in ["`param: text.format`", "a schema the grammar refuses", "`model_unsupported`"] {
+        assert!(rest.contains(named), "{named}: {refused}");
+    }
+}
+
 #[test]
 fn the_document_names_what_the_server_does_not_serve() {
     let description = document()["info"]["description"].as_str().unwrap_or_default().to_owned();

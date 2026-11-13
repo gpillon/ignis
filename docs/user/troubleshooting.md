@@ -625,6 +625,31 @@ itself: send it to the 27B, or `{"type": "text"}`. A tokenizer whose
 structured output; send `tool_choice: "none"`
 ([Structured output](api/structured-output.md#what-is-refused)).
 
+### WARN `ignis.structured.vocabulary_unreadable`
+
+"the tokenizer's vocabulary cannot be read as bytes: structured output is
+refused". Logged once, on the first request with a `response_format` (or a
+Responses `text.format`) after a load: a token of the artifact's tokenizer
+cannot be spelled as bytes, so no grammar can be held over its vocabulary.
+From then on every structured request answers `400 unsupported_value`, "this
+server's tokenizer cannot be read as bytes, so no answer can be held to a
+grammar here", and the rest is served as before. The built-in artifacts'
+tokenizers read; an artifact packed from another checkpoint may not. Load one
+from the [catalog](reference/models.md), or send no `response_format`
+([Structured output](api/structured-output.md)).
+
+### ERROR `ignis.structured.repair_failed` or `ignis.structured.no_pending_token`
+
+A request held to a grammar ended with an engine error: the engine could not
+sample a missed position again (`repair_failed`, whose `error` says why: the
+scores the token was sampled from were already written over, or the kernel
+leaf refused), or a round did not report the token it sampled for a request
+it was asked to check (`no_pending_token`). The client gets `500 engine_error`
+("the engine could not run the request; see the server log"), an `error`
+chunk on a stream, or `response.failed` on `/v1/responses`; the other requests
+are served on. Neither is a client's fault: send the request again, and report
+the line with the server's version and the request's `response_format`.
+
 ### The answer stops short with `finish_reason: "length"`
 
 Either the `max_tokens` you sent was reached, or, with none sent, the
