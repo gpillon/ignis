@@ -91,9 +91,10 @@ generates random documents of each grammar's language. Its output (the log,
   their 63-character label counters make 290-536 DFA states, and a state's
   first visit walks most of the vocabulary's ASCII words.
 
-**Part B, the check-first decode on the 27B** (the #287 spike, 2026-11-12,
-`crates/core/examples/structured_harness.rs` on branch
-`spike/287-structured-output`, raw results in `.scratch/287/spike/partB/`):
+**Part B, the check-first decode on the 27B** (the #287 spike, 2026-11-12;
+the spike's emulation harness was not kept once #287 shipped, and
+[the served measurements](2026-11-13-structured-output-served-on-the-27b.md)
+take its place; raw results in `.scratch/287/spike/partB/`):
 nvfp4full-v2, KV hq-e8-2b, thinking off, greedy, `max_tokens` 512. Each
 position's full logits come from the prefill route's readout; the
 unconstrained argmax is checked and a miss repaired with the argmax over the
