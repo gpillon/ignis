@@ -795,6 +795,24 @@ async fn without_strict_a_keyword_outside_the_subset_is_served_inert_and_the_gui
     assert!(inert.contains("`minLength`"), "the guide lists minLength as inert: {inert}");
 }
 
+/// The owner's call of 2026-11-13 on spec #287: without `strict`, a
+/// `pattern` that is not a regular language and a `$ref` that is not local
+/// are served inert, as a keyword outside the subset is, and only `strict`
+/// refuses them (by name, in the test below): the answer is held to the rest
+/// of the schema.
+#[tokio::test]
+async fn without_strict_a_non_regular_pattern_and_a_non_local_reference_are_served_inert() {
+    let schema = r#"{"type":"object","properties":{"a":{"type":"string","pattern":"(a)\\1"},"b":{"$ref":"https://example.com/s.json"},"c":{"type":"integer"}},"required":["a","b","c"],"additionalProperties":false}"#;
+    let script = r#"{"a": "xy", "b": 7, "c": x5}"#;
+    let (app, _) = app(script);
+    let got = answer_text(&app, &schema_chat(schema, false, false, 64), false).await;
+    let value: JsonValue = serde_json::from_str(&got.content).unwrap_or_else(|e| panic!("not JSON ({e}): {got:?}"));
+    assert_eq!((&value["a"], &value["b"]), (&json!("xy"), &json!(7)), "neither is held: {got:?}");
+    assert!(value["c"].is_i64(), "the rest of the schema is held: {got:?}");
+    let (status, _, text) = post_text(&app, &schema_chat(schema, true, false, 64)).await;
+    assert_eq!(status, 400, "under strict: {text}");
+}
+
 /// Acceptance 2: every refusal the spec names is a 400 before anything is
 /// generated, with the refusal's own code, `param` naming
 /// `response_format`, and a message naming the keyword or the limit.

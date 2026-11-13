@@ -165,6 +165,10 @@ and the answer is not held to it. Inert are:
 - a `$ref` that is not local (`#/...`), and any keyword beside a `$ref` or an
   `anyOf`.
 
+A non-regular `pattern` and a `$ref` that is not local are refused only under
+`strict: true` (`pattern_not_regular`, `unsupported_ref`); without it the
+answer is held to the rest of the schema.
+
 A looser schema than strict mode allows is served as written, each choice
 keeping the answer valid: a root of any type; a schema with no `type` takes
 the types its keywords imply (`properties` an object, `items` an array,
