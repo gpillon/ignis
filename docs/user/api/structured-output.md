@@ -101,9 +101,9 @@ sent them. A schema whose root is not an object (served without `strict`) is
 "a JSON value" instead.
 
 - **Why.** A model that has not read the schema writes key names of its own,
-  and the grammar then repairs nearly every key. Measured on the 27B: 4.2
-  misses per 100 tokens without the description against 0.04 with it, an
-  estimated 8 to 18% of speculative decode speed lost against 1 to 2%, and one
+  and the grammar then repairs nearly every key. Measured served on the 27B:
+  4.5 misses per 100 tokens without the description against 0.4 with it, 76%
+  of the decode speed against 98% ([What it costs](#what-it-costs)), and one
   recursive schema that ran away to `max_tokens`
   ([finding](../../findings/2026-11-12-structured-output-grammar-measured-on-the-27b.md)).
 - **Where.** After your last message, never inside it, and before the
@@ -291,6 +291,33 @@ The requests decoding beside a structured one are not touched: they keep
 every draft they would have kept, and the round runs as it does without the
 structured request. The only extra work is the check on the structured
 request's own tokens, and a round with no structured request in it does none.
+
+## What it costs
+
+Measured served on the 27B on an RTX 5090, with speculation on, greedy and
+thinking off, one request at a time on 19 schemas of our own
+([finding](../../findings/2026-11-13-structured-output-served-on-the-27b.md)):
+
+| | misses per 100 tokens | decode speed, against the same prompt unconstrained |
+|---|---:|---:|
+| the schema described (the default) | 0.4 | 98% |
+| `ignis_describe_schema: false` | 4.5 | 76% |
+
+- **A round costs the same** with a grammar and without, about 16 ms at one
+  request. What a miss costs is the verified run it ends: the drafts after it
+  are drafted again. With the schema described, most misses are the answer's
+  first token (a model that would open with a code fence), which the
+  prefill's own draw repairs before any draft; where the model writes the
+  answer it would have written anyway, the speed is 100%.
+- **A repair** takes about 0.3 ms, at most 1 ms in 98 of 100.
+- **The requests beside a structured one** decode at 99.4% of their speed
+  beside an unconstrained request on the same prompt, within the run's noise.
+- **Traffic with no structured request** decodes as fast as before structured
+  output, 100.0% at one request and at least 99% at eight.
+- **A JSON answer is often faster than a free one.** The same prompts with no
+  `response_format` were answered in prose or fenced Markdown, which drafts
+  worse: the held answers decoded 1.7 times as fast. Compare a structured
+  request with the same prompt and the schema in it, not with the bare prompt.
 
 ## What is refused
 

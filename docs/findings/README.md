@@ -177,6 +177,7 @@ edited by hand.
 
 ## Structured output: the grammar, its check and repair (`structured-output`)
 
+- 2026-11-13 [Structured output served on the 27B: plain traffic decodes as before it, the requests beside a constrained one keep their rate, and a described schema's answer decodes at 98% of the same prompt free](2026-11-13-structured-output-served-on-the-27b.md): RTX 5090, DFlash2: plain traffic decodes at 100.0% of c8358731 at one lane, requests beside a constrained one at 99.4% of beside a free one; a described schema's answer at 98% of its prompt free (0.41 misses/100 tokens), 76% off.
 - 2026-11-12 [Structured output's grammar on the 27B: a check costs 0.2 µs and a repair's permitted set 34 µs, exact to a per-token reference and an independent validator, and the model must be told the schema](2026-11-12-structured-output-grammar-measured-on-the-27b.md): On the 27B's 248,320-token vocabulary a grammar check takes 0.2 µs (1.0 µs p99) and a first-visit permitted set 34 µs (0.71 ms p99); misses fall from 4.2 to 0.04 per 100 tokens when the prompt describes the schema.
 
 ## Vision (`vision`)
