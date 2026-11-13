@@ -2488,7 +2488,9 @@ impl ConcreteScheduler {
             return Held::Kept;
         };
         match state.check(draw) {
-            Verdict::Passed => return Held::Kept,
+            // GitHub #592: a tool call's opener before the answer started;
+            // the turn is the call's, and nothing after it is checked.
+            Verdict::Passed | Verdict::Released => return Held::Kept,
             Verdict::Finished => return Held::Ended(FinishReason::Stop),
             Verdict::Miss => {}
         }
@@ -2557,6 +2559,12 @@ impl ConcreteScheduler {
     /// the model's, and is left alone. Ends the request when the draw or its
     /// repair is a stop where the answer is complete, and when a lane whose
     /// draw must be checked reports none.
+    ///
+    /// GitHub #590: after a verify round the drafts the commit kept were
+    /// checked before it ([`crate::structured::GrammarState::check_run`]); the
+    /// waiting draw is the draft the host cut at, or the run's own successor,
+    /// held here as a plain round's is -- so a miss inside a run is counted
+    /// and repaired in [`ConcreteScheduler::hold_to_grammar`] like any other.
     fn hold_round_draw(&mut self, i: usize, run: &DecodeOutcome, forced: bool, events: &mut Vec<SchedEvent>) {
         let r = &mut self.requests[i];
         let request = r.id;
@@ -5954,12 +5962,30 @@ impl Scheduler for ConcreteScheduler {
                     reasoning_close: reasoning_close(&self.config, &self.requests[i]),
                     anchor_emitted: self.requests[i].anchor_emitted,
                     // GitHub #587: a request held to a grammar has each draw
-                    // checked before the next round consumes it -- for now
-                    // in plain rounds, the reasoning's included (#590).
-                    checked: self.requests[i].grammar.is_some(),
+                    // checked before the next round consumes it, the
+                    // reasoning's included -- until its turn opens a tool
+                    // call (#592), which releases it.
+                    checked: self.requests[i].grammar.as_ref().is_some_and(|state| !state.released()),
                 })
                 .collect();
-            match self.compute.decode_step(&jobs) {
+            // GitHub #590: a round with a lane held to a grammar keeps
+            // speculation, and the host cuts that lane's verified run at its
+            // first draft the grammar does not pass. A round with none is the
+            // call it always was.
+            let decoded = match jobs.iter().any(|job| job.checked) {
+                false => self.compute.decode_step(&jobs),
+                true => {
+                    let requests = &mut self.requests;
+                    let mut cut = |job: usize, run: &[WaitingDraw]| -> usize {
+                        match requests[to_decode[job]].grammar.as_mut() {
+                            Some(state) => state.check_run(run),
+                            None => run.len(),
+                        }
+                    };
+                    self.compute.decode_step_cut(&jobs, &mut cut)
+                }
+            };
+            match decoded {
                 Ok(results) => {
                     for ((&i, res), job) in to_decode.iter().zip(&results).zip(&jobs) {
                         // GitHub #81 / ADR 0012: the decode-round span —

@@ -214,6 +214,32 @@ is held from the first token after the reasoning's `</think>`. A
 way: the close is the server's text, and the answer after it is held. With
 `enable_thinking: false` the answer is held from the first token generated.
 
+## Tools beside structured output
+
+A request may carry `tools` beside `response_format`, as agent SDKs send them:
+each turn either calls a tool or answers under the schema.
+
+- **Until the answer starts**, the grammar also admits a tool call's opener,
+  `<tool_call>`. Whitespace before it is fine; anything else starts the
+  answer. With thinking on, that is after the reasoning's `</think>`.
+- **A turn that opens a call is released** from the schema for the rest of
+  the turn: the call is written as the model writes it and comes back as any
+  other call, with `finish_reason: "tool_calls"`. Nothing in it is checked,
+  and it counts no miss and no repair in the request log or the
+  [metrics](../guides/telemetry.md).
+- **The next turn**, after the tool's result, is held again, so an agent
+  loop ends on an answer valid under the schema.
+- **Once the answer has started**, the turn cannot open a call any more: an
+  opener there is a miss, repaired into the answer.
+- **`tool_choice: "required"` or a named function** forces the call as it
+  does without `response_format` ([Chat completions](chat-completions.md)):
+  that turn is the call, and is not held, nor
+  [told the schema](#the-schema-described-to-the-model). `"none"` keeps the
+  tools from the model, and every turn answers under the schema.
+
+`strict: true` on a function tool is accepted and inert: the call's arguments
+are the model's own, not held to the tool's `parameters` (GitHub #582).
+
 ## Cuts
 
 - A cut by `max_tokens` (or `max_completion_tokens`) returns the content as
@@ -226,11 +252,19 @@ way: the close is the server's text, and the answer after it is held. With
 
 ## Speed and speculation
 
-While a structured request decodes, its rounds run without speculation, as a
-forced tool call's do, and so do the rounds of the requests decoding beside
-it. Each token of the answer is checked before the next round, and that needs
-the round's own scores, which only a plain round keeps. A later release keeps
-speculation on for structured output (GitHub #590).
+[Speculative decoding](../concepts/speculative-decoding.md) stays on for a
+structured request. In each verify round the drafts the model accepted are
+checked against the grammar before the round commits them: the run is kept up
+to its first miss, and that token is repaired from the scores the round has
+already computed for it. The drafts before the miss are kept, and only the
+ones after it are lost, to be drafted again in the next round. Greedy answers
+are the same with speculation on and off, up to the near-ties any request
+has.
+
+The requests decoding beside a structured one are not touched: they keep
+every draft they would have kept, and the round runs as it does without the
+structured request. The only extra work is the check on the structured
+request's own tokens, and a round with no structured request in it does none.
 
 ## What is refused
 
@@ -251,12 +285,8 @@ anything is generated. A schema the grammar refuses carries the refusal's own
 | `json_schema` without its `json_schema` object or its `schema`, a `strict` that is not a boolean, a `name` or `description` that is not a string | `invalid_request_error` |
 | any other `type`, or no object | `unsupported_value`. `{"type": "text"}`, `null` and absent are a free answer. |
 | structured output to Qwen3.8-Flash-Next | `model_unsupported`, naming the model: Flash-Next does not serve structured output yet (GitHub #581). |
-| structured output with `tool_choice: "required"` or a named function | `unsupported_value`: a forced call beside structured output is not served yet (GitHub #592). |
+| `tools` the turn may call (`tool_choice: "auto"`), on a tokenizer whose `<tool_call>` is not one token | `unsupported_value`: the grammar could not tell the call's opener from the answer. Send `tool_choice: "none"`. |
 | structured output with thinking on, on a tokenizer whose `</think>` is not one token | `unsupported_value`; send `enable_thinking: false`. |
-
-`tools` with `tool_choice: "auto"` are accepted beside `response_format`, but
-the turn answers under the grammar: the model cannot open a tool call in it
-until GitHub #592 lets a turn choose between a call and the answer.
 
 `/v1/responses` refuses `text.format` other than `text` for now
 ([The Responses API](responses.md)).

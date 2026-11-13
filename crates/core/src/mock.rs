@@ -141,6 +141,9 @@ struct Inner {
     repaired: HashMap<RequestId, (u32, TokenId, Option<TokenId>)>,
     /// Every repair the mock received, in order.
     repairs: Vec<RepairJob>,
+    /// Every verify commit the host cut (GitHub #590), in order: the request,
+    /// the run it was shown, and how many of its tokens the host kept.
+    cuts: Vec<(RequestId, Vec<WaitingDraw>, usize)>,
     /// What a request writes, step by step (GitHub #587): its token at step
     /// `i` is `script[i]` instead of the mix, and every step past the
     /// script is its EOS ([`MockCompute::script`]).
@@ -160,6 +163,23 @@ impl Inner {
         match self.scripts.get(&request).and_then(|script| script.get(step as usize)) {
             Some(&token) => token,
             None => MockCompute::mix(seed, request, self.seeds.get(&request).copied().unwrap_or(0), step),
+        }
+    }
+
+    /// What a round commits at `step` for an unconstrained `request`, as the
+    /// host's cut is shown it (GitHub #590): a repair's token, a redirect's
+    /// close, the EOS as a stop, else the free token -- the order a round's
+    /// run takes them in.
+    fn draw_at(&self, seed: u64, request: RequestId, step: u32) -> WaitingDraw {
+        if let Some(&(_, token, _)) = self.repaired.get(&request).filter(|r| r.0 == step) {
+            return WaitingDraw::Token(token);
+        }
+        if let Some(&(_, close)) = self.redirects.get(&request).filter(|r| r.0 == step) {
+            return WaitingDraw::Token(close);
+        }
+        match self.is_eos(request, step) {
+            true => WaitingDraw::Stop,
+            false => WaitingDraw::Token(self.free_token(seed, request, step)),
         }
     }
 }
@@ -617,6 +637,13 @@ impl MockCompute {
         self.inner.lock().unwrap().repairs.clone()
     }
 
+    /// The verify commits the host cut (GitHub #590), in order: the request,
+    /// the run the host was shown -- its anchor, then the drafts -- and how
+    /// many of its tokens the host kept.
+    pub fn cut_calls(&self) -> Vec<(RequestId, Vec<WaitingDraw>, usize)> {
+        self.inner.lock().unwrap().cuts.clone()
+    }
+
     /// The publishers whose shared prefix the scheduler released (P4-10,
     /// GitHub #126), in order.
     pub fn released_prefixes(&self) -> Vec<RequestId> {
@@ -782,6 +809,221 @@ impl MockCompute {
     /// it off the mix. Every step past the script is the request's EOS.
     pub fn script(&self, request: RequestId, tokens: &[TokenId]) {
         self.inner.lock().unwrap().scripts.insert(request, tokens.to_vec());
+    }
+}
+
+impl MockCompute {
+    /// One decode round (GitHub #61, P5-06), with the host's cut of every
+    /// [`DecodeJob::checked`] lane's run when `cut` is given (GitHub #590,
+    /// [`Compute::decode_step_cut`]): such a lane commits runs like any other
+    /// on a mock that commits runs, shown to the host first and cut where it
+    /// says. Without `cut` a checked lane runs plain, one token a round.
+    fn decode_round(
+        &self,
+        jobs: &[DecodeJob],
+        mut cut: Option<&mut dyn FnMut(usize, &[WaitingDraw]) -> usize>,
+    ) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        let mut g = self.inner.lock().unwrap();
+        g.decode_batches.push(jobs.to_vec());
+        // GitHub #590: the lanes whose commit the host cuts -- checked, handed
+        // no set, on a mock that commits runs.
+        let host_cut: Vec<bool> = jobs
+            .iter()
+            .map(|job| cut.is_some() && job.checked && job.permitted.is_none() && !g.run_lengths.is_empty())
+            .collect();
+        let outcomes = jobs
+            .iter()
+            .enumerate()
+            .map(|(index, job)| {
+                // GitHub #242 — a constrained lane, which is a different round
+                // entirely: exactly one token, the one drawn a round ago,
+                // and no speculation, no EOS and no token cap (the schedule
+                // is the budget, and the scheduler owns it).
+                if let Some(emitted) = g.pending.remove(&job.request) {
+                    if let Some(permitted) = &job.permitted {
+                        let next = Self::draw(self.seed, &mut g, job.request, permitted);
+                        g.pending.insert(job.request, next);
+                    }
+                    *g.generated.entry(job.request).or_insert(0) += 1;
+                    // #518: an anchor the prefill emitted is not emitted again.
+                    if job.anchor_emitted {
+                        return DecodeOutcome::run(Vec::new());
+                    }
+                    return DecodeOutcome::constrained_run(
+                        vec![emitted.token],
+                        vec![emitted.probability],
+                    );
+                }
+                let round = {
+                    let rounds = g.rounds.entry(job.request).or_insert(0);
+                    *rounds += 1;
+                    *rounds - 1
+                };
+                // A free lane handed a set mid-run (the thinking budget's
+                // forced close): the leaf runs it as a plain round — one
+                // token, the free draw it already holds — and the set's draw
+                // is what the *next* round returns, the same lag as above.
+                // GitHub #587: so is a lane whose draw the host checks.
+                // GitHub #590: unless the host cuts its commit.
+                let length = match (&job.permitted, g.run_lengths.len()) {
+                    (Some(_), _) | (None, 0) => 1,
+                    (None, _) if job.checked && !host_cut[index] => 1,
+                    (None, n) => g.run_lengths[round % n],
+                };
+                // An explicit stop_after overrides the learned limit; an
+                // unlearned request (no prefill seen) is treated as
+                // unbounded.
+                let limit = g
+                    .stops
+                    .get(&job.request)
+                    .copied()
+                    .or_else(|| g.limits.get(&job.request).copied().flatten());
+                // GitHub #590: the host is shown the run the round would
+                // commit -- its anchor, then the drafts, up to the EOS -- and
+                // keeps a prefix of it; the draw after the prefix waits.
+                let mut steps = length;
+                if host_cut[index] {
+                    let start = g.generated.get(&job.request).copied().unwrap_or(0);
+                    let mut shown = Vec::new();
+                    for step in start..start + length {
+                        if limit.is_some_and(|n| step >= n) {
+                            break;
+                        }
+                        let draw = g.draw_at(self.seed, job.request, step);
+                        shown.push(draw);
+                        if draw == WaitingDraw::Stop {
+                            break;
+                        }
+                    }
+                    if let Some(cut) = cut.as_mut().filter(|_| !shown.is_empty()) {
+                        let keep = (*cut)(index, &shown);
+                        assert!(
+                            (1..=shown.len()).contains(&keep),
+                            "the host kept {keep} tokens of a run of {}",
+                            shown.len()
+                        );
+                        steps = keep as u32;
+                        g.cuts.push((job.request, shown, keep));
+                    }
+                }
+                let mut run = Vec::new();
+                let mut committed = 0;
+                let mut finish = None;
+                // GitHub #315: whether this round's draw was redirected, and
+                // whether a `</think>` it committed closed the block for the
+                // rest of it.
+                let mut redirected = false;
+                let mut closed = false;
+                for _ in 0..steps {
+                    let step = *g.generated.entry(job.request).or_insert(0);
+                    if limit.is_some_and(|n| step >= n) {
+                        break;
+                    }
+                    *g.generated.get_mut(&job.request).unwrap() += 1;
+                    committed += 1;
+                    // GitHub #586: the token a repair put in place of this
+                    // step's draw -- an EOS's too, which is how an early stop
+                    // is repaired.
+                    if let Some(token) = g.repaired.get(&job.request).filter(|r| r.0 == step).map(|r| r.1) {
+                        g.repaired.remove(&job.request);
+                        run.push(token);
+                        continue;
+                    }
+                    // The close an earlier round drew in place of this
+                    // step's EOS.
+                    if let Some(close) = g.redirects.get(&job.request).filter(|r| r.0 == step).map(|r| r.1) {
+                        g.redirects.remove(&job.request);
+                        run.push(close);
+                        closed = true;
+                        continue;
+                    }
+                    if g.is_eos(job.request, step) {
+                        // An accepted draft (not the anchor, which the
+                        // previous round drew) that is the EOS, with the
+                        // block open: cut before it, `</think>` next.
+                        if let Some(close) = job.reasoning_close.filter(|_| committed > 1 && !closed) {
+                            *g.generated.get_mut(&job.request).unwrap() -= 1;
+                            committed -= 1;
+                            redirected = Self::redirect(&mut g, job.request, step, close);
+                            break;
+                        }
+                        finish = Some(FinishReason::Stop);
+                        break;
+                    }
+                    run.push(g.free_token(self.seed, job.request, step));
+                }
+                // The draw this round made is the next step's token.
+                if let Some(close) = job.reasoning_close.filter(|_| !redirected && !closed && finish.is_none()) {
+                    if committed > 0 && job.permitted.is_none() {
+                        let next = g.generated.get(&job.request).copied().unwrap_or(0);
+                        redirected = Self::redirect(&mut g, job.request, next, close);
+                    }
+                }
+                if let Some(permitted) = &job.permitted {
+                    if committed > 0 && finish.is_none() {
+                        let next = Self::draw(self.seed, &mut g, job.request, permitted);
+                        g.pending.insert(job.request, next);
+                    }
+                }
+                if committed == 0 {
+                    // Without `eos_after` the mock has no real EOS token —
+                    // its stop condition is a token-count cap, reached
+                    // before this round committed anything: `Length`.
+                    return DecodeOutcome::finished(FinishReason::Length);
+                }
+                // #518: the run's first token is its anchor, which a prefill
+                // that emitted it already sent.
+                if job.anchor_emitted && !run.is_empty() {
+                    run.remove(0);
+                }
+                DecodeOutcome {
+                    tokens: run,
+                    finish,
+                    probabilities: Vec::new(),
+                    spec: (!g.run_lengths.is_empty() && (!job.checked || host_cut[index]))
+                        .then(|| SpecCounters::round(length - 1, committed - 1)),
+                    reasoning_redirected: redirected,
+                    waiting: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        // GitHub #586: the draws this round made keep their scores until the
+        // next call -- a plain round's, that is: a speculative lane's (one
+        // handed no set while the mock commits runs), a redirected one and a
+        // finished request's keep none. GitHub #590: but a lane whose commit
+        // the host cut keeps its waiting draw's, as the leaf keeps the verify
+        // column the cut ended at.
+        g.steps_served += 1;
+        let call = g.steps_served;
+        for ((job, outcome), &cut_by_host) in jobs.iter().zip(&outcomes).zip(&host_cut) {
+            let speculative = outcome.spec.is_some() && job.permitted.is_none() && !cut_by_host;
+            if outcome.finish.is_none() && !outcome.reasoning_redirected && !speculative {
+                g.kept.insert(job.request, call);
+            } else {
+                g.kept.remove(&job.request);
+            }
+        }
+        // GitHub #587: a checked lane that goes on reports the draw its next
+        // round would commit -- a set's held draw, a redirected close, the
+        // EOS, or its free token -- as the leaf reports its pending token.
+        let outcomes = jobs
+            .iter()
+            .zip(outcomes)
+            .map(|(job, outcome)| match job.checked && outcome.finish.is_none() {
+                true => {
+                    let step = g.generated.get(&job.request).copied().unwrap_or(0);
+                    let draw = match (g.pending.get(&job.request), g.redirects.get(&job.request)) {
+                        (Some(held), _) => WaitingDraw::Token(held.token),
+                        (None, Some(&(at, close))) if at == step => WaitingDraw::Token(close),
+                        _ if g.is_eos(job.request, step) => WaitingDraw::Stop,
+                        _ => WaitingDraw::Token(g.free_token(self.seed, job.request, step)),
+                    };
+                    outcome.waiting_on(draw)
+                }
+                false => outcome,
+            })
+            .collect();
+        Ok(outcomes)
     }
 }
 
@@ -1018,169 +1260,16 @@ impl Compute for MockCompute {
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
-        let mut g = self.inner.lock().unwrap();
-        g.decode_batches.push(jobs.to_vec());
-        let outcomes = jobs
-            .iter()
-            .map(|job| {
-                // GitHub #242 — a constrained lane, which is a different round
-                // entirely: exactly one token, the one drawn a round ago,
-                // and no speculation, no EOS and no token cap (the schedule
-                // is the budget, and the scheduler owns it).
-                if let Some(emitted) = g.pending.remove(&job.request) {
-                    if let Some(permitted) = &job.permitted {
-                        let next = Self::draw(self.seed, &mut g, job.request, permitted);
-                        g.pending.insert(job.request, next);
-                    }
-                    *g.generated.entry(job.request).or_insert(0) += 1;
-                    // #518: an anchor the prefill emitted is not emitted again.
-                    if job.anchor_emitted {
-                        return DecodeOutcome::run(Vec::new());
-                    }
-                    return DecodeOutcome::constrained_run(
-                        vec![emitted.token],
-                        vec![emitted.probability],
-                    );
-                }
-                let round = {
-                    let rounds = g.rounds.entry(job.request).or_insert(0);
-                    *rounds += 1;
-                    *rounds - 1
-                };
-                // A free lane handed a set mid-run (the thinking budget's
-                // forced close): the leaf runs it as a plain round — one
-                // token, the free draw it already holds — and the set's draw
-                // is what the *next* round returns, the same lag as above.
-                // GitHub #587: so is a lane whose draw the host checks.
-                let length = match (&job.permitted, g.run_lengths.len()) {
-                    (Some(_), _) | (None, 0) => 1,
-                    (None, _) if job.checked => 1,
-                    (None, n) => g.run_lengths[round % n],
-                };
-                // An explicit stop_after overrides the learned limit; an
-                // unlearned request (no prefill seen) is treated as
-                // unbounded.
-                let limit = g
-                    .stops
-                    .get(&job.request)
-                    .copied()
-                    .or_else(|| g.limits.get(&job.request).copied().flatten());
-                let mut run = Vec::new();
-                let mut committed = 0;
-                let mut finish = None;
-                // GitHub #315: whether this round's draw was redirected, and
-                // whether a `</think>` it committed closed the block for the
-                // rest of it.
-                let mut redirected = false;
-                let mut closed = false;
-                for _ in 0..length {
-                    let step = *g.generated.entry(job.request).or_insert(0);
-                    if limit.is_some_and(|n| step >= n) {
-                        break;
-                    }
-                    *g.generated.get_mut(&job.request).unwrap() += 1;
-                    committed += 1;
-                    // GitHub #586: the token a repair put in place of this
-                    // step's draw -- an EOS's too, which is how an early stop
-                    // is repaired.
-                    if let Some(token) = g.repaired.get(&job.request).filter(|r| r.0 == step).map(|r| r.1) {
-                        g.repaired.remove(&job.request);
-                        run.push(token);
-                        continue;
-                    }
-                    // The close an earlier round drew in place of this
-                    // step's EOS.
-                    if let Some(close) = g.redirects.get(&job.request).filter(|r| r.0 == step).map(|r| r.1) {
-                        g.redirects.remove(&job.request);
-                        run.push(close);
-                        closed = true;
-                        continue;
-                    }
-                    if g.is_eos(job.request, step) {
-                        // An accepted draft (not the anchor, which the
-                        // previous round drew) that is the EOS, with the
-                        // block open: cut before it, `</think>` next.
-                        if let Some(close) = job.reasoning_close.filter(|_| committed > 1 && !closed) {
-                            *g.generated.get_mut(&job.request).unwrap() -= 1;
-                            committed -= 1;
-                            redirected = Self::redirect(&mut g, job.request, step, close);
-                            break;
-                        }
-                        finish = Some(FinishReason::Stop);
-                        break;
-                    }
-                    run.push(g.free_token(self.seed, job.request, step));
-                }
-                // The draw this round made is the next step's token.
-                if let Some(close) = job.reasoning_close.filter(|_| !redirected && !closed && finish.is_none()) {
-                    if committed > 0 && job.permitted.is_none() {
-                        let next = g.generated.get(&job.request).copied().unwrap_or(0);
-                        redirected = Self::redirect(&mut g, job.request, next, close);
-                    }
-                }
-                if let Some(permitted) = &job.permitted {
-                    if committed > 0 && finish.is_none() {
-                        let next = Self::draw(self.seed, &mut g, job.request, permitted);
-                        g.pending.insert(job.request, next);
-                    }
-                }
-                if committed == 0 {
-                    // Without `eos_after` the mock has no real EOS token —
-                    // its stop condition is a token-count cap, reached
-                    // before this round committed anything: `Length`.
-                    return DecodeOutcome::finished(FinishReason::Length);
-                }
-                // #518: the run's first token is its anchor, which a prefill
-                // that emitted it already sent.
-                if job.anchor_emitted && !run.is_empty() {
-                    run.remove(0);
-                }
-                DecodeOutcome {
-                    tokens: run,
-                    finish,
-                    probabilities: Vec::new(),
-                    spec: (!g.run_lengths.is_empty() && !job.checked)
-                        .then(|| SpecCounters::round(length - 1, committed - 1)),
-                    reasoning_redirected: redirected,
-                    waiting: None,
-                }
-            })
-            .collect::<Vec<_>>();
-        // GitHub #586: the draws this round made keep their scores until the
-        // next call -- a plain round's, that is: a speculative lane's (one
-        // handed no set while the mock commits runs), a redirected one and a
-        // finished request's keep none.
-        g.steps_served += 1;
-        let call = g.steps_served;
-        for (job, outcome) in jobs.iter().zip(&outcomes) {
-            let speculative = outcome.spec.is_some() && job.permitted.is_none();
-            if outcome.finish.is_none() && !outcome.reasoning_redirected && !speculative {
-                g.kept.insert(job.request, call);
-            } else {
-                g.kept.remove(&job.request);
-            }
-        }
-        // GitHub #587: a checked lane that goes on reports the draw its next
-        // round would commit -- a set's held draw, a redirected close, the
-        // EOS, or its free token -- as the leaf reports its pending token.
-        let outcomes = jobs
-            .iter()
-            .zip(outcomes)
-            .map(|(job, outcome)| match job.checked && outcome.finish.is_none() {
-                true => {
-                    let step = g.generated.get(&job.request).copied().unwrap_or(0);
-                    let draw = match (g.pending.get(&job.request), g.redirects.get(&job.request)) {
-                        (Some(held), _) => WaitingDraw::Token(held.token),
-                        (None, Some(&(at, close))) if at == step => WaitingDraw::Token(close),
-                        _ if g.is_eos(job.request, step) => WaitingDraw::Stop,
-                        _ => WaitingDraw::Token(g.free_token(self.seed, job.request, step)),
-                    };
-                    outcome.waiting_on(draw)
-                }
-                false => outcome,
-            })
-            .collect();
-        Ok(outcomes)
+        self.decode_round(jobs, None)
+    }
+
+    // GitHub #590: a checked lane keeps its runs, cut where the host says.
+    fn decode_step_cut(
+        &self,
+        jobs: &[DecodeJob],
+        cut: &mut dyn FnMut(usize, &[WaitingDraw]) -> usize,
+    ) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        self.decode_round(jobs, Some(cut))
     }
 
     // core-06 (P4-07, GitHub #125): the mock holds no real GPU sequence, so
@@ -1740,6 +1829,18 @@ impl GatedCompute {
         *self.armed_at.lock().unwrap() = Some((request, step));
     }
 
+    /// Blocks the call when the gate is armed for it (either way of arming),
+    /// until [`GateController::release`].
+    fn hold_at_gate(&self, jobs: &[DecodeJob]) {
+        if self.armed.swap(false, Ordering::SeqCst) || self.reaches_armed_step(jobs) {
+            // A rendezvous pair: `send` blocks until `wait_entered`'s `recv`
+            // is there to receive it, then this call blocks again until
+            // `release` sends the go-ahead.
+            let _ = self.entered_tx.send(());
+            let _ = self.release_rx.lock().unwrap().recv();
+        }
+    }
+
     /// Whether this call is the one [`GatedCompute::arm_at`] holds,
     /// counting one of the armed request's steps when it is in `jobs`.
     fn reaches_armed_step(&self, jobs: &[DecodeJob]) -> bool {
@@ -1769,14 +1870,18 @@ impl Compute for GatedCompute {
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
-        if self.armed.swap(false, Ordering::SeqCst) || self.reaches_armed_step(jobs) {
-            // A rendezvous pair: `send` blocks until `wait_entered`'s `recv`
-            // is there to receive it, then this call blocks again until
-            // `release` sends the go-ahead.
-            let _ = self.entered_tx.send(());
-            let _ = self.release_rx.lock().unwrap().recv();
-        }
+        self.hold_at_gate(jobs);
         self.inner.decode_step(jobs)
+    }
+
+    // GitHub #590: the host's cut reaches the wrapped backend, past the gate.
+    fn decode_step_cut(
+        &self,
+        jobs: &[DecodeJob],
+        cut: &mut dyn FnMut(usize, &[crate::scheduler::WaitingDraw]) -> usize,
+    ) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        self.hold_at_gate(jobs);
+        self.inner.decode_step_cut(jobs, cut)
     }
 
     fn repair(&self, job: &RepairJob) -> Result<TokenId, ComputeError> {

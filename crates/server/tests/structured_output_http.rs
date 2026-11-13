@@ -1,6 +1,7 @@
 //! Structured output on chat completions (GitHub #587, #588, spec #287, ADR
-//! 0089): `response_format` with `json_object` and with `json_schema`, end
-//! to end over the real router on `MockCompute` (ADR 0006).
+//! 0089): `response_format` with `json_object` and with `json_schema`, and
+//! beside tools (#592), end to end over the real router on `MockCompute`
+//! (ADR 0006).
 //!
 //! The "model" follows a script ([`MockCompute::script`]) that misses on
 //! purpose: a prose preamble, a code fence, a remark after the object, an
@@ -30,7 +31,7 @@ use tower::ServiceExt;
 
 use ignis_core::compute::ModelFamily;
 use ignis_core::mock::GatedCompute;
-use ignis_core::{Compute, ConcreteScheduler, MockCompute, SchedulerConfig, TokenId};
+use ignis_core::{Compute, ConcreteScheduler, MockCompute, SchedulerConfig, TokenId, WaitingDraw};
 use ignis_grammar::{GrammarCache, Vocab, VocabEntry, DEFAULT_CACHE_BYTES, DEFAULT_MAX_WS_RUN};
 use ignis_server::decoder::TokenDecoder;
 use ignis_server::engine::Engine;
@@ -62,6 +63,9 @@ const STOP: TokenId = 5;
 const THINK_END: TokenId = 6;
 /// A code fence, one token as a real tokenizer has it.
 const FENCE: TokenId = 7;
+/// A tool call's opener, `<tool_call>`: one control token, as in the real
+/// tokenizer, which no grammar accepts (#592).
+const TOOL_CALL: TokenId = 8;
 const NEWLINE: TokenId = 10;
 const VOCAB: usize = 128;
 
@@ -80,14 +84,17 @@ fn text_of(token: TokenId) -> Option<String> {
     }
 }
 
-/// `text` in the test vocabulary: `</think>` and a fence one token each,
-/// every other character its own code point.
+/// `text` in the test vocabulary: `</think>`, `<tool_call>` and a fence one
+/// token each, every other character its own code point.
 fn encode(text: &str) -> Vec<TokenId> {
     let mut ids = Vec::new();
     let mut rest = text;
     while let Some(c) = rest.chars().next() {
         if let Some(after) = rest.strip_prefix("</think>") {
             ids.push(THINK_END);
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("<tool_call>") {
+            ids.push(TOOL_CALL);
             rest = after;
         } else if let Some(after) = rest.strip_prefix("```") {
             ids.push(FENCE);
@@ -113,6 +120,9 @@ struct Vocabulary {
     /// generation opener, and the checkpoint boundary is where the
     /// conversation ends.
     boundaries: bool,
+    /// The tokenizer writes `<tool_call>` a character a token, as one with
+    /// no such special token would.
+    split_tool_call: bool,
 }
 
 /// One render the template made.
@@ -130,7 +140,7 @@ impl Vocabulary {
     fn new() -> Self {
         let entries = (0..VOCAB as TokenId)
             .map(|id| match (id, text_of(id)) {
-                (STOP | THINK_END, _) => VocabEntry::Control,
+                (STOP | THINK_END | TOOL_CALL, _) => VocabEntry::Control,
                 (_, Some(text)) => VocabEntry::Text(text.into_bytes()),
                 (_, None) => VocabEntry::Absent,
             })
@@ -139,6 +149,7 @@ impl Vocabulary {
             grammars: Arc::new(GrammarCache::new(Vocab::new(entries, &[STOP]), DEFAULT_CACHE_BYTES)),
             renders: Arc::default(),
             boundaries: false,
+            split_tool_call: false,
         }
     }
 
@@ -198,7 +209,11 @@ impl TemplateProvider for Vocabulary {
     }
 
     fn encode_literal(&self, text: &str) -> Option<Vec<TokenId>> {
-        Some(encode(text))
+        let opener: Vec<TokenId> = "<tool_call>".chars().map(|c| c as TokenId).collect();
+        match self.split_tool_call {
+            true => Some(text.split("<tool_call>").map(encode).collect::<Vec<_>>().join(&opener[..])),
+            false => Some(encode(text)),
+        }
     }
 
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
@@ -224,6 +239,7 @@ impl TokenDecoder for Decoder {
     fn push(&mut self, token: TokenId) -> String {
         match token {
             THINK_END => "</think>".into(),
+            TOOL_CALL => "<tool_call>".into(),
             STOP => "<stop>".into(),
             token => text_of(token).unwrap_or_else(|| "?".into()),
         }
@@ -361,6 +377,39 @@ async fn a_preamble_a_fence_a_remark_and_an_early_stop_each_come_back_a_valid_ob
         let (app, _) = self::app(script);
         let streamed = answer(&app, &chat(true, 64)).await;
         assert_eq!(streamed, whole, "{what}: streamed and whole carry the same answer");
+    }
+}
+
+/// Speculation stays on for a held answer (GitHub #590): over a mock that
+/// commits runs as verify rounds do, each run is checked before it is
+/// committed and cut at its first miss, and every answer, its repairs and
+/// its finish are the ones the same model gives one token a round.
+#[tokio::test]
+async fn with_speculation_each_answer_is_the_one_without() {
+    let scripts = [
+        "Sure! Here it is:
+{\"a\": 1}",
+        "```json
+{\"a\": 1}
+```",
+        "{\"a\": 1}
+That is all.",
+        "{\"a\": [1, 2",
+        "{\"name\": \"Tom\", \"legs\": 4x, \"toys\": [1, 2]}",
+    ];
+    for script in scripts {
+        let served = |mock: MockCompute| {
+            let mock = Arc::new(mock);
+            mock.script(0, &encode(script));
+            (server(mock.clone(), SchedulerConfig::default()).app(), mock)
+        };
+        let (app, plain) = served(MockCompute::new());
+        let without = answer(&app, &chat(false, 64)).await;
+        let (app, runs) = served(MockCompute::with_runs(&[4, 2, 6]));
+        let with = answer(&app, &chat(false, 64)).await;
+        assert_eq!(with, without, "{script:?}: the same answer with speculation");
+        assert_eq!(runs.repair_calls().len(), plain.repair_calls().len(), "{script:?}: the same repairs");
+        assert!(!runs.cut_calls().is_empty(), "{script:?}: the held lane's runs went to the host's cut");
     }
 }
 
@@ -523,19 +572,6 @@ async fn any_other_format_is_refused_and_text_is_a_free_answer() {
     body["response_format"] = json!({ "type": "text" });
     assert_eq!(answer(&app, &body).await.content, "Sure!");
     assert!(mock.repair_calls().is_empty());
-}
-
-/// A forced tool call and a held answer would each own the first token:
-/// refused until a turn may open a call under the grammar (#592).
-#[tokio::test]
-async fn a_forced_tool_call_beside_json_object_is_refused() {
-    let (app, _) = app("{}");
-    let mut body = chat(false, 64);
-    body["tools"] = json!([{ "type": "function", "function": { "name": "f", "parameters": { "type": "object" } } }]);
-    body["tool_choice"] = json!("required");
-    let (status, _, text) = post(&app, &body).await;
-    assert_eq!(status, 400, "{text}");
-    assert!(text.contains("\"param\":\"response_format\"") && text.contains("#592"), "{text}");
 }
 
 /// A template whose vocabulary cannot be read as bytes holds nothing to a
@@ -994,4 +1030,299 @@ async fn the_next_turn_reuses_the_described_turns_conversation() {
     assert!(renders.iter().all(|render| render.description.is_some()), "both turns described: {renders:?}");
     assert!(first["prompt_tokens"].as_u64().unwrap() > 21, "the first prompt carries its description: {first}");
     assert_eq!(usage(&second)["prompt_tokens_details"]["cached_tokens"], 20, "the first turn's conversation, and only it");
+}
+
+// ── tools beside response_format (#592) ─────────────────────────────────
+
+/// What the agent's last answer is held to.
+const WEATHER: &str = r#"{"type":"object","properties":{"city":{"type":"string"},"sky":{"type":"string","enum":["sunny","rainy"]}},"required":["city","sky"],"additionalProperties":false}"#;
+
+/// A call in the template's dialect, as the model writes it: text no JSON
+/// grammar would let through.
+const CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>";
+
+/// The user's question, the agent's first turn.
+fn question() -> JsonValue {
+    json!([{ "role": "user", "content": "What is the weather in Oslo?" }])
+}
+
+/// The conversation after the first turn's call and the tool's result.
+fn after_the_call() -> JsonValue {
+    json!([
+        { "role": "user", "content": "What is the weather in Oslo?" },
+        { "role": "assistant", "content": "", "tool_calls": [{ "id": "call_0", "type": "function",
+            "function": { "name": "get_weather", "arguments": "{\"city\":\"Oslo\"}" } }] },
+        { "role": "tool", "tool_call_id": "call_0", "content": "sunny, 21 C" },
+    ])
+}
+
+/// An agent's turn, as an SDK sends it: `messages`, a tool, `tool_choice`,
+/// and `response_format` holding the answer to [`WEATHER`]; greedy.
+fn agent_turn(messages: JsonValue, tool_choice: JsonValue, thinking: bool, stream: bool) -> String {
+    let body = json!({
+        "model": MODEL,
+        "messages": messages,
+        "tools": [{ "type": "function", "function": { "name": "get_weather", "parameters": {
+            "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] } } }],
+        "tool_choice": tool_choice,
+        "response_format": { "type": "json_schema", "json_schema": { "name": "weather", "strict": true, "schema": "SCHEMA" } },
+        "enable_thinking": thinking,
+        "temperature": 0,
+        "max_tokens": 256,
+        "stream": stream,
+    });
+    body.to_string().replace("\"SCHEMA\"", WEATHER)
+}
+
+/// What a turn came back with: its content, its calls as (name,
+/// arguments), its finish reason.
+#[derive(Debug, PartialEq)]
+struct Turn {
+    content: String,
+    calls: Vec<(String, JsonValue)>,
+    finish: String,
+}
+
+/// The turn `body` asks for, whole or streamed.
+async fn turn(app: &axum::Router, body: &str, stream: bool) -> Turn {
+    let (status, _, text) = post_text(app, body).await;
+    assert_eq!(status, 200, "{body}: {text}");
+    let call = |call: &JsonValue| {
+        let function = &call["function"];
+        let arguments = serde_json::from_str(function["arguments"].as_str().unwrap()).unwrap();
+        (function["name"].as_str().unwrap().to_owned(), arguments)
+    };
+    if stream {
+        let chunks: Vec<JsonValue> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|l| *l != "[DONE]")
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let deltas = || chunks.iter().map(|c| &c["choices"][0]["delta"]);
+        return Turn {
+            content: deltas().filter_map(|d| d["content"].as_str()).collect(),
+            calls: deltas().filter_map(|d| d["tool_calls"].as_array()).flatten().map(call).collect(),
+            finish: chunks.iter().find_map(|c| c["choices"][0]["finish_reason"].as_str()).expect("a finish chunk").to_owned(),
+        };
+    }
+    let v: JsonValue = serde_json::from_str(&text).unwrap();
+    let message = &v["choices"][0]["message"];
+    Turn {
+        content: message["content"].as_str().unwrap_or_default().to_owned(),
+        calls: message["tool_calls"].as_array().map(|calls| calls.iter().map(call).collect()).unwrap_or_default(),
+        finish: v["choices"][0]["finish_reason"].as_str().unwrap().to_owned(),
+    }
+}
+
+/// `text` as the model writes it: with thinking on, after a reasoning block.
+fn reasoned(thinking: bool, text: &str) -> String {
+    match thinking {
+        true => format!("Let me see.</think>\n\n{text}"),
+        false => text.to_owned(),
+    }
+}
+
+/// Acceptance 1: a turn that opens a tool call is released from the schema
+/// and its call comes back as the model wrote it, with no miss and no
+/// repair; the next turn, after the tool's result, is held again and answers
+/// under the schema. With thinking on the call opens after the reasoning,
+/// where the answer would start; with speculation, inside a verified run.
+#[tokio::test]
+async fn a_turn_that_opens_a_tool_call_is_released_and_the_next_turn_answers_under_the_schema() {
+    for thinking in [false, true] {
+        for runs in [false, true] {
+            for stream in [false, true] {
+                let case = format!("thinking {thinking}, runs {runs}, stream {stream}");
+                let mock = Arc::new(if runs { MockCompute::with_runs(&[4, 2, 6]) } else { MockCompute::new() });
+                mock.script(0, &encode(&reasoned(thinking, CALL)));
+                mock.script(1, &encode(&reasoned(thinking, "```json\n{\"city\": \"Oslo\", \"sky\": \"sunny\"}\n```")));
+                let app = server(mock.clone(), SchedulerConfig::default()).app();
+
+                let first = turn(&app, &agent_turn(question(), json!("auto"), thinking, stream), stream).await;
+                assert_eq!(first.calls, [("get_weather".to_owned(), json!({ "city": "Oslo" }))], "{case}: {first:?}");
+                assert_eq!(first.finish, "tool_calls", "{case}: {first:?}");
+                assert_eq!(first.content, "", "{case}: {first:?}");
+                assert!(mock.repair_calls().is_empty(), "{case}: the call's text was never held to the schema");
+                let rounds = mock.decode_calls().concat();
+                let last = rounds.iter().filter(|job| job.request == 0).last().expect("the first turn decoded");
+                assert!(!last.checked, "{case}: the released turn's rounds are no longer checked");
+                // A verified run that opens the call loses no draft to it:
+                // the opener is no miss, and nothing after it is checked.
+                let cuts: Vec<_> = mock.cut_calls().into_iter().filter(|(request, ..)| *request == 0).collect();
+                assert!(cuts.iter().all(|(_, shown, kept)| *kept == shown.len()), "{case}: {cuts:?}");
+                if runs && thinking {
+                    let opened = cuts.iter().any(|(_, shown, _)| shown[1..].contains(&WaitingDraw::Token(TOOL_CALL)));
+                    assert!(opened, "{case}: a verified run opened the call: {cuts:?}");
+                }
+
+                let second = turn(&app, &agent_turn(after_the_call(), json!("auto"), thinking, stream), stream).await;
+                assert!(second.calls.is_empty(), "{case}: {second:?}");
+                assert_eq!(second.finish, "stop", "{case}: {second:?}");
+                let answer: JsonValue = serde_json::from_str(&second.content).unwrap_or_else(|e| panic!("{case}: {e}: {second:?}"));
+                assert_eq!(answer, json!({ "city": "Oslo", "sky": "sunny" }), "{case}");
+                assert!(mock.repair_calls().iter().all(|repair| repair.request == 1), "{case}");
+                assert!(!mock.repair_calls().is_empty(), "{case}: the second turn's fence was repaired");
+                if runs {
+                    assert!(mock.cut_calls().iter().any(|(request, ..)| *request == 1), "{case}: the held turn kept its runs");
+                }
+            }
+        }
+    }
+}
+
+/// A released turn's call counts no miss and no repair on the structured
+/// series (#593); it is still a request held to a grammar.
+#[tokio::test]
+async fn a_released_turn_counts_no_miss() {
+    let mock = Arc::new(MockCompute::new());
+    mock.script(0, &encode(CALL));
+    let server = server(mock.clone(), SchedulerConfig::default()).with_metrics();
+    let metrics = server.metrics_app().expect("metrics are on");
+    let first = turn(&server.app(), &agent_turn(question(), json!("auto"), false, false), false).await;
+    assert_eq!(first.finish, "tool_calls", "{first:?}");
+    let series = |text: &str, name: &str| {
+        let wanted = format!("{name}{{type=\"json_schema\"}} ");
+        text.lines().find_map(|l| l.strip_prefix(&wanted)?.parse::<f64>().ok())
+    };
+    let mut scrape = String::new();
+    let settled = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let request = Request::builder().uri("/metrics").body(Body::empty()).unwrap();
+            let response = metrics.clone().oneshot(request).await.unwrap();
+            scrape = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+            if series(&scrape, "ignis_structured_requests_total") == Some(1.0) && series(&scrape, "ignis_structured_misses_total").is_some() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "the request never reached the series:\n{scrape}");
+    assert_eq!(series(&scrape, "ignis_structured_misses_total"), Some(0.0), "{scrape}");
+    assert_eq!(series(&scrape, "ignis_structured_repairs_total"), Some(0.0), "{scrape}");
+}
+
+/// Acceptance 2: a turn that answers instead of calling is held to the
+/// schema from its first token. Once the answer has started a tool call can
+/// no longer open: an opener there is a miss like any other, repaired into
+/// the answer.
+#[tokio::test]
+async fn a_turn_that_answers_directly_returns_an_answer_valid_under_the_schema() {
+    let scripts = [
+        ("an enum in the wrong case", "{\"city\": \"Oslo\", \"sky\": \"Sunny\"}"),
+        ("an opener inside the answer", "{\"city\": \"Oslo\", \"sky\": <tool_call>\"sunny\"}"),
+    ];
+    let mut answers = Vec::new();
+    for (what, script) in scripts {
+        for stream in [false, true] {
+            let (app, mock) = app(script);
+            let got = turn(&app, &agent_turn(question(), json!("auto"), false, stream), stream).await;
+            assert!(got.calls.is_empty(), "{what}: {got:?}");
+            assert_eq!(got.finish, "stop", "{what}: {got:?}");
+            let answer: JsonValue = serde_json::from_str(&got.content).unwrap_or_else(|e| panic!("{what}: {e}: {got:?}"));
+            assert_eq!(answer["city"], "Oslo", "{what}: {got:?}");
+            assert!(["sunny", "rainy"].contains(&answer["sky"].as_str().unwrap_or("")), "{what}: {got:?}");
+            assert!(!mock.repair_calls().is_empty(), "{what}: the miss was repaired");
+            answers.push((what, WEATHER, got.content));
+        }
+    }
+    assert_independently_valid(&answers);
+}
+
+/// Until the answer starts, a miss's repair may open the call: the opener is
+/// in the permitted set beside the answer's first tokens, as masking every
+/// step would have it. Once the answer has started it is not. The scripted
+/// model writes a word before its object, each letter a miss before the
+/// answer starts, and an enum in the wrong case inside it.
+#[tokio::test]
+async fn until_the_answer_starts_a_repair_may_open_the_call_and_after_it_may_not() {
+    let (app, mock) = app("Here: {\"city\": \"Oslo\", \"sky\": \"Sunny\"}");
+    let got = turn(&app, &agent_turn(question(), json!("auto"), false, false), false).await;
+    assert!(got.calls.is_empty(), "{got:?}");
+    assert!(serde_json::from_str::<JsonValue>(&got.content).is_ok(), "{got:?}");
+    let opens: Vec<bool> = mock.repair_calls().iter().map(|repair| repair.permitted.permits(TOOL_CALL)).collect();
+    assert_eq!(opens.first(), Some(&true), "a repair before the answer could open the call: {opens:?}");
+    assert_eq!(opens.last(), Some(&false), "a repair inside the answer could not: {opens:?}");
+    assert!(opens.windows(2).all(|pair| pair[0] >= pair[1]), "never again once the answer started: {opens:?}");
+}
+
+/// Acceptance 3: `tool_choice: "required"` or a named function forces the
+/// call beside `response_format`, as without it (#286): the opening is the
+/// server's, the model writes the rest, and the turn is a call, not held to
+/// the schema. The model here was about to answer.
+#[tokio::test]
+async fn a_forced_tool_choice_beside_response_format_forces_the_call() {
+    let cases = [
+        (json!("required"), "<tool_call>\n<function", "=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>"),
+        (
+            json!({ "type": "function", "function": { "name": "get_weather" } }),
+            "<tool_call>\n<function=get_weather>\n",
+            "<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>",
+        ),
+    ];
+    for (tool_choice, opening, rest) in cases {
+        for stream in [false, true] {
+            let forced = encode(opening).len();
+            let answering: String = "{\"city\": \"Oslo\", \"sky\": \"sunny\"}".chars().chain(std::iter::repeat(' ')).take(forced).collect();
+            let (app, mock) = app(&format!("{answering}{rest}"));
+            let got = turn(&app, &agent_turn(question(), tool_choice.clone(), false, stream), stream).await;
+            assert_eq!(got.calls, [("get_weather".to_owned(), json!({ "city": "Oslo" }))], "{tool_choice}: {got:?}");
+            assert_eq!(got.finish, "tool_calls", "{tool_choice}: {got:?}");
+            assert!(mock.repair_calls().is_empty(), "{tool_choice}: the forced turn was not held to the schema");
+        }
+    }
+}
+
+/// A tokenizer whose `<tool_call>` is not one token cannot tell a call's
+/// opener from the answer's first token, so tools a turn may call beside
+/// structured output are refused there, naming `response_format`, rather
+/// than offered and never callable. Without tools to call the request is
+/// served.
+#[tokio::test]
+async fn tools_a_turn_may_call_on_a_tokenizer_with_no_single_token_opener_are_refused() {
+    let vocabulary = Vocabulary { split_tool_call: true, ..Vocabulary::new() };
+    let app = server_over(Arc::new(MockCompute::new()), SchedulerConfig::default(), vocabulary).app();
+    let (status, _, text) = post_text(&app, &agent_turn(question(), json!("auto"), false, false)).await;
+    assert_eq!(status, 400, "{text}");
+    let v: JsonValue = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["error"]["param"], "response_format", "{text}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("<tool_call>"), "{text}");
+    let (status, _, text) = post_text(&app, &agent_turn(question(), json!("none"), false, false)).await;
+    assert_eq!(status, 200, "{text}");
+}
+
+// ── ignis's own callers (#594) ──────────────────────────────────────────
+
+/// An edit's rewrite on the loaded model: one condition image.
+async fn edit_rewrite(script: &str) -> (Result<ignis_server::images::enhance::Rewritten, String>, Arc<MockCompute>) {
+    use ignis_core::image::{ImageSize, RgbaImage};
+    let mock = Arc::new(MockCompute::new());
+    mock.script(0, &encode(script));
+    let server = server(mock.clone(), SchedulerConfig::default());
+    let image = RgbaImage { size: ImageSize::new(1, 1), pixels: vec![255, 0, 0, 255] };
+    (ignis_server::images::enhance::rewrite(&server, "make it blue", &[image], 1).await, mock)
+}
+
+/// The edit enhancer's request carries a strict `json_schema`: a fenced
+/// answer's first token is a miss, caught and repaired like any held answer.
+/// And the answer, held, is the object itself: no fence is stripped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_edit_enhancer_holds_its_answer_to_a_schema_and_reads_it_as_is() {
+    let (rewritten, mock) = edit_rewrite("{\"Rewritten\": \"Make the car blue.\"}").await;
+    assert_eq!(rewritten.unwrap().prompt, "Make the car blue.");
+    assert!(mock.repair_calls().is_empty(), "a conforming answer needs no repair");
+
+    let (_, mock) = edit_rewrite("```json\n{\"Rewritten\": \"Make the car blue.\"}\n```").await;
+    assert!(!mock.repair_calls().is_empty(), "the fence was refused by the grammar, so the request carried one");
+}
+
+/// #589 beside #592: a turn that may answer is told the schema; a forced
+/// call's turn, which writes no answer, is not.
+#[tokio::test]
+async fn a_forced_calls_turn_is_not_told_the_schema() {
+    for (tool_choice, described) in [(json!("auto"), true), (json!("required"), false)] {
+        let render = render_of(&agent_turn(question(), tool_choice.clone(), false, false), over_mock).await;
+        assert_eq!(render.description.is_some(), described, "{tool_choice}: {render:?}");
+    }
 }

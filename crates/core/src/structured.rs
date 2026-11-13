@@ -13,6 +13,14 @@
 //! one masking every step gives; a check costs about a microsecond and only
 //! a miss sends anything down.
 //!
+//! # Speculation stays on
+//!
+//! A verify round's drafts are checked before they are committed (GitHub
+//! #590, [`GrammarState::check_run`]): the host's cut keeps the run up to its
+//! first draft that does not pass, which then waits as the round's draw and
+//! is held like any other -- repaired from the verify pass's scores on a
+//! miss, or the request ended on a stop where the answer is complete.
+//!
 //! # Where the answer starts
 //!
 //! With the generation starting inside the reasoning block, at the token
@@ -20,6 +28,17 @@
 //! first token, which the prefill draws. A draw a permitted set forced (the
 //! thinking budget's close, whose tail is the line break after `</think>`)
 //! is the server's own text and is neither checked nor fed to the grammar.
+//!
+//! # A tool call instead of the answer
+//!
+//! With tools beside the grammar (GitHub #592), a turn either calls a tool or
+//! answers under the grammar. Until the answer starts -- until anything but
+//! leading whitespace has passed -- the grammar also admits the tool call's
+//! opener ([`AnswerGrammar::admitting_tool_call`]), a control token no
+//! grammar accepts: it passes, and the turn is **released** from the grammar,
+//! so the call is written as the model writes it, with no check, miss or
+//! repair. A repair before the answer starts may draw the opener too: it is
+//! in the permitted set, as masking every step would have it.
 //!
 //! # Where it ends
 //!
@@ -94,6 +113,7 @@ pub struct AnswerGrammar {
     grammar: Arc<Grammar>,
     kind: StructuredKind,
     think_end: Option<TokenId>,
+    tool_opener: Option<TokenId>,
 }
 
 impl AnswerGrammar {
@@ -101,7 +121,7 @@ impl AnswerGrammar {
     /// With the generation starting inside the reasoning block it starts
     /// after the block's close, which [`AnswerGrammar::after`] names.
     pub fn new(grammar: Arc<Grammar>, kind: StructuredKind) -> Self {
-        Self { grammar, kind, think_end: None }
+        Self { grammar, kind, think_end: None, tool_opener: None }
     }
 
     /// The same answer, starting after the reasoning block's `think_end` when
@@ -109,6 +129,14 @@ impl AnswerGrammar {
     /// ([`crate::types::DecodeParams::starts_in_reasoning`]).
     pub fn after(self, think_end: TokenId) -> Self {
         Self { think_end: Some(think_end), ..self }
+    }
+
+    /// The same answer, which the turn may skip for a tool call (GitHub
+    /// #592): until the answer starts, `opener` -- the tool call's opening
+    /// token, which no grammar accepts -- passes too, and releases the turn
+    /// from the grammar.
+    pub fn admitting_tool_call(self, opener: TokenId) -> Self {
+        Self { tool_opener: Some(opener), ..self }
     }
 
     /// What the request asked for.
@@ -125,6 +153,12 @@ impl AnswerGrammar {
     pub fn think_end(&self) -> Option<TokenId> {
         self.think_end
     }
+
+    /// The tool call's opener the turn may write instead of the answer, if
+    /// tools ride beside the grammar.
+    pub fn tool_opener(&self) -> Option<TokenId> {
+        self.tool_opener
+    }
 }
 
 /// A compiled grammar holds thousands of states; what a log line needs is
@@ -134,6 +168,7 @@ impl std::fmt::Debug for AnswerGrammar {
         f.debug_struct("AnswerGrammar")
             .field("kind", &self.kind)
             .field("think_end", &self.think_end)
+            .field("tool_opener", &self.tool_opener)
             .finish()
     }
 }
@@ -147,6 +182,9 @@ pub enum Verdict {
     Finished,
     /// A **miss**: the position is repaired before the next round.
     Miss,
+    /// The tool call's opener before the answer started (GitHub #592): the
+    /// turn is a call, released from the grammar.
+    Released,
 }
 
 /// One request's progress through its grammar
@@ -157,6 +195,9 @@ pub struct GrammarState {
     /// The answer has started: thinking off, or the reasoning block closed.
     open: bool,
     think_end: Option<TokenId>,
+    tool_opener: Option<TokenId>,
+    /// The turn opened a tool call (GitHub #592): nothing more is checked.
+    released: bool,
     /// The permitted set's bits, built on the first miss and reused.
     set: Option<TokenSet>,
 }
@@ -169,13 +210,28 @@ impl GrammarState {
             matcher: Matcher::new(grammar.grammar.clone()),
             open: !starts_in_reasoning,
             think_end: grammar.think_end,
+            tool_opener: grammar.tool_opener,
+            released: false,
             set: None,
         }
     }
 
-    /// Whether the answer has started, so a draw is the grammar's to check.
+    /// Whether the answer has started, so a draw is the grammar's to check:
+    /// never again once the turn opened a tool call.
     pub fn holds(&self) -> bool {
-        self.open
+        self.open && !self.released
+    }
+
+    /// Whether the turn opened a tool call and is released from the grammar
+    /// (GitHub #592): its rounds are no longer checked.
+    pub fn released(&self) -> bool {
+        self.released
+    }
+
+    /// Whether `token` is the tool call's opener where it may still open one:
+    /// before the answer has started.
+    fn opens_tool_call(&self, token: TokenId) -> bool {
+        self.tool_opener == Some(token) && !self.matcher.answer_started()
     }
 
     /// The tokens a call committed: the reasoning block's close among them
@@ -186,9 +242,57 @@ impl GrammarState {
         }
     }
 
-    /// Check a waiting draw of the answer, and take it when it passes.
+    /// Check a verify round's run before it is committed (GitHub #590): its
+    /// anchor -- the last waiting draw, already held -- then the drafts the
+    /// target accepted. Returns how many of the run's tokens the commit
+    /// keeps, at least the anchor: every draft that passes as an ordinary
+    /// token is the grammar's from then on, and the first that does not --
+    /// a miss, or a stop -- is where the run is cut. That draft then waits
+    /// as the round's draw, and is held as every waiting draw is
+    /// ([`GrammarState::check`]): repaired, or the request ended.
+    ///
+    /// Before the answer starts nothing is checked, but a reasoning close in
+    /// the run opens it at the token after; a stop there is the leaf's to cut
+    /// or redirect, and the rest of the run is left to it whole. So is the
+    /// rest of a run whose draft opens a tool call before the answer started
+    /// (GitHub #592), which releases the turn, and every run after.
+    pub fn check_run(&mut self, run: &[WaitingDraw]) -> usize {
+        if self.released {
+            return run.len();
+        }
+        for (index, &draw) in run.iter().enumerate() {
+            let token = match draw {
+                WaitingDraw::Token(token) => token,
+                WaitingDraw::Stop if self.open && index > 0 => return index,
+                WaitingDraw::Stop => return run.len(),
+            };
+            if !self.open {
+                self.open = self.think_end == Some(token);
+                continue;
+            }
+            // The anchor was held when it was drawn.
+            if index == 0 {
+                continue;
+            }
+            if self.opens_tool_call(token) {
+                self.released = true;
+                return run.len();
+            }
+            if self.matcher.grammar().vocab().is_stop(token) || !self.matcher.accept(token) {
+                return index;
+            }
+        }
+        run.len()
+    }
+
+    /// Check a waiting draw of the answer, and take it when it passes. The
+    /// tool call's opener before the answer started releases the turn.
     pub fn check(&mut self, draw: WaitingDraw) -> Verdict {
         match draw {
+            WaitingDraw::Token(token) if self.opens_tool_call(token) => {
+                self.released = true;
+                Verdict::Released
+            }
             WaitingDraw::Stop if self.matcher.is_accepting() => Verdict::Finished,
             WaitingDraw::Stop => Verdict::Miss,
             WaitingDraw::Token(token) if !self.matcher.accept(token) => Verdict::Miss,
@@ -198,19 +302,29 @@ impl GrammarState {
     }
 
     /// The permitted set where the answer stands: what a repair restricts
-    /// the missed position to. Never empty while the answer is not finished
-    /// (no state of a grammar is a dead end); an empty one is refused here.
+    /// the missed position to, the tool call's opener among it until the
+    /// answer starts. Never empty while the answer is not finished (no state
+    /// of a grammar is a dead end); an empty one is refused here.
     pub fn permitted(&mut self) -> Result<PermittedMask, String> {
         let vocab = self.matcher.grammar().vocab().len();
+        let opener = self.tool_opener.filter(|&opener| self.opens_tool_call(opener) && (opener as usize) < vocab);
         let set = self.set.get_or_insert_with(|| TokenSet::new(vocab));
         self.matcher.mask(set);
+        if let Some(opener) = opener {
+            set.insert(opener);
+        }
         PermittedMask::from_words(vocab as u32, set.words().to_vec())
     }
 
     /// Take the token a repair drew: `true` when it was a stop, and the
-    /// answer is complete. Refused when the token is not one the grammar
-    /// allows there, which a repair under its permitted set never draws.
+    /// answer is complete. The tool call's opener releases the turn. Refused
+    /// when the token is not one the grammar allows there, which a repair
+    /// under its permitted set never draws.
     pub fn repaired(&mut self, token: TokenId) -> Result<bool, String> {
+        if self.opens_tool_call(token) {
+            self.released = true;
+            return Ok(false);
+        }
         match self.matcher.accept(token) {
             true => Ok(self.matcher.is_finished()),
             false => Err(format!("the repair drew token {token}, which the grammar does not allow there")),
@@ -222,6 +336,7 @@ impl std::fmt::Debug for GrammarState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GrammarState")
             .field("open", &self.open)
+            .field("released", &self.released)
             .field("accepting", &self.matcher.is_accepting())
             .finish()
     }

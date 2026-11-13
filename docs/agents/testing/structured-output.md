@@ -64,7 +64,16 @@ The measured figures are in
   only whitespace -- and each answer comes back a valid object, streamed and
   whole alike; the reasoning stays unchecked with thinking on, and after a
   thinking budget's forced close the answer is held; cuts by `max_tokens` and
-  by the deadline; the refusals (Flash-Next, a forced tool call). Against a
+  by the deadline; the refusals (Flash-Next, tools beside a split
+  `<tool_call>`). Tools beside the schema (#592, the test vocabulary's
+  `<tool_call>` one control token): a turn that opens a call is released and
+  its call comes back as written, with no repair, no miss on the series and
+  its later rounds unchecked, also with thinking on and inside a verified run
+  that keeps every draft; the next turn is held again; an opener inside the
+  answer is a miss; a repair's permitted set holds the opener until the
+  answer starts and never after; a forced `tool_choice` forces the call.
+  `openai_http_fields strict_on_a_function_tool` pins `strict` on a function
+  tool inert, on chat completions and the Responses API. Against a
   strict schema the script writes key names of its own, an enum in the wrong
   case, numbers out of range, a missing key, an extra key, a string its
   pattern refuses and a date in words: each answer is checked by hand and by
@@ -90,13 +99,41 @@ The measured figures are in
   disagrees. `cargo test -p ignis-server --test user_docs_reference` holds
   the committed page to it.
 - **The adapter** (`cargo test -p ignis-runtime --test runtime_compute
-  a_checked_lane`): a checked lane reports its waiting draw, the EOS as a stop.
-- **On the GPU** (27B, speculation off, greedy): the served answers -- three
-  `json_object` prompts and every case of the corpus, each schema compiled
-  strict and not described in the prompt -- equal the per-token masked argmax
-  of the prefill route's readouts, up to a near-tie both routes call one.
-  Ignored outside the GPU profile:
+  a_checked_lane`): a checked lane reports its waiting draw, the EOS as a stop;
+  through `decode_step_cut` (#590) its verified run reaches the host by its
+  job, the EOS as a stop, and is committed as far as the host kept it.
+- **On the GPU** (27B, greedy): the served answers -- three `json_object`
+  prompts and every case of the corpus, each schema compiled strict and not
+  described in the prompt -- with DFlash2 off and on equal each other and the
+  per-token masked argmax of the prefill route's readouts, up to a near-tie
+  both routes call one. Ignored outside the GPU profile:
 
   ```sh
   cargo test -p ignis-server --features cuda --test structured_output_gpu -- --ignored --nocapture
+  ```
+
+## Speculation stays on (GitHub #590)
+
+A verify round's run is checked before it is committed: the host's cut keeps
+it up to its first draft the grammar does not pass, and that draft waits to be
+repaired from the verify pass's scores, as a plain round's draw is.
+
+- **Over the mock engine** (`cargo test -p ignis-core --test
+  structured_verify_cut`, `cargo test -p ignis-server --test
+  structured_output_http with_speculation`): `MockCompute::with_runs` commits
+  runs as verify rounds do and shows each checked lane's run to the host
+  (`MockCompute::cut_calls`). A miss in the middle of a run is cut there and
+  repaired, the tokens before it kept; an answer is the same with runs and one
+  token a round; an unconstrained neighbour keeps its runs.
+- **The leaf's cut arithmetic** (`ignis_cut_host_kept_run`, host-only, in
+  `kernel/tests/test_reasoning_redirect.cpp`):
+  `ctest --test-dir kernel/build -R ignis_kernel_reasoning_redirect_test`.
+- **On the GPU**, beside the served test above (`verify_cut_gpu`): three
+  DFlash2 lanes, one held to `json_object`. The free lanes verify and commit
+  what they do beside a free lane, every round replays its verify graph, each
+  repair after a cut is the masked argmax of the verify column that drew it,
+  and a run was cut inside:
+
+  ```sh
+  cargo test -p ignis-core --features cuda --test verify_cut_gpu -- --ignored --nocapture
   ```

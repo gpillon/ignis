@@ -431,6 +431,13 @@ struct IgnisVerifyRound {
   std::unique_ptr<ninfer::DeviceBuffer> append_counts; // I32 [B]
   std::unique_ptr<ninfer::DeviceArena> drafter_scratch;
 
+  // GitHub #590 (spec #287): `logits` is also where a repair reads the
+  // scores of a lane whose commit the host cut (`ignis_kept_scores`, source
+  // kVerifyLogits). Every round writes the whole buffer, so each round stamps
+  // it once, from the model's `kept_epoch` counter, and a repair refuses a
+  // kept record whose stamp is no longer this one.
+  std::uint64_t kept_epoch = 0;
+
   // One verify graph per exact width 1..decode_lanes, captured by
   // `ignis_decode_graph_capture` after the decode graphs; the tables stay
   // the most a round serves wide (GitHub #336).

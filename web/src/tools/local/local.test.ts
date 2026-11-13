@@ -4,10 +4,10 @@ import type { StreamOptions, StreamResult } from "../../api/stream.ts";
 import type { Timeline } from "../../metrics/figures.ts";
 import { type LocalContext, type LocalRun, runLocalCalls } from "./local.ts";
 import { createMemoryStore, memoryNotice } from "./memory.ts";
-import { JS_CHECK_SYSTEM_PROMPT, parseVerdict, runJs, type WorkerFactory, workerMain, type WorkerScope } from "./runjs.ts";
+import { checkJs, JS_CHECK_FORMAT, JS_CHECK_SYSTEM_PROMPT, parseVerdict, readVerdict, runJs, type WorkerFactory, workerMain, type WorkerScope } from "./runjs.ts";
 
 /** The chat body a request goes out as over HTTP. */
-const chatBody = ({ settings, turns, extras }: ConversationRequest) => buildChatRequest(settings, turns, extras);
+const chatBody = ({ settings, turns, extras, responseFormat }: ConversationRequest) => buildChatRequest(settings, turns, extras, responseFormat);
 
 const settings: Settings = {
   systemPrompt: "",
@@ -104,6 +104,37 @@ describe("run_js", () => {
     );
     expect(bodies[0].reasoning_effort).toBe("none");
     expect("thinking_budget" in bodies[0]).toBe(false);
+  });
+
+  it("holds the verdict to a strict schema and reads it as written", async () => {
+    const bodies: ChatRequest[] = [];
+    const check = await checkJs("1 + 1", { settings, signal: new AbortController().signal, stream: reviewer('{"verdict":"safe","reason":" Arithmetic. "}', bodies) });
+    expect(bodies[0].response_format).toEqual({ type: "json_schema", json_schema: { ...JS_CHECK_FORMAT, strict: true } });
+    expect(JS_CHECK_FORMAT.schema).toMatchObject({ required: ["verdict", "reason"], additionalProperties: false });
+    expect(check).toMatchObject({ verdict: "safe", reason: "Arithmetic." });
+    // No fence is stripped from a held reply: a fenced one is no verdict.
+    expect(readVerdict('```json\n{"verdict":"safe","reason":"ok"}\n```').verdict).toBe("unsafe");
+  });
+
+  it("calls a cut reply unsafe, even when its prefix reads safe", async () => {
+    const cut = async (o: StreamOptions): Promise<StreamResult> => {
+      o.onEvent({ kind: "content", text: '{"verdict":"safe","reason":"Arith' });
+      return { ok: true, timeline: { ...timeline, finishReason: "length" } };
+    };
+    expect((await checkJs("1 + 1", { settings, signal: new AbortController().signal, stream: cut })).verdict).toBe("unsafe");
+  });
+
+  it("asks again without the schema where the model answers 400 for it, so Flash-Next sees no new failure", async () => {
+    const bodies: ChatRequest[] = [];
+    const unsupported = async (o: StreamOptions): Promise<StreamResult> => {
+      bodies.push(chatBody(o.request));
+      if (o.request.responseFormat) return { ok: false, message: "400: response_format: structured output is not served by Flash-Next yet (GitHub #581)", timeline };
+      o.onEvent({ kind: "content", text: 'Sure: {"verdict":"safe","reason":"ok"}' });
+      return { ok: true, timeline };
+    };
+    const check = await checkJs("1 + 1", { settings, signal: new AbortController().signal, stream: unsupported });
+    expect(check).toMatchObject({ verdict: "safe", reason: "ok" });
+    expect(bodies.map((body) => "response_format" in body)).toEqual([true, false]);
   });
 
   it("reads anything but a clear safe verdict as unsafe", () => {

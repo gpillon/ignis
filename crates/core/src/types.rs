@@ -191,8 +191,10 @@ pub struct RequestInput {
     ///
     /// Never set together with [`RequestInput::constrained`] nor with
     /// [`RequestInput::forced_literal`]: each of those owns the draws it
-    /// forces, and the server refuses a forced tool call beside structured
-    /// output until a turn may open one under the grammar (#592).
+    /// forces. A turn whose tool call is forced is a call, and the server
+    /// holds it to no grammar; one that may call a tool admits the call's
+    /// opener until its answer starts (#592,
+    /// [`crate::structured::AnswerGrammar::admitting_tool_call`]).
     pub grammar: Option<crate::structured::AnswerGrammar>,
     /// Whether this request is a **warm-up** (GitHub #282, the Responses
     /// WebSocket mode's `generate: false`): like a decision it ends where its
