@@ -656,6 +656,19 @@ Seconds with no request using the model after which it is unloaded — VRAM, pin
 
 What a text model's host plan must leave of the physical memory available at load (free plus standby): a load whose pinned lines — the 27B's token embedding, Flash-Next's experts and n-gram hot rows, staging, retained host slots, the KV-RAM arena — leave less is refused, naming the line to shrink, so the desktop is never paged out. The image model makes no host plan: its start carries it for a switch to a text model.
 
+### `model.grammar_cache_bytes`
+
+| | |
+|---|---|
+| Flag | `--model-grammar-cache-bytes` |
+| Env var | `IGNIS_MODEL_GRAMMAR_CACHE_BYTES` |
+| Kind | `bytes` |
+| Default | `256M` |
+| Models | all |
+| `/v1/config` | shown by `GET`, not patchable |
+
+The memory structured output's compiled grammars may hold, for the loaded model: one per distinct `json_schema` and `strict` flag, so a schema sent again is not compiled again, and past this the least recently used are dropped (a request still holding one keeps it). Ordinary RAM, taken as schemas arrive. 0 keeps only the last one.
+
 ### `model.adapt_context_step`
 
 | | |

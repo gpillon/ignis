@@ -1,8 +1,12 @@
-//! Structured output's exactness on the 27B (GitHub #587 and #590, spec
-//! #287, ADR 0089): with greedy decoding, an answer served check-first --
-//! each draw checked against the grammar before the next round consumes it,
-//! a miss repaired from the scores its call kept -- is the answer masking
-//! every step gives, and speculation never changes it.
+//! Structured output's exactness on the 27B (GitHub #587, #588 and #590,
+//! spec #287, ADR 0089): with greedy decoding, an answer served check-first
+//! -- each draw checked against the grammar before the next round consumes
+//! it, a miss repaired from the scores its call kept -- is the answer
+//! masking every step gives, and speculation never changes it. The answers
+//! are held to `json_object` (three prompts the model answers in prose,
+//! behind a fence, or as an object) and to each case of the grammar's corpus
+//! (`crates/grammar/tests/corpus/cases.json`: its schemas compiled strict as
+//! a request's are, its prompts as written, the schema not described).
 //!
 //! Three halves, the model loaded once for each:
 //!
@@ -59,6 +63,7 @@ use ignis_core::{
     DecodeParams, FinishReason, KvFormat, RequestClass, RequestInput, SchedEvent, Speculation, SpeculativeBackend,
     TokenId,
 };
+use ignis_grammar::json::Json;
 use ignis_grammar::{Grammar, Matcher, TokenSet};
 use ignis_server::artifact_template::ArtifactTemplateProvider;
 use ignis_server::engine::Engine;
@@ -121,18 +126,21 @@ fn cases(provider: &ArtifactTemplateProvider) -> Vec<Case> {
             kind: StructuredKind::JsonObject,
         })
         .collect();
-    let corpus: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(CORPUS).unwrap_or_else(|e| panic!("{CORPUS}: {e}"))).unwrap();
-    for case in corpus.as_array().expect("the corpus is a list of cases") {
-        let name = case["name"].as_str().expect("a case's name").to_owned();
-        let (grammar, kind) = match case.get("schema") {
+    // Read with the grammar's own parser: a serde_json value would sort a
+    // schema's keys, and the grammar writes them in the schema's order.
+    let corpus = Json::parse(&std::fs::read_to_string(CORPUS).unwrap_or_else(|e| panic!("{CORPUS}: {e}")))
+        .unwrap_or_else(|e| panic!("{CORPUS}: {e}"));
+    let Json::Arr(entries) = corpus else { panic!("the corpus is a list of cases") };
+    for entry in &entries {
+        let name = entry.get("name").and_then(Json::as_str).expect("a case's name").to_owned();
+        let (grammar, kind) = match entry.get("schema") {
             None => (grammars.json_object(), StructuredKind::JsonObject),
             Some(schema) => (
-                grammars.json_schema(&schema.to_string(), true).unwrap_or_else(|e| panic!("{name}: {e}")),
+                grammars.json_schema(&schema.compact(), true).unwrap_or_else(|e| panic!("{name}: {e}")),
                 StructuredKind::JsonSchema,
             ),
         };
-        let prompt = render(case["prompt"].as_str().expect("a case's prompt"));
+        let prompt = render(entry.get("prompt").and_then(Json::as_str).expect("a case's prompt"));
         cases.push(Case { name, prompt, grammar, kind });
     }
     cases
@@ -314,7 +322,7 @@ async fn constrained_answers_equal_the_per_token_masked_argmax_with_dflash2_off_
     let provider = ArtifactTemplateProvider::new(
         FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}")),
     )
-    .with_grammar_vocabulary(vocab(), eos);
+    .with_grammar_vocabulary(vocab(), eos, ignis_grammar::DEFAULT_CACHE_BYTES);
     let cases = cases(&provider);
     let Some(off) = serve(&frontend, &cases, eos, false).await else { return };
     let Some(on) = serve(&frontend, &cases, eos, true).await else { return };

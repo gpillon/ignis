@@ -16,7 +16,10 @@ ignis-logging = { path = "../logging" }
 # The speech model's CPU executor (spec speech/01, ADR 0068): pure Rust, in every build.
 ignis-speech = { path = "../speech" }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value` (GitHub #588): a `json_schema` reaches the grammar as the text
+# the client sent, its keys in their order; `serde_json::Value`'s map sorts
+# them, and a strict answer writes its keys in the schema's order.
+serde_json = { workspace = true, features = ["raw_value"] }
 # The config file's YAML half (ADR 0046, spec config-v2/01): read and written
 # through the same `serde` path as its JSON half. 0.9 is the last release and
 # marked deprecated upstream; it is complete for a config file's needs and

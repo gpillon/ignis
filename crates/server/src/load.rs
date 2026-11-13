@@ -385,9 +385,14 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
     let item_bound = processor.as_ref().map(|p| p.options().max_item_tokens());
     let provider = crate::artifact_template::ArtifactTemplateProvider::new(frontend);
     // GitHub #587: a model that serves structured output reads its grammars'
-    // vocabulary over its logits row, the EOS ending a complete answer.
+    // vocabulary over its logits row, the EOS ending a complete answer; its
+    // compiled grammars hold what `model.grammar_cache_bytes` allows (#588).
     let provider = match eos.filter(|_| family.serves_structured_output()) {
-        Some(eos) => provider.with_grammar_vocabulary(ignis_core::compute::ModelConfig::qwen38_27b().vocab as usize, eos),
+        Some(eos) => provider.with_grammar_vocabulary(
+            ignis_core::compute::ModelConfig::qwen38_27b().vocab as usize,
+            eos,
+            usize::try_from(config.grammar_cache_bytes).unwrap_or(usize::MAX),
+        ),
         None => provider,
     };
 

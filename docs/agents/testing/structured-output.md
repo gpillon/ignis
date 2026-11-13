@@ -55,7 +55,7 @@ or a corpus document it refused that the standard accepts, except the
 The measured figures are in
 [the finding](../../findings/2026-11-12-structured-output-grammar-measured-on-the-27b.md).
 
-## The served path (`json_object`, GitHub #587)
+## The served path (`json_object` GitHub #587, `json_schema` #588)
 
 - **Over the mock engine** (`cargo test -p ignis-server --test
   structured_output_http`, about 1 s): the `/v1` surface with a test
@@ -64,20 +64,40 @@ The measured figures are in
   only whitespace -- and each answer comes back a valid object, streamed and
   whole alike; the reasoning stays unchecked with thinking on, and after a
   thinking budget's forced close the answer is held; cuts by `max_tokens` and
-  by the deadline; the refusals (`json_schema`, Flash-Next, a forced tool
-  call). The mock refuses a repair made after a later call, so a scheduler
-  that checks a draw late fails here first. Its repair ranks a script's later
-  tokens before the vocabulary in order, and the test vocabulary puts the
-  tokens that close a value first.
+  by the deadline; the refusals (Flash-Next, a forced tool call). Against a
+  strict schema the script writes key names of its own, an enum in the wrong
+  case, numbers out of range, a missing key, an extra key, a string its
+  pattern refuses and a date in words: each answer is checked by hand and by
+  the independent validator below, and keys come in the schema's order (the
+  schema reaches the grammar as sent, `serde_json::value::RawValue`). Every
+  refusal the spec names is a 400 with the refusal's code, `param`
+  `response_format` and the keyword or limit in the message, and the mock
+  saw no prefill; a non-strict `minLength` is served and listed inert by the
+  generated reference; a schema sent three times, its whitespace changed, is
+  compiled once. The mock refuses a repair made after a later call, so a
+  scheduler that checks a draw late fails here first. Its repair ranks a
+  script's later tokens before the vocabulary in order, and the test
+  vocabulary puts the tokens that close a value first.
+- **The independent validator in the served tests**: the schema answers go
+  through `tools/grammar-check/validate.py` with the Python of
+  `IGNIS_GRAMMAR_CHECK_PYTHON`, else the venv at `.scratch/grammar-venv`
+  (made as above). Where neither exists the validation is skipped with a
+  line saying so, and the hand checks still run.
+- **The generated reference** (`docs/user/reference/json-schema.md`,
+  `user_docs::json_schema`): its lists come from the grammar crate's, and the
+  page compiles each inert keyword (refused under `strict`, inert without)
+  and a schema past each limit, so generating it fails if the grammar
+  disagrees. `cargo test -p ignis-server --test user_docs_reference` holds
+  the committed page to it.
 - **The adapter** (`cargo test -p ignis-runtime --test runtime_compute
   a_checked_lane`): a checked lane reports its waiting draw, the EOS as a stop;
   through `decode_step_cut` (#590) its verified run reaches the host by its
   job, the EOS as a stop, and is committed as far as the host kept it.
-- **On the GPU** (27B, greedy): the served answers -- `json_object` and every
-  schema of the corpus, compiled through `ignis-grammar` -- with DFlash2 off
-  and on equal each other and the per-token masked argmax of the prefill
-  route's readouts, up to a near-tie both routes call one. Ignored outside the
-  GPU profile:
+- **On the GPU** (27B, greedy): the served answers -- three `json_object`
+  prompts and every case of the corpus, each schema compiled strict and not
+  described in the prompt -- with DFlash2 off and on equal each other and the
+  per-token masked argmax of the prefill route's readouts, up to a near-tie
+  both routes call one. Ignored outside the GPU profile:
 
   ```sh
   cargo test -p ignis-server --features cuda --test structured_output_gpu -- --ignored --nocapture
