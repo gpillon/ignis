@@ -266,9 +266,8 @@ pub(crate) async fn prepare(
     // `text.format`, read as chat reads `response_format` (GitHub #591): a
     // refusal comes before anything is rendered or generated. A warm-up
     // generates nothing, so it is told no schema and holds no grammar.
-    let describe = api::describe_schema(server, req.ignis_describe_schema.as_ref())?;
-    let format = api::text_answer_format(req.text.as_deref())?;
-    let held = api::hold_answer(server, format, describe, &thinking, &tools, &tool_choice, "text.format")?
+    let format = api::text_answer_format(req.text.as_deref());
+    let held = api::structured_output(server, format, "text.format", req.ignis_describe_schema.as_ref(), &thinking, &tools, &tool_choice)?
         .filter(|_| !warm_up);
     let (grammar, description) = match held {
         Some(held) => (Some(held.grammar), held.description.filter(|_| !system_only)),

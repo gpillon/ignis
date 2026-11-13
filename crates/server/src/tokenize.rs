@@ -253,7 +253,8 @@ async fn chat(server: &Arc<Server>, req: TokenizeRequest) -> Result<(Vec<u32>, O
     // with (GitHub #589), and a format chat would refuse is refused here.
     let description = structured_output(
         server,
-        req.response_format.as_deref(),
+        crate::api::chat_answer_format(req.response_format.as_deref()),
+        "response_format",
         req.ignis_describe_schema.as_ref(),
         &thinking,
         &tools,

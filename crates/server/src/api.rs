@@ -1678,37 +1678,49 @@ pub(crate) struct HeldAnswer {
 /// `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema":
 /// {"name", "description", "schema", "strict"}}`. Anything else is a 400
 /// naming `response_format`.
-fn chat_answer_format(format: Option<&RawValue>) -> Result<AnswerFormat<'_>, Response> {
+pub(crate) fn chat_answer_format(format: Option<&RawValue>) -> Result<AnswerFormat<'_>, Response> {
     const PARAM: &str = "response_format";
     let Some(raw) = format else { return Ok(AnswerFormat::Free) };
+    answer_format(raw, PARAM, "{\"type\": \"json_schema\", ...}", || {
+        #[derive(Deserialize)]
+        struct Wire<'a> {
+            #[serde(borrow)]
+            json_schema: Option<&'a RawValue>,
+        }
+        match serde_json::from_str::<Wire<'_>>(raw.get()).ok().and_then(|wire| wire.json_schema) {
+            Some(members) => schema_format(members, "response_format.json_schema", PARAM),
+            None => Err(bad_request_param(
+                "response_format: json_schema names its schema in a json_schema object: {\"type\": \"json_schema\", \"json_schema\": {\"name\": ..., \"schema\": {...}, \"strict\": true}}",
+                PARAM,
+            )),
+        }
+    })
+}
+
+/// A format's `type`, as both surfaces read it (#591): `text` a free answer,
+/// `json_object` any object, `json_schema` the schema `schema` reads from
+/// where the surface keeps its members. Any other is a 400 naming `param`,
+/// which shows `example` as the schema's form.
+fn answer_format<'a>(
+    raw: &'a RawValue,
+    param: &str,
+    example: &str,
+    schema: impl FnOnce() -> Result<SchemaFormat<'a>, Response>,
+) -> Result<AnswerFormat<'a>, Response> {
     let value: JsonValue = serde_json::from_str(raw.get()).unwrap_or(JsonValue::Null);
     match value.get("type").and_then(JsonValue::as_str) {
         Some("text") => Ok(AnswerFormat::Free),
         Some("json_object") => Ok(AnswerFormat::JsonObject),
-        Some("json_schema") => {
-            #[derive(Deserialize)]
-            struct Wire<'a> {
-                #[serde(borrow)]
-                json_schema: Option<&'a RawValue>,
-            }
-            let members = serde_json::from_str::<Wire<'_>>(raw.get()).ok().and_then(|wire| wire.json_schema);
-            match members {
-                Some(members) => schema_format(members, "response_format.json_schema", PARAM).map(AnswerFormat::JsonSchema),
-                None => Err(bad_request_param(
-                    "response_format: json_schema names its schema in a json_schema object: {\"type\": \"json_schema\", \"json_schema\": {\"name\": ..., \"schema\": {...}, \"strict\": true}}",
-                    PARAM,
-                )),
-            }
-        }
+        Some("json_schema") => schema().map(AnswerFormat::JsonSchema),
         _ => Err(error_response_naming(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "unsupported_value",
             format!(
-                "response_format: {} is not a format this server serves; send {{\"type\": \"json_schema\", ...}}, {{\"type\": \"json_object\"}} or {{\"type\": \"text\"}}, or omit it",
+                "{param}: {} is not a format this server serves; send {example}, {{\"type\": \"json_object\"}} or {{\"type\": \"text\"}}, or omit it",
                 raw.get()
             ),
-            Some(PARAM),
+            Some(param),
         )),
     }
 }
@@ -1730,25 +1742,11 @@ pub(crate) fn text_answer_format(text: Option<&RawValue>) -> Result<AnswerFormat
     let Some(raw) = serde_json::from_str::<Text<'_>>(raw.get()).ok().and_then(|text| text.format) else {
         return Ok(AnswerFormat::Free);
     };
-    let value: JsonValue = serde_json::from_str(raw.get()).unwrap_or(JsonValue::Null);
-    if value.is_null() {
+    if raw.get().trim() == "null" {
         return Ok(AnswerFormat::Free);
     }
-    match value.get("type").and_then(JsonValue::as_str) {
-        Some("text") => Ok(AnswerFormat::Free),
-        Some("json_object") => Ok(AnswerFormat::JsonObject),
-        Some("json_schema") => schema_format(raw, PARAM, PARAM).map(AnswerFormat::JsonSchema),
-        _ => Err(error_response_naming(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "unsupported_value",
-            format!(
-                "text.format: {} is not a format this server serves; send {{\"type\": \"json_schema\", \"name\": ..., \"schema\": {{...}}, \"strict\": true}}, {{\"type\": \"json_object\"}} or {{\"type\": \"text\"}}, or omit it",
-                raw.get()
-            ),
-            Some(PARAM),
-        )),
-    }
+    let example = "{\"type\": \"json_schema\", \"name\": ..., \"schema\": {...}, \"strict\": true}";
+    answer_format(raw, PARAM, example, || schema_format(raw, PARAM, PARAM))
 }
 
 /// A `json_schema` format's members, at `at` in the request (chat
@@ -1785,22 +1783,26 @@ pub(crate) fn schema_format<'a>(members: &'a RawValue, at: &str, param: &str) ->
     }
 }
 
-/// What `response_format` asks of a chat completion (GitHub #587, #588,
-/// #589, spec #287, ADR 0089): a free answer, or one held to a grammar, beside
-/// the request's resolved `tools` and `tool_choice` (#592). The prompt need
-/// not mention JSON; a `json_schema` request's schema is described after the
-/// conversation unless `describe` (the request's [`DESCRIBE_SCHEMA`]) or the
-/// server turns it off.
+/// What a request's format asks of its answer (GitHub #587, #588, #589,
+/// #591, spec #287, ADR 0089): chat completions' `response_format`
+/// ([`chat_answer_format`]) or the Responses API's `text.format`
+/// ([`text_answer_format`]), read from `param`, a free answer or one held to
+/// a grammar, beside the request's resolved `tools` and `tool_choice` (#592).
+/// The prompt need not mention JSON; a `json_schema` request's schema is
+/// described after the conversation unless `describe` (the request's
+/// [`DESCRIBE_SCHEMA`]) or the server turns it off. `describe` is checked
+/// before the format, as each field is validated whatever the others ask.
 pub(crate) fn structured_output(
     server: &Server,
-    format: Option<&RawValue>,
+    format: Result<AnswerFormat<'_>, Response>,
+    param: &str,
     describe: Option<&JsonValue>,
     thinking: &ThinkingOptions,
     tools: &[JsonValue],
     tool_choice: &ToolChoice,
 ) -> Result<Option<HeldAnswer>, Response> {
     let describe = describe_schema(server, describe)?;
-    hold_answer(server, chat_answer_format(format)?, describe, thinking, tools, tool_choice, "response_format")
+    hold_answer(server, format?, describe, thinking, tools, tool_choice, param)
 }
 
 /// The grammar a request's answer is held to, for a format read from the
@@ -2948,7 +2950,8 @@ async fn chat_completions(
     };
     let held = match structured_output(
         &server,
-        req.response_format.as_deref(),
+        chat_answer_format(req.response_format.as_deref()),
+        "response_format",
         req.ignis_describe_schema.as_ref(),
         &thinking,
         &tools,
