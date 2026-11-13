@@ -1,6 +1,6 @@
 ---
 title: "Structured output"
-description: "response_format json_object and json_schema on chat completions: every answer valid JSON, held to your schema, checked token by token and repaired."
+description: "response_format and text.format, json_object and json_schema, on chat completions and Responses: every answer valid JSON, held to your schema, checked token by token and repaired."
 sidebar:
   order: 2
 ---
@@ -240,12 +240,29 @@ each turn either calls a tool or answers under the schema.
 `strict: true` on a function tool is accepted and inert: the call's arguments
 are the model's own, not held to the tool's `parameters` (GitHub #582).
 
+## On the Responses API
+
+`/v1/responses` serves the same thing as `text.format`, over HTTP and over
+[the WebSocket mode](responses.md): `{"text": {"format": {"type":
+"json_object"}}}` or `{"text": {"format": {"type": "json_schema", "name":
+"cat", "schema": {...}, "strict": true}}}`. The Responses API carries a
+schema's members flat beside the `type`, where chat completions nest them in
+a `json_schema` object; everything else is the same: the guarantees, the
+schema's description (and `ignis_describe_schema: false`), the thinking and
+tools rules, the refusals and the limits. A refusal is a `400` whose `param`
+is `text.format`, and the response's own `text.format` echoes what was sent.
+A streamed response's `response.output_text.delta` events carry only tokens
+the grammar accepted, and the `output_text` they add up to is the one a
+non-streamed response returns.
+
 ## Cuts
 
 - A cut by `max_tokens` (or `max_completion_tokens`) returns the content as
   generated, with `finish_reason: "length"`: the answer may be unfinished, as
   OpenAI's is. Leave room for the whole answer, and for the reasoning with
-  thinking on.
+  thinking on. On the Responses API the same cut is a response with
+  `status: "incomplete"` and `incomplete_details.reason: "max_output_tokens"`,
+  its `output_text` as generated.
 - A request past its [deadline](deadlines.md) is answered as any other: with
   what it generated and `finish_reason: "length"`, or a `504`, as
   `--server-timeout-reply` says.
@@ -288,5 +305,5 @@ anything is generated. A schema the grammar refuses carries the refusal's own
 | `tools` the turn may call (`tool_choice: "auto"`), on a tokenizer whose `<tool_call>` is not one token | `unsupported_value`: the grammar could not tell the call's opener from the answer. Send `tool_choice: "none"`. |
 | structured output with thinking on, on a tokenizer whose `</think>` is not one token | `unsupported_value`; send `enable_thinking: false`. |
 
-`/v1/responses` refuses `text.format` other than `text` for now
+On `/v1/responses` the same refusals answer with `param: text.format`
 ([The Responses API](responses.md)).

@@ -47,8 +47,7 @@ export type StreamResult = { ok: true; timeline: Timeline } | { ok: false; messa
 /** `streamChat` over `socket`; the page's own is below, a test makes one on a fake. */
 export function createStreamChat(socket: ResponsesSocket) {
   return async (options: StreamOptions): Promise<StreamResult> => {
-    // A reply held to a schema goes over HTTP until the socket carries `text.format` (#591).
-    if (activeTransport() === "websocket" && !options.request.responseFormat) {
+    if (activeTransport() === "websocket") {
       const result = await socket.stream(options);
       if (result !== "unavailable") return result;
       fallBackToHttp();

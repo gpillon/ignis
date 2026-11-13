@@ -41,6 +41,13 @@ describe("buildResponseCreate", () => {
     });
   });
 
+  it("asks for a reply held to a schema as text.format, its members flat beside the type", () => {
+    const responseFormat = { name: "verdict", schema: { type: "object" } };
+    const body = buildResponseCreate({ settings, turns: [], responseFormat }, "s", []);
+    expect(body.text).toEqual({ format: { type: "json_schema", name: "verdict", schema: { type: "object" }, strict: true } });
+    expect("text" in buildResponseCreate({ settings, turns: [] }, "s", [])).toBe(false);
+  });
+
   it("leaves out what the chat request leaves out: a blank prompt, no tools, the engine's cap, the server's budget", () => {
     const body = buildResponseCreate(
       { settings: { ...settings, systemPrompt: " ", maxTokens: null, reasoningEffort: "none" }, turns: [] },

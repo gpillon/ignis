@@ -43,6 +43,8 @@ export type ResponseCreate = {
   reasoning_effort: ReasoningEffort;
   thinking_budget?: number;
   class: ConversationRequest["settings"]["laneTag"];
+  /** A reply held to a JSON schema: `text.format`, its members flat beside the type (#591). */
+  text?: { format: { type: "json_schema"; name: string; schema: object; strict: true } };
 };
 
 const text = (text: string): InputContent[] => [{ type: "input_text", text }];
@@ -122,6 +124,7 @@ export function buildResponseCreate(
     reasoning_effort: settings.reasoningEffort,
     ...(thinkingBudget !== undefined ? { thinking_budget: thinkingBudget } : {}),
     class: settings.laneTag,
+    ...(request.responseFormat ? { text: { format: { type: "json_schema" as const, ...request.responseFormat, strict: true as const } } } : {}),
   };
 }
 

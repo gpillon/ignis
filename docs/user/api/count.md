@@ -22,6 +22,11 @@ curl http://127.0.0.1:8000/v1/tokenize \
 
 Send `messages` **or** a raw `prompt` (tokenized with no template), never both.
 `return_token_ids` and `return_text` add the ids and the rendered prompt.
+A `response_format` of `json_schema` counts too: the server describes the
+schema to the model after the conversation ([Structured
+output](structured-output.md)), so the count includes that block, and
+`ignis_describe_schema: false` counts the prompt without it. The format is
+checked as chat checks it, so a schema chat would refuse is refused here.
 Sampling fields are ignored, `stream` is refused, and a body with an `image_url`
 part is a `400 media_not_countable`: an image's cost is its grid after
 preparation, which only fetching and decoding it would tell — send the request.

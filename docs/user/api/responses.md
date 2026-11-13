@@ -28,15 +28,19 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   both endpoints.
 - **What it cannot do is refused**, with OpenAI's error and a `param`, never
   ignored where ignoring it would change the answer: tools that are not
-  functions, `text.format` other than `text` (no structured output on this
-  route yet; chat completions serve `json_object` and `json_schema` from 0.11.0,
-  [Structured output](structured-output.md)),
-  `background: true`, and an input item of another type. `store`,
+  functions, `background: true`, and an input item of another type. `store`,
   `metadata`, `prompt_cache_key`, `service_tier`, a function tool's `strict`
   (its call's arguments are not held to its `parameters`, GitHub #582) and
   the like are accepted and change nothing; `include: ["reasoning.encrypted_content"]` adds the
   reasoning as the model saw it ([Chat completions](chat-completions.md)). ignis stores no response, so `previous_response_id` on
   HTTP is a `400 previous_response_not_found`.
+- **`text.format` holds the answer**, from 0.11.0: `json_object` to a valid
+  JSON object, `json_schema` (`name`, `schema`, `strict`, `description` flat
+  beside the `type`) to your schema, over HTTP and over the WebSocket mode,
+  with chat completions' guarantees, refusals (`param: text.format`) and
+  limits, and the schema described to the model unless
+  `ignis_describe_schema` is `false`
+  ([Structured output](structured-output.md)).
 - A length stop ends `incomplete` (`max_output_tokens`), an engine error
   `failed`; `usage` carries `input_tokens_details.cached_tokens` and
   `output_tokens_details.reasoning_tokens`.
