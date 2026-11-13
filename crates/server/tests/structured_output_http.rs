@@ -1565,6 +1565,134 @@ async fn a_cut_by_max_output_tokens_is_incomplete_as_a_free_answers_is() {
     assert_eq!(responses_reply(&app, &free, false).await, expected, "a free answer");
 }
 
+// ── tools beside text.format (#592 on the Responses API) ─────────────────
+
+/// An agent's turn on `/v1/responses`, as an SDK sends it: `input`, a flat
+/// function tool, `tool_choice`, and `text.format` holding the answer to
+/// [`WEATHER`]; greedy, thinking off.
+fn responses_agent_turn(input: JsonValue, tool_choice: JsonValue, stream: bool) -> String {
+    json!({
+        "model": MODEL,
+        "input": input,
+        "tools": [{ "type": "function", "name": "get_weather", "parameters": {
+            "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] } }],
+        "tool_choice": tool_choice,
+        "text": { "format": "FORMAT" },
+        "enable_thinking": false,
+        "temperature": 0,
+        "max_output_tokens": 256,
+        "stream": stream,
+    })
+    .to_string()
+    .replace("\"FORMAT\"", &schema_format_text(WEATHER, true))
+}
+
+/// The Responses input after the first turn's call and the tool's result.
+fn responses_after_the_call() -> JsonValue {
+    json!([
+        { "role": "user", "content": "What is the weather in Oslo?" },
+        { "type": "function_call", "call_id": "call_0", "name": "get_weather", "arguments": "{\"city\":\"Oslo\"}" },
+        { "type": "function_call_output", "call_id": "call_0", "output": "sunny, 21 C" },
+    ])
+}
+
+/// A Responses turn as a [`Turn`]: its message text, its calls as (name,
+/// arguments), and its status in place of a finish reason.
+fn responses_turn_of(response: &JsonValue) -> Turn {
+    let calls = response["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "function_call")
+        .map(|item| (item["name"].as_str().unwrap().to_owned(), serde_json::from_str(item["arguments"].as_str().unwrap()).unwrap()))
+        .collect();
+    Turn { content: output_text(response), calls, finish: response["status"].as_str().unwrap().to_owned() }
+}
+
+/// The wires a Responses turn goes over.
+#[derive(Debug, Clone, Copy)]
+enum Wire {
+    Whole,
+    Streamed,
+    Socket,
+}
+
+/// Turns sent over `wire`, in order, on one server (one socket for the
+/// WebSocket mode) over `mock`.
+async fn responses_turns(mock: &Arc<MockCompute>, wire: Wire, turns: &[(JsonValue, JsonValue)]) -> Vec<Turn> {
+    let mut out = Vec::new();
+    match wire {
+        Wire::Whole | Wire::Streamed => {
+            let stream = matches!(wire, Wire::Streamed);
+            let app = server(mock.clone(), SchedulerConfig::default()).app();
+            for (input, tool_choice) in turns {
+                let body = responses_agent_turn(input.clone(), tool_choice.clone(), stream);
+                let (status, _, text) = post_to(&app, RESPONSES, &body).await;
+                assert_eq!(status, 200, "{body}: {text}");
+                let response = match stream {
+                    false => serde_json::from_str::<JsonValue>(&text).unwrap(),
+                    true => responses::sse_events(&text).last().expect("a terminal event").1["response"].clone(),
+                };
+                out.push(responses_turn_of(&response));
+            }
+        }
+        Wire::Socket => {
+            let live = responses::live(server(mock.clone(), SchedulerConfig::default())).await;
+            let mut socket = responses::socket(&live).await;
+            for (input, tool_choice) in turns {
+                responses::send_text(&mut socket, create_frame(&responses_agent_turn(input.clone(), tool_choice.clone(), false))).await;
+                let events = responses::events_until(&mut socket, responses::terminal).await;
+                let last = events.last().unwrap();
+                assert_eq!(last["type"], "response.completed", "{last}");
+                out.push(responses_turn_of(&last["response"]));
+            }
+        }
+    }
+    out
+}
+
+/// #592 acceptance 1 on the Responses API, over HTTP whole and streamed and
+/// over its WebSocket mode: a turn that opens a tool call is released from
+/// `text.format`'s schema and its call comes back as the model wrote it, with
+/// no miss and no repair; the next turn, after the tool's result, is held
+/// again and answers under the schema.
+#[tokio::test]
+async fn on_responses_a_turn_that_calls_a_tool_is_released_and_the_next_answers_under_the_schema() {
+    for wire in [Wire::Whole, Wire::Streamed, Wire::Socket] {
+        let mock = Arc::new(MockCompute::new());
+        mock.script(0, &encode(CALL));
+        mock.script(1, &encode("```json\n{\"city\": \"Oslo\", \"sky\": \"sunny\"}\n```"));
+        let turns = [(json!("What is the weather in Oslo?"), json!("auto")), (responses_after_the_call(), json!("auto"))];
+        let [first, second] = <[Turn; 2]>::try_from(responses_turns(&mock, wire, &turns).await).unwrap();
+        assert_eq!(first.calls, [("get_weather".to_owned(), json!({ "city": "Oslo" }))], "{wire:?}: {first:?}");
+        assert_eq!((first.content.as_str(), first.finish.as_str()), ("", "completed"), "{wire:?}: {first:?}");
+        assert!(mock.repair_calls().iter().all(|repair| repair.request == 1), "{wire:?}: the call's text was never held");
+        assert!(second.calls.is_empty(), "{wire:?}: {second:?}");
+        let answer: JsonValue = serde_json::from_str(&second.content).unwrap_or_else(|e| panic!("{wire:?}: {e}: {second:?}"));
+        assert_eq!(answer, json!({ "city": "Oslo", "sky": "sunny" }), "{wire:?}");
+        assert!(!mock.repair_calls().is_empty(), "{wire:?}: the second turn's fence was repaired");
+    }
+}
+
+/// #592 acceptance 3 on the Responses API: `tool_choice: "required"` beside
+/// `text.format` forces the call, as without it; the model here was about to
+/// answer, and the forced turn is not held to the schema.
+#[tokio::test]
+async fn on_responses_a_forced_tool_choice_beside_text_format_forces_the_call() {
+    let opening = "<tool_call>\n<function";
+    let rest = "=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>";
+    let forced = encode(opening).len();
+    let answering: String = "{\"city\": \"Oslo\", \"sky\": \"sunny\"}".chars().chain(std::iter::repeat(' ')).take(forced).collect();
+    for wire in [Wire::Whole, Wire::Streamed, Wire::Socket] {
+        let mock = Arc::new(MockCompute::new());
+        mock.script(0, &encode(&format!("{answering}{rest}")));
+        let turns = [(json!("What is the weather in Oslo?"), json!("required"))];
+        let got = responses_turns(&mock, wire, &turns).await.remove(0);
+        assert_eq!(got.calls, [("get_weather".to_owned(), json!({ "city": "Oslo" }))], "{wire:?}: {got:?}");
+        assert!(mock.repair_calls().is_empty(), "{wire:?}: the forced turn was not held to the schema");
+    }
+}
+
 /// Acceptance 2: every refusal is a 400 naming `text.format` and the keyword
 /// or limit, before anything is generated, over HTTP and over the socket.
 #[tokio::test]
