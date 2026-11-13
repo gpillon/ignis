@@ -3,11 +3,18 @@
 //! held to a grammar, the others are not.
 //!
 //! Three lanes run the same verify rounds twice, from the same prompts: once
-//! all free, once with lane 2 held to `json_object` over the artifact's own
-//! vocabulary. In the held run the host sees lane 2's run after each pass,
-//! keeps it up to its first draft the grammar refuses, and repairs that
-//! draft -- now the lane's pending token -- from the verify pass's own scores
-//! (`ignis_program_repair`).
+//! all free, once with lane 2 held to a strict `json_schema` over the
+//! artifact's own vocabulary, whose keys are names the model does not guess
+//! and which its prompt does not describe. In the held run the host sees lane
+//! 2's run after each pass, keeps it up to its first draft the grammar
+//! refuses, and repairs that draft -- now the lane's pending token -- from the
+//! verify pass's own scores (`ignis_program_repair`).
+//!
+//! The schema is what makes the cut happen: under `json_object` the model's
+//! own object passes draft after draft (a run of #590's first GPU leg was
+//! never cut inside in sixteen rounds), while a key the model would not have
+//! written is refused where the target and the drafter agree on the key it
+//! would have -- a draft the target accepted, inside the run.
 //!
 //! - **The neighbours keep their drafts.** Lanes 0 and 1 verify the same
 //!   extents and commit the same tokens, round for round, as beside a free
@@ -59,20 +66,25 @@ const LANES: usize = 3;
 const HELD: usize = 2;
 
 /// Two free prompts the drafter does well on, and one the model answers in
-/// prose, which the grammar turns into an object: misses on keys and values.
+/// prose, which the schema turns into an object of its own: misses on keys
+/// and values.
 const PROMPTS: [&str; LANES] = [
     "In one sentence, what does `fn main() { println!(\"hi\"); }` do?",
     "Compute, step by step, 2 * 3 + 4 and give the final number on the last line.",
     "Name three rivers of Europe and say how long each one is.",
 ];
 
+/// The held lane's schema, strict: an object the prompt does not describe,
+/// with key names the model has no reason to write.
+const SCHEMA: &str = r#"{"type":"object","properties":{"waterways":{"type":"array","items":{"type":"object","properties":{"designation":{"type":"string"},"span_km":{"type":"integer"},"basin_states":{"type":"array","items":{"type":"string"}}},"required":["designation","span_km","basin_states"],"additionalProperties":false}}},"required":["waterways"],"additionalProperties":false}"#;
+
 fn vocab() -> usize {
     ModelConfig::qwen38_27b().vocab as usize
 }
 
 /// The prompts in the model's chat format with thinking closed, the stop
-/// ids, and the grammar over the artifact's vocabulary (the end of turn its
-/// stop, as the server builds it).
+/// ids, and the schema's grammar over the artifact's vocabulary (the end of
+/// turn its stop, as the server builds it).
 fn inputs(reader: &Reader) -> (Vec<Vec<i32>>, Vec<i32>, Arc<Grammar>) {
     let frontend = FrontendSet::from_reader(reader).unwrap_or_else(|e| panic!("frontend: {e}"));
     let tokenizer = frontend.tokenizer();
@@ -95,7 +107,8 @@ fn inputs(reader: &Reader) -> (Vec<Vec<i32>>, Vec<i32>, Arc<Grammar>) {
             TokenBytes::Absent => VocabEntry::Absent,
         })
         .collect();
-    let grammar = Grammar::json_object(Vocab::new(entries, &[stops[0] as u32]));
+    let grammar = Grammar::json_schema(Vocab::new(entries, &[stops[0] as u32]), SCHEMA, true)
+        .unwrap_or_else(|e| panic!("the held lane's schema: {e:?}"));
     (prompts, stops, grammar)
 }
 
