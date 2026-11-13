@@ -400,21 +400,27 @@ fn a_repair_draws_the_waiting_position_again_from_the_scores_its_call_kept() {
             "while the round that wrote them can repair its own draw"
         );
 
-        let mut per_token = alloc();
-        prefill_program_with_route(&model, &pool, &mut per_token, &prompt(), 0, PrefillRoute::PerToken, None)
-            .unwrap_or_else(|e| panic!("per-token prefill: {e}"));
-        let error = repair_program(&model, &pool, &mut per_token, SamplingParams::greedy(), &mask_of(&[forced]))
-            .expect_err("the per-token route keeps no scores");
-        assert!(error.contains("kept no scores"), "{error}");
+        // Each sequence below goes back to the pool before the next is
+        // taken: the pool has four slots, and `left` and `right` hold two.
+        {
+            let mut per_token = alloc();
+            prefill_program_with_route(&model, &pool, &mut per_token, &prompt(), 0, PrefillRoute::PerToken, None)
+                .unwrap_or_else(|e| panic!("per-token prefill: {e}"));
+            let error = repair_program(&model, &pool, &mut per_token, SamplingParams::greedy(), &mask_of(&[forced]))
+                .expect_err("the per-token route keeps no scores");
+            assert!(error.contains("kept no scores"), "{error}");
+        }
 
         // #287: a prefill not asked to keep its draw's scores -- a request
         // with no grammar -- keeps none.
-        let mut unheld = alloc();
-        prefill_program_sampled(&model, &pool, &mut unheld, &prompt(), 0, SamplingParams::greedy(), None)
-            .unwrap_or_else(|e| panic!("unheld prefill: {e}"));
-        let error = repair_program(&model, &pool, &mut unheld, SamplingParams::greedy(), &mask_of(&[forced]))
-            .expect_err("an unheld prefill keeps no scores");
-        assert!(error.contains("kept no scores"), "{error}");
+        {
+            let mut unheld = alloc();
+            prefill_program_sampled(&model, &pool, &mut unheld, &prompt(), 0, SamplingParams::greedy(), None)
+                .unwrap_or_else(|e| panic!("unheld prefill: {e}"));
+            let error = repair_program(&model, &pool, &mut unheld, SamplingParams::greedy(), &mask_of(&[forced]))
+                .expect_err("an unheld prefill keeps no scores");
+            assert!(error.contains("kept no scores"), "{error}");
+        }
 
         let mut fresh = alloc();
         let error = repair_program(&model, &pool, &mut fresh, SamplingParams::greedy(), &mask_of(&[forced]))
