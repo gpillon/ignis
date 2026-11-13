@@ -1,10 +1,12 @@
-//! Structured output's first tracer bullet (GitHub #587, spec #287, ADR
-//! 0089): `response_format: {"type": "json_object"}` on chat completions,
-//! end to end over the real router on `MockCompute` (ADR 0006).
+//! Structured output on chat completions (GitHub #587, #588, spec #287, ADR
+//! 0089): `response_format` with `json_object` and with `json_schema`, end
+//! to end over the real router on `MockCompute` (ADR 0006).
 //!
 //! The "model" follows a script ([`MockCompute::script`]) that misses on
 //! purpose: a prose preamble, a code fence, a remark after the object, an
-//! early stop, nothing but whitespace. Each draw of the answer is checked
+//! early stop, nothing but whitespace; against a schema, key names of its
+//! own, an enum in the wrong case, a number out of range, a missing key, an
+//! extra key, a string its pattern refuses. Each draw of the answer is checked
 //! against the grammar before the next round consumes it, and a miss is
 //! repaired. The mock's repair ranks what the script was going to write next
 //! above the rest, then the vocabulary in order; the test vocabulary puts
@@ -12,6 +14,7 @@
 //! to go on moves the answer toward its end, as a model that has to stop
 //! would.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -166,8 +169,13 @@ fn app(script: &str) -> (axum::Router, Arc<MockCompute>) {
 }
 
 fn server(compute: Arc<dyn Compute>, config: SchedulerConfig) -> Server {
+    server_over(compute, config, Vocabulary::new())
+}
+
+/// A server whose template is `vocabulary`, so a test can watch its grammars.
+fn server_over(compute: Arc<dyn Compute>, config: SchedulerConfig, vocabulary: Vocabulary) -> Server {
     let scheduler = ConcreteScheduler::with_config(SchedulerConfig { model: MODEL.into(), ..config }, compute);
-    Server::new(Engine::new(Box::new(scheduler)), Box::new(Vocabulary::new()))
+    Server::new(Engine::new(Box::new(scheduler)), Box::new(vocabulary))
         .with_request_timeout(Duration::from_secs(5))
         .with_seedless_seed(0)
 }
@@ -186,11 +194,16 @@ fn chat(stream: bool, max_tokens: u32) -> JsonValue {
 }
 
 async fn post(app: &axum::Router, body: &JsonValue) -> (u16, Option<String>, String) {
+    post_text(app, &body.to_string()).await
+}
+
+/// `body` as written: a schema's keys keep their order.
+async fn post_text(app: &axum::Router, body: &str) -> (u16, Option<String>, String) {
     let request = Request::builder()
         .method("POST")
         .uri(CHAT)
         .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
+        .body(Body::from(body.to_owned()))
         .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status().as_u16();
@@ -209,9 +222,14 @@ struct Answer {
 
 /// The answer to `body`, whole or streamed as `body["stream"]` says.
 async fn answer(app: &axum::Router, body: &JsonValue) -> Answer {
-    let (status, _, text) = post(app, body).await;
+    answer_text(app, &body.to_string(), body["stream"] == true).await
+}
+
+/// The answer to `body` sent as written, streamed when `stream`.
+async fn answer_text(app: &axum::Router, body: &str, stream: bool) -> Answer {
+    let (status, _, text) = post_text(app, body).await;
     assert_eq!(status, 200, "{body}: {text}");
-    if body["stream"] == true {
+    if stream {
         let chunks: Vec<JsonValue> = text
             .lines()
             .filter_map(|l| l.strip_prefix("data: "))
@@ -418,20 +436,6 @@ async fn flash_next_refuses_structured_output_naming_the_model() {
 }
 
 #[tokio::test]
-async fn json_schema_stays_refused_naming_the_work_in_progress() {
-    let (app, _) = app("{}");
-    let mut body = chat(false, 8);
-    body["response_format"] = json!({ "type": "json_schema", "json_schema": { "name": "x", "schema": { "type": "object" } } });
-    let (status, _, text) = post(&app, &body).await;
-    assert_eq!(status, 400, "{text}");
-    let v: JsonValue = serde_json::from_str(&text).unwrap();
-    assert_eq!(v["error"]["code"], "unsupported_value", "{text}");
-    assert_eq!(v["error"]["param"], "response_format", "{text}");
-    let message = v["error"]["message"].as_str().unwrap();
-    assert!(message.contains("json_schema") && message.contains("#287"), "{message}");
-}
-
-#[tokio::test]
 async fn any_other_format_is_refused_and_text_is_a_free_answer() {
     let (app, _) = app("{}");
     for format in [json!({ "type": "grammar" }), json!("json_object"), json!({})] {
@@ -476,4 +480,302 @@ async fn a_template_with_no_vocabulary_refuses_json_object() {
     let (status, _, text) = post(&app, &chat(false, 8)).await;
     assert_eq!(status, 400, "{text}");
     assert!(text.contains("\"param\":\"response_format\""), "{text}");
+}
+
+// ── json_schema (#588) ───────────────────────────────────────────────────
+
+/// A chat request whose answer is held to `schema`, the schema sent as
+/// written: a `serde_json::Value` sorts an object's keys, and the answer
+/// writes them in the schema's order.
+fn schema_chat(schema: &str, strict: bool, stream: bool, max_tokens: u32) -> String {
+    let mut body = chat(stream, max_tokens);
+    body["response_format"] =
+        json!({ "type": "json_schema", "json_schema": { "name": "answer", "strict": strict, "schema": "SCHEMA" } });
+    body.to_string().replace("\"SCHEMA\"", schema)
+}
+
+/// The repository's root.
+fn repo() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// The Python that runs `tools/grammar-check/validate.py` with its pinned
+/// `jsonschema`: `IGNIS_GRAMMAR_CHECK_PYTHON`, else the venv
+/// `docs/agents/testing/structured-output.md` makes under
+/// `.scratch/grammar-venv`.
+fn validator_python() -> Option<PathBuf> {
+    if let Some(python) = std::env::var_os("IGNIS_GRAMMAR_CHECK_PYTHON") {
+        return Some(PathBuf::from(python));
+    }
+    let venv = repo().join(".scratch/grammar-venv");
+    [venv.join("Scripts/python.exe"), venv.join("bin/python")].into_iter().find(|python| python.exists())
+}
+
+/// Every answer, `(case, schema, text)`, valid under its schema by an
+/// independent validator: `jsonschema` (Draft 2020-12, formats checked,
+/// numbers as exact decimals) through `validate.py`. Machine-local: where no
+/// Python has it, a skip that says so.
+fn assert_independently_valid(answers: &[(&str, &str, String)]) {
+    let Some(python) = validator_python() else {
+        eprintln!("skip: no Python with tools/grammar-check/requirements.txt (IGNIS_GRAMMAR_CHECK_PYTHON, .scratch/grammar-venv)");
+        return;
+    };
+    let rows: String = answers
+        .iter()
+        .map(|(case, schema, text)| {
+            json!({ "case": case, "source": "served", "ours": "valid", "schema": schema, "text": text }).to_string() + "\n"
+        })
+        .collect();
+    let file = std::env::temp_dir().join(format!("ignis-588-answers-{}-{}.jsonl", std::process::id(), answers[0].0.replace(' ', "-")));
+    std::fs::write(&file, rows).unwrap();
+    let output = std::process::Command::new(&python)
+        .arg("-I")
+        .arg(repo().join("tools/grammar-check/validate.py"))
+        .arg(&file)
+        .output()
+        .unwrap_or_else(|e| panic!("{}: {e}", python.display()));
+    let _ = std::fs::remove_file(&file);
+    let report = String::from_utf8_lossy(&output.stdout);
+    eprintln!("{report}");
+    assert!(output.status.success(), "the independent validator refuses an answer:\n{report}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(report.contains(&format!("ours valid, theirs valid: {}", answers.len())), "every answer was validated: {report}");
+}
+
+/// The keys of an answer's object (sorted: their order is checked on the
+/// text).
+fn keys(value: &JsonValue) -> Vec<&str> {
+    value.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default()
+}
+
+/// A model that misses a schema on purpose: what it writes, and what a
+/// reader checks of the answer by hand.
+struct Miss {
+    what: &'static str,
+    schema: &'static str,
+    script: &'static str,
+    holds: fn(&JsonValue) -> bool,
+}
+
+/// The ticket's misses (#588), each against a strict schema.
+fn misses() -> Vec<Miss> {
+    vec![
+        Miss {
+            what: "its own key names",
+            schema: r#"{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer","minimum":0}},"required":["name","age"],"additionalProperties":false}"#,
+            script: r#"{"nombre": "Tom", "edad": 4}"#,
+            holds: |v| keys(v) == ["age", "name"] && v["name"].is_string() && v["age"].is_u64(),
+        },
+        Miss {
+            what: "an enum in the wrong case",
+            schema: r#"{"type":"object","properties":{"mood":{"type":"string","enum":["happy","sad"]}},"required":["mood"],"additionalProperties":false}"#,
+            script: r#"{"mood": "Happy"}"#,
+            holds: |v| keys(v) == ["mood"] && ["happy", "sad"].contains(&v["mood"].as_str().unwrap_or("")),
+        },
+        Miss {
+            what: "numbers out of range",
+            schema: r#"{"type":"object","properties":{"legs":{"type":"integer","minimum":0,"maximum":8},"weight":{"type":"number","exclusiveMinimum":0,"maximum":9.5,"multipleOf":0.25}},"required":["legs","weight"],"additionalProperties":false}"#,
+            script: r#"{"legs": 12, "weight": 20.1}"#,
+            holds: |v| {
+                let weight = v["weight"].as_f64().unwrap_or(-1.0);
+                v["legs"].as_u64().is_some_and(|legs| legs <= 8) && weight > 0.0 && weight <= 9.5 && (weight * 4.0).fract() == 0.0
+            },
+        },
+        Miss {
+            what: "a missing key",
+            schema: r#"{"type":"object","properties":{"title":{"type":"string"},"done":{"type":"boolean"}},"required":["title","done"],"additionalProperties":false}"#,
+            script: r#"{"title": "milk"}"#,
+            holds: |v| keys(v) == ["done", "title"] && v["done"].is_boolean(),
+        },
+        Miss {
+            what: "an extra key",
+            schema: r#"{"type":"object","properties":{"city":{"type":"string"},"country":{"type":"string"}},"required":["city","country"],"additionalProperties":false}"#,
+            script: r#"{"city": "Oslo", "population": 709000, "country": "Norway"}"#,
+            holds: |v| keys(v) == ["city", "country"] && v["city"] == "Oslo" && v["country"].is_string(),
+        },
+        Miss {
+            what: "a string its pattern refuses",
+            schema: r#"{"type":"object","properties":{"code":{"type":"string","pattern":"^[A-Z]{3}-[0-9]{4}$"}},"required":["code"],"additionalProperties":false}"#,
+            script: r#"{"code": "abc-12"}"#,
+            holds: |v| {
+                let code = v["code"].as_str().unwrap_or("").as_bytes();
+                code.len() == 8
+                    && code[..3].iter().all(u8::is_ascii_uppercase)
+                    && code[3] == b'-'
+                    && code[4..].iter().all(u8::is_ascii_digit)
+            },
+        },
+        Miss {
+            what: "a date in words",
+            schema: r#"{"type":"object","properties":{"when":{"type":"string","format":"date"}},"required":["when"],"additionalProperties":false}"#,
+            script: r#"{"when": "next Friday"}"#,
+            holds: |v| {
+                let when = v["when"].as_str().unwrap_or("").as_bytes();
+                when.len() == 10
+                    && when.iter().enumerate().all(|(i, c)| if i == 4 || i == 7 { *c == b'-' } else { c.is_ascii_digit() })
+            },
+        },
+    ]
+}
+
+/// Acceptance 1: whatever the model misses, the answer is valid under the
+/// schema, streamed and whole alike, and the independent validator agrees.
+#[tokio::test]
+async fn a_model_that_misses_the_schema_is_repaired_into_an_answer_valid_under_it() {
+    let mut answers = Vec::new();
+    for miss in misses() {
+        let (app, mock) = app(miss.script);
+        let whole = answer_text(&app, &schema_chat(miss.schema, true, false, 256), false).await;
+        assert_eq!(whole.finish, "stop", "{}: {whole:?}", miss.what);
+        let value: JsonValue =
+            serde_json::from_str(&whole.content).unwrap_or_else(|e| panic!("{}: not JSON ({e}): {:?}", miss.what, whole.content));
+        eprintln!("{}: {:?}", miss.what, whole.content);
+        assert!((miss.holds)(&value), "{}: {}", miss.what, whole.content);
+        assert!(!mock.repair_calls().is_empty(), "{}: the scripted misses were repaired", miss.what);
+        let (app, _) = self::app(miss.script);
+        let streamed = answer_text(&app, &schema_chat(miss.schema, true, true, 256), true).await;
+        assert_eq!(streamed, whole, "{}: streamed and whole carry the same answer", miss.what);
+        answers.push((miss.what, miss.schema, whole.content));
+    }
+    assert_independently_valid(&answers);
+}
+
+/// Keys come in the schema's order whatever order the model writes them in,
+/// and a model that writes them so is never repaired: the schema reaches the
+/// grammar as sent.
+#[tokio::test]
+async fn keys_come_in_the_schemas_order() {
+    const SCHEMA: &str = r#"{"type":"object","properties":{"zeta":{"type":"integer"},"alpha":{"type":"integer"}},"required":["zeta","alpha"],"additionalProperties":false}"#;
+    let (app, _) = app(r#"{"alpha": 1, "zeta": 2}"#);
+    let got = answer_text(&app, &schema_chat(SCHEMA, true, false, 128), false).await;
+    let (zeta, alpha) = (got.content.find("\"zeta\""), got.content.find("\"alpha\""));
+    assert!(got.content.starts_with("{\"zeta\"") && alpha > zeta, "{got:?}");
+    let written = r#"{"zeta": 1, "alpha": 2}"#;
+    let (app, mock) = self::app(written);
+    let got = answer_text(&app, &schema_chat(SCHEMA, true, false, 128), false).await;
+    assert_eq!(got.content, written);
+    assert_eq!(got.finish, "stop");
+    assert!(mock.repair_calls().is_empty(), "nothing to repair");
+    assert_independently_valid(&[("schema order", SCHEMA, got.content)]);
+}
+
+/// Acceptance 3: without `strict`, a keyword outside the subset is served
+/// and not held, and the guide's generated reference lists it as inert;
+/// under `strict` it is refused by name.
+#[tokio::test]
+async fn without_strict_a_keyword_outside_the_subset_is_served_inert_and_the_guide_lists_it() {
+    const SCHEMA: &str = r#"{"type":"object","properties":{"name":{"type":"string","minLength":3}},"required":["name"],"additionalProperties":false}"#;
+    let (app, mock) = app(r#"{"name": "Al"}"#);
+    let got = answer_text(&app, &schema_chat(SCHEMA, false, false, 64), false).await;
+    assert_eq!(got.content, r#"{"name": "Al"}"#, "minLength is not held: {got:?}");
+    assert!(mock.repair_calls().is_empty());
+    let (status, _, text) = post_text(&app, &schema_chat(SCHEMA, true, false, 64)).await;
+    assert_eq!(status, 400, "{text}");
+    let v: JsonValue = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["error"]["code"], "unsupported_keyword", "{text}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("`minLength`"), "{text}");
+    let page = ignis_server::user_docs::json_schema();
+    let inert = page.split("## Inert without `strict`").nth(1).and_then(|rest| rest.split("\n## ").next()).expect("the inert section");
+    assert!(inert.contains("`minLength`"), "the guide lists minLength as inert: {inert}");
+}
+
+/// Acceptance 2: every refusal the spec names is a 400 before anything is
+/// generated, with the refusal's own code, `param` naming
+/// `response_format`, and a message naming the keyword or the limit.
+#[tokio::test]
+async fn every_refusal_answers_400_naming_its_keyword_or_limit_before_generation() {
+    let object = |inner: &str| {
+        format!(r#"{{"type":"object","properties":{{"a":{inner}}},"required":["a"],"additionalProperties":false}}"#)
+    };
+    let properties: Vec<String> = (0..=5000).map(|i| format!(r#""p{i}":{{"type":"null"}}"#)).collect();
+    let nested = (0..=10).fold(r#"{"type":"string"}"#.to_owned(), |inner, _| object(&inner));
+    let values: Vec<String> = (0..=1000).map(|i| format!(r#""v{i}""#)).collect();
+    let cases: Vec<(&str, String, bool, &str, &str)> = vec![
+        ("a keyword outside the subset", object(r#"{"type":"string","allOf":[]}"#), true, "unsupported_keyword", "allOf"),
+        ("oneOf", object(r#"{"oneOf":[{"type":"string"}]}"#), true, "unsupported_keyword", "oneOf"),
+        ("a root that is not an object", r#"{"type":"string"}"#.into(), true, "root_not_object", "type"),
+        ("a root anyOf", r#"{"anyOf":[{"type":"object"}]}"#.into(), true, "root_anyof", "anyOf"),
+        ("an open object", r#"{"type":"object","properties":{}}"#.into(), true, "additional_properties_not_false", "additionalProperties"),
+        (
+            "a property not required",
+            r#"{"type":"object","properties":{"a":{"type":"string"}},"required":[],"additionalProperties":false}"#.into(),
+            true,
+            "not_all_required",
+            "required",
+        ),
+        ("a non-regular pattern", object(r#"{"type":"string","pattern":"(a)\\1"}"#), true, "pattern_not_regular", "pattern"),
+        ("a non-local reference", object(r#"{"$ref":"https://example.com/s.json"}"#), true, "unsupported_ref", "$ref"),
+        (
+            "no finite value",
+            r##"{"type":"object","properties":{"child":{"$ref":"#"}},"required":["child"],"additionalProperties":false}"##.into(),
+            true,
+            "no_finite_value",
+            "$ref",
+        ),
+        // OpenAI's four limits, with `strict` and without it.
+        ("too many properties", format!(r#"{{"type":"object","properties":{{{}}}}}"#, properties.join(",")), false, "too_many_properties", "properties"),
+        ("nested too deep", nested, true, "too_deeply_nested", "nesting"),
+        ("too many enum values", object(&format!(r#"{{"type":"string","enum":[{}]}}"#, values.join(","))), false, "too_many_enum_values", "enum values"),
+        ("too many characters", object(&format!(r#"{{"type":"string","enum":["{}"]}}"#, "x".repeat(120_001))), true, "too_many_characters", "characters"),
+    ];
+    for (what, schema, strict, code, keyword) in cases {
+        let mock = Arc::new(MockCompute::new());
+        let app = server(mock.clone(), SchedulerConfig::default()).app();
+        let (status, _, text) = post_text(&app, &schema_chat(&schema, strict, false, 64)).await;
+        assert_eq!(status, 400, "{what}: {}", &text[..text.len().min(400)]);
+        let v: JsonValue = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["error"]["code"], code, "{what}: {text}");
+        assert_eq!(v["error"]["param"], "response_format", "{what}: {text}");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.contains(&format!("`{keyword}`")), "{what}: the message names `{keyword}`: {message}");
+        assert!(mock.prefill_calls().is_empty() && mock.decode_calls().is_empty(), "{what}: nothing was generated");
+    }
+}
+
+/// A `json_schema` format whose members are not what OpenAI's are is a 400
+/// naming `response_format`, before anything is generated.
+#[tokio::test]
+async fn a_json_schema_format_without_a_schema_is_refused_naming_response_format() {
+    let cases = [
+        ("no json_schema object", json!({ "type": "json_schema" }), "json_schema object"),
+        ("json_schema not an object", json!({ "type": "json_schema", "json_schema": "x" }), "must be an object"),
+        ("no schema", json!({ "type": "json_schema", "json_schema": { "name": "x" } }), "`schema` is required"),
+        (
+            "strict not a boolean",
+            json!({ "type": "json_schema", "json_schema": { "name": "x", "schema": { "type": "object" }, "strict": "yes" } }),
+            "`strict` must be a boolean",
+        ),
+        ("name not a string", json!({ "type": "json_schema", "json_schema": { "name": 3, "schema": { "type": "object" } } }), "`name` must be a string"),
+    ];
+    for (what, format, says) in cases {
+        let mock = Arc::new(MockCompute::new());
+        let app = server(mock.clone(), SchedulerConfig::default()).app();
+        let mut body = chat(false, 8);
+        body["response_format"] = format;
+        let (status, _, text) = post(&app, &body).await;
+        assert_eq!(status, 400, "{what}: {text}");
+        let v: JsonValue = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["error"]["param"], "response_format", "{what}: {text}");
+        assert!(v["error"]["message"].as_str().unwrap().contains(says), "{what}: {text}");
+        assert!(mock.prefill_calls().is_empty(), "{what}: nothing was generated");
+    }
+}
+
+/// Acceptance 4: a schema sent again, its whitespace changed or not, is
+/// compiled once; the same schema with another `strict` is another grammar.
+#[tokio::test]
+async fn a_schema_sent_again_is_not_compiled_again() {
+    const SCHEMA: &str = r#"{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}"#;
+    const SPACED: &str = r#"{ "type": "object", "properties": { "ok": { "type": "boolean" } }, "required": [ "ok" ], "additionalProperties": false }"#;
+    let vocabulary = Vocabulary::new();
+    let grammars = vocabulary.grammars.clone();
+    let app = server_over(Arc::new(MockCompute::new()), SchedulerConfig::default(), vocabulary).app();
+    let before = grammars.compiles();
+    for schema in [SCHEMA, SPACED, SCHEMA] {
+        let (status, _, text) = post_text(&app, &schema_chat(schema, true, false, 16)).await;
+        assert_eq!(status, 200, "{text}");
+    }
+    assert_eq!(grammars.compiles() - before, 1, "three requests, one compile");
+    let (status, _, text) = post_text(&app, &schema_chat(SCHEMA, false, false, 16)).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(grammars.compiles() - before, 2, "without strict, a grammar of its own");
 }

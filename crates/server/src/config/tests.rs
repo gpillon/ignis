@@ -1151,6 +1151,20 @@ fn help_lists_the_host_pool_budget_flag() {
     assert!(help().contains("--reuse-kv-host-pool-bytes"));
 }
 
+// ── structured output's compiled grammars (GitHub #588) ──────────────────
+
+/// The bound on the compiled grammars is a field (CODING_STANDARDS: limits
+/// are config fields), 256 MiB unless named, 0 the operator's call.
+#[test]
+fn the_grammar_cache_holds_256_mib_unless_named() {
+    assert_eq!(config(&["--profile", "none"]).grammar_cache_bytes, 256 << 20);
+    assert_eq!(config(&["--model-grammar-cache-bytes", "64M"]).grammar_cache_bytes, 64 << 20);
+    assert_eq!(config(&["--model-grammar-cache-bytes", "0"]).grammar_cache_bytes, 0, "only the last schema kept");
+    let env = env_map(&[("IGNIS_MODEL_GRAMMAR_CACHE_BYTES", "1G")]);
+    assert_eq!(expect_config(resolve(&[], env).expect("resolve")).grammar_cache_bytes, GIB);
+    assert!(refused(&["--model-grammar-cache-bytes", "lots"]).contains("--model-grammar-cache-bytes"));
+}
+
 // ── GitHub #186: cross-request state reuse (ADR 0029) ────────────────────
 
 /// (device, host) retained slots.

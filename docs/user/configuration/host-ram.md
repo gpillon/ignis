@@ -157,3 +157,15 @@ So is a start the plan let through but whose pin the system then declined
 (it may refuse to lock memory it reports available): its load fails with
 `materialize weights:`, the system's error, the bytes the plan had counted,
 the tower's and the pool's among them, and the same ways out.
+
+### Structured output's compiled grammars
+
+From 0.11.0. The first request with a `response_format` reads the 27B's
+vocabulary as bytes (about 13 MiB, once per load), and each distinct
+`json_schema` is compiled once and kept, with the masks its repairs build
+([Structured output](../api/structured-output.md#compiled-once)). They live in
+ordinary RAM, outside the host plan, taken as schemas arrive.
+`--model-grammar-cache-bytes` (`IGNIS_MODEL_GRAMMAR_CACHE_BYTES`, default
+`256M`) bounds them: past it the least recently used schemas are dropped, and
+sent again are compiled again; a request still running keeps its own. `0`
+keeps only the last one. Set at start; not patchable.

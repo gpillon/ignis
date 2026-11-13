@@ -16,7 +16,9 @@ controls sends, a quick way to see what a field does before you code it.
 2. **[The API](../api/index.md)** — every endpoint, the probes, keys and the
    error shape.
 3. **[Chat completions](../api/chat-completions.md)** — fields, streaming, tool
-   calls, reasoning, and the agent lane.
+   calls, reasoning, and the agent lane; **[structured
+   output](../api/structured-output.md)**, an answer held to a JSON object or
+   to your schema.
 4. **[The Responses API](../api/responses.md)** — `POST /v1/responses` and its
    WebSocket mode.
 5. **[Examples](../api/examples.md)** — curl for the common requests.
@@ -40,7 +42,9 @@ controls sends, a quick way to see what a field does before you code it.
     reasoning channel carries, and what the server does when it loops.
 12. **[HTTP routes](../reference/http-routes.md)** — the generated route list;
     a running server serves the full OpenAPI document at `/v1/openapi.json`
-    and a browsable page at `/v1/docs/`.
+    and a browsable page at `/v1/docs/`. **[JSON Schema
+    keywords](../reference/json-schema.md)** lists what a `json_schema` may
+    carry.
 
 :::tip
 Every field of the OpenAI request bodies is honoured, accepted as inert, or

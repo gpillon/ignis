@@ -95,10 +95,12 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   block that never closes ends `length` with no call, which the thinking
   budget's answer reserve prevents.
 - `response_format: {"type": "json_object"}` holds the answer to a valid JSON
-  object, streamed or not (from 0.11.0, on the 27B; 0.10.0 refuses it): each
-  sampled token is checked and a miss repaired. `{"type": "text"}` is a free
-  answer, `json_schema` is refused while it is being built, and Flash-Next
-  refuses structured output naming itself
+  object, and `{"type": "json_schema", "json_schema": {...}}` to your schema,
+  streamed or not (from 0.11.0, on the 27B; 0.10.0 refuses both): each
+  sampled token is checked and a miss repaired. Under `strict: true` OpenAI's
+  strict subset is held exactly and a schema outside it is refused by name;
+  without it the rest is inert. `{"type": "text"}` is a free answer, and
+  Flash-Next refuses structured output naming itself
   ([Structured output](structured-output.md)).
 - Non-streaming returns `choices[].message.content` plus `usage`, and
   `message.refusal`, always `null` (from 0.11.0); streaming

@@ -55,10 +55,13 @@ pub struct ArtifactTemplateProvider {
 /// The vocabulary a load's grammars read (GitHub #587): the logits row's
 /// width, the id that ends an answer, and the grammar cache built over them
 /// on the first structured request -- about 160 ms and 13 MiB on the 27B's
-/// tokenizer, which a load that never serves one does not pay.
+/// tokenizer, which a load that never serves one does not pay -- holding at
+/// most `cache_bytes` of compiled grammars (`model.grammar_cache_bytes`,
+/// #588).
 struct GrammarVocabulary {
     width: usize,
     stop: TokenId,
+    cache_bytes: usize,
     cache: std::sync::OnceLock<Option<Arc<ignis_grammar::GrammarCache>>>,
 }
 
@@ -67,6 +70,7 @@ impl std::fmt::Debug for GrammarVocabulary {
         f.debug_struct("GrammarVocabulary")
             .field("width", &self.width)
             .field("stop", &self.stop)
+            .field("cache_bytes", &self.cache_bytes)
             .field("built", &self.cache.get().is_some())
             .finish()
     }
@@ -88,8 +92,10 @@ impl ArtifactTemplateProvider {
     /// Serve structured output (GitHub #587): an answer's grammar reads the
     /// tokenizer's first `width` ids as bytes -- the load's logits row --
     /// and `stop`, the model's EOS, is the token that ends a complete answer.
-    pub fn with_grammar_vocabulary(mut self, width: usize, stop: TokenId) -> Self {
-        self.structured = Some(GrammarVocabulary { width, stop, cache: std::sync::OnceLock::new() });
+    /// The compiled grammars, one per distinct schema, hold at most about
+    /// `cache_bytes` (`model.grammar_cache_bytes`, GitHub #588).
+    pub fn with_grammar_vocabulary(mut self, width: usize, stop: TokenId, cache_bytes: usize) -> Self {
+        self.structured = Some(GrammarVocabulary { width, stop, cache_bytes, cache: std::sync::OnceLock::new() });
         self
     }
 
@@ -475,7 +481,7 @@ impl TemplateProvider for ArtifactTemplateProvider {
                     })
                     .collect();
                 let vocab = ignis_grammar::Vocab::new(entries, &[vocabulary.stop]);
-                Some(Arc::new(ignis_grammar::GrammarCache::new(vocab, ignis_grammar::DEFAULT_CACHE_BYTES)))
+                Some(Arc::new(ignis_grammar::GrammarCache::new(vocab, vocabulary.cache_bytes)))
             })
             .clone()
     }
@@ -730,6 +736,25 @@ mod tests {
             .collect();
         // "\n" joins adjacent text parts only; no newline across the image.
         assert_eq!(shape, ["text:a", "text:\n", "text:b", "image:data:x", "text:c"]);
+    }
+
+    /// GitHub #588: the compiled grammars hold what the load gives them
+    /// (`model.grammar_cache_bytes`): with nothing, only the schema last sent
+    /// is kept; with the default, both.
+    #[test]
+    fn the_compiled_grammars_hold_what_the_load_gives_them() {
+        let schema = |key: &str| {
+            format!(r#"{{"type":"object","properties":{{"{key}":{{"type":"string"}}}},"required":["{key}"],"additionalProperties":false}}"#)
+        };
+        for (bytes, kept) in [(0, 1), (ignis_grammar::DEFAULT_CACHE_BYTES, 2)] {
+            let (_fixture, _reader, provider) = build_provider();
+            // The fixture's five words, the last its stop.
+            let grammars = provider.with_grammar_vocabulary(5, 4, bytes).grammars().expect("the words read as bytes");
+            for key in ["a", "b"] {
+                grammars.json_schema(&schema(key), true).expect("a strict schema");
+            }
+            assert_eq!(grammars.len(), kept, "{bytes} bytes");
+        }
     }
 
     #[test]

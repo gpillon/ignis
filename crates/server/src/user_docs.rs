@@ -1,7 +1,8 @@
 //! The user guide's generated reference (ADR 0066, GitHub #347): the pages the
 //! code can write about itself — every config field, the built-in profiles,
-//! the built-in catalog, the metrics a server exports, the HTTP routes and
-//! the command line — rendered as Markdown for `docs/user/reference/`.
+//! the built-in catalog, the metrics a server exports, the HTTP routes,
+//! the command line and the JSON Schema keywords structured output takes —
+//! rendered as Markdown for `docs/user/reference/`.
 //!
 //! Each page is read from the table the server itself runs on (the field
 //! table, `profile::built_in`, `Catalog::built_in`, `Metrics::render`,
@@ -40,6 +41,7 @@ pub fn pages() -> Vec<Page> {
         Page { file: "metrics.md", text: metrics() },
         Page { file: "http-routes.md", text: http_routes() },
         Page { file: "cli.md", text: cli() },
+        Page { file: "json-schema.md", text: json_schema() },
     ]
 }
 
@@ -465,6 +467,121 @@ pub fn cli() -> String {
     let first_group = format!("\n{}:\n", GROUPS[0].0.to_ascii_uppercase());
     let usage = help.split(&first_group).next().unwrap_or(&help).trim_end();
     let _ = writeln!(out, "```text\n{usage}\n```");
+    finish(out)
+}
+
+/// The keywords of JSON Schema 2020-12, vocabulary by vocabulary (core,
+/// applicator, unevaluated, validation, meta-data, format, content), and the
+/// `definitions`, `dependencies` and `additionalItems` of the drafts before
+/// it: what a schema may carry, so the page can list the ones the grammar
+/// leaves inert.
+const JSON_SCHEMA_KEYWORDS: &[&str] = &[
+    "$schema", "$id", "$ref", "$anchor", "$dynamicRef", "$dynamicAnchor", "$vocabulary", "$comment", "$defs",
+    "prefixItems", "items", "contains", "additionalProperties", "properties", "patternProperties", "dependentSchemas",
+    "propertyNames", "if", "then", "else", "allOf", "anyOf", "oneOf", "not", "unevaluatedItems", "unevaluatedProperties",
+    "type", "const", "enum", "multipleOf", "maximum", "exclusiveMaximum", "minimum", "exclusiveMinimum", "maxLength",
+    "minLength", "pattern", "maxItems", "minItems", "uniqueItems", "maxContains", "minContains", "maxProperties",
+    "minProperties", "required", "dependentRequired", "title", "description", "default", "deprecated", "readOnly",
+    "writeOnly", "examples", "format", "contentEncoding", "contentMediaType", "contentSchema", "definitions",
+    "dependencies", "additionalItems",
+];
+
+/// A schema compiled as a request's would be, over a vocabulary of single
+/// bytes: what the page says of a keyword or a limit is what the grammar
+/// answers for it.
+fn compile_probe(schema: &str, strict: bool) -> Result<std::sync::Arc<ignis_grammar::Grammar>, ignis_grammar::Refusal> {
+    use ignis_grammar::{Vocab, VocabEntry};
+    let mut entries: Vec<VocabEntry> = (0..=255u8).map(|b| VocabEntry::Text(vec![b])).collect();
+    entries.push(VocabEntry::Control);
+    ignis_grammar::Grammar::json_schema(Vocab::new(entries, &[256]), schema, strict)
+}
+
+/// `keywords` as one line of code spans.
+fn code_list(keywords: &[&str]) -> String {
+    keywords.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ")
+}
+
+/// What `response_format`'s `json_schema` takes (GitHub #588): the keywords
+/// the grammar enforces, its formats, the annotations, the keywords it
+/// leaves inert without `strict` and refuses under it, and OpenAI's four
+/// limits -- each read from the grammar crate's lists, and each inert
+/// keyword and limit compiled here, so the page says what the grammar does.
+pub fn json_schema() -> String {
+    use ignis_grammar::{ANNOTATIONS, FORMATS, MAX_ENUM_VALUES, MAX_NESTING, MAX_PROPERTIES, MAX_SCHEMA_CHARS, STRICT_SUBSET};
+    let mut out = front_matter(
+        "JSON Schema keywords",
+        "The JSON Schema keywords structured output enforces, its formats and annotations, the keywords it leaves inert without strict, and OpenAI's four limits.",
+        7,
+    );
+    out.push_str(
+        "What a `json_schema` in `response_format` may carry, as the grammar reads it. \
+         [Structured output](../api/structured-output.md) explains how an answer is held to it, \
+         what the grammar writes, and the refusals.\n\n",
+    );
+    let _ = writeln!(
+        out,
+        "## Enforced\n\nOpenAI's strict subset, held in every answer with `strict: true` or without it: a `pattern` \
+         that is a regular expression, a `format` among the nine below, a bound a decimal holds exactly \
+         ([otherwise inert](../api/structured-output.md#without-strict), or refused under `strict`).\n\n{}\n",
+        code_list(STRICT_SUBSET)
+    );
+    let unsupported = compile_probe(r#"{"type":"object","properties":{"a":{"type":"string","format":"uri"}},"required":["a"],"additionalProperties":false}"#, true)
+        .expect_err("a format outside the nine is refused under strict");
+    let _ = writeln!(
+        out,
+        "## Formats\n\n`format` holds a string to one of these nine. Any other is refused under `strict: true` \
+         (`{}`) and inert without it.\n\n{}\n",
+        unsupported.code,
+        code_list(FORMATS)
+    );
+    let _ = writeln!(
+        out,
+        "## Annotations\n\nAccepted anywhere, with `strict: true` or without it, and never enforced.\n\n{}\n",
+        code_list(ANNOTATIONS)
+    );
+    let others: Vec<&str> = JSON_SCHEMA_KEYWORDS
+        .iter()
+        .copied()
+        .filter(|k| !STRICT_SUBSET.contains(k) && !ANNOTATIONS.contains(k))
+        .collect();
+    let mut code = None;
+    for keyword in &others {
+        let schema = format!(r#"{{"type":"object","properties":{{}},"required":[],"additionalProperties":false,"{keyword}":true}}"#);
+        let refusal = compile_probe(&schema, true).expect_err("a keyword outside the subset is refused under strict");
+        assert_eq!(refusal.keyword, *keyword, "the refusal names the keyword: {refusal:?}");
+        code.get_or_insert(refusal.code);
+        let served = compile_probe(&schema, false).unwrap_or_else(|r| panic!("`{keyword}` without strict: {r}"));
+        assert!(served.inert().iter().any(|inert| inert.keyword == *keyword), "`{keyword}` is inert without strict");
+    }
+    let _ = writeln!(
+        out,
+        "## Inert without `strict`\n\nAny other keyword is refused under `strict: true` (`{}`, naming it). Without \
+         `strict` the schema is served and the keyword is inert: the answer is not held to it. These are JSON \
+         Schema 2020-12's, with the earlier drafts' `dependencies` and `additionalItems`:\n\n{}\n",
+        code.unwrap_or_default(),
+        code_list(&others)
+    );
+    // One schema just past each limit: the refusal names the limit.
+    let object = |inner: String| format!(r#"{{"type":"object","properties":{{"a":{inner}}},"required":["a"],"additionalProperties":false}}"#);
+    let properties = {
+        let props: Vec<String> = (0..=MAX_PROPERTIES).map(|i| format!(r#""p{i}":{{"type":"null"}}"#)).collect();
+        format!(r#"{{"type":"object","properties":{{{}}}}}"#, props.join(","))
+    };
+    let nesting = (0..=MAX_NESTING).fold(r#"{"type":"string"}"#.to_owned(), |inner, _| object(inner));
+    let enums = {
+        let values: Vec<String> = (0..=MAX_ENUM_VALUES).map(|i| format!(r#""v{i}""#)).collect();
+        object(format!(r#"{{"type":"string","enum":[{}]}}"#, values.join(",")))
+    };
+    let characters = object(format!(r#"{{"type":"string","enum":["{}"]}}"#, "x".repeat(MAX_SCHEMA_CHARS + 1)));
+    let _ = writeln!(
+        out,
+        "## Limits\n\nOpenAI's limits on a schema, held with `strict: true` and without it. A schema past one is \
+         refused with the code below, naming the limit.\n\n| Limit | At most | Code |\n|---|---|---|"
+    );
+    for (schema, most) in [(properties, MAX_PROPERTIES), (nesting, MAX_NESTING), (enums, MAX_ENUM_VALUES), (characters, MAX_SCHEMA_CHARS)] {
+        let refusal = compile_probe(&schema, false).expect_err("a schema past a limit is refused");
+        let _ = writeln!(out, "| {} | {} | `{}` |", refusal.keyword, thousands(most as u64), refusal.code);
+    }
     finish(out)
 }
 

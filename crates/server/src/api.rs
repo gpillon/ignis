@@ -36,6 +36,7 @@ use axum::routing::{options, post};
 use axum::{Json, Router};
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value as JsonValue;
 use tower_http::trace::{MakeSpan, TraceLayer};
 use utoipa::{OpenApi, ToSchema};
@@ -1558,55 +1559,150 @@ pub(crate) fn forced_tool_call(
     literal.map(|literal| Some(Arc::new(literal))).map_err(|message| unsupported(&message))
 }
 
-/// What `response_format` asks of a chat completion (GitHub #587, spec
-/// #287, ADR 0089): a free answer (absent, `null`, `{"type": "text"}`), or
-/// one held to a grammar -- `{"type": "json_object"}`, any valid JSON
-/// object. The prompt need not mention JSON.
+/// What a request asks its answer to be (GitHub #587, #588, spec #287, ADR
+/// 0089): read from chat completions' `response_format` by
+/// [`chat_answer_format`], and held to a grammar by [`hold_answer`]. The
+/// Responses API's `text.format` (#591) carries a schema's members flat,
+/// beside its `type`, and reads them with [`schema_format`].
+pub(crate) enum AnswerFormat<'a> {
+    /// A free answer: absent, `null`, `{"type": "text"}`.
+    Free,
+    /// `{"type": "json_object"}`: any valid JSON object.
+    JsonObject,
+    /// `{"type": "json_schema"}`: a value valid under the caller's schema.
+    JsonSchema(SchemaFormat<'a>),
+}
+
+/// A `json_schema` format: the schema as the client sent it, and its
+/// `strict` flag.
+pub(crate) struct SchemaFormat<'a> {
+    /// The schema's own text. A `serde_json::Value` sorts an object's keys,
+    /// and the answer writes its keys in the schema's order, so the grammar
+    /// compiles this text.
+    pub schema: &'a RawValue,
+    /// `strict: true`: OpenAI's strict subset, all of it enforced, anything
+    /// else refused; `false`, absent or `null`: what can be enforced is, the
+    /// rest is inert.
+    pub strict: bool,
+}
+
+/// `response_format`'s format: `{"type": "text"}` (or absent, or `null`),
+/// `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema":
+/// {"name", "description", "schema", "strict"}}`. Anything else is a 400
+/// naming `response_format`.
+fn chat_answer_format(format: Option<&RawValue>) -> Result<AnswerFormat<'_>, Response> {
+    const PARAM: &str = "response_format";
+    let Some(raw) = format else { return Ok(AnswerFormat::Free) };
+    let value: JsonValue = serde_json::from_str(raw.get()).unwrap_or(JsonValue::Null);
+    match value.get("type").and_then(JsonValue::as_str) {
+        Some("text") => Ok(AnswerFormat::Free),
+        Some("json_object") => Ok(AnswerFormat::JsonObject),
+        Some("json_schema") => {
+            #[derive(Deserialize)]
+            struct Wire<'a> {
+                #[serde(borrow)]
+                json_schema: Option<&'a RawValue>,
+            }
+            let members = serde_json::from_str::<Wire<'_>>(raw.get()).ok().and_then(|wire| wire.json_schema);
+            match members {
+                Some(members) => schema_format(members, "response_format.json_schema", PARAM).map(AnswerFormat::JsonSchema),
+                None => Err(bad_request_param(
+                    "response_format: json_schema names its schema in a json_schema object: {\"type\": \"json_schema\", \"json_schema\": {\"name\": ..., \"schema\": {...}, \"strict\": true}}",
+                    PARAM,
+                )),
+            }
+        }
+        _ => Err(error_response_naming(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "unsupported_value",
+            format!(
+                "response_format: {} is not a format this server serves; send {{\"type\": \"json_schema\", ...}}, {{\"type\": \"json_object\"}} or {{\"type\": \"text\"}}, or omit it",
+                raw.get()
+            ),
+            Some(PARAM),
+        )),
+    }
+}
+
+/// A `json_schema` format's members, at `at` in the request (chat
+/// completions' `response_format.json_schema`, the Responses API's
+/// `text.format`, #591): `schema`, required; `strict`, a boolean or `null`;
+/// `name` and `description`, strings when present. A member of another kind
+/// is a 400 naming `param`.
+pub(crate) fn schema_format<'a>(members: &'a RawValue, at: &str, param: &str) -> Result<SchemaFormat<'a>, Response> {
+    #[derive(Deserialize)]
+    struct Members<'a> {
+        name: Option<JsonValue>,
+        description: Option<JsonValue>,
+        #[serde(borrow)]
+        schema: Option<&'a RawValue>,
+        strict: Option<JsonValue>,
+    }
+    let refused = |message: String| bad_request_param(&format!("{at}: {message}"), param);
+    let members: Members<'_> = serde_json::from_str(members.get())
+        .map_err(|_| refused("must be an object, {\"name\": ..., \"schema\": {...}, \"strict\": true}".to_owned()))?;
+    for (member, value) in [("name", &members.name), ("description", &members.description)] {
+        if value.as_ref().is_some_and(|value| !value.is_string()) {
+            return Err(refused(format!("`{member}` must be a string")));
+        }
+    }
+    let strict = match members.strict {
+        None | Some(JsonValue::Null) => false,
+        Some(JsonValue::Bool(strict)) => strict,
+        Some(_) => return Err(refused("`strict` must be a boolean".to_owned())),
+    };
+    match members.schema {
+        Some(schema) => Ok(SchemaFormat { schema, strict }),
+        None => Err(refused("`schema` is required: the JSON Schema the answer is held to".to_owned())),
+    }
+}
+
+/// What `response_format` asks of a chat completion (GitHub #587, #588,
+/// spec #287, ADR 0089): a free answer, or one held to a grammar. The
+/// prompt need not mention JSON, and nothing is added to it.
+pub(crate) fn structured_output(
+    server: &Server,
+    format: Option<&RawValue>,
+    thinking: &ThinkingOptions,
+    tool_choice: &ToolChoice,
+) -> Result<Option<ignis_core::structured::AnswerGrammar>, Response> {
+    hold_answer(server, chat_answer_format(format)?, thinking, tool_choice, "response_format")
+}
+
+/// The grammar a request's answer is held to, for a format read from the
+/// request's `param` (`response_format`, or `text.format` on the Responses
+/// API, #591): `json_object`'s, or the schema's, compiled once per distinct
+/// schema and kept (`model.grammar_cache_bytes`).
 ///
-/// Refused with a 400 naming `response_format`: `json_schema`, which is
-/// being built (#588), and any other type; a model that does not serve
+/// Refused with a 400 naming `param`, before anything is generated: a
+/// schema the grammar refuses, with the refusal's own code and a message
+/// naming its keyword or limit and where (OpenAI's strict subset under
+/// `strict`, OpenAI's four limits always); a model that does not serve
 /// structured output, naming it (Flash-Next, #581); a provider whose
 /// vocabulary cannot be read as bytes; with thinking on, a tokenizer with
 /// no single-token `</think>` to start the answer after; and a forced tool
 /// call beside it, until a turn may open a call under the grammar (#592).
-pub(crate) fn structured_output(
+pub(crate) fn hold_answer(
     server: &Server,
-    format: Option<&JsonValue>,
+    format: AnswerFormat<'_>,
     thinking: &ThinkingOptions,
     tool_choice: &ToolChoice,
+    param: &str,
 ) -> Result<Option<ignis_core::structured::AnswerGrammar>, Response> {
+    use ignis_core::structured::{AnswerGrammar, StructuredKind};
     let refused = |code: &str, message: String| {
-        error_response_naming(StatusCode::BAD_REQUEST, "invalid_request_error", code, message, Some("response_format"))
+        error_response_naming(StatusCode::BAD_REQUEST, "invalid_request_error", code, message, Some(param))
     };
-    let kind = match format {
-        None | Some(JsonValue::Null) => return Ok(None),
-        Some(format) => format.get("type").and_then(JsonValue::as_str),
-    };
-    match kind {
-        Some("text") => return Ok(None),
-        Some("json_object") => {}
-        Some("json_schema") => {
-            return Err(refused(
-                "unsupported_value",
-                "response_format: json_schema is not served yet, structured output is being built (GitHub #287) and json_object is served; send {\"type\": \"json_object\"} or {\"type\": \"text\"}, or omit it".to_owned(),
-            ));
-        }
-        _ => {
-            return Err(refused(
-                "unsupported_value",
-                format!(
-                    "response_format: {} is not a format this server serves; send {{\"type\": \"json_object\"}} or {{\"type\": \"text\"}}, or omit it",
-                    format.map(JsonValue::to_string).unwrap_or_default()
-                ),
-            ));
-        }
+    if let AnswerFormat::Free = format {
+        return Ok(None);
     }
     let active = server.active();
     if !active.family.serves_structured_output() {
         return Err(refused(
             "model_unsupported",
             format!(
-                "response_format: structured output is not served by {} yet (GitHub #581); send {{\"type\": \"text\"}} or omit it",
+                "{param}: structured output is not served by {} yet (GitHub #581); send {{\"type\": \"text\"}} or omit it",
                 active.family.name()
             ),
         ));
@@ -1614,19 +1710,28 @@ pub(crate) fn structured_output(
     if matches!(tool_choice, ToolChoice::Required | ToolChoice::Function(_)) {
         return Err(refused(
             "unsupported_value",
-            "response_format: a forced tool call beside structured output is not served yet (GitHub #592); send tool_choice \"auto\", or omit response_format".to_owned(),
+            format!("{param}: a forced tool call beside structured output is not served yet (GitHub #592); send tool_choice \"auto\", or omit {param}"),
         ));
     }
     let Some(grammars) = active.template.grammars() else {
         return Err(refused(
             "unsupported_value",
-            "response_format: this server's tokenizer cannot be read as bytes, so no answer can be held to a grammar here; omit response_format".to_owned(),
+            format!("{param}: this server's tokenizer cannot be read as bytes, so no answer can be held to a grammar here; omit {param}"),
         ));
     };
-    let grammar = ignis_core::structured::AnswerGrammar::new(
-        grammars.json_object(),
-        ignis_core::structured::StructuredKind::JsonObject,
-    );
+    let grammar = match format {
+        AnswerFormat::Free => return Ok(None),
+        AnswerFormat::JsonObject => AnswerGrammar::new(grammars.json_object(), StructuredKind::JsonObject),
+        AnswerFormat::JsonSchema(schema) => match grammars.json_schema(schema.schema.get(), schema.strict) {
+            Ok(grammar) => AnswerGrammar::new(grammar, StructuredKind::JsonSchema),
+            Err(refusal) => {
+                return Err(refused(
+                    refusal.code,
+                    format!("{param}: json_schema refused, `{}` at {}: {}", refusal.keyword, refusal.path, refusal.detail),
+                ));
+            }
+        },
+    };
     if !active.template.decoder_starts_in_reasoning(thinking) {
         return Ok(Some(grammar));
     }
@@ -1641,7 +1746,7 @@ pub(crate) fn structured_output(
         Some(ids) => Ok(Some(grammar.after(ids[0]))),
         None => Err(refused(
             "unsupported_value",
-            "response_format: with thinking on, the answer is held from the token after the reasoning's </think>, and this tokenizer has no single-token </think>; send enable_thinking: false".to_owned(),
+            format!("{param}: with thinking on, the answer is held from the token after the reasoning's </think>, and this tokenizer has no single-token </think>; send enable_thinking: false"),
         )),
     }
 }
@@ -2534,12 +2639,14 @@ struct ChatCompletionsRequest {
     /// force the call's opening (GitHub #286): from the first token with
     /// thinking off, right after the reasoning block with it on.
     tool_choice: Option<JsonValue>,
-    /// Structured output (GitHub #587, spec #287): `{"type": "json_object"}`
-    /// holds the answer to a valid JSON object, each sampled token checked
-    /// and a miss repaired; `{"type": "text"}`, `null` or absent is a free
-    /// answer. `json_schema` is refused while it is being built (#588).
+    /// Structured output (GitHub #587, #588, spec #287):
+    /// `{"type": "json_object"}` holds the answer to a valid JSON object and
+    /// `{"type": "json_schema", "json_schema": {...}}` to the caller's
+    /// schema, each sampled token checked and a miss repaired; `{"type":
+    /// "text"}`, `null` or absent is a free answer. Kept as sent: a
+    /// schema's keys keep their order, which the answer's follow.
     #[schema(value_type = Object)]
-    response_format: Option<JsonValue>,
+    response_format: Option<Box<RawValue>>,
     /// The Lane tag (GitHub #120, `GLOSSARY.md`): an ignis extension, not an
     /// OpenAI parameter (the way `top_k` went in at #101). `"interactive"`
     /// (default) or `"agent"`, the admission class `admission.rs` schedules
@@ -2581,7 +2688,7 @@ Every request has a deadline from its admission (ADR 0058): `--server-request-ti
 
 Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text. `tool_choice` takes `\"auto\"` (the default), `\"none\"`, `\"required\"` and a named function. The last two force the call's opening -- `<tool_call>` and the function tag, with the name when one is named -- and the model writes the rest: with thinking off the opening is the first thing generated, with thinking on the first thing after the reasoning block closes. A forced call that never closes is dropped like any other, and `finish_reason` says why.
 
-`response_format: {\"type\": \"json_object\"}` holds the answer to a valid JSON object, streamed or not: each sampled token is checked against the grammar before the model consumes it, and a miss is repaired from the same scores restricted to the tokens that keep the object valid. With thinking on the reasoning stays free and the answer is held from the token after its `</think>`. Whitespace runs are bounded, the prompt need not mention JSON, a cut by `max_tokens` returns the object as generated with `finish_reason: \"length\"`, and `message.refusal` is always null. `{\"type\": \"text\"}` is a free answer; `json_schema` is refused while it is being built.
+`response_format: {\"type\": \"json_object\"}` holds the answer to a valid JSON object, streamed or not: each sampled token is checked against the grammar before the model consumes it, and a miss is repaired from the same scores restricted to the tokens that keep the object valid. With thinking on the reasoning stays free and the answer is held from the token after its `</think>`. Whitespace runs are bounded, the prompt need not mention JSON, a cut by `max_tokens` returns the object as generated with `finish_reason: \"length\"`, and `message.refusal` is always null. `{\"type\": \"json_schema\", \"json_schema\": {\"name\", \"schema\", \"strict\"}}` holds it to the schema the same way: under `strict: true` OpenAI's strict subset, all of it enforced, keys in the schema's order; without it what can be enforced is and the rest is inert. A schema already seen is not compiled again. `{\"type\": \"text\"}` is a free answer.
 
 `max_completion_tokens` is `max_tokens` under its current name: the one cap on generated tokens, reasoning included; both sent with different values is a 400. `stop` (a string, or 1 to 4 strings) ends the answer before the first sequence to appear in its content, with `finish_reason: \"stop\"`; the sequence is never emitted, a stream holds back a possible prefix until the next delta resolves it, and it is never matched in the reasoning nor inside a tool call. `usage.prompt_tokens_details.cached_tokens` is the prompt this request resumed from retained state instead of prefilling, the quantity `/v1/responses` reports.
 
@@ -2592,7 +2699,7 @@ Tool calls come back whole -- one complete `tool_calls` delta per call, never a 
             (ChatCompletion = "application/json"),
             (Chunk = "text/event-stream"),
         ), headers(("ignis-stopped-by" = String, description = "`request_timeout` on an answer its deadline cut, answered whole under `--server-timeout-reply partial` (ADR 0058); absent otherwise.")),),
-        (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take. Or `response_format` asks for what this model does not serve (`param: response_format`): `json_schema`, any type but `text` and `json_object`, `json_object` beside a forced tool call, and on Qwen3.8-Flash-Next any structured output (`model_unsupported`, naming the model).", body = ApiError),
+        (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take. Or `response_format` asks for what this model does not serve (`param: response_format`): a schema the grammar refuses, with the refusal's own code (`unsupported_keyword`, `too_many_properties`, ...) and a message naming the keyword or the limit and where; a `json_schema` with no `schema`; any type but `text`, `json_object` and `json_schema`; structured output beside a forced tool call; and on Qwen3.8-Flash-Next any structured output (`model_unsupported`, naming the model).", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 409, description = "The model that would serve the request is the image model: the one loaded, with no `model` naming a text model to switch to, or the one `model` names (`model_kind_mismatch`, naming both kinds and the loaded id). Or `model` names a catalog entry this card cannot load, and no entry that answers to it can: by its class (`model_above_card_class`, naming the entry's class and the card's, ADR 0064) or by its GPU generation, alone or with its class (`model_above_gpu_generation`, naming the generation the entry needs and the card's name, compute capability and generation, ADR 0079): refused before anything loads or switches, the loaded model serving on.", body = ApiError),
@@ -2676,7 +2783,7 @@ async fn chat_completions(
         Ok(forced) => forced,
         Err(response) => return response,
     };
-    let grammar = match structured_output(&server, req.response_format.as_ref(), &thinking, &tool_choice) {
+    let grammar = match structured_output(&server, req.response_format.as_deref(), &thinking, &tool_choice) {
         Ok(grammar) => grammar,
         Err(response) => return response,
     };

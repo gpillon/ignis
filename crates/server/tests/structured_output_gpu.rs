@@ -1,8 +1,12 @@
-//! Structured output's exactness on the 27B (GitHub #587, spec #287, ADR
-//! 0089): with speculation off and greedy decoding, a `json_object` answer
-//! served check-first -- each draw checked against the grammar before the
-//! next round consumes it, a miss repaired from the scores its call kept --
-//! is the answer masking every step gives.
+//! Structured output's exactness on the 27B (GitHub #587, #588, spec #287,
+//! ADR 0089): with speculation off and greedy decoding, an answer served
+//! check-first -- each draw checked against the grammar before the next
+//! round consumes it, a miss repaired from the scores its call kept -- is the
+//! answer masking every step gives. The answers are held to `json_object`
+//! (three prompts the model answers in prose, behind a fence, or as an
+//! object) and to each case of the grammar's corpus
+//! (`crates/grammar/tests/corpus/cases.json`: its schemas compiled strict as
+//! a request's are, its prompts as written, the schema not described).
 //!
 //! Two halves, the model loaded once for each:
 //!
@@ -22,7 +26,8 @@
 //! tolerance the speculative tests use): a route's argmax is not invariant
 //! there, and the comparison goes on from the served token. Every served
 //! token is permitted where it stands, the answer ends on a stop the
-//! grammar allows, and its text parses as a JSON object.
+//! grammar allows, and its text parses as JSON (an object for
+//! `json_object`).
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a skip; under the profile it is a failure.
@@ -48,7 +53,8 @@ use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step::prefill_program;
 use ignis_core::structured::{AnswerGrammar, StructuredKind};
 use ignis_core::{DecodeParams, FinishReason, KvFormat, RequestClass, RequestInput, SchedEvent, TokenId};
-use ignis_grammar::{Grammar, Matcher, TokenSet};
+use ignis_grammar::json::Json;
+use ignis_grammar::{Grammar, GrammarCache, Matcher, TokenSet};
 use ignis_server::artifact_template::ArtifactTemplateProvider;
 use ignis_server::engine::Engine;
 use ignis_server::runtime::{cuda_scheduler, EngineShape};
@@ -88,6 +94,46 @@ fn masked_argmax(logits: &[f32], set: &TokenSet) -> TokenId {
     best.expect("a grammar never leaves an empty permitted set")
 }
 
+/// One prompt and the grammar its answer is held to.
+struct Case {
+    name: String,
+    prompt: String,
+    grammar: Arc<Grammar>,
+    kind: StructuredKind,
+}
+
+/// The three `json_object` prompts, then every case of the grammar's corpus,
+/// each schema compiled strict through `grammars` as a request's is.
+fn cases(grammars: &GrammarCache) -> Vec<Case> {
+    let mut cases: Vec<Case> = PROMPTS
+        .iter()
+        .enumerate()
+        .map(|(i, prompt)| Case {
+            name: format!("json_object {i}"),
+            prompt: (*prompt).to_owned(),
+            grammar: grammars.json_object(),
+            kind: StructuredKind::JsonObject,
+        })
+        .collect();
+    let corpus = concat!(env!("CARGO_MANIFEST_DIR"), "/../grammar/tests/corpus/cases.json");
+    let corpus = Json::parse(&std::fs::read_to_string(corpus).unwrap()).unwrap();
+    let Json::Arr(entries) = corpus else { panic!("the corpus is an array") };
+    for entry in &entries {
+        let name = entry.get("name").and_then(Json::as_str).unwrap().to_owned();
+        let prompt = entry.get("prompt").and_then(Json::as_str).unwrap().to_owned();
+        // The schema's own text, its keys in their order.
+        let (grammar, kind) = match entry.get("schema") {
+            None => (grammars.json_object(), StructuredKind::JsonObject),
+            Some(schema) => (
+                grammars.json_schema(&schema.compact(), true).unwrap_or_else(|r| panic!("{name}: {r}")),
+                StructuredKind::JsonSchema,
+            ),
+        };
+        cases.push(Case { name, prompt, grammar, kind });
+    }
+    cases
+}
+
 /// What the served half returns for one prompt.
 struct Served {
     prompt: Vec<TokenId>,
@@ -95,12 +141,12 @@ struct Served {
     reason: FinishReason,
 }
 
-/// The served half: every prompt through the production scheduler, held to
-/// `grammar`. `None` on a skip.
+/// The served half: every case's prompt through the production scheduler,
+/// held to its grammar. `None` on a skip.
 async fn serve(
     frontend: &FrontendSet,
     provider: &ArtifactTemplateProvider,
-    grammar: &Arc<Grammar>,
+    cases: &[Case],
     eos: TokenId,
 ) -> Option<Vec<Served>> {
     let shape = EngineShape { kv_format: KvFormat::Bf16, speculation: None, speculation_off: true, ..EngineShape::default() };
@@ -116,8 +162,10 @@ async fn serve(
     let (engine, driver) = Engine::with_clock_and_driver(Box::new(scheduler), Arc::new(SystemClock));
     let off = ThinkingOptions { enable_thinking: false, ..ThinkingOptions::default() };
     let mut served = Vec::new();
-    for text in PROMPTS {
-        let message: ChatMessage = serde_json::from_value(serde_json::json!({ "role": "user", "content": text })).unwrap();
+    for case in cases {
+        let text = &case.name;
+        let message: ChatMessage =
+            serde_json::from_value(serde_json::json!({ "role": "user", "content": case.prompt })).unwrap();
         let rendered = provider
             .apply_chat_template(std::slice::from_ref(&message), &off, &[])
             .unwrap_or_else(|e| panic!("render: {}", e.message));
@@ -133,7 +181,7 @@ async fn serve(
             decision: None,
             constrained: None,
             forced_literal: None,
-            grammar: Some(AnswerGrammar::new(grammar.clone(), StructuredKind::JsonObject)),
+            grammar: Some(AnswerGrammar::new(case.grammar.clone(), case.kind)),
             warm_up: false,
         };
         let (_, mut stream) = engine.submit(input, RequestClass::Interactive).await.expect("admitted");
@@ -146,7 +194,7 @@ async fn serve(
             }
         };
         eprintln!(
-            "served {text:?}: {} tokens, {reason:?}: {:?}",
+            "served {text}: {} tokens, {reason:?}: {:?}",
             tokens.len(),
             frontend.tokenizer().decode(&tokens).unwrap_or_default()
         );
@@ -160,7 +208,7 @@ async fn serve(
 
 #[tokio::test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
-async fn json_object_answers_equal_the_per_token_masked_argmax() {
+async fn json_object_and_corpus_schema_answers_equal_the_per_token_masked_argmax() {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return;
@@ -173,9 +221,9 @@ async fn json_object_answers_equal_the_per_token_masked_argmax() {
     let provider = ArtifactTemplateProvider::new(
         FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}")),
     )
-    .with_grammar_vocabulary(vocab(), eos);
-    let grammar = provider.grammars().expect("the 27B's vocabulary reads as bytes").json_object();
-    let Some(served) = serve(&frontend, &provider, &grammar, eos).await else { return };
+    .with_grammar_vocabulary(vocab(), eos, ignis_grammar::DEFAULT_CACHE_BYTES);
+    let cases = cases(&provider.grammars().expect("the 27B's vocabulary reads as bytes"));
+    let Some(served) = serve(&frontend, &provider, &cases, eos).await else { return };
 
     // ── the reference: the prefill route's readouts, teacher-forced ──────
     let (plan, handles) = bind_text_scope_27b(&reader).unwrap_or_else(|e| panic!("bind: {e}"));
@@ -198,7 +246,9 @@ async fn json_object_answers_equal_the_per_token_masked_argmax() {
         .unwrap_or_else(|e| panic!("seq pool: {e}"))
     };
     let mut repaired_positions = 0;
-    for (text, answer) in PROMPTS.iter().zip(&served) {
+    for (case, answer) in cases.iter().zip(&served) {
+        let text = &case.name;
+        let grammar = &case.grammar;
         let pool = new_pool();
         let mut sequence = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
         let mut logits = vec![0f32; vocab()];
@@ -245,7 +295,7 @@ async fn json_object_answers_equal_the_per_token_masked_argmax() {
                 assert!(matcher.is_finished(), "{text}: the answer ended on a stop the grammar allows");
                 let value: serde_json::Value =
                     serde_json::from_str(&content).unwrap_or_else(|e| panic!("{text}: not JSON ({e}): {content:?}"));
-                assert!(value.is_object(), "{text}: not an object: {content:?}");
+                assert!(case.kind != StructuredKind::JsonObject || value.is_object(), "{text}: not an object: {content:?}");
             }
             FinishReason::Length => assert_eq!(answer.tokens.len() as u32, MAX_TOKENS, "{text}: cut at its cap"),
             other => panic!("{text}: ended {other:?}"),

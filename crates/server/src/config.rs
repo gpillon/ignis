@@ -254,6 +254,10 @@ pub const DEFAULT_HOST_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// 2026-10-12, the owner's call; spec flash-next/03 set 6).
 pub const DEFAULT_HOST_MARGIN_BYTES: u64 = ignis_core::residency::DEFAULT_HOST_MARGIN_BYTES;
 
+/// `--model-grammar-cache-bytes`' default (GitHub #588): 256 MiB of compiled
+/// grammars, room for hundreds of SDK-sized schemas with their masks.
+pub const DEFAULT_GRAMMAR_CACHE_BYTES: u64 = ignis_grammar::DEFAULT_CACHE_BYTES as u64;
+
 /// `--model-adapt-context-step`'s default (ADR 0063 §3): a 27B context the
 /// load adapts goes down 65,536 tokens at a time, and never below 65,536 --
 /// spec 27b-16gb/04's 262,144 -> 196,608 -> 131,072 -> 65,536 on the 16 GB
@@ -412,6 +416,10 @@ pub struct Config {
     /// since its token embedding lives in pinned host memory (ADR 0062). The
     /// image model makes no host plan: its start carries it for a switch.
     pub host_margin_bytes: u64,
+    /// The memory structured output's compiled grammars may hold
+    /// (`--model-grammar-cache-bytes`, [`DEFAULT_GRAMMAR_CACHE_BYTES`], GitHub
+    /// #588): one per distinct schema, the least recently used dropped past it.
+    pub grammar_cache_bytes: u64,
     /// Cross-request state reuse (`--reuse-prompt`, GitHub #186, ADR 0029).
     /// On by default. Off means a request captures no prompt checkpoint and
     /// claims none, so a cold bench measures a cold engine and a correctness
@@ -1368,6 +1376,7 @@ fn derive(
         pinned_expert_bytes: s.vram.pinned_expert_bytes,
         host_pool_bytes: s.reuse.kv_host_pool_bytes,
         host_margin_bytes: s.model.host_margin_bytes,
+        grammar_cache_bytes: s.model.grammar_cache_bytes,
         prompt_reuse,
         // A profile's device slots serve prompt reuse (`rtx-24gb`'s, GitHub
         // #508): with it off they are not reserved; a count the operator

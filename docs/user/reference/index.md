@@ -1,6 +1,6 @@
 ---
 title: "Reference"
-description: "The lists the code writes about itself — config fields, profiles, models, metrics, routes, commands — and the glossary."
+description: "The lists the code writes about itself — config fields, profiles, models, metrics, routes, commands, JSON Schema keywords — and the glossary."
 sidebar:
   order: 0
   label: "Overview"
@@ -20,6 +20,7 @@ The pages around them explain; these list.
 | [Metrics](metrics.md) | Every Prometheus metric, its type and meaning | the metrics listener's own exposition |
 | [HTTP routes](http-routes.md) | Every route of the HTTP surface | the OpenAPI document the handlers build |
 | [Command line](cli.md) | The commands and subcommands | `ignis-server --help` |
+| [JSON Schema keywords](json-schema.md) | What a `json_schema` in `response_format` may carry: the keywords held, the formats, the annotations, the keywords inert without `strict`, OpenAI's four limits | the grammar's own lists, each inert keyword and limit compiled |
 | [Glossary](glossary.md) | The terms the guide uses | written by hand |
 
 A running server also describes itself: `ignis-server help --fields --format

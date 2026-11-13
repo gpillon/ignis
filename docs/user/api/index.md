@@ -24,7 +24,7 @@ not.
 | `/v1/config` | GET, PATCH | The running configuration, and a change to it ([configuration](../configuration/index.md)). |
 | `/v1/config/fields` | GET | What each visible configuration field is: kind, default, rule, families, whether a change reloads. |
 | `/v1/config/origins` | GET | Where each visible value in force comes from, shared and per model family: default, profile, card, file, env, flag or live. |
-| `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming; an answer held to a JSON object with `response_format` ([Structured output](structured-output.md), from 0.11.0). |
+| `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming; an answer held to a JSON object or to your JSON schema with `response_format` ([Structured output](structured-output.md), from 0.11.0). |
 | `/v1/responses` | POST | The OpenAI Responses API, streaming (`stream: true`, SSE) and non-streaming ([The Responses API](responses.md)). |
 | `/v1/responses` | GET | Its WebSocket mode: the upgrade, then `response.create` events ([The Responses API](responses.md)). |
 | `/v1/tokenize` | POST | A body's prompt-token count without serving it ([Counting a prompt](count.md)). |

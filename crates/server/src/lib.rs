@@ -546,8 +546,11 @@ impl Server {
         let eos = frontend.eos_token_id();
         let provider = artifact_template::ArtifactTemplateProvider::new(frontend);
         let provider = match eos {
-            Some(eos) => provider
-                .with_grammar_vocabulary(ignis_core::compute::ModelConfig::qwen38_27b().vocab as usize, eos),
+            Some(eos) => provider.with_grammar_vocabulary(
+                ignis_core::compute::ModelConfig::qwen38_27b().vocab as usize,
+                eos,
+                ignis_grammar::DEFAULT_CACHE_BYTES,
+            ),
             None => provider,
         };
         Self::new(engine, Box::new(provider))

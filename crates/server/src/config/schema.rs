@@ -478,6 +478,12 @@ config_group! {
         /// paged out. The image model makes no host plan: its start carries
         /// it for a switch to a text model.
         host_margin_bytes: Bytes = super::DEFAULT_HOST_MARGIN_BYTES, NO_RULE, ALL, [Visible, Patchable, ReloadRequired, Scoped];
+        /// The memory structured output's compiled grammars may hold, for the
+        /// loaded model: one per distinct `json_schema` and `strict` flag, so a
+        /// schema sent again is not compiled again, and past this the least
+        /// recently used are dropped (a request still holding one keeps it).
+        /// Ordinary RAM, taken as schemas arrive. 0 keeps only the last one.
+        grammar_cache_bytes: Bytes = super::DEFAULT_GRAMMAR_CACHE_BYTES, NO_RULE, ALL, [Visible];
         /// The 27B's adaptation (ADR 0063): when its VRAM plan refuses a
         /// `max_context` the profile or the default gave, the load lowers it
         /// this many tokens at a time, never below this many -- a start whose

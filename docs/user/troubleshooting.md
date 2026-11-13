@@ -612,12 +612,18 @@ is never clamped. Fix or remove the field the `param` names
 
 ### A `400` naming `response_format`
 
-`json_object` is served on the 27B from 0.11.0; `json_schema` is not served
-yet. Flash-Next answers `model_unsupported` naming itself, and a forced tool
-call (`tool_choice: "required"` or a named function) beside it is refused
-until a turn may choose between a call and the object. Send
-`{"type": "json_object"}` to the 27B, or `{"type": "text"}`
-([Structured output](api/structured-output.md)).
+`json_object` and `json_schema` are served on the 27B from 0.11.0. A schema
+the grammar refuses answers with the refusal's own `code` and a message naming
+the keyword or the limit and where: under `strict: true`, a keyword outside
+OpenAI's strict subset (`unsupported_keyword`), an object that is not closed
+(`additional_properties_not_false`) or a property `required` does not list
+(`not_all_required`); `strict` or not, a schema past one of OpenAI's limits
+(`too_many_properties`, ...). Fix the schema, or send it without `strict` to
+have the keyword served inert. Flash-Next answers `model_unsupported` naming
+itself, and a forced tool call (`tool_choice: "required"` or a named function)
+beside structured output is refused until a turn may choose between a call
+and the answer. Send it to the 27B, or `{"type": "text"}`
+([Structured output](api/structured-output.md#what-is-refused)).
 
 ### The answer stops short with `finish_reason: "length"`
 
