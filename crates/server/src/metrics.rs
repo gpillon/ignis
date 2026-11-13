@@ -598,14 +598,14 @@ const REPAIR_BOUNDS_US: [u64; 10] = [50, 100, 250, 500, 1_000, 2_500, 5_000, 10_
 
 /// A fixed-bucket histogram over microsecond observations.
 #[derive(Debug)]
-struct Micros {
+struct MicrosHistogram {
     bounds: &'static [u64; 10],
     /// Observations per bucket, not cumulative; the last is `+Inf`'s own.
     buckets: [AtomicU64; 11],
     sum_us: AtomicU64,
 }
 
-impl Micros {
+impl MicrosHistogram {
     fn new(bounds: &'static [u64; 10]) -> Self {
         Self { bounds, buckets: Default::default(), sum_us: AtomicU64::new(0) }
     }
@@ -725,7 +725,7 @@ pub struct Metrics {
     structured_requests: [AtomicU64; STRUCTURED_KINDS.len()],
     structured_misses: [AtomicU64; STRUCTURED_KINDS.len()],
     structured_repairs: [AtomicU64; STRUCTURED_KINDS.len()],
-    structured_repair_time: Micros,
+    structured_repair_time: MicrosHistogram,
     /// The loop guard (GitHub #330): the requests it watched and those that
     /// looped, its loops per [`LoopOutcome::ALL`], the tokens its rewinds
     /// took back, and each watched request's lowest score. Absent from the
@@ -922,7 +922,7 @@ impl Metrics {
             structured_requests: Default::default(),
             structured_misses: Default::default(),
             structured_repairs: Default::default(),
-            structured_repair_time: Micros::new(&REPAIR_BOUNDS_US),
+            structured_repair_time: MicrosHistogram::new(&REPAIR_BOUNDS_US),
             loop_guard_watched: AtomicU64::new(0),
             loop_guard_looped: AtomicU64::new(0),
             loop_guard_loops: Default::default(),

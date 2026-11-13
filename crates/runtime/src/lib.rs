@@ -2216,7 +2216,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
     fn decode_step_cut(
         &self,
         jobs: &[DecodeJob],
-        cut: &mut dyn FnMut(usize, &[PendingToken]) -> usize,
+        cut: &mut ignis_core::scheduler::HostCut<'_>,
     ) -> Result<Vec<DecodeOutcome>, ComputeError> {
         self.decode_round(jobs, Some(cut))
     }

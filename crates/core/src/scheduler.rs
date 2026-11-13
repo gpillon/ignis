@@ -323,6 +323,12 @@ pub enum PendingToken {
     Stop,
 }
 
+/// The host's cut of a verify round (GitHub #590, [`Compute::decode_step_cut`]):
+/// shown a checked lane's index among the round's jobs and its run -- the
+/// anchor, then the drafts the target accepted -- it returns how many of the
+/// run's tokens the commit keeps, `1..=run.len()`.
+pub type HostCut<'a> = dyn FnMut(usize, &[PendingToken]) -> usize + 'a;
+
 /// One **repair** handed to the compute backend (GitHub #586, spec #287): the
 /// position of `request`'s **pending token** — what its last prefill or plain
 /// round drew, which the next round consumes as its anchor — drawn again
@@ -746,7 +752,7 @@ pub trait Compute: Send + Sync {
     fn decode_step_cut(
         &self,
         jobs: &[DecodeJob],
-        _cut: &mut dyn FnMut(usize, &[PendingToken]) -> usize,
+        _cut: &mut HostCut<'_>,
     ) -> Result<Vec<DecodeOutcome>, ComputeError> {
         self.decode_step(jobs)
     }

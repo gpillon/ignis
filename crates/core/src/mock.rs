@@ -19,7 +19,7 @@ use std::time::Duration;
 use crate::decision::{Readout, argmax, log_sum_exp};
 use crate::scheduler::{
     Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome, DiskSource, DiskTarget,
-    KvRamEvent, KvRamMove, KvRamOutcome, PrefillJob, PrefillOutcome, RepairJob, PendingToken, NO_HOST_ROOM,
+    KvRamEvent, KvRamMove, KvRamOutcome, PrefillJob, PrefillOutcome, RepairJob, PendingToken, HostCut, NO_HOST_ROOM,
 };
 use crate::types::{ComputeError, FinishReason, RequestId, SpecCounters, TokenId};
 
@@ -822,7 +822,7 @@ impl MockCompute {
     fn decode_round(
         &self,
         jobs: &[DecodeJob],
-        mut cut: Option<&mut dyn FnMut(usize, &[PendingToken]) -> usize>,
+        mut cut: Option<&mut HostCut<'_>>,
     ) -> Result<Vec<DecodeOutcome>, ComputeError> {
         let mut g = self.inner.lock().unwrap();
         g.decode_batches.push(jobs.to_vec());
@@ -1272,7 +1272,7 @@ impl Compute for MockCompute {
     fn decode_step_cut(
         &self,
         jobs: &[DecodeJob],
-        cut: &mut dyn FnMut(usize, &[PendingToken]) -> usize,
+        cut: &mut HostCut<'_>,
     ) -> Result<Vec<DecodeOutcome>, ComputeError> {
         self.decode_round(jobs, Some(cut))
     }
@@ -1883,7 +1883,7 @@ impl Compute for GatedCompute {
     fn decode_step_cut(
         &self,
         jobs: &[DecodeJob],
-        cut: &mut dyn FnMut(usize, &[crate::scheduler::PendingToken]) -> usize,
+        cut: &mut crate::scheduler::HostCut<'_>,
     ) -> Result<Vec<DecodeOutcome>, ComputeError> {
         self.hold_at_gate(jobs);
         self.inner.decode_step_cut(jobs, cut)

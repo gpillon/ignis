@@ -13,9 +13,11 @@
 //!   distinct schema, in bounded memory;
 //! - [`Matcher`]: one request's state. [`Matcher::check`] and
 //!   [`Matcher::accept`] take one token (the common path),
-//!   [`Matcher::accept_run`] a run up to its first miss (a verify round's
-//!   cut), and [`Matcher::mask`] gives the permitted set where it stands (the
-//!   repair). The permitted set holds every token that keeps the answer
+//!   [`Matcher::accept_run`] a run up to its first miss (a test and bench
+//!   helper: the scheduler walks a verify round's run token by token with
+//!   [`Matcher::accept`], since the run may also hold the reasoning's close
+//!   or a tool call's opener), and [`Matcher::mask`] gives the permitted set
+//!   where it stands (the repair). The permitted set holds every token that keeps the answer
 //!   completable: no state is a dead end.
 //!
 //! It is our own Rust (no grammar engine), CPU-only; `regex-automata` builds
@@ -47,7 +49,7 @@ use automaton::{Config, Frame, State};
 
 /// One request's position in its grammar.
 pub struct Matcher {
-    g: Arc<Grammar>,
+    grammar: Arc<Grammar>,
     state: State,
     scratch: State,
     forks: Vec<Config>,
@@ -58,7 +60,7 @@ pub struct Matcher {
 /// A snapshot of the request's position (its scratch is not copied).
 impl Clone for Matcher {
     fn clone(&self) -> Self {
-        Self { state: self.state.clone(), finished: self.finished, ..Matcher::new(self.g.clone()) }
+        Self { state: self.state.clone(), finished: self.finished, ..Matcher::new(self.grammar.clone()) }
     }
 }
 
@@ -80,13 +82,13 @@ pub enum Position {
 }
 
 impl Matcher {
-    pub fn new(g: Arc<Grammar>) -> Self {
-        let state = State::initial(g.core.root);
-        Self { g, state, scratch: State::default(), forks: Vec::new(), walker: Default::default(), finished: false }
+    pub fn new(grammar: Arc<Grammar>) -> Self {
+        let state = State::initial(grammar.core.root);
+        Self { grammar, state, scratch: State::default(), forks: Vec::new(), walker: Default::default(), finished: false }
     }
 
     pub fn grammar(&self) -> &Arc<Grammar> {
-        &self.g
+        &self.grammar
     }
 
     /// Whether `token` is valid here. Leaves the state unchanged.
@@ -94,13 +96,13 @@ impl Matcher {
         if self.finished {
             return false;
         }
-        if self.g.vocab.is_stop(token) {
+        if self.grammar.vocab.is_stop(token) {
             return self.state.accepting();
         }
-        let Some(bytes) = self.g.vocab.token_bytes(token) else { return false };
+        let Some(bytes) = self.grammar.vocab.token_bytes(token) else { return false };
         self.scratch.clone_from(&self.state);
         for &b in bytes {
-            if !self.scratch.step(&self.g.core, b, &mut self.forks) {
+            if !self.scratch.step(&self.grammar.core, b, &mut self.forks) {
                 return false;
             }
         }
@@ -113,7 +115,7 @@ impl Matcher {
         if !self.check(token) {
             return false;
         }
-        if self.g.vocab.is_stop(token) {
+        if self.grammar.vocab.is_stop(token) {
             self.finished = true;
         } else {
             std::mem::swap(&mut self.state, &mut self.scratch);
@@ -122,8 +124,10 @@ impl Matcher {
     }
 
     /// Accept `tokens` in order up to the first miss, and return how many
-    /// were accepted: a verify round's licensed run is cut there, and the
-    /// miss's position repaired from the state the matcher is left in.
+    /// were accepted; the miss's position is repaired from the state the
+    /// matcher is left in. A run of the answer alone: the scheduler's own
+    /// walk of a verify round's run (`ignis_core::structured::GrammarState::check_run`)
+    /// also meets the reasoning's close and a tool call's opener.
     pub fn accept_run(&mut self, tokens: &[u32]) -> usize {
         tokens.iter().take_while(|&&t| self.accept(t)).count()
     }
@@ -141,7 +145,7 @@ impl Matcher {
     pub fn accept_bytes(&mut self, bytes: &[u8]) -> bool {
         self.scratch.clone_from(&self.state);
         for &b in bytes {
-            if !self.scratch.step(&self.g.core, b, &mut self.forks) {
+            if !self.scratch.step(&self.grammar.core, b, &mut self.forks) {
                 return false;
             }
         }
@@ -165,14 +169,14 @@ impl Matcher {
             out.clear();
             return false;
         }
-        self.g.mask(&self.state, out, &mut self.walker)
+        self.grammar.mask(&self.state, out, &mut self.walker)
     }
 
     /// The reference the mask is tested against: [`Matcher::check`] on every
     /// id of the vocabulary.
     pub fn mask_reference(&mut self, out: &mut TokenSet) {
         out.clear();
-        for id in 0..self.g.vocab.len() as u32 {
+        for id in 0..self.grammar.vocab.len() as u32 {
             if self.check(id) {
                 out.insert(id);
             }
@@ -220,7 +224,7 @@ impl Matcher {
         (0..=255u8)
             .filter(|&b| {
                 self.scratch.clone_from(&self.state);
-                self.scratch.step(&self.g.core, b, &mut self.forks)
+                self.scratch.step(&self.grammar.core, b, &mut self.forks)
             })
             .collect()
     }

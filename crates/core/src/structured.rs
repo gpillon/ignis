@@ -113,22 +113,6 @@ impl AnswerGrammar {
     pub fn kind(&self) -> StructuredKind {
         self.kind
     }
-
-    /// The compiled grammar.
-    pub fn grammar(&self) -> &Arc<Grammar> {
-        &self.grammar
-    }
-
-    /// The reasoning block's close the answer starts after, if one was named.
-    pub fn think_end(&self) -> Option<TokenId> {
-        self.think_end
-    }
-
-    /// The tool call's opener the turn may write instead of the answer, if
-    /// tools ride beside the grammar.
-    pub fn tool_opener(&self) -> Option<TokenId> {
-        self.tool_opener
-    }
 }
 
 /// A compiled grammar holds thousands of states; what a log line needs is

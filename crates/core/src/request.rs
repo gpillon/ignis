@@ -282,6 +282,13 @@ pub struct Request {
     pub prefill_failures: u32,
 }
 
+/// A request's progress through its grammar before its first token (GitHub
+/// #587): at submission, and again when a requeue writes its answer anew.
+fn grammar_state(input: &RequestInput) -> Option<crate::structured::GrammarState> {
+    let grammar = input.grammar.as_ref()?;
+    Some(crate::structured::GrammarState::new(grammar, input.params.starts_in_reasoning))
+}
+
 impl Request {
     /// A freshly-admitted request: state `Admitted`, no lane yet.
     /// `resources` is the request's KV reservation (the admission state
@@ -293,10 +300,7 @@ impl Request {
         resources: AdmissionResources,
         remaining_work: u64,
     ) -> Self {
-        let grammar = input
-            .grammar
-            .as_ref()
-            .map(|grammar| crate::structured::GrammarState::new(grammar, input.params.starts_in_reasoning));
+        let grammar = grammar_state(&input);
         Self {
             id,
             class,
@@ -844,11 +848,7 @@ impl Request {
         self.reasoning_redirected_at = None;
         self.forced_state = crate::forced_literal::ForcedState::default();
         // GitHub #587: and its answer, which the re-prefill writes again.
-        self.grammar = self
-            .input
-            .grammar
-            .as_ref()
-            .map(|grammar| crate::structured::GrammarState::new(grammar, self.input.params.starts_in_reasoning));
+        self.grammar = grammar_state(&self.input);
         // #518: and the re-prefill emits its own first token.
         self.anchor_emitted = false;
         true
