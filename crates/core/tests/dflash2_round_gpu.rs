@@ -46,7 +46,7 @@ use std::path::Path;
 
 use ignis_artifact::{
     bind_model_scope_27b, bind_model_scope_27b_with, materialize, text_scope_27b, CudaDevice, DraftModule, FrontendSet,
-    MaterializedArtifact, ModelScope, VisionResidency, ObjectHandle, Reader,
+    MaterializationPlan, MaterializedArtifact, ModelScope, VisionResidency, ObjectHandle, Reader,
 };
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
@@ -107,6 +107,44 @@ fn load_drafter(reader: &Reader, artifact: &MaterializedArtifact, handles: &[Obj
         .unwrap_or_else(|e| panic!("model load (dflash2, window {WINDOW}): {e}"))
 }
 
+/// The card and an artifact materialized on it. Dropping it gives the arena
+/// back -- at a test's end, and on a panic as well, so a failing test cannot
+/// leave the tests after it in this binary without VRAM (GitHub #576).
+struct OnDevice {
+    artifact: MaterializedArtifact,
+    device: CudaDevice,
+}
+
+impl Drop for OnDevice {
+    fn drop(&mut self) {
+        let _ = self.artifact.release_arena(&mut self.device);
+    }
+}
+
+/// `plan` materialized on GPU 0, or `None` when the test skips: a missing
+/// GPU or a failed upload is a skip outside the profile and a failure under
+/// it (ADR 0006).
+fn on_device(reader: &Reader, plan: &MaterializationPlan, scope: &str) -> Option<OnDevice> {
+    let mut device = match CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                return None;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    match materialize(reader, plan, &mut device, None) {
+        Ok(artifact) => Some(OnDevice { artifact, device }),
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize {scope}: {e}")) {
+                return None;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    }
+}
+
 fn prefill_all(model: &Model, pool: &SeqPool, sequences: &mut [Seq<'_>], prompts: &[Vec<i32>]) {
     for (seq, prompt) in sequences.iter_mut().zip(prompts) {
         prefill_program_sampled(model, pool, seq, prompt, 0, SamplingParams::greedy(), None)
@@ -151,11 +189,11 @@ fn round(
     budgets: &[u32],
     stop_ids: &[i32],
 ) -> Vec<LaneVerifyRun> {
-    round_with(model, pool, sequences, &vec![SamplingParams::greedy(); budgets.len()], budgets, stop_ids, -1)
+    round_with(model, pool, sequences, &vec![SamplingParams::greedy(); budgets.len()], budgets, stop_ids, &vec![-1; budgets.len()])
 }
 
-/// [`round`] with each lane under its own sampling, and `reasoning_close`
-/// as every lane's redirect (-1 for none) (GitHub #576).
+/// [`round`] with each lane under its own sampling, and `reasoning_closes[i]`
+/// as lane `i`'s redirect (-1 for none) (GitHub #576).
 fn round_with(
     model: &Model,
     pool: &SeqPool,
@@ -163,12 +201,13 @@ fn round_with(
     samplings: &[SamplingParams],
     budgets: &[u32],
     stop_ids: &[i32],
-    reasoning_close: i32,
+    reasoning_closes: &[i32],
 ) -> Vec<LaneVerifyRun> {
     let lanes: Vec<VerifyLane<'_>> = budgets
         .iter()
         .zip(samplings)
-        .map(|(&remaining_tokens, &sampling)| VerifyLane {
+        .zip(reasoning_closes)
+        .map(|((&remaining_tokens, &sampling), &reasoning_close)| VerifyLane {
             sampling,
             remaining_tokens,
             stop_ids,
@@ -224,7 +263,7 @@ fn spec_on_with(
         let mut refs: Vec<&mut Seq<'_>> =
             active.iter().map(|&i| remaining[i].take().expect("each active lane once")).collect();
         let lane_samplings: Vec<SamplingParams> = active.iter().map(|&i| samplings[i]).collect();
-        let results = round_with(model, pool, &mut refs, &lane_samplings, &budgets, stop_ids, -1);
+        let results = round_with(model, pool, &mut refs, &lane_samplings, &budgets, stop_ids, &vec![-1; active.len()]);
         let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("stats: {e}"));
         assert_eq!(stats.graph_launches, u64::from(expect_graph), "round {} at width {}: graph replay", rounds.len(), active.len());
         let mut this_round = Vec::new();
@@ -357,24 +396,10 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
     let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
         .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));
     let text_len = text_scope_27b().len();
-    let mut device = match CudaDevice::create(0) {
-        Ok(device) => device,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
+    let Some(on_device) = on_device(&reader, &plan, "text + dflash2") else {
+        return;
     };
-    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
-        Ok(artifact) => artifact,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
-    };
+    let artifact = &on_device.artifact;
 
     // --- the spec-off text at each width AC 1 compares -------------------
     let widths = [1usize, 4, 8];
@@ -611,8 +636,6 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
         generate(&mut restored, &mut evicted, None);
         assert_eq!(evicted, never_evicted, "the restored sequence continued differently from the one never evicted");
     }
-
-    let _ = artifact.release_arena(&mut device);
 }
 
 /// GitHub #257 (spec runtime/06): under hq-e8-2b a verify pass appends every
@@ -661,24 +684,10 @@ fn the_shortlist_head_drafts_and_the_text_stays_the_spec_off_text() {
     let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2ShortlistHead))
         .unwrap_or_else(|e| panic!("bind with the shortlist head: {e}"));
     let text_len = text_scope_27b().len();
-    let mut device = match CudaDevice::create(0) {
-        Ok(device) => device,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
+    let Some(on_device) = on_device(&reader, &plan, "text + dflash2 + shortlist head") else {
+        return;
     };
-    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
-        Ok(artifact) => artifact,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2 + shortlist head: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
-    };
+    let artifact = &on_device.artifact;
     const WIDTH: usize = 4;
     let off = {
         let model = load_qwen38_27b(&reader, &artifact, &handles[..text_len], MAX_CONTEXT, MAX_CONTEXT, KvFormat::Bf16)
@@ -709,10 +718,6 @@ fn the_shortlist_head_drafts_and_the_text_stays_the_spec_off_text() {
     assert_equivalent(&model, &probe, MAX_CONTEXT, &canaries[..WIDTH], &off, &run.emitted, "shortlist head");
     let accepted = report_acceptance("shortlist head", &run);
     assert!(accepted > 0, "no draft from the shortlist head ever landed");
-    // The tests after this one in the binary materialize their own: free this one's arena.
-    drop(capture);
-    drop(model);
-    let _ = artifact.release_arena(&mut device);
 }
 
 #[test]
@@ -762,24 +767,10 @@ fn hq_verify_rounds_clear_the_ring_bits_of_every_rejected_draft() {
 
     let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
         .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));
-    let mut device = match CudaDevice::create(0) {
-        Ok(device) => device,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
+    let Some(on_device) = on_device(&reader, &plan, "text + dflash2") else {
+        return;
     };
-    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
-        Ok(artifact) => artifact,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
-    };
+    let artifact = &on_device.artifact;
     {
         let spec = Speculation::new(SpeculativeBackend::Dflash2, WINDOW).unwrap();
         let model =
@@ -864,7 +855,6 @@ fn hq_verify_rounds_clear_the_ring_bits_of_every_rejected_draft() {
         );
         assert!(rejected_wrapped > 0, "no round rejected a column on a wrapped ring: the clear this test exists for never ran");
     }
-    let _ = artifact.release_arena(&mut device);
 }
 
 /// GitHub #341: with the BF16 exception tensors in FP8 (`--model-exception-weights
@@ -884,24 +874,10 @@ fn with_fp8_exception_tensors_the_verify_graphs_replay_the_eager_rounds() {
     let prompts8: Vec<Vec<i32>> = canaries.iter().chain(&canaries).cloned().collect();
     let scope = ModelScope { draft: Some(DraftModule::Dflash2), vision: false, vision_residency: VisionResidency::Device, fp8_exceptions: true };
     let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
-    let mut device = match CudaDevice::create(0) {
-        Ok(device) => device,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
+    let Some(on_device) = on_device(&reader, &plan, "text + dflash2, fp8 exceptions") else {
+        return;
     };
-    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
-        Ok(artifact) => artifact,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2, fp8 exceptions: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
-    };
+    let artifact = &on_device.artifact;
     const WIDTHS: [usize; 3] = [1, 2, 8];
     let eager: Vec<SpecRun> = {
         let model = load_drafter(&reader, &artifact, &handles);
@@ -917,7 +893,6 @@ fn with_fp8_exception_tensors_the_verify_graphs_replay_the_eager_rounds() {
             assert_eq!(eager, graph, "width {width}: the verify graph's replay diverged from eager");
         }
     }
-    let _ = artifact.release_arena(&mut device);
 }
 
 /// The snapshot section kind of a lane's penalty counts (`ignis_seq_sections.h`).
@@ -941,7 +916,7 @@ fn fixed_rounds(model: &Model, pool: &SeqPool, prompts: &[Vec<i32>], samplings: 
     let mut emitted = vec![Vec::new(); prompts.len()];
     for _ in 0..rounds {
         let mut refs: Vec<&mut Seq<'_>> = sequences.iter_mut().collect();
-        let results = round_with(model, pool, &mut refs, samplings, &vec![0; prompts.len()], &[], -1);
+        let results = round_with(model, pool, &mut refs, samplings, &vec![0; prompts.len()], &[], &vec![-1; prompts.len()]);
         for (text, result) in emitted.iter_mut().zip(results) {
             assert_eq!(result.extent, WINDOW, "a fixed round's lane must draft the whole window");
             text.extend(result.tokens);
@@ -977,7 +952,8 @@ fn agent(seed: u64) -> SamplingParams {
 /// - the penalty rows hold the emitted text and the pending token once each,
 ///   through runs cut at a stop id and runs whose stop was redirected to
 ///   `</think>`: the accept counts every token it produces, the commit gives
-///   back what a cut run did not emit;
+///   back what a cut run did not emit; no stop id reaches a lane's text while
+///   its reasoning block is open;
 /// - the draws run inside the captured verify graphs: at every width 1..8 the
 ///   replay of greedy and sampled lanes together is the eager run bit for bit.
 ///
@@ -1005,24 +981,10 @@ fn under_the_sampled_draft_the_drafter_draws_and_each_lane_keeps_its_text() {
     let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
         .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));
     let text_len = text_scope_27b().len();
-    let mut device = match CudaDevice::create(0) {
-        Ok(device) => device,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
+    let Some(on_device) = on_device(&reader, &plan, "text + dflash2") else {
+        return;
     };
-    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
-        Ok(artifact) => artifact,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
-    };
+    let artifact = &on_device.artifact;
     let greedy = SamplingParams::greedy();
     let load_sampled = || {
         let spec = Speculation::new(SpeculativeBackend::Dflash2, WINDOW)
@@ -1118,7 +1080,14 @@ fn under_the_sampled_draft_the_drafter_draws_and_each_lane_keeps_its_text() {
             let mut remaining: Vec<Option<&mut Seq<'_>>> = sequences.iter_mut().map(Some).collect();
             let mut refs: Vec<&mut Seq<'_>> =
                 active.iter().map(|&i| remaining[i].take().expect("each active lane once")).collect();
-            let results = round_with(&model, &pool, &mut refs, &lane_samplings, &budgets, &stop_ids, close);
+            // The host's view of a lane's reasoning block, as the server
+            // keeps it: open until the lane has emitted a `</think>`, the
+            // redirect's or its own. Inside a round the leaf closes it at a
+            // `</think>` in the run, so a stop id after one ends the answer
+            // and is emitted (ADR 0048).
+            let closes: Vec<i32> =
+                active.iter().map(|&i| if close >= 0 && !emitted[i].contains(&close) { close } else { -1 }).collect();
+            let results = round_with(&model, &pool, &mut refs, &lane_samplings, &budgets, &stop_ids, &closes);
             for (&i, result) in active.iter().zip(results) {
                 redirected += usize::from(result.redirected);
                 let ended = result.tokens.iter().any(|t| stop_ids.contains(t));
@@ -1145,7 +1114,11 @@ fn under_the_sampled_draft_the_drafter_draws_and_each_lane_keeps_its_text() {
                 "{label}, lane {lane}: the penalty row is not the emitted text and the pending token once each (off by {off_by:?})"
             );
             if close >= 0 {
-                assert!(!emitted[lane].iter().any(|t| stop_ids.contains(t)), "{label}, lane {lane}: a redirected stop id was emitted");
+                let closed_at = emitted[lane].iter().position(|&t| t == close).unwrap_or(emitted[lane].len());
+                assert!(
+                    !emitted[lane][..closed_at].iter().any(|t| stop_ids.contains(t)),
+                    "{label}, lane {lane}: a stop id was emitted while the reasoning block was open"
+                );
             }
         }
         if close < 0 {
@@ -1179,7 +1152,6 @@ fn under_the_sampled_draft_the_drafter_draws_and_each_lane_keeps_its_text() {
             assert_eq!(eager, graph, "width {width}: the sampled draft's graph replay diverged from eager");
         }
     }
-    let _ = artifact.release_arena(&mut device);
 }
 
 /// GitHub #576: the shortlist proposal head under the sampled draft. Its
@@ -1199,24 +1171,10 @@ fn under_the_sampled_draft_the_shortlist_head_drafts_too() {
     let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2ShortlistHead))
         .unwrap_or_else(|e| panic!("bind with the shortlist head: {e}"));
     let text_len = text_scope_27b().len();
-    let mut device = match CudaDevice::create(0) {
-        Ok(device) => device,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
+    let Some(on_device) = on_device(&reader, &plan, "text + dflash2 + shortlist head") else {
+        return;
     };
-    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
-        Ok(artifact) => artifact,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2 + shortlist head: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
-    };
+    let artifact = &on_device.artifact;
     const WIDTH: usize = 4;
     let off = {
         let model = load_qwen38_27b(&reader, &artifact, &handles[..text_len], MAX_CONTEXT, MAX_CONTEXT, KvFormat::Bf16)
@@ -1250,6 +1208,4 @@ fn under_the_sampled_draft_the_shortlist_head_drafts_too() {
     let run = spec_on(&model, &pool, &canaries[..WIDTH], &stop_ids, TOTAL, true);
     let probe = || drafter_pool(1);
     assert_equivalent(&model, &probe, MAX_CONTEXT, &canaries[..WIDTH], &off, &run.emitted, "shortlist head, the sampled draft, greedy");
-    drop(model);
-    let _ = artifact.release_arena(&mut device);
 }
