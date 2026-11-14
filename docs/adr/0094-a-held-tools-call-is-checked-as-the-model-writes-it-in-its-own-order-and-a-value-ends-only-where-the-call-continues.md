@@ -75,8 +75,12 @@ and repairs a miss, and it does not write the call's envelope for the model.
   - The residue: a string value cannot contain this call's own confirmed close.
   - The rule is not extended to tools that are not held, and the extension is weighed by a count: with metrics on,
     `ignis_tool_call_values_split_total` (an amendment of ADR 0017 beside #608's family). It counts the string
-    values of those tools' calls that the first-occurrence cuts ended at a tag where the confirmed close would read
-    on to a later step of the same block.
+    values of those tools' calls from which the first-occurrence cuts dropped text after a tag, text the confirmed
+    close would keep in the value: what the cuts skip after a `</parameter>` or between `</function>` and
+    `</tool_call>`, other than whitespace.
+    - It does not count a value whose text the cuts moved into another parameter, dropping nothing. An opener of a
+      written or undeclared parameter may be the model's own envelope, which the confirmed close, without a
+      grammar, would read as the value's text.
     - It does not count a value the confirmed close would end at no step of the block. That excludes a close with a
       required parameter missing, which that rule would not deliver, and a value whose end lies past the block's
       first `</tool_call>`. The count is a lower bound.

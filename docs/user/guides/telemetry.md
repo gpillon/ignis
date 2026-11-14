@@ -111,16 +111,19 @@ serves structured output, so not on Flash-Next). A call still open when
 generation ends is not counted: its `finish_reason` says it was cut. Beside
 them, `ignis_tool_call_values_split_total` counts the string values (of a
 parameter the tool declares a string) that the parser ended at a tag inside
-them, a `</parameter>` followed by more text, an opener of a parameter already
-written or not declared, a `</function>` not followed by `</tool_call>`, or a
-tag in the middle of a line, where the rule a held tool's calls will be read by
-would have read on to a later step of the same call: under that rule a value
+them and whose text after the tag it dropped: text after a `</parameter>` that
+no next parameter follows, or after a `</function>` not followed by
+`</tool_call>`, on a line of its own or inside one. The rule a held tool's
+calls will be read by would have kept that text in the value: under it a value
 ends only at a line that opens a declared parameter not yet written, or that
-closes the call once every required parameter is written. It measures how
-often that rule would change what a call delivers; nothing reads calls by it
-yet, so responses are unchanged. A value whose call closes with a required
-parameter missing, which that rule would not close at all, is not counted, nor
-one whose end under that rule lies past the call's first `</tool_call>`. The
+closes the call once every required parameter is written. It measures what
+that rule would save if every tool were read by it; nothing reads calls by it
+yet, so responses are unchanged. Not counted: a value whose text the parser
+moved into another parameter, dropping nothing (an opener of a parameter
+already written or not declared, which may be the model's own), a value whose
+call closes with a required parameter missing, which that rule would not close
+at all, and one whose end under that rule lies past the call's first
+`</tool_call>`. The
 family appears with the first call block or such a strict tool, and the check
 runs only with metrics on.
 

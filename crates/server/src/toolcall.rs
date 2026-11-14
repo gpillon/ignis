@@ -74,9 +74,9 @@
 //! of `ignis_grammar::call`, the rule its grammar reads by: a value ends
 //! only at a line that is a valid next step of the call, so a value may
 //! hold the dialect's own tags. No tool is held before the grammar holds
-//! its calls. With the check on, the values of a tool not held that the
-//! first-occurrence cuts end at a tag, where the confirmed close would read
-//! on to a later step, are counted ([`CallCheck`]).
+//! its calls. With the check on, the values of a tool not held from which
+//! the first-occurrence cuts drop text after a tag, text the confirmed close
+//! would keep in the value, are counted ([`CallCheck`]).
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -217,15 +217,20 @@ impl CallCheck {
 
     /// Count the values of a call to a tool that is not held, read from
     /// `text` (the block, its `</tool_call>` included) by the
-    /// first-occurrence cuts, that those cuts ended at a tag where the
-    /// confirmed close would have read on to a later step of the same block
-    /// (GitHub #610): the measure of extending that rule to every tool.
-    /// Only a value of a parameter the tool declares a string counts, the
-    /// values the rule is for. A value the confirmed close ends at no step
-    /// of the block does not count (a close with a required parameter
-    /// missing, which that rule would not deliver at all), nor one both
-    /// rules end at the same place (a call's own confirmed close inside a
-    /// value, the residue, among them).
+    /// first-occurrence cuts, from which those cuts dropped text after a tag
+    /// inside them that the confirmed close would have kept in the value
+    /// (GitHub #610): the measure of extending that rule to every tool. The
+    /// dropped text is what the reading skipped (after a `</parameter>`, or
+    /// between `</function>` and `</tool_call>`), not only whitespace, and
+    /// lying before the value's end under the confirmed close. Only a value
+    /// of a parameter the tool declares a string counts, the values the rule
+    /// is for. Not counted: a value the confirmed close ends at no step of
+    /// the block (a close with a required parameter missing, which that rule
+    /// would not deliver at all, or an end past the block's `</tool_call>`);
+    /// one whose text the cuts moved into another parameter, dropping
+    /// nothing (an opener of a written or undeclared parameter, which may be
+    /// the model's own envelope); one both rules end at the same place (the
+    /// residue among them).
     fn count_split_values(&self, text: &str, block: &Block, schemas: &ToolSchemas) {
         let name = &text[block.name.clone()];
         let Some(parameters) = self.rules.get(name) else { return };
@@ -240,7 +245,13 @@ impl CallCheck {
                 continue;
             }
             let start = value.text.start;
-            if call::value_end(&text.as_bytes()[start..], parameters, &written).is_some_and(|(end, _)| start + end != value.text.end) {
+            let Some((end, _)) = call::value_end(&text.as_bytes()[start..], parameters, &written) else { continue };
+            let kept = start..start + end;
+            let dropped = block.skipped.iter().any(|gap| {
+                let (from, to) = (gap.start.max(kept.start), gap.end.min(kept.end));
+                from < to && text.as_bytes()[from..to].iter().any(|b| !b.is_ascii_whitespace())
+            });
+            if dropped {
                 split += 1;
             }
         }
@@ -602,11 +613,16 @@ enum Cuts<'a> {
 
 /// One call block as read: where its function's name and each value's
 /// parameter name and raw text lie in the text it was read from, values in
-/// the order written, a parameter written twice included.
+/// the order written, a parameter written twice included, and the text the
+/// reading skipped.
 #[derive(Debug)]
 struct Block {
     name: Range<usize>,
     values: Vec<Value>,
+    /// What lies in no value and is no tag the reading took: before the
+    /// first opener, after a `</parameter>` up to the next one, and between
+    /// `</function>` and `</tool_call>`. The first-occurrence cuts drop it.
+    skipped: Vec<Range<usize>>,
 }
 
 #[derive(Debug)]
@@ -665,10 +681,13 @@ fn read_function_block(inner: &str) -> Option<Block> {
     let body = inner[body_start..].find(FUNCTION_CLOSE).map(|end| &inner[body_start..body_start + end])?;
 
     let mut values = Vec::new();
+    let mut skipped = Vec::new();
     let mut rest = 0;
     while let Some(start) = body[rest..].find(PARAMETER_PREFIX) {
+        skipped.push(body_start + rest..body_start + rest + start);
         let after = rest + start + PARAMETER_PREFIX.len();
         let Some(name_end) = body[after..].find('>') else {
+            rest += start;
             break; // malformed trailing parameter tag: stop, keep what we have
         };
         let value_start = after + name_end + 1;
@@ -689,7 +708,9 @@ fn read_function_block(inner: &str) -> Option<Block> {
         });
         rest = value_start + resume;
     }
-    Some(Block { name, values })
+    skipped.push(body_start + rest..body_start + body.len());
+    skipped.push(body_start + body.len() + FUNCTION_CLOSE.len()..inner.len());
+    Some(Block { name, values, skipped })
 }
 
 /// Reads a held tool's call from `text` (what follows its `<tool_call>`)
@@ -718,7 +739,7 @@ fn read_held_call(text: &str, parameters: &call::Parameters) -> Option<(usize, B
                 open = Some(after - 1 - parameters.declared()[index].len()..after - 1);
                 at = after;
             }
-            call::Step::Close { len } => return Some((at + end + len, Block { name, values })),
+            call::Step::Close { len } => return Some((at + end + len, Block { name, values, skipped: Vec::new() })),
         }
     }
 }
@@ -1553,31 +1574,41 @@ mod tests {
     }
 
     #[test]
-    fn a_value_the_confirmed_close_would_have_read_on_is_counted_split() {
+    fn a_value_whose_text_the_cuts_dropped_is_counted_split() {
         let split = |content: &str| split_values(&[&write_call(content)]);
-        // A `</parameter>` line followed by text, a tag inside a line, a
-        // `</function>` line not followed by `</tool_call>`: one each.
+        // Text after a `</parameter>` line, after one inside a line, and
+        // after a `</function>` line not followed by `</tool_call>`: dropped
+        // by the cuts, kept by the confirmed close. One each.
         assert_eq!(split("a\n</parameter>\nb"), ("1".into(), "1 calls".into()));
-        assert_eq!(split("see <parameter=mode> here"), ("1".into(), "1 calls".into()));
+        assert_eq!(split("a</parameter>b"), ("1".into(), "1 calls".into()));
         assert_eq!(split("a\n</function>\nb"), ("1".into(), "1 calls".into()));
-        // An opener of a written parameter: the confirmed close reads it as text.
-        assert_eq!(split("a\n<parameter=path>\nb"), ("1".into(), "1 calls".into()));
         // Split across chunks, counted once.
         let text = write_call("a\n</parameter>\nb");
         assert_eq!(split_values(&text.as_bytes().chunks(5).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>()).0, "1");
     }
 
     #[test]
-    fn a_value_both_rules_end_alike_or_the_confirmed_close_never_ends_is_not_counted() {
+    fn a_value_the_cuts_dropped_nothing_of_or_the_confirmed_close_never_ends_is_not_counted() {
         let none = ("0".to_owned(), "1 calls".to_owned());
         // A plain call, and one with forgotten closers.
         assert_eq!(split_values(&[&write_call("plain")]), none);
         let forgotten = "<tool_call>\n<function=write_file>\n<parameter=path>\na\n<parameter=content>\nb\n</function>\n</tool_call>";
         assert_eq!(split_values(&[forgotten]), none);
+        // Text the cuts moved into another parameter, dropping nothing: an
+        // opener of a written parameter, one inside a line, an undeclared
+        // parameter after a closed value, and values closed on their own
+        // line. The confirmed close would keep the opener in the value, but
+        // it may be the model's own envelope.
+        assert_eq!(split_values(&[&write_call("a\n<parameter=path>\nb")]), none);
+        assert_eq!(split_values(&[&write_call("see <parameter=mode> here")]), none);
+        let invented = "<tool_call>\n<function=write_file>\n<parameter=path>\na\n</parameter>\n<parameter=force>\ntrue\n</parameter>\n<parameter=content>\nb\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(split_values(&[invented]), none);
+        let inline = "<tool_call>\n<function=write_file>\n<parameter=path>a.txt</parameter>\n<parameter=content>b</parameter>\n</function>\n</tool_call>";
+        assert_eq!(split_values(&[inline]), none);
         // The residue: the value holds its call's own confirmed close, where both rules end it.
         assert_eq!(split_values(&[&write_call("x\n</function>\n</tool_call>\ny")]).0, "0");
         // A close with a required parameter missing: the confirmed close would not close at all.
-        let early = "<tool_call>\n<function=write_file>\n<parameter=content>\na\n</parameter>\n</function>\n</tool_call>";
+        let early = "<tool_call>\n<function=write_file>\n<parameter=content>\na\n</parameter>\nb\n</parameter>\n</function>\n</tool_call>";
         assert_eq!(split_values(&[early]), none);
         // A value cut at a tag whose confirmed end lies past the block's `</tool_call>`: not seen.
         assert_eq!(split_values(&[&write_call("a\n</parameter>\nb\n</tool_call>\nc")]).0, "0");

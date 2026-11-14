@@ -276,8 +276,8 @@ export type ToolCallViolation = (typeof TOOL_CALL_VIOLATIONS)[number];
  * against its tool's parameters, by outcome; the invalid ones by kind of
  * violation, a call once under each kind it has; the strict tools whose
  * schema lies outside OpenAI's strict subset; and (#610) the string values
- * of tools not held that the parser ended at a tag inside them, where a held
- * tool's confirmed close would have read on. Absent until one of them moved,
+ * of tools not held from which the parser dropped text after a tag inside
+ * them, text a held tool's confirmed close would keep. Absent until one of them moved,
  * so null on a server that never read a call.
  */
 export type ToolCalls = {

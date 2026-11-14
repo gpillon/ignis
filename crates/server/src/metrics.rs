@@ -736,8 +736,8 @@ pub struct Metrics {
     /// [`CallViolation::ALL`], once under each kind they have; and the strict
     /// tools whose parameters lie outside OpenAI's strict subset. Absent until
     /// one of them moves, then whole. With them (GitHub #610), the string
-    /// values of calls to tools not held that the first-occurrence cuts
-    /// ended at a tag where the confirmed close would have read on.
+    /// values of calls to tools not held from which the first-occurrence
+    /// cuts dropped text after a tag that the confirmed close would keep.
     tool_calls: [AtomicU64; TOOL_CALL_OUTCOMES.len()],
     tool_call_violations: [AtomicU64; CallViolation::ALL.len()],
     tool_strict_outside_subset: AtomicU64,
@@ -1102,9 +1102,9 @@ impl Metrics {
     }
 
     /// A call to a tool that is not held, just counted by
-    /// [`Metrics::record_tool_call`], had `values` string values the
-    /// first-occurrence cuts ended at a tag inside them, where the confirmed
-    /// close would have read on to a later step of the call (GitHub #610).
+    /// [`Metrics::record_tool_call`], had `values` string values from which
+    /// the first-occurrence cuts dropped text after a tag inside them, text
+    /// the confirmed close would have kept in the value (GitHub #610).
     pub(crate) fn record_tool_call_values_split(&self, values: u64) {
         self.tool_call_values_split.fetch_add(values, Ordering::Relaxed);
     }
@@ -1774,7 +1774,7 @@ impl Metrics {
                 &mut out,
                 "ignis_tool_call_values_split_total",
                 "counter",
-                "String values of calls to tools that are not held, which the parser ended at a tag inside them where a held tool's rule, the confirmed close, would have read on to a later step of the call.",
+                "String values of calls to tools that are not held, from which the parser dropped text after a tag inside them that a held tool's rule, the confirmed close, would have kept in the value.",
             );
             let _ = writeln!(out, "ignis_tool_call_values_split_total {}", read(&self.tool_call_values_split));
         }

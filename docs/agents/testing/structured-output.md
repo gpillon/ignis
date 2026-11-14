@@ -120,9 +120,9 @@ The measured figures are in
   again by the first-token probe; under `parallel_tool_calls: false` (#609)
   only the block that ends the turn is counted, a dropped one included;
   strict tools outside the subset are counted and served; a value cut at a
-  `</parameter>` line the confirmed close would read on is counted split
-  (#610), and a plain value, the residue and a close with its required
-  parameter missing are not.
+  `</parameter>` line, whose text after it the parser dropped and the
+  confirmed close would keep, is counted split (#610), and a plain value, the
+  residue and a close with its required parameter missing are not.
 - **The independent validator in the served tests**: the schema answers go
   through `tools/grammar-check/validate.py` with the Python of
   `IGNIS_GRAMMAR_CHECK_PYTHON`, else the venv at `.scratch/grammar-venv`

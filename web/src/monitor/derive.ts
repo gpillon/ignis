@@ -264,7 +264,7 @@ export type ToolCallsCard = {
   failedShare: number | null;
   violations: Record<ToolCallViolation, Tally>;
   strictOutsideSubset: Tally;
-  /** String values of tools not held cut at a tag the confirmed close reads as text (#610). */
+  /** String values of tools not held from which the parser dropped text after a tag, text the confirmed close would keep (#610). */
   valuesSplit: Tally;
 };
 

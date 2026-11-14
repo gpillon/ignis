@@ -179,9 +179,8 @@ const EVERY_KIND: &[&str] = &[
     "ignis_tool_call_violations_total{kind=\"constraint\"} 1",
     "ignis_tool_call_violations_total{kind=\"undeclared_tool\"} 1",
     "ignis_tool_strict_outside_subset_total 0",
-    // The path before the undeclared `force`: cut at its `</parameter>`, where
-    // a held tool's confirmed close reads the undeclared opener as text (#610).
-    "ignis_tool_call_values_split_total 1",
+    // No value holds a tag, so the cuts drop no text of one (#610).
+    "ignis_tool_call_values_split_total 0",
 ];
 
 /// `metrics`' exposition holds every line of `lines`, each times `times`.
@@ -471,11 +470,11 @@ async fn strict_tools_outside_the_subset_are_counted_and_served_as_before() {
 }
 
 /// Where a value ends (#610): a model that writes a value holding a
-/// `</parameter>` line, which the parser cuts there and a held tool's
-/// confirmed close would read on, and three that both rules end alike or
-/// the confirmed close never ends: a plain value, one holding its call's
-/// own close (the residue), and one whose call closes with its required
-/// path missing.
+/// `</parameter>` line, which the parser cuts there, dropping the text after
+/// it that a held tool's confirmed close would keep, and three it does not
+/// count: a plain value, one holding its call's own close (the residue,
+/// which both rules cut), and one whose call closes with its required path
+/// missing (which the confirmed close would not close).
 fn split_values() -> String {
     [
         call("edit", &[("path", "a.txt\n</parameter>\nnot a step"), ("mode", "append")]),
@@ -486,7 +485,7 @@ fn split_values() -> String {
     .concat()
 }
 
-/// The value the confirmed close would have read on is counted split, on
+/// The value whose text the parser dropped is counted split, on
 /// chat completions and on the Responses API, whole and streamed, and each
 /// response is what a server that checks nothing sends.
 #[tokio::test]
