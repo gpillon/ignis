@@ -21,12 +21,16 @@
 //! Spec 05b's capacity simulation (GitHub #340, AC 5) adds the card less 1 GiB
 //! and less 3 GiB of simulated desktop, load and plan only. No line but the
 //! pool follows the budget or, on this body, the context (the hq prompt
-//! planes are gone, ADR 0061), so each pool is the 16 GiB load's less the
-//! whole pages the desktop takes. Less 1 GiB the profile's shape still fits,
-//! nothing adapted. Less 3 GiB the context adapts to 65,536 at two lanes:
-//! 196,608 is refused by the plan's own floor, and 131,072 holds one
-//! sequence but not the spare reservation beside it
-//! (`vram.adapt_spare_tokens`), short by 577 pages.
+//! planes are gone, ADR 0061), so each plan charges the 16 GiB load's bytes
+//! beside its pool, to the byte, and its pool is the whole pages the budget
+//! leaves beside them and the card's own lines, the CUDA context the process
+//! measured and the trellis workspace (GitHub #607, `support/kv_pool_pins.rs`).
+//! Less 1 GiB the profile's shape still fits, nothing adapted. Less 3 GiB the
+//! context adapts to 65,536 at two lanes: 196,608 is refused by the plan's own
+//! floor, and 131,072 holds one sequence but not the spare reservation beside
+//! it (`vram.adapt_spare_tokens`), short by 577 pages where the context is
+//! charged at `CUDA_CONTEXT_BYTES` and 576 at the one the RTX 5090 measured
+//! under Windows on 2026-11-14.
 //!
 //! GitHub #415 (ADR 0075) loads the profile in the same 16 GiB with vision on
 //! under the `host` residency, at a 1,024- and a 4,096-token envelope, and
@@ -74,6 +78,11 @@ use ignis_server::Server;
 use ignis_server::adaptation::{Adaptable, Attempt, StartRefusal};
 use ignis_server::runtime::{EngineShape, Qwen27bLoadError, qwen27b_load};
 
+#[path = "support/kv_pool_pins.rs"]
+mod kv_pool_pins;
+
+use kv_pool_pins::{CardLines, RTX50_16GB_LESS_1_GIB, RTX50_16GB_LESS_3_GIB, RTX50_16GB_LESS_3_GIB_131072_SPARE, assert_pinned};
+
 const TRELLIS: &str = "F:/ai/models/Qwen3.8-27B-trellis-3bpw-ignis/qwen3_8_27b_trellis_sc30-v2.ninfer";
 const MODEL: &str = "qwen3.8-27b";
 /// A 16 GB card's whole memory: spec 05a Acceptance A1's budget.
@@ -94,14 +103,13 @@ const BUDGET: &str = "17179869184";
 const WORKSPACE_BYTES: u64 = 395_924_480;
 /// The same line under `--vision-enabled false`.
 const TEXT_ONLY_WORKSPACE_BYTES: u64 = 395_898_880;
+/// The RTX 5090's: the kernel sizes it by the card's multiprocessors.
 const TRELLIS_WORKSPACE_BYTES: u64 = 36_225_280;
 const DECODE_GRAPH_BYTES: u64 = 20_621_336;
 /// Spec 05b's capacity simulation: the 16 GB card less 1 GiB and less 3 GiB
 /// of simulated desktop.
 const BUDGET_LESS_1_GIB: u64 = 17_179_869_184 - (1 << 30);
 const BUDGET_LESS_3_GIB: u64 = 17_179_869_184 - (3 << 30);
-/// The 16 GiB load's KV pool (#339 A1): 7,956 pages.
-const POOL_TOKENS: u64 = 509_184;
 /// The spare reservation the ladder keeps beside one full sequence at two
 /// lanes: `vram.adapt_spare_tokens`' default (ADR 0063 §3).
 const SPARE_TOKENS: u64 = 65_536;
@@ -348,9 +356,9 @@ async fn the_16gb_artifact_serves_greedy_code_on_two_dflash2_lanes_in_a_16_gib_b
 /// The card less 1 GiB of simulated desktop: the profile's 262,144 tokens on
 /// two lanes still fit with the spare reservation beside them, so nothing
 /// adapts. Every line but the pool is the 16 GiB load's, and the pool, which
-/// takes the rest, is its 7,956 pages less the 1,820 whole pages 1 GiB is
-/// (the 16 GiB load left 493,468 bytes under a page; 1 GiB is 1,820 pages and
-/// 262,144 bytes).
+/// takes the rest, is the whole pages the budget leaves beside them and the
+/// card's lines: 6,136 where the context is charged at `CUDA_CONTEXT_BYTES`,
+/// 6,137 at the one the RTX 5090 measured on 2026-11-14 (GitHub #607).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn less_1_gib_of_desktop_keeps_262144_tokens_on_two_lanes_and_adapts_nothing() {
@@ -364,8 +372,8 @@ async fn less_1_gib_of_desktop_keeps_262144_tokens_on_two_lanes_and_adapts_nothi
     assert_eq!(lines["workspace_bytes"].as_u64(), Some(WORKSPACE_BYTES), "the workspace line");
     assert_eq!(lines["trellis_workspace_bytes"].as_u64(), Some(TRELLIS_WORKSPACE_BYTES), "the trellis workspace line");
     assert_eq!(lines["decode_graph_bytes"].as_u64(), Some(DECODE_GRAPH_BYTES), "the decode graph line");
+    assert_pinned(lines, RTX50_16GB_LESS_1_GIB, "the 16 GiB load's lines less 1 GiB");
     let pool = lines["kv_pool_tokens"].as_u64().unwrap();
-    assert_eq!(pool, POOL_TOKENS - 1_820 * 64, "the 16 GiB load's pool less 1 GiB's whole pages");
     assert!(pool >= 262_144 + SPARE_TOKENS, "one sequence and the spare reservation: {pool}");
     let total = lines["total_bytes"].as_u64().unwrap();
     assert!(BUDGET_LESS_1_GIB - total < page_bytes(), "the pool takes the rest: {total}");
@@ -389,8 +397,11 @@ async fn less_1_gib_of_desktop_keeps_262144_tokens_on_two_lanes_and_adapts_nothi
 /// `vram.adapt_spare_tokens` beside it; 65,536 holds both. Each is the plan
 /// at that context, the lines planned again for it, refused or not before
 /// anything is materialized. The lines are the 16 GiB load's at every
-/// context, so the pool is its 7,956 pages less the 5,461 whole pages 3 GiB
-/// is, 2,495, and 131,072 misses its 3,072 by 577 pages (36,928 tokens).
+/// context, so the plans differ only by their pools (the block tables
+/// included) and the card's lines (GitHub #607): 131,072 misses its 3,072
+/// pages by 577 where the context is charged at `CUDA_CONTEXT_BYTES`, 576 at
+/// the one the RTX 5090 measured on 2026-11-14, and the adapted load's pool is
+/// 2,495 pages there and 2,496 here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn less_3_gib_of_desktop_adapts_the_context_to_65536_on_two_lanes() {
@@ -421,14 +432,10 @@ async fn less_3_gib_of_desktop_adapts_the_context_to_65536_on_two_lanes() {
     assert!(floor_196608 > BUDGET_LESS_3_GIB, "196,608 tokens: the plan's floor alone does not fit");
     assert!(floor_131072 <= BUDGET_LESS_3_GIB, "131,072 tokens: one sequence fits");
     assert!(spare_131072 > BUDGET_LESS_3_GIB, "131,072 tokens: the spare reservation beside it does not");
-    let short = spare_131072 - BUDGET_LESS_3_GIB;
-    println!(
-        "131,072 tokens miss the spare reservation by {short} bytes: {} KV pages, {} tokens",
-        short.div_ceil(page_bytes()),
-        short.div_ceil(page_bytes()) * 64
-    );
-    assert_eq!(short.div_ceil(page_bytes()), 577, "131,072 misses its spare reservation by 577 pages");
     assert!(spare_65536 <= BUDGET_LESS_3_GIB, "65,536 tokens and the spare reservation fit");
+    // The refusals charged the context the first of them made in this process.
+    let reading = ignis_artifact::CudaDevice::context_reading().expect("the refusals made the context");
+    let refused_context = ignis_runtime::ContextCharge::of(reading).bytes;
 
     let Some((model, events)) = load_16g(BUDGET_LESS_3_GIB) else { return };
     let plan = named(&events, "ignis.runtime.vram_plan");
@@ -436,12 +443,32 @@ async fn less_3_gib_of_desktop_adapts_the_context_to_65536_on_two_lanes() {
     println!("vram_plan: {}", plan[0]);
     let lines = &plan[0]["attributes"];
     assert_eq!(lines["budget_bytes"], BUDGET_LESS_3_GIB);
+    let card = CardLines::of(lines);
+    assert_eq!(card.cuda_context, refused_context, "the load charges the context the refusals charged");
+    let short = spare_131072 - BUDGET_LESS_3_GIB;
+    println!(
+        "131,072 tokens miss the spare reservation by {short} bytes beside a CUDA context of {} bytes: {} KV pages, {} \
+         tokens",
+        card.cuda_context,
+        short.div_ceil(page_bytes()),
+        short.div_ceil(page_bytes()) * 64
+    );
+    assert_eq!(
+        spare_131072 - card.cuda_context - card.trellis_workspace,
+        RTX50_16GB_LESS_3_GIB_131072_SPARE.shape_bytes,
+        "131,072 and the spare reservation: the bytes beside the card's lines"
+    );
+    assert_eq!(
+        short.div_ceil(page_bytes()),
+        RTX50_16GB_LESS_3_GIB_131072_SPARE.pages_short(card),
+        "131,072 misses its spare reservation by the pages its pin gives beside this card's lines"
+    );
     assert_eq!(lines["adapted"], "max_context 262144 -> 65536 (adapt_context_step 65536, adapt_spare_tokens 65536)");
     assert_eq!(lines["workspace_bytes"].as_u64(), Some(WORKSPACE_BYTES), "the workspace line, as at 262,144");
     assert_eq!(lines["trellis_workspace_bytes"].as_u64(), Some(TRELLIS_WORKSPACE_BYTES), "the trellis workspace line");
     assert_eq!(lines["decode_graph_bytes"].as_u64(), Some(DECODE_GRAPH_BYTES), "the decode graph line, as at 262,144");
+    assert_pinned(lines, RTX50_16GB_LESS_3_GIB, "the 16 GiB load's lines at 65,536 less 3 GiB");
     let pool = lines["kv_pool_tokens"].as_u64().unwrap();
-    assert_eq!(pool, POOL_TOKENS - 5_461 * 64, "the 16 GiB load's pool less 3 GiB's whole pages");
     assert!((65_536 + SPARE_TOKENS..131_072 + SPARE_TOKENS).contains(&pool), "{pool}");
     let total = lines["total_bytes"].as_u64().unwrap();
     assert!(BUDGET_LESS_3_GIB - total < page_bytes(), "the pool takes the rest: {total}");
@@ -553,7 +580,9 @@ async fn the_8x_routes_keep_262144_tokens_on_two_lanes_less_1_gib() {
     assert_the_8x_routes(&events, lines);
     assert_eq!(lines["adapted"], "", "the profile's shape fits less 1 GiB on the 8.x routes");
     let pool = lines["kv_pool_tokens"].as_u64().unwrap();
-    let fused = POOL_TOKENS - 1_820 * 64;
+    // The fused load's pool beside this load's context and the RTX 5090's trellis workspace.
+    let fused = RTX50_16GB_LESS_1_GIB
+        .pool_tokens(CardLines { trellis_workspace: TRELLIS_WORKSPACE_BYTES, ..CardLines::of(lines) });
     println!(
         "kv pool: {pool} tokens on the 8.x routes, {fused} on the fused prefill and the FP8 band: {} fewer; workspace {} (fused {})",
         fused.saturating_sub(pool),

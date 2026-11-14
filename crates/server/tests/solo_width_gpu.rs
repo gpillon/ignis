@@ -9,8 +9,11 @@
 //! reads injected as an 8.x card so the
 //! load takes the 8.x solo ladder (8,192, 4,096, 2,048 above the chunk).
 //! - `rtx-24gb` (an RTX 3090, 24 GiB) and `rtx-16gb` (an RTX 4080, 16 GiB less
-//!   1 GiB) pin the 27B's solo width to their chunk: one width, the KV pool
-//!   their profile notes measured.
+//!   1 GiB) pin the 27B's solo width to their chunk: one width, and the KV
+//!   pool their profile notes measured, held as the bytes the plan charges
+//!   beside it, to the byte, and the whole pages those leave beside the card's
+//!   own lines, its measured CUDA context and its trellis workspace (GitHub
+//!   #607, `support/kv_pool_pins.rs`).
 //! - `--model-prefill-chunk-solo auto` on the same loads runs the ladder: a
 //!   width is kept only with nothing adapted and the spare reservation left
 //!   beside the context. `rtx-24gb` keeps 4,096 and serves a prompt alone at
@@ -46,17 +49,15 @@ use ignis_server::config::profile::Card;
 
 #[path = "support/card.rs"]
 mod card;
+#[path = "support/kv_pool_pins.rs"]
+mod kv_pool_pins;
+
+use kv_pool_pins::{CardLines, RTX_16GB_AT_THE_CHUNK, RTX_24GB_AT_THE_CHUNK, assert_pinned};
 
 const TRELLIS: &str = "F:/ai/models/Qwen3.8-27B-trellis-3bpw-ignis/qwen3_8_27b_trellis_sc30-v2.ninfer";
 const MODEL: &str = "qwen3.8-27b";
 /// The routes an 8.x card runs unset, named so the 5090 runs them.
 const ROUTES_8X: [&str; 4] = ["--model-prefill-linear", "int8", "--model-prefill-attention", "int8"];
-/// #508's pool on these routes at the 2,048-token chunk: 17,809 pages,
-/// 91,200 tokens past the context (`config::profile`'s `rtx-24gb` note).
-const POOL_AT_THE_CHUNK: u64 = 1_139_776;
-/// `rtx-16gb`'s pool on these routes at its 1,024-token chunk, 16 GiB less
-/// 1 GiB (`config::profile`'s `rtx-16gb` note).
-const POOL_16GB_AT_THE_CHUNK: u64 = 386_048;
 
 /// The process's one subscriber, installed by the first test that asks.
 fn sink() -> &'static Arc<ignis_logging::MemorySink> {
@@ -151,9 +152,10 @@ fn flags_of<'a>(profile: &'a str, budget: &'a str, extra: &[&'a str]) -> Vec<&'a
     .concat()
 }
 
-/// One load's facts: the plan's `adapted`, its KV pool, the width the solo
-/// line says and its text, and the `ignis.model.loaded` line.
+/// One load's facts: the plan's lines, its `adapted` and its KV pool, the
+/// width the solo line says and its text, and the `ignis.model.loaded` line.
 struct Loaded {
+    lines: serde_json::Value,
     adapted: String,
     pool: u64,
     width: u64,
@@ -174,6 +176,7 @@ fn facts(logged: &[serde_json::Value]) -> Loaded {
     assert_eq!(load.len(), 1, "{logged:?}");
     Loaded {
         adapted: lines["adapted"].as_str().unwrap().to_owned(),
+        lines: lines.clone(),
         pool: lines["kv_pool_tokens"].as_u64().unwrap(),
         width: solo[0]["attributes"]["width"].as_u64().unwrap(),
         text: solo[0]["body"].as_str().unwrap().to_owned(),
@@ -189,7 +192,8 @@ fn budget_16gb() -> String {
 }
 
 /// `rtx-24gb` on an RTX 3090 pins the 27B's solo width to its 2,048-token
-/// chunk: the plan is #508's, its pool 91,200 tokens past the context.
+/// chunk: the plan is #508's, its pool 91,200 tokens past the context when
+/// the CUDA context was charged at `CUDA_CONTEXT_BYTES`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn rtx_24gb_pins_its_solo_width_to_its_chunk() {
@@ -199,7 +203,7 @@ async fn rtx_24gb_pins_its_solo_width_to_its_chunk() {
     let loaded = facts(&events_since(start));
     assert_eq!(loaded.adapted, "");
     assert_eq!((loaded.width, loaded.text.as_str()), (2048, "prefill_chunk_solo 2048"));
-    assert_eq!(loaded.pool, POOL_AT_THE_CHUNK, "#508's pool");
+    assert_pinned(&loaded.lines, RTX_24GB_AT_THE_CHUNK, "#508's pool");
     assert_eq!(loaded.loaded["max_context"], 1_048_576);
     tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
 }
@@ -218,11 +222,11 @@ async fn rtx_24gb_on_an_rtx_30_card_widens_its_solo_chunk_under_auto() {
     let events = || events_since(start);
     let loaded = facts(&events());
     println!(
-        "solo width {}: kv pool {} tokens, {} past the context, {} fewer than at the chunk",
+        "solo width {}: kv pool {} tokens, {} past the context, beside a CUDA context of {} bytes",
         loaded.width,
         loaded.pool,
         loaded.pool.saturating_sub(1_048_576),
-        POOL_AT_THE_CHUNK.saturating_sub(loaded.pool)
+        CardLines::of(&loaded.lines).cuda_context
     );
     assert_eq!(loaded.adapted, "", "nothing adapted for the solo width");
     assert_eq!(loaded.retained_device_slots, slots, "beside the device retained slots");
@@ -277,7 +281,7 @@ async fn rtx_16gb_pins_its_solo_width_to_its_chunk() {
     let loaded = facts(&events_since(start));
     assert_eq!(loaded.adapted, "");
     assert_eq!((loaded.width, loaded.text.as_str()), (1024, "prefill_chunk_solo 1024"));
-    assert_eq!(loaded.pool, POOL_16GB_AT_THE_CHUNK, "the profile note's pool");
+    assert_pinned(&loaded.lines, RTX_16GB_AT_THE_CHUNK, "the profile note's pool");
     assert_eq!((&loaded.loaded["max_context"], &loaded.loaded["decode_lanes"]), (&262_144.into(), &2.into()));
     tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
 }
@@ -295,11 +299,11 @@ async fn rtx_16gb_on_an_rtx_40_card_steps_down_to_2048_under_auto() {
     let Some((model, start)) = load(&options, "under rtx-16gb in 16 GiB less 1 GiB, solo auto") else { return };
     let loaded = facts(&events_since(start));
     println!(
-        "solo width {}: kv pool {} tokens, {} past the context, {} fewer than at the chunk",
+        "solo width {}: kv pool {} tokens, {} past the context, beside a CUDA context of {} bytes",
         loaded.width,
         loaded.pool,
         loaded.pool.saturating_sub(262_144),
-        POOL_16GB_AT_THE_CHUNK.saturating_sub(loaded.pool)
+        CardLines::of(&loaded.lines).cuda_context
     );
     assert_eq!(loaded.adapted, "", "nothing adapted for the solo width");
     assert_eq!(loaded.width, 2048, "4,096 short of the spare reservation, 2,048 not");
