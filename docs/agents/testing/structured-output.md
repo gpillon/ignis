@@ -105,8 +105,9 @@ The measured figures are in
   WebSocket); each response equals the same request's on a server with
   metrics off, which checks nothing (whole: its bytes; streamed: what the
   stream assembles to); a call the first token writes is counted once, not
-  again by the first-token probe; strict tools outside the subset are counted
-  and served.
+  again by the first-token probe; under `parallel_tool_calls: false` (#609)
+  only the block that ends the turn is counted, a dropped one included;
+  strict tools outside the subset are counted and served.
 - **The independent validator in the served tests**: the schema answers go
   through `tools/grammar-check/validate.py` with the Python of
   `IGNIS_GRAMMAR_CHECK_PYTHON`, else the venv at `.scratch/grammar-venv`

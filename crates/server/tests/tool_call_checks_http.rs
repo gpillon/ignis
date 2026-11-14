@@ -366,6 +366,42 @@ async fn the_responses_api_counts_every_kind_of_call_on_http_and_websocket() {
     assert_counts(&metrics, EVERY_KIND, 2);
 }
 
+/// Under `parallel_tool_calls: false` (#609) the turn ends where its first
+/// block closes, and that block is the only one counted: a first block that
+/// does not parse is counted dropped, and still ends the turn.
+#[tokio::test]
+async fn under_one_call_only_the_block_that_ends_the_turn_is_counted() {
+    let dropped_first = ["<tool_call>\nno function here\n</tool_call>".to_owned(), call("edit", &[("path", "a.txt")])].concat();
+    let cases: [(String, &[&str]); 2] = [
+        (
+            every_kind(),
+            &["ignis_tool_calls_total{outcome=\"valid\"} 1", "ignis_tool_calls_total{outcome=\"invalid\"} 0", "ignis_tool_calls_total{outcome=\"dropped\"} 0"],
+        ),
+        (
+            dropped_first,
+            &["ignis_tool_calls_total{outcome=\"valid\"} 0", "ignis_tool_calls_total{outcome=\"invalid\"} 0", "ignis_tool_calls_total{outcome=\"dropped\"} 1"],
+        ),
+    ];
+    for (script, counts) in &cases {
+        for stream in [false, true] {
+            let checked = server(&[script], false, true);
+            let metrics = Arc::clone(checked.metrics.as_ref().unwrap());
+            let mut body = chat(stream, false);
+            body["parallel_tool_calls"] = json!(false);
+            let (status, served) = post(&checked, "/v1/chat/completions", &body).await;
+            assert_eq!(status, 200, "{served}");
+            assert_counts(&metrics, counts, 1);
+        }
+        let checked = server(&[script], false, true);
+        let metrics = Arc::clone(checked.metrics.as_ref().unwrap());
+        let mut body = response_body(false);
+        body["parallel_tool_calls"] = json!(false);
+        let (status, served) = post(&checked, "/v1/responses", &body).await;
+        assert_eq!(status, 200, "{served}");
+        assert_counts(&metrics, counts, 1);
+    }
+}
+
 /// Strict tools whose parameters lie outside the strict subset are counted,
 /// one per request that sends one, and served as before: a strict tool
 /// inside the subset and a free one are not counted.
