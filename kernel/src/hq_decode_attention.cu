@@ -144,9 +144,16 @@ void attend(const Tensor &q, const Tensor &k, const Tensor &v, const Tensor &pos
   launch_partials(launch, stream);
 
   // The vendored launcher's profile: one lane or many, the dense mask or a lane's valid prefix.
-  const auto reducer = batch == 1 ? (masked == nullptr ? reduce<false, false> : reduce<false, true>)
-                                  : (masked == nullptr ? reduce<true, false> : reduce<true, true>);
-  const cudaError_t err = reducer(acc, m, l, positions, masked, gate, width, batch, splits, out, stream);
+  cudaError_t err = cudaSuccess;
+  if (batch == 1 && masked == nullptr) {
+    err = reduce<false, false>(acc, m, l, positions, masked, gate, width, batch, splits, out, stream);
+  } else if (batch == 1) {
+    err = reduce<false, true>(acc, m, l, positions, masked, gate, width, batch, splits, out, stream);
+  } else if (masked == nullptr) {
+    err = reduce<true, false>(acc, m, l, positions, masked, gate, width, batch, splits, out, stream);
+  } else {
+    err = reduce<true, true>(acc, m, l, positions, masked, gate, width, batch, splits, out, stream);
+  }
   if (err != cudaSuccess) {
     (void)cudaGetLastError();
     throw std::runtime_error(std::string("hq_decode_attention: the reducer's launch: ") +

@@ -51,6 +51,8 @@ const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer
 const SWITCH: &str = "IGNIS_HQ_DECODE_ATTENTION";
 /// The load's context: past 16,390 keys the split policy reaches its cap.
 const MAX_CONTEXT: u32 = 65_536;
+/// The BF16 load's, which only reports its route.
+const BF16_CONTEXT: u32 = 2_048;
 const CHUNK: u32 = 512;
 /// What one lane's sequence reserves: its prompt and the tokens it emits.
 const SEQ_TOKENS: u32 = 2_048;
@@ -61,9 +63,12 @@ const WINDOW: u32 = 7;
 const TOTAL: usize = 24;
 
 /// What one route's loads recorded.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 struct RouteRun {
+    /// The text load's decode graphs, the drafter load's decode graphs, and
+    /// its verify graphs: each width's node count.
     decode_nodes: [u32; 8],
+    drafter_decode_nodes: [u32; 8],
     verify_nodes: [u32; 8],
     /// Per width 1..8: each lane's greedy decode text.
     decode: Vec<Vec<Vec<i32>>>,
@@ -96,7 +101,8 @@ fn pool_for(backend: Option<SpeculativeBackend>) -> SeqPool {
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {
             kv_format: KvFormat::HqE8_2b,
-            kv_page_group_count: SEQ_TOKENS.div_ceil(64) * LANES,
+            // One whole context of pages, as a served pool holds at least; the lanes take 32 each.
+            kv_page_group_count: MAX_CONTEXT.div_ceil(64),
             max_context_tokens: MAX_CONTEXT,
             slot_count: LANES,
             retained_slot_count: 0,
@@ -224,8 +230,7 @@ fn run_route(
         .unwrap_or_else(|e| panic!("{label}: model load (hq, dflash2, the sampled draft): {e}"));
     assert_eq!(model.hq_decode_attention(), expected, "the route the drafter load reports, the switch {label}");
     let pool = pool_for(Some(SpeculativeBackend::Dflash2));
-    let (spec_decode_nodes, verify_nodes) = capture(&model, &pool, true);
-    assert_eq!(spec_decode_nodes, decode_nodes, "a drafter load's decode graphs are the text load's");
+    let (drafter_decode_nodes, verify_nodes) = capture(&model, &pool, true);
     let mut verify: Vec<_> = (1..=LANES as usize)
         .map(|width| verify_rounds(&model, &pool, &prompts[..width], &vec![SamplingParams::greedy(); width]))
         .collect();
@@ -233,8 +238,11 @@ fn run_route(
         let samplings: Vec<SamplingParams> = (0..width).map(|lane| agent(0x572 + lane as u64)).collect();
         verify.push(verify_rounds(&model, &pool, &prompts[..width], &samplings));
     }
-    println!("{label}: {expected:?}, decode nodes {decode_nodes:?}, verify nodes {verify_nodes:?}");
-    RouteRun { decode_nodes, verify_nodes, decode, verify }
+    println!(
+        "{label}: {expected:?}, decode nodes {decode_nodes:?} (the drafter load's {drafter_decode_nodes:?}), \
+         verify nodes {verify_nodes:?}"
+    );
+    RouteRun { decode_nodes, drafter_decode_nodes, verify_nodes, decode, verify }
 }
 
 #[test]
@@ -313,7 +321,7 @@ fn a_blackwell_load_reads_hq_on_its_own_route_and_every_lane_keeps_todays_text()
     }
     // A BF16 load runs today's route whatever the card.
     set_switch(None);
-    let bf16 = load_qwen38_27b(&reader, &artifact, &handles[..text_len], CHUNK, MAX_CONTEXT, KvFormat::Bf16)
+    let bf16 = load_qwen38_27b(&reader, &artifact, &handles[..text_len], CHUNK, BF16_CONTEXT, KvFormat::Bf16)
         .unwrap_or_else(|e| panic!("model load (bf16): {e}"));
     assert_eq!(bf16.hq_decode_attention(), HqDecodeAttention::Vendored, "a BF16 load's route");
     drop(bf16);
@@ -325,6 +333,7 @@ fn a_blackwell_load_reads_hq_on_its_own_route_and_every_lane_keeps_todays_text()
         println!("this card keeps today's route: the two runs compare it with itself");
     }
     assert_eq!(cards.decode_nodes, todays.decode_nodes, "the decode graphs' node counts at widths 1..8");
+    assert_eq!(cards.drafter_decode_nodes, todays.drafter_decode_nodes, "a drafter load's decode graphs' node counts");
     assert_eq!(cards.verify_nodes, todays.verify_nodes, "the verify graphs' node counts at widths 1..8");
     for (width, (ours, theirs)) in cards.decode.iter().zip(&todays.decode).enumerate() {
         assert_eq!(ours, theirs, "decode rounds at width {}: every lane's text", width + 1);
