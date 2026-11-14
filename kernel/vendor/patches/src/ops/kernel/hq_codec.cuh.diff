@@ -1,8 +1,20 @@
 diff --git a/reference/src/ops/kernel/hq_codec.cuh b/vendor/src/ops/kernel/hq_codec.cuh
-index 68a8bc2..2e772a4 100644
+index 68a8bc2..789946f 100644
 --- a/reference/src/ops/kernel/hq_codec.cuh
 +++ b/vendor/src/ops/kernel/hq_codec.cuh
-@@ -745,10 +745,21 @@ __device__ __forceinline__ void hq_group_scan_window(unsigned long long w, std::
+@@ -487,9 +487,8 @@ __device__ __forceinline__ void hq_encode_row_warp(const __nv_bfloat16* row,
+ 
+     if (lane == 0) {
+         __half h = __float2half_rn(norm);
+-        std::uint16_t norm_bits = *reinterpret_cast<std::uint16_t*>(&h);
+-        meta_out[0] = static_cast<std::uint8_t>(norm_bits & 0xFFu);
+-        meta_out[1] = static_cast<std::uint8_t>(norm_bits >> 8);
++        const std::uint16_t norm_bits = __half_as_ushort(h);
++        *reinterpret_cast<std::uint16_t*>(meta_out) = norm_bits;
+         std::uint32_t bits;
+         if (used_bits >= 0) {
+             bits = static_cast<std::uint32_t>(used_bits);
+@@ -745,10 +744,21 @@ __device__ __forceinline__ void hq_group_scan_window(unsigned long long w, std::
      }
  }
  
@@ -25,7 +37,7 @@ index 68a8bc2..2e772a4 100644
      const std::uint32_t mw0 = *reinterpret_cast<const std::uint32_t*>(meta);
      const std::uint32_t mw1 = *reinterpret_cast<const std::uint32_t*>(meta + 4);
      const unsigned used_bits = ((mw0 >> 24) & 0xFFu) | ((mw1 & 0x3u) << 8);
-@@ -807,7 +818,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
+@@ -807,7 +817,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
          int carry = __shfl_up_sync(gmask, run, 1, 8);
          if (lane == 0) { carry = 0; }
          // Decode this window's symbols: z = zeros before each 1-bit.
@@ -34,7 +46,7 @@ index 68a8bc2..2e772a4 100644
          unsigned long long v = w;
          int n                = 0;
          while (v != 0ull && base + n < kHqHeadDim) {
-@@ -857,7 +868,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
+@@ -857,7 +867,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
          }
          idx_total = idx;
  
@@ -43,7 +55,7 @@ index 68a8bc2..2e772a4 100644
          int pending = -1;
          int s       = my_i;
          {
-@@ -910,7 +921,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
+@@ -910,7 +920,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
      // zero, exactly like the sequential reader's unary guard. Well-formed
      // rows always parse 256 symbols, so this never runs in the engine.
      if (idx_total < kHqHeadDim && lane == 0) {
@@ -52,7 +64,7 @@ index 68a8bc2..2e772a4 100644
  #pragma unroll 1
          for (int t = idx_total; t < kHqHeadDim; ++t) { out16[hq_swz_element(t, xor_chunk)] = 0; }
      }
-@@ -932,18 +943,231 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
+@@ -932,18 +942,231 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
          const int word = lane + 8 * i;
          const int base = hq_swz_element(word * 8, xor_chunk);
          std::uint32_t z[8];

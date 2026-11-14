@@ -102,17 +102,31 @@ cooperative schedule's CTAs per SM with constants true of the `120a` build,
 which an sm_86 build's kernels (72 registers in place of 62) do not meet, so
 on an RTX 3090 it admitted grids the card cannot hold and the launch failed;
 it now asks CUDA's occupancy query on the kernel it launches, which gives
-those constants on compute capability 12.0. `tests/ops/test_gdn_gating_proj.cpp`
-(GitHub #478), a test with no device code: its cooperative schedules are sized
-for the RTX 5090's 170 SMs, so on a card that cannot hold one resident it
-skips each one the planner's own residency query refuses and names it on its
-output (`SKIP` lines); it prints each cooperative kernel's CTAs per SM
-(`budget` lines) and fails on compute capability 12.0 if one is not the
-planner's former constant; a projection case the planner moves to the unsplit
-route is held to that route's own criterion, three times the split-K one,
-since its single fp32 accumulator carries the tensor core's truncation over
-all of K (the test's comment derives it); on the 5090 it runs every case as
-before, against the same criteria, names none, and fails if it skips one. A
+those constants on compute capability 12.0. On a card smaller than the RTX
+5090 (GitHub #602, with its first patch of `bf16_gdn_gating_proj_plan.h`), a
+route whose own split-K schedule the card cannot hold resident takes the
+largest smaller split it holds, and the unsplit route only when none fits,
+where it went straight to unsplit; the 27B's fused norm/control route takes
+split40 only where it is resident, the composed route otherwise, where it
+threw below 120 SMs; and the capacity query answers the peak over every width,
+where it asked each route at its last width only (30,720 bytes on an RTX
+5080 through 4,097 columns, against 2,752,512 at 896 columns). The header
+exposes the route table's schedule before residency and a test-only cap on
+the SM count the residency test multiplies by, which no engine path calls.
+`tests/ops/test_gdn_gating_proj.cpp` (GitHub #478, #602), a test with no device
+code: its cooperative schedules are sized for the RTX 5090's 170 SMs, so it
+runs its case list at the card's own SM count and then under each test-only
+cap below it, 84 (the RTX 5080) and 36 (the RTX 5060 Ti), and the 5090 runs a
+smaller card's routes end to end; a case the planner runs on a fallback is
+named on its output (`FALLBACK` lines, each naming the pass's SM count), and
+each interval's capacity is checked against the widest call at every width in
+it; it prints each cooperative kernel's CTAs per SM (`budget` lines) and fails
+on compute capability 12.0 if one is not the planner's former constant; a
+projection case the planner moves to the unsplit route is held to that route's
+own criterion, three times the split-K one, since its single fp32 accumulator
+carries the tensor core's truncation over all of K (the test's comment derives
+it); on the 5090 with no cap it runs every case as before, against the same
+criteria, and fails if one falls back. A
 portability patch changes no
 behaviour where the reference runs, so it adds no row to the table below. A
 file that cannot build for an older architecture is not patched: ten compile,
@@ -147,6 +161,7 @@ it is looking at (ADR 0037).
 |---|---|---|---|---|
 | The hq-e8-2b prompt route's residual ring, with the window on (`src/ops/launcher/gqa_attention_prefill.cu`, spec runtime/07) | Appends the chunk, then attends: the append rewrites the ring slots of the 512 keys before the chunk, so those keys are served the rows of chunk keys up to ~1,000 positions later | Attends, then appends: every key before the chunk is served its own ring row; after the call the ring and the codes are what the reference leaves | `ignis_kernel_hq_route_agreement_test`, the prefill-after-history arms (exact-window agreement with BF16, bit-exact causality; dense, masked, banded) | #258 |
 | The A1 capacity query for a banded hq-e8-2b prompt call, past one 262,144-key scratch band (`src/ops/wrapper/gqa_attention.cpp`) | Counts the carry state as raw `(2 * head_dim + 8) * q_heads * width` bytes, while the op bumps its three tensors at 256-byte alignment: at a width with one key split and `width % 8 != 0` (321..448 and 769..896 on a 170-SM card) the answer is short by the padding after `carry_m`, and an arena sized by it throws `bad_alloc` mid-layer | Sizes the carry through `WorkspaceLayoutBuilder`, as it already sizes the split partials; the op itself computes nothing differently | `ignis_kernel_gqa_workspace_capacity_test`, the banded arms (every prompt width 17..1024 against a replay of the op's allocations) | #296 |
+| The hq-e8-2b encoder's row-norm store (`src/ops/kernel/hq_codec.cuh`, `hq_encode_row_warp`) | Writes the norm's FP16 bits as two byte stores into metadata bytes 0 and 1, which ptxas 13.0.88 compiles into a numeric conversion of the low byte (`F2I.U8.F16.TRUNC.NTZ`, the half's value truncated: 0x4cbe is stored as 0x4c12), so a CUDA 13.0 build writes wrong norms; CUDA 13.1 compiles it as a byte move | Writes the bit pattern (`__half_as_ushort`) as one 16-bit store, the same two bytes in the same place on every toolchain | `ignis_kernel_kv_append_format_test` (the stored norms) and `ignis_hq_codec_test` (the FP64-oracle comparisons), red when built with CUDA 13.0.88 (the RTX 5080 fork's evidence) | #600 |
 
 Anything that is not a verbatim vendored file — including a file we edit
 beyond a recorded patch — is our own implementation and carries no provenance
