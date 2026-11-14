@@ -190,21 +190,28 @@ The dense prefill of the 27B's trellis body, our own but for the RMSnorm half of
 - Changed here: the row stays in shared memory for the A8 of each matrix that follows in the
   same kernel, and goes to `h` only when asked. The file header lists it.
 
-### `kernel/src/hq_verify_ws.cuh` (spec #570, GitHub #571)
+### `kernel/src/hq_verify_ws.cuh` and `kernel/src/hq_decode_attention.cu` (spec #570, GitHub #571, #572)
 The 27B's hq-e8-2b attention in the decode and verify rounds on Blackwell, warp-specialized
-(`ignis_hq_verify::hq_verify_ws_kernel`, leaf-internal; ADR 0093).
+(`ignis_hq_verify::hq_verify_ws_kernel`), and its launcher (`ignis::hq_decode_attention::attend`),
+both leaf-internal (ADR 0093).
 - Upstream: the reference, `gpillon/ninfer`, commit `a00648cb828457986cf5b4b4f712b4cbcd7af0d1`
   (the commit `kernel/vendor/manifest.json` pins), Apache-2.0 (`kernel/vendor/LICENSE`):
   - `src/ops/kernel/gqa_attention_decode_bf16.cuh`: `gqa_attention_small_t_tc_partial_bf16_kernel`'s
     hq route, its per-lane offsets, neutral partials (`write_neutral`), bounds, split
     arithmetic, the fused append's per-row body and the epilogue (the un-rotation and the
-    partial stores).
+    partial stores), in `hq_verify_ws.cuh`;
+  - `src/ops/wrapper/gqa_attention.cpp`: the small-T branch's workspace scope, split capacity
+    and three partial tensors in their order and shapes (`allocate_small_t_workspace`), and
+    `src/ops/launcher/gqa_attention_decode.cu`: `gqa_attention_small_t_launch_for`'s hq-route
+    grid and arguments and the reducer's block, chunk and grid, restated in
+    `hq_decode_attention.cu`, which then launches the vendored reducer unchanged.
 - Changed here: twelve decode warps feed eight MMA warps through a ring of three shared-memory
   tiles under mbarriers, one block of 640 threads per SM; QK is split by row group and key
   half, PV by output dimension. Its decoder, `kernel/src/hq_decode_lean.cuh`, is our own, from
   ignis's #268 decoder and not upstream code. The file header lists the parts. The vendored
   kernel stays in the subtree, not edited, as its oracle, bit for bit
-  (`kernel/tests/test_hq_verify_exact.cu`).
+  (`kernel/tests/test_hq_verify_exact.cu`), and as the route of every other card and call
+  (`kernel/vendor/VENDOR.md`).
 
 ## Per-file provenance (pre-#42 adaptations, superseded by ADR 0010)
 
