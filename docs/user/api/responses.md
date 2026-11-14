@@ -26,6 +26,16 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   thinking extensions. A conversation renders the same prompt tokens as the
   same conversation through chat completions, so prompt reuse hits across
   both endpoints.
+- **`parallel_tool_calls: false` gives at most one call per response**, from
+  0.11.0 (earlier versions accept it and change nothing): the response ends
+  at the close of its first call and completes with that one
+  `function_call` item, over HTTP and over the WebSocket mode, which is what
+  an agent CLI that sends `false` on every request asks for. Nothing
+  generated after that close is sent or counted in `usage`, a call written
+  inside the reasoning ends nothing, and such a response carries no
+  `thinking_budget_forced_at`. `true` or absent serves every
+  call the model writes; the response echoes the value
+  ([chat completions](chat-completions.md) has the same rule).
 - **What it cannot do is refused**, with OpenAI's error and a `param`, never
   ignored where ignoring it would change the answer: tools that are not
   functions, `background: true`, and an input item of another type. `store`,

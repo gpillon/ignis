@@ -22,7 +22,9 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   `max_tokens` for the answer. A forced close is reported as
   `thinking_budget_forced_at` on the choice (on the finish chunk when
   streaming; top-level on `/v1/responses`): the reasoning tokens emitted when
-  it began. The field is absent when the close was not forced.
+  it began. The field is absent when the close was not forced, and on a turn
+  that a `stop` sequence or `parallel_tool_calls: false` ended before the
+  model did.
 - **A turn that ends inside its reasoning answers.** With thinking on, an end
   of turn the model draws while its reasoning block is still open becomes the
   block's `</think>`, and the model goes on to answer — usually with the call
@@ -94,6 +96,14 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   way out). With thinking on the reasoning spends the same `max_tokens`: a
   block that never closes ends `length` with no call, which the thinking
   budget's answer reserve prevents.
+- `parallel_tool_calls: false` gives at most one tool call per turn (from
+  0.11.0; earlier versions refuse it with a 400). The turn ends at the close
+  of its first call, with `finish_reason: "tool_calls"`: nothing the model
+  generates after that close reaches you or counts in `usage`, streamed or
+  not. A call the model writes inside its reasoning is not a call and ends
+  nothing. With `tool_choice: "required"` or a named function the turn has
+  exactly one call. `true` or absent serves every call the model writes, as
+  before. It holds on every model, Flash-Next included.
 - `response_format: {"type": "json_object"}` holds the answer to a valid JSON
   object, and `{"type": "json_schema", "json_schema": {...}}` to your schema,
   streamed or not (from 0.11.0, on the 27B; 0.10.0 refuses both): each

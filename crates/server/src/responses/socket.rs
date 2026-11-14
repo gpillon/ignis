@@ -742,7 +742,7 @@ async fn serve(
         // cancel would log its consumer letting it go.
         guard.timed_out();
     }
-    if !matches!(driven, Some(Driven::Ended)) {
+    if !matches!(driven, Some(Driven::Ended | Driven::Stopped(_))) {
         // Cut short: what the loop guard held back still reaches the
         // response (ADR 0052), and the tokens already waiting.
         let owed = api::owed_at_deadline(&running, &mut scheduled).await;
@@ -750,6 +750,7 @@ async fn serve(
     }
     match driven {
         Some(Driven::Ended) => guard.completed(),
+        Some(Driven::Stopped(tokens)) => guard.stop(tokens),
         Some(Driven::TimedOut) => {
             events.timed_out(live.timeout_reply, timeout).into_iter().for_each(emit);
         }
