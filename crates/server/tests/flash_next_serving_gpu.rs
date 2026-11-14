@@ -223,7 +223,12 @@ fn vram_plan_only(path: &std::path::Path, shape: EngineShape) -> Option<serde_js
 /// Planned twice on the card as it is, the desktop's share of it included,
 /// so only the difference is asserted; nothing is pinned. On 2026-11-06,
 /// with 4.7 GB of the card taken: 15,833,292,112 bytes at 1,024, 14,732,307,024
-/// at 8,192, 1.03 GiB less.
+/// at 8,192, 1.03 GiB less. The process's context is made before either plan
+/// and held for the test's life, so both plans are reloads in any run order
+/// (GitHub #604): a cold plan's budget starts from the free memory before the
+/// context, a reload's, with no per-process figure to add back (WDDM), from a
+/// later free reading and the context as measured, and the two differ by the
+/// measurement's jitter.
 #[test]
 #[ignore = "GPU profile only: the real Flash-Next artifact"]
 fn under_rtx5090_flash_next_prefills_8192_a_chunk_and_keeps_15_gib_of_expert_cache() {
@@ -232,6 +237,13 @@ fn under_rtx5090_flash_next_prefills_8192_a_chunk_and_keeps_15_gib_of_expert_cac
     if !path.exists() && gpu_profile::skip_or_fail(&format!("no Flash-Next artifact at {}", path.display())) {
         return;
     }
+    let _context = match ignis_artifact::CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            gpu_profile::skip_or_fail(&format!("CUDA device unavailable: {e}"));
+            return;
+        }
+    };
     let args = ["--profile", "rtx5090"].map(str::to_owned);
     let ignis_server::config::ConfigOutcome::Config(config) = ignis_server::config::resolve(&args, |_| None).expect("resolve")
     else {

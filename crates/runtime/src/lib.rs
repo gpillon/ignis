@@ -110,25 +110,37 @@ pub const CUDA_CONTEXT_BYTES: u64 = 452_595_712;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextCharge {
     pub bytes: u64,
-    /// Whether `bytes` was measured, or is the fallback.
-    pub measured: bool,
+    pub source: ContextSource,
+}
+
+/// Where a plan's `cuda_context` line came from (GitHub #604).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextSource {
+    /// What NVML's free memory fell by when the process made the context.
+    Measured,
+    /// That reading failed or did not fall: [`CUDA_CONTEXT_BYTES`].
+    Fallback,
+}
+
+impl ContextSource {
+    /// What the plan events' `cuda_context_source` says.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContextSource::Measured => "measured",
+            ContextSource::Fallback => "fallback",
+        }
+    }
 }
 
 impl ContextCharge {
     /// What a plan charges for a context NVML read as `reading`.
     pub fn of(reading: ignis_artifact::ContextReading) -> ContextCharge {
         match reading {
-            ignis_artifact::ContextReading::Measured(bytes) => ContextCharge { bytes, measured: true },
+            ignis_artifact::ContextReading::Measured(bytes) => ContextCharge { bytes, source: ContextSource::Measured },
             ignis_artifact::ContextReading::Unreadable | ignis_artifact::ContextReading::NotLower { .. } => {
-                ContextCharge { bytes: CUDA_CONTEXT_BYTES, measured: false }
+                ContextCharge { bytes: CUDA_CONTEXT_BYTES, source: ContextSource::Fallback }
             }
         }
-    }
-
-    /// `measured` or `fallback`: what the plan events' `cuda_context_source`
-    /// says.
-    pub fn source(self) -> &'static str {
-        if self.measured { "measured" } else { "fallback" }
     }
 }
 
@@ -271,7 +283,7 @@ pub fn plan_start(family: ignis_core::compute::ModelFamily) -> Result<(PlanStart
     // This device made the context, or an earlier one did: it was measured then.
     let reading = CudaDevice::context_reading().unwrap_or(ContextReading::Unreadable);
     let context = ContextCharge::of(reading);
-    if !context.measured {
+    if context.source == ContextSource::Fallback {
         // hotpath-lint-allow: one line per model load, and only where the context could not be measured.
         tracing::warn!(
             name: "ignis.runtime.cuda_context_fallback",
@@ -2704,7 +2716,7 @@ mod tests {
     fn a_context_counted_at_the_first_reading_is_measured_once_it_held_still() {
         let before = 20 * GIB;
         let (charge, took, reads) = charged(Some(before), &[Some(before - CONTEXT)]);
-        assert_eq!(charge, ContextCharge { bytes: CONTEXT, measured: true });
+        assert_eq!(charge, ContextCharge { bytes: CONTEXT, source: ContextSource::Measured });
         // Read every 10 ms, and taken once it held for 250 ms: 26 readings,
         // long before the 2 s bound.
         assert_eq!((took, reads), (std::time::Duration::from_millis(250), 26));
@@ -2718,7 +2730,7 @@ mod tests {
         let early = Some(before - (CONTEXT - (64 << 20)));
         let values = [early, early, early, early, early, early, Some(before - CONTEXT)];
         let (charge, took, _) = charged(Some(before), &values);
-        assert_eq!(charge, ContextCharge { bytes: CONTEXT, measured: true });
+        assert_eq!(charge, ContextCharge { bytes: CONTEXT, source: ContextSource::Measured });
         assert_eq!(took, std::time::Duration::from_millis(60 + 250), "it held still from the piece's reading on");
     }
 
@@ -2730,24 +2742,25 @@ mod tests {
         let values: Vec<Option<u64>> =
             (0..400).map(|i| Some(before - CONTEXT - if i % 2 == 1 { 2 << 20 } else { 0 })).collect();
         let (charge, took, _) = charged(Some(before), &values);
-        assert_eq!(charge, ContextCharge { bytes: CONTEXT + (2 << 20), measured: true });
+        assert_eq!(charge, ContextCharge { bytes: CONTEXT + (2 << 20), source: ContextSource::Measured });
         assert_eq!(took, std::time::Duration::from_secs(2));
     }
 
     #[test]
     fn an_unreadable_reading_falls_back_to_the_rtx_5090_figure() {
-        let fallback = ContextCharge { bytes: CUDA_CONTEXT_BYTES, measured: false };
+        let fallback = ContextCharge { bytes: CUDA_CONTEXT_BYTES, source: ContextSource::Fallback };
         let before = 20 * GIB;
         assert_eq!(charged(Some(before), &[None]).0, fallback, "unreadable after the context");
         assert_eq!(charged(Some(before), &[Some(before - CONTEXT), None]).0, fallback, "unreadable while it settles");
         assert_eq!(charged(None, &[Some(before - CONTEXT)]).0, fallback, "unreadable before the context");
+        assert_eq!(fallback.source.as_str(), "fallback", "what the plan events' `cuda_context_source` says");
     }
 
     #[test]
     fn a_difference_of_zero_or_less_falls_back_to_the_rtx_5090_figure() {
         // Another process freed as much memory as the context took, or more,
         // inside the window.
-        let fallback = ContextCharge { bytes: CUDA_CONTEXT_BYTES, measured: false };
+        let fallback = ContextCharge { bytes: CUDA_CONTEXT_BYTES, source: ContextSource::Fallback };
         let before = 20 * GIB;
         assert_eq!(charged(Some(before), &[Some(before)]).0, fallback, "no difference");
         assert_eq!(charged(Some(before), &[Some(before + (64 << 20))]).0, fallback, "more free after than before");
@@ -2755,7 +2768,7 @@ mod tests {
 
     /// A context NVML measured at `bytes`.
     fn measured(bytes: u64) -> Option<ContextCharge> {
-        Some(ContextCharge { bytes, measured: true })
+        Some(ContextCharge { bytes, source: ContextSource::Measured })
     }
 
     const STATE: u64 = QWEN27B_PROCESS_STATE_BYTES;
@@ -2793,9 +2806,17 @@ mod tests {
         use ignis_core::compute::ModelFamily::Qwen38_27b;
         let charged_again = |bytes| ProcessHeld { bytes, source: HeldSource::ChargedAgain };
         assert_eq!(held_before_load(Qwen38_27b, measured(CONTEXT), true, None), charged_again(603_164_672));
-        assert_eq!(held_before_load(Qwen38_27b, measured(CONTEXT), false, None), charged_again(CONTEXT), "no 27B has run");
-        let fallback = Some(ContextCharge { bytes: CUDA_CONTEXT_BYTES, measured: false });
-        assert_eq!(held_before_load(Qwen38_27b, fallback, true, None), charged_again(536_489_984), "#324's two constants");
+        assert_eq!(
+            held_before_load(Qwen38_27b, measured(CONTEXT), false, None),
+            charged_again(CONTEXT),
+            "no 27B has run"
+        );
+        let fallback = Some(ContextCharge { bytes: CUDA_CONTEXT_BYTES, source: ContextSource::Fallback });
+        assert_eq!(
+            held_before_load(Qwen38_27b, fallback, true, None),
+            charged_again(536_489_984),
+            "#324's two constants"
+        );
         // A first load reads before its context exists: nothing is held.
         let nothing = ProcessHeld { bytes: 0, source: HeldSource::Nothing };
         assert_eq!(held_before_load(Qwen38_27b, None, false, Some(RTX5080_HELD)), nothing);
@@ -2808,7 +2829,10 @@ mod tests {
         // The process holds the context and the 27B's state; Flash-Next's plan
         // has no residual line, so it charges again the context only.
         for (figure, source) in [(None, HeldSource::ChargedAgain), (Some(CONTEXT + STATE), HeldSource::PerProcess)] {
-            assert_eq!(held_before_load(FlashNext, measured(CONTEXT), true, figure), ProcessHeld { bytes: CONTEXT, source });
+            assert_eq!(
+                held_before_load(FlashNext, measured(CONTEXT), true, figure),
+                ProcessHeld { bytes: CONTEXT, source }
+            );
         }
     }
 
@@ -2820,7 +2844,10 @@ mod tests {
         const FLASH_NEXT_STATE: u64 = 200 << 20;
         let per_process = |bytes| ProcessHeld { bytes, source: HeldSource::PerProcess };
         // Flash-Next first, then the 27B: no 27B state yet.
-        assert_eq!(held_before_load(Qwen38_27b, measured(CONTEXT), false, Some(CONTEXT + FLASH_NEXT_STATE)), per_process(CONTEXT));
+        assert_eq!(
+            held_before_load(Qwen38_27b, measured(CONTEXT), false, Some(CONTEXT + FLASH_NEXT_STATE)),
+            per_process(CONTEXT)
+        );
         // The 27B, Flash-Next, then the 27B again.
         assert_eq!(
             held_before_load(Qwen38_27b, measured(CONTEXT), true, Some(CONTEXT + STATE + FLASH_NEXT_STATE)),

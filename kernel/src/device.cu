@@ -341,7 +341,8 @@ extern "C" int32_t ignis_device_nvml_process_bytes(int device_id, uint32_t pid, 
   bool reported = false;
   bool unavailable = false;
   uint64_t held = 0;
-  if (on_nvml_device(device_id, "nvmlDeviceGetComputeRunningProcesses_v3", [&](const Nvml *api, nvmlDevice_t device) -> nvmlReturn_t {
+  if (on_nvml_device(device_id, "nvmlDeviceGetComputeRunningProcesses_v3",
+                     [&](const Nvml *api, nvmlDevice_t device) -> nvmlReturn_t {
         if (api->compute_processes == nullptr) {
           return NVML_SUCCESS;  // a driver without the query: no figure
         }

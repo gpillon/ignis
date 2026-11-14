@@ -199,15 +199,16 @@ add_test(NAME ignis_kernel_gdn_input_proj_tests COMMAND ignis_kernel_gdn_input_p
 
 # P1-12 (GitHub #48): the reference's own gdn_gating_proj test (BF16-only op,
 # no excluded op family to trim) — both the Qwen3.8-27B ([96,5120] ab_weight)
-# and Qwen3.6-35B geometries. Since GitHub #478 it carries a portability patch
-# (ADR 0077): on a card that cannot hold a cooperative schedule resident (fewer
-# SMs than the RTX 5090, or an sm_86 build's fewer CTAs per SM) it skips, and
-# names in a SKIP line, each one the planner's residency query refuses there,
-# and holds a projection case the planner then runs on the unsplit route to
-# that route's own error criterion;
+# and Qwen3.6-35B geometries. Since GitHub #478 and #602 it carries a
+# portability patch (ADR 0077, ADR 0091): it runs its case list at the card's
+# own SM count, then under test-only caps of 84 and 36 on the SM count the
+# planner reads, each below the card's own; where a cooperative schedule is not
+# resident (fewer SMs, or an sm_86 build's fewer CTAs per SM) it names each
+# case the planner runs on a fallback in a FALLBACK line, with its pass's SM
+# count or cap, and holds it to the criterion of the route it runs;
 # it prints each cooperative kernel's CTAs per SM and, on compute capability
 # 12.0, fails if one is not the value the planner was tuned on, or on the 5090
-# if it skips any. The wrapper itself is
+# with no cap if any case falls back. The wrapper itself is
 # vendored (kernel/vendor/src/ops/wrapper/gdn_gating_proj.cpp, built into
 # ignis_vendor), so this links only ignis_vendor, same as the norm/glue tests
 # above.

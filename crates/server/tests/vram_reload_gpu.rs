@@ -114,7 +114,7 @@ fn a_reload_plans_the_kv_pool_its_cold_start_planned() {
     assert!(ignis_runtime::qwen27b_loaded(), "the cold load left the 27B's per-process state behind");
     let reading = CudaDevice::context_reading().expect("the cold load made the context");
     let context = ignis_runtime::ContextCharge::of(reading);
-    assert!(context.measured, "the context was not measured: {reading}");
+    assert_eq!(context.source, ignis_runtime::ContextSource::Measured, "the context was not measured: {reading}");
     let process_bytes = CudaDevice::nvml_process_bytes(0);
     let held = ignis_runtime::held_before_load(ignis_core::compute::ModelFamily::Qwen38_27b, Some(context), true, process_bytes);
     println!(

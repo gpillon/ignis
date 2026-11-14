@@ -28,8 +28,9 @@ From 0.11.0 the CUDA context's line is measured on the card at the start: the
 first load reads the free memory just before and after it creates the
 context, and the plan charges the difference, what the context takes on this
 card and this OS. 0.10.0 charged every card the 452,595,712 bytes measured on
-an RTX 5090 under Windows: too much on an RTX 5080 under Linux, too little
-under WSL.
+an RTX 5090 under Windows: too little under WSL, and on an RTX 5080 under
+Linux the 27B's cold start charged more than the process holds for its context
+and its own state together.
 A reading that fails falls back to that figure, with a WARN
 ([troubleshooting](../troubleshooting.md#warn-ignisruntimecuda_context_fallback)).
 A later load in the same process, a model switch or the reload after an idle

@@ -52,7 +52,9 @@ correctness bug, whose patch ships with a test that fails without it and a
 architecture the build targets, or to a card smaller than the RTX 5090, whose
 patch leaves the default `120a` build's device code unchanged and whose
 `reason` names the CUDA architecture or the card size and what it fixes: a
-compile, or a launch that fails at run time there (ADR 0077); or a vendored
+compile, a launch that fails at run time there (ADR 0077), or a route choice
+the card cannot hold, whose test may run it on the RTX 5090 under a test-only
+SM cap (ADR 0091); or a vendored
 registry that lacks a case ignis needs, whose `reason` names the shapes
 added, why the routes fit them and the test cases that throw without it, and
 which a small registry may instead meet by being rewritten as ignis's own

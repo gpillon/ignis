@@ -577,7 +577,7 @@ pub fn log_vram_plan(
                 budget_bytes = plan.budget_bytes,
                 weights_bytes = lines.weights,
                 cuda_context_bytes = lines.cuda_context,
-                cuda_context_source = start.context.source(),
+                cuda_context_source = start.context.source.as_str(),
                 workspace_bytes = lines.workspace,
                 trellis_workspace_bytes = lines.trellis_workspace,
                 trellis_dense_bytes = lines.trellis_dense,
@@ -986,7 +986,7 @@ pub fn log_flash_next_plan(
         budget_bytes = plan.budget_bytes,
         weights_bytes = lines.weights,
         cuda_context_bytes = lines.cuda_context,
-        cuda_context_source = start.context.source(),
+        cuda_context_source = start.context.source.as_str(),
         program_bytes = lines.workspace + lines.sampling + lines.decode_graph,
         pool_bytes = plan.kv_pool_bytes + lines.lane_state + lines.hq_residual_window,
         kv_pool_policy = plan.kv_pool_policy.as_str(),
@@ -2617,7 +2617,7 @@ mod tests {
     const RELOAD_START: ignis_runtime::PlanStart = ignis_runtime::PlanStart {
         free_at_start_bytes: 30 << 30,
         held: ignis_runtime::ProcessHeld { bytes: 603_164_672, source: ignis_runtime::HeldSource::ChargedAgain },
-        context: ignis_runtime::ContextCharge { bytes: 519_270_400, measured: true },
+        context: ignis_runtime::ContextCharge { bytes: 519_270_400, source: ignis_runtime::ContextSource::Measured },
     };
 
     /// The host plan refused on 2026-10-13: 41.6 GB available.
@@ -3134,7 +3134,7 @@ mod tests {
         let start = ignis_runtime::PlanStart {
             free_at_start_bytes: 31 << 30,
             held: ignis_runtime::ProcessHeld { bytes: CONTEXT, source: ignis_runtime::HeldSource::PerProcess },
-            context: ignis_runtime::ContextCharge { bytes: CONTEXT, measured: true },
+            context: ignis_runtime::ContextCharge { bytes: CONTEXT, source: ignis_runtime::ContextSource::Measured },
         };
         let event_of = |plan: &ignis_core::VramPlan| {
             use tracing_subscriber::layer::SubscriberExt;
@@ -3411,7 +3411,9 @@ mod tests {
         // bytes where the plan charged 536,489,984 -- and the reload adds back
         // the driver's figure for the process where it has one.
         use ignis_core::compute::ModelFamily::Qwen38_27b;
-        use ignis_runtime::{held_before_load, ContextCharge, HeldSource, ProcessHeld, QWEN27B_PROCESS_STATE_BYTES};
+        use ignis_runtime::{
+            held_before_load, ContextCharge, ContextSource, HeldSource, ProcessHeld, QWEN27B_PROCESS_STATE_BYTES,
+        };
         const COLD_FREE: u64 = 31_104_512_000;
         const HEADROOM: u64 = 1_258_291_200;
         let mode = ignis_core::VramMode::Derived { headroom_bytes: HEADROOM };
@@ -3420,7 +3422,7 @@ mod tests {
         // The context measured below `CUDA_CONTEXT_BYTES`, at it, and at what
         // one took under WSL; the plan keeps it for the process's life.
         for context in [300 << 20, ignis_runtime::CUDA_CONTEXT_BYTES, 519_270_400] {
-            let measured = Some(ContextCharge { bytes: context, measured: true });
+            let measured = Some(ContextCharge { bytes: context, source: ContextSource::Measured });
             let cold = plan_at(mode, COLD_FREE + cold_start.bytes, context);
             let charged_again = context + QWEN27B_PROCESS_STATE_BYTES;
             // What the process holds after the cold load's teardown: what the

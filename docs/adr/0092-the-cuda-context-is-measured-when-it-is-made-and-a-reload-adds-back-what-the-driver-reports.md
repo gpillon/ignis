@@ -75,6 +75,7 @@ every other process on the card, which is why the window is short and the readin
 - On a card whose 27B state is larger than the 5090's the cold start still charges too little for it, as
   before; measuring that state, and `LOAD_RESIDUAL_BYTES`, on other cards is left out.
 - The reading is checked on the card by `nvml_memory_gpu`, which holds the measured context to the process's
-  WDDM dedicated usage right after the context is made, within 16 MiB, and where the driver reports the
-  process, to that figure; `vram_reload_gpu` prints the context, the add-back and where it came from, and
-  holds the reload's pool to the cold start's within 1%.
+  WDDM dedicated usage right after the context is made, within 16 MiB, and prints the driver's figure for the
+  process where it reports one, a different reading that no run here has held the context to;
+  `vram_reload_gpu` prints the context, the add-back and where it came from, and holds the reload's pool to
+  the cold start's within 1%.
