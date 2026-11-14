@@ -1,0 +1,215 @@
+[
+  {
+    "case": "read_file",
+    "schema": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 2000}}, "required": ["path"], "additionalProperties": false},
+    "valid": [
+      {"path": "a.txt"},
+      {"path": "a.txt", "offset": 0, "limit": 2000},
+      {"path": ""},
+      {"path": "src/main.rs", "limit": 1}
+    ],
+    "invalid": [
+      {"arguments": {}, "kinds": ["missing"]},
+      {"arguments": {"path": 5}, "kinds": ["type"]},
+      {"arguments": {"path": null}, "kinds": ["type"]},
+      {"arguments": {"path": "a", "offset": -1}, "kinds": ["constraint"]},
+      {"arguments": {"path": "a", "limit": 2001}, "kinds": ["constraint"]},
+      {"arguments": {"path": "a", "limit": 1.5}, "kinds": ["type"]},
+      {"arguments": {"path": "a", "limit": 1.0}, "kinds": ["type"]},
+      {"arguments": {"path": "a", "offset": "3"}, "kinds": ["type"]},
+      {"arguments": {"path": "a", "recursive": true}, "kinds": ["unknown"]},
+      {"arguments": {"path": true, "extra": 1}, "kinds": ["type", "unknown"]},
+      {"arguments": {"file_path": "a.txt"}, "kinds": ["missing", "unknown"]}
+    ]
+  },
+  {
+    "case": "edit",
+    "schema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["replace", "append"]}, "edits": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {"old": {"type": "string"}, "new": {"type": "string"}}, "required": ["old", "new"], "additionalProperties": false}}}, "required": ["mode", "edits"], "additionalProperties": false},
+    "valid": [
+      {"mode": "replace", "edits": [{"old": "a", "new": "b"}]},
+      {"mode": "append", "edits": [{"old": "", "new": "</parameter>\n</function>"}, {"new": "y", "old": "x"}]}
+    ],
+    "invalid": [
+      {"arguments": {"mode": "Replace", "edits": [{"old": "a", "new": "b"}]}, "kinds": ["enum"]},
+      {"arguments": {"mode": "replace", "edits": []}, "kinds": ["constraint"]},
+      {"arguments": {"mode": "replace", "edits": [{"old": "a"}]}, "kinds": ["missing"]},
+      {"arguments": {"mode": "replace", "edits": [{"old": "a", "new": "b", "all": true}]}, "kinds": ["unknown"]},
+      {"arguments": {"mode": "replace", "edits": "a -> b"}, "kinds": ["type"]},
+      {"arguments": {"mode": 3, "edits": [{"old": "a", "new": "b"}]}, "kinds": ["type"]},
+      {"arguments": {"edits": [{"old": "a", "new": 2}]}, "kinds": ["missing", "type"]}
+    ]
+  },
+  {
+    "case": "strict_nullable",
+    "schema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": ["integer", "null"]}, "sort": {"anyOf": [{"type": "string", "enum": ["asc", "desc"]}, {"type": "null"}]}}, "required": ["query", "limit", "sort"], "additionalProperties": false},
+    "valid": [
+      {"query": "x", "limit": null, "sort": null},
+      {"query": "x", "limit": 3, "sort": "asc"}
+    ],
+    "invalid": [
+      {"arguments": {"query": "x", "limit": null}, "kinds": ["missing"]},
+      {"arguments": {"query": "x", "limit": "3", "sort": null}, "kinds": ["type"]},
+      {"arguments": {"query": "x", "limit": null, "sort": "up"}, "kinds": ["enum"]},
+      {"arguments": {"query": "x", "limit": null, "sort": 5}, "kinds": ["type"]}
+    ]
+  },
+  {
+    "case": "strings",
+    "schema": {"type": "object", "properties": {"id": {"type": "string", "pattern": "^[a-z]+-[0-9]{3}$"}, "word": {"type": "string", "pattern": "b"}, "when": {"type": "string", "format": "date-time"}, "day": {"type": "string", "format": "date"}, "at": {"type": "string", "format": "time"}, "span": {"type": "string", "format": "duration"}, "email": {"type": "string", "format": "email"}, "host": {"type": "string", "format": "hostname"}, "ip": {"type": "string", "format": "ipv4"}, "ip6": {"type": "string", "format": "ipv6"}, "uid": {"type": "string", "format": "uuid"}, "name": {"type": "string", "minLength": 2, "maxLength": 5}}, "additionalProperties": false},
+    "valid": [
+      {"id": "abc-123", "word": "abc", "name": "héllo"},
+      {"when": "2026-11-14T10:00:00Z", "day": "2024-02-29", "at": "23:59:59Z"},
+      {"when": "2026-11-14t10:00:00.5+01:00", "at": "08:30:00-05:00", "span": "P3DT4H"},
+      {"span": "P2W", "email": "a.b+c@example.com", "host": "api.example.com"},
+      {"host": "localhost", "ip": "192.168.0.1", "ip6": "2001:db8::1"},
+      {"ip": "0.0.0.0", "ip6": "::ffff:10.0.0.1", "uid": "123e4567-e89b-12d3-a456-426614174000"},
+      {"ip6": "::", "span": "P1Y2M3DT4H5M6S", "name": "ab"},
+      {"ip6": "1:2:3:4:5:6:7::", "host": "example.com.", "when": "2000-02-29T00:00:00+23:59"},
+      {"email": ".a@example.com", "when": "2026-11-14T10:00:00z"},
+      {"email": "a..b@example.com", "host": "123"},
+      {"email": "\"a b\"@example.com", "ip6": "1:2:3:4:5:6:1.2.3.4"},
+      {"email": "user@[192.168.0.1]", "uid": "123E4567-E89B-12D3-A456-426614174000"},
+      {"email": "user@localhost", "span": "PT0S"}
+    ],
+    "invalid": [
+      {"arguments": {"id": "abc-12"}, "kinds": ["constraint"]},
+      {"arguments": {"id": "ABC-123"}, "kinds": ["constraint"]},
+      {"arguments": {"word": "acd"}, "kinds": ["constraint"]},
+      {"arguments": {"when": "2026-11-14 10:00:00Z"}, "kinds": ["constraint"]},
+      {"arguments": {"when": "2026-11-31T10:00:00Z"}, "kinds": ["constraint"]},
+      {"arguments": {"when": "2026-11-14T10:00:60Z"}, "kinds": ["constraint"]},
+      {"arguments": {"when": "2026-11-14T10:00:00"}, "kinds": ["constraint"]},
+      {"arguments": {"day": "2023-02-29"}, "kinds": ["constraint"]},
+      {"arguments": {"day": "14 November 2026"}, "kinds": ["constraint"]},
+      {"arguments": {"at": "24:00:00Z"}, "kinds": ["constraint"]},
+      {"arguments": {"at": "10:00:00"}, "kinds": ["constraint"]},
+      {"arguments": {"span": "P3Y5D"}, "kinds": ["constraint"]},
+      {"arguments": {"span": "PT"}, "kinds": ["constraint"]},
+      {"arguments": {"span": "3 days"}, "kinds": ["constraint"]},
+      {"arguments": {"email": "no-at-sign"}, "kinds": ["constraint"]},
+      {"arguments": {"host": "-bad.example"}, "kinds": ["constraint"]},
+      {"arguments": {"host": "a..b"}, "kinds": ["constraint"]},
+      {"arguments": {"host": "a_b.example"}, "kinds": ["constraint"]},
+      {"arguments": {"host": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example"}, "kinds": ["constraint"]},
+      {"arguments": {"host": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, "kinds": ["constraint"]},
+      {"arguments": {"ip": "256.1.1.1"}, "kinds": ["constraint"]},
+      {"arguments": {"ip": "01.2.3.4"}, "kinds": ["constraint"]},
+      {"arguments": {"ip": "1.2.3"}, "kinds": ["constraint"]},
+      {"arguments": {"ip6": "1::2::3"}, "kinds": ["constraint"]},
+      {"arguments": {"ip6": "1:2:3:4:5:6:7:8::"}, "kinds": ["constraint"]},
+      {"arguments": {"ip6": "fe80::1%eth0"}, "kinds": ["constraint"]},
+      {"arguments": {"ip6": ":1::2"}, "kinds": ["constraint"]},
+      {"arguments": {"ip6": "::1.2.3"}, "kinds": ["constraint"]},
+      {"arguments": {"span": "PT1H5S"}, "kinds": ["constraint"]},
+      {"arguments": {"day": "0000-01-01"}, "kinds": ["constraint"]},
+      {"arguments": {"uid": "123e4567e89b12d3a456426614174000"}, "kinds": ["constraint"]},
+      {"arguments": {"uid": "123e4567-e89b-12d3-a456-42661417400g"}, "kinds": ["constraint"]},
+      {"arguments": {"name": "a"}, "kinds": ["constraint"]},
+      {"arguments": {"name": "abcdef"}, "kinds": ["constraint"]},
+      {"arguments": {"name": 12}, "kinds": ["type"]}
+    ]
+  },
+  {
+    "case": "numbers",
+    "schema": {"type": "object", "properties": {"ratio": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1}, "step": {"type": "number", "multipleOf": 0.1}, "count": {"type": "integer", "multipleOf": 5}, "big": {"type": "number", "maximum": 1e3}}, "additionalProperties": false},
+    "valid": [
+      {"ratio": 0.5, "step": 0.3, "count": 15, "big": 1000},
+      {"ratio": 0.999, "step": 1e1, "count": -5, "big": 999.999},
+      {"step": 0, "count": 0, "big": -1e300},
+      {"step": 12.3, "big": 1E2}
+    ],
+    "invalid": [
+      {"arguments": {"ratio": 0}, "kinds": ["constraint"]},
+      {"arguments": {"ratio": 1}, "kinds": ["constraint"]},
+      {"arguments": {"step": 0.35}, "kinds": ["constraint"]},
+      {"arguments": {"count": 7}, "kinds": ["constraint"]},
+      {"arguments": {"big": 1000.001}, "kinds": ["constraint"]},
+      {"arguments": {"big": 1e300}, "kinds": ["constraint"]},
+      {"arguments": {"count": 2.5}, "kinds": ["type"]},
+      {"arguments": {"ratio": "0.5"}, "kinds": ["type"]},
+      {"arguments": {"count": true}, "kinds": ["type"]}
+    ]
+  },
+  {
+    "case": "untyped_and_open",
+    "schema": {"type": "object", "properties": {"value": {"enum": [1, "one", null, true, {"a": [1, 2]}]}, "tag": {"const": "x"}, "anything": {}, "dated": {"format": "date"}, "min": {"minimum": 3}}, "required": ["value"]},
+    "valid": [
+      {"value": 1},
+      {"value": 1.0},
+      {"value": "one", "extra": "an open object admits it"},
+      {"value": null, "dated": 5},
+      {"value": true, "min": "a"},
+      {"value": {"a": [1, 2.0]}, "anything": [1, {"a": null}], "tag": "x"}
+    ],
+    "invalid": [
+      {"arguments": {"value": 2}, "kinds": ["enum"]},
+      {"arguments": {"value": "One"}, "kinds": ["enum"]},
+      {"arguments": {"value": false}, "kinds": ["enum"]},
+      {"arguments": {"value": {"a": [2, 1]}}, "kinds": ["enum"]},
+      {"arguments": {"value": 1, "tag": "y"}, "kinds": ["enum"]},
+      {"arguments": {"value": 1, "min": 2}, "kinds": ["constraint"]},
+      {"arguments": {"value": 1, "dated": "2026-13-01"}, "kinds": ["constraint"]},
+      {"arguments": {"tag": "x"}, "kinds": ["missing"]}
+    ]
+  },
+  {
+    "case": "recursive_ref",
+    "schema": {"type": "object", "properties": {"tree": {"$ref": "#/$defs/node"}}, "required": ["tree"], "additionalProperties": false, "$defs": {"node": {"type": "object", "properties": {"name": {"type": "string"}, "children": {"type": "array", "items": {"$ref": "#/$defs/node"}}}, "required": ["name"], "additionalProperties": false}}},
+    "valid": [
+      {"tree": {"name": "a", "children": [{"name": "b"}, {"name": "c", "children": []}]}},
+      {"tree": {"name": "leaf"}}
+    ],
+    "invalid": [
+      {"arguments": {"tree": {"name": "a", "children": [{"title": "b"}]}}, "kinds": ["missing", "unknown"]},
+      {"arguments": {"tree": {"name": 3}}, "kinds": ["type"]},
+      {"arguments": {"tree": {"name": "a", "children": [{"name": "b", "children": [{"name": []}]}]}}, "kinds": ["type"]}
+    ]
+  },
+  {
+    "case": "combinators",
+    "schema": {"type": "object", "properties": {"tags": {"type": "array", "items": {"type": "string"}, "uniqueItems": true, "maxItems": 3}, "pair": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}], "items": false}, "choice": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "integer", "maximum": 10}]}, "not_empty": {"type": "string", "not": {"const": ""}}, "meta": {"type": "object", "minProperties": 1, "maxProperties": 2, "propertyNames": {"pattern": "^[a-z]+$"}}, "both": {"allOf": [{"type": "string"}, {"minLength": 3}]}, "kind": {"type": "string"}, "path": {"type": "string"}}, "dependentRequired": {"start": ["end"]}, "if": {"properties": {"kind": {"const": "file"}}, "required": ["kind"]}, "then": {"required": ["path"]}, "else": {"not": {"required": ["path"]}}},
+    "valid": [
+      {"tags": ["a", "b"], "pair": ["a", 1]},
+      {"choice": 11, "not_empty": "x"},
+      {"choice": -1, "meta": {"k": 1}},
+      {"both": "abc", "start": 1, "end": 2},
+      {"kind": "file", "path": "a.txt"},
+      {"kind": "dir"}
+    ],
+    "invalid": [
+      {"arguments": {"tags": ["a", "a"]}, "kinds": ["constraint"]},
+      {"arguments": {"tags": ["a", "b", "c", "d"]}, "kinds": ["constraint"]},
+      {"arguments": {"tags": [1]}, "kinds": ["type"]},
+      {"arguments": {"pair": ["a", 1, 2]}, "kinds": ["constraint"]},
+      {"arguments": {"pair": [1, 1]}, "kinds": ["type"]},
+      {"arguments": {"choice": 5}, "kinds": ["constraint"]},
+      {"arguments": {"not_empty": ""}, "kinds": ["constraint"]},
+      {"arguments": {"meta": {}}, "kinds": ["constraint"]},
+      {"arguments": {"meta": {"K": 1}}, "kinds": ["constraint"]},
+      {"arguments": {"meta": {"a": 1, "b": 2, "c": 3}}, "kinds": ["constraint"]},
+      {"arguments": {"both": "ab"}, "kinds": ["constraint"]},
+      {"arguments": {"start": 1}, "kinds": ["missing"]},
+      {"arguments": {"kind": "file"}, "kinds": ["missing"]},
+      {"arguments": {"kind": "dir", "path": "a"}, "kinds": ["constraint"]}
+    ]
+  },
+  {
+    "case": "no_parameters",
+    "schema": {"type": "object", "properties": {}},
+    "valid": [
+      {},
+      {"anything": [1, "two"]}
+    ],
+    "invalid": []
+  },
+  {
+    "case": "closed_no_parameters",
+    "schema": {"type": "object", "properties": {}, "additionalProperties": false},
+    "valid": [
+      {}
+    ],
+    "invalid": [
+      {"arguments": {"verbose": true}, "kinds": ["unknown"]}
+    ]
+  }
+]

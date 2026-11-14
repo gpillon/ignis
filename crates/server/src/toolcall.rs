@@ -29,8 +29,9 @@
 //!
 //! **An interrupted or malformed call is dropped whole, never leaked
 //! half-written.** A stop/cancel landing before `</tool_call>` closes, or a
-//! closed block whose body does not parse as `<function=...>`, is silently
-//! discarded at the point it is discovered — never surfaced as partial XML
+//! closed block whose body does not parse as `<function=...>`, is
+//! discarded at the point it is discovered (the closed block is counted,
+//! below) — never surfaced as partial XML
 //! in `content` and never surfaced as a tool call with truncated or
 //! garbled arguments (GitHub #121 acceptance criterion 3). The caller
 //! learns generation stopped from `finish_reason` (`stop`/`length`); it is
@@ -59,8 +60,16 @@
 //! before `</function>`. Such a value runs to the next `<parameter=` or to
 //! the end of the function body, whichever comes first, instead of being
 //! dropped (the `qwen3_coder` parsers' same boundary rule).
+//!
+//! **Every call block is checked and counted** (GitHub #608, ADR 0094) when
+//! the scanner is given a [`CallCheck`] ([`ToolCallScanner::checking`]): a
+//! call against its tool's `parameters` by the grammar crate's validator, a
+//! call to a tool the request did not declare as invalid, and a closed block
+//! that does not parse as dropped ([`CallVerdict`]). What the scanner emits
+//! does not change.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
@@ -117,6 +126,133 @@ pub struct ToolSchemas {
     /// (`"string"`, `"integer"`, ...). An empty list is an untyped
     /// parameter.
     functions: HashMap<String, HashMap<String, Vec<String>>>,
+}
+
+/// The call check of one response (GitHub #608, ADR 0094): every function
+/// the request declares, with its `parameters`, and the metrics each call
+/// block's [`CallVerdict`] is counted in. Made only with metrics on, so a
+/// server without them copies and checks nothing.
+#[derive(Debug)]
+pub struct CallCheck {
+    /// function name → its `parameters` as sent (`true` when it sent none),
+    /// for every declared function, with properties or not.
+    parameters: HashMap<String, JsonValue>,
+    metrics: Arc<crate::metrics::Metrics>,
+}
+
+impl CallCheck {
+    /// The check of a request whose resolved `tools` are these (none under
+    /// `tool_choice: "none"`, where every call names an undeclared tool), or
+    /// `None` without `metrics`.
+    pub fn new(tools: &[JsonValue], metrics: Option<&Arc<crate::metrics::Metrics>>) -> Option<Self> {
+        let metrics = Arc::clone(metrics?);
+        let parameters = tools
+            .iter()
+            .filter_map(|tool| {
+                let function = tool.get("function")?;
+                let name = function.get("name").and_then(JsonValue::as_str)?;
+                let parameters = function.get("parameters").filter(|p| !p.is_null()).cloned().unwrap_or(JsonValue::Bool(true));
+                Some((name.to_owned(), parameters))
+            })
+            .collect();
+        Some(Self { parameters, metrics })
+    }
+
+    /// A call to `name` with `arguments` (the JSON the parser delivers)
+    /// against the declared function's `parameters`, by
+    /// `ignis_grammar::validate`.
+    pub fn verdict(&self, name: &str, arguments: &str) -> CallVerdict {
+        use ignis_grammar::validate::{violations, Kind};
+        let Some(parameters) = self.parameters.get(name) else {
+            return CallVerdict::Invalid(vec![CallViolation::UndeclaredTool]);
+        };
+        let json = ignis_grammar::json::Json::parse;
+        let (Ok(schema), Ok(arguments)) = (json(&parameters.to_string()), json(arguments)) else {
+            // Both are serde_json's own output: never reached.
+            return CallVerdict::Valid;
+        };
+        let mut kinds: Vec<CallViolation> = violations(&schema, &arguments)
+            .into_iter()
+            .map(|violation| match violation.kind {
+                Kind::Missing => CallViolation::Missing,
+                Kind::Type => CallViolation::Type,
+                Kind::Enum => CallViolation::Enum,
+                Kind::Unknown => CallViolation::UnknownParameter,
+                Kind::Constraint => CallViolation::Constraint,
+            })
+            .collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        match kinds.is_empty() {
+            true => CallVerdict::Valid,
+            false => CallVerdict::Invalid(kinds),
+        }
+    }
+
+    /// Count a closed block: the call it parsed as, or `None` when it did
+    /// not parse.
+    fn count(&self, parsed: Option<(&str, &str)>) {
+        let verdict = match parsed {
+            Some((name, arguments)) => self.verdict(name, arguments),
+            None => CallVerdict::Dropped,
+        };
+        self.metrics.record_tool_call(&verdict);
+    }
+}
+
+/// What the call check found of one call block the scanner closed (GitHub
+/// #608, ADR 0094).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallVerdict {
+    /// The call names a declared tool, and its arguments validate against
+    /// the tool's `parameters`.
+    Valid,
+    /// The call names a tool the request did not declare, or its arguments
+    /// break the tool's `parameters`: each kind of violation once, in
+    /// [`CallViolation::ALL`] order.
+    Invalid(Vec<CallViolation>),
+    /// A closed block that did not parse as a call, dropped as ever.
+    Dropped,
+}
+
+/// The kinds of violation an invalid call is counted by: the validator's
+/// kinds (`ignis_grammar::validate::Kind`) and the call's own, a tool the
+/// request did not declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CallViolation {
+    /// A required parameter (or a required property inside one) is absent.
+    Missing,
+    /// A value of a type its schema does not admit.
+    Type,
+    /// A value outside its `enum`, or other than its `const`.
+    Enum,
+    /// A parameter (or a property inside one) the schema does not declare,
+    /// where the schema closes the object (`additionalProperties: false`).
+    /// An open object admits it: that call is valid.
+    UnknownParameter,
+    /// A value of the right type that breaks another keyword of its schema:
+    /// `pattern`, `format`, a bound, a length, a count, `multipleOf`.
+    Constraint,
+    /// A call to a function the request's `tools` do not declare; its
+    /// arguments are checked against nothing.
+    UndeclaredTool,
+}
+
+impl CallViolation {
+    pub const ALL: [CallViolation; 6] =
+        [Self::Missing, Self::Type, Self::Enum, Self::UnknownParameter, Self::Constraint, Self::UndeclaredTool];
+
+    /// The `kind` label of `ignis_tool_call_violations_total`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Type => "type",
+            Self::Enum => "enum",
+            Self::UnknownParameter => "unknown_parameter",
+            Self::Constraint => "constraint",
+            Self::UndeclaredTool => "undeclared_tool",
+        }
+    }
 }
 
 impl ToolSchemas {
@@ -199,6 +335,9 @@ pub struct ToolCallScanner {
     hold: String,
     next_index: usize,
     schemas: ToolSchemas,
+    /// Where each closed block is checked and counted: only a scanner that
+    /// delivers a response's calls has one.
+    check: Option<CallCheck>,
     /// The scan ends at its first call's close (`parallel_tool_calls:
     /// false`).
     ends_at_first_call: bool,
@@ -224,6 +363,7 @@ impl ToolCallScanner {
             hold: String::new(),
             next_index: 0,
             schemas,
+            check: None,
             ends_at_first_call: false,
         }
     }
@@ -244,6 +384,14 @@ impl ToolCallScanner {
     /// generation there.
     pub fn ended(&self) -> bool {
         matches!(self.state, State::Ended)
+    }
+
+    /// Check every call block this scanner closes by `check` (GitHub #608):
+    /// what a response's own scanner does, never a copy of it (the
+    /// first-token probe of #518) or a history's round trip.
+    pub fn checking(mut self, check: Option<CallCheck>) -> Self {
+        self.check = check;
+        self
     }
 
     /// True while a `<tool_call>` has been opened but not yet closed —
@@ -293,7 +441,11 @@ impl ToolCallScanner {
                     };
                     let body: String = self.hold.drain(..idx + CLOSE_TAG.len()).collect();
                     let inner = &body[..body.len() - CLOSE_TAG.len()];
-                    if let Some((name, arguments)) = parse_function_block(inner, &self.schemas) {
+                    let parsed = parse_function_block(inner, &self.schemas);
+                    if let Some(check) = &self.check {
+                        check.count(parsed.as_ref().map(|(name, arguments)| (name.as_str(), arguments.as_str())));
+                    }
+                    if let Some((name, arguments)) = parsed {
                         let index = self.next_index;
                         self.next_index += 1;
                         out.push(ToolEvent::Call(ToolCall {
@@ -304,8 +456,8 @@ impl ToolCallScanner {
                         }));
                     }
                     // A closed block that does not parse as a well-formed
-                    // `<function=...>` is dropped silently — same
-                    // never-leak-garbage rule as an interrupted one.
+                    // `<function=...>` is dropped — same never-leak-garbage
+                    // rule as an interrupted one — and counted `dropped`.
                     self.state = State::Scanning;
                     if self.ends_at_first_call {
                         self.state = State::Ended;
@@ -781,6 +933,90 @@ mod tests {
             args(calls(&events)[0]),
             serde_json::json!({"path": "a.txt", "content": "hello"})
         );
+    }
+
+    /// The tools of the call-check tests (#608): a closed `edit` with a
+    /// required path, an integer line and an enum mode, and a `note` with no
+    /// properties at all.
+    fn checked_tools() -> Vec<JsonValue> {
+        serde_json::from_value(serde_json::json!([
+            {"type": "function", "function": {"name": "edit", "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "pattern": "^[^ ]+$"},
+                    "line": {"type": "integer"},
+                    "mode": {"type": "string", "enum": ["replace", "append"]}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }}},
+            {"type": "function", "function": {"name": "note", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "ping"}}
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_call_check_names_each_kind_of_violation() {
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let check = CallCheck::new(&checked_tools(), Some(&metrics)).unwrap();
+        let invalid = |kinds: &[CallViolation]| CallVerdict::Invalid(kinds.to_vec());
+        assert_eq!(check.verdict("edit", r#"{"path":"a.txt","line":3,"mode":"append"}"#), CallVerdict::Valid);
+        assert_eq!(check.verdict("edit", r#"{"line":3}"#), invalid(&[CallViolation::Missing]));
+        assert_eq!(check.verdict("edit", r#"{"path":"a.txt","line":"three"}"#), invalid(&[CallViolation::Type]));
+        assert_eq!(check.verdict("edit", r#"{"path":"a.txt","mode":"Replace"}"#), invalid(&[CallViolation::Enum]));
+        assert_eq!(check.verdict("edit", r#"{"path":"a.txt","force":true}"#), invalid(&[CallViolation::UnknownParameter]));
+        assert_eq!(check.verdict("edit", r#"{"path":"a b"}"#), invalid(&[CallViolation::Constraint]));
+        assert_eq!(
+            check.verdict("edit", r#"{"file":"a.txt","line":1.5}"#),
+            invalid(&[CallViolation::Missing, CallViolation::Type, CallViolation::UnknownParameter])
+        );
+        assert_eq!(check.verdict("search", r#"{"path":"a.txt"}"#), invalid(&[CallViolation::UndeclaredTool]));
+        // A tool without properties, or without parameters, is declared, and
+        // its open object admits any parameter.
+        assert_eq!(check.verdict("note", r#"{"text":"hi"}"#), CallVerdict::Valid);
+        assert_eq!(check.verdict("ping", r#"{"anything":[1]}"#), CallVerdict::Valid);
+        // `tool_choice: "none"` declares nothing.
+        let none = CallCheck::new(&[], Some(&metrics)).unwrap();
+        assert_eq!(none.verdict("edit", r#"{"path":"a.txt"}"#), invalid(&[CallViolation::UndeclaredTool]));
+        assert!(CallCheck::new(&checked_tools(), None).is_none(), "no metrics, no check");
+    }
+
+    #[test]
+    fn a_checking_scanner_counts_every_block_it_closes_and_emits_what_it_did() {
+        let chunks = [
+            "before <tool_call>\n<function=edit>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=edit>\n<parameter=line>\nten\n</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\nno function here\n</tool_call> between ",
+            "<tool_call>\n<function=search>\n<parameter=q>\nx\n</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=edit>\n<parameter=path>\nb.txt\n</paramet",
+        ];
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let tools = checked_tools();
+        let mut checked = ToolCallScanner::with_schemas(ToolSchemas::from_tools(&tools)).checking(CallCheck::new(&tools, Some(&metrics)));
+        let mut plain = ToolCallScanner::with_schemas(ToolSchemas::from_tools(&tools));
+        let (mut with, mut without) = (Vec::new(), Vec::new());
+        for chunk in chunks {
+            with.extend(checked.feed(chunk));
+            without.extend(plain.feed(chunk));
+        }
+        with.extend(checked.finish());
+        without.extend(plain.finish());
+        assert_eq!(with, without, "the check changes nothing the scanner emits");
+        assert_eq!(calls(&with).len(), 3);
+        let text = metrics.render();
+        for line in [
+            "ignis_tool_calls_total{outcome=\"valid\"} 1",
+            "ignis_tool_calls_total{outcome=\"invalid\"} 2",
+            // The block left open at the end is a cut, not a dropped block.
+            "ignis_tool_calls_total{outcome=\"dropped\"} 1",
+            "ignis_tool_call_violations_total{kind=\"missing\"} 1",
+            "ignis_tool_call_violations_total{kind=\"type\"} 1",
+            "ignis_tool_call_violations_total{kind=\"undeclared_tool\"} 1",
+            "ignis_tool_call_violations_total{kind=\"enum\"} 0",
+        ] {
+            assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
+        }
     }
 
     #[test]

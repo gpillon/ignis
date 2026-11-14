@@ -61,7 +61,7 @@ use crate::template::{
 use crate::thinking::{
     self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields,
 };
-use crate::toolcall::{ToolCall as ScannedToolCall, ToolCallScanner, ToolEvent, ToolSchemas};
+use crate::toolcall::{CallCheck, ToolCall as ScannedToolCall, ToolCallScanner, ToolEvent, ToolSchemas};
 
 /// The request body limit of a `--vision-enabled` load, in bytes (the reference's
 /// `--max-request-mib` default). It is this size because it is the media
@@ -1496,6 +1496,29 @@ pub(crate) fn resolve_tools(
     Ok((tools, choice))
 }
 
+/// Count the request's strict tools whose `parameters` lie outside OpenAI's
+/// strict subset (GitHub #608, ADR 0094), the schemas structured output's
+/// grammar refuses under `strict` (a refusal is kept with the grammars, so a
+/// schema sent every turn is read once). Nothing about the request changes:
+/// the tool is served as any other. Only a model that holds answers to a
+/// grammar has the subset to read them by; Flash-Next's are not counted.
+pub(crate) fn count_strict_tools(server: &Server, tools: &[JsonValue]) {
+    let Some(metrics) = &server.metrics else { return };
+    let strict = |tool: &&JsonValue| tool["function"]["strict"] == JsonValue::Bool(true);
+    if !tools.iter().any(|tool| strict(&tool)) {
+        return;
+    }
+    let Some(grammars) = server.active().template.grammars() else { return };
+    let outside = tools
+        .iter()
+        .filter(strict)
+        .filter(|tool| grammars.json_schema(&tool["function"]["parameters"].to_string(), true).is_err())
+        .count();
+    if outside > 0 {
+        metrics.record_strict_tools_outside_subset(outside as u64);
+    }
+}
+
 /// The opening `"required"` forces (spec server/11): the call and its
 /// function tag up to the name. It stops before the `=`, which this
 /// tokenizer merges into the name's first token (`=read`, `=get`): a step
@@ -1965,15 +1988,17 @@ pub(crate) fn split_reasoning(
 /// non-streaming path parses tool calls with exactly the same rules as the
 /// streaming path (a call left open by a truncated generation is dropped,
 /// never returned half-written — acceptance criterion 3). Arguments are
-/// typed by the request's `tools` (`schemas`).
+/// typed by the request's `tools` (`schemas`), and each call block is
+/// checked and counted by `check` (GitHub #608).
 fn split_reasoning_and_tools(
     template: &dyn TemplateProvider,
     tokens: &[ignis_core::TokenId],
     thinking: &ThinkingOptions,
     schemas: ToolSchemas,
+    check: Option<CallCheck>,
 ) -> (Option<String>, String, Vec<ScannedToolCall>) {
     let (reasoning, content_text) = split_reasoning(template, tokens, thinking);
-    let mut scanner = ToolCallScanner::with_schemas(schemas);
+    let mut scanner = ToolCallScanner::with_schemas(schemas).checking(check);
     let mut events = scanner.feed(&content_text);
     events.extend(scanner.finish());
     let mut content = String::new();
@@ -2950,6 +2975,7 @@ async fn chat_completions(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
+    count_strict_tools(&server, &tools);
     let cap_field = match req.max_completion_tokens {
         Some(_) => "max_completion_tokens",
         None => "max_tokens",
@@ -2979,6 +3005,9 @@ async fn chat_completions(
         Err(message) => return bad_request(&message),
     };
     let schemas = ToolSchemas::from_tools(&tools);
+    // The pipeline that delivers the response checks its calls (#608); the
+    // first-token probe's copy below does not.
+    let check = CallCheck::new(&tools, server.metrics.as_ref());
     let (mut input, model, prompt_tokens, media) =
         match prepare_request(&server, model, &req.messages, params, &thinking, &tools, description.as_deref()).await {
             Ok(prepared) => prepared,
@@ -3043,6 +3072,7 @@ async fn chat_completions(
                 schemas,
                 stop,
             )
+            .checking(check)
             .ending_at_first_call(one_call),
             prompt_tokens,
             include_usage,
@@ -3067,6 +3097,7 @@ async fn chat_completions(
             schemas,
             stop,
         )
+        .checking(check)
         .ending_at_first_call(one_call);
         let answer = match collect_answer(&mut stream, live.request_timeout, pipeline).await {
             Ok(answer) => {
@@ -3122,7 +3153,7 @@ async fn chat_completions(
         },
     };
     let (reasoning_content, content, tool_calls) =
-        split_reasoning_and_tools(loaded.template.as_ref(), &tokens, &thinking, schemas);
+        split_reasoning_and_tools(loaded.template.as_ref(), &tokens, &thinking, schemas, check);
     let completion_tokens = tokens.len() as u32;
     let finish_reason = match reason {
         Some(reason) => resolve_finish_reason(reason, !tool_calls.is_empty(), false),
@@ -3401,6 +3432,14 @@ impl AnswerPipeline {
             stop: (!stop.is_empty()).then(|| crate::stop::StopMatcher::new(stop)),
             consumed: 0,
         }
+    }
+
+    /// Check and count every call block the scanner closes (GitHub #608):
+    /// the pipeline that delivers the response does, the first-token probe's
+    /// copy never.
+    fn checking(mut self, check: Option<CallCheck>) -> Self {
+        self.scanner = std::mem::take(&mut self.scanner).checking(check);
+        self
     }
 
     /// The turn ends at the close of its first call when `on`

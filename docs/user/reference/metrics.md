@@ -89,5 +89,8 @@ The metrics listener (on by default, keyless, on loopback) serves these in the P
 | `ignis_structured_requests_total` | counter | Completed requests held to a grammar, by the response_format type. | once a request held to a grammar (`response_format`) has ended |
 | `ignis_thinking_forced_closes_total` | counter | Completed requests whose reasoning block the thinking budget closed. | once the thinking budget has closed a reasoning block |
 | `ignis_tokenize_requests_total` | counter | Calls to the counting routes, which never enter the scheduler, by route. | after the first call to a counting route |
+| `ignis_tool_call_violations_total` | counter | Invalid tool calls by kind of violation, a call once under each kind it has. | once the model wrote a tool call, or a strict tool came outside the strict subset |
+| `ignis_tool_calls_total` | counter | Tool call blocks read from the model's output, checked against the tool's parameters: valid, invalid (a violation, or a tool the request did not declare), or dropped (a closed block that did not parse). | once the model wrote a tool call, or a strict tool came outside the strict subset |
+| `ignis_tool_strict_outside_subset_total` | counter | Strict tools (strict: true) whose parameters lie outside OpenAI's strict subset, once per request that sends one; served as any other tool. | once the model wrote a tool call, or a strict tool came outside the strict subset |
 | `ignis_vram_budget_bytes` | gauge | The device budget the plan was laid out inside. | always |
 | `ignis_vram_reserved_bytes` | gauge | Device bytes this load reserved, by the plan line that reserved them. | always |

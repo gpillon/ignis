@@ -94,4 +94,22 @@ With metrics on (the default; `--server-metrics false` turns them off), the Prom
 rejections, KV pool pages and evictions, the KV-RAM arena, retained slots and
 what reuse held or gave up, the VRAM plan, decoded tokens, forced thinking
 closes, and decision counters with the answer-mass histogram ([ADR 0017](../../adr/0017-prometheus-metrics.md)).
+From 0.11.0, every tool call block the model writes is checked against its
+tool's `parameters` as it closes, on chat completions and on the Responses API
+(HTTP and WebSocket), and counted, while the response stays byte for byte what
+it was: `ignis_tool_calls_total` by outcome (`valid`; `invalid`, arguments that
+break the schema or a call to a tool the request did not declare; `dropped`, a
+closed block that did not parse, which the client never sees),
+`ignis_tool_call_violations_total` by kind (`missing`, `type`, `enum`,
+`unknown_parameter` where the schema closes its object with
+`additionalProperties: false`, `constraint` for a pattern, a format, a bound, a
+length or a count, and `undeclared_tool`; a call counts once under each kind it
+has), and `ignis_tool_strict_outside_subset_total`, the strict tools
+(`strict: true`) whose schema lies outside OpenAI's strict subset, once per
+request that sends one and served as any other tool (read on a model that
+serves structured output, so not on Flash-Next). A call still open when
+generation ends is not counted: its `finish_reason` says it was cut. The
+family appears with the first call block or such a strict tool, and the check
+runs only with metrics on.
+
 The Playground's **Monitor** tab scrapes the same exposition. It scrapes every 2-5 s while the tab is visible and stops while the tab is hidden (so a tab left open does not keep a scale-to-zero deployment awake), scraping again when the tab shows.

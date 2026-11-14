@@ -1326,7 +1326,8 @@ thinking off and right after the reasoning block with it on; the thinking
 budget's forced close is the same shape.
 
 **Grammar**:
-The shape a caller gives a whole answer, as rules that say which continuations
+The shape a caller gives a whole answer, or a **held tool**'s call
+arguments, as rules that say which continuations
 of what has been written so far are valid. The third kind of **constrained
 decode**, beside a **schedule** and a **forced literal**, and the only one that
 depends on what the model wrote: it checks each sampled token instead of
@@ -1345,6 +1346,18 @@ _Avoid_: retry, resample
 An answer a **grammar** holds to valid JSON, or to a JSON schema the caller
 sent. OpenAI's name, kept because the field is OpenAI's.
 _Avoid_: JSON mode, guided decoding
+
+**Held tool**:
+A function tool whose calls' arguments a **grammar** holds to its parameters,
+in whatever order the model writes them: a **strict tool**, or a tool whose
+schema the server normalized into strict form.
+_Avoid_: constrained tool call, guided tool call
+
+**Strict tool**:
+A **held tool** a request sends with `strict: true`, whose schema must lie in
+OpenAI's strict subset or the request is refused. OpenAI's name, kept because
+the field is OpenAI's.
+_Avoid_: strict function calling
 
 **Answer mass**:
 How much of the whole next-token distribution the answer tokens hold,
