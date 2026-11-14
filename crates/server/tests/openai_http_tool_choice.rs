@@ -520,3 +520,36 @@ async fn the_responses_api_forces_required_and_refuses_what_chat_refuses() {
     let unknown = response_request(json!({ "type": "function", "name": "write_file" }));
     assert_eq!(refused(&app, "/v1/responses", unknown).await["param"], "tool_choice");
 }
+
+/// GitHub #609: `tool_choice: "required"` with `parallel_tool_calls: false`
+/// is exactly one call, on chat completions and on the Responses API: the
+/// forced opening opens it, and its close ends the turn before the second
+/// call the model goes on to write, which `true` serves.
+#[tokio::test]
+async fn required_with_parallel_tool_calls_false_is_exactly_one_call() {
+    let forced = tokens(REQUIRED_OPENER);
+    let script = [(forced, "=list_dir>\n</function>\n</tool_call>"), (forced + 1, "\n<tool_call>\n<function=read_file>\n</function>\n</tool_call>")];
+    for (parallel, calls) in [(false, 1), (true, 2)] {
+        let (router, _) = app(&script, Some(forced + 2));
+        let mut request = chat(json!("required"), false, false);
+        request["parallel_tool_calls"] = json!(parallel);
+        let (status, body) = post(&router, "/v1/chat/completions", request).await;
+        assert_eq!(status, 200, "{body}");
+        let v: JsonValue = serde_json::from_str(&body).unwrap();
+        let made = v["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(made.len(), calls, "parallel {parallel}: {body}");
+        assert_eq!(made[0]["function"]["name"], "list_dir");
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+
+        let (router, _) = app(&script, Some(forced + 2));
+        let mut request = response_request(json!("required"));
+        request["parallel_tool_calls"] = json!(parallel);
+        let (status, body) = post(&router, "/v1/responses", request).await;
+        assert_eq!(status, 200, "{body}");
+        let v: JsonValue = serde_json::from_str(&body).unwrap();
+        let made: Vec<&JsonValue> = v["output"].as_array().unwrap().iter().filter(|i| i["type"] == "function_call").collect();
+        assert_eq!(made.len(), calls, "parallel {parallel}: {body}");
+        assert_eq!(made[0]["name"], "list_dir");
+        assert_eq!(v["status"], "completed");
+    }
+}

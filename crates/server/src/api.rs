@@ -2796,6 +2796,12 @@ struct ChatCompletionsRequest {
     /// force the call's opening (GitHub #286): from the first token with
     /// thinking off, right after the reasoning block with it on.
     tool_choice: Option<JsonValue>,
+    /// `false` ends the turn at the close of its first tool call, so it makes
+    /// at most one, with `finish_reason: "tool_calls"` (GitHub #609); `true`,
+    /// `null` or absent serves every call the model writes. A call written
+    /// in the reasoning is not a call, and ends nothing.
+    #[schema(value_type = Option<bool>)]
+    parallel_tool_calls: Option<JsonValue>,
     /// Structured output (GitHub #587, #588, spec #287):
     /// `{"type": "json_object"}` holds the answer to a valid JSON object and
     /// `{"type": "json_schema", "json_schema": {...}}` to the caller's
@@ -2851,7 +2857,7 @@ struct StreamOptions {
 
 Every request has a deadline from its admission (ADR 0058): `--server-request-timeout` answered whole, `--server-stream-timeout` streamed, `0` for none. Past it the request is cancelled and, under `--server-timeout-reply partial` (the default), answered with what it generated as a completion a length limit cut: `finish_reason: \"length\"`, `usage` counting it, a tool call cut mid-way dropped, and answered whole the header `ignis-stopped-by: request_timeout`; streamed, the `length` finish chunk, the usage chunk when asked for, then `[DONE]`. Under `error` the answer is a `504 request_timeout`, and a stream ends with one `{\"error\": ...}` chunk (type and code `request_timeout`) and then `[DONE]`, as for an engine error.
 
-Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text. `tool_choice` takes `\"auto\"` (the default), `\"none\"`, `\"required\"` and a named function. The last two force the call's opening -- `<tool_call>` and the function tag, with the name when one is named -- and the model writes the rest: with thinking off the opening is the first thing generated, with thinking on the first thing after the reasoning block closes. A forced call that never closes is dropped like any other, and `finish_reason` says why.
+Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text. `tool_choice` takes `\"auto\"` (the default), `\"none\"`, `\"required\"` and a named function. The last two force the call's opening -- `<tool_call>` and the function tag, with the name when one is named -- and the model writes the rest: with thinking off the opening is the first thing generated, with thinking on the first thing after the reasoning block closes. A forced call that never closes is dropped like any other, and `finish_reason` says why. `parallel_tool_calls: false` ends the turn at the close of its first call, so it makes at most one, with `finish_reason: \"tool_calls\"`: nothing generated after that close is read or counted, and a call written in the reasoning ends nothing. `true` or absent serves every call the model writes.
 
 `response_format: {\"type\": \"json_object\"}` holds the answer to a valid JSON object, streamed or not: each sampled token is checked against the grammar before the model consumes it, and a miss is repaired from the same scores restricted to the tokens that keep the object valid. With thinking on the reasoning stays free and the answer is held from the token after its `</think>`. Whitespace runs are bounded, the prompt need not mention JSON, a cut by `max_tokens` returns the object as generated with `finish_reason: \"length\"`, and `message.refusal` is always null. `{\"type\": \"json_schema\", \"json_schema\": {\"name\", \"schema\", \"strict\"}}` holds it to the schema the same way: under `strict: true` OpenAI's strict subset, all of it enforced, keys in the schema's order; without it what can be enforced is and the rest is inert. A schema already seen is not compiled again. The schema is described to the model in a block after the conversation, where the assistant's turn opens, before any reasoning: the format's `description`, then `Respond with a JSON object that matches this JSON schema:` and the schema, compact. `ignis_describe_schema: false` (an ignis extension; absent or `null` takes `--model-describe-schema`, on by default) leaves the prompt as sent; `json_object` adds nothing. The next turn resumes from where this turn's conversation ended. `{\"type\": \"text\"}` is a free answer. Beside `tools` each turn either calls a tool or answers under the grammar: until the answer starts the grammar also admits `<tool_call>`, and a turn that opens a call is released from it for that turn, its call written and parsed as any other; `tool_choice: \"required\"` or a named function forces the call, and that turn is not held, nor told the schema.
 
@@ -2909,6 +2915,10 @@ async fn chat_completions(
     let stop = match crate::stop::parse_stop(req.stop.as_ref()) {
         Ok(stop) => stop,
         Err(message) => return bad_request_param(&message, "stop"),
+    };
+    let one_call = match optional_bool(req.parallel_tool_calls.as_ref(), "parallel_tool_calls") {
+        Ok(parallel) => parallel == Some(false),
+        Err(message) => return bad_request_param(&message, "parallel_tool_calls"),
     };
     let thinking = match resolve_thinking(
         &server,
@@ -2994,7 +3004,8 @@ async fn chat_completions(
             OutputDecoder::new(loaded.template.token_decoder(), starts_in_reasoning),
             schemas.clone(),
             stop.clone(),
-        );
+        )
+        .ending_at_first_call(one_call);
         Box::new(move |token| {
             probe.push(&[token]);
             probe.fired()
@@ -3031,7 +3042,8 @@ async fn chat_completions(
                 OutputDecoder::new(loaded.template.token_decoder(), starts_in_reasoning),
                 schemas,
                 stop,
-            ),
+            )
+            .ending_at_first_call(one_call),
             prompt_tokens,
             include_usage,
             StreamDeadline::after(Timeout::of(&live, true), running, live.timeout_reply),
@@ -3044,16 +3056,18 @@ async fn chat_completions(
     // and on `/v1/responses`. Left running it holds its lane to `max_tokens`,
     // and with one lane the client's retry meets `engine_full`.
     let mut cancel = CancelOnDrop::following(engine.clone(), running.clone());
-    if !stop.is_empty() {
-        // Non-streaming with `stop`: the tokens go through the streaming
-        // path's pipeline as they arrive, so the request ends at the token
-        // that completed a sequence instead of generating the tail nobody
+    if !stop.is_empty() || one_call {
+        // Non-streaming with `stop`, or with `parallel_tool_calls: false`:
+        // the tokens go through the streaming path's pipeline as they
+        // arrive, so the request ends at the token that completed a sequence
+        // or closed the turn's call instead of generating the tail nobody
         // will read.
         let pipeline = AnswerPipeline::new(
             OutputDecoder::new(loaded.template.token_decoder(), starts_in_reasoning),
             schemas,
             stop,
-        );
+        )
+        .ending_at_first_call(one_call);
         let answer = match collect_answer(&mut stream, live.request_timeout, pipeline).await {
             Ok(answer) => {
                 match answer.ending {
@@ -3211,12 +3225,14 @@ fn completion_body(
     .into_response()
 }
 
-/// How a non-streaming answer with `stop` ended.
+/// How a non-streaming answer with `stop`, or with `parallel_tool_calls:
+/// false`, ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AnswerEnding {
     /// The engine finished the request.
     Done(FinishReason),
-    /// A stop sequence matched, and the request was stopped there.
+    /// A stop sequence matched, or the turn's one call closed, and the
+    /// request was stopped there.
     Stopped,
     /// Its deadline passed, and the request was cancelled (ADR 0058).
     DeadlinePassed,
@@ -3250,12 +3266,14 @@ impl Answer {
     }
 }
 
-/// Drive a request with `stop` to its answer: each token through `pipeline`
-/// as it arrives, until the engine finishes the request or a stop sequence
-/// matches — then nothing past that token is read, and the caller stops the
-/// engine request at it ([`AnswerEnding::Stopped`]). Bounded by `timeout`,
-/// as [`collect_completion`] is: past it, what the answer had become, for
-/// the caller to cancel the request and finish it ([`CutAnswer`]).
+/// Drive a request with `stop`, or with `parallel_tool_calls: false`, to its
+/// answer: each token through `pipeline` as it arrives, until the engine
+/// finishes the request or the pipeline fires (a stop sequence matches, or
+/// the turn's one call closes) — then nothing past that token is read, and
+/// the caller stops the engine request at it ([`AnswerEnding::Stopped`]).
+/// Bounded by `timeout`, as [`collect_completion`] is: past it, what the
+/// answer had become, for the caller to cancel the request and finish it
+/// ([`CutAnswer`]).
 async fn collect_answer(
     stream: &mut EventStream,
     timeout: std::time::Duration,
@@ -3370,7 +3388,8 @@ struct AnswerPipeline {
     scanner: ToolCallScanner,
     stop: Option<crate::stop::StopMatcher>,
     /// Tokens fed so far: up to and including the one that completed a stop
-    /// sequence, which is the answer's `completion_tokens`.
+    /// sequence, or closed the turn's one call, which is the answer's
+    /// `completion_tokens`.
     consumed: u32,
 }
 
@@ -3384,8 +3403,21 @@ impl AnswerPipeline {
         }
     }
 
-    /// Whether a stop sequence matched: nothing more is read.
+    /// The turn ends at the close of its first call when `on`
+    /// (`parallel_tool_calls: false`, GitHub #609): the scanner decides
+    /// where that is ([`ToolCallScanner::ending_at_first_call`]).
+    fn ending_at_first_call(self, on: bool) -> Self {
+        Self { scanner: self.scanner.ending_at_first_call(on), ..self }
+    }
+
+    /// Whether the answer ended here: a stop sequence matched, or the turn's
+    /// one call closed. Nothing more is read, and the request is stopped.
     fn fired(&self) -> bool {
+        self.stop_matched() || self.scanner.ended()
+    }
+
+    /// Whether a stop sequence matched.
+    fn stop_matched(&self) -> bool {
         self.stop.as_ref().is_some_and(crate::stop::StopMatcher::fired)
     }
 
@@ -3460,7 +3492,9 @@ impl AnswerPipeline {
     }
 
     fn route_tool_event(&mut self, event: ToolEvent, pieces: &mut Vec<Piece>) {
-        if self.fired() {
+        // A stop sequence swallows what follows it; the call that ended the
+        // scan is its feed's last event, and is delivered.
+        if self.stop_matched() {
             return;
         }
         match (event, self.stop.as_mut()) {
@@ -3773,9 +3807,11 @@ impl CancelOnDrop {
         self.completed = true;
     }
 
-    /// A stop sequence ended the request after `tokens` generated tokens
-    /// ([`Engine::stop`]): it is released now, and reported done.
-    fn stop(&mut self, tokens: u32) {
+    /// A stop sequence, or the close of the turn's one call
+    /// (`parallel_tool_calls: false`), ended the request after `tokens`
+    /// generated tokens ([`Engine::stop`]): it is released now, and reported
+    /// done.
+    pub(crate) fn stop(&mut self, tokens: u32) {
         self.engine.stop(self.request.get(), tokens);
         self.completed = true;
     }
@@ -4019,9 +4055,10 @@ impl Stream for ChunkStream {
                         this.held = drain_tokens(&mut this.stream, &mut run);
                         let pieces = this.pipeline.push(&run);
                         this.queue_pieces(pieces);
-                        // A stop sequence matched in this run: the request
-                        // ends at that token, `stop`, as the model's own
-                        // end would (spec server/09).
+                        // A stop sequence matched in this run, or the
+                        // turn's one call closed: the request ends at that
+                        // token, `stop` (`tool_calls` after a call), as the
+                        // model's own end would (spec server/09).
                         if this.pipeline.fired() {
                             let tokens = this.pipeline.consumed();
                             this.cancel.stop(tokens);

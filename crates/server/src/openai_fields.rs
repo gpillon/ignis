@@ -12,8 +12,8 @@
 //! field outside the table stays ignored, as serde's default has it, because
 //! refusing the open-ended side would turn every field a gateway or a new
 //! SDK adds into an outage. Fields a handler already reads (`stop`,
-//! `max_completion_tokens`, `tools`, the thinking controls, ...) are not
-//! here: their parse is theirs.
+//! `max_completion_tokens`, `tools`, `parallel_tool_calls`, the thinking
+//! controls, ...) are not here: their parse is theirs.
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -81,10 +81,6 @@ fn null_or_false(value: &JsonValue) -> bool {
     value.is_null() || value == &JsonValue::Bool(false)
 }
 
-fn null_or_true(value: &JsonValue) -> bool {
-    value.is_null() || value == &JsonValue::Bool(true)
-}
-
 fn null_or_empty_object(value: &JsonValue) -> bool {
     value.is_null() || value.as_object().is_some_and(Map::is_empty)
 }
@@ -138,12 +134,6 @@ pub const CHAT: &[FieldRule] = &[
         inert: null_or_empty_object,
         inert_when: "`{}`",
         refusal: Some("logit bias is not served; send {} or omit it (GitHub #288)"),
-    },
-    FieldRule {
-        name: "parallel_tool_calls",
-        inert: null_or_true,
-        inert_when: "`true`",
-        refusal: Some("this template emits each tool call as it closes and cannot hold the model to one; send true or omit it"),
     },
     FieldRule {
         name: "store",
@@ -228,16 +218,15 @@ pub const CHAT: &[FieldRule] = &[
 
 /// The Responses body's fields past what the handler reads. Hosted `tools`,
 /// `background` and `previous_response_id` are refused where
-/// they are read (`responses::input`).
+/// they are read (`responses::input`), and `parallel_tool_calls` is honoured
+/// there (GitHub #609).
 ///
-/// `parallel_tool_calls`, `store` and `service_tier` are inert at every
-/// value here, unlike on chat (spec server/09 acceptance 2 — a value a real
-/// client sends is inert): Codex sends `parallel_tool_calls: false` and
-/// `store: false`, its flex and fast modes send `service_tier: "flex"` and
-/// `"priority"`, and the Responses default of `store` is `true`.
-/// `parallel_tool_calls` and `store` are echoed on the response.
+/// `store` and `service_tier` are inert at every value here, unlike on chat
+/// (spec server/09 acceptance 2 — a value a real client sends is inert): an
+/// agent CLI sends `store: false`, its flex and fast modes send
+/// `service_tier: "flex"` and `"priority"`, and the Responses default of
+/// `store` is `true`. `store` is echoed on the response.
 pub const RESPONSES: &[FieldRule] = &[
-    FieldRule { name: "parallel_tool_calls", inert: always, inert_when: ALWAYS, refusal: None },
     FieldRule { name: "store", inert: always, inert_when: ALWAYS, refusal: None },
     FieldRule { name: "service_tier", inert: always, inert_when: ALWAYS, refusal: None },
     FieldRule {
@@ -475,8 +464,6 @@ mod tests {
 
     #[test]
     fn the_defaults_an_sdk_fills_in_are_inert() {
-        accepted(Surface::Chat, "parallel_tool_calls", &[json!(null), json!(true)]);
-        refused(Surface::Chat, "parallel_tool_calls", &[json!(false)], "as it closes");
         accepted(Surface::Chat, "store", &[json!(null), json!(false)]);
         refused(Surface::Chat, "store", &[json!(true)], "stores no completions");
         accepted(Surface::Chat, "service_tier", &[json!(null), json!("auto"), json!("default")]);
@@ -510,6 +497,18 @@ mod tests {
         }
     }
 
+    /// GitHub #609: `parallel_tool_calls` is honoured by both handlers, so
+    /// neither table classifies it, and the document lists it as neither
+    /// inert nor refused.
+    #[test]
+    fn parallel_tool_calls_is_the_handlers_to_read_on_both_surfaces() {
+        for surface in [Surface::Chat, Surface::Responses] {
+            assert!(table(surface).iter().all(|rule| rule.name != "parallel_tool_calls"), "{surface:?}");
+            accepted(surface, "parallel_tool_calls", &[json!(false), json!(true), json!(null)]);
+            assert!(!describe(surface).contains("parallel_tool_calls"), "{surface:?}");
+        }
+    }
+
     #[test]
     fn a_field_outside_the_table_is_ignored() {
         assert_eq!(check(&body(json!({ "some_future_field": { "x": 1 } })), Surface::Chat), Ok(()));
@@ -517,7 +516,6 @@ mod tests {
 
     #[test]
     fn responses_takes_what_codex_sends() {
-        accepted(Surface::Responses, "parallel_tool_calls", &[json!(false), json!(true)]);
         accepted(Surface::Responses, "store", &[json!(false), json!(true)]);
         accepted(Surface::Responses, "prompt_cache_key", &[json!("thread-1")]);
         accepted(Surface::Responses, "client_metadata", &[json!({ "a": "b" })]);
