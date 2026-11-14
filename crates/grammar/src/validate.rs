@@ -751,8 +751,10 @@ mod formats {
         true
     }
 
-    /// RFC 5321 `Mailbox`: a dot-string or quoted-string local part, `@`,
-    /// and a domain or an address literal.
+    /// RFC 5321 `Mailbox`: a local part, `@`, and a domain or an address
+    /// literal. The local part is a quoted string, or `atext` and dots with
+    /// the dot-string's placement left free (`.a`, `a..b`): what the grammar
+    /// writes for `email`, which this validator must admit whole.
     fn email(s: &str) -> bool {
         let Some((local, domain)) = s.rsplit_once('@') else { return false };
         let atext = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-/=?^_`{|}~".contains(c);
@@ -768,7 +770,7 @@ mod formats {
             }
             ok
         } else {
-            !local.is_empty() && local.split('.').all(|atom| !atom.is_empty() && atom.chars().all(atext))
+            !local.is_empty() && local.chars().all(|c| c == '.' || atext(c))
         };
         let domain_ok = match domain.strip_prefix('[').and_then(|d| d.strip_suffix(']')) {
             Some(literal) => match literal.strip_prefix("IPv6:") {
@@ -906,11 +908,60 @@ mod tests {
         assert!(!is_valid(&Json::parse(r#"{"pattern":"^a"}"#).unwrap(), &Json::parse("\"xyz\"").unwrap()));
     }
 
+    /// The oracle admits everything the grammar writes (what the property
+    /// tests of #611 and #612 build on): the documents of random walks over
+    /// grammars of every format and of the keywords the strict subset holds,
+    /// each valid here.
+    #[test]
+    fn every_document_the_grammar_writes_is_valid_here() {
+        use crate::{random_document, Grammar, Vocab, VocabEntry};
+        let vocab = Vocab::new((0..=255u8).map(|b| VocabEntry::Text(vec![b])).chain([VocabEntry::Control]).collect(), &[256]);
+        let object = |properties: &str| {
+            let names: Vec<String> = Json::parse(properties)
+                .unwrap()
+                .get("x")
+                .map(|_| vec!["\"x\"".to_owned()])
+                .unwrap_or_default();
+            format!(r#"{{"type":"object","properties":{properties},"required":[{}],"additionalProperties":false}}"#, names.join(","))
+        };
+        let mut schemas: Vec<String> = crate::FORMATS
+            .iter()
+            .map(|format| object(&format!(r#"{{"x":{{"type":"string","format":"{format}"}}}}"#)))
+            .collect();
+        schemas.extend([
+            object(r#"{"x":{"type":"string","pattern":"^[a-z]+-[0-9]{3}$"}}"#),
+            object(r#"{"x":{"type":"string","pattern":"b"}}"#),
+            object(r#"{"x":{"type":"number","exclusiveMinimum":0,"exclusiveMaximum":1}}"#),
+            object(r#"{"x":{"type":"number","multipleOf":0.25,"minimum":-3,"maximum":3}}"#),
+            object(r#"{"x":{"type":"integer","multipleOf":5,"minimum":-100}}"#),
+            object(r#"{"x":{"type":["string","null"],"enum":["a","b",null]}}"#),
+            object(r#"{"x":{"anyOf":[{"type":"integer"},{"type":"boolean"},{"type":"null"}]}}"#),
+            object(r#"{"x":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"}},"required":["old","new"],"additionalProperties":false}}}"#),
+            r##"{"type":"object","properties":{"x":{"$ref":"#/$defs/node"}},"required":["x"],"additionalProperties":false,"$defs":{"node":{"type":"object","properties":{"name":{"type":"string"},"children":{"type":"array","items":{"$ref":"#/$defs/node"}}},"required":["name","children"],"additionalProperties":false}}}"##.to_owned(),
+        ]);
+        let mut checked = 0;
+        for schema in &schemas {
+            let grammar = Grammar::json_schema(vocab.clone(), schema, true).unwrap_or_else(|r| panic!("{schema}: {r}"));
+            let parsed = Json::parse(schema).unwrap();
+            for seed in 0..200 {
+                let Some(doc) = random_document(&grammar, seed, 40, 4000).unwrap() else { continue };
+                let text = String::from_utf8(doc).unwrap();
+                let value = Json::parse(&text).unwrap_or_else(|e| panic!("{schema}: {text}: {e}"));
+                let found = violations(&parsed, &value);
+                assert!(found.is_empty(), "the grammar of {schema} wrote {text}, which breaks {found:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 3000, "{checked} documents checked");
+    }
+
     #[test]
     fn the_formats_hold_their_rfcs() {
         let f = |format: &str, s: &str| formats::check(format, s).unwrap();
         assert!(f("email", "\"a b\"@example.com") && f("email", "a@[192.168.0.1]") && f("email", "a@[IPv6:2001:db8::1]"));
-        assert!(!f("email", "a@b@c") && !f("email", ".a@example.com") && !f("email", "a@example.com."));
+        assert!(!f("email", "a@b@c") && !f("email", "a@example.com.") && !f("email", "@example.com"));
+        // The grammar's own email admits dots anywhere in the local part.
+        assert!(f("email", ".a@example.com") && f("email", "a..b.@example.com"));
         assert!(f("ipv6", "1:2:3:4:5:6:1.2.3.4") && f("ipv6", "::1:2:3:4:5:6:7") && !f("ipv6", "1:2::3:4:5:6:7:8"));
         assert!(!f("ipv6", ":1::2") && !f("ipv6", "1::2:") && !f("ipv6", "00000::1") && !f("ipv6", "::1.2.3"));
         assert!(f("duration", "PT0S") && !f("duration", "P1W2D") && !f("duration", "P1D2Y") && !f("duration", "PT1H5S"));
