@@ -29,6 +29,7 @@
 #include "attention_readout.h"
 #include "ignis_dense_prefill.h"
 #include "gdn_prefill.h"
+#include "hq_decode_attention.h"
 #include "layer_internal.h"
 #include "model_internal.h"
 #include "sampled_draft.h"
@@ -1117,6 +1118,9 @@ struct LoadOptions {
   uint32_t vision_residency = IGNIS_VISION_RESIDENCY_DEVICE;
   // GitHub #514: the GDN prefill's route (`gdn_prefill_route`).
   bool gdn_prefill_ours = false;
+  // GitHub #572 (spec #570): what the measurement switch IGNIS_HQ_DECODE_ATTENTION names; the
+  // load decides the route from it and the card (`hq_decode_attention_route`).
+  ignis::hq_decode_attention::Switch hq_decode_attention = ignis::hq_decode_attention::Switch::Unset;
   // GitHub #576 (ADR 0090): the verify round's draft rule (enum
   // ignis_draft_rule) and, under the sampled draft, the drafter's
   // temperature factor and top-p.
@@ -1146,6 +1150,41 @@ bool gdn_prefill_route(bool &ours) {
     set_error(std::string("ignis_model_load: ") + e.what());
     return false;
   }
+  return true;
+}
+
+// GitHub #572 (spec #570): the measurement switch IGNIS_HQ_DECODE_ATTENTION, read once per load
+// beside the GDN prefill's, so a value it does not know refuses the plan and the load by name.
+bool hq_decode_attention_switch(ignis::hq_decode_attention::Switch &named) {
+  try {
+    named = ignis::hq_decode_attention::switch_for_load();
+  } catch (const std::invalid_argument &e) {
+    set_error(std::string("ignis_model_load: ") + e.what());
+    return false;
+  }
+  return true;
+}
+
+// GitHub #572 (spec #570): the attention route of the 27B's decode and verify rounds, decided once
+// per load, after the plan and outside any capture (kernel/src/hq_decode_attention.h): ignis's
+// warp-specialized route over hq-e8-2b on a Blackwell card whose image this binary holds, unless
+// the switch names today's route; today's (the vendored kernel's) everywhere else. False (error
+// set) when the device cannot say its generation.
+bool hq_decode_attention_route(ignis::hq_decode_attention::Switch named, int32_t kv_format, bool &ours) {
+  ours = false;
+  if (kv_format != IGNIS_KV_FORMAT_HQ_E8_2B || named == ignis::hq_decode_attention::Switch::Vendored) {
+    return true;
+  }
+  int device = 0, major = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err == cudaSuccess) err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_model_load: the GPU generation for the decode attention: ") +
+              cudaGetErrorString(err));
+    return false;
+  }
+  const bool image = ignis::hq_decode_attention::runs_on(major) && ignis::hq_decode_attention::image_here();
+  ours = ignis::hq_decode_attention::takes_ours(named, true, major, image);
   return true;
 }
 
@@ -1465,7 +1504,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.draft_rule = draft_rule;
   out.drafter_temperature_factor = drafter_temperature_factor;
   out.drafter_top_p = drafter_top_p;
-  if (!gdn_prefill_route(out.gdn_prefill_ours)) {
+  if (!gdn_prefill_route(out.gdn_prefill_ours) || !hq_decode_attention_switch(out.hq_decode_attention)) {
     return nullptr;
   }
 
@@ -2305,6 +2344,12 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // GitHub #514: the GDN prefill's route, read by every GDN prefill call
   // (kernel/src/gdn_layer.cu).
   model->gdn_prefill_ours = load.gdn_prefill_ours;
+  // GitHub #572 (spec #570): the decode and verify rounds' attention route, read by every call of
+  // the batch body (kernel/src/gqa_layer.cu `run_gqa_layer_batch`) and so baked into every graph
+  // captured after this load.
+  if (!hq_decode_attention_route(load.hq_decode_attention, kv_format, model->hq_decode_attention_ours)) {
+    return -1;
+  }
 
   // GitHub #341: the BF16 exception tensors a load holds in FP8 run on the FP8
   // linear and the W8A8 GEMM (kernel/src/fp8_exception.h), which refuse an
@@ -2612,6 +2657,13 @@ extern "C" uint32_t ignis_model_gdn_prefill(const struct ignis_model *model) {
     return IGNIS_GDN_PREFILL_VENDORED;
   }
   return model->gdn_prefill_ours ? IGNIS_GDN_PREFILL_OURS : IGNIS_GDN_PREFILL_VENDORED;
+}
+
+extern "C" uint32_t ignis_model_hq_decode_attention(const struct ignis_model *model) {
+  if (model == nullptr || model->flash_next) {
+    return IGNIS_HQ_DECODE_ATTENTION_VENDORED;
+  }
+  return model->hq_decode_attention_ours ? IGNIS_HQ_DECODE_ATTENTION_OURS : IGNIS_HQ_DECODE_ATTENTION_VENDORED;
 }
 
 extern "C" void ignis_model_free(struct ignis_model *model) {

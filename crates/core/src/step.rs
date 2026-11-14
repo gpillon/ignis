@@ -126,6 +126,11 @@ pub(crate) mod ffi {
         /// P5-04 (GitHub #153): the same for the verify graphs at the load's
         /// draft window; 0 on a load without one.
         pub verify_graph_ready_mask: u32,
+        /// GitHub #572: entry w-1 the node count of the 27B's decode graph
+        /// and of its verify graph for exact width w; 0 for a width with no
+        /// graph and on Flash-Next.
+        pub decode_graph_nodes: [u32; 8],
+        pub verify_graph_nodes: [u32; 8],
     }
 
     unsafe extern "C" {
@@ -447,6 +452,13 @@ pub struct ProgramStats {
     /// GitHub #153): captured by [`capture_decode_graphs`] on a load with a
     /// window, 0 without one.
     pub verify_graph_ready_mask: u32,
+    /// Entry `w - 1`: the node count of the 27B's decode graph for exact
+    /// batch width `w`, as captured (GitHub #572: a route that takes another's
+    /// place in a round leaves it as it was); 0 for a width with no graph and
+    /// on Flash-Next, which captures its own.
+    pub decode_graph_nodes: [u32; 8],
+    /// The same for the verify graphs.
+    pub verify_graph_nodes: [u32; 8],
 }
 
 /// The result of [`capture_decode_graphs`]: how long capture took and which
@@ -2242,6 +2254,8 @@ pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, Stri
         graph_launches: stats.graph_launches,
         decode_graph_ready_mask: stats.decode_graph_ready_mask,
         verify_graph_ready_mask: stats.verify_graph_ready_mask,
+        decode_graph_nodes: stats.decode_graph_nodes,
+        verify_graph_nodes: stats.verify_graph_nodes,
     })
 }
 

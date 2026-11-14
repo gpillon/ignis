@@ -5,6 +5,7 @@
 // KV append -> attention + sigmoid output gate -> output residual -> MLP tail.
 
 #include "attention_readout.h"
+#include "hq_decode_attention.h"
 #include "ignis_attn_tap.h"
 #include "ignis_gqa_layer.h"
 
@@ -562,10 +563,23 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     }
     ninfer::DeviceArena attention_workspace(attention_workspace_storage);
     ninfer::Tensor attention_heads = attention.view({kHeadDim, kQHeads, lane_tokens, batch});
-    ninfer::ops::gqa_attention(
-        rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns,
-        kv_table_rows, gate.view({kHeadDim, kQHeads, lane_tokens, batch}), attention_scale,
-        batch_cache, envelope, attention_workspace, attention_heads, stream);
+    const ninfer::Tensor gate_heads = gate.view({kHeadDim, kQHeads, lane_tokens, batch});
+    // GitHub #572 (spec #570): on the route the load chose, the same call, the same workspace and
+    // the same bytes out; ignis's route over hq-e8-2b on a Blackwell card. Graph-safe (ADR 0019):
+    // the choice is fixed for the load and the call's shape for the width, so a capture records the
+    // nodes every replay runs.
+    if (model->hq_decode_attention_ours &&
+        ignis::hq_decode_attention::serves(kQHeads, lane_tokens, batch, batch_cache.dtype, envelope)) {
+      ignis::hq_decode_attention::attend(
+          rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns,
+          kv_table_rows, gate_heads, attention_scale, batch_cache, envelope, attention_workspace,
+          attention_heads, stream);
+    } else {
+      ninfer::ops::gqa_attention(
+          rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns,
+          kv_table_rows, gate_heads, attention_scale, batch_cache, envelope, attention_workspace,
+          attention_heads, stream);
+    }
 
     ninfer::Tensor residual(out_residual, ninfer::DType::BF16, {hidden, columns, 1, 1});
     error = cudaMemcpyAsync(out_residual, in_residual,

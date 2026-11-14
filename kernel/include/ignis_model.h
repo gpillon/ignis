@@ -289,6 +289,22 @@ enum ignis_gdn_prefill {
   IGNIS_GDN_PREFILL_OURS = 1,
 };
 
+/* GitHub #572 (spec #570): the attention route of the 27B's decode and verify
+ * rounds over hq-e8-2b, which no load option names: decided once per load
+ * from the card (compute capability major 12, with the route's image in the
+ * binary for the device), unless the measurement switch
+ * IGNIS_HQ_DECODE_ATTENTION (`ours` or `vendored`) names today's route
+ * (kernel/src/hq_decode_attention.h). `ignis_model_hq_decode_attention`
+ * reports it. */
+enum ignis_hq_decode_attention {
+  /* The vendored kernel's small-T route: every card but Blackwell, a BF16
+   * load, Flash-Next, and what IGNIS_HQ_DECODE_ATTENTION=vendored names. */
+  IGNIS_HQ_DECODE_ATTENTION_VENDORED = 0,
+  /* ignis's warp-specialized route (kernel/src/hq_verify_ws.cuh): a Blackwell
+   * card's hq-e8-2b load unless the switch names the other. */
+  IGNIS_HQ_DECODE_ATTENTION_OURS = 1,
+};
+
 /* GitHub #414 (ADR 0075): where a vision load keeps the 27B's vision tower
  * and (GitHub #415) its media embedding pool. The binder places the tower and
  * the load checks it is where this says. */
@@ -654,6 +670,12 @@ int32_t ignis_model_stats(const struct ignis_model *model, struct ignis_model_st
  * also sized its scratch. IGNIS_GDN_PREFILL_VENDORED for NULL and for
  * Flash-Next, whose GDN layers are its own. */
 uint32_t ignis_model_gdn_prefill(const struct ignis_model *model);
+
+/* The attention route a loaded 27B's decode and verify rounds run (enum
+ * ignis_hq_decode_attention; GitHub #572): what the load decided, which every
+ * decode and verify graph captured on it holds. IGNIS_HQ_DECODE_ATTENTION_VENDORED
+ * for NULL and for Flash-Next, whose attention is its own. */
+uint32_t ignis_model_hq_decode_attention(const struct ignis_model *model);
 
 /* GitHub #557: the most merged vision tokens one media item may hold on a
  * loaded model -- what its encoder's share of the scratch was sized for, and

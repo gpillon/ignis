@@ -79,7 +79,10 @@ FP8 kernels and Flash-Next's decode clusters and staged kernel compile for that
 entry alone, and so do three vendored kernels that declare more than 48 KiB of
 static shared memory per block (the W8 linear's small-T and split-K routes, the
 i8 decode attention), on no route the 27B's trellis artifact takes. A launch
-of one on another card fails with CUDA's "no kernel image is available".
+of one on another card fails with CUDA's "no kernel image is available". From
+0.11.0 ignis's attention route of the 27B's decode and verify rounds over
+`hq-e8-2b` compiles for that entry alone too, and a load on another card keeps
+the vendored route ([Context and speculation](../configuration/context-and-speculation.md)).
 Every architecture added costs another device compile of nearly every
 translation unit.
 
