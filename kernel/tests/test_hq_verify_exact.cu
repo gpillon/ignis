@@ -32,7 +32,10 @@
 // the residual window on and off with cleared ring slots, and the fused append
 // (GqaAppendInput) as well as a pre-filled cache (GqaCachedInput). Every byte
 // of the partials must match the reference's, and with the append so must
-// every byte the kernel wrote into the cache.
+// every byte the kernel wrote into the cache, the residual ring's valid marks
+// among them: each route starts from the same marks, with the call's own ring
+// slots cleared as a rollback before the round leaves them, so a route that
+// skips or misplaces a mark differs.
 //
 // The grid is the engine's on every card: (KV heads, split capacity, lanes),
 // the capacity from the visible keys alone (the vendored launch's split
@@ -316,6 +319,20 @@ void run_case(const Case& c, const Rows& rows, const __nv_bfloat16* d_rows) {
             ring[static_cast<std::size_t>(t) * kRingWords + (t % kRingWords)] = 0xF0F0F0F0u;
             ring[static_cast<std::size_t>(t) * kRingWords + ((t + 7) % kRingWords)] &= ~0x1u;
         }
+        // With the append, the ring slots of the call's own columns past the
+        // sinks are cleared too, as a rollback before the round leaves them:
+        // the append marks each row it writes (hq_ring_mark_valid), so those
+        // marks are bytes the route writes.
+        if (c.append) {
+            for (int b = 0; b < lanes; ++b) {
+                for (int j = 0; j < c.tokens; ++j) {
+                    const int key = pos[static_cast<std::size_t>(b) * c.full_width + c.column_begin + j];
+                    if (key < static_cast<int>(kGqaHqSinkKeys)) { continue; }
+                    const int r = key & (static_cast<int>(kGqaHqRecentKeys) - 1);
+                    ring[static_cast<std::size_t>(table_rows[b]) * kRingWords + (r >> 5)] &= ~(1u << (r & 31));
+                }
+            }
+        }
         CUDA_CHECK(cudaMalloc(&kv.ring_valid, ring.size() * 4));
         CUDA_CHECK(cudaMemcpy(kv.ring_valid, ring.data(), ring.size() * 4, cudaMemcpyHostToDevice));
     }
@@ -354,8 +371,13 @@ void run_case(const Case& c, const Rows& rows, const __nv_bfloat16* d_rows) {
     // Snapshot the cache so both routes start from the same bytes.
     const auto codes_k0 = to_host(kv.codes_k, code_bytes), codes_v0 = to_host(kv.codes_v, code_bytes);
     const auto meta_k0 = to_host(kv.meta_k, meta_bytes), meta_v0 = to_host(kv.meta_v, meta_bytes);
-    std::vector<std::uint8_t> side_k0, side_v0;
-    if (c.residual) { side_k0 = to_host(kv.residual_k, side_bytes); side_v0 = to_host(kv.residual_v, side_bytes); }
+    std::vector<std::uint8_t> side_k0, side_v0, ring0;
+    const std::size_t ring_bytes = static_cast<std::size_t>(lanes) * kRingWords * 4;
+    if (c.residual) {
+        side_k0 = to_host(kv.residual_k, side_bytes);
+        side_v0 = to_host(kv.residual_v, side_bytes);
+        ring0   = to_host(kv.ring_valid, ring_bytes);
+    }
     auto restore = [&]() {
         CUDA_CHECK(cudaMemcpy(kv.codes_k, codes_k0.data(), code_bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(kv.codes_v, codes_v0.data(), code_bytes, cudaMemcpyHostToDevice));
@@ -364,13 +386,14 @@ void run_case(const Case& c, const Rows& rows, const __nv_bfloat16* d_rows) {
         if (c.residual) {
             CUDA_CHECK(cudaMemcpy(kv.residual_k, side_k0.data(), side_bytes, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(kv.residual_v, side_v0.data(), side_bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(kv.ring_valid, ring0.data(), ring_bytes, cudaMemcpyHostToDevice));
         }
         CUDA_CHECK(cudaMemset(d_acc, 0xAB, acc_bytes));
         CUDA_CHECK(cudaMemset(d_m, 0xAB, stat_bytes));
         CUDA_CHECK(cudaMemset(d_l, 0xAB, stat_bytes));
     };
     struct Out {
-        std::vector<std::uint8_t> acc, m, l, codes_k, codes_v, meta_k, meta_v, side_k, side_v;
+        std::vector<std::uint8_t> acc, m, l, codes_k, codes_v, meta_k, meta_v, side_k, side_v, ring;
     };
     auto capture = [&]() {
         Out o;
@@ -381,7 +404,11 @@ void run_case(const Case& c, const Rows& rows, const __nv_bfloat16* d_rows) {
         o.codes_v = to_host(kv.codes_v, code_bytes);
         o.meta_k  = to_host(kv.meta_k, meta_bytes);
         o.meta_v  = to_host(kv.meta_v, meta_bytes);
-        if (c.residual) { o.side_k = to_host(kv.residual_k, side_bytes); o.side_v = to_host(kv.residual_v, side_bytes); }
+        if (c.residual) {
+            o.side_k = to_host(kv.residual_k, side_bytes);
+            o.side_v = to_host(kv.residual_v, side_bytes);
+            o.ring   = to_host(kv.ring_valid, ring_bytes);
+        }
         return o;
     };
     auto run = [&](auto route) {
@@ -407,16 +434,18 @@ void run_case(const Case& c, const Rows& rows, const __nv_bfloat16* d_rows) {
         any_mass = v > 0.0f && v < 1e30f;
     }
     const std::size_t appended = differing(codes_k0, ref.codes_k) + differing(codes_v0, ref.codes_v);
+    const std::size_t marked   = differing(ring0, ref.ring);
     check(any_mass, std::string(c.name) + ": the reference route produced no attention mass");
     auto compare = [&](const Out& o, const char* route) {
         const std::size_t d_acc_n = differing(ref.acc, o.acc), d_m_n = differing(ref.m, o.m),
                           d_l_n = differing(ref.l, o.l);
+        const std::size_t d_ring  = differing(ref.ring, o.ring);
         const std::size_t d_cache = differing(ref.codes_k, o.codes_k) + differing(ref.codes_v, o.codes_v) +
                                     differing(ref.meta_k, o.meta_k) + differing(ref.meta_v, o.meta_v) +
-                                    differing(ref.side_k, o.side_k) + differing(ref.side_v, o.side_v);
+                                    differing(ref.side_k, o.side_k) + differing(ref.side_v, o.side_v) + d_ring;
         std::printf("%-44s %-10s partial bytes differing: acc %zu of %zu, m %zu, l %zu; cache bytes "
-                    "differing %zu (append changed %zu code bytes)\n",
-                    c.name, route, d_acc_n, ref.acc.size(), d_m_n, d_l_n, d_cache, appended);
+                    "differing %zu, ring %zu of them (append changed %zu code bytes, %zu ring bytes)\n",
+                    c.name, route, d_acc_n, ref.acc.size(), d_m_n, d_l_n, d_cache, d_ring, appended, marked);
         check(d_acc_n == 0 && d_m_n == 0 && d_l_n == 0,
               std::string(c.name) + ": the " + route + " route's partials differ from the reference route's");
         check(d_cache == 0, std::string(c.name) + ": the " + route +
@@ -425,6 +454,8 @@ void run_case(const Case& c, const Rows& rows, const __nv_bfloat16* d_rows) {
     compare(fast, "throughput");
     if (g_ws12_card) { compare(run(std::integral_constant<Route, Route::ws12>{}), "ws12"); }
     check(!c.append || appended > 0, std::string(c.name) + ": the fused append wrote nothing");
+    check(!(c.append && c.residual) || marked > 0,
+          std::string(c.name) + ": the fused append marked no ring slot");
 
     CUDA_CHECK(cudaFree(d_tables));
     CUDA_CHECK(cudaFree(d_table_rows));
