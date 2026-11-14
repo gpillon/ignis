@@ -102,17 +102,31 @@ cooperative schedule's CTAs per SM with constants true of the `120a` build,
 which an sm_86 build's kernels (72 registers in place of 62) do not meet, so
 on an RTX 3090 it admitted grids the card cannot hold and the launch failed;
 it now asks CUDA's occupancy query on the kernel it launches, which gives
-those constants on compute capability 12.0. `tests/ops/test_gdn_gating_proj.cpp`
-(GitHub #478), a test with no device code: its cooperative schedules are sized
-for the RTX 5090's 170 SMs, so on a card that cannot hold one resident it
-skips each one the planner's own residency query refuses and names it on its
-output (`SKIP` lines); it prints each cooperative kernel's CTAs per SM
-(`budget` lines) and fails on compute capability 12.0 if one is not the
-planner's former constant; a projection case the planner moves to the unsplit
-route is held to that route's own criterion, three times the split-K one,
-since its single fp32 accumulator carries the tensor core's truncation over
-all of K (the test's comment derives it); on the 5090 it runs every case as
-before, against the same criteria, names none, and fails if it skips one. A
+those constants on compute capability 12.0. On a card smaller than the RTX
+5090 (GitHub #602, with its first patch of `bf16_gdn_gating_proj_plan.h`), a
+route whose own split-K schedule the card cannot hold resident takes the
+largest smaller split it holds, and the unsplit route only when none fits,
+where it went straight to unsplit; the 27B's fused norm/control route takes
+split40 only where it is resident, the composed route otherwise, where it
+threw below 120 SMs; and the capacity query answers the peak over every width,
+where it asked each route at its last width only (30,720 bytes on an RTX
+5080 through 4,097 columns, against 2,752,512 at 896 columns). The header
+exposes the route table's schedule before residency and a test-only cap on
+the SM count the residency test multiplies by, which no engine path calls.
+`tests/ops/test_gdn_gating_proj.cpp` (GitHub #478, #602), a test with no device
+code: its cooperative schedules are sized for the RTX 5090's 170 SMs, so it
+runs its case list at the card's own SM count and then under each test-only
+cap below it, 84 (the RTX 5080) and 36 (the RTX 5060 Ti), and the 5090 runs a
+smaller card's routes end to end; a case the planner runs on a fallback is
+named on its output (`FALLBACK` lines, each naming the pass's SM count), and
+each interval's capacity is checked against the widest call at every width in
+it; it prints each cooperative kernel's CTAs per SM (`budget` lines) and fails
+on compute capability 12.0 if one is not the planner's former constant; a
+projection case the planner moves to the unsplit route is held to that route's
+own criterion, three times the split-K one, since its single fp32 accumulator
+carries the tensor core's truncation over all of K (the test's comment derives
+it); on the 5090 with no cap it runs every case as before, against the same
+criteria, and fails if one falls back. A
 portability patch changes no
 behaviour where the reference runs, so it adds no row to the table below. A
 file that cannot build for an older architecture is not patched: ten compile,

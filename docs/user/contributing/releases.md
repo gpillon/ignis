@@ -120,8 +120,10 @@ that route on the card, and it is no longer the gate.
 
 **The leaf's tests.** Built for `86;120a`, `ctest -LE sm120a-only` passes every
 test. `ignis_kernel_gdn_gating_proj_tests` prints `budget` lines and names with
-`SKIP` the cooperative schedules the card cannot hold resident (#478): skips
-there are expected, failures are not.
+`FALLBACK`, and the SM count or cap of the pass, each case whose route's
+cooperative schedule the card cannot hold resident, which runs a smaller split
+or the composed route in its place (#478, #602): fallbacks there are expected,
+failures are not.
 
 ```sh
 bash kernel/build.sh            # kernel\build.ps1 on Windows: the whole project, tests included

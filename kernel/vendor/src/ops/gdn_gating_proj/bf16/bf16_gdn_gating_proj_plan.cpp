@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -65,6 +66,33 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
 
+// Ignis portability patch (ADR 0077, GitHub #602): each model's cooperative split-K schedules,
+// largest first. Where a card cannot hold a route's own split resident, the planner takes the
+// first smaller one it holds, and the unsplit route only when none fits.
+constexpr std::array<Bf16GdnGatingScheduleId, 3> k27Splits{{
+    Bf16GdnGatingScheduleId::MmaCooperativeSplit8,
+    Bf16GdnGatingScheduleId::MmaCooperativeSplit4,
+    Bf16GdnGatingScheduleId::MmaCooperativeSplit2,
+}};
+
+constexpr std::array<Bf16GdnGatingScheduleId, 4> k35Splits{{
+    Bf16GdnGatingScheduleId::MmaCooperativeSplit16,
+    Bf16GdnGatingScheduleId::MmaCooperativeSplit8,
+    Bf16GdnGatingScheduleId::MmaCooperativeSplit4,
+    Bf16GdnGatingScheduleId::MmaCooperativeSplit2,
+}};
+
+// Ignis portability patch (ADR 0077, GitHub #602): the route table read once, for the planner
+// and for bf16_gdn_gating_route_schedule.
+template <std::size_t N>
+Bf16GdnGatingScheduleId routed_schedule(const std::array<RouteSpec, N>& routes,
+                                        std::int32_t cols) {
+    for (const RouteSpec& route : routes) {
+        if (route.cols.contains(cols)) { return route.schedule; }
+    }
+    throw std::logic_error("BF16 GDN gating: admitted problem has no covering route");
+}
+
 bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;
 }
@@ -92,27 +120,44 @@ bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     return false;
 }
 
+// Ignis portability patch (ADR 0077, GitHub #602): the test-only cap on the SM count, 0 for none
+// (bf16_gdn_gating_set_test_multiprocessor_cap).
+std::atomic<int> test_multiprocessor_cap{0};
+
 // Ignis portability patch (ADR 0077, GitHub #478): a cooperative launch fails unless the device
 // holds its whole grid at once, the kernel's CTAs/SM times the SMs. Both come from the current
 // device, read once per device and kernel, since the planner runs on every call.
+//
+// Ignis portability patch (ADR 0077, GitHub #602): the two factors are kept apart and the
+// test-only cap applies to the SMs as they are read, so one process can plan under several caps.
 std::int64_t device_resident_ctas(Bf16GdnGatingCooperativeKernel kernel) {
+    struct Budget {
+        int ctas_per_sm;
+        int multiprocessors;
+    };
     static std::mutex mutex;
-    static std::map<std::pair<int, Bf16GdnGatingCooperativeKernel>, std::int64_t> resident;
+    static std::map<std::pair<int, Bf16GdnGatingCooperativeKernel>, Budget> budgets;
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     const std::lock_guard<std::mutex> lock(mutex);
     const auto key = std::make_pair(device, kernel);
-    if (const auto found = resident.find(key); found != resident.end()) { return found->second; }
-    int multiprocessors = 0;
-    CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device));
-    if (multiprocessors <= 0) {
-        throw std::runtime_error("BF16 GDN gating: device reports no multiprocessors");
+    auto found     = budgets.find(key);
+    if (found == budgets.end()) {
+        int multiprocessors = 0;
+        CUDA_CHECK(
+            cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device));
+        if (multiprocessors <= 0) {
+            throw std::runtime_error("BF16 GDN gating: device reports no multiprocessors");
+        }
+        found = budgets
+                    .emplace(key, Budget{bf16_gdn_gating_cooperative_ctas_per_sm(kernel),
+                                         multiprocessors})
+                    .first;
     }
-    const std::int64_t ctas =
-        static_cast<std::int64_t>(bf16_gdn_gating_cooperative_ctas_per_sm(kernel)) *
-        multiprocessors;
-    resident.emplace(key, ctas);
-    return ctas;
+    const int cap = test_multiprocessor_cap.load(std::memory_order_relaxed);
+    const int multiprocessors =
+        cap > 0 ? std::min(cap, found->second.multiprocessors) : found->second.multiprocessors;
+    return static_cast<std::int64_t>(found->second.ctas_per_sm) * multiprocessors;
 }
 
 std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
@@ -271,6 +316,27 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
     return false;
 }
 
+// Ignis portability patch (ADR 0077, GitHub #602): a split-K schedule, whose grid the card must
+// hold resident.
+bool schedule_is_cooperative(Bf16GdnGatingScheduleId schedule) noexcept {
+    return schedule_uses_mma(schedule) && schedule != Bf16GdnGatingScheduleId::MmaUnsplit;
+}
+
+// Ignis portability patch (ADR 0077, GitHub #602): the fallback of a cooperative route whose own
+// schedule the card cannot hold resident, never a split larger than the route's own.
+template <std::size_t N>
+Bf16GdnGatingScheduleId resident_fallback(const std::array<Bf16GdnGatingScheduleId, N>& splits,
+                                          Bf16GdnGatingScheduleId routed,
+                                          const Bf16GdnGatingProblem& problem) {
+    const std::int32_t own_split_k = schedule_split_k(routed);
+    for (const Bf16GdnGatingScheduleId split : splits) {
+        if (schedule_split_k(split) < own_split_k && candidate_is_legal(split, problem)) {
+            return split;
+        }
+    }
+    return Bf16GdnGatingScheduleId::MmaUnsplit;
+}
+
 std::size_t checked_partial_bytes(std::int32_t heads, std::int32_t split_k, std::int32_t cols) {
     const std::size_t logical_rows = static_cast<std::size_t>(2 * heads);
     const std::size_t split        = static_cast<std::size_t>(split_k);
@@ -365,16 +431,30 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
     throw std::logic_error("BF16 GDN gating: unknown schedule");
 }
 
+// Ignis portability patch (ADR 0077, GitHub #602): a cooperative route is also asked at every
+// multiple of its column tile inside the interval. Residency changes only where the column-tile
+// count does, so inside a route that falls back on a smaller card each run of one schedule ends
+// at such a multiple or at the route's last width, and a fixed schedule's workspace grows with
+// the width: these widths hold every peak. On the RTX 5090 no route falls back, and each answer
+// is the one at the route's last width.
 template <std::size_t N>
 std::size_t route_capacity(const std::array<RouteSpec, N>& routes, const Bf16GdnGatingProblem& base,
                            std::int32_t min_cols, std::int32_t max_cols) {
     std::size_t maximum = 0;
+    const auto workspace = [&](std::int32_t cols) {
+        return bf16_gdn_gating_resolve_plan({base.heads, base.input_rows, cols}).workspace_bytes;
+    };
+    const std::int64_t tile_cols = mma_tile_cols(base);
     for (const RouteSpec& route : routes) {
         if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
         const std::int32_t endpoint = std::min(route.cols.last, max_cols);
-        maximum                     = std::max(
-            maximum,
-            bf16_gdn_gating_resolve_plan({base.heads, base.input_rows, endpoint}).workspace_bytes);
+        maximum                     = std::max(maximum, workspace(endpoint));
+        if (!schedule_is_cooperative(route.schedule)) { continue; }
+        const std::int64_t first = std::max(route.cols.first, min_cols);
+        for (std::int64_t cols = (first + tile_cols - 1) / tile_cols * tile_cols; cols < endpoint;
+             cols += tile_cols) {
+            maximum = std::max(maximum, workspace(static_cast<std::int32_t>(cols)));
+        }
     }
     return maximum;
 }
@@ -442,37 +522,25 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId sche
     return {schedule, variant, workspace};
 }
 
-Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
+Bf16GdnGatingScheduleId bf16_gdn_gating_route_schedule(const Bf16GdnGatingProblem& problem) {
     if (!bf16_gdn_gating_admits(problem)) {
         throw std::invalid_argument(
             "BF16 GDN gating: exact problem or column count is not admitted");
     }
-    if (is_27(problem)) {
-        for (const RouteSpec& route : k27Routes) {
-            if (route.cols.contains(problem.cols)) {
-                if (candidate_is_legal(route.schedule, problem)) {
-                    return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
-                }
-                if (schedule_uses_mma(route.schedule) &&
-                    route.schedule != Bf16GdnGatingScheduleId::MmaUnsplit) {
-                    return bf16_gdn_gating_resolve_candidate(
-                        Bf16GdnGatingScheduleId::MmaUnsplit, problem);
-                }
-            }
-        }
-    } else {
-        for (const RouteSpec& route : k35Routes) {
-            if (route.cols.contains(problem.cols)) {
-                if (candidate_is_legal(route.schedule, problem)) {
-                    return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
-                }
-                if (schedule_uses_mma(route.schedule) &&
-                    route.schedule != Bf16GdnGatingScheduleId::MmaUnsplit) {
-                    return bf16_gdn_gating_resolve_candidate(
-                        Bf16GdnGatingScheduleId::MmaUnsplit, problem);
-                }
-            }
-        }
+    return is_27(problem) ? routed_schedule(k27Routes, problem.cols)
+                          : routed_schedule(k35Routes, problem.cols);
+}
+
+Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
+    const Bf16GdnGatingScheduleId routed = bf16_gdn_gating_route_schedule(problem);
+    if (candidate_is_legal(routed, problem)) {
+        return bf16_gdn_gating_resolve_candidate(routed, problem);
+    }
+    if (schedule_is_cooperative(routed)) {
+        return bf16_gdn_gating_resolve_candidate(
+            is_27(problem) ? resident_fallback(k27Splits, routed, problem)
+                           : resident_fallback(k35Splits, routed, problem),
+            problem);
     }
     throw std::logic_error("BF16 GDN gating: admitted problem has no covering route");
 }
@@ -499,7 +567,11 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
                                                      problem);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
         norm_splits = 32;
-    } else if (is_27(problem) && problem.cols <= 8) {
+    } else if (is_27(problem) && problem.cols <= 8 &&
+               // Ignis portability patch (ADR 0077, GitHub #602): split40 only where the card
+               // holds its grid resident (120 CTAs, one per SM on the 120a build), as split32
+               // above; the composed route otherwise.
+               candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit40, problem)) {
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit40,
                                                      problem);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit40;
@@ -529,6 +601,10 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
             bf16_gdn_norm_gating_resolve_plan({heads, input_rows, fused_cols}).workspace_bytes);
     }
     return maximum;
+}
+
+void bf16_gdn_gating_set_test_multiprocessor_cap(int multiprocessors) noexcept {
+    test_multiprocessor_cap.store(std::max(multiprocessors, 0), std::memory_order_relaxed);
 }
 
 void bf16_gdn_gating_execute_plan(const Bf16GdnGatingPlan& plan, const Tensor& x,

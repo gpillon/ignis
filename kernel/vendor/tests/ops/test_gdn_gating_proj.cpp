@@ -39,36 +39,33 @@ constexpr ReductionCriterion kGdnNormControlFp32{/*relative_l2=*/8.0e-4,
                                                  /*gross_absolute=*/1.5e-4,
                                                  /*gross_relative_to_max_reference=*/1.05e-3};
 
-// Ignis portability patch (ADR 0077, GitHub #478): the cooperative schedules' grids are sized for
-// the RTX 5090's 170 SMs. On a card that cannot hold one resident (fewer SMs, or fewer CTAs/SM in
-// the build it runs) the test skips, and names, each one the planner's own residency query refuses
-// (candidate_is_legal, reached through resolve_candidate and resolve_plan). On the RTX 5090 it
-// refuses none, nothing is named, and main checks that.
-//
-// The 27B's fused norm/control route at T=1..8 is cooperative split40, which the planner resolves
-// with no fallback, so a card that cannot hold its grid throws from the capacity query on. For
-// that admitted problem and schedule, resolve_candidate refuses only a grid the card cannot hold
-// resident. The 35B's fused split32 route falls back to the composed route by itself.
-int skipped_schedules = 0;
+// Ignis portability patch (ADR 0077, GitHub #478, #602): the cooperative schedules' grids are
+// sized for the RTX 5090's 170 SMs. Where a card cannot hold a route's own schedule resident
+// (fewer SMs, or fewer CTAs/SM in the build it runs), the planner runs a fallback: the largest
+// smaller split of the model's family the card holds, the unsplit route when none fits, and for
+// the 27B's fused norm/control route at T=1..8 (cooperative split40) the composed route. The test
+// runs its whole case list at the card's own SM count, then under each test-only cap below it
+// (bf16_gdn_gating_set_test_multiprocessor_cap): 84, the RTX 5080's, and 36, the RTX 5060 Ti's.
+// The cap changes only the SM count the residency test multiplies by, so the RTX 5090 runs a
+// smaller card's routes end to end: the planner's choice, the capacity, the launch and the
+// workspace high-water against the query. Every line of a pass names its SM count. A case whose
+// plan differs from the route's own schedule is a fallback, named on a FALLBACK line; on the
+// RTX 5090 with no cap none is, and main checks that.
+struct Pass {
+    std::string label;
+    int fallbacks;
+};
 
-bool fused_27_norm_route_is_resident(const Geometry& geometry, std::int32_t tokens) {
-    if (geometry.heads != 48 || geometry.hidden != 5120 || tokens > 8) { return true; }
+// A case or a check that throws fails by name and the run goes on, so against a planner that
+// cannot plan a case every such case is named.
+template <typename Check>
+int guarded(const std::string& label, const Check& check) {
     try {
-        (void)ops::detail::bf16_gdn_gating_resolve_candidate(
-            ops::detail::Bf16GdnGatingScheduleId::MmaCooperativeSplit40,
-            {geometry.heads, geometry.hidden, tokens});
-        return true;
-    } catch (const std::invalid_argument&) {
-        return false;
+        return check();
+    } catch (const std::exception& error) {
+        std::cerr << label << ": threw: " << error.what() << "\n";
+        return 1;
     }
-}
-
-void name_skipped_fused_27_norm_route(const std::string& where) {
-    ++skipped_schedules;
-    std::cout << "SKIP "
-              << ops::detail::bf16_gdn_norm_gating_schedule_name(
-                     ops::detail::Bf16GdnNormGatingScheduleId::MmaCooperativeSplit40)
-              << " " << where << ": not resident on this card\n";
 }
 
 // The unsplit route, where the planner runs it in place of a cooperative route the card cannot
@@ -97,24 +94,59 @@ void name_skipped_fused_27_norm_route(const std::string& where) {
 // spread of the bias across data takes the rest. Those models stay within 0.73 of it over 300
 // seeds, the RTX 5090's unsplit route within 0.37 on this data; a wrong tile or K range errs by
 // ~1e-2. The 35B's fallback (K = 2048, 128 MMAs, at most 3.3e-7 on the RTX 5090) is held to it. On
-// the RTX 5090 no case is a fallback, so every check there is the reference's.
+// the RTX 5090 no case is a fallback, so every check there is the reference's. A fallback to a
+// smaller split (GitHub #602) runs chains no longer than split2's, which kGdnProjectionFp32 holds
+// with margin, and is held to kGdnProjectionFp32.
 constexpr ReductionCriterion kGdnProjectionUnsplitFp32{/*relative_l2=*/4.2e-6,
                                                        /*gross_absolute=*/1.5e-6,
                                                        /*gross_relative_to_max_reference=*/7.5e-6};
 
-// Below the unsplit route's first T (4097), the planner runs the unsplit route only in place of a
-// cooperative route the card cannot hold resident. Returns whether it does.
-bool name_skipped_cooperative_route(const Geometry& geometry, std::int32_t tokens) {
-    const ops::detail::Bf16GdnGatingPlan plan =
-        ops::detail::bf16_gdn_gating_resolve_plan({geometry.heads, geometry.hidden, tokens});
-    if (plan.schedule == ops::detail::Bf16GdnGatingScheduleId::MmaUnsplit && tokens < 4097) {
-        ++skipped_schedules;
-        std::cout << "SKIP the cooperative route of gdn_gating_proj " << geometry.label
-                  << " T=" << tokens << ": not resident on this card, the planner runs "
-                  << ops::detail::bf16_gdn_gating_schedule_name(plan.schedule) << "\n";
-        return true;
+// Names a projection case's fallback: a plan other than the schedule the route table names
+// (bf16_gdn_gating_route_schedule). Returns the criterion the schedule it runs is held to.
+const ReductionCriterion& name_projection_fallback(Pass& pass, const Geometry& geometry,
+                                                   std::int32_t tokens) {
+    const ops::detail::Bf16GdnGatingProblem problem{geometry.heads, geometry.hidden, tokens};
+    const ops::detail::Bf16GdnGatingScheduleId routed =
+        ops::detail::bf16_gdn_gating_route_schedule(problem);
+    const ops::detail::Bf16GdnGatingPlan plan = ops::detail::bf16_gdn_gating_resolve_plan(problem);
+    if (plan.schedule == routed) { return kGdnProjectionFp32; }
+    ++pass.fallbacks;
+    std::cout << "FALLBACK " << pass.label << " gdn_gating_proj " << geometry.label
+              << " T=" << tokens << ": the route's "
+              << ops::detail::bf16_gdn_gating_schedule_name(routed)
+              << " is not resident, the planner runs "
+              << ops::detail::bf16_gdn_gating_schedule_name(plan.schedule) << "\n";
+    return plan.schedule == ops::detail::Bf16GdnGatingScheduleId::MmaUnsplit
+               ? kGdnProjectionUnsplitFp32
+               : kGdnProjectionFp32;
+}
+
+// The fused route the norm/control op takes where the card holds it resident: split40 for the
+// 27B at T=1..8, split32 for the 35B at T=1..16, the composed route elsewhere.
+ops::detail::Bf16GdnNormGatingScheduleId fused_norm_route(const Geometry& geometry,
+                                                          std::int32_t tokens) {
+    if (geometry.heads == 48 && geometry.hidden == 5120 && tokens <= 8) {
+        return ops::detail::Bf16GdnNormGatingScheduleId::MmaCooperativeSplit40;
     }
-    return false;
+    if (geometry.heads == 32 && geometry.hidden == 2048 && tokens <= 16) {
+        return ops::detail::Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
+    }
+    return ops::detail::Bf16GdnNormGatingScheduleId::Composed;
+}
+
+// Names a norm/control case's fallback: a plan other than its fused route. A fallback runs the
+// composed route, held to the norm cases' criteria as the composed cases are.
+void name_norm_fallback(Pass& pass, const Geometry& geometry, std::int32_t tokens) {
+    const ops::detail::Bf16GdnNormGatingScheduleId routed = fused_norm_route(geometry, tokens);
+    const ops::detail::Bf16GdnNormGatingPlan plan =
+        ops::detail::bf16_gdn_norm_gating_resolve_plan({geometry.heads, geometry.hidden, tokens});
+    if (plan.schedule == routed) { return; }
+    ++pass.fallbacks;
+    std::cout << "FALLBACK " << pass.label << " gdn_norm_gating_proj " << geometry.label
+              << " T=" << tokens << ": the route's "
+              << ops::detail::bf16_gdn_norm_gating_schedule_name(routed)
+              << " is not resident, the planner runs "
+              << ops::detail::bf16_gdn_norm_gating_schedule_name(plan.schedule) << "\n";
 }
 
 // The planner takes each cooperative kernel's CTAs/SM from the occupancy query. On a compute
@@ -359,10 +391,9 @@ int verify_inputs_unchanged(const std::string& label, const DeviceBuffer& device
     return failures;
 }
 
-int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed) {
-    const ReductionCriterion& criterion = name_skipped_cooperative_route(geometry, tokens)
-                                              ? kGdnProjectionUnsplitFp32
-                                              : kGdnProjectionFp32;
+int run_projection_case(Pass& pass, const Geometry& geometry, std::int32_t tokens,
+                        std::uint32_t seed) {
+    const ReductionCriterion& criterion = name_projection_fallback(pass, geometry, tokens);
     std::vector<float> x(static_cast<std::size_t>(geometry.hidden) * tokens);
     std::vector<float> a_weight(static_cast<std::size_t>(geometry.heads) * geometry.hidden);
     std::vector<float> b_weight(static_cast<std::size_t>(geometry.heads) * geometry.hidden);
@@ -422,8 +453,8 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
 
     const std::vector<double> full_g    = read_fp32(device_g.data(), output_elements);
     const std::vector<double> full_beta = read_fp32(device_beta.data(), output_elements);
-    const std::string label =
-        std::string("gdn_gating_proj ") + geometry.label + " T=" + std::to_string(tokens);
+    const std::string label = pass.label + " gdn_gating_proj " + geometry.label +
+                              " T=" + std::to_string(tokens);
     int failures = 0;
     failures += require_all_finite(label + " g", full_g);
     failures += require_all_finite(label + " beta", full_beta);
@@ -447,12 +478,9 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
     return failures;
 }
 
-int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint32_t seed) {
-    if (!fused_27_norm_route_is_resident(geometry, tokens)) {
-        name_skipped_fused_27_norm_route(std::string(geometry.label) + " T=" +
-                                         std::to_string(tokens));
-        return 0;
-    }
+int run_norm_projection_case(Pass& pass, const Geometry& geometry, std::int32_t tokens,
+                             std::uint32_t seed) {
+    name_norm_fallback(pass, geometry, tokens);
     constexpr float kEps = 1.0e-6F;
     std::vector<float> x(static_cast<std::size_t>(geometry.hidden) * tokens);
     std::vector<float> norm_weight(static_cast<std::size_t>(geometry.hidden));
@@ -522,8 +550,8 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
     }
     cuda_synchronize();
 
-    const std::string label =
-        std::string("gdn_norm_gating_proj ") + geometry.label + " T=" + std::to_string(tokens);
+    const std::string label = pass.label + " gdn_norm_gating_proj " + geometry.label +
+                              " T=" + std::to_string(tokens);
     int failures = 0;
     failures += verify_normwise(label + " h", from_device_bf16(device_h.data(), h_elements),
                                 reference_h, kGdnNormOutputBf16);
@@ -551,38 +579,114 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
     return failures;
 }
 
-int verify_workspace_capacity_contract(const Geometry& geometry,
-                                       std::initializer_list<std::int32_t> route_endpoints) {
-    const std::int32_t last = *std::max_element(route_endpoints.begin(), route_endpoints.end());
-    const std::size_t interval =
-        ops::gdn_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, last);
-    std::size_t witness = 0;
-    for (const std::int32_t tokens : route_endpoints) {
-        witness = std::max(witness, ops::gdn_gating_proj_workspace_capacity_bytes(
-                                        geometry.heads, geometry.hidden, tokens, tokens));
-    }
-    int failures = 0;
-    if (interval != witness) {
-        std::cerr << geometry.label << ": GDN control interval missed a route endpoint\n";
-        ++failures;
-    }
-    if (!fused_27_norm_route_is_resident(geometry, 8)) {
-        name_skipped_fused_27_norm_route(std::string(geometry.label) + " workspace interval");
+using CapacityQuery = std::size_t (*)(std::int32_t, std::int32_t, std::int32_t, std::int32_t);
+
+// Ignis portability patch (ADR 0077, GitHub #602): an interval's capacity is the peak over every
+// width in it, so it must equal the largest single-width answer at every width from 1 to `last`.
+// On the RTX 5090 with no cap (`reference_card`) it must also equal the largest answer at the
+// route endpoints the reference checked, so the engine's reservation there is the reference's.
+int verify_capacity_interval(const Pass& pass, const Geometry& geometry, const char* op,
+                             CapacityQuery query, std::int32_t last,
+                             std::initializer_list<std::int32_t> route_endpoints,
+                             bool reference_card) {
+    const std::string label = pass.label + " " + op + " " + geometry.label + " workspace T=1.." +
+                              std::to_string(last);
+    return guarded(label, [&] {
+        const std::size_t interval = query(geometry.heads, geometry.hidden, 1, last);
+        std::size_t witness        = 0;
+        std::int32_t witness_cols  = 0;
+        for (std::int32_t tokens = 1; tokens <= last; ++tokens) {
+            const std::size_t bytes = query(geometry.heads, geometry.hidden, tokens, tokens);
+            if (bytes > witness) {
+                witness      = bytes;
+                witness_cols = tokens;
+            }
+        }
+        std::cout << "capacity " << label << ": " << interval << " bytes, the widest call "
+                  << witness << " at T=" << witness_cols << "\n";
+        int failures = 0;
+        if (interval != witness) {
+            std::cerr << label << ": the interval's capacity is " << interval << " bytes, a call of "
+                      << witness_cols << " columns allocates " << witness << "\n";
+            ++failures;
+        }
+        if (reference_card) {
+            std::size_t endpoints = 0;
+            for (const std::int32_t tokens : route_endpoints) {
+                endpoints =
+                    std::max(endpoints, query(geometry.heads, geometry.hidden, tokens, tokens));
+            }
+            if (interval != endpoints) {
+                std::cerr << label << ": the interval's capacity is " << interval
+                          << " bytes, its route endpoints' " << endpoints << "\n";
+                ++failures;
+            }
+        }
         return failures;
+    });
+}
+
+int verify_workspace_capacity_contract(const Pass& pass, const Geometry& geometry,
+                                       std::initializer_list<std::int32_t> route_endpoints,
+                                       bool reference_card) {
+    const std::int32_t last = *std::max_element(route_endpoints.begin(), route_endpoints.end());
+    int failures            = 0;
+    failures += verify_capacity_interval(pass, geometry, "gdn_gating_proj",
+                                         ops::gdn_gating_proj_workspace_capacity_bytes, last,
+                                         route_endpoints, reference_card);
+    failures += verify_capacity_interval(pass, geometry, "gdn_norm_gating_proj",
+                                         ops::gdn_norm_gating_proj_workspace_capacity_bytes, 64,
+                                         {8, 16, 64}, reference_card);
+    return failures;
+}
+
+// The whole case list under the pass's SM count.
+int run_pass(Pass& pass, bool reference_card) {
+    int failures = 0;
+    failures +=
+        verify_workspace_capacity_contract(pass, kQwen27, {1, 8, 1024, 2048, 4096, 4097},
+                                           reference_card);
+    failures +=
+        verify_workspace_capacity_contract(pass, kQwen35, {1, 127, 1024, 2048, 4096, 4097},
+                                           reference_card);
+
+    const auto projection = [&](const Geometry& geometry, std::int32_t tokens,
+                                std::uint32_t seed) {
+        return guarded(pass.label + " gdn_gating_proj " + geometry.label + " T=" +
+                           std::to_string(tokens),
+                       [&] { return run_projection_case(pass, geometry, tokens, seed); });
+    };
+    const auto norm = [&](const Geometry& geometry, std::int32_t tokens, std::uint32_t seed) {
+        return guarded(pass.label + " gdn_norm_gating_proj " + geometry.label + " T=" +
+                           std::to_string(tokens),
+                       [&] { return run_norm_projection_case(pass, geometry, tokens, seed); });
+    };
+
+    // Every registered 27B projection route, including predicated and full token tiles, and the
+    // full tiles at 2048 and 4096 a smaller card's fallbacks run (GitHub #602).
+    for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2048, 2049, 4096, 4097}) {
+        failures += projection(kQwen27, tokens, 0x1000u + static_cast<std::uint32_t>(tokens));
     }
-    const std::size_t norm_interval =
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, 64);
-    const std::size_t norm_witness = std::max(
-        std::max(ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden,
-                                                                    8, 8),
-                 ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden,
-                                                                    16, 16)),
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 64,
-                                                           64));
-    if (norm_interval != norm_witness) {
-        std::cerr << geometry.label << ": GDN norm/control interval missed a route endpoint\n";
-        ++failures;
+    // The Qwen3.8 parent changes only the public storage boundary. One direct oracle case proves
+    // its [A,B] row partition; the split 27B cases above cover every unchanged execution route.
+    failures += projection(kQwen38Parent, 1, 0x1801u);
+    // Every registered 35B projection route and its contiguous-parent storage contract.
+    for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2048, 2049, 4096, 4097}) {
+        failures += projection(kQwen35, tokens, 0x2000u + static_cast<std::uint32_t>(tokens));
     }
+
+    // 27B qualifies the fused split-80 route (T=1..8) and its composed boundary; the 35B
+    // qualifies both sides of its own fused boundary.
+    failures += norm(kQwen27, 1, 0x3001u);
+    failures += norm(kQwen27, 6, 0x3006u);
+    failures += norm(kQwen27, 8, 0x3008u);
+    failures += norm(kQwen27, 9, 0x3009u);
+    failures += norm(kQwen27, 64, 0x3040u);
+    failures += norm(kQwen38Parent, 1, 0x3801u);
+    failures += norm(kQwen35, 1, 0x4001u);
+    failures += norm(kQwen35, 16, 0x4010u);
+    failures += norm(kQwen35, 17, 0x4011u);
+    failures += norm(kQwen35, 64, 0x4040u);
     return failures;
 }
 
@@ -597,42 +701,31 @@ int main() {
     int failures = 0;
     const DeviceShape device = current_device_shape();
     failures += verify_cooperative_budgets(device);
-    failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097});
-    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
 
-    // Every registered 27B projection route, including predicated and full token tiles.
-    for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2049, 4097}) {
-        failures +=
-            run_projection_case(kQwen27, tokens, 0x1000u + static_cast<std::uint32_t>(tokens));
+    // The card's own SM count, then each test-only cap below it: the RTX 5080's 84 and the
+    // RTX 5060 Ti's 36 (GitHub #602).
+    std::vector<int> sm_counts{device.multiprocessors};
+    for (const int cap : {84, 36}) {
+        if (cap < device.multiprocessors) { sm_counts.push_back(cap); }
     }
-    // The Qwen3.8 parent changes only the public storage boundary. One direct oracle case proves
-    // its [A,B] row partition; the split 27B cases above cover every unchanged execution route.
-    failures += run_projection_case(kQwen38Parent, 1, 0x1801u);
-    // Every registered 35B projection route and its contiguous-parent storage contract.
-    for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
-        failures +=
-            run_projection_case(kQwen35, tokens, 0x2000u + static_cast<std::uint32_t>(tokens));
+    for (const int sm_count : sm_counts) {
+        const bool capped = sm_count != device.multiprocessors;
+        ops::detail::bf16_gdn_gating_set_test_multiprocessor_cap(capped ? sm_count : 0);
+        Pass pass{capped ? "[cap " + std::to_string(sm_count) + " SMs]"
+                         : "[" + std::to_string(sm_count) + " SMs]",
+                  0};
+        std::cout << "pass " << pass.label << ": the planner's residency test reads "
+                  << sm_count << " of the card's " << device.multiprocessors << " SMs\n";
+        const bool reference_card =
+            !capped && is_sm120(device) && device.multiprocessors >= kRtx5090Multiprocessors;
+        failures += run_pass(pass, reference_card);
+        if (reference_card && pass.fallbacks != 0) {
+            std::cerr << pass.label << " gdn_gating_proj: " << pass.fallbacks
+                      << " case(s) fell back on a card the schedules are sized for\n";
+            ++failures;
+        }
     }
-
-    // 27B qualifies the fused split-80 route (T=1..8) and its composed boundary; the 35B
-    // qualifies both sides of its own fused boundary.
-    failures += run_norm_projection_case(kQwen27, 1, 0x3001u);
-    failures += run_norm_projection_case(kQwen27, 6, 0x3006u);
-    failures += run_norm_projection_case(kQwen27, 8, 0x3008u);
-    failures += run_norm_projection_case(kQwen27, 9, 0x3009u);
-    failures += run_norm_projection_case(kQwen27, 64, 0x3040u);
-    failures += run_norm_projection_case(kQwen38Parent, 1, 0x3801u);
-    failures += run_norm_projection_case(kQwen35, 1, 0x4001u);
-    failures += run_norm_projection_case(kQwen35, 16, 0x4010u);
-    failures += run_norm_projection_case(kQwen35, 17, 0x4011u);
-    failures += run_norm_projection_case(kQwen35, 64, 0x4040u);
-
-    if (is_sm120(device) && device.multiprocessors >= kRtx5090Multiprocessors &&
-        skipped_schedules != 0) {
-        std::cerr << "gdn_gating_proj: " << skipped_schedules
-                  << " schedule(s) skipped on a card the schedules are sized for\n";
-        ++failures;
-    }
+    ops::detail::bf16_gdn_gating_set_test_multiprocessor_cap(0);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating_proj correctness\n";
     return failures == 0 ? 0 : 1;
