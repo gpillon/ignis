@@ -69,7 +69,8 @@ the other. They are no configuration fields: `GET /v1/config` and
 - `IGNIS_HQ_DECODE_ATTENTION=ours|vendored` (from 0.11.0) picks the attention
   route of the 27B's decode and verify rounds over `hq-e8-2b` at each model
   load: ignis's warp-specialized route, or the vendored kernel's route it
-  replaced ([ADR 0031](../../adr/0031-vendored-kernel-bottleneck-exemption.md)),
+  replaced ([ADR 0031](../../adr/0031-vendored-kernel-bottleneck-exemption.md),
+  [ADR 0093](../../adr/0093-on-blackwell-the-27bs-decode-and-verify-rounds-attend-over-hq-e8-2b-on-ignis-own-route-and-the-vendored-kernel-stays-its-oracle.md)),
   the comparison a speed measurement of the two needs. Unset, or `ours`, an
   RTX 50 or RTX PRO card runs ignis's own; `vendored` runs the vendored one
   there. An RTX 30 or RTX 40 card, a card the build holds no code of the route

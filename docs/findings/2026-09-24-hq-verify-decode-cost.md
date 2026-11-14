@@ -3,7 +3,7 @@
 - Kind: experiment
 - Status: current
 - Observed: 2026-09-24
-- Last verified: 2026-09-25
+- Last verified: 2026-11-14
 - Scope: kernel / hq-e8-2b verify-round attention (`gqa_attention_small_t_tc_partial_bf16_kernel` with `GqaTcKVHq`), the 8-lane group decode (`hq_codec.cuh`)
 - Topic: decode-27b
 - Related: GitHub #268, [spec runtime/09](../specs/runtime/09-hq-verify-decode-cost.md),
@@ -277,3 +277,16 @@ Following ADR 0031, the prompt route keeps the reference decode (`359d3b4`).
      this kernel as the oracle;
   2. option 3, a smaller or partial decoded tier (see Implications), designed
      with its eviction rule and VRAM plan line and measured on top of step 1.
+- Step 1 is built (spec #570, 2026-11-14): a warp-specialized route of ignis's
+  own, 20 warps per SM, the default on Blackwell, with this kernel's reference
+  route as its oracle and its throughput route as the comparison
+  ([ADR 0093](../adr/0093-on-blackwell-the-27bs-decode-and-verify-rounds-attend-over-hq-e8-2b-on-ignis-own-route-and-the-vendored-kernel-stays-its-oracle.md)).
+  [The follow-up finding](2026-11-14-the-warp-specialized-hq-attention-served-on-the-27b.md)
+  has its kernel table, its profile and the served A/B. Option 3 is still to be
+  judged, now on top of that route.
+- Re-checked 2026-11-14: the follow-up's bench re-timed this finding's two
+  routes, main's reference route and #268's throughput route, on the RTX 5090,
+  and on the seven cells of the table above the throughput route reads within
+  2.3% of its figures (876.5 us at 8 x 30K, 198.6 at 1 x 59K, 140.8 at 1 x 30K,
+  54.8 at 1 x 7K, 396.8 at 1 x 126K, 497.2 at 4 x 30K, 446.4 at 8 x 14K), and
+  38.8% to 47.7% below the reference route's.

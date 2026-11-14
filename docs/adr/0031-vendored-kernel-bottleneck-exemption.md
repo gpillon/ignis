@@ -1,5 +1,6 @@
 ---
 status: accepted
+amended-by: [ADR-0093]
 ---
 
 # ADR 0031 — a vendored kernel that is measured as the bottleneck is not untouchable
