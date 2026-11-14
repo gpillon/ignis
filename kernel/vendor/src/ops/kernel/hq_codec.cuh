@@ -487,9 +487,8 @@ __device__ __forceinline__ void hq_encode_row_warp(const __nv_bfloat16* row,
 
     if (lane == 0) {
         __half h = __float2half_rn(norm);
-        std::uint16_t norm_bits = *reinterpret_cast<std::uint16_t*>(&h);
-        meta_out[0] = static_cast<std::uint8_t>(norm_bits & 0xFFu);
-        meta_out[1] = static_cast<std::uint8_t>(norm_bits >> 8);
+        const std::uint16_t norm_bits = __half_as_ushort(h);
+        *reinterpret_cast<std::uint16_t*>(meta_out) = norm_bits;
         std::uint32_t bits;
         if (used_bits >= 0) {
             bits = static_cast<std::uint32_t>(used_bits);
