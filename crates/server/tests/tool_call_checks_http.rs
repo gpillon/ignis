@@ -179,6 +179,8 @@ const EVERY_KIND: &[&str] = &[
     "ignis_tool_call_violations_total{kind=\"constraint\"} 1",
     "ignis_tool_call_violations_total{kind=\"undeclared_tool\"} 1",
     "ignis_tool_strict_outside_subset_total 0",
+    // No value holds a tag, so the cuts drop no text of one (#610).
+    "ignis_tool_call_values_split_total 0",
 ];
 
 /// `metrics`' exposition holds every line of `lines`, each times `times`.
@@ -465,4 +467,59 @@ async fn strict_tools_outside_the_subset_are_counted_and_served_as_before() {
     assert_eq!(status, 200);
     responses::metric_reaches(&metrics, "ignis_requests_completed_total 1").await;
     assert!(!metrics.render().contains("ignis_tool_"));
+}
+
+/// Where a value ends (#610): a model that writes a value holding a
+/// `</parameter>` line, which the parser cuts there, dropping the text after
+/// it that a held tool's confirmed close would keep, and three it does not
+/// count: a plain value, one holding its call's own close (the residue,
+/// which both rules cut), and one whose call closes with its required path
+/// missing (which the confirmed close would not close).
+fn split_values() -> String {
+    [
+        call("edit", &[("path", "a.txt\n</parameter>\nnot a step"), ("mode", "append")]),
+        call("edit", &[("path", "a.txt")]),
+        call("edit", &[("path", "x\n</function>\n</tool_call>\ny")]),
+        call("edit", &[("mode", "a\n</parameter>\nb")]),
+    ]
+    .concat()
+}
+
+/// The value whose text the parser dropped is counted split, on
+/// chat completions and on the Responses API, whole and streamed, and each
+/// response is what a server that checks nothing sends.
+#[tokio::test]
+async fn a_value_the_confirmed_close_would_read_on_is_counted_split_and_served_as_before() {
+    let script = split_values();
+    let counts = &["ignis_tool_call_values_split_total 1", "ignis_tool_calls_total{outcome=\"valid\"} 3", "ignis_tool_calls_total{outcome=\"invalid\"} 1"];
+    for stream in [false, true] {
+        let checked = server(&[&script], false, true);
+        let metrics = Arc::clone(checked.metrics.as_ref().unwrap());
+        let (status, body) = post(&checked, "/v1/chat/completions", &chat(stream, false)).await;
+        assert_eq!(status, 200, "{body}");
+        let (_, unchecked) = post(&server(&[&script], false, false), "/v1/chat/completions", &chat(stream, false)).await;
+        match stream {
+            false => {
+                assert_eq!(without_created(&body), without_created(&unchecked));
+                let reply: JsonValue = serde_json::from_str(&body).unwrap();
+                let calls = reply["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+                assert_eq!(calls[0]["function"]["arguments"], "{\"mode\":\"append\",\"path\":\"a.txt\"}", "cut, as ever");
+            }
+            true => assert_eq!(assembled(&body), assembled(&unchecked)),
+        }
+        responses::metric_reaches(&metrics, "ignis_requests_completed_total 1").await;
+        assert_counts(&metrics, counts, 1);
+
+        let checked = server(&[&script], false, true);
+        let metrics = Arc::clone(checked.metrics.as_ref().unwrap());
+        let (status, body) = post(&checked, "/v1/responses", &response_body(stream)).await;
+        assert_eq!(status, 200, "{body}");
+        let (_, unchecked) = post(&server(&[&script], false, false), "/v1/responses", &response_body(stream)).await;
+        match stream {
+            false => assert_eq!(body, unchecked),
+            true => assert_eq!(assembled(&body), assembled(&unchecked)),
+        }
+        responses::metric_reaches(&metrics, "ignis_requests_completed_total 1").await;
+        assert_counts(&metrics, counts, 1);
+    }
 }

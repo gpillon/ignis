@@ -24,6 +24,8 @@
 //!   as JSON Schema reads it, each violation named by its kind: what the
 //!   server checks every tool call's arguments against, and the oracle of
 //!   the grammar's property tests.
+//! - [`call`]: where a value of a held tool's call ends (#610), the one
+//!   rule over bytes that the call parser and the call's grammar share.
 //!
 //! It is our own Rust (no grammar engine), CPU-only; `regex-automata` builds
 //! the DFAs of `pattern` and `format`.
@@ -31,6 +33,7 @@
 mod automaton;
 mod bitset;
 mod cache;
+pub mod call;
 pub mod json;
 mod mask;
 mod number;

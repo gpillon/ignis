@@ -59,9 +59,31 @@ and repairs a miss, and it does not write the call's envelope for the model.
   - One boundary function, over bytes, decides this for the grammar and for the parser, at all three layers that
     cut today at a tag's first occurrence (the call, the function body, the value). It applies to top-level free
     string values only.
+    - It is `ignis_grammar::call::line` (#610). It reads the bytes from a line's start and answers text, a step, or
+      not decided yet. Once text or a step, more bytes never change the answer, so a grammar can read a line byte by
+      byte.
+    - A line starts at a value's first byte and after each `\n`, and a tag counts only at a line's first byte.
+    - Between a step's tags, any run of spaces, tabs, `\r` and `\n` is allowed, none included, since the tokenizer
+      merges newlines with the whitespace beside them.
+    - A parameter's name runs to the first `>`, as the parser reads it. A required name the schema does not declare
+      is never written, so such a call never closes.
+    - The caller says which parameters are required, so a strict tool's nullable ones can be left out.
+    - The call parser chooses the rule per call, by the function's name. A tool not held keeps the first-occurrence
+      cuts, and a held tool's call ends only at its confirmed close.
   - Two alternatives were rejected. Ending a value at any of the three tags would forbid them in every string.
     Escapes are a convention the model never learned.
   - The residue: a string value cannot contain this call's own confirmed close.
+  - The rule is not extended to tools that are not held, and the extension is weighed by a count: with metrics on,
+    `ignis_tool_call_values_split_total` (an amendment of ADR 0017 beside #608's family). It counts the string
+    values of those tools' calls from which the first-occurrence cuts dropped text after a tag, text the confirmed
+    close would keep in the value: what the cuts skip after a `</parameter>` or between `</function>` and
+    `</tool_call>`, other than whitespace.
+    - It does not count a value whose text the cuts moved into another parameter, dropping nothing. An opener of a
+      written or undeclared parameter may be the model's own envelope, which the confirmed close, without a
+      grammar, would read as the value's text.
+    - It does not count a value the confirmed close would end at no step of the block. That excludes a close with a
+      required parameter missing, which that rule would not deliver, and a value whose end lies past the block's
+      first `</tool_call>`. The count is a lower bound.
 - **A missing required parameter is a miss at the close.**
   - After `</parameter>` and its newline, `</` is a miss.
   - Inside a value, `function` after a line-start `</` is a miss.

@@ -216,13 +216,17 @@ describe("MonitorView", () => {
       .replace('outcome="invalid"} 3', 'outcome="invalid"} 6')
       .replace('outcome="dropped"} 1', 'outcome="dropped"} 2')
       .replace('kind="type"} 2', 'kind="type"} 4')
-      .replace('kind="undeclared_tool"} 0', 'kind="undeclared_tool"} 1');
+      .replace('kind="undeclared_tool"} 0', 'kind="undeclared_tool"} 1')
+      .replace("ignis_tool_call_values_split_total 2", "ignis_tool_call_values_split_total 5");
     const state = applyScrape(applyScrape(initialMonitor(), { kind: "ok", text: TOOL_CALL_EXPOSITION }, now - 10_000, 2), { kind: "ok", text: later }, now, 2);
     const html = renderToStaticMarkup(<MonitorView state={state} />);
     expect(html).toContain("Tool calls");
     // 4 of 20 calls in the window failed.
     expect(html).toContain("20%");
     expect(html).toContain("2 of the wrong type; 1 to an undeclared tool");
+    // #610: 3 more values split at a tag in the window.
+    expect(html).toContain("Values split at a tag");
+    expect(html).toMatch(/Values split at a tag<\/[^>]+>\s*<[^>]+>3</);
     const text = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now, 2)} />);
     expect(text).not.toContain("Tool calls");
   });

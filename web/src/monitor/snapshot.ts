@@ -274,14 +274,17 @@ export type ToolCallViolation = (typeof TOOL_CALL_VIOLATIONS)[number];
 /**
  * Tool calls (#608, ADR 0094): every call block the model wrote, checked
  * against its tool's parameters, by outcome; the invalid ones by kind of
- * violation, a call once under each kind it has; and the strict tools whose
- * schema lies outside OpenAI's strict subset. Absent until one of them moved,
+ * violation, a call once under each kind it has; the strict tools whose
+ * schema lies outside OpenAI's strict subset; and (#610) the string values
+ * of tools not held from which the parser dropped text after a tag inside
+ * them, text a held tool's confirmed close would keep. Absent until one of them moved,
  * so null on a server that never read a call.
  */
 export type ToolCalls = {
   calls: Record<ToolCallOutcome, number | null>;
   violations: Record<ToolCallViolation, number | null>;
   strictOutsideSubset: number | null;
+  valuesSplit: number | null;
 };
 
 /** A histogram: upper bounds in seconds ending in +Inf, their cumulative counts, the sum and the count. */
@@ -424,6 +427,7 @@ const TOOL_CALL_FAMILIES = {
   calls: "ignis_tool_calls_total",
   violations: "ignis_tool_call_violations_total",
   strictOutsideSubset: "ignis_tool_strict_outside_subset_total",
+  valuesSplit: "ignis_tool_call_values_split_total",
 } as const;
 
 /** The thinking budget's forced closes (GitHub #330): absent until the first. */
@@ -651,6 +655,7 @@ export function readSnapshot({ families }: Exposition): Snapshot {
         TOOL_CALL_VIOLATIONS.map((kind) => [kind, valueOf(TOOL_CALL_FAMILIES.violations, ["kind", kind])]),
       ) as ToolCalls["violations"],
       strictOutsideSubset: valueOf(TOOL_CALL_FAMILIES.strictOutsideSubset),
+      valuesSplit: valueOf(TOOL_CALL_FAMILIES.valuesSplit),
     };
   }
   snap.thinkingForcedCloses = valueOf(THINKING_FORCED_CLOSES);
@@ -781,6 +786,7 @@ export function counterValues(s: Snapshot): (number | null)[] {
     ...TOOL_CALL_OUTCOMES.map((outcome) => s.toolCalls?.calls[outcome] ?? null),
     ...TOOL_CALL_VIOLATIONS.map((kind) => s.toolCalls?.violations[kind] ?? null),
     s.toolCalls?.strictOutsideSubset ?? null,
+    s.toolCalls?.valuesSplit ?? null,
     s.thinkingForcedCloses,
     s.ttft?.count ?? null,
     s.duration?.count ?? null,

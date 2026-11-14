@@ -67,20 +67,32 @@
 //! call to a tool the request did not declare as invalid, and a closed block
 //! that does not parse as dropped ([`CallVerdict`]). What the scanner emits
 //! does not change.
+//!
+//! **Where a call, its body and its values end is one rule** (GitHub #610,
+//! ADR 0094), [`Cuts`]: every tool keeps the first-occurrence cuts above,
+//! and a **held tool** ([`ToolCallScanner::holding`]) the confirmed close
+//! of `ignis_grammar::call`, the rule its grammar reads by: a value ends
+//! only at a line that is a valid next step of the call, so a value may
+//! hold the dialect's own tags. No tool is held before the grammar holds
+//! its calls. With the check on, the values of a tool not held from which
+//! the first-occurrence cuts drop text after a tag, text the confirmed close
+//! would keep in the value, are counted ([`CallCheck`]).
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
+use ignis_grammar::call;
 use serde_json::Value as JsonValue;
 
 /// The tool-call dialect's opening tag: one token on the Qwen tokenizers, which
 /// a turn may write instead of a structured answer (GitHub #592).
-pub(crate) const OPEN_TAG: &str = "<tool_call>";
-const CLOSE_TAG: &str = "</tool_call>";
-const FUNCTION_PREFIX: &str = "<function=";
-const FUNCTION_CLOSE: &str = "</function>";
-const PARAMETER_PREFIX: &str = "<parameter=";
-const PARAMETER_CLOSE: &str = "</parameter>";
+pub(crate) const OPEN_TAG: &str = call::CALL_OPEN;
+const CLOSE_TAG: &str = call::CALL_CLOSE;
+const FUNCTION_PREFIX: &str = call::FUNCTION_OPEN;
+const FUNCTION_CLOSE: &str = call::FUNCTION_CLOSE;
+const PARAMETER_PREFIX: &str = call::PARAMETER_OPEN;
+const PARAMETER_CLOSE: &str = call::PARAMETER_CLOSE;
 
 /// One fully parsed, complete tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +149,9 @@ pub struct CallCheck {
     /// function name → its `parameters` as sent (`true` when it sent none),
     /// for every declared function, with properties or not.
     parameters: HashMap<String, JsonValue>,
+    /// function name → what the confirmed close knows of it (#610), what a
+    /// value it ends is weighed by.
+    rules: HashMap<String, call::Parameters>,
     metrics: Arc<crate::metrics::Metrics>,
 }
 
@@ -154,8 +169,9 @@ impl CallCheck {
                 let parameters = function.get("parameters").filter(|p| !p.is_null()).cloned().unwrap_or(JsonValue::Bool(true));
                 Some((name.to_owned(), parameters))
             })
-            .collect();
-        Some(Self { parameters, metrics })
+            .collect::<HashMap<_, _>>();
+        let rules = parameters.iter().map(|(name, schema)| (name.clone(), rule_parameters(schema))).collect();
+        Some(Self { parameters, rules, metrics })
     }
 
     /// A call to `name` with `arguments` (the JSON the parser delivers)
@@ -198,6 +214,60 @@ impl CallCheck {
         };
         self.metrics.record_tool_call(&verdict);
     }
+
+    /// Count the values of a call to a tool that is not held, read from
+    /// `text` (the block, its `</tool_call>` included) by the
+    /// first-occurrence cuts, from which those cuts dropped text after a tag
+    /// inside them that the confirmed close would have kept in the value
+    /// (GitHub #610): the measure of extending that rule to every tool. The
+    /// dropped text is what the reading skipped (after a `</parameter>`, or
+    /// between `</function>` and `</tool_call>`), not only whitespace, and
+    /// lying before the value's end under the confirmed close. Only a value
+    /// of a parameter the tool declares a string counts, the values the rule
+    /// is for. Not counted: a value the confirmed close ends at no step of
+    /// the block (a close with a required parameter missing, which that rule
+    /// would not deliver at all, or an end past the block's `</tool_call>`);
+    /// one whose text the cuts moved into another parameter, dropping
+    /// nothing (an opener of a written or undeclared parameter, which may be
+    /// the model's own envelope); one both rules end at the same place (the
+    /// residue among them).
+    fn count_split_values(&self, text: &str, block: &Block, schemas: &ToolSchemas) {
+        let name = &text[block.name.clone()];
+        let Some(parameters) = self.rules.get(name) else { return };
+        let mut written = vec![false; parameters.declared().len()];
+        let mut split = 0;
+        for value in &block.values {
+            let param = &text[value.name.clone()];
+            if let Some(index) = parameters.index(param) {
+                written[index] = true;
+            }
+            if !schemas.param_types(name, param).iter().any(|t| t == "string") {
+                continue;
+            }
+            let start = value.text.start;
+            let Some((end, _)) = call::value_end(&text.as_bytes()[start..], parameters, &written) else { continue };
+            let kept = start..start + end;
+            let dropped = block.skipped.iter().any(|gap| {
+                let (from, to) = (gap.start.max(kept.start), gap.end.min(kept.end));
+                from < to && text.as_bytes()[from..to].iter().any(|b| !b.is_ascii_whitespace())
+            });
+            if dropped {
+                split += 1;
+            }
+        }
+        if split > 0 {
+            self.metrics.record_tool_call_values_split(split);
+        }
+    }
+}
+
+/// What the confirmed close knows of a tool whose `parameters` are these
+/// (GitHub #610): the names its `properties` declare, and those its
+/// `required` lists.
+pub(crate) fn rule_parameters(parameters: &JsonValue) -> call::Parameters {
+    let declared = parameters.get("properties").and_then(JsonValue::as_object).map(|p| p.keys().cloned().collect()).unwrap_or_else(Vec::new);
+    let required = parameters.get("required").and_then(JsonValue::as_array).map(|r| r.iter().filter_map(JsonValue::as_str).collect()).unwrap_or_else(Vec::new);
+    call::Parameters::new(declared, required)
 }
 
 /// What the call check found of one call block the scanner closed (GitHub
@@ -341,6 +411,9 @@ pub struct ToolCallScanner {
     /// The scan ends at its first call's close (`parallel_tool_calls:
     /// false`).
     ends_at_first_call: bool,
+    /// The held tools, by function name, whose calls end by the confirmed
+    /// close ([`ToolCallScanner::holding`]).
+    held: HashMap<String, call::Parameters>,
 }
 
 impl Default for ToolCallScanner {
@@ -365,7 +438,20 @@ impl ToolCallScanner {
             schemas,
             check: None,
             ends_at_first_call: false,
+            held: HashMap::new(),
         }
+    }
+
+    /// Read the calls to these held tools (function name → what the
+    /// confirmed close knows of it) by the confirmed close (GitHub #610,
+    /// ADR 0094) instead of the first-occurrence cuts: such a call ends only
+    /// at `</function>` and `</tool_call>` once every required parameter is
+    /// written, and a value only at a line that is a valid next step, so a
+    /// call that closes with a required parameter missing stays open. For a
+    /// call the grammar holds to its tool's schema; no caller holds a tool
+    /// before it does.
+    pub fn holding(self, held: HashMap<String, call::Parameters>) -> Self {
+        Self { held, ..self }
     }
 
     /// With `on`, the scan ends where its first call block closes, parsed
@@ -436,14 +522,20 @@ impl ToolCallScanner {
                     break;
                 }
                 State::Buffering => {
-                    let Some(idx) = self.hold.find(CLOSE_TAG) else {
-                        break; // still incomplete; wait for more text
+                    let (len, block, held) = {
+                        let cuts = self.cuts();
+                        let Some((len, block)) = cuts.read_call(&self.hold) else {
+                            break; // still incomplete; wait for more text
+                        };
+                        (len, block, matches!(cuts, Cuts::Confirmed(_)))
                     };
-                    let body: String = self.hold.drain(..idx + CLOSE_TAG.len()).collect();
-                    let inner = &body[..body.len() - CLOSE_TAG.len()];
-                    let parsed = parse_function_block(inner, &self.schemas);
+                    let body: String = self.hold.drain(..len).collect();
+                    let parsed = block.as_ref().map(|block| (body[block.name.clone()].to_string(), arguments(&body, block, &self.schemas)));
                     if let Some(check) = &self.check {
                         check.count(parsed.as_ref().map(|(name, arguments)| (name.as_str(), arguments.as_str())));
+                        if let (Some(block), false) = (&block, held) {
+                            check.count_split_values(&body, block, &self.schemas);
+                        }
                     }
                     if let Some((name, arguments)) = parsed {
                         let index = self.next_index;
@@ -505,26 +597,101 @@ fn tag_prefix_holdback(text: &str, tag: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Parses `<function=NAME>...<parameter=P>VALUE</parameter>...</function>`
-/// (the text between `<tool_call>` and `</tool_call>`, both already
-/// stripped) into `(name, json_arguments)`, typing each argument by
-/// `schemas`. Returns `None` if the block does not open with `<function=`
-/// or never closes with `</function>`.
-fn parse_function_block(inner: &str, schemas: &ToolSchemas) -> Option<(String, String)> {
-    let after_prefix = inner.trim_start().strip_prefix(FUNCTION_PREFIX)?;
-    let name_end = after_prefix.find('>')?;
-    let name = after_prefix[..name_end].to_string();
-    let body = after_prefix[name_end + 1..].find(FUNCTION_CLOSE).map(|end| &after_prefix[name_end + 1..name_end + 1 + end])?;
+/// Where the call parser ends a call, its function body and each value
+/// (GitHub #610, ADR 0094): one rule, chosen per call by the function it
+/// names.
+#[derive(Debug, Clone, Copy)]
+enum Cuts<'a> {
+    /// The rule of every tool that is not held: the call at its
+    /// `</tool_call>`'s first occurrence, the body at its `</function>`'s, a
+    /// value at its `</parameter>`'s, or at the next `<parameter=` when that
+    /// comes first (a forgotten closer).
+    FirstOccurrence,
+    /// A held tool's: the confirmed close, `ignis_grammar::call::line`.
+    Confirmed(&'a call::Parameters),
+}
 
-    let mut args = serde_json::Map::new();
-    let mut rest = body;
-    while let Some(start) = rest.find(PARAMETER_PREFIX) {
-        let after = &rest[start + PARAMETER_PREFIX.len()..];
-        let Some(name_end) = after.find('>') else {
+/// One call block as read: where its function's name and each value's
+/// parameter name and raw text lie in the text it was read from, values in
+/// the order written, a parameter written twice included, and the text the
+/// reading skipped.
+#[derive(Debug)]
+struct Block {
+    name: Range<usize>,
+    values: Vec<Value>,
+    /// What lies in no value and is no tag the reading took: before the
+    /// first opener, after a `</parameter>` up to the next one, and between
+    /// `</function>` and `</tool_call>`. The first-occurrence cuts drop it.
+    skipped: Vec<Range<usize>>,
+}
+
+#[derive(Debug)]
+struct Value {
+    name: Range<usize>,
+    /// Untrimmed: the newlines around it included.
+    text: Range<usize>,
+}
+
+impl ToolCallScanner {
+    /// The rule of the call the hold buffers: the confirmed close once it
+    /// names a held tool (a `</tool_call>` always follows the name's `>`, so
+    /// the name is read before the call can close).
+    fn cuts(&self) -> Cuts<'_> {
+        if self.held.is_empty() {
+            return Cuts::FirstOccurrence;
+        }
+        let named = self.hold.trim_start().strip_prefix(FUNCTION_PREFIX).and_then(|rest| rest.find('>').map(|end| &rest[..end]));
+        match named.and_then(|name| self.held.get(name)) {
+            Some(parameters) => Cuts::Confirmed(parameters),
+            None => Cuts::FirstOccurrence,
+        }
+    }
+}
+
+impl Cuts<'_> {
+    /// The call in `text` (what follows its `<tool_call>`), once it has
+    /// closed: the length of the block, its `</tool_call>` included, and
+    /// the block, or `None` for a block that does not parse as a call.
+    fn read_call(self, text: &str) -> Option<(usize, Option<Block>)> {
+        match self {
+            Cuts::FirstOccurrence => {
+                let idx = text.find(CLOSE_TAG)?;
+                Some((idx + CLOSE_TAG.len(), read_function_block(&text[..idx])))
+            }
+            // The close ends at a `</tool_call>`: no need to read before one.
+            Cuts::Confirmed(parameters) if text.contains(CLOSE_TAG) => {
+                read_held_call(text, parameters).map(|(len, block)| (len, Some(block)))
+            }
+            Cuts::Confirmed(_) => None,
+        }
+    }
+}
+
+/// Reads `<function=NAME>...<parameter=P>VALUE</parameter>...</function>`
+/// (the text between `<tool_call>` and `</tool_call>`, both already
+/// stripped) by the first-occurrence cuts. Returns `None` if the block does
+/// not open with `<function=` or never closes with `</function>`.
+fn read_function_block(inner: &str) -> Option<Block> {
+    let trimmed = inner.trim_start();
+    let after_prefix = trimmed.strip_prefix(FUNCTION_PREFIX)?;
+    let base = inner.len() - trimmed.len() + FUNCTION_PREFIX.len();
+    let name_end = after_prefix.find('>')?;
+    let name = base..base + name_end;
+    let body_start = name.end + 1;
+    let body = inner[body_start..].find(FUNCTION_CLOSE).map(|end| &inner[body_start..body_start + end])?;
+
+    let mut values = Vec::new();
+    let mut skipped = Vec::new();
+    let mut rest = 0;
+    while let Some(start) = body[rest..].find(PARAMETER_PREFIX) {
+        skipped.push(body_start + rest..body_start + rest + start);
+        let after = rest + start + PARAMETER_PREFIX.len();
+        let Some(name_end) = body[after..].find('>') else {
+            rest += start;
             break; // malformed trailing parameter tag: stop, keep what we have
         };
-        let param_name = after[..name_end].to_string();
-        let after_name = &after[name_end + 1..];
+        let value_start = after + name_end + 1;
+        let after_name = &body[value_start..];
         // The value ends at its `</parameter>`, or — when the model left it
         // unclosed — at the next `<parameter=` or the end of the body.
         let close = after_name.find(PARAMETER_CLOSE);
@@ -535,14 +702,60 @@ fn parse_function_block(inner: &str, schemas: &ToolSchemas) -> Option<(String, S
             (None, Some(n)) => (n, n),
             (None, None) => (after_name.len(), after_name.len()),
         };
-        let value = trim_one_newline(&after_name[..value_end]);
-        let types = schemas.param_types(&name, &param_name);
-        args.insert(param_name, parse_argument_value(value, types));
-        rest = &after_name[resume..];
+        values.push(Value {
+            name: body_start + after..body_start + after + name_end,
+            text: body_start + value_start..body_start + value_start + value_end,
+        });
+        rest = value_start + resume;
     }
-    let arguments = serde_json::to_string(&serde_json::Value::Object(args))
-        .expect("a Map<String, Value> always serializes");
-    Some((name, arguments))
+    skipped.push(body_start + rest..body_start + body.len());
+    skipped.push(body_start + body.len() + FUNCTION_CLOSE.len()..inner.len());
+    Some(Block { name, values, skipped })
+}
+
+/// Reads a held tool's call from `text` (what follows its `<tool_call>`)
+/// by the confirmed close: the length of the block, its `</tool_call>`
+/// included, and the block, or `None` while the call has not closed. What
+/// precedes the first parameter's opener is not read.
+fn read_held_call(text: &str, parameters: &call::Parameters) -> Option<(usize, Block)> {
+    let trimmed = text.trim_start();
+    let base = text.len() - trimmed.len() + FUNCTION_PREFIX.len();
+    let name_end = trimmed.strip_prefix(FUNCTION_PREFIX)?.find('>')?;
+    let name = base..base + name_end;
+    let mut written = vec![false; parameters.declared().len()];
+    let mut values = Vec::new();
+    // The value being read, by its parameter's name, and where it starts.
+    let mut open: Option<Range<usize>> = None;
+    let mut at = name.end + 1;
+    loop {
+        let (end, step) = call::value_end(&text.as_bytes()[at..], parameters, &written)?;
+        if let Some(name) = open.take() {
+            values.push(Value { name, text: at..at + end });
+        }
+        match step {
+            call::Step::Parameter { index, len } => {
+                written[index] = true;
+                let after = at + end + len;
+                open = Some(after - 1 - parameters.declared()[index].len()..after - 1);
+                at = after;
+            }
+            call::Step::Close { len } => return Some((at + end + len, Block { name, values, skipped: Vec::new() })),
+        }
+    }
+}
+
+/// The JSON arguments of `block`, read from `text`: each value trimmed of
+/// one newline either side and typed by `schemas`; a parameter written
+/// twice keeps its last value.
+fn arguments(text: &str, block: &Block, schemas: &ToolSchemas) -> String {
+    let name = &text[block.name.clone()];
+    let mut args = serde_json::Map::new();
+    for value in &block.values {
+        let param = &text[value.name.clone()];
+        let types = schemas.param_types(name, param);
+        args.insert(param.to_string(), parse_argument_value(trim_one_newline(&text[value.text.clone()]), types));
+    }
+    serde_json::to_string(&serde_json::Value::Object(args)).expect("a Map<String, Value> always serializes")
 }
 
 /// Trims exactly one leading and one trailing `\n` (the template's own
@@ -1079,6 +1292,333 @@ mod tests {
         let (events, ended) = run_to_first_call(&["just ", "text"]);
         assert!(!ended);
         assert_eq!(content(&events), "just text");
+    }
+
+    // ── where a call, its body and its values end (#610) ─────────────────
+
+    /// `parse_function_block` as it read before #610, kept verbatim: what
+    /// the first-occurrence cuts must keep reading.
+    fn parse_function_block_before_610(inner: &str, schemas: &ToolSchemas) -> Option<(String, String)> {
+        let after_prefix = inner.trim_start().strip_prefix(FUNCTION_PREFIX)?;
+        let name_end = after_prefix.find('>')?;
+        let name = after_prefix[..name_end].to_string();
+        let body = after_prefix[name_end + 1..].find(FUNCTION_CLOSE).map(|end| &after_prefix[name_end + 1..name_end + 1 + end])?;
+
+        let mut args = serde_json::Map::new();
+        let mut rest = body;
+        while let Some(start) = rest.find(PARAMETER_PREFIX) {
+            let after = &rest[start + PARAMETER_PREFIX.len()..];
+            let Some(name_end) = after.find('>') else {
+                break; // malformed trailing parameter tag: stop, keep what we have
+            };
+            let param_name = after[..name_end].to_string();
+            let after_name = &after[name_end + 1..];
+            // The value ends at its `</parameter>`, or — when the model left it
+            // unclosed — at the next `<parameter=` or the end of the body.
+            let close = after_name.find(PARAMETER_CLOSE);
+            let next = after_name.find(PARAMETER_PREFIX);
+            let (value_end, resume) = match (close, next) {
+                (Some(c), Some(n)) if n < c => (n, n),
+                (Some(c), _) => (c, c + PARAMETER_CLOSE.len()),
+                (None, Some(n)) => (n, n),
+                (None, None) => (after_name.len(), after_name.len()),
+            };
+            let value = trim_one_newline(&after_name[..value_end]);
+            let types = schemas.param_types(&name, &param_name);
+            args.insert(param_name, parse_argument_value(value, types));
+            rest = &after_name[resume..];
+        }
+        let arguments = serde_json::to_string(&serde_json::Value::Object(args))
+            .expect("a Map<String, Value> always serializes");
+        Some((name, arguments))
+    }
+
+    /// The scanner as it read before #610, over a whole text: its content
+    /// and its calls (name, arguments).
+    fn scan_before_610(text: &str, schemas: &ToolSchemas, first_call_only: bool) -> (String, Vec<(String, String)>) {
+        let (mut content, mut calls, mut rest) = (String::new(), Vec::new(), text);
+        while let Some(open) = rest.find(OPEN_TAG) {
+            content.push_str(&rest[..open]);
+            let after = &rest[open + OPEN_TAG.len()..];
+            let Some(close) = after.find(CLOSE_TAG) else {
+                return (content, calls);
+            };
+            calls.extend(parse_function_block_before_610(&after[..close], schemas));
+            rest = &after[close + CLOSE_TAG.len()..];
+            if first_call_only {
+                return (content, calls);
+            }
+        }
+        content.push_str(rest);
+        (content, calls)
+    }
+
+    /// A small xorshift: the tag soups below are the same on every run.
+    fn generator(mut seed: u64) -> impl FnMut() -> u64 {
+        move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        }
+    }
+
+    /// Text made of the dialect's tags, names, values and stray brackets.
+    fn tag_soup(next: &mut impl FnMut() -> u64) -> String {
+        const PIECES: [&str; 24] = [
+            "<tool_call>", "</tool_call>", "<function=", "</function>", "<parameter=", "</parameter>", "edit", "path",
+            "content", "line", "x", ">", "\n", "\n", " ", "<", "/", "=", "é", "42", "true", "{\"k\":1}", "\r\n", "a b",
+        ];
+        (0..next() % 48).map(|_| PIECES[next() as usize % PIECES.len()]).collect()
+    }
+
+    fn soup_tools() -> Vec<JsonValue> {
+        serde_json::from_value(serde_json::json!([
+            {"type": "function", "function": {"name": "edit", "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "line": {"type": "integer"}},
+                "required": ["path"]
+            }}},
+            {"type": "function", "function": {"name": "x"}}
+        ]))
+        .unwrap()
+    }
+
+    /// `text` in random chunks, cut at character boundaries.
+    fn chunked<'a>(text: &'a str, next: &mut impl FnMut() -> u64) -> Vec<&'a str> {
+        let mut chunks = Vec::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            let mut cut = (next() as usize % 7 + 1).min(rest.len());
+            while !rest.is_char_boundary(cut) {
+                cut += 1;
+            }
+            chunks.push(&rest[..cut]);
+            rest = &rest[cut..];
+        }
+        chunks
+    }
+
+    /// Every tool keeps the first-occurrence cuts: on generated tag soup,
+    /// fed in random chunks, checked or not, ending at the first call or
+    /// not, the scanner emits what it emitted before #610.
+    #[test]
+    fn the_first_occurrence_cuts_read_every_text_as_before() {
+        let tools = soup_tools();
+        let schemas = ToolSchemas::from_tools(&tools);
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let mut next = generator(0x9e37_79b9_7f4a_7c15);
+        let mut calls_seen = 0;
+        for round in 0..20_000 {
+            let mut text = tag_soup(&mut next);
+            if round % 2 == 0 {
+                // Half the texts sit inside a whole call, so most of them parse.
+                text = format!("<tool_call>\n<function=edit>\n<parameter=path>\n{text}\n</parameter>\n</function>\n</tool_call>");
+            }
+            let first_call_only = round % 3 == 0;
+            let check = (round % 5 != 0).then(|| CallCheck::new(&tools, Some(&metrics)).unwrap());
+            let mut scanner = ToolCallScanner::with_schemas(schemas.clone()).ending_at_first_call(first_call_only).checking(check);
+            let mut events = Vec::new();
+            for chunk in chunked(&text, &mut next) {
+                events.extend(scanner.feed(chunk));
+            }
+            events.extend(scanner.finish());
+            let got: Vec<(String, String)> = calls(&events).iter().map(|c| (c.name.clone(), c.arguments.clone())).collect();
+            calls_seen += got.len();
+            assert_eq!((content(&events), got), scan_before_610(&text, &schemas, first_call_only), "{text:?}");
+        }
+        assert!(calls_seen > 5_000, "the soups parse as calls often enough: {calls_seen}");
+    }
+
+    /// The tool of the confirmed-close tests: `path` and `content`
+    /// required, `mode` optional, `line` an integer.
+    fn write_file_tools() -> Vec<JsonValue> {
+        serde_json::from_value(serde_json::json!([
+            {"type": "function", "function": {"name": "write_file", "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["create", "append"]},
+                    "line": {"type": "integer"}
+                },
+                "required": ["path", "content"]
+            }}},
+            {"type": "function", "function": {"name": "read", "parameters": {
+                "type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]
+            }}}
+        ]))
+        .unwrap()
+    }
+
+    /// A scanner over [`write_file_tools`] holding `held` of them.
+    fn holding(held: &[&str]) -> ToolCallScanner {
+        let tools = write_file_tools();
+        let held = tools
+            .iter()
+            .map(|tool| &tool["function"])
+            .filter(|function| held.contains(&function["name"].as_str().unwrap()))
+            .map(|function| (function["name"].as_str().unwrap().to_owned(), rule_parameters(&function["parameters"])))
+            .collect();
+        ToolCallScanner::with_schemas(ToolSchemas::from_tools(&tools)).holding(held)
+    }
+
+    fn scan(mut scanner: ToolCallScanner, chunks: &[&str]) -> Vec<ToolEvent> {
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(scanner.feed(chunk));
+        }
+        events.extend(scanner.finish());
+        events
+    }
+
+    /// A file about tool calls: its content holds a `</parameter>` line
+    /// followed by text, openers of a written and of an undeclared
+    /// parameter, a `</function>` line not followed by `</tool_call>`, and
+    /// a `</tool_call>` line.
+    const FILE_ABOUT_CALLS: &str = "line one\n</parameter>\n<parameter=path>\nother.md\n<parameter=force>\n</function>\nnot yet\n</tool_call>\nlast line";
+
+    fn write_call(content: &str) -> String {
+        format!("before <tool_call>\n<function=write_file>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=content>\n{content}\n</parameter>\n</function>\n</tool_call> after")
+    }
+
+    #[test]
+    fn a_held_calls_value_keeps_the_dialects_own_tags_however_the_text_arrives() {
+        let text = write_call(FILE_ABOUT_CALLS);
+        let expected = serde_json::json!({"path": "notes.md", "content": FILE_ABOUT_CALLS});
+        let whole = scan(holding(&["write_file"]), &[&text]);
+        assert_eq!(content(&whole), "before  after");
+        assert_eq!(calls(&whole).len(), 1, "{whole:?}");
+        assert_eq!(args(calls(&whole)[0]), expected);
+        for cut in 1..text.len() {
+            let events = scan(holding(&["write_file"]), &[&text[..cut], &text[cut..]]);
+            assert_eq!(events.iter().filter(|e| matches!(e, ToolEvent::Call(_))).count(), 1, "cut at {cut}");
+            assert_eq!(args(calls(&events)[0]), expected, "cut at {cut}");
+            assert_eq!(content(&events), "before  after", "cut at {cut}");
+        }
+        let bytes: Vec<String> = text.chars().map(String::from).collect();
+        let events = scan(holding(&["write_file"]), &bytes.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(args(calls(&events)[0]), expected);
+        // The same text, not held: cut at the first `</tool_call>`, as ever.
+        let free = scan(holding(&[]), &[&text]);
+        assert_eq!(calls(&free).len(), 1);
+        assert_eq!(args(calls(&free)[0])["content"], "line one");
+        assert!(content(&free).contains("last line"), "{free:?}");
+    }
+
+    #[test]
+    fn a_held_call_closing_with_a_required_parameter_missing_stays_open() {
+        let early = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>";
+        let mut scanner = holding(&["write_file"]);
+        assert!(scanner.feed(early).is_empty());
+        assert!(scanner.is_mid_call(), "not a close");
+        assert!(scanner.finish().is_empty(), "left open at the end: dropped, never leaked");
+        // What follows is still the value, up to the missing parameter's opener.
+        let late = "\n<parameter=content>\nx\n</parameter>\n</function>\n</tool_call>";
+        let events = scan(holding(&["write_file"]), &[early, late]);
+        assert_eq!(
+            args(calls(&events)[0]),
+            serde_json::json!({"path": "a.txt\n</parameter>\n</function>\n</tool_call>", "content": "x"})
+        );
+    }
+
+    #[test]
+    fn a_held_calls_value_cannot_hold_its_own_confirmed_close() {
+        let text = write_call("an example:\n</function>\n</tool_call>\nand the rest");
+        let events = scan(holding(&["write_file"]), &[&text]);
+        assert_eq!(args(calls(&events)[0]), serde_json::json!({"path": "notes.md", "content": "an example:"}));
+        assert_eq!(content(&events), "before \nand the rest\n</parameter>\n</function>\n</tool_call> after");
+    }
+
+    #[test]
+    fn a_held_call_tolerates_forgotten_closers_and_takes_its_parameters_in_any_order() {
+        let text = "<tool_call>\n<function=write_file>\n<parameter=content>\nhi\n<parameter=mode>\nappend\n<parameter=path>\na.txt\n</function>\n</tool_call>";
+        let events = scan(holding(&["write_file"]), &[text]);
+        assert_eq!(args(calls(&events)[0]), serde_json::json!({"content": "hi", "mode": "append", "path": "a.txt"}));
+    }
+
+    #[test]
+    fn only_the_held_tools_calls_read_by_the_confirmed_close() {
+        // `read` is not held: its value is cut at the first `</parameter>`.
+        let free = "<tool_call>\n<function=read>\n<parameter=path>\na\n</parameter>\nb\n</parameter>\n</function>\n</tool_call>";
+        let held = write_call("a\n</parameter>\nb");
+        let events = scan(holding(&["write_file"]), &[free, &held]);
+        let calls = calls(&events);
+        assert_eq!(args(calls[0]), serde_json::json!({"path": "a"}));
+        assert_eq!(args(calls[1])["content"], "a\n</parameter>\nb");
+        assert_eq!((calls[0].index, calls[1].index), (0, 1));
+    }
+
+    #[test]
+    fn a_scan_ending_at_its_first_call_ends_at_a_held_calls_confirmed_close() {
+        let text = format!("{}\n{SECOND}", write_call(FILE_ABOUT_CALLS));
+        let mut scanner = holding(&["write_file"]).ending_at_first_call(true);
+        let events = scanner.feed(&text);
+        assert!(scanner.ended());
+        assert_eq!(calls(&events).len(), 1);
+        assert_eq!(args(calls(&events)[0])["content"], FILE_ABOUT_CALLS);
+    }
+
+    /// The counts of `chunks` through a checking scanner over
+    /// [`write_file_tools`], none held: the values split, and the calls.
+    fn split_values(chunks: &[&str]) -> (String, String) {
+        let tools = write_file_tools();
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let scanner = holding(&[]).checking(CallCheck::new(&tools, Some(&metrics)));
+        let events = scan(scanner, chunks);
+        let text = metrics.render();
+        let value = |series: &str| {
+            text.lines().find_map(|line| line.strip_prefix(series).map(|v| v.trim().to_owned())).unwrap_or_else(|| "absent".into())
+        };
+        (value("ignis_tool_call_values_split_total "), format!("{} calls", calls(&events).len()))
+    }
+
+    #[test]
+    fn a_value_whose_text_the_cuts_dropped_is_counted_split() {
+        let split = |content: &str| split_values(&[&write_call(content)]);
+        // Text after a `</parameter>` line, after one inside a line, and
+        // after a `</function>` line not followed by `</tool_call>`: dropped
+        // by the cuts, kept by the confirmed close. One each.
+        assert_eq!(split("a\n</parameter>\nb"), ("1".into(), "1 calls".into()));
+        assert_eq!(split("a</parameter>b"), ("1".into(), "1 calls".into()));
+        assert_eq!(split("a\n</function>\nb"), ("1".into(), "1 calls".into()));
+        // Split across chunks, counted once.
+        let text = write_call("a\n</parameter>\nb");
+        assert_eq!(split_values(&text.as_bytes().chunks(5).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>()).0, "1");
+    }
+
+    #[test]
+    fn a_value_the_cuts_dropped_nothing_of_or_the_confirmed_close_never_ends_is_not_counted() {
+        let none = ("0".to_owned(), "1 calls".to_owned());
+        // A plain call, and one with forgotten closers.
+        assert_eq!(split_values(&[&write_call("plain")]), none);
+        let forgotten = "<tool_call>\n<function=write_file>\n<parameter=path>\na\n<parameter=content>\nb\n</function>\n</tool_call>";
+        assert_eq!(split_values(&[forgotten]), none);
+        // Text the cuts moved into another parameter, dropping nothing: an
+        // opener of a written parameter, one inside a line, an undeclared
+        // parameter after a closed value, and values closed on their own
+        // line. The confirmed close would keep the opener in the value, but
+        // it may be the model's own envelope.
+        assert_eq!(split_values(&[&write_call("a\n<parameter=path>\nb")]), none);
+        assert_eq!(split_values(&[&write_call("see <parameter=mode> here")]), none);
+        let invented = "<tool_call>\n<function=write_file>\n<parameter=path>\na\n</parameter>\n<parameter=force>\ntrue\n</parameter>\n<parameter=content>\nb\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(split_values(&[invented]), none);
+        let inline = "<tool_call>\n<function=write_file>\n<parameter=path>a.txt</parameter>\n<parameter=content>b</parameter>\n</function>\n</tool_call>";
+        assert_eq!(split_values(&[inline]), none);
+        // The residue: the value holds its call's own confirmed close, where both rules end it.
+        assert_eq!(split_values(&[&write_call("x\n</function>\n</tool_call>\ny")]).0, "0");
+        // A close with a required parameter missing: the confirmed close would not close at all.
+        let early = "<tool_call>\n<function=write_file>\n<parameter=content>\na\n</parameter>\nb\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(split_values(&[early]), none);
+        // A value cut at a tag whose confirmed end lies past the block's `</tool_call>`: not seen.
+        assert_eq!(split_values(&[&write_call("a\n</parameter>\nb\n</tool_call>\nc")]).0, "0");
+        // Only declared strings count: an integer, an undeclared parameter, an undeclared tool.
+        let typed = "<tool_call>\n<function=write_file>\n<parameter=line>\n1\n</parameter>\nx\n<parameter=path>\na\n</parameter>\n<parameter=content>\nb\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(split_values(&[typed]), none);
+        let undeclared = "<tool_call>\n<function=search>\n<parameter=q>\na\n</parameter>\nb\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(split_values(&[undeclared]), none);
+        // No call, no family.
+        assert_eq!(split_values(&["just text"]), ("absent".into(), "0 calls".into()));
     }
 
     #[test]
