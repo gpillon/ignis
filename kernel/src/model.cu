@@ -1179,8 +1179,8 @@ bool hq_decode_attention_switch(ignis::hq_decode_attention::Switch &named) {
 // per load, after the plan and outside any capture (kernel/src/hq_decode_attention.h): ignis's
 // warp-specialized route over hq-e8-2b on a Blackwell card whose image this binary holds, unless
 // the switch names today's route; today's (the vendored kernel's) everywhere else. False (error
-// set) when the device cannot say its generation. The image probe runs on any card an hq-e8-2b
-// load reaches here on, and finds none on a card the route does not run on.
+// set) when the device cannot say its generation. The image probe runs only on a card the route
+// runs on, so an RTX 30 or 40 load makes no call it did not make before the route existed.
 bool hq_decode_attention_route(ignis::hq_decode_attention::Switch named, int32_t kv_format, bool &ours) {
   ours = false;
   if (kv_format != IGNIS_KV_FORMAT_HQ_E8_2B || named == ignis::hq_decode_attention::Switch::Vendored) {
@@ -1190,7 +1190,8 @@ bool hq_decode_attention_route(ignis::hq_decode_attention::Switch named, int32_t
   if (!device_major("the decode attention", major)) {
     return false;
   }
-  ours = ignis::hq_decode_attention::takes_ours(named, true, major, ignis::hq_decode_attention::image_here());
+  const bool image = ignis::hq_decode_attention::runs_on(major) && ignis::hq_decode_attention::image_here();
+  ours = ignis::hq_decode_attention::takes_ours(named, true, major, image);
   return true;
 }
 
