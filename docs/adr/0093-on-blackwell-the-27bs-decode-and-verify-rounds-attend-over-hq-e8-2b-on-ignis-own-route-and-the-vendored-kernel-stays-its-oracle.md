@@ -16,10 +16,14 @@ kernel as the oracle. Spec #570 built it (#571, #572) and served it (#573), as
 [the finding](../findings/2026-11-14-the-warp-specialized-hq-attention-served-on-the-27b.md) records with its
 figures. As built:
 
-- **The route is ignis's own, in `kernel/src/`**, beside the vendored kernel: `hq_verify_ws_kernel`
-  (`kernel/src/hq_verify_ws.cuh`), its decode warps' group decoder (`kernel/src/hq_decode_lean.cuh`), its one
-  instantiation and image probe (`kernel/src/hq_decode_attention_ws.cu`), and its launcher
-  (`kernel/src/hq_decode_attention.cu`). The launcher restates the vendored small-T call it stands in for (one
+- **The route is ignis's, an adapted op (ADR 0051 tier 2), in `kernel/src/`**, beside the vendored kernel:
+  `hq_verify_ws_kernel` (`kernel/src/hq_verify_ws.cuh`), its decode warps' group decoder
+  (`kernel/src/hq_decode_lean.cuh`), its one instantiation and image probe (`kernel/src/hq_decode_attention_ws.cu`),
+  and its launcher (`kernel/src/hq_decode_attention.cu`). The kernel takes from the reference's hq route, at the
+  commit the manifest pins, its per-lane offsets, neutral partials, bounds, split arithmetic, the fused append's
+  per-row body and the epilogue; the warp roles, the ring and the split of the matrix products are ignis's, and
+  the decoder is ignis's own, from #268's. The file headers and `kernel/NOTICE` name the upstream, its commit,
+  its paths and its licence. The launcher restates the vendored small-T call it stands in for (one
   workspace scope, the split capacity, the three partial tensors in their order and shapes), launches the route
   on the vendored hq route's grid and arguments, and then launches the vendored split reducer, unchanged. The
   route runs one block of 20 warps per SM, twelve decoding keys and values into a ring of shared-memory tiles
@@ -44,8 +48,9 @@ figures. As built:
   load, not a configuration field.
 - **Its win is shown per op, as ADR 0031 asks.** On the RTX 5090 the kernel alone takes 0.58 to 0.84 of the
   throughput form's time on thirteen cells, residual window off and on; Nsight Compute at 8 lanes and 30K keys
-  reads 19.95 resident warps per SM against 7.90; and served at the production flags of main 177175fa, the
-  sampled draft included, rounds a second rise by 1.5% to 10.2% from 7K to 142K tokens of context at one, four
+  reads 19.95 resident warps per SM against 7.90; and served at the production flags of main 177175fa with the
+  host's user configuration (the exception weights in FP8, 1500M of headroom), the sampled draft included,
+  rounds a second rise by 1.5% to 10.2% from 7K to 142K tokens of context at one, four
   and eight lanes, with the one-lane text and tokens a round unchanged.
 
 ## Considered Options

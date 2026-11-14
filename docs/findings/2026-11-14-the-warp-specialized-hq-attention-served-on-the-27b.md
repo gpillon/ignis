@@ -21,10 +21,11 @@
 
 #268 left the 27B's attention over hq-e8-2b in the decode and verify rounds
 latency-bound on registers: 8 warps per SM, 3.9 to 4.9 times its MMA floor.
-Its next step was more warps per SM. Spec #570 built it as a route of ignis's
-own, which decodes keys and values in twelve warps and runs the matrix products
-in eight, byte for byte the reference route's (#571), and made it the default on
-Blackwell with today's route behind a measurement switch (#572). The spec
+Its next step was more warps per SM. Spec #570 built it as a route of ignis's,
+an adapted op (ADR 0051 tier 2) beside the vendored kernel, which decodes keys
+and values in twelve warps and runs the matrix products in eight, byte for byte
+the reference route's (#571), and made it the default on Blackwell with today's
+route behind a measurement switch (#572). The spec
 inferred from the kernel alone about +6%, +10% and +14% rounds a second at one
 lane at 64K, 142K and 253K. What does the kernel table say, what binds the new
 route, and what does the server measure, cell by cell: is any cell slower, is
@@ -119,7 +120,8 @@ before any launch to the build below), on #574's launch protocol:
   launch refused to measure unless its load's `ignis.runtime.decode_routes`
   named its arm's route; every load did (`ours`, `vendored`).
 - **Server**: `make start UI=0 LOOP_GUARD=off IDLE_UNLOAD=0`, main's production
-  flags since 0ba44c53: `--model-artifact ./models/qwen3_8_27b_nvfp4full-v2.ninfer
+  flags since 0ba44c53, with the host's user configuration (the next bullet):
+  `--model-artifact ./models/qwen3_8_27b_nvfp4full-v2.ninfer
   --model-kv-format hq-e8-2b --reuse-kv-host-pool-bytes 8G
   --qwen38flashnext-reuse-kv-host-pool-bytes 2G --spec-backend dflash2
   --spec-draft-tokens 7 --server-ui false --server-system-message-policy merge
@@ -242,8 +244,10 @@ measured CUDA context (GitHub #607), not the route.
   lanes as requests finish, as #268's limits say.
 - **The route changes no text.** It writes the reference route's bytes, so a
   lane's text cannot move with it. The eight-lane differences are the batch's
-  own run-to-run variation: both controls show it, and at 14K two cross-route
-  pairs agree in every lane where both same-route pairs do not.
+  own run-to-run variation: at 14K and 33K both controls show it, at 7K the
+  new route's alone (today's two launches agree in 8 of 8 lanes there), and at
+  14K two cross-route pairs agree in every lane where both same-route pairs do
+  not.
 - **Under sampling the gain is the same.** The attention runs before the
   accept and costs a round the same whatever the draft rule: the sampled cell at
   64K gains 6.0% against the greedy cell's 5.9%, with the same text and the same

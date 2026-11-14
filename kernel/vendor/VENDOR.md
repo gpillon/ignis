@@ -434,7 +434,19 @@ ticket):
   `attn_input_proj`/`linear_add` (P1-11), the vendored wrapper *is* the
   complete public API — every cache dtype (BF16, I8, hq-e8-2b/U8) is
   vendored and compiles, so no leaf-side dispatcher (`kernel/src/*.cu`) is
-  needed for this op.
+  needed for this op. GitHub #572 (spec #570, ADR 0031 option (b), ADR 0093):
+  on Blackwell the hq-e8-2b small-T partial call of the 27B's decode and
+  verify rounds (the batch body, `run_gqa_layer_batch`) left it for ignis's
+  route, `kernel/src/hq_decode_attention.cu`, an adapted op whose partials
+  kernel is `kernel/src/hq_verify_ws.cuh`; the split reducer it launches after
+  them stays this op's, unpatched, and every other call and card keeps the
+  vendored route. The files stay here as they are: the reference hq route is
+  the oracle the route is held to byte for byte
+  (`ignis_kernel_hq_verify_exact_test`) and the throughput form the
+  comparison (`IGNIS_HQ_DECODE_ATTENTION=vendored`). At a reference bump, a
+  change to this op's partials contract (the partial layout, the masks, the
+  neutral partials, the fused append, the residual window) has to reach the
+  route and its exactness test too.
 - **kv_cache_append_prefix** — `ops/kernel/kv_cache_append_prefix.cuh`,
   `ops/launcher/kv_cache_append_prefix.{h,cu}`,
   `ops/wrapper/kv_cache_append_prefix.cpp`,

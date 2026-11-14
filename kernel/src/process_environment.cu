@@ -3,6 +3,7 @@
 #include "process_environment.h"
 
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 
 #ifdef _WIN32
@@ -31,6 +32,14 @@ std::string process_environment(const char *name) {
   const char *v = std::getenv(name);
   return v == nullptr ? std::string() : std::string(v);
 #endif
+}
+
+RouteSwitch route_switch(const char *name) {
+  const std::string named = process_environment(name);
+  if (named.empty()) return RouteSwitch::Unset;
+  if (named == "ours") return RouteSwitch::Ours;
+  if (named == "vendored") return RouteSwitch::Vendored;
+  throw std::invalid_argument(std::string(name) + " is `ours` or `vendored`, not `" + named + "`");
 }
 
 } // namespace ignis

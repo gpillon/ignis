@@ -1,5 +1,8 @@
-// The hq-e8-2b 8-lane group row decode, lean form -- OURS (ADR 0031; spec #570, GitHub #571), the
-// decoder of the warp-specialized verify attention's decode warps (hq_verify_ws.cuh). Bit-exact
+// The hq-e8-2b 8-lane group row decode, lean form -- OURS (ADR 0051 tier 1; spec #570, GitHub
+// #571), the decoder of the warp-specialized verify attention's decode warps (hq_verify_ws.cuh).
+// Its source is ignis's own #268 decoder, not upstream code: hq_decode_row_group_fast, which
+// kernel/vendor/src/ops/kernel/hq_codec.cuh carries as a patch kernel/vendor/manifest.json records
+// (kernel/vendor/patches/src/ops/kernel/hq_codec.cuh.diff; ADR 0031, GitHub #268). Bit-exact
 // against hq_decode_row_group and hq_decode_row_group_fast (kernel/tests/test_hq_codec_kv_rows.cu,
 // the fifth way, called as that route calls it). It builds for every architecture the leaf does.
 #pragma once

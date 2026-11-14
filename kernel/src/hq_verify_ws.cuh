@@ -1,9 +1,26 @@
-// The hq-e8-2b verify attention at the 27B's 48 query rows, warp-specialized -- OURS (ADR 0031:
-// the vendored kernel's routes stay as the oracle; the occupancy step of
-// docs/findings/2026-09-24-hq-verify-decode-cost.md; spec #570, GitHub #571).
+// The hq-e8-2b verify attention at the 27B's 48 query rows, warp-specialized -- an ADAPTED op
+// (ADR 0051 tier 2; ADR 0031 option (b) and ADR 0093: the vendored kernel's routes stay as the
+// oracle; the occupancy step of docs/findings/2026-09-24-hq-verify-decode-cost.md; spec #570,
+// GitHub #571).
 //
-// The same partials as gqa_attention_small_t_tc_partial_bf16_kernel's hq routes, bit for bit,
-// from one block per SM in which the decode and the MMAs no longer take turns:
+// Upstream: the reference, gpillon/ninfer, commit a00648cb828457986cf5b4b4f712b4cbcd7af0d1
+// (the commit kernel/vendor/manifest.json pins), Apache-2.0 (kernel/vendor/LICENSE):
+//   src/ops/kernel/gqa_attention_decode_bf16.cuh
+//       gqa_attention_small_t_tc_partial_bf16_kernel's hq route: the masked columns' count and
+//       the per-lane offsets of q, the positions, the new rows, the table row and the partials;
+//       write_neutral (the neutral partials); the bounds and their early returns; the split
+//       arithmetic (the active splits, tile or key units, the split's key range, its tiles and
+//       pages); the ring-valid row; the fused append's per-unit body (the encode, the residual
+//       row, the ring mark); and the epilogue (each output row un-rotated in shared memory, then
+//       the partial stores).
+// From the vendored reference, called and not copied: the geometry and partial-index helpers
+// (gqa_small_t_tc_row_to_qt, gqa_valid_q_head, gqa_partial_stat_index, gqa_partial_acc_index,
+// gqa_small_t_active_splits, gqa_kv_new_index), the codec's (hq_encode_row_warp,
+// hq_store_rotated_row_warp, hq_ring_mark_valid, hq_ifwht256_sign, hq_engine_signs_fill, the row
+// addresses and the dither seed), div_up, load_vec, store_vec, pdl::sync and pdl::publish.
+//
+// Changes from upstream (ours): the block's structure. The same partials as the hq routes, bit
+// for bit, from one block per SM in which the decode and the MMAs no longer take turns:
 //   - Producers (twelve warps) decode the K and V tiles of the block's split into a ring of
 //     three 32-key role tiles in shared memory, one warp call = four rows, each warp staging
 //     its own code rows by cp.async one call ahead, with hq_decode_row_group_lean (the
@@ -20,8 +37,10 @@
 //     immediate, and step k + 1's fragments load before step k's MMAs.
 //   - Each ring slot has a full and an empty mbarrier; a slot's k-th use waits on parity k & 1
 //     (in-order producers and consumers keep every waiter within one phase of its barrier).
-// The fused append and the epilogue (un-rotation, partial stores) run on every warp; the q
-// staging and rotation on the consumers alone, while the producers decode the first tiles.
+//   - The fused append runs on sixteen warps, its scratch aliasing the ring, and the epilogue
+//     (un-rotation, partial stores) on every warp; the q staging and rotation on the consumers
+//     alone, while the producers decode the first tiles. The decoder is ours too
+//     (hq_decode_lean.cuh).
 // The partial layout, the masks, the neutral partials, the fused append, the residual window
 // and the rotated frame are the vendored kernel's. Launch it as that kernel's hq route, with
 // its arguments, on its grid (KV heads, split capacity, lanes), kHqVerifyWsThreads threads and

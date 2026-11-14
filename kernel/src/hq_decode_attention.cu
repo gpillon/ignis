@@ -1,16 +1,20 @@
 // ignis kernel leaf: the launcher of the 27B's warp-specialized hq-e8-2b attention route in the
-// decode and verify rounds, and the rule that picks it at a load -- OURS (spec #570, GitHub #572;
-// kernel/src/hq_decode_attention.h).
+// decode and verify rounds, and the rule that picks it at a load -- an ADAPTED op (ADR 0051 tier
+// 2; spec #570, GitHub #572; kernel/src/hq_decode_attention.h). The rule (switch_for_load, serves)
+// is our own.
 //
 // The launch restates the vendored call it stands in for, so nothing above the kernel can tell the
-// two apart. From the vendored reference (kernel/vendor, ADR 0010), restated and not changed:
+// two apart. Upstream: the reference, gpillon/ninfer, commit
+// a00648cb828457986cf5b4b4f712b4cbcd7af0d1 (the commit kernel/vendor/manifest.json pins, ADR
+// 0010), Apache-2.0 (kernel/vendor/LICENSE), restated and not changed:
 //   src/ops/wrapper/gqa_attention.cpp   gqa_attention's small-T branch: one workspace scope, the
 //                                       split capacity, and allocate_small_t_workspace's three
 //                                       partial tensors in its order and shapes;
 //   src/ops/launcher/gqa_attention_decode.cu
 //                                       gqa_attention_small_t_launch_for: the hq route's grid and
 //                                       arguments (gqa_attention_decode_hq_routes.cuh), then the
-//                                       reducer's grid, block and arguments.
+//                                       reducer's launch, its block (kReduceBlock, 256), its chunk
+//                                       (kDChunk, 64), its grid and its arguments.
 // Called and not copied: gqa_attention_split_capacity and gqa_attention_resolve_route
 // (ops/launcher/gqa_attention.h), and the reducer itself,
 // gqa_attention_small_t_reduce_output_kernel (ops/kernel/gqa_attention_decode.cuh), instantiated
@@ -71,13 +75,7 @@ cudaError_t reduce(const Tensor &acc, const Tensor &m, const Tensor &l, const Te
 
 }  // namespace
 
-Switch switch_for_load() {
-  const std::string named = ignis::process_environment(kSwitch);
-  if (named.empty()) return Switch::Unset;
-  if (named == "ours") return Switch::Ours;
-  if (named == "vendored") return Switch::Vendored;
-  throw std::invalid_argument(std::string(kSwitch) + " is `ours` or `vendored`, not `" + named + "`");
-}
+Switch switch_for_load() { return ignis::route_switch(kSwitch); }
 
 bool serves(std::int32_t q_heads, std::int32_t width, std::int32_t batch, DType cache_dtype,
             ninfer::ops::GqaExecutionEnvelope envelope) {
