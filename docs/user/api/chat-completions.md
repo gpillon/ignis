@@ -22,7 +22,9 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   `max_tokens` for the answer. A forced close is reported as
   `thinking_budget_forced_at` on the choice (on the finish chunk when
   streaming; top-level on `/v1/responses`): the reasoning tokens emitted when
-  it began. The field is absent when the close was not forced.
+  it began. The field is absent when the close was not forced, and on a turn
+  that a `stop` sequence or `parallel_tool_calls: false` ended before the
+  model did.
 - **A turn that ends inside its reasoning answers.** With thinking on, an end
   of turn the model draws while its reasoning block is still open becomes the
   block's `</think>`, and the model goes on to answer — usually with the call

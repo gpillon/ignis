@@ -778,6 +778,11 @@ pub(crate) mod testing {
     }
 
     pub(crate) fn events(texts: &'static [&'static str], thinking: bool) -> ResponseEvents {
+        events_with(texts, thinking, true)
+    }
+
+    /// [`events`] for a request whose `parallel_tool_calls` is `parallel`.
+    pub(crate) fn events_with(texts: &'static [&'static str], thinking: bool, parallel: bool) -> ResponseEvents {
         let response = ResponseObject {
             id: "resp_0".into(),
             object: "response",
@@ -790,7 +795,7 @@ pub(crate) mod testing {
             max_output_tokens: None,
             model: "m".into(),
             output: Vec::new(),
-            parallel_tool_calls: true,
+            parallel_tool_calls: parallel,
             previous_response_id: None,
             reasoning: JsonValue::Null,
             store: true,
@@ -963,6 +968,48 @@ mod tests {
             assert_eq!(model_view[0]["content"][0]["text"], "kept Wait.");
             assert_eq!(model_view[1], output[1], "the message as it is");
         }
+    }
+
+    /// GitHub #609: a response that ends at its first call reads a run token
+    /// by token, yet a turn it does not cut gives the events the whole-run
+    /// path gives, one delta per channel, items and usage alike, whether it
+    /// ends at its one call or at the engine's finish; only the echo of
+    /// `parallel_tool_calls` differs. A second call in the same run is not
+    /// read, nor counted.
+    #[test]
+    fn a_response_ending_at_its_first_call_gives_the_whole_run_paths_events() {
+        const CALL: &[&str] = &[
+            "plan ", "</thi", "nk>Reading ", "<tool_", "call>\n<function=read>\n<parameter=path>\na.txt\n</para",
+            "meter>\n</function>\n</tool_call>",
+        ];
+        const NO_CALL: &[&str] = &["plan ", "</think>", "just ", "text"];
+        let echo = |mut events: Vec<JsonValue>| {
+            for event in events.iter_mut().filter(|e| e.get("response").is_some()) {
+                event["response"]["parallel_tool_calls"] = json!(null);
+            }
+            events
+        };
+        for texts in [CALL, NO_CALL] {
+            let tokens: Vec<TokenId> = (0..texts.len() as u32).collect();
+            let whole = finished(&mut events(texts, true), &tokens);
+            assert_eq!(of_type(&whole, "response.output_text.delta").len(), 1, "{texts:?}");
+            let mut one = super::testing::events_with(texts, true, false);
+            let mut out = one.on_tokens(&tokens);
+            assert_eq!(one.stopped_at(), (texts == CALL).then_some(texts.len() as u32), "{texts:?}");
+            out.extend(one.on_event(done(tokens.len() as u32)));
+            assert_eq!(echo(out), echo(whole), "{texts:?}");
+        }
+
+        const TWO: &[&str] = &["<tool_call>\n<function=a>\n</function>\n</tool_call>", "\n", "<tool_call>\n<function=b>\n</function>\n</tool_call>", "more"];
+        let mut one = super::testing::events_with(TWO, false, false);
+        let out = one.on_tokens(&[0, 1, 2, 3]);
+        assert_eq!(one.stopped_at(), Some(1), "the tokens up to the close");
+        let names: Vec<&JsonValue> = of_type(&out, "response.function_call_arguments.done").iter().map(|e| &e["name"]).collect();
+        assert_eq!(names, [&json!("a")]);
+        let last = out.last().unwrap();
+        assert_eq!(last["type"], "response.completed");
+        assert_eq!(last["response"]["usage"]["output_tokens"], 1);
+        assert!(one.on_event(done(4)).is_empty() && one.cut().is_empty(), "an ended response takes no later ending");
     }
 
     /// A round's tokens waiting together are one delta, and the ending still

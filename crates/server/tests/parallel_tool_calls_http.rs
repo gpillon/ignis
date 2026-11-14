@@ -21,7 +21,7 @@ use ignis_core::{MockCompute, SchedulerConfig};
 use serde_json::{json, Value as JsonValue};
 use tower::ServiceExt;
 
-use responses::{events_until, live, send, server, socket, sse_events, terminal, Script, MODEL};
+use responses::{events_until, live, metric_reaches, send, server, socket, sse_events, terminal, Script, MODEL};
 
 const FIRST: &str = "<tool_call>\n<function=read_file>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>";
 /// A second call, whose argument no answer that ends at the first call
@@ -262,6 +262,34 @@ async fn false_ends_the_turn_at_its_first_call_on_every_surface_and_both_familie
                 assert!(!got.raw.contains('?'), "a token past the close reached the client: {case}");
                 released_early(&mock).await;
             }
+        }
+    }
+}
+
+/// The model's own end right behind the close, as a real turn writes it:
+/// the stop and the engine's finish race, and the request is counted once,
+/// completed and never cancelled, on every surface, the finish in the same
+/// decode run as the close or a round later.
+#[tokio::test]
+async fn a_turn_whose_model_ends_right_after_its_call_is_counted_once_as_completed() {
+    for runs in [false, true] {
+        for surface in SURFACES {
+            let (server, _) = writing(SPLIT, Some(2), ModelFamily::Qwen38_27b, runs);
+            let server = server.with_metrics();
+            let metrics = server.metrics.clone().unwrap();
+            let again = server.clone().app();
+            let got = turn(server, surface, &body(surface, Some(false), &json!({}))).await;
+            let case = format!("{surface:?} runs {runs}: {got:?}");
+            assert_eq!(got.paths, ["a.txt"], "{case}");
+            assert_eq!(got.finish, called(surface), "{case}");
+            assert_eq!(got.tokens, 2, "{case}");
+            // A request behind it: counted, it follows every fact of the
+            // first, which a second count or a cancel would have moved.
+            let plain = json!({ "model": MODEL, "messages": [{ "role": "user", "content": "hi" }], "max_tokens": 1, "enable_thinking": false });
+            post(&again, "/v1/chat/completions", &plain).await;
+            metric_reaches(&metrics, "ignis_requests_completed_total 2").await;
+            metric_reaches(&metrics, "ignis_generated_tokens_total 3").await;
+            metric_reaches(&metrics, "ignis_requests_cancelled_total 0").await;
         }
     }
 }

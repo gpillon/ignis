@@ -31,8 +31,9 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   at the close of its first call and completes with that one
   `function_call` item, over HTTP and over the WebSocket mode, which is what
   an agent CLI that sends `false` on every request asks for. Nothing
-  generated after that close is sent or counted in `usage`, and a call
-  written inside the reasoning ends nothing. `true` or absent serves every
+  generated after that close is sent or counted in `usage`, a call written
+  inside the reasoning ends nothing, and such a response carries no
+  `thinking_budget_forced_at`. `true` or absent serves every
   call the model writes; the response echoes the value
   ([chat completions](chat-completions.md) has the same rule).
 - **What it cannot do is refused**, with OpenAI's error and a `param`, never
