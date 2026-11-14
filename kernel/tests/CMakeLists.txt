@@ -369,9 +369,14 @@ add_test(NAME ignis_hq_codec_test COMMAND ignis_hq_codec_test)
 # the test does not depend on CTest's working directory. Same
 # no-SKIP_RETURN_CODE rule as every other GPU test here (ADR 0006): a
 # missing or corrupt fixture is this test's own hard failure, not a skip.
+# GitHub #571: it also holds the lean group decoder of the warp-specialized
+# verify route (kernel/src/hq_decode_lean.cuh, a leaf-internal header, hence
+# the include of kernel/src) to the vendored decode ways on every corpus, in
+# both registrations; that decoder builds for every architecture.
 add_executable(ignis_hq_codec_kv_rows_test test_hq_codec_kv_rows.cu)
 target_compile_definitions(ignis_hq_codec_kv_rows_test PRIVATE
   IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
+target_include_directories(ignis_hq_codec_kv_rows_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_hq_codec_kv_rows_test PRIVATE ignis_vendor)
 add_test(NAME ignis_hq_codec_kv_rows_test COMMAND ignis_hq_codec_kv_rows_test)
 
@@ -384,6 +389,7 @@ add_executable(ignis_hq_codec_kv_rows_flash_next_test test_hq_codec_kv_rows.cu)
 target_compile_definitions(ignis_hq_codec_kv_rows_flash_next_test PRIVATE
   IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_flash_next.bin"
   IGNIS_HQ_KV_FLASH_NEXT=1)
+target_include_directories(ignis_hq_codec_kv_rows_flash_next_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_hq_codec_kv_rows_flash_next_test PRIVATE ignis_vendor)
 add_test(NAME ignis_hq_codec_kv_rows_flash_next_test COMMAND ignis_hq_codec_kv_rows_flash_next_test)
 
@@ -397,10 +403,13 @@ target_link_libraries(ignis_hq_prompt_bench PRIVATE ignis_kernel ignis_vendor)
 # timed alone at the engine's real launch, over code planes encoded from the
 # same committed fixture rows, plus a hash of its partials so two builds can
 # be compared bit for bit. A timing is a finding, not a pass/fail, so this is
-# a tool and deliberately NOT registered with CTest.
+# a tool and deliberately NOT registered with CTest. GitHub #571: the same
+# binary times the reference route (--reference), today's throughput route
+# and ignis's warp-specialized route (--ws12, kernel/src/hq_verify_ws.cuh).
 add_executable(ignis_hq_verify_bench bench_hq_verify_attention.cu)
 target_compile_definitions(ignis_hq_verify_bench PRIVATE
   IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
+target_include_directories(ignis_hq_verify_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_hq_verify_bench PRIVATE ignis_vendor)
 
 # GitHub #268: OURS -- ADR 0031's oracle for the patched hq verify kernel. The
@@ -408,10 +417,16 @@ target_link_libraries(ignis_hq_verify_bench PRIVATE ignis_vendor)
 # K/V phases) against the reference route of the same kernel
 # (IgnisThroughput = false), on caches encoded from the committed fixture:
 # every partial byte and every cache byte the fused append writes must match.
-# Same no-SKIP_RETURN_CODE rule as every other GPU test here (ADR 0006).
+# GitHub #571 (spec #570): ignis's warp-specialized route
+# (kernel/src/hq_verify_ws.cuh) is held to the same reference on every shape,
+# at compute capability 12.0 and up. On an older card, from a build whose list
+# covers it (IGNIS_CUDA_ARCHITECTURES, #456), that route's kernel is a trap
+# and the test runs the throughput route alone, so it takes no sm120a-only
+# label. Same no-SKIP_RETURN_CODE rule as every other GPU test here (ADR 0006).
 add_executable(ignis_kernel_hq_verify_exact_test test_hq_verify_exact.cu)
 target_compile_definitions(ignis_kernel_hq_verify_exact_test PRIVATE
   IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
+target_include_directories(ignis_kernel_hq_verify_exact_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_hq_verify_exact_test PRIVATE ignis_vendor)
 add_test(NAME ignis_kernel_hq_verify_exact_test COMMAND ignis_kernel_hq_verify_exact_test)
 

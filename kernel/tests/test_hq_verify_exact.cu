@@ -1,6 +1,7 @@
 // GitHub #268 (spec runtime/09): the hq-e8-2b verify attention kernel's
 // throughput form against its reference form, bit for bit -- OURS, not
-// vendored.
+// vendored. GitHub #571 (spec #570): ignis's warp-specialized route against
+// the same reference.
 //
 // ADR 0031 lets a vendored kernel measured as the bottleneck carry a recorded
 // patch, on one condition: where the op is exact, the patched op computes the
@@ -15,8 +16,14 @@
 //                            shared memory with K and V taking turns in one
 //                            tile, each role's code rows staged one phase
 //                            ahead by cp.async, the throughput group decoder.
+//   ws12 (ours)              kernel/src/hq_verify_ws.cuh: one 640-thread block
+//                            per SM, twelve decode warps (the lean group
+//                            decoder) feeding eight MMA warps through a ring
+//                            of tiles. Blackwell's route: it runs here only
+//                            at compute capability 12.0 and up, and a build
+//                            for an older card compiles it as a trap there.
 //
-// Both run on identical inputs -- the same paged cache encoded from the
+// All run on identical inputs -- the same paged cache encoded from the
 // committed real K/V rows under their true dither seeds, the same q, the same
 // positions -- over the shapes the verify round uses and the ones it may: one
 // and several lanes, widths 1..8, masked columns, a column offset, a permuted
@@ -24,8 +31,14 @@
 // split capacities (grid.y) of 4, 23, 40 and 85,
 // the residual window on and off with cleared ring slots, and the fused append
 // (GqaAppendInput) as well as a pre-filled cache (GqaCachedInput). Every byte
-// of the partials must match, and with the append so must every byte the
-// kernel wrote into the cache.
+// of the partials must match the reference's, and with the append so must
+// every byte the kernel wrote into the cache.
+//
+// The grid is the engine's on every card: (KV heads, split capacity, lanes),
+// the capacity from the visible keys alone (the vendored launch's split
+// policy, capped at 85), never from the card's SM count. A card with fewer
+// SMs runs the same blocks in more waves, each block on its own, so these
+// shapes are a smaller Blackwell card's too (spec #570, story 17).
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU, a
 // kernel error or a missing fixture fails this test.
@@ -37,9 +50,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "ops/kernel/gqa_attention_decode_hq.cuh"
+
+#include "hq_verify_ws.cuh"
 
 using namespace ninfer;
 using namespace ninfer::ops;
@@ -181,17 +197,31 @@ struct Case {
     int splits = kSplits;      // the launch's split capacity (grid.y); serving uses 4..85
 };
 
-template <typename CacheInput, bool Throughput>
+enum class Route { reference, throughput, ws12 };
+
+// ws12 is Blackwell's (kernel/src/hq_verify_ws.cuh): below compute capability 12.0 its kernel
+// is a trap, so it is not launched there.
+bool g_ws12_card = false;
+
+template <typename CacheInput, Route R>
 void launch(const Case& c, const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
             GqaTcKVHq kv, const std::int32_t* tables, const std::int32_t* valid,
             const std::int32_t* table_rows, int table_stride, __nv_bfloat16* acc, float* m,
             float* l) {
     const dim3 grid(kHeads, c.splits, static_cast<unsigned>(c.windows.size()));
-    gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, kTokenTile, 4, true, true, CacheInput,
-                                                 GqaTcKVHq, Throughput>
-        <<<grid, kGqaHqDecodeThreads>>>(q, input, pos, kv, tables, valid, table_rows, table_stride,
-                                        c.tokens, c.full_width, c.column_begin, 262144,
-                                        1.0f / 16.0f, acc, m, l);
+    if constexpr (R == Route::ws12) {
+        ignis_hq_verify::hq_verify_ws_kernel<Geometry, CacheInput>
+            <<<grid, ignis_hq_verify::kHqVerifyWsThreads>>>(
+                q, input, pos, kv, tables, valid, table_rows, table_stride, c.tokens,
+                c.full_width, c.column_begin, 262144, 1.0f / 16.0f, acc, m, l);
+    } else {
+        gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, kTokenTile, 4, true, true,
+                                                     CacheInput, GqaTcKVHq,
+                                                     R == Route::throughput>
+            <<<grid, kGqaHqDecodeThreads>>>(q, input, pos, kv, tables, valid, table_rows,
+                                            table_stride, c.tokens, c.full_width, c.column_begin,
+                                            262144, 1.0f / 16.0f, acc, m, l);
+    }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -354,24 +384,19 @@ void run_case(const Case& c, const Rows& rows, const __nv_bfloat16* d_rows) {
         if (c.residual) { o.side_k = to_host(kv.residual_k, side_bytes); o.side_v = to_host(kv.residual_v, side_bytes); }
         return o;
     };
-    auto run = [&](bool throughput) {
+    auto run = [&](auto route) {
+        constexpr Route R = decltype(route)::value;
         restore();
         if (c.append) {
             const GqaAppendInput input{d_k_new, d_v_new};
-            if (throughput) {
-                launch<GqaAppendInput, true>(c, d_q, input, d_pos, kv, d_tables, d_valid, d_table_rows, pages_per_lane, d_acc, d_m, d_l);
-            } else {
-                launch<GqaAppendInput, false>(c, d_q, input, d_pos, kv, d_tables, d_valid, d_table_rows, pages_per_lane, d_acc, d_m, d_l);
-            }
-        } else if (throughput) {
-            launch<GqaCachedInput, true>(c, d_q, GqaCachedInput{}, d_pos, kv, d_tables, d_valid, d_table_rows, pages_per_lane, d_acc, d_m, d_l);
+            launch<GqaAppendInput, R>(c, d_q, input, d_pos, kv, d_tables, d_valid, d_table_rows, pages_per_lane, d_acc, d_m, d_l);
         } else {
-            launch<GqaCachedInput, false>(c, d_q, GqaCachedInput{}, d_pos, kv, d_tables, d_valid, d_table_rows, pages_per_lane, d_acc, d_m, d_l);
+            launch<GqaCachedInput, R>(c, d_q, GqaCachedInput{}, d_pos, kv, d_tables, d_valid, d_table_rows, pages_per_lane, d_acc, d_m, d_l);
         }
         return capture();
     };
-    const Out ref  = run(false);
-    const Out fast = run(true);
+    const Out ref  = run(std::integral_constant<Route, Route::reference>{});
+    const Out fast = run(std::integral_constant<Route, Route::throughput>{});
 
     // The reference must have produced real attention, not only neutral
     // partials: some split of some row has l > 0.
@@ -381,19 +406,24 @@ void run_case(const Case& c, const Rows& rows, const __nv_bfloat16* d_rows) {
         std::memcpy(&v, ref.l.data() + i, 4);
         any_mass = v > 0.0f && v < 1e30f;
     }
-    const std::size_t d_acc_n = differing(ref.acc, fast.acc), d_m_n = differing(ref.m, fast.m),
-                      d_l_n = differing(ref.l, fast.l);
-    const std::size_t d_cache = differing(ref.codes_k, fast.codes_k) + differing(ref.codes_v, fast.codes_v) +
-                                differing(ref.meta_k, fast.meta_k) + differing(ref.meta_v, fast.meta_v) +
-                                differing(ref.side_k, fast.side_k) + differing(ref.side_v, fast.side_v);
     const std::size_t appended = differing(codes_k0, ref.codes_k) + differing(codes_v0, ref.codes_v);
-    std::printf("%-44s partial bytes differing: acc %zu of %zu, m %zu, l %zu; cache bytes differing %zu "
-                "(append changed %zu code bytes)\n",
-                c.name, d_acc_n, ref.acc.size(), d_m_n, d_l_n, d_cache, appended);
     check(any_mass, std::string(c.name) + ": the reference route produced no attention mass");
-    check(d_acc_n == 0 && d_m_n == 0 && d_l_n == 0,
-          std::string(c.name) + ": the throughput route's partials differ from the reference route's");
-    check(d_cache == 0, std::string(c.name) + ": the routes left different cache bytes");
+    auto compare = [&](const Out& o, const char* route) {
+        const std::size_t d_acc_n = differing(ref.acc, o.acc), d_m_n = differing(ref.m, o.m),
+                          d_l_n = differing(ref.l, o.l);
+        const std::size_t d_cache = differing(ref.codes_k, o.codes_k) + differing(ref.codes_v, o.codes_v) +
+                                    differing(ref.meta_k, o.meta_k) + differing(ref.meta_v, o.meta_v) +
+                                    differing(ref.side_k, o.side_k) + differing(ref.side_v, o.side_v);
+        std::printf("%-44s %-10s partial bytes differing: acc %zu of %zu, m %zu, l %zu; cache bytes "
+                    "differing %zu (append changed %zu code bytes)\n",
+                    c.name, route, d_acc_n, ref.acc.size(), d_m_n, d_l_n, d_cache, appended);
+        check(d_acc_n == 0 && d_m_n == 0 && d_l_n == 0,
+              std::string(c.name) + ": the " + route + " route's partials differ from the reference route's");
+        check(d_cache == 0, std::string(c.name) + ": the " + route +
+                                " route left different cache bytes than the reference route");
+    };
+    compare(fast, "throughput");
+    if (g_ws12_card) { compare(run(std::integral_constant<Route, Route::ws12>{}), "ws12"); }
     check(!c.append || appended > 0, std::string(c.name) + ": the fused append wrote nothing");
 
     CUDA_CHECK(cudaFree(d_tables));
@@ -424,6 +454,12 @@ int main() {
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     std::printf("device: %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
+    g_ws12_card = prop.major >= 12;
+    if (!g_ws12_card) {
+        std::printf("compute capability %d.%d: the ws12 route is Blackwell's and does not run on "
+                    "this card; the throughput route against the reference only\n",
+                    prop.major, prop.minor);
+    }
     const Rows rows = load_rows(IGNIS_HQ_KV_FIXTURE_PATH);
     __nv_bfloat16* d_rows;
     CUDA_CHECK(cudaMalloc(&d_rows, rows.bits.size() * 2));
@@ -452,6 +488,7 @@ int main() {
         std::fprintf(stderr, "test_hq_verify_exact: %d failures\n", g_failed);
         return EXIT_FAILURE;
     }
-    std::printf("test_hq_verify_exact: ALL PASSED\n");
+    std::printf("test_hq_verify_exact: ALL PASSED (%zu shapes, routes held to the reference: %s)\n",
+                cases.size(), g_ws12_card ? "throughput, ws12" : "throughput");
     return 0;
 }
