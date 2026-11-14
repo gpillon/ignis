@@ -10,7 +10,7 @@ same process add back what the process already holds. Both took their figures fr
 RTX 5090 under Windows: `CUDA_CONTEXT_BYTES` (452,595,712 bytes) for the context and
 `QWEN27B_PROCESS_STATE_BYTES` (83,894,272) for the state a 27B load leaves, and every card and OS charged and
 added back the same two. The RTX 5080 under Linux holds 299,892,736 bytes after a 27B teardown (NVML's figure
-for the process, in the fork xzzqqq/ignis-5080), so its cold start charged 236,597,248 bytes more than the
+for the process, measured in the RTX 5080 fork GitHub #604 links), so its cold start charged 236,597,248 bytes more than the
 process holds, and its reload, adding back those constants, reserved 5,242 KV pages against 4,858 cold. The
 reload's plan charges again what it adds back, so it was sized to the memory actually free; the plan that
 was off is the cold start's. Under WSL a context made through the driver API took 519,270,400 bytes on the
@@ -59,7 +59,7 @@ every other process on the card, which is why the window is short and the readin
 
 ## Considered Options
 
-- **The fork's fix** (xzzqqq/ignis-5080 f09c53f2): on Linux only, add back NVML's per-process figure whole,
+- **The fork's fix** (f09c53f2, which GitHub #604 links): on Linux only, add back NVML's per-process figure whole,
   and refuse the load where it cannot be read. It leaves the cold start's over-charge in place and makes the
   reload match it, not the card; under WSL it reads 0 for a PID the list does not carry and adds back
   nothing; and it refuses a load over a figure that only sizes a reload.

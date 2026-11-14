@@ -385,11 +385,10 @@ impl MeasureClock for WallClock {
 
 /// What the CUDA context took (GitHub #604): `before`, NVML's free memory
 /// read just before the context was made, less `read`'s free memory after
-/// it. `read` is asked every [`CONTEXT_READ_EVERY`], and its readings are
-/// taken once they have held within [`CONTEXT_STILL_WITHIN_BYTES`] of one
-/// another for [`CONTEXT_STILL_FOR`], the lowest of them; at
-/// [`CONTEXT_READ_WITHIN`] the lowest reading seen is taken, the largest
-/// difference: an over-charge, never short. A reading that fails is
+/// it. `read` is asked every 10 ms, and its readings are taken once they
+/// have held within 1 MiB of one another for 250 ms, the lowest of them; at
+/// 2 s the lowest reading seen is taken, the largest difference: an
+/// over-charge, never short. A reading that fails is
 /// [`ContextReading::Unreadable`]; a difference of zero or less,
 /// [`ContextReading::NotLower`].
 pub fn measure_context(
