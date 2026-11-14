@@ -20,6 +20,11 @@
 //!   where it stands (the repair). The permitted set holds every token that keeps the answer
 //!   completable: no state is a dead end.
 //!
+//! - [`validate`]: the validator (#608), a value checked against its schema
+//!   as JSON Schema reads it, each violation named by its kind: what the
+//!   server checks every tool call's arguments against, and the oracle of
+//!   the grammar's property tests.
+//!
 //! It is our own Rust (no grammar engine), CPU-only; `regex-automata` builds
 //! the DFAs of `pattern` and `format`.
 
@@ -32,6 +37,7 @@ mod number;
 mod regex;
 mod schema;
 mod string;
+pub mod validate;
 mod vocab;
 
 use std::sync::Arc;
