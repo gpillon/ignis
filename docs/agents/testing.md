@@ -33,16 +33,23 @@ until the test suite is green.
   #456), run CTest as `ctest -LE sm120a-only`: the tests that label leaves out
   exercise the kernels only the sm_120a set holds, and fail there by design.
   `ignis_kernel_gdn_gating_proj_tests` runs cooperative schedules sized for
-  the RTX 5090's 170 SMs: on a card that cannot hold one resident (fewer SMs,
-  or an sm_86 build's fewer CTAs per SM) it skips each one the planner's own
-  residency query refuses there and names it in a `SKIP` line of its output
-  (#478, a portability patch under ADR 0077). A projection case the planner
-  then runs on the unsplit route is held to that route's own error
-  criterion, derived in the test's comment, three times the split-K one. Its
-  `budget` lines give each
+  the RTX 5090's 170 SMs. Where a card cannot hold a route's own schedule
+  resident (fewer SMs, or an sm_86 build's fewer CTAs per SM) the planner
+  runs a fallback: the largest smaller split the card holds, unsplit when
+  none fits, the composed route for the 27B's fused norm/control cases
+  (#478, #602, portability patches under ADR 0077). The test runs its case
+  list at the card's own SM count, then under a test-only cap on the SM count
+  the planner reads, 84 (the RTX 5080) and 36 (the RTX 5060 Ti), each below
+  the card's own, so the 5090 runs a smaller card's routes; every line of a
+  pass names its SM count (`[170 SMs]`, `[cap 84 SMs]`), and a `FALLBACK`
+  line names each case the planner runs on a fallback, the route's schedule
+  and the one it runs. An unsplit fallback is held to that route's own error
+  criterion, derived in the test's comment, three times the split-K one; a
+  `capacity` line gives each interval's workspace capacity and the widest
+  single call, which it must equal. Its `budget` lines give each
   cooperative kernel's CTAs per SM; on compute capability 12.0 it fails if
-  one is not the value the planner was tuned on, and on the 5090 if it skips
-  any schedule. The one kernel-adjacent thing
+  one is not the value the planner was tuned on, and on the 5090 if a case
+  falls back with no cap. The one kernel-adjacent thing
   `cargo test` *does* check is the vendored subtree's integrity
   (`crates/vendor`): a vendored file edited without a recorded patch turns the
   workspace red (ADR 0010, `kernel/vendor/VENDOR.md`).
@@ -468,8 +475,9 @@ stops the release. Check `make gpu-status` first, as for any GPU run.
    on the card, and is not the gate.)
 2. **The leaf's tests**: built for `86;120a`, then `ctest -LE sm120a-only`.
    Every test passes. In `ignis_kernel_gdn_gating_proj_tests` the `budget`
-   lines and the `SKIP` lines that name the cooperative schedules the card
-   cannot hold resident (#478) are expected; a failure is not.
+   lines, and the `FALLBACK` lines that name, with the SM count or cap of
+   their pass, the cases whose route's schedule the card cannot hold resident
+   (#478, #602), are expected; a failure is not.
 3. **Smoke**: a server started under `--profile auto` (on a 24 GB card,
    `rtx-24gb`, which turns DFlash2 and vision on; its `GET /v1/config` reports
    `prefill_linear` and `prefill_attention` as `int8`, the card their source)
