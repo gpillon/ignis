@@ -253,8 +253,9 @@ export type StructuredOutputCard = {
 /**
  * The Tool calls card's figures (#608): the call blocks the model wrote over
  * the window, by what the check against their tools' parameters found, the
- * share that failed it, the invalid ones by kind of violation, and the strict
- * tools that came outside the strict subset.
+ * share that failed it, the invalid ones by kind of violation, the strict
+ * tools that came outside the strict subset, and the values split at a tag
+ * (#610).
  */
 export type ToolCallsCard = {
   calls: Tally;
@@ -263,6 +264,8 @@ export type ToolCallsCard = {
   failedShare: number | null;
   violations: Record<ToolCallViolation, Tally>;
   strictOutsideSubset: Tally;
+  /** String values of tools not held cut at a tag the confirmed close reads as text (#610). */
+  valuesSplit: Tally;
 };
 
 /**
@@ -715,6 +718,7 @@ export function deriveToolCalls(points: Point[], since: number): ToolCallsCard {
       TOOL_CALL_VIOLATIONS.map((kind) => [kind, tally((s) => s.toolCalls?.violations[kind] ?? null)]),
     ) as Record<ToolCallViolation, Tally>,
     strictOutsideSubset: tally((s) => s.toolCalls?.strictOutsideSubset ?? null),
+    valuesSplit: tally((s) => s.toolCalls?.valuesSplit ?? null),
   };
 }
 

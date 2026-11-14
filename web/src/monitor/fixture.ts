@@ -438,6 +438,9 @@ ignis_tool_call_violations_total{kind="undeclared_tool"} 0
 # HELP ignis_tool_strict_outside_subset_total Strict tools (strict: true) whose parameters lie outside OpenAI's strict subset, once per request that sends one; served as any other tool.
 # TYPE ignis_tool_strict_outside_subset_total counter
 ignis_tool_strict_outside_subset_total 5
+# HELP ignis_tool_call_values_split_total String values of calls to tools that are not held, which the parser ended at a tag inside them where a held tool's rule, the confirmed close, would have read on to a later step of the call.
+# TYPE ignis_tool_call_values_split_total counter
+ignis_tool_call_values_split_total 2
 `;
 
 export const TOOL_CALL_EXPOSITION = `${IGNIS_EXPOSITION}${TOOL_CALL_FAMILIES}`;

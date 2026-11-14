@@ -39,6 +39,18 @@ never how the automaton stores its states.
   `tools/grammar-check/validate.py`, to `jsonschema` (`ours valid, theirs
   valid: N` and `ours invalid, theirs invalid: M`, 0 disagreements), the
   Python found as below and skipped or failed on CI the same way.
+- **Where a value ends** (`ignis_grammar::call`, #610, ADR 0094): the rule
+  the call parser and a held tool's grammar share. `cargo test -p
+  ignis-grammar --lib call` pins it on bytes (a `</parameter>` line followed
+  by text, openers of a written or undeclared parameter, a `</function>` not
+  followed by `</tool_call>`, a forgotten closer, a close with a required
+  parameter missing, the residue, whitespace and newlines between the tags,
+  every prefix of a step pending) and holds a line's answer stable as bytes
+  arrive. `cargo test -p ignis-server --lib toolcall` holds the parser's
+  first-occurrence cuts to a verbatim copy of the pre-#610 parser on 20,000
+  generated tag soups, fed in random chunks, checked or not, ending at the
+  first call or not, and reads a held call (`ToolCallScanner::holding`, which
+  no caller sets yet) whole and split at every byte.
 
 ## The bench and the independent validator
 
@@ -107,7 +119,10 @@ The measured figures are in
   stream assembles to); a call the first token writes is counted once, not
   again by the first-token probe; under `parallel_tool_calls: false` (#609)
   only the block that ends the turn is counted, a dropped one included;
-  strict tools outside the subset are counted and served.
+  strict tools outside the subset are counted and served; a value cut at a
+  `</parameter>` line the confirmed close would read on is counted split
+  (#610), and a plain value, the residue and a close with its required
+  parameter missing are not.
 - **The independent validator in the served tests**: the schema answers go
   through `tools/grammar-check/validate.py` with the Python of
   `IGNIS_GRAMMAR_CHECK_PYTHON`, else the venv at `.scratch/grammar-venv`

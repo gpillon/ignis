@@ -735,10 +735,13 @@ pub struct Metrics {
     /// parser closed, per [`TOOL_CALL_OUTCOMES`]; the invalid ones per
     /// [`CallViolation::ALL`], once under each kind they have; and the strict
     /// tools whose parameters lie outside OpenAI's strict subset. Absent until
-    /// one of them moves, then whole.
+    /// one of them moves, then whole. With them (GitHub #610), the string
+    /// values of calls to tools not held that the first-occurrence cuts
+    /// ended at a tag where the confirmed close would have read on.
     tool_calls: [AtomicU64; TOOL_CALL_OUTCOMES.len()],
     tool_call_violations: [AtomicU64; CallViolation::ALL.len()],
     tool_strict_outside_subset: AtomicU64,
+    tool_call_values_split: AtomicU64,
     /// The loop guard (GitHub #330): the requests it watched and those that
     /// looped, its loops per [`LoopOutcome::ALL`], the tokens its rewinds
     /// took back, and each watched request's lowest score. Absent from the
@@ -939,6 +942,7 @@ impl Metrics {
             tool_calls: Default::default(),
             tool_call_violations: Default::default(),
             tool_strict_outside_subset: AtomicU64::new(0),
+            tool_call_values_split: AtomicU64::new(0),
             loop_guard_watched: AtomicU64::new(0),
             loop_guard_looped: AtomicU64::new(0),
             loop_guard_loops: Default::default(),
@@ -1095,6 +1099,14 @@ impl Metrics {
     /// OpenAI's strict subset (GitHub #608), served as any other tool.
     pub(crate) fn record_strict_tools_outside_subset(&self, tools: u64) {
         self.tool_strict_outside_subset.fetch_add(tools, Ordering::Relaxed);
+    }
+
+    /// A call to a tool that is not held, just counted by
+    /// [`Metrics::record_tool_call`], had `values` string values the
+    /// first-occurrence cuts ended at a tag inside them, where the confirmed
+    /// close would have read on to a later step of the call (GitHub #610).
+    pub(crate) fn record_tool_call_values_split(&self, values: u64) {
+        self.tool_call_values_split.fetch_add(values, Ordering::Relaxed);
     }
 
     /// A request the loop guard watched ended (GitHub #330). Recorded by the
@@ -1758,6 +1770,13 @@ impl Metrics {
                 "Strict tools (strict: true) whose parameters lie outside OpenAI's strict subset, once per request that sends one; served as any other tool.",
             );
             let _ = writeln!(out, "ignis_tool_strict_outside_subset_total {strict_outside}");
+            declare(
+                &mut out,
+                "ignis_tool_call_values_split_total",
+                "counter",
+                "String values of calls to tools that are not held, which the parser ended at a tag inside them where a held tool's rule, the confirmed close, would have read on to a later step of the call.",
+            );
+            let _ = writeln!(out, "ignis_tool_call_values_split_total {}", read(&self.tool_call_values_split));
         }
         // GitHub #330: the loop guard, absent until a request it watched
         // ended or it saw a loop (a load that runs it `off` exports nothing
@@ -2344,6 +2363,7 @@ mod tests {
                 ("ignis_tool_calls_total", "counter"),
                 ("ignis_tool_call_violations_total", "counter"),
                 ("ignis_tool_strict_outside_subset_total", "counter"),
+                ("ignis_tool_call_values_split_total", "counter"),
             ],
         );
         assert_eq!(value(&text, "ignis_tool_calls_total", "outcome=\"valid\""), "0");
@@ -2353,6 +2373,10 @@ mod tests {
         assert_eq!(value(&text, "ignis_tool_call_violations_total", "kind=\"undeclared_tool\""), "1");
         assert_eq!(value(&text, "ignis_tool_call_violations_total", "kind=\"constraint\""), "0");
         assert_eq!(value(&text, "ignis_tool_strict_outside_subset_total", ""), "0");
+        assert_eq!(value(&text, "ignis_tool_call_values_split_total", ""), "0");
+        metrics.record_tool_call(&CallVerdict::Valid);
+        metrics.record_tool_call_values_split(2);
+        assert_eq!(value(&metrics.render(), "ignis_tool_call_values_split_total", ""), "2");
         // A strict tool outside the subset alone brings the whole family in.
         let strict = Metrics::new();
         strict.record_strict_tools_outside_subset(2);

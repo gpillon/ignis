@@ -1269,12 +1269,14 @@ function ToolCallsView({ tools, win }: { tools: ToolCallsCard; win: string }) {
           ["Dropped", formatCount(tools.byOutcome.dropped.window)],
           ["Failed", formatShare(tools.failedShare, 1)],
           ["Strict, outside the subset", formatCount(tools.strictOutsideSubset.window)],
+          ["Values split at a tag", formatCount(tools.valuesSplit.window)],
         ]}
       />
       {kinds.length > 0 && <p className="text-[11px] text-ash">Invalid calls: {kinds.join("; ")}.</p>}
       <p className="text-[11px] text-ash">
         Every call the model writes is checked as it closes and delivered as written. A dropped call is a block that did not parse, which the
-        client never sees. A strict tool outside OpenAI's strict subset is served as any other.
+        client never sees. A strict tool outside OpenAI's strict subset is served as any other. A value split at a tag is a string the parser
+        ended at a tag inside it, where a held tool's rule would have read on.
       </p>
     </Card>
   );
