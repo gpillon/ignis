@@ -101,7 +101,6 @@ fn rows() -> Vec<(&'static str, JsonValue, Option<JsonValue>)> {
         ("logprobs", json!(false), Some(json!(true))),
         ("top_logprobs", json!(null), Some(json!(3))),
         ("logit_bias", json!({}), Some(json!({ "7": 5 }))),
-        ("parallel_tool_calls", json!(true), Some(json!(false))),
         ("store", json!(false), Some(json!(true))),
         ("service_tier", json!("auto"), Some(json!("priority"))),
         ("modalities", json!(["text"]), Some(json!(["text", "audio"]))),
@@ -157,6 +156,32 @@ async fn a_refused_value_is_a_400_naming_the_field_and_what_to_send() {
         let message = answer["error"]["message"].as_str().unwrap();
         assert!(message.contains(rule.refusal.unwrap()), "{name}: {message}");
     }
+}
+
+/// GitHub #609: `parallel_tool_calls` is honoured on both routes, not
+/// classified: its row left the chat table, which refused `false`, and the
+/// Responses table, where every value was inert. `false` on an answer with
+/// no call changes nothing (its calls: `parallel_tool_calls_http.rs`), and a
+/// value that is not a boolean is a 400 naming it on chat completions.
+#[tokio::test]
+async fn parallel_tool_calls_is_honoured_on_both_routes_not_classified() {
+    for table in [openai_fields::CHAT, openai_fields::RESPONSES] {
+        assert!(table.iter().all(|rule| rule.name != "parallel_tool_calls"));
+    }
+    let text = ["one ", "two ", "three"];
+    let without = served(&app_reading(&text), CHAT, &plain(json!({}))).await;
+    for value in [json!(false), json!(true), json!(null)] {
+        let with = served(&app_reading(&text), CHAT, &plain(json!({ "parallel_tool_calls": value }))).await;
+        assert_eq!(with["choices"], without["choices"], "{value}");
+        assert_eq!(with["usage"], without["usage"], "{value}");
+        let body = json!({ "model": MODEL, "input": "hi", "max_output_tokens": 8, "enable_thinking": false, "parallel_tool_calls": value });
+        let response = served(&app_reading(&text), "/v1/responses", &body).await;
+        assert_eq!(response["status"], "incomplete", "{value}: {response}");
+        assert_eq!(response["parallel_tool_calls"], value.as_bool().unwrap_or(true), "echoed: {response}");
+    }
+    let answer = refused(&app_reading(&[]), &plain(json!({ "parallel_tool_calls": "no" }))).await;
+    assert_eq!(answer["error"]["param"], "parallel_tool_calls", "{answer}");
+    assert_eq!(answer["error"]["message"], "parallel_tool_calls must be a boolean", "{answer}");
 }
 
 // ── the clients this server serves (acceptances 2 and 3) ──────────────────

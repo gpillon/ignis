@@ -48,7 +48,9 @@ pub(crate) struct CreateResponse {
     /// "name": ...}` naming one of `tools`, forced as on chat completions.
     #[schema(value_type = Object)]
     tool_choice: Option<JsonValue>,
-    /// Accepted; calls come back as the model writes them.
+    /// `false` ends the response at the close of its first function call: it
+    /// completes with that one `function_call` item (GitHub #609). `true`,
+    /// `null` or absent serves every call the model writes. Echoed.
     parallel_tool_calls: Option<bool>,
     max_output_tokens: Option<u32>,
     /// An ignis extension: keep decoding past EOS. Requires

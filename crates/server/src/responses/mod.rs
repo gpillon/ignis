@@ -47,12 +47,17 @@ use input::CreateResponse;
 pub(crate) enum Driven {
     /// It reached its terminal event.
     Ended,
+    /// It reached its terminal event at the close of its one call
+    /// (`parallel_tool_calls: false`, GitHub #609) after this many tokens,
+    /// while the engine still generates: the caller stops the request there.
+    Stopped(u32),
     /// The request's deadline passed first; the response has not ended.
     TimedOut,
 }
 
 /// Drive `events` through the request's scheduler stream until the response
 /// ends or `deadline` passes, handing each event to `emit` as it is made.
+/// Nothing past the token that ended it is read.
 /// A stream that closes without a finish (the engine dropped the request)
 /// ends the response `failed`.
 ///
@@ -83,6 +88,9 @@ pub(crate) async fn drive(
                 let mut run = vec![token];
                 held = drain_tokens(stream, &mut run);
                 events.on_tokens(&run).into_iter().for_each(&mut emit);
+                if let Some(tokens) = events.stopped_at() {
+                    return Driven::Stopped(tokens);
+                }
             }
             Some(event) => {
                 events.on_event(event).into_iter().for_each(&mut emit);
@@ -132,7 +140,7 @@ struct ResponseStreamEvent {
     tag = "responses",
     operation_id = "responses",
     summary = "A response, the Responses API",
-    description = "The OpenAI Responses API on the engine path chat completions uses: `instructions` as the system prompt, `input` as a string or a list of items (`message`, `function_call`, `function_call_output`, `reasoning`), function `tools` in the Responses shape, and the answer as `output` items: a `reasoning` item for the thinking channel, a `message` item for the text, one `function_call` item per tool call. `tool_choice` is served as on chat completions: `\"required\"` and `{type: \"function\", name}` force the call's opening.
+    description = "The OpenAI Responses API on the engine path chat completions uses: `instructions` as the system prompt, `input` as a string or a list of items (`message`, `function_call`, `function_call_output`, `reasoning`), function `tools` in the Responses shape, and the answer as `output` items: a `reasoning` item for the thinking channel, a `message` item for the text, one `function_call` item per tool call. `tool_choice` is served as on chat completions: `\"required\"` and `{type: \"function\", name}` force the call's opening. `parallel_tool_calls: false` ends the response at the close of its first call: it completes with that one `function_call` item, over HTTP and over the WebSocket mode; `true` or absent serves every call the model writes.
 
 `stream: true` answers `text/event-stream`, one event per `event:`/`data:` pair: `response.created`, `response.in_progress`, then per output item `response.output_item.added`, its content events (`response.reasoning_text.delta`, `response.output_text.delta`, `response.function_call_arguments.delta`, ...), `response.output_item.done`, and one terminal event (`response.completed`, `response.incomplete` on `max_output_tokens` or the deadline, `response.failed`). Every event carries a `sequence_number` counting from 0. Without it the body is the terminal event's `response`.
 
@@ -223,13 +231,21 @@ pub(crate) async fn create_response(
             cancel.completed();
             Json(events.response().clone()).into_response()
         }
+        Driven::Stopped(tokens) => {
+            cancel.stop(tokens);
+            Json(events.response().clone()).into_response()
+        }
         Driven::TimedOut => {
             cancel.timed_out();
             if live.timeout_reply == TimeoutReply::Error {
                 return timeout.response();
             }
-            // What it generated, and what the loop guard held back of it.
+            // What it generated, and what the loop guard held back of it:
+            // where that closes the response's one call, it ended there.
             events.on_tokens(&api::owed_at_deadline(&running, &mut scheduled).await);
+            if events.stopped_at().is_some() {
+                return Json(events.response().clone()).into_response();
+            }
             events.cut();
             crate::deadline::stopped_by_timeout(Json(events.response().clone()).into_response())
         }
@@ -274,6 +290,12 @@ impl Stream for EventSse {
                     let mut run = vec![token];
                     this.held = drain_tokens(&mut this.stream, &mut run);
                     this.pending.extend(this.events.on_tokens(&run));
+                    // The response ended at its one call: the request is
+                    // stopped there, and its stream never polled again.
+                    if let Some(tokens) = this.events.stopped_at() {
+                        this.cancel.stop(tokens);
+                        this.ended = true;
+                    }
                     continue;
                 }
                 Poll::Ready(Next::Event(event)) => {

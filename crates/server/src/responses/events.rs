@@ -267,7 +267,8 @@ pub(crate) struct ResponseEvents {
 impl ResponseEvents {
     /// A response whose object starts as `response` (its id, echo fields and
     /// model already set by the caller), decoding with `decoder` and scanning
-    /// tool calls typed by `schemas`.
+    /// tool calls typed by `schemas`. Its `parallel_tool_calls: false` ends
+    /// it at the close of its first call (GitHub #609).
     pub(crate) fn new(
         response: ResponseObject,
         suffix: String,
@@ -275,11 +276,12 @@ impl ResponseEvents {
         schemas: ToolSchemas,
         prompt_tokens: u32,
     ) -> Self {
+        let scanner = ToolCallScanner::with_schemas(schemas).ending_at_first_call(!response.parallel_tool_calls);
         Self {
             response,
             suffix,
             decoder,
-            scanner: ToolCallScanner::with_schemas(schemas),
+            scanner,
             sequence: 0,
             reasoning: None,
             message: None,
@@ -314,6 +316,14 @@ impl ResponseEvents {
     /// How the response ended; `None` while it runs.
     pub(crate) fn ending(&self) -> Option<Ending> {
         self.ending
+    }
+
+    /// The tokens it read, once the response ended at the close of its one
+    /// call (`parallel_tool_calls: false`, GitHub #609) while the engine was
+    /// still generating: the caller stops the request there
+    /// ([`crate::engine::Engine::stop`]). `None` otherwise.
+    pub(crate) fn stopped_at(&self) -> Option<u32> {
+        self.scanner.ended().then_some(self.output_tokens)
     }
 
     /// The response object as it stands (the terminal one once it ended).
@@ -362,6 +372,9 @@ impl ResponseEvents {
         if let Some(reused) = crate::engine::reused_prompt_tokens(&event) {
             self.cached_tokens = self.cached_tokens.max(reused);
         }
+        if self.ending.is_some() {
+            return out;
+        }
         match event {
             SchedEvent::Token { token, .. } => return self.on_tokens(&[token]),
             SchedEvent::Done { reason, thinking, .. } => {
@@ -393,6 +406,9 @@ impl ResponseEvents {
     /// ([`crate::decoder::join`]). Each token is still counted on the
     /// channel it was generated on.
     pub(crate) fn on_tokens(&mut self, tokens: &[TokenId]) -> Vec<JsonValue> {
+        if !self.response.parallel_tool_calls {
+            return self.on_tokens_to_first_call(tokens);
+        }
         let mut deltas = Vec::new();
         for &token in tokens {
             self.output_tokens += 1;
@@ -408,11 +424,55 @@ impl ResponseEvents {
         out
     }
 
+    /// [`ResponseEvents::on_tokens`] for a response that ends at the close
+    /// of its first call (`parallel_tool_calls: false`): each token's
+    /// content reaches the scanner as it is decoded, so the response ends at
+    /// the token that closed the call ([`ResponseEvents::stopped_at`]),
+    /// `completed` with that call, and no token after it is read or
+    /// counted. The text is still one delta per channel the run touched.
+    fn on_tokens_to_first_call(&mut self, tokens: &[TokenId]) -> Vec<JsonValue> {
+        let mut reasoning = String::new();
+        let mut scanned: Vec<ToolEvent> = Vec::new();
+        for &token in tokens {
+            if self.scanner.ended() {
+                break;
+            }
+            self.output_tokens += 1;
+            if self.decoder.channel() == Channel::Reasoning {
+                self.reasoning_tokens += 1;
+            }
+            for delta in self.decoder.push(&[token]) {
+                match delta.channel {
+                    Channel::Reasoning => reasoning.push_str(&delta.text),
+                    Channel::Content => {
+                        for event in self.scanner.feed(&delta.text) {
+                            match (scanned.last_mut(), event) {
+                                (Some(ToolEvent::Content(last)), ToolEvent::Content(text)) => last.push_str(&text),
+                                (_, event) => scanned.push(event),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        self.route(Delta { channel: Channel::Reasoning, text: reasoning }, &mut out);
+        for event in scanned {
+            self.scanned(event, &mut out);
+        }
+        if self.scanner.ended() && self.ending.is_none() {
+            self.finish(Ending::Completed, &mut out);
+        }
+        out
+    }
+
     /// The response was cancelled (`response.cancel`): what it produced so far
     /// is closed out, and it ends `incomplete` with `status: "cancelled"`.
     pub(crate) fn cancelled(&mut self) -> Vec<JsonValue> {
         let mut out = Vec::new();
-        self.finish(Ending::Cancelled, &mut out);
+        if self.ending.is_none() {
+            self.finish(Ending::Cancelled, &mut out);
+        }
         out
     }
 
@@ -431,6 +491,9 @@ impl ResponseEvents {
     /// (the one truncation reason the API defines, which every client reads).
     pub(crate) fn cut(&mut self) -> Vec<JsonValue> {
         let mut out = Vec::new();
+        if self.ending.is_some() {
+            return out;
+        }
         self.response.incomplete_details = Some(IncompleteDetails { reason: "max_output_tokens" });
         self.finish(Ending::Incomplete, &mut out);
         out
@@ -440,6 +503,9 @@ impl ResponseEvents {
     /// engine dropped it, or a queued request's admission was refused.
     pub(crate) fn failed(&mut self, code: &str, message: String) -> Vec<JsonValue> {
         let mut out = Vec::new();
+        if self.ending.is_some() {
+            return out;
+        }
         self.response.error = Some(ResponseError { code: code.into(), message });
         self.finish(Ending::Failed, &mut out);
         out

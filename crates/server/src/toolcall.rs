@@ -102,6 +102,9 @@ enum State {
     /// Between `<tool_call>` and its matching `</tool_call>` — buffering,
     /// nothing streams out until the block resolves one way or the other.
     Buffering,
+    /// The turn's one call has closed
+    /// ([`ToolCallScanner::ending_at_first_call`]): nothing more is read.
+    Ended,
 }
 
 /// The JSON types a request's `tools` declare for each function's
@@ -196,6 +199,9 @@ pub struct ToolCallScanner {
     hold: String,
     next_index: usize,
     schemas: ToolSchemas,
+    /// The scan ends at its first call's close (`parallel_tool_calls:
+    /// false`).
+    ends_at_first_call: bool,
 }
 
 impl Default for ToolCallScanner {
@@ -218,7 +224,26 @@ impl ToolCallScanner {
             hold: String::new(),
             next_index: 0,
             schemas,
+            ends_at_first_call: false,
         }
+    }
+
+    /// With `on`, the scan ends where its first call block closes, parsed
+    /// or dropped (`parallel_tool_calls: false`, GitHub #609): that close
+    /// ends the turn, and nothing fed after it is read, a second call
+    /// already in the same text included. Where a block closes is this
+    /// scanner's to say, so a `</tool_call>` its caller never feeds it (the
+    /// reasoning's) ends nothing, and a change to where a call closes is a
+    /// change to when the turn ends.
+    pub fn ending_at_first_call(self, on: bool) -> Self {
+        Self { ends_at_first_call: on, ..self }
+    }
+
+    /// Whether the scan ended at its first call's close
+    /// ([`ToolCallScanner::ending_at_first_call`]): the caller stops the
+    /// generation there.
+    pub fn ended(&self) -> bool {
+        matches!(self.state, State::Ended)
     }
 
     /// True while a `<tool_call>` has been opened but not yet closed —
@@ -238,6 +263,9 @@ impl ToolCallScanner {
     /// available (zero, one, or more).
     pub fn feed(&mut self, text: &str) -> Vec<ToolEvent> {
         let mut out = Vec::new();
+        if self.ended() {
+            return out;
+        }
         self.hold.push_str(text);
         loop {
             match self.state {
@@ -279,8 +307,14 @@ impl ToolCallScanner {
                     // `<function=...>` is dropped silently — same
                     // never-leak-garbage rule as an interrupted one.
                     self.state = State::Scanning;
+                    if self.ends_at_first_call {
+                        self.state = State::Ended;
+                        self.hold.clear();
+                        break;
+                    }
                     continue;
                 }
+                State::Ended => break,
             }
         }
         out
@@ -289,6 +323,7 @@ impl ToolCallScanner {
     /// Flush whatever is left at the end of generation.
     pub fn finish(&mut self) -> Vec<ToolEvent> {
         match self.state {
+            State::Ended => vec![],
             State::Scanning => {
                 let text = std::mem::take(&mut self.hold);
                 if text.is_empty() {
@@ -756,5 +791,65 @@ mod tests {
             "ion>\n</tool_call>",
         ]);
         assert_eq!(args(calls(&events)[0]), serde_json::json!({"x": 1}));
+    }
+
+    /// `chunks` through a scanner that ends at its first call's close
+    /// (`parallel_tool_calls: false`, GitHub #609); whether it ended.
+    fn run_to_first_call(chunks: &[&str]) -> (Vec<ToolEvent>, bool) {
+        let mut scanner = ToolCallScanner::new().ending_at_first_call(true);
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(scanner.feed(chunk));
+        }
+        let ended = scanner.ended();
+        assert!(!(ended && scanner.is_mid_call()), "an ended scan holds no open call");
+        events.extend(scanner.finish());
+        (events, ended)
+    }
+
+    const FIRST: &str = "<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>";
+    const SECOND: &str = "<tool_call>\n<function=b>\n</function>\n</tool_call>";
+
+    #[test]
+    fn a_scan_ending_at_its_first_call_reads_nothing_after_that_calls_close() {
+        let one_chunk = format!("before {FIRST}\n{SECOND}\nafter");
+        let (events, ended) = run_to_first_call(&[&one_chunk]);
+        assert!(ended);
+        assert_eq!(calls(&events).len(), 1, "{events:?}");
+        assert_eq!(calls(&events)[0].name, "a");
+        assert_eq!(content(&events), "before ", "nothing after the close is content");
+
+        let (events, ended) = run_to_first_call(&["before <tool_", &FIRST[6..], "\n<tool_call>\n", SECOND, "after"]);
+        assert!(ended);
+        assert_eq!(calls(&events).iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["a"]);
+        assert_eq!(content(&events), "before ");
+    }
+
+    #[test]
+    fn a_scan_ending_at_its_first_call_ends_at_a_dropped_block_too() {
+        // The first block closes and does not parse: the turn's call was
+        // written, and the one after it is not read.
+        let (events, ended) = run_to_first_call(&["<tool_call>\nno function here\n</tool_call>", SECOND]);
+        assert!(ended);
+        assert!(calls(&events).is_empty(), "{events:?}");
+        assert_eq!(content(&events), "");
+    }
+
+    #[test]
+    fn a_scan_ending_at_its_first_call_reads_text_with_no_call_to_its_end() {
+        let (events, ended) = run_to_first_call(&["no ", "call <tool_", "call> left open"]);
+        assert!(!ended);
+        assert_eq!(content(&events), "no call ");
+        let (events, ended) = run_to_first_call(&["just ", "text"]);
+        assert!(!ended);
+        assert_eq!(content(&events), "just text");
+    }
+
+    #[test]
+    fn a_scan_that_does_not_end_at_its_first_call_reads_every_call() {
+        let mut scanner = ToolCallScanner::new().ending_at_first_call(false);
+        let events = scanner.feed(&format!("{FIRST}\n{SECOND}"));
+        assert!(!scanner.ended());
+        assert_eq!(calls(&events).len(), 2);
     }
 }
