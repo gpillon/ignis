@@ -8,9 +8,13 @@
 // keys as at 1,048,576, for every prompt width. What a load reserves for the
 // layer (`ignis_gqa_attention_capacity_bytes`, kernel/src/model.cu) covers
 // every width's call. And against A1's own query -- what the load reserved
-// before -- the reservation at 524,288 keys drops by the prompt planes, less
-// the band: at least 1.0e9 bytes (the acceptance as amended with the band,
-// owner 2026-10-21). The numbers are printed.
+// before -- at 524,288 keys and 1,024-token chunks: A1's reservation holds its
+// two BF16 prompt planes, and the load's cannot hold even one, both bounds
+// replayed through the layout builder at A1's span (GitHub #603). The saving
+// is printed with the card's SM count, not gated: it moves with the SM count
+// through A1's key-split partials, 1,020,474,240 bytes on the RTX 5090 (ADR
+// 0061), 997,861,152 on the RTX 5080, where the 1.0e9 floor it replaced
+// failed though nothing was wrong.
 //
 // #296, below, still pins A1's query: A1's hq Prompt route is the oracle the
 // route agreement test holds the prompt attention against, and that test
@@ -43,9 +47,9 @@
 // gives every width here a split would not reproduce it, which is why the
 // sweep covers every width rather than naming 330.
 //
-// Host-only layout arithmetic: the one device call is
-// `gqa_prefill_split_count`'s SM-count query, which creates no context and
-// touches no device memory. ADR 0006 / docs/agents/testing.md: no
+// Host-only layout arithmetic: the device calls are the SM-count query,
+// `gqa_prefill_split_count`'s and the one the arena line prints, which create
+// no context and touch no device memory. ADR 0006 / docs/agents/testing.md: no
 // SKIP_RETURN_CODE.
 
 #include "ignis_gqa_workspace.h"
@@ -54,6 +58,8 @@
 #include "core/layout.h"
 #include "ninfer/ops/gqa_attention.h"
 #include "ops/launcher/gqa_attention.h"
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -79,13 +85,20 @@ constexpr std::int32_t kKvHeads = 4;
 // crates/core/src/concrete.rs): every prefill chunk is at most this wide.
 constexpr std::int32_t kWidestChunk = 1024;
 
+// The keys A1's hq Prompt route materializes into each of its two BF16 prompt
+// planes over `envelope`: the history, up to one scratch band
+// (`allocate_hq_prompt_scratch`).
+std::int32_t prompt_plane_span(ninfer::ops::GqaExecutionEnvelope envelope) {
+  return static_cast<std::int32_t>(
+      std::min(envelope.max_visible_keys, ninfer::ops::kGqaHqPromptScratchBandKeys));
+}
+
 // The bytes `gqa_attention` bumps for one B=1 Prompt call on a U8 cache at
 // `width` over `envelope`, replayed through the same layout builder the
 // arena's own dry runs use, in the op's order.
 std::size_t prompt_call_bytes(std::int32_t width, ninfer::ops::GqaExecutionEnvelope envelope) {
   ninfer::WorkspaceLayoutBuilder layout;
-  const std::int32_t span = static_cast<std::int32_t>(
-      std::min(envelope.max_visible_keys, ninfer::ops::kGqaHqPromptScratchBandKeys));
+  const std::int32_t span = prompt_plane_span(envelope);
   (void)layout.alloc(ninfer::DType::BF16, {kHeadDim, kKvHeads, span, 1});
   (void)layout.alloc(ninfer::DType::BF16, {kHeadDim, kKvHeads, span, 1});
   const bool banded = envelope.max_visible_keys > ninfer::ops::kGqaHqPromptScratchBandKeys;
@@ -183,19 +196,50 @@ void the_load_covers_every_call() {
   }
 }
 
+// The bytes the first `planes` of A1's BF16 prompt planes take over
+// `envelope`, as `allocate_hq_prompt_scratch` bumps them.
+std::size_t prompt_plane_bytes(int planes, ninfer::ops::GqaExecutionEnvelope envelope) {
+  ninfer::WorkspaceLayoutBuilder layout;
+  for (int plane = 0; plane < planes; ++plane) {
+    (void)layout.alloc(ninfer::DType::BF16, {kHeadDim, kKvHeads, prompt_plane_span(envelope), 1});
+  }
+  return layout.peak_bytes(1);
+}
+
+// The SM count of the card the test runs on, read as `gqa_prefill_split_count`
+// reads it; 0 when the query fails.
+int card_sm_count() {
+  int device = 0;
+  int count = 0;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+    return 0;
+  }
+  return count;
+}
+
 void the_planes_are_gone_at_524288() {
   // What the load reserved for one hq layer's attention before #335 -- A1's
-  // own query over the serving widths -- against what it reserves now.
+  // own query over the serving widths: its two prompt planes and its key-split
+  // partials -- against what it reserves now. A1's must hold both planes, or
+  // the comparison says nothing; the load's must not hold one. The saving is
+  // printed, not gated: the partials grow with the SM count.
   const ninfer::ops::GqaExecutionEnvelope load{.min_visible_keys = 1, .max_visible_keys = 524'288};
   const std::size_t before = ninfer::ops::gqa_attention_workspace_capacity_bytes(
       kQHeads, ninfer::DType::U8, load, 1, 1, kWidestChunk);
   const std::size_t now =
       ignis_gqa_attention_capacity_bytes(ninfer::DType::U8, load, 1, 1, kWidestChunk);
-  std::printf("hq attention arena at 524,288 keys, 1,024-token chunks: %zu bytes with prompt planes, "
-              "%zu now, %zu fewer\n",
-              before, now, before - now);
-  check(now < before && before - now >= 1'000'000'000,
-        "the reservation at 524,288 keys dropped by less than 1.0e9 bytes");
+  const std::size_t planes = prompt_plane_bytes(2, load);
+  const std::size_t one_plane = prompt_plane_bytes(1, load);
+  std::printf("hq attention arena at 524,288 keys, 1,024-token chunks, %d SMs: %zu bytes with prompt "
+              "planes, %zu now, %lld fewer; A1's two prompt planes %zu bytes, one %zu\n",
+              card_sm_count(), before, now,
+              static_cast<long long>(before) - static_cast<long long>(now), planes, one_plane);
+  check(before >= planes, "A1's reservation at 524,288 keys (" + std::to_string(before) +
+                              " bytes) does not hold its two prompt planes (" +
+                              std::to_string(planes) + ")");
+  check(now < one_plane, "the reservation at 524,288 keys (" + std::to_string(now) +
+                             " bytes) can hold a prompt plane (" + std::to_string(one_plane) + ")");
   // BF16 keeps A1, untouched.
   check(ignis_gqa_attention_capacity_bytes(ninfer::DType::BF16, load, 1, 1, kWidestChunk) ==
             ninfer::ops::gqa_attention_workspace_capacity_bytes(kQHeads, ninfer::DType::BF16, load, 1,
