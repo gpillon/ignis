@@ -13,9 +13,10 @@
 //! The first device measures the context it makes from NVML's free memory
 //! (GitHub #604), what every VRAM plan charges for it: on Windows the figure
 //! is held to the process's WDDM dedicated usage right after the context is
-//! made, within [`CONTEXT_WITHIN`], and where the driver reports the
-//! process's own memory (native Linux) to that figure too. The measurement's
-//! CPU tests are `ignis-runtime`'s, which falls back where it reads nothing.
+//! made, within [`CONTEXT_WITHIN`]; where the driver reports the process's
+//! own memory (native Linux) that figure is printed beside it, a different
+//! reading no run here has held it to. The measurement's CPU tests are
+//! `ignis-runtime`'s, which falls back where it reads nothing.
 
 use std::time::Duration;
 
@@ -32,7 +33,7 @@ const COUNTED_WITHIN: Duration = Duration::from_secs(2);
 
 /// How far the measured context may be from what the process holds right
 /// after it is made (GitHub #604).
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", windows))]
 const CONTEXT_WITHIN: u64 = 16 << 20;
 
 /// This process's dedicated device memory, as WDDM counts it
@@ -149,14 +150,10 @@ fn nvml_free_memory_counts_the_context_and_every_allocation() {
             "the context measured at {measured} B against {dedicated} B of WDDM dedicated usage: more than {CONTEXT_WITHIN} B apart"
         );
     }
+    // NVML's per-process figure is another reading than the free memory
+    // (ADR 0092), and no run here has one: printed, not held to the context.
     match CudaDevice::nvml_process_bytes(0) {
-        Some(held) => {
-            println!("NVML's per-process figure with the context alone: {held} B");
-            assert!(
-                measured.abs_diff(held) <= CONTEXT_WITHIN,
-                "the context measured at {measured} B against the {held} B NVML reports for the process: more than {CONTEXT_WITHIN} B apart"
-            );
-        }
+        Some(held) => println!("NVML's per-process figure with the context alone: {held} B"),
         None => println!("NVML reports no per-process figure here: a reload adds back what the plan charges again"),
     }
     let (free_with_context, _) = CudaDevice::nvml_memory(0).expect("NVML after the context");

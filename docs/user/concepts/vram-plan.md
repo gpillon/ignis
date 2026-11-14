@@ -59,6 +59,8 @@ Flash-Next). The lines include:
   the compressed KV format, the residual window of every lane and slot;
 - the **media embedding** pool for images (0 under `--vision-residency host`,
   which keeps it in pinned host RAM);
+- the **CUDA context**, from 0.11.0 measured on the card when the first load
+  creates it ([Every byte planned at load](../why-ignis/every-byte-planned.md#how-it-works));
 - the **KV pool**, which takes whatever is left on the 27B, or is reserved first
   on a Flash-Next that streams its experts.
 
