@@ -32,6 +32,10 @@ import {
   type SlotSkipReason,
   type Snapshot,
   STRUCTURED_TYPES,
+  TOOL_CALL_OUTCOMES,
+  TOOL_CALL_VIOLATIONS,
+  type ToolCallOutcome,
+  type ToolCallViolation,
   VRAM_LINES,
   type VramLine,
 } from "./snapshot.ts";
@@ -247,6 +251,21 @@ export type StructuredOutputCard = {
 };
 
 /**
+ * The Tool calls card's figures (#608): the call blocks the model wrote over
+ * the window, by what the check against their tools' parameters found, the
+ * share that failed it, the invalid ones by kind of violation, and the strict
+ * tools that came outside the strict subset.
+ */
+export type ToolCallsCard = {
+  calls: Tally;
+  byOutcome: Record<ToolCallOutcome, Tally>;
+  /** Invalid and dropped over all call blocks in the window; null with none in it. */
+  failedShare: number | null;
+  violations: Record<ToolCallViolation, Tally>;
+  strictOutsideSubset: Tally;
+};
+
+/**
  * The reasoning's two ways of being cut short over the window (GitHub #330):
  * the loop guard's rewinds and the thinking budget's forced closes. Shares are
  * computed here from the counters, since the server exports none. The guard's
@@ -323,6 +342,8 @@ export type Dashboard = {
   reasoning: Reasoning | null;
   /** Null until a request held to a grammar ended. */
   structured: StructuredOutputCard | null;
+  /** Null until a tool call block was read, or a strict tool came outside the strict subset. */
+  toolCalls: ToolCallsCard | null;
   health: Health;
 };
 
@@ -552,6 +573,7 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
       : null,
     reasoning: last.loopGuard || last.thinkingForcedCloses !== null ? deriveReasoning(points, from) : null,
     structured: last.structured ? deriveStructured(points, from) : null,
+    toolCalls: last.toolCalls ? deriveToolCalls(points, from) : null,
     health: { level: "idle", summary: "", notes: [] },
   };
   dash.health = assessHealth({
@@ -673,6 +695,26 @@ export function deriveStructured(points: Point[], since: number): StructuredOutp
     repairTime,
     repairP50: has ? histogramQuantile(0.5, repairTime) : null,
     repairP95: has ? histogramQuantile(0.95, repairTime) : null,
+  };
+}
+
+/** The Tool calls card's figures (#608). */
+export function deriveToolCalls(points: Point[], since: number): ToolCallsCard {
+  const last = points.at(-1)?.snap ?? emptySnapshot();
+  const tally = (pick: CounterPick): Tally => ({ total: pick(last), window: increaseOver(points, pick, since) });
+  const byOutcome = Object.fromEntries(
+    TOOL_CALL_OUTCOMES.map((outcome) => [outcome, tally((s) => s.toolCalls?.calls[outcome] ?? null)]),
+  ) as Record<ToolCallOutcome, Tally>;
+  const calls = tally((s) => (s.toolCalls ? sumKnown(TOOL_CALL_OUTCOMES.map((outcome) => s.toolCalls!.calls[outcome])) : null));
+  const failed = [byOutcome.invalid.window, byOutcome.dropped.window];
+  return {
+    calls,
+    byOutcome,
+    failedShare: shareOf(failed.every((n) => n === null) ? null : failed.reduce<number>((sum, n) => sum + (n ?? 0), 0), calls.window),
+    violations: Object.fromEntries(
+      TOOL_CALL_VIOLATIONS.map((kind) => [kind, tally((s) => s.toolCalls?.violations[kind] ?? null)]),
+    ) as Record<ToolCallViolation, Tally>,
+    strictOutsideSubset: tally((s) => s.toolCalls?.strictOutsideSubset ?? null),
   };
 }
 

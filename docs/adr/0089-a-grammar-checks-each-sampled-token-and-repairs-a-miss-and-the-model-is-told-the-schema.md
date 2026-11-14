@@ -1,6 +1,7 @@
 ---
 status: accepted
 amends: [ADR-0017, ADR-0034]
+amended-by: [ADR-0094]
 ---
 
 # A grammar checks each sampled token and repairs a miss, and the model is told the schema

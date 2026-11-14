@@ -350,6 +350,10 @@ const ACTIVATIONS: &[Activation] = &[
             })
         },
     },
+    Activation {
+        when: "once the model wrote a tool call, or a strict tool came outside the strict subset",
+        activate: |m| m.record_tool_call(&crate::toolcall::CallVerdict::Valid),
+    },
     Activation { when: "once the loop guard has watched a request", activate: |m| m.record_loop_guard_watched() },
     Activation {
         when: "after the first request that ran speculative verify rounds",

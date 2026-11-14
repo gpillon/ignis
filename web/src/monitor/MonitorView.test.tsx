@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, IMAGE_EXPOSITION, IMAGE_LOAD_EXPOSITION, KV_DISK_EXPOSITION, LOOP_GUARD_EXPOSITION, SPEECH_EXPOSITION, STRUCTURED_EXPOSITION, THINKING_FORCED_CLOSES } from "./fixture.ts";
+import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, IMAGE_EXPOSITION, IMAGE_LOAD_EXPOSITION, KV_DISK_EXPOSITION, LOOP_GUARD_EXPOSITION, SPEECH_EXPOSITION, STRUCTURED_EXPOSITION, THINKING_FORCED_CLOSES, TOOL_CALL_EXPOSITION } from "./fixture.ts";
 import { MonitorView } from "./MonitorView.tsx";
 import { applyScrape, initialMonitor } from "./scrape.ts";
 
@@ -206,6 +206,25 @@ describe("MonitorView", () => {
     expect(html).toContain("0.40");
     const text = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now, 2)} />);
     expect(text).not.toContain("Structured output");
+  });
+
+  // #608: the Tool calls card, only once a call block was read.
+  it("draws the Tool calls card once a call block was read, and not before", () => {
+    const now = Date.now();
+    // Ten seconds on: 16 more valid calls, 3 more invalid (two of a wrong type, one to an undeclared tool) and one more dropped.
+    const later = TOOL_CALL_EXPOSITION.replace('outcome="valid"} 40', 'outcome="valid"} 56')
+      .replace('outcome="invalid"} 3', 'outcome="invalid"} 6')
+      .replace('outcome="dropped"} 1', 'outcome="dropped"} 2')
+      .replace('kind="type"} 2', 'kind="type"} 4')
+      .replace('kind="undeclared_tool"} 0', 'kind="undeclared_tool"} 1');
+    const state = applyScrape(applyScrape(initialMonitor(), { kind: "ok", text: TOOL_CALL_EXPOSITION }, now - 10_000, 2), { kind: "ok", text: later }, now, 2);
+    const html = renderToStaticMarkup(<MonitorView state={state} />);
+    expect(html).toContain("Tool calls");
+    // 4 of 20 calls in the window failed.
+    expect(html).toContain("20%");
+    expect(html).toContain("2 of the wrong type; 1 to an undeclared tool");
+    const text = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now, 2)} />);
+    expect(text).not.toContain("Tool calls");
   });
 
   // Spec speech/02: the Transcriptions card, only once the speech model was asked.

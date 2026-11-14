@@ -41,7 +41,7 @@ use ignis_core::{FinishReason, SchedEvent, TokenId};
 use crate::deadline::{Timeout, TimeoutReply};
 use crate::decoder::{Channel, Delta, OutputDecoder};
 use crate::loop_guard::Rewound;
-use crate::toolcall::{ToolCall, ToolCallScanner, ToolEvent, ToolSchemas};
+use crate::toolcall::{CallCheck, ToolCall, ToolCallScanner, ToolEvent, ToolSchemas};
 
 /// What `encrypted_content` opens with when this server wrote it. In this
 /// version, standard padded base64 of the reasoning's UTF-8 follows.
@@ -292,6 +292,12 @@ impl ResponseEvents {
             encrypted_reasoning: false,
             ending: None,
         }
+    }
+
+    /// Check and count every call block the scanner closes (GitHub #608).
+    pub(crate) fn checking(mut self, check: Option<CallCheck>) -> Self {
+        self.scanner = std::mem::take(&mut self.scanner).checking(check);
+        self
     }
 
     /// Count the tokens the loop guard's rewinds take back in the usage.

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseExposition } from "./exposition.ts";
-import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, IMAGE_EXPOSITION, IMAGE_LOAD_EXPOSITION, KV_DISK_EXPOSITION, LOOP_GUARD_EXPOSITION, SPEECH_EXPOSITION, STRUCTURED_EXPOSITION } from "./fixture.ts";
+import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, IMAGE_EXPOSITION, IMAGE_LOAD_EXPOSITION, KV_DISK_EXPOSITION, LOOP_GUARD_EXPOSITION, SPEECH_EXPOSITION, STRUCTURED_EXPOSITION, TOOL_CALL_EXPOSITION } from "./fixture.ts";
 import { emptySnapshot, readSnapshot, counterValues, RETAINED_FAMILY_KEYS } from "./snapshot.ts";
 
 describe("readSnapshot", () => {
@@ -152,8 +152,8 @@ ignis_retained_state_hits_total{tier="tape",kind="prefix"} 1
     // 8 plain counters, 3 reject reasons, 36 retained series (disk's 12 null without the tier), 3 skips, 4 KV-disk, then
     // Flash-Next's 32 expert hit and miss series, 2 prefetch, 2 bytes, 2
     // stall (GitHub #306), 2 n-gram rows, 2 reads, the 3 speculative totals
-    // (GitHub #307), the image jobs' 6 outcomes (timed_out since ADR 0058), images, 4 phases and duration count (GitHub #324), the loop guard's watched, looped, 7 outcomes, tokens and score count with the budget's closes (GitHub #330), the structured output's 2 types by 3 counters and repair count (#593), and 2 histogram counts. The speech model's 8 transcription series, audio seconds and wait count (spec speech/02).
-    expect(counterValues(empty)).toHaveLength(142);
+    // (GitHub #307), the image jobs' 6 outcomes (timed_out since ADR 0058), images, 4 phases and duration count (GitHub #324), the loop guard's watched, looped, 7 outcomes, tokens and score count with the budget's closes (GitHub #330), the structured output's 2 types by 3 counters and repair count (#593), the tool calls' 3 outcomes, 6 kinds and strict tools outside the subset (#608), and 2 histogram counts. The speech model's 8 transcription series, audio seconds and wait count (spec speech/02).
+    expect(counterValues(empty)).toHaveLength(152);
     expect(counterValues(moved).filter((v) => v !== null)).toHaveLength(40);
     const flashNext = readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION));
     expect(counterValues(flashNext).filter((v) => v !== null)).toHaveLength(82);
@@ -244,6 +244,26 @@ ignis_retained_state_hits_total{tier="tape",kind="prefix"} 1
     const stray = readSnapshot(parseExposition(`${STRUCTURED_EXPOSITION}ignis_structured_misses_total{type="grammar"} 1
 `));
     expect(stray.unknown).toEqual([{ name: "ignis_structured_misses_total", labels: { type: "grammar" }, value: 1 }]);
+  });
+
+  // #608: the tool-call families, all at once after the first call block read.
+  it("reads the tool calls, all in the contract, and none from a server that never read one", () => {
+    const s = readSnapshot(parseExposition(TOOL_CALL_EXPOSITION));
+    expect(s.unknown).toEqual([]);
+    expect(s.toolCalls).toEqual({
+      calls: { valid: 40, invalid: 3, dropped: 1 },
+      violations: { missing: 1, type: 2, enum: 0, unknown_parameter: 1, constraint: 0, undeclared_tool: 0 },
+      strictOutsideSubset: 5,
+    });
+    expect(counterValues(s)).toContain(40);
+    expect(readSnapshot(parseExposition(IGNIS_EXPOSITION)).toolCalls).toBeNull();
+    const stray = readSnapshot(parseExposition(`${TOOL_CALL_EXPOSITION}ignis_tool_call_violations_total{kind="pattern"} 1
+ignis_tool_calls_total{outcome="cut"} 1
+`));
+    expect(stray.unknown).toEqual([
+      { name: "ignis_tool_calls_total", labels: { outcome: "cut" }, value: 1 },
+      { name: "ignis_tool_call_violations_total", labels: { kind: "pattern" }, value: 1 },
+    ]);
   });
 
   // Spec speech/02: the speech families, once the speech model was asked for a transcription.

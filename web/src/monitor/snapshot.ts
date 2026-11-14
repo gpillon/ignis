@@ -263,6 +263,27 @@ export type StructuredOutput = {
   repairTime: Histogram | null;
 };
 
+/** `ignis_tool_calls_total`'s outcomes (#608). */
+export const TOOL_CALL_OUTCOMES = ["valid", "invalid", "dropped"] as const;
+export type ToolCallOutcome = (typeof TOOL_CALL_OUTCOMES)[number];
+
+/** `ignis_tool_call_violations_total`'s kinds (#608). */
+export const TOOL_CALL_VIOLATIONS = ["missing", "type", "enum", "unknown_parameter", "constraint", "undeclared_tool"] as const;
+export type ToolCallViolation = (typeof TOOL_CALL_VIOLATIONS)[number];
+
+/**
+ * Tool calls (#608, ADR 0094): every call block the model wrote, checked
+ * against its tool's parameters, by outcome; the invalid ones by kind of
+ * violation, a call once under each kind it has; and the strict tools whose
+ * schema lies outside OpenAI's strict subset. Absent until one of them moved,
+ * so null on a server that never read a call.
+ */
+export type ToolCalls = {
+  calls: Record<ToolCallOutcome, number | null>;
+  violations: Record<ToolCallViolation, number | null>;
+  strictOutsideSubset: number | null;
+};
+
 /** A histogram: upper bounds in seconds ending in +Inf, their cumulative counts, the sum and the count. */
 export type Histogram = { bounds: number[]; cumulative: number[]; sum: number; count: number };
 
@@ -301,6 +322,8 @@ export type Snapshot = {
   loopGuard: LoopGuard | null;
   /** Null until a request held to a grammar ended. */
   structured: StructuredOutput | null;
+  /** Null until a tool call block was read, or a strict tool came outside the strict subset. */
+  toolCalls: ToolCalls | null;
   /** The thinking budget's own closes (GitHub #330); null until the first. Not the guard's `closed`. */
   thinkingForcedCloses: number | null;
   ttft: Histogram | null;
@@ -396,6 +419,13 @@ const STRUCTURED_FAMILIES = {
   repairTime: "ignis_structured_repair_seconds",
 } as const;
 
+/** The tool-call families (#608). */
+const TOOL_CALL_FAMILIES = {
+  calls: "ignis_tool_calls_total",
+  violations: "ignis_tool_call_violations_total",
+  strictOutsideSubset: "ignis_tool_strict_outside_subset_total",
+} as const;
+
 /** The thinking budget's forced closes (GitHub #330): absent until the first. */
 const THINKING_FORCED_CLOSES = "ignis_thinking_forced_closes_total";
 
@@ -429,6 +459,7 @@ const KNOWN = new Set<string>([
   ...Object.values(SPEECH_FAMILIES),
   ...Object.values(LOOP_FAMILIES),
   ...Object.values(STRUCTURED_FAMILIES),
+  ...Object.values(TOOL_CALL_FAMILIES),
   THINKING_FORCED_CLOSES,
 ]);
 
@@ -470,6 +501,7 @@ export function emptySnapshot(): Snapshot {
     speech: null,
     loopGuard: null,
     structured: null,
+    toolCalls: null,
     thinkingForcedCloses: null,
     ttft: null,
     duration: null,
@@ -611,6 +643,16 @@ export function readSnapshot({ families }: Exposition): Snapshot {
       repairTime: readHistogram(samples(STRUCTURED_FAMILIES.repairTime), STRUCTURED_FAMILIES.repairTime),
     };
   }
+  // Tool calls, all or nothing: the first call block, or strict tool outside the subset, renders every series.
+  if (families.has(TOOL_CALL_FAMILIES.calls)) {
+    snap.toolCalls = {
+      calls: Object.fromEntries(TOOL_CALL_OUTCOMES.map((outcome) => [outcome, valueOf(TOOL_CALL_FAMILIES.calls, ["outcome", outcome])])) as ToolCalls["calls"],
+      violations: Object.fromEntries(
+        TOOL_CALL_VIOLATIONS.map((kind) => [kind, valueOf(TOOL_CALL_FAMILIES.violations, ["kind", kind])]),
+      ) as ToolCalls["violations"],
+      strictOutsideSubset: valueOf(TOOL_CALL_FAMILIES.strictOutsideSubset),
+    };
+  }
   snap.thinkingForcedCloses = valueOf(THINKING_FORCED_CLOSES);
 
   snap.ttft = readHistogram(samples("ignis_request_ttft_seconds"), "ignis_request_ttft_seconds");
@@ -649,6 +691,10 @@ function inContract(family: string, s: Sample): boolean {
       return oneOf(STRUCTURED_TYPES, s.labels.type) && Object.keys(s.labels).length === 1;
     case LOOP_FAMILIES.loops:
       return oneOf(LOOP_OUTCOMES, s.labels.outcome) && Object.keys(s.labels).length === 1;
+    case TOOL_CALL_FAMILIES.calls:
+      return oneOf(TOOL_CALL_OUTCOMES, s.labels.outcome) && Object.keys(s.labels).length === 1;
+    case TOOL_CALL_FAMILIES.violations:
+      return oneOf(TOOL_CALL_VIOLATIONS, s.labels.kind) && Object.keys(s.labels).length === 1;
     case IMAGE_FAMILIES.jobs:
       return oneOf(IMAGE_OUTCOMES, s.labels.outcome) && Object.keys(s.labels).length === 1;
     case IMAGE_FAMILIES.phaseSeconds:
@@ -732,6 +778,9 @@ export function counterValues(s: Snapshot): (number | null)[] {
     s.loopGuard?.minRatio?.count ?? null,
     ...STRUCTURED_TYPES.flatMap((type) => [s.structured?.requests[type] ?? null, s.structured?.misses[type] ?? null, s.structured?.repairs[type] ?? null]),
     s.structured?.repairTime?.count ?? null,
+    ...TOOL_CALL_OUTCOMES.map((outcome) => s.toolCalls?.calls[outcome] ?? null),
+    ...TOOL_CALL_VIOLATIONS.map((kind) => s.toolCalls?.violations[kind] ?? null),
+    s.toolCalls?.strictOutsideSubset ?? null,
     s.thinkingForcedCloses,
     s.ttft?.count ?? null,
     s.duration?.count ?? null,

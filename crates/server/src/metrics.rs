@@ -28,6 +28,7 @@ use ignis_core::structured::StructuredKind;
 use ignis_core::ngram_table::NgramCounters;
 use ignis_core::residency::{KClass, Phase, ResidencyCounters};
 use ignis_core::{RetainedSkip, SubmitError};
+use crate::toolcall::{CallVerdict, CallViolation};
 
 /// What one load reserved, and the shapes the reservations bound (GitHub
 /// #216, ADR 0030 §Observability). Computed once, during the load that
@@ -625,6 +626,10 @@ impl MicrosHistogram {
 /// `type` label's series (#593).
 const STRUCTURED_KINDS: [StructuredKind; 2] = [StructuredKind::JsonObject, StructuredKind::JsonSchema];
 
+/// `ignis_tool_calls_total`'s `outcome` label (GitHub #608), in the order of
+/// its series: [`CallVerdict`]'s three.
+const TOOL_CALL_OUTCOMES: [&str; 3] = ["valid", "invalid", "dropped"];
+
 /// A fixed-bucket histogram over millisecond observations.
 #[derive(Debug)]
 struct Histogram {
@@ -726,6 +731,14 @@ pub struct Metrics {
     structured_misses: [AtomicU64; STRUCTURED_KINDS.len()],
     structured_repairs: [AtomicU64; STRUCTURED_KINDS.len()],
     structured_repair_time: MicrosHistogram,
+    /// Tool calls (GitHub #608, ADR 0094): every call block a response's
+    /// parser closed, per [`TOOL_CALL_OUTCOMES`]; the invalid ones per
+    /// [`CallViolation::ALL`], once under each kind they have; and the strict
+    /// tools whose parameters lie outside OpenAI's strict subset. Absent until
+    /// one of them moves, then whole.
+    tool_calls: [AtomicU64; TOOL_CALL_OUTCOMES.len()],
+    tool_call_violations: [AtomicU64; CallViolation::ALL.len()],
+    tool_strict_outside_subset: AtomicU64,
     /// The loop guard (GitHub #330): the requests it watched and those that
     /// looped, its loops per [`LoopOutcome::ALL`], the tokens its rewinds
     /// took back, and each watched request's lowest score. Absent from the
@@ -923,6 +936,9 @@ impl Metrics {
             structured_misses: Default::default(),
             structured_repairs: Default::default(),
             structured_repair_time: MicrosHistogram::new(&REPAIR_BOUNDS_US),
+            tool_calls: Default::default(),
+            tool_call_violations: Default::default(),
+            tool_strict_outside_subset: AtomicU64::new(0),
             loop_guard_watched: AtomicU64::new(0),
             loop_guard_looped: AtomicU64::new(0),
             loop_guard_loops: Default::default(),
@@ -1053,6 +1069,32 @@ impl Metrics {
         // The request counts last: a scrape between the writes never reads a
         // miss of a request not yet counted as one.
         self.structured_requests[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A call block a response's parser closed, as the call check found it
+    /// (GitHub #608). Recorded by the response's scanner, on the HTTP side,
+    /// as the block closes: the model thread never sees calls.
+    pub(crate) fn record_tool_call(&self, verdict: &CallVerdict) {
+        let outcome = match verdict {
+            CallVerdict::Valid => 0,
+            CallVerdict::Invalid(kinds) => {
+                for &kind in kinds {
+                    // `ALL` lists the kinds in declaration order.
+                    self.tool_call_violations[kind as usize].fetch_add(1, Ordering::Relaxed);
+                }
+                1
+            }
+            CallVerdict::Dropped => 2,
+        };
+        // The call counts last: a scrape between the writes never reads a
+        // violation of a call not yet counted invalid.
+        self.tool_calls[outcome].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A request sent `tools` strict tools whose parameters lie outside
+    /// OpenAI's strict subset (GitHub #608), served as any other tool.
+    pub(crate) fn record_strict_tools_outside_subset(&self, tools: u64) {
+        self.tool_strict_outside_subset.fetch_add(tools, Ordering::Relaxed);
     }
 
     /// A request the loop guard watched ended (GitHub #330). Recorded by the
@@ -1686,6 +1728,37 @@ impl Metrics {
                 "Time to repair one rejected token of a structured answer.",
             );
         }
+        // GitHub #608: tool calls, absent until a call block was read or a
+        // strict tool found outside the strict subset, for the decision
+        // family's reason, then every series of it.
+        let strict_outside = read(&self.tool_strict_outside_subset);
+        if self.tool_calls.iter().map(read).sum::<u64>() + strict_outside > 0 {
+            declare(
+                &mut out,
+                "ignis_tool_calls_total",
+                "counter",
+                "Tool call blocks read from the model's output, checked against the tool's parameters: valid, invalid (a violation, or a tool the request did not declare), or dropped (a closed block that did not parse).",
+            );
+            for (outcome, series) in TOOL_CALL_OUTCOMES.iter().zip(&self.tool_calls) {
+                let _ = writeln!(out, "ignis_tool_calls_total{{outcome=\"{outcome}\"}} {}", read(series));
+            }
+            declare(
+                &mut out,
+                "ignis_tool_call_violations_total",
+                "counter",
+                "Invalid tool calls by kind of violation, a call once under each kind it has.",
+            );
+            for (kind, series) in CallViolation::ALL.iter().zip(&self.tool_call_violations) {
+                let _ = writeln!(out, "ignis_tool_call_violations_total{{kind=\"{}\"}} {}", kind.label(), read(series));
+            }
+            declare(
+                &mut out,
+                "ignis_tool_strict_outside_subset_total",
+                "counter",
+                "Strict tools (strict: true) whose parameters lie outside OpenAI's strict subset, once per request that sends one; served as any other tool.",
+            );
+            let _ = writeln!(out, "ignis_tool_strict_outside_subset_total {strict_outside}");
+        }
         // GitHub #330: the loop guard, absent until a request it watched
         // ended or it saw a loop (a load that runs it `off` exports nothing
         // of it), then the whole family: its zeros are what a quiet guard
@@ -2256,6 +2329,36 @@ mod tests {
         assert_eq!(value(&text, "ignis_structured_repair_seconds_sum", ""), "0.00234");
         assert_eq!(value(&text, "ignis_structured_repair_seconds_bucket", "le=\"0.00005\""), "1");
         assert_eq!(value(&text, "ignis_structured_repair_seconds_bucket", "le=\"0.0005\""), "2");
+    }
+
+    #[test]
+    fn the_tool_call_family_is_absent_until_a_call_or_a_strict_tool_moves_it() {
+        let metrics = Metrics::new();
+        assert!(!metrics.render().contains("ignis_tool_"));
+        metrics.record_tool_call(&CallVerdict::Invalid(vec![CallViolation::Missing, CallViolation::UndeclaredTool]));
+        metrics.record_tool_call(&CallVerdict::Dropped);
+        let text = metrics.render();
+        declared_once(
+            &text,
+            &[
+                ("ignis_tool_calls_total", "counter"),
+                ("ignis_tool_call_violations_total", "counter"),
+                ("ignis_tool_strict_outside_subset_total", "counter"),
+            ],
+        );
+        assert_eq!(value(&text, "ignis_tool_calls_total", "outcome=\"valid\""), "0");
+        assert_eq!(value(&text, "ignis_tool_calls_total", "outcome=\"invalid\""), "1");
+        assert_eq!(value(&text, "ignis_tool_calls_total", "outcome=\"dropped\""), "1");
+        assert_eq!(value(&text, "ignis_tool_call_violations_total", "kind=\"missing\""), "1");
+        assert_eq!(value(&text, "ignis_tool_call_violations_total", "kind=\"undeclared_tool\""), "1");
+        assert_eq!(value(&text, "ignis_tool_call_violations_total", "kind=\"constraint\""), "0");
+        assert_eq!(value(&text, "ignis_tool_strict_outside_subset_total", ""), "0");
+        // A strict tool outside the subset alone brings the whole family in.
+        let strict = Metrics::new();
+        strict.record_strict_tools_outside_subset(2);
+        let text = strict.render();
+        assert_eq!(value(&text, "ignis_tool_strict_outside_subset_total", ""), "2");
+        assert_eq!(value(&text, "ignis_tool_calls_total", "outcome=\"valid\""), "0");
     }
 
     #[test]

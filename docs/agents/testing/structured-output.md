@@ -28,6 +28,17 @@ never how the automaton stores its states.
   refused.
 - **`token_bytes_table`** itself: `cargo test -p ignis-artifact --lib
   frontend::tests::token_bytes_table`.
+- **The validator** (`ignis_grammar::validate`, #608, ADR 0094): what every
+  tool call's arguments are checked against, and the oracle of the grammar's
+  property tests, so it shares nothing with the automaton but the JSON parser
+  and the pattern translation. `cargo test -p ignis-grammar --lib validate`
+  (where a violation is found, exact decimals, a `$ref` cycle, the formats'
+  RFC edges) and `cargo test -p ignis-grammar --test tool_arguments` (about 1
+  s): a corpus of tool arguments (`tests/corpus/tool_arguments.json`), each
+  invalid one labelled by hand with its kinds, held to the labels and, through
+  `tools/grammar-check/validate.py`, to `jsonschema` (`ours valid, theirs
+  valid: N` and `ours invalid, theirs invalid: M`, 0 disagreements), the
+  Python found as below and skipped or failed on CI the same way.
 
 ## The bench and the independent validator
 
@@ -86,6 +97,16 @@ The measured figures are in
   scheduler that checks a draw late fails here first. Its repair ranks a
   script's later tokens before the vocabulary in order, and the test
   vocabulary puts the tokens that close a value first.
+- **The call check over the mock engine** (`cargo test -p ignis-server
+  --test tool_call_checks_http`, about 1 s, #608): a script that writes a
+  call of every kind (valid, each violation, an undeclared tool, a block that
+  does not parse) is counted under its outcome and kinds on chat completions
+  (whole, with a stop sequence, streamed) and on the Responses API (HTTP,
+  WebSocket); each response equals the same request's on a server with
+  metrics off, which checks nothing (whole: its bytes; streamed: what the
+  stream assembles to); a call the first token writes is counted once, not
+  again by the first-token probe; strict tools outside the subset are counted
+  and served.
 - **The independent validator in the served tests**: the schema answers go
   through `tools/grammar-check/validate.py` with the Python of
   `IGNIS_GRAMMAR_CHECK_PYTHON`, else the venv at `.scratch/grammar-venv`

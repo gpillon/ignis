@@ -19,6 +19,7 @@ import {
   type Speech,
   type Reasoning,
   type StructuredOutputCard,
+  type ToolCallsCard,
   type Speculation,
   RATE_SPAN_MS,
   TOKENS_PER_KV_PAGE,
@@ -42,6 +43,8 @@ import {
   type RetainedTier,
   SLOT_SKIP_REASONS,
   type SlotSkipReason,
+  TOOL_CALL_VIOLATIONS,
+  type ToolCallViolation,
   type VramLine,
 } from "./snapshot.ts";
 import { setMonitorInterval, setMonitorPaused, useNow } from "./useMonitor.ts";
@@ -276,6 +279,9 @@ function Board({ dash, state }: { dash: Dashboard; state: MonitorState }) {
 
       {/* #593: only once a request held to a grammar ended. */}
       {dash.structured && <StructuredCard structured={dash.structured} win={win} />}
+
+      {/* #608: only once a tool call block was read, or a strict tool came outside the strict subset. */}
+      {dash.toolCalls && <ToolCallsView tools={dash.toolCalls} win={win} />}
 
       {/* GitHub #324: only once the image model admitted a job -- a text-only server shows nothing of it. */}
       {dash.images && <ImagesCard images={dash.images} win={win} />}
@@ -1233,6 +1239,42 @@ function StructuredCard({ structured, win }: { structured: StructuredOutputCard;
       <p className="text-[11px] text-ash">
         A miss is a sampled token the grammar rejected; a repair samples that position again from the same scores, restricted to what the grammar
         allows. A request that sampled no miss costs nothing extra.
+      </p>
+    </Card>
+  );
+}
+
+/** How the Tool calls card names each kind of violation (#608). */
+const VIOLATION_WORDS: Record<ToolCallViolation, string> = {
+  missing: "missing a required parameter",
+  type: "of the wrong type",
+  enum: "outside an enum",
+  unknown_parameter: "with an undeclared parameter",
+  constraint: "breaking a pattern, format, bound or length",
+  undeclared_tool: "to an undeclared tool",
+};
+
+/** Tool calls (#608): the call blocks the model wrote, checked against their tools' parameters, and what failed. */
+function ToolCallsView({ tools, win }: { tools: ToolCallsCard; win: string }) {
+  const kinds = TOOL_CALL_VIOLATIONS.filter((kind) => tools.violations[kind].window).map(
+    (kind) => `${formatCount(tools.violations[kind].window)} ${VIOLATION_WORDS[kind]}`,
+  );
+  return (
+    <Card title="Tool calls" subtitle={`Checked against their tools' parameters · last ${win}`}>
+      <Figures
+        items={[
+          ["Calls", formatCount(tools.calls.window)],
+          ["Valid", formatCount(tools.byOutcome.valid.window)],
+          ["Invalid", formatCount(tools.byOutcome.invalid.window)],
+          ["Dropped", formatCount(tools.byOutcome.dropped.window)],
+          ["Failed", formatShare(tools.failedShare, 1)],
+          ["Strict, outside the subset", formatCount(tools.strictOutsideSubset.window)],
+        ]}
+      />
+      {kinds.length > 0 && <p className="text-[11px] text-ash">Invalid calls: {kinds.join("; ")}.</p>}
+      <p className="text-[11px] text-ash">
+        Every call the model writes is checked as it closes and delivered as written. A dropped call is a block that did not parse, which the
+        client never sees. A strict tool outside OpenAI's strict subset is served as any other.
       </p>
     </Card>
   );

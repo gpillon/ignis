@@ -19,7 +19,7 @@ use crate::engine::RequestNotes;
 use crate::responses::events::{wire_number, ResponseEvents, ResponseObject};
 use crate::template::{check_roles, ChatMessage, FunctionIn, MessageContent, ToolCallIn};
 use crate::thinking::ThinkingRequestFields;
-use crate::toolcall::ToolSchemas;
+use crate::toolcall::{CallCheck, ToolSchemas};
 use crate::Server;
 
 /// A Responses request: the `POST /v1/responses` body, and the body of a
@@ -143,6 +143,8 @@ pub(crate) struct ResponseStart {
     response: ResponseObject,
     decoder: OutputDecoder,
     schemas: ToolSchemas,
+    /// The response's call check (GitHub #608): none with metrics off.
+    check: Option<CallCheck>,
     prompt_tokens: u32,
     /// `include: ["reasoning.encrypted_content"]`.
     encrypted_reasoning: bool,
@@ -151,10 +153,12 @@ pub(crate) struct ResponseStart {
 impl ResponseStart {
     /// The event producer for this response, now that it is `resp_<suffix>`.
     pub(crate) fn events(self, suffix: String, created_at: u64) -> ResponseEvents {
-        let ResponseStart { mut response, decoder, schemas, prompt_tokens, encrypted_reasoning } = self;
+        let ResponseStart { mut response, decoder, schemas, check, prompt_tokens, encrypted_reasoning } = self;
         response.id = format!("resp_{suffix}");
         response.created_at = created_at;
-        ResponseEvents::new(response, suffix, decoder, schemas, prompt_tokens).with_encrypted_reasoning(encrypted_reasoning)
+        ResponseEvents::new(response, suffix, decoder, schemas, prompt_tokens)
+            .checking(check)
+            .with_encrypted_reasoning(encrypted_reasoning)
     }
 }
 
@@ -220,6 +224,7 @@ pub(crate) async fn prepare(
         .map(str::to_owned);
     let tools = chat_tools(req.tools.as_deref().unwrap_or_default())?;
     let (tools, tool_choice) = api::resolve_tools(Some(tools), req.tool_choice.clone().map(chat_tool_choice))?;
+    api::count_strict_tools(server, &tools);
 
     let mut items = history;
     items.extend(input_items(req.input.clone())?);
@@ -276,6 +281,7 @@ pub(crate) async fn prepare(
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
         .map_err(|message| api::bad_request(&message))?;
     let schemas = ToolSchemas::from_tools(&tools);
+    let check = CallCheck::new(&tools, server.metrics.as_ref());
     let (mut input, model, mut prompt_tokens, media) =
         api::prepare_request(server, model, &messages, params, &thinking, &tools, description.as_deref()).await?;
     input.warm_up = warm_up;
@@ -339,6 +345,7 @@ pub(crate) async fn prepare(
             response,
             decoder: OutputDecoder::new(server.active().template.token_decoder(), starts_in_reasoning),
             schemas,
+            check,
             prompt_tokens,
             encrypted_reasoning,
         },

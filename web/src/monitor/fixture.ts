@@ -421,6 +421,27 @@ ignis_structured_repair_seconds_count 6
 
 export const STRUCTURED_EXPOSITION = `${IGNIS_EXPOSITION}${STRUCTURED_FAMILIES}`;
 
+// Tool calls (#608): the first call block read, or strict tool outside the subset, renders every series.
+export const TOOL_CALL_FAMILIES = `# HELP ignis_tool_calls_total Tool call blocks read from the model's output, checked against the tool's parameters: valid, invalid (a violation, or a tool the request did not declare), or dropped (a closed block that did not parse).
+# TYPE ignis_tool_calls_total counter
+ignis_tool_calls_total{outcome="valid"} 40
+ignis_tool_calls_total{outcome="invalid"} 3
+ignis_tool_calls_total{outcome="dropped"} 1
+# HELP ignis_tool_call_violations_total Invalid tool calls by kind of violation, a call once under each kind it has.
+# TYPE ignis_tool_call_violations_total counter
+ignis_tool_call_violations_total{kind="missing"} 1
+ignis_tool_call_violations_total{kind="type"} 2
+ignis_tool_call_violations_total{kind="enum"} 0
+ignis_tool_call_violations_total{kind="unknown_parameter"} 1
+ignis_tool_call_violations_total{kind="constraint"} 0
+ignis_tool_call_violations_total{kind="undeclared_tool"} 0
+# HELP ignis_tool_strict_outside_subset_total Strict tools (strict: true) whose parameters lie outside OpenAI's strict subset, once per request that sends one; served as any other tool.
+# TYPE ignis_tool_strict_outside_subset_total counter
+ignis_tool_strict_outside_subset_total 5
+`;
+
+export const TOOL_CALL_EXPOSITION = `${IGNIS_EXPOSITION}${TOOL_CALL_FAMILIES}`;
+
 export const LOOP_GUARD_EXPOSITION = `${IGNIS_EXPOSITION}${LOOP_GUARD_FAMILIES}${THINKING_FORCED_CLOSES}`;
 
 // The speech families (spec speech/02, ADR 0017's amendment of 2026-10-24),
