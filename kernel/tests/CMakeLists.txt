@@ -525,8 +525,8 @@ target_link_libraries(ignis_kernel_media_encode_test PRIVATE ignis_kernel ignis_
 add_test(NAME ignis_kernel_media_encode_test COMMAND ignis_kernel_media_encode_test)
 
 # GitHub #296 / #335: OURS -- the GQA attention's arena: ignis's prompt
-# attention's, flat in the context past one band and at least 1.0e9 bytes
-# under A1's at 524,288 keys (spec 27b-16gb/03 acceptance 1), and the vendored
+# attention's, flat in the context past one band and, at 524,288 keys, too
+# small to hold one of the two prompt planes A1's holds (#603), and the vendored
 # A1 capacity query against a layout-builder replay of what the hq Prompt
 # route bumps, at every serving prompt width, in one scratch band and past it.
 # Host-only layout arithmetic (the SM-count query creates no context); it pins
