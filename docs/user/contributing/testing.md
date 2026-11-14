@@ -66,6 +66,20 @@ the other. They are no configuration fields: `GET /v1/config` and
   attention band beside it, and its VRAM plan is sized for that route. The
   sm_86 gate's quality leg ([Releases](releases.md)) names `ours` beside the
   other two routes, as its limits were measured.
+- `IGNIS_HQ_DECODE_ATTENTION=ours|vendored` (from 0.11.0) picks the attention
+  route of the 27B's decode and verify rounds over `hq-e8-2b` at each model
+  load: ignis's warp-specialized route, or the vendored kernel's route it
+  replaced ([ADR 0031](../../adr/0031-vendored-kernel-bottleneck-exemption.md)),
+  the comparison a speed measurement of the two needs. Unset, or `ours`, an
+  RTX 50 or RTX PRO card runs ignis's own; `vendored` runs the vendored one
+  there. An RTX 30 or RTX 40 card, a card the build holds no code of the route
+  for, and a `bf16` load run the vendored route whatever the variable says.
+  Any other value refuses the load, naming the variable. The load logs the
+  route it runs under `ignis.runtime.decode_routes` (`hq_decode_attention`),
+  and `ignis.runtime.decode_graph_capture` gives the node count of each
+  width's decode graph and verify graph (`decode_nodes`, `verify_nodes`),
+  which the two routes share, as they share every byte they write and the
+  VRAM plan.
 
 ## The speech executor's CPU legs
 

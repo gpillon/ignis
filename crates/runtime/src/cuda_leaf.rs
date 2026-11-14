@@ -710,6 +710,16 @@ impl StepLeaf for CudaLeaf {
             gdn_prefill = model.gdn_prefill().as_str(),
             "prefill routes"
         );
+        // GitHub #572 (spec #570): the attention route of the decode and
+        // verify rounds, which no option names either (the leaf decides it
+        // from the card, or the measurement switch IGNIS_HQ_DECODE_ATTENTION
+        // names today's route): `ours` on a Blackwell card's hq-e8-2b load.
+        // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80).
+        tracing::info!(
+            name: "ignis.runtime.decode_routes",
+            hq_decode_attention = model.hq_decode_attention().as_str(),
+            "decode routes"
+        );
         let cfg = ModelConfig::qwen38_27b();
         // The pool holds the pages the byte budget bought under this load's
         // format, shared across the slots; `max_context_tokens` is the
@@ -765,6 +775,10 @@ impl StepLeaf for CudaLeaf {
         // existed to avoid eight copies of.
         let capture = step::capture_decode_graphs(&model, &pool)
             .map_err(|e| leaf_error("decode graph capture", e))?;
+        // GitHub #572: each width's graph node count, so two loads (two
+        // attention routes) can be held to the same rounds from their logs.
+        let graphs = step::program_stats(&model, &pool)
+            .map_err(|e| leaf_error("program stats", e))?;
         // Reported unconditionally (GitHub #102's acceptance: "startup cost
         // of capturing the graphs is measured and reported, not assumed")
         // -- not only when a width failed, so the common all-widths-ready case
@@ -777,6 +791,8 @@ impl StepLeaf for CudaLeaf {
             name: "ignis.runtime.decode_graph_capture",
             ready = capture.ready_count(),
             capture_micros = capture.capture_micros,
+            decode_nodes = ?graphs.decode_graph_nodes,
+            verify_nodes = ?graphs.verify_graph_nodes,
             "decode graph capture"
         );
         if !capture_complete(capture.ready_count(), self.config.slot_count) {

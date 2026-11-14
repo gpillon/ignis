@@ -230,6 +230,8 @@ pub(crate) mod ffi {
 
         pub fn ignis_model_gdn_prefill(model: *const IgnisModel) -> u32;
 
+        pub fn ignis_model_hq_decode_attention(model: *const IgnisModel) -> u32;
+
         pub fn ignis_model_vision_item_max_tokens(model: *const IgnisModel) -> u32;
 
         pub fn ignis_model_free(model: *mut IgnisModel);
@@ -259,6 +261,16 @@ impl Model {
     pub fn gdn_prefill(&self) -> crate::GdnPrefill {
         let code = unsafe { ffi::ignis_model_gdn_prefill(self.handle) };
         crate::GdnPrefill::from_abi(code).unwrap_or_else(|| panic!("ignis_model_gdn_prefill: unknown route {code}"))
+    }
+
+    /// The attention route this load's decode and verify rounds run (GitHub
+    /// #572), as the leaf decided it at load: ours on a Blackwell card's
+    /// hq-e8-2b load, the vendored one otherwise or under
+    /// `IGNIS_HQ_DECODE_ATTENTION=vendored`.
+    pub fn hq_decode_attention(&self) -> crate::HqDecodeAttention {
+        let code = unsafe { ffi::ignis_model_hq_decode_attention(self.handle) };
+        crate::HqDecodeAttention::from_abi(code)
+            .unwrap_or_else(|| panic!("ignis_model_hq_decode_attention: unknown route {code}"))
     }
 
     /// The most merged tokens one media item may hold on this load (GitHub

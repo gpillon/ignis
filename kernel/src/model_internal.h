@@ -471,6 +471,9 @@ struct IgnisVerifyRound {
   // the most a round serves wide (GitHub #336).
   std::array<cudaGraphExec_t, IGNIS_DECODE_MAX_BATCH> graph_exec{};
   std::array<bool, IGNIS_DECODE_MAX_BATCH> graph_ready{};
+  // GitHub #572: each captured graph's node count, 0 for a width not captured
+  // (`ignis_program_stats`'s `verify_graph_nodes`).
+  std::array<uint32_t, IGNIS_DECODE_MAX_BATCH> graph_nodes{};
 
   std::size_t device_bytes() const {
     std::size_t bytes = 0;
@@ -526,6 +529,13 @@ struct ignis_model {
   // prefill call of at least ignis::gdn_prefill::kMinTokens tokens
   // (kernel/src/gdn_layer.cu `run_gdn_layer`).
   bool gdn_prefill_ours = false;
+  // GitHub #572 (spec #570): the attention route of the decode and verify
+  // rounds, decided once at load (model.cu `hq_decode_attention_route`):
+  // ignis's warp-specialized route over hq-e8-2b when true
+  // (kernel/src/hq_decode_attention.h), the vendored kernel's otherwise; read
+  // by every call of the batch body (kernel/src/gqa_layer.cu
+  // `run_gqa_layer_batch`), so every graph captured on this load bakes it in.
+  bool hq_decode_attention_ours = false;
   uint64_t vram_bytes = 0;
   // ADR 0062: what of the bound tensors lives in mapped host memory.
   uint64_t host_mapped_bytes = 0;
@@ -653,6 +663,9 @@ struct ignis_model {
   // most a round serves wide.
   std::array<cudaGraphExec_t, IGNIS_DECODE_MAX_BATCH> decode_graph_exec{};
   std::array<bool, IGNIS_DECODE_MAX_BATCH> decode_graph_ready{};
+  // GitHub #572: each captured graph's node count, 0 for a width not captured
+  // (`ignis_program_stats`'s `decode_graph_nodes`).
+  std::array<uint32_t, IGNIS_DECODE_MAX_BATCH> decode_graph_nodes{};
   // Set by the most recent `ignis_program_decode` call: 1 if it replayed a
   // graph, 0 if it ran the eager loop (`ignis_program_stats`'s
   // `graph_launches`).

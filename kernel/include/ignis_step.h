@@ -495,6 +495,11 @@ struct ignis_program_stats {
    * width w is captured at the load's draft window. Always 0 on a load with
    * no window. */
   uint32_t verify_graph_ready_mask;
+  /* GitHub #572: entry w-1 is the node count of the 27B's decode graph and of
+   * its verify graph for exact width w, as captured; 0 for a width with no
+   * graph, and for Flash-Next, which captures its own. */
+  uint32_t decode_graph_nodes[IGNIS_DECODE_MAX_BATCH];
+  uint32_t verify_graph_nodes[IGNIS_DECODE_MAX_BATCH];
 };
 
 /* Captures one CUDA graph per exact decode batch width 1..the load's decode

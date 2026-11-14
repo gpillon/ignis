@@ -36,10 +36,11 @@ foreach(arch IN LISTS IGNIS_CUDA_ARCHITECTURES)
 endforeach()
 # The sm_120a set: the kernels that build for the arch-specific Blackwell
 # targets alone (the NVFP4 W4A4 prefill GEMMs, the block-scaled FP8 MMA,
-# Flash-Next's decode clusters and staged kernel, and three vendored ones
-# with more static shared memory than an sm_8x block takes) compile for those
-# entries of the list only, so on any other card a launch of one fails with
-# CUDA's "no kernel image is available" rather than running a stand-in.
+# Flash-Next's decode clusters and staged kernel, the 27B's hq-e8-2b decode
+# attention route, and three vendored ones with more static shared memory
+# than an sm_8x block takes) compile for those entries of the list only, so on
+# any other card a launch of one fails with CUDA's "no kernel image is
+# available" rather than running a stand-in.
 set(IGNIS_SM120A_ARCHITECTURES ${IGNIS_CUDA_ARCHITECTURES})
 list(FILTER IGNIS_SM120A_ARCHITECTURES INCLUDE REGEX "^12[0-9]a$")
 if(NOT IGNIS_SM120A_ARCHITECTURES)
@@ -356,22 +357,26 @@ file(GLOB_RECURSE IGNIS_KERNEL_SRCS CONFIGURE_DEPENDS
 # GitHub #456: our sources whose every kernel needs the sm_120a set compile
 # for it alone, as ignis_vendor_sm120a above: Flash-Next's decode clusters
 # (thread-block clusters) and staged kernel (`mbarrier.try_wait`), neither its
-# default route, and the image model's FP8 GEMM and attention (the
-# block-scaled FP8 MMA). On another card the prepare step finds no staged or
-# cluster kernel and Flash-Next keeps its register kernel; a launch fails
-# with "no kernel image is available".
+# default route, the image model's FP8 GEMM and attention (the
+# block-scaled FP8 MMA), and the 27B's warp-specialized hq-e8-2b attention
+# route in the decode and verify rounds (87,408 bytes of static shared memory
+# per block and `mbarrier.try_wait`, spec #570, GitHub #572). On another card
+# the prepare step finds no staged or cluster kernel and Flash-Next keeps its
+# register kernel, and a 27B load finds no image of the route and keeps the
+# vendored one; a launch fails with "no kernel image is available".
 set(IGNIS_KERNEL_SM120A_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/moe_decode_cluster.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/src/moe_decode_staged.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/src/image/fp8_gemm.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/src/image/attn8.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/hq_decode_attention_ws.cu
 )
 list(LENGTH IGNIS_KERNEL_SRCS kernel_sources)
 list(REMOVE_ITEM IGNIS_KERNEL_SRCS ${IGNIS_KERNEL_SM120A_SRCS})
 list(LENGTH IGNIS_KERNEL_SRCS kernel_sources_left)
 math(EXPR kernel_sources_moved "${kernel_sources} - ${kernel_sources_left}")
-if(NOT kernel_sources_moved EQUAL 4)
-  message(FATAL_ERROR "the sm_120a set's four sources are not all under kernel/src (${kernel_sources_moved} found)")
+if(NOT kernel_sources_moved EQUAL 5)
+  message(FATAL_ERROR "the sm_120a set's five sources are not all under kernel/src (${kernel_sources_moved} found)")
 endif()
 add_library(ignis_kernel_sm120a OBJECT ${IGNIS_KERNEL_SM120A_SRCS})
 set_target_properties(ignis_kernel_sm120a PROPERTIES CUDA_ARCHITECTURES "${IGNIS_SM120A_ARCHITECTURES}")

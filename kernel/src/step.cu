@@ -3248,6 +3248,16 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   }
   out_stats->decode_graph_ready_mask = ready_mask;
   out_stats->verify_graph_ready_mask = verify_ready_mask;
+  // GitHub #572: the 27B's capture alone counts nodes (kernel/src/decode_graph.cu); Flash-Next's
+  // leaves them at 0.
+  for (uint32_t width = 1; width <= IGNIS_DECODE_MAX_BATCH; ++width) {
+    out_stats->decode_graph_nodes[width - 1] =
+        model->decode_graph_ready[width - 1] ? model->decode_graph_nodes[width - 1] : 0;
+    out_stats->verify_graph_nodes[width - 1] =
+        model->verify != nullptr && model->verify->graph_ready[width - 1]
+            ? model->verify->graph_nodes[width - 1]
+            : 0;
+  }
   return 0;
 }
 

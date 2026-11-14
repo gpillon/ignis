@@ -430,6 +430,19 @@ target_include_directories(ignis_kernel_hq_verify_exact_test PRIVATE ${CMAKE_CUR
 target_link_libraries(ignis_kernel_hq_verify_exact_test PRIVATE ignis_vendor)
 add_test(NAME ignis_kernel_hq_verify_exact_test COMMAND ignis_kernel_hq_verify_exact_test)
 
+# GitHub #572 (spec #570): OURS -- how a 27B load picks the attention route of
+# its decode and verify rounds over hq-e8-2b (kernel/src/hq_decode_attention.h):
+# the rule with the card's generation injected (Blackwell takes ignis's route
+# unless IGNIS_HQ_DECODE_ATTENTION=vendored, every other card keeps today's
+# whatever the switch says, a bad value is refused by name), then the image
+# probe on the card at hand, which finds the route exactly when the build names
+# the card's arch-specific target. Not sm120a-only: an older card's answer is
+# "no image". No SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_hq_decode_attention_route_test test_hq_decode_attention_route.cu)
+target_include_directories(ignis_kernel_hq_decode_attention_route_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_hq_decode_attention_route_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_hq_decode_attention_route_test COMMAND ignis_kernel_hq_decode_attention_route_test)
+
 # P4-04 (GitHub #122): OURS, not vendored -- the KV append path under both
 # storage formats. It builds two sequence pools differing only in
 # `ignis_seq_pool_spec::kv_format`, appends the same real fixture rows to a

@@ -291,12 +291,24 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
 
 namespace {
 
+// GitHub #572: a captured graph's node count (`ignis_program_stats`), what a route that takes
+// another's place in a round must leave as it was; 0 if the runtime cannot say.
+uint32_t node_count(cudaGraph_t graph) {
+  std::size_t nodes = 0;
+  if (cudaGraphGetNodes(graph, nullptr, &nodes) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return 0;
+  }
+  return static_cast<uint32_t>(nodes);
+}
+
 // P5-04 (GitHub #153): records one width-W verify graph -- exactly
 // `ignis_verify_graph_run_batch`, captured once. Same failure handling as
 // the decode capture below.
 int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, uint32_t width,
-                                   cudaGraphExec_t *out_exec) {
+                                   cudaGraphExec_t *out_exec, uint32_t *out_nodes) {
   *out_exec = nullptr;
+  *out_nodes = 0;
   // GitHub #577: a teacher-forced round's recording is set only while that
   // round runs eagerly; a graph that baked it in would force serving rounds.
   if (model->verify->forced_tokens != nullptr) {
@@ -322,6 +334,7 @@ int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
     cudaGraphDestroy(graph);
     return -1;
   }
+  const uint32_t nodes = node_count(graph);
   cudaGraphExec_t exec = nullptr;
   const cudaError_t inst_err = cudaGraphInstantiate(&exec, graph, 0);
   cudaGraphDestroy(graph);
@@ -331,6 +344,7 @@ int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
     return -1;
   }
   *out_exec = exec;
+  *out_nodes = nodes;
   return 0;
 }
 
@@ -342,8 +356,9 @@ int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
 // the partial graph is discarded and `*out_exec` stays null; the caller
 // leaves this width on the eager fallback.
 int32_t capture_decode_graph_width(ignis_model *model, ignis_seq_pool *pool, uint32_t width,
-                                   cudaGraphExec_t *out_exec) {
+                                   cudaGraphExec_t *out_exec, uint32_t *out_nodes) {
   *out_exec = nullptr;
+  *out_nodes = 0;
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto batch = static_cast<std::int32_t>(width);
 
@@ -386,6 +401,7 @@ int32_t capture_decode_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
     return -1;
   }
 
+  const uint32_t nodes = node_count(graph);
   cudaGraphExec_t exec = nullptr;
   const cudaError_t inst_err = cudaGraphInstantiate(&exec, graph, 0);
   cudaGraphDestroy(graph);
@@ -395,6 +411,7 @@ int32_t capture_decode_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
     return -1;
   }
   *out_exec = exec;
+  *out_nodes = nodes;
   return 0;
 }
 
@@ -437,7 +454,8 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   // past them is refused, so a graph for it would only hold memory.
   for (uint32_t width = 1; width <= model->decode_lanes; ++width) {
     cudaGraphExec_t exec = nullptr;
-    if (capture_decode_graph_width(model, pool, width, &exec) == 0) {
+    if (capture_decode_graph_width(model, pool, width, &exec,
+                                   &model->decode_graph_nodes[width - 1]) == 0) {
       model->decode_graph_exec[width - 1] = exec;
       model->decode_graph_ready[width - 1] = true;
       ready_mask |= (1u << (width - 1));
@@ -457,7 +475,8 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   if (model->verify != nullptr) {
     for (uint32_t width = 1; width <= model->decode_lanes; ++width) {
       cudaGraphExec_t exec = nullptr;
-      if (capture_verify_graph_width(model, pool, width, &exec) == 0) {
+      if (capture_verify_graph_width(model, pool, width, &exec,
+                                     &model->verify->graph_nodes[width - 1]) == 0) {
         model->verify->graph_exec[width - 1] = exec;
         model->verify->graph_ready[width - 1] = true;
       } else {

@@ -37,6 +37,7 @@ pub mod checkpoint;
 pub mod compute;
 pub mod concrete;
 pub mod decision;
+pub mod decode_attention;
 // GitHub #267: the drafter's proposals at a sequence's frontier, for the
 // replay of recorded turns (its leaf call is cuda-only; the lattice walk is
 // not).
@@ -143,6 +144,7 @@ pub use kv_format::{
 pub use mock::{FakeDisk, MockCompute, MockSections};
 pub use exception_weights::ExceptionWeights;
 pub use prefill_attention::{GdnPrefill, PrefillAttention, PrefillLinear};
+pub use decode_attention::HqDecodeAttention;
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};
 pub use retained_slot::{

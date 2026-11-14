@@ -27,6 +27,7 @@
 // out [T][value][128], g and beta [T][value], the state [value head][value][key].
 
 #include "gdn_prefill.h"
+#include "process_environment.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -40,16 +41,6 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 
 namespace ignis::gdn_prefill {
 namespace {
@@ -667,27 +658,10 @@ void require(bool ok, const std::string &what) {
   if (!ok) throw std::invalid_argument("gdn_prefill: " + what);
 }
 
-// `name` in the operating system's environment block, empty when unset.
-std::string environment(const char *name) {
-#ifdef _WIN32
-  std::string value(64, '\0');
-  DWORD n = GetEnvironmentVariableA(name, value.data(), static_cast<DWORD>(value.size()));
-  if (n >= value.size()) {
-    value.assign(n, '\0');
-    n = GetEnvironmentVariableA(name, value.data(), static_cast<DWORD>(value.size()));
-  }
-  value.resize(n < value.size() ? n : 0);
-  return value;
-#else
-  const char *v = std::getenv(name);
-  return v == nullptr ? std::string() : std::string(v);
-#endif
-}
-
 } // namespace
 
 bool route_for_load(int compute_capability_major) {
-  const std::string named = environment("IGNIS_GDN_PREFILL");
+  const std::string named = ignis::process_environment("IGNIS_GDN_PREFILL");
   if (named.empty()) return runs_by_default(compute_capability_major);
   if (named == "ours") return true;
   if (named == "vendored") return false;
