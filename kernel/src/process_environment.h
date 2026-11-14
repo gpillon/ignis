@@ -13,4 +13,12 @@ namespace ignis {
 // `name` in the operating system's environment block, empty when unset.
 std::string process_environment(const char *name);
 
+// What a measurement switch of the leaf names at a load: unset (or empty), `ours` or `vendored`.
+enum class RouteSwitch { Unset, Ours, Vendored };
+
+// The switch `name` in the operating system's environment (`process_environment`), read at each
+// call: the one parse of `ours` and `vendored`. Throws std::invalid_argument, naming the
+// variable, on any other value.
+RouteSwitch route_switch(const char *name);
+
 } // namespace ignis

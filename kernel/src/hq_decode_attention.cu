@@ -75,13 +75,7 @@ cudaError_t reduce(const Tensor &acc, const Tensor &m, const Tensor &l, const Te
 
 }  // namespace
 
-Switch switch_for_load() {
-  const std::string named = ignis::process_environment(kSwitch);
-  if (named.empty()) return Switch::Unset;
-  if (named == "ours") return Switch::Ours;
-  if (named == "vendored") return Switch::Vendored;
-  throw std::invalid_argument(std::string(kSwitch) + " is `ours` or `vendored`, not `" + named + "`");
-}
+Switch switch_for_load() { return ignis::route_switch(kSwitch); }
 
 bool serves(std::int32_t q_heads, std::int32_t width, std::int32_t batch, DType cache_dtype,
             ninfer::ops::GqaExecutionEnvelope envelope) {

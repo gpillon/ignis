@@ -661,11 +661,12 @@ void require(bool ok, const std::string &what) {
 } // namespace
 
 bool route_for_load(int compute_capability_major) {
-  const std::string named = ignis::process_environment("IGNIS_GDN_PREFILL");
-  if (named.empty()) return runs_by_default(compute_capability_major);
-  if (named == "ours") return true;
-  if (named == "vendored") return false;
-  throw std::invalid_argument("IGNIS_GDN_PREFILL is `ours` or `vendored`, not `" + named + "`");
+  switch (ignis::route_switch("IGNIS_GDN_PREFILL")) {
+  case ignis::RouteSwitch::Ours: return true;
+  case ignis::RouteSwitch::Vendored: return false;
+  case ignis::RouteSwitch::Unset: break;
+  }
+  return runs_by_default(compute_capability_major);
 }
 
 std::size_t workspace_bytes(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t tokens) {

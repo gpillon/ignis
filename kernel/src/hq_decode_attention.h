@@ -21,6 +21,8 @@
 // vendored route's too.
 #pragma once
 
+#include "process_environment.h"
+
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
@@ -33,15 +35,13 @@
 
 namespace ignis::hq_decode_attention {
 
-// What the measurement switch IGNIS_HQ_DECODE_ATTENTION names at a load.
-enum class Switch {
-  // Unset (or empty): the card decides.
-  Unset,
-  // `ours`: the card's own default where the route runs; it never takes the route anywhere else.
-  Ours,
-  // `vendored`: today's route, the vendored kernel's hq small-T route, on any card.
-  Vendored,
-};
+// What the measurement switch IGNIS_HQ_DECODE_ATTENTION names at a load, in the one parse the
+// leaf's route switches share (kernel/src/process_environment.h):
+//   - Unset (or empty): the card decides;
+//   - Ours, `ours`: the card's own default where the route runs; it never takes the route
+//     anywhere else;
+//   - Vendored, `vendored`: today's route, the vendored kernel's hq small-T route, on any card.
+using Switch = ignis::RouteSwitch;
 
 // The switch in the process environment (kernel/src/process_environment.h), read once per load.
 // Throws std::invalid_argument, naming the variable, on any value but `ours` and `vendored`.

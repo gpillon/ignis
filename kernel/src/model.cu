@@ -1129,6 +1129,19 @@ struct LoadOptions {
   float drafter_top_p = 1.0f;
 };
 
+// The current device's compute capability major, which a load's route choices read: false (error
+// set, naming `what` the generation was for) when the device cannot say it.
+bool device_major(const char *what, int &major) {
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err == cudaSuccess) err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_model_load: the GPU generation for ") + what + ": " + cudaGetErrorString(err));
+    return false;
+  }
+  return true;
+}
+
 // GitHub #514: the GDN prefill on our full-rate kernels (kernel/src/gdn_prefill.h)
 // or on the vendored chunked ones, decided once per load: the card's generation
 // decides (ours on 8.x and on Blackwell, `ignis::gdn_prefill::runs_by_default`)
@@ -1137,11 +1150,8 @@ struct LoadOptions {
 // any other value is refused by name. False (error set) on a refusal or when the
 // device cannot say its generation.
 bool gdn_prefill_route(bool &ours) {
-  int device = 0, major = 0;
-  cudaError_t err = cudaGetDevice(&device);
-  if (err == cudaSuccess) err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-  if (err != cudaSuccess) {
-    set_error(std::string("ignis_model_load: the GPU generation for the GDN prefill: ") + cudaGetErrorString(err));
+  int major = 0;
+  if (!device_major("the GDN prefill", major)) {
     return false;
   }
   try {
@@ -1169,22 +1179,18 @@ bool hq_decode_attention_switch(ignis::hq_decode_attention::Switch &named) {
 // per load, after the plan and outside any capture (kernel/src/hq_decode_attention.h): ignis's
 // warp-specialized route over hq-e8-2b on a Blackwell card whose image this binary holds, unless
 // the switch names today's route; today's (the vendored kernel's) everywhere else. False (error
-// set) when the device cannot say its generation.
+// set) when the device cannot say its generation. The image probe runs on any card an hq-e8-2b
+// load reaches here on, and finds none on a card the route does not run on.
 bool hq_decode_attention_route(ignis::hq_decode_attention::Switch named, int32_t kv_format, bool &ours) {
   ours = false;
   if (kv_format != IGNIS_KV_FORMAT_HQ_E8_2B || named == ignis::hq_decode_attention::Switch::Vendored) {
     return true;
   }
-  int device = 0, major = 0;
-  cudaError_t err = cudaGetDevice(&device);
-  if (err == cudaSuccess) err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-  if (err != cudaSuccess) {
-    set_error(std::string("ignis_model_load: the GPU generation for the decode attention: ") +
-              cudaGetErrorString(err));
+  int major = 0;
+  if (!device_major("the decode attention", major)) {
     return false;
   }
-  const bool image = ignis::hq_decode_attention::runs_on(major) && ignis::hq_decode_attention::image_here();
-  ours = ignis::hq_decode_attention::takes_ours(named, true, major, image);
+  ours = ignis::hq_decode_attention::takes_ours(named, true, major, ignis::hq_decode_attention::image_here());
   return true;
 }
 
