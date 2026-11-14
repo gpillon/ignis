@@ -21,14 +21,16 @@
 //! Spec 05b's capacity simulation (GitHub #340, AC 5) adds the card less 1 GiB
 //! and less 3 GiB of simulated desktop, load and plan only. No line but the
 //! pool follows the budget or, on this body, the context (the hq prompt
-//! planes are gone, ADR 0061), so each plan charges the 16 GiB load's bytes
-//! beside its pool, to the byte, and its pool is the whole pages the budget
-//! leaves beside them and the card's own lines, the CUDA context the process
-//! measured and the trellis workspace (GitHub #607, `support/kv_pool_pins.rs`).
-//! Less 1 GiB the profile's shape still fits, nothing adapted. Less 3 GiB the
-//! context adapts to 65,536 at two lanes: 196,608 is refused by the plan's own
-//! floor, and 131,072 holds one sequence but not the spare reservation beside
-//! it (`vram.adapt_spare_tokens`), short by 577 pages where the context is
+//! planes are gone, ADR 0061), so each plan charges the 16 GiB load's lines
+//! beside its pool, to the byte (the pool's block tables follow the context),
+//! and its pool is the whole pages the budget leaves beside them and the
+//! card's own lines, the CUDA context the process measured and the trellis
+//! workspace (GitHub #607, `support/kv_pool_pins.rs`). Less 1 GiB the
+//! profile's shape still fits,
+//! nothing adapted. Less 3 GiB the context adapts to 65,536 at two lanes:
+//! 196,608 is refused by the plan's own floor, and 131,072 holds one
+//! sequence but not the spare reservation beside it
+//! (`vram.adapt_spare_tokens`), short by 577 pages where the context is
 //! charged at `CUDA_CONTEXT_BYTES` and 576 at the one the RTX 5090 measured
 //! under Windows on 2026-11-14.
 //!
@@ -73,7 +75,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use ignis_artifact::{FrontendSet, Reader};
 use ignis_core::compute::ModelFamily;
 use ignis_core::gpu_profile;
-use ignis_core::{KvFormat, KvGeometry, KvPoolSize, VramMode, VramPlanError};
+use ignis_core::{KvPoolSize, VramMode, VramPlanError};
 use ignis_server::Server;
 use ignis_server::adaptation::{Adaptable, Attempt, StartRefusal};
 use ignis_server::runtime::{EngineShape, Qwen27bLoadError, qwen27b_load};
@@ -81,7 +83,10 @@ use ignis_server::runtime::{EngineShape, Qwen27bLoadError, qwen27b_load};
 #[path = "support/kv_pool_pins.rs"]
 mod kv_pool_pins;
 
-use kv_pool_pins::{CardLines, RTX50_16GB_LESS_1_GIB, RTX50_16GB_LESS_3_GIB, RTX50_16GB_LESS_3_GIB_131072_SPARE, assert_pinned};
+use kv_pool_pins::{
+    CardLines, RTX50_16GB, RTX50_16GB_LESS_1_GIB, RTX50_16GB_LESS_3_GIB, RTX50_16GB_LESS_3_GIB_131072_SPARE,
+    RTX50_16GB_RTX_5090_TRELLIS_WORKSPACE, assert_pinned, page_bytes,
+};
 
 const TRELLIS: &str = "F:/ai/models/Qwen3.8-27B-trellis-3bpw-ignis/qwen3_8_27b_trellis_sc30-v2.ninfer";
 const MODEL: &str = "qwen3.8-27b";
@@ -103,8 +108,9 @@ const BUDGET: &str = "17179869184";
 const WORKSPACE_BYTES: u64 = 395_924_480;
 /// The same line under `--vision-enabled false`.
 const TEXT_ONLY_WORKSPACE_BYTES: u64 = 395_898_880;
-/// The RTX 5090's: the kernel sizes it by the card's multiprocessors.
-const TRELLIS_WORKSPACE_BYTES: u64 = 36_225_280;
+/// The RTX 5090's: the kernel splits the widest call by the card's
+/// multiprocessors.
+const TRELLIS_WORKSPACE_BYTES: u64 = RTX50_16GB_RTX_5090_TRELLIS_WORKSPACE;
 const DECODE_GRAPH_BYTES: u64 = 20_621_336;
 /// Spec 05b's capacity simulation: the 16 GB card less 1 GiB and less 3 GiB
 /// of simulated desktop.
@@ -117,10 +123,6 @@ const SPARE_TOKENS: u64 = 65_536;
 /// The 16 GB card's start inside `budget` bytes (#339 A1's flags).
 fn flags_16g(budget: &str) -> [&str; 8] {
     ["--profile", "rtx50-16gb", "--vram-budget-bytes", budget, "--model-idle-unload", "0", "--model-loop-guard", "off"]
-}
-
-fn page_bytes() -> u64 {
-    KvFormat::HqE8_2b.page_bytes(KvGeometry::qwen38_27b())
 }
 
 fn the_27b(flags: &[&str]) -> ignis_server::config::Config {
@@ -271,6 +273,7 @@ async fn the_16gb_artifact_serves_greedy_code_on_two_dflash2_lanes_in_a_16_gib_b
     assert_eq!(trellis_workspace, TRELLIS_WORKSPACE_BYTES, "the trellis workspace line");
     assert_eq!(lines["workspace_bytes"].as_u64(), Some(WORKSPACE_BYTES), "the workspace line");
     assert_eq!(lines["decode_graph_bytes"].as_u64(), Some(DECODE_GRAPH_BYTES), "the decode graph line");
+    assert_pinned(lines, RTX50_16GB, "#339 A1's load");
     let load = named(&logged, "ignis.model.loaded");
     println!("model.loaded: {}", load[0]);
     assert_eq!(load[0]["attributes"]["decode_lanes"], 2);
@@ -455,13 +458,8 @@ async fn less_3_gib_of_desktop_adapts_the_context_to_65536_on_two_lanes() {
     );
     assert_eq!(
         spare_131072 - card.cuda_context - card.trellis_workspace,
-        RTX50_16GB_LESS_3_GIB_131072_SPARE.shape_bytes,
+        RTX50_16GB_LESS_3_GIB_131072_SPARE.needed_bytes,
         "131,072 and the spare reservation: the bytes beside the card's lines"
-    );
-    assert_eq!(
-        short.div_ceil(page_bytes()),
-        RTX50_16GB_LESS_3_GIB_131072_SPARE.pages_short(card),
-        "131,072 misses its spare reservation by the pages its pin gives beside this card's lines"
     );
     assert_eq!(lines["adapted"], "max_context 262144 -> 65536 (adapt_context_step 65536, adapt_spare_tokens 65536)");
     assert_eq!(lines["workspace_bytes"].as_u64(), Some(WORKSPACE_BYTES), "the workspace line, as at 262,144");
@@ -580,9 +578,8 @@ async fn the_8x_routes_keep_262144_tokens_on_two_lanes_less_1_gib() {
     assert_the_8x_routes(&events, lines);
     assert_eq!(lines["adapted"], "", "the profile's shape fits less 1 GiB on the 8.x routes");
     let pool = lines["kv_pool_tokens"].as_u64().unwrap();
-    // The fused load's pool beside this load's context and the RTX 5090's trellis workspace.
-    let fused = RTX50_16GB_LESS_1_GIB
-        .pool_tokens(CardLines { trellis_workspace: TRELLIS_WORKSPACE_BYTES, ..CardLines::of(lines) });
+    // The fused load's pool on the RTX 5090 beside this load's context.
+    let fused = RTX50_16GB_LESS_1_GIB.pool_tokens(RTX50_16GB_LESS_1_GIB.on_the_rtx_5090(CardLines::of(lines).cuda_context));
     println!(
         "kv pool: {pool} tokens on the 8.x routes, {fused} on the fused prefill and the FP8 band: {} fewer; workspace {} (fused {})",
         fused.saturating_sub(pool),

@@ -203,7 +203,7 @@ async fn rtx_24gb_pins_its_solo_width_to_its_chunk() {
     let loaded = facts(&events_since(start));
     assert_eq!(loaded.adapted, "");
     assert_eq!((loaded.width, loaded.text.as_str()), (2048, "prefill_chunk_solo 2048"));
-    assert_pinned(&loaded.lines, RTX_24GB_AT_THE_CHUNK, "#508's pool");
+    assert_pinned(&loaded.lines, RTX_24GB_AT_THE_CHUNK, "#508's load");
     assert_eq!(loaded.loaded["max_context"], 1_048_576);
     tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
 }
@@ -221,12 +221,15 @@ async fn rtx_24gb_on_an_rtx_30_card_widens_its_solo_chunk_under_auto() {
     let Some((model, start)) = load(&options, "under rtx-24gb in 24 GiB, solo auto") else { return };
     let events = || events_since(start);
     let loaded = facts(&events());
+    let context = CardLines::of(&loaded.lines).cuda_context;
     println!(
-        "solo width {}: kv pool {} tokens, {} past the context, beside a CUDA context of {} bytes",
+        "solo width {}: kv pool {} tokens, {} past the context, {} fewer than at the chunk on the RTX 5090, beside a \
+         CUDA context of {} bytes",
         loaded.width,
         loaded.pool,
         loaded.pool.saturating_sub(1_048_576),
-        CardLines::of(&loaded.lines).cuda_context
+        RTX_24GB_AT_THE_CHUNK.pool_tokens(RTX_24GB_AT_THE_CHUNK.on_the_rtx_5090(context)).saturating_sub(loaded.pool),
+        context
     );
     assert_eq!(loaded.adapted, "", "nothing adapted for the solo width");
     assert_eq!(loaded.retained_device_slots, slots, "beside the device retained slots");
@@ -270,7 +273,8 @@ async fn rtx_24gb_on_an_rtx_30_card_widens_its_solo_chunk_under_auto() {
 }
 
 /// `rtx-16gb` on an RTX 4080 pins the 27B's solo width to its 1,024-token
-/// chunk: the pool its 8.x note measured.
+/// chunk: the pool its 8.x note measured, which the context the RTX 5090
+/// measured on 2026-11-14 leaves as it was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn rtx_16gb_pins_its_solo_width_to_its_chunk() {
@@ -281,7 +285,7 @@ async fn rtx_16gb_pins_its_solo_width_to_its_chunk() {
     let loaded = facts(&events_since(start));
     assert_eq!(loaded.adapted, "");
     assert_eq!((loaded.width, loaded.text.as_str()), (1024, "prefill_chunk_solo 1024"));
-    assert_pinned(&loaded.lines, RTX_16GB_AT_THE_CHUNK, "the profile note's pool");
+    assert_pinned(&loaded.lines, RTX_16GB_AT_THE_CHUNK, "the profile note's load");
     assert_eq!((&loaded.loaded["max_context"], &loaded.loaded["decode_lanes"]), (&262_144.into(), &2.into()));
     tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
 }
@@ -298,12 +302,15 @@ async fn rtx_16gb_on_an_rtx_40_card_steps_down_to_2048_under_auto() {
     assert_eq!(options.prefill_chunk, 1024);
     let Some((model, start)) = load(&options, "under rtx-16gb in 16 GiB less 1 GiB, solo auto") else { return };
     let loaded = facts(&events_since(start));
+    let context = CardLines::of(&loaded.lines).cuda_context;
     println!(
-        "solo width {}: kv pool {} tokens, {} past the context, beside a CUDA context of {} bytes",
+        "solo width {}: kv pool {} tokens, {} past the context, {} fewer than at the chunk on the RTX 5090, beside a \
+         CUDA context of {} bytes",
         loaded.width,
         loaded.pool,
         loaded.pool.saturating_sub(262_144),
-        CardLines::of(&loaded.lines).cuda_context
+        RTX_16GB_AT_THE_CHUNK.pool_tokens(RTX_16GB_AT_THE_CHUNK.on_the_rtx_5090(context)).saturating_sub(loaded.pool),
+        context
     );
     assert_eq!(loaded.adapted, "", "nothing adapted for the solo width");
     assert_eq!(loaded.width, 2048, "4,096 short of the spare reservation, 2,048 not");
