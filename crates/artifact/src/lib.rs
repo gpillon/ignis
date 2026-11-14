@@ -58,7 +58,7 @@ pub use binder::{
 pub use checksum::{
     verify, ChecksumReport, GraftedSource, Nvfp4Record, ObjectCheck, Outcome, Sidecar,
 };
-pub use device::{CpuDevice, Device, DeviceBuffer, HostMappedBuffer};
+pub use device::{measure_context, ContextReading, CpuDevice, Device, DeviceBuffer, HostMappedBuffer, MeasureClock};
 pub use direct::{AlignedBuffer, DirectReader, DirectWriter, volume_free_bytes};
 #[cfg(feature = "cuda")]
 pub use device::{built_cuda_architectures, CudaDevice};

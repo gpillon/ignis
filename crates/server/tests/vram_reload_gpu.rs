@@ -16,7 +16,13 @@
 //! counter the held figures came from: NVML's free memory near a full card
 //! moves with what WDDM pages in and out for other processes, 84 MB within one
 //! reload on 2026-10-15. Its own test binary: the
-//! first load must make the process's context. Run under
+//! first load must make the process's context, which it measures (GitHub
+//! #604), and the plan charges that figure as its `cuda_context` line. Where
+//! the driver reports the process's own memory (NVML's per-process figure,
+//! native Linux) the reload adds back that figure, capped at what the plan
+//! charges again; where it does not (Windows, WSL) it adds back what the plan
+//! charges again. The test prints the measured context, the add-back and where
+//! it came from, and both loads' pages, on every OS. Run under
 //! `scripts/gpu-profile.ps1` only (`IGNIS_GPU_PROFILE=1`). Machine-local path:
 //! the 27B at [`ARTIFACT_27B`] (or `IGNIS_ARTIFACT_27B`).
 
@@ -52,7 +58,7 @@ const HELD_SLACK_BYTES: u64 = 16 << 20;
 
 /// One load of `artifact`, torn down before it returns: its KV pool's pages
 /// and the free memory NVML reads once it is in; `None` when the GPU profile
-/// says to skip.
+/// says to skip. Its plan's `cuda_context` line is printed.
 fn one_load(artifact: &Path) -> Option<(u32, u64)> {
     let loaded = match ignis_server::load::prepare_model(&options(), artifact).and_then(ignis_server::load::load_model) {
         Ok(loaded) => loaded,
@@ -61,7 +67,12 @@ fn one_load(artifact: &Path) -> Option<(u32, u64)> {
             return None;
         }
     };
-    let pages = loaded.reservations.as_ref().expect("a text load reserves its pool").kv_pool_pages;
+    let reservations = loaded.reservations.as_ref().expect("a text load reserves its pool");
+    println!(
+        "27B load: cuda_context {} B, budget {} B, {} KV pages",
+        reservations.lines.cuda_context, reservations.budget_bytes, reservations.kv_pool_pages
+    );
+    let pages = reservations.kv_pool_pages;
     let (free_after_load, _) = CudaDevice::nvml_memory(0).expect("NVML once the load is in");
     loaded.model.shut_down();
     drop(loaded);
@@ -101,10 +112,21 @@ fn a_reload_plans_the_kv_pool_its_cold_start_planned() {
     };
     assert!(CudaDevice::context_created(), "the cold load made the context, and the teardown kept it");
     assert!(ignis_runtime::qwen27b_loaded(), "the cold load left the 27B's per-process state behind");
+    let reading = CudaDevice::context_reading().expect("the cold load made the context");
+    let context = ignis_runtime::ContextCharge::of(reading);
+    assert!(context.measured, "the context was not measured: {reading}");
+    let process_bytes = CudaDevice::nvml_process_bytes(0);
+    let held = ignis_runtime::held_before_load(ignis_core::compute::ModelFamily::Qwen38_27b, Some(context), true, process_bytes);
+    println!(
+        "context measured at {} B ({reading}); per-process figure {process_bytes:?}; a reload adds back {} B ({})",
+        context.bytes,
+        held.bytes,
+        held.source.as_str()
+    );
     #[cfg(windows)]
     {
+        let added_back = held.bytes;
         let held = process_dedicated_bytes();
-        let added_back = ignis_runtime::held_before_load(true, true);
         println!("after the cold load's teardown: the process holds {held} B, a reload adds back {added_back} B");
         assert!(
             added_back <= held + HELD_SLACK_BYTES,

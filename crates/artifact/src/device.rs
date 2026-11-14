@@ -322,6 +322,114 @@ fn driver_check(rc: i32, version: i32, runtime: i32) -> Result<()> {
     Ok(())
 }
 
+/// How often NVML's free memory is read once the CUDA context is made
+/// (GitHub #604).
+const CONTEXT_READ_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
+/// How close the readings after the context must stay to one another, and
+/// for how long, before the lowest of them is taken: NVML can count a fresh
+/// allocation late, in 64 MiB pieces, by up to 63 ms (the finding
+/// 2026-10-31, `nvml-counts-a-fresh-allocation-late`).
+const CONTEXT_STILL_WITHIN_BYTES: u64 = 1 << 20;
+const CONTEXT_STILL_FOR: std::time::Duration = std::time::Duration::from_millis(250);
+/// When the readings stop, held still or not: the lowest seen is taken then.
+const CONTEXT_READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What NVML's free memory said this process's CUDA context took when its
+/// first device made it (GitHub #604), as [`measure_context`] read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextReading {
+    /// The bytes the free memory fell by: the reading before the context,
+    /// less the one taken after it.
+    Measured(u64),
+    /// A reading before or after the context failed.
+    Unreadable,
+    /// The free memory after the context was no lower than before: another
+    /// process freed as much inside the window, or more.
+    NotLower { before: u64, after: u64 },
+}
+
+impl std::fmt::Display for ContextReading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ContextReading::Measured(bytes) => write!(f, "{bytes} bytes measured"),
+            ContextReading::Unreadable => f.write_str("NVML's free memory could not be read either side of the context"),
+            ContextReading::NotLower { before, after } => write!(
+                f,
+                "NVML read {after} bytes free after the context against {before} before it: another process freed memory meanwhile"
+            ),
+        }
+    }
+}
+
+/// The time a context measurement reads by: the wall clock on the card, a
+/// test's own in the CPU tests.
+pub trait MeasureClock {
+    /// The time since the measurement began.
+    fn elapsed(&self) -> std::time::Duration;
+    /// Waits `pause` before the next reading.
+    fn pause(&mut self, pause: std::time::Duration);
+}
+
+/// The wall clock, from when it is started.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct WallClock(std::time::Instant);
+
+impl MeasureClock for WallClock {
+    fn elapsed(&self) -> std::time::Duration {
+        self.0.elapsed()
+    }
+    fn pause(&mut self, pause: std::time::Duration) {
+        std::thread::sleep(pause);
+    }
+}
+
+/// What the CUDA context took (GitHub #604): `before`, NVML's free memory
+/// read just before the context was made, less `read`'s free memory after
+/// it. `read` is asked every [`CONTEXT_READ_EVERY`], and its readings are
+/// taken once they have held within [`CONTEXT_STILL_WITHIN_BYTES`] of one
+/// another for [`CONTEXT_STILL_FOR`], the lowest of them; at
+/// [`CONTEXT_READ_WITHIN`] the lowest reading seen is taken, the largest
+/// difference: an over-charge, never short. A reading that fails is
+/// [`ContextReading::Unreadable`]; a difference of zero or less,
+/// [`ContextReading::NotLower`].
+pub fn measure_context(
+    before: Option<u64>, mut read: impl FnMut() -> Option<u64>, clock: &mut impl MeasureClock,
+) -> ContextReading {
+    let Some(before) = before else {
+        return ContextReading::Unreadable;
+    };
+    let mut lowest = u64::MAX;
+    // Since when the readings have held still, and their lowest and highest.
+    let mut still: Option<(std::time::Duration, u64, u64)> = None;
+    let mut reads = 0u32;
+    let after = loop {
+        let Some(free) = read() else {
+            return ContextReading::Unreadable;
+        };
+        let now = clock.elapsed();
+        lowest = lowest.min(free);
+        let (since, low, high) = match still {
+            Some((since, low, high)) if high.max(free) - low.min(free) <= CONTEXT_STILL_WITHIN_BYTES => {
+                (since, low.min(free), high.max(free))
+            }
+            _ => (now, free, free),
+        };
+        still = Some((since, low, high));
+        if now - since >= CONTEXT_STILL_FOR {
+            break low;
+        }
+        if now >= CONTEXT_READ_WITHIN {
+            break lowest;
+        }
+        reads += 1;
+        clock.pause((CONTEXT_READ_EVERY * reads).saturating_sub(clock.elapsed()));
+    };
+    match before.checked_sub(after) {
+        Some(bytes) if bytes > 0 => ContextReading::Measured(bytes),
+        _ => ContextReading::NotLower { before, after },
+    }
+}
+
 /// A CUDA device context (a dedicated non-blocking load stream + a
 /// blocking-sync event — the reference `DeviceContext` pattern; the event
 /// sleeps instead of spinning on the stream).
@@ -332,25 +440,43 @@ pub struct CudaDevice {
     device_id: i32,
 }
 
-/// Set once a [`CudaDevice`] has been created in this process (GitHub #324).
+/// What this process's CUDA context took, set when the first [`CudaDevice`]
+/// made it (GitHub #324, #604) and kept for the process's life, as the
+/// context is.
 #[cfg(feature = "cuda")]
-static CONTEXT_CREATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CONTEXT: std::sync::OnceLock<ContextReading> = std::sync::OnceLock::new();
+
+/// Held while a device is made, so the first device's measurement is the
+/// only one and no second device is made inside its window.
+#[cfg(feature = "cuda")]
+static MAKING_A_DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(feature = "cuda")]
 impl CudaDevice {
     /// Create a CUDA device context.
     ///
+    /// The first device makes the process's context, and measures it from
+    /// NVML's free memory either side ([`measure_context`], GitHub #604):
+    /// what the context takes on this card and this OS, which
+    /// [`CudaDevice::context_reading`] then answers. That first create takes
+    /// 250 ms more, 2 s at most.
+    ///
     /// Fails (the ADR 0006 skip path) if the driver is missing or
     /// `device_id` is invalid.
     pub fn create(device_id: i32) -> Result<CudaDevice> {
         Self::require_driver()?;
+        let _making = MAKING_A_DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = CONTEXT.get().is_none().then(|| Self::nvml_free(device_id));
         let handle = unsafe { crate::ffi::ignis_device_create(device_id) };
         if handle.is_null() {
             return Err(fail(format!(
                 "ignis_device_create({device_id}) failed; is the CUDA driver available?"
             )));
         }
-        CONTEXT_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(before) = before {
+            let reading = measure_context(before, || Self::nvml_free(device_id), &mut WallClock(std::time::Instant::now()));
+            let _ = CONTEXT.set(reading);
+        }
         Ok(CudaDevice { handle, device_id })
     }
 
@@ -360,7 +486,34 @@ impl CudaDevice {
     /// [`CudaDevice::create`] on the process holds it until it exits: a free
     /// reading by [`CudaDevice::nvml_memory`] no longer counts it.
     pub fn context_created() -> bool {
-        CONTEXT_CREATED.load(std::sync::atomic::Ordering::Relaxed)
+        CONTEXT.get().is_some()
+    }
+
+    /// What the process's CUDA context took when the first device made it
+    /// (GitHub #604); `None` before the context exists.
+    pub fn context_reading() -> Option<ContextReading> {
+        CONTEXT.get().copied()
+    }
+
+    /// This process's device memory on device `device_id` as NVML's
+    /// per-process accounting reports it (GitHub #604): what a later load can
+    /// add back. `None` where the driver reports no figure for this process:
+    /// a PID absent from its list (under WSL the list is empty), a figure it
+    /// marks not available (every figure under WDDM), a driver without the
+    /// query, or a call that fails. Creates no context.
+    pub fn nvml_process_bytes(device_id: i32) -> Option<u64> {
+        Self::require_driver().ok()?;
+        let mut bytes = 0u64;
+        let rc = unsafe { crate::ffi::ignis_device_nvml_process_bytes(device_id, std::process::id(), &mut bytes) };
+        (rc == 0).then_some(bytes)
+    }
+
+    /// NVML's free memory on `device_id`, `None` when it cannot be read (the
+    /// leaf says why on stderr): one reading of a context measurement.
+    fn nvml_free(device_id: i32) -> Option<u64> {
+        let (mut free, mut total) = (0u64, 0u64);
+        let rc = unsafe { crate::ffi::ignis_device_nvml_mem_info(device_id, &mut free, &mut total) };
+        (rc == 0).then_some(free)
     }
 
     /// The device's ordinal: what [`CudaDevice::nvml_memory`] reads for it.

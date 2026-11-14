@@ -24,6 +24,21 @@ left becomes the KV pool. Requests then allocate no device memory as they go,
 and a retained-state capture that finds no slot is skipped, not served with a
 fresh allocation ([ADR 0030](../../adr/0030-device-memory-reserved-at-load.md)).
 
+From 0.11.0 the CUDA context's line is measured on the card at the start: the
+first load reads the free memory just before and after it creates the
+context, and the plan charges the difference, what the context takes on this
+card and this OS. 0.10.0 charged every card the 452,595,712 bytes measured on
+an RTX 5090 under Windows: too much on an RTX 5080 under Linux, too little
+under WSL.
+A reading that fails falls back to that figure, with a WARN
+([troubleshooting](../troubleshooting.md#warn-ignisruntimecuda_context_fallback)).
+A later load in the same process, a model switch or the reload after an idle
+unload, adds back what the process already holds: the driver's own figure
+for the process where it reports one (native Linux), so the reload plans the
+pool its cold start planned, and elsewhere what the plan charges again for
+it, so the reload plans on the memory actually free
+([ADR 0092](../../adr/0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md)).
+
 The 27B adapts before it refuses. When the plan cannot hold what its profile
 asks for in the memory the start finds free, the load lowers the values one at
 a time and plans again: the drafter's head first, then the context in steps,
@@ -81,7 +96,10 @@ what the desktop holds, so the 5090's context is what fits after the desktop.
 - **Oversubscription**: [`vram.allow_oversubscription`](../reference/configuration.md#vramallow_oversubscription),
   off by default, lets a plan exceed the device at your risk.
 - **Log**: `ignis.runtime.vram_plan` prints every line (Flash-Next prints
-  `ignis.runtime.flash_next_plan`); `ignis.runtime.vram_oversubscribed` and
+  `ignis.runtime.flash_next_plan`), `cuda_context_source` whether the context
+  was measured or the fallback, and `process_held_bytes` with
+  `process_held_source` what a later load added back and where that figure came
+  from; `ignis.runtime.vram_oversubscribed` and
   `ignis.runtime.flash_next_host_plan_refused` mark the refusals.
 - **Metrics**: `ignis_vram_budget_bytes`, `ignis_vram_reserved_bytes` (by plan
   line) and `ignis_kv_pool_pages` ([metrics](../reference/metrics.md)); they

@@ -9,6 +9,13 @@
 //! all of it (27 and 63 ms later, where a probe timed it). So the allocation's
 //! reading waits for the count, for at most [`COUNTED_WITHIN`]; its CPU tests
 //! feed it injected readings.
+//!
+//! The first device measures the context it makes from NVML's free memory
+//! (GitHub #604), what every VRAM plan charges for it: on Windows the figure
+//! is held to the process's WDDM dedicated usage right after the context is
+//! made, within [`CONTEXT_WITHIN`], and where the driver reports the
+//! process's own memory (native Linux) to that figure too. The measurement's
+//! CPU tests are `ignis-runtime`'s, which falls back where it reads nothing.
 
 use std::time::Duration;
 
@@ -22,6 +29,29 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// How long a reading waits for NVML to count an allocation in full: some
 /// thirty times the longest wait seen (GitHub #424).
 const COUNTED_WITHIN: Duration = Duration::from_secs(2);
+
+/// How far the measured context may be from what the process holds right
+/// after it is made (GitHub #604).
+#[cfg(feature = "cuda")]
+const CONTEXT_WITHIN: u64 = 16 << 20;
+
+/// This process's dedicated device memory, as WDDM counts it
+/// (`\GPU Process Memory(pid_*)\Dedicated Usage`, Task Manager's figure, the
+/// counter `CUDA_CONTEXT_BYTES` was read from); `vram_reload_gpu` reads it the
+/// same way.
+#[cfg(all(feature = "cuda", windows))]
+fn process_dedicated_bytes() -> u64 {
+    let counter = format!(
+        r"(Get-Counter '\GPU Process Memory(pid_{}_*)\Dedicated Usage').CounterSamples | Measure-Object CookedValue -Sum | ForEach-Object {{ [uint64]$_.Sum }}",
+        std::process::id()
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &counter])
+        .output()
+        .expect("powershell reads the WDDM counter");
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.trim().parse().unwrap_or_else(|_| panic!("the WDDM counter reads as bytes, not {text:?}"))
+}
 
 /// The free memory `read` reports once it counts `bytes` allocated with
 /// `free_before` free, or its last reading if it has not counted them within
@@ -103,6 +133,32 @@ fn nvml_free_memory_counts_the_context_and_every_allocation() {
     assert!(!CudaDevice::context_created(), "a context before the first device");
     let mut device = CudaDevice::create(0).expect("CUDA device");
     assert!(CudaDevice::context_created(), "the first device made the context");
+    // GitHub #604: what the plan charges for the context, measured as it was
+    // made, against what the process holds now, before anything else is.
+    let measured = match CudaDevice::context_reading() {
+        Some(ignis_artifact::ContextReading::Measured(bytes)) => bytes,
+        other => panic!("the first device did not measure its context: {other:?}"),
+    };
+    println!("the context measured at {measured} B");
+    #[cfg(windows)]
+    {
+        let dedicated = process_dedicated_bytes();
+        println!("the process's WDDM dedicated usage with the context alone: {dedicated} B");
+        assert!(
+            measured.abs_diff(dedicated) <= CONTEXT_WITHIN,
+            "the context measured at {measured} B against {dedicated} B of WDDM dedicated usage: more than {CONTEXT_WITHIN} B apart"
+        );
+    }
+    match CudaDevice::nvml_process_bytes(0) {
+        Some(held) => {
+            println!("NVML's per-process figure with the context alone: {held} B");
+            assert!(
+                measured.abs_diff(held) <= CONTEXT_WITHIN,
+                "the context measured at {measured} B against the {held} B NVML reports for the process: more than {CONTEXT_WITHIN} B apart"
+            );
+        }
+        None => println!("NVML reports no per-process figure here: a reload adds back what the plan charges again"),
+    }
     let (free_with_context, _) = CudaDevice::nvml_memory(0).expect("NVML after the context");
     // The context holds hundreds of MiB; `cudaMemGetInfo` would not see it.
     assert!(

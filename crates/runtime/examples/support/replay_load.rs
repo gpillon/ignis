@@ -81,12 +81,12 @@ impl Loaded {
 pub fn load(reader: &Reader, shape: LoadShape) -> Result<Loaded, String> {
     let body = body_27b(reader);
     // What is free before this process holds anything, read before the
-    // context exists, as the server reads it: the context is a plan line. A
-    // later load in the process adds back what it still holds (GitHub #324).
-    let (nvml_free, _) = CudaDevice::nvml_memory(0).map_err(|e| format!("NVML: {e}"))?;
-    let free_at_start =
-        nvml_free + ignis_runtime::held_before_load(CudaDevice::context_created(), ignis_runtime::qwen27b_loaded());
-    let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
+    // context exists, as the server reads it: the context is a plan line, the
+    // figure it took when the first load made it (GitHub #604). A later load
+    // in the process adds back what it still holds (GitHub #324).
+    let (start, mut device) = ignis_runtime::plan_start(ignis_core::compute::ModelFamily::Qwen38_27b)?;
+    let free_at_start = start.free_at_start_bytes;
+    let nvml_free = free_at_start - start.held.bytes;
     let speculation = shape.speculation();
     let scope = model_load::model_scope(speculation, None, ExceptionWeights::default());
     let (bound, handles) = bind_model_scope_27b_with(reader, scope).map_err(|e| format!("bind: {e}"))?;
@@ -100,7 +100,7 @@ pub fn load(reader: &Reader, shape: LoadShape) -> Result<Loaded, String> {
     let plan = plan_vram(&VramRequest {
         mode: shape.vram,
         free_at_start_bytes: free_at_start,
-        lines: ignis_runtime::vram_lines(bound.device_capacity_bytes, reservations.reserved),
+        lines: ignis_runtime::vram_lines(bound.device_capacity_bytes, start.context.bytes, reservations.reserved),
         kv_page_bytes: format.page_bytes(geometry),
         max_context_tokens: shape.max_context,
         retained_slots: 0,

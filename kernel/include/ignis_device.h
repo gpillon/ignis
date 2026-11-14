@@ -87,6 +87,17 @@ int32_t ignis_device_runtime_version(int32_t *version);
  * not load, or on a bad argument. */
 int32_t ignis_device_nvml_mem_info(int device_id, uint64_t *free_bytes, uint64_t *total_bytes);
 
+/* The device memory NVML's per-process accounting reports for process `pid`
+ * on CUDA device `device_id` (nvmlDeviceGetComputeRunningProcesses_v3, every
+ * entry of `pid` summed), into `*bytes` (GitHub #604): what a later load can
+ * add back. Returns 0 with that figure; 1, `*bytes` untouched, where the
+ * driver reports none for `pid` -- a PID absent from its list (under WSL the
+ * list is empty), a figure it marks NVML_VALUE_NOT_AVAILABLE (every figure
+ * under WDDM), a query the device does not support or a driver without it;
+ * -1 on a CUDA or NVML error (logged to stderr), on NVML that does not load,
+ * or on a bad argument. Creates no context and needs no ignis_device. */
+int32_t ignis_device_nvml_process_bytes(int device_id, uint32_t pid, uint64_t *bytes);
+
 /* The name of CUDA device `device_id` as NVML reports it ("NVIDIA GeForce RTX
  * 5090"), NUL-terminated into `name` (`name_bytes` long, truncated to fit),
  * and its compute capability as the CUDA runtime reports it, into `*major`
