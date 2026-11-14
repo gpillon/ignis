@@ -358,6 +358,19 @@ them its message says so: start with
 `--vision-residency device` to keep both in VRAM, or without vision
 ([Where the vision tower and the embedding pool live](configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live)).
 
+### WARN `ignis.runtime.cuda_context_fallback`
+
+"the CUDA context could not be measured (…): the VRAM plan charges it 452595712
+bytes, the RTX 5090's figure under Windows". From 0.11.0 the first load
+measures the CUDA context it creates, from the card's free memory read just
+before and after, and the plan charges that figure. When a reading fails, or
+the free memory did not fall because another program freed memory at that
+moment, the plan charges the fixed figure instead and the load goes on; the
+plan event says `cuda_context_source: fallback`. Where this card's context is
+larger than the fixed figure the plan charges too little by the difference,
+which comes out of the headroom. Restart the server while the card is quiet
+to measure it again ([Every byte planned](why-ignis/every-byte-planned.md#how-it-works)).
+
 ### `--spec-backend mtp` refuses the start
 
 Flash-Next's MTP head needs its companion container

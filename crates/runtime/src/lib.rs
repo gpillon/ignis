@@ -94,11 +94,43 @@ pub fn auto_kv_pool_bytes(format: ignis_core::KvFormat, max_context: u32) -> u64
 /// counter `\GPU Process Memory(pid_*)\Dedicated Usage` (Task Manager's
 /// figure) on the RTX 5090, 2026-09-17.
 ///
-/// A plan line: the budget starts from the free memory NVML reports before
-/// the context exists (`CudaDevice::nvml_memory`), so the context is one more
-/// thing the process holds inside it. A later load in the same process reads
-/// NVML with the context held and adds [`held_before_load`] back (GitHub #324).
+/// The plan's `cuda_context` line where the context could not be measured
+/// (GitHub #604, [`ContextCharge`]): every plan charged this figure before,
+/// on every card and OS.
 pub const CUDA_CONTEXT_BYTES: u64 = 452_595_712;
+
+/// The VRAM plan's `cuda_context` line (GitHub #210, #604). The budget starts
+/// from the free memory NVML reports before the context exists
+/// (`CudaDevice::nvml_memory`), so the context is one more thing the process
+/// holds inside it: what NVML's free memory fell by when the process made it
+/// (`CudaDevice::context_reading`), on this card and this OS, or
+/// [`CUDA_CONTEXT_BYTES`] where that reading failed or did not fall. A later
+/// load in the same process reads NVML with the context held and adds
+/// [`held_before_load`] back (GitHub #324).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextCharge {
+    pub bytes: u64,
+    /// Whether `bytes` was measured, or is the fallback.
+    pub measured: bool,
+}
+
+impl ContextCharge {
+    /// What a plan charges for a context NVML read as `reading`.
+    pub fn of(reading: ignis_artifact::ContextReading) -> ContextCharge {
+        match reading {
+            ignis_artifact::ContextReading::Measured(bytes) => ContextCharge { bytes, measured: true },
+            ignis_artifact::ContextReading::Unreadable | ignis_artifact::ContextReading::NotLower { .. } => {
+                ContextCharge { bytes: CUDA_CONTEXT_BYTES, measured: false }
+            }
+        }
+    }
+
+    /// `measured` or `fallback`: what the plan events' `cuda_context_source`
+    /// says.
+    pub fn source(self) -> &'static str {
+        if self.measured { "measured" } else { "fallback" }
+    }
+}
 
 /// What a 27B load leaves on the device beside the CUDA context once it is
 /// torn down (GitHub #324), which the plan charges as part of
@@ -138,22 +170,119 @@ pub fn qwen27b_loaded() -> bool {
     QWEN27B_LOADED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The device bytes a load's VRAM plan adds back to the free memory NVML
-/// reads (GitHub #324): what the process already holds and the plan's lines
-/// charge again. None on the process's first load, which reads before its
-/// context exists; the context, its `cuda_context` line, once it exists; and,
-/// on a plan whose `residual` line charges it, the 27B's per-process state
-/// once a 27B load has run. A model switch or the reload after an idle unload
-/// then plans what its cold start planned, since ADR 0030's budget starts
-/// from what was free before the process held anything. Flash-Next's plan has
-/// no residual line, and its own per-process state is not measured: neither is
-/// added back, so its budget is never more than the card has.
-pub fn held_before_load(context_created: bool, qwen27b_state_charged: bool) -> u64 {
-    match (context_created, qwen27b_state_charged) {
-        (false, _) => 0,
-        (true, false) => CUDA_CONTEXT_BYTES,
-        (true, true) => CUDA_CONTEXT_BYTES + QWEN27B_PROCESS_STATE_BYTES,
+/// What a load adds back to the free memory NVML reads ([`held_before_load`]),
+/// and where its figure came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessHeld {
+    pub bytes: u64,
+    pub source: HeldSource,
+}
+
+/// Where a load's add-back came from (GitHub #604).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldSource {
+    /// The process's first load: it reads before its context exists.
+    Nothing,
+    /// The driver's figure for this process, at most what the plan charges
+    /// again.
+    PerProcess,
+    /// No figure for this process: what the plan charges again.
+    ChargedAgain,
+}
+
+impl HeldSource {
+    /// What the plan events' `process_held_source` says.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeldSource::Nothing => "none",
+            HeldSource::PerProcess => "per_process",
+            HeldSource::ChargedAgain => "charged_again",
+        }
     }
+}
+
+/// The device bytes a `family` load's VRAM plan adds back to the free memory
+/// NVML reads (GitHub #324, #604): what the process already holds, never more
+/// than the plan's lines charge again for it. Nothing on the process's first
+/// load, which reads before its `context` exists. Once it exists the plan
+/// charges again the context, its `cuda_context` line, and on a 27B plan,
+/// whose `residual` line charges it, the 27B's per-process state once a 27B
+/// load has run (`qwen27b_loaded`); Flash-Next's plan has no residual line,
+/// and its own per-process state is not measured, so it charges again the
+/// context only. The add-back is `process_bytes`, the driver's own figure for
+/// this process, where there is one, capped at what the plan charges again;
+/// without one, what the plan charges again. With a figure, a model switch or
+/// the reload after an idle unload plans what its cold start planned, since
+/// ADR 0030's budget starts from what was free before the process held
+/// anything; without one it plans on the memory actually free, and a figure
+/// above the cap does too. A family's state the plan does not charge is never
+/// added back, so a budget is never more than the card has.
+pub fn held_before_load(
+    family: ignis_core::compute::ModelFamily, context: Option<ContextCharge>, qwen27b_loaded: bool,
+    process_bytes: Option<u64>,
+) -> ProcessHeld {
+    let Some(context) = context else {
+        return ProcessHeld { bytes: 0, source: HeldSource::Nothing };
+    };
+    let qwen27b_state = if family == ignis_core::compute::ModelFamily::Qwen38_27b && qwen27b_loaded {
+        QWEN27B_PROCESS_STATE_BYTES
+    } else {
+        0
+    };
+    let charged_again = context.bytes + qwen27b_state;
+    match process_bytes {
+        Some(bytes) => ProcessHeld { bytes: bytes.min(charged_again), source: HeldSource::PerProcess },
+        None => ProcessHeld { bytes: charged_again, source: HeldSource::ChargedAgain },
+    }
+}
+
+/// Where a load's VRAM plan starts (GitHub #210, #324, #604): the free memory
+/// it plans from, and the two figures beside NVML's reading that the plan
+/// events carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanStart {
+    /// NVML's free reading with `held` added back: the plan's
+    /// `free_at_start_bytes`.
+    pub free_at_start_bytes: u64,
+    /// What the process already held, added back.
+    pub held: ProcessHeld,
+    /// The plan's `cuda_context` line.
+    pub context: ContextCharge,
+}
+
+/// Reads where a `family` load's VRAM plan starts on device 0, and makes the
+/// device it loads on (GitHub #210, #324, #604): NVML's free memory first,
+/// before this load makes anything, with what the process already holds
+/// added back ([`held_before_load`], the driver's per-process figure read
+/// beside it); then the device, which on the process's first load makes the
+/// CUDA context and measures it. A plan made before its context existed
+/// would charge a context nothing measured, so every load starts here. A
+/// context that could not be measured is charged at [`CUDA_CONTEXT_BYTES`],
+/// and a WARN names it.
+#[cfg(feature = "cuda")]
+pub fn plan_start(family: ignis_core::compute::ModelFamily) -> Result<(PlanStart, ignis_artifact::CudaDevice), String> {
+    use ignis_artifact::{ContextReading, CudaDevice};
+    let (nvml_free_bytes, _) =
+        CudaDevice::nvml_memory(0).map_err(|e| format!("VRAM budget: free memory is unreadable: {e}"))?;
+    let context = CudaDevice::context_reading().map(ContextCharge::of);
+    let process_bytes = context.and_then(|_| CudaDevice::nvml_process_bytes(0));
+    let held = held_before_load(family, context, qwen27b_loaded(), process_bytes);
+    let device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
+    // This device made the context, or an earlier one did: it was measured then.
+    let reading = CudaDevice::context_reading().unwrap_or(ContextReading::Unreadable);
+    let context = ContextCharge::of(reading);
+    if !context.measured {
+        // hotpath-lint-allow: one line per model load, and only where the context could not be measured.
+        tracing::warn!(
+            name: "ignis.runtime.cuda_context_fallback",
+            cuda_context_bytes = context.bytes,
+            reading = %reading,
+            "the CUDA context could not be measured ({reading}): the VRAM plan charges it {} bytes, the RTX 5090's \
+             figure under Windows",
+            CUDA_CONTEXT_BYTES
+        );
+    }
+    Ok((PlanStart { free_at_start_bytes: nvml_free_bytes + held.bytes, held, context }, device))
 }
 
 /// What a load holds beyond every reservation the VRAM plan names (GitHub
@@ -220,12 +349,13 @@ impl ReservedBytes {
 }
 
 /// The VRAM plan's lines for a load (GitHub #210): the weights' arena, the
-/// CUDA context, what the leaf planned beside them -- its retained slots
-/// included (GitHub #215) -- and the measured residual, in plan order.
-pub fn vram_lines(weights_bytes: u64, reserved: ReservedBytes) -> ignis_core::VramLines {
+/// CUDA context (its [`ContextCharge`], GitHub #604), what the leaf planned
+/// beside them -- its retained slots included (GitHub #215) -- and the
+/// measured residual, in plan order.
+pub fn vram_lines(weights_bytes: u64, cuda_context_bytes: u64, reserved: ReservedBytes) -> ignis_core::VramLines {
     ignis_core::VramLines {
         weights: weights_bytes,
-        cuda_context: CUDA_CONTEXT_BYTES,
+        cuda_context: cuda_context_bytes,
         workspace: reserved.workspace,
         trellis_workspace: reserved.trellis_workspace,
         trellis_dense: reserved.trellis_dense,
@@ -2526,5 +2656,175 @@ mod tests {
         assert!(err.contains("its VRAM plan laid out"), "{err}");
         let err = ReservedBytes { verify_round: 0, ..built }.check_planned(lines(0), 1 << 30).expect_err("a missing line");
         assert!(err.contains("verify_round: 0"), "{err}");
+    }
+
+    /// A clock that moves only when the measurement pauses: NVML as these
+    /// tests inject it answers at once, so a reading's time is the pauses
+    /// before it.
+    #[derive(Default)]
+    struct TestClock {
+        now: std::time::Duration,
+    }
+
+    impl ignis_artifact::MeasureClock for TestClock {
+        fn elapsed(&self) -> std::time::Duration {
+            self.now
+        }
+        fn pause(&mut self, pause: std::time::Duration) {
+            self.now += pause;
+        }
+    }
+
+    /// Readings in turn, the last one repeated, each counted: NVML as
+    /// `nvml_memory_gpu`'s tests inject it, `None` a reading that failed.
+    fn readings<'a>(values: &'a [Option<u64>], reads: &'a mut usize) -> impl FnMut() -> Option<u64> + 'a {
+        move || {
+            let value = values[(*reads).min(values.len() - 1)];
+            *reads += 1;
+            value
+        }
+    }
+
+    const GIB: u64 = 1 << 30;
+    /// What a context made through the driver API took on the RTX 5090
+    /// under WSL (GitHub #604).
+    const CONTEXT: u64 = 519_270_400;
+
+    /// The plan's `cuda_context` line for the context `values` read after
+    /// it was made, `before` free before, and the time the measurement took
+    /// and the readings it made.
+    fn charged(before: Option<u64>, values: &[Option<u64>]) -> (ContextCharge, std::time::Duration, usize) {
+        let mut clock = TestClock::default();
+        let mut reads = 0;
+        let reading = ignis_artifact::measure_context(before, readings(values, &mut reads), &mut clock);
+        (ContextCharge::of(reading), clock.now, reads)
+    }
+
+    #[test]
+    fn a_context_counted_at_the_first_reading_is_measured_once_it_held_still() {
+        let before = 20 * GIB;
+        let (charge, took, reads) = charged(Some(before), &[Some(before - CONTEXT)]);
+        assert_eq!(charge, ContextCharge { bytes: CONTEXT, measured: true });
+        // Read every 10 ms, and taken once it held for 250 ms: 26 readings,
+        // long before the 2 s bound.
+        assert_eq!((took, reads), (std::time::Duration::from_millis(250), 26));
+    }
+
+    #[test]
+    fn a_context_counted_a_64_mib_piece_late_is_measured_whole() {
+        // The finding 2026-10-31 (`nvml-counts-a-fresh-allocation-late`): NVML
+        // counted the last 64 MiB piece of an allocation up to 63 ms late.
+        let before = 20 * GIB;
+        let early = Some(before - (CONTEXT - (64 << 20)));
+        let values = [early, early, early, early, early, early, Some(before - CONTEXT)];
+        let (charge, took, _) = charged(Some(before), &values);
+        assert_eq!(charge, ContextCharge { bytes: CONTEXT, measured: true });
+        assert_eq!(took, std::time::Duration::from_millis(60 + 250), "it held still from the piece's reading on");
+    }
+
+    #[test]
+    fn readings_that_never_hold_still_take_the_lowest_at_the_bound() {
+        // Another process on the card moves the reading 2 MiB at every read:
+        // the bound takes the largest difference, an over-charge, never short.
+        let before = 20 * GIB;
+        let values: Vec<Option<u64>> =
+            (0..400).map(|i| Some(before - CONTEXT - if i % 2 == 1 { 2 << 20 } else { 0 })).collect();
+        let (charge, took, _) = charged(Some(before), &values);
+        assert_eq!(charge, ContextCharge { bytes: CONTEXT + (2 << 20), measured: true });
+        assert_eq!(took, std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn an_unreadable_reading_falls_back_to_the_rtx_5090_figure() {
+        let fallback = ContextCharge { bytes: CUDA_CONTEXT_BYTES, measured: false };
+        let before = 20 * GIB;
+        assert_eq!(charged(Some(before), &[None]).0, fallback, "unreadable after the context");
+        assert_eq!(charged(Some(before), &[Some(before - CONTEXT), None]).0, fallback, "unreadable while it settles");
+        assert_eq!(charged(None, &[Some(before - CONTEXT)]).0, fallback, "unreadable before the context");
+    }
+
+    #[test]
+    fn a_difference_of_zero_or_less_falls_back_to_the_rtx_5090_figure() {
+        // Another process freed as much memory as the context took, or more,
+        // inside the window.
+        let fallback = ContextCharge { bytes: CUDA_CONTEXT_BYTES, measured: false };
+        let before = 20 * GIB;
+        assert_eq!(charged(Some(before), &[Some(before)]).0, fallback, "no difference");
+        assert_eq!(charged(Some(before), &[Some(before + (64 << 20))]).0, fallback, "more free after than before");
+    }
+
+    /// A context NVML measured at `bytes`.
+    fn measured(bytes: u64) -> Option<ContextCharge> {
+        Some(ContextCharge { bytes, measured: true })
+    }
+
+    const STATE: u64 = QWEN27B_PROCESS_STATE_BYTES;
+    /// What the RTX 5080 under Linux holds after a 27B teardown, NVML's
+    /// per-process figure (the fork's finding, GitHub #604).
+    const RTX5080_HELD: u64 = 299_892_736;
+
+    #[test]
+    fn a_per_process_figure_below_what_the_plan_charges_again_is_added_back_whole() {
+        use ignis_core::compute::ModelFamily::Qwen38_27b;
+        // A 27B reload whose plan charges a measured context and the 27B's
+        // state again: 216,000,000 + 83,894,272 bytes, or at the constant
+        // 536,489,984, both above what the 5080 holds.
+        for context in [216_000_000, CUDA_CONTEXT_BYTES] {
+            assert_eq!(
+                held_before_load(Qwen38_27b, measured(context), true, Some(RTX5080_HELD)),
+                ProcessHeld { bytes: RTX5080_HELD, source: HeldSource::PerProcess },
+                "context {context}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_per_process_figure_above_what_the_plan_charges_again_is_capped() {
+        use ignis_core::compute::ModelFamily::Qwen38_27b;
+        assert_eq!(
+            held_before_load(Qwen38_27b, measured(CONTEXT), true, Some(CONTEXT + STATE + (100 << 20))),
+            ProcessHeld { bytes: 603_164_672, source: HeldSource::PerProcess },
+            "the measured context and the 27B's state, no more"
+        );
+    }
+
+    #[test]
+    fn without_a_per_process_figure_what_the_plan_charges_again_is_added_back() {
+        use ignis_core::compute::ModelFamily::Qwen38_27b;
+        let charged_again = |bytes| ProcessHeld { bytes, source: HeldSource::ChargedAgain };
+        assert_eq!(held_before_load(Qwen38_27b, measured(CONTEXT), true, None), charged_again(603_164_672));
+        assert_eq!(held_before_load(Qwen38_27b, measured(CONTEXT), false, None), charged_again(CONTEXT), "no 27B has run");
+        let fallback = Some(ContextCharge { bytes: CUDA_CONTEXT_BYTES, measured: false });
+        assert_eq!(held_before_load(Qwen38_27b, fallback, true, None), charged_again(536_489_984), "#324's two constants");
+        // A first load reads before its context exists: nothing is held.
+        let nothing = ProcessHeld { bytes: 0, source: HeldSource::Nothing };
+        assert_eq!(held_before_load(Qwen38_27b, None, false, Some(RTX5080_HELD)), nothing);
+        assert_eq!(held_before_load(Qwen38_27b, None, true, None), nothing);
+    }
+
+    #[test]
+    fn flash_next_after_a_27b_never_adds_back_the_27b_s_state() {
+        use ignis_core::compute::ModelFamily::FlashNext;
+        // The process holds the context and the 27B's state; Flash-Next's plan
+        // has no residual line, so it charges again the context only.
+        for (figure, source) in [(None, HeldSource::ChargedAgain), (Some(CONTEXT + STATE), HeldSource::PerProcess)] {
+            assert_eq!(held_before_load(FlashNext, measured(CONTEXT), true, figure), ProcessHeld { bytes: CONTEXT, source });
+        }
+    }
+
+    #[test]
+    fn a_27b_after_flash_next_never_adds_back_more_than_its_plan_charges_again() {
+        use ignis_core::compute::ModelFamily::Qwen38_27b;
+        // Whatever Flash-Next's own state is, the process's figure counts it
+        // and no 27B line charges it.
+        const FLASH_NEXT_STATE: u64 = 200 << 20;
+        let per_process = |bytes| ProcessHeld { bytes, source: HeldSource::PerProcess };
+        // Flash-Next first, then the 27B: no 27B state yet.
+        assert_eq!(held_before_load(Qwen38_27b, measured(CONTEXT), false, Some(CONTEXT + FLASH_NEXT_STATE)), per_process(CONTEXT));
+        // The 27B, Flash-Next, then the 27B again.
+        assert_eq!(
+            held_before_load(Qwen38_27b, measured(CONTEXT), true, Some(CONTEXT + STATE + FLASH_NEXT_STATE)),
+            per_process(603_164_672)
+        );
     }
 }

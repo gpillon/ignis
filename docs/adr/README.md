@@ -50,7 +50,7 @@ memory of why ignis is built the way it is.
 | [0027](0027-make-as-the-dev-entrypoint.md) | make is the development entry point, with per-OS hooks | accepted | |
 | [0028](0028-expose-modes-always-keyed.md) | exposure is a named mode, and an exposed server always has a key | accepted | |
 | [0029](0029-cross-request-state-reuse.md) | cross-request state reuse: content-matched retained state across three residency tiers | accepted | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) |
-| [0030](0030-device-memory-reserved-at-load.md) | device memory reserved at load, within a VRAM budget | accepted | [0035](0035-the-vision-embedding-outlives-its-encode.md), [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) |
+| [0030](0030-device-memory-reserved-at-load.md) | device memory reserved at load, within a VRAM budget | accepted | [0035](0035-the-vision-embedding-outlives-its-encode.md), [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0092](0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md) |
 | [0031](0031-vendored-kernel-bottleneck-exemption.md) | a vendored kernel that is measured as the bottleneck is not untouchable | accepted | |
 | [0032](0032-release-through-the-container-build.md) | the Linux release is the container build, and it is one pipeline | accepted | [0086](0086-the-builds-run-beside-the-tests-and-nothing-is-published-before-they-pass.md) |
 | [0033](0033-the-server-fetches-its-own-model.md) | the server fetches its own model, and asks first only when somebody is there | accepted | [0047](0047-a-catalog-the-operator-can-extend.md) |
@@ -112,3 +112,4 @@ memory of why ignis is built the way it is.
 | [0089](0089-a-grammar-checks-each-sampled-token-and-repairs-a-miss-and-the-model-is-told-the-schema.md) | A grammar checks each sampled token and repairs a miss, and the model is told the schema | accepted | |
 | [0090](0090-the-27bs-sampled-lanes-draw-their-drafts-and-take-them-by-an-accept-of-ignis-s-own.md) | The 27B's sampled lanes draw their drafts and take them by an accept of ignis's own | accepted | |
 | [0091](0091-on-a-card-smaller-than-the-rtx-5090-the-gdn-gating-planner-takes-the-largest-split-it-holds-and-its-test-caps-the-sm-count.md) | On a card smaller than the RTX 5090 the GDN gating planner takes the largest split it holds, and its test caps the SM count | accepted | |
+| [0092](0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md) | The CUDA context is measured when it is made, and a reload adds back what the driver reports | accepted | |

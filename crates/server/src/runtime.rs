@@ -549,14 +549,17 @@ pub struct RetainedSlotsPlan {
 /// was free, the headroom or the budget, whether the plan oversubscribes and
 /// the retained slots of both kinds (GitHub #281) -- then one
 /// `ignis.runtime.vram_oversubscribed` warning per reason the start proceeds
-/// anyway. `process_held_bytes` is what of the free memory this process
-/// already held (GitHub #324, [`ignis_runtime::held_before_load`]).
+/// anyway. `start` is where the plan started (GitHub #324, #604,
+/// [`ignis_runtime::plan_start`]): the event's `process_held_bytes` is what of
+/// the free memory this process already held and `process_held_source` where
+/// that figure came from, and `cuda_context_source` says whether the
+/// `cuda_context` line was measured or is the fallback.
 /// `adapted` is every adaptation the load took to fit the plan (ADR 0063
 /// §3), in order: the event's `adapted`, empty when it took none.
 /// `vision` is where a vision load keeps its tower (ADR 0075), the event's
 /// `vision_residency`; a text load (`None`) logs none.
 pub fn log_vram_plan(
-    plan: &ignis_core::VramPlan, retained: RetainedSlotsPlan, process_held_bytes: u64,
+    plan: &ignis_core::VramPlan, retained: RetainedSlotsPlan, start: ignis_runtime::PlanStart,
     adapted: &[crate::adaptation::AdaptStep], vision: Option<ignis_core::VisionResidency>,
 ) {
     let lines = plan.lines;
@@ -568,11 +571,13 @@ pub fn log_vram_plan(
                 name: "ignis.runtime.vram_plan",
                 mode = plan.mode.as_str(),
                 free_at_start_bytes = plan.free_at_start_bytes,
-                process_held_bytes,
+                process_held_bytes = start.held.bytes,
+                process_held_source = start.held.source.as_str(),
                 $($mode_field = $mode_value,)*
                 budget_bytes = plan.budget_bytes,
                 weights_bytes = lines.weights,
                 cuda_context_bytes = lines.cuda_context,
+                cuda_context_source = start.context.source(),
                 workspace_bytes = lines.workspace,
                 trellis_workspace_bytes = lines.trellis_workspace,
                 trellis_dense_bytes = lines.trellis_dense,
@@ -963,13 +968,15 @@ pub fn log_vram_warnings(plan: &ignis_core::VramPlan) {
 /// bytes (ADR 0045), residency's fixed lines and, of them, the prefill staging
 /// ring (0 on the resident branch, whose residency never stages: GitHub #329),
 /// the expert cache and the hit
-/// rate its split expects, the lanes and the speculation, and what of the free
-/// memory this process already held (GitHub #324). With vision (GitHub #557,
+/// rate its split expects, the lanes and the speculation, and where the plan
+/// started (GitHub #324, #604): what of the free memory this process already
+/// held and where that figure came from, and the `cuda_context` line, measured
+/// or the fallback, as `ignis.runtime.vram_plan` carries them. With vision (GitHub #557,
 /// ADR 0087), where it keeps its tower and pool, the pool's VRAM line, and
 /// the item bound the prefill scratch and the staging ring hold (GitHub
 /// #558), which the processor serves.
 pub fn log_flash_next_plan(
-    plan: &ignis_core::VramPlan, expected_hit_rate: f64, lanes: u32, speculation: &str, process_held_bytes: u64,
+    plan: &ignis_core::VramPlan, expected_hit_rate: f64, lanes: u32, speculation: &str, start: ignis_runtime::PlanStart,
     vision: Option<ignis_core::Vision>,
 ) {
     let lines = plan.lines;
@@ -978,6 +985,8 @@ pub fn log_flash_next_plan(
         name: "ignis.runtime.flash_next_plan",
         budget_bytes = plan.budget_bytes,
         weights_bytes = lines.weights,
+        cuda_context_bytes = lines.cuda_context,
+        cuda_context_source = start.context.source(),
         program_bytes = lines.workspace + lines.sampling + lines.decode_graph,
         pool_bytes = plan.kv_pool_bytes + lines.lane_state + lines.hq_residual_window,
         kv_pool_policy = plan.kv_pool_policy.as_str(),
@@ -993,7 +1002,8 @@ pub fn log_flash_next_plan(
         lanes,
         verify_round_bytes = lines.verify_round,
         speculation,
-        process_held_bytes,
+        process_held_bytes = start.held.bytes,
+        process_held_source = start.held.source.as_str(),
         vision_residency = vision.map(|vision| vision.residency().as_str()),
         vision_item_max_tokens = vision.map_or(0, |vision| vision.item_max_tokens()),
         media_embedding_bytes = lines.media_embedding,
@@ -1199,12 +1209,11 @@ pub fn qwen27b_load(
     // exists; the context is a plan line. Not `cudaMemGetInfo`, which on
     // Windows ignores the caller's context and reads ~400 MiB optimistic.
     // GitHub #324: on a later load the context exists, and what the process
-    // still holds is added back.
-    let (nvml_free_bytes, _) = CudaDevice::nvml_memory(0)
-        .map_err(|e| format!("VRAM budget: free memory is unreadable: {e}"))?;
-    let process_held_bytes = ignis_runtime::held_before_load(CudaDevice::context_created(), ignis_runtime::qwen27b_loaded());
-    let free_at_start_bytes = nvml_free_bytes + process_held_bytes;
-    let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
+    // still holds is added back. GitHub #604: the device made here is the
+    // process's first on a cold start, and the context it makes is measured;
+    // the plan's `cuda_context` line is that figure.
+    let (start, mut device) = ignis_runtime::plan_start(ignis_core::compute::ModelFamily::Qwen38_27b)?;
+    let free_at_start_bytes = start.free_at_start_bytes;
     let geometry = ignis_core::KvGeometry::qwen38_27b();
     // ADR 0063 §3: the plan at the shape's values, and when it refuses them
     // below its minimum, at each adaptation's in turn -- the leaf's lines
@@ -1229,7 +1238,7 @@ pub fn qwen27b_load(
         let planned = ignis_core::plan_vram(&ignis_core::VramRequest {
             mode: shape.vram,
             free_at_start_bytes,
-            lines: vram_lines(plan.device_capacity_bytes, reservations.reserved),
+            lines: vram_lines(plan.device_capacity_bytes, start.context.bytes, reservations.reserved),
             kv_page_bytes: shape.kv_format.page_bytes(geometry),
             max_context_tokens: shape.max_context,
             // Every retained slot keeps one tail page, whichever kind it is.
@@ -1289,7 +1298,7 @@ pub fn qwen27b_load(
             host_slots: shape.retained_host_slots,
             host_bytes: reservations.retained_host_bytes,
         },
-        process_held_bytes,
+        start,
         &adapted.steps,
         shape.vision.map(|v| v.residency()),
     );
@@ -1521,7 +1530,7 @@ pub(crate) fn flash_next_load(
     kv_disk_location: &ignis_core::ngram_cache::CacheLocation,
 ) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations, EngineShape), FlashNextLoadError> {
     use ignis_artifact::flash_next::{self, FlashNextGeometry};
-    use ignis_artifact::{CudaDevice, Reader};
+    use ignis_artifact::Reader;
     use ignis_core::compute::ModelConfig;
     use ignis_core::flash_next::{
         device_only, expert_traffic, plan_cache_request, residency_pools, PoolsRefused,
@@ -1540,13 +1549,14 @@ pub(crate) fn flash_next_load(
     let lanes = shape.decode_lanes_for(ignis_core::compute::ModelFamily::FlashNext);
     // As the 27B's load reads it (GitHub #210, #324), but for the 27B's
     // per-process state: no line here charges it, so a 27B's, if one ran,
-    // stays outside this budget.
-    let (nvml_free_bytes, _) = CudaDevice::nvml_memory(0)
-        .map_err(|e| format!("VRAM budget: free memory is unreadable: {e}"))?;
-    let process_held_bytes = ignis_runtime::held_before_load(CudaDevice::context_created(), false);
-    let free_at_start_bytes = nvml_free_bytes + process_held_bytes;
+    // stays outside this budget. GitHub #604: the weights make the device the
+    // leaf loads on, after the plan, so the context the plan charges is made
+    // and measured here, first; this device only does that.
+    let (start, context_device) = ignis_runtime::plan_start(ignis_core::compute::ModelFamily::FlashNext)?;
+    drop(context_device);
+    let free_at_start_bytes = start.free_at_start_bytes;
 
-    // The plan, before anything is on the device.
+    // The plan, before anything but the context is on the device.
     let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
     let geometry = FlashNextGeometry::qwen38_flash_next();
     let plan = flash_next::bind(&reader, &geometry).map_err(|e| format!("bind the Flash-Next artifact: {e:?}"))?;
@@ -1611,7 +1621,7 @@ pub(crate) fn flash_next_load(
     let lines = with_flash_next_vision(
         ignis_core::VramLines {
             weights: plan.plan.device_capacity_bytes + mtp_plan.as_ref().map_or(0, |p| p.plan.device_capacity_bytes),
-            cuda_context: ignis_runtime::CUDA_CONTEXT_BYTES,
+            cuda_context: start.context.bytes,
             workspace: reserved.workspace_bytes + reserved.activation_bytes,
             sampling: reserved.sampling_bytes,
             decode_graph: reserved.decode_graph_bytes,
@@ -1690,7 +1700,7 @@ pub(crate) fn flash_next_load(
         |s| format!("mtp draft tokens {} rows {} (k at 1/2/3 lanes: {}/{}/{})", s.draft_tokens(), s.row_budget(),
                     s.window(1), s.window(2), s.window(3)),
     );
-    log_flash_next_plan(&vram, plan_split.expected_hit_rate, lanes, &speculation_text, process_held_bytes, shape.vision);
+    log_flash_next_plan(&vram, plan_split.expected_hit_rate, lanes, &speculation_text, start, shape.vision);
     options.kv_pool_pages = Some(vram.kv_page_count);
     options.expert_cache_bytes = vram.expert_cache_bytes;
     // GitHub #329 item 12: the load's pools and pinned hot set, from the call
@@ -2550,12 +2560,12 @@ mod tests {
             hq_residual_window: 11,
             kv_pool: 1 << 40,
         };
-        let lines = vram_lines(100, reserved);
+        let lines = vram_lines(100, 9, reserved);
         assert_eq!(
             lines.entries().map(|(_, bytes)| bytes),
             [
                 100,
-                ignis_runtime::CUDA_CONTEXT_BYTES,
+                9,
                 1,
                 2,
                 12,
@@ -2593,15 +2603,22 @@ mod tests {
         let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
         let subscriber =
             tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
-        tracing::subscriber::with_default(subscriber, || log_vram_plan(plan, DEFAULT_RETAINED, PROCESS_HELD, adapted, None));
+        tracing::subscriber::with_default(subscriber, || log_vram_plan(plan, DEFAULT_RETAINED, RELOAD_START, adapted, None));
         sink.lines()
             .iter()
             .map(|line| serde_json::from_str(line).expect("valid json"))
             .collect()
     }
 
-    /// What a reload's plan event names as held (GitHub #324).
-    const PROCESS_HELD: u64 = ignis_runtime::CUDA_CONTEXT_BYTES + ignis_runtime::QWEN27B_PROCESS_STATE_BYTES;
+    /// Where a 27B reload's plan started (GitHub #324, #604), as it does under
+    /// WSL: the context measured at 519,270,400 bytes, and no per-process
+    /// figure, so what the plan charges again for the context and the 27B's
+    /// state is added back.
+    const RELOAD_START: ignis_runtime::PlanStart = ignis_runtime::PlanStart {
+        free_at_start_bytes: 30 << 30,
+        held: ignis_runtime::ProcessHeld { bytes: 603_164_672, source: ignis_runtime::HeldSource::ChargedAgain },
+        context: ignis_runtime::ContextCharge { bytes: 519_270_400, measured: true },
+    };
 
     /// The host plan refused on 2026-10-13: 41.6 GB available.
     fn starved_plan() -> ignis_core::residency::HostPlanError {
@@ -2937,6 +2954,11 @@ mod tests {
     }
 
     fn plan_for(mode: ignis_core::VramMode, free: u64) -> ignis_core::VramPlan {
+        plan_at(mode, free, ignis_runtime::CUDA_CONTEXT_BYTES)
+    }
+
+    /// [`plan_for`], its `cuda_context` line `context` bytes.
+    fn plan_at(mode: ignis_core::VramMode, free: u64, context: u64) -> ignis_core::VramPlan {
         let reserved = ignis_runtime::ReservedBytes {
             workspace: 1 << 30,
             lane_state: 1 << 30,
@@ -2948,7 +2970,7 @@ mod tests {
         ignis_core::plan_vram(&ignis_core::VramRequest {
             mode,
             free_at_start_bytes: free,
-            lines: vram_lines(17 << 30, reserved),
+            lines: vram_lines(17 << 30, context, reserved),
             kv_page_bytes: page_bytes,
             max_context_tokens: 262_144,
             retained_slots: EngineShape::default().retained_slots(),
@@ -2963,7 +2985,7 @@ mod tests {
 
     #[test]
     fn one_vram_plan_event_carries_every_line_the_mode_and_the_headroom() {
-        let plan = plan_for(ignis_core::VramMode::Derived { headroom_bytes: 1 << 30 }, 30 << 30);
+        let plan = plan_at(ignis_core::VramMode::Derived { headroom_bytes: 1 << 30 }, 30 << 30, RELOAD_START.context.bytes);
         let records = captured_vram_plan(&plan);
         assert_eq!(records.len(), 1, "{records:?}");
         let event = &records[0];
@@ -2977,8 +2999,13 @@ mod tests {
         };
         assert_eq!(field("mode"), "derived");
         assert_eq!(field("free_at_start_bytes"), 30u64 << 30);
-        // GitHub #324: of which this process already held so much when NVML read it.
-        assert_eq!(field("process_held_bytes"), PROCESS_HELD);
+        // GitHub #324: of which this process already held so much when NVML
+        // read it; GitHub #604: a figure the plan charges again, there being
+        // no per-process one, beside a context line that was measured.
+        assert_eq!(field("process_held_bytes"), 603_164_672u64);
+        assert_eq!(field("process_held_source"), "charged_again");
+        assert_eq!(field("cuda_context_bytes"), 519_270_400u64);
+        assert_eq!(field("cuda_context_source"), "measured");
         assert_eq!(field("headroom_bytes"), 1u64 << 30);
         assert_eq!(field("budget_bytes"), plan.budget_bytes);
         for (name, bytes) in plan.lines.entries() {
@@ -3014,7 +3041,7 @@ mod tests {
         let capture = |vision: Option<ignis_core::VisionResidency>| {
             let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
             let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
-            tracing::subscriber::with_default(subscriber, || log_vram_plan(&plan, DEFAULT_RETAINED, PROCESS_HELD, &[], vision));
+            tracing::subscriber::with_default(subscriber, || log_vram_plan(&plan, DEFAULT_RETAINED, RELOAD_START, &[], vision));
             let events: Vec<serde_json::Value> =
                 sink.lines().iter().map(|line| serde_json::from_str(line).expect("valid json")).collect();
             assert_eq!(events[0]["event_name"], "ignis.runtime.vram_plan");
@@ -3073,7 +3100,14 @@ mod tests {
         // the pool's pages and tokens, on a plan the load's own call builds.
         const PAGE: u64 = 4_224 * 64;
         let arena = |pages: u32| 4_096 + u64::from(pages) * PAGE;
-        let lines = ignis_core::VramLines { weights: 5 << 30, workspace: 2 << 30, lane_state: 400 << 20, ..Default::default() };
+        const CONTEXT: u64 = 519_270_400;
+        let lines = ignis_core::VramLines {
+            weights: 5 << 30,
+            cuda_context: CONTEXT,
+            workspace: 2 << 30,
+            lane_state: 400 << 20,
+            ..Default::default()
+        };
         let plan_at = |free_at_start_bytes: u64| {
             ignis_core::plan_vram(&ignis_core::VramRequest {
                 mode: ignis_core::VramMode::Derived { headroom_bytes: 4 << 30 },
@@ -3095,12 +3129,18 @@ mod tests {
             })
             .expect("fits")
         };
-        let held = ignis_runtime::CUDA_CONTEXT_BYTES;
+        // GitHub #604: Flash-Next after a 27B where the driver reports the
+        // process: its figure, capped at the context Flash-Next charges again.
+        let start = ignis_runtime::PlanStart {
+            free_at_start_bytes: 31 << 30,
+            held: ignis_runtime::ProcessHeld { bytes: CONTEXT, source: ignis_runtime::HeldSource::PerProcess },
+            context: ignis_runtime::ContextCharge { bytes: CONTEXT, measured: true },
+        };
         let event_of = |plan: &ignis_core::VramPlan| {
             use tracing_subscriber::layer::SubscriberExt;
             let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
             let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
-            tracing::subscriber::with_default(subscriber, || log_flash_next_plan(plan, 0.5, 3, "off", held, None));
+            tracing::subscriber::with_default(subscriber, || log_flash_next_plan(plan, 0.5, 3, "off", start, None));
             let records: Vec<serde_json::Value> =
                 sink.lines().iter().map(|line| serde_json::from_str(line).expect("json")).collect();
             assert_eq!(records.len(), 1, "{records:?}");
@@ -3123,7 +3163,10 @@ mod tests {
         assert_eq!(field("pool_bytes"), arena(8_192) + (400 << 20));
         assert_eq!(field("lanes"), 3);
         assert_eq!(field("oversubscribed"), false);
-        assert_eq!(field("process_held_bytes"), held);
+        assert_eq!(field("process_held_bytes"), CONTEXT);
+        assert_eq!(field("process_held_source"), "per_process");
+        assert_eq!(field("cuda_context_bytes"), CONTEXT);
+        assert_eq!(field("cuda_context_source"), "measured");
 
         // GitHub #329 item 2: resident, the residency is device-only and
         // stages nothing, so the event shows no ring and the pool has its
@@ -3363,20 +3406,46 @@ mod tests {
         // context, and the 27B's per-process state once a 27B has loaded,
         // still held. The plan charges both again, so a reload that did not
         // add them back planned 8.2% fewer pages in the AC 14 live run.
-        use ignis_runtime::{held_before_load, CUDA_CONTEXT_BYTES, QWEN27B_PROCESS_STATE_BYTES};
+        // GitHub #604: what the process holds and what the plan charges again
+        // for it are two figures -- the RTX 5080 under Linux held 299,892,736
+        // bytes where the plan charged 536,489,984 -- and the reload adds back
+        // the driver's figure for the process where it has one.
+        use ignis_core::compute::ModelFamily::Qwen38_27b;
+        use ignis_runtime::{held_before_load, ContextCharge, HeldSource, ProcessHeld, QWEN27B_PROCESS_STATE_BYTES};
         const COLD_FREE: u64 = 31_104_512_000;
-        let mode = ignis_core::VramMode::Derived { headroom_bytes: 1_258_291_200 };
-        let cold = plan_for(mode, COLD_FREE + held_before_load(false, false));
-        for (qwen27b_loaded, held) in
-            [(false, CUDA_CONTEXT_BYTES), (true, CUDA_CONTEXT_BYTES + QWEN27B_PROCESS_STATE_BYTES)]
-        {
-            let reload = plan_for(mode, COLD_FREE - held + held_before_load(true, qwen27b_loaded));
-            assert_eq!((reload.kv_page_count, reload.budget_bytes), (cold.kv_page_count, cold.budget_bytes));
-            let unadded = plan_for(mode, COLD_FREE - held);
-            assert!(unadded.kv_page_count < cold.kv_page_count, "the double charge this adds back");
+        const HEADROOM: u64 = 1_258_291_200;
+        let mode = ignis_core::VramMode::Derived { headroom_bytes: HEADROOM };
+        let cold_start = held_before_load(Qwen38_27b, None, false, None);
+        assert_eq!(cold_start, ProcessHeld { bytes: 0, source: HeldSource::Nothing }, "a first load reads before its context exists");
+        // The context measured below `CUDA_CONTEXT_BYTES`, at it, and at what
+        // one took under WSL; the plan keeps it for the process's life.
+        for context in [300 << 20, ignis_runtime::CUDA_CONTEXT_BYTES, 519_270_400] {
+            let measured = Some(ContextCharge { bytes: context, measured: true });
+            let cold = plan_at(mode, COLD_FREE + cold_start.bytes, context);
+            let charged_again = context + QWEN27B_PROCESS_STATE_BYTES;
+            // What the process holds after the cold load's teardown: what the
+            // plan charges again, or 2 MiB of 27B state less, as at
+            // `vram_reload_gpu`'s shape.
+            for holds in [charged_again, charged_again - (2 << 20)] {
+                let nvml_free = COLD_FREE - holds;
+                let held = held_before_load(Qwen38_27b, measured, true, Some(holds));
+                let reload = plan_at(mode, nvml_free + held.bytes, context);
+                assert_eq!(
+                    (reload.kv_page_count, reload.budget_bytes),
+                    (cold.kv_page_count, cold.budget_bytes),
+                    "a per-process figure: context {context}, the process holding {holds}"
+                );
+                let held = held_before_load(Qwen38_27b, measured, true, None);
+                let reload = plan_at(mode, nvml_free + held.bytes, context);
+                assert_eq!(
+                    reload.budget_bytes,
+                    nvml_free + charged_again - HEADROOM,
+                    "no figure: the free memory and what the plan charges again, context {context}, holding {holds}"
+                );
+                let unadded = plan_at(mode, nvml_free, context);
+                assert!(unadded.kv_page_count < cold.kv_page_count, "the double charge this adds back: context {context}");
+            }
         }
-        assert_eq!(held_before_load(false, false), 0, "a first load reads before its context exists");
-        assert_eq!(held_before_load(false, true), 0, "nothing is held without a context");
     }
 
     #[test]

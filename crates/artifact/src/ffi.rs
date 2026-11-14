@@ -84,6 +84,11 @@ unsafe extern "C" {
         total_bytes: *mut u64,
     ) -> i32;
 
+    /// The device memory NVML's per-process accounting reports for `pid` on
+    /// CUDA device `device_id`, into `*bytes` (GitHub #604): 0 with a figure,
+    /// 1 where it reports none, -1 on an error. No context.
+    pub fn ignis_device_nvml_process_bytes(device_id: i32, pid: u32, bytes: *mut u64) -> i32;
+
     /// The name (NVML's, NUL-terminated into `name`) and compute capability
     /// (the CUDA runtime's) of CUDA device `device_id`, read without
     /// creating a CUDA context (GitHub #457).

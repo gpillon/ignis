@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 struct ignis_device {
   cudaStream_t load_stream;
@@ -51,6 +52,9 @@ struct Nvml {
   decltype(&nvmlDeviceGetHandleByPciBusId_v2) handle_by_pci_bus_id;
   decltype(&nvmlDeviceGetMemoryInfo) memory_info;
   decltype(&nvmlDeviceGetName) name;
+  // Optional (GitHub #604): a driver without it reports no per-process
+  // figure, and every query above still works.
+  decltype(&nvmlDeviceGetComputeRunningProcesses_v3) compute_processes;
 };
 
 template <typename Fn>
@@ -79,6 +83,8 @@ const Nvml *nvml() {
                                        &table.handle_by_pci_bus_id) &&
                           resolve_nvml(library, "nvmlDeviceGetMemoryInfo", &table.memory_info) &&
                           resolve_nvml(library, "nvmlDeviceGetName", &table.name);
+    table.compute_processes = reinterpret_cast<decltype(table.compute_processes)>(
+        ignis::shared_library_symbol(library, "nvmlDeviceGetComputeRunningProcesses_v3"));
     return resolved ? &table : nullptr;
   }();
   return api;
@@ -325,6 +331,54 @@ extern "C" int32_t ignis_device_nvml_mem_info(int device_id, uint64_t *free_byte
   }
   *free_bytes = memory.free;
   *total_bytes = memory.total;
+  return 0;
+}
+
+extern "C" int32_t ignis_device_nvml_process_bytes(int device_id, uint32_t pid, uint64_t *bytes) {
+  if (bytes == nullptr) {
+    return -1;
+  }
+  bool reported = false;
+  bool unavailable = false;
+  uint64_t held = 0;
+  if (on_nvml_device(device_id, "nvmlDeviceGetComputeRunningProcesses_v3", [&](const Nvml *api, nvmlDevice_t device) -> nvmlReturn_t {
+        if (api->compute_processes == nullptr) {
+          return NVML_SUCCESS;  // a driver without the query: no figure
+        }
+        std::vector<nvmlProcessInfo_t> processes;
+        unsigned int count = 0;
+        nvmlReturn_t rc = api->compute_processes(device, &count, nullptr);
+        // A process can start between the two calls: ask again with room to spare.
+        for (int attempt = 0; rc == NVML_ERROR_INSUFFICIENT_SIZE && attempt < 3; ++attempt) {
+          processes.resize(count + 8);
+          count = static_cast<unsigned int>(processes.size());
+          rc = api->compute_processes(device, &count, processes.data());
+        }
+        if (rc == NVML_ERROR_NOT_SUPPORTED) {
+          return NVML_SUCCESS;  // no figure, and not an error
+        }
+        if (rc != NVML_SUCCESS) {
+          return rc;
+        }
+        for (unsigned int i = 0; i < count && i < processes.size(); ++i) {
+          if (processes[i].pid != pid) {
+            continue;
+          }
+          if (processes[i].usedGpuMemory == static_cast<unsigned long long>(NVML_VALUE_NOT_AVAILABLE)) {
+            unavailable = true;
+          } else {
+            reported = true;
+            held += processes[i].usedGpuMemory;
+          }
+        }
+        return NVML_SUCCESS;
+      }) != 0) {
+    return -1;
+  }
+  if (!reported || unavailable) {
+    return 1;
+  }
+  *bytes = held;
   return 0;
 }
 
