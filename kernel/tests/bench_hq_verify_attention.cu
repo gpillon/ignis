@@ -21,11 +21,14 @@
 //     decode rewrite changed no bit.
 //
 //   ignis_hq_verify_bench --lanes 8 --ctx 30720 [--iters 20] [--residual] [--decode-only]
-//                         [--reference]
+//                         [--reference | --ws12]
 //
 // --reference launches the kernel's reference hq route (IgnisThroughput =
 // false: main's code path) instead of the throughput route, a same-binary A/B
-// that prints the same hash.
+// that prints the same hash. --ws12 launches ignis's warp-specialized route
+// (kernel/src/hq_verify_ws.cuh, GitHub #571) on the same grid with its 640
+// threads, and prints the same hash too; it is Blackwell's, so the bench
+// refuses it below compute capability 12.0.
 //
 // --decode-only times the kernel's tile decode alone (decode_only_kernel),
 // once with the reference group decode and once with the throughput decoder.
@@ -45,6 +48,8 @@
 #include <vector>
 
 #include "ops/kernel/gqa_attention_decode_hq.cuh"
+
+#include "hq_verify_ws.cuh"
 
 using namespace ninfer;
 using namespace ninfer::ops;
@@ -248,7 +253,7 @@ __launch_bounds__(128, 2) __global__ void decode_only_kernel(GqaTcKVHq kv,
 
 int main(int argc, char** argv) {
     int lanes = 1, ctx = 30720, iters = 20;
-    bool residual = false, decode_only = false, reference = false;
+    bool residual = false, decode_only = false, reference = false, ws12 = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--lanes" && i + 1 < argc) { lanes = std::atoi(argv[++i]); }
@@ -257,12 +262,22 @@ int main(int argc, char** argv) {
         else if (a == "--residual") { residual = true; }
         else if (a == "--decode-only") { decode_only = true; }
         else if (a == "--reference") { reference = true; }
+        else if (a == "--ws12") { ws12 = true; }
         else {
-            std::fprintf(stderr, "usage: %s --lanes N --ctx KEYS [--iters N] [--residual] [--decode-only] [--reference]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s --lanes N --ctx KEYS [--iters N] [--residual] [--decode-only] [--reference | --ws12]\n", argv[0]);
             return 2;
         }
     }
-    if (lanes < 1 || ctx < kTokens || iters < 1) { return 2; }
+    if (lanes < 1 || ctx < kTokens || iters < 1 || (reference && ws12)) { return 2; }
+    if (ws12) {
+        int major = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0));
+        if (major < 12) {
+            std::fprintf(stderr, "--ws12: the warp-specialized route is Blackwell's; this card is "
+                                 "compute capability %d.x\n", major);
+            return 2;
+        }
+    }
 
     const Rows rows = load_rows(IGNIS_HQ_KV_FIXTURE_PATH);
     const int pages_per_lane = (ctx + kPagedKVPageSize - 1) / kPagedKVPageSize;
@@ -341,7 +356,12 @@ int main(int argc, char** argv) {
     const dim3 grid(Geometry::KVHeads, kSplits, lanes);
     const float scale = 1.0f / 16.0f;
     auto launch = [&]() {
-        if (reference) {
+        if (ws12) {
+            ignis_hq_verify::hq_verify_ws_kernel<Geometry, GqaCachedInput>
+                <<<grid, ignis_hq_verify::kHqVerifyWsThreads>>>(
+                    d_q, GqaCachedInput{}, d_pos, kv, d_table, nullptr, d_table_rows,
+                    pages_per_lane, kTokens, kTokens, 0, 262144, scale, d_acc, d_m, d_l);
+        } else if (reference) {
             gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, 8, 4, true, true, GqaCachedInput,
                                                          GqaTcKVHq, false>
                 <<<grid, kGqaHqDecodeThreads>>>(d_q, GqaCachedInput{}, d_pos, kv, d_table, nullptr,
@@ -410,7 +430,7 @@ int main(int argc, char** argv) {
     std::printf("hq verify attention (%s route): lanes %d ctx %d residual %s: median %.1f us (min "
                 "%.1f, max %.1f, %d launches) = %.3f us per layer per 1K keys per lane; partials "
                 "fnv1a64 %016llx\n",
-                reference ? "reference" : "throughput", lanes, ctx, residual ? "on" : "off",
+                ws12 ? "ws12" : reference ? "reference" : "throughput", lanes, ctx, residual ? "on" : "off",
                 median_us, lo, hi, iters, median_us / (lanes * (ctx / 1024.0f)),
                 static_cast<unsigned long long>(h));
     return 0;

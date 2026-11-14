@@ -48,9 +48,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "ops/kernel/hq_codec.cuh"
+
+#include "hq_decode_lean.cuh"
 
 using namespace ninfer::ops;
 
@@ -336,6 +339,66 @@ __global__ void fast_decode_rows_kernel(const std::uint8_t* codes, const std::ui
                              real ? seeds[row] : 0ull, active);
 }
 
+// GitHub #571: the warp-specialized verify route (kernel/src/hq_verify_ws.cuh) decodes with
+// hq_decode_row_group_lean, the fifth way, called here as that route's decode warps call it:
+// each warp decodes four rows, one per 8-lane group, from code and meta rows staged in shared
+// memory in the route's layout (the four rows' codes, then their meta), into a tile of shared
+// memory whose rows are 512-byte aligned, the tile's row r at xor_chunk r & 7. Each block first
+// copies its 32 output rows' current contents into the tile, so an inactive row keeps the
+// host's sentinel, decodes there and copies them back. The reference group decode writes the
+// same placement next to it, from the rows in global memory.
+__global__ void lean_decode_rows_kernel(const std::uint8_t* codes, const std::uint8_t* meta,
+                                        const std::uint64_t* seeds,
+                                        __nv_bfloat16* reference_swizzled,
+                                        __nv_bfloat16* lean_swizzled, int n_rows,
+                                        int inactive_mod) {
+    constexpr int kCallRows   = 4;  // rows per decode-warp call
+    constexpr int kStageBytes = kCallRows * (kHqRowBudgetBytes + kHqMetaBytes);
+    __shared__ __align__(1024) __nv_bfloat16 tile[(kGroupDecodeThreads / 8) * kHqHeadDim];
+    __shared__ __align__(16) std::uint8_t stage[kGroupDecodeThreads / 32][kStageBytes];
+    const int tid   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row   = tid >> 3;
+    const int lane8 = tid & 7;
+    const int row_g = (threadIdx.x >> 3) & (kCallRows - 1);
+    const bool real = row < n_rows;
+    const int at    = real ? row : 0;
+    const std::uint8_t* row_codes = codes + static_cast<std::size_t>(at) * kHqRowBudgetBytes;
+    const std::uint8_t* row_meta  = meta + static_cast<std::size_t>(at) * kHqMetaBytes;
+    const std::size_t out_row     = static_cast<std::size_t>(at) * kHqHeadDim;
+    __nv_bfloat16* staged         = tile + (threadIdx.x >> 3) * kHqHeadDim;
+    std::uint8_t* call            = stage[threadIdx.x >> 5];
+    std::uint8_t* call_codes      = call + row_g * kHqRowBudgetBytes;
+    std::uint8_t* call_meta       = call + kCallRows * kHqRowBudgetBytes + row_g * kHqMetaBytes;
+    if (lane8 < kHqRowBudgetBytes / 16) {
+        reinterpret_cast<uint4*>(call_codes)[lane8] =
+            reinterpret_cast<const uint4*>(row_codes)[lane8];
+    } else if (lane8 == kHqRowBudgetBytes / 16) {
+        *reinterpret_cast<uint2*>(call_meta) = *reinterpret_cast<const uint2*>(row_meta);
+    }
+    if (real) {
+        hq_decode_row_group<true>(row_codes, row_meta, reference_swizzled + out_row, lane8,
+                                  row & 7, seeds[row]);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            reinterpret_cast<uint4*>(staged)[lane8 * 4 + j] =
+                reinterpret_cast<const uint4*>(lean_swizzled + out_row)[lane8 * 4 + j];
+        }
+    }
+    __syncwarp();
+    const bool active =
+        real && (inactive_mod == 0 || row % inactive_mod != inactive_mod - 1);
+    ignis_hq_verify::hq_decode_row_group_lean(call_codes, call_meta, staged, lane8, at & 7,
+                                              real ? seeds[row] : 0ull, active);
+    __syncwarp();
+    if (real) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            reinterpret_cast<uint4*>(lean_swizzled + out_row)[lane8 * 4 + j] =
+                reinterpret_cast<const uint4*>(staged)[lane8 * 4 + j];
+        }
+    }
+}
+
 __global__ void fixture_seeds_kernel(std::uint64_t* seeds, int n_rows, int role_count,
                                      int kv_heads, int rows_per_block, int first_position) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -377,7 +440,8 @@ struct FastDecodeDiffs {
 
 FastDecodeDiffs fast_decode_diffs(const std::uint8_t* d_codes, const std::uint8_t* d_meta,
                                   const std::uint64_t* d_seeds, int n_rows,
-                                  const std::vector<std::uint16_t>* thread_rows) {
+                                  const std::vector<std::uint16_t>* thread_rows,
+                                  bool lean = false) {
     constexpr int kInactiveMod = 3;
     const std::size_t n_elems = static_cast<std::size_t>(n_rows) * kHqHeadDim;
     __nv_bfloat16 *d_reference, *d_fast;
@@ -386,15 +450,22 @@ FastDecodeDiffs fast_decode_diffs(const std::uint8_t* d_codes, const std::uint8_
     const long long threads = static_cast<long long>(n_rows) * 8;
     const int blocks = static_cast<int>((threads + kGroupDecodeThreads - 1) / kGroupDecodeThreads);
     std::vector<std::uint16_t> reference(n_elems), fast(n_elems), masked(n_elems);
-    fast_decode_rows_kernel<<<blocks, kGroupDecodeThreads>>>(d_codes, d_meta, d_seeds, d_reference,
-                                                              d_fast, n_rows, 0);
+    auto decode = [&](int inactive_mod) {
+        if (lean) {
+            lean_decode_rows_kernel<<<blocks, kGroupDecodeThreads>>>(
+                d_codes, d_meta, d_seeds, d_reference, d_fast, n_rows, inactive_mod);
+        } else {
+            fast_decode_rows_kernel<<<blocks, kGroupDecodeThreads>>>(
+                d_codes, d_meta, d_seeds, d_reference, d_fast, n_rows, inactive_mod);
+        }
+    };
+    decode(0);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(reference.data(), d_reference, n_elems * 2, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(fast.data(), d_fast, n_elems * 2, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemset(d_fast, 0xFF, n_elems * 2));
-    fast_decode_rows_kernel<<<blocks, kGroupDecodeThreads>>>(d_codes, d_meta, d_seeds, d_reference,
-                                                              d_fast, n_rows, kInactiveMod);
+    decode(kInactiveMod);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(masked.data(), d_fast, n_elems * 2, cudaMemcpyDeviceToHost));
@@ -419,18 +490,19 @@ FastDecodeDiffs fast_decode_diffs(const std::uint8_t* d_codes, const std::uint8_
     return d;
 }
 
-void check_fast_decode(const FastDecodeDiffs& d, const char* corpus, bool with_thread) {
-    std::printf("fast group decode (the verify kernel's call) on %s: %zu elements; differing vs "
-                "the group decode %zu",
-                corpus, d.elements, d.vs_group);
+void check_fast_decode(const FastDecodeDiffs& d, const char* corpus, bool with_thread,
+                       const char* way = "fast group decode (the verify kernel's call)") {
+    std::printf("%s on %s: %zu elements; differing vs the group decode %zu", way, corpus,
+                d.elements, d.vs_group);
     if (with_thread) { std::printf(", vs the per-thread decode %zu", d.vs_thread); }
     std::printf("; with every third row inactive: %zu differing, %zu inactive elements written\n",
                 d.masked_vs_group, d.inactive_touched);
     check(d.vs_group == 0 && d.masked_vs_group == 0,
-          "the fast group decode disagrees with hq_decode_row_group");
-    check(d.inactive_touched == 0, "the fast group decode wrote an inactive row");
+          (std::string(way) + " disagrees with hq_decode_row_group").c_str());
+    check(d.inactive_touched == 0, (std::string(way) + " wrote an inactive row").c_str());
     if (with_thread) {
-        check(d.vs_thread == 0, "the fast group decode disagrees with hq_decode_row_thread");
+        check(d.vs_thread == 0,
+              (std::string(way) + " disagrees with hq_decode_row_thread").c_str());
     }
 }
 
@@ -640,6 +712,8 @@ int main() {
                               cudaMemcpyDeviceToHost));
         check_fast_decode(fast_decode_diffs(d_codes, d_meta, d_seeds, n_rows, &thread_rows),
                           "the real rows", true);
+        check_fast_decode(fast_decode_diffs(d_codes, d_meta, d_seeds, n_rows, &thread_rows, true),
+                          "the real rows", true, "lean group decode (the ws12 route's call)");
     }
 
     // Rows the engine's encoder never writes, built from real rows: every
@@ -710,6 +784,9 @@ int main() {
         CUDA_CHECK(cudaMemcpy(d_eseeds, eseeds.data(), eseeds.size() * 8, cudaMemcpyHostToDevice));
         check_fast_decode(fast_decode_diffs(d_ecodes, d_emeta, d_eseeds, n_edge, nullptr),
                           "rows the encoder never writes", false);
+        check_fast_decode(fast_decode_diffs(d_ecodes, d_emeta, d_eseeds, n_edge, nullptr, true),
+                          "rows the encoder never writes", false,
+                          "lean group decode (the ws12 route's call)");
         CUDA_CHECK(cudaFree(d_ecodes));
         CUDA_CHECK(cudaFree(d_emeta));
         CUDA_CHECK(cudaFree(d_eseeds));
@@ -999,6 +1076,10 @@ int main() {
             check_fast_decode(fast_decode_diffs(d_heavy_codes, d_heavy_meta, d_heavy_seeds,
                                                 kHeavySamples, &heavy_thread),
                               "the escalated heavy-tailed rows", true);
+            check_fast_decode(fast_decode_diffs(d_heavy_codes, d_heavy_meta, d_heavy_seeds,
+                                                kHeavySamples, &heavy_thread, true),
+                              "the escalated heavy-tailed rows", true,
+                              "lean group decode (the ws12 route's call)");
             CUDA_CHECK(cudaFree(d_heavy_seeds));
             CUDA_CHECK(cudaFree(d_heavy_thread));
         }
