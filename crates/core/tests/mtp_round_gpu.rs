@@ -52,6 +52,12 @@
 //!   rule says: the chain's rows past the commit cleared, the committed ones
 //!   set, the target's words as for DFlash2 (GitHub #257); at eight lanes,
 //!   every width's verify graph captured.
+//! - **The head is the right head** (GitHub #625): on the same sixteen greedy
+//!   prompts, at one lane, a fixed window of 7 and the full proposal head,
+//!   under BF16 and hq-e8-2b KV, ignis commits no fewer tokens a round than
+//!   the reference engine's MTP less 5%, both counted as the reference counts
+//!   them; every prompt's and the pooled acceptance at each position are
+//!   printed beside the reference's (`fixtures/mtp_reference_acceptance.json`).
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact, GPU, or kernel error is a **skip**; under the profile
@@ -79,7 +85,7 @@ use ignis_core::step::{
     prefill_program_sampled, prefill_program_with_route, program_stats, LaneDraw, LaneVerifyRun, PrefillRoute, Redirect,
     SamplingParams, VerifyLane,
 };
-use ignis_core::{mtp_readout, KvFormat, Speculation, SpeculativeBackend};
+use ignis_core::{mtp_readout, KvFormat, SpecCounters, Speculation, SpeculativeBackend};
 
 use near_tie::first_divergence;
 
@@ -1165,4 +1171,260 @@ fn on_the_16gb_artifact_the_head_drafts_and_the_substrate_commits_the_same_runs(
         full.1
     );
     assert!(accepted > 0, "16 GB artifact: the head never landed a draft");
+}
+
+// --- the head against the reference engine's (GitHub #625) ---------------
+
+/// The prompts of the comparison with the reference engine, by id: the four
+/// canaries and twelve more (code, prose, lists, arithmetic, a translation).
+const ACCEPTANCE_PROMPTS: [(&str, &str); 16] = [
+    ("rust-hello", CANARY_PROMPTS[0]),
+    ("rust-sort", CANARY_PROMPTS[1]),
+    ("math-greedy", CANARY_PROMPTS[2]),
+    ("explain-reverse", CANARY_PROMPTS[3]),
+    ("py-fib", "Write a Python function that returns the n-th Fibonacci number iteratively, with a docstring and two doctest examples."),
+    ("rust-struct", "Write a Rust struct `Stack<T>` backed by a `Vec<T>` with `push`, `pop` and `peek` methods, and a short test module."),
+    (
+        "sql-join",
+        "Given tables `orders(id, customer_id, total)` and `customers(id, name)`, write a SQL query that lists each customer's \
+         name and the sum of their order totals, highest first, and explain it briefly.",
+    ),
+    ("json-convert", "Convert this list into a JSON array of objects with fields name and age: Alice 31, Bob 27, Carol 45, Dave 19."),
+    ("prose-story", "Write a short story of about 150 words about a lighthouse keeper who finds a message in a bottle."),
+    ("prose-explain", "Explain to a high-school student how a refrigerator moves heat from inside to outside."),
+    ("history", "Summarize the main causes of the French Revolution in five bullet points."),
+    (
+        "translate",
+        "Translate into Italian: The meeting has been moved to Thursday afternoon because the room is not available on Wednesday.",
+    ),
+    ("math-word", "A train leaves at 9:40 and travels 210 km at 84 km/h. At what time does it arrive? Show your reasoning."),
+    ("list-tips", "Give eight practical tips for writing clear commit messages."),
+    ("regex", "Write a regular expression that matches ISO 8601 dates like 2024-03-17 and explain each part of it."),
+    (
+        "bash-script",
+        "Write a bash script that finds every .log file older than 7 days under /var/log/app, compresses it with gzip, and \
+         prints how many files it compressed.",
+    ),
+];
+
+/// The reference engine's runs of [`ACCEPTANCE_PROMPTS`] under each KV format,
+/// in their order; its settings are the fixture's `about`.
+const REFERENCE_ACCEPTANCE: &str = include_str!("fixtures/mtp_reference_acceptance.json");
+/// The reference's pooled rounds and drafts accepted as its runs printed them:
+/// a guard on the fixture's copy.
+const REFERENCE_POOLED: [(&str, u32, u32); 2] = [("bf16", 634, 2033), ("hq-e8-2b", 654, 2069)];
+/// The reference engine's run: max context 4096, at most 256 new tokens.
+const ACCEPTANCE_CONTEXT: u32 = 4096;
+const ACCEPTANCE_NEW_TOKENS: usize = 256;
+/// How far ignis's pooled tokens a round may stand under the reference's.
+const ACCEPTANCE_MARGIN: f64 = 0.05;
+
+/// One engine's greedy run of one prompt.
+struct EngineRun {
+    /// The rounds that drafted (extent > 0), with their leading-run counters.
+    counters: SpecCounters,
+    /// The generated text, the prefill's token first, through the first stop id.
+    generated: Vec<i32>,
+}
+
+fn tokens_a_round(counters: &SpecCounters) -> f64 {
+    1.0 + f64::from(counters.accepted) / f64::from(counters.rounds.max(1))
+}
+
+/// Accepted over drafted at position `j + 1`, the leading-run definition.
+fn rate(counters: &SpecCounters, j: usize) -> f64 {
+    f64::from(counters.accepted_at[j]) / f64::from(counters.drafted_at[j].max(1))
+}
+
+fn by_position(counters: &SpecCounters) -> String {
+    (0..WINDOW as usize).map(|j| format!("{}/{}", counters.accepted_at[j], counters.drafted_at[j])).collect::<Vec<_>>().join(" ")
+}
+
+/// The reference engine's runs under `kv` (the fixture's key): each prompt's
+/// id, its prompt tokens and its run.
+fn reference_runs(kv: &str) -> Vec<(String, usize, EngineRun)> {
+    let fixture: serde_json::Value = serde_json::from_str(REFERENCE_ACCEPTANCE).expect("the reference fixture parses");
+    let rows = fixture["runs"][kv].as_array().unwrap_or_else(|| panic!("the fixture has no run under {kv}"));
+    rows.iter()
+        .map(|row| {
+            let numbers = |key: &str| -> Vec<i64> {
+                row[key].as_array().unwrap_or_else(|| panic!("{key}")).iter().map(|x| x.as_i64().expect(key)).collect()
+            };
+            let counts = |key: &str| -> Vec<u32> { numbers(key).into_iter().map(|x| x as u32).collect() };
+            let (accepted_at, drafted_at) = (counts("accepted_per_position"), counts("drafted_per_position"));
+            let mut counters = SpecCounters {
+                rounds: drafted_at[0],
+                drafted: drafted_at.iter().sum(),
+                accepted: accepted_at.iter().sum(),
+                ..SpecCounters::default()
+            };
+            counters.accepted_at.copy_from_slice(&accepted_at);
+            counters.drafted_at.copy_from_slice(&drafted_at);
+            let generated = numbers("generated_ids").into_iter().map(|x| x as i32).collect();
+            let id = row["id"].as_str().expect("id").to_string();
+            let prompt_tokens = row["prompt_tokens"].as_u64().expect("prompt_tokens") as usize;
+            (id, prompt_tokens, EngineRun { counters, generated })
+        })
+        .collect()
+}
+
+/// ignis's greedy run of `prompt` at one lane, run and counted as the
+/// reference engine runs and counts its own. Each round is given what is left
+/// of the generation's budget, so its extent is the reference's, `min(7,
+/// remaining - 1)`, and no stop ids, so it commits the whole run the target
+/// accepts, past a stop too, as the reference's round licenses and counts it;
+/// the run ends after the round whose generated tokens (its drafts committed
+/// and the target's next token) hold a stop id, or at the cap. A round at
+/// extent 0 is a plain step, not a round. Returns the run, the counters with
+/// each round's run cut at its stop (as a round given the stop ids commits
+/// and reports it), and the rounds at extent 0.
+fn acceptance_run(model: &Model, pool: &SeqPool, prompt: &[i32], stop_ids: &[i32]) -> (EngineRun, SpecCounters, u32) {
+    let mut seq = alloc_prefilled(model, pool, &[prompt.to_vec()], ACCEPTANCE_CONTEXT).remove(0);
+    let mut generated = vec![seq.pending_token().expect("the prefill's token")];
+    let (mut counters, mut cut_at, mut fallback_steps) = (SpecCounters::default(), SpecCounters::default(), 0u32);
+    let stops = |t: &i32| stop_ids.contains(t);
+    while !generated.iter().any(stops) && generated.len() < ACCEPTANCE_NEW_TOKENS {
+        let remaining = (ACCEPTANCE_NEW_TOKENS - generated.len()) as u32;
+        let run = round(model, pool, &mut [&mut seq], &greedy(1), &[remaining], &[], WINDOW).remove(0);
+        assert_eq!(run.tokens.first(), generated.last(), "a run that does not open with its anchor");
+        assert_eq!(run.extent, WINDOW.min(remaining - 1), "the leaf's extent is not the reference's");
+        let accepted = run.tokens.len() as u32 - 1;
+        if run.extent == 0 {
+            fallback_steps += 1;
+        } else {
+            counters = counters + SpecCounters::round(run.extent, accepted);
+            let served = run.tokens[1..].iter().position(stops).map_or(accepted, |k| k as u32 + 1);
+            cut_at = cut_at + SpecCounters::round(run.extent, served);
+        }
+        generated.extend_from_slice(&run.tokens[1..]);
+        generated.push(seq.pending_token().expect("the round's next token"));
+        assert!(counters.rounds + fallback_steps <= ACCEPTANCE_NEW_TOKENS as u32, "the run does not converge");
+    }
+    cut_at_stop(&mut generated, stop_ids);
+    (EngineRun { counters, generated }, cut_at, fallback_steps)
+}
+
+/// GitHub #625: a head read wrongly shows only as drafts the target refuses,
+/// so the measure of the reading is the reference engine's acceptance with
+/// the same head on the same prompts. Both engines: the NVFP4 artifact, one
+/// lane, MTP at a fixed window of 7, the full proposal head, greedy, thinking
+/// off and no system message, at most 256 new tokens, the same KV format;
+/// ignis's loop guard is off, since the leaf has none. ignis's pooled tokens a
+/// round may not stand under the reference's by more than 5%. A larger gap is
+/// a defect in the reading of the head until shown otherwise: the test prints
+/// the first position where ignis's rate falls under the reference's by more
+/// than the margin, and for each prompt the first token where the texts part.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn the_heads_acceptance_is_within_five_percent_of_the_reference_engines_on_the_same_prompts() {
+    for (kv, rounds, accepted) in REFERENCE_POOLED {
+        let pooled = reference_runs(kv).into_iter().fold(SpecCounters::default(), |sum, (_, _, run)| sum + run.counters);
+        assert_eq!((pooled.rounds, pooled.accepted), (rounds, accepted), "{kv}: the fixture is not the reference's runs");
+    }
+    let Some((reader, handles, on_device)) = materialized(ARTIFACT) else {
+        return;
+    };
+    let artifact = &on_device.artifact;
+    let encode = encoder(&reader);
+    let (_, stop_ids) = chat_canaries(&reader);
+    let prompts: Vec<Vec<i32>> = ACCEPTANCE_PROMPTS.iter().map(|(_, text)| turn(&encode, text)).collect();
+    println!(
+        "#625: one lane, MTP at a fixed window of {WINDOW}, the full proposal head, greedy, thinking off, at most \
+         {ACCEPTANCE_NEW_TOKENS} new tokens, max context {ACCEPTANCE_CONTEXT}; ignis's loop guard off (the leaf has none)"
+    );
+    let mut verdicts = Vec::new();
+    for (kv_format, kv) in [(KvFormat::Bf16, "bf16"), (KvFormat::HqE8_2b, "hq-e8-2b")] {
+        let reference = reference_runs(kv);
+        assert_eq!(reference.len(), ACCEPTANCE_PROMPTS.len(), "{kv}: a reference run per prompt");
+        for ((id, _), (prompt, (reference_id, prompt_tokens, _))) in ACCEPTANCE_PROMPTS.iter().zip(prompts.iter().zip(&reference)) {
+            assert_eq!(*id, reference_id.as_str(), "{kv}: the fixture's prompts are not in the test's order");
+            assert_eq!(prompt.len(), *prompt_tokens, "{id}: the prompt is not the reference engine's");
+        }
+        let model = load_head(&reader, artifact, &handles, WINDOW, kv_format, ACCEPTANCE_CONTEXT);
+        let pool = head_pool(kv_format, 1, ACCEPTANCE_CONTEXT);
+        let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+        let (mut ours, mut cut, mut theirs) = (SpecCounters::default(), SpecCounters::default(), SpecCounters::default());
+        let (mut same_ours, mut same_theirs, mut same_prompts, mut fallback) =
+            (SpecCounters::default(), SpecCounters::default(), 0usize, 0u32);
+        for ((id, _), (prompt, (_, _, reference))) in ACCEPTANCE_PROMPTS.iter().zip(prompts.iter().zip(&reference)) {
+            let (run, served, fallback_steps) = acceptance_run(&model, &pool, prompt, &stop_ids);
+            let text = match first_divergence(&run.generated, &reference.generated) {
+                None => {
+                    same_ours = same_ours + run.counters;
+                    same_theirs = same_theirs + reference.counters;
+                    same_prompts += 1;
+                    format!("the same {} generated tokens", run.generated.len())
+                }
+                Some(d) => format!(
+                    "parts at generated token {d} (ignis {:?}, the reference {:?}; {} and {} generated)",
+                    run.generated.get(d),
+                    reference.generated.get(d),
+                    run.generated.len(),
+                    reference.generated.len()
+                ),
+            };
+            println!(
+                "{kv} {id:15} prompt {:2} | ignis {:3} rounds (+{fallback_steps} at extent 0), {:3} accepted, {:.3} tokens a \
+                 round, accepted/drafted by position {} | the reference {:3} rounds, {:3} accepted, {:.3}, {} | {text}",
+                prompt.len(),
+                run.counters.rounds,
+                run.counters.accepted,
+                tokens_a_round(&run.counters),
+                by_position(&run.counters),
+                reference.counters.rounds,
+                reference.counters.accepted,
+                tokens_a_round(&reference.counters),
+                by_position(&reference.counters),
+            );
+            ours = ours + run.counters;
+            cut = cut + served;
+            theirs = theirs + reference.counters;
+            fallback += fallback_steps;
+        }
+        let (mine, reference_figure) = (tokens_a_round(&ours), tokens_a_round(&theirs));
+        println!(
+            "{kv} pooled over {} prompts: ignis {} rounds (+{fallback} at extent 0), {} accepted, {mine:.3} tokens a round \
+             ({:.3} with each round's run cut at its stop, as the served counters count it) | the reference engine {} \
+             rounds, {} accepted, {reference_figure:.3} tokens a round | ignis / reference {:.4}",
+            ACCEPTANCE_PROMPTS.len(),
+            ours.rounds,
+            ours.accepted,
+            tokens_a_round(&cut),
+            theirs.rounds,
+            theirs.accepted,
+            mine / reference_figure
+        );
+        for j in 0..WINDOW as usize {
+            println!(
+                "{kv} position {}: ignis {}/{} = {:.3}, the reference {}/{} = {:.3}, ignis / reference {:.3}",
+                j + 1,
+                ours.accepted_at[j],
+                ours.drafted_at[j],
+                rate(&ours, j),
+                theirs.accepted_at[j],
+                theirs.drafted_at[j],
+                rate(&theirs, j),
+                rate(&ours, j) / rate(&theirs, j).max(f64::MIN_POSITIVE)
+            );
+        }
+        match (0..WINDOW as usize).find(|&j| rate(&ours, j) < rate(&theirs, j) * (1.0 - ACCEPTANCE_MARGIN)) {
+            Some(j) => println!("{kv}: the first position where ignis's rate is under the reference's by more than 5%: {}", j + 1),
+            None => println!("{kv}: at no position is ignis's rate under the reference's by more than 5%"),
+        }
+        println!(
+            "{kv}: the {same_prompts} prompt(s) whose text is the reference's end to end: ignis {:.3}, the reference {:.3} \
+             tokens a round",
+            tokens_a_round(&same_ours),
+            tokens_a_round(&same_theirs)
+        );
+        verdicts.push((kv, mine, reference_figure));
+    }
+    for (kv, mine, reference_figure) in verdicts {
+        assert!(
+            mine >= reference_figure * (1.0 - ACCEPTANCE_MARGIN),
+            "{kv}: ignis commits {mine:.3} tokens a round, under the reference engine's {reference_figure:.3} by more than \
+             {:.0}%",
+            100.0 * ACCEPTANCE_MARGIN
+        );
+    }
 }

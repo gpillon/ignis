@@ -10,7 +10,10 @@
 //! (kernel/src/decode_graph.cu). GitHub #620: the MTP head's proposal readout
 //! (`mtp_readout`) and the span readout of the hiddens it reads
 //! (`prefill_program_span_hidden`, the prefill options' `out_span_hidden`) are
-//! the same kind of seam.
+//! the same kind of seam. GitHub #626: so is the head's chain readout
+//! (`mtp_readout::chain`, the leaf's `ignis_mtp_readout_chain`), which the
+//! `mtp_readout` name already holds. The replays that call the seams are
+//! examples (`crates/runtime/examples/`), outside every directory scanned.
 
 use std::path::{Path, PathBuf};
 

@@ -1198,7 +1198,11 @@ too: its drafter drafts the recorded tokens that are among its candidates, and
 its accept takes each with the probability a live round under the rule takes
 the token it emits, min(p, q)/p — the live round's own verdict where the lane's
 draws emit the recorded token, a coin of its own elsewhere — so the rounds a
-replay walks are distributed as live rounds under the rule are.
+replay walks are distributed as live rounds under the rule are. On a 27B load
+built for the **MTP head** (GitHub #626) the head's chain proposes in the pass
+as in a live round; the head drafts under the fixed draft only, so only greedy
+lanes are forced, and fed the text its own rounds committed a forced round is
+those rounds bit for bit.
 
 **Proposal readout**:
 The drafter's proposals at a sequence's frontier, read without running a round
@@ -1210,7 +1214,11 @@ Named after the **readout**'s
 precedent — a measurement beside the program, never a second way to generate —
 but not one: a **readout** reads named tokens' target logits at one position
 and costs a prefill; this reads the drafter's lattice and costs one eager
-drafter forward.
+drafter forward. Under the 27B's **MTP head** (GitHub #626) it reads the
+head's chain instead: the drafts the next round proposes, each with the head's
+probability of it (its share of the softmax at temperature 1 over the head's
+scores, the whole vocabulary) and its 16 leading candidates, at one eager
+chain's cost.
 
 **MTP**:
 The model's native multi-token-prediction head, the alternative drafter (draft
