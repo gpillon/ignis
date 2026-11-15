@@ -244,8 +244,10 @@ at the address its graphs read) less one, plus `s`; the commit's rows, built on 
 plain round's row is its rotation position less one, as its KV row is its position less one.
 
 A row whose next token is an image placeholder embeds the image's column the target's embedding took there, not the
-placeholder id's row: Flash-Next's rule (#564), and what the head was trained beside, a trunk whose input at an
-image is the image. Because the entry at `p` is written by the step that consumes `x_{p+1}`, that column is always
+placeholder id's row: Flash-Next's rule (#564), the input the target itself took at that position, which every
+placeholder id shares and so cannot tell one image from another. Measured on the canaries, the head so built
+commits 4.67 tokens a full-window round on the text after an image, and the first round after number.png drafted
+its whole window and committed all of it. Because the entry at `p` is written by the step that consumes `x_{p+1}`, that column is always
 in the chunk that writes the row, so nothing like Flash-Next's continuation past a span ending inside an image is
 needed: the head's call copies the chunk's media columns into its embedding, from wherever the residency put the
 pool.

@@ -525,6 +525,98 @@ fn after_an_image_the_heads_rows_and_first_draft_are_its_weights_in_double_preci
     eprintln!("plain round's row: keys {key:.6}, values {value:.6}; at the bare position: keys {control:.4}");
     assert!(key <= tolerance(KEY_ROUNDINGS) && value <= tolerance(VALUE_ROUNDINGS), "plain keys {key}, values {value}");
     assert!(control > CONTROL_FACTOR * tolerance(KEY_ROUNDINGS), "the plain round's bare-position control {control}");
+
+    // The same from the captured graphs, which serving replays: a verify round
+    // and a plain round at two lanes, the image's beside a text sequence's
+    // (rope delta 0), each lane's rows at its own rotation.
+    let text_tokens: Vec<i32> = FrontendSet::from_reader(reader)
+        .expect("frontend")
+        .tokenizer()
+        .encode("Explain in two sentences how a bicycle gear changes the effort a rider needs.")
+        .expect("tokenize")
+        .into_iter()
+        .map(|t| t as i32)
+        .collect();
+    let mut text = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc the text lane: {e}"));
+    let mut text_bits = vec![0u16; text_tokens.len() * HIDDEN];
+    step::prefill_program_span_hidden(model, &pool, &mut text, &text_tokens, 0, None, &mut text_bits, None)
+        .unwrap_or_else(|e| panic!("prefill the text lane: {e}"));
+    step::capture_decode_graphs(model, &pool).unwrap_or_else(|e| panic!("capture the graphs: {e}"));
+    let program = step::program_stats(model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
+    assert!(
+        program.decode_graph_ready_mask & 2 != 0 && program.verify_graph_ready_mask & 2 != 0,
+        "the width-2 graphs are captured (decode {:#b}, verify {:#b})",
+        program.decode_graph_ready_mask,
+        program.verify_graph_ready_mask
+    );
+    // What each lane's next rows are built from: its continuation hidden and
+    // frontier, and (the image lane's) the chain's drafts, read eagerly.
+    let image_continuation = mtp_readout::propose(model, &pool, &mut spans).expect("readout").continuation;
+    let text_continuation = mtp_readout::propose(model, &pool, &mut text).expect("readout").continuation;
+    let eager_drafts = mtp_readout::chain(model, &pool, &mut spans, WINDOW, WINDOW, false).expect("chain").drafts();
+    let bases = [spans.stats().position as usize, text.stats().position as usize];
+    let deltas = [delta, 0];
+    let lanes = [VerifyLane::greedy(&[]), VerifyLane::greedy(&[])];
+    let runs = decode_program_verify_runs(model, &pool, &mut [&mut spans, &mut text], &lanes, WINDOW)
+        .unwrap_or_else(|e| panic!("a verify round from its graph: {e}"));
+    let round = mtp_readout::round_hidden(model, 2, WINDOW).unwrap_or_else(|e| panic!("round hidden: {e}"));
+    let lane_column = |lane: usize, j: usize| column(&round, lane * (WINDOW as usize + 1) + j);
+    let image_run = &runs[0].tokens;
+    eprintln!("graph round: image lane {:?}, text lane {:?}; eager chain {eager_drafts:?}", image_run, runs[1].tokens);
+    assert_eq!(
+        image_run[1..],
+        eager_drafts[..image_run.len() - 1],
+        "the graph's chain drafted what the eager chain drafts: the accepted run is its drafts"
+    );
+    for (lane, continuation) in [(0usize, &image_continuation), (1, &text_continuation)] {
+        let run = &runs[lane].tokens;
+        let rows = |turn: &dyn Fn(usize) -> [i32; 3]| -> Vec<RowInputs> {
+            (0..run.len())
+                .map(|j| RowInputs {
+                    hidden: if j == 0 {
+                        continuation.iter().copied().map(bf16_to_f64).collect()
+                    } else {
+                        lane_column(lane, j - 1)
+                    },
+                    embedding: embedding(reader, run[j]),
+                    axes: turn(bases[lane] - 1 + j),
+                })
+                .collect()
+        };
+        let positions: Vec<u32> = (0..run.len()).map(|j| (bases[lane] - 1 + j) as u32).collect();
+        let at_delta = |p: usize| [p as i32 + deltas[lane]; 3];
+        let sequence = if lane == 0 { &spans } else { &text };
+        let (key, value) = drift(reader, &pool, sequence, &positions, &rows(&at_delta));
+        eprintln!("graph round, lane {lane} (delta {}): commit keys {key:.6}, values {value:.6}", deltas[lane]);
+        assert!(key <= tolerance(KEY_ROUNDINGS) && value <= tolerance(VALUE_ROUNDINGS), "lane {lane}: {key}, {value}");
+        if lane == 0 {
+            let (control, _) = drift(reader, &pool, sequence, &positions, &rows(&flat));
+            assert!(control > CONTROL_FACTOR * tolerance(KEY_ROUNDINGS), "the graph commit's control {control}");
+        }
+    }
+    let consumed = [spans.pending_token().expect("pending"), text.pending_token().expect("pending")];
+    let frontiers = [spans.stats().position as usize, text.stats().position as usize];
+    decode_program_batch(model, &pool, &mut [&mut spans, &mut text]).unwrap_or_else(|e| panic!("a plain round from its graph: {e}"));
+    for lane in 0..2 {
+        let last = runs[lane].tokens.len() - 1;
+        let row = |turn: &dyn Fn(usize) -> [i32; 3]| {
+            vec![RowInputs {
+                hidden: lane_column(lane, last),
+                embedding: embedding(reader, consumed[lane]),
+                axes: turn(frontiers[lane] - 1),
+            }]
+        };
+        let at_delta = |p: usize| [p as i32 + deltas[lane]; 3];
+        let sequence = if lane == 0 { &spans } else { &text };
+        let (key, value) = drift(reader, &pool, sequence, &[frontiers[lane] as u32 - 1], &row(&at_delta));
+        eprintln!("graph plain round, lane {lane}: keys {key:.6}, values {value:.6}");
+        assert!(key <= tolerance(KEY_ROUNDINGS) && value <= tolerance(VALUE_ROUNDINGS), "lane {lane}: {key}, {value}");
+        if lane == 0 {
+            let (control, _) = drift(reader, &pool, sequence, &[frontiers[lane] as u32 - 1], &row(&flat));
+            assert!(control > CONTROL_FACTOR * tolerance(KEY_ROUNDINGS), "the graph plain round's control {control}");
+        }
+    }
+    drop(text);
     drop(spans);
     drop(media);
 

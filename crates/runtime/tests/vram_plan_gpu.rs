@@ -191,6 +191,28 @@ fn an_mtp_load_with_vision_holds_its_plan_under_each_residency_and_a_text_one_pl
     let device_vision = Vision::new(ignis_core::DEFAULT_VISION_MAX_TOKENS).expect("default envelope");
     let dflash2_vision = plan_of(dflash2, Some(device_vision)).decode_graph - plan_of(dflash2, None).decode_graph;
     eprintln!("vision adds {dflash2_vision} B to a DFlash2 load's decode_graph line");
+    // The prefill's three axes a row, where the prefill sizes the arena: a
+    // 4,096-token chunk is past the item-bounded encoder (the 16,384-token
+    // item the processor lets through), so the head's workspace beside the
+    // verify substrate's is its prefill line on a vision load, the CPU's.
+    let bounded = device_vision.with_item_max_tokens(16_384);
+    let wide = |speculation: Speculation| {
+        let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+        let (plan, handles) =
+            bind_model_scope_27b_with(&reader, model_load::model_scope(Some(speculation), Some(bounded), ExceptionWeights::Bf16))
+                .unwrap_or_else(|e| panic!("bind ({speculation:?}): {e}"));
+        CudaLeafConfig { speculation: Some(speculation), prefill_chunk_tokens: 4096, ..config(Some(bounded)) }
+            .plan_reservations(&reader, &plan, &handles)
+            .unwrap_or_else(|e| panic!("plan ({speculation:?}) at a 4,096-token chunk: {e}"))
+            .reserved
+            .workspace
+    };
+    let substrate = Speculation::new(SpeculativeBackend::VerifyOnly, 7).expect("verify-only-7");
+    assert_eq!(
+        wide(speculation) - wide(substrate),
+        speculation.prefill_scratch_bytes(4096, true),
+        "a vision load's head prefill line, three rotation axes a row, as the CPU states it"
+    );
     for residency in [VisionResidency::Device, VisionResidency::Host] {
         let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
         let vision = Vision::new(ignis_core::DEFAULT_VISION_MAX_TOKENS)

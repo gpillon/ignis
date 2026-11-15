@@ -24,9 +24,11 @@ set. The text after an image is drafted as text is, and a greedy answer is the
 same with speculation on or off, up to near-ties. Where the next token is an
 image placeholder, the MTP head takes the image's row the model itself took
 there, and it reads the image's positions as the model does. Beside a text
-load's lines, a vision load with the head plans 1 KB more prefill scratch and
-four bytes a round column for those positions. Flash-Next's MTP head drafts
-after images too ([Flash-Next](#flash-next)).
+load's lines, a vision load with the head plans those positions: 1 KB more of
+the prefill scratch, which only shows where the prefill chunk rather than the
+image encoder sets that arena's size, and 256 bytes of a round's scratch at
+eight lanes. Flash-Next's MTP head drafts after images too
+([Flash-Next](#flash-next)).
 
 ## Flash-Next
 
