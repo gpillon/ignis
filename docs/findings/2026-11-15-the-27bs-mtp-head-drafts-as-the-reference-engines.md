@@ -13,7 +13,7 @@
   https://github.com/gpillon/ignis/issues/621,
   [ADR 0095](../adr/0095-the-27b-has-two-drafters-and-its-mtp-head-keeps-attention-state-over-the-whole-context-and-a-continuation-hidden.md)
 - Superseded by: none
-- Summary: RTX 5090, 27B NVFP4, MTP at a fixed window of 7, one lane, greedy, 16 prompts: ignis commits 4.241 tokens a round to the reference engine's 4.207 (BF16 KV) and 4.175 to 4.164 (hq-e8-2b); where the texts match, so do the counters.
+- Summary: RTX 5090, 27B NVFP4, MTP at a fixed window of 7, one lane, greedy, 16 prompts: ignis commits 4.241 tokens a round to the reference engine's 4.207 (BF16 KV) and 4.175 to 4.164 (hq-e8-2b); where the BF16 texts match, so do the counters.
 
 ## Question
 
@@ -127,7 +127,8 @@ Observed:
   hq-e8-2b, on the same prompts at the same settings.
 - At no draft position is ignis's rate under the reference's by more than 5%. The lowest ratios are position 2
   under BF16 (0.967) and position 3 under hq-e8-2b (0.970).
-- Where the two engines write the same BF16 text, they draft the same tokens, round for round.
+- Where the two engines write the same BF16 text (three prompts, 19 rounds), their counts of drafts proposed
+  and accepted are the same at every position.
 - Cut at the stop, as the served counters are, ignis's figure stays within 1.5% of the reference's (4.219 and
   4.146).
 
@@ -163,7 +164,7 @@ position, above.
 - Sixteen prompts and 2,655 to 2,808 generated tokens per engine and format. The texts part early on most prompts (on some at the
   first token), so the per-prompt and per-position figures compare different texts. The pooled figure, and
   the prompts whose texts match, are the comparison. Positions 4 to 7 carry about ±10% of that noise.
-- On three prompt-format pairs the texts part at the first generated token: math-greedy under both formats,
+- On four prompt-format pairs (three prompts) the texts part at the first generated token: math-greedy under both formats,
   regex under BF16, rust-sort under hq-e8-2b. That token is the target's pick from the prefill, before any
   draft, so the difference lies in the target's prefill numerics, not in the head. Whether each is a near tie
   was not probed.
