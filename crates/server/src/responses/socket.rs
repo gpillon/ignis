@@ -44,7 +44,6 @@ use axum::extract::State;
 use axum::http::header::{SEC_WEBSOCKET_PROTOCOL, UPGRADE};
 use axum::http::HeaderMap;
 use axum::response::Response;
-use serde_json::value::RawValue;
 use serde_json::{json, Map, Value as JsonValue};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -361,7 +360,7 @@ impl Connection {
             return self.send(error_event("invalid_request_error", "a frame must carry one JSON object event", None, &None));
         };
         match event.get("type").and_then(JsonValue::as_str) {
-            Some("response.create") => self.create(event, input::frame_text(text)),
+            Some("response.create") => self.create(event, text),
             Some("response.cancel") => self.cancel(&event),
             Some("response.steer") => self.send(coded_error(
                 400,
@@ -380,9 +379,9 @@ impl Connection {
         }
     }
 
-    /// `response.create`: checked and resolved now, started when its stream
-    /// and a place are free.
-    fn create(&mut self, event: Map<String, JsonValue>, text: Option<Box<RawValue>>) {
+    /// `response.create` (`frame`, the event as sent): checked and resolved
+    /// now, started when its stream and a place are free.
+    fn create(&mut self, event: Map<String, JsonValue>, frame: &str) {
         let stream: StreamKey = match api::optional_str(event.get("stream_id"), "stream_id") {
             Ok(None) => None,
             Ok(Some(id)) if valid_stream_id(id) => Some(id.to_owned()),
@@ -409,7 +408,7 @@ impl Connection {
         // The parent this request names, read even when the rest of the body
         // is not: a refused same-stream continuation evicts it.
         let named_parent = event.get("previous_response_id").and_then(JsonValue::as_str).map(str::to_owned);
-        match self.accept(event, text, &stream) {
+        match self.accept(event, frame, &stream) {
             Ok(job) => {
                 // Only an accepted request takes a name of the 32.
                 self.streams.entry(stream).or_default();
@@ -425,15 +424,20 @@ impl Connection {
         }
     }
 
-    /// A `response.create`'s body, checked, with the conversation it
-    /// continues — or the `error` event refusing it.
-    fn accept(&self, mut event: Map<String, JsonValue>, text: Option<Box<RawValue>>, stream: &StreamKey) -> Result<Job, JsonValue> {
+    /// A `response.create`'s body (`frame`, the event as sent), checked, with
+    /// the conversation it continues — or the `error` event refusing it.
+    fn accept(&self, mut event: Map<String, JsonValue>, frame: &str, stream: &StreamKey) -> Result<Job, JsonValue> {
         // `text` is not read from the parsed event: a value has sorted a
         // schema's keys, and the answer writes them in the order sent.
         event.remove("text");
         let mut body: CreateResponse = serde_json::from_value(JsonValue::Object(event))
             .map_err(|e| error_event("invalid_request_error", &format!("response.create: {e}"), None, stream))?;
-        body.text = text;
+        body.text = input::frame_text(frame);
+        // Nor are `tools`, once read from it: a strict tool's held calls
+        // write their arguments in its `parameters`' order as sent (#613).
+        if body.tools.is_some() {
+            body.tools = input::frame_tools(frame).or(body.tools);
+        }
         let warm_up = api::optional_bool(body.generate.as_ref(), "generate")
             .map_err(|message| error_event("invalid_request_error", &message, Some("generate"), stream))?
             .is_some_and(|generate| !generate);

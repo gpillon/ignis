@@ -96,8 +96,8 @@ The measured figures are in
   answer starts and never after; a forced `tool_choice` forces the call.
   `openai_http_fields strict_on_a_function_tool` pins `strict` on a function
   tool inert where no grammar holds the answers (its template has none), on
-  chat completions and the Responses API; on the 27B chat completions hold it
-  (#611, below). Against a
+  chat completions and the Responses API; on the 27B both hold it (#611,
+  #613, below). Against a
   strict schema the script writes key names of its own, an enum in the wrong
   case, numbers out of range, a missing key, an extra key, a string its
   pattern refuses and a date in words: each answer is checked by hand and by
@@ -121,8 +121,8 @@ The measured figures are in
   stream assembles to); a call the first token writes is counted once, not
   again by the first-token probe; under `parallel_tool_calls: false` (#609)
   only the block that ends the turn is counted, a dropped one included;
-  strict tools outside the subset are counted as they arrive, refused on chat
-  completions (#611) and served on the Responses API; a value cut at a
+  strict tools outside the subset are counted as they arrive, and refused on
+  chat completions (#611) and on the Responses API (#613); a value cut at a
   `</parameter>` line, whose text after it the parser dropped and the
   confirmed close would keep, is counted split (#610), and a plain value, the
   residue and a close with its required parameter missing are not.
@@ -224,11 +224,18 @@ repaired from the verify pass's scores, as a plain round's draw is.
   held_tools_http`, about 1 s): the scripts that miss on purpose come out
   valid, each with its repairs counted under `type="tool"`; each refusal by
   code and `param`; the schema's key order; a free tool beside a strict one;
-  no strict tool, no grammar; streaming; a cap; the reasoning free. Beside
-  the fields that shape a turn (#615): a `"required"` and a named forced
-  call missing after its opening, valid, the forced tokens no miss; beside
-  `response_format` a held call, or an answer valid under the schema, both
-  counted under `type="json_schema"`; with thinking on a call written in the
+  no strict tool, no grammar; streaming; a cap; the reasoning free. On the
+  Responses API (#613), over HTTP whole and streamed and over the WebSocket
+  mode, whose frame `tools` are read again from its text: the same scripts
+  come out the same valid calls in the schema's order, repairs counted, a
+  streamed call in one arguments delta; each refusal names the flat tool
+  (`tools[1].parameters`), or the chat path for a tool sent in the chat
+  shape, as a 400 and as the socket's `error` event; a tool with
+  `strict: false` or none is held to nothing. Beside the fields that shape
+  a turn (#615): a `"required"` and a named forced call missing after its
+  opening, valid, the forced tokens no miss; beside `response_format` a held
+  call, or an answer valid under the schema, both counted under
+  `type="json_schema"`; with thinking on a call written in the
   reasoning neither held nor parsed; under `parallel_tool_calls: false` a
   value holding `</tool_call>` delivered whole, the turn ended at the
   confirmed close. The byte-identity of requests with no strict tool is the

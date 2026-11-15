@@ -39,8 +39,7 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
 - **What it cannot do is refused**, with OpenAI's error and a `param`, never
   ignored where ignoring it would change the answer: tools that are not
   functions, `background: true`, and an input item of another type. `store`,
-  `metadata`, `prompt_cache_key`, `service_tier`, a function tool's `strict`
-  (its call's arguments are not held to its `parameters`, GitHub #582) and
+  `metadata`, `prompt_cache_key`, `service_tier` and
   the like are accepted and change nothing; `include: ["reasoning.encrypted_content"]` adds the
   reasoning as the model saw it ([Chat completions](chat-completions.md)). ignis stores no response, so `previous_response_id` on
   HTTP is a `400 previous_response_not_found`.
@@ -51,6 +50,21 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   limits, and the schema described to the model unless
   `ignis_describe_schema` is `false`
   ([Structured output](structured-output.md)).
+- **`strict: true` on a function tool holds its calls**, from 0.11.0, on the
+  27B (earlier versions accept it and change nothing): `strict` sits flat
+  beside the tool's `name`, and every call to such a strict tool names a
+  tool the request declares and carries `arguments` valid under its
+  `parameters`, in the order you sent its `properties` in, over HTTP and over
+  the WebSocket mode, with chat completions' guarantees, refusals and metrics
+  ([Held tools](structured-output.md#held-tools-strict-true)). A streamed
+  call arrives once complete, its arguments in one
+  `response.function_call_arguments.delta`. A strict schema outside
+  OpenAI's strict subset is a `400` before anything is generated, its
+  `param` the tool's field where you sent it: `tools[1].parameters`, or
+  `tools[1].function.parameters` for a tool in the chat shape; the WebSocket
+  mode answers the same refusal as an `error` event. `false`, `null` and
+  absent serve the tool as before, and on Flash-Next `strict` is accepted
+  and inert (GitHub #581).
 - A length stop ends `incomplete` (`max_output_tokens`), an engine error
   `failed`; `usage` carries `input_tokens_details.cached_tokens` and
   `output_tokens_details.reasoning_tokens`.

@@ -1526,41 +1526,11 @@ pub(crate) struct HeldTools {
     /// the reasoning's `</think>` with thinking on.
     pub grammar: ignis_core::structured::AnswerGrammar,
     /// The same grammar as compiled, which a structured answer beside the
-    /// tools hands the call its turn opens to (#615, [`turn_grammar`]).
+    /// tools hands the call its turn opens to (#615, [`held_content`]).
     calls: Arc<ignis_grammar::ToolCallGrammar>,
     /// The held tools by name, as every scanner of the response reads their
     /// calls ([`ToolSchemas::holding`]).
     pub held: std::collections::HashMap<String, ignis_grammar::call::Parameters>,
-}
-
-/// The grammar a turn's content is held to, and the schema description its
-/// prompt carries, from the answer its format asks for ([`structured_output`])
-/// and its held tools ([`held_tools`]): one rule for every surface that
-/// serves strict tools (GitHub #615, ADR 0094).
-///
-/// - An answer alone, or the held tools alone, is held to its own grammar.
-///   The held tools' holds every turn that may call them: `tool_choice`
-///   `"auto"`, `"required"` or a named function, whose forced literal opens
-///   the call and whose tokens the grammar follows (#286), and
-///   `parallel_tool_calls: false`, whose turn ends at the call's confirmed
-///   close.
-/// - An answer beside held tools: until the answer starts, the call's opener
-///   releases the turn from the answer's grammar (#592), and the call is held
-///   to the tool calls' grammar, which holds the rest of the turn, its text
-///   free and each further call held. A forced call's turn has no answer
-///   ([`hold_answer`]): the tools' grammar holds it alone. The request counts
-///   under the answer's `type` in the structured-output metrics and the
-///   request log, the call's misses and repairs included.
-pub(crate) fn turn_grammar(
-    answer: Option<HeldAnswer>,
-    tools: Option<&HeldTools>,
-) -> (Option<ignis_core::structured::AnswerGrammar>, Option<String>) {
-    match (answer, tools) {
-        (Some(answer), Some(tools)) => (Some(answer.grammar.holding_calls(tools.calls.clone())), answer.description),
-        (Some(answer), None) => (Some(answer.grammar), answer.description),
-        (None, Some(tools)) => (Some(tools.grammar.clone()), None),
-        (None, None) => (None, None),
-    }
 }
 
 /// The held tools of a request whose resolved `tools` are these (none
@@ -1572,7 +1542,7 @@ pub(crate) fn turn_grammar(
 /// Every strict tool is compiled when the request arrives, and the tool
 /// calls' grammar with them, once per distinct set of tools
 /// ([`ignis_grammar::GrammarCache::tool_calls`]); the content is held to it
-/// ([`turn_grammar`]), the function name of every call to the request's
+/// ([`held_content`]), the function name of every call to the request's
 /// declared tools, and each strict tool's arguments to its `parameters`, in
 /// the key order the client sent them. Refused with a 400 before anything is
 /// generated, naming the tool's field in `param`: a strict schema outside
@@ -1607,7 +1577,7 @@ pub(crate) fn held_tools(
             ToolField::Name => "name",
             ToolField::Parameters => "parameters",
         };
-        let param = format!("tools[{}].function.{field}", refused.tool);
+        let param = tool_member(raw, refused.tool, field);
         let refusal = refused.refusal;
         error_response_naming(
             StatusCode::BAD_REQUEST,
@@ -1626,7 +1596,7 @@ pub(crate) fn held_tools(
         true => match active.template.encode_literal(crate::thinking::THINK_END_TEXT).filter(|ids| ids.len() == 1) {
             Some(ids) => content.after(ids[0]),
             None => {
-                let param = format!("tools[{first}].function.strict");
+                let param = tool_member(raw, first, "strict");
                 return Err(error_response_naming(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
@@ -1645,8 +1615,77 @@ pub(crate) fn held_tools(
 /// tool's when it sent none ([`normalize_tool`]).
 fn strict_parameters(raw: Option<&ignis_grammar::json::Json>, normalized: &JsonValue) -> String {
     use ignis_grammar::json::Json;
-    let sent = raw.and_then(|tool| tool.get("function")?.get("parameters")).filter(|parameters| **parameters != Json::Null);
+    let sent = raw.and_then(|tool| sent_function(tool).get("parameters")).filter(|parameters| **parameters != Json::Null);
     sent.map(Json::compact).unwrap_or_else(|| normalized["function"]["parameters"].to_string())
+}
+
+/// A tool's function as the client sent it: the tool's `function` in chat
+/// completions' shape, the tool itself in the Responses API's, whose
+/// function tools are flat and which takes one in the chat shape as it is
+/// (GitHub #613).
+fn sent_function(tool: &ignis_grammar::json::Json) -> &ignis_grammar::json::Json {
+    tool.get("function").unwrap_or(tool)
+}
+
+/// Where the function `member` of the request's `index`th tool sits in the
+/// body as sent, as a refusal's `param` names it: `tools[1].function.name`
+/// in chat completions' shape, `tools[1].name` in the Responses API's flat
+/// one ([`sent_function`]).
+fn tool_member(raw: &[ignis_grammar::json::Json], index: usize, member: &str) -> String {
+    match raw.get(index).is_some_and(|tool| tool.get("function").is_none()) {
+        true => format!("tools[{index}].{member}"),
+        false => format!("tools[{index}].function.{member}"),
+    }
+}
+
+/// What a request's content is held to, and how its response reads its
+/// calls, on chat completions and the Responses API alike (GitHub #591,
+/// #611, #613, #615, ADR 0094): the answer under its format (`answer`, from
+/// [`structured_output`]), its strict tools' calls ([`held_tools`]), or
+/// both, by [`held_content`].
+pub(crate) struct HeldContent {
+    /// The grammar the content is held to, if any.
+    pub grammar: Option<ignis_core::structured::AnswerGrammar>,
+    /// The schema description the prompt carries ([`HeldAnswer::description`]).
+    pub description: Option<String>,
+    /// The request's tools as every scanner of its response reads their
+    /// calls, a held tool's by the confirmed close ([`ToolSchemas::holding`]).
+    pub schemas: ToolSchemas,
+}
+
+/// The [`HeldContent`] of a request whose answer is `answer`, whose
+/// resolved `tools` are these, `raw` the same tools as sent: one rule for
+/// every surface that serves strict tools (GitHub #615, ADR 0094).
+///
+/// - An answer alone, or the strict tools alone, is held to its own
+///   grammar. The tools' holds every turn that may call them: `tool_choice`
+///   `"auto"`, `"required"` or a named function, whose forced literal opens
+///   the call and whose tokens the grammar follows (#286), and
+///   `parallel_tool_calls: false`, whose turn ends at the call's confirmed
+///   close, where the scanner holding the tool closes it.
+/// - An answer beside strict tools: until the answer starts, the call's
+///   opener releases the turn from the answer's grammar (#592), and the call
+///   is held to the tool calls' grammar, which holds the rest of the turn,
+///   its text free and each further call held. A forced call's turn has no
+///   answer ([`hold_answer`]): the tools' grammar holds it alone. The request
+///   counts under the answer's `type` in the structured-output metrics and
+///   the request log, the call's misses and repairs included.
+pub(crate) fn held_content(
+    server: &Server,
+    answer: Option<HeldAnswer>,
+    raw: &[ignis_grammar::json::Json],
+    tools: &[JsonValue],
+    thinking: &ThinkingOptions,
+) -> Result<HeldContent, Response> {
+    let held_tools = held_tools(server, raw, tools, thinking)?;
+    let (grammar, description) = match (answer, &held_tools) {
+        (Some(answer), Some(held)) => (Some(answer.grammar.holding_calls(held.calls.clone())), answer.description),
+        (Some(answer), None) => (Some(answer.grammar), answer.description),
+        (None, Some(held)) => (Some(held.grammar.clone()), None),
+        (None, None) => (None, None),
+    };
+    let held = held_tools.map(|held| held.held).unwrap_or_default();
+    Ok(HeldContent { grammar, description, schemas: ToolSchemas::from_tools(tools).holding(held) })
 }
 
 /// A JSON value read once into the two shapes the handler needs:
@@ -1655,6 +1694,7 @@ fn strict_parameters(raw: Option<&ignis_grammar::json::Json>, normalized: &JsonV
 /// a strict tool's `parameters`, whose order its held calls' arguments
 /// follow (GitHub #611). Read by the same deserializer as a
 /// `serde_json::Value`, with the same nesting bound and the same errors.
+#[derive(Clone)]
 pub(crate) struct Sent {
     pub value: JsonValue,
     pub ordered: ignis_grammar::json::Json,
@@ -3228,18 +3268,15 @@ async fn chat_completions(
         Ok(held) => held,
         Err(response) => return response,
     };
-    // GitHub #611, #615: strict tools' calls are held on every turn that
-    // may call them, beside the answer's grammar too.
-    let held_tools = match held_tools(&server, raw_tools.as_deref().unwrap_or_default(), &tools, &thinking) {
-        Ok(held_tools) => held_tools,
-        Err(response) => return response,
-    };
-    let (grammar, description) = turn_grammar(held, held_tools.as_ref());
+    let HeldContent { grammar, description, schemas } =
+        match held_content(&server, held, raw_tools.as_deref().unwrap_or_default(), &tools, &thinking) {
+            Ok(content) => content,
+            Err(response) => return response,
+        };
     let (model, class) = match resolve_model_and_class(req.model, req.class) {
         Ok(x) => x,
         Err(message) => return bad_request(&message),
     };
-    let schemas = ToolSchemas::from_tools(&tools).holding(held_tools.map(|held| held.held).unwrap_or_default());
     // The pipeline that delivers the response checks its calls (#608); the
     // first-token probe's copy below does not.
     let check = CallCheck::new(&tools, server.metrics.as_ref());

@@ -644,6 +644,8 @@ A strict tool (`strict: true`) is held on the 27B from 0.11.0, and its schema
 is read as `response_format`'s is under `strict: true`: one outside OpenAI's
 strict subset answers with the same `code`, and a message naming the keyword
 and where, ``tools[1].function.parameters: strict tool refused, `minLength` at #/properties/a: `minLength` is outside the strict subset``.
+The Responses API holds strict tools too, and there the `param` names the flat
+tool: `tools[i].parameters`, `tools[i].name`.
 Agent SDKs that send `strict: true` close their objects and require every
 property; a hand-written schema often does neither
 (`additional_properties_not_false`, `not_all_required`). A tool the model's

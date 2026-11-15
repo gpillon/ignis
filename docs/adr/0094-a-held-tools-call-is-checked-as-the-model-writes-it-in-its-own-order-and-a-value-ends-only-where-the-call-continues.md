@@ -138,7 +138,7 @@ and repairs a miss, and it does not write the call's envelope for the model.
       each (#615, below).
   - A schema that cannot be normalized leaves the tool free, and the response echoes `strict: false`, as
     OpenAI's fallback does. It is never a 400.
-- **Beside the fields that shape a turn's calls (#615).** One rule, `api::turn_grammar`, composes a turn's grammar
+- **Beside the fields that shape a turn's calls (#615).** One rule, `api::held_content`, composes a turn's grammar
   from its answer's and its held tools', for every surface that serves strict tools.
   - `tool_choice` `"required"` or a named function: #286's forced literal opens the call, and the tool calls'
     grammar holds what follows. The literal's tokens are the server's text: the scheduler feeds each to the
@@ -170,3 +170,11 @@ and repairs a miss, and it does not write the call's envelope for the model.
   - A held call's misses and repairs are structured output's: ADR 0089's three counters gain the `type` value
     `tool` (this ADR's amendment of ADR 0017 and ADR 0089), the Playground Monitor's Structured output card
     counts them, and the request's log line carries `structured.type = "tool"` with its misses and repairs.
+
+**On the Responses API (#613).** A strict tool, `strict` flat beside its name there, is held as on chat
+completions, through the same code, over HTTP and over the WebSocket mode, with the same refusals, metrics and
+log fields. A refusal's `param` names the tool's field where the request sent it: `tools[i].parameters`,
+`tools[i].name` and `tools[i].strict` for a flat tool, the chat paths for a tool sent in the chat shape, which
+the Responses API takes as it is. The WebSocket mode parses a frame into a value, which sorts its keys, so it
+reads the frame's `tools` again from its text, as it already read `text`. With `strict` honoured on both surfaces,
+the field contract lists it as inert on neither.
