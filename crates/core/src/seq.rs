@@ -557,6 +557,33 @@ fn kv_capture_last_error() -> String {
     msg.to_string_lossy().into_owned()
 }
 
+/// What a pool of `cfg` carries for a load's speculative backend (GitHub
+/// #619): the backend the leaf's pool spec names, whose slot sections the
+/// leaf lays out by it, and the attention layers the drafter adds to the
+/// paged KV. Flash-Next's MTP head keeps no drafter window: its state is one
+/// more attention layer of the pool, its KV, indexer and hq window carried
+/// like the trunk's (GitHub #307). The 27B's pool names the load's drafter
+/// as it is, and no drafter the 27B accepts adds a layer.
+fn pool_drafter(cfg: &ModelConfig, speculative_backend: Option<crate::SpeculativeBackend>) -> (i32, u32) {
+    match (cfg.family, speculative_backend) {
+        (_, None) => (0, 0),
+        (crate::compute::ModelFamily::FlashNext, Some(crate::SpeculativeBackend::Mtp)) => (0, 1),
+        (_, Some(backend)) => (backend.abi_code(), 0),
+    }
+}
+
+/// The paged KV a pool of `cfg` holds for a load with `speculative_backend`
+/// (GitHub #619): the topology's attention layers and any the load's drafter
+/// adds -- the geometry the pool's page bytes, and so the tokens a KV budget
+/// buys, are planned against.
+pub fn kv_geometry(cfg: &ModelConfig, speculative_backend: Option<crate::SpeculativeBackend>) -> crate::KvGeometry {
+    let topology = cfg.kv_geometry();
+    crate::KvGeometry {
+        gqa_layers: topology.gqa_layers + pool_drafter(cfg, speculative_backend).1,
+        ..topology
+    }
+}
+
 /// The leaf's pool spec for `cfg`, `budget` and a speculative backend.
 fn pool_spec(
     cfg: &ModelConfig,
@@ -575,17 +602,10 @@ fn pool_spec(
         gdn_value_heads: cfg.gdn_value_heads as u32,
         gdn_head_dim: cfg.gdn_head_dim as u32,
         vocab: cfg.vocab as u32,
-        // Flash-Next's MTP head keeps no drafter window: its state is the
-        // attention section below.
-        speculative_backend: speculative_backend
-            .filter(|&b| b != crate::SpeculativeBackend::Mtp)
-            .map_or(0, |b| b.abi_code()),
+        speculative_backend: pool_drafter(cfg, speculative_backend).0,
         retained_slot_count: budget.retained_slot_count,
         retained_host_slot_count: budget.retained_host_slot_count,
-        // GitHub #307: an MTP load's head is one more attention layer of the
-        // pool -- its KV, indexer and hq window carried like the trunk's.
-        kv_num_layers: cfg.attention_layer_count() as u32
-            + u32::from(speculative_backend == Some(crate::SpeculativeBackend::Mtp)),
+        kv_num_layers: kv_geometry(cfg, speculative_backend).gqa_layers,
         indexer_key_dim: cfg.indexer.map_or(0, |i| (i.kv_heads * i.head_dim) as u32),
         indexer_compress_tokens: cfg.indexer.map_or(0, |i| i.compress_ratio as u32),
         ngram_conv_columns: cfg.ngram.map_or(0, |n| n.conv_state_tokens() as u32),
@@ -1809,6 +1829,44 @@ mod tests {
         let mtp = pool_spec(&ModelConfig::qwen38_flash_next(), &budget, Some(crate::SpeculativeBackend::Mtp));
         assert_eq!((mtp.kv_num_layers, mtp.speculative_backend), (13, 0));
         assert_eq!((flash.gdn_num_layers, flash.gdn_value_heads), (36, 48));
+    }
+
+    /// GitHub #619: a 27B pool names the load's drafter, whose slot sections
+    /// the leaf lays out by it, and holds the target's 16 attention layers
+    /// whatever drafts; a Flash-Next pool keeps its own rule, its MTP head one
+    /// more attention layer and no drafter named.
+    #[test]
+    fn a_pool_names_the_loads_drafter_and_its_attention_layers() {
+        use crate::SpeculativeBackend::{Dflash2, Mtp, VerifyOnly};
+        let budget = SeqPoolBudget {
+            kv_format: crate::KvFormat::HqE8_2b,
+            kv_page_group_count: 8,
+            max_context_tokens: 512,
+            slot_count: 3,
+            retained_slot_count: 0,
+            retained_host_slot_count: 0,
+        };
+        let spec = |cfg: &ModelConfig, backend| {
+            let spec = pool_spec(cfg, &budget, backend);
+            (spec.speculative_backend, spec.kv_num_layers)
+        };
+        let dense = ModelConfig::qwen38_27b();
+        assert_eq!(spec(&dense, None), (0, 16));
+        assert_eq!(spec(&dense, Some(Dflash2)), (1, 16));
+        assert_eq!(spec(&dense, Some(VerifyOnly)), (2, 16));
+        // A 27B pool asked for MTP names it, and the leaf's pool spec refuses
+        // the backend by value, as the 27B's load refuses MTP by name.
+        assert_eq!(spec(&dense, Some(Mtp)), (3, 16));
+        let flash = ModelConfig::qwen38_flash_next();
+        assert_eq!(spec(&flash, None), (0, 12));
+        assert_eq!(spec(&flash, Some(Mtp)), (0, 13));
+        assert_eq!(spec(&flash, Some(VerifyOnly)), (2, 12));
+        // The geometry a load's KV pool is planned against is the one the pool
+        // holds: the 27B's 16 layers of 4 KV heads of 256 whatever drafts.
+        for backend in [None, Some(Dflash2), Some(VerifyOnly), Some(Mtp)] {
+            assert_eq!(kv_geometry(&dense, backend), crate::KvGeometry::qwen38_27b(), "{backend:?}");
+            assert_eq!(kv_geometry(&flash, backend).gqa_layers, spec(&flash, backend).1, "{backend:?}");
+        }
     }
 
     /// GitHub #302: a Flash-Next pool carries the indexer's 128-wide keys of

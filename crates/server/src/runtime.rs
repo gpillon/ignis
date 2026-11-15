@@ -1214,7 +1214,6 @@ pub fn qwen27b_load(
     // the plan's `cuda_context` line is that figure.
     let (start, mut device) = ignis_runtime::plan_start(ignis_core::compute::ModelFamily::Qwen38_27b)?;
     let free_at_start_bytes = start.free_at_start_bytes;
-    let geometry = ignis_core::KvGeometry::qwen38_27b();
     // ADR 0063 §3: the plan at the shape's values, and when it refuses them
     // below its minimum, at each adaptation's in turn -- the leaf's lines
     // planned again at the attempt's context (the hq prompt planes, the rope
@@ -1239,7 +1238,8 @@ pub fn qwen27b_load(
             mode: shape.vram,
             free_at_start_bytes,
             lines: vram_lines(plan.device_capacity_bytes, start.context.bytes, reservations.reserved),
-            kv_page_bytes: shape.kv_format.page_bytes(geometry),
+            // GitHub #619: the pool's geometry under the load's drafter.
+            kv_page_bytes: shape.kv_format.page_bytes(planning.kv_geometry()),
             max_context_tokens: shape.max_context,
             // Every retained slot keeps one tail page, whichever kind it is.
             retained_slots: shape.retained_slots(),
@@ -1268,6 +1268,7 @@ pub fn qwen27b_load(
     })?;
     let shape = shape.at(adapted.attempt);
     let (vram, reservations) = adapted.plan;
+    let geometry = leaf_config_for_shape(shape, 0).kv_geometry();
     let index = bound_index(&bound, model_scope_27b(&shape)).expect("the kept plan's scope is bound");
     let BoundScope { plan, handles, .. } = bound.swap_remove(index);
     // Only where the scratch is the prefill chunk's: a wider solo width is

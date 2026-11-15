@@ -31,7 +31,7 @@ use ignis_core::model_load::{self, Model};
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step::capture_decode_graphs;
 use ignis_core::{
-    plan_vram, ExceptionWeights, KvFormat, KvGeometry, ModelConfig, PrefillAttention, Residency, VramRequest,
+    plan_vram, ExceptionWeights, KvFormat, ModelConfig, PrefillAttention, Residency, VramRequest,
 };
 use ignis_runtime::CudaLeafConfig;
 
@@ -95,7 +95,7 @@ pub fn load(reader: &Reader, shape: LoadShape) -> Result<Loaded, String> {
     let reservations = planning.plan_reservations(reader, &bound, &handles)?;
     planning.kv_pool_arena_bytes(1)?;
     let kv_arena_bytes = |pages: u32| planning.kv_pool_arena_bytes(pages).unwrap_or(u64::MAX);
-    let geometry = KvGeometry::qwen38_27b();
+    let geometry = planning.kv_geometry();
     let format = planning.kv_format;
     let plan = plan_vram(&VramRequest {
         mode: shape.vram,

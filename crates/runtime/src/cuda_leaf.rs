@@ -234,6 +234,14 @@ impl Drop for CudaLeaf {
 }
 
 impl CudaLeafConfig {
+    /// The paged KV this load's pool holds (GitHub #619): the 27B's
+    /// attention layers and any the load's drafter adds
+    /// (`ignis_core::seq::kv_geometry`, the rule the pool itself is built
+    /// by). Every plan of the pool's pages and tokens reads it.
+    pub fn kv_geometry(&self) -> KvGeometry {
+        ignis_core::seq::kv_geometry(&ModelConfig::qwen38_27b(), self.speculation.map(|s| s.backend()))
+    }
+
     /// What this config's byte budget buys under its format: the pool the
     /// leaf will build and the token capacity it holds.
     ///
@@ -245,7 +253,7 @@ impl CudaLeafConfig {
     pub fn kv_pool_plan(&self) -> Result<KvPoolPlan, ignis_core::KvBudgetTooSmall> {
         plan_kv_pool_for_context(
             self.kv_format,
-            KvGeometry::qwen38_27b(),
+            self.kv_geometry(),
             self.kv_pool_bytes,
             self.max_context_tokens,
         )
@@ -1456,6 +1464,29 @@ mod tests {
                 plain.kv_pool_plan().expect("plan"),
                 "{format:?}"
             );
+        }
+    }
+
+    /// GitHub #619: the pool a 27B load's KV budget buys is planned from the
+    /// load's drafter, and no drafter the 27B accepts moves it: the same 16
+    /// layers, pages and tokens under DFlash2, the verify substrate alone and
+    /// no speculation, for every format.
+    #[test]
+    fn the_27bs_drafters_leave_the_kv_pool_as_it_is() {
+        for format in [KvFormat::Bf16, KvFormat::HqE8_2b] {
+            let plain = CudaLeafConfig {
+                kv_format: format,
+                ..CudaLeafConfig::default()
+            };
+            assert_eq!(plain.kv_geometry(), KvGeometry::qwen38_27b());
+            for backend in [ignis_core::SpeculativeBackend::Dflash2, ignis_core::SpeculativeBackend::VerifyOnly] {
+                let speculative = CudaLeafConfig {
+                    speculation: Some(ignis_core::Speculation::new(backend, 7).expect("in range")),
+                    ..plain
+                };
+                assert_eq!(speculative.kv_geometry(), KvGeometry::qwen38_27b(), "{backend:?}");
+                assert_eq!(speculative.kv_pool_plan().expect("plan"), plain.kv_pool_plan().expect("plan"), "{backend:?}");
+            }
         }
     }
 
