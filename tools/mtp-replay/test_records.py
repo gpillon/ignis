@@ -67,6 +67,23 @@ def test_acceptance_by_position_follows_the_accepted_count():
     assert records.accepted_at(rows)[1].tolist() == [True, True] + [False] * 5
 
 
+def test_a_turns_last_round_tests_only_the_drafts_the_recording_reaches():
+    # A turn of 10 tokens from 100: a full round at 100, then one at 108 with a token left after
+    # its anchor (109), and one at 109 with none.
+    manifest = {"jobs": [{"job": "j000", "turns": [{"turn": 5, "start": 100, "end": 110}]}]}
+    rows = np.zeros(3, records.RECORD)
+    rows["job"], rows["turn"], rows["window"], rows["extent"] = 0, 5, 7, 7
+    rows["anchor"] = [100, 108, 109]
+    rows["accepted"] = [3, 1, 0]
+    tested = records.tested_at(rows, manifest)
+    np.testing.assert_array_equal(tested.sum(1), [7, 1, 0])
+    # Every accepted draft was tested; the last round's later drafts are untested, not rejected.
+    assert not (records.accepted_at(rows) & ~tested).any()
+    # A round at a narrower window or extent tests no more than it drafted.
+    rows["window"] = 3
+    np.testing.assert_array_equal(records.tested_at(rows, manifest).sum(1), [3, 1, 0])
+
+
 def test_load_reads_the_finished_jobs_only(tmp_path):
     out = tmp_path / "out"
     out.mkdir()

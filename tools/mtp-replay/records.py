@@ -51,3 +51,16 @@ def accepted_at(rows):
     """Per round and draft position s (0-based), whether the recording accepted draft s + 1:
     a bool [rounds, K], False past the round's window."""
     return np.arange(K)[None, :] < rows["accepted"][:, None]
+
+
+def tested_at(rows, manifest):
+    """Per round and draft position s (0-based), whether the recording had a token for draft s + 1
+    to be held to: s below the round's window, its extent and the tokens its turn has left after the
+    anchor. A turn's last round compares the drafts past the turn's end with the pad, which takes
+    none of them: those are untested, not rejected. A bool [rounds, K]; acceptance by position is
+    `accepted_at` over `tested_at`."""
+    ends = {(j, t["turn"]): t["end"] for j, job in enumerate(manifest["jobs"]) for t in job["turns"]}
+    end = np.array([ends[(int(r["job"]), int(r["turn"]))] for r in rows], dtype=np.int64)
+    left = end - rows["anchor"].astype(np.int64) - 1
+    bound = np.minimum(np.minimum(rows["window"], rows["extent"]).astype(np.int64), left)
+    return np.arange(K)[None, :] < bound[:, None]
