@@ -246,8 +246,9 @@ each turn either calls a tool or answers under the schema.
   [told the schema](#the-schema-described-to-the-model). `"none"` keeps the
   tools from the model, and every turn answers under the schema.
 
-A strict tool's calls on such a turn are the model's own for now (GitHub
-#615); a turn without `response_format` holds them, as the next section says.
+A call to a strict tool is the exception, forced or not: the turn is
+released from the schema all the same, and the call is held to its tool
+([Beside `tool_choice`, `response_format` and `parallel_tool_calls`](#beside-tool_choice-response_format-and-parallel_tool_calls)).
 
 ## Held tools: `strict: true`
 
@@ -296,10 +297,6 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
 - **A tool without `strict`** in the same request keeps its arguments as the
   model writes them. With a strict tool in the request, every call's
   function name is held to the request's tools.
-- **Checked, not held yet**: with `tool_choice: "required"` or a named
-  function, beside `response_format`, or with `parallel_tool_calls: false`,
-  a strict tool is checked when the request arrives (the refusals below),
-  and its calls are served as the model writes them (GitHub #615).
 - **A request with no strict tool** is served as before, byte for byte.
 - **On Qwen3.8-Flash-Next**, `strict` is accepted and inert for now (GitHub
   #581).
@@ -381,6 +378,40 @@ arrives with the `arguments`
 `{"line":12,"dry_run":false,"change":{"edits":[{"old":"x","new":"y"}]},"note":null}`
 when its `properties` are sent in that order: `line`, `dry_run`, `change`,
 `note`.
+
+### Beside `tool_choice`, `response_format` and `parallel_tool_calls`
+
+A strict tool's calls are held on every turn that may call it, whatever else
+the request asks of the turn.
+
+- **`tool_choice: "required"` or a named function**: the forced opening
+  ([Chat completions](chat-completions.md)) opens the call, and the grammar
+  holds everything after it, the parameters included, the function's name
+  too under `"required"`. The forced tokens are the server's text, never a
+  miss. With thinking on the opening is forced after the reasoning closes;
+  when the model has already opened the call itself there, and what it
+  wrote is not how the opening goes on (a line break more, say), the server
+  stops forcing and the grammar holds the rest: the call names one of the
+  request's tools, though not always the one a named `tool_choice` named.
+- **`response_format` beside strict tools**: until the answer starts,
+  `<tool_call>` releases the turn from the schema, as
+  [above](#tools-beside-structured-output), and the call is held to its
+  tool. The turn stays released after it: its text is free, and every
+  further call in it is held the same way. A turn that answers is held to
+  the schema. The request counts under the answer's type, `json_schema` or
+  `json_object`, in the metrics and the request log, the call's misses and
+  repairs included.
+- **Thinking on**: the reasoning stays free, and a call written there is
+  neither held nor read as a call; the hold starts at the first call after
+  the reasoning's `</think>`.
+- **`parallel_tool_calls: false`**: the turn ends at the call's own close,
+  `</function>` then `</tool_call>` once every required parameter is
+  written, not at the first `</tool_call>` the model writes: a string value
+  may hold `</tool_call>` on a line of its own, and is delivered whole.
+  Nothing generated after the close reaches you or counts in `usage`.
+
+The Responses API holds them the same way, `text.format` in place of
+`response_format`, over HTTP and over the WebSocket mode.
 
 ## On the Responses API
 

@@ -284,12 +284,10 @@ pub(crate) async fn prepare(
     let format = api::text_answer_format(req.text.as_deref());
     let held = api::structured_output(server, format, "text.format", req.ignis_describe_schema.as_ref(), &thinking, &tools, &tool_choice)?
         .filter(|_| !warm_up);
-    // A strict tool's calls are held as on chat completions (GitHub #613);
-    // its refusals come before anything is rendered or generated, and a
-    // warm-up holds no grammar.
-    let one_call = req.parallel_tool_calls == Some(false);
-    let api::HeldContent { grammar, description, schemas } =
-        api::held_content(server, held, &raw_tools, &tools, &tool_choice, one_call, &thinking)?;
+    // A strict tool's calls are held as on chat completions (GitHub #613,
+    // #615); its refusals come before anything is rendered or generated, and
+    // a warm-up holds no grammar.
+    let api::HeldContent { grammar, description, schemas } = api::held_content(server, held, &raw_tools, &tools, &thinking)?;
     let (grammar, description) = (grammar.filter(|_| !warm_up), description.filter(|_| !system_only));
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
         .map_err(|message| api::bad_request(&message))?;

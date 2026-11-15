@@ -205,9 +205,20 @@ async fn tool_counts(server: &Server, requests: u64, misses: u64) {
 
 /// [`tool_counts`] in `metrics`.
 async fn counted(metrics: &ignis_server::metrics::Metrics, requests: u64, misses: u64) {
-    responses::metric_reaches(metrics, &format!("ignis_structured_requests_total{{type=\"tool\"}} {requests}")).await;
+    counted_as(metrics, "tool", requests, misses).await;
+}
+
+/// The structured-output counts of `kind` once the request is done, each
+/// miss repaired.
+async fn structured_counts(server: &Server, kind: &str, requests: u64, misses: u64) {
+    counted_as(server.metrics.as_ref().unwrap(), kind, requests, misses).await;
+}
+
+/// [`structured_counts`] in `metrics`.
+async fn counted_as(metrics: &ignis_server::metrics::Metrics, kind: &str, requests: u64, misses: u64) {
+    responses::metric_reaches(metrics, &format!("ignis_structured_requests_total{{type=\"{kind}\"}} {requests}")).await;
     let exposition = metrics.render();
-    for line in [format!("ignis_structured_misses_total{{type=\"tool\"}} {misses}"), format!("ignis_structured_repairs_total{{type=\"tool\"}} {misses}")] {
+    for line in [format!("ignis_structured_misses_total{{type=\"{kind}\"}} {misses}"), format!("ignis_structured_repairs_total{{type=\"{kind}\"}} {misses}")] {
         assert!(exposition.contains(&format!("\n{line}\n")), "no `{line}` in:\n{exposition}");
     }
 }
@@ -522,6 +533,160 @@ async fn the_reasoning_is_free_and_the_content_after_it_held() {
     tool_counts(&server, 1, 1).await;
 }
 
+// ── GitHub #615: beside `tool_choice`, `response_format` and
+// `parallel_tool_calls` ──────────────────────────────────────────────────
+
+/// `chat`'s request with `field` (its JSON) added.
+fn chat_with(tools: &[&str], stream: bool, max_tokens: u32, field: &str) -> String {
+    chat(tools, stream, max_tokens).replacen("\"tools\"", &format!("{field},\"tools\""), 1)
+}
+
+/// `"required"`'s forced opening, `<tool_call>` to `function`.
+const REQUIRED_OPENING: &str = "<tool_call>\n<function";
+
+/// `response_format` asking for `{"ok": <boolean>}`.
+const FORMAT: &str = r#""response_format":{"type":"json_schema","json_schema":{"name":"done","strict":true,"schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}}}"#;
+
+/// Text of as many tokens as `forced` encodes to: what the model would have
+/// written where the server forces it.
+fn in_place_of(forced: &str) -> String {
+    "Sure, I will ".chars().cycle().take(encode(forced).len()).collect()
+}
+
+/// A call forced by `tool_choice`, `"required"` or named, is held after its
+/// opening: the model's own text after it misses on purpose (an undeclared
+/// function, its own name for a parameter, a value outside the enum) and
+/// comes out valid, its misses counted and the forced tokens none of them,
+/// though the model would have written other text where they were forced.
+#[tokio::test]
+async fn a_forced_calls_misses_after_its_opening_are_repaired_and_its_forced_tokens_are_none() {
+    let named_opening = "<tool_call>\n<function=write_file>\n";
+    let cases: Vec<(&str, String, &str, u64)> = vec![
+        // `save_files` repaired letter by letter, ten, and `x` to `a`.
+        (
+            r#""tool_choice":"required""#,
+            format!(
+                "{}=save_files>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n<parameter=mode>\nx\n</parameter>\n</function>\n</tool_call>",
+                in_place_of(REQUIRED_OPENING)
+            ),
+            r#"{"path":"a.txt","content":"hi","mode":"a"}"#,
+            11,
+        ),
+        // The model's own `file` for `path`, four letters.
+        (
+            r#""tool_choice":{"type":"function","function":{"name":"write_file"}}"#,
+            format!(
+                "{}<parameter=file>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n<parameter=mode>\nw\n</parameter>\n</function>\n</tool_call>",
+                in_place_of(named_opening)
+            ),
+            r#"{"path":"a.txt","content":"hi","mode":"w"}"#,
+            4,
+        ),
+    ];
+    for (choice, script, arguments, misses) in cases {
+        let (server, _) = server(&script, ModelFamily::Qwen38_27b);
+        let (content, calls, finish) = served(&server, &chat_with(&[WRITE_FILE], false, 512, choice)).await;
+        assert_eq!((content.as_str(), finish.as_str()), ("", "tool_calls"), "{choice}");
+        assert_eq!(calls, [("write_file".to_owned(), arguments.to_owned())], "{choice}");
+        assert!(valid(WRITE_FILE, arguments), "{choice}: {arguments}");
+        tool_counts(&server, 1, misses).await;
+    }
+}
+
+/// `response_format` beside a strict tool: a turn either opens a held call
+/// before it answers or answers under the schema. The call the opener starts
+/// is held, its miss repaired; the answer is held to the schema, its miss
+/// repaired. Both count under the answer's `type`, the call's miss included.
+#[tokio::test]
+async fn beside_a_structured_answer_a_turn_makes_a_held_call_or_an_answer_valid_under_the_schema() {
+    let calling = call("write_file", &[("mode", "x"), ("content", "hi"), ("path", "a.txt")]);
+    let (calls_to, _) = server(&calling, ModelFamily::Qwen38_27b);
+    let (content, calls, finish) = served(&calls_to, &chat_with(&[WRITE_FILE], false, 256, FORMAT)).await;
+    assert_eq!((content.as_str(), finish.as_str()), ("", "tool_calls"));
+    assert_eq!(calls, [("write_file".to_owned(), r#"{"path":"a.txt","content":"hi","mode":"a"}"#.to_owned())]);
+    structured_counts(&calls_to, "json_schema", 1, 1).await;
+    // One request, one type: the answer's.
+    structured_counts(&calls_to, "tool", 0, 0).await;
+
+    // The answer's `,` after `true` is a miss, repaired to the close, and
+    // the script's next `"` one more, repaired to the stop.
+    let (answers, _) = server(r#"{"ok":true,"why":1}"#, ModelFamily::Qwen38_27b);
+    let (content, calls, finish) = served(&answers, &chat_with(&[WRITE_FILE], false, 256, FORMAT)).await;
+    assert_eq!((content.as_str(), calls.len(), finish.as_str()), (r#"{"ok":true}"#, 0, "stop"));
+    structured_counts(&answers, "json_schema", 1, 2).await;
+}
+
+/// With thinking on the reasoning is free and never read as a call, however
+/// it looks; the hold starts at the call after it, on every turn that holds
+/// a strict tool's call: `"required"`, whose literal is forced after the
+/// reasoning closes, and `response_format`, whose opener hands the call to
+/// the tools' grammar.
+#[tokio::test]
+async fn with_thinking_on_a_call_written_in_the_reasoning_is_neither_held_nor_parsed() {
+    let reasoning = "I could <tool_call>\n<function=nope>\n<parameter=x>\ny\n</parameter>\n</function>\n</tool_call> here.</think>\n";
+    let body = "<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n<parameter=mode>\nx\n</parameter>\n</function>\n</tool_call>";
+    // After the model's own close and the line break drawn with it, the
+    // joiner and the opening are forced in place of what it would write.
+    let required = format!("{reasoning}{}=wrote_file>\n{body}", in_place_of(&format!("\n{REQUIRED_OPENING}")));
+    let cases = [
+        (r#""tool_choice":"required""#, required, "tool", 2),
+        (FORMAT, format!("{reasoning}<tool_call>\n<function=write_file>\n{body}"), "json_schema", 1),
+    ];
+    for (field, script, kind, misses) in cases {
+        let (server, _) = server(&script, ModelFamily::Qwen38_27b);
+        let request = chat_with(&[WRITE_FILE], false, 512, field).replace("\"enable_thinking\":false", "\"enable_thinking\":true");
+        let (status, json, text) = post(&server, &request).await;
+        assert_eq!(status, 200, "{text}");
+        let message = &json["choices"][0]["message"];
+        assert!(message["reasoning_content"].as_str().unwrap().contains("<function=nope>\n<parameter=x>"), "{field}: {text}");
+        let calls = message["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "{field}: {text}");
+        assert_eq!(calls[0]["function"]["name"], "write_file", "{field}");
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"path":"a.txt","content":"hi","mode":"a"}"#, "{field}");
+        structured_counts(&server, kind, 1, misses).await;
+    }
+}
+
+/// `parallel_tool_calls: false` beside a strict tool: the turn ends at the
+/// call's confirmed close, not at the call closer its `content` holds on a
+/// line of its own, where the first-occurrence rule would end it; the value
+/// is delivered whole, the second call never, and nothing past the close is
+/// generated for the client, streamed or not.
+#[tokio::test]
+async fn with_parallel_tool_calls_false_a_held_call_ends_the_turn_at_its_confirmed_close() {
+    let first = call("write_file", &[("path", "a.txt"), ("mode", "w"), ("content", "first\n</tool_call>\nlast")]);
+    let script = format!("{first}\n{}", call("write_file", &[("path", "b.txt"), ("mode", "w"), ("content", "no")]));
+    for stream in [false, true] {
+        let (server, mock) = server(&script, ModelFamily::Qwen38_27b);
+        let (status, json, text) = post(&server, &chat_with(&[WRITE_FILE], stream, 512, r#""parallel_tool_calls":false"#)).await;
+        assert_eq!(status, 200, "{text}");
+        let chunks: Vec<JsonValue> = match stream {
+            false => vec![json],
+            true => text.lines().filter_map(|l| l.strip_prefix("data: ")).filter(|d| *d != "[DONE]").map(|d| serde_json::from_str(d).unwrap()).collect(),
+        };
+        let part = if stream { "delta" } else { "message" };
+        let calls: Vec<&JsonValue> = chunks.iter().filter_map(|c| c["choices"][0][part]["tool_calls"].as_array()).flatten().collect();
+        assert_eq!(calls.len(), 1, "stream {stream}: {text}");
+        let whole = r#"{"path":"a.txt","content":"first\n</tool_call>\nlast","mode":"w"}"#;
+        assert_eq!(calls[0]["function"]["arguments"], whole, "stream {stream}");
+        let finish = chunks.iter().filter_map(|c| c["choices"][0]["finish_reason"].as_str()).last();
+        assert_eq!(finish, Some("tool_calls"), "stream {stream}: {text}");
+        if !stream {
+            let tokens = chunks[0]["usage"]["completion_tokens"].as_u64();
+            assert_eq!(tokens, Some(encode(&first).len() as u64), "the tokens up to the confirmed close");
+        }
+        assert!(!text.contains("b.txt"), "stream {stream}: the second call reached the client: {text}");
+        let released = tokio::time::timeout(Duration::from_secs(10), async {
+            while !mock.released_requests().contains(&0) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert!(released.is_ok(), "stream {stream}: the request ran on past the close");
+        tool_counts(&server, 1, 0).await;
+    }
+}
+
 // ── the Responses API (GitHub #613) ──────────────────────────────────────
 //
 // The same hold on `/v1/responses`, over HTTP and over the WebSocket mode:
@@ -757,5 +922,47 @@ async fn on_the_responses_api_a_free_tool_and_the_reasoning_stay_free() {
         let (socket, metrics) = over_socket(&script, &body).await;
         assert_eq!(socket, whole, "{script}: the socket and HTTP");
         counted(&metrics, 1, misses).await;
+    }
+}
+
+/// #615 on the Responses API, over HTTP, whole and streamed, and over the
+/// WebSocket mode, through the code chat completions take: beside
+/// `text.format` a turn makes a held call or an answer valid under the
+/// schema, both counted under `type="json_schema"`; a `"required"` call
+/// missing after its forced opening comes out valid, its misses under
+/// `type="tool"` and none for the forced tokens; and under
+/// `parallel_tool_calls: false` a value holding `</tool_call>` on its own
+/// line is delivered whole, the response ending at the confirmed close.
+#[tokio::test]
+async fn on_the_responses_api_text_format_and_a_forced_call_beside_a_strict_tool_are_held_as_on_chat() {
+    let format = r#""text":{"format":{"type":"json_schema","name":"done","strict":true,"schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}}}"#;
+    let held = ("write_file".to_owned(), r#"{"path":"a.txt","content":"hi","mode":"a"}"#.to_owned());
+    let delivered = |text: &str, calls: Vec<(String, String)>| Delivered { reasoning: String::new(), text: text.to_owned(), calls, status: "completed".to_owned() };
+    let forced = format!(
+        "{}=save_files>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n<parameter=mode>\nx\n</parameter>\n</function>\n</tool_call>",
+        in_place_of(REQUIRED_OPENING)
+    );
+    let first = call("write_file", &[("path", "a.txt"), ("mode", "w"), ("content", "first\n</tool_call>\nlast")]);
+    let two_calls = format!("{first}\n{}", call("write_file", &[("path", "b.txt"), ("mode", "w"), ("content", "no")]));
+    let whole_value = ("write_file".to_owned(), r#"{"path":"a.txt","content":"first\n</tool_call>\nlast","mode":"w"}"#.to_owned());
+    // Each case: the field beside the tool, the script, what it delivers,
+    // and the type its misses count under.
+    let cases = [
+        (format, call("write_file", &[("mode", "x"), ("content", "hi"), ("path", "a.txt")]), delivered("", vec![held.clone()]), "json_schema", 1),
+        // The `,` after `true` repaired to the close, then the `"` to the stop.
+        (format, r#"{"ok":true,"why":1}"#.to_owned(), delivered(r#"{"ok":true}"#, vec![]), "json_schema", 2),
+        (r#""tool_choice":"required""#, forced, delivered("", vec![held.clone()]), "tool", 11),
+        (r#""parallel_tool_calls":false"#, two_calls, delivered("", vec![whole_value]), "tool", 0),
+    ];
+    for (field, script, expected, kind, misses) in cases {
+        let body = |stream: bool| responses_body(&[&flat(WRITE_FILE)], stream, 512).replacen("\"tools\"", &format!("{field},\"tools\""), 1);
+        let (whole, metrics, _) = over_http(&script, &body(false), false).await;
+        assert_eq!(whole, expected, "{field}: {script}");
+        counted_as(&metrics, kind, 1, misses).await;
+        let (streamed, _, _) = over_http(&script, &body(true), true).await;
+        assert_eq!(streamed, whole, "{field}: streamed and whole");
+        let (socket, metrics) = over_socket(&script, &body(false)).await;
+        assert_eq!(socket, whole, "{field}: the socket and HTTP");
+        counted_as(&metrics, kind, 1, misses).await;
     }
 }
