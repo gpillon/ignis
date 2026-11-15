@@ -38,7 +38,12 @@
 //! grammar accepts: it passes, and the turn is **released** from the grammar,
 //! so the call is written as the model writes it, with no check, miss or
 //! repair. A repair before the answer starts may draw the opener too: it is
-//! in the permitted set, as masking every step would have it.
+//! in the permitted set, as masking every step would have it. Beside the
+//! request's **strict tools** (GitHub #615,
+//! [`AnswerGrammar::holding_calls`]) the call is held instead: from the
+//! opener on the turn is read by their tool calls' grammar, which holds that
+//! call and every one after it, the text between them free, and never
+//! returns to the answer's.
 //!
 //! # Where it ends
 //!
@@ -58,6 +63,14 @@
 //! passes whatever it is -- and a verified run is cut at its first miss
 //! inside a call. The reasoning stays free: the content starts after the
 //! block's `</think>`, as an answer does.
+//!
+//! A call `tool_choice` forces (GitHub #615) is opened by its **forced
+//! literal** ([`crate::forced_literal`]), whose tokens are the server's: each
+//! is fed to the grammar as it is forced ([`GrammarState::forced`]), never
+//! checked nor counted a miss, and the model's own tokens after it are held
+//! as any call's. A literal token the grammar does not take where the
+//! content stands ([`GrammarState::admits`]) is not forced: the literal
+//! yields there, and the grammar holds what the model writes instead.
 
 use std::sync::Arc;
 
@@ -102,6 +115,8 @@ pub struct AnswerGrammar {
     kind: StructuredKind,
     think_end: Option<TokenId>,
     tool_opener: Option<TokenId>,
+    /// The tool calls' grammar the call the opener starts is held to (#615).
+    calls: Option<Arc<ToolCallGrammar>>,
 }
 
 /// What an [`AnswerGrammar`] holds the content to.
@@ -118,7 +133,7 @@ impl AnswerGrammar {
     /// With the generation starting inside the reasoning block it starts
     /// after the block's close, which [`AnswerGrammar::after`] names.
     pub fn new(grammar: Arc<Grammar>, kind: StructuredKind) -> Self {
-        Self { grammar: Compiled::Answer(grammar), kind, think_end: None, tool_opener: None }
+        Self { grammar: Compiled::Answer(grammar), kind, think_end: None, tool_opener: None, calls: None }
     }
 
     /// The content held to a request's tool calls' grammar (GitHub #611):
@@ -127,7 +142,7 @@ impl AnswerGrammar {
     /// [`AnswerGrammar::admitting_tool_call`] has no use here, the grammar
     /// reading the opener itself.
     pub fn tool_calls(grammar: Arc<ToolCallGrammar>) -> Self {
-        Self { grammar: Compiled::Calls(grammar), kind: StructuredKind::Tool, think_end: None, tool_opener: None }
+        Self { grammar: Compiled::Calls(grammar), kind: StructuredKind::Tool, think_end: None, tool_opener: None, calls: None }
     }
 
     /// Whether the content's first draw can be a miss, so the draw a
@@ -154,6 +169,16 @@ impl AnswerGrammar {
     /// from the grammar.
     pub fn admitting_tool_call(self, opener: TokenId) -> Self {
         Self { tool_opener: Some(opener), ..self }
+    }
+
+    /// The same answer, beside the request's **strict tools** (GitHub #615):
+    /// the call a turn opens instead of the answer
+    /// ([`AnswerGrammar::admitting_tool_call`]) is held to their tool calls'
+    /// grammar, which then holds the rest of the turn -- its text free, each
+    /// further call held as the first. The turn stays released from the
+    /// answer's grammar, and the request keeps the answer's kind.
+    pub fn holding_calls(self, calls: Arc<ToolCallGrammar>) -> Self {
+        Self { calls: Some(calls), ..self }
     }
 
     /// What the request asked for.
@@ -184,7 +209,8 @@ pub enum Verdict {
     /// A **miss**: the position is repaired before the next round.
     Miss,
     /// The tool call's opener before the answer started (GitHub #592): the
-    /// turn is a call, released from the grammar.
+    /// turn is a call, released from the grammar -- unless the request's
+    /// strict tools hold the call (#615), and the opener then passes.
     Released,
 }
 
@@ -197,7 +223,10 @@ pub struct GrammarState {
     open: bool,
     think_end: Option<TokenId>,
     tool_opener: Option<TokenId>,
-    /// The turn opened a tool call (GitHub #592): nothing more is checked.
+    /// The tool calls' grammar the call the opener starts is held to (#615).
+    calls: Option<Arc<ToolCallGrammar>>,
+    /// The turn opened a tool call (GitHub #592), or the grammar could not
+    /// follow a token the server forced (#615): nothing more is checked.
     released: bool,
     /// The permitted set's bits, built on the first miss and reused.
     set: Option<TokenSet>,
@@ -216,6 +245,7 @@ impl GrammarState {
             open: !starts_in_reasoning,
             think_end: grammar.think_end,
             tool_opener: grammar.tool_opener,
+            calls: grammar.calls.clone(),
             released: false,
             set: None,
         }
@@ -239,6 +269,46 @@ impl GrammarState {
         self.tool_opener == Some(token) && !self.matcher.answer_started()
     }
 
+    /// The turn opens a tool call instead of the answer, at `opener`: it is
+    /// released from the answer's grammar (#592), and with the request's
+    /// tool calls' grammar beside it (#615) the call is held to that from
+    /// the opener on, for the rest of the turn. Returns whether the turn is
+    /// released, nothing more checked: with no tool calls' grammar, or on a
+    /// vocabulary whose opener has no text to arm it.
+    fn open_tool_call(&mut self, opener: TokenId) -> bool {
+        let Some(calls) = self.calls.take() else {
+            self.released = true;
+            return true;
+        };
+        let mut matcher = ToolCallMatcher::new(calls);
+        self.released = !(matcher.accept(opener) && matcher.in_call());
+        self.matcher = Held::Calls(matcher);
+        self.tool_opener = None;
+        self.released
+    }
+
+    /// Whether the grammar takes `token` where the content stands, taking
+    /// nothing: true before the content starts, where nothing is held. A
+    /// forced literal's token is forced only where it does (#615).
+    pub fn admits(&mut self, token: TokenId) -> bool {
+        !self.holds() || self.opens_tool_call(token) || self.matcher.check(token)
+    }
+
+    /// Take a token the server forced, a forced literal's (#615): the grammar
+    /// follows the server's own text, which is never a miss. Only where the
+    /// content is held; a token the grammar does not take there, which
+    /// [`GrammarState::admits`] keeps from being forced, releases the turn.
+    pub fn forced(&mut self, token: TokenId) {
+        if !self.holds() {
+            return;
+        }
+        if self.opens_tool_call(token) {
+            self.open_tool_call(token);
+        } else if !self.matcher.accept(token) {
+            self.released = true;
+        }
+    }
+
     /// The tokens a call committed: the reasoning block's close among them
     /// opens the answer at the token after it.
     pub fn commit(&mut self, tokens: &[TokenId]) {
@@ -260,7 +330,9 @@ impl GrammarState {
     /// the run opens it at the token after; a stop there is the leaf's to cut
     /// or redirect, and the rest of the run is left to it whole. So is the
     /// rest of a run whose draft opens a tool call before the answer started
-    /// (GitHub #592), which releases the turn, and every run after.
+    /// (GitHub #592), which releases the turn, and every run after -- unless
+    /// the request's strict tools hold the call (#615), whose drafts are then
+    /// checked as the answer's were.
     pub fn check_run(&mut self, run: &[PendingToken]) -> usize {
         if self.released {
             return run.len();
@@ -280,8 +352,10 @@ impl GrammarState {
                 continue;
             }
             if self.opens_tool_call(token) {
-                self.released = true;
-                return run.len();
+                if self.open_tool_call(token) {
+                    return run.len();
+                }
+                continue;
             }
             if self.matcher.is_stop(token) || !self.matcher.accept(token) {
                 return index;
@@ -291,13 +365,14 @@ impl GrammarState {
     }
 
     /// Check a pending token of the answer, and take it when it passes. The
-    /// tool call's opener before the answer started releases the turn.
+    /// tool call's opener before the answer started releases the turn, or
+    /// passes into the call the request's strict tools hold (#615).
     pub fn check(&mut self, draw: PendingToken) -> Verdict {
         match draw {
-            PendingToken::Token(token) if self.opens_tool_call(token) => {
-                self.released = true;
-                Verdict::Released
-            }
+            PendingToken::Token(token) if self.opens_tool_call(token) => match self.open_tool_call(token) {
+                true => Verdict::Released,
+                false => Verdict::Passed,
+            },
             PendingToken::Stop if self.matcher.is_accepting() => Verdict::Finished,
             PendingToken::Stop => Verdict::Miss,
             PendingToken::Token(token) if !self.matcher.accept(token) => Verdict::Miss,
@@ -322,12 +397,13 @@ impl GrammarState {
     }
 
     /// Take the token a repair drew: `true` when it was a stop, and the
-    /// answer is complete. The tool call's opener releases the turn. Refused
-    /// when the token is not one the grammar allows there, which a repair
-    /// under its permitted set never draws.
+    /// answer is complete. The tool call's opener releases the turn, or
+    /// opens the call the request's strict tools hold (#615). Refused when
+    /// the token is not one the grammar allows there, which a repair under
+    /// its permitted set never draws.
     pub fn repaired(&mut self, token: TokenId) -> Result<bool, String> {
         if self.opens_tool_call(token) {
-            self.released = true;
+            self.open_tool_call(token);
             return Ok(false);
         }
         match self.matcher.accept(token) {
@@ -350,6 +426,13 @@ impl Held {
         match self {
             Held::Answer(m) => m.accept(token),
             Held::Calls(m) => m.accept(token),
+        }
+    }
+
+    fn check(&mut self, token: TokenId) -> bool {
+        match self {
+            Held::Answer(m) => m.check(token),
+            Held::Calls(m) => m.check(token),
         }
     }
 

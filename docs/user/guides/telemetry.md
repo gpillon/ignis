@@ -32,7 +32,8 @@ Everything goes through one structured log on stdout, in the format
 - From 0.11.0, a request held to a grammar (`response_format`, or the calls
   of a strict tool, see [Structured output](../api/structured-output.md))
   says so on the line it ends with, `done` or `cancelled`: `structured.type`
-  (`json_object`, `json_schema`, or `tool` for held tool calls),
+  (`json_object`, `json_schema`, or `tool` for held tool calls; a request
+  with both counts under its `response_format`'s, its calls' misses included),
   `structured.misses` (the sampled tokens the grammar
   rejected) and `structured.repairs` (the rejected tokens sampled again under
   the grammar). A request its caller's stop sequence ends says them on its

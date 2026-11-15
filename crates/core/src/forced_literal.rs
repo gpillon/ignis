@@ -54,6 +54,17 @@
 //! literal's next, and forcing resumes at the one after that. A model that
 //! wrote all of them, or wrote something else after `<tool_call>`, is left
 //! alone: the name, or whatever it wrote, is its own.
+//!
+//! # Beside a grammar
+//!
+//! A request with **strict tools** holds its calls to their grammar, the
+//! forced call's included (GitHub #615): the literal's tokens are fed to the
+//! grammar as they are forced, and a token the grammar would not take where
+//! the content stands -- the model's own unseen token after its own
+//! `<tool_call>` having been whitespace, say -- is not forced. The literal
+//! is then released ([`ForcedState::release`]) and the grammar holds the
+//! rest of the call: a call to one of the request's tools, though not
+//! always the one a named `tool_choice` named.
 
 use std::sync::Arc;
 
@@ -127,7 +138,8 @@ enum Phase {
     /// token before it having been drawn unseen; `unseen_opened`: that token
     /// was the literal's first.
     Forcing { from: u32, at: usize, joined: bool, unseen_opened: bool },
-    /// The model is writing the call itself: nothing is forced.
+    /// The model is writing the call itself, or the literal yielded to the
+    /// request's grammar ([`ForcedState::release`]): nothing is forced.
     Released,
 }
 
@@ -179,10 +191,21 @@ impl ForcedState {
         set
     }
 
+    /// Force nothing more (GitHub #615): the literal's next token is one the
+    /// request's grammar does not take where the content stands, so the
+    /// round draws freely, held to the grammar, and so does every round
+    /// after. A literal that starts at the generation stops as one forced
+    /// after the reasoning does.
+    pub fn release(&mut self) {
+        self.phase = Phase::Released;
+        self.last_draw_forced = false;
+    }
+
     fn step(&mut self, literal: &ForcedLiteral, draw: u32) -> Option<PermittedSet> {
         let at = match (literal.start, self.phase) {
+            (_, Phase::Released) => return None,
             (ForcedStart::Generation, _) => draw as usize,
-            (_, Phase::Reasoning | Phase::Released) => return None,
+            (_, Phase::Reasoning) => return None,
             // Nothing of the call yet: the joiner after an unseen token, the
             // first token after a seen one.
             (_, Phase::Closed { matched: 0 }) => {
@@ -356,6 +379,21 @@ mod tests {
             let mut state = one_round(&literal, tokens);
             assert!((6..20).all(|emitted| state.permitted(&literal, emitted, None).is_none()), "{tokens:?}");
         }
+    }
+
+    #[test]
+    fn a_released_literal_forces_nothing_more_wherever_it_starts() {
+        let at_generation = ForcedLiteral::at_generation(OPENER.to_vec()).unwrap();
+        let mut state = ForcedState::default();
+        assert_eq!(state.permitted(&at_generation, 0, None).as_deref(), Some(&[NL][..]));
+        state.release();
+        assert!((1..8).all(|emitted| state.permitted(&at_generation, emitted, None).is_none()));
+        // After the reasoning, at its joiner.
+        let after = ForcedLiteral::after_reasoning(OPENER.to_vec(), END, 4).unwrap();
+        let mut state = one_round(&after, &[5, END]);
+        assert_eq!(state.permitted(&after, 2, None).as_deref(), Some(&[NL][..]));
+        state.release();
+        assert!((3..10).all(|emitted| state.permitted(&after, emitted, None).is_none()));
     }
 
     #[test]

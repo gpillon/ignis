@@ -134,10 +134,31 @@ and repairs a miss, and it does not write the call's envelope for the model.
       and a held string with no value it can write on one line (`no_writable_value`).
     - A tool that is not held is never refused for its name: one the dialect cannot write is just not callable.
     - Every strict tool is compiled when the request arrives, on every chat path, a forced `tool_choice`, one
-      beside `response_format` and one under `parallel_tool_calls: false` included. Those three serve the call as
-      the model writes it until #615 holds it there.
+      beside `response_format` and one under `parallel_tool_calls: false` included, and its calls are held on
+      each (#615, below).
   - A schema that cannot be normalized leaves the tool free, and the response echoes `strict: false`, as
     OpenAI's fallback does. It is never a 400.
+- **Beside the fields that shape a turn's calls (#615).** One rule, `api::held_content`, composes a turn's grammar
+  from its answer's and its held tools', for every surface that serves strict tools.
+  - `tool_choice` `"required"` or a named function: #286's forced literal opens the call, and the tool calls'
+    grammar holds what follows. The literal's tokens are the server's text: the scheduler feeds each to the
+    grammar as it is forced, never checks it nor counts it a miss. A literal token the grammar would not take
+    where the content stands is not forced: the literal is released there, and the grammar holds the rest. That
+    happens after the reasoning, when the model opened its own call at the close and wrote something the opening
+    would not continue, and for a named tool that is not held whose name the dialect cannot write. The call then
+    names one of the request's tools, though not always the named one; the alternative, forcing a token the
+    grammar refuses, would release the grammar and serve the call unheld.
+  - `response_format` (or `text.format`) beside held tools: until the answer starts, the opener releases the
+    answer's grammar, as #592 does, and the scheduler hands the call to the tool calls' grammar, fed the opener,
+    which then holds the rest of the turn: free text, each further call held. The turn never returns to the
+    answer's grammar. A forced call's turn has no answer's grammar, and the tools' holds it alone.
+  - Such a request counts once, under the answer's `type` (`json_schema` or `json_object`), in structured
+    output's three counters and in the request log, the held call's misses and repairs included: a request has
+    one kind, fixed when it arrives, and which way the turn went is known only as it ends.
+  - With thinking on the reasoning stays free: the content is held from the token after `</think>`, so the hold
+    starts at the first call.
+  - `parallel_tool_calls: false` ends the turn where the scanner closes the call, and a held call closes only at
+    its confirmed close: a `</tool_call>` inside a string value ends nothing.
 - **Scope.**
   - The 27B. On Flash-Next, tools stay free until #581: `strict` is accepted and inert, and the guide says so.
     Agent SDKs set `strict` by default, and a 400 would shut them out of Flash-Next.

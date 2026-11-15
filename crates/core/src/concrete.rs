@@ -2535,10 +2535,19 @@ impl ConcreteScheduler {
     /// GitHub #587: the prompt's last job drew request `i`'s first token,
     /// held to its grammar when its answer starts there. Returns the run the
     /// request emits: the draw, the token that repaired it, or the request's
-    /// end.
+    /// end. A forced literal's first token (GitHub #615), drawn from its set,
+    /// is fed to the grammar, never checked.
     fn hold_first_token(&mut self, i: usize, run: DecodeOutcome, events: &mut Vec<SchedEvent>) -> DecodeOutcome {
-        if !self.requests[i].grammar.as_ref().is_some_and(|state| state.holds()) {
+        let r = &mut self.requests[i];
+        let Some(state) = r.grammar.as_mut().filter(|state| state.holds()) else {
             return run;
+        };
+        let forced = r.input.forced_literal.as_deref().and_then(crate::forced_literal::ForcedLiteral::prefill_step);
+        if let (Some(set), [token], None) = (forced, run.tokens.as_slice(), run.finish) {
+            if set.contains(token) {
+                state.forced(*token);
+                return run;
+            }
         }
         let draw = match (run.tokens.as_slice(), run.finish) {
             ([token], None) => PendingToken::Token(*token),
@@ -2556,16 +2565,25 @@ impl ConcreteScheduler {
     /// GitHub #587: after a round, request `i`'s pending token held to its
     /// grammar, once the answer has started (the round's own run may be what
     /// started it). A draw a permitted set forced is the server's text, not
-    /// the model's, and is left alone. Ends the request when the draw or its
-    /// repair is a stop where the answer is complete, and when a lane whose
-    /// draw must be checked reports none.
+    /// the model's, and is never checked: the thinking budget's is left
+    /// alone, and a forced literal's token (`literal`, GitHub #615) is fed to
+    /// the grammar, which follows the call the literal opens. Ends the
+    /// request when the draw or its repair is a stop where the answer is
+    /// complete, and when a lane whose draw must be checked reports none.
     ///
     /// GitHub #590: after a verify round the drafts the commit kept were
     /// checked before it ([`crate::structured::GrammarState::check_run`]); the
     /// pending token is the draft the host cut at, or the run's own successor,
     /// held here as a plain round's is -- so a miss inside a run is counted
     /// and repaired in [`ConcreteScheduler::hold_to_grammar`] like any other.
-    fn hold_round_token(&mut self, i: usize, run: &DecodeOutcome, forced: bool, events: &mut Vec<SchedEvent>) {
+    fn hold_round_token(
+        &mut self,
+        i: usize,
+        run: &DecodeOutcome,
+        forced: bool,
+        literal: Option<TokenId>,
+        events: &mut Vec<SchedEvent>,
+    ) {
         let r = &mut self.requests[i];
         let request = r.id;
         let done = r.state == RequestState::Done;
@@ -2573,7 +2591,14 @@ impl ConcreteScheduler {
             return;
         };
         state.commit(&run.tokens);
-        if done || !state.holds() || forced {
+        if done || !state.holds() {
+            return;
+        }
+        if let Some(token) = literal.filter(|_| run.finish.is_none()) {
+            state.forced(token);
+            return;
+        }
+        if forced {
             return;
         }
         let held = match run.pending {
@@ -5912,9 +5937,16 @@ impl Scheduler for ConcreteScheduler {
             // it exists, the budget's rounds included: it waits for the
             // budget's close and needs to know whether the last draw was
             // forced.
+            //
+            // GitHub #615: beside a grammar the literal's token is the
+            // grammar's too, fed to it after the round (`literal`); one the
+            // grammar does not take where the content stands is not forced,
+            // and the literal yields to the grammar from there.
+            let mut literal: Vec<Option<TokenId>> = vec![None; to_decode.len()];
             let forced: Vec<Option<crate::constrained::PermittedSet>> = to_decode
                 .iter()
-                .map(|&i| {
+                .zip(literal.iter_mut())
+                .map(|(&i, literal_draw)| {
                     let r = &mut self.requests[i];
                     if r.input.constrained.is_some() {
                         return None;
@@ -5927,10 +5959,17 @@ impl Scheduler for ConcreteScheduler {
                         .thinking_close
                         .as_deref()
                         .and_then(|close| r.thinking.permitted(r.input.params.thinking_budget, close, anchor));
-                    match r.input.forced_literal.as_deref() {
-                        Some(literal) => r.forced_state.permitted(literal, anchor, budget),
-                        None => budget,
+                    let Some(forced_literal) = r.input.forced_literal.as_deref() else { return budget };
+                    let from_literal = budget.is_none();
+                    let set = r.forced_state.permitted(forced_literal, anchor, budget);
+                    let token = set.as_ref().filter(|_| from_literal).map(|set| set[0]);
+                    let Some((token, state)) = token.zip(r.grammar.as_mut()) else { return set };
+                    if !state.admits(token) {
+                        r.forced_state.release();
+                        return None;
                     }
+                    *literal_draw = Some(token);
+                    set
                 })
                 .collect();
             let jobs: Vec<DecodeJob> = to_decode
@@ -5982,7 +6021,7 @@ impl Scheduler for ConcreteScheduler {
             };
             match decoded {
                 Ok(results) => {
-                    for ((&i, res), job) in to_decode.iter().zip(&results).zip(&jobs) {
+                    for (n, ((&i, res), job)) in to_decode.iter().zip(&results).zip(&jobs).enumerate() {
                         // GitHub #81 / ADR 0012: the decode-round span —
                         // one per request per `decode_step` call (the unit
                         // a decode CUDA graph is captured over), opened
@@ -6013,7 +6052,7 @@ impl Scheduler for ConcreteScheduler {
                         // GitHub #587: and the draw it left waiting, held to
                         // the request's grammar before the next round.
                         if job.checked {
-                            self.hold_round_token(i, res, job.permitted.is_some(), &mut events);
+                            self.hold_round_token(i, res, job.permitted.is_some(), literal[n], &mut events);
                         }
                     }
                 }

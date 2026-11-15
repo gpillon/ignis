@@ -189,12 +189,15 @@ pub struct RequestInput {
     /// consumes it, and a **miss** is **repaired** ([`crate::structured`]).
     /// `None` for every request whose answer is free.
     ///
-    /// Never set together with [`RequestInput::constrained`] nor with
-    /// [`RequestInput::forced_literal`]: each of those owns the draws it
-    /// forces. A turn whose tool call is forced is a call, and the server
-    /// holds it to no grammar; one that may call a tool admits the call's
-    /// opener until its answer starts (#592,
-    /// [`crate::structured::AnswerGrammar::admitting_tool_call`]).
+    /// Never set together with [`RequestInput::constrained`], whose schedule
+    /// owns every draw of its run. A turn whose tool call is forced is a
+    /// call, and the server holds it to no answer's grammar; one that may
+    /// call a tool admits the call's opener until its answer starts (#592,
+    /// [`crate::structured::AnswerGrammar::admitting_tool_call`]). A request
+    /// with **strict tools** (#611) holds its calls to their tool calls'
+    /// grammar, beside a [`RequestInput::forced_literal`] too (#615): the
+    /// literal's tokens are the server's, fed to the grammar and never
+    /// checked, and one the grammar does not take is not forced.
     pub grammar: Option<crate::structured::AnswerGrammar>,
     /// Whether this request is a **warm-up** (GitHub #282, the Responses
     /// WebSocket mode's `generate: false`): like a decision it ends where its
@@ -331,9 +334,13 @@ impl RequestInput {
     /// the reason [`RequestInput::reuse_reach`] gives. A request's held tool
     /// calls (#611) start in free text, where the first draw cannot miss
     /// unless a token holds the call's opener with more after it
-    /// ([`crate::structured::AnswerGrammar::checks_first_draw`]).
+    /// ([`crate::structured::AnswerGrammar::checks_first_draw`]). A first
+    /// token a forced literal draws (#615) is the server's, fed to the
+    /// grammar and never checked.
     pub fn checks_prefill_draw(&self) -> bool {
-        self.grammar.as_ref().is_some_and(|grammar| grammar.checks_first_draw()) && !self.params.starts_in_reasoning
+        self.grammar.as_ref().is_some_and(|grammar| grammar.checks_first_draw())
+            && !self.params.starts_in_reasoning
+            && !self.draws_forced_at_prefill()
     }
 
     /// Whether this request is a **constrained decode** (GitHub #242,
