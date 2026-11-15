@@ -392,6 +392,20 @@ The reasoning tokens a request may spend before the model's close is forced; `of
 
 Whether structured output describes a `json_schema` request's schema to the model, in a block after the conversation where the assistant's turn opens (ADR 0089): a model that has not read the schema misses on nearly every key. A request's own ignis_describe_schema overrides it.
 
+### `model.tool_arguments`
+
+| | |
+|---|---|
+| Flag | `--model-tool-arguments` |
+| Env var | `IGNIS_MODEL_TOOL_ARGUMENTS` |
+| Kind | `tool arguments` |
+| Default | `as-sent` |
+| Rule | one of as-sent, held |
+| Models | all |
+| `/v1/config` | shown by `GET`, patchable live |
+
+How the 27B serves a tool a request does not send `strict: true` (spec #582, ADR 0094), on chat completions and `/v1/responses`: `as-sent`, each tool as sent (a tool sent without `strict` free on chat completions and normalized on `/v1/responses`, as OpenAI serves them, one sent `strict: false` free); `held`, every such tool, `strict: false` included, normalized into strict form and its calls held where its schema allows it: its objects closed, so no parameter it does not declare, an optional parameter left out of the arguments when the model leaves it out. A schema that cannot be normalized stays free, never refused, and a strict tool stays strict either way. On Flash-Next it changes nothing until it holds tool calls (#581).
+
 ### `model.loop_guard`
 
 | | |

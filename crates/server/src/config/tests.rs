@@ -1199,6 +1199,43 @@ fn the_grammars_limits_are_the_measured_ones_unless_named() {
     }
 }
 
+/// The operator's switch for the tools a request does not send strict
+/// (GitHub #616): `as-sent` unless named, `held` from the file, the
+/// environment or the command line (the flag over the environment), an
+/// unknown value refused by name, visible and patchable with no reload; and
+/// a Flash-Next start takes it, where it changes nothing (#581), as the 27B
+/// does.
+#[test]
+fn the_tool_arguments_switch_is_as_sent_unless_named() {
+    use crate::api::ToolArguments;
+    assert_eq!(config(&[]).tool_arguments, ToolArguments::AsSent);
+    assert_eq!(config(&["--model-tool-arguments", "held"]).tool_arguments, ToolArguments::Held);
+    assert_eq!(config(&["--model-tool-arguments", "HELD"]).tool_arguments, ToolArguments::Held);
+    let env = env_map(&[("IGNIS_MODEL_TOOL_ARGUMENTS", "held")]);
+    assert_eq!(expect_config(resolve(&[], env).expect("resolve")).tool_arguments, ToolArguments::Held);
+    let env = env_map(&[("IGNIS_MODEL_TOOL_ARGUMENTS", "held")]);
+    let flag = expect_config(resolve(&args(&["--model-tool-arguments", "as-sent"]), env).expect("resolve"));
+    assert_eq!(flag.tool_arguments, ToolArguments::AsSent, "the flag over the environment");
+    let files = MemFiles::with(&[("c.yaml", "model:\n  tool_arguments: held\n")]);
+    assert_eq!(with_files(&["--config", "c.yaml"], no_env, &files).unwrap().tool_arguments, ToolArguments::Held);
+    for unknown in ["strict", "as_sent", "on"] {
+        let err = refused(&["--model-tool-arguments", unknown]);
+        assert!(err.contains("--model-tool-arguments") && err.contains("as-sent, held") && err.contains(&format!("`{unknown}`")), "{err}");
+    }
+    let env = env_map(&[("IGNIS_MODEL_TOOL_ARGUMENTS", "everything")]);
+    let err = resolve(&[], env).expect_err("an unknown value").0;
+    assert!(err.contains("IGNIS_MODEL_TOOL_ARGUMENTS") && err.contains("`everything`"), "{err}");
+    let files = MemFiles::with(&[("c.yaml", "model:\n  tool_arguments: always\n")]);
+    let err = with_files(&["--config", "c.yaml"], no_env, &files).expect_err("an unknown value").0;
+    assert!(err.contains("model.tool_arguments") && err.contains("`always`"), "{err}");
+    let field = schema::field("model", "tool_arguments").expect("declared");
+    assert!(field.visible && field.patchable && !field.reload_required, "{field:?}");
+    let held = config(&["--model-tool-arguments", "held"]);
+    for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
+        assert_eq!(held.for_family(family).unwrap().tool_arguments, ToolArguments::Held, "{family:?}");
+    }
+}
+
 // ── GitHub #186: cross-request state reuse (ADR 0029) ────────────────────
 
 /// (device, host) retained slots.

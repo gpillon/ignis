@@ -107,8 +107,10 @@ pub(crate) struct ResponseObject {
     /// The request's `tools`, in the Responses shape it sent them in; a tool
     /// sent without `strict` carries the one it was served with (GitHub
     /// #614): `true` where its calls are held, its `parameters` normalized
-    /// into strict form, `false` where they are not. On Qwen3.8-Flash-Next,
-    /// which holds no tool's calls, every tool carries `false`.
+    /// into strict form, `false` where they are not, and so does one sent
+    /// `strict: false` under `--model-tool-arguments held` (GitHub #616). On
+    /// Qwen3.8-Flash-Next, which holds no tool's calls, every tool carries
+    /// `false`.
     #[schema(value_type = Vec<Object>)]
     pub tools: Vec<JsonValue>,
     pub top_p: f64,

@@ -250,7 +250,14 @@ repaired from the verify pass's scores, as a plain round's draw is.
   value holding `</tool_call>` delivered whole, the turn ended at the
   confirmed close. On the Responses API, over HTTP whole and streamed and
   over the socket, `text.format`, `"required"` and `parallel_tool_calls:
-  false` the same. The byte-identity of requests with no strict tool is the
+  false` the same. Under the operator's switch at `held` (#616,
+  `Server::with_tool_arguments`): a chat tool without `strict` and one with
+  `strict: false` held as the Responses default holds one without, the same
+  misses; one whose schema does not normalize free on both surfaces; a
+  strict tool's refusals unchanged; on the Responses API a `strict: false`
+  tool held whole, streamed and over the socket and echoed `strict: true`,
+  each tool's echo; Flash-Next unchanged. The byte-identity of requests with
+  no strict tool, and of every request at the default `as-sent`, is the
   existing suites'.
 - **On the GPU**, agent requests with strict tools on the served 27B with
   DFlash2 on: every call valid and to a declared tool, every request a call,

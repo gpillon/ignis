@@ -49,8 +49,10 @@ pub(crate) struct CreateResponse {
     /// they allow it: every object closed, an optional parameter left out
     /// when the call leaves it out; a schema that does not normalize leaves
     /// the tool free, never refused (GitHub #614). `strict: false` serves it
-    /// free. Each also kept in its key order as sent: a held tool's
-    /// `parameters` keep theirs, which its held calls' arguments follow.
+    /// free, but under `--model-tool-arguments held` it is normalized and
+    /// held as a tool without `strict` is (GitHub #616). Each also kept in
+    /// its key order as sent: a held tool's `parameters` keep theirs, which
+    /// its held calls' arguments follow.
     #[schema(value_type = Vec<Object>)]
     pub(crate) tools: Option<Vec<api::Sent>>,
     /// `"auto"` (default), `"none"`, `"required"`, or `{"type": "function",
@@ -293,7 +295,7 @@ pub(crate) async fn prepare(
     // #615), and a tool sent without `strict` is normalized and held where
     // its schema allows it (#614); a strict tool's refusals come before
     // anything is rendered or generated, and a warm-up holds no grammar.
-    let api::HeldContent { grammar, description, schemas, held: held_tools } =
+    let api::HeldContent { grammar, description, schemas, held: held_tools, switch } =
         api::held_content(server, held, &raw_tools, &tools, &thinking, api::WithoutStrict::Normalized)?;
     let (grammar, description) = (grammar.filter(|_| !warm_up), description.filter(|_| !system_only));
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
@@ -341,7 +343,7 @@ pub(crate) async fn prepare(
         temperature: wire_number(params.temperature),
         text: echoed_text(req.text.as_deref()),
         tool_choice: req.tool_choice.clone().unwrap_or_else(|| json!("auto")),
-        tools: echoed_tools(sent_tools, &held_tools, server.active().family.serves_structured_output()),
+        tools: echoed_tools(sent_tools, &held_tools, server.active().family.serves_structured_output(), switch),
         top_p: wire_number(params.top_p),
         truncation: "disabled",
         usage: None,
@@ -375,17 +377,23 @@ pub(crate) async fn prepare(
 /// (or with `null`) carries `true` where its calls are held (its
 /// `parameters` normalized into strict form) and `false` where they are not
 /// (a schema that does not normalize, `tool_choice: "none"`); one sent with
-/// `strict` keeps it; and on a model that holds no tool's calls (`holds`
-/// false: Flash-Next, #581) every tool carries `false`, a `strict: true`
-/// inert there. `held` is [`api::HeldContent::held`], by the tools' places.
-fn echoed_tools(mut tools: Vec<JsonValue>, held: &[bool], holds: bool) -> Vec<JsonValue> {
+/// `strict` keeps it, but under the operator's switch at `held` (#616) only
+/// `strict: true` does, and one sent `strict: false` carries the one it was
+/// served with as one sent without; and on a model that holds no tool's
+/// calls (`holds` false: Flash-Next, #581) every tool carries `false`, a
+/// `strict: true` inert there. `held` is [`api::HeldContent::held`], by the
+/// tools' places.
+fn echoed_tools(mut tools: Vec<JsonValue>, held: &[bool], holds: bool, switch: api::ToolArguments) -> Vec<JsonValue> {
     for (index, tool) in tools.iter_mut().enumerate() {
         let function = match tool.get("function").is_some() {
             true => &mut tool["function"],
             false => tool,
         };
         let Some(function) = function.as_object_mut() else { continue };
-        let sent = function.get("strict").is_some_and(|strict| !strict.is_null());
+        let sent = match switch {
+            api::ToolArguments::AsSent => function.get("strict").is_some_and(|strict| !strict.is_null()),
+            api::ToolArguments::Held => function.get("strict") == Some(&JsonValue::Bool(true)),
+        };
         let served = match (holds, sent) {
             (false, _) => Some(false),
             (true, false) => Some(held.get(index).copied().unwrap_or(false)),

@@ -224,6 +224,7 @@ async fn main() {
         reasoning_effort: default_reasoning_effort,
         thinking_budget: default_thinking_budget,
         describe_schema,
+        tool_arguments,
         loop_guard,
         prefill_chunk: _,
         prefill_chunk_solo: _,
@@ -581,6 +582,7 @@ async fn main() {
         .with_thinking_defaults(default_enable_thinking, default_reasoning_effort)
         .with_thinking_budget(default_thinking_budget)
         .with_describe_schema(describe_schema)
+        .with_tool_arguments(tool_arguments)
         .with_loop_guard(loop_guard);
 
     // The Playground (GitHub #163, ADR 0026): whatever this binary embedded

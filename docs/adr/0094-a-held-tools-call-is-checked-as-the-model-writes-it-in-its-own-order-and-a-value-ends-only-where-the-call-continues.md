@@ -222,3 +222,19 @@ OpenAI's defaults on the two surfaces are. The normalization is the grammar crat
   Flash-Next and `tool_choice: "none"`, under which nothing is held. A `strict` the client sent is echoed as sent,
   so the echo of `strict: false` changes by no byte, but on Flash-Next every tool echoes `false`: `strict: true` is
   inert there (#581), and the echo says what each tool was served with.
+
+**The operator's switch (#616).** `model.tool_arguments` (`--model-tool-arguments`, `IGNIS_MODEL_TOOL_ARGUMENTS`)
+is `as-sent` or `held`, a live field read once per request. `as-sent`, the default, serves every tool as the
+paragraphs above say, by no byte changed. `held` declares every tool not sent `strict: true` normalized, on chat
+completions and the Responses API alike, with the Responses default's fallback: a schema that cannot be normalized
+stays free, never refused, and a strict tool stays strict, its refusals unchanged.
+- `strict: false` is normalized under `held` too. The agent CLIs send it on every tool, so a switch that left it free
+  would hold none of their calls; only `strict: true` keeps a meaning of its own. Under `held` the Responses echo of
+  a tool sent `strict: false` is the `strict` it was served with, as for one sent without; `strict: true` is echoed
+  as sent.
+- The field is every family's, not the 27B's alone: Flash-Next holds no tool's calls (#581), so the switch changes
+  nothing there, and a config file that names it starts either model. Once Flash-Next holds tool calls, the switch
+  reaches them with no change to the field.
+- Its values are spelled as the configuration spells a value of several words, joined by `-` (`as-sent`).
+- The default changes only if the served close-out (#617) measures `held` on the 27B as no slower, with sensible
+  repairs.
