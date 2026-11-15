@@ -589,6 +589,36 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
     assert_eq!(tight_plan["kv_holder_pages"].as_u64(), Some(u64::from(reserve)));
     assert_eq!(holder_pages(&tight_plan, u64::from(lanes)), u64::from(reserve), "the load's lanes and retained slots");
 
+    // An Agent request through KV-RAM for an Interactive one reserving the
+    // whole context: admission holds it only because the floor held the
+    // holders' pages beside it.
+    // First on the load, so no retained state stands in the room the move
+    // makes: the scheduler moves a victim only when that makes the whole room.
+    let ttft_before = log.named("ignis.request.ttft").len();
+    let done_before = log.named("ignis.request.done").len();
+    let agent = tokio::spawn(chat(tight.app.clone(), agent_request()));
+    log.at_least("ignis.request.ttft", ttft_before + 1).await;
+    println!("pages in use as the intruder arrives: {}", metric(&tight.metrics, "ignis_kv_pool_used_pages").await);
+    let intruder = chat(tight.app.clone(), question("What is 2 + 2? Answer with a number only.", SMALL_CONTEXT - 64, "interactive")).await;
+    let agent = agent.await.expect("the agent request");
+    assert!(content(&intruder).contains('4'), "{intruder}");
+    let moved_text = content(&agent);
+    println!("moved agent request: {moved_text:?}");
+    assert!(moved_text.to_lowercase().contains("hundred"), "restored, it went on to the end: {moved_text:?}");
+    let done = log.at_least("ignis.request.done", done_before + 2).await;
+    let agents: Vec<u64> = done[done_before..]
+        .iter()
+        .filter(|e| e["attributes"]["class"] == "agent")
+        .filter_map(|e| e["attributes"]["request_id"].as_u64())
+        .collect();
+    assert_eq!(agents.len(), 1, "one Agent request");
+    let ids = |name: &str| log.named(name).iter().filter_map(|e| e["attributes"]["request_id"].as_u64()).collect::<Vec<_>>();
+    assert_eq!(ids("ignis.request.evicted"), agents, "the Agent request is the one evicted");
+    assert_eq!(ids("ignis.request.restored"), agents, "and restored from its blob, not prefilled again");
+    let agent_line = done.iter().find(|e| e["attributes"]["request_id"].as_u64() == Some(agents[0])).unwrap();
+    println!("moved agent request's line: {agent_line}");
+    assert!(logged_spec(agent_line).is_some_and(|(_, drafted, accepted)| drafted > 0 && accepted > 0), "it drafted: {agent_line}");
+
     // Siblings over one system prompt: the first publishes it, seven claim it
     // at once, every lane holding a copy of its last page, their reservations
     // filling what admission holds.
@@ -629,32 +659,6 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
         assert!(logged_spec(line).is_some_and(|(rounds, _, _)| rounds > 0), "a sibling ran verify rounds: {line}");
     }
 
-    // An Agent request through KV-RAM for an Interactive one reserving the
-    // whole context: admission holds it only because the floor held the
-    // holders' pages beside it.
-    let ttft_before = log.named("ignis.request.ttft").len();
-    let done_before = log.named("ignis.request.done").len();
-    let agent = tokio::spawn(chat(tight.app.clone(), agent_request()));
-    log.at_least("ignis.request.ttft", ttft_before + 1).await;
-    let intruder = chat(tight.app.clone(), question("What is 2 + 2? Answer with a number only.", SMALL_CONTEXT - 64, "interactive")).await;
-    let agent = agent.await.expect("the agent request");
-    assert!(content(&intruder).contains('4'), "{intruder}");
-    let moved_text = content(&agent);
-    println!("moved agent request: {moved_text:?}");
-    assert!(moved_text.to_lowercase().contains("hundred"), "restored, it went on to the end: {moved_text:?}");
-    let done = log.at_least("ignis.request.done", done_before + 2).await;
-    let agents: Vec<u64> = done[done_before..]
-        .iter()
-        .filter(|e| e["attributes"]["class"] == "agent")
-        .filter_map(|e| e["attributes"]["request_id"].as_u64())
-        .collect();
-    assert_eq!(agents.len(), 1, "one Agent request");
-    let ids = |name: &str| log.named(name).iter().filter_map(|e| e["attributes"]["request_id"].as_u64()).collect::<Vec<_>>();
-    assert_eq!(ids("ignis.request.evicted"), agents, "the Agent request is the one evicted");
-    assert_eq!(ids("ignis.request.restored"), agents, "and restored from its blob, not prefilled again");
-    let agent_line = done.iter().find(|e| e["attributes"]["request_id"].as_u64() == Some(agents[0])).unwrap();
-    println!("moved agent request's line: {agent_line}");
-    assert!(logged_spec(agent_line).is_some_and(|(_, drafted, accepted)| drafted > 0 && accepted > 0), "it drafted: {agent_line}");
     tight.close().await;
 
     // The same request alone on a fresh load of the same flags.
