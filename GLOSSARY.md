@@ -331,7 +331,11 @@ objects every 27B artifact carries, W8 on each (451 MB): its stem projects
 `[the next token's embedding; the target's post-final-norm hidden]`, one gated
 attention layer whose state is one more attention layer of the KV pool, over
 the whole context, and a dense SwiGLU. A 27B load built for it keeps that
-state and the **continuation hidden** through every prefill and round.
+state and the **continuation hidden** through every prefill and round. In a
+verify round its chain proposes each lane's drafts (the **fixed draft**), the
+first step from the continuation hidden and the pending token, and the round's
+commit writes again the head's rows the committed run licenses, so none the
+chain built from the head's own hidden stays below the frontier (#621).
 
 **Continuation hidden**:
 On a 27B load with the **MTP head**: the target's post-final-norm hidden at a

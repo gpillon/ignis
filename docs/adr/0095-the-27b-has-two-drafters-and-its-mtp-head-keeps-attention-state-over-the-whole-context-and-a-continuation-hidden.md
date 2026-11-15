@@ -66,12 +66,60 @@ on an MTP load a prefill normalizes every column the head reads, in calls of at 
 chunk's last column as the continuation hidden; a plain round writes each lane's row before its position from
 the continuation hidden and the token it consumes, and leaves the round's post-norm hidden.
 
+**The head drafts at the start of a verify round, and the round's commit rewrites the head's rows from the
+committed run alone** (#621). At the round's proposal seam, inside its pass and the graph captured per lane count,
+each lane's head chains its drafts: step 0 builds the row at `P - 1` (`P` the lane's frontier, its anchor the
+pending token) from the continuation hidden and the anchor, step `s` the row at `P - 1 + s` from the head's own
+hidden at step `s - 1` and the draft that step chose; step `s` chooses draft `s + 1`, the argmax of the target's
+output head over the head's hidden, at every temperature (the fixed draft, taken by the accept the fixed draft uses
+today). A lane needs steps `0 .. e - 1` for its extent `e`; a step past them is the attention's masked empty row and
+writes nothing, so a lane at extent 0 writes no row and none writes past its budget or its context. The chain's rows
+are scratch: built from the head's hidden, not the target's, they are not entries. After the cut the commit writes
+the rows the committed run of `c` tokens licenses, `[P - 1, P - 1 + c)`, again, from what the sequence consumed: the
+continuation hidden and the anchor, then the target's post-final-norm hidden of each committed column (the pass's
+own normalization of the residual it kept) and the run's next token. One head call over the round's `lanes x (k +
+1)` columns, its attention in the masked form, `c` valid columns a lane, and only its stem and projection: a
+committed row's key and value are all the state takes from it. The continuation hidden then moves to the run's last
+column, the round's last device step, so a round that fails before it leaves the lane's frontier and its hidden
+together. The chain's rows past the commit, `[P - 1 + c, P - 1 + e)`, stand past the head's frontier and are never
+read before a later step writes them; under hq-e8-2b their ring bits come off in the head's own words, as the
+target's rejected columns' do in the target's, and a round that fails after its pass clears the head's words over
+`[P - 1, P + e)`. The commit is eager, beside the GDN fold and DFlash2's append: it reads the cut, which the host
+decides.
+
+What "the head's state is the committed run's" is held to (spec #618 asked for bit for bit against a sequence that
+committed the same tokens by plain rounds). That cannot hold, for a reason outside the head: a committed row is
+built from the target's hidden at its position, and the target's hidden is the round's that computed it. A plain
+round's is the one-column decode's, a verify round's the verify tile's (ADR 0056's drift), and a verify round's at
+another extent already parts (measured: the same load committing the same canaries one token a round, at extent 0,
+leaves the drafted text at a near-tie at one window and two lanes). The head's own call also runs at the round's
+width, where the W8 small-T route splits its K by the width. So the claim is held in each round instead, under BF16
+KV, drafts accepted and rejected: the continuation hidden is the round's last committed column's, bit for bit; the
+head's rows at the run's positions are the head's in double precision over what the run consumed (the continuation
+hidden before the round, the round's own committed columns, the run's tokens) within the BF16 bounds #620 measured;
+and a row built as the chain builds its own (the head's hidden in place of the target's) lands far outside them
+(measured: 0.0038 keys and 0.0034 values against bounds of 0.0096 and 0.0087; a chain-built row 0.35). Against
+plain rounds held to the same tokens the drafted rows stand within twice the distance a prefill of the same text
+stands from them, two correct routes (measured 0.087 and 0.103 relative L2), and a chain-built row past both.
+
+The head leaves the target's computation as it was: the verify substrate alone, given each round the drafts it
+committed and one the target rejects, commits the same runs at the same extents, bit for bit, at every window from 1
+to 7 and every lane count from one to eight. The greedy text is the same load's spec-off text up to the near-tie
+rule, with one exception the rule does not know and that names a new threshold: where both prefill routes put
+spec-off's pick ahead but the verify substrate, given the same drafts, makes spec-on's, the two picks may stand at
+most 16 BF16 ulps apart at the routes' top logit (ADR 0056's moved-pick bound, measured moved picks 0 to 8 ulps on
+Flash-Next's verify rows): the verify tile's drift from a one-column decode, which any drafter's accepted drafts
+expose, not the head's. Measured once on the canaries, at four lanes: 3 ulps.
+
 **The plan states the head's lines, and nothing of DFlash2.** `weights` holds the head's 451,267,584 bytes;
 `workspace` adds one head call of `min(chunk, 128)` rows (its inputs, its buffers; the call's attention takes
 the workspace the target's GQA layers already hold at the same widths); `decode_graph` adds one call over the
 widest round's `lanes × (k + 1)` columns; `lane_state` and `retained_slots` add 10,240 bytes a slot;
 `hq_residual_window` adds the head's layer, 2,228,288 bytes a slot; the KV pool's page is 17/16 of the 27B's.
-No drafter weights, window, round or tap scratch. `ignis_core::mtp_head` states each line on the CPU and a GPU
+No drafter weights, window, round or tap scratch. The verify round (#621) adds no line: its chain runs in the
+round's scratch in a scope of its own, released before the pass bumps its buffers, its scores in the round's own
+logits, which the pass writes whole after it; its commit is the one head call over the widest round's columns the
+`decode_graph` line already holds. `ignis_core::mtp_head` states each line on the CPU and a GPU
 test holds the leaf's plan, and the load, to it to the byte.
 
 **The head's state is held to its weights in double precision.** A test-only readout beside the program
@@ -88,6 +136,5 @@ yet, so until #622 lists them (and earns their snapshot point) such a pool refus
 retained slot, prefix and checkpoint by name rather than move a sequence without its head. A blob names its
 drafter in its identity already (ADR 0029: "mtp window 7"). This amends ADR 0046 too: its example gives MTP the
 Flash-Next family alone, and MTP is the 27B's as well once the server accepts the option (#623); until then a
-27B load built for the head is reached through the leaf and the core load API only. Until #621 builds the
-head's chain, an MTP load's verify round is refused and it decodes in plain rounds; until #624, an MTP load
-takes no vision; it drafts under the fixed draft only.
+27B load built for the head is reached through the leaf, the core load API and the runtime's compute seam only.
+Until #624, an MTP load takes no vision; it drafts under the fixed draft only.

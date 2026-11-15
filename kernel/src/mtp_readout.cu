@@ -11,6 +11,7 @@
 #include "trellis_body.h"
 
 #include "ninfer/ops/argmax.h"
+#include "ninfer/ops/rmsnorm.h"
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -227,6 +228,46 @@ extern "C" int32_t ignis_mtp_readout_ring(const struct ignis_seq_pool *pool, con
     return -1;
   }
   return 0;
+}
+
+extern "C" int32_t ignis_mtp_readout_round_hidden(struct ignis_model *model, uint32_t lanes, uint16_t *out_hidden) {
+  if (out_hidden == nullptr) {
+    set_error("ignis_mtp_readout_round_hidden: null argument");
+    return -1;
+  }
+  if (const char *refusal = head_refusal(model)) {
+    set_error(std::string("ignis_mtp_readout_round_hidden: ") + refusal);
+    return -1;
+  }
+  if (model->verify == nullptr) {
+    set_error("ignis_mtp_readout_round_hidden: the model was loaded without a draft window");
+    return -1;
+  }
+  if (lanes == 0 || lanes > model->decode_lanes) {
+    set_error("ignis_mtp_readout_round_hidden: lanes " + std::to_string(lanes) + " is not in 1.." +
+              std::to_string(model->decode_lanes) + ", the load's decode lanes");
+    return -1;
+  }
+  const auto hidden = static_cast<std::int32_t>(model->hidden);
+  const auto columns = static_cast<std::int32_t>(lanes * (model->verify->window + 1));
+  ninfer::DeviceArena::Scope scope = model->scratch->scope();
+  try {
+    // The commit's own call (kernel/src/mtp_head.cu `commit_rows`): the
+    // final norm over the round's kept residual, at the round's width.
+    const ninfer::Tensor residual(model->verify->hidden->p, ninfer::DType::BF16, {hidden, columns, 1, 1});
+    ninfer::Tensor normalized = model->scratch->alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
+    const ninfer::Tensor gain(const_cast<void *>(model->final_norm.qdata), ninfer::DType::BF16, {hidden, 1, 1, 1});
+    ninfer::ops::rmsnorm(residual, gain, model->rms_norm_eps, /*unit_offset=*/true, normalized, model->stream);
+    check(cudaMemcpyAsync(out_hidden, normalized.data,
+                          static_cast<std::size_t>(hidden) * static_cast<std::size_t>(columns) * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost, model->stream),
+          "cudaMemcpyAsync(round hidden)");
+    check(cudaStreamSynchronize(model->stream), "cudaStreamSynchronize");
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_mtp_readout_round_hidden: ") + e.what());
+    return -1;
+  }
 }
 
 extern "C" const char *ignis_mtp_readout_last_error(void) {

@@ -81,6 +81,15 @@ int32_t ignis_mtp_readout_state(const struct ignis_seq_pool *pool, const struct 
 int32_t ignis_mtp_readout_ring(const struct ignis_seq_pool *pool, const struct ignis_seq *seq,
                                uint32_t *out_target_words, uint32_t *out_head_words);
 
+/* GitHub #621: the last verify round's target post-final-norm hidden of
+ * every column, for its `lanes` lanes at the load's window `k`: host BF16
+ * `[lanes][k + 1][hidden]`, lane b's column j the hidden at its frontier plus
+ * j -- the pass's own normalization of the residual it kept, the hiddens the
+ * round's commit built the head's rows from. Read before the next round or
+ * prefill. Refused without the MTP head or a draft window, and past the
+ * load's lanes. */
+int32_t ignis_mtp_readout_round_hidden(struct ignis_model *model, uint32_t lanes, uint16_t *out_hidden);
+
 /* The message from the most recent failing call on this thread; never NULL. */
 const char *ignis_mtp_readout_last_error(void);
 

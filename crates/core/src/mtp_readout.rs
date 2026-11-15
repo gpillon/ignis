@@ -55,6 +55,7 @@ mod ffi {
             out_target_words: *mut u32,
             out_head_words: *mut u32,
         ) -> i32;
+        pub fn ignis_mtp_readout_round_hidden(model: *mut IgnisModel, lanes: u32, out_hidden: *mut u16) -> i32;
         pub fn ignis_mtp_readout_last_error() -> *const c_char;
     }
 }
@@ -174,6 +175,22 @@ pub fn ring_words(
         return Err(last_error());
     }
     Ok((target, head))
+}
+
+/// GitHub #621: the last verify round's target post-final-norm hidden of
+/// every column, for its `lanes` lanes at the load's `window`: BF16 bits
+/// `[lanes][window + 1][hidden]`, lane b's column j the hidden at its
+/// frontier plus j -- what the round's commit built the head's rows from.
+/// Read it before the next round or prefill.
+#[cfg(feature = "cuda")]
+pub fn round_hidden(model: &Model, lanes: u32, window: u32) -> Result<Vec<u16>, String> {
+    let config = crate::compute::ModelConfig::qwen38_27b();
+    let mut hidden = vec![0u16; lanes as usize * (window as usize + 1) * config.hidden as usize];
+    let rc = unsafe { ffi::ignis_mtp_readout_round_hidden(model.handle(), lanes, hidden.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(hidden)
 }
 
 #[cfg(test)]
