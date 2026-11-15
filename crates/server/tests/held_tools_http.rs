@@ -36,6 +36,9 @@ use ignis_server::Server;
 #[path = "support/responses.rs"]
 mod responses;
 
+#[path = "support/held_tools_corpus.rs"]
+mod corpus;
+
 const MODEL: &str = "test-model";
 const CHAT: &str = "/v1/chat/completions";
 
@@ -1140,6 +1143,114 @@ async fn on_the_responses_api_each_tool_echoes_the_strict_it_was_served_with() {
     assert_eq!(response["tools"], flash_next, "on Flash-Next");
     let (response, _, _) = responses_post("", ModelFamily::Qwen38_27b, &body.replacen("\"tools\"", "\"tool_choice\":\"none\",\"tools\"", 1)).await;
     assert_eq!(response["tools"], none_held, "under tool_choice none");
+}
+
+// ── the served close-out's corpus (GitHub #617) ──────────────────────────
+
+/// The corpus `held_tools_gpu.rs` serves on the 27B, every request and its
+/// free twin, sent to the mock 27B: none is refused, each request is held
+/// (counted once under the type its grammar counts under) and each twin
+/// holds no tool, and on the Responses API each tool sent without `strict`
+/// is echoed `strict: true`, held. A request the card would refuse is found
+/// here.
+#[tokio::test]
+async fn the_gpu_corpus_is_served_its_requests_held_and_their_free_twins_free() {
+    for case in corpus::corpus() {
+        for held in [true, false] {
+            let what = format!("{} ({:?}, held {held})", case.label, case.api);
+            let (server, _) = server("", ModelFamily::Qwen38_27b);
+            let request = Request::builder()
+                .method("POST")
+                .uri(case.api.path())
+                .header("content-type", "application/json")
+                .body(Body::from(case.body(MODEL, held, 64)))
+                .unwrap();
+            let response = server.app().oneshot(request).await.unwrap();
+            let status = response.status().as_u16();
+            let text = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+            assert_eq!(status, 200, "{what}: {text}");
+            let metrics = server.metrics.as_ref().unwrap();
+            responses::metric_reaches(metrics, "ignis_request_duration_seconds_count 1").await;
+            let exposition = metrics.render();
+            let counted = |kind: &str| exposition.contains(&format!("\nignis_structured_requests_total{{type=\"{kind}\"}} 1\n"));
+            match held {
+                true => assert!(counted(case.counted_as()), "{what}: not held:\n{exposition}"),
+                false => assert!(!counted("tool"), "{what}: the twin holds a tool:\n{exposition}"),
+            }
+            if held && case.api == corpus::Api::Responses {
+                let echoed = corpus::Delivered::read(case.api, &serde_json::from_str(&text).unwrap()).echoed_strict;
+                for (tool, strict) in corpus::declared(case.api, &case.tools_sent(true)).iter().zip(&echoed) {
+                    if tool.hold == corpus::Hold::Normalized {
+                        assert_eq!(strict, &JsonValue::Bool(true), "{what}: {} sent without strict is echoed held", tool.name);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The conversations the GPU legs hold to one call per turn, on the mock 27B
+/// and Flash-Next, chat completions and the Responses API: the control's
+/// first turn makes both calls its script writes; under
+/// `parallel_tool_calls: false` the first turn ends at the first, the next
+/// turn, answered, makes the other, and the one after answers.
+#[tokio::test]
+async fn the_gpu_legs_conversations_take_their_calls_one_turn_at_a_time() {
+    let two = format!("{}\n{}", call("read_file", &[("path", "README.md")]), call("read_file", &[("path", "Cargo.toml")]));
+    let one = call("read_file", &[("path", "Cargo.toml")]);
+    for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
+        for api in [corpus::Api::Chat, corpus::Api::Responses] {
+            let tools: Vec<String> = corpus::PARALLEL_TOOLS.iter().map(|tool| if api == corpus::Api::Chat { (*tool).to_owned() } else { corpus::flat(tool) }).collect();
+            let mut turns = Vec::new();
+            for (scripts, parallel) in [(vec![two.clone(), "done".to_owned()], None), (vec![two.clone(), one.clone(), "done".to_owned()], Some(false))] {
+                let (server, mock) = server(&scripts[0], family);
+                for (i, script) in scripts.iter().enumerate().skip(1) {
+                    mock.script(i as ignis_core::RequestId, &encode(script));
+                }
+                let send = |path: &'static str, body: String| {
+                    let app = server.app();
+                    async move {
+                        let request = Request::builder().method("POST").uri(path).header("content-type", "application/json").body(Body::from(body)).unwrap();
+                        let response = app.oneshot(request).await.unwrap();
+                        let status = response.status().as_u16();
+                        (status, String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap())
+                    }
+                };
+                turns.push(corpus::conversation(send, MODEL, api, &tools, corpus::PARALLEL_PROMPT, parallel).await);
+            }
+            let what = format!("{family:?}, {api:?}");
+            let failures = corpus::one_call_per_turn(&what, api, &turns[0], &turns[1]);
+            assert!(failures.is_empty(), "{failures:?}");
+            let calls = |turns: &Result<Vec<corpus::Turn>, String>| -> Vec<Vec<String>> {
+                turns.as_ref().unwrap().iter().map(|turn| turn.calls.iter().map(|call| call.arguments.clone()).collect()).collect()
+            };
+            let (readme, cargo) = (r#"{"path":"README.md"}"#.to_owned(), r#"{"path":"Cargo.toml"}"#.to_owned());
+            assert_eq!(calls(&turns[0]), [vec![readme.clone(), cargo.clone()], vec![]], "{what}: the control");
+            assert_eq!(calls(&turns[1]), [vec![readme], vec![cargo], vec![]], "{what}: under false");
+        }
+    }
+}
+
+/// What the corpus test prints of a free twin's call: each fault where it
+/// is (a missing parameter, a bound, an undeclared key in a closed object
+/// and in an open one), the value there, and where two deliveries part.
+#[test]
+fn the_gpu_corpus_reads_a_calls_faults_where_they_are() {
+    let parameters = |tool: &str| corpus::declared(corpus::Api::Chat, &[tool.to_owned()]).remove(0).parameters;
+    let kinds = |tool: &str, arguments: &str| -> Vec<(String, String)> {
+        corpus::faults(&parameters(tool), arguments).unwrap().into_iter().map(|fault| (fault.kind, fault.at)).collect()
+    };
+    let deploy = r#"{"service":"api","version":"v1.4.0","region":"eu-west","replicas":25,"extra":1}"#;
+    let pair = |kind: &str, at: &str| (kind.to_owned(), at.to_owned());
+    let mut found = kinds(corpus::DEPLOY, deploy);
+    found.sort();
+    assert_eq!(found, [pair("constraint", "/replicas"), pair("missing", "/approved_by"), pair("missing", "/notes"), pair("unknown", "/extra")]);
+    let open = r#"{"path":"a","line":1,"change":{"edits":[{"old":"x","new":"y","why":"z"}]}}"#;
+    assert_eq!(kinds(corpus::EDIT_OPEN, open), [pair("undeclared", "/change/edits/0/why")]);
+    assert!(corpus::faults(&parameters(corpus::DEPLOY), "not json").is_none());
+    assert_eq!((corpus::shown_at(deploy, "/replicas"), corpus::shown_at(deploy, "/notes")), ("25".to_owned(), "(absent)".to_owned()));
+    assert_eq!(corpus::shown_at(open, "/change/edits/0"), r#"{"old":"x","new":"y","why":"z"}"#);
+    assert_eq!([corpus::parting("abc", "abd"), corpus::parting("ab", "abc"), corpus::parting("a", "a")], [Some(2), Some(2), None]);
 }
 
 // ── the operator's switch (GitHub #616) ──────────────────────────────────
