@@ -90,7 +90,9 @@ and repairs a miss, and it does not write the call's envelope for the model.
   - The residue: a string value cannot contain this call's own confirmed close.
   - The grammar bounds the whitespace the rule leaves open, between a step's tags, before `<function=` and before
     the first parameter, at `model.grammar_max_whitespace` (48): the byte past it is a miss, so the parser never
-    reads a step the grammar did not allow (#611).
+    reads a step the grammar did not allow (#611). Where the next step must start a line (before the first
+    parameter, after a typed value's JSON), the bound's last byte is kept for a line break, so a run of spaces is
+    never a dead end (#612).
   - A string held to an `enum`, a `const`, a `pattern` or a `format` is written on one line that does not start
     with one of the dialect's tags (`<parameter=`, `</parameter>`, `</function>`). A value's end is then never in
     doubt, and the grammar stays free of dead ends without a search over its lines. A value of a strict tool
