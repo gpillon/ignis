@@ -2,7 +2,7 @@
 //! from the tokenizer, and a byte trie over them that a mask walks.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::string::StrState;
 
@@ -109,6 +109,18 @@ pub struct Vocab {
     /// shared by every grammar, never grown afterwards. The rarer states
     /// (inside a `\u` escape, thousands of them) walk the trie instead.
     pub(crate) free_tables: HashMap<StrState, Arc<StrTable>>,
+    /// A held tool's raw text, read mid-line ([`RawTables`]): built on the
+    /// first such mask, never for a vocabulary that holds no tool call.
+    raw: OnceLock<RawTables>,
+}
+
+/// The tokens a free value of a held tool's call admits mid-line (GitHub
+/// #611): those with no newline, by the UTF-8 continuation bytes owed before
+/// them, which pass whole; and those with a newline, which start a line the
+/// call may continue on and are walked one by one.
+pub(crate) struct RawTables {
+    pub plain: Vec<crate::TokenSet>,
+    pub newline: Vec<u32>,
 }
 
 impl Vocab {
@@ -145,6 +157,7 @@ impl Vocab {
             stops: stops.iter().copied().filter(|&s| (s as usize) < n).collect(),
             trie,
             free_tables: HashMap::new(),
+            raw: OnceLock::new(),
         };
         // The states a free string sits in at a token boundary almost
         // always: no escape pending, any UTF-8 debt, and after a backslash.
@@ -202,6 +215,26 @@ impl Vocab {
 
     pub fn free_table_count(&self) -> usize {
         self.free_tables.len()
+    }
+
+    pub(crate) fn raw_tables(&self) -> &RawTables {
+        self.raw.get_or_init(|| {
+            let mut plain: Vec<crate::TokenSet> = (0..8).map(|_| crate::TokenSet::new(self.n)).collect();
+            let mut newline = Vec::new();
+            for id in 0..self.n as u32 {
+                let Some(bytes) = self.token_bytes(id) else { continue };
+                if bytes.contains(&b'\n') {
+                    newline.push(id);
+                    continue;
+                }
+                for (debt, set) in plain.iter_mut().enumerate() {
+                    if bytes.iter().try_fold(debt as u8, |d, &b| crate::tool_calls::utf8_next(d, b)).is_some() {
+                        set.insert(id);
+                    }
+                }
+            }
+            RawTables { plain, newline }
+        })
     }
 }
 

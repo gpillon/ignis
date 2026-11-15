@@ -93,7 +93,7 @@ impl Parameters {
 
     /// Whether a call that wrote `written` may close: every required
     /// parameter written.
-    fn may_close(&self, written: &[bool]) -> bool {
+    pub fn may_close(&self, written: &[bool]) -> bool {
         self.required.iter().all(|place| place.is_some_and(|i| written.get(i) == Some(&true)))
     }
 
