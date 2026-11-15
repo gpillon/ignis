@@ -552,7 +552,10 @@ fn pattern_slot(dfa: &ByteDfa, re: u32, null: bool) -> Option<Slot> {
 impl ToolCallGrammar {
     /// Compile a request's tools. `schemas[i]` is tool `i`'s compiled
     /// `parameters` when it is held; a normalized tool the dialect cannot
-    /// hold is left free here, where a strict one is refused.
+    /// hold is left free here, where a strict one is refused. With `only`,
+    /// the function a named `tool_choice` names, a call names that tool
+    /// alone, when the dialect can write its name, and every declared tool
+    /// otherwise.
     pub(crate) fn compile(
         vocab: Arc<Vocab>,
         controls: Arc<Controls>,
@@ -560,14 +563,16 @@ impl ToolCallGrammar {
         memo_budget: usize,
         tools: &[DeclaredTool],
         schemas: Vec<Option<HeldSchema>>,
+        only: Option<&str>,
     ) -> Result<Self, ToolRefusal> {
+        let only = only.filter(|name| tools.iter().any(|tool| tool.name == *name) && writable_name(name));
         let mut names = LitTrie::new();
         let mut name_tools = HashMap::new();
         let mut callable = 0;
         let mut held = Vec::new();
         for (i, (tool, mut schema)) in tools.iter().zip(schemas).enumerate() {
             let name_refusal = |code, detail: String| ToolRefusal { tool: i, field: ToolField::Name, refusal: refusal(code, "name", "#", detail) };
-            let writable = !tool.name.contains('>') && !tool.name.contains(CALL_CLOSE.trim_end_matches('>'));
+            let writable = writable_name(&tool.name);
             let duplicate = tools.iter().enumerate().any(|(j, other)| j != i && other.name == tool.name);
             if schema.as_ref().is_some_and(|s| s.normalized) && (!writable || duplicate) {
                 schema = None;
@@ -583,7 +588,7 @@ impl ToolCallGrammar {
                     return Err(name_refusal("duplicate_tool_name", format!("another tool is also named \"{}\", so a call to it names neither", tool.name)));
                 }
             }
-            if writable && !tool.name.is_empty() {
+            if writable && !tool.name.is_empty() && only.is_none_or(|only| only == tool.name) {
                 let before = name_tools.len();
                 names.add(tool.name.as_bytes());
                 let node = name_node(&names, tool.name.as_bytes());
@@ -1053,6 +1058,12 @@ impl ToolCallGrammar {
         }
         false
     }
+}
+
+/// Whether the dialect can write a function's name: it ends at its first
+/// `>`, and `</tool_call` in it would read as the call's end.
+fn writable_name(name: &str) -> bool {
+    !name.contains('>') && !name.contains(CALL_CLOSE.trim_end_matches('>'))
 }
 
 /// The node `bytes` reach in `trie`.

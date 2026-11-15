@@ -1634,7 +1634,8 @@ fn tool_hold(
 /// parameter's name, a held string with no value it can write on one line);
 /// and, with thinking on, a tokenizer with no single-token `</think>` to
 /// hold the content after. A normalized tool is never refused: where any of
-/// those would refuse it, it stays free (#614).
+/// those would refuse it, it stays free (#614). Under a named `tool_choice`
+/// (`named`), a call names that tool alone (#615).
 pub(crate) fn held_tools(
     server: &Server,
     raw: &[ignis_grammar::json::Json],
@@ -1642,6 +1643,7 @@ pub(crate) fn held_tools(
     thinking: &ThinkingOptions,
     without_strict: WithoutStrict,
     switch: ToolArguments,
+    named: Option<&str>,
 ) -> Result<Option<HeldTools>, Response> {
     use ignis_grammar::{DeclaredTool, ToolField, ToolHold};
     let holds: Vec<ToolHold> =
@@ -1660,7 +1662,7 @@ pub(crate) fn held_tools(
         .zip(holds)
         .map(|(tool, hold)| DeclaredTool { name: tool["function"]["name"].as_str().unwrap_or_default().to_owned(), hold })
         .collect();
-    let grammar = grammars.tool_calls(&declared).map_err(|refused| {
+    let grammar = grammars.tool_calls_naming(&declared, named).map_err(|refused| {
         let field = match refused.field {
             ToolField::Name => "name",
             ToolField::Parameters => "parameters",
@@ -1763,7 +1765,8 @@ pub(crate) struct HeldContent {
 /// - An answer alone, or the held tools alone, is held to its own
 ///   grammar. The tools' holds every turn that may call them: `tool_choice`
 ///   `"auto"`, `"required"` or a named function, whose forced literal opens
-///   the call and whose tokens the grammar follows (#286), and
+///   the call and whose tokens the grammar follows (#286), the call held to
+///   the named function's name, and
 ///   `parallel_tool_calls: false`, whose turn ends at the call's confirmed
 ///   close, where the scanner holding the tool closes it.
 /// - An answer beside held tools: until the answer starts, the call's
@@ -1778,11 +1781,16 @@ pub(crate) fn held_content(
     answer: Option<HeldAnswer>,
     raw: &[ignis_grammar::json::Json],
     tools: &[JsonValue],
+    tool_choice: &ToolChoice,
     thinking: &ThinkingOptions,
     without_strict: WithoutStrict,
 ) -> Result<HeldContent, Response> {
     let switch = server.live().tool_arguments;
-    let held_tools = held_tools(server, raw, tools, thinking, without_strict, switch)?;
+    let named = match tool_choice {
+        ToolChoice::Function(name) => Some(name.as_str()),
+        _ => None,
+    };
+    let held_tools = held_tools(server, raw, tools, thinking, without_strict, switch, named)?;
     let (grammar, description) = match (answer, &held_tools) {
         (Some(answer), Some(held)) => (Some(answer.grammar.holding_calls(held.calls.clone())), answer.description),
         (Some(answer), None) => (Some(answer.grammar), answer.description),
@@ -3378,7 +3386,7 @@ async fn chat_completions(
         Err(response) => return response,
     };
     let HeldContent { grammar, description, schemas, .. } =
-        match held_content(&server, held, raw_tools.as_deref().unwrap_or_default(), &tools, &thinking, WithoutStrict::Free) {
+        match held_content(&server, held, raw_tools.as_deref().unwrap_or_default(), &tools, &tool_choice, &thinking, WithoutStrict::Free) {
             Ok(content) => content,
             Err(response) => return response,
         };

@@ -396,8 +396,10 @@ the request asks of the turn.
   miss. With thinking on the opening is forced after the reasoning closes;
   when the model has already opened the call itself there, and what it
   wrote is not how the opening goes on (a line break more, say), the server
-  stops forcing and the grammar holds the rest: the call names one of the
-  request's tools, though not always the one a named `tool_choice` named.
+  stops forcing and the grammar holds the rest. Under a named function the
+  call names that function, there too; only a named function whose name
+  holds `>`, which the dialect cannot write, leaves the call to any of the
+  request's tools.
 - **`response_format` beside strict tools**: until the answer starts,
   `<tool_call>` releases the turn from the schema, as
   [above](#tools-beside-structured-output), and the call is held to its

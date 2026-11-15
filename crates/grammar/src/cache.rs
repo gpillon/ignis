@@ -149,7 +149,25 @@ impl GrammarCache {
     /// normalize, or which the dialect cannot hold, is left free
     /// ([`ToolCallGrammar::holds`]).
     pub fn tool_calls(&self, tools: &[DeclaredTool]) -> Result<Arc<ToolCallGrammar>, ToolRefusal> {
+        self.tool_calls_naming(tools, None)
+    }
+
+    /// [`GrammarCache::tool_calls`], a call naming `only` alone where it is
+    /// some: the function a named `tool_choice` names, so that the call the
+    /// turn makes is to that tool even where its forced opening yields to
+    /// the grammar, or the model opened the call itself (#615). A name the
+    /// dialect cannot write leaves every declared tool callable. Cached apart
+    /// from the same tools under `"auto"`.
+    pub fn tool_calls_naming(&self, tools: &[DeclaredTool], only: Option<&str>) -> Result<Arc<ToolCallGrammar>, ToolRefusal> {
         let mut key = Vec::new();
+        match only {
+            Some(name) => {
+                key.push(1);
+                key.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                key.extend_from_slice(name.as_bytes());
+            }
+            None => key.push(0),
+        }
         for tool in tools {
             key.extend_from_slice(&(tool.name.len() as u32).to_le_bytes());
             key.extend_from_slice(tool.name.as_bytes());
@@ -190,7 +208,7 @@ impl GrammarCache {
         }
         let controls = self.controls.get_or_init(|| Arc::new(Controls::new(&self.vocab, &self.added))).clone();
         self.compiles.fetch_add(1, Ordering::Relaxed);
-        let result = ToolCallGrammar::compile(self.vocab.clone(), controls, self.limits.max_whitespace, self.limits.cache_bytes, tools, schemas)
+        let result = ToolCallGrammar::compile(self.vocab.clone(), controls, self.limits.max_whitespace, self.limits.cache_bytes, tools, schemas, only)
             .map(Arc::new);
         self.keep(key, Compiled::ToolCalls(result.clone()));
         result

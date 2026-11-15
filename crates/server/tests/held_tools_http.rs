@@ -654,6 +654,35 @@ async fn with_thinking_on_a_call_written_in_the_reasoning_is_neither_held_nor_pa
     }
 }
 
+/// A named `tool_choice` beside a strict tool, thinking on, where its forced
+/// opening yields: the model's run commits `</think>`, its own
+/// `<tool_call>` and a line break, and the line break after them is not
+/// the opening's `<`. The call it then writes to `wrote_file`, another of
+/// the request's tools, is held to the named `write_file`: the name's `o`
+/// and the mode `x` repaired.
+#[tokio::test]
+async fn a_named_tool_choice_holds_the_call_to_its_name_where_its_opening_yields() {
+    let wrote = SEARCH.replace("\"search\"", "\"wrote_file\"");
+    let script = format!("ok</think><tool_call>\n\n{}", &call("wrote_file", &[("mode", "x"), ("path", "a.txt"), ("content", "hi")])["<tool_call>\n".len()..]);
+    let mock = Arc::new(MockCompute::with_runs(&[5]));
+    mock.script(0, &encode(&script));
+    let scheduler = ConcreteScheduler::with_config(SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() }, mock.clone());
+    let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(Vocabulary::new()))
+        .with_request_timeout(Duration::from_secs(5))
+        .with_seedless_seed(0)
+        .with_family(ModelFamily::Qwen38_27b)
+        .with_metrics();
+    let named = r#""tool_choice":{"type":"function","function":{"name":"write_file"}}"#;
+    let body = chat_with(&[WRITE_FILE, &wrote], false, 512, named).replace("\"enable_thinking\":false", "\"enable_thinking\":true");
+    let (status, json, text) = post(&server, &body).await;
+    assert_eq!(status, 200, "{text}");
+    let calls = json["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1, "{text}");
+    assert_eq!(calls[0]["function"]["name"], "write_file", "{text}");
+    assert_eq!(calls[0]["function"]["arguments"], r#"{"path":"a.txt","content":"hi","mode":"a"}"#);
+    tool_counts(&server, 1, 2).await;
+}
+
 /// `parallel_tool_calls: false` beside a strict tool: the turn ends at the
 /// call's confirmed close, not at the call closer its `content` holds on a
 /// line of its own, where the first-occurrence rule would end it; the value

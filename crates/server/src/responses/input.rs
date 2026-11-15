@@ -296,7 +296,7 @@ pub(crate) async fn prepare(
     // its schema allows it (#614); a strict tool's refusals come before
     // anything is rendered or generated, and a warm-up holds no grammar.
     let api::HeldContent { grammar, description, schemas, held: held_tools, switch } =
-        api::held_content(server, held, &raw_tools, &tools, &thinking, api::WithoutStrict::Normalized)?;
+        api::held_content(server, held, &raw_tools, &tools, &tool_choice, &thinking, api::WithoutStrict::Normalized)?;
     let (grammar, description) = (grammar.filter(|_| !warm_up), description.filter(|_| !system_only));
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
         .map_err(|message| api::bad_request(&message))?;

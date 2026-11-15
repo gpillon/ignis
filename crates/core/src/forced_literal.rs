@@ -57,14 +57,15 @@
 //!
 //! # Beside a grammar
 //!
-//! A request with **strict tools** holds its calls to their grammar, the
+//! A request with **held tools** holds their calls to their grammar, the
 //! forced call's included (GitHub #615): the literal's tokens are fed to the
 //! grammar as they are forced, and a token the grammar would not take where
 //! the content stands -- the model's own unseen token after its own
 //! `<tool_call>` having been whitespace, say -- is not forced. The literal
 //! is then released ([`ForcedState::release`]) and the grammar holds the
-//! rest of the call: a call to one of the request's tools, though not
-//! always the one a named `tool_choice` named.
+//! rest of the call: under a named `tool_choice`, a call to the function it
+//! names, whose name the server holds the grammar to
+//! (`ignis_grammar::GrammarCache::tool_calls_naming`).
 
 use std::sync::Arc;
 

@@ -327,6 +327,36 @@ fn a_tool_set_sent_again_is_compiled_once_and_its_strict_schemas_with_it() {
     assert_eq!(held, vec![("write_file", vec!["path".into(), "content".into(), "mode".into()]), ("get_time", vec!["zone".into(), "day".into()])]);
 }
 
+/// A named `tool_choice` (#615): a call names that tool alone, held or not,
+/// whatever else the request declares, and the same tools under `"auto"`
+/// are a grammar of their own, every tool callable. A named tool whose name
+/// the dialect cannot write leaves every declared tool callable.
+#[test]
+fn a_named_tool_choice_holds_the_call_to_its_name() {
+    let cache = cache();
+    let named = |name: &str| ToolCallMatcher::new(cache.tool_calls_naming(&tools(), Some(name)).unwrap());
+    let heads = |mut m: ToolCallMatcher| -> Vec<bool> {
+        let mut opens: Vec<bool> = ["write_file", "get_time", "search"]
+            .iter()
+            .map(|name| m.clone().accept_bytes(format!("<tool_call>\n<function={name}>").as_bytes()))
+            .collect();
+        opens.push(m.accept_bytes(b"<tool_call>\n<function="));
+        opens
+    };
+    assert_eq!(heads(named("write_file")), [true, false, false, true]);
+    assert_eq!(heads(named("search")), [false, false, true, true], "a named tool that is not held");
+    let auto = ToolCallMatcher::new(cache.tool_calls(&tools()).unwrap());
+    assert_eq!(heads(auto), [true, true, true, true], "the same tools under \"auto\", cached apart");
+    // The tools it does not name stay held: what the scanner and the echo read.
+    let grammar = cache.tool_calls_naming(&tools(), Some("search")).unwrap();
+    assert!(grammar.holds(0) && grammar.holds(1) && !grammar.holds(2));
+    assert_eq!(grammar.held().count(), 2);
+    // A name the dialect cannot write: every declared tool, as before.
+    let beside = [tool("write_file", Some(WRITE_FILE)), tool("a>b", None)];
+    let mut m = ToolCallMatcher::new(cache.tool_calls_naming(&beside, Some("a>b")).unwrap());
+    assert!(m.accept_bytes(b"<tool_call>\n<function=write_file>"));
+}
+
 // ── typed and nullable values (#612) ─────────────────────────────────────
 
 /// `edit`, strict and typed: an integer with bounds, a boolean, an object

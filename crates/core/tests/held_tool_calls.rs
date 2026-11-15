@@ -398,6 +398,45 @@ fn a_call_the_model_opens_in_the_run_that_closes_its_reasoning_is_continued_or_y
     }
 }
 
+/// A named `tool_choice` beside a held tool holds the call to the name it
+/// names, on the two paths where its forced opening does not write the
+/// name: the literal yielding to the grammar after a line break more, and
+/// the model having written the whole common opening itself in the run that
+/// closes its reasoning, the literal then left alone. The model goes on to
+/// name `wrote_file`, another declared tool: its `o` is a miss, repaired to
+/// the named `write_file`'s `i`, and the call is held to that tool, its
+/// mode `x` repaired too.
+#[test]
+fn a_named_tool_choice_holds_the_call_to_its_name_where_its_literal_does_not_write_it() {
+    let tools = [
+        DeclaredTool { name: "write_file".into(), hold: ToolHold::Strict(WRITE_FILE.into()) },
+        DeclaredTool { name: "wrote_file".into(), hold: ToolHold::Free },
+    ];
+    let named = || cache().tool_calls_naming(&tools, Some("write_file")).unwrap();
+    let other = body("x").replacen("write_file", "wrote_file", 1);
+    let opening = script(&[&[OPEN], &encode("\n<function")]);
+    let cases = [
+        ("a line break more", 5, script(&[&encode("ok"), &[THINK_END, OPEN], &encode("\n\n"), &encode(&other[1..]), &[CLOSE]])),
+        ("the model's own opening", 16, script(&[&encode("ok"), &[THINK_END], &opening, &encode(&other["\n<function".len()..]), &[CLOSE]])),
+    ];
+    for (what, run, written) in cases {
+        let mock = Arc::new(MockCompute::with_runs(&[run]));
+        let mut sched = scheduler(&mock);
+        let literal = script(&[&[OPEN], &encode("\n<function=write_file>\n")]);
+        let forced = ForcedLiteral::after_reasoning(literal, THINK_END, required_opening().len()).unwrap();
+        let id = submit_held(&mut sched, true, 256, AnswerGrammar::tool_calls(named()).after(THINK_END), Some(forced));
+        mock.script(id, &written);
+
+        let events = run_to_idle(&mut sched);
+
+        let held = String::from_utf8(emitted(&events, id).iter().filter(|&&t| t < 128 && t != OPEN && t != CLOSE && t != THINK_END).map(|&t| t as u8).collect()).unwrap();
+        assert!(held.contains("<function=write_file>\n<parameter=mode>\na\n"), "{what}: {held:?}");
+        assert!(!held.contains("wrote_file"), "{what}: {held:?}");
+        assert_eq!(misses(&events, id), (2, 2), "{what}: the name's `o` and the mode");
+        assert_eq!(reason(&events, id), FinishReason::Stop, "{what}");
+    }
+}
+
 /// A repair before the answer starts may draw the opener (#592): beside the
 /// request's strict tools the call it opens is held from there, the mask
 /// the answer's set was built for read anew by the tools' grammar.
