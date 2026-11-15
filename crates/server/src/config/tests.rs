@@ -2094,6 +2094,21 @@ fn the_27bs_mtp_setting_round_trips_and_its_scope_names_both_models() {
             assert_eq!((read.speculation, read.speculation_off), (started.speculation, started.speculation_off), "{flags:?} {name}");
         }
     }
+    // Under a profile whose DFlash2 window is not the head's default, the
+    // document writes the window that runs, not the profile's.
+    let profiles = "profiles:
+  drafts:
+    spec:
+      qwen38: { backend: dflash2, draft_tokens: 5 }
+";
+    let files = MemFiles::with(&[("p.yaml", profiles)]);
+    let flags = ["--config", "p.yaml", "--profile", "drafts", "--qwen38-vision-enabled", "false", "--spec-backend", "mtp"];
+    let started = with_files(&flags, no_env, &files).unwrap().for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert_eq!(started.speculation, Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)));
+    let document = file::effective_document(&started);
+    let files = MemFiles::with(&[("c.yaml", &Format::Yaml.write(&document))]);
+    let read = with_files(&["--config", "c.yaml"], no_env, &files).unwrap().for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert_eq!(read.speculation, started.speculation, "{document}");
     let backend = schema::field("spec", "backend").unwrap();
     assert!(!backend.applies.refused_by(ModelFamily::Qwen38_27b) && !backend.applies.refused_by(ModelFamily::FlashNext));
     let text = backend.description_line();

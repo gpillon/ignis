@@ -23,12 +23,15 @@
 //!    window-0 load writes no `spec.*` field and exports no speculative
 //!    series. The load's log names the drafter and the window.
 //! 3. **Structured output.** A `json_schema` response format answers with a
-//!    document valid under its schema.
+//!    document valid under its schema; a request at the API's defaults
+//!    (thinking on, sampled) drafts too.
 //! 4. **Siblings over one system prompt reuse the shared prefix**, each
-//!    answering its own question and drafting, two of them claiming it at
-//!    once: every holder keeps its own copy of the prefix's last page (ADR
-//!    0095), so the pool runs at its floor, the pages admission keeps back
-//!    for those copies included (GitHub #623).
+//!    answering its own question and drafting, seven of them claiming it at
+//!    once, one a lane: every holder keeps its own copy of the prefix's last
+//!    page (ADR 0095), on a pool at its floor, the pages admission keeps back
+//!    for those copies included (GitHub #623), their reservations filling
+//!    what admission holds. A pool a page under that floor is refused before
+//!    anything loads, naming the copies.
 //! 5. **A request evicted to KV-RAM goes on.** On that floor pool, an Agent
 //!    request is decoding when an Interactive request reserving one whole
 //!    context arrives: admission holds exactly that context beside the
@@ -424,6 +427,7 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
     assert!(on_plan["kv_pool_pages"].as_u64().unwrap() >= floor, "the served pool holds its floor: {on_plan}");
     assert_eq!(on_plan["drafter_round_bytes"], 0, "no DFlash2 round");
 
+    let done_at_load = log.named("ignis.request.done").len();
     let mut on_runs = Vec::new();
     for (name, tokens) in &prompts {
         let run = run(on.engine(), name, tokens).await;
@@ -431,6 +435,25 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
         println!("{name}: {} tokens, {} rounds, {} drafted, {} accepted", run.tokens.len(), spec.rounds, spec.drafted, spec.accepted);
         on_runs.push(run);
     }
+    // The engine's runs are requests too: their lines and their counters
+    // first, the sums of what the runs reported.
+    let engine_sum = on_runs.iter().filter_map(|run| run.spec).fold((0, 0, 0), |sum, spec| {
+        (sum.0 + u64::from(spec.rounds), sum.1 + u64::from(spec.drafted), sum.2 + u64::from(spec.accepted))
+    });
+    log.at_least("ignis.request.done", done_at_load + prompts.len()).await;
+    let mut counted = (0, 0, 0);
+    for _ in 0..200 {
+        counted = (
+            metric(&on.metrics, "ignis_speculative_rounds_total").await,
+            metric(&on.metrics, "ignis_speculative_drafted_tokens_total").await,
+            metric(&on.metrics, "ignis_speculative_accepted_tokens_total").await,
+        );
+        if counted == engine_sum {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(counted, engine_sum, "/metrics counts the engine's runs' rounds, drafts and accepted drafts");
     // Through the route: the engine's text, and the request log's counters
     // are the engine run's.
     let (rounds_before, drafted_before, accepted_before) = (
@@ -456,7 +479,8 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
         assert_eq!(logged, (u64::from(spec.rounds), u64::from(spec.drafted), u64::from(spec.accepted)), "{name}: {line}");
         assert!(logged.0 > 0 && logged.1 <= u64::from(WINDOW) * logged.0 && logged.2 <= logged.1, "{name}: {line}");
         let completion = response.pointer("/usage/completion_tokens").and_then(Value::as_u64).unwrap();
-        assert_eq!(line["attributes"]["tokens"].as_u64(), Some(completion), "{name}: the line's tokens are the usage's");
+        let tokens = line["attributes"]["tokens"].as_u64().unwrap();
+        assert!((completion..=completion + 1).contains(&tokens), "{name}: the line's {tokens} tokens against the usage's {completion}");
         assert!(completion <= logged.0 + logged.2 + 1, "{name}: a round commits its accepted drafts and one token: {line}");
         logged_sum = (logged_sum.0 + logged.0, logged_sum.1 + logged.1, logged_sum.2 + logged.2);
     }
@@ -489,6 +513,18 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
     assert!(faults.is_empty(), "the answer {answer}: {faults:?}");
     let done = log.at_least("ignis.request.done", done_before + PROMPTS.len() + 1).await;
     println!("structured output's request log: {}", done[done_before + PROMPTS.len()]);
+    // A request at the API's defaults: thinking on, sampled at the model's
+    // own settings, so the head drafts for a sampling lane and the reasoning
+    // closes inside its rounds.
+    let defaults = json!({ "model": MODEL, "messages": [{ "role": "user", "content": "Why is the sky blue? Two sentences." }], "max_tokens": 400 });
+    let response = chat(on.app.clone(), defaults).await;
+    let message = &response["choices"][0]["message"];
+    let said = format!("{}{}", message["reasoning_content"].as_str().unwrap_or_default(), message["content"].as_str().unwrap_or_default());
+    assert!(!said.trim().is_empty(), "a defaults request says something: {response}");
+    let done = log.at_least("ignis.request.done", done_before + PROMPTS.len() + 2).await;
+    let line = &done[done_before + PROMPTS.len() + 1];
+    println!("a request at the defaults: {line}");
+    assert!(logged_spec(line).is_some_and(|(rounds, _, _)| rounds > 0), "the head drafted for a sampling lane: {line}");
     on.close().await;
 
     // ── 1-2. The same flags at a window of 0: no speculation ────────────────
@@ -522,7 +558,11 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
     println!("{} of {} prompts split at a near tie", splits.len(), prompts.len());
 
     // ── 4-5. A pool at its floor, prompt reuse on, hq-e8-2b ─────────────────
-    let small = ["--spec-backend", "mtp", "--qwen38-vision-enabled", "false", "--model-max-context", "4096", "--model-idle-unload", "0", "--model-loop-guard", "off"];
+    // The lanes named, so a plan that refuses does not adapt them away.
+    let small = [
+        "--spec-backend", "mtp", "--qwen38-vision-enabled", "false", "--model-max-context", "4096", "--spec-decode-lanes", "8",
+        "--model-idle-unload", "0", "--model-loop-guard", "off",
+    ];
     let unsized_options = options(&flags(&small, &[]));
     let shape = ignis_server::runtime::EngineShape::from(&unsized_options);
     let lanes = shape.decode_lanes_for(ModelFamily::Qwen38_27b);
@@ -549,28 +589,42 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
     assert_eq!(tight_plan["kv_holder_pages"].as_u64(), Some(u64::from(reserve)));
     assert_eq!(holder_pages(&tight_plan, u64::from(lanes)), u64::from(reserve), "the load's lanes and retained slots");
 
-    // Siblings over one system prompt: the first publishes it, two claim it
-    // at once.
+    // Siblings over one system prompt: the first publishes it, seven claim it
+    // at once, every lane holding a copy of its last page, their reservations
+    // filling what admission holds.
     let system = system_prompt();
-    let sibling = |q: &str| chat_body(json!([{ "role": "system", "content": system }, { "role": "user", "content": q }]), 32, "interactive");
+    let sibling = |q: &str, max_tokens: u32| {
+        chat_body(json!([{ "role": "system", "content": system }, { "role": "user", "content": q }]), max_tokens, "interactive")
+    };
     let reused = |metrics: Router| async move {
         metric(&metrics, "ignis_prefix_reused_tokens_total").await + metric(&metrics, "ignis_retained_reused_tokens_total").await
     };
     let done_before = log.named("ignis.request.done").len();
-    let first = chat(tight.app.clone(), sibling("What is the capital of Italy? Answer in one word.")).await;
-    let reused_before = reused(tight.metrics.clone()).await;
-    let (second, third) = tokio::join!(
-        chat(tight.app.clone(), sibling("What is the capital of Japan? Answer in one word.")),
-        chat(tight.app.clone(), sibling("What is twelve times twelve? Answer with the number only.")),
-    );
-    let done = log.at_least("ignis.request.done", done_before + 3).await;
-    let reused_tokens = reused(tight.metrics.clone()).await - reused_before;
-    println!("siblings: {:?} {:?} {:?}; reused {reused_tokens} prompt tokens", content(&first), content(&second), content(&third));
+    let first = chat(tight.app.clone(), sibling("What is the capital of Italy? Answer in one word.", 32)).await;
     assert!(content(&first).contains("Rome"), "{first}");
-    assert!(content(&second).contains("Tokyo"), "{second}");
-    assert!(content(&third).contains("144"), "{third}");
+    let reused_before = reused(tight.metrics.clone()).await;
+    let claimants = [
+        ("What is the capital of Japan? Answer in one word.", "Tokyo"),
+        ("What is the capital of France? Answer in one word.", "Paris"),
+        ("What is twelve times twelve? Answer with the number only.", "144"),
+        ("Which is the largest planet of the solar system? Answer in one word.", "Jupiter"),
+        ("What is the chemical symbol for gold? Answer with the symbol only.", "Au"),
+        ("Who wrote Hamlet? Answer with the surname only.", "Shakespeare"),
+        ("What colour is a clear daytime sky? Answer in one word.", "lue"),
+    ];
+    let answers: Vec<_> = claimants.iter().map(|(q, _)| tokio::spawn(chat(tight.app.clone(), sibling(q, 400)))).collect();
+    let mut said = Vec::new();
+    for answer in answers {
+        said.push(content(&answer.await.expect("a claimant")));
+    }
+    let done = log.at_least("ignis.request.done", done_before + 1 + claimants.len()).await;
+    let reused_tokens = reused(tight.metrics.clone()).await - reused_before;
+    println!("claimants: {said:?}; reused {reused_tokens} prompt tokens");
+    for ((q, expected), answer) in claimants.iter().zip(&said) {
+        assert!(answer.contains(expected), "{q}: {answer:?}");
+    }
     assert!(reused_tokens > 0, "the siblings reused the shared prefix");
-    for line in &done[done_before..done_before + 3] {
+    for line in &done[done_before..done_before + 1 + claimants.len()] {
         println!("sibling: {line}");
         assert!(logged_spec(line).is_some_and(|(rounds, _, _)| rounds > 0), "a sibling ran verify rounds: {line}");
     }

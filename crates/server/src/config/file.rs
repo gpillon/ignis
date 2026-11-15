@@ -436,7 +436,19 @@ pub fn effective_document(config: &Config) -> Value {
     }
     let mut changes = Vec::new();
     for (family, resolution) in families {
-        let scoped = resolution.settings.render();
+        let mut scoped = resolution.settings.render();
+        // GitHub #623: the 27B's MTP load does not take a window a profile
+        // gave beside its own DFlash2; written as it resolved, it would read
+        // back as the operator's. The document writes the window that runs.
+        if family == ModelFamily::Qwen38_27b
+            && resolution.settings.spec.backend == Some(super::SpecChoice::Backend(ignis_core::SpeculativeBackend::Mtp))
+            && resolution.settings.spec.draft_tokens.is_some()
+            && !super::mtp_window_given(&resolution)
+        {
+            if let Some(spec) = scoped.get_mut("spec").and_then(Value::as_object_mut) {
+                spec.insert("draft_tokens".to_owned(), Value::from(ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS));
+            }
+        }
         for meta in all_fields().filter(|meta| meta.takes_scope(family)) {
             let at = |groups: &Map<String, Value>| groups.get(meta.group).and_then(|group| group.get(meta.name)).cloned();
             let value = at(&scoped);

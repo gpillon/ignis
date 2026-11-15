@@ -137,7 +137,9 @@ instead of this refusal, and the next message may follow.
 
 The VRAM plan cannot hold one full context. The message ends with the knobs
 that fix it: "name a larger --vram-kv-pool-bytes, or a smaller
---model-max-context, --reuse-retained-device or --reuse-retained-host". The
+--model-max-context, --reuse-retained-device or --reuse-retained-host". On the
+27B's MTP load the floor also holds a page a lane and a page a retained slot
+for the head's holders, which the message names. The
 plan is printed as `ignis.runtime.vram_plan` (`ignis.runtime.flash_next_plan`
 on Flash-Next) ([VRAM budget and the KV pool](configuration/vram-and-kv-pool.md#the-kv-pool),
 [ADR 0030](../adr/0030-device-memory-reserved-at-load.md)). On a card that
@@ -377,6 +379,27 @@ Flash-Next's MTP head needs its companion container
 (`qwen3_8_flash_next_mtp_3p0-v2.ninfer`) beside the artifact. `model download
 qwen3.8-flash-next` fetches both
 ([Flash-Next speculation](configuration/flash-next-mtp.md)).
+
+### `` `--spec-backend mtp`: the 27B's MTP head does not draft beside vision yet ``
+
+From 0.11.0 the 27B takes its own MTP head as its drafter, but not yet beside
+images, and every built-in profile turns the 27B's vision on. The message names
+where vision came from (the profile's `vision.qwen38.enabled`, your own flag,
+or the model switched from, whose vision a switch carries) and the fix:
+`--qwen38-vision-enabled false` turns vision off for the 27B alone. A model
+switch to the 27B is refused the same way, and a `--spec-draft-tokens 0`
+start, which loads no head, keeps vision
+([the 27B's two drafters](concepts/speculative-decoding.md#the-27bs-two-drafters)).
+
+### `` `--spec-drafter-top-p …`: the drafter top-p is DFlash2's, and the 27B's MTP head … drafts the fixed draft only ``
+
+On the 27B's MTP load the settings only DFlash2 reads are refused where you
+named them: `--spec-draft-rule sampled`, `--spec-drafter-temperature-factor`,
+`--spec-drafter-top-p` (by a flag or an env var at any value, in a config file
+at a value other than the default) and `--spec-draft-head shortlist`. Remove
+them, or scope them to a DFlash2 load. `--spec-draft-rule fixed` names the
+head's own rule and is accepted
+([context, KV and speculation](configuration/context-and-speculation.md)).
 
 ### Flash-Next refuses the start for its vision companion
 
