@@ -492,6 +492,12 @@ The EXL3 weight code (16×16 tiles, the `mul1` codebook, Hadamard rotation with
 per-channel scales on both sides), bit-compatible with exllamav3's records, at
 a **K** per matrix.
 
+**Recipe**:
+The K of every matrix of a trellis body and the bits of its output head. Its
+bits per weight are the average of those, a property of the recipe and not of
+the model.
+_Avoid_: "2.8 bpw model", quant level.
+
 **Object**:
 The unit inside an artifact. The binder must consume every object at bind time;
 an unconsumed object is a load failure.
