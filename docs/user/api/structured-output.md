@@ -532,8 +532,11 @@ schema you sent.
   same `400`.
 - **Misses and repairs** count as a strict tool's, with the type `tool`.
 - **The default, `as-sent`**, serves every tool as the sections above say,
-  byte for byte as before. It stays the default until `held` is measured on
-  the 27B: no slower, and repairs that write sensible arguments.
+  byte for byte as before. Measured on the 27B, `held` is no slower, but on an
+  agentic replay it changed no call, every one already valid
+  ([finding](../../findings/2026-11-15-held-tools-served-on-the-27b.md)), so
+  `as-sent` stays the default. Where `ignis_tool_calls_total{outcome="invalid"}`
+  counts invalid calls, `held` is the switch to try.
 - **On Flash-Next the switch changes nothing** until that model holds tool
   calls (GitHub #581): a Flash-Next start takes it, and serves every tool as
   before.

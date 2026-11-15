@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 amends: [ADR-0017, ADR-0089]
 ---
 
@@ -107,8 +107,10 @@ naming an undeclared key), nor where the subset or the dialect refuses it. `mode
 default, or `held`) is a live field read once per request: `held` normalizes every tool not sent `strict: true`,
 `strict: false` included because the agent CLIs send it on every tool. The field is every family's, so one
 configuration file starts either model; it changes nothing on Flash-Next until #581. Its values join a value of
-several words by `-`, as the configuration spells them. The default changes only if the served close-out (#617)
-measures `held` on the 27B as no slower, with sensible repairs.
+several words by `-`, as the configuration spells them. The default stays `as-sent`: the served close-out (#617)
+measured `held` on the 27B as no slower, but on the owner's agentic replay it changed no call, every one already
+valid, and the corpus's one repair wrote a value the free call left out, so nothing measured justifies leaving
+OpenAI's defaults ([finding](../findings/2026-11-15-held-tools-served-on-the-27b.md)).
 
 **Scope and documented exceptions.** A request with no held tool changes by no byte; with one, every call's name
 is held to the declared tools. Flash-Next keeps its tools free until #581: `strict` is accepted and inert, as the
