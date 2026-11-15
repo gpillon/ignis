@@ -12,7 +12,8 @@
 
 use std::sync::Arc;
 
-use ignis_core::structured::AnswerGrammar;
+use ignis_core::forced_literal::ForcedLiteral;
+use ignis_core::structured::{AnswerGrammar, StructuredKind};
 use ignis_core::{
     ConcreteScheduler, DecodeParams, FinishReason, MockCompute, PendingToken, RequestClass, RequestId, RequestInput,
     SchedEvent, Scheduler, SchedulerConfig, TokenId,
@@ -30,7 +31,7 @@ const VOCAB: TokenId = 128;
 
 const WRITE_FILE: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"mode":{"type":"string","enum":["w","a"]}},"required":["path","mode"],"additionalProperties":false}"#;
 
-fn grammar() -> Arc<ToolCallGrammar> {
+fn cache() -> GrammarCache {
     let entries = (0..VOCAB)
         .map(|id| match id {
             STOP | THINK_END | OPEN | CLOSE => VocabEntry::Control,
@@ -39,8 +40,11 @@ fn grammar() -> Arc<ToolCallGrammar> {
         })
         .collect();
     let added = vec![(THINK_END, b"</think>".to_vec()), (OPEN, b"<tool_call>".to_vec()), (CLOSE, b"</tool_call>".to_vec())];
-    let cache = GrammarCache::new(Vocab::new(entries, &[STOP]), DEFAULT_CACHE_BYTES).with_added_texts(added);
-    cache.tool_calls(&[DeclaredTool { name: "write_file".into(), strict: Some(WRITE_FILE.into()) }]).unwrap()
+    GrammarCache::new(Vocab::new(entries, &[STOP]), DEFAULT_CACHE_BYTES).with_added_texts(added)
+}
+
+fn grammar() -> Arc<ToolCallGrammar> {
+    cache().tool_calls(&[DeclaredTool { name: "write_file".into(), strict: Some(WRITE_FILE.into()) }]).unwrap()
 }
 
 fn encode(text: &str) -> Vec<TokenId> {
@@ -53,6 +57,18 @@ fn scheduler(mock: &Arc<MockCompute>) -> ConcreteScheduler {
 
 fn submit(sched: &mut ConcreteScheduler, thinking: bool, max_tokens: u32) -> RequestId {
     let held = AnswerGrammar::tool_calls(grammar());
+    submit_held(sched, thinking, max_tokens, if thinking { held.after(THINK_END) } else { held }, None)
+}
+
+/// A request whose content is held to `grammar`, with the literal `forced`
+/// (GitHub #615).
+fn submit_held(
+    sched: &mut ConcreteScheduler,
+    thinking: bool,
+    max_tokens: u32,
+    grammar: AnswerGrammar,
+    forced: Option<ForcedLiteral>,
+) -> RequestId {
     sched
         .submit(
             RequestInput {
@@ -66,8 +82,8 @@ fn submit(sched: &mut ConcreteScheduler, thinking: bool, max_tokens: u32) -> Req
                 tokens: vec![1, 2, 3],
                 params: DecodeParams { max_tokens: Some(max_tokens), starts_in_reasoning: thinking, ..DecodeParams::default() },
                 constrained: None,
-                forced_literal: None,
-                grammar: Some(if thinking { held.after(THINK_END) } else { held }),
+                forced_literal: forced.map(Arc::new),
+                grammar: Some(grammar),
                 warm_up: false,
             },
             RequestClass::Interactive,
@@ -214,4 +230,130 @@ fn a_stop_ends_free_text_and_an_eos_decoded_past_passes_it() {
     assert_eq!(state.check(PendingToken::Token(OPEN)), Verdict::Passed);
     assert_eq!(state.check(PendingToken::Token(STOP)), Verdict::Miss);
     assert_eq!(state.check(PendingToken::Stop), Verdict::Miss);
+}
+
+// ── GitHub #615: beside a forced literal and a structured answer ────────
+
+/// `tool_choice` `"required"`'s opening as the server forces it: the call's
+/// opener up to `function`, before the name.
+fn required_opening() -> Vec<TokenId> {
+    script(&[&[OPEN], &encode("\n<function")])
+}
+
+/// The call's text after the `"required"` opening, to `write_file` under a
+/// name of the model's own, `mode` first, its value `value`.
+fn after_opening(value: &str) -> Vec<TokenId> {
+    script(&[&encode(&body(value).replacen("\n<function=write_file", "=wrote_file", 1)), &[CLOSE]])
+}
+
+/// Thinking off, `"required"`: the forced literal opens the call from the
+/// prefill's draw. Each forced token is fed to the grammar and none is a
+/// miss, though the model would have written text there; what the model
+/// writes after it is held: its own name for the tool and a mode outside
+/// the enum, each repaired.
+#[test]
+fn a_call_a_forced_literal_opens_is_held_after_it_and_its_tokens_are_no_miss() {
+    let mock = Arc::new(MockCompute::new());
+    let mut sched = scheduler(&mock);
+    let forced = ForcedLiteral::at_generation(required_opening()).unwrap();
+    let id = submit_held(&mut sched, false, 256, AnswerGrammar::tool_calls(grammar()), Some(forced));
+    mock.script(id, &script(&[&encode("Sure, I'll "), &after_opening("x"), &encode("\nDone.")]));
+
+    let events = run_to_idle(&mut sched);
+
+    assert_eq!(emitted(&events, id), script(&[&[OPEN], &encode(&body("a")), &[CLOSE], &encode("\nDone.")]));
+    assert_eq!(reason(&events, id), FinishReason::Stop);
+    assert_eq!(misses(&events, id), (2, 2), "`o` of `wrote` and the mode `x`, nothing forced");
+}
+
+/// Thinking on, `"required"`: the literal is forced after the model's own
+/// `</think>`, joined on the line break after the token drawn with the
+/// close, and the call it opens is held from the model's first token after
+/// it. The reasoning before is free.
+#[test]
+fn a_call_forced_after_the_reasoning_is_held_after_the_literal() {
+    let mock = Arc::new(MockCompute::new());
+    let mut sched = scheduler(&mock);
+    let forced = ForcedLiteral::after_reasoning(required_opening(), THINK_END, required_opening().len()).unwrap();
+    let id = submit_held(&mut sched, true, 256, AnswerGrammar::tool_calls(grammar()).after(THINK_END), Some(forced));
+    // Twelve tokens the joiner and the literal are forced in place of.
+    let filler = encode(&"y".repeat(required_opening().len() + 1));
+    mock.script(id, &script(&[&encode("hmm <tool_call>"), &[THINK_END], &encode("\n"), &filler, &after_opening("x")]));
+
+    let events = run_to_idle(&mut sched);
+
+    let call = script(&[&[OPEN], &encode(&body("a")), &[CLOSE]]);
+    assert_eq!(emitted(&events, id), script(&[&encode("hmm <tool_call>"), &[THINK_END], &encode("\n\n"), &call]));
+    assert_eq!(reason(&events, id), FinishReason::Stop);
+    assert_eq!(misses(&events, id), (2, 2));
+}
+
+/// A literal token the grammar would refuse where the content stands is not
+/// forced: the literal stops there and the grammar holds the rest. A named
+/// function whose name holds `>` (a tool that is not held) cannot be
+/// written by the dialect, so the model's own draw replaces it, held to the
+/// declared tools.
+#[test]
+fn a_literal_token_the_grammar_refuses_is_not_forced_and_the_grammar_holds_on() {
+    let grammar = cache()
+        .tool_calls(&[
+            DeclaredTool { name: "write_file".into(), strict: Some(WRITE_FILE.into()) },
+            DeclaredTool { name: "a>b".into(), strict: None },
+        ])
+        .unwrap();
+    let mock = Arc::new(MockCompute::new());
+    let mut sched = scheduler(&mock);
+    let forced = ForcedLiteral::at_generation(script(&[&[OPEN], &encode("\n<function=a>b>\n")])).unwrap();
+    let id = submit_held(&mut sched, false, 256, AnswerGrammar::tool_calls(grammar), Some(forced));
+    mock.script(id, &script(&[&[OPEN], &encode(&body("x")), &[CLOSE]]));
+
+    let events = run_to_idle(&mut sched);
+
+    assert_eq!(emitted(&events, id), script(&[&[OPEN], &encode(&body("a")), &[CLOSE]]));
+    assert_eq!(misses(&events, id), (1, 1), "the mode `x` alone");
+}
+
+/// A structured answer beside a strict tool: until the answer starts the
+/// opener releases the answer's grammar (#592), and the call it opens is
+/// held to the tool calls' grammar, as is every call after it in the turn,
+/// the text between them free.
+#[test]
+fn beside_a_structured_answer_the_call_the_opener_starts_is_held_and_so_is_the_next() {
+    let schema = r#"{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}"#;
+    let answer = AnswerGrammar::new(cache().json_schema(schema, true).unwrap(), StructuredKind::JsonSchema);
+    let held = answer.admitting_tool_call(OPEN).holding_calls(grammar());
+    let mock = Arc::new(MockCompute::new());
+    let mut sched = scheduler(&mock);
+    let id = submit_held(&mut sched, false, 512, held, None);
+    let call = |value: &str| script(&[&[OPEN], &encode(&body(value)), &[CLOSE]]);
+    mock.script(id, &script(&[&call("x"), &encode("\nand {not json}\n"), &call("x")]));
+
+    let events = run_to_idle(&mut sched);
+
+    assert_eq!(emitted(&events, id), script(&[&call("a"), &encode("\nand {not json}\n"), &call("a")]));
+    assert_eq!(reason(&events, id), FinishReason::Stop);
+    assert_eq!(misses(&events, id), (2, 2));
+}
+
+/// The same with thinking on, runs of eight: the first run holds the
+/// reasoning's close, the opener and a byte the call cannot start with. The
+/// host keeps it up to that byte, which is repaired, and the call is held.
+#[test]
+fn beside_a_structured_answer_a_run_holding_the_opener_and_a_miss_is_cut_at_the_miss() {
+    let schema = r#"{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}"#;
+    let answer = AnswerGrammar::new(cache().json_schema(schema, true).unwrap(), StructuredKind::JsonSchema).after(THINK_END);
+    let held = answer.admitting_tool_call(OPEN).holding_calls(grammar());
+    let mock = Arc::new(MockCompute::with_runs(&[8]));
+    let mut sched = scheduler(&mock);
+    let id = submit_held(&mut sched, true, 256, held, None);
+    let written = script(&[&encode("ok"), &[THINK_END, OPEN], &encode("x"), &encode(&body("x")), &[CLOSE]]);
+    mock.script(id, &written);
+
+    let events = run_to_idle(&mut sched);
+
+    let repaired = script(&[&encode("ok"), &[THINK_END, OPEN], &encode("\n"), &encode(&body("a")), &[CLOSE]]);
+    assert_eq!(emitted(&events, id), repaired);
+    assert_eq!(misses(&events, id), (2, 2));
+    let first: Vec<PendingToken> = written[..8].iter().map(|&t| PendingToken::Token(t)).collect();
+    assert_eq!(mock.cut_calls()[0], (id, first, 4), "kept: o, k, the close and the opener");
 }
