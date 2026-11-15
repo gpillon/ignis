@@ -637,8 +637,10 @@ bool validate_program(const ignis_model *model, const ignis_seq_pool *pool,
 // same speculative backend. A drafter-bearing model over a plain pool would
 // have no window to write; a plain model over a drafter pool would leave
 // every window unwritten while snapshots carry it as if it were state. Either
-// is refused by name before any device work.
-bool dflash2_matches_load(const ignis_model *model, const ignis_seq_pool *pool, const char *op) {
+// is refused by name before any device work. So the pool's drafter is the
+// model's, and a step past this check chooses by `model->drafter` alone
+// (GitHub #619).
+bool drafter_matches_load(const ignis_model *model, const ignis_seq_pool *pool, const char *op) {
   if (pool->speculative_backend == model->speculative_backend) {
     return true;
   }
@@ -1045,13 +1047,18 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto T = static_cast<std::int32_t>(num_tokens);
-  // The chunk's own columns the drafter taps: [tap_first, T).
+  // GitHub #619: what the chunk does for the load's drafter, chosen here once
+  // (the pool's drafter is the model's, `drafter_matches_load`). DFlash2
+  // writes the anchor an extent-0 round carried, taps the chunk's own columns
+  // [tap_first, T) into its window and stands the window's frontier at the
+  // chunk's end; the verify substrate alone does nothing here.
+  const bool dflash2 = model->drafter == IgnisDrafter::kDflash2;
   const std::uint64_t chunk_start = seq->position;
   const std::int32_t tap_first =
       dflash2_tap_from > chunk_start
           ? static_cast<std::int32_t>(std::min<std::uint64_t>(dflash2_tap_from - chunk_start, num_tokens))
           : 0;
-  const std::int32_t tap_count = pool->has_dflash2() ? T - tap_first : 0;
+  const std::int32_t tap_count = dflash2 ? T - tap_first : 0;
   // GitHub #92 criterion 1: inert unless IGNIS_CHUNK_PROFILE is set.
   ChunkProfiler &profiler = ChunkProfiler::instance();
   profiler.ensure_events(model->layers.size());
@@ -1064,7 +1071,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     // order. Its own scope: none of it outlives the enqueued append.
     std::vector<std::int32_t> pending_scalars;
     bool pending_appended = false;
-    if (chunk_offset == 0 && pool->has_dflash2()) {
+    if (chunk_offset == 0 && dflash2) {
       ninfer::DeviceArena::Scope pending_scope = model->scratch->scope();
       pending_appended = append_dflash2_pending(model, pool, *seq, pending_scalars);
     }
@@ -1499,7 +1506,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     // GitHub #506: over a chunk it tapped nothing of too. The positions below
     // the tap start are ones no later window reads, so the frontier stands at
     // the chunk's end exactly as it would have had they been tapped.
-    if (pool->has_dflash2()) {
+    if (dflash2) {
       seq->dflash2_position = chunk_start + num_tokens;
     }
     model->last_step_kernel_count = dispatches;
@@ -1646,7 +1653,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     set_error(std::string("ignis_program_prefill: ") + refusal);
     return -1;
   }
-  if (!dflash2_matches_load(model, pool, "ignis_program_prefill")) {
+  if (!drafter_matches_load(model, pool, "ignis_program_prefill")) {
     return -1;
   }
   if (seq->position != start_position) {
@@ -2010,13 +2017,17 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
   const std::uint32_t lane_columns = k + 1;
   const auto batch = static_cast<std::int32_t>(batch_size);
   const auto hidden = static_cast<std::int32_t>(model->hidden);
-  // P5-05 (GitHub #155): on a load with the drafter the leaf proposes every
-  // lane's drafts itself, inside the verify pass, and appends the committed
-  // columns' feature taps to each lane's window after the cut.
-  const bool drafter = verify.drafter_scratch != nullptr;
-  if (drafter && (options.drafts != nullptr || options.draft_counts != nullptr)) {
-    set_error("ignis_program_decode: this model was loaded with the DFlash2 drafter, which "
-              "proposes every lane's drafts; drafts and draft_counts must be NULL");
+  // GitHub #619: what fills the round's proposal follows the load's drafter.
+  // One in the leaf proposes every lane's drafts itself, inside the verify
+  // pass (P5-05, GitHub #155); the verify substrate alone takes them from
+  // the caller. Around the pass, DFlash2 alone appends: the carried anchor's
+  // taps before it and the committed columns' feature taps after the cut.
+  const bool in_leaf = ignis_drafter_proposes_in_the_leaf(model->drafter);
+  const bool dflash2 = model->drafter == IgnisDrafter::kDflash2;
+  if (in_leaf && (options.drafts != nullptr || options.draft_counts != nullptr)) {
+    set_error(std::string("ignis_program_decode: this model was loaded with ") +
+              ignis_drafter_name(model->drafter) +
+              ", which proposes every lane's drafts; drafts and draft_counts must be NULL");
     return -1;
   }
   // GitHub #267 (test-only): a teacher-forced round licenses the caller's
@@ -2076,9 +2087,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       // leaves after the anchor, or than its context leaves after the
       // anchor. 0 is the fallback step inside this same round.
       uint64_t extent = k;
-      if (!drafter && options.drafts == nullptr) {
+      if (!in_leaf && options.drafts == nullptr) {
         extent = 0;
-      } else if (!drafter && options.draft_counts != nullptr) {
+      } else if (!in_leaf && options.draft_counts != nullptr) {
         extent = std::min<uint64_t>(extent, options.draft_counts[i]);
       }
       if (sampling[i].remaining_tokens != 0) {
@@ -2096,7 +2107,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       valid_columns[i] = static_cast<std::int32_t>(extent + 1);
       slots[i] = seq->slot;
       configs[i] = to_sampling_config(sampling[i], pool->token_counts_for(seq->slot));
-      for (uint64_t j = 0; j < extent && !drafter; ++j) {
+      for (uint64_t j = 0; j < extent && !in_leaf; ++j) {
         drafts[i * k + j] = options.drafts[i * k + j];
       }
       // The lane's rotation positions: the traversal's own column rule with
@@ -2135,7 +2146,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     // same bytes when the lane runs again.
     std::vector<std::vector<std::int32_t>> pending_scalars(batch_size);
     std::vector<bool> pending_appended(batch_size, false);
-    if (drafter) {
+    if (dflash2) {
       ninfer::DeviceArena::Scope pending_scope = model->scratch->scope();
       for (uint64_t i = 0; i < batch_size; ++i) {
         pending_appended[i] = append_dflash2_pending(model, pool, *sequences[i], pending_scalars[i]);
@@ -2156,7 +2167,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     const std::size_t lane_bytes = batch_size * sizeof(std::int32_t);
     if (!stage(*verify.anchors, anchors.data(), lane_bytes, "verify anchors") ||
         // The drafter writes this buffer on the device, inside the pass.
-        (!drafter &&
+        (!in_leaf &&
          !stage(*verify.drafts, drafts.data(), drafts.size() * sizeof(std::int32_t), "verify drafts")) ||
         !stage(*verify.base_positions, base_positions.data(), lane_bytes, "verify base positions") ||
         !stage(*verify.extents, extents.data(), lane_bytes, "verify extents") ||
@@ -2252,7 +2263,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     // run's successor, so it must be a vocabulary id -- or the pad after a
     // recording that ends at a stop id (kernel/src/teacher_forcing.h).
     if (options.forced_tokens != nullptr) {
-      if (drafter) {
+      if (in_leaf) {
         err = cudaMemcpyAsync(drafts.data(), verify.drafts->p, drafts.size() * sizeof(std::int32_t),
                               cudaMemcpyDeviceToHost, model->stream);
         if (err == cudaSuccess) {
@@ -2409,7 +2420,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     // GitHub #157: what that lane carries instead -- its anchor column's
     // taps, read back for the sequence's handle.
     std::vector<std::vector<std::uint8_t>> carried_taps(batch_size);
-    if (drafter) {
+    if (dflash2) {
       for (uint64_t i = 0; i < batch_size; ++i) {
         append_counts[i] = extents[i] == 0 ? 0 : committed[i];
       }
@@ -2513,7 +2524,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       if (append_counts[i] > 0) {
         sequences[i]->dflash2_position = sequences[i]->position;
       }
-      if (drafter) {
+      if (dflash2) {
         // GitHub #157: a lane at extent 0 carries its anchor's taps, but
         // only while its window stands exactly at that anchor -- the
         // position the carried column is appended at.
@@ -2581,7 +2592,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
               " exceeds the load's decode lanes (" + std::to_string(model->decode_lanes) + ")");
     return -1;
   }
-  if (!dflash2_matches_load(model, pool, "ignis_program_decode")) {
+  if (!drafter_matches_load(model, pool, "ignis_program_decode")) {
     return -1;
   }
   for (uint64_t i = 0; i < batch_size; ++i) {

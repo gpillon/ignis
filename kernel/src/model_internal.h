@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "drafter.h"
 #include "ignis_model.h"
 #include "ignis_step.h"
 #include "ignis_trellis_linear.h"
@@ -678,6 +679,10 @@ struct ignis_model {
   // (P5-03, GitHub #152, `ignis_seq_pool`); a pool
   // built without the same backend is refused by the program entry points.
   int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
+  // GitHub #619: the drafter that backend names (kernel/src/drafter.h), set
+  // where the load binds its weights; every choice the load makes for its
+  // drafter follows it.
+  IgnisDrafter drafter = IgnisDrafter::kNone;
   uint32_t draft_tokens = 0;
   // GitHub #336: the 27B's decode lanes, a load option (1..IGNIS_DECODE_MAX_BATCH):
   // the widest decode or verify round, what every round buffer above and

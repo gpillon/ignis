@@ -1676,23 +1676,31 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     }
   }
 
-  // Without the option the `dflash2/*` tensors are not asked for, so a caller
-  // that hands them over anyway fails on `require_no_extras` below.
-  if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2 && !bind_dflash2(binder, g, model->dflash2)) {
-    return nullptr;
-  }
-  // The shortlist proposal head is the caller's choice (the artifact always
-  // carries it): bound when either half is handed over, so a load that sends
-  // one without the other fails naming the missing one, and one without a
-  // drafter fails on `require_no_extras`.
-  if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2 &&
-      (binder.has("text/draft_head") || binder.has("text/draft_head_token_ids"))) {
-    ninfer::Weight token_ids{};
-    if (!binder.bind("text/draft_head", {kProposalHeadRows, g.hidden}, model->proposal_head) ||
-        !binder.bind("text/draft_head_token_ids", {kProposalHeadRows}, token_ids)) {
+  // GitHub #619: the weights the load's drafter binds. Without the option
+  // the `dflash2/*` tensors are not asked for, so a caller that hands them
+  // over anyway fails on `require_no_extras` below.
+  model->drafter = ignis_drafter_of(speculative_backend);
+  switch (model->drafter) {
+  case IgnisDrafter::kDflash2:
+    if (!bind_dflash2(binder, g, model->dflash2)) {
       return nullptr;
     }
-    model->proposal_token_ids = static_cast<const std::int32_t *>(token_ids.qdata);
+    // The shortlist proposal head is the caller's choice (the artifact always
+    // carries it): bound when either half is handed over, so a load that sends
+    // one without the other fails naming the missing one, and one without a
+    // drafter fails on `require_no_extras`.
+    if (binder.has("text/draft_head") || binder.has("text/draft_head_token_ids")) {
+      ninfer::Weight token_ids{};
+      if (!binder.bind("text/draft_head", {kProposalHeadRows, g.hidden}, model->proposal_head) ||
+          !binder.bind("text/draft_head_token_ids", {kProposalHeadRows}, token_ids)) {
+        return nullptr;
+      }
+      model->proposal_token_ids = static_cast<const std::int32_t *>(token_ids.qdata);
+    }
+    break;
+  case IgnisDrafter::kHost:
+  case IgnisDrafter::kNone:
+    break;
   }
   // GitHub #177: likewise the `vision/*` tensors, only with an envelope.
   if (vision_max_tokens > 0 && !bind_vision(binder, g, model->vision)) {
@@ -1755,6 +1763,8 @@ struct LoadSizes {
   std::size_t decode_graph_scratch = 0;
   std::size_t verify_round = 0;
   std::size_t drafter_features = 0;
+  // One count per lane: the columns its committed run appends to its window.
+  std::size_t drafter_append_counts = 0;
   std::size_t drafter_scratch = 0;
   // GitHub #576: under the sampled draft, the drafter's q kept from the draw
   // to the accept -- its candidates' ids and probabilities (0 otherwise).
@@ -1794,9 +1804,9 @@ struct LoadSizes {
     out.decode_graph_bytes =
         decode_graph_scratch + (vision ? 3 : 2) * sizeof(int32_t) * lanes;
     out.verify_round_bytes = verify_round;
-    out.drafter_round_bytes =
-        drafter_scratch == 0 ? 0
-                             : drafter_features + sizeof(std::int32_t) * lanes + drafter_draws + drafter_scratch;
+    // The load's drafter's round buffers, as `plan_load_sizes` chose them
+    // (GitHub #619): 0 without a drafter that has any.
+    out.drafter_round_bytes = drafter_features + drafter_append_counts + drafter_draws + drafter_scratch;
     out.trellis_workspace_bytes = trellis_workspace;
     out.trellis_dense_bytes = trellis_dense;
     return out;
@@ -1980,10 +1990,6 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
   sizes.prefill_scratch = compute_program_scratch_bytes(
       model, topology, static_cast<std::int32_t>(prefill_chunk_tokens), max_context_tokens,
       options.cache_dtype, /*batch=*/1, /*head_every_column=*/false, prefill_routes);
-  if (options.speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
-    sizes.prefill_scratch +=
-        dflash2_prefill_scratch_bytes(topology, static_cast<std::int32_t>(prefill_chunk_tokens));
-  }
 
   // GitHub #177: the encoder workspace for one item's merged tokens, and
   // GitHub #243 the embedding pool for the envelope's -- both capped by the
@@ -2056,18 +2062,31 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
         verify_round_bytes(topology, options.draft_tokens, options.vision_max_tokens > 0, lanes);
   }
 
-  // P5-05 (GitHub #155): the drafter's round buffers.
-  if (options.speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
+  // GitHub #619: the load's drafter's lines, chosen here once -- what its
+  // prefill adds to a chunk's scratch, and its round buffers. The verify
+  // substrate alone has neither: its drafts come from its caller.
+  switch (model.drafter) {
+  case IgnisDrafter::kDflash2: {
+    // P5-03 (GitHub #152): the chunk's feature taps and their context append.
+    sizes.prefill_scratch +=
+        dflash2_prefill_scratch_bytes(topology, static_cast<std::int32_t>(prefill_chunk_tokens));
+    // P5-05 (GitHub #155): the drafter's round buffers.
     check_dflash2_round_workspace(model, g, max_context_tokens, options.draft_tokens, lanes);
     const auto block = static_cast<std::size_t>(options.draft_tokens + 1);
     sizes.drafter_features = kDflash2TapLayers.size() * static_cast<std::size_t>(g.hidden) * block *
                              lanes * sizeof(std::uint16_t);
+    sizes.drafter_append_counts = sizeof(std::int32_t) * lanes;
     sizes.drafter_scratch =
         dflash2_round_activation_bytes(topology, static_cast<std::int32_t>(options.draft_tokens), lanes) +
         kDflash2RoundWorkspaceBytes;
     if (options.draft_rule == IGNIS_DRAFT_RULE_SAMPLED) {
       sizes.drafter_draws = dflash2_draw_bytes(options.draft_tokens, lanes);
     }
+    break;
+  }
+  case IgnisDrafter::kHost:
+  case IgnisDrafter::kNone:
+    break;
   }
 
   // GitHub #339: the trellis body's workspace, whose head runs at most a
@@ -2611,13 +2630,14 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     }
   }
 
-  // P5-05 (GitHub #155): the drafter's round buffers (model_internal.h), on
-  // a load with the drafter only. `plan_load_sizes` has already checked the
-  // vendored workspaces against their allowance.
-  if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
+  // P5-05 (GitHub #155): the drafter's round buffers (model_internal.h), as
+  // the load's drafter has them (GitHub #619). `plan_load_sizes` has already
+  // checked the vendored workspaces against their allowance.
+  switch (model->drafter) {
+  case IgnisDrafter::kDflash2:
     try {
       model->verify->features = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_features);
-      model->verify->append_counts = std::make_unique<ninfer::DeviceBuffer>(lanes * sizeof(std::int32_t));
+      model->verify->append_counts = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_append_counts);
       model->verify->drafter_scratch = std::make_unique<ninfer::DeviceArena>(sizes.drafter_scratch);
       // GitHub #576: under the sampled draft, the drafter's q from the draw
       // to the accept, one half of `drafter_draws` each.
@@ -2631,6 +2651,10 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       model->stream = nullptr;
       return -1;
     }
+    break;
+  case IgnisDrafter::kHost:
+  case IgnisDrafter::kNone:
+    break;
   }
 
   *out_model = model.release();

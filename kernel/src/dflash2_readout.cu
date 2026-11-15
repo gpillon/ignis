@@ -47,7 +47,7 @@ extern "C" int32_t ignis_dflash2_readout(struct ignis_model *model, struct ignis
     return fail("ignis_dflash2_readout: the drafts, candidates, candidate logits and scores "
                 "outputs are required");
   }
-  if (model->verify == nullptr || model->verify->drafter_scratch == nullptr) {
+  if (model->verify == nullptr || model->drafter != IgnisDrafter::kDflash2) {
     return fail("ignis_dflash2_readout: this model was loaded without the DFlash2 drafter");
   }
   if (pool->speculative_backend != model->speculative_backend || !pool->has_dflash2()) {

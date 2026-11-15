@@ -32,6 +32,7 @@
 // state transfer, _NO_HOST_ROOM for a KV-RAM arena with no span long enough),
 // no C++ types across the boundary.
 
+#include "drafter.h"
 #include "ignis_model.h"
 #include "ignis_seq.h"
 #include "ignis_seq_internal.h"
@@ -838,7 +839,11 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
   // planned by the vendored cache itself so the lane layout the drafter's
   // kernels address is the one sized here. The window only: the reference's
   // rewrite checkpoint of it was a second lane nothing here read.
-  if (spec.speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
+  //
+  // GitHub #619: the sections a slot carries for the pool's drafter, chosen
+  // here once; the verify substrate alone carries none.
+  switch (ignis_drafter_of(spec.speculative_backend)) {
+  case IgnisDrafter::kDflash2: {
     ninfer::LayoutBuilder dflash2_builder;
     const auto lanes = static_cast<std::int32_t>(state_slots);
     out.dflash2 = true;
@@ -846,6 +851,11 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
         dflash2_builder, kIgnisDflash2Layers, kIgnisDflash2WindowTokens, kIgnisDflash2KvHeads,
         kIgnisDflash2HeadDim, lanes);
     out.dflash2_bytes = dflash2_builder.finish(256);
+    break;
+  }
+  case IgnisDrafter::kHost:
+  case IgnisDrafter::kNone:
+    break;
   }
   out.slot_state_bytes = per_slot_bytes(out.gdn_layout.conv, state_slots) +
                          per_slot_bytes(out.gdn_layout.recurrent, state_slots) +

@@ -174,11 +174,18 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
     const ninfer::Tensor extents(verify.extents->p, ninfer::DType::I32, {batch, 1, 1, 1});
     ninfer::Tensor verify_ids(verify.verify_ids->p, ninfer::DType::I32, {lane_columns, batch, 1, 1});
     ninfer::Tensor positions(verify.positions->p, ninfer::DType::I32, {lane_columns, batch, 1, 1});
-    // P5-05 (GitHub #155): on a load with the drafter, its forward writes
-    // this round's drafts from each lane's window before the verify inputs
-    // read them -- one pass, inside the same graph.
-    if (verify.drafter_scratch != nullptr) {
+    // GitHub #619: the proposal seam, filled by the load's drafter before
+    // the verify inputs read the drafts -- one pass, inside the same graph.
+    // DFlash2's forward writes this round's drafts from each lane's window
+    // (P5-05, GitHub #155); the verify substrate alone's were staged by the
+    // round from its caller.
+    switch (model->drafter) {
+    case IgnisDrafter::kDflash2:
       ignis_dflash2_propose(model, pool, width);
+      break;
+    case IgnisDrafter::kHost:
+    case IgnisDrafter::kNone:
+      break;
     }
     ninfer::ops::speculative_prepare_verify_inputs(anchors, drafts, base_positions, extents,
                                                    verify_ids, positions, model->stream);
@@ -206,9 +213,9 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
       // P5-05 (GitHub #155): `left` is this layer's output now. At a tapped
       // layer every column's output lands in rows [j * hidden, (j + 1) *
       // hidden) of `features` -- the prefill chunk's own tap, over the round's
-      // columns.
+      // columns. DFlash2's alone (GitHub #619).
       const auto tap = std::find(kDflash2TapLayers.begin(), kDflash2TapLayers.end(), layer);
-      if (verify.features != nullptr && tap != kDflash2TapLayers.end()) {
+      if (model->drafter == IgnisDrafter::kDflash2 && tap != kDflash2TapLayers.end()) {
         const auto j = static_cast<std::size_t>(tap - kDflash2TapLayers.begin());
         const std::size_t row_bytes = static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
         const cudaError_t tap_err = cudaMemcpy2DAsync(
