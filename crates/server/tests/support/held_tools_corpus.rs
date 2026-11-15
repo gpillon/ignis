@@ -590,9 +590,9 @@ fn result(call: &Call) -> String {
 /// A conversation on `api` over `tools` (their JSON as sent) from `prompt`,
 /// with `parallel_tool_calls` sent as `parallel` (absent when `None`):
 /// greedy, thinking off, until a turn makes no call or after
-/// [`MAX_TURNS`]. `post` sends a body to a path and gives the status and the
-/// body back.
-pub async fn conversation<F, Fut>(post: F, model: &str, api: Api, tools: &[String], prompt: &str, parallel: Option<bool>) -> Vec<Turn>
+/// [`MAX_TURNS`]; a turn answered other than 200 is an error naming it.
+/// `post` sends a body to a path and gives the status and the body back.
+pub async fn conversation<F, Fut>(post: F, model: &str, api: Api, tools: &[String], prompt: &str, parallel: Option<bool>) -> Result<Vec<Turn>, String>
 where
     F: Fn(&'static str, String) -> Fut,
     Fut: Future<Output = (u16, String)>,
@@ -612,8 +612,10 @@ where
             ),
         };
         let (status, text) = post(api.path(), body).await;
-        assert_eq!(status, 200, "turn {}: {text}", turns.len() + 1);
-        let response: JsonValue = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+        if status != 200 {
+            return Err(format!("turn {}: {status} {text}", turns.len() + 1));
+        }
+        let response: JsonValue = serde_json::from_str(&text).map_err(|e| format!("turn {}: {e}: {text}", turns.len() + 1))?;
         let delivered = Delivered::read(api, &response);
         let turn = Turn { end: delivered.end.clone(), calls: delivered.calls.clone(), text: delivered.text.clone() };
         let more = !turn.calls.is_empty();
@@ -644,7 +646,7 @@ where
             break;
         }
     }
-    turns
+    Ok(turns)
 }
 
 /// Print a conversation's turns.
@@ -662,22 +664,40 @@ pub fn print_turns(what: &str, turns: &[Turn]) {
 /// first turn, so the prompt shows what the limit changes; under `false`
 /// every turn makes one call at most, and the first exactly one, the turn
 /// ending as a call ends it (`tool_calls` on chat completions, `completed`
-/// on the Responses API).
-pub fn one_call_per_turn(what: &str, api: Api, control: &[Turn], limited: &[Turn]) {
+/// on the Responses API). Both conversations printed; what fails, said, so
+/// a caller can go on to its next conversation and fail at the end.
+pub fn one_call_per_turn(what: &str, api: Api, control: &Result<Vec<Turn>, String>, limited: &Result<Vec<Turn>, String>) -> Vec<String> {
+    let mut failures = Vec::new();
+    let (control, limited) = match (control, limited) {
+        (Ok(control), Ok(limited)) => (control, limited),
+        (control, limited) => {
+            for (name, error) in [("the control", control.as_ref().err()), ("under false", limited.as_ref().err())] {
+                if let Some(error) = error {
+                    eprintln!("{what}, {name}: {error}");
+                    failures.push(format!("{what}, {name}: {error}"));
+                }
+            }
+            return failures;
+        }
+    };
     print_turns(&format!("{what}, parallel_tool_calls absent (the control)"), control);
     print_turns(&format!("{what}, parallel_tool_calls false"), limited);
     let first = control.first().map_or(0, |turn| turn.calls.len());
-    assert!(
-        first >= 2,
-        "{what}: the control made {first} calls in its first turn, so this prompt does not show the limit: {control:?}"
-    );
+    if first < 2 {
+        failures.push(format!("{what}: the control made {first} calls in its first turn, so this prompt does not show the limit"));
+    }
     let ends = match api {
         Api::Chat => "tool_calls",
         Api::Responses => "completed",
     };
-    let opening = limited.first().expect("a turn");
-    assert_eq!((opening.calls.len(), opening.end.as_str()), (1, ends), "{what}: the first turn under false: {opening:?}");
-    for (i, turn) in limited.iter().enumerate() {
-        assert!(turn.calls.len() <= 1, "{what}: turn {} made {} calls under parallel_tool_calls false: {turn:?}", i + 1, turn.calls.len());
+    match limited.first() {
+        Some(opening) if (opening.calls.len(), opening.end.as_str()) == (1, ends) => {}
+        opening => failures.push(format!("{what}: the first turn under false is not one call ending {ends}: {opening:?}")),
     }
+    for (i, turn) in limited.iter().enumerate() {
+        if turn.calls.len() > 1 {
+            failures.push(format!("{what}: turn {} made {} calls under parallel_tool_calls false", i + 1, turn.calls.len()));
+        }
+    }
+    failures
 }

@@ -40,12 +40,15 @@ const FLASH_NEXT_DIR: &str = "F:/ai/models/Qwen3.8-Flash-Next-ignis";
 const MODEL: &str = "qwen3.8-flash-next";
 
 /// `main`'s options: the RTX 5090 profile's (the built-in default on that
-/// card), a context the conversations fit, no KV-RAM or KV-disk tier, no
-/// idle unload, the loop guard off.
+/// card), as `flash_next_vision_reuse_http_gpu.rs` loads it but for vision:
+/// a context the conversations fit, two host retained slots and no KV-RAM
+/// or KV-disk tier past them, no idle unload, the loop guard off.
 fn options() -> ignis_server::config::Config {
     let args: Vec<String> = [
         "--model-max-context",
         "16384",
+        "--reuse-retained-host",
+        "2",
         "--reuse-kv-host-pool-bytes",
         "0",
         "--kv-disk-bytes",
@@ -89,11 +92,15 @@ fn with_parallel_tool_calls_false_flash_next_makes_one_call_per_turn() {
     let Some(live) = SwitchingLiveServer::start(options(), &artifact.to_string_lossy(), MODEL) else { return };
     let url = live.url.clone();
     let post = |path: &'static str, body: String| send(url.clone(), path, body);
+    let mut failures = Vec::new();
     for api in [Api::Chat, Api::Responses] {
         // As a client sends them: `strict: true`, inert on Flash-Next.
         let tools: Vec<String> = corpus::PARALLEL_TOOLS.iter().map(|tool| if api == Api::Chat { (*tool).to_owned() } else { corpus::flat(tool) }).collect();
         let control = live.block_on(corpus::conversation(&post, MODEL, api, &tools, corpus::PARALLEL_PROMPT, None));
         let limited = live.block_on(corpus::conversation(&post, MODEL, api, &tools, corpus::PARALLEL_PROMPT, Some(false)));
-        corpus::one_call_per_turn(&format!("Flash-Next, {api:?}"), api, &control, &limited);
+        failures.extend(corpus::one_call_per_turn(&format!("Flash-Next, {api:?}"), api, &control, &limited));
     }
+    assert!(failures.is_empty(), "{} failures:
+{}", failures.len(), failures.join("
+"));
 }

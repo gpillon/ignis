@@ -48,9 +48,14 @@
 //! conversation without the field, which makes two calls or more in its
 //! first turn.
 //!
+//! Each test goes through every case before it fails, so one case that
+//! fails costs no other case's reading: the summary is printed, then the
+//! failures listed.
+//!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a skip; under the profile it is a failure.
-//! Each test loads the 27B: run them one at a time.
+//! Each test loads the 27B, and takes [`CARD`] first, so the two never load
+//! together whatever the test threads.
 //!
 //! ```text
 //! cargo test -p ignis-server --features cuda --test held_tools_gpu -- --ignored --nocapture --test-threads=1
@@ -84,6 +89,11 @@ const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer
 const MODEL: &str = "qwen3.8-27b";
 /// DFlash2-7, every built-in profile's window.
 const WINDOW: u32 = 7;
+
+/// Held by a test for as long as its load lives: two 27B loads never fit the
+/// card together. Its guard is the test's first local, so the load is
+/// dropped, the model thread joined, before the next test takes it.
+static CARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A live server over the real scheduler with DFlash2, its grammars the
 /// load's own; the router dropped before the model thread is joined, so the
@@ -238,16 +248,22 @@ struct Served {
 }
 
 /// `case` served, or (`held` false) its free twin; `done` requests served
-/// before it.
-async fn serve(server: &Server, case: &Case, held: bool, done: &mut u64) -> Served {
+/// before it. A status other than 200 is an error naming it, `done` read
+/// back off the metrics (a request refused before it ran records no
+/// duration).
+async fn serve(server: &Server, case: &Case, held: bool, done: &mut u64) -> Result<Served, String> {
     let metrics = server.metrics.as_ref().expect("metrics on");
     let before = recorded(metrics, *done).await;
     let (status, text) = send(server, case.api.path(), case.body(MODEL, held, case.max_tokens())).await;
-    assert_eq!(status, 200, "{} (held {held}): {text}", case.label);
+    if status != 200 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        *done = value(&metrics.render(), DURATIONS) as u64;
+        return Err(format!("{} ({:?}, held {held}): {status} {text}", case.label, case.api));
+    }
     *done += 1;
     let after = recorded(metrics, *done).await;
-    let response: JsonValue = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
-    Served { delivered: Delivered::read(case.api, &response), counts: Counts::read(&after).since(Counts::read(&before)) }
+    let response: JsonValue = serde_json::from_str(&text).map_err(|e| format!("{} ({:?}, held {held}): {e}: {text}", case.label, case.api))?;
+    Ok(Served { delivered: Delivered::read(case.api, &response), counts: Counts::read(&after).since(Counts::read(&before)) })
 }
 
 /// How a turn that calls ends.
@@ -258,42 +274,53 @@ fn ends_calling(api: Api) -> &'static str {
     }
 }
 
-/// The held request keeps the promise: what its case expects, every call to
-/// a declared tool, every held call valid under its tool's schema as sent,
-/// each tool sent without `strict` echoed held, the request counted as held.
-fn check_held(case: &Case, served: &Served) {
+/// Whether the held request kept the promise: what its case expects, every
+/// call to a declared tool, every held call valid under its tool's schema as
+/// sent, each tool sent without `strict` echoed held, the request counted as
+/// held. What it broke, said; nothing when it kept it.
+fn check_held(case: &Case, served: &Served) -> Vec<String> {
     let what = format!("{} ({:?})", case.label, case.api);
     let tools = corpus::declared(case.api, &case.tools_sent(true));
     let delivered = &served.delivered;
     let calls = &delivered.calls;
+    let mut failures = Vec::new();
     match case.expect {
-        Expect::Call => assert!(!calls.is_empty(), "{what}: no call: {delivered:?}"),
-        Expect::Named(name) => {
-            assert!(!calls.is_empty(), "{what}: no call: {delivered:?}");
-            assert!(calls.iter().all(|call| call.name == name), "{what}: a call to another tool than {name}: {calls:?}");
-        }
+        Expect::Call | Expect::Named(_) if calls.is_empty() => failures.push(format!("{what}: no call: {delivered:?}")),
+        Expect::Named(name) if calls.iter().any(|call| call.name != name) => failures.push(format!("{what}: a call to another tool than {name}: {calls:?}")),
         Expect::CallOrAnswer if calls.is_empty() => {
             let schema = case.answer_schema().expect("the case's response_format");
-            let answer = ignis_grammar::json::Json::parse(&delivered.text).unwrap_or_else(|e| panic!("{what}: the answer is not JSON ({e}): {delivered:?}"));
-            let faults = ignis_grammar::validate::violations(&schema, &answer);
-            assert!(faults.is_empty(), "{what}: the answer {:?}: {faults:?}", delivered.text);
+            match ignis_grammar::json::Json::parse(&delivered.text) {
+                Err(e) => failures.push(format!("{what}: the answer is not JSON ({e}): {delivered:?}")),
+                Ok(answer) => {
+                    let faults = ignis_grammar::validate::violations(&schema, &answer);
+                    if !faults.is_empty() {
+                        failures.push(format!("{what}: the answer {:?}: {faults:?}", delivered.text));
+                    }
+                }
+            }
         }
-        Expect::CallOrAnswer => {}
+        _ => {}
     }
-    if !calls.is_empty() {
-        assert_eq!(delivered.end, ends_calling(case.api), "{what}: {delivered:?}");
+    if !calls.is_empty() && delivered.end != ends_calling(case.api) {
+        failures.push(format!("{what}: a turn that calls ended {}: {delivered:?}", delivered.end));
     }
     for call in calls {
-        let tool = tools.iter().find(|tool| tool.name == call.name).unwrap_or_else(|| panic!("{what}: a call to {}, which the request does not declare", call.name));
+        let Some(tool) = tools.iter().find(|tool| tool.name == call.name) else {
+            failures.push(format!("{what}: a call to {}, which the request does not declare", call.name));
+            continue;
+        };
         if tool.hold != Hold::Free {
-            let faults = corpus::faults(&tool.parameters, &call.arguments).unwrap_or_else(|| panic!("{what}: {}'s arguments are not JSON: {}", call.name, call.arguments));
-            assert!(faults.is_empty(), "{what}: {} {}: {faults:?}", call.name, call.arguments);
+            match corpus::faults(&tool.parameters, &call.arguments) {
+                None => failures.push(format!("{what}: {}'s arguments are not JSON: {}", call.name, call.arguments)),
+                Some(faults) if !faults.is_empty() => failures.push(format!("{what}: {} {}: {faults:?}", call.name, call.arguments)),
+                Some(_) => {}
+            }
         }
     }
     if case.api == Api::Responses {
         for (tool, echoed) in tools.iter().zip(&delivered.echoed_strict) {
-            if tool.hold == Hold::Normalized {
-                assert_eq!(echoed, &JsonValue::Bool(true), "{what}: {} sent without strict is echoed held", tool.name);
+            if tool.hold == Hold::Normalized && echoed != &JsonValue::Bool(true) {
+                failures.push(format!("{what}: {} sent without strict is echoed {echoed}, not held", tool.name));
             }
         }
     }
@@ -301,7 +328,10 @@ fn check_held(case: &Case, served: &Served) {
         "tool" => served.counts.tool_requests,
         _ => served.counts.json_requests,
     };
-    assert_eq!(counted, 1.0, "{what}: counted once under type=\"{}\": {:?}", case.counted_as(), served.counts);
+    if counted != 1.0 {
+        failures.push(format!("{what}: counted {counted} times under type=\"{}\": {:?}", case.counted_as(), served.counts));
+    }
+    failures
 }
 
 /// One fault of a free twin's call beside what the held call wrote there.
@@ -435,8 +465,10 @@ impl Pool {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn strict_tools_on_the_27b_with_dflash2_return_valid_calls_their_repairs_counted_and_drafts_kept() {
+    let _card = CARD.lock().await;
     let Some(harness) = harness() else { return };
     let server = harness.server.as_ref().unwrap();
+    let mut failures = Vec::new();
     let mut done = 0;
     let (mut held_pool, mut free_pool) = (BTreeMap::<String, Pool>::new(), BTreeMap::<String, Pool>::new());
     let mut baits = BTreeMap::<&str, (u32, f64)>::new();
@@ -445,9 +477,24 @@ async fn strict_tools_on_the_27b_with_dflash2_return_valid_calls_their_repairs_c
     for case in &corpus::corpus() {
         let held = serve(server, case, true, &mut done).await;
         let free = serve(server, case, false, &mut done).await;
+        let (held, free) = match (held, free) {
+            (Ok(held), Ok(free)) => (held, free),
+            (held, free) => {
+                if let Ok(held) = &held {
+                    failures.extend(check_held(case, held));
+                }
+                for error in [held.err(), free.err()].into_iter().flatten() {
+                    eprintln!("\n── {}: FAILED: {error}", case.label);
+                    failures.push(error);
+                }
+                continue;
+            }
+        };
         read.extend(print_pair(case, &held, &free));
-        check_held(case, &held);
-        assert_eq!(free.counts.tool_requests, 0.0, "{}: the free twin holds no tool: {:?}", case.label, free.counts);
+        failures.extend(check_held(case, &held));
+        if free.counts.tool_requests != 0.0 {
+            failures.push(format!("{} ({:?}): the free twin held a tool: {:?}", case.label, case.api, free.counts));
+        }
         for served in [&held, &free] {
             misses += served.counts.misses;
             repairs += served.counts.repairs;
@@ -500,8 +547,13 @@ async fn strict_tools_on_the_27b_with_dflash2_return_valid_calls_their_repairs_c
         eprintln!("  {}{bait}: {} at {} ({}): free wrote {}, held wrote {}", r.case, r.fault.kind, r.fault.at, r.fault.keyword, r.free, r.held);
     }
     eprintln!("\n{done} requests, {misses} misses, {repairs} repairs; the held requests drafted {drafted}, accepted {accepted}");
-    assert_eq!(repairs, misses, "every miss repaired");
-    assert!(drafted > 0.0 && accepted > 0.0, "the held requests' verify rounds kept their drafts: {drafted} drafted, {accepted} accepted");
+    if repairs != misses {
+        failures.push(format!("{misses} misses, {repairs} repaired: every miss is repaired"));
+    }
+    if drafted == 0.0 || accepted == 0.0 {
+        failures.push(format!("the held requests' verify rounds kept no drafts: {drafted} drafted, {accepted} accepted"));
+    }
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
 }
 
 /// `parallel_tool_calls: false` returns one call per turn on the served
@@ -511,9 +563,11 @@ async fn strict_tools_on_the_27b_with_dflash2_return_valid_calls_their_repairs_c
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn with_parallel_tool_calls_false_the_27b_makes_one_call_per_turn() {
+    let _card = CARD.lock().await;
     let Some(harness) = harness() else { return };
     let server = harness.server.as_ref().unwrap();
     let post = |path: &'static str, body: String| send(server, path, body);
+    let mut failures = Vec::new();
     for api in [Api::Chat, Api::Responses] {
         for held in [true, false] {
             let tools: Vec<String> = corpus::PARALLEL_TOOLS
@@ -530,7 +584,8 @@ async fn with_parallel_tool_calls_false_the_27b_makes_one_call_per_turn() {
             let control = corpus::conversation(&post, MODEL, api, &tools, corpus::PARALLEL_PROMPT, None).await;
             let limited = corpus::conversation(&post, MODEL, api, &tools, corpus::PARALLEL_PROMPT, Some(false)).await;
             let what = format!("27B, {api:?}, {}", if held { "strict tools, held" } else { "strict: false, free" });
-            corpus::one_call_per_turn(&what, api, &control, &limited);
+            failures.extend(corpus::one_call_per_turn(&what, api, &control, &limited));
         }
     }
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
 }

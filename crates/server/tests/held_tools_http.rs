@@ -1207,8 +1207,11 @@ async fn the_gpu_legs_conversations_take_their_calls_one_turn_at_a_time() {
                 turns.push(corpus::conversation(send, MODEL, api, &tools, corpus::PARALLEL_PROMPT, parallel).await);
             }
             let what = format!("{family:?}, {api:?}");
-            corpus::one_call_per_turn(&what, api, &turns[0], &turns[1]);
-            let calls = |turns: &[corpus::Turn]| -> Vec<Vec<String>> { turns.iter().map(|turn| turn.calls.iter().map(|call| call.arguments.clone()).collect()).collect() };
+            let failures = corpus::one_call_per_turn(&what, api, &turns[0], &turns[1]);
+            assert!(failures.is_empty(), "{failures:?}");
+            let calls = |turns: &Result<Vec<corpus::Turn>, String>| -> Vec<Vec<String>> {
+                turns.as_ref().unwrap().iter().map(|turn| turn.calls.iter().map(|call| call.arguments.clone()).collect()).collect()
+            };
             let (readme, cargo) = (r#"{"path":"README.md"}"#.to_owned(), r#"{"path":"Cargo.toml"}"#.to_owned());
             assert_eq!(calls(&turns[0]), [vec![readme.clone(), cargo.clone()], vec![]], "{what}: the control");
             assert_eq!(calls(&turns[1]), [vec![readme], vec![cargo], vec![]], "{what}: under false");
