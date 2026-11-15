@@ -12,11 +12,12 @@ mod responses;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
 use ignis_core::compute::ModelFamily;
-use ignis_core::mock::GatedCompute;
+use ignis_core::mock::{GateController, GatedCompute};
 use ignis_core::{Compute, MockCompute, SchedulerConfig};
 use serde_json::{json, Value as JsonValue};
 use tower::ServiceExt;
@@ -82,13 +83,31 @@ impl std::fmt::Debug for Serving {
 /// up to the cap. With `runs` each decode round commits 8 tokens, which
 /// reach the server together.
 fn writing(steps: &[&'static str], eos: Option<u32>, family: ModelFamily, runs: bool) -> (ignis_server::Server, Arc<MockCompute>) {
+    let (mock, script) = scripted(steps, eos, runs);
+    let server = server(&script, SchedulerConfig::default(), mock.clone()).with_family(family);
+    (server, mock)
+}
+
+/// [`writing`] with no end of its own, its model thread held at the gate in
+/// request 0's decode round `round` (its first is 0): held in the round after
+/// the one that delivers the call's close, the request generates nothing past
+/// it while the turn ends, however long the turn's handler waits for a core.
+fn holding(steps: &[&'static str], family: ModelFamily, runs: bool, round: u32) -> (ignis_server::Server, Arc<MockCompute>, GateController) {
+    let (mock, script) = scripted(steps, None, runs);
+    let (gated, gate) = GatedCompute::new(mock.clone() as Arc<dyn Compute>);
+    gated.arm_at(0, round);
+    let server = server(&script, SchedulerConfig::default(), gated).with_family(family);
+    (server, mock, gate)
+}
+
+/// The mock and the template of [`writing`].
+fn scripted(steps: &[&'static str], eos: Option<u32>, runs: bool) -> (Arc<MockCompute>, Arc<Script>) {
     let mock = Arc::new(if runs { MockCompute::with_runs(&[8]) } else { MockCompute::new() });
     if let Some(step) = eos {
         mock.eos_after(0, step);
     }
     let decode: HashMap<_, _> = steps.iter().enumerate().map(|(step, text)| (mock.token_for(0, step as u32), *text)).collect();
-    let server = server(&Script::new(decode), SchedulerConfig::default(), mock.clone()).with_family(family);
-    (server, mock)
+    (mock, Script::new(decode))
 }
 
 fn read_file() -> JsonValue {
@@ -251,13 +270,24 @@ fn called(surface: Surface) -> &'static str {
     }
 }
 
-/// The engine let request 0 go long before its cap: the turn's end released
-/// it, and it did not generate on to `CAP` for nobody. `case` names the turn.
-async fn released_early(mock: &MockCompute, case: &str) {
-    let released = responses::released(mock, 0).await;
+/// The turn's end released request 0 and it generated nothing for nobody: its
+/// model thread, held in decode round `round` ([`holding`]), goes on once the
+/// turn has ended, unless the stop came before that round and the request is
+/// gone already, and no round runs past it. `case` names the turn.
+async fn released_early(mock: &MockCompute, gate: &GateController, round: u32, case: &str) {
+    let released = tokio::time::timeout(Duration::from_secs(10), async {
+        while !mock.released_requests().contains(&0) {
+            if gate.entered() {
+                gate.release();
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .is_ok();
     let rounds = mock.decode_calls().len();
     assert!(released, "request 0 was never released, {rounds} decode rounds in: {case}");
-    assert!(rounds < (CAP / 2) as usize, "{rounds} decode rounds: the request ran on past its turn's end: {case}");
+    assert!(rounds <= round as usize + 1, "{rounds} decode rounds: the request ran on past its turn's end: {case}");
 }
 
 #[tokio::test]
@@ -265,7 +295,8 @@ async fn false_ends_the_turn_at_its_first_call_on_every_surface_and_both_familie
     for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
         for (steps, runs) in [(SPLIT, false), (SPLIT, true), (ONE_TOKEN, false)] {
             for surface in SURFACES {
-                let (server, mock) = writing(steps, None, family, runs);
+                // Token 1 closes the call; round 1 delivers it.
+                let (server, mock, gate) = holding(steps, family, runs, 2);
                 let got = turn(&server, surface, &body(surface, Some(false), &json!({}))).await;
                 let case = format!("{family:?} {surface:?} runs {runs} {steps:?}: {got:?}");
                 assert_eq!(got.paths, ["a.txt"], "{case}");
@@ -274,7 +305,7 @@ async fn false_ends_the_turn_at_its_first_call_on_every_surface_and_both_familie
                 assert_eq!(got.tokens, 2, "the tokens up to the call's close: {case}");
                 assert!(!got.raw.contains(SECOND_MARK), "the second call reached the client: {case}");
                 assert!(!got.raw.contains('?'), "a token past the close reached the client: {case}");
-                released_early(&mock, &case).await;
+                released_early(&mock, &gate, 2, &case).await;
             }
         }
     }
@@ -331,7 +362,8 @@ async fn a_call_closed_inside_the_reasoning_ends_nothing() {
     let thought = "plan <tool_call>\n<function=read_file>\n<parameter=path>\nthought.txt\n</parameter>\n</function>\n</tool_call> then";
     let steps: &[&'static str] = &[thought, "</think>", "Reading. ", FIRST, "\n", SECOND];
     for surface in SURFACES {
-        let (server, mock) = writing(steps, None, ModelFamily::Qwen38_27b, false);
+        // Token 3 closes the call; round 3 delivers it.
+        let (server, mock, gate) = holding(steps, ModelFamily::Qwen38_27b, false, 4);
         let thinking = json!({ "enable_thinking": true, "thinking_budget": 0 });
         let got = turn(&server, surface, &body(surface, Some(false), &thinking)).await;
         let case = format!("{surface:?}: {got:?}");
@@ -341,7 +373,7 @@ async fn a_call_closed_inside_the_reasoning_ends_nothing() {
         assert_eq!(got.finish, called(surface), "{case}");
         assert_eq!(got.tokens, 4, "{case}");
         assert!(!got.raw.contains(SECOND_MARK), "{case}");
-        released_early(&mock, &case).await;
+        released_early(&mock, &gate, 4, &case).await;
     }
 }
 
@@ -353,19 +385,14 @@ async fn a_call_closed_inside_the_reasoning_ends_nothing() {
 #[tokio::test]
 async fn a_stop_that_waits_behind_a_round_releases_the_request_at_the_next_step() {
     for surface in SURFACES {
-        let mock = Arc::new(MockCompute::new());
-        let (gated, gate) = GatedCompute::new(mock.clone() as Arc<dyn Compute>);
-        gated.arm_at(0, 0);
-        let steps = [FIRST, "\n", SECOND];
-        let decode: HashMap<_, _> = steps.iter().enumerate().map(|(step, text)| (mock.token_for(0, step as u32), *text)).collect();
-        let server = server(&Script::new(decode), SchedulerConfig::default(), gated);
+        let (server, mock, gate) = holding(&[FIRST, "\n", SECOND], ModelFamily::Qwen38_27b, false, 0);
         let got = turn(&server, surface, &body(surface, Some(false), &json!({}))).await;
         let case = format!("{surface:?}: {got:?}");
         assert_eq!(got.paths, ["a.txt"], "{case}");
         assert_eq!(got.tokens, 1, "the call closes at the first token: {case}");
         gate.wait_entered();
         gate.release();
-        released_early(&mock, &case).await;
+        released_early(&mock, &gate, 0, &case).await;
     }
 }
 
