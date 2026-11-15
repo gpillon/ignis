@@ -59,6 +59,7 @@ use crate::call::{self, Line, Parameters, Reading, Step, CALL_CLOSE, CALL_OPEN, 
 use crate::json::Json;
 use crate::regex::{ByteDfa, DEAD, FREE};
 use crate::schema::{Grammar, LitTrie, Node, Refusal, NO_RE};
+use crate::string::utf8_next;
 use crate::vocab::{Trie, Vocab};
 use crate::TokenSet;
 
@@ -387,37 +388,6 @@ fn kmp(tag: &[u8], k: u8, b: u8) -> u8 {
     }
 }
 
-/// UTF-8 after `b`, with `debt` continuation bytes owed (`string.rs`'s
-/// encoding), or `None` where `b` breaks it.
-#[inline]
-pub(crate) fn utf8_next(debt: u8, b: u8) -> Option<u8> {
-    if debt != 0 {
-        let ok = match debt {
-            3 => (0xA0..=0xBF).contains(&b),
-            4 => (0x80..=0x9F).contains(&b),
-            6 => (0x90..=0xBF).contains(&b),
-            7 => (0x80..=0x8F).contains(&b),
-            _ => (0x80..=0xBF).contains(&b),
-        };
-        return ok.then_some(match debt {
-            1 => 0,
-            2..=4 => 1,
-            _ => 2,
-        });
-    }
-    match b {
-        0x00..=0x7F => Some(0),
-        0xC2..=0xDF => Some(1),
-        0xE0 => Some(3),
-        0xE1..=0xEC | 0xEE..=0xEF => Some(2),
-        0xED => Some(4),
-        0xF0 => Some(6),
-        0xF1..=0xF3 => Some(5),
-        0xF4 => Some(7),
-        _ => None,
-    }
-}
-
 fn refusal(code: &'static str, keyword: &str, path: &str, detail: impl Into<String>) -> Refusal {
     Refusal { code, keyword: keyword.to_string(), path: path.to_string(), detail: detail.into() }
 }
@@ -483,7 +453,7 @@ impl Slot {
 impl Slot {
     /// The slot's own tables (a pattern's DFA is its schema grammar's).
     fn heap_bytes(&self) -> usize {
-        64 + match self {
+        crate::mask::ENTRY_BYTES + match self {
             Slot::Pattern { coacc, prefixes, .. } => coacc.len() + prefixes.len() * 2,
             Slot::Enum(trie) => trie.strings().iter().map(|s| s.len() * 16).sum(),
             Slot::Junk | Slot::Free | Slot::Json { .. } => 0,
@@ -618,7 +588,7 @@ impl ToolCallGrammar {
             tables_bytes: 0,
             first_draw_misses: false,
         };
-        g.tables_bytes = g.held.iter().flatten().flat_map(|h| &h.slots).map(Slot::heap_bytes).sum::<usize>() + g.tool_names.iter().map(|n| n.len() * 3 + 64).sum::<usize>();
+        g.tables_bytes = g.held.iter().flatten().flat_map(|h| &h.slots).map(Slot::heap_bytes).sum::<usize>() + g.tool_names.iter().map(|n| n.len() * 3 + crate::mask::ENTRY_BYTES).sum::<usize>();
         let start = CallState::default();
         g.first_draw_misses = g.callable == 0
             || g.controls.opener_inside.iter().any(|&id| {
@@ -989,22 +959,7 @@ impl ToolCallGrammar {
             levels.resize_with(trie.max_depth + 1, CallState::default);
         }
         levels[0].clone_from(start);
-        let mut i = 0;
-        while i < trie.nodes.len() {
-            let node = trie.nodes[i];
-            let d = node.depth as usize;
-            let (lo, hi) = levels.split_at_mut(d);
-            let cur = &mut hi[0];
-            cur.clone_from(&lo[d - 1]);
-            if !self.step(cur, node.byte) {
-                i = node.end as usize;
-                continue;
-            }
-            for &t in trie.tokens(i) {
-                out.insert(t);
-            }
-            i += 1;
-        }
+        crate::mask::walk_trie(trie, levels, out, |state, b| self.step(state, b));
     }
 
     fn mask(&self, state: &CallState, out: &mut TokenSet, levels: &mut Vec<CallState>) -> bool {
@@ -1052,8 +1007,7 @@ impl ToolCallGrammar {
             }
         }
         let mut memo = self.memo.lock().unwrap();
-        if !memo.masks.contains_key(state) && memo.bytes.saturating_add(out.heap_bytes() + 64) <= self.memo_budget {
-            memo.bytes += out.heap_bytes() + 64;
+        if !memo.masks.contains_key(state) && crate::mask::keeps(&mut memo.bytes, out.heap_bytes() + crate::mask::ENTRY_BYTES, self.memo_budget) {
             memo.masks.insert(state.clone(), Arc::new(out.clone()));
         }
         false
@@ -1097,7 +1051,7 @@ fn held_tool(grammar: Arc<Grammar>, optional: &[String]) -> Result<Held, Refusal
     let mut required = Vec::new();
     for (&key, &value) in keys.iter().zip(values.iter()) {
         let name = decode(key).expect("a key is a string");
-        let path = format!("#/properties/{}", name.replace('~', "~0").replace('/', "~1"));
+        let path = format!("#/properties/{}", crate::json::pointer_token(&name));
         if name.contains('>') {
             return Err(refusal(
                 "parameter_name_unwritable",

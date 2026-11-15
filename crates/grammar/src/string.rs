@@ -79,27 +79,50 @@ pub(crate) fn closable(dfa: Option<&ByteDfa>, s: &StrState) -> bool {
     s.esc == NORMAL && s.utf8 == 0 && dfa.is_none_or(|d| s.dfa == FREE || d.accepts_at_end(s.dfa))
 }
 
+/// How many states the UTF-8 debt of [`utf8_next`] takes.
+pub(crate) const UTF8_STATES: usize = 8;
+
+/// UTF-8 after `b`, with `debt` continuation bytes owed ([`StrState::utf8`]'s
+/// encoding), or `None` where `b` breaks it.
+#[inline]
+pub(crate) fn utf8_next(debt: u8, b: u8) -> Option<u8> {
+    if debt != 0 {
+        let ok = match debt {
+            3 => (0xA0..=0xBF).contains(&b),
+            4 => (0x80..=0x9F).contains(&b),
+            6 => (0x90..=0xBF).contains(&b),
+            7 => (0x80..=0x8F).contains(&b),
+            _ => (0x80..=0xBF).contains(&b),
+        };
+        return ok.then_some(match debt {
+            1 => 0,
+            2..=4 => 1,
+            _ => 2,
+        });
+    }
+    match b {
+        0x00..=0x7F => Some(0),
+        0xC2..=0xDF => Some(1),
+        0xE0 => Some(3),
+        0xE1..=0xEC | 0xEE..=0xEF => Some(2),
+        0xED => Some(4),
+        0xF0 => Some(6),
+        0xF1..=0xF3 => Some(5),
+        0xF4 => Some(7),
+        _ => None,
+    }
+}
+
 #[inline]
 pub(crate) fn step(dfa: Option<&ByteDfa>, st: StrState, b: u8) -> StrStep {
     let mut s = st;
     match st.esc {
         NORMAL => {
             if st.utf8 != 0 {
-                let ok = match st.utf8 {
-                    3 => (0xA0..=0xBF).contains(&b),
-                    4 => (0x80..=0x9F).contains(&b),
-                    6 => (0x90..=0xBF).contains(&b),
-                    7 => (0x80..=0x8F).contains(&b),
-                    _ => (0x80..=0xBF).contains(&b),
-                };
-                if !ok {
-                    return StrStep::Reject;
+                match utf8_next(st.utf8, b) {
+                    Some(utf8) => s.utf8 = utf8,
+                    None => return StrStep::Reject,
                 }
-                s.utf8 = match st.utf8 {
-                    1 => 0,
-                    2..=4 => 1,
-                    _ => 2,
-                };
             } else {
                 match b {
                     b'"' => return if closable(dfa, &st) { StrStep::Close } else { StrStep::Reject },
@@ -114,15 +137,10 @@ pub(crate) fn step(dfa: Option<&ByteDfa>, st: StrState, b: u8) -> StrStep {
                         return StrStep::Inside(s);
                     }
                     0x00..=0x1F => return StrStep::Reject,
-                    0x20..=0x7F => {}
-                    0xC2..=0xDF => s.utf8 = 1,
-                    0xE0 => s.utf8 = 3,
-                    0xE1..=0xEC | 0xEE..=0xEF => s.utf8 = 2,
-                    0xED => s.utf8 = 4,
-                    0xF0 => s.utf8 = 6,
-                    0xF1..=0xF3 => s.utf8 = 5,
-                    0xF4 => s.utf8 = 7,
-                    _ => return StrStep::Reject,
+                    _ => match utf8_next(0, b) {
+                        Some(utf8) => s.utf8 = utf8,
+                        None => return StrStep::Reject,
+                    },
                 }
             }
             if !feed(dfa, &mut s, &[b]) {

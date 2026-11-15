@@ -226,6 +226,29 @@ pub async fn metric_reaches(metrics: &ignis_server::metrics::Metrics, line: &str
     assert!(found.is_ok(), "no `{line}` in:\n{}", metrics.render());
 }
 
+/// A call in the template's tool-call dialect: `<tool_call>`, the function
+/// `name`, each parameter's value on its own lines, `</tool_call>`.
+pub fn tool_call(name: &str, parameters: &[(&str, &str)]) -> String {
+    let mut out = format!("<tool_call>\n<function={name}>\n");
+    for (parameter, value) in parameters {
+        out.push_str(&format!("<parameter={parameter}>\n{value}\n</parameter>\n"));
+    }
+    out.push_str("</function>\n</tool_call>");
+    out
+}
+
+/// Whether `mock` released `request` within ten seconds: a turn's end let
+/// the engine request go.
+pub async fn released(mock: &MockCompute, request: RequestId) -> bool {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !mock.released_requests().contains(&request) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
 /// The events of a `text/event-stream` body: each `event:` line's name, and
 /// the `data:` line after it parsed.
 pub fn sse_events(body: &str) -> Vec<(String, JsonValue)> {

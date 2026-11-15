@@ -332,6 +332,16 @@ impl Parser<'_> {
     }
 }
 
+/// A key as a JSON pointer token (RFC 6901): `~` written `~0`, `/` `~1`.
+pub fn pointer_token(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// A JSON pointer token read back: `~1` is `/`, then `~0` is `~`.
+pub fn unescape_pointer_token(token: &str) -> String {
+    token.replace("~1", "/").replace("~0", "~")
+}
+
 /// serde_json's string escaping.
 pub fn write_string(s: &str, out: &mut Vec<u8>) {
     out.push(b'"');

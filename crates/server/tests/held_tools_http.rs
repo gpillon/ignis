@@ -35,6 +35,7 @@ use ignis_server::Server;
 
 #[path = "support/responses.rs"]
 mod responses;
+use responses::tool_call as call;
 
 #[path = "support/held_tools_corpus.rs"]
 mod corpus;
@@ -171,16 +172,6 @@ fn chat(tools: &[&str], stream: bool, max_tokens: u32) -> String {
         r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"write it"}}],"tools":[{}],"enable_thinking":false,"temperature":0,"max_tokens":{max_tokens},"stream":{stream}}}"#,
         tools.join(",")
     )
-}
-
-/// A call in the template's form.
-fn call(name: &str, args: &[(&str, &str)]) -> String {
-    let mut out = format!("<tool_call>\n<function={name}>\n");
-    for (k, v) in args {
-        out.push_str(&format!("<parameter={k}>\n{v}\n</parameter>\n"));
-    }
-    out.push_str("</function>\n</tool_call>");
-    out
 }
 
 async fn post(server: &Server, body: &str) -> (u16, JsonValue, String) {
@@ -762,13 +753,7 @@ async fn with_parallel_tool_calls_false_a_held_call_ends_the_turn_at_its_confirm
             assert_eq!(tokens, Some(encode(&first).len() as u64), "the tokens up to the confirmed close");
         }
         assert!(!text.contains("b.txt"), "stream {stream}: the second call reached the client: {text}");
-        let released = tokio::time::timeout(Duration::from_secs(10), async {
-            while !mock.released_requests().contains(&0) {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        })
-        .await;
-        assert!(released.is_ok(), "stream {stream}: the request ran on past the close");
+        assert!(responses::released(&mock, 0).await, "stream {stream}: the request ran on past the close");
         tool_counts(&server, 1, 0).await;
     }
 }
@@ -1378,7 +1363,7 @@ fn the_gpu_corpus_reads_a_calls_faults_where_they_are() {
     let pair = |kind: &str, at: &str| (kind.to_owned(), at.to_owned());
     let mut found = kinds(corpus::DEPLOY, deploy);
     found.sort();
-    assert_eq!(found, [pair("constraint", "/replicas"), pair("missing", "/approved_by"), pair("missing", "/notes"), pair("unknown", "/extra")]);
+    assert_eq!(found, [pair("constraint", "/replicas"), pair("missing", "/approved_by"), pair("missing", "/notes"), pair("unknown_parameter", "/extra")]);
     let open = r#"{"path":"a","line":1,"change":{"edits":[{"old":"x","new":"y","why":"z"}]}}"#;
     assert_eq!(kinds(corpus::EDIT_OPEN, open), [pair("undeclared", "/change/edits/0/why")]);
     assert!(corpus::faults(&parameters(corpus::DEPLOY), "not json").is_none());

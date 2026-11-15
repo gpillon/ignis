@@ -515,7 +515,7 @@ pub fn faults(parameters: &Json, arguments: &str) -> Option<Vec<Fault>> {
     let value = Json::parse(arguments).ok()?;
     let mut out: Vec<Fault> = ignis_grammar::validate::violations(parameters, &value)
         .into_iter()
-        .map(|v| Fault { kind: format!("{:?}", v.kind).to_lowercase(), at: v.at, keyword: v.keyword })
+        .map(|v| Fault { kind: v.kind.label().to_owned(), at: v.at, keyword: v.keyword })
         .collect();
     let mut undeclared = Vec::new();
     undeclared_keys(parameters, &value, "", &mut undeclared);
@@ -531,7 +531,7 @@ fn undeclared_keys(schema: &Json, value: &Json, at: &str, out: &mut Vec<String>)
     match (value, schema.get("properties"), schema.get("items")) {
         (Json::Obj(members), Some(Json::Obj(properties)), _) => {
             for (key, member) in members {
-                let path = format!("{at}/{}", key.replace('~', "~0").replace('/', "~1"));
+                let path = format!("{at}/{}", ignis_grammar::json::pointer_token(key));
                 match properties.iter().find(|(name, _)| name == key) {
                     Some((_, schema)) => undeclared_keys(schema, member, &path, out),
                     None => out.push(path),
@@ -550,7 +550,7 @@ fn undeclared_keys(schema: &Json, value: &Json, at: &str, out: &mut Vec<String>)
 /// The value at JSON pointer `at` in `value`.
 pub fn pointed<'a>(value: &'a Json, at: &str) -> Option<&'a Json> {
     at.split('/').skip(1).try_fold(value, |value, token| {
-        let token = token.replace("~1", "/").replace("~0", "~");
+        let token = ignis_grammar::json::unescape_pointer_token(token);
         match value {
             Json::Obj(members) => members.iter().find(|(key, _)| *key == token).map(|(_, member)| member),
             Json::Arr(items) => token.parse::<usize>().ok().and_then(|i| items.get(i)),

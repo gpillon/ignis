@@ -12,7 +12,6 @@ mod responses;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
@@ -235,13 +234,7 @@ fn called(surface: Surface) -> &'static str {
 /// The engine let request 0 go long before its cap: the turn's end released
 /// it, and it did not generate on to `CAP` for nobody.
 async fn released_early(mock: &MockCompute) {
-    let released = tokio::time::timeout(Duration::from_secs(10), async {
-        while !mock.released_requests().contains(&0) {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await;
-    assert!(released.is_ok(), "request 0 was never released");
+    assert!(responses::released(mock, 0).await, "request 0 was never released");
     let rounds = mock.decode_calls().len();
     assert!(rounds < (CAP / 2) as usize, "{rounds} decode rounds: the request ran on past its turn's end");
 }

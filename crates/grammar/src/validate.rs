@@ -47,12 +47,25 @@ pub enum Kind {
     Enum,
     /// A property an object closed by `additionalProperties: false` does not
     /// declare.
-    Unknown,
+    UnknownParameter,
     /// A value of an admitted type that breaks another of its keywords: a
     /// `pattern`, a `format`, a bound, a length, an item or property count,
     /// `multipleOf`, `uniqueItems`, `propertyNames`, `not`, a `false` schema,
     /// a `oneOf` matched more than once.
     Constraint,
+}
+
+impl Kind {
+    /// The kind's name, as `ignis_tool_call_violations_total` labels it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Missing => "missing",
+            Kind::Type => "type",
+            Kind::Enum => "enum",
+            Kind::UnknownParameter => "unknown_parameter",
+            Kind::Constraint => "constraint",
+        }
+    }
 }
 
 /// One failure of a value against its schema.
@@ -83,6 +96,10 @@ pub fn is_valid(schema: &Json, value: &Json) -> bool {
 
 /// How deep subschemas and `$ref`s may nest while one value is checked: a
 /// `$ref` cycle that never descends into the value stops here, unchecked.
+/// This bound and the two below cap the check's own work on a client's
+/// schema, and decide only how a call is counted, never what a response
+/// carries, so they are not configuration fields (`CODING_STANDARDS.md`,
+/// "Limits are config fields"); one that came to decide a response would be.
 const MAX_DEPTH: usize = 256;
 
 /// How many subschemas, and `uniqueItems` comparisons, one value's check may
@@ -103,7 +120,7 @@ fn violation(kind: Kind, at: &str, keyword: &'static str) -> Violation {
 
 /// A JSON pointer token, escaped.
 fn child(at: &str, token: &str) -> String {
-    format!("{at}/{}", token.replace('~', "~0").replace('/', "~1"))
+    format!("{at}/{}", crate::json::pointer_token(token))
 }
 
 fn entries(schema: &Json) -> &[(String, Json)] {
@@ -328,7 +345,7 @@ impl<'a> Checker<'a> {
             }
             if !declared {
                 match schema.get("additionalProperties") {
-                    Some(Json::Bool(false)) => out.push(violation(Kind::Unknown, &path, "additionalProperties")),
+                    Some(Json::Bool(false)) => out.push(violation(Kind::UnknownParameter, &path, "additionalProperties")),
                     Some(sub) => self.check(sub, item, &path, out),
                     None => {}
                 }
@@ -439,7 +456,7 @@ fn resolve<'a>(root: &'a Json, reference: &str) -> Option<&'a Json> {
     }
     let mut at = root;
     for token in pointer.strip_prefix('/')?.split('/') {
-        let token = percent_decode(token)?.replace("~1", "/").replace("~0", "~");
+        let token = crate::json::unescape_pointer_token(&percent_decode(token)?);
         at = match at {
             Json::Obj(_) => at.get(&token)?,
             Json::Arr(items) => items.get(token.parse::<usize>().ok()?)?,
@@ -872,7 +889,7 @@ mod tests {
         let found = violations(&schema, &Json::parse(r#"{"a":[1,"x"],"b/c":1}"#).unwrap());
         assert_eq!(
             found,
-            vec![violation(Kind::Type, "/a/1", "type"), violation(Kind::Unknown, "/b~1c", "additionalProperties")]
+            vec![violation(Kind::Type, "/a/1", "type"), violation(Kind::UnknownParameter, "/b~1c", "additionalProperties")]
         );
     }
 

@@ -423,17 +423,22 @@ impl ResponseEvents {
         }
         let mut deltas = Vec::new();
         for &token in tokens {
-            self.output_tokens += 1;
-            if self.decoder.channel() == Channel::Reasoning {
-                self.reasoning_tokens += 1;
-            }
-            deltas.extend(self.decoder.push(&[token]));
+            deltas.extend(self.decode(token));
         }
         let mut out = Vec::new();
         for delta in crate::decoder::join(deltas) {
             self.route(delta, &mut out);
         }
         out
+    }
+
+    /// One token counted on the channel it was generated on, and decoded.
+    fn decode(&mut self, token: TokenId) -> Vec<Delta> {
+        self.output_tokens += 1;
+        if self.decoder.channel() == Channel::Reasoning {
+            self.reasoning_tokens += 1;
+        }
+        self.decoder.push(&[token])
     }
 
     /// [`ResponseEvents::on_tokens`] for a response that ends at the close
@@ -449,11 +454,7 @@ impl ResponseEvents {
             if self.scanner.ended() {
                 break;
             }
-            self.output_tokens += 1;
-            if self.decoder.channel() == Channel::Reasoning {
-                self.reasoning_tokens += 1;
-            }
-            for delta in self.decoder.push(&[token]) {
+            for delta in self.decode(token) {
                 match delta.channel {
                     Channel::Reasoning => reasoning.push_str(&delta.text),
                     Channel::Content => {
@@ -472,7 +473,7 @@ impl ResponseEvents {
         for event in scanned {
             self.scanned(event, &mut out);
         }
-        if self.scanner.ended() && self.ending.is_none() {
+        if self.scanner.ended() {
             self.finish(Ending::Completed, &mut out);
         }
         out
@@ -482,9 +483,7 @@ impl ResponseEvents {
     /// is closed out, and it ends `incomplete` with `status: "cancelled"`.
     pub(crate) fn cancelled(&mut self) -> Vec<JsonValue> {
         let mut out = Vec::new();
-        if self.ending.is_none() {
-            self.finish(Ending::Cancelled, &mut out);
-        }
+        self.finish(Ending::Cancelled, &mut out);
         out
     }
 
@@ -723,7 +722,11 @@ impl ResponseEvents {
     /// End the response: everything still held back — the decoder's tail and
     /// the scanner's (a call left open is dropped whole, never delivered
     /// half-written) — then the open items closed, then the terminal event.
+    /// Nothing once it has ended.
     fn finish(&mut self, ending: Ending, out: &mut Vec<JsonValue>) {
+        if self.ending.is_some() {
+            return;
+        }
         for delta in self.decoder.finish() {
             self.route(delta, out);
         }

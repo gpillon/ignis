@@ -1603,18 +1603,25 @@ fn tool_hold(
     without_strict: WithoutStrict,
     switch: ToolArguments,
 ) -> ignis_grammar::ToolHold {
-    use ignis_grammar::json::Json;
     use ignis_grammar::ToolHold;
     if tool["function"]["strict"] == JsonValue::Bool(true) {
         return ToolHold::Strict(strict_parameters(raw, tool));
     }
-    let sent_none = raw.is_some_and(|tool| sent_function(tool).get("strict").is_none_or(|strict| *strict == Json::Null));
-    match (switch, sent_none, without_strict) {
-        (ToolArguments::Held, _, _) | (ToolArguments::AsSent, true, WithoutStrict::Normalized) => {
-            ToolHold::Normalized(strict_parameters(raw, tool))
-        }
-        _ => ToolHold::Free,
+    match normalizes(raw, without_strict, switch) {
+        true => ToolHold::Normalized(strict_parameters(raw, tool)),
+        false => ToolHold::Free,
     }
+}
+
+/// Whether a tool not sent `strict: true`, `raw` as sent, is normalized
+/// (where its schema allows it): every one under the operator's switch at
+/// `held`, and under `as-sent` one sent without `strict` (or with `null`)
+/// where `without_strict` normalizes it. The one reading of a tool's sent
+/// `strict` that [`tool_hold`] holds it by and [`HeldContent::echo`] echoes.
+fn normalizes(raw: Option<&ignis_grammar::json::Json>, without_strict: WithoutStrict, switch: ToolArguments) -> bool {
+    use ignis_grammar::json::Json;
+    let sent_none = raw.is_some_and(|tool| sent_function(tool).get("strict").is_none_or(|strict| *strict == Json::Null));
+    matches!((switch, sent_none, without_strict), (ToolArguments::Held, _, _) | (ToolArguments::AsSent, true, WithoutStrict::Normalized))
 }
 
 /// The held tools of a request whose resolved `tools` are these (none
@@ -1750,13 +1757,12 @@ pub(crate) struct HeldContent {
     /// The request's tools as every scanner of its response reads their
     /// calls, a held tool's by the confirmed close ([`ToolSchemas::holding`]).
     pub schemas: ToolSchemas,
-    /// Whether each of the resolved tools is held, by its place: the
-    /// `strict` the Responses API echoes for a tool sent without one (#614),
-    /// and under [`ToolArguments::Held`] for every tool not sent `strict:
-    /// true` (#616).
-    pub held: Vec<bool>,
-    /// The operator's switch the request was served under, read once.
-    pub switch: ToolArguments,
+    /// The `strict` the Responses API echoes for each tool as sent, by its
+    /// place (#614, #616): `Some`, the one it was served with, for a tool
+    /// whose own `strict` did not decide it (one it normalizes, held where
+    /// its schema allows it), and for every tool on a model that holds no
+    /// tool's calls (Flash-Next, #581: `false`); `None`, the `strict` it sent.
+    pub echo: Vec<Option<bool>>,
 }
 
 /// The [`HeldContent`] of a request whose answer is `answer`, whose
@@ -1800,9 +1806,20 @@ pub(crate) fn held_content(
         (None, Some(held)) => (Some(held.grammar.clone()), None),
         (None, None) => (None, None),
     };
-    let holds = (0..tools.len()).map(|tool| held_tools.as_ref().is_some_and(|held| held.calls.holds(tool))).collect();
+    let holds = |tool: usize| held_tools.as_ref().is_some_and(|held| held.calls.holds(tool));
+    let serves = server.active().family.serves_structured_output();
+    let echo = (0..raw.len())
+        .map(|tool| {
+            let strict = sent_function(&raw[tool]).get("strict") == Some(&ignis_grammar::json::Json::Bool(true));
+            match (serves, strict || !normalizes(raw.get(tool), without_strict, switch)) {
+                (false, _) => Some(false),
+                (true, false) => Some(tool < tools.len() && holds(tool)),
+                (true, true) => None,
+            }
+        })
+        .collect();
     let held = held_tools.map(|held| held.held).unwrap_or_default();
-    Ok(HeldContent { grammar, description, schemas: ToolSchemas::from_tools(tools).holding(held), held: holds, switch })
+    Ok(HeldContent { grammar, description, schemas: ToolSchemas::from_tools(tools).holding(held), echo })
 }
 
 /// A JSON value read once into the two shapes the handler needs:
