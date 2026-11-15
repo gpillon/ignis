@@ -341,7 +341,7 @@ const ACTIVATIONS: &[Activation] = &[
     },
     Activation { when: "once the thinking budget has closed a reasoning block", activate: |m| m.record_thinking_forced_close() },
     Activation {
-        when: "once a request held to a grammar (`response_format`, or a strict tool's calls) has ended",
+        when: "once a request held to a grammar (`response_format`, or a held tool's calls) has ended",
         activate: |m| {
             m.record_structured(&crate::telemetry::StructuredSummary {
                 kind: ignis_core::structured::StructuredKind::JsonObject,

@@ -57,7 +57,7 @@ pub use schema::{
     Grammar, GrammarLimits, Inert, Refusal, ANNOTATIONS, DEFAULT_MAX_DEPTH, DEFAULT_MAX_REF_CHAIN, DEFAULT_MAX_WS_RUN,
     FORMATS, MAX_ENUM_VALUES, MAX_NESTING, MAX_PROPERTIES, MAX_SCHEMA_CHARS, STRICT_SUBSET,
 };
-pub use tool_calls::{DeclaredTool, ToolCallGrammar, ToolCallMatcher, ToolField, ToolRefusal};
+pub use tool_calls::{DeclaredTool, ToolCallGrammar, ToolCallMatcher, ToolField, ToolHold, ToolRefusal};
 pub use vocab::{Vocab, VocabEntry};
 
 use automaton::{Config, Frame, State};

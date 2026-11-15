@@ -18,7 +18,7 @@ use ignis_core::{
     ConcreteScheduler, DecodeParams, FinishReason, MockCompute, PendingToken, RequestClass, RequestId, RequestInput,
     SchedEvent, Scheduler, SchedulerConfig, TokenId,
 };
-use ignis_grammar::{DeclaredTool, GrammarCache, ToolCallGrammar, Vocab, VocabEntry, DEFAULT_CACHE_BYTES};
+use ignis_grammar::{DeclaredTool, GrammarCache, ToolCallGrammar, ToolHold, Vocab, VocabEntry, DEFAULT_CACHE_BYTES};
 
 /// The model's EOS.
 const STOP: TokenId = 5;
@@ -44,7 +44,7 @@ fn cache() -> GrammarCache {
 }
 
 fn grammar() -> Arc<ToolCallGrammar> {
-    cache().tool_calls(&[DeclaredTool { name: "write_file".into(), strict: Some(WRITE_FILE.into()) }]).unwrap()
+    cache().tool_calls(&[DeclaredTool { name: "write_file".into(), hold: ToolHold::Strict(WRITE_FILE.into()) }]).unwrap()
 }
 
 fn encode(text: &str) -> Vec<TokenId> {
@@ -297,8 +297,8 @@ fn a_call_forced_after_the_reasoning_is_held_after_the_literal() {
 fn a_literal_token_the_grammar_refuses_is_not_forced_and_the_grammar_holds_on() {
     let grammar = cache()
         .tool_calls(&[
-            DeclaredTool { name: "write_file".into(), strict: Some(WRITE_FILE.into()) },
-            DeclaredTool { name: "a>b".into(), strict: None },
+            DeclaredTool { name: "write_file".into(), hold: ToolHold::Strict(WRITE_FILE.into()) },
+            DeclaredTool { name: "a>b".into(), hold: ToolHold::Free },
         ])
         .unwrap();
     let mock = Arc::new(MockCompute::new());

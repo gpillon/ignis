@@ -30,7 +30,7 @@ Everything goes through one structured log on stdout, in the format
   `prefill_chunks_consumed`, `prefill_chunks_solo` and `prefilled_tokens`,
   as does a decision's.
 - From 0.11.0, a request held to a grammar (`response_format`, or the calls
-  of a strict tool, see [Structured output](../api/structured-output.md))
+  of a held tool, see [Structured output](../api/structured-output.md))
   says so on the line it ends with, `done` or `cancelled`: `structured.type`
   (`json_object`, `json_schema`, or `tool` for held tool calls; a request
   with both counts under its `response_format`'s, its calls' misses included),

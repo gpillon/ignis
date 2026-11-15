@@ -1520,7 +1520,8 @@ pub(crate) fn count_strict_tools(server: &Server, tools: &[JsonValue]) {
 }
 
 /// A request's **held tools** (GitHub #611, spec #582, ADR 0094): its
-/// **strict tools**, and the grammar its content is held to.
+/// **strict tools** and the tools normalized into strict form (#614), and
+/// the grammar its content is held to.
 pub(crate) struct HeldTools {
     /// The tool calls' grammar the content is held to, from the token after
     /// the reasoning's `</think>` with thinking on.
@@ -1533,32 +1534,71 @@ pub(crate) struct HeldTools {
     pub held: std::collections::HashMap<String, ignis_grammar::call::Parameters>,
 }
 
+/// How a surface serves a function tool sent without `strict`, or with
+/// `strict: null` (GitHub #614, ADR 0094): OpenAI's default on that surface.
+/// `strict: true` is a strict tool and `strict: false` a free one on every
+/// surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WithoutStrict {
+    /// Free: its arguments as the model writes them, chat completions'
+    /// default.
+    Free,
+    /// Normalized into strict form and held where its schema allows it
+    /// ([`ignis_grammar::ToolHold::Normalized`]), free otherwise and never
+    /// refused: the Responses API's default.
+    Normalized,
+}
+
+/// How the request's tool `tool` (resolved, its `strict` then `false` where
+/// it was sent none), `raw` as sent, is held: `strict: true` a strict tool,
+/// one sent without `strict` (or with `null`) as `without_strict` says, any
+/// other free.
+fn tool_hold(raw: Option<&ignis_grammar::json::Json>, tool: &JsonValue, without_strict: WithoutStrict) -> ignis_grammar::ToolHold {
+    use ignis_grammar::json::Json;
+    use ignis_grammar::ToolHold;
+    if tool["function"]["strict"] == JsonValue::Bool(true) {
+        return ToolHold::Strict(strict_parameters(raw, tool));
+    }
+    let sent_none = raw.is_some_and(|tool| sent_function(tool).get("strict").is_none_or(|strict| *strict == Json::Null));
+    match (sent_none, without_strict) {
+        (true, WithoutStrict::Normalized) => ToolHold::Normalized(strict_parameters(raw, tool)),
+        _ => ToolHold::Free,
+    }
+}
+
 /// The held tools of a request whose resolved `tools` are these (none
-/// under `tool_choice: "none"`), `raw` the same tools as sent; `None` for a
-/// request with no strict tool, which changes by no byte, and on a model
-/// that does not serve structured output, where `strict` stays inert
-/// (Flash-Next, #581).
+/// under `tool_choice: "none"`), `raw` the same tools as sent, a tool sent
+/// without `strict` served as `without_strict` says; `None` for a request
+/// with no held tool, which changes by no byte, and on a model that does not
+/// serve structured output, where `strict` stays inert and no tool is
+/// normalized (Flash-Next, #581).
 ///
-/// Every strict tool is compiled when the request arrives, and the tool
-/// calls' grammar with them, once per distinct set of tools
+/// Every strict and normalized tool is compiled when the request arrives,
+/// and the tool calls' grammar with them, once per distinct set of tools
 /// ([`ignis_grammar::GrammarCache::tool_calls`]); the content is held to it
 /// ([`held_content`]), the function name of every call to the request's
-/// declared tools, and each strict tool's arguments to its `parameters`, in
-/// the key order the client sent them. Refused with a 400 before anything is
-/// generated, naming the tool's field in `param`: a strict schema outside
-/// OpenAI's strict subset, with structured output's codes; a strict tool the
-/// model's dialect cannot write (its name, a parameter's name, a held string
-/// with no value it can write on one line); and, with thinking on, a
-/// tokenizer with no single-token `</think>` to hold the content after.
+/// declared tools, and each held tool's arguments to its `parameters`, in
+/// the key order the client sent them. A strict tool is refused with a 400
+/// before anything is generated, naming the tool's field in `param`: a
+/// strict schema outside OpenAI's strict subset, with structured output's
+/// codes; a strict tool the model's dialect cannot write (its name, a
+/// parameter's name, a held string with no value it can write on one line);
+/// and, with thinking on, a tokenizer with no single-token `</think>` to
+/// hold the content after. A normalized tool is never refused: where any of
+/// those would refuse it, it stays free (#614).
 pub(crate) fn held_tools(
     server: &Server,
     raw: &[ignis_grammar::json::Json],
     tools: &[JsonValue],
     thinking: &ThinkingOptions,
+    without_strict: WithoutStrict,
 ) -> Result<Option<HeldTools>, Response> {
-    use ignis_grammar::{DeclaredTool, ToolField};
-    let strict = |tool: &JsonValue| tool["function"]["strict"] == JsonValue::Bool(true);
-    let Some(first) = tools.iter().position(strict) else { return Ok(None) };
+    use ignis_grammar::{DeclaredTool, ToolField, ToolHold};
+    let holds: Vec<ToolHold> = tools.iter().enumerate().map(|(index, tool)| tool_hold(raw.get(index), tool, without_strict)).collect();
+    if holds.iter().all(|hold| *hold == ToolHold::Free) {
+        return Ok(None);
+    }
+    let first_strict = holds.iter().position(|hold| matches!(hold, ToolHold::Strict(_)));
     let active = server.active();
     if !active.family.serves_structured_output() {
         return Ok(None);
@@ -1566,11 +1606,8 @@ pub(crate) fn held_tools(
     let Some(grammars) = active.template.grammars() else { return Ok(None) };
     let declared: Vec<DeclaredTool> = tools
         .iter()
-        .enumerate()
-        .map(|(index, tool)| DeclaredTool {
-            name: tool["function"]["name"].as_str().unwrap_or_default().to_owned(),
-            strict: strict(tool).then(|| strict_parameters(raw.get(index), tool)),
-        })
+        .zip(holds)
+        .map(|(tool, hold)| DeclaredTool { name: tool["function"]["name"].as_str().unwrap_or_default().to_owned(), hold })
         .collect();
     let grammar = grammars.tool_calls(&declared).map_err(|refused| {
         let field = match refused.field {
@@ -1587,15 +1624,21 @@ pub(crate) fn held_tools(
             Some(&param),
         )
     })?;
+    // Every normalized tool left free, and no strict one: nothing is held.
+    if grammar.held().next().is_none() {
+        return Ok(None);
+    }
     let held = grammar.held().map(|(name, parameters)| (name.to_owned(), parameters.clone())).collect();
     let content = ignis_core::structured::AnswerGrammar::tool_calls(grammar.clone());
     // With thinking on the reasoning stays free, and the content is held
-    // from the token after the block's `</think>`, as an answer is.
+    // from the token after the block's `</think>`, as an answer is;
+    // normalized tools alone stay free without one.
     let content = match active.template.decoder_starts_in_reasoning(thinking) {
         false => content,
         true => match active.template.encode_literal(crate::thinking::THINK_END_TEXT).filter(|ids| ids.len() == 1) {
             Some(ids) => content.after(ids[0]),
             None => {
+                let Some(first) = first_strict else { return Ok(None) };
                 let param = tool_member(raw, first, "strict");
                 return Err(error_response_naming(
                     StatusCode::BAD_REQUEST,
@@ -1610,7 +1653,7 @@ pub(crate) fn held_tools(
     Ok(Some(HeldTools { grammar: content, calls: grammar, held }))
 }
 
-/// A strict tool's `parameters` as the client sent them, key order kept
+/// A held tool's `parameters` as the client sent them, key order kept
 /// (`raw`, the grammar crate's own JSON, which keeps it), or the normalized
 /// tool's when it sent none ([`normalize_tool`]).
 fn strict_parameters(raw: Option<&ignis_grammar::json::Json>, normalized: &JsonValue) -> String {
@@ -1641,7 +1684,7 @@ fn tool_member(raw: &[ignis_grammar::json::Json], index: usize, member: &str) ->
 /// What a request's content is held to, and how its response reads its
 /// calls, on chat completions and the Responses API alike (GitHub #591,
 /// #611, #613, #615, ADR 0094): the answer under its format (`answer`, from
-/// [`structured_output`]), its strict tools' calls ([`held_tools`]), or
+/// [`structured_output`]), its held tools' calls ([`held_tools`]), or
 /// both, by [`held_content`].
 pub(crate) struct HeldContent {
     /// The grammar the content is held to, if any.
@@ -1651,19 +1694,23 @@ pub(crate) struct HeldContent {
     /// The request's tools as every scanner of its response reads their
     /// calls, a held tool's by the confirmed close ([`ToolSchemas::holding`]).
     pub schemas: ToolSchemas,
+    /// Whether each of the resolved tools is held, by its place: the
+    /// `strict` the Responses API echoes for a tool sent without one (#614).
+    pub held: Vec<bool>,
 }
 
 /// The [`HeldContent`] of a request whose answer is `answer`, whose
-/// resolved `tools` are these, `raw` the same tools as sent: one rule for
-/// every surface that serves strict tools (GitHub #615, ADR 0094).
+/// resolved `tools` are these, `raw` the same tools as sent, a tool sent
+/// without `strict` served as `without_strict` says (#614): one rule for
+/// every surface that serves held tools (GitHub #615, ADR 0094).
 ///
-/// - An answer alone, or the strict tools alone, is held to its own
+/// - An answer alone, or the held tools alone, is held to its own
 ///   grammar. The tools' holds every turn that may call them: `tool_choice`
 ///   `"auto"`, `"required"` or a named function, whose forced literal opens
 ///   the call and whose tokens the grammar follows (#286), and
 ///   `parallel_tool_calls: false`, whose turn ends at the call's confirmed
 ///   close, where the scanner holding the tool closes it.
-/// - An answer beside strict tools: until the answer starts, the call's
+/// - An answer beside held tools: until the answer starts, the call's
 ///   opener releases the turn from the answer's grammar (#592), and the call
 ///   is held to the tool calls' grammar, which holds the rest of the turn,
 ///   its text free and each further call held. A forced call's turn has no
@@ -1676,16 +1723,18 @@ pub(crate) fn held_content(
     raw: &[ignis_grammar::json::Json],
     tools: &[JsonValue],
     thinking: &ThinkingOptions,
+    without_strict: WithoutStrict,
 ) -> Result<HeldContent, Response> {
-    let held_tools = held_tools(server, raw, tools, thinking)?;
+    let held_tools = held_tools(server, raw, tools, thinking, without_strict)?;
     let (grammar, description) = match (answer, &held_tools) {
         (Some(answer), Some(held)) => (Some(answer.grammar.holding_calls(held.calls.clone())), answer.description),
         (Some(answer), None) => (Some(answer.grammar), answer.description),
         (None, Some(held)) => (Some(held.grammar.clone()), None),
         (None, None) => (None, None),
     };
+    let holds = (0..tools.len()).map(|tool| held_tools.as_ref().is_some_and(|held| held.calls.holds(tool))).collect();
     let held = held_tools.map(|held| held.held).unwrap_or_default();
-    Ok(HeldContent { grammar, description, schemas: ToolSchemas::from_tools(tools).holding(held) })
+    Ok(HeldContent { grammar, description, schemas: ToolSchemas::from_tools(tools).holding(held), held: holds })
 }
 
 /// A JSON value read once into the two shapes the handler needs:
@@ -3268,8 +3317,8 @@ async fn chat_completions(
         Ok(held) => held,
         Err(response) => return response,
     };
-    let HeldContent { grammar, description, schemas } =
-        match held_content(&server, held, raw_tools.as_deref().unwrap_or_default(), &tools, &thinking) {
+    let HeldContent { grammar, description, schemas, .. } =
+        match held_content(&server, held, raw_tools.as_deref().unwrap_or_default(), &tools, &thinking, WithoutStrict::Free) {
             Ok(content) => content,
             Err(response) => return response,
         };

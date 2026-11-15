@@ -62,14 +62,42 @@ use crate::schema::{Grammar, LitTrie, Node, Refusal, NO_RE};
 use crate::vocab::{Trie, Vocab};
 use crate::TokenSet;
 
+pub(crate) mod normalize;
+
 /// A function tool the request declares, as the grammar is given it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredTool {
     pub name: String,
-    /// A **strict tool**'s `parameters`, as sent (their key order is the
-    /// order the arguments are delivered in); `None` for a tool that is not
-    /// held, whose arguments stay free.
-    pub strict: Option<String>,
+    pub hold: ToolHold,
+}
+
+/// Whether a declared tool is held, and to what. A schema is the tool's
+/// `parameters` as sent: their key order is the order its arguments are
+/// delivered in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolHold {
+    /// A tool that is not held, whose arguments stay free.
+    Free,
+    /// A **strict tool**'s schema, refused outside OpenAI's strict subset
+    /// and where the dialect cannot hold it.
+    Strict(String),
+    /// A tool sent without `strict` where the surface serves OpenAI's
+    /// default, the Responses API's (GitHub #614): its schema normalized into
+    /// strict form, every object closed and its optional parameters left out
+    /// when the call leaves them out ([`normalize::strict_form`]), and held.
+    /// A schema that does not normalize, or a tool the dialect cannot hold,
+    /// leaves the tool free: never refused.
+    Normalized(String),
+}
+
+/// A held tool's compiled `parameters` and how the call may leave them out.
+pub(crate) struct HeldSchema {
+    pub grammar: Arc<Grammar>,
+    /// The parameters the client left optional, which a normalized tool's
+    /// call may leave out and whose arguments then omit them.
+    pub optional: Vec<String>,
+    /// A normalized tool: what the dialect cannot hold leaves it free.
+    pub normalized: bool,
 }
 
 /// Which of a tool's fields a refusal is about.
@@ -522,31 +550,36 @@ fn pattern_slot(dfa: &ByteDfa, re: u32, null: bool) -> Option<Slot> {
 }
 
 impl ToolCallGrammar {
-    /// Compile a request's tools. `strict[i]` is tool `i`'s compiled
-    /// `parameters` when it is held.
+    /// Compile a request's tools. `schemas[i]` is tool `i`'s compiled
+    /// `parameters` when it is held; a normalized tool the dialect cannot
+    /// hold is left free here, where a strict one is refused.
     pub(crate) fn compile(
         vocab: Arc<Vocab>,
         controls: Arc<Controls>,
         max_ws: u8,
         memo_budget: usize,
         tools: &[DeclaredTool],
-        strict: Vec<Option<Arc<Grammar>>>,
+        schemas: Vec<Option<HeldSchema>>,
     ) -> Result<Self, ToolRefusal> {
         let mut names = LitTrie::new();
         let mut name_tools = HashMap::new();
         let mut callable = 0;
         let mut held = Vec::new();
-        for (i, (tool, grammar)) in tools.iter().zip(strict).enumerate() {
+        for (i, (tool, mut schema)) in tools.iter().zip(schemas).enumerate() {
             let name_refusal = |code, detail: String| ToolRefusal { tool: i, field: ToolField::Name, refusal: refusal(code, "name", "#", detail) };
             let writable = !tool.name.contains('>') && !tool.name.contains(CALL_CLOSE.trim_end_matches('>'));
-            if grammar.is_some() {
+            let duplicate = tools.iter().enumerate().any(|(j, other)| j != i && other.name == tool.name);
+            if schema.as_ref().is_some_and(|s| s.normalized) && (!writable || duplicate) {
+                schema = None;
+            }
+            if schema.is_some() {
                 if !writable {
                     return Err(name_refusal(
                         "tool_name_unwritable",
                         format!("the model's tool-call dialect cannot write the name \"{}\": a name ends at its first `>`", tool.name),
                     ));
                 }
-                if tools.iter().enumerate().any(|(j, other)| j != i && other.name == tool.name) {
+                if duplicate {
                     return Err(name_refusal("duplicate_tool_name", format!("another tool is also named \"{}\", so a call to it names neither", tool.name)));
                 }
             }
@@ -557,8 +590,12 @@ impl ToolCallGrammar {
                 name_tools.entry(node).or_insert(i as u32);
                 callable += (name_tools.len() > before) as usize;
             }
-            held.push(match grammar {
-                Some(grammar) => Some(held_tool(grammar).map_err(|refusal| ToolRefusal { tool: i, field: ToolField::Parameters, refusal })?),
+            held.push(match schema {
+                Some(schema) => match held_tool(schema.grammar, &schema.optional) {
+                    Ok(tool) => Some(tool),
+                    Err(_) if schema.normalized => None,
+                    Err(refusal) => return Err(ToolRefusal { tool: i, field: ToolField::Parameters, refusal }),
+                },
                 None => None,
             });
         }
@@ -591,6 +628,12 @@ impl ToolCallGrammar {
     /// read the same calls by.
     pub fn held(&self) -> impl Iterator<Item = (&str, &Parameters)> + '_ {
         self.tool_names.iter().zip(&self.held).filter_map(|(name, held)| held.as_ref().map(|h| (name.as_str(), &h.parameters)))
+    }
+
+    /// Whether the request's `tool`th tool is held: a strict tool always, a
+    /// normalized one when its schema normalized and the dialect holds it.
+    pub fn holds(&self, tool: usize) -> bool {
+        self.held.get(tool).is_some_and(Option::is_some)
     }
 
     pub fn vocab(&self) -> &Arc<Vocab> {
@@ -1020,8 +1063,10 @@ fn name_node(trie: &LitTrie, bytes: &[u8]) -> u32 {
 /// A held tool from its compiled strict `parameters`: the declared
 /// parameters in the schema's order, each required but the nullable ones (a
 /// strict schema requires them all, and one that may be null may be left
-/// out, delivered `null`), how each value reads, and a slot per parameter.
-fn held_tool(grammar: Arc<Grammar>) -> Result<Held, Refusal> {
+/// out, delivered `null`) and the `optional` ones (a normalized tool's that
+/// the client left optional, left out of the arguments when the call leaves
+/// them out, #614), how each value reads, and a slot per parameter.
+fn held_tool(grammar: Arc<Grammar>, optional: &[String]) -> Result<Held, Refusal> {
     let core = &grammar.core;
     let object = core.alts[core.root as usize].iter().find_map(|&a| match &core.nodes[a as usize] {
         Node::Object { keys, values } => Some((keys, values)),
@@ -1052,9 +1097,10 @@ fn held_tool(grammar: Arc<Grammar>) -> Result<Held, Refusal> {
         }
         let nullable = accepts_value(core, value, NULL);
         let (slot, reading) = slot_of(core, value, nullable, &path)?;
+        let optional = optional.contains(&name);
         slots.push(slot);
-        readings.push((reading, nullable));
-        if !nullable {
+        readings.push((reading, nullable && !optional));
+        if !nullable && !optional {
             required.push(name.clone());
         }
         names.push(name);

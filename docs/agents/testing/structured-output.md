@@ -200,8 +200,11 @@ repaired from the verify pass's scores, as a plain round's draw is.
   spike S1's two points, bounds the whitespace between tags (the byte past
   the bound a miss) and refuses what it cannot hold by name. No state is a
   dead end (a search back to free text from states of generated texts), and
-  the mask equals the token-by-token reference on every state of them.
-  Machine-local, on the 27B's tokenizer (`--test tool_calls_real_tokenizer`,
+  the mask equals the token-by-token reference on every state of them. A
+  normalized tool (#614) is held, its objects closed and its optional
+  parameters omissible and left out; one whose schema does not normalize,
+  or that the dialect cannot hold, is left free, never refused, a strict
+  tool beside it held; strict and normalized compile apart. Machine-local, on the 27B's tokenizer (`--test tool_calls_real_tokenizer`,
   a few seconds, skips without the artifact): the tags are one added token
   each, read as they decode; no ordinary token holds the opener, so the first
   draw keeps no scores; masks equal the reference on held calls as the
@@ -231,7 +234,14 @@ repaired from the verify pass's scores, as a plain round's draw is.
   streamed call in one arguments delta; each refusal names the flat tool
   (`tools[1].parameters`), or the chat path for a tool sent in the chat
   shape, as a 400 and as the socket's `error` event; a tool with
-  `strict: false` or none is held to nothing. Beside the fields that shape
+  `strict: false` is held to nothing and echoed as sent. A tool sent
+  without `strict` (#614) is normalized: an invented parameter and a nested
+  object's own key repaired away, the optional parameters left out, the
+  arguments valid under the schema as sent, echoed `strict: true`; one whose
+  schema does not normalize, and every one on Flash-Next, served free and
+  echoed `strict: false`; each tool's echo, in its `function` for the chat
+  shape, and none held under `tool_choice: "none"`. On chat completions a
+  tool without `strict` stays free. Beside the fields that shape
   a turn (#615): a `"required"` and a named forced call missing after its
   opening, valid, the forced tokens no miss; beside `response_format` a held
   call, or an answer valid under the schema, both counted under

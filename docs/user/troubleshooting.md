@@ -655,6 +655,9 @@ a parameter whose name holds `>` (`parameter_name_unwritable`), a held string
 none of whose values fits on one line (`no_writable_value`). Fix the schema,
 or send the tool with `strict: false` to have its calls served as the model
 writes them ([Held tools](api/structured-output.md#held-tools-strict-true)).
+On the Responses API a tool sent without `strict` is never refused: it is
+held where its schema normalizes and served free where it does not
+([A tool sent without `strict`](api/structured-output.md#a-tool-sent-without-strict)).
 
 ### WARN `ignis.structured.vocabulary_unreadable`
 

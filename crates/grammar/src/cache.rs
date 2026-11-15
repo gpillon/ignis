@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::json::Json;
 use crate::schema::{Grammar, GrammarLimits, Refusal};
-use crate::tool_calls::{Controls, DeclaredTool, ToolCallGrammar, ToolRefusal};
+use crate::tool_calls::normalize::strict_form;
+use crate::tool_calls::{Controls, DeclaredTool, HeldSchema, ToolCallGrammar, ToolHold, ToolRefusal};
 use crate::vocab::Vocab;
 
 /// The memory a [`GrammarCache`] keeps its grammars in by default: room for
@@ -20,7 +21,7 @@ pub const DEFAULT_CACHE_BYTES: usize = 256 << 20;
 /// A schema is the same schema when its JSON is, whitespace aside, with the
 /// same `strict` flag; its refusal is kept too. A request's tool calls
 /// ([`GrammarCache::tool_calls`], #611) are the same when its declared tools
-/// are, names and strict schemas in order. Past the capacity
+/// are, names, strict and normalized schemas in order. Past the capacity
 /// ([`GrammarLimits::cache_bytes`]), the least recently used entries are
 /// dropped; a request still holding one keeps it alive. A grammar's own
 /// caches grow while requests use it, never past the capacity, and the bound
@@ -141,42 +142,55 @@ impl GrammarCache {
     /// The grammar of a request's tool calls (GitHub #611, ADR 0094): the
     /// function tools it declares, in order, each strict one's `parameters`
     /// compiled under `strict` (and cached as [`GrammarCache::json_schema`]
-    /// keeps it), compiled once per distinct set. A strict schema outside
-    /// OpenAI's strict subset, and a tool the model's dialect cannot hold,
-    /// are refused, naming the tool and its field.
+    /// keeps it), and each normalized one's in strict form (#614), compiled
+    /// once per distinct set. A strict schema outside OpenAI's strict subset,
+    /// and a strict tool the model's dialect cannot hold, are refused, naming
+    /// the tool and its field; a normalized tool whose schema does not
+    /// normalize, or which the dialect cannot hold, is left free
+    /// ([`ToolCallGrammar::holds`]).
     pub fn tool_calls(&self, tools: &[DeclaredTool]) -> Result<Arc<ToolCallGrammar>, ToolRefusal> {
         let mut key = Vec::new();
         for tool in tools {
             key.extend_from_slice(&(tool.name.len() as u32).to_le_bytes());
             key.extend_from_slice(tool.name.as_bytes());
-            match &tool.strict {
-                Some(schema) => {
-                    let schema = canonical(schema);
-                    key.push(1);
-                    key.extend_from_slice(&(schema.len() as u32).to_le_bytes());
-                    key.extend_from_slice(&schema);
-                }
-                None => key.push(0),
+            let (kind, schema) = match &tool.hold {
+                ToolHold::Free => (0, None),
+                ToolHold::Strict(schema) => (1, Some(schema)),
+                ToolHold::Normalized(schema) => (2, Some(schema)),
+            };
+            key.push(kind);
+            if let Some(schema) = schema {
+                let schema = canonical(schema);
+                key.extend_from_slice(&(schema.len() as u32).to_le_bytes());
+                key.extend_from_slice(&schema);
             }
         }
         let key = (key, Kind::ToolCalls);
         if let Some(Compiled::ToolCalls(result)) = self.lookup(&key) {
             return result;
         }
-        let mut strict = Vec::with_capacity(tools.len());
+        let mut schemas = Vec::with_capacity(tools.len());
         for (tool, declared) in tools.iter().enumerate() {
-            strict.push(match &declared.strict {
-                Some(schema) => Some(self.json_schema(schema, true).map_err(|refusal| ToolRefusal {
-                    tool,
-                    field: crate::tool_calls::ToolField::Parameters,
-                    refusal,
-                })?),
-                None => None,
+            schemas.push(match &declared.hold {
+                ToolHold::Free => None,
+                ToolHold::Strict(schema) => Some(HeldSchema {
+                    grammar: self.json_schema(schema, true).map_err(|refusal| ToolRefusal {
+                        tool,
+                        field: crate::tool_calls::ToolField::Parameters,
+                        refusal,
+                    })?,
+                    optional: Vec::new(),
+                    normalized: false,
+                }),
+                ToolHold::Normalized(schema) => Json::parse(schema)
+                    .ok()
+                    .and_then(|parameters| strict_form(&parameters))
+                    .and_then(|form| Some(HeldSchema { grammar: self.json_schema(&form.schema, true).ok()?, optional: form.optional, normalized: true })),
             });
         }
         let controls = self.controls.get_or_init(|| Arc::new(Controls::new(&self.vocab, &self.added))).clone();
         self.compiles.fetch_add(1, Ordering::Relaxed);
-        let result = ToolCallGrammar::compile(self.vocab.clone(), controls, self.limits.max_whitespace, self.limits.cache_bytes, tools, strict)
+        let result = ToolCallGrammar::compile(self.vocab.clone(), controls, self.limits.max_whitespace, self.limits.cache_bytes, tools, schemas)
             .map(Arc::new);
         self.keep(key, Compiled::ToolCalls(result.clone()));
         result

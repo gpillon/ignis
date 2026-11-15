@@ -200,3 +200,25 @@ log fields. A refusal's `param` names the tool's field where the request sent it
 the Responses API takes as it is. The WebSocket mode parses a frame into a value, which sorts its keys, so it
 reads the frame's `tools` again from its text, as it already read `text`. With `strict` honoured on both surfaces,
 the field contract lists it as inert on neither.
+
+**The Responses API's default (#614).** A function tool sent there without `strict`, or with `strict: null`, is
+normalized into strict form and held; `strict: false` stays free, and chat completions normalize nothing, as
+OpenAI's defaults on the two surfaces are. The normalization is the grammar crate's
+(`ignis_grammar::ToolHold::Normalized`), so the operator's `held` can declare tools the same way on both surfaces.
+- It rewrites the client's `parameters` and compiles the result as a strict schema: every object gets
+  `additionalProperties: false` and lists every property in `required`, and the top-level properties the client's
+  `required` left out stay omissible, left out of the arguments when the call leaves them out. A required parameter
+  that may be `null` is held as a strict tool's: left out, it arrives as `null`. A nested object is written whole, as
+  ADR 0089's grammar writes every object, which the client's schema admits too.
+- Closing an object must not narrow what the client asked for, so a schema is not normalized where it would: an
+  object that admits keys by name (`additionalProperties` `true` or a schema), a nested object that declares no
+  property (a map, which closing would hold to `{}`; the root may declare none, a tool without parameters), and a
+  `required` naming a key the object does not declare. Nor is one the strict subset refuses, nor a tool the dialect
+  cannot hold (its name, a parameter's name, a value no line can hold), nor, with thinking on, one on a tokenizer
+  whose `</think>` is not one token. Each such tool stays free, alone, and is never refused; a strict tool beside it
+  is refused as before.
+- The response's `tools` echo the `strict` each tool sent without one was served with, beside its name (in its
+  `function` for the chat shape): `true` where its calls are held, `false` where they are not, which includes
+  Flash-Next and `tool_choice: "none"`, under which nothing is held. A `strict` the client sent is echoed as sent,
+  so the echo of `strict: false` changes by no byte, but on Flash-Next every tool echoes `false`: `strict: true` is
+  inert there (#581), and the echo says what each tool was served with.

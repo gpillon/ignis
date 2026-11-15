@@ -148,5 +148,7 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   and one under `parallel_tool_calls: false`, which ends the turn at the
   call's own close
   ([Beside `tool_choice`, `response_format` and `parallel_tool_calls`](structured-output.md#beside-tool_choice-response_format-and-parallel_tool_calls)).
-  `false`, `null` and absent serve the tool as before; on Flash-Next
-  `strict` is accepted and inert (GitHub #581).
+  `false`, `null` and absent serve the tool as before, OpenAI's default here
+  (the Responses API normalizes a tool sent without `strict`:
+  [A tool sent without `strict`](structured-output.md#a-tool-sent-without-strict));
+  on Flash-Next `strict` is accepted and inert (GitHub #581).
