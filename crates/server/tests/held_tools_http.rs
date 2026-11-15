@@ -539,14 +539,21 @@ async fn a_streamed_held_call_arrives_only_once_complete() {
     assert_eq!(calls[0].1, r#"{"path":"a.txt","content":"hi","mode":"a"}"#);
 }
 
-/// A call `max_tokens` cuts is left open, so dropped, as every open call
-/// is, with `finish_reason: "length"` (#583 changes how it is sent).
+/// A held call `max_tokens` cuts is a cut tool call (GitHub #583): its
+/// values read by the confirmed close as far as they were written, the one
+/// in progress last, with `finish_reason: "length"`; it is not counted in
+/// `ignis_tool_calls_total`. The cap lands after `a long`: nine tokens of
+/// content, the call's open tag, then one token a character.
 #[tokio::test]
-async fn a_held_call_the_cap_cuts_is_dropped_with_length() {
+async fn a_held_call_the_cap_cuts_is_a_cut_call_with_length() {
     let script = format!("Writing.\n{}", call("write_file", &[("path", "a.txt"), ("content", "a long text"), ("mode", "w")]));
     let (server, _) = server(&script, ModelFamily::Qwen38_27b);
-    let (content, calls, finish) = served(&server, &chat(&[WRITE_FILE], false, 40)).await;
-    assert_eq!((content.as_str(), calls.len(), finish.as_str()), ("Writing.\n", 0, "length"));
+    let (content, calls, finish) = served(&server, &chat(&[WRITE_FILE], false, 95)).await;
+    assert_eq!((content.as_str(), finish.as_str()), ("Writing.\n", "length"));
+    assert_eq!(calls, [("write_file".to_owned(), r#"{"path":"a.txt","content":"a long"#.to_owned())]);
+    let text = server.metrics.as_ref().unwrap().render();
+    let counted: Vec<&str> = text.lines().filter(|line| line.starts_with("ignis_tool_calls_total{") && !line.ends_with(" 0")).collect();
+    assert!(counted.is_empty(), "{counted:?}");
 }
 
 /// `tools` is read in its key order as sent by the deserializer that read

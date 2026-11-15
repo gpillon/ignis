@@ -229,3 +229,17 @@ describe("streamChatCompletions and the page's connections", () => {
     expect(results.every((result) => result.ok)).toBe(true);
   });
 });
+
+describe("streamChatCompletions and a cut tool call", () => {
+  it("delivers a call whose arguments are an unterminated prefix, then the length finish, without throwing", async () => {
+    const events: ChunkEvent[] = [];
+    const whole =
+      sse({ tool_calls: [{ index: 0, id: "call_0", type: "function", function: { name: "agent", arguments: '{"prompt":"look at' } }] }) +
+      sse({}, "length") +
+      "data: [DONE]\n\n";
+    const result = await streamChatCompletions({ body: {}, fetch: fakeFetch([whole]), now: ticking(), onEvent: (e) => events.push(e) });
+    expect(result.ok).toBe(true);
+    expect(result.timeline.finishReason).toBe("length");
+    expect(events.find((e) => e.kind === "tool_call")).toMatchObject({ call: { id: "call_0", name: "agent", arguments: '{"prompt":"look at' } });
+  });
+});

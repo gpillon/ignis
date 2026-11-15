@@ -283,8 +283,10 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
 - **The answer is free outside its calls.** The grammar arms at a call's
   `<tool_call>`, in the answer only, never in the reasoning, and is released
   at the call's close; each further call arms it again. A call `max_tokens`
-  cuts is dropped, as every call left open is, and `finish_reason` is
-  `"length"` (GitHub #583 will change how it is sent).
+  cuts comes back as any cut call does (from 0.11.0): its name and the
+  arguments written so far, each value ending where the call goes on, and
+  `finish_reason: "length"`
+  ([Chat completions](chat-completions.md)).
 - **A string value is the call's raw text**, and it ends only where the call
   goes on: a parameter's opener the call has not written yet, or the
   function's close once every required parameter is written. A file's

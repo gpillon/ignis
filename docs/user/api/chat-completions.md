@@ -104,6 +104,23 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   nothing. With `tool_choice: "required"` or a named function the turn has
   exactly one call. `true` or absent serves every call the model writes, as
   before. It holds on every model, Flash-Next included.
+- **A tool call the cap cuts comes back as the model wrote it** (from 0.11.0;
+  0.10.0 drops it whole), as OpenAI's API returns one: a call `max_tokens`
+  stops before it closes is the last entry of `tool_calls`, after the calls
+  that closed, with its name and the arguments written so far, and the answer
+  ends `finish_reason: "length"`. The arguments are the start of the JSON the
+  call would have had, never closed: cut after `printl` in a `write_file`
+  call's `content`, they are `{"path":"src/main.rs","content":"fn main()
+  {\n    printl`. They do not parse, and `length` says the call is not
+  complete: do not run it (OpenAI's SDKs raise on `length`). Streamed, it is
+  one whole `tool_calls` delta, the last before the `length` finish chunk. A
+  call cut before its function's name closes is not sent, and every other
+  end (the model's own, a `stop` sequence, a cancel, an engine error) drops a
+  call left open, as before. A cut call sent back in a later turn's history
+  is rendered with no parameters (`{}`), with a warning in the server's log.
+  A deadline that passes under `timeout_reply: partial` cuts a call the same
+  way ([Deadlines](deadlines.md)); a cut call is not counted in
+  `ignis_tool_calls_total`.
 - `response_format: {"type": "json_object"}` holds the answer to a valid JSON
   object, and `{"type": "json_schema", "json_schema": {...}}` to your schema,
   streamed or not (from 0.11.0, on the 27B; 0.10.0 refuses both): each

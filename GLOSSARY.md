@@ -88,6 +88,11 @@ The most a request may generate, reasoning included: its `max_tokens`
 `--model-max-context`. Reaching it ends the request with `finish_reason:
 "length"`.
 
+**Cut tool call**:
+A tool call a `length` ending stopped before it closed: it reaches the client
+with its name and the arguments written so far (ADR 0096).
+_Avoid_: truncated call, partial call, interrupted call.
+
 **Deadline**:
 How long a request may run before the server cuts it (ADR 0058):
 `server.request_timeout` for one answered whole, `server.stream_timeout` for

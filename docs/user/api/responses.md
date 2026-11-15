@@ -88,7 +88,16 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   echoes `strict: false`.
 - A length stop ends `incomplete` (`max_output_tokens`), an engine error
   `failed`; `usage` carries `input_tokens_details.cached_tokens` and
-  `output_tokens_details.reasoning_tokens`.
+  `output_tokens_details.reasoning_tokens`. A tool call the cap cuts before it
+  closes (from 0.11.0; 0.10.0 drops it) is the response's last
+  `function_call` item, `status: "incomplete"`, with its name and the
+  arguments written so far, a JSON prefix that does not parse; every call
+  that closed stays `completed`. Streamed, it carries a closed call's four
+  events, `response.output_item.added`,
+  `response.function_call_arguments.delta` and `.done`, and
+  `response.output_item.done`, before `response.incomplete`, and the response
+  a `previous_response_id` continues holds it. A cancel or a failure drops a
+  call left open ([Chat completions](chat-completions.md) has the rule).
 
 **WebSocket mode.** `GET /v1/responses` upgrades to a WebSocket, keyed like
 HTTP: `Authorization: Bearer <key>` on the upgrade, or a

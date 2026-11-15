@@ -690,7 +690,8 @@ impl ResponseEvents {
 
     /// One whole tool call: its item is added, its arguments streamed in one
     /// delta (the call is parsed out of a closed block, so it is whole by the
-    /// time it is known), and it is done.
+    /// time it is known), and it is done, `completed`; a cut call (GitHub
+    /// #583) the same way, `incomplete`.
     fn function_call(&mut self, call: ToolCall, out: &mut Vec<JsonValue>) {
         let id = format!("fc_{}_{}", self.suffix, call.index);
         let call_id = format!("call_{}_{}", self.suffix, call.index);
@@ -715,14 +716,16 @@ impl ResponseEvents {
             "name": call.name,
             "arguments": call.arguments,
         })));
-        let done = OutputItem::FunctionCall { id, status: "completed", call_id, name: call.name, arguments: call.arguments };
+        let status = if call.cut { "incomplete" } else { "completed" };
+        let done = OutputItem::FunctionCall { id, status, call_id, name: call.name, arguments: call.arguments };
         self.done(index, done, out);
     }
 
     /// End the response: everything still held back — the decoder's tail and
-    /// the scanner's (a call left open is dropped whole, never delivered
-    /// half-written) — then the open items closed, then the terminal event.
-    /// Nothing once it has ended.
+    /// the scanner's (a call left open is a cut call when the response ends
+    /// `incomplete`, by its cap or its deadline, GitHub #583, and dropped
+    /// whole at any other ending) — then the open items closed, then the
+    /// terminal event. Nothing once it has ended.
     fn finish(&mut self, ending: Ending, out: &mut Vec<JsonValue>) {
         if self.ending.is_some() {
             return;
@@ -730,7 +733,11 @@ impl ResponseEvents {
         for delta in self.decoder.finish() {
             self.route(delta, out);
         }
-        for event in self.scanner.finish() {
+        let events = match ending {
+            Ending::Incomplete => self.scanner.finish_at_length(),
+            Ending::Completed | Ending::Cancelled | Ending::Failed => self.scanner.finish(),
+        };
+        for event in events {
             self.scanned(event, out);
         }
         self.close_reasoning(out);
@@ -1048,5 +1055,49 @@ mod tests {
         let at = |kind: &str| emitted.iter().position(|e| e["type"] == kind).unwrap();
         assert!(at("response.output_text.delta") < at("response.output_text.done"));
         assert_eq!(emitted.last().unwrap()["type"], "response.completed");
+    }
+
+    /// GitHub #583: a call open when the response ends `incomplete`, by its
+    /// cap or by its deadline under `partial`, is a cut call, a
+    /// `function_call` item `incomplete` with the arguments written so far,
+    /// its four events before `response.incomplete`; a completed call before
+    /// it stays `completed`. Ended any other way (its own end, a cancel, a
+    /// failure) the open call is dropped whole.
+    #[test]
+    fn a_call_open_at_an_incomplete_ending_is_a_cut_call_and_at_any_other_dropped() {
+        const TEXTS: &[&str] = &["Reading.", "<tool_call>\n<function=a>\n</function>\n</tool_call>", "<tool_call>\n<function=read>\n<parameter=path>\nsrc/ma"];
+        let ended = |end: &dyn Fn(&mut ResponseEvents) -> Vec<JsonValue>| {
+            let mut events = events(TEXTS, false);
+            let mut out = events.on_tokens(&[0, 1, 2]);
+            out.extend(end(&mut events));
+            (out, events.response().output.clone())
+        };
+        let at_length = |events: &mut ResponseEvents| {
+            let mut capped = done(3);
+            if let SchedEvent::Done { reason, .. } = &mut capped {
+                *reason = FinishReason::Length;
+            }
+            events.on_event(capped)
+        };
+        for (out, output) in [ended(&at_length), ended(&|events| events.cut())] {
+            let calls: Vec<(&JsonValue, &JsonValue, &JsonValue)> =
+                output.iter().filter(|item| item["type"] == "function_call").map(|item| (&item["name"], &item["arguments"], &item["status"])).collect();
+            assert_eq!(calls, [(&json!("a"), &json!("{}"), &json!("completed")), (&json!("read"), &json!("{\"path\":\"src/ma"), &json!("incomplete"))]);
+            let kinds: Vec<&str> = out.iter().map(|e| e["type"].as_str().unwrap()).collect();
+            assert_eq!(
+                kinds[kinds.len() - 5..],
+                ["response.output_item.added", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done", "response.incomplete"]
+            );
+            let last = out.last().unwrap();
+            assert_eq!((&last["response"]["status"], &last["response"]["incomplete_details"]["reason"]), (&json!("incomplete"), &json!("max_output_tokens")));
+        }
+        for (out, output) in [
+            ended(&|events| events.on_event(done(3))),
+            ended(&|events| events.cancelled()),
+            ended(&|events| events.failed("server_error", "the engine failed".into())),
+        ] {
+            let names: Vec<&JsonValue> = output.iter().filter(|item| item["type"] == "function_call").map(|item| &item["name"]).collect();
+            assert_eq!(names, [&json!("a")], "{out:?}");
+        }
     }
 }

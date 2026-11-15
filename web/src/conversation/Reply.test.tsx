@@ -61,6 +61,21 @@ describe("Reply and the thinking budget", () => {
   });
 });
 
+describe("Reply cut at the token limit", () => {
+  it("marks a reply that ended at its token limit, with or without a call", () => {
+    const html = render(reply({ figures: { ...figures, finishReason: "length" } }));
+    expect(html).toContain("Cut at the token limit");
+    expect(html).toContain("The reply reached its token limit and stopped here.");
+    expect(render(reply({ figures: { ...figures, finishReason: "length" }, toolCalls: [{ id: "c", name: "agent", arguments: '{"prompt":"lo' }] }))).toContain(
+      "Cut at the token limit",
+    );
+  });
+
+  it("carries no mark on a reply that stopped by itself", () => {
+    expect(render(reply())).not.toContain("Cut at the token limit");
+  });
+});
+
 // A reply the engine queued says so while it waits, and its figures keep the
 // wait apart from TTFT (GitHub #283).
 

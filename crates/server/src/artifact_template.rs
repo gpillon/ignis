@@ -1594,6 +1594,26 @@ You are a careful assistant.<|im_end|>
     }
 
     #[test]
+    fn a_resent_cut_tool_call_renders_as_a_call_with_no_parameters() {
+        // GitHub #583: a cut tool call's arguments, the JSON written so far,
+        // are not a JSON object; sent back in a history, the call renders as
+        // one whose arguments are `{}`, its name kept.
+        let template = ChatTemplate::from_source(REAL_TOOL_DIALECT_TEMPLATE).expect("compile");
+        let render = |arguments: &str| {
+            let history = ArtifactMessage {
+                role: Role::Assistant,
+                content: ignis_artifact::MessageContent::Text("Writing it.".to_owned()),
+                tool_calls: vec![artifact_tool_call(&wire_tool_call("write_file", arguments))],
+                reasoning_content: None,
+            };
+            template.render(&[history]).expect("render")
+        };
+        let cut = render(r#"{"path":"src/main.rs","content":"fn main() {\n    printl"#);
+        assert_eq!(cut, render("{}"));
+        assert!(cut.contains("<function=write_file>"), "{cut}");
+    }
+
+    #[test]
     fn a_malformed_tool_call_arguments_string_degrades_to_an_empty_object_not_a_panic() {
         // Acceptance: `ArtifactTemplateProvider::apply_chat_template`
         // parses a history tool call's wire `arguments` (a JSON-encoded

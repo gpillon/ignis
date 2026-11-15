@@ -13,8 +13,10 @@
 //! never `Stop`. The `finish_reason: "tool_calls"` enhancement
 //! (`resolve_finish_reason`, only reachable from `Stop`) is therefore
 //! pinned by `api.rs`'s own unit tests, not here; what these tests exercise
-//! is reassembly correctness and the interrupted-call drop rule, both of
-//! which are independent of which finish reason ends the stream.
+//! is reassembly correctness and the cut-call rule (GitHub #583: a call the
+//! cap cuts reaches the client with its arguments so far), and one test
+//! scripts the mock's EOS (`eos_after`) to pin the drop of a call its own
+//! end leaves open.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -98,7 +100,11 @@ struct Harness {
 }
 
 fn harness_with(template: RecordingTemplateProvider) -> Harness {
-    let compute = Arc::new(MockCompute::new());
+    harness_on(Arc::new(MockCompute::new()), template)
+}
+
+/// [`harness_with`] on `compute`, which a test may script first (an EOS).
+fn harness_on(compute: Arc<MockCompute>, template: RecordingTemplateProvider) -> Harness {
     let scheduler = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
@@ -180,34 +186,162 @@ async fn non_streaming_returns_a_tool_call_and_strips_it_from_content() {
     assert!(!body.contains("<tool_call"), "raw XML leaked: {body}");
 }
 
-/// A tool call left open when `max_tokens` cuts generation off mid-block
-/// (acceptance criterion 3): dropped whole, never returned half-written,
-/// and the text before the open tag is still delivered as ordinary content.
-#[tokio::test]
-async fn a_call_truncated_by_max_tokens_is_dropped_not_half_written() {
+// ── GitHub #583: a cut tool call ─────────────────────────────────────────
+
+/// The issue's example, after content and a closed call, over three
+/// tokens: `max_tokens: 3` cuts it after `printl`.
+fn cut_call_decode_map() -> HashMap<TokenId, &'static str> {
     let mock = MockCompute::new();
-    let mut decode = HashMap::new();
-    decode.insert(
-        mock.token_for(0, 0),
-        "before <tool_call>\n<function=read_file>\n<parameter=path>\na",
-    );
-    let h = harness_with(RecordingTemplateProvider::permissive(decode));
-    let req = serde_json::json!({
+    let mut map = HashMap::new();
+    map.insert(mock.token_for(0, 0), "Writing it.\n<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function>\n</tool_call>");
+    map.insert(mock.token_for(0, 1), "<tool_call>\n<function=write_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n");
+    map.insert(mock.token_for(0, 2), PRINTL);
+    map
+}
+
+const PRINTL: &str = "<parameter=content>\nfn main() {\n    printl";
+
+/// The cut call's arguments: exactly the issue's.
+const CUT_ARGUMENTS: &str = r#"{"path":"src/main.rs","content":"fn main() {\n    printl"#;
+
+fn cut_request(stream: bool) -> serde_json::Value {
+    serde_json::json!({
         "messages": [{ "role": "user", "content": "hi" }],
+        "tools": write_file_tools(),
+        "max_tokens": 3,
+        "enable_thinking": false,
+        "stream": stream
+    })
+}
+
+/// The calls of a whole answer, `(index, name, arguments)`, its content and
+/// its finish reason.
+fn whole_calls(body: &str) -> (Vec<(u64, String, String)>, String, String) {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    let message = &v["choices"][0]["message"];
+    let calls = message["tool_calls"].as_array().map_or_else(Vec::new, |calls| {
+        calls
+            .iter()
+            .enumerate()
+            .map(|(index, c)| (index as u64, c["function"]["name"].as_str().unwrap().to_owned(), c["function"]["arguments"].as_str().unwrap().to_owned()))
+            .collect()
+    });
+    (calls, message["content"].as_str().unwrap().to_owned(), v["choices"][0]["finish_reason"].as_str().unwrap().to_owned())
+}
+
+/// A call `max_tokens` cuts before it closes reaches the client as OpenAI's
+/// API returns one: its name and the arguments written so far, last, with
+/// `finish_reason: "length"`; the content and the closed call before it
+/// unchanged.
+#[tokio::test]
+async fn a_call_cut_by_max_tokens_carries_its_name_and_the_arguments_written_so_far() {
+    let h = harness_with(RecordingTemplateProvider::permissive(cut_call_decode_map()));
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(cut_request(false))).await;
+    assert_eq!(status, 200, "{body}");
+    let (calls, content, finish) = whole_calls(&body);
+    assert_eq!((content.as_str(), finish.as_str()), ("Writing it.\n", "length"), "{body}");
+    assert_eq!(
+        calls,
+        [(0, "read_file".to_owned(), r#"{"path":"src/main.rs"}"#.to_owned()), (1, "write_file".to_owned(), CUT_ARGUMENTS.to_owned())],
+        "{body}"
+    );
+    assert!(!body.contains("<tool_call") && !body.contains("<parameter"), "no XML fragment leaked: {body}");
+}
+
+/// The same answer with a stop sequence, collected token by token: the
+/// sequence written inside the call's arguments matches nothing, and the
+/// cut call is the same.
+#[tokio::test]
+async fn a_call_cut_by_max_tokens_is_the_same_with_a_stop_sequence_it_holds() {
+    let h = harness_with(RecordingTemplateProvider::permissive(cut_call_decode_map()));
+    let mut request = cut_request(false);
+    request["stop"] = serde_json::json!(["main"]);
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(request)).await;
+    assert_eq!(status, 200, "{body}");
+    let (calls, content, finish) = whole_calls(&body);
+    assert_eq!((content.as_str(), finish.as_str(), calls.len()), ("Writing it.\n", "length", 2), "{body}");
+    assert_eq!(calls[1], (1, "write_file".to_owned(), CUT_ARGUMENTS.to_owned()));
+}
+
+/// Cut before its function's name closes, the call names nothing: no call,
+/// `length`, the content before it. Cut right after the name, its arguments
+/// are `{`.
+#[tokio::test]
+async fn a_call_cut_before_its_name_closes_is_dropped_and_right_after_it_is_an_open_brace() {
+    let mock = MockCompute::new();
+    for (text, calls) in [("Reading.\n<tool_call>\n<function=read_fi", 0), ("Reading.\n<tool_call>\n<function=read_file>\n", 1)] {
+        let decode = HashMap::from([(mock.token_for(0, 0), text)]);
+        let h = harness_with(RecordingTemplateProvider::permissive(decode));
+        let mut request = cut_request(false);
+        request["max_tokens"] = serde_json::json!(1);
+        let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(request)).await;
+        assert_eq!(status, 200, "{body}");
+        let (got, content, finish) = whole_calls(&body);
+        assert_eq!((content.as_str(), finish.as_str(), got.len()), ("Reading.\n", "length", calls), "{body}");
+        if calls == 1 {
+            assert_eq!(got[0].1, "read_file");
+            assert_eq!(got[0].2, "{");
+        }
+    }
+}
+
+/// A call open at the model's own end is dropped whole, as before: `stop`
+/// would call it complete.
+#[tokio::test]
+async fn a_call_open_at_the_models_own_end_is_dropped_whole() {
+    for stream in [false, true] {
+        let compute = Arc::new(MockCompute::new());
+        compute.eos_after(0, 3);
+        let mut decode = cut_call_decode_map();
+        decode.insert(compute.token_for(0, 0), "Writing it.\n");
+        let h = harness_on(compute, RecordingTemplateProvider::permissive(decode));
+        let mut request = cut_request(stream);
+        request["max_tokens"] = serde_json::json!(8);
+        let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(request)).await;
+        assert_eq!(status, 200, "{body}");
+        let (names, finish): (Vec<String>, String) = match stream {
+            false => {
+                let (calls, _, finish) = whole_calls(&body);
+                (calls.into_iter().map(|c| c.1).collect(), finish)
+            }
+            true => {
+                let chunks = sse_chunks(&body);
+                let names = chunks
+                    .iter()
+                    .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array())
+                    .flatten()
+                    .map(|c| c["function"]["name"].as_str().unwrap().to_owned())
+                    .collect();
+                let finish = chunks.iter().filter_map(|c| c["choices"][0]["finish_reason"].as_str()).last().unwrap().to_owned();
+                (names, finish)
+            }
+        };
+        assert_eq!((names, finish.as_str()), (Vec::<String>::new(), "stop"), "stream {stream}: {body}");
+    }
+}
+
+/// A client that sends a cut call back in its history is served: its
+/// arguments are not a JSON object, and the template renders them `{}`.
+#[tokio::test]
+async fn a_history_holding_a_cut_call_is_still_served() {
+    let mock = MockCompute::new();
+    let h = harness_with(RecordingTemplateProvider::permissive(HashMap::from([(mock.token_for(0, 0), "Done.")])));
+    let request = serde_json::json!({
+        "messages": [
+            { "role": "user", "content": "write it" },
+            { "role": "assistant", "content": "Writing it.\n", "tool_calls": [{
+                "id": "call_1", "type": "function", "function": { "name": "write_file", "arguments": CUT_ARGUMENTS }
+            }] },
+            { "role": "tool", "tool_call_id": "call_1", "content": "Not run: the reply was cut by the token limit." },
+            { "role": "user", "content": "go on" }
+        ],
+        "tools": write_file_tools(),
         "max_tokens": 1,
         "enable_thinking": false
     });
-    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(request)).await;
     assert_eq!(status, 200, "{body}");
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let message = &v["choices"][0]["message"];
-    assert_eq!(message["content"], "before ");
-    assert!(
-        message.as_object().unwrap().get("tool_calls").is_none(),
-        "an interrupted call must not appear at all: {body}"
-    );
-    assert_eq!(v["choices"][0]["finish_reason"], "length");
-    assert!(!body.contains('<'), "no XML fragment leaked: {body}");
+    assert_eq!(whole_calls(&body).1, "Done.");
 }
 
 /// The all-reasoning-no-content shape (GitHub #70): the token budget is
@@ -327,43 +461,28 @@ async fn several_tool_calls_in_one_response_stream_with_distinct_indices() {
     assert_ne!(tool_call_deltas[0]["id"], tool_call_deltas[1]["id"]);
 }
 
+/// Streamed, the cut call is sent once, as one complete `tool_calls` delta
+/// (its id, its name, the arguments so far) with the next `index`, the last
+/// delta before the `length` finish chunk.
 #[tokio::test]
-async fn a_streamed_call_truncated_by_max_tokens_is_dropped_not_half_written() {
-    let mock = MockCompute::new();
-    let mut decode = HashMap::new();
-    decode.insert(
-        mock.token_for(0, 0),
-        "before <tool_call>\n<function=read_file>\n<parameter=path>\na",
-    );
-    let h = harness_with(RecordingTemplateProvider::permissive(decode));
-    let req = serde_json::json!({
-        "messages": [{ "role": "user", "content": "hi" }],
-        "max_tokens": 1,
-        "enable_thinking": false,
-        "stream": true
-    });
-    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+async fn a_streamed_call_cut_by_max_tokens_is_one_whole_delta_before_the_length_finish() {
+    let h = harness_with(RecordingTemplateProvider::permissive(cut_call_decode_map()));
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(cut_request(true))).await;
     assert_eq!(status, 200, "{body}");
     let chunks = sse_chunks(&body);
-    let mut content = String::new();
-    let mut saw_tool_call = false;
-    let mut finish_reason = None;
-    for chunk in &chunks {
-        let delta = &chunk["choices"][0]["delta"];
-        if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
-            content.push_str(c);
-        }
-        if delta.get("tool_calls").is_some() {
-            saw_tool_call = true;
-        }
-        if let Some(r) = chunk["choices"][0]["finish_reason"].as_str() {
-            finish_reason = Some(r.to_string());
-        }
-    }
-    assert_eq!(content, "before ");
-    assert!(!saw_tool_call, "an interrupted call must never reach the client: {body}");
-    assert_eq!(finish_reason.as_deref(), Some("length"));
-    assert!(!body.contains("<tool_call"), "raw XML leaked: {body}");
+    let content: String = chunks.iter().filter_map(|c| c["choices"][0]["delta"]["content"].as_str()).collect();
+    assert_eq!(content, "Writing it.\n");
+    let with_calls: Vec<usize> = (0..chunks.len()).filter(|&i| chunks[i]["choices"][0]["delta"].get("tool_calls").is_some()).collect();
+    let calls: Vec<&serde_json::Value> = with_calls.iter().flat_map(|&i| chunks[i]["choices"][0]["delta"]["tool_calls"].as_array().unwrap()).collect();
+    assert_eq!(calls.len(), 2, "{body}");
+    assert_eq!((&calls[0]["index"], &calls[0]["function"]["name"]), (&serde_json::json!(0), &serde_json::json!("read_file")));
+    let cut = calls[1];
+    assert_eq!((&cut["index"], &cut["function"]["name"], &cut["function"]["arguments"]), (&serde_json::json!(1), &serde_json::json!("write_file"), &serde_json::json!(CUT_ARGUMENTS)));
+    assert!(cut["id"].as_str().is_some_and(|id| !id.is_empty()), "{body}");
+    // The cut call's delta, then the finish chunk, and nothing between.
+    let finish = chunks.iter().position(|c| c["choices"][0]["finish_reason"].is_string()).unwrap();
+    assert_eq!((with_calls[1] + 1, chunks[finish]["choices"][0]["finish_reason"].as_str()), (finish, Some("length")), "{body}");
+    assert!(!body.contains("<tool_call") && !body.contains("<parameter"), "raw XML leaked: {body}");
 }
 
 // ── schema-typed arguments ───────────────────────────────────────────────

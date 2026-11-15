@@ -534,6 +534,44 @@ async fn a_continuation_renders_the_parents_whole_conversation_without_its_instr
     );
 }
 
+/// GitHub #583: the response kept for `previous_response_id` holds the call
+/// its cap cut, `incomplete`, and the next turn is served from it: the
+/// template receives the cut call as the model wrote it, beside its output.
+#[tokio::test]
+async fn a_continuation_of_a_response_with_a_cut_call_is_served_from_it() {
+    let mock = MockCompute::new();
+    let mut turn = agent_turn();
+    turn.insert(mock.token_for(0, 2), "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/ma");
+    let script = Script::new(turn);
+    let live = live(server(&script, SchedulerConfig::default(), plain())).await;
+    let mut socket = socket(&live).await;
+    let mut first = agent_body();
+    first["max_output_tokens"] = json!(3);
+    send(&mut socket, create(&first, None)).await;
+    let parent = stream_until_terminal(&mut socket, None).await.pop().unwrap();
+    assert_eq!(parent["type"], "response.incomplete", "{parent}");
+    let call = parent["response"]["output"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!((&call["status"], &call["arguments"]), (&json!("incomplete"), &json!("{\"path\":\"src/ma")), "{parent}");
+
+    let mut second = short("go on");
+    second["previous_response_id"] = parent["response"]["id"].clone();
+    second["input"] = json!([{ "type": "function_call_output", "call_id": call["call_id"], "output": "Not run: the reply was cut by the token limit." }]);
+    send(&mut socket, create(&second, None)).await;
+    let child = stream_until_terminal(&mut socket, None).await.pop().unwrap();
+    assert_ne!(child["type"], "response.failed", "{child}");
+    assert_eq!(child["response"]["previous_response_id"], parent["response"]["id"]);
+    let rendered = script.seen().last().unwrap().clone();
+    let calls: Vec<(String, String)> = rendered
+        .messages
+        .iter()
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flatten()
+        .map(|c| (c.function.name.clone(), c.function.arguments.clone()))
+        .collect();
+    assert_eq!(calls, [("read_file".to_owned(), "{\"path\":\"src/ma".to_owned())]);
+    assert!(rendered.messages.iter().any(|m| m.role == "tool"), "{rendered:?}");
+}
+
 #[tokio::test]
 async fn unknown_superseded_and_foreign_ids_are_not_found() {
     let live = live(server(&Script::new(HashMap::new()), SchedulerConfig::default(), plain())).await;

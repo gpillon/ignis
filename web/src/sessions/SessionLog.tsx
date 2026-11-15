@@ -1,4 +1,5 @@
 import { memo, type ReactNode } from "react";
+import { endedAtTokenLimit } from "../metrics/CutAtLimit.tsx";
 import { describeFigures, type Figures } from "../metrics/figures.ts";
 import { EFFORT_LABELS } from "../settings/defaults.ts";
 import { IconChevron } from "../ui/icons.tsx";
@@ -119,6 +120,7 @@ function BudgetCell({ row }: { row: LogRow }) {
     <>
       {sent}
       {forcedAt !== undefined && <span className="text-ember"> · reached {forcedAt}</span>}
+      {endedAtTokenLimit(row.figures) && <span className="text-ember"> · cut</span>}
     </>
   );
 }

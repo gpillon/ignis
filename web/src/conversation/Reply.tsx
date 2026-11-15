@@ -1,5 +1,6 @@
 import { memo, useLayoutEffect, useRef, useState } from "react";
 import { BudgetReached } from "../metrics/BudgetReached.tsx";
+import { CutAtLimit, endedAtTokenLimit } from "../metrics/CutAtLimit.tsx";
 import { Readout } from "../metrics/Readout.tsx";
 import type { Message } from "../sessions/sessions.ts";
 import { AgentStrip } from "../tools/agents/AgentStrip.tsx";
@@ -101,6 +102,11 @@ function ReplyTurn(props: {
       {m.error && (
         <p className="border-l-2 border-fault pl-3 text-sm text-fault" role="alert">
           {m.error}
+        </p>
+      )}
+      {endedAtTokenLimit(m.figures) && (
+        <p>
+          <CutAtLimit />
         </p>
       )}
       {m.figures && <Readout figures={m.figures} />}

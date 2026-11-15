@@ -78,7 +78,7 @@ memory of why ignis is built the way it is.
 | [0055](0055-a-pinned-hot-set-is-opt-in.md) | a pinned hot set of experts: a field off by default, 2 GiB in the rtx5090 profile | accepted | |
 | [0056](0056-speculation-past-eight-verify-rows-is-numerically-equivalent.md) | speculation past 8 verify rows is numerically equivalent, not bit-exact | accepted | |
 | [0057](0057-rope-scaling-is-auto-by-default.md) | rope scaling is `auto` by default: the YaRN factor follows the context | accepted | |
-| [0058](0058-every-route-has-a-deadline-and-a-passed-one-answers-what-was-generated.md) | every route has a deadline, and a passed one answers what was generated | accepted | |
+| [0058](0058-every-route-has-a-deadline-and-a-passed-one-answers-what-was-generated.md) | every route has a deadline, and a passed one answers what was generated | accepted | [0096](0096-a-cut-tool-call-reaches-the-client-as-generated-its-name-its-arguments-so-far-and-finish-reason-length.md) |
 | [0059](0059-flash-next-applies-yarn-on-q-and-k.md) | Flash-Next applies YaRN, the attention factor folded into cos and sin on q and k | accepted | |
 | [0060](0060-the-27b-has-a-trellis-body-for-small-cards.md) | the 27B gets a second body format, trellis, for the 16 GB card class | accepted | |
 | [0061](0061-prefill-attention-reads-the-hq-codec.md) | prefill attention reads the hq-e8-2b codec: no prompt planes, on every card | accepted | |
@@ -115,3 +115,4 @@ memory of why ignis is built the way it is.
 | [0092](0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md) | The CUDA context is measured when it is made, and a reload adds back what the driver reports | accepted | |
 | [0093](0093-on-blackwell-the-27bs-decode-and-verify-rounds-attend-over-hq-e8-2b-on-ignis-own-route-and-the-vendored-kernel-stays-its-oracle.md) | On Blackwell the 27B's decode and verify rounds attend over hq-e8-2b on ignis's own route, and the vendored kernel stays its oracle | accepted | |
 | [0094](0094-a-held-tools-call-is-checked-as-the-model-writes-it-in-its-own-order-and-a-value-ends-only-where-the-call-continues.md) | A held tool's call is checked as the model writes it, in its own order, and a value ends only where the call continues | accepted | |
+| [0096](0096-a-cut-tool-call-reaches-the-client-as-generated-its-name-its-arguments-so-far-and-finish-reason-length.md) | A cut tool call reaches the client as generated: its name, its arguments so far, and finish_reason length | accepted | |

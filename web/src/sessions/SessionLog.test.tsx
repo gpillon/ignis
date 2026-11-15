@@ -55,6 +55,11 @@ describe("SessionLog and the thinking budget", () => {
     expect(budget(row({ figures: figures(6144) }))).toBe("default · reached 6144");
   });
 
+  it("adds cut to the budget cell of a request that ended at the token limit", () => {
+    expect(budget(row({ figures: { ...figures(), finishReason: "length" } }))).toBe("default · cut");
+    expect(budget(row({ figures: { ...figures(), finishReason: "stop" } }))).toBe("default");
+  });
+
   it("keeps the budget on a row that failed, whose figures never came", () => {
     expect(budget(row({ thinkingBudget: 2048, figures: null, error: "503: engine full" }))).toBe("2048");
   });

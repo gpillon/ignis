@@ -21,6 +21,7 @@ const STATUS_LABEL: Record<AgentStatus, string> = {
   done: "Done",
   failed: "Failed",
   stopped: "Stopped",
+  cut: "Cut",
 };
 
 export function statusLine(run: AgentRun, now: number): string {
@@ -36,6 +37,7 @@ export function StatusMark({ status }: { status: AgentStatus }) {
     done: "bg-ink",
     failed: "bg-fault",
     stopped: "bg-ash",
+    cut: "bg-ember",
   }[status];
   return <span className={`cut size-2 shrink-0 [--cut-size:3px] ${color}`} aria-hidden />;
 }

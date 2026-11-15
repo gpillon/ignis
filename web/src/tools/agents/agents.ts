@@ -1,3 +1,4 @@
+import { endedAtTokenLimit } from "../../metrics/CutAtLimit.tsx";
 import { computeFigures, type Figures } from "../../metrics/figures.ts";
 import type { ConversationRequest, Settings, ToolDefinition, ToolExtras, Turn } from "../../api/request.ts";
 import type { ToolCall } from "../../api/sse.ts";
@@ -63,7 +64,7 @@ export const MAX_PARALLEL_AGENTS = 8;
 /** How many replies in a row an agent may call tools in before it is failed, when the caller names no budget. */
 export const MAX_AGENT_TOOL_ROUNDS = 16;
 
-export type AgentStatus = "queued" | "running" | "done" | "failed" | "stopped";
+export type AgentStatus = "queued" | "running" | "done" | "failed" | "stopped" | "cut";
 
 /** One agent as the Playground shows it and the model is told about it. */
 export type AgentRun = {
@@ -138,10 +139,11 @@ export function toolResult(run: AgentRun): string {
   if (run.status === "done") return run.content.trim() || "(The agent returned no text.)";
   if (run.status === "failed") return `The agent failed: ${run.error ?? "unknown error"}`;
   const partial = run.content.trim();
-  return `The agent was stopped before it finished.${partial ? `\n\nPartial answer:\n\n${partial}` : ""}`;
+  const ended = run.status === "cut" ? "cut by its token limit" : "stopped";
+  return `The agent was ${ended} before it finished.${partial ? `\n\nPartial answer:\n\n${partial}` : ""}`;
 }
 
-const ORDER: AgentStatus[] = ["running", "queued", "done", "failed", "stopped"];
+const ORDER: AgentStatus[] = ["running", "queued", "done", "failed", "stopped", "cut"];
 
 /** `3 agents: 2 running, 1 done`. */
 export function agentSummary(runs: AgentRun[]): string {
@@ -321,6 +323,8 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
       const figures = computeFigures(result.timeline);
       set(task.callId, { figures, rounds: [...(get(task.callId).rounds ?? []), figures] });
       if (result.timeline.stopped) return set(task.callId, { status: "stopped" });
+      // A round cut at the token limit is incomplete: none of its calls run, the closed ones included.
+      if (endedAtTokenLimit(figures)) return set(task.callId, { status: "cut" });
       if (calls.length === 0) return set(task.callId, { status: "done" });
       if (round >= maxRounds) {
         return set(task.callId, {

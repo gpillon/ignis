@@ -6,7 +6,8 @@ import { streamChat } from "../api/stream.ts";
 import { switchAndWait } from "../api/switching.ts";
 import type { NextModel } from "../conversation/nextModel.ts";
 import { type PromptImage, redrawn } from "../conversation/images.ts";
-import { computeFigures } from "../metrics/figures.ts";
+import { CUT_NOT_RUN, endedAtTokenLimit } from "../metrics/CutAtLimit.tsx";
+import { computeFigures, type Figures } from "../metrics/figures.ts";
 import { mergeLoaded } from "../store/docs.ts";
 import type { ImageId, ImageStore } from "../store/imageStore.ts";
 import { pageStore } from "../store/index.ts";
@@ -82,6 +83,18 @@ export function canStartTurn(streaming: ReadonlySet<number>, sessionId: number, 
 
 /** A session's stream on the socket: its turns continue one another there, and its agents' streams are named under it. */
 export const sessionStream = (sessionId: number) => `session-${sessionId}`;
+
+/**
+ * Why a reply's tool calls do not run, each call's result, or `undefined` when they run: a reply cut at the token
+ * limit is incomplete, none of its calls run, the closed ones included (GitHub #583); a stopped turn runs nothing
+ * more; and a turn calls tools at most `maxRounds` times in a row.
+ */
+export function callsNotRun(figures: Figures | undefined, aborted: boolean, round: number, maxRounds: number): string | undefined {
+  if (endedAtTokenLimit(figures)) return CUT_NOT_RUN;
+  if (aborted) return "Stopped before the call ran.";
+  if (round >= maxRounds) return `Not run: a turn can call tools at most ${maxRounds} times in a row.`;
+  return undefined;
+}
 
 /**
  * What a turn brings beside its prompt: the box's files and pictures for the workspace, the names a resent prompt
@@ -436,11 +449,9 @@ export function useConversation({
         const calls = reply.toolCalls ?? [];
         if (calls.length === 0 || reply.error) break;
         // Every call gets a result, even one that never ran: the history must stay well-formed.
-        if (abort.signal.aborted || round >= maxRounds) {
-          const reason = abort.signal.aborted
-            ? "Stopped before the call ran."
-            : `Not run: a turn can call tools at most ${maxRounds} times in a row.`;
-          addToolResults(sessionId, calls.map((c) => ({ callId: c.id, content: reason })));
+        const notRun = callsNotRun(reply.figures, abort.signal.aborted, round, maxRounds);
+        if (notRun) {
+          addToolResults(sessionId, calls.map((c) => ({ callId: c.id, content: notRun })));
           break;
         }
         unanswered = calls;

@@ -2380,8 +2380,8 @@ pub(crate) fn split_reasoning(
 /// [`split_reasoning`] plus tool-call extraction (GitHub #121): the content
 /// channel's text is fed through a fresh [`ToolCallScanner`] so the
 /// non-streaming path parses tool calls with exactly the same rules as the
-/// streaming path (a call left open by a truncated generation is dropped,
-/// never returned half-written — acceptance criterion 3). Arguments are
+/// streaming path (a call left open is a cut call when the generation ended
+/// `at_length`, GitHub #583, and dropped whole otherwise). Arguments are
 /// typed by the request's `tools` (`schemas`), and each call block is
 /// checked and counted by `check` (GitHub #608).
 fn split_reasoning_and_tools(
@@ -2390,11 +2390,15 @@ fn split_reasoning_and_tools(
     thinking: &ThinkingOptions,
     schemas: ToolSchemas,
     check: Option<CallCheck>,
+    at_length: bool,
 ) -> (Option<String>, String, Vec<ScannedToolCall>) {
     let (reasoning, content_text) = split_reasoning(template, tokens, thinking);
     let mut scanner = ToolCallScanner::with_schemas(schemas).checking(check);
     let mut events = scanner.feed(&content_text);
-    events.extend(scanner.finish());
+    events.extend(match at_length {
+        true => scanner.finish_at_length(),
+        false => scanner.finish(),
+    });
     let mut content = String::new();
     let mut calls = Vec::new();
     for event in events {
@@ -2579,10 +2583,12 @@ fn engine_error_response() -> Response {
 /// tool call reports `"tool_calls"`, matching what a real agent client
 /// branches on to decide whether to execute a call rather than just render
 /// text. A call left open when generation stopped (`mid_call`) never earns
-/// that label — it was dropped whole by [`ToolCallScanner`], so reporting
-/// `"tool_calls"` here would tell the client to run a call that was never
-/// actually delivered (acceptance criterion 3); the plain `stop`/`length`
-/// reason is reported instead, same as if no call had been attempted.
+/// that label — at a `stop` it was dropped whole by [`ToolCallScanner`], so
+/// reporting `"tool_calls"` here would tell the client to run a call that was
+/// never actually delivered (acceptance criterion 3); the plain `stop` reason
+/// is reported instead, same as if no call had been attempted. At `length`
+/// it is delivered as a cut call (GitHub #583), and `length` says it is not
+/// complete.
 pub(crate) fn resolve_finish_reason(
     reason: FinishReason,
     any_calls: bool,
@@ -3280,9 +3286,9 @@ struct StreamOptions {
 
 `stream: false` answers one JSON body. `stream: true` answers `text/event-stream`: one `data:` line per chunk in the `chat.completion.chunk` shape, a final chunk carrying `finish_reason` and an empty `delta`, then a literal `data: [DONE]` line. With `stream_options.include_usage: true` a usage-only chunk (empty `choices`) precedes it. A request the engine could not run ends instead with one `{\"error\": {message, type, code}}` chunk (type and code `engine_error`) and then `[DONE]`: the status is already 200 by then.
 
-Every request has a deadline from its admission (ADR 0058): `--server-request-timeout` answered whole, `--server-stream-timeout` streamed, `0` for none. Past it the request is cancelled and, under `--server-timeout-reply partial` (the default), answered with what it generated as a completion a length limit cut: `finish_reason: \"length\"`, `usage` counting it, a tool call cut mid-way dropped, and answered whole the header `ignis-stopped-by: request_timeout`; streamed, the `length` finish chunk, the usage chunk when asked for, then `[DONE]`. Under `error` the answer is a `504 request_timeout`, and a stream ends with one `{\"error\": ...}` chunk (type and code `request_timeout`) and then `[DONE]`, as for an engine error.
+Every request has a deadline from its admission (ADR 0058): `--server-request-timeout` answered whole, `--server-stream-timeout` streamed, `0` for none. Past it the request is cancelled and, under `--server-timeout-reply partial` (the default), answered with what it generated as a completion a length limit cut: `finish_reason: \"length\"`, `usage` counting it, a tool call cut mid-way sent as the model wrote it (its name and the arguments so far), and answered whole the header `ignis-stopped-by: request_timeout`; streamed, the `length` finish chunk, the usage chunk when asked for, then `[DONE]`. Under `error` the answer is a `504 request_timeout`, and a stream ends with one `{\"error\": ...}` chunk (type and code `request_timeout`) and then `[DONE]`, as for an engine error.
 
-Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text. `tool_choice` takes `\"auto\"` (the default), `\"none\"`, `\"required\"` and a named function. The last two force the call's opening -- `<tool_call>` and the function tag, with the name when one is named -- and the model writes the rest: with thinking off the opening is the first thing generated, with thinking on the first thing after the reasoning block closes. A forced call that never closes is dropped like any other, and `finish_reason` says why. `parallel_tool_calls: false` ends the turn at the close of its first call, so it makes at most one, with `finish_reason: \"tool_calls\"`: nothing generated after that close is read or counted, and a call written in the reasoning ends nothing. `true` or absent serves every call the model writes.
+Tool calls come back whole -- one complete `tool_calls` delta per call -- because they are parsed out of a closed block in the generated text. A call the generation cap cuts before it closes, or a passed deadline under `timeout_reply: partial`, comes back as the model wrote it, as OpenAI's API returns one: last, one delta too, with its name and the arguments written so far, a JSON prefix that does not parse, and `finish_reason: \"length\"`. Any other end drops a call left open, and a call cut before its function's name closes is not sent. `tool_choice` takes `\"auto\"` (the default), `\"none\"`, `\"required\"` and a named function. The last two force the call's opening -- `<tool_call>` and the function tag, with the name when one is named -- and the model writes the rest: with thinking off the opening is the first thing generated, with thinking on the first thing after the reasoning block closes. A forced call that never closes follows the same rule. `parallel_tool_calls: false` ends the turn at the close of its first call, so it makes at most one, with `finish_reason: \"tool_calls\"`: nothing generated after that close is read or counted, and a call written in the reasoning ends nothing. `true` or absent serves every call the model writes.
 
 `response_format: {\"type\": \"json_object\"}` holds the answer to a valid JSON object, streamed or not: each sampled token is checked against the grammar before the model consumes it, and a miss is repaired from the same scores restricted to the tokens that keep the object valid. With thinking on the reasoning stays free and the answer is held from the token after its `</think>`. Whitespace runs are bounded, the prompt need not mention JSON, a cut by `max_tokens` returns the object as generated with `finish_reason: \"length\"`, and `message.refusal` is always null. `{\"type\": \"json_schema\", \"json_schema\": {\"name\", \"schema\", \"strict\"}}` holds it to the schema the same way: under `strict: true` OpenAI's strict subset, all of it enforced, keys in the schema's order; without it what can be enforced is and the rest is inert. A schema already seen is not compiled again. The schema is described to the model in a block after the conversation, where the assistant's turn opens, before any reasoning: the format's `description`, then `Respond with a JSON object that matches this JSON schema:` and the schema, compact. `ignis_describe_schema: false` (an ignis extension; absent or `null` takes `--model-describe-schema`, on by default) leaves the prompt as sent; `json_object` adds nothing. The next turn resumes from where this turn's conversation ended. `{\"type\": \"text\"}` is a free answer. Beside `tools` each turn either calls a tool or answers under the grammar: until the answer starts the grammar also admits `<tool_call>`, and a turn that opens a call is released from it for that turn, its call written and parsed as any other, a strict tool's held to its `parameters`; `tool_choice: \"required\"` or a named function forces the call, and that turn is not held to the schema, nor told it.
 
@@ -3562,7 +3568,7 @@ async fn chat_completions(
         },
     };
     let (reasoning_content, content, tool_calls) =
-        split_reasoning_and_tools(loaded.template.as_ref(), &tokens, &thinking, schemas, check);
+        split_reasoning_and_tools(loaded.template.as_ref(), &tokens, &thinking, schemas, check, reason.is_none_or(|r| r == FinishReason::Length));
     let completion_tokens = tokens.len() as u32;
     let finish_reason = match reason {
         Some(reason) => resolve_finish_reason(reason, !tool_calls.is_empty(), false),
@@ -3682,7 +3688,8 @@ enum AnswerEnding {
 struct Answer {
     pieces: Vec<Piece>,
     ending: AnswerEnding,
-    /// A tool call was open when the engine finished (dropped whole).
+    /// A tool call was open when the engine finished (a cut call at
+    /// `length`, GitHub #583; dropped whole at any other ending).
     mid_call: bool,
     completion_tokens: u32,
     cached_tokens: u32,
@@ -3737,7 +3744,7 @@ async fn collect_answer(
                 (AnswerEnding::Stopped, false, None)
             }
             SchedEvent::Done { reason, thinking, .. } => {
-                let (tail, mid_call) = pipeline.finish();
+                let (tail, mid_call) = pipeline.finish(reason == FinishReason::Length);
                 join_pieces(&mut pieces, tail);
                 (AnswerEnding::Done(pipeline.ended(reason)), mid_call, thinking.and_then(|b| b.forced_at))
             }
@@ -3771,15 +3778,17 @@ impl CutAnswer {
     /// The answer, once its request was cancelled and `owed` — what the
     /// loop guard held back, and the tokens already waiting
     /// ([`owed_at_deadline`]) — was read: where the deadline cut it, a tool
-    /// call left open dropped whole; or, at a stop sequence the owed tokens
-    /// completed, there, as it would have ended before the deadline.
+    /// call left open delivered as a cut call (GitHub #583: only
+    /// `timeout_reply: partial` answers one); or, at a stop sequence the
+    /// owed tokens completed, there, as it would have ended before the
+    /// deadline.
     fn finish(self, owed: &[ignis_core::TokenId]) -> Answer {
         let Self { mut pieces, mut pipeline, cached_tokens } = self;
         join_pieces(&mut pieces, pipeline.push(owed));
         let (ending, mid_call) = match pipeline.fired() {
             true => (AnswerEnding::Stopped, false),
             false => {
-                let (tail, mid_call) = pipeline.finish();
+                let (tail, mid_call) = pipeline.finish(true);
                 join_pieces(&mut pieces, tail);
                 (AnswerEnding::DeadlinePassed, mid_call)
             }
@@ -3897,8 +3906,10 @@ impl AnswerPipeline {
 
     /// The end of generation: what the decoder, the scanner and the matcher
     /// still held, and whether a tool call was left open (read before the
-    /// scanner's flush clears it — GitHub #121 acceptance criterion 3).
-    fn finish(&mut self) -> (Vec<Piece>, bool) {
+    /// scanner's flush clears it — GitHub #121 acceptance criterion 3). A
+    /// generation that ended `at_length` delivers that call as a cut call,
+    /// last (GitHub #583); any other ending drops it whole.
+    fn finish(&mut self, at_length: bool) -> (Vec<Piece>, bool) {
         let mut pieces = Vec::new();
         if self.fired() {
             return (pieces, false);
@@ -3907,7 +3918,11 @@ impl AnswerPipeline {
             self.route(delta, &mut pieces);
         }
         let mid_call = self.scanner.is_mid_call();
-        for event in self.scanner.finish() {
+        let events = match at_length {
+            true => self.scanner.finish_at_length(),
+            false => self.scanner.finish(),
+        };
+        for event in events {
             self.route_tool_event(event, &mut pieces);
         }
         if let Some(stop) = self.stop.as_mut().filter(|s| !s.fired()) {
@@ -4014,10 +4029,9 @@ struct ToolCallOut {
 #[derive(Serialize, ToSchema)]
 struct FunctionOut {
     name: String,
-    /// A JSON-encoded object, e.g. `{"path":"a.txt"}` (never a
-    /// half-written fragment — GitHub #121 acceptance criterion 3: an
-    /// interrupted call is dropped entirely by `ToolCallScanner`, never
-    /// surfaced here truncated).
+    /// A JSON-encoded object, e.g. `{"path":"a.txt"}`; a cut call's (GitHub
+    /// #583, `finish_reason: "length"`) is the prefix of that JSON as far as
+    /// the model wrote it, e.g. `{"path":"a.t`, never closed.
     arguments: String,
 }
 
@@ -4318,14 +4332,15 @@ impl ChunkStream {
 
     /// The deadline's end, once the request was cancelled and `owed` — what
     /// the loop guard held back, or the tokens already waiting — read: the
-    /// answer's last pieces, a tool call left open dropped whole, then the
+    /// answer's last pieces, a tool call left open as a cut call under
+    /// `partial` (GitHub #583) and dropped whole under `error`, then the
     /// `length` finish or, under `error`, the `request_timeout` error chunk
     /// naming `timeout`, then `[DONE]`. A stop sequence the owed tokens
     /// completed ends it `stop`, as it would have before the deadline.
     fn end_at_deadline(&mut self, owed: &[ignis_core::TokenId], reply: TimeoutReply, timeout: Timeout) {
         let pieces = self.pipeline.push(owed);
         self.queue_pieces(pieces);
-        let (pieces, _) = self.pipeline.finish();
+        let (pieces, _) = self.pipeline.finish(reply == TimeoutReply::Partial);
         self.queue_pieces(pieces);
         let tokens = self.pipeline.consumed();
         match (self.pipeline.fired(), reply) {
@@ -4526,8 +4541,10 @@ impl Stream for ChunkStream {
                         // `mid_call` is read before the scanner's flush
                         // clears it (GitHub #121 acceptance criterion 3): a
                         // stop/cancel landing mid-call must never be
-                        // reported as a clean `tool_calls` finish.
-                        let (pieces, mid_call) = this.pipeline.finish();
+                        // reported as a clean `tool_calls` finish. At
+                        // `length` the open call is sent as a cut call, the
+                        // last delta before the finish (GitHub #583).
+                        let (pieces, mid_call) = this.pipeline.finish(reason == FinishReason::Length);
                         this.queue_pieces(pieces);
                         let reason = this.pipeline.ended(reason);
                         // GitHub #296: an engine error is OpenAI's error
@@ -4911,7 +4928,7 @@ mod tests {
         for token in 0..text.len() as u32 {
             join_pieces(&mut pieces, p.push(&[token]));
         }
-        join_pieces(&mut pieces, p.finish().0);
+        join_pieces(&mut pieces, p.finish(false).0);
         (pieces, p.consumed())
     }
 
