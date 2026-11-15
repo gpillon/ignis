@@ -828,3 +828,39 @@ async fn on_the_responses_api_a_free_tool_and_the_reasoning_stay_free() {
         counted(&metrics, 1, misses).await;
     }
 }
+
+/// #615 on the Responses API, over HTTP, whole and streamed, and over the
+/// WebSocket mode, through the code chat completions take: beside
+/// `text.format` a turn makes a held call or an answer valid under the
+/// schema, both counted under `type="json_schema"`; a `"required"` call
+/// missing after its forced opening comes out valid, its misses under
+/// `type="tool"` and none for the forced tokens.
+#[tokio::test]
+async fn on_the_responses_api_text_format_and_a_forced_call_beside_a_strict_tool_are_held_as_on_chat() {
+    let format = r#""text":{"format":{"type":"json_schema","name":"done","strict":true,"schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}}}"#;
+    let held = ("write_file".to_owned(), r#"{"path":"a.txt","content":"hi","mode":"a"}"#.to_owned());
+    let delivered = |text: &str, calls: Vec<(String, String)>| Delivered { reasoning: String::new(), text: text.to_owned(), calls, status: "completed".to_owned() };
+    let forced = format!(
+        "{}=save_files>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n<parameter=mode>\nx\n</parameter>\n</function>\n</tool_call>",
+        in_place_of(REQUIRED_OPENING)
+    );
+    // Each case: the field beside the tool, the script, what it delivers,
+    // and the type its misses count under.
+    let cases = [
+        (format, call("write_file", &[("mode", "x"), ("content", "hi"), ("path", "a.txt")]), delivered("", vec![held.clone()]), "json_schema", 1),
+        // The `,` after `true` repaired to the close, then the `"` to the stop.
+        (format, r#"{"ok":true,"why":1}"#.to_owned(), delivered(r#"{"ok":true}"#, vec![]), "json_schema", 2),
+        (r#""tool_choice":"required""#, forced, delivered("", vec![held.clone()]), "tool", 11),
+    ];
+    for (field, script, expected, kind, misses) in cases {
+        let body = |stream: bool| responses_body(&[&flat(WRITE_FILE)], stream, 512).replacen("\"tools\"", &format!("{field},\"tools\""), 1);
+        let (whole, metrics, _) = over_http(&script, &body(false), false).await;
+        assert_eq!(whole, expected, "{field}: {script}");
+        counted_as(&metrics, kind, 1, misses).await;
+        let (streamed, _, _) = over_http(&script, &body(true), true).await;
+        assert_eq!(streamed, whole, "{field}: streamed and whole");
+        let (socket, metrics) = over_socket(&script, &body(false)).await;
+        assert_eq!(socket, whole, "{field}: the socket and HTTP");
+        counted_as(&metrics, kind, 1, misses).await;
+    }
+}

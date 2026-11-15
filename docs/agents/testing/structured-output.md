@@ -235,7 +235,8 @@ repaired from the verify pass's scores, as a plain round's draw is.
   a turn (#615): a `"required"` and a named forced call missing after its
   opening, valid, the forced tokens no miss; beside `response_format` a held
   call, or an answer valid under the schema, both counted under
-  `type="json_schema"`; with thinking on a call written in the
+  `type="json_schema"`, and the same beside `text.format` on the Responses
+  API, over HTTP and the socket; with thinking on a call written in the
   reasoning neither held nor parsed; under `parallel_tool_calls: false` a
   value holding `</tool_call>` delivered whole, the turn ended at the
   confirmed close. The byte-identity of requests with no strict tool is the

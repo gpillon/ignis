@@ -354,6 +354,9 @@ the request asks of the turn.
   may hold `</tool_call>` on a line of its own, and is delivered whole.
   Nothing generated after the close reaches you or counts in `usage`.
 
+The Responses API holds them the same way, `text.format` in place of
+`response_format`, over HTTP and over the WebSocket mode.
+
 ## On the Responses API
 
 `/v1/responses` serves the same thing as `text.format`, over HTTP and over
