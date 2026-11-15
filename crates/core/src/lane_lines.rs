@@ -76,13 +76,13 @@ pub fn lane_lines(
 ) -> LaneLines {
     let image = config.state_image(kv_format);
     // A lane's state is its pool slot (`kernel/src/seq.cu`): the GDN
-    // recurrent state and conv taps, the penalty counts and the drafter's
-    // window. The hq residual window rides every slot, lanes and device
-    // retained slots alike.
+    // recurrent state and conv taps, the penalty counts and the load's
+    // drafter's state (DFlash2's window). The hq residual window rides every
+    // slot, lanes and device retained slots alike.
     let slot = image.gdn_recurrent
         + image.gdn_conv_taps
         + image.penalty_counts
-        + speculation.map_or(0, |speculation| speculation.window_pool_bytes(1));
+        + speculation.map_or(0, |speculation| speculation.drafter_state_bytes(1));
     LaneLines {
         sampling: sampling_bytes(config, lanes),
         verify_round: speculation.map_or(0, |speculation| verify_round_bytes(config, speculation, vision, lanes)),
@@ -243,7 +243,7 @@ mod tests {
         near(image.gdn_recurrent, 151.0, "GDN fp32");
         near(image.gdn_conv_taps, 3.0, "conv");
         near(image.penalty_counts, 1.0, "penalty");
-        assert_eq!(dflash2().window_pool_bytes(1), 40 * MIB, "the DFlash2 window");
+        assert_eq!(dflash2().drafter_state_bytes(1), 40 * MIB, "the DFlash2 window");
         near(image.hq_residual_window, 36.0, "hq window");
         for (lanes, lines) in [(1u32, one), (2, two)] {
             let slots = u64::from(lanes + 2);

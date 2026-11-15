@@ -116,11 +116,11 @@ fn a_dflash2_load_reports_the_drafters_vram_and_a_plain_load_reports_todays() {
     assert_eq!(spec_bound, plain_bound + 66, "every dflash2 object crosses the ABI");
     assert_eq!(verify_bound, plain_bound, "a verify-only load binds no drafter object");
     assert!(verify_vram > plain_vram, "a draft window reserves the verify substrate");
-    assert_eq!(spec.window_pool_bytes(1), 40 * 1024 * 1024);
+    assert_eq!(spec.drafter_state_bytes(1), 40 * 1024 * 1024);
     assert_eq!(
         spec_vram - verify_vram,
         drafter_weight_bytes
-            + spec.window_pool_bytes(1)
+            + spec.drafter_state_bytes(1)
             + spec.prefill_scratch_bytes(128)
             + spec.round_scratch_bytes(ignis_core::N_DECODE_LANES as u32),
         "the drafter adds its weights, one slot's 40 MiB window, its prefill scratch at a \
