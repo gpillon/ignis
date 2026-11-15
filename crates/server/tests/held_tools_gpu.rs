@@ -373,6 +373,11 @@ fn print_pair(case: &Case, held: &Served, free: &Served) -> Vec<Read> {
             read.push(Read { case: format!("{} ({:?})", case.label, case.api), bait: case.bait, fault, free: free_value, held: held_value });
         }
     }
+    let (prompts, same) = ((held.delivered.prompt_tokens, free.delivered.prompt_tokens), held.delivered.prompt_tokens == free.delivered.prompt_tokens);
+    match (case.api, case.without_strict) {
+        (Api::Responses, true) => eprintln!("  prompts {prompts:?} tokens: {}", if same { "the same length, as the twin's prompt is the request's own" } else { "NOT the same length" }),
+        _ => eprintln!("  prompts {prompts:?} tokens (the template renders each tool's strict)"),
+    }
     let (a, b) = (held.delivered.delivery(), free.delivered.delivery());
     match corpus::parting(&a, &b) {
         None => eprintln!("  the two deliveries are the same"),
