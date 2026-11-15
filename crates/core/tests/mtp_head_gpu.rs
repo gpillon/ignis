@@ -43,7 +43,7 @@ use ignis_core::gpu_profile;
 use ignis_core::lane_lines::lane_lines;
 use ignis_core::model_load::{load_qwen38_27b_with_speculation, plan_qwen38_27b_reservations};
 use ignis_core::seq::{kv_geometry, Seq, SeqPool, SeqPoolBudget};
-use ignis_core::step::{capture_decode_graphs, decode_program_batch, prefill_program, prefill_program_span_hidden};
+use ignis_core::step::{capture_decode_graphs, decode_program_batch, prefill_program_span_hidden};
 use ignis_core::{mtp_head, mtp_readout, KvFormat, PrefillAttention, PrefillLinear, RopeScaling, Speculation, SpeculativeBackend};
 
 const NVFP4: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -315,7 +315,7 @@ fn an_mtp_load_binds_the_head_and_plans_its_lines_as_the_cpu_does_to_the_byte() 
     assert_eq!(model.stats().bound_tensor_count, plain.stats().bound_tensor_count + 12);
     drop(plain);
     // A load without the option binds nothing of the head: handed its
-    // objects, it names the first as an extra.
+    // objects, the load refuses them as outside its scope.
     let err = load_qwen38_27b_with_speculation(
         &loaded.reader,
         &loaded.artifact,
@@ -330,12 +330,28 @@ fn an_mtp_load_binds_the_head_and_plans_its_lines_as_the_cpu_does_to_the_byte() 
     assert!(err.contains("does not match the inventory"), "{err}");
 
     // Under hq-e8-2b the head runs too: its prompt route over the chunks, its
-    // decode route in plain rounds, its own ring words; the readout drafts.
+    // decode route in plain rounds, its own ring words. The prompt is shorter
+    // than the residual window (32 sink rows and a 512-row ring), so every row
+    // the readout's attention reads is the exact row in the head's own planes,
+    // under the head's own ring bits: its hidden is the f64 head's over the
+    // hiddens this prefill read, within the BF16 bound.
     let pool = SeqPool::create_with_speculation(&cfg, &budget(KvFormat::HqE8_2b, 2, 0), Some(SpeculativeBackend::Mtp))
         .unwrap_or_else(|e| panic!("hq pool: {e}"));
     let tokens = prompt(&loaded.reader);
+    let n = tokens.len();
+    assert!(n < 544, "the prompt fits the residual window");
     let mut sequence = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
-    prefill_program(&model, &pool, &mut sequence, &tokens, 0, None).unwrap_or_else(|e| panic!("hq prefill: {e}"));
+    let mut hidden_bits = vec![0u16; n * HIDDEN];
+    prefill_program_span_hidden(&model, &pool, &mut sequence, &tokens, 0, None, &mut hidden_bits, None)
+        .unwrap_or_else(|e| panic!("hq prefill: {e}"));
+    let pending = sequence.pending_token().expect("the prompt draws");
+    let proposal = mtp_readout::propose(&model, &pool, &mut sequence).unwrap_or_else(|e| panic!("hq readout: {e}"));
+    let hiddens: Vec<Vec<f64>> = (0..n).map(|p| hidden_of(&hidden_bits[p * HIDDEN..(p + 1) * HIDDEN])).collect();
+    let next_tokens: Vec<i32> = (1..n).map(|p| tokens[p]).chain(std::iter::once(pending)).collect();
+    let reference_head = reference(&loaded.reader, &hiddens, &next_tokens, &(0..n as i32).collect::<Vec<_>>());
+    let hidden_drift = relative_l2(proposal.head_hidden.iter().copied().map(bf16_to_f64), &reference_head.hidden);
+    eprintln!("hq-e8-2b: head hidden {hidden_drift:.6} (bound {:.6})", tolerance(HIDDEN_ROUNDINGS));
+    assert!(hidden_drift <= tolerance(HIDDEN_ROUNDINGS), "hq head hidden {hidden_drift}");
     for _ in 0..2 {
         decode_program_batch(&model, &pool, &mut [&mut sequence]).unwrap_or_else(|e| panic!("hq round: {e}"));
     }
@@ -400,24 +416,35 @@ fn check_against_f64(path: &str, host_head: bool) {
         Some(mtp()),
     )
     .unwrap_or_else(|e| panic!("load with the MTP head: {e}"));
-    let pool = SeqPool::create_with_speculation(&cfg, &budget(KvFormat::Bf16, 1, 0), Some(SpeculativeBackend::Mtp))
+    let pool = SeqPool::create_with_speculation(&cfg, &budget(KvFormat::Bf16, 2, 0), Some(SpeculativeBackend::Mtp))
         .unwrap_or_else(|e| panic!("pool: {e}"));
     let reader = &loaded.reader;
     let tokens = prompt(reader);
     let n = tokens.len();
+    // The sequence the readouts read, and a witness that runs the same prefill
+    // and the same rounds with no readout at all -- the readout writes the
+    // head's row at the frontier, the very row a round then writes, so only
+    // the witness's rows show what the rounds wrote -- in the pool's other
+    // slot, so a slot read where a lane was meant shows too.
     let mut sequence = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
+    let mut witness = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc the witness: {e}"));
+    assert_ne!(sequence.stats().slot, witness.stats().slot);
 
     // The prefill, in two spans of several chunks, reading the target's
     // post-final-norm hidden of every position as the head read it.
     let mut hidden_bits = vec![0u16; n * HIDDEN];
+    let mut witness_bits = vec![0u16; n * HIDDEN];
     let mut logits = vec![0f32; VOCAB];
+    for (seq, bits, logits) in
+        [(&mut sequence, &mut hidden_bits, Some(logits.as_mut_slice())), (&mut witness, &mut witness_bits, None)]
     {
-        let (first, second) = hidden_bits.split_at_mut(SPLIT * HIDDEN);
-        prefill_program_span_hidden(&model, &pool, &mut sequence, &tokens[..SPLIT], 0, Some(tokens[SPLIT] as u32), first, None)
+        let (first, second) = bits.split_at_mut(SPLIT * HIDDEN);
+        prefill_program_span_hidden(&model, &pool, seq, &tokens[..SPLIT], 0, Some(tokens[SPLIT] as u32), first, None)
             .unwrap_or_else(|e| panic!("prefill, first span: {e}"));
-        prefill_program_span_hidden(&model, &pool, &mut sequence, &tokens[SPLIT..], SPLIT as u64, None, second, Some(&mut logits))
+        prefill_program_span_hidden(&model, &pool, seq, &tokens[SPLIT..], SPLIT as u64, None, second, logits)
             .unwrap_or_else(|e| panic!("prefill, second span: {e}"));
     }
+    assert!(witness_bits == hidden_bits, "the witness's prefill read the sequence's hiddens");
     let pending = sequence.pending_token().expect("the prompt's last span draws");
     assert_eq!(sequence.stats().position, n as u64);
 
@@ -495,34 +522,54 @@ fn check_against_f64(path: &str, host_head: bool) {
         assert!(gap <= tolerance(SCORE_ROUNDINGS) * scale, "draft {} against the f64's {best}, {gap} apart", proposal.draft);
     }
 
+    // The witness holds what the sequence does: its prefill's rows, bit for
+    // bit, from its own slot.
+    let (witness_keys, witness_values) = mtp_readout::head_state(&pool, &witness, 0, (n - 1) as u32)
+        .unwrap_or_else(|e| panic!("the witness's state: {e}"));
+    assert!(witness_keys == keys && witness_values == values, "the head's rows follow the sequence, not its slot");
+
     // Plain rounds: each writes the head's row at the position before the one
     // it consumes, from the continuation hidden and that token, and leaves
     // the hidden of the position it consumed, whose scores drew its token.
-    let round = |sequence: &mut Seq<'_>, what: &str| {
+    // The inputs come from the sequence's readouts; the rows the rounds wrote
+    // are read off the witness, which ran the same rounds and no readout.
+    let mut rows = Vec::new();
+    let round = |sequence: &mut Seq<'_>, witness: &mut Seq<'_>, rows: &mut Vec<(u32, Vec<u16>, i32)>, what: &str| {
         let before = mtp_readout::propose(&model, &pool, sequence).unwrap_or_else(|e| panic!("{what}: readout: {e}"));
         let consumed = sequence.pending_token().expect("a pending token");
         let position = sequence.stats().position;
-        decode_program_batch(&model, &pool, &mut [&mut *sequence]).unwrap_or_else(|e| panic!("{what}: round: {e}"));
-        let row = (position - 1) as u32;
-        let (keys, values) = mtp_readout::head_state(&pool, sequence, row, 1).unwrap_or_else(|e| panic!("{what}: state: {e}"));
-        let reference_row = reference(reader, &[hidden_of(&before.continuation)], &[consumed], &[row as i32]);
-        let (key_drift, value_drift) = kv_drift(&keys, &values, &reference_row, 1);
-        eprintln!("{path}: {what} row {row}: keys {key_drift:.6}, values {value_drift:.6}");
-        assert!(key_drift <= tolerance(KEY_ROUNDINGS) && value_drift <= tolerance(VALUE_ROUNDINGS), "{what}: row {row}");
+        let emitted = decode_program_batch(&model, &pool, &mut [&mut *sequence]).unwrap_or_else(|e| panic!("{what}: round: {e}"));
+        let witnessed = decode_program_batch(&model, &pool, &mut [&mut *witness]).unwrap_or_else(|e| panic!("{what}: witness: {e}"));
+        assert_eq!(emitted, witnessed, "{what}: the witness emits what the sequence does");
+        assert_eq!(witness.pending_token(), sequence.pending_token(), "{what}: and draws what it does");
+        rows.push(((position - 1) as u32, before.continuation, consumed));
         let after = mtp_readout::propose(&model, &pool, sequence).unwrap_or_else(|e| panic!("{what}: readout: {e}"));
         let scores = mtp_readout::score(&model, &after.continuation).unwrap();
         let drawn = sequence.pending_token().expect("the round drew");
         assert_eq!(argmax(scores.iter().map(|&s| f64::from(s))).0, drawn as usize, "{what}: the round's hidden drew its token");
-        assert_ne!(after.continuation, before.continuation, "{what}: the continuation hidden moved on");
+        assert_ne!(after.continuation, rows.last().unwrap().1, "{what}: the continuation hidden moved on");
     };
     for i in 0..EAGER_ROUNDS {
-        round(&mut sequence, &format!("eager round {i}"));
+        round(&mut sequence, &mut witness, &mut rows, &format!("eager round {i}"));
     }
-    capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    let capture = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    assert!(capture.is_ready(1), "the one-lane round, the head's step in it, is captured and replayed");
     for i in 0..GRAPH_ROUNDS {
-        round(&mut sequence, &format!("replayed round {i}"));
+        round(&mut sequence, &mut witness, &mut rows, &format!("replayed round {i}"));
     }
+    for (i, (row, continuation, consumed)) in rows.iter().enumerate() {
+        let (keys, values) =
+            mtp_readout::head_state(&pool, &witness, *row, 1).unwrap_or_else(|e| panic!("round {i}: state: {e}"));
+        let reference_row = reference(reader, &[hidden_of(continuation)], &[*consumed], &[*row as i32]);
+        let (key_drift, value_drift) = kv_drift(&keys, &values, &reference_row, 1);
+        eprintln!("{path}: round {i} row {row}: keys {key_drift:.6}, values {value_drift:.6}");
+        assert!(key_drift <= tolerance(KEY_ROUNDINGS) && value_drift <= tolerance(VALUE_ROUNDINGS), "round {i}: row {row}");
+    }
+    let last = mtp_readout::propose(&model, &pool, &mut witness).unwrap_or_else(|e| panic!("the witness's readout: {e}"));
+    let first = mtp_readout::propose(&model, &pool, &mut sequence).unwrap_or_else(|e| panic!("the readout: {e}"));
+    assert_eq!(last.continuation, first.continuation, "the witness's continuation hidden is the sequence's");
     assert_eq!(model.stats().reserved.drafter_round_bytes, 0);
+    drop(witness);
 
     drop(sequence);
     drop(pool);
