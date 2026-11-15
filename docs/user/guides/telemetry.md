@@ -112,7 +112,14 @@ request that sends one, counted as it arrives, before the 27B refuses it with
 a `400` on chat completions and on the Responses API
 ([Held tools](../api/structured-output.md#held-tools-strict-true); read on a
 model that serves structured output, so not on Flash-Next). A call still open when
-generation ends is not counted: its `finish_reason` says it was cut. Beside
+generation ends is not counted: its `finish_reason` says it was cut.
+`ignis_tool_call_undeclared_parameters_total` counts, once per call, valid or
+not, the calls holding a parameter that an object with no
+`additionalProperties` does not declare, which JSON Schema admits, in a tool
+the operator's switch at `held` would hold: what `held`, which closes such
+objects, would change that `unknown_parameter` does not show
+([Holding every tool](../api/structured-output.md#holding-every-tool)); never
+on a model that holds no tool (Flash-Next). Beside
 them, `ignis_tool_call_values_split_total` counts, in the calls to tools that
 are not held, the string values (of a
 parameter the tool declares a string) that the parser ended at a tag inside

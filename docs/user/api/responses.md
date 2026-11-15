@@ -72,9 +72,10 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   versions serve it free): its `parameters` are put in strict form, every
   object closed, so a call names no parameter they do not declare, and an
   optional parameter, one `required` does not list, may be left out and
-  stays out of `arguments`, which are valid under the schema you sent. A
-  schema that cannot be normalized leaves the tool free, as before, and is
-  never a `400` ([Held tools on the Responses API](structured-output.md#on-the-responses-api)).
+  stays out of `arguments`, which are valid under the schema you sent, its
+  length bounds aside (a normalized tool leaves `minLength` and `maxLength`
+  out). A schema that cannot be normalized leaves the tool free, as before,
+  and is never a `400` ([Held tools on the Responses API](structured-output.md#on-the-responses-api)).
   `strict: null` is the same as no `strict`, and `strict: false` serves the
   tool free, as before, so an agent CLI that sends `false` on every tool
   sees no change, unless the operator holds every tool

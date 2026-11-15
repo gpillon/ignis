@@ -1374,7 +1374,8 @@ _Avoid_: strict function calling
 A **held tool** sent without `strict` whose schema the server rewrote into
 strict form, its objects closed and its optional parameters left out of the
 arguments when the call leaves them out: OpenAI's default on the Responses
-API, and every tool not sent `strict: true` under the operator's `held`. A
+API, and every tool not sent `strict: true` under the operator's `held`. Its
+length bounds are left out, outside the strict subset (GitHub #641). A
 schema that cannot be normalized leaves its tool free, never refused.
 
 **Confirmed close**:

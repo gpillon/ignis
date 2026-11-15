@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
+use ignis_core::compute::ModelFamily;
 use ignis_core::{ConcreteScheduler, MockCompute, SchedulerConfig, TokenId};
 use ignis_grammar::{GrammarCache, Vocab, VocabEntry};
 use ignis_server::decoder::TokenDecoder;
@@ -361,6 +362,99 @@ async fn the_responses_api_counts_every_kind_of_call_on_http_and_websocket() {
     }
     responses::metric_reaches(&metrics, "ignis_requests_completed_total 2").await;
     assert_counts(&metrics, EVERY_KIND, 2);
+}
+
+/// Tools not held under `as-sent`, each in its own way open to keys it does
+/// not declare: `open`, its objects open, `opts` one nested in it;
+/// `by_name`, admitting any key by `additionalProperties: true`; `map`, with
+/// a nested map; `one_of`, with a `oneOf`; and [`tools`]' `edit`, closed.
+/// `held` would normalize and hold `open` and `edit` alone.
+fn open_tools() -> JsonValue {
+    let open = json!({
+        "type": "object",
+        "properties": {"path": {"type": "string"}, "opts": {"type": "object", "properties": {"hidden": {"type": "boolean"}}}},
+        "required": ["path"]
+    });
+    let with = |key: &str, value: JsonValue| {
+        let mut schema = open.clone();
+        match key {
+            "additionalProperties" => schema[key] = value,
+            _ => schema["properties"][key] = value,
+        }
+        schema
+    };
+    let tool = |name: &str, parameters: JsonValue| json!({"type": "function", "function": {"name": name, "parameters": parameters}});
+    json!([
+        tool("open", open.clone()),
+        tool("by_name", with("additionalProperties", json!(true))),
+        tool("map", with("labels", json!({"type": "object", "additionalProperties": {"type": "string"}}))),
+        tool("one_of", with("size", json!({"oneOf": [{"type": "integer"}, {"type": "string"}]}))),
+        tools()[0].clone(),
+    ])
+}
+
+/// Calls to [`open_tools`], three of them holding keys an object `held`
+/// would close does not declare: two invented at the top, one nested, and
+/// one invented beside a required parameter left out.
+fn open_calls() -> String {
+    [
+        call("open", &[("path", "a"), ("force", "true"), ("deep", "1")]),
+        call("open", &[("path", "a"), ("opts", r#"{"hidden": true, "x": 1}"#)]),
+        call("open", &[("force", "true")]),
+        call("open", &[("path", "a")]),
+        call("by_name", &[("path", "a"), ("force", "true")]),
+        call("map", &[("path", "a"), ("force", "true")]),
+        call("one_of", &[("path", "a"), ("force", "true")]),
+        call("edit", &[("path", "a.txt"), ("force", "true")]),
+    ]
+    .concat()
+}
+
+/// The parameters `held` would close (GitHub #641): a call holding a key
+/// that an object with no `additionalProperties` does not declare counts
+/// once under `ignis_tool_call_undeclared_parameters_total`, valid or not,
+/// in a tool the operator's switch at `held` would hold on the serving
+/// model, and its outcome stays what JSON Schema reads. Not counted: a key
+/// an object admits by name, a tool `held` would leave free (a nested map,
+/// a `oneOf`), a closed object's key, which counts `unknown_parameter`, and
+/// any call on a model that holds no tool. On chat completions, and on the
+/// Responses API for tools sent `strict: false`.
+#[tokio::test]
+async fn the_parameters_held_would_close_are_counted_beside_the_calls_outcome() {
+    let counts = [
+        "ignis_tool_calls_total{outcome=\"valid\"} 6",
+        "ignis_tool_calls_total{outcome=\"invalid\"} 2",
+        "ignis_tool_call_violations_total{kind=\"missing\"} 1",
+        "ignis_tool_call_violations_total{kind=\"unknown_parameter\"} 1",
+    ];
+    let chat = json!({
+        "model": MODEL, "messages": [{"role": "user", "content": "go"}], "tools": open_tools(),
+        "max_tokens": 4000, "enable_thinking": false,
+    });
+    let flat: Vec<JsonValue> = open_tools()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| {
+            let mut flat = tool["function"].clone();
+            flat["type"] = json!("function");
+            flat["strict"] = json!(false);
+            flat
+        })
+        .collect();
+    let responses = json!({ "model": MODEL, "input": "go", "tools": flat, "max_output_tokens": 4000, "enable_thinking": false });
+    for (path, body) in [("/v1/chat/completions", &chat), ("/v1/responses", &responses)] {
+        for (family, undeclared) in [(ModelFamily::Qwen38_27b, 3), (ModelFamily::FlashNext, 0)] {
+            let checked = server(&[&open_calls()], true, true).with_family(family);
+            let metrics = Arc::clone(checked.metrics.as_ref().unwrap());
+            let (status, body) = post(&checked, path, body).await;
+            assert_eq!(status, 200, "{path} {family:?}: {body}");
+            responses::metric_reaches(&metrics, "ignis_requests_completed_total 1").await;
+            assert_counts(&metrics, &counts, 1);
+            let line = format!("\nignis_tool_call_undeclared_parameters_total {undeclared}\n");
+            assert!(metrics.render().contains(&line), "{path} {family:?}: no `{}` in:\n{}", line.trim(), metrics.render());
+        }
+    }
 }
 
 /// Under `parallel_tool_calls: false` (#609) the turn ends where its first

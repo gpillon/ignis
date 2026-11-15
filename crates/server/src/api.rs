@@ -61,7 +61,7 @@ use crate::template::{
 use crate::thinking::{
     self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields,
 };
-use crate::toolcall::{CallCheck, ToolCall as ScannedToolCall, ToolCallScanner, ToolEvent, ToolSchemas};
+use crate::toolcall::{AtHeld, CallCheck, ToolCall as ScannedToolCall, ToolCallScanner, ToolEvent, ToolSchemas};
 
 /// The request body limit of a `--vision-enabled` load, in bytes (the reference's
 /// `--max-request-mib` default). It is this size because it is the media
@@ -1763,6 +1763,9 @@ pub(crate) struct HeldContent {
     /// its schema allows it), and for every tool on a model that holds no
     /// tool's calls (Flash-Next, #581: `false`); `None`, the `strict` it sent.
     pub echo: Vec<Option<bool>>,
+    /// What the operator's switch at `held` would hold of the tools, for the
+    /// call check to count the calls it would change ([`at_held`], #641).
+    pub at_held: Option<AtHeld>,
 }
 
 /// The [`HeldContent`] of a request whose answer is `answer`, whose
@@ -1819,7 +1822,42 @@ pub(crate) fn held_content(
         })
         .collect();
     let held = held_tools.map(|held| held.held).unwrap_or_default();
-    Ok(HeldContent { grammar, description, schemas: ToolSchemas::from_tools(tools).holding(held), echo })
+    let at_held = at_held(server, raw, tools, thinking, named);
+    Ok(HeldContent { grammar, description, schemas: ToolSchemas::from_tools(tools).holding(held), echo, at_held })
+}
+
+/// What the operator's switch at `held` would hold of a request's resolved
+/// `tools` (`raw` as sent), as [`held_tools`] would hold them at `held`,
+/// for the call check (GitHub #641); nothing is compiled until a call needs
+/// it. `None` without metrics, on a model that does not serve structured
+/// output, and where `held` would leave every normalized tool free: with
+/// thinking on and no single-token `</think>` to hold the content after.
+fn at_held(
+    server: &Server,
+    raw: &[ignis_grammar::json::Json],
+    tools: &[JsonValue],
+    thinking: &ThinkingOptions,
+    named: Option<&str>,
+) -> Option<AtHeld> {
+    server.metrics.as_ref()?;
+    let active = server.active();
+    if !active.family.serves_structured_output() {
+        return None;
+    }
+    let grammars = active.template.grammars()?;
+    let think_end = || active.template.encode_literal(crate::thinking::THINK_END_TEXT).filter(|ids| ids.len() == 1);
+    if active.template.decoder_starts_in_reasoning(thinking) && think_end().is_none() {
+        return None;
+    }
+    let declared = tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| ignis_grammar::DeclaredTool {
+            name: tool["function"]["name"].as_str().unwrap_or_default().to_owned(),
+            hold: tool_hold(raw.get(index), tool, WithoutStrict::Free, ToolArguments::Held),
+        })
+        .collect();
+    Some(AtHeld::new(grammars, declared, named.map(str::to_owned)))
 }
 
 /// A JSON value read once into the two shapes the handler needs:
@@ -3412,7 +3450,7 @@ async fn chat_completions(
         Ok(held) => held,
         Err(response) => return response,
     };
-    let HeldContent { grammar, description, schemas, .. } =
+    let HeldContent { grammar, description, schemas, at_held, .. } =
         match held_content(&server, held, raw_tools.as_deref().unwrap_or_default(), &tools, &tool_choice, &thinking, WithoutStrict::Free) {
             Ok(content) => content,
             Err(response) => return response,
@@ -3423,7 +3461,7 @@ async fn chat_completions(
     };
     // The pipeline that delivers the response checks its calls (#608); the
     // first-token probe's copy below does not.
-    let check = CallCheck::new(&tools, server.metrics.as_ref());
+    let check = CallCheck::new(&tools, server.metrics.as_ref()).map(|check| check.with_held(at_held));
     let (mut input, model, prompt_tokens, media) =
         match prepare_request(&server, model, &req.messages, params, &thinking, &tools, description.as_deref()).await {
             Ok(prepared) => prepared,

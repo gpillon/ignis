@@ -126,7 +126,12 @@ The measured figures are in
   chat completions (#611) and on the Responses API (#613); a value cut at a
   `</parameter>` line, whose text after it the parser dropped and the
   confirmed close would keep, is counted split (#610), and a plain value, the
-  residue and a close with its required parameter missing are not.
+  residue and a close with its required parameter missing are not; a call
+  holding a key an open object does not declare, in a tool `held` would hold,
+  is counted once under `ignis_tool_call_undeclared_parameters_total`, valid
+  or not, on chat completions and on the Responses API (`strict: false`), and
+  not one under `additionalProperties: true`, in a tool `held` leaves free (a
+  nested map, a `oneOf`), in a closed object, or on Flash-Next (#641).
 - **The independent validator in the served tests**: the schema answers go
   through `tools/grammar-check/validate.py` with the Python of
   `IGNIS_GRAMMAR_CHECK_PYTHON`, else the venv at `.scratch/grammar-venv`
@@ -247,6 +252,9 @@ repaired from the verify pass's scores, as a plain round's draw is.
   without `strict` (#614) is normalized: an invented parameter and a nested
   object's own key repaired away, the optional parameters left out, the
   arguments valid under the schema as sent, echoed `strict: true`; one whose
+  length bounds are left out held on the rest, a string past its bound served
+  and counted `constraint`, on the Responses API and at `held` on chat
+  completions (#641); one whose
   schema does not normalize, and every one on Flash-Next, served free and
   echoed `strict: false`; each tool's echo, in its `function` for the chat
   shape, and none held under `tool_choice: "none"`. On chat completions a

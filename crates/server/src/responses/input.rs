@@ -295,12 +295,12 @@ pub(crate) async fn prepare(
     // #615), and a tool sent without `strict` is normalized and held where
     // its schema allows it (#614); a strict tool's refusals come before
     // anything is rendered or generated, and a warm-up holds no grammar.
-    let api::HeldContent { grammar, description, schemas, echo } =
+    let api::HeldContent { grammar, description, schemas, echo, at_held } =
         api::held_content(server, held, &raw_tools, &tools, &tool_choice, &thinking, api::WithoutStrict::Normalized)?;
     let (grammar, description) = (grammar.filter(|_| !warm_up), description.filter(|_| !system_only));
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
         .map_err(|message| api::bad_request(&message))?;
-    let check = CallCheck::new(&tools, server.metrics.as_ref());
+    let check = CallCheck::new(&tools, server.metrics.as_ref()).map(|check| check.with_held(at_held));
     let (mut input, model, mut prompt_tokens, media) =
         api::prepare_request(server, model, &messages, params, &thinking, &tools, description.as_deref()).await?;
     input.warm_up = warm_up;

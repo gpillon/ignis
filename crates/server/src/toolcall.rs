@@ -168,7 +168,50 @@ pub struct CallCheck {
     /// function name → what the confirmed close knows of it (#610), what a
     /// value it ends is weighed by.
     rules: HashMap<String, call::Parameters>,
+    /// What the operator's switch at `held` would hold of the request's
+    /// tools (#641), where it would hold any.
+    at_held: Option<AtHeld>,
     metrics: Arc<crate::metrics::Metrics>,
+}
+
+/// What the operator's switch at `held` would hold of a request's tools
+/// (GitHub #641): the tools as it would declare them to the grammar, each
+/// one not sent `strict: true` normalized, and the tool calls' grammar they
+/// compile to, compiled only once a call needs it and cached as any other.
+pub struct AtHeld {
+    grammars: Arc<ignis_grammar::GrammarCache>,
+    tools: Vec<ignis_grammar::DeclaredTool>,
+    named: Option<String>,
+    held: std::sync::OnceLock<Vec<String>>,
+}
+
+impl AtHeld {
+    /// `tools` as `held` would declare them, a call named by a named
+    /// `tool_choice` (`named`), compiled by `grammars`.
+    pub(crate) fn new(grammars: Arc<ignis_grammar::GrammarCache>, tools: Vec<ignis_grammar::DeclaredTool>, named: Option<String>) -> Self {
+        Self { grammars, tools, named, held: std::sync::OnceLock::new() }
+    }
+
+    /// Whether `held` would hold the calls to `name`: its schema normalizes
+    /// and the dialect holds it. A grammar refused holds none, and under a
+    /// named `tool_choice` a call to another tool is one `held` would not
+    /// let be written at all, not one whose object it would close.
+    fn holds(&self, name: &str) -> bool {
+        if self.named.as_deref().is_some_and(|named| named != name) {
+            return false;
+        }
+        let held = self.held.get_or_init(|| match self.grammars.tool_calls_naming(&self.tools, self.named.as_deref()) {
+            Ok(grammar) => grammar.held().map(|(name, _)| name.to_owned()).collect(),
+            Err(_) => Vec::new(),
+        });
+        held.iter().any(|held| held == name)
+    }
+}
+
+impl std::fmt::Debug for AtHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtHeld").field("tools", &self.tools).field("named", &self.named).finish_non_exhaustive()
+    }
 }
 
 impl CallCheck {
@@ -187,7 +230,15 @@ impl CallCheck {
             })
             .collect::<HashMap<_, _>>();
         let rules = parameters.iter().map(|(name, schema)| (name.clone(), rule_parameters(schema))).collect();
-        Some(Self { parameters, rules, metrics })
+        Some(Self { parameters, rules, at_held: None, metrics })
+    }
+
+    /// The check counting, beside each call's outcome, the calls holding a
+    /// parameter that an object `held` would close does not declare, in a
+    /// tool `at_held` holds (#641); `None` counts none.
+    pub fn with_held(mut self, at_held: Option<AtHeld>) -> Self {
+        self.at_held = at_held;
+        self
     }
 
     /// A call to `name` with `arguments` (the JSON the parser delivers)
@@ -229,6 +280,21 @@ impl CallCheck {
             None => CallVerdict::Dropped,
         };
         self.metrics.record_tool_call(&verdict);
+        if parsed.is_some_and(|(name, arguments)| self.held_would_close(name, arguments)) {
+            self.metrics.record_tool_call_undeclared_parameters();
+        }
+    }
+
+    /// Whether a call to `name` with `arguments` holds a parameter that an
+    /// object with no `additionalProperties` does not declare, in a tool
+    /// `held` would hold (#641): JSON Schema admits it, `held` would close
+    /// the object. The schema is read first, the grammar only for a call it
+    /// finds one in.
+    fn held_would_close(&self, name: &str, arguments: &str) -> bool {
+        let (Some(at_held), Some(parameters)) = (&self.at_held, self.parameters.get(name)) else { return false };
+        let json = ignis_grammar::json::Json::parse;
+        let (Ok(schema), Ok(arguments)) = (json(&parameters.to_string()), json(arguments)) else { return false };
+        ignis_grammar::validate::undeclared_parameters(&schema, &arguments) && at_held.holds(name)
     }
 
     /// Count the values of a call to a tool that is not held, read from
@@ -1372,6 +1438,24 @@ mod tests {
             {"type": "function", "function": {"name": "ping"}}
         ]))
         .unwrap()
+    }
+
+    /// What `held` would hold (#641): each normalized tool whose schema
+    /// normalizes, none whose schema does not, and under a named
+    /// `tool_choice` the named tool alone.
+    #[test]
+    fn at_held_holds_what_the_switch_would_hold() {
+        use ignis_grammar::{DeclaredTool, GrammarCache, ToolHold, Vocab, VocabEntry};
+        let entries = (0..=255u8).map(|b| VocabEntry::Text(vec![b])).collect();
+        let grammars = Arc::new(GrammarCache::new(Vocab::new(entries, &[]), 1 << 20));
+        let normalized = |name: &str, schema: &str| DeclaredTool { name: name.into(), hold: ToolHold::Normalized(schema.into()) };
+        let open = r#"{"type":"object","properties":{"a":{"type":"string"}}}"#;
+        let map = r#"{"type":"object","properties":{"m":{"type":"object","additionalProperties":{"type":"string"}}}}"#;
+        let tools = vec![normalized("a", open), normalized("b", open), normalized("m", map)];
+        let every = AtHeld::new(Arc::clone(&grammars), tools.clone(), None);
+        assert_eq!(["a", "b", "m", "x"].map(|name| every.holds(name)), [true, true, false, false]);
+        let named = AtHeld::new(grammars, tools, Some("a".into()));
+        assert_eq!(["a", "b"].map(|name| named.holds(name)), [true, false]);
     }
 
     #[test]

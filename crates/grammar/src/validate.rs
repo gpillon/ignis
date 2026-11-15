@@ -83,10 +83,40 @@ pub struct Violation {
 /// violations of the member that came closest (its type admitted the value,
 /// fewest violations, first).
 pub fn violations(schema: &Json, value: &Json) -> Vec<Violation> {
-    let mut checker = Checker { root: schema, depth: 0, steps: 0 };
+    let mut checker = Checker { root: schema, depth: 0, steps: 0, closed: false };
     let mut out = Vec::new();
     checker.check(schema, value, "", &mut out);
     out
+}
+
+/// Whether `value` holds a property that an object with no
+/// `additionalProperties`, open to it as JSON Schema reads it, does not
+/// declare, in a schema typed `object`: a property the operator's switch at
+/// `held`, which closes such objects, would refuse (GitHub #641). It is no
+/// violation. Read as [`violations`] reads the value with every such object
+/// closed, so a `oneOf` or `anyOf` member that admits the value closed holds
+/// none.
+pub fn undeclared_parameters(schema: &Json, value: &Json) -> bool {
+    let mut checker = Checker { root: schema, depth: 0, steps: 0, closed: true };
+    let mut out = Vec::new();
+    checker.check(schema, value, "", &mut out);
+    out.iter().any(|found| found.kind == Kind::UnknownParameter && found.keyword == UNDECLARED_IN_OPEN)
+}
+
+/// The keyword an undeclared property of an object with no
+/// `additionalProperties` is found at, read closed: the `properties` that do
+/// not name it.
+const UNDECLARED_IN_OPEN: &str = "properties";
+
+/// Whether `schema`'s `type` is `object`, alone or beside others: the
+/// schemas `held` closes, which a schema with no `type` (an `anyOf`'s, `{}`)
+/// is not.
+fn typed_object(schema: &Json) -> bool {
+    match schema.get("type") {
+        Some(Json::Str(kind)) => kind == "object",
+        Some(Json::Arr(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some("object")),
+        _ => false,
+    }
 }
 
 /// Whether `value` is valid under `schema`.
@@ -112,6 +142,9 @@ struct Checker<'a> {
     root: &'a Json,
     depth: usize,
     steps: usize,
+    /// Every object with no `additionalProperties` read as closed
+    /// ([`undeclared_parameters`]).
+    closed: bool,
 }
 
 fn violation(kind: Kind, at: &str, keyword: &'static str) -> Violation {
@@ -347,6 +380,7 @@ impl<'a> Checker<'a> {
                 match schema.get("additionalProperties") {
                     Some(Json::Bool(false)) => out.push(violation(Kind::UnknownParameter, &path, "additionalProperties")),
                     Some(sub) => self.check(sub, item, &path, out),
+                    None if self.closed && typed_object(schema) => out.push(violation(Kind::UnknownParameter, &path, UNDECLARED_IN_OPEN)),
                     None => {}
                 }
             }
@@ -891,6 +925,28 @@ mod tests {
             found,
             vec![violation(Kind::Type, "/a/1", "type"), violation(Kind::UnknownParameter, "/b~1c", "additionalProperties")]
         );
+    }
+
+    #[test]
+    fn an_open_objects_undeclared_property_is_no_violation_and_is_found_read_closed() {
+        let found = |schema: &str, value: &str| undeclared_parameters(&Json::parse(schema).unwrap(), &Json::parse(value).unwrap());
+        let open = r#"{"type":"object","properties":{"a":{"type":"string"},"o":{"type":"object","properties":{"h":{"type":"boolean"}}}}}"#;
+        assert!(is_valid(&Json::parse(open).unwrap(), &Json::parse(r#"{"a":"x","b":1}"#).unwrap()));
+        assert!(found(open, r#"{"a":"x","b":1}"#));
+        assert!(found(open, r#"{"o":{"h":true,"x":1}}"#), "nested");
+        assert!(!found(open, r#"{"a":"x","o":{"h":true}}"#));
+        // Admitted by name, by a schema of its own, or by a schema not typed
+        // `object`: nothing `held` closes.
+        assert!(!found("{}", r#"{"b":1}"#));
+        assert!(!found(r#"{"type":"object","properties":{},"additionalProperties":true}"#, r#"{"b":1}"#));
+        assert!(!found(r#"{"type":"object","additionalProperties":{"type":"integer"}}"#, r#"{"b":1}"#));
+        // Closed already: a violation, not this.
+        assert!(!found(r#"{"type":"object","properties":{},"additionalProperties":false}"#, r#"{"b":1}"#));
+        // An `anyOf` member that admits the value closed holds none; one
+        // that admits it only open does.
+        let either = r#"{"anyOf":[{"type":"object","properties":{"a":{}}},{"type":"object","properties":{"a":{},"b":{}}}]}"#;
+        assert!(!found(either, r#"{"a":1,"b":2}"#));
+        assert!(found(either, r#"{"a":1,"c":2}"#));
     }
 
     #[test]

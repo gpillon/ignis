@@ -1270,13 +1270,15 @@ function ToolCallsView({ tools, win }: { tools: ToolCallsCard; win: string }) {
           ["Failed", formatShare(tools.failedShare, 1)],
           ["Strict, outside the subset", formatCount(tools.strictOutsideSubset.window)],
           ["Values split at a tag", formatCount(tools.valuesSplit.window)],
+          ["Calls with a key held would close", formatCount(tools.undeclaredParameters.window)],
         ]}
       />
       {kinds.length > 0 && <p className="text-[11px] text-ash">Invalid calls: {kinds.join("; ")}.</p>}
       <p className="text-[11px] text-ash">
         Every call the model writes is checked as it closes and delivered as written. A dropped call is a block that did not parse, which the
         client never sees. A strict tool outside OpenAI's strict subset is refused with a 400, and counted here. A value split at a tag is a string the parser
-        ended at a tag inside it, dropping text after the tag that a held tool's rule would have kept.
+        ended at a tag inside it, dropping text after the tag that a held tool's rule would have kept. A call with a key held would close holds a parameter an
+        open object does not declare: JSON Schema admits it, and the switch at held would close the object to it.
       </p>
     </Card>
   );

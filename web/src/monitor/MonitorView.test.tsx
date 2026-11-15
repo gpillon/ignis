@@ -230,7 +230,8 @@ describe("MonitorView", () => {
       .replace('outcome="dropped"} 1', 'outcome="dropped"} 2')
       .replace('kind="type"} 2', 'kind="type"} 4')
       .replace('kind="undeclared_tool"} 0', 'kind="undeclared_tool"} 1')
-      .replace("ignis_tool_call_values_split_total 2", "ignis_tool_call_values_split_total 5");
+      .replace("ignis_tool_call_values_split_total 2", "ignis_tool_call_values_split_total 5")
+      .replace("ignis_tool_call_undeclared_parameters_total 4", "ignis_tool_call_undeclared_parameters_total 6");
     const state = applyScrape(applyScrape(initialMonitor(), { kind: "ok", text: TOOL_CALL_EXPOSITION }, now - 10_000, 2), { kind: "ok", text: later }, now, 2);
     const html = renderToStaticMarkup(<MonitorView state={state} />);
     expect(html).toContain("Tool calls");
@@ -240,6 +241,9 @@ describe("MonitorView", () => {
     // #610: 3 more values split at a tag in the window.
     expect(html).toContain("Values split at a tag");
     expect(html).toMatch(/Values split at a tag<\/[^>]+>\s*<[^>]+>3</);
+    // #641: 2 more calls in the window holding a key `held` would close.
+    expect(html).toMatch(/Calls with a key held would close<\/[^>]+>\s*<[^>]+>2</);
+    expect(html).toContain("the switch at held would close");
     // #611: a strict tool outside the subset is refused, not served.
     expect(html).toContain("is refused with a 400");
     expect(html).not.toContain("served as any other");

@@ -1,6 +1,7 @@
 ---
 status: accepted
 amends: [ADR-0017, ADR-0089]
+amended-by: [ADR-0097]
 ---
 
 # A held tool's call is checked as the model writes it, in its own order, and a value ends only where the call continues
