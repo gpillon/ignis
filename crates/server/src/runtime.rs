@@ -349,7 +349,13 @@ impl EngineShape {
         crate::adaptation::Attempt {
             max_context: self.max_context,
             decode_lanes: self.decode_lanes_for(ignis_core::compute::ModelFamily::Qwen38_27b),
-            draft_head: self.speculation.map(|speculation| speculation.proposal_head()),
+            // GitHub #619: the head is the load's drafter's to choose: DFlash2
+            // scores with the full head or its shortlist; no other drafter
+            // the 27B takes has a head to choose.
+            draft_head: self.speculation.and_then(|speculation| match speculation.backend() {
+                ignis_core::SpeculativeBackend::Dflash2 => Some(speculation.proposal_head()),
+                ignis_core::SpeculativeBackend::VerifyOnly | ignis_core::SpeculativeBackend::Mtp => None,
+            }),
             prefill_chunk_solo: self.prefill_chunk,
         }
     }
@@ -2409,6 +2415,24 @@ mod tests {
             panic!("expected a runnable config");
         };
         EngineShape::from(&config.for_family(ignis_core::compute::ModelFamily::Qwen38_27b).expect("the 27B"))
+    }
+
+    /// GitHub #619: the head the ladder may adapt is the load's drafter's to
+    /// choose, DFlash2's (its shortlist is the step's one move); a load whose
+    /// drafter has no head to choose, or that drafts nothing, brings none to
+    /// the adaptation, and its shape at the start is itself.
+    #[test]
+    fn only_dflash2_brings_a_head_to_the_adaptation() {
+        use ignis_core::{ProposalHead, Speculation, SpeculativeBackend};
+        let shape = rtx5090_27b(&[]);
+        assert_eq!(shape.adaptation_start().draft_head, Some(ProposalHead::Full));
+        let verify_only =
+            EngineShape { speculation: Some(Speculation::new(SpeculativeBackend::VerifyOnly, 7).unwrap()), ..shape };
+        let off = EngineShape { speculation: None, ..shape };
+        for (what, shape) in [("verify-only", verify_only), ("no speculation", off)] {
+            assert_eq!(shape.adaptation_start().draft_head, None, "{what}");
+            assert_eq!(shape.at(shape.adaptation_start()), shape, "{what}");
+        }
     }
 
     /// ADR 0063 §3: the shape carries what may adapt, and at an adapted
