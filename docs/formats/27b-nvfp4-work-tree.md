@@ -158,7 +158,9 @@ are cast to FP32.
 
 ### 4.3 `mtp/`
 
-The checkpoint's MTP layer (ignis binds none of it; the container carries it as the served one does):
+The checkpoint's MTP layer, the 27B's MTP head, which a load built for MTP binds whole
+(`ignis_artifact::mtp_scope_27b`, ADR 0095) and every other load leaves unbound; the container carries it
+as the served one does, and the 16 GB artifacts copy the same objects:
 
 | name | format | shape |
 |---|---|---|

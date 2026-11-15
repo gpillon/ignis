@@ -322,9 +322,26 @@ Flash-Next's hashed n-gram embedding table (320M rows, INT4), a
 the device.
 
 **MTP head**:
-The checkpoint's own one-layer draft head (spec `flash-next/07`): it combines
-the trunk's pre-mixer streams with the next token's embedding and drafts the
-token after it.
+The checkpoint's own one-layer draft head: it combines the target's hidden
+state at a position with the embedding of the token after it and scores the
+token after that with the target's output head. On Flash-Next (spec
+`flash-next/07`) it reads the trunk's pre-mixer streams and comes in a
+**companion container**. On the 27B (spec #618, ADR 0095) it is the 12 `mtp/`
+objects every 27B artifact carries, W8 on each (451 MB): its stem projects
+`[the next token's embedding; the target's post-final-norm hidden]`, one gated
+attention layer whose state is one more attention layer of the KV pool, over
+the whole context, and a dense SwiGLU. A 27B load built for it keeps that
+state and the **continuation hidden** through every prefill and round.
+
+**Continuation hidden**:
+On a 27B load with the **MTP head**: the target's post-final-norm hidden at a
+sequence's last consumed position, one BF16 vector a sequence kept in its pool
+slot. The head's entry at a position is built from the hidden there and the
+token after it, so the entry at a sequence's last position waits for the token
+the sequence consumes next; the continuation hidden is the half of it that
+waits. Every prefill chunk and every round reads it for its first head row and
+leaves the next one (ADR 0095). A **state section** to be: a restored or
+claimed sequence that carries it drafts in its first round.
 
 **Companion container**:
 A small `.ninfer` beside the main one that holds one optional part of the
@@ -759,7 +776,10 @@ One part of what a sequence is made of: its KV pages, its GDN slot, its conv
 taps, its position and last token, its penalty-count row, on a pool built with
 DFlash2 its **drafter window**, and on an hq-e8-2b pool its **residual
 window**. Each is either shareable read-only (KV pages) or must be cloned per
-sequence (everything mutable).
+sequence (everything mutable). A pool built for the 27B's **MTP head** holds
+the head's attention state in its KV pages and the **continuation hidden** per
+slot, which no move carries yet: such a pool refuses every snapshot, restore,
+retained slot, prefix and checkpoint until the sections are listed (#622).
 
 **Snapshot blob**:
 The opaque, versioned byte image of a whole sequence that crosses the ABI.
@@ -1131,7 +1151,9 @@ Whatever fills a verify round's proposal seam: **DFlash2** inside the leaf
 (P5-05), proposing each lane's drafts from its **drafter window** in the same
 pass that verifies them, or a fake drafter in the substrate's own tests
 (`verify-only` load: the verify substrate with nothing bound, the drafts passed
-per call).
+per call). The 27B's **MTP head** is its second drafter (ADR 0095): a load
+built for it binds the head and keeps its state current; its chain proposes in
+the verify round from #621.
 
 **Draft rule**:
 How a **verify round**'s sampling lanes draft and accept (`--spec-draft-rule`,
