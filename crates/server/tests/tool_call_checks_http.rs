@@ -364,10 +364,11 @@ async fn the_responses_api_counts_every_kind_of_call_on_http_and_websocket() {
 }
 
 /// Under `parallel_tool_calls: false` (#609) the turn ends where its first
-/// block closes, and that block is the only one counted: a first block that
-/// does not parse is counted dropped, and still ends the turn.
+/// call closes, and the blocks up to that close are the only ones counted: a
+/// first block that does not parse is counted dropped and ends nothing
+/// (#640), so the call after it is counted too.
 #[tokio::test]
-async fn under_one_call_only_the_block_that_ends_the_turn_is_counted() {
+async fn under_one_call_only_the_blocks_up_to_the_turns_call_are_counted() {
     let dropped_first = ["<tool_call>\nno function here\n</tool_call>".to_owned(), call("edit", &[("path", "a.txt")])].concat();
     let cases: [(String, &[&str]); 2] = [
         (
@@ -376,7 +377,7 @@ async fn under_one_call_only_the_block_that_ends_the_turn_is_counted() {
         ),
         (
             dropped_first,
-            &["ignis_tool_calls_total{outcome=\"valid\"} 0", "ignis_tool_calls_total{outcome=\"invalid\"} 0", "ignis_tool_calls_total{outcome=\"dropped\"} 1"],
+            &["ignis_tool_calls_total{outcome=\"valid\"} 1", "ignis_tool_calls_total{outcome=\"invalid\"} 0", "ignis_tool_calls_total{outcome=\"dropped\"} 1"],
         ),
     ];
     for (script, counts) in &cases {

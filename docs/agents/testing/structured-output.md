@@ -120,7 +120,8 @@ The measured figures are in
   metrics off, which checks nothing (whole: its bytes; streamed: what the
   stream assembles to); a call the first token writes is counted once, not
   again by the first-token probe; under `parallel_tool_calls: false` (#609)
-  only the block that ends the turn is counted, a dropped one included;
+  only the blocks up to the call that ends the turn are counted, a dropped
+  one before it included (#640);
   strict tools outside the subset are counted as they arrive, and refused on
   chat completions (#611) and on the Responses API (#613); a value cut at a
   `</parameter>` line, whose text after it the parser dropped and the
@@ -271,7 +272,8 @@ repaired from the verify pass's scores, as a plain round's draw is.
   --test parallel_tool_calls_http`, #609): `parallel_tool_calls: false` ends
   the turn at its first call on chat completions (whole and streamed) and
   the Responses API (HTTP and socket), on both families, a call closed in the
-  reasoning ending nothing; `true` or absent serves every call.
+  reasoning ending nothing, and a closed block that does not parse ending
+  nothing either (#640); `true` or absent serves every call.
   `openai_http_tool_choice` covers the forced call beside the grammar.
 - **On the GPU**, the served close-out (#617): `held_tools_gpu` serves a
   corpus of agent requests (`support/held_tools_corpus.rs`: chat completions

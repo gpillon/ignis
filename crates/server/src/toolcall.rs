@@ -467,13 +467,14 @@ impl ToolCallScanner {
         }
     }
 
-    /// With `on`, the scan ends where its first call block closes, parsed
-    /// or dropped (`parallel_tool_calls: false`, GitHub #609): that close
-    /// ends the turn, and nothing fed after it is read, a second call
-    /// already in the same text included. Where a block closes is this
-    /// scanner's to say, so a `</tool_call>` its caller never feeds it (the
-    /// reasoning's) ends nothing, and a change to where a call closes is a
-    /// change to when the turn ends.
+    /// With `on`, the scan ends where its first call closes
+    /// (`parallel_tool_calls: false`, GitHub #609): that close ends the
+    /// turn, and nothing fed after it is read, a second call already in the
+    /// same text included. A closed block that does not parse is not a call
+    /// and ends nothing (#640): the scan reads on past it, as without `on`.
+    /// Where a block closes is this scanner's to say, so a `</tool_call>` its
+    /// caller never feeds it (the reasoning's) ends nothing, and a change to
+    /// where a call closes is a change to when the turn ends.
     pub fn ending_at_first_call(self, on: bool) -> Self {
         Self { ends_at_first_call: on, ..self }
     }
@@ -554,6 +555,7 @@ impl ToolCallScanner {
                             check.count_split_values(&body, block, &self.schemas);
                         }
                     }
+                    let called = parsed.is_some();
                     if let Some((name, arguments)) = parsed {
                         let index = self.next_index;
                         self.next_index += 1;
@@ -568,9 +570,10 @@ impl ToolCallScanner {
                     // A closed block that does not parse as a well-formed
                     // `<function=...>` is dropped — same never-leak-garbage
                     // rule as a call left open at any ending but `length` —
-                    // and counted `dropped`.
+                    // and counted `dropped`. It is not a call, so it ends no
+                    // turn (GitHub #640).
                     self.state = State::Scanning;
-                    if self.ends_at_first_call {
+                    if self.ends_at_first_call && called {
                         self.state = State::Ended;
                         self.hold.clear();
                         break;
@@ -1476,14 +1479,30 @@ mod tests {
         assert_eq!(content(&events), "before ");
     }
 
+    const UNPARSED: &str = "<tool_call>\nno function here\n</tool_call>";
+
     #[test]
-    fn a_scan_ending_at_its_first_call_ends_at_a_dropped_block_too() {
-        // The first block closes and does not parse: the turn's call was
-        // written, and the one after it is not read.
-        let (events, ended) = run_to_first_call(&["<tool_call>\nno function here\n</tool_call>", SECOND]);
+    fn a_scan_ending_at_its_first_call_reads_on_past_a_block_that_does_not_parse() {
+        // A closed block that does not parse is not a call (GitHub #640): it
+        // ends nothing, and the turn's call is the first one that parses,
+        // the first the scan emits.
+        let (events, ended) = run_to_first_call(&[UNPARSED, SECOND, "\nafter"]);
         assert!(ended);
-        assert!(calls(&events).is_empty(), "{events:?}");
+        let got: Vec<_> = calls(&events).iter().map(|c| (c.index, c.id.clone(), c.name.clone())).collect();
+        assert_eq!(got, [(0, "call_0".to_owned(), "b".to_owned())], "{events:?}");
         assert_eq!(content(&events), "");
+
+        // With nothing after it that parses, the scan reads its text to the
+        // end, as a scan with no call does.
+        let (events, ended) = run_to_first_call(&["one ", UNPARSED, " two"]);
+        assert!(!ended);
+        assert!(calls(&events).is_empty(), "{events:?}");
+        assert_eq!(content(&events), "one  two");
+
+        // A block that does not parse after the turn's call is never read.
+        let (events, ended) = run_to_first_call(&[FIRST, UNPARSED, SECOND]);
+        assert!(ended);
+        assert_eq!(calls(&events).iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["a"]);
     }
 
     #[test]
@@ -1536,7 +1555,8 @@ mod tests {
     }
 
     /// The scanner as it read before #610, over a whole text: its content
-    /// and its calls (name, arguments).
+    /// and its calls (name, arguments). With `first_call_only` it ends at
+    /// the close of the first call that parses (#609, #640).
     fn scan_before_610(text: &str, schemas: &ToolSchemas, first_call_only: bool) -> (String, Vec<(String, String)>) {
         let (mut content, mut calls, mut rest) = (String::new(), Vec::new(), text);
         while let Some(open) = rest.find(OPEN_TAG) {
@@ -1545,9 +1565,11 @@ mod tests {
             let Some(close) = after.find(CLOSE_TAG) else {
                 return (content, calls);
             };
-            calls.extend(parse_function_block_before_610(&after[..close], schemas));
+            let call = parse_function_block_before_610(&after[..close], schemas);
+            let called = call.is_some();
+            calls.extend(call);
             rest = &after[close + CLOSE_TAG.len()..];
-            if first_call_only {
+            if first_call_only && called {
                 return (content, calls);
             }
         }
