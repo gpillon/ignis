@@ -672,7 +672,21 @@ pub fn evaluate_mtp_head(
     embeddings: &[Vec<f64>],
     positions: &[i32],
 ) -> Result<MtpHeadReference> {
-    let rows = positions.len();
+    let axes: Vec<[i32; 3]> = positions.iter().map(|&p| [p, p, p]).collect();
+    evaluate_mtp_head_at_axes(reader, hiddens, embeddings, &axes)
+}
+
+/// [`evaluate_mtp_head`] with each row rotated at its own three MRoPE axes
+/// (temporal, height, width; GitHub #624): rotary pair `i` at axis `i mod 3`,
+/// as the text layers rotate a multimodal span's columns. A text row's three
+/// axes are one value, and then this is [`evaluate_mtp_head`].
+pub fn evaluate_mtp_head_at_axes(
+    reader: &Reader,
+    hiddens: &[Vec<f64>],
+    embeddings: &[Vec<f64>],
+    axes: &[[i32; 3]],
+) -> Result<MtpHeadReference> {
+    let rows = axes.len();
     if rows == 0 || hiddens.len() != rows || embeddings.len() != rows {
         return Err(fail("MTP head reference: one hidden, embedding and position per row, and a row at least"));
     }
@@ -708,7 +722,7 @@ pub fn evaluate_mtp_head(
         let mut key = p[q_width..q_width + kv_width].to_vec();
         for head in 0..GQA_KV_HEADS {
             let at = head * GQA_HEAD_DIM;
-            let prepared = rope(&norm(&key[at..at + GQA_HEAD_DIM], &k_weight, true)?, positions[row]);
+            let prepared = rope_at_axes(&norm(&key[at..at + GQA_HEAD_DIM], &k_weight, true)?, axes[row]);
             key[at..at + GQA_HEAD_DIM].copy_from_slice(&prepared);
         }
         keys.push(key);
@@ -717,7 +731,7 @@ pub fn evaluate_mtp_head(
             let mut query = p[..q_width].to_vec();
             for head in 0..GQA_HEADS {
                 let at = head * GQA_HEAD_DIM;
-                let prepared = rope(&norm(&query[at..at + GQA_HEAD_DIM], &q_weight, true)?, positions[row]);
+                let prepared = rope_at_axes(&norm(&query[at..at + GQA_HEAD_DIM], &q_weight, true)?, axes[row]);
                 query[at..at + GQA_HEAD_DIM].copy_from_slice(&prepared);
             }
             last = (x, query, p[q_width + kv_width..2 * q_width + kv_width].to_vec());
@@ -768,8 +782,15 @@ pub struct MtpHeadReference {
 }
 
 fn rope(values: &[f64], position: i32) -> Vec<f64> {
+    rope_at_axes(values, [position; 3])
+}
+
+/// The text layers' partial MRoPE over the first 64 dims: pair `i` (dims `i`
+/// and `i + 32`) rotates at axis `i mod 3`'s position.
+fn rope_at_axes(values: &[f64], axes: [i32; 3]) -> Vec<f64> {
     let mut out = values.to_vec();
     for pair in 0..32 {
+        let position = axes[pair % 3];
         let angle = position as f64 * 10_000_000f64.powf(-(2.0 * pair as f64 / 64.0));
         let (s, c) = angle.sin_cos();
         let a = values[pair];
@@ -945,6 +966,27 @@ fn e4m3(code: u8) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// GitHub #624: pair `i` rotates at axis `i mod 3`. A unit vector in pair
+    /// 1's first dim turns by pair 1's angle at the height axis alone, and the
+    /// temporal and width axes leave it where it is; one value on all three
+    /// axes is the text rotation.
+    #[test]
+    fn each_rotary_pair_turns_at_its_own_axis() {
+        let mut unit = vec![0.; 256];
+        unit[1] = 1.;
+        let theta = 10_000_000f64.powf(-2.0 / 64.0);
+        let turned = rope_at_axes(&unit, [0, 5, 0]);
+        assert!((turned[1] - (5. * theta).cos()).abs() < 1e-15 && (turned[33] - (5. * theta).sin()).abs() < 1e-15);
+        assert_eq!(rope_at_axes(&unit, [5, 0, 5]), unit, "the other axes leave pair 1 alone");
+        let mut third = vec![0.; 256];
+        third[2] = 1.;
+        let theta = 10_000_000f64.powf(-4.0 / 64.0);
+        let text = rope_at_axes(&third, [7; 3]);
+        assert!((text[2] - (7. * theta).cos()).abs() < 1e-15 && (text[34] - (7. * theta).sin()).abs() < 1e-15);
+        let values: Vec<f64> = (0..256).map(|i| (i as f64 * 0.37).sin()).collect();
+        assert_eq!(rope_at_axes(&values, [9, 4, 2])[64..], values[64..], "only the first 64 dims rotate");
+    }
+
     #[test]
     fn host_float_decoders_preserve_known_values() {
         assert_eq!(bf16(0x3fc0), 1.5);

@@ -352,6 +352,15 @@ struct ignis_prefill_options {
    * span's position `i` is built from). No serving path sets it; NULL costs
    * nothing, and a load without the head refuses a set one. */
   uint16_t *out_span_hidden;
+  /* GitHub #624: the three axes the position before a multimodal span
+   * rotated at -- the prompt's `mrope_positions` column at the span's start
+   * less one, temporal, height, width -- or NULL. On a 27B load built for the
+   * MTP head, a multimodal span that continues a sequence (start past 0)
+   * needs it: the head's row at that position is built from the span's first
+   * token and rotates where the target's hidden there did, which no later
+   * span's own positions say. Refused NULL there; unread on a span starting
+   * at 0, on a text span and on every other load. */
+  const int32_t *mrope_previous;
 };
 
 #ifdef __cplusplus
@@ -359,13 +368,15 @@ struct ignis_prefill_options {
  * crates/core/src/step_abi.rs's mirror test, on CPU): GitHub #520's
  * `keeps_draw` filled the tail padding after `next_prompt_token`, so the size
  * alone no longer tells that layout from the one before it; GitHub #287's
- * `keeps_scores` follows it, and GitHub #620's `out_span_hidden` them. */
-static_assert(sizeof(struct ignis_prefill_options) == 240 &&
+ * `keeps_scores` follows it, GitHub #620's `out_span_hidden` them, and
+ * GitHub #624's `mrope_previous` that. */
+static_assert(sizeof(struct ignis_prefill_options) == 248 &&
                   offsetof(struct ignis_prefill_options, drafter_floor) == 208 &&
                   offsetof(struct ignis_prefill_options, next_prompt_token) == 216 &&
                   offsetof(struct ignis_prefill_options, keeps_draw) == 220 &&
                   offsetof(struct ignis_prefill_options, keeps_scores) == 224 &&
-                  offsetof(struct ignis_prefill_options, out_span_hidden) == 232,
+                  offsetof(struct ignis_prefill_options, out_span_hidden) == 232 &&
+                  offsetof(struct ignis_prefill_options, mrope_previous) == 240,
               "ignis_prefill_options drifted from crates/core/src/step_abi.rs IgnisPrefillOptions");
 #endif
 

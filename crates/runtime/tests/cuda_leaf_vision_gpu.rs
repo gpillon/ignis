@@ -20,6 +20,14 @@
 //! claims a lane's tokens are independent of who shares its round. What must
 //! not change is the answer.
 //!
+//! GitHub #624: on a load that drafts with the 27B's MTP head, an image
+//! prefill interleaved with three text lanes decoding long answers leaves
+//! their text as it is when they run alone, token for token: the image
+//! request draws its one token in its prefill and joins no round, so every
+//! round the text lanes run is the same three lanes' at the same width in both
+//! runs, and only the image's prefill chunks between those rounds -- its head
+//! rows, its media columns, its rotation -- tell the runs apart.
+//!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a skip; under the profile, a hard failure.
 
@@ -34,9 +42,10 @@ use ignis_artifact::{
 };
 use ignis_core::gpu_profile;
 use ignis_core::vision::Multimodal;
+use ignis_core::compute::ModelConfig;
 use ignis_core::{
     ConcreteScheduler, DecodeParams, KvFormat, RequestClass, RequestId, RequestInput, SchedEvent,
-    Scheduler, SchedulerConfig, TokenId, Vision,
+    Scheduler, SchedulerConfig, Speculation, SpeculativeBackend, TokenId, Vision,
 };
 use ignis_runtime::{CudaLeaf, CudaLeafConfig, Model, RuntimeCompute};
 
@@ -174,7 +183,11 @@ struct Loaded {
     model: Arc<Model<CudaLeaf>>,
     compute: Arc<RuntimeCompute<CudaLeaf>>,
     frontend: FrontendSet,
+    /// The pages admission may hand out: the pool's, less the pages the MTP
+    /// head's holders may copy (GitHub #622; none on any other load).
     pages: u32,
+    /// The scheduler's `kv_holder_lag` for the load's pool.
+    holder_lag: u32,
 }
 
 /// Load the model with vision, or `None` where the profile allows a skip.
@@ -186,6 +199,11 @@ fn load() -> Option<Loaded> {
 /// keeps them (ADR 0075): the binder's scope and the leaf's option agree, as a
 /// load requires.
 fn load_at(residency: VisionResidency) -> Option<Loaded> {
+    load_with(residency, None)
+}
+
+/// [`load_at`] drafting with `speculation` (GitHub #624: the MTP head).
+fn load_with(residency: VisionResidency, speculation: Option<Speculation>) -> Option<Loaded> {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return None;
@@ -193,7 +211,8 @@ fn load_at(residency: VisionResidency) -> Option<Loaded> {
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
     let eos = frontend.eos_token_id().expect("eos");
-    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true, vision_residency: residency, fp8_exceptions: false })
+    let draft = ignis_core::model_load::draft_module(speculation);
+    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft, vision: true, vision_residency: residency, fp8_exceptions: false })
         .unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(device) => device,
@@ -218,8 +237,18 @@ fn load_at(residency: VisionResidency) -> Option<Loaded> {
         kv_format: KvFormat::Bf16,
         kv_pool_bytes: ignis_runtime::auto_kv_pool_bytes(KvFormat::Bf16, MAX_CONTEXT),
         vision: Some(Vision::default().with_residency(residency)),
+        speculation,
         ..CudaLeafConfig::default()
     };
+    let cfg = ModelConfig::qwen38_27b();
+    let backend = speculation.map(|s| s.backend());
+    let holder_pages = ignis_core::seq::holder_page_reserve(
+        &cfg,
+        backend,
+        config.slot_count,
+        config.retained_device_slots + config.retained_host_slots,
+    );
+    let holder_lag = ignis_core::seq::holder_lag(&cfg, backend);
     // GitHub #213: the eviction leg below pushes a sequence to KV-RAM, which
     // is placed in this arena. The same figure its scheduler budgets.
     let leaf = CudaLeaf::new(device, reader, artifact, handles, config)
@@ -230,14 +259,14 @@ fn load_at(residency: VisionResidency) -> Option<Loaded> {
     // The leaf's errors are `tracing::error!` events; without a subscriber a
     // failing round only reports `Kernel(-1)`.
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
-    let pages = model.stats().expect("stats").kv_page_count;
-    Some(Loaded { model, compute, frontend, pages })
+    let pages = model.stats().expect("stats").kv_page_count - holder_pages;
+    Some(Loaded { model, compute, frontend, pages, holder_lag })
 }
 
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn an_image_prefill_interleaved_with_text_lanes_leaves_them_as_they_run_alone() {
-    let Some(Loaded { model, compute, frontend, pages }) = load() else {
+    let Some(Loaded { model, compute, frontend, pages, .. }) = load() else {
         return;
     };
 
@@ -287,6 +316,95 @@ fn an_image_prefill_interleaved_with_text_lanes_leaves_them_as_they_run_alone() 
         assert_eq!(compute.live_sequences(), 0, "round {round}");
     }
     assert_eq!(model.stats().expect("stats").vram_bytes, before);
+}
+
+/// GitHub #624: on the MTP head's load, the text lanes' tokens with an image
+/// prefill between their rounds are their tokens alone (module doc).
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn on_an_mtp_load_an_image_prefill_interleaved_with_text_lanes_leaves_their_text_unchanged() {
+    let speculation = Speculation::new(SpeculativeBackend::Mtp, 7).expect("mtp-7");
+    let Some(loaded) = load_with(VisionResidency::Device, Some(speculation)) else {
+        return;
+    };
+    let Loaded { compute, frontend, pages, holder_lag, .. } = &loaded;
+    // No prompt reuse: the second run's text lanes prefill cold, as the
+    // first's did, rather than claiming the state the first left retained.
+    let config = || SchedulerConfig { kv_holder_lag: *holder_lag, prompt_reuse: false, ..config(*pages) };
+    let long = |question: &str| RequestInput {
+        params: DecodeParams { max_tokens: Some(128), ..DecodeParams::default() },
+        ..text_input(frontend, question)
+    };
+    let questions = [
+        "Write a paragraph about the history of Rome.",
+        "Explain how a bicycle gear works.",
+        "Describe the water cycle step by step.",
+    ];
+    // The image request draws its one token in its prefill and joins no round.
+    let image = image();
+    let picture =
+        RequestInput { params: DecodeParams { max_tokens: Some(1), ..DecodeParams::default() }, ..image_input(frontend, &image) };
+    let prompt_tokens = picture.tokens.len();
+    assert!(prompt_tokens > 2 * SERVING_CHUNK as usize, "the image prompt prefills in several chunks");
+    let run = |then: Vec<RequestInput>| {
+        let mut sched = ConcreteScheduler::with_config(config(), compute.clone());
+        let texts: Vec<RequestId> =
+            questions.iter().map(|q| sched.submit(long(q), RequestClass::Agent).expect("submit")).collect();
+        // The text lanes prefilled and decoding before the image arrives.
+        let mut events = sched.advance();
+        events.extend(sched.advance());
+        let later: Vec<RequestId> =
+            then.into_iter().map(|input| sched.submit(input, RequestClass::Agent).expect("submit")).collect();
+        let mut interleaved = 0;
+        let mut later_done = later.is_empty();
+        while !sched.is_idle() {
+            let tick = sched.advance();
+            assert!(sched.last_error().is_none(), "compute error: {:?}", sched.last_error());
+            let committed = |among: &[RequestId]| {
+                tick.iter().any(|event| matches!(event, SchedEvent::Token { request, .. } if among.contains(request)))
+            };
+            if !later_done {
+                if committed(&later) {
+                    later_done = true;
+                } else if committed(&texts) {
+                    interleaved += 1;
+                }
+            }
+            events.extend(tick);
+        }
+        let tokens: Vec<Vec<TokenId>> = texts.iter().map(|&id| generated(&events, id)).collect();
+        let later: Vec<Vec<TokenId>> = later.iter().map(|&id| generated(&events, id)).collect();
+        (tokens, later, interleaved)
+    };
+    let (alone, _, _) = run(Vec::new());
+    let (mixed, image_tokens, interleaved) = run(vec![picture]);
+    eprintln!("mtp: {interleaved} ticks committed text between the image's prefill chunks ({prompt_tokens} tokens)");
+    assert!(interleaved >= 2, "the image prefill interleaved with the decoding text lanes");
+    assert_eq!(image_tokens[0].len(), 1, "the image request drew its one token");
+    let decode = |tokens: &[TokenId]| frontend.tokenizer().decode(tokens).expect("decode");
+    for (n, (solo, beside)) in alone.iter().zip(&mixed).enumerate() {
+        assert!(solo.len() > 32, "text lane {n} decoded a long answer: {} tokens", solo.len());
+        assert_eq!(
+            decode(beside),
+            decode(solo),
+            "text lane {n}: the image prefill between its rounds left its text as it is alone"
+        );
+        assert_eq!(beside, solo, "text lane {n}: token for token");
+    }
+    assert_eq!(compute.live_media(), 0);
+
+    // And the image request, answered whole on the head's load, names its
+    // image.
+    let (ids, events) = {
+        let mut sched = ConcreteScheduler::with_config(config(), compute.clone());
+        let id = sched.submit(image_input(frontend, &image), RequestClass::Agent).expect("submit");
+        let mut events = Vec::new();
+        run_to_idle(&mut sched, &mut events);
+        (vec![id], events)
+    };
+    let answer = decode(&generated(&events, ids[0]));
+    eprintln!("mtp image answer: {answer:?}");
+    assert!(answer.contains("47"), "a sane answer about the image: {answer:?}");
 }
 
 #[test]

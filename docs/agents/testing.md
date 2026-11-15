@@ -424,6 +424,21 @@ Agent image request to KV-RAM, which is restored and still describes its image.
 The request log it prints names the evicted and restored request id and each
 request's `spec.*` counters.
 
+Since GitHub #624 `--vision-enabled` combines with `--spec-backend mtp` on the
+27B too. `crates/core/tests/mtp_vision_gpu.rs` holds the head's rows after an
+image prompt to its weights in double precision (`evaluate_mtp_head_at_axes`):
+the rows at and around the image (its columns embedded where the next token is
+a placeholder, three MRoPE axes a row), the frontier's first draft and the
+round's chain, the first verify round's commit and a plain round's row (at
+position + rope delta), each with a control that lands far outside the bound,
+the prompt in one span a chunk against one span bit for bit (the
+`mrope_previous` path), and the host residency's rows against the device's.
+`vision_dflash2_gpu.rs`, `vision_mixed_load_gpu.rs`, `vision_prefix_reuse_gpu.rs`
+(server) and `cuda_leaf_vision_gpu.rs` (runtime) each have an MTP test beside
+their DFlash2 or drafter-less one, and `vram_plan_gpu.rs` holds the head's
+vision load to its plan under both residencies; the interleaved test there
+holds the text lanes to their tokens alone, the image request joining no round.
+
 `crates/server/tests/mtp_serving_gpu.rs` (GitHub #623) is the 27B's MTP head
 served the same way, through `load::prepare_model`/`load_model` from the flags
 an operator passes: greedy text against the same flags at a window of 0 (no

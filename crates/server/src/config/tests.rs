@@ -2039,25 +2039,32 @@ fn the_27bs_mtp_load_refuses_dflash2s_own_settings_by_name() {
     }
 }
 
-/// Until the head drafts beside images (GitHub #624), the 27B's MTP load
-/// refuses vision on by name -- whether the operator, a built-in profile (all
-/// of them turn it on for the 27B) or a switch's carry turned it on -- and
-/// says how to turn it off. A window of 0 binds no head and keeps vision.
+/// GitHub #624: the 27B's MTP head drafts beside images, so its load keeps
+/// vision on wherever vision came from -- a built-in profile (all of them turn
+/// it on for the 27B), the operator, a switch's carry -- under either
+/// residency, and binds the head beside the tower. A window of 0 binds no head
+/// and keeps vision too.
 #[test]
-fn the_27bs_mtp_load_refuses_vision_by_name_until_the_head_drafts_beside_images() {
-    let err = config(&["--spec-backend", "mtp"]).for_family(ModelFamily::Qwen38_27b).expect_err("the profile's vision").0;
-    assert!(err.contains("--spec-backend mtp") && err.contains("vision.qwen38.enabled"), "{err}");
-    assert!(err.contains("--qwen38-vision-enabled false"), "{err}");
-    let err = config(&["--profile", "none", "--spec-backend", "mtp", "--vision-enabled"]).for_family(ModelFamily::Qwen38_27b).expect_err("named").0;
-    assert!(err.contains("--vision-enabled") && err.contains("does not draft beside vision"), "{err}");
+fn the_27bs_mtp_load_keeps_vision_on_from_a_profile_the_operator_or_a_switch() {
+    let profile = config(&["--spec-backend", "mtp"]).for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert!(profile.vision.is_some(), "the profile's vision");
+    assert_eq!(profile.speculation, Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)));
+    let named = config(&["--profile", "none", "--spec-backend", "mtp", "--vision-enabled"]).for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert!(named.vision.is_some() && named.speculation == Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)), "named");
+    for residency in ["host", "device"] {
+        let on = config(&["--spec-backend", "mtp", "--vision-residency", residency]).for_family(ModelFamily::Qwen38_27b).unwrap();
+        assert_eq!(on.vision.map(|v| v.residency().as_str()), Some(residency));
+        assert!(on.speculation.is_some(), "{residency}");
+    }
     let zero = config(&["--spec-backend", "mtp", "--spec-draft-tokens", "0"]).for_family(ModelFamily::Qwen38_27b).unwrap();
-    assert!(zero.vision.is_some() && zero.speculation.is_none(), "no head, no refusal");
+    assert!(zero.vision.is_some() && zero.speculation.is_none(), "no head, vision kept");
     let started = config(&["--spec-backend", "mtp"]).for_family(ModelFamily::FlashNext).unwrap();
-    let err = fit_to_family(&started, ModelFamily::Qwen38_27b).expect_err("a switch refuses it, never drops it silently").0;
-    assert!(err.contains("--qwen38-vision-enabled false"), "{err}");
+    let (switched, dropped) = fit_to_family(&started, ModelFamily::Qwen38_27b).unwrap();
+    assert!(dropped.is_empty(), "{dropped:?}");
+    assert!(switched.vision.is_some() && switched.speculation == Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)), "a switch keeps both");
     let carried = switch_target(&started, true, std::path::Path::new("27b.ninfer"), "qwen3.8-27b", ModelFamily::Qwen38_27b).unwrap();
-    let err = fit_to_family(&carried, ModelFamily::Qwen38_27b).expect_err("a carried vision").0;
-    assert!(err.contains("vision"), "{err}");
+    let (carried, _) = fit_to_family(&carried, ModelFamily::Qwen38_27b).unwrap();
+    assert!(carried.vision.is_some() && carried.speculation.is_some(), "a carried vision");
 }
 
 /// AC 4: a switch to the 27B keeps an MTP setting named for both models
@@ -2078,15 +2085,16 @@ fn a_switch_to_the_27b_keeps_the_mtp_head() {
     assert_eq!(on_27b.speculation, Some(mtp(3)));
 }
 
-/// AC 3 on a live change: a running 27B patched to its MTP head is refused
-/// for the profile's vision, naming it, as a start is; the same patch turning
-/// the 27B's vision off is taken, at the head's default window.
+/// AC 3 on a live change: a running 27B patched to its MTP head keeps the
+/// profile's vision (GitHub #624), at the head's default window; the same
+/// patch turning the 27B's vision off is taken too.
 #[test]
-fn a_live_change_to_the_27bs_mtp_head_refuses_vision_on_and_takes_it_off() {
+fn a_live_change_to_the_27bs_mtp_head_keeps_vision_on_or_takes_it_off() {
     let running = config(&[]).for_family(ModelFamily::Qwen38_27b).unwrap();
     assert!(running.vision.is_some(), "the profile turns the 27B's vision on");
-    let err = running.with_patch(&patch_of(&[("spec", "backend", "mtp")])).expect_err("vision on").0;
-    assert!(err.contains("vision") && err.contains("--qwen38-vision-enabled false"), "{err}");
+    let next = running.with_patch(&patch_of(&[("spec", "backend", "mtp")])).unwrap();
+    assert_eq!(next.speculation, Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)));
+    assert!(next.vision.is_some(), "vision stays on beside the head");
     let mut patch = patch_of(&[("spec", "backend", "mtp")]);
     let enabled = schema::field("vision", "enabled").unwrap();
     let spelling = enabled.scoped_file_key(ModelFamily::Qwen38_27b);

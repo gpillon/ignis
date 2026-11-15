@@ -380,16 +380,6 @@ Flash-Next's MTP head needs its companion container
 qwen3.8-flash-next` fetches both
 ([Flash-Next speculation](configuration/flash-next-mtp.md)).
 
-### `` `--spec-backend mtp`: the 27B's MTP head does not draft beside vision yet ``
-
-From 0.11.0 the 27B takes its own MTP head as its drafter, but not yet beside
-images, and every built-in profile turns the 27B's vision on. The message names
-where vision came from (the profile's `vision.qwen38.enabled`, your own flag,
-or the model switched from, whose vision a switch carries) and the fix:
-`--qwen38-vision-enabled false` turns vision off for the 27B alone. A model
-switch to the 27B is refused the same way, and a `--spec-draft-tokens 0`
-start, which loads no head, keeps vision
-([the 27B's two drafters](concepts/speculative-decoding.md#the-27bs-two-drafters)).
 
 ### `` `--spec-drafter-top-p …`: the drafter top-p is DFlash2's, and the 27B's MTP head … drafts the fixed draft only ``
 

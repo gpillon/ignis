@@ -551,6 +551,7 @@ fn standing<'e>(
                 positions: &multimodal.positions,
                 rope_delta: multimodal.rope_delta,
                 media: columns,
+                previous: None,
             };
             engine.span(&tokens, hashed.as_deref(), Some(span))
         }

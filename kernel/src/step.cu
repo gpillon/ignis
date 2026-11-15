@@ -961,6 +961,8 @@ struct SpanMultimodal {
   const int32_t *scatter = nullptr; // span-relative, strictly increasing
   uint32_t count = 0;
   uint32_t first_column = 0;
+  // GitHub #624: the axes the position before the span rotated at, or null.
+  const int32_t *previous = nullptr; // [3]
 };
 
 // GitHub #260 (ADR 0038): an attention readout armed by the entry point for
@@ -1111,6 +1113,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     const void *rope_positions = nullptr;
     std::vector<std::int32_t> rope_positions_host;
     std::vector<std::int32_t> scatter_host;
+    std::int32_t media_column = 0;
     if (multimodal.positions != nullptr) {
       rope_positions_host.resize(3 * static_cast<std::size_t>(T));
       for (std::size_t axis = 0; axis < 3; ++axis) {
@@ -1153,6 +1156,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
         const auto column =
             static_cast<std::int32_t>(multimodal.first_column) +
             static_cast<std::int32_t>(first - multimodal.scatter);
+        media_column = column;
         // GitHub #243: the chunk's columns are contiguous in the embedding's
         // column space but sit in its pool pages, so the scatter runs once
         // per page run. Same `ops::scatter` the single output transient
@@ -1346,8 +1350,32 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     // continuation hidden its last column leaves (kernel/src/mtp_head.h);
     // with the readout, the post-final-norm hidden of every column.
     if (model->drafter == IgnisDrafter::kMtp) {
+      // GitHub #624: on a multimodal chunk, the axes its positions rotated
+      // at from the one before it -- the span's column before the chunk, or
+      // before the span the position the caller names (`mrope_previous`) --
+      // and the media columns its embedding took. The host vector outlives
+      // the chunk's synchronize below.
+      ignis::mtp::ChunkMultimodal head_media;
+      std::vector<std::int32_t> head_axes;
+      if (multimodal.positions != nullptr) {
+        const std::size_t entries = static_cast<std::size_t>(T) + 1;
+        head_axes.resize(3 * entries);
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+          std::int32_t *row = head_axes.data() + axis * entries;
+          row[0] = chunk_offset > 0 ? multimodal.positions[axis * multimodal.span_tokens + chunk_offset - 1]
+                   : multimodal.previous != nullptr ? multimodal.previous[axis]
+                                                    : 0;
+          std::copy_n(rope_positions_host.data() + axis * static_cast<std::size_t>(T), T, row + 1);
+        }
+        head_media.axes = head_axes.data();
+        head_media.media = multimodal.media;
+        head_media.scatter = scatter_host.data();
+        head_media.count = static_cast<std::int32_t>(scatter_host.size());
+        head_media.first_column = media_column;
+      }
       std::string head_error;
-      if (ignis::mtp::prefill_chunk(*model, *pool, *seq, ids, final_residual, T, span_hidden_out, &head_error) != 0) {
+      if (ignis::mtp::prefill_chunk(*model, *pool, *seq, ids, final_residual, T, head_media, span_hidden_out,
+                                    &head_error) != 0) {
         set_error("ignis_program_prefill: chunk at span offset " + std::to_string(chunk_offset) + " (" +
                   std::to_string(num_tokens) + " tokens) for sequence slot " + std::to_string(seq->slot) +
                   " failed: " + head_error);
@@ -1738,8 +1766,18 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     multimodal.scatter = options->media_scatter_indices;
     multimodal.count = options->media_column_count;
     multimodal.first_column = options->media_first_column;
+    multimodal.previous = options->mrope_previous;
   }
   if (!validate_span_multimodal(model, route, multimodal)) {
+    return -1;
+  }
+  // GitHub #624: the MTP head's row before a span continuing a sequence is
+  // built from the span's first token, at a position no column of the span
+  // holds, so its axes come with the span.
+  if (model->drafter == IgnisDrafter::kMtp && multimodal.positions != nullptr && seq->position > 0 &&
+      multimodal.previous == nullptr) {
+    set_error("ignis_program_prefill: a multimodal span continuing a sequence on a load with the MTP head needs "
+              "mrope_previous, the axes its position before the span rotated at");
     return -1;
   }
   std::uint16_t *span_logits = options != nullptr ? options->out_span_logits : nullptr;
@@ -2485,17 +2523,27 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     // head's own hidden below the new frontier is written over. The host
     // arrays live until the synchronize below.
     std::vector<std::int32_t> head_rows;
+    // GitHub #624: on a vision load each row rotates at its position plus
+    // the lane's rope delta, as the chain's and the target's columns did.
+    std::vector<std::int32_t> head_rotation;
     if (mtp) {
       head_rows.resize(static_cast<std::size_t>(lane_columns) * batch_size);
+      if (!rope_positions.empty()) {
+        head_rotation.resize(head_rows.size());
+      }
       for (uint64_t i = 0; i < batch_size; ++i) {
         for (std::uint32_t j = 0; j < lane_columns; ++j) {
           head_rows[i * lane_columns + j] =
               base_positions[i] - 1 + std::min<std::int32_t>(static_cast<std::int32_t>(j), committed[i] - 1);
+          if (!head_rotation.empty()) {
+            head_rotation[i * lane_columns + j] = head_rows[i * lane_columns + j] + sequences[i]->rope_delta;
+          }
         }
       }
       std::string head_error;
       if (ignis::mtp::commit_rows(*model, *pool, static_cast<std::uint32_t>(batch_size), head_rows.data(),
-                                  committed.data(), &head_error) != 0) {
+                                  head_rotation.empty() ? nullptr : head_rotation.data(), committed.data(),
+                                  &head_error) != 0) {
         set_error("ignis_program_decode: " + head_error);
         return -1;
       }

@@ -57,6 +57,14 @@
 //!   that runs to the token budget, because a one-sentence answer is two or
 //!   three rounds and that is not a sample.
 //!
+//! GitHub #624: the same four checks on a load that drafts with the 27B's
+//! MTP head (`--spec-backend mtp`) in place of DFlash2: its chain and its
+//! commit rotate at the positions plus the sequence's rope delta, as the
+//! verify round's columns do, and its prefill wrote its rows at the image's
+//! positions (crates/core/tests/mtp_vision_gpu.rs holds those rows to the
+//! head's weights). The acceptance band printed is DFlash2's reference; the
+//! head's is measured on text by GitHub #625, so here it is a report only.
+//!
 //! BF16 KV throughout: it is the correctness oracle (ADR 0022).
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
@@ -122,7 +130,7 @@ struct Prompt {
     multimodal: Multimodal,
 }
 
-fn drafter_pool(slot_count: u32) -> SeqPool {
+fn drafter_pool(backend: SpeculativeBackend, slot_count: u32) -> SeqPool {
     SeqPool::create_with_speculation(
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {
@@ -133,9 +141,9 @@ fn drafter_pool(slot_count: u32) -> SeqPool {
             retained_slot_count: 0,
             retained_host_slot_count: 0,
         },
-        Some(SpeculativeBackend::Dflash2),
+        Some(backend),
     )
-    .unwrap_or_else(|e| panic!("seq pool create (dflash2): {e}"))
+    .unwrap_or_else(|e| panic!("seq pool create ({backend:?}): {e}"))
 }
 
 fn prompt_for(
@@ -439,7 +447,7 @@ fn assert_near_tie(
         verify.verify_pick,
         verify.ulp(),
     );
-    eprintln!("vision+dflash2 near-tie {judgement}");
+    eprintln!("near-tie {judgement}");
     assert!(
         verdict != Verdict::VerifyFault,
         "{judgement}: the verify shape, computed outside the round, sides with the decode round beyond the \
@@ -450,6 +458,18 @@ fn assert_near_tie(
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text() {
+    follows_an_image_prompt(SpeculativeBackend::Dflash2);
+}
+
+/// GitHub #624: the 27B's MTP head in place of DFlash2.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn the_mtp_head_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text() {
+    follows_an_image_prompt(SpeculativeBackend::Mtp);
+}
+
+fn follows_an_image_prompt(backend: SpeculativeBackend) {
+    let tag = format!("vision+{}", backend.as_str());
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("the real artifact is absent: {ARTIFACT}")) {
         return;
@@ -469,7 +489,7 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
     // --- AC 1: the two load options together -----------------------------
     // Today's load, the tower on the device (ADR 0075's `device`): the scope
     // is bound from the vision the model loads with, so the two agree.
-    let speculation = Speculation::new(SpeculativeBackend::Dflash2, WINDOW).expect("dflash2-7");
+    let speculation = Speculation::new(backend, WINDOW).expect("a 7-token window");
     let vision = Vision::default().with_residency(VisionResidency::Device);
     let (plan, handles) =
         bind_model_scope_27b_with(&reader, model_scope(Some(speculation), Some(vision), ExceptionWeights::Bf16))
@@ -486,7 +506,7 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
     let mut artifact = match materialize(&reader, &plan, &mut device, None) {
         Ok(a) => a,
         Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2 + vision: {e}")) {
+            if gpu_profile::skip_or_fail(&format!("materialize text + {backend:?} + vision: {e}")) {
                 return;
             }
             unreachable!("skip_or_fail panics under the profile");
@@ -503,20 +523,20 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
         Some(vision),
         RopeScaling::NONE,
     )
-    .unwrap_or_else(|e| panic!("ignis_model_load with vision and dflash2: {e}"));
+    .unwrap_or_else(|e| panic!("ignis_model_load with vision and {backend:?}: {e}"));
     let stats = model.stats();
     assert!(
         stats.vision_reserved_bytes > 0,
         "a vision load must still report its reservation with the drafter loaded beside it"
     );
     eprintln!(
-        "vision + dflash2 load: {} bound tensors, {:.2} GiB, vision reservation {:.2} MiB",
+        "{tag} load: {} bound tensors, {:.2} GiB, vision reservation {:.2} MiB",
         stats.bound_tensor_count,
         stats.vram_bytes as f64 / (1u64 << 30) as f64,
         stats.vision_reserved_bytes as f64 / (1u64 << 20) as f64
     );
 
-    let pool = drafter_pool(1);
+    let pool = drafter_pool(backend, 1);
     // Both rounds run through their captured graphs, which bake the address
     // the rotation positions are staged at (ADR 0019/0020).
     step::capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
@@ -537,7 +557,7 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
         let prompt = prompt_for(&frontend, &processor, canary, &canary.question);
         let item = &prompt.multimodal.media[0];
         eprintln!(
-            "vision+dflash2 canary {}: {} prompt tokens, image {}x{} patches ({} merged), rope_delta {}",
+            "{tag} canary {}: {} prompt tokens, image {}x{} patches ({} merged), rope_delta {}",
             canary.id,
             prompt.tokens.len(),
             item.grid.h,
@@ -567,12 +587,12 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
             let result = score_teacher_forced(&canary.id, &canary.expected, &predictions, FIRST_N);
             for m in &result.mismatches {
                 eprintln!(
-                    "vision+dflash2 canary {} position {}: ours={:?} reference={}",
+                    "{tag} canary {} position {}: ours={:?} reference={}",
                     result.id, m.position, m.predicted, m.expected
                 );
             }
             eprintln!(
-                "vision+dflash2 canary {}: teacher-forced agreement {}/{} = {:.1}%",
+                "{tag} canary {}: teacher-forced agreement {}/{} = {:.1}%",
                 result.id,
                 result.agree,
                 result.compared,
@@ -607,7 +627,7 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
                 .or_else(|| (off.len() != on.emitted.len()).then(|| off.len().min(on.emitted.len())));
             match divergence {
                 None => eprintln!(
-                    "vision+dflash2 {label}: the verify rounds' text equals the decode rounds' over {} tokens",
+                    "{tag} {label}: the verify rounds' text equals the decode rounds' over {} tokens",
                     off.len()
                 ),
                 Some(d) => {
@@ -626,15 +646,15 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
                         on.emitted.len()
                     );
                     eprintln!(
-                        "vision+dflash2 {label}: the two rounds part at token {d} ({} vs {}) -- probing",
+                        "{tag} {label}: the two rounds part at token {d} ({} vs {}) -- probing",
                         off[d], on.emitted[d]
                     );
-                    assert_near_tie(&model, &pool, prompt, &embedding, &off, &on, d, &label);
+                    assert_near_tie(&model, &pool, prompt, &embedding, &off, &on, d, &format!("{tag} {label}"));
                 }
             }
             for (index, round) in on.rounds.iter().enumerate() {
                 eprintln!(
-                    "vision+dflash2 {label} round {index}: accepted/drafted {}/{}",
+                    "{tag} {label} round {index}: accepted/drafted {}/{}",
                     round.committed - 1,
                     round.extent
                 );
@@ -652,7 +672,7 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
     let agree: usize = results.iter().map(|r| r.agree).sum();
     let compared: usize = results.iter().map(|r| r.compared).sum();
     eprintln!(
-        "vision+dflash2 canary OVERALL teacher-forced agreement {agree}/{compared} = {:.1}% (floor {:.0}%)",
+        "{tag} canary OVERALL teacher-forced agreement {agree}/{compared} = {:.1}% (floor {:.0}%)",
         overall * 100.0,
         G1_AGREEMENT_FLOOR * 100.0
     );
@@ -660,19 +680,19 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
     // make: no full-window round is no data, not an acceptance of zero.
     if full_rounds == 0 {
         eprintln!(
-            "vision+dflash2: NOT MEASURED -- no round reached the full {WINDOW}-token window, so \
+            "{tag}: NOT MEASURED -- no round reached the full {WINDOW}-token window, so \
              there is no acceptance to compare with the reference's band"
         );
     } else {
         let mean = committed_full as f64 / full_rounds as f64;
         eprintln!(
-            "vision+dflash2: {mean:.2} committed tokens per full-window round over {full_rounds} rounds \
+            "{tag}: {mean:.2} committed tokens per full-window round over {full_rounds} rounds \
              (reference band {:.2}-{:.2} at draft {WINDOW})",
             REFERENCE_BAND.0, REFERENCE_BAND.1
         );
         if mean < REFERENCE_BAND.0 {
             eprintln!(
-                "vision+dflash2: FINDING -- acceptance on the text after an image is below the reference's band"
+                "{tag}: FINDING -- acceptance on the text after an image is below the reference's band"
             );
         }
     }
@@ -692,7 +712,7 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
     );
     assert!(
         meets_g1_floor(overall),
-        "vision canary on a DFlash2 load: teacher-forced agreement {agree}/{compared} = {:.1}% < {:.0}%",
+        "vision canary on a {backend:?} load: teacher-forced agreement {agree}/{compared} = {:.1}% < {:.0}%",
         overall * 100.0,
         G1_AGREEMENT_FLOOR * 100.0
     );

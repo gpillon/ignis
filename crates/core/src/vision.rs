@@ -411,6 +411,15 @@ impl Multimodal {
             .collect()
     }
 
+    /// The three axes (temporal, height, width) of the prompt position
+    /// before `start`, or `None` at the prompt's first (GitHub #624): what a
+    /// span from `start` passes the leaf, whose MTP head rotates its row
+    /// there where the target's hidden at that position rotated.
+    pub fn axes_before(&self, start: usize) -> Option<[i32; 3]> {
+        let tokens = self.prompt_tokens();
+        (start > 0).then(|| std::array::from_fn(|axis| self.positions[axis * tokens + start - 1]))
+    }
+
     fn item_end(item: &MediaItem) -> usize {
         item.token_span.begin + item.token_span.count
     }
@@ -690,6 +699,16 @@ mod tests {
     fn span_positions_are_axis_major_slices() {
         let prompt = multimodal(5, Vec::new());
         assert_eq!(prompt.span_positions(1, 2), [1, 2, 1001, 1002, 2001, 2002]);
+    }
+
+    /// GitHub #624: the axes of the position before a span, the column the
+    /// prompt's positions hold there; none before the prompt's first.
+    #[test]
+    fn the_axes_before_a_span_are_the_prompts_column_before_it() {
+        let prompt = multimodal(5, Vec::new());
+        assert_eq!(prompt.axes_before(0), None);
+        assert_eq!(prompt.axes_before(1), Some([0, 1000, 2000]));
+        assert_eq!(prompt.axes_before(4), Some([3, 1003, 2003]));
     }
 
     #[test]

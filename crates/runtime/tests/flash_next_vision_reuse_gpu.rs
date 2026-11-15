@@ -187,7 +187,7 @@ impl Run<'_> {
             first_column: chunk.first_column,
             scatter_indices: &chunk.scatter_indices,
         });
-        let span = MultimodalSpan { positions: &positions, rope_delta: self.multimodal.rope_delta, media };
+        let span = MultimodalSpan { positions: &positions, rope_delta: self.multimodal.rope_delta, media, previous: None };
         let mut logits = self.logits();
         self.leaf
             .prefill_multimodal(

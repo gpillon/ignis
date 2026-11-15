@@ -1659,13 +1659,10 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     return nullptr;
   }
   out.decode_lanes = decode_lanes;
-  // GitHub #620: the 27B's own MTP head. Its prefill writes text positions,
-  // and a multimodal span's head rows are not built: vision and the head do
-  // not combine on one load yet. Its draft rule is the fixed draft's.
-  if (speculative_backend == IGNIS_SPECULATIVE_MTP && vision_max_tokens > 0) {
-    set_error("ignis_model_load: the 27B's MTP head does not combine with vision on one load yet");
-    return nullptr;
-  }
+  // GitHub #620: the 27B's own MTP head, whose draft rule is the fixed
+  // draft's. GitHub #624: it binds beside vision as DFlash2 does
+  // (kernel/src/mtp_head.h says how its rows rotate and embed on a vision
+  // load).
   if (speculative_backend == IGNIS_SPECULATIVE_MTP && draft_rule != IGNIS_DRAFT_RULE_FIXED) {
     set_error("ignis_model_load: the 27B's MTP head drafts its best token at every temperature, the fixed "
               "draft; draft_rule 1 (sampled) is DFlash2's");
@@ -2139,10 +2136,12 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
     // columns. Their attention takes the workspace the target's GQA layers
     // already hold at the same widths, so only the head's own buffers are
     // added (kernel/src/mtp_head.h); its weights are on the weights line and
-    // its state is the pool's.
-    sizes.prefill_scratch += ignis::mtp::prefill_scratch_bytes(g.hidden, static_cast<std::int64_t>(prefill_chunk_tokens));
-    sizes.decode_graph_scratch +=
-        ignis::mtp::round_scratch_bytes(g.hidden, static_cast<std::int64_t>(lanes) * round_columns);
+    // its state is the pool's. GitHub #624: on a vision load, its rows'
+    // rotation beside their positions.
+    sizes.prefill_scratch += ignis::mtp::prefill_scratch_bytes(
+        g.hidden, static_cast<std::int64_t>(prefill_chunk_tokens), options.vision_max_tokens > 0);
+    sizes.decode_graph_scratch += ignis::mtp::round_scratch_bytes(
+        g.hidden, static_cast<std::int64_t>(lanes) * round_columns, options.vision_max_tokens > 0);
     break;
   case IgnisDrafter::kHost:
   case IgnisDrafter::kNone:

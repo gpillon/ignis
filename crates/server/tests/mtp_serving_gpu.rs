@@ -103,8 +103,10 @@ const PROMPTS: [(&str, &str); 4] = [
 ];
 
 /// The greedy loads' flags: the operator's MTP choice, the 27B's vision off
-/// (the head does not draft beside it until GitHub #624), BF16 KV, no prompt
-/// reuse, a 16,384-token context on the card's whole budget.
+/// (a text-only load: images on the head's load are
+/// `vision_mixed_load_gpu.rs`'s and `vision_dflash2_gpu.rs`'s, GitHub #624),
+/// BF16 KV, no prompt reuse, a 16,384-token context on the card's whole
+/// budget.
 const GREEDY: [&str; 14] = [
     "--spec-backend", "mtp", "--qwen38-vision-enabled", "false", "--model-kv-format", "bf16", "--reuse-prompt", "off",
     "--model-max-context", "16384", "--model-idle-unload", "0", "--model-loop-guard", "off",

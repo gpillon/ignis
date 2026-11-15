@@ -540,6 +540,10 @@ pub struct MultimodalSpan<'a, M> {
     /// The media embedding the span's placeholder columns take, if the span
     /// covers any.
     pub media: Option<SpanMedia<'a, M>>,
+    /// GitHub #624: the axes the prompt position before the span rotated at
+    /// ([`Multimodal::axes_before`]), none for a span from the prompt's start:
+    /// the 27B's MTP head rotates its row there by them.
+    pub previous: Option<[i32; 3]>,
 }
 
 /// The placeholder columns of one media item a prefill span covers.
@@ -1595,6 +1599,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                 positions: &positions,
                 rope_delta: multimodal.rope_delta,
                 media: span_media,
+                previous: multimodal.axes_before(start as usize),
             },
             out_logits,
             attention,

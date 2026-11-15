@@ -229,15 +229,45 @@ drafter's temperature factor and top-p at any value, are refused by a flag or an
 head's own rule and is taken; the shortlist head is refused as it was, by either model's head. The effective
 configuration document of a head's load reads back to the same speculation.
 
-**Until #624 the head's load takes no vision, and says so.** Every built-in profile turns the 27B's vision on, so
-a served 27B load brings its tower by default, and the leaf refuses the head beside it (its chain and commit rotate
-at positions with no rope delta). The choice was between refusing such a load by name and loading it without vision.
-A load without vision fails where the operator does not look, at the first image a client sends, against a profile
-that promised images; a refusal fails at start, says which setting turned vision on (the profile's key, a switch's
-carry or the operator's flag) and names `--qwen38-vision-enabled false`, which turns the 27B's vision off and stops a
-switch carrying another model's. So the head's load refuses vision on, at start, on a switch and on a live change
-alike, wherever vision came from; a window of 0 binds no head and keeps vision. The check is one predicate in the
-configuration's fit, for #624 to take out.
+**The head drafts after images** (#624). Until then the head's load refused vision on, at start, on a switch and on
+a live change, by one predicate in the configuration's fit, because every built-in profile turns the 27B's vision on
+and a load quietly without it would fail at the first image a client sends; that predicate and the leaf's refusal are
+gone, and the head binds beside the tower under either residency, as DFlash2 does. Three things make the head's
+state right after an image.
+
+A row rotates where the target's hidden at its position did, and its key lands at the position itself, the KV
+index. Inside a multimodal span that is the position's three MRoPE axes (pair `i` at axis `i mod 3`, the text
+layers' rule); everywhere else, a text span, a plain round, a verify round, it is the position plus the sequence's
+rope delta, as the target's decode and verify columns rotate. The chain needs no buffer of its own for it: step `s`
+of a lane rotates at the verify round's own rotation of the lane's first column (`base + delta`, staged per round
+at the address its graphs read) less one, plus `s`; the commit's rows, built on the host, add the lane's delta; a
+plain round's row is its rotation position less one, as its KV row is its position less one.
+
+A row whose next token is an image placeholder embeds the image's column the target's embedding took there, not the
+placeholder id's row: Flash-Next's rule (#564), and what the head was trained beside, a trunk whose input at an
+image is the image. Because the entry at `p` is written by the step that consumes `x_{p+1}`, that column is always
+in the chunk that writes the row, so nothing like Flash-Next's continuation past a span ending inside an image is
+needed: the head's call copies the chunk's media columns into its embedding, from wherever the residency put the
+pool.
+
+The row before a span that continues a sequence (a scheduler chunk after the first, a claimant of a prefix that
+ends inside an image, a later turn) is built from the span's first token, at a position no column of the span
+holds, and the sequence cannot say where that position rotated: its rope delta is the whole prompt's, set after
+each span, and a prefix's image carries none. Keeping that position's axes as sequence state would make them a
+section that every move carries; the caller already holds the whole prompt's positions. So the span names them:
+`ignis_prefill_options::mrope_previous` (the options grow from 240 to 248 bytes), the prompt's column before the
+span (`Multimodal::axes_before`), refused NULL on a multimodal span that continues a sequence on the head's load and
+unread everywhere else. A prompt cut into spans a chunk each leaves the head's rows of the same prompt as one span,
+bit for bit.
+
+What vision adds to the head's plan is those rotations: a multimodal chunk's head call takes three I32 axes a row in
+place of one (1,024 bytes at its 128 rows, inside the arena the encoder usually sizes), and the round scratch one
+I32 a column of the widest round. A text-only head load's lines are what they were, to the byte. Held on the card
+(BF16, number.png, rope delta -182): the prompt's rows at and around the image within the f64 bounds (keys 0.0037,
+values 0.0031), the placeholder ids' embeddings and the KV positions' rotation far outside them (values 0.33, keys
+0.26); the frontier's hidden 0.0056 and the chain's first scores 0.0050; the first verify round after the image
+drafted its whole window and committed all of it, and its commit's rows and the plain round's row after it stand
+within the bounds where the bare positions' rotation lands at 0.49 and 0.50.
 
 **What admission keeps back is held by the plan's floor.** The scheduler bounds the holders' copies rather than
 tracking them (#622, above): the ledger charges a prefix its whole pages and each holder the pages past them; a live

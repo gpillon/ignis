@@ -525,8 +525,10 @@ impl Speculation {
     /// rounded to the arena's alignment.
     ///
     /// The 27B's MTP head writes its rows over the chunk in calls of at most
-    /// [`crate::mtp_head::PREFILL_ROWS`] rows ([`crate::mtp_head::prefill_scratch_bytes`]).
-    pub fn prefill_scratch_bytes(&self, prefill_chunk_tokens: u32) -> u64 {
+    /// [`crate::mtp_head::PREFILL_ROWS`] rows ([`crate::mtp_head::prefill_scratch_bytes`]),
+    /// at three rotation axes a row on a load with `vision` (GitHub #624);
+    /// DFlash2's taps are the same with or without it.
+    pub fn prefill_scratch_bytes(&self, prefill_chunk_tokens: u32, vision: bool) -> u64 {
         match self.backend {
             SpeculativeBackend::Dflash2 => {
                 let bf16 = |elements: u64| (elements * 2).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
@@ -542,7 +544,7 @@ impl Speculation {
                     + bf16((DFLASH2_QUERY_SIZE + 2 * kv_width) * columns)
                     + 3 * bf16(kv_width * columns)
             }
-            SpeculativeBackend::Mtp => crate::mtp_head::prefill_scratch_bytes(prefill_chunk_tokens),
+            SpeculativeBackend::Mtp => crate::mtp_head::prefill_scratch_bytes(prefill_chunk_tokens, vision),
             // No drafter bound, nothing tapped (P5-04, GitHub #153).
             SpeculativeBackend::VerifyOnly => 0,
         }
@@ -552,12 +554,14 @@ impl Speculation {
     /// `decode_graph` line, at `decode_lanes` lanes: the 27B's MTP head's
     /// buffers over the widest round's `lanes * (k + 1)` columns (GitHub #620,
     /// [`crate::mtp_head::round_scratch_bytes`]), which every round runs the
-    /// head in. DFlash2's round has its own line ([`Self::round_scratch_bytes`]).
-    pub fn decode_round_bytes(&self, decode_lanes: u32) -> u64 {
+    /// head in, with the rows' rotation on a load with `vision` (GitHub #624).
+    /// DFlash2's round has its own line ([`Self::round_scratch_bytes`]).
+    pub fn decode_round_bytes(&self, decode_lanes: u32, vision: bool) -> u64 {
         match self.backend {
-            SpeculativeBackend::Mtp => {
-                crate::mtp_head::round_scratch_bytes(u64::from(decode_lanes) * u64::from(self.draft_tokens + 1))
-            }
+            SpeculativeBackend::Mtp => crate::mtp_head::round_scratch_bytes(
+                u64::from(decode_lanes) * u64::from(self.draft_tokens + 1),
+                vision,
+            ),
             SpeculativeBackend::Dflash2 | SpeculativeBackend::VerifyOnly => 0,
         }
     }
@@ -675,19 +679,19 @@ mod tests {
     #[test]
     fn each_drafter_reserves_its_own_state_and_the_verify_substrate_none() {
         let spec = Speculation::new(SpeculativeBackend::VerifyOnly, 3).expect("in range");
-        assert_eq!((spec.drafter_state_bytes(4), spec.prefill_scratch_bytes(1024), spec.round_scratch_bytes(4)), (0, 0, 0));
-        assert_eq!((spec.decode_round_bytes(4), spec.hq_residual_window_bytes(crate::KvFormat::HqE8_2b)), (0, 0));
+        assert_eq!((spec.drafter_state_bytes(4), spec.prefill_scratch_bytes(1024, false), spec.round_scratch_bytes(4)), (0, 0, 0));
+        assert_eq!((spec.decode_round_bytes(4, false), spec.hq_residual_window_bytes(crate::KvFormat::HqE8_2b)), (0, 0));
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 3).expect("in range");
-        assert!(spec.drafter_state_bytes(4) > 0 && spec.prefill_scratch_bytes(1024) > 0 && spec.round_scratch_bytes(4) > 0);
-        assert_eq!((spec.decode_round_bytes(4), spec.hq_residual_window_bytes(crate::KvFormat::HqE8_2b)), (0, 0));
+        assert!(spec.drafter_state_bytes(4) > 0 && spec.prefill_scratch_bytes(1024, false) > 0 && spec.round_scratch_bytes(4) > 0);
+        assert_eq!((spec.decode_round_bytes(4, false), spec.hq_residual_window_bytes(crate::KvFormat::HqE8_2b)), (0, 0));
         // GitHub #620: the 27B's MTP head keeps a continuation hidden per
         // slot, its layer in the hq window, and its buffers in a prefill chunk
         // and a round; it has no drafter round of its own.
         let spec = Speculation::new(SpeculativeBackend::Mtp, 3).expect("in range");
         assert_eq!(spec.drafter_state_bytes(4), 4 * 10_240);
-        assert_eq!(spec.prefill_scratch_bytes(1024), crate::mtp_head::prefill_scratch_bytes(1024));
+        assert_eq!(spec.prefill_scratch_bytes(1024, false), crate::mtp_head::prefill_scratch_bytes(1024, false));
         assert_eq!(spec.round_scratch_bytes(4), 0);
-        assert_eq!(spec.decode_round_bytes(4), crate::mtp_head::round_scratch_bytes(16));
+        assert_eq!(spec.decode_round_bytes(4, false), crate::mtp_head::round_scratch_bytes(16, false));
         assert_eq!(spec.hq_residual_window_bytes(crate::KvFormat::HqE8_2b), 2_228_288);
         assert_eq!(spec.hq_residual_window_bytes(crate::KvFormat::Bf16), 0);
     }
@@ -828,7 +832,7 @@ mod tests {
         assert_eq!(spec.draft_tokens(), 7);
         assert_eq!(spec.backend().abi_code(), 2);
         assert_eq!(spec.drafter_state_bytes(8), 0, "no drafter, no window pool");
-        assert_eq!(spec.prefill_scratch_bytes(128), 0, "no drafter, no prefill taps");
+        assert_eq!(spec.prefill_scratch_bytes(128, false), 0, "no drafter, no prefill taps");
         assert_eq!(spec.round_scratch_bytes(8), 0, "no drafter, no round scratch");
         let err = Speculation::new(SpeculativeBackend::VerifyOnly, 8).expect_err("out of range");
         assert!(err.contains("1..7"), "{err}");
@@ -853,10 +857,10 @@ mod tests {
         // 128 columns, worked by hand: taps 6,553,600 + positions 512 + two
         // scalars 256 each + projected and context 1,310,720 each + qkv
         // 1,572,864 + key_raw, key, value 262,144 each.
-        assert_eq!(spec.prefill_scratch_bytes(128), 11_535_360);
+        assert_eq!(spec.prefill_scratch_bytes(128, false), 11_535_360);
         // A chunk wider than the window taps at most the window.
-        assert_eq!(spec.prefill_scratch_bytes(4096), spec.prefill_scratch_bytes(2048));
-        assert!(spec.prefill_scratch_bytes(1024) < spec.prefill_scratch_bytes(2048));
+        assert_eq!(spec.prefill_scratch_bytes(4096, false), spec.prefill_scratch_bytes(2048, false));
+        assert!(spec.prefill_scratch_bytes(1024, false) < spec.prefill_scratch_bytes(2048, false));
     }
 
     #[test]

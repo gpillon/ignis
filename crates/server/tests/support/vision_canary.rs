@@ -89,6 +89,7 @@ pub fn prefill_prompt(
     while start < total {
         let len = prompt.cap_chunk(start, chunk.min(total - start));
         let positions = prompt.span_positions(start as usize, len as usize);
+        let previous = prompt.axes_before(start as usize);
         let media = prompt.chunk_media(start, len);
         let last = start + len == total;
         step::prefill_program_multimodal(
@@ -114,6 +115,7 @@ pub fn prefill_prompt(
                     first_column: media.first_column,
                     scatter_indices: &media.scatter_indices,
                 }),
+                previous: previous.as_ref(),
             },
             if last { Some(&mut *logits) } else { None },
             None,

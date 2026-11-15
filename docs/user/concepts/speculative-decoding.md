@@ -100,7 +100,7 @@ spec-off text up to near-ties, and sampling keeps its distribution.
 | A shared prefix | shared as on any load | each holder keeps its own copy of the prefix's last page, which the VRAM plan holds beside the context |
 | Draft rule | the sampled draft (default) or the fixed draft | the fixed draft only |
 | Draft tokens | 1 to 7, required | 0 to 7, default 7; 0 loads no speculation |
-| Images | drafts after them | not yet: an MTP load refuses vision on |
+| Images | drafts after them | drafts after them |
 
 What the choice moves is how the card's memory splits between the drafter and
 the KV pool, how much a prefill and a round cost, and how many tokens a round
@@ -178,11 +178,11 @@ one, up to the draft window.
   DFlash2's own settings are refused by name on an MTP load: the shortlist
   head, `--spec-draft-rule sampled`, and the drafter's temperature factor and
   top-p ([context, KV and speculation](../configuration/context-and-speculation.md)).
-- **No images yet.** Every built-in profile turns the 27B's vision on, and the
-  head does not draft after an image yet, so an MTP start with vision on is
-  refused, naming where vision came from and
-  `--qwen38-vision-enabled false`, which turns it off for the 27B alone; a
-  model switch to the 27B with vision on is refused the same way.
+- **Images.** The head drafts after an image, with vision on as every
+  built-in profile turns it on, under either vision residency. Where the next
+  token is an image placeholder, the head takes the image's row the model
+  itself took there, and it reads the image's positions as the model does, so
+  the text after the image is drafted as text is.
 - **Everything else is a DFlash2 load's.** Prompt reuse, retained slots,
   KV-RAM and KV-disk carry the head's state with the sequence, and a blob
   written by one drafter is refused by another, by name, and prefilled again.

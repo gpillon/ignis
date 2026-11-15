@@ -30,6 +30,15 @@
 // continuation hidden. A prefill's first chunk has no row at -1. A verify
 // round (GitHub #621) is such a step over its committed run; its chain's own
 // rows are scratch (below, "the head in a verify round").
+//
+// GitHub #624: on a vision load a row rotates where the target's hidden at its
+// position did -- inside a multimodal span at that position's three MRoPE axes,
+// past it at the position plus the sequence's rope delta, as the target's
+// decode and verify rounds do -- while its key lands at the position itself,
+// the KV index. A row whose next token is an image placeholder embeds the
+// image's column the target's embedding took for it (Flash-Next's rule, GitHub
+// #564): the entry at `p` is written by the step that consumes `x_{p+1}`, so
+// that column is always in the chunk that writes the row.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -43,6 +52,7 @@
 struct ignis_model;
 struct ignis_seq_pool;
 struct ignis_seq;
+struct ignis_media_embedding;
 
 namespace ignis::mtp {
 
@@ -69,13 +79,32 @@ std::size_t call_bytes(std::int64_t hidden, std::int64_t rows);
 
 // What a prefill chunk of `chunk` tokens adds to the program scratch on an MTP
 // load: one call of at most kPrefillRows rows, its input hiddens and
-// embeddings, and the continuation hidden's readout room. The CPU plan
-// restates it (crates/core/src/mtp_head.rs).
-std::size_t prefill_scratch_bytes(std::int64_t hidden, std::int64_t chunk);
+// embeddings, and the continuation hidden's readout room; on a load with
+// vision (GitHub #624) a multimodal chunk's rows rotate at three axes, not
+// one. The CPU plan restates it (crates/core/src/mtp_head.rs).
+std::size_t prefill_scratch_bytes(std::int64_t hidden, std::int64_t chunk, bool vision);
 
 // What a round of `columns` columns adds to the decode-round scratch on an MTP
-// load: one call over every column, its inputs and its positions.
-std::size_t round_scratch_bytes(std::int64_t hidden, std::int64_t columns);
+// load: one call over every column, its inputs and its positions; on a load
+// with vision (GitHub #624) the rows' rotation beside their positions.
+std::size_t round_scratch_bytes(std::int64_t hidden, std::int64_t columns, bool vision);
+
+// GitHub #624: what a multimodal chunk gives the head's rows. The default is a
+// text chunk's: its rows rotate at their positions plus the sequence's rope
+// delta and embed their next tokens' ids.
+struct ChunkMultimodal {
+  // Host I32 axis-major [3, tokens + 1]: the axes (temporal, height, width)
+  // the chunk's positions rotate at, from the one before it -- entry 0 the
+  // position before the chunk (unread on a prompt's first chunk), entry j + 1
+  // the chunk's column j. Null on a text chunk.
+  const std::int32_t *axes = nullptr;
+  // The chunk's media columns: chunk column `scatter[i]` (host, chunk-
+  // relative, ascending) took column `first_column + i` of `media`.
+  const ignis_media_embedding *media = nullptr;
+  const std::int32_t *scatter = nullptr;
+  std::int32_t count = 0;
+  std::int32_t first_column = 0;
+};
 
 // The head over a prefill chunk of `tokens` columns of `seq`, which stands at
 // the chunk's start: `ids` (device I32 [tokens]) are the chunk's tokens and
@@ -83,18 +112,22 @@ std::size_t round_scratch_bytes(std::int64_t hidden, std::int64_t columns);
 // Writes the head's rows the chunk licenses and the continuation hidden of the
 // chunk's last column. With `span_hidden` (host BF16 [tokens][hidden], or null)
 // it also copies out the target's post-final-norm hidden of every column --
-// the readout `ignis_prefill_options::out_span_hidden`. Enqueue only, on the
-// model's stream, from `model.scratch`. 0, or -1 with `*error` set.
+// the readout `ignis_prefill_options::out_span_hidden`. `multimodal` is a
+// multimodal chunk's axes and media (GitHub #624), its host arrays alive until
+// the stream synchronizes. Enqueue only, on the model's stream, from
+// `model.scratch`. 0, or -1 with `*error` set.
 int32_t prefill_chunk(ignis_model &model, ignis_seq_pool &pool, ignis_seq &seq, const ninfer::Tensor &ids,
-                      const ninfer::Tensor &final_residual, std::int32_t tokens, std::uint16_t *span_hidden,
-                      std::string *error);
+                      const ninfer::Tensor &final_residual, std::int32_t tokens, const ChunkMultimodal &multimodal,
+                      std::uint16_t *span_hidden, std::string *error);
 
 // The head over a plain decode round of `width` lanes, graph-safe: each lane's
 // row at its position less one, from its continuation hidden and the token
 // the round consumes (`model.decode_graph_token_ids`), its slot from
 // `model.decode_graph_slots`; then each lane's continuation hidden becomes
-// `normalized` (BF16 [hidden, width]: the round's post-final-norm hidden).
-// Enqueue only, from `model.decode_graph_scratch`. 0, or -1 with `*error`.
+// `normalized` (BF16 [hidden, width]: the round's post-final-norm hidden). On
+// a vision load the rows rotate at the round's rotation positions less one
+// (`model.decode_rope_positions`: position + rope delta). Enqueue only, from
+// `model.decode_graph_scratch`. 0, or -1 with `*error`.
 int32_t decode_round(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, const ninfer::Tensor &normalized,
                      std::string *error);
 
@@ -147,7 +180,9 @@ RoundRows round_rows(std::uint64_t base, std::uint32_t extent, std::uint32_t com
 // The chain over the round's `width` lanes, from the verify round's staging
 // (`IgnisVerifyRound`: anchors, base positions, extents; the round's slots in
 // `model.decode_graph_slots`): every lane's drafts into `verify.drafts`
-// (I32 [k, width], lane-major), its steps at width `width`. Graph-safe;
+// (I32 [k, width], lane-major), its steps at width `width`. On a vision load
+// step s rotates at the lane's first column's rotation position less one,
+// plus s (`verify.rope_positions`: base + rope delta). Graph-safe;
 // scratch from `model.decode_graph_scratch` in its own scope, the step's
 // scores in `verify.logits` (which the pass writes again after it). Enqueue
 // only. 0, or -1 with `*error`.
@@ -163,13 +198,14 @@ int32_t propose(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, s
 
 // The commit's rows, eager, after the round's pass: lane b's rows at
 // `positions[b * (k + 1) + j]` (host I32 [k + 1, width]: base_b - 1 + min(j,
-// committed_b - 1)), its first `committed[b]` (host I32 [width]) columns
-// valid, from the round's own `verify.hidden` and `verify.verify_ids`. Both
-// host arrays stay alive until the stream synchronizes. Only the rows' keys
-// and values: the head's hidden at a committed row is no draft's. 0, or -1
-// with `*error`.
+// committed_b - 1)), rotated at `rotation` (the same shape, each position
+// plus the lane's rope delta, GitHub #624; or null: at the positions), its
+// first `committed[b]` (host I32 [width]) columns valid, from the round's own
+// `verify.hidden` and `verify.verify_ids`. The host arrays stay alive until
+// the stream synchronizes. Only the rows' keys and values: the head's hidden
+// at a committed row is no draft's. 0, or -1 with `*error`.
 int32_t commit_rows(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, const std::int32_t *positions,
-                    const std::int32_t *committed, std::string *error);
+                    const std::int32_t *rotation, const std::int32_t *committed, std::string *error);
 
 // Each lane's continuation hidden from the run's last committed column,
 // `verify.selected_hidden` (the pre-norm residual the commit selected),
@@ -182,9 +218,15 @@ namespace detail {
 
 // Step `step` of the chain: lane b's row `positions[b]` = base[b] - 1 + step
 // and `valid[b]` = 1 when the lane needs that step (step < extents[b]); 0
-// and 0 (the masked form's empty row) otherwise.
+// and 0 (the masked form's empty row) otherwise. With `rope_positions` (I32
+// [lane_columns, batch], a vision load's, GitHub #624) the row's rotation
+// too: `rotation[b]` = rope_positions[b * lane_columns] - 1 + step where the
+// lane needs the step, 0 otherwise; without, `rotation` is left unwritten
+// (the rows rotate at `positions`).
 void chain_rows(const std::int32_t *base_positions, const std::int32_t *extents, std::int32_t step,
-                std::int32_t *positions, std::int32_t *valid, std::int32_t batch, cudaStream_t stream);
+                std::int32_t *positions, std::int32_t *valid, std::int32_t batch, cudaStream_t stream,
+                const std::int32_t *rope_positions = nullptr, std::int32_t lane_columns = 0,
+                std::int32_t *rotation = nullptr);
 
 // drafts[b * window + step] = tokens[b].
 void write_drafts(const std::int32_t *tokens, std::int32_t *drafts, std::int32_t window, std::int32_t step,

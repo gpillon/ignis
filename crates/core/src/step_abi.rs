@@ -144,6 +144,11 @@ pub struct IgnisPrefillOptions {
     /// (host BF16 `[tokens][hidden]`), what the head's rows read. Null in
     /// every serving call.
     pub out_span_hidden: *mut u16,
+    /// GitHub #624: the three axes (temporal, height, width) the position
+    /// before a multimodal span rotated at, or null. A 27B load built for the
+    /// MTP head needs them on a multimodal span that continues a sequence: the
+    /// head's row there rotates where the target's hidden did.
+    pub mrope_previous: *const i32,
 }
 
 /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -172,12 +177,14 @@ mod tests {
 
     /// GitHub #520: `keeps_draw` filled the tail padding after
     /// `next_prompt_token`, so `size` alone no longer tells the layout before
-    /// it from the layout after; GitHub #287's `keeps_scores` follows it, and
-    /// GitHub #620's `out_span_hidden` them. The leaf pins the same numbers
+    /// it from the layout after; GitHub #287's `keeps_scores` follows it,
+    /// GitHub #620's `out_span_hidden` them and GitHub #624's
+    /// `mrope_previous` that. The leaf pins the same numbers
     /// (kernel/include/ignis_step.h), as for the decode options.
     #[test]
     fn the_prefill_options_mirror_is_the_leaf_structs_layout() {
-        assert_eq!(std::mem::size_of::<IgnisPrefillOptions>(), 240);
+        assert_eq!(std::mem::size_of::<IgnisPrefillOptions>(), 248);
+        assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, mrope_previous), 240);
         assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, out_reasoning_redirected), 200);
         assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, drafter_floor), 208);
         assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, next_prompt_token), 216);

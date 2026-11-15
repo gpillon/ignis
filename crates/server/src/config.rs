@@ -1318,7 +1318,7 @@ fn derive(
     let mut model = s.model.id.clone().unwrap_or_else(|| DEFAULT_MODEL.to_owned());
     let mut speculation = speculation;
     if let (true, Some(family)) = (family_checks, family) {
-        let fitted = FamilyFit { model: &mut model, speculation: &mut speculation, vision: vision.is_some(), dropped: &mut dropped };
+        let fitted = FamilyFit { model: &mut model, speculation: &mut speculation, dropped: &mut dropped };
         fit_family(fitted, &resolution, family, fit, &spelled)?;
     }
     let rope_scaling = s.model.rope_scaling.resolve(s.model.max_context).map_err(|e| {
@@ -1479,12 +1479,10 @@ pub fn log_source(config: &Config) {
 }
 
 /// The values [`fit_family`] may change: the served id, the speculation a
-/// switch drops, and the list of what it dropped; and whether the load has
-/// vision, which the 27B's MTP head does not draft beside yet (GitHub #623).
+/// switch drops, and the list of what it dropped.
 struct FamilyFit<'a> {
     model: &'a mut String,
     speculation: &'a mut Option<Speculation>,
-    vision: bool,
     dropped: &'a mut Vec<String>,
 }
 
@@ -1993,9 +1991,8 @@ pub fn log_vision_options(config: &Config) {
 /// model that loads is judged as it is named, on a switch as at start (a
 /// bound, not a drop): Flash-Next's head drafts 1 to 7 tokens, so a window of
 /// 0, the 27B's no-speculation load, is refused there; the 27B's MTP load
-/// refuses DFlash2's own settings where the operator named them, and, until
-/// the head drafts beside images (GitHub #624), vision on, wherever vision
-/// came from (a profile, a switch's carry, the operator).
+/// refuses DFlash2's own settings where the operator named them. It takes
+/// vision as DFlash2's does (GitHub #624).
 fn fit_family(
     fitted: FamilyFit<'_>,
     resolution: &Resolution,
@@ -2045,15 +2042,6 @@ fn fit_family(
             }
             ModelFamily::Qwen38_27b => {
                 refuse_dflash2s_settings_under_mtp(resolution, spelled)?;
-                // GitHub #623: one predicate, for #624 to take out.
-                if fitted.vision && fitted.speculation.is_some() {
-                    return Err(ConfigError(format!(
-                        "`{} mtp`: the 27B's MTP head does not draft beside vision yet, and vision is on for it                          (`{}`): turn it off for the 27B with `{} false`",
-                        spelled("spec", "backend"),
-                        spelled("vision", "enabled"),
-                        schema::field("vision", "enabled").expect("declared").scoped_flag(ModelFamily::Qwen38_27b)
-                    )));
-                }
             }
             _ => {}
         }

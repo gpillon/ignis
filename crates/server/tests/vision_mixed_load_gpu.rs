@@ -30,6 +30,14 @@
 //! recorded by a tracing layer: that the evicted and the restored request
 //! are that Agent request, not a re-prefill, and that the drafter drafted.
 //!
+//! GitHub #624: the same load drafting with the 27B's MTP head in place of
+//! DFlash2 (`--spec-backend mtp`) runs the same three parts and is held to the
+//! same: the head drafts after the images, the swatch siblings each name their
+//! own colour while sharing their system prompt's pages, and the Agent image
+//! request comes back from KV-RAM with the head's state and drafts again. Its
+//! pool is the head's one context too, its pages a seventeenth layer larger,
+//! with the pages the head's holders copy beside it (ADR 0095).
+//!
 //! Sane, not token-identical: a decode round's width is part of its
 //! numerics (`cuda_leaf_vision_gpu.rs`'s module doc). hq-e8-2b, the serving
 //! default, since nothing here carries a derived tolerance.
@@ -57,8 +65,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
 use ignis_artifact::{FrontendSet, Reader};
+use ignis_core::compute::{ModelConfig, ModelFamily};
 use ignis_core::gpu_profile;
-use ignis_core::{KvFormat, KvGeometry, Speculation, SpeculativeBackend, Vision};
+use ignis_core::{KvFormat, Speculation, SpeculativeBackend, Vision};
 use ignis_server::artifact_template::ArtifactTemplateProvider;
 use ignis_server::engine::Engine;
 use ignis_server::media::{load_processor, MediaAcquirer, MediaPolicy};
@@ -126,13 +135,18 @@ const RETAINED_SLOTS: u32 = 2;
 /// The KV pool's byte budget: exactly one `MAX_CONTEXT` sequence of hq pages,
 /// so a request reserving the whole context can only run alone — plus the
 /// page each retained slot's checkpoint may keep, which the VRAM plan requires
-/// beside that sequence (GitHub #215).
-fn one_context_pool_bytes() -> u64 {
-    let tail_tokens = RETAINED_SLOTS * ignis_runtime::KV_PAGE_TOKENS;
-    KvFormat::HqE8_2b.bytes_per_token(KvGeometry::qwen38_27b()) * u64::from(MAX_CONTEXT + tail_tokens)
+/// beside that sequence (GitHub #215), and on the MTP head's load the page
+/// each of its `lanes` and retained slots may copy as a holder (GitHub #623):
+/// the plan's floor, in the pages of `backend`'s pool.
+fn one_context_pool_bytes(backend: SpeculativeBackend, lanes: u32) -> u64 {
+    let cfg = ModelConfig::qwen38_27b();
+    let pages = MAX_CONTEXT / ignis_runtime::KV_PAGE_TOKENS
+        + RETAINED_SLOTS
+        + ignis_core::seq::holder_page_reserve(&cfg, Some(backend), lanes, RETAINED_SLOTS);
+    KvFormat::HqE8_2b.page_bytes(ignis_core::seq::kv_geometry(&cfg, Some(backend))) * u64::from(pages)
 }
 
-fn harness() -> Option<Harness> {
+fn harness(backend: SpeculativeBackend) -> Option<Harness> {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return None;
@@ -141,18 +155,19 @@ fn harness() -> Option<Harness> {
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
     let eos = frontend.eos_token_id().expect("eos");
     let vision = Vision::default();
-    let shape = EngineShape {
+    let mut shape = EngineShape {
         prefill_chunk: PREFILL_CHUNK,
         max_context: MAX_CONTEXT,
         kv_format: KvFormat::HqE8_2b,
-        kv_pool: Some(ignis_core::KvPoolSize::Bytes(one_context_pool_bytes())),
         prompt_reuse: true,
         retained_device_slots: RETAINED_SLOTS,
         retained_host_slots: 0,
-        speculation: Some(Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7")),
+        speculation: Some(Speculation::new(backend, 7).expect("a 7-token window")),
         vision: Some(vision),
         ..EngineShape::default()
     };
+    let lanes = shape.decode_lanes_for(ModelFamily::Qwen38_27b);
+    shape.kv_pool = Some(ignis_core::KvPoolSize::Bytes(one_context_pool_bytes(backend, lanes)));
     // GitHub #210: the reservations beside the scheduler are for `/metrics`,
     // which this test does not read.
     let scheduler = match cuda_scheduler(path, MODEL.into(), eos, shape) {
@@ -264,6 +279,26 @@ impl<S: tracing::Subscriber> Layer<S> for RequestLog {
 impl RequestLog {
     fn named(&self, name: &str) -> Vec<Logged> {
         self.0.lock().unwrap().iter().filter(|e| e.name == name).cloned().collect()
+    }
+
+    /// The one log of this binary, installed with its subscriber on first
+    /// use and emptied for each test: the tests run one at a time, a load each.
+    fn fresh() -> Self {
+        static LOG: std::sync::OnceLock<RequestLog> = std::sync::OnceLock::new();
+        let log = LOG
+            .get_or_init(|| {
+                let log = RequestLog::default();
+                tracing_subscriber::registry()
+                    .with(tracing_subscriber::filter::LevelFilter::INFO)
+                    .with(tracing_subscriber::fmt::layer())
+                    .with(log.clone())
+                    .try_init()
+                    .expect("this test binary installs the only subscriber");
+                log
+            })
+            .clone();
+        log.0.lock().unwrap().clear();
+        log
     }
 }
 
@@ -441,16 +476,21 @@ async fn metric(metrics: &Router, name: &str) -> f64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn an_agentic_load_with_images_by_url_keeps_every_lane_sane() {
+    agentic_load_with_images(SpeculativeBackend::Dflash2).await;
+}
+
+/// GitHub #624: the same on a load that drafts with the 27B's MTP head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn on_an_mtp_load_an_agentic_load_with_images_by_url_keeps_every_lane_sane() {
+    agentic_load_with_images(SpeculativeBackend::Mtp).await;
+}
+
+async fn agentic_load_with_images(backend: SpeculativeBackend) {
     // The request log, printed for the profile's output and recorded for the
     // assertions below.
-    let log = RequestLog::default();
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::filter::LevelFilter::INFO)
-        .with(tracing_subscriber::fmt::layer())
-        .with(log.clone())
-        .try_init()
-        .expect("this test binary installs the only subscriber");
-    let Some(h) = harness() else { return };
+    let log = RequestLog::fresh();
+    let Some(h) = harness(backend) else { return };
     let images = image_server().await;
     let number = format!("{images}/number.png");
 
@@ -531,7 +571,8 @@ async fn an_agentic_load_with_images_by_url_keeps_every_lane_sane() {
     assert_eq!(ids("ignis.request.evicted"), agents, "the Agent image request is the one evicted");
     assert_eq!(ids("ignis.request.restored"), agents, "and restored from its blob, not re-prefilled");
     let agent_drafted = done.iter().find(|e| e.request_id == Some(agents[0])).and_then(|e| e.drafted);
-    assert!(agent_drafted.is_some_and(|n| n > 0), "DFlash2 drafted for the restored request: {agent_drafted:?}");
+    eprintln!("{backend:?}: the restored request drafted {agent_drafted:?}");
+    assert!(agent_drafted.is_some_and(|n| n > 0), "{backend:?} drafted for the restored request: {agent_drafted:?}");
     assert!(done.iter().all(|e| e.drafted.is_some()), "every request ran speculative rounds: {done:?}");
 
     // GitHub #444: moved for the intruder, the image request generated what
@@ -542,7 +583,7 @@ async fn an_agentic_load_with_images_by_url_keeps_every_lane_sane() {
     // KV-RAM, short of the restore floor and so neither claimed nor captured
     // again, and its prefill would not be cut at the opener.
     drop(h);
-    let Some(h) = harness() else { return };
+    let Some(h) = harness(backend) else { return };
     let unmoved = Stream::start(h.app(), "agent image, unmoved", image(&number, AGENT_QUESTION, 160, "agent"));
     let unmoved = unmoved.finish().await;
     assert_eq!(unmoved.text, agent.text, "the moved image request generated what it generates unmoved");

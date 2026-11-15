@@ -662,6 +662,7 @@ impl StepLeaf for CudaLeaf {
                     first_column: media.first_column,
                     scatter_indices: media.scatter_indices,
                 }),
+                previous: span.previous.as_ref(),
             },
             out_logits,
             readout,

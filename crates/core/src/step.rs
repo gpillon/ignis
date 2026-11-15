@@ -672,6 +672,7 @@ impl PrefillRoute {
             keeps_draw: 0,
             keeps_scores: 0,
             out_span_hidden: std::ptr::null_mut(),
+            mrope_previous: std::ptr::null(),
         }
     }
 }
@@ -962,19 +963,79 @@ pub fn prefill_program_span_hidden(
     out_span_hidden: &mut [u16],
     out_logits: Option<&mut [f32]>,
 ) -> Result<(), String> {
+    span_hidden_prefill(
+        "prefill_program_span_hidden",
+        model,
+        pool,
+        sequence,
+        token_ids,
+        start_position,
+        next_prompt_token,
+        None,
+        out_span_hidden,
+        out_logits,
+    )
+}
+
+/// GitHub #624: [`prefill_program_span_hidden`] over a span of a multimodal
+/// prompt, as [`prefill_program_multimodal`] takes it (`span`: its axes, its
+/// media columns and the axes before it): the hiddens the head's rows at an
+/// image's positions are built from. A measurement beside the program.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_program_multimodal_span_hidden(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    next_prompt_token: Option<TokenId>,
+    span: MultimodalPrefill<'_>,
+    out_span_hidden: &mut [u16],
+    out_logits: Option<&mut [f32]>,
+) -> Result<(), String> {
+    span_hidden_prefill(
+        "prefill_program_multimodal_span_hidden",
+        model,
+        pool,
+        sequence,
+        token_ids,
+        start_position,
+        next_prompt_token,
+        Some(span),
+        out_span_hidden,
+        out_logits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn span_hidden_prefill(
+    what: &str,
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    next_prompt_token: Option<TokenId>,
+    span: Option<MultimodalPrefill<'_>>,
+    out_span_hidden: &mut [u16],
+    out_logits: Option<&mut [f32]>,
+) -> Result<(), String> {
     let hidden = crate::compute::ModelConfig::qwen38_27b().hidden as usize;
     if out_span_hidden.len() != token_ids.len() * hidden {
         return Err(format!(
-            "prefill_program_span_hidden: {} hidden values for {} tokens of {hidden}",
+            "{what}: {} hidden values for {} tokens of {hidden}",
             out_span_hidden.len(),
             token_ids.len()
         ));
     }
-    let options = ffi::IgnisPrefillOptions {
+    let mut options = ffi::IgnisPrefillOptions {
         out_span_hidden: out_span_hidden.as_mut_ptr(),
-        next_prompt_token: next_prompt_token_field("prefill_program_span_hidden", next_prompt_token)?,
+        next_prompt_token: next_prompt_token_field(what, next_prompt_token)?,
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
+    if let Some(span) = span {
+        arm_multimodal(what, &mut options, span, token_ids.len())?;
+    }
     let logits = match out_logits {
         Some(row) => row.as_mut_ptr(),
         None => std::ptr::null_mut(),
@@ -1993,6 +2054,11 @@ pub struct MultimodalPrefill<'a> {
     pub rope_delta: i32,
     /// The media columns the span's placeholders take, if it covers any.
     pub media: Option<SpanMediaColumns<'a>>,
+    /// GitHub #624: the axes the position before the span rotated at (the
+    /// prompt's positions one column before the span), for a span that
+    /// continues a sequence: a load with the 27B's MTP head refuses such a
+    /// span without them, and every other load leaves them unread.
+    pub previous: Option<&'a [i32; 3]>,
 }
 
 /// One **attention readout** a span asks for (GitHub #260, ADR 0038): what
@@ -2162,6 +2228,7 @@ fn arm_multimodal(
     options.media = media;
     options.media_scatter_indices = scatter;
     options.media_first_column = first_column;
+    options.mrope_previous = span.previous.map_or(std::ptr::null(), |axes| axes.as_ptr());
     Ok(())
 }
 

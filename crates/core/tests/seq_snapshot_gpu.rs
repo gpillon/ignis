@@ -114,7 +114,7 @@ fn prefill_multimodal_and_decode<'p>(
         // No permitted set (GitHub #242): this prefills a prompt.
         &[],
         Redirect::NONE,
-        MultimodalPrefill { positions, rope_delta, media: None },
+        MultimodalPrefill { positions, rope_delta, media: None, previous: None },
         None,
         None,
     )

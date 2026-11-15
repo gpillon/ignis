@@ -166,7 +166,7 @@ fn three_equal_axes_rotate_as_the_text_path_with_vision_off_and_on() {
     let (_, _, on) = engine.span(&tokens, None, None).expect("the vision load's text span");
     assert_bit_identical(&text, &on, vocab, "a text span with vision on");
     let axes = equal_axes(tokens.len());
-    let span = MultimodalPrefill { positions: &axes, rope_delta: 0, media: None };
+    let span = MultimodalPrefill { positions: &axes, rope_delta: 0, media: None, previous: None };
     let (_, _, multimodal) = engine.span(&tokens, None, Some(span)).expect("the span at three equal axes");
     assert_bit_identical(&text, &multimodal, vocab, "the span at three equal axes");
     println!("{} rows of 300 bit for bit: vision off, on, and at three equal axes", text.len() / vocab);
@@ -205,10 +205,11 @@ fn media_columns_replace_their_placeholders_in_every_stream() {
             positions: &axes,
             rope_delta: 0,
             media: Some(SpanMediaColumns { embedding: &media, first_column: 0, scatter_indices: &scatter }),
+            previous: None,
         };
         let (_, _, placed) = engine.span(&placeholders, None, Some(span)).expect("the span with the columns");
         assert_bit_identical(&reference, &placed, vocab, &format!("{residency:?}: the placed columns"));
-        let bare = MultimodalPrefill { positions: &axes, rope_delta: 0, media: None };
+        let bare = MultimodalPrefill { positions: &axes, rope_delta: 0, media: None, previous: None };
         let (_, _, unplaced) = engine.span(&placeholders, None, Some(bare)).expect("the span without the columns");
         let moved = differing_rows(&placed, &unplaced, vocab);
         assert_eq!(moved, (first..tokens.len()).collect::<Vec<_>>(), "{residency:?}: the rows the columns move");
@@ -255,10 +256,10 @@ fn the_axes_and_the_rope_delta_reach_the_forward() {
     let vocab = engine.vocab();
     let media = engine.place_media(&columns).expect("place the columns");
     let columns_of = || Some(SpanMediaColumns { embedding: &media, first_column: 0, scatter_indices: &scatter });
-    let at_grid = |rope_delta| MultimodalPrefill { positions: &grid, rope_delta, media: columns_of() };
+    let at_grid = |rope_delta| MultimodalPrefill { positions: &grid, rope_delta, media: columns_of(), previous: None };
 
     let (_, _, flat_rows) = engine
-        .span(&placeholders, None, Some(MultimodalPrefill { positions: &flat, rope_delta: 0, media: columns_of() }))
+        .span(&placeholders, None, Some(MultimodalPrefill { positions: &flat, rope_delta: 0, media: columns_of(), previous: None }))
         .expect("the image at equal axes");
     let (seq, context, grid_rows) = engine.span(&placeholders, None, Some(at_grid(delta))).expect("the image at its axes");
     let moved = differing_rows(&flat_rows, &grid_rows, vocab);

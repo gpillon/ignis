@@ -88,18 +88,23 @@ pub fn call_bytes(rows: u64) -> u64 {
 /// What a `prefill_chunk_tokens`-wide chunk adds to the prefill scratch
 /// (`ignis::mtp::prefill_scratch_bytes`): one call of at most
 /// [`PREFILL_ROWS`] rows, its input hiddens, embeddings and head hiddens, its
-/// positions, rotation positions and table row.
-pub fn prefill_scratch_bytes(prefill_chunk_tokens: u32) -> u64 {
+/// positions, rotation positions and table row. On a load with `vision`
+/// (GitHub #624) a multimodal chunk's rows rotate at three axes a row.
+pub fn prefill_scratch_bytes(prefill_chunk_tokens: u32, vision: bool) -> u64 {
     let rows = u64::from(prefill_chunk_tokens).min(PREFILL_ROWS);
-    3 * bf16(HIDDEN * rows) + 2 * i32(rows) + i32(1) + call_bytes(rows)
+    let axes = if vision { 3 } else { 1 };
+    3 * bf16(HIDDEN * rows) + i32(rows) + i32(axes * rows) + i32(1) + call_bytes(rows)
 }
 
 /// What a round of `columns` columns adds to the decode-round scratch
 /// (`ignis::mtp::round_scratch_bytes`): one call over every column, its
-/// continuation hiddens, embeddings and head hiddens and its positions. A load
-/// sizes it for its widest round, `lanes * (k + 1)` columns.
-pub fn round_scratch_bytes(columns: u64) -> u64 {
-    3 * bf16(HIDDEN * columns) + i32(columns) + call_bytes(columns)
+/// continuation hiddens, embeddings and head hiddens and its positions, and on
+/// a load with `vision` (GitHub #624) their rotation, each position plus the
+/// lane's rope delta. A load sizes it for its widest round, `lanes * (k + 1)`
+/// columns.
+pub fn round_scratch_bytes(columns: u64, vision: bool) -> u64 {
+    let positions = if vision { 2 } else { 1 };
+    3 * bf16(HIDDEN * columns) + positions * i32(columns) + call_bytes(columns)
 }
 
 #[cfg(test)]
@@ -130,19 +135,33 @@ mod tests {
     /// chunk adds what a 128-token one does.
     #[test]
     fn the_prefill_line_is_one_call_at_most_the_call_width_wide() {
-        assert_eq!(prefill_scratch_bytes(1024), prefill_scratch_bytes(128));
-        assert!(prefill_scratch_bytes(64) < prefill_scratch_bytes(128));
+        assert_eq!(prefill_scratch_bytes(1024, false), prefill_scratch_bytes(128, false));
+        assert!(prefill_scratch_bytes(64, false) < prefill_scratch_bytes(128, false));
         // 140,288 BF16 elements a row through the call's buffers.
         assert_eq!(call_bytes(128), 140_288 * 2 * 128);
-        assert_eq!(prefill_scratch_bytes(128), 3 * 5120 * 2 * 128 + 2 * 512 + 256 + call_bytes(128));
+        assert_eq!(prefill_scratch_bytes(128, false), 3 * 5120 * 2 * 128 + 2 * 512 + 256 + call_bytes(128));
+    }
+
+    /// GitHub #624: on a vision load a multimodal chunk's rows rotate at
+    /// three axes a row, so the prefill line holds 1,024 bytes more at the
+    /// call's 128 rows (1,536 for the axes in place of 512), and a round's
+    /// rows their rotation beside their positions, one more I32 a column; a
+    /// text load's lines are what they were.
+    #[test]
+    fn a_vision_loads_lines_hold_the_rows_rotation() {
+        assert_eq!(prefill_scratch_bytes(128, true) - prefill_scratch_bytes(128, false), 1_024);
+        assert_eq!(prefill_scratch_bytes(2048, true), prefill_scratch_bytes(128, true));
+        assert_eq!(prefill_scratch_bytes(64, true) - prefill_scratch_bytes(64, false), 512);
+        assert_eq!(round_scratch_bytes(8, true) - round_scratch_bytes(8, false), 256);
+        assert_eq!(round_scratch_bytes(65, true) - round_scratch_bytes(65, false), 512);
     }
 
     /// The round line follows the round's columns.
     #[test]
     fn the_round_line_follows_the_rounds_columns() {
         for columns in [1u64, 8, 64] {
-            assert_eq!(round_scratch_bytes(columns), 3 * bf16(5120 * columns) + i32(columns) + call_bytes(columns));
+            assert_eq!(round_scratch_bytes(columns, false), 3 * bf16(5120 * columns) + i32(columns) + call_bytes(columns));
         }
-        assert!(round_scratch_bytes(64) > round_scratch_bytes(8));
+        assert!(round_scratch_bytes(64, false) > round_scratch_bytes(8, false));
     }
 }

@@ -121,7 +121,7 @@ fn a_dflash2_load_reports_the_drafters_vram_and_a_plain_load_reports_todays() {
         spec_vram - verify_vram,
         drafter_weight_bytes
             + spec.drafter_state_bytes(1)
-            + spec.prefill_scratch_bytes(128)
+            + spec.prefill_scratch_bytes(128, false)
             + spec.round_scratch_bytes(ignis_core::N_DECODE_LANES as u32),
         "the drafter adds its weights, one slot's 40 MiB window, its prefill scratch at a \
          128-token chunk and its verify round's taps and scratch, nothing else"

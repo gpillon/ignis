@@ -14,6 +14,20 @@ sidebar:
 | `--media-cache-mib <n>` | `IGNIS_MEDIA_CACHE_MIB` | `1024` with `--vision-enabled` | Prepared images kept for reuse; `0` disables, max 65536. |
 | `--media-allow-private-network` | `IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK` | off | Needs `--vision-enabled`. Fetch image URLs on private, loopback and link-local addresses. |
 
+## With speculative decoding
+
+The 27B's vision combines with either of its drafters
+([the 27B's two drafters](../concepts/speculative-decoding.md#the-27bs-two-drafters)):
+DFlash2, which every built-in profile loads, and, from 0.11.0, its own MTP head
+(`--spec-backend mtp`), under either vision residency and with nothing else to
+set. The text after an image is drafted as text is, and a greedy answer is the
+same with speculation on or off, up to near-ties. Where the next token is an
+image placeholder, the MTP head takes the image's row the model itself took
+there, and it reads the image's positions as the model does. Beside a text
+load's lines, a vision load with the head plans 1 KB more prefill scratch and
+four bytes a round column for those positions. Flash-Next's MTP head drafts
+after images too ([Flash-Next](#flash-next)).
+
 ## Flash-Next
 
 From 0.11.0, Flash-Next takes images as the 27B does, through the same

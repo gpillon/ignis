@@ -143,6 +143,118 @@ fn planned_reservations_are_held(exceptions: ExceptionWeights) {
     );
 }
 
+/// GitHub #624: a 27B load with vision and the MTP head binds both scopes
+/// under each vision residency and holds to the byte what its plan laid out;
+/// under `host` the media embedding is no VRAM line. What vision adds to the
+/// head's own lines is its rows' rotation: one I32 a column of the widest
+/// round (64 columns at 8 lanes and a 7-token window, 256 bytes aligned) beside
+/// the rounds' rotation positions (8 lanes' I32s), and a multimodal chunk's
+/// three axes a row in the prefill (inside the encoder-sized arena here); a
+/// text-only MTP load plans no media embedding, no rotation and no encoder.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn an_mtp_load_with_vision_holds_its_plan_under_each_residency_and_a_text_one_plans_nothing_for_vision() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    let speculation = Speculation::new(SpeculativeBackend::Mtp, 7).expect("mtp-7");
+    let cfg = ignis_core::compute::ModelConfig::qwen38_27b();
+    let pages = MAX_CONTEXT.div_ceil(64);
+    let page_bytes =
+        KvFormat::HqE8_2b.page_bytes(ignis_core::seq::kv_geometry(&cfg, Some(SpeculativeBackend::Mtp)));
+    let config = |vision: Option<Vision>| CudaLeafConfig {
+        max_context_tokens: MAX_CONTEXT,
+        kv_format: KvFormat::HqE8_2b,
+        kv_pool_bytes: u64::from(pages) * page_bytes,
+        speculation: Some(speculation),
+        vision,
+        retained_device_slots: 2,
+        retained_host_slots: 0,
+        ..CudaLeafConfig::default()
+    };
+    // The leaf's plan alone, of a load with `speculation` and `vision`.
+    let plan_of = |speculation: Speculation, vision: Option<Vision>| {
+        let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+        let (plan, handles) =
+            bind_model_scope_27b_with(&reader, model_load::model_scope(Some(speculation), vision, ExceptionWeights::Bf16))
+                .unwrap_or_else(|e| panic!("bind ({speculation:?}, {vision:?}): {e}"));
+        CudaLeafConfig { speculation: Some(speculation), ..config(vision) }
+            .plan_reservations(&reader, &plan, &handles)
+            .unwrap_or_else(|e| panic!("plan ({speculation:?}, {vision:?}): {e}"))
+            .reserved
+    };
+    let text = plan_of(speculation, None);
+    assert_eq!(text.media_embedding, 0, "a text-only MTP load plans no media embedding");
+    // What vision adds to a DFlash2 load's round line: its rotation positions.
+    let dflash2 = Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7");
+    let device_vision = Vision::new(ignis_core::DEFAULT_VISION_MAX_TOKENS).expect("default envelope");
+    let dflash2_vision = plan_of(dflash2, Some(device_vision)).decode_graph - plan_of(dflash2, None).decode_graph;
+    eprintln!("vision adds {dflash2_vision} B to a DFlash2 load's decode_graph line");
+    for residency in [VisionResidency::Device, VisionResidency::Host] {
+        let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+        let vision = Vision::new(ignis_core::DEFAULT_VISION_MAX_TOKENS)
+            .expect("default envelope")
+            .with_residency(residency);
+        let scope = model_load::model_scope(Some(speculation), Some(vision), ExceptionWeights::Bf16);
+        let (plan, handles) =
+            bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind the head and vision: {e}"));
+        let config = config(Some(vision));
+        let planned = config
+            .plan_reservations(&reader, &plan, &handles)
+            .unwrap_or_else(|e| panic!("plan ({residency:?}): {e}"));
+        let kv_arena = config.kv_pool_arena_bytes(pages).unwrap_or_else(|e| panic!("plan the pool: {e}"));
+        eprintln!("{residency:?}: planned {:#?}", planned.reserved);
+        assert_eq!(
+            planned.reserved.media_embedding == 0,
+            residency == VisionResidency::Host,
+            "{residency:?}: the media embedding is a VRAM line under device alone"
+        );
+        assert_eq!(planned.reserved.drafter_round, 0, "the head has no drafter round");
+        assert_eq!(
+            planned.reserved.decode_graph - text.decode_graph,
+            dflash2_vision + 256,
+            "{residency:?}: what vision adds to a DFlash2 load's rounds, and the head's rotation beside its 64 columns"
+        );
+        assert!(planned.reserved.workspace >= text.workspace, "{residency:?}: the encoder's arena holds the prefill's");
+        assert_eq!(
+            (planned.reserved.lane_state, planned.reserved.retained_slots, planned.reserved.hq_residual_window),
+            (text.lane_state, text.retained_slots, text.hq_residual_window),
+            "{residency:?}: vision moves none of the head's state lines"
+        );
+
+        let mut device = match CudaDevice::create(0) {
+            Ok(device) => device,
+            Err(e) => {
+                if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                    return;
+                }
+                unreachable!();
+            }
+        };
+        let artifact = match materialize(&reader, &plan, &mut device, None) {
+            Ok(artifact) => artifact,
+            Err(e) => {
+                if gpu_profile::skip_or_fail(&format!("materialize: {e}")) {
+                    return;
+                }
+                unreachable!();
+            }
+        };
+        let leaf = CudaLeaf::new(device, reader, artifact, handles, config)
+            .with_kv_ram_arena(1024 * 1024 * 1024)
+            .unwrap_or_else(|e| panic!("pin KV-RAM: {e}"));
+        let model = Arc::new(Model::load(Arc::new(leaf)).unwrap_or_else(|e| panic!("model load ({residency:?}): {e:?}")));
+        let stats = model.stats().unwrap_or_else(|e| panic!("stats: {e:?}"));
+        assert_eq!(stats.kv_page_count, pages);
+        assert_eq!(
+            stats.reserved,
+            ReservedBytes { kv_pool: kv_arena, ..planned.reserved },
+            "{residency:?}: the load holds what its plan laid out"
+        );
+    }
+}
+
 /// GitHub #281: a load at the server's defaults keeps no retained slot in
 /// VRAM -- the `retained_slots` line is 0 and the residual window is the
 /// lanes' alone -- and sixteen in the pinned host block. Asked of the leaf's

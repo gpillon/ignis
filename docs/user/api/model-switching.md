@@ -22,9 +22,7 @@ flags the server started with, except the ones it cannot take, which are left
 off for it and named in the log (the 27B's `--spec-backend dflash2` on
 Flash-Next; Flash-Next's own knobs on the 27B). From 0.11.0 `--spec-backend mtp`
 is both models' and crosses the switch: the 27B loads its own MTP head, at its
-own default window when none is named. Until that head drafts after images, a
-switch to the 27B with `mtp` and vision on for it (every built-in profile's, or
-the vision a switch carries) is refused, naming `--qwen38-vision-enabled false`
+own default window when none is named, beside the vision the switch carries
 ([the 27B's two drafters](../concepts/speculative-decoding.md#the-27bs-two-drafters)).
 
 **Vision crosses the switch** (from 0.11.0; 0.10.0 drops vision on a switch

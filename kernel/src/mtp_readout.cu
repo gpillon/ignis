@@ -338,6 +338,9 @@ extern "C" int32_t ignis_mtp_readout_chain(struct ignis_model *model, struct ign
   const auto base = static_cast<std::int32_t>(seq->position);
   const auto extent = static_cast<std::int32_t>(readout->extent);
   const std::int32_t slot = seq->slot;
+  // GitHub #624: on a vision load the chain rotates at the lane's first
+  // column's rotation position, the round's base plus its rope delta.
+  const std::int32_t rope_base = base + seq->rope_delta;
   ninfer::DeviceArena::Scope scope = model->scratch->scope();
   try {
     const struct {
@@ -353,6 +356,11 @@ extern "C" int32_t ignis_mtp_readout_chain(struct ignis_model *model, struct ign
     for (const auto &stage : staged) {
       check(cudaMemcpyAsync(stage.buffer->p, stage.value, sizeof(std::int32_t), cudaMemcpyHostToDevice, stream),
             (std::string("cudaMemcpyAsync(") + stage.what + ")").c_str());
+    }
+    if (verify.rope_positions != nullptr) {
+      check(cudaMemcpyAsync(verify.rope_positions->p, &rope_base, sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                            stream),
+            "cudaMemcpyAsync(rotation position)");
     }
     // Every step's scores, the whole window's (the chain runs every step).
     const ninfer::DeviceSpan scores = model->scratch->alloc_bytes(k * vocab * sizeof(std::uint16_t));

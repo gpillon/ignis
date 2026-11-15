@@ -738,6 +738,8 @@ impl StepLeaf for FlashNextLeaf {
         if attention.is_some() {
             return Err(leaf_error("prefill", "Qwen3.8-Flash-Next serves no attention readouts".to_string()));
         }
+        // Flash-Next's head builds its entry from the span's own next token
+        // (GitHub #520), so it reads no axes before the span.
         let span = step::MultimodalPrefill {
             positions: span.positions,
             rope_delta: span.rope_delta,
@@ -746,6 +748,7 @@ impl StepLeaf for FlashNextLeaf {
                 first_column: media.first_column,
                 scatter_indices: media.scatter_indices,
             }),
+            previous: None,
         };
         self.prefill_span(
             model,

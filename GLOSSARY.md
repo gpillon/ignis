@@ -1231,8 +1231,9 @@ The model's native multi-token-prediction head as a drafter
 it (draft window 1..7, verification width chosen per round by the row budget).
 The 27B drafts with it as its opt-in second drafter, in place of **DFlash2**
 (#623): draft window 0..7, the **fixed draft** only, DFlash2's own settings
-refused by name where the operator names them, and vision on refused until the
-head drafts beside images (#624). It saves DFlash2's weights, **drafter window**
+refused by name where the operator names them, and drafting after images as
+DFlash2 does (#624: its rows rotate at their positions plus the **rope delta**
+and embed an image's column at a placeholder). It saves DFlash2's weights, **drafter window**
 and round, and costs one more attention layer in every KV page, the head over
 every prefill position, and a page a holder of a shared prefix (ADR 0095).
 

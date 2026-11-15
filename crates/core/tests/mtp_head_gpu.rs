@@ -260,8 +260,8 @@ fn an_mtp_load_binds_the_head_and_plans_its_lines_as_the_cpu_does_to_the_byte() 
         // Beside the verify substrate at the same window, the head adds its
         // prefill's buffers to the workspace and its rounds' to the decode
         // round's scratch, and no drafter round.
-        assert_eq!(head.workspace_bytes - substrate.workspace_bytes, spec.prefill_scratch_bytes(PREFILL_CHUNK), "{kv_format:?}");
-        assert_eq!(head.decode_graph_bytes - substrate.decode_graph_bytes, spec.decode_round_bytes(lanes), "{kv_format:?}");
+        assert_eq!(head.workspace_bytes - substrate.workspace_bytes, spec.prefill_scratch_bytes(PREFILL_CHUNK, false), "{kv_format:?}");
+        assert_eq!(head.decode_graph_bytes - substrate.decode_graph_bytes, spec.decode_round_bytes(lanes, false), "{kv_format:?}");
         assert_eq!((head.drafter_round_bytes, spec.round_scratch_bytes(lanes)), (0, 0), "{kv_format:?}");
         assert_eq!(head.verify_round_bytes, substrate.verify_round_bytes, "{kv_format:?}");
         assert_eq!(head.sampling_bytes, substrate.sampling_bytes, "{kv_format:?}");

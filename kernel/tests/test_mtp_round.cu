@@ -6,7 +6,10 @@
 //   when the lane needs it (s < extent_b), and the masked form's empty row
 //   (position 0, valid 0) otherwise -- a lane at extent 0 writes nothing,
 //   and no lane writes past its extent, so none writes past its budget or
-//   its context;
+//   its context; on a vision load (GitHub #624) the row rotates at the
+//   lane's first verify column's rotation position (base + rope delta) less
+//   one, plus s, read from that column alone, while its row stays the KV
+//   position;
 // - `write_drafts`: step s's choices land at drafts[b * window + s];
 // - `commit_hiddens`: lane b's column 0 is its slot's continuation hidden,
 //   column j > 0 the round's normalized column j - 1;
@@ -95,6 +98,50 @@ void chain_rows_follow_each_lanes_extent() {
   cudaFree(d_extents);
   cudaFree(d_positions);
   cudaFree(d_valid);
+}
+
+// GitHub #624: lanes whose rope deltas are 0, negative (an image's grid
+// takes fewer positions than tokens) and positive; the verify columns past
+// each lane's first hold a sentinel, which the chain must never read.
+void chain_rows_rotate_at_each_lanes_rope_delta() {
+  constexpr std::int32_t kWindow = 3;
+  constexpr std::int32_t kColumns = kWindow + 1;
+  const std::vector<std::int32_t> base = {10, 64, 600, 300};
+  const std::vector<std::int32_t> extents = {kWindow, 2, 0, 1};
+  // Each lane's first column: base + delta, deltas 0, -37, -500, +12.
+  const std::vector<std::int32_t> first_column = {10, 27, 100, 312};
+  const auto batch = static_cast<std::int32_t>(base.size());
+  std::vector<std::int32_t> rope(static_cast<std::size_t>(kColumns * batch), -9999);
+  for (std::int32_t b = 0; b < batch; ++b) {
+    rope[static_cast<std::size_t>(b * kColumns)] = first_column[b];
+  }
+  // What each step's rotation is, by lane: needed rows only, 0 otherwise.
+  const std::int32_t expected[kWindow][4] = {{9, 26, 0, 311}, {10, 27, 0, 0}, {11, 0, 0, 0}};
+  std::int32_t *d_base = device_copy(base);
+  std::int32_t *d_extents = device_copy(extents);
+  std::int32_t *d_rope = device_copy(rope);
+  std::int32_t *d_positions = device_copy(std::vector<std::int32_t>(batch, -7));
+  std::int32_t *d_valid = device_copy(std::vector<std::int32_t>(batch, -7));
+  std::int32_t *d_rotation = device_copy(std::vector<std::int32_t>(batch, -7));
+  for (std::int32_t step = 0; step < kWindow; ++step) {
+    ignis::mtp::detail::chain_rows(d_base, d_extents, step, d_positions, d_valid, batch, nullptr, d_rope, kColumns,
+                                   d_rotation);
+    cuda(cudaDeviceSynchronize(), "chain_rows with rope positions");
+    const auto positions = host_copy(d_positions, batch);
+    const auto rotation = host_copy(d_rotation, batch);
+    for (std::int32_t b = 0; b < batch; ++b) {
+      const bool needed = step < extents[b];
+      const std::string at = "rope step " + std::to_string(step) + " lane " + std::to_string(b);
+      expect(rotation[b] == expected[step][b], at + ": rotation " + std::to_string(rotation[b]));
+      expect(positions[b] == (needed ? base[b] - 1 + step : 0), at + ": row " + std::to_string(positions[b]));
+    }
+  }
+  cudaFree(d_base);
+  cudaFree(d_extents);
+  cudaFree(d_rope);
+  cudaFree(d_positions);
+  cudaFree(d_valid);
+  cudaFree(d_rotation);
 }
 
 void each_steps_choices_land_in_the_lanes_draft_column() {
@@ -195,6 +242,7 @@ int main() {
     return 1;
   }
   chain_rows_follow_each_lanes_extent();
+  chain_rows_rotate_at_each_lanes_rope_delta();
   each_steps_choices_land_in_the_lanes_draft_column();
   the_commits_hiddens_are_the_continuation_then_the_rounds_columns();
   a_rounds_rows_are_the_chains_and_the_commits();

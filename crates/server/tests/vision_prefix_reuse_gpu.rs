@@ -26,6 +26,12 @@
 //! tells the two swatches apart at all — otherwise "blue" after reuse would
 //! prove nothing.
 //!
+//! GitHub #624: the same on a load that drafts with DFlash2 and then on one
+//! that drafts with the 27B's MTP head, whose holders each copy a prefix's
+//! last page (ADR 0095): the siblings share what their images agree on, and
+//! nothing past it, and the MTP load's reuse is the DFlash2 load's token for
+//! token; admission keeps the copies' pages back as the server does.
+//!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a skip; under the profile, a hard failure.
 
@@ -37,9 +43,10 @@ use std::sync::Arc;
 
 use ignis_artifact::{bind_model_scope_27b_with, materialize, CudaDevice, FrontendSet, VisionResidency, Reader};
 use ignis_core::gpu_profile;
+use ignis_core::compute::ModelConfig;
 use ignis_core::{
     model_load, ConcreteScheduler, DecodeParams, ExceptionWeights, KvFormat, RequestClass, RequestId,
-    RequestInput, SchedEvent, Scheduler, SchedulerConfig, TokenId, Vision,
+    RequestInput, SchedEvent, Scheduler, SchedulerConfig, Speculation, SpeculativeBackend, TokenId, Vision,
 };
 use ignis_runtime::{CudaLeaf, CudaLeafConfig, Model, RuntimeCompute};
 use ignis_server::artifact_template::ArtifactTemplateProvider;
@@ -175,9 +182,28 @@ impl Run {
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
+    let _ = siblings_share_what_their_images_agree_on(None);
+}
+
+/// GitHub #624: on a load that drafts with the 27B's MTP head, the siblings
+/// share what they share on a DFlash2 load, token for token: the two loads,
+/// one after the other, reuse the same prompt tokens in both legs.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn on_an_mtp_load_siblings_sending_same_size_images_share_what_they_share_on_a_dflash2_load() {
+    let dflash2 = siblings_share_what_their_images_agree_on(Some(Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7")));
+    let mtp = siblings_share_what_their_images_agree_on(Some(Speculation::new(SpeculativeBackend::Mtp, 7).expect("mtp-7")));
+    eprintln!("reuse (blue, red again, counter) with prompt reuse off then on: dflash2 {dflash2:?}, mtp {mtp:?}");
+    assert_eq!(mtp, dflash2, "the MTP load's siblings reuse what the DFlash2 load's do");
+}
+
+/// One load's siblings, held to the module's claims; what the blue sibling
+/// and the second red reused, and the sibling counter, with prompt reuse off
+/// and then on (empty where the profile allows a skip).
+fn siblings_share_what_their_images_agree_on(speculation: Option<Speculation>) -> Vec<(u32, u32, u64)> {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
-        return;
+        return Vec::new();
     }
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
@@ -188,13 +214,14 @@ fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
     // Today's load, the tower on the device (ADR 0075's `device`): the scope
     // is bound from the vision the model loads with, so the two agree.
     let vision = Vision::default().with_residency(VisionResidency::Device);
-    let (plan, handles) = bind_model_scope_27b_with(&reader, model_load::model_scope(None, Some(vision), ExceptionWeights::Bf16))
-        .unwrap_or_else(|e| panic!("bind: {e}"));
+    let (plan, handles) =
+        bind_model_scope_27b_with(&reader, model_load::model_scope(speculation, Some(vision), ExceptionWeights::Bf16))
+            .unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(device) => device,
         Err(e) => {
             if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
-                return;
+                return Vec::new();
             }
             unreachable!();
         }
@@ -203,7 +230,7 @@ fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
         Ok(artifact) => artifact,
         Err(e) => {
             if gpu_profile::skip_or_fail(&format!("materialize: {e}")) {
-                return;
+                return Vec::new();
             }
             unreachable!();
         }
@@ -213,8 +240,21 @@ fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
         kv_format: KvFormat::Bf16,
         kv_pool_bytes: ignis_runtime::auto_kv_pool_bytes(KvFormat::Bf16, MAX_CONTEXT),
         vision: Some(vision),
+        speculation,
         ..CudaLeafConfig::default()
     };
+    // GitHub #622: on the MTP head's pool admission keeps back the page each
+    // lane and retained slot may copy as a holder, and a capture's loan may
+    // carry one; both are 0 on every other pool.
+    let cfg = ModelConfig::qwen38_27b();
+    let backend = speculation.map(|s| s.backend());
+    let holder_pages = ignis_core::seq::holder_page_reserve(
+        &cfg,
+        backend,
+        leaf_config.slot_count,
+        leaf_config.retained_device_slots + leaf_config.retained_host_slots,
+    );
+    let holder_lag = ignis_core::seq::holder_lag(&cfg, backend);
     // GitHub #213: KV-RAM is one arena pinned at the load, so a leaf without
     // one refuses every spill. A gibibyte costs this load nothing it notices
     // and keeps a leg that starts spilling from failing for the wrong reason.
@@ -230,7 +270,8 @@ fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
         max_sequence_tokens: MAX_CONTEXT,
         serving_chunk_tokens: SERVING_CHUNK,
         kv_page_tokens: ignis_runtime::KV_PAGE_TOKENS,
-        kv_capacity_pages: stats.kv_page_count,
+        kv_capacity_pages: stats.kv_page_count - holder_pages,
+        kv_holder_lag: holder_lag,
         prompt_reuse,
         ..SchedulerConfig::default()
     };
@@ -267,6 +308,7 @@ fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
     assert!(text(red_alone).to_lowercase().contains("red"), "{:?}", text(red_alone));
     assert!(text(blue_alone).to_lowercase().contains("blue"), "{:?}", text(blue_alone));
 
+    let mut figures = Vec::new();
     for prompt_reuse in [false, true] {
         // The siblings: red publishes, then blue and red again arrive. With
         // prompt reuse off nothing outlives the first red, and a one-word
@@ -276,10 +318,23 @@ fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
         // captured at the opener: three chunks, and whatever is retained
         // stays for them.
         let lead = if prompt_reuse { 3 } else { 1 };
+        // GitHub #624: a drafter's first round can commit the stop its target
+        // accepts, and then the first red ends in the advance its prefill
+        // completes, before the siblings admitted after it claim its prefix,
+        // which nothing retains with prompt reuse off. So on a drafting load
+        // it decodes past its stop, to stay live while they claim; its prompt,
+        // and so what the siblings may share, is the same.
+        let publisher = match speculation {
+            Some(_) => RequestInput {
+                params: DecodeParams { max_tokens: Some(48), ignore_eos: true, ..red_input.params.clone() },
+                ..red_input.clone()
+            },
+            None => red_input.clone(),
+        };
         let siblings = run(
             &compute,
             config(prompt_reuse),
-            vec![red_input.clone()],
+            vec![publisher],
             lead,
             vec![blue_input.clone(), red_input.clone()],
         );
@@ -321,5 +376,7 @@ fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
         assert!(answer(same).to_lowercase().contains("red"), "{:?}", answer(same));
         assert!(answer(first).to_lowercase().contains("red"), "{:?}", answer(first));
         assert_eq!(compute.live_media(), 0);
+        figures.push((blue_reused, same_reused, siblings.sibling_reused_tok));
     }
+    figures
 }
