@@ -1850,8 +1850,8 @@ mod tests {
     /// Every valid call written in the template's form is accepted, the
     /// parser reading back what was written, except the ones the grammar
     /// leaves out by name: the residue (a value the parser itself ends
-    /// early) and spike S1's two miss points (while a required parameter is
-    /// missing, a free value's line starting `</function`, or a
+    /// early) and spike S1's two miss points (spec #582: while a required
+    /// parameter is missing, a free value's line starting `</function`, or a
     /// `</parameter>` line followed by `</`).
     #[test]
     fn every_valid_call_in_the_templates_form_is_accepted() {

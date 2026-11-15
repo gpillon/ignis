@@ -1,6 +1,6 @@
 //! A request's tool calls held to its tools (GitHub #611, spec #582, ADR
 //! 0094): the **grammar** of the content channel of a request that has a
-//! **strict tool**, read as bytes.
+//! **held tool**, read as bytes.
 //!
 //! The model writes its calls in its own dialect ([`crate::call`]) and in
 //! its own order; the grammar checks each sampled token and the scheduler
@@ -926,7 +926,7 @@ impl ToolCallGrammar {
     }
 
     /// The two miss points of a free value while a required parameter is
-    /// still missing (spike S1 on the 27B's tokenizer): a line may not start
+    /// still missing (spike S1 of spec #582, the 27B's): a line may not start
     /// `</function` (the token after a line-start `</` that names the
     /// function's closer), and a line that starts `</parameter>` may not go
     /// on, after its whitespace, with `</` (the token that starts a closing

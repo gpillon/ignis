@@ -462,7 +462,7 @@ fn a_typed_value_starts_at_its_first_byte_and_whitespace_may_follow_it() {
         assert_eq!(edit_taken(&edit_call(&[("line", value)], &[])), head.len() + kept.len(), "{value:?}");
     }
     // With a later parameter still to write, the close after a typed value
-    // is a miss at spike S1's two points, by the rule itself.
+    // is a miss at the two points of spike S1 (spec #582), by the rule itself.
     for (after, kept) in [("</parameter>\n</function>", "</parameter>\n<"), ("</function>", "</")] {
         let text = format!("{head}12\n{after}");
         assert_eq!(edit_taken(&text), head.len() + 3 + kept.len(), "{after:?}");
