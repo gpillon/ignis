@@ -677,10 +677,9 @@ fn read_file_parameters() -> JsonValue {
 /// whose answers no grammar holds (this template has no vocabulary for one,
 /// as Flash-Next has none), on chat completions and on the Responses API:
 /// the call comes back as the model wrote it, its arguments not held to the
-/// tool's `parameters`, and the template receives the tool as sent. The
-/// Responses document declares it inert (`openai_fields::members`, #613
-/// holds it there); chat completions hold a strict tool's calls on the 27B
-/// (GitHub #611, `held_tools_http`) and declare it no more.
+/// tool's `parameters`, and the template receives the tool as sent. Both
+/// hold a strict tool's calls on the 27B (GitHub #611, #613,
+/// `held_tools_http`), so neither document declares it inert.
 #[tokio::test]
 async fn strict_on_a_function_tool_is_accepted_and_inert() {
     for strict in [json!(true), json!(false), json!(null)] {
@@ -703,9 +702,7 @@ async fn strict_on_a_function_tool_is_accepted_and_inert() {
         assert_eq!(call["name"], "read_file", "strict {strict}: {response}");
         assert_eq!(call["arguments"], r#"{"depth":3}"#, "strict {strict}: {response}");
     }
-    let (surface, path) = (openai_fields::Surface::Responses, "tools[].strict");
-    let member = openai_fields::members(surface).iter().find(|member| member.path == path);
-    assert!(member.is_some_and(|member| member.why.contains("#582")), "{surface:?} declares {path} inert");
-    assert!(openai_fields::describe(surface).contains(&format!("`{path}`")), "{surface:?}: the document lists it");
-    assert!(openai_fields::members(openai_fields::Surface::Chat).is_empty(), "chat completions hold strict tools");
+    for surface in [openai_fields::Surface::Chat, openai_fields::Surface::Responses] {
+        assert!(!openai_fields::describe(surface).contains("strict"), "{surface:?} holds strict tools");
+    }
 }

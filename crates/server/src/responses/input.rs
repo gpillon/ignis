@@ -42,8 +42,12 @@ pub(crate) struct CreateResponse {
     instructions: Option<JsonValue>,
     /// Function tools, in the Responses shape `{type: "function", name,
     /// description, parameters, strict}`. Any other tool type is a 400.
+    /// `strict: true` holds the tool's calls to its `parameters` on a model
+    /// that serves structured output (GitHub #613), as on chat completions.
+    /// Each also kept in its key order as sent: a strict tool's `parameters`
+    /// keep theirs, which its held calls' arguments follow.
     #[schema(value_type = Vec<Object>)]
-    tools: Option<Vec<JsonValue>>,
+    pub(crate) tools: Option<Vec<api::Sent>>,
     /// `"auto"` (default), `"none"`, `"required"`, or `{"type": "function",
     /// "name": ...}` naming one of `tools`, forced as on chat completions.
     #[schema(value_type = Object)]
@@ -224,7 +228,11 @@ pub(crate) async fn prepare(
     let instructions = api::optional_str(req.instructions.as_ref(), "instructions")
         .map_err(|message| api::bad_request_param(&message, "instructions"))?
         .map(str::to_owned);
-    let tools = chat_tools(req.tools.as_deref().unwrap_or_default())?;
+    // The tools as values, and in their key order as sent, for a strict
+    // tool's (#613).
+    let (sent_tools, raw_tools): (Vec<JsonValue>, Vec<ignis_grammar::json::Json>) =
+        req.tools.unwrap_or_default().into_iter().map(|tool| (tool.value, tool.ordered)).unzip();
+    let tools = chat_tools(&sent_tools)?;
     let (tools, tool_choice) = api::resolve_tools(Some(tools), req.tool_choice.clone().map(chat_tool_choice))?;
     api::count_strict_tools(server, &tools);
 
@@ -276,13 +284,15 @@ pub(crate) async fn prepare(
     let format = api::text_answer_format(req.text.as_deref());
     let held = api::structured_output(server, format, "text.format", req.ignis_describe_schema.as_ref(), &thinking, &tools, &tool_choice)?
         .filter(|_| !warm_up);
-    let (grammar, description) = match held {
-        Some(held) => (Some(held.grammar), held.description.filter(|_| !system_only)),
-        None => (None, None),
-    };
+    // A strict tool's calls are held as on chat completions (GitHub #613);
+    // its refusals come before anything is rendered or generated, and a
+    // warm-up holds no grammar.
+    let one_call = req.parallel_tool_calls == Some(false);
+    let api::HeldContent { grammar, description, schemas } =
+        api::held_content(server, held, &raw_tools, &tools, &tool_choice, one_call, &thinking)?;
+    let (grammar, description) = (grammar.filter(|_| !warm_up), description.filter(|_| !system_only));
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
         .map_err(|message| api::bad_request(&message))?;
-    let schemas = ToolSchemas::from_tools(&tools);
     let check = CallCheck::new(&tools, server.metrics.as_ref());
     let (mut input, model, mut prompt_tokens, media) =
         api::prepare_request(server, model, &messages, params, &thinking, &tools, description.as_deref()).await?;
@@ -326,7 +336,7 @@ pub(crate) async fn prepare(
         temperature: wire_number(params.temperature),
         text: echoed_text(req.text.as_deref()),
         tool_choice: req.tool_choice.clone().unwrap_or_else(|| json!("auto")),
-        tools: req.tools.clone().unwrap_or_default(),
+        tools: sent_tools,
         top_p: wire_number(params.top_p),
         truncation: "disabled",
         usage: None,
@@ -373,6 +383,16 @@ pub(crate) fn frame_text(frame: &str) -> Option<Box<RawValue>> {
         text: Option<Box<RawValue>>,
     }
     serde_json::from_str::<Frame>(frame).ok().and_then(|frame| frame.text)
+}
+
+/// A `response.create` frame's `tools`, each in its key order as sent
+/// ([`CreateResponse::tools`]), which the parsed frame has sorted.
+pub(crate) fn frame_tools(frame: &str) -> Option<Vec<api::Sent>> {
+    #[derive(Deserialize)]
+    struct Frame {
+        tools: Option<Vec<api::Sent>>,
+    }
+    serde_json::from_str::<Frame>(frame).ok().and_then(|frame| frame.tools)
 }
 
 /// The Responses `tools` in the shape chat completions takes (spec

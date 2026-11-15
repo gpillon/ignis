@@ -1577,7 +1577,7 @@ pub(crate) fn held_tools(
             ToolField::Name => "name",
             ToolField::Parameters => "parameters",
         };
-        let param = format!("tools[{}].function.{field}", refused.tool);
+        let param = tool_member(raw, refused.tool, field);
         let refusal = refused.refusal;
         error_response_naming(
             StatusCode::BAD_REQUEST,
@@ -1599,7 +1599,7 @@ pub(crate) fn held_tools(
         true => match active.template.encode_literal(crate::thinking::THINK_END_TEXT).filter(|ids| ids.len() == 1) {
             Some(ids) => content.after(ids[0]),
             None => {
-                let param = format!("tools[{first}].function.strict");
+                let param = tool_member(raw, first, "strict");
                 return Err(error_response_naming(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
@@ -1618,8 +1618,65 @@ pub(crate) fn held_tools(
 /// tool's when it sent none ([`normalize_tool`]).
 fn strict_parameters(raw: Option<&ignis_grammar::json::Json>, normalized: &JsonValue) -> String {
     use ignis_grammar::json::Json;
-    let sent = raw.and_then(|tool| tool.get("function")?.get("parameters")).filter(|parameters| **parameters != Json::Null);
+    let sent = raw.and_then(|tool| sent_function(tool).get("parameters")).filter(|parameters| **parameters != Json::Null);
     sent.map(Json::compact).unwrap_or_else(|| normalized["function"]["parameters"].to_string())
+}
+
+/// A tool's function as the client sent it: the tool's `function` in chat
+/// completions' shape, the tool itself in the Responses API's, whose
+/// function tools are flat and which takes one in the chat shape as it is
+/// (GitHub #613).
+fn sent_function(tool: &ignis_grammar::json::Json) -> &ignis_grammar::json::Json {
+    tool.get("function").unwrap_or(tool)
+}
+
+/// Where the function `member` of the request's `index`th tool sits in the
+/// body as sent, as a refusal's `param` names it: `tools[1].function.name`
+/// in chat completions' shape, `tools[1].name` in the Responses API's flat
+/// one ([`sent_function`]).
+fn tool_member(raw: &[ignis_grammar::json::Json], index: usize, member: &str) -> String {
+    match raw.get(index).is_some_and(|tool| tool.get("function").is_none()) {
+        true => format!("tools[{index}].{member}"),
+        false => format!("tools[{index}].function.{member}"),
+    }
+}
+
+/// What a request's content is held to, and how its response reads its
+/// calls, on chat completions and the Responses API alike (GitHub #591,
+/// #611, #613, ADR 0094): the answer under its format (`answer`, from
+/// [`structured_output`]), or else its strict tools' calls ([`held_tools`])
+/// on a turn that may call any tool, answers freely and may make more than
+/// one call (`one_call`, `parallel_tool_calls: false`). The strict tools are
+/// compiled and checked either way, and only admitted where their calls are
+/// not held yet (#615).
+pub(crate) struct HeldContent {
+    /// The grammar the content is held to, if any.
+    pub grammar: Option<ignis_core::structured::AnswerGrammar>,
+    /// The schema description the prompt carries ([`HeldAnswer::description`]).
+    pub description: Option<String>,
+    /// The request's tools as every scanner of its response reads their
+    /// calls, a held tool's by the confirmed close ([`ToolSchemas::holding`]).
+    pub schemas: ToolSchemas,
+}
+
+/// The [`HeldContent`] of a request whose answer is `answer`, whose
+/// resolved `tools` are these, `raw` the same tools as sent.
+pub(crate) fn held_content(
+    server: &Server,
+    answer: Option<HeldAnswer>,
+    raw: &[ignis_grammar::json::Json],
+    tools: &[JsonValue],
+    tool_choice: &ToolChoice,
+    one_call: bool,
+    thinking: &ThinkingOptions,
+) -> Result<HeldContent, Response> {
+    let holds = matches!(tool_choice, ToolChoice::Auto) && answer.is_none() && !one_call;
+    let held_tools = held_tools(server, raw, tools, holds, thinking)?.unwrap_or(HeldTools { grammar: None, held: Default::default() });
+    let (grammar, description) = match answer {
+        Some(answer) => (Some(answer.grammar), answer.description),
+        None => (held_tools.grammar, None),
+    };
+    Ok(HeldContent { grammar, description, schemas: ToolSchemas::from_tools(tools).holding(held_tools.held) })
 }
 
 /// A JSON value read once into the two shapes the handler needs:
@@ -1628,6 +1685,7 @@ fn strict_parameters(raw: Option<&ignis_grammar::json::Json>, normalized: &JsonV
 /// a strict tool's `parameters`, whose order its held calls' arguments
 /// follow (GitHub #611). Read by the same deserializer as a
 /// `serde_json::Value`, with the same nesting bound and the same errors.
+#[derive(Clone)]
 pub(crate) struct Sent {
     pub value: JsonValue,
     pub ordered: ignis_grammar::json::Json,
@@ -3201,23 +3259,15 @@ async fn chat_completions(
         Ok(held) => held,
         Err(response) => return response,
     };
-    // GitHub #611: strict tools' calls are held on a turn that may call any
-    // tool and answers freely, and admitted everywhere else, where #615
-    // holds them.
-    let holds = matches!(tool_choice, ToolChoice::Auto) && held.is_none() && !one_call;
-    let held_tools = match held_tools(&server, raw_tools.as_deref().unwrap_or_default(), &tools, holds, &thinking) {
-        Ok(held_tools) => held_tools.unwrap_or(HeldTools { grammar: None, held: Default::default() }),
-        Err(response) => return response,
-    };
-    let (grammar, description) = match held {
-        Some(held) => (Some(held.grammar), held.description),
-        None => (held_tools.grammar, None),
-    };
+    let HeldContent { grammar, description, schemas } =
+        match held_content(&server, held, raw_tools.as_deref().unwrap_or_default(), &tools, &tool_choice, one_call, &thinking) {
+            Ok(content) => content,
+            Err(response) => return response,
+        };
     let (model, class) = match resolve_model_and_class(req.model, req.class) {
         Ok(x) => x,
         Err(message) => return bad_request(&message),
     };
-    let schemas = ToolSchemas::from_tools(&tools).holding(held_tools.held);
     // The pipeline that delivers the response checks its calls (#608); the
     // first-token probe's copy below does not.
     let check = CallCheck::new(&tools, server.metrics.as_ref());

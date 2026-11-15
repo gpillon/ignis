@@ -149,3 +149,11 @@ and repairs a miss, and it does not write the call's envelope for the model.
   - A held call's misses and repairs are structured output's: ADR 0089's three counters gain the `type` value
     `tool` (this ADR's amendment of ADR 0017 and ADR 0089), the Playground Monitor's Structured output card
     counts them, and the request's log line carries `structured.type = "tool"` with its misses and repairs.
+
+**On the Responses API (#613).** A strict tool, `strict` flat beside its name there, is held as on chat
+completions, through the same code, over HTTP and over the WebSocket mode, with the same refusals, metrics and
+log fields. A refusal's `param` names the tool's field where the request sent it: `tools[i].parameters`,
+`tools[i].name` and `tools[i].strict` for a flat tool, the chat paths for a tool sent in the chat shape, which
+the Responses API takes as it is. The WebSocket mode parses a frame into a value, which sorts its keys, so it
+reads the frame's `tools` again from its text, as it already read `text`. With `strict` honoured on both surfaces,
+the field contract lists it as inert on neither.

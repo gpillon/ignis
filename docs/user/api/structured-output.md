@@ -254,7 +254,8 @@ A strict tool's calls on such a turn are the model's own for now (GitHub
 From 0.11.0, chat completions on the 27B hold the calls of a function tool
 sent with `strict: true`, a **strict tool**, to its `parameters`, with the
 same grammar that holds an answer: each sampled token is checked, and a miss
-is repaired.
+is repaired. The Responses API holds them too
+([below](#on-the-responses-api)).
 
 ```bash
 curl http://localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
@@ -301,8 +302,8 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
   a strict tool is checked when the request arrives (the refusals below),
   and its calls are served as the model writes them (GitHub #615).
 - **A request with no strict tool** is served as before, byte for byte.
-- **On Qwen3.8-Flash-Next** and **on the Responses API**, `strict` is
-  accepted and inert for now (GitHub #581, #613).
+- **On Qwen3.8-Flash-Next**, `strict` is accepted and inert for now (GitHub
+  #581).
 
 A held call's misses and repairs count beside structured output's, with the
 type `tool`: `ignis_structured_*{type="tool"}` in the
@@ -313,6 +314,8 @@ type `tool`: `ignis_structured_*{type="tool"}` in the
 A strict tool is refused with a `400` before anything is generated, naming
 the tool's field in `param`: `tools[1].function.parameters` for its schema,
 ``tools[1].function.parameters: strict tool refused, `minLength` at #/properties/a: `minLength` is outside the strict subset``.
+On the Responses API a `param` names the field where the tool sent it, flat
+beside its `type`: `tools[1].parameters`, `tools[i].name`, `tools[i].strict`.
 
 | You send | You get |
 |---|---|
@@ -337,6 +340,17 @@ is `text.format`, and the response's own `text.format` echoes what was sent.
 A streamed response's `response.output_text.delta` events carry only tokens
 the grammar accepted, and the `output_text` they add up to is the one a
 non-streamed response returns.
+
+[Held tools](#held-tools-strict-true) are the same on `/v1/responses`, over
+HTTP and over the WebSocket mode: a function tool sent with `strict: true`,
+which sits flat beside the tool's `name` there (`{"type": "function", "name":
+"write_file", "strict": true, "parameters": {...}}`), has its calls held, with
+the same refusals, metrics and log fields. A refusal's `param` names the tool
+as the request sent it, `tools[1].parameters` for a flat tool (or
+`tools[1].function.parameters` for one in the chat shape, which the Responses
+API takes as it is), and the WebSocket mode answers it as an `error` event. A
+streamed call comes in one `response.function_call_arguments.delta`, once the
+call is complete, with the `arguments` a non-streamed response returns.
 
 ## Cuts
 
