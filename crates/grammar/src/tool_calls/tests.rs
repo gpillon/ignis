@@ -709,7 +709,7 @@ const TYPED_SOUP: &[&str] = &[
     "<parameter=change>", "<parameter=rows>", "<parameter=tree>", "<parameter=note>", "<parameter=limit>", "</parameter>",
     "</function>", "</tool_call>", "{", "}", "[", "]", "\"", ",", ":", " ", "\"edits\"", "\"old\"", "\"new\"", "\"k\"", "\"v\"",
     "\"name\"", "\"kids\"", "1", "2", "0", "-", ".", "e", "true", "false", "null", "x", "é", "<", "</",
-    "12\n</parameter>\n", "\"edits\": [", "{\"old\": \"a\", \"new\": \"b\"}", "{\"name\": \"n\", \"kids\": []}", "{\"k\": \"a\", \"v\": 1}",
+    "\\n", "\\\"", "\\u00e9", "12\n</parameter>\n", "\"edits\": [", "{\"old\": \"a\", \"new\": \"b\"}", "{\"name\": \"n\", \"kids\": []}", "{\"k\": \"a\", \"v\": 1}",
 ];
 
 /// `edit`, held, and `search`, free, with whitespace runs of at most two
@@ -756,52 +756,104 @@ fn generated(fresh: fn() -> ToolCallMatcher, soup: &[&str], bytes: bool, seed: u
     (text, states)
 }
 
-/// Whether some bytes lead `m` back to free text: a breadth-first search
-/// over states, printable bytes and the line break (no space: a run of
-/// mixed whitespace makes as many states as it has spellings), one value
-/// at a time: from each state it reaches, to one with another parameter
-/// written, or free text (a whole call's search spends its budget on the
-/// orders of a typed tool's other parameters and the spellings of its JSON).
-fn completes(m: &ToolCallMatcher) -> bool {
-    let g = &m.grammar;
-    let alphabet: Vec<u8> = (0x21..0x7F).filter(|&b| b != b'\\').chain([b'\n']).collect();
+/// `write_file`, `get_time` and `search`, with whitespace runs of at most
+/// three bytes: a run reaches its bound, and the byte past it, within a
+/// search's reach.
+fn bounded_matcher() -> ToolCallMatcher {
+    matcher_of(&cache_within(GrammarLimits { max_whitespace: 3, ..GrammarLimits::default() }), &tools())
+}
+
+/// The readings the dead-end search starts from: `SOUP`'s over the string
+/// tools and `TYPED_SOUP`'s over the typed one, each grammar's whitespace
+/// bounded at two or three bytes.
+const SEARCHED: [(fn() -> ToolCallMatcher, &[&str], bool); 2] = [(bounded_matcher, SOUP, false), (typed_matcher, TYPED_SOUP, true)];
+
+/// The bytes a search writes: the printable ones, the space among them,
+/// and the line break; a backslash too where `escapes` (a free string's
+/// lines), never in a typed value's JSON, where an escape's hex digits make
+/// thousands of states (the generated texts write escapes there instead).
+fn alphabet(escapes: bool) -> Vec<u8> {
+    (0x20..0x7F).filter(|&b| escapes || b != b'\\').chain([b'\n']).collect()
+}
+
+/// Whether some bytes lead `s` out of its value: to free text, or to the
+/// state after another parameter's opener (a parameter more written),
+/// which is returned; a breadth-first search, so the way out is a shortest
+/// one, within a budget.
+fn way_out(g: &ToolCallGrammar, s: &CallState) -> Option<CallState> {
     let written = |s: &CallState| s.written.iter().filter(|&&w| w).count();
-    let mut from = m.state.clone();
-    'value: loop {
-        if ToolCallGrammar::outside_held(&from) {
-            return true;
+    let escapes = match s.at {
+        At::Value(v) => v.slot == JUNK || matches!(g.tool(v.tool).slots[v.slot as usize], Slot::Free),
+        _ => true,
+    };
+    let alphabet = alphabet(escapes);
+    let (mut seen, mut queue) = (HashSet::new(), VecDeque::from([s.clone()]));
+    while let Some(at) = queue.pop_front() {
+        if ToolCallGrammar::outside_held(&at) || written(&at) > written(s) {
+            return Some(at);
         }
-        let (mut seen, mut queue) = (HashSet::new(), VecDeque::from([from.clone()]));
-        while let Some(s) = queue.pop_front() {
-            if ToolCallGrammar::outside_held(&s) || written(&s) > written(&from) {
-                from = s;
-                continue 'value;
-            }
-            assert!(seen.len() <= 200_000, "search budget spent");
-            for &b in &alphabet {
-                let mut next = s.clone();
-                if g.step(&mut next, b) && seen.insert(next.clone()) {
-                    queue.push_back(next);
-                }
+        assert!(seen.len() <= 200_000, "search budget spent");
+        for &b in &alphabet {
+            let mut next = at.clone();
+            if g.step(&mut next, b) && seen.insert(next.clone()) {
+                queue.push_back(next);
             }
         }
-        return false;
     }
+    None
+}
+
+/// Whether `m` completes, its call's every other slot with it: from `m`'s
+/// own state a way out of its value, then of each value after it, to free
+/// text; and, for its held call, a way out of every value it may still
+/// open, under every set of parameters it may have written by then (each
+/// slot entered once across the whole test, in `entered`). Each way out
+/// writes a parameter more, so a call whose every entry has one completes.
+fn completes(m: &ToolCallMatcher, entered: &mut HashSet<(u32, Vec<bool>, u32)>) -> bool {
+    let g = &m.grammar;
+    let mut from = m.state.clone();
+    while !ToolCallGrammar::outside_held(&from) {
+        match way_out(g, &from) {
+            Some(next) => from = next,
+            None => return false,
+        }
+    }
+    let At::Value(v) = m.state.at else { return true };
+    let declared = g.tool(v.tool).parameters.declared().len();
+    // Every set holding what the call has written, and each slot it lacks.
+    for set in 0u32..1 << declared {
+        let written: Vec<bool> = (0..declared).map(|i| set & (1 << i) != 0 || m.state.written[i]).collect();
+        for slot in (0..declared).filter(|&i| !written[i]) {
+            let mut after = written.clone();
+            after[slot] = true;
+            if !entered.insert((v.tool, after.clone(), slot as u32)) {
+                continue;
+            }
+            let mut entry = CallState { written: after, ..CallState::default() };
+            g.enter(&mut entry, v.tool, slot as u32);
+            if way_out(g, &entry).is_none() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[test]
 fn no_state_is_a_dead_end() {
-    for (fresh, soup, bytes) in READINGS {
+    let mut entered = HashSet::new();
+    for (fresh, soup, bytes) in SEARCHED {
         let mut held = 0;
         for seed in 0..16 {
             let (text, states) = generated(fresh, soup, bytes, seed, 40);
-            for m in states.iter().filter(|m| m.in_call()).step_by(2) {
-                assert!(completes(m), "a dead end after {:?}", String::from_utf8_lossy(&text));
+            for m in states.iter().filter(|m| m.in_call()) {
+                assert!(completes(m, &mut entered), "a dead end after {:?}", String::from_utf8_lossy(&text));
                 held += 1;
             }
         }
-        assert!(held > 50, "{held}");
+        assert!(held > 100, "{held}");
     }
+    assert!(entered.len() > 400, "the typed tool's slots under every set written: {}", entered.len());
 }
 
 /// `text` as the vocabulary's tokens: the call's tags as their added

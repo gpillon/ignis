@@ -216,6 +216,43 @@ fn a_stop_inside_a_held_call_is_a_miss_and_the_cap_cuts_it() {
     assert!(missed > 0 && missed == repaired, "{missed} misses");
 }
 
+/// What the scheduler does where the grammar permits no token, which a
+/// grammar free of dead ends never reaches on a vocabulary that can write
+/// its tags: here one with no line break and no `<` token, the function's
+/// opening one token, and whitespace bounded at two bytes. Before the first
+/// parameter the call needs whitespace, then a line break or `<parameter=`:
+/// the model's `x` is repaired to a space, and at its next `x` nothing is
+/// permitted. That miss is not repaired and the request ends in an error,
+/// in the round it reaches it, the call never delivered.
+#[test]
+fn an_empty_permitted_set_ends_the_request_in_an_error() {
+    const HEAD: TokenId = VOCAB;
+    let entries = (0..=VOCAB)
+        .map(|id| match id {
+            STOP | THINK_END | OPEN | CLOSE => VocabEntry::Control,
+            HEAD => VocabEntry::Text(b"<function=write_file>".to_vec()),
+            60 => VocabEntry::Absent,
+            32..=126 => VocabEntry::Text(vec![id as u8]),
+            _ => VocabEntry::Absent,
+        })
+        .collect();
+    let added = vec![(THINK_END, b"</think>".to_vec()), (OPEN, b"<tool_call>".to_vec()), (CLOSE, b"</tool_call>".to_vec())];
+    let limits = ignis_grammar::GrammarLimits { max_whitespace: 2, ..ignis_grammar::GrammarLimits::default() };
+    let cache = GrammarCache::within(Vocab::new(entries, &[STOP]), limits).with_added_texts(added);
+    let grammar = cache.tool_calls(&[DeclaredTool { name: "write_file".into(), hold: ToolHold::Strict(WRITE_FILE.into()) }]).unwrap();
+    let mock = Arc::new(MockCompute::new());
+    let mut sched = scheduler(&mock);
+    let id = submit_held(&mut sched, false, 64, AnswerGrammar::tool_calls(grammar), None);
+    mock.script(id, &script(&[&[OPEN, HEAD], &encode("xxxx")]));
+
+    let events = run_to_idle(&mut sched);
+
+    assert_eq!(reason(&events, id), FinishReason::Error);
+    assert_eq!(emitted(&events, id), [OPEN, HEAD, TokenId::from(b' ')]);
+    assert_eq!(misses(&events, id), (2, 1), "the first `x` repaired, the second not");
+    assert_eq!(mock.repair_calls().len(), 1, "no repair is asked for an empty set");
+}
+
 /// The two shapes a stop arrives in: the leaf's own stop, which in free
 /// text ends the request as it would with no grammar, and the EOS a lane
 /// that decodes past it (`ignore_eos`) reports as a token, which passes in

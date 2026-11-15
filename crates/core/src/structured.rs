@@ -384,7 +384,8 @@ impl GrammarState {
     /// The permitted set where the answer stands: what a repair restricts
     /// the missed position to, the tool call's opener among it until the
     /// answer starts. Never empty while the answer is not finished (no state
-    /// of a grammar is a dead end); an empty one is refused here.
+    /// of a grammar is a dead end); an empty one is refused here, and the
+    /// miss then ends its request in an error, unrepaired.
     pub fn permitted(&mut self) -> Result<PermittedMask, String> {
         let vocab = self.matcher.vocab_len();
         let opener = self.tool_opener.filter(|&opener| self.opens_tool_call(opener) && (opener as usize) < vocab);
