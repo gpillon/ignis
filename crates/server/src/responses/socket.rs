@@ -432,11 +432,12 @@ impl Connection {
         event.remove("text");
         let mut body: CreateResponse = serde_json::from_value(JsonValue::Object(event))
             .map_err(|e| error_event("invalid_request_error", &format!("response.create: {e}"), None, stream))?;
-        body.text = input::frame_text(frame);
+        let as_sent = input::frame_as_sent(frame);
+        body.text = as_sent.text;
         // Nor are `tools`, once read from it: a strict tool's held calls
         // write their arguments in its `parameters`' order as sent (#613).
         if body.tools.is_some() {
-            body.tools = input::frame_tools(frame).or(body.tools);
+            body.tools = as_sent.tools.or(body.tools);
         }
         let warm_up = api::optional_bool(body.generate.as_ref(), "generate")
             .map_err(|message| error_event("invalid_request_error", &message, Some("generate"), stream))?

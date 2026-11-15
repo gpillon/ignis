@@ -390,8 +390,8 @@ ignis_thinking_forced_closes_total 3
 `;
 
 // Structured output (#593): the first request held to a grammar renders every series,
-// the tool calls a strict tool's requests hold among them (#611).
-export const STRUCTURED_FAMILIES = `# HELP ignis_structured_requests_total Completed requests held to a grammar, by the response_format type, or tool for a strict tool's calls.
+// the tool calls a held tool's requests hold among them (#611).
+export const STRUCTURED_FAMILIES = `# HELP ignis_structured_requests_total Completed requests held to a grammar, by the response_format type, or tool for a held tool's calls.
 # TYPE ignis_structured_requests_total counter
 ignis_structured_requests_total{type="json_object"} 20
 ignis_structured_requests_total{type="json_schema"} 0
@@ -439,7 +439,7 @@ ignis_tool_call_violations_total{kind="enum"} 0
 ignis_tool_call_violations_total{kind="unknown_parameter"} 1
 ignis_tool_call_violations_total{kind="constraint"} 0
 ignis_tool_call_violations_total{kind="undeclared_tool"} 0
-# HELP ignis_tool_strict_outside_subset_total Strict tools (strict: true) whose parameters lie outside OpenAI's strict subset, once per request that sends one; served as any other tool.
+# HELP ignis_tool_strict_outside_subset_total Strict tools (strict: true) whose parameters lie outside OpenAI's strict subset, once per request that sends one, counted as it arrives; the 27B then refuses the request with a 400.
 # TYPE ignis_tool_strict_outside_subset_total counter
 ignis_tool_strict_outside_subset_total 5
 # HELP ignis_tool_call_values_split_total String values of calls to tools that are not held, from which the parser dropped text after a tag inside them that a held tool's rule, the confirmed close, would have kept in the value.

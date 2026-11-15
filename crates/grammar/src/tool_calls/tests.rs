@@ -230,12 +230,17 @@ fn a_held_string_is_held_to_its_enum_pattern_and_format_on_one_line() {
 }
 
 #[test]
-fn a_value_cannot_hold_its_own_calls_confirmed_close() {
+fn a_value_cannot_hold_a_line_that_is_a_step_of_its_call() {
     let mut m = matcher();
     let head = "<tool_call>\n<function=write_file>\n<parameter=mode>\nw\n</parameter>\n<parameter=path>\na\n</parameter>\n<parameter=content>\nan example:\n";
     assert!(m.accept_bytes(head.as_bytes()));
     assert!(m.accept_bytes(b"</function>\n") && m.in_call());
     assert!(m.accept(CLOSE) && !m.in_call(), "the documented residue: the call ends there");
+    // Written first, a value ends at an opener of a parameter the call has
+    // not written yet: a `mode` that is not one of its values is then a miss.
+    let mut m = matcher();
+    assert!(m.accept_bytes(b"<tool_call>\n<function=write_file>\n<parameter=content>\ncall it so:\n<parameter=mode>\n"));
+    assert!(!m.clone().accept_bytes(b"x") && m.accept_bytes(b"w\n</parameter>\n"), "`mode`'s value now");
 }
 
 #[test]
@@ -325,6 +330,36 @@ fn a_tool_set_sent_again_is_compiled_once_and_its_strict_schemas_with_it() {
     assert_eq!(cache.compiles(), before);
     let held: Vec<(&str, Vec<String>)> = first.held().map(|(name, p)| (name, p.declared().to_vec())).collect();
     assert_eq!(held, vec![("write_file", vec!["path".into(), "content".into(), "mode".into()]), ("get_time", vec!["zone".into(), "day".into()])]);
+}
+
+/// A named `tool_choice` (#615): a call names that tool alone, held or not,
+/// whatever else the request declares, and the same tools under `"auto"`
+/// are a grammar of their own, every tool callable. A named tool whose name
+/// the dialect cannot write leaves every declared tool callable.
+#[test]
+fn a_named_tool_choice_holds_the_call_to_its_name() {
+    let cache = cache();
+    let named = |name: &str| ToolCallMatcher::new(cache.tool_calls_naming(&tools(), Some(name)).unwrap());
+    let heads = |mut m: ToolCallMatcher| -> Vec<bool> {
+        let mut opens: Vec<bool> = ["write_file", "get_time", "search"]
+            .iter()
+            .map(|name| m.clone().accept_bytes(format!("<tool_call>\n<function={name}>").as_bytes()))
+            .collect();
+        opens.push(m.accept_bytes(b"<tool_call>\n<function="));
+        opens
+    };
+    assert_eq!(heads(named("write_file")), [true, false, false, true]);
+    assert_eq!(heads(named("search")), [false, false, true, true], "a named tool that is not held");
+    let auto = ToolCallMatcher::new(cache.tool_calls(&tools()).unwrap());
+    assert_eq!(heads(auto), [true, true, true, true], "the same tools under \"auto\", cached apart");
+    // The tools it does not name stay held: what the scanner and the echo read.
+    let grammar = cache.tool_calls_naming(&tools(), Some("search")).unwrap();
+    assert!(grammar.holds(0) && grammar.holds(1) && !grammar.holds(2));
+    assert_eq!(grammar.held().count(), 2);
+    // A name the dialect cannot write: every declared tool, as before.
+    let beside = [tool("write_file", Some(WRITE_FILE)), tool("a>b", None)];
+    let mut m = ToolCallMatcher::new(cache.tool_calls_naming(&beside, Some("a>b")).unwrap());
+    assert!(m.accept_bytes(b"<tool_call>\n<function=write_file>"));
 }
 
 // ── typed and nullable values (#612) ─────────────────────────────────────
@@ -427,7 +462,7 @@ fn a_typed_value_starts_at_its_first_byte_and_whitespace_may_follow_it() {
         assert_eq!(edit_taken(&edit_call(&[("line", value)], &[])), head.len() + kept.len(), "{value:?}");
     }
     // With a later parameter still to write, the close after a typed value
-    // is a miss at spike S1's two points, by the rule itself.
+    // is a miss at the two points of spike S1 (spec #582), by the rule itself.
     for (after, kept) in [("</parameter>\n</function>", "</parameter>\n<"), ("</function>", "</")] {
         let text = format!("{head}12\n{after}");
         assert_eq!(edit_taken(&text), head.len() + 3 + kept.len(), "{after:?}");
@@ -516,6 +551,31 @@ fn a_string_that_may_be_null_is_raw_text_and_its_text_null_is_null() {
     }
     assert_eq!(readings(the_word), (Reading::Text, false));
     assert_eq!(readings(r#"{"type":"string"}"#), (Reading::Text, false));
+}
+
+/// The deepest typed value the grammar holds at the deepest nesting the
+/// server allows (`model.grammar_max_depth` at most the call parser's own
+/// bound, [`crate::json::MAX_DEPTH`]) is read by the parser as the JSON it
+/// is, never as a string: a held call is never delivered invalid by its
+/// depth (spec #582).
+#[test]
+fn the_deepest_value_held_at_the_widest_depth_reads_as_json() {
+    let parameters = r##"{"type":"object","properties":{"a":{"$ref":"#/$defs/t"}},"required":["a"],"additionalProperties":false,"$defs":{"t":{"type":"array","items":{"$ref":"#/$defs/t"}}}}"##;
+    let cache = cache_within(GrammarLimits { max_depth: crate::json::MAX_DEPTH, ..GrammarLimits::default() });
+    let grammar = cache.tool_calls(&[tool("one", Some(parameters))]).unwrap();
+    let mut m = ToolCallMatcher::new(grammar.clone());
+    assert!(m.accept_bytes(b"<tool_call>\n<function=one>\n<parameter=a>\n"));
+    let deepest = (0..).take_while(|_| m.accept_bytes(b"[")).count();
+    assert_eq!(deepest, crate::json::MAX_DEPTH - 1, "the depth bounds the value");
+    let value = format!("{}{}", "[".repeat(deepest), "]".repeat(deepest));
+    assert!(m.accept_bytes(&value.as_bytes()[deepest..]) && m.accept_bytes(b"\n</parameter>\n</function>\n</tool_call>"));
+    assert!(!m.in_call());
+    let (_, p) = grammar.held().next().unwrap();
+    let read = p.reading_of(0).read(&value);
+    assert_eq!(read, value, "read as JSON, not as a string");
+    let schema = crate::json::Json::parse(parameters).unwrap();
+    let arguments = crate::json::Json::parse(&format!(r#"{{"a":{read}}}"#)).unwrap();
+    assert!(crate::validate::is_valid(&schema, &arguments));
 }
 
 #[test]
@@ -649,7 +709,7 @@ const TYPED_SOUP: &[&str] = &[
     "<parameter=change>", "<parameter=rows>", "<parameter=tree>", "<parameter=note>", "<parameter=limit>", "</parameter>",
     "</function>", "</tool_call>", "{", "}", "[", "]", "\"", ",", ":", " ", "\"edits\"", "\"old\"", "\"new\"", "\"k\"", "\"v\"",
     "\"name\"", "\"kids\"", "1", "2", "0", "-", ".", "e", "true", "false", "null", "x", "é", "<", "</",
-    "12\n</parameter>\n", "\"edits\": [", "{\"old\": \"a\", \"new\": \"b\"}", "{\"name\": \"n\", \"kids\": []}", "{\"k\": \"a\", \"v\": 1}",
+    "\\n", "\\\"", "\\u00e9", "12\n</parameter>\n", "\"edits\": [", "{\"old\": \"a\", \"new\": \"b\"}", "{\"name\": \"n\", \"kids\": []}", "{\"k\": \"a\", \"v\": 1}",
 ];
 
 /// `edit`, held, and `search`, free, with whitespace runs of at most two
@@ -696,52 +756,104 @@ fn generated(fresh: fn() -> ToolCallMatcher, soup: &[&str], bytes: bool, seed: u
     (text, states)
 }
 
-/// Whether some bytes lead `m` back to free text: a breadth-first search
-/// over states, printable bytes and the line break (no space: a run of
-/// mixed whitespace makes as many states as it has spellings), one value
-/// at a time: from each state it reaches, to one with another parameter
-/// written, or free text (a whole call's search spends its budget on the
-/// orders of a typed tool's other parameters and the spellings of its JSON).
-fn completes(m: &ToolCallMatcher) -> bool {
-    let g = &m.grammar;
-    let alphabet: Vec<u8> = (0x21..0x7F).filter(|&b| b != b'\\').chain([b'\n']).collect();
+/// `write_file`, `get_time` and `search`, with whitespace runs of at most
+/// three bytes: a run reaches its bound, and the byte past it, within a
+/// search's reach.
+fn bounded_matcher() -> ToolCallMatcher {
+    matcher_of(&cache_within(GrammarLimits { max_whitespace: 3, ..GrammarLimits::default() }), &tools())
+}
+
+/// The readings the dead-end search starts from: `SOUP`'s over the string
+/// tools and `TYPED_SOUP`'s over the typed one, each grammar's whitespace
+/// bounded at two or three bytes.
+const SEARCHED: [(fn() -> ToolCallMatcher, &[&str], bool); 2] = [(bounded_matcher, SOUP, false), (typed_matcher, TYPED_SOUP, true)];
+
+/// The bytes a search writes: the printable ones, the space among them,
+/// and the line break; a backslash too where `escapes` (a free string's
+/// lines), never in a typed value's JSON, where an escape's hex digits make
+/// thousands of states (the generated texts write escapes there instead).
+fn alphabet(escapes: bool) -> Vec<u8> {
+    (0x20..0x7F).filter(|&b| escapes || b != b'\\').chain([b'\n']).collect()
+}
+
+/// Whether some bytes lead `s` out of its value: to free text, or to the
+/// state after another parameter's opener (a parameter more written),
+/// which is returned; a breadth-first search, so the way out is a shortest
+/// one, within a budget.
+fn way_out(g: &ToolCallGrammar, s: &CallState) -> Option<CallState> {
     let written = |s: &CallState| s.written.iter().filter(|&&w| w).count();
-    let mut from = m.state.clone();
-    'value: loop {
-        if ToolCallGrammar::outside_held(&from) {
-            return true;
+    let escapes = match s.at {
+        At::Value(v) => v.slot == JUNK || matches!(g.tool(v.tool).slots[v.slot as usize], Slot::Free),
+        _ => true,
+    };
+    let alphabet = alphabet(escapes);
+    let (mut seen, mut queue) = (HashSet::new(), VecDeque::from([s.clone()]));
+    while let Some(at) = queue.pop_front() {
+        if ToolCallGrammar::outside_held(&at) || written(&at) > written(s) {
+            return Some(at);
         }
-        let (mut seen, mut queue) = (HashSet::new(), VecDeque::from([from.clone()]));
-        while let Some(s) = queue.pop_front() {
-            if ToolCallGrammar::outside_held(&s) || written(&s) > written(&from) {
-                from = s;
-                continue 'value;
-            }
-            assert!(seen.len() <= 200_000, "search budget spent");
-            for &b in &alphabet {
-                let mut next = s.clone();
-                if g.step(&mut next, b) && seen.insert(next.clone()) {
-                    queue.push_back(next);
-                }
+        assert!(seen.len() <= 200_000, "search budget spent");
+        for &b in &alphabet {
+            let mut next = at.clone();
+            if g.step(&mut next, b) && seen.insert(next.clone()) {
+                queue.push_back(next);
             }
         }
-        return false;
     }
+    None
+}
+
+/// Whether `m` completes, its call's every other slot with it: from `m`'s
+/// own state a way out of its value, then of each value after it, to free
+/// text; and, for its held call, a way out of every value it may still
+/// open, under every set of parameters it may have written by then (each
+/// slot entered once across the whole test, in `entered`). Each way out
+/// writes a parameter more, so a call whose every entry has one completes.
+fn completes(m: &ToolCallMatcher, entered: &mut HashSet<(u32, Vec<bool>, u32)>) -> bool {
+    let g = &m.grammar;
+    let mut from = m.state.clone();
+    while !ToolCallGrammar::outside_held(&from) {
+        match way_out(g, &from) {
+            Some(next) => from = next,
+            None => return false,
+        }
+    }
+    let At::Value(v) = m.state.at else { return true };
+    let declared = g.tool(v.tool).parameters.declared().len();
+    // Every set holding what the call has written, and each slot it lacks.
+    for set in 0u32..1 << declared {
+        let written: Vec<bool> = (0..declared).map(|i| set & (1 << i) != 0 || m.state.written[i]).collect();
+        for slot in (0..declared).filter(|&i| !written[i]) {
+            let mut after = written.clone();
+            after[slot] = true;
+            if !entered.insert((v.tool, after.clone(), slot as u32)) {
+                continue;
+            }
+            let mut entry = CallState { written: after, ..CallState::default() };
+            g.enter(&mut entry, v.tool, slot as u32);
+            if way_out(g, &entry).is_none() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[test]
 fn no_state_is_a_dead_end() {
-    for (fresh, soup, bytes) in READINGS {
+    let mut entered = HashSet::new();
+    for (fresh, soup, bytes) in SEARCHED {
         let mut held = 0;
         for seed in 0..16 {
             let (text, states) = generated(fresh, soup, bytes, seed, 40);
-            for m in states.iter().filter(|m| m.in_call()).step_by(2) {
-                assert!(completes(m), "a dead end after {:?}", String::from_utf8_lossy(&text));
+            for m in states.iter().filter(|m| m.in_call()) {
+                assert!(completes(m, &mut entered), "a dead end after {:?}", String::from_utf8_lossy(&text));
                 held += 1;
             }
         }
-        assert!(held > 50, "{held}");
+        assert!(held > 100, "{held}");
     }
+    assert!(entered.len() > 400, "the typed tool's slots under every set written: {}", entered.len());
 }
 
 /// `text` as the vocabulary's tokens: the call's tags as their added

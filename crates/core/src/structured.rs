@@ -39,7 +39,7 @@
 //! so the call is written as the model writes it, with no check, miss or
 //! repair. A repair before the answer starts may draw the opener too: it is
 //! in the permitted set, as masking every step would have it. Beside the
-//! request's **strict tools** (GitHub #615,
+//! request's **held tools** (GitHub #615,
 //! [`AnswerGrammar::holding_calls`]) the call is held instead: from the
 //! opener on the turn is read by their tool calls' grammar, which holds that
 //! call and every one after it, the text between them free, and never
@@ -54,7 +54,7 @@
 //!
 //! # Tool calls held to their tools
 //!
-//! A request with a **strict tool** (GitHub #611, spec #582, ADR 0094) holds
+//! A request with a **held tool** (GitHub #611, spec #582, ADR 0094) holds
 //! its content to its tool calls' grammar ([`AnswerGrammar::tool_calls`])
 //! instead: free text, in which each call the model opens is checked as it
 //! is written, a held tool's arguments to its parameters. The grammar arms
@@ -89,7 +89,7 @@ pub enum StructuredKind {
     JsonObject,
     /// A JSON value valid under the caller's schema (`json_schema`, #588).
     JsonSchema,
-    /// Tool calls held to the request's tools: a request with a **strict
+    /// Tool calls held to the request's tools: a request with a **held
     /// tool** (GitHub #611).
     Tool,
 }
@@ -171,7 +171,7 @@ impl AnswerGrammar {
         Self { tool_opener: Some(opener), ..self }
     }
 
-    /// The same answer, beside the request's **strict tools** (GitHub #615):
+    /// The same answer, beside the request's **held tools** (GitHub #615):
     /// the call a turn opens instead of the answer
     /// ([`AnswerGrammar::admitting_tool_call`]) is held to their tool calls'
     /// grammar, which then holds the rest of the turn -- its text free, each
@@ -210,7 +210,7 @@ pub enum Verdict {
     Miss,
     /// The tool call's opener before the answer started (GitHub #592): the
     /// turn is a call, released from the grammar -- unless the request's
-    /// strict tools hold the call (#615), and the opener then passes.
+    /// held tools hold the call (#615), and the opener then passes.
     Released,
 }
 
@@ -331,7 +331,7 @@ impl GrammarState {
     /// or redirect, and the rest of the run is left to it whole. So is the
     /// rest of a run whose draft opens a tool call before the answer started
     /// (GitHub #592), which releases the turn, and every run after -- unless
-    /// the request's strict tools hold the call (#615), whose drafts are then
+    /// the request's held tools hold the call (#615), whose drafts are then
     /// checked as the answer's were.
     pub fn check_run(&mut self, run: &[PendingToken]) -> usize {
         if self.released {
@@ -366,7 +366,7 @@ impl GrammarState {
 
     /// Check a pending token of the answer, and take it when it passes. The
     /// tool call's opener before the answer started releases the turn, or
-    /// passes into the call the request's strict tools hold (#615).
+    /// passes into the call the request's held tools hold (#615).
     pub fn check(&mut self, draw: PendingToken) -> Verdict {
         match draw {
             PendingToken::Token(token) if self.opens_tool_call(token) => match self.open_tool_call(token) {
@@ -384,7 +384,8 @@ impl GrammarState {
     /// The permitted set where the answer stands: what a repair restricts
     /// the missed position to, the tool call's opener among it until the
     /// answer starts. Never empty while the answer is not finished (no state
-    /// of a grammar is a dead end); an empty one is refused here.
+    /// of a grammar is a dead end); an empty one is refused here, and the
+    /// miss then ends its request in an error, unrepaired.
     pub fn permitted(&mut self) -> Result<PermittedMask, String> {
         let vocab = self.matcher.vocab_len();
         let opener = self.tool_opener.filter(|&opener| self.opens_tool_call(opener) && (opener as usize) < vocab);
@@ -398,7 +399,7 @@ impl GrammarState {
 
     /// Take the token a repair drew: `true` when it was a stop, and the
     /// answer is complete. The tool call's opener releases the turn, or
-    /// opens the call the request's strict tools hold (#615). Refused when
+    /// opens the call the request's held tools hold (#615). Refused when
     /// the token is not one the grammar allows there, which a repair under
     /// its permitted set never draws.
     pub fn repaired(&mut self, token: TokenId) -> Result<bool, String> {

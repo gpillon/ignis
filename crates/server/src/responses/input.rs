@@ -241,7 +241,7 @@ pub(crate) async fn prepare(
         req.tools.unwrap_or_default().into_iter().map(|tool| (tool.value, tool.ordered)).unzip();
     let tools = chat_tools(&sent_tools)?;
     let (tools, tool_choice) = api::resolve_tools(Some(tools), req.tool_choice.clone().map(chat_tool_choice))?;
-    api::count_strict_tools(server, &tools);
+    api::count_strict_tools(server, &raw_tools, &tools);
 
     let mut items = history;
     items.extend(input_items(req.input.clone())?);
@@ -295,8 +295,8 @@ pub(crate) async fn prepare(
     // #615), and a tool sent without `strict` is normalized and held where
     // its schema allows it (#614); a strict tool's refusals come before
     // anything is rendered or generated, and a warm-up holds no grammar.
-    let api::HeldContent { grammar, description, schemas, held: held_tools, switch } =
-        api::held_content(server, held, &raw_tools, &tools, &thinking, api::WithoutStrict::Normalized)?;
+    let api::HeldContent { grammar, description, schemas, echo } =
+        api::held_content(server, held, &raw_tools, &tools, &tool_choice, &thinking, api::WithoutStrict::Normalized)?;
     let (grammar, description) = (grammar.filter(|_| !warm_up), description.filter(|_| !system_only));
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
         .map_err(|message| api::bad_request(&message))?;
@@ -343,7 +343,7 @@ pub(crate) async fn prepare(
         temperature: wire_number(params.temperature),
         text: echoed_text(req.text.as_deref()),
         tool_choice: req.tool_choice.clone().unwrap_or_else(|| json!("auto")),
-        tools: echoed_tools(sent_tools, &held_tools, server.active().family.serves_structured_output(), switch),
+        tools: echoed_tools(sent_tools, &echo),
         top_p: wire_number(params.top_p),
         truncation: "disabled",
         usage: None,
@@ -380,27 +380,17 @@ pub(crate) async fn prepare(
 /// `strict` keeps it, but under the operator's switch at `held` (#616) only
 /// `strict: true` does, and one sent `strict: false` carries the one it was
 /// served with as one sent without; and on a model that holds no tool's
-/// calls (`holds` false: Flash-Next, #581) every tool carries `false`, a
-/// `strict: true` inert there. `held` is [`api::HeldContent::held`], by the
-/// tools' places.
-fn echoed_tools(mut tools: Vec<JsonValue>, held: &[bool], holds: bool, switch: api::ToolArguments) -> Vec<JsonValue> {
-    for (index, tool) in tools.iter_mut().enumerate() {
+/// calls (Flash-Next, #581) every tool carries `false`, a `strict: true`
+/// inert there. `echo` is [`api::HeldContent::echo`], by the tools' places.
+fn echoed_tools(mut tools: Vec<JsonValue>, echo: &[Option<bool>]) -> Vec<JsonValue> {
+    for (tool, served) in tools.iter_mut().zip(echo) {
         let function = match tool.get("function").is_some() {
             true => &mut tool["function"],
             false => tool,
         };
         let Some(function) = function.as_object_mut() else { continue };
-        let sent = match switch {
-            api::ToolArguments::AsSent => function.get("strict").is_some_and(|strict| !strict.is_null()),
-            api::ToolArguments::Held => function.get("strict") == Some(&JsonValue::Bool(true)),
-        };
-        let served = match (holds, sent) {
-            (false, _) => Some(false),
-            (true, false) => Some(held.get(index).copied().unwrap_or(false)),
-            (true, true) => None,
-        };
         if let Some(served) = served {
-            function.insert("strict".to_owned(), JsonValue::Bool(served));
+            function.insert("strict".to_owned(), JsonValue::Bool(*served));
         }
     }
     tools
@@ -415,25 +405,20 @@ fn echoed_text(text: Option<&RawValue>) -> JsonValue {
     json!({ "format": format.unwrap_or_else(|| json!({ "type": "text" })) })
 }
 
-/// A `response.create` frame's `text`, as the client sent it: a frame is
-/// parsed into a value to be read field by field, and a value has lost its
-/// schema's key order ([`CreateResponse::text`]).
-pub(crate) fn frame_text(frame: &str) -> Option<Box<RawValue>> {
-    #[derive(Deserialize)]
-    struct Frame {
-        text: Option<Box<RawValue>>,
-    }
-    serde_json::from_str::<Frame>(frame).ok().and_then(|frame| frame.text)
+/// What a `response.create` frame sent in an order a parsed value loses,
+/// read once from the frame's text: a frame is parsed into a value to be
+/// read field by field, and a value has sorted every object's keys.
+#[derive(Deserialize, Default)]
+pub(crate) struct FrameAsSent {
+    /// Its `text`, as sent ([`CreateResponse::text`]): a schema's key order.
+    pub text: Option<Box<RawValue>>,
+    /// Its `tools`, each in its key order as sent ([`CreateResponse::tools`]).
+    pub tools: Option<Vec<api::Sent>>,
 }
 
-/// A `response.create` frame's `tools`, each in its key order as sent
-/// ([`CreateResponse::tools`]), which the parsed frame has sorted.
-pub(crate) fn frame_tools(frame: &str) -> Option<Vec<api::Sent>> {
-    #[derive(Deserialize)]
-    struct Frame {
-        tools: Option<Vec<api::Sent>>,
-    }
-    serde_json::from_str::<Frame>(frame).ok().and_then(|frame| frame.tools)
+/// A `response.create` frame's [`FrameAsSent`].
+pub(crate) fn frame_as_sent(frame: &str) -> FrameAsSent {
+    serde_json::from_str(frame).unwrap_or_default()
 }
 
 /// The Responses `tools` in the shape chat completions takes (spec

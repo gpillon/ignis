@@ -679,7 +679,8 @@ fn read_file_parameters() -> JsonValue {
 /// the call comes back as the model wrote it, its arguments not held to the
 /// tool's `parameters`, and the template receives the tool as sent. Both
 /// hold a strict tool's calls on the 27B (GitHub #611, #613,
-/// `held_tools_http`), so neither document declares it inert.
+/// `held_tools_http`), so each document declares it inert on Flash-Next
+/// alone.
 #[tokio::test]
 async fn strict_on_a_function_tool_is_accepted_and_inert() {
     for strict in [json!(true), json!(false), json!(null)] {
@@ -703,6 +704,8 @@ async fn strict_on_a_function_tool_is_accepted_and_inert() {
         assert_eq!(call["arguments"], r#"{"depth":3}"#, "strict {strict}: {response}");
     }
     for surface in [openai_fields::Surface::Chat, openai_fields::Surface::Responses] {
-        assert!(!openai_fields::describe(surface).contains("strict"), "{surface:?} holds strict tools");
+        let text = openai_fields::describe(surface);
+        assert_eq!(text.matches("strict").count(), 1, "{surface:?}: {text}");
+        assert!(text.contains("`strict` is honoured on the 27B, and accepted as inert on Qwen3.8-Flash-Next"), "{surface:?}: {text}");
     }
 }

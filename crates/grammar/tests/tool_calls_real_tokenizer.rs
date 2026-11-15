@@ -5,7 +5,7 @@
 //! the permitted set equals the token-by-token reference on the states of
 //! held calls as the tokenizer splits them (`=` merged into a name, the
 //! newlines merged with whitespace, the tags in several tokens); and spike
-//! S1's two miss points land on the real ids. Machine-local: skips when the
+//! S1's two miss points (spec #582) land on the real ids. Machine-local: skips when the
 //! artifact is not at its path (the convention of
 //! `crates/artifact/tests/real_artifact.rs`). CPU-only.
 

@@ -12,6 +12,7 @@
 
 #[path = "support/responses.rs"]
 mod responses;
+use responses::tool_call as call;
 
 use std::sync::Arc;
 
@@ -139,12 +140,6 @@ fn tools() -> JsonValue {
         }}},
         {"type": "function", "function": {"name": "note"}}
     ])
-}
-
-fn call(function: &str, parameters: &[(&str, &str)]) -> String {
-    let parameters: String =
-        parameters.iter().map(|(name, value)| format!("<parameter={name}>\n{value}\n</parameter>\n")).collect();
-    format!("<tool_call>\n<function={function}>\n{parameters}</function>\n</tool_call>")
 }
 
 /// A model that writes a call of every kind the check counts: two valid,

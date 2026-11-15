@@ -216,6 +216,43 @@ fn a_stop_inside_a_held_call_is_a_miss_and_the_cap_cuts_it() {
     assert!(missed > 0 && missed == repaired, "{missed} misses");
 }
 
+/// What the scheduler does where the grammar permits no token, which a
+/// grammar free of dead ends never reaches on a vocabulary that can write
+/// its tags: here one with no line break and no `<` token, the function's
+/// opening one token, and whitespace bounded at two bytes. Before the first
+/// parameter the call needs whitespace, then a line break or `<parameter=`:
+/// the model's `x` is repaired to a space, and at its next `x` nothing is
+/// permitted. That miss is not repaired and the request ends in an error,
+/// in the round it reaches it, the call never delivered.
+#[test]
+fn an_empty_permitted_set_ends_the_request_in_an_error() {
+    const HEAD: TokenId = VOCAB;
+    let entries = (0..=VOCAB)
+        .map(|id| match id {
+            STOP | THINK_END | OPEN | CLOSE => VocabEntry::Control,
+            HEAD => VocabEntry::Text(b"<function=write_file>".to_vec()),
+            60 => VocabEntry::Absent,
+            32..=126 => VocabEntry::Text(vec![id as u8]),
+            _ => VocabEntry::Absent,
+        })
+        .collect();
+    let added = vec![(THINK_END, b"</think>".to_vec()), (OPEN, b"<tool_call>".to_vec()), (CLOSE, b"</tool_call>".to_vec())];
+    let limits = ignis_grammar::GrammarLimits { max_whitespace: 2, ..ignis_grammar::GrammarLimits::default() };
+    let cache = GrammarCache::within(Vocab::new(entries, &[STOP]), limits).with_added_texts(added);
+    let grammar = cache.tool_calls(&[DeclaredTool { name: "write_file".into(), hold: ToolHold::Strict(WRITE_FILE.into()) }]).unwrap();
+    let mock = Arc::new(MockCompute::new());
+    let mut sched = scheduler(&mock);
+    let id = submit_held(&mut sched, false, 64, AnswerGrammar::tool_calls(grammar), None);
+    mock.script(id, &script(&[&[OPEN, HEAD], &encode("xxxx")]));
+
+    let events = run_to_idle(&mut sched);
+
+    assert_eq!(reason(&events, id), FinishReason::Error);
+    assert_eq!(emitted(&events, id), [OPEN, HEAD, TokenId::from(b' ')]);
+    assert_eq!(misses(&events, id), (2, 1), "the first `x` repaired, the second not");
+    assert_eq!(mock.repair_calls().len(), 1, "no repair is asked for an empty set");
+}
+
 /// The two shapes a stop arrives in: the leaf's own stop, which in free
 /// text ends the request as it would with no grammar, and the EOS a lane
 /// that decodes past it (`ignore_eos`) reports as a token, which passes in
@@ -395,6 +432,45 @@ fn a_call_the_model_opens_in_the_run_that_closes_its_reasoning_is_continued_or_y
         assert_eq!(misses(&events, id), missed, "{what}");
         let first: Vec<PendingToken> = written[..5].iter().map(|&t| PendingToken::Token(t)).collect();
         assert_eq!(mock.cut_calls()[0], (id, first, 5), "{what}: the run kept whole");
+    }
+}
+
+/// A named `tool_choice` beside a held tool holds the call to the name it
+/// names, on the two paths where its forced opening does not write the
+/// name: the literal yielding to the grammar after a line break more, and
+/// the model having written the whole common opening itself in the run that
+/// closes its reasoning, the literal then left alone. The model goes on to
+/// name `wrote_file`, another declared tool: its `o` is a miss, repaired to
+/// the named `write_file`'s `i`, and the call is held to that tool, its
+/// mode `x` repaired too.
+#[test]
+fn a_named_tool_choice_holds_the_call_to_its_name_where_its_literal_does_not_write_it() {
+    let tools = [
+        DeclaredTool { name: "write_file".into(), hold: ToolHold::Strict(WRITE_FILE.into()) },
+        DeclaredTool { name: "wrote_file".into(), hold: ToolHold::Free },
+    ];
+    let named = || cache().tool_calls_naming(&tools, Some("write_file")).unwrap();
+    let other = body("x").replacen("write_file", "wrote_file", 1);
+    let opening = script(&[&[OPEN], &encode("\n<function")]);
+    let cases = [
+        ("a line break more", 5, script(&[&encode("ok"), &[THINK_END, OPEN], &encode("\n\n"), &encode(&other[1..]), &[CLOSE]])),
+        ("the model's own opening", 16, script(&[&encode("ok"), &[THINK_END], &opening, &encode(&other["\n<function".len()..]), &[CLOSE]])),
+    ];
+    for (what, run, written) in cases {
+        let mock = Arc::new(MockCompute::with_runs(&[run]));
+        let mut sched = scheduler(&mock);
+        let literal = script(&[&[OPEN], &encode("\n<function=write_file>\n")]);
+        let forced = ForcedLiteral::after_reasoning(literal, THINK_END, required_opening().len()).unwrap();
+        let id = submit_held(&mut sched, true, 256, AnswerGrammar::tool_calls(named()).after(THINK_END), Some(forced));
+        mock.script(id, &written);
+
+        let events = run_to_idle(&mut sched);
+
+        let held = String::from_utf8(emitted(&events, id).iter().filter(|&&t| t < 128 && t != OPEN && t != CLOSE && t != THINK_END).map(|&t| t as u8).collect()).unwrap();
+        assert!(held.contains("<function=write_file>\n<parameter=mode>\na\n"), "{what}: {held:?}");
+        assert!(!held.contains("wrote_file"), "{what}: {held:?}");
+        assert_eq!(misses(&events, id), (2, 2), "{what}: the name's `o` and the mode");
+        assert_eq!(reason(&events, id), FinishReason::Stop, "{what}");
     }
 }
 

@@ -17,9 +17,9 @@
       {"arguments": {"path": "a", "limit": 1.5}, "kinds": ["type"]},
       {"arguments": {"path": "a", "limit": 1.0}, "kinds": ["type"]},
       {"arguments": {"path": "a", "offset": "3"}, "kinds": ["type"]},
-      {"arguments": {"path": "a", "recursive": true}, "kinds": ["unknown"]},
-      {"arguments": {"path": true, "extra": 1}, "kinds": ["type", "unknown"]},
-      {"arguments": {"file_path": "a.txt"}, "kinds": ["missing", "unknown"]}
+      {"arguments": {"path": "a", "recursive": true}, "kinds": ["unknown_parameter"]},
+      {"arguments": {"path": true, "extra": 1}, "kinds": ["type", "unknown_parameter"]},
+      {"arguments": {"file_path": "a.txt"}, "kinds": ["missing", "unknown_parameter"]}
     ]
   },
   {
@@ -33,7 +33,7 @@
       {"arguments": {"mode": "Replace", "edits": [{"old": "a", "new": "b"}]}, "kinds": ["enum"]},
       {"arguments": {"mode": "replace", "edits": []}, "kinds": ["constraint"]},
       {"arguments": {"mode": "replace", "edits": [{"old": "a"}]}, "kinds": ["missing"]},
-      {"arguments": {"mode": "replace", "edits": [{"old": "a", "new": "b", "all": true}]}, "kinds": ["unknown"]},
+      {"arguments": {"mode": "replace", "edits": [{"old": "a", "new": "b", "all": true}]}, "kinds": ["unknown_parameter"]},
       {"arguments": {"mode": "replace", "edits": "a -> b"}, "kinds": ["type"]},
       {"arguments": {"mode": 3, "edits": [{"old": "a", "new": "b"}]}, "kinds": ["type"]},
       {"arguments": {"edits": [{"old": "a", "new": 2}]}, "kinds": ["missing", "type"]}
@@ -160,7 +160,7 @@
       {"tree": {"name": "leaf"}}
     ],
     "invalid": [
-      {"arguments": {"tree": {"name": "a", "children": [{"title": "b"}]}}, "kinds": ["missing", "unknown"]},
+      {"arguments": {"tree": {"name": "a", "children": [{"title": "b"}]}}, "kinds": ["missing", "unknown_parameter"]},
       {"arguments": {"tree": {"name": 3}}, "kinds": ["type"]},
       {"arguments": {"tree": {"name": "a", "children": [{"name": "b", "children": [{"name": []}]}]}}, "kinds": ["type"]}
     ]
@@ -209,7 +209,7 @@
       {}
     ],
     "invalid": [
-      {"arguments": {"verbose": true}, "kinds": ["unknown"]}
+      {"arguments": {"verbose": true}, "kinds": ["unknown_parameter"]}
     ]
   }
 ]

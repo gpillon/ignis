@@ -219,7 +219,7 @@ impl Vocab {
 
     pub(crate) fn raw_tables(&self) -> &RawTables {
         self.raw.get_or_init(|| {
-            let mut plain: Vec<crate::TokenSet> = (0..8).map(|_| crate::TokenSet::new(self.n)).collect();
+            let mut plain: Vec<crate::TokenSet> = (0..crate::string::UTF8_STATES).map(|_| crate::TokenSet::new(self.n)).collect();
             let mut newline = Vec::new();
             for id in 0..self.n as u32 {
                 let Some(bytes) = self.token_bytes(id) else { continue };
@@ -228,7 +228,7 @@ impl Vocab {
                     continue;
                 }
                 for (debt, set) in plain.iter_mut().enumerate() {
-                    if bytes.iter().try_fold(debt as u8, |d, &b| crate::tool_calls::utf8_next(d, b)).is_some() {
+                    if bytes.iter().try_fold(debt as u8, |d, &b| crate::string::utf8_next(d, b)).is_some() {
                         set.insert(id);
                     }
                 }

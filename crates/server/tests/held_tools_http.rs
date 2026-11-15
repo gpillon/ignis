@@ -35,6 +35,7 @@ use ignis_server::Server;
 
 #[path = "support/responses.rs"]
 mod responses;
+use responses::tool_call as call;
 
 #[path = "support/held_tools_corpus.rs"]
 mod corpus;
@@ -71,12 +72,19 @@ fn encode(text: &str) -> Vec<TokenId> {
     ids
 }
 
-/// The placeholder's prompt, the vocabulary's text back out, its grammars.
+/// The placeholder's prompt, the vocabulary's text back out, its grammars;
+/// with `split_think_end`, a template that encodes `</think>` to more than
+/// one token.
 struct Vocabulary {
     grammars: Arc<GrammarCache>,
+    split_think_end: bool,
 }
 
 impl Vocabulary {
+    fn split_think_end() -> Self {
+        Self { split_think_end: true, ..Self::new() }
+    }
+
     fn new() -> Self {
         let entries = (0..VOCAB)
             .map(|id| match id {
@@ -86,7 +94,8 @@ impl Vocabulary {
             })
             .collect();
         let added = TAGS.iter().map(|(id, tag)| (*id, tag.as_bytes().to_vec())).collect();
-        Self { grammars: Arc::new(GrammarCache::new(Vocab::new(entries, &[STOP]), DEFAULT_CACHE_BYTES).with_added_texts(added)) }
+        let grammars = Arc::new(GrammarCache::new(Vocab::new(entries, &[STOP]), DEFAULT_CACHE_BYTES).with_added_texts(added));
+        Self { grammars, split_think_end: false }
     }
 }
 
@@ -101,7 +110,10 @@ impl TemplateProvider for Vocabulary {
     }
 
     fn encode_literal(&self, text: &str) -> Option<Vec<TokenId>> {
-        Some(encode(text))
+        match self.split_think_end && text == "</think>" {
+            true => Some(text.chars().map(TokenId::from).collect()),
+            false => Some(encode(text)),
+        }
     }
 
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
@@ -160,16 +172,6 @@ fn chat(tools: &[&str], stream: bool, max_tokens: u32) -> String {
         r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"write it"}}],"tools":[{}],"enable_thinking":false,"temperature":0,"max_tokens":{max_tokens},"stream":{stream}}}"#,
         tools.join(",")
     )
-}
-
-/// A call in the template's form.
-fn call(name: &str, args: &[(&str, &str)]) -> String {
-    let mut out = format!("<tool_call>\n<function={name}>\n");
-    for (k, v) in args {
-        out.push_str(&format!("<parameter={k}>\n{v}\n</parameter>\n"));
-    }
-    out.push_str("</function>\n</tool_call>");
-    out
 }
 
 async fn post(server: &Server, body: &str) -> (u16, JsonValue, String) {
@@ -236,6 +238,27 @@ async fn a_strict_tools_call_is_held_and_delivered_in_the_schemas_order() {
     assert_eq!(calls, [("write_file".to_owned(), r#"{"path":"a.txt","content":"hi","mode":"w"}"#.to_owned())]);
     tool_counts(&server, 1, 0).await;
     assert!(mock.decode_calls().iter().flatten().all(|job| job.checked), "every round of the content is checked");
+}
+
+/// A strict schema sent in an order that is not its keys' sorted one is
+/// compiled once, as sent, for the outside-subset count and for its held
+/// calls alike: one grammar for it and one for the request's tools, and a
+/// request sent again compiles nothing.
+#[tokio::test]
+async fn a_strict_schema_is_compiled_once_in_the_order_sent() {
+    let script = call("write_file", &[("path", "a.txt"), ("content", "hi"), ("mode", "w")]);
+    let mock = Arc::new(MockCompute::new());
+    mock.script(0, &encode(&script));
+    mock.script(1, &encode(&script));
+    let vocabulary = Vocabulary::new();
+    let grammars = vocabulary.grammars.clone();
+    let scheduler = ConcreteScheduler::with_config(SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() }, mock);
+    let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(vocabulary)).with_seedless_seed(0).with_family(ModelFamily::Qwen38_27b).with_metrics();
+    for _ in 0..2 {
+        let (_, calls, _) = served(&server, &chat(&[WRITE_FILE], false, 256)).await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!((grammars.compiles(), grammars.len()), (2, 2), "the schema as sent, and the tools'");
+    }
 }
 
 /// The scripts that miss on purpose, each one call to `write_file`, and
@@ -309,6 +332,18 @@ fn scripts_that_miss() -> Vec<(&'static str, String, &'static str, u64)> {
             format!("<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=mode>\nw\n</parameter>\n<parameter=content>\n<parameter=path>\nb.txt\n</parameter>\n</function>\nnot the end\n</tool_call> either\n{close}"),
             r#"{"path":"a.txt","content":"<parameter=path>\nb.txt\n</parameter>\n</function>\nnot the end\n</tool_call> either","mode":"w"}"#,
             0,
+        ),
+        // The same kind of file written first, the order the model chose on
+        // the 27B: with `path` and `mode` still missing a line may not start
+        // `</function`, so the `n` of `</functional>` is a miss, repaired to
+        // the script's next letter, `a`; and a line opening `mode`, which
+        // the call has not written yet, ends `content` and opens the call's
+        // own `mode`, the example's `w` its value (the documented residue).
+        (
+            "a file's content written first",
+            "<tool_call>\n<function=write_file>\n<parameter=content>\nCall it so:\n</functional>\n<parameter=mode>\nw\n</parameter>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>".into(),
+            r#"{"path":"a.txt","content":"Call it so:\n</functioaal>","mode":"w"}"#,
+            1,
         ),
     ]
 }
@@ -418,6 +453,12 @@ fn refused_tools() -> Vec<(String, &'static str, &'static str, &'static str)> {
         (strict(r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a"],"additionalProperties":false}"#), "not_all_required", "tools[1].function.parameters", "`required`"),
         (object(r#"{"type":"string","enum":["two\nlines"]}"#), "no_writable_value", "tools[1].function.parameters", "`enum`"),
         (
+            strict(r#"{"type":"object","properties":{"a>b":{"type":"string"}},"required":["a>b"],"additionalProperties":false}"#),
+            "parameter_name_unwritable",
+            "tools[1].function.parameters",
+            "`properties`",
+        ),
+        (
             r#"{"type":"function","function":{"name":"a>b","strict":true,"parameters":{"type":"object","properties":{},"required":[],"additionalProperties":false}}}"#.into(),
             "tool_name_unwritable",
             "tools[1].function.name",
@@ -498,10 +539,10 @@ async fn a_streamed_held_call_arrives_only_once_complete() {
     assert_eq!(calls[0].1, r#"{"path":"a.txt","content":"hi","mode":"a"}"#);
 }
 
-/// A call `max_tokens` cuts is the call as generated: open, so not
-/// delivered, with `finish_reason: "length"` (#583 changes how it is sent).
+/// A call `max_tokens` cuts is left open, so dropped, as every open call
+/// is, with `finish_reason: "length"` (#583 changes how it is sent).
 #[tokio::test]
-async fn a_held_call_the_cap_cuts_returns_as_generated_with_length() {
+async fn a_held_call_the_cap_cuts_is_dropped_with_length() {
     let script = format!("Writing.\n{}", call("write_file", &[("path", "a.txt"), ("content", "a long text"), ("mode", "w")]));
     let (server, _) = server(&script, ModelFamily::Qwen38_27b);
     let (content, calls, finish) = served(&server, &chat(&[WRITE_FILE], false, 40)).await;
@@ -654,6 +695,35 @@ async fn with_thinking_on_a_call_written_in_the_reasoning_is_neither_held_nor_pa
     }
 }
 
+/// A named `tool_choice` beside a strict tool, thinking on, where its forced
+/// opening yields: the model's run commits `</think>`, its own
+/// `<tool_call>` and a line break, and the line break after them is not
+/// the opening's `<`. The call it then writes to `wrote_file`, another of
+/// the request's tools, is held to the named `write_file`: the name's `o`
+/// and the mode `x` repaired.
+#[tokio::test]
+async fn a_named_tool_choice_holds_the_call_to_its_name_where_its_opening_yields() {
+    let wrote = SEARCH.replace("\"search\"", "\"wrote_file\"");
+    let script = format!("ok</think><tool_call>\n\n{}", &call("wrote_file", &[("mode", "x"), ("path", "a.txt"), ("content", "hi")])["<tool_call>\n".len()..]);
+    let mock = Arc::new(MockCompute::with_runs(&[5]));
+    mock.script(0, &encode(&script));
+    let scheduler = ConcreteScheduler::with_config(SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() }, mock.clone());
+    let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(Vocabulary::new()))
+        .with_request_timeout(Duration::from_secs(5))
+        .with_seedless_seed(0)
+        .with_family(ModelFamily::Qwen38_27b)
+        .with_metrics();
+    let named = r#""tool_choice":{"type":"function","function":{"name":"write_file"}}"#;
+    let body = chat_with(&[WRITE_FILE, &wrote], false, 512, named).replace("\"enable_thinking\":false", "\"enable_thinking\":true");
+    let (status, json, text) = post(&server, &body).await;
+    assert_eq!(status, 200, "{text}");
+    let calls = json["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1, "{text}");
+    assert_eq!(calls[0]["function"]["name"], "write_file", "{text}");
+    assert_eq!(calls[0]["function"]["arguments"], r#"{"path":"a.txt","content":"hi","mode":"a"}"#);
+    tool_counts(&server, 1, 2).await;
+}
+
 /// `parallel_tool_calls: false` beside a strict tool: the turn ends at the
 /// call's confirmed close, not at the call closer its `content` holds on a
 /// line of its own, where the first-occurrence rule would end it; the value
@@ -683,13 +753,7 @@ async fn with_parallel_tool_calls_false_a_held_call_ends_the_turn_at_its_confirm
             assert_eq!(tokens, Some(encode(&first).len() as u64), "the tokens up to the confirmed close");
         }
         assert!(!text.contains("b.txt"), "stream {stream}: the second call reached the client: {text}");
-        let released = tokio::time::timeout(Duration::from_secs(10), async {
-            while !mock.released_requests().contains(&0) {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        })
-        .await;
-        assert!(released.is_ok(), "stream {stream}: the request ran on past the close");
+        assert!(responses::released(&mock, 0).await, "stream {stream}: the request ran on past the close");
         tool_counts(&server, 1, 0).await;
     }
 }
@@ -900,6 +964,61 @@ async fn on_the_responses_api_a_refused_strict_tool_is_named_where_it_was_sent()
         let (events, _, _) = socket_events("", ModelFamily::FlashNext, &body).await;
         assert_eq!(events.last().unwrap()["type"], "response.completed", "{events:?}");
     }
+}
+
+/// With thinking on, a template whose `</think>` is not one token has no
+/// token to hold the content after: a strict tool is refused, its `strict`
+/// named where it was sent (chat completions, the Responses API's flat
+/// tool, the WebSocket mode's `error` event), while a Responses tool sent
+/// without `strict` is served free, echoed `strict: false`, and beside a
+/// strict tool it is the strict one that is refused.
+#[tokio::test]
+async fn with_thinking_on_a_split_think_end_refuses_a_strict_tool_and_leaves_a_normalized_one_free() {
+    let split = |script: &str| {
+        let mock = Arc::new(MockCompute::new());
+        mock.script(0, &encode(script));
+        let scheduler = ConcreteScheduler::with_config(SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() }, mock.clone());
+        let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(Vocabulary::split_think_end()))
+            .with_request_timeout(Duration::from_secs(5))
+            .with_seedless_seed(0)
+            .with_family(ModelFamily::Qwen38_27b)
+            .with_metrics();
+        (server, mock)
+    };
+    let thinking = |body: String| body.replace("\"enable_thinking\":false", "\"enable_thinking\":true");
+    let refusal = |json: &JsonValue| (json["error"]["code"].as_str().map(str::to_owned), json["error"]["param"].as_str().map(str::to_owned));
+    let expected = |param: &str| (Some("unsupported_value".to_owned()), Some(param.to_owned()));
+
+    let (server, mock) = split("");
+    let (status, json, text) = post(&server, &thinking(chat(&[WRITE_FILE], false, 64))).await;
+    assert_eq!((status, refusal(&json)), (400, expected("tools[0].function.strict")), "{text}");
+    assert!(mock.prefill_calls().is_empty(), "nothing is generated");
+
+    let without = flat(SEARCH);
+    for (tools, param) in [(vec![flat(WRITE_FILE)], "tools[0].strict"), (vec![without.clone(), flat(WRITE_FILE)], "tools[1].strict")] {
+        let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
+        let body = thinking(responses_body(&tools, false, 64));
+        let (server, mock) = split("");
+        let request = Request::builder().method("POST").uri(RESPONSES).header("content-type", "application/json").body(Body::from(body.clone())).unwrap();
+        let response = server.app().oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let json: JsonValue = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!((status, refusal(&json)), (400, expected(param)), "{json}");
+        assert!(mock.prefill_calls().is_empty(), "nothing is generated");
+        let (server, mock) = split("");
+        let events = socket_events_of(server, &body).await;
+        assert_eq!((events.len(), events[0]["type"].as_str()), (1, Some("error")), "{events:?}");
+        assert_eq!(&events[0]["error"], &json["error"], "the socket's refusal is HTTP's");
+        assert!(mock.prefill_calls().is_empty(), "nothing is generated on the socket");
+    }
+
+    let script = call("search", &[("query", "cats"), ("limit", "many")]);
+    let (server, mock) = split(&format!("ok</think>{script}"));
+    let text = responses_text(&server, &thinking(responses_body(&[&without], false, 256))).await;
+    let response: JsonValue = serde_json::from_str(&text).unwrap();
+    assert_eq!(response["tools"][0]["strict"], false, "served free: {text}");
+    assert_eq!(delivered(&response).calls, [("search".to_owned(), r#"{"limit":"many","query":"cats"}"#.to_owned())]);
+    assert!(mock.decode_calls().iter().flatten().all(|job| !job.checked), "no round is checked");
 }
 
 /// A Responses request whose tools are sent `strict: false` is held to
@@ -1244,7 +1363,7 @@ fn the_gpu_corpus_reads_a_calls_faults_where_they_are() {
     let pair = |kind: &str, at: &str| (kind.to_owned(), at.to_owned());
     let mut found = kinds(corpus::DEPLOY, deploy);
     found.sort();
-    assert_eq!(found, [pair("constraint", "/replicas"), pair("missing", "/approved_by"), pair("missing", "/notes"), pair("unknown", "/extra")]);
+    assert_eq!(found, [pair("constraint", "/replicas"), pair("missing", "/approved_by"), pair("missing", "/notes"), pair("unknown_parameter", "/extra")]);
     let open = r#"{"path":"a","line":1,"change":{"edits":[{"old":"x","new":"y","why":"z"}]}}"#;
     assert_eq!(kinds(corpus::EDIT_OPEN, open), [pair("undeclared", "/change/edits/0/why")]);
     assert!(corpus::faults(&parameters(corpus::DEPLOY), "not json").is_none());

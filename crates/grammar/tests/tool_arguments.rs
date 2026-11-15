@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use ignis_grammar::json::{write_string, Json};
-use ignis_grammar::validate::{violations, Kind};
+use ignis_grammar::validate::violations;
 
 /// The repository's root.
 fn repo() -> PathBuf {
@@ -50,16 +50,6 @@ fn corpus() -> Vec<Row> {
         }
     }
     rows
-}
-
-fn label(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Missing => "missing",
-        Kind::Type => "type",
-        Kind::Enum => "enum",
-        Kind::Unknown => "unknown",
-        Kind::Constraint => "constraint",
-    }
 }
 
 /// `value` as JSON text with every number as the corpus wrote it (the
@@ -106,7 +96,7 @@ fn every_verdict_and_kind_is_the_one_labelled_by_hand() {
     let mut wrong = Vec::new();
     for row in &rows {
         let found = violations(&row.schema, &row.arguments);
-        let mut kinds: Vec<&str> = found.iter().map(|v| label(v.kind)).collect();
+        let mut kinds: Vec<&str> = found.iter().map(|v| v.kind.label()).collect();
         kinds.sort_unstable();
         kinds.dedup();
         let mut expected: Vec<&str> = row.kinds.iter().map(String::as_str).collect();

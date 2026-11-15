@@ -407,8 +407,8 @@ config_group! {
         /// no parameter it does not declare, an optional parameter left out
         /// of the arguments when the model leaves it out. A schema that
         /// cannot be normalized stays free, never refused, and a strict tool
-        /// stays strict either way. On Flash-Next it changes nothing until
-        /// it holds tool calls (#581).
+        /// stays strict either way. On Flash-Next, whose start accepts it
+        /// too, it changes nothing until it holds tool calls (#581).
         tool_arguments: ToolArgumentsKind = crate::api::ToolArguments::AsSent, Validator::OneOf(crate::api::ToolArguments::NAMES), ALL,
             [Visible, Patchable];
         /// The loop guard (ADR 0052): `rewind`, a loop in a request's
@@ -512,13 +512,15 @@ config_group! {
         /// How deep structured output's answer may nest, in levels: a value is
         /// opened only where it can still be closed within it, and a schema
         /// whose shortest answer nests deeper is refused (`exceeds_max_depth`).
-        grammar_max_depth: Levels = super::DEFAULT_GRAMMAR_MAX_DEPTH, between(3, 4096), ALL, [Visible];
+        /// At most the call parser's own bound, so that a held tool's typed
+        /// value is always read back as the JSON it was held to.
+        grammar_max_depth: Levels = super::DEFAULT_GRAMMAR_MAX_DEPTH, between(3, ignis_grammar::json::MAX_DEPTH as i64), ALL, [Visible];
         /// How deep a `json_schema` may chain its subschemas and `$ref`s while
         /// it compiles: deeper is refused (`references_too_deep`).
         grammar_max_ref_chain: Levels = super::DEFAULT_GRAMMAR_MAX_REF_CHAIN, between(1, 1024), ALL, [Visible];
         /// The longest run of whitespace structured output lets the model
         /// write between two of the answer's tokens, and between the tags of
-        /// a strict tool's call, so an answer never streams whitespace
+        /// a held tool's call, so an answer never streams whitespace
         /// without end.
         grammar_max_whitespace: Chars = super::DEFAULT_GRAMMAR_MAX_WHITESPACE, between(1, 255), ALL, [Visible];
         /// The 27B's adaptation (ADR 0063): when its VRAM plan refuses a

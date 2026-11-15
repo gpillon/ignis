@@ -654,7 +654,8 @@ call dialect cannot hold is refused by name too: a name holding `>`
 a parameter whose name holds `>` (`parameter_name_unwritable`), a held string
 none of whose values fits on one line (`no_writable_value`). Fix the schema,
 or send the tool with `strict: false` to have its calls served as the model
-writes them ([Held tools](api/structured-output.md#held-tools-strict-true)).
+writes them ([Held tools](api/structured-output.md#held-tools-strict-true)),
+unless the operator holds every tool (below).
 On the Responses API a tool sent without `strict` is never refused: it is
 held where its schema normalizes and served free where it does not
 ([A tool sent without `strict`](api/structured-output.md#a-tool-sent-without-strict)),
@@ -678,8 +679,9 @@ from the [catalog](reference/models.md), or send no `response_format`
 
 A request held to a grammar ended with an engine error: the engine could not
 sample a missed position again (`repair_failed`, whose `error` says why: the
-scores the token was sampled from were already written over, or the kernel
-leaf refused), or a round did not report the token it sampled for a request
+scores the token was sampled from were already written over, the kernel
+leaf refused, or the grammar permitted no token there, "the mask permits no
+token", which a tokenizer that cannot write the call's tags would reach), or a round did not report the token it sampled for a request
 it was asked to check (`no_pending_token`). The client gets `500 engine_error`
 ("the engine could not run the request; see the server log"), an `error`
 chunk on a stream, or `response.failed` on `/v1/responses`; the other requests

@@ -27,8 +27,14 @@
 //! forgets. Anything else is the value's text: a `</parameter>` line followed
 //! by more text, an opener of a parameter already written or never declared,
 //! a `</function>` line not followed by `</tool_call>`, and a close written
-//! while a required parameter is missing. The residue: a value cannot hold
-//! its own call's confirmed close.
+//! while a required parameter is missing. The residue, what no value can
+//! hold: a line that is a step, so the opener of a declared parameter the
+//! call has not written yet (a value written before that parameter ends at
+//! an example of it, which then opens it), and, once every required
+//! parameter is written, the confirmed close. A held tool's grammar holds
+//! a value back from more ([`crate::tool_calls`]): the two miss points
+//! while a required parameter is missing, and whitespace past its bound
+//! after a step's first tag.
 //!
 //! What the rule reads as a line, and how it reads the tags:
 //! - A line starts at the value's first byte and after each `\n`; a tag
@@ -438,11 +444,18 @@ mod tests {
     }
 
     #[test]
-    fn a_value_cannot_hold_its_own_calls_confirmed_close() {
-        // The documented residue: the value ends at the first confirmed close.
+    fn a_value_cannot_hold_a_line_that_is_a_step_of_its_call() {
+        // The documented residue: the value ends at the first confirmed close,
         let value = "\nan example:\n</function>\n</tool_call>\nand the rest\n</parameter>\n</function>\n</tool_call>";
         let at = value.find("</function>").unwrap();
         assert_eq!(end(value, &["path", "content"]), Some((at, Step::Close { len: "</function>\n</tool_call>".len() })));
+        // on one line or two, whitespace between,
+        assert_eq!(end("\nx\n</function> </tool_call>", &["path", "content"]), Some((3, Step::Close { len: 24 })));
+        // and, in a value written before them, at an opener of a declared
+        // parameter the call has not written yet, which it then opens.
+        let value = "\ncall it so:\n<parameter=mode>\nw\n</parameter>\n</function>\n</tool_call>";
+        let at = value.find("<parameter=mode>").unwrap();
+        assert_eq!(end(value, &["content"]), Some((at, Step::Parameter { index: 2, len: "<parameter=mode>".len() })));
     }
 
     #[test]

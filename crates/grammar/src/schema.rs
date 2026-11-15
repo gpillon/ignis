@@ -563,7 +563,7 @@ impl Compiler {
         let rest = pointer.strip_prefix('#').unwrap_or(pointer);
         let mut cur = doc;
         for raw in rest.split('/').skip(1) {
-            let key = raw.replace("~1", "/").replace("~0", "~");
+            let key = crate::json::unescape_pointer_token(raw);
             cur = match cur {
                 Json::Obj(_) => cur.get(&key),
                 Json::Arr(a) => key.parse::<usize>().ok().and_then(|i| a.get(i)),
@@ -969,7 +969,7 @@ impl Compiler {
             self.core.lits.push(set);
             keys.push((self.core.lits.len() - 1) as u32);
             if props.contains(k) {
-                let esc = k.replace('~', "~0").replace('/', "~1");
+                let esc = crate::json::pointer_token(k);
                 values.push(self.compile(&format!("{path}/properties/{esc}"))?);
             } else {
                 values.push(extra_value.expect("an open object"));

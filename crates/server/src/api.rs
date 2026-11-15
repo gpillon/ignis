@@ -1498,21 +1498,24 @@ pub(crate) fn resolve_tools(
 
 /// Count the request's strict tools whose `parameters` lie outside OpenAI's
 /// strict subset (GitHub #608, ADR 0094), the schemas structured output's
-/// grammar refuses under `strict` (a refusal is kept with the grammars, so a
-/// schema sent every turn is read once). Nothing about the request changes:
-/// the tool is served as any other. Only a model that holds answers to a
-/// grammar has the subset to read them by; Flash-Next's are not counted.
-pub(crate) fn count_strict_tools(server: &Server, tools: &[JsonValue]) {
+/// grammar refuses under `strict`, as they arrive: [`held_tools`] then
+/// refuses such a request with a 400. Each is compiled as `held_tools`
+/// compiles it, in the key order sent (`raw`), so it is the same cached
+/// grammar or refusal, read once for a schema sent every turn. Only a model
+/// that holds answers to a grammar has the subset to read them by;
+/// Flash-Next's are not counted.
+pub(crate) fn count_strict_tools(server: &Server, raw: &[ignis_grammar::json::Json], tools: &[JsonValue]) {
     let Some(metrics) = &server.metrics else { return };
-    let strict = |tool: &&JsonValue| tool["function"]["strict"] == JsonValue::Bool(true);
-    if !tools.iter().any(|tool| strict(&tool)) {
+    let strict = |tool: &JsonValue| tool["function"]["strict"] == JsonValue::Bool(true);
+    if !tools.iter().any(strict) {
         return;
     }
     let Some(grammars) = server.active().template.grammars() else { return };
     let outside = tools
         .iter()
-        .filter(strict)
-        .filter(|tool| grammars.json_schema(&tool["function"]["parameters"].to_string(), true).is_err())
+        .enumerate()
+        .filter(|(_, tool)| strict(tool))
+        .filter(|(index, tool)| grammars.json_schema(&strict_parameters(raw.get(*index), tool), true).is_err())
         .count();
     if outside > 0 {
         metrics.record_strict_tools_outside_subset(outside as u64);
@@ -1600,18 +1603,25 @@ fn tool_hold(
     without_strict: WithoutStrict,
     switch: ToolArguments,
 ) -> ignis_grammar::ToolHold {
-    use ignis_grammar::json::Json;
     use ignis_grammar::ToolHold;
     if tool["function"]["strict"] == JsonValue::Bool(true) {
         return ToolHold::Strict(strict_parameters(raw, tool));
     }
-    let sent_none = raw.is_some_and(|tool| sent_function(tool).get("strict").is_none_or(|strict| *strict == Json::Null));
-    match (switch, sent_none, without_strict) {
-        (ToolArguments::Held, _, _) | (ToolArguments::AsSent, true, WithoutStrict::Normalized) => {
-            ToolHold::Normalized(strict_parameters(raw, tool))
-        }
-        _ => ToolHold::Free,
+    match normalizes(raw, without_strict, switch) {
+        true => ToolHold::Normalized(strict_parameters(raw, tool)),
+        false => ToolHold::Free,
     }
+}
+
+/// Whether a tool not sent `strict: true`, `raw` as sent, is normalized
+/// (where its schema allows it): every one under the operator's switch at
+/// `held`, and under `as-sent` one sent without `strict` (or with `null`)
+/// where `without_strict` normalizes it. The one reading of a tool's sent
+/// `strict` that [`tool_hold`] holds it by and [`HeldContent::echo`] echoes.
+fn normalizes(raw: Option<&ignis_grammar::json::Json>, without_strict: WithoutStrict, switch: ToolArguments) -> bool {
+    use ignis_grammar::json::Json;
+    let sent_none = raw.is_some_and(|tool| sent_function(tool).get("strict").is_none_or(|strict| *strict == Json::Null));
+    matches!((switch, sent_none, without_strict), (ToolArguments::Held, _, _) | (ToolArguments::AsSent, true, WithoutStrict::Normalized))
 }
 
 /// The held tools of a request whose resolved `tools` are these (none
@@ -1634,7 +1644,8 @@ fn tool_hold(
 /// parameter's name, a held string with no value it can write on one line);
 /// and, with thinking on, a tokenizer with no single-token `</think>` to
 /// hold the content after. A normalized tool is never refused: where any of
-/// those would refuse it, it stays free (#614).
+/// those would refuse it, it stays free (#614). Under a named `tool_choice`
+/// (`named`), a call names that tool alone (#615).
 pub(crate) fn held_tools(
     server: &Server,
     raw: &[ignis_grammar::json::Json],
@@ -1642,6 +1653,7 @@ pub(crate) fn held_tools(
     thinking: &ThinkingOptions,
     without_strict: WithoutStrict,
     switch: ToolArguments,
+    named: Option<&str>,
 ) -> Result<Option<HeldTools>, Response> {
     use ignis_grammar::{DeclaredTool, ToolField, ToolHold};
     let holds: Vec<ToolHold> =
@@ -1660,7 +1672,7 @@ pub(crate) fn held_tools(
         .zip(holds)
         .map(|(tool, hold)| DeclaredTool { name: tool["function"]["name"].as_str().unwrap_or_default().to_owned(), hold })
         .collect();
-    let grammar = grammars.tool_calls(&declared).map_err(|refused| {
+    let grammar = grammars.tool_calls_naming(&declared, named).map_err(|refused| {
         let field = match refused.field {
             ToolField::Name => "name",
             ToolField::Parameters => "parameters",
@@ -1745,13 +1757,12 @@ pub(crate) struct HeldContent {
     /// The request's tools as every scanner of its response reads their
     /// calls, a held tool's by the confirmed close ([`ToolSchemas::holding`]).
     pub schemas: ToolSchemas,
-    /// Whether each of the resolved tools is held, by its place: the
-    /// `strict` the Responses API echoes for a tool sent without one (#614),
-    /// and under [`ToolArguments::Held`] for every tool not sent `strict:
-    /// true` (#616).
-    pub held: Vec<bool>,
-    /// The operator's switch the request was served under, read once.
-    pub switch: ToolArguments,
+    /// The `strict` the Responses API echoes for each tool as sent, by its
+    /// place (#614, #616): `Some`, the one it was served with, for a tool
+    /// whose own `strict` did not decide it (one it normalizes, held where
+    /// its schema allows it), and for every tool on a model that holds no
+    /// tool's calls (Flash-Next, #581: `false`); `None`, the `strict` it sent.
+    pub echo: Vec<Option<bool>>,
 }
 
 /// The [`HeldContent`] of a request whose answer is `answer`, whose
@@ -1763,7 +1774,8 @@ pub(crate) struct HeldContent {
 /// - An answer alone, or the held tools alone, is held to its own
 ///   grammar. The tools' holds every turn that may call them: `tool_choice`
 ///   `"auto"`, `"required"` or a named function, whose forced literal opens
-///   the call and whose tokens the grammar follows (#286), and
+///   the call and whose tokens the grammar follows (#286), the call held to
+///   the named function's name, and
 ///   `parallel_tool_calls: false`, whose turn ends at the call's confirmed
 ///   close, where the scanner holding the tool closes it.
 /// - An answer beside held tools: until the answer starts, the call's
@@ -1778,20 +1790,36 @@ pub(crate) fn held_content(
     answer: Option<HeldAnswer>,
     raw: &[ignis_grammar::json::Json],
     tools: &[JsonValue],
+    tool_choice: &ToolChoice,
     thinking: &ThinkingOptions,
     without_strict: WithoutStrict,
 ) -> Result<HeldContent, Response> {
     let switch = server.live().tool_arguments;
-    let held_tools = held_tools(server, raw, tools, thinking, without_strict, switch)?;
+    let named = match tool_choice {
+        ToolChoice::Function(name) => Some(name.as_str()),
+        _ => None,
+    };
+    let held_tools = held_tools(server, raw, tools, thinking, without_strict, switch, named)?;
     let (grammar, description) = match (answer, &held_tools) {
         (Some(answer), Some(held)) => (Some(answer.grammar.holding_calls(held.calls.clone())), answer.description),
         (Some(answer), None) => (Some(answer.grammar), answer.description),
         (None, Some(held)) => (Some(held.grammar.clone()), None),
         (None, None) => (None, None),
     };
-    let holds = (0..tools.len()).map(|tool| held_tools.as_ref().is_some_and(|held| held.calls.holds(tool))).collect();
+    let holds = |tool: usize| held_tools.as_ref().is_some_and(|held| held.calls.holds(tool));
+    let serves = server.active().family.serves_structured_output();
+    let echo = (0..raw.len())
+        .map(|tool| {
+            let strict = sent_function(&raw[tool]).get("strict") == Some(&ignis_grammar::json::Json::Bool(true));
+            match (serves, strict || !normalizes(raw.get(tool), without_strict, switch)) {
+                (false, _) => Some(false),
+                (true, false) => Some(tool < tools.len() && holds(tool)),
+                (true, true) => None,
+            }
+        })
+        .collect();
     let held = held_tools.map(|held| held.held).unwrap_or_default();
-    Ok(HeldContent { grammar, description, schemas: ToolSchemas::from_tools(tools).holding(held), held: holds, switch })
+    Ok(HeldContent { grammar, description, schemas: ToolSchemas::from_tools(tools).holding(held), echo })
 }
 
 /// A JSON value read once into the two shapes the handler needs:
@@ -3356,7 +3384,7 @@ async fn chat_completions(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
-    count_strict_tools(&server, &tools);
+    count_strict_tools(&server, raw_tools.as_deref().unwrap_or_default(), &tools);
     let cap_field = match req.max_completion_tokens {
         Some(_) => "max_completion_tokens",
         None => "max_tokens",
@@ -3378,7 +3406,7 @@ async fn chat_completions(
         Err(response) => return response,
     };
     let HeldContent { grammar, description, schemas, .. } =
-        match held_content(&server, held, raw_tools.as_deref().unwrap_or_default(), &tools, &thinking, WithoutStrict::Free) {
+        match held_content(&server, held, raw_tools.as_deref().unwrap_or_default(), &tools, &tool_choice, &thinking, WithoutStrict::Free) {
             Ok(content) => content,
             Err(response) => return response,
         };
@@ -3683,9 +3711,9 @@ impl Answer {
 /// finishes the request or the pipeline fires (a stop sequence matches, or
 /// the turn's one call closes) — then nothing past that token is read, and
 /// the caller stops the engine request at it ([`AnswerEnding::Stopped`]).
-/// Bounded by `timeout`, as [`collect_completion`] is: past it, what the
-/// answer had become, for the caller to cancel the request and finish it
-/// ([`CutAnswer`]).
+/// Bounded by `timeout`,
+/// as [`collect_completion`] is: past it, what the answer had become, for
+/// the caller to cancel the request and finish it ([`CutAnswer`]).
 async fn collect_answer(
     stream: &mut EventStream,
     timeout: std::time::Duration,

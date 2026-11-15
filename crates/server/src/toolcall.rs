@@ -70,7 +70,7 @@
 //!
 //! **Where a call, its body and its values end is one rule** (GitHub #610,
 //! ADR 0094), [`Cuts`]: every tool keeps the first-occurrence cuts above,
-//! and a **held tool** ([`ToolCallScanner::holding`]) the confirmed close
+//! and a **held tool** ([`ToolSchemas::holding`]) the confirmed close
 //! of `ignis_grammar::call`, the rule its grammar reads by: a value ends
 //! only at a line that is a valid next step of the call, so a value may
 //! hold the dialect's own tags. No tool is held before the grammar holds
@@ -199,7 +199,7 @@ impl CallCheck {
                 Kind::Missing => CallViolation::Missing,
                 Kind::Type => CallViolation::Type,
                 Kind::Enum => CallViolation::Enum,
-                Kind::Unknown => CallViolation::UnknownParameter,
+                Kind::UnknownParameter => CallViolation::UnknownParameter,
                 Kind::Constraint => CallViolation::Constraint,
             })
             .collect();
@@ -320,12 +320,13 @@ impl CallViolation {
 
     /// The `kind` label of `ignis_tool_call_violations_total`.
     pub fn label(self) -> &'static str {
+        use ignis_grammar::validate::Kind;
         match self {
-            Self::Missing => "missing",
-            Self::Type => "type",
-            Self::Enum => "enum",
-            Self::UnknownParameter => "unknown_parameter",
-            Self::Constraint => "constraint",
+            Self::Missing => Kind::Missing.label(),
+            Self::Type => Kind::Type.label(),
+            Self::Enum => Kind::Enum.label(),
+            Self::UnknownParameter => Kind::UnknownParameter.label(),
+            Self::Constraint => Kind::Constraint.label(),
             Self::UndeclaredTool => "undeclared_tool",
         }
     }
@@ -361,7 +362,7 @@ impl ToolSchemas {
     /// The same schemas, whose calls to these held tools (function name →
     /// what the confirmed close knows of it, its parameters declared in the
     /// schema's order) every scanner reads by the confirmed close
-    /// ([`ToolCallScanner::holding`]), delivering their arguments in the
+    /// ([`ToolCallScanner::with_schemas`]), delivering their arguments in the
     /// schema's order (GitHub #611). For a request whose content the tool
     /// calls' grammar holds, and only then.
     pub fn holding(self, held: HashMap<String, call::Parameters>) -> Self {
@@ -427,9 +428,6 @@ pub struct ToolCallScanner {
     /// The scan ends at its first call's close (`parallel_tool_calls:
     /// false`).
     ends_at_first_call: bool,
-    /// The held tools, by function name, whose calls end by the confirmed
-    /// close ([`ToolCallScanner::holding`]).
-    held: HashMap<String, call::Parameters>,
 }
 
 impl Default for ToolCallScanner {
@@ -453,23 +451,10 @@ impl ToolCallScanner {
             state: State::Scanning,
             hold: String::new(),
             next_index: 0,
-            held: schemas.held.clone(),
             schemas,
             check: None,
             ends_at_first_call: false,
         }
-    }
-
-    /// Read the calls to these held tools (function name → what the
-    /// confirmed close knows of it) by the confirmed close (GitHub #610,
-    /// ADR 0094) instead of the first-occurrence cuts: such a call ends only
-    /// at `</function>` and `</tool_call>` once every required parameter is
-    /// written, and a value only at a line that is a valid next step, so a
-    /// call that closes with a required parameter missing stays open. For a
-    /// call the grammar holds to its tool's schema; no caller holds a tool
-    /// before it does.
-    pub fn holding(self, held: HashMap<String, call::Parameters>) -> Self {
-        Self { held, ..self }
     }
 
     /// With `on`, the scan ends where its first call block closes, parsed
@@ -550,7 +535,7 @@ impl ToolCallScanner {
                     let body: String = self.hold.drain(..len).collect();
                     let parsed = block.as_ref().map(|block| {
                         let name = &body[block.name.clone()];
-                        let order = self.held.get(name).filter(|_| held);
+                        let order = self.schemas.held.get(name).filter(|_| held);
                         (name.to_string(), arguments(&body, block, &self.schemas, order))
                     });
                     if let Some(check) = &self.check {
@@ -659,11 +644,11 @@ impl ToolCallScanner {
     /// names a held tool (a `</tool_call>` always follows the name's `>`, so
     /// the name is read before the call can close).
     fn cuts(&self) -> Cuts<'_> {
-        if self.held.is_empty() {
+        if self.schemas.held.is_empty() {
             return Cuts::FirstOccurrence;
         }
-        let named = self.hold.trim_start().strip_prefix(FUNCTION_PREFIX).and_then(|rest| rest.find('>').map(|end| &rest[..end]));
-        match named.and_then(|name| self.held.get(name)) {
+        let named = function_name(&self.hold).map(|name| &self.hold[name]);
+        match named.and_then(|name| self.schemas.held.get(name)) {
             Some(parameters) => Cuts::Confirmed(parameters),
             None => Cuts::FirstOccurrence,
         }
@@ -689,16 +674,22 @@ impl Cuts<'_> {
     }
 }
 
+/// Where the function's name lies in a call's text after `<tool_call>`:
+/// after its leading whitespace and `<function=`, up to the first `>`;
+/// `None` until both are read.
+fn function_name(text: &str) -> Option<Range<usize>> {
+    let trimmed = text.trim_start();
+    let base = text.len() - trimmed.len() + FUNCTION_PREFIX.len();
+    let name_end = trimmed.strip_prefix(FUNCTION_PREFIX)?.find('>')?;
+    Some(base..base + name_end)
+}
+
 /// Reads `<function=NAME>...<parameter=P>VALUE</parameter>...</function>`
 /// (the text between `<tool_call>` and `</tool_call>`, both already
 /// stripped) by the first-occurrence cuts. Returns `None` if the block does
 /// not open with `<function=` or never closes with `</function>`.
 fn read_function_block(inner: &str) -> Option<Block> {
-    let trimmed = inner.trim_start();
-    let after_prefix = trimmed.strip_prefix(FUNCTION_PREFIX)?;
-    let base = inner.len() - trimmed.len() + FUNCTION_PREFIX.len();
-    let name_end = after_prefix.find('>')?;
-    let name = base..base + name_end;
+    let name = function_name(inner)?;
     let body_start = name.end + 1;
     let body = inner[body_start..].find(FUNCTION_CLOSE).map(|end| &inner[body_start..body_start + end])?;
 
@@ -740,10 +731,7 @@ fn read_function_block(inner: &str) -> Option<Block> {
 /// included, and the block, or `None` while the call has not closed. What
 /// precedes the first parameter's opener is not read.
 fn read_held_call(text: &str, parameters: &call::Parameters) -> Option<(usize, Block)> {
-    let trimmed = text.trim_start();
-    let base = text.len() - trimmed.len() + FUNCTION_PREFIX.len();
-    let name_end = trimmed.strip_prefix(FUNCTION_PREFIX)?.find('>')?;
-    let name = base..base + name_end;
+    let name = function_name(text)?;
     let mut written = vec![false; parameters.declared().len()];
     let mut values = Vec::new();
     // The value being read, by its parameter's name, and where it starts.
@@ -1504,7 +1492,7 @@ mod tests {
             .filter(|function| held.contains(&function["name"].as_str().unwrap()))
             .map(|function| (function["name"].as_str().unwrap().to_owned(), rule_parameters(&function["parameters"])))
             .collect();
-        ToolCallScanner::with_schemas(ToolSchemas::from_tools(&tools)).holding(held)
+        ToolCallScanner::with_schemas(ToolSchemas::from_tools(&tools).holding(held))
     }
 
     fn scan(mut scanner: ToolCallScanner, chunks: &[&str]) -> Vec<ToolEvent> {
@@ -1850,8 +1838,8 @@ mod tests {
     /// Every valid call written in the template's form is accepted, the
     /// parser reading back what was written, except the ones the grammar
     /// leaves out by name: the residue (a value the parser itself ends
-    /// early) and spike S1's two miss points (while a required parameter is
-    /// missing, a free value's line starting `</function`, or a
+    /// early) and spike S1's two miss points (spec #582: while a required
+    /// parameter is missing, a free value's line starting `</function`, or a
     /// `</parameter>` line followed by `</`).
     #[test]
     fn every_valid_call_in_the_templates_form_is_accepted() {

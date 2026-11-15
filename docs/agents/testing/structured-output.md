@@ -197,10 +197,15 @@ repaired from the verify pass's scores, as a plain round's draw is.
   a free tool's body runs to its first `</tool_call>`, a held call takes its
   parameters in any order and once, closes only with every required one
   written, holds an enum, a pattern and a format on one line, misses at
-  spike S1's two points, bounds the whitespace between tags (the byte past
+  spike S1's two points (spec #582), bounds the whitespace between tags (the byte past
   the bound a miss) and refuses what it cannot hold by name. No state is a
-  dead end (a search back to free text from states of generated texts), and
-  the mask equals the token-by-token reference on every state of them. A
+  dead end (from every state of generated texts, over grammars whose
+  whitespace is bounded at two or three bytes: a way out of its value and
+  of each after it, and of every value its call may still open under every
+  set of parameters written), and the mask equals the token-by-token
+  reference on every state of them. Under a named `tool_choice` only the
+  named tool can be called (#615); the deepest typed value held at the
+  widest `model.grammar_max_depth` reads back as its JSON. A
   normalized tool (#614) is held, its objects closed and its optional
   parameters omissible and left out; one whose schema does not normalize,
   or that the dialect cannot hold, is left free, never refused, a strict
@@ -218,9 +223,12 @@ repaired from the verify pass's scores, as a plain round's draw is.
 - **The scheduler** (`cargo test -p ignis-core --test held_tool_calls`): the
   prefill's draw opening a call, with no scores kept; a verified run holding
   `</think>`, the opener and a miss cut at the miss; free text never a miss;
-  a stop inside a held call a miss. Beside a forced literal (#615), thinking
+  a stop inside a held call a miss; an empty permitted set ending the
+  request in an error, unrepaired. Beside a forced literal (#615), thinking
   off and on: its tokens fed to the grammar and never a miss, the model's
-  after it held; a literal token the grammar refuses not forced. Beside a
+  after it held; a literal token the grammar refuses not forced; a named
+  choice's call held to its name where the literal yields or the model
+  opened the call itself. Beside a
   structured answer: the call the opener starts held, and the next one, a
   verified run cut at a miss after the opener.
 - **Over the mock engine** (`cargo test -p ignis-server --test
@@ -259,11 +267,34 @@ repaired from the verify pass's scores, as a plain round's draw is.
   each tool's echo; Flash-Next unchanged. The byte-identity of requests with
   no strict tool, and of every request at the default `as-sent`, is the
   existing suites'.
-- **On the GPU**, agent requests with strict tools on the served 27B with
-  DFlash2 on: every call valid and to a declared tool, every request a call,
-  each miss repaired and counted, the verify rounds drafting and accepting.
-  It prints each call and each request's misses, for reading the repairs:
+- **One call per turn over the mock engine** (`cargo test -p ignis-server
+  --test parallel_tool_calls_http`, #609): `parallel_tool_calls: false` ends
+  the turn at its first call on chat completions (whole and streamed) and
+  the Responses API (HTTP and socket), on both families, a call closed in the
+  reasoning ending nothing; `true` or absent serves every call.
+  `openai_http_tool_choice` covers the forced call beside the grammar.
+- **On the GPU**, the served close-out (#617): `held_tools_gpu` serves a
+  corpus of agent requests (`support/held_tools_corpus.rs`: chat completions
+  and the Responses API, strict tools and the Responses default, forced calls
+  with thinking off and on, `response_format` beside the tools, and cases
+  built to make the model miss) on the 27B with DFlash2 on, each beside its
+  free twin, every tool sent `strict: false`: every call to a declared tool,
+  a named choice's to the named one, every held call valid, each miss
+  repaired and counted, the verify rounds drafting and accepting. It prints
+  both deliveries with the twin's faults and what the held call wrote there,
+  the cost on held traffic beside free, and the one-call-per-turn
+  conversations; each test goes through every case before it fails. The two
+  tests load the 27B under one card lock; run them one at a time:
 
   ```sh
-  cargo test -p ignis-server --features cuda --test held_tools_gpu -- --ignored --nocapture
+  cargo test -p ignis-server --features cuda --test held_tools_gpu -- --ignored --nocapture --test-threads=1
+  ```
+
+  `flash_next_parallel_tool_calls_gpu` holds the same conversations to one
+  call per turn on Flash-Next. It needs the Flash-Next artifact
+  (`IGNIS_FLASH_NEXT_DIR` names another directory) and about 40 GiB of host
+  RAM, and runs under the GPU profile:
+
+  ```sh
+  cargo test -p ignis-server --features cuda --test flash_next_parallel_tool_calls_gpu -- --ignored --nocapture
   ```

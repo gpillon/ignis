@@ -40,12 +40,22 @@ impl Memo {
 
     /// Whether `bytes` more fit in `budget`; counted when they do.
     fn keeps(&mut self, bytes: usize, budget: usize) -> bool {
-        let kept = self.bytes.saturating_add(bytes) <= budget;
-        if kept {
-            self.bytes += bytes;
-        }
-        kept
+        keeps(&mut self.bytes, bytes, budget)
     }
+}
+
+/// What an entry of a grammar's tables or caches is counted at beside its
+/// own heap: its slot in a map and its headers, about.
+pub(crate) const ENTRY_BYTES: usize = 64;
+
+/// Whether `bytes` more fit beside `held` in `budget`; added to `held` when
+/// they do: a grammar's caches stop growing at its budget.
+pub(crate) fn keeps(held: &mut usize, bytes: usize, budget: usize) -> bool {
+    let kept = held.saturating_add(bytes) <= budget;
+    if kept {
+        *held += bytes;
+    }
+    kept
 }
 
 /// Per-matcher scratch for the trie walks.
@@ -99,14 +109,23 @@ pub(crate) fn walk(core: &Core, trie: &Trie, start: &Config, out: &mut TokenSet,
     }
     w.levels[0].configs.clear();
     w.levels[0].configs.push(start.clone());
+    let forks = &mut w.forks;
+    walk_trie(trie, &mut w.levels, out, |state, b| state.step(core, b, forks));
+}
+
+/// Mark every token of `trie` whose bytes `levels[0]`, the state the walk
+/// starts from, takes by `step` (`false` on a byte refused): depth by
+/// depth, each node's state cloned from its parent's into `levels` (one
+/// more than the trie is deep), a refused node's subtree skipped.
+pub(crate) fn walk_trie<S: Clone>(trie: &Trie, levels: &mut [S], out: &mut TokenSet, mut step: impl FnMut(&mut S, u8) -> bool) {
     let mut i = 0;
     while i < trie.nodes.len() {
         let node = trie.nodes[i];
         let d = node.depth as usize;
-        let (lo, hi) = w.levels.split_at_mut(d);
+        let (lo, hi) = levels.split_at_mut(d);
         let cur = &mut hi[0];
         cur.clone_from(&lo[d - 1]);
-        if !cur.step(core, node.byte, &mut w.forks) {
+        if !step(cur, node.byte) {
             i = node.end as usize;
             continue;
         }
@@ -170,7 +189,7 @@ impl Grammar {
             }
         }
         let mut memo = self.memo.lock().unwrap();
-        if !memo.masks.contains_key(&state.configs) && memo.keeps(out.heap_bytes() + 64, self.memo_budget) {
+        if !memo.masks.contains_key(&state.configs) && memo.keeps(out.heap_bytes() + ENTRY_BYTES, self.memo_budget) {
             memo.masks.insert(state.configs.clone(), Arc::new(out.clone()));
         }
         false

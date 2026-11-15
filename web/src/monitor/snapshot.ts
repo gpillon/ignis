@@ -248,7 +248,7 @@ export type LoopGuard = {
 
 /**
  * The types a `response_format` can ask for (#593), and `tool` for the calls
- * a request with a strict tool holds (#611): `ignis_structured_*`'s `type` label.
+ * a request with a held tool holds (#611): `ignis_structured_*`'s `type` label.
  */
 export const STRUCTURED_TYPES = ["json_object", "json_schema", "tool"] as const;
 export type StructuredType = (typeof STRUCTURED_TYPES)[number];

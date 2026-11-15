@@ -1359,6 +1359,22 @@ OpenAI's strict subset or the request is refused. OpenAI's name, kept because
 the field is OpenAI's.
 _Avoid_: strict function calling
 
+**Normalized tool**:
+A **held tool** sent without `strict` whose schema the server rewrote into
+strict form, its objects closed and its optional parameters left out of the
+arguments when the call leaves them out: OpenAI's default on the Responses
+API, and every tool not sent `strict: true` under the operator's `held`. A
+schema that cannot be normalized leaves its tool free, never refused.
+
+**Confirmed close**:
+The rule a **held tool**'s call is read by: a string value ends only at a
+line that is a valid next step of the call, the opener of a declared
+parameter not yet written, or the function's and the call's closers once
+every required parameter is written; any other line that looks like a tag
+is the value's text. A tool that is not held keeps the first-occurrence
+cuts: each value, body and call ends at the first closing tag written.
+_Avoid_: smart close, schema-aware parsing
+
 **Answer mass**:
 How much of the whole next-token distribution the answer tokens hold,
 `exp(logsumexp(answer logits) - logsumexp(all logits))`. It is what says

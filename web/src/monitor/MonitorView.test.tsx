@@ -208,10 +208,10 @@ describe("MonitorView", () => {
     expect(text).not.toContain("Structured output");
   });
 
-  // #611: a strict tool's held calls count in the same card, by their own type.
+  // #611: a held tool's calls count in the same card, by their own type.
   it("counts the held tool calls in the Structured output card", () => {
     const now = Date.now();
-    // Ten seconds on: five more requests with strict tools, two misses in their calls, each repaired.
+    // Ten seconds on: five more requests with held tools, two misses in their calls, each repaired.
     const later = STRUCTURED_EXPOSITION.replace('requests_total{type="tool"} 4', 'requests_total{type="tool"} 9')
       .replace('misses_total{type="tool"} 0', 'misses_total{type="tool"} 2')
       .replace('repairs_total{type="tool"} 0', 'repairs_total{type="tool"} 2');
@@ -240,6 +240,9 @@ describe("MonitorView", () => {
     // #610: 3 more values split at a tag in the window.
     expect(html).toContain("Values split at a tag");
     expect(html).toMatch(/Values split at a tag<\/[^>]+>\s*<[^>]+>3</);
+    // #611: a strict tool outside the subset is refused, not served.
+    expect(html).toContain("is refused with a 400");
+    expect(html).not.toContain("served as any other");
     const text = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now, 2)} />);
     expect(text).not.toContain("Tool calls");
   });

@@ -623,7 +623,7 @@ impl MicrosHistogram {
 }
 
 /// The two types `response_format` can ask for, and the tool calls a
-/// request with a strict tool holds (#611), in the order of the `type`
+/// request with a held tool holds (#611), in the order of the `type`
 /// label's series (#593).
 const STRUCTURED_KINDS: [StructuredKind; 3] = [StructuredKind::JsonObject, StructuredKind::JsonSchema, StructuredKind::Tool];
 
@@ -1097,7 +1097,8 @@ impl Metrics {
     }
 
     /// A request sent `tools` strict tools whose parameters lie outside
-    /// OpenAI's strict subset (GitHub #608), served as any other tool.
+    /// OpenAI's strict subset (GitHub #608), counted as it arrives; a model
+    /// that holds tool calls then refuses it with a 400 (#611).
     pub(crate) fn record_strict_tools_outside_subset(&self, tools: u64) {
         self.tool_strict_outside_subset.fetch_add(tools, Ordering::Relaxed);
     }
@@ -1768,7 +1769,7 @@ impl Metrics {
                 &mut out,
                 "ignis_tool_strict_outside_subset_total",
                 "counter",
-                "Strict tools (strict: true) whose parameters lie outside OpenAI's strict subset, once per request that sends one; served as any other tool.",
+                "Strict tools (strict: true) whose parameters lie outside OpenAI's strict subset, once per request that sends one, counted as it arrives; the 27B then refuses the request with a 400.",
             );
             let _ = writeln!(out, "ignis_tool_strict_outside_subset_total {strict_outside}");
             declare(

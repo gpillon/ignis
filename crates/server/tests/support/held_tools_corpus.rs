@@ -55,6 +55,12 @@ pub const EDIT_OPEN: &str = r#"{"type":"function","function":{"name":"edit_file"
 /// optional.
 pub const WRITE_OPEN: &str = r#"{"type":"function","function":{"name":"write_file","description":"Write a text file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["replace","append"],"description":"replace when left out."}},"required":["path","content"]}}}"#;
 
+/// A directory copy as a client writes it without `strict`: an `options`
+/// object it requires, whose two members are optional. Normalized, every
+/// member of a nested object is required (spec #582, #614), so a held call
+/// writes both where the model may have written one.
+pub const COPY_OPEN: &str = r#"{"type":"function","function":{"name":"copy_dir","description":"Copy a directory.","parameters":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"},"options":{"type":"object","properties":{"recursive":{"type":"boolean"},"depth":{"type":"integer","minimum":1}},"required":[],"description":"How to copy; each member optional."}},"required":["from","to","options"]}}}"#;
+
 /// `tool_choice: "required"`.
 pub const REQUIRED: &str = r#""tool_choice":"required""#;
 /// `tool_choice` naming `write_file`.
@@ -301,6 +307,14 @@ pub fn corpus() -> Vec<Case> {
         Case::chat("a read and a free search", "Read Cargo.toml and search the web for the Rust 2024 edition guide.", &[READ_FILE, SEARCH]),
         Case::chat("tool_choice required", "What does the README say?", &[READ_FILE, WRITE_FILE]).field(REQUIRED),
         Case::chat("tool_choice named", "The build passed.", &[WRITE_FILE, READ_FILE]).field(NAMED_WRITE).expect(Expect::Named("write_file")),
+        // Thinking on, the forced opening joins the model's own run at the
+        // reasoning's close, where it may yield to the grammar (#615): the
+        // call still names the tool a named choice names.
+        Case::chat("tool_choice required, thinking on", "What does the README say?", &[READ_FILE, WRITE_FILE]).field(REQUIRED).thinking(),
+        Case::chat("tool_choice named, thinking on", "The build passed.", &[WRITE_FILE, READ_FILE])
+            .field(NAMED_WRITE)
+            .expect(Expect::Named("write_file"))
+            .thinking(),
         Case::chat("response_format beside", "Save the word 'hello' to greeting.txt, then say whether it was saved.", &[WRITE_FILE])
             .field(OUTCOME)
             .expect(Expect::CallOrAnswer),
@@ -316,6 +330,12 @@ pub fn corpus() -> Vec<Case> {
             &[TICKET],
         ),
         Case::responses("two strict reads", "Read both package.json and tsconfig.json.", &[READ_FILE, WRITE_FILE]),
+        Case::responses("tool_choice required, thinking on", "What does the README say?", &[READ_FILE, WRITE_FILE]).field(REQUIRED).thinking(),
+        Case::responses("tool_choice named, thinking on", "The build passed.", &[WRITE_FILE, READ_FILE])
+            .field(NAMED_WRITE)
+            .expect(Expect::Named("write_file"))
+            .thinking(),
+        Case::responses("the default: a nested object's optional members", "Copy the directory assets/ to backup/assets/, recursively.", &[COPY_OPEN]).without_strict(),
         Case::responses("the default: an open typed edit", "In lib/util.py, on line 40, replace the call old_name() with new_name().", &[EDIT_OPEN]).without_strict(),
         Case::responses(
             "the default: an open write and a parameter it lacks",
@@ -495,7 +515,7 @@ pub fn faults(parameters: &Json, arguments: &str) -> Option<Vec<Fault>> {
     let value = Json::parse(arguments).ok()?;
     let mut out: Vec<Fault> = ignis_grammar::validate::violations(parameters, &value)
         .into_iter()
-        .map(|v| Fault { kind: format!("{:?}", v.kind).to_lowercase(), at: v.at, keyword: v.keyword })
+        .map(|v| Fault { kind: v.kind.label().to_owned(), at: v.at, keyword: v.keyword })
         .collect();
     let mut undeclared = Vec::new();
     undeclared_keys(parameters, &value, "", &mut undeclared);
@@ -511,7 +531,7 @@ fn undeclared_keys(schema: &Json, value: &Json, at: &str, out: &mut Vec<String>)
     match (value, schema.get("properties"), schema.get("items")) {
         (Json::Obj(members), Some(Json::Obj(properties)), _) => {
             for (key, member) in members {
-                let path = format!("{at}/{}", key.replace('~', "~0").replace('/', "~1"));
+                let path = format!("{at}/{}", ignis_grammar::json::pointer_token(key));
                 match properties.iter().find(|(name, _)| name == key) {
                     Some((_, schema)) => undeclared_keys(schema, member, &path, out),
                     None => out.push(path),
@@ -530,7 +550,7 @@ fn undeclared_keys(schema: &Json, value: &Json, at: &str, out: &mut Vec<String>)
 /// The value at JSON pointer `at` in `value`.
 pub fn pointed<'a>(value: &'a Json, at: &str) -> Option<&'a Json> {
     at.split('/').skip(1).try_fold(value, |value, token| {
-        let token = token.replace("~1", "/").replace("~0", "~");
+        let token = ignis_grammar::json::unescape_pointer_token(token);
         match value {
             Json::Obj(members) => members.iter().find(|(key, _)| *key == token).map(|(_, member)| member),
             Json::Arr(items) => token.parse::<usize>().ok().and_then(|i| items.get(i)),
