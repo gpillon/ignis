@@ -199,3 +199,19 @@ fn a_stop_inside_a_held_call_is_a_miss_and_the_cap_cuts_it() {
     let (missed, repaired) = misses(&events, id);
     assert!(missed > 0 && missed == repaired, "{missed} misses");
 }
+
+/// The two shapes a stop arrives in: the leaf's own stop, which in free
+/// text ends the request as it would with no grammar, and the EOS a lane
+/// that decodes past it (`ignore_eos`) reports as a token, which passes in
+/// free text and leaves the content going on. Inside a held call both miss.
+#[test]
+fn a_stop_ends_free_text_and_an_eos_decoded_past_passes_it() {
+    use ignis_core::structured::{GrammarState, Verdict};
+    let mut state = GrammarState::new(&AnswerGrammar::tool_calls(grammar()), false);
+    assert_eq!(state.check(PendingToken::Stop), Verdict::Finished);
+    assert_eq!(state.check(PendingToken::Token(STOP)), Verdict::Passed);
+    assert_eq!(state.check(PendingToken::Token(TokenId::from(b'x'))), Verdict::Passed, "the content goes on");
+    assert_eq!(state.check(PendingToken::Token(OPEN)), Verdict::Passed);
+    assert_eq!(state.check(PendingToken::Token(STOP)), Verdict::Miss);
+    assert_eq!(state.check(PendingToken::Stop), Verdict::Miss);
+}

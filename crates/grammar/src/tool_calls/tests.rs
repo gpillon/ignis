@@ -90,14 +90,16 @@ fn refused_after(prefix: &str, next: &str) -> bool {
 }
 
 #[test]
-fn free_text_passes_every_token_and_a_stop_ends_it() {
+fn free_text_passes_every_token_a_stop_included() {
     let mut m = matcher();
     for id in [b'h' as u32, CLOSING, THINK, NOTHING, b'<' as u32, CLOSE] {
         assert!(m.accept(id), "token {id}");
     }
     assert!(m.is_accepting() && !m.in_call());
-    assert!(m.accept(STOP) && m.is_finished());
-    assert!(!m.check(b'x' as u32));
+    // A stop passes and changes nothing: a lane that decodes past its EOS
+    // goes on in free text, a call it opens held as any.
+    assert!(m.accept(STOP) && !m.is_finished());
+    assert!(m.accept(OPEN) && !m.check(STOP));
 }
 
 #[test]

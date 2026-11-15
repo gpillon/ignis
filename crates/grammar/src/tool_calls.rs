@@ -986,18 +986,17 @@ pub struct ToolCallMatcher {
     state: CallState,
     scratch: CallState,
     levels: Vec<CallState>,
-    finished: bool,
 }
 
 impl Clone for ToolCallMatcher {
     fn clone(&self) -> Self {
-        Self { state: self.state.clone(), finished: self.finished, ..Self::new(self.grammar.clone()) }
+        Self { state: self.state.clone(), ..Self::new(self.grammar.clone()) }
     }
 }
 
 impl ToolCallMatcher {
     pub fn new(grammar: Arc<ToolCallGrammar>) -> Self {
-        Self { grammar, state: CallState::default(), scratch: CallState::default(), levels: Vec::new(), finished: false }
+        Self { grammar, state: CallState::default(), scratch: CallState::default(), levels: Vec::new() }
     }
 
     pub fn grammar(&self) -> &Arc<ToolCallGrammar> {
@@ -1006,9 +1005,6 @@ impl ToolCallMatcher {
 
     /// Whether `token` is valid here. Leaves the state unchanged.
     pub fn check(&mut self, token: u32) -> bool {
-        if self.finished {
-            return false;
-        }
         let g = &*self.grammar;
         if g.vocab.is_stop(token) {
             return self.is_accepting();
@@ -1020,15 +1016,16 @@ impl ToolCallMatcher {
         bytes.iter().all(|&b| g.step(&mut self.scratch, b))
     }
 
-    /// Check `token` and, when valid, take it. A stop finishes the matcher.
+    /// Check `token` and, when valid, take it. A stop passes where it is
+    /// valid and changes nothing: the generation ends there unless the
+    /// lane decodes past its EOS (`ignore_eos`), and then the content goes on
+    /// as free text does without a grammar.
     pub fn accept(&mut self, token: u32) -> bool {
         if !self.check(token) {
             return false;
         }
         let g = &*self.grammar;
-        if g.vocab.is_stop(token) {
-            self.finished = true;
-        } else if g.controls.bytes(&g.vocab, token).is_some() {
+        if !g.vocab.is_stop(token) && g.controls.bytes(&g.vocab, token).is_some() {
             std::mem::swap(&mut self.state, &mut self.scratch);
         }
         true
@@ -1057,11 +1054,12 @@ impl ToolCallMatcher {
     /// Whether a stop may end the generation here: in free text, or in the
     /// body of a call to a tool that is not held.
     pub fn is_accepting(&self) -> bool {
-        !self.finished && ToolCallGrammar::outside_held(&self.state)
+        ToolCallGrammar::outside_held(&self.state)
     }
 
+    /// Never: the content's text never completes, a stop passing in it.
     pub fn is_finished(&self) -> bool {
-        self.finished
+        false
     }
 
     /// Whether a call is open: its opener read, its close not yet.
@@ -1072,10 +1070,6 @@ impl ToolCallMatcher {
     /// The repair's permitted set. Returns `true` when it came whole from
     /// the grammar's cache.
     pub fn mask(&mut self, out: &mut TokenSet) -> bool {
-        if self.finished {
-            out.clear();
-            return false;
-        }
         self.grammar.mask(&self.state, out, &mut self.levels)
     }
 

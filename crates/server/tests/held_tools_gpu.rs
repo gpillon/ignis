@@ -130,18 +130,33 @@ fn counter(exposition: &str, series: &str) -> u64 {
     exposition.lines().find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok()).unwrap_or(0)
 }
 
+const TOOL_REQUESTS: &str = "ignis_structured_requests_total{type=\"tool\"}";
+
+/// The exposition once `requests` held requests are recorded: a request is
+/// counted after its response is sent, so a read straight after it races.
+async fn recorded(metrics: &ignis_server::metrics::Metrics, requests: u64) -> String {
+    for _ in 0..3_000 {
+        let exposition = metrics.render();
+        if counter(&exposition, TOOL_REQUESTS) >= requests {
+            return exposition;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{requests} held requests never recorded:\n{}", metrics.render());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn strict_tools_on_the_27b_with_dflash2_return_valid_calls_their_repairs_counted_and_drafts_kept() {
     let Some(harness) = harness() else { return };
     let server = harness.server.as_ref().unwrap();
     let metrics = server.metrics.clone().expect("metrics on");
-    for (prompt, tools, thinking) in CASES {
-        let before = metrics.render();
+    for (done, (prompt, tools, thinking)) in CASES.iter().enumerate() {
+        let before = recorded(&metrics, done as u64).await;
         let answer = chat(server, prompt, tools, *thinking).await;
         let choice = &answer["choices"][0];
         let calls = choice["message"]["tool_calls"].as_array().cloned().unwrap_or_default();
-        let after = metrics.render();
+        let after = recorded(&metrics, done as u64 + 1).await;
         let misses = counter(&after, "ignis_structured_misses_total{type=\"tool\"}") - counter(&before, "ignis_structured_misses_total{type=\"tool\"}");
         eprintln!("{prompt}\n  finish {}, {} calls, {misses} misses", choice["finish_reason"], calls.len());
         assert!(!calls.is_empty(), "{prompt}: no call: {answer}");
@@ -163,9 +178,9 @@ async fn strict_tools_on_the_27b_with_dflash2_return_valid_calls_their_repairs_c
             }
         }
     }
-    let exposition = metrics.render();
+    let exposition = recorded(&metrics, CASES.len() as u64).await;
     let (requests, misses, repairs) = (
-        counter(&exposition, "ignis_structured_requests_total{type=\"tool\"}"),
+        counter(&exposition, TOOL_REQUESTS),
         counter(&exposition, "ignis_structured_misses_total{type=\"tool\"}"),
         counter(&exposition, "ignis_structured_repairs_total{type=\"tool\"}"),
     );
