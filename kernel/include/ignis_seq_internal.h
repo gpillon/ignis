@@ -47,6 +47,18 @@ inline constexpr int32_t kIgnisGdnConvStateWidth = kIgnisGdnConvKernel - 1;
  * progress image. */
 inline constexpr int32_t kIgnisGqaLayerCount = 16;
 
+/* GitHub #620 (spec #618): a Qwen 3.8-27B pool built for the MTP head
+ * (IGNIS_SPECULATIVE_MTP) stores one more attention layer than the target's,
+ * the head's own -- the last plane run, `ignis_seq_pool::mtp_head_layer()`.
+ * Its frontier is not one of the `gqa_positions` (those are the target's
+ * 16): it follows the sequence's own, `ignis_mtp_head_frontier` below. */
+inline constexpr int32_t kIgnisMtpHeadLayers = 1;
+
+/* The width of the head's continuation hidden: the 27B's hidden, which the
+ * head's stem reads. kernel/src/model.cu pairs a pool with a model of this
+ * width. */
+inline constexpr int32_t kIgnisMtpHidden = 5120;
+
 /* The other 48 of the 64 backbone layers: 0, 1, 2, 4, 5, 6, 8, ... Each keeps
  * its own conv taps and recurrent state in the linear-attention state pool,
  * so the pool is sized by this count and `ignis_seq::gdn_positions` carries
@@ -149,7 +161,8 @@ struct ignis_seq_pool {
   std::int32_t kv_head_dim     = 0;
   std::int32_t kv_num_kv_heads = 0;
   /* The attention layers the pool stores K/V for (GitHub #302): the spec's
-   * `kv_num_layers`, at most kIgnisGqaLayerCount. */
+   * `kv_num_layers`, at most kIgnisGqaLayerCount, and on a 27B pool built
+   * for the MTP head the head's one more (GitHub #620). */
   std::int32_t kv_num_layers = 0;
   /* Lane slots only, `0..slot_count`: the retained slots past them are never
    * listed here (GitHub #211). */
@@ -233,6 +246,44 @@ struct ignis_seq_pool {
   std::unique_ptr<ninfer::CyclicKVCache> dflash2_window;
 
   bool has_dflash2() const { return dflash2_window != nullptr; }
+
+  // GitHub #620 (spec #618): the Qwen 3.8-27B's MTP head, present only on a
+  // pool built with IGNIS_SPECULATIVE_MTP. Two pieces of state:
+  //
+  // - the head's attention state, one more attention layer of the paged pool
+  //   (`mtp_head_layer()`, the last plane run of every page), in the pool's KV
+  //   format. Entry `p` is the head's key and value of its row at position
+  //   `p`, built from the target's hidden at `p` and the token at `p + 1`; it
+  //   is written when that token is consumed, one position behind the
+  //   target's own (`ignis_mtp_head_frontier`);
+  // - the continuation hidden, `mtp_continuation`: one BF16 [hidden] vector
+  //   per state slot (the lanes, then the retained slots), the target's
+  //   post-final-norm hidden at the sequence's last consumed position -- the
+  //   input of the head's next row.
+  //
+  // Under hq-e8-2b the head's residual window rides the pool's residual
+  // buffer as one more layer's planes, but its ring words are its own
+  // (`hq_head_ring`, right after the target's): the target's words say which
+  // ring rows hold exact keys of the positions the target appended, and the
+  // head appends each position one step later. Null without the head.
+  std::unique_ptr<ninfer::DeviceBuffer> mtp_continuation;
+  std::uint32_t *hq_head_ring = nullptr;
+
+  bool has_mtp_head() const { return mtp_continuation != nullptr; }
+
+  // The plane run of the head's attention state: the pool's last.
+  std::int32_t mtp_head_layer() const { return kv_num_layers - kIgnisMtpHeadLayers; }
+
+  // Bytes one slot's continuation hidden occupies. 0 without the head.
+  std::uint64_t mtp_continuation_slot_bytes() const {
+    return has_mtp_head() ? static_cast<std::uint64_t>(kIgnisMtpHidden) * sizeof(std::uint16_t) : 0;
+  }
+
+  // Slot `slot`'s continuation hidden.
+  void *mtp_continuation_of(std::int32_t slot) const {
+    return static_cast<unsigned char *>(mtp_continuation->p) +
+           static_cast<std::uint64_t>(slot) * mtp_continuation_slot_bytes();
+  }
 
   // Bytes one slot's lane of the window occupies: every layer's K and V over
   // the whole ring. 0 without the drafter.
@@ -336,6 +387,11 @@ struct ignis_seq_pool {
   // Slot `slot`'s ring validity words.
   std::uint32_t *hq_ring_words(std::int32_t slot) const {
     return hq_ring + static_cast<std::ptrdiff_t>(slot) * kIgnisHqRingWords;
+  }
+
+  // GitHub #620: slot `slot`'s ring validity words of the MTP head's layer.
+  std::uint32_t *hq_head_ring_words(std::int32_t slot) const {
+    return hq_head_ring + static_cast<std::ptrdiff_t>(slot) * kIgnisHqRingWords;
   }
 
   // Bytes one slot's window occupies, on the device and in its host image
@@ -502,6 +558,15 @@ struct ignis_seq {
   };
   std::unique_ptr<restore_window> restoring;
 };
+
+/* GitHub #620: one past the last position whose MTP head entry `seq` holds.
+ * The entry at `p` is built from the token at `p + 1`, so the head writes it
+ * when that token is consumed: after any completed step the head holds every
+ * position but the sequence's last, whose entry its next step builds from the
+ * continuation hidden and the token it consumes. */
+inline std::uint64_t ignis_mtp_head_frontier(const ignis_seq &seq) {
+  return seq.position == 0 ? 0 : seq.position - 1;
+}
 
 /* Why `seq` refuses a step, a snapshot, a publish or a capture: a windowed
  * restore not yet complete (spec vram-budget/03), or nullptr. */
@@ -737,6 +802,33 @@ inline ninfer::PagedKVBatchLayerView ignis_kv_batch_layer_view(ignis_seq_pool *p
   // the lanes hold images, never a row a round names.
   ignis_kv_fill_residual(view, pool, gqa_layer, 0, pool->kv_pool.table_row_count());
   view.block_tables = pool->kv_pool.block_tables();
+  return view;
+}
+
+/* GitHub #620: the MTP head's layer views -- the pool's last plane run, with
+ * the head's own ring words in place of the target's under hq-e8-2b. The
+ * single-sequence view is pre-sliced to the sequence's slot like
+ * `ignis_kv_layer_view`'s, and `ignis_mtp_head_ring` narrows a batched view a
+ * caller has already narrowed the same way. */
+template <class View>
+inline void ignis_mtp_head_ring(View &view, const ignis_seq_pool *pool, std::int32_t first_slot,
+                                std::int32_t slots) {
+  if (!pool->has_hq_residual()) {
+    return;
+  }
+  view.ring_valid = ninfer::Tensor(pool->hq_head_ring_words(first_slot), ninfer::DType::I32,
+                                   {kIgnisHqRingWords, slots, 1, 1});
+}
+
+inline ninfer::PagedKVLayerView ignis_mtp_head_layer_view(ignis_seq_pool *pool, ignis_seq *seq) {
+  ninfer::PagedKVLayerView view = ignis_kv_layer_view(pool, seq, pool->mtp_head_layer());
+  ignis_mtp_head_ring(view, pool, seq->slot, 1);
+  return view;
+}
+
+inline ninfer::PagedKVBatchLayerView ignis_mtp_head_batch_view(ignis_seq_pool *pool) {
+  ninfer::PagedKVBatchLayerView view = ignis_kv_batch_layer_view(pool, pool->mtp_head_layer());
+  ignis_mtp_head_ring(view, pool, 0, pool->kv_pool.table_row_count());
   return view;
 }
 

@@ -20,6 +20,7 @@
 #include "ignis_seq_internal.h"
 #include "layer_internal.h"
 #include "model_internal.h"
+#include "mtp_head.h"
 #include "permitted_tokens.h"
 #include "step_internal.h"
 #include "teacher_forcing.h"
@@ -641,14 +642,29 @@ bool validate_program(const ignis_model *model, const ignis_seq_pool *pool,
 // model's, and a step past this check chooses by `model->drafter` alone
 // (GitHub #619).
 bool drafter_matches_load(const ignis_model *model, const ignis_seq_pool *pool, const char *op) {
-  if (pool->speculative_backend == model->speculative_backend) {
-    return true;
+  if (pool->speculative_backend != model->speculative_backend) {
+    set_error(std::string(op) + ": the sequence pool was built for speculative backend " +
+              std::to_string(pool->speculative_backend) + ", this model was loaded with " +
+              std::to_string(model->speculative_backend) +
+              "; the drafter's weights and its per-sequence window come as a pair");
+    return false;
   }
-  set_error(std::string(op) + ": the sequence pool was built for speculative backend " +
-            std::to_string(pool->speculative_backend) + ", this model was loaded with " +
-            std::to_string(model->speculative_backend) +
-            "; the drafter's weights and its per-sequence window come as a pair");
-  return false;
+  // GitHub #620: the MTP head's layer is the pool's last, past the model's
+  // own GQA layers, and its continuation hidden is the model's width.
+  if (model->drafter == IgnisDrafter::kMtp) {
+    std::int32_t gqa_layers = 0;
+    for (const auto &layer : model->layers) {
+      gqa_layers += layer.kind == IGNIS_LAYER_GQA ? 1 : 0;
+    }
+    if (pool->kv_num_layers != gqa_layers + kIgnisMtpHeadLayers ||
+        model->hidden != static_cast<uint64_t>(kIgnisMtpHidden)) {
+      set_error(std::string(op) + ": the sequence pool stores " + std::to_string(pool->kv_num_layers) +
+                " attention layers, not this model's " + std::to_string(gqa_layers) +
+                " and the MTP head's one, or its continuation hidden is not the model's width");
+      return false;
+    }
+  }
+  return true;
 }
 
 // The first absolute position of a prefill span whose target features reach
@@ -1043,7 +1059,8 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                           float *out_logits, LinearPolicyMode mode,
                           const SpanMultimodal &multimodal, float *permitted_prob_out,
                           const ArmedAttentionReadout *attention_readout,
-                          std::uint16_t *span_logits_out, ignis_kept_scores *out_kept) {
+                          std::uint16_t *span_logits_out, ignis_kept_scores *out_kept,
+                          std::uint16_t *span_hidden_out) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto T = static_cast<std::int32_t>(num_tokens);
@@ -1325,6 +1342,18 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     // `left` holds every layer's output once the layer is done (a swap after
     // each layer that wrote `right`), so the final residual is in `left`.
     ninfer::Tensor final_residual = left;
+    // GitHub #620: on an MTP load, the head's rows the chunk licenses and the
+    // continuation hidden its last column leaves (kernel/src/mtp_head.h);
+    // with the readout, the post-final-norm hidden of every column.
+    if (model->drafter == IgnisDrafter::kMtp) {
+      std::string head_error;
+      if (ignis::mtp::prefill_chunk(*model, *pool, *seq, ids, final_residual, T, span_hidden_out, &head_error) != 0) {
+        set_error("ignis_program_prefill: chunk at span offset " + std::to_string(chunk_offset) + " (" +
+                  std::to_string(num_tokens) + " tokens) for sequence slot " + std::to_string(seq->slot) +
+                  " failed: " + head_error);
+        return -1;
+      }
+    }
     // The measurement readout (`ignis_prefill_options::out_span_logits`):
     // the head over every column of the chunk, 32 columns at a time, each
     // block copied out before the next reuses its buffers (stream order).
@@ -1544,7 +1573,7 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
                                     float *permitted_prob,
                                     const ArmedAttentionReadout *attention_readout,
                                     std::uint16_t *span_logits, uint64_t drafter_floor,
-                                    bool draws, bool keeps_scores) {
+                                    bool draws, bool keeps_scores, std::uint16_t *span_hidden) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
   ChunkProfiler::instance().begin_span(num_tokens, model->prefill_chunk_tokens);
   const uint64_t tap_from = dflash2_tap_from(seq->position, num_tokens, drafter_floor);
@@ -1562,7 +1591,9 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
                           span_logits == nullptr
                               ? nullptr
                               : span_logits + offset * static_cast<uint64_t>(model->vocab),
-                          keeps_scores ? &kept : nullptr) != 0) {
+                          keeps_scores ? &kept : nullptr,
+                          span_hidden == nullptr ? nullptr
+                                                 : span_hidden + offset * static_cast<uint64_t>(model->hidden)) != 0) {
       return -1;
     }
     seq->position += chunk_len;
@@ -1714,6 +1745,18 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   std::uint16_t *span_logits = options != nullptr ? options->out_span_logits : nullptr;
   if (span_logits != nullptr && route != IGNIS_PREFILL_ROUTE_CHUNKED) {
     set_error("ignis_program_prefill: out_span_logits needs the chunked route");
+    return -1;
+  }
+  // GitHub #620: the head's rows are written by the chunk loop alone; the
+  // test-only per-token route would leave them unwritten. And the hiddens the
+  // head reads are read out where it reads them, on an MTP load.
+  if (model->drafter == IgnisDrafter::kMtp && route != IGNIS_PREFILL_ROUTE_CHUNKED) {
+    set_error("ignis_program_prefill: an MTP load prefills on the chunked route, which writes the head's state");
+    return -1;
+  }
+  std::uint16_t *span_hidden = options != nullptr ? options->out_span_hidden : nullptr;
+  if (span_hidden != nullptr && model->drafter != IgnisDrafter::kMtp) {
+    set_error("ignis_program_prefill: out_span_hidden reads the hiddens the MTP head reads, on an MTP load");
     return -1;
   }
   // GitHub #519: a span with a next prompt token draws nothing -- no output
@@ -1885,7 +1928,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
                                      out_logits, mode, multimodal, permitted_prob,
                                      arms_readout ? &attention_readout : nullptr, span_logits,
                                      options != nullptr ? options->drafter_floor : 0, draws,
-                                     options != nullptr && options->keeps_scores != 0);
+                                     options != nullptr && options->keeps_scores != 0, span_hidden);
   }
   if (rc != 0) {
     return rc;
@@ -2024,6 +2067,13 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
   // taps before it and the committed columns' feature taps after the cut.
   const bool in_leaf = ignis_drafter_proposes_in_the_leaf(model->drafter);
   const bool dflash2 = model->drafter == IgnisDrafter::kDflash2;
+  // GitHub #620: the MTP head keeps its state through prefills and plain
+  // rounds; the chain that proposes inside the verify round is not built.
+  if (model->drafter == IgnisDrafter::kMtp) {
+    set_error("ignis_program_decode: a verify round on an MTP load needs the head's chain, which this leaf does not "
+              "run yet; an MTP load decodes in plain rounds (speculative_window 0)");
+    return -1;
+  }
   if (in_leaf && (options.drafts != nullptr || options.draft_counts != nullptr)) {
     set_error(std::string("ignis_program_decode: this model was loaded with ") +
               ignis_drafter_name(model->drafter) +

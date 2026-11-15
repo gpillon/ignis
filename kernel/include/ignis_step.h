@@ -345,6 +345,13 @@ struct ignis_prefill_options {
    * it. 0 under NULL options. Unread on the per-token route, which keeps
    * none, and on Flash-Next, which repairs nothing (#581). */
   int32_t keeps_scores;
+  /* GitHub #620: a measurement readout beside the MTP head -- when non-NULL,
+   * on a 27B load built for the head, the target's post-final-norm hidden of
+   * **every** position of the span, host BF16 `[num_tokens][hidden]`: what
+   * the head's rows read (row `i` is the hidden the head's entry at the
+   * span's position `i` is built from). No serving path sets it; NULL costs
+   * nothing, and a load without the head refuses a set one. */
+  uint16_t *out_span_hidden;
 };
 
 #ifdef __cplusplus
@@ -352,12 +359,13 @@ struct ignis_prefill_options {
  * crates/core/src/step_abi.rs's mirror test, on CPU): GitHub #520's
  * `keeps_draw` filled the tail padding after `next_prompt_token`, so the size
  * alone no longer tells that layout from the one before it; GitHub #287's
- * `keeps_scores` follows it. */
-static_assert(sizeof(struct ignis_prefill_options) == 232 &&
+ * `keeps_scores` follows it, and GitHub #620's `out_span_hidden` them. */
+static_assert(sizeof(struct ignis_prefill_options) == 240 &&
                   offsetof(struct ignis_prefill_options, drafter_floor) == 208 &&
                   offsetof(struct ignis_prefill_options, next_prompt_token) == 216 &&
                   offsetof(struct ignis_prefill_options, keeps_draw) == 220 &&
-                  offsetof(struct ignis_prefill_options, keeps_scores) == 224,
+                  offsetof(struct ignis_prefill_options, keeps_scores) == 224 &&
+                  offsetof(struct ignis_prefill_options, out_span_hidden) == 232,
               "ignis_prefill_options drifted from crates/core/src/step_abi.rs IgnisPrefillOptions");
 #endif
 

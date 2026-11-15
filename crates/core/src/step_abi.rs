@@ -139,6 +139,11 @@ pub struct IgnisPrefillOptions {
     /// GitHub #287: nonzero when the span's draw keeps its scores for a
     /// repair -- a request held to a grammar; 0 keeps none.
     pub keeps_scores: i32,
+    /// GitHub #620: a measurement readout, on a load with the 27B's MTP head:
+    /// the target's post-final-norm hidden of every position of the span
+    /// (host BF16 `[tokens][hidden]`), what the head's rows read. Null in
+    /// every serving call.
+    pub out_span_hidden: *mut u16,
 }
 
 /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -167,16 +172,17 @@ mod tests {
 
     /// GitHub #520: `keeps_draw` filled the tail padding after
     /// `next_prompt_token`, so `size` alone no longer tells the layout before
-    /// it from the layout after; GitHub #287's `keeps_scores` follows it. The
-    /// leaf pins the same numbers (kernel/include/ignis_step.h), as for the
-    /// decode options.
+    /// it from the layout after; GitHub #287's `keeps_scores` follows it, and
+    /// GitHub #620's `out_span_hidden` them. The leaf pins the same numbers
+    /// (kernel/include/ignis_step.h), as for the decode options.
     #[test]
     fn the_prefill_options_mirror_is_the_leaf_structs_layout() {
-        assert_eq!(std::mem::size_of::<IgnisPrefillOptions>(), 232);
+        assert_eq!(std::mem::size_of::<IgnisPrefillOptions>(), 240);
         assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, out_reasoning_redirected), 200);
         assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, drafter_floor), 208);
         assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, next_prompt_token), 216);
         assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, keeps_draw), 220);
         assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, keeps_scores), 224);
+        assert_eq!(std::mem::offset_of!(IgnisPrefillOptions, out_span_hidden), 232);
     }
 }

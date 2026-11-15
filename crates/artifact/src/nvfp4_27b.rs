@@ -7,8 +7,9 @@
 //! - `frontend/`: the six resources of [`FRONTEND_FILES`];
 //! - `text/`: ignis's 27B text scope (the positional BF16 exceptions on the
 //!   early attention and GDN layers included), then the draft head pair;
-//! - `mtp/`: the checkpoint's MTP layer, W8 and BF16 (ignis binds none of
-//!   it; the container carries it as the served one does);
+//! - `mtp/`: the checkpoint's MTP layer, W8 and BF16, the 27B's MTP head
+//!   (bound by a load built for it, [`crate::inventory::mtp_scope_27b`]; the
+//!   container carries it as the served one does);
 //! - `vision/`: the tower;
 //! - `dflash2/`: the drafter module.
 //!

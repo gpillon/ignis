@@ -11,8 +11,9 @@
 // whether some drafter buffer happens to exist.
 //
 // Flash-Next's MTP never reaches here: its program is its own
-// (kernel/src/flash_next/), and the 27B's load and its pool spec refuse
-// IGNIS_SPECULATIVE_MTP by name.
+// (kernel/src/flash_next/), and its pool names no drafter (backend 0, the
+// head's KV one more attention layer). IGNIS_SPECULATIVE_MTP on a 27B load
+// is the 27B's own MTP head (GitHub #620, kernel/src/mtp_head.h).
 
 #include "ignis_model.h"
 
@@ -29,6 +30,11 @@ enum class IgnisDrafter : std::uint8_t {
   // feature taps in every prefill chunk, and its forward inside the verify
   // pass, proposing each lane's drafts from that window.
   kDflash2,
+  // The checkpoint's MTP head (GitHub #620, spec #618): its 12 weights, one
+  // more attention layer in the KV pool (the head's attention state over the
+  // whole context) and the continuation hidden in every pool slot. A prefill
+  // and every round keep both current; it proposes inside the verify round.
+  kMtp,
 };
 
 // The drafter a 27B load, or a pool built for one, names by
@@ -39,6 +45,8 @@ inline IgnisDrafter ignis_drafter_of(std::int32_t speculative_backend) {
     return IgnisDrafter::kDflash2;
   case IGNIS_SPECULATIVE_VERIFY_ONLY:
     return IgnisDrafter::kHost;
+  case IGNIS_SPECULATIVE_MTP:
+    return IgnisDrafter::kMtp;
   default:
     return IgnisDrafter::kNone;
   }
@@ -49,6 +57,7 @@ inline IgnisDrafter ignis_drafter_of(std::int32_t speculative_backend) {
 inline bool ignis_drafter_proposes_in_the_leaf(IgnisDrafter drafter) {
   switch (drafter) {
   case IgnisDrafter::kDflash2:
+  case IgnisDrafter::kMtp:
     return true;
   case IgnisDrafter::kHost:
   case IgnisDrafter::kNone:
@@ -62,6 +71,8 @@ inline const char *ignis_drafter_name(IgnisDrafter drafter) {
   switch (drafter) {
   case IgnisDrafter::kDflash2:
     return "the DFlash2 drafter";
+  case IgnisDrafter::kMtp:
+    return "the MTP head";
   case IgnisDrafter::kHost:
     return "the verify substrate alone";
   case IgnisDrafter::kNone:

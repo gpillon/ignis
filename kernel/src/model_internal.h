@@ -130,6 +130,27 @@ struct Dflash2Weights {
   ninfer::Weight selector_successor;
 };
 
+// GitHub #620 (spec #618): the Qwen 3.8-27B's MTP head -- the checkpoint's one
+// MTP layer, the container's 12 `mtp/` objects, its matrices W8 on every 27B
+// artifact (the 16 GB ones included) and its gains BF16. The head has no
+// embedding and no output head of its own: it reads the target's
+// `token_embedding` and scores with the target's output head. Bound only
+// under IGNIS_SPECULATIVE_MTP (kernel/src/mtp_head.h runs it).
+struct MtpHeadWeights {
+  ninfer::Weight input_projection;      // W8 [hidden, 2 hidden]: the stem's fc over [embedding; hidden]
+  ninfer::Weight embedding_norm;        // BF16 [hidden]
+  ninfer::Weight hidden_norm;           // BF16 [hidden]
+  ninfer::Weight input_norm;            // BF16 [hidden]: the layer's
+  ninfer::Weight query_key_gate_value;  // W8 [2 q + 2 kv, hidden]: rows query, key, gate, value
+  ninfer::Weight query_norm;            // BF16 [head_dim]
+  ninfer::Weight key_norm;              // BF16 [head_dim]
+  ninfer::Weight output;                // W8 [hidden, q]
+  ninfer::Weight post_attention_norm;   // BF16 [hidden]
+  ninfer::Weight mlp_gate_up;           // W8 [2 ffn, hidden]: gate rows, then up rows
+  ninfer::Weight mlp_down;              // W8 [hidden, ffn]
+  ninfer::Weight final_norm;            // BF16 [hidden]: the head's own, before the output head
+};
+
 // GitHub #177: the vision tower's geometry (the reference's
 // `VisionBackboneConfig`, `targets/qwen3_6/export/.../vision.h`) and its
 // weights, named after the artifact's `vision/*` objects.
@@ -691,6 +712,8 @@ struct ignis_model {
   // (`FlashNextModel::decode_lanes`).
   uint32_t decode_lanes = IGNIS_DECODE_MAX_BATCH;
   Dflash2Weights dflash2{};
+  // GitHub #620: the 27B's MTP head, bound under IGNIS_SPECULATIVE_MTP.
+  MtpHeadWeights mtp{};
   // The drafter's shortlist proposal head (`text/draft_head`, Q4 over the
   // 131,072 most frequent tokens) and the token id each of its rows stands
   // for (`text/draft_head_token_ids`), bound when the load hands both over;

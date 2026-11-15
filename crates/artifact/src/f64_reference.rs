@@ -649,6 +649,124 @@ fn evaluate_gqa(
     })
 }
 
+/// The 27B's MTP head over a sequence's rows, evaluated in f64 from the
+/// stored `mtp/` weights (GitHub #620, spec #618): what
+/// `kernel/src/mtp_head.h` takes the head to compute.
+///
+/// Row `r` is the head's row at position `positions[r]`, built from the
+/// target's post-final-norm hidden there (`hiddens[r]`, `[HIDDEN]`) and the
+/// embedding of the token after it (`embeddings[r]`): `x = W_fc [RMSNorm(e);
+/// RMSNorm(h)]`, then one gated GQA layer whose attention reads the rows
+/// before it and itself, then the dense SwiGLU MLP and the head's final norm.
+/// Every norm takes the `1 + w` gain; the rows rotate at their positions, all
+/// three MRoPE axes at the one scalar, as the text layers do.
+///
+/// Returns each row's key (after its norm and rotation) and value, the state
+/// the head keeps, and the last row's hidden after the head's final norm --
+/// the first draft's input, which the target's output head scores. Only the
+/// last row's attention, MLP and norm are evaluated: the others' leave no
+/// state.
+pub fn evaluate_mtp_head(
+    reader: &Reader,
+    hiddens: &[Vec<f64>],
+    embeddings: &[Vec<f64>],
+    positions: &[i32],
+) -> Result<MtpHeadReference> {
+    let rows = positions.len();
+    if rows == 0 || hiddens.len() != rows || embeddings.len() != rows {
+        return Err(fail("MTP head reference: one hidden, embedding and position per row, and a row at least"));
+    }
+    if hiddens.iter().chain(embeddings).any(|row| row.len() != HIDDEN || row.iter().any(|v| !v.is_finite())) {
+        return Err(fail("MTP head reference: every hidden and embedding is [5120] and finite"));
+    }
+    let q_width = GQA_HEADS * GQA_HEAD_DIM;
+    let kv_width = GQA_KV_HEADS * GQA_HEAD_DIM;
+    let stem = Matrix::load(reader, "mtp/input_projection", HIDDEN, 2 * HIDDEN)?;
+    let embedding_norm = vector_weight(reader, "mtp/embedding_norm", HIDDEN)?;
+    let hidden_norm = vector_weight(reader, "mtp/hidden_norm", HIDDEN)?;
+    let input_norm = vector_weight(reader, "mtp/layer/input_norm", HIDDEN)?;
+    let projection = Matrix::load(reader, "mtp/layer/attention/query_key_gate_value", 2 * q_width + 2 * kv_width, HIDDEN)?;
+    let q_weight = vector_weight(reader, "mtp/layer/attention/query_norm", GQA_HEAD_DIM)?;
+    let k_weight = vector_weight(reader, "mtp/layer/attention/key_norm", GQA_HEAD_DIM)?;
+    let output = Matrix::load(reader, "mtp/layer/attention/output", HIDDEN, q_width)?;
+    let common = CommonWeights {
+        input_norm: Matrix::load_vector(reader, "mtp/layer/input_norm", HIDDEN)?,
+        post_norm: Matrix::load_vector(reader, "mtp/layer/post_attention_norm", HIDDEN)?,
+        gate_up: Matrix::load(reader, "mtp/layer/mlp/gate_up", 34816, HIDDEN)?,
+        down: Matrix::load(reader, "mtp/layer/mlp/down", HIDDEN, 17408)?,
+    };
+    let final_norm = vector_weight(reader, "mtp/final_norm", HIDDEN)?;
+
+    let mut keys = Vec::with_capacity(rows);
+    let mut values = Vec::with_capacity(rows);
+    let mut last = (Vec::new(), Vec::new(), Vec::new());
+    for row in 0..rows {
+        let mut stem_input = norm(&embeddings[row], &embedding_norm, true)?;
+        stem_input.extend(norm(&hiddens[row], &hidden_norm, true)?);
+        let x = stem.product(&stem_input)?;
+        let p = projection.product(&norm(&x, &input_norm, true)?)?;
+        let mut key = p[q_width..q_width + kv_width].to_vec();
+        for head in 0..GQA_KV_HEADS {
+            let at = head * GQA_HEAD_DIM;
+            let prepared = rope(&norm(&key[at..at + GQA_HEAD_DIM], &k_weight, true)?, positions[row]);
+            key[at..at + GQA_HEAD_DIM].copy_from_slice(&prepared);
+        }
+        keys.push(key);
+        values.push(p[2 * q_width + kv_width..].to_vec());
+        if row + 1 == rows {
+            let mut query = p[..q_width].to_vec();
+            for head in 0..GQA_HEADS {
+                let at = head * GQA_HEAD_DIM;
+                let prepared = rope(&norm(&query[at..at + GQA_HEAD_DIM], &q_weight, true)?, positions[row]);
+                query[at..at + GQA_HEAD_DIM].copy_from_slice(&prepared);
+            }
+            last = (x, query, p[q_width + kv_width..2 * q_width + kv_width].to_vec());
+        }
+    }
+    let (mut residual, query, gate) = last;
+    let mut attention = vec![0.; q_width];
+    for head in 0..GQA_HEADS {
+        let kv = head / (GQA_HEADS / GQA_KV_HEADS);
+        let q = &query[head * GQA_HEAD_DIM..(head + 1) * GQA_HEAD_DIM];
+        let scores: Vec<f64> = keys
+            .iter()
+            .map(|k| q.iter().zip(&k[kv * GQA_HEAD_DIM..(kv + 1) * GQA_HEAD_DIM]).map(|(a, b)| a * b).sum::<f64>() / 16.0)
+            .collect();
+        let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let denom = scores.iter().map(|s| (s - max).exp()).sum::<f64>();
+        let out = &mut attention[head * GQA_HEAD_DIM..(head + 1) * GQA_HEAD_DIM];
+        for (score, v) in scores.iter().zip(&values) {
+            let weight = (score - max).exp() / denom;
+            for (target, value) in out.iter_mut().zip(&v[kv * GQA_HEAD_DIM..(kv + 1) * GQA_HEAD_DIM]) {
+                *target += weight * value;
+            }
+        }
+        for (value, g) in out.iter_mut().zip(&gate[head * GQA_HEAD_DIM..(head + 1) * GQA_HEAD_DIM]) {
+            *value *= sigmoid(*g);
+        }
+    }
+    for (x, add) in residual.iter_mut().zip(output.product(&attention)?) {
+        *x += add;
+    }
+    mlp(&common, &mut residual)?;
+    Ok(MtpHeadReference {
+        keys,
+        values,
+        hidden: norm(&residual, &final_norm, true)?,
+    })
+}
+
+/// [`evaluate_mtp_head`]'s result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MtpHeadReference {
+    /// Each row's key, `[kv heads x head dim]`, after its norm and rotation.
+    pub keys: Vec<Vec<f64>>,
+    /// Each row's value, `[kv heads x head dim]`.
+    pub values: Vec<Vec<f64>>,
+    /// The last row's hidden after the head's final norm, `[HIDDEN]`.
+    pub hidden: Vec<f64>,
+}
+
 fn rope(values: &[f64], position: i32) -> Vec<f64> {
     let mut out = values.to_vec();
     for pair in 0..32 {

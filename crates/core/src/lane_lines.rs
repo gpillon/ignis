@@ -77,18 +77,22 @@ pub fn lane_lines(
     let image = config.state_image(kv_format);
     // A lane's state is its pool slot (`kernel/src/seq.cu`): the GDN
     // recurrent state and conv taps, the penalty counts and the load's
-    // drafter's state (DFlash2's window). The hq residual window rides every
-    // slot, lanes and device retained slots alike.
+    // drafter's state (DFlash2's window, the MTP head's continuation hidden).
+    // The hq residual window rides every slot, lanes and device retained
+    // slots alike, with the MTP head's layer in it on an MTP load (GitHub
+    // #620).
     let slot = image.gdn_recurrent
         + image.gdn_conv_taps
         + image.penalty_counts
         + speculation.map_or(0, |speculation| speculation.drafter_state_bytes(1));
+    let hq_window =
+        image.hq_residual_window + speculation.map_or(0, |speculation| speculation.hq_residual_window_bytes(kv_format));
     LaneLines {
         sampling: sampling_bytes(config, lanes),
         verify_round: speculation.map_or(0, |speculation| verify_round_bytes(config, speculation, vision, lanes)),
         drafter_round: speculation.map_or(0, |speculation| speculation.round_scratch_bytes(lanes)),
         lane_state: u64::from(lanes) * slot,
-        hq_residual_window: u64::from(lanes + retained_device_slots) * image.hq_residual_window,
+        hq_residual_window: u64::from(lanes + retained_device_slots) * hq_window,
     }
 }
 

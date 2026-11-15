@@ -177,9 +177,16 @@ struct ignis_seq_pool_spec {
    * ignis_seq_alloc. It is a state section like the GDN slot, so snapshot,
    * restore and the prefix clone carry it, and a blob taken on a pool with the drafter is
    * refused by one without it and vice versa. IGNIS_SPECULATIVE_VERIFY_ONLY
-   * (P5-04, GitHub #153) owns no per-slot state and adds no section. Must
-   * match the speculative backend of the model the pool's sequences are
-   * stepped with. */
+   * (P5-04, GitHub #153) owns no per-slot state and adds no section.
+   * IGNIS_SPECULATIVE_MTP (GitHub #620) is the Qwen 3.8-27B's MTP head: the
+   * pool stores the head's attention state as one more attention layer,
+   * the last of `kv_num_layers`, and every slot owns the continuation
+   * hidden (one BF16 vector of the model's hidden width), zeroed at
+   * ignis_seq_alloc; under hq-e8-2b the head's layer keeps ring words of its
+   * own. Such a pool takes no snapshot, restore, retained slot, prefix or
+   * checkpoint yet. Flash-Next's MTP pool names no backend (0): its head's
+   * layer is one more of `kv_num_layers` and nothing else. Must match the
+   * speculative backend of the model the pool's sequences are stepped with. */
   int32_t speculative_backend;
   /* Retained slots beside the lanes (GitHub #211, ADR 0030): places for one
    * mutable-state image each -- a lane's own state, GDN conv and recurrent
@@ -200,8 +207,9 @@ struct ignis_seq_pool_spec {
   uint32_t retained_host_slot_count;
   /* The attention layers whose K/V the pool stores, one plane run each (the
    * topology's attention-layer count, GitHub #302): 16 on Qwen 3.8-27B, 12
-   * on Flash-Next. 1..16; the hq-e8-2b residual window and a blob's
-   * geometry follow it. */
+   * on Flash-Next. 1..16, and 2..17 under IGNIS_SPECULATIVE_MTP, whose last
+   * layer is the MTP head's (GitHub #620); the hq-e8-2b residual window and
+   * a blob's geometry follow it. */
   uint32_t kv_num_layers;
   /* Flash-Next's QSA indexer section (GitHub #302), one per attention
    * layer, or 0 and 0 for none (the 27B): the BF16 elements of one
@@ -251,7 +259,8 @@ struct ignis_seq_pool_stats {
    * (GitHub #210). */
   uint64_t kv_arena_bytes;
   /* Every lane's mutable state on the device: the GDN state arena, the
-   * penalty counts and, under DFLASH2, the drafter's window (GitHub #210) -- the retained slots' share of those arenas excluded. */
+   * penalty counts and, under DFLASH2, the drafter's window (GitHub #210), under MTP the continuation hidden (GitHub
+   * #620) -- the retained slots' share of those arenas excluded. */
   uint64_t lane_state_bytes;
   /* The device retained slots (GitHub #211): how many, what one slot's state
    * occupies, and `retained_slot_count * slot_state_bytes`. The host ones

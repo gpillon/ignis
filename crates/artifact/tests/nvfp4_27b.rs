@@ -19,7 +19,8 @@ use ignis_artifact::binder::Binder;
 use ignis_artifact::nvfp4_27b::{self, Entry, Geometry, FRONTEND_FILES, UNITS};
 use ignis_artifact::packer::{pack, sidecar_path, state_path, PackOptions, PackOutcome};
 use ignis_artifact::{
-    dflash2_scope_27b, draft_head_scope_27b, tensor_encoded_size, text_scope_27b, verify, vision_scope_27b,
+    dflash2_scope_27b, draft_head_scope_27b, mtp_scope_27b, tensor_encoded_size, text_scope_27b, verify,
+    vision_scope_27b,
     NumericFormat, Object, Reader, Sidecar, StorageLayout,
 };
 use serde_json::{json, Value};
@@ -76,6 +77,14 @@ fn the_served_inventory_is_ignis_27b_inventory_with_the_mtp_layer_and_the_fronte
     expected.extend(scope(vision_scope_27b()));
     expected.extend(scope(dflash2_scope_27b()));
     assert_eq!(described(&inventory), expected);
+    // GitHub #620: the MTP head's scope, what a 27B load built for it binds,
+    // is the served artifact's 12 `mtp/` objects, in their order.
+    assert_eq!(scope(mtp_scope_27b()), served_mtp());
+    let head_bytes: u64 = mtp_scope_27b()
+        .iter()
+        .map(|e| tensor_encoded_size(e.layout, e.format, e.shape).expect("an encodable head object"))
+        .sum();
+    assert_eq!(head_bytes, 451_267_584, "the head's weights");
 
     // The served recipe's counts (ninfer's `validate_inventory`).
     assert_eq!(inventory.len(), 1325);

@@ -239,6 +239,9 @@ pub enum DraftModule {
     /// scores with instead of the target's output head: `text/draft_head` and
     /// `text/draft_head_token_ids` ([`draft_head_scope_27b`]).
     Dflash2ShortlistHead,
+    /// The checkpoint's MTP head, the 12 `mtp/` objects every 27B artifact
+    /// carries ([`mtp_scope_27b`], GitHub #620): the 27B's second drafter.
+    Mtp,
 }
 
 /// The drafter's layer count (§15.1: five sliding-attention layers).
@@ -288,6 +291,36 @@ pub fn dflash2_scope_27b() -> Vec<InventoryEntry> {
     push("dflash2/selector/predecessor", nvfp4, &SH_DF_CODEBOOK);
     push("dflash2/selector/successor", nvfp4, &SH_DF_CODEBOOK);
     entries
+}
+
+const SH_MTP_INPUT_PROJECTION: [u64; 2] = [5120, 10240]; // hidden x [embedding; hidden]
+
+/// The 27B's MTP head (GitHub #620, spec #618), in the artifact's directory
+/// order: the checkpoint's one MTP layer, its five matrices W8 and its seven
+/// gains BF16 -- on every 27B artifact, the 16 GB ones included, whose bodies
+/// are trellis and whose head is not (`docs/formats/27b-nvfp4-work-tree.md`
+/// section 4.3). 451,267,584 bytes. The head reads the target's token
+/// embedding and scores with its output head, so neither is here.
+pub fn mtp_scope_27b() -> Vec<InventoryEntry> {
+    let w8 = (NumericFormat::W8G32F16S, StorageLayout::RowSplitK128V1);
+    let bf16 = (NumericFormat::Bf16, StorageLayout::ContiguousLeV1);
+    let entry = |name: &str, (format, layout): (NumericFormat, StorageLayout), shape: &'static [u64]| {
+        mk(name, format, layout, shape)
+    };
+    vec![
+        entry("mtp/input_projection", w8, &SH_MTP_INPUT_PROJECTION),
+        entry("mtp/embedding_norm", bf16, &SH_HIDDEN),
+        entry("mtp/hidden_norm", bf16, &SH_HIDDEN),
+        entry("mtp/layer/input_norm", bf16, &SH_HIDDEN),
+        entry("mtp/layer/attention/query_key_gate_value", w8, &SH_QKGV),
+        entry("mtp/layer/attention/query_norm", bf16, &SH_ATTN_NORM),
+        entry("mtp/layer/attention/key_norm", bf16, &SH_ATTN_NORM),
+        entry("mtp/layer/attention/output", w8, &SH_ATTN_OUT),
+        entry("mtp/layer/post_attention_norm", bf16, &SH_HIDDEN),
+        entry("mtp/layer/mlp/gate_up", w8, &SH_MLP_GATE_UP),
+        entry("mtp/layer/mlp/down", w8, &SH_MLP_DOWN),
+        entry("mtp/final_norm", bf16, &SH_HIDDEN),
+    ]
 }
 
 const SH_DRAFT_HEAD: [u64; 2] = [131072, 5120]; // the shortlist rows x hidden
@@ -489,6 +522,7 @@ fn with_modules(text: Vec<InventoryEntry>, scope: ModelScope) -> Vec<InventoryEn
             entries.extend(dflash2_scope_27b());
             entries.extend(draft_head_scope_27b());
         }
+        Some(DraftModule::Mtp) => entries.extend(mtp_scope_27b()),
     }
     if scope.vision {
         let residence = match scope.vision_residency {

@@ -19,6 +19,7 @@
 #include "ignis_gqa_layer.h"
 #include "layer_internal.h"
 #include "model_internal.h"
+#include "mtp_head.h"
 #include "sampled_draft.h"
 #include "trellis_body.h"
 #include "flash_next/program.h"
@@ -123,6 +124,17 @@ int32_t ignis_decode_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
     ninfer::Tensor logits(model->sampling_decode_logits->p, ninfer::DType::BF16,
                           {vocab, batch, 1, 1});
     ignis::trellis_body::output_head(*model, normalized, logits, model->stream);
+    // GitHub #620: on an MTP load each lane's head row at the position before
+    // the one it consumed, and its continuation hidden moves to the round's
+    // (kernel/src/mtp_head.h) -- graph-safe, so every captured width keeps
+    // the head current as the eager round does.
+    if (model->drafter == IgnisDrafter::kMtp) {
+      std::string head_error;
+      if (ignis::mtp::decode_round(*model, *pool, width, normalized, &head_error) != 0) {
+        set_error("ignis_decode_graph: width " + std::to_string(width) + ": " + head_error);
+        return -1;
+      }
+    }
     return 0;
   } catch (const std::exception &e) {
     set_error("ignis_decode_graph: width " + std::to_string(width) + ": " + e.what());
@@ -183,6 +195,11 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
     case IgnisDrafter::kDflash2:
       ignis_dflash2_propose(model, pool, width);
       break;
+    case IgnisDrafter::kMtp:
+      // GitHub #620: the head's chain is not built; the round refuses an MTP
+      // load before any pass (kernel/src/step.cu `run_verify_round`).
+      set_error("ignis_verify_graph: the MTP head proposes no drafts in this leaf yet");
+      return -1;
     case IgnisDrafter::kHost:
     case IgnisDrafter::kNone:
       break;
@@ -479,7 +496,8 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   // P5-04 (GitHub #153): the verify graphs, one per exact width at the
   // load's window, under the same never-refuse-service rule -- a width whose
   // verify capture failed runs the verify traversal eagerly.
-  if (model->verify != nullptr) {
+  // GitHub #620: an MTP load runs no verify round yet, so none is captured.
+  if (model->verify != nullptr && model->drafter != IgnisDrafter::kMtp) {
     for (uint32_t width = 1; width <= model->decode_lanes; ++width) {
       cudaGraphExec_t exec = nullptr;
       if (capture_verify_graph_width(model, pool, width, &exec,

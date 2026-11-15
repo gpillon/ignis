@@ -133,6 +133,20 @@ void zero_dflash2_lane(ignis_seq_pool &pool, std::int32_t slot) {
   }
 }
 
+// GitHub #620: zero `slot`'s continuation hidden, so a re-allocated slot's
+// first head row is never built from another request's hidden. A no-op on a
+// pool without the MTP head.
+void zero_mtp_continuation(ignis_seq_pool &pool, std::int32_t slot) {
+  if (!pool.has_mtp_head()) {
+    return;
+  }
+  const cudaError_t err =
+      cudaMemset(pool.mtp_continuation_of(slot), 0, static_cast<std::size_t>(pool.mtp_continuation_slot_bytes()));
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaMemset(continuation hidden) failed: ") + cudaGetErrorString(err));
+  }
+}
+
 // GitHub #302: a slot's Flash-Next tails and n-gram conv columns, zeroed so
 // nothing of its previous occupant is read as this sequence's history.
 void zero_flash_next_slot(ignis_seq_pool &pool, std::int32_t slot) {
@@ -246,6 +260,15 @@ void ignis_seq_zero_hq_residual(ignis_seq_pool &pool, std::int32_t slot) {
   if (err != cudaSuccess) {
     throw std::runtime_error(std::string("cudaMemset(hq ring words) failed: ") +
                              cudaGetErrorString(err));
+  }
+  // GitHub #620: the MTP head's ring words, its layer's own.
+  if (pool.has_mtp_head()) {
+    const cudaError_t head_err =
+        cudaMemset(pool.hq_head_ring_words(slot), 0, kIgnisHqRingWords * sizeof(std::uint32_t));
+    if (head_err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaMemset(hq head ring words) failed: ") +
+                               cudaGetErrorString(head_err));
+    }
   }
 }
 
@@ -706,10 +729,17 @@ bool validate_pool_spec(const struct ignis_seq_pool_spec &spec, const std::strin
     return false;
   }
   // GitHub #302: the attention layers are the topology's (16 on the 27B, 12
-  // on Flash-Next), within what a sequence's frontier array holds.
-  if (spec.kv_num_layers == 0 || spec.kv_num_layers > static_cast<std::uint32_t>(kIgnisGqaLayerCount)) {
-    set_error(fn + ": kv_num_layers " + std::to_string(spec.kv_num_layers) + " is not in 1.." +
-              std::to_string(kIgnisGqaLayerCount));
+  // on Flash-Next), within what a sequence's frontier array holds. GitHub
+  // #620: a pool built for the 27B's MTP head stores the head's own layer
+  // past them, whose frontier is not in that array (ignis_mtp_head_frontier).
+  const bool mtp_head = spec.speculative_backend == IGNIS_SPECULATIVE_MTP;
+  const std::uint32_t most_layers =
+      static_cast<std::uint32_t>(kIgnisGqaLayerCount + (mtp_head ? kIgnisMtpHeadLayers : 0));
+  const std::uint32_t fewest_layers = mtp_head ? static_cast<std::uint32_t>(1 + kIgnisMtpHeadLayers) : 1u;
+  if (spec.kv_num_layers < fewest_layers || spec.kv_num_layers > most_layers) {
+    set_error(fn + ": kv_num_layers " + std::to_string(spec.kv_num_layers) + " is not in " +
+              std::to_string(fewest_layers) + ".." + std::to_string(most_layers) +
+              (mtp_head ? " (the target's attention layers and the MTP head's one)" : ""));
     return false;
   }
   // GitHub #302: Flash-Next's sections, each all or nothing.
@@ -742,9 +772,17 @@ bool validate_pool_spec(const struct ignis_seq_pool_spec &spec, const std::strin
   }
   if (spec.speculative_backend != IGNIS_SPECULATIVE_NONE &&
       spec.speculative_backend != IGNIS_SPECULATIVE_DFLASH2 &&
-      spec.speculative_backend != IGNIS_SPECULATIVE_VERIFY_ONLY) {
+      spec.speculative_backend != IGNIS_SPECULATIVE_VERIFY_ONLY &&
+      spec.speculative_backend != IGNIS_SPECULATIVE_MTP) {
     set_error(fn + ": speculative_backend " + std::to_string(spec.speculative_backend) +
               " is not an ignis_speculative_backend");
+    return false;
+  }
+  // GitHub #620: backend 3 is the 27B's MTP head. Flash-Next's own head names
+  // no drafter in its pool spec, so a pool with Flash-Next's sections and
+  // backend 3 is a contradiction.
+  if (mtp_head && (indexer || ngram)) {
+    set_error(fn + ": speculative_backend 3 (the 27B's MTP head) with Flash-Next's indexer or n-gram sections");
     return false;
   }
   return true;
@@ -778,6 +816,12 @@ struct PoolLayout {
   std::size_t indexer_bytes = 0;
   std::uint64_t ngram_conv_slot_bytes = 0;
   std::size_t ngram_conv_bytes = 0;
+  /* GitHub #620: the MTP head's continuation hidden, one per state slot, and
+   * under hq-e8-2b its layer's own ring words (counted in
+   * `hq_residual_bytes`). 0 without the head. */
+  bool mtp_head = false;
+  std::uint64_t mtp_continuation_slot_bytes = 0;
+  std::size_t mtp_continuation_bytes = 0;
 };
 
 // Every slot the state arenas hold: the lanes, then the device retained slots
@@ -853,6 +897,14 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
     out.dflash2_bytes = dflash2_builder.finish(256);
     break;
   }
+  case IgnisDrafter::kMtp:
+    // GitHub #620: the continuation hidden, one BF16 vector per slot. The
+    // head's attention state is the KV pool's last layer (`kv_num_layers`
+    // counts it), so it is planned with the pages above.
+    out.mtp_head = true;
+    out.mtp_continuation_slot_bytes = static_cast<std::uint64_t>(kIgnisMtpHidden) * sizeof(std::uint16_t);
+    out.mtp_continuation_bytes = static_cast<std::size_t>(state_slots * out.mtp_continuation_slot_bytes);
+    break;
   case IgnisDrafter::kHost:
   case IgnisDrafter::kNone:
     break;
@@ -863,6 +915,7 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
   if (out.dflash2) {
     out.slot_state_bytes += cyclic_lane_bytes(out.dflash2_window_layout);
   }
+  out.slot_state_bytes += out.mtp_continuation_slot_bytes;
   // GitHub #257 (spec runtime/06): the hq residual window, for every state
   // slot. Reserved here, at load, like every other line of the plan (ADR
   // 0030): its bytes come off the KV pool's budget, never out of a request.
@@ -872,8 +925,11 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
     out.hq_residual_plane_bytes = static_cast<std::size_t>(kIgnisHqHeadDim) * spec.num_kv_heads *
                                   kIgnisHqResidualRows * sizeof(std::uint16_t);
     const std::size_t planes = static_cast<std::size_t>(spec.kv_num_layers) * state_slots;
+    // GitHub #620: the MTP head's layer has its planes among `planes` and
+    // ring words of its own after the target's.
+    const std::size_t ring_sets = out.mtp_head ? 2 : 1;
     out.hq_residual_bytes = 2 * planes * out.hq_residual_plane_bytes +
-                            static_cast<std::size_t>(state_slots) * kIgnisHqRingWords *
+                            ring_sets * static_cast<std::size_t>(state_slots) * kIgnisHqRingWords *
                                 sizeof(std::uint32_t);
   }
   // GitHub #302: Flash-Next's sections, BF16 throughout.
@@ -897,8 +953,8 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
 // slots' share (GitHub #210, #211).
 std::uint64_t lane_state_bytes_of(const PoolLayout &layout,
                                   const struct ignis_seq_pool_spec &spec) {
-  return layout.gdn_bytes + layout.sampling_counts_bytes + layout.dflash2_bytes -
-         spec.retained_slot_count * layout.slot_state_bytes;
+  return layout.gdn_bytes + layout.sampling_counts_bytes + layout.dflash2_bytes +
+         layout.mtp_continuation_bytes - spec.retained_slot_count * layout.slot_state_bytes;
 }
 
 // One slot's share of every region in `regions`.
@@ -1036,8 +1092,22 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
       pool->hq_ring           = reinterpret_cast<std::uint32_t *>(
           base + 2 * planes * layout.hq_residual_plane_bytes);
       pool->hq_residual_slots = static_cast<std::int32_t>(state_slot_count(*spec));
+      // GitHub #620: the MTP head's ring words, after every slot's target words.
+      if (layout.mtp_head) {
+        pool->hq_head_ring = pool->hq_ring + static_cast<std::size_t>(state_slot_count(*spec)) * kIgnisHqRingWords;
+      }
       if (pool->hq_residual_plane_bytes() != layout.hq_residual_plane_bytes) {
         throw std::logic_error("the hq residual plane the pool addresses is not the one it planned");
+      }
+    }
+
+    // GitHub #620: the MTP head's continuation hidden, zeroed once here and a
+    // slot's again at every alloc.
+    if (layout.mtp_head) {
+      pool->mtp_continuation = std::make_unique<ninfer::DeviceBuffer>(layout.mtp_continuation_bytes);
+      pool->mtp_continuation->fill(0);
+      if (pool->mtp_continuation_slot_bytes() != layout.mtp_continuation_slot_bytes) {
+        throw std::logic_error("the continuation hidden the pool addresses is not the one it planned");
       }
     }
 
@@ -1134,7 +1204,8 @@ extern "C" int32_t ignis_seq_pool_stats(const struct ignis_seq_pool *pool,
   out_stats->slot_state_bytes     = pool->slot_state_bytes;
   out_stats->retained_state_bytes = pool->retained_device_slot_count * pool->slot_state_bytes;
   out_stats->lane_state_bytes = pool->gdn_arena.capacity() + pool->sampling_counts.bytes +
-                                (pool->has_dflash2() ? pool->dflash2_arena->capacity() : 0) -
+                                (pool->has_dflash2() ? pool->dflash2_arena->capacity() : 0) +
+                                (pool->has_mtp_head() ? pool->mtp_continuation->bytes : 0) -
                                 out_stats->retained_state_bytes;
   out_stats->hq_residual_bytes = pool->has_hq_residual() ? pool->hq_residual->bytes : 0;
   // GitHub #281: host memory, in none of the device lines above.
@@ -1146,7 +1217,13 @@ extern "C" int32_t ignis_seq_pool_stats(const struct ignis_seq_pool *pool,
 }
 
 const char *ignis_seq_clone_refusal(const ignis_seq_pool &pool) {
-  (void)pool;
+  // GitHub #620: the MTP head's two sections -- its layer's ring words and the
+  // continuation hidden -- are not in the section table yet, and a move that
+  // left them behind would hand its sequence a head that is not its own.
+  if (pool.has_mtp_head()) {
+    return "a pool built for the MTP head carries the head's state, which no snapshot, restore, retained "
+           "slot, prefix or checkpoint moves yet";
+  }
   return nullptr;
 }
 
@@ -1205,6 +1282,7 @@ extern "C" int32_t ignis_seq_alloc(struct ignis_seq_pool *pool, uint32_t context
                                cudaGetErrorString(err));
     }
     zero_dflash2_lane(*pool, slot);
+    zero_mtp_continuation(*pool, slot);
     // GitHub #257: nothing of the slot's previous occupant stays readable as
     // an exact row -- neither a ring bit, which names no position, nor a sink
     // row, which the kernels read with no bit at all.
@@ -2258,6 +2336,10 @@ int32_t retained_refusal(const ignis_seq_pool *pool, const ignis_seq *seq,
   }
   if (retained_slot >= pool->retained_slot_count) {
     set_error(std::string(fn) + ": " + ignis_seq_retained_slot_refusal(*pool, retained_slot));
+    return -1;
+  }
+  if (const char *refusal = ignis_seq_clone_refusal(*pool)) {
+    set_error(std::string(fn) + ": " + refusal);
     return -1;
   }
   if (!ignis_seq_at_chunk_boundary(*seq)) {

@@ -671,6 +671,7 @@ impl PrefillRoute {
             next_prompt_token: -1,
             keeps_draw: 0,
             keeps_scores: 0,
+            out_span_hidden: std::ptr::null_mut(),
         }
     }
 }
@@ -934,6 +935,61 @@ pub fn prefill_program_span_logits(
             &GREEDY,
             &options,
             std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// GitHub #620: [`prefill_program_draw`]'s span on a load with the 27B's MTP
+/// head, also reading the target's post-final-norm hidden of **every**
+/// position of the span into `out_span_hidden` (row-major
+/// `[token_ids.len()][hidden]`, BF16 bits): what the head's rows are built
+/// from, for the double-precision check of its state. `next_prompt_token` is
+/// [`prefill_program_draw`]'s; the span draws when it is `None`, greedily,
+/// and then `out_logits`, if `Some`, receives the draw's logits as
+/// [`prefill_program`]'s do. Chunked route, engine default policy. A
+/// measurement beside the program: no serving path calls it.
+pub fn prefill_program_span_hidden(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    next_prompt_token: Option<TokenId>,
+    out_span_hidden: &mut [u16],
+    out_logits: Option<&mut [f32]>,
+) -> Result<(), String> {
+    let hidden = crate::compute::ModelConfig::qwen38_27b().hidden as usize;
+    if out_span_hidden.len() != token_ids.len() * hidden {
+        return Err(format!(
+            "prefill_program_span_hidden: {} hidden values for {} tokens of {hidden}",
+            out_span_hidden.len(),
+            token_ids.len()
+        ));
+    }
+    let options = ffi::IgnisPrefillOptions {
+        out_span_hidden: out_span_hidden.as_mut_ptr(),
+        next_prompt_token: next_prompt_token_field("prefill_program_span_hidden", next_prompt_token)?,
+        ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
+    };
+    let logits = match out_logits {
+        Some(row) => row.as_mut_ptr(),
+        None => std::ptr::null_mut(),
+    };
+    let rc = unsafe {
+        ffi::ignis_program_prefill(
+            model.handle(),
+            pool.handle(),
+            sequence.handle(),
+            token_ids.as_ptr(),
+            token_ids.len() as u64,
+            start_position,
+            &GREEDY,
+            &options,
+            logits,
         )
     };
     if rc != 0 {

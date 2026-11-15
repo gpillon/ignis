@@ -7,7 +7,10 @@
 //! the modules that define them. The leaf forces a round only when the decode
 //! options carry `forced_tokens`, which only the forced round's Rust entry
 //! sets; its verify graphs are captured without a recording and refuse one
-//! (kernel/src/decode_graph.cu).
+//! (kernel/src/decode_graph.cu). GitHub #620: the MTP head's proposal readout
+//! (`mtp_readout`) and the span readout of the hiddens it reads
+//! (`prefill_program_span_hidden`, the prefill options' `out_span_hidden`) are
+//! the same kind of seam.
 
 use std::path::{Path, PathBuf};
 
@@ -33,11 +36,20 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The seams' names, as code would call them.
-const SEAMS: [&str; 5] = ["decode_program_verify_forced", "dflash2_readout", "forced_tokens", "propose_sampled", "verify_logits"];
+const SEAMS: [&str; 8] = [
+    "decode_program_verify_forced",
+    "dflash2_readout",
+    "forced_tokens",
+    "propose_sampled",
+    "verify_logits",
+    "mtp_readout",
+    "prefill_program_span_hidden",
+    "out_span_hidden",
+];
 
 /// The core crate's files that define the seams, and its root, which
-/// declares the readout's module.
-const DEFINING: [&str; 4] = ["dflash2_readout.rs", "step.rs", "step_abi.rs", "lib.rs"];
+/// declares the readouts' modules.
+const DEFINING: [&str; 5] = ["dflash2_readout.rs", "mtp_readout.rs", "step.rs", "step_abi.rs", "lib.rs"];
 
 #[test]
 fn no_serving_path_names_the_forced_round_or_the_readout() {

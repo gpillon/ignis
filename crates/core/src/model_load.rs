@@ -402,10 +402,10 @@ pub fn draft_module(speculation: Option<Speculation>) -> Option<DraftModule> {
         // The verify substrate binds no drafter (P5-04, GitHub #153): the
         // text scope alone.
         SpeculativeBackend::VerifyOnly => None,
-        // The 27B refuses MTP at load (`kernel/src/model.cu`). Flash-Next's
-        // head comes from a companion container, never from this module
-        // (spec flash-next/07).
-        SpeculativeBackend::Mtp => None,
+        // GitHub #620: the 27B's own MTP head, its 12 `mtp/` objects.
+        // Flash-Next's head comes from a companion container, never from
+        // this module (spec flash-next/07): its loads bind no 27B scope.
+        SpeculativeBackend::Mtp => Some(DraftModule::Mtp),
     })
 }
 
@@ -1547,6 +1547,10 @@ mod tests {
             .unwrap()
             .with_proposal_head(ProposalHead::Shortlist);
         assert_eq!(draft_module(Some(verify_only)), None);
+        // GitHub #620: MTP binds the 27B's own head, whatever head the option
+        // names (only DFlash2 has a shortlist).
+        let mtp = Speculation::new(SpeculativeBackend::Mtp, 7).unwrap();
+        assert_eq!(draft_module(Some(mtp)), Some(DraftModule::Mtp));
     }
 
     #[test]

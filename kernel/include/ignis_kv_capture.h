@@ -63,7 +63,9 @@ struct ignis_seq;
  *
  * `gqa_layer_ordinal` is the 0..kIgnisGqaLayerCount-1 index `seq`'s own
  * per-layer position tracking uses (kernel/include/ignis_seq_internal.h),
- * not an absolute backbone layer index. `role` is 0 for K, 1 for V. `head_dim`
+ * not an absolute backbone layer index -- or, on a pool built for the 27B's
+ * MTP head (GitHub #620), kIgnisGqaLayerCount: the head's layer, read up to
+ * the head's own frontier. `role` is 0 for K, 1 for V. `head_dim`
  * must equal the pool's actual head_dim (the geometry `ignis_seq_pool_create`
  * was built with) -- it is not re-derived from `pool` so a mismatched caller
  * fails loudly instead of silently reading a differently-shaped row.

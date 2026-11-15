@@ -32,6 +32,7 @@
 #include "hq_decode_attention.h"
 #include "layer_internal.h"
 #include "model_internal.h"
+#include "mtp_head.h"
 #include "sampled_draft.h"
 #include "trellis_body.h"
 
@@ -494,6 +495,39 @@ bool bind_dflash2(ModelBinder &binder, const Geometry &g, Dflash2Weights &w) {
                      w.selector_predecessor) &&
          binder.bind("dflash2/selector/successor", {g.vocab, kDflash2SelectorRank},
                      w.selector_successor);
+}
+
+// GitHub #620 (spec #618): the 27B's MTP head, the container's 12 `mtp/`
+// objects: its matrices W8 and its gains BF16 on every 27B artifact, the 16
+// GB ones included (the head is never trellis), at the target's widths.
+bool bind_mtp_head(ModelBinder &binder, const Geometry &g, MtpHeadWeights &w) {
+  return binder.bind("mtp/input_projection", {g.hidden, 2 * g.hidden}, w.input_projection) &&
+         binder.bind("mtp/embedding_norm", {g.hidden}, w.embedding_norm) &&
+         binder.bind("mtp/hidden_norm", {g.hidden}, w.hidden_norm) &&
+         binder.bind("mtp/layer/input_norm", {g.hidden}, w.input_norm) &&
+         binder.bind("mtp/layer/attention/query_key_gate_value", {2 * g.gqa_width + 2 * g.gqa_kv_width, g.hidden},
+                     w.query_key_gate_value) &&
+         binder.bind("mtp/layer/attention/query_norm", {g.head_dim}, w.query_norm) &&
+         binder.bind("mtp/layer/attention/key_norm", {g.head_dim}, w.key_norm) &&
+         binder.bind("mtp/layer/attention/output", {g.hidden, g.gqa_width}, w.output) &&
+         binder.bind("mtp/layer/post_attention_norm", {g.hidden}, w.post_attention_norm) &&
+         binder.bind("mtp/layer/mlp/gate_up", {2 * g.ffn_intermediate, g.hidden}, w.mlp_gate_up) &&
+         binder.bind("mtp/layer/mlp/down", {g.hidden, g.ffn_intermediate}, w.mlp_down) &&
+         binder.bind("mtp/final_norm", {g.hidden}, w.final_norm);
+}
+
+// The head runs on the W8 linear at its five registered geometries, so a
+// matrix the load hands over in another format would reach no route; refused
+// by name at load rather than at its first prefill.
+bool check_mtp_head_formats(const MtpHeadWeights &w) {
+  for (const auto *matrix : {&w.input_projection, &w.query_key_gate_value, &w.output, &w.mlp_gate_up, &w.mlp_down}) {
+    if (matrix->qtype != ninfer::QType::W8G32_F16S) {
+      set_error("ignis_model_load: the MTP head's matrices are W8G32 on every 27B artifact; one is qtype " +
+                std::to_string(static_cast<int>(matrix->qtype)));
+      return false;
+    }
+  }
+  return true;
 }
 
 // P5-03 (GitHub #152): the drafter's window lives in the sequence pool, one
@@ -1625,8 +1659,16 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     return nullptr;
   }
   out.decode_lanes = decode_lanes;
-  if (speculative_backend == IGNIS_SPECULATIVE_MTP) {
-    set_error("ignis_model_load: MTP is Qwen3.8-Flash-Next's draft head; the 27B drafts with DFlash2");
+  // GitHub #620: the 27B's own MTP head. Its prefill writes text positions,
+  // and a multimodal span's head rows are not built: vision and the head do
+  // not combine on one load yet. Its draft rule is the fixed draft's.
+  if (speculative_backend == IGNIS_SPECULATIVE_MTP && vision_max_tokens > 0) {
+    set_error("ignis_model_load: the 27B's MTP head does not combine with vision on one load yet");
+    return nullptr;
+  }
+  if (speculative_backend == IGNIS_SPECULATIVE_MTP && draft_rule != IGNIS_DRAFT_RULE_FIXED) {
+    set_error("ignis_model_load: the 27B's MTP head drafts its best token at every temperature, the fixed "
+              "draft; draft_rule 1 (sampled) is DFlash2's");
     return nullptr;
   }
 
@@ -1696,6 +1738,13 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
         return nullptr;
       }
       model->proposal_token_ids = static_cast<const std::int32_t *>(token_ids.qdata);
+    }
+    break;
+  case IgnisDrafter::kMtp:
+    // GitHub #620: the head's 12 objects. Without the option a caller that
+    // hands them over fails on `require_no_extras` below.
+    if (!bind_mtp_head(binder, g, model->mtp) || !check_mtp_head_formats(model->mtp)) {
+      return nullptr;
     }
     break;
   case IgnisDrafter::kHost:
@@ -2084,6 +2133,17 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
     }
     break;
   }
+  case IgnisDrafter::kMtp:
+    // GitHub #620: the head's rows in every prefill chunk, at most
+    // ignis::mtp::kPrefillRows a call, and in every round, over each of its
+    // columns. Their attention takes the workspace the target's GQA layers
+    // already hold at the same widths, so only the head's own buffers are
+    // added (kernel/src/mtp_head.h); its weights are on the weights line and
+    // its state is the pool's.
+    sizes.prefill_scratch += ignis::mtp::prefill_scratch_bytes(g.hidden, static_cast<std::int64_t>(prefill_chunk_tokens));
+    sizes.decode_graph_scratch +=
+        ignis::mtp::round_scratch_bytes(g.hidden, static_cast<std::int64_t>(lanes) * round_columns);
+    break;
   case IgnisDrafter::kHost:
   case IgnisDrafter::kNone:
     break;

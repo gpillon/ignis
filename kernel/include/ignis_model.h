@@ -234,10 +234,17 @@ enum ignis_speculative_backend {
    * drafter fills, and what proves accept, rollback and fold before the real
    * drafter is wired in (P5-05). Not an operator-facing backend. */
   IGNIS_SPECULATIVE_VERIFY_ONLY = 2,
-  /* GitHub #307 (spec flash-next/07): Qwen3.8-Flash-Next's own MTP draft
-   * head, from its companion container. Flash-Next's only drafter: a 27B
-   * load refuses it, as a Flash-Next load refuses DFLASH2. Flash-Next takes
-   * VERIFY_ONLY too, with its drafts per call. */
+  /* The checkpoint's own MTP layer. GitHub #307 (spec flash-next/07):
+   * Qwen3.8-Flash-Next's draft head, from its companion container, its only
+   * drafter (a Flash-Next load refuses DFLASH2, and takes VERIFY_ONLY too,
+   * with its drafts per call). GitHub #620 (spec #618): on the 27B its second
+   * drafter, the 12 `mtp/` objects of its own container -- a sequence pool
+   * built with it stores the head's attention state as one more attention
+   * layer and carries a continuation hidden per slot
+   * (ignis_seq_pool_spec::speculative_backend). Text only, under the fixed
+   * draft: a 27B load refuses it with vision or the sampled draft. Its
+   * prefills and plain rounds keep the head's state; its verify round is
+   * refused until the head's chain proposes in it. */
   IGNIS_SPECULATIVE_MTP = 3,
 };
 

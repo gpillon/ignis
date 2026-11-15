@@ -568,6 +568,10 @@ fn pool_drafter(cfg: &ModelConfig, speculative_backend: Option<crate::Speculativ
     match (cfg.family, speculative_backend) {
         (_, None) => (0, 0),
         (crate::compute::ModelFamily::FlashNext, Some(crate::SpeculativeBackend::Mtp)) => (0, 1),
+        // GitHub #620: the 27B's MTP head names its backend, so its pool
+        // carries the continuation hidden, and keeps its attention state in
+        // one more attention layer, the pool's last.
+        (_, Some(crate::SpeculativeBackend::Mtp)) => (crate::SpeculativeBackend::Mtp.abi_code(), 1),
         (_, Some(backend)) => (backend.abi_code(), 0),
     }
 }
@@ -1833,8 +1837,9 @@ mod tests {
 
     /// GitHub #619: a 27B pool names the load's drafter, whose slot sections
     /// the leaf lays out by it, and holds the target's 16 attention layers
-    /// whatever drafts; a Flash-Next pool keeps its own rule, its MTP head one
-    /// more attention layer and no drafter named.
+    /// under every drafter but the MTP head, whose attention state is one
+    /// more (GitHub #620); a Flash-Next pool keeps its own rule, its MTP head
+    /// one more attention layer and no drafter named.
     #[test]
     fn a_pool_names_the_loads_drafter_and_its_attention_layers() {
         use crate::SpeculativeBackend::{Dflash2, Mtp, VerifyOnly};
@@ -1854,17 +1859,21 @@ mod tests {
         assert_eq!(spec(&dense, None), (0, 16));
         assert_eq!(spec(&dense, Some(Dflash2)), (1, 16));
         assert_eq!(spec(&dense, Some(VerifyOnly)), (2, 16));
-        // A 27B pool asked for MTP names it, and the leaf's pool spec refuses
-        // the backend by value, as the 27B's load refuses MTP by name.
-        assert_eq!(spec(&dense, Some(Mtp)), (3, 16));
+        // A 27B pool asked for MTP names it and stores the head's layer last.
+        assert_eq!(spec(&dense, Some(Mtp)), (3, 17));
         let flash = ModelConfig::qwen38_flash_next();
         assert_eq!(spec(&flash, None), (0, 12));
         assert_eq!(spec(&flash, Some(Mtp)), (0, 13));
         assert_eq!(spec(&flash, Some(VerifyOnly)), (2, 12));
         // The geometry a load's KV pool is planned against is the one the pool
-        // holds: the 27B's 16 layers of 4 KV heads of 256 whatever drafts.
-        for backend in [None, Some(Dflash2), Some(VerifyOnly), Some(Mtp)] {
+        // holds: the 27B's 16 layers of 4 KV heads of 256 under every drafter
+        // but the MTP head, and its 17 under the head.
+        for backend in [None, Some(Dflash2), Some(VerifyOnly)] {
             assert_eq!(kv_geometry(&dense, backend), crate::KvGeometry::qwen38_27b(), "{backend:?}");
+        }
+        assert_eq!(kv_geometry(&dense, Some(Mtp)), crate::KvGeometry { gqa_layers: 17, ..crate::KvGeometry::qwen38_27b() });
+        for backend in [None, Some(Dflash2), Some(VerifyOnly), Some(Mtp)] {
+            assert_eq!(kv_geometry(&dense, backend).gqa_layers, spec(&dense, backend).1, "{backend:?}");
             assert_eq!(kv_geometry(&flash, backend).gqa_layers, spec(&flash, backend).1, "{backend:?}");
         }
     }

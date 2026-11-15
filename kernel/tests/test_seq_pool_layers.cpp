@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -149,6 +150,46 @@ int main() {
     const std::string message = ignis_seq_last_error();
     check(!planned && message.find(r.needle) != std::string::npos,
           std::string(r.what) + " is refused by name: got \"" + message + "\"");
+  }
+
+  // GitHub #620: a pool built for the 27B's MTP head (backend 3) stores the
+  // head's layer past the target's 16 -- one more layer's planes per page
+  // and in the hq window, the head's own ring words beside the target's --
+  // and gives every slot a continuation hidden of 5,120 BF16. 17 layers are
+  // the head's alone, and the head's pool holds one layer of its own at least.
+  {
+    ignis_seq_pool_spec target = spec_of(IGNIS_KV_FORMAT_HQ_E8_2B, 16);
+    ignis_seq_pool_spec head = spec_of(IGNIS_KV_FORMAT_HQ_E8_2B, 17);
+    head.speculative_backend = IGNIS_SPECULATIVE_MTP;
+    struct ignis_seq_pool_plan without{}, with{};
+    check(plan(target, without), "a 16-layer hq pool plans");
+    check(plan(head, with), std::string("a 17-layer MTP pool plans: ") + ignis_seq_last_error());
+    check(with.kv_bytes - without.kv_bytes == 8ull * 2 * 72 * 64 * 2,
+          "the head's layer is one layer's planes per page: got " + std::to_string(with.kv_bytes - without.kv_bytes));
+    check(with.hq_residual_bytes - without.hq_residual_bytes == 2 * 3 * plane + 3 * 16 * 4,
+          "the head's layer in the hq window, its planes and its own ring words: got " +
+              std::to_string(with.hq_residual_bytes - without.hq_residual_bytes));
+    check(with.lane_state_bytes - without.lane_state_bytes == 3ull * 5120 * 2,
+          "each lane's continuation hidden: got " + std::to_string(with.lane_state_bytes - without.lane_state_bytes));
+    check(with.slot_state_bytes - without.slot_state_bytes == 5120ull * 2, "a slot's continuation hidden");
+    ignis_seq_pool_spec bf16 = spec_of(IGNIS_KV_FORMAT_BF16, 17);
+    bf16.speculative_backend = IGNIS_SPECULATIVE_MTP;
+    struct ignis_seq_pool_plan bf16_head{};
+    check(plan(bf16, bf16_head), "a 17-layer BF16 MTP pool plans");
+    check(bf16_head.kv_bytes - sixteen.kv_bytes == 8ull * 131072 && bf16_head.hq_residual_bytes == 0,
+          "under BF16 the head's layer is its pages alone");
+    for (const auto &[layers, backend] : {std::pair<uint32_t, int32_t>{18u, IGNIS_SPECULATIVE_MTP},
+                                          std::pair<uint32_t, int32_t>{1u, IGNIS_SPECULATIVE_MTP},
+                                          std::pair<uint32_t, int32_t>{17u, IGNIS_SPECULATIVE_DFLASH2}}) {
+      ignis_seq_pool_spec refused = spec_of(IGNIS_KV_FORMAT_BF16, layers);
+      refused.speculative_backend = backend;
+      struct ignis_seq_pool_plan out{};
+      const bool planned = plan(refused, out);
+      const std::string message = ignis_seq_last_error();
+      check(!planned && message.find("kv_num_layers " + std::to_string(layers)) != std::string::npos,
+            "kv_num_layers " + std::to_string(layers) + " under backend " + std::to_string(backend) +
+                " is refused by name: got \"" + message + "\"");
+    }
   }
 
   if (g_failed != 0) {

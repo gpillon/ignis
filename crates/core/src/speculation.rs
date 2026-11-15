@@ -72,9 +72,11 @@ pub enum SpeculativeBackend {
     /// [`crate::step::decode_program_verify`] -- the seam a test's fake
     /// drafter fills. Not an operator spelling: [`Self::parse`] refuses it.
     VerifyOnly,
-    /// Qwen3.8-Flash-Next's own draft head, the checkpoint's MTP layer
-    /// (spec flash-next/07, GitHub #307), bound from its companion container.
-    /// Flash-Next's backend only: the 27B keeps DFlash2.
+    /// The checkpoint's own MTP layer. On Qwen3.8-Flash-Next its draft head
+    /// (spec flash-next/07, GitHub #307), bound from its companion container;
+    /// on the 27B its second drafter (GitHub #620, spec #618), the 12 `mtp/`
+    /// objects of its own container ([`crate::mtp_head`]), which a load
+    /// reaches through the leaf: the server still offers the 27B DFlash2.
     Mtp,
 }
 
@@ -474,6 +476,10 @@ impl Speculation {
     /// also keeps a rewrite checkpoint of it, which ignis carried for every
     /// slot and never read, so it is not reserved. Independent of the draft
     /// window.
+    ///
+    /// The 27B's MTP head keeps the continuation hidden (GitHub #620): one
+    /// BF16 hidden per slot. Its attention state is the KV pool's
+    /// ([`crate::seq::kv_geometry`]), not a slot's.
     pub fn drafter_state_bytes(&self, slot_count: u32) -> u64 {
         match self.backend {
             SpeculativeBackend::Dflash2 => {
@@ -486,10 +492,21 @@ impl Speculation {
                     * bf16;
                 u64::from(slot_count) * per_slot
             }
-            // The verify substrate binds no drafter (P5-04, GitHub #153), and
-            // the 27B refuses MTP at load (Flash-Next's head sizes its own
-            // state, spec flash-next/07).
-            SpeculativeBackend::VerifyOnly | SpeculativeBackend::Mtp => 0,
+            SpeculativeBackend::Mtp => u64::from(slot_count) * crate::mtp_head::continuation_bytes(),
+            // The verify substrate binds no drafter (P5-04, GitHub #153).
+            SpeculativeBackend::VerifyOnly => 0,
+        }
+    }
+
+    /// What the load's drafter adds to one slot's hq-e8-2b residual window
+    /// under `kv_format` (the plan's `hq_residual_window` line): the 27B's MTP
+    /// head's layer, its planes and its own ring words (GitHub #620). Nothing
+    /// under BF16 KV, and nothing for a drafter that keeps no attention layer
+    /// in the pool.
+    pub fn hq_residual_window_bytes(&self, kv_format: crate::KvFormat) -> u64 {
+        match (self.backend, kv_format) {
+            (SpeculativeBackend::Mtp, crate::KvFormat::HqE8_2b) => crate::mtp_head::hq_residual_window_bytes(),
+            _ => 0,
         }
     }
 
@@ -501,6 +518,9 @@ impl Speculation {
     /// and one drafter layer's query/key/value parent with the key and value
     /// rows kept from it — each at most one window of columns wide, each
     /// rounded to the arena's alignment.
+    ///
+    /// The 27B's MTP head writes its rows over the chunk in calls of at most
+    /// [`crate::mtp_head::PREFILL_ROWS`] rows ([`crate::mtp_head::prefill_scratch_bytes`]).
     pub fn prefill_scratch_bytes(&self, prefill_chunk_tokens: u32) -> u64 {
         match self.backend {
             SpeculativeBackend::Dflash2 => {
@@ -517,9 +537,23 @@ impl Speculation {
                     + bf16((DFLASH2_QUERY_SIZE + 2 * kv_width) * columns)
                     + 3 * bf16(kv_width * columns)
             }
-            // No drafter bound, nothing tapped (P5-04, GitHub #153); the 27B
-            // refuses MTP at load.
-            SpeculativeBackend::VerifyOnly | SpeculativeBackend::Mtp => 0,
+            SpeculativeBackend::Mtp => crate::mtp_head::prefill_scratch_bytes(prefill_chunk_tokens),
+            // No drafter bound, nothing tapped (P5-04, GitHub #153).
+            SpeculativeBackend::VerifyOnly => 0,
+        }
+    }
+
+    /// What the load's drafter adds to the decode round's scratch, the plan's
+    /// `decode_graph` line, at `decode_lanes` lanes: the 27B's MTP head's
+    /// buffers over the widest round's `lanes * (k + 1)` columns (GitHub #620,
+    /// [`crate::mtp_head::round_scratch_bytes`]), which every round runs the
+    /// head in. DFlash2's round has its own line ([`Self::round_scratch_bytes`]).
+    pub fn decode_round_bytes(&self, decode_lanes: u32) -> u64 {
+        match self.backend {
+            SpeculativeBackend::Mtp => {
+                crate::mtp_head::round_scratch_bytes(u64::from(decode_lanes) * u64::from(self.draft_tokens + 1))
+            }
+            SpeculativeBackend::Dflash2 | SpeculativeBackend::VerifyOnly => 0,
         }
     }
 
@@ -539,8 +573,9 @@ impl Speculation {
     pub fn round_scratch_bytes(&self, decode_lanes: u32) -> u64 {
         match self.backend {
             // The fake drafter proposes from the host: nothing to reserve. The
-            // 27B refuses MTP at load (Flash-Next's MTP sizes its own, spec
-            // flash-next/07).
+            // 27B's MTP head runs in the round's own scratch
+            // ([`Self::decode_round_bytes`]), and Flash-Next's MTP sizes its
+            // own (spec flash-next/07).
             SpeculativeBackend::VerifyOnly | SpeculativeBackend::Mtp => 0,
             SpeculativeBackend::Dflash2 => {
                 let bf16 = |elements: u64| (elements * 2).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
@@ -633,13 +668,23 @@ mod tests {
     }
 
     #[test]
-    fn only_dflash2_reserves_drafter_state() {
-        for backend in [SpeculativeBackend::VerifyOnly, SpeculativeBackend::Mtp] {
-            let spec = Speculation::new(backend, 3).expect("in range");
-            assert_eq!((spec.drafter_state_bytes(4), spec.prefill_scratch_bytes(1024), spec.round_scratch_bytes(4)), (0, 0, 0));
-        }
+    fn each_drafter_reserves_its_own_state_and_the_verify_substrate_none() {
+        let spec = Speculation::new(SpeculativeBackend::VerifyOnly, 3).expect("in range");
+        assert_eq!((spec.drafter_state_bytes(4), spec.prefill_scratch_bytes(1024), spec.round_scratch_bytes(4)), (0, 0, 0));
+        assert_eq!((spec.decode_round_bytes(4), spec.hq_residual_window_bytes(crate::KvFormat::HqE8_2b)), (0, 0));
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 3).expect("in range");
         assert!(spec.drafter_state_bytes(4) > 0 && spec.prefill_scratch_bytes(1024) > 0 && spec.round_scratch_bytes(4) > 0);
+        assert_eq!((spec.decode_round_bytes(4), spec.hq_residual_window_bytes(crate::KvFormat::HqE8_2b)), (0, 0));
+        // GitHub #620: the 27B's MTP head keeps a continuation hidden per
+        // slot, its layer in the hq window, and its buffers in a prefill chunk
+        // and a round; it has no drafter round of its own.
+        let spec = Speculation::new(SpeculativeBackend::Mtp, 3).expect("in range");
+        assert_eq!(spec.drafter_state_bytes(4), 4 * 10_240);
+        assert_eq!(spec.prefill_scratch_bytes(1024), crate::mtp_head::prefill_scratch_bytes(1024));
+        assert_eq!(spec.round_scratch_bytes(4), 0);
+        assert_eq!(spec.decode_round_bytes(4), crate::mtp_head::round_scratch_bytes(16));
+        assert_eq!(spec.hq_residual_window_bytes(crate::KvFormat::HqE8_2b), 2_228_288);
+        assert_eq!(spec.hq_residual_window_bytes(crate::KvFormat::Bf16), 0);
     }
 
     #[test]

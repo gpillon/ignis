@@ -622,6 +622,8 @@ std::string prefill_options_refusal(const ignis_prefill_options *options, bool &
       options->attention_set_count != 0 || options->out_attention_set_rows != nullptr) {
     return "Qwen3.8-Flash-Next serves no attention readouts";
   }
+  // GitHub #620: the readout of the hiddens the 27B's MTP head reads.
+  if (options->out_span_hidden != nullptr) return "out_span_hidden is the 27B's MTP head's readout";
   if (options->ngram_rows == nullptr) return "a Flash-Next prefill needs the span's n-gram rows";
   span_logits_ok = true;
   return {};

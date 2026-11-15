@@ -38,8 +38,12 @@ extern "C" int32_t ignis_kv_capture_rows(const struct ignis_seq_pool *pool,
     set_error("ignis_kv_capture_rows: null argument");
     return -1;
   }
-  if (gqa_layer_ordinal < 0 || gqa_layer_ordinal >= kIgnisGqaLayerCount) {
-    set_error("ignis_kv_capture_rows: gqa_layer_ordinal out of range [0, kIgnisGqaLayerCount)");
+  // GitHub #620: on a pool built for the MTP head, the head's own layer too
+  // (the pool's last), whose frontier is the head's.
+  const bool head_layer = pool->has_mtp_head() && gqa_layer_ordinal == pool->mtp_head_layer();
+  if (gqa_layer_ordinal < 0 || (gqa_layer_ordinal >= kIgnisGqaLayerCount && !head_layer)) {
+    set_error("ignis_kv_capture_rows: gqa_layer_ordinal out of range [0, kIgnisGqaLayerCount), and not the MTP "
+              "head's layer");
     return -1;
   }
   if (role != 0 && role != 1) {
@@ -124,7 +128,8 @@ extern "C" int32_t ignis_kv_capture_rows(const struct ignis_seq_pool *pool,
   // Rows must already be real: never read past what this sequence has
   // actually written for this GQA layer (kernel/src/gqa_layer.cu advances
   // gqa_positions[gqa_layer_ordinal] past every token it appends).
-  const std::uint64_t written = seq->gqa_positions[static_cast<std::size_t>(gqa_layer_ordinal)];
+  const std::uint64_t written = head_layer ? ignis_mtp_head_frontier(*seq)
+                                           : seq->gqa_positions[static_cast<std::size_t>(gqa_layer_ordinal)];
   const std::uint64_t last_position = static_cast<std::uint64_t>(first_position) +
                                       static_cast<std::uint64_t>(row_count);
   if (last_position > written) {

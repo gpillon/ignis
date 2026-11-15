@@ -82,6 +82,12 @@ pub mod locate;
 pub mod mock;
 #[cfg(feature = "cuda")]
 pub mod model_load;
+// GitHub #620 (spec #618): the 27B's MTP head on the VRAM plan, CPU
+// arithmetic the leaf's plan is held to.
+pub mod mtp_head;
+// GitHub #620: the MTP head's proposal readout, a test-only measurement seam
+// (its leaf calls are cuda-only; its layout pin is not).
+pub mod mtp_readout;
 #[cfg(feature = "cuda")]
 pub mod moe;
 pub mod ngram;
