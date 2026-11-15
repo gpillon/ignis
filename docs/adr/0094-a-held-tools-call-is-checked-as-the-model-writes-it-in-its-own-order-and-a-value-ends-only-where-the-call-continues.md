@@ -73,17 +73,21 @@ without a search over its lines. A string that may be `null` reads `null` as nul
 `null`. Any other value, a string beside another type included (written quoted, as a raw `5` cannot tell the
 integer from the string), is JSON held by ADR 0089's automaton from its subschema, delivered as written, compact
 and canonical, in the grammar's subset, instead of typed by its declared types as a tool that is not held still
-is; it nests at most `model.grammar_max_depth`, whose ceiling is the call parser's own nesting bound so that every
-held value reads back as the JSON it was held to. A strict tool's nullable parameter may be left out and arrives
-`null`; a normalized tool's optional one stays omitted.
+is. The JSON starts at the value's first byte, no whitespace before it but the newline the parser trims, and
+whitespace may follow it, bounded so that a line break is always left for the next step; it nests at most
+`model.grammar_max_depth`, whose ceiling is the call parser's own nesting bound so that every held value reads
+back as the JSON it was held to. A nullable parameter, a strict tool's or a normalized tool's required one, may be
+left out and arrives `null`; a normalized tool's optional one stays omitted.
 
 **Refusals.** A strict tool outside OpenAI's strict subset is a 400 with structured output's codes, `param` naming
 the tool's field where it was sent (`tools[i].function.parameters` on chat completions, `tools[i].parameters` for
 a flat Responses tool). `minLength` and `maxLength` lie outside the subset, so no strict tool has a length bound
 to hold. A tool that is not held is never refused for its name: one the dialect cannot write is just not callable.
-A normalized tool is never refused: what would refuse it leaves it free, and the Responses API echoes the `strict`
-each tool sent without one was served with, a `strict` sent echoed as sent but on Flash-Next, where every tool
-echoes `false`.
+A normalized tool is never refused: what would refuse it leaves it free (a `</think>` of several tokens with
+thinking on among it). The Responses API echoes the `strict` each tool it normalizes was served with: `true` where
+its calls are held, `false` where they are not, `tool_choice: "none"` included; a `strict` the client sent is
+echoed as sent, but under `held` only `strict: true` (a tool sent `strict: false` echoes the one it was served
+with), and on Flash-Next every tool echoes `false`.
 
 **Beside the fields that shape a turn.** `tool_choice` `"required"` or a named function forces the call's opening
 (#286), its tokens fed to the grammar and never a miss; a literal token the grammar would not take where the
