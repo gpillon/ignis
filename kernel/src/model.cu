@@ -35,6 +35,7 @@
 #include "mtp_head.h"
 #include "sampled_draft.h"
 #include "trellis_body.h"
+#include "w8_imma.h"
 
 #include "ignis_dflash2_topk.h"
 
@@ -1155,6 +1156,9 @@ struct LoadOptions {
   // GitHub #572 (spec #570): what the measurement switch IGNIS_HQ_DECODE_ATTENTION names; the
   // load decides the route from it and the card (`hq_decode_attention_route`).
   ignis::hq_decode_attention::Switch hq_decode_attention = ignis::hq_decode_attention::Switch::Unset;
+  // GitHub #627 (spec #618): the MTP head's matrices on ours (`mtp_head_linear_route`), which an
+  // MTP load runs.
+  bool mtp_head_linear_ours = false;
   // GitHub #576 (ADR 0090): the verify round's draft rule (enum
   // ignis_draft_rule) and, under the sampled draft, the drafter's
   // temperature factor and top-p.
@@ -1190,6 +1194,25 @@ bool gdn_prefill_route(bool &ours) {
   }
   try {
     ours = ignis::gdn_prefill::route_for_load(major);
+  } catch (const std::invalid_argument &e) {
+    set_error(std::string("ignis_model_load: ") + e.what());
+    return false;
+  }
+  return true;
+}
+
+// GitHub #627 (spec #618): the MTP head's matrices on ours (kernel/src/w8_imma.h) or on the
+// vendored `ops::linear`, decided once per load: ours on every card below compute capability 12,
+// the vendored routes on Blackwell unless the measurement switch IGNIS_MTP_HEAD_LINEAR names ours
+// (`ignis::w8_imma::route_for_load`); any other value is refused by name. False (error set) on a
+// refusal or when the device cannot say its generation.
+bool mtp_head_linear_route(bool &ours) {
+  int major = 0;
+  if (!device_major("the MTP head's matrices", major)) {
+    return false;
+  }
+  try {
+    ours = ignis::w8_imma::route_for_load(major);
   } catch (const std::invalid_argument &e) {
     set_error(std::string("ignis_model_load: ") + e.what());
     return false;
@@ -1545,7 +1568,8 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.draft_rule = draft_rule;
   out.drafter_temperature_factor = drafter_temperature_factor;
   out.drafter_top_p = drafter_top_p;
-  if (!gdn_prefill_route(out.gdn_prefill_ours) || !hq_decode_attention_switch(out.hq_decode_attention)) {
+  if (!gdn_prefill_route(out.gdn_prefill_ours) || !hq_decode_attention_switch(out.hq_decode_attention) ||
+      !mtp_head_linear_route(out.mtp_head_linear_ours)) {
     return nullptr;
   }
 
@@ -2429,6 +2453,9 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // GitHub #514: the GDN prefill's route, read by every GDN prefill call
   // (kernel/src/gdn_layer.cu).
   model->gdn_prefill_ours = load.gdn_prefill_ours;
+  // GitHub #627 (spec #618): the MTP head's matrices, read by every head call
+  // (kernel/src/mtp_head.cu) and so baked into every graph captured after this load.
+  model->mtp_head_linear_ours = speculative_backend == IGNIS_SPECULATIVE_MTP && load.mtp_head_linear_ours;
   // GitHub #572 (spec #570): the decode and verify rounds' attention route, read by every call of
   // the batch body (kernel/src/gqa_layer.cu `run_gqa_layer_batch`) and so baked into every graph
   // captured after this load.
@@ -2754,6 +2781,13 @@ extern "C" uint32_t ignis_model_hq_decode_attention(const struct ignis_model *mo
     return IGNIS_HQ_DECODE_ATTENTION_VENDORED;
   }
   return model->hq_decode_attention_ours ? IGNIS_HQ_DECODE_ATTENTION_OURS : IGNIS_HQ_DECODE_ATTENTION_VENDORED;
+}
+
+extern "C" uint32_t ignis_model_mtp_head_linear(const struct ignis_model *model) {
+  if (model == nullptr || model->flash_next || model->speculative_backend != IGNIS_SPECULATIVE_MTP) {
+    return IGNIS_MTP_HEAD_LINEAR_NONE;
+  }
+  return model->mtp_head_linear_ours ? IGNIS_MTP_HEAD_LINEAR_OURS : IGNIS_MTP_HEAD_LINEAR_VENDORED;
 }
 
 extern "C" void ignis_model_free(struct ignis_model *model) {

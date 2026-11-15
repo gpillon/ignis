@@ -335,7 +335,9 @@ state and the **continuation hidden** through every prefill and round. In a
 verify round its chain proposes each lane's drafts (the **fixed draft**), the
 first step from the continuation hidden and the pending token, and the round's
 commit writes again the head's rows the committed run licenses, so none the
-chain built from the head's own hidden stays below the frontier (#621).
+chain built from the head's own hidden stays below the frontier (#621). On an
+RTX 30 or 40 card its matrices run on routes of the full-rate rule (#627): the
+vendored W8 SIMT kernel up to 8 tokens, ignis's integer MMA above.
 
 **Continuation hidden**:
 On a 27B load with the **MTP head**: the target's post-final-norm hidden at a

@@ -178,6 +178,15 @@ one, up to the draft window.
   DFlash2's own settings are refused by name on an MTP load: the shortlist
   head, `--spec-draft-rule sampled`, and the drafter's temperature factor and
   top-p ([context, KV and speculation](../configuration/context-and-speculation.md)).
+- **On an RTX 30 or RTX 40 card.** The head drafts there as on Blackwell, on
+  the 16 GB entries those cards load. Its five matrices multiply on ignis's own
+  route, in the forms those cards run at full rate: on the CUDA cores for a
+  round's few rows, on the integer MMA for a prefill's and a wide commit's,
+  each activation carried in 16-bit fixed point, so the head computes what it
+  computes on Blackwell within the rounding of its outputs, and the VRAM plan
+  is the same. The load's `ignis.runtime.decode_routes` line names the route as
+  `mtp_head_linear`: `ours` there, `vendored` on an RTX 50 or RTX PRO card,
+  `none` on a load without the head.
 - **Images.** The head drafts after an image, with vision on as every
   built-in profile turns it on, under either vision residency. Where the next
   token is an image placeholder, the head takes the image's row the model

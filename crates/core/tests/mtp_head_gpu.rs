@@ -19,6 +19,10 @@
 //!   exact BF16 inputs the device's head read (the target's hiddens through
 //!   the span readout, each next token's embedding rounded as the device
 //!   rounds it), so what it measures is the head's own arithmetic.
+//! - GitHub #627: the same check on the 16 GB artifact with the head's
+//!   matrices on the route an RTX 30 or RTX 40 card runs
+//!   (`kernel/src/w8_imma.h`), which `IGNIS_MTP_HEAD_LINEAR=ours` names on
+//!   the RTX 5090, under the same bounds.
 //!
 //! The 16 GB artifact's output head is trellis, which no host code decodes;
 //! its head is W8 like the NVFP4 artifact's (the same bytes). There the head's
@@ -389,6 +393,31 @@ fn the_heads_state_and_first_draft_are_its_weights_in_double_precision_on_the_16
     check_against_f64(TRELLIS, false);
 }
 
+/// GitHub #627: the same check on the route the head's matrices take on an
+/// RTX 30 or RTX 40 card (`kernel/src/w8_imma.h`), which
+/// `IGNIS_MTP_HEAD_LINEAR=ours` names on any card: the prompt's head calls of
+/// 11 to 128 rows on the integer MMA, the readout's and the rounds' one row on
+/// the vendored SIMT route, under the bounds the vendored route is held to.
+/// On the 16 GB artifact, the one those cards load.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn on_the_rtx_30_and_40_route_the_heads_state_and_first_draft_are_its_weights_in_double_precision() {
+    const SWITCH: &str = "IGNIS_MTP_HEAD_LINEAR";
+    // Removed however the check ends, so a failure here never moves the
+    // tests after it onto this route.
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(SWITCH) };
+        }
+    }
+    // The switch is read from the process environment at each load
+    // (kernel/src/process_environment.h); the profile runs one test at a time.
+    let _unset = Unset;
+    unsafe { std::env::set_var(SWITCH, "ours") };
+    check_against_f64(TRELLIS, false);
+}
+
 /// The head's rows at `positions` from `hiddens` and the embeddings of
 /// `next_tokens`, in f64.
 fn reference(reader: &Reader, hiddens: &[Vec<f64>], next_tokens: &[i32], positions: &[i32]) -> f64_reference::MtpHeadReference {
@@ -425,6 +454,13 @@ fn check_against_f64(path: &str, host_head: bool) {
         Some(mtp()),
     )
     .unwrap_or_else(|e| panic!("load with the MTP head: {e}"));
+    // GitHub #627: the route the head's matrices run on, which the switch
+    // names when it is set.
+    let route = model.mtp_head_linear().expect("an MTP load reports its head's route");
+    eprintln!("{path}: the head's matrices on the {} route", route.as_str());
+    if std::env::var_os("IGNIS_MTP_HEAD_LINEAR").is_some_and(|named| named == "ours") {
+        assert_eq!(route, mtp_head::HeadLinear::Ours, "the switch names ours");
+    }
     let pool = SeqPool::create_with_speculation(&cfg, &budget(KvFormat::Bf16, 2, 0), Some(SpeculativeBackend::Mtp))
         .unwrap_or_else(|e| panic!("pool: {e}"));
     let reader = &loaded.reader;

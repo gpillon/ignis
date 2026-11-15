@@ -107,9 +107,56 @@ pub fn round_scratch_bytes(columns: u64, vision: bool) -> u64 {
     3 * bf16(HIDDEN * columns) + positions * i32(columns) + call_bytes(columns)
 }
 
+/// The route of the head's five W8G32 matrices (GitHub #627), which no load
+/// option names: the leaf decides it once per MTP load from the card, or the
+/// measurement switch `IGNIS_MTP_HEAD_LINEAR` names ours on Blackwell, and
+/// reports it (`Model::mtp_head_linear`; `enum ignis_mtp_head_linear`,
+/// `kernel/include/ignis_model.h`). The VRAM plan is the same on either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadLinear {
+    /// The vendored `ops::linear`: a Blackwell card's MTP load.
+    Vendored,
+    /// ignis's (`kernel/src/w8_imma.h`): the vendored SIMT route up to 8
+    /// tokens, the integer MMA above; an RTX 30 or RTX 40 card's MTP load, or
+    /// a Blackwell card's under `IGNIS_MTP_HEAD_LINEAR=ours`.
+    Ours,
+}
+
+impl HeadLinear {
+    /// The leaf's code: `Some(None)` for a load without the head (0),
+    /// `Some(Some(..))` for 1 (vendored) and 2 (ours), `None` for any other.
+    pub const fn from_abi(code: u32) -> Option<Option<Self>> {
+        match code {
+            0 => Some(None),
+            1 => Some(Some(Self::Vendored)),
+            2 => Some(Some(Self::Ours)),
+            _ => None,
+        }
+    }
+
+    /// The switch's own spellings, which the load's
+    /// `ignis.runtime.decode_routes` line reports (`none` without the head).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vendored => "vendored",
+            Self::Ours => "ours",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The leaf's codes, and the switch's spellings.
+    #[test]
+    fn the_heads_matrix_routes_are_the_headers_codes() {
+        assert_eq!(HeadLinear::from_abi(0), Some(None));
+        assert_eq!(HeadLinear::from_abi(1), Some(Some(HeadLinear::Vendored)));
+        assert_eq!(HeadLinear::from_abi(2), Some(Some(HeadLinear::Ours)));
+        assert_eq!(HeadLinear::from_abi(3), None);
+        assert_eq!((HeadLinear::Vendored.as_str(), HeadLinear::Ours.as_str()), ("vendored", "ours"));
+    }
 
     /// The container's 12 objects at their stored sizes: five W8G32 matrices
     /// (an int8 code per weight, one FP16 scale per 32 along K) and seven BF16

@@ -558,6 +558,12 @@ struct ignis_model {
   // by every call of the batch body (kernel/src/gqa_layer.cu
   // `run_gqa_layer_batch`), so every graph captured on this load bakes it in.
   bool hq_decode_attention_ours = false;
+  // GitHub #627 (spec #618): the MTP head's matrices, decided once at an MTP
+  // load (model.cu `mtp_head_linear_route`): ours on an RTX 30 or RTX 40 card
+  // (kernel/src/w8_imma.h) when true, the vendored `ops::linear` otherwise;
+  // read by every head call (kernel/src/mtp_head.cu `head_linear`), so every
+  // graph captured on this load bakes it in. False on a load without the head.
+  bool mtp_head_linear_ours = false;
   uint64_t vram_bytes = 0;
   // ADR 0062: what of the bound tensors lives in mapped host memory.
   uint64_t host_mapped_bytes = 0;

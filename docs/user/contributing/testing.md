@@ -81,6 +81,20 @@ the other. They are no configuration fields: `GET /v1/config` and
   width's decode graph and verify graph (`decode_nodes`, `verify_nodes`),
   which the two routes share, as they share every byte they write and the
   VRAM plan.
+- `IGNIS_MTP_HEAD_LINEAR=ours|vendored` (from 0.11.0) picks, at each MTP load
+  of the 27B, the route of the head's five W8 matrices: ignis's own, the one
+  an RTX 30 or RTX 40 card runs (the vendored SIMT kernel up to 8 tokens, the
+  integer MMA above, `kernel/src/w8_imma.h`), or the vendored `ops::linear`
+  an RTX 50 or RTX PRO card runs. Unset, or `vendored`, an RTX 50 or RTX PRO
+  card runs the vendored one; `ours` runs ignis's there, which is how the
+  RTX 5090 checks the route the older cards run
+  (`crates/core/tests/mtp_head_gpu.rs` holds it to the head's f64
+  recomputation). An RTX 30 or RTX 40 card runs ignis's whatever the variable
+  says: the vendored routes there are half-rate BF16 MMA, or have no kernel
+  image. Any other value refuses the load, naming the variable. The load logs
+  the route under `ignis.runtime.decode_routes` (`mtp_head_linear`: `ours`,
+  `vendored`, or `none` without the head), and the VRAM plan is the same on
+  both.
 
 ## The speech executor's CPU legs
 

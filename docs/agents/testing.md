@@ -529,7 +529,19 @@ stops the release. Check `make gpu-status` first, as for any GPU run.
    merger's up to 4 or 5, then `mma_r64_c128`), so no image reaches a kernel
    only the sm_120a set holds. The large image sits at the processor's item
    bound, 16,384 tokens (4096 x 4096 pixels, a merged token being 32 x 32),
-   under the profile's `vision.max_tokens`.
+   under the profile's `vision.max_tokens`. Then an **MTP load** (spec #618,
+   #627): the server stopped and started again with `--spec-backend mtp
+   --qwen38-vision-enabled false` (the head does not draft beside images yet;
+   the profile's DFlash2 window is DFlash2's, so the head drafts at its default
+   7) answers the same greedy chat completion correctly, `Paris`. Its
+   `ignis.runtime.decode_routes` line says `mtp_head_linear=ours`: the head's
+   matrices on ignis's route for these cards (`kernel/src/w8_imma.h`), the
+   vendored SIMT kernel for the rounds' few rows and the integer MMA for the
+   prefill's and the commits'. No 8.x card was at hand when that route was
+   written: the gate of the release that ships it (0.11.0) is its first run on
+   one, and records its result. `crates/server/src/config/tests.rs`
+   (`the_sm86_gates_mtp_smoke_is_an_mtp_load_under_the_24gb_profile`) holds the
+   command to an MTP load under `rtx-24gb`.
 
 The commands, in order:
 
@@ -572,6 +584,10 @@ for image in small large; do
     "$(base64 -w0 "$image.png")" > "$image.json"
   curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d "@$image.json"
 done
+# The MTP load, once the first server has stopped: the same greedy request.
+ignis-server --profile auto --spec-backend mtp --qwen38-vision-enabled false   # decode_routes: mtp_head_linear=ours
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d \
+  '{"model":"qwen3.8-27b","temperature":0,"enable_thinking":false,"max_tokens":64,"messages":[{"role":"user","content":"What is the capital of France? One word."}]}'
 ```
 
 The release binary is also checked to carry code for 8.6 and 12.0, whatever
@@ -579,8 +595,9 @@ list the build was given (`mk/cuda-build-check.sh --require`, in CI, #482).
 
 The same check holds the `86` cubin to the full-rate rule (spec #503, #512): an
 RTX 30 or RTX 40 card runs some tensor-core forms at half the rate of others, and
-a kernel the sm_8x prefill work added uses only the full-rate ones, INT8 and HMMA
-with an f16 accumulator. `mk/full-rate-kernels.txt` is the one place that lists
+a kernel the sm_8x prefill work or the 27B's MTP head on those cards (#627) added
+uses only the full-rate ones, INT8 and HMMA with an f16 accumulator, or the CUDA
+cores alone. `mk/full-rate-kernels.txt` is the one place that lists
 the covered kernels and #488's exceptions. The check dumps the `sm_86` SASS with
 `cuobjdump` (the CUDA toolkit's, wherever nvcc is) and refuses a covered kernel
 that holds HMMA with an f32 accumulator, any BF16, TF32 or FP8/FP6/FP4 form, a

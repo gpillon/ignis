@@ -66,6 +66,13 @@ You can add models of your own with an
     `--model-prefill-linear fp16` and `--model-prefill-attention fp16` name
     the fused prefill and the FP16 band instead
     ([Context and speculation](../configuration/context-and-speculation.md)).
+  - *MTP on an RTX 30 or RTX 40 card.* From 0.11.0 the 27B's own MTP head
+    (`--spec-backend mtp`) drafts on those cards as on Blackwell, on the 16 GB
+    entries: its matrices multiply on ignis's own route, in the forms those
+    cards run at full rate
+    ([MTP, for the 27B](../concepts/speculative-decoding.md#mtp-for-the-27b)),
+    and the release's [sm_86 gate](../contributing/releases.md#the-sm_86-gate)
+    starts an MTP load beside the default one.
   - This guide gives no speed for an RTX 30 or RTX 40 card.
 
   Each catalog entry states the smallest card class and the oldest GPU
