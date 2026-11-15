@@ -30,8 +30,8 @@
 //!   refused, as is a forced run of the wrong length and a successor outside
 //!   the vocabulary, the sequence unmoved.
 //!
-//! The state "bit for bit" is held to: a pool built for the head refuses a
-//! snapshot until #622, so the comparison is the runs, the pending token and
+//! The state "bit for bit" is held to: the readout leaves the head's rows past
+//! its frontier, which a snapshot carries, so the comparison is the runs, the pending token and
 //! the chain read at the end, every draft and every score -- the
 //! continuation hidden, the head's rows and the target's state are all in
 //! it.
