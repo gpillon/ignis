@@ -657,7 +657,9 @@ or send the tool with `strict: false` to have its calls served as the model
 writes them ([Held tools](api/structured-output.md#held-tools-strict-true)).
 On the Responses API a tool sent without `strict` is never refused: it is
 held where its schema normalizes and served free where it does not
-([A tool sent without `strict`](api/structured-output.md#a-tool-sent-without-strict)).
+([A tool sent without `strict`](api/structured-output.md#a-tool-sent-without-strict)),
+as is every tool not sent `strict: true` under `--model-tool-arguments held`
+([Holding every tool](api/structured-output.md#holding-every-tool)).
 
 ### WARN `ignis.structured.vocabulary_unreadable`
 

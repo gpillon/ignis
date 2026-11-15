@@ -1536,8 +1536,9 @@ pub(crate) struct HeldTools {
 
 /// How a surface serves a function tool sent without `strict`, or with
 /// `strict: null` (GitHub #614, ADR 0094): OpenAI's default on that surface.
-/// `strict: true` is a strict tool and `strict: false` a free one on every
-/// surface.
+/// `strict: true` is a strict tool on every surface, and `strict: false` a
+/// free one unless the operator's switch holds every tool
+/// ([`ToolArguments::Held`], #616).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WithoutStrict {
     /// Free: its arguments as the model writes them, chat completions'
@@ -1549,29 +1550,77 @@ pub(crate) enum WithoutStrict {
     Normalized,
 }
 
+/// The operator's switch for the tools a request does not send strict
+/// (`--model-tool-arguments`, GitHub #616, spec #582, ADR 0094), read per
+/// request on chat completions and the Responses API alike.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolArguments {
+    /// Every tool served as sent: `strict: true` a strict tool, a tool sent
+    /// without `strict` as its surface's default ([`WithoutStrict`]),
+    /// `strict: false` free. The default.
+    #[default]
+    AsSent,
+    /// Every tool not sent `strict: true` normalized into strict form and
+    /// held where its schema allows it, free otherwise and never refused, as
+    /// the Responses API serves a tool sent without `strict`: `strict: false`
+    /// included, which agents send on every tool.
+    Held,
+}
+
+impl ToolArguments {
+    /// The switch's written names, in order.
+    pub const NAMES: &'static [&'static str] = &["as-sent", "held"];
+
+    /// The value a written name names.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "as-sent" => Some(Self::AsSent),
+            "held" => Some(Self::Held),
+            _ => None,
+        }
+    }
+
+    /// The value's written name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AsSent => "as-sent",
+            Self::Held => "held",
+        }
+    }
+}
+
 /// How the request's tool `tool` (resolved, its `strict` then `false` where
-/// it was sent none), `raw` as sent, is held: `strict: true` a strict tool,
-/// one sent without `strict` (or with `null`) as `without_strict` says, any
-/// other free.
-fn tool_hold(raw: Option<&ignis_grammar::json::Json>, tool: &JsonValue, without_strict: WithoutStrict) -> ignis_grammar::ToolHold {
+/// it was sent none), `raw` as sent, is held: `strict: true` a strict tool;
+/// any other normalized under the operator's switch at `held` (#616), and
+/// otherwise one sent without `strict` (or with `null`) as `without_strict`
+/// says, any other free.
+fn tool_hold(
+    raw: Option<&ignis_grammar::json::Json>,
+    tool: &JsonValue,
+    without_strict: WithoutStrict,
+    switch: ToolArguments,
+) -> ignis_grammar::ToolHold {
     use ignis_grammar::json::Json;
     use ignis_grammar::ToolHold;
     if tool["function"]["strict"] == JsonValue::Bool(true) {
         return ToolHold::Strict(strict_parameters(raw, tool));
     }
     let sent_none = raw.is_some_and(|tool| sent_function(tool).get("strict").is_none_or(|strict| *strict == Json::Null));
-    match (sent_none, without_strict) {
-        (true, WithoutStrict::Normalized) => ToolHold::Normalized(strict_parameters(raw, tool)),
+    match (switch, sent_none, without_strict) {
+        (ToolArguments::Held, _, _) | (ToolArguments::AsSent, true, WithoutStrict::Normalized) => {
+            ToolHold::Normalized(strict_parameters(raw, tool))
+        }
         _ => ToolHold::Free,
     }
 }
 
 /// The held tools of a request whose resolved `tools` are these (none
 /// under `tool_choice: "none"`), `raw` the same tools as sent, a tool sent
-/// without `strict` served as `without_strict` says; `None` for a request
-/// with no held tool, which changes by no byte, and on a model that does not
-/// serve structured output, where `strict` stays inert and no tool is
-/// normalized (Flash-Next, #581).
+/// without `strict` served as `without_strict` says and every tool not sent
+/// strict as the operator's `switch` says ([`tool_hold`]); `None` for a
+/// request with no held tool, which changes by no byte, and on a model that
+/// does not serve structured output, where `strict` stays inert and no tool
+/// is normalized (Flash-Next, #581).
 ///
 /// Every strict and normalized tool is compiled when the request arrives,
 /// and the tool calls' grammar with them, once per distinct set of tools
@@ -1592,9 +1641,11 @@ pub(crate) fn held_tools(
     tools: &[JsonValue],
     thinking: &ThinkingOptions,
     without_strict: WithoutStrict,
+    switch: ToolArguments,
 ) -> Result<Option<HeldTools>, Response> {
     use ignis_grammar::{DeclaredTool, ToolField, ToolHold};
-    let holds: Vec<ToolHold> = tools.iter().enumerate().map(|(index, tool)| tool_hold(raw.get(index), tool, without_strict)).collect();
+    let holds: Vec<ToolHold> =
+        tools.iter().enumerate().map(|(index, tool)| tool_hold(raw.get(index), tool, without_strict, switch)).collect();
     if holds.iter().all(|hold| *hold == ToolHold::Free) {
         return Ok(None);
     }
@@ -1695,13 +1746,18 @@ pub(crate) struct HeldContent {
     /// calls, a held tool's by the confirmed close ([`ToolSchemas::holding`]).
     pub schemas: ToolSchemas,
     /// Whether each of the resolved tools is held, by its place: the
-    /// `strict` the Responses API echoes for a tool sent without one (#614).
+    /// `strict` the Responses API echoes for a tool sent without one (#614),
+    /// and under [`ToolArguments::Held`] for every tool not sent `strict:
+    /// true` (#616).
     pub held: Vec<bool>,
+    /// The operator's switch the request was served under, read once.
+    pub switch: ToolArguments,
 }
 
 /// The [`HeldContent`] of a request whose answer is `answer`, whose
 /// resolved `tools` are these, `raw` the same tools as sent, a tool sent
-/// without `strict` served as `without_strict` says (#614): one rule for
+/// without `strict` served as `without_strict` says (#614) and every tool not
+/// sent strict as the operator's switch says, read once (#616): one rule for
 /// every surface that serves held tools (GitHub #615, ADR 0094).
 ///
 /// - An answer alone, or the held tools alone, is held to its own
@@ -1725,7 +1781,8 @@ pub(crate) fn held_content(
     thinking: &ThinkingOptions,
     without_strict: WithoutStrict,
 ) -> Result<HeldContent, Response> {
-    let held_tools = held_tools(server, raw, tools, thinking, without_strict)?;
+    let switch = server.live().tool_arguments;
+    let held_tools = held_tools(server, raw, tools, thinking, without_strict, switch)?;
     let (grammar, description) = match (answer, &held_tools) {
         (Some(answer), Some(held)) => (Some(answer.grammar.holding_calls(held.calls.clone())), answer.description),
         (Some(answer), None) => (Some(answer.grammar), answer.description),
@@ -1734,7 +1791,7 @@ pub(crate) fn held_content(
     };
     let holds = (0..tools.len()).map(|tool| held_tools.as_ref().is_some_and(|held| held.calls.holds(tool))).collect();
     let held = held_tools.map(|held| held.held).unwrap_or_default();
-    Ok(HeldContent { grammar, description, schemas: ToolSchemas::from_tools(tools).holding(held), held: holds })
+    Ok(HeldContent { grammar, description, schemas: ToolSchemas::from_tools(tools).holding(held), held: holds, switch })
 }
 
 /// A JSON value read once into the two shapes the handler needs:
@@ -3126,6 +3183,9 @@ struct ChatCompletionsRequest {
     /// shallowly and passed to the template as-is (`resolve_tools`). Each
     /// also kept in its key order as sent: a strict tool's `parameters`
     /// keep theirs, which its held calls' arguments follow (GitHub #611).
+    /// A tool not sent `strict: true` is free, but under
+    /// `--model-tool-arguments held` it is normalized into strict form and
+    /// held where its schema allows it, never refused (GitHub #616).
     #[schema(value_type = Option<Vec<JsonValue>>)]
     tools: Option<Vec<Sent>>,
     /// `"auto"` (default), `"none"`, `"required"`, or `{"type": "function",

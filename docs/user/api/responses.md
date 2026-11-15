@@ -74,14 +74,18 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   never a `400` ([Held tools on the Responses API](structured-output.md#on-the-responses-api)).
   `strict: null` is the same as no `strict`, and `strict: false` serves the
   tool free, as before, so an agent CLI that sends `false` on every tool
-  sees no change. On Flash-Next no tool is normalized.
+  sees no change, unless the operator holds every tool
+  ([Holding every tool](structured-output.md#holding-every-tool)). On
+  Flash-Next no tool is normalized.
 - **The response's `tools` echo the `strict` each tool was served with**:
   a tool you sent without one (or with `null`) carries `strict: true` where
   its calls are held and `strict: false` where they are not (a schema that
   cannot be normalized, Flash-Next, `tool_choice: "none"`), beside its
   `name`, or in its `function` for a tool in the chat shape; a `strict` you
-  sent is echoed as you sent it, but on Flash-Next, which holds no tool's
-  calls, every tool echoes `strict: false`.
+  sent is echoed as you sent it (under `--model-tool-arguments held` only
+  `strict: true` is, and a tool sent `strict: false` carries the one it was
+  served with), but on Flash-Next, which holds no tool's calls, every tool
+  echoes `strict: false`.
 - A length stop ends `incomplete` (`max_output_tokens`), an engine error
   `failed`; `usage` carries `input_tokens_details.cached_tokens` and
   `output_tokens_details.reasoning_tokens`.
