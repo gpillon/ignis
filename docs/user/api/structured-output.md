@@ -301,7 +301,8 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
   With a strict tool in the request, every call's function name is held to
   the request's tools.
 - **A request with no strict tool** is served as before, byte for byte, on
-  chat completions.
+  chat completions, unless the operator's switch holds every tool
+  ([Holding every tool](#holding-every-tool)).
 - **On Qwen3.8-Flash-Next**, `strict` is accepted and inert for now (GitHub
   #581).
 
