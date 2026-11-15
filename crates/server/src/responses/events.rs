@@ -104,7 +104,10 @@ pub(crate) struct ResponseObject {
     pub text: JsonValue,
     #[schema(value_type = Object)]
     pub tool_choice: JsonValue,
-    /// The request's `tools`, in the Responses shape it sent them in.
+    /// The request's `tools`, in the Responses shape it sent them in; a tool
+    /// sent without `strict` carries the one it was served with (GitHub
+    /// #614): `true` where its calls are held, its `parameters` normalized
+    /// into strict form, `false` where they are not.
     #[schema(value_type = Vec<Object>)]
     pub tools: Vec<JsonValue>,
     pub top_p: f64,

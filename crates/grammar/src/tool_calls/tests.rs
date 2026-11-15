@@ -44,7 +44,12 @@ const WRITE_FILE: &str = r#"{"type":"object","properties":{"path":{"type":"strin
 const GET_TIME: &str = r#"{"type":"object","properties":{"zone":{"type":"string","pattern":"^[A-Z][a-z]+/[A-Z][a-z]+$"},"day":{"type":"string","format":"date"}},"required":["zone","day"],"additionalProperties":false}"#;
 
 fn tool(name: &str, strict: Option<&str>) -> DeclaredTool {
-    DeclaredTool { name: name.into(), strict: strict.map(str::to_string) }
+    DeclaredTool { name: name.into(), hold: strict.map_or(ToolHold::Free, |schema| ToolHold::Strict(schema.into())) }
+}
+
+/// A tool sent without `strict` where the surface normalizes it (#614).
+fn normalized(name: &str, schema: &str) -> DeclaredTool {
+    DeclaredTool { name: name.into(), hold: ToolHold::Normalized(schema.into()) }
 }
 
 /// `write_file` and `get_time` strict, `search` free.
@@ -529,6 +534,91 @@ fn a_union_no_raw_text_holds_is_json_a_string_in_it_quoted() {
             assert!(!one_takes(schema, value), "{schema}: {value}");
         }
     }
+}
+
+// ── normalized tools (#614) ──────────────────────────────────────────────
+
+/// `find`, as a client writes it without `strict`: its objects open, `path`
+/// and `tag` required, `tag` and `note` nullable, `depth` and `opts`
+/// optional, `opts` an object of one property.
+const FIND: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"depth":{"type":"integer"},"note":{"type":["string","null"]},"tag":{"type":["string","null"]},"opts":{"type":"object","properties":{"hidden":{"type":"boolean"}}}},"required":["path","tag"]}"#;
+
+fn find_matcher() -> ToolCallMatcher {
+    matcher_of(&cache(), &[normalized("find", FIND)])
+}
+
+#[test]
+fn a_normalized_tool_is_held_its_objects_closed_and_its_optional_parameters_left_out() {
+    let grammar = cache().tool_calls(&[normalized("find", FIND), tool("search", None)]).unwrap();
+    assert!(grammar.holds(0) && !grammar.holds(1));
+    // What the parser is told: a call may close with `path` alone, `tag`
+    // (required, nullable) delivered `null` when left out, the optional ones
+    // left out of the arguments.
+    let (_, parameters) = grammar.held().next().unwrap();
+    let nulled: Vec<(&str, bool)> = parameters.declared().iter().enumerate().map(|(i, name)| (name.as_str(), parameters.nulled_when_omitted(i))).collect();
+    assert_eq!(nulled, [("path", false), ("depth", false), ("note", false), ("tag", true), ("opts", false)]);
+    assert!(parameters.may_close(&[true, false, false, false, false]));
+    assert!(!parameters.may_close(&[false, true, true, true, true]));
+    assert!(takes_whole(find_matcher(), &call("find", &[("path", "src")])));
+    let every = [("opts", r#"{"hidden": true}"#), ("depth", "2"), ("path", "src"), ("note", "null"), ("tag", "x")];
+    assert!(takes_whole(find_matcher(), &call("find", &every)));
+    // Closed: a parameter the schema does not declare is a miss at its name,
+    // a key the nested object does not declare at its comma.
+    let head = "<tool_call>\n<function=find>\n<parameter=";
+    assert_eq!(taken(&mut find_matcher(), &format!("{head}force>")), head.len());
+    let nested = "<tool_call>\n<function=find>\n<parameter=opts>\n{\"hidden\": true";
+    assert_eq!(taken(&mut find_matcher(), &format!("{nested}, \"x\": 1}}")), nested.len());
+    // Still typed: a word for the integer is a miss at its first letter.
+    let depth = "<tool_call>\n<function=find>\n<parameter=depth>\n";
+    assert_eq!(taken(&mut find_matcher(), &format!("{depth}two")), depth.len());
+}
+
+#[test]
+fn a_normalized_tool_without_parameters_is_held_to_none() {
+    for parameters in [r#"{"type":"object","properties":{}}"#, r#"{"type":"object"}"#] {
+        let m = matcher_of(&cache(), &[normalized("now", parameters)]);
+        assert!(m.grammar().holds(0), "{parameters}");
+        assert!(takes_whole(m.clone(), &call("now", &[])), "{parameters}");
+        // No parameter is declared, so none opens: the miss is at its `p`.
+        let head = "<tool_call>\n<function=now>\n<";
+        assert_eq!(taken(&mut m.clone(), &format!("{head}parameter=zone>")), head.len(), "{parameters}");
+    }
+}
+
+#[test]
+fn a_tool_that_cannot_be_normalized_is_left_free_and_never_refused() {
+    let object = |inner: &str| format!(r#"{{"type":"object","properties":{{"a":{inner}}}}}"#);
+    let cases: Vec<(&str, Vec<DeclaredTool>)> = vec![
+        ("a keyword outside the strict subset", vec![normalized("g", &object(r#"{"type":"string","minLength":3}"#))]),
+        ("an object open by name", vec![normalized("g", r#"{"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":true}"#)]),
+        ("a map", vec![normalized("g", &object(r#"{"type":"object","additionalProperties":{"type":"string"}}"#))]),
+        ("a nested object that declares no property", vec![normalized("g", &object(r#"{"type":"object"}"#))]),
+        ("a required key the object does not declare", vec![normalized("g", r#"{"type":"object","properties":{"a":{"type":"string"}},"required":["b"]}"#)]),
+        ("a root that is not an object", vec![normalized("g", r#"{"type":"string"}"#)]),
+        ("an untyped schema", vec![normalized("g", r#"{"properties":{"a":{"type":"string"}}}"#)]),
+        ("a name the dialect cannot write", vec![normalized("a>b", &object(r#"{"type":"string"}"#))]),
+        ("a name another tool has", vec![tool("g", None), normalized("g", &object(r#"{"type":"string"}"#))]),
+        ("a parameter name the dialect cannot write", vec![normalized("g", r#"{"type":"object","properties":{"a>b":{"type":"string"}}}"#)]),
+        ("a value no line can hold", vec![normalized("g", &object(r#"{"type":"string","enum":["a\nb"]}"#))]),
+    ];
+    for (what, tools) in cases {
+        let grammar = cache().tool_calls(&tools).unwrap_or_else(|refused| panic!("{what}: {refused:?}"));
+        assert!(grammar.held().next().is_none(), "{what}");
+        // A strict tool beside it is held still.
+        let mut beside = tools.clone();
+        beside.push(tool("write_file", Some(WRITE_FILE)));
+        let grammar = cache().tool_calls(&beside).unwrap_or_else(|refused| panic!("{what}: {refused:?}"));
+        assert!((0..tools.len()).all(|i| !grammar.holds(i)) && grammar.holds(tools.len()), "{what}");
+    }
+}
+
+#[test]
+fn a_schema_sent_strict_and_normalized_is_two_grammars() {
+    let open = r#"{"type":"object","properties":{"a":{"type":"string"}}}"#;
+    let cache = cache();
+    assert!(cache.tool_calls(&[normalized("g", open)]).unwrap().holds(0));
+    assert_eq!(cache.tool_calls(&[tool("g", Some(open))]).unwrap_err().refusal.code, "additional_properties_not_false");
+    assert!(cache.tool_calls(&[normalized("g", open)]).unwrap().holds(0));
 }
 
 #[test]

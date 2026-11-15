@@ -44,8 +44,13 @@ pub(crate) struct CreateResponse {
     /// description, parameters, strict}`. Any other tool type is a 400.
     /// `strict: true` holds the tool's calls to its `parameters` on a model
     /// that serves structured output (GitHub #613), as on chat completions.
-    /// Each also kept in its key order as sent: a strict tool's `parameters`
-    /// keep theirs, which its held calls' arguments follow.
+    /// Without `strict` (or with `null`), OpenAI's default here, the tool's
+    /// `parameters` are normalized into strict form and its calls held where
+    /// they allow it: every object closed, an optional parameter left out
+    /// when the call leaves it out; a schema that does not normalize leaves
+    /// the tool free, never refused (GitHub #614). `strict: false` serves it
+    /// free. Each also kept in its key order as sent: a held tool's
+    /// `parameters` keep theirs, which its held calls' arguments follow.
     #[schema(value_type = Vec<Object>)]
     pub(crate) tools: Option<Vec<api::Sent>>,
     /// `"auto"` (default), `"none"`, `"required"`, or `{"type": "function",
@@ -285,9 +290,11 @@ pub(crate) async fn prepare(
     let held = api::structured_output(server, format, "text.format", req.ignis_describe_schema.as_ref(), &thinking, &tools, &tool_choice)?
         .filter(|_| !warm_up);
     // A strict tool's calls are held as on chat completions (GitHub #613,
-    // #615); its refusals come before anything is rendered or generated, and
-    // a warm-up holds no grammar.
-    let api::HeldContent { grammar, description, schemas } = api::held_content(server, held, &raw_tools, &tools, &thinking)?;
+    // #615), and a tool sent without `strict` is normalized and held where
+    // its schema allows it (#614); a strict tool's refusals come before
+    // anything is rendered or generated, and a warm-up holds no grammar.
+    let api::HeldContent { grammar, description, schemas, held: held_tools } =
+        api::held_content(server, held, &raw_tools, &tools, &thinking, api::WithoutStrict::Normalized)?;
     let (grammar, description) = (grammar.filter(|_| !warm_up), description.filter(|_| !system_only));
     let (model, class) = api::resolve_model_and_class(req.model.clone(), req.class.clone())
         .map_err(|message| api::bad_request(&message))?;
@@ -334,7 +341,7 @@ pub(crate) async fn prepare(
         temperature: wire_number(params.temperature),
         text: echoed_text(req.text.as_deref()),
         tool_choice: req.tool_choice.clone().unwrap_or_else(|| json!("auto")),
-        tools: sent_tools,
+        tools: echoed_tools(sent_tools, &held_tools),
         top_p: wire_number(params.top_p),
         truncation: "disabled",
         usage: None,
@@ -361,6 +368,27 @@ pub(crate) async fn prepare(
         },
         starts_in_reasoning,
     })
+}
+
+/// The `tools` a response reports: each as sent, and one sent without
+/// `strict` (or with `null`) with the `strict` it was served with (GitHub
+/// #614), `true` where its calls are held (its `parameters` normalized into
+/// strict form) and `false` where they are not (a schema that does not
+/// normalize, a model that holds no tool, `tool_choice: "none"`), beside its
+/// `name`. `held` is [`api::HeldContent::held`], by the tools' places.
+fn echoed_tools(mut tools: Vec<JsonValue>, held: &[bool]) -> Vec<JsonValue> {
+    for (index, tool) in tools.iter_mut().enumerate() {
+        let function = match tool.get("function").is_some() {
+            true => &mut tool["function"],
+            false => tool,
+        };
+        if let Some(function) = function.as_object_mut()
+            && function.get("strict").is_none_or(JsonValue::is_null)
+        {
+            function.insert("strict".to_owned(), JsonValue::Bool(held.get(index).copied().unwrap_or(false)));
+        }
+    }
+    tools
 }
 
 /// The `text` a response reports: the request's `format` as sent, or `text`

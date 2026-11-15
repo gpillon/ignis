@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use ignis_artifact::{FrontendSet, Reader, TokenBytes, Tokenizer};
-use ignis_grammar::{DeclaredTool, GrammarCache, TokenSet, ToolCallMatcher, Vocab, VocabEntry, DEFAULT_CACHE_BYTES};
+use ignis_grammar::{DeclaredTool, GrammarCache, TokenSet, ToolCallMatcher, ToolHold, Vocab, VocabEntry, DEFAULT_CACHE_BYTES};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 /// The 27B family's logits row (crates/core/src/compute.rs).
@@ -57,9 +57,9 @@ const GET_TIME: &str = r#"{"type":"object","properties":{"zone":{"type":"string"
 
 fn tools() -> Vec<DeclaredTool> {
     vec![
-        DeclaredTool { name: "write_file".into(), strict: Some(WRITE_FILE.into()) },
-        DeclaredTool { name: "get_time".into(), strict: Some(GET_TIME.into()) },
-        DeclaredTool { name: "read".into(), strict: None },
+        DeclaredTool { name: "write_file".into(), hold: ToolHold::Strict(WRITE_FILE.into()) },
+        DeclaredTool { name: "get_time".into(), hold: ToolHold::Strict(GET_TIME.into()) },
+        DeclaredTool { name: "read".into(), hold: ToolHold::Free },
     ]
 }
 

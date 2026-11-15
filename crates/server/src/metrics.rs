@@ -1716,7 +1716,7 @@ impl Metrics {
             for (name, help, series) in [
                 (
                     "ignis_structured_requests_total",
-                    "Completed requests held to a grammar, by the response_format type, or tool for a strict tool's calls.",
+                    "Completed requests held to a grammar, by the response_format type, or tool for a held tool's calls.",
                     &self.structured_requests,
                 ),
                 (

@@ -1710,7 +1710,10 @@ mod tests {
                 let function = tool.get("function").unwrap();
                 ignis_grammar::DeclaredTool {
                     name: function.get("name").unwrap().as_str().unwrap().to_owned(),
-                    strict: (function.get("strict") == Some(&Json::Bool(true))).then(|| function.get("parameters").unwrap().compact()),
+                    hold: match function.get("strict") == Some(&Json::Bool(true)) {
+                        true => ignis_grammar::ToolHold::Strict(function.get("parameters").unwrap().compact()),
+                        false => ignis_grammar::ToolHold::Free,
+                    },
                 }
             })
             .collect();

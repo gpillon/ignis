@@ -295,9 +295,12 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
 - **A parameter of another type**, and one that may be `null`, is held as
   well: [Typed and nullable parameters](#typed-and-nullable-parameters).
 - **A tool without `strict`** in the same request keeps its arguments as the
-  model writes them. With a strict tool in the request, every call's
-  function name is held to the request's tools.
-- **A request with no strict tool** is served as before, byte for byte.
+  model writes them, as OpenAI's chat completions do; the Responses API
+  normalizes it instead ([below](#a-tool-sent-without-strict)). With a strict
+  tool in the request, every call's function name is held to the request's
+  tools.
+- **A request with no strict tool** is served as before, byte for byte, on
+  chat completions.
 - **On Qwen3.8-Flash-Next**, `strict` is accepted and inert for now (GitHub
   #581).
 
@@ -438,6 +441,49 @@ as the request sent it, `tools[1].parameters` for a flat tool (or
 API takes as it is), and the WebSocket mode answers it as an `error` event. A
 streamed call comes in one `response.function_call_arguments.delta`, once the
 call is complete, with the `arguments` a non-streamed response returns.
+
+### A tool sent without `strict`
+
+From 0.11.0, on the 27B, the Responses API normalizes a function tool sent
+without `strict`, or with `strict: null`, into strict form and holds its
+calls, as OpenAI's Responses API does by default (GitHub #614):
+
+- **Every object is closed**: a call names no parameter the tool's
+  `parameters` do not declare, and a nested object holds no key it does not
+  declare. A parameter the model invents is a miss, steered to one the tool
+  declares.
+- **An optional parameter, one `required` does not list, may be left out**,
+  and stays out of the call's `arguments`, one that may be `null` included:
+  the arguments are valid under the schema you sent. A required parameter is
+  held as a strict tool's: the call closes only once it is written, unless it
+  may be `null`, and then it arrives as `null` when left out.
+- **A nested object is written whole**: every property it declares, as the
+  grammar writes an object ([What the grammar writes](#what-the-grammar-writes)),
+  which is valid under your schema too.
+- **A schema that cannot be normalized leaves the tool free**, served as
+  before and never refused: a keyword outside OpenAI's strict subset
+  ([What is refused](#what-is-refused)), an object that admits keys it does
+  not name (`additionalProperties` `true` or a schema, or a nested object
+  without `properties`, which closing would hold to `{}`), a `required`
+  naming a key the object does not declare, a name or a value the call's
+  dialect cannot write (what [refuses a strict tool](#held-tools-strict-true)),
+  and, with thinking on, a tokenizer whose `</think>` is not one token.
+- **The response's `tools` echo the `strict` each one was served with**:
+  `true` where its calls are held, `false` where they are not: on fallback,
+  on Flash-Next, which normalizes no tool, and under `tool_choice: "none"`,
+  which holds nothing.
+- **`strict: false` serves the tool free**, echoed as sent, so an agent CLI
+  that sends `false` on every tool sees no change. Chat completions
+  normalize nothing: a tool without `strict` is free there, OpenAI's default
+  on that endpoint.
+
+For a `find` tool whose `parameters` are `{"type": "object", "properties":
+{"path": {"type": "string"}, "size": {"type": "integer"}, "tag": {"type":
+["string", "null"]}}, "required": ["path"]}`, a call in which the model writes
+`path` alone arrives with the `arguments` `{"path":"src"}`, `size` and `tag`
+left out, and the response echoes the tool with `"strict": true`. A held
+normalized tool's misses and repairs count as a strict tool's, with the type
+`tool`.
 
 ## Cuts
 

@@ -449,17 +449,20 @@ async fn beside_a_strict_tool_a_free_tools_arguments_stay_free() {
 
 /// A request with no strict tool is the request it was: no grammar, so no
 /// round of it is checked, and the call as the parser reads it today, its
-/// keys sorted.
+/// keys sorted. On chat completions a tool sent without `strict` is such a
+/// tool, as OpenAI's default there (GitHub #614 normalizes it on the
+/// Responses API only).
 #[tokio::test]
 async fn a_request_with_no_strict_tool_is_held_to_nothing() {
-    let not_strict = WRITE_FILE.replace("\"strict\":true", "\"strict\":false");
     let script = call("write_file", &[("mode", "x"), ("path", "a.txt")]);
-    let (server, mock) = server(&script, ModelFamily::Qwen38_27b);
-    let (_, calls, _) = served(&server, &chat(&[&not_strict], false, 256)).await;
-    assert_eq!(calls, [("write_file".to_owned(), r#"{"mode":"x","path":"a.txt"}"#.to_owned())]);
-    assert!(mock.decode_calls().iter().flatten().all(|job| !job.checked));
-    assert!(mock.repair_calls().is_empty());
-    assert!(!server.metrics.as_ref().unwrap().render().contains("ignis_structured_"));
+    for tool in [WRITE_FILE.replace("\"strict\":true", "\"strict\":false"), WRITE_FILE.replace("\"strict\":true,", "")] {
+        let (server, mock) = server(&script, ModelFamily::Qwen38_27b);
+        let (_, calls, _) = served(&server, &chat(&[&tool], false, 256)).await;
+        assert_eq!(calls, [("write_file".to_owned(), r#"{"mode":"x","path":"a.txt"}"#.to_owned())], "{tool}");
+        assert!(mock.decode_calls().iter().flatten().all(|job| !job.checked));
+        assert!(mock.repair_calls().is_empty());
+        assert!(!server.metrics.as_ref().unwrap().render().contains("ignis_structured_"));
+    }
 }
 
 /// Streamed, a held call arrives once complete, in one delta, its misses
@@ -879,16 +882,21 @@ async fn on_the_responses_api_a_refused_strict_tool_is_named_where_it_was_sent()
     }
 }
 
-/// A Responses request whose tools are not strict, `strict: false` or no
-/// `strict` at all (normalized only from #614), is held to nothing: no
-/// round of it is checked, and its call is read as today, its keys sorted.
+/// A Responses request whose tools are sent `strict: false` is held to
+/// nothing, as before #614 normalized the tools sent without `strict`: no
+/// round of it is checked, its call is read as today, its keys sorted, and
+/// the response echoes its tools as sent, in the flat shape and the chat
+/// one.
 #[tokio::test]
 async fn on_the_responses_api_a_request_with_no_strict_tool_is_held_to_nothing() {
     let script = call("write_file", &[("mode", "x"), ("path", "a.txt")]);
-    for tool in [flat(WRITE_FILE).replace("\"strict\":true", "\"strict\":false"), flat(WRITE_FILE).replace("\"strict\":true,", "")] {
+    let not_strict = WRITE_FILE.replace("\"strict\":true", "\"strict\":false");
+    for tool in [flat(&not_strict), not_strict.clone()] {
         let body = responses_body(&[&tool], false, 256);
-        let (whole, metrics, mock) = over_http(&script, &body, false).await;
+        let (response, metrics, mock) = responses_post(&script, ModelFamily::Qwen38_27b, &body).await;
+        let whole = delivered(&response);
         assert_eq!(whole.calls, [("write_file".to_owned(), r#"{"mode":"x","path":"a.txt"}"#.to_owned())], "{tool}");
+        assert_eq!(response["tools"], serde_json::from_str::<JsonValue>(&format!("[{tool}]")).unwrap(), "echoed as sent");
         assert!(mock.decode_calls().iter().flatten().all(|job| !job.checked));
         assert!(mock.repair_calls().is_empty());
         assert!(!metrics.render().contains("ignis_structured_"));
@@ -898,9 +906,10 @@ async fn on_the_responses_api_a_request_with_no_strict_tool_is_held_to_nothing()
 }
 
 /// #611's other scripts on the Responses API, over HTTP and the WebSocket
-/// mode: beside a strict tool a free tool's arguments stay free, and with
-/// thinking on the reasoning is free, a call written there included, and the
-/// content after its `</think>` held.
+/// mode: beside a strict tool a free tool's arguments stay free (a tool sent
+/// `strict: false`: one sent without `strict` is normalized there, #614), and
+/// with thinking on the reasoning is free, a call written there included, and
+/// the content after its `</think>` held.
 #[tokio::test]
 async fn on_the_responses_api_a_free_tool_and_the_reasoning_stay_free() {
     let free = "<tool_call>\n<function=search>\n<parameter=query>\ncats\n</parameter>\n<parameter=limit>\nmany\n</parameter>\n</function>\n</tool_call>";
@@ -910,7 +919,7 @@ async fn on_the_responses_api_a_free_tool_and_the_reasoning_stay_free() {
     // Each script, its request, the calls it delivers, what its reasoning
     // holds, and its misses.
     let cases = [
-        (beside, responses_body(&[&flat(SEARCH), &flat(WRITE_FILE)], false, 512), r#"[["search","{\"limit\":\"many\",\"query\":\"cats\"}"],["write_file","{\"path\":\"a.txt\",\"content\":\"hi\",\"mode\":\"w\"}"]]"#, "", 0),
+        (beside, responses_body(&[&flat(&strict_false(SEARCH)), &flat(WRITE_FILE)], false, 512), r#"[["search","{\"limit\":\"many\",\"query\":\"cats\"}"],["write_file","{\"path\":\"a.txt\",\"content\":\"hi\",\"mode\":\"w\"}"]]"#, "", 0),
         (reasoned, thinking, r#"[["write_file","{\"path\":\"a.txt\",\"content\":\"hi\",\"mode\":\"a\"}"]]"#, "<function=nope>", 1),
     ];
     for (script, body, calls, reasoning, misses) in cases {
@@ -965,4 +974,156 @@ async fn on_the_responses_api_text_format_and_a_forced_call_beside_a_strict_tool
         assert_eq!(socket, whole, "{field}: the socket and HTTP");
         counted_as(&metrics, kind, 1, misses).await;
     }
+}
+
+// ── the Responses API's default (GitHub #614) ────────────────────────────
+//
+// A function tool sent without `strict` is normalized into strict form, as
+// OpenAI's Responses API does: held where its schema allows it, served free
+// where it does not, and echoed with the `strict` it was served with.
+
+/// `find`, flat and without `strict`, as a client writes it: its objects
+/// open, `path` required, `recursive`, `size`, `tag` (which may be `null`)
+/// and `where` (an object of one property) optional.
+const FIND: &str = r#"{"type":"function","name":"find","parameters":{"type":"object","properties":{"path":{"type":"string"},"recursive":{"type":"boolean"},"size":{"type":"integer"},"tag":{"type":["string","null"]},"where":{"type":"object","properties":{"hidden":{"type":"boolean"}}}},"required":["path"]}}"#;
+
+/// A chat tool sent `strict: false`, beside its `name`.
+fn strict_false(tool: &str) -> String {
+    tool.replacen("\"name\":", "\"strict\":false,\"name\":", 1)
+}
+
+/// Whether `arguments` validate against a flat tool's own `parameters`, as
+/// the independent reading of #608's validator has it.
+fn valid_flat(tool: &str, arguments: &str) -> bool {
+    let tool = Json::parse(tool).unwrap();
+    ignis_grammar::validate::violations(tool.get("parameters").unwrap(), &Json::parse(arguments).unwrap()).is_empty()
+}
+
+/// The whole response to `body` over HTTP on a model of `family` whose
+/// first request writes `script`, and the server's metrics.
+async fn responses_post(script: &str, family: ModelFamily, body: &str) -> (JsonValue, Arc<ignis_server::metrics::Metrics>, Arc<MockCompute>) {
+    let (server, mock) = server(script, family);
+    let request = Request::builder().method("POST").uri(RESPONSES).header("content-type", "application/json").body(Body::from(body.to_owned())).unwrap();
+    let response = server.app().oneshot(request).await.unwrap();
+    let status = response.status().as_u16();
+    let text = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    assert_eq!(status, 200, "{text}");
+    (serde_json::from_str(&text).unwrap(), server.metrics.clone().unwrap(), mock)
+}
+
+/// A tool sent without `strict` whose schema normalizes has its calls held:
+/// an invented parameter is repaired away, the optional parameters a call
+/// leaves out stay out of its arguments (`tag`, which may be `null`,
+/// included), one it writes is held to its type, and a key the nested
+/// object does not declare is repaired away. The arguments are valid under
+/// the schema as sent, its objects open; the same whole, streamed and on the
+/// WebSocket mode, the misses counted under `type="tool"`; and the response
+/// echoes `strict: true`.
+#[tokio::test]
+async fn on_the_responses_api_a_tool_sent_without_strict_is_normalized_held_and_echoed_strict_true() {
+    let cases = [
+        // `flag` repaired letter by letter to `path`: the first declared
+        // name's letter the script writes later is the `p` of its
+        // `</parameter>`, and its value holds none of the others' first.
+        ("an invented parameter", "<tool_call>\n<function=find>\n<parameter=flag>\na.md\n</parameter>\n</function>\n</tool_call>".to_owned(), r#"{"path":"a.md"}"#, 4),
+        // After `true` the object may only close: each byte of `, "x": 1`
+        // but its spaces repaired to the space the script writes later, its
+        // `1` to the `}`, and that `}` to the line break after it.
+        (
+            "an optional parameter written, an object with a key of its own",
+            call("find", &[("where", r#"{"hidden": true, "x": 1}"#), ("size", "3"), ("path", "src")]),
+            r#"{"path":"src","size":3,"where":{"hidden":true}}"#,
+            7,
+        ),
+    ];
+    for (what, script, arguments, misses) in cases {
+        let body = responses_body(&[FIND], false, 512);
+        let (response, metrics, mock) = responses_post(&script, ModelFamily::Qwen38_27b, &body).await;
+        let whole = delivered(&response);
+        assert_eq!(whole.status, "completed", "{what}");
+        assert_eq!(whole.calls, [("find".to_owned(), arguments.to_owned())], "{what}");
+        assert!(valid_flat(FIND, arguments), "{what}: {arguments}");
+        assert_eq!(response["tools"][0]["strict"], true, "{what}");
+        counted(&metrics, 1, misses).await;
+        assert!(mock.decode_calls().iter().flatten().all(|job| job.checked), "{what}: every round of the content is checked");
+        let (streamed, metrics, _) = over_http(&script, &responses_body(&[FIND], true, 512), true).await;
+        assert_eq!(streamed, whole, "{what}: streamed and whole");
+        counted(&metrics, 1, misses).await;
+        let (events, metrics, _) = socket_events(&script, ModelFamily::Qwen38_27b, &body).await;
+        assert_eq!(delivered_by(&events), whole, "{what}: the socket and HTTP");
+        assert_eq!(events.last().unwrap()["response"]["tools"][0]["strict"], true, "{what}");
+        counted(&metrics, 1, misses).await;
+    }
+}
+
+/// A tool sent without `strict` whose schema does not normalize is served
+/// free, never refused, and echoed `strict: false`: a keyword outside the
+/// strict subset, an object that admits keys it does not name. On Flash-Next
+/// every such tool is: its schema would normalize, and the call is still
+/// read as written. No round is checked and nothing is counted, over HTTP
+/// and the WebSocket mode alike.
+#[tokio::test]
+async fn on_the_responses_api_a_tool_whose_schema_does_not_normalize_is_served_free_and_echoed_strict_false() {
+    let length = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1}}}}"#;
+    let map = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string"},"labels":{"type":"object","additionalProperties":{"type":"string"}}}}}"#;
+    let look = "<tool_call>\n<function=look>\n<parameter=query>\ncats\n</parameter>\n<parameter=limit>\nmany\n</parameter>\n</function>\n</tool_call>";
+    let find = "<tool_call>\n<function=find>\n<parameter=flag>\nsrc\n</parameter>\n</function>\n</tool_call>";
+    let cases = [
+        (ModelFamily::Qwen38_27b, length, look, r#"{"limit":"many","query":"cats"}"#),
+        (ModelFamily::Qwen38_27b, map, look, r#"{"limit":"many","query":"cats"}"#),
+        (ModelFamily::FlashNext, FIND, find, r#"{"flag":"src"}"#),
+    ];
+    for (family, tool, script, arguments) in cases {
+        let body = responses_body(&[tool], false, 256);
+        let (response, metrics, mock) = responses_post(script, family, &body).await;
+        let whole = delivered(&response);
+        let name = Json::parse(tool).unwrap().get("name").unwrap().as_str().unwrap().to_owned();
+        assert_eq!(whole.calls, [(name, arguments.to_owned())], "{tool}");
+        assert_eq!(response["tools"][0]["strict"], false, "{tool}");
+        assert!(mock.decode_calls().iter().flatten().all(|job| !job.checked), "{tool}");
+        assert!(mock.repair_calls().is_empty(), "{tool}");
+        assert!(!metrics.render().contains("ignis_structured_"), "{tool}");
+        let (events, _, _) = socket_events(script, family, &body).await;
+        assert_eq!(delivered_by(&events), whole, "{tool}: the socket and HTTP");
+        assert_eq!(events.last().unwrap()["response"]["tools"][0]["strict"], false, "{tool}");
+    }
+}
+
+/// The response's `tools` are the request's, each as sent, and a tool sent
+/// without `strict`, or with `null`, carries the one it was served with
+/// beside its `name`, in its `function` for a tool in the chat shape: `true`
+/// where it is held, `false` where its schema does not normalize, on
+/// Flash-Next, and under `tool_choice: "none"`, which holds nothing. A
+/// `strict` sent `true` or `false` is echoed as sent.
+#[tokio::test]
+async fn on_the_responses_api_each_tool_echoes_the_strict_it_was_served_with() {
+    let length = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1}}}}"#;
+    let chat_shaped = r#"{"type":"function","function":{"name":"list","parameters":{"type":"object","properties":{"dir":{"type":"string"}}}}}"#;
+    let null = FIND.replacen("\"name\":\"find\"", "\"name\":\"seek\",\"strict\":null", 1);
+    let (search, write_file) = (flat(&strict_false(SEARCH)), flat(WRITE_FILE));
+    let tools = [FIND, length, chat_shaped, null.as_str(), search.as_str(), write_file.as_str()];
+    // The tools as sent, each sent without `strict` given the one it is
+    // echoed with.
+    let echoed = |strict: [Option<bool>; 6]| -> JsonValue {
+        let echoed = tools.iter().zip(strict).map(|(tool, strict)| {
+            let mut tool: JsonValue = serde_json::from_str(tool).unwrap();
+            if let Some(strict) = strict {
+                let function = if tool.get("function").is_some() { &mut tool["function"] } else { &mut tool };
+                function["strict"] = JsonValue::Bool(strict);
+            }
+            tool
+        });
+        JsonValue::Array(echoed.collect())
+    };
+    let held = echoed([Some(true), Some(false), Some(true), Some(true), None, None]);
+    let none_held = echoed([Some(false), Some(false), Some(false), Some(false), None, None]);
+    let body = responses_body(&tools, false, 64);
+    let (response, _, _) = responses_post("", ModelFamily::Qwen38_27b, &body).await;
+    assert_eq!(response["tools"], held);
+    let (events, _, _) = socket_events("", ModelFamily::Qwen38_27b, &body).await;
+    assert_eq!(events.last().unwrap()["response"]["tools"], held, "the socket's echo");
+    let (response, _, _) = responses_post("", ModelFamily::FlashNext, &body).await;
+    assert_eq!(response["tools"], none_held, "on Flash-Next");
+    let (response, _, _) = responses_post("", ModelFamily::Qwen38_27b, &body.replacen("\"tools\"", "\"tool_choice\":\"none\",\"tools\"", 1)).await;
+    assert_eq!(response["tools"], none_held, "under tool_choice none");
 }

@@ -62,9 +62,25 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   OpenAI's strict subset is a `400` before anything is generated, its
   `param` the tool's field where you sent it: `tools[1].parameters`, or
   `tools[1].function.parameters` for a tool in the chat shape; the WebSocket
-  mode answers the same refusal as an `error` event. `false`, `null` and
-  absent serve the tool as before, and on Flash-Next `strict` is accepted
-  and inert (GitHub #581).
+  mode answers the same refusal as an `error` event. On Flash-Next `strict`
+  is accepted and inert (GitHub #581).
+- **A function tool sent without `strict` is normalized and held**, from
+  0.11.0, on the 27B, as OpenAI's Responses API does by default (earlier
+  versions serve it free): its `parameters` are put in strict form, every
+  object closed, so a call names no parameter they do not declare, and an
+  optional parameter, one `required` does not list, may be left out and
+  stays out of `arguments`, which are valid under the schema you sent. A
+  schema that cannot be normalized leaves the tool free, as before, and is
+  never a `400` ([Held tools on the Responses API](structured-output.md#on-the-responses-api)).
+  `strict: null` is the same as no `strict`, and `strict: false` serves the
+  tool free, as before, so an agent CLI that sends `false` on every tool
+  sees no change. On Flash-Next no tool is normalized.
+- **The response's `tools` echo the `strict` each tool was served with**:
+  a tool you sent without one (or with `null`) carries `strict: true` where
+  its calls are held and `strict: false` where they are not (a schema that
+  cannot be normalized, Flash-Next, `tool_choice: "none"`), beside its
+  `name`, or in its `function` for a tool in the chat shape; a `strict` you
+  sent is echoed as you sent it.
 - A length stop ends `incomplete` (`max_output_tokens`), an engine error
   `failed`; `usage` carries `input_tokens_details.cached_tokens` and
   `output_tokens_details.reasoning_tokens`.
