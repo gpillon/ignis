@@ -341,7 +341,7 @@ pub(crate) async fn prepare(
         temperature: wire_number(params.temperature),
         text: echoed_text(req.text.as_deref()),
         tool_choice: req.tool_choice.clone().unwrap_or_else(|| json!("auto")),
-        tools: echoed_tools(sent_tools, &held_tools),
+        tools: echoed_tools(sent_tools, &held_tools, server.active().family.serves_structured_output()),
         top_p: wire_number(params.top_p),
         truncation: "disabled",
         usage: None,
@@ -370,22 +370,29 @@ pub(crate) async fn prepare(
     })
 }
 
-/// The `tools` a response reports: each as sent, and one sent without
-/// `strict` (or with `null`) with the `strict` it was served with (GitHub
-/// #614), `true` where its calls are held (its `parameters` normalized into
-/// strict form) and `false` where they are not (a schema that does not
-/// normalize, a model that holds no tool, `tool_choice: "none"`), beside its
-/// `name`. `held` is [`api::HeldContent::held`], by the tools' places.
-fn echoed_tools(mut tools: Vec<JsonValue>, held: &[bool]) -> Vec<JsonValue> {
+/// The `tools` a response reports: each as sent, with the `strict` it was
+/// served with beside its `name` (GitHub #614). One sent without `strict`
+/// (or with `null`) carries `true` where its calls are held (its
+/// `parameters` normalized into strict form) and `false` where they are not
+/// (a schema that does not normalize, `tool_choice: "none"`); one sent with
+/// `strict` keeps it; and on a model that holds no tool's calls (`holds`
+/// false: Flash-Next, #581) every tool carries `false`, a `strict: true`
+/// inert there. `held` is [`api::HeldContent::held`], by the tools' places.
+fn echoed_tools(mut tools: Vec<JsonValue>, held: &[bool], holds: bool) -> Vec<JsonValue> {
     for (index, tool) in tools.iter_mut().enumerate() {
         let function = match tool.get("function").is_some() {
             true => &mut tool["function"],
             false => tool,
         };
-        if let Some(function) = function.as_object_mut()
-            && function.get("strict").is_none_or(JsonValue::is_null)
-        {
-            function.insert("strict".to_owned(), JsonValue::Bool(held.get(index).copied().unwrap_or(false)));
+        let Some(function) = function.as_object_mut() else { continue };
+        let sent = function.get("strict").is_some_and(|strict| !strict.is_null());
+        let served = match (holds, sent) {
+            (false, _) => Some(false),
+            (true, false) => Some(held.get(index).copied().unwrap_or(false)),
+            (true, true) => None,
+        };
+        if let Some(served) = served {
+            function.insert("strict".to_owned(), JsonValue::Bool(served));
         }
     }
     tools

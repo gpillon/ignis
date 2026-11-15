@@ -220,4 +220,5 @@ OpenAI's defaults on the two surfaces are. The normalization is the grammar crat
 - The response's `tools` echo the `strict` each tool sent without one was served with, beside its name (in its
   `function` for the chat shape): `true` where its calls are held, `false` where they are not, which includes
   Flash-Next and `tool_choice: "none"`, under which nothing is held. A `strict` the client sent is echoed as sent,
-  so the echo of `strict: false`, and of an inert `strict: true` on Flash-Next, changes by no byte.
+  so the echo of `strict: false` changes by no byte, but on Flash-Next every tool echoes `false`: `strict: true` is
+  inert there (#581), and the echo says what each tool was served with.

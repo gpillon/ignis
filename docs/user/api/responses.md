@@ -63,7 +63,7 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   `param` the tool's field where you sent it: `tools[1].parameters`, or
   `tools[1].function.parameters` for a tool in the chat shape; the WebSocket
   mode answers the same refusal as an `error` event. On Flash-Next `strict`
-  is accepted and inert (GitHub #581).
+  is accepted and inert (GitHub #581), and echoed `false`.
 - **A function tool sent without `strict` is normalized and held**, from
   0.11.0, on the 27B, as OpenAI's Responses API does by default (earlier
   versions serve it free): its `parameters` are put in strict form, every
@@ -80,7 +80,8 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   its calls are held and `strict: false` where they are not (a schema that
   cannot be normalized, Flash-Next, `tool_choice: "none"`), beside its
   `name`, or in its `function` for a tool in the chat shape; a `strict` you
-  sent is echoed as you sent it.
+  sent is echoed as you sent it, but on Flash-Next, which holds no tool's
+  calls, every tool echoes `strict: false`.
 - A length stop ends `incomplete` (`max_output_tokens`), an engine error
   `failed`; `usage` carries `input_tokens_details.cached_tokens` and
   `output_tokens_details.reasoning_tokens`.

@@ -1092,9 +1092,10 @@ async fn on_the_responses_api_a_tool_whose_schema_does_not_normalize_is_served_f
 /// The response's `tools` are the request's, each as sent, and a tool sent
 /// without `strict`, or with `null`, carries the one it was served with
 /// beside its `name`, in its `function` for a tool in the chat shape: `true`
-/// where it is held, `false` where its schema does not normalize, on
-/// Flash-Next, and under `tool_choice: "none"`, which holds nothing. A
-/// `strict` sent `true` or `false` is echoed as sent.
+/// where it is held, `false` where its schema does not normalize and under
+/// `tool_choice: "none"`, which holds nothing. A `strict` sent `true` or
+/// `false` is echoed as sent, but on Flash-Next, which holds no tool's
+/// calls, every tool echoes `false`, a `strict: true` inert there.
 #[tokio::test]
 async fn on_the_responses_api_each_tool_echoes_the_strict_it_was_served_with() {
     let length = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1}}}}"#;
@@ -1117,13 +1118,14 @@ async fn on_the_responses_api_each_tool_echoes_the_strict_it_was_served_with() {
     };
     let held = echoed([Some(true), Some(false), Some(true), Some(true), None, None]);
     let none_held = echoed([Some(false), Some(false), Some(false), Some(false), None, None]);
+    let flash_next = echoed([Some(false), Some(false), Some(false), Some(false), None, Some(false)]);
     let body = responses_body(&tools, false, 64);
     let (response, _, _) = responses_post("", ModelFamily::Qwen38_27b, &body).await;
     assert_eq!(response["tools"], held);
     let (events, _, _) = socket_events("", ModelFamily::Qwen38_27b, &body).await;
     assert_eq!(events.last().unwrap()["response"]["tools"], held, "the socket's echo");
     let (response, _, _) = responses_post("", ModelFamily::FlashNext, &body).await;
-    assert_eq!(response["tools"], none_held, "on Flash-Next");
+    assert_eq!(response["tools"], flash_next, "on Flash-Next");
     let (response, _, _) = responses_post("", ModelFamily::Qwen38_27b, &body.replacen("\"tools\"", "\"tool_choice\":\"none\",\"tools\"", 1)).await;
     assert_eq!(response["tools"], none_held, "under tool_choice none");
 }

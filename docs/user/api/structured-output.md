@@ -471,7 +471,8 @@ calls, as OpenAI's Responses API does by default (GitHub #614):
 - **The response's `tools` echo the `strict` each one was served with**:
   `true` where its calls are held, `false` where they are not: on fallback,
   on Flash-Next, which normalizes no tool, and under `tool_choice: "none"`,
-  which holds nothing.
+  which holds nothing. On Flash-Next every tool is echoed `strict: false`,
+  one sent `strict: true` included, inert there.
 - **`strict: false` serves the tool free**, echoed as sent, so an agent CLI
   that sends `false` on every tool sees no change. Chat completions
   normalize nothing: a tool without `strict` is free there, OpenAI's default
