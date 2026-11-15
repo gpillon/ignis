@@ -130,6 +130,32 @@ BF16 roundings on each path allow. On the 16 GB artifact, whose output head is t
 code, the scores are the device's own output head over the f64 hidden; the head's every weight is already in the
 state and hidden it is held to.
 
+**The replay's instruments read the head's chain and force its rounds as DFlash2's do** (#626). The proposal
+readout under MTP is the round's own chain (`ignis::mtp::propose`), run once, eagerly, at width 1, for one sequence
+staged as a round's lane at the extent asked: the same steps on the same inputs as the chain in the sequence's next
+width-1 round, so the same drafts, at one chain's cost and without the round. Only where each step's scores land
+moves: a block of the readout's own scratch, not the round's logits, which a host cut's repair may still read.
+#620's frontier readout stays as it was for the double-precision checks: its row is built on the prefill's
+attention route, not the round's. Each draft's probability is its share of the softmax
+at temperature 1 over the head's BF16 scores, the whole vocabulary, taken on the host in double precision (a score
+more than 40 below the step's best is left out: under 1e-12 of the sum); the leading candidates are the step's 16
+best ids, the lower id first on a tie, the first the device's argmax, which the host checks. What the readout leaves
+is what a round's chain leaves: the head's rows at and past its frontier, `[P - 1, P - 1 + e)`, which no committed
+state holds and every later step writes before it reads. Under hq-e8-2b those appends also land on ring rows older
+keys inside the window still name, and set their bits; clearing the bits, as a failed round's guard does, would be
+safe but leave the next round reading the codec where a sequence never read reads exact rows. So the readout saves
+the slot's head residual planes (2 x 1,114,112 bytes) and head ring words before the chain and puts them back after
+it, and a sequence read before every round generates bit for bit what one never read generates, under BF16 and
+under hq-e8-2b past the ring's first lap. A teacher-forced round on an MTP load needs nothing of its own: the
+verdict is accept-side and reads the chain's drafts back as it reads DFlash2's, and since the head drafts under the
+fixed draft only, only greedy lanes are forced. Fed the text its own rounds committed, it is those rounds bit for
+bit at one and two lanes. The replay of recorded turns under MTP is its own example and record
+(`crates/runtime/examples/mtp_replay.rs`, 1,016 bytes a round: the drafts, the head's probability of each, its
+candidates, the accepted count, the committed run, the window in the header), with its own reader
+(`tools/mtp-replay/records.py`); DFlash2's replay and its 9,520-byte record are unchanged, and a directory holds one
+replay (`replay.json`). The run is its own check: it exits 1 where a round's forced run is not the read drafts'
+agreement with the recording.
+
 This amends ADR 0024. A pool built for the head holds two pieces of state that are sections to be, the head's
 ring words and the continuation hidden, beside the head's layer in its pages; they are not in the section table
 yet, so until #622 lists them (and earns their snapshot point) such a pool refuses every snapshot, restore,

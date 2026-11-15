@@ -36,6 +36,12 @@ cuda = ["ignis-core/cuda", "ignis-artifact/cuda"]
 [[example]]
 name = "dflash2_replay"
 required-features = ["cuda"]
+# The same replay under the 27B's MTP head (GitHub #626): teacher-forced verify
+# rounds, with the head's chain, its probability of each draft and its leading
+# candidates read per round.
+[[example]]
+name = "mtp_replay"
+required-features = ["cuda"]
 # The verify round's width-cost curve (GitHub #267): round time at draft
 # windows 1..7 and at plain decode, at the load's lanes.
 [[example]]

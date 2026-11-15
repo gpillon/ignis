@@ -12,7 +12,10 @@
 //! eight lanes, so a replay on both differs only in the body and the card.
 //! GitHub #577: on either body the rounds run under a named draft rule
 //! (`--draft-rule`), today's fixed draft unless the flag names the sampled
-//! draft, at its default drafter settings.
+//! draft, at its default drafter settings. GitHub #626: the MTP replay
+//! (`mtp_replay.rs`) loads the same shape with the 27B's MTP head drafting in
+//! place of DFlash2 ([`LoadShape::with_mtp`]), under the fixed draft, the one
+//! rule an MTP load drafts under.
 
 use ignis_artifact::Body27b;
 use ignis_core::{DraftRule, DrafterSampling, ProposalHead, RopeScaling, Speculation, SpeculativeBackend, VramMode};
@@ -31,12 +34,16 @@ pub struct LoadShape {
     /// The decode lanes: the pool's slots and the widest round.
     pub lanes: u32,
     pub prefill_chunk: u32,
-    /// The DFlash2 window (full head); 0 for a plain load.
+    /// The draft window (DFlash2's with the full head, or the MTP head's);
+    /// 0 for a plain load.
     pub window: u32,
     pub rope: RopeScaling,
     /// GitHub #577: the rounds' draft rule (ADR 0090), at its default drafter
     /// settings.
     pub draft_rule: DraftRule,
+    /// GitHub #626: the drafter, DFlash2 unless the MTP replay asks for the
+    /// head.
+    pub drafter: SpeculativeBackend,
 }
 
 /// The flags that move a replay's shape off its body's, taken out of the
@@ -93,6 +100,7 @@ impl LoadShape {
             window: 7,
             rope: RopeScaling::NONE,
             draft_rule: DraftRule::Fixed,
+            drafter: SpeculativeBackend::Dflash2,
         };
         match body {
             Body27b::Trellis => sixteen_gb,
@@ -122,14 +130,31 @@ impl LoadShape {
         Ok(moved)
     }
 
-    /// The load's DFlash2 speculation, full head, under the shape's draft
-    /// rule; none for a plain load.
+    /// GitHub #626: the same shape with the 27B's MTP head drafting at
+    /// `window` (1 to 7). The head drafts under the fixed draft only, so a
+    /// shape under the sampled draft is refused. The MTP replay's alone: the
+    /// DFlash2 examples that share this file never call it.
+    #[allow(dead_code)]
+    pub fn with_mtp(self, window: u32) -> Result<Self, String> {
+        if self.draft_rule != DraftRule::Fixed {
+            return Err(format!("the MTP head drafts under the fixed draft only, not the {} draft", self.draft_rule.as_str()));
+        }
+        Speculation::new(SpeculativeBackend::Mtp, window).map_err(|e| format!("window {window}: {e}"))?;
+        Ok(Self { drafter: SpeculativeBackend::Mtp, window, ..self })
+    }
+
+    /// The load's speculation: DFlash2 with the full head under the shape's
+    /// draft rule, or the MTP head (GitHub #626); none for a plain load.
     pub fn speculation(&self) -> Option<Speculation> {
         (self.window > 0).then(|| {
-            Speculation::new(SpeculativeBackend::Dflash2, self.window)
-                .unwrap_or_else(|e| panic!("window {}: {e}", self.window))
-                .with_proposal_head(ProposalHead::Full)
-                .with_draft_rule(self.draft_rule, DrafterSampling::default())
+            let speculation = Speculation::new(self.drafter, self.window)
+                .unwrap_or_else(|e| panic!("window {}: {e}", self.window));
+            match self.drafter {
+                SpeculativeBackend::Dflash2 => speculation
+                    .with_proposal_head(ProposalHead::Full)
+                    .with_draft_rule(self.draft_rule, DrafterSampling::default()),
+                _ => speculation,
+            }
         })
     }
 }
@@ -225,6 +250,27 @@ mod tests {
             assert_eq!(sampled, LoadShape { draft_rule: DraftRule::Sampled, ..today });
             let speculation = sampled.speculation().unwrap();
             assert_eq!((speculation.draft_rule(), speculation.drafter_sampling()), (DraftRule::Sampled, DrafterSampling::default()));
+        }
+    }
+
+    /// GitHub #626: the MTP replay's shape is the DFlash2 replay's on either
+    /// body, the head drafting at the named window under the fixed draft.
+    #[test]
+    fn the_mtp_shape_is_the_replays_with_the_head_drafting_under_the_fixed_draft() {
+        for body in [Body27b::Trellis, Body27b::Nvfp4] {
+            let today = LoadShape::new(body, ShapeFlags::default()).unwrap();
+            assert_eq!(today.drafter, SpeculativeBackend::Dflash2, "a replay drafts with DFlash2 unless asked");
+            let mtp = today.with_mtp(7).unwrap();
+            assert_eq!(mtp, LoadShape { drafter: SpeculativeBackend::Mtp, ..today });
+            let speculation = mtp.speculation().unwrap();
+            assert_eq!((speculation.backend(), speculation.draft_tokens()), (SpeculativeBackend::Mtp, 7));
+            assert_eq!(speculation.draft_rule(), DraftRule::Fixed);
+            assert_eq!(today.with_mtp(3).unwrap().speculation().unwrap().draft_tokens(), 3);
+            let err = today.with_mtp(8).unwrap_err();
+            assert!(err.contains("window 8"), "{err}");
+            let sampled = LoadShape::new(body, ShapeFlags { draft_rule: Some(DraftRule::Sampled), ..ShapeFlags::default() }).unwrap();
+            let err = sampled.with_mtp(7).unwrap_err();
+            assert!(err.contains("fixed draft only"), "{err}");
         }
     }
 }

@@ -343,6 +343,17 @@ teacher-forced rounds. The recorded token after a lane's run is its pending
 token, so it must be a vocabulary id; the pad past a recording's end is taken
 only after a stop id, and leaves no pending token until a prefill gives one.
 Only greedy lanes may be forced, and only on 27B loads.
+The same instruments under the 27B's MTP head (GitHub #626,
+`crates/core/tests/mtp_replay_seams_gpu.rs`, both bodies): the chain readout
+(`mtp_readout::chain`) runs the round's own chain once, eagerly at width 1,
+and its drafts are the next round's (a forced round whose recording is the
+read drafts takes them all); a sequence read before every round generates
+what one never read generates, under BF16 and, past the hq ring's first lap,
+under hq-e8-2b, where the readout gives the head's residual window and ring
+words back. The head drafts under the fixed draft only, so a sampling lane is
+never forced on an MTP load. Its replay (`crates/runtime/examples/mtp_replay.rs`,
+records read by `tools/mtp-replay/records.py`) is its own check on one
+recorded turn: it exits 1 if any round's read drafts were not the round's.
 
 Vision is a load option too (GitHub #177): `--vision-enabled` (with
 `--vision-max-tokens N`, default 32,768 merged tokens) binds the 333 `vision/*`
