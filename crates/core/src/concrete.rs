@@ -256,6 +256,15 @@ pub struct SchedulerConfig {
     /// published at a cut of their own (#187) -- the 27B on Blackwell, whose
     /// extra traversal costs ~19 ms there.
     pub opener_page_rides_capture: bool,
+    /// GitHub #622 (ADR 0095): how many positions behind its frontier a
+    /// sequence of the leaf's pool still writes -- 1 on a 27B load built for
+    /// its MTP head, 0 on every other. There the page holding a frontier's
+    /// last position is every holder's own copy, so a capture may lend the
+    /// copy of its prefix's last page with the pages this ledger moves: a page
+    /// this ledger charges to that prefix, and which the load's
+    /// `ignis_core::seq::holder_page_reserve` keeps back from admission. A
+    /// capture that lent more than this past what the ledger moves is released.
+    pub kv_holder_lag: u32,
     /// The load's **retained slots** (GitHub #215, #281, ADR 0030; the
     /// operator's `--reuse-retained-device` and `--reuse-retained-host` together): how
     /// many images of mutable state retained state may hold, prompt
@@ -514,6 +523,7 @@ impl Default for SchedulerConfig {
             // asks for it by setting fewer here.
             prompt_reuse: true,
             opener_page_rides_capture: false,
+            kv_holder_lag: 0,
             retained_slots: N_DECODE_LANES as u32,
             retained_interactive_ttl: DEFAULT_RETAINED_INTERACTIVE_TTL,
             thinking_close: None,
@@ -1885,7 +1895,10 @@ impl ConcreteScheduler {
         let page_tokens = self.config.kv_page_tokens;
         let moved = self.link_pages(idx, opener);
         let r = &self.requests[idx];
-        if leaf_lent > moved {
+        // GitHub #622: under the MTP head the leaf's loan may hold the
+        // sequence's own copy of its prefix's last page besides, which this
+        // ledger charges to that prefix.
+        if leaf_lent > moved + self.config.kv_holder_lag {
             // hotpath-lint-allow: failure-only path (a capture whose loan the ledger cannot carry is released), reviewed exception (GitHub #306).
             tracing::error!(
                 name: "ignis.checkpoint.loan_mismatch",

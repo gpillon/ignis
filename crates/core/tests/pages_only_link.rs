@@ -481,6 +481,35 @@ fn a_27b_capture_that_lent_is_released() {
 }
 
 #[test]
+fn a_27b_mtp_capture_that_lent_its_holders_copy_is_retained_and_one_page_more_is_not() {
+    // GitHub #622: under the MTP head the page of a prefix's last position is
+    // the sequence's own copy, which the leaf's capture lends with the pages
+    // this ledger moves -- none here, the opener's floor being published --
+    // and this ledger charges to the prefix. That loan is retained; a loan
+    // past it is still a drifted view, and released.
+    for (lent, retained) in [(1, true), (2, false)] {
+        let compute = Arc::new(MockCompute::new());
+        let mut sched = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                opener_page_rides_capture: false,
+                kv_holder_lag: 1,
+                ..config()
+            },
+            compute.clone(),
+        );
+        let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+        compute.lend_at_capture(n, lent);
+        run_to_idle(&mut sched);
+        assert_eq!(chunk_widths(&compute, n), vec![32, 5, 3], "the 27B's cuts: the floor, then the opener");
+        assert_eq!(sched.checkpoint_pool().entry_count(), usize::from(retained), "a loan of {lent}");
+        assert_eq!(compute.released_checkpoints().is_empty(), retained, "a loan of {lent}");
+        if retained {
+            assert_eq!(sched.prefix_pinned_pages(), 2, "the floor's two pages, and no link in the ledger");
+        }
+    }
+}
+
+#[test]
 fn a_link_the_leaf_made_longer_than_the_scheduler_s_is_released() {
     // Standing on the block's one-page prefix, the scheduler moves the one
     // page between it and the opener's floor; a leaf that lent two stood on

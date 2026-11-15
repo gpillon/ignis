@@ -1382,6 +1382,16 @@ pub fn qwen27b_load(
     )
     .map_err(|e| e.to_string())?;
     let capacity_pages = kv_pool.block_count() as u32;
+    // GitHub #622: admission keeps back the pages an MTP pool's holders copy
+    // past the ledger -- none under any other drafter.
+    let dense = ignis_core::compute::ModelConfig::qwen38_27b();
+    let drafter = shape.speculation.map(|s| s.backend());
+    let admission_pages = capacity_pages.saturating_sub(ignis_core::seq::holder_page_reserve(
+        &dense,
+        drafter,
+        leaf_config.slot_count,
+        shape.retained_slots(),
+    ));
 
     // GitHub #210: the same for every reservation the plan laid out -- the
     // leaf's buffers, read back, must be the plan's lines, or the plan no
@@ -1418,7 +1428,8 @@ pub fn qwen27b_load(
     let (sched, kv_disk_bytes) = scheduler_with_kv_disk(
         SchedulerConfig {
             thinking_close,
-            ..scheduler_config_for_shape(model_id.clone(), shape, KV_PAGE_TOKENS, capacity_pages, leaf_config.slot_count)
+            kv_holder_lag: ignis_core::seq::holder_lag(&dense, drafter),
+            ..scheduler_config_for_shape(model_id.clone(), shape, KV_PAGE_TOKENS, admission_pages, leaf_config.slot_count)
         },
         model,
         eos,

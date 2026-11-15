@@ -997,6 +997,40 @@ mod tests {
         );
     }
 
+    /// GitHub #622: a blob belongs to one drafter. An MTP load refuses a
+    /// DFlash2 blob and one with no drafter, each refuses an MTP blob, and the
+    /// refusal names the drafter, both sides spelled -- the layout version is
+    /// the same on all three (the leaf's MTP sections are additive).
+    #[test]
+    fn a_blob_from_another_drafter_is_refused_by_name_whatever_the_drafters() {
+        let mtp = BlobIdentity::of_load(
+            artifact(1),
+            KvFormat::HqE8_2b,
+            Some(Speculation::new(SpeculativeBackend::Mtp, 7).unwrap()),
+            5,
+        );
+        let dflash2 = BlobIdentity::of_load(artifact(1), KvFormat::HqE8_2b, Some(dflash2(7)), 5);
+        let none = BlobIdentity::of_load(artifact(1), KvFormat::HqE8_2b, None, 5);
+        for (load, blob, expected, found) in [
+            (&mtp, &dflash2, "mtp window 7", "dflash2 window 7"),
+            (&mtp, &none, "mtp window 7", "none"),
+            (&dflash2, &mtp, "dflash2 window 7", "mtp window 7"),
+            (&none, &mtp, "none", "mtp window 7"),
+        ] {
+            let refused = load.accepts(blob).expect_err("another drafter's blob");
+            assert_eq!(refused.field, IdentityField::Drafter, "{refused}");
+            assert_eq!((refused.expected.as_str(), refused.found.as_str()), (expected, found));
+            assert_eq!(
+                refused.to_string(),
+                format!("retained state refused: drafter is {expected} here, {found} in the blob")
+            );
+        }
+        // And each drafter's blob restores on a load of its own.
+        for identity in [&mtp, &dflash2, &none] {
+            assert_eq!(identity.accepts(identity), Ok(()));
+        }
+    }
+
     /// GitHub #576: the draft rule decides how a round drafts and accepts, not
     /// what state it leaves, so a blob taken under one rule restores under the
     /// other.

@@ -212,9 +212,10 @@ void checked_memcpy_async(void *dst, const void *src, std::size_t bytes, cudaMem
 
 // GitHub #257: slot `slot`'s residual window against `host`, laid out as the
 // IGNIS_SEQ_SECTION_HQ_RESIDUAL payload -- every GQA layer's K plane, then
-// every layer's V plane, then the ring words. One 2D copy per role: a slot's
-// plane sits at the same offset of every layer's run, one layer pitch apart.
-// On the default stream, like every other section copy here.
+// every layer's V plane, then the ring words (GitHub #622: the target's, then
+// with the MTP head the head's own). One 2D copy per role: a slot's plane
+// sits at the same offset of every layer's run, one layer pitch apart. On the
+// default stream, like every other section copy here.
 void ignis_seq_copy_hq_residual(const ignis_seq_pool &pool, std::int32_t slot, void *host,
                                 cudaMemcpyKind kind) {
   const bool to_host        = kind == cudaMemcpyDeviceToHost;
@@ -238,6 +239,12 @@ void ignis_seq_copy_hq_residual(const ignis_seq_pool &pool, std::int32_t slot, v
   checked_memcpy_async(to_host ? static_cast<void *>(ring) : static_cast<void *>(pool.hq_ring_words(slot)),
                        to_host ? static_cast<const void *>(pool.hq_ring_words(slot)) : ring, ring_bytes,
                        kind, "hq ring words");
+  if (pool.has_mtp_head()) {
+    unsigned char *head = ring + ring_bytes;
+    checked_memcpy_async(to_host ? static_cast<void *>(head) : static_cast<void *>(pool.hq_head_ring_words(slot)),
+                         to_host ? static_cast<const void *>(pool.hq_head_ring_words(slot)) : head, ring_bytes,
+                         kind, "hq head ring words");
+  }
 }
 
 void ignis_seq_zero_hq_residual(ignis_seq_pool &pool, std::int32_t slot) {
@@ -398,6 +405,10 @@ bool pack_slot_section_to_host(const ignis_seq_pool &pool, std::int32_t slot,
     checked_memcpy_async(at, pool.ngram_slot_conv(slot), static_cast<std::size_t>(section.bytes),
                          cudaMemcpyDeviceToHost, "n-gram conv state");
     return true;
+  case IGNIS_SEQ_SECTION_MTP_CONTINUATION:
+    checked_memcpy_async(at, pool.mtp_continuation_of(slot), static_cast<std::size_t>(section.bytes),
+                         cudaMemcpyDeviceToHost, "continuation hidden");
+    return true;
   default:
     return false;
   }
@@ -448,6 +459,10 @@ bool unpack_slot_section_from_host(ignis_seq_pool &pool, std::int32_t slot,
   case IGNIS_SEQ_SECTION_NGRAM_CONV:
     checked_memcpy_async(pool.ngram_slot_conv(slot), const_cast<unsigned char *>(at),
                          static_cast<std::size_t>(section.bytes), cudaMemcpyHostToDevice, "n-gram conv state");
+    return true;
+  case IGNIS_SEQ_SECTION_MTP_CONTINUATION:
+    checked_memcpy_async(pool.mtp_continuation_of(slot), const_cast<unsigned char *>(at),
+                         static_cast<std::size_t>(section.bytes), cudaMemcpyHostToDevice, "continuation hidden");
     return true;
   default:
     return false;
@@ -658,6 +673,13 @@ std::string snapshot_refusal(const ignis_seq_pool &pool, const ignis_seq &seq,
   }
   if (header.total_bytes != src_bytes) {
     return mismatch("size", header.total_bytes, src_bytes);
+  }
+
+  // GitHub #622: a blob of a pool built for the MTP head and one of any other
+  // pool are named by the drafter state that differs, before the geometry
+  // (whose plane count differs too) would name a plane count.
+  if (const char *head = ignis_seq_mtp_head_refusal(records, pool.has_mtp_head())) {
+    return std::string("snapshot ") + head;
   }
 
   // The geometry as one struct, compared whole: `memcmp` decides, and the
@@ -993,8 +1015,9 @@ std::uint64_t host_image_stride(const PoolLayout &layout, const struct ignis_seq
     stride += aligned(cyclic_lane_bytes(layout.dflash2_window_layout));
   }
   if (layout.hq_residual_plane_bytes != 0) {
+    // GitHub #622: with the MTP head's ring words after the target's.
     stride += aligned(2u * spec.kv_num_layers * layout.hq_residual_plane_bytes +
-                      kIgnisHqRingWords * sizeof(std::uint32_t));
+                      (layout.mtp_head ? 2u : 1u) * kIgnisHqRingWords * sizeof(std::uint32_t));
   }
   // GitHub #303: Flash-Next's slot sections, in table order.
   if (layout.indexer_tail_slot_bytes != 0) {
@@ -1003,6 +1026,8 @@ std::uint64_t host_image_stride(const PoolLayout &layout, const struct ignis_seq
   if (layout.ngram_conv_slot_bytes != 0) {
     stride += aligned(layout.ngram_conv_slot_bytes);
   }
+  // GitHub #622: the MTP head's continuation hidden.
+  stride += layout.mtp_head ? aligned(layout.mtp_continuation_slot_bytes) : 0;
   return stride;
 }
 
@@ -1216,14 +1241,10 @@ extern "C" int32_t ignis_seq_pool_stats(const struct ignis_seq_pool *pool,
   return 0;
 }
 
-const char *ignis_seq_clone_refusal(const ignis_seq_pool &pool) {
-  // GitHub #620: the MTP head's two sections -- its layer's ring words and the
-  // continuation hidden -- are not in the section table yet, and a move that
-  // left them behind would hand its sequence a head that is not its own.
-  if (pool.has_mtp_head()) {
-    return "a pool built for the MTP head carries the head's state, which no snapshot, restore, retained "
-           "slot, prefix or checkpoint moves yet";
-  }
+const char *ignis_seq_clone_refusal(const ignis_seq_pool &) {
+  // GitHub #622: the MTP head's state is in the section table (its layer in
+  // the KV pages and the hq window, its ring words, the continuation hidden),
+  // so no pool is refused here.
   return nullptr;
 }
 
@@ -1523,6 +1544,10 @@ void slot_section_runs(const ignis_seq_pool &pool, std::int32_t slot, const igni
       }
     }
     out.device(at, pool.hq_ring_words(slot), kIgnisHqRingWords * sizeof(std::uint32_t));
+    if (pool.has_mtp_head()) {
+      out.device(at + kIgnisHqRingWords * sizeof(std::uint32_t), pool.hq_head_ring_words(slot),
+                 kIgnisHqRingWords * sizeof(std::uint32_t));
+    }
     return;
   }
   case IGNIS_SEQ_SECTION_INDEXER_TAIL:
@@ -1533,6 +1558,9 @@ void slot_section_runs(const ignis_seq_pool &pool, std::int32_t slot, const igni
     return;
   case IGNIS_SEQ_SECTION_NGRAM_CONV:
     out.device(at, pool.ngram_slot_conv(slot), section.bytes);
+    return;
+  case IGNIS_SEQ_SECTION_MTP_CONTINUATION:
+    out.device(at, pool.mtp_continuation_of(slot), section.bytes);
     return;
   default:
     // ADR 0024's "carried by all or by none": a section the table lists and
@@ -2290,6 +2318,11 @@ void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int3
       }
       copy(pool.hq_ring_words(dst), pool.hq_ring_words(src),
            kIgnisHqRingWords * sizeof(std::uint32_t), what);
+      // GitHub #622: and the MTP head's own words.
+      if (pool.has_mtp_head()) {
+        copy(pool.hq_head_ring_words(dst), pool.hq_head_ring_words(src),
+             kIgnisHqRingWords * sizeof(std::uint32_t), what);
+      }
       break;
     }
     case IGNIS_SEQ_SECTION_INDEXER_TAIL: {
@@ -2307,6 +2340,10 @@ void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int3
     }
     case IGNIS_SEQ_SECTION_NGRAM_CONV:
       copy(pool.ngram_slot_conv(dst), pool.ngram_slot_conv(src), static_cast<std::size_t>(section.bytes), what);
+      break;
+    case IGNIS_SEQ_SECTION_MTP_CONTINUATION:
+      copy(pool.mtp_continuation_of(dst), pool.mtp_continuation_of(src), static_cast<std::size_t>(section.bytes),
+           what);
       break;
     default:
       throw std::logic_error(std::string("state section ") + what +

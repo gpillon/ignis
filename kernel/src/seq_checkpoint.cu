@@ -191,7 +191,12 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
     return -1;
   }
   const auto page_size      = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
-  const std::uint32_t below = opener_tokens / page_size;
+  // GitHub #622: the whole pages below the first position a claimant writes,
+  // which with the MTP head is the opener's last (the head's entry there
+  // waits for the claimant's own next token), so the page holding it is the
+  // checkpoint's copy even for an opener on a page boundary.
+  const std::uint32_t lag   = pool->holder_lag();
+  const std::uint32_t below = (opener_tokens - lag) / page_size;
   // GitHub #306: pages already lent to a link (an earlier capture at this
   // opener) are a prefix's as far as a claimant is concerned.
   const std::uint32_t lent =
@@ -264,8 +269,9 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
     return -1;
   }
   // GitHub #215: an opener on a page boundary ends inside no page, so only
-  // one that does not takes a page of the pool for its copy.
-  const bool partial = opener_tokens % page_size != 0;
+  // one that does not takes a page of the pool for its copy. GitHub #622:
+  // under the MTP head every opener does -- the page of its last position.
+  const bool partial = lag != 0 || opener_tokens % page_size != 0;
   if (partial && !pool->kv_pool.can_reserve(1)) {
     ignis_seq_set_last_error("ignis_seq_checkpoint_capture: the KV pool has no page left for the "
                              "copy of the page the opener ends inside");
@@ -342,6 +348,17 @@ extern "C" int32_t ignis_seq_alloc_from_checkpoint(struct ignis_seq_pool *pool,
   }
   if (pool == nullptr || checkpoint == nullptr || out_seq == nullptr) {
     ignis_seq_set_last_error("ignis_seq_alloc_from_checkpoint: null argument");
+    return -1;
+  }
+  // GitHub #622: under the MTP head the claimant's first own page is the
+  // copy of the opener's last position, which an opener on a page boundary
+  // leaves full: its next token needs the page after it.
+  if (pool->holder_lag() != 0 &&
+      static_cast<std::uint64_t>(ninfer::pages_for_tokens(context_tokens)) * ninfer::kPagedKVPageSize <=
+          checkpoint->tokens) {
+    ignis_seq_set_last_error("ignis_seq_alloc_from_checkpoint: a reservation of " +
+                             std::to_string(context_tokens) + " tokens leaves no room past the " +
+                             std::to_string(checkpoint->tokens) + "-token opener");
     return -1;
   }
   // The shared pages, a fresh zeroed tail, the block-table row -- everything

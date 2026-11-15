@@ -142,8 +142,9 @@ struct ignis_seq_pool;
 /* GitHub #302: why a sequence of `pool` cannot be snapshotted, restored,
  * captured as a checkpoint or published as a prefix, or nullptr. Since
  * GitHub #303 the section table carries Flash-Next's indexer and n-gram
- * sections, and no pool is refused; the seam stays, so a section a pool
- * holds and the table does not list has one place to say so. */
+ * sections, and since GitHub #622 the MTP head's continuation hidden and ring
+ * words, and no pool is refused; the seam stays, so a section a pool holds
+ * and the table does not list has one place to say so. */
 const char *ignis_seq_clone_refusal(const ignis_seq_pool &pool);
 
 struct ignis_seq_pool {
@@ -279,6 +280,17 @@ struct ignis_seq_pool {
     return has_mtp_head() ? static_cast<std::uint64_t>(kIgnisMtpHidden) * sizeof(std::uint16_t) : 0;
   }
 
+  // GitHub #622: how many positions behind its frontier a sequence of this
+  // pool still writes. 1 with the MTP head, whose entry at the sequence's last
+  // position is built from the token the sequence consumes next
+  // (`ignis_mtp_head_frontier`); 0 otherwise. A sequence that continues from
+  // a frontier writes the page holding position `frontier - holder_lag()`, so
+  // two holders of one frontier -- a prefix's publisher and its claimants, a
+  // checkpoint's claimants -- each need their own copy of that page whenever
+  // it holds history: with the head always (the page of the last position),
+  // without it only when the frontier is not on a page boundary.
+  std::uint32_t holder_lag() const { return has_mtp_head() ? 1u : 0u; }
+
   // Slot `slot`'s continuation hidden.
   void *mtp_continuation_of(std::int32_t slot) const {
     return static_cast<unsigned char *>(mtp_continuation->p) +
@@ -394,12 +406,17 @@ struct ignis_seq_pool {
     return hq_head_ring + static_cast<std::ptrdiff_t>(slot) * kIgnisHqRingWords;
   }
 
+  // The ring word sets one slot keeps: the target's, and with the MTP head
+  // its layer's own (GitHub #620, #622).
+  std::uint32_t hq_ring_sets() const { return has_mtp_head() ? 2u : 1u; }
+
   // Bytes one slot's window occupies, on the device and in its host image
   // alike: every layer's K plane, then every layer's V plane, then its ring
-  // words. 0 on a BF16 pool.
+  // words -- the target's, then with the MTP head the head's (GitHub #622).
+  // 0 on a BF16 pool.
   std::uint64_t hq_residual_slot_bytes() const {
     return has_hq_residual() ? 2u * static_cast<std::uint32_t>(kv_num_layers) * hq_residual_plane_bytes() +
-                                   kIgnisHqRingWords * sizeof(std::uint32_t)
+                                   hq_ring_sets() * kIgnisHqRingWords * sizeof(std::uint32_t)
                              : 0;
   }
 

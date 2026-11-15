@@ -588,6 +588,43 @@ pub fn kv_geometry(cfg: &ModelConfig, speculative_backend: Option<crate::Specula
     }
 }
 
+/// The KV pages a pool of `cfg` for `speculative_backend`, with `slot_count`
+/// lanes and `retained_slots` retained slots (device and host), may hold
+/// beyond what the scheduler's ledger charges (GitHub #622): what admission
+/// keeps back from the pool's pages so the leaf never runs out of pages the
+/// ledger thinks it has.
+///
+/// 0 but on a 27B pool built for its MTP head. There the head's entry at a
+/// frontier's last position is written by whichever sequence continues from
+/// it, so the page holding that position is never shared: a prefix keeps a
+/// copy of its last page while its handle lives, a checkpoint keeps one even
+/// for an opener on a page boundary, and every holder of a prefix -- its
+/// publisher and each claimant -- or of a checkpoint on a page boundary maps
+/// its own copy in place of a shared page. The ledger charges a prefix its
+/// whole pages and each claimant the pages past them, as for any other pool.
+/// So the leaf holds at most one page more per sequence (one holder copy
+/// each, the prefix's own last page as charged covering one of them) and one
+/// per retained slot (a prefix's or a checkpoint's copy, each with the image
+/// a retained slot holds, and gone with it).
+pub fn holder_page_reserve(
+    cfg: &ModelConfig,
+    speculative_backend: Option<crate::SpeculativeBackend>,
+    slot_count: u32,
+    retained_slots: u32,
+) -> u32 {
+    holder_lag(cfg, speculative_backend) * (slot_count + retained_slots)
+}
+
+/// How many positions behind its frontier a sequence of a pool of `cfg` for
+/// `speculative_backend` still writes (GitHub #622, the leaf's
+/// `ignis_seq_pool::holder_lag`): 1 on the 27B's MTP pool, whose head writes
+/// its entry at a frontier's last position from the token after it, 0 on
+/// every other -- the scheduler's
+/// [`crate::SchedulerConfig::kv_holder_lag`].
+pub fn holder_lag(cfg: &ModelConfig, speculative_backend: Option<crate::SpeculativeBackend>) -> u32 {
+    u32::from(pool_drafter(cfg, speculative_backend).0 == crate::SpeculativeBackend::Mtp.abi_code())
+}
+
 /// The leaf's pool spec for `cfg`, `budget` and a speculative backend.
 fn pool_spec(
     cfg: &ModelConfig,
@@ -1875,6 +1912,28 @@ mod tests {
         for backend in [None, Some(Dflash2), Some(VerifyOnly), Some(Mtp)] {
             assert_eq!(kv_geometry(&dense, backend).gqa_layers, spec(&dense, backend).1, "{backend:?}");
             assert_eq!(kv_geometry(&flash, backend).gqa_layers, spec(&flash, backend).1, "{backend:?}");
+        }
+    }
+
+    /// GitHub #622: only a 27B pool built for its MTP head holds pages past
+    /// the scheduler's ledger, one a lane and one a retained slot at most;
+    /// Flash-Next's head, whose prefix's last entry is its publisher's, holds
+    /// none, and neither does any other drafter.
+    #[test]
+    fn only_the_27bs_mtp_pool_keeps_pages_back_for_its_holders_copies() {
+        use crate::SpeculativeBackend::{Dflash2, Mtp, VerifyOnly};
+        let dense = ModelConfig::qwen38_27b();
+        assert_eq!(holder_page_reserve(&dense, Some(Mtp), 8, 10), 18);
+        assert_eq!(holder_page_reserve(&dense, Some(Mtp), 1, 0), 1);
+        assert_eq!(holder_lag(&dense, Some(Mtp)), 1);
+        for backend in [None, Some(Dflash2), Some(VerifyOnly)] {
+            assert_eq!(holder_page_reserve(&dense, backend, 8, 10), 0, "{backend:?}");
+            assert_eq!(holder_lag(&dense, backend), 0, "{backend:?}");
+        }
+        let flash = ModelConfig::qwen38_flash_next();
+        for backend in [None, Some(Mtp), Some(VerifyOnly)] {
+            assert_eq!(holder_page_reserve(&flash, backend, 3, 4), 0, "{backend:?}");
+            assert_eq!(holder_lag(&flash, backend), 0, "{backend:?}");
         }
     }
 

@@ -65,7 +65,10 @@ struct ignis_seq_checkpoint {
   /* The page the opener ends inside, copied into one KV page of the pool this
    * entry owns (GitHub #215) -- never bound to a block-table row, and not
    * shared. Empty (`valid()` false) for an opener on a page boundary, which
-   * ends inside no page. */
+   * ends inside no page -- except on a pool built for the MTP head (GitHub
+   * #622), where it is the page of the opener's last position, whose head
+   * entry each claimant writes from its own next token, wherever the opener
+   * falls. */
   ninfer::PagedKVAllocation tail;
   /* The IGNIS_SEQ_SECTION_PROGRESS payload: host scalars, so they live here
    * rather than in a retained slot (the snapshot path does the same). */

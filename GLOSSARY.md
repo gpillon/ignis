@@ -344,8 +344,8 @@ slot. The head's entry at a position is built from the hidden there and the
 token after it, so the entry at a sequence's last position waits for the token
 the sequence consumes next; the continuation hidden is the half of it that
 waits. Every prefill chunk and every round reads it for its first head row and
-leaves the next one (ADR 0095). A **state section** to be: a restored or
-claimed sequence that carries it drafts in its first round.
+leaves the next one (ADR 0095). A **state section** (#622): a restored or
+claimed sequence carries it and drafts in its first round.
 
 **Companion container**:
 A small `.ninfer` beside the main one that holds one optional part of the
@@ -781,9 +781,9 @@ taps, its position and last token, its penalty-count row, on a pool built with
 DFlash2 its **drafter window**, and on an hq-e8-2b pool its **residual
 window**. Each is either shareable read-only (KV pages) or must be cloned per
 sequence (everything mutable). A pool built for the 27B's **MTP head** holds
-the head's attention state in its KV pages and the **continuation hidden** per
-slot, which no move carries yet: such a pool refuses every snapshot, restore,
-retained slot, prefix and checkpoint until the sections are listed (#622).
+the head's attention state in its KV pages (and under hq-e8-2b its layer of
+the residual window, with its own ring words) and the **continuation hidden**
+per slot, a section of its own; every move carries them (#622).
 
 **Snapshot blob**:
 The opaque, versioned byte image of a whole sequence that crosses the ABI.
@@ -936,7 +936,10 @@ nothing. A shared or retained prefix's is always a whole number of KV pages in
 — a **chained prefix**'s is measured from the start of the prompt, not from
 what the publisher already shares; a **prompt checkpoint**'s is the generation
 opener wherever it falls, and whoever reuses it copies the partial page rather
-than sharing it.
+than sharing it. On a load built for the 27B's **MTP head** the page holding
+the publish point's last position is every holder's own copy, whatever the
+point: the head's entry there is built from the token after it, which each
+holder writes from its own (#622).
 
 **Eviction priority**:
 The one ordering that decides what loses residency, on the device, in KV-RAM

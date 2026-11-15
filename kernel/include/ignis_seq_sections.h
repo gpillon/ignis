@@ -56,7 +56,18 @@
  * from one would read whatever its slot's previous occupant left there.
  * 5: the drafter's checkpoint section is gone. It held the reference's
  * rewrite checkpoint of the window, which nothing in ignis ever read; a
- * version-4 drafter blob lists one section more than this leaf's table. */
+ * version-4 drafter blob lists one section more than this leaf's table.
+ *
+ * Still 5 since GitHub #622 (ADR 0095): a pool built for the 27B's MTP head
+ * lists one section more, the continuation hidden, and its hq residual
+ * window carries the head's ring words after the target's. Nothing else
+ * changed, and a pool without the head writes the bytes it wrote before, so
+ * no blob that exists is reread: an MTP pool refused every move of a
+ * sequence until this table listed the head's state, so no version-5 blob of
+ * one was ever written, and a blob of one pool kind restored into the other
+ * is refused by name ("the MTP head's state") before its geometry is read.
+ * Keeping the number lets the blob identity name the drafter, the field that
+ * differs, rather than the layout version. */
 inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 5;
 
 /* GitHub #303 (spec flash-next/05): a Flash-Next pool's blobs number their
@@ -117,7 +128,9 @@ enum ignis_seq_section_kind {
   /* The hq-e8-2b residual window of this slot (GitHub #257, spec
    * runtime/06): every GQA layer's exact K side plane, then every layer's V
    * side plane (`ignis_seq_pool::hq_residual_plane_bytes` each, sink rows
-   * then ring rows), then the 16 ring validity words. Listed only by an hq
+   * then ring rows), then the 16 ring validity words. On a pool built for the
+   * MTP head (GitHub #622) the head's layer is the last layer of both plane
+   * runs and its own 16 ring words follow the target's. Listed only by an hq
    * pool, and placed before the progress section in blob order. Mutable:
    * every append rewrites ring rows and bits. Slot-indexed, not
    * page-indexed, which is why it is a CLONE section rather than riding the
@@ -136,7 +149,17 @@ enum ignis_seq_section_kind {
   IGNIS_SEQ_SECTION_INDEXER_TAIL = 9,
   /* GitHub #303: the n-gram embedding's dilated conv state, its past input
    * columns: CLONE, rewritten every step. */
-  IGNIS_SEQ_SECTION_NGRAM_CONV = 10
+  IGNIS_SEQ_SECTION_NGRAM_CONV = 10,
+  /* GitHub #622 (spec #618, ADR 0095): the 27B MTP head's continuation hidden
+   * of this slot, one BF16 [5,120] vector -- the target's post-final-norm
+   * hidden at the sequence's last consumed position, half of the head's next
+   * row. Listed only by a pool built for the head, and placed before the
+   * progress section in blob order. CLONE: every step rewrites it, and a
+   * claimant or a restored sequence builds its first head row from it. The
+   * head's attention state rides the sections above: its layer is the last
+   * plane run of every KV page (SHAREABLE, like the target's) and, under
+   * hq-e8-2b, the last layer of the residual window with its own ring words. */
+  IGNIS_SEQ_SECTION_MTP_CONTINUATION = 11
 };
 
 /* How a second sequence may come to hold a section (ADR 0024).
@@ -174,12 +197,15 @@ inline constexpr std::size_t kIgnisSeqHqResidualSectionCount = 1;
 /* GitHub #303: the indexer's keys and tail, and the n-gram conv state. */
 inline constexpr std::size_t kIgnisSeqIndexerSectionCount = 2;
 inline constexpr std::size_t kIgnisSeqNgramSectionCount = 1;
+/* GitHub #622: the MTP head's continuation hidden. */
+inline constexpr std::size_t kIgnisSeqMtpSectionCount = 1;
 
 inline std::size_t ignis_seq_section_count(const ignis_seq_pool &pool) {
   return kIgnisSeqSectionCount + (pool.has_dflash2() ? kIgnisSeqDflash2SectionCount : 0) +
          (pool.has_hq_residual() ? kIgnisSeqHqResidualSectionCount : 0) +
          (pool.has_indexer() ? kIgnisSeqIndexerSectionCount : 0) +
-         (pool.has_ngram_conv() ? kIgnisSeqNgramSectionCount : 0);
+         (pool.has_ngram_conv() ? kIgnisSeqNgramSectionCount : 0) +
+         (pool.has_mtp_head() ? kIgnisSeqMtpSectionCount : 0);
 }
 
 /* The blob layout version a pool of this family writes and accepts (GitHub
@@ -524,6 +550,25 @@ inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_po
   if (pool.has_ngram_conv()) {
     push(IGNIS_SEQ_SECTION_NGRAM_CONV, IGNIS_SEQ_SECTION_CLONE, pool.ngram_conv_slot_bytes);
   }
+  // GitHub #622 (ADR 0095): the MTP head's continuation hidden. The head's
+  // state earns the snapshot point at the two points a snapshot is taken,
+  // and holds there what `ignis_mtp_head_frontier` derives from the progress
+  // scalars -- no frontier of its own to disagree:
+  // - a completed prefill chunk: the chunk's head call writes the rows
+  //   [start - 1, end - 1) from the hidden the step before left and the
+  //   chunk's own, then leaves its last column as the continuation hidden,
+  //   inside the chunk the one synchronize confirms -- every row below the
+  //   head's frontier, none at it, the hidden at the last consumed position;
+  // - a committed round: a plain round writes its lanes' rows before their
+  //   positions and the round's hidden; a verify round's commit rewrites the
+  //   committed run's rows and moves the hidden to the run's last column as
+  //   its last device step, and under hq-e8-2b clears the head's ring bits of
+  //   every chain row past the commit, so rows past the head's frontier are
+  //   never read before a later step writes them. A round that fails before
+  //   that step leaves the frontier and the hidden together.
+  if (pool.has_mtp_head()) {
+    push(IGNIS_SEQ_SECTION_MTP_CONTINUATION, IGNIS_SEQ_SECTION_CLONE, pool.mtp_continuation_slot_bytes());
+  }
   push(IGNIS_SEQ_SECTION_PROGRESS, IGNIS_SEQ_SECTION_CLONE, sizeof(ignis_seq_progress_image));
   assert(sections.size() == ignis_seq_section_count(pool) &&
          "ignis_seq_section_count has drifted from the table above");
@@ -535,18 +580,24 @@ inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_po
   // The unused records' bytes are zeroed like any other gap.
   // GitHub #303: the Flash-Next sections' records fit the same aligned
   // room (128 + 10 x 24 bytes still round to 512), so a 27B blob's payload
-  // starts where it always did.
+  // starts where it always did. GitHub #622: and so does the MTP head's
+  // record (128 + 11 x 24 = 392), which keeps every blob of a pool without
+  // the head the bytes it was.
   std::uint64_t cursor = ignis_seq_align_up(
       sizeof(ignis_seq_snapshot_header) +
           (kIgnisSeqSectionCount + kIgnisSeqDflash2SectionCount + kIgnisSeqHqResidualSectionCount +
-           kIgnisSeqIndexerSectionCount + kIgnisSeqNgramSectionCount) *
+           kIgnisSeqIndexerSectionCount + kIgnisSeqNgramSectionCount + kIgnisSeqMtpSectionCount) *
               sizeof(ignis_seq_section),
       kIgnisSeqSectionAlign);
   static_assert((sizeof(ignis_seq_snapshot_header) + 7 * sizeof(ignis_seq_section) + kIgnisSeqSectionAlign - 1) /
                         kIgnisSeqSectionAlign ==
-                    (sizeof(ignis_seq_snapshot_header) + 10 * sizeof(ignis_seq_section) + kIgnisSeqSectionAlign - 1) /
+                    (sizeof(ignis_seq_snapshot_header) + 11 * sizeof(ignis_seq_section) + kIgnisSeqSectionAlign - 1) /
                         kIgnisSeqSectionAlign,
-                "the Flash-Next records moved a 27B blob's first payload");
+                "the Flash-Next or MTP records moved a 27B blob's first payload");
+  static_assert(kIgnisSeqSectionCount + kIgnisSeqDflash2SectionCount + kIgnisSeqHqResidualSectionCount +
+                        kIgnisSeqIndexerSectionCount + kIgnisSeqNgramSectionCount + kIgnisSeqMtpSectionCount ==
+                    11,
+                "the record room above counts every section kind this leaf knows");
   for (ignis_seq_section &section : sections) {
     section.offset = cursor;
     cursor = ignis_seq_align_up(cursor + section.bytes, kIgnisSeqSectionAlign);
@@ -591,9 +642,32 @@ inline const char *ignis_seq_section_name(std::int32_t kind) {
     return "indexer_tail";
   case IGNIS_SEQ_SECTION_NGRAM_CONV:
     return "ngram_conv";
+  case IGNIS_SEQ_SECTION_MTP_CONTINUATION:
+    return "mtp_continuation";
   default:
     return "unknown";
   }
+}
+
+/* GitHub #622: why a blob listing `records` cannot be restored into a pool
+ * whose head presence is `pool_has_head`, or nullptr. A blob taken on a pool
+ * built for the MTP head lists the continuation hidden, and one taken on any
+ * other pool does not; the two kinds of pool also differ in their KV pages
+ * (17 attention layers against 16), which the geometry would name as a plane
+ * count. This names the drafter state that actually differs, ahead of the
+ * geometry, the way the DFlash2 window's lane size names the other drafter. */
+inline const char *ignis_seq_mtp_head_refusal(const std::vector<ignis_seq_section> &records, bool pool_has_head) {
+  bool blob_has_head = false;
+  for (const ignis_seq_section &record : records) {
+    blob_has_head = blob_has_head || record.kind == IGNIS_SEQ_SECTION_MTP_CONTINUATION;
+  }
+  if (blob_has_head == pool_has_head) {
+    return nullptr;
+  }
+  return blob_has_head ? "the MTP head's state (the blob was taken on a pool built for the MTP head, this pool has "
+                         "none)"
+                       : "the MTP head's state (this pool is built for the MTP head, the blob was taken on a pool "
+                         "without it)";
 }
 
 /* The header describing a blob of `sections` over `pool`'s geometry, with

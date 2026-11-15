@@ -954,6 +954,41 @@ mod tests {
         assert_eq!(read.check(&load, &expected), Err(Refusal::NotTheBlob("match key")));
     }
 
+    /// GitHub #622: a file belongs to one drafter. Written by a DFlash2 load
+    /// or by one with no drafter, an MTP load refuses it by the drafter, and
+    /// the others refuse an MTP load's file the same way; each restores on a
+    /// load of its own drafter.
+    #[test]
+    fn a_file_of_another_drafter_is_refused_by_the_drafter() {
+        use ignis_core::{ArtifactHash, KvFormat, RopeScaling, Speculation, SpeculativeBackend};
+        let of = |drafter: Option<SpeculativeBackend>| {
+            let blob = BlobIdentity::of_load(
+                ArtifactHash::from_bytes([3; 32]),
+                KvFormat::HqE8_2b,
+                drafter.map(|backend| Speculation::new(backend, 7).unwrap()),
+                5,
+            );
+            DiskIdentity::of_load("qwen3.8-27b", &blob, RopeScaling::default(), None)
+        };
+        let mtp = of(Some(SpeculativeBackend::Mtp));
+        let dflash2 = of(Some(SpeculativeBackend::Dflash2));
+        let none = of(None);
+        assert_eq!((mtp.drafter.as_str(), dflash2.drafter.as_str(), none.drafter.as_str()), ("mtp:7:full", "dflash2:7:full", ""));
+        for (load, file) in [(&mtp, &dflash2), (&mtp, &none), (&dflash2, &mtp), (&none, &mtp)] {
+            let mut written = header(8192, 4096);
+            written.identity = file.clone();
+            let read = FileHeader::decode(&written.encode().unwrap()).unwrap();
+            let expected = FileHeader { identity: load.clone(), ..written.clone() };
+            assert_eq!(read.check(load, &expected), Err(Refusal::Foreign("drafter")), "{} on {}", file.drafter, load.drafter);
+        }
+        for own in [&mtp, &dflash2, &none] {
+            let mut written = header(8192, 4096);
+            written.identity = own.clone();
+            let read = FileHeader::decode(&written.encode().unwrap()).unwrap();
+            assert_eq!(read.check(own, &written), Ok(()), "{}", own.drafter);
+        }
+    }
+
     #[test]
     fn the_sidecar_hash_is_read_from_the_artifacts_sha256_file() {
         let location = temp_location("sidecar");

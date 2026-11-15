@@ -53,9 +53,9 @@ prompt and decode routes), which is out of proportion to what it buys.
 
 What that costs is at a shared prefix. A prefix is whole pages, and the entry at its last position `P - 1` is
 written after the publish, by the publisher's next step and by every claimant's first, each from its own next
-token; the claimant's entry must be its own (spec #618). So #622 gives each holder its own copy of the prefix's
-last page, in which it writes that entry from its next token and the continuation hidden the prefix carries,
-and shares the pages below it. The cost is one page a holder.
+token; the claimant's entry must be its own (spec #618). So each holder has its own copy of the prefix's last
+page, in which it writes that entry from its next token and the continuation hidden the prefix carries, and
+shares the pages below it (#622, below). The cost is one page a holder.
 
 **A sequence keeps a continuation hidden**: the target's post-final-norm hidden at its last consumed position,
 one BF16 vector of 5,120 per pool slot. It is the half of the entry at the last position that the step which
@@ -130,11 +130,55 @@ BF16 roundings on each path allow. On the 16 GB artifact, whose output head is t
 code, the scores are the device's own output head over the f64 hidden; the head's every weight is already in the
 state and hidden it is held to.
 
-This amends ADR 0024. A pool built for the head holds two pieces of state that are sections to be, the head's
-ring words and the continuation hidden, beside the head's layer in its pages; they are not in the section table
-yet, so until #622 lists them (and earns their snapshot point) such a pool refuses every snapshot, restore,
-retained slot, prefix and checkpoint by name rather than move a sequence without its head. A blob names its
-drafter in its identity already (ADR 0029: "mtp window 7"). This amends ADR 0046 too: its example gives MTP the
-Flash-Next family alone, and MTP is the 27B's as well once the server accepts the option (#623); until then a
-27B load built for the head is reached through the leaf, the core load API and the runtime's compute seam only.
-Until #624, an MTP load takes no vision; it drafts under the fixed draft only.
+**The head's state travels with the sequence, and a blob belongs to one drafter** (#622). This amends ADR 0024.
+The head's attention state rides the sections a sequence already has: its layer is the last plane run of every KV
+page (shareable, like the target's), and under hq-e8-2b the last layer of the residual window, whose section
+carries the head's ring words after the target's. The continuation hidden is a section of its own
+(`IGNIS_SEQ_SECTION_MTP_CONTINUATION`, cloned), listed only by a pool built for the head. So every move of a
+sequence carries them: a snapshot and its restore, whole or a window at a time, KV-RAM and KV disk (which move
+those blobs), a retained slot on the device or on the host, a prefix's image and a checkpoint's.
+
+The blob's format stays 5. A pool without the head writes the bytes it wrote before: the same sections, and the
+records' room before the first payload, now eleven, still rounds to 512 bytes. A pool built for the head refused
+every move until this table listed its state, so no blob of one exists to be reread; and a blob of either kind of
+pool restored into the other is refused by name before its geometry is read ("the MTP head's state", the leaf's
+named check on the blob's records, as DFlash2's window lane size names the other drafter). Bumping the version for
+the head's pools alone would have made the blob identity name the layout version rather than the drafter, the
+field that differs: an MTP load refuses a DFlash2 blob and one with no drafter as `drafter is mtp window 7 here,
+dflash2 window 7 in the blob` (or `none`), the others refuse an MTP blob the same way, a KV-disk file names its
+drafter as `mtp:7:full` and is refused by it, and the refused prompt is prefilled again. The format document is the
+leaf's section header (`kernel/include/ignis_seq_sections.h`), whose version history says why the number holds.
+
+The snapshot point is earned, not inherited: at a completed chunk boundary the chunk's head call has written every
+row below the head's frontier and left the chunk's last column as the hidden, inside the chunk the one synchronize
+confirms; after a committed round the commit has rewritten the run's rows and moved the hidden as its last device
+step, and under hq-e8-2b cleared the head's ring bits of every chain row past the commit. The head's frontier is
+derived from the sequence's, so nothing of its own can disagree with the progress image. Measured on the card under
+BF16 and hq-e8-2b: a sequence restored at a chunk boundary, after a round with rejected drafts and after a round at
+extent 0 drafts in its first round and every round after it is the uninterrupted run's, extent and committed run.
+
+**The page holding a frontier's last position is every holder's own.** With the head, a sequence continuing from a
+frontier writes the head's entry at the position before it (`ignis_seq_pool::holder_lag`, 1). A prefix of `P`
+tokens shares its first `P/64 - 1` pages and keeps a copy of its last (`ignis_seq_prefix::last`) while its handle
+lives, the image a claim copies; the publisher takes a copy as its first own page at the publish, each claimant at
+its claim, and each writes the entry at `P - 1` from its own next token: a claimant's is bit for bit a sequence's
+that prefilled the same tokens cold, never its publisher's. A chained prefix's first page is its publisher's copy,
+which holds that publisher's entry, part of the chain's history. A checkpoint copies the page of its opener's last
+position, so an opener on a page boundary now keeps a tail page too, and lends one page fewer to its link. A
+spilled prefix's blob ends with the copy, as a checkpoint's ends with its tail. Flash-Next's head, which stores its
+entries the same way, keeps its rule: a claimant there reads its publisher's last entry.
+
+What that costs the scheduler's ledger, which charges a prefix its whole pages and a claimant the pages past them
+as for any other pool, is bounded rather than tracked: at most one page more a sequence (its copy; the prefix's
+last page as charged covers one holder's) and one a retained slot (a prefix's or a checkpoint's copy, each held
+with the image a retained slot holds and gone with it). `ignis_core::seq::holder_page_reserve` states it, `slot_count
++ retained_slots` on the 27B's MTP pool and 0 on every other, and the 27B's load keeps it back from admission's
+pages (#623 serves the backend). The one place the ledger reads the leaf's count is a capture's loan: a capture by a
+sequence holding a copy lends that copy with the pages the ledger moves (the ledger charges it to the prefix), so
+the scheduler takes a loan of one page more than it moves on such a load (`SchedulerConfig::kv_holder_lag`, 1 there)
+and releases a capture that lent more, as before.
+
+This amends ADR 0046 too: its example gives MTP the Flash-Next family alone, and MTP is the 27B's as well once the
+server accepts the option (#623); until then a 27B load built for the head is reached through the leaf, the core
+load API and the runtime's compute seam only. Until #624, an MTP load takes no vision; it drafts under the fixed
+draft only.

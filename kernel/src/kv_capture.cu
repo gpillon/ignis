@@ -14,10 +14,12 @@
 
 #include "ignis_kv_capture.h"
 #include "ignis_seq_internal.h"
+#include "ignis_seq_prefix_internal.h"
 
 #include <cuda_runtime.h>
 
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -139,17 +141,14 @@ extern "C" int32_t ignis_kv_capture_rows(const struct ignis_seq_pool *pool,
     return -1;
   }
 
-  // P4-10 (GitHub #126): `page_ids` is the sequence's OWN pages, which is its
-  // whole history only while it claims no shared prefix. A claimant's logical
-  // page 0 is the prefix's, not this allocation's, so the addressing below
-  // would read the wrong page rather than fail -- refuse instead. The fixture
-  // capture this seam exists for never shares a prefix.
-  if (seq->prefix != nullptr) {
-    set_error("ignis_kv_capture_rows: the sequence claims a shared prefix, whose pages it does "
-              "not own; capture from the publisher instead");
-    return -1;
-  }
-  const auto page_ids = seq->kv.page_ids();
+  // P4-10 (GitHub #126): the sequence's OWN pages are its whole history only
+  // while it claims no shared prefix. GitHub #622: a claimant's logical pages
+  // are the prefix chain's shared pages, then its own -- the block-table row
+  // its kernels read -- so a claimant's rows, the MTP head's at the prefix's
+  // last position among them, are read as its kernels read them.
+  std::vector<std::int32_t> page_ids = ignis_seq_prefix_chain_page_ids(seq->prefix);
+  const auto own = seq->kv.page_ids();
+  page_ids.insert(page_ids.end(), own.begin(), own.end());
   const auto *byte_base = static_cast<const unsigned char *>(plane.data);
   for (int32_t i = 0; i < row_count; ++i) {
     const std::int32_t position = first_position + i;

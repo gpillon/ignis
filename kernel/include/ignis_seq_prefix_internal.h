@@ -64,6 +64,19 @@ struct ignis_seq_prefix {
    * charged to the pool once and freed once, whichever link of the chain a
    * sequence happens to hold. */
   ninfer::PagedKVAllocation kv;
+  /* GitHub #622: on a pool built for the MTP head, a copy of the page holding
+   * the prefix's last position, which `kv` does not hold and no claimant
+   * shares. The head's entry at that position is built from the token after
+   * it, so the publisher's next step writes it, and so does every claimant's
+   * first, each from its own token: each holder of the prefix gets its own
+   * copy of this page (ignis_seq_prefix_publish gives the publisher one,
+   * ignis_seq_alloc_shared each claimant), and the page below it is the last
+   * one shared. One KV page of the pool, never bound to a row, held with the
+   * image -- a claim copies it, and nothing can claim the prefix once its
+   * handle is released (ignis_seq_prefix_release lets it go then) -- and
+   * empty (`valid()` false) on every other pool, and in a pages-only link,
+   * whose pages hold only positions every head entry of which is written. */
+  ninfer::PagedKVAllocation last;
   /* The prefix this one extends (GitHub #187), or null for one that owns
    * every page of the head it covers.
    *
@@ -103,9 +116,12 @@ struct ignis_seq_prefix {
    * rather than in the retained slot above (the snapshot path writes them
    * with a plain memcpy for the same reason). */
   ignis_seq_progress_image progress{};
-  /* Tokens of history the prefix covers, its chain included -- always
-   * `ignis_seq_prefix_total_pages * kPagedKVPageSize`, which is what makes a
-   * claimant's first write land on a page it owns. */
+  /* Tokens of history the prefix covers, its chain included -- a whole number
+   * of pages, `ignis_seq_prefix_total_pages * kPagedKVPageSize`, which is what
+   * makes a claimant's first write land on a page it owns. GitHub #622: on a
+   * pool built for the MTP head one page more than the shared ones, its last
+   * (`last`), where a claimant's first write -- the head's entry at the last
+   * position -- lands on its own copy. */
   std::uint32_t tokens = 0;
   /* Live holders: the publisher's handle, every claiming sequence, and a
    * chained child (GitHub #187) -- and a pages-only link's lender, until it
@@ -138,7 +154,7 @@ inline bool ignis_seq_prefix_belongs_to(const ignis_seq_prefix &prefix, const ig
  * This is what a claimant shares and what `ignis_seq::shared_pages` counts —
  * "how much history is warm", which the chain answers together. Who gives
  * which page back is a different question, answered by each link's own
- * pages. */
+ * pages. GitHub #622: no link's `last` page, which no claimant shares. */
 inline std::uint32_t ignis_seq_prefix_total_pages(const ignis_seq_prefix &prefix) {
   std::uint32_t pages = 0;
   for (const ignis_seq_prefix *at = &prefix; at != nullptr; at = at->parent) {

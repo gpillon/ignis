@@ -158,9 +158,9 @@ pub fn head_state(
 
 /// GitHub #621: under hq-e8-2b, `sequence`'s residual window ring words --
 /// the target's, then the MTP head's own -- as the device holds them, each
-/// comparable with [`crate::hq_ring::HqRing::words`]. A pool built for the
-/// head refuses a snapshot until the head's sections are listed (#622), so
-/// this is the read of them meanwhile.
+/// comparable with [`crate::hq_ring::HqRing::words`]: the words a snapshot
+/// carries at the end of the residual window section (#622), read without
+/// one.
 #[cfg(feature = "cuda")]
 pub fn ring_words(
     pool: &SeqPool,

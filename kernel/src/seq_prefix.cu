@@ -224,6 +224,10 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
   }
 
   const std::uint32_t pages = prefix_tokens / page_size;
+  // GitHub #622: with the MTP head the prefix's last page is every holder's
+  // own (`ignis_seq_prefix::last`), so the shared head stops a page short.
+  const std::uint32_t lag    = pool->holder_lag();
+  const std::uint32_t shares = pages - lag;
   // GitHub #187: what this sequence already shares is not its to publish, and
   // what it warmed past that is. So the entry owns `own` pages -- the ones
   // trimmed off the front of the sequence's own allocation -- and reaches
@@ -237,17 +241,21 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
         "shared or not at all");
     return -1;
   }
-  const std::uint32_t own = pages - below;
-  if (own > seq->kv.mapped_page_count()) {
+  // The pages the entry shares, and with the head the one past them it keeps
+  // a copy of: both are the sequence's own pages.
+  const std::uint32_t own = shares - below;
+  if (own + lag > seq->kv.mapped_page_count()) {
     ignis_seq_set_last_error("ignis_seq_prefix_publish: the sequence maps " +
                              std::to_string(seq->kv.mapped_page_count()) +
-                             " KV pages of its own, fewer than the " + std::to_string(own) +
+                             " KV pages of its own, fewer than the " + std::to_string(own + lag) +
                              " it would publish past the " + std::to_string(below) +
                              " it already shares");
     return -1;
   }
+  // What the sequence keeps of its reservation: with the head, its own copy
+  // of the prefix's last page first.
   const std::uint32_t tail = seq->kv.page_entitlement() - own;
-  if (tail == 0) {
+  if (tail <= lag) {
     ignis_seq_set_last_error(
         "ignis_seq_prefix_publish: the whole reservation of sequence slot " +
         std::to_string(seq->slot) + " is the prefix, leaving it no page of its own to write");
@@ -258,15 +266,33 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
     ignis_seq_set_last_error("ignis_seq_prefix_publish: " + refusal);
     return -1;
   }
+  if (lag != 0 && !pool->kv_pool.can_reserve(1)) {
+    ignis_seq_set_last_error("ignis_seq_prefix_publish: the KV pool has no page left for the copy of the "
+                             "prefix's last page, which every holder of it writes on its own under the MTP head");
+    return -1;
+  }
 
   try {
     // Fallible work first, while nothing the pool owns has moved: the
-    // capture into the retained slot. A failure here leaves the sequence and
-    // the pool exactly as they were, and the slot still free.
+    // capture into the retained slot, and with the head the copy of the
+    // prefix's last page. A failure here leaves the sequence and the pool
+    // exactly as they were, the slot still free and the copy's page back
+    // with the entry.
     auto entry           = std::make_unique<ignis_seq_prefix>();
     entry->tokens        = prefix_tokens;
     entry->image_bytes   = pool->retained_image_bytes();
-    timed([&] { ignis_seq_capture_state(*pool, *seq, retained_slot, entry->progress); });
+    if (lag != 0) {
+      entry->last = pool->kv_pool.reserve(1);
+      entry->last.materialize_pages(1);
+      entry->image_bytes += ignis_seq_checkpoint_page_bytes(*pool);
+    }
+    const std::int32_t last_page = lag != 0 ? seq->kv.page_ids()[own] : -1;
+    timed([&] {
+      ignis_seq_capture_state(*pool, *seq, retained_slot, entry->progress);
+      if (lag != 0) {
+        ignis_seq_copy_kv_page(*pool, last_page, entry->last.page_ids()[0]);
+      }
+    });
 
     // From here the steps are balanced against each other and cannot fail:
     // the tail entitlement handed back below is exactly the one re-reserved,
@@ -276,7 +302,8 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
     // The publisher has written exactly `prefix_tokens`, so every page past
     // the prefix is still the zeroed page `ignis_seq_alloc` materialized --
     // trimming them loses no history, and hands back the pages the tail
-    // reservation immediately takes.
+    // reservation immediately takes. With the head the prefix's last page
+    // goes too: its copy is in `entry->last`, and the sequence's own below.
     shared.trim_pages(own);
     shared.set_page_entitlement(own);
     entry->kv = std::move(shared);
@@ -291,8 +318,19 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
     pool->kv_pool.zero_pages(seq->kv.page_ids());
     seq->kv.bind_row(seq->slot);
     seq->prefix       = entry.get();
-    seq->shared_pages = pages;
+    seq->shared_pages = shares;
     publish_shared_row(*pool, *seq);
+    // GitHub #622: the publisher's own copy of the prefix's last page, its
+    // first own page, where its next step writes the head's entry at the
+    // last position from its own next token.
+    if (lag != 0) {
+      ignis_seq_copy_kv_page(*pool, entry->last.page_ids()[0], seq->kv.page_ids()[0]);
+      const cudaError_t err = cudaStreamSynchronize(nullptr);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaStreamSynchronize after the publisher's last page failed: ") +
+                                 cudaGetErrorString(err));
+      }
+    }
 
     entry->retained_slot                 = static_cast<std::int32_t>(retained_slot);
     pool->retained_held[retained_slot]   = true;
@@ -345,7 +383,17 @@ int32_t ignis_seq_alloc_against_prefix(struct ignis_seq_pool *pool, uint32_t con
   // What a claimant shares is the whole history, whichever link happens to
   // own each page of it.
   const std::uint32_t shared = ignis_seq_prefix_total_pages(*prefix);
-  if (total <= shared) {
+  // GitHub #622: with the MTP head a prefix claimant's first own page is its
+  // copy of the prefix's last page, and its next token lands on the page
+  // after it. (A checkpoint's claimant gets the checkpoint's tail there.)
+  const std::uint32_t copied = clone_prefix_state ? pool->holder_lag() : 0u;
+  if (copied != 0 && !prefix->last.valid()) {
+    ignis_seq_set_last_error(std::string(who) +
+                             ": the prefix holds no copy of its last page, which a claimant under the MTP head "
+                             "writes on its own");
+    return -1;
+  }
+  if (total <= shared + copied) {
     ignis_seq_set_last_error(
         std::string(who) + ": a reservation of " + std::to_string(context_tokens) + " tokens is " +
         std::to_string(total) + " pages, which the " + std::to_string(shared) +
@@ -396,8 +444,15 @@ int32_t ignis_seq_alloc_against_prefix(struct ignis_seq_pool *pool, uint32_t con
     // returns, so cloning the prefix's first would be bytes nothing reads.
     if (clone_prefix_state) {
       const auto retained = static_cast<std::uint32_t>(prefix->retained_slot);
-      prefix->last_clone_micros =
-          timed([&] { ignis_seq_clone_state(*pool, retained, prefix->progress, *seq); });
+      prefix->last_clone_micros = timed([&] {
+        ignis_seq_clone_state(*pool, retained, prefix->progress, *seq);
+        // GitHub #622: the claimant's own copy of the prefix's last page, in
+        // which its first step writes the head's entry at the last position
+        // from the claimant's own next token -- never the publisher's.
+        if (copied != 0) {
+          ignis_seq_copy_kv_page(*pool, prefix->last.page_ids()[0], seq->kv.page_ids()[0]);
+        }
+      });
       ++prefix->clone_count;
     }
 
@@ -437,6 +492,9 @@ extern "C" void ignis_seq_prefix_release(struct ignis_seq_pool *pool,
   if (pool != nullptr && prefix != nullptr && prefix->retained_slot >= 0) {
     pool->retained_held[static_cast<std::size_t>(prefix->retained_slot)] = false;
     prefix->retained_slot                                                   = -1;
+    // GitHub #622: and the copy of its last page, which only a claim and a
+    // spill of the prefix read.
+    prefix->last = ninfer::PagedKVAllocation{};
   }
   ignis_seq_prefix_drop_reference(prefix);
 }
@@ -460,7 +518,9 @@ extern "C" int32_t ignis_seq_prefix_snapshot_size(const struct ignis_seq_pool *p
     return -1;
   }
   try {
-    *out_bytes = ignis_seq_materialized_blob_bytes(*pool, ignis_seq_prefix_total_pages(*prefix));
+    // GitHub #622: with the copy of its last page under the MTP head.
+    *out_bytes = ignis_seq_materialized_blob_bytes(
+        *pool, ignis_seq_prefix_total_pages(*prefix) + (prefix->last.valid() ? 1u : 0u));
     return 0;
   } catch (const std::exception &e) {
     ignis_seq_set_last_error(std::string("ignis_seq_prefix_snapshot_size: ") + e.what());
@@ -489,17 +549,20 @@ extern "C" int32_t ignis_seq_prefix_snapshot(const struct ignis_seq_pool *pool,
     return -1;
   }
   try {
+    // GitHub #622: the shared pages, then with the MTP head the copy of the
+    // last page -- the pages the publisher stood on, as a checkpoint's blob
+    // ends with its tail.
+    const std::int32_t last_page = prefix->last.valid() ? prefix->last.page_ids()[0] : -1;
+    const std::uint32_t pages    = ignis_seq_prefix_total_pages(*prefix) + (last_page >= 0 ? 1u : 0u);
     if (window != nullptr) {
-      ignis_seq_write_materialized_window(*pool, prefix, -1,
+      ignis_seq_write_materialized_window(*pool, prefix, last_page,
                                           static_cast<std::uint32_t>(prefix->retained_slot),
-                                          prefix->progress, ignis_seq_prefix_total_pages(*prefix), dst,
-                                          dst_bytes, *window);
+                                          prefix->progress, pages, dst, dst_bytes, *window);
       return 0;
     }
-    ignis_seq_write_materialized_blob(*pool, prefix, -1,
+    ignis_seq_write_materialized_blob(*pool, prefix, last_page,
                                       static_cast<std::uint32_t>(prefix->retained_slot),
-                                      prefix->progress, ignis_seq_prefix_total_pages(*prefix), dst,
-                                      dst_bytes);
+                                      prefix->progress, pages, dst, dst_bytes);
     return 0;
   } catch (const std::exception &e) {
     ignis_seq_set_last_error(std::string("ignis_seq_prefix_snapshot: ") + e.what());
@@ -519,7 +582,7 @@ extern "C" int32_t ignis_seq_prefix_stats(const struct ignis_seq_prefix *prefix,
   // Its own pages: what comes back to the pool when this entry drops. A
   // chained entry's ancestors give theirs back separately (GitHub #187), and
   // `tokens` is what the head as a whole covers.
-  out_stats->pages             = prefix->kv.mapped_page_count();
+  out_stats->pages             = prefix->kv.mapped_page_count() + prefix->last.mapped_page_count();
   out_stats->refcount          = prefix->refcount;
   out_stats->clone_image_bytes = prefix->retained_slot >= 0 ? prefix->image_bytes : 0;
   out_stats->clone_count       = prefix->clone_count;

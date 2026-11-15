@@ -858,6 +858,13 @@ add_test(NAME ignis_kernel_seq_pool_layers_test COMMAND ignis_kernel_seq_pool_la
 add_executable(ignis_kernel_seq_flash_next_sections_test test_seq_flash_next_sections.cpp)
 target_link_libraries(ignis_kernel_seq_flash_next_sections_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_seq_flash_next_sections_test COMMAND ignis_kernel_seq_flash_next_sections_test)
+# GitHub #622: a pool built for the 27B MTP head carries the head's state --
+# its layer in the pages and the hq window, its ring words, the continuation
+# hidden -- through snapshot, restore, prefix and checkpoint, every holder of
+# a prefix's or checkpoint's last page holding its own copy. GPU (ADR 0006).
+add_executable(ignis_kernel_seq_mtp_sections_test test_seq_mtp_sections.cpp)
+target_link_libraries(ignis_kernel_seq_mtp_sections_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_seq_mtp_sections_test COMMAND ignis_kernel_seq_mtp_sections_test)
 # The Flash-Next binder (kernel/src/flash_next/bind.cu) at the real 48-layer
 # schema: binds, places, refuses by name. Host-only.
 add_executable(ignis_kernel_flash_next_bind_test test_flash_next_bind.cpp)

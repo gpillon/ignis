@@ -1152,6 +1152,52 @@ fn the_retained_pool_holds_the_identity_the_backend_reports() {
     );
 }
 
+/// GitHub #622: retained state belongs to one drafter. A checkpoint taken by
+/// a DFlash2 load or by one with no drafter is refused by an MTP load, and an
+/// MTP load's by both, by name -- the drafter -- and the turn after it is
+/// prefilled again from its first token, standing on nothing.
+#[test]
+fn a_checkpoint_of_one_drafter_is_refused_by_the_others_and_the_turn_is_prefilled_again() {
+    let of = |backend: Option<SpeculativeBackend>| {
+        BlobIdentity::of_load(
+            ArtifactHash::from_bytes([7; 32]),
+            KvFormat::Bf16,
+            backend.map(|b| Speculation::new(b, 7).unwrap()),
+            5,
+        )
+    };
+    let mtp = Some(SpeculativeBackend::Mtp);
+    for (taken, refusing) in [
+        (Some(SpeculativeBackend::Dflash2), mtp),
+        (None, mtp),
+        (mtp, Some(SpeculativeBackend::Dflash2)),
+        (mtp, None),
+    ] {
+        let mut sched = scheduler(Arc::new(MockCompute::with_blob_identity(of(taken))), config());
+        sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+        run_to_idle(&mut sched);
+        let header = sched.checkpoint_pool().entries().first().expect("turn N left a checkpoint").header();
+
+        let other_compute = Arc::new(MockCompute::with_blob_identity(of(refusing)));
+        let mut other = scheduler(other_compute.clone(), config());
+        let refused = other.checkpoint_pool().accepts(&header).expect_err("another drafter's checkpoint");
+        assert_eq!(refused.field, IdentityField::Drafter, "{taken:?} on {refusing:?}: {refused}");
+        assert!(refused.to_string().starts_with("retained state refused: drafter is "), "{refused}");
+        let later = other.submit(turn_n_plus_1(), RequestClass::Interactive).unwrap();
+        let events = run_to_idle(&mut other);
+        assert!(reuses(&events, later).is_empty(), "{taken:?} on {refusing:?}: nothing to stand on");
+        assert_eq!(
+            chunk_widths(&other_compute, later).iter().sum::<usize>(),
+            60,
+            "{taken:?} on {refusing:?}: every token of the prompt was prefilled again"
+        );
+
+        // A load of the drafter that took it stands on it.
+        let own = scheduler(Arc::new(MockCompute::with_blob_identity(of(taken))), config());
+        assert_eq!(own.checkpoint_pool().accepts(&header), Ok(()), "{taken:?} accepts its own");
+    }
+}
+
 #[test]
 fn a_spilled_checkpoint_returns_its_pages_to_the_pool() {
     let compute = Arc::new(MockCompute::with_sections(crate::sections()));
