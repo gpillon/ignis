@@ -227,7 +227,7 @@ use ignis_core::compute::ModelFamily;
 pub const DEFAULT_VRAM_HEADROOM_BYTES: u64 = 1536 * 1024 * 1024;
 pub use ignis_core::{MAX_DRAFT_TOKENS, ProposalHead, ProposalHeadSetting, Speculation, SpeculativeBackend};
 use ignis_core::{DraftRule, DrafterSampling};
-use ignis_core::speculation::FLASH_NEXT_DEFAULT_DRAFT_TOKENS;
+use ignis_core::speculation::{FLASH_NEXT_DEFAULT_DRAFT_TOKENS, QWEN38_MTP_DEFAULT_DRAFT_TOKENS};
 
 pub use ignis_core::{MAX_YARN_FACTOR, RopeScaling};
 pub use ignis_core::{DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, Vision, VisionResidency};
@@ -1132,7 +1132,7 @@ fn refuse_for_family(patch: &source::Layer, family: ModelFamily) -> Result<(), C
         }
         if (meta.group, meta.name) == ("spec", "backend") {
             if let Ok(SpecChoice::Backend(backend)) = <kind::SpecBackend as kind::FieldKind>::parse(raw) {
-                if Some(backend) != family.drafter() {
+                if !family.drafts_with(backend) {
                     return Err(ConfigError(format!(
                         "`{} {}`: {} {}",
                         candidate.spelling,
@@ -1147,12 +1147,13 @@ fn refuse_for_family(patch: &source::Layer, family: ModelFamily) -> Result<(), C
     Ok(())
 }
 
-/// How a refusal says what `family` drafts with: its backend, or that it has
-/// none (the image model decodes no tokens).
+/// How a refusal says what `family` drafts with: its backends (the 27B's
+/// two since GitHub #623), or that it has none (the image model decodes no
+/// tokens).
 fn drafts_with(family: ModelFamily) -> String {
-    match family.drafter() {
-        Some(backend) => format!("drafts with {}", backend.as_str()),
-        None => "has no drafter".to_owned(),
+    match family.drafters() {
+        [] => "has no drafter".to_owned(),
+        backends => format!("drafts with {}", backends.iter().map(|b| b.as_str()).collect::<Vec<_>>().join(" or ")),
     }
 }
 
@@ -1278,7 +1279,7 @@ fn derive(
         )));
     }
 
-    let (speculation, speculation_off) = derive_speculation(&resolution, &spelled)?;
+    let (speculation, speculation_off) = derive_speculation(&resolution, family, &spelled)?;
     let vision = derive_vision(&resolution, sources, family, &spelled)?;
     let media = derive_media(&resolution, sources, family, vision.is_some())?;
 
@@ -1316,7 +1317,7 @@ fn derive(
     let mut model = s.model.id.clone().unwrap_or_else(|| DEFAULT_MODEL.to_owned());
     let mut speculation = speculation;
     if let (true, Some(family)) = (family_checks, family) {
-        let fitted = FamilyFit { model: &mut model, speculation: &mut speculation, dropped: &mut dropped };
+        let fitted = FamilyFit { model: &mut model, speculation: &mut speculation, vision: vision.is_some(), dropped: &mut dropped };
         fit_family(fitted, &resolution, family, fit, &spelled)?;
     }
     let rope_scaling = s.model.rope_scaling.resolve(s.model.max_context).map_err(|e| {
@@ -1477,10 +1478,12 @@ pub fn log_source(config: &Config) {
 }
 
 /// The values [`fit_family`] may change: the served id, the speculation a
-/// switch drops, and the list of what it dropped.
+/// switch drops, and the list of what it dropped; and whether the load has
+/// vision, which the 27B's MTP head does not draft beside yet (GitHub #623).
 struct FamilyFit<'a> {
     model: &'a mut String,
     speculation: &'a mut Option<Speculation>,
+    vision: bool,
     dropped: &'a mut Vec<String>,
 }
 
@@ -1667,8 +1670,15 @@ fn derive_diarizer(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> Str
 /// GitHub #576 (ADR 0090): `--spec-draft-rule` and the drafter's two
 /// settings ride the speculation the same way; Flash-Next refuses them by
 /// their scope (the 27B's alone) before this runs.
+///
+/// GitHub #623: `mtp` on the 27B (`family`) takes its own default window,
+/// and a window of 0 there is a load with no speculation, the one `off`
+/// makes. What else only the family decides -- Flash-Next's head refusing 0,
+/// the 27B's MTP load refusing DFlash2's own settings and vision -- is
+/// [`fit_family`]'s, which runs only for the artifact that loads.
 fn derive_speculation(
     resolution: &Resolution,
+    family: Option<ModelFamily>,
     spelled: &impl Fn(&str, &str) -> String,
 ) -> Result<(Option<Speculation>, bool), ConfigError> {
     let s = &resolution.settings.spec;
@@ -1719,12 +1729,19 @@ fn derive_speculation(
     let head = s.draft_head.map_or(ProposalHead::Full, |setting| setting.resolve());
     if backend == SpeculativeBackend::Mtp && head != ProposalHead::Full {
         return Err(ConfigError(format!(
-            "`{}`: `--spec-backend mtp` has no proposal head to choose",
-            spelled("spec", "draft_head")
+            "`{} {}`: `--spec-backend mtp` has no proposal head to choose (the shortlist is DFlash2's)",
+            spelled("spec", "draft_head"),
+            head.as_str()
         )));
     }
-    let tokens = match s.draft_tokens {
+    // GitHub #623: the 27B's MTP window is the operator's, or a profile's that
+    // chose MTP too; the window a profile gives beside its own DFlash2 (every
+    // built-in profile's 7) is that drafter's, not the head's.
+    let the_27bs_mtp = backend == SpeculativeBackend::Mtp && family == Some(ModelFamily::Qwen38_27b);
+    let window = s.draft_tokens.filter(|_| !the_27bs_mtp || mtp_window_given(resolution));
+    let tokens = match window {
         Some(tokens) => tokens,
+        None if the_27bs_mtp => QWEN38_MTP_DEFAULT_DRAFT_TOKENS,
         // GitHub #307: Flash-Next's head has a measured default window.
         None if backend == SpeculativeBackend::Mtp => FLASH_NEXT_DEFAULT_DRAFT_TOKENS,
         None => {
@@ -1735,17 +1752,72 @@ fn derive_speculation(
             )));
         }
     };
+    // GitHub #623: a window of 0 is the 27B's MTP head drafting nothing, a
+    // load with no speculation (`fit_family` refuses it on Flash-Next's
+    // head). DFlash2 drafts 1 to 7 a round on every model.
+    if tokens == 0 {
+        if backend != SpeculativeBackend::Mtp {
+            return Err(ConfigError(format!(
+                "`{} 0`: `--spec-backend {}` drafts 1..={MAX_DRAFT_TOKENS} tokens a round (a window of 0 is the 27B's                  MTP head's, which then loads no speculation)",
+                spelled("spec", "draft_tokens"),
+                backend.as_str()
+            )));
+        }
+        return Ok((None, true));
+    }
     let speculation = Speculation::new(backend, tokens)
         .map_err(|_| ConfigError(format!("`{}` must be in 1..={MAX_DRAFT_TOKENS}, got {tokens}", spelled("spec", "draft_tokens"))))?;
     let drafter = DrafterSampling {
         temperature_factor_milli: s.drafter_temperature_factor,
         top_p_milli: s.drafter_top_p,
     };
-    // The rule's default is the 27B's: Flash-Next's MTP head drafts one rule
-    // only, and a value other than the default named there was refused by its
-    // scope before this ran.
+    // The rule's default is the 27B's: an MTP head drafts one rule only, the
+    // fixed draft. A value other than the default named there was refused by
+    // its scope before this ran (Flash-Next), or is refused by name where the
+    // family is fitted (the 27B, GitHub #623).
     let rule = if backend == SpeculativeBackend::Mtp { DraftRule::Fixed } else { s.draft_rule };
     Ok((Some(speculation.with_proposal_head(head).with_draft_rule(rule, drafter)), false))
+}
+
+/// Whether the 27B's MTP load takes the window `resolution` resolved
+/// (GitHub #623): one the operator named, or a profile's when the profile
+/// chose the backend too. A profile's window beside a backend the operator
+/// named is the profile's own drafter's.
+fn mtp_window_given(resolution: &Resolution) -> bool {
+    let source = |name: &str| resolution.origin("spec", name).map(|origin| origin.source);
+    match source("draft_tokens") {
+        Some(source::Source::Profile) => source("backend") == Some(source::Source::Profile),
+        Some(given) => given.explicit(),
+        None => false,
+    }
+}
+
+/// GitHub #623: on the 27B's MTP load, DFlash2's own sampling settings
+/// refused by name where the operator named them
+/// ([`Resolution::named_by_operator`]): the sampled draft, and the drafter's
+/// temperature factor and top-p, which only the sampled draft reads. The head
+/// drafts the fixed draft, which `--spec-draft-rule fixed` names harmlessly;
+/// a default in force (the sampled draft is the 27B's since GitHub #578)
+/// refuses nothing. The shortlist head is refused where the speculation is
+/// built ([`derive_speculation`]), on either model's head.
+fn refuse_dflash2s_settings_under_mtp(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> String) -> Result<(), ConfigError> {
+    let s = &resolution.settings.spec;
+    let named = |name: &str| resolution.named_by_operator("spec", name);
+    let refused = [
+        ("draft_rule", (s.draft_rule == DraftRule::Sampled && named("draft_rule")).then(|| s.draft_rule.as_str().to_owned()), "the sampled draft"),
+        ("drafter_temperature_factor", named("drafter_temperature_factor").then(|| decimal_text(s.drafter_temperature_factor)), "the drafter temperature factor"),
+        ("drafter_top_p", named("drafter_top_p").then(|| decimal_text(s.drafter_top_p)), "the drafter top-p"),
+    ];
+    for (name, value, what) in refused {
+        if let Some(value) = value {
+            return Err(ConfigError(format!(
+                "`{} {value}`: {what} is DFlash2's, and the 27B's MTP head (`{} mtp`) drafts the fixed draft only",
+                spelled("spec", name),
+                spelled("spec", "backend")
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A decimal field's value as its flag would spell it (thousandths to `0.9`):
@@ -1912,9 +1984,17 @@ pub fn log_vision_options(config: &Config) {
 
 /// What an artifact's family decides about a config (spec flash-next/04),
 /// once the per-field applicability has been applied by the resolver: the
-/// id the load is served under, whether the named backend is this family's
-/// drafter, and — Flash-Next attends with its own QSA, not the GQA op — the
-/// 27B's attention envelope (GitHub #228).
+/// id the load is served under, whether the named backend is one this family
+/// drafts with, and — Flash-Next attends with its own QSA, not the GQA op —
+/// the 27B's attention envelope (GitHub #228).
+///
+/// GitHub #623: what `mtp` takes differs by model, and a value named for the
+/// model that loads is judged as it is named, on a switch as at start (a
+/// bound, not a drop): Flash-Next's head drafts 1 to 7 tokens, so a window of
+/// 0, the 27B's no-speculation load, is refused there; the 27B's MTP load
+/// refuses DFlash2's own settings where the operator named them, and, until
+/// the head drafts beside images (GitHub #624), vision on, wherever vision
+/// came from (a profile, a switch's carry, the operator).
 fn fit_family(
     fitted: FamilyFit<'_>,
     resolution: &Resolution,
@@ -1934,7 +2014,7 @@ fn fit_family(
         Some(_) => {}
         None => *fitted.model = family.model_id().to_owned(),
     }
-    if let Some(speculation) = fitted.speculation.filter(|s| Some(s.backend()) != family.drafter()) {
+    if let Some(speculation) = fitted.speculation.filter(|s| !family.drafts_with(s.backend())) {
         if fit == Fit::Start {
             return Err(ConfigError(format!(
                 "`{} {}`: {} {}",
@@ -1950,6 +2030,31 @@ fn fit_family(
             if resolution.explicit("spec", name) {
                 fitted.dropped.push(schema::field("spec", name).expect("declared").flag());
             }
+        }
+    }
+    if s.spec.backend == Some(SpecChoice::Backend(SpeculativeBackend::Mtp)) {
+        match family {
+            ModelFamily::FlashNext if s.spec.draft_tokens == Some(0) => {
+                return Err(ConfigError(format!(
+                    "`{} 0`: {}'s MTP head drafts 1..={MAX_DRAFT_TOKENS} tokens a round; a window of 0 is the                      27B's MTP load with no speculation (`{} 0` names it for the 27B alone)",
+                    spelled("spec", "draft_tokens"),
+                    family.name(),
+                    schema::field("spec", "draft_tokens").expect("declared").scoped_flag(ModelFamily::Qwen38_27b)
+                )));
+            }
+            ModelFamily::Qwen38_27b => {
+                refuse_dflash2s_settings_under_mtp(resolution, spelled)?;
+                // GitHub #623: one predicate, for #624 to take out.
+                if fitted.vision && fitted.speculation.is_some() {
+                    return Err(ConfigError(format!(
+                        "`{} mtp`: the 27B's MTP head does not draft beside vision yet, and vision is on for it                          (`{}`): turn it off for the 27B with `{} false`",
+                        spelled("spec", "backend"),
+                        spelled("vision", "enabled"),
+                        schema::field("vision", "enabled").expect("declared").scoped_flag(ModelFamily::Qwen38_27b)
+                    )));
+                }
+            }
+            _ => {}
         }
     }
     let (max_context, kv_format) = (s.model.max_context, s.model.kv_format);

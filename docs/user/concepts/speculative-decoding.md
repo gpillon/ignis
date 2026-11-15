@@ -1,6 +1,6 @@
 ---
 title: "Speculative decoding"
-description: "How DFlash2 and Flash-Next's MTP head draft tokens that the model then verifies, what acceptance means, how a draft is accepted under sampling, how the row budget is shared across lanes, and why MTP is off on the RTX 5090."
+description: "How DFlash2 and the MTP heads draft tokens that the model then verifies, the 27B's two drafters and how to choose, what acceptance means, how a draft is accepted under sampling, how the row budget is shared across lanes, and why Flash-Next's MTP is off on the RTX 5090."
 sidebar:
   order: 5
 ---
@@ -80,6 +80,33 @@ under `sampled`, the default, that text is not the one the same seed gives under
 same, a seed's text is not. Neither rule changes what a stop sequence, the
 reasoning budget or a JSON schema does to the run the round commits.
 
+## The 27B's two drafters
+
+From 0.11.0 the 27B drafts with **DFlash2** or with its own **MTP head**, one
+per load, chosen at start with `--spec-backend`; earlier releases refuse
+`--spec-backend mtp` on the 27B. DFlash2 is the default: every built-in
+profile loads it, at 7 draft tokens. MTP is opt-in (`--spec-backend mtp`), for
+the card where DFlash2's memory is what the context lacks. Both are verified
+by the same rounds, so neither changes the text: greedy output is the
+spec-off text up to near-ties, and sampling keeps its distribution.
+
+| | DFlash2 | MTP head |
+|---|---|---|
+| What it is | a second small model, five layers over a window of the last 2,048 positions | the checkpoint's own draft layer, one attention layer over the whole context |
+| Weights | 1.08 GB, its own | 0.45 GB; it reads the target's embedding and output head |
+| State per lane and retained slot | a drafter window of 40 MiB | one vector of the model's hidden size, about 10 KB |
+| KV pool | unchanged | one more attention layer in every page: 17/16 of the page, so about 6% fewer tokens for the same bytes |
+| Prefill | scratch for its taps in every chunk | the head runs over every prompt position, and every column the head reads is normalized |
+| A shared prefix | shared as on any load | each holder keeps its own copy of the prefix's last page, which the VRAM plan holds beside the context |
+| Draft rule | the sampled draft (default) or the fixed draft | the fixed draft only |
+| Draft tokens | 1 to 7, required | 0 to 7, default 7; 0 loads no speculation |
+| Images | drafts after them | not yet: an MTP load refuses vision on |
+
+What the choice moves is how the card's memory splits between the drafter and
+the KV pool, how much a prefill and a round cost, and how many tokens a round
+yields; a request's text is the model's under either. Changing the drafter is
+a reload ([the VRAM plan](vram-plan.md) shows each one's lines).
+
 ## DFlash2, for the 27B
 
 DFlash2 is a small drafter grafted into the 27B's artifact: five layers that
@@ -114,6 +141,55 @@ taken at the opener already carries the window as it stood there.
 - **Variants.** The abliterated 27B uses the same drafter. It was fitted to the
   default weights, and since the target verifies every draft, a mismatch lowers
   acceptance and nothing else.
+
+## MTP, for the 27B
+
+Every 27B artifact carries the checkpoint's own **multi-token-prediction
+head**: one gated attention layer and an MLP that take the model's hidden
+state at a position and the token after it, and draft the token after that,
+scored by the model's own output head. `--spec-backend mtp` loads it as the
+27B's drafter, on every 27B artifact (NVFP4, the abliterated one, the 16 GB
+one), in place of DFlash2. A round chains the head: each draft feeds the next
+one, up to the draft window.
+
+- **The draft window.** `--spec-draft-tokens` 0 to 7, fixed for the life of
+  the load; 7 when unnamed, a provisional default the measurement of the two
+  drafters will set. A window of 0 loads no speculation: the same load as
+  `--spec-backend off`, with nothing of the head bound and the same VRAM plan.
+  A window a profile gives beside its own DFlash2 (every built-in profile's 7)
+  is DFlash2's: `--spec-backend mtp` over it takes the head's own default.
+- **What it saves.** DFlash2's weights, its 40 MiB window in every lane and
+  every retained slot, its round's scratch and the taps in every prefill chunk.
+  The head's own weights are about 0.45 GB.
+- **What it costs.** Its attention state spans the whole context, as the head
+  was trained: one more attention layer in every KV page, so the same bytes
+  hold about 6% fewer tokens. Each sequence keeps one more vector, the model's
+  last hidden state, so that its next step can build the head's row. Under
+  `hq-e8-2b` the head's layer takes its share of the residual window. A
+  prefill runs the head over every position of the prompt. Each holder of a
+  shared prefix (the request that published it and every request that claims
+  it) keeps its own copy of the prefix's last page, because the head's row at
+  the prefix's last position is built from each holder's own next token; the
+  VRAM plan holds a page a lane and a page a retained slot for those copies
+  beside one context, and admission never hands them out
+  ([the VRAM plan](vram-plan.md)).
+- **One rule.** The head drafts the fixed draft at every temperature: a
+  request that samples takes each draft with the model's probability of it.
+  DFlash2's own settings are refused by name on an MTP load: the shortlist
+  head, `--spec-draft-rule sampled`, and the drafter's temperature factor and
+  top-p ([context, KV and speculation](../configuration/context-and-speculation.md)).
+- **No images yet.** Every built-in profile turns the 27B's vision on, and the
+  head does not draft after an image yet, so an MTP start with vision on is
+  refused, naming where vision came from and
+  `--qwen38-vision-enabled false`, which turns it off for the 27B alone; a
+  model switch to the 27B with vision on is refused the same way.
+- **Everything else is a DFlash2 load's.** Prompt reuse, retained slots,
+  KV-RAM and KV-disk carry the head's state with the sequence, and a blob
+  written by one drafter is refused by another, by name, and prefilled again.
+  The load's log names the drafter and the window in `ignis.model.loaded`'s
+  `speculation` (`mtp draft_tokens=7`, or `off (mtp draft_tokens=0)`); the
+  request log's `spec.*` fields and the `ignis_speculative_*` counters mean
+  what they mean under DFlash2.
 
 ## MTP, for Flash-Next
 
@@ -186,7 +262,7 @@ turns, four agents generated 1.21 times the tokens and eight 1.05 times
 
 ## Where the knobs are
 
-`--spec-backend`, `--spec-draft-tokens`, `--spec-draft-rows`,
+`--spec-backend` (the 27B's `dflash2` or `mtp`, Flash-Next's `mtp`), `--spec-draft-tokens`, `--spec-draft-rows`,
 `--spec-draft-head`, `--spec-draft-rule` and the sampled draft's
 `--spec-drafter-temperature-factor` and `--spec-drafter-top-p` are in
 [context, KV and speculation](../configuration/context-and-speculation.md);

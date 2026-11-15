@@ -35,6 +35,18 @@ start):
 `--vram-kv-pool-bytes` replaces either size. On a resident load it becomes the pool
 and the rest of the budget stays unused.
 
+**The 27B's MTP head** (`--spec-backend mtp`, from 0.11.0) changes the 27B's pool twice.
+Its attention state is one more layer in every page, so a page holds the same
+64 tokens in 17/16 of the bytes and the same budget buys about 6% fewer tokens
+(DFlash2 keeps its own state outside the pool, in 40 MiB a lane and a retained
+slot that the head does not take). And every holder of a shared prefix keeps
+its own copy of the prefix's last page, so the floor holds a page a lane and a
+page a retained slot more: one `--model-max-context` sequence, a page per
+retained slot, and those (`kv_holder_pages` in the plan event). Requests are
+admitted against the pool less them, so `kv_pool_pages` and `kv_pool_tokens`
+are that many pages more than a request can reserve
+([the 27B's two drafters](../concepts/speculative-decoding.md#the-27bs-two-drafters)).
+
 A request reserves its prompt plus its cap when it is admitted: its
 `max_tokens`, or `--model-default-max-tokens`. When a request cannot fit, a
 lower-ranked sequence (an `agent` one, for an `interactive` request) moves to

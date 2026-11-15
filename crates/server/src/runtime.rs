@@ -601,6 +601,9 @@ pub fn log_vram_plan(
                 kv_pool_policy = plan.kv_pool_policy.as_str(),
                 kv_pool_pages = plan.kv_page_count,
                 kv_pool_tokens = plan.kv_token_capacity(),
+                // GitHub #623: of the pool's pages, those admission keeps back
+                // for the MTP head's holders (0 on every other load).
+                kv_holder_pages = plan.holder_pages,
                 total_bytes = plan.total_bytes,
                 allocated_at_load_bytes = plan.total_bytes,
                 oversubscribed = plan.oversubscribed,
@@ -1153,6 +1156,32 @@ pub(crate) fn model_scope_27b(shape: &EngineShape) -> ignis_artifact::ModelScope
     ignis_core::model_load::model_scope(shape.speculation, shape.vision, shape.exception_weights)
 }
 
+/// The pages a 27B load of `shape` with `slot_count` lanes keeps back from
+/// admission beside the scheduler's ledger (GitHub #622) and its VRAM plan
+/// holds beside its floor (GitHub #623): on the MTP head's pool, where every
+/// holder of a frontier keeps its own copy of the frontier's last page, one a
+/// lane and one a retained slot; none on any other.
+///
+/// Why that bounds the leaf: the ledger charges a prefix its whole pages and
+/// each holder the pages past them, as on every pool. What the leaf holds
+/// beyond that is one copy per holder of a prefix's last page or of a
+/// checkpoint's page on a page boundary. A live sequence holds at most one
+/// copy (the one frontier it continues from), and a lane holds one live
+/// sequence; a retained slot holds one image, a prefix's or a checkpoint's,
+/// with at most one copy, gone with it; the prefix's own last page, as
+/// charged, covers one holder's. So the leaf holds at most the ledger plus
+/// `slot_count + retained` pages, and a ledger admission keeps within the
+/// pool less those never asks the leaf for a page it does not have.
+#[cfg(feature = "cuda")]
+fn holder_pages_27b(shape: &EngineShape, slot_count: u32) -> u32 {
+    ignis_core::seq::holder_page_reserve(
+        &ignis_core::compute::ModelConfig::qwen38_27b(),
+        shape.speculation.map(|s| s.backend()),
+        slot_count,
+        shape.retained_slots(),
+    )
+}
+
 /// A scope the binder bound, with its plan and handles.
 #[cfg(feature = "cuda")]
 struct BoundScope {
@@ -1249,6 +1278,9 @@ pub fn qwen27b_load(
             max_context_tokens: shape.max_context,
             // Every retained slot keeps one tail page, whichever kind it is.
             retained_slots: shape.retained_slots(),
+            // GitHub #623: and the pages admission keeps back for the MTP
+            // head's holders (below), so it still holds one context.
+            holder_pages: holder_pages_27b(&shape, planning.slot_count),
             kv_pool: shape.kv_pool,
             // ADR 0045: every weight is a line, so the pool takes the rest.
             residency: ignis_core::Residency::Resident,
@@ -1383,15 +1415,12 @@ pub fn qwen27b_load(
     .map_err(|e| e.to_string())?;
     let capacity_pages = kv_pool.block_count() as u32;
     // GitHub #622: admission keeps back the pages an MTP pool's holders copy
-    // past the ledger -- none under any other drafter.
+    // past the ledger -- none under any other drafter. The plan held them
+    // beside its floor (GitHub #623), so admission still holds one context
+    // and the retained slots' pages.
     let dense = ignis_core::compute::ModelConfig::qwen38_27b();
     let drafter = shape.speculation.map(|s| s.backend());
-    let admission_pages = capacity_pages.saturating_sub(ignis_core::seq::holder_page_reserve(
-        &dense,
-        drafter,
-        leaf_config.slot_count,
-        shape.retained_slots(),
-    ));
+    let admission_pages = capacity_pages.saturating_sub(holder_pages_27b(&shape, leaf_config.slot_count));
 
     // GitHub #210: the same for every reservation the plan laid out -- the
     // leaf's buffers, read back, must be the plan's lines, or the plan no
@@ -1666,6 +1695,7 @@ pub(crate) fn flash_next_load(
         kv_page_bytes: config.paged_sections(shape.kv_format).bytes_per_token() * u64::from(KV_PAGE_TOKENS),
         max_context_tokens: shape.max_context,
         retained_slots: options.retained_slots(),
+        holder_pages: 0,
         kv_pool: shape.kv_pool,
         residency: ignis_core::Residency::Experts(ignis_core::ExpertResidency {
             expert_pool_bytes: cat.total_bytes(),
@@ -3010,6 +3040,7 @@ mod tests {
             kv_page_bytes: page_bytes,
             max_context_tokens: 262_144,
             retained_slots: EngineShape::default().retained_slots(),
+            holder_pages: 0,
             kv_pool: None,
             residency: ignis_core::Residency::Resident,
             embedding_pool_named: false,
@@ -3152,6 +3183,7 @@ mod tests {
                 kv_page_bytes: PAGE,
                 max_context_tokens: 262_144,
                 retained_slots: 8,
+                holder_pages: 0,
                 kv_pool: None,
                 residency: ignis_core::Residency::Experts(ignis_core::ExpertResidency {
                     expert_pool_bytes: 37 << 30,
@@ -3265,6 +3297,7 @@ mod tests {
                     kv_page_bytes: PAGE,
                     max_context_tokens: shape.max_context,
                     retained_slots: 8,
+                    holder_pages: 0,
                     kv_pool: shape.kv_pool,
                     residency: ignis_core::Residency::Experts(ignis_core::ExpertResidency {
                         expert_pool_bytes: 37 << 30,

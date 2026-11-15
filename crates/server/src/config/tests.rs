@@ -8,8 +8,9 @@ use crate::instruction::{DeveloperMessagePolicy, SystemMessagePolicy};
 use crate::thinking::ReasoningEffort;
 use ignis_core::compute::ModelFamily;
 use ignis_core::speculation::{
-    FLASH_NEXT_DEFAULT_DRAFT_TOKENS, FLASH_NEXT_DEFAULT_VERIFY_ROWS, FLASH_NEXT_MAX_VERIFY_ROWS,
+    FLASH_NEXT_DEFAULT_DRAFT_TOKENS, FLASH_NEXT_DEFAULT_VERIFY_ROWS, FLASH_NEXT_MAX_VERIFY_ROWS, QWEN38_MTP_DEFAULT_DRAFT_TOKENS,
 };
+use ignis_core::{DraftRule, DrafterSampling};
 
 fn no_env(_: &str) -> Option<String> {
     None
@@ -1742,7 +1743,10 @@ fn a_draft_window_outside_1_to_7_is_refused_naming_the_flag_and_the_value() {
         let err = refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", raw]);
         assert!(err.contains("--spec-draft-tokens") && err.contains(raw), "{err}");
     }
-    assert!(refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "8"]).contains("1..=7"));
+    // GitHub #623: the field takes 0..=7 (the 27B's MTP window of 0), and
+    // DFlash2 refuses 0 by name.
+    assert!(refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "8"]).contains("0..=7"));
+    assert!(refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "0"]).contains("1..=7"));
 }
 
 #[test]
@@ -1912,6 +1916,192 @@ fn mtp_takes_no_proposal_head_and_spec_off_takes_no_draft_options() {
     assert!(config(&["--spec-backend", "off"]).speculation.is_none());
 }
 
+// ── the 27B's MTP head (spec #618, GitHub #623) ──────────────────────────
+
+/// The 27B fitted from `flags`, its own vision off unless they say otherwise
+/// (every built-in profile turns it on, and the head does not draft beside it
+/// yet).
+fn the_27b_mtp(flags: &[&str]) -> Result<Config, ConfigError> {
+    let mut all = vec!["--qwen38-vision-enabled", "false"];
+    all.extend_from_slice(flags);
+    config(&all).for_family(ModelFamily::Qwen38_27b)
+}
+
+fn mtp(window: u32) -> Speculation {
+    Speculation::new(SpeculativeBackend::Mtp, window).unwrap().with_draft_rule(DraftRule::Fixed, DrafterSampling::default())
+}
+
+/// AC 1, 2: the 27B takes `mtp` at a window of 0 to 7, 7 when none is named
+/// (the provisional default #628 sets), the fixed draft its one rule; a
+/// window of 0 is the load `off` makes, the same engine shape to the field,
+/// so the same scope, plan and pool. Before an artifact names its model the
+/// window is still Flash-Next's default (`spec_mtp_spec_off_and_draft_rows_parse`).
+#[test]
+fn the_27b_takes_mtp_at_a_window_of_0_to_7_and_7_unnamed() {
+    use crate::runtime::EngineShape;
+    let default = the_27b_mtp(&["--spec-backend", "mtp"]).unwrap();
+    assert_eq!(QWEN38_MTP_DEFAULT_DRAFT_TOKENS, 7);
+    assert_eq!(default.speculation, Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)));
+    assert!(!default.speculation_off);
+    for window in 1..=7u32 {
+        let named = the_27b_mtp(&["--spec-backend", "mtp", "--spec-draft-tokens", &window.to_string()]).unwrap();
+        assert_eq!(named.speculation, Some(mtp(window)), "window {window}");
+    }
+    let zero = the_27b_mtp(&["--spec-backend", "mtp", "--spec-draft-tokens", "0"]).unwrap();
+    let off = the_27b_mtp(&["--spec-backend", "off"]).unwrap();
+    assert!(zero.speculation.is_none() && zero.speculation_off, "a window of 0 loads no speculation");
+    assert_eq!(EngineShape::from(&zero), EngineShape::from(&off), "the window of 0 is the load off makes");
+    let env = env_map(&[("IGNIS_SPEC_BACKEND", "mtp"), ("IGNIS_SPEC_DRAFT_TOKENS", "0"), ("IGNIS_QWEN38_VISION_ENABLED", "false")]);
+    let by_env = expect_config(resolve(&[], env).expect("resolve")).for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert_eq!(EngineShape::from(&by_env), EngineShape::from(&off), "by env var too");
+    let err = refused(&["--spec-backend", "mtp", "--spec-draft-tokens", "8"]);
+    assert!(err.contains("--spec-draft-tokens") && err.contains("0..=7"), "{err}");
+}
+
+/// AC 1: the window a profile gives beside its own DFlash2 (every built-in
+/// profile's 7) is that drafter's: `mtp` named over it takes the head's own
+/// default. A profile that chose `mtp` keeps its window, and a named window
+/// is the operator's whatever the profile says.
+#[test]
+fn a_profiles_dflash2_window_is_not_the_27bs_mtp_window() {
+    let files = MemFiles::with(&[(
+        "c.yaml",
+        "profiles:\n  drafts:\n    spec:\n      qwen38: { backend: dflash2, draft_tokens: 5 }\n  heads:\n    spec:\n      qwen38: { backend: mtp, draft_tokens: 5 }\n",
+    )]);
+    let under = |flags: &[&str]| {
+        let mut all = vec!["--config", "c.yaml", "--qwen38-vision-enabled", "false"];
+        all.extend_from_slice(flags);
+        with_files(&all, no_env, &files).unwrap().for_family(ModelFamily::Qwen38_27b).unwrap().speculation
+    };
+    let dflash2 = |window| {
+        Speculation::new(SpeculativeBackend::Dflash2, window).unwrap().with_draft_rule(DraftRule::Sampled, DrafterSampling::default())
+    };
+    assert_eq!(under(&["--profile", "drafts"]), Some(dflash2(5)), "the profile's own drafter at its window");
+    assert_eq!(under(&["--profile", "drafts", "--spec-backend", "mtp"]), Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)));
+    assert_eq!(under(&["--profile", "drafts", "--spec-backend", "mtp", "--spec-draft-tokens", "3"]), Some(mtp(3)));
+    assert_eq!(under(&["--profile", "heads"]), Some(mtp(5)), "a profile that chose the head keeps its window");
+    assert_eq!(under(&["--profile", "rtx5090", "--spec-backend", "mtp"]), Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)));
+}
+
+/// AC 1: Flash-Next's head drafts 1 to 7 tokens: a window of 0 named for it
+/// is refused by name, at start and on a switch alike (a bound, not a drop),
+/// pointing at the 27B's own flag; DFlash2 refuses 0 on every model.
+#[test]
+fn a_window_of_0_is_the_27bs_mtp_alone() {
+    let both = config(&["--spec-backend", "mtp", "--spec-draft-tokens", "0", "--qwen38-vision-enabled", "false"]);
+    let err = both.for_family(ModelFamily::FlashNext).expect_err("Flash-Next's head drafts 1..=7").0;
+    assert!(err.contains("--spec-draft-tokens 0") && err.contains("Qwen3.8-Flash-Next"), "{err}");
+    assert!(err.contains("--qwen38-spec-draft-tokens 0"), "{err}");
+    assert!(fit_to_family(&both, ModelFamily::FlashNext).is_err(), "a switch refuses it too");
+    assert!(both.for_family(ModelFamily::Qwen38_27b).unwrap().speculation_off);
+    let own = config(&["--spec-backend", "mtp", "--qwen38-spec-draft-tokens", "0", "--qwen38-vision-enabled", "false"]);
+    let flash_next = Speculation::new(SpeculativeBackend::Mtp, FLASH_NEXT_DEFAULT_DRAFT_TOKENS).unwrap();
+    assert_eq!(own.for_family(ModelFamily::FlashNext).unwrap().speculation, Some(flash_next));
+    assert!(own.for_family(ModelFamily::Qwen38_27b).unwrap().speculation_off);
+    let err = refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "0"]);
+    assert!(err.contains("--spec-draft-tokens 0") && err.contains("1..=7") && err.contains("dflash2"), "{err}");
+}
+
+/// AC 3: on the 27B's MTP load each of DFlash2's own settings is refused by
+/// name where the operator named it -- by flag or env var at any value, by a
+/// file at a value other than its default -- and a default in force refuses
+/// nothing: the sampled draft is the 27B's default, and a file `config
+/// generate` wrote names it. `--spec-draft-rule fixed` names the head's own
+/// rule.
+#[test]
+fn the_27bs_mtp_load_refuses_dflash2s_own_settings_by_name() {
+    for (flag, value, needle) in [
+        ("--spec-draft-rule", "sampled", "the sampled draft"),
+        ("--spec-drafter-temperature-factor", "0.9", "temperature factor"),
+        ("--spec-drafter-temperature-factor", "0.5", "temperature factor"),
+        ("--spec-drafter-top-p", "0.95", "top-p"),
+        ("--spec-drafter-top-p", "1", "top-p"),
+    ] {
+        let err = the_27b_mtp(&["--spec-backend", "mtp", flag, value]).expect_err("DFlash2's").0;
+        assert!(err.contains(&format!("{flag} {value}")) && err.contains(needle) && err.contains("--spec-backend mtp"), "{err}");
+    }
+    // The shortlist is refused where the speculation is built, on either model.
+    let err = refused(&["--spec-backend", "mtp", "--spec-draft-head", "shortlist"]);
+    assert!(err.contains("--spec-draft-head shortlist") && err.contains("mtp"), "{err}");
+    let env = env_map(&[("IGNIS_SPEC_BACKEND", "mtp"), ("IGNIS_SPEC_DRAFTER_TOP_P", "0.95"), ("IGNIS_QWEN38_VISION_ENABLED", "false")]);
+    let err = expect_config(resolve(&[], env).expect("resolve")).for_family(ModelFamily::Qwen38_27b).expect_err("by env").0;
+    assert!(err.contains("IGNIS_SPEC_DRAFTER_TOP_P"), "{err}");
+
+    let fixed = the_27b_mtp(&["--spec-backend", "mtp", "--spec-draft-rule", "fixed", "--spec-draft-head", "full"]).unwrap();
+    assert_eq!(fixed.speculation, Some(mtp(7)), "the head's own rule and head, named");
+    // Under rtx-16gb, whose `draft_head: auto` resolves to the full head.
+    let auto = the_27b_mtp(&["--profile", "rtx-16gb", "--spec-backend", "mtp"]).unwrap();
+    assert_eq!(auto.speculation, Some(mtp(7)));
+    for (key, value, takes) in [("draft_rule", "sampled", true), ("drafter_top_p", "0.95", true), ("drafter_top_p", "0.9", false), ("draft_rule", "fixed", true)] {
+        let files = MemFiles::with(&[("c.yaml", &format!("spec:\n  backend: mtp\n  qwen38:\n    {key}: {value}\n"))]);
+        let read = with_files(&["--config", "c.yaml", "--qwen38-vision-enabled", "false"], no_env, &files).unwrap();
+        assert_eq!(read.for_family(ModelFamily::Qwen38_27b).is_ok(), takes, "a file's {key}: {value}");
+    }
+}
+
+/// Until the head drafts beside images (GitHub #624), the 27B's MTP load
+/// refuses vision on by name -- whether the operator, a built-in profile (all
+/// of them turn it on for the 27B) or a switch's carry turned it on -- and
+/// says how to turn it off. A window of 0 binds no head and keeps vision.
+#[test]
+fn the_27bs_mtp_load_refuses_vision_by_name_until_the_head_drafts_beside_images() {
+    let err = config(&["--spec-backend", "mtp"]).for_family(ModelFamily::Qwen38_27b).expect_err("the profile's vision").0;
+    assert!(err.contains("--spec-backend mtp") && err.contains("vision.qwen38.enabled"), "{err}");
+    assert!(err.contains("--qwen38-vision-enabled false"), "{err}");
+    let err = config(&["--profile", "none", "--spec-backend", "mtp", "--vision-enabled"]).for_family(ModelFamily::Qwen38_27b).expect_err("named").0;
+    assert!(err.contains("--vision-enabled") && err.contains("does not draft beside vision"), "{err}");
+    let zero = config(&["--spec-backend", "mtp", "--spec-draft-tokens", "0"]).for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert!(zero.vision.is_some() && zero.speculation.is_none(), "no head, no refusal");
+    let started = config(&["--spec-backend", "mtp"]).for_family(ModelFamily::FlashNext).unwrap();
+    let err = fit_to_family(&started, ModelFamily::Qwen38_27b).expect_err("a switch refuses it, never drops it silently").0;
+    assert!(err.contains("--qwen38-vision-enabled false"), "{err}");
+    let carried = switch_target(&started, true, std::path::Path::new("27b.ninfer"), "qwen3.8-27b", ModelFamily::Qwen38_27b).unwrap();
+    let err = fit_to_family(&carried, ModelFamily::Qwen38_27b).expect_err("a carried vision").0;
+    assert!(err.contains("vision"), "{err}");
+}
+
+/// AC 4: a switch to the 27B keeps an MTP setting named for both models
+/// instead of dropping it, at the 27B's own default window when none is
+/// named; Flash-Next keeps its own.
+#[test]
+fn a_switch_to_the_27b_keeps_the_mtp_head() {
+    let flash = config(&["--spec-backend", "mtp", "--qwen38-vision-enabled", "false"]).for_family(ModelFamily::FlashNext).unwrap();
+    assert_eq!(flash.speculation.map(|s| s.draft_tokens()), Some(FLASH_NEXT_DEFAULT_DRAFT_TOKENS));
+    let (on_27b, dropped) = fit_to_family(&flash, ModelFamily::Qwen38_27b).unwrap();
+    assert!(dropped.is_empty(), "{dropped:?}");
+    assert_eq!(on_27b.speculation, Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)));
+    let (back, dropped) = fit_to_family(&on_27b, ModelFamily::FlashNext).unwrap();
+    assert!(dropped.is_empty(), "{dropped:?}");
+    assert_eq!(back.speculation.map(|s| s.draft_tokens()), Some(FLASH_NEXT_DEFAULT_DRAFT_TOKENS));
+    let named = config(&["--spec-backend", "mtp", "--spec-draft-tokens", "3", "--qwen38-vision-enabled", "false"]);
+    let (on_27b, _) = fit_to_family(&named.for_family(ModelFamily::FlashNext).unwrap(), ModelFamily::Qwen38_27b).unwrap();
+    assert_eq!(on_27b.speculation, Some(mtp(3)));
+}
+
+/// AC 6: the effective configuration document of a 27B MTP load reads back
+/// to the same speculation, in both formats, at a named window, at 0 and
+/// with none; and the backend's scope, the field every model takes, names
+/// the MTP head of both.
+#[test]
+fn the_27bs_mtp_setting_round_trips_and_its_scope_names_both_models() {
+    for flags in [&["--spec-backend", "mtp"][..], &["--spec-backend", "mtp", "--spec-draft-tokens", "4"], &["--spec-backend", "mtp", "--spec-draft-tokens", "0"]] {
+        let started = the_27b_mtp(flags).unwrap();
+        let document = file::effective_document(&started);
+        for (name, format) in [("c.yaml", Format::Yaml), ("c.json", Format::Json)] {
+            let files = MemFiles::with(&[(name, &format.write(&document))]);
+            let read = with_files(&["--config", name], no_env, &files).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let read = read.for_family(ModelFamily::Qwen38_27b).unwrap_or_else(|e| panic!("{flags:?} {name}: {e}\n{document}"));
+            assert_eq!((read.speculation, read.speculation_off), (started.speculation, started.speculation_off), "{flags:?} {name}");
+        }
+    }
+    let backend = schema::field("spec", "backend").unwrap();
+    assert!(!backend.applies.refused_by(ModelFamily::Qwen38_27b) && !backend.applies.refused_by(ModelFamily::FlashNext));
+    let text = backend.description_line();
+    assert!(text.contains("`mtp`") && text.contains("27B") && text.contains("Flash-Next"), "{text}");
+    let window = schema::field("spec", "draft_tokens").unwrap().description_line();
+    assert!(window.contains("0..=7") && window.contains("default 7") && window.contains("default 2"), "{window}");
+}
+
 #[test]
 fn the_speculation_env_vars_apply_and_the_flags_win_over_them() {
     let env = env_map(&[("IGNIS_SPEC_BACKEND", "dflash2"), ("IGNIS_SPEC_DRAFT_TOKENS", "3")]);
@@ -2059,11 +2249,12 @@ fn flash_next_refuses_the_27bs_drafter_at_start_naming_itself() {
     assert!(err.contains("drafts with mtp"), "{err}");
     let mtp = config(&["--spec-backend", "mtp", "--spec-draft-rows", "6"]);
     assert!(served_model_for(&mtp, ModelFamily::FlashNext).is_ok(), "Flash-Next drafts with mtp");
-    // `--spec-draft-rows` is Flash-Next's, so the 27B is refused for it
-    // first, in declaration order; without it, for the backend.
-    let mtp_alone = config(&["--spec-backend", "mtp"]);
-    let err = served_model_for(&mtp_alone, ModelFamily::Qwen38_27b).expect_err("Flash-Next's head").0;
-    assert!(err.contains("--spec-backend mtp") && err.contains("drafts with dflash2"), "{err}");
+    // `--spec-draft-rows` is Flash-Next's, so the 27B is refused for it.
+    let err = served_model_for(&mtp, ModelFamily::Qwen38_27b).expect_err("Flash-Next's row budget").0;
+    assert!(err.contains("--spec-draft-rows"), "{err}");
+    // GitHub #623: the 27B drafts with its own MTP head too.
+    let mtp_alone = config(&["--spec-backend", "mtp", "--qwen38-vision-enabled", "false"]);
+    assert!(served_model_for(&mtp_alone, ModelFamily::Qwen38_27b).is_ok(), "the 27B drafts with mtp");
 }
 
 /// GitHub #557 (ADR 0087): Flash-Next takes images, with vision off unless
@@ -2419,10 +2610,14 @@ fn a_patch_on_a_switched_config_keeps_its_drops_and_judges_only_its_own_entries(
 /// a 27B start from the rewritten file never would.
 #[test]
 fn a_patch_from_before_a_switch_never_refuses_a_later_one() {
-    let flash = config(&[]).for_family(ModelFamily::FlashNext).unwrap();
+    // The 27B's vision off: its MTP head does not draft beside it yet (GitHub #623).
+    let flash = config(&["--qwen38-vision-enabled", "false"]).for_family(ModelFamily::FlashNext).unwrap();
     let patched = flash.with_patch(&patch_of(&[("spec", "draft_rows", "6"), ("spec", "backend", "mtp")])).unwrap();
     let (on_27b, dropped) = fit_to_family(&patched, ModelFamily::Qwen38_27b).unwrap();
-    assert_eq!(dropped, ["--spec-backend"], "a value both families read is dropped; the family-only one waits in its section");
+    // GitHub #623: both families draft with `mtp` now, so nothing is dropped;
+    // the family-only value waits in its section.
+    assert!(dropped.is_empty(), "{dropped:?}");
+    assert_eq!(on_27b.speculation.map(|s| s.backend()), Some(SpeculativeBackend::Mtp));
     assert_eq!(on_27b.draft_rows, None);
     let later = on_27b.with_patch(&patch_of(&[("server", "request_timeout", "60")])).unwrap();
     assert_eq!(later.request_timeout_secs, 60);

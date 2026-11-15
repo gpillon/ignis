@@ -626,13 +626,16 @@ config_group! {
 config_group! {
     /// Speculative decoding, and the decode lanes.
     SpecGroup = "spec" {
-        /// The speculative backend: `dflash2` (the 27B's drafter), `mtp`
-        /// (Flash-Next's head, with its companion container beside the
-        /// artifact), or `off`. Unset, no speculation.
+        /// The speculative backend: `dflash2` (the 27B's drafter, every
+        /// profile's), `mtp` (a model's own MTP head: the 27B's, opt-in, or
+        /// Flash-Next's, with its companion container beside the artifact),
+        /// or `off`. Unset, no speculation.
         backend: Opt<SpecBackend> = None, Validator::OneOf(&["dflash2", "mtp", "off"]), ALL, [Visible, Patchable, ReloadRequired, Scoped];
-        /// The draft window: required with `dflash2`; with `mtp`, the most
-        /// drafts a lane verifies (default 2). Needs a backend.
-        draft_tokens: Opt<Tokens> = None, between(1, ignis_core::MAX_DRAFT_TOKENS as i64), ALL, [Visible, Patchable, ReloadRequired, Scoped];
+        /// The draft window, the most drafts a lane verifies: 1..=7, required
+        /// with `dflash2`; with `mtp` on the 27B 0..=7 (default 7, where 0
+        /// loads no speculation), on Flash-Next 1..=7 (default 2). Needs a
+        /// backend.
+        draft_tokens: Opt<Tokens> = None, between(0, ignis_core::MAX_DRAFT_TOKENS as i64), ALL, [Visible, Patchable, ReloadRequired, Scoped];
         /// Flash-Next's draft row budget: the rows a verify round takes across
         /// lanes, 0 (= 8) or 2..=32; past 8, five to eight lanes draft too.
         draft_rows: Opt<DraftRows> = None, between(0, ignis_core::speculation::FLASH_NEXT_MAX_VERIFY_ROWS as i64), FLASH_NEXT_ONLY,
@@ -649,7 +652,7 @@ config_group! {
         /// `shortlist` (the artifact's Q4 head over the 131,072 most frequent
         /// tokens, ~357 MB more VRAM) or `auto` (`full` on every card class: the
         /// shortlist frees no VRAM and measured slower). Needs a backend; `mtp`
-        /// has only `full`. Unset, `full`.
+        /// has only `full`, on either model. Unset, `full`.
         draft_head: Opt<DraftHead> = None, Validator::OneOf(&["full", "shortlist", "auto"]), ALL, [Visible, Patchable, ReloadRequired, Scoped];
         /// How the 27B's DFlash2 rounds draft and accept for a request that
         /// samples (ADR 0090): `fixed`, the fixed draft, the drafter's single
@@ -660,7 +663,9 @@ config_group! {
         /// seed's text differs between them. Greedy requests draft and accept
         /// the same way under either. The default is `sampled` (GitHub #578);
         /// `fixed`, the rule of earlier releases, stays for a comparison or a
-        /// way back. Needs `dflash2`.
+        /// way back. Needs `dflash2`: the 27B's MTP head drafts the fixed
+        /// draft only, and refuses `sampled` and the two settings below when
+        /// they are named.
         draft_rule: DraftRuleKind = DraftRule::Sampled, Validator::OneOf(&DraftRule::NAMES), QWEN38_ONLY,
             [Visible, Patchable, ReloadRequired];
         /// Under `sampled`, the drafter's temperature as a factor of the

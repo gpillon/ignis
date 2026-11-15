@@ -104,6 +104,7 @@ pub fn load(reader: &Reader, shape: LoadShape) -> Result<Loaded, String> {
         kv_page_bytes: format.page_bytes(geometry),
         max_context_tokens: shape.max_context,
         retained_slots: 0,
+        holder_pages: 0,
         kv_pool: None,
         residency: Residency::Resident,
         embedding_pool_named: false,

@@ -204,7 +204,55 @@ sequence holding a copy lends that copy with the pages the ledger moves (the led
 the scheduler takes a loan of one page more than it moves on such a load (`SchedulerConfig::kv_holder_lag`, 1 there)
 and releases a capture that lent more, as before.
 
-This amends ADR 0046 too: its example gives MTP the Flash-Next family alone, and MTP is the 27B's as well once the
-server accepts the option (#623); until then a 27B load built for the head is reached through the leaf, the core
-load API and the runtime's compute seam only. Until #624, an MTP load takes no vision; it drafts under the fixed
-draft only.
+**The server takes the head as the 27B's opt-in drafter** (#623). This amends ADR 0046 too: its example gives MTP
+the Flash-Next family alone, and `--spec-backend mtp` is now both models' value. A model lists the backends it
+drafts with, its default first (`ModelFamily::drafters`: the 27B's DFlash2 and MTP, Flash-Next's MTP), so a model
+switch to the 27B keeps an MTP setting instead of dropping it, and every profile and card class still gives the 27B
+DFlash2. The draft window is the load's, 0 to 7 on the 27B's head; named nowhere it is 7, a provisional default the
+measurement (#628) sets. A window a profile gives beside its own DFlash2 (every built-in profile's 7) is that
+drafter's, so `mtp` named over a profile takes the head's default, and a profile that chose `mtp` keeps its own. A
+window of 0 is a load with no speculation: the configuration resolves it to what `off` resolves to, the same engine
+shape field for field, so nothing of the head is bound, no pool carries its section and the plan is the off load's
+to the byte. Flash-Next's head drafts 1 to 7, so 0 named for both models is refused when Flash-Next loads, at start
+and on a switch alike (a bound, as a context past the 27B's envelope is, not a drop), naming the 27B's own flag;
+DFlash2 refuses 0 everywhere. A rule only the loading model decides runs where the configuration is fitted to it,
+never where every model's values are validated, or a value for one would refuse a start of the other.
+
+DFlash2's own settings are refused by name on the head's load, and only where the operator named them, never because
+a default is in force: the sampled draft has been the 27B's default since #578, so the head's load drafts the fixed
+draft, its only rule, without anyone having to say so. "Named" is new here, because the repository's rule that
+naming a default says nothing would let `--spec-draft-rule sampled` pass silently and leave the shortlist head the
+only setting the head could refuse: a flag or an env var names its value even at the default; a config file and a
+live patch name a value only away from the default, because a file `config generate` wrote holds every field at its
+default and must start either drafter (`Resolution::named_by_operator`). So `--spec-draft-rule sampled`, and the
+drafter's temperature factor and top-p at any value, are refused by a flag or an env var; a file's `fixed` names the
+head's own rule and is taken; the shortlist head is refused as it was, by either model's head. The effective
+configuration document of a head's load reads back to the same speculation.
+
+**Until #624 the head's load takes no vision, and says so.** Every built-in profile turns the 27B's vision on, so
+a served 27B load brings its tower by default, and the leaf refuses the head beside it (its chain and commit rotate
+at positions with no rope delta). The choice was between refusing such a load by name and loading it without vision.
+A load without vision fails where the operator does not look, at the first image a client sends, against a profile
+that promised images; a refusal fails at start, says which setting turned vision on (the profile's key, a switch's
+carry or the operator's flag) and names `--qwen38-vision-enabled false`, which turns the 27B's vision off and stops a
+switch carrying another model's. So the head's load refuses vision on, at start, on a switch and on a live change
+alike, wherever vision came from; a window of 0 binds no head and keeps vision. The check is one predicate in the
+configuration's fit, for #624 to take out.
+
+**What admission keeps back is held by the plan's floor.** The scheduler bounds the holders' copies rather than
+tracking them (#622, above): the ledger charges a prefix its whole pages and each holder the pages past them; a live
+sequence holds one copy at most (the one frontier it continues from), a lane one live sequence, and a retained slot
+one image with one copy at most, gone with it; the prefix's own last page as charged covers one holder's. So the leaf
+holds at most the ledger plus a page a lane and a page a retained slot, and admission, kept within the pool less
+those, never asks the leaf for a page it lacks. What #622 left was the floor: the plan held one context and a page
+per retained slot, so a pool at that floor left admission a page a lane short of one context, and a request
+reserving the whole context the server advertises would have been refused as larger than the pool. The plan's floor
+now holds those pages too (`VramRequest::holder_pages`, from the same `seq::holder_page_reserve` admission subtracts,
+0 on every other load): a named pool below it is refused naming them, and a pool at it leaves admission exactly the
+context and the retained slots' pages a pool without the head leaves at its own floor. The plan event says how many
+of its pages admission keeps back (`kv_holder_pages`); `kv_pool_pages` and `kv_pool_tokens` stay the leaf's pool.
+
+The load's log names the drafter and the window (`ignis.model.loaded`'s `speculation`: `mtp draft_tokens=7`, and
+`off (mtp draft_tokens=0)` for the window of 0), and nothing of DFlash2's settings; Flash-Next's line is what it was.
+The request log's `spec.*` fields and the `ignis_speculative_*` counters keep their meaning: a round's extent, its
+accepted drafts, the per-position profile. The head's load drafts under the fixed draft only.

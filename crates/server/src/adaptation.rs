@@ -467,6 +467,7 @@ mod tests {
                 kv_page_bytes: page,
                 max_context_tokens: attempt.max_context,
                 retained_slots: 2 * attempt.decode_lanes,
+                holder_pages: 0,
                 kv_pool: None,
                 residency: Residency::Resident,
                 embedding_pool_named: false,

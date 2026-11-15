@@ -914,15 +914,21 @@ impl ModelFamily {
         self == ModelFamily::Qwen38_27b
     }
 
-    /// The model's speculative backend: the 27B's DFlash2 drafter, or
-    /// Flash-Next's own MTP head (spec flash-next/07). The image model
-    /// decodes no tokens and has none.
-    pub fn drafter(self) -> Option<crate::SpeculativeBackend> {
+    /// The speculative backends the model drafts with, its default first:
+    /// the 27B's DFlash2 drafter and, chosen at load, its own MTP head (spec
+    /// #618, GitHub #623); Flash-Next's own MTP head (spec flash-next/07).
+    /// The image model and the diarizer decode no tokens and have none.
+    pub fn drafters(self) -> &'static [crate::SpeculativeBackend] {
         match self {
-            ModelFamily::Qwen38_27b => Some(crate::SpeculativeBackend::Dflash2),
-            ModelFamily::FlashNext => Some(crate::SpeculativeBackend::Mtp),
-            ModelFamily::QwenImage21 | ModelFamily::Nemotron3Diarization => None,
+            ModelFamily::Qwen38_27b => &[crate::SpeculativeBackend::Dflash2, crate::SpeculativeBackend::Mtp],
+            ModelFamily::FlashNext => &[crate::SpeculativeBackend::Mtp],
+            ModelFamily::QwenImage21 | ModelFamily::Nemotron3Diarization => &[],
         }
+    }
+
+    /// Whether the model drafts with `backend` ([`Self::drafters`]).
+    pub fn drafts_with(self, backend: crate::SpeculativeBackend) -> bool {
+        self.drafters().contains(&backend)
     }
 
     /// The model's name, as a refusal names it to a client.
@@ -1465,10 +1471,10 @@ mod tests {
         let image = ModelFamily::QwenImage21;
         assert_eq!(image.name(), "Qwen-Image-2.1");
         assert!(!image.takes_images() && !image.serves_readouts());
-        assert_eq!(image.drafter(), None);
+        assert!(image.drafters().is_empty());
         assert_eq!(image.default_retained_host_slots(image.default_decode_lanes()), 0);
         assert_eq!(image.default_decode_lanes(), 0);
-        assert_eq!(ModelFamily::FlashNext.drafter(), Some(crate::SpeculativeBackend::Mtp));
+        assert_eq!(ModelFamily::FlashNext.drafters(), [crate::SpeculativeBackend::Mtp]);
     }
 
     /// GitHub #336: each family's lanes when none is named -- the 27B every
@@ -1490,15 +1496,18 @@ mod tests {
     /// What each model can serve beyond text: Flash-Next takes images with
     /// its vision companion's tower (GitHub #557, ADR 0087) but has no
     /// readouts (spec flash-next/04, Out of Scope), and drafts with its own
-    /// MTP head where the 27B drafts with DFlash2 (spec flash-next/07).
+    /// MTP head (spec flash-next/07); the 27B drafts with DFlash2 by default
+    /// and with its own MTP head when a load chooses it (GitHub #623).
     #[test]
     fn flash_next_takes_images_and_serves_no_readouts() {
         let dense = ModelFamily::Qwen38_27b;
         assert!(dense.takes_images() && dense.serves_readouts());
-        assert_eq!(dense.drafter(), Some(crate::SpeculativeBackend::Dflash2));
+        assert_eq!(dense.drafters(), [crate::SpeculativeBackend::Dflash2, crate::SpeculativeBackend::Mtp]);
+        assert!(dense.drafts_with(crate::SpeculativeBackend::Mtp) && !dense.drafts_with(crate::SpeculativeBackend::VerifyOnly));
         let flash = ModelFamily::FlashNext;
         assert!(flash.takes_images() && !flash.serves_readouts());
-        assert_eq!(flash.drafter(), Some(crate::SpeculativeBackend::Mtp));
+        assert_eq!(flash.drafters(), [crate::SpeculativeBackend::Mtp]);
+        assert!(!flash.drafts_with(crate::SpeculativeBackend::Dflash2));
     }
 
     const MIB: u64 = 1024 * 1024;

@@ -126,6 +126,11 @@ pub const FLASH_NEXT_MAX_VERIFY_ROWS: u32 = 32;
 /// row budget as lanes join.
 pub const FLASH_NEXT_DEFAULT_DRAFT_TOKENS: u32 = 2;
 
+/// The draft window a 27B MTP load verifies when the operator names none
+/// (`--spec-backend mtp` alone, GitHub #623): the head's widest window, a
+/// provisional default that the measurement of spec #618 (GitHub #628) sets.
+pub const QWEN38_MTP_DEFAULT_DRAFT_TOKENS: u32 = 7;
+
 /// The window a Flash-Next round of `lanes` lanes verifies at (spec
 /// flash-next/07): the load's draft tokens, cut so that `lanes * (k + 1)`
 /// stays within the row budget (0: [`FLASH_NEXT_DEFAULT_VERIFY_ROWS`]; past

@@ -85,19 +85,21 @@ token, replayed from a CUDA graph for the exact number of lanes. See
 prefills (`--model-decode-share`, 25 percent by default). See
 [how ignis serves a request](../concepts/how-ignis-serves.md).
 
-**DFlash2.** The 27B's speculative-decoding drafter, grafted into its artifact: a
-five-layer, sliding-window model that proposes 1 to 7 tokens per round. See
-[speculative decoding](../concepts/speculative-decoding.md).
+**DFlash2.** The 27B's default speculative-decoding drafter, grafted into its
+artifact: a five-layer, sliding-window model that proposes 1 to 7 tokens per
+round. See [speculative decoding](../concepts/speculative-decoding.md).
 
 **Draft.** A token a drafter proposes ahead of the model, to be verified in the same
 pass. See [speculative decoding](../concepts/speculative-decoding.md).
 
 **Draft tokens.** The most tokens a lane drafts per round
-(`--spec-draft-tokens`). See
+(`--spec-draft-tokens`), the draft window: 1 to 7, and 0 to 7 for the 27B's
+MTP head, where 0 loads no speculation. See
 [speculative decoding](../concepts/speculative-decoding.md).
 
-**Drafter.** Whatever proposes the drafts: DFlash2 for the 27B, the MTP head for
-Flash-Next. See [speculative decoding](../concepts/speculative-decoding.md).
+**Drafter.** Whatever proposes the drafts, one per load: DFlash2 or its own MTP
+head for the 27B (DFlash2 by default, MTP opt-in), the MTP head for Flash-Next.
+See [the 27B's two drafters](../concepts/speculative-decoding.md#the-27bs-two-drafters).
 
 **Expert cache.** On Flash-Next, the fixed-size pools of VRAM that hold the experts
 in use, replaced least-recently-used. It takes what the KV pool leaves and is
@@ -194,8 +196,11 @@ protection and eviction order. See
 streams, and takes a persistent loop back. See
 [reasoning and the loop guard](../concepts/reasoning.md).
 
-**MTP.** Multi-token prediction: Flash-Next's own draft head, shipped in a
-companion container. Off on the RTX 5090, on under the `rtxpro6000` profile. See
+**MTP.** Multi-token prediction: a model's own draft head. The 27B's is in every
+27B artifact and is opt-in from 0.11.0 (`--spec-backend mtp`), in place of DFlash2: smaller
+weights and no drafter window, for one more attention layer in every KV page.
+Flash-Next's is shipped in a companion container, off on the RTX 5090 and on
+under the `rtxpro6000` profile. See
 [speculative decoding](../concepts/speculative-decoding.md).
 
 **Nudge.** The sentence in the model's own voice that a rewind adds to the

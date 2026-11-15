@@ -14,7 +14,8 @@ Fetching and pointing at a model is covered in
 ## The artifact
 
 An artifact is a `.ninfer` container: the weights, the tokenizer and the chat
-template in one file, plus, for the 27B, a grafted DFlash2 drafter module
+template in one file, plus, for the 27B, a grafted DFlash2 drafter module and
+the checkpoint's own multi-token-prediction (MTP) head, its two drafters
 ([ADR 0002](../../adr/0002-load-ninfer-artifact.md)). It is loaded as it is
 stored; the kernels read the weight planes directly, with no conversion on the
 host at load.
@@ -69,7 +70,10 @@ state rather than a whole context, and why the KV pool can be shared by lanes
 ([the KV cache](kv-cache-and-prompt-reuse.md)).
 
 It serves a fixed eight decode lanes, takes image input when
-`--vision-enabled` is set, and drafts with DFlash2.
+`--vision-enabled` is set, and drafts with DFlash2, every profile's drafter,
+or, from 0.11.0, with its own MTP head when `--spec-backend mtp` names it, one or the other
+for the life of a load
+([the 27B's two drafters](speculative-decoding.md#the-27bs-two-drafters)).
 
 Memory:
 
@@ -189,7 +193,9 @@ same 70 matrices re-quantized. It does not
 refuse requests, so guardrails belong in the layer that executes tools. The
 DFlash2 drafter loads unchanged; it was fitted to the default weights, and
 because the target verifies every draft, a mismatch can only lower the
-acceptance rate ([the uncensored variant](../guides/uncensored.md)).
+acceptance rate. The same holds of the MTP head, which every 27B artifact
+carries as the base checkpoint has it, the abliterated and Swift ones
+included ([the uncensored variant](../guides/uncensored.md)).
 
 ## What differs, side by side
 

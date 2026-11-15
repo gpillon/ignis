@@ -241,6 +241,14 @@ pub struct VramRequest<'a> {
     /// while it stands on the checkpoint — so a lone `--model-max-context` sequence
     /// has to fit beside every one.
     pub retained_slots: u32,
+    /// The pages the scheduler's admission keeps back beside its ledger
+    /// (GitHub #622, #623): on the 27B's MTP pool every holder of a frontier
+    /// keeps its own copy of the page holding the frontier's last position,
+    /// at most one a lane and one a retained slot
+    /// ([`crate::seq::holder_page_reserve`]); 0 on every other pool. The pool
+    /// holds them too, beside one `--model-max-context` sequence and the
+    /// retained slots' pages, so that admission still holds that sequence.
+    pub holder_pages: u32,
     /// `--vram-kv-pool-bytes`, when the operator named it, in bytes or tokens: it
     /// replaces the policy's size (ADR 0045). `None` takes the policy's.
     pub kv_pool: Option<KvPoolSize>,
@@ -270,6 +278,10 @@ pub struct VramPlan {
     pub kv_pool_policy: KvPoolPolicy,
     /// Pages the KV pool holds.
     pub kv_page_count: u32,
+    /// Of those, the pages the scheduler's admission keeps back for the MTP
+    /// head's holders ([`VramRequest::holder_pages`], GitHub #623): what the
+    /// ledger may charge is the pool less these.
+    pub holder_pages: u32,
     /// The KV pool's device bytes (planes and block tables).
     pub kv_pool_bytes: u64,
     /// Residency's fixed lines: its tables, and its staging ring when the
@@ -331,6 +343,8 @@ pub enum VramPlanError {
         floor_pages: u32,
         max_context_tokens: u32,
         retained_slots: u32,
+        /// [`VramRequest::holder_pages`].
+        holder_pages: u32,
         /// The model's own bytes per token, so a byte count can be redone.
         bytes_per_token: u64,
     },
@@ -354,15 +368,24 @@ impl std::fmt::Display for VramPlanError {
                 floor_pages,
                 max_context_tokens,
                 retained_slots,
+                holder_pages,
                 bytes_per_token,
-            } => write!(
-                f,
-                "the KV pool of {pool} (--vram-kv-pool-bytes) holds {pool_pages} pages of {KV_PAGE_TOKENS} tokens \
-                 ({bytes_per_token} bytes per token on this model), fewer than the {floor_pages} it must hold: \
-                 one --model-max-context sequence ({max_context_tokens} tokens) and a page per retained slot \
-                 ({retained_slots}); name a larger --vram-kv-pool-bytes, or a smaller --model-max-context, \
-                 --reuse-retained-device or --reuse-retained-host"
-            ),
+            } => {
+                write!(
+                    f,
+                    "the KV pool of {pool} (--vram-kv-pool-bytes) holds {pool_pages} pages of {KV_PAGE_TOKENS} tokens \
+                     ({bytes_per_token} bytes per token on this model), fewer than the {floor_pages} it must hold: \
+                     one --model-max-context sequence ({max_context_tokens} tokens) and a page per retained slot \
+                     ({retained_slots})"
+                )?;
+                if holder_pages > 0 {
+                    write!(f, " and the {holder_pages} pages the MTP head's holders copy, one a lane and one a retained slot")?;
+                }
+                f.write_str(
+                    "; name a larger --vram-kv-pool-bytes, or a smaller --model-max-context, \
+                     --reuse-retained-device or --reuse-retained-host",
+                )
+            }
             Self::BelowMinimum {
                 mode,
                 policy: KvPoolPolicy::Offloaded,
@@ -459,11 +482,14 @@ pub fn plan_vram(request: &VramRequest<'_>) -> Result<VramPlan, VramPlanError> {
 
     let page_bytes = request.kv_page_bytes;
     // ADR 0030's floor, on both models since ADR 0045: one `--model-max-context`
-    // sequence and a page per retained slot.
+    // sequence and a page per retained slot -- and, on the 27B's MTP pool, the
+    // pages admission keeps back for the holders' copies (GitHub #623), so the
+    // ledger still holds that sequence beside the retained slots.
     let min_pages = request
         .max_context_tokens
         .div_ceil(KV_PAGE_TOKENS)
-        .saturating_add(request.retained_slots);
+        .saturating_add(request.retained_slots)
+        .saturating_add(request.holder_pages);
     let fixed = request.lines.total();
     let arena = request.kv_arena_bytes;
 
@@ -476,6 +502,7 @@ pub fn plan_vram(request: &VramRequest<'_>) -> Result<VramPlan, VramPlanError> {
                 floor_pages: min_pages,
                 max_context_tokens: request.max_context_tokens,
                 retained_slots: request.retained_slots,
+                holder_pages: request.holder_pages,
                 bytes_per_token: page_bytes / u64::from(KV_PAGE_TOKENS),
             });
         }
@@ -559,6 +586,7 @@ pub fn plan_vram(request: &VramRequest<'_>) -> Result<VramPlan, VramPlanError> {
         lines: request.lines,
         kv_pool_policy: policy,
         kv_page_count,
+        holder_pages: request.holder_pages,
         kv_pool_bytes,
         residency_bytes,
         staging_ring_bytes,
@@ -652,6 +680,7 @@ mod tests {
             kv_page_bytes: page_bytes(),
             max_context_tokens: 262_144,
             retained_slots: SLOTS,
+            holder_pages: 0,
             kv_pool: None,
             residency: Residency::Resident,
             embedding_pool_named: false,
@@ -924,6 +953,7 @@ mod tests {
             kv_page_bytes: FN_PAGE_BYTES,
             max_context_tokens: FN_CONTEXT,
             retained_slots: FN_SLOTS,
+            holder_pages: 0,
             kv_pool: None,
             residency: Residency::Experts(ExpertResidency {
                 expert_pool_bytes: FN_EXPERTS,
@@ -1080,6 +1110,7 @@ mod tests {
                     floor_pages: FN_FLOOR,
                     max_context_tokens: FN_CONTEXT,
                     retained_slots: FN_SLOTS,
+                    holder_pages: 0,
                     bytes_per_token: FN_TOKEN_BYTES,
                 }
             );
@@ -1088,6 +1119,45 @@ mod tests {
                 assert!(message.contains(needle), "{needle} missing: {message}");
             }
         }
+    }
+
+    /// GitHub #623: on the 27B's MTP pool admission keeps back a page a lane
+    /// and a page a retained slot for the holders' copies (GitHub #622), so
+    /// the floor holds them beside one context and the retained slots' pages.
+    /// A pool at that floor leaves admission exactly what a pool without the
+    /// head has at its own; one page under it is refused, naming the copies.
+    #[test]
+    fn the_mtp_heads_holder_pages_join_the_floor_so_admission_still_holds_one_context() {
+        const LANES: u32 = 8;
+        let holder_pages = LANES + SLOTS;
+        let context_pages = 262_144 / KV_PAGE_TOKENS;
+        let floor = context_pages + SLOTS + holder_pages;
+        let at = |pages: u32| VramRequest {
+            holder_pages,
+            kv_pool: Some(KvPoolSize::Tokens(u64::from(pages) * u64::from(KV_PAGE_TOKENS))),
+            ..request(DERIVED, 31 * GIB)
+        };
+        let plan = plan_vram(&at(floor)).expect("a pool at the floor");
+        assert_eq!(plan.kv_page_count, floor);
+        // What the scheduler is given: the pool less the holders' pages, one
+        // context and a page per retained slot, as at the floor without them.
+        assert_eq!(plan.kv_page_count - holder_pages, context_pages + SLOTS);
+        let err = plan_vram(&at(floor - 1)).expect_err("a page under the floor");
+        let VramPlanError::PoolBelowFloor { floor_pages, holder_pages: named, .. } = err else {
+            panic!("refused as below the floor: {err}");
+        };
+        assert_eq!((floor_pages, named), (floor, holder_pages));
+        let message = err.to_string();
+        assert!(message.contains("the 16 pages the MTP head's holders copy"), "{message}");
+        // Without the head nothing is said of them, and the floor is as before.
+        let plain = plan_vram(&VramRequest { holder_pages: 0, ..at(floor - holder_pages) }).expect("the floor without the head");
+        assert_eq!(plain.kv_page_count, context_pages + SLOTS);
+        let err = plan_vram(&VramRequest { holder_pages: 0, ..at(context_pages) }).expect_err("below it");
+        assert!(!err.to_string().contains("holders"), "{err}");
+        // On a derived pool, the floor's refusal counts them too.
+        let tight = VramRequest { holder_pages, kv_pool: None, ..request(DERIVED, 31 * GIB) };
+        let plan = plan_vram(&tight).expect("the derived pool");
+        assert!(plan.kv_page_count >= floor, "the rest of the budget holds the floor: {}", plan.kv_page_count);
     }
 
     #[test]

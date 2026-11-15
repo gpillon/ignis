@@ -1066,9 +1066,12 @@ draft tokens 1..7, native acceptance 3.4–3.7 tokens/round). Selected at load
 `dflash2/*` objects is bound.
 
 **Draft window**:
-The number of tokens the drafter proposes per round (`--spec-draft-tokens`,
-1..7), fixed for the life of a load. Not to be confused with the drafter's own
-2048-token sliding **drafter window**.
+The number of tokens the drafter proposes per round (`--spec-draft-tokens`),
+fixed for the life of a load: 1..7 under **DFlash2** (required) and Flash-Next's
+**MTP head** (default 2); 0..7 under the 27B's MTP head (default 7, provisional
+until spec #618's measurement sets it), where 0 is a load with no speculation,
+the load `off` makes, nothing of the head bound (#623). Not to be confused with
+the drafter's own 2048-token sliding **drafter window**.
 
 **Drafter window**:
 A sequence's DFlash2 context: every drafter layer's BF16 K and V for the last
@@ -1158,9 +1161,11 @@ Whatever fills a verify round's proposal seam: **DFlash2** inside the leaf
 (P5-05), proposing each lane's drafts from its **drafter window** in the same
 pass that verifies them, or a fake drafter in the substrate's own tests
 (`verify-only` load: the verify substrate with nothing bound, the drafts passed
-per call). The 27B's **MTP head** is its second drafter (ADR 0095): a load
-built for it binds the head and keeps its state current; its chain proposes in
-the verify round (#621).
+per call). The 27B has two, one per load: **DFlash2**, every profile's, and its
+**MTP head** (ADR 0095), chosen with `--spec-backend mtp`: a load built for it
+binds the head and keeps its state current; its chain proposes in the verify
+round (#621). `ModelFamily::drafters` lists a model's, its default first
+(#623).
 
 **Draft rule**:
 How a **verify round**'s sampling lanes draft and accept (`--spec-draft-rule`,
@@ -1221,10 +1226,15 @@ scores, the whole vocabulary) and its 16 leading candidates, at one eager
 chain's cost.
 
 **MTP**:
-The model's native multi-token-prediction head, the alternative drafter (draft
-window 1..7 chosen at load, verification width chosen per round). Flash-Next
-drafts with it, its **MTP head** (`--spec-backend mtp`); the 27B drafts with
-**DFlash2** and refuses it.
+The model's native multi-token-prediction head as a drafter
+(`--spec-backend mtp`), its **MTP head**, chosen at load. Flash-Next drafts with
+it (draft window 1..7, verification width chosen per round by the row budget).
+The 27B drafts with it as its opt-in second drafter, in place of **DFlash2**
+(#623): draft window 0..7, the **fixed draft** only, DFlash2's own settings
+refused by name where the operator names them, and vision on refused until the
+head drafts beside images (#624). It saves DFlash2's weights, **drafter window**
+and round, and costs one more attention layer in every KV page, the head over
+every prefill position, and a page a holder of a shared prefix (ADR 0095).
 
 **Vision**:
 Multimodal input: images today, video refused until its own spec. A load

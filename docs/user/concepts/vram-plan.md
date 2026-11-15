@@ -53,6 +53,14 @@ Flash-Next). The lines include:
 - the **lane state** of every decode lane (on the 27B, about 144 MiB per lane
   for the linear-attention layers);
 - the **decode and drafter graphs**' staging buffers;
+- the **drafter**, when one is loaded: DFlash2's weights, its window in every
+  lane and retained slot (40 MiB each) and its round, or the 27B's MTP head's
+  weights (0.45 GB), one call over the widest round in the decode graph's line,
+  one call of a prefill chunk's in the workspace, and about 10 KB a lane and a
+  retained slot (under `hq-e8-2b`, the head's share of the residual window
+  too). Under the MTP head every KV page holds one more attention layer, so the
+  pool's bytes buy about 6% fewer tokens
+  ([the 27B's two drafters](speculative-decoding.md#the-27bs-two-drafters));
 - the **retained slots** that live on the device (none by default, two for
   the 27B under `rtx-24gb`, with prompt reuse on; the event's `retained_device_slots` counts them
   and `retained_slots_bytes` is their line) and, under
@@ -138,7 +146,13 @@ the load, and it is the figure Windows reports as shared GPU memory
 ## Seeing the plan
 
 - The `ignis.runtime.vram_plan` log event, with the pool policy
-  (`kv_pool_policy`), `kv_pool_pages` and `kv_pool_tokens`.
+  (`kv_pool_policy`), `kv_pool_pages` and `kv_pool_tokens`, and
+  `kv_holder_pages`: on the 27B's MTP load, the pages of the pool admission
+  keeps back for the head's holders, a page a lane and a page a retained slot
+  (0 on every other load). Each holder of a shared prefix keeps its own copy
+  of the prefix's last page there; the plan holds those pages beside one
+  context and a page per retained slot, so requests are admitted against the
+  pool less them and the pool is never short of a page they asked for.
 - The Playground's Monitor shows the plan beside what is in use
   ([the Playground](../playground/index.md)).
 - Prometheus gauges carry the plan lines, the KV pool and KV-RAM; they read zero

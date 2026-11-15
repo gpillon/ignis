@@ -1515,6 +1515,7 @@ mod tests {
             kv_page_bytes: 1,
             max_context_tokens: 64,
             retained_slots: 0,
+            holder_pages: 0,
             kv_pool: None,
             residency: Residency::Experts(ExpertResidency {
                 expert_pool_bytes: catalog.total_bytes(),

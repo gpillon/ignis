@@ -993,7 +993,7 @@ The models a request may switch to by naming them, each with the artifact it loa
 | Per model | `--qwen38-spec-backend`, `--qwen38flashnext-spec-backend` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The speculative backend: `dflash2` (the 27B's drafter), `mtp` (Flash-Next's head, with its companion container beside the artifact), or `off`. Unset, no speculation.
+The speculative backend: `dflash2` (the 27B's drafter, every profile's), `mtp` (a model's own MTP head: the 27B's, opt-in, or Flash-Next's, with its companion container beside the artifact), or `off`. Unset, no speculation.
 
 ### `spec.draft_tokens`
 
@@ -1003,12 +1003,12 @@ The speculative backend: `dflash2` (the 27B's drafter), `mtp` (Flash-Next's head
 | Env var | `IGNIS_SPEC_DRAFT_TOKENS` |
 | Kind | `tokens` |
 | Default | `unset` |
-| Rule | 1..=7 |
+| Rule | 0..=7 |
 | Models | all |
 | Per model | `--qwen38-spec-draft-tokens`, `--qwen38flashnext-spec-draft-tokens` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The draft window: required with `dflash2`; with `mtp`, the most drafts a lane verifies (default 2). Needs a backend.
+The draft window, the most drafts a lane verifies: 1..=7, required with `dflash2`; with `mtp` on the 27B 0..=7 (default 7, where 0 loads no speculation), on Flash-Next 1..=7 (default 2). Needs a backend.
 
 ### `spec.draft_rows`
 
@@ -1052,7 +1052,7 @@ The decode lanes: the sequences a model decodes at once. On the 27B each lane re
 | Per model | `--qwen38-spec-draft-head`, `--qwen38flashnext-spec-draft-head` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The drafter's proposal head: `full` (the target's output head), `shortlist` (the artifact's Q4 head over the 131,072 most frequent tokens, ~357 MB more VRAM) or `auto` (`full` on every card class: the shortlist frees no VRAM and measured slower). Needs a backend; `mtp` has only `full`. Unset, `full`.
+The drafter's proposal head: `full` (the target's output head), `shortlist` (the artifact's Q4 head over the 131,072 most frequent tokens, ~357 MB more VRAM) or `auto` (`full` on every card class: the shortlist frees no VRAM and measured slower). Needs a backend; `mtp` has only `full`, on either model. Unset, `full`.
 
 ### `spec.draft_rule`
 
@@ -1066,7 +1066,7 @@ The drafter's proposal head: `full` (the target's output head), `shortlist` (the
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-How the 27B's DFlash2 rounds draft and accept for a request that samples (ADR 0090): `fixed`, the fixed draft, the drafter's single best draft taken with the target's probability of it, or `sampled`, the sampled draft, a draft drawn from the drafter's own distribution and taken by the ratio of the two distributions. Both keep the text distributed as the model's sampler draws it; a seed's text differs between them. Greedy requests draft and accept the same way under either. The default is `sampled` (GitHub #578); `fixed`, the rule of earlier releases, stays for a comparison or a way back. Needs `dflash2`.
+How the 27B's DFlash2 rounds draft and accept for a request that samples (ADR 0090): `fixed`, the fixed draft, the drafter's single best draft taken with the target's probability of it, or `sampled`, the sampled draft, a draft drawn from the drafter's own distribution and taken by the ratio of the two distributions. Both keep the text distributed as the model's sampler draws it; a seed's text differs between them. Greedy requests draft and accept the same way under either. The default is `sampled` (GitHub #578); `fixed`, the rule of earlier releases, stays for a comparison or a way back. Needs `dflash2`: the 27B's MTP head drafts the fixed draft only, and refuses `sampled` and the two settings below when they are named.
 
 ### `spec.drafter_temperature_factor`
 

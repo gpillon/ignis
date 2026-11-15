@@ -438,4 +438,6 @@ never matched against the catalog. Served with no `--model-id`, it takes its
 family's default id.
 
 The artifact carries a grafted DFlash2 drafter module, which `--spec-backend dflash2`
-loads for speculative decoding and which costs no VRAM when speculation is off.
+loads for speculative decoding and which costs no VRAM when speculation is off,
+and the checkpoint's own MTP head, which `--spec-backend mtp` loads in its place
+([the 27B's two drafters](../concepts/speculative-decoding.md#the-27bs-two-drafters)).

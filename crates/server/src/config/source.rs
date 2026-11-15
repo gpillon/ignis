@@ -400,6 +400,19 @@ impl Resolution {
         self.origin(group, name).is_some_and(|origin| origin.source.explicit() && !origin.at_default)
     }
 
+    /// Whether the operator named `<group>.<name>` for this load at any value
+    /// (GitHub #623): on the command line or in the environment even at its
+    /// default, where naming it says what it says; in a config file or a live
+    /// patch only at another value, since a file `config generate` wrote
+    /// names every field at its default and says nothing by it
+    /// ([`Origin::at_default`]). For a rule that refuses a setting the load
+    /// cannot run whatever its value: a default in force never counts.
+    pub fn named_by_operator(&self, group: &str, name: &str) -> bool {
+        self.origin(group, name).is_some_and(|origin| {
+            origin.source.explicit() && (!origin.at_default || matches!(origin.source, Source::Flag | Source::Env))
+        })
+    }
+
     /// Whether `<group>.<name>`'s value is the profile's or the hardcoded
     /// default's: what a load's **adaptation** may lower (ADR 0063 §3). By
     /// source alone -- a value the operator wrote never adapts, not even one
