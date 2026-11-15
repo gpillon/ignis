@@ -1233,7 +1233,8 @@ pub fn served_model_for(config: &Config, family: ModelFamily) -> Result<String, 
 ///
 /// One process serves the 27B and Flash-Next in turn on the options it was
 /// started with, and some of those name a capability only one of the two
-/// has: vision (the 27B's tower), a speculative backend (each model drafts
+/// has: vision (the 27B's tower), a speculative backend (DFlash2 is the
+/// 27B's alone, `mtp` both models', GitHub #623; each model drafts
 /// with its own), the Flash-Next-only knobs. At start such a value on the
 /// wrong model is refused ([`Config::for_family`]) because the operator
 /// named it for that load; on a switch it was named for the *other* model,

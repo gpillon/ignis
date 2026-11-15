@@ -424,6 +424,19 @@ Agent image request to KV-RAM, which is restored and still describes its image.
 The request log it prints names the evicted and restored request id and each
 request's `spec.*` counters.
 
+`crates/server/tests/mtp_serving_gpu.rs` (GitHub #623) is the 27B's MTP head
+served the same way, through `load::prepare_model`/`load_model` from the flags
+an operator passes: greedy text against the same flags at a window of 0 (no
+speculation) up to ADR 0056's near tie, judged on that load's prefill route;
+each route request's `spec.*` against the engine's run of the same prompt and
+`/metrics`; a `json_schema` answer and a request at the API's defaults; then a
+pool at its floor (one context, a page per retained slot, a page a lane and a
+retained slot for the head's holders), where an Agent request goes through
+KV-RAM for an Interactive request reserving the whole context, first on the
+load because retained state would stand in the room, and eight siblings share
+a system prompt, one a lane. Its own binary: the request log is the process's
+global subscriber.
+
 **The verify round's rope delta is a deliberate departure from the reference.**
 The reference's DFlash2 round passes its proposal positions for both the cache
 and the rotation and carries no rope delta in its decode ingress at all, while

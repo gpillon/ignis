@@ -433,7 +433,10 @@ A field only one model takes is refused at start when set for the other
 (`--model-prefill-attention` and Flash-Next, the n-gram flags and the 27B,
 `--spec-decode-lanes` and the 27B). Remove it, or give it in the model's own
 family section of the config file. On a model switch it is dropped instead,
-with a log line ([Configuration](configuration/index.md)).
+with a log line ([Configuration](configuration/index.md)). The 27B's MTP load
+is the exception: what it refuses (vision on, DFlash2's own settings named, a
+window of 0 on Flash-Next) is refused on a switch too, since it was named for
+the model loading.
 
 ## Serving requests
 

@@ -2078,6 +2078,24 @@ fn a_switch_to_the_27b_keeps_the_mtp_head() {
     assert_eq!(on_27b.speculation, Some(mtp(3)));
 }
 
+/// AC 3 on a live change: a running 27B patched to its MTP head is refused
+/// for the profile's vision, naming it, as a start is; the same patch turning
+/// the 27B's vision off is taken, at the head's default window.
+#[test]
+fn a_live_change_to_the_27bs_mtp_head_refuses_vision_on_and_takes_it_off() {
+    let running = config(&[]).for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert!(running.vision.is_some(), "the profile turns the 27B's vision on");
+    let err = running.with_patch(&patch_of(&[("spec", "backend", "mtp")])).expect_err("vision on").0;
+    assert!(err.contains("vision") && err.contains("--qwen38-vision-enabled false"), "{err}");
+    let mut patch = patch_of(&[("spec", "backend", "mtp")]);
+    let enabled = schema::field("vision", "enabled").unwrap();
+    let spelling = enabled.scoped_file_key(ModelFamily::Qwen38_27b);
+    patch.set(enabled, Some(ModelFamily::Qwen38_27b), source::Candidate { raw: "false".into(), spelling }).unwrap();
+    let next = running.with_patch(&patch).unwrap();
+    assert_eq!(next.speculation, Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)));
+    assert!(next.vision.is_none());
+}
+
 /// AC 6: the effective configuration document of a 27B MTP load reads back
 /// to the same speculation, in both formats, at a named window, at 0 and
 /// with none; and the backend's scope, the field every model takes, names
