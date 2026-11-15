@@ -14,10 +14,16 @@
  * at the head's frontier -- the one position of the head's layer no committed
  * state holds yet, which the sequence's next step writes again from the same
  * inputs -- and nothing else.
+ *
+ * GitHub #626: the chain readout (`ignis_mtp_readout_chain`, below) reads
+ * every draft the head's chain proposes at the frontier, with each step's
+ * scores: the replay of recorded agent turns under MTP stands on it, beside
+ * the teacher-forced round.
  */
 #ifndef IGNIS_MTP_READOUT_H
 #define IGNIS_MTP_READOUT_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -89,6 +95,60 @@ int32_t ignis_mtp_readout_ring(const struct ignis_seq_pool *pool, const struct i
  * prefill. Refused without the MTP head or a draft window, and past the
  * load's lanes. */
 int32_t ignis_mtp_readout_round_hidden(struct ignis_model *model, uint32_t lanes, uint16_t *out_hidden);
+
+/* GitHub #626: the head's chain at a sequence's frontier, read without
+ * running a round. `ignis_mtp_readout_chain` stages `seq` as lane 0 of a
+ * width-1 verify round at `extent` -- its pending token the anchor, its
+ * position the base, its slot -- and runs the round's own chain
+ * (kernel/src/mtp_head.h `propose`) once, eagerly: the same steps on the
+ * same inputs as the chain inside the sequence's next width-1 round at that
+ * extent, so the same drafts, each the argmax of its step's scores (the
+ * lowest id on a tie). Only where each step's scores land differs: its own
+ * block of the readout's scratch, not the round's logits, which it leaves
+ * as the last round left them. It copies out
+ *
+ *   out_drafts  I32 [extent]          the chain's drafts, in order
+ *   out_scores  BF16 [extent][vocab]  each step's scores, the target's output
+ *                                     head over the head's hidden at the step
+ *
+ * `window` is the caller's draft window and must be the load's; `extent` is
+ * 1 .. window, and the steps past it are not read (the chain masks them).
+ *
+ * What it writes: the round's staging buffers it stages (anchors, base
+ * positions, extents, the lane's slot, the drafts), which every round
+ * stages again before use, and the head's rows at positions [position - 1,
+ * position - 1 + extent): the head's frontier and the rows past it, which no
+ * committed state holds and every later step writes before it reads them.
+ * Under hq-e8-2b those appends also overwrite rows of the head's residual
+ * window and set their ring bits, which older keys inside the window still
+ * name, so the leaf saves the slot's head residual planes and head ring
+ * words before the chain and puts them back after it: the next step reads
+ * the window it would have read with no readout. The target's state is read
+ * only.
+ *
+ * Refused (-1, see ignis_mtp_readout_last_error) without the MTP head, on a
+ * pool of another drafter, for a sequence of another pool or with no
+ * pending token or no position, a window not the load's, an extent of 0 or
+ * past the window or one that runs past the sequence's capacity, and a size
+ * this leaf does not recognize. Synchronous; not thread-safe with any other
+ * call on the model. */
+struct ignis_mtp_chain_readout {
+  uint32_t size;   /* sizeof(struct ignis_mtp_chain_readout) */
+  uint32_t window; /* the load's draft window `k` */
+  uint32_t extent; /* the chain's steps read, 1 .. k */
+  uint32_t reserved;
+  int32_t *out_drafts;  /* host I32 [extent] */
+  uint16_t *out_scores; /* host BF16 [extent][vocab] */
+};
+#ifdef __cplusplus
+static_assert(sizeof(struct ignis_mtp_chain_readout) == 32 && offsetof(struct ignis_mtp_chain_readout, extent) == 8 &&
+                  offsetof(struct ignis_mtp_chain_readout, out_drafts) == 16 &&
+                  offsetof(struct ignis_mtp_chain_readout, out_scores) == 24,
+              "ignis_mtp_chain_readout drifted from crates/core/src/mtp_readout.rs IgnisMtpChainReadout");
+#endif
+
+int32_t ignis_mtp_readout_chain(struct ignis_model *model, struct ignis_seq_pool *pool, struct ignis_seq *seq,
+                                const struct ignis_mtp_chain_readout *readout);
 
 /* The message from the most recent failing call on this thread; never NULL. */
 const char *ignis_mtp_readout_last_error(void);

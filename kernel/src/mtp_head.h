@@ -151,7 +151,15 @@ RoundRows round_rows(std::uint64_t base, std::uint32_t extent, std::uint32_t com
 // scratch from `model.decode_graph_scratch` in its own scope, the step's
 // scores in `verify.logits` (which the pass writes again after it). Enqueue
 // only. 0, or -1 with `*error`.
-int32_t propose(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, std::string *error);
+//
+// GitHub #626: with `step_scores` (device BF16 `[window][vocab, width]`;
+// null in the round and in every captured graph) step s scores into its own
+// `[vocab, width]` block instead, so every step's scores outlive the next --
+// the proposal readout's (kernel/include/ignis_mtp_readout.h
+// `ignis_mtp_readout_chain`): the same kernels on the same inputs, only the
+// scores' address moves, and the round's logits are left as they were.
+int32_t propose(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, std::string *error,
+                std::uint16_t *step_scores = nullptr);
 
 // The commit's rows, eager, after the round's pass: lane b's rows at
 // `positions[b * (k + 1) + j]` (host I32 [k + 1, width]: base_b - 1 + min(j,

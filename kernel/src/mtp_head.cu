@@ -567,7 +567,8 @@ RoundRows round_rows(std::uint64_t base, std::uint32_t extent, std::uint32_t com
   return rows;
 }
 
-int32_t propose(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, std::string *error) {
+int32_t propose(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, std::string *error,
+                std::uint16_t *step_scores) {
   try {
     IgnisVerifyRound &verify = *model.verify;
     const auto window = static_cast<std::int32_t>(verify.window);
@@ -593,10 +594,15 @@ int32_t propose(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, s
     ninfer::Tensor positions = arena.alloc(ninfer::DType::I32, {batch, 1, 1, 1});
     ninfer::Tensor valid = arena.alloc(ninfer::DType::I32, {batch, 1, 1, 1});
     // The step's scores: the round's own logits, which the pass after the
-    // chain writes whole.
+    // chain writes whole -- or (GitHub #626) the readout's block of the step.
     ninfer::Tensor logits(verify.logits->p, ninfer::DType::BF16, {vocab, batch, 1, 1});
     for (std::int32_t step = 0; step < window; ++step) {
       ninfer::DeviceArena::Scope step_scope = arena.scope();
+      if (step_scores != nullptr) {
+        logits = ninfer::Tensor(step_scores + static_cast<std::size_t>(step) * static_cast<std::size_t>(vocab) *
+                                                  static_cast<std::size_t>(batch),
+                                ninfer::DType::BF16, {vocab, batch, 1, 1});
+      }
       detail::chain_rows(base_positions, extents, step, static_cast<std::int32_t *>(positions.data),
                          static_cast<std::int32_t *>(valid.data), batch, stream);
       ninfer::Tensor embedded = arena.alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
