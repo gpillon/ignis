@@ -357,3 +357,62 @@ fn beside_a_structured_answer_a_run_holding_the_opener_and_a_miss_is_cut_at_the_
     let first: Vec<PendingToken> = written[..8].iter().map(|&t| PendingToken::Token(t)).collect();
     assert_eq!(mock.cut_calls()[0], (id, first, 4), "kept: o, k, the close and the opener");
 }
+
+/// Thinking on, runs of five: the first run holds the reasoning's close and
+/// the model's own `<tool_call>` and line break, so the literal is joined
+/// after the token drawn with them, taken to be its `<`. Where that token is
+/// `<` the literal goes on from `function`, and the model's text after it is
+/// held; where it is a second line break, which the grammar takes where `<`
+/// was due, the literal's `function` is not forced: the literal yields and
+/// the model writes the call's head itself, held.
+#[test]
+fn a_call_the_model_opens_in_the_run_that_closes_its_reasoning_is_continued_or_yielded_to() {
+    let opened = script(&[&encode("ok"), &[THINK_END, OPEN], &encode("\n")]);
+    let cases = [
+        (
+            "the literal's `<`",
+            script(&[&opened, &encode("<"), &encode(&"y".repeat(8)), &after_opening("x")]),
+            script(&[&encode("ok"), &[THINK_END, OPEN], &encode(&body("a")), &[CLOSE]]),
+            (2, 2),
+        ),
+        (
+            "a line break more",
+            script(&[&opened, &encode("\n"), &encode(&body("x")[1..]), &[CLOSE]]),
+            script(&[&encode("ok"), &[THINK_END, OPEN], &encode("\n"), &encode(&body("a")), &[CLOSE]]),
+            (1, 1),
+        ),
+    ];
+    for (what, written, held, missed) in cases {
+        let mock = Arc::new(MockCompute::with_runs(&[5]));
+        let mut sched = scheduler(&mock);
+        let forced = ForcedLiteral::after_reasoning(required_opening(), THINK_END, required_opening().len()).unwrap();
+        let id = submit_held(&mut sched, true, 256, AnswerGrammar::tool_calls(grammar()).after(THINK_END), Some(forced));
+        mock.script(id, &written);
+
+        let events = run_to_idle(&mut sched);
+
+        assert_eq!(emitted(&events, id), held, "{what}");
+        assert_eq!(misses(&events, id), missed, "{what}");
+        let first: Vec<PendingToken> = written[..5].iter().map(|&t| PendingToken::Token(t)).collect();
+        assert_eq!(mock.cut_calls()[0], (id, first, 5), "{what}: the run kept whole");
+    }
+}
+
+/// A repair before the answer starts may draw the opener (#592): beside the
+/// request's strict tools the call it opens is held from there, the mask
+/// the answer's set was built for read anew by the tools' grammar.
+#[test]
+fn an_opener_a_repair_draws_opens_a_held_call() {
+    use ignis_core::structured::{GrammarState, Verdict};
+    let schema = r#"{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}"#;
+    let answer = AnswerGrammar::new(cache().json_schema(schema, true).unwrap(), StructuredKind::JsonSchema);
+    let mut state = GrammarState::new(&answer.admitting_tool_call(OPEN).holding_calls(grammar()), false);
+    let before = state.permitted().unwrap();
+    assert!(before.permits(OPEN) && before.permits(TokenId::from(b'{')));
+    assert_eq!(state.repaired(OPEN), Ok(false));
+    assert!(!state.released() && state.holds());
+    assert_eq!(state.check(PendingToken::Token(TokenId::from(b'x'))), Verdict::Miss);
+    let after = state.permitted().unwrap();
+    assert!(after.permits(TokenId::from(b'\n')) && after.permits(TokenId::from(b'<')), "the call's head");
+    assert!(!after.permits(TokenId::from(b'{')) && !after.permits(OPEN), "nothing of the answer");
+}
