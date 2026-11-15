@@ -272,37 +272,6 @@ pub const RESPONSES: &[FieldRule] = &[
     FieldRule { name: "client_metadata", inert: always, inert_when: ALWAYS, refusal: None },
 ];
 
-/// A member of a field the handler reads (`tools`) that is accepted at any
-/// value and inert: it asks for something this server does not do yet, and
-/// changes nothing it does. The template still renders it as sent.
-pub struct InertMember {
-    /// Where it sits in the body, as the document names it.
-    pub path: &'static str,
-    /// What it would ask for, and the issue that will serve it.
-    pub why: &'static str,
-}
-
-/// `strict` on a function tool (spec #287): the call's arguments are the
-/// model's own text, parsed as they come.
-const TOOL_STRICT: &str = "a call's arguments are not held to the function's `parameters` yet (GitHub #582)";
-
-/// The chat body's inert members: none since chat completions hold a strict
-/// tool's calls to its `parameters` (GitHub #611); on Flash-Next `strict`
-/// stays inert until #581, which the guide says.
-pub const CHAT_MEMBERS: &[InertMember] = &[];
-
-/// The Responses body's inert members: its function tools are flat.
-pub const RESPONSES_MEMBERS: &[InertMember] = &[InertMember { path: "tools[].strict", why: TOOL_STRICT }];
-
-/// The inert members of `surface`'s body.
-pub fn members(surface: Surface) -> &'static [InertMember] {
-    match surface {
-        Surface::Chat => CHAT_MEMBERS,
-        Surface::Responses => RESPONSES_MEMBERS,
-        Surface::Images | Surface::Transcriptions => &[],
-    }
-}
-
 /// The Images API's fields past what the image routes read
 /// (`crate::images::routes`): `response_format`, `output_format`,
 /// `background`, `size`, `n` and `mask` are refused where they are read.
@@ -406,13 +375,6 @@ pub fn describe(surface: Surface) -> String {
             rule.inert_when,
             rule.refusal.expect("filtered")
         ));
-    }
-    let members = members(surface);
-    if !members.is_empty() {
-        text.push_str("\nInert at any value inside a field the server reads:\n\n");
-        for member in members {
-            text.push_str(&format!("- `{}`: {}.\n", member.path, member.why));
-        }
     }
     text
 }
@@ -559,16 +521,15 @@ mod tests {
         }
     }
 
-    /// Spec #287: `strict` on a function tool is declared inert where the
-    /// document lists the fields, on the Responses API, naming #582; chat
-    /// completions hold a strict tool's calls (GitHub #611) and list it no
-    /// more.
+    /// `strict` on a function tool was declared inert where the document
+    /// lists the fields (spec #287) until a strict tool's calls were held, on
+    /// chat completions (GitHub #611) and on the Responses API (#613): no
+    /// surface lists it now. On Flash-Next, where it stays inert until #581,
+    /// the guide says so.
     #[test]
-    fn the_description_declares_a_function_tools_strict_inert_on_the_responses_api() {
-        let text = describe(Surface::Responses);
-        let line = text.lines().find(|line| line.contains("`tools[].strict`")).unwrap_or_else(|| panic!("{text}"));
-        assert!(line.contains("#582") && line.contains("`parameters`"), "{line}");
-        assert!(!describe(Surface::Chat).contains("strict"));
-        assert!(!describe(Surface::Images).contains("strict"));
+    fn no_surface_declares_a_function_tools_strict_inert() {
+        for surface in [Surface::Chat, Surface::Responses, Surface::Images, Surface::Transcriptions] {
+            assert!(!describe(surface).contains("strict"), "{surface:?}");
+        }
     }
 }

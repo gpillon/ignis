@@ -198,7 +198,11 @@ fn valid(tool: &str, arguments: &str) -> bool {
 
 /// The held tool calls' structured-output counts once the request is done.
 async fn tool_counts(server: &Server, requests: u64, misses: u64) {
-    let metrics = server.metrics.as_ref().unwrap();
+    counted(server.metrics.as_ref().unwrap(), requests, misses).await;
+}
+
+/// [`tool_counts`] in `metrics`.
+async fn counted(metrics: &ignis_server::metrics::Metrics, requests: u64, misses: u64) {
     responses::metric_reaches(metrics, &format!("ignis_structured_requests_total{{type=\"tool\"}} {requests}")).await;
     let exposition = metrics.render();
     for line in [format!("ignis_structured_misses_total{{type=\"tool\"}} {misses}"), format!("ignis_structured_repairs_total{{type=\"tool\"}} {misses}")] {
@@ -221,8 +225,21 @@ async fn a_strict_tools_call_is_held_and_delivered_in_the_schemas_order() {
 /// what each comes out as: always valid, its misses repaired.
 #[tokio::test]
 async fn scripts_that_miss_on_purpose_all_come_out_valid_with_their_repairs_counted() {
+    for (what, script, arguments, misses) in scripts_that_miss() {
+        let (server, _) = server(&script, ModelFamily::Qwen38_27b);
+        let (_, calls, finish) = served(&server, &chat(&[WRITE_FILE], false, 512)).await;
+        assert_eq!(finish, "tool_calls", "{what}");
+        assert_eq!(calls, [("write_file".to_owned(), arguments.to_owned())], "{what}");
+        assert!(valid(WRITE_FILE, arguments), "{what}: {arguments}");
+        tool_counts(&server, 1, misses).await;
+    }
+}
+
+/// What each script that misses on purpose is, writes, comes out as (the
+/// call's arguments) and misses, the same on every surface.
+fn scripts_that_miss() -> Vec<(&'static str, String, &'static str, u64)> {
     let close = "</parameter>\n</function>\n</tool_call>";
-    let cases: Vec<(&str, String, &str, u64)> = vec![
+    vec![
         // The model's own name for `path`: four letters, `file`, repaired
         // one at a time to the declared one, its value kept under it.
         (
@@ -276,22 +293,36 @@ async fn scripts_that_miss_on_purpose_all_come_out_valid_with_their_repairs_coun
             r#"{"path":"a.txt","content":"<parameter=path>\nb.txt\n</parameter>\n</function>\nnot the end\n</tool_call> either","mode":"w"}"#,
             0,
         ),
-    ];
-    for (what, script, arguments, misses) in cases {
-        let (server, _) = server(&script, ModelFamily::Qwen38_27b);
-        let (_, calls, finish) = served(&server, &chat(&[WRITE_FILE], false, 512)).await;
-        assert_eq!(finish, "tool_calls", "{what}");
-        assert_eq!(calls, [("write_file".to_owned(), arguments.to_owned())], "{what}");
-        assert!(valid(WRITE_FILE, arguments), "{what}: {arguments}");
-        tool_counts(&server, 1, misses).await;
-    }
+    ]
 }
 
 #[tokio::test]
 async fn a_strict_tool_outside_what_can_be_held_is_refused_before_generation_by_name() {
+    for (tool, code, param, named) in refused_tools() {
+        for choice in ["\"auto\"", "\"required\""] {
+            let (server, mock) = server("", ModelFamily::Qwen38_27b);
+            let body = chat(&[SEARCH, &tool], false, 64).replacen("\"tools\"", &format!("\"tool_choice\":{choice},\"tools\""), 1);
+            let (status, json, text) = post(&server, &body).await;
+            assert_eq!(status, 400, "{tool}: {text}");
+            assert_eq!((json["error"]["code"].as_str(), json["error"]["param"].as_str()), (Some(code), Some(param)), "{text}");
+            let message = json["error"]["message"].as_str().unwrap();
+            assert!(message.starts_with(&format!("{param}: strict tool refused, {named}")), "{message}");
+            assert!(mock.prefill_calls().is_empty(), "nothing is generated");
+        }
+        // Flash-Next serves them, `strict` inert there until #581.
+        let (server, _) = server("", ModelFamily::FlashNext);
+        let (status, _, text) = post(&server, &chat(&[SEARCH, &tool], false, 64)).await;
+        assert_eq!(status, 200, "{text}");
+    }
+}
+
+/// Strict tools the second of a request's tools, each refused: the tool as
+/// sent to chat completions, the refusal's code, its `param` there, and the
+/// keyword its message names.
+fn refused_tools() -> Vec<(String, &'static str, &'static str, &'static str)> {
     let strict = |parameters: &str| format!(r#"{{"type":"function","function":{{"name":"g","strict":true,"parameters":{parameters}}}}}"#);
     let object = |inner: &str| strict(&format!(r#"{{"type":"object","properties":{{"a":{inner}}},"required":["a"],"additionalProperties":false}}"#));
-    let cases: Vec<(String, &str, &str, &str)> = vec![
+    vec![
         (object(r#"{"type":"string","minLength":2}"#), "unsupported_keyword", "tools[1].function.parameters", "`minLength`"),
         (strict(r#"{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}"#), "additional_properties_not_false", "tools[1].function.parameters", "`additionalProperties`"),
         (strict(r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a"],"additionalProperties":false}"#), "not_all_required", "tools[1].function.parameters", "`required`"),
@@ -308,23 +339,7 @@ async fn a_strict_tool_outside_what_can_be_held_is_refused_before_generation_by_
             "tools[1].function.name",
             "`name`",
         ),
-    ];
-    for (tool, code, param, named) in cases {
-        for choice in ["\"auto\"", "\"required\""] {
-            let (server, mock) = server("", ModelFamily::Qwen38_27b);
-            let body = chat(&[SEARCH, &tool], false, 64).replacen("\"tools\"", &format!("\"tool_choice\":{choice},\"tools\""), 1);
-            let (status, json, text) = post(&server, &body).await;
-            assert_eq!(status, 400, "{tool}: {text}");
-            assert_eq!((json["error"]["code"].as_str(), json["error"]["param"].as_str()), (Some(code), Some(param)), "{text}");
-            let message = json["error"]["message"].as_str().unwrap();
-            assert!(message.starts_with(&format!("{param}: strict tool refused, {named}")), "{message}");
-            assert!(mock.prefill_calls().is_empty(), "nothing is generated");
-        }
-        // Flash-Next serves them, `strict` inert there until #581.
-        let (server, _) = server("", ModelFamily::FlashNext);
-        let (status, _, text) = post(&server, &chat(&[SEARCH, &tool], false, 64)).await;
-        assert_eq!(status, 200, "{text}");
-    }
+    ]
 }
 
 #[tokio::test]
@@ -430,4 +445,221 @@ async fn the_reasoning_is_free_and_the_content_after_it_held() {
     assert!(message["reasoning_content"].as_str().unwrap().contains("<function=nope>"), "{text}");
     assert_eq!(message["tool_calls"][0]["function"]["arguments"], r#"{"path":"a.txt","content":"hi","mode":"a"}"#);
     tool_counts(&server, 1, 1).await;
+}
+
+// ── the Responses API (GitHub #613) ──────────────────────────────────────
+//
+// The same hold on `/v1/responses`, over HTTP and over the WebSocket mode:
+// a function tool sent with `strict: true` flat beside its name.
+
+const RESPONSES: &str = "/v1/responses";
+
+/// A chat tool in the Responses API's flat shape: its function's members
+/// beside its `type`, in the order sent.
+fn flat(tool: &str) -> String {
+    let members = tool.strip_prefix(r#"{"type":"function","function":{"#).and_then(|rest| rest.strip_suffix("}}")).expect("a chat tool");
+    format!(r#"{{"type":"function",{members}}}"#)
+}
+
+/// A Responses request with `tools` (their JSON as sent), thinking off,
+/// greedy.
+fn responses_body(tools: &[&str], stream: bool, max_output_tokens: u32) -> String {
+    format!(
+        r#"{{"model":"{MODEL}","input":"write it","tools":[{}],"enable_thinking":false,"temperature":0,"max_output_tokens":{max_output_tokens},"stream":{stream}}}"#,
+        tools.join(",")
+    )
+}
+
+/// `body` as a `response.create` frame, its text as written: a `type`
+/// first, every key in the order sent.
+fn create_frame(body: &str) -> String {
+    body.replacen('{', "{\"type\":\"response.create\",", 1)
+}
+
+/// What a response delivered: its reasoning, its text, its calls (name and
+/// arguments as sent), its status.
+#[derive(Debug, PartialEq)]
+struct Delivered {
+    reasoning: String,
+    text: String,
+    calls: Vec<(String, String)>,
+    status: String,
+}
+
+fn delivered(response: &JsonValue) -> Delivered {
+    let items = response["output"].as_array().unwrap();
+    let texts = |kind: &str| -> String {
+        items
+            .iter()
+            .filter(|item| item["type"] == kind)
+            .flat_map(|item| item["content"].as_array().unwrap())
+            .filter_map(|part| part["text"].as_str())
+            .collect()
+    };
+    let calls = items
+        .iter()
+        .filter(|item| item["type"] == "function_call")
+        .map(|item| (item["name"].as_str().unwrap().to_owned(), item["arguments"].as_str().unwrap().to_owned()))
+        .collect();
+    Delivered { reasoning: texts("reasoning"), text: texts("message"), calls, status: response["status"].as_str().unwrap().to_owned() }
+}
+
+/// What a stream of events delivered, read from its terminal event's
+/// response, once held to what a client sees on the way: every call in one
+/// arguments delta, its whole arguments, and text deltas that add up to the
+/// response's text and never carry a call's tags.
+fn delivered_by(events: &[JsonValue]) -> Delivered {
+    let of = |kind: &'static str| events.iter().filter(move |event| event["type"] == kind);
+    let terminal = events.last().expect("a terminal event");
+    let whole = delivered(&terminal["response"]);
+    let deltas: Vec<&JsonValue> = of("response.function_call_arguments.delta").collect();
+    let done: Vec<&JsonValue> = of("response.function_call_arguments.done").collect();
+    assert_eq!(deltas.len(), whole.calls.len(), "one arguments delta per call: {events:?}");
+    for ((delta, done), (_, arguments)) in deltas.iter().zip(&done).zip(&whole.calls) {
+        assert_eq!((delta["delta"].as_str(), done["arguments"].as_str()), (Some(arguments.as_str()), Some(arguments.as_str())));
+    }
+    let text: String = of("response.output_text.delta").map(|event| event["delta"].as_str().unwrap()).collect();
+    assert_eq!(text, whole.text, "the text deltas add up to the response's text");
+    assert!(!text.contains("<tool_call>") && !text.contains("<function"), "{text:?}");
+    whole
+}
+
+/// The response to `body` over HTTP, whole or streamed, and the server's
+/// metrics.
+async fn over_http(script: &str, body: &str, stream: bool) -> (Delivered, Arc<ignis_server::metrics::Metrics>, Arc<MockCompute>) {
+    let (server, mock) = server(script, ModelFamily::Qwen38_27b);
+    let request = Request::builder().method("POST").uri(RESPONSES).header("content-type", "application/json").body(Body::from(body.to_owned())).unwrap();
+    let response = server.app().oneshot(request).await.unwrap();
+    let status = response.status().as_u16();
+    let text = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    assert_eq!(status, 200, "{text}");
+    let out = match stream {
+        false => delivered(&serde_json::from_str(&text).unwrap()),
+        true => delivered_by(&responses::sse_events(&text).into_iter().map(|(_, event)| event).collect::<Vec<_>>()),
+    };
+    (out, server.metrics.clone().unwrap(), mock)
+}
+
+/// The events answering `body` as a `response.create` on the WebSocket mode
+/// of a server whose first request writes `script`, and its metrics.
+async fn socket_events(script: &str, family: ModelFamily, body: &str) -> (Vec<JsonValue>, Arc<ignis_server::metrics::Metrics>, Arc<MockCompute>) {
+    let (server, mock) = server(script, family);
+    let metrics = server.metrics.clone().unwrap();
+    let live = responses::live(server).await;
+    let mut socket = responses::socket(&live).await;
+    responses::send_text(&mut socket, create_frame(body)).await;
+    (responses::events_until(&mut socket, responses::terminal).await, metrics, mock)
+}
+
+/// The response to `body` on the WebSocket mode, and the server's metrics.
+async fn over_socket(script: &str, body: &str) -> (Delivered, Arc<ignis_server::metrics::Metrics>) {
+    let (events, metrics, _) = socket_events(script, ModelFamily::Qwen38_27b, body).await;
+    (delivered_by(&events), metrics)
+}
+
+/// #611's scripts that miss on purpose, and one that writes the parameters
+/// in an order of its own after some text, each come out on the Responses
+/// API valid and in the schema's order, their misses repaired and counted,
+/// the same whole, streamed and on the WebSocket mode, whose frame is
+/// parsed into a value that sorts the keys of the `parameters` sent.
+#[tokio::test]
+async fn on_the_responses_api_the_scripts_come_out_valid_over_http_and_the_socket() {
+    let own_order = ("a call in the model's own order", format!("On it.\n{}", call("write_file", &[("mode", "w"), ("content", "hi"), ("path", "a.txt")])), r#"{"path":"a.txt","content":"hi","mode":"w"}"#, 0);
+    let tool = flat(WRITE_FILE);
+    for (what, script, arguments, misses) in std::iter::once(own_order).chain(scripts_that_miss()) {
+        let (whole, metrics, mock) = over_http(&script, &responses_body(&[&tool], false, 512), false).await;
+        assert_eq!(whole.status, "completed", "{what}");
+        assert_eq!(whole.calls, [("write_file".to_owned(), arguments.to_owned())], "{what}");
+        assert!(valid(WRITE_FILE, arguments), "{what}: {arguments}");
+        counted(&metrics, 1, misses).await;
+        assert!(mock.decode_calls().iter().flatten().all(|job| job.checked), "{what}: every round of the content is checked");
+        let (streamed, metrics, _) = over_http(&script, &responses_body(&[&tool], true, 512), true).await;
+        assert_eq!(streamed, whole, "{what}: streamed and whole");
+        counted(&metrics, 1, misses).await;
+        let (socket, metrics) = over_socket(&script, &responses_body(&[&tool], false, 512)).await;
+        assert_eq!(socket, whole, "{what}: the socket and HTTP");
+        counted(&metrics, 1, misses).await;
+    }
+}
+
+/// A strict tool the hold refuses is refused on the Responses API as on chat
+/// completions, before anything is generated, its `param` naming the tool's
+/// field where the request sent it: flat beside the tool's `type`, or in its
+/// `function` for a tool sent in the chat shape, which the Responses API
+/// takes as it is. The WebSocket mode answers the same refusal as an `error`
+/// event; Flash-Next serves the tool, `strict` inert there.
+#[tokio::test]
+async fn on_the_responses_api_a_refused_strict_tool_is_named_where_it_was_sent() {
+    let as_chat = refused_tools().into_iter().map(|(tool, code, param, named)| (tool, code, param.to_owned(), named));
+    let as_flat = refused_tools().into_iter().map(|(tool, code, param, named)| (flat(&tool), code, param.replacen(".function.", ".", 1), named));
+    for (tool, code, param, named) in as_flat.chain(as_chat.take(1)) {
+        let body = responses_body(&[&flat(SEARCH), &tool], false, 64);
+        let (server, mock) = server("", ModelFamily::Qwen38_27b);
+        let request = Request::builder().method("POST").uri(RESPONSES).header("content-type", "application/json").body(Body::from(body.clone())).unwrap();
+        let response = server.app().oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let json: JsonValue = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(status, 400, "{tool}: {json}");
+        let error = &json["error"];
+        assert_eq!((error["code"].as_str(), error["param"].as_str()), (Some(code), Some(param.as_str())), "{json}");
+        assert!(error["message"].as_str().unwrap().starts_with(&format!("{param}: strict tool refused, {named}")), "{json}");
+        assert!(mock.prefill_calls().is_empty(), "nothing is generated");
+        let (events, _, mock) = socket_events("", ModelFamily::Qwen38_27b, &body).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!((events[0]["type"].as_str(), events[0]["status"].as_u64()), (Some("error"), Some(400)), "{events:?}");
+        assert_eq!(&events[0]["error"], error, "the socket's refusal is HTTP's");
+        assert!(mock.prefill_calls().is_empty(), "nothing is generated on the socket");
+        // A warm-up, which generates nothing, refuses it too.
+        let (events, _, mock) = socket_events("", ModelFamily::Qwen38_27b, &body.replacen('{', "{\"generate\":false,", 1)).await;
+        assert_eq!((events.len(), &events[0]["error"]), (1, error), "a warm-up's refusal: {events:?}");
+        assert!(mock.prefill_calls().is_empty(), "nothing is prefilled for the warm-up");
+        let (events, _, _) = socket_events("", ModelFamily::FlashNext, &body).await;
+        assert_eq!(events.last().unwrap()["type"], "response.completed", "{events:?}");
+    }
+}
+
+/// A Responses request whose tools are not strict, `strict: false` or no
+/// `strict` at all (normalized only from #614), is held to nothing: no
+/// round of it is checked, and its call is read as today, its keys sorted.
+#[tokio::test]
+async fn on_the_responses_api_a_request_with_no_strict_tool_is_held_to_nothing() {
+    let script = call("write_file", &[("mode", "x"), ("path", "a.txt")]);
+    for tool in [flat(WRITE_FILE).replace("\"strict\":true", "\"strict\":false"), flat(WRITE_FILE).replace("\"strict\":true,", "")] {
+        let body = responses_body(&[&tool], false, 256);
+        let (whole, metrics, mock) = over_http(&script, &body, false).await;
+        assert_eq!(whole.calls, [("write_file".to_owned(), r#"{"mode":"x","path":"a.txt"}"#.to_owned())], "{tool}");
+        assert!(mock.decode_calls().iter().flatten().all(|job| !job.checked));
+        assert!(mock.repair_calls().is_empty());
+        assert!(!metrics.render().contains("ignis_structured_"));
+        let (socket, _) = over_socket(&script, &body).await;
+        assert_eq!(socket, whole, "{tool}: the socket and HTTP");
+    }
+}
+
+/// #611's other scripts on the Responses API, over HTTP and the WebSocket
+/// mode: beside a strict tool a free tool's arguments stay free, and with
+/// thinking on the reasoning is free, a call written there included, and the
+/// content after its `</think>` held.
+#[tokio::test]
+async fn on_the_responses_api_a_free_tool_and_the_reasoning_stay_free() {
+    let free = "<tool_call>\n<function=search>\n<parameter=query>\ncats\n</parameter>\n<parameter=limit>\nmany\n</parameter>\n</function>\n</tool_call>";
+    let beside = format!("{free}\n{}", call("write_file", &[("path", "a.txt"), ("content", "hi"), ("mode", "w")]));
+    let reasoned = format!("I could <tool_call>\n<function=nope> here.</think>\n{}", call("write_file", &[("path", "a.txt"), ("content", "hi"), ("mode", "x")]));
+    let thinking = responses_body(&[&flat(WRITE_FILE)], false, 256).replace("\"enable_thinking\":false", "\"enable_thinking\":true");
+    // Each script, its request, the calls it delivers, what its reasoning
+    // holds, and its misses.
+    let cases = [
+        (beside, responses_body(&[&flat(SEARCH), &flat(WRITE_FILE)], false, 512), r#"[["search","{\"limit\":\"many\",\"query\":\"cats\"}"],["write_file","{\"path\":\"a.txt\",\"content\":\"hi\",\"mode\":\"w\"}"]]"#, "", 0),
+        (reasoned, thinking, r#"[["write_file","{\"path\":\"a.txt\",\"content\":\"hi\",\"mode\":\"a\"}"]]"#, "<function=nope>", 1),
+    ];
+    for (script, body, calls, reasoning, misses) in cases {
+        let calls: Vec<(String, String)> = serde_json::from_str(calls).unwrap();
+        let (whole, metrics, _) = over_http(&script, &body, false).await;
+        assert_eq!(whole.calls, calls, "{script}");
+        assert!(whole.reasoning.contains(reasoning) && whole.reasoning.is_empty() == reasoning.is_empty(), "{whole:?}");
+        counted(&metrics, 1, misses).await;
+        let (socket, metrics) = over_socket(&script, &body).await;
+        assert_eq!(socket, whole, "{script}: the socket and HTTP");
+        counted(&metrics, 1, misses).await;
+    }
 }
