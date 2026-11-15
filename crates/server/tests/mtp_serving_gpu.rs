@@ -25,14 +25,15 @@
 //! 3. **Structured output.** A `json_schema` response format answers with a
 //!    document valid under its schema; a request at the API's defaults
 //!    (thinking on, sampled) drafts too.
-//! 4. **Siblings over one system prompt reuse the shared prefix**, each
+//! 4. (after 5, on the same load) **Siblings over one system prompt reuse the shared prefix**, each
 //!    answering its own question and drafting, seven of them claiming it at
 //!    once, one a lane: every holder keeps its own copy of the prefix's last
 //!    page (ADR 0095), on a pool at its floor, the pages admission keeps back
 //!    for those copies included (GitHub #623), their reservations filling
 //!    what admission holds. A pool a page under that floor is refused before
 //!    anything loads, naming the copies.
-//! 5. **A request evicted to KV-RAM goes on.** On that floor pool, an Agent
+//! 5. **A request evicted to KV-RAM goes on.** First on that floor pool, so no
+//!    retained state stands in the room a move makes, an Agent
 //!    request is decoding when an Interactive request reserving one whole
 //!    context arrives: admission holds exactly that context beside the
 //!    retained slots' pages, so the Agent request -- the eviction order's

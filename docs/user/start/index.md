@@ -25,7 +25,7 @@ loads one of the eight at a time and switches between them without a restart.
 
 | Model | Id | What it is | Size on disk |
 |---|---|---|---|
-| Qwen3.8-27B | `qwen3.8-27b` (the default) | A dense text model, NVFP4, with a DFlash2 draft module for speculative decoding and an optional vision tower for image input. | 18.1 GiB |
+| Qwen3.8-27B | `qwen3.8-27b` (the default) | A dense text model, NVFP4, with a DFlash2 draft module for speculative decoding (from 0.11.0 its own MTP head too, opt-in) and an optional vision tower for image input. | 18.1 GiB |
 | Qwen3.8-27B for 16 GB cards | `qwen3.8-27b-16g` | The same 27B with a 3-bit trellis body, for the 16 GB class; it answers to `qwen3.8-27b` on a 16 GB card. | 12.5 GiB |
 | Qwen3.8-27B, uncensored | `qwen3.8-27b-abliterated` | The same weights with an abliteration applied. It does not refuse, so [read its page](../guides/uncensored.md) before exposing it. | 18.1 GiB |
 | Qwen3.8-27B, uncensored, for 16 GB cards | `qwen3.8-27b-abliterated-16g` | The 16 GB artifact with the same abliteration; it answers to `qwen3.8-27b-abliterated` on a 16 GB card. | 12.5 GiB |
