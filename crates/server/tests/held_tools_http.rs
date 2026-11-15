@@ -609,6 +609,10 @@ async fn on_the_responses_api_a_refused_strict_tool_is_named_where_it_was_sent()
         assert_eq!((events[0]["type"].as_str(), events[0]["status"].as_u64()), (Some("error"), Some(400)), "{events:?}");
         assert_eq!(&events[0]["error"], error, "the socket's refusal is HTTP's");
         assert!(mock.prefill_calls().is_empty(), "nothing is generated on the socket");
+        // A warm-up, which generates nothing, refuses it too.
+        let (events, _, mock) = socket_events("", ModelFamily::Qwen38_27b, &body.replacen('{', "{\"generate\":false,", 1)).await;
+        assert_eq!((events.len(), &events[0]["error"]), (1, error), "a warm-up's refusal: {events:?}");
+        assert!(mock.prefill_calls().is_empty(), "nothing is prefilled for the warm-up");
         let (events, _, _) = socket_events("", ModelFamily::FlashNext, &body).await;
         assert_eq!(events.last().unwrap()["type"], "response.completed", "{events:?}");
     }

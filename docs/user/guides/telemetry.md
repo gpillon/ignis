@@ -107,8 +107,10 @@ closed block that did not parse, which the client never sees),
 length or a count, and `undeclared_tool`; a call counts once under each kind it
 has), and `ignis_tool_strict_outside_subset_total`, the strict tools
 (`strict: true`) whose schema lies outside OpenAI's strict subset, once per
-request that sends one and served as any other tool (read on a model that
-serves structured output, so not on Flash-Next). A call still open when
+request that sends one, counted as it arrives, before the 27B refuses it with
+a `400` on chat completions and on the Responses API
+([Held tools](../api/structured-output.md#held-tools-strict-true); read on a
+model that serves structured output, so not on Flash-Next). A call still open when
 generation ends is not counted: its `finish_reason` says it was cut. Beside
 them, `ignis_tool_call_values_split_total` counts the string values (of a
 parameter the tool declares a string) that the parser ended at a tag inside
