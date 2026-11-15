@@ -241,7 +241,7 @@ pub(crate) async fn prepare(
         req.tools.unwrap_or_default().into_iter().map(|tool| (tool.value, tool.ordered)).unzip();
     let tools = chat_tools(&sent_tools)?;
     let (tools, tool_choice) = api::resolve_tools(Some(tools), req.tool_choice.clone().map(chat_tool_choice))?;
-    api::count_strict_tools(server, &tools);
+    api::count_strict_tools(server, &raw_tools, &tools);
 
     let mut items = history;
     items.extend(input_items(req.input.clone())?);

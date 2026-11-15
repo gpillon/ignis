@@ -1498,21 +1498,24 @@ pub(crate) fn resolve_tools(
 
 /// Count the request's strict tools whose `parameters` lie outside OpenAI's
 /// strict subset (GitHub #608, ADR 0094), the schemas structured output's
-/// grammar refuses under `strict` (a refusal is kept with the grammars, so a
-/// schema sent every turn is read once). Nothing about the request changes:
-/// the tool is served as any other. Only a model that holds answers to a
-/// grammar has the subset to read them by; Flash-Next's are not counted.
-pub(crate) fn count_strict_tools(server: &Server, tools: &[JsonValue]) {
+/// grammar refuses under `strict`, as they arrive: [`held_tools`] then
+/// refuses such a request with a 400. Each is compiled as `held_tools`
+/// compiles it, in the key order sent (`raw`), so it is the same cached
+/// grammar or refusal, read once for a schema sent every turn. Only a model
+/// that holds answers to a grammar has the subset to read them by;
+/// Flash-Next's are not counted.
+pub(crate) fn count_strict_tools(server: &Server, raw: &[ignis_grammar::json::Json], tools: &[JsonValue]) {
     let Some(metrics) = &server.metrics else { return };
-    let strict = |tool: &&JsonValue| tool["function"]["strict"] == JsonValue::Bool(true);
-    if !tools.iter().any(|tool| strict(&tool)) {
+    let strict = |tool: &JsonValue| tool["function"]["strict"] == JsonValue::Bool(true);
+    if !tools.iter().any(strict) {
         return;
     }
     let Some(grammars) = server.active().template.grammars() else { return };
     let outside = tools
         .iter()
-        .filter(strict)
-        .filter(|tool| grammars.json_schema(&tool["function"]["parameters"].to_string(), true).is_err())
+        .enumerate()
+        .filter(|(_, tool)| strict(tool))
+        .filter(|(index, tool)| grammars.json_schema(&strict_parameters(raw.get(*index), tool), true).is_err())
         .count();
     if outside > 0 {
         metrics.record_strict_tools_outside_subset(outside as u64);
@@ -3364,7 +3367,7 @@ async fn chat_completions(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
-    count_strict_tools(&server, &tools);
+    count_strict_tools(&server, raw_tools.as_deref().unwrap_or_default(), &tools);
     let cap_field = match req.max_completion_tokens {
         Some(_) => "max_completion_tokens",
         None => "max_tokens",

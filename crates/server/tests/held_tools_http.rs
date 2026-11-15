@@ -238,6 +238,27 @@ async fn a_strict_tools_call_is_held_and_delivered_in_the_schemas_order() {
     assert!(mock.decode_calls().iter().flatten().all(|job| job.checked), "every round of the content is checked");
 }
 
+/// A strict schema sent in an order that is not its keys' sorted one is
+/// compiled once, as sent, for the outside-subset count and for its held
+/// calls alike: one grammar for it and one for the request's tools, and a
+/// request sent again compiles nothing.
+#[tokio::test]
+async fn a_strict_schema_is_compiled_once_in_the_order_sent() {
+    let script = call("write_file", &[("path", "a.txt"), ("content", "hi"), ("mode", "w")]);
+    let mock = Arc::new(MockCompute::new());
+    mock.script(0, &encode(&script));
+    mock.script(1, &encode(&script));
+    let vocabulary = Vocabulary::new();
+    let grammars = vocabulary.grammars.clone();
+    let scheduler = ConcreteScheduler::with_config(SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() }, mock);
+    let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(vocabulary)).with_seedless_seed(0).with_family(ModelFamily::Qwen38_27b).with_metrics();
+    for _ in 0..2 {
+        let (_, calls, _) = served(&server, &chat(&[WRITE_FILE], false, 256)).await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!((grammars.compiles(), grammars.len()), (2, 2), "the schema as sent, and the tools'");
+    }
+}
+
 /// The scripts that miss on purpose, each one call to `write_file`, and
 /// what each comes out as: always valid, its misses repaired.
 #[tokio::test]
