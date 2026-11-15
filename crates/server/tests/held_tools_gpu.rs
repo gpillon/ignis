@@ -481,11 +481,19 @@ async fn strict_tools_on_the_27b_with_dflash2_return_valid_calls_their_repairs_c
     }
     eprintln!("\n══ the early closes: a required parameter the free twin left out, which the held call wrote");
     let missing = || read.iter().filter(|r| r.fault.kind == "missing");
-    let early: Vec<&Read> = missing().filter(|r| r.held != "(absent)" && r.held != "(no such call)").collect();
+    let written = |r: &&Read| r.held != "(absent)" && r.held != "(no such call)";
+    // A nullable parameter left out is delivered `null` by rule (#612), no
+    // miss: not a repair.
+    let early: Vec<&Read> = missing().filter(written).filter(|r| r.held != "null").collect();
     for r in &early {
         eprintln!("  {}: {} -> held wrote {}", r.case, r.fault.at, r.held);
     }
-    eprintln!("  {} early closes repaired into writing the parameter, of {} parameters the free twins left out", early.len(), missing().count());
+    let nulled = missing().filter(written).filter(|r| r.held == "null").count();
+    eprintln!(
+        "  {} early closes repaired into writing the parameter, of {} parameters the free twins left out ({nulled} of them nullable, delivered null by rule)",
+        early.len(),
+        missing().count()
+    );
     eprintln!("\n══ the other repairs, as the free twins show them");
     for r in read.iter().filter(|r| r.fault.kind != "missing") {
         let bait = if r.bait.is_empty() { String::new() } else { format!(" [{}]", r.bait) };
