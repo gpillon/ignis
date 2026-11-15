@@ -276,7 +276,8 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
 - **The model writes its call in its own dialect and order.** It may write
   the parameters in any order, each at most once; the function closes only
   once every required parameter is written (a strict schema requires them
-  all). A call that would close early is steered to the missing parameter.
+  all; one that may be `null` may be left out). A call that would close early
+  is steered to the missing parameter.
 - **The answer is free outside its calls.** The grammar arms at a call's
   `<tool_call>`, in the answer only, never in the reasoning, and is released
   at the call's close; each further call arms it again. A call cut by
@@ -291,10 +292,8 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
   to it, on one line that does not start with one of the call's tags
   (`<parameter=`, `</parameter>`, `</function>`). `minLength` and `maxLength`
   lie outside the strict subset and are refused.
-- **A parameter of another type** (an integer, a number, a boolean, an
-  object, an array, a union with `null`) is accepted, and its value comes as
-  the model wrote it: the call around it is held, the value not yet (GitHub
-  #612).
+- **A parameter of another type**, and one that may be `null`, is held as
+  well: [Typed and nullable parameters](#typed-and-nullable-parameters).
 - **A tool without `strict`** in the same request keeps its arguments as the
   model writes them. With a strict tool in the request, every call's
   function name is held to the request's tools.
@@ -322,6 +321,63 @@ beside its `type`: `tools[1].parameters`, `tools[i].name`, `tools[i].strict`.
 | a strict tool with a parameter whose name holds `>` | `parameter_name_unwritable` |
 | a strict tool with an `enum`, a `const` or a `pattern` no value of which fits on one line that does not start with one of the call's tags | `no_writable_value`, naming the keyword |
 | a strict tool with thinking on, on a tokenizer whose `</think>` is not one token | `unsupported_value`, `param` `tools[i].function.strict`; send `enable_thinking: false` |
+
+### Typed and nullable parameters
+
+A strict tool's parameters of every type are held, not only its strings, on
+chat completions and on the Responses API alike (GitHub #612).
+
+- **An integer, a number, a boolean, an object or an array** is written by
+  the model as JSON and held to its own subschema by the grammar that holds
+  `json_schema`: bounds and `multipleOf`, item counts, an object's keys,
+  `enum` and `const`, `anyOf`, and `$defs` with `$ref`, recursion included,
+  in the grammar's narrower set ([What the grammar writes](#what-the-grammar-writes)).
+  The JSON starts on the line after the parameter's opener, or right after
+  it, with no whitespace before it; whitespace may follow it.
+- **It arrives as the model wrote it**, compact: an object's keys in its
+  schema's order, every digit of a number kept, a literal in its canonical
+  spelling (`1.50` is `1.5`). A call that writes `12` for an integer gets
+  `12`; one that would write `twelve` is repaired to a number.
+- **A string beside another type**, as in `anyOf` a string and an integer,
+  or an `enum` of a string and a number, is held as JSON as well: the model
+  writes the string quoted, `"abc"`.
+- **A parameter that may be `null`** (`"type": ["string", "null"]`, or
+  `anyOf` with `{"type": "null"}`, the way a strict schema writes an
+  optional one) may be left out of the call, and the call's `arguments` then
+  carry `null` for it, so they hold every key strict mode requires. Written,
+  it is held to its type, or to `null`.
+- **A string that may be `null` is the call's raw text, and a text that
+  reads `null` is `null`.** Such a parameter never arrives as the string
+  `"null"`: the model's dialect writes a string without quotes, so the four
+  letters can only be one of the two, and they are read as null, spaces
+  around them aside. Any other text is that text, `"null"` with its quotes
+  included. A `pattern`, a `format` or an `enum` on such a parameter holds
+  its text to it, or to `null`.
+
+A call to a strict `edit` with an object `change` holding a list of edits,
+an integer `line`, a boolean `dry_run` and an optional string `note`, which
+the model writes in its own dialect, `note` left out,
+
+```text
+<tool_call>
+<function=edit>
+<parameter=change>
+{"edits": [{"old": "x", "new": "y"}]}
+</parameter>
+<parameter=line>
+12
+</parameter>
+<parameter=dry_run>
+false
+</parameter>
+</function>
+</tool_call>
+```
+
+arrives with the `arguments`
+`{"line":12,"dry_run":false,"change":{"edits":[{"old":"x","new":"y"}]},"note":null}`
+when its `properties` are sent in that order: `line`, `dry_run`, `change`,
+`note`.
 
 ### Beside `tool_choice`, `response_format` and `parallel_tool_calls`
 

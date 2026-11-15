@@ -23,17 +23,27 @@
 //!   opens the same way.
 //!
 //! A held value is the dialect's raw text, one leading and one trailing
-//! newline aside (the parser trims them):
-//! - a free string (and, until #612, a value of any other type) is any
-//!   UTF-8 text; with a required parameter still missing, a line of it may
-//!   not start `</function`, and a `</parameter>` line may not be followed by
-//!   `</` (the two miss points the spike found on the 27B's tokenizer: the
-//!   close it is steered away from);
+//! newline aside (the parser trims them), read into the arguments as its
+//! [`call::Reading`] says (#612):
+//! - a free string is any UTF-8 text; with a required parameter still
+//!   missing, a line of it may not start `</function`, and a `</parameter>`
+//!   line may not be followed by `</` (the two miss points the spike found on
+//!   the 27B's tokenizer: the close it is steered away from);
 //! - a string with an `enum`, a `const`, a `pattern` or a `format` is held
 //!   to it, written on one line that does not start with one of the
 //!   dialect's own tags (`<parameter=`, `</parameter>`, `</function>`), so
 //!   where it ends is never in doubt; a value outside that is refused when
-//!   the request arrives, by name (`no_writable_value`).
+//!   the request arrives, by name (`no_writable_value`);
+//! - a string that may be `null` is either, and its text `null` is `null`:
+//!   such a value cannot be the string `null`;
+//! - a value of another type (an integer, a number, a boolean, an object, an
+//!   array), or of a union no raw text holds (a string beside another type),
+//!   is JSON held to its subschema by the schema's own automaton, from the
+//!   value's first byte (no whitespace before it but the trimmed newline);
+//!   whitespace may follow it, then the call's next step at a line's start.
+//!
+//! A nullable parameter is not required: a call may leave it out, and its
+//! arguments then carry `null` for it ([`call::Parameters::reading`]).
 //!
 //! Whitespace between a step's tags, before `<function=` and before the
 //! first parameter is bounded ([`crate::GrammarLimits::max_whitespace`]):
@@ -44,7 +54,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::call::{self, Line, Parameters, Step, CALL_CLOSE, CALL_OPEN, FUNCTION_CLOSE, FUNCTION_OPEN, PARAMETER_CLOSE, PARAMETER_OPEN};
+use crate::automaton::{accepts_value, Config, Frame, State};
+use crate::call::{self, Line, Parameters, Reading, Step, CALL_CLOSE, CALL_OPEN, FUNCTION_CLOSE, FUNCTION_OPEN, PARAMETER_CLOSE, PARAMETER_OPEN};
 use crate::json::Json;
 use crate::regex::{ByteDfa, DEAD, FREE};
 use crate::schema::{Grammar, LitTrie, Node, Refusal, NO_RE};
@@ -125,17 +136,19 @@ impl Controls {
 enum Slot {
     /// What precedes the first parameter: whitespace.
     Junk,
-    /// A string with no `enum`, `pattern` or `format`, and (until #612) a
-    /// value of any other type: any UTF-8 text.
+    /// A string with no `enum`, `pattern` or `format`: any UTF-8 text.
     Free,
     /// A string held to a `pattern` or a `format`: its DFA (`re`, in the
     /// tool's own grammar), which states can still reach a match on one
     /// line, and the same for each prefix of a dialect tag the value may
-    /// start with.
-    Pattern { re: u32, coacc: Vec<bool>, prefixes: Vec<(u8, bool)> },
+    /// start with; with `null`, the text `null` too.
+    Pattern { re: u32, coacc: Vec<bool>, prefixes: Vec<(u8, bool)>, null: bool },
     /// A string held to an `enum` or a `const`: the values that can be
-    /// written, raw.
+    /// written, raw (`null` among them where the value may be null).
     Enum(LitTrie),
+    /// JSON held to `node`, the parameter's subschema in the tool's own
+    /// grammar (GitHub #612).
+    Json { node: u32 },
 }
 
 /// A held tool: what the confirmed close knows of it, a slot per declared
@@ -226,8 +239,11 @@ struct Value {
     /// The two miss points' progress (see `free_misses`).
     r1: u8,
     r2: u8,
-    /// Whitespace before the first parameter.
+    /// Whitespace before the first parameter, or after a typed value's JSON.
     ws: u8,
+    /// How much of `null` a held string that may be null has read, or
+    /// [`OFF`].
+    nul: u8,
 }
 
 /// A matcher's position in a [`ToolCallGrammar`].
@@ -241,17 +257,22 @@ pub(crate) struct CallState {
     /// The undecided line starts in `pending`, in order: the offset, shifted
     /// past the flags [`END_OK`] and [`MUST_STEP`].
     starts: Vec<u32>,
+    /// A typed value's JSON as the schema's automaton has read it: no
+    /// configuration once the text can no longer be JSON of its subschema,
+    /// and none outside a typed value.
+    json: State,
 }
 
 impl Clone for CallState {
     fn clone(&self) -> Self {
-        Self { at: self.at, written: self.written.clone(), pending: self.pending.clone(), starts: self.starts.clone() }
+        Self { at: self.at, written: self.written.clone(), pending: self.pending.clone(), starts: self.starts.clone(), json: self.json.clone() }
     }
     fn clone_from(&mut self, o: &Self) {
         self.at = o.at;
         self.written.clone_from(&o.written);
         self.pending.clone_from(&o.pending);
         self.starts.clone_from(&o.starts);
+        self.json.clone_from(&o.json);
     }
 }
 
@@ -273,6 +294,30 @@ const LIT_START: u8 = 0b111;
 /// read as the call's next step.
 const TAGS: [&str; 3] = [PARAMETER_OPEN, PARAMETER_CLOSE, FUNCTION_CLOSE];
 const FUNCTION_LINE: &[u8] = b"</function";
+const NULL: &[u8] = b"null";
+
+/// The next `nul` after `b`.
+#[inline]
+fn null_step(nul: u8, b: u8) -> u8 {
+    match NULL.get(nul as usize) {
+        Some(&c) if c == b => nul + 1,
+        _ => OFF,
+    }
+}
+
+/// Whether a typed value's JSON has read a byte other than whitespace: its
+/// root is no longer the value expected.
+fn json_begun(json: &State) -> bool {
+    !matches!(json.configs.as_slice(), [c] if c.frames.len() == 2 && matches!(c.frames[1], Frame::Value { .. }))
+}
+
+/// A typed value's JSON once whole and followed by whitespace: one
+/// configuration, done, whose whitespace the call counts from here.
+fn json_done(json: &mut State) {
+    json.configs.retain(Config::accepting);
+    json.configs.truncate(1);
+    json.configs[0].ws = 0;
+}
 
 #[inline]
 fn is_ws(b: u8) -> bool {
@@ -358,6 +403,7 @@ impl Slot {
                 pattern_accepts(dfa, dfa.start)
             }
             Slot::Enum(trie) => trie.terminal(0),
+            Slot::Json { .. } => false,
         }
     }
 
@@ -379,26 +425,30 @@ impl Slot {
         }
     }
 
-    fn accepts(&self, g: &Held, cs: u32) -> bool {
-        cs != DEAD
+    /// Whether a held string's text, read whole, is a value: one of its own,
+    /// or, where the value may be null, `null`.
+    fn accepts(&self, g: &Held, v: &Value) -> bool {
+        let own = v.cs != DEAD
+            && v.lit != TAG
             && match self {
-                Slot::Pattern { re, .. } => pattern_accepts(&g.grammar.core.dfas[*re as usize], cs),
-                Slot::Enum(trie) => trie.terminal(cs),
+                Slot::Pattern { re, .. } => pattern_accepts(&g.grammar.core.dfas[*re as usize], v.cs),
+                Slot::Enum(trie) => trie.terminal(v.cs),
                 _ => true,
-            }
+            };
+        own || v.nul as usize == NULL.len()
     }
 
     /// Whether a held string's text, read so far, can still become a value
     /// on its one line.
     fn text_alive(&self, v: &Value) -> bool {
-        if v.cs == DEAD || v.lit == TAG {
-            return false;
-        }
-        match self {
-            Slot::Pattern { coacc, .. } if v.lit == ESCAPED => coacc[v.cs as usize],
-            Slot::Pattern { prefixes, .. } => prefixes.iter().any(|&(lit, alive)| lit == v.lit && alive),
-            _ => true,
-        }
+        let own = v.cs != DEAD
+            && v.lit != TAG
+            && match self {
+                Slot::Pattern { coacc, .. } if v.lit == ESCAPED => coacc[v.cs as usize],
+                Slot::Pattern { prefixes, .. } => prefixes.iter().any(|&(lit, alive)| lit == v.lit && alive),
+                _ => true,
+            };
+        own || v.nul != OFF
     }
 }
 
@@ -408,7 +458,7 @@ impl Slot {
         64 + match self {
             Slot::Pattern { coacc, prefixes, .. } => coacc.len() + prefixes.len() * 2,
             Slot::Enum(trie) => trie.strings().iter().map(|s| s.len() * 16).sum(),
-            Slot::Junk | Slot::Free => 0,
+            Slot::Junk | Slot::Free | Slot::Json { .. } => 0,
         }
     }
 }
@@ -419,9 +469,9 @@ fn pattern_accepts(dfa: &ByteDfa, s: u32) -> bool {
 
 /// A pattern's slot: which DFA states reach a match over bytes other than a
 /// newline, and for each prefix of a dialect tag the value may start with,
-/// whether a value starting so can still be written. `None` when no value
-/// can be.
-fn pattern_slot(dfa: &ByteDfa, re: u32) -> Option<Slot> {
+/// whether a value starting so can still be written; with `null`, the text
+/// `null` is a value too. `None` when no value can be.
+fn pattern_slot(dfa: &ByteDfa, re: u32, null: bool) -> Option<Slot> {
     let n = dfa.state_count();
     let mut back: Vec<Vec<u32>> = vec![Vec::new(); n];
     for s in 0..n as u32 {
@@ -467,7 +517,8 @@ fn pattern_slot(dfa: &ByteDfa, re: u32) -> Option<Slot> {
         any
     }
     let mut prefixes = Vec::new();
-    alive(dfa, &coacc, LIT_START, dfa.start, &mut prefixes).then_some(Slot::Pattern { re, coacc, prefixes })
+    let any = alive(dfa, &coacc, LIT_START, dfa.start, &mut prefixes);
+    (any || null).then_some(Slot::Pattern { re, coacc, prefixes, null })
 }
 
 impl ToolCallGrammar {
@@ -608,7 +659,7 @@ impl ToolCallGrammar {
                             s.written.resize(held.parameters.declared().len(), false);
                             s.pending.clear();
                             s.starts.clear();
-                            s.at = At::Value(self.value(tool, JUNK));
+                            self.enter(s, tool, JUNK);
                         }
                         None => s.at = At::Body { kmp: 0 },
                     }
@@ -639,7 +690,55 @@ impl ToolCallGrammar {
     fn value(&self, tool: u32, slot: u32) -> Value {
         let held = self.tool(tool);
         let kind = if slot == JUNK { &JUNK_SLOT } else { &held.slots[slot as usize] };
-        Value { tool, slot, lead: true, utf8: 0, cs: kind.start(held), lit: LIT_START, terminated: false, r1: OFF, r2: OFF, ws: 0 }
+        let nul = if matches!(kind, Slot::Pattern { null: true, .. }) { 0 } else { OFF };
+        Value { tool, slot, lead: true, utf8: 0, cs: kind.start(held), lit: LIT_START, terminated: false, r1: OFF, r2: OFF, ws: 0, nul }
+    }
+
+    /// Start reading that value in `s`: a typed value's JSON from its
+    /// subschema's root.
+    fn enter(&self, s: &mut CallState, tool: u32, slot: u32) {
+        s.at = At::Value(self.value(tool, slot));
+        s.json.configs.clear();
+        if slot != JUNK
+            && let Slot::Json { node } = self.tool(tool).slots[slot as usize]
+        {
+            s.json.configs.push(Config::initial(node));
+        }
+    }
+
+    /// A typed value's byte as its JSON's (GitHub #612): `false` on a miss.
+    /// No whitespace before the JSON (the trimmed newline aside); once it is
+    /// whole, whitespace, bounded so that a line break is always left, and
+    /// any other byte ends it: that byte is a step's, or a miss.
+    fn json_byte(&self, s: &mut CallState, v: &mut Value, held: &Held, b: u8) -> bool {
+        if s.json.configs.is_empty() {
+            return true;
+        }
+        if is_ws(b) && !json_begun(&s.json) {
+            return false;
+        }
+        // Whitespace after the whole JSON, the byte that ends a number
+        // included.
+        let trailing = is_ws(b) && s.json.accepting();
+        if !trailing {
+            let mut forks = Vec::new();
+            if !s.json.step(&held.grammar.core, b, &mut forks) {
+                s.json.configs.clear();
+                return true;
+            }
+            if !(is_ws(b) && s.json.accepting()) {
+                return true;
+            }
+        }
+        json_done(&mut s.json);
+        v.ws = v.ws.saturating_add(1);
+        self.whitespace_fits(v.ws, b)
+    }
+
+    /// Whether a run of whitespace whose `ws`th byte is `b` fits the bound,
+    /// a line break always left for the step that must start a line.
+    fn whitespace_fits(&self, ws: u8, b: u8) -> bool {
+        ws < self.max_ws || (b == b'\n' && ws == self.max_ws)
     }
 
     fn value_byte(&self, s: &mut CallState, mut v: Value, b: u8) -> bool {
@@ -647,10 +746,10 @@ impl ToolCallGrammar {
         let slot = if v.slot == JUNK { &JUNK_SLOT } else { &held.slots[v.slot as usize] };
         let tracks = matches!(slot, Slot::Free) && !held.parameters.may_close(&s.written);
         if is_ws(b) && v.slot == JUNK {
-            if v.ws >= self.max_ws {
+            v.ws = v.ws.saturating_add(1);
+            if !self.whitespace_fits(v.ws, b) {
                 return false;
             }
-            v.ws += 1;
         }
         // The value's first byte starts its first line; a newline there is
         // the one the parser trims, and the line starts after it.
@@ -681,9 +780,14 @@ impl ToolCallGrammar {
                     return false;
                 }
             }
+            Slot::Json { .. } => {
+                if !self.json_byte(s, &mut v, held, b) {
+                    return false;
+                }
+            }
             Slot::Pattern { .. } | Slot::Enum(_) if !v.terminated => {
                 if b == b'\n' {
-                    if !(v.utf8 == 0 && v.lit != TAG && slot.accepts(held, v.cs)) {
+                    if !(v.utf8 == 0 && slot.accepts(held, &v)) {
                         return false;
                     }
                     v.terminated = true;
@@ -696,6 +800,7 @@ impl ToolCallGrammar {
                         None => v.cs = DEAD,
                     }
                     v.lit = lit_step(v.lit, b);
+                    v.nul = null_step(v.nul, b);
                 }
             }
             Slot::Pattern { .. } | Slot::Enum(_) => {}
@@ -714,6 +819,12 @@ impl ToolCallGrammar {
             let at = (s.pending.len() as u32) << FLAGS;
             match slot {
                 Slot::Junk | Slot::Free => s.starts.push(at | END_OK),
+                // A typed value's line ends where its JSON is whole.
+                Slot::Json { .. } => {
+                    if s.json.accepting() {
+                        s.starts.push(at | END_OK);
+                    }
+                }
                 _ if !was_terminated => s.starts.push(at | END_OK | MUST_STEP),
                 _ => {}
             }
@@ -752,6 +863,7 @@ impl ToolCallGrammar {
         let text = match slot {
             Slot::Free => true,
             Slot::Junk => s.pending.iter().all(|&c| is_ws(c)),
+            Slot::Json { .. } => !s.json.configs.is_empty(),
             _ => !v.terminated && slot.text_alive(&v),
         };
         if !(can_step || text) {
@@ -807,10 +919,11 @@ impl ToolCallGrammar {
         match step {
             Step::Parameter { index, .. } => {
                 s.written[index] = true;
-                s.at = At::Value(self.value(tool, index as u32));
+                self.enter(s, tool, index as u32);
             }
             Step::Close { .. } => {
                 s.written.clear();
+                s.json.configs.clear();
                 s.at = At::Free { kmp: 0 };
             }
         }
@@ -905,8 +1018,9 @@ fn name_node(trie: &LitTrie, bytes: &[u8]) -> u32 {
 }
 
 /// A held tool from its compiled strict `parameters`: the declared
-/// parameters in the schema's order (each required, as a strict schema has
-/// them), and a slot per parameter.
+/// parameters in the schema's order, each required but the nullable ones (a
+/// strict schema requires them all, and one that may be null may be left
+/// out, delivered `null`), how each value reads, and a slot per parameter.
 fn held_tool(grammar: Arc<Grammar>) -> Result<Held, Refusal> {
     let core = &grammar.core;
     let object = core.alts[core.root as usize].iter().find_map(|&a| match &core.nodes[a as usize] {
@@ -923,6 +1037,8 @@ fn held_tool(grammar: Arc<Grammar>) -> Result<Held, Refusal> {
     };
     let mut names = Vec::new();
     let mut slots = Vec::new();
+    let mut readings = Vec::new();
+    let mut required = Vec::new();
     for (&key, &value) in keys.iter().zip(values.iter()) {
         let name = decode(key).expect("a key is a string");
         let path = format!("#/properties/{}", name.replace('~', "~0").replace('/', "~1"));
@@ -934,16 +1050,24 @@ fn held_tool(grammar: Arc<Grammar>) -> Result<Held, Refusal> {
                 format!("the model's tool-call dialect cannot write the parameter name \"{name}\": a name ends at its first `>`"),
             ));
         }
-        slots.push(slot_of(core, value, &path)?);
+        let nullable = accepts_value(core, value, NULL);
+        let (slot, reading) = slot_of(core, value, nullable, &path)?;
+        slots.push(slot);
+        readings.push((reading, nullable));
+        if !nullable {
+            required.push(name.clone());
+        }
         names.push(name);
     }
-    let required = names.clone();
-    Ok(Held { parameters: Parameters::new(names, required), slots, grammar })
+    Ok(Held { parameters: Parameters::new(names, required).reading(readings), slots, grammar })
 }
 
-/// What a value of `node` is held to as the dialect's raw text.
-fn slot_of(core: &crate::schema::Core, node: u32, path: &str) -> Result<Slot, Refusal> {
-    let alts = &core.alts[node as usize];
+/// What a value of `node` (which may be `null` when `nullable`) is held to,
+/// and how its text reads (GitHub #612): the dialect's raw text where every
+/// alternative is a string or `null` and one slot holds them all (a free
+/// string, a single pattern or format, or enum strings), else JSON held to
+/// the node, a string beside another type written quoted.
+fn slot_of(core: &crate::schema::Core, node: u32, nullable: bool, path: &str) -> Result<(Slot, Reading), Refusal> {
     let unwritable = |keyword: &str| {
         refusal(
             "no_writable_value",
@@ -952,19 +1076,34 @@ fn slot_of(core: &crate::schema::Core, node: u32, path: &str) -> Result<Slot, Re
             format!("no value of this `{keyword}` can be written on one line of the model's tool-call dialect that does not start with one of its tags"),
         )
     };
-    let [only] = alts.as_slice() else { return Ok(Slot::Free) };
-    match &core.nodes[*only as usize] {
-        Node::String { re } if *re == NO_RE => Ok(Slot::Free),
-        Node::String { re } => pattern_slot(&core.dfas[*re as usize], *re).ok_or_else(|| unwritable("pattern")),
-        Node::Literal { set } => {
-            let spelled = core.lits[*set as usize].strings();
-            if !spelled.iter().all(|s| s.first() == Some(&b'"')) {
-                return Ok(Slot::Free);
+    let json = Ok((Slot::Json { node }, Reading::Json));
+    let (mut free, mut patterns, mut strings) = (false, Vec::new(), Vec::new());
+    for &alt in &core.alts[node as usize] {
+        match &core.nodes[alt as usize] {
+            Node::String { re } if *re == NO_RE => free = true,
+            Node::String { re } => patterns.push(*re),
+            Node::Literal { set } => {
+                for spelled in core.lits[*set as usize].strings() {
+                    match Json::parse(std::str::from_utf8(&spelled).unwrap_or("")) {
+                        Ok(Json::Str(value)) => strings.push(value),
+                        Ok(Json::Null) => {}
+                        _ => return json,
+                    }
+                }
             }
+            _ => return json,
+        }
+    }
+    let reading = if nullable { Reading::TextOrNull } else { Reading::Text };
+    if free {
+        return Ok((Slot::Free, reading));
+    }
+    match (patterns.as_slice(), strings.is_empty()) {
+        ([re], true) => pattern_slot(&core.dfas[*re as usize], *re, nullable).map(|slot| (slot, reading)).ok_or_else(|| unwritable("pattern")),
+        ([], false) => {
             let mut trie = LitTrie::new();
             let mut kept = 0;
-            for s in &spelled {
-                let Ok(Json::Str(value)) = Json::parse(std::str::from_utf8(s).unwrap_or("")) else { continue };
+            for value in strings.iter().map(String::as_str).chain(nullable.then_some("null")) {
                 let starts_with_tag = value.bytes().try_fold(LIT_START, |lit, b| Some(lit_step(lit, b)).filter(|&l| l != TAG)).is_none();
                 if !value.contains('\n') && !starts_with_tag {
                     trie.add(value.as_bytes());
@@ -973,10 +1112,11 @@ fn slot_of(core: &crate::schema::Core, node: u32, path: &str) -> Result<Slot, Re
             }
             match kept {
                 0 => Err(unwritable("enum")),
-                _ => Ok(Slot::Enum(trie)),
+                _ => Ok((Slot::Enum(trie), reading)),
             }
         }
-        _ => Ok(Slot::Free),
+        // `null` alone, several patterns, or a pattern beside enum strings.
+        _ => json,
     }
 }
 

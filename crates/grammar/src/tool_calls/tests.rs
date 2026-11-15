@@ -253,6 +253,11 @@ fn whitespace_between_tags_is_bounded_at_its_limit_and_the_byte_past_it_is_a_mis
         let mut past = m.clone();
         assert!(past.accept_bytes(run(limit as usize).as_bytes()) && !past.accept_bytes(b"\n") && !past.accept_bytes(b" "), "{before:?} + {} spaces", limit + 1);
     }
+    // Before the first parameter, spaces leave room for the line break a
+    // step needs: a run of them up to the bound is no dead end.
+    let mut m = fresh();
+    assert!(m.accept_bytes(format!("<tool_call><function=write_file>{}", " ".repeat(limit as usize - 1)).as_bytes()));
+    assert!(!m.clone().accept_bytes(b" ") && m.accept_bytes(b"\n<parameter=path>"));
     // In a free value, past the bound after a closer's line the text goes on
     // with something else.
     let mut m = fresh();
@@ -317,11 +322,213 @@ fn a_tool_set_sent_again_is_compiled_once_and_its_strict_schemas_with_it() {
     assert_eq!(held, vec![("write_file", vec!["path".into(), "content".into(), "mode".into()]), ("get_time", vec!["zone".into(), "day".into()])]);
 }
 
+// ── typed and nullable values (#612) ─────────────────────────────────────
+
+/// `edit`, strict and typed: an integer with bounds, a boolean, an object
+/// holding a list of edits, a nested array of objects, a recursive tree,
+/// and two nullable parameters, a string and a bounded integer.
+const EDIT: &str = r##"{"type":"object","properties":{"line":{"type":"integer","minimum":1,"maximum":1000},"dry_run":{"type":"boolean"},"change":{"type":"object","properties":{"edits":{"type":"array","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"}},"required":["old","new"],"additionalProperties":false}}},"required":["edits"],"additionalProperties":false},"rows":{"type":"array","items":{"type":"array","items":{"type":"object","properties":{"k":{"type":"string"},"v":{"type":"number"}},"required":["k","v"],"additionalProperties":false}}},"tree":{"$ref":"#/$defs/node"},"note":{"type":["string","null"]},"limit":{"anyOf":[{"type":"integer","minimum":0,"maximum":9},{"type":"null"}]}},"required":["line","dry_run","change","rows","tree","note","limit"],"additionalProperties":false,"$defs":{"node":{"type":"object","properties":{"name":{"type":"string"},"kids":{"type":"array","items":{"$ref":"#/$defs/node"}}},"required":["name","kids"],"additionalProperties":false}}}"##;
+
+/// `edit`'s values in the template's form (`tojson`'s spelling for a typed
+/// one), in the schema's order.
+const EDIT_VALUES: [(&str, &str); 7] = [
+    ("line", "12"),
+    ("dry_run", "false"),
+    ("change", r#"{"edits": [{"old": "x", "new": "y"}, {"old": "a\nb", "new": ""}]}"#),
+    ("rows", r#"[[{"k": "a", "v": 1.5}], [], [{"k": "b", "v": -2e3}, {"k": "c", "v": 0}]]"#),
+    ("tree", r#"{"name": "root", "kids": [{"name": "leaf", "kids": []}, {"name": "twig", "kids": [{"name": "bud", "kids": []}]}]}"#),
+    ("note", "hello"),
+    ("limit", "3"),
+];
+
+fn edit_matcher() -> ToolCallMatcher {
+    matcher_of(&cache(), &[tool("edit", Some(EDIT))])
+}
+
+/// A call to `edit`: its values, each replaced by `with`'s where named, in
+/// the schema's order, those `without` names left out.
+fn edit_call(with: &[(&str, &str)], without: &[&str]) -> String {
+    let args: Vec<(&str, &str)> = EDIT_VALUES
+        .iter()
+        .filter(|(k, _)| !without.contains(k))
+        .map(|&(k, v)| with.iter().find(|(name, _)| *name == k).copied().unwrap_or((k, v)))
+        .collect();
+    call("edit", &args)
+}
+
+/// Whether `m` takes the whole of `text` and is back in free text.
+fn takes_whole(mut m: ToolCallMatcher, text: &str) -> bool {
+    taken(&mut m, text) == text.len() && !m.in_call()
+}
+
+/// The bytes of `text` an `edit` matcher takes before its first miss.
+fn edit_taken(text: &str) -> usize {
+    taken(&mut edit_matcher(), text)
+}
+
+/// The text of `edit`'s call up to the value of `name` (its opener and
+/// newline included), every value before it as `EDIT_VALUES` has it.
+fn edit_head(name: &str) -> String {
+    let call = edit_call(&[], &[]);
+    let at = call.find(&format!("<parameter={name}>\n")).unwrap();
+    call[..at + format!("<parameter={name}>\n").len()].to_owned()
+}
+
 #[test]
-fn a_typed_parameter_is_free_text_until_its_values_are_held() {
-    let schema = r#"{"type":"object","properties":{"n":{"type":"integer"},"s":{"type":["string","null"]}},"required":["n","s"],"additionalProperties":false}"#;
-    let mut m = matcher_of(&cache(), &[tool("count", Some(schema))]);
-    assert!(m.accept_bytes(call("count", &[("n", "twelve"), ("s", "null")]).as_bytes()) && !m.in_call());
+fn a_typed_value_is_json_held_to_its_subschema() {
+    assert!(takes_whole(edit_matcher(), &edit_call(&[], &[])));
+    // Compact, as `tojson` spells it, and pretty-printed.
+    let compact: Vec<(&str, String)> = EDIT_VALUES.iter().map(|&(k, v)| (k, if k == "note" { v.to_owned() } else { Json::parse(v).unwrap().compact() })).collect();
+    let pretty: Vec<(&str, String)> = EDIT_VALUES.iter().map(|&(k, v)| (k, if k == "note" { v.to_owned() } else { Json::parse(v).unwrap().pretty() })).collect();
+    for args in [compact, pretty] {
+        let args: Vec<(&str, &str)> = args.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert!(takes_whole(edit_matcher(), &call("edit", &args)), "{args:?}");
+    }
+    // Each miss at the byte that makes it one.
+    let misses: [(&str, &str, &str); 11] = [
+        ("line", "twelve", ""),
+        ("line", "2000", "200"),
+        ("line", "0", ""),
+        ("line", "1.5", "1"),
+        ("dry_run", "\"no\"", ""),
+        ("dry_run", "True", ""),
+        ("change", r#"{"edits": [{"old": "x"}]}"#, r#"{"edits": [{"old": "x""#),
+        ("change", r#"{"edits": [{"old": "x", "path": "p"}]}"#, r#"{"edits": [{"old": "x", ""#),
+        ("rows", r#"[{"k": "a", "v": 1}]"#, "["),
+        ("tree", r#"{"name": "root", "kids": [{"name": "leaf"}]}"#, r#"{"name": "root", "kids": [{"name": "leaf""#),
+        ("limit", "10", "1"),
+    ];
+    for (name, value, kept) in misses {
+        let text = edit_call(&[(name, value)], &[]);
+        let head = edit_head(name);
+        assert_eq!(edit_taken(&text), head.len() + kept.len(), "{name}: {value}");
+    }
+}
+
+#[test]
+fn a_typed_value_starts_at_its_first_byte_and_whitespace_may_follow_it() {
+    let head = edit_head("line");
+    // No whitespace before it but the newline the parser trims, which it
+    // may also leave out.
+    for value in [" 12", "\n12", "\t12"] {
+        assert_eq!(edit_taken(&edit_call(&[("line", value)], &[])), head.len(), "{value:?}");
+    }
+    let bare = edit_call(&[], &[]).replace("<parameter=line>\n12", "<parameter=line>12");
+    assert!(takes_whole(edit_matcher(), &bare));
+    // After it, whitespace and blank lines, then the call's next step at a
+    // line's start, and nothing else.
+    assert!(takes_whole(edit_matcher(), &edit_call(&[("line", "12 \t\n\n ")], &[])));
+    for (value, kept) in [("12 x", "12 "), ("12\nx", "12\n"), ("12\n </parameter>", "12\n "), ("12</parameter>", "12")] {
+        assert_eq!(edit_taken(&edit_call(&[("line", value)], &[])), head.len() + kept.len(), "{value:?}");
+    }
+    // With a later parameter still to write, the close after a typed value
+    // is a miss at spike S1's two points, by the rule itself.
+    for (after, kept) in [("</parameter>\n</function>", "</parameter>\n<"), ("</function>", "</")] {
+        let text = format!("{head}12\n{after}");
+        assert_eq!(edit_taken(&text), head.len() + 3 + kept.len(), "{after:?}");
+    }
+    // The whitespace after it is bounded, and a line break always left.
+    let cache = cache_within(GrammarLimits { max_whitespace: 4, ..GrammarLimits::default() });
+    let mut m = matcher_of(&cache, &[tool("edit", Some(EDIT))]);
+    assert!(m.accept_bytes(format!("{head}12   ").as_bytes()));
+    assert!(!m.clone().accept_bytes(b" ") && m.accept_bytes(b"\n"));
+    assert!(!m.clone().accept_bytes(b"\n") && m.accept_bytes(b"</parameter>\n<parameter=note>\nx\n"));
+}
+
+#[test]
+fn a_nullable_parameter_may_be_left_out_or_written_null() {
+    for without in [&["note"][..], &["limit"], &["note", "limit"]] {
+        assert!(takes_whole(edit_matcher(), &edit_call(&[], without)), "{without:?}");
+    }
+    for (name, value) in [("note", "null"), ("limit", "null"), ("note", "a note\nof two lines"), ("limit", "9")] {
+        assert!(takes_whole(edit_matcher(), &edit_call(&[(name, value)], &[])), "{name}: {value}");
+    }
+    // A parameter that may not be null is still required.
+    let head = "<tool_call>\n<function=edit>\n<parameter=note>\nhi\n</parameter>\n<";
+    assert_eq!(edit_taken(&format!("{head}/function>")), head.len());
+    // What the parser is told: the nullable ones are not required, and are
+    // delivered `null` when left out; how each value reads.
+    let grammar = cache().tool_calls(&[tool("edit", Some(EDIT))]).unwrap();
+    let (_, parameters) = grammar.held().next().unwrap();
+    let readings: Vec<(&str, Reading, bool)> =
+        parameters.declared().iter().enumerate().map(|(i, name)| (name.as_str(), parameters.reading_of(i), parameters.nulled_when_omitted(i))).collect();
+    assert_eq!(
+        readings,
+        [
+            ("line", Reading::Json, false),
+            ("dry_run", Reading::Json, false),
+            ("change", Reading::Json, false),
+            ("rows", Reading::Json, false),
+            ("tree", Reading::Json, false),
+            ("note", Reading::TextOrNull, true),
+            ("limit", Reading::Json, true),
+        ]
+    );
+    let all_but_nullable = vec![true, true, true, true, true, false, false];
+    assert!(parameters.may_close(&all_but_nullable));
+    assert!(!parameters.may_close(&[false, true, true, true, true, true, true]));
+}
+
+/// A strict tool of one required parameter `a` of this schema.
+fn one(schema: &str) -> ToolCallMatcher {
+    let parameters = format!(r#"{{"type":"object","properties":{{"a":{schema}}},"required":["a"],"additionalProperties":false}}"#);
+    matcher_of(&cache(), &[tool("one", Some(&parameters))])
+}
+
+/// Whether a call of `one(schema)` with `value` is taken whole.
+fn one_takes(schema: &str, value: &str) -> bool {
+    takes_whole(one(schema), &call("one", &[("a", value)]))
+}
+
+#[test]
+fn a_string_that_may_be_null_is_raw_text_and_its_text_null_is_null() {
+    // A free one: any text, `null` the parser's null.
+    let free = r#"{"type":["string","null"]}"#;
+    for value in ["null", "\"quoted\"", "anything at all", "12"] {
+        assert!(one_takes(free, value), "{value}");
+    }
+    // Held to its pattern or format, or `null`.
+    let date = r#"{"type":["string","null"],"format":"date"}"#;
+    for (value, ok) in [("2026-11-15", true), ("null", true), ("nul", false), ("nulls", false), ("null\"", false), ("2026-13-01", false)] {
+        assert_eq!(one_takes(date, value), ok, "{value}");
+    }
+    let pattern_or_null = r#"{"anyOf":[{"type":"string","pattern":"^[a-z]+$"},{"type":"null"}]}"#;
+    assert!(one_takes(pattern_or_null, "null") && one_takes(pattern_or_null, "abc") && !one_takes(pattern_or_null, "ABC"));
+    // An enum: its strings and, where it holds null, `null`.
+    let with_null = r#"{"type":["string","null"],"enum":["a",null]}"#;
+    assert!(one_takes(with_null, "a") && one_takes(with_null, "null") && !one_takes(with_null, "b"));
+    // The string "null" with no null beside it is that string.
+    let the_word = r#"{"type":["string","null"],"enum":["null","a"]}"#;
+    assert!(one_takes(the_word, "null") && one_takes(the_word, "a"));
+    let readings = |schema: &str| {
+        let parameters = format!(r#"{{"type":"object","properties":{{"a":{schema}}},"required":["a"],"additionalProperties":false}}"#);
+        let grammar = cache().tool_calls(&[tool("one", Some(&parameters))]).unwrap();
+        let (_, p) = grammar.held().next().unwrap();
+        (p.reading_of(0), p.nulled_when_omitted(0))
+    };
+    for schema in [free, date, pattern_or_null, with_null] {
+        assert_eq!(readings(schema), (Reading::TextOrNull, true), "{schema}");
+    }
+    assert_eq!(readings(the_word), (Reading::Text, false));
+    assert_eq!(readings(r#"{"type":"string"}"#), (Reading::Text, false));
+}
+
+#[test]
+fn a_union_no_raw_text_holds_is_json_a_string_in_it_quoted() {
+    let cases: [(&str, &[&str], &[&str]); 4] = [
+        (r#"{"anyOf":[{"type":"string"},{"type":"integer"}]}"#, &["\"abc\"", "5", "\"5\""], &["abc", "5.5"]),
+        (r#"{"enum":["a",1,true]}"#, &["\"a\"", "1", "true"], &["a", "2"]),
+        (r#"{"anyOf":[{"type":"string","pattern":"^a+$"},{"type":"string","format":"date"}]}"#, &["\"aa\"", "\"2026-11-15\""], &["aa", "\"b\""]),
+        (r#"{"type":"null"}"#, &["null"], &["nil", "\"null\""]),
+    ];
+    for (schema, taken, missed) in cases {
+        for value in taken {
+            assert!(one_takes(schema, value), "{schema}: {value}");
+        }
+        for value in missed {
+            assert!(!one_takes(schema, value), "{schema}: {value}");
+        }
+    }
 }
 
 #[test]
@@ -345,18 +552,52 @@ const SOUP: &[&str] = &[
     "</div>", "<think>",
 ];
 
-/// A text the grammar accepts, grown from `SOUP`'s pieces in random order
-/// (a piece refused is skipped), with the matcher at each piece's end.
-fn generated(seed: u64, pieces: usize) -> (Vec<u8>, Vec<ToolCallMatcher>) {
+/// `edit`'s pieces beside a free tool's (#612): the dialect's, JSON's, and
+/// text.
+const TYPED_SOUP: &[&str] = &[
+    "<tool_call>", "\n", "<function=edit>", "<function=search>", "<parameter=line>", "<parameter=dry_run>",
+    "<parameter=change>", "<parameter=rows>", "<parameter=tree>", "<parameter=note>", "<parameter=limit>", "</parameter>",
+    "</function>", "</tool_call>", "{", "}", "[", "]", "\"", ",", ":", " ", "\"edits\"", "\"old\"", "\"new\"", "\"k\"", "\"v\"",
+    "\"name\"", "\"kids\"", "1", "2", "0", "-", ".", "e", "true", "false", "null", "x", "é", "<", "</",
+    "12\n</parameter>\n", "\"edits\": [", "{\"old\": \"a\", \"new\": \"b\"}", "{\"name\": \"n\", \"kids\": []}", "{\"k\": \"a\", \"v\": 1}",
+];
+
+/// `edit`, held, and `search`, free, with whitespace runs of at most two
+/// bytes (fewer spellings of the same JSON for a search to go through).
+fn typed_matcher() -> ToolCallMatcher {
+    let cache = cache_within(GrammarLimits { max_whitespace: 2, ..GrammarLimits::default() });
+    matcher_of(&cache, &[tool("edit", Some(EDIT)), tool("search", None)])
+}
+
+/// The two generated readings: `SOUP`'s over the string tools, and
+/// `TYPED_SOUP`'s over the typed one, half its steps a byte the grammar
+/// takes there.
+const READINGS: [(fn() -> ToolCallMatcher, &[&str], bool); 2] = [(matcher, SOUP, false), (typed_matcher, TYPED_SOUP, true)];
+
+/// A text the grammar accepts, grown from `soup`'s pieces in random order
+/// (a piece refused is skipped), and with `bytes`, half the time from a byte
+/// the grammar takes (printable or a line break, a backslash aside: an
+/// escape's hex digits make thousands of states for a search), with the
+/// matcher at each piece's end.
+fn generated(fresh: fn() -> ToolCallMatcher, soup: &[&str], bytes: bool, seed: u64, pieces: usize) -> (Vec<u8>, Vec<ToolCallMatcher>) {
     let mut rng = XorShift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-    let mut m = matcher();
+    let mut m = fresh();
     let mut text = Vec::new();
     let mut states = Vec::new();
     for _ in 0..pieces * 8 {
         if states.len() >= pieces {
             break;
         }
-        let piece = SOUP[(rng.next_u64() % SOUP.len() as u64) as usize];
+        if bytes && rng.next_u64() % 2 == 0 {
+            let allowed: Vec<u8> = m.allowed_bytes().into_iter().filter(|&b| (b == b'\n' || (0x20..0x7F).contains(&b)) && b != b'\\').collect();
+            if let Some(&b) = allowed.get((rng.next_u64() % allowed.len().max(1) as u64) as usize) {
+                assert!(m.accept_bytes(&[b]));
+                text.push(b);
+                states.push(m.clone());
+            }
+            continue;
+        }
+        let piece = soup[(rng.next_u64() % soup.len() as u64) as usize];
         if m.accept_bytes(piece.as_bytes()) {
             text.extend_from_slice(piece.as_bytes());
             states.push(m.clone());
@@ -367,38 +608,50 @@ fn generated(seed: u64, pieces: usize) -> (Vec<u8>, Vec<ToolCallMatcher>) {
 
 /// Whether some bytes lead `m` back to free text: a breadth-first search
 /// over states, printable bytes and the line break (no space: a run of
-/// mixed whitespace makes as many states as it has spellings).
+/// mixed whitespace makes as many states as it has spellings), one value
+/// at a time: from each state it reaches, to one with another parameter
+/// written, or free text (a whole call's search spends its budget on the
+/// orders of a typed tool's other parameters and the spellings of its JSON).
 fn completes(m: &ToolCallMatcher) -> bool {
     let g = &m.grammar;
-    let alphabet: Vec<u8> = (0x21..0x7F).chain([b'\n']).collect();
-    let mut seen: HashSet<CallState> = HashSet::new();
-    let mut queue = VecDeque::from([m.state.clone()]);
-    while let Some(s) = queue.pop_front() {
-        if ToolCallGrammar::outside_held(&s) {
+    let alphabet: Vec<u8> = (0x21..0x7F).filter(|&b| b != b'\\').chain([b'\n']).collect();
+    let written = |s: &CallState| s.written.iter().filter(|&&w| w).count();
+    let mut from = m.state.clone();
+    'value: loop {
+        if ToolCallGrammar::outside_held(&from) {
             return true;
         }
-        assert!(seen.len() <= 200_000, "search budget spent");
-        for &b in &alphabet {
-            let mut next = s.clone();
-            if g.step(&mut next, b) && seen.insert(next.clone()) {
-                queue.push_back(next);
+        let (mut seen, mut queue) = (HashSet::new(), VecDeque::from([from.clone()]));
+        while let Some(s) = queue.pop_front() {
+            if ToolCallGrammar::outside_held(&s) || written(&s) > written(&from) {
+                from = s;
+                continue 'value;
+            }
+            assert!(seen.len() <= 200_000, "search budget spent");
+            for &b in &alphabet {
+                let mut next = s.clone();
+                if g.step(&mut next, b) && seen.insert(next.clone()) {
+                    queue.push_back(next);
+                }
             }
         }
+        return false;
     }
-    false
 }
 
 #[test]
 fn no_state_is_a_dead_end() {
-    let mut held = 0;
-    for seed in 0..16 {
-        let (text, states) = generated(seed, 40);
-        for m in states.iter().filter(|m| m.in_call()).step_by(2) {
-            assert!(completes(m), "a dead end after {:?}", String::from_utf8_lossy(&text));
-            held += 1;
+    for (fresh, soup, bytes) in READINGS {
+        let mut held = 0;
+        for seed in 0..16 {
+            let (text, states) = generated(fresh, soup, bytes, seed, 40);
+            for m in states.iter().filter(|m| m.in_call()).step_by(2) {
+                assert!(completes(m), "a dead end after {:?}", String::from_utf8_lossy(&text));
+                held += 1;
+            }
         }
+        assert!(held > 50, "{held}");
     }
-    assert!(held > 50, "{held}");
 }
 
 /// `text` as the vocabulary's tokens: the call's tags as their added
@@ -432,18 +685,20 @@ fn tokenize(text: &[u8]) -> Vec<u32> {
 #[test]
 fn the_permitted_set_equals_the_reference_on_every_state_of_generated_texts() {
     let (mut mask, mut reference) = (TokenSet::new(VOCAB), TokenSet::new(VOCAB));
-    let mut states = 0;
-    for seed in 0..40 {
-        let (text, _) = generated(seed, 30);
-        let mut m = matcher();
-        for id in tokenize(&text) {
-            m.mask(&mut mask);
-            m.mask_reference(&mut reference);
-            assert_eq!(mask, reference, "after {:?}", String::from_utf8_lossy(&text));
-            assert!(mask.contains(id), "the text's own next token {id}");
-            assert!(m.accept(id), "{:?}", String::from_utf8_lossy(&text));
-            states += 1;
+    for (fresh, soup, bytes) in READINGS {
+        let mut states = 0;
+        for seed in 0..40 {
+            let (text, _) = generated(fresh, soup, bytes, seed, 30);
+            let mut m = fresh();
+            for id in tokenize(&text) {
+                m.mask(&mut mask);
+                m.mask_reference(&mut reference);
+                assert_eq!(mask, reference, "after {:?}", String::from_utf8_lossy(&text));
+                assert!(mask.contains(id), "the text's own next token {id}");
+                assert!(m.accept(id), "{:?}", String::from_utf8_lossy(&text));
+                states += 1;
+            }
         }
+        assert!(states > 1_000, "{states}");
     }
-    assert!(states > 1_000, "{states}");
 }

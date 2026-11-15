@@ -40,6 +40,8 @@
 //!   declared name holding a `>` is never opened, and a required parameter
 //!   the tool does not declare is never written, so its call never closes.
 
+use crate::json::{write_string, Json};
+
 /// The dialect's tags.
 pub const CALL_OPEN: &str = "<tool_call>";
 pub const CALL_CLOSE: &str = "</tool_call>";
@@ -51,12 +53,54 @@ pub const PARAMETER_CLOSE: &str = "</parameter>";
 /// What the rule knows of a tool: the parameters it declares, and those of
 /// them a call writes before it may close. The caller says which are
 /// required (a strict tool's nullable parameters may be omitted, for one).
+/// A held tool's also say how each value is read into the call's arguments
+/// ([`Parameters::reading`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Parameters {
     declared: Vec<String>,
     /// Each required name's place in `declared`, or `None` for a name the
     /// tool does not declare, which no call can write.
     required: Vec<Option<usize>>,
+    /// How each declared parameter's value is read, by its place.
+    readings: Vec<Reading>,
+    /// The declared parameters a call that omits them delivers `null` for.
+    nulled: Vec<bool>,
+}
+
+/// How a **held tool**'s value is read from its text into the call's
+/// arguments (GitHub #612): the grammar holds each value's text to what its
+/// reading delivers valid, and the parser delivers it so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Reading {
+    /// The text itself, as a JSON string.
+    #[default]
+    Text,
+    /// The text, or `null` where the text, trimmed, is `null`: a
+    /// string-or-null value, which therefore cannot be the string `null`.
+    TextOrNull,
+    /// JSON, as the model wrote it: a value of another type than a string,
+    /// or of a union no raw text can hold.
+    Json,
+}
+
+impl Reading {
+    /// The value's JSON, compact, from its text (the newline either side
+    /// already trimmed): a string, `null`, or the JSON written, in the
+    /// grammar crate's canonical spelling, its keys in the order written.
+    /// A text that is not JSON reads as a string, so a value never
+    /// disappears.
+    pub fn read(self, text: &str) -> String {
+        let mut out = Vec::new();
+        match self {
+            Reading::TextOrNull if text.trim() == "null" => return "null".to_owned(),
+            Reading::Json => match Json::parse(text) {
+                Ok(json) => return json.compact(),
+                Err(_) => write_string(text, &mut out),
+            },
+            _ => write_string(text, &mut out),
+        }
+        String::from_utf8(out).expect("a string's JSON is UTF-8")
+    }
 }
 
 impl Parameters {
@@ -77,7 +121,32 @@ impl Parameters {
             }
         }
         let required = required.into_iter().map(|name| names.iter().position(|d| d == name.as_ref())).collect();
-        Self { declared: names, required }
+        let (readings, nulled) = (vec![Reading::Text; names.len()], vec![false; names.len()]);
+        Self { declared: names, required, readings, nulled }
+    }
+
+    /// The same parameters, each value read by its [`Reading`], and with
+    /// `true` beside it, delivered as `null` when a call omits it: a held
+    /// tool's, by their place in [`Parameters::declared`] (GitHub #612). A
+    /// strict tool's nullable parameters are such, and a normalized tool's
+    /// optional ones are not: they stay omitted.
+    pub fn reading(mut self, readings: impl IntoIterator<Item = (Reading, bool)>) -> Self {
+        for (i, (reading, nulled)) in readings.into_iter().enumerate().take(self.declared.len()) {
+            self.readings[i] = reading;
+            self.nulled[i] = nulled;
+        }
+        self
+    }
+
+    /// How the value of the declared parameter at `index` is read.
+    pub fn reading_of(&self, index: usize) -> Reading {
+        self.readings[index]
+    }
+
+    /// Whether a call that omits the declared parameter at `index` delivers
+    /// `null` for it.
+    pub fn nulled_when_omitted(&self, index: usize) -> bool {
+        self.nulled[index]
     }
 
     /// The declared parameters: what [`Step::Parameter`]'s `index` and the
@@ -422,6 +491,28 @@ mod tests {
         // Every parameter written and a required one undeclared: nothing can follow.
         let parameters = Parameters::new(["a"], ["b"]);
         assert_eq!(line(b"", &parameters, &[true]), Line::Text);
+    }
+
+    #[test]
+    fn a_held_value_is_read_as_its_reading_says() {
+        assert_eq!(Reading::Text.read("null"), r#""null""#);
+        assert_eq!(Reading::Text.read("a\n\"b\"\t"), r#""a\n\"b\"\t""#);
+        assert_eq!(Reading::TextOrNull.read("null"), "null");
+        assert_eq!(Reading::TextOrNull.read(" null\n"), "null");
+        assert_eq!(Reading::TextOrNull.read("nullable"), r#""nullable""#);
+        // JSON as written: its keys' order and every digit, in the canonical
+        // spelling.
+        let written = r#"{"old": "x", "new": [1.50, 12345678901234567890123, true, null]}"#;
+        assert_eq!(Reading::Json.read(written), r#"{"old":"x","new":[1.5,12345678901234567890123,true,null]}"#);
+        assert_eq!(Reading::Json.read(" 7 "), "7");
+        // A text that is not JSON is not lost: it is a string.
+        assert_eq!(Reading::Json.read("twelve"), r#""twelve""#);
+        // By default every value reads as text, and none is delivered when
+        // left out.
+        let parameters = Parameters::new(["a", "b", "a"], ["a"]);
+        assert_eq!((parameters.reading_of(1), parameters.nulled_when_omitted(1)), (Reading::Text, false));
+        let parameters = parameters.reading([(Reading::Json, false), (Reading::TextOrNull, true)]);
+        assert_eq!((parameters.reading_of(0), parameters.reading_of(1), parameters.nulled_when_omitted(1)), (Reading::Json, Reading::TextOrNull, true));
     }
 
     #[test]

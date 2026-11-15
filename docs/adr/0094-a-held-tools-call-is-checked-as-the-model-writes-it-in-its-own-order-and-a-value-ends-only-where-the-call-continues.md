@@ -90,14 +90,16 @@ and repairs a miss, and it does not write the call's envelope for the model.
   - The residue: a string value cannot contain this call's own confirmed close.
   - The grammar bounds the whitespace the rule leaves open, between a step's tags, before `<function=` and before
     the first parameter, at `model.grammar_max_whitespace` (48): the byte past it is a miss, so the parser never
-    reads a step the grammar did not allow (#611).
+    reads a step the grammar did not allow (#611). Where the next step must start a line (before the first
+    parameter, after a typed value's JSON), the bound's last byte is kept for a line break, so a run of spaces is
+    never a dead end (#612).
   - A string held to an `enum`, a `const`, a `pattern` or a `format` is written on one line that does not start
     with one of the dialect's tags (`<parameter=`, `</parameter>`, `</function>`). A value's end is then never in
     doubt, and the grammar stays free of dead ends without a search over its lines. A value of a strict tool
     outside that is refused (below). It is the grammar's subset of the valid calls, as ADR 0089's grammar
     writes a subset of the valid documents. A free string's lines are free, the miss points below aside.
-  - A value of another type (integer, number, boolean, object, array, a union with `null`) is free text until
-    #612, which holds it to its subschema. The call around it is held.
+  - A value of another type (integer, number, boolean, object, array) is JSON held to its subschema (#612,
+    **Typed and nullable values** below).
   - The rule is not extended to tools that are not held, and the extension is weighed by a count: with metrics on,
     `ignis_tool_call_values_split_total` (an amendment of ADR 0017 beside #608's family). It counts the string
     values of those tools' calls from which the first-occurrence cuts dropped text after a tag, text the confirmed
@@ -123,6 +125,26 @@ and repairs a miss, and it does not write the call's envelope for the model.
   - For a normalized tool, an optional parameter may be omitted, and stays omitted, so the JSON is valid under
     the client's own schema.
   - A normalized tool's objects are closed: no parameter the schema does not declare.
+- **Typed and nullable values (#612).** How a held value's text is read into the arguments is decided once per
+  parameter, from its compiled alternatives, and the grammar and the parser share it: the grammar holds the text
+  to what the reading delivers valid (`call::Reading`, carried in `call::Parameters` beside the omitted
+  parameters delivered `null`, so the seams the tickets after #611 build on keep their shapes).
+  - A parameter whose every alternative is a string or `null`, held by one slot (a free string, a single pattern
+    or format, enum strings), is the dialect's raw text, as before; with `null` among them, a text that reads
+    `null` (spaces aside) is `null`, so such a parameter cannot carry the string `null`. The dialect has no
+    quotes for a string, and this is the spec's documented limit.
+  - Any other parameter is JSON, held by ADR 0089's automaton from the subschema's node, its grammar subset
+    included (keys in the schema's order, literals canonical). A string beside another type is written quoted:
+    a raw text could not tell `5` the integer from `5` the string, and the parser's reading by declared type
+    would deliver the string where the schema has one.
+  - The parser delivers a JSON value as written, through the grammar crate's order-keeping value, compact and
+    canonical, instead of typing it by the declared types (`parse_argument_value`), which stays for tools that
+    are not held. That reading delivered a string for a `$ref`'s number, for an integer past 64 bits, and for a
+    nested value's keys out of order, each of which the grammar admits.
+  - The JSON starts at the value's first byte, no whitespace before it but the newline the parser trims, and
+    whitespace may follow it, bounded so that a line break is always left; the call's next step then comes at a
+    line's start, as for every value. Inside the JSON no line can be a step, since a JSON string holds no raw
+    newline.
 - **Refusals.**
   - `strict: true` with a schema outside OpenAI's strict subset is a 400 naming the constraint, as
     `response_format` is.
