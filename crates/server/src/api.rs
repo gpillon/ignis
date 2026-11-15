@@ -1551,7 +1551,7 @@ pub(crate) struct HeldTools {
 /// tokenizer with no single-token `</think>` to hold the content after.
 pub(crate) fn held_tools(
     server: &Server,
-    raw: &[Box<RawValue>],
+    raw: &[ignis_grammar::json::Json],
     tools: &[JsonValue],
     holds: bool,
     thinking: &ThinkingOptions,
@@ -1614,15 +1614,102 @@ pub(crate) fn held_tools(
 }
 
 /// A strict tool's `parameters` as the client sent them, key order kept
-/// (`raw`, read by the grammar crate's own JSON, which keeps it), or the
-/// normalized tool's when it sent none ([`normalize_tool`]).
-fn strict_parameters(raw: Option<&Box<RawValue>>, normalized: &JsonValue) -> String {
+/// (`raw`, the grammar crate's own JSON, which keeps it), or the normalized
+/// tool's when it sent none ([`normalize_tool`]).
+fn strict_parameters(raw: Option<&ignis_grammar::json::Json>, normalized: &JsonValue) -> String {
     use ignis_grammar::json::Json;
-    let sent = raw.and_then(|raw| Json::parse(raw.get()).ok()).and_then(|tool| {
-        let parameters = tool.get("function")?.get("parameters")?.clone();
-        (parameters != Json::Null).then(|| parameters.compact())
-    });
-    sent.unwrap_or_else(|| normalized["function"]["parameters"].to_string())
+    let sent = raw.and_then(|tool| tool.get("function")?.get("parameters")).filter(|parameters| **parameters != Json::Null);
+    sent.map(Json::compact).unwrap_or_else(|| normalized["function"]["parameters"].to_string())
+}
+
+/// A JSON value read once into the two shapes the handler needs:
+/// `serde_json`'s, its keys sorted, which every reader of a request's
+/// `tools` takes, and the grammar crate's, which keeps their order as sent:
+/// a strict tool's `parameters`, whose order its held calls' arguments
+/// follow (GitHub #611). Read by the same deserializer as a
+/// `serde_json::Value`, with the same nesting bound and the same errors.
+pub(crate) struct Sent {
+    pub value: JsonValue,
+    pub ordered: ignis_grammar::json::Json,
+}
+
+impl<'de> Deserialize<'de> for Sent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(SentVisitor)
+    }
+}
+
+struct SentVisitor;
+
+impl<'de> serde::de::Visitor<'de> for SentVisitor {
+    type Value = Sent;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E>(self, b: bool) -> Result<Sent, E> {
+        Ok(Sent { value: JsonValue::Bool(b), ordered: ignis_grammar::json::Json::Bool(b) })
+    }
+
+    fn visit_i64<E>(self, n: i64) -> Result<Sent, E> {
+        Ok(sent_number(JsonValue::from(n)))
+    }
+
+    fn visit_u64<E>(self, n: u64) -> Result<Sent, E> {
+        Ok(sent_number(JsonValue::from(n)))
+    }
+
+    fn visit_f64<E>(self, n: f64) -> Result<Sent, E> {
+        Ok(sent_number(serde_json::Number::from_f64(n).map_or(JsonValue::Null, JsonValue::Number)))
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Sent, E> {
+        Ok(Sent { value: JsonValue::String(s.to_owned()), ordered: ignis_grammar::json::Json::Str(s.to_owned()) })
+    }
+
+    fn visit_string<E>(self, s: String) -> Result<Sent, E> {
+        Ok(Sent { ordered: ignis_grammar::json::Json::Str(s.clone()), value: JsonValue::String(s) })
+    }
+
+    fn visit_unit<E>(self) -> Result<Sent, E> {
+        Ok(Sent { value: JsonValue::Null, ordered: ignis_grammar::json::Json::Null })
+    }
+
+    fn visit_none<E>(self) -> Result<Sent, E> {
+        Ok(Sent { value: JsonValue::Null, ordered: ignis_grammar::json::Json::Null })
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Sent, D::Error> {
+        Sent::deserialize(deserializer)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Sent, A::Error> {
+        let (mut values, mut ordered) = (Vec::new(), Vec::new());
+        while let Some(item) = seq.next_element::<Sent>()? {
+            values.push(item.value);
+            ordered.push(item.ordered);
+        }
+        Ok(Sent { value: JsonValue::Array(values), ordered: ignis_grammar::json::Json::Arr(ordered) })
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Sent, A::Error> {
+        let (mut values, mut ordered) = (serde_json::Map::new(), Vec::new());
+        while let Some((key, item)) = map.next_entry::<String, Sent>()? {
+            values.insert(key.clone(), item.value);
+            ordered.push((key, item.ordered));
+        }
+        Ok(Sent { value: JsonValue::Object(values), ordered: ignis_grammar::json::Json::Obj(ordered) })
+    }
+}
+
+/// A number in both shapes, the grammar's spelt as serde_json writes it.
+fn sent_number(value: JsonValue) -> Sent {
+    let ordered = match &value {
+        JsonValue::Null => ignis_grammar::json::Json::Null,
+        number => ignis_grammar::json::Json::Num(number.to_string()),
+    };
+    Sent { value, ordered }
 }
 
 /// The opening `"required"` forces (spec server/11): the call and its
@@ -2921,10 +3008,10 @@ struct ChatCompletionsRequest {
     thinking_budget: Option<JsonValue>,
     /// The tool definitions (GitHub #132) — opaque JSON, validated
     /// shallowly and passed to the template as-is (`resolve_tools`). Each
-    /// kept as sent: a strict tool's `parameters` keep their key order,
-    /// which its held calls' arguments follow (GitHub #611).
+    /// also kept in its key order as sent: a strict tool's `parameters`
+    /// keep theirs, which its held calls' arguments follow (GitHub #611).
     #[schema(value_type = Option<Vec<JsonValue>>)]
-    tools: Option<Vec<Box<RawValue>>>,
+    tools: Option<Vec<Sent>>,
     /// `"auto"` (default), `"none"`, `"required"`, or `{"type": "function",
     /// "function": {"name": ...}}` naming one of `tools`. The last two
     /// force the call's opening (GitHub #286): from the first token with
@@ -3080,11 +3167,15 @@ async fn chat_completions(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
-    // The tools as sent, for a strict tool's key order (#611), and as values.
-    let raw_tools = req.tools;
-    let sent_tools = raw_tools
-        .as_ref()
-        .map(|raw| raw.iter().map(|tool| serde_json::from_str(tool.get()).expect("a raw value is JSON")).collect());
+    // The tools as values, and in their key order as sent, for a strict
+    // tool's (#611).
+    let (sent_tools, raw_tools): (Option<Vec<JsonValue>>, Option<Vec<ignis_grammar::json::Json>>) = match req.tools {
+        Some(tools) => {
+            let (values, ordered) = tools.into_iter().map(|tool| (tool.value, tool.ordered)).unzip();
+            (Some(values), Some(ordered))
+        }
+        None => (None, None),
+    };
     let (tools, tool_choice) = match resolve_tools(sent_tools, req.tool_choice) {
         Ok(resolved) => resolved,
         Err(response) => return response,

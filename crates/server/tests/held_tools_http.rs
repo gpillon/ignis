@@ -400,6 +400,23 @@ async fn a_held_call_the_cap_cuts_returns_as_generated_with_length() {
     assert_eq!((content.as_str(), calls.len(), finish.as_str()), ("Writing.\n", 0, "length"));
 }
 
+/// `tools` is read in its key order as sent by the deserializer that read
+/// it before, so a tool nested past serde_json's bound is refused with the
+/// body, as before, and the same nesting in a field read as a plain value is
+/// refused the same way.
+#[tokio::test]
+async fn a_tool_nested_past_the_parsers_bound_is_refused_with_the_body_as_before() {
+    let deep = format!("{}1{}", "[".repeat(130), "]".repeat(130));
+    let (server, _) = server("", ModelFamily::Qwen38_27b);
+    let tool = format!(r#"{{"type":"function","function":{{"name":"g","parameters":{deep}}}}}"#);
+    let (status, _, text) = post(&server, &chat(&[&tool], false, 8)).await;
+    let elsewhere = chat(&[SEARCH], false, 8).replacen("\"tools\"", &format!("\"tool_choice\":{{\"x\":{{\"y\":{deep}}}}},\"tools\""), 1);
+    let (other_status, _, other) = post(&server, &elsewhere).await;
+    assert_eq!((status, other_status), (400, 400), "{text} / {other}");
+    assert!(text.contains("tools[0].function.parameters[0]") && text.contains("recursion limit exceeded"), "{text}");
+    assert!(other.contains("recursion limit exceeded"), "{other}");
+}
+
 /// With thinking on the reasoning is free, a call written there included;
 /// the content is held from the token after `</think>`.
 #[tokio::test]

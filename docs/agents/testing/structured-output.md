@@ -49,8 +49,8 @@ never how the automaton stores its states.
   arrive. `cargo test -p ignis-server --lib toolcall` holds the parser's
   first-occurrence cuts to a verbatim copy of the pre-#610 parser on 20,000
   generated tag soups, fed in random chunks, checked or not, ending at the
-  first call or not, and reads a held call (`ToolCallScanner::holding`, which
-  no caller sets yet) whole and split at every byte.
+  first call or not, and reads a held call (`ToolCallScanner::holding`, set
+  through `ToolSchemas::holding` since #611) whole and split at every byte.
 
 ## The bench and the independent validator
 
@@ -95,7 +95,9 @@ The measured figures are in
   answer is a miss; a repair's permitted set holds the opener until the
   answer starts and never after; a forced `tool_choice` forces the call.
   `openai_http_fields strict_on_a_function_tool` pins `strict` on a function
-  tool inert, on chat completions and the Responses API. Against a
+  tool inert where no grammar holds the answers (its template has none), on
+  chat completions and the Responses API; on the 27B chat completions hold it
+  (#611, below). Against a
   strict schema the script writes key names of its own, an enum in the wrong
   case, numbers out of range, a missing key, an extra key, a string its
   pattern refuses and a date in words: each answer is checked by hand and by
@@ -119,7 +121,8 @@ The measured figures are in
   stream assembles to); a call the first token writes is counted once, not
   again by the first-token probe; under `parallel_tool_calls: false` (#609)
   only the block that ends the turn is counted, a dropped one included;
-  strict tools outside the subset are counted and served; a value cut at a
+  strict tools outside the subset are counted as they arrive, refused on chat
+  completions (#611) and served on the Responses API; a value cut at a
   `</parameter>` line, whose text after it the parser dropped and the
   confirmed close would keep, is counted split (#610), and a plain value, the
   residue and a close with its required parameter missing are not.
@@ -185,4 +188,45 @@ repaired from the verify pass's scores, as a plain round's draw is.
 
   ```sh
   cargo test -p ignis-core --features cuda --test verify_cut_gpu -- --ignored --nocapture
+  ```
+
+## Held tools (GitHub #611, spec #582, ADR 0094)
+
+- **The grammar** (`cargo test -p ignis-grammar --lib tool_calls`, about 6
+  s): free text passes, the opener (token or bytes) arms, the name is held,
+  a free tool's body runs to its first `</tool_call>`, a held call takes its
+  parameters in any order and once, closes only with every required one
+  written, holds an enum, a pattern and a format on one line, misses at
+  spike S1's two points, bounds the whitespace between tags (the byte past
+  the bound a miss) and refuses what it cannot hold by name. No state is a
+  dead end (a search back to free text from states of generated texts), and
+  the mask equals the token-by-token reference on every state of them.
+  Machine-local, on the 27B's tokenizer (`--test tool_calls_real_tokenizer`,
+  a few seconds, skips without the artifact): the tags are one added token
+  each, read as they decode; no ordinary token holds the opener, so the first
+  draw keeps no scores; masks equal the reference on held calls as the
+  tokenizer splits them; S1's miss points on the real ids.
+- **The grammar against the parser** (`cargo test -p ignis-server --lib
+  toolcall`): what the grammar accepts from dialect pieces, read back in
+  random chunks, delivers every held call, each valid under #608's validator
+  (a free tool's call may be dropped as today); every valid call in the
+  template's form is accepted, but for the residue and S1's miss points,
+  carved out by name.
+- **The scheduler** (`cargo test -p ignis-core --test held_tool_calls`): the
+  prefill's draw opening a call, with no scores kept; a verified run holding
+  `</think>`, the opener and a miss cut at the miss; free text never a miss;
+  a stop inside a held call a miss.
+- **Over the mock engine** (`cargo test -p ignis-server --test
+  held_tools_http`, about 1 s): the scripts that miss on purpose come out
+  valid, each with its repairs counted under `type="tool"`; each refusal by
+  code and `param`; the schema's key order; a free tool beside a strict one;
+  no strict tool, no grammar; streaming; a cap; the reasoning free. The
+  byte-identity of requests with no strict tool is the existing suites'.
+- **On the GPU**, agent requests with strict tools on the served 27B with
+  DFlash2 on: every call valid and to a declared tool, every request a call,
+  each miss repaired and counted, the verify rounds drafting and accepting.
+  It prints each call and each request's misses, for reading the repairs:
+
+  ```sh
+  cargo test -p ignis-server --features cuda --test held_tools_gpu -- --ignored --nocapture
   ```

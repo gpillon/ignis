@@ -60,9 +60,10 @@ and repairs a miss, and it does not write the call's envelope for the model.
     under another name.
   - No parameter is written twice.
   - `</function>` is allowed only once every required parameter is written.
-  - The JSON delivered follows the schema's order. Chat completions read each of `tools` as sent (a raw value per
-    tool, the same field to serde and to the API document) so that a strict tool's `parameters` keep the client's
-    key order, which the workspace's `serde_json` does not keep (#611).
+  - The JSON delivered follows the schema's order. Chat completions read each of `tools` once into two values, by
+    the deserializer that read it before (its nesting bound and its errors unchanged): `serde_json`'s, which every
+    reader takes, and the grammar crate's, which keeps a strict tool's `parameters` in the client's key order. The
+    workspace's `serde_json` keeps no order (#611).
 - **A value ends only where the call continues.** A tag on its own line counts only when it is a valid next step
   of this call under the schema:
   - `<parameter=K>`, for a K the tool declares and the call has not written yet;
