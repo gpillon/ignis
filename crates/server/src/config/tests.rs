@@ -1985,16 +1985,14 @@ fn a_profiles_dflash2_window_is_not_the_27bs_mtp_window() {
 
 /// GitHub #627: the sm_86 gate's MTP smoke (docs/agents/testing.md, "The sm_86
 /// gate"; the contributors' releases page) starts `--profile auto --spec-backend
-/// mtp --qwen38-vision-enabled false` on a 24 GB card, where `auto` is
-/// `rtx-24gb`: the 27B's MTP load at the head's default window, its vision off,
-/// whatever the profile's own DFlash2 says.
+/// mtp` on a 24 GB card, where `auto` is `rtx-24gb`: the 27B's MTP load at the
+/// head's default window, whatever the profile's own DFlash2 says, and (GitHub
+/// #624) with the profile's vision on beside it.
 #[test]
 fn the_sm86_gates_mtp_smoke_is_an_mtp_load_under_the_24gb_profile() {
-    let smoke = config(&["--profile", "rtx-24gb", "--spec-backend", "mtp", "--qwen38-vision-enabled", "false"])
-        .for_family(ModelFamily::Qwen38_27b)
-        .unwrap();
+    let smoke = config(&["--profile", "rtx-24gb", "--spec-backend", "mtp"]).for_family(ModelFamily::Qwen38_27b).unwrap();
     assert_eq!(smoke.speculation, Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)));
-    assert!(smoke.vision.is_none(), "the 27B's vision off");
+    assert!(smoke.vision.is_some(), "the profile's vision on beside the head");
     let default = config(&["--profile", "rtx-24gb"]).for_family(ModelFamily::Qwen38_27b).unwrap();
     assert_eq!(default.speculation.map(|s| s.backend()), Some(SpeculativeBackend::Dflash2), "the gate's first start is DFlash2's");
 }

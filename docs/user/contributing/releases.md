@@ -148,9 +148,9 @@ smoke runs the route the card's users run. Ask for:
 - the greedy chat completion again on an MTP load: a second start with
   `--spec-backend mtp`, the 27B's own head, whose matrices run on the route
   these cards run (its `ignis.runtime.decode_routes` line says
-  `mtp_head_linear=ours`), with `--qwen38-vision-enabled false`, since the
-  head does not draft beside images yet. The profile's DFlash2 window is
-  DFlash2's, so the head drafts at its own default of 7.
+  `mtp_head_linear=ours`), with the profile's vision on as it is. The
+  profile's DFlash2 window is DFlash2's, so the head drafts at its own default
+  of 7.
 
 ```sh
 ignis-server --profile auto      # its ignis.config.source line names rtx-24gb
@@ -174,7 +174,7 @@ for image in small large; do
   curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d "@$image.json"
 done
 # The MTP load, once the first server has stopped: the same greedy request.
-ignis-server --profile auto --spec-backend mtp --qwen38-vision-enabled false   # decode_routes: mtp_head_linear=ours
+ignis-server --profile auto --spec-backend mtp   # decode_routes: mtp_head_linear=ours
 curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d \
   '{"model":"qwen3.8-27b","temperature":0,"enable_thinking":false,"max_tokens":64,"messages":[{"role":"user","content":"What is the capital of France? One word."}]}'
 ```

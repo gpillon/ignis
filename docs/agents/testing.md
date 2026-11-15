@@ -530,10 +530,10 @@ stops the release. Check `make gpu-status` first, as for any GPU run.
    only the sm_120a set holds. The large image sits at the processor's item
    bound, 16,384 tokens (4096 x 4096 pixels, a merged token being 32 x 32),
    under the profile's `vision.max_tokens`. Then an **MTP load** (spec #618,
-   #627): the server stopped and started again with `--spec-backend mtp
-   --qwen38-vision-enabled false` (the head does not draft beside images yet;
-   the profile's DFlash2 window is DFlash2's, so the head drafts at its default
-   7) answers the same greedy chat completion correctly, `Paris`. Its
+   #627): the server stopped and started again with `--spec-backend mtp`
+   (vision on, as the profile has it; the profile's DFlash2 window is
+   DFlash2's, so the head drafts at its default 7) answers the same greedy
+   chat completion correctly, `Paris`. Its
    `ignis.runtime.decode_routes` line says `mtp_head_linear=ours`: the head's
    matrices on ignis's route for these cards (`kernel/src/w8_imma.h`), the
    vendored SIMT kernel for the rounds' few rows and the integer MMA for the
@@ -585,7 +585,7 @@ for image in small large; do
   curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d "@$image.json"
 done
 # The MTP load, once the first server has stopped: the same greedy request.
-ignis-server --profile auto --spec-backend mtp --qwen38-vision-enabled false   # decode_routes: mtp_head_linear=ours
+ignis-server --profile auto --spec-backend mtp   # decode_routes: mtp_head_linear=ours
 curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d \
   '{"model":"qwen3.8-27b","temperature":0,"enable_thinking":false,"max_tokens":64,"messages":[{"role":"user","content":"What is the capital of France? One word."}]}'
 ```

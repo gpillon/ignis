@@ -496,7 +496,11 @@ async fn agentic_load_with_images(backend: SpeculativeBackend) {
 
     // 1. An image prefill interleaved with three decoding text lanes.
     let lanes = [
-        ("primes", "List the first forty prime numbers, separated by commas.", "173"),
+        // The fortieth prime, 173, stands at a near tie with the stop after the
+        // thirty-ninth on a DFlash2 load, where the rounds' widths follow the
+        // streams' timing: runs of one build end at either. The lane answers
+        // its question when its list reaches 167.
+        ("primes", "List the first forty prime numbers, separated by commas.", "167"),
         ("months", "Name the twelve months of the year in order, separated by commas.", "September"),
         ("words", "Write the English words for the numbers one through thirty, separated by commas.", "twenty"),
     ];
