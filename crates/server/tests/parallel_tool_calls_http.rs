@@ -12,11 +12,13 @@ mod responses;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
 use ignis_core::compute::ModelFamily;
-use ignis_core::{MockCompute, SchedulerConfig};
+use ignis_core::mock::{GateController, GatedCompute};
+use ignis_core::{Compute, MockCompute, SchedulerConfig};
 use serde_json::{json, Value as JsonValue};
 use tower::ServiceExt;
 
@@ -61,6 +63,19 @@ struct Turn {
     tokens: u64,
     /// Every byte the client received.
     raw: String,
+    /// The WebSocket mode's serve, going on until the turn is dropped.
+    _serving: Option<Serving>,
+}
+
+/// A server serving the WebSocket mode. A serve's end shuts its model down,
+/// which would end what a turn's end left the engine to release and any
+/// request sent after the turn, so a turn keeps it.
+struct Serving(responses::Live);
+
+impl std::fmt::Debug for Serving {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "serving on {}", self.0.addr)
+    }
 }
 
 /// A server whose request 0 writes `steps`, one a step, on `family`; with
@@ -68,13 +83,31 @@ struct Turn {
 /// up to the cap. With `runs` each decode round commits 8 tokens, which
 /// reach the server together.
 fn writing(steps: &[&'static str], eos: Option<u32>, family: ModelFamily, runs: bool) -> (ignis_server::Server, Arc<MockCompute>) {
+    let (mock, script) = scripted(steps, eos, runs);
+    let server = server(&script, SchedulerConfig::default(), mock.clone()).with_family(family);
+    (server, mock)
+}
+
+/// [`writing`] with no end of its own, its model thread held at the gate in
+/// request 0's decode round `round` (its first is 0): held in the round after
+/// the one that delivers the call's close, the request generates nothing past
+/// it while the turn ends, however long the turn's handler waits for a core.
+fn holding(steps: &[&'static str], family: ModelFamily, runs: bool, round: u32) -> (ignis_server::Server, Arc<MockCompute>, GateController) {
+    let (mock, script) = scripted(steps, None, runs);
+    let (gated, gate) = GatedCompute::new(mock.clone() as Arc<dyn Compute>);
+    gated.arm_at(0, round);
+    let server = server(&script, SchedulerConfig::default(), gated).with_family(family);
+    (server, mock, gate)
+}
+
+/// The mock and the template of [`writing`].
+fn scripted(steps: &[&'static str], eos: Option<u32>, runs: bool) -> (Arc<MockCompute>, Arc<Script>) {
     let mock = Arc::new(if runs { MockCompute::with_runs(&[8]) } else { MockCompute::new() });
     if let Some(step) = eos {
         mock.eos_after(0, step);
     }
     let decode: HashMap<_, _> = steps.iter().enumerate().map(|(step, text)| (mock.token_for(0, step as u32), *text)).collect();
-    let server = server(&Script::new(decode), SchedulerConfig::default(), mock.clone()).with_family(family);
-    (server, mock)
+    (mock, Script::new(decode))
 }
 
 fn read_file() -> JsonValue {
@@ -145,6 +178,7 @@ fn response_turn(response: &JsonValue, raw: String) -> Turn {
         finish: response["status"].as_str().unwrap().to_owned(),
         tokens: response["usage"]["output_tokens"].as_u64().unwrap(),
         raw,
+        _serving: None,
     };
     for item in response["output"].as_array().unwrap() {
         match item["type"].as_str().unwrap() {
@@ -157,8 +191,11 @@ fn response_turn(response: &JsonValue, raw: String) -> Turn {
     turn
 }
 
-/// One turn on `surface`, over `server`.
-async fn turn(server: ignis_server::Server, surface: Surface, body: &JsonValue) -> Turn {
+/// One turn on `surface`, over `server`, which outlives it as a serving
+/// one does: an engine with no handle left ends its model thread before the
+/// step that would release what the turn's end stopped. On the WebSocket
+/// mode the turn keeps its serve going ([`Serving`]).
+async fn turn(server: &ignis_server::Server, surface: Surface, body: &JsonValue) -> Turn {
     match surface {
         Surface::Chat => {
             let raw = post(&server.app(), "/v1/chat/completions", body).await;
@@ -172,6 +209,7 @@ async fn turn(server: ignis_server::Server, surface: Surface, body: &JsonValue) 
                 finish: answer["choices"][0]["finish_reason"].as_str().unwrap().to_owned(),
                 tokens: answer["usage"]["completion_tokens"].as_u64().unwrap(),
                 raw,
+                _serving: None,
             }
         }
         Surface::ChatStream => {
@@ -194,6 +232,7 @@ async fn turn(server: ignis_server::Server, surface: Surface, body: &JsonValue) 
                 finish: finishes[0]["choices"][0]["finish_reason"].as_str().unwrap().to_owned(),
                 tokens: chunks.last().unwrap()["usage"]["completion_tokens"].as_u64().expect("the usage chunk"),
                 raw,
+                _serving: None,
             }
         }
         Surface::Responses => {
@@ -210,14 +249,14 @@ async fn turn(server: ignis_server::Server, surface: Surface, body: &JsonValue) 
             response_turn(&ends[0]["response"], raw)
         }
         Surface::Socket => {
-            let live = live(server).await;
+            let live = live(server.clone()).await;
             let mut socket = socket(&live).await;
             let mut create = body.clone();
             create["type"] = json!("response.create");
             send(&mut socket, create).await;
             let events = events_until(&mut socket, terminal).await;
             let raw = events.iter().map(JsonValue::to_string).collect::<Vec<_>>().join("\n");
-            response_turn(&events.last().unwrap()["response"], raw)
+            Turn { _serving: Some(Serving(live)), ..response_turn(&events.last().unwrap()["response"], raw) }
         }
     }
 }
@@ -231,12 +270,24 @@ fn called(surface: Surface) -> &'static str {
     }
 }
 
-/// The engine let request 0 go long before its cap: the turn's end released
-/// it, and it did not generate on to `CAP` for nobody.
-async fn released_early(mock: &MockCompute) {
-    assert!(responses::released(mock, 0).await, "request 0 was never released");
+/// The turn's end released request 0 and it generated nothing for nobody: its
+/// model thread, held in decode round `round` ([`holding`]), goes on once the
+/// turn has ended, unless the stop came before that round and the request is
+/// gone already, and no round runs past it. `case` names the turn.
+async fn released_early(mock: &MockCompute, gate: &GateController, round: u32, case: &str) {
+    let released = tokio::time::timeout(Duration::from_secs(10), async {
+        while !mock.released_requests().contains(&0) {
+            if gate.entered() {
+                gate.release();
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .is_ok();
     let rounds = mock.decode_calls().len();
-    assert!(rounds < (CAP / 2) as usize, "{rounds} decode rounds: the request ran on past its turn's end");
+    assert!(released, "request 0 was never released, {rounds} decode rounds in: {case}");
+    assert!(rounds <= round as usize + 1, "{rounds} decode rounds: the request ran on past its turn's end: {case}");
 }
 
 #[tokio::test]
@@ -244,8 +295,9 @@ async fn false_ends_the_turn_at_its_first_call_on_every_surface_and_both_familie
     for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
         for (steps, runs) in [(SPLIT, false), (SPLIT, true), (ONE_TOKEN, false)] {
             for surface in SURFACES {
-                let (server, mock) = writing(steps, None, family, runs);
-                let got = turn(server, surface, &body(surface, Some(false), &json!({}))).await;
+                // Token 1 closes the call; round 1 delivers it.
+                let (server, mock, gate) = holding(steps, family, runs, 2);
+                let got = turn(&server, surface, &body(surface, Some(false), &json!({}))).await;
                 let case = format!("{family:?} {surface:?} runs {runs} {steps:?}: {got:?}");
                 assert_eq!(got.paths, ["a.txt"], "{case}");
                 assert_eq!(got.content, "Reading. ", "{case}");
@@ -253,7 +305,7 @@ async fn false_ends_the_turn_at_its_first_call_on_every_surface_and_both_familie
                 assert_eq!(got.tokens, 2, "the tokens up to the call's close: {case}");
                 assert!(!got.raw.contains(SECOND_MARK), "the second call reached the client: {case}");
                 assert!(!got.raw.contains('?'), "a token past the close reached the client: {case}");
-                released_early(&mock).await;
+                released_early(&mock, &gate, 2, &case).await;
             }
         }
     }
@@ -271,7 +323,7 @@ async fn a_turn_whose_model_ends_right_after_its_call_is_counted_once_as_complet
             let server = server.with_metrics();
             let metrics = server.metrics.clone().unwrap();
             let again = server.clone().app();
-            let got = turn(server, surface, &body(surface, Some(false), &json!({}))).await;
+            let got = turn(&server, surface, &body(surface, Some(false), &json!({}))).await;
             let case = format!("{surface:?} runs {runs}: {got:?}");
             assert_eq!(got.paths, ["a.txt"], "{case}");
             assert_eq!(got.finish, called(surface), "{case}");
@@ -294,7 +346,7 @@ async fn true_or_absent_serves_every_call_the_turn_writes() {
             for parallel in [None, Some(true)] {
                 for surface in SURFACES {
                     let (server, _) = writing(steps, Some(steps.len() as u32), family, runs);
-                    let got = turn(server, surface, &body(surface, parallel, &json!({}))).await;
+                    let got = turn(&server, surface, &body(surface, parallel, &json!({}))).await;
                     let case = format!("{family:?} {surface:?} {parallel:?} runs {runs} {steps:?}: {got:?}");
                     assert_eq!(got.paths, ["a.txt", "never.txt"], "{case}");
                     assert_eq!(got.finish, called(surface), "{case}");
@@ -310,9 +362,10 @@ async fn a_call_closed_inside_the_reasoning_ends_nothing() {
     let thought = "plan <tool_call>\n<function=read_file>\n<parameter=path>\nthought.txt\n</parameter>\n</function>\n</tool_call> then";
     let steps: &[&'static str] = &[thought, "</think>", "Reading. ", FIRST, "\n", SECOND];
     for surface in SURFACES {
-        let (server, mock) = writing(steps, None, ModelFamily::Qwen38_27b, false);
+        // Token 3 closes the call; round 3 delivers it.
+        let (server, mock, gate) = holding(steps, ModelFamily::Qwen38_27b, false, 4);
         let thinking = json!({ "enable_thinking": true, "thinking_budget": 0 });
-        let got = turn(server, surface, &body(surface, Some(false), &thinking)).await;
+        let got = turn(&server, surface, &body(surface, Some(false), &thinking)).await;
         let case = format!("{surface:?}: {got:?}");
         assert_eq!(got.reasoning, thought, "the reasoning is whole: {case}");
         assert_eq!(got.paths, ["a.txt"], "{case}");
@@ -320,7 +373,26 @@ async fn a_call_closed_inside_the_reasoning_ends_nothing() {
         assert_eq!(got.finish, called(surface), "{case}");
         assert_eq!(got.tokens, 4, "{case}");
         assert!(!got.raw.contains(SECOND_MARK), "{case}");
-        released_early(&mock).await;
+        released_early(&mock, &gate, 4, &case).await;
+    }
+}
+
+/// The turn's end releases its request at the engine's next step however
+/// late that step comes. Here the turn's first token closes its call and the
+/// model thread is held in the decode round its prefill goes on to, so the
+/// stop waits in the engine's queue until the turn has ended, as behind a
+/// slow round on a loaded machine; then the round goes on.
+#[tokio::test]
+async fn a_stop_that_waits_behind_a_round_releases_the_request_at_the_next_step() {
+    for surface in SURFACES {
+        let (server, mock, gate) = holding(&[FIRST, "\n", SECOND], ModelFamily::Qwen38_27b, false, 0);
+        let got = turn(&server, surface, &body(surface, Some(false), &json!({}))).await;
+        let case = format!("{surface:?}: {got:?}");
+        assert_eq!(got.paths, ["a.txt"], "{case}");
+        assert_eq!(got.tokens, 1, "the call closes at the first token: {case}");
+        gate.wait_entered();
+        gate.release();
+        released_early(&mock, &gate, 0, &case).await;
     }
 }
 
@@ -332,7 +404,7 @@ async fn a_turn_with_no_call_is_served_to_its_end() {
         let mut answers = Vec::new();
         for parallel in [Some(false), None] {
             let (server, _) = writing(steps, Some(2), ModelFamily::Qwen38_27b, false);
-            answers.push(turn(server, surface, &body(surface, parallel, &json!({}))).await);
+            answers.push(turn(&server, surface, &body(surface, parallel, &json!({}))).await);
         }
         let [with, without]: [Turn; 2] = answers.try_into().unwrap();
         assert_eq!((with.content.as_str(), with.tokens), ("one two", 2), "{surface:?}: {with:?}");
