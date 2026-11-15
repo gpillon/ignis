@@ -500,8 +500,9 @@ fn the_compilers_recursion_is_bounded_by_the_ref_chain_limit() {
 }
 
 /// The server's widest bounds (`model.grammar_max_ref_chain` 1024,
-/// `model.grammar_max_depth` 4096) compile a schema at the edge of both on a
-/// thread's default stack, as a request's handler does.
+/// `model.grammar_max_depth` at [`crate::json::MAX_DEPTH`]) compile a schema
+/// at the edge of the chain on a thread's default stack, as a request's
+/// handler does, and refuse its 500 levels by the depth once compiled.
 #[test]
 fn the_widest_bounds_the_server_allows_compile_on_a_default_stack() {
     let v = vocab();
@@ -515,12 +516,12 @@ fn the_widest_bounds_the_server_allows_compile_on_a_default_stack() {
     );
     let widest = within(|l| {
         l.max_ref_chain = 1024;
-        l.max_depth = 4096;
+        l.max_depth = crate::json::MAX_DEPTH;
     });
     let compiled = std::thread::spawn(move || Grammar::json_schema_within(v, &schema, true, &widest).map(|_| ()))
         .join()
         .expect("no stack overflow");
-    assert_eq!(compiled, Ok(()));
+    assert_eq!(compiled.map_err(|refusal| refusal.code), Err("exceeds_max_depth"));
 }
 
 #[test]

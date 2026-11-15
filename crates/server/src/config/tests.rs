@@ -1192,6 +1192,7 @@ fn the_grammars_limits_are_the_measured_ones_unless_named() {
     for (flag, past) in [
         ("--model-grammar-max-pattern-states", "0"),
         ("--model-grammar-max-depth", "2"),
+        ("--model-grammar-max-depth", "129"),
         ("--model-grammar-max-ref-chain", "1025"),
         ("--model-grammar-max-whitespace", "256"),
     ] {

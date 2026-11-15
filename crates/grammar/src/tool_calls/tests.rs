@@ -548,6 +548,31 @@ fn a_string_that_may_be_null_is_raw_text_and_its_text_null_is_null() {
     assert_eq!(readings(r#"{"type":"string"}"#), (Reading::Text, false));
 }
 
+/// The deepest typed value the grammar holds at the deepest nesting the
+/// server allows (`model.grammar_max_depth` at most the call parser's own
+/// bound, [`crate::json::MAX_DEPTH`]) is read by the parser as the JSON it
+/// is, never as a string: a held call is never delivered invalid by its
+/// depth (spec #582).
+#[test]
+fn the_deepest_value_held_at_the_widest_depth_reads_as_json() {
+    let parameters = r##"{"type":"object","properties":{"a":{"$ref":"#/$defs/t"}},"required":["a"],"additionalProperties":false,"$defs":{"t":{"type":"array","items":{"$ref":"#/$defs/t"}}}}"##;
+    let cache = cache_within(GrammarLimits { max_depth: crate::json::MAX_DEPTH, ..GrammarLimits::default() });
+    let grammar = cache.tool_calls(&[tool("one", Some(parameters))]).unwrap();
+    let mut m = ToolCallMatcher::new(grammar.clone());
+    assert!(m.accept_bytes(b"<tool_call>\n<function=one>\n<parameter=a>\n"));
+    let deepest = (0..).take_while(|_| m.accept_bytes(b"[")).count();
+    assert_eq!(deepest, crate::json::MAX_DEPTH - 1, "the depth bounds the value");
+    let value = format!("{}{}", "[".repeat(deepest), "]".repeat(deepest));
+    assert!(m.accept_bytes(&value.as_bytes()[deepest..]) && m.accept_bytes(b"\n</parameter>\n</function>\n</tool_call>"));
+    assert!(!m.in_call());
+    let (_, p) = grammar.held().next().unwrap();
+    let read = p.reading_of(0).read(&value);
+    assert_eq!(read, value, "read as JSON, not as a string");
+    let schema = crate::json::Json::parse(parameters).unwrap();
+    let arguments = crate::json::Json::parse(&format!(r#"{{"a":{read}}}"#)).unwrap();
+    assert!(crate::validate::is_valid(&schema, &arguments));
+}
+
 #[test]
 fn a_union_no_raw_text_holds_is_json_a_string_in_it_quoted() {
     let cases: [(&str, &[&str], &[&str]); 4] = [

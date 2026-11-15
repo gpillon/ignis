@@ -718,11 +718,11 @@ The most states a `json_schema`'s `pattern` or `format` may compile to: a larger
 | Env var | `IGNIS_MODEL_GRAMMAR_MAX_DEPTH` |
 | Kind | `levels` |
 | Default | `128` |
-| Rule | 3..=4096 |
+| Rule | 3..=128 |
 | Models | all |
 | `/v1/config` | shown by `GET`, not patchable |
 
-How deep structured output's answer may nest, in levels: a value is opened only where it can still be closed within it, and a schema whose shortest answer nests deeper is refused (`exceeds_max_depth`).
+How deep structured output's answer may nest, in levels: a value is opened only where it can still be closed within it, and a schema whose shortest answer nests deeper is refused (`exceeds_max_depth`). At most the call parser's own bound, so that a held tool's typed value is always read back as the JSON it was held to.
 
 ### `model.grammar_max_ref_chain`
 
