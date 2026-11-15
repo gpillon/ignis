@@ -403,11 +403,19 @@ fn the_heads_state_and_first_draft_are_its_weights_in_double_precision_on_the_16
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn on_the_rtx_30_and_40_route_the_heads_state_and_first_draft_are_its_weights_in_double_precision() {
     const SWITCH: &str = "IGNIS_MTP_HEAD_LINEAR";
+    // Removed however the check ends, so a failure here never moves the
+    // tests after it onto this route.
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(SWITCH) };
+        }
+    }
     // The switch is read from the process environment at each load
     // (kernel/src/process_environment.h); the profile runs one test at a time.
+    let _unset = Unset;
     unsafe { std::env::set_var(SWITCH, "ours") };
     check_against_f64(TRELLIS, false);
-    unsafe { std::env::remove_var(SWITCH) };
 }
 
 /// The head's rows at `positions` from `hiddens` and the embeddings of
