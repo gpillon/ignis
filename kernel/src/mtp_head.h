@@ -27,7 +27,9 @@
 // `[a - 1, b - 1)` -- the first from the sequence's continuation hidden (the
 // target's hidden at `a - 1`, kept in the pool), the rest from the step's own
 // hiddens -- and leaves the target's hidden at `b - 1` as the next
-// continuation hidden. A prefill's first chunk has no row at -1.
+// continuation hidden. A prefill's first chunk has no row at -1. A verify
+// round (GitHub #621) is such a step over its committed run; its chain's own
+// rows are scratch (below, "the head in a verify round").
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -105,5 +107,88 @@ int32_t decode_round(ignis_model &model, ignis_seq_pool &pool, std::uint32_t wid
 // `*error`.
 int32_t frontier_row(ignis_model &model, ignis_seq_pool &pool, ignis_seq &seq, std::int32_t next_token,
                      ninfer::DeviceArena &arena, ninfer::Tensor &out_hidden, std::string *error);
+
+// GitHub #621: the head in a verify round. A lane at frontier `P` (its
+// anchor, the pending token, at `P`) with extent `e` and a committed run of
+// `c` tokens (1 <= c <= e + 1):
+//
+//   the chain  (`propose`, inside the round's pass and its graph): step 0 the
+//              head's row at P - 1 from the continuation hidden and the
+//              anchor, step s > 0 its row at P - 1 + s from the head's own
+//              hidden at step s - 1 and the draft d_s that step chose; step s
+//              chooses d_{s+1}, the argmax of the target's output head over
+//              the head's hidden (the fixed draft, at every temperature). A
+//              lane needs steps 0 .. e - 1; a step past them writes nothing
+//              (a lane at extent 0 none), so no row lands past the lane's
+//              budget or its context;
+//   the commit (`commit_rows`, after the cut, eager): the rows the run
+//              licenses, [P - 1, P + c - 1), each again from what the
+//              sequence consumed -- the continuation hidden and the anchor,
+//              then the target's post-final-norm hidden of each committed
+//              column and the token after it -- so no row the chain built
+//              from the head's own hidden stays below the frontier;
+//   the continuation hidden (`commit_continuation`, the round's last device
+//              step): the target's post-final-norm hidden of column c - 1.
+//
+// Rows the chain wrote past the commit are past the head's frontier (P + c
+// - 1), never read before a later step writes them again; under hq-e8-2b
+// their ring bits are cleared (`round_rows`, kernel/src/step.cu).
+
+// The head's rows a verify round touches, for a lane at frontier `base`
+// with extent `extent` that commits `committed` tokens: the chain's are
+// [first, chain_end), the commit's [first, committed_end). Host arithmetic.
+struct RoundRows {
+  std::uint64_t first = 0;
+  std::uint64_t chain_end = 0;
+  std::uint64_t committed_end = 0;
+};
+RoundRows round_rows(std::uint64_t base, std::uint32_t extent, std::uint32_t committed);
+
+// The chain over the round's `width` lanes, from the verify round's staging
+// (`IgnisVerifyRound`: anchors, base positions, extents; the round's slots in
+// `model.decode_graph_slots`): every lane's drafts into `verify.drafts`
+// (I32 [k, width], lane-major), its steps at width `width`. Graph-safe;
+// scratch from `model.decode_graph_scratch` in its own scope, the step's
+// scores in `verify.logits` (which the pass writes again after it). Enqueue
+// only. 0, or -1 with `*error`.
+int32_t propose(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, std::string *error);
+
+// The commit's rows, eager, after the round's pass: lane b's rows at
+// `positions[b * (k + 1) + j]` (host I32 [k + 1, width]: base_b - 1 + min(j,
+// committed_b - 1)), its first `committed[b]` (host I32 [width]) columns
+// valid, from the round's own `verify.hidden` and `verify.verify_ids`. Both
+// host arrays stay alive until the stream synchronizes. Only the rows' keys
+// and values: the head's hidden at a committed row is no draft's. 0, or -1
+// with `*error`.
+int32_t commit_rows(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, const std::int32_t *positions,
+                    const std::int32_t *committed, std::string *error);
+
+// Each lane's continuation hidden from the run's last committed column,
+// `verify.selected_hidden` (the pre-norm residual the commit selected),
+// normalized as the pass normalized it. 0, or -1 with `*error`.
+int32_t commit_continuation(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, std::string *error);
+
+// The round's three small device steps, exposed for their op test
+// (kernel/tests/test_mtp_round.cu). Enqueue only; throw on a launch error.
+namespace detail {
+
+// Step `step` of the chain: lane b's row `positions[b]` = base[b] - 1 + step
+// and `valid[b]` = 1 when the lane needs that step (step < extents[b]); 0
+// and 0 (the masked form's empty row) otherwise.
+void chain_rows(const std::int32_t *base_positions, const std::int32_t *extents, std::int32_t step,
+                std::int32_t *positions, std::int32_t *valid, std::int32_t batch, cudaStream_t stream);
+
+// drafts[b * window + step] = tokens[b].
+void write_drafts(const std::int32_t *tokens, std::int32_t *drafts, std::int32_t window, std::int32_t step,
+                  std::int32_t batch, cudaStream_t stream);
+
+// The commit's input hiddens, BF16 [hidden, lane_columns, batch]: lane b's
+// column 0 is its continuation hidden (`table` column `slots[b]`), column j >
+// 0 the round's normalized column j - 1 (`normalized`, the same shape).
+void commit_hiddens(const std::uint16_t *normalized, const std::uint16_t *table, const std::int32_t *slots,
+                    std::uint16_t *out, std::int32_t hidden, std::int32_t lane_columns, std::int32_t batch,
+                    cudaStream_t stream);
+
+}  // namespace detail
 
 }  // namespace ignis::mtp

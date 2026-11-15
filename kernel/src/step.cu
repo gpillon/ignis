@@ -2014,10 +2014,19 @@ struct UncommittedRingColumns {
     }
     for (std::size_t i = 0; i < slots->size(); ++i) {
       const auto first = static_cast<std::uint64_t>((*base_positions)[i]);
+      const auto extent = static_cast<std::uint64_t>((*extents)[i]);
       ninfer::apply_kv_ring_valid_words(
           pool->hq_ring_words((*slots)[i]),
-          ignis_hq_ring_invalidate_mask(first, first + static_cast<std::uint64_t>((*extents)[i]) + 1),
+          ignis_hq_ring_invalidate_mask(first, first + extent + 1),
           ninfer::KvRingWords{}, kIgnisHqRingWords, stream);
+      // GitHub #621: and the MTP head's own words over every row its chain
+      // and its commit may have written, [P - 1, P + extent)
+      // (kernel/src/mtp_head.h `round_rows`).
+      if (pool->has_mtp_head()) {
+        ninfer::apply_kv_ring_valid_words(pool->hq_head_ring_words((*slots)[i]),
+                                          ignis_hq_ring_invalidate_mask(first - 1, first + extent),
+                                          ninfer::KvRingWords{}, kIgnisHqRingWords, stream);
+      }
     }
     (void)cudaStreamSynchronize(stream);
   }
@@ -2067,13 +2076,10 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
   // taps before it and the committed columns' feature taps after the cut.
   const bool in_leaf = ignis_drafter_proposes_in_the_leaf(model->drafter);
   const bool dflash2 = model->drafter == IgnisDrafter::kDflash2;
-  // GitHub #620: the MTP head keeps its state through prefills and plain
-  // rounds; the chain that proposes inside the verify round is not built.
-  if (model->drafter == IgnisDrafter::kMtp) {
-    set_error("ignis_program_decode: a verify round on an MTP load needs the head's chain, which this leaf does not "
-              "run yet; an MTP load decodes in plain rounds (speculative_window 0)");
-    return -1;
-  }
+  // GitHub #621: the MTP head's chain proposes inside the pass, and after the
+  // cut the head's rows and continuation hidden follow the committed run
+  // alone (kernel/src/mtp_head.h, "the head in a verify round").
+  const bool mtp = model->drafter == IgnisDrafter::kMtp;
   if (in_leaf && (options.drafts != nullptr || options.draft_counts != nullptr)) {
     set_error(std::string("ignis_program_decode: this model was loaded with ") +
               ignis_drafter_name(model->drafter) +
@@ -2441,6 +2447,28 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
         }
       }
     }
+    // GitHub #621: so are the MTP head's rows its chain wrote past the
+    // commit, in the head's own words: the chain's [P - 1, P - 1 + extent)
+    // less the commit's [P - 1, P - 1 + c).
+    if (mtp && pool->has_hq_residual()) {
+      for (uint64_t i = 0; i < batch_size; ++i) {
+        const ignis::mtp::RoundRows rows =
+            ignis::mtp::round_rows(static_cast<std::uint64_t>(base_positions[i]), static_cast<std::uint32_t>(extents[i]),
+                                   static_cast<std::uint32_t>(committed[i]));
+        if (rows.committed_end >= rows.chain_end) {
+          continue;
+        }
+        ninfer::apply_kv_ring_valid_words(pool->hq_head_ring_words(slots[i]),
+                                          ignis_hq_ring_invalidate_mask(rows.committed_end, rows.chain_end),
+                                          ninfer::KvRingWords{}, kIgnisHqRingWords, model->stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+          set_error(std::string("ignis_program_decode: the MTP head's hq ring invalidation failed: ") +
+                    cudaGetErrorString(err));
+          return -1;
+        }
+      }
+    }
 
     // The fold: every GDN layer's slot and conv taps rebuilt from the
     // committed prefix of this round's records, in one vendored call over
@@ -2450,6 +2478,28 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
                                  std::span<const ninfer::ops::GdnReplayFoldRow>(fold_rows.data(),
                                                                                 batch_size),
                                  model->stream);
+
+    // GitHub #621: the MTP head's rows the run licenses, [P - 1, P - 1 + c)
+    // in each lane, built again from the continuation hidden, the round's
+    // committed columns and their tokens: every row the chain built from the
+    // head's own hidden below the new frontier is written over. The host
+    // arrays live until the synchronize below.
+    std::vector<std::int32_t> head_rows;
+    if (mtp) {
+      head_rows.resize(static_cast<std::size_t>(lane_columns) * batch_size);
+      for (uint64_t i = 0; i < batch_size; ++i) {
+        for (std::uint32_t j = 0; j < lane_columns; ++j) {
+          head_rows[i * lane_columns + j] =
+              base_positions[i] - 1 + std::min<std::int32_t>(static_cast<std::int32_t>(j), committed[i] - 1);
+        }
+      }
+      std::string head_error;
+      if (ignis::mtp::commit_rows(*model, *pool, static_cast<std::uint32_t>(batch_size), head_rows.data(),
+                                  committed.data(), &head_error) != 0) {
+        set_error("ignis_program_decode: " + head_error);
+        return -1;
+      }
+    }
 
     // The accepted hidden state per lane (the run's last column's final
     // residual), kept for the drafter's continuation input (P5-05).
@@ -2539,6 +2589,23 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       err = adjust_penalty_counts(rollback, model->stream);
       if (err != cudaSuccess) {
         set_error(std::string("ignis_program_decode: penalty count rollback failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+    }
+
+    // GitHub #621: the MTP head's continuation hidden, sequence state the
+    // next round's chain starts from, moves last: a round that fails before
+    // here leaves it the hidden of the lane's unmoved frontier.
+    if (mtp) {
+      std::string head_error;
+      if (ignis::mtp::commit_continuation(*model, *pool, static_cast<std::uint32_t>(batch_size), &head_error) != 0) {
+        set_error("ignis_program_decode: " + head_error);
+        return -1;
+      }
+      err = cudaStreamSynchronize(model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: cudaStreamSynchronize(the MTP head's continuation) failed: ") +
                   cudaGetErrorString(err));
         return -1;
       }

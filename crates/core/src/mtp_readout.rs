@@ -49,6 +49,12 @@ mod ffi {
             out_keys: *mut u16,
             out_values: *mut u16,
         ) -> i32;
+        pub fn ignis_mtp_readout_ring(
+            pool: *const IgnisSeqPool,
+            seq: *const IgnisSeq,
+            out_target_words: *mut u32,
+            out_head_words: *mut u32,
+        ) -> i32;
         pub fn ignis_mtp_readout_last_error() -> *const c_char;
     }
 }
@@ -147,6 +153,27 @@ pub fn head_state(
         return Err(last_error());
     }
     Ok((keys, values))
+}
+
+/// GitHub #621: under hq-e8-2b, `sequence`'s residual window ring words --
+/// the target's, then the MTP head's own -- as the device holds them, each
+/// comparable with [`crate::hq_ring::HqRing::words`]. A pool built for the
+/// head refuses a snapshot until the head's sections are listed (#622), so
+/// this is the read of them meanwhile.
+#[cfg(feature = "cuda")]
+pub fn ring_words(
+    pool: &SeqPool,
+    sequence: &Seq<'_>,
+) -> Result<(crate::hq_ring::RingWords, crate::hq_ring::RingWords), String> {
+    let mut target = [0u32; crate::hq_ring::RING_WORDS];
+    let mut head = [0u32; crate::hq_ring::RING_WORDS];
+    let rc = unsafe {
+        ffi::ignis_mtp_readout_ring(pool.handle(), sequence.handle(), target.as_mut_ptr(), head.as_mut_ptr())
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok((target, head))
 }
 
 #[cfg(test)]

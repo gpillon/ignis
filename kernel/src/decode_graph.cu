@@ -189,17 +189,21 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
     // GitHub #619: the proposal seam, filled by the load's drafter before
     // the verify inputs read the drafts -- one pass, inside the same graph.
     // DFlash2's forward writes this round's drafts from each lane's window
-    // (P5-05, GitHub #155); the verify substrate alone's were staged by the
-    // round from its caller.
+    // (P5-05, GitHub #155); the MTP head's chain from each lane's
+    // continuation hidden and anchor (GitHub #621, kernel/src/mtp_head.h);
+    // the verify substrate alone's were staged by the round from its caller.
     switch (model->drafter) {
     case IgnisDrafter::kDflash2:
       ignis_dflash2_propose(model, pool, width);
       break;
-    case IgnisDrafter::kMtp:
-      // GitHub #620: the head's chain is not built; the round refuses an MTP
-      // load before any pass (kernel/src/step.cu `run_verify_round`).
-      set_error("ignis_verify_graph: the MTP head proposes no drafts in this leaf yet");
-      return -1;
+    case IgnisDrafter::kMtp: {
+      std::string head_error;
+      if (ignis::mtp::propose(*model, *pool, width, &head_error) != 0) {
+        set_error("ignis_verify_graph: width " + std::to_string(width) + ": " + head_error);
+        return -1;
+      }
+      break;
+    }
     case IgnisDrafter::kHost:
     case IgnisDrafter::kNone:
       break;
@@ -495,9 +499,9 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   }
   // P5-04 (GitHub #153): the verify graphs, one per exact width at the
   // load's window, under the same never-refuse-service rule -- a width whose
-  // verify capture failed runs the verify traversal eagerly.
-  // GitHub #620: an MTP load runs no verify round yet, so none is captured.
-  if (model->verify != nullptr && model->drafter != IgnisDrafter::kMtp) {
+  // verify capture failed runs the verify traversal eagerly. On an MTP load
+  // the head's chain is in them (GitHub #621).
+  if (model->verify != nullptr) {
     for (uint32_t width = 1; width <= model->decode_lanes; ++width) {
       cudaGraphExec_t exec = nullptr;
       if (capture_verify_graph_width(model, pool, width, &exec,

@@ -459,6 +459,15 @@ target_compile_definitions(ignis_kernel_kv_append_format_test PRIVATE
 target_link_libraries(ignis_kernel_kv_append_format_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_kv_append_format_test COMMAND ignis_kernel_kv_append_format_test)
 
+# GitHub #621 (spec #618): OURS -- the 27B MTP head's verify round, its small device steps
+# (kernel/src/mtp_head.h `detail`: the chain's rows and mask per lane, its drafts, the commit's
+# input hiddens) and the rows a round touches (`round_rows`), against a host restatement. GPU,
+# no SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_mtp_round_test test_mtp_round.cu)
+target_include_directories(ignis_kernel_mtp_round_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_mtp_round_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_mtp_round_test COMMAND ignis_kernel_mtp_round_test)
+
 # P4-06 (GitHub #124): OURS, not vendored -- sequence state transfer. It
 # checks the leaf-internal state-section table against the blob a snapshot
 # actually writes, round-trips a dirtied sequence through release and

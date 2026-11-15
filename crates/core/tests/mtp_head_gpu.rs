@@ -357,8 +357,8 @@ fn an_mtp_load_binds_the_head_and_plans_its_lines_as_the_cpu_does_to_the_byte() 
     }
     let proposal = mtp_readout::propose(&model, &pool, &mut sequence).unwrap_or_else(|e| panic!("hq readout: {e}"));
     assert!((0..VOCAB as i32).contains(&proposal.draft), "{}", proposal.draft);
-    // The verify round needs the head's chain, which the next ticket builds:
-    // the pool and every move of its sequences refuse by name meanwhile.
+    // Until the head's sections are listed (#622) the pool refuses every
+    // move of its sequences by name.
     let err = sequence.snapshot().map(|_| ()).expect_err("an MTP pool refuses a snapshot").to_string();
     assert!(err.contains("MTP head"), "{err}");
 

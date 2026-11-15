@@ -8,7 +8,9 @@
 #include "ignis_hq_prompt_attention.h"
 #include "ignis_seq_internal.h"
 #include "model_internal.h"
+#include "trellis_body.h"
 
+#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gqa_attention.h"
 #include "ninfer/ops/linear.h"
@@ -116,17 +118,64 @@ __global__ void gather_columns_kernel(const std::uint16_t *table, std::int32_t r
   }
 }
 
-// The head's forward over `columns` rows: `hidden` the target's post-norm
-// hiddens, `embedded` the next tokens' embeddings (both BF16 [hidden,
-// columns]), `rotation` the positions the rows rotate at (I32 [columns]);
-// `attend(rq, rk, v, gate, out)` appends the rows' keys and values and
-// attends, over flat [256, heads, columns] views. Leaves the head's hidden in
-// `out` (BF16 [hidden, columns]). Every buffer is `call_bytes`'s, in its
-// order; the attention bumps its own workspace after them.
+// GitHub #621: chain step `step`'s row and mask per lane (mtp_head.h
+// `detail::chain_rows`).
+__global__ void chain_rows_kernel(const std::int32_t *base, const std::int32_t *extents, std::int32_t step,
+                                  std::int32_t *positions, std::int32_t *valid, std::int32_t count) {
+  const std::int32_t b = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (b < count) {
+    const bool needed = step < extents[b];
+    positions[b] = needed ? base[b] - 1 + step : 0;
+    valid[b] = needed ? 1 : 0;
+  }
+}
+
+// drafts[b * window + step] = tokens[b].
+__global__ void write_drafts_kernel(const std::int32_t *tokens, std::int32_t *drafts, std::int32_t window,
+                                    std::int32_t step, std::int32_t count) {
+  const std::int32_t b = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (b < count) {
+    drafts[static_cast<std::size_t>(b) * static_cast<std::size_t>(window) + static_cast<std::size_t>(step)] = tokens[b];
+  }
+}
+
+// The commit's input hiddens (mtp_head.h `detail::commit_hiddens`): column
+// (b, 0) from the continuation table by slot, column (b, j > 0) the round's
+// normalized column (b, j - 1).
+__global__ void commit_hiddens_kernel(const std::uint16_t *normalized, const std::uint16_t *table,
+                                      const std::int32_t *slots, std::uint16_t *out, std::int32_t rows,
+                                      std::int32_t lane_columns) {
+  const std::int32_t column = static_cast<std::int32_t>(blockIdx.y);
+  const std::int32_t lane = column / lane_columns;
+  const std::int32_t j = column % lane_columns;
+  const std::uint16_t *from =
+      j == 0 ? table + static_cast<std::size_t>(slots[lane]) * static_cast<std::size_t>(rows)
+             : normalized + static_cast<std::size_t>(column - 1) * static_cast<std::size_t>(rows);
+  std::uint16_t *to = out + static_cast<std::size_t>(column) * static_cast<std::size_t>(rows);
+  for (std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x); i < rows;
+       i += static_cast<std::int32_t>(gridDim.x * blockDim.x)) {
+    to[i] = from[i];
+  }
+}
+
+// The head's stem and attention over `columns` rows: `hidden` the target's
+// post-norm hiddens (or, in a chain, the head's own), `embedded` the next
+// tokens' embeddings (both BF16 [hidden, columns]), `rotation` the positions
+// the rows rotate at (I32 [columns]); `attend(rq, rk, v, gate, out)` appends
+// the rows' keys and values and attends, over flat [256, heads, columns]
+// views. Returns the stem's residual and the attention's output. Every buffer
+// is `call_bytes`'s first two groups, in its order; the attention bumps its
+// own workspace after them. A row's key and value are this half's alone, so
+// a caller that keeps only the rows (`commit_rows`) stops here.
+struct AttendedRows {
+  ninfer::Tensor x;
+  ninfer::Tensor attention;
+};
+
 template <class Attend>
-void forward(ignis_model &model, const ninfer::Tensor &hidden, const ninfer::Tensor &embedded,
-             const ninfer::Tensor &rotation, std::int32_t columns, ninfer::DeviceArena &arena, ninfer::Tensor &out,
-             Attend &&attend) {
+AttendedRows attend_rows(ignis_model &model, const ninfer::Tensor &hidden, const ninfer::Tensor &embedded,
+                         const ninfer::Tensor &rotation, std::int32_t columns, ninfer::DeviceArena &arena,
+                         Attend &&attend) {
   const MtpHeadWeights &w = model.mtp;
   const auto h = static_cast<std::int32_t>(model.hidden);
   const float eps = model.rms_norm_eps;
@@ -168,6 +217,25 @@ void forward(ignis_model &model, const ninfer::Tensor &hidden, const ninfer::Ten
   ninfer::Tensor attention_heads = attention.view({kHeadDim, kQueryHeads, columns, 1});
   attend(rotated_query_heads, rotated_key_heads, value.view({kHeadDim, kKvHeads, columns, 1}),
          gate.view({kHeadDim, kQueryHeads, columns, 1}), attention_heads);
+  return AttendedRows{x, attention};
+}
+
+// The head's forward over `columns` rows (`attend_rows`, then the output
+// projection's residual add, the MLP's and the final norm): leaves the head's
+// hidden in `out` (BF16 [hidden, columns]). Every buffer is `call_bytes`'s,
+// in its order.
+template <class Attend>
+void forward(ignis_model &model, const ninfer::Tensor &hidden, const ninfer::Tensor &embedded,
+             const ninfer::Tensor &rotation, std::int32_t columns, ninfer::DeviceArena &arena, ninfer::Tensor &out,
+             Attend &&attend) {
+  const MtpHeadWeights &w = model.mtp;
+  const auto h = static_cast<std::int32_t>(model.hidden);
+  const float eps = model.rms_norm_eps;
+  const cudaStream_t stream = model.stream;
+  const auto alloc = [&](std::int32_t rows) { return arena.alloc(ninfer::DType::BF16, {rows, columns, 1, 1}); };
+  AttendedRows rows = attend_rows(model, hidden, embedded, rotation, columns, arena, attend);
+  ninfer::Tensor &x = rows.x;
+  const ninfer::Tensor &attention = rows.attention;
 
   // The output projection's residual add, then the MLP's.
   ninfer::Tensor projected_out = alloc(h);
@@ -237,7 +305,96 @@ void sequence_rows(ignis_model &model, ignis_seq_pool &pool, ignis_seq &seq, con
   forward(model, hidden, embedded, rotation, columns, arena, out, attend);
 }
 
+// The append-and-attend of a round's rows, `lane_columns` a lane over the
+// round's `batch` lanes, as a target GQA layer's batch body is
+// (kernel/src/gqa_layer.cu `run_gqa_layer_batch`): the pool-wide tables, each
+// lane's slot from `model.decode_graph_slots`, positions I32 [lane_columns,
+// batch]; `valid_columns` I32 [batch] the masked form's each lane's valid
+// prefix, or an empty tensor (every column). Graph-safe: every choice is the
+// load's and the call's shape.
+struct BatchAttend {
+  ignis_model &model;
+  ignis_seq_pool &pool;
+  ninfer::DeviceArena &arena;
+  std::int32_t lane_columns;
+  std::int32_t batch;
+  const void *positions;
+  ninfer::Tensor valid_columns;
+
+  void operator()(const ninfer::Tensor &q, const ninfer::Tensor &k, const ninfer::Tensor &v, const ninfer::Tensor &g,
+                  ninfer::Tensor &o) const {
+    const cudaStream_t stream = model.stream;
+    const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+    const ninfer::Tensor slots(model.decode_graph_slots->p, ninfer::DType::I32, {batch, 1, 1, 1});
+    const ninfer::Tensor positions_rows(const_cast<void *>(positions), ninfer::DType::I32,
+                                        {lane_columns, batch, 1, 1});
+    const ninfer::PagedKVBatchLayerView cache = ignis_mtp_head_batch_view(&pool);
+    const ninfer::ops::GqaExecutionEnvelope envelope{
+        .min_visible_keys = 1,
+        .max_visible_keys = model.max_context_tokens,
+    };
+    const std::size_t workspace_bytes = ninfer::ops::gqa_attention_workspace_capacity_bytes(
+        kQueryHeads, cache.dtype, envelope, batch, lane_columns, lane_columns);
+    const ninfer::DeviceSpan storage = arena.alloc_bytes(std::max<std::size_t>(workspace_bytes, 1));
+    if (ignis_gqa_workspace_needs_zeroing(cache.dtype)) {
+      check(cudaMemsetAsync(storage.data, 0, storage.bytes, stream), "cudaMemsetAsync(attention workspace)");
+    }
+    ninfer::DeviceArena workspace(storage);
+    const ninfer::Tensor q_rows = q.view({kHeadDim, kQueryHeads, lane_columns, batch});
+    const ninfer::Tensor k_rows = k.view({kHeadDim, kKvHeads, lane_columns, batch});
+    const ninfer::Tensor v_rows = v.view({kHeadDim, kKvHeads, lane_columns, batch});
+    const ninfer::Tensor g_rows = g.view({kHeadDim, kQueryHeads, lane_columns, batch});
+    ninfer::Tensor o_rows = o.view({kHeadDim, kQueryHeads, lane_columns, batch});
+    if (model.hq_decode_attention_ours &&
+        ignis::hq_decode_attention::serves(kQueryHeads, lane_columns, batch, cache.dtype, envelope)) {
+      ignis::hq_decode_attention::attend(q_rows, k_rows, v_rows, positions_rows, valid_columns, slots, g_rows, scale,
+                                         cache, envelope, workspace, o_rows, stream);
+    } else {
+      ninfer::ops::gqa_attention(q_rows, k_rows, v_rows, positions_rows, valid_columns, slots, g_rows, scale, cache,
+                                 envelope, workspace, o_rows, stream);
+    }
+  }
+};
+
+std::int32_t continuation_slots(const ignis_seq_pool &pool) {
+  return static_cast<std::int32_t>(pool.mtp_continuation->bytes / pool.mtp_continuation_slot_bytes());
+}
+
+void launch_gather_columns(const ignis_seq_pool &pool, const ninfer::Tensor &slots, ninfer::Tensor &out,
+                           std::int32_t hidden, std::int32_t batch, cudaStream_t stream) {
+  gather_columns_kernel<<<dim3(static_cast<unsigned>((hidden + 255) / 256), static_cast<unsigned>(batch)), 256, 0,
+                          stream>>>(static_cast<const std::uint16_t *>(pool.mtp_continuation->p), hidden,
+                                    static_cast<const std::int32_t *>(slots.data),
+                                    static_cast<std::uint16_t *>(out.data), batch);
+  check(cudaGetLastError(), "the continuation hidden's gather");
+}
+
 }  // namespace
+
+namespace detail {
+
+void chain_rows(const std::int32_t *base_positions, const std::int32_t *extents, std::int32_t step,
+                std::int32_t *positions, std::int32_t *valid, std::int32_t batch, cudaStream_t stream) {
+  chain_rows_kernel<<<1, 32, 0, stream>>>(base_positions, extents, step, positions, valid, batch);
+  check(cudaGetLastError(), "the chain's rows");
+}
+
+void write_drafts(const std::int32_t *tokens, std::int32_t *drafts, std::int32_t window, std::int32_t step,
+                  std::int32_t batch, cudaStream_t stream) {
+  write_drafts_kernel<<<1, 32, 0, stream>>>(tokens, drafts, window, step, batch);
+  check(cudaGetLastError(), "the chain's drafts");
+}
+
+void commit_hiddens(const std::uint16_t *normalized, const std::uint16_t *table, const std::int32_t *slots,
+                    std::uint16_t *out, std::int32_t hidden, std::int32_t lane_columns, std::int32_t batch,
+                    cudaStream_t stream) {
+  commit_hiddens_kernel<<<dim3(static_cast<unsigned>((hidden + 255) / 256),
+                               static_cast<unsigned>(lane_columns * batch)),
+                          256, 0, stream>>>(normalized, table, slots, out, hidden, lane_columns);
+  check(cudaGetLastError(), "the commit's hiddens");
+}
+
+}  // namespace detail
 
 std::size_t call_bytes(std::int64_t hidden, std::int64_t rows) {
   std::size_t bytes = 0;
@@ -348,17 +505,11 @@ int32_t decode_round(ignis_model &model, ignis_seq_pool &pool, std::uint32_t wid
     ninfer::DeviceArena &arena = *model.decode_graph_scratch;
     const ninfer::Tensor slots(model.decode_graph_slots->p, ninfer::DType::I32, {batch, 1, 1, 1});
     const ninfer::Tensor ids(model.decode_graph_token_ids->p, ninfer::DType::I32, {batch, 1, 1, 1});
-    const auto state_slots =
-        static_cast<std::int32_t>(pool.mtp_continuation->bytes / pool.mtp_continuation_slot_bytes());
 
     // Each lane's row is the head's at its position less one: from its
     // continuation hidden and the token this round consumes.
     ninfer::Tensor hidden_in = arena.alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
-    gather_columns_kernel<<<dim3(static_cast<unsigned>((hidden + 255) / 256), static_cast<unsigned>(batch)), 256, 0,
-                            stream>>>(static_cast<const std::uint16_t *>(pool.mtp_continuation->p), hidden,
-                                      static_cast<const std::int32_t *>(slots.data),
-                                      static_cast<std::uint16_t *>(hidden_in.data), batch);
-    check(cudaGetLastError(), "the continuation hidden's gather");
+    launch_gather_columns(pool, slots, hidden_in, hidden, batch, stream);
     ninfer::Tensor embedded = arena.alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
     ninfer::ops::embedding(ids, model.token_embedding, embedded, stream);
     ninfer::Tensor positions = arena.alloc(ninfer::DType::I32, {batch, 1, 1, 1});
@@ -367,44 +518,14 @@ int32_t decode_round(ignis_model &model, ignis_seq_pool &pool, std::uint32_t wid
     check(cudaGetLastError(), "the head's positions");
     ninfer::Tensor out = arena.alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
 
-    const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-    const ninfer::Tensor positions_rows(positions.data, ninfer::DType::I32, {1, batch, 1, 1});
-    const auto attend = [&](const ninfer::Tensor &q, const ninfer::Tensor &k, const ninfer::Tensor &v,
-                            const ninfer::Tensor &g, ninfer::Tensor &o) {
-      // A1's batched shape, one row per lane (kernel/src/gqa_layer.cu
-      // `run_gqa_layer_batch`): the pool-wide tables, each lane's slot.
-      const ninfer::PagedKVBatchLayerView cache = ignis_mtp_head_batch_view(&pool);
-      const ninfer::ops::GqaExecutionEnvelope envelope{
-          .min_visible_keys = 1,
-          .max_visible_keys = model.max_context_tokens,
-      };
-      const std::size_t workspace_bytes =
-          ninfer::ops::gqa_attention_workspace_capacity_bytes(kQueryHeads, cache.dtype, envelope, batch, 1, 1);
-      const ninfer::DeviceSpan storage = arena.alloc_bytes(std::max<std::size_t>(workspace_bytes, 1));
-      if (ignis_gqa_workspace_needs_zeroing(cache.dtype)) {
-        check(cudaMemsetAsync(storage.data, 0, storage.bytes, stream), "cudaMemsetAsync(attention workspace)");
-      }
-      ninfer::DeviceArena workspace(storage);
-      const ninfer::Tensor q_rows = q.view({kHeadDim, kQueryHeads, 1, batch});
-      const ninfer::Tensor k_rows = k.view({kHeadDim, kKvHeads, 1, batch});
-      const ninfer::Tensor v_rows = v.view({kHeadDim, kKvHeads, 1, batch});
-      const ninfer::Tensor g_rows = g.view({kHeadDim, kQueryHeads, 1, batch});
-      ninfer::Tensor o_rows = o.view({kHeadDim, kQueryHeads, 1, batch});
-      if (model.hq_decode_attention_ours &&
-          ignis::hq_decode_attention::serves(kQueryHeads, 1, batch, cache.dtype, envelope)) {
-        ignis::hq_decode_attention::attend(q_rows, k_rows, v_rows, positions_rows, ninfer::Tensor{}, slots, g_rows,
-                                           scale, cache, envelope, workspace, o_rows, stream);
-      } else {
-        ninfer::ops::gqa_attention(q_rows, k_rows, v_rows, positions_rows, ninfer::Tensor{}, slots, g_rows, scale,
-                                   cache, envelope, workspace, o_rows, stream);
-      }
-    };
-    // A text load's rows rotate at their positions (an MTP load has no vision).
-    forward(model, hidden_in, embedded, positions, batch, arena, out, attend);
+    // A1's batched shape, one row per lane, every lane's row valid. A text
+    // load's rows rotate at their positions (an MTP load has no vision).
+    forward(model, hidden_in, embedded, positions, batch, arena, out,
+            BatchAttend{model, pool, arena, 1, batch, positions.data, ninfer::Tensor{}});
 
     // Each lane's continuation hidden is now its hidden at the position it
     // consumed.
-    ninfer::Tensor table(pool.mtp_continuation->p, ninfer::DType::BF16, {hidden, state_slots, 1, 1});
+    ninfer::Tensor table(pool.mtp_continuation->p, ninfer::DType::BF16, {hidden, continuation_slots(pool), 1, 1});
     ninfer::ops::scatter(normalized, slots, table, stream);
     return 0;
   } catch (const std::exception &e) {
@@ -432,6 +553,136 @@ int32_t frontier_row(ignis_model &model, ignis_seq_pool &pool, ignis_seq &seq, s
     return 0;
   } catch (const std::exception &e) {
     *error = std::string("the MTP head: ") + e.what();
+    return -1;
+  }
+}
+
+RoundRows round_rows(std::uint64_t base, std::uint32_t extent, std::uint32_t committed) {
+  // The chain's steps 0 .. e - 1 write rows P - 1 .. P + e - 2; the
+  // commit's c rows start at P - 1 too.
+  RoundRows rows;
+  rows.first = base - 1;
+  rows.chain_end = base - 1 + extent;
+  rows.committed_end = base - 1 + committed;
+  return rows;
+}
+
+int32_t propose(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, std::string *error) {
+  try {
+    IgnisVerifyRound &verify = *model.verify;
+    const auto window = static_cast<std::int32_t>(verify.window);
+    const auto hidden = static_cast<std::int32_t>(model.hidden);
+    const auto vocab = static_cast<std::int32_t>(model.vocab);
+    const auto batch = static_cast<std::int32_t>(width);
+    const cudaStream_t stream = model.stream;
+    ninfer::DeviceArena &arena = *model.decode_graph_scratch;
+    // Its own scope: released before the pass's buffers are bumped.
+    ninfer::DeviceArena::Scope scope = arena.scope();
+    const ninfer::Tensor slots(model.decode_graph_slots->p, ninfer::DType::I32, {batch, 1, 1, 1});
+    const ninfer::Tensor anchors(verify.anchors->p, ninfer::DType::I32, {batch, 1, 1, 1});
+    const auto *base_positions = static_cast<const std::int32_t *>(verify.base_positions->p);
+    const auto *extents = static_cast<const std::int32_t *>(verify.extents->p);
+    auto *drafts = static_cast<std::int32_t *>(verify.drafts->p);
+
+    // A step's input hidden and its output, swapped after each step: the
+    // first step's is the continuation hidden.
+    ninfer::Tensor step_in = arena.alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
+    ninfer::Tensor step_out = arena.alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
+    launch_gather_columns(pool, slots, step_in, hidden, batch, stream);
+    ninfer::Tensor chosen = arena.alloc(ninfer::DType::I32, {batch, 1, 1, 1});
+    ninfer::Tensor positions = arena.alloc(ninfer::DType::I32, {batch, 1, 1, 1});
+    ninfer::Tensor valid = arena.alloc(ninfer::DType::I32, {batch, 1, 1, 1});
+    // The step's scores: the round's own logits, which the pass after the
+    // chain writes whole.
+    ninfer::Tensor logits(verify.logits->p, ninfer::DType::BF16, {vocab, batch, 1, 1});
+    for (std::int32_t step = 0; step < window; ++step) {
+      ninfer::DeviceArena::Scope step_scope = arena.scope();
+      detail::chain_rows(base_positions, extents, step, static_cast<std::int32_t *>(positions.data),
+                         static_cast<std::int32_t *>(valid.data), batch, stream);
+      ninfer::Tensor embedded = arena.alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
+      ninfer::ops::embedding(step == 0 ? anchors : chosen, model.token_embedding, embedded, stream);
+      // A text load's rows rotate at their positions (an MTP load has no
+      // vision: GitHub #624).
+      forward(model, step_in, embedded, positions, batch, arena, step_out,
+              BatchAttend{model, pool, arena, 1, batch, positions.data, valid});
+      ignis::trellis_body::output_head(model, step_out, logits, stream);
+      ninfer::ops::argmax(logits, chosen, vocab, stream);
+      detail::write_drafts(static_cast<const std::int32_t *>(chosen.data), drafts, window, step, batch, stream);
+      std::swap(step_in, step_out);
+    }
+    return 0;
+  } catch (const std::exception &e) {
+    *error = std::string("the MTP head's chain: ") + e.what();
+    return -1;
+  }
+}
+
+int32_t commit_rows(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, const std::int32_t *positions,
+                    const std::int32_t *committed, std::string *error) {
+  try {
+    IgnisVerifyRound &verify = *model.verify;
+    const auto lane_columns = static_cast<std::int32_t>(verify.window + 1);
+    const auto hidden = static_cast<std::int32_t>(model.hidden);
+    const auto batch = static_cast<std::int32_t>(width);
+    const std::int32_t columns = lane_columns * batch;
+    const cudaStream_t stream = model.stream;
+    ninfer::DeviceArena &arena = *model.decode_graph_scratch;
+    ninfer::DeviceArena::Scope scope = arena.scope();
+
+    // The target's post-final-norm hidden of every column of the round: the
+    // pass's own normalization, again, of the residual it kept.
+    const ninfer::Tensor residual(verify.hidden->p, ninfer::DType::BF16, {hidden, columns, 1, 1});
+    ninfer::Tensor normalized = arena.alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
+    ninfer::ops::rmsnorm(residual, gain(model.final_norm, hidden), model.rms_norm_eps, /*unit_offset=*/true,
+                         normalized, stream);
+    // Row P - 1 + j is built from the hidden at P - 1 + j -- the continuation
+    // hidden at j = 0, the round's column j - 1 after it -- and the token at
+    // P + j, the round's own column j: the run's tokens.
+    ninfer::Tensor hidden_in = arena.alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
+    detail::commit_hiddens(static_cast<const std::uint16_t *>(normalized.data),
+                           static_cast<const std::uint16_t *>(pool.mtp_continuation->p),
+                           static_cast<const std::int32_t *>(model.decode_graph_slots->p),
+                           static_cast<std::uint16_t *>(hidden_in.data), hidden, lane_columns, batch, stream);
+    const ninfer::Tensor ids(verify.verify_ids->p, ninfer::DType::I32, {columns, 1, 1, 1});
+    ninfer::Tensor embedded = arena.alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
+    ninfer::ops::embedding(ids, model.token_embedding, embedded, stream);
+    ninfer::Tensor rows = arena.alloc(ninfer::DType::I32, {columns, 1, 1, 1});
+    ninfer::Tensor valid = arena.alloc(ninfer::DType::I32, {batch, 1, 1, 1});
+    check(cudaMemcpyAsync(rows.data, positions, static_cast<std::size_t>(columns) * sizeof(std::int32_t),
+                          cudaMemcpyHostToDevice, stream),
+          "cudaMemcpyAsync(the commit's rows)");
+    check(cudaMemcpyAsync(valid.data, committed, static_cast<std::size_t>(batch) * sizeof(std::int32_t),
+                          cudaMemcpyHostToDevice, stream),
+          "cudaMemcpyAsync(the commit's counts)");
+    // Each lane's committed prefix of its columns, appended and attended in
+    // the masked form; the rows are what stays, the attention is no draft's.
+    (void)attend_rows(model, hidden_in, embedded, rows, columns, arena,
+                      BatchAttend{model, pool, arena, lane_columns, batch, rows.data, valid});
+    return 0;
+  } catch (const std::exception &e) {
+    *error = std::string("the MTP head's commit: ") + e.what();
+    return -1;
+  }
+}
+
+int32_t commit_continuation(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, std::string *error) {
+  try {
+    const auto hidden = static_cast<std::int32_t>(model.hidden);
+    const auto batch = static_cast<std::int32_t>(width);
+    ninfer::DeviceArena &arena = *model.decode_graph_scratch;
+    ninfer::DeviceArena::Scope scope = arena.scope();
+    const ninfer::Tensor selected(model.verify->selected_hidden->p, ninfer::DType::BF16, {hidden, batch, 1, 1});
+    ninfer::Tensor normalized = arena.alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
+    // One CTA a column at this width, the pass's own normalization: the bits
+    // of the column whose scores drew the lane's pending token.
+    ninfer::ops::rmsnorm(selected, gain(model.final_norm, hidden), model.rms_norm_eps, /*unit_offset=*/true,
+                         normalized, model.stream);
+    const ninfer::Tensor slots(model.decode_graph_slots->p, ninfer::DType::I32, {batch, 1, 1, 1});
+    ninfer::Tensor table(pool.mtp_continuation->p, ninfer::DType::BF16, {hidden, continuation_slots(pool), 1, 1});
+    ninfer::ops::scatter(normalized, slots, table, model.stream);
+    return 0;
+  } catch (const std::exception &e) {
+    *error = std::string("the MTP head's continuation: ") + e.what();
     return -1;
   }
 }

@@ -243,8 +243,9 @@ enum ignis_speculative_backend {
    * layer and carries a continuation hidden per slot
    * (ignis_seq_pool_spec::speculative_backend). Text only, under the fixed
    * draft: a 27B load refuses it with vision or the sampled draft. Its
-   * prefills and plain rounds keep the head's state; its verify round is
-   * refused until the head's chain proposes in it. */
+   * prefills, plain rounds and verify rounds keep the head's state, and in a
+   * verify round the head's chain proposes every lane's drafts (GitHub
+   * #621). */
   IGNIS_SPECULATIVE_MTP = 3,
 };
 

@@ -201,6 +201,34 @@ extern "C" int32_t ignis_mtp_readout_state(const struct ignis_seq_pool *pool, co
   return 0;
 }
 
+static_assert(IGNIS_MTP_READOUT_RING_WORDS == kIgnisHqRingWords, "the readout's ring words are the pool's");
+
+extern "C" int32_t ignis_mtp_readout_ring(const struct ignis_seq_pool *pool, const struct ignis_seq *seq,
+                                          uint32_t *out_target_words, uint32_t *out_head_words) {
+  if (pool == nullptr || seq == nullptr || out_target_words == nullptr || out_head_words == nullptr) {
+    set_error("ignis_mtp_readout_ring: null argument");
+    return -1;
+  }
+  if (!pool->has_mtp_head()) {
+    set_error("ignis_mtp_readout_ring: the sequence pool was not built for the MTP head");
+    return -1;
+  }
+  if (!pool->has_hq_residual()) {
+    set_error("ignis_mtp_readout_ring: the sequence pool holds no hq-e8-2b residual window");
+    return -1;
+  }
+  const std::size_t bytes = static_cast<std::size_t>(kIgnisHqRingWords) * sizeof(std::uint32_t);
+  cudaError_t err = cudaMemcpy(out_target_words, pool->hq_ring_words(seq->slot), bytes, cudaMemcpyDeviceToHost);
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(out_head_words, pool->hq_head_ring_words(seq->slot), bytes, cudaMemcpyDeviceToHost);
+  }
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_mtp_readout_ring: cudaMemcpy failed: ") + cudaGetErrorString(err));
+    return -1;
+  }
+  return 0;
+}
+
 extern "C" const char *ignis_mtp_readout_last_error(void) {
   return g_last_error.c_str();
 }

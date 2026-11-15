@@ -71,6 +71,16 @@ int32_t ignis_mtp_readout_scores(struct ignis_model *model, const uint16_t *hidd
 int32_t ignis_mtp_readout_state(const struct ignis_seq_pool *pool, const struct ignis_seq *seq,
                                 int32_t first_position, int32_t count, uint16_t *out_keys, uint16_t *out_values);
 
+/* GitHub #621: under hq-e8-2b, the validity words of `seq`'s residual
+ * window rings, `IGNIS_MTP_READOUT_RING_WORDS` host U32 each: the target's
+ * (every target attention layer's, `out_target_words`) and the MTP head's own
+ * (`out_head_words`), bit `r % 32` of word `r / 32` ring slot `r`. What a
+ * snapshot would carry once the head's words are a section (#622); until
+ * then, the only read of them. Refused without the head or under BF16 KV. */
+#define IGNIS_MTP_READOUT_RING_WORDS 16
+int32_t ignis_mtp_readout_ring(const struct ignis_seq_pool *pool, const struct ignis_seq *seq,
+                               uint32_t *out_target_words, uint32_t *out_head_words);
+
 /* The message from the most recent failing call on this thread; never NULL. */
 const char *ignis_mtp_readout_last_error(void);
 
