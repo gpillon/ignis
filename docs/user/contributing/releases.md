@@ -49,9 +49,10 @@ packages a server that is not a CUDA build: `mk/cuda-build-check.sh` reads the
 binaries and refuses a server that would fall back to the CPU mock, which
 v0.9.0 and v0.9.1 shipped (#408), or any binary that carries no machine code
 for 8.6, or none for 12.0, which the workflow requires apart from the list the
-build is given (#482). It also reads the 8.6 code of the kernels the RTX 30 and
-RTX 40 prefill added and refuses one that uses a tensor-core form those cards run
-at half rate (HMMA with an f32 accumulator, BF16, TF32, FP8), naming the kernel
+build is given (#482). It also reads the 8.6 code of the kernels added for the
+RTX 30 and RTX 40 prefill and for the 27B's MTP head on those cards, and refuses
+one that uses a tensor-core form those cards run at half rate (HMMA with an f32
+accumulator, BF16, TF32, FP8), naming the kernel
 and the opcode (`mk/full-rate-kernels.txt`, #512); `cuobjdump`, which comes with
 nvcc, must be on the build host. The Containerfile's build stage installs the
 CUDA toolkit's `cuobjdump` package if its devel image lacks it, and points the
@@ -119,7 +120,7 @@ and 92.92%, from the 5090's 0.03825 and 93.42%); naming
 that route on the card, and it is no longer the gate.
 
 **The leaf's tests.** Built for `86;120a`, `ctest -LE sm120a-only` passes every
-test. `ignis_kernel_gdn_gating_proj_tests` prints `budget` lines and names with
+test, the MTP head's route among them (`ignis_kernel_w8_imma_test`). `ignis_kernel_gdn_gating_proj_tests` prints `budget` lines and names with
 `FALLBACK`, and the SM count or cap of the pass, each case whose route's
 cooperative schedule the card cannot hold resident, which runs a smaller split
 or the composed route in its place (#478, #602): fallbacks there are expected,
@@ -143,7 +144,13 @@ smoke runs the route the card's users run. Ask for:
   routes serve up to 16 tokens, the merger's up to 4 or 5, and `mma_r64_c128`
   above), so no image reaches a kernel only an sm_120a build holds;
 - a large image, at the processor's item bound: 16,384 tokens, 4096 x 4096
-  pixels at 32 x 32 a merged token, under the profile's `vision.max_tokens`.
+  pixels at 32 x 32 a merged token, under the profile's `vision.max_tokens`;
+- the greedy chat completion again on an MTP load: a second start with
+  `--spec-backend mtp`, the 27B's own head, whose matrices run on the route
+  these cards run (its `ignis.runtime.decode_routes` line says
+  `mtp_head_linear=ours`), with `--qwen38-vision-enabled false`, since the
+  head does not draft beside images yet. The profile's DFlash2 window is
+  DFlash2's, so the head drafts at its own default of 7.
 
 ```sh
 ignis-server --profile auto      # its ignis.config.source line names rtx-24gb
@@ -166,9 +173,16 @@ for image in small large; do
     "$(base64 -w0 "$image.png")" > "$image.json"
   curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d "@$image.json"
 done
+# The MTP load, once the first server has stopped: the same greedy request.
+ignis-server --profile auto --spec-backend mtp --qwen38-vision-enabled false   # decode_routes: mtp_head_linear=ours
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d \
+  '{"model":"qwen3.8-27b","temperature":0,"enable_thinking":false,"max_tokens":64,"messages":[{"role":"user","content":"What is the capital of France? One word."}]}'
 ```
 
-Each must be answered correctly: `Paris`, red, blue.
+Each must be answered correctly: `Paris`, red, blue, and `Paris` on the MTP
+load. The release that ships the 27B's MTP head (0.11.0) is the first whose
+gate starts one: no RTX 30 or RTX 40 card was at hand when the head's route for
+them was written (#627), so that start is the route's first run on such a card.
 
 The release binary must also carry machine code for 8.6 and 12.0: the release
 check above does that in CI, whatever list the build was given.

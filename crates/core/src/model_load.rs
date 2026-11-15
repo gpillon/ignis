@@ -232,6 +232,8 @@ pub(crate) mod ffi {
 
         pub fn ignis_model_hq_decode_attention(model: *const IgnisModel) -> u32;
 
+        pub fn ignis_model_mtp_head_linear(model: *const IgnisModel) -> u32;
+
         pub fn ignis_model_vision_item_max_tokens(model: *const IgnisModel) -> u32;
 
         pub fn ignis_model_free(model: *mut IgnisModel);
@@ -271,6 +273,16 @@ impl Model {
         let code = unsafe { ffi::ignis_model_hq_decode_attention(self.handle) };
         crate::HqDecodeAttention::from_abi(code)
             .unwrap_or_else(|| panic!("ignis_model_hq_decode_attention: unknown route {code}"))
+    }
+
+    /// The route this load's MTP head runs its matrices on (GitHub #627), as
+    /// the leaf decided it at load: ours on an RTX 30 or RTX 40 card, the
+    /// vendored `ops::linear` on Blackwell unless `IGNIS_MTP_HEAD_LINEAR=ours`;
+    /// `None` on a load without the head.
+    pub fn mtp_head_linear(&self) -> Option<crate::mtp_head::HeadLinear> {
+        let code = unsafe { ffi::ignis_model_mtp_head_linear(self.handle) };
+        crate::mtp_head::HeadLinear::from_abi(code)
+            .unwrap_or_else(|| panic!("ignis_model_mtp_head_linear: unknown route {code}"))
     }
 
     /// The most merged tokens one media item may hold on this load (GitHub

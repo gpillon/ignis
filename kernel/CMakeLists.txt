@@ -111,10 +111,11 @@ set(IGNIS_VENDOR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor)
 # MLP gate_up, MMA and TMA (P1-13, #49). With them, three whose kernels
 # declare more than 48 KiB of static shared memory per block, which ptxas
 # refuses for sm_8x and accepts for 120a: the W8 linear's small-T and
-# split-K routes (P1-10, #46; on the 27B only its MTP layer, which no load
-# binds, takes the small-T route, and only a [2048, 16384] problem no served
-# artifact holds takes split-K) and the i8 decode attention (P1-15, #51; no
-# KV format a load can name):
+# split-K routes (P1-10, #46; on the 27B only its MTP head takes the small-T
+# route, and on any other card the head's matrices run on ours,
+# kernel/src/w8_imma.h, #627; only a [2048, 16384] problem no served artifact
+# holds takes split-K) and the i8 decode attention (P1-15, #51; no KV format a
+# load can name):
 add_library(ignis_vendor_sm120a OBJECT
   ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_w4a4.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cu

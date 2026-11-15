@@ -468,6 +468,18 @@ target_include_directories(ignis_kernel_mtp_round_test PRIVATE ${CMAKE_CURRENT_S
 target_link_libraries(ignis_kernel_mtp_round_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_mtp_round_test COMMAND ignis_kernel_mtp_round_test)
 
+# GitHub #627 (spec #618): OURS -- the 27B MTP head's W8G32 matrices on an RTX 30 or RTX 40 card
+# (kernel/src/w8_imma.h, leaf-internal): the route a load takes and the measurement switch, what
+# the route refuses, the activation's split bit for bit against its host restatement, and each of
+# the head's five geometries at every width a call has, on the vendored SIMT route and on the
+# integer MMA, against the W8 product in f64 within the bound the test file derives, and a column
+# of the integer MMA the same bits at every width. Not sm120a-only: it runs on 8.6. GPU; no
+# SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_w8_imma_test test_w8_imma.cu)
+target_include_directories(ignis_kernel_w8_imma_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_w8_imma_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_w8_imma_test COMMAND ignis_kernel_w8_imma_test)
+
 # P4-06 (GitHub #124): OURS, not vendored -- sequence state transfer. It
 # checks the leaf-internal state-section table against the blob a snapshot
 # actually writes, round-trips a dirtied sequence through release and

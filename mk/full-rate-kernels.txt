@@ -47,6 +47,18 @@ cuda     gdn_split_conv_state_kernel      kernel/src/gdn_conv_split.cu
 cuda     gdn_prefill_prepare_kernel       kernel/src/gdn_prefill.cu     # #514: the chunk preparation, CUDA cores
 cuda     gdn_prefill_recurrence_kernel    kernel/src/gdn_prefill.cu     # #514: HMMA with an f16 accumulator only (reported); no integer MMA required, it is neither a GEMM nor a band kernel
 
+# The 27B's MTP head on 8.x (spec #618, #627): its own steps on the CUDA cores,
+# its W8G32 matrices on the vendored SIMT route up to 8 tokens and on our
+# integer MMA above.
+cuda     previous_positions_kernel        kernel/src/mtp_head.cu        # #627: a plain round's head row positions
+cuda     gather_columns_kernel            kernel/src/mtp_head.cu        # #627: the continuation hiddens by slot
+cuda     chain_rows_kernel                kernel/src/mtp_head.cu        # #627: a chain step's rows and mask
+cuda     write_drafts_kernel              kernel/src/mtp_head.cu        # #627: a chain step's drafts
+cuda     commit_hiddens_kernel            kernel/src/mtp_head.cu        # #627: the commit's input hiddens
+cuda     w8_imma_split_kernel             kernel/src/w8_imma.cu         # #627: the activation's two INT8 planes
+mma      w8_imma_gemm_kernel              kernel/src/w8_imma.cu         # #627: the head's matrices above 8 tokens, s8 x s8 MMA per group
+cuda     w8_rowsplit_gemm_simt_kernel     kernel/vendor/src/ops/linear/w8/w8_rowsplit_gemm_simt.cuh   # #627: vendored, the head's matrices up to 8 tokens (and the vision tower's), fp32 FMA
+
 # The kernels of the prompt prefill that predate the rule and stay as they are
 # (#488, parked): each leaves the list when #488 converts it.
 exempt   nvfp4_a16_mma_kernel                       # #488: the DFlash2 drafter's prompt prefill, BF16 MMA

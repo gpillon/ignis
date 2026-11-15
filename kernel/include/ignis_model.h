@@ -313,6 +313,22 @@ enum ignis_hq_decode_attention {
   IGNIS_HQ_DECODE_ATTENTION_OURS = 1,
 };
 
+/* GitHub #627 (spec #618): the route of the 27B MTP head's five W8G32
+ * matrices, which no load option names: decided once per MTP load from the
+ * card (ours below compute capability 12), unless the measurement switch
+ * IGNIS_MTP_HEAD_LINEAR (`ours` or `vendored`) names ours on Blackwell
+ * (kernel/src/w8_imma.h). `ignis_model_mtp_head_linear` reports it. */
+enum ignis_mtp_head_linear {
+  /* A load without the head: DFlash2, no speculation, Flash-Next. */
+  IGNIS_MTP_HEAD_LINEAR_NONE = 0,
+  /* The vendored `ops::linear`: a Blackwell card's MTP load. */
+  IGNIS_MTP_HEAD_LINEAR_VENDORED = 1,
+  /* ignis's (kernel/src/w8_imma.h): the vendored SIMT route up to 8 tokens,
+   * the integer MMA above; an RTX 30 or RTX 40 card's MTP load, or a
+   * Blackwell card's under IGNIS_MTP_HEAD_LINEAR=ours. */
+  IGNIS_MTP_HEAD_LINEAR_OURS = 2,
+};
+
 /* GitHub #414 (ADR 0075): where a vision load keeps the 27B's vision tower
  * and (GitHub #415) its media embedding pool. The binder places the tower and
  * the load checks it is where this says. */
@@ -684,6 +700,12 @@ uint32_t ignis_model_gdn_prefill(const struct ignis_model *model);
  * decode and verify graph captured on it holds. IGNIS_HQ_DECODE_ATTENTION_VENDORED
  * for NULL and for Flash-Next, whose attention is its own. */
 uint32_t ignis_model_hq_decode_attention(const struct ignis_model *model);
+
+/* The route a loaded 27B's MTP head runs its matrices on (enum
+ * ignis_mtp_head_linear; GitHub #627): what the load decided, which every
+ * graph captured on it holds. IGNIS_MTP_HEAD_LINEAR_NONE for NULL and for a
+ * load without the head. */
+uint32_t ignis_model_mtp_head_linear(const struct ignis_model *model);
 
 /* GitHub #557: the most merged vision tokens one media item may hold on a
  * loaded model -- what its encoder's share of the scratch was sized for, and

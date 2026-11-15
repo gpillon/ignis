@@ -16,11 +16,14 @@
 //
 // Every RMSNorm has the 1 + w gain the target's have. The row's key and value
 // land in the head's own attention layer (the pool's last, ignis_seq_internal.h)
-// at position `p`, and its attention reads the head's rows 0..p. The head's
-// matrices run on the op layer every 27B matrix runs on (the W8 `ops::linear`,
-// whose registry carries the head's five geometries); the fused projections
-// are not registered at these shapes, so the layer composes linear, a split,
-// residual adds and the SwiGLU. Nothing here is the reference engine's MTP.
+// at position `p`, and its attention reads the head's rows 0..p. On Blackwell
+// the head's matrices run on the op layer every 27B matrix runs on (the W8
+// `ops::linear`, whose registry carries the head's five geometries); on an RTX
+// 30 or RTX 40 card, where those routes are half-rate BF16 MMA or have no
+// kernel image, on ours (kernel/src/w8_imma.h, GitHub #627), decided at load
+// (`ignis_model::mtp_head_linear_ours`). The fused projections are not
+// registered at these shapes, so the layer composes linear, a split, residual
+// adds and the SwiGLU. Nothing here is the reference engine's MTP.
 //
 // Who writes which row: the entry at `p` is built when `x_{p+1}` is consumed,
 // so a step that consumes positions `[a, b)` writes the head's rows

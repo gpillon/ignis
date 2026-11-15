@@ -24,7 +24,26 @@ on: the vendored W8 `ops::linear`, whose registry already carries the head's fiv
 with the linear op). The fused projections (`attn_input_proj`, `linear_add`, `linear_swiglu`) are not
 registered for W8 at the 27B's shapes, so the layer composes `linear`, a split of the fused projection's rows
 (query, key, gate, value), `residual_add` and `silu_mul`. Those W8 routes are BF16 tensor-core MMA with FP32
-accumulation, which the full-rate rule refuses on RTX 30 and 40 cards; the head's routes there are #627's.
+accumulation, which the full-rate rule refuses on RTX 30 and 40 cards, and their small-T kernel is in the
+sm_120a set alone.
+
+**On an RTX 30 or 40 card the head's matrices run on routes of the full-rate rule (#627).** The load decides
+once, from the card (`kernel/src/w8_imma.h`; the measurement switch `IGNIS_MTP_HEAD_LINEAR=ours` takes the same
+routes on Blackwell, for its checks there). Up to 8 tokens (a round's lanes, a chain step, the readout's row) a
+call runs the vendored W8 SIMT kernel, called and not copied, the route the vision tower already runs on those
+cards: the CUDA cores, fp32 FMA on the BF16 activation, the matrix read once. Wider (a commit over several lanes,
+a prefill call of up to 128 rows) it runs ignis's own GEMM on the integer MMA: the activation split per token and
+per 32 inputs into a 16-bit fixed point held as two INT8 planes, one m16n8k32 s8 MMA per plane and group, the
+group's exact integer sums scaled in fp32. Neither existing full-rate route fits the wide calls as it is: the
+dense prefill's GEMM keeps one integer accumulator over the whole K under a single scale (the trellis copy's
+affine map), where W8G32 has a scale per row and 32 inputs, and the SIMT kernel reads the matrix once per 8
+tokens. Plain A8 (one INT8 plane) was the other form: it adds an activation step of 2^-8 at each matrix, which
+no RTX 30 or 40 card was at hand to measure against acceptance; the 16-bit fixed point's step, 2^-16 of a
+group's largest value, sits below the BF16 rounding of every output, so the head computes what it computes on
+Blackwell within the roundings its f64 checks allow. The planes live in a buffer of the same head call that is
+dead or not yet written at that point, so the VRAM plan is the same on every card. The load logs the route
+(`ignis.runtime.decode_routes`, `mtp_head_linear`). No 8.x card ran it before the release that ships it: that
+release's sm_86 gate starts an MTP load.
 
 **The head's attention state spans the whole context, in the KV pool, as one more attention layer.** The head
 was trained attending over every row before it; a head that sees only the last rows would save the state's bytes

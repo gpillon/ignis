@@ -722,10 +722,14 @@ impl StepLeaf for CudaLeaf {
         // verify rounds, which no option names either (the leaf decides it
         // from the card, or the measurement switch IGNIS_HQ_DECODE_ATTENTION
         // names today's route): `ours` on a Blackwell card's hq-e8-2b load.
+        // GitHub #627: and the MTP head's matrices, `ours` on an RTX 30 or
+        // RTX 40 card (or under IGNIS_MTP_HEAD_LINEAR=ours), `none` without
+        // the head.
         // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80).
         tracing::info!(
             name: "ignis.runtime.decode_routes",
             hq_decode_attention = model.hq_decode_attention().as_str(),
+            mtp_head_linear = model.mtp_head_linear().map_or("none", |route| route.as_str()),
             "decode routes"
         );
         let cfg = ModelConfig::qwen38_27b();

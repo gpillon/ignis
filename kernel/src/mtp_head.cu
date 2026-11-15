@@ -9,6 +9,7 @@
 #include "ignis_seq_internal.h"
 #include "model_internal.h"
 #include "trellis_body.h"
+#include "w8_imma.h"
 
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/embedding.h"
@@ -158,6 +159,32 @@ __global__ void commit_hiddens_kernel(const std::uint16_t *normalized, const std
   }
 }
 
+// GitHub #627: one of the head's five matrices, out = w x, on the load's route: the vendored
+// `ops::linear` on Blackwell, ours on an RTX 30 or RTX 40 card (kernel/src/w8_imma.h), whose wide
+// calls split the activation into `room`, a buffer of the same call that is dead or not yet
+// written at that point, so the head takes no byte the plan does not hold (`call_bytes`).
+void head_linear(const ignis_model &model, const ninfer::Tensor &x, const ninfer::Weight &w, ninfer::Tensor &out,
+                 const ninfer::Tensor &room) {
+  if (model.mtp_head_linear_ours) {
+    ignis::w8_imma::linear(x, w, out, room.data, room.bytes(), model.stream);
+  } else {
+    ninfer::ops::linear(x, w, out, model.stream);
+  }
+}
+
+// A wide call's room, per token: the activation's two INT8 planes and an fp32 scale per 32 inputs.
+// The output projection's (query-width inputs) in the fused projection's buffer and down's
+// (MLP-width inputs) in gate and up's hold them by these asserts; the three calls whose inputs are
+// the hidden width, the load's, are held at the call (`ignis::w8_imma::linear` refuses a room too
+// small).
+constexpr std::size_t split_bytes_per_token(std::int64_t inputs) {
+  return static_cast<std::size_t>(2 * inputs + inputs / 32 * 4);
+}
+static_assert(split_bytes_per_token(kQueryWidth) < 2 * static_cast<std::size_t>(kProjectionRows),
+              "the output projection's planes fit the fused projection's buffer");
+static_assert(split_bytes_per_token(kFfn) < 2 * 2 * static_cast<std::size_t>(kFfn),
+              "the down projection's planes fit the gate and up buffer");
+
 // The head's stem and attention over `columns` rows: `hidden` the target's
 // post-norm hiddens (or, in a chain, the head's own), `embedded` the next
 // tokens' embeddings (both BF16 [hidden, columns]), `rotation` the positions
@@ -170,6 +197,7 @@ __global__ void commit_hiddens_kernel(const std::uint16_t *normalized, const std
 struct AttendedRows {
   ninfer::Tensor x;
   ninfer::Tensor attention;
+  ninfer::Tensor projected;  // dead once the attention's parts are split from it
 };
 
 template <class Attend>
@@ -187,15 +215,18 @@ AttendedRows attend_rows(ignis_model &model, const ninfer::Tensor &hidden, const
   ninfer::Tensor hidden_normed = alloc(h);
   ninfer::Tensor stem = alloc(2 * h);
   ninfer::Tensor x = alloc(h);
+  // The attention's input and the fused projection's rows query | key | gate | value, allocated
+  // here (in the same order) so that the stem's projection can take the second, not yet written,
+  // as its room.
+  ninfer::Tensor attention_in = alloc(h);
+  ninfer::Tensor projected = alloc(kProjectionRows);
   ninfer::ops::rmsnorm(embedded, gain(w.embedding_norm, h), eps, /*unit_offset=*/true, embedding_normed, stream);
   ninfer::ops::rmsnorm(hidden, gain(w.hidden_norm, h), eps, /*unit_offset=*/true, hidden_normed, stream);
   copy_into_rows(embedding_normed, h, stem, 2 * h, 0, columns, stream);
   copy_into_rows(hidden_normed, h, stem, 2 * h, h, columns, stream);
-  ninfer::ops::linear(stem, w.input_projection, x, stream);
+  head_linear(model, stem, w.input_projection, x, projected);
 
-  // The attention: the fused projection's rows query | key | gate | value.
-  ninfer::Tensor attention_in = alloc(h);
-  ninfer::Tensor projected = alloc(kProjectionRows);
+  // The attention.
   ninfer::Tensor query = alloc(kQueryWidth);
   ninfer::Tensor key = alloc(kKvWidth);
   ninfer::Tensor gate = alloc(kQueryWidth);
@@ -204,7 +235,8 @@ AttendedRows attend_rows(ignis_model &model, const ninfer::Tensor &hidden, const
   ninfer::Tensor rotated_key = alloc(kKvWidth);
   ninfer::Tensor attention = alloc(kQueryWidth);
   ninfer::ops::rmsnorm(x, gain(w.input_norm, h), eps, /*unit_offset=*/true, attention_in, stream);
-  ninfer::ops::linear(attention_in, w.query_key_gate_value, projected, stream);
+  // The stem, read by its projection only, is the room.
+  head_linear(model, attention_in, w.query_key_gate_value, projected, stem);
   copy_rows(projected, kProjectionRows, 0, query, kQueryWidth, columns, stream);
   copy_rows(projected, kProjectionRows, kQueryWidth, key, kKvWidth, columns, stream);
   copy_rows(projected, kProjectionRows, kQueryWidth + kKvWidth, gate, kQueryWidth, columns, stream);
@@ -217,7 +249,7 @@ AttendedRows attend_rows(ignis_model &model, const ninfer::Tensor &hidden, const
   ninfer::Tensor attention_heads = attention.view({kHeadDim, kQueryHeads, columns, 1});
   attend(rotated_query_heads, rotated_key_heads, value.view({kHeadDim, kKvHeads, columns, 1}),
          gate.view({kHeadDim, kQueryHeads, columns, 1}), attention_heads);
-  return AttendedRows{x, attention};
+  return AttendedRows{x, attention, projected};
 }
 
 // The head's forward over `columns` rows (`attend_rows`, then the output
@@ -236,6 +268,8 @@ void forward(ignis_model &model, const ninfer::Tensor &hidden, const ninfer::Ten
   AttendedRows rows = attend_rows(model, hidden, embedded, rotation, columns, arena, attend);
   ninfer::Tensor &x = rows.x;
   const ninfer::Tensor &attention = rows.attention;
+  // The fused projection's buffer, read only by the split into the attention's parts.
+  const ninfer::Tensor &projected = rows.projected;
 
   // The output projection's residual add, then the MLP's.
   ninfer::Tensor projected_out = alloc(h);
@@ -243,12 +277,13 @@ void forward(ignis_model &model, const ninfer::Tensor &hidden, const ninfer::Ten
   ninfer::Tensor gate_up = alloc(2 * kFfn);
   ninfer::Tensor activated = alloc(kFfn);
   ninfer::Tensor down = alloc(h);
-  ninfer::ops::linear(attention, w.output, projected_out, stream);
+  head_linear(model, attention, w.output, projected_out, projected);
   ninfer::ops::residual_add(projected_out, x, stream);
   ninfer::ops::rmsnorm(x, gain(w.post_attention_norm, h), eps, /*unit_offset=*/true, mlp_in, stream);
-  ninfer::ops::linear(mlp_in, w.mlp_gate_up, gate_up, stream);
+  head_linear(model, mlp_in, w.mlp_gate_up, gate_up, projected);
   ninfer::ops::silu_mul(gate_up.slice(0, 0, kFfn), gate_up.slice(0, kFfn, kFfn), activated, stream);
-  ninfer::ops::linear(activated, w.mlp_down, down, stream);
+  // Gate and up, read by the SwiGLU only, are the room.
+  head_linear(model, activated, w.mlp_down, down, gate_up);
   ninfer::ops::residual_add(down, x, stream);
   ninfer::ops::rmsnorm(x, gain(w.final_norm, h), eps, /*unit_offset=*/true, out, stream);
 }
