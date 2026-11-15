@@ -376,8 +376,17 @@ pub fn describe(surface: Surface) -> String {
             rule.refusal.expect("filtered")
         ));
     }
+    if matches!(surface, Surface::Chat | Surface::Responses) {
+        text.push_str(FLASH_NEXT_STRICT);
+    }
     text
 }
+
+/// What the field table says of a function tool's `strict` on the two
+/// surfaces that take tools: honoured where tool calls are held, inert on
+/// Flash-Next (spec #582).
+const FLASH_NEXT_STRICT: &str =
+    "\nA function tool's `strict` is honoured on the 27B, and accepted as inert on Qwen3.8-Flash-Next until it holds tool calls (GitHub #581).\n";
 
 #[cfg(test)]
 mod tests {
@@ -523,12 +532,17 @@ mod tests {
 
     /// `strict` on a function tool was declared inert where the document
     /// lists the fields (spec #287) until a strict tool's calls were held, on
-    /// chat completions (GitHub #611) and on the Responses API (#613): no
-    /// surface lists it now. On Flash-Next, where it stays inert until #581,
-    /// the guide says so.
+    /// chat completions (GitHub #611) and on the Responses API (#613): the two
+    /// surfaces that take tools now say it is inert on Flash-Next alone,
+    /// until #581, and the other two say nothing of it.
     #[test]
-    fn no_surface_declares_a_function_tools_strict_inert() {
-        for surface in [Surface::Chat, Surface::Responses, Surface::Images, Surface::Transcriptions] {
+    fn the_tool_surfaces_declare_a_function_tools_strict_inert_on_flash_next_alone() {
+        for surface in [Surface::Chat, Surface::Responses] {
+            let text = describe(surface);
+            assert!(text.ends_with(FLASH_NEXT_STRICT), "{surface:?}");
+            assert_eq!(text.matches("strict").count(), 1, "{surface:?}: {text}");
+        }
+        for surface in [Surface::Images, Surface::Transcriptions] {
             assert!(!describe(surface).contains("strict"), "{surface:?}");
         }
     }

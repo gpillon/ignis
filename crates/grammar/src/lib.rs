@@ -27,7 +27,7 @@
 //! - [`call`]: where a value of a held tool's call ends (#610), the one
 //!   rule over bytes that the call parser and the call's grammar share.
 //! - [`ToolCallGrammar`] and [`ToolCallMatcher`] (#611): the grammar of a
-//!   request's tool calls, when it has a **strict tool**: free text in which
+//!   request's tool calls, when it has a **held tool**: free text in which
 //!   each call names a declared tool and a held tool's call is held to its
 //!   parameters, compiled by [`GrammarCache::tool_calls`].
 //!

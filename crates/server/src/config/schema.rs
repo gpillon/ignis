@@ -407,8 +407,8 @@ config_group! {
         /// no parameter it does not declare, an optional parameter left out
         /// of the arguments when the model leaves it out. A schema that
         /// cannot be normalized stays free, never refused, and a strict tool
-        /// stays strict either way. On Flash-Next it changes nothing until
-        /// it holds tool calls (#581).
+        /// stays strict either way. On Flash-Next, whose start accepts it
+        /// too, it changes nothing until it holds tool calls (#581).
         tool_arguments: ToolArgumentsKind = crate::api::ToolArguments::AsSent, Validator::OneOf(crate::api::ToolArguments::NAMES), ALL,
             [Visible, Patchable];
         /// The loop guard (ADR 0052): `rewind`, a loop in a request's
@@ -520,7 +520,7 @@ config_group! {
         grammar_max_ref_chain: Levels = super::DEFAULT_GRAMMAR_MAX_REF_CHAIN, between(1, 1024), ALL, [Visible];
         /// The longest run of whitespace structured output lets the model
         /// write between two of the answer's tokens, and between the tags of
-        /// a strict tool's call, so an answer never streams whitespace
+        /// a held tool's call, so an answer never streams whitespace
         /// without end.
         grammar_max_whitespace: Chars = super::DEFAULT_GRAMMAR_MAX_WHITESPACE, between(1, 255), ALL, [Visible];
         /// The 27B's adaptation (ADR 0063): when its VRAM plan refuses a

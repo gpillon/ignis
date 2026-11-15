@@ -404,7 +404,7 @@ Whether structured output describes a `json_schema` request's schema to the mode
 | Models | all |
 | `/v1/config` | shown by `GET`, patchable live |
 
-How the 27B serves a tool a request does not send `strict: true` (spec #582, ADR 0094), on chat completions and `/v1/responses`: `as-sent`, each tool as sent (a tool sent without `strict` free on chat completions and normalized on `/v1/responses`, as OpenAI serves them, one sent `strict: false` free); `held`, every such tool, `strict: false` included, normalized into strict form and its calls held where its schema allows it: its objects closed, so no parameter it does not declare, an optional parameter left out of the arguments when the model leaves it out. A schema that cannot be normalized stays free, never refused, and a strict tool stays strict either way. On Flash-Next it changes nothing until it holds tool calls (#581).
+How the 27B serves a tool a request does not send `strict: true` (spec #582, ADR 0094), on chat completions and `/v1/responses`: `as-sent`, each tool as sent (a tool sent without `strict` free on chat completions and normalized on `/v1/responses`, as OpenAI serves them, one sent `strict: false` free); `held`, every such tool, `strict: false` included, normalized into strict form and its calls held where its schema allows it: its objects closed, so no parameter it does not declare, an optional parameter left out of the arguments when the model leaves it out. A schema that cannot be normalized stays free, never refused, and a strict tool stays strict either way. On Flash-Next, whose start accepts it too, it changes nothing until it holds tool calls (#581).
 
 ### `model.loop_guard`
 
@@ -750,7 +750,7 @@ How deep a `json_schema` may chain its subschemas and `$ref`s while it compiles:
 | Models | all |
 | `/v1/config` | shown by `GET`, not patchable |
 
-The longest run of whitespace structured output lets the model write between two of the answer's tokens, and between the tags of a strict tool's call, so an answer never streams whitespace without end.
+The longest run of whitespace structured output lets the model write between two of the answer's tokens, and between the tags of a held tool's call, so an answer never streams whitespace without end.
 
 ### `model.adapt_context_step`
 

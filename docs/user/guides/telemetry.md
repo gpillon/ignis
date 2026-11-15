@@ -98,8 +98,8 @@ what reuse held or gave up, the VRAM plan, decoded tokens, forced thinking
 closes, and decision counters with the answer-mass histogram ([ADR 0017](../../adr/0017-prometheus-metrics.md)).
 From 0.11.0, every tool call block the model writes is checked against its
 tool's `parameters` as it closes, on chat completions and on the Responses API
-(HTTP and WebSocket), and counted, while the response stays byte for byte what
-it was: `ignis_tool_calls_total` by outcome (`valid`; `invalid`, arguments that
+(HTTP and WebSocket), and counted, the check changing nothing the response
+carries: `ignis_tool_calls_total` by outcome (`valid`; `invalid`, arguments that
 break the schema or a call to a tool the request did not declare; `dropped`, a
 closed block that did not parse, which the client never sees),
 `ignis_tool_call_violations_total` by kind (`missing`, `type`, `enum`,
@@ -113,16 +113,18 @@ a `400` on chat completions and on the Responses API
 ([Held tools](../api/structured-output.md#held-tools-strict-true); read on a
 model that serves structured output, so not on Flash-Next). A call still open when
 generation ends is not counted: its `finish_reason` says it was cut. Beside
-them, `ignis_tool_call_values_split_total` counts the string values (of a
+them, `ignis_tool_call_values_split_total` counts, in the calls to tools that
+are not held, the string values (of a
 parameter the tool declares a string) that the parser ended at a tag inside
 them and whose text after the tag it dropped: text after a `</parameter>` that
 no next parameter follows, or after a `</function>` not followed by
-`</tool_call>`, on a line of its own or inside one. The rule a held tool's
-calls will be read by would have kept that text in the value: under it a value
+`</tool_call>`, on a line of its own or inside one. The rule held tools' calls
+are read by, the confirmed close
+([Held tools](../api/structured-output.md#held-tools-strict-true)), would have
+kept that text in the value: under it a value
 ends only at a line that opens a declared parameter not yet written, or that
 closes the call once every required parameter is written. It measures what
-that rule would save if every tool were read by it; nothing reads calls by it
-yet, so responses are unchanged. Not counted: a value whose text the parser
+that rule would save if every tool were read by it. Not counted: a value whose text the parser
 moved into another parameter, dropping nothing (an opener of a parameter
 already written or not declared, which may be the model's own), a value whose
 call closes with a required parameter missing, which that rule would not close

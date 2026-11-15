@@ -12,6 +12,11 @@ That makes the Playground an agent loop you can watch: a turn streams a reply,
 runs the calls it made, sends the results back, and goes on until a reply
 calls nothing, up to **Tool rounds** replies. A call to a tool the model was
 not given is shown under **Unknown tools** with its arguments, and not run.
+On the 27B, from 0.11.0, the calls are held to their tools' parameters when
+the chat talks over the Responses socket, which sends its tools without
+`strict` ([A tool sent without `strict`](../api/structured-output.md#a-tool-sent-without-strict));
+over chat completions they come as the model writes them, unless the
+operator holds every tool.
 
 ## Agents
 

@@ -414,7 +414,6 @@ async fn fields_that_do_not_change_the_answer_are_accepted() {
         "client_metadata": { "a": 1 },
         "text": { "format": { "type": "text" }, "verbosity": "low" },
         "reasoning": { "effort": "low", "summary": "auto" },
-        "parallel_tool_calls": false,
         "tool_choice": "auto",
         "background": false,
         "previous_response_id": null,

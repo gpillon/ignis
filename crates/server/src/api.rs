@@ -3694,9 +3694,9 @@ impl Answer {
 /// finishes the request or the pipeline fires (a stop sequence matches, or
 /// the turn's one call closes) — then nothing past that token is read, and
 /// the caller stops the engine request at it ([`AnswerEnding::Stopped`]).
-/// Bounded by `timeout`, as [`collect_completion`] is: past it, what the
-/// answer had become, for the caller to cancel the request and finish it
-/// ([`CutAnswer`]).
+/// Bounded by `timeout`,
+/// as [`collect_completion`] is: past it, what the answer had become, for
+/// the caller to cancel the request and finish it ([`CutAnswer`]).
 async fn collect_answer(
     stream: &mut EventStream,
     timeout: std::time::Duration,

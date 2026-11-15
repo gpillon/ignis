@@ -194,7 +194,7 @@ pub struct RequestInput {
     /// call, and the server holds it to no answer's grammar; one that may
     /// call a tool admits the call's opener until its answer starts (#592,
     /// [`crate::structured::AnswerGrammar::admitting_tool_call`]). A request
-    /// with **strict tools** (#611) holds its calls to their tool calls'
+    /// with **held tools** (#611) holds their calls to their tool calls'
     /// grammar, beside a [`RequestInput::forced_literal`] too (#615): the
     /// literal's tokens are the server's, fed to the grammar and never
     /// checked, and one the grammar does not take is not forced.
