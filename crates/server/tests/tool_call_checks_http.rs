@@ -405,8 +405,10 @@ async fn under_one_call_only_the_block_that_ends_the_turn_is_counted() {
 }
 
 /// Strict tools whose parameters lie outside the strict subset are counted,
-/// one per request that sends one, and served as before: a strict tool
-/// inside the subset and a free one are not counted.
+/// one per request that sends one, as the request arrives: a strict tool
+/// inside the subset and a free one are not counted. Chat completions then
+/// refuse the request (GitHub #611, `held_tools_http`); the Responses API
+/// serves it as before until #613.
 fn strict_tools() -> JsonValue {
     json!([
         // Outside: an object not closed, a property not required.
@@ -429,20 +431,20 @@ fn strict_tools() -> JsonValue {
 }
 
 #[tokio::test]
-async fn strict_tools_outside_the_subset_are_counted_and_served_as_before() {
+async fn strict_tools_outside_the_subset_are_counted_as_they_arrive() {
     let script = call("open", &[("a", "x")]);
     let mut body = chat(false, false);
     body["tools"] = strict_tools();
-    let checked = server(&[&script, &script], true, true);
+    let checked = server(&[&script], true, true);
     let metrics = Arc::clone(checked.metrics.as_ref().unwrap());
-    let (status, served) = post(&checked, "/v1/chat/completions", &body).await;
-    assert_eq!(status, 200, "{served}");
+    let (status, refused) = post(&checked, "/v1/chat/completions", &body).await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(refused.contains("tools[0].function.parameters"), "{refused}");
     let (_, unchecked) = post(&server(&[&script], true, false), "/v1/chat/completions", &body).await;
-    assert_eq!(without_created(&served), without_created(&unchecked));
-    responses::metric_reaches(&metrics, "ignis_requests_completed_total 1").await;
-    assert_counts(&metrics, &["ignis_tool_strict_outside_subset_total 2", "ignis_tool_calls_total{outcome=\"valid\"} 1"], 1);
+    assert_eq!(refused, unchecked);
+    assert_counts(&metrics, &["ignis_tool_strict_outside_subset_total 2"], 1);
 
-    // The Responses API's flat tools, the same count again.
+    // The Responses API's flat tools, the same count again, and served.
     let mut flat = response_body(false);
     flat["tools"] = strict_tools()
         .as_array()
@@ -456,8 +458,8 @@ async fn strict_tools_outside_the_subset_are_counted_and_served_as_before() {
         .collect();
     let (status, served) = post(&checked, "/v1/responses", &flat).await;
     assert_eq!(status, 200, "{served}");
-    responses::metric_reaches(&metrics, "ignis_requests_completed_total 2").await;
-    assert_counts(&metrics, &["ignis_tool_strict_outside_subset_total 4", "ignis_tool_calls_total{outcome=\"valid\"} 2"], 1);
+    responses::metric_reaches(&metrics, "ignis_requests_completed_total 1").await;
+    assert_counts(&metrics, &["ignis_tool_strict_outside_subset_total 4", "ignis_tool_calls_total{outcome=\"valid\"} 1"], 1);
 
     // A model without the grammar's vocabulary (Flash-Next has none) has no
     // subset to read them by.

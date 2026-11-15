@@ -138,5 +138,11 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   `metadata`, `user`, ...) and refused
   with a 400 `unsupported_value` naming it in `param` otherwise. The full
   table is in the API reference at `/v1/docs/`; a field outside it is ignored.
-  `strict` on a function tool is accepted at any value and inert: the call's
-  arguments are not held to the tool's `parameters` (GitHub #582).
+- `strict: true` on a function tool (from 0.11.0, on the 27B) holds its calls
+  to the tool's `parameters` as the model writes them: every call to it names
+  a declared tool and carries arguments valid under its schema, in the order
+  of its `properties`, and a strict schema outside OpenAI's strict subset is
+  a 400 naming the tool's `parameters` in `param`
+  ([Held tools](structured-output.md#held-tools-strict-true)). `false`, `null`
+  and absent serve the tool as before; on Flash-Next `strict` is accepted and
+  inert (GitHub #581).

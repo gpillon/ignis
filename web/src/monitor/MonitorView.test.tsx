@@ -208,6 +208,19 @@ describe("MonitorView", () => {
     expect(text).not.toContain("Structured output");
   });
 
+  // #611: a strict tool's held calls count in the same card, by their own type.
+  it("counts the held tool calls in the Structured output card", () => {
+    const now = Date.now();
+    // Ten seconds on: five more requests with strict tools, two misses in their calls, each repaired.
+    const later = STRUCTURED_EXPOSITION.replace('requests_total{type="tool"} 4', 'requests_total{type="tool"} 9')
+      .replace('misses_total{type="tool"} 0', 'misses_total{type="tool"} 2')
+      .replace('repairs_total{type="tool"} 0', 'repairs_total{type="tool"} 2');
+    const state = applyScrape(applyScrape(initialMonitor(), { kind: "ok", text: STRUCTURED_EXPOSITION }, now - 10_000, 2), { kind: "ok", text: later }, now, 2);
+    const html = renderToStaticMarkup(<MonitorView state={state} />);
+    expect(html).toContain("Answers and tool calls held to a grammar");
+    expect(html).toContain("0.40");
+  });
+
   // #608: the Tool calls card, only once a call block was read.
   it("draws the Tool calls card once a call block was read, and not before", () => {
     const now = Date.now();

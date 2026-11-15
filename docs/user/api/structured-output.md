@@ -246,8 +246,82 @@ each turn either calls a tool or answers under the schema.
   [told the schema](#the-schema-described-to-the-model). `"none"` keeps the
   tools from the model, and every turn answers under the schema.
 
-`strict: true` on a function tool is accepted and inert: the call's arguments
-are the model's own, not held to the tool's `parameters` (GitHub #582).
+A strict tool's calls on such a turn are the model's own for now (GitHub
+#615); a turn without `response_format` holds them, as the next section says.
+
+## Held tools: `strict: true`
+
+From 0.11.0, chat completions on the 27B hold the calls of a function tool
+sent with `strict: true`, a **strict tool**, to its `parameters`, with the
+same grammar that holds an answer: each sampled token is checked, and a miss
+is repaired.
+
+```bash
+curl http://localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "qwen3.8-27b",
+  "messages": [{"role": "user", "content": "Save a note saying hi."}],
+  "tools": [{"type": "function", "function": {"name": "write_file", "strict": true, "parameters": {
+    "type": "object",
+    "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "mode": {"type": "string", "enum": ["w", "a"]}},
+    "required": ["path", "content", "mode"], "additionalProperties": false}}}]
+}'
+```
+
+- **Every call to a strict tool** names a tool the request declares, and its
+  `arguments` are valid under the tool's `parameters`, written in the order
+  you sent its `properties` in. Streamed, a call arrives once complete, as
+  every call does.
+- **The model writes its call in its own dialect and order.** It may write
+  the parameters in any order, each at most once; the function closes only
+  once every required parameter is written (a strict schema requires them
+  all). A call that would close early is steered to the missing parameter.
+- **The answer is free outside its calls.** The grammar arms at a call's
+  `<tool_call>`, in the answer only, never in the reasoning, and is released
+  at the call's close; each further call arms it again. A call cut by
+  `max_tokens` comes back as generated, with `finish_reason: "length"`.
+- **A string value is the call's raw text**, and it ends only where the call
+  goes on: a parameter's opener the call has not written yet, or the
+  function's close once every required parameter is written. A file's
+  content may hold lines that look like the call's own tags. The one text a
+  value cannot hold is its own call's close, `</function>` then
+  `</tool_call>`, each at a line's start, once the call may close.
+- **A string with an `enum`, a `const`, a `pattern` or a `format`** is held
+  to it, on one line that does not start with one of the call's tags
+  (`<parameter=`, `</parameter>`, `</function>`). `minLength` and `maxLength`
+  lie outside the strict subset and are refused.
+- **A parameter of another type** (an integer, a number, a boolean, an
+  object, an array, a union with `null`) is accepted, and its value comes as
+  the model wrote it: the call around it is held, the value not yet (GitHub
+  #612).
+- **A tool without `strict`** in the same request keeps its arguments as the
+  model writes them. With a strict tool in the request, every call's
+  function name is held to the request's tools.
+- **Checked, not held yet**: with `tool_choice: "required"` or a named
+  function, beside `response_format`, or with `parallel_tool_calls: false`,
+  a strict tool is checked when the request arrives (the refusals below),
+  and its calls are served as the model writes them (GitHub #615).
+- **A request with no strict tool** is served as before, byte for byte.
+- **On Qwen3.8-Flash-Next** and **on the Responses API**, `strict` is
+  accepted and inert for now (GitHub #581, #613).
+
+A held call's misses and repairs count beside structured output's, with the
+type `tool`: `ignis_structured_*{type="tool"}` in the
+[metrics](../reference/metrics.md), and `structured.type`,
+`structured.misses` and `structured.repairs` in the request log's
+`ignis.request.done` ([Telemetry](../guides/telemetry.md)).
+
+A strict tool is refused with a `400` before anything is generated, naming
+the tool's field in `param`: `tools[1].function.parameters` for its schema,
+``tools[1].function.parameters: strict tool refused, `minLength` at #/properties/a: `minLength` is outside the strict subset``.
+
+| You send | You get |
+|---|---|
+| a strict tool's `parameters` that `json_schema` under `strict: true` refuses | the same code ([What is refused](#what-is-refused)), naming the keyword and where |
+| a strict tool whose name holds `>`, or `</tool_call` | `tool_name_unwritable`, `param` `tools[i].function.name`: the dialect ends a name at its first `>` |
+| a strict tool whose name another tool in the request has | `duplicate_tool_name`, `param` `tools[i].function.name` |
+| a strict tool with a parameter whose name holds `>` | `parameter_name_unwritable` |
+| a strict tool with an `enum`, a `const` or a `pattern` no value of which fits on one line that does not start with one of the call's tags | `no_writable_value`, naming the keyword |
+| a strict tool with thinking on, on a tokenizer whose `</think>` is not one token | `unsupported_value`, `param` `tools[i].function.strict`; send `enable_thinking: false` |
 
 ## On the Responses API
 

@@ -152,8 +152,8 @@ ignis_retained_state_hits_total{tier="tape",kind="prefix"} 1
     // 8 plain counters, 3 reject reasons, 36 retained series (disk's 12 null without the tier), 3 skips, 4 KV-disk, then
     // Flash-Next's 32 expert hit and miss series, 2 prefetch, 2 bytes, 2
     // stall (GitHub #306), 2 n-gram rows, 2 reads, the 3 speculative totals
-    // (GitHub #307), the image jobs' 6 outcomes (timed_out since ADR 0058), images, 4 phases and duration count (GitHub #324), the loop guard's watched, looped, 7 outcomes, tokens and score count with the budget's closes (GitHub #330), the structured output's 2 types by 3 counters and repair count (#593), the tool calls' 3 outcomes, 6 kinds and strict tools outside the subset (#608) with the values split (#610), and 2 histogram counts. The speech model's 8 transcription series, audio seconds and wait count (spec speech/02).
-    expect(counterValues(empty)).toHaveLength(153);
+    // (GitHub #307), the image jobs' 6 outcomes (timed_out since ADR 0058), images, 4 phases and duration count (GitHub #324), the loop guard's watched, looped, 7 outcomes, tokens and score count with the budget's closes (GitHub #330), the structured output's 3 types (tool since #611) by 3 counters and repair count (#593), the tool calls' 3 outcomes, 6 kinds and strict tools outside the subset (#608) with the values split (#610), and 2 histogram counts. The speech model's 8 transcription series, audio seconds and wait count (spec speech/02).
+    expect(counterValues(empty)).toHaveLength(156);
     expect(counterValues(moved).filter((v) => v !== null)).toHaveLength(40);
     const flashNext = readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION));
     expect(counterValues(flashNext).filter((v) => v !== null)).toHaveLength(82);
@@ -235,9 +235,9 @@ ignis_retained_state_hits_total{tier="tape",kind="prefix"} 1
     const s = readSnapshot(parseExposition(STRUCTURED_EXPOSITION));
     expect(s.unknown).toEqual([]);
     expect(s.structured).toMatchObject({
-      requests: { json_object: 20, json_schema: 0 },
-      misses: { json_object: 6, json_schema: 0 },
-      repairs: { json_object: 6, json_schema: 0 },
+      requests: { json_object: 20, json_schema: 0, tool: 4 },
+      misses: { json_object: 6, json_schema: 0, tool: 0 },
+      repairs: { json_object: 6, json_schema: 0, tool: 0 },
     });
     expect(s.structured?.repairTime).toMatchObject({ count: 6, sum: 0.0011 });
     expect(readSnapshot(parseExposition(IGNIS_EXPOSITION)).structured).toBeNull();

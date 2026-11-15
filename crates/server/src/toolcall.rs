@@ -138,6 +138,12 @@ pub struct ToolSchemas {
     /// (`"string"`, `"integer"`, ...). An empty list is an untyped
     /// parameter.
     functions: HashMap<String, HashMap<String, Vec<String>>>,
+    /// The **held tools** (GitHub #611), by function name, with what the
+    /// confirmed close knows of each, their parameters in the schema's
+    /// order: set only beside the grammar that holds their calls
+    /// ([`ToolSchemas::holding`]), so that every scanner of the response
+    /// reads those calls as the grammar does.
+    held: HashMap<String, call::Parameters>,
 }
 
 /// The call check of one response (GitHub #608, ADR 0094): every function
@@ -349,7 +355,17 @@ impl ToolSchemas {
                 .collect();
             functions.insert(name.to_string(), params);
         }
-        Self { functions }
+        Self { functions, held: HashMap::new() }
+    }
+
+    /// The same schemas, whose calls to these held tools (function name →
+    /// what the confirmed close knows of it, its parameters declared in the
+    /// schema's order) every scanner reads by the confirmed close
+    /// ([`ToolCallScanner::holding`]), delivering their arguments in the
+    /// schema's order (GitHub #611). For a request whose content the tool
+    /// calls' grammar holds, and only then.
+    pub fn holding(self, held: HashMap<String, call::Parameters>) -> Self {
+        Self { held, ..self }
     }
 
     fn param_types(&self, function: &str, param: &str) -> &[String] {
@@ -429,16 +445,18 @@ impl ToolCallScanner {
         Self::with_schemas(ToolSchemas::default())
     }
 
-    /// A scanner that types each argument by the request's `tools`.
+    /// A scanner that types each argument by the request's `tools`, and
+    /// reads the calls of the held tools they carry
+    /// ([`ToolSchemas::holding`]) by the confirmed close.
     pub fn with_schemas(schemas: ToolSchemas) -> Self {
         Self {
             state: State::Scanning,
             hold: String::new(),
             next_index: 0,
+            held: schemas.held.clone(),
             schemas,
             check: None,
             ends_at_first_call: false,
-            held: HashMap::new(),
         }
     }
 
@@ -530,7 +548,11 @@ impl ToolCallScanner {
                         (len, block, matches!(cuts, Cuts::Confirmed(_)))
                     };
                     let body: String = self.hold.drain(..len).collect();
-                    let parsed = block.as_ref().map(|block| (body[block.name.clone()].to_string(), arguments(&body, block, &self.schemas)));
+                    let parsed = block.as_ref().map(|block| {
+                        let name = &body[block.name.clone()];
+                        let order = self.held.get(name).filter(|_| held);
+                        (name.to_string(), arguments(&body, block, &self.schemas, order))
+                    });
                     if let Some(check) = &self.check {
                         check.count(parsed.as_ref().map(|(name, arguments)| (name.as_str(), arguments.as_str())));
                         if let (Some(block), false) = (&block, held) {
@@ -746,8 +768,10 @@ fn read_held_call(text: &str, parameters: &call::Parameters) -> Option<(usize, B
 
 /// The JSON arguments of `block`, read from `text`: each value trimmed of
 /// one newline either side and typed by `schemas`; a parameter written
-/// twice keeps its last value.
-fn arguments(text: &str, block: &Block, schemas: &ToolSchemas) -> String {
+/// twice keeps its last value. Keys sorted, or, for a held tool's call
+/// (`order`: its parameters, declared in the schema's order), in the
+/// schema's order (GitHub #611).
+fn arguments(text: &str, block: &Block, schemas: &ToolSchemas, order: Option<&call::Parameters>) -> String {
     let name = &text[block.name.clone()];
     let mut args = serde_json::Map::new();
     for value in &block.values {
@@ -755,7 +779,16 @@ fn arguments(text: &str, block: &Block, schemas: &ToolSchemas) -> String {
         let types = schemas.param_types(name, param);
         args.insert(param.to_string(), parse_argument_value(trim_one_newline(&text[value.text.clone()]), types));
     }
-    serde_json::to_string(&serde_json::Value::Object(args)).expect("a Map<String, Value> always serializes")
+    let Some(order) = order else {
+        return serde_json::to_string(&serde_json::Value::Object(args)).expect("a Map<String, Value> always serializes");
+    };
+    // serde_json's compact form, a key at a time: no map here keeps an order.
+    let fields: Vec<String> = order
+        .declared()
+        .iter()
+        .filter_map(|key| args.get(key).map(|value| format!("{}:{}", JsonValue::String(key.clone()), value)))
+        .collect();
+    format!("{{{}}}", fields.join(","))
 }
 
 /// Trims exactly one leading and one trailing `\n` (the template's own

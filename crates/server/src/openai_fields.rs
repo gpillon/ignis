@@ -286,8 +286,10 @@ pub struct InertMember {
 /// model's own text, parsed as they come.
 const TOOL_STRICT: &str = "a call's arguments are not held to the function's `parameters` yet (GitHub #582)";
 
-/// The chat body's inert members.
-pub const CHAT_MEMBERS: &[InertMember] = &[InertMember { path: "tools[].function.strict", why: TOOL_STRICT }];
+/// The chat body's inert members: none since chat completions hold a strict
+/// tool's calls to its `parameters` (GitHub #611); on Flash-Next `strict`
+/// stays inert until #581, which the guide says.
+pub const CHAT_MEMBERS: &[InertMember] = &[];
 
 /// The Responses body's inert members: its function tools are flat.
 pub const RESPONSES_MEMBERS: &[InertMember] = &[InertMember { path: "tools[].strict", why: TOOL_STRICT }];
@@ -558,14 +560,15 @@ mod tests {
     }
 
     /// Spec #287: `strict` on a function tool is declared inert where the
-    /// document lists the fields, on both completion surfaces, naming #582.
+    /// document lists the fields, on the Responses API, naming #582; chat
+    /// completions hold a strict tool's calls (GitHub #611) and list it no
+    /// more.
     #[test]
-    fn the_description_declares_a_function_tools_strict_inert() {
-        for (surface, path) in [(Surface::Chat, "`tools[].function.strict`"), (Surface::Responses, "`tools[].strict`")] {
-            let text = describe(surface);
-            let line = text.lines().find(|line| line.contains(path)).unwrap_or_else(|| panic!("{surface:?}: {text}"));
-            assert!(line.contains("#582") && line.contains("`parameters`"), "{surface:?}: {line}");
-        }
+    fn the_description_declares_a_function_tools_strict_inert_on_the_responses_api() {
+        let text = describe(Surface::Responses);
+        let line = text.lines().find(|line| line.contains("`tools[].strict`")).unwrap_or_else(|| panic!("{text}"));
+        assert!(line.contains("#582") && line.contains("`parameters`"), "{line}");
+        assert!(!describe(Surface::Chat).contains("strict"));
         assert!(!describe(Surface::Images).contains("strict"));
     }
 }

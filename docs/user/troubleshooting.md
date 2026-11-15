@@ -638,6 +638,22 @@ itself: send it to the 27B, or `{"type": "text"}`. A tokenizer whose
 structured output; send `tool_choice: "none"`
 ([Structured output](api/structured-output.md#what-is-refused)).
 
+### A `400` naming `tools[i].function.parameters` or `tools[i].function.name`
+
+A strict tool (`strict: true`) is held on the 27B from 0.11.0, and its schema
+is read as `response_format`'s is under `strict: true`: one outside OpenAI's
+strict subset answers with the same `code`, and a message naming the keyword
+and where, ``tools[1].function.parameters: strict tool refused, `minLength` at #/properties/a: `minLength` is outside the strict subset``.
+Agent SDKs that send `strict: true` close their objects and require every
+property; a hand-written schema often does neither
+(`additional_properties_not_false`, `not_all_required`). A tool the model's
+call dialect cannot hold is refused by name too: a name holding `>`
+(`tool_name_unwritable`), a name another tool shares (`duplicate_tool_name`),
+a parameter whose name holds `>` (`parameter_name_unwritable`), a held string
+none of whose values fits on one line (`no_writable_value`). Fix the schema,
+or send the tool with `strict: false` to have its calls served as the model
+writes them ([Held tools](api/structured-output.md#held-tools-strict-true)).
+
 ### WARN `ignis.structured.vocabulary_unreadable`
 
 "the tokenizer's vocabulary cannot be read as bytes: structured output is

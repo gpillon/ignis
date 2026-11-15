@@ -1222,10 +1222,10 @@ function ReasoningCard({ reasoning, win }: { reasoning: Reasoning; win: string }
   );
 }
 
-/** Structured output (#593): the requests held to a grammar, the sampled tokens it rejected, and how long a repair took. */
+/** Structured output (#593): the requests held to a grammar, held tool calls among them (#611), the sampled tokens it rejected, and how long a repair took. */
 function StructuredCard({ structured, win }: { structured: StructuredOutputCard; win: string }) {
   return (
-    <Card title="Structured output" subtitle={`Answers held to a grammar · last ${win}`}>
+    <Card title="Structured output" subtitle={`Answers and tool calls held to a grammar · last ${win}`}>
       <Figures
         items={[
           ["Requests", formatCount(structured.requests.window)],
