@@ -76,10 +76,6 @@ fn an_mtp_leaf_drafts_inside_the_round_and_reports_each_rounds_counters_per_posi
         kv_pool_bytes: auto_kv_pool_bytes(KvFormat::Bf16, MAX_CONTEXT),
         prefill_chunk_tokens: MAX_CONTEXT,
         speculation: Some(Speculation::new(SpeculativeBackend::Mtp, WINDOW).unwrap()),
-        // A pool built for the head refuses every move of a sequence until
-        // #622 lists the head's sections: no retained slot to move one into.
-        retained_device_slots: 0,
-        retained_host_slots: 0,
         ..CudaLeafConfig::default()
     };
     let leaf = CudaLeaf::new(device, reader, artifact, handles, config);

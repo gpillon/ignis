@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ignis_artifact::{bind_model_scope_27b, materialize, CudaDevice, DraftModule, FrontendSet, Reader};
+use ignis_artifact::{bind_model_scope_27b, materialize, CudaDevice, FrontendSet, Reader};
 use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
 use ignis_core::gpu_profile;
 use ignis_core::scheduler::CheckpointClaim;
@@ -39,6 +39,9 @@ pub struct Loaded {
     model: Arc<Model<CudaLeaf>>,
     eos: TokenId,
     frontend: FrontendSet,
+    /// GitHub #622: the load drafts with the 27B's MTP head, whose state the
+    /// blob carries: a restored request must draft as its control did.
+    mtp: bool,
 }
 
 /// Load the artifact onto the card, with the drafter when `speculation` asks
@@ -53,7 +56,9 @@ pub fn load(speculation: Option<Speculation>) -> Option<Loaded> {
     let eos = frontend
         .eos_token_id()
         .unwrap_or_else(|| panic!("qwen3.8-27b generation config must carry eos_token_id"));
-    let draft = speculation.map(|_| DraftModule::Dflash2);
+    // GitHub #622: the drafter the load names -- DFlash2's model, or the 27B's
+    // own MTP head.
+    let draft = ignis_core::model_load::draft_module(speculation);
     let (plan, handles) =
         bind_model_scope_27b(&reader, draft).unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
@@ -86,7 +91,8 @@ pub fn load(speculation: Option<Speculation>) -> Option<Loaded> {
         .with_kv_ram_arena(HOST_POOL_BYTES)
         .unwrap_or_else(|e| panic!("pin KV-RAM: {e}"));
     let model = Arc::new(Model::load(Arc::new(leaf)).unwrap_or_else(|e| panic!("model load: {e:?}")));
-    Some(Loaded { model, eos, frontend })
+    let mtp = speculation.is_some_and(|s| s.backend() == ignis_core::SpeculativeBackend::Mtp);
+    Some(Loaded { model, eos, frontend, mtp })
 }
 
 impl Loaded {
@@ -122,6 +128,8 @@ impl Loaded {
                 serving_chunk_tokens: CHUNK,
                 host_capacity_bytes: HOST_POOL_BYTES,
                 retained_slots,
+                // GitHub #622: the load's own, as the server sets it.
+                kv_holder_lag: u32::from(self.mtp),
                 ..SchedulerConfig::default()
             },
             compute,
@@ -248,6 +256,29 @@ fn reuse(events: &[SchedEvent], request: RequestId) -> Option<(ReuseSource, u32)
     })
 }
 
+/// `request`'s speculative rounds, summed on its finish.
+fn drafting(events: &[SchedEvent], request: RequestId) -> Option<ignis_core::SpecCounters> {
+    events.iter().find_map(|e| match e {
+        SchedEvent::Done { request: r, spec, .. } if *r == request => *spec,
+        _ => None,
+    })
+}
+
+impl Loaded {
+    /// GitHub #622: on an MTP load, `restored` drafted as `control` did --
+    /// round for round, draft for draft, the same commits -- and landed
+    /// drafts: its head's state came back with it.
+    fn drafts_as(&self, restored: Option<ignis_core::SpecCounters>, control: Option<ignis_core::SpecCounters>, what: &str) {
+        if !self.mtp {
+            return;
+        }
+        let restored = restored.unwrap_or_else(|| panic!("{what}: the restored request ran no verify round"));
+        assert_eq!(Some(restored), control, "{what}: the restored request drafts as its control does");
+        assert!(restored.accepted > 0, "{what}: the restored request landed no draft: {restored:?}");
+        println!("{what}: {} rounds, {}/{} drafts accepted", restored.rounds, restored.accepted, restored.drafted);
+    }
+}
+
 /// A request that needs the whole device pool — and so every retained page.
 fn whole_pool(loaded: &Loaded) -> RequestInput {
     let mut prompt = Vec::new();
@@ -300,6 +331,7 @@ pub fn an_idle_conversation_resumes_from_kv_ram_exactly(loaded: &Loaded) {
     let events = run_to_idle(&mut sched);
     assert_eq!(reuse(&events, control), Some((ReuseSource::Device, opener)));
     let expected = generated(&events, control);
+    let expected_drafts = drafting(&events, control);
     assert!(expected.len() > 1, "the control generated past its first token: {expected:?}");
 
     // Push it off the device.
@@ -326,6 +358,7 @@ pub fn an_idle_conversation_resumes_from_kv_ram_exactly(loaded: &Loaded) {
         expected,
         "a KV-RAM restore must generate exactly what the device checkpoint does"
     );
+    loaded.drafts_as(drafting(&events, restored), expected_drafts, "a conversation back from KV-RAM");
 }
 
 /// AC2 (GitHub #190): a request standing on a retained prefix, snapshotted to
@@ -384,6 +417,7 @@ pub fn a_retained_prefix_claimant_evicted_mid_decode_continues_exactly(loaded: &
     };
 
     let (expected, control_events, claimant) = run(false);
+    let control_claimant = claimant;
     assert!(
         control_events.iter().any(|e| matches!(
             e,
@@ -410,6 +444,11 @@ pub fn a_retained_prefix_claimant_evicted_mid_decode_continues_exactly(loaded: &
     assert_eq!(
         actual, expected,
         "a claimant restored from a materialized blob must continue exactly"
+    );
+    loaded.drafts_as(
+        drafting(&events, claimant),
+        drafting(&control_events, control_claimant),
+        "a prefix claimant evicted mid-decode",
     );
 }
 
@@ -462,6 +501,7 @@ pub fn a_burst_block_brought_back_from_kv_ram_serves_exactly(loaded: &Loaded) {
     };
 
     let (expected, control, second) = run(false);
+    let control_second = second;
     assert!(
         control.iter().any(|e| matches!(
             e,
@@ -495,6 +535,7 @@ pub fn a_burst_block_brought_back_from_kv_ram_serves_exactly(loaded: &Loaded) {
         "the second subagent claimed the block that came back"
     );
     assert_eq!(actual, expected, "a block brought back from KV-RAM must serve exactly");
+    loaded.drafts_as(drafting(&events, second), drafting(&control, control_second), "a block brought back from KV-RAM");
 }
 
 /// Greedy decode of `request` on `compute` until `count` tokens are committed
@@ -661,6 +702,7 @@ pub fn a_checkpoint_given_up_for_a_slot_resumes_from_kv_ram_exactly(loaded: &Loa
     let events = run_to_idle(&mut sched);
     assert_eq!(reuse(&events, control), Some((ReuseSource::Device, opener)));
     let expected = generated(&events, control);
+    let expected_drafts = drafting(&events, control);
     assert!(expected.len() > 1, "the control generated past its first token: {expected:?}");
     drop(sched);
 
@@ -699,4 +741,5 @@ pub fn a_checkpoint_given_up_for_a_slot_resumes_from_kv_ram_exactly(loaded: &Loa
         expected,
         "a checkpoint spilled for a slot must restore exactly"
     );
+    loaded.drafts_as(drafting(&events, restored), expected_drafts, "a checkpoint spilled for a slot");
 }

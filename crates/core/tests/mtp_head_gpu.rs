@@ -357,10 +357,19 @@ fn an_mtp_load_binds_the_head_and_plans_its_lines_as_the_cpu_does_to_the_byte() 
     }
     let proposal = mtp_readout::propose(&model, &pool, &mut sequence).unwrap_or_else(|e| panic!("hq readout: {e}"));
     assert!((0..VOCAB as i32).contains(&proposal.draft), "{}", proposal.draft);
-    // Until the head's sections are listed (#622) the pool refuses every
-    // move of its sequences by name.
-    let err = sequence.snapshot().map(|_| ()).expect_err("an MTP pool refuses a snapshot").to_string();
-    assert!(err.contains("MTP head"), "{err}");
+    // GitHub #622: the head's state is in the section table, so its sequences
+    // move: a restored sequence holds the head's ring words, and its own
+    // snapshot is the source's bytes.
+    let blob = sequence.snapshot().unwrap_or_else(|e| panic!("an MTP pool's snapshot: {e}"));
+    let mut restored = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc the restore's target: {e}"));
+    restored.restore(&blob).unwrap_or_else(|e| panic!("restore: {e}"));
+    assert_eq!(
+        mtp_readout::ring_words(&pool, &restored).unwrap_or_else(|e| panic!("ring words: {e}")),
+        mtp_readout::ring_words(&pool, &sequence).unwrap_or_else(|e| panic!("ring words: {e}")),
+        "the restored sequence holds the target's and the head's ring words"
+    );
+    assert!(restored.snapshot().unwrap_or_else(|e| panic!("snapshot the restored: {e}")) == blob);
+    drop(restored);
 
     drop(sequence);
     drop(pool);
