@@ -768,25 +768,36 @@ fn read_held_call(text: &str, parameters: &call::Parameters) -> Option<(usize, B
 
 /// The JSON arguments of `block`, read from `text`: each value trimmed of
 /// one newline either side and typed by `schemas`; a parameter written
-/// twice keeps its last value. Keys sorted, or, for a held tool's call
+/// twice keeps its last value; keys sorted. For a held tool's call
 /// (`order`: its parameters, declared in the schema's order), in the
-/// schema's order (GitHub #611).
+/// schema's order (GitHub #611), each value read as the grammar held it
+/// (its `call::Reading`), and a parameter left out that is delivered `null`
+/// when omitted (a strict tool's nullable one) as `null` (GitHub #612).
 fn arguments(text: &str, block: &Block, schemas: &ToolSchemas, order: Option<&call::Parameters>) -> String {
     let name = &text[block.name.clone()];
-    let mut args = serde_json::Map::new();
-    for value in &block.values {
-        let param = &text[value.name.clone()];
-        let types = schemas.param_types(name, param);
-        args.insert(param.to_string(), parse_argument_value(trim_one_newline(&text[value.text.clone()]), types));
-    }
     let Some(order) = order else {
+        let mut args = serde_json::Map::new();
+        for value in &block.values {
+            let param = &text[value.name.clone()];
+            let types = schemas.param_types(name, param);
+            args.insert(param.to_string(), parse_argument_value(trim_one_newline(&text[value.text.clone()]), types));
+        }
         return serde_json::to_string(&serde_json::Value::Object(args)).expect("a Map<String, Value> always serializes");
     };
-    // serde_json's compact form, a key at a time: no map here keeps an order.
+    // Compact JSON, a key at a time: no map here keeps an order.
+    let written = |key: &str| block.values.iter().rev().find(|value| &text[value.name.clone()] == key).map(|value| trim_one_newline(&text[value.text.clone()]));
     let fields: Vec<String> = order
         .declared()
         .iter()
-        .filter_map(|key| args.get(key).map(|value| format!("{}:{}", JsonValue::String(key.clone()), value)))
+        .enumerate()
+        .filter_map(|(index, key)| {
+            let value = match written(key) {
+                Some(value) => order.reading_of(index).read(value),
+                None if order.nulled_when_omitted(index) => "null".to_owned(),
+                None => return None,
+            };
+            Some(format!("{}:{}", JsonValue::String(key.clone()), value))
+        })
         .collect();
     format!("{{{}}}", fields.join(","))
 }
@@ -1672,13 +1683,27 @@ mod tests {
         {"type":"function","function":{"name":"search","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}}
     ]"#;
 
+    /// `edit`, strict and typed (#612): an object holding a list of edits,
+    /// an integer with bounds and one without, a boolean, a nested array of
+    /// objects, a recursive definition, and two nullable parameters, a
+    /// string and a bounded integer; `search`, free, beside it.
+    const TYPED_TOOLS: &str = r##"[
+        {"type":"function","function":{"name":"edit","strict":true,"parameters":{"type":"object","properties":{"change":{"type":"object","properties":{"edits":{"type":"array","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"}},"required":["old","new"],"additionalProperties":false}}},"required":["edits"],"additionalProperties":false},"line":{"type":"integer","minimum":1,"maximum":1000},"id":{"type":"integer"},"dry_run":{"type":"boolean"},"rows":{"type":"array","items":{"type":"array","items":{"type":"object","properties":{"k":{"type":"string","enum":["a","b"]},"v":{"type":"number"}},"required":["k","v"],"additionalProperties":false}}},"tree":{"$ref":"#/$defs/node"},"note":{"type":["string","null"]},"limit":{"anyOf":[{"type":"integer","minimum":0,"maximum":9},{"type":"null"}]}},"required":["change","line","id","dry_run","rows","tree","note","limit"],"additionalProperties":false,"$defs":{"node":{"type":"object","properties":{"name":{"type":"string"},"kids":{"type":"array","items":{"$ref":"#/$defs/node"}}},"required":["name","kids"],"additionalProperties":false}}}}},
+        {"type":"function","function":{"name":"search","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}}
+    ]"##;
+
     /// The tools' grammar over a vocabulary of single bytes, a scanner that
     /// reads their calls as a held request's do, and each strict tool's
     /// `parameters` for the validator.
     fn held_parts() -> (std::sync::Arc<ignis_grammar::ToolCallGrammar>, impl Fn() -> ToolCallScanner, HashMap<String, ignis_grammar::json::Json>) {
+        held_parts_of(HELD_TOOLS)
+    }
+
+    /// [`held_parts`] of the tools `sent`.
+    fn held_parts_of(sent: &str) -> (std::sync::Arc<ignis_grammar::ToolCallGrammar>, impl Fn() -> ToolCallScanner, HashMap<String, ignis_grammar::json::Json>) {
         use ignis_grammar::json::Json;
-        let tools: Vec<JsonValue> = serde_json::from_str(HELD_TOOLS).unwrap();
-        let Json::Arr(sent) = Json::parse(HELD_TOOLS).unwrap() else { unreachable!() };
+        let tools: Vec<JsonValue> = serde_json::from_str(sent).unwrap();
+        let Json::Arr(sent) = Json::parse(sent).unwrap() else { unreachable!() };
         let declared: Vec<ignis_grammar::DeclaredTool> = sent
             .iter()
             .map(|tool| {
@@ -1719,16 +1744,63 @@ mod tests {
             "<parameter=path>\na.txt\n</parameter>\n", "<parameter=content>\nhi\n</parameter>\n", "<parameter=mode>\nw\n</parameter>\n",
             "<parameter=zone>\nEurope/Rome\n</parameter>\n", "<parameter=day>\n2026-11-15\n</parameter>\n", "</function>\n</tool_call>",
         ];
-        let (grammar, scanner, parameters) = held_parts();
-        let mut next = generator(0x5DEE_CE66_D1CE_4E5B);
-        let (mut texts, mut delivered) = (0, 0);
-        for _ in 0..3_000 {
+        let (texts, delivered, _) = grammar_to_parser(HELD_TOOLS, PIECES, false, 0x5DEE_CE66_D1CE_4E5B, 3_000, 400);
+        assert!(delivered > 500, "{delivered} calls from {texts} texts");
+    }
+
+    /// The same of a typed tool (#612), half the texts' steps a printable
+    /// byte the grammar takes there, so that its JSON grows past the pieces:
+    /// an object holding a list of edits, a bounded integer and a long one, a
+    /// boolean, a nested array of objects, a recursive definition, and the
+    /// nullable parameters written or left out.
+    #[test]
+    fn what_the_grammar_accepts_of_typed_and_nullable_values_the_parser_delivers_valid() {
+        const PIECES: &[&str] = &[
+            "<tool_call>", "\n", "<function=edit>", "<function=search>", "<parameter=change>", "<parameter=line>",
+            "<parameter=id>", "<parameter=dry_run>", "<parameter=rows>", "<parameter=tree>", "<parameter=note>",
+            "<parameter=limit>", "<parameter=query>", "</parameter>", "</function>", "</tool_call>", "\"", "}", "]", ",",
+            "null", "true", "x", " ", "</",
+            // Whole steps, so that many texts finish their calls.
+            "<parameter=change>\n{\"edits\": [{\"old\": \"a\", \"new\": \"b\"}]}\n</parameter>\n", "<parameter=line>\n7\n</parameter>\n",
+            "<parameter=id>\n-12\n</parameter>\n", "<parameter=dry_run>\ntrue\n</parameter>\n", "<parameter=rows>\n[[]]\n</parameter>\n",
+            "<parameter=tree>\n{\"name\": \"t\", \"kids\": []}\n</parameter>\n", "<parameter=note>\nnull\n</parameter>\n",
+            "<parameter=limit>\n3\n</parameter>\n", "</function>\n</tool_call>",
+        ];
+        let (texts, delivered, held) = grammar_to_parser(TYPED_TOOLS, PIECES, true, 0x9E37_79B9_7F4A_7C15, 2_000, 1_200);
+        assert!(held > 300, "{held} held calls, {delivered} in all, from {texts} texts");
+    }
+
+    /// Texts grown from `pieces` (and, with `bytes`, half the steps a
+    /// printable byte or a line break, closers first), each step taken only where the
+    /// grammar of the tools `sent` takes it, cut at their last point in free
+    /// text and read back by a holding scanner in random chunks: every held
+    /// call closed is delivered and valid. The texts, the calls delivered,
+    /// the held ones among them.
+    fn grammar_to_parser(sent: &str, pieces: &[&str], bytes: bool, seed: u64, count: usize, steps: u64) -> (usize, usize, usize) {
+        let (grammar, scanner, parameters) = held_parts_of(sent);
+        let mut next = generator(seed);
+        let (mut texts, mut delivered, mut held_delivered) = (0, 0, 0);
+        for _ in 0..count {
             let mut m = ignis_grammar::ToolCallMatcher::new(grammar.clone());
             let (mut text, mut free_at, mut opened_at) = (String::new(), 0, 0);
             // The calls closed, held and free, as of the last point in free text.
             let (mut closes, mut closes_at_free) = ((0, 0), (0, 0));
-            for _ in 0..(next() % 400) {
-                let piece = PIECES[next() as usize % PIECES.len()];
+            for _ in 0..(next() % steps) {
+                let byte;
+                let piece = if bytes && next() % 2 == 0 {
+                    // Closers weigh most, so that the JSON ends and the call goes on.
+                    let weight = |b: u8| match b {
+                        b'"' | b'}' | b']' => 24,
+                        b'\n' => 4,
+                        _ => 1,
+                    };
+                    let allowed: Vec<u8> = m.allowed_bytes().into_iter().filter(|&b| b == b'\n' || (0x20..0x7F).contains(&b)).flat_map(|b| vec![b; weight(b)]).collect();
+                    let Some(&b) = allowed.get(next() as usize % allowed.len().max(1)) else { continue };
+                    byte = [b];
+                    std::str::from_utf8(&byte).unwrap()
+                } else {
+                    pieces[next() as usize % pieces.len()]
+                };
                 let was_in_call = m.in_call();
                 if m.accept_bytes(piece.as_bytes()) {
                     if !was_in_call && m.in_call() {
@@ -1767,8 +1839,9 @@ mod tests {
             assert!(!content(&events).contains("<tool_call>"), "{text:?}");
             texts += 1;
             delivered += calls.len();
+            held_delivered += held;
         }
-        assert!(delivered > 500, "{delivered} calls from {texts} texts");
+        (texts, delivered, held_delivered)
     }
 
     /// Every valid call written in the template's form is accepted, the
@@ -1835,5 +1908,135 @@ mod tests {
             accepted += 1;
         }
         assert!(accepted > 2_000 && residue > 0 && miss_points > 0, "{accepted} accepted, {residue} residue, {miss_points} at the miss points");
+    }
+
+    /// `value` as the template writes a typed one: `tojson`'s spelling, a
+    /// space after each `,` and `:` (`style` 0), compact (1), or
+    /// pretty-printed (2).
+    fn spelled(value: &ignis_grammar::json::Json, style: u64) -> String {
+        use ignis_grammar::json::Json;
+        match (style, value) {
+            (1, _) => value.compact(),
+            (2, _) => value.pretty(),
+            (_, Json::Arr(items)) => format!("[{}]", items.iter().map(|item| spelled(item, 0)).collect::<Vec<_>>().join(", ")),
+            (_, Json::Obj(entries)) => {
+                let entries: Vec<String> = entries.iter().map(|(k, v)| format!("{}: {}", Json::Str(k.clone()).compact(), spelled(v, 0))).collect();
+                format!("{{{}}}", entries.join(", "))
+            }
+            (_, leaf) => leaf.compact(),
+        }
+    }
+
+    /// Every valid call of the typed tool written in the template's form is
+    /// accepted and read back as written (#612): arguments its schema's own
+    /// grammar writes (the grammar's subset: keys in the schema's order,
+    /// literals in their canonical spelling), each typed value spelled as
+    /// `tojson` spells it, compact or pretty-printed (within the whitespace
+    /// bound), the parameters in random order, a nullable one left out half
+    /// the times it is `null`. Carved out by name: a string-or-null value
+    /// whose text reads `null`, which is `null` (the documented limit).
+    #[test]
+    fn every_valid_typed_call_in_the_templates_form_is_accepted_and_read_back() {
+        use ignis_grammar::json::Json;
+        let (grammar, scanner, parameters) = held_parts_of(TYPED_TOOLS);
+        let schema = &parameters["edit"];
+        let vocab = ignis_grammar::Vocab::new((0..=255u8).map(|b| ignis_grammar::VocabEntry::Text(vec![b])).collect(), &[]);
+        let documents = ignis_grammar::GrammarCache::new(vocab, 1 << 26).json_schema(&schema.compact(), true).unwrap();
+        let mut next = generator(0xD1B5_4A32_D192_ED03);
+        let (mut accepted, mut long, mut omitted, mut limit) = (0, 0, 0, 0);
+        for seed in 0..1_500 {
+            let Some(bytes) = ignis_grammar::random_document(&documents, seed, 80, 6_000).unwrap() else { continue };
+            let doc = Json::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
+            if doc.get("note").and_then(Json::as_str).is_some_and(|note| note.trim() == "null") {
+                limit += 1;
+                continue;
+            }
+            let Json::Obj(mut entries) = doc.clone() else { unreachable!() };
+            for i in (1..entries.len()).rev() {
+                entries.swap(i, next() as usize % (i + 1));
+            }
+            let mut text = "<tool_call>\n<function=edit>\n".to_owned();
+            for (k, v) in &entries {
+                if *v == Json::Null && next() % 2 == 0 {
+                    omitted += 1;
+                    continue;
+                }
+                let value = match v {
+                    Json::Str(note) => note.clone(),
+                    typed => {
+                        let pretty = spelled(typed, next() % 3);
+                        let indent = pretty.split('\n').map(|line| line.len() - line.trim_start().len() + 1).max().unwrap_or(0);
+                        if indent > 40 { spelled(typed, 0) } else { pretty }
+                    }
+                };
+                text.push_str(&format!("<parameter={k}>\n{value}\n</parameter>\n"));
+            }
+            text.push_str("</function>\n</tool_call>");
+            let mut m = ignis_grammar::ToolCallMatcher::new(grammar.clone());
+            assert!(m.accept_bytes(text.as_bytes()) && !m.in_call(), "{text:?}");
+            let events = scan(scanner(), &chunked(&text, &mut next));
+            let calls = calls(&events);
+            assert_eq!(calls.len(), 1, "{text:?}");
+            assert_eq!(calls[0].arguments, doc.compact(), "{text:?}");
+            assert!(ignis_grammar::validate::is_valid(schema, &Json::parse(&calls[0].arguments).unwrap()), "{}", calls[0].arguments);
+            long += doc.get("id").and_then(Json::number_text).is_some_and(|id| id.trim_start_matches('-').len() > 19) as usize;
+            accepted += 1;
+        }
+        assert!(accepted > 1_000 && long > 0 && omitted > 0, "{accepted} accepted, {long} past i64, {omitted} nulls left out, {limit} at the limit");
+    }
+
+    /// A call of `edit` with these values, the rest of them valid, its
+    /// parameters in the reverse of the schema's order.
+    fn edit_call(with: &[(&str, &str)], without: &[&str]) -> String {
+        let values = [
+            ("change", r#"{"edits": [{"old": "x", "new": "y"}]}"#),
+            ("line", "12"),
+            ("id", "123456789012345678901234567890"),
+            ("dry_run", "false"),
+            ("rows", r#"[[{"k": "a", "v": 1.50}], []]"#),
+            ("tree", r#"{"name": "root", "kids": [{"name": "leaf", "kids": []}]}"#),
+            ("note", "a note"),
+            ("limit", "3"),
+        ];
+        let mut text = "<tool_call>\n<function=edit>\n".to_owned();
+        for (k, v) in values.iter().rev().filter(|(k, _)| !without.contains(k)) {
+            let v = with.iter().find(|(name, _)| name == k).map_or(*v, |(_, v)| *v);
+            text.push_str(&format!("<parameter={k}>\n{v}\n</parameter>\n"));
+        }
+        text + "</function>\n</tool_call>"
+    }
+
+    /// What a held `edit` call is delivered as.
+    fn edit_arguments(with: &[(&str, &str)], without: &[&str]) -> serde_json::Value {
+        let (_, scanner, _) = held_parts_of(TYPED_TOOLS);
+        let events = scan(scanner(), &[&edit_call(with, without)]);
+        serde_json::from_str(&calls(&events)[0].arguments).unwrap()
+    }
+
+    #[test]
+    fn a_held_calls_typed_values_are_delivered_as_written_and_its_nulls_as_null() {
+        let (_, scanner, _) = held_parts_of(TYPED_TOOLS);
+        let events = scan(scanner(), &[&edit_call(&[], &[])]);
+        // In the schema's order, the nested keys as written, every digit of
+        // an integer past i64 kept, a number in its canonical spelling.
+        assert_eq!(
+            calls(&events)[0].arguments,
+            r#"{"change":{"edits":[{"old":"x","new":"y"}]},"line":12,"id":123456789012345678901234567890,"dry_run":false,"rows":[[{"k":"a","v":1.5}],[]],"tree":{"name":"root","kids":[{"name":"leaf","kids":[]}]},"note":"a note","limit":3}"#
+        );
+        // A nullable parameter left out, or written `null`, is `null`.
+        for (with, without) in [(&[][..], &["note", "limit"][..]), (&[("note", "null"), ("limit", "null")][..], &[][..])] {
+            let arguments = edit_arguments(with, without);
+            assert_eq!((&arguments["note"], &arguments["limit"]), (&JsonValue::Null, &JsonValue::Null), "{with:?} {without:?}");
+        }
+    }
+
+    /// The documented limit: a string-or-null value whose text, trimmed,
+    /// reads `null` is `null`, never the string `null`; any other text is
+    /// itself.
+    #[test]
+    fn a_string_or_null_value_whose_text_reads_null_is_null() {
+        for (text, note) in [("null", JsonValue::Null), (" null ", JsonValue::Null), ("\"null\"", JsonValue::from("\"null\"")), ("nullable", JsonValue::from("nullable"))] {
+            assert_eq!(edit_arguments(&[("note", text)], &[])["note"], note, "{text:?}");
+        }
     }
 }
