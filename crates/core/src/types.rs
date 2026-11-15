@@ -328,9 +328,12 @@ impl RequestInput {
     /// which the prefill draws, and a repair of it reads the scores that
     /// draw kept. A claimed state that covered the whole prompt would carry
     /// a draw with none, so such a request is left a token to prefill, for
-    /// the reason [`RequestInput::reuse_reach`] gives.
+    /// the reason [`RequestInput::reuse_reach`] gives. A request's held tool
+    /// calls (#611) start in free text, where the first draw cannot miss
+    /// unless a token holds the call's opener with more after it
+    /// ([`crate::structured::AnswerGrammar::checks_first_draw`]).
     pub fn checks_prefill_draw(&self) -> bool {
-        self.grammar.is_some() && !self.params.starts_in_reasoning
+        self.grammar.as_ref().is_some_and(|grammar| grammar.checks_first_draw()) && !self.params.starts_in_reasoning
     }
 
     /// Whether this request is a **constrained decode** (GitHub #242,

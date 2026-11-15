@@ -5357,8 +5357,10 @@ impl Scheduler for ConcreteScheduler {
                     // request emits first (#518).
                     next_prompt_token: r.input.tokens.get((start + take) as usize).copied(),
                     // GitHub #287: the draw `hold_first_token` checks, on the
-                    // job that draws it: its scores are kept for a repair.
+                    // job that draws it: its scores are kept for a repair,
+                    // where it can miss (#611).
                     checked: r.grammar.as_ref().is_some_and(|state| state.holds())
+                        && r.input.checks_prefill_draw()
                         && start + take >= r.input.tokens.len() as u32,
                 }
             })

@@ -46,10 +46,22 @@
 //! with `stop` at once, the EOS never consumed. Nothing else ends it but its
 //! cap (`length`) or its deadline: the grammar never strands the model in a
 //! state it cannot finish, and its whitespace runs are bounded.
+//!
+//! # Tool calls held to their tools
+//!
+//! A request with a **strict tool** (GitHub #611, spec #582, ADR 0094) holds
+//! its content to its tool calls' grammar ([`AnswerGrammar::tool_calls`])
+//! instead: free text, in which each call the model opens is checked as it
+//! is written, a held tool's arguments to its parameters. The grammar arms
+//! at the call's opener and is released at its confirmed close inside its
+//! own automaton, so every draw of the content is checked -- free text
+//! passes whatever it is -- and a verified run is cut at its first miss
+//! inside a call. The reasoning stays free: the content starts after the
+//! block's `</think>`, as an answer does.
 
 use std::sync::Arc;
 
-use ignis_grammar::{Grammar, Matcher, TokenSet};
+use ignis_grammar::{Grammar, Matcher, TokenSet, ToolCallGrammar, ToolCallMatcher};
 
 use crate::constrained::PermittedMask;
 use crate::scheduler::PendingToken;
@@ -64,14 +76,19 @@ pub enum StructuredKind {
     JsonObject,
     /// A JSON value valid under the caller's schema (`json_schema`, #588).
     JsonSchema,
+    /// Tool calls held to the request's tools: a request with a **strict
+    /// tool** (GitHub #611).
+    Tool,
 }
 
 impl StructuredKind {
-    /// The wire name: `response_format`'s `type`.
+    /// The wire name: `response_format`'s `type`, and `tool` for a request's
+    /// held tool calls.
     pub fn name(self) -> &'static str {
         match self {
             StructuredKind::JsonObject => "json_object",
             StructuredKind::JsonSchema => "json_schema",
+            StructuredKind::Tool => "tool",
         }
     }
 }
@@ -81,10 +98,19 @@ impl StructuredKind {
 /// every request that sent the same shape, and where the answer starts.
 #[derive(Clone)]
 pub struct AnswerGrammar {
-    grammar: Arc<Grammar>,
+    grammar: Compiled,
     kind: StructuredKind,
     think_end: Option<TokenId>,
     tool_opener: Option<TokenId>,
+}
+
+/// What an [`AnswerGrammar`] holds the content to.
+#[derive(Clone)]
+enum Compiled {
+    /// A structured answer (#287).
+    Answer(Arc<Grammar>),
+    /// The request's tool calls (#611).
+    Calls(Arc<ToolCallGrammar>),
 }
 
 impl AnswerGrammar {
@@ -92,7 +118,27 @@ impl AnswerGrammar {
     /// With the generation starting inside the reasoning block it starts
     /// after the block's close, which [`AnswerGrammar::after`] names.
     pub fn new(grammar: Arc<Grammar>, kind: StructuredKind) -> Self {
-        Self { grammar, kind, think_end: None, tool_opener: None }
+        Self { grammar: Compiled::Answer(grammar), kind, think_end: None, tool_opener: None }
+    }
+
+    /// The content held to a request's tool calls' grammar (GitHub #611):
+    /// free text whose calls name the request's tools, a held tool's held to
+    /// its parameters. [`AnswerGrammar::after`] applies as to an answer;
+    /// [`AnswerGrammar::admitting_tool_call`] has no use here, the grammar
+    /// reading the opener itself.
+    pub fn tool_calls(grammar: Arc<ToolCallGrammar>) -> Self {
+        Self { grammar: Compiled::Calls(grammar), kind: StructuredKind::Tool, think_end: None, tool_opener: None }
+    }
+
+    /// Whether the content's first draw can be a miss, so the draw a
+    /// prefill makes must keep its scores for a repair: always for an
+    /// answer, and for tool calls only on a vocabulary where a token holds
+    /// the call's opener with more after it.
+    pub fn checks_first_draw(&self) -> bool {
+        match &self.grammar {
+            Compiled::Answer(_) => true,
+            Compiled::Calls(grammar) => grammar.first_draw_may_miss(),
+        }
     }
 
     /// The same answer, starting after the reasoning block's `think_end` when
@@ -146,7 +192,7 @@ pub enum Verdict {
 /// ([`crate::request::Request::grammar`]).
 #[derive(Clone)]
 pub struct GrammarState {
-    matcher: Matcher,
+    matcher: Held,
     /// The answer has started: thinking off, or the reasoning block closed.
     open: bool,
     think_end: Option<TokenId>,
@@ -161,8 +207,12 @@ impl GrammarState {
     /// A request's state before its first token: the answer open at once
     /// unless the generation starts inside the reasoning block.
     pub fn new(grammar: &AnswerGrammar, starts_in_reasoning: bool) -> Self {
+        let matcher = match &grammar.grammar {
+            Compiled::Answer(grammar) => Held::Answer(Matcher::new(grammar.clone())),
+            Compiled::Calls(grammar) => Held::Calls(ToolCallMatcher::new(grammar.clone())),
+        };
         Self {
-            matcher: Matcher::new(grammar.grammar.clone()),
+            matcher,
             open: !starts_in_reasoning,
             think_end: grammar.think_end,
             tool_opener: grammar.tool_opener,
@@ -233,7 +283,7 @@ impl GrammarState {
                 self.released = true;
                 return run.len();
             }
-            if self.matcher.grammar().vocab().is_stop(token) || !self.matcher.accept(token) {
+            if self.matcher.is_stop(token) || !self.matcher.accept(token) {
                 return index;
             }
         }
@@ -261,7 +311,7 @@ impl GrammarState {
     /// answer starts. Never empty while the answer is not finished (no state
     /// of a grammar is a dead end); an empty one is refused here.
     pub fn permitted(&mut self) -> Result<PermittedMask, String> {
-        let vocab = self.matcher.grammar().vocab().len();
+        let vocab = self.matcher.vocab_len();
         let opener = self.tool_opener.filter(|&opener| self.opens_tool_call(opener) && (opener as usize) < vocab);
         let set = self.set.get_or_insert_with(|| TokenSet::new(vocab));
         self.matcher.mask(set);
@@ -283,6 +333,71 @@ impl GrammarState {
         match self.matcher.accept(token) {
             true => Ok(self.matcher.is_finished()),
             false => Err(format!("the repair drew token {token}, which the grammar does not allow there")),
+        }
+    }
+}
+
+/// The matcher a [`GrammarState`] reads by: one request's position in its
+/// grammar.
+#[derive(Clone)]
+enum Held {
+    Answer(Matcher),
+    Calls(ToolCallMatcher),
+}
+
+impl Held {
+    fn accept(&mut self, token: TokenId) -> bool {
+        match self {
+            Held::Answer(m) => m.accept(token),
+            Held::Calls(m) => m.accept(token),
+        }
+    }
+
+    fn is_accepting(&self) -> bool {
+        match self {
+            Held::Answer(m) => m.is_accepting(),
+            Held::Calls(m) => m.is_accepting(),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        match self {
+            Held::Answer(m) => m.is_finished(),
+            Held::Calls(m) => m.is_finished(),
+        }
+    }
+
+    fn is_stop(&self, token: TokenId) -> bool {
+        match self {
+            Held::Answer(m) => m.grammar().vocab().is_stop(token),
+            Held::Calls(m) => m.grammar().vocab().is_stop(token),
+        }
+    }
+
+    fn vocab_len(&self) -> usize {
+        match self {
+            Held::Answer(m) => m.grammar().vocab().len(),
+            Held::Calls(m) => m.grammar().vocab().len(),
+        }
+    }
+
+    /// Whether the answer has started (#592); a request's tool calls have
+    /// no answer to start, and admit no opener beside their grammar's.
+    fn answer_started(&self) -> bool {
+        match self {
+            Held::Answer(m) => m.answer_started(),
+            Held::Calls(_) => true,
+        }
+    }
+
+    fn mask(&mut self, set: &mut TokenSet) {
+        match self {
+            Held::Answer(m) => {
+                m.mask(set);
+            }
+            Held::Calls(m) => {
+                m.mask(set);
+            }
         }
     }
 }
