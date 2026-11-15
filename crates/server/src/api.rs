@@ -1522,14 +1522,45 @@ pub(crate) fn count_strict_tools(server: &Server, tools: &[JsonValue]) {
 /// A request's **held tools** (GitHub #611, spec #582, ADR 0094): its
 /// **strict tools**, and the grammar its content is held to.
 pub(crate) struct HeldTools {
-    /// The tool calls' grammar the content is held to; `None` where the
-    /// request's strict tools are admitted but their calls not yet held: a
-    /// forced `tool_choice`, `response_format` beside them, or
-    /// `parallel_tool_calls: false` (#615).
-    pub grammar: Option<ignis_core::structured::AnswerGrammar>,
+    /// The tool calls' grammar the content is held to, from the token after
+    /// the reasoning's `</think>` with thinking on.
+    pub grammar: ignis_core::structured::AnswerGrammar,
+    /// The same grammar as compiled, which a structured answer beside the
+    /// tools hands the call its turn opens to (#615, [`turn_grammar`]).
+    calls: Arc<ignis_grammar::ToolCallGrammar>,
     /// The held tools by name, as every scanner of the response reads their
-    /// calls ([`ToolSchemas::holding`]): set only beside `grammar`.
+    /// calls ([`ToolSchemas::holding`]).
     pub held: std::collections::HashMap<String, ignis_grammar::call::Parameters>,
+}
+
+/// The grammar a turn's content is held to, and the schema description its
+/// prompt carries, from the answer its format asks for ([`structured_output`])
+/// and its held tools ([`held_tools`]): one rule for every surface that
+/// serves strict tools (GitHub #615, ADR 0094).
+///
+/// - An answer alone, or the held tools alone, is held to its own grammar.
+///   The held tools' holds every turn that may call them: `tool_choice`
+///   `"auto"`, `"required"` or a named function, whose forced literal opens
+///   the call and whose tokens the grammar follows (#286), and
+///   `parallel_tool_calls: false`, whose turn ends at the call's confirmed
+///   close.
+/// - An answer beside held tools: until the answer starts, the call's opener
+///   releases the turn from the answer's grammar (#592), and the call is held
+///   to the tool calls' grammar, which holds the rest of the turn, its text
+///   free and each further call held. A forced call's turn has no answer
+///   ([`hold_answer`]): the tools' grammar holds it alone. The request counts
+///   under the answer's `type` in the structured-output metrics and the
+///   request log, the call's misses and repairs included.
+pub(crate) fn turn_grammar(
+    answer: Option<HeldAnswer>,
+    tools: Option<&HeldTools>,
+) -> (Option<ignis_core::structured::AnswerGrammar>, Option<String>) {
+    match (answer, tools) {
+        (Some(answer), Some(tools)) => (Some(answer.grammar.holding_calls(tools.calls.clone())), answer.description),
+        (Some(answer), None) => (Some(answer.grammar), answer.description),
+        (None, Some(tools)) => (Some(tools.grammar.clone()), None),
+        (None, None) => (None, None),
+    }
 }
 
 /// The held tools of a request whose resolved `tools` are these (none
@@ -1540,10 +1571,10 @@ pub(crate) struct HeldTools {
 ///
 /// Every strict tool is compiled when the request arrives, and the tool
 /// calls' grammar with them, once per distinct set of tools
-/// ([`ignis_grammar::GrammarCache::tool_calls`]); with `holds` the content
-/// is held to it, the function name of every call to the request's declared
-/// tools, and each strict tool's arguments to its `parameters`, in the key
-/// order the client sent them. Refused with a 400 before anything is
+/// ([`ignis_grammar::GrammarCache::tool_calls`]); the content is held to it
+/// ([`turn_grammar`]), the function name of every call to the request's
+/// declared tools, and each strict tool's arguments to its `parameters`, in
+/// the key order the client sent them. Refused with a 400 before anything is
 /// generated, naming the tool's field in `param`: a strict schema outside
 /// OpenAI's strict subset, with structured output's codes; a strict tool the
 /// model's dialect cannot write (its name, a parameter's name, a held string
@@ -1553,7 +1584,6 @@ pub(crate) fn held_tools(
     server: &Server,
     raw: &[ignis_grammar::json::Json],
     tools: &[JsonValue],
-    holds: bool,
     thinking: &ThinkingOptions,
 ) -> Result<Option<HeldTools>, Response> {
     use ignis_grammar::{DeclaredTool, ToolField};
@@ -1587,11 +1617,8 @@ pub(crate) fn held_tools(
             Some(&param),
         )
     })?;
-    if !holds {
-        return Ok(Some(HeldTools { grammar: None, held: Default::default() }));
-    }
     let held = grammar.held().map(|(name, parameters)| (name.to_owned(), parameters.clone())).collect();
-    let content = ignis_core::structured::AnswerGrammar::tool_calls(grammar);
+    let content = ignis_core::structured::AnswerGrammar::tool_calls(grammar.clone());
     // With thinking on the reasoning stays free, and the content is held
     // from the token after the block's `</think>`, as an answer is.
     let content = match active.template.decoder_starts_in_reasoning(thinking) {
@@ -1610,7 +1637,7 @@ pub(crate) fn held_tools(
             }
         },
     };
-    Ok(Some(HeldTools { grammar: Some(content), held }))
+    Ok(Some(HeldTools { grammar: content, calls: grammar, held }))
 }
 
 /// A strict tool's `parameters` as the client sent them, key order kept
@@ -3080,7 +3107,7 @@ Every request has a deadline from its admission (ADR 0058): `--server-request-ti
 
 Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text. `tool_choice` takes `\"auto\"` (the default), `\"none\"`, `\"required\"` and a named function. The last two force the call's opening -- `<tool_call>` and the function tag, with the name when one is named -- and the model writes the rest: with thinking off the opening is the first thing generated, with thinking on the first thing after the reasoning block closes. A forced call that never closes is dropped like any other, and `finish_reason` says why. `parallel_tool_calls: false` ends the turn at the close of its first call, so it makes at most one, with `finish_reason: \"tool_calls\"`: nothing generated after that close is read or counted, and a call written in the reasoning ends nothing. `true` or absent serves every call the model writes.
 
-`response_format: {\"type\": \"json_object\"}` holds the answer to a valid JSON object, streamed or not: each sampled token is checked against the grammar before the model consumes it, and a miss is repaired from the same scores restricted to the tokens that keep the object valid. With thinking on the reasoning stays free and the answer is held from the token after its `</think>`. Whitespace runs are bounded, the prompt need not mention JSON, a cut by `max_tokens` returns the object as generated with `finish_reason: \"length\"`, and `message.refusal` is always null. `{\"type\": \"json_schema\", \"json_schema\": {\"name\", \"schema\", \"strict\"}}` holds it to the schema the same way: under `strict: true` OpenAI's strict subset, all of it enforced, keys in the schema's order; without it what can be enforced is and the rest is inert. A schema already seen is not compiled again. The schema is described to the model in a block after the conversation, where the assistant's turn opens, before any reasoning: the format's `description`, then `Respond with a JSON object that matches this JSON schema:` and the schema, compact. `ignis_describe_schema: false` (an ignis extension; absent or `null` takes `--model-describe-schema`, on by default) leaves the prompt as sent; `json_object` adds nothing. The next turn resumes from where this turn's conversation ended. `{\"type\": \"text\"}` is a free answer. Beside `tools` each turn either calls a tool or answers under the grammar: until the answer starts the grammar also admits `<tool_call>`, and a turn that opens a call is released from it for that turn, its call written and parsed as any other; `tool_choice: \"required\"` or a named function forces the call, and that turn is not held, nor told the schema.
+`response_format: {\"type\": \"json_object\"}` holds the answer to a valid JSON object, streamed or not: each sampled token is checked against the grammar before the model consumes it, and a miss is repaired from the same scores restricted to the tokens that keep the object valid. With thinking on the reasoning stays free and the answer is held from the token after its `</think>`. Whitespace runs are bounded, the prompt need not mention JSON, a cut by `max_tokens` returns the object as generated with `finish_reason: \"length\"`, and `message.refusal` is always null. `{\"type\": \"json_schema\", \"json_schema\": {\"name\", \"schema\", \"strict\"}}` holds it to the schema the same way: under `strict: true` OpenAI's strict subset, all of it enforced, keys in the schema's order; without it what can be enforced is and the rest is inert. A schema already seen is not compiled again. The schema is described to the model in a block after the conversation, where the assistant's turn opens, before any reasoning: the format's `description`, then `Respond with a JSON object that matches this JSON schema:` and the schema, compact. `ignis_describe_schema: false` (an ignis extension; absent or `null` takes `--model-describe-schema`, on by default) leaves the prompt as sent; `json_object` adds nothing. The next turn resumes from where this turn's conversation ended. `{\"type\": \"text\"}` is a free answer. Beside `tools` each turn either calls a tool or answers under the grammar: until the answer starts the grammar also admits `<tool_call>`, and a turn that opens a call is released from it for that turn, its call written and parsed as any other, a strict tool's held to its `parameters`; `tool_choice: \"required\"` or a named function forces the call, and that turn is not held to the schema, nor told it.
 
 `max_completion_tokens` is `max_tokens` under its current name: the one cap on generated tokens, reasoning included; both sent with different values is a 400. `stop` (a string, or 1 to 4 strings) ends the answer before the first sequence to appear in its content, with `finish_reason: \"stop\"`; the sequence is never emitted, a stream holds back a possible prefix until the next delta resolves it, and it is never matched in the reasoning nor inside a tool call. `usage.prompt_tokens_details.cached_tokens` is the prompt this request resumed from retained state instead of prefilling, the quantity `/v1/responses` reports.
 
@@ -3201,23 +3228,18 @@ async fn chat_completions(
         Ok(held) => held,
         Err(response) => return response,
     };
-    // GitHub #611: strict tools' calls are held on a turn that may call any
-    // tool and answers freely, and admitted everywhere else, where #615
-    // holds them.
-    let holds = matches!(tool_choice, ToolChoice::Auto) && held.is_none() && !one_call;
-    let held_tools = match held_tools(&server, raw_tools.as_deref().unwrap_or_default(), &tools, holds, &thinking) {
-        Ok(held_tools) => held_tools.unwrap_or(HeldTools { grammar: None, held: Default::default() }),
+    // GitHub #611, #615: strict tools' calls are held on every turn that
+    // may call them, beside the answer's grammar too.
+    let held_tools = match held_tools(&server, raw_tools.as_deref().unwrap_or_default(), &tools, &thinking) {
+        Ok(held_tools) => held_tools,
         Err(response) => return response,
     };
-    let (grammar, description) = match held {
-        Some(held) => (Some(held.grammar), held.description),
-        None => (held_tools.grammar, None),
-    };
+    let (grammar, description) = turn_grammar(held, held_tools.as_ref());
     let (model, class) = match resolve_model_and_class(req.model, req.class) {
         Ok(x) => x,
         Err(message) => return bad_request(&message),
     };
-    let schemas = ToolSchemas::from_tools(&tools).holding(held_tools.held);
+    let schemas = ToolSchemas::from_tools(&tools).holding(held_tools.map(|held| held.held).unwrap_or_default());
     // The pipeline that delivers the response checks its calls (#608); the
     // first-token probe's copy below does not.
     let check = CallCheck::new(&tools, server.metrics.as_ref());

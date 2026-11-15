@@ -215,13 +215,24 @@ repaired from the verify pass's scores, as a plain round's draw is.
 - **The scheduler** (`cargo test -p ignis-core --test held_tool_calls`): the
   prefill's draw opening a call, with no scores kept; a verified run holding
   `</think>`, the opener and a miss cut at the miss; free text never a miss;
-  a stop inside a held call a miss.
+  a stop inside a held call a miss. Beside a forced literal (#615), thinking
+  off and on: its tokens fed to the grammar and never a miss, the model's
+  after it held; a literal token the grammar refuses not forced. Beside a
+  structured answer: the call the opener starts held, and the next one, a
+  verified run cut at a miss after the opener.
 - **Over the mock engine** (`cargo test -p ignis-server --test
   held_tools_http`, about 1 s): the scripts that miss on purpose come out
   valid, each with its repairs counted under `type="tool"`; each refusal by
   code and `param`; the schema's key order; a free tool beside a strict one;
-  no strict tool, no grammar; streaming; a cap; the reasoning free. The
-  byte-identity of requests with no strict tool is the existing suites'.
+  no strict tool, no grammar; streaming; a cap; the reasoning free. Beside
+  the fields that shape a turn (#615): a `"required"` and a named forced
+  call missing after its opening, valid, the forced tokens no miss; beside
+  `response_format` a held call, or an answer valid under the schema, both
+  counted under `type="json_schema"`; with thinking on a call written in the
+  reasoning neither held nor parsed; under `parallel_tool_calls: false` a
+  value holding `</tool_call>` delivered whole, the turn ended at the
+  confirmed close. The byte-identity of requests with no strict tool is the
+  existing suites'.
 - **On the GPU**, agent requests with strict tools on the served 27B with
   DFlash2 on: every call valid and to a declared tool, every request a call,
   each miss repaired and counted, the verify rounds drafting and accepting.
