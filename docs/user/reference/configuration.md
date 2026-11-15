@@ -736,7 +736,7 @@ How deep a `json_schema` may chain its subschemas and `$ref`s while it compiles:
 | Models | all |
 | `/v1/config` | shown by `GET`, not patchable |
 
-The longest run of whitespace structured output lets the model write between two of the answer's tokens, so an answer never streams whitespace without end.
+The longest run of whitespace structured output lets the model write between two of the answer's tokens, and between the tags of a strict tool's call, so an answer never streams whitespace without end.
 
 ### `model.adapt_context_step`
 

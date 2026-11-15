@@ -1519,6 +1519,199 @@ pub(crate) fn count_strict_tools(server: &Server, tools: &[JsonValue]) {
     }
 }
 
+/// A request's **held tools** (GitHub #611, spec #582, ADR 0094): its
+/// **strict tools**, and the grammar its content is held to.
+pub(crate) struct HeldTools {
+    /// The tool calls' grammar the content is held to; `None` where the
+    /// request's strict tools are admitted but their calls not yet held: a
+    /// forced `tool_choice`, `response_format` beside them, or
+    /// `parallel_tool_calls: false` (#615).
+    pub grammar: Option<ignis_core::structured::AnswerGrammar>,
+    /// The held tools by name, as every scanner of the response reads their
+    /// calls ([`ToolSchemas::holding`]): set only beside `grammar`.
+    pub held: std::collections::HashMap<String, ignis_grammar::call::Parameters>,
+}
+
+/// The held tools of a request whose resolved `tools` are these (none
+/// under `tool_choice: "none"`), `raw` the same tools as sent; `None` for a
+/// request with no strict tool, which changes by no byte, and on a model
+/// that does not serve structured output, where `strict` stays inert
+/// (Flash-Next, #581).
+///
+/// Every strict tool is compiled when the request arrives, and the tool
+/// calls' grammar with them, once per distinct set of tools
+/// ([`ignis_grammar::GrammarCache::tool_calls`]); with `holds` the content
+/// is held to it, the function name of every call to the request's declared
+/// tools, and each strict tool's arguments to its `parameters`, in the key
+/// order the client sent them. Refused with a 400 before anything is
+/// generated, naming the tool's field in `param`: a strict schema outside
+/// OpenAI's strict subset, with structured output's codes; a strict tool the
+/// model's dialect cannot write (its name, a parameter's name, a held string
+/// with no value it can write on one line); and, with thinking on, a
+/// tokenizer with no single-token `</think>` to hold the content after.
+pub(crate) fn held_tools(
+    server: &Server,
+    raw: &[ignis_grammar::json::Json],
+    tools: &[JsonValue],
+    holds: bool,
+    thinking: &ThinkingOptions,
+) -> Result<Option<HeldTools>, Response> {
+    use ignis_grammar::{DeclaredTool, ToolField};
+    let strict = |tool: &JsonValue| tool["function"]["strict"] == JsonValue::Bool(true);
+    let Some(first) = tools.iter().position(strict) else { return Ok(None) };
+    let active = server.active();
+    if !active.family.serves_structured_output() {
+        return Ok(None);
+    }
+    let Some(grammars) = active.template.grammars() else { return Ok(None) };
+    let declared: Vec<DeclaredTool> = tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| DeclaredTool {
+            name: tool["function"]["name"].as_str().unwrap_or_default().to_owned(),
+            strict: strict(tool).then(|| strict_parameters(raw.get(index), tool)),
+        })
+        .collect();
+    let grammar = grammars.tool_calls(&declared).map_err(|refused| {
+        let field = match refused.field {
+            ToolField::Name => "name",
+            ToolField::Parameters => "parameters",
+        };
+        let param = format!("tools[{}].function.{field}", refused.tool);
+        let refusal = refused.refusal;
+        error_response_naming(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            refusal.code,
+            format!("{param}: strict tool refused, `{}` at {}: {}", refusal.keyword, refusal.path, refusal.detail),
+            Some(&param),
+        )
+    })?;
+    if !holds {
+        return Ok(Some(HeldTools { grammar: None, held: Default::default() }));
+    }
+    let held = grammar.held().map(|(name, parameters)| (name.to_owned(), parameters.clone())).collect();
+    let content = ignis_core::structured::AnswerGrammar::tool_calls(grammar);
+    // With thinking on the reasoning stays free, and the content is held
+    // from the token after the block's `</think>`, as an answer is.
+    let content = match active.template.decoder_starts_in_reasoning(thinking) {
+        false => content,
+        true => match active.template.encode_literal(crate::thinking::THINK_END_TEXT).filter(|ids| ids.len() == 1) {
+            Some(ids) => content.after(ids[0]),
+            None => {
+                let param = format!("tools[{first}].function.strict");
+                return Err(error_response_naming(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "unsupported_value",
+                    format!("{param}: with thinking on, a strict tool's calls are held from the token after the reasoning's </think>, and this tokenizer has no single-token </think>; send enable_thinking: false, or strict: false"),
+                    Some(&param),
+                ));
+            }
+        },
+    };
+    Ok(Some(HeldTools { grammar: Some(content), held }))
+}
+
+/// A strict tool's `parameters` as the client sent them, key order kept
+/// (`raw`, the grammar crate's own JSON, which keeps it), or the normalized
+/// tool's when it sent none ([`normalize_tool`]).
+fn strict_parameters(raw: Option<&ignis_grammar::json::Json>, normalized: &JsonValue) -> String {
+    use ignis_grammar::json::Json;
+    let sent = raw.and_then(|tool| tool.get("function")?.get("parameters")).filter(|parameters| **parameters != Json::Null);
+    sent.map(Json::compact).unwrap_or_else(|| normalized["function"]["parameters"].to_string())
+}
+
+/// A JSON value read once into the two shapes the handler needs:
+/// `serde_json`'s, its keys sorted, which every reader of a request's
+/// `tools` takes, and the grammar crate's, which keeps their order as sent:
+/// a strict tool's `parameters`, whose order its held calls' arguments
+/// follow (GitHub #611). Read by the same deserializer as a
+/// `serde_json::Value`, with the same nesting bound and the same errors.
+pub(crate) struct Sent {
+    pub value: JsonValue,
+    pub ordered: ignis_grammar::json::Json,
+}
+
+impl<'de> Deserialize<'de> for Sent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(SentVisitor)
+    }
+}
+
+struct SentVisitor;
+
+impl<'de> serde::de::Visitor<'de> for SentVisitor {
+    type Value = Sent;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E>(self, b: bool) -> Result<Sent, E> {
+        Ok(Sent { value: JsonValue::Bool(b), ordered: ignis_grammar::json::Json::Bool(b) })
+    }
+
+    fn visit_i64<E>(self, n: i64) -> Result<Sent, E> {
+        Ok(sent_number(JsonValue::from(n)))
+    }
+
+    fn visit_u64<E>(self, n: u64) -> Result<Sent, E> {
+        Ok(sent_number(JsonValue::from(n)))
+    }
+
+    fn visit_f64<E>(self, n: f64) -> Result<Sent, E> {
+        Ok(sent_number(serde_json::Number::from_f64(n).map_or(JsonValue::Null, JsonValue::Number)))
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Sent, E> {
+        Ok(Sent { value: JsonValue::String(s.to_owned()), ordered: ignis_grammar::json::Json::Str(s.to_owned()) })
+    }
+
+    fn visit_string<E>(self, s: String) -> Result<Sent, E> {
+        Ok(Sent { ordered: ignis_grammar::json::Json::Str(s.clone()), value: JsonValue::String(s) })
+    }
+
+    fn visit_unit<E>(self) -> Result<Sent, E> {
+        Ok(Sent { value: JsonValue::Null, ordered: ignis_grammar::json::Json::Null })
+    }
+
+    fn visit_none<E>(self) -> Result<Sent, E> {
+        Ok(Sent { value: JsonValue::Null, ordered: ignis_grammar::json::Json::Null })
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Sent, D::Error> {
+        Sent::deserialize(deserializer)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Sent, A::Error> {
+        let (mut values, mut ordered) = (Vec::new(), Vec::new());
+        while let Some(item) = seq.next_element::<Sent>()? {
+            values.push(item.value);
+            ordered.push(item.ordered);
+        }
+        Ok(Sent { value: JsonValue::Array(values), ordered: ignis_grammar::json::Json::Arr(ordered) })
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Sent, A::Error> {
+        let (mut values, mut ordered) = (serde_json::Map::new(), Vec::new());
+        while let Some((key, item)) = map.next_entry::<String, Sent>()? {
+            values.insert(key.clone(), item.value);
+            ordered.push((key, item.ordered));
+        }
+        Ok(Sent { value: JsonValue::Object(values), ordered: ignis_grammar::json::Json::Obj(ordered) })
+    }
+}
+
+/// A number in both shapes, the grammar's spelt as serde_json writes it.
+fn sent_number(value: JsonValue) -> Sent {
+    let ordered = match &value {
+        JsonValue::Null => ignis_grammar::json::Json::Null,
+        number => ignis_grammar::json::Json::Num(number.to_string()),
+    };
+    Sent { value, ordered }
+}
+
 /// The opening `"required"` forces (spec server/11): the call and its
 /// function tag up to the name. It stops before the `=`, which this
 /// tokenizer merges into the name's first token (`=read`, `=get`): a step
@@ -2814,8 +3007,11 @@ struct ChatCompletionsRequest {
     /// least 1; absent or `null` takes the server's `--model-thinking-budget`.
     thinking_budget: Option<JsonValue>,
     /// The tool definitions (GitHub #132) — opaque JSON, validated
-    /// shallowly and passed to the template as-is (`resolve_tools`).
-    tools: Option<Vec<JsonValue>>,
+    /// shallowly and passed to the template as-is (`resolve_tools`). Each
+    /// also kept in its key order as sent: a strict tool's `parameters`
+    /// keep theirs, which its held calls' arguments follow (GitHub #611).
+    #[schema(value_type = Option<Vec<JsonValue>>)]
+    tools: Option<Vec<Sent>>,
     /// `"auto"` (default), `"none"`, `"required"`, or `{"type": "function",
     /// "function": {"name": ...}}` naming one of `tools`. The last two
     /// force the call's opening (GitHub #286): from the first token with
@@ -2971,7 +3167,16 @@ async fn chat_completions(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
-    let (tools, tool_choice) = match resolve_tools(req.tools, req.tool_choice) {
+    // The tools as values, and in their key order as sent, for a strict
+    // tool's (#611).
+    let (sent_tools, raw_tools): (Option<Vec<JsonValue>>, Option<Vec<ignis_grammar::json::Json>>) = match req.tools {
+        Some(tools) => {
+            let (values, ordered) = tools.into_iter().map(|tool| (tool.value, tool.ordered)).unzip();
+            (Some(values), Some(ordered))
+        }
+        None => (None, None),
+    };
+    let (tools, tool_choice) = match resolve_tools(sent_tools, req.tool_choice) {
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
@@ -2996,15 +3201,23 @@ async fn chat_completions(
         Ok(held) => held,
         Err(response) => return response,
     };
+    // GitHub #611: strict tools' calls are held on a turn that may call any
+    // tool and answers freely, and admitted everywhere else, where #615
+    // holds them.
+    let holds = matches!(tool_choice, ToolChoice::Auto) && held.is_none() && !one_call;
+    let held_tools = match held_tools(&server, raw_tools.as_deref().unwrap_or_default(), &tools, holds, &thinking) {
+        Ok(held_tools) => held_tools.unwrap_or(HeldTools { grammar: None, held: Default::default() }),
+        Err(response) => return response,
+    };
     let (grammar, description) = match held {
         Some(held) => (Some(held.grammar), held.description),
-        None => (None, None),
+        None => (held_tools.grammar, None),
     };
     let (model, class) = match resolve_model_and_class(req.model, req.class) {
         Ok(x) => x,
         Err(message) => return bad_request(&message),
     };
-    let schemas = ToolSchemas::from_tools(&tools);
+    let schemas = ToolSchemas::from_tools(&tools).holding(held_tools.held);
     // The pipeline that delivers the response checks its calls (#608); the
     // first-token probe's copy below does not.
     let check = CallCheck::new(&tools, server.metrics.as_ref());

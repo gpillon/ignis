@@ -68,7 +68,7 @@ pub struct GrammarLimits {
     /// `$ref`s: deeper is refused (`references_too_deep`).
     pub max_ref_chain: usize,
     /// The longest whitespace run the model may write between two
-    /// structural bytes.
+    /// structural bytes, and between a held tool call's tags (#611).
     pub max_whitespace: u8,
     /// The memory a cache's compiled grammars may hold
     /// ([`crate::GrammarCache`]), their masks and string tables included:
@@ -160,10 +160,10 @@ pub(crate) struct LitTrie {
 }
 
 impl LitTrie {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { edges: vec![Vec::new()], terminal: vec![false] }
     }
-    fn add(&mut self, s: &[u8]) {
+    pub(crate) fn add(&mut self, s: &[u8]) {
         let mut cur = 0usize;
         for &b in s {
             cur = match self.edges[cur].iter().find(|(c, _)| *c == b) {
@@ -190,6 +190,23 @@ impl LitTrie {
     #[inline]
     pub fn leaf(&self, pos: u32) -> bool {
         self.edges[pos as usize].is_empty()
+    }
+    /// Every string the set holds, in no particular order (a held tool's
+    /// `enum` read back, #611).
+    pub(crate) fn strings(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut stack = vec![(0u32, Vec::new())];
+        while let Some((pos, path)) = stack.pop() {
+            if self.terminal(pos) {
+                out.push(path.clone());
+            }
+            for &(b, next) in &self.edges[pos as usize] {
+                let mut longer = path.clone();
+                longer.push(b);
+                stack.push((next, longer));
+            }
+        }
+        out
     }
 }
 

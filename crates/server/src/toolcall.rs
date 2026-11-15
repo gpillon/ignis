@@ -138,6 +138,12 @@ pub struct ToolSchemas {
     /// (`"string"`, `"integer"`, ...). An empty list is an untyped
     /// parameter.
     functions: HashMap<String, HashMap<String, Vec<String>>>,
+    /// The **held tools** (GitHub #611), by function name, with what the
+    /// confirmed close knows of each, their parameters in the schema's
+    /// order: set only beside the grammar that holds their calls
+    /// ([`ToolSchemas::holding`]), so that every scanner of the response
+    /// reads those calls as the grammar does.
+    held: HashMap<String, call::Parameters>,
 }
 
 /// The call check of one response (GitHub #608, ADR 0094): every function
@@ -349,7 +355,17 @@ impl ToolSchemas {
                 .collect();
             functions.insert(name.to_string(), params);
         }
-        Self { functions }
+        Self { functions, held: HashMap::new() }
+    }
+
+    /// The same schemas, whose calls to these held tools (function name →
+    /// what the confirmed close knows of it, its parameters declared in the
+    /// schema's order) every scanner reads by the confirmed close
+    /// ([`ToolCallScanner::holding`]), delivering their arguments in the
+    /// schema's order (GitHub #611). For a request whose content the tool
+    /// calls' grammar holds, and only then.
+    pub fn holding(self, held: HashMap<String, call::Parameters>) -> Self {
+        Self { held, ..self }
     }
 
     fn param_types(&self, function: &str, param: &str) -> &[String] {
@@ -429,16 +445,18 @@ impl ToolCallScanner {
         Self::with_schemas(ToolSchemas::default())
     }
 
-    /// A scanner that types each argument by the request's `tools`.
+    /// A scanner that types each argument by the request's `tools`, and
+    /// reads the calls of the held tools they carry
+    /// ([`ToolSchemas::holding`]) by the confirmed close.
     pub fn with_schemas(schemas: ToolSchemas) -> Self {
         Self {
             state: State::Scanning,
             hold: String::new(),
             next_index: 0,
+            held: schemas.held.clone(),
             schemas,
             check: None,
             ends_at_first_call: false,
-            held: HashMap::new(),
         }
     }
 
@@ -530,7 +548,11 @@ impl ToolCallScanner {
                         (len, block, matches!(cuts, Cuts::Confirmed(_)))
                     };
                     let body: String = self.hold.drain(..len).collect();
-                    let parsed = block.as_ref().map(|block| (body[block.name.clone()].to_string(), arguments(&body, block, &self.schemas)));
+                    let parsed = block.as_ref().map(|block| {
+                        let name = &body[block.name.clone()];
+                        let order = self.held.get(name).filter(|_| held);
+                        (name.to_string(), arguments(&body, block, &self.schemas, order))
+                    });
                     if let Some(check) = &self.check {
                         check.count(parsed.as_ref().map(|(name, arguments)| (name.as_str(), arguments.as_str())));
                         if let (Some(block), false) = (&block, held) {
@@ -746,8 +768,10 @@ fn read_held_call(text: &str, parameters: &call::Parameters) -> Option<(usize, B
 
 /// The JSON arguments of `block`, read from `text`: each value trimmed of
 /// one newline either side and typed by `schemas`; a parameter written
-/// twice keeps its last value.
-fn arguments(text: &str, block: &Block, schemas: &ToolSchemas) -> String {
+/// twice keeps its last value. Keys sorted, or, for a held tool's call
+/// (`order`: its parameters, declared in the schema's order), in the
+/// schema's order (GitHub #611).
+fn arguments(text: &str, block: &Block, schemas: &ToolSchemas, order: Option<&call::Parameters>) -> String {
     let name = &text[block.name.clone()];
     let mut args = serde_json::Map::new();
     for value in &block.values {
@@ -755,7 +779,16 @@ fn arguments(text: &str, block: &Block, schemas: &ToolSchemas) -> String {
         let types = schemas.param_types(name, param);
         args.insert(param.to_string(), parse_argument_value(trim_one_newline(&text[value.text.clone()]), types));
     }
-    serde_json::to_string(&serde_json::Value::Object(args)).expect("a Map<String, Value> always serializes")
+    let Some(order) = order else {
+        return serde_json::to_string(&serde_json::Value::Object(args)).expect("a Map<String, Value> always serializes");
+    };
+    // serde_json's compact form, a key at a time: no map here keeps an order.
+    let fields: Vec<String> = order
+        .declared()
+        .iter()
+        .filter_map(|key| args.get(key).map(|value| format!("{}:{}", JsonValue::String(key.clone()), value)))
+        .collect();
+    format!("{{{}}}", fields.join(","))
 }
 
 /// Trims exactly one leading and one trailing `\n` (the template's own
@@ -1627,5 +1660,180 @@ mod tests {
         let events = scanner.feed(&format!("{FIRST}\n{SECOND}"));
         assert!(!scanner.ended());
         assert_eq!(calls(&events).len(), 2);
+    }
+
+    // ── #611: what the grammar holds is what the parser delivers ─────────
+
+    /// The held tools as sent: `write_file` (two free strings and an enum)
+    /// and `get_time` (a pattern and a format), strict; `search`, free.
+    const HELD_TOOLS: &str = r#"[
+        {"type":"function","function":{"name":"write_file","strict":true,"parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["w","a"]}},"required":["path","content","mode"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"get_time","strict":true,"parameters":{"type":"object","properties":{"zone":{"type":"string","pattern":"^[A-Z][a-z]+/[A-Z][a-z]+$"},"day":{"type":"string","format":"date"}},"required":["zone","day"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"search","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}}
+    ]"#;
+
+    /// The tools' grammar over a vocabulary of single bytes, a scanner that
+    /// reads their calls as a held request's do, and each strict tool's
+    /// `parameters` for the validator.
+    fn held_parts() -> (std::sync::Arc<ignis_grammar::ToolCallGrammar>, impl Fn() -> ToolCallScanner, HashMap<String, ignis_grammar::json::Json>) {
+        use ignis_grammar::json::Json;
+        let tools: Vec<JsonValue> = serde_json::from_str(HELD_TOOLS).unwrap();
+        let Json::Arr(sent) = Json::parse(HELD_TOOLS).unwrap() else { unreachable!() };
+        let declared: Vec<ignis_grammar::DeclaredTool> = sent
+            .iter()
+            .map(|tool| {
+                let function = tool.get("function").unwrap();
+                ignis_grammar::DeclaredTool {
+                    name: function.get("name").unwrap().as_str().unwrap().to_owned(),
+                    strict: (function.get("strict") == Some(&Json::Bool(true))).then(|| function.get("parameters").unwrap().compact()),
+                }
+            })
+            .collect();
+        let parameters = sent
+            .iter()
+            .filter_map(|tool| {
+                let function = tool.get("function").unwrap();
+                (function.get("strict") == Some(&Json::Bool(true)))
+                    .then(|| (function.get("name").unwrap().as_str().unwrap().to_owned(), function.get("parameters").unwrap().clone()))
+            })
+            .collect();
+        let vocab = ignis_grammar::Vocab::new((0..=255u8).map(|b| ignis_grammar::VocabEntry::Text(vec![b])).collect(), &[]);
+        let grammar = ignis_grammar::GrammarCache::new(vocab, 1 << 26).tool_calls(&declared).unwrap();
+        let held: HashMap<String, call::Parameters> = grammar.held().map(|(name, p)| (name.to_owned(), p.clone())).collect();
+        let scanner = move || ToolCallScanner::with_schemas(ToolSchemas::from_tools(&tools).holding(held.clone()));
+        (grammar, scanner, parameters)
+    }
+
+    /// Everything the grammar accepts, the parser delivers as calls to the
+    /// declared tools whose held arguments the validator finds valid: texts
+    /// grown from the dialect's pieces, each piece taken only where the
+    /// grammar takes it, read back by the scanner in random chunks.
+    #[test]
+    fn what_the_grammar_accepts_the_parser_delivers_valid() {
+        const PIECES: &[&str] = &[
+            "<tool_call>", "\n", "<function=write_file>", "<function=get_time>", "<function=search>", "<parameter=path>",
+            "<parameter=content>", "<parameter=mode>", "<parameter=zone>", "<parameter=day>", "<parameter=query>",
+            "<parameter=x>", "</parameter>", "</function>", "</tool_call>", "a.txt", "w", "a", "x", " ", "\t", "<", "</",
+            "Europe/Rome", "2026-11-15", "é", "hello\n", "</div>", "\r\n",
+            // Whole steps, so that many texts finish their calls.
+            "<parameter=path>\na.txt\n</parameter>\n", "<parameter=content>\nhi\n</parameter>\n", "<parameter=mode>\nw\n</parameter>\n",
+            "<parameter=zone>\nEurope/Rome\n</parameter>\n", "<parameter=day>\n2026-11-15\n</parameter>\n", "</function>\n</tool_call>",
+        ];
+        let (grammar, scanner, parameters) = held_parts();
+        let mut next = generator(0x5DEE_CE66_D1CE_4E5B);
+        let (mut texts, mut delivered) = (0, 0);
+        for _ in 0..3_000 {
+            let mut m = ignis_grammar::ToolCallMatcher::new(grammar.clone());
+            let (mut text, mut free_at, mut opened_at) = (String::new(), 0, 0);
+            // The calls closed, held and free, as of the last point in free text.
+            let (mut closes, mut closes_at_free) = ((0, 0), (0, 0));
+            for _ in 0..(next() % 400) {
+                let piece = PIECES[next() as usize % PIECES.len()];
+                let was_in_call = m.in_call();
+                if m.accept_bytes(piece.as_bytes()) {
+                    if !was_in_call && m.in_call() {
+                        opened_at = text.len();
+                    }
+                    text.push_str(piece);
+                    if was_in_call && !m.in_call() {
+                        let name = text[opened_at..].split_once(FUNCTION_PREFIX).and_then(|(_, rest)| rest.split_once('>')).map(|(name, _)| name);
+                        match parameters.contains_key(name.unwrap_or_default()) {
+                            true => closes.0 += 1,
+                            false => closes.1 += 1,
+                        }
+                    }
+                    if !m.in_call() {
+                        (free_at, closes_at_free) = (text.len(), closes);
+                    }
+                }
+            }
+            // The text up to its last point in free text: every call it opened closed.
+            let text = &text[..free_at];
+            let events = scan(scanner(), &chunked(text, &mut next));
+            let calls = calls(&events);
+            // Every held call is delivered; a free one, whose body the grammar
+            // leaves free, may be dropped as today, its `</function>` unwritten.
+            let held = calls.iter().filter(|call| parameters.contains_key(&call.name)).count();
+            assert_eq!(held, closes_at_free.0, "{text:?}");
+            assert!(calls.len() - held <= closes_at_free.1, "{text:?}");
+            for call in &calls {
+                let arguments = ignis_grammar::json::Json::parse(&call.arguments).unwrap();
+                match parameters.get(&call.name) {
+                    Some(schema) => assert!(ignis_grammar::validate::is_valid(schema, &arguments), "{} {} from {text:?}", call.name, call.arguments),
+                    None => assert_eq!(call.name, "search", "{text:?}"),
+                }
+            }
+            // Free text may hold the call's other tags; an opener always opens a call.
+            assert!(!content(&events).contains("<tool_call>"), "{text:?}");
+            texts += 1;
+            delivered += calls.len();
+        }
+        assert!(delivered > 500, "{delivered} calls from {texts} texts");
+    }
+
+    /// Every valid call written in the template's form is accepted, the
+    /// parser reading back what was written, except the ones the grammar
+    /// leaves out by name: the residue (a value the parser itself ends
+    /// early) and spike S1's two miss points (while a required parameter is
+    /// missing, a free value's line starting `</function`, or a
+    /// `</parameter>` line followed by `</`).
+    #[test]
+    fn every_valid_call_in_the_templates_form_is_accepted() {
+        const TEXT: &[&str] = &[
+            "a", "x y", "\n", "<parameter=path>", "<parameter=mode>", "</parameter>", "</function>", "</tool_call>",
+            "<tool_call>", "<div>", "</div>", " ", "\t", "é", "<", "</", "parameter", "function", "\r\n", "line\n",
+        ];
+        let (grammar, scanner, parameters) = held_parts();
+        let mut next = generator(0x2545_F491_4F6C_DD1D);
+        let mut free = || -> String { (0..next() % 6).map(|_| TEXT[next() as usize % TEXT.len()]).collect() };
+        let mut next = generator(0x9E37_79B9_7F4A_7C15);
+        let (mut accepted, mut residue, mut miss_points) = (0, 0, 0);
+        for _ in 0..4_000 {
+            let (name, mut args): (&str, Vec<(&str, String)>) = match next() % 3 {
+                0 => ("get_time", vec![("zone", ["Europe/Rome", "America/Lima"][next() as usize % 2].into()), ("day", ["2026-11-15", "1999-02-28"][next() as usize % 2].into())]),
+                _ => ("write_file", vec![("path", free()), ("content", free()), ("mode", ["w", "a"][next() as usize % 2].into())]),
+            };
+            for i in (1..args.len()).rev() {
+                args.swap(i, next() as usize % (i + 1));
+            }
+            let mut text = format!("<tool_call>\n<function={name}>\n");
+            for (k, v) in &args {
+                text.push_str(&format!("<parameter={k}>\n{v}\n</parameter>\n"));
+            }
+            text.push_str("</function>\n</tool_call>");
+            // What the parser reads back, against what was written.
+            let events = scan(scanner(), &[&text]);
+            let read = calls(&events).first().map(|call| call.arguments.clone());
+            let written: serde_json::Map<String, JsonValue> = args.iter().map(|(k, v)| (k.to_string(), JsonValue::String(v.clone()))).collect();
+            let same = read.as_deref().and_then(|a| serde_json::from_str::<serde_json::Map<String, JsonValue>>(a).ok()) == Some(written);
+            if !same {
+                residue += 1;
+                continue;
+            }
+            // While a later parameter is still to write, a free value may not
+            // hold the two miss points, read with the closer line the
+            // template writes after it: a line starting `</function`, and a
+            // line starting `</parameter>` whose whitespace, across lines,
+            // runs on to a `</`.
+            let misses = args.iter().take(args.len() - 1).filter(|(k, _)| matches!(*k, "path" | "content")).any(|(_, v)| {
+                let read = format!("{v}\n</parameter>");
+                let starts = std::iter::once(0).chain(read.match_indices('\n').map(|(at, _)| at + 1));
+                starts.into_iter().any(|at| {
+                    let line = &read[at..];
+                    line.starts_with("</function")
+                        || line.strip_prefix("</parameter>").is_some_and(|rest| rest.trim_start_matches([' ', '\t', '\r', '\n']).starts_with("</"))
+                })
+            });
+            let mut m = ignis_grammar::ToolCallMatcher::new(grammar.clone());
+            let taken = m.accept_bytes(text.as_bytes()) && !m.in_call();
+            if misses {
+                miss_points += 1;
+                continue;
+            }
+            assert!(taken, "{text:?}");
+            assert!(ignis_grammar::validate::is_valid(&parameters[name], &ignis_grammar::json::Json::parse(&read.unwrap()).unwrap()));
+            accepted += 1;
+        }
+        assert!(accepted > 2_000 && residue > 0 && miss_points > 0, "{accepted} accepted, {residue} residue, {miss_points} at the miss points");
     }
 }

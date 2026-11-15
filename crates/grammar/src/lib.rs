@@ -26,6 +26,10 @@
 //!   the grammar's property tests.
 //! - [`call`]: where a value of a held tool's call ends (#610), the one
 //!   rule over bytes that the call parser and the call's grammar share.
+//! - [`ToolCallGrammar`] and [`ToolCallMatcher`] (#611): the grammar of a
+//!   request's tool calls, when it has a **strict tool**: free text in which
+//!   each call names a declared tool and a held tool's call is held to its
+//!   parameters, compiled by [`GrammarCache::tool_calls`].
 //!
 //! It is our own Rust (no grammar engine), CPU-only; `regex-automata` builds
 //! the DFAs of `pattern` and `format`.
@@ -40,6 +44,7 @@ mod number;
 mod regex;
 mod schema;
 mod string;
+mod tool_calls;
 pub mod validate;
 mod vocab;
 
@@ -52,6 +57,7 @@ pub use schema::{
     Grammar, GrammarLimits, Inert, Refusal, ANNOTATIONS, DEFAULT_MAX_DEPTH, DEFAULT_MAX_REF_CHAIN, DEFAULT_MAX_WS_RUN,
     FORMATS, MAX_ENUM_VALUES, MAX_NESTING, MAX_PROPERTIES, MAX_SCHEMA_CHARS, STRICT_SUBSET,
 };
+pub use tool_calls::{DeclaredTool, ToolCallGrammar, ToolCallMatcher, ToolField, ToolRefusal};
 pub use vocab::{Vocab, VocabEntry};
 
 use automaton::{Config, Frame, State};

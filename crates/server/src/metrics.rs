@@ -622,9 +622,10 @@ impl MicrosHistogram {
     }
 }
 
-/// The two types `response_format` can ask for, in the order of the
-/// `type` label's series (#593).
-const STRUCTURED_KINDS: [StructuredKind; 2] = [StructuredKind::JsonObject, StructuredKind::JsonSchema];
+/// The two types `response_format` can ask for, and the tool calls a
+/// request with a strict tool holds (#611), in the order of the `type`
+/// label's series (#593).
+const STRUCTURED_KINDS: [StructuredKind; 3] = [StructuredKind::JsonObject, StructuredKind::JsonSchema, StructuredKind::Tool];
 
 /// `ignis_tool_calls_total`'s `outcome` label (GitHub #608), in the order of
 /// its series: [`CallVerdict`]'s three.
@@ -1715,12 +1716,12 @@ impl Metrics {
             for (name, help, series) in [
                 (
                     "ignis_structured_requests_total",
-                    "Completed requests held to a grammar, by the response_format type.",
+                    "Completed requests held to a grammar, by the response_format type, or tool for a strict tool's calls.",
                     &self.structured_requests,
                 ),
                 (
                     "ignis_structured_misses_total",
-                    "Sampled tokens of a structured answer the grammar rejected, by type.",
+                    "Sampled tokens of a structured answer or a held tool call the grammar rejected, by type.",
                     &self.structured_misses,
                 ),
                 (
@@ -1737,7 +1738,7 @@ impl Metrics {
             self.structured_repair_time.render(
                 &mut out,
                 "ignis_structured_repair_seconds",
-                "Time to repair one rejected token of a structured answer.",
+                "Time to repair one rejected token of a structured answer or a held tool call.",
             );
         }
         // GitHub #608: tool calls, absent until a call block was read or a

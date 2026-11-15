@@ -36,6 +36,18 @@ and repairs a miss, and it does not write the call's envelope for the model.
     them moves, then whole. The scanner checks only with metrics on, so a server without them does no work.
 - **Checked, not pre-written.** The grammar arms on the `<tool_call>` token, in the content channel only, and is
   released at the call's close. Each further call arms it again.
+  - It is one byte automaton over the request's content (#611), `ignis_grammar::ToolCallGrammar`, compiled per
+    distinct set of declared tools and cached with the schema grammars. Outside a call every token passes, a
+    stop included. The opener arms it as the parser reads it: the added token, or the same text in bytes. The call
+    names a declared tool. A tool that is not held keeps free arguments to its first `</tool_call>`, the parser's
+    rule for it, where a stop also passes. A held tool's call is read by `call::line` on the bytes since each
+    undecided line start, so the grammar and the parser end each value at the same byte.
+  - The scheduler holds it as it holds an answer (`StructuredKind::Tool`). Every draw of the content is checked,
+    and a verified run is cut at its first miss inside a call. The turn is never released from the grammar,
+    since the automaton releases and re-arms itself. The prefill's draw keeps no scores unless a token of the
+    vocabulary holds the opener's text with more after it, which no token of the 27B's does.
+  - The tokenizer's added tokens are read as the text the decoder writes for them. A column with no text passes
+    outside a held call and is a miss inside one.
   - Where the grammar allows a single continuation, a repair is the forcing.
   - Writing the envelope as a forced literal was rejected, for three reasons. The envelope is known only after
     the model chose to call and which tool. A forced literal commits one token per round, and a round with a
@@ -48,7 +60,10 @@ and repairs a miss, and it does not write the call's envelope for the model.
     under another name.
   - No parameter is written twice.
   - `</function>` is allowed only once every required parameter is written.
-  - The JSON delivered follows the schema's order.
+  - The JSON delivered follows the schema's order. Chat completions read each of `tools` once into two values, by
+    the deserializer that read it before (its nesting bound and its errors unchanged): `serde_json`'s, which every
+    reader takes, and the grammar crate's, which keeps a strict tool's `parameters` in the client's key order. The
+    workspace's `serde_json` keeps no order (#611).
 - **A value ends only where the call continues.** A tag on its own line counts only when it is a valid next step
   of this call under the schema:
   - `<parameter=K>`, for a K the tool declares and the call has not written yet;
@@ -73,6 +88,16 @@ and repairs a miss, and it does not write the call's envelope for the model.
   - Two alternatives were rejected. Ending a value at any of the three tags would forbid them in every string.
     Escapes are a convention the model never learned.
   - The residue: a string value cannot contain this call's own confirmed close.
+  - The grammar bounds the whitespace the rule leaves open, between a step's tags, before `<function=` and before
+    the first parameter, at `model.grammar_max_whitespace` (48): the byte past it is a miss, so the parser never
+    reads a step the grammar did not allow (#611).
+  - A string held to an `enum`, a `const`, a `pattern` or a `format` is written on one line that does not start
+    with one of the dialect's tags (`<parameter=`, `</parameter>`, `</function>`). A value's end is then never in
+    doubt, and the grammar stays free of dead ends without a search over its lines. A value of a strict tool
+    outside that is refused (below). It is the grammar's subset of the valid calls, as ADR 0089's grammar
+    writes a subset of the valid documents. A free string's lines are free, the miss points below aside.
+  - A value of another type (integer, number, boolean, object, array, a union with `null`) is free text until
+    #612, which holds it to its subschema. The call around it is held.
   - The rule is not extended to tools that are not held, and the extension is weighed by a count: with metrics on,
     `ignis_tool_call_values_split_total` (an amendment of ADR 0017 beside #608's family). It counts the string
     values of those tools' calls from which the first-occurrence cuts dropped text after a tag, text the confirmed
@@ -88,7 +113,11 @@ and repairs a miss, and it does not write the call's envelope for the model.
   - After `</parameter>` and its newline, `</` is a miss.
   - Inside a value, `function` after a line-start `</` is a miss.
 
-  How often the repair then reaches the missing parameter is measured on the GPU.
+  In bytes (#611): while a required parameter is missing, a free string's line may not start `</function`, and a
+  line that starts `</parameter>` may not go on, after its whitespace, with `</`. Text that only looks like either
+  (`</footer>`, `</parameter>x`) stays the value's. After a held string's line, and before the first parameter,
+  the next line must be a step, so the same two tokens are misses there by the rule itself. How often the repair
+  then reaches the missing parameter is measured on the GPU.
 - **Omitted parameters.**
   - For a strict tool, a nullable parameter may be omitted, and the JSON carries `null`.
   - For a normalized tool, an optional parameter may be omitted, and stays omitted, so the JSON is valid under
@@ -97,6 +126,16 @@ and repairs a miss, and it does not write the call's envelope for the model.
 - **Refusals.**
   - `strict: true` with a schema outside OpenAI's strict subset is a 400 naming the constraint, as
     `response_format` is.
+    - The code is the grammar's own, and `param` is `tools[i].function.parameters`. `minLength` and `maxLength`
+      are among the refused keywords, so no strict tool has a length bound to hold.
+    - A strict tool the dialect cannot hold is refused by name, the same way: a name holding `>` or
+      `</tool_call` (`tool_name_unwritable`, `param` `tools[i].function.name`), a name another tool of the
+      request shares (`duplicate_tool_name`), a parameter whose name holds `>` (`parameter_name_unwritable`),
+      and a held string with no value it can write on one line (`no_writable_value`).
+    - A tool that is not held is never refused for its name: one the dialect cannot write is just not callable.
+    - Every strict tool is compiled when the request arrives, on every chat path, a forced `tool_choice`, one
+      beside `response_format` and one under `parallel_tool_calls: false` included. Those three serve the call as
+      the model writes it until #615 holds it there.
   - A schema that cannot be normalized leaves the tool free, and the response echoes `strict: false`, as
     OpenAI's fallback does. It is never a 400.
 - **Scope.**
@@ -105,3 +144,8 @@ and repairs a miss, and it does not write the call's envelope for the model.
   - A request with no held tool changes by no byte. When one is present, the function name is held to the
     declared tools.
   - `parallel_tool_calls: false` ends the turn at the first call's close, on every model, and needs no grammar.
+  - Chat completions hold strict tools from #611, and the Responses API from #613. Until then its `strict` stays
+    inert, as the field contract says.
+  - A held call's misses and repairs are structured output's: ADR 0089's three counters gain the `type` value
+    `tool` (this ADR's amendment of ADR 0017 and ADR 0089), the Playground Monitor's Structured output card
+    counts them, and the request's log line carries `structured.type = "tool"` with its misses and repairs.

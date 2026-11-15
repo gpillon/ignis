@@ -389,20 +389,24 @@ export const THINKING_FORCED_CLOSES = `# HELP ignis_thinking_forced_closes_total
 ignis_thinking_forced_closes_total 3
 `;
 
-// Structured output (#593): the first request held to a grammar renders every series.
-export const STRUCTURED_FAMILIES = `# HELP ignis_structured_requests_total Completed requests held to a grammar, by the response_format type.
+// Structured output (#593): the first request held to a grammar renders every series,
+// the tool calls a strict tool's requests hold among them (#611).
+export const STRUCTURED_FAMILIES = `# HELP ignis_structured_requests_total Completed requests held to a grammar, by the response_format type, or tool for a strict tool's calls.
 # TYPE ignis_structured_requests_total counter
 ignis_structured_requests_total{type="json_object"} 20
 ignis_structured_requests_total{type="json_schema"} 0
-# HELP ignis_structured_misses_total Sampled tokens of a structured answer the grammar rejected, by type.
+ignis_structured_requests_total{type="tool"} 4
+# HELP ignis_structured_misses_total Sampled tokens of a structured answer or a held tool call the grammar rejected, by type.
 # TYPE ignis_structured_misses_total counter
 ignis_structured_misses_total{type="json_object"} 6
 ignis_structured_misses_total{type="json_schema"} 0
+ignis_structured_misses_total{type="tool"} 0
 # HELP ignis_structured_repairs_total Rejected tokens sampled again under the grammar, by type.
 # TYPE ignis_structured_repairs_total counter
 ignis_structured_repairs_total{type="json_object"} 6
 ignis_structured_repairs_total{type="json_schema"} 0
-# HELP ignis_structured_repair_seconds Time to repair one rejected token of a structured answer.
+ignis_structured_repairs_total{type="tool"} 0
+# HELP ignis_structured_repair_seconds Time to repair one rejected token of a structured answer or a held tool call.
 # TYPE ignis_structured_repair_seconds histogram
 ignis_structured_repair_seconds_bucket{le="0.00005"} 0
 ignis_structured_repair_seconds_bucket{le="0.0001"} 2

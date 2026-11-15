@@ -518,16 +518,26 @@ impl TemplateProvider for ArtifactTemplateProvider {
                         return None;
                     }
                 };
+                // An added token is a control token to a schema's grammar; a
+                // tool call's grammar reads it as the text the decoder writes
+                // for it (GitHub #611), the tags of the call among them.
+                let mut added = Vec::new();
                 let entries = table
                     .into_iter()
-                    .map(|entry| match entry {
+                    .enumerate()
+                    .map(|(id, entry)| match entry {
                         ignis_artifact::TokenBytes::Text(bytes) => ignis_grammar::VocabEntry::Text(bytes),
-                        ignis_artifact::TokenBytes::Added { .. } => ignis_grammar::VocabEntry::Control,
+                        ignis_artifact::TokenBytes::Added { .. } => {
+                            if let Ok(text) = self.set.tokenizer().decode(&[id as TokenId]) {
+                                added.push((id as TokenId, text.into_bytes()));
+                            }
+                            ignis_grammar::VocabEntry::Control
+                        }
                         ignis_artifact::TokenBytes::Absent => ignis_grammar::VocabEntry::Absent,
                     })
                     .collect();
                 let vocab = ignis_grammar::Vocab::new(entries, &[vocabulary.stop]);
-                Some(Arc::new(ignis_grammar::GrammarCache::within(vocab, vocabulary.limits)))
+                Some(Arc::new(ignis_grammar::GrammarCache::within(vocab, vocabulary.limits).with_added_texts(added)))
             })
             .clone()
     }

@@ -503,8 +503,9 @@ config_group! {
         /// it compiles: deeper is refused (`references_too_deep`).
         grammar_max_ref_chain: Levels = super::DEFAULT_GRAMMAR_MAX_REF_CHAIN, between(1, 1024), ALL, [Visible];
         /// The longest run of whitespace structured output lets the model
-        /// write between two of the answer's tokens, so an answer never
-        /// streams whitespace without end.
+        /// write between two of the answer's tokens, and between the tags of
+        /// a strict tool's call, so an answer never streams whitespace
+        /// without end.
         grammar_max_whitespace: Chars = super::DEFAULT_GRAMMAR_MAX_WHITESPACE, between(1, 255), ALL, [Visible];
         /// The 27B's adaptation (ADR 0063): when its VRAM plan refuses a
         /// `max_context` the profile or the default gave, the load lowers it

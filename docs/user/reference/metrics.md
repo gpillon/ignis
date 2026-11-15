@@ -83,10 +83,10 @@ The metrics listener (on by default, keyless, on loopback) serves these in the P
 | `ignis_speech_queue_length` | gauge | Batch transcriptions waiting behind the one running. | on a server that has been asked for a transcription |
 | `ignis_speech_sessions_open` | gauge | Realtime transcription sessions open. | on a server that has been asked for a transcription |
 | `ignis_speech_transcriptions_total` | counter | Transcriptions ended, by executor and outcome. | on a server that has been asked for a transcription |
-| `ignis_structured_misses_total` | counter | Sampled tokens of a structured answer the grammar rejected, by type. | once a request held to a grammar (`response_format`) has ended |
-| `ignis_structured_repair_seconds` | histogram | Time to repair one rejected token of a structured answer. | once a request held to a grammar (`response_format`) has ended |
-| `ignis_structured_repairs_total` | counter | Rejected tokens sampled again under the grammar, by type. | once a request held to a grammar (`response_format`) has ended |
-| `ignis_structured_requests_total` | counter | Completed requests held to a grammar, by the response_format type. | once a request held to a grammar (`response_format`) has ended |
+| `ignis_structured_misses_total` | counter | Sampled tokens of a structured answer or a held tool call the grammar rejected, by type. | once a request held to a grammar (`response_format`, or a strict tool's calls) has ended |
+| `ignis_structured_repair_seconds` | histogram | Time to repair one rejected token of a structured answer or a held tool call. | once a request held to a grammar (`response_format`, or a strict tool's calls) has ended |
+| `ignis_structured_repairs_total` | counter | Rejected tokens sampled again under the grammar, by type. | once a request held to a grammar (`response_format`, or a strict tool's calls) has ended |
+| `ignis_structured_requests_total` | counter | Completed requests held to a grammar, by the response_format type, or tool for a strict tool's calls. | once a request held to a grammar (`response_format`, or a strict tool's calls) has ended |
 | `ignis_thinking_forced_closes_total` | counter | Completed requests whose reasoning block the thinking budget closed. | once the thinking budget has closed a reasoning block |
 | `ignis_tokenize_requests_total` | counter | Calls to the counting routes, which never enter the scheduler, by route. | after the first call to a counting route |
 | `ignis_tool_call_values_split_total` | counter | String values of calls to tools that are not held, from which the parser dropped text after a tag inside them that a held tool's rule, the confirmed close, would have kept in the value. | once the model wrote a tool call, or a strict tool came outside the strict subset |

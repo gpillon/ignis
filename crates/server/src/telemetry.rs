@@ -2512,6 +2512,11 @@ mod tests {
             telemetry.note_submit(4, 3, RequestClass::Interactive);
             telemetry.on_miss(4, Some(1));
             telemetry.on_cancelled(4, CancelCause::Consumer);
+            // A strict tool's held calls (#611): one miss, repaired.
+            telemetry.note_submit(5, 3, RequestClass::Interactive);
+            telemetry.note_structured(5, StructuredKind::Tool);
+            telemetry.on_miss(5, Some(60));
+            telemetry.on_stopped(5, 9);
         });
         let line = |name: &str, id: u64| {
             events
@@ -2538,6 +2543,12 @@ mod tests {
         assert_eq!((&gone["structured.misses"], &gone["structured.repairs"]), (&json!(0), &json!(0)), "{gone}");
         let free = line("ignis.request.cancelled", 4);
         assert!(free.get("structured.type").is_none() && free.get("structured.misses").is_none(), "{free}");
+        let tool = line("ignis.request.done", 5);
+        assert_eq!(
+            (&tool["structured.type"], &tool["structured.misses"], &tool["structured.repairs"]),
+            (&json!("tool"), &json!(1), &json!(1)),
+            "{tool}"
+        );
 
         let text = metrics.render();
         for line in [
@@ -2546,7 +2557,10 @@ mod tests {
             "ignis_structured_misses_total{type=\"json_schema\"} 2",
             "ignis_structured_misses_total{type=\"json_object\"} 0",
             "ignis_structured_repairs_total{type=\"json_schema\"} 1",
-            "ignis_structured_repair_seconds_count 1",
+            "ignis_structured_requests_total{type=\"tool\"} 1",
+            "ignis_structured_misses_total{type=\"tool\"} 1",
+            "ignis_structured_repairs_total{type=\"tool\"} 1",
+            "ignis_structured_repair_seconds_count 2",
         ] {
             assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
         }
