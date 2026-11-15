@@ -71,12 +71,19 @@ fn encode(text: &str) -> Vec<TokenId> {
     ids
 }
 
-/// The placeholder's prompt, the vocabulary's text back out, its grammars.
+/// The placeholder's prompt, the vocabulary's text back out, its grammars;
+/// with `split_think_end`, a template that encodes `</think>` to more than
+/// one token.
 struct Vocabulary {
     grammars: Arc<GrammarCache>,
+    split_think_end: bool,
 }
 
 impl Vocabulary {
+    fn split_think_end() -> Self {
+        Self { split_think_end: true, ..Self::new() }
+    }
+
     fn new() -> Self {
         let entries = (0..VOCAB)
             .map(|id| match id {
@@ -86,7 +93,8 @@ impl Vocabulary {
             })
             .collect();
         let added = TAGS.iter().map(|(id, tag)| (*id, tag.as_bytes().to_vec())).collect();
-        Self { grammars: Arc::new(GrammarCache::new(Vocab::new(entries, &[STOP]), DEFAULT_CACHE_BYTES).with_added_texts(added)) }
+        let grammars = Arc::new(GrammarCache::new(Vocab::new(entries, &[STOP]), DEFAULT_CACHE_BYTES).with_added_texts(added));
+        Self { grammars, split_think_end: false }
     }
 }
 
@@ -101,7 +109,10 @@ impl TemplateProvider for Vocabulary {
     }
 
     fn encode_literal(&self, text: &str) -> Option<Vec<TokenId>> {
-        Some(encode(text))
+        match self.split_think_end && text == "</think>" {
+            true => Some(text.chars().map(TokenId::from).collect()),
+            false => Some(encode(text)),
+        }
     }
 
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
@@ -438,6 +449,12 @@ fn refused_tools() -> Vec<(String, &'static str, &'static str, &'static str)> {
         (strict(r#"{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}"#), "additional_properties_not_false", "tools[1].function.parameters", "`additionalProperties`"),
         (strict(r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a"],"additionalProperties":false}"#), "not_all_required", "tools[1].function.parameters", "`required`"),
         (object(r#"{"type":"string","enum":["two\nlines"]}"#), "no_writable_value", "tools[1].function.parameters", "`enum`"),
+        (
+            strict(r#"{"type":"object","properties":{"a>b":{"type":"string"}},"required":["a>b"],"additionalProperties":false}"#),
+            "parameter_name_unwritable",
+            "tools[1].function.parameters",
+            "`properties`",
+        ),
         (
             r#"{"type":"function","function":{"name":"a>b","strict":true,"parameters":{"type":"object","properties":{},"required":[],"additionalProperties":false}}}"#.into(),
             "tool_name_unwritable",
@@ -950,6 +967,61 @@ async fn on_the_responses_api_a_refused_strict_tool_is_named_where_it_was_sent()
         let (events, _, _) = socket_events("", ModelFamily::FlashNext, &body).await;
         assert_eq!(events.last().unwrap()["type"], "response.completed", "{events:?}");
     }
+}
+
+/// With thinking on, a template whose `</think>` is not one token has no
+/// token to hold the content after: a strict tool is refused, its `strict`
+/// named where it was sent (chat completions, the Responses API's flat
+/// tool, the WebSocket mode's `error` event), while a Responses tool sent
+/// without `strict` is served free, echoed `strict: false`, and beside a
+/// strict tool it is the strict one that is refused.
+#[tokio::test]
+async fn with_thinking_on_a_split_think_end_refuses_a_strict_tool_and_leaves_a_normalized_one_free() {
+    let split = |script: &str| {
+        let mock = Arc::new(MockCompute::new());
+        mock.script(0, &encode(script));
+        let scheduler = ConcreteScheduler::with_config(SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() }, mock.clone());
+        let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(Vocabulary::split_think_end()))
+            .with_request_timeout(Duration::from_secs(5))
+            .with_seedless_seed(0)
+            .with_family(ModelFamily::Qwen38_27b)
+            .with_metrics();
+        (server, mock)
+    };
+    let thinking = |body: String| body.replace("\"enable_thinking\":false", "\"enable_thinking\":true");
+    let refusal = |json: &JsonValue| (json["error"]["code"].as_str().map(str::to_owned), json["error"]["param"].as_str().map(str::to_owned));
+    let expected = |param: &str| (Some("unsupported_value".to_owned()), Some(param.to_owned()));
+
+    let (server, mock) = split("");
+    let (status, json, text) = post(&server, &thinking(chat(&[WRITE_FILE], false, 64))).await;
+    assert_eq!((status, refusal(&json)), (400, expected("tools[0].function.strict")), "{text}");
+    assert!(mock.prefill_calls().is_empty(), "nothing is generated");
+
+    let without = flat(SEARCH);
+    for (tools, param) in [(vec![flat(WRITE_FILE)], "tools[0].strict"), (vec![without.clone(), flat(WRITE_FILE)], "tools[1].strict")] {
+        let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
+        let body = thinking(responses_body(&tools, false, 64));
+        let (server, mock) = split("");
+        let request = Request::builder().method("POST").uri(RESPONSES).header("content-type", "application/json").body(Body::from(body.clone())).unwrap();
+        let response = server.app().oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let json: JsonValue = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!((status, refusal(&json)), (400, expected(param)), "{json}");
+        assert!(mock.prefill_calls().is_empty(), "nothing is generated");
+        let (server, mock) = split("");
+        let events = socket_events_of(server, &body).await;
+        assert_eq!((events.len(), events[0]["type"].as_str()), (1, Some("error")), "{events:?}");
+        assert_eq!(&events[0]["error"], &json["error"], "the socket's refusal is HTTP's");
+        assert!(mock.prefill_calls().is_empty(), "nothing is generated on the socket");
+    }
+
+    let script = call("search", &[("query", "cats"), ("limit", "many")]);
+    let (server, mock) = split(&format!("ok</think>{script}"));
+    let text = responses_text(&server, &thinking(responses_body(&[&without], false, 256))).await;
+    let response: JsonValue = serde_json::from_str(&text).unwrap();
+    assert_eq!(response["tools"][0]["strict"], false, "served free: {text}");
+    assert_eq!(delivered(&response).calls, [("search".to_owned(), r#"{"limit":"many","query":"cats"}"#.to_owned())]);
+    assert!(mock.decode_calls().iter().flatten().all(|job| !job.checked), "no round is checked");
 }
 
 /// A Responses request whose tools are sent `strict: false` is held to
