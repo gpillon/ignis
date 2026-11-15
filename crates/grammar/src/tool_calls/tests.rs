@@ -230,12 +230,17 @@ fn a_held_string_is_held_to_its_enum_pattern_and_format_on_one_line() {
 }
 
 #[test]
-fn a_value_cannot_hold_its_own_calls_confirmed_close() {
+fn a_value_cannot_hold_a_line_that_is_a_step_of_its_call() {
     let mut m = matcher();
     let head = "<tool_call>\n<function=write_file>\n<parameter=mode>\nw\n</parameter>\n<parameter=path>\na\n</parameter>\n<parameter=content>\nan example:\n";
     assert!(m.accept_bytes(head.as_bytes()));
     assert!(m.accept_bytes(b"</function>\n") && m.in_call());
     assert!(m.accept(CLOSE) && !m.in_call(), "the documented residue: the call ends there");
+    // Written first, a value ends at an opener of a parameter the call has
+    // not written yet: a `mode` that is not one of its values is then a miss.
+    let mut m = matcher();
+    assert!(m.accept_bytes(b"<tool_call>\n<function=write_file>\n<parameter=content>\ncall it so:\n<parameter=mode>\n"));
+    assert!(!m.clone().accept_bytes(b"x") && m.accept_bytes(b"w\n</parameter>\n"), "`mode`'s value now");
 }
 
 #[test]

@@ -342,6 +342,18 @@ fn scripts_that_miss() -> Vec<(&'static str, String, &'static str, u64)> {
             r#"{"path":"a.txt","content":"<parameter=path>\nb.txt\n</parameter>\n</function>\nnot the end\n</tool_call> either","mode":"w"}"#,
             0,
         ),
+        // The same kind of file written first, the order the model chose on
+        // the 27B: with `path` and `mode` still missing a line may not start
+        // `</function`, so the `n` of `</functional>` is a miss, repaired to
+        // the script's next letter, `a`; and a line opening `mode`, which
+        // the call has not written yet, ends `content` and opens the call's
+        // own `mode`, the example's `w` its value (the documented residue).
+        (
+            "a file's content written first",
+            "<tool_call>\n<function=write_file>\n<parameter=content>\nCall it so:\n</functional>\n<parameter=mode>\nw\n</parameter>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>".into(),
+            r#"{"path":"a.txt","content":"Call it so:\n</functioaal>","mode":"w"}"#,
+            1,
+        ),
     ]
 }
 
@@ -536,10 +548,10 @@ async fn a_streamed_held_call_arrives_only_once_complete() {
     assert_eq!(calls[0].1, r#"{"path":"a.txt","content":"hi","mode":"a"}"#);
 }
 
-/// A call `max_tokens` cuts is the call as generated: open, so not
-/// delivered, with `finish_reason: "length"` (#583 changes how it is sent).
+/// A call `max_tokens` cuts is left open, so dropped, as every open call
+/// is, with `finish_reason: "length"` (#583 changes how it is sent).
 #[tokio::test]
-async fn a_held_call_the_cap_cuts_returns_as_generated_with_length() {
+async fn a_held_call_the_cap_cuts_is_dropped_with_length() {
     let script = format!("Writing.\n{}", call("write_file", &[("path", "a.txt"), ("content", "a long text"), ("mode", "w")]));
     let (server, _) = server(&script, ModelFamily::Qwen38_27b);
     let (content, calls, finish) = served(&server, &chat(&[WRITE_FILE], false, 40)).await;

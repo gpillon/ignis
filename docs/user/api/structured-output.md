@@ -256,7 +256,9 @@ From 0.11.0, chat completions on the 27B hold the calls of a function tool
 sent with `strict: true`, a **strict tool**, to its `parameters`, with the
 same grammar that holds an answer: each sampled token is checked, and a miss
 is repaired. The Responses API holds them too
-([below](#on-the-responses-api)).
+([below](#on-the-responses-api)). Why the model writes its call in its own
+order, and why a value ends only where the call goes on:
+[ADR 0094](../../adr/0094-a-held-tools-call-is-checked-as-the-model-writes-it-in-its-own-order-and-a-value-ends-only-where-the-call-continues.md).
 
 ```bash
 curl http://localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
@@ -280,14 +282,28 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
   is steered to the missing parameter.
 - **The answer is free outside its calls.** The grammar arms at a call's
   `<tool_call>`, in the answer only, never in the reasoning, and is released
-  at the call's close; each further call arms it again. A call cut by
-  `max_tokens` comes back as generated, with `finish_reason: "length"`.
+  at the call's close; each further call arms it again. A call `max_tokens`
+  cuts is dropped, as every call left open is, and `finish_reason` is
+  `"length"` (GitHub #583 will change how it is sent).
 - **A string value is the call's raw text**, and it ends only where the call
   goes on: a parameter's opener the call has not written yet, or the
   function's close once every required parameter is written. A file's
-  content may hold lines that look like the call's own tags. The one text a
-  value cannot hold is its own call's close, `</function>` then
-  `</tool_call>`, each at a line's start, once the call may close.
+  content may hold lines that look like the call's own tags, but not these:
+  - a line opening a parameter the tool declares and the call has not
+    written yet (`<parameter=mode>`), alone or after a `</parameter>` line:
+    the value ends there, and what follows is that parameter's value;
+  - once every required parameter is written, the call's close: a
+    `</function>` line and `</tool_call>` after it, whitespace between;
+  - while a required parameter is still missing, a line starting
+    `</function` (`</functional>` too), and a line starting `</parameter>`
+    that goes on, after its whitespace, with `</` (a `</div>` on the next
+    line too): the model is steered to the missing parameter;
+  - a `</parameter>` line, or a closing `</function>` one, followed by more
+    whitespace than `--model-grammar-max-whitespace` (48).
+
+  The model writes the parameters in its own order: a file about tool calls
+  is kept whole when its content comes after the parameters its examples
+  open, and written before them it ends at the first such example.
 - **A string with an `enum`, a `const`, a `pattern` or a `format`** is held
   to it, on one line that does not start with one of the call's tags
   (`<parameter=`, `</parameter>`, `</function>`). `minLength` and `maxLength`
