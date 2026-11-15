@@ -440,6 +440,24 @@ impl FieldKind for LoopGuard {
     }
 }
 
+/// The operator's switch for the tools a request does not send strict
+/// (`crate::api::ToolArguments`): `as-sent` or `held`.
+pub struct ToolArgumentsKind;
+
+impl FieldKind for ToolArgumentsKind {
+    type Value = crate::api::ToolArguments;
+    const TAG: &'static str = "tool arguments";
+
+    fn parse(raw: &str) -> Result<crate::api::ToolArguments, String> {
+        crate::api::ToolArguments::parse(&raw.to_ascii_lowercase())
+            .ok_or_else(|| format!("must be one of {}, got `{raw}`", crate::api::ToolArguments::NAMES.join(", ")))
+    }
+
+    fn render(value: &crate::api::ToolArguments) -> Value {
+        Value::String(value.as_str().to_owned())
+    }
+}
+
 /// A byte count with the size suffixes an operator actually types: a bare
 /// count, or one followed by `K`/`M`/`G` (case-insensitive, binary — `4G`
 /// is 4 GiB), optionally spelled `KiB`/`MiB`/`GiB` or `KB`/`MB`/`GB`. A pool

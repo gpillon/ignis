@@ -296,11 +296,13 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
   well: [Typed and nullable parameters](#typed-and-nullable-parameters).
 - **A tool without `strict`** in the same request keeps its arguments as the
   model writes them, as OpenAI's chat completions do; the Responses API
-  normalizes it instead ([below](#a-tool-sent-without-strict)). With a strict
-  tool in the request, every call's function name is held to the request's
-  tools.
+  normalizes it instead ([below](#a-tool-sent-without-strict)), and so do both
+  under the operator's switch ([Holding every tool](#holding-every-tool)).
+  With a strict tool in the request, every call's function name is held to
+  the request's tools.
 - **A request with no strict tool** is served as before, byte for byte, on
-  chat completions.
+  chat completions, unless the operator's switch holds every tool
+  ([Holding every tool](#holding-every-tool)).
 - **On Qwen3.8-Flash-Next**, `strict` is accepted and inert for now (GitHub
   #581).
 
@@ -476,7 +478,8 @@ calls, as OpenAI's Responses API does by default (GitHub #614):
 - **`strict: false` serves the tool free**, echoed as sent, so an agent CLI
   that sends `false` on every tool sees no change. Chat completions
   normalize nothing: a tool without `strict` is free there, OpenAI's default
-  on that endpoint.
+  on that endpoint. Both change only under the operator's switch
+  ([Holding every tool](#holding-every-tool)).
 
 For a `find` tool whose `parameters` are `{"type": "object", "properties":
 {"path": {"type": "string"}, "size": {"type": "integer"}, "tag": {"type":
@@ -485,6 +488,40 @@ For a `find` tool whose `parameters` are `{"type": "object", "properties":
 left out, and the response echoes the tool with `"strict": true`. A held
 normalized tool's misses and repairs count as a strict tool's, with the type
 `tool`.
+
+## Holding every tool
+
+From 0.11.0, on the 27B, an operator whose agents never send `strict: true`
+can still have their calls held: `--model-tool-arguments held`
+(`IGNIS_MODEL_TOOL_ARGUMENTS=held`, or `model: { tool_arguments: held }` in
+the config file, [Prompting](../configuration/prompting.md)) normalizes every
+tool a request does not send `strict: true`, on chat completions and on the
+Responses API, over HTTP and the WebSocket mode, as the Responses API
+normalizes a tool sent without `strict` by default
+([above](#a-tool-sent-without-strict)): every object closed, so a call names
+no parameter the tool does not declare, and an optional parameter left out of
+`arguments` when the model leaves it out, the arguments valid under the
+schema you sent.
+
+- **`strict: false` is held too**: agent CLIs send it on every tool, and the
+  switch is for holding every tool. On the Responses API the response's
+  `tools` echo such a tool with the `strict` it was served with, `true` where
+  its calls are held and `false` where they are not, as for a tool sent
+  without one.
+- **A schema that cannot be normalized stays free**, never refused, for the
+  reasons [above](#a-tool-sent-without-strict).
+- **A strict tool stays strict**: a strict schema outside the subset is the
+  same `400`.
+- **Misses and repairs** count as a strict tool's, with the type `tool`.
+- **The default, `as-sent`**, serves every tool as the sections above say,
+  byte for byte as before. It stays the default until `held` is measured on
+  the 27B: no slower, and repairs that write sensible arguments.
+- **On Flash-Next the switch changes nothing** until that model holds tool
+  calls (GitHub #581): a Flash-Next start takes it, and serves every tool as
+  before.
+
+The switch is patchable live: after `PATCH /v1/config` with `{"model":
+{"tool_arguments": "held"}}` the next request is served under it.
 
 ## Cuts
 

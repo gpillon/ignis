@@ -150,5 +150,7 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   ([Beside `tool_choice`, `response_format` and `parallel_tool_calls`](structured-output.md#beside-tool_choice-response_format-and-parallel_tool_calls)).
   `false`, `null` and absent serve the tool as before, OpenAI's default here
   (the Responses API normalizes a tool sent without `strict`:
-  [A tool sent without `strict`](structured-output.md#a-tool-sent-without-strict));
+  [A tool sent without `strict`](structured-output.md#a-tool-sent-without-strict)),
+  unless the operator holds every tool, which normalizes them as the
+  Responses API does ([Holding every tool](structured-output.md#holding-every-tool));
   on Flash-Next `strict` is accepted and inert (GitHub #581).

@@ -397,6 +397,20 @@ config_group! {
         /// schema misses on nearly every key. A request's own
         /// ignis_describe_schema overrides it.
         describe_schema: Bool = true, NO_RULE, ALL, [Visible, Patchable];
+        /// How the 27B serves a tool a request does not send `strict: true`
+        /// (spec #582, ADR 0094), on chat completions and `/v1/responses`:
+        /// `as-sent`, each tool as sent (a tool sent without `strict` free on
+        /// chat completions and normalized on `/v1/responses`, as OpenAI
+        /// serves them, one sent `strict: false` free); `held`, every such
+        /// tool, `strict: false` included, normalized into strict form and
+        /// its calls held where its schema allows it: its objects closed, so
+        /// no parameter it does not declare, an optional parameter left out
+        /// of the arguments when the model leaves it out. A schema that
+        /// cannot be normalized stays free, never refused, and a strict tool
+        /// stays strict either way. On Flash-Next it changes nothing until
+        /// it holds tool calls (#581).
+        tool_arguments: ToolArgumentsKind = crate::api::ToolArguments::AsSent, Validator::OneOf(crate::api::ToolArguments::NAMES), ALL,
+            [Visible, Patchable];
         /// The loop guard (ADR 0052): `rewind`, a loop in a request's
         /// reasoning (chat completions, `/v1/responses`) is taken back and
         /// the model nudged, then closed after `loop_guard_retries` nudges;

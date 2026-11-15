@@ -371,6 +371,9 @@ pub struct Config {
     /// unless the request says otherwise (`--model-describe-schema`, GitHub
     /// #589).
     pub describe_schema: bool,
+    /// The operator's switch for the tools a request does not send strict
+    /// (`--model-tool-arguments`, GitHub #616).
+    pub tool_arguments: crate::api::ToolArguments,
     /// The loop guard (`--model-loop-guard` and its knobs, ADR 0052).
     pub loop_guard: crate::loop_guard::LoopGuardParams,
     /// The prefill chunk width, in tokens (a nonzero multiple of
@@ -1362,6 +1365,7 @@ fn derive(
         reasoning_effort: s.model.reasoning_effort,
         thinking_budget: s.model.thinking_budget,
         describe_schema: s.model.describe_schema,
+        tool_arguments: s.model.tool_arguments,
         loop_guard: crate::loop_guard::LoopGuardParams {
             mode: s.model.loop_guard,
             ratio_permille: s.model.loop_guard_ratio,

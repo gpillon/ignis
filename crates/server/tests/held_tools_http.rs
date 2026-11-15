@@ -30,6 +30,7 @@ use ignis_server::decoder::TokenDecoder;
 use ignis_server::engine::Engine;
 use ignis_server::template::{ChatMessage, RenderedPrompt, SimpleTemplateProvider, TemplateProvider, TemplateRejection};
 use ignis_server::thinking::{ThinkingCapabilities, ThinkingOptions};
+use ignis_server::api::ToolArguments;
 use ignis_server::Server;
 
 #[path = "support/responses.rs"]
@@ -774,16 +775,26 @@ fn delivered_by(events: &[JsonValue]) -> Delivered {
 /// metrics.
 async fn over_http(script: &str, body: &str, stream: bool) -> (Delivered, Arc<ignis_server::metrics::Metrics>, Arc<MockCompute>) {
     let (server, mock) = server(script, ModelFamily::Qwen38_27b);
+    (delivered_over_http(&server, body, stream).await, server.metrics.clone().unwrap(), mock)
+}
+
+/// What `server` delivers to `body` over HTTP, whole or streamed.
+async fn delivered_over_http(server: &Server, body: &str, stream: bool) -> Delivered {
+    let text = responses_text(server, body).await;
+    match stream {
+        false => delivered(&serde_json::from_str(&text).unwrap()),
+        true => delivered_by(&responses::sse_events(&text).into_iter().map(|(_, event)| event).collect::<Vec<_>>()),
+    }
+}
+
+/// `server`'s answer to `body` on `/v1/responses`, a 200, as text.
+async fn responses_text(server: &Server, body: &str) -> String {
     let request = Request::builder().method("POST").uri(RESPONSES).header("content-type", "application/json").body(Body::from(body.to_owned())).unwrap();
     let response = server.app().oneshot(request).await.unwrap();
     let status = response.status().as_u16();
     let text = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
     assert_eq!(status, 200, "{text}");
-    let out = match stream {
-        false => delivered(&serde_json::from_str(&text).unwrap()),
-        true => delivered_by(&responses::sse_events(&text).into_iter().map(|(_, event)| event).collect::<Vec<_>>()),
-    };
-    (out, server.metrics.clone().unwrap(), mock)
+    text
 }
 
 /// The events answering `body` as a `response.create` on the WebSocket mode
@@ -791,10 +802,16 @@ async fn over_http(script: &str, body: &str, stream: bool) -> (Delivered, Arc<ig
 async fn socket_events(script: &str, family: ModelFamily, body: &str) -> (Vec<JsonValue>, Arc<ignis_server::metrics::Metrics>, Arc<MockCompute>) {
     let (server, mock) = server(script, family);
     let metrics = server.metrics.clone().unwrap();
+    (socket_events_of(server, body).await, metrics, mock)
+}
+
+/// The events `server` answers `body` with as a `response.create` on the
+/// WebSocket mode.
+async fn socket_events_of(server: Server, body: &str) -> Vec<JsonValue> {
     let live = responses::live(server).await;
     let mut socket = responses::socket(&live).await;
     responses::send_text(&mut socket, create_frame(body)).await;
-    (responses::events_until(&mut socket, responses::terminal).await, metrics, mock)
+    responses::events_until(&mut socket, responses::terminal).await
 }
 
 /// The response to `body` on the WebSocket mode, and the server's metrics.
@@ -1006,12 +1023,7 @@ fn valid_flat(tool: &str, arguments: &str) -> bool {
 /// first request writes `script`, and the server's metrics.
 async fn responses_post(script: &str, family: ModelFamily, body: &str) -> (JsonValue, Arc<ignis_server::metrics::Metrics>, Arc<MockCompute>) {
     let (server, mock) = server(script, family);
-    let request = Request::builder().method("POST").uri(RESPONSES).header("content-type", "application/json").body(Body::from(body.to_owned())).unwrap();
-    let response = server.app().oneshot(request).await.unwrap();
-    let status = response.status().as_u16();
-    let text = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
-    assert_eq!(status, 200, "{text}");
-    (serde_json::from_str(&text).unwrap(), server.metrics.clone().unwrap(), mock)
+    (serde_json::from_str(&responses_text(&server, body).await).unwrap(), server.metrics.clone().unwrap(), mock)
 }
 
 /// A tool sent without `strict` whose schema normalizes has its calls held:
@@ -1239,4 +1251,197 @@ fn the_gpu_corpus_reads_a_calls_faults_where_they_are() {
     assert_eq!((corpus::shown_at(deploy, "/replicas"), corpus::shown_at(deploy, "/notes")), ("25".to_owned(), "(absent)".to_owned()));
     assert_eq!(corpus::shown_at(open, "/change/edits/0"), r#"{"old":"x","new":"y","why":"z"}"#);
     assert_eq!([corpus::parting("abc", "abd"), corpus::parting("ab", "abc"), corpus::parting("a", "a")], [Some(2), Some(2), None]);
+}
+
+// ── the operator's switch (GitHub #616) ──────────────────────────────────
+
+/// A server whose first request writes `script`, the operator's switch
+/// (`model.tool_arguments`) at `held`.
+fn held_server(script: &str, family: ModelFamily) -> (Server, Arc<MockCompute>) {
+    let (server, mock) = server(script, family);
+    (server.with_tool_arguments(ToolArguments::Held), mock)
+}
+
+/// A flat Responses tool in chat completions' shape: its members in its
+/// `function`, in the order sent.
+fn chat_shaped(tool: &str) -> String {
+    let members = tool.strip_prefix(r#"{"type":"function","#).expect("a flat tool");
+    format!(r#"{{"type":"function","function":{{{members}}}"#)
+}
+
+/// `find`'s two scripts that miss, the arguments each delivers held and its
+/// misses: an invented parameter repaired away, the optional parameters it
+/// leaves out left out; an optional parameter written, held to its type,
+/// and a nested object's own key repaired away (as on the Responses API by
+/// default, [`on_the_responses_api_a_tool_sent_without_strict_is_normalized_held_and_echoed_strict_true`]).
+fn find_scripts() -> [(&'static str, String, &'static str, u64); 2] {
+    [
+        ("an invented parameter", "<tool_call>\n<function=find>\n<parameter=flag>\na.md\n</parameter>\n</function>\n</tool_call>".to_owned(), r#"{"path":"a.md"}"#, 4),
+        (
+            "an optional parameter written, an object with a key of its own",
+            call("find", &[("where", r#"{"hidden": true, "x": 1}"#), ("size", "3"), ("path", "src")]),
+            r#"{"path":"src","size":3,"where":{"hidden":true}}"#,
+            7,
+        ),
+    ]
+}
+
+/// With the switch at `held`, chat completions hold a tool sent without
+/// `strict`, and one sent `strict: false`, normalized as the Responses API
+/// holds a tool sent without `strict`: the arguments valid under the schema
+/// as sent, every round of the content checked, the misses counted under
+/// `type="tool"`. At the default, `as-sent`, the same call is read as the
+/// model wrote it.
+#[tokio::test]
+async fn with_the_switch_held_a_chat_tool_not_sent_strict_has_its_calls_held() {
+    let find = chat_shaped(FIND);
+    for tool in [find.clone(), strict_false(&find)] {
+        for (what, script, arguments, misses) in find_scripts() {
+            let (server, mock) = held_server(&script, ModelFamily::Qwen38_27b);
+            let (_, calls, finish) = served(&server, &chat(&[&tool], false, 512)).await;
+            assert_eq!(finish, "tool_calls", "{what}: {tool}");
+            assert_eq!(calls, [("find".to_owned(), arguments.to_owned())], "{what}: {tool}");
+            assert!(valid(&tool, arguments), "{what}: {arguments}");
+            assert!(mock.decode_calls().iter().flatten().all(|job| job.checked), "{what}: every round of the content is checked");
+            tool_counts(&server, 1, misses).await;
+        }
+        let (server, mock) = server(&find_scripts()[0].1, ModelFamily::Qwen38_27b);
+        let (_, calls, _) = served(&server, &chat(&[&tool], false, 512)).await;
+        assert_eq!(calls, [("find".to_owned(), r#"{"flag":"a.md"}"#.to_owned())], "at the default: {tool}");
+        assert!(mock.decode_calls().iter().flatten().all(|job| !job.checked), "at the default: {tool}");
+    }
+}
+
+/// With the switch at `held`, a tool whose schema does not normalize is
+/// served free, never refused, sent without `strict` or with `strict:
+/// false`: a keyword outside the strict subset, an object that admits keys
+/// it does not name. On chat completions and the Responses API alike its
+/// call is read as written, no round checked, nothing counted, and the
+/// Responses API echoes it `strict: false`.
+#[tokio::test]
+async fn with_the_switch_held_a_tool_whose_schema_does_not_normalize_stays_free() {
+    let length = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1}}}}"#;
+    let map = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string"},"labels":{"type":"object","additionalProperties":{"type":"string"}}}}}"#;
+    let look = "<tool_call>\n<function=look>\n<parameter=query>\ncats\n</parameter>\n<parameter=limit>\nmany\n</parameter>\n</function>\n</tool_call>";
+    let free = [("look".to_owned(), r#"{"limit":"many","query":"cats"}"#.to_owned())];
+    for tool in [length.to_owned(), strict_false(length), map.to_owned(), strict_false(map)] {
+        let (server, mock) = held_server(look, ModelFamily::Qwen38_27b);
+        let (_, calls, _) = served(&server, &chat(&[&chat_shaped(&tool)], false, 256)).await;
+        assert_eq!(calls, free, "chat: {tool}");
+        assert!(mock.decode_calls().iter().flatten().all(|job| !job.checked), "chat: {tool}");
+        assert!(mock.repair_calls().is_empty(), "chat: {tool}");
+        assert!(!server.metrics.as_ref().unwrap().render().contains("ignis_structured_"), "chat: {tool}");
+        let (server, mock) = held_server(look, ModelFamily::Qwen38_27b);
+        let response: JsonValue = serde_json::from_str(&responses_text(&server, &responses_body(&[&tool], false, 256)).await).unwrap();
+        assert_eq!(delivered(&response).calls, free, "responses: {tool}");
+        assert_eq!(response["tools"][0]["strict"], false, "responses: {tool}");
+        assert!(mock.decode_calls().iter().flatten().all(|job| !job.checked), "responses: {tool}");
+        assert!(!server.metrics.as_ref().unwrap().render().contains("ignis_structured_"), "responses: {tool}");
+    }
+}
+
+/// With the switch at `held`, a strict tool is the strict tool it was: one
+/// outside what can be held is refused before generation with the same 400,
+/// naming the same field, beside a tool the switch normalizes.
+#[tokio::test]
+async fn with_the_switch_held_a_strict_tool_outside_what_can_be_held_is_refused_as_before() {
+    for (tool, code, param, named) in refused_tools() {
+        let (server, mock) = held_server("", ModelFamily::Qwen38_27b);
+        let (status, json, text) = post(&server, &chat(&[SEARCH, &tool], false, 64)).await;
+        assert_eq!(status, 400, "{tool}: {text}");
+        assert_eq!((json["error"]["code"].as_str(), json["error"]["param"].as_str()), (Some(code), Some(param)), "{text}");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with(&format!("{param}: strict tool refused, {named}")), "{message}");
+        assert!(mock.prefill_calls().is_empty(), "nothing is generated");
+    }
+}
+
+/// With the switch at `held`, the Responses API holds a tool sent `strict:
+/// false` as it holds one sent without `strict` by default: the same
+/// arguments and misses whole, streamed and on the WebSocket mode, and the
+/// response echoes it `strict: true`, the `strict` it was served with.
+#[tokio::test]
+async fn with_the_switch_held_the_responses_api_holds_a_tool_sent_strict_false_and_echoes_strict_true() {
+    let tool = strict_false(FIND);
+    for (what, script, arguments, misses) in find_scripts() {
+        let body = responses_body(&[&tool], false, 512);
+        let (server, mock) = held_server(&script, ModelFamily::Qwen38_27b);
+        let response: JsonValue = serde_json::from_str(&responses_text(&server, &body).await).unwrap();
+        let whole = delivered(&response);
+        assert_eq!(whole.calls, [("find".to_owned(), arguments.to_owned())], "{what}");
+        assert!(valid_flat(&tool, arguments), "{what}: {arguments}");
+        assert_eq!(response["tools"][0]["strict"], true, "{what}");
+        assert!(mock.decode_calls().iter().flatten().all(|job| job.checked), "{what}: every round of the content is checked");
+        tool_counts(&server, 1, misses).await;
+        let (server, _) = held_server(&script, ModelFamily::Qwen38_27b);
+        assert_eq!(delivered_over_http(&server, &responses_body(&[&tool], true, 512), true).await, whole, "{what}: streamed and whole");
+        tool_counts(&server, 1, misses).await;
+        let (server, _) = held_server(&script, ModelFamily::Qwen38_27b);
+        let metrics = server.metrics.clone().unwrap();
+        let events = socket_events_of(server, &body).await;
+        assert_eq!(delivered_by(&events), whole, "{what}: the socket and HTTP");
+        assert_eq!(events.last().unwrap()["response"]["tools"][0]["strict"], true, "{what}");
+        counted(&metrics, 1, misses).await;
+    }
+}
+
+/// With the switch at `held`, the response's `tools` echo the `strict` each
+/// tool was served with, one sent `strict: false` as one sent without: `true`
+/// where held, `false` where its schema does not normalize and under
+/// `tool_choice: "none"`; `strict: true` as sent; and on Flash-Next, which
+/// the switch does not reach, every tool `false`, as at the default.
+#[tokio::test]
+async fn with_the_switch_held_each_tool_echoes_the_strict_it_was_served_with() {
+    let length = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1}}}}"#;
+    let chat_shaped_false = strict_false(r#"{"type":"function","function":{"name":"list","parameters":{"type":"object","properties":{"dir":{"type":"string"}}}}}"#);
+    let (search, write_file) = (flat(&strict_false(SEARCH)), flat(WRITE_FILE));
+    let length_false = strict_false(length);
+    let tools = [FIND, length_false.as_str(), chat_shaped_false.as_str(), search.as_str(), write_file.as_str()];
+    let echoed = |strict: [Option<bool>; 5]| -> JsonValue {
+        let echoed = tools.iter().zip(strict).map(|(tool, strict)| {
+            let mut tool: JsonValue = serde_json::from_str(tool).unwrap();
+            if let Some(strict) = strict {
+                let function = if tool.get("function").is_some() { &mut tool["function"] } else { &mut tool };
+                function["strict"] = JsonValue::Bool(strict);
+            }
+            tool
+        });
+        JsonValue::Array(echoed.collect())
+    };
+    let body = responses_body(&tools, false, 64);
+    let (server, _) = held_server("", ModelFamily::Qwen38_27b);
+    let response: JsonValue = serde_json::from_str(&responses_text(&server, &body).await).unwrap();
+    assert_eq!(response["tools"], echoed([Some(true), Some(false), Some(true), Some(true), None]));
+    let (server, _) = held_server("", ModelFamily::Qwen38_27b);
+    let none = body.replacen("\"tools\"", "\"tool_choice\":\"none\",\"tools\"", 1);
+    let response: JsonValue = serde_json::from_str(&responses_text(&server, &none).await).unwrap();
+    assert_eq!(response["tools"], echoed([Some(false), Some(false), Some(false), Some(false), None]), "under tool_choice none");
+    let (server, _) = held_server("", ModelFamily::FlashNext);
+    let response: JsonValue = serde_json::from_str(&responses_text(&server, &body).await).unwrap();
+    assert_eq!(response["tools"], echoed([Some(false); 5]), "on Flash-Next");
+    let (response, _, _) = responses_post("", ModelFamily::Qwen38_27b, &body).await;
+    assert_eq!(response["tools"], echoed([Some(true), None, None, None, None]), "at the default: `strict: false` as sent");
+}
+
+/// On Flash-Next the switch changes nothing until it holds tool calls
+/// (#581): at `held` a tool sent without `strict`, or with `strict: false`,
+/// is served free on chat completions and the Responses API, its call read
+/// as written, no round checked and nothing counted.
+#[tokio::test]
+async fn on_flash_next_the_switch_changes_nothing() {
+    let script = "<tool_call>\n<function=find>\n<parameter=flag>\nsrc\n</parameter>\n</function>\n</tool_call>";
+    let free = [("find".to_owned(), r#"{"flag":"src"}"#.to_owned())];
+    for tool in [FIND.to_owned(), strict_false(FIND)] {
+        let (server, mock) = held_server(script, ModelFamily::FlashNext);
+        let (_, calls, _) = served(&server, &chat(&[&chat_shaped(&tool)], false, 256)).await;
+        assert_eq!(calls, free, "chat: {tool}");
+        assert!(mock.decode_calls().iter().flatten().all(|job| !job.checked) && mock.repair_calls().is_empty(), "chat: {tool}");
+        assert!(!server.metrics.as_ref().unwrap().render().contains("ignis_structured_"), "chat: {tool}");
+        let (server, mock) = held_server(script, ModelFamily::FlashNext);
+        let body = responses_body(&[&tool], false, 256);
+        assert_eq!(delivered_over_http(&server, &body, false).await.calls, free, "responses: {tool}");
+        assert!(mock.decode_calls().iter().flatten().all(|job| !job.checked), "responses: {tool}");
+        let (server, _) = held_server(script, ModelFamily::FlashNext);
+        assert_eq!(delivered_by(&socket_events_of(server, &body).await).calls, free, "the socket: {tool}");
+    }
 }

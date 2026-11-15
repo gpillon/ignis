@@ -516,6 +516,31 @@ async fn a_loop_guard_patch_applies_live() {
     assert!(loader.prepared_options().is_empty(), "no model was prepared, so none was switched");
 }
 
+/// The switch for the tools a request does not send strict (GitHub #616) is
+/// live: `as-sent` at a start that names nothing, a patch to `held` reaches
+/// the next request at once with no model touched, and an unknown value is
+/// refused by name, the running value kept.
+#[tokio::test]
+async fn a_tool_arguments_patch_applies_live() {
+    use ignis_server::api::ToolArguments;
+    let loader = MockLoader::new();
+    let server = server_on(&loader, started(&[]));
+    let app = server.app();
+    assert_eq!(server.live().tool_arguments, ToolArguments::AsSent);
+    let (_, before) = send(&app, Method::GET, "/v1/config", None).await;
+    assert_eq!(before["model"]["tool_arguments"], "as-sent");
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "model": { "tool_arguments": "held" } }))).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!((&applied["applied"], &applied["config"]["model"]["tool_arguments"]), (&json!("live"), &json!("held")));
+    assert_eq!(server.live().tool_arguments, ToolArguments::Held, "the next request reads it");
+    let (status, refused) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "model": { "tool_arguments": "always" } }))).await;
+    assert_eq!((status, refused["error"]["code"].clone()), (StatusCode::BAD_REQUEST, json!("config_invalid")), "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("tool_arguments") && message.contains("as-sent, held") && message.contains("`always`"), "{message}");
+    assert_eq!(server.live().tool_arguments, ToolArguments::Held, "the running value kept");
+    assert!(loader.prepared_options().is_empty(), "no model was prepared, so none was switched");
+}
+
 /// A placeholder start has no artifact to load again: a reload is refused,
 /// while a live change still applies.
 #[tokio::test]
