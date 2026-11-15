@@ -327,8 +327,8 @@ beside its `type`: `tools[1].parameters`, `tools[i].name`, `tools[i].strict`.
 
 ### Typed and nullable parameters
 
-A strict tool's parameters of every type are held, not only its strings
-(GitHub #612).
+A strict tool's parameters of every type are held, not only its strings, on
+chat completions and on the Responses API alike (GitHub #612).
 
 - **An integer, a number, a boolean, an object or an array** is written by
   the model as JSON and held to its own subschema by the grammar that holds

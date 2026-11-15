@@ -5,8 +5,10 @@
 //! The "model" follows a script ([`MockCompute::script`]) that misses on
 //! purpose: a parameter name of its own, an invented parameter, an
 //! undeclared function, a value outside an enum, a required parameter
-//! missing at an early close; and a file whose content holds the dialect's
-//! own tags, which is no miss. Each draw of the content is checked against
+//! missing at an early close; a word for a number, a string for a boolean,
+//! an object missing a key, a value outside its bounds (#612); and a file
+//! whose content holds the dialect's own tags, which is no miss. Each draw
+//! of the content is checked against
 //! the tool calls' grammar before the next round consumes it, and a miss is
 //! repaired. The mock's repair ranks what the script was going to write next
 //! above the rest, then the vocabulary in order, so a script that writes the
@@ -296,6 +298,79 @@ fn scripts_that_miss() -> Vec<(&'static str, String, &'static str, u64)> {
     ]
 }
 
+/// `edit`, strict and typed (#612): a path, an integer `line` from 1 to
+/// 1000, a boolean, an object holding a list of edits, and a string that may
+/// be null.
+const EDIT: &str = r#"{"type":"function","function":{"name":"edit","strict":true,"parameters":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer","minimum":1,"maximum":1000},"dry_run":{"type":"boolean"},"change":{"type":"object","properties":{"edits":{"type":"array","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"}},"required":["old","new"],"additionalProperties":false}}},"required":["edits"],"additionalProperties":false},"note":{"type":["string","null"]}},"required":["path","line","dry_run","change","note"],"additionalProperties":false}}}"#;
+
+/// Scripts that write a typed value wrong, each one call to `edit`, and what
+/// each comes out as: always valid, its misses repaired, the nullable `note`
+/// that none of them writes delivered `null`.
+#[tokio::test]
+async fn scripts_that_write_a_typed_value_wrong_come_out_valid_with_their_repairs_counted() {
+    for (what, script, arguments, misses) in typed_scripts() {
+        let (server, _) = server(&script, ModelFamily::Qwen38_27b);
+        let (_, calls, finish) = served(&server, &chat(&[EDIT], false, 512)).await;
+        assert_eq!(finish, "tool_calls", "{what}");
+        assert_eq!(calls, [("edit".to_owned(), arguments.to_owned())], "{what}");
+        assert!(valid(EDIT, arguments), "{what}: {arguments}");
+        tool_counts(&server, 1, misses).await;
+    }
+}
+
+/// What each script that writes a typed value wrong is, writes, comes out
+/// as (the call's arguments) and misses, the same on every surface.
+fn typed_scripts() -> Vec<(&'static str, String, &'static str, u64)> {
+    let edit = |values: &[(&str, &str)]| call("edit", values);
+    let change = ("change", r#"{"edits": [{"old": "x", "new": "y"}]}"#);
+    vec![
+        // `t` cannot start an integer from 1 to 1000, and no later token of
+        // the script can: the lowest the mask permits, `1`. Then `welve`,
+        // five misses more, each repaired to the script's next line break,
+        // the whitespace a number may be followed by.
+        (
+            "a word for a number",
+            edit(&[("path", "a.txt"), ("line", "twelve"), ("dry_run", "false"), change]),
+            r#"{"path":"a.txt","line":1,"dry_run":false,"change":{"edits":[{"old":"x","new":"y"}]},"note":null}"#,
+            6,
+        ),
+        // `"no"` for a boolean: each of its four tokens a miss, repaired to
+        // the script's next letter that spells `true` (the `t` and `r` of
+        // `parameter`, the `u` of `function`, an `e`).
+        (
+            "a string for a boolean",
+            edit(&[("path", "a.txt"), ("line", "12"), ("dry_run", "\"no\""), change]),
+            r#"{"path":"a.txt","line":12,"dry_run":true,"change":{"edits":[{"old":"x","new":"y"}]},"note":null}"#,
+            4,
+        ),
+        // The first edit closes without its `new`: that `}` is a miss,
+        // repaired to the second edit's `,`, and the grammar then writes the
+        // missing key and its value from the second edit's own tokens, the
+        // rest of which is repaired into the list's close.
+        (
+            "an object missing a key",
+            edit(&[("path", "a.txt"), ("line", "12"), ("dry_run", "false"), ("change", r#"{"edits": [{"old": "x"}, {"old": "y", "new": "z"}]}"#)]),
+            r#"{"path":"a.txt","line":12,"dry_run":false,"change":{"edits":[{"old":"x","new":"y"}]},"note":null}"#,
+            22,
+        ),
+        // `2000` is past the maximum at its fourth digit: repaired to the
+        // line break after it, so `200`.
+        (
+            "a value outside its bounds",
+            edit(&[("path", "a.txt"), ("line", "2000"), ("dry_run", "false"), change]),
+            r#"{"path":"a.txt","line":200,"dry_run":false,"change":{"edits":[{"old":"x","new":"y"}]},"note":null}"#,
+            1,
+        ),
+        // No miss: the parameters in the model's own order, `note` left out.
+        (
+            "every value right, the nullable one left out",
+            edit(&[("line", "12"), ("path", "a.txt"), change, ("dry_run", "true")]),
+            r#"{"path":"a.txt","line":12,"dry_run":true,"change":{"edits":[{"old":"x","new":"y"}]},"note":null}"#,
+            0,
+        ),
+    ]
+}
+
 #[tokio::test]
 async fn a_strict_tool_outside_what_can_be_held_is_refused_before_generation_by_name() {
     for (tool, code, param, named) in refused_tools() {
@@ -573,6 +648,27 @@ async fn on_the_responses_api_the_scripts_come_out_valid_over_http_and_the_socke
         assert!(valid(WRITE_FILE, arguments), "{what}: {arguments}");
         counted(&metrics, 1, misses).await;
         assert!(mock.decode_calls().iter().flatten().all(|job| job.checked), "{what}: every round of the content is checked");
+        let (streamed, metrics, _) = over_http(&script, &responses_body(&[&tool], true, 512), true).await;
+        assert_eq!(streamed, whole, "{what}: streamed and whole");
+        counted(&metrics, 1, misses).await;
+        let (socket, metrics) = over_socket(&script, &responses_body(&[&tool], false, 512)).await;
+        assert_eq!(socket, whole, "{what}: the socket and HTTP");
+        counted(&metrics, 1, misses).await;
+    }
+}
+
+/// The scripts that write a typed value wrong (#612) come out on the
+/// Responses API as on chat completions: valid, the nullable one `null`,
+/// their misses repaired and counted, the same whole, streamed and on the
+/// WebSocket mode.
+#[tokio::test]
+async fn on_the_responses_api_the_typed_scripts_come_out_valid_over_http_and_the_socket() {
+    let tool = flat(EDIT);
+    for (what, script, arguments, misses) in typed_scripts() {
+        let (whole, metrics, _) = over_http(&script, &responses_body(&[&tool], false, 512), false).await;
+        assert_eq!(whole.status, "completed", "{what}");
+        assert_eq!(whole.calls, [("edit".to_owned(), arguments.to_owned())], "{what}");
+        counted(&metrics, 1, misses).await;
         let (streamed, metrics, _) = over_http(&script, &responses_body(&[&tool], true, 512), true).await;
         assert_eq!(streamed, whole, "{what}: streamed and whole");
         counted(&metrics, 1, misses).await;
