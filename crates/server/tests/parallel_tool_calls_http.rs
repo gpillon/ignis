@@ -29,6 +29,9 @@ const FIRST: &str = "<tool_call>\n<function=read_file>\n<parameter=path>\na.txt\
 /// carries anywhere in its bytes.
 const SECOND: &str = "<tool_call>\n<function=read_file>\n<parameter=path>\nnever.txt\n</parameter>\n</function>\n</tool_call>";
 const SECOND_MARK: &str = "never.txt";
+/// A closed block that does not parse as a call: dropped, never shown.
+const UNPARSED: &str = "<tool_call>\nno function here\n</tool_call>";
+const UNPARSED_MARK: &str = "no function here";
 
 /// Two calls, one a token apart: text, the first call, the newline the
 /// template writes between calls, the second.
@@ -55,6 +58,8 @@ const SURFACES: [Surface; 5] = [Surface::Chat, Surface::ChatStream, Surface::Res
 struct Turn {
     /// Each call's `path` argument, in order.
     paths: Vec<String>,
+    /// Each call's id (`id` on chat, `call_id` on Responses), in order.
+    ids: Vec<String>,
     content: String,
     reasoning: String,
     /// `finish_reason` on chat, `status` on Responses.
@@ -112,6 +117,18 @@ fn scripted(steps: &[&'static str], eos: Option<u32>, runs: bool) -> (Arc<MockCo
 
 fn read_file() -> JsonValue {
     json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] })
+}
+
+/// The request's `read_file` sent `strict: false`, as `extra` to [`body`]:
+/// a tool never held, whose blocks the model may write so they do not parse
+/// (a held tool's grammar lets no such block through).
+fn free_tools(surface: Surface) -> JsonValue {
+    match surface {
+        Surface::Chat | Surface::ChatStream => {
+            json!({ "tools": [{ "type": "function", "function": { "name": "read_file", "parameters": read_file(), "strict": false } }] })
+        }
+        _ => json!({ "tools": [{ "type": "function", "name": "read_file", "parameters": read_file(), "strict": false }] }),
+    }
 }
 
 /// The request body on `surface`: `parallel` as `parallel_tool_calls`
@@ -173,6 +190,7 @@ fn path_of(arguments: &JsonValue) -> String {
 fn response_turn(response: &JsonValue, raw: String) -> Turn {
     let mut turn = Turn {
         paths: Vec::new(),
+        ids: Vec::new(),
         content: String::new(),
         reasoning: String::new(),
         finish: response["status"].as_str().unwrap().to_owned(),
@@ -182,7 +200,10 @@ fn response_turn(response: &JsonValue, raw: String) -> Turn {
     };
     for item in response["output"].as_array().unwrap() {
         match item["type"].as_str().unwrap() {
-            "function_call" => turn.paths.push(path_of(&item["arguments"])),
+            "function_call" => {
+                turn.paths.push(path_of(&item["arguments"]));
+                turn.ids.push(item["call_id"].as_str().unwrap().to_owned());
+            }
             "message" => turn.content.push_str(item["content"][0]["text"].as_str().unwrap()),
             "reasoning" => turn.reasoning.push_str(item["content"][0]["text"].as_str().unwrap()),
             other => panic!("an output item of type {other}: {response}"),
@@ -204,6 +225,7 @@ async fn turn(server: &ignis_server::Server, surface: Surface, body: &JsonValue)
             let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
             Turn {
                 paths: calls.iter().map(|c| path_of(&c["function"]["arguments"])).collect(),
+                ids: calls.iter().map(|c| c["id"].as_str().unwrap().to_owned()).collect(),
                 content: message["content"].as_str().unwrap().to_owned(),
                 reasoning: message["reasoning_content"].as_str().unwrap_or_default().to_owned(),
                 finish: answer["choices"][0]["finish_reason"].as_str().unwrap().to_owned(),
@@ -220,13 +242,10 @@ async fn turn(server: &ignis_server::Server, surface: Surface, body: &JsonValue)
             let delta = |c: &JsonValue, key: &str| c["choices"][0]["delta"][key].as_str().unwrap_or_default().to_owned();
             let finishes: Vec<&JsonValue> = chunks.iter().filter(|c| !c["choices"][0]["finish_reason"].is_null()).collect();
             assert_eq!(finishes.len(), 1, "one finish chunk: {raw}");
+            let calls: Vec<&JsonValue> = chunks.iter().filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array()).flatten().collect();
             Turn {
-                paths: chunks
-                    .iter()
-                    .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array())
-                    .flatten()
-                    .map(|call| path_of(&call["function"]["arguments"]))
-                    .collect(),
+                paths: calls.iter().map(|call| path_of(&call["function"]["arguments"])).collect(),
+                ids: calls.iter().map(|call| call["id"].as_str().unwrap().to_owned()).collect(),
                 content: chunks.iter().map(|c| delta(c, "content")).collect(),
                 reasoning: chunks.iter().map(|c| delta(c, "reasoning_content")).collect(),
                 finish: finishes[0]["choices"][0]["finish_reason"].as_str().unwrap().to_owned(),
@@ -307,6 +326,63 @@ async fn false_ends_the_turn_at_its_first_call_on_every_surface_and_both_familie
                 assert!(!got.raw.contains('?'), "a token past the close reached the client: {case}");
                 released_early(&mock, &gate, 2, &case).await;
             }
+        }
+    }
+}
+
+/// A closed block that does not parse is not a call (GitHub #640), as a call
+/// written in the reasoning is not one: it ends nothing, and the turn ends at
+/// the close of the first call that parses, which is served as `true` serves
+/// it, on every surface and both families. The block is counted `dropped`
+/// once and never reaches the client.
+#[tokio::test]
+async fn a_block_that_does_not_parse_ends_nothing() {
+    let steps: &[&'static str] = &["Reading. ", UNPARSED, "\n", FIRST, "\n", SECOND];
+    for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
+        for surface in SURFACES {
+            // Token 3 closes the call; round 3 delivers it.
+            let (server, mock, gate) = holding(steps, family, false, 4);
+            let server = server.with_metrics();
+            let metrics = server.metrics.clone().unwrap();
+            let got = turn(&server, surface, &body(surface, Some(false), &free_tools(surface))).await;
+            let case = format!("{family:?} {surface:?}: {got:?}");
+            assert_eq!(got.paths, ["a.txt"], "{case}");
+            assert!(got.ids[0].ends_with("_0"), "the turn's call is its first: {case}");
+            assert_eq!(got.finish, called(surface), "{case}");
+            assert_eq!(got.tokens, 4, "the tokens up to the call's close: {case}");
+            assert!(!got.raw.contains(UNPARSED_MARK), "the dropped block reached the client: {case}");
+            assert!(!got.raw.contains(SECOND_MARK), "the second call reached the client: {case}");
+            released_early(&mock, &gate, 4, &case).await;
+            metric_reaches(&metrics, "ignis_tool_calls_total{outcome=\"dropped\"} 1").await;
+            metric_reaches(&metrics, "ignis_tool_calls_total{outcome=\"valid\"} 1").await;
+
+            // `true`, the model ending at the same close, serves the same turn.
+            let (server, _) = writing(&steps[..4], Some(4), family, false);
+            let all = turn(&server, surface, &body(surface, Some(true), &free_tools(surface))).await;
+            assert_eq!((&all.paths, &all.ids, &all.content, &all.finish, all.tokens), (&got.paths, &got.ids, &got.content, &got.finish, got.tokens), "{case}");
+        }
+    }
+}
+
+/// A turn whose only block does not parse has no call, and `false` serves it
+/// to its end as `true` does, on both families.
+#[tokio::test]
+async fn a_turn_whose_only_block_does_not_parse_is_served_to_its_end() {
+    let steps: &[&'static str] = &["Reading. ", UNPARSED, " done"];
+    for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
+        for surface in SURFACES {
+            let mut answers = Vec::new();
+            for parallel in [Some(false), Some(true)] {
+                let (server, _) = writing(steps, Some(3), family, false);
+                answers.push(turn(&server, surface, &body(surface, parallel, &free_tools(surface))).await);
+            }
+            let [one_call, every_call]: [Turn; 2] = answers.try_into().unwrap();
+            let case = format!("{family:?} {surface:?}: {one_call:?}");
+            assert!(one_call.paths.is_empty(), "{case}");
+            assert_eq!(one_call.tokens, 3, "{case}");
+            assert!(!one_call.raw.contains(UNPARSED_MARK), "{case}");
+            let served = |turn: &Turn| (turn.content.clone(), turn.finish.clone(), turn.tokens);
+            assert_eq!(served(&one_call), served(&every_call), "{case}");
         }
     }
 }

@@ -101,9 +101,14 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   of its first call, with `finish_reason: "tool_calls"`: nothing the model
   generates after that close reaches you or counts in `usage`, streamed or
   not. A call the model writes inside its reasoning is not a call and ends
-  nothing. With `tool_choice: "required"` or a named function the turn has
-  exactly one call. `true` or absent serves every call the model writes, as
-  before. It holds on every model, Flash-Next included.
+  nothing, and neither does a call block that does not parse, which never
+  reaches you: the model goes on as with `true`, and the turn's call is the
+  next one that parses, if it writes one. With `tool_choice: "required"` or
+  a named function the turn of a
+  [held tool](structured-output.md#held-tools-strict-true) has exactly one
+  call; with a tool that is not held, a turn whose only block does not parse
+  has none. `true` or absent serves every call the model writes, as before.
+  It holds on every model, Flash-Next included.
 - `response_format: {"type": "json_object"}` holds the answer to a valid JSON
   object, and `{"type": "json_schema", "json_schema": {...}}` to your schema,
   streamed or not (from 0.11.0, on the 27B; 0.10.0 refuses both): each
