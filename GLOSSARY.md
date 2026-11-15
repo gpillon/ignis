@@ -1157,7 +1157,7 @@ pass that verifies them, or a fake drafter in the substrate's own tests
 (`verify-only` load: the verify substrate with nothing bound, the drafts passed
 per call). The 27B's **MTP head** is its second drafter (ADR 0095): a load
 built for it binds the head and keeps its state current; its chain proposes in
-the verify round from #621.
+the verify round (#621).
 
 **Draft rule**:
 How a **verify round**'s sampling lanes draft and accept (`--spec-draft-rule`,

@@ -13,8 +13,9 @@
 //!   the drafts the target accepts: the verify substrate alone (no head),
 //!   given the same drafts -- each round's committed ones, then one the
 //!   target rejects -- commits the same runs at the same extents, bit for bit,
-//!   at windows 1 to 7 and one to eight lanes. So the head leaves the target's
-//!   computation as it was.
+//!   at windows 1 to 7 and one to eight lanes, and on the 16 GB artifact
+//!   (whose output head, which the chain scores with, is trellis) at one to
+//!   eight lanes. So the head leaves the target's computation as it was.
 //! - Greedy spec-on equals the same load's spec-off text (plain rounds) on
 //!   the canary prompts at one, four and eight lanes, each stream cut at the
 //!   turn's first stop id, up to the near-tie rule (`support/near_tie.rs`,
@@ -65,8 +66,8 @@ mod near_tie;
 use std::path::Path;
 
 use ignis_artifact::{
-    bind_model_scope_27b, f64_reference, materialize, text_scope_27b, CudaDevice, DraftModule, FrontendSet,
-    MaterializationPlan, MaterializedArtifact, ObjectHandle, Reader,
+    bind_model_scope_27b, f64_reference, materialize, model_scope_27b_of, CudaDevice, DraftModule, FrontendSet,
+    MaterializationPlan, MaterializedArtifact, ModelScope, ObjectHandle, Reader,
 };
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
@@ -83,6 +84,8 @@ use ignis_core::{mtp_readout, KvFormat, Speculation, SpeculativeBackend};
 use near_tie::first_divergence;
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
+/// The 16 GB artifact: a trellis body and output head, the same W8 head.
+const TRELLIS: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_trellis_sc30-v2.ninfer";
 const MAX_CONTEXT: u32 = 128;
 /// The 27B MTP load's chunk: a multiple of 128 (`mtp_head::PREFILL_ROWS`).
 const CHUNK: u32 = 128;
@@ -210,11 +213,11 @@ fn on_device(reader: &Reader, plan: &MaterializationPlan) -> Option<OnDevice> {
     }
 }
 
-/// The artifact's reader, its text + MTP scope and the scope on the card, or
-/// `None` when the test skips.
-fn materialized() -> Option<(Reader, Vec<ObjectHandle>, OnDevice)> {
-    let path = Path::new(ARTIFACT);
-    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+/// The artifact at `artifact`'s reader, its text + MTP scope and the scope on
+/// the card, or `None` when the test skips.
+fn materialized(artifact: &str) -> Option<(Reader, Vec<ObjectHandle>, OnDevice)> {
+    let path = Path::new(artifact);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {artifact}")) {
         return None;
     }
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
@@ -222,6 +225,11 @@ fn materialized() -> Option<(Reader, Vec<ObjectHandle>, OnDevice)> {
         bind_model_scope_27b(&reader, Some(DraftModule::Mtp)).unwrap_or_else(|e| panic!("bind with the MTP head: {e}"));
     let on_device = on_device(&reader, &plan)?;
     Some((reader, handles, on_device))
+}
+
+/// How many of the scope's handles are the text scope's: its first.
+fn text_len(reader: &Reader) -> usize {
+    model_scope_27b_of(reader, ModelScope::default()).unwrap_or_else(|e| panic!("text scope: {e}")).len()
 }
 
 fn encoder(reader: &Reader) -> impl Fn(&str) -> Vec<i32> + '_ {
@@ -581,11 +589,11 @@ fn embedding(reader: &Reader, token: i32) -> Vec<f64> {
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn the_head_drafts_in_the_verify_round_and_the_text_stays_the_spec_off_text() {
-    let Some((reader, handles, on_device)) = materialized() else {
+    let Some((reader, handles, on_device)) = materialized(ARTIFACT) else {
         return;
     };
     let artifact = &on_device.artifact;
-    let text_len = text_scope_27b().len();
+    let text_len = text_len(&reader);
     let (canaries, stop_ids) = chat_canaries(&reader);
     // Eight lanes carry the four canaries twice.
     let prompts8: Vec<Vec<i32>> = canaries.iter().chain(&canaries).cloned().collect();
@@ -953,13 +961,13 @@ fn the_head_drafts_in_the_verify_round_and_the_text_stays_the_spec_off_text() {
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn every_window_and_lane_count_commits_the_anchor_and_the_drafts_the_target_accepts() {
     const WINDOW_TOTAL: usize = 24;
-    let Some((reader, handles, on_device)) = materialized() else {
+    let Some((reader, handles, on_device)) = materialized(ARTIFACT) else {
         return;
     };
     let artifact = &on_device.artifact;
     let (canaries, stop_ids) = chat_canaries(&reader);
     let prompts8: Vec<Vec<i32>> = canaries.iter().chain(&canaries).cloned().collect();
-    let text_len = text_scope_27b().len();
+    let text_len = text_len(&reader);
     for window in 1..=WINDOW {
         let runs: Vec<SpecRun> = {
             let model = load_head(&reader, artifact, &handles, window, KvFormat::Bf16, MAX_CONTEXT);
@@ -1008,7 +1016,7 @@ fn every_window_and_lane_count_commits_the_anchor_and_the_drafts_the_target_acce
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn hq_rounds_clear_the_heads_ring_bits_of_every_chain_row_past_the_commit() {
     const CONTEXT: u32 = 1024;
-    let Some((reader, handles, on_device)) = materialized() else {
+    let Some((reader, handles, on_device)) = materialized(ARTIFACT) else {
         return;
     };
     let artifact = &on_device.artifact;
@@ -1107,4 +1115,54 @@ fn hq_rounds_clear_the_heads_ring_bits_of_every_chain_row_past_the_commit() {
     }
     println!("hq: {rounds} rounds over {width} lanes, {cleared} chain rows past the commit cleared, {cleared_wrapped} on a wrapped ring");
     assert!(cleared_wrapped > 0, "no chain row past a commit on a wrapped ring: the clear this test exists for never ran");
+}
+
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn on_the_16gb_artifact_the_head_drafts_and_the_substrate_commits_the_same_runs() {
+    const RUN_TOTAL: usize = 24;
+    let Some((reader, handles, on_device)) = materialized(TRELLIS) else {
+        return;
+    };
+    let artifact = &on_device.artifact;
+    let text_len = text_len(&reader);
+    let (canaries, stop_ids) = chat_canaries(&reader);
+    let prompts8: Vec<Vec<i32>> = canaries.iter().chain(&canaries).cloned().collect();
+    // Its chain scores with the trellis output head, inside every width's
+    // verify graph.
+    let runs: Vec<SpecRun> = {
+        let model = load_head(&reader, artifact, &handles, WINDOW, KvFormat::Bf16, MAX_CONTEXT);
+        let pool = head_pool(KvFormat::Bf16, 8, MAX_CONTEXT);
+        let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+        let stats = program_stats(&model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
+        assert_eq!(stats.verify_graph_ready_mask, 0xFF, "16 GB artifact: every width's verify graph, the chain in it");
+        (1..=8usize)
+            .map(|width| spec_on(&model, &pool, &prompts8[..width], &greedy(width), &stop_ids, RUN_TOTAL, WINDOW, Some(true)))
+            .collect()
+    };
+    let substrate = load_substrate(&reader, artifact, &handles[..text_len], WINDOW);
+    let pool = substrate_pool(8);
+    let _ = capture_decode_graphs(&substrate, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    let mut accepted = 0usize;
+    let mut full = (0usize, 0usize);
+    for (width, run) in (1..=8usize).zip(&runs) {
+        let replayed = replay(&substrate, &pool, &prompts8[..width], &stop_ids, RUN_TOTAL, WINDOW, run);
+        assert!(
+            replayed == rounds_of(run),
+            "16 GB artifact, {width} lanes: the substrate given the head's drafts committed other runs"
+        );
+        for &(_, extent, committed) in run.rounds.iter().flatten() {
+            accepted += committed - 1;
+            if extent == WINDOW {
+                full.0 += committed;
+                full.1 += 1;
+            }
+        }
+    }
+    println!(
+        "16 GB artifact: {accepted} drafts accepted, {:.2} committed tokens per full-window round over {} rounds",
+        full.0 as f64 / full.1.max(1) as f64,
+        full.1
+    );
+    assert!(accepted > 0, "16 GB artifact: the head never landed a draft");
 }

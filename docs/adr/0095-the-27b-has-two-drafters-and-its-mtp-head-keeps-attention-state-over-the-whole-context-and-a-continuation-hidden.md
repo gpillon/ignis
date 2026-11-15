@@ -36,7 +36,7 @@ pages are shared, cloned and freed as the target's are. The head's frontier is n
 (`ignis_mtp_head_frontier`). A pool and a blob without the head are what they were, byte for byte: 16 layers,
 the same sections, snapshot format 5. Under hq-e8-2b the head's layer takes one more layer's residual planes and
 ring words of its own, after the target's, because its appends do not land where the target's do (below) and a
-chain's rows will run past the frontier (#621); the target's words keep saying which of the target's ring rows
+chain's rows run past the frontier (#621); the target's words keep saying which of the target's ring rows
 are exact.
 
 **The entry at `p` is stored at `p` and written when `x_{p+1}` is consumed.** A step that consumes positions
@@ -104,7 +104,7 @@ stands from them, two correct routes (measured 0.087 and 0.103 relative L2), and
 
 The head leaves the target's computation as it was: the verify substrate alone, given each round the drafts it
 committed and one the target rejects, commits the same runs at the same extents, bit for bit, at every window from 1
-to 7 and every lane count from one to eight. The greedy text is the same load's spec-off text up to the near-tie
+to 7 and every lane count from one to eight, and on the 16 GB artifact. The greedy text is the same load's spec-off text up to the near-tie
 rule, with one exception the rule does not know and that names a new threshold: where both prefill routes put
 spec-off's pick ahead but the verify substrate, given the same drafts, makes spec-on's, the two picks may stand at
 most 16 BF16 ulps apart at the routes' top logit (ADR 0056's moved-pick bound, measured moved picks 0 to 8 ulps on
