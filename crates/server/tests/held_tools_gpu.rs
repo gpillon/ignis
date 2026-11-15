@@ -11,9 +11,12 @@
 //! parameters, a tool of nine parameters; long values (a script, a file
 //! about the call dialect whose content holds the dialect's own tags, a
 //! typed value of ten edits); parallel calls; a free tool beside held ones;
-//! `tool_choice` `"required"` and named; `response_format` beside the tools;
-//! thinking on and off; the Responses API with strict tools and with its
-//! default -- and cases built against the model's prior, so that it misses:
+//! `tool_choice` `"required"` and named, thinking off and on (where the
+//! forced opening joins the model's own run at the reasoning's close and may
+//! yield to the grammar, #615: the delivered name is printed);
+//! `response_format` beside the tools; thinking on and off; the Responses
+//! API with strict tools and with its default, nested optional members
+//! too -- and cases built against the model's prior, so that it misses:
 //! a value the prompt puts outside an enum, a bound or a pattern, a word
 //! where a number goes, a day that is not a date, required parameters the
 //! prompt gives nothing for or whose description calls them optional (the
@@ -154,7 +157,7 @@ fn value(exposition: &str, series: &str) -> f64 {
 
 /// What the metrics say: read whole, or as the difference across one
 /// request.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Counts {
     tool_requests: f64,
     json_requests: f64,
@@ -227,18 +230,31 @@ impl Counts {
 
 const DURATIONS: &str = "ignis_request_duration_seconds_count";
 
-/// The exposition once `requests` requests are recorded: a request's
-/// duration is the last thing its end records, after its response is sent,
-/// so a read straight after the response races.
-async fn recorded(metrics: &ignis_server::metrics::Metrics, requests: u64) -> String {
+/// The exposition once `requests` requests are recorded and every series
+/// [`Counts`] reads has held still for `polls` reads 10 ms apart: a
+/// request's end records its series one at a time (a histogram's count
+/// before its sum), its duration after its response is sent, so a read at
+/// the first sign of the end races the rest.
+async fn settled(metrics: &ignis_server::metrics::Metrics, requests: u64, polls: usize) -> String {
+    let (mut last, mut still) = (None, 0);
     for _ in 0..3_000 {
         let exposition = metrics.render();
+        let counts = Counts::read(&exposition);
         if value(&exposition, DURATIONS) as u64 >= requests {
-            return exposition;
+            still = if last == Some(counts) { still + 1 } else { 0 };
+            if still >= polls {
+                return exposition;
+            }
         }
+        last = Some(counts);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("{requests} requests never recorded:\n{}", metrics.render());
+    panic!("{requests} requests never recorded, or their series never held still:\n{}", metrics.render());
+}
+
+/// The exposition once `requests` requests are recorded, whole.
+async fn recorded(metrics: &ignis_server::metrics::Metrics, requests: u64) -> String {
+    settled(metrics, requests, 1).await
 }
 
 /// One request served: what it delivered, what the metrics say it did.
@@ -256,8 +272,9 @@ async fn serve(server: &Server, case: &Case, held: bool, done: &mut u64) -> Resu
     let before = recorded(metrics, *done).await;
     let (status, text) = send(server, case.api.path(), case.body(MODEL, held, case.max_tokens())).await;
     if status != 200 {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        *done = value(&metrics.render(), DURATIONS) as u64;
+        // Refused before it ran, it records nothing; run and failed, its
+        // duration: whichever, once the series hold still for 200 ms.
+        *done = value(&settled(metrics, *done, 20).await, DURATIONS) as u64;
         return Err(format!("{} ({:?}, held {held}): {status} {text}", case.label, case.api));
     }
     *done += 1;
