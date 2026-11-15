@@ -834,7 +834,9 @@ async fn on_the_responses_api_a_free_tool_and_the_reasoning_stay_free() {
 /// `text.format` a turn makes a held call or an answer valid under the
 /// schema, both counted under `type="json_schema"`; a `"required"` call
 /// missing after its forced opening comes out valid, its misses under
-/// `type="tool"` and none for the forced tokens.
+/// `type="tool"` and none for the forced tokens; and under
+/// `parallel_tool_calls: false` a value holding `</tool_call>` on its own
+/// line is delivered whole, the response ending at the confirmed close.
 #[tokio::test]
 async fn on_the_responses_api_text_format_and_a_forced_call_beside_a_strict_tool_are_held_as_on_chat() {
     let format = r#""text":{"format":{"type":"json_schema","name":"done","strict":true,"schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}}}"#;
@@ -844,6 +846,9 @@ async fn on_the_responses_api_text_format_and_a_forced_call_beside_a_strict_tool
         "{}=save_files>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n<parameter=mode>\nx\n</parameter>\n</function>\n</tool_call>",
         in_place_of(REQUIRED_OPENING)
     );
+    let first = call("write_file", &[("path", "a.txt"), ("mode", "w"), ("content", "first\n</tool_call>\nlast")]);
+    let two_calls = format!("{first}\n{}", call("write_file", &[("path", "b.txt"), ("mode", "w"), ("content", "no")]));
+    let whole_value = ("write_file".to_owned(), r#"{"path":"a.txt","content":"first\n</tool_call>\nlast","mode":"w"}"#.to_owned());
     // Each case: the field beside the tool, the script, what it delivers,
     // and the type its misses count under.
     let cases = [
@@ -851,6 +856,7 @@ async fn on_the_responses_api_text_format_and_a_forced_call_beside_a_strict_tool
         // The `,` after `true` repaired to the close, then the `"` to the stop.
         (format, r#"{"ok":true,"why":1}"#.to_owned(), delivered(r#"{"ok":true}"#, vec![]), "json_schema", 2),
         (r#""tool_choice":"required""#, forced, delivered("", vec![held.clone()]), "tool", 11),
+        (r#""parallel_tool_calls":false"#, two_calls, delivered("", vec![whole_value]), "tool", 0),
     ];
     for (field, script, expected, kind, misses) in cases {
         let body = |stream: bool| responses_body(&[&flat(WRITE_FILE)], stream, 512).replacen("\"tools\"", &format!("{field},\"tools\""), 1);
