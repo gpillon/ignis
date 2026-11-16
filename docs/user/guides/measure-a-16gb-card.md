@@ -9,8 +9,13 @@ The `rtx-16gb` profile is derived, not measured: the project has no 16 GB
 card ([the profile](../concepts/profiles.md#rtx-16gb)). If you run the 27B
 on an RTX 5060 Ti 16 GB, a 5070 Ti or a 5080, one command against your running
 server writes a record of what it does there, and that record, posted on
-[issue #360](https://github.com/gpillon/ignis/issues/360), is how the profile
-gets real numbers.
+[issue #360](https://github.com/gpillon/ignis/issues/360) beside the reports
+already there, is how the profile gets real numbers.
+
+The same command measures an RTX 30 or RTX 40 card (the RTX 3090, 3090 Ti and
+4090 at 24 GB, or a 16 GB RTX 40 card), which the project has none of: its
+record goes on [issue #643](https://github.com/gpillon/ignis/issues/643)
+instead ([Send it](#send-it)).
 
 A coding agent can run the whole test for you, the install included: it
 tries the default, tries a few settings if the default is refused, and writes
@@ -113,7 +118,10 @@ measured. Run it against a server without a key.
 
 Comment on [issue #360](https://github.com/gpillon/ignis/issues/360), the one
 that collects the 16 GB reports, starting with your card's name, and paste the
-whole file in a fenced block:
+whole file in a fenced block. An RTX 30 or RTX 40 card's record goes on
+[issue #643](https://github.com/gpillon/ignis/issues/643), with the start's
+`prefill routes` line and any `WARN` or `ERROR` line, each path replaced by
+`<dir>`:
 
 ````markdown
 ```json

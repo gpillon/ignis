@@ -649,7 +649,7 @@ fn a_normalized_tool_without_parameters_is_held_to_none() {
 fn a_tool_that_cannot_be_normalized_is_left_free_and_never_refused() {
     let object = |inner: &str| format!(r#"{{"type":"object","properties":{{"a":{inner}}}}}"#);
     let cases: Vec<(&str, Vec<DeclaredTool>)> = vec![
-        ("a keyword outside the strict subset", vec![normalized("g", &object(r#"{"type":"string","minLength":3}"#))]),
+        ("a keyword outside the strict subset", vec![normalized("g", &object(r#"{"oneOf":[{"type":"string"},{"type":"integer"}]}"#))]),
         ("an object open by name", vec![normalized("g", r#"{"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":true}"#)]),
         ("a map", vec![normalized("g", &object(r#"{"type":"object","additionalProperties":{"type":"string"}}"#))]),
         ("a nested object that declares no property", vec![normalized("g", &object(r#"{"type":"object"}"#))]),
@@ -670,6 +670,28 @@ fn a_tool_that_cannot_be_normalized_is_left_free_and_never_refused() {
         let grammar = cache().tool_calls(&beside).unwrap_or_else(|refused| panic!("{what}: {refused:?}"));
         assert!((0..tools.len()).all(|i| !grammar.holds(i)) && grammar.holds(tools.len()), "{what}");
     }
+}
+
+#[test]
+fn a_normalized_tool_leaves_its_length_bounds_out_and_is_held_on_the_rest() {
+    // `maxLength` on a parameter, `minLength` on a nested object's string,
+    // and a parameter named `maxLength`, which is a parameter, not a bound.
+    let schema = r#"{"type":"object","properties":{"path":{"type":"string","maxLength":4},"opts":{"type":"object","properties":{"tag":{"type":"string","minLength":3}}},"maxLength":{"type":"integer"}},"required":["path"]}"#;
+    let m = matcher_of(&cache(), &[normalized("find", schema)]);
+    assert!(m.grammar().holds(0));
+    // A string is written at any length, past either bound.
+    assert!(takes_whole(m.clone(), &call("find", &[("path", "a/longer/path")])));
+    assert!(takes_whole(m.clone(), &call("find", &[("path", "src"), ("opts", r#"{"tag": "x"}"#)])));
+    // The parameter named `maxLength` is declared, and typed.
+    assert!(takes_whole(m.clone(), &call("find", &[("path", "src"), ("maxLength", "2")])));
+    let value = "<tool_call>\n<function=find>\n<parameter=maxLength>\n";
+    assert_eq!(taken(&mut m.clone(), &format!("{value}two")), value.len());
+    // Closed: a parameter the schema does not declare is a miss at its name.
+    let head = "<tool_call>\n<function=find>\n<parameter=";
+    assert_eq!(taken(&mut m.clone(), &format!("{head}force>")), head.len());
+    // Sent `strict: true`, a length bound is still refused.
+    let strict = r#"{"type":"object","properties":{"path":{"type":"string","maxLength":4}},"required":["path"],"additionalProperties":false}"#;
+    assert_eq!(cache().tool_calls(&[tool("find", Some(strict))]).unwrap_err().refusal.code, "unsupported_keyword");
 }
 
 #[test]

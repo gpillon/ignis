@@ -48,7 +48,7 @@ arrow keys once focused.
 | **Speculation** | Acceptance, tokens per verify round, how often each draft position is kept | `ignis_speculative_*` |
 | **Reasoning** | Turns the loop guard saw loop, tokens taken back, closes the thinking budget forced | `ignis_loop_guard_*`, `ignis_thinking_forced_closes_total` |
 | **Structured output** | From 0.11.0: requests held to a grammar (an answer under `response_format`, or a held tool's calls), the sampled tokens it rejected, the repairs, and the median and p95 time of a repair | `ignis_structured_*` |
-| **Tool calls** | From 0.11.0: the tool calls the model wrote, checked against their tools' parameters: valid, invalid, dropped (a block that did not parse), the share that failed, the invalid ones by kind, strict tools outside OpenAI's strict subset, and string values the parser split at a tag inside them, dropping text after it | `ignis_tool_*` |
+| **Tool calls** | From 0.11.0: the tool calls the model wrote, checked against their tools' parameters: valid, invalid, dropped (a block that did not parse), the share that failed, the invalid ones by kind, strict tools outside OpenAI's strict subset, string values the parser split at a tag inside them, dropping text after it, and the calls with a key the switch at `held` would close: a parameter an open object does not declare | `ignis_tool_*` |
 | **Image jobs** | Jobs, pictures made, their duration and the time in each phase | `ignis_image_*` |
 | **Transcriptions** | Transcriptions that ended and how, the audio they covered, the median wait from commit, sessions open and the queue | `ignis_speech_*` |
 | **Expert residency** | Flash-Next's expert cache: hit rates, copies from host RAM, stalls | `ignis_expert_*` |

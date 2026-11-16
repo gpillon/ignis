@@ -8,7 +8,11 @@
 //!   grammar writes of a nested object either way; the top-level parameters
 //!   the client left optional are returned beside it, and a call may leave
 //!   them out, its arguments then omitting them. The arguments stay valid
-//!   under the client's own schema.
+//!   under the client's own schema, its length bounds aside.
+//! - **Length bounds are left out** (GitHub #641): `minLength` and
+//!   `maxLength` lie outside the strict subset, so a string is written at any
+//!   length, as a tool that is not held writes it, and the rest of the schema
+//!   is held. Sent `strict: true`, they are refused still.
 //! - **What closing would change is not normalized**: an object that admits
 //!   other keys by name (`additionalProperties` `true` or a schema), a nested
 //!   object that declares no property (a map, which closing would hold to
@@ -45,6 +49,7 @@ pub(crate) fn strict_form(parameters: &Json) -> Option<StrictForm> {
 /// object may declare none (a tool without parameters).
 fn close(schema: &mut Json, root: bool) -> Option<Vec<String>> {
     let Json::Obj(members) = schema else { return Some(Vec::new()) };
+    members.retain(|(keyword, _)| !matches!(keyword.as_str(), "minLength" | "maxLength"));
     let mut optional = Vec::new();
     if is_object(members) {
         if !matches!(member(members, "additionalProperties"), None | Some(Json::Bool(false))) {

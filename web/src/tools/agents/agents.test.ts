@@ -98,6 +98,8 @@ describe("toolResult and agentSummary", () => {
     expect(toolResult(run("done", { content: " answer " }))).toBe("answer");
     expect(toolResult(run("failed", { error: "boom" }))).toBe("The agent failed: boom");
     expect(toolResult(run("stopped", { content: "half" }))).toMatch(/stopped before it finished\.\n\nPartial answer:\n\nhalf/);
+    expect(toolResult(run("cut", { content: " half " }))).toBe("The agent was cut by its token limit before it finished.\n\nPartial answer:\n\nhalf");
+    expect(toolResult(run("cut"))).toBe("The agent was cut by its token limit before it finished.");
   });
 
   it("summarises the runs", () => {
@@ -235,6 +237,24 @@ describe("agents with tools", () => {
       },
       { role: "tool", content: "1. T\nhttps://t\nc", tool_call_id: "w1" },
     ]);
+  });
+
+  it("ends an agent whose round was cut at the token limit as cut, running none of its calls", async () => {
+    let ran = 0;
+    let requests = 0;
+    const stream = async (o: StreamOptions): Promise<StreamResult> => {
+      requests++;
+      o.onEvent({ kind: "content", text: "half" });
+      o.onEvent(callEvent("web_search", { query: "ignis" }));
+      o.onEvent({ kind: "tool_call", call: { id: "w2", name: "web_search", arguments: '{"query":"ig' } });
+      return { ok: true, timeline: { ...timeline(), finishReason: "length" } };
+    };
+    const countingWeb: typeof runWeb = async (tasks, o) => ((ran += tasks.length), doneWeb(tasks, o));
+    const [run] = await runAgents([task(1)], { settings, tools: webTools, signal: new AbortController().signal, onUpdate: () => {}, stream, runWeb: countingWeb });
+    expect(run).toMatchObject({ status: "cut", content: "half" });
+    expect(ran).toBe(0);
+    expect(requests).toBe(1);
+    expect(toolResult(run)).toBe("The agent was cut by its token limit before it finished.\n\nPartial answer:\n\nhalf");
   });
 
   /** An agent has no history to put a notice after: its notice goes ahead of its one prompt, the same in every round. */

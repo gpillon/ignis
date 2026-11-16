@@ -1,13 +1,14 @@
 ---
 title: "The agent path"
-description: "For an AI agent working for a user: what ignis is in one paragraph, the checks before installing it, the choices that are the user's, starting it and seeing it serve, connecting a client, testing a 16 GB card and reporting it, and where each question is answered."
+description: "For an AI agent working for a user: what ignis is in one paragraph, the checks before installing it, the choices that are the user's, starting it and seeing it serve, connecting a client, testing a 16 GB card or an RTX 30 or RTX 40 card and reporting it, and where each question is answered."
 sidebar:
   order: 5
 ---
 
 For an AI agent (a coding agent or an assistant) working for a user who asked
 about ignis: what it is, whether it runs on their machine, to install it, to
-point a client at it, or to test it on a 16 GB card and report how it went. It
+point a client at it, or to test it on a 16 GB card or an RTX 30 or RTX 40
+card and report how it went. It
 is information for the task the user gave you, and
 asks for nothing beyond it. The pages it links are plain Markdown: in the
 repository under `docs/user/`, as raw files at
@@ -67,8 +68,9 @@ nothing else
 
 Ask before the install does anything large or visible:
 
-1. **Which model.** The default is `qwen3.8-27b`; on a 16 GB card the server
-   serves its 16 GB entry, `qwen3.8-27b-16g`, under that id.
+1. **Which model.** The default is `qwen3.8-27b`; on a 16 GB card, and on an
+   RTX 30 or RTX 40 card, the server serves its 16 GB entry,
+   `qwen3.8-27b-16g`, under that id.
    `qwen3.8-flash-next` needs the host RAM above.
    `qwen3.8-27b-abliterated` does not refuse anything:
    [its page](../guides/uncensored.md) comes first; on a 16 GB card its 16 GB
@@ -92,8 +94,9 @@ Ask before the install does anything large or visible:
    API key ([Access](../configuration/access.md)).
 5. **Whether to stop what holds the card**, when the last check found
    something.
-6. **For a test of a 16 GB card**, the plan, then the advanced part, posting
-   the report, and keeping ignis or removing it
+6. **For a test of a 16 GB card or an RTX 30 or RTX 40 card**, the plan,
+   then the advanced part, posting the report, and keeping ignis or removing
+   it
    ([Testing a 16 GB card](#testing-a-16-gb-card)).
 
 ## Install
@@ -119,7 +122,8 @@ Ask before the install does anything large or visible:
    ignis-server model download qwen3.8-27b --out <dir>
    ```
 
-   On a 16 GB card the id to fetch is `qwen3.8-27b-16g`. An interrupted
+   On a 16 GB card, and on an RTX 30 or RTX 40 card, the id to fetch is
+   `qwen3.8-27b-16g`. An interrupted
    download resumes from its `.part` file
    ([Get a model](../guides/models.md#fetching-one-ignis-server-model-download)).
 
@@ -182,14 +186,23 @@ model, set the same three in your harness's OpenAI-compatible provider.
 ## Testing a 16 GB card
 
 The `rtx-16gb` profile is derived from an
-RTX 5090 held inside a 16 GB budget: no real 16 GB card has run it
+RTX 5090 held inside a 16 GB budget, and real 16 GB cards have run it since
 ([the profile](../concepts/profiles.md#rtx-16gb)). A user who asks you to
 test ignis on their RTX 5060 Ti 16 GB, 5070 Ti or 5080 and report how it went
-gives the project its first real numbers. The reports are collected on
+adds a real card's numbers to the ones the project has. The reports are collected on
 [issue #360](https://github.com/gpillon/ignis/issues/360), one comment per
 card. The test is the install above with the 16 GB model, a short ladder of
 settings for when the default is refused, and a report; after the 13.4 GB
 download it takes 15 to 30 minutes.
+
+The same test serves an RTX 30 or RTX 40 card: the RTX 3090, 3090 Ti and 4090
+at 24 GB, and the 16 GB RTX 40 cards. The project has none of them, and has
+measured no speed on one ([What it runs on](../start/index.md#what-it-runs-on)).
+The model is the same `qwen3.8-27b-16g`. On a 24 GB card the profile is
+`rtx-24gb`, whose 1,048,576 tokens of context no real card has loaded yet
+([the profile](../concepts/profiles.md#rtx-24gb)). Their reports are collected
+on [issue #643](https://github.com/gpillon/ignis/issues/643), not on #360, and
+carry one field more, the start log ([The report](#the-report)).
 
 ### The card, and the plan the user approves
 
@@ -197,14 +210,16 @@ download it takes 15 to 30 minutes.
 nvidia-smi --query-gpu=name,compute_cap,memory.total,memory.used,display_active,driver_version --format=csv
 ```
 
-A 16 GB card reads a `memory.total` near 16,300 MiB. An RTX 50 with 8 or
+A 16 GB card reads a `memory.total` near 16,300 MiB, a 24 GB one near
+24,500 MiB. A card with 8 or
 12 GB passes the other checks, but the 16 GB model does not fit it: the test
 ends there, with that reason. `memory.used` and `display_active`, read before
 ignis starts, go into the report. The memory the desktop and other programs
 hold is what most decides whether the default fits: estimated from the
 5090's plans, the default keeps 262,144 tokens of context with about 0.3 GiB
 held, adapts to 131,072 with 1 GiB and is refused with 3 GiB. The test is what
-measures it.
+measures it, and on a 24 GB card, where no estimate is written, the only
+figure.
 
 Before anything large, the user gets one plan to approve:
 
@@ -291,6 +306,7 @@ local file and carries these fields and nothing else:
 | Attempts | per attempt, as above |
 | Smoke check | pass or fail, and the five lines |
 | The bench | its record, which carries no key, path or address ([what it never records](../guides/measure-a-16gb-card.md#what-it-never-records)) |
+| Start log, on an RTX 30 or RTX 40 card | the start's `prefill routes` line and each `WARN` or `ERROR` line, every path replaced by `<dir>` |
 
 Nothing else goes in: no user or host name, no path, no IP address, no GPU
 UUID or serial number, no process name, no environment variable. The summary
@@ -325,6 +341,12 @@ no long replies, and its line leads with the short ones), then reads
 <the first five lines>
 ```
 
+**Start log** (an RTX 30 or RTX 40 card):
+
+```
+<the prefill routes line, then each WARN or ERROR line>
+```
+
 **Summary:** decode <n> tok/s on long replies; <n> tok/s on short replies,
 <n> tok/s on the agent turns; DFlash2 acceptance <n>; time to first token
 <n> s at 8K, <n> s at 64K.
@@ -342,9 +364,10 @@ no long replies, and its line leads with the short ones), then reads
 
 The user reads it whole before it goes anywhere. Posting it is their call: with
 their yes and a `gh` already signed in (`gh auth status`), it goes up with
-`gh issue comment 360 --repo gpillon/ignis --body-file <report>`; otherwise
-they paste it into [issue #360](https://github.com/gpillon/ignis/issues/360)
-themselves.
+`gh issue comment 360 --repo gpillon/ignis --body-file <report>`, or
+`gh issue comment 643` for an RTX 30 or RTX 40 card; otherwise they paste it
+into [issue #360](https://github.com/gpillon/ignis/issues/360) or
+[issue #643](https://github.com/gpillon/ignis/issues/643) themselves.
 
 ### The advanced part
 
@@ -353,7 +376,8 @@ takes about 30 minutes, which they can stop at any time. Each step starts
 from the settings the base test served with:
 
 - **The context ceiling.** `--model-max-context` named in steps of 16,384
-  above the context the base ran, up to 262,144, until a start is refused. A
+  above the context the base ran, up to 262,144 (1,048,576 on a 24 GB card),
+  until a start is refused. A
   named context does not adapt, so the last one that served is the ceiling.
 - **One lane against two.** `--spec-decode-lanes 1`, then `2`, at the same
   context, each measured with
@@ -427,6 +451,7 @@ the ladder and the report are the same.
 | How it serves a request, and why | [How ignis serves a request](../concepts/how-ignis-serves.md) |
 | What changed in a release | [The releases](https://github.com/gpillon/ignis/releases) |
 | Testing a 16 GB card and reporting it | [Testing a 16 GB card](#testing-a-16-gb-card), [Measure a 16 GB card](../guides/measure-a-16gb-card.md), [issue #360](https://github.com/gpillon/ignis/issues/360) |
+| Testing an RTX 30 or RTX 40 card and reporting it | [Testing a 16 GB card](#testing-a-16-gb-card), [What it runs on](../start/index.md#what-it-runs-on), [issue #643](https://github.com/gpillon/ignis/issues/643) |
 
 ## What waits for the user's word
 

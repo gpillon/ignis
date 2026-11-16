@@ -88,6 +88,11 @@ The most a request may generate, reasoning included: its `max_tokens`
 `--model-max-context`. Reaching it ends the request with `finish_reason:
 "length"`.
 
+**Cut tool call**:
+A tool call a `length` ending stopped before it closed: it reaches the client
+with its name and the arguments written so far (ADR 0096).
+_Avoid_: truncated call, partial call, interrupted call.
+
 **Deadline**:
 How long a request may run before the server cuts it (ADR 0058):
 `server.request_timeout` for one answered whole, `server.stream_timeout` for
@@ -1419,7 +1424,8 @@ _Avoid_: strict function calling
 A **held tool** sent without `strict` whose schema the server rewrote into
 strict form, its objects closed and its optional parameters left out of the
 arguments when the call leaves them out: OpenAI's default on the Responses
-API, and every tool not sent `strict: true` under the operator's `held`. A
+API, and every tool not sent `strict: true` under the operator's `held`. Its
+length bounds are left out, outside the strict subset (GitHub #641). A
 schema that cannot be normalized leaves its tool free, never refused.
 
 **Confirmed close**:

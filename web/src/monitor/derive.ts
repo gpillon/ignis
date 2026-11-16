@@ -254,8 +254,8 @@ export type StructuredOutputCard = {
  * The Tool calls card's figures (#608): the call blocks the model wrote over
  * the window, by what the check against their tools' parameters found, the
  * share that failed it, the invalid ones by kind of violation, the strict
- * tools that came outside the strict subset, and the values split at a tag
- * (#610).
+ * tools that came outside the strict subset, the values split at a tag
+ * (#610), and the calls holding a key `held` would close (#641).
  */
 export type ToolCallsCard = {
   calls: Tally;
@@ -266,6 +266,8 @@ export type ToolCallsCard = {
   strictOutsideSubset: Tally;
   /** String values of tools not held from which the parser dropped text after a tag, text the confirmed close would keep (#610). */
   valuesSplit: Tally;
+  /** Calls holding a parameter that an object the switch at `held` would close does not declare, valid or not (#641). */
+  undeclaredParameters: Tally;
 };
 
 /**
@@ -719,6 +721,7 @@ export function deriveToolCalls(points: Point[], since: number): ToolCallsCard {
     ) as Record<ToolCallViolation, Tally>,
     strictOutsideSubset: tally((s) => s.toolCalls?.strictOutsideSubset ?? null),
     valuesSplit: tally((s) => s.toolCalls?.valuesSplit ?? null),
+    undeclaredParameters: tally((s) => s.toolCalls?.undeclaredParameters ?? null),
   };
 }
 

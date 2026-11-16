@@ -32,7 +32,10 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   `function_call` item, over HTTP and over the WebSocket mode, which is what
   an agent CLI that sends `false` on every request asks for. Nothing
   generated after that close is sent or counted in `usage`, a call written
-  inside the reasoning ends nothing, and such a response carries no
+  inside the reasoning ends nothing, nor does a call block that does not
+  parse (never sent: the model goes on as with `true`, and the response's
+  call is the next one that parses, if it writes one), and such a response
+  carries no
   `thinking_budget_forced_at`. `true` or absent serves every
   call the model writes; the response echoes the value
   ([chat completions](chat-completions.md) has the same rule).
@@ -69,9 +72,10 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   versions serve it free): its `parameters` are put in strict form, every
   object closed, so a call names no parameter they do not declare, and an
   optional parameter, one `required` does not list, may be left out and
-  stays out of `arguments`, which are valid under the schema you sent. A
-  schema that cannot be normalized leaves the tool free, as before, and is
-  never a `400` ([Held tools on the Responses API](structured-output.md#on-the-responses-api)).
+  stays out of `arguments`, which are valid under the schema you sent, its
+  length bounds aside (a normalized tool leaves `minLength` and `maxLength`
+  out). A schema that cannot be normalized leaves the tool free, as before,
+  and is never a `400` ([Held tools on the Responses API](structured-output.md#on-the-responses-api)).
   `strict: null` is the same as no `strict`, and `strict: false` serves the
   tool free, as before, so an agent CLI that sends `false` on every tool
   sees no change, unless the operator holds every tool
@@ -88,7 +92,16 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   echoes `strict: false`.
 - A length stop ends `incomplete` (`max_output_tokens`), an engine error
   `failed`; `usage` carries `input_tokens_details.cached_tokens` and
-  `output_tokens_details.reasoning_tokens`.
+  `output_tokens_details.reasoning_tokens`. A tool call the cap cuts before it
+  closes (from 0.11.0; 0.10.0 drops it) is the response's last
+  `function_call` item, `status: "incomplete"`, with its name and the
+  arguments written so far, a JSON prefix that does not parse; every call
+  that closed stays `completed`. Streamed, it carries a closed call's four
+  events, `response.output_item.added`,
+  `response.function_call_arguments.delta` and `.done`, and
+  `response.output_item.done`, before `response.incomplete`, and the response
+  a `previous_response_id` continues holds it. A cancel or a failure drops a
+  call left open ([Chat completions](chat-completions.md) has the rule).
 
 **WebSocket mode.** `GET /v1/responses` upgrades to a WebSocket, keyed like
 HTTP: `Authorization: Bearer <key>` on the upgrade, or a

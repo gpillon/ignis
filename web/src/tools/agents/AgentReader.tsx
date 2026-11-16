@@ -1,5 +1,6 @@
 import { type ReactNode, useEffect, useLayoutEffect, useRef } from "react";
 import { BudgetReached } from "../../metrics/BudgetReached.tsx";
+import { CutAtLimit } from "../../metrics/CutAtLimit.tsx";
 import { Markdown } from "../../ui/Markdown.tsx";
 import { ReasoningText } from "../../ui/ReasoningText.tsx";
 import { isAtBottom } from "../../ui/scroll.ts";
@@ -97,6 +98,11 @@ export function AgentReader(props: { run: AgentRun; markdown: boolean; figures: 
         {run.web && run.web.length > 0 && <WebStrip runs={run.web} />}
         {run.local && run.local.length > 0 && <LocalStrip runs={run.local} />}
         {run.unknownTools && run.unknownTools.length > 0 && <UnknownCalls calls={run.unknownTools} />}
+        {run.status === "cut" && (
+          <p>
+            <CutAtLimit />
+          </p>
+        )}
         <section aria-label="Answer" className="flex flex-col gap-3">
           {run.content ? (
             props.markdown ? (
@@ -113,7 +119,7 @@ export function AgentReader(props: { run: AgentRun; markdown: boolean; figures: 
                 ? "Waiting for a free lane."
                 : run.status === "running"
                   ? "No answer yet."
-                  : run.status === "failed"
+                  : run.status === "failed" || run.status === "cut"
                     ? ""
                     : "The agent returned no text."}
             </p>

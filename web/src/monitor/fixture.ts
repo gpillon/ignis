@@ -445,6 +445,9 @@ ignis_tool_strict_outside_subset_total 5
 # HELP ignis_tool_call_values_split_total String values of calls to tools that are not held, from which the parser dropped text after a tag inside them that a held tool's rule, the confirmed close, would have kept in the value.
 # TYPE ignis_tool_call_values_split_total counter
 ignis_tool_call_values_split_total 2
+# HELP ignis_tool_call_undeclared_parameters_total Tool calls holding a parameter that an object with no additionalProperties does not declare, in a tool the switch model.tool_arguments at held would hold, once per call, valid or not: what held would change, as JSON Schema admits such a parameter.
+# TYPE ignis_tool_call_undeclared_parameters_total counter
+ignis_tool_call_undeclared_parameters_total 4
 `;
 
 export const TOOL_CALL_EXPOSITION = `${IGNIS_EXPOSITION}${TOOL_CALL_FAMILIES}`;

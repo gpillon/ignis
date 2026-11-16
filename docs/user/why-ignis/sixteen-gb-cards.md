@@ -13,12 +13,13 @@ On a 16 GB card the server picks the matching profile and the matching
 catalog entry by itself, and the artifact passed **all four quality gates**
 against the NVFP4 it stands in for.
 
-:::caution[Not yet measured on a 16 GB card]
+:::caution[Measured on an RTX 5090 held to 16 GiB]
 The project has no 16 GB card. Every figure below was measured on an RTX 5090
 held to a 16 GiB budget; the speeds for the 5060 Ti 16 GB, 5070 Ti and 5080 are
 an estimate from those measurements. If you have one of these cards,
-[one command measures it](../guides/measure-a-16gb-card.md), and its report is
-how the profile gets real numbers.
+[one command measures it](../guides/measure-a-16gb-card.md), and its report
+joins the real cards' reports on
+[issue #360](https://github.com/gpillon/ignis/issues/360).
 :::
 
 ## How it works

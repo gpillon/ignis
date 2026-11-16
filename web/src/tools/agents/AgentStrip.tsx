@@ -36,6 +36,7 @@ function AgentCard({ run, now, open, onOpen }: { run: AgentRun; now: number; ope
     done: "bg-ember",
     failed: "bg-fault",
     stopped: "bg-ash",
+    cut: "bg-ember",
   }[run.status];
   return (
     <button

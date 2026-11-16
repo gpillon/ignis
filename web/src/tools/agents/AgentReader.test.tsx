@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { Figures } from "../../metrics/figures.ts";
 import { AgentReader } from "./AgentReader.tsx";
 import type { AgentRun } from "./agents.ts";
+import { statusLine } from "./status.tsx";
 
 // An agent's reasoning runs across every request it made; the reader marks
 // it when the thinking budget closed any of them.
@@ -31,6 +32,15 @@ const run = (rounds: Figures[]): AgentRun => ({
 
 const render = (r: AgentRun) =>
   renderToStaticMarkup(<AgentReader run={r} markdown={false} figures={null} systemPrompt="s" onClose={() => {}} />);
+
+describe("AgentReader and a cut agent", () => {
+  it("marks an agent cut at the token limit, and does not say it returned no text", () => {
+    const html = render({ ...run([{ ...round(), finishReason: "length" }]), status: "cut", content: "" });
+    expect(html).toContain("Cut at the token limit");
+    expect(html).not.toContain("The agent returned no text.");
+    expect(statusLine({ ...run([round()]), status: "cut" }, 0)).toBe("Cut");
+  });
+});
 
 describe("AgentReader and the thinking budget", () => {
   it("marks the reasoning when the budget closed any of the agent's requests", () => {

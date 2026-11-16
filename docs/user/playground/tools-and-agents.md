@@ -34,6 +34,12 @@ the **agent reader**: its system prompt, its task, its reasoning, the tools it
 called, its answer and its own figures. The session log gets a row per agent
 request, tagged `agent <name>`.
 
+From 0.11.0 an agent whose reply reaches its token limit ends as **Cut**, beside
+Done, Failed and Stopped, and the reader shows **Cut at the token limit**. It
+runs none of that reply's tool calls. The model that launched it receives
+*The agent was cut by its token limit before it finished.* and, if the agent
+had written any, its partial answer.
+
 ![The agent reader](../images/playground/agent-reader.png)
 
 This is the load ignis is built for: one main conversation and a burst of

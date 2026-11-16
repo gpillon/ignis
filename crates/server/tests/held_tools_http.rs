@@ -449,6 +449,7 @@ fn refused_tools() -> Vec<(String, &'static str, &'static str, &'static str)> {
     let object = |inner: &str| strict(&format!(r#"{{"type":"object","properties":{{"a":{inner}}},"required":["a"],"additionalProperties":false}}"#));
     vec![
         (object(r#"{"type":"string","minLength":2}"#), "unsupported_keyword", "tools[1].function.parameters", "`minLength`"),
+        (object(r#"{"type":"string","maxLength":8}"#), "unsupported_keyword", "tools[1].function.parameters", "`maxLength`"),
         (strict(r#"{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}"#), "additional_properties_not_false", "tools[1].function.parameters", "`additionalProperties`"),
         (strict(r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a"],"additionalProperties":false}"#), "not_all_required", "tools[1].function.parameters", "`required`"),
         (object(r#"{"type":"string","enum":["two\nlines"]}"#), "no_writable_value", "tools[1].function.parameters", "`enum`"),
@@ -539,14 +540,21 @@ async fn a_streamed_held_call_arrives_only_once_complete() {
     assert_eq!(calls[0].1, r#"{"path":"a.txt","content":"hi","mode":"a"}"#);
 }
 
-/// A call `max_tokens` cuts is left open, so dropped, as every open call
-/// is, with `finish_reason: "length"` (#583 changes how it is sent).
+/// A held call `max_tokens` cuts is a cut tool call (GitHub #583): its
+/// values read by the confirmed close as far as they were written, the one
+/// in progress last, with `finish_reason: "length"`; it is not counted in
+/// `ignis_tool_calls_total`. The cap lands after `a long`: nine tokens of
+/// content, the call's open tag, then one token a character.
 #[tokio::test]
-async fn a_held_call_the_cap_cuts_is_dropped_with_length() {
+async fn a_held_call_the_cap_cuts_is_a_cut_call_with_length() {
     let script = format!("Writing.\n{}", call("write_file", &[("path", "a.txt"), ("content", "a long text"), ("mode", "w")]));
     let (server, _) = server(&script, ModelFamily::Qwen38_27b);
-    let (content, calls, finish) = served(&server, &chat(&[WRITE_FILE], false, 40)).await;
-    assert_eq!((content.as_str(), calls.len(), finish.as_str()), ("Writing.\n", 0, "length"));
+    let (content, calls, finish) = served(&server, &chat(&[WRITE_FILE], false, 95)).await;
+    assert_eq!((content.as_str(), finish.as_str()), ("Writing.\n", "length"));
+    assert_eq!(calls, [("write_file".to_owned(), r#"{"path":"a.txt","content":"a long"#.to_owned())]);
+    let text = server.metrics.as_ref().unwrap().render();
+    let counted: Vec<&str> = text.lines().filter(|line| line.starts_with("ignis_tool_calls_total{") && !line.ends_with(" 0")).collect();
+    assert!(counted.is_empty(), "{counted:?}");
 }
 
 /// `tools` is read in its key order as sent by the deserializer that read
@@ -1179,6 +1187,7 @@ async fn on_the_responses_api_a_tool_sent_without_strict_is_normalized_held_and_
         assert!(valid_flat(FIND, arguments), "{what}: {arguments}");
         assert_eq!(response["tools"][0]["strict"], true, "{what}");
         counted(&metrics, 1, misses).await;
+        none_held_would_close(&metrics).await;
         assert!(mock.decode_calls().iter().flatten().all(|job| job.checked), "{what}: every round of the content is checked");
         let (streamed, metrics, _) = over_http(&script, &responses_body(&[FIND], true, 512), true).await;
         assert_eq!(streamed, whole, "{what}: streamed and whole");
@@ -1198,12 +1207,12 @@ async fn on_the_responses_api_a_tool_sent_without_strict_is_normalized_held_and_
 /// and the WebSocket mode alike.
 #[tokio::test]
 async fn on_the_responses_api_a_tool_whose_schema_does_not_normalize_is_served_free_and_echoed_strict_false() {
-    let length = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1}}}}"#;
+    let one_of = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"oneOf":[{"type":"string"},{"type":"integer"}]}}}}"#;
     let map = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string"},"labels":{"type":"object","additionalProperties":{"type":"string"}}}}}"#;
     let look = "<tool_call>\n<function=look>\n<parameter=query>\ncats\n</parameter>\n<parameter=limit>\nmany\n</parameter>\n</function>\n</tool_call>";
     let find = "<tool_call>\n<function=find>\n<parameter=flag>\nsrc\n</parameter>\n</function>\n</tool_call>";
     let cases = [
-        (ModelFamily::Qwen38_27b, length, look, r#"{"limit":"many","query":"cats"}"#),
+        (ModelFamily::Qwen38_27b, one_of, look, r#"{"limit":"many","query":"cats"}"#),
         (ModelFamily::Qwen38_27b, map, look, r#"{"limit":"many","query":"cats"}"#),
         (ModelFamily::FlashNext, FIND, find, r#"{"flag":"src"}"#),
     ];
@@ -1223,6 +1232,56 @@ async fn on_the_responses_api_a_tool_whose_schema_does_not_normalize_is_served_f
     }
 }
 
+/// A tool sent without `strict` whose schema bounds a string's length is
+/// normalized with its length bounds left out (GitHub #641): held on the
+/// rest, every round checked, and echoed `strict: true` on the Responses
+/// API. A string past its bound is served as written, and the call check,
+/// which reads the schema as sent, counts the call `invalid` under
+/// `constraint`. The same on chat completions with the switch at `held`.
+#[tokio::test]
+async fn a_normalized_tools_length_bounds_are_left_out_and_the_rest_of_it_held() {
+    let look = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string","maxLength":4},"opts":{"type":"object","properties":{"tag":{"type":"string","minLength":3}}}},"required":["query"]}}"#;
+    // `query` past its `maxLength`, the nested `tag` short of its `minLength`.
+    let script = call("look", &[("query", "cats and dogs"), ("opts", r#"{"tag": "x"}"#)]);
+    let calls = [("look".to_owned(), r#"{"query":"cats and dogs","opts":{"tag":"x"}}"#.to_owned())];
+    let (response, metrics, mock) = responses_post(&script, ModelFamily::Qwen38_27b, &responses_body(&[look], false, 256)).await;
+    assert_eq!(delivered(&response).calls, calls, "responses");
+    assert_eq!(response["tools"][0]["strict"], true, "responses");
+    assert!(mock.decode_calls().iter().flatten().all(|job| job.checked), "responses: every round of the content is checked");
+    counted_invalid_by_its_length(&metrics).await;
+    let (server, mock) = held_server(&script, ModelFamily::Qwen38_27b);
+    let (_, served_calls, _) = served(&server, &chat(&[&chat_shaped(look)], false, 256)).await;
+    assert_eq!(served_calls, calls, "chat at held");
+    assert!(mock.decode_calls().iter().flatten().all(|job| job.checked), "chat: every round of the content is checked");
+    counted_invalid_by_its_length(server.metrics.as_ref().unwrap()).await;
+}
+
+/// One held call, with no miss, counted `invalid` for its lengths alone, and
+/// no parameter `held` would close in it.
+async fn counted_invalid_by_its_length(metrics: &ignis_server::metrics::Metrics) {
+    counted(metrics, 1, 0).await;
+    // The outcome is counted last.
+    responses::metric_reaches(metrics, "ignis_tool_calls_total{outcome=\"invalid\"} 1").await;
+    let exposition = metrics.render();
+    let lines = [
+        "ignis_tool_calls_total{outcome=\"valid\"} 0",
+        "ignis_tool_call_violations_total{kind=\"constraint\"} 1",
+        "ignis_tool_call_undeclared_parameters_total 0",
+    ];
+    for line in lines {
+        assert!(exposition.contains(&format!("\n{line}\n")), "no `{line}` in:\n{exposition}");
+    }
+}
+
+/// One valid call of a held tool, and no parameter `held` would close
+/// counted in it, though the script invents one: the grammar let none be
+/// written (#641).
+async fn none_held_would_close(metrics: &ignis_server::metrics::Metrics) {
+    responses::metric_reaches(metrics, "ignis_tool_calls_total{outcome=\"valid\"} 1").await;
+    let exposition = metrics.render();
+    assert!(exposition.contains("\nignis_tool_call_undeclared_parameters_total 0\n"), "{exposition}");
+}
+
 /// The response's `tools` are the request's, each as sent, and a tool sent
 /// without `strict`, or with `null`, carries the one it was served with
 /// beside its `name`, in its `function` for a tool in the chat shape: `true`
@@ -1232,11 +1291,11 @@ async fn on_the_responses_api_a_tool_whose_schema_does_not_normalize_is_served_f
 /// calls, every tool echoes `false`, a `strict: true` inert there.
 #[tokio::test]
 async fn on_the_responses_api_each_tool_echoes_the_strict_it_was_served_with() {
-    let length = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1}}}}"#;
+    let one_of = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"oneOf":[{"type":"string"},{"type":"integer"}]}}}}"#;
     let chat_shaped = r#"{"type":"function","function":{"name":"list","parameters":{"type":"object","properties":{"dir":{"type":"string"}}}}}"#;
     let null = FIND.replacen("\"name\":\"find\"", "\"name\":\"seek\",\"strict\":null", 1);
     let (search, write_file) = (flat(&strict_false(SEARCH)), flat(WRITE_FILE));
-    let tools = [FIND, length, chat_shaped, null.as_str(), search.as_str(), write_file.as_str()];
+    let tools = [FIND, one_of, chat_shaped, null.as_str(), search.as_str(), write_file.as_str()];
     // The tools as sent, each sent without `strict` given the one it is
     // echoed with.
     let echoed = |strict: [Option<bool>; 6]| -> JsonValue {
@@ -1439,11 +1498,11 @@ async fn with_the_switch_held_a_chat_tool_not_sent_strict_has_its_calls_held() {
 /// Responses API echoes it `strict: false`.
 #[tokio::test]
 async fn with_the_switch_held_a_tool_whose_schema_does_not_normalize_stays_free() {
-    let length = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1}}}}"#;
+    let one_of = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"oneOf":[{"type":"string"},{"type":"integer"}]}}}}"#;
     let map = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string"},"labels":{"type":"object","additionalProperties":{"type":"string"}}}}}"#;
     let look = "<tool_call>\n<function=look>\n<parameter=query>\ncats\n</parameter>\n<parameter=limit>\nmany\n</parameter>\n</function>\n</tool_call>";
     let free = [("look".to_owned(), r#"{"limit":"many","query":"cats"}"#.to_owned())];
-    for tool in [length.to_owned(), strict_false(length), map.to_owned(), strict_false(map)] {
+    for tool in [one_of.to_owned(), strict_false(one_of), map.to_owned(), strict_false(map)] {
         let (server, mock) = held_server(look, ModelFamily::Qwen38_27b);
         let (_, calls, _) = served(&server, &chat(&[&chat_shaped(&tool)], false, 256)).await;
         assert_eq!(calls, free, "chat: {tool}");
@@ -1492,6 +1551,7 @@ async fn with_the_switch_held_the_responses_api_holds_a_tool_sent_strict_false_a
         assert_eq!(response["tools"][0]["strict"], true, "{what}");
         assert!(mock.decode_calls().iter().flatten().all(|job| job.checked), "{what}: every round of the content is checked");
         tool_counts(&server, 1, misses).await;
+        none_held_would_close(server.metrics.as_ref().unwrap()).await;
         let (server, _) = held_server(&script, ModelFamily::Qwen38_27b);
         assert_eq!(delivered_over_http(&server, &responses_body(&[&tool], true, 512), true).await, whole, "{what}: streamed and whole");
         tool_counts(&server, 1, misses).await;
@@ -1511,11 +1571,11 @@ async fn with_the_switch_held_the_responses_api_holds_a_tool_sent_strict_false_a
 /// the switch does not reach, every tool `false`, as at the default.
 #[tokio::test]
 async fn with_the_switch_held_each_tool_echoes_the_strict_it_was_served_with() {
-    let length = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1}}}}"#;
+    let one_of = r#"{"type":"function","name":"look","parameters":{"type":"object","properties":{"query":{"oneOf":[{"type":"string"},{"type":"integer"}]}}}}"#;
     let chat_shaped_false = strict_false(r#"{"type":"function","function":{"name":"list","parameters":{"type":"object","properties":{"dir":{"type":"string"}}}}}"#);
     let (search, write_file) = (flat(&strict_false(SEARCH)), flat(WRITE_FILE));
-    let length_false = strict_false(length);
-    let tools = [FIND, length_false.as_str(), chat_shaped_false.as_str(), search.as_str(), write_file.as_str()];
+    let one_of_false = strict_false(one_of);
+    let tools = [FIND, one_of_false.as_str(), chat_shaped_false.as_str(), search.as_str(), write_file.as_str()];
     let echoed = |strict: [Option<bool>; 5]| -> JsonValue {
         let echoed = tools.iter().zip(strict).map(|(tool, strict)| {
             let mut tool: JsonValue = serde_json::from_str(tool).unwrap();

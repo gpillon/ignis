@@ -204,12 +204,15 @@ async fn a_browser_on_another_origin_can_read_why_an_answer_stopped() {
     }
 }
 
-/// A tool call the deadline cut mid-way is dropped whole: the content
-/// before it stands, and no half-written call reaches the client. Answered
-/// whole, with and without a stop sequence, and streamed: three ways of
-/// assembling the answer.
-async fn check_a_cut_tool_call_is_dropped(stream: bool, stop: Option<&str>) {
-    let rig = one_second(&["Reading it. ", "<tool_call>\n<function=read_file>\n<parameter=path>\na."], TimeoutReply::Partial);
+/// A tool call the deadline cut mid-way is a cut tool call under `partial`
+/// (GitHub #583): the content before it stands, and the call reaches the
+/// client last, with its name and the arguments written so far, and
+/// `finish_reason: "length"`. Under `error` the answers are today's: a
+/// `504`, or the stream's error chunk, and no call. Answered whole, with
+/// and without a stop sequence, and streamed: three ways of assembling the
+/// answer.
+async fn check_a_tool_call_the_deadline_cut(stream: bool, stop: Option<&str>, reply: TimeoutReply) {
+    let rig = one_second(&["Reading it. ", "<tool_call>\n<function=read_file>\n<parameter=path>\na."], reply);
     let mut body = chat(stream);
     body["tools"] = json!([{ "type": "function", "function": { "name": "read_file", "parameters": {
         "type": "object", "properties": { "path": { "type": "string" } }
@@ -217,38 +220,68 @@ async fn check_a_cut_tool_call_is_dropped(stream: bool, stop: Option<&str>) {
     if let Some(stop) = stop {
         body["stop"] = json!([stop]);
     }
-    let reply = tokio::spawn(post(&rig.app, "/v1/chat/completions", body).then(read));
+    let answer = tokio::spawn(post(&rig.app, "/v1/chat/completions", body).then(read));
     rig.holds();
-    let (status, _, body) = reply.await.unwrap();
-    assert_eq!(status, 200, "{body}");
-    if stream {
-        let chunks = chunks(&body);
-        assert_eq!(streamed_text(&chunks, "content"), "Reading it. ", "{body}");
-        assert!(chunks.iter().all(|c| c["choices"][0]["delta"].get("tool_calls").is_none()), "{body}");
-        assert_eq!(finish_reasons(&chunks), ["length"], "{body}");
-    } else {
-        let v: Value = serde_json::from_str(&body).unwrap();
-        let message = &v["choices"][0]["message"];
-        assert_eq!(message["content"], "Reading it. ", "{body}");
-        assert!(message.get("tool_calls").is_none(), "{body}");
-        assert_eq!(v["choices"][0]["finish_reason"], "length", "{body}");
+    let (status, _, body) = answer.await.unwrap();
+    let cut = json!([{ "name": "read_file", "arguments": "{\"path\":\"a." }]);
+    match (stream, reply) {
+        (true, _) => {
+            assert_eq!(status, 200, "{body}");
+            let chunks = chunks(&body);
+            assert_eq!(streamed_text(&chunks, "content"), "Reading it. ", "{body}");
+            let calls: Vec<Value> = chunks
+                .iter()
+                .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array())
+                .flatten()
+                .map(|c| json!({ "name": c["function"]["name"], "arguments": c["function"]["arguments"] }))
+                .collect();
+            match reply {
+                TimeoutReply::Partial => {
+                    assert_eq!((Value::from(calls), finish_reasons(&chunks)), (cut, vec!["length"]), "{body}");
+                }
+                TimeoutReply::Error => {
+                    assert!(calls.is_empty() && finish_reasons(&chunks).is_empty(), "{body}");
+                    assert!(chunks.iter().any(|c| c["error"]["code"] == "request_timeout"), "{body}");
+                }
+            }
+        }
+        (false, TimeoutReply::Partial) => {
+            assert_eq!(status, 200, "{body}");
+            let v: Value = serde_json::from_str(&body).unwrap();
+            let message = &v["choices"][0]["message"];
+            assert_eq!(message["content"], "Reading it. ", "{body}");
+            let calls: Vec<Value> = message["tool_calls"].as_array().into_iter().flatten().map(|c| c["function"].clone()).collect();
+            assert_eq!(Value::from(calls), cut, "{body}");
+            assert_eq!(v["choices"][0]["finish_reason"], "length", "{body}");
+        }
+        (false, TimeoutReply::Error) => {
+            assert_eq!(status, 504, "{body}");
+            assert!(!body.contains("read_file"), "{body}");
+        }
     }
     rig.the_lane_comes_back().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_tool_call_the_deadline_cut_is_dropped() {
-    check_a_cut_tool_call_is_dropped(false, None).await;
+async fn a_tool_call_the_deadline_cut_is_a_cut_call() {
+    check_a_tool_call_the_deadline_cut(false, None, TimeoutReply::Partial).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_tool_call_the_deadline_cut_is_dropped_with_a_stop_sequence() {
-    check_a_cut_tool_call_is_dropped(false, Some("zzz")).await;
+async fn a_tool_call_the_deadline_cut_is_a_cut_call_with_a_stop_sequence() {
+    check_a_tool_call_the_deadline_cut(false, Some("zzz"), TimeoutReply::Partial).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_streamed_tool_call_the_deadline_cut_is_dropped() {
-    check_a_cut_tool_call_is_dropped(true, None).await;
+async fn a_streamed_tool_call_the_deadline_cut_is_a_cut_call() {
+    check_a_tool_call_the_deadline_cut(true, None, TimeoutReply::Partial).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_call_the_deadline_cut_under_the_error_reply_is_answered_as_before() {
+    for (stream, stop) in [(false, None), (false, Some("zzz")), (true, None)] {
+        check_a_tool_call_the_deadline_cut(stream, stop, TimeoutReply::Error).await;
+    }
 }
 
 /// Under `error`, a completion its deadline cut is today's `504

@@ -283,8 +283,10 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
 - **The answer is free outside its calls.** The grammar arms at a call's
   `<tool_call>`, in the answer only, never in the reasoning, and is released
   at the call's close; each further call arms it again. A call `max_tokens`
-  cuts is dropped, as every call left open is, and `finish_reason` is
-  `"length"` (GitHub #583 will change how it is sent).
+  cuts comes back as any cut call does (from 0.11.0): its name and the
+  arguments written so far, each value ending where the call goes on, and
+  `finish_reason: "length"`
+  ([Chat completions](chat-completions.md)).
 - **A string value is the call's raw text**, and it ends only where the call
   goes on: a parameter's opener the call has not written yet, or the
   function's close once every required parameter is written. A file's
@@ -307,7 +309,8 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
 - **A string with an `enum`, a `const`, a `pattern` or a `format`** is held
   to it, on one line that does not start with one of the call's tags
   (`<parameter=`, `</parameter>`, `</function>`). `minLength` and `maxLength`
-  lie outside the strict subset and are refused.
+  lie outside the strict subset and are refused; a tool the server normalizes
+  leaves them out instead ([below](#a-tool-sent-without-strict)).
 - **A parameter of another type**, and one that may be `null`, is held as
   well: [Typed and nullable parameters](#typed-and-nullable-parameters).
 - **A tool without `strict`** in the same request keeps its arguments as the
@@ -474,19 +477,26 @@ calls, as OpenAI's Responses API does by default (GitHub #614):
   declares.
 - **An optional parameter, one `required` does not list, may be left out**,
   and stays out of the call's `arguments`, one that may be `null` included:
-  the arguments are valid under the schema you sent. A required parameter is
-  held as a strict tool's: the call closes only once it is written, unless it
-  may be `null`, and then it arrives as `null` when left out.
+  the arguments are valid under the schema you sent, its length bounds aside.
+  A required parameter is held as a strict tool's: the call closes only once
+  it is written, unless it may be `null`, and then it arrives as `null` when
+  left out.
 - **A nested object is written whole**: every property it declares, as the
   grammar writes an object ([What the grammar writes](#what-the-grammar-writes)),
   which is valid under your schema too.
+- **Length bounds are left out** (GitHub #641): `minLength` and `maxLength`
+  lie outside the strict subset, so the tool is held on the rest of its
+  schema and a string is written at any length, as a free tool's is. The call
+  check reads the schema you sent, so a call whose string breaks a bound
+  counts `invalid`, kind `constraint`.
 - **A schema that cannot be normalized leaves the tool free**, served as
-  before and never refused: a keyword outside OpenAI's strict subset
-  ([What is refused](#what-is-refused)), an object that admits keys it does
-  not name (`additionalProperties` `true` or a schema, or a nested object
-  without `properties`, which closing would hold to `{}`), a `required`
-  naming a key the object does not declare, a name or a value the call's
-  dialect cannot write (what [refuses a strict tool](#held-tools-strict-true)),
+  before and never refused: a keyword outside OpenAI's strict subset other
+  than the length bounds ([What is refused](#what-is-refused)), an object
+  that admits keys it does not name (`additionalProperties` `true` or a
+  schema, or a nested object without `properties`, which closing would hold
+  to `{}`), a `required` naming a key the object does not declare, a name or
+  a value the call's dialect cannot write (what
+  [refuses a strict tool](#held-tools-strict-true)),
   and, with thinking on, a tokenizer whose `</think>` is not one token.
 - **The response's `tools` echo the `strict` each one was served with**:
   `true` where its calls are held, `false` where they are not: on fallback,
@@ -519,7 +529,7 @@ normalizes a tool sent without `strict` by default
 ([above](#a-tool-sent-without-strict)): every object closed, so a call names
 no parameter the tool does not declare, and an optional parameter left out of
 `arguments` when the model leaves it out, the arguments valid under the
-schema you sent.
+schema you sent, its length bounds aside.
 
 - **`strict: false` is held too**: agent CLIs send it on every tool, and the
   switch is for holding every tool. On the Responses API the response's
@@ -536,7 +546,11 @@ schema you sent.
   agentic replay it changed no call, every one already valid
   ([finding](../../findings/2026-11-15-held-tools-served-on-the-27b.md)), so
   `as-sent` stays the default. Where `ignis_tool_calls_total{outcome="invalid"}`
-  counts invalid calls, `held` is the switch to try.
+  counts invalid calls, `held` is the switch to try, and
+  `ignis_tool_call_undeclared_parameters_total` counts the calls it would
+  change that JSON Schema admits: those holding a parameter that an object
+  with no `additionalProperties` does not declare
+  ([Telemetry](../guides/telemetry.md)).
 - **On Flash-Next the switch changes nothing** until that model holds tool
   calls (GitHub #581): a Flash-Next start takes it, and serves every tool as
   before.

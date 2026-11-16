@@ -446,6 +446,43 @@ async fn a_length_stop_ends_incomplete_with_its_reason() {
     assert_eq!(last["response"]["usage"]["output_tokens"], 2);
 }
 
+/// GitHub #583: a call `max_output_tokens` cuts before it closes is a
+/// `function_call` item `incomplete`, with its name and the arguments
+/// written so far, in an `incomplete` response; streamed, its four item
+/// events come before `response.incomplete`. Whole and streamed alike.
+#[tokio::test]
+async fn a_call_the_cap_cuts_is_an_incomplete_function_call_item() {
+    let app = || {
+        let mock = MockCompute::new();
+        let mut turn = agent_turn();
+        turn.insert(mock.token_for(0, 2), "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/ma");
+        server(&Script::new(turn), SchedulerConfig::default(), Arc::new(mock)).app()
+    };
+    let mut request = agent_request(true);
+    request["max_output_tokens"] = json!(3);
+    let (status, _, streamed) = post(&app(), "/v1/responses", request.clone()).await;
+    assert_eq!(status, 200, "{streamed}");
+    let events = sse_events(&streamed);
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names[names.len() - 5..],
+        ["response.output_item.added", "response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done", "response.incomplete"],
+        "{streamed}"
+    );
+    request["stream"] = json!(false);
+    let (status, _, whole) = post(&app(), "/v1/responses", request).await;
+    assert_eq!(status, 200, "{whole}");
+    for response in [&events.last().unwrap().1["response"], &serde_json::from_str::<JsonValue>(&whole).unwrap()] {
+        assert_eq!((&response["status"], &response["incomplete_details"]["reason"]), (&json!("incomplete"), &json!("max_output_tokens")), "{response}");
+        let call = response["output"].as_array().unwrap().last().unwrap();
+        assert_eq!(
+            (&call["type"], &call["status"], &call["name"], &call["arguments"]),
+            (&json!("function_call"), &json!("incomplete"), &json!("read_file"), &json!("{\"path\":\"src/ma")),
+            "{response}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn an_engine_error_ends_the_response_failed() {
     let app = server(&Script::new(HashMap::new()), SchedulerConfig::default(), Arc::new(FailingPrefill(MockCompute::new()))).app();

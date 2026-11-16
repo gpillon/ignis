@@ -55,7 +55,9 @@ follows from both. Which cards run ignis, and how far each is verified, is
 [What it runs on](../start/index.md#what-it-runs-on); which model each of them
 loads is the table of
 [Where each model loads](../reference/models.md#where-each-model-loads).
-No profile here carries a speed for an RTX 30 or RTX 40 card.
+No profile here carries a speed for an RTX 30 or RTX 40 card: those come
+from the reports of people who have one, collected on
+[issue #643](https://github.com/gpillon/ignis/issues/643).
 
 `rtx5090` and `rtxpro6000` carry numbers measured on the card they name,
 with the finding for each choice linked below; `rtx-16gb` is derived from
@@ -252,7 +254,10 @@ Why each:
   device slots and the dense buffer have theirs, is room for what a real
   card's desktop holds;
   past that the load adapts
-  ([when a profile does not fit](#when-a-profile-does-not-fit)).
+  ([when a profile does not fit](#when-a-profile-does-not-fit)). No real
+  24 GB card has loaded this profile yet: a report on
+  [issue #643](https://github.com/gpillon/ignis/issues/643) says what one
+  does.
 - **No wider chunk while no lane decodes.** The
   [solo width](../configuration/context-and-speculation.md#the-solo-width) is
   pinned to the 2,048-token chunk, so those 91,200 tokens stay the desktop's.

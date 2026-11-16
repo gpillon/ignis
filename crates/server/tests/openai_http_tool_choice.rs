@@ -281,25 +281,37 @@ async fn a_forced_call_streams_the_way_an_unforced_one_does() {
     assert_no_opener_leaked(&body);
 }
 
-/// A forced call the cap cuts before it closes is dropped whole, as an
-/// unforced one is: no call, the ordinary `finish_reason`, and nothing of
-/// the forced opening in the content.
+/// A forced call the cap cuts before it closes is a cut tool call, as an
+/// unforced one is (GitHub #583): its name, from the forced opening when
+/// one is named, and the arguments written so far, with `finish_reason:
+/// "length"`, and nothing of the forced opening in the content. Named and
+/// `"required"`, whole and streamed.
 #[tokio::test]
-async fn a_forced_call_cut_before_it_closes_is_dropped_whole() {
-    let forced = tokens(OPENER);
-    for stream in [false, true] {
-        let (app, _) = app(&[(forced, "<parameter=path>\na")], None);
-        let mut request = chat(json!({ "type": "function", "function": { "name": "read_file" } }), false, stream);
-        request["max_tokens"] = json!(forced + 1);
-        let (status, body) = post(&app, "/v1/chat/completions", request).await;
-        assert_eq!(status, 200, "{body}");
-        assert_no_opener_leaked(&body);
-        assert!(!body.contains("tool_calls\":["), "no call: {body}");
-        let finish = match stream {
-            false => serde_json::from_str::<JsonValue>(&body).unwrap()["choices"][0]["finish_reason"].clone(),
-            true => sse_chunks(&body).last().unwrap()["choices"][0]["finish_reason"].clone(),
-        };
-        assert_eq!(finish, "length", "{body}");
+async fn a_forced_call_the_cap_cuts_is_a_cut_call() {
+    let named = json!({ "type": "function", "function": { "name": "read_file" } });
+    for (tool_choice, forced, written) in [(named, tokens(OPENER), "<parameter=path>\na"), (json!("required"), tokens(REQUIRED_OPENER), "=read_file>\n<parameter=path>\na")] {
+        for stream in [false, true] {
+            let (app, _) = app(&[(forced, written)], None);
+            let mut request = chat(tool_choice.clone(), false, stream);
+            request["max_tokens"] = json!(forced + 1);
+            let (status, body) = post(&app, "/v1/chat/completions", request).await;
+            assert_eq!(status, 200, "{body}");
+            assert_no_opener_leaked(&body);
+            let (calls, finish): (Vec<JsonValue>, JsonValue) = match stream {
+                false => {
+                    let v = serde_json::from_str::<JsonValue>(&body).unwrap();
+                    (v["choices"][0]["message"]["tool_calls"].as_array().cloned().unwrap_or_default(), v["choices"][0]["finish_reason"].clone())
+                }
+                true => {
+                    let chunks = sse_chunks(&body);
+                    let calls = chunks.iter().filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array()).flatten().cloned().collect();
+                    (calls, chunks.last().unwrap()["choices"][0]["finish_reason"].clone())
+                }
+            };
+            let calls: Vec<&JsonValue> = calls.iter().map(|c| &c["function"]).collect();
+            assert_eq!(calls, [&json!({ "name": "read_file", "arguments": "{\"path\":\"a" })], "{body}");
+            assert_eq!(finish, "length", "{body}");
+        }
     }
 }
 
