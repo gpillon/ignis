@@ -1673,8 +1673,8 @@ fn derive_diarizer(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> Str
 /// GitHub #623: `mtp` on the 27B (`family`) takes its own default window,
 /// and a window of 0 there is a load with no speculation, the one `off`
 /// makes. What else only the family decides -- Flash-Next's head refusing 0,
-/// the 27B's MTP load refusing DFlash2's own settings and vision -- is
-/// [`fit_family`]'s, which runs only for the artifact that loads.
+/// the 27B's MTP load refusing DFlash2's own settings -- is [`fit_family`]'s,
+/// which runs only for the artifact that loads.
 fn derive_speculation(
     resolution: &Resolution,
     family: Option<ModelFamily>,
