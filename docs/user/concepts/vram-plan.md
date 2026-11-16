@@ -90,6 +90,33 @@ DFlash2 on, and 950,272 is refused by 59 MB
 That is the plan working as intended: the context is sized to the card, not
 guessed.
 
+### What the 27B's drafter holds
+
+The same 27B load under its two drafters and with no speculation, read off the
+three plans on the RTX 5090 (from 0.11.0, where the 27B takes its MTP head;
+vision on, as every profile turns it on;
+[finding](../../findings/2026-11-15-the-27bs-mtp-head-measured-on-the-rtx-5090.md)):
+
+| | NVFP4, `rtx5090`, 8 lanes | 16 GB artifact, `rtx-16gb`, 2 lanes, 13 GiB budget |
+|---|---:|---:|
+| weights: DFlash2's 1,083 MB against the head's 451 MB | -631.6 MB | -631.6 MB |
+| drafter window in the lanes' state (40 MiB a lane) | -335.5 MB | -83.9 MB |
+| drafter round | -78.0 MB | -44.7 MB |
+| workspace | 0 | -52.4 MB |
+| decode graph, the head's residual window | +37.7 MB | +9.4 MB |
+| **MTP against DFlash2, outside the KV pool** | **-1.01 GB** | **-0.80 GB** |
+| MTP against no speculation, outside the KV pool | +0.71 GB | +0.56 GB |
+| KV pool tokens: MTP, DFlash2, none | 1,039,040; 988,544; 1,182,336 | 232,320; 161,664; 307,200 |
+| context loaded: MTP, DFlash2, none | 917,504 each | 131,072; 65,536; 262,144 |
+
+The workspace is one arena for the prefill's scratch and the image encoder's:
+on the NVFP4 load at 2,048-token chunks the encoder's share sizes it under all
+three, and on the 16 GB load at 1,024-token chunks the prefill's does, where
+DFlash2's taps add 92 MB to it and the head 40 MB. The head's layer in every
+KV page costs the pool 6% of its tokens beside that, and an MTP load keeps a
+page a lane back for the holders of shared prefixes. Read under WDDM's own
+counter right after load, every one of these loads held less than its plan.
+
 ## Why refuse instead of run
 
 A budget that cannot hold the minimum refuses the start. The minimum is the

@@ -1932,7 +1932,7 @@ fn mtp(window: u32) -> Speculation {
 }
 
 /// AC 1, 2: the 27B takes `mtp` at a window of 0 to 7, 7 when none is named
-/// (the provisional default #628 sets), the fixed draft its one rule; a
+/// (the default #628 measured on the 16 GB artifact), the fixed draft its one rule; a
 /// window of 0 is the load `off` makes, the same engine shape to the field,
 /// so the same scope, plan and pool. Before an artifact names its model the
 /// window is still Flash-Next's default (`spec_mtp_spec_off_and_draft_rows_parse`).
@@ -2042,10 +2042,10 @@ fn the_27bs_mtp_load_refuses_dflash2s_own_settings_by_name() {
     assert!(err.contains("IGNIS_SPEC_DRAFTER_TOP_P"), "{err}");
 
     let fixed = the_27b_mtp(&["--spec-backend", "mtp", "--spec-draft-rule", "fixed", "--spec-draft-head", "full"]).unwrap();
-    assert_eq!(fixed.speculation, Some(mtp(7)), "the head's own rule and head, named");
+    assert_eq!(fixed.speculation, Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)), "the head's own rule and head, named");
     // Under rtx-16gb, whose `draft_head: auto` resolves to the full head.
     let auto = the_27b_mtp(&["--profile", "rtx-16gb", "--spec-backend", "mtp"]).unwrap();
-    assert_eq!(auto.speculation, Some(mtp(7)));
+    assert_eq!(auto.speculation, Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)));
     for (key, value, takes) in [("draft_rule", "sampled", true), ("drafter_top_p", "0.95", true), ("drafter_top_p", "0.9", false), ("draft_rule", "fixed", true)] {
         let files = MemFiles::with(&[("c.yaml", &format!("spec:\n  backend: mtp\n  qwen38:\n    {key}: {value}\n"))]);
         let read = with_files(&["--config", "c.yaml", "--qwen38-vision-enabled", "false"], no_env, &files).unwrap();

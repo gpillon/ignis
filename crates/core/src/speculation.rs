@@ -127,8 +127,12 @@ pub const FLASH_NEXT_MAX_VERIFY_ROWS: u32 = 32;
 pub const FLASH_NEXT_DEFAULT_DRAFT_TOKENS: u32 = 2;
 
 /// The draft window a 27B MTP load verifies when the operator names none
-/// (`--spec-backend mtp` alone, GitHub #623): the head's widest window, a
-/// provisional default that the measurement of spec #618 (GitHub #628) sets.
+/// (`--spec-backend mtp` alone, GitHub #623): the window that committed the
+/// most tokens per second on the 16 GB artifact in a 13 GiB budget over
+/// recorded agent turns (GitHub #628, finding
+/// 2026-11-15-the-27bs-mtp-head-measured-on-the-rtx-5090), where windows 5 to
+/// 7 came within 0.4% of each other; on the NVFP4 artifact 5 commits about
+/// 3.5% more.
 pub const QWEN38_MTP_DEFAULT_DRAFT_TOKENS: u32 = 7;
 
 /// The window a Flash-Next round of `lanes` lanes verifies at (spec

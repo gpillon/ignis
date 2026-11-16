@@ -100,6 +100,7 @@ spec-off text up to near-ties, and sampling keeps its distribution.
 | A shared prefix | shared as on any load | each holder keeps its own copy of the prefix's last page, which the VRAM plan holds beside the context |
 | Draft rule | the sampled draft (default) or the fixed draft | the fixed draft only |
 | Draft tokens | 1 to 7, required | 0 to 7, default 7; 0 loads no speculation |
+| Tokens a round, recorded agent turns at 7 drafts | 3.83 (sampled draft), 3.45 (fixed) | 3.90 (NVFP4), 3.88 (16 GB) |
 | Images | drafts after them | drafts after them |
 
 What the choice moves is how the card's memory splits between the drafter and
@@ -153,26 +154,61 @@ one), in place of DFlash2. A round chains the head: each draft feeds the next
 one, up to the draft window.
 
 - **The draft window.** `--spec-draft-tokens` 0 to 7, fixed for the life of
-  the load; 7 when unnamed, a provisional default the measurement of the two
-  drafters will set. A window of 0 loads no speculation: the same load as
+  the load; 7 when unnamed, the window that committed the most tokens per
+  second on the 16 GB artifact in a 13 GiB budget, over recorded agent turns.
+  There windows 5, 6 and 7 came within 0.4% of each other; on the NVFP4
+  artifact under `rtx5090` window 5 committed about 3.5% more than 7, so
+  `--spec-draft-tokens 5` is the window to name there
+  ([finding](../../findings/2026-11-15-the-27bs-mtp-head-measured-on-the-rtx-5090.md)).
+  A window of 0 loads no speculation: the same load as
   `--spec-backend off`, with nothing of the head bound and the same VRAM plan.
   A window a profile gives beside its own DFlash2 (every built-in profile's 7)
   is DFlash2's: `--spec-backend mtp` over it takes the head's own default.
+- **Acceptance.** On a replay of 200 real agent turns, sampled at temperature
+  1, the head committed 3.9 tokens a round at 7 draft tokens on both artifacts
+  (one is the anchor): its first draft was taken 74% of the time, its seventh
+  20%. DFlash2 commits 3.83 on the same turns under its sampled draft. Its
+  acceptance does not fall with the context: 3.6 to 4.3 tokens a round from
+  under 16K tokens to past 96K.
 - **What it saves.** DFlash2's weights, its 40 MiB window in every lane and
   every retained slot, its round's scratch and the taps in every prefill chunk.
-  The head's own weights are about 0.45 GB.
+  The head's own weights are about 0.45 GB. Measured on the RTX 5090, the
+  plan of an MTP load holds 1.01 GB less than the same DFlash2 load outside
+  the KV pool on the NVFP4 artifact under `rtx5090` (8 lanes) and 0.80 GB less
+  on the 16 GB artifact under `rtx-16gb` (2 lanes). In a 13 GiB budget, a
+  16 GB card less 3 GiB of desktop, the 16 GB artifact loads 131,072 tokens
+  of context under MTP where DFlash2 adapts to 65,536
+  ([the VRAM plan](vram-plan.md#what-the-27bs-drafter-holds)).
+- **What it buys.** Against the same load at window 0, decode ran 1.3 to 2.3
+  times as fast on the NVFP4 artifact and 1.3 to 2.9 times on the 16 GB one,
+  at one lane and at the load's lanes, on agent requests and on 32K-token
+  prompts, greedy and sampled; least where several lanes share long contexts.
 - **What it costs.** Its attention state spans the whole context, as the head
   was trained: one more attention layer in every KV page, so the same bytes
   hold about 6% fewer tokens. Each sequence keeps one more vector, the model's
   last hidden state, so that its next step can build the head's row. Under
   `hq-e8-2b` the head's layer takes its share of the residual window. A
-  prefill runs the head over every position of the prompt. Each holder of a
+  prefill runs the head over every position of the prompt: on the RTX 5090
+  the NVFP4 artifact's time to first token at 8K and 32K tokens is 13% longer
+  than at window 0, the 16 GB artifact's 1 to 2%. A round chains the head
+  once a draft, each step the head's layer
+  and the model's whole output head: 1.2 to 1.4 ms a step on the NVFP4
+  artifact at one lane (2.6 ms at eight lanes 64K tokens deep), 0.8 to 1.1 ms
+  on the 16 GB one, so at 7 draft tokens the head takes 28 to 40% of a round.
+  Each holder of a
   shared prefix (the request that published it and every request that claims
   it) keeps its own copy of the prefix's last page, because the head's row at
   the prefix's last position is built from each holder's own next token; the
   VRAM plan holds a page a lane and a page a retained slot for those copies
   beside one context, and admission never hands them out
   ([the VRAM plan](vram-plan.md)).
+- **When to choose it.** When DFlash2's memory is what your context lacks:
+  on a 16 GB card, or on any card whose plan adapts the context down under
+  DFlash2. The head commits as many tokens a round as DFlash2 on agent
+  traffic and far more tokens a second than no speculation, for about 0.8 to
+  1 GB less than DFlash2. Where DFlash2 fits at the context you need, it stays
+  the default; the two drafters' decode rates against each other were not
+  measured side by side.
 - **One rule.** The head drafts the fixed draft at every temperature: a
   request that samples takes each draft with the model's probability of it.
   DFlash2's own settings are refused by name on an MTP load: the shortlist
