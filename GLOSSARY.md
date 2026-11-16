@@ -948,6 +948,19 @@ the publish point's last position is every holder's own copy, whatever the
 point: the head's entry there is built from the token after it, which each
 holder writes from its own (#622).
 
+**Holder copy**:
+On a load built for the 27B's **MTP head**, a sequence's own copy of the **KV
+page** holding a **shared prefix**'s or a **prompt checkpoint**'s last
+position, mapped in place of the shared page: the head's entry at that position
+is written from the token after it, which each holder (the publisher and every
+claimant) writes from its own (#622, ADR 0095). The leaf holds at most one copy
+a sequence and one a **retained slot** (a prefix's or a checkpoint's, gone with
+its image) past what the ledger charges, so admission keeps that many pages back
+from the pool (`ignis_core::seq::holder_page_reserve`, the plan's
+`holder_pages`, `kv_holder_pages` in the plan event), and a capture may lend its
+prefix's copy beside the pages the ledger moves (the scheduler's
+`kv_holder_lag`: 1 there, 0 on every other pool).
+
 **Eviction priority**:
 The one ordering that decides what loses residency, on the device, in KV-RAM
 and on KV-disk (ADR 0023, ADR 0045). A need moves only what ranks below its
@@ -1240,9 +1253,10 @@ The 27B drafts with it as its opt-in second drafter, in place of **DFlash2**
 (#623): draft window 0..7, the **fixed draft** only, DFlash2's own settings
 refused by name where the operator names them, and drafting after images as
 DFlash2 does (#624: its rows rotate at their positions plus the **rope delta**
-and embed an image's column at a placeholder). It saves DFlash2's weights, **drafter window**
-and round, and costs one more attention layer in every KV page, the head over
-every prefill position, and a page a holder of a shared prefix (ADR 0095).
+and embed an image's column at a placeholder). It saves DFlash2's weights,
+**drafter window** and round, and costs one more attention layer in every KV
+page, the head over every prefill position, and a page a holder of a shared
+prefix (ADR 0095).
 
 **Vision**:
 Multimodal input: images today, video refused until its own spec. A load
