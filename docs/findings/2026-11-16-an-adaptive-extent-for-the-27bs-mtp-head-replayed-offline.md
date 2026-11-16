@@ -14,6 +14,7 @@
   https://github.com/gpillon/ignis/issues/618,
   https://github.com/gpillon/ignis/issues/628,
   https://github.com/gpillon/ignis/issues/630,
+  https://github.com/gpillon/ignis/issues/644,
   [the head measured on the RTX 5090](2026-11-15-the-27bs-mtp-head-measured-on-the-rtx-5090.md) (the records,
   the cost table, the default window),
   [ADR 0095](../adr/0095-the-27b-has-two-drafters-and-its-mtp-head-keeps-attention-state-over-the-whole-context-and-a-continuation-hidden.md),
@@ -295,6 +296,7 @@ Inferred:
 
 ## Follow-ups
 
-- The cost of a verify width chosen inside the round, and of a skipped chain step, on the RTX 5090: the owner's
-  call, before any ticket builds the controller.
+- The cost of a verify width chosen inside the round, and of a skipped chain step, on the RTX 5090: the owner
+  parked it, and the fixed draft window 7 ships; what would unpark it (that measurement, then a controller
+  ticket written with the owner) is https://github.com/gpillon/ignis/issues/644.
 - The 12 GB card class asks again on its own artifact: https://github.com/gpillon/ignis/issues/630.
