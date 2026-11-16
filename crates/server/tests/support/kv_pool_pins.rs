@@ -263,7 +263,7 @@ pub const RTX_12GB_LESS_1_GIB: PinnedLoad =
 /// What the load less 1 GiB logs in its plan's `adapted`.
 pub const RTX_12GB_LESS_1_GIB_ADAPTED: &str = "max_context 131072 -> 98304 (adapt_context_step 16384, one lane)";
 
-/// The ladder's first step less 1 GiB, 131,072 tokens: the plan's floor at
+/// The ladder's first context less 1 GiB, 131,072 tokens: the plan's floor at
 /// one lane, one sequence and a page for each of the lane's two retained
 /// slots and for each of the three holders the MTP head's copies keep back
 /// (GitHub #623), 2,053 pages.
@@ -297,7 +297,7 @@ pub const RTX_12GB_8X_LESS_1_GIB: PinnedLoad =
 /// What it logs in its plan's `adapted`.
 pub const RTX_12GB_8X_LESS_1_GIB_ADAPTED: &str = "max_context 131072 -> 81920 (adapt_context_step 16384, one lane)";
 
-/// The last step it passes over less 1 GiB, 98,304 tokens: its floor of
+/// The last context it passes over less 1 GiB, 98,304 tokens: its floor of
 /// 1,541 pages beside the dense buffer.
 pub const RTX_12GB_8X_LESS_1_GIB_98304: PinnedRefusal = PinnedRefusal {
     budget: RTX_12GB_BUDGET - (1 << 30),

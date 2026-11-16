@@ -85,7 +85,7 @@ mod kv_pool_pins;
 
 use kv_pool_pins::{
     CardLines, RTX50_16GB, RTX50_16GB_LESS_1_GIB, RTX50_16GB_LESS_3_GIB, RTX50_16GB_LESS_3_GIB_131072_SPARE,
-    RTX50_16GB_RTX_5090_TRELLIS_WORKSPACE, assert_pinned, page_bytes,
+    RTX50_16GB_RTX_5090_TRELLIS_WORKSPACE, TRELLIS_DENSE_BYTES, assert_pinned, page_bytes,
 };
 
 const TRELLIS: &str = "F:/ai/models/Qwen3.8-27B-trellis-3bpw-ignis/qwen3_8_27b_trellis_sc30-v2.ninfer";
@@ -546,9 +546,6 @@ async fn the_profiles_own_default_load_has_host_vision_and_the_text_only_kv_pool
 /// The prefill routes an 8.x card runs unset, named so the RTX 5090 runs them
 /// (spec #503, GitHub #515): the dense prefill and the integer band.
 const ROUTES_8X: [&str; 4] = ["--model-prefill-linear", "int8", "--model-prefill-attention", "int8"];
-/// The dense prefill's one buffer on the 27B, the INT8 copy of its largest
-/// matrix, 5120 x 17408 (GitHub #509).
-const TRELLIS_DENSE_BYTES: u64 = 89_128_960;
 
 /// The load logged the routes an 8.x card runs (`ignis.runtime.prefill_routes`),
 /// our GDN prefill with nothing naming it, every card's (GitHub #536),
