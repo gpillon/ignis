@@ -14,7 +14,7 @@
 
 <p align="center">
   <img alt="license Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-d94b1f?style=flat-square">
-  <img alt="cards RTX 50, RTX PRO 6000 and RTX 30" src="https://img.shields.io/badge/cards-RTX%2050%20%7C%20RTX%20PRO%206000%20%7C%20RTX%203090-d94b1f?style=flat-square">
+  <img alt="cards NVIDIA RTX of 16 GB or more, from the RTX 30 series on" src="https://img.shields.io/badge/cards-RTX%2030%20series%20on%20%7C%2016%20GB%20or%20more-d94b1f?style=flat-square">
   <img alt="models Qwen3.8-27B NVFP4 and trellis, Qwen3.8-Flash-Next and Qwen-Image-2.1-Turbo" src="https://img.shields.io/badge/models-Qwen3.8--27B%20NVFP4%20%2F%20trellis%20%7C%20Flash--Next%20125B%20MoE%20%7C%20Qwen--Image--2.1-d94b1f?style=flat-square">
   <img alt="API OpenAI-compatible" src="https://img.shields.io/badge/API-OpenAI--compatible-d94b1f?style=flat-square">
   <br>
