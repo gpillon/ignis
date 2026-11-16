@@ -360,7 +360,12 @@ method on the head's loads at each window, beside the verify substrate alone
 at the same window, lanes and context: the difference is the head's chain and
 commit, and the substrate's slope is a verify column's. Its table and the
 replay's records are what the comparison of adaptive extents reads
-([finding](../findings/2026-11-15-the-27bs-mtp-head-measured-on-the-rtx-5090.md)).
+([finding](../findings/2026-11-15-the-27bs-mtp-head-measured-on-the-rtx-5090.md)):
+`tools/mtp-replay/extent.py` (GitHub #629, its CPU check `test_extent.py`)
+rates the fixed windows, the head's confidence stop and the lane's acceptance
+history over the records at the table's costs, under three ways a round could
+pay, and reads no clock: two runs give the same bytes
+([finding](../findings/2026-11-16-an-adaptive-extent-for-the-27bs-mtp-head-replayed-offline.md)).
 
 Vision is a load option too (GitHub #177): `--vision-enabled` (with
 `--vision-max-tokens N`, default 32,768 merged tokens) binds the 333 `vision/*`
