@@ -276,7 +276,7 @@ Why each:
   at the start less 512 MiB ([VRAM budget](../configuration/vram-and-kv-pool.md#the-12-gb-class)).
 - **The 512-token chunk.** The prefill scratch is sized by the chunk, and the
   chunk also sets the first token's price. Measured on the RTX 5090 held to
-  12 GiB, on the class's candidate artifact, vision on, the median first token
+  12 GiB, on the class's artifact, vision on, the median first token
   and the KV pool:
 
   | Chunk | First token, 8,192-token prompt | First token, 65,536-token prompt | KV pool |

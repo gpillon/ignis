@@ -291,7 +291,7 @@ impl Sm120aRoute {
 
     fn instead(self) -> &'static str {
         match self {
-            Self::Nvfp4Prefill => ": on this card the 27B loads from its trellis artifact (`--model-id qwen3.8-27b-16g`)",
+            Self::Nvfp4Prefill => ": on this card the 27B loads from its trellis artifact (`--model-id qwen3.8-27b-16g`, or `qwen3.8-27b-12g` on a 12 GB card)",
             Self::ImageModel => "",
             Self::FlashNextStagedDecode => ": unset IGNIS_FN_MOE_STAGED, and Flash-Next decodes on its register kernel",
         }
@@ -537,7 +537,8 @@ pub fn prefill_linear_refusal(
     (prefill_linear == PrefillLinear::Int8 && nvfp4_body()).then(|| {
         format!(
             "`{spelled} int8` names the dense prefill, which decodes the trellis body's matrices, and this artifact's \
-             body is NVFP4: name `fp16` or leave it unset, or load the 27B's trellis artifact (`--model-id qwen3.8-27b-16g`)"
+             body is NVFP4: name `fp16` or leave it unset, or load the 27B's trellis artifact (`--model-id qwen3.8-27b-16g`, or \
+             `qwen3.8-27b-12g` on a 12 GB card)"
         )
     })
 }
@@ -786,7 +787,7 @@ mod tests {
         assert!(image.starts_with("the image model") && image.contains("NVIDIA GeForce RTX 3090 (8.6)") && image.contains("120a alone"), "{image}");
         assert!(image.contains("which run on compute capability 12.0 (RTX 50, RTX PRO); the card is"), "{image}");
         let nvfp4 = load_refusal(Some(&ampere), ModelFamily::Qwen38_27b, || true, false).unwrap();
-        assert!(nvfp4.contains("W4A4") && nvfp4.contains("--model-id qwen3.8-27b-16g"), "{nvfp4}");
+        assert!(nvfp4.contains("W4A4") && nvfp4.contains("--model-id qwen3.8-27b-16g") && nvfp4.contains("`qwen3.8-27b-12g` on a 12 GB card"), "{nvfp4}");
         assert_eq!(load_refusal(Some(&ampere), ModelFamily::Qwen38_27b, || false, false), None, "the trellis artifact loads");
         let staged = load_refusal(Some(&ampere), ModelFamily::FlashNext, || false, true).unwrap();
         assert!(staged.contains("IGNIS_FN_MOE_STAGED"), "{staged}");
@@ -883,6 +884,7 @@ mod tests {
             let refusal = prefill_linear_refusal(PrefillLinear::Int8, || true, spelled).unwrap();
             assert!(refusal.starts_with(&format!("`{spelled} int8` names the dense prefill")), "{refusal}");
             assert!(refusal.contains("NVFP4") && refusal.contains("`fp16`") && refusal.contains("qwen3.8-27b-16g"), "{refusal}");
+            assert!(refusal.ends_with("(`--model-id qwen3.8-27b-16g`, or `qwen3.8-27b-12g` on a 12 GB card)"), "GitHub #638: {refusal}");
         }
         assert_eq!(prefill_linear_refusal(PrefillLinear::Int8, || false, "--model-prefill-linear"), None, "the trellis artifact");
         assert_eq!(prefill_linear_refusal(PrefillLinear::Fp16, never, "--model-prefill-linear"), None);

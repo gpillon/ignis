@@ -19,7 +19,7 @@ models:
     card_class: 32                     # optional: the smallest card class it loads on, in GB: 12, 16, 24, 32 or 96
     # generation: blackwell            # optional: the oldest GPU generation it loads on: ampere, ada or blackwell
     # family: qwen3.8-27b              # optional: its model family, by the family's own id (see below)
-    # aliases: [qwen3.8-27b]           # optional: the ids it answers to on a smaller card: its family's default id, or another entry's of its family
+    # aliases: [acme-27b-ft]           # optional: the ids it answers to on a smaller card: another entry's of its family, or its family's default id where no built-in entry answers to it
     # license: { id: acme-1.0, url: "https://acme.example/LICENSE" }   # optional: the license its weights are published under (see below)
     files:                             # every file, all pinned
       - { name: acme_ft.ninfer.graft.json, bytes: 48211,       sha256: 9c1e… }

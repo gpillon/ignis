@@ -34,7 +34,9 @@ as unavailable, the reason naming the entry that serves it
 ([the catalog](models.md#the-catalog)). A script that must have the 16 GB
 artifact names `qwen3.8-27b-abliterated-16g` itself. `make dev UNCENSORED=1`
 names the 32 GB artifact whatever the card, as `make dev` names the 32 GB
-27B's: on a 16 GB card, start with `ignis-server --model-id`.
+27B's: on a 16 GB card, start with `ignis-server --model-id`. A 12 GB card,
+from 0.11.0, has no build of it: it and its 16 GB build are refused there by
+name before anything is fetched.
 
 ## The 32 GB artifact
 

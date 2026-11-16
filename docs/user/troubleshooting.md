@@ -48,8 +48,8 @@ alone: the 27B's NVFP4 artifact (its W4A4 prefill GEMMs), the image model, or
 Flash-Next's staged expert decode (`IGNIS_FN_MOE_STAGED=1`). The load is
 refused before it starts, under the event `ignis.model.route_unsupported`; a
 switch to it is refused the same way and the loaded model keeps serving. Load
-the 27B from its trellis artifact (`--model-id qwen3.8-27b-16g`), and unset
-`IGNIS_FN_MOE_STAGED`.
+the 27B from its trellis artifact (`--model-id qwen3.8-27b-16g`, or from 0.11.0
+`qwen3.8-27b-12g` on a 12 GB card), and unset `IGNIS_FN_MOE_STAGED`.
 
 On the same card `--model-exception-weights fp8` is refused naming that
 spelling, whatever its source (a flag, the environment, a config file or a
@@ -72,7 +72,8 @@ RTX 30 or RTX 40 card refuses the NVFP4 artifact first), and only for a named
 as it was given, `IGNIS_MODEL_PREFILL_LINEAR` or a config file's key included,
 and the load is refused before it starts, under the event
 `ignis.model.route_unsupported`. Name `fp16` or unset the option, or load the
-trellis artifact (`--model-id qwen3.8-27b-16g`).
+trellis artifact (`--model-id qwen3.8-27b-16g`, or from 0.11.0 `qwen3.8-27b-12g`
+on a 12 GB card).
 
 ### A start under `--profile auto` is refused, naming `--profile`
 

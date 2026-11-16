@@ -1741,6 +1741,12 @@ mod tests {
         let joined = operator(OPERATOR).expect("an entry claiming no alias joins");
         assert_eq!(joined.ids().last(), Some(&"acme-qwen3.8-27b-ft"));
         assert!(joined.ids().contains(&"qwen3.8-27b-16g"));
+        // A built-in id no built-in entry answers to is the operator's to
+        // claim: a Flash-Next build of a smaller class serves it there.
+        let flash = OPERATOR.replacen("id: acme-qwen3.8-27b-ft", "id: acme-flash-next-24g", 1).replacen("card_class: 32", "card_class: 24\n    aliases: [qwen3.8-flash-next]", 1);
+        let flash = operator(&flash).expect("an alias no built-in entry claims");
+        assert_eq!(resolved(&flash, "qwen3.8-flash-next", Some(&on(CardClass::Gb24))), Ok("acme-flash-next-24g"));
+        assert_eq!(resolved(&flash, "qwen3.8-flash-next", Some(&on(CardClass::Gb32))), Ok("qwen3.8-flash-next"));
     }
 
     /// The class-aware step's answer, as the id that serves `id` on a card
