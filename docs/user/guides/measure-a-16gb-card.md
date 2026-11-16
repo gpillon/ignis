@@ -12,6 +12,11 @@ server writes a record of what it does there, and that record, posted on
 [issue #360](https://github.com/gpillon/ignis/issues/360), is how the profile
 gets real numbers.
 
+The same command measures an RTX 30 or RTX 40 card (the RTX 3090, 3090 Ti and
+4090 at 24 GB, or a 16 GB RTX 40 card), which the project has none of: its
+record goes on [issue #643](https://github.com/gpillon/ignis/issues/643)
+instead ([Send it](#send-it)).
+
 A coding agent can run the whole test for you, the install included: it
 tries the default, tries a few settings if the default is refused, and writes
 the report for you to read before anything is posted
@@ -113,7 +118,10 @@ measured. Run it against a server without a key.
 
 Comment on [issue #360](https://github.com/gpillon/ignis/issues/360), the one
 that collects the 16 GB reports, starting with your card's name, and paste the
-whole file in a fenced block:
+whole file in a fenced block. An RTX 30 or RTX 40 card's record goes on
+[issue #643](https://github.com/gpillon/ignis/issues/643), with the start's
+`prefill routes` line and any `WARN` or `ERROR` line, each path replaced by
+`<dir>`:
 
 ````markdown
 ```json

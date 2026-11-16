@@ -33,7 +33,9 @@ On an RTX 30 or RTX 40 card, use the latest release, or build for it
 the RTX 3090 and 3090 Ti are supported, and the RTX 4090 and the 16 GB RTX 40
 cards are verified for correctness: the release's sm_86 gate passed on an Ada
 Lovelace card (sm_89)
-([the finding](../findings/2026-11-08-sm86-gate-on-the-release-range.md)). On a machine with more
+([the finding](../findings/2026-11-08-sm86-gate-on-the-release-range.md)).
+A report of how ignis runs on such a card, or of a start it refuses, goes on
+[issue #643](https://github.com/gpillon/ignis/issues/643). On a machine with more
 than one card, ignis uses CUDA device 0; when that is the other card,
 `CUDA_VISIBLE_DEVICES` names the supported one.
 

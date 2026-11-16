@@ -33,7 +33,9 @@ I read every new issue on [gpillon/ignis](https://github.com/gpillon/ignis/issue
   the issue.
 - **Figures from a card**: the
   [16 GB card reports](https://github.com/gpillon/ignis/issues/360) issue for
-  a 16 GB card, an issue of its own for any other.
+  a 16 GB RTX 50 card, the
+  [RTX 30 and RTX 40 card reports](https://github.com/gpillon/ignis/issues/643)
+  issue for an RTX 30 or RTX 40 card, an issue of its own for any other.
 - **A setting your card or machine needs**: most of that is configuration,
   not code. A [profile of your own](../concepts/profiles.md#defining-your-own),
   a [config file](../configuration/index.md), `local.mk` for make's knobs

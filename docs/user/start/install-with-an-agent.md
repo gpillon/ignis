@@ -41,6 +41,14 @@ DFlash2 on against off, if you want it. At the end it asks whether to keep
 ignis or remove what it installed
 ([the agent path's test](../paths/agent.md#testing-a-16-gb-card)).
 
+With an RTX 30 or RTX 40 card (the RTX 3090, 3090 Ti and 4090 at 24 GB, or a
+16 GB RTX 40 card) the test is the same, with the same 16 GB model, and its
+report goes to [issue #643](https://github.com/gpillon/ignis/issues/643):
+
+```
+I have an RTX 30 or RTX 40 card. Read https://raw.githubusercontent.com/gpillon/ignis/main/docs/user/paths/agent.md and follow its section on testing a 16 GB card: help me install ignis, test it, and write the report for issue #643. Ask me before downloading or installing anything.
+```
+
 ## What it does
 
 1. **Checks the machine**: the card, the driver, the system, the disk and,
