@@ -607,7 +607,9 @@ RTX 30 or RTX 40 card runs some tensor-core forms at half the rate of others, an
 a kernel the sm_8x prefill work or the 27B's MTP head on those cards (#627) added
 uses only the full-rate ones, INT8 and HMMA with an f16 accumulator, or the CUDA
 cores alone. `mk/full-rate-kernels.txt` is the one place that lists
-the covered kernels and #488's exceptions. The check dumps the `sm_86` SASS with
+the covered kernels and the declared exceptions: #488's in the prompt prefill,
+and #642's, the vendored small-T attention over hq-e8-2b the target's decode
+and the MTP head's rounds share. The check dumps the `sm_86` SASS with
 `cuobjdump` (the CUDA toolkit's, wherever nvcc is) and refuses a covered kernel
 that holds HMMA with an f32 accumulator, any BF16, TF32 or FP8/FP6/FP4 form, a
 warpgroup or tensor-memory MMA or a form it does not know, or that holds no

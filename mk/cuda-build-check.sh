@@ -32,8 +32,8 @@
 # (spec #503, #512): the RTX 30 and RTX 40 cards run some tensor-core forms at
 # half the rate of others, and the kernels the sm_8x prefill work added use only
 # the full-rate ones. The kernels the rule covers are listed in
-# mk/full-rate-kernels.txt, one place, with #488's exceptions; the check dumps
-# the sm_86 SASS with cuobjdump (IGNIS_CUOBJDUMP, else PATH, else
+# mk/full-rate-kernels.txt, one place, with its exceptions (#488, #642); the
+# check dumps the sm_86 SASS with cuobjdump (IGNIS_CUOBJDUMP, else PATH, else
 # $CUDA_PATH/bin or $CUDA_HOME/bin) and refuses a covered kernel that holds
 # HMMA with an f32 accumulator, any BF16, TF32 or FP8/FP6/FP4 form, any
 # warpgroup or tensor-memory MMA, or an MMA form it does not know, or that holds
