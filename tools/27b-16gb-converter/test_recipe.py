@@ -31,6 +31,12 @@ def test_the_16gb_artifacts_recipe_is_the_default_and_names_its_k_head_ceiling_a
                                   "quantization_config.json"]
 
 
+def test_a_tool_given_no_recipe_takes_the_default_and_one_given_takes_it():
+    assert recipe.or_default(None) == recipe.load(recipe.DEFAULT)
+    named = recipe.load("ig28a")
+    assert recipe.or_default(named) is named
+
+
 def test_the_public_2_5_bit_quants_recipe_names_its_k_config_ceiling_and_pins():
     r = recipe.load("tandem25")
     assert (r["name"], r["weights_id"], r["ceiling_bytes"], r["job"]) == ("tandem25", "trellis-tandem25", 8_304_000_000, None)

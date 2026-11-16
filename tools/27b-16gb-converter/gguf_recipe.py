@@ -253,26 +253,25 @@ def fit(alloc, shapes, copied, ceiling):
 
 def exllamav3_bits(ks, shapes):
     """The `bits` exllamav3 1.5.3 writes in the quant's configuration from a recipe: the body's average K weighted
-    by each matrix's weights, to two decimals (`create_q_strategy_from_recipe`, `round(final_bpw, 2)`)."""
-    body = [k for k in ks if k != recipe_mod.HEAD]
-    return round(float(sum(_numel(shapes[k]) * ks[k] for k in body)) / sum(_numel(shapes[k]) for k in body), 2)
+    by each matrix's weights, `recipe.bpw`, to two decimals (`create_q_strategy_from_recipe`, `round(final_bpw, 2)`)."""
+    return recipe_mod.bpw({k: {"K": K, "shape": shapes[k]} for k, K in ks.items()}, 2)
 
 
-def about(source, f):
+def about(source, fitted):
     return (f"Candidate B of the 12 GB card class (#634): the per-tensor allocation of {source['repo']} "
             f"{source['file']} at revision {source['revision']} (LFS oid {source['lfs_oid']}), read from its GGUF "
             f"header, translated by gguf_recipe.py: each matrix's K the integer nearest its ggml type's bits per weight "
             f"(block scales included) plus one shift for the whole body, held to 2 to 5, the head at 4; the shift the "
-            f"largest under the ceiling ({f['delta']}), then the next class to cross promoted by its layer's mean "
+            f"largest under the ceiling ({fitted['delta']}), then the next class to cross promoted by its layer's mean "
             f"bits, then its key, while it fits.")
 
 
-def build(base, f, shapes, source, weights_id, ceiling):
+def build(base, fitted, shapes, source, weights_id, ceiling):
     """The recipe: the base's configuration, job and calibration pins, the fit's K, exllamav3's bits."""
-    return {"schema": recipe_mod.SCHEMA, "about": about(source, f), "weights_id": weights_id, "ceiling_bytes": ceiling,
-            "quantization_config": dict(base["quantization_config"], bits=exllamav3_bits(f["K"], shapes)),
+    return {"schema": recipe_mod.SCHEMA, "about": about(source, fitted), "weights_id": weights_id, "ceiling_bytes": ceiling,
+            "quantization_config": dict(base["quantization_config"], bits=exllamav3_bits(fitted["K"], shapes)),
             "job": base["job"], "files": {n: base["files"][n] for n in CALIBRATION},
-            "tensors": {k: K for k, K in f["K"].items() if k != recipe_mod.HEAD}}
+            "tensors": {k: K for k, K in fitted["K"].items() if k != recipe_mod.HEAD}}
 
 
 def histogram(ks):
@@ -304,17 +303,17 @@ def cmd_recipe(a, log):
         record = json.load(fh)
     shapes = {m["source"]: m["shape"] for m in record["trellis"]["matrices"].values()}
     copied = {n: c["bytes"] for n, c in record["copied"]["objects"].items()}
-    f = fit(allocation(table["tensors"], shapes), shapes, copied, a.ceiling)
-    data = build(recipe_mod.load(a.base), f, shapes, table["source"], a.weights_id, a.ceiling)
+    fitted = fit(allocation(table["tensors"], shapes), shapes, copied, a.ceiling)
+    data = build(recipe_mod.load(a.base), fitted, shapes, table["source"], a.weights_id, a.ceiling)
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(data, fh, indent=1)
         fh.write("\n")
     r = recipe_mod.load(a.name, a.recipes)
     m = {k: {"K": K, "shape": shapes[k]} for k, K in recipe_mod.ks(r).items()}
     log(f"recipe {a.name}: {histogram(recipe_mod.ks(r))}, {recipe_mod.bpw(m)} bpw (exllamav3's bits "
-        f"{r['quantization_config']['bits']}), text scope {f['text_scope_bytes']:,} bytes of {a.ceiling:,}; shift "
-        f"{f['delta']}, {f['class_bytes']:,} bytes before the next class (shift {f['next_delta']}), "
-        f"{len(f['promoted'])} of it promoted, {len(f['left'])} left")
+        f"{r['quantization_config']['bits']}), text scope {fitted['text_scope_bytes']:,} bytes of {a.ceiling:,}; shift "
+        f"{fitted['delta']}, {fitted['class_bytes']:,} bytes before the next class (shift {fitted['next_delta']}), "
+        f"{len(fitted['promoted'])} of it promoted, {len(fitted['left'])} left")
     return 0
 
 

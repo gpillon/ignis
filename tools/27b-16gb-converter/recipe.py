@@ -108,6 +108,11 @@ def load(name, root=None):
             "tensors": {key: int(k) for key, k in sorted(data["tensors"].items())}}
 
 
+def or_default(r):
+    """The recipe `r` (`load`'s), or `DEFAULT`'s when it is None: what a tool takes when none is named."""
+    return r if r is not None else load(DEFAULT)
+
+
 def ks(r):
     """Every matrix of the recipe `r` at its K: the body's `tensors`, the head at its bits."""
     return dict(r["tensors"], **{HEAD: r["quantization_config"]["head_bits"]})
@@ -127,12 +132,12 @@ def mismatches(r, held):
     return out
 
 
-def bpw(matrices):
+def bpw(matrices, digits=4):
     """The body's bits per weight, `{key: {"K", "shape"}}`'s average K weighted by each matrix's weights,
-    the head apart as exllamav3's `bits` counts it."""
+    the head apart as exllamav3's `bits` counts it, to `digits` decimals (exllamav3 writes its `bits` to 2)."""
     body = [m for key, m in matrices.items() if key != HEAD]
     weights = sum(m["shape"][0] * m["shape"][1] for m in body)
-    return round(sum(m["K"] * m["shape"][0] * m["shape"][1] for m in body) / weights, 4)
+    return round(sum(m["K"] * m["shape"][0] * m["shape"][1] for m in body) / weights, digits)
 
 
 # The text objects the text scope's device weights leave out: the token embedding lives in host memory, the

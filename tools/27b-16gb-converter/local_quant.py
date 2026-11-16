@@ -244,7 +244,7 @@ def run(bf16_root, bf16_repo, recipe_quant, record_path, out, work_dir, checkpoi
     artifact's by default) and writes `<out>.recipe.yaml` and `<out>.pins.json` beside it (`check` stops
     before the GPU step and writes nothing). Raises Refused."""
     t0 = time.time()
-    named = recipe if recipe is not None else recipe_mod.load(recipe_mod.DEFAULT)
+    recipe = recipe_mod.or_default(recipe)
     if not is_empty(out):
         raise convert.Refused(f"{out} is not empty: remove it to convert again")
     if resume and is_empty(work_dir):
@@ -252,28 +252,28 @@ def run(bf16_root, bf16_repo, recipe_quant, record_path, out, work_dir, checkpoi
     if not resume and not is_empty(work_dir):
         raise convert.Refused(f"{work_dir} is not empty: remove it, or --resume the job it holds")
     record = read_json(record_path)
-    r = recipe_mod.job(named, {m["source"]: m["shape"] for m in record["trellis"]["matrices"].values()})
-    sources = pin_sources(bf16_root, recipe_quant, record, named)
-    check_bf16(bf16_root, r)
-    text_bytes = recipe_mod.text_scope_bytes(r["matrices"], {n: c["bytes"] for n, c in record["copied"]["objects"].items()})
-    recipe_mod.check_ceiling(named, text_bytes)
-    need = disk_need(bf16_root, r, record, checkpoints)
+    job = recipe_mod.job(recipe, {m["source"]: m["shape"] for m in record["trellis"]["matrices"].values()})
+    sources = pin_sources(bf16_root, recipe_quant, record, recipe)
+    check_bf16(bf16_root, job)
+    text_bytes = recipe_mod.text_scope_bytes(job["matrices"], {n: c["bytes"] for n, c in record["copied"]["objects"].items()})
+    recipe_mod.check_ceiling(recipe, text_bytes)
+    need = disk_need(bf16_root, job, record, checkpoints)
     anchor = os.path.dirname(os.path.abspath(out))
     while not os.path.isdir(anchor):
         anchor = os.path.dirname(anchor)
     free = (disk_free or (lambda p: shutil.disk_usage(p).free))(anchor)
-    log(f"recipe {named['name']}: {len(r['matrices'])} matrices {recipe_mod.formats(r)}, "
-        f"{recipe_mod.bpw(r['matrices'])} bpw, text scope {text_bytes:,} bytes of {named['ceiling_bytes']:,}, "
-        f"head {r['head_bits']}, MTP {r['mtp_bits']}, "
-        f"bits {r['bits']}; {bf16_repo} at {sources['bf16']['revision']}, the recipe's quant at "
+    log(f"recipe {recipe['name']}: {len(job['matrices'])} matrices {recipe_mod.formats(job)}, "
+        f"{recipe_mod.bpw(job['matrices'])} bpw, text scope {text_bytes:,} bytes of {recipe['ceiling_bytes']:,}, "
+        f"head {job['head_bits']}, MTP {job['mtp_bits']}, "
+        f"bits {job['bits']}; {bf16_repo} at {sources['bf16']['revision']}, the recipe's quant at "
         f"{sources['quant']['revision']}; disk: {gib(need)} needed, {gib(free)} free")
     if not resume and free < need:
         raise convert.Refused(f"the run writes up to {gib(need)} and {anchor} has {gib(free)} free"
                               + ("" if not checkpoints else "; --no-checkpoints saves exllamav3's checkpoints"))
-    ex = recipe_mod.exllamav3(r)
+    ex = recipe_mod.exllamav3(job)
     paths = {"bf16": bf16_root, "work": work_dir, "out": out, "recipe": beside(out, ".recipe.yaml"),
              "cal_data": os.path.join(recipe_quant, CAL_TRACE)}
-    argv = exllamav3_argv(r, paths, checkpoints, resume)
+    argv = exllamav3_argv(job, paths, checkpoints, resume)
     if check:
         log("CHECK PASS")
         return None
@@ -289,7 +289,7 @@ def run(bf16_root, bf16_repo, recipe_quant, record_path, out, work_dir, checkpoi
         f"{gib(measured['vram_peak_reserved_bytes'])} reserved; host peak {gib(measured['host_peak_working_set_bytes'])} "
         f"working set, {gib(measured['host_peak_commit_bytes'])} commit")
 
-    problems = check_output(out, r)
+    problems = check_output(out, job)
     if problems:
         raise convert.Refused("the quant is not the recipe's:\n  " + "\n  ".join(problems))
     files = pin_dir(out)
@@ -300,13 +300,13 @@ def run(bf16_root, bf16_repo, recipe_quant, record_path, out, work_dir, checkpoi
             "status": "complete",
             "bf16": {"repo": bf16_repo, **sources["bf16"]},
             "quant": sources["quant"],
-            "calibration": dict(sources["calibration"], **r["calibration"]),
-            "recipe": {"named": recipe_mod.record(named, r["matrices"], text_bytes),
+            "calibration": dict(sources["calibration"], **job["calibration"]),
+            "recipe": {"named": recipe_mod.record(recipe, job["matrices"], text_bytes),
                        "file": os.path.basename(paths["recipe"]), "sha256": work.file_digest(paths["recipe"]),
-                       "formats": recipe_mod.formats(r), "vision_bits": VISION_BITS, "mtp_bits": r["mtp_bits"],
-                       "codebook": r["codebook"], "out_scales": r["out_scales"], "exllamav3": ex},
+                       "formats": recipe_mod.formats(job), "vision_bits": VISION_BITS, "mtp_bits": job["mtp_bits"],
+                       "codebook": job["codebook"], "out_scales": job["out_scales"], "exllamav3": ex},
             "exllamav3": {"version": convert.versions()["exllamav3"], "entry": ENTRY,
-                          "argv": exllamav3_argv(r, {k: f"<{k}>" for k in ROLES}, checkpoints, resume)},
+                          "argv": exllamav3_argv(job, {k: f"<{k}>" for k in ROLES}, checkpoints, resume)},
             "run": dict(measured, seconds=seconds, resumed=resume),
             "converter": convert.tool_commit(),
             "versions": convert.versions(),

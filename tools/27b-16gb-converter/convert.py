@@ -259,7 +259,7 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
     its files by their pins, the text scope's device weights within its ceiling; its weights id is
     the artifact's unless `weights_id` names another."""
     t0 = time.time()
-    named = recipe if recipe is not None else recipe_mod.load(recipe_mod.DEFAULT)
+    named = recipe_mod.or_default(recipe)
     given = labels or {}
     unknown = sorted(set(given) - set(LABELS))
     if unknown:
