@@ -282,7 +282,7 @@ impl Model {
     pub fn mtp_head_linear(&self) -> Option<crate::mtp_head::HeadLinear> {
         let code = unsafe { ffi::ignis_model_mtp_head_linear(self.handle) };
         crate::mtp_head::HeadLinear::from_abi(code)
-            .unwrap_or_else(|| panic!("ignis_model_mtp_head_linear: unknown route {code}"))
+            .unwrap_or_else(|unknown| panic!("ignis_model_mtp_head_linear: unknown route {unknown}"))
     }
 
     /// The most merged tokens one media item may hold on this load (GitHub

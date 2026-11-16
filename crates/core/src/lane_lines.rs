@@ -22,13 +22,12 @@
 //! them moves; the GPU test pins the line at 1, 2 and 8 lanes instead, where
 //! it is exactly affine in them.
 
+// The leaf's arena alignment (`kArenaAlign`, `kernel/src/model.cu`), which
+// the vendored layouts below align every tensor and their total to.
+use crate::arena::{aligned, ALIGN as ARENA_ALIGN};
 use crate::compute::{LayerKind, ModelConfig};
 use crate::kv_format::KvFormat;
 use crate::speculation::Speculation;
-
-/// The leaf's arena alignment (`kArenaAlign`, `kernel/src/model.cu`), which
-/// the vendored layouts below align every tensor and their total to.
-const ARENA_ALIGN: u64 = 256;
 
 /// `sizeof(ninfer::ops::SamplingConfig)` (`ninfer/ops/sampling.h`): a
 /// temperature, a top-k, the top-p and min-p, two penalties, a seed and a
@@ -180,7 +179,6 @@ fn sampling_workspace_capacity_bytes(vocab: u64, min_columns: u64, max_columns: 
 /// `ninfer::LayoutBuilder` at the arena's alignment: each tensor starts on a
 /// block, and the whole is rounded up to one.
 fn layout(tensors: &[u64]) -> u64 {
-    let aligned = |bytes: u64| bytes.div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
     aligned(tensors.iter().fold(0, |cursor, &bytes| aligned(cursor) + bytes))
 }
 

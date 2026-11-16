@@ -13,14 +13,15 @@
 //! the head's buffers in a prefill chunk (`workspace`) and a round
 //! (`decode_graph`). Nothing of DFlash2.
 
+use crate::arena::{bf16, words as i32};
+// The target's hidden width, which the head's stem and continuation hidden
+// share.
+use crate::speculation::HIDDEN;
+
 /// The head's 12 objects in the container: five W8G32 matrices and seven BF16
 /// gains, the same bytes on every 27B artifact
 /// (`ignis_artifact::mtp_scope_27b`).
 pub const WEIGHT_BYTES: u64 = 451_267_584;
-
-/// The target's hidden width, which the head's stem and continuation hidden
-/// share.
-const HIDDEN: u64 = 5120;
 
 /// The head's attention layer: 24 query heads of 256 and 4 KV heads, the
 /// fused projection's rows query, key, gate and value, and its dense MLP.
@@ -39,17 +40,6 @@ pub const PREFILL_ROWS: u64 = 128;
 /// (`kIgnisHqResidualRows`, `kIgnisHqRingWords`).
 const HQ_RESIDUAL_ROWS: u64 = 32 + 512;
 const HQ_RING_WORDS: u64 = 512 / 32;
-
-/// The leaf's scratch-arena allocation alignment.
-const ARENA_ALIGN: u64 = 256;
-
-fn bf16(elements: u64) -> u64 {
-    (elements * 2).div_ceil(ARENA_ALIGN) * ARENA_ALIGN
-}
-
-fn i32(elements: u64) -> u64 {
-    (elements * 4).div_ceil(ARENA_ALIGN) * ARENA_ALIGN
-}
 
 /// The continuation hidden one pool slot keeps: the target's post-final-norm
 /// hidden at the sequence's last position, BF16.
@@ -123,14 +113,15 @@ pub enum HeadLinear {
 }
 
 impl HeadLinear {
-    /// The leaf's code: `Some(None)` for a load without the head (0),
-    /// `Some(Some(..))` for 1 (vendored) and 2 (ours), `None` for any other.
-    pub const fn from_abi(code: u32) -> Option<Option<Self>> {
+    /// The leaf's code: `Ok(None)` for a load without the head (0),
+    /// `Ok(Some(..))` for 1 (vendored) and 2 (ours), and the code back as the
+    /// error for any other, which the header does not define.
+    pub const fn from_abi(code: u32) -> Result<Option<Self>, u32> {
         match code {
-            0 => Some(None),
-            1 => Some(Some(Self::Vendored)),
-            2 => Some(Some(Self::Ours)),
-            _ => None,
+            0 => Ok(None),
+            1 => Ok(Some(Self::Vendored)),
+            2 => Ok(Some(Self::Ours)),
+            unknown => Err(unknown),
         }
     }
 
@@ -151,10 +142,10 @@ mod tests {
     /// The leaf's codes, and the switch's spellings.
     #[test]
     fn the_heads_matrix_routes_are_the_headers_codes() {
-        assert_eq!(HeadLinear::from_abi(0), Some(None));
-        assert_eq!(HeadLinear::from_abi(1), Some(Some(HeadLinear::Vendored)));
-        assert_eq!(HeadLinear::from_abi(2), Some(Some(HeadLinear::Ours)));
-        assert_eq!(HeadLinear::from_abi(3), None);
+        assert_eq!(HeadLinear::from_abi(0), Ok(None));
+        assert_eq!(HeadLinear::from_abi(1), Ok(Some(HeadLinear::Vendored)));
+        assert_eq!(HeadLinear::from_abi(2), Ok(Some(HeadLinear::Ours)));
+        assert_eq!(HeadLinear::from_abi(3), Err(3));
         assert_eq!((HeadLinear::Vendored.as_str(), HeadLinear::Ours.as_str()), ("vendored", "ours"));
     }
 

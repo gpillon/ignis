@@ -29,6 +29,8 @@
 //! reuse) are implemented on top of this contract.
 
 pub mod admission;
+// The leaf's scratch-arena rounding, one copy for the VRAM plan's lines.
+pub(crate) mod arena;
 // Test-only: the attention-input tap, reachable only with both the kernel
 // linked (`cuda`) and the non-default `attn-tap` feature on.
 #[cfg(all(feature = "cuda", feature = "attn-tap"))]

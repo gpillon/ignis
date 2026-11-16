@@ -559,20 +559,39 @@ fn kv_capture_last_error() -> String {
 
 /// What a pool of `cfg` carries for a load's speculative backend (GitHub
 /// #619): the backend the leaf's pool spec names, whose slot sections the
-/// leaf lays out by it, and the attention layers the drafter adds to the
-/// paged KV. Flash-Next's MTP head keeps no drafter window: its state is one
-/// more attention layer of the pool, its KV, indexer and hq window carried
-/// like the trunk's (GitHub #307). The 27B's pool names the load's drafter
-/// as it is, and no drafter the 27B accepts adds a layer.
-fn pool_drafter(cfg: &ModelConfig, speculative_backend: Option<crate::SpeculativeBackend>) -> (i32, u32) {
+/// leaf lays out by it, the attention layers the drafter adds to the paged
+/// KV, and how far behind its frontier a sequence still writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PoolDrafter {
+    /// `enum ignis_speculative_backend`, as the pool spec names it (0: none).
+    abi_code: i32,
+    /// The attention layers the drafter adds to the paged KV.
+    added_layers: u32,
+    /// The positions behind its frontier a sequence still writes
+    /// ([`holder_lag`]).
+    holder_lag: u32,
+}
+
+/// What a pool of `cfg` carries for `speculative_backend`. Flash-Next's MTP
+/// head keeps no drafter window: its state is one more attention layer of the
+/// pool, its KV, indexer and hq window carried like the trunk's (GitHub
+/// #307). The 27B's pool names the load's drafter as it is; its MTP head adds
+/// one attention layer and writes one position behind its frontier, DFlash2
+/// neither.
+fn pool_drafter(cfg: &ModelConfig, speculative_backend: Option<crate::SpeculativeBackend>) -> PoolDrafter {
     match (cfg.family, speculative_backend) {
-        (_, None) => (0, 0),
-        (crate::compute::ModelFamily::FlashNext, Some(crate::SpeculativeBackend::Mtp)) => (0, 1),
+        (_, None) => PoolDrafter { abi_code: 0, added_layers: 0, holder_lag: 0 },
+        (crate::compute::ModelFamily::FlashNext, Some(crate::SpeculativeBackend::Mtp)) => {
+            PoolDrafter { abi_code: 0, added_layers: 1, holder_lag: 0 }
+        }
         // GitHub #620: the 27B's MTP head names its backend, so its pool
         // carries the continuation hidden, and keeps its attention state in
-        // one more attention layer, the pool's last.
-        (_, Some(crate::SpeculativeBackend::Mtp)) => (crate::SpeculativeBackend::Mtp.abi_code(), 1),
-        (_, Some(backend)) => (backend.abi_code(), 0),
+        // one more attention layer, the pool's last. GitHub #622: it writes
+        // its entry at a frontier's last position from the token after it.
+        (_, Some(crate::SpeculativeBackend::Mtp)) => {
+            PoolDrafter { abi_code: crate::SpeculativeBackend::Mtp.abi_code(), added_layers: 1, holder_lag: 1 }
+        }
+        (_, Some(backend)) => PoolDrafter { abi_code: backend.abi_code(), added_layers: 0, holder_lag: 0 },
     }
 }
 
@@ -583,7 +602,7 @@ fn pool_drafter(cfg: &ModelConfig, speculative_backend: Option<crate::Speculativ
 pub fn kv_geometry(cfg: &ModelConfig, speculative_backend: Option<crate::SpeculativeBackend>) -> crate::KvGeometry {
     let topology = cfg.kv_geometry();
     crate::KvGeometry {
-        gqa_layers: topology.gqa_layers + pool_drafter(cfg, speculative_backend).1,
+        gqa_layers: topology.gqa_layers + pool_drafter(cfg, speculative_backend).added_layers,
         ..topology
     }
 }
@@ -622,7 +641,7 @@ pub fn holder_page_reserve(
 /// every other -- the scheduler's
 /// [`crate::SchedulerConfig::kv_holder_lag`].
 pub fn holder_lag(cfg: &ModelConfig, speculative_backend: Option<crate::SpeculativeBackend>) -> u32 {
-    u32::from(pool_drafter(cfg, speculative_backend).0 == crate::SpeculativeBackend::Mtp.abi_code())
+    pool_drafter(cfg, speculative_backend).holder_lag
 }
 
 /// The leaf's pool spec for `cfg`, `budget` and a speculative backend.
@@ -643,7 +662,7 @@ fn pool_spec(
         gdn_value_heads: cfg.gdn_value_heads as u32,
         gdn_head_dim: cfg.gdn_head_dim as u32,
         vocab: cfg.vocab as u32,
-        speculative_backend: pool_drafter(cfg, speculative_backend).0,
+        speculative_backend: pool_drafter(cfg, speculative_backend).abi_code,
         retained_slot_count: budget.retained_slot_count,
         retained_host_slot_count: budget.retained_host_slot_count,
         kv_num_layers: kv_geometry(cfg, speculative_backend).gqa_layers,

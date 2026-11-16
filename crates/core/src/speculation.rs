@@ -28,8 +28,9 @@ pub const DFLASH2_FEATURE_TAPS: u64 = 5;
 /// The drafter's query width (32 heads x 128).
 pub const DFLASH2_QUERY_SIZE: u64 = 4096;
 
-/// The target's hidden width, which the drafter shares.
-const HIDDEN: u64 = 5120;
+/// The 27B's hidden width, which both its drafters share: DFlash2, and the
+/// MTP head's stem and continuation hidden ([`crate::mtp_head`]).
+pub(crate) const HIDDEN: u64 = 5120;
 
 /// The target's MLP width and vocabulary, which the drafter's forward shares
 /// (its MLP, and the target's output head over its draft columns).
@@ -58,9 +59,6 @@ const DFLASH2_TOPK_ENTRY_BYTES: u64 = 8;
 /// drafter's forward (`kDflash2RoundWorkspaceBytes`, `kernel/src/model.cu`).
 const DFLASH2_ROUND_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
 
-/// The leaf's scratch-arena allocation alignment (`DeviceArena::alloc_bytes`).
-const ARENA_ALIGN: u64 = 256;
-
 /// A speculative backend a load can select.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeculativeBackend {
@@ -76,7 +74,8 @@ pub enum SpeculativeBackend {
     /// (spec flash-next/07, GitHub #307), bound from its companion container;
     /// on the 27B its second drafter (GitHub #620, spec #618), the 12 `mtp/`
     /// objects of its own container ([`crate::mtp_head`]), which a load
-    /// reaches through the leaf: the server still offers the 27B DFlash2.
+    /// reaches through the leaf. The server offers it as `--spec-backend mtp`
+    /// (GitHub #623), opt-in beside DFlash2, every profile's drafter.
     Mtp,
 }
 
@@ -535,8 +534,7 @@ impl Speculation {
     pub fn prefill_scratch_bytes(&self, prefill_chunk_tokens: u32, vision: bool) -> u64 {
         match self.backend {
             SpeculativeBackend::Dflash2 => {
-                let bf16 = |elements: u64| (elements * 2).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
-                let i32 = |elements: u64| (elements * 4).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
+                use crate::arena::{bf16, words as i32};
                 let columns = u64::from(prefill_chunk_tokens).min(DFLASH2_WINDOW_TOKENS);
                 let kv_width = DFLASH2_KV_HEADS * DFLASH2_HEAD_DIM;
                 bf16(DFLASH2_FEATURE_TAPS * HIDDEN * columns)
@@ -573,7 +571,8 @@ impl Speculation {
     /// What the load's drafter's verify round adds to a load of
     /// `decode_lanes` lanes: the plan's `drafter_round` line.
     ///
-    /// DFlash2's (P5-05, GitHub #155; `kernel/src/model.cu`): the feature taps of every verify column of the widest round -- one of
+    /// DFlash2's (P5-05, GitHub #155; `kernel/src/model.cu`): the feature
+    /// taps of every verify column of the widest round -- one of
     /// `decode_lanes` lanes since GitHub #336, where it was always 8 -- one
     /// append count per lane, and the round scratch -- the larger of the
     /// drafter's forward activations and the round's context append, each
@@ -591,8 +590,7 @@ impl Speculation {
             // own (spec flash-next/07).
             SpeculativeBackend::VerifyOnly | SpeculativeBackend::Mtp => 0,
             SpeculativeBackend::Dflash2 => {
-                let bf16 = |elements: u64| (elements * 2).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
-                let wide = |elements: u64| (elements * 4).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
+                use crate::arena::{bf16, words as wide};
                 let lanes = u64::from(decode_lanes);
                 let columns = u64::from(self.draft_tokens + 1) * lanes;
                 let drafts = u64::from(self.draft_tokens) * lanes;
