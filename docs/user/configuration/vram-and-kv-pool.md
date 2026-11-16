@@ -158,7 +158,7 @@ which will confirm or correct them
 131,072 tokens need 12,027 MiB free on an RTX 50 card and 12,112 MiB on an
 RTX 30 or 40 card, whose dense prefill buffer is one line more; each
 16,384-token step below needs about 153 MiB less. The first two rows are
-within 5 MiB of their step on an RTX 50 card: a few MiB more taken and each
+within 5 MiB of what their context needs on an RTX 50 card: a few MiB more taken and each
 keeps one step less; the last misses 16,384 tokens by 10 MiB. Your own figure is `nvidia-smi`'s free memory before the
 start, and the load's `ignis.runtime.vram_plan` event says what it kept.
 

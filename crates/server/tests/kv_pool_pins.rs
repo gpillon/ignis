@@ -107,7 +107,7 @@ fn rtx_12gb_keeps_its_measured_pool_and_one_page_fewer_at_the_constant() {
     assert_eq!(load.pool_tokens(load.on_the_rtx_5090(CUDA_CONTEXT_BYTES)), 214_080);
 }
 
-/// Less 1 GiB the 131,072-token step misses its floor of 2,053 pages by 420
+/// Less 1 GiB the 131,072-token context misses its floor of 2,053 pages by 420
 /// at the measured context (421 at the constant), 114,688 its 1,797 by 164,
 /// and 98,304 holds its 1,541 in a pool of 1,633 pages, 104,512 tokens: the
 /// load adapts, and its log says so.
