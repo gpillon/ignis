@@ -1248,7 +1248,8 @@ chain's cost.
 **MTP**:
 The model's native multi-token-prediction head as a drafter
 (`--spec-backend mtp`), its **MTP head**, chosen at load. Flash-Next drafts with
-it (draft window 1..7, verification width chosen per round by the row budget).
+it (draft window 1..7; a round of several lanes verifies fewer drafts a lane,
+down to none, to stay within the load's row budget, `--spec-draft-rows`).
 The 27B drafts with it as its opt-in second drafter, in place of **DFlash2**
 (#623): draft window 0..7, the **fixed draft** only, DFlash2's own settings
 refused by name where the operator names them, and drafting after images as
