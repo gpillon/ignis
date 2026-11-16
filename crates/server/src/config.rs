@@ -657,6 +657,23 @@ pub enum SpecChoice {
     Backend(SpeculativeBackend),
 }
 
+impl SpecChoice {
+    /// The backend named, `None` for `off`.
+    pub fn backend(self) -> Option<SpeculativeBackend> {
+        match self {
+            Self::Off => None,
+            Self::Backend(backend) => Some(backend),
+        }
+    }
+}
+
+/// Whether `backend` on `family` is the 27B's MTP head (GitHub #623), the one
+/// load whose window, settings and load line differ from both Flash-Next's
+/// head and DFlash2: what the config, its document and the load each ask.
+pub(crate) fn the_27bs_mtp(family: Option<ModelFamily>, backend: Option<SpeculativeBackend>) -> bool {
+    family == Some(ModelFamily::Qwen38_27b) && backend == Some(SpeculativeBackend::Mtp)
+}
+
 /// How image parts are acquired (GitHub #179).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaOptions {
@@ -1736,7 +1753,7 @@ fn derive_speculation(
     // GitHub #623: the 27B's MTP window is the operator's, or a profile's that
     // chose MTP too; the window a profile gives beside its own DFlash2 (every
     // built-in profile's 7) is that drafter's, not the head's.
-    let the_27bs_mtp = backend == SpeculativeBackend::Mtp && family == Some(ModelFamily::Qwen38_27b);
+    let the_27bs_mtp = the_27bs_mtp(family, Some(backend));
     let window = s.draft_tokens.filter(|_| !the_27bs_mtp || mtp_window_given(resolution));
     let tokens = match window {
         Some(tokens) => tokens,

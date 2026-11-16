@@ -1418,7 +1418,7 @@ pub fn qwen27b_load(
     // past the ledger -- none under any other drafter. The plan held them
     // beside its floor (GitHub #623), so admission still holds one context
     // and the retained slots' pages.
-    let dense = ignis_core::compute::ModelConfig::qwen38_27b();
+    let the_27bs_config = ignis_core::compute::ModelConfig::qwen38_27b();
     let drafter = shape.speculation.map(|s| s.backend());
     let admission_pages = capacity_pages.saturating_sub(holder_pages_27b(&shape, leaf_config.slot_count));
 
@@ -1457,7 +1457,7 @@ pub fn qwen27b_load(
     let (sched, kv_disk_bytes) = scheduler_with_kv_disk(
         SchedulerConfig {
             thinking_close,
-            kv_holder_lag: ignis_core::seq::holder_lag(&dense, drafter),
+            kv_holder_lag: ignis_core::seq::holder_lag(&the_27bs_config, drafter),
             ..scheduler_config_for_shape(model_id.clone(), shape, KV_PAGE_TOKENS, admission_pages, leaf_config.slot_count)
         },
         model,

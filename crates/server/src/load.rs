@@ -549,9 +549,7 @@ pub fn load_shape(config: &crate::config::Config, vision_item_bound: Option<u64>
     };
     // GitHub #623: the 27B's MTP head has no head to choose, whatever a
     // profile's `auto` says (rtx-16gb's).
-    let the_27bs_mtp = |s: &ignis_core::Speculation| {
-        s.backend() == ignis_core::SpeculativeBackend::Mtp && config.basis.family() == Some(ModelFamily::Qwen38_27b)
-    };
+    let the_27bs_mtp = |s: &ignis_core::Speculation| crate::config::the_27bs_mtp(config.basis.family(), Some(s.backend()));
     if let Some(speculation) = shape
         .speculation
         .filter(|s| !the_27bs_mtp(s) && config.settings().spec.draft_head.is_some_and(|head| head.is_auto()))
@@ -700,7 +698,7 @@ fn cuda_scheduler_for(
         // GitHub #336: the 27B's are a load setting too.
         decode_lanes = shape.decode_lanes_for(family),
         kv_format = shape.kv_format.as_str(),
-        speculation = %speculation_text(family, shape.speculation, mtp_window_zero(config)),
+        speculation = %speculation_text(family, LoadSpeculation::of(config, family, shape.speculation)),
         vision = %shape.vision.map_or_else(
             || "off".to_owned(),
             |v| format!("max_tokens={} item_max_tokens={}", v.max_tokens(), v.item_max_tokens())
@@ -714,23 +712,46 @@ fn cuda_scheduler_for(
     Ok((Box::new(scheduler), reserved, shape, crate::adaptation::steps_text(&adapted)))
 }
 
+/// What a load's `ignis.model.loaded` line says of its speculation (GitHub
+/// #623): the speculation it runs, or none, or none because it named the
+/// 27B's MTP head at a window of 0, which the line tells from `off`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LoadSpeculation {
+    /// The speculation the load runs, `None` for none.
+    Runs(Option<ignis_core::Speculation>),
+    /// None: the config named the 27B's MTP head at a window of 0.
+    MtpWindowZero,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl LoadSpeculation {
+    /// The speculation of `family`'s load of `config`, which runs `runs`.
+    fn of(config: &crate::config::Config, family: ModelFamily, runs: Option<ignis_core::Speculation>) -> Self {
+        let named = config.settings().spec.backend.and_then(crate::config::SpecChoice::backend);
+        if config.speculation_off && crate::config::the_27bs_mtp(Some(family), named) {
+            Self::MtpWindowZero
+        } else {
+            Self::Runs(runs)
+        }
+    }
+}
+
 /// A load's speculation as `ignis.model.loaded` spells it: the backend, the
 /// draft window and the proposal head, then (GitHub #576, ADR 0090) the
 /// draft rule and the drafter's two settings, which a report of what was
 /// measured names; `off` without one. GitHub #623: the 27B's MTP load names
 /// its drafter and window alone, none of DFlash2's settings being its own,
-/// and its window of 0 (`mtp_off`) is `off` saying so; Flash-Next's line is
-/// what it was.
+/// and its window of 0 is `off` saying so; Flash-Next's line is what it was.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn speculation_text(family: ModelFamily, speculation: Option<ignis_core::Speculation>, mtp_off: bool) -> String {
-    let the_27b = family == ModelFamily::Qwen38_27b;
-    match speculation {
-        None if the_27b && mtp_off => return "off (mtp draft_tokens=0)".to_owned(),
-        Some(s) if the_27b && s.backend() == ignis_core::SpeculativeBackend::Mtp => {
+fn speculation_text(family: ModelFamily, speculation: LoadSpeculation) -> String {
+    let speculation = match speculation {
+        LoadSpeculation::MtpWindowZero => return "off (mtp draft_tokens=0)".to_owned(),
+        LoadSpeculation::Runs(Some(s)) if crate::config::the_27bs_mtp(Some(family), Some(s.backend())) => {
             return format!("mtp draft_tokens={}", s.draft_tokens());
         }
-        _ => {}
-    }
+        LoadSpeculation::Runs(runs) => runs,
+    };
     speculation.map_or_else(
         || "off".to_owned(),
         |s| {
@@ -746,14 +767,6 @@ fn speculation_text(family: ModelFamily, speculation: Option<ignis_core::Specula
             )
         },
     )
-}
-
-/// Whether `config` loads no speculation because it named the MTP head at a
-/// window of 0 (GitHub #623), not `off`.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn mtp_window_zero(config: &crate::config::Config) -> bool {
-    config.speculation_off
-        && config.settings().spec.backend == Some(crate::config::SpecChoice::Backend(ignis_core::SpeculativeBackend::Mtp))
 }
 
 #[cfg(all(test, not(feature = "cuda")))]
@@ -1034,15 +1047,15 @@ mod tests {
         let the_27b = ModelFamily::Qwen38_27b;
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
         assert_eq!(
-            speculation_text(the_27b, Some(spec), false),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(spec))),
             "dflash2 draft_tokens=7 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
         );
         let sampled = spec.with_draft_rule(DraftRule::Sampled, DrafterSampling { temperature_factor_milli: 1000, top_p_milli: 875 });
         assert_eq!(
-            speculation_text(the_27b, Some(sampled), false),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(sampled))),
             "dflash2 draft_tokens=7 draft_head=full draft_rule=sampled drafter_temperature_factor=1 drafter_top_p=0.875"
         );
-        assert_eq!(speculation_text(the_27b, None, false), "off");
+        assert_eq!(speculation_text(the_27b, LoadSpeculation::Runs(None)), "off");
     }
 
     /// GitHub #623: the 27B's MTP load names its drafter and its window, and
@@ -1052,10 +1065,10 @@ mod tests {
     fn the_load_log_names_the_27bs_mtp_drafter_and_its_window() {
         use ignis_core::{DraftRule, DrafterSampling, Speculation, SpeculativeBackend};
         let mtp = Speculation::new(SpeculativeBackend::Mtp, 5).unwrap().with_draft_rule(DraftRule::Fixed, DrafterSampling::default());
-        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, Some(mtp), false), "mtp draft_tokens=5");
-        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, None, true), "off (mtp draft_tokens=0)");
+        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(Some(mtp))), "mtp draft_tokens=5");
+        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::MtpWindowZero), "off (mtp draft_tokens=0)");
         assert_eq!(
-            speculation_text(ModelFamily::FlashNext, Some(mtp), false),
+            speculation_text(ModelFamily::FlashNext, LoadSpeculation::Runs(Some(mtp))),
             "mtp draft_tokens=5 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
         );
         let config = |flags: &[&str]| {
@@ -1063,8 +1076,13 @@ mod tests {
             let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).unwrap() else { unreachable!() };
             config.for_family(ModelFamily::Qwen38_27b).unwrap()
         };
-        assert!(mtp_window_zero(&config(&["--spec-backend", "mtp", "--spec-draft-tokens", "0", "--vision-enabled", "false"])));
-        assert!(!mtp_window_zero(&config(&["--spec-backend", "off"])), "off is off, not the head's window of 0");
-        assert!(!mtp_window_zero(&config(&["--spec-backend", "mtp", "--vision-enabled", "false"])));
+        let of = |flags: &[&str], family| LoadSpeculation::of(&config(flags), family, None);
+        let zero = ["--spec-backend", "mtp", "--spec-draft-tokens", "0", "--vision-enabled", "false"];
+        assert_eq!(of(&zero, ModelFamily::Qwen38_27b), LoadSpeculation::MtpWindowZero);
+        assert_eq!(of(&["--spec-backend", "off"], ModelFamily::Qwen38_27b), LoadSpeculation::Runs(None), "off is off, not the head's window of 0");
+        let runs = Speculation::new(SpeculativeBackend::Mtp, 7).unwrap();
+        let default = config(&["--spec-backend", "mtp", "--vision-enabled", "false"]);
+        assert_eq!(LoadSpeculation::of(&default, ModelFamily::Qwen38_27b, Some(runs)), LoadSpeculation::Runs(Some(runs)));
+        assert_eq!(of(&zero, ModelFamily::FlashNext), LoadSpeculation::Runs(None), "only the 27B's MTP load names its window of 0");
     }
 }
