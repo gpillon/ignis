@@ -186,10 +186,10 @@ model, set the same three in your harness's OpenAI-compatible provider.
 ## Testing a 16 GB card
 
 The `rtx-16gb` profile is derived from an
-RTX 5090 held inside a 16 GB budget: no real 16 GB card has run it
+RTX 5090 held inside a 16 GB budget, and real 16 GB cards have run it since
 ([the profile](../concepts/profiles.md#rtx-16gb)). A user who asks you to
 test ignis on their RTX 5060 Ti 16 GB, 5070 Ti or 5080 and report how it went
-gives the project its first real numbers. The reports are collected on
+adds a real card's numbers to the ones the project has. The reports are collected on
 [issue #360](https://github.com/gpillon/ignis/issues/360), one comment per
 card. The test is the install above with the 16 GB model, a short ladder of
 settings for when the default is refused, and a report; after the 13.4 GB

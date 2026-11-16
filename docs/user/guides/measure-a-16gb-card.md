@@ -9,8 +9,8 @@ The `rtx-16gb` profile is derived, not measured: the project has no 16 GB
 card ([the profile](../concepts/profiles.md#rtx-16gb)). If you run the 27B
 on an RTX 5060 Ti 16 GB, a 5070 Ti or a 5080, one command against your running
 server writes a record of what it does there, and that record, posted on
-[issue #360](https://github.com/gpillon/ignis/issues/360), is how the profile
-gets real numbers.
+[issue #360](https://github.com/gpillon/ignis/issues/360) beside the reports
+already there, is how the profile gets real numbers.
 
 The same command measures an RTX 30 or RTX 40 card (the RTX 3090, 3090 Ti and
 4090 at 24 GB, or a 16 GB RTX 40 card), which the project has none of: its
