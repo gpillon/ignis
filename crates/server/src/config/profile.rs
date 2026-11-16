@@ -267,9 +267,10 @@ pub const NONE_PROFILE: &str = "none";
 ///
 /// `rtx-12gb` is the 12 GB class (spec #630, ADR 0098): the RTX 5070, the
 /// 12 GB RTX 4070 family, the RTX 3060 12 GB and the RTX 3080 Ti, the cards
-/// `--profile auto` finds below 14 GiB. Derived, not measured: no 12 GB card
-/// exists in the project, and the class is simulated on the RTX 5090 under a
-/// 12 GiB budget. It is sized for one user with a desktop on the card, about 1
+/// `--profile auto` finds below 14 GiB. Derived: no 12 GB card exists in the
+/// project, and the class is simulated on the RTX 5090 under a 12 GiB budget,
+/// where the 12 GB artifact loads 131,072 tokens with nothing adapted (#635,
+/// 2026-11-16). It is sized for one user with a desktop on the card, about 1
 /// GB already taken: one decode lane, where a second costs about 0.87 GB; the
 /// 27B's MTP head as the drafter, at the window #628 measured
 /// ([`ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS`], ADR 0095),

@@ -62,8 +62,9 @@ You can add models of your own with an
     (RTX 5070, the 12 GB RTX 4070 family, RTX 3060 12 GB, RTX 3080 Ti) is a
     card class of its own, on its own profile, `rtx-12gb`: the 27B on one
     lane, drafting with its MTP head, at 131,072 tokens of context in a
-    12 GiB VRAM budget and 98,304 in 11 GiB, measured on the RTX 5090 held
-    to those budgets: no 12 GB card has run it yet
+    12 GiB VRAM budget, measured on the RTX 5090 held to it (no 12 GB card
+    has run it yet), and 98,304 by the same plan in 11 GiB; 65,536 there on
+    an RTX 30 or 40 card, whose prefill routes hold 89 MB more
     ([the profile](../concepts/profiles.md#rtx-12gb)). That artifact, the 27B
     at about 2.8 bits per weight, is not published yet; until it is, every
     built-in model is above the class, and the server refuses each one there
