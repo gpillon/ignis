@@ -30,13 +30,13 @@ of weights, while single-turn code barely moves
   its plan's lines are 707,931,720 bytes more than the head's and its KV pool holds 150,720 tokens against the head's
   214,144. In that budget the head's edge is pool; on a real card the pool is the context: on the plan's arithmetic,
   from the DFlash2 load's logged lines, DFlash2 keeps 49,152 tokens on an RTX 50 card with nothing else on it, where
-  the head keeps 131,072, and beside a desktop of about 0.75 GB it keeps no step.
+  the head keeps 131,072, and beside a desktop of about 0.75 GB its plan holds no context of the ladder.
 - **The profile is sized for a desktop on the card, one user**: one decode lane, a context of 131,072 that adapts in
   steps of 16,384 (`model.adapt_context_step`; 65,536 elsewhere), `vram.qwen38.headroom_bytes` 512M (1200M
   elsewhere), a 512-token prefill chunk with the solo width at the chunk, vision on in host memory at 4,096 tokens.
   The step is the owner's call of 2026-11-16, after the gate: a real card's budget is derived from the memory its
-  desktop leaves, the context is the largest step that budget holds, and at 32,768 the real-card cases wasted up to
-  a step of it, which 16,384 recovers at no cost.
+  desktop leaves, the context is the largest of the ladder's that budget holds, and at 32,768 the real-card cases
+  wasted up to a step of it, which 16,384 recovers at no cost.
   Every value is a default the load adapts and the operator overrides; two lanes, a 256-token chunk and DFlash2 stay
   configuration choices. The chunk's price is measured (#636, candidate A in 12 GiB): 512 buys 4,608 tokens of KV
   pool over 1,024, not the estimated 17,000, for 7% on the first token, and 256 buys none with vision on, 25%

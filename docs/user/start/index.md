@@ -68,12 +68,10 @@ You can add models of your own with an
     lane, drafting with its MTP head, at up to 131,072 tokens of context,
     stepping down 16,384 at a time to what the card's free memory holds.
     The RTX 5090 held to a 12 GiB VRAM budget measured 131,072 (no 12 GB card
-    has run it yet). On a real card, by the same plan's arithmetic, an RTX 50
-    card keeps 131,072 with nothing else on it, 81,920 beside a desktop of
-    about 0.5 GB and 32,768 beside about 1 GB; an RTX 30 or 40 card, whose
-    prefill routes hold 89 MB more, keeps a step less in some of those cases
-    ([on a real 12 GB card](../configuration/vram-and-kv-pool.md#on-a-real-12-gb-card),
-    [the profile](../concepts/profiles.md#rtx-12gb)). Against the 16 GB entry
+    has run it yet); what a real card keeps depends on the memory its desktop
+    leaves, case by case on
+    [the VRAM page](../configuration/vram-and-kv-pool.md#on-a-real-12-gb-card)
+    ([the profile](../concepts/profiles.md#rtx-12gb)). Against the 16 GB entry
     it gives up a little quality: a KLD against BF16 of 0.0431 against 0.0418,
     on the RTX 5090 at the class's shape. On an RTX 30 or 40 card it runs the
     prefill routes the 16 GB entries run there, and its quality on them has

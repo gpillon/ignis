@@ -96,8 +96,8 @@ context 16,384 tokens at a time and says so in the plan event's `adapted`:
 `max_context 131072 -> 98304 (adapt_context_step 16384, one lane)`. What a
 real card keeps depends on its desktop:
 [on a real 12 GB card](#on-a-real-12-gb-card). A card of
-10 or 11 GB is read as the class, and its plan refuses the start after every
-step, naming the bytes it misses.
+10 or 11 GB is read as the class, and its plan refuses the start at every
+context of the ladder, naming the bytes it misses.
 
 The plan of a 12 GB load on the class's own artifact, measured on the RTX
 5090 under an explicit 12 GiB budget
@@ -126,9 +126,15 @@ the three the head's copies keep back. In an 11 GiB budget the same lines
 leave 1,633 pages, 104,512 tokens, so the load passes 114,688 over for
 98,304, and its plan's `adapted` says
 `max_context 131072 -> 98304 (adapt_context_step 16384, one lane)`. On the
-routes an RTX 30 or 40 card runs, the dense prefill's 89 MB buffer takes 142
-pages of the pool, and in 11 GiB the load adapts to 81,920
-([the profile](../concepts/profiles.md#rtx-12gb)).
+routes an RTX 30 or 40 card runs
+([Context and speculation](context-and-speculation.md)), the dense prefill's
+89 MB buffer is one line more and takes 142 pages of the pool; the workspace
+stays, since at the 512-token chunk the vision encoder's share sets it.
+Planned from the RTX 5090's load, with its CUDA context and trellis
+workspace, the pool is 205,056 tokens in 12 GiB, where 131,072 tokens still
+load; in 11 GiB it is 50 pages, about 31 MB, short of 98,304, and the load
+adapts to 81,920. A card whose CUDA context and trellis workspace come to
+that much less than the 5090's keeps 98,304.
 
 ### On a real 12 GB card
 

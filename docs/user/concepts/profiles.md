@@ -254,16 +254,12 @@ Why each:
   `--spec-decode-lanes 2` asks for two on a card with nothing else on it.
 - **131,072 tokens, adapting 16,384 at a time.** Every other profile adapts
   65,536 at a time. A 12 GB card's budget is derived from the memory free at
-  the start, which the desktop sets, and the context is the largest step that
-  memory holds, so what lies short of the next step goes unused: at 16,384
-  tokens a step is about 153 MiB, and the finer step costs nothing. By the
-  plan's arithmetic an
-  RTX 50 card keeps 131,072 tokens with nothing else on it, 81,920 beside a
-  desktop of about 0.5 GB (65,536 at a 32,768-token step) and 32,768 beside
-  about 1 GB, and a desktop of about 1.3 GB leaves no step; an RTX 30 or 40
-  card keeps a step less in some of those cases
-  ([on a real 12 GB card](../configuration/vram-and-kv-pool.md#on-a-real-12-gb-card):
-  the table, the free memory each context needs, and what you can change).
+  the start, which the desktop sets, and the context is the largest of the
+  ladder's contexts that memory holds, so what lies short of the next one
+  goes unused: at 16,384 tokens a step is about 153 MiB, and the finer step
+  costs nothing. What a real card keeps beside each desktop is on
+  [the VRAM page](../configuration/vram-and-kv-pool.md#on-a-real-12-gb-card),
+  with the free memory each context needs and what you can change.
   On the class's
   artifact, on the RTX 5090 held to an explicit 12 GiB budget
   (`--vram-budget-bytes`), 131,072 tokens load with nothing adapted, beside
@@ -297,18 +293,12 @@ Why each:
 - **Vision on**, as on `rtx-16gb`: 4,096 tokens an image, tower and pool in
   host RAM, so with no image in flight vision costs no context.
 - **A card of 10 or 11 GB** is read as the class too: its VRAM plan refuses
-  the load after every step of the ladder, naming the bytes it misses.
+  the load at every context of the ladder, naming the bytes it misses.
 - **On a 12 GB RTX 30 or 40 card** the 27B prefills on the routes those cards
   run ([Context and speculation](../configuration/context-and-speculation.md)),
-  and the dense prefill's 89 MB buffer is a line of the VRAM plan; the
-  workspace stays, since at the 512-token chunk the vision encoder's share
-  sets it. Planned from the RTX 5090's load, with its CUDA context and
-  trellis workspace, the buffer leaves a KV pool of 205,056 tokens in 12 GiB
-  against 214,144, and 131,072 tokens still load; in 11 GiB the pool is 50
-  pages, about 31 MB, short of 98,304, and the load adapts to 81,920. A card
-  whose CUDA context and trellis workspace come to that much less than the
-  5090's keeps 98,304. On a real card with nothing else on it the buffer
-  costs a step: 114,688 tokens, where an RTX 50 card keeps 131,072.
+  and the dense prefill's 89 MB buffer is a line of the VRAM plan, which
+  takes pool and, in some budgets, a step of the context
+  ([the 12 GB class's plan](../configuration/vram-and-kv-pool.md#the-12-gb-class)).
 - No real 12 GB card has loaded this profile yet: its numbers are the RTX
   5090's, held to a 12 GiB budget, and a real card's are the same plan's
   arithmetic until one confirms them
