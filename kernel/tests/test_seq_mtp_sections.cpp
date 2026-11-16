@@ -19,12 +19,16 @@
 //   page boundary, lends the pages below it, and hands each claimant its own
 //   copy and the opener's continuation hidden and ring words, through a host
 //   retained slot;
-// - a spilled prefix and a spilled checkpoint restore with every page.
+// - a spilled prefix and a spilled checkpoint restore with every page;
+// - the KV capture seam reads a claimant's rows through its logical pages, the
+//   prefix's shared page first, on a pool built for the head, and refuses a
+//   claimant by name on a pool without it, as before the head.
 // The program writes these sections; here the test writes known bytes into
 // them and moves the frontier by hand, as a program's chunk would.
 //
 // GPU test (ADR 0006): no SKIP_RETURN_CODE, a missing device fails.
 
+#include "ignis_kv_capture.h"
 #include "ignis_model.h"
 #include "ignis_seq.h"
 #include "ignis_seq_checkpoint_internal.h"
@@ -556,6 +560,57 @@ void run(int32_t kv_format) {
   ignis_seq_pool_free(pool);
 }
 
+// The KV capture seam over a claimant (GitHub #622), BF16 KV, the only format
+// it reads: on a pool built for the head its rows are read through its logical
+// pages, page 0 the prefix's shared one (the head's readout reads a claimant's
+// state this way); on a pool without the head a claimant is refused by name,
+// as it was before the head.
+void check_claimant_capture() {
+  for (const bool head : {true, false}) {
+    const std::string what = head ? "capture on an MTP pool" : "capture on a pool without the head";
+    ignis_seq_pool *pool = create(
+        small_spec(IGNIS_KV_FORMAT_BF16, head ? IGNIS_SPECULATIVE_MTP : IGNIS_SPECULATIVE_NONE, head ? kLayers : kLayers - 1),
+        what);
+    if (pool == nullptr) {
+      continue;
+    }
+    ignis_seq *a = nullptr;
+    ignis_seq_prefix *prefix = nullptr;
+    ignis_seq *c = nullptr;
+    check(ignis_seq_alloc(pool, 256, &a) == 0, what + ": alloc the publisher: " + ignis_seq_last_error());
+    if (a != nullptr) {
+      fill_page(*pool, a->kv.page_ids()[0], 0x30);
+      stand_at(*a, 128);
+      cudaDeviceSynchronize();
+      check(ignis_seq_prefix_publish(pool, a, 128, 0, &prefix) == 0 && ignis_seq_alloc_shared(pool, 320, prefix, &c) == 0,
+            what + ": publish and claim: " + ignis_seq_last_error());
+    }
+    if (c != nullptr) {
+      std::vector<uint16_t> rows(static_cast<std::size_t>(kPage) * 256, 0);
+      const int32_t rc = ignis_kv_capture_rows(pool, c, 0, 0, 0, 0, static_cast<int32_t>(kPage), 256, rows.data());
+      const std::string message = ignis_kv_capture_last_error();
+      if (head) {
+        // fill_page writes plane `i` of a page with 0x30 + i.
+        const auto key = static_cast<unsigned char>(0x30 + ignis_kv_plane_index(IGNIS_KV_FORMAT_BF16, 0, IGNIS_KV_PLANE_K));
+        std::vector<unsigned char> bytes(rows.size() * sizeof(uint16_t));
+        std::memcpy(bytes.data(), rows.data(), bytes.size());
+        check(rc == 0 && all(bytes, key), what + ": a claimant's rows are the prefix's shared page: \"" + message + "\"");
+      } else {
+        check(rc == -1 && message.find("claims a shared prefix") != std::string::npos,
+              what + ": a claimant is refused by name: got " + std::to_string(rc) + " \"" + message + "\"");
+      }
+      ignis_seq_release(pool, c);
+    }
+    if (prefix != nullptr) {
+      ignis_seq_prefix_release(pool, prefix);
+    }
+    if (a != nullptr) {
+      ignis_seq_release(pool, a);
+    }
+    ignis_seq_pool_free(pool);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -566,6 +621,7 @@ int main() {
   }
   run(IGNIS_KV_FORMAT_BF16);
   run(IGNIS_KV_FORMAT_HQ_E8_2B);
+  check_claimant_capture();
   if (g_failed != 0) {
     std::fprintf(stderr, "seq mtp sections test: %d check(s) failed\n", g_failed);
     return 1;

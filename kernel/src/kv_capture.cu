@@ -142,10 +142,18 @@ extern "C" int32_t ignis_kv_capture_rows(const struct ignis_seq_pool *pool,
   }
 
   // P4-10 (GitHub #126): the sequence's OWN pages are its whole history only
-  // while it claims no shared prefix. GitHub #622: a claimant's logical pages
-  // are the prefix chain's shared pages, then its own -- the block-table row
-  // its kernels read -- so a claimant's rows, the MTP head's at the prefix's
-  // last position among them, are read as its kernels read them.
+  // while it claims no shared prefix. GitHub #622: on a pool built for the
+  // 27B's MTP head a claimant's logical pages are the prefix chain's shared
+  // pages, then its own -- the block-table row its kernels read -- so a
+  // claimant's rows, the head's at the prefix's last position among them, are
+  // read as its kernels read them (`ignis_mtp_readout_state`). Every other
+  // pool's fixture captures never share a prefix, and a claimant is refused
+  // there as before.
+  if (seq->prefix != nullptr && !pool->has_mtp_head()) {
+    set_error("ignis_kv_capture_rows: the sequence claims a shared prefix, whose pages it does "
+              "not own; capture from the publisher instead");
+    return -1;
+  }
   std::vector<std::int32_t> page_ids = ignis_seq_prefix_chain_page_ids(seq->prefix);
   const auto own = seq->kv.page_ids();
   page_ids.insert(page_ids.end(), own.begin(), own.end());

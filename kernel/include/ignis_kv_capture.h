@@ -78,7 +78,10 @@ struct ignis_seq;
  * or past its currently mapped pages -- every one of those means the
  * fixture capture asked for something that either does not exist yet or
  * was never real activations, and this seam has exactly one caller who
- * would want to know that immediately, not read garbage. */
+ * would want to know that immediately, not read garbage. A sequence that
+ * claims a shared prefix is read through its logical pages, the shared ones
+ * then its own, on a pool built for the 27B's MTP head (GitHub #622), and
+ * refused on every other. */
 int32_t ignis_kv_capture_rows(const struct ignis_seq_pool *pool, const struct ignis_seq *seq,
                                int32_t gqa_layer_ordinal, int32_t role, int32_t kv_head,
                                int32_t first_position, int32_t row_count, int32_t head_dim,
