@@ -31,6 +31,24 @@ def test_the_16gb_artifacts_recipe_is_the_default_and_names_its_k_head_ceiling_a
                                   "quantization_config.json"]
 
 
+def test_the_public_2_5_bit_quants_recipe_names_its_k_config_ceiling_and_pins():
+    r = recipe.load("tandem25")
+    assert (r["name"], r["weights_id"], r["ceiling_bytes"], r["job"]) == ("tandem25", "trellis-tandem25", 8_304_000_000, None)
+    # 0xBakeer/TandemLLM-Qwen3.8-27B-EXL3-2.5 at a7fef26e: K2 192 and K3 208 over the body, the head at K4
+    assert len(r["tensors"]) == 400 and all(k.startswith(P) for k in r["tensors"])
+    assert collections.Counter(r["tensors"].values()) == {2: 192, 3: 208}
+    assert r["quantization_config"] == {"quant_method": "exl3", "codebook": "mul1", "out_scales": "auto", "bits": 2.5,
+                                        "head_bits": 4}
+    # the shards are pinned by their LFS oid, as its download records give it
+    assert r["files"]["model-00001-of-00002.safetensors"]["sha256"] == (
+        "6f744805a09cf267d246fc2e4badf06d8f63acf89514ed155c27d04b997c71e1")
+    assert r["files"]["model-00002-of-00002.safetensors"]["sha256"] == (
+        "a83396393c028ae2e30321716f5272bce59664070927edc1412e8f49286142fb")
+    assert sorted(r["files"]) == ["config.json", "model-00001-of-00002.safetensors",
+                                  "model-00002-of-00002.safetensors", "model.safetensors.index.json",
+                                  "quantization_config.json"]
+
+
 def _named(tmp_path, change=None, name="mine"):
     """A recipe `name` in a recipes directory of its own: two body matrices, the head at 4, one pin."""
     data = {"schema": recipe.SCHEMA, "weights_id": "trellis-mine", "ceiling_bytes": 1 << 30,
