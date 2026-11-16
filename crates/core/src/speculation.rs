@@ -131,8 +131,8 @@ pub const FLASH_NEXT_DEFAULT_DRAFT_TOKENS: u32 = 2;
 /// most tokens per second on the 16 GB artifact in a 13 GiB budget over
 /// recorded agent turns (GitHub #628, finding
 /// 2026-11-15-the-27bs-mtp-head-measured-on-the-rtx-5090), where windows 5 to
-/// 7 came within 0.4% of each other; on the NVFP4 artifact 5 commits about
-/// 3.5% more.
+/// 7 came within 0.4% of each other; on the NVFP4 artifact 5 is estimated
+/// to commit about 3.5% more.
 pub const QWEN38_MTP_DEFAULT_DRAFT_TOKENS: u32 = 7;
 
 /// The window a Flash-Next round of `lanes` lanes verifies at (spec

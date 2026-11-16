@@ -157,8 +157,9 @@ one, up to the draft window.
   the load; 7 when unnamed, the window that committed the most tokens per
   second on the 16 GB artifact in a 13 GiB budget, over recorded agent turns.
   There windows 5, 6 and 7 came within 0.4% of each other; on the NVFP4
-  artifact under `rtx5090` window 5 committed about 3.5% more than 7, so
-  `--spec-draft-tokens 5` is the window to name there
+  artifact under `rtx5090` window 5 is estimated, from the measured round
+  costs, to commit about 3.5% more than 7, a gap the size of the costs' own
+  spread between launches
   ([finding](../../findings/2026-11-15-the-27bs-mtp-head-measured-on-the-rtx-5090.md)).
   A window of 0 loads no speculation: the same load as
   `--spec-backend off`, with nothing of the head bound and the same VRAM plan.
@@ -190,7 +191,7 @@ one, up to the draft window.
   `hq-e8-2b` the head's layer takes its share of the residual window. A
   prefill runs the head over every position of the prompt: on the RTX 5090
   the NVFP4 artifact's time to first token at 8K and 32K tokens is 13% longer
-  than at window 0, the 16 GB artifact's 1 to 2%. A round chains the head
+  than at window 0, and the 16 GB artifact's prefill takes 6% longer. A round chains the head
   once a draft, each step the head's layer
   and the model's whole output head: 1.2 to 1.4 ms a step on the NVFP4
   artifact at one lane (2.6 ms at eight lanes 64K tokens deep), 0.8 to 1.1 ms

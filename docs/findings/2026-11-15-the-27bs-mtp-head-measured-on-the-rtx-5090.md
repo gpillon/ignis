@@ -266,7 +266,8 @@ own launch spread at 32K (4%).
 - **The workspace line, settled**: on the NVFP4 load (2,048-token chunks, vision's 32,768-token envelope) the image
   encoder's share sizes the arena under all three; on the 16 GB load (1,024-token chunks, a 4,096-token envelope) the
   prefill's scratch does, and DFlash2's taps add 92.3 MB to it (the spec's "up to 92.3 MB"), the head's prefill 39.8 MB.
-- **The residual, settled**: WDDM's counter for the server process 5 s after it served (`GPU Process Memory`,
+- **The residual, settled**: WDDM's counter for the server process 5 s after it answered its first `/v1/models`, before
+  any cell (`GPU Process Memory`,
   `Dedicated Usage`: byte-exact, where NVML's free memory drifts with the desktop), less every other line of its plan:
   NVFP4 MTP 109.6 and 110.7 MB (two launches), DFlash2 117.0 MB, none 67.7 and 66.3 MB; 16 GB MTP 45.7 MB and, once,
   42.7 MB under its other lines, DFlash2 64.5 MB, none 32.6 MB twice. The plan's 124,474,800-byte residual line covers
@@ -280,7 +281,12 @@ own launch spread at 32K (4%).
   the same tokens under MTP and window 0, both pairs of launches; on NVFP4 three part, at tokens 3, 4 and 23, the same
   on both pairs, each launch equal to its twin. Probed after the campaign by the near-tie rule (`support/near_tie.rs`'s
   two prefill routes, on a plain load at the served `hq-e8-2b` and `yarn:3.5`; a one-off test kept in
-  `.scratch/618/628/judge/`): all three are near ties, the per-token route rating them 0 to 1 BF16 ulp apart.
+  `.scratch/618/628/judge/`): all three are near ties, the per-token route rating them 0 to 1 BF16 ulp apart. The
+  probe stands on the served context: its prompts are the served ones' lengths (31, 40, 36, 35 tokens), its first
+  greedy pick is the served first token on every canary, and at each divergence it picks one of the two served picks.
+  A first probe under BF16 KV was set aside: there rust-sort's first token is already another (63 where both served
+  launches wrote 5836), so it probed a different context, and it rated rust-sort's divergence 4 and 3 ulps to
+  spec-off's side, past the rule.
 - *The canary floor.* `vision_dflash2_gpu`'s MTP test, teacher-forced against the vision canary: 48 of 50, 96.0%
   (floor 95%). `ignis-bench canary` on every launch, DFlash2's included: sane and deterministic.
 - *The regression set.* `decide_entailment_gpu` on the speculation-off load and on an MTP load: every gate case keeps
@@ -313,9 +319,10 @@ Observed:
   verify column costs 0.15 to 0.18 ms at one lane, 0.64 to 1.01 at eight lanes (NVFP4), 0.20 to 0.55 (16 GB).
 - **The chain's share of a round**, with the full proposal head: 32 to 39% at window 7 on NVFP4, 28 to 32% on 16 GB;
   27 to 32% and 21 to 24% at window 5.
-- **What a prefill pays for the head's layer**: 16 to 18% more prefill time on the NVFP4 artifact (cost example), 13%
-  more time to first token served at 8K and 32K tokens; 6% more prefill time on the 16 GB artifact, 1 to 2% more time
-  to first token served, within window 0's own launch spread.
+- **What a prefill pays for the head's layer**: 16 to 18% more prefill time on the NVFP4 artifact (cost example, the
+  same load shape either way), 13% more time to first token served at 8K and 32K tokens; 6% more prefill time on the
+  16 GB artifact like for like, 1 to 2% more time to first token served, where the two loads also differ in context
+  (131,072 against 262,144) and window 0's own launch spread at 32K is 4%.
 - **Committed tokens per second against window 0** are 2.1 to 2.3 times at windows 5 to 7 in every cost cell, on both
   legs. On the 16 GB leg windows 5, 6 and 7 come within 0.4% of each other (geometric means 2.218, 2.216, 2.224);
   window 7 is the most, so the default stays 7, now measured. On NVFP4 window 5 is the most, 3.5% above window 7.
@@ -353,8 +360,9 @@ Inferred:
 ## Implications
 
 - **The default draft window stays 7**, measured (`QWEN38_MTP_DEFAULT_DRAFT_TOKENS`): the 16 GB leg's windows 5 to 7
-  are a tie within the measurement, and 7 is its point estimate. On an NVFP4 load `--spec-draft-tokens 5` commits
-  about 3.5% more; the guide says so.
+  are a tie within the measurement, and 7 is its point estimate. On an NVFP4 load `--spec-draft-tokens 5` is estimated
+  to commit about 3.5% more, from the replay and the cost table, not served: window 7's own round cost moved 4 to 6%
+  between its two cost launches at 64K tokens.
 - **When to choose MTP**: where DFlash2's memory is what the context lacks. On the NVFP4 artifact at 8 lanes it frees
   about 1.0 GB against DFlash2, about 50,000 tokens of pool more (1,039,040 against 988,544) after its own 6% a token;
   in a 13 GiB budget the 16 GB artifact keeps twice DFlash2's context (131,072 against 65,536). It commits as many
@@ -387,6 +395,9 @@ Inferred:
 
 - One card, one desktop (about 2.6 GB held), Windows; the 16 GB leg is a 13 GiB budget on the RTX 5090, not a 16 GB
   card: a smaller card's bandwidth moves every cost, and its compute moves the trellis's.
+- In the 13 GiB budget the three 16 GB loads are not the same load: each adapts its context to what its plan leaves
+  (MTP 131,072, DFlash2 65,536, none 262,144). The lines outside the KV pool do not depend on the context (DFlash2's
+  92.3 MB of taps is the spec's figure at a 1,024-token chunk); the pool, and the served time to first token, do.
 - The replay is #267's 200 turns of one agent workload, sampled at temperature 1, all recorded on DFlash2's engine;
   greedy traffic accepts more (#625: 4.24 tokens a round on short greedy prompts).
 - Tokens a round at windows 1 to 3 are derived only; at 4 to 6 corrected by one 15,179-token subset.

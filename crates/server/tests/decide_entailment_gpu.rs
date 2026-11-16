@@ -81,7 +81,20 @@ fn harness(shape: EngineShape) -> Option<Harness> {
         .eos_token_id()
         .unwrap_or_else(|| panic!("qwen3.8-27b generation config must carry eos_token_id"));
     let scheduler = match cuda_scheduler(path, MODEL.into(), eos, shape) {
-        Ok((scheduler, _reservations)) => scheduler,
+        Ok((scheduler, reservations)) => {
+            // GitHub #628: a load that drafts binds a verify round, and the
+            // head no drafter round (DFlash2's); the plan's lines say which
+            // load the cases ran on.
+            if let Some(speculation) = shape.speculation {
+                assert_eq!(speculation.backend(), ignis_core::SpeculativeBackend::Mtp);
+                assert!(
+                    reservations.lines.verify_round > 0 && reservations.lines.drafter_round == 0,
+                    "an MTP load plans a verify round and no drafter round: {:?}",
+                    reservations.lines
+                );
+            }
+            scheduler
+        }
         Err(e) => {
             if gpu_profile::skip_or_fail(&format!("cuda_scheduler: {e}")) {
                 return None;
