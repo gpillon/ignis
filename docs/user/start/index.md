@@ -58,6 +58,19 @@ You can add models of your own with an
     has measured no speed on one. Reports from people who have one are collected
     on [issue #643](https://github.com/gpillon/ignis/issues/643), one comment
     per card: the speeds the guide quotes for these cards will come from them.
+  - *The 12 GB class, from 0.11.0.* A card below 14 GiB of total memory
+    (RTX 5070, the 12 GB RTX 4070 family, RTX 3060 12 GB, RTX 3080 Ti) is a
+    card class of its own, on its own profile, `rtx-12gb`: the 27B on one
+    lane, drafting with its MTP head, at 131,072 tokens of context with
+    nothing else on the card and about 98,304 with a desktop's gigabyte
+    taken, both estimates until a load on the class's artifact measures them
+    ([the profile](../concepts/profiles.md#rtx-12gb)). That artifact, the 27B
+    at about 2.8 bits per weight, is not published yet; until it is, every
+    built-in model is above the class, and the server refuses each one there
+    before it unloads or fetches anything. A card of 10 or 11 GB is read as
+    the class and refused by its VRAM plan, which names the bytes it misses.
+    In 0.10.0 a 12 GB card is read as the 16 GB class, whose entries do not
+    fit it.
   - *Blackwell only.* The NVFP4 builds (the 27B, its uncensored variant,
     Swift 1.5), Flash-Next and the image model, which also need a card of
     32 GB or more, by their card class. On an RTX 30 or RTX 40 card the server

@@ -993,7 +993,7 @@ The models a request may switch to by naming them, each with the artifact it loa
 | Per model | `--qwen38-spec-backend`, `--qwen38flashnext-spec-backend` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The speculative backend: `dflash2` (the 27B's drafter, every profile's), `mtp` (a model's own MTP head: the 27B's, opt-in, or Flash-Next's, with its companion container beside the artifact), or `off`. Unset, no speculation.
+The speculative backend: `dflash2` (the 27B's drafter, every profile's but `rtx-12gb`'s), `mtp` (a model's own MTP head: the 27B's, `rtx-12gb`'s and opt-in elsewhere, or Flash-Next's, with its companion container beside the artifact), or `off`. Unset, no speculation.
 
 ### `spec.draft_tokens`
 

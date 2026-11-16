@@ -68,7 +68,9 @@ the RTX 5090's class, or 16 GB for a built-in text or image model, none for
 the speech models and the diarizer;
 [Where each model loads](../reference/models.md#where-each-model-loads) gives
 each entry on every card, by its class and generation.
-On a card of a smaller class (16 or 24 GB), the server refuses an entry above it before unloading or fetching
+On a card of a smaller class (16 or 24 GB, and from 0.11.0 the 12 GB class,
+below 14 GiB, which every built-in entry is above until the class's own
+artifact is published), the server refuses an entry above it before unloading or fetching
 anything: a switch to it and a request naming it are answered
 `409 model_above_card_class`, naming both classes, while the loaded model
 serves on; a start with no artifact that would load it, and its

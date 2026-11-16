@@ -627,9 +627,10 @@ config_group! {
     /// Speculative decoding, and the decode lanes.
     SpecGroup = "spec" {
         /// The speculative backend: `dflash2` (the 27B's drafter, every
-        /// profile's), `mtp` (a model's own MTP head: the 27B's, opt-in, or
-        /// Flash-Next's, with its companion container beside the artifact),
-        /// or `off`. Unset, no speculation.
+        /// profile's but `rtx-12gb`'s), `mtp` (a model's own MTP head: the
+        /// 27B's, `rtx-12gb`'s and opt-in elsewhere, or Flash-Next's, with its
+        /// companion container beside the artifact), or `off`. Unset, no
+        /// speculation.
         backend: Opt<SpecBackend> = None, Validator::OneOf(&["dflash2", "mtp", "off"]), ALL, [Visible, Patchable, ReloadRequired, Scoped];
         /// The draft window, the most drafts a lane verifies: 1..=7, required
         /// with `dflash2`; with `mtp` on the 27B 0..=7 (default 7, where 0

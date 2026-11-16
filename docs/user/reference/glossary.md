@@ -15,6 +15,12 @@ and [the uncensored variant](../guides/uncensored.md).
 how many tokens a speculative round yields. See
 [speculative decoding](../concepts/speculative-decoding.md).
 
+**Adaptation.** A 27B load lowering the values its profile or the built-in
+defaults gave until its VRAM plan fits: the drafter's head, then the context
+in steps (65,536 tokens; 32,768 under `rtx-12gb`), then the decode lanes. A
+value you name never adapts, and the plan event's `adapted` lists every step
+taken. See [profiles](../concepts/profiles.md#when-a-profile-does-not-fit).
+
 **Admission.** The step where the server decides whether a request runs, on which
 lane and in what rank, checking the KV pool and looking for retained state. See
 [how ignis serves a request](../concepts/how-ignis-serves.md).
@@ -40,9 +46,10 @@ and only on a card it loads on: on a 16 GB card or an RTX 3090,
 `--profile auto` picks one by the card's memory. See [profiles](../concepts/profiles.md).
 
 **Card class.** The cards one built-in profile serves, named by their memory
-(16, 24, 32 or 96 GB), and the smallest one a catalog entry loads on. An entry above
-the card is refused before anything is unloaded or fetched. See
-[models and artifacts](../concepts/models-and-artifacts.md).
+(12, 16, 24, 32 or 96 GB; 12 GB from 0.11.0, a total below 14 GiB), and the smallest
+one a catalog entry loads on. An entry above the card is refused before anything
+is unloaded or fetched. See [models and artifacts](../concepts/models-and-artifacts.md)
+and [profiles](../concepts/profiles.md).
 
 **Catalog.** The models the server knows how to fetch: twelve entries built into
 the binary (eight text and image models, three speech models and a diarizer),
@@ -197,7 +204,8 @@ streams, and takes a persistent loop back. See
 [reasoning and the loop guard](../concepts/reasoning.md).
 
 **MTP.** Multi-token prediction: a model's own draft head. The 27B's is in every
-27B artifact and is opt-in from 0.11.0 (`--spec-backend mtp`), in place of DFlash2: smaller
+27B artifact and drafts from 0.11.0, in place of DFlash2: the default under `rtx-12gb`
+and opt-in elsewhere (`--spec-backend mtp`), smaller
 weights and no drafter window, for one more attention layer in every KV page.
 Flash-Next's is shipped in a companion container, off on the RTX 5090 and on
 under the `rtxpro6000` profile. See
@@ -229,7 +237,9 @@ read, by resuming from retained state that matches by content. See
 [the KV cache and prompt reuse](../concepts/kv-cache-and-prompt-reuse.md).
 
 **Profile.** A named bundle of hardware-shaped defaults, below the config file and
-above the built-in defaults. See [profiles](../concepts/profiles.md).
+above the built-in defaults: `rtx-12gb` (from 0.11.0), `rtx-16gb`, `rtx-24gb`,
+`rtx5090` and `rtxpro6000` are built in, one for each card class, and `auto`
+picks the card's. See [profiles](../concepts/profiles.md).
 
 **Prompt checkpoint.** The whole state of a request at its generation opener, kept
 after it ends so the next turn resumes there. See

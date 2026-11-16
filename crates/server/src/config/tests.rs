@@ -291,7 +291,7 @@ fn the_file_value_wins_over_its_own_profile_and_the_profile_is_named_by_flag_env
     let env = env_map(&[("IGNIS_PROFILE", "from-env")]);
     assert_eq!(with_files(&["--config", "c.yaml", "--profile", "from-file"], env, &files).unwrap().retained_device_slots, 2, "the flag over the env var");
     let err = with_files(&["--config", "c.yaml", "--profile", "no-such-card"], no_env, &files).unwrap_err().0;
-    assert!(err.contains("`no-such-card`") && err.contains("from-env, from-file, rtx-16gb, rtx-24gb, rtx5090"), "{err}");
+    assert!(err.contains("`no-such-card`") && err.contains("from-env, from-file, rtx-12gb, rtx-16gb, rtx-24gb, rtx5090"), "{err}");
     assert!(refused(&["--profile", "nope"]).contains("rtx5090"));
 }
 
@@ -665,11 +665,13 @@ fn the_solo_width_is_auto_unless_named_or_pinned_by_the_8x_class_profiles() {
     assert_eq!(scoped.for_family(ModelFamily::Qwen38_27b).unwrap().prefill_chunk_solo, SoloWidth::Tokens(4096));
     assert_eq!(scoped.for_family(ModelFamily::FlashNext).unwrap().prefill_chunk_solo, SoloWidth::Auto, "the 27B's section");
     // The Blackwell profiles name none: `auto`, which is the prefill chunk
-    // there. The 16 and 24 GB classes pin the 27B's to its chunk, one width,
-    // the KV pool before a wider chunk (the owner, 2026-11-06).
+    // there. The 12, 16 and 24 GB classes pin the 27B's to its chunk, one
+    // width, the KV pool before a wider chunk (the owner, 2026-11-06, and
+    // spec #630).
     for (profile, qwen) in [
         ("rtx5090", SoloWidth::Auto),
         ("rtxpro6000", SoloWidth::Auto),
+        ("rtx-12gb", SoloWidth::Tokens(512)),
         ("rtx-16gb", SoloWidth::Tokens(1024)),
         ("rtx-24gb", SoloWidth::Tokens(2048)),
     ] {
@@ -3859,6 +3861,7 @@ fn on_total(flags: &[&str], gib: f64) -> Result<Config, ConfigError> {
 #[test]
 fn auto_picks_the_profile_of_the_cards_class() {
     for (gib, name, class) in [
+        (11.9, "rtx-12gb", profile::CardClass::Gb12),
         (15.9, "rtx-16gb", profile::CardClass::Gb16),
         (24.0, "rtx-24gb", profile::CardClass::Gb24),
         (31.8, "rtx5090", profile::CardClass::Gb32),
@@ -3889,6 +3892,138 @@ fn auto_picks_the_profile_of_the_cards_class_on_either_side_of_the_24gb_boundari
         assert_eq!(config.basis.sources().profile_name, name, "{total} bytes");
         assert_eq!(config.card_class(), Some(class), "{total} bytes");
     }
+}
+
+/// Spec #630 (GitHub #637): a total below 14 GiB is the 12 GB class and
+/// `auto` resolves `rtx-12gb` on it, on either generation; 14 GiB up to 20
+/// GiB stays the 16 GB class. The class has no lower bound: a 10 GiB card is
+/// read as the class, and its VRAM plan is what refuses it.
+#[test]
+fn auto_picks_rtx_12gb_below_14_gib_and_rtx_16gb_from_it() {
+    for (total, name, class) in [
+        (10u64 << 30, "rtx-12gb", profile::CardClass::Gb12),
+        ((11.9 * GIB_F) as u64, "rtx-12gb", profile::CardClass::Gb12),
+        ((14u64 << 30) - 1, "rtx-12gb", profile::CardClass::Gb12),
+        (14 << 30, "rtx-16gb", profile::CardClass::Gb16),
+        ((20u64 << 30) - 1, "rtx-16gb", profile::CardClass::Gb16),
+    ] {
+        let config = on_card(&[], profile::Card::blackwell(total)).unwrap();
+        assert_eq!(config.basis.sources().profile_name, name, "{total} bytes");
+        assert!(config.basis.sources().profile_auto);
+        assert_eq!(config.card_class(), Some(class), "{total} bytes");
+    }
+    // Memory alone: an RTX 30 or RTX 40 card of 12 GB is the class too.
+    for card in [card_of(11.8, "NVIDIA GeForce RTX 3060", (8, 6), "86;120a"), card_of(11.6, "NVIDIA GeForce RTX 4070", (8, 9), "86;120a")] {
+        let config = on_card(&[], card.clone()).unwrap();
+        assert_eq!((config.basis.sources().profile_name.as_str(), config.card_class()), ("rtx-12gb", Some(profile::CardClass::Gb12)), "{card:?}");
+    }
+}
+
+/// Spec #630 (GitHub #637): `rtx-12gb` gives the 27B the class's values at
+/// configuration resolution, each one the profile's and so each one adapting:
+/// one decode lane and its two host retained slots, the MTP head at the
+/// window #628 measured, 131,072 tokens whose ladder steps 32,768 at a time,
+/// a budget derived at 512M of headroom, a 512-token prefill chunk and solo
+/// width, vision on in host memory at 4,096 tokens. Flash-Next resolves
+/// under it with none of them, the 27B's alone passed over.
+#[test]
+fn the_rtx_12gb_profile_serves_the_27b_on_one_lane_drafting_with_mtp() {
+    use crate::adaptation::{contexts, Adaptable, Ladder};
+    let rtx12 = on_total(&[], 11.9).unwrap();
+    let s27 = rtx12.for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert_eq!(s27.max_context, 131_072);
+    assert_eq!(s27.decode_lanes, Some(1));
+    assert_eq!(s27.retained_host_slots, 2, "two per lane");
+    assert_eq!(s27.speculation, Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)), "the head at its measured window");
+    assert!(!s27.speculation_off);
+    assert_eq!(s27.vram, VramMode::Derived { headroom_bytes: 512 << 20 });
+    assert_eq!((s27.prefill_chunk, s27.prefill_chunk_solo), (512, SoloWidth::Tokens(512)));
+    assert!(s27.settings().vision.enabled, "vision is on, explicitly");
+    assert_eq!(s27.vision.map(|v| (v.residency(), v.max_tokens())), Some((VisionResidency::Host, 4096)));
+    assert_eq!(s27.adapt_ladder(), Ladder { context_step: 32_768, spare_tokens: DEFAULT_ADAPT_SPARE_TOKENS });
+    assert_eq!(contexts(s27.max_context, s27.adapt_ladder().context_step), [131_072, 98_304, 65_536, 32_768], "the ladder it walks");
+    assert_eq!(s27.adaptable(), Adaptable::ALL, "every value the profile's or a default, so every one adapts");
+    let shape = crate::runtime::EngineShape::from(&s27);
+    assert_eq!((shape.adapt_ladder.context_step, shape.solo_width()), (32_768, 512), "the load's shape carries them");
+    // Every other class keeps the 65,536-token step.
+    for profile in ["rtx-16gb", "rtx-24gb", "rtx5090", "rtxpro6000"] {
+        assert_eq!(config(&["--profile", profile]).adapt_ladder(), Ladder::default(), "{profile}");
+    }
+    // Flash-Next starts under it with nothing of the 27B's, the step passed
+    // over rather than refused.
+    let flash = rtx12.for_family(ModelFamily::FlashNext).expect("Flash-Next resolves under the 27B's profile");
+    assert_eq!((flash.decode_lanes, flash.speculation.is_none(), flash.vision.is_none()), (None, true, true));
+    assert_eq!(flash.vram, VramMode::Derived { headroom_bytes: DEFAULT_VRAM_HEADROOM_BYTES });
+}
+
+/// Spec #630 (GitHub #637): a derived budget under `rtx-12gb` is the memory
+/// free at the start less 512M, as the VRAM plan computes it.
+#[test]
+fn under_rtx_12gb_a_derived_budget_is_the_free_memory_less_512m() {
+    use ignis_core::{KvFormat, KvGeometry, Residency, VramLines};
+    let s27 = on_total(&[], 11.9).unwrap().for_family(ModelFamily::Qwen38_27b).unwrap();
+    let free: u64 = 11_500_000_000;
+    let page = KvFormat::HqE8_2b.page_bytes(KvGeometry::qwen38_27b());
+    let arena = move |pages: u32| u64::from(pages) * page;
+    let plan = ignis_core::plan_vram(&ignis_core::VramRequest {
+        mode: s27.vram,
+        free_at_start_bytes: free,
+        lines: VramLines { weights: 1 << 30, ..VramLines::default() },
+        kv_page_bytes: page,
+        max_context_tokens: s27.max_context,
+        retained_slots: s27.retained_host_slots,
+        holder_pages: 0,
+        kv_pool: None,
+        residency: Residency::Resident,
+        embedding_pool_named: false,
+        kv_arena_bytes: &arena,
+        can_page: true,
+    })
+    .expect("fits");
+    assert_eq!(plan.budget_bytes, free - 536_870_912, "512M is 512 MiB");
+}
+
+/// Spec #630 (GitHub #637): every value of `rtx-12gb` is a default the
+/// operator overrides, and what the class does not default to stays
+/// selectable: two lanes, a 256-token chunk (the solo width named with it,
+/// or the profile's 512 sizes the scratch), DFlash2 at the profile's window,
+/// another step, another headroom, an explicit budget.
+#[test]
+fn under_rtx_12gb_the_operator_overrides_every_value() {
+    use crate::adaptation::Ladder;
+    let s27 = |flags: &[&str]| {
+        let mut all = vec!["--profile", "rtx-12gb"];
+        all.extend_from_slice(flags);
+        config(&all).for_family(ModelFamily::Qwen38_27b).unwrap()
+    };
+    let two = s27(&["--spec-decode-lanes", "2"]);
+    assert_eq!((two.decode_lanes, two.retained_host_slots), (Some(2), 4));
+    assert!(!two.adaptable().decode_lanes, "the operator's lanes never adapt");
+    let narrow = s27(&["--model-prefill-chunk", "256", "--model-prefill-chunk-solo", "256"]);
+    assert_eq!((narrow.prefill_chunk, crate::runtime::EngineShape::from(&narrow).solo_width()), (256, 256));
+    let chunk_alone = s27(&["--model-prefill-chunk", "256"]);
+    assert_eq!((chunk_alone.prefill_chunk, crate::runtime::EngineShape::from(&chunk_alone).solo_width()), (256, 512), "the profile's solo width stays");
+    let dflash2 = |window| {
+        Speculation::new(SpeculativeBackend::Dflash2, window).unwrap().with_draft_rule(DraftRule::Sampled, DrafterSampling::default())
+    };
+    // DFlash2 names its window, as everywhere; named for the 27B alone, it
+    // takes the profile's.
+    assert_eq!(s27(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7"]).speculation, Some(dflash2(7)));
+    assert_eq!(s27(&["--qwen38-spec-backend", "dflash2"]).speculation, Some(dflash2(7)), "DFlash2 at the profile's window");
+    assert_eq!(s27(&["--spec-backend", "dflash2", "--spec-draft-tokens", "4"]).speculation, Some(dflash2(4)));
+    assert_eq!(s27(&["--qwen38-spec-draft-tokens", "3"]).speculation, Some(mtp(3)), "the head at the operator's window");
+    let off = s27(&["--spec-backend", "off"]);
+    assert!(off.speculation.is_none() && off.speculation_off);
+    assert_eq!(s27(&["--model-max-context", "98304"]).max_context, 98_304);
+    assert_eq!(s27(&["--model-adapt-context-step", "65536"]).adapt_ladder(), Ladder::default());
+    assert_eq!(s27(&["--vram-headroom-bytes", "1G"]).vram, VramMode::Derived { headroom_bytes: 1 << 30 });
+    assert_eq!(
+        s27(&["--vram-budget-bytes", "12884901888"]).vram,
+        VramMode::Explicit { budget_bytes: 12 << 30, allow_oversubscription: false },
+        "the 12 GiB budget the class is simulated in"
+    );
+    let text = s27(&["--vision-enabled", "false"]);
+    assert!(text.vision.is_none());
 }
 
 /// A total of no class refuses the start, naming the total and `--profile`
@@ -4502,13 +4637,21 @@ fn help_names_the_profile_of_every_card_class() {
     for class in profile::CardClass::ALL {
         assert!(help.contains(&format!("{class}: {}", class.profile())), "{class}: {help}");
     }
+    // Spec #630: the fifth class, smallest first.
+    assert!(help.contains("(12 GB: rtx-12gb, 16 GB: rtx-16gb, 24 GB: rtx-24gb"), "{help}");
 }
 
 /// The refusal of a card of no class spells the boundaries the constants hold.
 #[test]
 fn the_refusal_of_a_card_of_no_class_spells_every_boundary() {
     let err = on_total(&[], 48.0).unwrap_err().0;
-    for bounds in ["16 GB below 20 GiB", "24 GB from 20 to under 28 GiB", "32 GB from 28 to 40 GiB", "96 GB from 88 to 104 GiB"] {
+    for bounds in [
+        "12 GB below 14 GiB",
+        "16 GB from 14 to under 20 GiB",
+        "24 GB from 20 to under 28 GiB",
+        "32 GB from 28 to 40 GiB",
+        "96 GB from 88 to 104 GiB",
+    ] {
         assert!(err.contains(bounds), "{bounds}: {err}");
     }
 }

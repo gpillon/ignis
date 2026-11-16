@@ -77,7 +77,8 @@ trellis artifact (`--model-id qwen3.8-27b-16g`).
 ### A start under `--profile auto` is refused, naming `--profile`
 
 The card's total memory is not one the built-in profiles serve (under 20 GiB,
-from 20 up to 28, 28 to 40, 88 to 104), or NVML could not read it. Name the profile that fits the
+which from 0.11.0 is two classes, under 14 and from 14 up to 20; from 20 up to
+28, 28 to 40, 88 to 104), or NVML could not read it. Name the profile that fits the
 card, or `none` for the hardcoded defaults
 ([Profiles and defaults](concepts/profiles.md)).
 

@@ -28,7 +28,8 @@ counts as unset.
 Choose a profile with `--profile <name>`, `IGNIS_PROFILE`, or `profile:` in the
 config file. With none of them the profile is `auto`: the start reads the
 card's total memory from NVML and takes the built-in profile of its class,
-`rtx-16gb` under 20 GiB, `rtx-24gb` from
+`rtx-12gb` under 14 GiB (from 0.11.0; 0.10.0 gives such a card `rtx-16gb`),
+`rtx-16gb` from 14 GiB up to 20 GiB, `rtx-24gb` from
 20 GiB up to 28 GiB, `rtx5090` from
 28 to 40 GiB, `rtxpro6000` from 88 to 104 GiB. The log line
 `ignis.config.source` names the profile chosen and
@@ -60,10 +61,10 @@ from the reports of people who have one, collected on
 [issue #643](https://github.com/gpillon/ignis/issues/643).
 
 `rtx5090` and `rtxpro6000` carry numbers measured on the card they name,
-with the finding for each choice linked below; `rtx-16gb` is derived from
-them, since no 16 GB card exists in the project; `rtx-24gb` takes the 5090's
-values for the 27B, at a context measured on the 5090 held to a 24 GiB
-budget.
+with the finding for each choice linked below; `rtx-16gb` and `rtx-12gb` are
+derived from them, since no 16 or 12 GB card exists in the project;
+`rtx-24gb` takes the 5090's values for the 27B, at a context measured on the
+5090 held to a 24 GiB budget.
 
 ### `rtx5090`
 
@@ -208,6 +209,59 @@ Why each:
   than an RTX 50 card's (386,048 against 392,704) and the context loaded at
   262,144 with nothing adapted: the buffer costs pool, not context.
 
+### `rtx-12gb`
+
+From 0.11.0. The 12 GB class: the RTX 5070, the 12 GB RTX 4070 family, the
+RTX 3060 12 GB and the RTX 3080 Ti, a total memory below 14 GiB. It is sized
+for one person with a desktop on the card, about 1 GB of it already taken
+([ADR 0098](../../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md)).
+The profile names no model. The class's own artifact, the 27B at about 2.8
+bits per weight under a ceiling of 9.2 GB of weights, is not published yet:
+until it is, the catalog holds no entry of this class and refuses every
+built-in entry on such a card by its class
+([the catalog](../guides/models.md#the-catalog)), and the profile serves an
+artifact named by its path, `--model-artifact`.
+
+| Field | 27B |
+|---|---|
+| Context | 131,072, adapting 32,768 tokens at a time (`model.adapt_context_step`) |
+| Vision | on, 4,096 tokens an image, tower and pool in host RAM |
+| Speculation | MTP, the 27B's own head, 7 draft tokens |
+| Decode lanes | 1 |
+| Prefill chunk | 512, with no lane decoding too ([the solo width](../configuration/context-and-speculation.md#the-solo-width) pinned) |
+| VRAM headroom | 512 MiB |
+
+Why each:
+
+- **MTP, not DFlash2.** DFlash2 holds about 0.7 GB more than the 27B's own
+  head, and on this card that is the context. The head drafts at the window
+  measured for it on the RTX 5090, 7
+  ([MTP, for the 27B](speculative-decoding.md#mtp-for-the-27b)). On a card
+  with room for it, `--qwen38-spec-backend dflash2` drafts with DFlash2 at the
+  profile's 7, and `--spec-backend dflash2 --spec-draft-tokens N` at N.
+- **One lane.** A second costs about 0.87 GB, which the context pays.
+  `--spec-decode-lanes 2` asks for two on a card with nothing else on it.
+- **131,072 tokens, adapting 32,768 at a time.** Every other profile adapts
+  65,536 at a time; here that would leave a desktop that has room for about
+  100,000 tokens at 65,536, where 32,768 keeps 98,304. Expected on the class's
+  artifact, until it is measured: 131,072 tokens with nothing adapted on a free
+  card, 98,304 with a desktop's gigabyte taken
+  ([when a profile does not fit](#when-a-profile-does-not-fit)).
+- **512 MiB of headroom.** A choice, not a placeholder: at the 1,200 MiB of
+  the larger classes no context is left. A derived budget is the memory free
+  at the start less 512 MiB ([VRAM budget](../configuration/vram-and-kv-pool.md#the-12-gb-class)).
+- **The 512-token chunk.** The prefill scratch is sized by the chunk, and 512
+  leaves an estimated 17,000 tokens more of context than 1,024 would. A
+  256-token chunk buys about 25,000 more, also an estimate, at a slower first
+  token: name both `--model-prefill-chunk 256 --model-prefill-chunk-solo 256`,
+  since the solo width the profile pins at 512 sizes the scratch otherwise.
+- **Vision on**, as on `rtx-16gb`: 4,096 tokens an image, tower and pool in
+  host RAM, so with no image in flight vision costs no context.
+- **A card of 10 or 11 GB** is read as the class too: its VRAM plan refuses
+  the load after every step of the ladder, naming the bytes it misses.
+- No real 12 GB card has loaded this profile yet: its numbers are the RTX
+  5090's, held to a 12 GiB budget.
+
 ### `rtx-24gb`
 
 The 24 GB class: the RTX 3090 and the RTX 4090, from 20 GiB up to 28 GiB of
@@ -269,7 +323,8 @@ Why each:
 A profile's values, and the built-in defaults, are what the 27B asks for, not
 what it insists on. When the VRAM plan cannot hold them in the memory the
 start finds free, the load lowers them one at a time and plans again: the
-drafter's head first, then the context in steps, then the lanes. A
+drafter's head first, then the context in steps (65,536 tokens; 32,768 under
+`rtx-12gb`), then the lanes. A
 [solo width](../configuration/context-and-speculation.md#the-solo-width) is
 settled before any of them: `auto` takes a wider one only where nothing else
 has to give, and one you named drops to the prefill chunk first. A value you

@@ -51,8 +51,10 @@ ignis-server config patch --model-max-context 131072   # change the file in plac
 
 **Profiles.** `--profile <name>` / `IGNIS_PROFILE` / the file's `profile:`
 names a bundle of hardware-shaped defaults, below the file and above the
-built-in defaults. Four are built in, and the default, `--profile auto`,
-picks one by the card's total memory as NVML reports it: under 20 GiB
+built-in defaults. Five are built in, and the default, `--profile auto`,
+picks one by the card's total memory as NVML reports it: under 14 GiB
+(a 12 GB card) `rtx-12gb` (from 0.11.0; 0.10.0 has four, and reads such a
+card as the 16 GB class), from 14 GiB up to 20 GiB
 (a 16 GB card) `rtx-16gb`, from 20 GiB up
 to 28 GiB (an RTX 3090 or RTX 4090)
 `rtx-24gb`, 28 to 40 GiB (a 5090) `rtx5090`, 88 to 104 GiB
@@ -98,6 +100,15 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   pinned to it).
   It names no model: a start with no artifact takes the catalog's 16 GB entry
   of the default id.
+- `rtx-12gb`, from 0.11.0, is the 12 GB class (RTX 5070, the 12 GB RTX 4070
+  family, RTX 3060 12 GB, RTX 3080 Ti): derived, not measured, simulated on
+  the 5090 under a 12 GiB budget. The 27B at 131,072 tokens of context, which
+  adapt 32,768 at a time (`--model-adapt-context-step`), on one decode lane,
+  drafting with its MTP head at 7 draft tokens, vision on at 4,096 tokens an
+  image in host RAM, a VRAM headroom of 512M and a 512-token prefill chunk,
+  the solo width pinned to it. It names no model, and no catalog entry is of
+  its class yet: the class's own artifact is not published
+  ([Profiles and defaults](../concepts/profiles.md#rtx-12gb)).
 - `rtx-24gb` is the 24 GB class (RTX 3090, RTX 4090): the 5090 profile's
   values for the 27B (VRAM headroom 1200M, a 2,048-token prefill chunk,
   DFlash2 at 7 draft tokens, vision on with the tower and pool in host RAM,
