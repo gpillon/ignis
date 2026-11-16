@@ -47,3 +47,9 @@ required-features = ["cuda"]
 [[example]]
 name = "verify_width_cost"
 required-features = ["cuda"]
+# What a round costs under the 27B's MTP head (GitHub #628): round time at
+# draft windows 1..7, the same rounds with no drafter, plain decode, and the
+# prefill that brings the lanes to each context.
+[[example]]
+name = "mtp_round_cost"
+required-features = ["cuda"]

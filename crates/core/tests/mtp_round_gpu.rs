@@ -100,8 +100,11 @@ const WINDOW: u32 = 7;
 /// Tokens each lane emits in a comparison: several full windows.
 const TOTAL: usize = 48;
 /// The reference engine's committed tokens per full-window round with its
-/// MTP head at draft 7 (spec #618: "about 3").
-const REFERENCE_PER_ROUND: f64 = 3.0;
+/// MTP head at draft 7, the full proposal head and the fixed window, as this
+/// test drafts: 4.207 under BF16 KV and 4.164 under hq-e8-2b on #625's
+/// sixteen short prompts, 3.97 on its four long ones (2K to 15K tokens).
+/// The spec's "about 3" was the shortlist head under the adaptive window.
+const REFERENCE_PER_ROUND: f64 = 4.2;
 const HIDDEN: usize = 5120;
 const VOCAB: usize = 248_320;
 const KV_WIDTH: usize = mtp_readout::KV_WIDTH;
@@ -429,7 +432,7 @@ fn report_acceptance(label: &str, run: &SpecRun, window: u32) -> (usize, f64) {
     let mean = committed_full as f64 / full_rounds.max(1) as f64;
     println!(
         "{label}: {mean:.2} committed tokens per full-window round over {full_rounds} rounds (the reference engine: \
-         about {REFERENCE_PER_ROUND:.0} at draft {WINDOW})"
+         about {REFERENCE_PER_ROUND:.1} at draft {WINDOW})"
     );
     if window == WINDOW && mean < REFERENCE_PER_ROUND {
         println!("{label}: FINDING -- fewer committed tokens per round than the reference engine's");

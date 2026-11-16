@@ -16,7 +16,9 @@
 //! redoes each arm and every case's logit in every arm (`NOTICE.md` tells
 //! the set's provenance). The card's default route runs ignis's GDN prefill
 //! (GitHub #536); `IGNIS_GDN_PREFILL=vendored` runs this test on the vendored
-//! one, where the same gates must hold.
+//! one, where the same gates must hold. GitHub #628: the same gates hold on a
+//! load that drafts with the 27B's MTP head, whose prefill also writes the
+//! head's state; the speculation-off load is the set's own.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or an unavailable GPU is a **skip**; under the profile
@@ -68,7 +70,7 @@ impl Drop for Harness {
     }
 }
 
-fn harness() -> Option<Harness> {
+fn harness(shape: EngineShape) -> Option<Harness> {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return None;
@@ -78,7 +80,7 @@ fn harness() -> Option<Harness> {
     let eos = frontend
         .eos_token_id()
         .unwrap_or_else(|| panic!("qwen3.8-27b generation config must carry eos_token_id"));
-    let scheduler = match cuda_scheduler(path, MODEL.into(), eos, EngineShape::default()) {
+    let scheduler = match cuda_scheduler(path, MODEL.into(), eos, shape) {
         Ok((scheduler, _reservations)) => scheduler,
         Err(e) => {
             if gpu_profile::skip_or_fail(&format!("cuda_scheduler: {e}")) {
@@ -113,7 +115,19 @@ async fn decide(app: &axum::Router, body: &JsonValue) -> (u16, JsonValue) {
 #[tokio::test]
 #[ignore = "GPU"]
 async fn the_gate_cases_keep_their_entailment_labels() {
-    let Some(harness) = harness() else { return };
+    gate_cases_keep_their_labels(EngineShape::default()).await;
+}
+
+/// GitHub #628: MTP on against off, the regression set's quality leg.
+#[tokio::test]
+#[ignore = "GPU"]
+async fn the_gate_cases_keep_their_entailment_labels_on_an_mtp_load() {
+    let speculation = ignis_core::Speculation::new(ignis_core::SpeculativeBackend::Mtp, 7).expect("window 7");
+    gate_cases_keep_their_labels(EngineShape { speculation: Some(speculation), ..EngineShape::default() }).await;
+}
+
+async fn gate_cases_keep_their_labels(shape: EngineShape) {
+    let Some(harness) = harness(shape) else { return };
     let fixture = entailment::load();
     let mut wrong = Vec::new();
     let mut right = 0;
