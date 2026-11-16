@@ -453,8 +453,8 @@ fn the_scan_reads_the_kernel_names_of_every_declaration_form() {
 /// The full-rate rule's list is one place (#503, #512): every `__global__`
 /// function of a source file it names has its line, so a kernel added to one
 /// of those files is held to the rule or the test says so, and every listed
-/// kernel is in the file its line names. #488's exceptions each name that
-/// issue, and no kernel is listed twice.
+/// kernel is in the file its line names. Each exception names the issue
+/// that decided it (#488's, #642's), and no kernel is listed twice.
 #[test]
 fn the_full_rate_list_holds_every_kernel_of_the_files_it_names() {
     let repo = repo();
@@ -468,7 +468,12 @@ fn the_full_rate_list_holds_every_kernel_of_the_files_it_names() {
             _ => assert!(line.file.is_none(), "{}: only a covered kernel names a source file", line.name),
         }
         if line.role == "exempt" {
-            assert!(line.comment.contains("#488"), "{}: an exception names the issue that decided it", line.name);
+            let issue = line.comment.trim_start().strip_prefix('#').and_then(|rest| rest.split_once(':')).map(|(issue, _)| issue);
+            assert!(
+                issue.is_some_and(|issue| !issue.is_empty() && issue.bytes().all(|b| b.is_ascii_digit())),
+                "{}: an exception names the issue that decided it (`# #<issue>: ...`)",
+                line.name
+            );
         }
     }
     assert!(listed.iter().any(|line| line.role == "control"), "the list holds the negative control");

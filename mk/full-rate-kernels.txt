@@ -67,6 +67,11 @@ exempt   output_kernel                              # #488: the GDN chunked delt
 exempt   prepare_wy_wu_kernel                       # #488: the GDN chunked delta rule, WY/WU preparation
 exempt   state_passing_kernel                       # #488: the GDN chunked delta rule, state passing
 
+# The vendored small-T attention over hq-e8-2b, which the target's GQA layers
+# run in their decode and verify rounds on 8.x and the 27B's MTP head runs too
+# (spec #618, #627): a declared exception, parked on #642.
+exempt   gqa_attention_small_t_tc_partial_bf16_kernel   # #642: the target's hq decode and the MTP head's rounds and short prefill calls, BF16 MMA
+
 # The negative control: the prompt attention's existing window kernel, whose
 # BF16 form accumulates in f32 (#488 leaves it as it is).
 control  fa_kernel

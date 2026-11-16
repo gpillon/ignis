@@ -97,7 +97,13 @@ the list says. The sm_120a code in such a build is the same, byte for byte, as
 a `120a`-only build's.
 The same check refuses a build whose 8.6 code holds, in a kernel of the RTX 30 and
 RTX 40 prefill or of the 27B's MTP head on those cards, a tensor-core form those
-cards run at half rate (`mk/full-rate-kernels.txt`).
+cards run at half rate (`mk/full-rate-kernels.txt`). The kernels that predate
+the rule are listed there as declared exceptions, each naming the issue that
+parks its conversion. One of them the head runs: the vendored small-T attention
+over hq-e8-2b, BF16 with an f32 accumulator, which the target's attention
+layers run in their decode rounds on those cards, and the head in its rounds
+and its prefill calls of 8 rows or fewer
+([issue #642](https://github.com/gpillon/ignis/issues/642)).
 
 Which cards are supported is in [What it runs on](../start/index.md#what-it-runs-on).
 A card none of the listed architectures runs on is refused at start
