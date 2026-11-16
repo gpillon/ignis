@@ -7,7 +7,7 @@
 //! and a turn resumed from a retained slot each go on drafting and generate
 //! the text of a run whose state never moved. Same body as
 //! `cuda_leaf_kv_ram_gpu.rs`, driven through the scheduler and the runtime's
-//! compute seam; the server still refuses the MTP backend on the 27B (#623).
+//! compute seam, below the server's MTP load (#623).
 //!
 //! Its own test binary: it materializes the artifact, and the card fits one
 //! at a time.

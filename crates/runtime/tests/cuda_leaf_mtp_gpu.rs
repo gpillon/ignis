@@ -4,8 +4,9 @@
 //! round's text, state and acceptance; this proves the runtime's side of it:
 //! the leaf loads the head from the model scope's handles, passes no drafts,
 //! and turns each lane's extent and committed run into the round's
-//! speculative counters, drafted and accepted per position. The server still
-//! refuses the MTP backend on the 27B (#623): the leaf is reached here only.
+//! speculative counters, drafted and accepted per position. The leaf is
+//! reached here below the server's MTP load (#623), which `ignis-server`'s
+//! `mtp_serving_gpu.rs` serves.
 //!
 //! Its own test binary: each materializes the artifact, and the card fits one
 //! at a time.

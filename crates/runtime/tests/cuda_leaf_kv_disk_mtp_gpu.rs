@@ -12,8 +12,8 @@
 //! alone. Every round is at width 1 in both runs.
 //!
 //! Driven through the scheduler and the runtime's compute seam, as
-//! `ignis-server`'s `kv_disk_gpu.rs` drives a served load: the server still
-//! refuses the MTP backend on the 27B (#623). The file names the load's
+//! `ignis-server`'s `kv_disk_gpu.rs` drives a served load, below the server's
+//! MTP load (#623). The file names the load's
 //! drafter, `mtp:7:full` (the CPU tests hold a file of another drafter to a
 //! refusal by name). The files go under this checkout's
 //! `.scratch/kv-disk-mtp-gpu/`, which the test empties after itself.

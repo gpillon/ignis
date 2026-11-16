@@ -24,8 +24,8 @@
 //!   the opener's last position, and restored from its spilled blob: each
 //!   claimant drafts as the cold twin does.
 //!
-//! The server still refuses the MTP backend on the 27B (#623): the head is
-//! reached here through the core load API.
+//! The head is reached here through the core load API, below the server's
+//! MTP load (#623), which `ignis-server`'s `mtp_serving_gpu.rs` serves.
 //!
 //! Explicit GPU profile (ADR 0006): outside `IGNIS_GPU_PROFILE=1` a missing
 //! GPU or artifact is a skip, under it a failure.

@@ -40,6 +40,11 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "support/bf16.rs"]
+mod bf16;
+#[path = "support/mtp_bounds.rs"]
+mod mtp_bounds;
+
 use std::path::{Path, PathBuf};
 
 use ignis_artifact::{
@@ -57,6 +62,9 @@ use ignis_core::step::{
 use ignis_core::vision::{vision_item_control, Multimodal};
 use ignis_core::{mtp_readout, ExceptionWeights, KvFormat, RopeScaling, Speculation, SpeculativeBackend, Vision};
 
+use bf16::{bf16_to_f64, f32_to_bf16};
+use mtp_bounds::{tolerance, HIDDEN_ROUNDINGS, KEY_ROUNDINGS, SCORE_ROUNDINGS, VALUE_ROUNDINGS};
+
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 1024;
 /// The load's chunk: number.png's 196 placeholders start a few tokens into
@@ -67,30 +75,9 @@ const WINDOW: u32 = 7;
 const HIDDEN: usize = 5120;
 const VOCAB: usize = 248_320;
 
-/// BF16's unit roundoff, and the roundings on the device's path to each
-/// quantity (crates/core/tests/mtp_head_gpu.rs states them): a key, a value,
-/// the head's hidden, its scores.
-const BF16_UNIT: f64 = 1.0 / 256.0;
-const KEY_ROUNDINGS: f64 = 6.0;
-const VALUE_ROUNDINGS: f64 = 5.0;
-const HIDDEN_ROUNDINGS: f64 = 16.0;
-const SCORE_ROUNDINGS: f64 = 17.0;
 /// A control lands at least this many bounds out: a wrong embedding or
 /// rotation moves a row by its own size, not by a rounding.
 const CONTROL_FACTOR: f64 = 10.0;
-
-fn tolerance(roundings: f64) -> f64 {
-    BF16_UNIT * roundings.sqrt()
-}
-
-fn bf16_to_f64(bits: u16) -> f64 {
-    f32::from_bits(u32::from(bits) << 16) as f64
-}
-
-fn f32_to_bf16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
-}
 
 fn relative_l2(device: impl IntoIterator<Item = f64>, host: impl IntoIterator<Item = f64>) -> f64 {
     let (mut error, mut reference) = (0.0, 0.0);

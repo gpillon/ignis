@@ -65,6 +65,10 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "support/bf16.rs"]
+mod bf16;
+#[path = "support/mtp_bounds.rs"]
+mod mtp_bounds;
 #[path = "support/near_tie.rs"]
 #[allow(dead_code)]
 mod near_tie;
@@ -87,6 +91,8 @@ use ignis_core::step::{
 };
 use ignis_core::{mtp_readout, KvFormat, SpecCounters, Speculation, SpeculativeBackend};
 
+use bf16::{bf16_to_f64, f32_to_bf16};
+use mtp_bounds::{tolerance, KEY_ROUNDINGS, VALUE_ROUNDINGS};
 use near_tie::first_divergence;
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -113,16 +119,6 @@ const KV_WIDTH: usize = mtp_readout::KV_WIDTH;
 /// their top logit: ADR 0056's moved-pick bound (measured moved picks 0-8
 /// ulps on Flash-Next's verify rows), recorded for the 27B in ADR 0095.
 const VERIFY_TILE_PICK_ULPS: f64 = 16.0;
-/// BF16's unit roundoff and the roundings on the device's path to a head
-/// row's key and value (crates/core/tests/mtp_head_gpu.rs, #620's bounds).
-const BF16_UNIT: f64 = 1.0 / 256.0;
-const KEY_ROUNDINGS: f64 = 6.0;
-const VALUE_ROUNDINGS: f64 = 5.0;
-
-fn tolerance(roundings: f64) -> f64 {
-    BF16_UNIT * roundings.sqrt()
-}
-
 /// The canary suite's prompts (`crates/bench/src/canary.rs::CANARIES`), each
 /// in a user turn of the model's chat format with thinking closed.
 const CANARY_PROMPTS: [&str; 4] = [
@@ -558,15 +554,6 @@ fn judge(plain: &Model, prompts: &[Vec<i32>], off: &[Vec<i32>], on: &[Vec<i32>],
         findings.push(line);
     }
     findings
-}
-
-fn bf16_to_f64(bits: u16) -> f64 {
-    f64::from(f32::from_bits(u32::from(bits) << 16))
-}
-
-fn f32_to_bf16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
 }
 
 /// `ours` against `reference`, both BF16 bits, as a relative L2.
