@@ -9,7 +9,9 @@ A 12 GB card was the 16 GB class's (ADR 0063: every total below 20 GiB), and the
 lane of that artifact holds 12,218,298,952 bytes before its KV pool, and `rtx-16gb`'s headroom alone is 1.26 GB.
 The 27B stays the model: the family has no smaller sibling (checked 2026-11-15), and on the one public harness that
 runs agent tasks below 3 bits per weight the loss grows with the task's length and steps down between 8.0 and 9.2 GB
-of weights, while single-turn code barely moves. The owner's grill of 2026-11-15 (spec GitHub #630) decided:
+of weights, while single-turn code barely moves
+([the online research](../findings/2026-11-15-the-12-gb-card-class-online-research.md)). The owner's grill of
+2026-11-15 (spec GitHub #630) decided:
 
 - **A card class of its own.** A card whose NVML total is below 14 GiB is the 12 GB class (a 12 GB card reads about
   11.9 GiB), with its profile, `rtx-12gb`, which `--profile auto` picks there, and its catalog entry,

@@ -69,8 +69,10 @@ You can add models of your own with an
     built-in model is above the class, and the server refuses each one there
     before it unloads or fetches anything. A card of 10 or 11 GB is read as
     the class and refused by its VRAM plan, which names the bytes it misses.
-    In 0.10.0 a 12 GB card is read as the 16 GB class, whose entries do not
-    fit it.
+    The class has no column in
+    [Where each model loads](../reference/models.md#where-each-model-loads)
+    until its artifact is published. In 0.10.0 a 12 GB card is read as the
+    16 GB class, whose entries do not fit it.
   - *Blackwell only.* The NVFP4 builds (the 27B, its uncensored variant,
     Swift 1.5), Flash-Next and the image model, which also need a card of
     32 GB or more, by their card class. On an RTX 30 or RTX 40 card the server
@@ -96,7 +98,8 @@ You can add models of your own with an
   generation it loads on, and the server refuses one above the card before it
   unloads or fetches anything:
   [Where each model loads](../reference/models.md#where-each-model-loads) is
-  the table, every built-in model on every card above. A release is built
+  the table, every built-in model on every card above but the 12 GB class's.
+  A release is built
   for compute capabilities 8.6 and 12.0 (`86;120a`). Other cards, including
   the DGX Spark, are not
   supported; [why not DGX Spark?](../guides/dgx-spark.md) gives the reasoning.

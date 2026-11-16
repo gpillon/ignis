@@ -133,7 +133,7 @@ one named value that adapts.
 1. the drafter's head: a `shortlist` from a profile falls to `full` (the
    shortlist is bound beside the full head and costs ~357 MB);
 2. `--model-max-context`, down `--model-adapt-context-step` tokens at a time
-   (65,536) to one step, keeping the largest context at which the KV pool
+   (65,536; 32,768 under `rtx-12gb`) to one step, keeping the largest context at which the KV pool
    holds one whole sequence and a spare reservation of
    `--vram-adapt-spare-tokens` (65,536) for a second request (at one lane,
    the sequence alone);
