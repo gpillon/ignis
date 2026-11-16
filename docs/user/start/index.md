@@ -74,8 +74,9 @@ You can add models of your own with an
     ([the profile](../concepts/profiles.md#rtx-12gb)). Against the 16 GB entry
     it gives up a little quality: a KLD against BF16 of 0.0431 against 0.0418,
     on the RTX 5090 at the class's shape. On an RTX 30 or 40 card it runs the
-    prefill routes the 16 GB entries run there, and its quality on them has
-    not been measured yet. The uncensored variant and Swift 1.5 have no build
+    prefill routes the 16 GB entries run there; the RTX 5090, running those
+    routes, reads 0.0435, 1.01 times its reading on Blackwell's, and no RTX 30
+    or 40 card has measured it yet. The uncensored variant and Swift 1.5 have no build
     of the class: on a 12 GB card the server refuses them and every 16 GB
     entry, by name, before it unloads or fetches anything. A card of 10 or
     11 GB is read as the class and refused by its VRAM plan, which names the

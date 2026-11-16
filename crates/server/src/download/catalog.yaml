@@ -173,9 +173,10 @@ models:
   # answers to the 27B's default id on a 12 GB card; on a larger one the
   # 16 GB entry, of the larger class, does, and this one loads by its own id
   # (ADR 0098). It states no generation, as the 16 GB 27B: its layout is that
-  # build's, at the K classes and formats that build binds; its quality on the
-  # RTX 30 and 40 routes is not measured yet (ADR 0098). Pinned to the
-  # upload's hub commit.
+  # build's, at the K classes and formats that build binds, and its KLD on the
+  # RTX 30 and 40 routes, read on the RTX 5090, is 1.01 times its own on
+  # Blackwell's (ADR 0098, as #513 read Swift 1.5's). Pinned to the upload's
+  # hub commit.
   - id: qwen3.8-27b-12g
     repo: gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis
     revision: "15333a0829f055e7ee25d6d5ef84fd8d521518c6"

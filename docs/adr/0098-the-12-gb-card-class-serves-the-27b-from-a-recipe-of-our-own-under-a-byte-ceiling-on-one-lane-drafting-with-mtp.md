@@ -95,7 +95,12 @@ of weights, while single-turn code barely moves
   different classes may answer to one id.
 - The entry states no generation, as the 16 GB 27B's, where ADR 0079 has a trellis build state `blackwell` until it
   is verified below Blackwell: its layout is that build's (the trellis K classes 2 to 5 and the 4-bit head the RTX
-  30 and 40 routes bind, every other object the 32 GB artifact's), and the class is memory alone. Unlike Swift
-  1.5's build (#529), its quality on those routes is not measured: an sm_86 gate leg, or a 12 GB RTX 30 or 40
-  card (#639), reads it.
+  30 and 40 routes bind, every other object the 32 GB artifact's), and the class is memory alone. Its quality on
+  those routes is measured as Swift 1.5's build's was (#529, #513): on 2026-11-17 the RTX 5090, running them
+  (`IGNIS_MODEL_PREFILL_LINEAR=int8`, `IGNIS_MODEL_PREFILL_ATTENTION=int8`, the 512-token chunk), read a KLD
+  against BF16 of 0.04353, 1.0103 times the same artifact's on Blackwell's routes (95% interval 0.974 to 1.035;
+  Swift's, 1.0148), under ADR 0082's 1.05 for a route's numerics, with top-1 93.23% against 93.35%
+  ([the finding](../findings/2026-11-15-the-12-gb-card-class-online-research.md)). So the entry stands on both
+  grounds ADR 0079 admitted Swift 1.5's build on, its layout, read as above, and its quality on those routes; an
+  sm_86 gate leg, or a 12 GB RTX 30 or 40 card (#639), reads it on such a card.
 - A limit above 0.0484 for this class, if the owner admits one, is registered in the spec that admits it.

@@ -14,7 +14,7 @@
 
 <p align="center">
   <img alt="license Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-d94b1f?style=flat-square">
-  <img alt="cards NVIDIA RTX of 16 GB or more, from the RTX 30 series on" src="https://img.shields.io/badge/cards-RTX%2030%20series%20on%20%7C%2016%20GB%20or%20more-d94b1f?style=flat-square">
+  <img alt="cards NVIDIA RTX from the RTX 30 series on, of 16 GB or more (12 GB from 0.11.0)" src="https://img.shields.io/badge/cards-RTX%2030%20series%20on%20%7C%2016%20GB%20or%20more%20%7C%2012%20GB%20from%200.11.0-d94b1f?style=flat-square">
   <img alt="models Qwen3.8-27B NVFP4 and trellis, Qwen3.8-Flash-Next and Qwen-Image-2.1-Turbo" src="https://img.shields.io/badge/models-Qwen3.8--27B%20NVFP4%20%2F%20trellis%20%7C%20Flash--Next%20125B%20MoE%20%7C%20Qwen--Image--2.1-d94b1f?style=flat-square">
   <img alt="API OpenAI-compatible" src="https://img.shields.io/badge/API-OpenAI--compatible-d94b1f?style=flat-square">
   <br>
@@ -94,7 +94,9 @@ the 16 GB RTX 50 cards the 16 GB entries. The **RTX 3090 and 3090 Ti** are
 supported, on the 27B's 16 GB entries; the **RTX 4090** and the 16 GB RTX 40
 cards are verified for correctness: the release's sm_86 gate passed on an Ada
 Lovelace card (sm_89)
-([the finding](docs/findings/2026-11-08-sm86-gate-on-the-release-range.md)). The releases
+([the finding](docs/findings/2026-11-08-sm86-gate-on-the-release-range.md)). From
+0.11.0 a **12 GB card** (the RTX 5070, the 12 GB RTX 4070 family, the RTX 3060
+12 GB, the RTX 3080 Ti) runs the 27B from its 12 GB entry, on one lane. The releases
 are built for compute capabilities 8.6 and 12.0, so RTX 30 and RTX 40 cards run
 them. The NVFP4 builds, Flash-Next
 and the image model load on Blackwell alone, on a card of 32 GB or more
@@ -596,9 +598,9 @@ box says what sending will do first:
 
 ### The weights
 
-Eight artifacts on Hugging Face: six of the 27B, all carrying the DFlash2
-drafter (the three NVFP4 ones 18.07-18.08 GiB, the three for 16 GB cards 12.46 GiB),
-Flash-Next, and the image model:
+Nine artifacts on Hugging Face (eight in 0.10.0): seven of the 27B, all carrying the DFlash2
+drafter (the three NVFP4 ones 18.07-18.08 GiB, the three for 16 GB cards 12.46 GiB,
+the 12 GB card's 11.88 GiB from 0.11.0), Flash-Next, and the image model:
 
 | | Hugging Face | file |
 |---|---|---|
@@ -606,13 +608,14 @@ Flash-Next, and the image model:
 | **Uncensored** | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer) | `qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer` |
 | **16 GB card** (trellis body, about 3 bits per weight) | [`gpillon/Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis) | `qwen3_8_27b_trellis_sc30-v2.ninfer` |
 | **Uncensored, 16 GB card** | [`gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis) | `qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer` |
+| **12 GB card**, from 0.11.0 (trellis body, about 2.8 bits per weight) | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis) | `qwen3_8_27b_trellis_ig28-v2.ninfer` |
 | **Swift 1.5** (a fine-tune of the 27B; **commercial use above the license's US$1M revenue threshold is not licensed**) | [`gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis) | `qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer` |
 | **Swift 1.5, 16 GB card** | [`gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis) | `qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer` |
 | **Flash-Next** (125B MoE, 68.2 GiB with its MTP and vision companions) | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | `qwen3_8_flash_next_trellis_a25-v2.ninfer` |
 | **Image** (Qwen-Image-2.1-Turbo, 15.57 GiB, **non-commercial use only**) | [`gpillon/ignis-image-2.1-turbo`](https://huggingface.co/gpillon/ignis-image-2.1-turbo) | `ignis_image_2_1_turbo-v2.ninfer` |
 
 The server fetches the standard one by itself the first time it starts without
-a model (on a 16 GB card, the 16 GB one), and checks every file's size and SHA-256 before using it. To download
+a model (on a 16 GB card, the 16 GB one; on a 12 GB card, from 0.11.0, the 12 GB one), and checks every file's size and SHA-256 before using it. To download
 any of them ahead of time — no GPU needed, `--out <dir>` for a machine with no
 network:
 
