@@ -32,7 +32,7 @@ it. Python never writes the container.
 | `reconstruction.py` | The conversion's GPU step and its only exllamav3 user: each trellis matrix's relative reconstruction error against the BF16 checkpoint. |
 | `replay.py` | The abliterated variant's 70 matrices re-quantized by replaying exllamav3's conversion: the plan (no torch), `fetch` of huihui's changed tensors by HTTP range, `run` (the GPU step). |
 | `recipe.py` | A named recipe (GitHub #631): `load` reads and checks `recipes/<name>.json`; the text scope's bytes and the bits per weight; a local conversion's per-tensor recipe (`job`) and exllamav3's YAML. |
-| `recipes/` | The recipes, one JSON file each, named by its stem: `sc30.json` is the 16 GB artifact's and the default; `tandem25.json` is the public 2.5-bit quant's (`0xBakeer/TandemLLM-Qwen3.8-27B-EXL3-2.5`, a measurement artifact that does not ship); `ig28a.json` is the 12 GB class's first candidate (GitHub #633), from exllamav3's allocation optimizer, its `about` says how; `ig28b.json` the second (GitHub #634), from a public GGUF file's allocation (`gguf_recipe.py`). |
+| `recipes/` | The recipes, one JSON file each, named by its stem: `sc30.json` is the 16 GB artifact's and the default; `tandem25.json` is the public 2.5-bit quant's (`0xBakeer/TandemLLM-Qwen3.8-27B-EXL3-2.5`, a measurement artifact that does not ship); `ig28a.json` is the 12 GB artifact's (GitHub #633), from exllamav3's allocation optimizer, its `about` says how, published as weights id `trellis-ig28` ("The 12 GB artifact" below); `ig28b.json` the second candidate (GitHub #634), from a public GGUF file's allocation (`gguf_recipe.py`), not admitted. |
 | `gguf_recipe.py` | A recipe translated from a public GGUF file's per-tensor allocation (GitHub #634): `header` reads the file's header by HTTP ranges (no weights), `recipe` translates its types to integer K under a ceiling. |
 | `local_quant.py` | An EXL3 quant of the 27B or a fine-tune converted on this machine by exllamav3 at a named recipe: `run` (the GPU step, its check, the pins and the provenance) and `control` (each matrix's error against the fine-tune's BF16 beside the default artifact's). |
 | `work.py` | The DONE protocol the packer checks (copied from `tools/image-converter/work.py`). |
@@ -131,8 +131,8 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
 
 ### A recipe from a GGUF allocation
 
-`gguf_recipe.py` (GitHub #634) makes `ig28b`, the 12 GB class's second candidate, from the per-tensor types of the
-public dynamic 2-bit GGUF file of the 27B, read from its header and never its weights:
+`gguf_recipe.py` (GitHub #634) makes `ig28b`, the 12 GB class's second candidate, not admitted, from the per-tensor
+types of the public dynamic 2-bit GGUF file of the 27B, read from its header and never its weights:
 
 ```
 F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/gguf_recipe.py header     --repo unsloth/Qwen3.8-27B-GGUF --revision 4af51b3542f775b0a8e4b310bfb3f17e01c306c9     --file Qwen3.8-27B-UD-Q2_K_XL.gguf --out <table.json>
@@ -292,6 +292,47 @@ F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/local_quant.py c
   (`reconstruction.rel_errors`) beside the default 16 GB artifact's error on the same matrix against the
   base BF16 (its record's `trellis.matrices`), under the record's object names, and refuses a record that
   does not hold the quant's matrices at their K.
+
+## The 12 GB artifact
+
+The 12 GB class's artifact (spec #630) is the recipe `ig28a`, the candidate the gate admitted (GitHub #635),
+published as weights id `trellis-ig28`: `qwen3_8_27b_trellis_ig28-v2.ninfer` at
+`gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis`, revision `15333a0829f055e7ee25d6d5ef84fd8d521518c6`, 12,754,663,684
+bytes, sha256 `fab06bea49ce114da99ca69588f00b10fb5081c564f9ce60ecbef8b3dbf6d6a5`. The second candidate, `ig28b`, was
+not admitted (its KLD is in `docs/findings/2026-11-15-the-12-gb-card-class-online-research.md`). The published file
+comes from a local quant of the base 27B's BF16 at `ig28a`, then the conversion and the packer above:
+
+```
+F:/ai/ngram-venv/Scripts/hf.exe download turboderp/Qwen3.8-27B-exl3 quantization_config.json cal_trace.safetensors \
+    --revision 86b95530f9d365d90dd24d01a997a8de0cdf6c55 --local-dir H:/630/sc30
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/local_quant.py run --recipe ig28a \
+    --bf16 H:/models/Qwen3.8-27B --bf16-repo Qwen/Qwen3.8-27B --recipe-quant H:/630/sc30 \
+    --record F:/ai/q38/ninfer-models/qwen3_8_27b_trellis_sc30-v2.ninfer.conversion.json \
+    --out H:/models/Qwen3.8-27B-exl3-ig28a --work H:/630/quant-work --no-checkpoints
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/convert.py run --recipe ig28a --weights-id trellis-ig28 \
+    --served F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer \
+    --quant H:/models/Qwen3.8-27B-exl3-ig28a --quant-pins H:/models/Qwen3.8-27B-exl3-ig28a.pins.json \
+    --quant-repo Qwen/Qwen3.8-27B --quant-branch exl3-ig28-local --bf16 H:/models/Qwen3.8-27B --work H:/630/work
+target/x86_64-pc-windows-msvc/release/ignis-artifact-pack.exe --family qwen3.8-27b-trellis --work H:/630/work \
+    --out F:/ai/models/Qwen3.8-27B-trellis-2.8bpw-ignis/qwen3_8_27b_trellis_ig28-v2.ninfer --weights-id trellis-ig28
+F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
+    --artifact F:/ai/models/Qwen3.8-27B-trellis-2.8bpw-ignis/qwen3_8_27b_trellis_ig28-v2.ninfer \
+    --served F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer \
+    --quant H:/models/Qwen3.8-27B-exl3-ig28a --weights-id trellis-ig28 --report <report.json>
+```
+
+- **The inputs** are public: the 27B's BF16 (its download records pin the revision the record names,
+  `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`), the NVFP4 artifact the 16 GB conversion reads, and the 16 GB
+  artifact's calibration trace and configuration at that quant's revision, which `ig28a.json` pins by sha256.
+  The recipe file stays as committed: the record pins its sha256, `0f5e8460...`.
+- **`--weights-id trellis-ig28`** names the artifact; it overrides the recipe's own `weights_id`, `trellis-ig28a`,
+  the candidate's, and the packer and `verify` take the same.
+- **The labels** `--quant-repo Qwen/Qwen3.8-27B --quant-branch exl3-ig28-local` are the published record's
+  `source`: the quant was made from that repository's BF16, here, at `ig28a`.
+- **What was shown**: the same quant packed twice, once under other labels, gives the same file, the sha256 above;
+  the labels are the record's, not the container's. The local quant is exllamav3's own conversion on this machine
+  (2,602 s on the RTX 5090, 19.6 GiB of VRAM allocated, 42.1 GiB of host working set); that a second quant gives the
+  same bytes is not shown.
 
 ## The sidecar
 
