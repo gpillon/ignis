@@ -2738,6 +2738,9 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       return -1;
     }
     break;
+  case IgnisDrafter::kMtp:
+    // GitHub #620: the MTP head has no drafter round buffers; its buffers are
+    // in the decode graph's scratch (`plan_load_sizes`).
   case IgnisDrafter::kHost:
   case IgnisDrafter::kNone:
     break;
