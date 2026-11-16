@@ -438,6 +438,24 @@ mod tests {
     /// body's weights (#338), text only.
     const GB16: Card = Card { budget: 0, weights: 12_500_000_000, workspace: 342_290_432, lane: 268_000_000, chunk: CHUNK };
 
+    /// A 12 GB card's 27B under `rtx-12gb` (spec #630): a stand-in for the
+    /// 12 GB artifact's load, which is not yet admitted -- about the spec's
+    /// estimate of its weights under MTP (a 9.2 GB text scope, the head, the
+    /// CUDA context and the residual), the 16 GB stand-in's lane, and a
+    /// workspace at a 512-token chunk. The plan's real lines are pinned on
+    /// the admitted artifact.
+    const GB12: Card = Card { budget: 0, weights: 10_250_000_000, workspace: 250_000_000, lane: 268_000_000, chunk: 512 };
+
+    /// The ladder `rtx-12gb` gives the 27B: 32,768-token steps, the default
+    /// spare reservation (which one lane never asks for).
+    const RTX_12GB_LADDER: Ladder = Ladder { context_step: 32_768, spare_tokens: 65_536 };
+
+    /// `rtx-12gb`'s values at `max_context`: one lane, the MTP head (the
+    /// full head), its scratch at the 512-token chunk.
+    fn rtx_12gb_at(max_context: u32) -> Attempt {
+        Attempt { max_context, decode_lanes: 1, draft_head: Some(ProposalHead::Full), prefill_chunk_solo: 512 }
+    }
+
     impl Card {
         fn with_budget(self, budget: u64) -> Self {
             Self { budget, ..self }
@@ -800,6 +818,51 @@ mod tests {
             assert_eq!(adapted.attempt, values(context, 2), "{context}");
             assert_eq!(adapted.steps, [context_step(262_144, context)]);
         }
+    }
+
+    /// Spec #630 (GitHub #637): the 12 GB profile's ladder, at one lane,
+    /// walks 131,072 down 32,768 at a time, each budget keeping one step
+    /// lower, and names the step as every adaptation is named: a desktop that
+    /// leaves room for about 100,000 tokens keeps 98,304, not 65,536.
+    #[test]
+    fn the_12gb_ladder_steps_131072_98304_65536_32768_at_one_lane() {
+        let start = rtx_12gb_at(131_072);
+        let fits = GB12.with_budget(GB12.budget_holding(start, 131_072 + 2 * 64));
+        assert!(kept(fits.adapt_with(start, Adaptable::ALL, RTX_12GB_LADDER).0).steps.is_empty(), "131,072 fits as configured");
+        for context in [98_304, 65_536, 32_768] {
+            let card = GB12.with_budget(GB12.budget_holding(rtx_12gb_at(context), context + 2 * 64));
+            let (result, attempts) = card.adapt_with(start, Adaptable::ALL, RTX_12GB_LADDER);
+            let adapted = kept(result);
+            assert_eq!(adapted.attempt, rtx_12gb_at(context), "{context}");
+            assert_eq!(adapted.steps, [AdaptStep::MaxContext { from: 131_072, to: context, context_step: 32_768, room: Room::OneLane }]);
+            assert!(attempts.iter().all(|a| a.decode_lanes == 1), "one lane has no lane to drop: {attempts:?}");
+        }
+        let card = GB12.with_budget(GB12.budget_holding(rtx_12gb_at(98_304), 98_304 + 2 * 64));
+        assert_eq!(
+            steps_text(&kept(card.adapt_with(start, Adaptable::ALL, RTX_12GB_LADDER).0).steps),
+            "max_context 131072 -> 98304 (adapt_context_step 32768, one lane)"
+        );
+        // At the default step the same budget falls to 65,536.
+        assert_eq!(kept(card.adapt_with(start, Adaptable::ALL, DEFAULT).0).attempt, rtx_12gb_at(65_536));
+    }
+
+    /// Spec #630 (GitHub #637): a 10 GiB card is read as the 12 GB class, and
+    /// its plan refuses it once the ladder has tried every step, naming the
+    /// bytes the last, smallest attempt misses; no lane step is tried at one
+    /// lane.
+    #[test]
+    fn a_10gib_card_under_rtx_12gb_is_refused_naming_the_bytes_it_misses() {
+        let budget = (10u64 << 30) - (512 << 20);
+        let card = GB12.with_budget(budget);
+        let refused = refused(card.adapt_with(rtx_12gb_at(131_072), Adaptable::ALL, RTX_12GB_LADDER).0);
+        let needed = GB12.budget_holding(rtx_12gb_at(32_768), 32_768 + 2 * 64);
+        assert!(matches!(refused.error, VramPlanError::BelowMinimum { max_context_tokens: 32_768, .. }), "{:?}", refused.error);
+        let message = refused.to_string();
+        assert!(
+            message.contains(&format!("needs {needed} bytes")) && message.contains(&format!("{} bytes more than the {budget}-byte VRAM budget", needed - budget)),
+            "{message}"
+        );
+        assert!(message.ends_with("; adaptation tried, in order: max_context 131072 -> 98304 -> 65536 -> 32768"), "{message}");
     }
 
     /// Decision 6: a context the plan holds at two lanes without a spare

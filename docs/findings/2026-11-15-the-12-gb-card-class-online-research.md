@@ -1,0 +1,312 @@
+# The 12 GB card class: what the public evidence of 2026-11-15 says about the 27B below 3 bits, and what nobody has measured
+
+- Kind: research
+- Status: current
+- Observed: 2026-11-15
+- Last verified: 2026-11-16
+- Scope: models / the 27B at 2.2 to 3.0 bits per weight in the trellis format, its public quants, the alternatives to it
+  for a 12 GB card, and the public agent-task evidence
+- Topic: artifacts-and-gates
+- Related: [#630](https://github.com/gpillon/ignis/issues/630), [#632](https://github.com/gpillon/ignis/issues/632),
+  [the 16 GB quality gates](2026-10-24-27b-16gb-quality-gates.md)
+- Superseded by: none
+- Summary: No smaller Qwen3.8 exists. In the one public agent-task harness (read off charts, ±0.5) the 27B's long tasks give way between 9.2 and 8.0 GB (Terminal-Bench 53.0 to 44.6, DeepSWE 29.2 to 21.7); tool calls below 3 bits are unmeasured.
+
+## Question
+
+A 12 GB card is to become a card class of its own, served from a 27B body of ignis's own recipe under a ceiling in
+bytes (spec #630). Before that recipe is built: which public candidates exist, and which of them load with the K
+classes the engine binds today; what do the public agent-task results say a body of about 9 GB, 8 GB and 7 GB costs a
+coding agent; what is there to choose instead of the 27B; and what has nobody measured, so that the gate has to?
+
+This finding opens with the online research of 2026-11-15 and the facts of the one public quant that binds today. It
+has a section, marked, for the slope measured on ignis's own instrument by #632, which is not in it yet.
+
+## Evidence
+
+Three research agents read the sources on 2026-11-15, one question each (quants below 3 bits, alternatives, task-level
+evidence), with no GPU, no weights downloaded and nothing posted. Their reports, with every table's source and
+harness, are the raw material:
+[`.scratch/12gb-model-study-2026-11-15/`](../../.scratch/12gb-model-study-2026-11-15/) (`SINTESI.md`, the reports
+`A-sub3bpw-quants.md`, `B-alternatives.md`, `C-task-level-evidence.md` and the common brief `BRIEF-COMMON.md`). The
+folder is local to a clone; the tables below carry what must outlast it.
+
+Conventions. GB is 10^9 bytes. "Body and head" is the device weights of the text scope (the token embedding lives in
+host memory). Each table is one source and one harness: **numbers from different tables are never compared**. `chart
+±0.5` marks a value read off a published chart image (no numeric table exists), good to about half a point on the
+agent tasks and 0.2 on the others; a value printed on a chart is marked `printed`. Everything was fetched on
+2026-11-15 unless a row says otherwise.
+
+### Sources
+
+| key | what | where |
+|---|---|---|
+| S1 | the integer-K and fractional-K ladder of the 27B in the trellis format, with its charts, recipes and per-branch `quantization_config.json` | `turboderp/Qwen3.8-27B-exl3` (refs, trees, README, discussions #3 and #12) |
+| S2 | the quantizer's releases and its optimizer notes | `turboderp-org/exllamav3` (releases, `doc/optimize.md`) |
+| S3 | a public quantization challenge: leaderboard of 122 entries, mean KLD and top-1 on one private corpus, updated 2026-11-03 | `StillDeadcode/qwen3.8-27b-quant-challenge` |
+| S4 | the ladder above scored on that leaderboard, bit for bit, and a mixed-K re-quant | `Hero422/qwen3.8-27b-exl3-turboderp-ladder`, `Hero422/qwen3.8-27b-exl3-v2-rad` |
+| S5 | an independent set with a multi-slice harness | `yeasah/Qwen3.8-27B-exl3` |
+| S6 | the agent-task harness: the model page and the method page of a publisher of quants in another format, published 2026-11-11 | its Qwen3.8 model page and its "Dynamic 3.1" page (URLs in `A-sub3bpw-quants.md`, S6, and `C-task-level-evidence.md` §1) |
+| S7 | third-party quants at 2.5 to 3.0 bits | `0xBakeer/TandemLLM-Qwen3.8-27B-EXL3-2.5` and `-3.0`, `Derpyhue/Qwen3.8-27B-exl3-2.67bpw-SC-SH` (series 2.65 to 2.80), `nalimc/Qwen3.8-27B-exl3-SC_2.60bpw_H4`, `BHCC2025/Qwen3.8-27B-EXL3-3.0bpw-mix`, `GestaltLabs/Qwen3.8-27B-EXL3-11.5GB` |
+| S8 | fine-tunes of the 27B with low-bit builds | `JRamirez-UAB/Qwopus3.8-27B-Coder-Flash-EXL3-2.25bpw-24GB`, `jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2` |
+| S9 | the same model in a second format, learned scalar, with its own card and per-tensor allocations | `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF` |
+| S10 | the Qwen organisation's repositories and cards (27B, Flash-Next, predecessors) | `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.8-Flash-Next`, `Qwen/Qwen3.6-35B-A3B`, `Qwen/Qwen3.5-9B` |
+| S11 | an independent blog run of the 27B in the second format against BF16 on Terminal-Bench 2.1 | `quesma.com/blog/qwen38-27b-quantizations-benchmarked/` (2026-08-26) |
+| S12 | a sweep whose score includes tool-calling suites | `byteshape.com/blogs/Qwen3.8-27B/` (2026-09-14, updated 09-18) |
+| S13 | the model's own MTP head, quantized | `HermiHg/Qwen3.8-27B-Optimized-MTP-Heads-exl3` |
+
+The other cards and papers read are named where they are used and in the reports.
+
+### The candidates
+
+**Public quants of the 27B, by what the engine binds today** (integer K 2 to 5 in the body, a 4-bit head, codebook
+`mul1`; a fractional K, a K of 1 or a 6-bit head is kernel work). Sizes are the sums of each branch's `n_bytes` in its
+`quantization_config.json`, 2026-11-15 (S1, S7; `A-sub3bpw-quants.md` §2).
+
+| quant (date) | quantizer | body and head GB | K classes of the 400 body linears | head | binds today |
+|---|---|---:|---|---|---|
+| `SC_3.00bpw_H4` of S1, the source of the 16 GB artifact | 1.4.2 | 9.820 | K2 x34, K3 x297, K4 x65, K5 x4 | 4 bit | yes |
+| `0xBakeer/...-EXL3-2.5` (2026-10-08) | 1.6.0 | 8.299 | K2 x192, K3 x208 | 4 bit | yes |
+| `0xBakeer/...-EXL3-3.0` (2026-10-08) | 1.6.0 | 9.821 | K2 x57, K3 x268, K4 x75 | 4 bit | yes |
+| `BHCC2025/...-EXL3-3.0bpw-mix` (2026-11-09) | 1.6.1 | 9.980 | K2 x32, K3 x305, K4 x63 | 5 bit | body yes, head no |
+| `2.50bpw` of S1 | 1.4.2 | 8.616 | K2 x137, K3 x262, K4 x1 | 6 bit | body yes, head no |
+| `SC_2.20bpw_H3` of S1 | 1.4.2 | 7.229 | K1 x3, K2 x278, K3 x103, K4 x16 | 3 bit | no (K1) |
+| `nalimc/...-SC_2.60bpw_H4` (2026-10-01) | 1.5.3 | 8.604 | K1 x4, K2 x134, K3 x225, K4 x31, K5 x6 | 4 bit | no (K1) |
+| `Derpyhue/...-2.65bpw-SC` to `-2.80bpw-SC` (2026-10-05 to 08) | 1.5.4 | 8.757 to 9.212 | K1.5 x2 to x4, K2.5 and K3.5 in the tens to hundreds | 4 bit | no (fractional) |
+| `yeasah/...` at `2.50bpw-H5` (2026-11-09) | 1.6.4 | 8.459 | K2 x90, K2.5 x191, K3 x83, K3.5 x16, K4 x20 | 5 bit | no (fractional) |
+| `GestaltLabs/...-EXL3-11.5GB` (2026-09-05) | 1.4.6 | 9.419 | K1 x2, K6 x8 among K2 to K5 | 4 bit | no (K1, K6) |
+| `SCP_2.00bpw`, `SCP_2.20bpw`, `SCP_3.00bpw` of S1 (2026-11-14) | 1.6.6, 1.6.7 | 6.621, 7.228, 9.821 | K1.5, K2.5 and K3.5 classes | 3 and 4 bit | no (fractional) |
+
+- **Observed.** Between 2.2 and 3.0 bits, the only public quant that binds with the head at 4 bits is the third-party
+  2.5 (`0xBakeer`, 8.299 GB; K2 and K3 in halves). The branches turboderp added on 2026-11-14 (`SCP_*`, "fractional-K +
+  YAQA") need fractional K; the old `SC_*` branches below 3.0 need K1. The fractional classes are a different trellis
+  width (24, 32, 40, 48 int16 words per 16x16 tile at K 1.5, 2, 2.5, 3), not a relabel.
+- **Observed.** The public optimizer (`sc_optimize`, S2) writes "a YAML recipe mapping every quantizable tensor to an
+  integer bitrate", and `-mink 2` forbids K1. Its recipe for the third-party 2.5 is on that repository
+  (`calibration/recipe_2.5.yaml`: target 2.5, achieved 2.4996, predicted KLD 0.074612, head 4 bits, `k_proj`, `q_proj`
+  and `v_proj` tied, `gate_proj` and `up_proj` tied). No public quant made this way exists at 2.4 to 2.9 bits.
+- **Observed**, from the files of `0xBakeer/TandemLLM-Qwen3.8-27B-EXL3-2.5` at revision `a7fef26e`, listed and read on
+  2026-11-16 (copies of its metadata in `.scratch/630/632/hf-meta/`): two safetensors shards of 11.98 GB in all,
+  configuration, tokenizer, card, licence (Apache 2.0), quality output and the recipe, no executable. Its
+  configuration: quantizer 1.6.0, `out_scales` "auto" with `suh` and `svh` stored on all 401 matrices, codebook
+  `mul1`, `head_bits` 4, `mtp_bits` 4, calibration 250 rows of 2,048 columns. K2 x192, K3 x208 in the body (attention
+  at K3 in 12 of 16 layers, the GDN `out_proj` at K3 in 42 of 48, the GDN input projections at K2 in 38 of 48, the MLP
+  about half and half), and a 4-bit head.
+- **Observed**, the instrument-free reading of that quant: wikitext-2 KL 0.1112 and top-1 86.3% against BF16 (3.0 of
+  the same author: 0.0621, 89.8%), by the author, BF16 perplexity 6.849 (S7). The card calls raw web text
+  the publisher's "vestigial signal" for this model, so the ratio matters, not the level.
+- **Inference.** Its allocation is a recipe of the same family as the 16 GB artifact's source, so its quality at 2.5 is
+  what the ladder below predicts for a public integer-K allocation; whether ignis's own allocation does better is what
+  the two candidate recipes of #630 are for.
+
+**Measured quality of the same ladder, one table per harness** (S1, S3, S4, S5, S7; `A-sub3bpw-quants.md` §3). The
+first column's steps are the only comparison inside a table.
+
+| harness | what | 3.0 | 2.5 | 2.2 | 2.0 | 1.8 |
+|---|---|---:|---:|---:|---:|---:|
+| the publisher's suite on its new 347K-token trace (S1, chart dated 2026-11-14, `printed`) | mean KLD of the fractional ladder `SCP` | 0.0291 | not published | 0.0954 | 0.1355 | 0.2344 (1.75) |
+| the challenge leaderboard (S3, S4, 2026-11-03) | mean KLD / top-1 of turboderp's tensors, whole-model bits | 0.0349 / 93.06% | 0.0778 / 89.96% | 0.1025 / 88.05% | 0.1476 to 0.1540 / 85.8% to 86.0% | 0.2584 / 80.99% |
+| the same, a mixed integer-K re-quant (S4) | mean KLD / top-1 | 0.0306 / 93.58% | 0.0666 / 90.24% | | 0.1644 / 84.91% | |
+| a multi-slice harness on 200 recorded agent sessions (S5, 2026-11-09, composite 0.7 swe + 0.3 wild) | excess KLD of turboderp's tensors | 0.0196 | 0.0519 | 0.0643 | 0.0835 to 0.0928 | 0.1755 |
+| the same, S5's own ladder | excess KLD | 0.0136 | 0.0306 | | | |
+| wikitext-2 (S7, the third-party 2.5 and 3.0) | KL / top-1 | 0.0621 / 89.8% | 0.1112 / 86.3% | | | |
+
+- **Observed.** On five independent harnesses the cost of each quarter of a bit between 3.0 and 2.2 is a factor of
+  about 1.45 to 1.5 in KLD (1.34 on wikitext-2) and 1.6 to 1.7 points of top-1; above 3.0 it is about 1.35 to 1.4 and
+  0.8 points. Below 2.0 the step is 1.9 to 2.9 times. Two public 2.5s on the same multi-slice harness read 0.0519 and
+  0.0306, 1.7 times apart: the allocation is worth about as much as a quarter of a bit.
+- **Observed**, the instrument of this repository: the 16 GB artifact reads KLD 0.0403 against BF16 at a 1,024-token
+  chunk on set A, its registered limit for a re-quantization is 0.0484, and the NVFP4 artifact the RTX 5090 serves
+  reads 0.0492 with a limit of 0.0590 (the 16 GB quality gates). The publisher's chart reads the old 3.00 at 0.0257 and
+  this repository's harness reads the same tensors at 0.0340: harnesses do not mix, only ratios do.
+- **Observed.** The step is not a cliff in a distribution metric: the sharp bend is between 2.0 and 1.8 bits, where K1
+  matrices go from 1.0% of the parameters (`SC_2.20`) to 4.8% (`SC_2.00`) and 28.6% (`SC_1.80`). The optimizer's notes
+  give the mechanism: the KLD-vs-noise exponent was "measured ~2.35 for the K2->K1 octave on Qwen3.8-27B".
+
+### The agent-task table
+
+One public harness runs agent tasks on this model below 3 bits. It is the model page of a publisher of quants in
+another format, published 2026-11-11 (S6), so the trellis rows are its competitor's: the harness ran them, through a
+runtime its page does not name, beside its own files. **Every value is read off its charts (chart ±0.5); only BF16
+is printed.** Terminal-Bench 2.1 with mini-swe-agent 2.4.6 and native tool calls, 82 tasks (7 excluded), 3 attempts
+each, a limit of 150 steps, no internet for the agent; DeepSWE v1.1 on 113 tasks, at least 3 passes each, graded by
+the tasks' own tests; LiveCodeBench v6 at 128K output tokens; temperature 1.0, top-p 0.95, top-k 20, reasoning at its
+highest setting, 128K to 256K of context. The x axis is "GB without the token embedding", which is this
+repository's body and head. The trellis points sit at 7.25 and 9.85 GB, which are the sizes of `SC_2.20bpw_H3` and
+`SC_3.00bpw_H4` (the page does not name the branches).
+
+| 27B build | GB without the token embedding | Terminal-Bench 2.1 | DeepSWE v1.1 | LiveCodeBench v6 |
+|---|---:|---:|---:|---:|
+| BF16 (printed) | | 59.15 | 40.40 | 88.62 |
+| the publisher's 4-bit point | 16.6 | 60.2 | 38.4 | 89.8 |
+| its 3-bit point | 11.15 | 59.7 | 34.5 | 89.0 |
+| trellis, the 16 GB artifact's source recipe | 9.85 | 55.3 | 31.2 | 88.7 |
+| the other format, dynamic 2-bit, 3.1 | 9.2 | 53.0 | 29.2 | 88.5 |
+| a third publisher's learned-scalar 3.00 bpw (S9) | 9.7 | 51.2 | 25.6 | 87.1 |
+| a third publisher's learned-scalar 2.75 bpw (S9) | 8.85 | 42.7 | 24.8 | 83.2 |
+| the other format, dynamic 2-bit, 3.1 | 8.0 | 44.6 | 21.7 | 84.7 |
+| a third publisher's learned-scalar 2.50 bpw (S9) | 8.15 | 37.8 | 16.8 | 84.0 |
+| the other format, dynamic 2-bit, 3.1 | 7.3 | 41.0 | 12.8 | 84.5 |
+| trellis, the public 2.2-bit branch | 7.25 | 43.1 | 9.8 | 83.3 |
+
+The two reports read the same chart twice and agree within 0.1 point (DeepSWE 12.8 or 12.9 at 7.3 GB, 24.7 or 24.8 at
+8.85 GB, 34.4 or 34.5 at 11.15 GB); the first value is kept. The chart prints a recovery figure that the readings
+reproduce: trellis 2.20 mean(83.3/88.62, 43.1/59.15, 9.8/40.40) is 63.7%, trellis 3.00 is 90.3%.
+
+- **Observed.** The loss is ordered by the length of the task. At 7.25 GB the trellis body keeps 94% of BF16 on
+  single-turn code, 73% on terminal tasks and 24% on long repository tasks; at 9.85 GB, 100%, 93.5% and 77%. The
+  dynamic 2-bit line keeps 90% and 72% of BF16 on terminal and long tasks at 9.2 GB, 75% and 54% at 8.0 GB. The step on
+  the long tasks sits between 8.0 and 9.2 GB, and that publisher states the same break for its own files ("a sharp drop
+  off from UD-Q2_K_XL to UD-IQ2_S ... tool calling and non thinking modes break down").
+- **Observed.** Allocation alone moved the same quantizer at about 8 GB from the previous generation to the 3.1 one:
+  Terminal-Bench 41.5 to 44.6, DeepSWE 12.8 to 21.7, LiveCodeBench 76.6 to 84.7 (recipe not disclosed).
+- **Observed.** The harness's noise: above 11 GB its line is not monotone (Terminal-Bench 59.7, 56.7, 55.6, 57.8, 60.2
+  from 11.15 to 16.6 GB; DeepSWE 34.5, 37.6, 36.3, 33.6, 38.4), so a single point carries about 2 to 3 points. On
+  single-turn code, the 5.7-point step from 2.50 to 2.75 bits on a learned-scalar publisher's own card (76.57 to 82.29,
+  one trial) is not reproduced in this harness (84.0 to 83.2): a quarter of a bit on LiveCodeBench is inside one trial's
+  noise.
+- **Observed.** At equal size the second format's 9.2 GB file and the trellis 9.85 GB body score the same within that
+  noise here, although the trellis author's KLD chart puts the earlier file of the same name at more than twice the
+  KLD (0.0587 against 0.0257).
+- **Inference.** The agentic step between a 2.2-class and a 2.5-class body, that is between about 7.3 and 8.3 GB, is
+  where the long tasks give way. A body of 9.2 GB sits on the right side of it on this evidence, and the ceiling that
+  #630 takes is motivated by this table. It is motivation, not a measurement of the artifact ignis will build: the
+  trellis curve has two points (7.25 and 9.85), so every value between them is an interpolation and the shape between
+  is unknown (the second format's curve is concave in the band, which would make the trellis step smaller than the
+  chord on DeepSWE).
+
+For the byte budgets of the spec (at 65,536 tokens of context, a 12 GB card's 12.82 GB usable, about 1 GB for a
+desktop and headroom), interpolating linearly inside the one harness, derived by the research agent: the two-lane
+points (7.95 GB under DFlash2, 8.68 GB under MTP) cost about 4 to 6 Terminal-Bench points and 5 to 7 DeepSWE points
+against the one-lane points (8.8 and 9.55 GB), out of 59 and 40. The chord between the two trellis points is 4.7
+Terminal-Bench and 8.2 DeepSWE points a GB; the dynamic line between 8.0 and 9.2 GB is 7.0 and 6.3 (`inference`, one
+harness).
+
+Other agent-task and process evidence, each its own harness (`C-task-level-evidence.md`):
+
+| source | build | result | what it shows |
+|---|---|---|---|
+| an independent blog run (S11, 2026-08-26): llama.cpp of 2026-08-16, Terminal-Bench 2.1 on 89 tasks, 3 h timeout, one run | the dynamic 2-bit file of 10.7 GB, KLD 0.079, top-1 87.3% | 57/89 (64.0%, CI 54 to 73) against 63/89 (70.8%) for BF16; 17 failed and 15 timed out against 18 and 8 | at KLD 0.08 the pass count falls inside its interval while the timeouts nearly double |
+| the same, tasks both solved | the same | output tokens 1.27x BF16 (CI 1.06 to 1.81), 1.17x on GPQA, 1.40x on IFBench | a harder quant spends more tokens |
+| the same | single-turn IFBench, strict | 240/300 against 245/300 | short instruction following does not move |
+| a coder fine-tune of the 27B on 3090s (S8, 2026-11-02): own opencode tasks, 10 x 3 | trellis 2.25 bits (fractional) against 3.50 bits | agent tasks 25/30 against 30/30; tool calls 29/30 against 30/30; loops on long answers 8/30 against 0/30 at temperature 1.0 | at 2.25 bits tasks, loops and tool calls already cost; one model, n = 30 |
+| a sweep including BFCL v4 multi-turn and ACEBench (S12, GGUF only, per-benchmark scores unpublished) | a quarter to a third of a bit starting near 2.5 | +3.5 points of BF16 for the best allocation, +7.2, +9.4 and +13.1 for the others | the method changes the cost of the same step about fourfold |
+| MTP acceptance of the model's own head on a GGUF target (S9, llama.cpp speed bench, 3 drafts, 5 samples a bar; chart ±0.3) | 2.50, 2.75, 3.00, 3.50 bits | coding 58.5, 58.7, 55.9, 58.0%; reasoning 53.0, 51.8, 50.7, 53.3% | no fall in acceptance from 3.5 to 2.5 bits |
+
+### The alternatives to the 27B (what was checked, 2026-11-15)
+
+- **No smaller Qwen3.8.** The Qwen organisation's Hub repositories named Qwen3.8 are the 27B, its FP8, Flash-Next, its
+  FP8, and the 2.4T-A95B with its FP8; nothing was created after 2026-10-20 and the newest repository is an image model
+  of 2026-10-09 (S10, the Hub listing). Requests for a 9B stay open (27B repository discussions #223, #237, #238)
+  without a Qwen reply. The only Qwen4 artifact found is a hosted preview that retires on 2026-11-25; a "Qwen4 27B"
+  for local use is named by secondary sources only, with no date, licence or architecture.
+- **Flash-Next is the one candidate that beats the 27B per byte of VRAM on agent suites, at a different cost.** In the
+  harness of the agent-task table, its builds of about 66 to 68 GB score Terminal-Bench 57 to 70 and DeepSWE 35 to 54
+  against 55.3 and 31.2 for the 27B at 9.85 GB (chart ±0.5; its quantizations differ a lot at one size: 35.4 and 54.0
+  on DeepSWE at about 66 GB). It asks 34 GB of experts in host memory plus about 10 GB, with a 28.8 GB n-gram table on
+  disk (48 GB of host memory for the 2.4-bit build, 64 GB above), a new artifact, and a licence that restricts
+  commercial model-serving. Independent runs put it below the 27B on BFCL v4 multi-turn (0.523 against 0.570, one
+  author, one box) and level on LiveCodeBench and GPQA. A public engine runs it on a 12 GB card (an RTX 5070 at 76 to
+  93 tok/s decode up to 64K of context under its engine's own measurement), which is not ignis's. It is a later
+  phase, not this class.
+- **Fine-tunes of the 27B buy no quality per byte.** Three that cut reasoning tokens by 36 to 47% at the highest
+  reasoning setting match the base within noise on one frozen suite (average 91.1 to 91.4 and 89.8 against 90.2); one
+  claims a Terminal-Bench gain on its own harness (72.13 against 69.21) under a licence that caps free use at a
+  revenue. None has low-bit task evidence.
+- **Other architectures, reference only, not loadable.** The vendor cards of two 2026-08 releases claim Terminal-Bench
+  2.1 46.2 for a 9B (7.6 to 9.8 GB at 6 to 8 bits) and 67.8 for a 35B-A3B with its experts in host memory, no
+  independent reproduction found. Across harnesses, so only a pointer: a 27B at 2.4 to 2.65 bits keeps about 0.65 to
+  0.8 of its Terminal-Bench, and its margin over a well-trained 9B is small on public data (`B-alternatives.md` §9,
+  `inference`).
+
+### The slope on our own instrument
+
+**Not measured yet.** The coordinator of #632 adds this section after the GPU legs run: the KLD of the converted
+third-party 2.5 and of the 16 GB artifact on set A at the 16 GB artifact's serving shape (1,024-token chunk, hq-e8-2b),
+with top-1 and the window-bootstrap interval, the loop set on both, the session, the commit, the instrument's
+reproduction of the 16 GB artifact's 0.0403, and the reading of the 0.5 bit between 3.0 and 2.5. Until then nothing in
+this finding is a reading of ignis's own curve; the one figure of it that exists is the 16 GB artifact's, above.
+
+## Finding
+
+Observed:
+
+1. No Qwen3.8 smaller than the 27B exists (Hub listing, 2026-11-15). The model of the class stays the 27B.
+2. No public quant at 2.4, 2.65 or 2.9 bits binds with today's K classes. The only one between 2.2 and 3.0 that does is
+   the third-party 2.5 (K2 and K3 in halves, a 4-bit head, 8.299 GB, quantizer 1.6.0).
+3. In KLD and top-1 the curve is smooth from 3.0 to 2.2 bits, about 1.5 times the KLD and 1.6 to 1.7 points of top-1
+   for every quarter of a bit, on five harnesses, and bends sharply only below 2.0 bits, where K1 matrices appear. The
+   allocation matters as much as a quarter of a bit (0.0519 against 0.0306 for two public 2.5s on one harness).
+4. In the one public agent-task harness the loss grows with the length of the task. A trellis body at 7.25 GB keeps
+   94, 73 and 24% of BF16 on single-turn code, Terminal-Bench and DeepSWE; at 9.85 GB, 100, 93.5 and 77%. The dynamic
+   2-bit line steps on the long tasks between 8.0 and 9.2 GB. A harder quant also spends more tokens and times out more
+   (1.27 times the output tokens, 15 timeouts against 8, on one blog run).
+5. The model's own MTP head's acceptance is flat from 3.5 to 2.5 bits on one public card (chart, ±0.3, 5 samples a
+   bar).
+
+Inferred (`inference` in the sections above):
+
+- The step of the long tasks lies between about 7.3 and 8.3 GB of body and head, so a 9.2 GB body is on its upper side
+  and a second lane at 8.0 GB or below is in its steepest stretch.
+- Between a one-lane and a two-lane recipe (0.87 GB, about 0.28 bits of the body) a coding agent probably loses about
+  one terminal task in ten and one long repository task in four or five of those the larger completes; short edits
+  barely change. This is an interpolation between two trellis points 2.6 GB apart and one vendor's line, not a
+  measurement.
+- KLD per bit carries over to tasks only partly: the dynamic 2-bit line at 9.2 GB and the trellis at 9.85 GB score
+  alike on tasks where their KLDs differ by more than two on an older file.
+- Staying with integer K costs a predicted 4 to 5% of KLD against half-steps, small against a factor of 1.5 a quarter
+  of a bit.
+
+## Implications
+
+- The spec's 9.2 GB ceiling is consistent with this evidence, which is its only support: at 9.2 GB the second format's
+  files keep 90% (terminal) and 72% (repository) of BF16 in the one harness that has them, and the long tasks give way
+  below about 8.3 GB. #632's slope on ignis's own instrument is what tests it, and the owner decides whether it stands.
+- The gate's numbers (KLD, the drafter's acceptance, the loop rate) are blind to what the public evidence says matters
+  most: the length of a task, the tokens spent, the timeouts, the validity of a tool call. The agent-facing checks the
+  repository has (the replay of recorded turns, the canary prompts, the regression set) are the instrument for those,
+  beside the gate and not binding.
+- A recipe built to a byte ceiling should be compared against the public integer-K 2.5 on KLD first: its allocation
+  is the cheapest candidate there is, and the allocation is worth about a quarter of a bit.
+- Flash-Next's per-byte lead is a later phase with its own cost in host memory and licence; a smaller sibling, if
+  the Qwen4 27B of the secondary sources ships, would change the question and is worth a check at its date.
+
+## Limits and unknowns
+
+- **One agent-task harness, run by a competitor.** The trellis rows are a quantizer's competitor's runs, through a
+  runtime its page does not name, with its own samplers and templates. Every value is a chart reading (±0.5), the
+  harness's own noise is 2 to 3 points a point, and the trellis curve has two points: the shape between 7.25 and 9.85
+  GB is not known, and the 2.2 point used a 3-bit head where the engine keeps 4.
+- **No agent-task measurement of any trellis quant between 2.2 and 3.0 bits exists** in public, including the third-party
+  2.5. The nearest proxy, the dynamic 2-bit line, is another format and another runtime.
+- **Not measured by anyone, on any model of this size below 3 bits:** the validity of tool calls and of structured
+  output (the papers read stop at 4 bits and find more of the errors a model already makes, hidden by retry budgets),
+  retrieval or agent work past 100K tokens, drift over many turns, DFlash2's acceptance on a target below 4 bits
+  (MTP's is flat on one card; a bound by argument for a drafter that misses every flipped token is a few percent
+  relative, an argument and not a measurement), the effect of a half-bit on the tokens spent per solved task (its
+  direction is measured, its size is not). The 30 to 50 agentic tasks, three times, on a 2.4 and a 2.65 build,
+  logging pass rate, tokens a solved task, tool-call parse failures and accepted length, are what is missing and cheap.
+- **Task evidence from other formats and models** (scalar GPTQ on a 30B mixture, AQLM on code models, a 30B-A3B at 2.0
+  to 2.25 bits losing 4 to 5 points of HumanEval+ and 7 to 9 of BFCL) is at other widths, other formats or other
+  architectures: it shows failure modes (a termination threshold that a mean KLD does not announce; function calling
+  losing about twice what single-function code does), not the 27B's curve.
+- **The third-party 2.5's quality is the author's wikitext reading only**, with the quantizer's own
+  evaluator; its agent-task behaviour, its tool calls and its loop rate are what #632 is to measure. Its calibration
+  (250 rows of 2,048 columns) is not stated to be the 16 GB artifact's source's trace.
+- **The published KLD figures come from five harnesses** with different corpora and units; ratios within a harness are
+  the usable reading, never levels across them. Where a card gives a KLD with no stated set (the 2.65 to 2.80 series),
+  its harness is unknown.
+- **The card's own lines.** The research says nothing about the CUDA context or the workspace of a real 12 GB card.
+- Pages that could not be read: every Reddit thread (blocked), two paywalled newsletters, the methods article of the
+  quant publisher's 3.1 update, the Flash-Next technical report, a gated card. One page that printed tool-call validity
+  per quant was not used: it names no primary source and contradicts itself on three figures.
+
+## Follow-ups
+
+- #632: the slope on ignis's own instrument fills the section marked above; the owner's reading of it decides whether
+  the 9.2 GB ceiling stands.
+- #630's later tickets build the two recipes at integer K and the gate measures them; the agent-facing checks sit beside
+  it, as above.
+- A set of 30 to 50 agentic tasks, three attempts each, on the admitted artifact and the 16 GB artifact, would measure
+  what the public evidence cannot (tool-call validity, tokens a solved task).
+- A request to an owner of a real 12 GB card for three readings is the spec's own open issue.

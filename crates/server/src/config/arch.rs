@@ -571,9 +571,10 @@ pub fn opener_page_rides_capture(family: ModelFamily, generation: Option<GpuGene
 /// the one decision, which [`crate::runtime::EngineShape::solo_widths`] asks.
 /// The load keeps the first its VRAM plan holds with nothing else adapted and,
 /// at more than one lane, the spare reservation left beside the context,
-/// otherwise the prefill chunk. The `rtx-16gb` and `rtx-24gb` profiles pin
-/// the width to their chunk, so the ladder runs on the 8.x cards no built-in
-/// profile pins: a 32 GB one under `rtx5090`, a larger one under none.
+/// otherwise the prefill chunk. The `rtx-12gb`, `rtx-16gb` and `rtx-24gb`
+/// profiles pin the width to their chunk, so the ladder runs on the 8.x cards
+/// no built-in profile pins: a 32 GB one under `rtx5090`, a larger one under
+/// none.
 ///
 /// 8,192, 4,096, then 2,048 for the 27B on Ampere and Ada, where the dense
 /// prefill decodes each trellis matrix once per chunk, so a wider chunk

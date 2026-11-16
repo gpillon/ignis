@@ -27,9 +27,9 @@ pub const DEFAULT_PROFILE: &str = AUTO_PROFILE;
 /// the real profile first and names that one, so `GET /v1/config`, `make
 /// config` and the Playground show `rtx5090`, never `auto`. It picks the
 /// class's profile by NAME, through the same [`lookup`] a named profile goes
-/// through: a config file's `profiles:` that redefines `rtx-16gb`,
-/// `rtx-24gb`, `rtx5090` or `rtxpro6000` replaces what `auto` picks for that
-/// class.
+/// through: a config file's `profiles:` that redefines `rtx-12gb`,
+/// `rtx-16gb`, `rtx-24gb`, `rtx5090` or `rtxpro6000` replaces what `auto`
+/// picks for that class.
 pub const AUTO_PROFILE: &str = "auto";
 
 /// What the start could read of the card `--profile auto` chooses by. Injected
@@ -142,8 +142,8 @@ pub fn auto(card: Card) -> Result<Option<&'static str>, ConfigError> {
 }
 
 /// The boundaries of every class, spelled from the `CARD_CLASS_*` constants:
-/// "16 GB below 20 GiB, 24 GB from 20 to under 28 GiB, 32 GB from 28 to 40
-/// GiB, 96 GB from 88 to 104 GiB".
+/// "12 GB below 14 GiB, 16 GB from 14 to under 20 GiB, 24 GB from 20 to under
+/// 28 GiB, 32 GB from 28 to 40 GiB, 96 GB from 88 to 104 GiB".
 fn class_bounds() -> String {
     CardClass::ALL.into_iter().map(|class| format!("{class} {}", class.totals())).collect::<Vec<_>>().join(", ")
 }
@@ -235,7 +235,8 @@ pub const NONE_PROFILE: &str = "none";
 ///
 /// `rtx-16gb` is the 16 GB class (ADR 0063, ADR 0064; named `rtx50-16gb` until
 /// GitHub #476, a name [`canonical`] still accepts): the RTX 5060 Ti 16 GB,
-/// 5070 Ti and 5080, the RTX 50 cards `--profile auto` finds below 20 GiB.
+/// 5070 Ti and 5080, the RTX 50 cards `--profile auto` finds from 14 GiB up to
+/// 20 GiB.
 /// Derived, not measured: no 16 GB card exists in the project. It serves the 27B
 /// (the 16 GB catalog entry) at the 262,144 positions it was trained on, with
 /// DFlash2 at 7 tokens, as the other profiles, and vision on, explicit
@@ -263,6 +264,26 @@ pub const NONE_PROFILE: &str = "none";
 /// 2,048 (4,096 leaves less than the spare reservation past the context), its
 /// pool 352,768 tokens against 386,048. Flash-Next's `prefill_chunk` 2,048 is
 /// a placeholder no card of the class has measured (GitHub #526).
+///
+/// `rtx-12gb` is the 12 GB class (spec #630, ADR 0098): the RTX 5070, the
+/// 12 GB RTX 4070 family, the RTX 3060 12 GB and the RTX 3080 Ti, the cards
+/// `--profile auto` finds below 14 GiB. Derived, not measured: no 12 GB card
+/// exists in the project, and the class is simulated on the RTX 5090 under a
+/// 12 GiB budget. It is sized for one user with a desktop on the card, about 1
+/// GB already taken: one decode lane, where a second costs about 0.87 GB; the
+/// 27B's MTP head as the drafter, at the window #628 measured
+/// ([`ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS`], ADR 0095),
+/// where every other class drafts with DFlash2, which holds about 0.7 GB more,
+/// on this card the context; 131,072 tokens of context that adapt 32,768 at a
+/// time (`model.adapt_context_step`, 65,536 elsewhere), so a desktop that
+/// leaves room for about 100,000 tokens keeps 98,304 and not 65,536; 512M of
+/// `vram.qwen38.headroom_bytes`, a choice, since 1200M would leave no context;
+/// a 512-token prefill chunk with the solo width pinned to it, the scratch
+/// before the context; and vision on as `rtx-16gb` has it, in host memory at
+/// a 4,096-token envelope. Each is a default the load adapts (ADR 0063 §3)
+/// and the operator overrides: two lanes, a 256-token chunk (with the solo
+/// width named too) and DFlash2 stay selectable. It names no model, and no
+/// Flash-Next value: Flash-Next on a small card is not this class's.
 ///
 /// `rtx-24gb` is the 24 GB class (GitHub #480, spec #474): the RTX 3090 and
 /// RTX 4090, the cards `--profile auto` finds from 20 GiB up to 28 GiB. It
@@ -351,6 +372,19 @@ const BUILT_IN: &str = r#"{
             "qwen38": { "backend": "dflash2", "draft_tokens": 7, "decode_lanes": 2, "draft_head": "auto" }
         }
     },
+    "rtx-12gb": {
+        "vram": {
+            "qwen38": { "headroom_bytes": "512M" }
+        },
+        "model": {
+            "adapt_context_step": 32768,
+            "qwen38": { "max_context": 131072, "prefill_chunk": 512, "prefill_chunk_solo": 512 }
+        },
+        "vision": { "max_tokens": 4096, "residency": "host", "qwen38": { "enabled": true } },
+        "spec": {
+            "qwen38": { "backend": "mtp", "draft_tokens": QWEN38_MTP_DEFAULT_DRAFT_TOKENS, "decode_lanes": 1 }
+        }
+    },
     "rtx-24gb": {
         "vram": {
             "qwen38": { "headroom_bytes": "1200M" }
@@ -375,19 +409,23 @@ const BUILT_IN: &str = r#"{
 /// entry needs a larger card than this one".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CardClass {
+    Gb12,
     Gb16,
     Gb24,
     Gb32,
     Gb96,
 }
 
-/// The total memories each [`CardClass`] covers (spec 27b-16gb/04, spec #474),
-/// as NVML reports a card's total: below 20 GiB is the 16 GB class (a 16 GB
-/// card reports ~15.9 GiB), from 20 GiB up to, but not including, 28 GiB the
-/// 24 GB one (the RTX 3090 and RTX 4090, 24 GiB), 28-40 GiB the 32 GB one
-/// (the 5090 ~31.8 GiB), 88-104 GiB the 96 GB one (the RTX PRO 6000 ~95.6
-/// GiB). Any other total is no class: `--profile auto` refuses it, naming
-/// `--profile`.
+/// The total memories each [`CardClass`] covers (spec 27b-16gb/04, spec #474,
+/// spec #630), as NVML reports a card's total: below 14 GiB is the 12 GB class
+/// (a 12 GB card reports ~11.9 GiB; no lower bound, so a 10 or 11 GB card is
+/// read as the class and refused by its VRAM plan), from 14 GiB up to, but not
+/// including, 20 GiB the 16 GB class (a 16 GB card reports ~15.9 GiB), from 20
+/// GiB up to, but not including, 28 GiB the 24 GB one (the RTX 3090 and RTX
+/// 4090, 24 GiB), 28-40 GiB the 32 GB one (the 5090 ~31.8 GiB), 88-104 GiB the
+/// 96 GB one (the RTX PRO 6000 ~95.6 GiB). Any other total is no class:
+/// `--profile auto` refuses it, naming `--profile`.
+pub const CARD_CLASS_12GB_BELOW_BYTES: u64 = 14 << 30;
 pub const CARD_CLASS_16GB_BELOW_BYTES: u64 = 20 << 30;
 pub const CARD_CLASS_24GB_BYTES: std::ops::Range<u64> = CARD_CLASS_16GB_BELOW_BYTES..*CARD_CLASS_32GB_BYTES.start();
 pub const CARD_CLASS_32GB_BYTES: std::ops::RangeInclusive<u64> = (28 << 30)..=(40 << 30);
@@ -395,12 +433,14 @@ pub const CARD_CLASS_96GB_BYTES: std::ops::RangeInclusive<u64> = (88 << 30)..=(1
 
 impl CardClass {
     /// Every class, smallest first.
-    pub const ALL: [CardClass; 4] = [Self::Gb16, Self::Gb24, Self::Gb32, Self::Gb96];
+    pub const ALL: [CardClass; 5] = [Self::Gb12, Self::Gb16, Self::Gb24, Self::Gb32, Self::Gb96];
 
     /// The class a card whose total memory is `total_bytes` belongs to, by
     /// the boundaries above; `None` for a total between or past them.
     pub fn of_total(total_bytes: u64) -> Option<Self> {
-        if total_bytes < CARD_CLASS_16GB_BELOW_BYTES {
+        if total_bytes < CARD_CLASS_12GB_BELOW_BYTES {
+            Some(Self::Gb12)
+        } else if total_bytes < CARD_CLASS_16GB_BELOW_BYTES {
             Some(Self::Gb16)
         } else if CARD_CLASS_24GB_BYTES.contains(&total_bytes) {
             Some(Self::Gb24)
@@ -414,12 +454,13 @@ impl CardClass {
     }
 
     /// The total memories the class covers, spelled from the `CARD_CLASS_*`
-    /// constants: "below 20 GiB", "from 20 to under 28 GiB", "from 28 to 40
-    /// GiB", "from 88 to 104 GiB".
+    /// constants: "below 14 GiB", "from 14 to under 20 GiB", "from 20 to
+    /// under 28 GiB", "from 28 to 40 GiB", "from 88 to 104 GiB".
     pub fn totals(self) -> String {
         let gib = |bytes: u64| bytes >> 30;
         match self {
-            Self::Gb16 => format!("below {} GiB", gib(CARD_CLASS_16GB_BELOW_BYTES)),
+            Self::Gb12 => format!("below {} GiB", gib(CARD_CLASS_12GB_BELOW_BYTES)),
+            Self::Gb16 => format!("from {} to under {} GiB", gib(CARD_CLASS_12GB_BELOW_BYTES), gib(CARD_CLASS_16GB_BELOW_BYTES)),
             Self::Gb24 => format!("from {} to under {} GiB", gib(CARD_CLASS_24GB_BYTES.start), gib(CARD_CLASS_24GB_BYTES.end)),
             Self::Gb32 => format!("from {} to {} GiB", gib(*CARD_CLASS_32GB_BYTES.start()), gib(*CARD_CLASS_32GB_BYTES.end())),
             Self::Gb96 => format!("from {} to {} GiB", gib(*CARD_CLASS_96GB_BYTES.start()), gib(*CARD_CLASS_96GB_BYTES.end())),
@@ -429,6 +470,7 @@ impl CardClass {
     /// The class's size in GB, as a catalog entry spells it (`card_class: 16`).
     pub fn gb(self) -> u32 {
         match self {
+            Self::Gb12 => 12,
             Self::Gb16 => 16,
             Self::Gb24 => 24,
             Self::Gb32 => 32,
@@ -445,6 +487,7 @@ impl CardClass {
     /// The built-in profile `--profile auto` picks for a card of this class.
     pub fn profile(self) -> &'static str {
         match self {
+            Self::Gb12 => "rtx-12gb",
             Self::Gb16 => "rtx-16gb",
             Self::Gb24 => "rtx-24gb",
             Self::Gb32 => "rtx5090",
@@ -491,7 +534,9 @@ pub const RTX_24GB_RETAINED_DEVICE_SLOTS: u32 = 2;
 /// Every built-in profile, by name: [`BUILT_IN`], its constants' names
 /// replaced by their values.
 pub fn built_in() -> BTreeMap<String, Layer> {
-    let profiles = BUILT_IN.replace("RTX_24GB_RETAINED_DEVICE_SLOTS", &RTX_24GB_RETAINED_DEVICE_SLOTS.to_string());
+    let profiles = BUILT_IN
+        .replace("RTX_24GB_RETAINED_DEVICE_SLOTS", &RTX_24GB_RETAINED_DEVICE_SLOTS.to_string())
+        .replace("QWEN38_MTP_DEFAULT_DRAFT_TOKENS", &ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS.to_string());
     let value = serde_json::from_str(&format!(r#"{{"profiles": {profiles}}}"#)).expect("the built-in profiles are JSON");
     read_document(&value, "the built-in profiles").expect("the built-in profiles name only declared fields").profiles
 }
@@ -799,6 +844,38 @@ mod tests {
         }
     }
 
+    /// Spec #630 (GitHub #637): `rtx-12gb` carries the table of its spec for
+    /// the 27B -- one lane, the MTP head at its measured window, 131,072
+    /// tokens adapting 32,768 at a time, 512M of headroom, a 512-token chunk
+    /// and solo width, vision on in host memory at 4,096 tokens -- and nothing
+    /// for Flash-Next.
+    #[test]
+    fn the_rtx_12gb_profile_carries_the_12gb_classs_values() {
+        use ignis_core::compute::ModelFamily::{FlashNext, Qwen38_27b};
+        use ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS;
+
+        let profiles = built_in();
+        let rtx12 = &profiles["rtx-12gb"];
+        let value = |group: &str, name: &str, family| rtx12.get(field(group, name).unwrap(), family).map(|candidate| candidate.raw.clone());
+        assert_eq!(value("spec", "decode_lanes", Some(Qwen38_27b)).as_deref(), Some("1"));
+        assert_eq!(value("spec", "backend", Some(Qwen38_27b)).as_deref(), Some("mtp"));
+        assert_eq!(QWEN38_MTP_DEFAULT_DRAFT_TOKENS, 7, "ADR 0095: the window #628 measured");
+        assert_eq!(value("spec", "draft_tokens", Some(Qwen38_27b)), Some(QWEN38_MTP_DEFAULT_DRAFT_TOKENS.to_string()));
+        assert_eq!(value("spec", "draft_head", Some(Qwen38_27b)), None, "MTP has only the full head");
+        assert_eq!(value("model", "max_context", Some(Qwen38_27b)).as_deref(), Some("131072"));
+        assert_eq!(value("model", "adapt_context_step", None).as_deref(), Some("32768"), "the 27B's field, written for every model");
+        assert_eq!(value("vram", "headroom_bytes", Some(Qwen38_27b)).as_deref(), Some("512M"));
+        assert_eq!(value("vram", "headroom_bytes", None), None, "the general headroom stays the default");
+        assert_eq!(value("model", "prefill_chunk", Some(Qwen38_27b)).as_deref(), Some("512"));
+        assert_eq!(value("model", "prefill_chunk_solo", Some(Qwen38_27b)).as_deref(), Some("512"));
+        assert_eq!(value("vision", "enabled", Some(Qwen38_27b)).as_deref(), Some("true"));
+        assert_eq!(value("vision", "enabled", None), None, "GitHub #557: the 27B's alone");
+        assert_eq!(value("vision", "residency", None).as_deref(), Some("host"));
+        assert_eq!(value("vision", "max_tokens", None).as_deref(), Some("4096"));
+        let flash: Vec<_> = rtx12.entries().filter(|(_, family, _)| *family == Some(FlashNext)).collect();
+        assert!(flash.is_empty(), "no Flash-Next section: Flash-Next on a small card is not this class's");
+    }
+
     /// The 27B started under `rtxpro6000` takes the profile's Flash-Next-only
     /// n-gram budget as a default it passes over, not a value to refuse.
     #[test]
@@ -813,14 +890,19 @@ mod tests {
         assert_eq!(flash.settings.ngram.hot_bytes.map(|b| b.to_string()).as_deref(), Some("auto"));
     }
 
-    /// Spec 27b-16gb/04 and spec #474: the class boundaries by NVML's total,
-    /// at the totals the cards report and either side of every boundary.
+    /// Spec 27b-16gb/04, spec #474 and spec #630: the class boundaries by
+    /// NVML's total, at the totals the cards report and either side of every
+    /// boundary.
     #[test]
     fn a_cards_total_memory_names_its_class() {
         const GIB: f64 = (1u64 << 30) as f64;
         let class = |gib: f64| CardClass::of_total((gib * GIB) as u64);
         assert_eq!(class(15.9), Some(CardClass::Gb16), "a 16 GB card");
-        assert_eq!(class(11.9), Some(CardClass::Gb16), "a 12 GB card is the 16 GB class's");
+        assert_eq!(class(11.9), Some(CardClass::Gb12), "a 12 GB card is its own class");
+        assert_eq!(class(10.0), Some(CardClass::Gb12), "no lower bound: a 10 GB card is read as the class, its plan refuses it");
+        assert_eq!(CardClass::of_total(CARD_CLASS_12GB_BELOW_BYTES - 1), Some(CardClass::Gb12));
+        assert_eq!(CardClass::of_total(CARD_CLASS_12GB_BELOW_BYTES), Some(CardClass::Gb16), "14 GiB: the 16 GB class");
+        assert_eq!(CARD_CLASS_12GB_BELOW_BYTES, 14 << 30);
         assert_eq!(class(31.8), Some(CardClass::Gb32), "the 5090");
         assert_eq!(class(95.5), Some(CardClass::Gb96), "the RTX PRO 6000");
         assert_eq!(CardClass::of_total(CARD_CLASS_16GB_BELOW_BYTES - 1), Some(CardClass::Gb16));
@@ -842,8 +924,14 @@ mod tests {
             assert_eq!(CardClass::from_gb(class.gb()), Some(class));
         }
         assert_eq!(CardClass::from_gb(24), Some(CardClass::Gb24));
+        assert_eq!(CardClass::from_gb(12), Some(CardClass::Gb12));
         assert_eq!(CardClass::from_gb(48), None);
+        assert!(CardClass::Gb12 < CardClass::Gb16);
         assert!(CardClass::Gb16 < CardClass::Gb24 && CardClass::Gb24 < CardClass::Gb32 && CardClass::Gb32 < CardClass::Gb96);
+        assert_eq!(CardClass::Gb12.to_string(), "12 GB");
+        assert_eq!(CardClass::Gb12.profile(), "rtx-12gb");
+        assert_eq!(CardClass::Gb12.totals(), "below 14 GiB");
+        assert_eq!(CardClass::Gb16.totals(), "from 14 to under 20 GiB");
         assert_eq!(CardClass::Gb24.to_string(), "24 GB");
         assert_eq!(CardClass::Gb32.to_string(), "32 GB");
         assert_eq!(CardClass::Gb24.profile(), "rtx-24gb");
@@ -869,6 +957,6 @@ mod tests {
         assert_eq!(lookup("rtx5090", &from_file).unwrap(), mine);
         assert_eq!(lookup("rtx5090", &BTreeMap::new()).unwrap(), built_in()["rtx5090"]);
         let err = lookup("no-such-card", &from_file).unwrap_err().0;
-        assert!(err.contains("`no-such-card`") && err.contains("a4000, rtx-16gb, rtx-24gb, rtx5090"), "{err}");
+        assert!(err.contains("`no-such-card`") && err.contains("a4000, rtx-12gb, rtx-16gb, rtx-24gb, rtx5090"), "{err}");
     }
 }

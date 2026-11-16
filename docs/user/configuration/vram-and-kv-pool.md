@@ -82,3 +82,23 @@ class is refused whatever the flag says.
 | `--reuse-retained-device <n>` | `IGNIS_REUSE_RETAINED_DEVICE` | `0`; `2` for the 27B under the `rtx-24gb` profile, `0` there with `--reuse-prompt off` | Retained slots in VRAM: reserved in the VRAM plan, copied device to device (~0.3 ms), and handed out before any host slot. A card with VRAM to spare can take `--reuse-retained-device 16 --reuse-retained-host 0`. |
 | `--reuse-retained-host <n>` | `IGNIS_REUSE_RETAINED_HOST` | two per decode lane of the 27B (16 at its 8); `0` with `--reuse-prompt off` | Retained slots in one pinned host block reserved at start, ~222 MiB each at the default load (3.5 GiB for 16): no VRAM, so the KV pool gets it; a capture and a claim each cost a PCIe copy (~15–19 ms). Both kinds hold the images of retained checkpoints and shared prefixes. When none is free, retained state gives one up — checkpoints before prefixes, `agent` before `interactive`, then least recently used; when nothing can, the publish or capture is skipped. `--retained-slots` was replaced by these two and now refuses the start. |
 | `--reuse-retained-interactive-ttl <secs>` | `IGNIS_REUSE_RETAINED_INTERACTIVE_TTL` | `300` | Idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's. Needs `--reuse-prompt on`. |
+
+## The 12 GB class
+
+From 0.11.0 a card below 14 GiB starts on the
+[`rtx-12gb` profile](../concepts/profiles.md#rtx-12gb), which derives the
+27B's budget from 512 MiB of headroom (`vram.qwen38.headroom_bytes`): the
+memory free at the start less 512 MiB, where the larger classes leave
+1,200 MiB and the default 1,536 MiB. The load runs one lane drafting with MTP,
+so the KV pool takes what the weights, the workspace and that lane leave, and
+must hold one 131,072-token context. When it cannot, the load lowers the
+context 32,768 tokens at a time and says so in the plan event's `adapted`:
+`max_context 131072 -> 98304 (adapt_context_step 32768, one lane)`. A card of
+10 or 11 GB is read as the class, and its plan refuses the start after every
+step, naming the bytes it misses.
+
+The plan of a 12 GB load, line by line, is held to the byte on the class's
+own artifact once it is admitted, measured on the RTX 5090 under an explicit
+12 GiB budget (`--profile rtx-12gb --vram-budget-bytes 12884901888`); until
+then the context the class expects is the estimate on
+[its profile](../concepts/profiles.md#rtx-12gb).

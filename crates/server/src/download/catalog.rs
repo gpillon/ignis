@@ -1419,8 +1419,8 @@ mod tests {
             ("bytes: 48211", "bytes: lots", vec![entry, "`bytes`"]),
             // ADR 0064 §1: a card class stated is one of the classes there
             // are.
-            ("card_class: 32", "card_class: 48", vec![entry, "`card_class`", "16, 24, 32, 96", "got 48"]),
-            ("card_class: 32", "card_class: \"32\"", vec![entry, "`card_class`", "16, 24, 32, 96"]),
+            ("card_class: 32", "card_class: 48", vec![entry, "`card_class`", "12, 16, 24, 32, 96", "got 48"]),
+            ("card_class: 32", "card_class: \"32\"", vec![entry, "`card_class`", "12, 16, 24, 32, 96"]),
             ("card_class: 32", "card_class: -16", vec![entry, "`card_class`"]),
             // ADR 0064 §2: an alias is of one family, never the entry's own
             // id.
@@ -1753,6 +1753,26 @@ mod tests {
         let card = on(CardClass::Gb16);
         assert_eq!(Catalog::built_in().answering("ignis-image-2.1-turbo", Some(&card)).map_err(refused), Err(("model_above_card_class", said.to_owned())));
         assert_eq!(Catalog::built_in().refusal_on("ignis-image-2.1-turbo", Some(&card)).map(refused), Some(("model_above_card_class", said.to_owned())));
+    }
+
+    /// Spec #630 (GitHub #637): a card below 14 GiB is of the 12 GB class,
+    /// below every built-in entry's: a 16 GB entry is refused there by name,
+    /// as the larger classes' entries are on a 16 GB card, and so is each id
+    /// a 16 GB entry answers to, until an entry of the 12 GB class does
+    /// (GitHub #638). A start on that card loads an artifact named by its
+    /// path, which the catalog does not judge.
+    #[test]
+    fn on_a_12gb_card_the_16gb_entries_are_above_its_class() {
+        let catalog = Catalog::built_in();
+        let card = on(CardClass::Gb12);
+        let said = "qwen3.8-27b-16g needs a 16 GB card or larger (its catalog entry's card_class), and this card is of the 12 GB class";
+        let refused = |refusal: CardRefusal| (refusal.code(), refusal.to_string());
+        assert_eq!(catalog.answering("qwen3.8-27b-16g", Some(&card)).map_err(refused), Err(("model_above_card_class", said.to_owned())));
+        for id in ["qwen3.8-27b", "qwen3.8-27b-abliterated", "swift-1.5-27b", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b-16g"] {
+            let err = resolved(catalog, id, Some(&card)).unwrap_err();
+            assert!(err.starts_with(id) && err.ends_with("this card is of the 12 GB class"), "{id}: {err}");
+        }
+        assert_eq!(catalog.refusal_on("some-other-model", Some(&card)), None, "an artifact the catalog has no entry for");
     }
 
     /// ADR 0064 §2 on the artifact: the entry that answers to an alias must

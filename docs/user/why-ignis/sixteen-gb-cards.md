@@ -34,7 +34,9 @@ the artifact it stands in for. The DFlash2 drafter is the same.
 
 **A profile chosen by the card** ([ADR 0063](../../adr/0063-the-profile-follows-the-card-class.md)).
 With `--profile auto`, the default, the server reads the card's memory and
-picks `rtx-16gb` under 20 GiB: 262,144 tokens of context, two decode lanes,
+picks `rtx-16gb` from 14 GiB up to 20 GiB (under 20 GiB in 0.10.0; from
+0.11.0 a card under 14 GiB is the 12 GB class, on `rtx-12gb`): 262,144 tokens
+of context, two decode lanes,
 DFlash2 with 7 drafts, vision on at 4,096 tokens an image (the tower and the
 embedding pool sit in pinned host RAM, so with no image in flight vision costs no
 context; `--vision-enabled false` turns it off). The VRAM budget is the card's free memory less the

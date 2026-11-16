@@ -1250,8 +1250,9 @@ The model's native multi-token-prediction head as a drafter
 (`--spec-backend mtp`), its **MTP head**, chosen at load. Flash-Next drafts with
 it (draft window 1..7; a round of several lanes verifies fewer drafts a lane,
 down to none, to stay within the load's row budget, `--spec-draft-rows`).
-The 27B drafts with it as its opt-in second drafter, in place of **DFlash2**
-(#623): draft window 0..7, the **fixed draft** only, DFlash2's own settings
+The 27B drafts with it as its second drafter, in place of **DFlash2** (#623),
+opt-in on every **card class** but the 12 GB one, whose profile defaults to it
+(ADR 0098): draft window 0..7, the **fixed draft** only, DFlash2's own settings
 refused by name where the operator names them, and drafting after images as
 DFlash2 does (#624: its rows rotate at their positions plus the **rope delta**
 and embed an image's column at a placeholder). It saves DFlash2's weights,
@@ -1690,31 +1691,36 @@ refused by name.
 _Avoid_: arch, SM version.
 
 **Card class**:
-The device memory a profile is shaped for: 16 GB (RTX 5060 Ti / 5070 Ti /
-5080, RTX 4060 Ti 16 GB / 4080), 24 GB (RTX 3090, RTX 4090), 32 GB (RTX 5090),
-96 GB (RTX PRO 6000). Memory alone: the **GPU generation** is a separate axis
+The device memory a profile is shaped for, by NVML's total: 12 GB, below
+14 GiB (RTX 5070, RTX 4070 family 12 GB, RTX 3060 12 GB, RTX 3080 Ti; no
+lower bound, a smaller card is read as the class and refused by its plan),
+16 GB, 14 up to 20 GiB (RTX 5060 Ti / 5070 Ti / 5080, RTX 4060 Ti 16 GB /
+4080), 24 GB (RTX 3090, RTX 4090), 32 GB (RTX 5090), 96 GB (RTX PRO 6000)
+(ADR 0063, ADR 0098). Memory alone: the **GPU generation** is a separate axis
 that decides routes, never the class. It decides which artifact, how many
-lanes and what context the profile defaults to.
+lanes, which drafter and what context the profile defaults to.
 _Avoid_: GPU tier.
 
 **Profile**:
 A named bundle of hardware-shaped field defaults (`--profile`, built-in
-`rtx-16gb` (also accepted as `rtx50-16gb`), `rtx-24gb`, `rtx5090` or
-`rtxpro6000`, or a config file's `profiles:`):
+`rtx-12gb`, `rtx-16gb` (also accepted as `rtx50-16gb`), `rtx-24gb`, `rtx5090`
+or `rtxpro6000`, or a config file's `profiles:`):
 below the config file, above the hardcoded defaults — a default, never an
 override. `auto`, the default, picks the built-in profile of the card's **card
-class** from NVML's total memory (ADR 0063); a named profile always wins.
+class** from NVML's total memory (ADR 0063); a named profile always wins. A
+profile may set the ladder's step too: `rtx-12gb` steps 32,768 (ADR 0098).
 
 **Adaptation**:
 A 27B load lowering the values its profile or the hardcoded defaults gave, in a
 fixed order, until its VRAM plan fits (ADR 0063): the drafter's `shortlist`
-head to `full`, then the context down its **ladder**, then one decode lane.
-Only a plan refused below its minimum adapts; one that fits as configured
-changes nothing.
+head to `full`, then the context down its **ladder**, then one decode lane (a
+load at one lane already, as under `rtx-12gb`, has no lane step). Only a plan
+refused below its minimum adapts; one that fits as configured changes nothing.
 
 **Ladder**:
 The contexts an adaptation plans, from the configured one down every multiple
-of the context step (`model.adapt_context_step`, 65,536) to one step, keeping
+of the context step (`model.adapt_context_step`, 65,536; 32,768 under
+`rtx-12gb`) to one step, keeping
 the largest whose KV pool holds one full sequence and a spare reservation
 (`vram.adapt_spare_tokens`, 65,536) at more than one lane.
 _Avoid_: step (bare) for one of its rungs: an adaptation taken is an

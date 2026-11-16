@@ -482,7 +482,9 @@ guide's [Why ignis](https://gpillon.github.io/ignis/why-ignis/) section.
   weight (a repack of a public 3.0 bpw EXL3 quantization), read by dense
   kernels of ignis's own, beside the NVFP4 artifact's token embedding and
   DFlash2 drafter: **12.5 GiB on disk** against 18.1 GiB.
-- **Chosen by the card.** Under `--profile auto` a card under 20 GiB takes
+- **Chosen by the card.** Under `--profile auto` a card from 14 GiB up to
+  20 GiB (under 20 GiB in 0.10.0; from 0.11.0 a card under 14 GiB has a class
+  of its own) takes
   `rtx-16gb` (262,144 tokens of context, two lanes, DFlash2 with 7 drafts,
   no image input), and the default id `qwen3.8-27b` resolves to the 16 GB
   entry. On a 5090 held to a 16 GiB budget the load fits with nothing

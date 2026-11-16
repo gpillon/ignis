@@ -84,11 +84,29 @@ reasoning budget or a JSON schema does to the run the round commits.
 
 From 0.11.0 the 27B drafts with **DFlash2** or with its own **MTP head**, one
 per load, chosen at start with `--spec-backend`; earlier releases refuse
-`--spec-backend mtp` on the 27B. DFlash2 is the default: every built-in
-profile loads it, at 7 draft tokens. MTP is opt-in (`--spec-backend mtp`), for
-the card where DFlash2's memory is what the context lacks. Both are verified
-by the same rounds, so neither changes the text: greedy output is the
-spec-off text up to near-ties, and sampling keeps its distribution.
+`--spec-backend mtp` on the 27B. DFlash2 is the default on every card class
+but the 12 GB one: every built-in profile but `rtx-12gb` loads it, at 7 draft
+tokens. MTP is the 12 GB class's default, from 0.11.0, and opt-in on the
+others (`--spec-backend mtp`), for the card where DFlash2's memory is what the
+context lacks. Both are verified by the same rounds, so neither changes the
+text: greedy output is the spec-off text up to near-ties, and sampling keeps
+its distribution.
+
+Which drafter each [card class](profiles.md#the-built-in-profiles) starts
+with, under `--profile auto`:
+
+| Card class | Profile | The 27B's drafter |
+|---|---|---|
+| 12 GB, below 14 GiB (from 0.11.0) | `rtx-12gb` | MTP, 7 draft tokens: DFlash2's 0.7 GB more is the context there ([ADR 0098](../../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md)) |
+| 16 GB | `rtx-16gb` | DFlash2, 7 draft tokens |
+| 24 GB | `rtx-24gb` | DFlash2, 7 draft tokens |
+| 32 GB | `rtx5090` | DFlash2, 7 draft tokens |
+| 96 GB | `rtxpro6000` | DFlash2, 7 draft tokens |
+
+Either drafter can be named on any class: `--spec-backend mtp` on the larger
+ones, and on `rtx-12gb` `--qwen38-spec-backend dflash2` (at the profile's 7)
+or `--spec-backend dflash2 --spec-draft-tokens N`, where the card has room for
+it.
 
 | | DFlash2 | MTP head |
 |---|---|---|
@@ -163,8 +181,9 @@ one, up to the draft window.
   ([finding](../../findings/2026-11-15-the-27bs-mtp-head-measured-on-the-rtx-5090.md)).
   A window of 0 loads no speculation: the same load as
   `--spec-backend off`, with nothing of the head bound and the same VRAM plan.
-  A window a profile gives beside its own DFlash2 (every built-in profile's 7)
-  is DFlash2's: `--spec-backend mtp` over it takes the head's own default.
+  A window a profile gives beside its own DFlash2 (every built-in profile's 7
+  but `rtx-12gb`'s, which is the head's own) is DFlash2's: `--spec-backend
+  mtp` over it takes the head's own default.
 - **Acceptance.** On a replay of 200 real agent turns, sampled at temperature
   1, the head committed 3.9 tokens a round at 7 draft tokens on both artifacts
   (one is the anchor): its first draft was taken 74% of the time, its seventh
@@ -205,7 +224,7 @@ one, up to the draft window.
   ([the VRAM plan](vram-plan.md)).
 - **When to choose it.** When DFlash2's memory is what your context lacks:
   on a 16 GB card, or on any card whose plan adapts the context down under
-  DFlash2. The head commits as many tokens a round as DFlash2 on agent
+  DFlash2. On a 12 GB card `rtx-12gb` chooses it for you. The head commits as many tokens a round as DFlash2 on agent
   traffic and far more tokens a second than no speculation, for about 0.8 to
   1 GB less than DFlash2. Where DFlash2 fits at the context you need, it stays
   the default; the two drafters' decode rates against each other were not

@@ -1,0 +1,59 @@
+---
+status: proposed
+amends: [ADR-0063, ADR-0064]
+---
+
+# The 12 GB card class serves the 27B from a recipe of our own under a byte ceiling, on one lane, drafting with MTP
+
+A 12 GB card was the 16 GB class's (ADR 0063: every total below 20 GiB), and the 16 GB entry does not fit it: one
+lane of that artifact holds 12,218,298,952 bytes before its KV pool, and `rtx-16gb`'s headroom alone is 1.26 GB.
+The 27B stays the model: the family has no smaller sibling (checked 2026-11-15), and on the one public harness that
+runs agent tasks below 3 bits per weight the loss grows with the task's length and steps down between 8.0 and 9.2 GB
+of weights, while single-turn code barely moves
+([the online research](../findings/2026-11-15-the-12-gb-card-class-online-research.md)). The owner's grill of
+2026-11-15 (spec GitHub #630) decided:
+
+- **A card class of its own.** A card whose NVML total is below 14 GiB is the 12 GB class (a 12 GB card reads about
+  11.9 GiB), with its profile, `rtx-12gb`, which `--profile auto` picks there, and its catalog entry,
+  `qwen3.8-27b-12g` (`card_class: 12`), which answers to `qwen3.8-27b` there. The 16 GB class becomes 14 GiB up to
+  20 GiB; the larger classes do not move. The class is memory alone, as every class: an RTX 5070, a 12 GB RTX 4070
+  family card, an RTX 3060 12 GB or an RTX 3080 Ti are one class, and the GPU generation decides routes. It has no
+  lower bound: a card of 10 or 11 GB is read as the class and refused by its plan, which names the bytes it misses.
+- **A recipe of our own, bound by bytes.** The body is trellis at integer K 2 to 5 with a 4-bit head, the classes
+  the load binds today, under a ceiling of 9.2 GB of text-scope device weights; its bits per weight, about 2.8, are
+  what that leaves. No public quant between 2.2 and 3.0 bits binds with those classes. The artifact keeps the DFlash2
+  module and the 8-bit MTP head.
+- **MTP is this class's default drafter**
+  ([ADR 0095](0095-the-27b-has-two-drafters-and-its-mtp-head-keeps-attention-state-over-the-whole-context-and-a-continuation-hidden.md),
+  at the window #628 measured, 7), where every other class drafts with DFlash2: DFlash2 holds about 0.7 GB more,
+  which on this card is the context.
+- **The profile is sized for a desktop on the card, one user**: one decode lane, a context of 131,072 that adapts in
+  steps of 32,768 (`model.adapt_context_step`; 65,536 elsewhere), `vram.qwen38.headroom_bytes` 512M (1200M
+  elsewhere), a 512-token prefill chunk with the solo width at the chunk, vision on in host memory at 4,096 tokens.
+  Every value is a default the load adapts and the operator overrides; two lanes, a 256-token chunk and DFlash2 stay
+  configuration choices.
+- **The gate's three legs are measured and reported, and the owner admits the artifact on the numbers** (ADR 0082: a
+  failing leg stops the work and the owner decides). The limit a re-quantization of the 16 GB body has registered is
+  0.0484; the 16 GB body reads 0.0403 and the estimate for this recipe is about 0.056.
+
+## Considered Options
+
+- **A smaller quant to pay for a second lane.** A lane costs about 0.87 GB, 0.28 bits per weight of the body, and
+  lands the recipe where long agent tasks give way.
+- **Kernels for another weight format.** On that harness a 9.2 GB file of the other format and the 9.85 GB trellis
+  score the same within noise: the per-tensor allocation is what pays, and it translates to K.
+- **Flash-Next on the 12 GB card.** More per byte of VRAM on agent suites, at 48 to 64 GB of host memory and under a
+  licence that restricts commercial serving. A later phase.
+- **Keeping the class inside the 16 GB class and adapting.** The class decides the artifact (ADR 0064), and no
+  adaptation changes an artifact.
+- **The 65,536-token step of the other classes.** A desktop that leaves room for about 100,000 tokens would get
+  65,536; with 32,768 it gets 98,304.
+- **The 1200M headroom of the other classes.** With it no context is left: 512M is a choice, not a placeholder.
+
+## Consequences
+
+- The headroom and the context are the RTX 5090's simulation, under an explicit 12 GiB budget and that less 1 GiB,
+  until a 12 GB card reads its CUDA context, its residual at one lane and its speed.
+- Until the class's catalog entry lands, every built-in entry is above the class: a 12 GB card is refused each of
+  them by name before a fetch or a teardown, and loads an artifact named by its path.
+- A limit above 0.0484 for this class, if the owner admits one, is registered in the spec that admits it.

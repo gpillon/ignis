@@ -228,8 +228,8 @@ pub fn models() -> String {
 /// The cards the guide names (`docs/user/start/index.md`, What it runs on),
 /// one column each of the models page's table: their names, their GPU
 /// generation and card class. How far each is verified stays on that page
-/// alone. A card of no column gets none because the catalog alone would not
-/// refuse it (a 12 GB card reads as the 16 GB class), only the VRAM plan would.
+/// alone. The 12 GB class has no column until the catalog holds an entry of
+/// its class (GitHub #638): until then every built-in entry is above it.
 const CARDS: [(&str, GpuGeneration, CardClass); 6] = [
     ("RTX PRO 6000", GpuGeneration::Blackwell, CardClass::Gb96),
     ("RTX 5090", GpuGeneration::Blackwell, CardClass::Gb32),
@@ -686,7 +686,8 @@ mod tests {
         let page = profiles();
         assert!(page.contains("[Where each model loads](models.md#where-each-model-loads)"), "{page}");
         assert!(page.contains("## rtx-24gb\n\n`--profile auto` picks it on a card of the 24 GB class: a total memory from 20 to under 28 GiB.\n"), "{page}");
-        assert!(page.contains("## rtx-16gb\n\n`--profile auto` picks it on a card of the 16 GB class: a total memory below 20 GiB.\n"), "{page}");
+        assert!(page.contains("## rtx-12gb\n\n`--profile auto` picks it on a card of the 12 GB class: a total memory below 14 GiB.\n"), "{page}");
+        assert!(page.contains("## rtx-16gb\n\n`--profile auto` picks it on a card of the 16 GB class: a total memory from 14 to under 20 GiB.\n"), "{page}");
         assert!(page.contains("## rtx5090\n\n`--profile auto` picks it on a card of the 32 GB class: a total memory from 28 to 40 GiB.\n"), "{page}");
         assert!(page.contains("## rtxpro6000\n\n`--profile auto` picks it on a card of the 96 GB class: a total memory from 88 to 104 GiB.\n"), "{page}");
     }

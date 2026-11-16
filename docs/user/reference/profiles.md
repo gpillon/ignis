@@ -17,9 +17,27 @@ A profile is a layer of defaults for one kind of card, between the config file a
 
 A profile follows the card's memory, not its generation, and what a card loads follows from both: [Where each model loads](models.md#where-each-model-loads) gives each built-in model on each card ignis runs on ([What it runs on](../start/index.md#what-it-runs-on)).
 
+## rtx-12gb
+
+`--profile auto` picks it on a card of the 12 GB class: a total memory below 14 GiB.
+
+| Field | Model | Value |
+|---|---|---|
+| [`model.adapt_context_step`](configuration.md#modeladapt_context_step) | every model | `32768` |
+| [`model.max_context`](configuration.md#modelmax_context) | Qwen3.8-27B | `131072` |
+| [`model.prefill_chunk`](configuration.md#modelprefill_chunk) | Qwen3.8-27B | `512` |
+| [`model.prefill_chunk_solo`](configuration.md#modelprefill_chunk_solo) | Qwen3.8-27B | `512` |
+| [`spec.backend`](configuration.md#specbackend) | Qwen3.8-27B | `mtp` |
+| [`spec.decode_lanes`](configuration.md#specdecode_lanes) | Qwen3.8-27B | `1` |
+| [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-27B | `7` |
+| [`vision.enabled`](configuration.md#visionenabled) | Qwen3.8-27B | `true` |
+| [`vision.max_tokens`](configuration.md#visionmax_tokens) | every model | `4096` |
+| [`vision.residency`](configuration.md#visionresidency) | every model | `host` |
+| [`vram.headroom_bytes`](configuration.md#vramheadroom_bytes) | Qwen3.8-27B | `512M` |
+
 ## rtx-16gb
 
-`--profile auto` picks it on a card of the 16 GB class: a total memory below 20 GiB.
+`--profile auto` picks it on a card of the 16 GB class: a total memory from 14 to under 20 GiB.
 
 | Field | Model | Value |
 |---|---|---|

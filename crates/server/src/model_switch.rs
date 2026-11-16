@@ -2319,7 +2319,7 @@ mod tests {
     /// file before the `202` (155f6304; `start_load`'s switch to a FIFO).
     #[test]
     fn the_placeholder_start_carries_no_vision_to_a_switch() {
-        for profile in ["none", "rtx5090", "rtxpro6000", "rtx-16gb", "rtx-24gb"] {
+        for profile in ["none", "rtx5090", "rtxpro6000", "rtx-12gb", "rtx-16gb", "rtx-24gb"] {
             let args: Vec<String> = ["--profile", profile].map(String::from).to_vec();
             let crate::config::ConfigOutcome::Config(placeholder) = crate::config::resolve(&args, |_| None).unwrap() else { panic!("a config") };
             assert_eq!(placeholder.basis.family(), None, "{profile}");
