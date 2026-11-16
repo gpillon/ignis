@@ -61,6 +61,17 @@ def test_the_12gb_classs_first_candidate_is_the_optimizers_recipe_converted_as_s
     assert r["files"] == {n: sc30["files"][n] for n in ("cal_trace.safetensors", "quantization_config.json")}
 
 
+def test_the_12gb_classs_second_candidate_is_the_gguf_allocation_converted_as_sc30s():
+    r, sc30 = recipe.load("ig28b"), recipe.load(recipe.DEFAULT)
+    assert (r["name"], r["weights_id"], r["ceiling_bytes"]) == ("ig28b", "trellis-ig28b", 9_200_000_000)
+    # gguf_recipe.py on Qwen3.8-27B-UD-Q2_K_XL.gguf at 4af51b35: K2 106, K3 226, K4 46, K5 22 over the body, the head at K4
+    assert sorted(r["tensors"]) == sorted(sc30["tensors"])
+    assert collections.Counter(r["tensors"].values()) == {2: 106, 3: 226, 4: 46, 5: 22}
+    assert r["quantization_config"] == dict(sc30["quantization_config"], bits=2.79)
+    assert r["job"] == sc30["job"]
+    assert r["files"] == {n: sc30["files"][n] for n in ("cal_trace.safetensors", "quantization_config.json")}
+
+
 def _named(tmp_path, change=None, name="mine"):
     """A recipe `name` in a recipes directory of its own: two body matrices, the head at 4, one pin."""
     data = {"schema": recipe.SCHEMA, "weights_id": "trellis-mine", "ceiling_bytes": 1 << 30,
