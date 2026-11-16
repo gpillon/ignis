@@ -459,12 +459,12 @@ each route request's `spec.*` against the engine's run of the same prompt and
 `/metrics`; a `json_schema` answer that drafts and a request at the API's
 defaults; the thinking budget's forced close and the loop guard (tuned to act
 on any reasoning) on the MTP load and on the window-0 load alike (spec #618,
-story 14); then a pool at its floor (one context, a page per retained slot, a page a lane and a
-retained slot for the head's holders), where an Agent request goes through
-KV-RAM for an Interactive request reserving the whole context, first on the
-load because retained state would stand in the room, and eight siblings share
-a system prompt, one a lane. Its own binary: the request log is the process's
-global subscriber.
+story 14); then a pool at its floor (one context, a page per retained slot, a
+page a lane and a retained slot for the head's holders), where an Agent request
+goes through KV-RAM for an Interactive request reserving the whole context,
+first on the load because retained state would stand in the room, and eight
+siblings share a system prompt, one a lane. Its own binary: the request log is
+the process's global subscriber.
 
 **The verify round's rope delta is a deliberate departure from the reference.**
 The reference's DFlash2 round passes its proposal positions for both the cache
