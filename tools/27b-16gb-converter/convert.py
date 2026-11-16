@@ -8,6 +8,10 @@ writes the container.
 
 - The body and the output head are the public quant's trellis records, repacked bit for bit
   (`exl3.py`); everything else is the served artifact's object, byte for byte (`plan.py`).
+- The quant is its recipe's (`--recipe`, `recipe.py`; the 16 GB artifact's, `sc30`, by default): its
+  configuration, every matrix at the recipe's K, the text scope's device weights within the recipe's
+  ceiling, its files by the recipe's pins; the record names the recipe, and its weights id is the
+  artifact's unless `--weights-id` names another. All of it is checked before the GPU step.
 - The source is pinned: the quant's repository, branch and revision (from its Hugging Face
   download metadata), every file the converter reads by sha256, each shard's checked against its
   LFS oid; the served artifact and its graft sidecar by sha256.
@@ -29,7 +33,7 @@ abliterated 16 GB artifact against the default one, GitHub #422): the same direc
 identity, every payload the baseline's bit for bit but the override's records, which differ. It
 prints VERIFY PASS or VERIFY FAILED (exit 3).
 
-  python convert.py run --served S.ninfer --quant DIR --bf16 DIR --work DIR [--skip-errors]
+  python convert.py run --served S.ninfer --quant DIR --bf16 DIR --work DIR [--recipe NAME] [--skip-errors]
   python convert.py verify --artifact A.ninfer --served S.ninfer --quant DIR [--baseline B.ninfer] [--report R.json]
 """
 import argparse
@@ -45,6 +49,7 @@ import container
 import exl3
 import override as override_mod
 import plan
+import recipe as recipe_mod
 import reconstruction
 import work
 
@@ -72,8 +77,8 @@ EXIT_REFUSED = 2
 EXIT_VERIFY_FAILED = 3
 
 
-class Refused(Exception):
-    """A conversion that must not produce a work tree."""
+# A conversion that must not produce a work tree (a recipe's refusals are the same exception).
+Refused = recipe_mod.Refused
 
 
 def download_record(root, name):
@@ -128,11 +133,17 @@ def read_pins(path, root, names):
         raise Refused(f"the quant's pins {path} cannot be read: {e}")
     if not isinstance(files, dict):
         raise Refused(f"{path} has no `files`: the quant's files cannot be pinned")
+    return pins_of(files, path, root, names)
+
+
+def pins_of(files, source, root, names):
+    """{name: {bytes, sha256}}: each file of `names` under `root` by its pin in `files` (a pins file's or a
+    recipe's, `source` names it), which it must have, and of its size. Refused names the file."""
     out = {}
     for name in names:
         pin = files.get(name)
         if not isinstance(pin, dict) or not isinstance(pin.get("bytes"), int) or not isinstance(pin.get("sha256"), str):
-            raise Refused(f"{name}: {path} gives no bytes and sha256 for it")
+            raise Refused(f"{name}: {source} gives no bytes and sha256 for it")
         file = os.path.join(root, name)
         if not os.path.isfile(file):
             raise Refused(f"{name} is pinned, and missing from {root}")
@@ -170,8 +181,10 @@ def bf16_shards(bf16_root):
         return sorted(set(json.load(f)["weight_map"].values()))
 
 
-def check_quant_config(config):
-    for k, v in QUANT_CONFIG.items():
+def check_quant_config(config, want=QUANT_CONFIG):
+    """Refused unless the quant's quantization_config.json `config` states every field of `want` (a
+    recipe's `quantization_config`; the 16 GB artifact's by default)."""
+    for k, v in want.items():
         if config.get(k) != v:
             raise Refused(f"the quant's quantization_config.json has {k} = {config.get(k)!r}, not {v!r}")
 
@@ -236,13 +249,17 @@ def versions():
 
 def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, error_bound=reconstruction.ERROR_BOUND,
             errors_fn=None, log=print, override=None, weights_id=None, served_weights_id=None, labels=None,
-            quant_pins=None):
+            quant_pins=None, recipe=None):
     """Writes the work tree `out_work`; returns the converter.json record. Raises Refused.
     `override` (an `override.Override`) swaps its records for the quant's of the same name;
     `served_weights_id` is the served artifact's when it is not the vanilla one (a fine-tune's);
     `labels` replaces some of `LABELS`; `quant_pins` (a path) pins a quant converted locally, in
-    place of its download record (`read_pins`)."""
+    place of its download record (`read_pins`) and its recipe's pins. `recipe` (`recipe.load`'s, the
+    16 GB artifact's by default) is what the quant must be: its configuration, every matrix at its K,
+    its files by their pins, the text scope's device weights within its ceiling; its weights id is
+    the artifact's unless `weights_id` names another."""
     t0 = time.time()
+    named = recipe if recipe is not None else recipe_mod.load(recipe_mod.DEFAULT)
     given = labels or {}
     unknown = sorted(set(given) - set(LABELS))
     if unknown:
@@ -264,20 +281,29 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
     with open(sidecar_path, encoding="utf-8") as f:
         sidecar = json.load(f)
     quant = exl3.Quant(quant_root)
-    check_quant_config(quant.config)
+    check_quant_config(quant.config, named["quantization_config"])
 
     matrices, unused = text_matrices(quant)
+    problems = recipe_mod.mismatches(named, {key: m.k2 / 2 for key, m in matrices.items()})
+    if problems:
+        raise Refused(f"the quant is not the recipe {named['name']}'s:\n  " + "\n  ".join(problems))
     if override is not None:
         refuse_override(override, matrices)
     objects, dropped = plan.plan(served.objects, matrices)
+    held = {key: {"K": recipe_mod.rate(m.k2 / 2), "shape": m.shape} for key, m in matrices.items()}
+    text_bytes = recipe_mod.text_scope_bytes(held, {p.name: served.by_name[p.copy]["bytes"]
+                                                    for p in objects if p.copy is not None})
+    recipe_mod.check_ceiling(named, text_bytes)
     log(f"plan: {len(objects)} objects ({sum(p.key is not None for p in objects)} trellis), "
-        f"{len(dropped)} served objects dropped, {len(unused)} quant matrices unused")
+        f"{len(dropped)} served objects dropped, {len(unused)} quant matrices unused; the recipe "
+        f"{named['name']}: {recipe_mod.bpw(held)} bpw, text scope {text_bytes:,} bytes of {named['ceiling_bytes']:,}")
 
-    # The revisions are read before the GPU step; the hashes (~33 GB, ~88 GB with the BF16
-    # reference) run beside it.
+    # The revisions are read and the quant's files hashed before the GPU step; the other hashes
+    # (~20 GB, ~75 GB with the BF16 reference) run beside it.
     quant_files = list(quant.shards) + list(QUANT_META)
     if quant_pins is None:
-        quant_revision, pins = revision_of(quant_root, quant_files, "the quant"), None
+        quant_revision = revision_of(quant_root, quant_files, "the quant")
+        pins = pins_of(named["files"], f"the recipe {named['name']}", quant_root, quant_files)
     else:
         # A local conversion has no hub revision: its pins stand for the download record.
         quant_revision, pins = None, read_pins(quant_pins, quant_root, quant_files)
@@ -301,14 +327,15 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
         bf16_digests = digests(bf16_root, bf16_files)
         ov_digests = digests(override.root, ov_files) if override is not None else {}
         served_digest = pool.submit(work.file_digest, served_path)
+        if quant_pins is None:
+            pin_files(quant_root, quant_digests, set(quant.shards))
+        pinned = pin_against(quant_root, quant_digests, pins)
         if skip_errors:
             rel = None
         else:
             # The override's matrices are measured against its own reference BF16.
             extra = {} if override is None else {"override": override}
             rel = (errors_fn or reconstruction.rel_errors)(quant, bf16_root, objects, log=log, **extra)
-        pinned = (pin_files(quant_root, quant_digests, set(quant.shards)) if pins is None
-                  else pin_against(quant_root, quant_digests, pins))
         bf16_pinned = pin_files(bf16_root, bf16_digests, set(bf16_files) - {INDEX})
         if override is not None:
             ov_pinned = pin_local(override.root, ov_digests)
@@ -367,13 +394,14 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
     record = {
         "schema": SCHEMA,
         "status": "dry-run" if skip_errors else "complete",
-        "identity": identity_of(weights_id),
+        "identity": identity_of(named["weights_id"] if weights_id is None else weights_id),
+        "recipe": recipe_mod.record(named, held, text_bytes),
         "source": {
             "repo": labels["quant_repo"],
             "branch": labels["quant_branch"],
             "revision": quant_revision,
             "license": labels["license"],
-            "quantization_config": {k: quant.config.get(k) for k in QUANT_CONFIG},
+            "quantization_config": {k: quant.config.get(k) for k in named["quantization_config"]},
             "files": pinned,
             # A local conversion: the pins its files were checked against.
             **({} if quant_pins is None else {"pins": {"file": os.path.basename(quant_pins),
@@ -555,7 +583,9 @@ def override_of(a):
     return load_override(a.override, a.override_bf16)
 
 
-def main(argv=None):
+def main(argv=None, recipes=None, errors_fn=None):
+    """The command line; `recipes` is where `--recipe` is looked up (default `recipe.RECIPES`) and
+    `errors_fn` stands in for the GPU step, both for the tests."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
     r = sub.add_parser("run", help="write the packer's work tree and converter.json")
@@ -569,8 +599,11 @@ def main(argv=None):
                                         "bytes and sha256, in place of its download record")
     r.add_argument("--bf16", required=True, help="the BF16 checkpoint the reconstruction errors are measured against")
     r.add_argument("--work", required=True, help="the work tree to write (absent or empty)")
+    r.add_argument("--recipe", default=recipe_mod.DEFAULT, help="the recipe the quant is, by name: recipes/<name>.json "
+                                                                "(default %(default)s, the 16 GB artifact's)")
     add_override_arguments(r)
-    r.add_argument("--weights-id", help="the weights id of a variant (default %s)" % IDENTITY["weights_id"])
+    r.add_argument("--weights-id", help="the weights id of a variant (default the recipe's, %s for %s)"
+                                        % (IDENTITY["weights_id"], recipe_mod.DEFAULT))
     r.add_argument("--skip-errors", action="store_true", help="skip the GPU step: a dry-run tree")
     r.add_argument("--error-bound", type=float, default=reconstruction.ERROR_BOUND,
                    help="the largest relative reconstruction error (default %(default)s; above it is a layout error)")
@@ -591,9 +624,10 @@ def main(argv=None):
     if a.command == "run":
         try:
             labels = {k: getattr(a, k) for k in LABELS if getattr(a, k) is not None}
+            named = recipe_mod.load(a.recipe, recipes)
             convert(a.served, a.quant, a.bf16, a.work, skip_errors=a.skip_errors, error_bound=a.error_bound, log=log,
                     override=override_of(a), weights_id=a.weights_id, served_weights_id=a.served_weights_id,
-                    labels=labels, quant_pins=a.quant_pins)
+                    labels=labels, quant_pins=a.quant_pins, recipe=named, errors_fn=errors_fn)
         except Refused as e:
             print(f"REFUSED: {e}", flush=True)
             return EXIT_REFUSED

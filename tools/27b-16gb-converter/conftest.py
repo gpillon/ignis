@@ -140,9 +140,9 @@ def served_objects(rng):
     return objs
 
 
-def make_sources(root, seed=338):
-    """Writes the served artifact (+ graft sidecar), the quant and a BF16 index under `root`;
-    returns their paths."""
+def make_sources(root, seed=338, recipes=None):
+    """Writes the served artifact (+ graft sidecar), the quant and a BF16 index under `root`, and the
+    quant's recipe `sc30` in `recipes` (default `<root>/recipes`); returns their paths."""
     rng = random.Random(seed)
     served = os.path.join(root, "served", "qwen3_8_27b_nvfp4full-v2.ninfer")
     os.makedirs(os.path.dirname(served))
@@ -188,7 +188,43 @@ def make_sources(root, seed=338):
         json.dump({"weight_map": {"lm_head.weight": "model-00001-of-00001.safetensors"}}, f)
     download_records(bf16, ["model-00001-of-00001.safetensors", "model.safetensors.index.json"],
                      {"model-00001-of-00001.safetensors"}, BF16_REVISION)
-    return {"served": served, "quant": quant, "bf16": bf16}
+    # The default recipe, `sc30`, of the reduced quant: its K and its files' pins (GitHub #631).
+    recipes = recipes or os.path.join(root, "recipes")
+    write_recipe(os.path.join(recipes, "sc30.json"), files=pin_dir(quant))
+    return {"served": served, "quant": quant, "bf16": bf16, "recipes": recipes}
+
+
+def body_k():
+    """The reduced quant's body, each matrix at its K, from the tables above."""
+    return {f"model.language_model.layers.{i}.{module}": k2 // 2
+            for i in range(LAYERS) for module, _, _, k2 in (GQA if (i + 1) % 4 == 0 else GDN) + MLP}
+
+
+def pin_dir(*roots):
+    """{name: {bytes, sha256}} of every file directly under each of `roots` (a later root's file wins)."""
+    out = {}
+    for root in roots:
+        for name in sorted(os.listdir(root)):
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                with open(path, "rb") as f:
+                    out[name] = {"bytes": os.path.getsize(path), "sha256": hashlib.sha256(f.read()).hexdigest()}
+    return out
+
+
+def write_recipe(path, **fields):
+    """A recipe file (`recipe.load`'s): the reduced quant's K, the head at 4, today's configuration, a
+    ceiling of 1 GiB, exllamav3's job; `fields` replace any of them."""
+    data = {"schema": "qwen3.8-27b-trellis-recipe-v1", "weights_id": "trellis-sc30", "ceiling_bytes": 1 << 30,
+            "quantization_config": {"quant_method": "exl3", "codebook": "mul1", "out_scales": "always", "bits": 3.0,
+                                    "head_bits": 4},
+            "job": {"mtp_bits": 3, "calibration": {"rows": 250, "cols": 2048}},
+            "tensors": body_k(), "files": {}}
+    data.update(fields)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(data, f)
+    return path
 
 
 def download_records(root, names, lfs, revision):

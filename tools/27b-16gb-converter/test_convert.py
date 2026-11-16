@@ -1,12 +1,14 @@
 import hashlib
 import json
 import os
+import re
 
 import pytest
 
 import container
 import convert
 import exl3
+import recipe
 from conftest import BF16_REVISION, REVISION, make_sources, write_container
 
 
@@ -18,6 +20,7 @@ def _errors(value=0.25):
 
 def _run(src, out, **kw):
     kw.setdefault("errors_fn", _errors())
+    kw.setdefault("recipe", recipe.load(recipe.DEFAULT, src["recipes"]))
     return convert.convert(src["served"], src["quant"], src["bf16"], out, log=lambda _: None, **kw)
 
 
@@ -377,7 +380,7 @@ def test_both_commands_refuse_an_override_they_cannot_load_alike(tmp_path, capsy
                    "--quant", src["quant"], "--override", ov["override"]],
     }
     for name, argv in commands.items():
-        assert convert.main(argv) == convert.EXIT_REFUSED, name
+        assert convert.main(argv, recipes=src["recipes"]) == convert.EXIT_REFUSED, name
         said = capsys.readouterr().out
         assert said.startswith(f"REFUSED: the override: {ov['override']} has no replay.json"), (name, said)
     assert not (tmp_path / "work").exists()
@@ -606,7 +609,8 @@ TODAY_DONE = {"frontend": "a6633fda050f6f1ecd5efe4102de8db54cf5423c9d6a09bcd5816
 
 
 def _record_digest(record):
-    pinned = {k: v for k, v in record.items() if k not in ("converter", "versions")}
+    # the named recipe's block (#631) is new beside them: every other field is as before
+    pinned = {k: v for k, v in record.items() if k not in ("converter", "versions", "recipe")}
     return hashlib.sha256(json.dumps(pinned, sort_keys=True).encode()).hexdigest()
 
 
@@ -617,8 +621,8 @@ def test_without_the_fine_tune_arguments_the_work_tree_and_the_record_are_todays
     assert {unit: _sha(os.path.join(work, unit, "DONE")) for unit in UNITS} == TODAY_DONE
     assert _record_digest(record) == TODAY_RECORD
     assert sorted(record) == ["converter", "copied", "dropped", "graft", "identity", "local_nvfp4", "objects",
-                              "quant_unused", "reference", "schema", "served", "source", "status", "trellis",
-                              "versions"]
+                              "quant_unused", "recipe", "reference", "schema", "served", "source", "status",
+                              "trellis", "versions"]
     assert sorted(record["served"]) == ["bytes", "file", "graft_sidecar", "identity", "sha256"]
     assert record["served"]["identity"] == {"model_id": "qwen3.8-27b", "weights_id": "nvfp4full"}
     s = record["source"]
@@ -775,7 +779,7 @@ def test_the_fine_tune_route_runs_and_verifies_from_the_command_line(tmp_path, c
                          "--work", work, "--served-weights-id", FINE_TUNE_SERVED, "--quant-pins", pins,
                          "--license", LABELS["license"], "--quant-repo", LABELS["quant_repo"],
                          "--quant-branch", LABELS["quant_branch"], "--bf16-repo", LABELS["bf16_repo"],
-                         "--weights-id", "trellis-sc30-swift-1.5", "--skip-errors"])
+                         "--weights-id", "trellis-sc30-swift-1.5", "--skip-errors"], recipes=src["recipes"])
     assert code == 0, capsys.readouterr().out
     record = _json(os.path.join(work, "converter.json"))
     assert record["identity"] == {"model_id": "qwen3.8-27b", "weights_id": "trellis-sc30-swift-1.5"}
@@ -794,3 +798,100 @@ def test_the_fine_tune_route_runs_and_verifies_from_the_command_line(tmp_path, c
     ok, report = convert.verify(artifact, vanilla, src["quant"], log=lambda _: None, weights_id="trellis-sc30-swift-1.5")
     assert not ok and report["problems"] and all("sha256 differs from the served object's" in p
                                                  for p in report["problems"])
+
+
+# --- a named recipe (#631) ---
+
+from conftest import body_k, download_records, pin_dir, write_recipe  # noqa: E402
+
+P = "model.language_model.layers."
+# What a third-party quant at 2.5 bits states (#632's): output scales "auto", MTP at 4, exllamav3 1.6.0.
+TANDEM = {"quant_method": "exl3", "version": "1.6.0", "bits": 2.5, "head_bits": 4, "out_scales": "auto",
+          "codebook": "mul1", "mtp_bits": 4, "calibration": {"rows": 250, "cols": 2048}}
+STATED = ("quant_method", "codebook", "out_scales", "bits", "head_bits")
+
+
+def _argv(src, work, *extra):
+    return ["run", "--served", src["served"], "--quant", src["quant"], "--bf16", src["bf16"], "--work", work, *extra]
+
+
+def test_a_named_recipe_converts_its_quant_under_its_own_weights_id_and_the_record_names_it(tmp_path, capsys):
+    src = make_sources(str(tmp_path))
+    with open(os.path.join(src["quant"], "quantization_config.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(TANDEM, f)
+    download_records(src["quant"], ["quantization_config.json"], set(), REVISION)
+    path = write_recipe(os.path.join(src["recipes"], "tandem25.json"), weights_id="trellis-tandem25", job=None,
+                        quantization_config={k: TANDEM[k] for k in STATED}, files=pin_dir(src["quant"]))
+    work = str(tmp_path / "work")
+    # the default recipe, the 16 GB artifact's, refuses it as the converter always has
+    assert convert.main(_argv(src, work, "--skip-errors"), recipes=src["recipes"]) == convert.EXIT_REFUSED
+    assert "REFUSED: the quant's quantization_config.json has out_scales = 'auto', not 'always'" in capsys.readouterr().out
+    assert convert.main(_argv(src, work, "--skip-errors", "--recipe", "tandem25"), recipes=src["recipes"]) == 0
+    record = _json(os.path.join(work, "converter.json"))
+    assert record["identity"] == {"model_id": "qwen3.8-27b", "weights_id": "trellis-tandem25"}
+    assert (record["recipe"]["name"], record["recipe"]["sha256"]) == ("tandem25", _sha(path))
+    assert record["source"]["quantization_config"] == {k: TANDEM[k] for k in STATED}
+    # the work tree is the default recipe's: the same records, the same objects
+    assert {unit: _sha(os.path.join(work, unit, "DONE")) for unit in UNITS} == TODAY_DONE
+
+
+def test_the_record_names_the_recipe_its_ceiling_and_its_bits_per_weight(tmp_path):
+    src = make_sources(str(tmp_path))
+    work = str(tmp_path / "work")
+    record = _run(src, work)
+    artifact = str(tmp_path / "a.ninfer")
+    pack(work, artifact)
+    # the text scope's device weights: the artifact's text objects but the token embedding (host memory)
+    # and the draft head (not bound with the text scope)
+    text = sum(o["bytes"] for o in container.Container(artifact).objects if o["name"].startswith("text/")
+               and o["name"] not in ("text/token_embedding", "text/draft_head", "text/draft_head_token_ids"))
+    # the body's bits per weight: three GDN layers at 475,136 bits and the GQA layer's 540,672 over
+    # 671,744 weights, 120/41; the head apart, as exllamav3 counts its `bits`
+    assert record["recipe"] == {"name": "sc30", "sha256": _sha(os.path.join(src["recipes"], "sc30.json")),
+                                "ceiling_bytes": 1 << 30, "text_scope_bytes": text, "bpw": 2.9268}
+
+
+def _pins(src, change):
+    pins = pin_dir(src["quant"])
+    change(pins)
+    return pins
+
+
+@pytest.mark.parametrize("fields,message", [
+    (lambda src: {"tensors": body_k() | {P + "0.mlp.down_proj": 1}}, P + r"0\.mlp\.down_proj: K 1, outside 2 to 5"),
+    (lambda src: {"tensors": body_k() | {P + "0.mlp.down_proj": 6}}, P + r"0\.mlp\.down_proj: K 6, outside 2 to 5"),
+    (lambda src: {"tensors": body_k() | {P + "0.mlp.down_proj": 2.5}}, P + r"0\.mlp\.down_proj: K 2\.5, a fractional K"),
+    (lambda src: {"quantization_config": dict(convert.QUANT_CONFIG, head_bits=6)}, r"the head at 6 bits"),
+    (lambda src: {"files": _pins(src, lambda p: p.pop("config.json"))},
+     r"config\.json: the recipe sc30 gives no bytes and sha256 for it"),
+    (lambda src: {"files": _pins(src, lambda p: p["config.json"].update(bytes=1))}, r"config\.json is \d+ bytes, its pin is 1$"),
+    (lambda src: {"files": _pins(src, lambda p: p["model-00002-of-00002.safetensors"].update(sha256="0" * 64))},
+     r"model-00002-of-00002\.safetensors hashes to [0-9a-f]{64}, its pin is 0{64}$"),
+    (lambda src: {"tensors": body_k() | {P + "0.mlp.down_proj": 2}},
+     P + r"0\.mlp\.down_proj: K 3, the recipe's is 2$"),
+    (lambda src: {"tensors": {k: v for k, v in body_k().items() if k != P + "3.self_attn.k_proj"}},
+     P + r"3\.self_attn\.k_proj: in the quant, not in the recipe$"),
+    (lambda src: {"tensors": body_k() | {P + "4.mlp.down_proj": 3}}, P + r"4\.mlp\.down_proj: in the recipe, not in the quant$"),
+])
+def test_a_recipe_the_conversion_cannot_take_is_refused_before_the_gpu_naming_its_cause(tmp_path, capsys, fields, message):
+    src = make_sources(str(tmp_path))
+    write_recipe(os.path.join(src["recipes"], "sc30.json"), **({"files": pin_dir(src["quant"])} | fields(src)))
+    work = tmp_path / "work"
+    assert convert.main(_argv(src, str(work)), recipes=src["recipes"], errors_fn=_never) == convert.EXIT_REFUSED
+    said = capsys.readouterr().out
+    assert "REFUSED: " in said and re.search(message, said[said.index("REFUSED: "):], re.M), said
+    assert not work.exists()
+
+
+def test_text_scope_bytes_above_the_recipes_ceiling_are_refused_before_the_gpu(tmp_path, capsys):
+    src = make_sources(str(tmp_path))
+    text = _run(src, str(tmp_path / "dry"), skip_errors=True, errors_fn=None)["recipe"]["text_scope_bytes"]
+    work = str(tmp_path / "work")
+    write_recipe(os.path.join(src["recipes"], "sc30.json"), files=pin_dir(src["quant"]), ceiling_bytes=text - 1)
+    assert convert.main(_argv(src, work), recipes=src["recipes"], errors_fn=_never) == convert.EXIT_REFUSED
+    assert (f"REFUSED: the text scope's device weights are {text:,} bytes, above the recipe sc30's ceiling of "
+            f"{text - 1:,}") in capsys.readouterr().out
+    assert not os.path.exists(work)
+    # at the ceiling, the conversion runs
+    write_recipe(os.path.join(src["recipes"], "sc30.json"), files=pin_dir(src["quant"]), ceiling_bytes=text)
+    assert convert.main(_argv(src, work), recipes=src["recipes"], errors_fn=_errors()) == 0

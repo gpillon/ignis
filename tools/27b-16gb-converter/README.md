@@ -31,8 +31,9 @@ it. Python never writes the container.
 | `overlay.py` | A BF16 checkpoint with a `replay.py fetch` directory laid over it: which file holds each tensor, the overlay's checked like for like and pinned by `fetch.json`. The KLD reference of the abliterated BF16 reads through it (GitHub #422). |
 | `reconstruction.py` | The conversion's GPU step and its only exllamav3 user: each trellis matrix's relative reconstruction error against the BF16 checkpoint. |
 | `replay.py` | The abliterated variant's 70 matrices re-quantized by replaying exllamav3's conversion: the plan (no torch), `fetch` of huihui's changed tensors by HTTP range, `run` (the GPU step). |
-| `recipe.py` | A local conversion's per-tensor recipe, derived from the quant's `quantization_config.json` (a pure step): every matrix at the quant's K and shape, the head at 4. |
-| `local_quant.py` | A fine-tune's EXL3 quant converted on this machine by exllamav3 at that recipe: `run` (the GPU step, its check, the pins and the provenance) and `control` (each matrix's error against the fine-tune's BF16 beside the default artifact's). |
+| `recipe.py` | A named recipe (GitHub #631): `load` reads and checks `recipes/<name>.json`; the text scope's bytes and the bits per weight; a local conversion's per-tensor recipe (`job`) and exllamav3's YAML. |
+| `recipes/` | The recipes, one JSON file each, named by its stem: `sc30.json` is the 16 GB artifact's and the default. |
+| `local_quant.py` | An EXL3 quant of the 27B or a fine-tune converted on this machine by exllamav3 at a named recipe: `run` (the GPU step, its check, the pins and the provenance) and `control` (each matrix's error against the fine-tune's BF16 beside the default artifact's). |
 | `work.py` | The DONE protocol the packer checks (copied from `tools/image-converter/work.py`). |
 | `test_*.py`, `conftest.py` | Unit tests (CPU only) on a reduced synthetic served artifact and quant. |
 
@@ -70,8 +71,9 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
     --quant H:/models/qwen38-27b-exl3-SC_3.00bpw_H4 --report <report.json>
 ```
 
-- **`run`** refuses (exit 2, nothing written) a non-empty `--work`, another quant recipe (its
-  `quantization_config.json` must say exl3, mul1, out scales always, 3.0 bits, head 4), a shard whose
+- **`run`** refuses (exit 2, nothing written) a non-empty `--work`, a quant that is not its recipe's
+  ("The recipe" below: by default the 16 GB artifact's, whose `quantization_config.json` says exl3, mul1,
+  out scales always, 3.0 bits, head 4), a shard whose
   sha256 is not its LFS oid (the BF16 checkpoint's too), files from two revisions or with no download
   record (a quant converted locally is pinned instead: "A fine-tune" below), a quant matrix with no served plane or a plane
   with no quant matrix, split parts that do not tile their plane, and any matrix whose reconstruction
@@ -80,6 +82,51 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
 - **The packer** consumes the work files as it appends them (`--keep-work` keeps them, given room for
   two copies) and writes `<artifact>.conversion.json`: `converter.json` plus the whole-file invariants.
 - **`verify`** prints VERIFY PASS or VERIFY FAILED (exit 3).
+
+## The recipe
+
+`convert.py run` and `local_quant.py run` take a **recipe** by name, `--recipe <name>` (GitHub #631, spec
+#630). With none they take `sc30`, the 16 GB artifact's, so the commands above run as they always have.
+
+- **Where.** A recipe is `recipes/<name>.json` beside the tool, committed; its name is the file's stem.
+  To write one, copy `sc30.json` under the new name and change what differs.
+- **What it states** (schema `qwen3.8-27b-trellis-recipe-v1`):
+  - `tensors`: the K of every body matrix, by its exllamav3 key (`model.language_model.layers.<i>.<module>`),
+    the 400 of the 27B. The head is not listed: its bits are `quantization_config.head_bits`.
+  - `quantization_config`: the fields the quant's `quantization_config.json` must state, compared as they
+    are and recorded in `source.quantization_config`. `sc30`'s are exl3, mul1, out scales always, bits 3.0,
+    head 4; a downloaded quant states its own (an `out_scales` of `auto`, bits 2.5). A local conversion
+    passes exllamav3 its `bits` (`target_bpw`), `codebook`, `out_scales` and `head_bits`.
+  - `ceiling_bytes`: the most the text scope's device weights may be. They are counted as the container
+    stores them: every trellis record of the body and the head, at the recipe's K, and every other
+    `text/` object but the token embedding (host memory) and the draft head and its token ids (not bound
+    with the text scope). `sc30` counts 9,824,608,256, which the shipped artifact holds; the load's plan
+    line says 9,825,095,804, its arena's alignment beside them. `sc30`'s ceiling is 9,830,000,000.
+  - `files`: the pins of every file the recipe's side reads, `{"<file name>": {"bytes": n, "sha256":
+    "<hex>"}}`: the downloaded quant's files the converter reads (its shards, index,
+    `quantization_config.json` and `config.json`) and the calibration files the local quant reads
+    (`quantization_config.json` and `cal_trace.safetensors`). A downloaded quant's pins are its LFS oids for
+    the shards and the sha256 of each small file as downloaded; `sc30`'s are the shipped artifact's record's
+    `source.files` and the trace's LFS oid. The rest of a conversion's inputs keep their own pins: the BF16
+    checkpoint its download records, the served artifact its sha256 in the record, an override its
+    `replay.json`, and a quant converted locally its `--quant-pins`, which stand for the recipe's pins of
+    the quant's files.
+  - `weights_id`: the artifact's, which `--weights-id` overrides (a fine-tune's, the abliterated variant's).
+  - `job` (a recipe this machine converts): exllamav3's MTP bits and calibration size, `{"mtp_bits": 3,
+    "calibration": {"rows": 250, "cols": 2048}}`. A recipe without it names a downloaded quant;
+    `local_quant.py run` refuses it.
+  - `about`: free text, for the reader.
+- **Refused before the GPU** (exit 2, `REFUSED:` naming the cause): a K outside 2 to 5, a fractional K, a
+  head not at 4 bits, a field the schema does not have or lacks; a quant whose configuration is not the
+  recipe's, or with a matrix at another K, or one the recipe does not name or names and the quant lacks;
+  text-scope device bytes above the ceiling; a file the conversion reads with no pin, of another size, or
+  whose sha256 is not its pin's (the quant's files are hashed before the GPU step, the BF16 checkpoint's
+  beside it).
+- **The record** names it: `recipe` in `converter.json` (and in the local quant's `provenance.recipe.named`)
+  is its name, the sha256 of its file, its ceiling, the text scope's bytes and the body's **bits per
+  weight**, its average K weighted by each matrix's weights, the head apart as exllamav3's `bits` counts
+  it (`sc30`: 2.9998). Nothing of it reaches the container: the 16 GB artifact converted through a recipe
+  is the bytes it was.
 
 ## The override
 
@@ -156,10 +203,10 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
   `{"files": {"<file name>": {"bytes": <n>, "sha256": "<hex>"}}}` (other keys are ignored, so the file can
   carry the conversion's provenance too). Every file the converter reads (the shards, the index,
   `quantization_config.json`, `config.json`) needs its pin. `run` refuses (exit 2), naming the file, one
-  with no pin or of another size, before the GPU step, and one whose sha256 is not its pin's, once hashed
-  beside it. A local quant takes `--quant-repo` and `--quant-branch` too, so the record never names the
-  downloaded quant's. Its recipe is checked as the download's is (exl3, mul1, out scales always, 3.0 bits,
-  head 4).
+  with no pin, of another size, or whose sha256 is not its pin's, before the GPU step. A local quant takes
+  `--quant-repo` and `--quant-branch` too, so the record never names the downloaded quant's. It is checked
+  against its recipe (`--recipe`, `sc30` by default) as the download is; its pins stand for the recipe's
+  pins of the quant's files.
 - **The labels** are the record's: `--license` (default `apache-2.0`), `--quant-repo` and `--quant-branch`
   (default `turboderp/Qwen3.8-27B-exl3`, `SC_3.00bpw_H4`) in `source`, `--bf16-repo` (default
   `Qwen/Qwen3.8-27B`) in `reference`. The BF16 checkpoint is pinned by its download record as before.
@@ -171,8 +218,9 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
 ## The fine-tune's local quant
 
 `local_quant.py` makes that local quant (GitHub #471): exllamav3 1.5.3's own conversion of the fine-tune's
-BF16 at the bit widths of `SC_3.00bpw_H4`, with that quant's own calibration trace. Of the quant only two
-files are fetched, at the revision the default 16 GB artifact's record names (its `source`):
+BF16 at the bit widths of `SC_3.00bpw_H4` (the recipe `sc30`), with that quant's own calibration trace. It
+converts the base 27B's BF16 at a recipe of our own the same way, `--recipe <name>` (GitHub #631). Of the
+quant only two files are fetched, at the revision the default 16 GB artifact's record names (its `source`):
 
 ```
 F:/ai/ngram-venv/Scripts/hf.exe download turboderp/Qwen3.8-27B-exl3 quantization_config.json cal_trace.safetensors \
@@ -189,20 +237,23 @@ F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/local_quant.py c
     --out <main checkout>/.scratch/471/control.json
 ```
 
-- **The recipe** (`recipe.py`, no torch) is the quant's `quantization_config.json`: each matrix's K is its
-  `tensor_storage` entry's, which must be the K its stored trellis holds and one the container stores; the
-  head is at `head_bits`, 4; bits 3.0, `mul1`, out scales always, MTP bits 3, calibration 250 x 2,048,
-  checked as `convert.py run` checks a quant. On `SC_3.00bpw_H4`: K2 34, K3 297, K4 66, K5 4 over 401
-  matrices, the head included. exllamav3's YAML (`<out>.recipe.yaml`) lists the 400 body matrices only: it
-  takes the head from `head_bits` and would ignore an entry for it.
-- **`run`** refuses (exit 2), before the GPU and writing nothing: the two files at another revision than the
-  record's quant, a configuration whose sha256 is not the record's, a trace that is not its LFS oid, a BF16
-  checkpoint without its download records or without a recipe matrix at its shape, a non-empty `--out` or
+- **The recipe** is `--recipe` ("The recipe" above; `recipe.job`, no torch): every body matrix at its K, at
+  the shape the record gives it; the head at `head_bits`, 4; the recipe's bits, codebook and output scales,
+  and its `job`'s MTP bits and calibration size. `sc30` is `SC_3.00bpw_H4`'s: K2 34, K3 297, K4 66, K5 4
+  over 401 matrices, the head included, bits 3.0, `mul1`, out scales always, MTP bits 3, calibration 250 x
+  2,048. exllamav3's YAML (`<out>.recipe.yaml`) lists the 400 body matrices only: it takes the head from
+  `head_bits` and would ignore an entry for it.
+- **`run`** refuses (exit 2), before the GPU and writing nothing: a recipe the load cannot bind or with no
+  `job`, or not of the record's matrices; the two files at another revision than the
+  record's quant, a configuration whose sha256 is not the record's, a trace that is not its LFS oid, either
+  without the recipe's pin or not its bytes and sha256, a BF16
+  checkpoint without its download records or without a recipe matrix at its shape, text-scope device bytes
+  at the recipe's K above its ceiling, a non-empty `--out` or
   `--work`, and a disk with less free space than the output, exllamav3's work files and three copies of
   its fp32 calibration state (54 GiB for the 27B; `--no-checkpoints` leaves the copies out, 25 GiB, and
   gives up `--resume`). `--check` stops there.
 - **The conversion** is `exllamav3.conversion.convert_model`'s parser, `prepare` and `main`, run in this
-  process: `-hb 4 -mb 3 -vb 16 -cb mul1 --out_scales always -cd <trace> -cr 250 -cc 2048 --recipe`. The
+  process, at `sc30`: `-hb 4 -mb 3 -vb 16 -cb mul1 --out_scales always -cd <trace> -cr 250 -cc 2048 --recipe`. The
   vision tower stays unquantized as in the quant (1.5.3 would quantize it at 6 bits). `--resume` resumes an
   interrupted job from `--work` (exllamav3's `-r`). The time and the peaks are logged and recorded: the
   CUDA allocator's (allocated, reserved) and the process's working set and commit.
@@ -212,7 +263,8 @@ F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/local_quant.py c
 - **`<out>.pins.json`**, beside the quant: `files`, every file of the quant by bytes and sha256 (the
   `--quant-pins` above), and `provenance`: the BF16's repository, revision, index and shards (LFS oid),
   the quant's repository, branch and revision with its configuration's sha256 and the exllamav3 that made
-  it, the calibration trace's sha256 and size, the recipe (its YAML's sha256, its formats, the YAML itself),
+  it, the calibration trace's sha256 and size, the recipe (`named`, the named recipe as the converter's
+  record has it; its YAML's sha256, its formats, the YAML itself),
   exllamav3's version and arguments (paths by role), the run's seconds and peaks, the converter's commit
   and the versions. No local path.
 - **`control`** (GPU) measures each matrix's relative reconstruction error against the fine-tune's BF16
@@ -224,8 +276,10 @@ F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/local_quant.py c
 
 `converter.json` (merged into `<artifact>.conversion.json`) carries no local path and no timestamp:
 
+- `recipe`: the named recipe, its file's sha256, its ceiling, the text scope's device bytes and the body's
+  bits per weight ("The recipe" above). The packer's own `recipe_id` beside it is the artifact's file stem.
 - `source`: the quant's repository, branch, revision and every file the converter reads, by bytes and
-  sha256; its `quantization_config`; its `license`. A local quant has no revision (`null`) and `pins`, its
+  sha256; its `quantization_config` (the recipe's fields); its `license`. A local quant has no revision (`null`) and `pins`, its
   pins file by name, bytes and sha256.
 - `served`: the served artifact's file name, bytes, sha256 and identity; its graft sidecar's sha256
   (`graft_sidecar`), or its conversion sidecar's sha256 and recipe id (`conversion_sidecar`).

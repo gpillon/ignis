@@ -18,7 +18,8 @@ import yaml
 import convert
 import exl3
 import local_quant
-from conftest import REVISION, download_records, make_sources, write_safetensors
+import recipe
+from conftest import REVISION, body_k, download_records, make_sources, pin_dir, write_recipe, write_safetensors
 
 SWIFT_REVISION = "b4c84d42903a8646b25857eb2827288d92ed85a4"
 SWIFT_REPO = "someone/fine-tune"
@@ -34,7 +35,7 @@ def _storage(quant):
         m = quant.matrix(key)
         out[key] = {"stored_tensors": {f"{key}.{s}": {"shape": quant.tensors[f"{key}.{s}"].shape}
                                        for s in ("trellis", "suh", "svh", "mul1")},
-                    "quant_format": "exl3", "bits_per_weight": local_quant.recipe.rate(m.k2 / 2)}
+                    "quant_format": "exl3", "bits_per_weight": recipe.rate(m.k2 / 2)}
     out["model.language_model.layers.0.input_layernorm"] = {"stored_tensors": {}}
     return out
 
@@ -56,6 +57,8 @@ def _sources(tmp_path):
     download_records(src["quant"], ["quantization_config.json"], set(), REVISION)
     write_safetensors(os.path.join(published, TRACE), {"input_ids": ("I64", [4, 16], bytes(8 * 64))})
     download_records(published, ["quantization_config.json", TRACE], {TRACE}, REVISION)
+    # The default recipe pins the quant's files and the published two, its configuration among both.
+    write_recipe(os.path.join(src["recipes"], "sc30.json"), files=pin_dir(src["quant"], published))
 
     swift = str(tmp_path / "swift")
     os.makedirs(os.path.join(swift, ".cache", "huggingface", "download"))
@@ -85,12 +88,12 @@ def _sources(tmp_path):
         return dict(errors)
 
     record = convert.convert(src["served"], src["quant"], src["bf16"], str(tmp_path / "default-work"),
-                             errors_fn=measured, log=lambda _: None)
+                             errors_fn=measured, log=lambda _: None, recipe=recipe.load("sc30", src["recipes"]))
     record_path = str(tmp_path / "qwen3_8_27b_trellis_sc30-v2.ninfer.conversion.json")
     with open(record_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(record, f)
     return {"src": src, "published": published, "swift": swift, "record": record_path, "quant": quant,
-            "config": config, "default_errors": errors,
+            "config": config, "default_errors": errors, "recipes": src["recipes"],
             "out": str(tmp_path / "out" / "swift-exl3"), "work": str(tmp_path / "work")}
 
 
@@ -152,7 +155,7 @@ class Exllamav3:
 def _run(s, *extra, free=1 << 50):
     return local_quant.main(["run", "--bf16", s["swift"], "--bf16-repo", SWIFT_REPO, "--recipe-quant", s["published"],
                              "--record", s["record"], "--out", s["out"], "--work", s["work"], *extra],
-                            disk_free=lambda path: free)
+                            disk_free=lambda path: free, recipes=s["recipes"])
 
 
 def _read(path):
@@ -193,6 +196,7 @@ def test_the_pins_cover_every_file_of_the_quant_and_the_16gb_converter_takes_the
     # #465's contract: the 16 GB converter takes the local quant by these pins
     record = convert.convert(s["src"]["served"], s["out"], s["src"]["bf16"], str(tmp_path / "work16"),
                              skip_errors=True, log=lambda _: None, quant_pins=s["out"] + ".pins.json",
+                             recipe=recipe.load("sc30", s["recipes"]),
                              labels={"quant_repo": SWIFT_REPO, "quant_branch": "local"})
     assert record["source"]["revision"] is None
     assert record["source"]["pins"]["sha256"] == _sha256(s["out"] + ".pins.json")
@@ -313,7 +317,7 @@ def test_check_stops_before_the_gpu_and_writes_nothing(tmp_path, monkeypatch, ca
     ex = Exllamav3(s).install(monkeypatch)
     assert _run(s, "--check") == 0
     out = capsys.readouterr().out
-    assert "recipe: 26 matrices" in out and "CHECK PASS" in out
+    assert "recipe sc30: 26 matrices" in out and "CHECK PASS" in out
     assert ex.calls == [] and not os.path.exists(os.path.dirname(s["out"]))
 
 
@@ -415,3 +419,77 @@ def test_a_control_whose_record_does_not_hold_the_quants_matrices_is_refused(tmp
     assert f"{L1}mlp.down_proj: not in the record" in printed
     assert "text/layers/2/mlp/down: K 3, the record's is 4" in printed
     assert not os.path.exists(out)
+
+
+# --- a named recipe (#631) ---
+
+P = "model.language_model.layers."
+# A recipe of our own: three matrices at other K, its bits what that leaves (the reduced quant's 1,966,080
+# bits, 32,768 weights a bit down, 32,768 a bit up and 16,384 a bit down, over 671,744 weights: 119/41).
+OWN = body_k() | {P + "0.mlp.down_proj": 2, P + "1.mlp.gate_proj": 3, P + "3.self_attn.v_proj": 4}
+
+
+def _recipe(s, name="sc30", **fields):
+    return write_recipe(os.path.join(s["recipes"], f"{name}.json"),
+                        **({"files": pin_dir(s["src"]["quant"], s["published"])} | fields))
+
+
+def test_run_converts_at_a_named_recipes_k_and_bits_and_checks_the_quant_against_them(tmp_path, monkeypatch, capsys):
+    s = _sources(tmp_path)
+    ex = Exllamav3(s).install(monkeypatch)
+    _recipe(s, "ig28a", weights_id="trellis-ig28a", tensors=OWN,
+            quantization_config=dict(convert.QUANT_CONFIG, bits=2.9024))
+    assert _run(s, "--recipe", "ig28a") == convert.EXIT_REFUSED
+    # exllamav3 was given the recipe's K and its bits
+    assert ex.calls == ["parse_args", "prepare", "main"]
+    assert ex.recipe_read == {"target_bpw": 2.9024, "head_bits": 4, "tensors": OWN}
+    # the stub wrote the 16 GB artifact's quant: it is not this recipe's, and gets no pins
+    said = capsys.readouterr().out
+    assert "recipe ig28a: 26 matrices" in said and "2.9024 bpw" in said
+    assert "quantization_config.json has bits = 3.0, not 2.9024" in said
+    assert P + "0.mlp.down_proj: K 3, the recipe's is 2" in said
+    assert not os.path.exists(s["out"] + ".pins.json")
+
+
+def test_the_provenance_names_the_recipe_its_ceiling_and_its_bits_per_weight(tmp_path, monkeypatch):
+    s = _sources(tmp_path)
+    Exllamav3(s).install(monkeypatch)
+    assert _run(s) == 0
+    named = _read(s["out"] + ".pins.json")["provenance"]["recipe"]["named"]
+    # the text scope is the one the 16 GB converter counts in the default artifact's record
+    assert named == {"name": "sc30", "sha256": _sha256(os.path.join(s["recipes"], "sc30.json")),
+                     "ceiling_bytes": 1 << 30, "text_scope_bytes": _read(s["record"])["recipe"]["text_scope_bytes"],
+                     "bpw": 2.9268}
+
+
+def _ceiling_below(s):
+    _recipe(s, ceiling_bytes=_read(s["record"])["recipe"]["text_scope_bytes"] - 1)
+
+
+@pytest.mark.parametrize("change,message", [
+    (lambda s: _recipe(s, tensors=body_k() | {P + "0.mlp.down_proj": 1}), P + "0.mlp.down_proj: K 1, outside 2 to 5"),
+    (lambda s: _recipe(s, tensors=body_k() | {P + "0.mlp.down_proj": 6}), P + "0.mlp.down_proj: K 6, outside 2 to 5"),
+    (lambda s: _recipe(s, tensors=body_k() | {P + "0.mlp.down_proj": 3.5}), P + "0.mlp.down_proj: K 3.5, a fractional K"),
+    (lambda s: _recipe(s, quantization_config=dict(convert.QUANT_CONFIG, head_bits=5)), "the head at 5 bits"),
+    (_ceiling_below, "above the recipe sc30's ceiling of"),
+    (lambda s: _recipe(s, files={k: v for k, v in pin_dir(s["src"]["quant"], s["published"]).items() if k != TRACE}),
+     f"{TRACE}: the recipe sc30 gives no bytes and sha256 for it"),
+    (lambda s: _recipe(s, files=pin_dir(s["src"]["quant"], s["published"]) | {TRACE: {"bytes": 7, "sha256": "1" * 64}}),
+     "bytes, its pin is 7"),
+    (lambda s: _recipe(s, files=pin_dir(s["src"]["quant"], s["published"]) | {
+        "quantization_config.json": dict(pin_dir(s["published"])["quantization_config.json"], sha256="2" * 64)}),
+     "quantization_config.json hashes to "),
+    (lambda s: _recipe(s, tensors={k: v for k, v in body_k().items() if k != P + "2.mlp.up_proj"}),
+     P + "2.mlp.up_proj: in the record, not in the recipe"),
+    (lambda s: _recipe(s, job=None), "the recipe sc30 states no exllamav3 job"),
+])
+def test_a_recipe_the_local_quant_cannot_take_is_refused_before_the_gpu_naming_its_cause(
+        tmp_path, monkeypatch, capsys, change, message):
+    s = _sources(tmp_path)
+    ex = Exllamav3(s).install(monkeypatch)
+    change(s)
+    assert _run(s) == convert.EXIT_REFUSED
+    said = capsys.readouterr().out
+    assert said.startswith("REFUSED: ") and message in said, said
+    assert ex.calls == []
+    assert not os.path.exists(s["out"] + ".recipe.yaml") and not os.path.exists(s["out"] + ".pins.json")
