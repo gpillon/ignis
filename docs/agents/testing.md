@@ -451,8 +451,10 @@ served the same way, through `load::prepare_model`/`load_model` from the flags
 an operator passes: greedy text against the same flags at a window of 0 (no
 speculation) up to ADR 0056's near tie, judged on that load's prefill route;
 each route request's `spec.*` against the engine's run of the same prompt and
-`/metrics`; a `json_schema` answer and a request at the API's defaults; then a
-pool at its floor (one context, a page per retained slot, a page a lane and a
+`/metrics`; a `json_schema` answer that drafts and a request at the API's
+defaults; the thinking budget's forced close and the loop guard (tuned to act
+on any reasoning) on the MTP load and on the window-0 load alike (spec #618,
+story 14); then a pool at its floor (one context, a page per retained slot, a page a lane and a
 retained slot for the head's holders), where an Agent request goes through
 KV-RAM for an Interactive request reserving the whole context, first on the
 load because retained state would stand in the room, and eight siblings share

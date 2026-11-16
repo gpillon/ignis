@@ -23,8 +23,8 @@
 //!    window-0 load writes no `spec.*` field and exports no speculative
 //!    series. The load's log names the drafter and the window.
 //! 3. **Structured output.** A `json_schema` response format answers with a
-//!    document valid under its schema; a request at the API's defaults
-//!    (thinking on, sampled) drafts too.
+//!    document valid under its schema, and drafts; a request at the API's
+//!    defaults (thinking on, sampled) drafts too.
 //! 4. (after 5, on the same load) **Siblings over one system prompt reuse the shared prefix**, each
 //!    answering its own question and drafting, seven of them claiming it at
 //!    once, one a lane: every holder keeps its own copy of the prefix's last
@@ -41,6 +41,13 @@
 //!    done, and drafts again. It decodes alone on either side of its move, so
 //!    it is held to the same request served alone on a fresh load of the same
 //!    flags, token for token (GitHub #444).
+//! 6. (after 3 on the MTP load, and on the window-0 load) **The reasoning
+//!    controls act as without speculation** (spec #618, story 14). A thinking
+//!    budget's close is forced whole and an answer follows, beginning one
+//!    token past the budget without speculation and at most a round's width
+//!    past it on the head's load, which drafts under it; the loop guard, tuned
+//!    to score every window a loop, takes the reasoning back to its last clean
+//!    window and nudges it, then at most closes it, on either load alike.
 //!
 //! Its own test binary: the request log is written on the engine's telemetry
 //! task, so the capture is the process's global subscriber.
@@ -70,8 +77,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 use ignis_artifact::{ChatMessage, ChatRenderOptions, FrontendSet, MessageContent, Reader, Role};
 use ignis_core::compute::{ModelConfig, ModelFamily};
 use ignis_core::types::{DecisionRead, DecodeParams, RequestClass, RequestInput, SchedEvent, SpecCounters};
+use ignis_core::thinking_budget::ANSWER_RESERVE;
 use ignis_core::{gpu_profile, KvFormat, SpeculativeBackend};
 use ignis_server::engine::{collect_readout, Engine};
+use ignis_server::loop_guard::{LoopGuardMode, LoopGuardParams, DEFAULT_NUDGE, TAG_PREFIX};
 use ignis_server::Server;
 
 // ADR 0056's near-tie bound and one BF16 ulp, as the core tests' logit drift
@@ -391,6 +400,110 @@ fn agent_request() -> Value {
     question("Write the English words for the numbers one through one hundred, separated by commas.", 1500, "agent")
 }
 
+// ── the reasoning controls (story 14) ───────────────────────────────────────
+
+/// The reasoning budget the forced-close request names.
+const BUDGET: u32 = 64;
+/// A question the model reasons about at length, past the budget and past the
+/// loop guard's first three windows.
+const REASONING_PROMPT: &str = "Find all pairs of integers x and y with x^2 - y^2 = 45. Work through it carefully.";
+
+/// What the reasoning controls did on one load.
+#[derive(Debug)]
+struct Controls {
+    /// The forced close's request: the output index its close began at, and
+    /// its `</think>`'s.
+    forced_at: u64,
+    closed_at: u64,
+    /// That request's rounds, `None` without speculation.
+    rounds: Option<u64>,
+    /// The loop guard's rewinds of its request: each line's attempt and
+    /// whether it closed the reasoning.
+    rewinds: Vec<(u64, bool)>,
+}
+
+/// The loop guard as `rewind` runs it, tuned so that every window of 500
+/// characters, scored as written, is a loop and is clean: the third check in
+/// a row acts, 700 characters in, taking the reasoning back to the start of
+/// the second window and nudging it; the next loop, if the reasoning runs
+/// that long again, closes it.
+fn eager_guard() -> LoopGuardParams {
+    LoopGuardParams {
+        mode: LoopGuardMode::Rewind,
+        normalize: false,
+        ratio_permille: 999,
+        raw_gate_permille: 0,
+        clean_permille: 1,
+        window_chars: 500,
+        check_every_chars: 100,
+        persist_checks: 3,
+        margin_chars: 0,
+        snap_chars: 0,
+        retries: 1,
+        ..LoopGuardParams::default()
+    }
+}
+
+/// The forced close and the loop guard on `load`, greedy and thinking on.
+async fn reasoning_controls(load: &Load, log: &Log, name: &str) -> Controls {
+    let close_sentence = ignis_server::thinking::THINKING_CLOSE_TEXT.split("</think>").next().unwrap().trim();
+    let reasoned = |text: &str, max_tokens: u32| {
+        json!({
+            "model": MODEL,
+            "messages": [{ "role": "user", "content": text }],
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "stream": false,
+            "enable_thinking": true,
+            "class": "interactive",
+        })
+    };
+    let said = |response: &Value| {
+        let message = &response["choices"][0]["message"];
+        (message["reasoning_content"].as_str().unwrap_or_default().to_owned(), content(response))
+    };
+
+    // The budget: its close forced whole once it is spent, then an answer.
+    let mark = log.named("ignis.request.done").len();
+    let mut body = reasoned(REASONING_PROMPT, ANSWER_RESERVE + 512);
+    body["thinking_budget"] = json!(BUDGET);
+    let (reasoning, answer) = said(&chat(load.app.clone(), body).await);
+    println!("{name}: the forced close's reasoning {reasoning:?}, answer {answer:?}");
+    assert!(reasoning.trim_end().ends_with(close_sentence), "{name}: the close ends the reasoning: {reasoning:?}");
+    assert!(!answer.trim().is_empty(), "{name}: an answer follows the close");
+    // Its line, found by its budget: an earlier run's may land after the mark.
+    let mut found = None;
+    for _ in 0..200 {
+        found = log.named("ignis.request.done").split_off(mark).into_iter().find(|e| e["attributes"]["thinking_budget"] == BUDGET);
+        if found.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let line = found.unwrap_or_else(|| panic!("{name}: no request line with the budget's {BUDGET}"));
+    let a = &line["attributes"];
+    assert_eq!((a["thinking_forced"].as_bool(), a["thinking_closed"].as_bool()), (Some(true), Some(true)), "{name}: {line}");
+    let (forced_at, closed_at) = (a["thinking_forced_at"].as_u64().unwrap(), a["thinking_closed_at"].as_u64().unwrap());
+    let rounds = logged_spec(&line).map(|(rounds, _, _)| rounds);
+
+    // The loop guard, on a server over the same model.
+    let guarded = Server::from_active(load.model.clone()).with_request_timeout(DEADLINE).with_loop_guard(eager_guard()).app();
+    let mark = log.events().len();
+    let (reasoning, answer) = said(&chat(guarded, reasoned(REASONING_PROMPT, 3000)).await);
+    println!("{name}: the loop guard's reasoning {reasoning:?}, answer {answer:?}");
+    let rewound: Vec<Value> = log.events()[mark..].iter().filter(|e| e["event_name"] == "ignis.loop_guard.rewound").cloned().collect();
+    for line in &rewound {
+        println!("{name}: {line}");
+    }
+    let rewinds: Vec<(u64, bool)> =
+        rewound.iter().map(|e| (e["attributes"]["attempt"].as_u64().unwrap(), e["attributes"]["closed"].as_bool().unwrap())).collect();
+    assert!(rewinds == [(1, false)] || rewinds == [(1, false), (2, true)], "{name}: a nudge, then at most the close: {rewinds:?}");
+    assert_eq!(reasoning.matches(DEFAULT_NUDGE).count(), 1, "{name}: the nudge once in the reasoning: {reasoning:?}");
+    assert!(reasoning.contains(TAG_PREFIX), "{name}: the rewind's tag: {reasoning:?}");
+    assert!(!answer.trim().is_empty(), "{name}: an answer after the guard's interventions");
+    Controls { forced_at, closed_at, rounds, rewinds }
+}
+
 // ── the test ────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -444,27 +557,32 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
         (sum.0 + u64::from(spec.rounds), sum.1 + u64::from(spec.drafted), sum.2 + u64::from(spec.accepted))
     });
     log.at_least("ignis.request.done", done_at_load + prompts.len()).await;
-    let mut counted = (0, 0, 0);
+    // The counters a run moves, the per-position accepted drafts last (the
+    // telemetry bumps them after the accepted count): the whole end state.
+    let counters = |metrics: Router| async move {
+        (
+            metric(&metrics, "ignis_speculative_rounds_total").await,
+            metric(&metrics, "ignis_speculative_drafted_tokens_total").await,
+            metric(&metrics, "ignis_speculative_accepted_tokens_total").await,
+            metric(&metrics, "ignis_speculative_position_accepted_total").await,
+        )
+    };
+    let wanted = (engine_sum.0, engine_sum.1, engine_sum.2, engine_sum.2);
+    let mut counted = (0, 0, 0, 0);
     for _ in 0..200 {
-        counted = (
-            metric(&on.metrics, "ignis_speculative_rounds_total").await,
-            metric(&on.metrics, "ignis_speculative_drafted_tokens_total").await,
-            metric(&on.metrics, "ignis_speculative_accepted_tokens_total").await,
-        );
-        if counted == engine_sum {
+        counted = counters(on.metrics.clone()).await;
+        if counted == wanted {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(counted, engine_sum, "/metrics counts the engine's runs' rounds, drafts and accepted drafts");
-    // Through the route: the engine's text, and the request log's counters
-    // are the engine run's.
-    let (rounds_before, drafted_before, accepted_before) = (
-        metric(&on.metrics, "ignis_speculative_rounds_total").await,
-        metric(&on.metrics, "ignis_speculative_drafted_tokens_total").await,
-        metric(&on.metrics, "ignis_speculative_accepted_tokens_total").await,
+    assert_eq!(
+        counted, wanted,
+        "/metrics counts the engine's runs' rounds, drafts and accepted drafts, each accepted draft once at its position"
     );
-    let positions_before = metric(&on.metrics, "ignis_speculative_position_accepted_total").await;
+    // Through the route: the engine's text, and the request log's counters
+    // are the engine run's. The baseline is the end state waited for above.
+    let (rounds_before, drafted_before, accepted_before, positions_before) = counted;
     let done_before = log.named("ignis.request.done").len();
     let mut logged_sum = (0, 0, 0);
     for (index, ((name, question_text), run)) in PROMPTS.iter().zip(&on_runs).enumerate() {
@@ -487,21 +605,19 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
         assert!(completion <= logged.0 + logged.2 + 1, "{name}: a round commits its accepted drafts and one token: {line}");
         logged_sum = (logged_sum.0 + logged.0, logged_sum.1 + logged.1, logged_sum.2 + logged.2);
     }
-    let mut moved = (0, 0, 0);
+    // The accepted drafts again at the end: a draft committed at a position
+    // counts once at it.
+    let logged = (logged_sum.0, logged_sum.1, logged_sum.2, logged_sum.2);
+    let mut moved = (0, 0, 0, 0);
     for _ in 0..100 {
-        moved = (
-            metric(&on.metrics, "ignis_speculative_rounds_total").await - rounds_before,
-            metric(&on.metrics, "ignis_speculative_drafted_tokens_total").await - drafted_before,
-            metric(&on.metrics, "ignis_speculative_accepted_tokens_total").await - accepted_before,
-        );
-        if moved == logged_sum {
+        let (rounds, drafted, accepted, positions) = counters(on.metrics.clone()).await;
+        moved = (rounds - rounds_before, drafted - drafted_before, accepted - accepted_before, positions - positions_before);
+        if moved == logged {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(moved, logged_sum, "/metrics moved by the request log's counters");
-    let positions = metric(&on.metrics, "ignis_speculative_position_accepted_total").await - positions_before;
-    assert_eq!(positions, logged_sum.2, "a draft committed at a position counts once at it");
+    assert_eq!(moved, logged, "/metrics moved by the request log's counters, each accepted draft once at its position");
 
     // Structured output: a document valid under its schema.
     let schema_text = r#"{"type":"object","properties":{"city":{"type":"string"},"population":{"type":"integer"}},"required":["city","population"],"additionalProperties":false}"#;
@@ -515,7 +631,12 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
     let faults = ignis_grammar::validate::violations(&schema, &document);
     assert!(faults.is_empty(), "the answer {answer}: {faults:?}");
     let done = log.at_least("ignis.request.done", done_before + PROMPTS.len() + 1).await;
-    println!("structured output's request log: {}", done[done_before + PROMPTS.len()]);
+    let line = &done[done_before + PROMPTS.len()];
+    println!("structured output's request log: {line}");
+    assert!(
+        logged_spec(line).is_some_and(|(rounds, drafted, _)| rounds > 0 && drafted > 0),
+        "the checked request drafted: {line}"
+    );
     // A request at the API's defaults: thinking on, sampled at the model's
     // own settings, so the head drafts for a sampling lane and the reasoning
     // closes inside its rounds.
@@ -528,6 +649,9 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
     let line = &done[done_before + PROMPTS.len() + 1];
     println!("a request at the defaults: {line}");
     assert!(logged_spec(line).is_some_and(|(rounds, _, _)| rounds > 0), "the head drafted for a sampling lane: {line}");
+    // 6. The reasoning controls on the head's load.
+    let on_controls = reasoning_controls(&on, &log, "MTP").await;
+    assert!(on_controls.rounds.is_some_and(|rounds| rounds > 0), "the head drafted under the budget: {on_controls:?}");
     on.close().await;
 
     // ── 1-2. The same flags at a window of 0: no speculation ────────────────
@@ -557,6 +681,23 @@ async fn an_mtp_load_serves_text_structured_output_shared_prefixes_and_kv_ram() 
     let done = log.at_least("ignis.request.done", done_before + 1).await;
     assert!(logged_spec(&done[done_before]).is_none(), "no spec.* field without speculation: {}", done[done_before]);
     assert!(!metrics_text(&off.metrics).await.contains("ignis_speculative_rounds_total"), "no speculative series");
+    // 6. The same controls without speculation: the close forced at the same
+    // budget, as long, and the guard's interventions alike.
+    let off_controls = reasoning_controls(&off, &log, "window 0").await;
+    println!("reasoning controls: MTP {on_controls:?}, window 0 {off_controls:?}");
+    assert_eq!(off_controls.rounds, None, "no rounds without speculation");
+    let budget = u64::from(BUDGET);
+    assert_eq!(off_controls.forced_at, budget + 1, "without speculation the close begins one token past the budget");
+    assert!(
+        (budget + 1..=budget + 1 + u64::from(WINDOW)).contains(&on_controls.forced_at),
+        "the head's load begins it at most a round's width later: {on_controls:?}"
+    );
+    assert_eq!(
+        on_controls.closed_at - on_controls.forced_at,
+        off_controls.closed_at - off_controls.forced_at,
+        "the same close, forced whole"
+    );
+    assert_eq!(on_controls.rewinds[0], off_controls.rewinds[0], "the guard's first intervention, a nudge, on both");
     off.close().await;
     println!("{} of {} prompts split at a near tie", splits.len(), prompts.len());
 
