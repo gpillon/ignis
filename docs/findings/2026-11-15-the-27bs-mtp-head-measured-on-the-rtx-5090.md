@@ -413,6 +413,7 @@ Inferred:
 
 ## Follow-ups
 
-- The adaptive extent, go or no-go: https://github.com/gpillon/ignis/issues/629.
+- The adaptive extent, go or no-go: https://github.com/gpillon/ignis/issues/629, replayed offline in
+  [an adaptive extent for the head](2026-11-16-an-adaptive-extent-for-the-27bs-mtp-head-replayed-offline.md).
 - The shortlist head under MTP: the owner's to open (above).
 - The head's prefill on the prefill GEMMs: the owner's to open.
