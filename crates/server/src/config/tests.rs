@@ -3922,7 +3922,7 @@ fn auto_picks_rtx_12gb_below_14_gib_and_rtx_16gb_from_it() {
 /// Spec #630 (GitHub #637): `rtx-12gb` gives the 27B the class's values at
 /// configuration resolution, each one the profile's and so each one adapting:
 /// one decode lane and its two host retained slots, the MTP head at the
-/// window #628 measured, 131,072 tokens whose ladder steps 32,768 at a time,
+/// window #628 measured, 131,072 tokens whose ladder steps 16,384 at a time,
 /// a budget derived at 512M of headroom, a 512-token prefill chunk and solo
 /// width, vision on in host memory at 4,096 tokens. Flash-Next resolves
 /// under it with none of them, the 27B's alone passed over.
@@ -3940,11 +3940,15 @@ fn the_rtx_12gb_profile_serves_the_27b_on_one_lane_drafting_with_mtp() {
     assert_eq!((s27.prefill_chunk, s27.prefill_chunk_solo), (512, SoloWidth::Tokens(512)));
     assert!(s27.settings().vision.enabled, "vision is on, explicitly");
     assert_eq!(s27.vision.map(|v| (v.residency(), v.max_tokens())), Some((VisionResidency::Host, 4096)));
-    assert_eq!(s27.adapt_ladder(), Ladder { context_step: 32_768, spare_tokens: DEFAULT_ADAPT_SPARE_TOKENS });
-    assert_eq!(contexts(s27.max_context, s27.adapt_ladder().context_step), [131_072, 98_304, 65_536, 32_768], "the ladder it walks");
+    assert_eq!(s27.adapt_ladder(), Ladder { context_step: 16_384, spare_tokens: DEFAULT_ADAPT_SPARE_TOKENS });
+    assert_eq!(
+        contexts(s27.max_context, s27.adapt_ladder().context_step),
+        [131_072, 114_688, 98_304, 81_920, 65_536, 49_152, 32_768, 16_384],
+        "the ladder it walks"
+    );
     assert_eq!(s27.adaptable(), Adaptable::ALL, "every value the profile's or a default, so every one adapts");
     let shape = crate::runtime::EngineShape::from(&s27);
-    assert_eq!((shape.adapt_ladder.context_step, shape.solo_width()), (32_768, 512), "the load's shape carries them");
+    assert_eq!((shape.adapt_ladder.context_step, shape.solo_width()), (16_384, 512), "the load's shape carries them");
     // Every other class keeps the 65,536-token step.
     for profile in ["rtx-16gb", "rtx-24gb", "rtx5090", "rtxpro6000"] {
         assert_eq!(config(&["--profile", profile]).adapt_ladder(), Ladder::default(), "{profile}");

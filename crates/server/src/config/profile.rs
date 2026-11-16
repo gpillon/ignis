@@ -270,14 +270,17 @@ pub const NONE_PROFILE: &str = "none";
 /// `--profile auto` finds below 14 GiB. Derived: no 12 GB card exists in the
 /// project, and the class is simulated on the RTX 5090 under a 12 GiB budget,
 /// where the 12 GB artifact loads 131,072 tokens with nothing adapted (#635,
-/// 2026-11-16). It is sized for one user with a desktop on the card, about 1
-/// GB already taken: one decode lane, where a second costs about 0.87 GB; the
+/// 2026-11-16). It is sized for one user with a desktop on the card: one
+/// decode lane, where a second costs about 0.87 GB; the
 /// 27B's MTP head as the drafter, at the window #628 measured
 /// ([`ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS`], ADR 0095),
 /// where every other class drafts with DFlash2, which holds about 0.7 GB more,
-/// on this card the context; 131,072 tokens of context that adapt 32,768 at a
-/// time (`model.adapt_context_step`, 65,536 elsewhere), so a desktop that
-/// leaves room for about 100,000 tokens keeps 98,304 and not 65,536; 512M of
+/// on this card the context; 131,072 tokens of context that adapt 16,384 at a
+/// time (`model.adapt_context_step`, 65,536 elsewhere; the owner's call of
+/// 2026-11-16), so a real card keeps all but less than one step of the context
+/// its desktop leaves room for: by the plan's arithmetic 131,072 with nothing
+/// else on the card, 81,920 beside a desktop of about 0.5 GB (65,536 at a
+/// 32,768-token step) and 32,768 beside about 1 GB (ADR 0098); 512M of
 /// `vram.qwen38.headroom_bytes`, a choice, since 1200M would leave no context;
 /// a 512-token prefill chunk with the solo width pinned to it, the scratch
 /// before the context; and vision on as `rtx-16gb` has it, in host memory at
@@ -378,7 +381,7 @@ const BUILT_IN: &str = r#"{
             "qwen38": { "headroom_bytes": "512M" }
         },
         "model": {
-            "adapt_context_step": 32768,
+            "adapt_context_step": 16384,
             "qwen38": { "max_context": 131072, "prefill_chunk": 512, "prefill_chunk_solo": 512 }
         },
         "vision": { "max_tokens": 4096, "residency": "host", "qwen38": { "enabled": true } },
@@ -847,7 +850,7 @@ mod tests {
 
     /// Spec #630 (GitHub #637): `rtx-12gb` carries the table of its spec for
     /// the 27B -- one lane, the MTP head at its measured window, 131,072
-    /// tokens adapting 32,768 at a time, 512M of headroom, a 512-token chunk
+    /// tokens adapting 16,384 at a time, 512M of headroom, a 512-token chunk
     /// and solo width, vision on in host memory at 4,096 tokens -- and nothing
     /// for Flash-Next.
     #[test]
@@ -864,7 +867,7 @@ mod tests {
         assert_eq!(value("spec", "draft_tokens", Some(Qwen38_27b)), Some(QWEN38_MTP_DEFAULT_DRAFT_TOKENS.to_string()));
         assert_eq!(value("spec", "draft_head", Some(Qwen38_27b)), None, "MTP has only the full head");
         assert_eq!(value("model", "max_context", Some(Qwen38_27b)).as_deref(), Some("131072"));
-        assert_eq!(value("model", "adapt_context_step", None).as_deref(), Some("32768"), "the 27B's field, written for every model");
+        assert_eq!(value("model", "adapt_context_step", None).as_deref(), Some("16384"), "the 27B's field, written for every model");
         assert_eq!(value("vram", "headroom_bytes", Some(Qwen38_27b)).as_deref(), Some("512M"));
         assert_eq!(value("vram", "headroom_bytes", None), None, "the general headroom stays the default");
         assert_eq!(value("model", "prefill_chunk", Some(Qwen38_27b)).as_deref(), Some("512"));

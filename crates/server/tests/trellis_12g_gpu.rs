@@ -16,15 +16,15 @@
 //!
 //! Less 1 GiB of simulated desktop, 131,072 tokens miss the plan's own floor
 //! (one sequence, the lane's two retained slots' pages and the three the MTP
-//! head's holders keep back) and the ladder takes the profile's 32,768-token
-//! step to 98,304, which the plan's `adapted` says; every line but the pool's
-//! block tables is the 12 GiB load's.
+//! head's holders keep back), and so do 114,688; the ladder takes the
+//! profile's 16,384-token steps to 98,304, which the plan's `adapted` says;
+//! every line but the pool's block tables is the 12 GiB load's.
 //!
 //! On the routes an RTX 30 or 40 card runs unset (the dense prefill and the
 //! integer band, named so the RTX 5090 runs them, and our GDN prefill, every
 //! card's), the dense prefill's 89 MB buffer is the one line more, as the CPU
 //! pins derive it: 131,072 tokens still load in 12 GiB, and less 1 GiB the
-//! ladder goes to 65,536.
+//! ladder goes to 81,920.
 //!
 //! The artifact is the admitted one, by its path in the models folder.
 //!
@@ -309,8 +309,9 @@ async fn the_12gb_artifact_plans_its_lines_to_the_byte_in_12_gib_and_serves_gree
 }
 
 /// Less 1 GiB of simulated desktop: 131,072 tokens miss the plan's floor by
-/// 420 pages at the context the RTX 5090 measured, and the load adapts to
-/// 98,304 on one lane, its plan saying so, on a pool of 1,633 pages.
+/// 420 pages at the context the RTX 5090 measured, 114,688 theirs too, and
+/// the load adapts to 98,304 on one lane, its plan saying so, on a pool of
+/// 1,633 pages.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn less_1_gib_of_desktop_adapts_the_context_to_98304_and_the_plan_says_so() {
@@ -353,13 +354,13 @@ async fn less_1_gib_of_desktop_adapts_the_context_to_98304_and_the_plan_says_so(
 /// The routes an RTX 30 or 40 card runs, named on the RTX 5090: the dense
 /// buffer's line beside the 12 GiB load's others, the workspace unchanged, and
 /// the pool the CPU pins derive -- 131,072 tokens in 12 GiB with nothing
-/// adapted, 65,536 less 1 GiB. Each pool is printed beside Blackwell's.
+/// adapted, 81,920 less 1 GiB. Each pool is printed beside Blackwell's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
-async fn on_the_8x_routes_the_12gb_load_keeps_131072_in_12_gib_and_adapts_to_65536_less_1_gib() {
+async fn on_the_8x_routes_the_12gb_load_keeps_131072_in_12_gib_and_adapts_to_81920_less_1_gib() {
     for (budget, pinned, blackwell, adapted, context) in [
         (RTX_12GB_BUDGET, RTX_12GB_8X, RTX_12GB, "", 131_072),
-        (BUDGET_LESS_1_GIB, RTX_12GB_8X_LESS_1_GIB, RTX_12GB_LESS_1_GIB, RTX_12GB_8X_LESS_1_GIB_ADAPTED, 65_536),
+        (BUDGET_LESS_1_GIB, RTX_12GB_8X_LESS_1_GIB, RTX_12GB_LESS_1_GIB, RTX_12GB_8X_LESS_1_GIB_ADAPTED, 81_920),
     ] {
         let Some((model, events)) = load_12g(budget, &ROUTES_8X) else { return };
         let routes = named(&events, "ignis.runtime.prefill_routes");

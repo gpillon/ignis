@@ -1075,7 +1075,7 @@ async fn under_auto_a_24gb_card_runs_rtx_24gb_and_the_config_says_so() {
 
 /// Spec #630 (GitHub #637): under `--profile auto` a 12 GB card, read below
 /// 14 GiB, starts on `rtx-12gb`: `GET /v1/config` shows the class's 27B
-/// values (one lane, the MTP head at 7, 131,072 tokens stepping 32,768, 512M
+/// values (one lane, the MTP head at 7, 131,072 tokens stepping 16,384, 512M
 /// of headroom, a 512-token chunk and solo width) and `GET /v1/config/origins`
 /// names the profile as their source, which the Server view shows as `From
 /// profile rtx-12gb`.
@@ -1096,7 +1096,7 @@ async fn under_auto_a_12gb_card_runs_rtx_12gb_and_the_config_says_so() {
     assert_eq!(status, StatusCode::OK, "{document}");
     let (model, spec, vram) = (&document["model"]["qwen38"], &document["spec"]["qwen38"], &document["vram"]["qwen38"]);
     assert_eq!((&model["max_context"], &model["prefill_chunk"], &model["prefill_chunk_solo"]), (&json!(131072), &json!(512), &json!(512)), "{document}");
-    assert_eq!(model["adapt_context_step"], 32768, "the 27B's field, in its section: {document}");
+    assert_eq!(model["adapt_context_step"], 16384, "the 27B's field, in its section: {document}");
     assert_eq!((&spec["backend"], &spec["draft_tokens"], &spec["decode_lanes"]), (&json!("mtp"), &json!(7), &json!(1)), "{document}");
     assert_eq!(vram["headroom_bytes"], "512M", "{document}");
     let vision = &document["vision"];

@@ -26,10 +26,17 @@ of weights, while single-turn code barely moves
 - **MTP is this class's default drafter**
   ([ADR 0095](0095-the-27b-has-two-drafters-and-its-mtp-head-keeps-attention-state-over-the-whole-context-and-a-continuation-hidden.md),
   at the window #628 measured, 7), where every other class drafts with DFlash2: DFlash2 holds about 0.7 GB more,
-  which on this card is the context.
+  which on this card is the context. Measured (#635, candidate A in 12 GiB), DFlash2 also keeps 131,072 tokens there:
+  its plan's lines are 707,931,720 bytes more than the head's and its KV pool holds 150,720 tokens against the head's
+  214,144. In that budget the head's edge is pool; on a real card the pool is the context: on the plan's arithmetic,
+  from the DFlash2 load's logged lines, DFlash2 keeps 49,152 tokens on an RTX 50 card with nothing else on it, where
+  the head keeps 131,072, and beside a desktop of about 0.75 GB it keeps no step.
 - **The profile is sized for a desktop on the card, one user**: one decode lane, a context of 131,072 that adapts in
-  steps of 32,768 (`model.adapt_context_step`; 65,536 elsewhere), `vram.qwen38.headroom_bytes` 512M (1200M
+  steps of 16,384 (`model.adapt_context_step`; 65,536 elsewhere), `vram.qwen38.headroom_bytes` 512M (1200M
   elsewhere), a 512-token prefill chunk with the solo width at the chunk, vision on in host memory at 4,096 tokens.
+  The step is the owner's call of 2026-11-16, after the gate: a real card's budget is derived from the memory its
+  desktop leaves, the context is the largest step that budget holds, and at 32,768 the real-card cases wasted up to
+  a step of it, which 16,384 recovers at no cost.
   Every value is a default the load adapts and the operator overrides; two lanes, a 256-token chunk and DFlash2 stay
   configuration choices. The chunk's price is measured (#636, candidate A in 12 GiB): 512 buys 4,608 tokens of KV
   pool over 1,024, not the estimated 17,000, for 7% on the first token, and 256 buys none with vision on, 25%
@@ -39,7 +46,8 @@ of weights, while single-turn code barely moves
   0.0484; the 16 GB body reads 0.0403 and the estimate for this recipe is about 0.056. Measured on 2026-11-16
   (#635), against the 16 GB body's 0.04177 on that session's engine and shape, whose limit is 0.0501: the optimizer's
   recipe (candidate A) reads 0.04308, 1.03 times, and the GGUF allocation's (B) 0.05084, 1.22 times. The estimate of
-  0.056 was high ([the finding](../findings/2026-11-15-the-12-gb-card-class-online-research.md)).
+  0.056 was high ([the finding](../findings/2026-11-15-the-12-gb-card-class-online-research.md)). The owner admitted
+  candidate A on 2026-11-16 as `trellis-ig28`, the ceiling staying 9.2 GB and the chunk 512.
 
 ## Considered Options
 
@@ -51,8 +59,10 @@ of weights, while single-turn code barely moves
   licence that restricts commercial serving. A later phase.
 - **Keeping the class inside the 16 GB class and adapting.** The class decides the artifact (ADR 0064), and no
   adaptation changes an artifact.
-- **The 65,536-token step of the other classes.** A desktop that leaves room for about 100,000 tokens would get
-  65,536; with 32,768 it gets 98,304.
+- **The 65,536-token step of the other classes, or 32,768.** The spec took 32,768, so that a desktop leaving room for
+  about 100,000 tokens kept 98,304 and not 65,536. On a real card's derived budget either throws away up to a step
+  of the context the free memory holds: beside a desktop of about 0.5 GB 32,768 keeps 65,536 where 16,384 keeps
+  81,920, and beside about 0.3 GB 98,304 where 16,384 keeps 114,688; the finer step costs nothing.
 - **The 1200M headroom of the other classes.** With it no context is left: 512M is a choice, not a placeholder.
 
 ## Consequences
@@ -60,6 +70,17 @@ of weights, while single-turn code barely moves
 - The headroom and the context are the RTX 5090's simulation, under an explicit 12 GiB budget and that less 1 GiB
   (131,072 and 98,304 tokens, measured by the plan on candidate A), until a 12 GB card reads its CUDA
   context, its residual at one lane and its speed.
+- A real 12 GB card's context is the plan's arithmetic on those lines until one confirms it (#639). Its budget is
+  what NVML reads free before the start less 512 MiB: 131,072 tokens need 12,027 MiB free on Blackwell's routes and
+  12,112 MiB on an RTX 30 or 40 card's, whose dense prefill buffer is 89 MB more, and each 16,384-token step below
+  about 153 MiB less. With nothing else on a card of about 11.9 GiB (about 11.75 GiB free) that is 131,072 tokens
+  on Blackwell's routes and 114,688 on the 8.x routes; beside a desktop of about 0.3 GB 114,688 and 98,304; about
+  0.5 GB 81,920 on both; about 0.75 GB 65,536 and 49,152; about 1 GB 32,768 on both; about 1.3 GB the start is
+  refused, 10 MiB short of 16,384. The spec's 98,304 beside a desktop's gigabyte was the RTX 5090's 12 GiB less
+  1 GiB, an explicit budget with no headroom; a real card's derived budget leaves that desktop 32,768. The guide
+  states the table (`configuration/vram-and-kv-pool.md`) and what an operator can change: the desktop,
+  `--vram-budget-bytes` (at most the 512 MiB of headroom, three steps, since a budget above free memory is
+  refused), and the second lane and DFlash2 as costs.
 - Until the class's catalog entry lands, every built-in entry is above the class: a 12 GB card is refused each of
   them by name before a fetch or a teardown, and loads an artifact named by its path.
 - A limit above 0.0484 for this class, if the owner admits one, is registered in the spec that admits it.

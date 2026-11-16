@@ -261,7 +261,7 @@ pub const RTX_12GB_LESS_1_GIB: PinnedLoad =
     PinnedLoad { budget: RTX_12GB_BUDGET - (1 << 30), shape_bytes: RTX_12GB_SHAPE - 2_048, ..RTX_12GB };
 
 /// What the load less 1 GiB logs in its plan's `adapted`.
-pub const RTX_12GB_LESS_1_GIB_ADAPTED: &str = "max_context 131072 -> 98304 (adapt_context_step 32768, one lane)";
+pub const RTX_12GB_LESS_1_GIB_ADAPTED: &str = "max_context 131072 -> 98304 (adapt_context_step 16384, one lane)";
 
 /// The ladder's first step less 1 GiB, 131,072 tokens: the plan's floor at
 /// one lane, one sequence and a page for each of the lane's two retained
@@ -289,16 +289,16 @@ pub const TRELLIS_DENSE_BYTES: u64 = 89_128_960;
 /// no byte of their own.
 pub const RTX_12GB_8X: PinnedLoad = PinnedLoad { shape_bytes: RTX_12GB_SHAPE + TRELLIS_DENSE_BYTES, ..RTX_12GB };
 
-/// That load less 1 GiB, adapted to 65,536 tokens: the block tables hold
-/// 65,536, 4,096 bytes fewer than at 131,072.
+/// That load less 1 GiB, adapted to 81,920 tokens: the block tables hold
+/// 81,920, 3,072 bytes fewer than at 131,072.
 pub const RTX_12GB_8X_LESS_1_GIB: PinnedLoad =
-    PinnedLoad { budget: RTX_12GB_BUDGET - (1 << 30), shape_bytes: RTX_12GB_SHAPE + TRELLIS_DENSE_BYTES - 4_096, ..RTX_12GB };
+    PinnedLoad { budget: RTX_12GB_BUDGET - (1 << 30), shape_bytes: RTX_12GB_SHAPE + TRELLIS_DENSE_BYTES - 3_072, ..RTX_12GB };
 
 /// What it logs in its plan's `adapted`.
-pub const RTX_12GB_8X_LESS_1_GIB_ADAPTED: &str = "max_context 131072 -> 65536 (adapt_context_step 32768, one lane)";
+pub const RTX_12GB_8X_LESS_1_GIB_ADAPTED: &str = "max_context 131072 -> 81920 (adapt_context_step 16384, one lane)";
 
-/// The step it passes over less 1 GiB, 98,304 tokens: its floor of 1,541
-/// pages beside the dense buffer.
+/// The last step it passes over less 1 GiB, 98,304 tokens: its floor of
+/// 1,541 pages beside the dense buffer.
 pub const RTX_12GB_8X_LESS_1_GIB_98304: PinnedRefusal = PinnedRefusal {
     budget: RTX_12GB_BUDGET - (1 << 30),
     needed_bytes: 11_358_137_344,

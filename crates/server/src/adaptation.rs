@@ -546,9 +546,10 @@ mod tests {
         }
     }
 
-    /// The ladder `rtx-12gb` gives the 27B: 32,768-token steps, the default
-    /// spare reservation (which one lane never asks for).
-    const RTX_12GB_LADDER: Ladder = Ladder { context_step: 32_768, spare_tokens: 65_536 };
+    /// The ladder `rtx-12gb` gives the 27B: 16,384-token steps (the owner's
+    /// call of 2026-11-16), the default spare reservation (which one lane
+    /// never asks for).
+    const RTX_12GB_LADDER: Ladder = Ladder { context_step: 16_384, spare_tokens: 65_536 };
 
     /// `rtx-12gb`'s values at `max_context`: one lane, the MTP head (the
     /// full head), its scratch at the 512-token chunk.
@@ -920,28 +921,31 @@ mod tests {
         }
     }
 
-    /// Spec #630 (GitHub #637): the 12 GB profile's ladder, at one lane,
-    /// walks 131,072 down 32,768 at a time, each budget keeping one step
-    /// lower, and names the step as every adaptation is named: a desktop that
-    /// leaves room for about 100,000 tokens keeps 98,304, not 65,536.
+    /// Spec #630 (GitHub #637), at the step the owner set on 2026-11-16: the
+    /// 12 GB profile's ladder, at one lane, walks 131,072 down 16,384 at a
+    /// time, each budget keeping one step lower, and names the step as every
+    /// adaptation is named. A budget that holds 114,688 keeps it, where a
+    /// 32,768-token step would drop it to 98,304 and the default step to
+    /// 65,536: the context a coarser step wastes on a real card.
     #[test]
-    fn the_12gb_ladder_steps_131072_98304_65536_32768_at_one_lane() {
+    fn the_12gb_ladder_steps_131072_down_16384_at_a_time_at_one_lane() {
         let fits = Gb12::in_budget(Gb12::floor_budget(rtx_12gb_at(131_072)));
         assert!(kept(fits.adapt(RTX_12GB_LADDER).0).steps.is_empty(), "131,072 fits as configured");
-        for context in [98_304, 65_536, 32_768] {
+        for context in [114_688, 98_304, 81_920, 65_536, 49_152, 32_768, 16_384] {
             let card = Gb12::in_budget(Gb12::floor_budget(rtx_12gb_at(context)));
             let (result, attempts) = card.adapt(RTX_12GB_LADDER);
             let adapted = kept(result);
             assert_eq!(adapted.attempt, rtx_12gb_at(context), "{context}");
-            assert_eq!(adapted.steps, [AdaptStep::MaxContext { from: 131_072, to: context, context_step: 32_768, room: Room::OneLane }]);
+            assert_eq!(adapted.steps, [AdaptStep::MaxContext { from: 131_072, to: context, context_step: 16_384, room: Room::OneLane }]);
             assert!(attempts.iter().all(|a| a.decode_lanes == 1), "one lane has no lane to drop: {attempts:?}");
         }
-        let card = Gb12::in_budget(Gb12::floor_budget(rtx_12gb_at(98_304)));
+        let card = Gb12::in_budget(Gb12::floor_budget(rtx_12gb_at(114_688)));
         assert_eq!(
             steps_text(&kept(card.adapt(RTX_12GB_LADDER).0).steps),
-            "max_context 131072 -> 98304 (adapt_context_step 32768, one lane)"
+            "max_context 131072 -> 114688 (adapt_context_step 16384, one lane)"
         );
-        // At the default step the same budget falls to 65,536.
+        // At 32,768 the same budget falls to 98,304, at the default step to 65,536.
+        assert_eq!(kept(card.adapt(Ladder { context_step: 32_768, ..RTX_12GB_LADDER }).0).attempt, rtx_12gb_at(98_304));
         assert_eq!(kept(card.adapt(DEFAULT).0).attempt, rtx_12gb_at(65_536));
     }
 
@@ -953,14 +957,17 @@ mod tests {
     fn a_10gib_card_under_rtx_12gb_is_refused_naming_the_bytes_it_misses() {
         let budget = (10u64 << 30) - (512 << 20);
         let refused = refused(Gb12::in_budget(budget).adapt(RTX_12GB_LADDER).0);
-        let needed = Gb12::floor_budget(rtx_12gb_at(32_768));
-        assert!(matches!(refused.error, VramPlanError::BelowMinimum { max_context_tokens: 32_768, .. }), "{:?}", refused.error);
+        let needed = Gb12::floor_budget(rtx_12gb_at(16_384));
+        assert!(matches!(refused.error, VramPlanError::BelowMinimum { max_context_tokens: 16_384, .. }), "{:?}", refused.error);
         let message = refused.to_string();
         assert!(
             message.contains(&format!("needs {needed} bytes")) && message.contains(&format!("{} bytes more than the {budget}-byte VRAM budget", needed - budget)),
             "{message}"
         );
-        assert!(message.ends_with("; adaptation tried, in order: max_context 131072 -> 98304 -> 65536 -> 32768"), "{message}");
+        assert!(
+            message.ends_with("; adaptation tried, in order: max_context 131072 -> 114688 -> 98304 -> 81920 -> 65536 -> 49152 -> 32768 -> 16384"),
+            "{message}"
+        );
     }
 
     /// Spec #630 (GitHub #637): in a 12 GiB budget the 12 GB artifact's plan
@@ -980,8 +987,9 @@ mod tests {
     }
 
     /// Spec #630 (GitHub #637): less 1 GiB, 131,072 tokens miss their floor of
-    /// 2,053 pages and the ladder's next step, 98,304, holds its 1,541 in a
-    /// pool of 1,633: the load adapts one step and says so.
+    /// 2,053 pages, 114,688 theirs of 1,797, and the ladder's next step,
+    /// 98,304, holds its 1,541 in a pool of 1,633: the load adapts and says
+    /// so.
     #[test]
     fn less_1_gib_the_12gb_artifacts_plan_adapts_to_98304_and_names_the_step() {
         let card = Gb12::in_budget(GIB_12 - (1 << 30));
@@ -992,8 +1000,8 @@ mod tests {
         let (result, attempts) = card.adapt(RTX_12GB_LADDER);
         let adapted = kept(result);
         assert_eq!(adapted.attempt, rtx_12gb_at(98_304));
-        assert_eq!(steps_text(&adapted.steps), "max_context 131072 -> 98304 (adapt_context_step 32768, one lane)");
-        assert_eq!(attempts.iter().map(|a| a.max_context).collect::<Vec<_>>(), [131_072, 98_304]);
+        assert_eq!(steps_text(&adapted.steps), "max_context 131072 -> 98304 (adapt_context_step 16384, one lane)");
+        assert_eq!(attempts.iter().map(|a| a.max_context).collect::<Vec<_>>(), [131_072, 114_688, 98_304]);
         assert_eq!(adapted.plan.kv_page_count, 1_633);
     }
 
@@ -1001,9 +1009,9 @@ mod tests {
     /// dense prefill's buffer is the plan's one line more: in 12 GiB it leaves
     /// 3,204 pages, 142 fewer, and 131,072 tokens still load; less 1 GiB, at
     /// the RTX 5090's context and trellis workspace, 98,304 misses its floor
-    /// by 50 pages and the load adapts to 65,536.
+    /// by 50 pages and the load adapts one step further, to 81,920.
     #[test]
-    fn on_an_rtx_30_or_40_cards_routes_the_dense_buffer_keeps_131072_in_12_gib_and_65536_less_1_gib() {
+    fn on_an_rtx_30_or_40_cards_routes_the_dense_buffer_keeps_131072_in_12_gib_and_81920_less_1_gib() {
         let routes_8x = |budget| Gb12 { budget, trellis_dense: TRELLIS_DENSE };
         let adapted = kept(routes_8x(GIB_12).adapt(RTX_12GB_LADDER).0);
         assert_eq!((adapted.attempt, adapted.steps.as_slice()), (rtx_12gb_at(131_072), &[][..]));
@@ -1016,9 +1024,45 @@ mod tests {
         assert_eq!((needed_bytes - budget_bytes).div_ceil(Gb12::page()), 50);
         let (result, attempts) = card.adapt(RTX_12GB_LADDER);
         let adapted = kept(result);
-        assert_eq!(steps_text(&adapted.steps), "max_context 131072 -> 65536 (adapt_context_step 32768, one lane)");
-        assert_eq!(attempts.iter().map(|a| a.max_context).collect::<Vec<_>>(), [131_072, 98_304, 65_536]);
+        assert_eq!(steps_text(&adapted.steps), "max_context 131072 -> 81920 (adapt_context_step 16384, one lane)");
+        assert_eq!(attempts.iter().map(|a| a.max_context).collect::<Vec<_>>(), [131_072, 114_688, 98_304, 81_920]);
         assert_eq!(adapted.plan.kv_page_count, 1_491);
+    }
+
+    /// Spec #630 (GitHub #637), the figures the owner asked the guide for on
+    /// 2026-11-16: on a real 12 GB card the budget is derived, the memory
+    /// NVML reads free before the start less `rtx-12gb`'s 512 MiB of headroom,
+    /// and the context is the plan's on the RTX 5090's lines (a real card
+    /// confirms them, #639). From a card with nothing else on it, about 11.75
+    /// of a 12 GB card's 11.9 GiB free, to one whose desktop holds about
+    /// 1.3 GB, on Blackwell's routes and on an RTX 30 or 40 card's; then the
+    /// free memory 131,072 tokens need on each, a MiB less taking one step.
+    #[test]
+    fn on_a_real_12gb_card_the_derived_budget_gives_each_desktop_its_context() {
+        const HEADROOM: u64 = 512 << 20;
+        let derived = |free_mib: u64, trellis_dense: u64| Gb12 { budget: (free_mib << 20) - HEADROOM, trellis_dense };
+        let context = |card: Gb12| card.adapt(RTX_12GB_LADDER).0.ok().map(|adapted| adapted.attempt.max_context);
+        // Free MiB at the start; the context on Blackwell's routes, then on an RTX 30 or 40 card's.
+        let cases = [
+            (12_032, Some(131_072), Some(114_688)), // nothing else on the card
+            (11_878, Some(114_688), Some(98_304)),  // a light desktop, ~0.3 GB
+            (11_704, Some(81_920), Some(81_920)),   // ~0.5 GB
+            (11_468, Some(65_536), Some(49_152)),   // ~0.75 GB
+            (11_233, Some(32_768), Some(32_768)),   // ~1 GB
+            (10_946, None, None),                   // ~1.3 GB: refused
+        ];
+        for (free_mib, blackwell, routes_8x) in cases {
+            assert_eq!(context(derived(free_mib, 0)), blackwell, "{free_mib} MiB free, Blackwell's routes");
+            assert_eq!(context(derived(free_mib, TRELLIS_DENSE)), routes_8x, "{free_mib} MiB free, an RTX 30 or 40 card's routes");
+        }
+        // 131,072 tokens need 12,027 MiB free on Blackwell's routes and 12,112
+        // on an RTX 30 or 40 card's; each step below 256 pages less, ~153 MiB.
+        for (free_mib, trellis_dense) in [(12_027, 0), (12_112, TRELLIS_DENSE)] {
+            assert_eq!(context(derived(free_mib, trellis_dense)), Some(131_072), "{free_mib}");
+            assert_eq!(context(derived(free_mib - 1, trellis_dense)), Some(114_688), "{free_mib} less 1 MiB");
+        }
+        let step = Gb12::floor_budget(rtx_12gb_at(131_072)) - Gb12::floor_budget(rtx_12gb_at(114_688));
+        assert_eq!(step, 160_433_152, "256 pages and their block tables");
     }
 
     /// Decision 6: a context the plan holds at two lanes without a spare

@@ -23,7 +23,7 @@ A profile follows the card's memory, not its generation, and what a card loads f
 
 | Field | Model | Value |
 |---|---|---|
-| [`model.adapt_context_step`](configuration.md#modeladapt_context_step) | every model | `32768` |
+| [`model.adapt_context_step`](configuration.md#modeladapt_context_step) | every model | `16384` |
 | [`model.max_context`](configuration.md#modelmax_context) | Qwen3.8-27B | `131072` |
 | [`model.prefill_chunk`](configuration.md#modelprefill_chunk) | Qwen3.8-27B | `512` |
 | [`model.prefill_chunk_solo`](configuration.md#modelprefill_chunk_solo) | Qwen3.8-27B | `512` |

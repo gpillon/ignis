@@ -108,9 +108,9 @@ fn rtx_12gb_keeps_its_measured_pool_and_one_page_fewer_at_the_constant() {
 }
 
 /// Less 1 GiB the 131,072-token step misses its floor of 2,053 pages by 420
-/// at the measured context (421 at the constant), and the next, 98,304, holds
-/// its 1,541 in a pool of 1,633 pages, 104,512 tokens: the load adapts one
-/// step, and its log says so.
+/// at the measured context (421 at the constant), 114,688 its 1,797 by 164,
+/// and 98,304 holds its 1,541 in a pool of 1,633 pages, 104,512 tokens: the
+/// load adapts, and its log says so.
 #[test]
 fn rtx_12gb_less_1_gib_adapts_to_98304_on_a_pool_of_1633_pages() {
     let refusal = RTX_12GB_LESS_1_GIB_131072;
@@ -119,7 +119,7 @@ fn rtx_12gb_less_1_gib_adapts_to_98304_on_a_pool_of_1633_pages() {
     let load = RTX_12GB_LESS_1_GIB;
     assert_eq!(load.pool_tokens(load.on_the_rtx_5090(MEASURED)), 104_512);
     assert_eq!(load.pool_tokens(load.on_the_rtx_5090(CUDA_CONTEXT_BYTES)), 104_448);
-    let step = AdaptStep::MaxContext { from: 131_072, to: 98_304, context_step: 32_768, room: Room::OneLane };
+    let step = AdaptStep::MaxContext { from: 131_072, to: 98_304, context_step: 16_384, room: Room::OneLane };
     assert_eq!(steps_text(&[step]), RTX_12GB_LESS_1_GIB_ADAPTED);
 }
 
@@ -127,9 +127,9 @@ fn rtx_12gb_less_1_gib_adapts_to_98304_on_a_pool_of_1633_pages() {
 /// takes 142 pages, 3,204 left in 12 GiB (205,056 tokens against Blackwell's
 /// 214,144), and 131,072 tokens still load. Less 1 GiB, with the RTX 5090's
 /// context and trellis workspace, 98,304 misses its floor by 50 pages (51 at
-/// the constant), and the load adapts to 65,536 on a pool of 1,491 pages.
+/// the constant), and the load adapts to 81,920 on a pool of 1,491 pages.
 #[test]
-fn on_an_rtx_30_or_40_cards_routes_rtx_12gb_keeps_131072_in_12_gib_and_adapts_to_65536_less_1_gib() {
+fn on_an_rtx_30_or_40_cards_routes_rtx_12gb_keeps_131072_in_12_gib_and_adapts_to_81920_less_1_gib() {
     let load = RTX_12GB_8X;
     assert_eq!(load.pool_tokens(load.on_the_rtx_5090(MEASURED)), 205_056);
     assert_eq!(load.pool_tokens(load.on_the_rtx_5090(CUDA_CONTEXT_BYTES)), 204_992);
@@ -141,6 +141,6 @@ fn on_an_rtx_30_or_40_cards_routes_rtx_12gb_keeps_131072_in_12_gib_and_adapts_to
     let load = RTX_12GB_8X_LESS_1_GIB;
     assert_eq!(load.pool_tokens(load.on_the_rtx_5090(MEASURED)), 95_424);
     assert_eq!(load.pool_tokens(load.on_the_rtx_5090(CUDA_CONTEXT_BYTES)), 95_360);
-    let step = AdaptStep::MaxContext { from: 131_072, to: 65_536, context_step: 32_768, room: Room::OneLane };
+    let step = AdaptStep::MaxContext { from: 131_072, to: 81_920, context_step: 16_384, room: Room::OneLane };
     assert_eq!(steps_text(&[step]), RTX_12GB_8X_LESS_1_GIB_ADAPTED);
 }

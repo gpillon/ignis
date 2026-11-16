@@ -1708,7 +1708,7 @@ or `rtxpro6000`, or a config file's `profiles:`):
 below the config file, above the hardcoded defaults — a default, never an
 override. `auto`, the default, picks the built-in profile of the card's **card
 class** from NVML's total memory (ADR 0063); a named profile always wins. A
-profile may set the ladder's step too: `rtx-12gb` steps 32,768 (ADR 0098).
+profile may set the ladder's step too: `rtx-12gb` steps 16,384 (ADR 0098).
 
 **Adaptation**:
 A 27B load lowering the values its profile or the hardcoded defaults gave, in a
@@ -1719,7 +1719,7 @@ refused below its minimum adapts; one that fits as configured changes nothing.
 
 **Ladder**:
 The contexts an adaptation plans, from the configured one down every multiple
-of the context step (`model.adapt_context_step`, 65,536; 32,768 under
+of the context step (`model.adapt_context_step`, 65,536; 16,384 under
 `rtx-12gb`) to one step, keeping
 the largest whose KV pool holds one full sequence and a spare reservation
 (`vram.adapt_spare_tokens`, 65,536) at more than one lane.

@@ -92,8 +92,10 @@ memory free at the start less 512 MiB, where the larger classes leave
 1,200 MiB and the default 1,536 MiB. The load runs one lane drafting with MTP,
 so the KV pool takes what the weights, the workspace and that lane leave, and
 must hold one 131,072-token context. When it cannot, the load lowers the
-context 32,768 tokens at a time and says so in the plan event's `adapted`:
-`max_context 131072 -> 98304 (adapt_context_step 32768, one lane)`. A card of
+context 16,384 tokens at a time and says so in the plan event's `adapted`:
+`max_context 131072 -> 98304 (adapt_context_step 16384, one lane)`. What a
+real card keeps depends on its desktop:
+[on a real 12 GB card](#on-a-real-12-gb-card). A card of
 10 or 11 GB is read as the class, and its plan refuses the start after every
 step, naming the bytes it misses.
 
@@ -121,8 +123,51 @@ A token of KV costs 9,792 bytes there, not 9,216: the MTP head keeps its own
 attention layer in the pool. The pool's floor at 131,072 tokens is 2,053
 pages: one sequence, a page for each of the lane's two retained slots, and
 the three the head's copies keep back. In an 11 GiB budget the same lines
-leave 1,633 pages, 104,512 tokens, so the load takes the next step, 98,304,
-and its plan's `adapted` says
-`max_context 131072 -> 98304 (adapt_context_step 32768, one lane)`. On the
+leave 1,633 pages, 104,512 tokens, so the load passes 114,688 over for
+98,304, and its plan's `adapted` says
+`max_context 131072 -> 98304 (adapt_context_step 16384, one lane)`. On the
 routes an RTX 30 or 40 card runs, the dense prefill's 89 MB buffer takes 142
-pages of the pool ([the profile](../concepts/profiles.md#rtx-12gb)).
+pages of the pool, and in 11 GiB the load adapts to 81,920
+([the profile](../concepts/profiles.md#rtx-12gb)).
+
+### On a real 12 GB card
+
+A 12 GB card reads about 11.9 GiB in all, and `rtx-12gb` derives its budget:
+the memory free before the start, as NVML and `nvidia-smi` read it, less
+512 MiB. So the context is what the desktop and the other programs on the
+card leave. These figures are the plan's arithmetic on the lines above, the
+RTX 5090's (its CUDA context among them), not a measurement on a 12 GB card,
+which will confirm or correct them
+([issue #639](https://github.com/gpillon/ignis/issues/639)):
+
+| What else holds the card | Free at the start | Context, RTX 50 card | Context, RTX 30 or 40 card |
+|---|---:|---:|---:|
+| nothing: no display on it | 12,032 MiB | 131,072 | 114,688 |
+| a light desktop, about 0.3 GB | 11,878 MiB | 114,688 | 98,304 |
+| a desktop, about 0.5 GB | 11,704 MiB | 81,920 | 81,920 |
+| a desktop, about 0.75 GB | 11,468 MiB | 65,536 | 49,152 |
+| a desktop, about 1 GB | 11,233 MiB | 32,768 | 32,768 |
+| a desktop, about 1.3 GB | 10,946 MiB | refused | refused |
+
+131,072 tokens need 12,027 MiB free on an RTX 50 card and 12,112 MiB on an
+RTX 30 or 40 card, whose dense prefill buffer is one line more; each
+16,384-token step below needs about 153 MiB less. The first two rows are
+within 5 MiB of their step on an RTX 50 card: a few MiB more taken and each
+keeps one step less; the last misses 16,384 tokens by 10 MiB. Your own figure is `nvidia-smi`'s free memory before the
+start, and the load's `ignis.runtime.vram_plan` event says what it kept.
+
+What changes the context:
+
+- **What else is on the card.** Each 153 MiB the desktop and other programs
+  give back is a step: a display on another card or on the processor's
+  graphics, a browser without hardware acceleration, fewer programs open.
+- **`--vram-budget-bytes`.** A budget you name replaces the derived one. A
+  budget above the free memory refuses the start (unless
+  `--vram-allow-oversubscription`), so it gains at most the 512 MiB of
+  headroom, three steps, and gives up what the headroom is for: a desktop
+  that grows after the start makes Windows page the card's memory and decode
+  collapse ([the VRAM plan](../concepts/vram-plan.md)).
+- **A second lane** (`--spec-decode-lanes 2`) costs about 0.87 GB, more than
+  five steps, and **DFlash2** about 0.7 GB more than the MTP head
+  ([the profile](../concepts/profiles.md#rtx-12gb)): choices for a card with
+  room for them.

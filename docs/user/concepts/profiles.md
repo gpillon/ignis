@@ -213,7 +213,8 @@ Why each:
 
 From 0.11.0. The 12 GB class: the RTX 5070, the 12 GB RTX 4070 family, the
 RTX 3060 12 GB and the RTX 3080 Ti, a total memory below 14 GiB. It is sized
-for one person with a desktop on the card, about 1 GB of it already taken
+for one person with a desktop on the card, and its context is what the
+desktop leaves
 ([ADR 0098](../../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md)).
 The profile names no model. The class's own artifact, the 27B at about 2.8
 bits per weight under a ceiling of 9.2 GB of weights, is not published yet:
@@ -228,7 +229,7 @@ no card but the RTX 5090 has measured it.
 
 | Field | 27B |
 |---|---|
-| Context | 131,072, adapting 32,768 tokens at a time (`model.adapt_context_step`) |
+| Context | 131,072, adapting 16,384 tokens at a time (`model.adapt_context_step`) |
 | Vision | on, 4,096 tokens an image, tower and pool in host RAM |
 | Speculation | MTP, the 27B's own head, 7 draft tokens |
 | Decode lanes | 1 |
@@ -238,16 +239,33 @@ no card but the RTX 5090 has measured it.
 Why each:
 
 - **MTP, not DFlash2.** DFlash2 holds about 0.7 GB more than the 27B's own
-  head, and on this card that is the context. The head drafts at the window
+  head, and on this card that is the context. Held to 12 GiB on the RTX 5090
+  both load 131,072 tokens, the head beside a KV pool of 214,144 tokens and
+  DFlash2 beside 150,720; on a real card, whose budget is what the desktop
+  leaves, the pool is the context: by the plan's arithmetic DFlash2 keeps
+  49,152 tokens on an RTX 50 card with nothing else on it, where the head
+  keeps 131,072, and beside a desktop of about 0.75 GB it keeps none. The
+  head drafts at the window
   measured for it on the RTX 5090, 7
   ([MTP, for the 27B](speculative-decoding.md#mtp-for-the-27b)). On a card
   with room for it, `--qwen38-spec-backend dflash2` drafts with DFlash2 at the
   profile's 7, and `--spec-backend dflash2 --spec-draft-tokens N` at N.
-- **One lane.** A second costs about 0.87 GB, which the context pays.
+- **One lane.** A second costs about 0.87 GB, which the context pays: more
+  than five of its 16,384-token steps.
   `--spec-decode-lanes 2` asks for two on a card with nothing else on it.
-- **131,072 tokens, adapting 32,768 at a time.** Every other profile adapts
-  65,536 at a time; here that would leave a desktop that has room for about
-  100,000 tokens at 65,536, where 32,768 keeps 98,304. On the class's
+- **131,072 tokens, adapting 16,384 at a time.** Every other profile adapts
+  65,536 at a time. A 12 GB card's budget is derived from the memory free at
+  the start, which the desktop sets, and the context is the largest step that
+  memory holds, so what lies short of the next step goes unused: at 16,384
+  tokens a step is about 153 MiB, and the finer step costs nothing. By the
+  plan's arithmetic an
+  RTX 50 card keeps 131,072 tokens with nothing else on it, 81,920 beside a
+  desktop of about 0.5 GB (65,536 at a 32,768-token step) and 32,768 beside
+  about 1 GB, and a desktop of about 1.3 GB leaves no step; an RTX 30 or 40
+  card keeps a step less in some of those cases
+  ([on a real 12 GB card](../configuration/vram-and-kv-pool.md#on-a-real-12-gb-card):
+  the table, the free memory each context needs, and what you can change).
+  On the class's
   artifact, on the RTX 5090 held to an explicit 12 GiB budget
   (`--vram-budget-bytes`), 131,072 tokens load with nothing adapted, beside
   a KV pool of 214,144 tokens; held to 11 GiB, the same plan has room for
@@ -288,11 +306,14 @@ Why each:
   sets it. Planned from the RTX 5090's load, with its CUDA context and
   trellis workspace, the buffer leaves a KV pool of 205,056 tokens in 12 GiB
   against 214,144, and 131,072 tokens still load; in 11 GiB the pool is 50
-  pages, about 31 MB, short of 98,304, and the load adapts to 65,536. A card
+  pages, about 31 MB, short of 98,304, and the load adapts to 81,920. A card
   whose CUDA context and trellis workspace come to that much less than the
-  5090's keeps 98,304.
+  5090's keeps 98,304. On a real card with nothing else on it the buffer
+  costs a step: 114,688 tokens, where an RTX 50 card keeps 131,072.
 - No real 12 GB card has loaded this profile yet: its numbers are the RTX
-  5090's, held to a 12 GiB budget.
+  5090's, held to a 12 GiB budget, and a real card's are the same plan's
+  arithmetic until one confirms them
+  ([issue #639](https://github.com/gpillon/ignis/issues/639)).
 
 ### `rtx-24gb`
 
@@ -355,7 +376,7 @@ Why each:
 A profile's values, and the built-in defaults, are what the 27B asks for, not
 what it insists on. When the VRAM plan cannot hold them in the memory the
 start finds free, the load lowers them one at a time and plans again: the
-drafter's head first, then the context in steps (65,536 tokens; 32,768 under
+drafter's head first, then the context in steps (65,536 tokens; 16,384 under
 `rtx-12gb`), then the lanes. A
 [solo width](../configuration/context-and-speculation.md#the-solo-width) is
 settled before any of them: `auto` takes a wider one only where nothing else

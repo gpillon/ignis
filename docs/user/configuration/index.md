@@ -103,7 +103,9 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
 - `rtx-12gb`, from 0.11.0, is the 12 GB class (RTX 5070, the 12 GB RTX 4070
   family, RTX 3060 12 GB, RTX 3080 Ti): measured on the 5090 held to a 12 GiB
   budget, not on a 12 GB card. The 27B at 131,072 tokens of context, which
-  adapt 32,768 at a time (`--model-adapt-context-step`), on one decode lane,
+  adapt 16,384 at a time (`--model-adapt-context-step`) to what the card's
+  free memory holds: on a real card with a desktop, less
+  ([on a real 12 GB card](vram-and-kv-pool.md#on-a-real-12-gb-card)); on one decode lane,
   drafting with its MTP head at 7 draft tokens, vision on at 4,096 tokens an
   image in host RAM, a VRAM headroom of 512M and a 512-token prefill chunk,
   the solo width pinned to it. It names no model, and no catalog entry is of
@@ -133,7 +135,7 @@ one named value that adapts.
 1. the drafter's head: a `shortlist` from a profile falls to `full` (the
    shortlist is bound beside the full head and costs ~357 MB);
 2. `--model-max-context`, down `--model-adapt-context-step` tokens at a time
-   (65,536; 32,768 under `rtx-12gb`) to one step, keeping the largest context at which the KV pool
+   (65,536; 16,384 under `rtx-12gb`) to one step, keeping the largest context at which the KV pool
    holds one whole sequence and a spare reservation of
    `--vram-adapt-spare-tokens` (65,536) for a second request (at one lane,
    the sequence alone);

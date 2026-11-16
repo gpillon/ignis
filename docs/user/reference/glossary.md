@@ -17,7 +17,7 @@ how many tokens a speculative round yields. See
 
 **Adaptation.** A 27B load lowering the values its profile or the built-in
 defaults gave until its VRAM plan fits: the drafter's head, then the context
-in steps (65,536 tokens; 32,768 under `rtx-12gb`), then the decode lanes. A
+in steps (65,536 tokens; 16,384 under `rtx-12gb`), then the decode lanes. A
 value you name never adapts, and the plan event's `adapted` lists every step
 taken. See [profiles](../concepts/profiles.md#when-a-profile-does-not-fit).
 
