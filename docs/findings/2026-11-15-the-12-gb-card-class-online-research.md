@@ -13,7 +13,7 @@
   [#638](https://github.com/gpillon/ignis/issues/638), [the 16 GB quality gates](2026-10-24-27b-16gb-quality-gates.md),
   [ADR 0098](../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md)
 - Superseded by: none
-- Summary: No smaller Qwen3.8 exists, and the 27B's long agent tasks give way between 9.2 and 8.0 GB; on the RTX 5090 (KLD against BF16, set A, each pair at one shape) its 9.2 GB recipe ig28 reads 1.03x the 16 GB artifact, a 2.5-bit quant 1.66x.
+- Summary: No smaller Qwen3.8 exists, and the 27B's long agent tasks give way between 9.2 and 8.0 GB; on the RTX 5090 (KLD against BF16, set A) its 9.2 GB recipe ig28 reads 1.03x the 16 GB artifact at chunk 512, a 2.5-bit quant 1.66x at 1,024.
 
 ## Question
 
