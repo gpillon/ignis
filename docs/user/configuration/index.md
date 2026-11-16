@@ -101,8 +101,8 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   It names no model: a start with no artifact takes the catalog's 16 GB entry
   of the default id.
 - `rtx-12gb`, from 0.11.0, is the 12 GB class (RTX 5070, the 12 GB RTX 4070
-  family, RTX 3060 12 GB, RTX 3080 Ti): derived, not measured, simulated on
-  the 5090 under a 12 GiB budget. The 27B at 131,072 tokens of context, which
+  family, RTX 3060 12 GB, RTX 3080 Ti): measured on the 5090 held to a 12 GiB
+  budget, not on a 12 GB card. The 27B at 131,072 tokens of context, which
   adapt 32,768 at a time (`--model-adapt-context-step`), on one decode lane,
   drafting with its MTP head at 7 draft tokens, vision on at 4,096 tokens an
   image in host RAM, a VRAM headroom of 512M and a 512-token prefill chunk,

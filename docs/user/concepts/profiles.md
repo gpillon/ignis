@@ -243,10 +243,13 @@ Why each:
   `--spec-decode-lanes 2` asks for two on a card with nothing else on it.
 - **131,072 tokens, adapting 32,768 at a time.** Every other profile adapts
   65,536 at a time; here that would leave a desktop that has room for about
-  100,000 tokens at 65,536, where 32,768 keeps 98,304. Expected on the class's
-  artifact, until it is measured: 131,072 tokens with nothing adapted on a free
-  card, 98,304 with a desktop's gigabyte taken
-  ([when a profile does not fit](#when-a-profile-does-not-fit)).
+  100,000 tokens at 65,536, where 32,768 keeps 98,304. On the class's
+  artifact, on the RTX 5090 held to an explicit 12 GiB budget
+  (`--vram-budget-bytes`), 131,072 tokens load with nothing adapted, beside
+  a KV pool of 214,144 tokens; held to 11 GiB, the same plan has room for
+  104,512 tokens and the load adapts to 98,304
+  ([when a profile does not fit](#when-a-profile-does-not-fit), the plan line
+  by line on [the VRAM page](../configuration/vram-and-kv-pool.md#the-12-gb-class)).
 - **512 MiB of headroom.** A choice, not a placeholder: at the 1,200 MiB of
   the larger classes no context is left. A derived budget is the memory free
   at the start less 512 MiB ([VRAM budget](../configuration/vram-and-kv-pool.md#the-12-gb-class)).
@@ -259,6 +262,16 @@ Why each:
   host RAM, so with no image in flight vision costs no context.
 - **A card of 10 or 11 GB** is read as the class too: its VRAM plan refuses
   the load after every step of the ladder, naming the bytes it misses.
+- **On a 12 GB RTX 30 or 40 card** the 27B prefills on the routes those cards
+  run ([Context and speculation](../configuration/context-and-speculation.md)),
+  and the dense prefill's 89 MB buffer is a line of the VRAM plan; the
+  workspace stays, since at the 512-token chunk the vision encoder's share
+  sets it. Planned from the RTX 5090's load, with its CUDA context and
+  trellis workspace, the buffer leaves a KV pool of 205,056 tokens in 12 GiB
+  against 214,144, and 131,072 tokens still load; in 11 GiB the pool is 50
+  pages, about 31 MB, short of 98,304, and the load adapts to 65,536. A card
+  whose CUDA context and trellis workspace come to that much less than the
+  5090's keeps 98,304.
 - No real 12 GB card has loaded this profile yet: its numbers are the RTX
   5090's, held to a 12 GiB budget.
 

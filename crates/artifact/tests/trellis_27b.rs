@@ -8,6 +8,8 @@
 //!   its text scope binds with the token embedding in host memory at
 //!   <= 10.5 GB of device bytes (Acceptance 4), and the drafter, the draft
 //!   head and the vision tower bind as in the served artifact.
+//! - Machine-local too: the 12 GB artifact (spec #630, GitHub #637) binds
+//!   through the 27B's scope as `rtx-12gb` loads it at its load's weights line.
 
 use std::path::{Path, PathBuf};
 
@@ -24,6 +26,10 @@ use sha2::{Digest, Sha256};
 const REAL_ARTIFACT: &str = "F:/ai/models/Qwen3.8-27B-trellis-3bpw-ignis/qwen3_8_27b_trellis_sc30-v2.ninfer";
 /// The served 32 GB artifact the 16 GB one copies from.
 const SERVED_ARTIFACT: &str = "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer";
+/// The 12 GB artifact (spec #630): the trellis body at about 2.8 bits under
+/// the class's 9.2 GB ceiling, the objects of #635's candidate `ig28a` under
+/// the admitted artifact's own identity, in the models folder.
+const ARTIFACT_12G: &str = "F:/ai/q38/ninfer-models/qwen3_8_27b_trellis_ig28-v2.ninfer";
 
 /// A scratch directory removed on drop.
 struct Scratch(PathBuf);
@@ -256,6 +262,31 @@ fn real_trellis_artifact_binds_through_the_27bs_model_scope() {
     if served_path.exists() {
         assert_eq!(body_27b(&Reader::open(served_path).unwrap()), Body27b::Nvfp4);
     }
+}
+
+/// Spec #630 (GitHub #637): the 12 GB artifact binds through the 27B's own
+/// scope as `rtx-12gb` loads it -- the trellis text scope, the MTP head's 12
+/// objects, the vision tower host-mapped -- at the device bytes its load's
+/// VRAM plan names as its weights line on the RTX 5090 in a 12 GiB budget,
+/// 9,651,141,632 (#635, 2026-11-16, on `ig28a`, whose objects the admitted
+/// artifact carries), its text scope under the class's ceiling of 9.2 GB.
+#[test]
+fn the_12gb_artifact_binds_through_the_27bs_scope_at_its_loads_weights_line() {
+    let path = Path::new(ARTIFACT_12G);
+    if !path.exists() {
+        eprintln!("skip: {ARTIFACT_12G} does not exist");
+        return;
+    }
+    let reader = Reader::open(path).unwrap();
+    let identity = reader.identity();
+    assert_eq!((identity.model_id.as_str(), identity.weights_id.as_str()), ("qwen3.8-27b", "trellis-ig28"));
+    assert_eq!(body_27b(&reader), Body27b::Trellis);
+    let (text, _) = bind_model_scope_27b_with(&reader, ModelScope::default()).unwrap();
+    let scope = ModelScope { draft: Some(DraftModule::Mtp), vision: true, vision_residency: VisionResidency::Host, ..ModelScope::default() };
+    let (served, _) = bind_model_scope_27b_with(&reader, scope).unwrap();
+    eprintln!("text scope {} bytes; with the MTP head and the tower in host memory {}", text.device_capacity_bytes, served.device_capacity_bytes);
+    assert!(text.device_capacity_bytes <= 9_200_000_000, "the text scope is under the class's ceiling of 9.2 GB");
+    assert_eq!(served.device_capacity_bytes, 9_651_141_632, "{scope:?}");
 }
 
 #[test]

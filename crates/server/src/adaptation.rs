@@ -438,13 +438,113 @@ mod tests {
     /// body's weights (#338), text only.
     const GB16: Card = Card { budget: 0, weights: 12_500_000_000, workspace: 342_290_432, lane: 268_000_000, chunk: CHUNK };
 
-    /// A 12 GB card's 27B under `rtx-12gb` (spec #630): a stand-in for the
-    /// 12 GB artifact's load, which is not yet admitted -- about the spec's
-    /// estimate of its weights under MTP (a 9.2 GB text scope, the head, the
-    /// CUDA context and the residual), the 16 GB stand-in's lane, and a
-    /// workspace at a 512-token chunk. The plan's real lines are pinned on
-    /// the admitted artifact.
-    const GB12: Card = Card { budget: 0, weights: 10_250_000_000, workspace: 250_000_000, lane: 268_000_000, chunk: 512 };
+    /// The 12 GB artifact's load under `rtx-12gb` (spec #630, GitHub #637),
+    /// planned as the server plans it: the lines its plan logged on the RTX
+    /// 5090 in a 12 GiB budget on 2026-11-16 (#635, on `ig28a`, whose objects
+    /// the admitted artifact carries), one lane drafting with MTP at 7, the
+    /// 512-token chunk, vision on in host RAM at 4,096 tokens; a pool whose
+    /// pages hold the MTP head's own attention layer beside the 27B's, the
+    /// pages admission keeps back for the head's holders, and the pool's block
+    /// tables, 4 bytes a context page a lane. No line follows the context on
+    /// the trellis body (ADR 0061), and these are one lane's.
+    #[derive(Clone, Copy)]
+    struct Gb12 {
+        budget: u64,
+        /// The dense prefill's buffer (GitHub #509): 0 on Blackwell's routes,
+        /// the INT8 copy of the body's largest matrix on the routes an RTX 30
+        /// or 40 card runs, the one line those routes move at this chunk.
+        trellis_dense: u64,
+    }
+
+    /// A 12 GB card's whole memory.
+    const GIB_12: u64 = 12 << 30;
+
+    /// The dense prefill's one buffer on the 27B: 5120 x 17408.
+    const TRELLIS_DENSE: u64 = 89_128_960;
+
+    impl Gb12 {
+        /// Blackwell's routes, in `budget` bytes.
+        fn in_budget(budget: u64) -> Self {
+            Self { budget, trellis_dense: 0 }
+        }
+
+        /// The plan's lines but the pool's, as #635's load logged them.
+        fn lines(&self) -> VramLines {
+            VramLines {
+                weights: 9_651_141_632,
+                cuda_context: 452_161_536,
+                workspace: 302_433_536,
+                trellis_workspace: 32_134_400,
+                trellis_dense: self.trellis_dense,
+                sampling: 579_048,
+                decode_graph: 12_802_060,
+                verify_round: 19_017_436,
+                lane_state: 154_947_584,
+                hq_residual_window: 37_879_936,
+                residual: 124_474_800,
+                ..VramLines::default()
+            }
+        }
+
+        /// One page of the MTP head's pool: the 27B's 16 attention layers and
+        /// the head's own.
+        fn page() -> u64 {
+            let body = KvGeometry::qwen38_27b();
+            KvFormat::HqE8_2b.page_bytes(KvGeometry { gqa_layers: body.gqa_layers + 1, ..body })
+        }
+
+        /// The pool's block tables at `attempt`.
+        fn block_tables(attempt: Attempt) -> u64 {
+            4 * u64::from(attempt.max_context.div_ceil(64)) * u64::from(attempt.decode_lanes)
+        }
+
+        /// The pages of the plan's floor at `attempt`: one sequence, a page
+        /// for each of the lane's two retained slots, and one for each holder
+        /// of a copy the MTP head keeps back, the lane and its two slots
+        /// (GitHub #623).
+        fn floor_pages(attempt: Attempt) -> u32 {
+            attempt.max_context.div_ceil(64) + 2 + 3
+        }
+
+        /// The budget at which `attempt` just holds its floor.
+        fn floor_budget(attempt: Attempt) -> u64 {
+            Self::in_budget(0).lines().total() + u64::from(Self::floor_pages(attempt)) * Self::page() + Self::block_tables(attempt)
+        }
+
+        fn plan(&self, attempt: Attempt) -> Result<VramPlan, VramPlanError> {
+            assert_eq!(attempt.decode_lanes, 1, "the lines are one lane's");
+            let page = Self::page();
+            let arena = move |pages: u32| u64::from(pages) * page + Self::block_tables(attempt);
+            ignis_core::plan_vram(&ignis_core::VramRequest {
+                mode: VramMode::Explicit { budget_bytes: self.budget, allow_oversubscription: false },
+                free_at_start_bytes: u64::MAX,
+                lines: self.lines(),
+                kv_page_bytes: page,
+                max_context_tokens: attempt.max_context,
+                retained_slots: 2,
+                holder_pages: 3,
+                kv_pool: None,
+                residency: Residency::Resident,
+                embedding_pool_named: false,
+                kv_arena_bytes: &arena,
+                can_page: true,
+            })
+        }
+
+        /// `rtx-12gb`'s ladder from its 131,072 tokens, with every attempt it
+        /// planned.
+        fn adapt(&self, ladder: Ladder) -> (Result<Adapted<VramPlan>, AdaptError<Infallible>>, Vec<Attempt>) {
+            let mut attempts = Vec::new();
+            let adapted = adapt(rtx_12gb_at(131_072), Adaptable::ALL, ladder, |attempt| {
+                attempts.push(attempt);
+                Ok::<_, Infallible>(match self.plan(attempt) {
+                    Ok(plan) => Planned::Fits { kv_tokens: plan.kv_token_capacity(), plan },
+                    Err(error) => Planned::Unfit(error),
+                })
+            });
+            (adapted, attempts)
+        }
+    }
 
     /// The ladder `rtx-12gb` gives the 27B: 32,768-token steps, the default
     /// spare reservation (which one lane never asks for).
@@ -826,24 +926,23 @@ mod tests {
     /// leaves room for about 100,000 tokens keeps 98,304, not 65,536.
     #[test]
     fn the_12gb_ladder_steps_131072_98304_65536_32768_at_one_lane() {
-        let start = rtx_12gb_at(131_072);
-        let fits = GB12.with_budget(GB12.budget_holding(start, 131_072 + 2 * 64));
-        assert!(kept(fits.adapt_with(start, Adaptable::ALL, RTX_12GB_LADDER).0).steps.is_empty(), "131,072 fits as configured");
+        let fits = Gb12::in_budget(Gb12::floor_budget(rtx_12gb_at(131_072)));
+        assert!(kept(fits.adapt(RTX_12GB_LADDER).0).steps.is_empty(), "131,072 fits as configured");
         for context in [98_304, 65_536, 32_768] {
-            let card = GB12.with_budget(GB12.budget_holding(rtx_12gb_at(context), context + 2 * 64));
-            let (result, attempts) = card.adapt_with(start, Adaptable::ALL, RTX_12GB_LADDER);
+            let card = Gb12::in_budget(Gb12::floor_budget(rtx_12gb_at(context)));
+            let (result, attempts) = card.adapt(RTX_12GB_LADDER);
             let adapted = kept(result);
             assert_eq!(adapted.attempt, rtx_12gb_at(context), "{context}");
             assert_eq!(adapted.steps, [AdaptStep::MaxContext { from: 131_072, to: context, context_step: 32_768, room: Room::OneLane }]);
             assert!(attempts.iter().all(|a| a.decode_lanes == 1), "one lane has no lane to drop: {attempts:?}");
         }
-        let card = GB12.with_budget(GB12.budget_holding(rtx_12gb_at(98_304), 98_304 + 2 * 64));
+        let card = Gb12::in_budget(Gb12::floor_budget(rtx_12gb_at(98_304)));
         assert_eq!(
-            steps_text(&kept(card.adapt_with(start, Adaptable::ALL, RTX_12GB_LADDER).0).steps),
+            steps_text(&kept(card.adapt(RTX_12GB_LADDER).0).steps),
             "max_context 131072 -> 98304 (adapt_context_step 32768, one lane)"
         );
         // At the default step the same budget falls to 65,536.
-        assert_eq!(kept(card.adapt_with(start, Adaptable::ALL, DEFAULT).0).attempt, rtx_12gb_at(65_536));
+        assert_eq!(kept(card.adapt(DEFAULT).0).attempt, rtx_12gb_at(65_536));
     }
 
     /// Spec #630 (GitHub #637): a 10 GiB card is read as the 12 GB class, and
@@ -853,9 +952,8 @@ mod tests {
     #[test]
     fn a_10gib_card_under_rtx_12gb_is_refused_naming_the_bytes_it_misses() {
         let budget = (10u64 << 30) - (512 << 20);
-        let card = GB12.with_budget(budget);
-        let refused = refused(card.adapt_with(rtx_12gb_at(131_072), Adaptable::ALL, RTX_12GB_LADDER).0);
-        let needed = GB12.budget_holding(rtx_12gb_at(32_768), 32_768 + 2 * 64);
+        let refused = refused(Gb12::in_budget(budget).adapt(RTX_12GB_LADDER).0);
+        let needed = Gb12::floor_budget(rtx_12gb_at(32_768));
         assert!(matches!(refused.error, VramPlanError::BelowMinimum { max_context_tokens: 32_768, .. }), "{:?}", refused.error);
         let message = refused.to_string();
         assert!(
@@ -863,6 +961,64 @@ mod tests {
             "{message}"
         );
         assert!(message.ends_with("; adaptation tried, in order: max_context 131072 -> 98304 -> 65536 -> 32768"), "{message}");
+    }
+
+    /// Spec #630 (GitHub #637): in a 12 GiB budget the 12 GB artifact's plan
+    /// is its load's, to the byte -- a KV pool of 3,346 pages, 2,096,906,240
+    /// bytes with its block tables, the three the head's holders keep back
+    /// among them, and 12,884,478,208 bytes in all -- at 131,072 tokens, with
+    /// nothing adapted.
+    #[test]
+    fn in_12_gib_the_12gb_artifacts_plan_is_its_loads_to_the_byte_and_adapts_nothing() {
+        let (result, attempts) = Gb12::in_budget(GIB_12).adapt(RTX_12GB_LADDER);
+        let adapted = kept(result);
+        assert_eq!((adapted.attempt, adapted.steps.as_slice()), (rtx_12gb_at(131_072), &[][..]));
+        assert_eq!(attempts, [rtx_12gb_at(131_072)], "one plan");
+        let plan = adapted.plan;
+        assert_eq!((plan.kv_page_count, plan.holder_pages), (3_346, 3));
+        assert_eq!((plan.kv_pool_bytes, plan.total_bytes), (2_096_906_240, 12_884_478_208));
+    }
+
+    /// Spec #630 (GitHub #637): less 1 GiB, 131,072 tokens miss their floor of
+    /// 2,053 pages and the ladder's next step, 98,304, holds its 1,541 in a
+    /// pool of 1,633: the load adapts one step and says so.
+    #[test]
+    fn less_1_gib_the_12gb_artifacts_plan_adapts_to_98304_and_names_the_step() {
+        let card = Gb12::in_budget(GIB_12 - (1 << 30));
+        let VramPlanError::BelowMinimum { needed_bytes, .. } = card.plan(rtx_12gb_at(131_072)).unwrap_err() else {
+            panic!("refused below its minimum");
+        };
+        assert_eq!(needed_bytes, 12_074_170_624, "2,053 pages beside the lines");
+        let (result, attempts) = card.adapt(RTX_12GB_LADDER);
+        let adapted = kept(result);
+        assert_eq!(adapted.attempt, rtx_12gb_at(98_304));
+        assert_eq!(steps_text(&adapted.steps), "max_context 131072 -> 98304 (adapt_context_step 32768, one lane)");
+        assert_eq!(attempts.iter().map(|a| a.max_context).collect::<Vec<_>>(), [131_072, 98_304]);
+        assert_eq!(adapted.plan.kv_page_count, 1_633);
+    }
+
+    /// Spec #630 (GitHub #637): on the routes an RTX 30 or 40 card runs, the
+    /// dense prefill's buffer is the plan's one line more: in 12 GiB it leaves
+    /// 3,204 pages, 142 fewer, and 131,072 tokens still load; less 1 GiB, at
+    /// the RTX 5090's context and trellis workspace, 98,304 misses its floor
+    /// by 50 pages and the load adapts to 65,536.
+    #[test]
+    fn on_an_rtx_30_or_40_cards_routes_the_dense_buffer_keeps_131072_in_12_gib_and_65536_less_1_gib() {
+        let routes_8x = |budget| Gb12 { budget, trellis_dense: TRELLIS_DENSE };
+        let adapted = kept(routes_8x(GIB_12).adapt(RTX_12GB_LADDER).0);
+        assert_eq!((adapted.attempt, adapted.steps.as_slice()), (rtx_12gb_at(131_072), &[][..]));
+        assert_eq!(adapted.plan.kv_page_count, 3_204);
+
+        let card = routes_8x(GIB_12 - (1 << 30));
+        let VramPlanError::BelowMinimum { needed_bytes, budget_bytes, .. } = card.plan(rtx_12gb_at(98_304)).unwrap_err() else {
+            panic!("refused below its minimum");
+        };
+        assert_eq!((needed_bytes - budget_bytes).div_ceil(Gb12::page()), 50);
+        let (result, attempts) = card.adapt(RTX_12GB_LADDER);
+        let adapted = kept(result);
+        assert_eq!(steps_text(&adapted.steps), "max_context 131072 -> 65536 (adapt_context_step 32768, one lane)");
+        assert_eq!(attempts.iter().map(|a| a.max_context).collect::<Vec<_>>(), [131_072, 98_304, 65_536]);
+        assert_eq!(adapted.plan.kv_page_count, 1_491);
     }
 
     /// Decision 6: a context the plan holds at two lanes without a spare

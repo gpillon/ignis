@@ -11,7 +11,10 @@
 //! load's widest call by the card's multiprocessors. A test pins the shape's
 //! bytes exactly and reads the card's two lines off the plan, so its pool is
 //! exact on any card and no longer moves a page when the context does; on
-//! the RTX 5090 the pin holds the trellis workspace too, to the byte.
+//! the RTX 5090 the pin holds the trellis workspace too, to the byte. A load
+//! drafting with the 27B's MTP head cuts its pages for one attention layer
+//! more, the head's own (GitHub #619), so a pin names the pool its pages are
+//! cut for.
 //! Included via `#[path]` by the binaries that pin one; the `kv_pool_pins`
 //! test binary checks the arithmetic on the CPU.
 
@@ -24,6 +27,27 @@ use ignis_core::{KvFormat, KvGeometry};
 /// One KV page of the 27B under hq-e8-2b.
 pub fn page_bytes() -> u64 {
     KvFormat::HqE8_2b.page_bytes(KvGeometry::qwen38_27b())
+}
+
+/// The pool a load's KV pages are cut for (GitHub #619).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pool {
+    /// The 27B's 16 attention layers: a load drafting with DFlash2, or not
+    /// at all.
+    Body,
+    /// Those and the MTP head's own attention layer, the pool's last.
+    Mtp,
+}
+
+impl Pool {
+    /// One hq-e8-2b page of this pool.
+    pub fn page_bytes(self) -> u64 {
+        let body = KvGeometry::qwen38_27b();
+        match self {
+            Pool::Body => page_bytes(),
+            Pool::Mtp => KvFormat::HqE8_2b.page_bytes(KvGeometry { gqa_layers: body.gqa_layers + 1, ..body }),
+        }
+    }
 }
 
 /// The `name` attribute of the plan `lines` (the `ignis.runtime.vram_plan`
@@ -54,10 +78,10 @@ impl CardLines {
     }
 }
 
-/// The bytes the plan `lines` charges beside its KV pool's pages and the
-/// card's lines: what a [`PinnedLoad`] holds, to the byte.
-pub fn shape_bytes(lines: &serde_json::Value) -> u64 {
-    (read(lines, "kv_pool_pages") * page_bytes())
+/// The bytes the plan `lines` charges beside its KV pool's pages, cut for
+/// `pool`, and the card's lines: what a [`PinnedLoad`] holds, to the byte.
+pub fn shape_bytes(lines: &serde_json::Value, pool: Pool) -> u64 {
+    (read(lines, "kv_pool_pages") * pool.page_bytes())
         .checked_add(CardLines::of(lines).bytes())
         .and_then(|beside| read(lines, "total_bytes").checked_sub(beside))
         .unwrap_or_else(|| panic!("the plan's total holds its pool and the card's lines: {lines}"))
@@ -88,14 +112,14 @@ pub fn assert_pinned(lines: &serde_json::Value, pinned: PinnedLoad, what: &str) 
     println!(
         "{what}: {} bytes beside the pool and the card's lines, a CUDA context of {} bytes and a trellis workspace \
          of {} ({}): {} tokens expected, {pool} planned",
-        shape_bytes(lines),
+        shape_bytes(lines, pinned.pool),
         card.cuda_context,
         card.trellis_workspace,
         if rtx_5090 { "the RTX 5090's, pinned" } else { "this card's" },
         pinned.pool_tokens(card)
     );
     assert_eq!(read(lines, "budget_bytes"), pinned.budget, "{what}: the budget");
-    assert_eq!(shape_bytes(lines), pinned.shape_bytes, "{what}: the bytes the plan charges beside the pool and the card's lines");
+    assert_eq!(shape_bytes(lines, pinned.pool), pinned.shape_bytes, "{what}: the bytes the plan charges beside the pool and the card's lines");
     if rtx_5090 {
         assert_eq!(card.trellis_workspace, pinned.rtx_5090_trellis_workspace, "{what}: the RTX 5090's trellis workspace");
     }
@@ -103,19 +127,20 @@ pub fn assert_pinned(lines: &serde_json::Value, pinned: PinnedLoad, what: &str) 
 }
 
 /// A load as its pin holds it: its budget, the bytes its plan charges beside
-/// the KV pool's pages and the card's lines, and its trellis workspace on the
-/// RTX 5090.
+/// the KV pool's pages and the card's lines, its trellis workspace on the
+/// RTX 5090, and the pool its pages are cut for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinnedLoad {
     pub budget: u64,
     pub shape_bytes: u64,
     pub rtx_5090_trellis_workspace: u64,
+    pub pool: Pool,
 }
 
 impl PinnedLoad {
     /// The pages of the pool this load plans beside `card`.
     pub fn pool_pages(self, card: CardLines) -> u64 {
-        self.budget.saturating_sub(self.shape_bytes + card.bytes()) / page_bytes()
+        self.budget.saturating_sub(self.shape_bytes + card.bytes()) / self.pool.page_bytes()
     }
 
     /// [`PinnedLoad::pool_pages`] in tokens.
@@ -134,13 +159,13 @@ impl PinnedLoad {
 /// the routes an 8.x card runs unset, its solo width at the 2,048-token chunk
 /// (GitHub #508): read off main's plan on 2026-11-14.
 pub const RTX_24GB_AT_THE_CHUNK: PinnedLoad =
-    PinnedLoad { budget: 25_769_803_776, shape_bytes: 14_748_563_076, rtx_5090_trellis_workspace: 64_252_160 };
+    PinnedLoad { budget: 25_769_803_776, shape_bytes: 14_748_563_076, rtx_5090_trellis_workspace: 64_252_160, pool: Pool::Body };
 
 /// `rtx-16gb` in 16 GiB less 1 GiB, on the routes an 8.x card runs unset, its
 /// solo width at the 1,024-token chunk (GitHub #489): read off main's plan on
 /// 2026-11-14.
 pub const RTX_16GB_AT_THE_CHUNK: PinnedLoad =
-    PinnedLoad { budget: 16_106_127_360, shape_bytes: 12_063_478_444, rtx_5090_trellis_workspace: 32_134_400 };
+    PinnedLoad { budget: 16_106_127_360, shape_bytes: 12_063_478_444, rtx_5090_trellis_workspace: 32_134_400, pool: Pool::Body };
 
 /// The 16 GB artifact's shape under `rtx50-16gb` (262,144 tokens on two lanes,
 /// the 1,024-token chunk), on its own card's routes: read off main's plans on
@@ -155,6 +180,7 @@ pub const RTX50_16GB: PinnedLoad = PinnedLoad {
     budget: 17_179_869_184,
     shape_bytes: RTX50_16GB_SHAPE,
     rtx_5090_trellis_workspace: RTX50_16GB_RTX_5090_TRELLIS_WORKSPACE,
+    pool: Pool::Body,
 };
 
 /// That shape less 1 GiB of simulated desktop (#340): nothing adapts.
@@ -169,19 +195,21 @@ pub const RTX50_16GB_LESS_3_GIB: PinnedLoad =
 
 /// A plan refused below its floor, as its pin holds it: its budget, the bytes
 /// it needs (`VramPlanError::BelowMinimum`'s `needed_bytes`) beside the card's
-/// lines, its pool included, and its trellis workspace on the RTX 5090.
+/// lines, its pool included, its trellis workspace on the RTX 5090, and the
+/// pool its pages are cut for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinnedRefusal {
     pub budget: u64,
     pub needed_bytes: u64,
     pub rtx_5090_trellis_workspace: u64,
+    pub pool: Pool,
 }
 
 impl PinnedRefusal {
     /// The whole KV pages this plan misses its budget by beside `card`; 0
     /// where it fits.
     pub fn pages_short(self, card: CardLines) -> u64 {
-        (self.needed_bytes + card.bytes()).saturating_sub(self.budget).div_ceil(page_bytes())
+        (self.needed_bytes + card.bytes()).saturating_sub(self.budget).div_ceil(self.pool.page_bytes())
     }
 
     /// The card's lines of this plan on the RTX 5090 beside a context of
@@ -198,4 +226,82 @@ pub const RTX50_16GB_LESS_3_GIB_131072_SPARE: PinnedRefusal = PinnedRefusal {
     budget: 17_179_869_184 - (3 << 30),
     needed_bytes: 13_809_865_388,
     rtx_5090_trellis_workspace: RTX50_16GB_RTX_5090_TRELLIS_WORKSPACE,
+    pool: Pool::Body,
+};
+
+/// A 12 GB card's whole memory: the budget spec #630 measures the class in.
+pub const RTX_12GB_BUDGET: u64 = 12_884_901_888;
+
+/// The 12 GB artifact's shape under `rtx-12gb` (spec #630, GitHub #637):
+/// 131,072 tokens on one lane drafting with MTP at 7, the 512-token chunk and
+/// vision on in host RAM at 4,096 tokens, on Blackwell's routes. Read off the
+/// plan of its load on the RTX 5090 in 12 GiB on 2026-11-16 (#635, on
+/// `ig28a`, whose objects the admitted artifact carries): the weights line,
+/// 9,651,141,632 bytes, the workspace, 302,433,536, which the vision encoder's
+/// staged share sets at this chunk, a lane's state, window, rounds and
+/// sampling, the measured residual, and the pool's block tables, 8,192 bytes.
+pub const RTX_12GB_SHAPE: u64 = 10_303_284_224;
+
+/// That shape's trellis workspace on the RTX 5090: the decode route's widest
+/// call, which no prefill call at the 512-token chunk passes.
+pub const RTX_12GB_RTX_5090_TRELLIS_WORKSPACE: u64 = 32_134_400;
+
+/// That shape in the 12 GiB budget of a 12 GB card: nothing adapts.
+pub const RTX_12GB: PinnedLoad = PinnedLoad {
+    budget: RTX_12GB_BUDGET,
+    shape_bytes: RTX_12GB_SHAPE,
+    rtx_5090_trellis_workspace: RTX_12GB_RTX_5090_TRELLIS_WORKSPACE,
+    pool: Pool::Mtp,
+};
+
+/// That shape less 1 GiB, adapted to 98,304 tokens on its lane: every line is
+/// the 131,072-token load's but the pool's block tables, which hold 98,304
+/// tokens, 2,048 bytes fewer.
+pub const RTX_12GB_LESS_1_GIB: PinnedLoad =
+    PinnedLoad { budget: RTX_12GB_BUDGET - (1 << 30), shape_bytes: RTX_12GB_SHAPE - 2_048, ..RTX_12GB };
+
+/// What the load less 1 GiB logs in its plan's `adapted`.
+pub const RTX_12GB_LESS_1_GIB_ADAPTED: &str = "max_context 131072 -> 98304 (adapt_context_step 32768, one lane)";
+
+/// The ladder's first step less 1 GiB, 131,072 tokens: the plan's floor at
+/// one lane, one sequence and a page for each of the lane's two retained
+/// slots and for each of the three holders the MTP head's copies keep back
+/// (GitHub #623), 2,053 pages.
+pub const RTX_12GB_LESS_1_GIB_131072: PinnedRefusal = PinnedRefusal {
+    budget: RTX_12GB_BUDGET - (1 << 30),
+    needed_bytes: 11_589_874_688,
+    rtx_5090_trellis_workspace: RTX_12GB_RTX_5090_TRELLIS_WORKSPACE,
+    pool: Pool::Mtp,
+};
+
+/// The dense prefill's one buffer on the 27B (GitHub #509): the INT8 copy of
+/// its largest matrix, 5120 x 17408.
+pub const TRELLIS_DENSE_BYTES: u64 = 89_128_960;
+
+/// The same load on those routes, planned on the CPU from the Blackwell
+/// load's lines (to be read off a plan on the RTX 5090, GitHub #637): the
+/// dense buffer is the one line that moves. The dense prefill narrows the
+/// prefill scratch, but at the 512-token chunk the workspace is the vision
+/// encoder's staged share (the load's `vision_reserved_bytes`, 76,951,040
+/// past the prefill's), so it stays; the trellis workspace stays the decode
+/// route's widest call, past the dense prefill's activations; and the MTP
+/// head's matrices on ours (GitHub #627) and the decode attention's route take
+/// no byte of their own.
+pub const RTX_12GB_8X: PinnedLoad = PinnedLoad { shape_bytes: RTX_12GB_SHAPE + TRELLIS_DENSE_BYTES, ..RTX_12GB };
+
+/// That load less 1 GiB, adapted to 65,536 tokens: the block tables hold
+/// 65,536, 4,096 bytes fewer than at 131,072.
+pub const RTX_12GB_8X_LESS_1_GIB: PinnedLoad =
+    PinnedLoad { budget: RTX_12GB_BUDGET - (1 << 30), shape_bytes: RTX_12GB_SHAPE + TRELLIS_DENSE_BYTES - 4_096, ..RTX_12GB };
+
+/// What it logs in its plan's `adapted`.
+pub const RTX_12GB_8X_LESS_1_GIB_ADAPTED: &str = "max_context 131072 -> 65536 (adapt_context_step 32768, one lane)";
+
+/// The step it passes over less 1 GiB, 98,304 tokens: its floor of 1,541
+/// pages beside the dense buffer.
+pub const RTX_12GB_8X_LESS_1_GIB_98304: PinnedRefusal = PinnedRefusal {
+    budget: RTX_12GB_BUDGET - (1 << 30),
+    needed_bytes: 11_358_137_344,
+    rtx_5090_trellis_workspace: RTX_12GB_RTX_5090_TRELLIS_WORKSPACE,
+    pool: Pool::Mtp,
 };

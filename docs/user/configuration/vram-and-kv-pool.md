@@ -97,8 +97,32 @@ context 32,768 tokens at a time and says so in the plan event's `adapted`:
 10 or 11 GB is read as the class, and its plan refuses the start after every
 step, naming the bytes it misses.
 
-The plan of a 12 GB load, line by line, is held to the byte on the class's
-own artifact once it is admitted, measured on the RTX 5090 under an explicit
-12 GiB budget (`--profile rtx-12gb --vram-budget-bytes 12884901888`); until
-then the context the class expects is the estimate on
-[its profile](../concepts/profiles.md#rtx-12gb).
+The plan of a 12 GB load on the class's own artifact, measured on the RTX
+5090 under an explicit 12 GiB budget
+(`--profile rtx-12gb --vram-budget-bytes 12884901888`), as its
+`ignis.runtime.vram_plan` event gives it:
+
+| Line | Bytes |
+|---|---:|
+| `weights`: the text scope and the MTP head (the vision tower is in host RAM) | 9,651,141,632 |
+| `cuda_context`, measured | 452,161,536 |
+| `workspace`: at the 512-token chunk, the vision encoder's share sets it | 302,433,536 |
+| `lane_state` | 154,947,584 |
+| `residual` | 124,474,800 |
+| `hq_residual_window` | 37,879,936 |
+| `trellis_workspace` | 32,134,400 |
+| `verify_round` | 19,017,436 |
+| `decode_graph` | 12,802,060 |
+| `sampling` | 579,048 |
+| `kv_pool`: 3,346 pages, 214,144 tokens | 2,096,906,240 |
+| total, nothing adapted | 12,884,478,208 |
+
+A token of KV costs 9,792 bytes there, not 9,216: the MTP head keeps its own
+attention layer in the pool. The pool's floor at 131,072 tokens is 2,053
+pages: one sequence, a page for each of the lane's two retained slots, and
+the three the head's copies keep back. In an 11 GiB budget the same lines
+leave 1,633 pages, 104,512 tokens, so the load takes the next step, 98,304,
+and its plan's `adapted` says
+`max_context 131072 -> 98304 (adapt_context_step 32768, one lane)`. On the
+routes an RTX 30 or 40 card runs, the dense prefill's 89 MB buffer takes 142
+pages of the pool ([the profile](../concepts/profiles.md#rtx-12gb)).
