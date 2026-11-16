@@ -32,7 +32,8 @@ it. Python never writes the container.
 | `reconstruction.py` | The conversion's GPU step and its only exllamav3 user: each trellis matrix's relative reconstruction error against the BF16 checkpoint. |
 | `replay.py` | The abliterated variant's 70 matrices re-quantized by replaying exllamav3's conversion: the plan (no torch), `fetch` of huihui's changed tensors by HTTP range, `run` (the GPU step). |
 | `recipe.py` | A named recipe (GitHub #631): `load` reads and checks `recipes/<name>.json`; the text scope's bytes and the bits per weight; a local conversion's per-tensor recipe (`job`) and exllamav3's YAML. |
-| `recipes/` | The recipes, one JSON file each, named by its stem: `sc30.json` is the 16 GB artifact's and the default. |
+| `recipes/` | The recipes, one JSON file each, named by its stem: `sc30.json` is the 16 GB artifact's and the default; `ig28b.json` the 12 GB class's second candidate (`gguf_recipe.py`). |
+| `gguf_recipe.py` | A recipe translated from a public GGUF file's per-tensor allocation (GitHub #634): `header` reads the file's header by HTTP ranges (no weights), `recipe` translates its types to integer K under a ceiling. |
 | `local_quant.py` | An EXL3 quant of the 27B or a fine-tune converted on this machine by exllamav3 at a named recipe: `run` (the GPU step, its check, the pins and the provenance) and `control` (each matrix's error against the fine-tune's BF16 beside the default artifact's). |
 | `work.py` | The DONE protocol the packer checks (copied from `tools/image-converter/work.py`). |
 | `test_*.py`, `conftest.py` | Unit tests (CPU only) on a reduced synthetic served artifact and quant. |
@@ -127,6 +128,26 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
   weight**, its average K weighted by each matrix's weights, the head apart as exllamav3's `bits` counts
   it (`sc30`: 2.9998). Nothing of it reaches the container: the 16 GB artifact converted through a recipe
   is the bytes it was.
+
+### A recipe from a GGUF allocation
+
+`gguf_recipe.py` (GitHub #634) makes `ig28b`, the 12 GB class's second candidate, from the per-tensor types of the
+public dynamic 2-bit GGUF file of the 27B, read from its header and never its weights:
+
+```
+F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/gguf_recipe.py header     --repo unsloth/Qwen3.8-27B-GGUF --revision 4af51b3542f775b0a8e4b310bfb3f17e01c306c9     --file Qwen3.8-27B-UD-Q2_K_XL.gguf --out <table.json>
+F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/gguf_recipe.py recipe --table <table.json>     --record F:/ai/q38/ninfer-models/qwen3_8_27b_trellis_sc30-v2.ninfer.conversion.json     --name ig28b --weights-id trellis-ig28b --ceiling 9200000000
+```
+
+- **`header`** writes the file's size, LFS oid and revision and every tensor's name, dims and ggml type, reading 1 MiB
+  ranges until the header ends.
+- **`recipe`** gives each matrix the integer K nearest its type's bits per weight (block scales included) plus one
+  shift for the whole body, 2 to 5, the head at 4; the shift is the largest whose text scope (counted as above, from the
+  record's shapes and copied objects) is at or under `--ceiling`, and the class that would cross next is promoted by
+  its layer's mean bits, then its key, while it fits. The recipe takes the `--base` recipe's configuration (`bits`
+  becomes exllamav3's, the body's average K to two decimals), job and calibration pins. It refuses a matrix the header
+  lacks or holds at other dims, a ceiling below every matrix at K2, and a recipe name that exists. The rule and its
+  choices for `ig28b` are in `docs/findings/2026-11-15-the-12-gb-card-class-online-research.md`.
 
 ## The override
 

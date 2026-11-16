@@ -8,6 +8,7 @@
   for a 12 GB card, and the public agent-task evidence
 - Topic: artifacts-and-gates
 - Related: [#630](https://github.com/gpillon/ignis/issues/630), [#632](https://github.com/gpillon/ignis/issues/632),
+  [#634](https://github.com/gpillon/ignis/issues/634),
   [the 16 GB quality gates](2026-10-24-27b-16gb-quality-gates.md)
 - Superseded by: none
 - Summary: No smaller Qwen3.8 exists. In the one public agent-task harness (read off charts, ±0.5) the 27B's long tasks give way between 9.2 and 8.0 GB (Terminal-Bench 53.0 to 44.6, DeepSWE 29.2 to 21.7); tool calls below 3 bits are unmeasured.
@@ -226,6 +227,99 @@ third-party 2.5 and of the 16 GB artifact on set A at the 16 GB artifact's servi
 with top-1 and the window-bootstrap interval, the loop set on both, the session, the commit, the instrument's
 reproduction of the 16 GB artifact's 0.0403, and the reading of the 0.5 bit between 3.0 and 2.5. Until then nothing in
 this finding is a reading of ignis's own curve; the one figure of it that exists is the 16 GB artifact's, above.
+
+### Candidate B's recipe: a public GGUF allocation translated to K
+
+#634 builds the second candidate of #630 from the per-tensor allocation of the dynamic 2-bit GGUF file at the 9.2 GB
+row of the agent-task table, read from its header and translated to integer K by a stated rule. The tool is
+`tools/27b-16gb-converter/gguf_recipe.py` (`header`, then `recipe`), the recipe `recipes/ig28b.json`. Read on
+2026-11-16; the parsed table is in `.scratch/630/634/ud-q2_k_xl.table.json`, and `header` reads it again.
+
+- **The source.** `unsloth/Qwen3.8-27B-GGUF`, file `Qwen3.8-27B-UD-Q2_K_XL.gguf`, at the repository's revision
+  `4af51b3542f775b0a8e4b310bfb3f17e01c306c9` (the file's last commit is `acb953b1`, "New UD3.1 quants", 2026-11-11),
+  one file of 9,948,666,784 bytes, LFS oid `18f1187f38e7994b05c08cb45c674b90b7f17523687c83a4614fe493f7ea739d`. The
+  repository's files were listed before anything was read. Its 400 body matrices and its output head hold 9,169,463,296
+  bytes, which is the table's 9.2 GB; every tensor but the token embedding (the MTP layer, norms and GDN small set
+  included) holds 9,520,492,544.
+- **The read.** The GGUF v3 header by HTTP range requests: 50 metadata keys and 866 tensor infos in 10,996,621 bytes,
+  read as 11 ranges of 1 MiB (11,534,336 bytes). The last range runs 537,715 bytes past the header, into the alignment
+  and the first bytes of the head's data, which the parser does not read. Each tensor's size from the data offsets is
+  its type's block size times its blocks, for all 866 (no mismatch): the type table below is the file's.
+- **The bits of a type** are its bits per weight with its block scales: a block's bytes times 8 over its weights, from
+  the `block_*` structs that llama.cpp's `ggml/src/ggml-common.h` pins with static asserts (tag v1.0.0, commit
+  `b1b770d9`; the type ids from `ggml/include/ggml.h`).
+
+  | type | bytes / weights a block | bits | | type | bytes / weights a block | bits |
+  |---|---:|---:|---|---|---:|---:|
+  | IQ1_S | 50 / 256 | 1.5625 | | IQ3_XXS | 98 / 256 | 3.0625 |
+  | IQ2_XXS | 66 / 256 | 2.0625 | | IQ3_S, Q3_K | 110 / 256 | 3.4375 |
+  | IQ2_XS | 74 / 256 | 2.3125 | | IQ4_XS | 136 / 256 | 4.25 |
+  | IQ2_S | 82 / 256 | 2.5625 | | Q4_K | 144 / 256 | 4.5 |
+  | Q2_K | 84 / 256 | 2.625 | | Q5_K | 176 / 256 | 5.5 |
+
+- **The rule** (`gguf_recipe.fit`):
+  1. Each matrix's K is the integer nearest its type's bits plus one shift for the whole body, held to 2 to 5. The head
+     is at 4 whatever its type: the load binds it there, so it is outside the order.
+  2. The shift is the largest at which the text scope's device weights, counted as the converter counts them (every
+     trellis record, every other `text/` object but the token embedding and the draft head), are at or under the
+     ceiling. K changes only where a class of bits crosses a half, so the shift is one of those points, and a matrix
+     with more bits than another never gets a lower K.
+  3. The class that would cross next does not fit whole: its matrices are promoted one by one in rank order, and the
+     promotion stops at the first that does not fit. Its matrices tie on bits, so the rank is the source's allocation
+     one grain coarser: the mean bits of the matrix's layer, weighted by its weights, higher first; then the key. Two
+     classes whose bits differ by a whole number cross together and share that rank.
+- **Where the rule chose.**
+  - The 17 IQ1_S matrices (1.56 bits; MLP gate, up and down of layers 0, 1, 10, 12 to 15 and 17) are raised to K2, more
+    than the source gives them. The one Q5_K (5.5 bits, layer 63's `v_proj`) is held to K5.
+  - The shift landed at 0: every matrix at the integer nearest its bits. The 21 Q4_K matrices sit on a half (4.5) and go
+    to K5 at any shift above 0, so they are K5 by the fit, not by a convention for rounding a half. The head is Q4_K
+    too and stays at 4.
+  - The next class is IQ3_S and Q3_K, 41 matrices at 3.4375 bits (shift 1/16), 285 MB whole against 103,496,704 bytes
+    left under the ceiling (the recipe at the shift alone counts 9,096,503,296). Ten were promoted to K4: layer 60's
+    `in_proj_qkv`, 59's `o_proj`, the gate and up of layers 56 and 57, the gate, up and down of 62 and 61's `out_proj`.
+    The first left out, 61's `down_proj`, needed 11,141,120 bytes and 11,090,944 were left; they stay unspent.
+  - The names map one to one. The GGUF file splits the body as exllamav3 does (`attn_qkv`/`attn_gate`/`ssm_out`,
+    `attn_q`/`attn_k`/`attn_v`/`attn_output`, `ffn_gate`/`ffn_up`/`ffn_down`, `output` for the head): nothing is fused
+    on one side and split on the other. The GDN `ssm_alpha` and `ssm_beta` (Q8_0 there) are copied objects here, not
+    matrices of a recipe; the file's layer 64 is its MTP layer and is not read.
+  - Nothing is tied. The source gives gate and up, q, k and v, and a GDN layer's `in_proj_qkv` and `in_proj_z` their
+    own types, and the recipe keeps them: gate and up differ in 5 layers (4, 22, 29, 44, 48), k and v in 12 of the 16
+    GQA layers, q, k and v are not all one K in any. exllamav3's optimizer ties q/k/v and gate/up, and its own runtime
+    fuses gate and up only at equal K; its conversion from a recipe takes each matrix's K, and the trellis ops take each
+    matrix at its own K (their op tests run a gate/up pair of different K, decode and dense prefill). `sc30` never has
+    gate and up, or k and v, at different K: no artifact has loaded such a pair yet.
+- **The recipe `ig28b`**: K2 x106, K3 x226, K4 x47 (the head among them), K5 x22 over 401 matrices; the body at 2.7907
+  bits per weight (exllamav3's `bits` 2.79); the text scope 9,188,909,056 bytes of the 9,200,000,000 ceiling. Its
+  calibration trace, quant configuration pins and exllamav3 job are `sc30`'s; `local_quant.py run --recipe ig28b
+  --check` passes on the BF16 checkpoint and that trace (2026-11-16).
+
+By family, the source's types, its mean bits weighted by weights, and the K of `ig28b` and of `sc30` (the 16 GB
+artifact's) with their means:
+
+| family | n | the source's types | source bits | `ig28b` K | mean | `sc30` K | mean |
+|---|---:|---|---:|---|---:|---|---:|
+| GDN `in_proj_qkv` | 48 | IQ3_XXS 20, IQ2_S 9, IQ2_XXS 7, IQ2_XS 5, IQ3_S 4, Q2_K 3 | 2.749 | K2 12, K3 35, K4 1 | 2.771 | K2 4, K3 42, K4 2 | 2.958 |
+| GDN `in_proj_z` | 48 | IQ3_XXS 26, IQ2_XXS 7, IQ2_S 7, IQ2_XS 3, Q2_K 3, IQ4_XS 1, IQ3_S 1 | 2.802 | K2 10, K3 37, K4 1 | 2.812 | K2 3, K3 40, K4 5 | 3.042 |
+| GDN `out_proj` | 48 | IQ3_XXS 22, IQ4_XS 8, IQ3_S 7, IQ2_S 5, IQ2_XS 4, Q4_K 1, Q3_K 1 | 3.238 | K2 4, K3 34, K4 9, K5 1 | 3.146 | K3 40, K4 8 | 3.167 |
+| GQA `q_proj` | 16 | Q2_K 8, IQ3_XXS 4, IQ2_XXS 2, IQ2_XS 1, IQ2_S 1 | 2.641 | K2 3, K3 13 | 2.812 | K2 6, K3 10 | 2.625 |
+| GQA `k_proj` | 16 | IQ4_XS 6, IQ3_S 5, Q4_K 4, IQ3_XXS 1 | 3.984 | K3 6, K4 6, K5 4 | 3.875 | K4 14, K5 2 | 4.125 |
+| GQA `v_proj` | 16 | Q4_K 15, Q5_K 1 | 4.562 | K5 16 | 5.000 | K4 14, K5 2 | 4.125 |
+| GQA `o_proj` | 16 | IQ4_XS 6, IQ3_S 5, IQ3_XXS 1, IQ2_XXS 1, IQ2_XS 1, Q4_K 1, Q2_K 1 | 3.578 | K2 2, K3 6, K4 7, K5 1 | 3.438 | K3 14, K4 2 | 3.125 |
+| MLP `gate_proj` | 64 | IQ3_XXS 17, IQ2_XXS 13, IQ2_XS 10, IQ1_S 8, IQ2_S 8, IQ3_S 4, IQ4_XS 4 | 2.590 | K2 31, K3 26, K4 7 | 2.625 | K2 9, K3 49, K4 6 | 2.953 |
+| MLP `up_proj` | 64 | IQ3_XXS 19, IQ2_XXS 13, IQ2_S 11, IQ2_XS 7, IQ1_S 6, IQ3_S 4, IQ4_XS 4 | 2.648 | K2 26, K3 31, K4 7 | 2.703 | K2 9, K3 49, K4 6 | 2.953 |
+| MLP `down_proj` | 64 | IQ3_XXS 15, IQ2_S 13, IQ2_XXS 12, IQ3_S 9, IQ4_XS 7, IQ2_XS 3, IQ1_S 3, Q3_K 1, Q2_K 1 | 2.850 | K2 18, K3 38, K4 8 | 2.844 | K2 3, K3 53, K4 8 | 3.078 |
+| output head | 1 | Q4_K | 4.5 | K4 | 4 | K4 | 4 |
+| body | 400 | | 2.769 | | 2.791 | | 3.000 |
+
+- **Observed.** Against `sc30`, `ig28b` keeps the K of 249 matrices, raises 49 and lowers 103. It moves bits from the
+  MLP and the GDN input projections (K2 on 75 MLP matrices against 21) to the GQA layers' `v_proj` (all 16 at K5),
+  `o_proj` and q, and from the first layers to the last: the mean K of layers 0 to 15 is 2.28 against 2.91, of 16 to
+  31 2.64 against 2.95, of 32 to 47 2.86 against 2.91, of 48 to 63 3.39 against 3.23. The source's own allocation has
+  that shape: 12 of its 17 IQ1_S matrices are the MLP of layers 12 to 17, and layers 56 to 63 are at IQ3 and IQ4
+  types.
+- **Inference.** At 0.21 bits apart the two differ less in their totals than in where the bits go, by family and by
+  depth; which allocation holds on ignis's instrument is the gate's reading. Nothing here says the source's per-type
+  quality carries over to a trellis K: the rule translates its bits, not its error.
 
 ## Finding
 
