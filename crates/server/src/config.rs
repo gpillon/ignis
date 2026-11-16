@@ -1757,7 +1757,8 @@ fn derive_speculation(
     if tokens == 0 {
         if backend != SpeculativeBackend::Mtp {
             return Err(ConfigError(format!(
-                "`{} 0`: `--spec-backend {}` drafts 1..={MAX_DRAFT_TOKENS} tokens a round (a window of 0 is the 27B's                  MTP head's, which then loads no speculation)",
+                "`{} 0`: `--spec-backend {}` drafts 1..={MAX_DRAFT_TOKENS} tokens a round (a window of 0 is the 27B's \
+                 MTP head's, which then loads no speculation)",
                 spelled("spec", "draft_tokens"),
                 backend.as_str()
             )));
@@ -2034,7 +2035,8 @@ fn fit_family(
         match family {
             ModelFamily::FlashNext if s.spec.draft_tokens == Some(0) => {
                 return Err(ConfigError(format!(
-                    "`{} 0`: {}'s MTP head drafts 1..={MAX_DRAFT_TOKENS} tokens a round; a window of 0 is the                      27B's MTP load with no speculation (`{} 0` names it for the 27B alone)",
+                    "`{} 0`: {}'s MTP head drafts 1..={MAX_DRAFT_TOKENS} tokens a round; a window of 0 is the \
+                     27B's MTP load with no speculation (`{} 0` names it for the 27B alone)",
                     spelled("spec", "draft_tokens"),
                     family.name(),
                     schema::field("spec", "draft_tokens").expect("declared").scoped_flag(ModelFamily::Qwen38_27b)

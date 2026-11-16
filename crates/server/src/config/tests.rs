@@ -2016,6 +2016,23 @@ fn a_window_of_0_is_the_27bs_mtp_alone() {
     assert!(err.contains("--spec-draft-tokens 0") && err.contains("1..=7") && err.contains("dflash2"), "{err}");
 }
 
+/// The two refusals of a window of 0, held whole: DFlash2's, on every model,
+/// and Flash-Next's head's, which points at the 27B's own flag.
+#[test]
+fn the_refusals_of_a_window_of_0_read_as_one_sentence() {
+    assert_eq!(
+        refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "0"]),
+        "`--spec-draft-tokens 0`: `--spec-backend dflash2` drafts 1..=7 tokens a round (a window of 0 is the 27B's MTP \
+         head's, which then loads no speculation)"
+    );
+    let both = config(&["--spec-backend", "mtp", "--spec-draft-tokens", "0", "--qwen38-vision-enabled", "false"]);
+    assert_eq!(
+        both.for_family(ModelFamily::FlashNext).expect_err("Flash-Next's head drafts 1..=7").0,
+        "`--spec-draft-tokens 0`: Qwen3.8-Flash-Next's MTP head drafts 1..=7 tokens a round; a window of 0 is the 27B's \
+         MTP load with no speculation (`--qwen38-spec-draft-tokens 0` names it for the 27B alone)"
+    );
+}
+
 /// AC 3: on the 27B's MTP load each of DFlash2's own settings is refused by
 /// name where the operator named it -- by flag or env var at any value, by a
 /// file at a value other than its default -- and a default in force refuses
