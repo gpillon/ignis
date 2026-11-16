@@ -220,7 +220,11 @@ bits per weight under a ceiling of 9.2 GB of weights, is not published yet:
 until it is, the catalog holds no entry of this class and refuses every
 built-in entry on such a card by its class
 ([the catalog](../guides/models.md#the-catalog)), and the profile serves an
-artifact named by its path, `--model-artifact`.
+artifact named by its path, `--model-artifact`. The candidate the gate
+measured on the RTX 5090 reads 0.0431 in KLD against BF16 (the 16 GB
+artifact, 0.0418, on the same set and shape) and decodes 294, 251 and 228
+tokens a second at 8,192, 65,536 and 130,560 tokens of context under MTP;
+no card but the RTX 5090 has measured it.
 
 | Field | 27B |
 |---|---|
@@ -253,11 +257,26 @@ Why each:
 - **512 MiB of headroom.** A choice, not a placeholder: at the 1,200 MiB of
   the larger classes no context is left. A derived budget is the memory free
   at the start less 512 MiB ([VRAM budget](../configuration/vram-and-kv-pool.md#the-12-gb-class)).
-- **The 512-token chunk.** The prefill scratch is sized by the chunk, and 512
-  leaves an estimated 17,000 tokens more of context than 1,024 would. A
-  256-token chunk buys about 25,000 more, also an estimate, at a slower first
-  token: name both `--model-prefill-chunk 256 --model-prefill-chunk-solo 256`,
-  since the solo width the profile pins at 512 sizes the scratch otherwise.
+- **The 512-token chunk.** The prefill scratch is sized by the chunk, and the
+  chunk also sets the first token's price. Measured on the RTX 5090 held to
+  12 GiB, on the class's candidate artifact, vision on, the median first token
+  and the KV pool:
+
+  | Chunk | First token, 8,192-token prompt | First token, 65,536-token prompt | KV pool |
+  |---:|---:|---:|---:|
+  | 256 | 3.1 s | 26.4 s | 214,144 tokens |
+  | 512 | 2.5 s | 21.4 s | 214,144 tokens |
+  | 1,024 | 2.3 s | 20.2 s | 209,536 tokens |
+
+  A 1,024 chunk leaves 4,608 tokens less pool than 512 (72 pages), where an
+  earlier estimate said about 17,000, and takes 7% less time to the first
+  token; the context is 131,072 at all three, and decode (295 to 303 tokens a
+  second at 8,192) does not move. A 256 chunk buys no pool at all with vision
+  on: below 512 the workspace is set by the vision encoder's share, so the
+  pool is the same as at 512, and the first token costs 25% more at 8,192 and
+  23% more at 65,536. It stays selectable, by naming both
+  `--model-prefill-chunk 256 --model-prefill-chunk-solo 256`, since the solo
+  width the profile pins at 512 sizes the scratch otherwise.
 - **Vision on**, as on `rtx-16gb`: 4,096 tokens an image, tower and pool in
   host RAM, so with no image in flight vision costs no context.
 - **A card of 10 or 11 GB** is read as the class too: its VRAM plan refuses

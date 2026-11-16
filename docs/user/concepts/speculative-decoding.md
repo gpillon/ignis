@@ -227,8 +227,11 @@ one, up to the draft window.
   DFlash2. On a 12 GB card `rtx-12gb` chooses it for you. The head commits as many tokens a round as DFlash2 on agent
   traffic and far more tokens a second than no speculation, for about 0.8 to
   1 GB less than DFlash2. Where DFlash2 fits at the context you need, it stays
-  the default; the two drafters' decode rates against each other were not
-  measured side by side.
+  the default. On the 12 GB class's candidate artifact, held to a 12 GiB
+  budget on the RTX 5090, the two were measured side by side: DFlash2 decodes
+  409, 348 and 321 tokens a second at 8,192, 65,536 and 130,560 tokens of
+  context against the head's 294, 251 and 228, and the context is 131,072 under
+  either, with a KV pool of 150,720 tokens against 214,144.
 - **One rule.** The head drafts the fixed draft at every temperature: a
   request that samples takes each draft with the model's probability of it.
   DFlash2's own settings are refused by name on an MTP load: the shortlist

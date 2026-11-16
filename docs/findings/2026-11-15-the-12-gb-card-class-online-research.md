@@ -8,10 +8,11 @@
   for a 12 GB card, and the public agent-task evidence
 - Topic: artifacts-and-gates
 - Related: [#630](https://github.com/gpillon/ignis/issues/630), [#632](https://github.com/gpillon/ignis/issues/632),
-  [#634](https://github.com/gpillon/ignis/issues/634),
+  [#633](https://github.com/gpillon/ignis/issues/633), [#634](https://github.com/gpillon/ignis/issues/634),
+  [#635](https://github.com/gpillon/ignis/issues/635), [#636](https://github.com/gpillon/ignis/issues/636),
   [the 16 GB quality gates](2026-10-24-27b-16gb-quality-gates.md)
 - Superseded by: none
-- Summary: No smaller Qwen3.8 exists. Public agent tasks: the 27B's long ones give way between 9.2 and 8.0 GB. On ignis's own instrument the 2.5 costs 1.66x the 3.0's KLD, 11/32 loops against 8.
+- Summary: No smaller Qwen3.8 exists. Public agent tasks: the 27B's long ones give way between 9.2 and 8.0 GB. On ignis's instrument the 2.5 costs 1.66x the 3.0's KLD; a 9.2 GB recipe of exllamav3's optimizer reads 1.03x (spec est. 1.3x).
 
 ## Question
 
@@ -21,7 +22,8 @@ classes the engine binds today; what do the public agent-task results say a body
 coding agent; what is there to choose instead of the 27B; and what has nobody measured, so that the gate has to?
 
 This finding opens with the online research of 2026-11-15 and the facts of the one public quant that binds today. It
-has a section for the slope measured on ignis's own instrument by #632 (2026-11-16), and says what that reading adds.
+has a section for the slope measured on ignis's own instrument by #632 (2026-11-16), one for the two candidate recipes
+and the gate's numbers at the class's shape (#633 to #636, 2026-11-16), and says what those readings add.
 
 ## Evidence
 
@@ -356,6 +358,128 @@ artifact's) with their means:
   depth; which allocation holds on ignis's instrument is the gate's reading. Nothing here says the source's per-type
   quality carries over to a trellis K: the rule translates its bits, not its error.
 
+### The gate at the class's shape (2026-11-16)
+
+#633 and #634 built the two candidates at the 9.2 GB ceiling, #635 measured them against the 16 GB artifact
+(`trellis-sc30`) and #636 measured the prefill chunk. All of it in one session on the RTX 5090, with the engine code of
+`6a763649`, at the class's shape: `--profile rtx-12gb --vram-budget-bytes 12884901888` (one lane, MTP at window 7,
+512-token chunk, hq-e8-2b, exception weights bf16, loop guard off, vision on host); the counterpart ran at the same
+shape. Records: [`.scratch/630/635/`](../../.scratch/630/635/) (`kld/compare-635.txt`, `decode-compare.txt`,
+`loops-compare.txt`, `plan-table.txt`, `chunk-table.txt`, `real-card-context.txt`, `replay/`, `served/`) and
+`.scratch/630/orchestra/decisions.md`. Neither candidate is admitted: pending the owner's reading.
+
+**The two recipes.**
+
+- **A, `ig28a`** (`tools/27b-16gb-converter/recipes/ig28a.json`, #633): exllamav3's own allocation optimizer,
+  `sc_optimize.py` (git blob `eeb1cbee`, the same file from 1.5.3 to 1.6.7), on the 16 GB artifact's source
+  publisher's tables at `3f8a2d64` (`noise_attrib.json`, `rfn_2.00bpw.json`): `sc_optimize.py -m noise_attrib.json -rr
+  rfn_2.00bpw.json -b 2.7942 -hb 4 -al 2.0 -mink 2 -maxk 5 -tie "k_proj+v_proj,gate_proj+up_proj"`. The optimizer
+  targets bits per weight over the body, so the byte ceiling was met by iterating `-b` (2.7947 goes over). It does not
+  reproduce the published 3.00 recipe (123 of 400 matrices differ; that one came from another script of the project).
+  Text scope 9,199,394,816 bytes of the 9,200,000,000, body 2.7942 bits; K2 72, K3 287, K4 36 (the head among them),
+  K5 6 over 401 matrices; against the 16 GB recipe 124 matrices differ (94 down, 30 up), 625,213,440 bytes smaller:
+  the MLP and the GDN inputs lose bits, attention k/v and o gain. The optimizer's own model predicted 0.0505 against
+  0.0430 for the 16 GB recipe (1.17 times). Converted with exllamav3 1.5.3 on the public calibration trace of the 16 GB
+  artifact's revision `86b95530`: 2,602 s, 19.63 GiB VRAM allocated, 42.1 GiB host working set, `--no-checkpoints`.
+- **B, `ig28b`** (#634): the GGUF allocation translated by the rule of the section above; the same conversion
+  (2,543 s). Text scope 9,188,909,056 bytes, 2.7907 bits.
+- Packed with the DFlash2 module and the MTP head: A 12,754,663,684 bytes, B 12,744,177,924, both VERIFY PASS. The
+  artifact to admit would be A's repack, `trellis-ig28` (a complete conversion, reconstruction errors against BF16
+  measured, VERIFY PASS), which reads the same 0.04308: the same bytes.
+
+**Observed, KLD against BF16, set A** (16 windows x 4,096; `span_logits` at chunk 512; window-bootstrap 95% CI, 20,000
+resamples; BF16 ppl 2.690):
+
+| | text scope | KLD | 95% CI | ratio to 16 GB | top-1 | ppl | code | prose | chat |
+|---|---:|---:|---|---|---:|---:|---:|---:|---:|
+| 16 GB artifact | 9.82 GB | 0.04177 | [0.0358, 0.0477] | 1 | 93.30% | 2.742 | 0.0400 | 0.0520 | 0.0367 |
+| A, `ig28a` | 9.20 GB | 0.04308 | [0.0368, 0.0496] | 1.032 [0.993, 1.070], lower in 3/16 windows | 93.35% | 2.728 | 0.0418 | 0.0534 | 0.0375 |
+| B, `ig28b` | 9.19 GB | 0.05084 | [0.0430, 0.0589] | 1.217 [1.179, 1.256], lower in 0/16 | 92.69% | 2.760 | 0.0473 | 0.0642 | 0.0455 |
+
+The limit a re-quantization registers, 1.2 times the counterpart's reading in the same session, is 0.05012: A is under
+it, B above. (The 16 GB artifact reads 0.04177 here at chunk 512 and 0.04049 at its own 1,024 in the slope above: the
+readings of one session at one shape are compared with each other.)
+
+- **Observed, the estimate against the read.** The spec's estimate was about 0.056 and the slope's interpolation about
+  0.049; the optimizer predicted 1.17 times the 16 GB artifact for A (about 0.047). A reads **0.0431**, 1.03 times.
+  The estimate was high by about 0.013, and the optimizer's relative prediction over-called A's loss by 14 points.
+- **Observed, the same-K comparison of the quantizer.** `ig28` was converted by exllamav3 1.5.3, the 16 GB artifact by
+  the version its publisher used, so a 1.03 could be the recipe's or the quantizer's. On the 277 matrices that have the
+  same K in both (reconstruction errors against the BF16 checkpoint, each artifact's own), the ratio of the errors has
+  median 0.9993 (10th percentile 0.997, 90th 1.001): the quantizer version moves nothing, and the 1.03 is the
+  recipe's.
+
+**Observed, the drafter on against off** (A; greedy, 512 tokens, one lane; launches MTP-1, off-1, off-2, then
+DFlash2-1, DFlash2-2, the counterpart and #636's, MTP-2 re-run last after a script error left its first launch with no
+decode cell, a departure from ABBA; pooled tok/s; the verdict is on above off by more than the launch-to-launch spread;
+`decode-compare.txt`):
+
+| context | MTP on, cold / reuse | off (window 0), cold / reuse | ratio | DFlash2, cold / reuse | ratio |
+|---:|---:|---:|---:|---:|---:|
+| 8,192 | 293.7 / 293.6 | 92.4 / 91.4 | 3.18x / 3.21x | 409.4 / 411.0 | 4.43x / 4.50x |
+| 65,536 | 250.9 / 250.9 | 75.6 / 77.5 | 3.32x / 3.24x | 347.6 / 347.8 | 4.60x / 4.49x |
+| 130,560 (the largest the load keeps) | 228.0 / 228.3 | 64.9 / 64.9 | 3.51x / 3.52x | 320.6 / 321.8 | 4.94x / 4.96x |
+
+Every cell: on beats off. DFlash2 loads in the same 12 GiB with the same 131,072 context and nothing adapted; its KV
+pool is 150,720 tokens against MTP's 214,144 (off: 280,320). The counterpart's own decode cells were not measured.
+
+**Observed, the loop set** (#340's 32 requests, one lane): A **7/32**, the 16 GB artifact at the same shape **11/32**;
+one-sided Fisher exact p (A loops more) = 0.92. Tool calls 27 against 26, length 5 against 6, forced closes 9 against
+13. (The slope's loop sets ran two lanes and read 8/32 for the 16 GB artifact: not the same shape, not compared.)
+
+**Observed, beside the gate and not binding.** The canary's four greedy prompts are sane and identical twice on both
+candidates and on the counterpart. The replay of recorded agent turns under MTP at window 7 (#618's subset, jobs 0-21,
+24 turns, 15,179 tokens; at the replay's fixed shape of the 16 GB artifact, two lanes and 1,024 chunk, since it
+refuses one lane at 512 for a trellis body): **4.072 tokens a round** against the 16 GB artifact's 4.116 (-1.1%).
+
+**Not run, and why.** The regression set (the contributed entailment cases, `decide_entailment_gpu`): its test file pins
+the NVFP4 artifact by path. B's decode on/off, DFlash2 and loop legs: the KLD put B over the limit at equal bytes (1.22
+times the counterpart against A's 1.03), so no leg could change the choice; about 1 h 15 min of GPU on request. B's
+12 GiB load and canary did run (allocated 12,884,646,144, pool 215,232 tokens, nothing adapted). The 16 GB
+counterpart's decode cells and any agent-task check were not run.
+
+**The 12 GiB plans** (`plan-table.txt`): A allocated 12,884,478,208 bytes, KV pool 214,144 tokens (3,346 pages),
+context 131,072 with nothing adapted, weights 9,651,141,632; the 16 GB artifact 12,884,883,712 bytes and a pool of
+150,336 tokens, also at 131,072.
+
+**Observed, the prefill chunk** (#636; A in 12 GiB, one lane, MTP 7, vision on host; `ignis-bench ttft` cold, a nonce
+per sample, three samples a cell, median; two launches a chunk, the 512 row's second being #635's `mtp-2`;
+`chunk-table.txt`):
+
+| chunk | first token, 8,192 prompt (ms) | first token, 65,536 prompt (ms) | decode at 8,192 (tok/s) | workspace | trellis workspace | KV pool tokens | context |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 3,123 / 3,130 | 26,404 / 26,356 | 295.1 / 296.4 | 302,433,536 | 32,134,400 | 214,144 | 131,072 |
+| 512 | 2,491 / 2,522 | 21,433 / 21,676 | 296.8 / 291.9 | 302,433,536 | 32,134,400 | 214,144 | 131,072 |
+| 1,024 | 2,348 / 2,329 | 20,210 / 20,206 | 300.8 / 303.0 | 343,493,376 | 36,225,280 | 209,536 | 131,072 |
+
+- 256 buys nothing with vision on: below 512 the workspace is set by the vision encoder's share (76,951,040 reserved),
+  so the pool equals 512's, and the first token costs 25% more at 8,192 and 23% more at 65,536.
+- 512 buys 4,608 tokens of pool over 1,024 (72 pages), not the spec's estimated 17,000, for 7% of the first token (7% at
+  8,192; 1,350 ms or 6.7% at 65,536). In 12 GiB and in 12 GiB less 1 GiB the context is the same at both chunks (131,072
+  and 98,304; at 11 GiB 1,024 leaves 1,561 pages against 98,304's 1,539). The chunk does not move decode.
+- Inference: the 7% is below the roughly 10% the owner asks before trading pool for prefill speed, so 512 stays unless
+  the owner says otherwise; pending the owner's reading.
+
+**Inference, the context on a real card** (arithmetic on the plan's pinned lines, **not a measurement**: no 12 GB card
+has run the load, and these are the RTX 5090's lines with its CUDA context and trellis workspace). A card's derived
+budget is the memory free at the start less 512 MiB; the KV pool is 1,713 pages per GiB (about 0.627 MB a page), and
+one 32,768-token step is 512 pages, 321 MB. With a card total of 11.9 GiB:
+
+| case | free (GiB) | budget (GiB) | pages | context, 32,768 step | context, 16,384 step |
+|---|---:|---:|---:|---:|---:|
+| headless, nothing else on the card | 11.75 | 11.25 | 2,061 | 131,072 | 131,072 |
+| light desktop, about 0.3 GB | 11.60 | 11.10 | 1,804 | 98,304 | 114,688 |
+| desktop, about 0.5 GB | 11.43 | 10.93 | 1,513 | 65,536 | 81,920 |
+| desktop, about 0.75 GB | 11.20 | 10.70 | 1,119 | 65,536 | 65,536 |
+| desktop, about 1 GB | 10.97 | 10.47 | 725 | 32,768 | 32,768 |
+| desktop, about 1.3 GB | 10.69 | 10.19 | 245 | refused | refused |
+
+131,072 needs a budget of 11.245 GiB, 98,304 10.945 GiB and 65,536 10.646 GiB. The spec's "about 100,000 tokens with a
+desktop of about 1 GB" does not hold on these lines: 1 GB of desktop leaves 32,768. The levers, each the owner's to
+decide and pending the owner's reading: a lower byte ceiling (one step is about 0.1 bit; the two optimizer points
+suggest about +17% KLD a step, an estimate), the headroom from 512M to 256M (about 0.83 of a 32,768 step), a ladder
+step of 16,384.
+
 ## Finding
 
 Observed:
@@ -375,6 +499,17 @@ Observed:
    2.5 ends on a tool call 15 times against 24 for the 16 GB artifact and loops on 11 against 8 (p = 0.29).
 5. The model's own MTP head's acceptance is flat from 3.5 to 2.5 bits on one public card (chart, ±0.3, 5 samples a
    bar).
+6. At the class's shape on the RTX 5090 (#635, 2026-11-16) candidate A, the optimizer's 9.2 GB recipe, reads 0.04308
+   KLD against the 16 GB artifact's 0.04177 (ratio 1.032, interval 0.993 to 1.070), under the limit of 0.05012;
+   candidate B, the GGUF allocation, reads 0.05084 (1.217), above it. The spec's estimate was 0.056. On the 277
+   matrices at the same K the reconstruction errors of the two artifacts have a median ratio of 0.9993, so the 1.03 is
+   the recipe's and not the quantizer version's.
+7. On A, MTP decodes 3.2 to 3.5 times faster than no speculation (294, 251 and 228 tok/s at 8,192, 65,536 and 130,560
+   tokens; off 92, 76 and 65), DFlash2 4.4 to 4.9 times (409, 348 and 321), the context 131,072 and nothing adapted in
+   12 GiB under both; the KV pool 214,144 tokens under MTP, 150,720 under DFlash2. Loops: 7/32 against the 16 GB
+   artifact's 11/32 (Fisher p = 0.92); replay 4.072 tokens a round against 4.116.
+8. The prefill chunk (#636): 256 buys no pool with vision on and costs 25% more first token at 8,192; 512 buys 4,608
+   tokens of pool over 1,024 (the spec estimated 17,000) for 7% of the first token; decode does not move.
 
 Inferred (`inference` in the sections above):
 
@@ -391,6 +526,12 @@ Inferred (`inference` in the sections above):
   artifact's), both at the 0.0486 limit; interpolation and prediction, not measurements of a recipe.
 - Staying with integer K costs a predicted 4 to 5% of KLD against half-steps, small against a factor of 1.5 a quarter
   of a bit.
+- The optimizer's allocation at 9.2 GB loses much less than either interpolation said (1.03 against 1.17 predicted
+  and about 1.2 interpolated); whether the tasks that give way below 8.3 GB (above) agree with the KLD is not
+  measured.
+- At 131,072 tokens in 12 GiB the class's context is a property of the RTX 5090's lines; on a real card with a desktop
+  the arithmetic below gives 98,304 at about 0.3 GB taken and 32,768 at about 1 GB (a derived budget is the free memory
+  less 512 MiB), not the spec's roughly 100,000 at 1 GB.
 
 ## Implications
 
@@ -398,7 +539,11 @@ Inferred (`inference` in the sections above):
   files keep 90% (terminal) and 72% (repository) of BF16 in the one harness that has them, and the long tasks give way
   below about 8.3 GB. #632's slope on ignis's own instrument tests it and neither of the spec's two cases is met (the
   2.5 is not close to the 3.0, 1.66 times its KLD, and 9.2 GB is not already low: an interpolated 2.79 bits sits at
-  the limit), so the candidates are built at 9.2 GB pending the owner's reading; the owner decides whether it stands.
+  the limit), so the candidates are built at 9.2 GB pending the owner's reading; the owner decides whether it stands. The candidates built there read 1.03 (A) and 1.22 (B) times the 16 GB artifact's
+  KLD: A holds the registered limit with the ceiling where it is; whether to lower it for the desktop's context is
+  pending the owner's reading.
+- The gate's numbers at the class's shape are in the section above. Admission of a candidate, the 512 chunk and the
+  ceiling are pending the owner's reading; none is decided here.
 - The gate's numbers (KLD, the drafter's acceptance, the loop rate) are blind to what the public evidence says matters
   most: the length of a task, the tokens spent, the timeouts, the validity of a tool call. The agent-facing checks the
   repository has (the replay of recorded turns, the canary prompts, the regression set) are the instrument for those,
@@ -434,6 +579,14 @@ Inferred (`inference` in the sections above):
   the usable reading, never levels across them. Where a card gives a KLD with no stated set (the 2.65 to 2.80 series),
   its harness is unknown.
 - **The card's own lines.** The research says nothing about the CUDA context or the workspace of a real 12 GB card.
+  The gate's plans are the RTX 5090's lines held to a 12 GiB budget, and the context on a real card is arithmetic on
+  them, not a measurement.
+- **The gate's reading is one session, one card, one artifact each.** Each KLD rests on 16 windows (intervals above), the
+  loop rates on 32 requests, the decode cells on two launches at most with a spread of 3 to 5 tok/s, the chunk table
+  on two launches a chunk. The replay ran at the 16 GB shape (two lanes, 1,024 chunk) on 24 turns. The regression set
+  was not run (its test pins the NVFP4 artifact by path), B's drafter and loop legs were not run (its KLD decided), the
+  16 GB counterpart's own decode cells were not measured, and the optimizer's +17% KLD a step comes from two optimizer
+  points, an estimate.
 - Pages that could not be read: every Reddit thread (blocked), two paywalled newsletters, the methods article of the
   quant publisher's 3.1 update, the Flash-Next technical report, a gated card. One page that printed tool-call validity
   per quant was not used: it names no primary source and contradicts itself on three figures.
@@ -442,6 +595,9 @@ Inferred (`inference` in the sections above):
 
 - #632: the slope on ignis's own instrument is in its section above; the owner's reading of it decides whether the
   9.2 GB ceiling stands.
+- #635 and #636: pending the owner's reading, the admission of candidate A (as `trellis-ig28`), the chunk (512 stays
+  unless the owner says otherwise) and the ceiling against the real-card context table above. B's remaining legs
+  (about 1 h 15 min of GPU) and the 16 GB counterpart's decode cells are available on request.
 - #630's later tickets build the two recipes at integer K and the gate measures them; the agent-facing checks sit beside
   it, as above.
 - A set of 30 to 50 agentic tasks, three attempts each, on the admitted artifact and the 16 GB artifact, would measure

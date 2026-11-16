@@ -31,10 +31,15 @@ of weights, while single-turn code barely moves
   steps of 32,768 (`model.adapt_context_step`; 65,536 elsewhere), `vram.qwen38.headroom_bytes` 512M (1200M
   elsewhere), a 512-token prefill chunk with the solo width at the chunk, vision on in host memory at 4,096 tokens.
   Every value is a default the load adapts and the operator overrides; two lanes, a 256-token chunk and DFlash2 stay
-  configuration choices.
+  configuration choices. The chunk's price is measured (#636, candidate A in 12 GiB): 512 buys 4,608 tokens of KV
+  pool over 1,024, not the estimated 17,000, for 7% on the first token, and 256 buys none with vision on, 25%
+  slower at 8,192 tokens; the context is 131,072 at all three.
 - **The gate's three legs are measured and reported, and the owner admits the artifact on the numbers** (ADR 0082: a
   failing leg stops the work and the owner decides). The limit a re-quantization of the 16 GB body has registered is
-  0.0484; the 16 GB body reads 0.0403 and the estimate for this recipe is about 0.056.
+  0.0484; the 16 GB body reads 0.0403 and the estimate for this recipe is about 0.056. Measured on 2026-11-16
+  (#635), against the 16 GB body's 0.04177 on that session's engine and shape, whose limit is 0.0501: the optimizer's
+  recipe (candidate A) reads 0.04308, 1.03 times, and the GGUF allocation's (B) 0.05084, 1.22 times. The estimate of
+  0.056 was high ([the finding](../findings/2026-11-15-the-12-gb-card-class-online-research.md)).
 
 ## Considered Options
 
@@ -52,8 +57,9 @@ of weights, while single-turn code barely moves
 
 ## Consequences
 
-- The headroom and the context are the RTX 5090's simulation, under an explicit 12 GiB budget and that less 1 GiB,
-  until a 12 GB card reads its CUDA context, its residual at one lane and its speed.
+- The headroom and the context are the RTX 5090's simulation, under an explicit 12 GiB budget and that less 1 GiB
+  (131,072 and 98,304 tokens, measured by the plan on candidate A), until a 12 GB card reads its CUDA
+  context, its residual at one lane and its speed.
 - Until the class's catalog entry lands, every built-in entry is above the class: a 12 GB card is refused each of
   them by name before a fetch or a teardown, and loads an artifact named by its path.
 - A limit above 0.0484 for this class, if the owner admits one, is registered in the spec that admits it.
