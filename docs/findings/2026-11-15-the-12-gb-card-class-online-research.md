@@ -11,7 +11,7 @@
   [#634](https://github.com/gpillon/ignis/issues/634),
   [the 16 GB quality gates](2026-10-24-27b-16gb-quality-gates.md)
 - Superseded by: none
-- Summary: No smaller Qwen3.8 exists. In the one public agent-task harness (read off charts, ±0.5) the 27B's long tasks give way between 9.2 and 8.0 GB (Terminal-Bench 53.0 to 44.6, DeepSWE 29.2 to 21.7); tool calls below 3 bits are unmeasured.
+- Summary: No smaller Qwen3.8 exists. Public agent tasks: the 27B's long ones give way between 9.2 and 8.0 GB. On ignis's own instrument the 2.5 costs 1.66x the 3.0's KLD, 11/32 loops against 8.
 
 ## Question
 
@@ -21,7 +21,7 @@ classes the engine binds today; what do the public agent-task results say a body
 coding agent; what is there to choose instead of the 27B; and what has nobody measured, so that the gate has to?
 
 This finding opens with the online research of 2026-11-15 and the facts of the one public quant that binds today. It
-has a section, marked, for the slope measured on ignis's own instrument by #632, which is not in it yet.
+has a section for the slope measured on ignis's own instrument by #632 (2026-11-16), and says what that reading adds.
 
 ## Evidence
 
@@ -30,7 +30,10 @@ evidence), with no GPU, no weights downloaded and nothing posted. Their reports,
 harness, are the raw material:
 [`.scratch/12gb-model-study-2026-11-15/`](../../.scratch/12gb-model-study-2026-11-15/) (`SINTESI.md`, the reports
 `A-sub3bpw-quants.md`, `B-alternatives.md`, `C-task-level-evidence.md` and the common brief `BRIEF-COMMON.md`). The
-folder is local to a clone; the tables below carry what must outlast it.
+folder is local to a clone; the tables below carry what must outlast it. The slope of #632 is measured, not read:
+its records are in [`.scratch/630/632/`](../../.scratch/630/632/) (`comment-numbers.md`, the numbers as posted on #632;
+`kld/compare-632.txt`, the KLD per kind and per window; `served/`, the loop set; `convert.log`), and the session's
+decisions in `.scratch/630/orchestra/decisions.md`.
 
 Conventions. GB is 10^9 bytes. "Body and head" is the device weights of the text scope (the token embedding lives in
 host memory). Each table is one source and one harness: **numbers from different tables are never compared**. `chart
@@ -222,11 +225,43 @@ Other agent-task and process evidence, each its own harness (`C-task-level-evide
 
 ### The slope on our own instrument
 
-**Not measured yet.** The coordinator of #632 adds this section after the GPU legs run: the KLD of the converted
-third-party 2.5 and of the 16 GB artifact on set A at the 16 GB artifact's serving shape (1,024-token chunk, hq-e8-2b),
-with top-1 and the window-bootstrap interval, the loop set on both, the session, the commit, the instrument's
-reproduction of the 16 GB artifact's 0.0403, and the reading of the 0.5 bit between 3.0 and 2.5. Until then nothing in
-this finding is a reading of ignis's own curve; the one figure of it that exists is the 16 GB artifact's, above.
+Measured on 2026-11-16 in one session on the RTX 5090, integration tree `15d001e5` (engine code = `main` `0840b74c`),
+at the 16 GB artifact's serving shape: 1,024-token chunk, hq-e8-2b, exception weights bf16. Records:
+`.scratch/630/632/comment-numbers.md`, `kld/compare-632.txt`.
+
+- **Observed, the 2.5-bit quant.** The third-party 2.5 converted with the named recipe `tandem25` (#631's converter,
+  commit `a92871d1`): 401 trellis matrices (K2 x192, K3 x208, head K4), text scope 8,303,517,696 bytes, 2.4996 bits
+  per weight; reconstruction errors measured against the BF16 checkpoint, VERIFY PASS; 11,858,786,564 bytes in all. It
+  loads under `rtx-16gb` in a 16 GiB budget: 17,179,624,364 bytes allocated, context 262,144, nothing adapted,
+  674,304 tokens of KV pool (the 16 GB artifact: 509,248).
+- **Observed, KLD against BF16, set A** (16 windows of 4,096 tokens; the scorer is `span_logits` at the serving shape
+  against `H:/kld-ref/base.pt`; window-bootstrap 95% interval, 20,000 resamples):
+
+  | | KLD | 95% CI | top-1 | ppl | code | prose | chat |
+  |---|---:|---|---:|---:|---:|---:|---:|
+  | 16 GB artifact (3.00 bits, 9.82 GB) | 0.04049 | [0.0346, 0.0463] | 93.40% | 2.739 | 0.0385 | 0.0499 | 0.0362 |
+  | third-party 2.5 (2.50 bits, 8.30 GB) | 0.06704 | [0.0564, 0.0780] | 91.00% | 2.790 | 0.0690 | 0.0949 | 0.0465 |
+
+  BF16 ppl is 2.690. The ratio 2.5 / 3.0 is **1.656** (paired 95% interval [1.485, 1.810]) and the 2.5 reads above the
+  3.0 in all 16 windows; by kind 1.79 times on code, 1.90 on prose, 1.28 on chat.
+- **Observed, the instrument's reproduction.** The 16 GB artifact reads 0.04049 against its registered 0.04034 (+0.4%:
+  today's engine against the reference of 2026-11-03; top-1 93.40% against 93.42%, ppl 2.7386 against 2.738); the
+  limit of 1.2 times today's reading is 0.0486. No in-process reproduction was made: the difference is small and the
+  two arms were read in the same session.
+- **Observed, the loop set** (#340's 32 requests, 2 lanes, loop guard off, through `.scratch/630/gpu/served630.py`; a
+  loop is a 6-gram repeated 25 times or a zlib window below 0.20): the 2.5 loops on **11 of 32**, the 16 GB artifact on
+  **8 of 32** (one-sided Fisher exact p = 0.29, no difference at this size). Finish reasons, 2.5 against 16 GB: tool
+  calls 15 against 24, stop 7 against 1, length 10 against 7; forced closes of the thinking 13 and 13.
+- **Inference, the reading of the half bit.** The curve between 3.0 and 2.5 is a factor of 1.66 in KLD for half a bit,
+  gentler than the public ladders' about 1.5 for every quarter of a bit (that is 2.25 for half a bit), but the 2.5
+  does not hold close to the 3.0. Log-linear between the two points, a recipe at 2.79 bits (the 9.2 GB ceiling) would
+  read about 0.049, at the limit of 0.0486; the allocation optimizer's own model predicts 1.17 times the 16 GB
+  artifact's KLD for candidate A, about 0.047. Both are interpolations and a prediction, not readings of a recipe at
+  9.2 GB. Neither of the spec's two cases (the 2.5 close to the 3.0, or 9.2 GB already low) is met, so the candidates
+  are built at 9.2 GB (9,200,000,000 bytes of text scope as the converter counts it) pending the owner's reading of
+  these numbers; the ceiling decision is the owner's.
+- **Not measured here:** agent tasks, tool-call validity and the drafter's acceptance on the 2.5; the loop rates rest
+  on 32 requests each.
 
 ### Candidate B's recipe: a public GGUF allocation translated to K
 
@@ -331,10 +366,13 @@ Observed:
 3. In KLD and top-1 the curve is smooth from 3.0 to 2.2 bits, about 1.5 times the KLD and 1.6 to 1.7 points of top-1
    for every quarter of a bit, on five harnesses, and bends sharply only below 2.0 bits, where K1 matrices appear. The
    allocation matters as much as a quarter of a bit (0.0519 against 0.0306 for two public 2.5s on one harness).
+   On ignis's instrument (#632, 2026-11-16) the half bit from 3.0 to 2.5 costs a factor of 1.66 in KLD (0.0405 to
+   0.0670, paired interval 1.49 to 1.81) and 2.4 points of top-1 (93.40% to 91.00%), above the 3.0 in all 16 windows.
 4. In the one public agent-task harness the loss grows with the length of the task. A trellis body at 7.25 GB keeps
    94, 73 and 24% of BF16 on single-turn code, Terminal-Bench and DeepSWE; at 9.85 GB, 100, 93.5 and 77%. The dynamic
    2-bit line steps on the long tasks between 8.0 and 9.2 GB. A harder quant also spends more tokens and times out more
-   (1.27 times the output tokens, 15 timeouts against 8, on one blog run).
+   (1.27 times the output tokens, 15 timeouts against 8, on one blog run). On the 32-request loop set the third-party
+   2.5 ends on a tool call 15 times against 24 for the 16 GB artifact and loops on 11 against 8 (p = 0.29).
 5. The model's own MTP head's acceptance is flat from 3.5 to 2.5 bits on one public card (chart, ±0.3, 5 samples a
    bar).
 
@@ -348,6 +386,9 @@ Inferred (`inference` in the sections above):
   measurement.
 - KLD per bit carries over to tasks only partly: the dynamic 2-bit line at 9.2 GB and the trellis at 9.85 GB score
   alike on tasks where their KLDs differ by more than two on an older file.
+- A recipe at the 9.2 GB ceiling (2.79 bits) would read about 0.049 in KLD by log-linear interpolation between the
+  3.0 and the 2.5 of #632, and about 0.047 by the optimizer's prediction for candidate A (1.17 times the 16 GB
+  artifact's), both at the 0.0486 limit; interpolation and prediction, not measurements of a recipe.
 - Staying with integer K costs a predicted 4 to 5% of KLD against half-steps, small against a factor of 1.5 a quarter
   of a bit.
 
@@ -355,7 +396,9 @@ Inferred (`inference` in the sections above):
 
 - The spec's 9.2 GB ceiling is consistent with this evidence, which is its only support: at 9.2 GB the second format's
   files keep 90% (terminal) and 72% (repository) of BF16 in the one harness that has them, and the long tasks give way
-  below about 8.3 GB. #632's slope on ignis's own instrument is what tests it, and the owner decides whether it stands.
+  below about 8.3 GB. #632's slope on ignis's own instrument tests it and neither of the spec's two cases is met (the
+  2.5 is not close to the 3.0, 1.66 times its KLD, and 9.2 GB is not already low: an interpolated 2.79 bits sits at
+  the limit), so the candidates are built at 9.2 GB pending the owner's reading; the owner decides whether it stands.
 - The gate's numbers (KLD, the drafter's acceptance, the loop rate) are blind to what the public evidence says matters
   most: the length of a task, the tokens spent, the timeouts, the validity of a tool call. The agent-facing checks the
   repository has (the replay of recorded turns, the canary prompts, the regression set) are the instrument for those,
@@ -384,8 +427,8 @@ Inferred (`inference` in the sections above):
   to 2.25 bits losing 4 to 5 points of HumanEval+ and 7 to 9 of BFCL) is at other widths, other formats or other
   architectures: it shows failure modes (a termination threshold that a mean KLD does not announce; function calling
   losing about twice what single-function code does), not the 27B's curve.
-- **The third-party 2.5's quality is the author's wikitext reading only**, with the quantizer's own
-  evaluator; its agent-task behaviour, its tool calls and its loop rate are what #632 is to measure. Its calibration
+- **The third-party 2.5's quality, beyond the author's wikitext reading with the quantizer's own evaluator, is #632's
+  KLD and loop set**; its agent-task behaviour and its tool calls are still unmeasured. Its calibration
   (250 rows of 2,048 columns) is not stated to be the 16 GB artifact's source's trace.
 - **The published KLD figures come from five harnesses** with different corpora and units; ratios within a harness are
   the usable reading, never levels across them. Where a card gives a KLD with no stated set (the 2.65 to 2.80 series),
@@ -397,8 +440,8 @@ Inferred (`inference` in the sections above):
 
 ## Follow-ups
 
-- #632: the slope on ignis's own instrument fills the section marked above; the owner's reading of it decides whether
-  the 9.2 GB ceiling stands.
+- #632: the slope on ignis's own instrument is in its section above; the owner's reading of it decides whether the
+  9.2 GB ceiling stands.
 - #630's later tickets build the two recipes at integer K and the gate measures them; the agent-facing checks sit beside
   it, as above.
 - A set of 30 to 50 agentic tasks, three attempts each, on the admitted artifact and the 16 GB artifact, would measure
