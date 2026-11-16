@@ -49,6 +49,18 @@ def test_the_public_2_5_bit_quants_recipe_names_its_k_config_ceiling_and_pins():
                                   "quantization_config.json"]
 
 
+def test_the_12gb_classs_first_candidate_is_the_optimizers_recipe_converted_as_sc30s():
+    r, sc30 = recipe.load("ig28a"), recipe.load(recipe.DEFAULT)
+    assert (r["name"], r["weights_id"], r["ceiling_bytes"]) == ("ig28a", "trellis-ig28a", 9_200_000_000)
+    # sc_optimize.py at 2.7942 bits, K 2 to 5: K2 72, K3 287, K4 35, K5 6 over the body, the head at K4
+    assert sorted(r["tensors"]) == sorted(sc30["tensors"])
+    assert collections.Counter(r["tensors"].values()) == {2: 72, 3: 287, 4: 35, 5: 6}
+    # exllamav3 writes `bits` as the body's average rounded to two places
+    assert r["quantization_config"] == dict(sc30["quantization_config"], bits=2.79)
+    assert r["job"] == sc30["job"]
+    assert r["files"] == {n: sc30["files"][n] for n in ("cal_trace.safetensors", "quantization_config.json")}
+
+
 def _named(tmp_path, change=None, name="mine"):
     """A recipe `name` in a recipes directory of its own: two body matrices, the head at 4, one pin."""
     data = {"schema": recipe.SCHEMA, "weights_id": "trellis-mine", "ceiling_bytes": 1 << 30,
