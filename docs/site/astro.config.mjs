@@ -33,7 +33,7 @@ await writeChangelog(path.join(guide, "changelog"), {
 });
 
 const section = (label, directory, extra = {}) => ({ label, items: sectionItems(guide, directory), ...extra });
-const description = "A CUDA inference engine for Qwen3.8 on RTX 50-series and RTX PRO 6000 cards: install, configure, call and extend it.";
+const description = "A CUDA inference engine for Qwen3.8 on NVIDIA RTX cards of 16 GB or more, from the RTX 30 series on: install, configure, call and extend it.";
 const changelog = section("Changelog", "changelog", { collapsed: true });
 const sidebar = [
   section("Start here", "start"),
