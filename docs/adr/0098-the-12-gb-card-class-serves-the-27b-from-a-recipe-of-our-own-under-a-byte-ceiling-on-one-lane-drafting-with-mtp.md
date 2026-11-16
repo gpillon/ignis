@@ -1,6 +1,6 @@
 ---
 status: proposed
-amends: [ADR-0063, ADR-0064]
+amends: [ADR-0063, ADR-0064, ADR-0079]
 ---
 
 # The 12 GB card class serves the 27B from a recipe of our own under a byte ceiling, on one lane, drafting with MTP
@@ -81,6 +81,21 @@ of weights, while single-turn code barely moves
   states the table (`configuration/vram-and-kv-pool.md`) and what an operator can change: the desktop,
   `--vram-budget-bytes` (at most the 512 MiB of headroom, three steps, since a budget above free memory is
   refused), and the second lane and DFlash2 as costs.
-- Until the class's catalog entry lands, every built-in entry is above the class: a 12 GB card is refused each of
-  them by name before a fetch or a teardown, and loads an artifact named by its path.
+- The class's catalog entry, `qwen3.8-27b-12g` (#638), pins `trellis-ig28` at
+  `gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis`, revision `15333a0829f055e7ee25d6d5ef84fd8d521518c6`, public under
+  Apache 2.0: the artifact and its conversion record, 12,754,973,515 bytes. On a 12 GB card it is the one built-in
+  text or image model that loads; the uncensored variant and Swift 1.5 have no build of the class, and they and
+  every 16 GB entry are refused there by name before a fetch or a teardown. An artifact named by its path still
+  loads, judged by the plan alone.
+- Two entries now answer to `qwen3.8-27b`, the 16 GB 27B and this one, so ADR 0064's one claimant of an alias
+  becomes one claimant of each card class within a layer, and where several entries that answer to an id fit the
+  card, the one of the largest class answers, never the catalog's order: the 16 GB entry on a 16 or 24 GB card, an
+  RTX 3090 or 4090 and a card of no class, this one on a 12 GB card only. It loads by its own id on every class. An
+  operator entry still claims no alias a built-in entry claims, whatever its class; two of its own entries of
+  different classes may answer to one id.
+- The entry states no generation, as the 16 GB 27B's, where ADR 0079 has a trellis build state `blackwell` until it
+  is verified below Blackwell: its layout is that build's (the trellis K classes 2 to 5 and the 4-bit head the RTX
+  30 and 40 routes bind, every other object the 32 GB artifact's), and the class is memory alone. Unlike Swift
+  1.5's build (#529), its quality on those routes is not measured: an sm_86 gate leg, or a 12 GB RTX 30 or 40
+  card (#639), reads it.
 - A limit above 0.0484 for this class, if the owner admits one, is registered in the spec that admits it.

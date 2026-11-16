@@ -303,7 +303,11 @@ impl Catalog {
     /// [`Catalog::refusal_on`]; `Ok(Some(entry))` when its own entry is, and
     /// `entry`, of its family, lists it as an alias and fits the card's class
     /// and generation both; refused, naming what the requested entry needs and
-    /// the card, when no entry that answers to it fits. Matched exactly, as
+    /// the card, when no entry that answers to it fits. Where several that
+    /// answer to it fit, the one of the largest card class does (ADR 0098:
+    /// the 16 GB 27B on a 16 GB card, the 12 GB one on a 12 GB card), never
+    /// the catalog's order; an entry that states no class is the smallest.
+    /// Matched exactly, as
     /// [`Catalog::refusal_on`] matches. The family is the one the catalog
     /// tells of `requested`'s entry ([`CatalogEntry::family()`]): its id's,
     /// or the one it states (ADR 0074) — an entry of no family the catalog
@@ -313,12 +317,13 @@ impl Catalog {
             return Ok(None);
         };
         let family = self.family_of(requested);
-        let answering = self.entries.iter().find(|entry| {
+        let answering = self.entries.iter().filter(|entry| {
             card.and_then(|card| entry.refusal_on(card)).is_none()
                 && family.is_some()
                 && entry.family() == family
                 && entry.aliases.iter().any(|alias| alias == requested)
         });
+        let answering = answering.max_by_key(|entry| entry.card_class);
         answering.map(Some).ok_or(refusal)
     }
 
@@ -523,13 +528,13 @@ pub fn load(files: &dyn Files, path: Option<&Path>) -> Result<Catalog, CatalogEr
 /// entries. `origin` (the file's path) is named in every refusal.
 ///
 /// An operator entry may answer to a built-in entry's id as an alias (ADR
-/// 0064 §2: an operator's own 16 GB build of the 27B answering to
-/// `qwen3.8-27b`). That is not the silent re-pin ADR 0047 refuses: the
-/// built-in entry keeps its id and its pins and serves it wherever it fits,
-/// the alias is consulted only on a card below its class, and the served id
-/// a response reports is the operator entry's, so a client can tell which
-/// model answered. An alias a built-in entry already claims is refused, as
-/// within one file.
+/// 0064 §2: an operator's own build of Flash-Next for a smaller class
+/// answering to `qwen3.8-flash-next`). That is not the silent re-pin ADR 0047
+/// refuses: the built-in entry keeps its id and its pins and serves it
+/// wherever it fits, the alias is consulted only on a card below its class,
+/// and the served id a response reports is the operator entry's, so a client
+/// can tell which model answered. An alias a built-in entry already claims is
+/// refused, whatever the operator entry's class ([`claimed_once`]).
 pub fn parse_operator(text: &str, format: Format, origin: &str) -> Result<Catalog, CatalogError> {
     parse_operator_over(Catalog::built_in(), text, format, origin)
 }
@@ -590,19 +595,26 @@ pub fn parse(document: &Value, origin: &str, layer: CatalogLayer) -> Result<Vec<
     Ok(entries)
 }
 
-/// Every alias claimed by one entry at most (ADR 0064 §2): an id answers for
-/// one entry, or which one served it would be the catalog's order. Checked
-/// over one file's entries, and again over the merged catalog once an
-/// operator's join the built-in ones. That an alias is another entry's id
-/// is the point of it, not a collision.
+/// Every alias claimed by one entry of each card class at most within a
+/// layer, and an operator entry claiming none a built-in entry claims (ADR
+/// 0064 §2, ADR 0098): where several entries answer to an id, the one of the
+/// largest class that fits answers ([`Catalog::answering`]), so two of one
+/// class would leave it to the catalog's order. An entry that states no class
+/// is one class of its own here. Checked over one file's entries, and again
+/// over the merged catalog once an operator's join the built-in ones. That an
+/// alias is another entry's id is the point of it, not a collision.
 fn claimed_once(entries: &[CatalogEntry]) -> Result<(), String> {
     for (index, entry) in entries.iter().enumerate() {
         for alias in &entry.aliases {
-            if let Some(earlier) = entries[..index].iter().find(|earlier| earlier.aliases.contains(alias)) {
-                return Err(format!(
-                    "entry `{}`: alias `{alias}` is already `{}`'s — an id answers for one entry",
-                    entry.id, earlier.id
-                ));
+            let clashes = |earlier: &&CatalogEntry| earlier.aliases.contains(alias) && (earlier.layer != entry.layer || earlier.card_class == entry.card_class);
+            if let Some(earlier) = entries[..index].iter().find(clashes) {
+                let why = if earlier.layer != entry.layer {
+                    "a built-in entry: an operator entry never answers to an id a built-in one answers to".to_owned()
+                } else {
+                    let class = entry.card_class.map_or_else(|| "no card class".to_owned(), |class| format!("the {class} class"));
+                    format!("an entry of {class} too: an id answers for one entry of each card class")
+                };
+                return Err(format!("entry `{}`: alias `{alias}` is already `{}`'s, {why}", entry.id, earlier.id));
             }
         }
     }
@@ -942,17 +954,19 @@ pub(crate) mod testing {
     /// parsed over [`thirty_two`]: the input of the parsing tests.
     pub(crate) const SIXTEEN: &str = include_str!("../../tests/fixtures/catalog/sixteen.yaml");
 
-    /// The built-in catalog, which holds the 16 GB 27B (GitHub #338) and the
-    /// uncensored variant's 16 GB build (GitHub #423).
+    /// The built-in catalog, which holds the 16 GB 27B (GitHub #338), the
+    /// uncensored variant's 16 GB build (GitHub #423) and the 12 GB 27B
+    /// (GitHub #638).
     pub(crate) fn built_in() -> super::Catalog {
         super::Catalog::built_in().clone()
     }
 
-    /// The built-in catalog without its 16 GB entries: a catalog in which no
-    /// entry answers to the 27B's default id, nor to the uncensored
+    /// The built-in catalog without its 16 GB and 12 GB entries: a catalog in
+    /// which no entry answers to the 27B's default id, nor to the uncensored
     /// variant's or Swift 1.5's, on a 16 GB card.
     pub(crate) fn thirty_two() -> super::Catalog {
-        let entries = super::Catalog::built_in().entries.iter().filter(|entry| entry.card_class != Some(super::CardClass::Gb16));
+        use super::CardClass::{Gb12, Gb16};
+        let entries = super::Catalog::built_in().entries.iter().filter(|entry| !matches!(entry.card_class, Some(Gb12 | Gb16)));
         super::Catalog { entries: entries.cloned().collect() }
     }
 
@@ -974,19 +988,20 @@ mod tests {
     /// then each file's name, bytes and SHA-256 in the order listed). Every
     /// built-in entry states its card class (ADR 0064 §1: an operator's may
     /// leave it out, a built-in one never does), the 32 GB one for each but
-    /// the three 16 GB entries, and its generation by one rule (spec #474, ADR
-    /// 0079): `blackwell` for an NVFP4 artifact, Flash-Next and the image
-    /// model, none for the three 16 GB entries (Swift 1.5's since GitHub
-    /// #529). The three 16 GB entries are the
-    /// only ones with an alias: the 16 GB 27B's (GitHub #338,
-    /// spec 27b-16gb/01) `qwen3.8-27b`, its uncensored variant's build's
-    /// (GitHub #423, ADR 0074) `qwen3.8-27b-abliterated`, and Swift 1.5's
-    /// (GitHub #473) `swift-1.5-27b`, each the 32 GB entry's served id. Every
+    /// the three 16 GB entries and the 12 GB one, and its generation by one
+    /// rule (spec #474, ADR 0079): `blackwell` for an NVFP4 artifact,
+    /// Flash-Next and the image model, none for the trellis builds (Swift
+    /// 1.5's since GitHub #529, the 12 GB 27B's by ADR 0098). The trellis
+    /// builds are the only ones with an alias: the 16 GB 27B's (GitHub #338,
+    /// spec 27b-16gb/01) and the 12 GB 27B's (spec #630) `qwen3.8-27b`, its
+    /// uncensored variant's build's (GitHub #423, ADR 0074)
+    /// `qwen3.8-27b-abliterated`, and Swift 1.5's (GitHub #473)
+    /// `swift-1.5-27b`, each the 32 GB entry's served id. Every
     /// one is of a family the catalog tells (ADR 0074): its own id's, its
     /// alias's, or the one it states — the abliterated 27B's, Swift's and
     /// their 16 GB builds', whose ids name none.
     #[allow(clippy::type_complexity)]
-    const RELEASES: [(&str, &str, &str, &str, u32, Option<GpuGeneration>, ModelFamily, &[&str], &[(&str, u64, &str)]); 8] = [
+    const RELEASES: [(&str, &str, &str, &str, u32, Option<GpuGeneration>, ModelFamily, &[&str], &[(&str, u64, &str)]); 9] = [
         (
             "qwen3.8-27b",
             "gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer",
@@ -1145,6 +1160,22 @@ mod tests {
                     "c3116f23756f7c759d84616cf78486618d424ecc5001bfd823c3ddf08cbb3d2d",
                 ),
                 ("qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer", 13_379_877_124, "3a039cb76d2291e3c68f8df5f7b37ac3e83981eb8090625f8a730a670bab63df"),
+            ],
+        ),
+        // The 12 GB 27B (spec #630, GitHub #638): the admitted `trellis-ig28`,
+        // the upload's hub commit (2026-11-16).
+        (
+            "qwen3.8-27b-12g",
+            "gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis",
+            "15333a0829f055e7ee25d6d5ef84fd8d521518c6",
+            "qwen3_8_27b_trellis_ig28-v2.ninfer",
+            12,
+            None,
+            ModelFamily::Qwen38_27b,
+            &["qwen3.8-27b"],
+            &[
+                ("qwen3_8_27b_trellis_ig28-v2.ninfer.conversion.json", 309_831, "b19eb010025276cfb59f93db40e41d52db30e104fa89867218ebd6b789ea4ac9"),
+                ("qwen3_8_27b_trellis_ig28-v2.ninfer", 12_754_663_684, "fab06bea49ce114da99ca69588f00b10fb5081c564f9ce60ecbef8b3dbf6d6a5"),
             ],
         ),
     ];
@@ -1386,7 +1417,7 @@ mod tests {
         let json = serde_json::to_string(&Format::Yaml.read(OPERATOR).unwrap()).unwrap();
         let from_json = parse_operator(&json, Format::Json, "acme.catalog.json").expect("valid");
         assert_eq!(from_yaml, from_json);
-        assert_eq!(from_yaml.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", "acme-qwen3.8-27b-ft"]);
+        assert_eq!(from_yaml.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3.8-27b-12g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", "acme-qwen3.8-27b-ft"]);
         let acme = from_yaml.entry("acme-qwen3.8-27b-ft").unwrap();
         assert_eq!(acme.layer, CatalogLayer::Operator);
         assert_eq!(acme.revision, "v1");
@@ -1571,6 +1602,7 @@ mod tests {
             ("qwen3.8-27b-abliterated-16g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis/blob/94a8bfc0f47ce86403f274be03e2c0f79500727c/LICENSE"),
             ("swift-1.5-27b", "swift-open-license-1.0", "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/890d5744d116caff2ee6746285bf839da175a63e/LICENSE"),
             ("swift-1.5-27b-16g", "swift-open-license-1.0", "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/3fe94555a30b3df89a283bf61338281243642166/LICENSE"),
+            ("qwen3.8-27b-12g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis/blob/15333a0829f055e7ee25d6d5ef84fd8d521518c6/LICENSE"),
             ("qwen3-asr-1.7b", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE"),
             ("qwen3-asr-1.7b-q8", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE"),
             ("qwen3-asr-0.6b", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis/blob/af02916ea7a532a667a907c2a163b16a8c04b433/LICENSE"),
@@ -1673,29 +1705,38 @@ mod tests {
         assert!(err.contains("`qwen3.8-flash-next`") && err.contains("`qwen3.8-27b`") && err.contains("one model family"), "{err}");
     }
 
-    /// ADR 0064 §2: an id answers for one entry, or which one served it would
-    /// be the catalog's order — refused within a file.
+    /// ADR 0064 §2, ADR 0098: an id answers for one entry of each card class,
+    /// or which one served it would be the catalog's order — two of one class
+    /// are refused within a file. Two of different classes both answer to it,
+    /// the larger one where both fit, the smaller one below it.
     #[test]
-    fn an_alias_two_entries_claim_is_refused() {
+    fn an_alias_two_entries_of_one_class_claim_is_refused() {
         let (_, body) = SIXTEEN.split_once("models:\n").unwrap();
         let first = body.split("\n  - ").next().unwrap();
         let twice = format!("{SIXTEEN}\n{}\n", first.replacen("id: qwen3.8-27b-16g", "id: acme-27b-16g", 1));
         let err = sixteen_over_thirty_two(&twice).unwrap_err().0;
         assert!(
-            err.contains("acme.catalog.yaml") && err.contains("`acme-27b-16g`") && err.contains("`qwen3.8-27b-16g`") && err.contains("alias `qwen3.8-27b`"),
+            err.contains("acme.catalog.yaml") && err.contains("`acme-27b-16g`") && err.contains("`qwen3.8-27b-16g`") && err.contains("alias `qwen3.8-27b`") && err.contains("the 16 GB class"),
             "{err}"
         );
+        let twelve = first.replacen("id: qwen3.8-27b-16g", "id: acme-27b-12g", 1).replacen("card_class: 16", "card_class: 12", 1).replace("q16.ninfer", "q12.ninfer");
+        let catalog = sixteen_over_thirty_two(&format!("models:\n{twelve}\n{body}")).expect("two classes, one entry each");
+        assert_eq!(resolved(&catalog, "qwen3.8-27b", Some(&on(CardClass::Gb16))), Ok("qwen3.8-27b-16g"));
+        assert_eq!(resolved(&catalog, "qwen3.8-27b", Some(&on(CardClass::Gb12))), Ok("acme-27b-12g"));
     }
 
     /// ADR 0064 §2 across the two layers: an operator entry claiming an alias
     /// a built-in entry claims is refused by the check over the merged
-    /// catalog, each file being valid on its own; an operator entry reusing
-    /// the built-in 16 GB 27B's id is refused as any built-in id is.
+    /// catalog, each file being valid on its own, of whatever class it is
+    /// (ADR 0098: the per-class rule holds within a layer); an operator entry
+    /// reusing the built-in 16 GB 27B's id is refused as any built-in id is.
     #[test]
     fn an_alias_a_built_in_entry_claims_is_refused_to_an_operator_entry() {
-        let claiming = SIXTEEN.replacen("id: qwen3.8-27b-16g", "id: acme-27b-16g", 1);
-        let err = operator(&claiming).unwrap_err().0;
-        assert!(err.contains("acme.catalog.yaml") && err.contains("entry `acme-27b-16g`: alias `qwen3.8-27b` is already `qwen3.8-27b-16g`'s"), "{err}");
+        for class in ["12", "16", "24"] {
+            let claiming = SIXTEEN.replacen("id: qwen3.8-27b-16g", "id: acme-27b-16g", 1).replacen("card_class: 16", &format!("card_class: {class}"), 1);
+            let err = operator(&claiming).unwrap_err().0;
+            assert!(err.contains("acme.catalog.yaml") && err.contains("entry `acme-27b-16g`: alias `qwen3.8-27b` is already `qwen3.8-27b-16g`'s, a built-in entry"), "{class}: {err}");
+        }
         assert!(operator(SIXTEEN).unwrap_err().0.contains("reuses the built-in id `qwen3.8-27b-16g`"));
         let joined = operator(OPERATOR).expect("an entry claiming no alias joins");
         assert_eq!(joined.ids().last(), Some(&"acme-qwen3.8-27b-ft"));
@@ -1718,7 +1759,7 @@ mod tests {
     fn an_id_resolves_to_its_own_entry_when_the_card_class_fits() {
         use CardClass::*;
         let catalog = Catalog::built_in();
-        for (id, card) in [("qwen3.8-27b", Gb32), ("qwen3.8-27b", Gb96), ("qwen3.8-flash-next", Gb32), ("ignis-image-2.1-turbo", Gb96), ("qwen3.8-27b-16g", Gb16), ("qwen3.8-27b-16g", Gb32), ("qwen3.8-27b-abliterated", Gb32), ("qwen3.8-27b-abliterated-16g", Gb16), ("swift-1.5-27b", Gb32), ("swift-1.5-27b", Gb96), ("swift-1.5-27b-16g", Gb16), ("swift-1.5-27b-16g", Gb32), ("qwen3.8-27b-16g", Gb24), ("qwen3.8-27b-abliterated-16g", Gb24), ("swift-1.5-27b-16g", Gb24)] {
+        for (id, card) in [("qwen3.8-27b", Gb32), ("qwen3.8-27b", Gb96), ("qwen3.8-flash-next", Gb32), ("ignis-image-2.1-turbo", Gb96), ("qwen3.8-27b-16g", Gb16), ("qwen3.8-27b-16g", Gb32), ("qwen3.8-27b-abliterated", Gb32), ("qwen3.8-27b-abliterated-16g", Gb16), ("swift-1.5-27b", Gb32), ("swift-1.5-27b", Gb96), ("swift-1.5-27b-16g", Gb16), ("swift-1.5-27b-16g", Gb32), ("qwen3.8-27b-16g", Gb24), ("qwen3.8-27b-abliterated-16g", Gb24), ("swift-1.5-27b-16g", Gb24), ("qwen3.8-27b-12g", Gb12), ("qwen3.8-27b-12g", Gb16), ("qwen3.8-27b-12g", Gb32)] {
             assert_eq!(catalog.refusal_on(id, Some(&on(card))), None, "{id} on {card}");
             assert_eq!(catalog.answering(id, Some(&on(card))), Ok(None), "{id} on {card}: it stands as it is");
         }
@@ -1755,24 +1796,75 @@ mod tests {
         assert_eq!(Catalog::built_in().refusal_on("ignis-image-2.1-turbo", Some(&card)).map(refused), Some(("model_above_card_class", said.to_owned())));
     }
 
-    /// Spec #630 (GitHub #637): a card below 14 GiB is of the 12 GB class,
-    /// below every built-in entry's: a 16 GB entry is refused there by name,
-    /// as the larger classes' entries are on a 16 GB card, and so is each id
-    /// a 16 GB entry answers to, until an entry of the 12 GB class does
-    /// (GitHub #638). A start on that card loads an artifact named by its
-    /// path, which the catalog does not judge.
+    /// Spec #630 (GitHub #638): on a card below 14 GiB, the 12 GB class, the
+    /// 27B's id is served by `qwen3.8-27b-12g`, the class's own entry, which
+    /// stands as it is there; each 16 GB entry is refused by name, and so is
+    /// each id only a 16 GB entry answers to, the uncensored variant's and
+    /// Swift 1.5's. The listing says which entry serves the 27B's id, and
+    /// none for a 16 GB entry. An RTX 30 or 40 card of 12 GB is the class
+    /// too: the entry states no generation. A start on that card loads an
+    /// artifact named by its path, which the catalog does not judge.
     #[test]
-    fn on_a_12gb_card_the_16gb_entries_are_above_its_class() {
+    fn on_a_12gb_card_the_27bs_id_is_served_by_the_12gb_entry_and_a_16gb_entry_is_refused_by_name() {
         let catalog = Catalog::built_in();
-        let card = on(CardClass::Gb12);
-        let said = "qwen3.8-27b-16g needs a 16 GB card or larger (its catalog entry's card_class), and this card is of the 12 GB class";
         let refused = |refusal: CardRefusal| (refusal.code(), refusal.to_string());
-        assert_eq!(catalog.answering("qwen3.8-27b-16g", Some(&card)).map_err(refused), Err(("model_above_card_class", said.to_owned())));
-        for id in ["qwen3.8-27b", "qwen3.8-27b-abliterated", "swift-1.5-27b", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b-16g"] {
+        for card in [on(CardClass::Gb12), reading(12 << 30, "NVIDIA GeForce RTX 3060", 8, 6), reading(12 << 30, "NVIDIA GeForce RTX 4070", 8, 9)] {
+            assert_eq!(card.class(), Some(CardClass::Gb12), "{}", card.name);
+            let card = Some(&card);
+            assert_eq!(resolved(catalog, "qwen3.8-27b", card), Ok("qwen3.8-27b-12g"), "{card:?}");
+            assert_eq!(catalog.answering("qwen3.8-27b-12g", card), Ok(None), "{card:?}: it stands as it is");
+            let unavailable = catalog.unavailable("qwen3.8-27b", card).expect("its own entry is above the class");
+            assert_eq!(unavailable.served_by.as_deref(), Some("qwen3.8-27b-12g"), "{unavailable}");
+            assert!(unavailable.to_string().ends_with("; a request naming it is served by qwen3.8-27b-12g"), "{unavailable}");
+            for id in ["qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b-16g"] {
+                let said = format!("{id} needs a 16 GB card or larger (its catalog entry's card_class), and this card is of the 12 GB class");
+                assert_eq!(catalog.answering(id, card).map_err(refused), Err(("model_above_card_class", said.clone())), "{card:?}");
+                assert_eq!(catalog.unavailable(id, card).map(|unavailable| (unavailable.to_string(), unavailable.served_by)), Some((said, None)));
+            }
+        }
+        let card = on(CardClass::Gb12);
+        let twelve = catalog.entry("qwen3.8-27b-12g").unwrap();
+        assert_eq!(catalog.alias_holds("qwen3.8-27b", twelve, Some(ModelFamily::Qwen38_27b), Some(&card)), Ok(()));
+        let other = catalog.alias_holds("qwen3.8-27b", twelve, Some(ModelFamily::FlashNext), Some(&card)).unwrap_err().to_string();
+        assert!(other.contains("qwen3.8-27b-12g lists it as an alias") && other.contains("one model family"), "{other}");
+        for id in ["qwen3.8-27b-abliterated", "swift-1.5-27b"] {
             let err = resolved(catalog, id, Some(&card)).unwrap_err();
-            assert!(err.starts_with(id) && err.ends_with("this card is of the 12 GB class"), "{id}: {err}");
+            assert!(err.starts_with(&format!("{id} needs a 32 GB card")) && err.ends_with("this card is of the 12 GB class"), "{id}: {err}");
         }
         assert_eq!(catalog.refusal_on("some-other-model", Some(&card)), None, "an artifact the catalog has no entry for");
+    }
+
+    /// Spec #630 (GitHub #638, ADR 0098): two entries answer to
+    /// `qwen3.8-27b`, the 16 GB 27B and the 12 GB one, and where both fit the
+    /// one of the larger class answers, whatever their order in the catalog:
+    /// the 16 GB entry on a 16 or 24 GB card, an RTX 3090 or 4090 and an Ada
+    /// card of no class, the 12 GB entry on a 12 GB card. On a 32 or 96 GB
+    /// card the id is its own entry's, and on every class the 12 GB entry
+    /// loads by its own id.
+    #[test]
+    fn of_the_entries_answering_to_an_id_the_one_of_the_largest_class_that_fits_answers() {
+        use CardClass::*;
+        let reversed = Catalog::from_entries(Catalog::built_in().entries().iter().rev().cloned().collect());
+        for catalog in [Catalog::built_in(), &reversed] {
+            let ada = reading(48 << 30, "NVIDIA RTX (Ada)", 8, 9);
+            for (card, answering) in [
+                (on(Gb12), "qwen3.8-27b-12g"),
+                (on(Gb16), "qwen3.8-27b-16g"),
+                (on(Gb24), "qwen3.8-27b-16g"),
+                (rtx_3090(), "qwen3.8-27b-16g"),
+                (rtx_4090(), "qwen3.8-27b-16g"),
+                (ada, "qwen3.8-27b-16g"),
+            ] {
+                assert_eq!(resolved(catalog, "qwen3.8-27b", Some(&card)), Ok(answering), "{}", card.name);
+            }
+            for card in [on(Gb32), on(Gb96), rtx_5090()] {
+                assert_eq!(catalog.answering("qwen3.8-27b", Some(&card)), Ok(None), "{}: its own entry", card.name);
+            }
+            for card in [on(Gb12), on(Gb16), on(Gb24), on(Gb32), on(Gb96), rtx_3090(), rtx_4090(), rtx_5090()] {
+                assert_eq!(catalog.refusal_on("qwen3.8-27b-12g", Some(&card)), None, "{}", card.name);
+                assert_eq!(catalog.answering("qwen3.8-27b-12g", Some(&card)), Ok(None), "{}: by its own id", card.name);
+            }
+        }
     }
 
     /// ADR 0064 §2 on the artifact: the entry that answers to an alias must
@@ -1969,7 +2061,7 @@ mod tests {
     #[test]
     fn an_unknown_card_class_refuses_nothing() {
         let catalog = Catalog::built_in();
-        for id in ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g"] {
+        for id in ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3.8-27b-12g"] {
             assert_eq!(catalog.answering(id, None), Ok(None), "{id}: the id's own entry, never the one answering to it");
             assert_eq!(catalog.refusal_on(id, None), None, "{id}");
         }

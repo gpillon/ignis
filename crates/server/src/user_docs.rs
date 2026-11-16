@@ -228,15 +228,18 @@ pub fn models() -> String {
 /// The cards the guide names (`docs/user/start/index.md`, What it runs on),
 /// one column each of the models page's table: their names, their GPU
 /// generation and card class. How far each is verified stays on that page
-/// alone. The 12 GB class has no column until the catalog holds an entry of
-/// its class (GitHub #638): until then every built-in entry is above it.
-const CARDS: [(&str, GpuGeneration, CardClass); 6] = [
+/// alone. The 12 GB class's three, one a generation, since its entry
+/// (GitHub #638).
+const CARDS: [(&str, GpuGeneration, CardClass); 9] = [
     ("RTX PRO 6000", GpuGeneration::Blackwell, CardClass::Gb96),
     ("RTX 5090", GpuGeneration::Blackwell, CardClass::Gb32),
     ("RTX 5060 Ti 16 GB, 5070 Ti, 5080", GpuGeneration::Blackwell, CardClass::Gb16),
+    ("RTX 5070", GpuGeneration::Blackwell, CardClass::Gb12),
     ("RTX 3090, 3090 Ti", GpuGeneration::Ampere, CardClass::Gb24),
+    ("RTX 3060 12 GB, 3080 Ti", GpuGeneration::Ampere, CardClass::Gb12),
     ("RTX 4090", GpuGeneration::Ada, CardClass::Gb24),
     ("RTX 4060 Ti 16 GB, 4080", GpuGeneration::Ada, CardClass::Gb16),
+    ("RTX 4070, 4070 Super, 4070 Ti", GpuGeneration::Ada, CardClass::Gb12),
 ];
 
 /// A card of `generation` and `class` as the start reads it, under the
@@ -652,29 +655,37 @@ mod tests {
             let start = format!("| `{id}` |");
             page.lines().find(|line| line.starts_with(&start)).unwrap_or_else(|| panic!("no row for {id}: {page}")).to_owned()
         };
-        // PRO 6000, 5090, 16 GB RTX 50, 3090, 4090, 16 GB RTX 40.
-        let sixteen = "served by `qwen3.8-27b-16g`";
-        assert_eq!(row("qwen3.8-27b"), format!("| `qwen3.8-27b` | loads | loads | {sixteen} | {sixteen} | {sixteen} | {sixteen} |"));
-        assert_eq!(row("qwen3.8-27b-16g"), "| `qwen3.8-27b-16g` | loads | loads | loads | loads | loads | loads |");
+        // PRO 6000, 5090, 16 GB RTX 50, 12 GB RTX 50, 3090, 12 GB RTX 30,
+        // 4090, 16 GB RTX 40, 12 GB RTX 40.
+        let (sixteen, twelve) = ("served by `qwen3.8-27b-16g`", "served by `qwen3.8-27b-12g`");
+        assert_eq!(
+            row("qwen3.8-27b"),
+            format!("| `qwen3.8-27b` | loads | loads | {sixteen} | {twelve} | {sixteen} | {twelve} | {sixteen} | {sixteen} | {twelve} |")
+        );
+        let class = "refused (class)";
+        assert_eq!(row("qwen3.8-27b-16g"), format!("| `qwen3.8-27b-16g` | loads | loads | loads | {class} | loads | {class} | loads | loads | {class} |"));
+        assert_eq!(row("qwen3.8-27b-12g"), "| `qwen3.8-27b-12g` | loads | loads | loads | loads | loads | loads | loads | loads | loads |", "GitHub #638");
+        let both = "refused (class, generation)";
         let abliterated = "served by `qwen3.8-27b-abliterated-16g`";
         assert_eq!(
             row("qwen3.8-27b-abliterated"),
-            format!("| `qwen3.8-27b-abliterated` | loads | loads | {abliterated} | {abliterated} | {abliterated} | {abliterated} |")
+            format!("| `qwen3.8-27b-abliterated` | loads | loads | {abliterated} | {class} | {abliterated} | {both} | {abliterated} | {abliterated} | {both} |")
         );
-        assert_eq!(row("qwen3.8-27b-abliterated-16g"), "| `qwen3.8-27b-abliterated-16g` | loads | loads | loads | loads | loads | loads |");
+        assert_eq!(
+            row("qwen3.8-27b-abliterated-16g"),
+            format!("| `qwen3.8-27b-abliterated-16g` | loads | loads | loads | {class} | loads | {class} | loads | loads | {class} |")
+        );
         let swift = "served by `swift-1.5-27b-16g`";
-        assert_eq!(row("swift-1.5-27b"), format!("| `swift-1.5-27b` | loads | loads | {swift} | {swift} | {swift} | {swift} |"));
-        assert_eq!(row("swift-1.5-27b-16g"), "| `swift-1.5-27b-16g` | loads | loads | loads | loads | loads | loads |", "GitHub #529");
-        assert_eq!(
-            row("qwen3.8-flash-next"),
-            "| `qwen3.8-flash-next` | loads | loads | refused (class) | refused (class, generation) | refused (class, generation) | refused (class, generation) |"
-        );
-        assert_eq!(
-            row("ignis-image-2.1-turbo"),
-            "| `ignis-image-2.1-turbo` | loads | loads | refused (class) | refused (class, generation) | refused (class, generation) | refused (class, generation) |"
-        );
+        assert_eq!(row("swift-1.5-27b"), format!("| `swift-1.5-27b` | loads | loads | {swift} | {class} | {swift} | {both} | {swift} | {swift} | {both} |"));
+        assert_eq!(row("swift-1.5-27b-16g"), format!("| `swift-1.5-27b-16g` | loads | loads | loads | {class} | loads | {class} | loads | loads | {class} |"), "GitHub #529");
+        for id in ["qwen3.8-flash-next", "ignis-image-2.1-turbo"] {
+            assert_eq!(row(id), format!("| `{id}` | loads | loads | {class} | {class} | {both} | {both} | {both} | {both} | {both} |"));
+        }
         assert!(!page.contains("| *Status* |"), "how far a card is verified stays on What it runs on: {page}");
-        assert!(page.contains("| *Generation, class* | Blackwell (12.0), 96 GB | Blackwell (12.0), 32 GB | Blackwell (12.0), 16 GB | Ampere (8.6), 24 GB | Ada (8.9), 24 GB | Ada (8.9), 16 GB |"), "{page}");
+        assert!(
+            page.contains("| *Generation, class* | Blackwell (12.0), 96 GB | Blackwell (12.0), 32 GB | Blackwell (12.0), 16 GB | Blackwell (12.0), 12 GB | Ampere (8.6), 24 GB | Ampere (8.6), 12 GB | Ada (8.9), 24 GB | Ada (8.9), 16 GB | Ada (8.9), 12 GB |"),
+            "{page}"
+        );
         assert!(!page.contains("| `qwen3-asr-1.7b` |"), "a model on the CPU has no row: {page}");
         assert!(page.contains("The speech models and the diarizer (`qwen3-asr-1.7b`, `qwen3-asr-1.7b-q8`, `qwen3-asr-0.6b`, `nemotron-3-diarization`) run on the CPU"), "{page}");
     }

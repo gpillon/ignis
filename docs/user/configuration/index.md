@@ -108,8 +108,8 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   ([on a real 12 GB card](vram-and-kv-pool.md#on-a-real-12-gb-card)); on one decode lane,
   drafting with its MTP head at 7 draft tokens, vision on at 4,096 tokens an
   image in host RAM, a VRAM headroom of 512M and a 512-token prefill chunk,
-  the solo width pinned to it. It names no model, and no catalog entry is of
-  its class yet: the class's own artifact is not published
+  the solo width pinned to it. It names no model: a start with no artifact
+  takes the catalog's 12 GB entry of the default id, `qwen3.8-27b-12g`
   ([Profiles and defaults](../concepts/profiles.md#rtx-12gb)).
 - `rtx-24gb` is the 24 GB class (RTX 3090, RTX 4090): the 5090 profile's
   values for the 27B (VRAM headroom 1200M, a 2,048-token prefill chunk,

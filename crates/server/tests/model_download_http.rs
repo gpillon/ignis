@@ -174,6 +174,29 @@ async fn a_download_is_refused_with_a_reason_and_fetches_nothing() {
     }
     assert!(files_in(&built_in_dir).is_empty(), "nothing landed");
     let _ = std::fs::remove_dir_all(built_in_dir);
+
+    // Spec #630 (GitHub #638): on a 12 GB card, an RTX 50 or an RTX 30, a
+    // 16 GB entry is refused by name, `409 model_above_card_class`, before
+    // any fetch; the 27B's own id is refused naming the 12 GB entry that
+    // serves it there, which is the one to download.
+    for (name, major, minor) in [("NVIDIA GeForce RTX 5070", 12, 0), ("NVIDIA GeForce RTX 3060", 8, 6)] {
+        let built_in = CatalogModels { catalog: Arc::new(ignis_server::download::Catalog::built_in().clone()), dir: repo::fresh_dir("refused-12gb") };
+        let built_in_dir = built_in.dir.clone();
+        let on_12gb = Server::from_active(loader.model("mock-a"))
+            .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_catalog(built_in, true).with_card(Some(card(12, name, major, minor))))
+            .with_downloads(Downloads::of(&config(&repo, &[]), None))
+            .app();
+        for model in ["qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b-16g"] {
+            let (status, code, message) = refused(on_12gb.clone(), model).await;
+            assert_eq!((status, code.as_str()), (StatusCode::CONFLICT, "model_above_card_class"), "{name}: {message}");
+            assert!(message.starts_with(&format!("{model} needs a 16 GB card or larger")) && message.contains("the 12 GB class"), "{name}: {message}");
+        }
+        let (status, _, message) = refused(on_12gb.clone(), "qwen3.8-27b").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{name}: {message}");
+        assert!(message.contains("a request naming it is served by qwen3.8-27b-12g"), "{name}: {message}");
+        assert!(files_in(&built_in_dir).is_empty(), "{name}: nothing landed");
+        let _ = std::fs::remove_dir_all(built_in_dir);
+    }
     assert!(repo.seen().is_empty(), "no refusal reached the endpoint: {:?}", repo.seen());
     let _ = std::fs::remove_dir_all(dir);
 }

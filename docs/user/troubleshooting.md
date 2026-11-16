@@ -517,7 +517,11 @@ download ([Get a model](guides/models.md), [Switching models](api/model-switchin
 The request or the switch names a catalog entry that needs a larger card than
 this one, such as Flash-Next on a 16 GB card. The message names both classes,
 and the loaded model keeps serving. Name an entry the card loads on
-([Get a model](guides/models.md)). When an entry that fits answers to the id as
+([Get a model](guides/models.md)). On a 12 GB card, from 0.11.0, that is
+`qwen3.8-27b-12g` alone among the text and image models: a client or a start
+naming `qwen3.8-27b-16g`, the uncensored variant or Swift 1.5 is refused
+there, since none has a 12 GB build; name `qwen3.8-27b`, which the 12 GB
+entry serves there, or that entry by its id. When an entry that fits answers to the id as
 an alias but its artifact's header names another model family than the id's,
 the message names both families: that entry's files, or the `family` its
 catalog states, are wrong ([an operator catalog](guides/operator-catalog.md#an-entrys-family-and-an-alias-of-your-own)).
@@ -532,7 +536,8 @@ its name, compute capability and generation, and the entry's class as well
 when that is above the card's too; the loaded model keeps serving, and a start
 that would load it is refused. On such a card name `qwen3.8-27b`,
 `qwen3.8-27b-abliterated` or `swift-1.5-27b`, which their 16 GB entries serve
-there, or one of
+there (on a 12 GB card, from 0.11.0, only `qwen3.8-27b`, which its 12 GB entry
+serves), or one of
 those entries by its own id ([Get a model](guides/models.md#the-catalog)). An
 operator entry that states a `generation` its artifact does not need is
 fixed in its catalog ([an operator catalog](guides/operator-catalog.md)).

@@ -151,20 +151,24 @@ reports. It tells artifacts of one family apart: `qwen3.8-27b` and
 operator's `--model-id`, or the family's default when none is named.
 
 The **catalog** is the set of models the server knows how to fetch
-([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Twelve entries
+([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Thirteen entries
+(twelve in 0.10.0)
 are built into the binary, each pinned file by file at a fixed revision of its
-Hugging Face repository: eight text and image models, `qwen3.8-27b`,
-`qwen3.8-27b-16g`, `qwen3.8-27b-abliterated`, `qwen3.8-27b-abliterated-16g`,
-`swift-1.5-27b`, `swift-1.5-27b-16g`, `qwen3.8-flash-next` and
-`ignis-image-2.1-turbo`, plus three speech models and a diarizer. Each of the
-eight states the smallest **card class** it loads on: 32 GB for all but the
-three `-16g` entries, which load on 16 GB and answer to `qwen3.8-27b`,
-to `qwen3.8-27b-abliterated` and to `swift-1.5-27b` on a 16 or 24 GB card
+Hugging Face repository: nine text and image models, `qwen3.8-27b`,
+`qwen3.8-27b-16g`, `qwen3.8-27b-12g` (from 0.11.0), `qwen3.8-27b-abliterated`,
+`qwen3.8-27b-abliterated-16g`, `swift-1.5-27b`, `swift-1.5-27b-16g`,
+`qwen3.8-flash-next` and `ignis-image-2.1-turbo`, plus three speech models and
+a diarizer. Each of the nine states the smallest **card class** it loads on:
+32 GB for all but the three `-16g` entries, which load on 16 GB and answer to
+`qwen3.8-27b`, to `qwen3.8-27b-abliterated` and to `swift-1.5-27b` on a 16 or
+24 GB card, and `qwen3.8-27b-12g`, which loads on 12 GB and answers to
+`qwen3.8-27b` on a 12 GB card
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md),
-[ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md))
-([the catalog](../guides/models.md#the-catalog)). All but the three `-16g`
-entries also state the oldest **GPU generation** they load on, Blackwell: on an
-RTX 30 or RTX 40 card the `-16g` entries serve the ids they answer to, and the
+[ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md),
+[ADR 0098](../../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md))
+([the catalog](../guides/models.md#the-catalog)). All but the trellis
+entries (`-16g`, `-12g`) also state the oldest **GPU generation** they load on, Blackwell: on an
+RTX 30 or RTX 40 card the trellis entries serve the ids they answer to, and the
 rest are refused
 ([ADR 0079](../../adr/0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md),
 [Where each model loads](../reference/models.md#where-each-model-loads)).

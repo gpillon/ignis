@@ -216,16 +216,15 @@ RTX 3060 12 GB and the RTX 3080 Ti, a total memory below 14 GiB. It is sized
 for one person with a desktop on the card, and its context is what the
 desktop leaves
 ([ADR 0098](../../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md)).
-The profile names no model. The class's own artifact, the 27B at about 2.8
-bits per weight under a ceiling of 9.2 GB of weights, is not published yet:
-until it is, the catalog holds no entry of this class and refuses every
-built-in entry on such a card by its class
-([the catalog](../guides/models.md#the-catalog)), and the profile serves an
-artifact named by its path, `--model-artifact`. The candidate the gate
-measured on the RTX 5090 reads 0.0431 in KLD against BF16 (the 16 GB
-artifact, 0.0418, on the same set and shape) and decodes 294, 251 and 228
-tokens a second at 8,192, 65,536 and 130,560 tokens of context under MTP;
-no card but the RTX 5090 has measured it.
+The profile names no model: a start with no artifact takes the catalog's
+12 GB entry of the default id, `qwen3.8-27b-12g`, the 27B at about 2.8 bits
+per weight under a ceiling of 9.2 GB of weights, which answers to
+`qwen3.8-27b` on such a card; a 16 GB entry is refused there by its class
+([the catalog](../guides/models.md#the-catalog)). The artifact reads 0.0431
+in KLD against BF16 on the RTX 5090 (the 16 GB artifact, 0.0418, on the same
+set and shape) and decodes 294, 251 and 228 tokens a second at 8,192, 65,536
+and 130,560 tokens of context under MTP; no card but the RTX 5090 has
+measured it.
 
 | Field | 27B |
 |---|---|

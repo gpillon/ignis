@@ -637,7 +637,10 @@ id's own entry, its **card class** below the entry's or its **GPU generation**
 older: its family's default id, or another entry's served id of the same
 family (ADR 0064, ADR 0074, ADR 0079). It resolves only within
 one model family — the entry that answers to it holds an artifact whose header
-names that family — and only to an entry the card can load.
+names that family — and only to an entry the card can load. Entries of
+different card classes may answer to one id, and where several fit the card
+the one of the largest class answers (ADR 0098): `qwen3.8-27b` is the 16 GB
+27B's on a 16 GB card and the 12 GB 27B's on a 12 GB one.
 
 **Fine-tune**:
 A catalog entry of a model family whose weights are another party's

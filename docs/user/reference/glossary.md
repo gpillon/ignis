@@ -39,10 +39,12 @@ trellis). It is read from the artifact, never configured. See
 
 **Alias.** A second id a catalog entry answers to, within its own model family
 and only on a card it loads on: on a 16 GB card or an RTX 3090,
-`qwen3.8-27b-16g` answers to `qwen3.8-27b`. See [Get a model](../guides/models.md).
+`qwen3.8-27b-16g` answers to `qwen3.8-27b`, and on a 12 GB card, from 0.11.0,
+`qwen3.8-27b-12g`; where both fit, the entry of the larger class answers. See
+[Get a model](../guides/models.md).
 
 **Card.** The GPU ignis runs on. The built-in profiles are written for the
-16 GB class, the 24 GB class, a 32 GB RTX 5090 and a 96 GB RTX PRO 6000, and
+12 GB class (from 0.11.0), the 16 GB class, the 24 GB class, a 32 GB RTX 5090 and a 96 GB RTX PRO 6000, and
 `--profile auto` picks one by the card's memory. See [profiles](../concepts/profiles.md).
 
 **Card class.** The cards one built-in profile serves, named by their memory
@@ -51,8 +53,9 @@ one a catalog entry loads on. An entry above the card is refused before anything
 is unloaded or fetched. See [models and artifacts](../concepts/models-and-artifacts.md)
 and [profiles](../concepts/profiles.md).
 
-**Catalog.** The models the server knows how to fetch: twelve entries built into
-the binary (eight text and image models, three speech models and a diarizer),
+**Catalog.** The models the server knows how to fetch: thirteen entries built
+into the binary (twelve in 0.10.0), nine text and image models, three speech
+models and a diarizer,
 pinned file by file, plus any an operator adds. See
 [models and artifacts](../concepts/models-and-artifacts.md) and
 [Get a model](../guides/models.md).

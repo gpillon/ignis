@@ -579,7 +579,7 @@ mod tests {
         }
     }
 
-    const ALL_IDS: [&str; 12] = [
+    const ALL_IDS: [&str; 13] = [
         "qwen3.8-27b",
         "qwen3.8-27b-abliterated",
         "qwen3.8-flash-next",
@@ -588,6 +588,7 @@ mod tests {
         "qwen3.8-27b-abliterated-16g",
         "swift-1.5-27b",
         "swift-1.5-27b-16g",
+        "qwen3.8-27b-12g",
         "qwen3-asr-1.7b",
         "qwen3-asr-1.7b-q8",
         "qwen3-asr-0.6b",
@@ -673,6 +674,27 @@ mod tests {
         assert_eq!(ids, ["qwen3.8-27b"]);
     }
 
+    /// Spec #630 (GitHub #638), through the command line: on a 12 GB card,
+    /// an RTX 50 or an RTX 30, `model download` fetches the 12 GB entry that
+    /// answers to the default id, and so does `model download qwen3.8-27b`,
+    /// while a 16 GB entry is refused by name before anything is fetched; on
+    /// a 16 GB card the 12 GB entry is fetched by its own id.
+    #[test]
+    fn model_download_on_a_12gb_card_fetches_the_12gb_entry() {
+        let files = MemFiles::default();
+        let rtx_3060 = Card::Read(super::super::profile::testing::reading(11 << 30, "NVIDIA GeForce RTX 3060", 8, 6));
+        for card in [Card::blackwell(12 << 30), rtx_3060] {
+            for argv in [&["model", "download"][..], &["model", "download", "qwen3.8-27b"]] {
+                let (ids, ..) = download_of(run_on(argv, &files, card.clone()).unwrap());
+                assert_eq!(ids, ["qwen3.8-27b-12g"], "{argv:?} on {card:?}");
+            }
+            let err = run_on(&["model", "download", "qwen3.8-27b-16g"], &files, card.clone()).unwrap_err().0;
+            assert!(err.contains("nothing fetched") && err.contains("qwen3.8-27b-16g needs a 16 GB card or larger") && err.contains("this card is of the 12 GB class"), "{err}");
+        }
+        let (ids, ..) = download_of(run_on(&["model", "download", "qwen3.8-27b-12g"], &files, Card::blackwell(16 << 30)).unwrap());
+        assert_eq!(ids, ["qwen3.8-27b-12g"]);
+    }
+
     /// Spec #474, through the command line on an RTX 3090 (24 GiB, 8.6): the
     /// `model` verbs read the card's generation as a start does. `model
     /// download qwen3.8-27b` fetches the 16 GB entry, a Blackwell-only entry
@@ -720,7 +742,7 @@ mod tests {
         let files = MemFiles::with(&[("conf/ignis.config.yaml", "download:\n  catalog: acme.yaml\n  path: /srv/models\n"), ("conf/acme.yaml", catalog)]);
         match run(&["model", "list", "--config", "conf/ignis.config.yaml", "--format", "json"], &[], &files).unwrap() {
             ConfigOutcome::Model(ModelCommand::List { catalog, dir, format, card }) => {
-                assert_eq!(catalog.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", "acme-ft"]);
+                assert_eq!(catalog.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3.8-27b-12g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", "acme-ft"]);
                 assert_eq!((dir, format, card.map(|card| card.total)), (PathBuf::from("/srv/models"), ListFormat::Json, Some(super::super::profile::RTX_5090_TOTAL_BYTES)));
             }
             other => panic!("{other:?}"),

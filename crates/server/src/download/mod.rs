@@ -528,6 +528,49 @@ mod tests {
         assert_eq!(served_start_options(options.clone(), &served, Some(&own), &catalog, options.card(), &|_| panic!("its own entry")).unwrap(), options);
     }
 
+    /// Spec #630 (GitHub #638), `main`'s start path end to end: a start with
+    /// no artifact named on a 12 GB card, an RTX 50 or an RTX 30, resolves
+    /// `rtx-12gb` and serves the 27B's default id from the 12 GB entry under
+    /// that entry's own id, its artifact and id over the start options, or
+    /// fetches it when it is not on disk; a start naming a 16 GB entry is
+    /// refused by name before anything is fetched. On a 16 GB card the
+    /// default id is still the 16 GB entry's, and a start naming the 12 GB
+    /// entry serves it by its own id.
+    #[test]
+    fn a_start_on_a_12gb_card_serves_the_12gb_entry_under_rtx_12gb() {
+        use crate::config::profile::{testing::reading, Card, CardClass};
+        let catalog = catalog::testing::built_in();
+        let dir = PathBuf::from(DIR);
+        let gib = |gib: f64| (gib * (1u64 << 30) as f64) as u64;
+        for card in [Card::blackwell(gib(11.9)), Card::Read(reading(gib(11.8), "NVIDIA GeForce RTX 3060", 8, 6))] {
+            let options = start_config_reading(&[], card.clone());
+            assert_eq!((options.basis.sources().profile_name.as_str(), options.card_class()), ("rtx-12gb", Some(CardClass::Gb12)), "{card:?}");
+            let served = start_model(&catalog, &options.model, options.card()).unwrap();
+            assert_eq!(served, "qwen3.8-27b-12g", "{card:?}");
+            let mut settings = settings(&served, &dir);
+            settings.catalog = &catalog;
+            let ArtifactSource::Use(path) = artifact_source(&settings, |_| true, never_asked) else { panic!("on disk") };
+            assert_eq!(path, dir.join("qwen3_8_27b_trellis_ig28-v2.ninfer"));
+            let serving = served_start_options(options.clone(), &served, Some(&path), &catalog, options.card(), &|_| Some(ModelFamily::Qwen38_27b)).unwrap();
+            assert_eq!((serving.model.as_str(), serving.artifact.as_deref()), ("qwen3.8-27b-12g", Some(path.as_path())));
+            assert_eq!(serving.basis.sources().profile_name, "rtx-12gb");
+            let ArtifactSource::Download { entry, .. } = artifact_source(&settings, nothing_exists, |_, _| None) else { panic!("fetched") };
+            assert_eq!(entry.id, "qwen3.8-27b-12g");
+
+            let options = start_config_reading(&["--model-id", "qwen3.8-27b-16g"], card.clone());
+            let refusal = start_model(&catalog, &options.model, options.card()).unwrap_err();
+            assert_eq!(
+                (refusal.code(), refusal.to_string().ends_with("qwen3.8-27b-16g needs a 16 GB card or larger (its catalog entry's card_class), and this card is of the 12 GB class")),
+                ("model_above_card_class", true),
+                "{refusal}"
+            );
+        }
+        assert_eq!(start_model(&catalog, crate::config::DEFAULT_MODEL, Some(&on(CardClass::Gb16))), Ok("qwen3.8-27b-16g".to_owned()));
+        for card in [on(CardClass::Gb16), on(CardClass::Gb32), rtx_3090()] {
+            assert_eq!(start_model(&catalog, "qwen3.8-27b-12g", Some(&card)), Ok("qwen3.8-27b-12g".to_owned()), "{}: by its own id", card.name);
+        }
+    }
+
     /// ADR 0064 §2: an alias resolves only within one model family, by the
     /// artifact's header (ADR 0047). A start that has to fetch the entry
     /// answering to the default id knows the header only once the fetch has

@@ -8,18 +8,22 @@
 # at that revision. Files are listed small first. Adding one of the owner's
 # models is an entry here and a new binary.
 #
-# `card_class` is the smallest card class an entry loads on, in GB (16, 24,
-# 32 or 96; ADR 0064): a switch, a request, a start or a download naming an
-# entry above the card's class is refused before anything is torn down or
-# fetched. `generation` (optional; ADR 0079) is the oldest GPU generation an
-# entry loads on, `ampere`, `ada` or `blackwell`, refused the same way on an
-# older card; an entry stating none loads on every generation the build runs
-# on. An NVFP4 artifact, Flash-Next and the image model state `blackwell`,
-# and so does a trellis build until it is verified below it. `aliases`
+# `card_class` is the smallest card class an entry loads on, in GB (12, 16,
+# 24, 32 or 96; ADR 0064, ADR 0098): a switch, a request, a start or a
+# download naming an entry above the card's class is refused before anything
+# is torn down or fetched. `generation` (optional; ADR 0079) is the oldest GPU
+# generation an entry loads on, `ampere`, `ada` or `blackwell`, refused the
+# same way on an older card; an entry stating none loads on every generation
+# the build runs on. An NVFP4 artifact, Flash-Next and the image model state
+# `blackwell`, and so does a trellis build of another layout than the 16 GB
+# 27B's until it is verified below it. `aliases`
 # (optional) lists the ids an entry also answers to: its family's default id,
 # or another entry's served id of its family, served by it on a card that
 # cannot load that id's own entry — how the 16 GB 27B answers to
-# `qwen3.8-27b` on a 16 GB card, and on an RTX 3090. `family` (optional) is
+# `qwen3.8-27b` on a 16 GB card, and on an RTX 3090. Entries of different
+# classes may answer to one id, and where several fit the card the one of the
+# largest class answers (ADR 0098): the 12 GB 27B answers to `qwen3.8-27b`
+# on a 12 GB card only. `family` (optional) is
 # the model family an entry is of, by the family's own id (ADR 0074): stated
 # where an alias involves an entry and neither its id nor its aliases is a
 # family's own id.
@@ -160,6 +164,28 @@ models:
     files:
       - { name: qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer.conversion.json, bytes: 308144, sha256: "c3116f23756f7c759d84616cf78486618d424ecc5001bfd823c3ddf08cbb3d2d" }
       - { name: qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer, bytes: 13379877124, sha256: "3a039cb76d2291e3c68f8df5f7b37ac3e83981eb8090625f8a730a670bab63df" }
+
+  # The 27B for the 12 GB card class (spec #630, GitHub #638): the trellis
+  # body and head of a local exllamav3 conversion of the 27B's BF16 at
+  # ignis's own recipe `ig28a`, 2.79 bits per weight under a ceiling of
+  # 9.2 GB of text-scope weights, every other object the 32 GB artifact's, as
+  # the 16 GB 27B's are (weights id `trellis-ig28`, admitted 2026-11-16). It
+  # answers to the 27B's default id on a 12 GB card; on a larger one the
+  # 16 GB entry, of the larger class, does, and this one loads by its own id
+  # (ADR 0098). It states no generation, as the 16 GB 27B: its layout is that
+  # build's, at the K classes and formats that build binds; its quality on the
+  # RTX 30 and 40 routes is not measured yet (ADR 0098). Pinned to the
+  # upload's hub commit.
+  - id: qwen3.8-27b-12g
+    repo: gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis
+    revision: "15333a0829f055e7ee25d6d5ef84fd8d521518c6"
+    artifact: qwen3_8_27b_trellis_ig28-v2.ninfer
+    card_class: 12
+    aliases: [qwen3.8-27b]
+    license: { id: apache-2.0, url: "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis/blob/15333a0829f055e7ee25d6d5ef84fd8d521518c6/LICENSE" }
+    files:
+      - { name: qwen3_8_27b_trellis_ig28-v2.ninfer.conversion.json, bytes: 309831, sha256: "b19eb010025276cfb59f93db40e41d52db30e104fa89867218ebd6b789ea4ac9" }
+      - { name: qwen3_8_27b_trellis_ig28-v2.ninfer, bytes: 12754663684, sha256: "fab06bea49ce114da99ca69588f00b10fb5081c564f9ce60ecbef8b3dbf6d6a5" }
 
   # The speech models (ADR 0067, spec speech/01 §6, GitHub #351): the
   # Qwen3-ASR decoder and its audio encoder as GGUFs, converted by the owner

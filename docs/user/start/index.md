@@ -19,14 +19,16 @@ that built it. How that works is in
 
 ## What it serves
 
-Twelve entries are built into the server's [catalog](../guides/models.md#the-catalog):
-the eight text and image models below, three speech models and a diarizer. It
-loads one of the eight at a time and switches between them without a restart.
+Thirteen entries are built into the server's [catalog](../guides/models.md#the-catalog)
+(twelve in 0.10.0): the nine text and image models below, three speech models
+and a diarizer. It loads one of the nine at a time and switches between them
+without a restart.
 
 | Model | Id | What it is | Size on disk |
 |---|---|---|---|
 | Qwen3.8-27B | `qwen3.8-27b` (the default) | A dense text model, NVFP4, with a DFlash2 draft module for speculative decoding (from 0.11.0 its own MTP head too, opt-in) and an optional vision tower for image input. | 18.1 GiB |
 | Qwen3.8-27B for 16 GB cards | `qwen3.8-27b-16g` | The same 27B with a 3-bit trellis body, for the 16 GB class; it answers to `qwen3.8-27b` on a 16 GB card. | 12.5 GiB |
+| Qwen3.8-27B for 12 GB cards | `qwen3.8-27b-12g` | From 0.11.0. The same 27B with a trellis body of about 2.8 bits per weight, for the 12 GB class; it answers to `qwen3.8-27b` on a 12 GB card. | 11.9 GiB |
 | Qwen3.8-27B, uncensored | `qwen3.8-27b-abliterated` | The same weights with an abliteration applied. It does not refuse, so [read its page](../guides/uncensored.md) before exposing it. | 18.1 GiB |
 | Qwen3.8-27B, uncensored, for 16 GB cards | `qwen3.8-27b-abliterated-16g` | The 16 GB artifact with the same abliteration; it answers to `qwen3.8-27b-abliterated` on a 16 GB card. | 12.5 GiB |
 | Swift 1.5 | `swift-1.5-27b` | UkisAI's post-training of the 27B, a [fine-tune](../guides/fine-tunes.md). Its license does not cover commercial use by an organization whose gross revenue was US$1,000,000 or more in its last fiscal year: [read its page](../guides/fine-tunes.md#its-license). | 18.1 GiB |
@@ -60,7 +62,9 @@ You can add models of your own with an
     per card: the speeds the guide quotes for these cards will come from them.
   - *The 12 GB class, from 0.11.0.* A card below 14 GiB of total memory
     (RTX 5070, the 12 GB RTX 4070 family, RTX 3060 12 GB, RTX 3080 Ti) is a
-    card class of its own, on its own profile, `rtx-12gb`: the 27B on one
+    card class of its own, with its own profile, `rtx-12gb`, and its own
+    entry, `qwen3.8-27b-12g`, the 27B at about 2.8 bits per weight, which
+    answers to `qwen3.8-27b` there: a start with no flag serves it, on one
     lane, drafting with its MTP head, at up to 131,072 tokens of context,
     stepping down 16,384 at a time to what the card's free memory holds.
     The RTX 5090 held to a 12 GiB VRAM budget measured 131,072 (no 12 GB card
@@ -69,19 +73,21 @@ You can add models of your own with an
     about 0.5 GB and 32,768 beside about 1 GB; an RTX 30 or 40 card, whose
     prefill routes hold 89 MB more, keeps a step less in some of those cases
     ([on a real 12 GB card](../configuration/vram-and-kv-pool.md#on-a-real-12-gb-card),
-    [the profile](../concepts/profiles.md#rtx-12gb)). That artifact, the 27B
-    at about 2.8 bits per weight, is not published yet; until it is, every
-    built-in model is above the class, and the server refuses each one there
-    before it unloads or fetches anything. A card of 10 or 11 GB is read as
-    the class and refused by its VRAM plan, which names the bytes it misses.
-    The class has no column in
-    [Where each model loads](../reference/models.md#where-each-model-loads)
-    until its artifact is published. In 0.10.0 a 12 GB card is read as the
-    16 GB class, whose entries do not fit it.
+    [the profile](../concepts/profiles.md#rtx-12gb)). Against the 16 GB entry
+    it gives up a little quality: a KLD against BF16 of 0.0431 against 0.0418,
+    on the RTX 5090 at the class's shape. On an RTX 30 or 40 card it runs the
+    prefill routes the 16 GB entries run there, and its quality on them has
+    not been measured yet. The uncensored variant and Swift 1.5 have no build
+    of the class: on a 12 GB card the server refuses them and every 16 GB
+    entry, by name, before it unloads or fetches anything. A card of 10 or
+    11 GB is read as the class and refused by its VRAM plan, which names the
+    bytes it misses. In 0.10.0 a 12 GB card is read as the 16 GB class, whose
+    entries do not fit it.
   - *Blackwell only.* The NVFP4 builds (the 27B, its uncensored variant,
     Swift 1.5), Flash-Next and the image model, which also need a card of
     32 GB or more, by their card class. On an RTX 30 or RTX 40 card the server
-    refuses them, and the NVFP4 builds' ids are served by their 16 GB entries.
+    refuses them, and the NVFP4 builds' ids are served by their 16 GB entries
+    (on a 12 GB card, from 0.11.0, the 27B's by its 12 GB entry).
   - *The prefill on an RTX 30 or RTX 40 card.* Unset, the 27B reads a prompt
     through the **dense prefill** (each trellis matrix decoded once per chunk
     and multiplied on the integer MMA), the **integer band** of the prompt
@@ -92,7 +98,7 @@ You can add models of your own with an
     ([Context and speculation](../configuration/context-and-speculation.md)).
   - *MTP on an RTX 30 or RTX 40 card.* From 0.11.0 the 27B's own MTP head
     (`--spec-backend mtp`) drafts on those cards as on Blackwell, on the 16 GB
-    entries: its matrices multiply on ignis's own route, in the forms those
+    entries and on the 12 GB one, whose default it is: its matrices multiply on ignis's own route, in the forms those
     cards run at full rate
     ([MTP, for the 27B](../concepts/speculative-decoding.md#mtp-for-the-27b)),
     and the release's [sm_86 gate](../contributing/releases.md#the-sm_86-gate)
@@ -103,7 +109,7 @@ You can add models of your own with an
   generation it loads on, and the server refuses one above the card before it
   unloads or fetches anything:
   [Where each model loads](../reference/models.md#where-each-model-loads) is
-  the table, every built-in model on every card above but the 12 GB class's.
+  the table, every built-in model on every card above.
   A release is built
   for compute capabilities 8.6 and 12.0 (`86;120a`). Other cards, including
   the DGX Spark, are not

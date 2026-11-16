@@ -31,7 +31,10 @@ In one paragraph, for "what is github.com/gpillon/ignis?":
 > 8.6, supported), and the same on an RTX 4090 or a 16 GB RTX 40 card (Ada,
 > 8.9, verified for correctness: the release's sm_86 gate passed on an Ada
 > Lovelace card,
-> [the finding](../../findings/2026-11-08-sm86-gate-on-the-release-range.md)). It
+> [the finding](../../findings/2026-11-08-sm86-gate-on-the-release-range.md));
+> from 0.11.0 the 27B's 12 GB build on a 12 GB card of any of the three (RTX
+> 5070, the 12 GB RTX 4070 family, RTX 3060 12 GB, RTX 3080 Ti), which no
+> 12 GB card has run yet. It
 > serves them over an OpenAI-compatible HTTP API, with a browser Playground
 > and Prometheus metrics in the same binary, on Windows and Linux on x86-64.
 > It is shaped around the load a coding agent makes: a main agent and a few
@@ -70,7 +73,8 @@ Ask before the install does anything large or visible:
 
 1. **Which model.** The default is `qwen3.8-27b`; on a 16 GB card, and on an
    RTX 30 or RTX 40 card, the server serves its 16 GB entry,
-   `qwen3.8-27b-16g`, under that id.
+   `qwen3.8-27b-16g`, under that id, and on a 12 GB card, from 0.11.0, its
+   12 GB entry, `qwen3.8-27b-12g`, the only built-in text or image model such a card loads.
    `qwen3.8-flash-next` needs the host RAM above.
    `qwen3.8-27b-abliterated` does not refuse anything:
    [its page](../guides/uncensored.md) comes first; on a 16 GB card its 16 GB
@@ -211,9 +215,11 @@ nvidia-smi --query-gpu=name,compute_cap,memory.total,memory.used,display_active,
 ```
 
 A 16 GB card reads a `memory.total` near 16,300 MiB, a 24 GB one near
-24,500 MiB. A card with 8 or
-12 GB passes the other checks, but the 16 GB model does not fit it: the test
-ends there, with that reason. `memory.used` and `display_active`, read before
+24,500 MiB. A card with 8 GB passes the other checks, but no model fits it:
+the test ends there, with that reason. A 12 GB card, from 0.11.0, is a class
+of its own with its own model, `qwen3.8-27b-12g`: this test, written for the
+16 GB model, does not cover it, and the readings asked of a 12 GB card are on
+[issue #639](https://github.com/gpillon/ignis/issues/639). `memory.used` and `display_active`, read before
 ignis starts, go into the report. The memory the desktop and other programs
 hold is what most decides whether the default fits: estimated from the
 5090's plans, the default keeps 262,144 tokens of context with about 0.3 GiB

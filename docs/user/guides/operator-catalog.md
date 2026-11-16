@@ -40,8 +40,10 @@ not a model family's default id (`qwen3.8-27b`, `qwen3.8-flash-next`,
 the entry's id or an alias says, no `family` where one is required (below), or
 an alias that is neither a model family's default id nor another entry's id
 (matched exactly), is the entry's own id, names another family than the
-entry's, names an entry whose family nothing states, or is already another
-entry's — a built-in one's included. A relative `--download-catalog` set in a config file is read
+entry's, names an entry whose family nothing states, or is already a built-in
+entry's or another entry's of the same `card_class` in your file (two of
+different classes may answer to one id, and where both fit the card the one
+of the larger class does, from 0.11.0; in 0.10.0 one entry at most). A relative `--download-catalog` set in a config file is read
 from that file's directory; from a flag or an env var, from the working
 directory. An entry with no `card_class` states no class: it is never refused
 by class, so a catalog written before card classes still starts, and only the
@@ -64,11 +66,12 @@ no card class), which is never switched to and is loaded beside the speech model
 `kind` is refused: a text or an image model's kind is read from its artifact.
 
 A built-in id cannot be re-pinned by a file: a mirror of the owner's models is
-an endpoint, a variant of them a new id. Your entry may answer to a built-in
-default id as an alias — your own 16 GB build answering to `qwen3.8-27b` —
-since the built-in entry keeps its id and pins and still serves it wherever it
-fits: the alias is consulted only on a card below its class, and the answer
-names your entry.
+an endpoint, a variant of them a new id. Your entry may list as an alias a
+built-in entry's id that no built-in entry already answers to — your own build
+of Flash-Next for a smaller class answering to `qwen3.8-flash-next` — since the
+built-in entry keeps its id and pins and still serves it wherever it fits:
+the alias is consulted only on a card below its class, and the answer names
+your entry.
 
 ## An entry's license
 
