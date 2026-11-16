@@ -434,6 +434,17 @@ def _recipe(s, name="sc30", **fields):
                         **({"files": pin_dir(s["src"]["quant"], s["published"])} | fields))
 
 
+def test_a_named_recipe_of_our_own_passes_the_check_before_the_gpu(tmp_path, monkeypatch, capsys):
+    s = _sources(tmp_path)
+    ex = Exllamav3(s).install(monkeypatch)
+    _recipe(s, "ig28a", weights_id="trellis-ig28a", tensors=OWN,
+            quantization_config=dict(convert.QUANT_CONFIG, bits=2.9024))
+    assert _run(s, "--recipe", "ig28a", "--check") == 0
+    said = capsys.readouterr().out
+    assert "recipe ig28a: 26 matrices" in said and "2.9024 bpw" in said and "CHECK PASS" in said
+    assert ex.calls == [] and not os.path.exists(os.path.dirname(s["out"]))
+
+
 def test_run_converts_at_a_named_recipes_k_and_bits_and_checks_the_quant_against_them(tmp_path, monkeypatch, capsys):
     s = _sources(tmp_path)
     ex = Exllamav3(s).install(monkeypatch)
