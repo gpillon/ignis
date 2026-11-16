@@ -3,16 +3,17 @@
 - Kind: research
 - Status: current
 - Observed: 2026-11-15
-- Last verified: 2026-11-16
+- Last verified: 2026-11-17
 - Scope: models / the 27B at 2.2 to 3.0 bits per weight in the trellis format, its public quants, the alternatives to it
   for a 12 GB card, and the public agent-task evidence
 - Topic: artifacts-and-gates
 - Related: [#630](https://github.com/gpillon/ignis/issues/630), [#632](https://github.com/gpillon/ignis/issues/632),
   [#633](https://github.com/gpillon/ignis/issues/633), [#634](https://github.com/gpillon/ignis/issues/634),
   [#635](https://github.com/gpillon/ignis/issues/635), [#636](https://github.com/gpillon/ignis/issues/636),
-  [#638](https://github.com/gpillon/ignis/issues/638), [the 16 GB quality gates](2026-10-24-27b-16gb-quality-gates.md)
+  [#638](https://github.com/gpillon/ignis/issues/638), [the 16 GB quality gates](2026-10-24-27b-16gb-quality-gates.md),
+  [ADR 0098](../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md)
 - Superseded by: none
-- Summary: No smaller Qwen3.8 exists. Public agent tasks: the 27B's long ones give way between 9.2 and 8.0 GB. On ignis's instrument the 2.5 costs 1.66x the 3.0's KLD; the admitted 9.2 GB recipe (exllamav3's optimizer) reads 1.03x.
+- Summary: No smaller Qwen3.8 exists, and the 27B's long agent tasks give way between 9.2 and 8.0 GB; on the RTX 5090 (KLD against BF16, set A, each pair at one shape) its 9.2 GB recipe ig28 reads 1.03x the 16 GB artifact, a 2.5-bit quant 1.66x.
 
 ## Question
 
@@ -57,8 +58,8 @@ agent tasks and 0.2 on the others; a value printed on a chart is marked `printed
 | S8 | fine-tunes of the 27B with low-bit builds | `JRamirez-UAB/Qwopus3.8-27B-Coder-Flash-EXL3-2.25bpw-24GB`, `jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2` |
 | S9 | the same model in a second format, learned scalar, with its own card and per-tensor allocations | `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF` |
 | S10 | the Qwen organisation's repositories and cards (27B, Flash-Next, predecessors) | `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.8-Flash-Next`, `Qwen/Qwen3.6-35B-A3B`, `Qwen/Qwen3.5-9B` |
-| S11 | an independent blog run of the 27B in the second format against BF16 on Terminal-Bench 2.1 | `quesma.com/blog/qwen38-27b-quantizations-benchmarked/` (2026-08-26) |
-| S12 | a sweep whose score includes tool-calling suites | `byteshape.com/blogs/Qwen3.8-27B/` (2026-09-14, updated 09-18) |
+| S11 | an independent blog run of the 27B in the second format against BF16 on Terminal-Bench 2.1 | a software company's engineering blog, 2026-08-26 (URL in `C-task-level-evidence.md` §2) |
+| S12 | a sweep whose score includes tool-calling suites | the blog of a publisher of learned-allocation quants, 2026-09-14, updated 09-18 (URL in `C-task-level-evidence.md` §4) |
 | S13 | the model's own MTP head, quantized | `HermiHg/Qwen3.8-27B-Optimized-MTP-Heads-exl3` |
 
 The other cards and papers read are named where they are used and in the reports.
@@ -260,9 +261,7 @@ at the 16 GB artifact's serving shape: 1,024-token chunk, hq-e8-2b, exception we
   read about 0.049, at the limit of 0.0486; the allocation optimizer's own model predicts 1.17 times the 16 GB
   artifact's KLD for candidate A, about 0.047. Both are interpolations and a prediction, not readings of a recipe at
   9.2 GB. Neither of the spec's two cases (the 2.5 close to the 3.0, or 9.2 GB already low) is met, so the candidates
-  are built at 9.2 GB (9,200,000,000 bytes of text scope as the converter counts it) pending the owner's reading of
-  these numbers; the ceiling decision is the owner's, and on 2026-11-16 the owner kept it at 9.2 GB (the owner's
-  decisions, below).
+  are built at 9.2 GB (9,200,000,000 bytes of text scope as the converter counts it).
 - **Not measured here:** agent tasks, tool-call validity and the drafter's acceptance on the 2.5; the loop rates rest
   on 32 requests each.
 
@@ -367,8 +366,7 @@ artifact's) with their means:
 512-token chunk, hq-e8-2b, exception weights bf16, loop guard off, vision on host); the counterpart ran at the same
 shape. Records: [`.scratch/630/635/`](../../.scratch/630/635/) (`kld/compare-635.txt`, `decode-compare.txt`,
 `loops-compare.txt`, `plan-table.txt`, `chunk-table.txt`, `real-card-context.txt`, `replay/`, `served/`) and
-`.scratch/630/orchestra/decisions.md`. The owner admitted candidate A on 2026-11-16, as `trellis-ig28` (the owner's
-decisions, below).
+`.scratch/630/orchestra/decisions.md`.
 
 **The two recipes.**
 
@@ -385,9 +383,13 @@ decisions, below).
   artifact's revision `86b95530`: 2,602 s, 19.63 GiB VRAM allocated, 42.1 GiB host working set, `--no-checkpoints`.
 - **B, `ig28b`** (#634): the GGUF allocation translated by the rule of the section above; the same conversion
   (2,543 s). Text scope 9,188,909,056 bytes, 2.7907 bits.
-- Packed with the DFlash2 module and the MTP head: A 12,754,663,684 bytes, B 12,744,177,924, both VERIFY PASS. The
-  artifact admitted is A's repack, `trellis-ig28` (a complete conversion, reconstruction errors against BF16
-  measured, VERIFY PASS), which reads the same 0.04308: the same bytes.
+- Packed with the DFlash2 module and the MTP head: A 12,754,663,684 bytes, B 12,744,177,924, both VERIFY PASS. A's
+  repack as `trellis-ig28` (a complete conversion, reconstruction errors against BF16 measured, VERIFY PASS) reads
+  the same 0.04308: the same bytes. It packs to the same content hash twice from the same quant and recipe: a second
+  complete conversion, under the public labels `Qwen/Qwen3.8-27B` and `exl3-ig28-local`, gave the same file,
+  `qwen3_8_27b_trellis_ig28-v2.ninfer`, sha256 `fab06bea49ce114da99ca69588f00b10fb5081c564f9ce60ecbef8b3dbf6d6a5`,
+  the bytes `gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis` serves at revision `15333a0829f055e7ee25d6d5ef84fd8d521518c6`
+  beside that conversion's record (309,831 bytes).
 
 **Observed, KLD against BF16, set A** (16 windows x 4,096; `span_logits` at chunk 512; window-bootstrap 95% CI, 20,000
 resamples; BF16 ppl 2.690):
@@ -397,10 +399,14 @@ resamples; BF16 ppl 2.690):
 | 16 GB artifact | 9.82 GB | 0.04177 | [0.0358, 0.0477] | 1 | 93.30% | 2.742 | 0.0400 | 0.0520 | 0.0367 |
 | A, `ig28a` | 9.20 GB | 0.04308 | [0.0368, 0.0496] | 1.032 [0.993, 1.070], lower in 3/16 windows | 93.35% | 2.728 | 0.0418 | 0.0534 | 0.0375 |
 | B, `ig28b` | 9.19 GB | 0.05084 | [0.0430, 0.0589] | 1.217 [1.179, 1.256], lower in 0/16 | 92.69% | 2.760 | 0.0473 | 0.0642 | 0.0455 |
+| `trellis-ig28` on the RTX 30 and 40 routes (2026-11-17) | 9.20 GB | 0.04353 | [0.0374, 0.0495] | 1.010 [0.974, 1.035] to A's row, lower in 2/16 | 93.23% | 2.734 | 0.0429 | 0.0555 | 0.0362 |
 
 The limit a re-quantization registers, 1.2 times the counterpart's reading in the same session, is 0.05012: A is under
-it, B above. (The 16 GB artifact reads 0.04177 here at chunk 512 and 0.04049 at its own 1,024 in the slope above: the
-readings of one session at one shape are compared with each other.)
+it, B above. The last row is `trellis-ig28` on the RTX 5090 running the prefill routes an RTX 30 or 40 card runs unset
+(`IGNIS_MODEL_PREFILL_LINEAR=int8`, `IGNIS_MODEL_PREFILL_ATTENTION=int8`), as #513 read Swift 1.5's build (1.0148):
+its ratio is to A's row of 2026-11-16, under the 1.05 a route's numerics registers (ADR 0082), top-1 0.12 points
+under A's (`kld/compare-ig28-8x.txt`). (The 16 GB artifact reads 0.04177 here at chunk 512 and 0.04049 at its own
+1,024 in the slope above: the readings of one session at one shape are compared with each other.)
 
 - **Observed, the estimate against the read.** The spec's estimate was about 0.056 and the slope's interpolation about
   0.049; the optimizer predicted 1.17 times the 16 GB artifact for A (about 0.047). A reads **0.0431**, 1.03 times.
@@ -436,9 +442,9 @@ refuses one lane at 512 for a trellis body): **4.072 tokens a round** against th
 
 **Not run, and why.** The regression set (the contributed entailment cases, `decide_entailment_gpu`): its test file pins
 the NVFP4 artifact by path. B's decode on/off, DFlash2 and loop legs: the KLD put B over the limit at equal bytes (1.22
-times the counterpart against A's 1.03), so no leg could change the choice; about 1 h 15 min of GPU on request. B's
-12 GiB load and canary did run (allocated 12,884,646,144, pool 215,232 tokens, nothing adapted). The 16 GB
-counterpart's decode cells and any agent-task check were not run.
+times the counterpart against A's 1.03), so no leg could change the choice. B's 12 GiB load and canary did run
+(allocated 12,884,646,144, pool 215,232 tokens, nothing adapted). The 16 GB counterpart's decode cells and any
+agent-task check were not run.
 
 **The 12 GiB plans** (`plan-table.txt`): A allocated 12,884,478,208 bytes, KV pool 214,144 tokens (3,346 pages),
 context 131,072 with nothing adapted, weights 9,651,141,632; the 16 GB artifact 12,884,883,712 bytes and a pool of
@@ -459,8 +465,7 @@ per sample, three samples a cell, median; two launches a chunk, the 512 row's se
 - 512 buys 4,608 tokens of pool over 1,024 (72 pages), not the spec's estimated 17,000, for 7% of the first token (7% at
   8,192; 1,350 ms or 6.7% at 65,536). In 12 GiB and in 12 GiB less 1 GiB the context is the same at both chunks (131,072
   and 98,304; at 11 GiB 1,024 leaves 1,561 pages against 98,304's 1,539). The chunk does not move decode.
-- Inference: the 7% is below the roughly 10% the owner asks before trading pool for prefill speed, so 512 stays unless
-  the owner says otherwise; the owner kept it on 2026-11-16.
+- Inference: the 7% is below the roughly 10% the owner asks before trading pool for prefill speed.
 
 **Inference, the context on a real card** (arithmetic on the plan's pinned lines, **not a measurement**: no 12 GB card
 has run the load, and these are the RTX 5090's lines with its CUDA context and trellis workspace). A card's derived
@@ -477,26 +482,9 @@ one 32,768-token step is 512 pages, 321 MB. With a card total of 11.9 GiB:
 | desktop, about 1.3 GB | 10.69 | 10.19 | 245 | refused | refused |
 
 131,072 needs a budget of 11.245 GiB, 98,304 10.945 GiB and 65,536 10.646 GiB. The spec's "about 100,000 tokens with a
-desktop of about 1 GB" does not hold on these lines: 1 GB of desktop leaves 32,768. The levers, each the owner's to
-decide: a lower byte ceiling (one step is about 0.1 bit; the two optimizer points
-suggest about +17% KLD a step, an estimate), the headroom from 512M to 256M (about 0.83 of a 32,768 step), a ladder
-step of 16,384. The owner took the last on 2026-11-16, the table's last column, and kept the ceiling and the
-headroom.
-
-### The owner's decisions (2026-11-16)
-
-On the numbers above the owner decided, on 2026-11-16 (`.scratch/630/orchestra/decisions.md`):
-
-- **Candidate A is admitted**, as `trellis-ig28`: its repack, `qwen3_8_27b_trellis_ig28-v2.ninfer` (12,754,663,684
-  bytes, sha256 `fab06bea49ce114da99ca69588f00b10fb5081c564f9ce60ecbef8b3dbf6d6a5`), packs to the same content hash
-  twice from the same quant and recipe (a second complete conversion, under the public labels `Qwen/Qwen3.8-27B` and
-  `exl3-ig28-local`, gave the same file), and is published at `gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis`, revision
-  `15333a0829f055e7ee25d6d5ef84fd8d521518c6`, with its conversion record (309,831 bytes) and its licence, Apache 2.0.
-  The built-in catalog's `qwen3.8-27b-12g` pins that revision and answers to `qwen3.8-27b` on a 12 GB card (#638).
-- **The 9.2 GB ceiling stands.**
-- **The 512-token chunk stays.**
-- **`rtx-12gb` adapts its context 16,384 tokens at a time**, where the spec had 32,768 (#637): the last column of the
-  real-card table above. The 512M headroom stays.
+desktop of about 1 GB" does not hold on these lines: 1 GB of desktop leaves 32,768. The levers: a lower byte ceiling
+(one step is about 0.1 bit; the two optimizer points suggest about +17% KLD a step, an estimate), the headroom from
+512M to 256M (about 0.83 of a 32,768 step), a ladder step of 16,384 (the table's last column).
 
 ## Finding
 
@@ -557,11 +545,10 @@ Inferred (`inference` in the sections above):
   files keep 90% (terminal) and 72% (repository) of BF16 in the one harness that has them, and the long tasks give way
   below about 8.3 GB. #632's slope on ignis's own instrument tests it and neither of the spec's two cases is met (the
   2.5 is not close to the 3.0, 1.66 times its KLD, and 9.2 GB is not already low: an interpolated 2.79 bits sits at
-  the limit), so the candidates are built at 9.2 GB, where the owner kept it on 2026-11-16. The candidates built there read 1.03 (A) and 1.22 (B) times the 16 GB artifact's
-  KLD: A holds the registered limit with the ceiling where it is; the owner did not lower it for the desktop's
-  context, and took a ladder step of 16,384 instead.
-- The gate's numbers at the class's shape are in the section above. On them the owner admitted candidate A as
-  `trellis-ig28`, kept the 512 chunk and the 9.2 GB ceiling, and stepped the ladder by 16,384 (2026-11-16).
+  the limit), so the candidates are built at 9.2 GB. The candidates built there read 1.03 (A) and 1.22 (B) times the
+  16 GB artifact's KLD: A holds the registered limit with the ceiling where it is.
+- The decisions taken on the gate's numbers (the artifact admitted, the ceiling, the chunk, the ladder's step) are
+  [ADR 0098](../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md)'s.
 - The gate's numbers (KLD, the drafter's acceptance, the loop rate) are blind to what the public evidence says matters
   most: the length of a task, the tokens spent, the timeouts, the validity of a tool call. The agent-facing checks the
   repository has (the replay of recorded turns, the canary prompts, the regression set) are the instrument for those,
@@ -605,20 +592,12 @@ Inferred (`inference` in the sections above):
   was not run (its test pins the NVFP4 artifact by path), B's drafter and loop legs were not run (its KLD decided), the
   16 GB counterpart's own decode cells were not measured, and the optimizer's +17% KLD a step comes from two optimizer
   points, an estimate.
-- Pages that could not be read: every Reddit thread (blocked), two paywalled newsletters, the methods article of the
+- Pages that could not be read: every thread of one discussion forum (blocked), two paywalled newsletters, the methods article of the
   quant publisher's 3.1 update, the Flash-Next technical report, a gated card. One page that printed tool-call validity
   per quant was not used: it names no primary source and contradicts itself on three figures.
 
 ## Follow-ups
 
-- #632: the slope on ignis's own instrument is in its section above; on the owner's reading of it the 9.2 GB ceiling
-  stands (2026-11-16).
-- #635 and #636: decided by the owner on 2026-11-16 (above): candidate A admitted as `trellis-ig28`, the chunk 512,
-  the ceiling 9.2 GB, the ladder step 16,384. B's remaining legs (about 1 h 15 min of GPU) and the 16 GB
-  counterpart's decode cells are available on request.
-- #638: the admitted artifact is public, and the built-in catalog's `qwen3.8-27b-12g` pins it.
-- #630's later tickets build the two recipes at integer K and the gate measures them; the agent-facing checks sit beside
-  it, as above.
-- A set of 30 to 50 agentic tasks, three attempts each, on the admitted artifact and the 16 GB artifact, would measure
-  what the public evidence cannot (tool-call validity, tokens a solved task).
-- A request to an owner of a real 12 GB card for three readings is the spec's own open issue.
+- A set of 30 to 50 agentic tasks, three attempts each, on `trellis-ig28` and the 16 GB artifact, would measure what
+  the public evidence cannot (tool-call validity, tokens a solved task).
+- Readings on a real 12 GB card: [#639](https://github.com/gpillon/ignis/issues/639).
