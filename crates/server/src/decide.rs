@@ -2451,6 +2451,37 @@ Thinking is refused rather than ignored: a decision's prompt ends exactly where 
         (status = 409, description = "The model that would serve the decision is the image model: the one loaded, with no `model` naming a text model to switch to, or the one `model` names (`model_kind_mismatch`).", body = crate::api::ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted; or a model switch is under way (`model_switching`, with `Retry-After`); or the model was unloaded while idle and loading it again failed (`model_load_failed`); or the server began to stop while the request waited for a switch or a load (`server_stopping`, with `Retry-After`).", body = crate::api::ApiError),
     ),
+    // Spec #656: the connector's `decide`, whose input is `state` and
+    // `questions` alone: no `model`, so a call never switches the server,
+    // and no thinking field. Its call sends them as the harness wrote them
+    // (`crate::connector::decide`).
+    extensions(("x-ignis-tool" = json!({
+        "name": "decide",
+        "description": "Use it to classify or judge content: typed questions about it (yes/no, a choice, a score, a number) answered by reading the model, not by generating. The 27B only: on Flash-Next the server answers model_unsupported.",
+        "read_only": false,
+        "destructive": false,
+        "input": {
+            "type": "object",
+            "properties": {
+                "state": { "description": "The content to judge: text, or JSON, an object's keys read in the order written." },
+                "questions": {
+                    "type": "object",
+                    "description": "The questions, keyed by ids you choose and asked in the order written; each answer comes back under its id.",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "type": { "type": "string", "enum": ["noul", "choice", "score", "number", "scalar", "point", "box", "locate"], "description": "noul: yes or no, answered with the probability of yes; choice: one option; score: a level." },
+                            "instructions": { "description": "What to decide." },
+                            "criteria": { "description": "A choice's options as {\"name\": \"meaning\"}, in order; a score's levels as a list, low to high; a noul's {\"true\": …, \"false\": …}." },
+                        },
+                        "required": ["type", "instructions"],
+                    },
+                },
+            },
+            "required": ["state", "questions"],
+            "additionalProperties": false,
+        },
+    }))),
 )]
 pub async fn decide(
     axum::extract::State(server): axum::extract::State<std::sync::Arc<crate::Server>>,

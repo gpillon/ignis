@@ -148,6 +148,7 @@ fn the_tool_extension_sits_on_exactly_the_tools_routes() {
         "get /v1/config read_config",
         "get /v1/config/fields describe_config",
         "get /v1/models/catalog read_catalog",
+        "post /v1/decide decide",
         "post /v1/images/generations generate_image",
     ]
     .into_iter()
