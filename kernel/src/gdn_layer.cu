@@ -110,10 +110,11 @@ void output_and_mlp(ignis_model &model, const GdnLayerWeights &w, const ninfer::
   // #85 behavior); under the engine default AllowA4 at every width, the
   // vendored dispatch's own decision per its token thresholds, GitHub
   // #85's acceptance. GitHub #651: under the load's route, the fused op at
-  // the W4A4 TMA widths (kernel/src/prefill_swiglu.h).
-  ignis::prefill_swiglu::linear_swiglu(model.prefill_swiglu, post, w.mlp_gate_up, fused,
-                                       ignis_linear_swiglu_policy_for(w.mlp_gate_up.qtype, mode, T), arena, stream);
-  ninfer::ops::linear_add(fused, w.mlp_down, residual, ignis_policy_for(w.mlp_down.qtype, mode), arena, stream);
+  // the W4A4 TMA widths (kernel/src/prefill_swiglu.h); GitHub #653: its
+  // NVFP4 epilogue where the down product runs on the W4A4 TMA route.
+  ignis::prefill_swiglu::mlp(model.prefill_swiglu, post, w.mlp_gate_up,
+                             ignis_linear_swiglu_policy_for(w.mlp_gate_up.qtype, mode, T), w.mlp_down,
+                             ignis_policy_for(w.mlp_down.qtype, mode), fused, residual, arena, stream);
 }
 
 // GitHub #339: the GDN input projection -- the conv input's q | k | v

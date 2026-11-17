@@ -124,12 +124,13 @@ void output_and_mlp(ignis_model &model, const GqaLayerWeights &weights, const ni
   // runnable route above its A16 cap -- the pre-#85 behavior. The scratch
   // was already reserved for AllowA4 at any T (P2-01, GitHub #83), so a
   // chunk's A4 route needs nothing new. GitHub #651: under the load's
-  // route, the fused op at the W4A4 TMA widths (kernel/src/prefill_swiglu.h).
-  ignis::prefill_swiglu::linear_swiglu(model.prefill_swiglu, post, weights.mlp_gate_up, fused,
-                                       ignis_linear_swiglu_policy_for(weights.mlp_gate_up.qtype, mode, tokens),
-                                       arena, stream);
-  ninfer::ops::linear_add(fused, weights.mlp_down, residual, ignis_policy_for(weights.mlp_down.qtype, mode), arena,
-                          stream);
+  // route, the fused op at the W4A4 TMA widths (kernel/src/prefill_swiglu.h);
+  // GitHub #653: its NVFP4 epilogue where the down product runs on the W4A4
+  // TMA route.
+  ignis::prefill_swiglu::mlp(model.prefill_swiglu, post, weights.mlp_gate_up,
+                             ignis_linear_swiglu_policy_for(weights.mlp_gate_up.qtype, mode, tokens),
+                             weights.mlp_down, ignis_policy_for(weights.mlp_down.qtype, mode), fused, residual, arena,
+                             stream);
 }
 
 int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,

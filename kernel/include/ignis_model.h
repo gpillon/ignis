@@ -329,20 +329,26 @@ enum ignis_mtp_head_linear {
   IGNIS_MTP_HEAD_LINEAR_OURS = 2,
 };
 
-/* GitHub #651 (spec #646): the route of the 27B prefill's MLP gate and up
- * product on its NVFP4 body, which no load option names: decided once per load
- * by the measurement switch IGNIS_PREFILL_SWIGLU (`split` or `fused`; unset is
- * `fused`) (kernel/src/prefill_swiglu.h). `ignis_model_prefill_swiglu` reports
- * it. */
+/* GitHub #651, #653 (spec #646): the route of the 27B prefill's MLP gate and
+ * up product on its NVFP4 body, and the epilogue it runs, which no load option
+ * names: decided once per load by the measurement switch IGNIS_PREFILL_SWIGLU
+ * (`split`, `fused` or `quant`; unset is `quant`) (kernel/src/prefill_swiglu.h).
+ * `ignis_model_prefill_swiglu` reports it. */
 enum ignis_prefill_swiglu {
   /* A load whose prefill runs no such product: the trellis body, Flash-Next. */
   IGNIS_PREFILL_SWIGLU_NONE = 0,
   /* The vendored dispatch: the product, then SiLU-mul, and at exactly 1,024
    * tokens the vendored fused kernel; what IGNIS_PREFILL_SWIGLU=split names. */
   IGNIS_PREFILL_SWIGLU_SPLIT = 1,
-  /* ignis's fused op, the split route's bytes, at every width the W4A4 TMA
-   * route takes from 1,024 tokens; the default. */
+  /* ignis's fused op with its BF16 epilogue, the split route's bytes, at every
+   * width the W4A4 TMA route takes from 1,024 tokens; what
+   * IGNIS_PREFILL_SWIGLU=fused names. */
   IGNIS_PREFILL_SWIGLU_FUSED = 2,
+  /* ignis's fused op with its NVFP4 epilogue, which writes the down product's
+   * quantized input in the layout that product reads, wherever the down
+   * product runs on the W4A4 TMA route, and its BF16 epilogue at every other
+   * width the op takes; the default (GitHub #653). */
+  IGNIS_PREFILL_SWIGLU_QUANT = 3,
 };
 
 /* GitHub #652 (spec #646): the layout the 27B's W4A4 prefill products read
@@ -752,8 +758,9 @@ uint32_t ignis_model_hq_decode_attention(const struct ignis_model *model);
  * load without the head. */
 uint32_t ignis_model_mtp_head_linear(const struct ignis_model *model);
 
-/* The route a loaded 27B's prefill runs its MLP gate and up product on (enum
- * ignis_prefill_swiglu; GitHub #651): what the load decided.
+/* The route a loaded 27B's prefill runs its MLP gate and up product on, and
+ * the epilogue it runs (enum ignis_prefill_swiglu; GitHub #651, #653): what
+ * the load decided.
  * IGNIS_PREFILL_SWIGLU_NONE for NULL, the trellis body and Flash-Next. */
 uint32_t ignis_model_prefill_swiglu(const struct ignis_model *model);
 

@@ -11,7 +11,8 @@
 //       shared memory before 16-byte stores.
 // Called and not copied: its shared storage (Nvfp4LinearSwiGluTmaSharedStorage), the schedule
 // (Nvfp4W4a4TmaSchedule), the TMA, mbarrier and raster helpers (ops/linear/nvfp4/
-// nvfp4_w4a4_tma.cuh), ldmatrix, mma_nvfp4_e4m3, load_vec, store_vec and silu.
+// nvfp4_w4a4_tma.cuh), ldmatrix, mma_nvfp4_e4m3, load_vec, store_vec, silu and
+// quantize_nvfp4_k16 (ops/linear/nvfp4/nvfp4_codec.cuh).
 //
 // Changed here (ours):
 //   - the epilogue rounds gate and up to BF16 before the product, as the split route's product
@@ -22,11 +23,23 @@
 //     its N slot in the tile differs.
 //   - two pipeline stages, not three: what the served measurement ran (the two were within the
 //     bench's noise).
+//   - GitHub #653: a second epilogue form, Store::Nvfp4, quantizes those BF16 values into the
+//     down product's NVFP4 input instead of writing them (each consumer thread one token's 64
+//     values, four 16-wide groups under quantize_nvfp4_k16 and the down weight's input divisor,
+//     as the down product's own quantizer runs it on the BF16 row), so the [17408, T] BF16 matrix
+//     is never written.
+//   - GitHub #653: a schedule with kKTileActivations (Nvfp4W4a4KTileSchedule, GitHub #652) reads
+//     its activations K-tile-major, as the vendored W4A4 TMA product's K-tile-major schedule does
+//     under its recorded patch (ops/linear/nvfp4/nvfp4_w4a4_tma.cuh): a K tile of a token tile in
+//     one box of 128-byte rows under the 128-byte swizzle, the scales of a pair of K tiles in one
+//     box, the weight scales in boxes of eight 128-byte rows. Its NVFP4 epilogue writes the same
+//     layout, the one the down product then reads (ops/linear/nvfp4/nvfp4_w4a4_plan.h).
 #pragma once
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma.cuh"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh"
 
@@ -37,15 +50,25 @@
 
 namespace ignis::prefill_swiglu {
 
-// The 256-token tile, the 128 weight rows (64 gate, 64 up) and the two stages.
-using GateUpSchedule = ninfer::ops::detail::Nvfp4W4a4TmaSchedule<256, 2, 1>;
+// The 256-token tile, the 128 weight rows (64 gate, 64 up) and the two stages, reading the
+// activations token-major; its twin reading them K-tile-major.
+using GateUpSchedule      = ninfer::ops::detail::Nvfp4W4a4TmaSchedule<256, 2, 1>;
+using GateUpKTileSchedule = ninfer::ops::detail::Nvfp4W4a4KTileSchedule<GateUpSchedule>;
+
+// What the epilogue writes: the BF16 [17408, T] SwiGLU output, or the down product's NVFP4 input
+// (codes and scales) in the layout the schedule reads its own activations in.
+enum class Store { Bf16, Nvfp4 };
 
 // NINFER_NVFP4_TMA_DESCRIPTOR_PARAM names the descriptor block unqualified.
 using ninfer::ops::detail::Nvfp4W4a4TmaDescriptors;
 
-template <class Geometry, class Schedule>
+// `output` is Store::Bf16's; `out_codes`, `out_scales` and `down_input_scale_divisor` are
+// Store::Nvfp4's.
+template <class Geometry, class Schedule, Store kStore>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void swiglu_tma_kernel(
-    NINFER_NVFP4_TMA_DESCRIPTOR_PARAM descriptors, float alpha, __nv_bfloat16* __restrict__ output) {
+    NINFER_NVFP4_TMA_DESCRIPTOR_PARAM descriptors, float alpha, __nv_bfloat16* __restrict__ output,
+    std::uint8_t* __restrict__ out_codes, std::uint8_t* __restrict__ out_scales,
+    float down_input_scale_divisor) {
     using namespace ninfer::ops;
     using namespace ninfer::ops::detail;
     static_assert(Geometry::kOutputRows == 34816);
@@ -69,8 +92,15 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     nvfp4_tma_raster_blocks(block_x, block_y);
     const int token_begin = block_y * Schedule::kBlockM;
     const int pair_begin  = block_x * kPairN;
+    // The call's tokens, which the K-tile-major layout's rows are counted in.
+    [[maybe_unused]] const int tokens = static_cast<int>(gridDim.y) * Schedule::kBlockM;
 
     if (threadIdx.x == 0) {
+        if constexpr (Schedule::kKTileActivations) {
+            // The 128-byte swizzle the consumers undo below repeats every 1,024 bytes of shared
+            // memory, so the stage buffers must start on such a boundary.
+            if ((smem_addr(shared.scratch.tensors.a_codes[0]) & 1023U) != 0U) { __trap(); }
+        }
 #pragma unroll
         for (int stage = 0; stage < Schedule::kStages; ++stage) {
             nvfp4_mbarrier_init(&shared.full[stage], 1);
@@ -112,9 +142,17 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                                                             : kTransactionBytes - kScaleBytes);
 
                 auto& tensors = shared.scratch.tensors;
-                nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptor_block->a_codes,
-                                  k_tile * Schedule::kCodeRowBytes, token_begin,
-                                  &shared.full[stage]);
+                if constexpr (Schedule::kKTileActivations) {
+                    // ignis (GitHub #653): K tile k_tile of the token tile is 128-byte row
+                    // (k_tile * tokens + token_begin) / 2 of the codes, and the scales of its
+                    // pair of K tiles row ((k_tile / 2) * tokens + token_begin) / 8 of theirs.
+                    nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptor_block->a_codes, 0,
+                                      (k_tile * tokens + token_begin) / 2, &shared.full[stage]);
+                } else {
+                    nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptor_block->a_codes,
+                                      k_tile * Schedule::kCodeRowBytes, token_begin,
+                                      &shared.full[stage]);
+                }
                 nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptor_block->b_codes,
                                   k_tile * Schedule::kCodeRowBytes, pair_begin,
                                   &shared.full[stage]);
@@ -122,9 +160,16 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                                   &descriptor_block->b_codes, k_tile * Schedule::kCodeRowBytes,
                                   pair_begin + kIntermediate, &shared.full[stage]);
                 if (load_scales) {
-                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1],
-                                      &descriptor_block->a_scales, (k_tile / 2) * 16, token_begin,
-                                      &shared.full[stage]);
+                    if constexpr (Schedule::kKTileActivations) {
+                        nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1],
+                                          &descriptor_block->a_scales, 0,
+                                          ((k_tile / 2) * tokens + token_begin) / 8,
+                                          &shared.full[stage]);
+                    } else {
+                        nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1],
+                                          &descriptor_block->a_scales, (k_tile / 2) * 16,
+                                          token_begin, &shared.full[stage]);
+                    }
                 }
 
                 const int gate_scale_row = ((pair_begin / 128) * Geometry::kScaleTilesPerRow +
@@ -134,10 +179,13 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                     (((pair_begin + kIntermediate) / 128) * Geometry::kScaleTilesPerRow +
                      k_tile * Schedule::kK64PerStage) *
                     32;
+                // ignis (GitHub #653): K-tile-major, the weight scales' box is eight 128-byte rows,
+                // the same 1,024 bytes as sixty-four of 16.
+                constexpr int kScaleRowsPerBoxRow = Schedule::kKTileActivations ? 8 : 1;
                 nvfp4_tma_load_2d(tensors.b_scales[stage][0], &descriptor_block->b_scales, 0,
-                                  gate_scale_row, &shared.full[stage]);
+                                  gate_scale_row / kScaleRowsPerBoxRow, &shared.full[stage]);
                 nvfp4_tma_load_2d(tensors.b_scales[stage][1], &descriptor_block->b_scales, 0,
-                                  up_scale_row, &shared.full[stage]);
+                                  up_scale_row / kScaleRowsPerBoxRow, &shared.full[stage]);
             }
         }
         return;
@@ -180,10 +228,18 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             for (int mma_m = 0; mma_m < Schedule::kMmaM; ++mma_m) {
                 const int row          = warp_m * Schedule::kWarpM + mma_m * 16 + a_row_offset;
                 const int logical_byte = local_k64 * 32 + a_column_byte;
-                const int physical_byte =
-                    ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
-                const auto* address =
-                    tensors.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
+                int a_offset           = 0;
+                if constexpr (Schedule::kKTileActivations) {
+                    // ignis (GitHub #653): two tokens to a 128-byte row, its eight 16-byte chunks
+                    // under the 128-byte swizzle.
+                    const int line  = row >> 1;
+                    const int chunk = ((row & 1) << 2) | (logical_byte >> 4);
+                    a_offset = line * 128 + ((chunk ^ (line & 7)) << 4) + (logical_byte & 15);
+                } else {
+                    a_offset = row * Schedule::kCodeRowBytes +
+                               ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
+                }
+                const auto* address = tensors.a_codes[stage] + a_offset;
                 ldmatrix_x4(a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
                             a_fragments[mma_m][3], smem_addr(address));
                 const int scale_row = warp_m * Schedule::kWarpM + mma_m * 16 + sfa_row;
@@ -269,17 +325,55 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
 
     asm volatile("bar.sync 1, %0;" : : "r"(Schedule::kConsumerThreads) : "memory");
-    constexpr int kVectorsPerRow = kPairN / 8;
-    constexpr int kOutputVectors = Schedule::kBlockM * kVectorsPerRow;
-    for (int task = consumer_thread; task < kOutputVectors; task += Schedule::kConsumerThreads) {
-        const int token_local = task / kVectorsPerRow;
-        const int row_vector  = task - token_local * kVectorsPerRow;
-        const int token       = token_begin + token_local;
-        const uint4 values =
-            load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
-        store_vec(output + static_cast<std::int64_t>(token) * kIntermediate + pair_begin +
-                      row_vector * 8,
-                  values);
+    if constexpr (kStore == Store::Bf16) {
+        constexpr int kVectorsPerRow = kPairN / 8;
+        constexpr int kOutputVectors = Schedule::kBlockM * kVectorsPerRow;
+        for (int task = consumer_thread; task < kOutputVectors; task += Schedule::kConsumerThreads) {
+            const int token_local = task / kVectorsPerRow;
+            const int row_vector  = task - token_local * kVectorsPerRow;
+            const int token       = token_begin + token_local;
+            const uint4 values =
+                load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
+            store_vec(output + static_cast<std::int64_t>(token) * kIntermediate + pair_begin +
+                          row_vector * 8,
+                      values);
+        }
+    } else {
+        // ignis (GitHub #653): one token per consumer thread; its 64 values are four 16-wide
+        // groups of the down product's input, quantized as that product's quantizer quantizes
+        // them, and stored where that quantizer stores them: K-tile-major, group g's 8 code bytes
+        // at K tile g / 8, byte (g % 8) * 8 of the token's 64, its scale at the pair of K tiles
+        // g / 16, byte g % 16 of the token's 16 (nvfp4_w4a4_quantize_k_tile_kernel); token-major,
+        // at [token][g * 8] and [token][g] (nvfp4_w4a4_quantize_kernel). This CTA's groups are
+        // g = pair_begin / 16 + 0..3, contiguous in either.
+        static_assert(Schedule::kConsumerThreads == Schedule::kBlockM, "one token per consumer thread");
+        constexpr int kCodeBytesPerRow = kIntermediate / 2;
+        constexpr int kGroupsPerRow    = kIntermediate / 16;
+        const int token                = token_begin + consumer_thread;
+        const __nv_bfloat16* row       = shared_output + consumer_thread * kOutputStride;
+        const Nvfp4QuantizedK16 q0     = quantize_nvfp4_k16(row, down_input_scale_divisor);
+        const Nvfp4QuantizedK16 q1     = quantize_nvfp4_k16(row + 16, down_input_scale_divisor);
+        const Nvfp4QuantizedK16 q2     = quantize_nvfp4_k16(row + 32, down_input_scale_divisor);
+        const Nvfp4QuantizedK16 q3     = quantize_nvfp4_k16(row + 48, down_input_scale_divisor);
+        std::uint8_t* codes            = nullptr;
+        std::uint8_t* scales           = nullptr;
+        if constexpr (Schedule::kKTileActivations) {
+            codes  = out_codes +
+                    (static_cast<std::int64_t>(pair_begin / 128) * tokens + token) * 64 +
+                    (pair_begin & 127) / 2;
+            scales = out_scales +
+                     (static_cast<std::int64_t>(pair_begin / 256) * tokens + token) * 16 +
+                     (pair_begin & 255) / 16;
+        } else {
+            codes  = out_codes + static_cast<std::int64_t>(token) * kCodeBytesPerRow + pair_begin / 2;
+            scales = out_scales + static_cast<std::int64_t>(token) * kGroupsPerRow + pair_begin / 16;
+        }
+        store_vec(codes, make_uint4(q0.codes_lo, q0.codes_hi, q1.codes_lo, q1.codes_hi));
+        store_vec(codes + 16, make_uint4(q2.codes_lo, q2.codes_hi, q3.codes_lo, q3.codes_hi));
+        store_vec(scales, static_cast<std::uint32_t>(q0.scale) |
+                              (static_cast<std::uint32_t>(q1.scale) << 8) |
+                              (static_cast<std::uint32_t>(q2.scale) << 16) |
+                              (static_cast<std::uint32_t>(q3.scale) << 24));
     }
 }
 

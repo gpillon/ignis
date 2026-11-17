@@ -213,10 +213,11 @@ both leaf-internal (ADR 0093).
   (`kernel/tests/test_hq_verify_exact.cu`), and as the route of every other card and call
   (`kernel/vendor/VENDOR.md`).
 
-### `kernel/src/prefill_swiglu.cuh` and `kernel/src/prefill_swiglu.cu` (spec #646, GitHub #651)
+### `kernel/src/prefill_swiglu.cuh` and `kernel/src/prefill_swiglu.cu` (spec #646, GitHub #651, #653)
 The 27B prefill's MLP gate and up product with SwiGLU in its epilogue
-(`ignis::prefill_swiglu::swiglu_tma_kernel`), and its launcher
-(`ignis::prefill_swiglu::gate_up_swiglu`), both leaf-internal.
+(`ignis::prefill_swiglu::swiglu_tma_kernel`), and its launchers
+(`ignis::prefill_swiglu::gate_up_swiglu`, `gate_up_swiglu_nvfp4` and the layers' `mlp`), all
+leaf-internal.
 - Upstream: the reference, `gpillon/ninfer`, commit `a00648cb828457986cf5b4b4f712b4cbcd7af0d1`
   (the commit `kernel/vendor/manifest.json` pins), Apache-2.0 (`kernel/vendor/LICENSE`):
   - `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh`:
@@ -230,9 +231,11 @@ The 27B prefill's MLP gate and up product with SwiGLU in its epilogue
 - Changed here: the epilogue rounds gate and up to BF16 before the product, as the split route
   (the product, then SiLU-mul) does, so the output is the split route's byte for byte where
   upstream's, one rounding fewer, differs; two pipeline stages; on Windows the descriptor block
-  from the load's device slots (`kernel/src/tma_descriptor_cache.h`). The file headers list the
-  parts. The vendored kernel stays in the subtree as it is (its launcher with the ADR 0031 patch
-  of GitHub #650), as the route under
+  from the load's device slots (`kernel/src/tma_descriptor_cache.h`); a second epilogue form that
+  quantizes the output into the down product's NVFP4 input instead of writing it, and the
+  activations read and that input written K-tile-major where the load names that layout (GitHub
+  #653). The file headers list the parts. The vendored kernel stays in the subtree as it is (its
+  launcher with the ADR 0031 patch of GitHub #650), as the route under
   `IGNIS_PREFILL_SWIGLU=split` at exactly 1,024 tokens (`kernel/vendor/VENDOR.md`); the op is
   held to the split route byte for byte (`kernel/tests/test_prefill_swiglu.cu`).
 
