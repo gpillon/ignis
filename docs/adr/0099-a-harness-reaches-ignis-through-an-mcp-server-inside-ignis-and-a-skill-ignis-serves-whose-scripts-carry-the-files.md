@@ -98,11 +98,14 @@ the same machine. With the scripts, the server touches no file and
   when the text model it returns to has vision on. An image left in the
   harness's history is refused `vision_disabled` without vision, and past
   `vision.max_tokens` with it, on every later turn. With vision off the tool
-  answers at once, without switching, and names the skill's script.
+  answers without switching, once the image calls before it have ended, and
+  names the skill's script.
 - The connector's image calls run one at a time, so several in one turn
-  cost one switch out and one back. The vision check reads the text model
-  the server switched away from, which it remembers while the image model is
-  loaded.
+  cost one switch out and one back. A call given up mid-switch keeps its
+  turn until the switch, which runs on, has ended. The vision check is made
+  once a call has its turn, so never by an enhancer a call before it visits,
+  and with the image model loaded it reads the text model the server
+  switched away from, which it remembers.
 - The image model never runs beside a text model
   ([ADR 0050](0050-ignis-serves-an-image-model.md)). The next chat turn's
   implicit switch brings the text model back: no tool switches back itself.

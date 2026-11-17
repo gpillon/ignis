@@ -21,7 +21,7 @@ use ignis_core::image::ImageSize;
 use ignis_server::config::ApiKey;
 use ignis_server::download::Catalog;
 use ignis_server::media::{MediaAcquirer, MediaPolicy};
-use ignis_server::model_switch::{CatalogModels, Switcher};
+use ignis_server::model_switch::{CatalogModels, Switcher, TextModelLeft};
 use ignis_server::Server;
 use serde_json::{json, Value};
 
@@ -284,7 +284,8 @@ async fn with_vision_off_generate_image_answers_at_once_naming_the_skill_and_swi
 /// away from, which the server remembers while the image model is loaded:
 /// with the image model loaded by the first call, a second call is judged
 /// by `mock-a`, which has vision, and makes its image with no further
-/// switch.
+/// switch. A server that remembers none takes the agent to see, so the
+/// memory is asserted itself.
 #[tokio::test]
 async fn a_second_call_is_judged_by_the_text_model_switched_away_from_and_switches_no_further() {
     let (loader, server) = image_server("remembered", &[IMAGE, "mock-a"], true);
@@ -293,6 +294,8 @@ async fn a_second_call_is_judged_by_the_text_model_switched_away_from_and_switch
         let result = generate(&app, json!({ "prompt": prompt, "size": "256x128" }), None).await;
         assert_eq!(result["content"][0]["type"], "image", "{prompt}: {result}");
         assert_eq!(server.active().model_id(), IMAGE);
+        let remembered = server.switcher.as_ref().unwrap().text_model_left();
+        assert_eq!(remembered, Some(TextModelLeft { id: "mock-a".to_owned(), vision: true }), "{prompt}");
     }
     assert_eq!(loader.loads(), [IMAGE]);
     assert_eq!(loader.encoded_prompts(), ["a fox", "a second fox"]);
@@ -393,6 +396,100 @@ async fn three_calls_in_one_turn_make_one_switch_and_the_ones_sent_mid_switch_wa
     assert_eq!(loader.loads(), [IMAGE]);
     assert_eq!(loader.encoded_prompts(), ["first", "second", "third"]);
     assert_eq!(server.image_calls.waiting(), 0);
+}
+
+/// `server` until no request uses the model (scheduling turns, bounded).
+async fn until_unused(server: &Server) {
+    for _ in 0..10_000 {
+        if server.usage.in_flight() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("{} requests still use the model", server.usage.in_flight());
+}
+
+/// Spec #656: a call its harness gives up while the switch it began runs (a
+/// timeout closing its request) keeps the turn until that switch ends. The
+/// switch runs on without it, so the call sent next waits for it, as it would
+/// for a call that had not been given up, rather than meet its `503
+/// model_switching`, which a client's own request meets meanwhile; it then
+/// finds the image model loaded. The call given up makes no image.
+#[tokio::test]
+async fn a_call_given_up_mid_switch_holds_the_next_one_until_the_switch_ends() {
+    let (loader, server) = image_server("given-up", &[IMAGE, "mock-a"], true);
+    let app = server.app();
+    let release = loader.hold_next_load();
+    let given_up = {
+        let (app, arguments) = (app.clone(), json!({ "prompt": "given up", "size": "256x128" }));
+        tokio::spawn(async move { generate(&app, arguments, None).await })
+    };
+    until_status(&app, "switching").await;
+    // The harness closes the request: the call is given up, and its request
+    // of the image route, held on the switch, is dropped with it.
+    given_up.abort();
+    until_unused(&server).await;
+
+    let next = {
+        let (app, arguments) = (app.clone(), json!({ "prompt": "next", "size": "256x128" }));
+        tokio::spawn(async move { generate(&app, arguments, None).await })
+    };
+    until_waiting(&server, 1).await;
+    let (status, refused) = send(&app, Method::POST, "/v1/images/generations", Some(json!({ "model": IMAGE, "prompt": "a client's own" }))).await;
+    assert_eq!((status, refused["error"]["code"].clone()), (StatusCode::SERVICE_UNAVAILABLE, json!("model_switching")));
+
+    release.send(()).expect("the held load is waiting");
+    let next = next.await.unwrap();
+    assert_ne!(next["isError"], json!(true), "{next}");
+    assert_eq!(next["content"][0]["type"], "image", "{next}");
+    assert_eq!(loader.loads(), [IMAGE]);
+    assert_eq!(loader.encoded_prompts(), ["next"]);
+    assert_eq!(server.image_calls.waiting(), 0);
+}
+
+/// `server` until `id` serves, its status aside (scheduling turns, bounded).
+async fn until_active(server: &Server, id: &str) {
+    for _ in 0..10_000 {
+        if server.active().model_id() == id {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("{id} never served: {} does", server.active().model_id());
+}
+
+/// Spec #656: a call is judged by the agent's text model once it has its
+/// turn. With `image.prompt_enhancement` on, the call ahead visits the
+/// enhancer on its way to the image model, and the enhancer serves
+/// meanwhile: a call sent then is judged by `mock-a`, the agent's model, which
+/// has vision, not by the enhancer, `mock-b`, which has none, and makes its
+/// image.
+#[tokio::test]
+async fn a_call_sent_while_the_enhancer_serves_is_judged_by_the_agents_model() {
+    let (loader, server) = image_server("enhancer-serves", &[IMAGE, "mock-a", "mock-b"], true);
+    server.update_live(|live| {
+        live.image.prompt_enhancement = true;
+        live.image.prompt_enhancer = "mock-b".to_owned();
+        live.image.prompt_enhancer_max_tokens = 16;
+    });
+    let app = server.app();
+    let to_the_enhancer = loader.hold_next_load();
+    let on_to_the_image_model = loader.hold_next_load();
+    let call = |prompt: &str| {
+        let (app, arguments) = (app.clone(), json!({ "prompt": prompt, "size": "256x128" }));
+        tokio::spawn(async move { generate(&app, arguments, None).await })
+    };
+    let first = call("first");
+    to_the_enhancer.send(()).expect("the load of the enhancer is waiting");
+    until_active(&server, "mock-b").await;
+    let second = call("second");
+    until_waiting(&server, 1).await;
+
+    on_to_the_image_model.send(()).expect("the load of the image model is waiting");
+    for (result, prompt) in [(first.await.unwrap(), "first"), (second.await.unwrap(), "second")] {
+        assert_eq!(result["content"][0]["type"], "image", "{prompt}: {result}");
+    }
+    assert_eq!(loader.loads(), ["mock-b", IMAGE, "mock-b", IMAGE]);
 }
 
 /// `generate_image`'s call with `arguments` and the progress token `token`,

@@ -3,14 +3,16 @@
 //! /v1/images/generations` (`crate::images::routes::create_image`), and its
 //! call goes, in order:
 //!
-//! 1. [`agent_sees`]: whether the agent's text model has vision, the one
-//!    loaded or, with the image model loaded, the one the server switched
-//!    away from. Without, the call answers at once naming the skill's
-//!    script ([`unseen`]), and nothing switches for an image nobody sees.
-//! 2. [`ImageCalls`]: the turn. The connector's image calls run one at a
+//! 1. [`ImageCalls`]: the turn. The connector's image calls run one at a
 //!    time, so a call sent while another one's switch runs waits for it to
 //!    end rather than meet its `503 model_switching`, and finds the image
 //!    model loaded: several calls in one turn cost one switch.
+//! 2. [`agent_sees`]: whether the agent's text model has vision, the one
+//!    loaded or, with the image model loaded, the one the server switched
+//!    away from. Judged once the call has its turn, so never by the enhancer
+//!    a call before it visits (`image.prompt_enhancement`). Without, the call
+//!    answers naming the skill's script ([`unseen`]), and nothing switches
+//!    for an image nobody sees.
 //! 3. [`image_model`]: the catalog's image model on disk, read through
 //!    `GET /v1/models/catalog` with the caller's key. With none, the tool's
 //!    error names the download that fetches it.
@@ -27,7 +29,8 @@
 //! Each refusal on the way is the route's own answer, through
 //! [`super::call::answer`]; a full image queue among them. A call its
 //! harness gives up, by closing the request as its timeout does, leaves the
-//! line, or drops its route's answer, which cancels its job.
+//! line, or drops its route's answer, which cancels its job, and keeps the
+//! turn until the switch it began, which runs on, has ended.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -65,8 +68,8 @@ pub(crate) const PREVIEW_EDGE: u32 = 512;
 pub(crate) const INSTRUCTIONS: &str = "generate_image costs about 20 s of model switching, out and back on your next turn; other clients get 503 meanwhile, and you see the image only with vision on.";
 
 /// The connector's `generate_image` calls (spec #656), one at a time: a
-/// call holds the turn from its read of the catalog until its image is read
-/// off the route, so that a call sent meanwhile never meets the first one's
+/// call holds the turn from its vision check until its image is read off
+/// the route, so that a call sent meanwhile never meets the first one's
 /// switch, which would answer it `503 model_switching`, and finds the image
 /// model loaded once its turn comes. Not a retry: behind it, the image
 /// route's own queue serves every client. One per server, shared by every
@@ -141,14 +144,16 @@ pub(super) async fn generate(
         Ok(fields) => fields,
         Err(refused) => return call::answer(refused).await,
     };
-    if !agent_sees(&connector.server) {
-        return unseen();
-    }
     let mut progress = Progress::of(context);
     let waits = progress.tell("waiting for the image call before this one".to_owned());
     let Some(turn) = connector.server.image_calls.turn(waits, context.ct.cancelled()).await else {
         return given_up();
     };
+    // Judged once the call has its turn: the call before it has ended, and
+    // with it a visit to the enhancer, which serves meanwhile.
+    if !agent_sees(&connector.server) {
+        return unseen();
+    }
     let model = match image_model(routes, authorization.clone()).await {
         Ok(Pick::OnDisk(model)) => model,
         Ok(Pick::Absent { model, unavailable }) => {
@@ -157,14 +162,42 @@ pub(super) async fn generate(
         Err(refused) => return refused,
     };
     let made = tokio::select! {
-        made = made(routes, tool, fields, model, authorization, &mut progress) => made,
-        // Dropped with the route's answer, the job is cancelled.
-        () = context.ct.cancelled() => return given_up(),
+        made = made(routes, tool, fields, model, authorization, &mut progress) => Some(made),
+        () = context.ct.cancelled() => None,
+    };
+    let Some(made) = made else {
+        // Dropped with the route's answer, the job is cancelled; a switch the
+        // call began runs on without it. The turn is kept until that switch
+        // ends, so the next call finds the image model loaded rather than
+        // meet its `503 model_switching`.
+        until_no_switch_runs(&connector.server).await;
+        drop(turn);
+        return given_up();
     };
     drop(turn);
     match made {
         Ok(encoded) => shown(encoded).await,
         Err(refused) => refused,
+    }
+}
+
+/// Until nothing holds the server's switch slot: no switch, reload, load,
+/// visit or unload runs. Each ends by its own deadline; the serve stopping
+/// ends the wait too.
+async fn until_no_switch_runs(server: &Server) {
+    let Some(switcher) = &server.switcher else {
+        return;
+    };
+    loop {
+        // Taken before the read, so a slot freed in between is not missed:
+        // freeing it wakes this.
+        let mut changed = server.status.subscribe();
+        if switcher.running().is_none() {
+            return;
+        }
+        if !matches!(switcher.unless_stopping(changed.changed()).await, Some(Ok(()))) {
+            return;
+        }
     }
 }
 

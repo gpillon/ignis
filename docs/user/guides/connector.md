@@ -256,16 +256,18 @@ Harness pass a tool's image to the model only when the harness's
 configuration of the model declares image input; otherwise the model reads
 the line of text alone.
 
-**With vision off** the tool makes no image and switches nothing: it answers
-at once with a line of text naming the skill's `generate-image` script,
-which makes the image as a file, and the skill's install commands, in a
-POSIX shell form and a PowerShell form. An image the model cannot see would
-cost the switch for nothing, and, sent back with each later turn, would have
-those turns refused `vision_disabled`. The check reads the text model the
-agent returns to: the loaded model when it is a text model; with the image
-model loaded, the text model the server switched away from, which it
-remembers. So a second call in the same turn is judged by the agent's own
-model, not by the image model. A server started on the image model knows no
+**With vision off** the tool makes no image and switches nothing: it answers,
+once any image call before it has ended, with a line of text naming the
+skill's `generate-image` script, which makes the image as a file, and the
+skill's install commands, in a POSIX shell form and a PowerShell form. An
+image the model cannot see would cost the switch for nothing, and, sent back
+with each later turn, would have those turns refused `vision_disabled`. The
+check reads the text model the agent returns to: the loaded model when it is
+a text model; with the image model loaded, the text model the server switched
+away from, which it remembers. It is made once the call's turn has come, so a
+second call in the same turn is judged by the agent's own model, not by the
+image model, nor by the enhancer that a call before it visits for
+`image.prompt_enhancement`. A server started on the image model knows no
 text model, and the tool makes the image.
 
 **Several images in a turn.** The connector's image calls run one at a time.
@@ -277,7 +279,10 @@ and one back, and none is answered `503 model_switching`. With
 on (it is off by default), a call made while the image model is loaded
 visits the enhancer to rewrite its prompt, two switches more each. A waiting call is
 not a retry and has no deadline of its own: it waits as long as the call
-before it runs, and the harness's own timeout gives it up. Behind the
+before it runs, and the harness's own timeout gives it up. A call given up
+while the switch it began runs makes no image, but the switch runs on, and
+the next call waits for it to end as it would for a call that had not been
+given up. Behind the
 connector, the image route's own queue serves every client, one job at a
 time with up to [`image.queue_depth`](../reference/configuration.md#imagequeue_depth)
 waiting; a full queue comes back as the tool's error, `503 engine_full`
@@ -291,7 +296,10 @@ opencode 1.x reset their 60 s call timeout on progress, and qwen-code its
 300 s idle timer; opencode 2.x gives a call 12 h; DeepSeek Harness sends no
 token and cuts a call at 60 s whatever. The image job of a call with a token
 is held to [`server.stream_timeout`](../reference/configuration.md#serverstream_timeout),
-as a streamed request is; one without, to `server.request_timeout`.
+as a streamed request is; one without, to `server.request_timeout`. A
+refusal that arrives once the call's progress has begun, such as a full
+queue met after the switch, is the tool's error with no `Retry-After`: the
+route sent it as an event of a stream it had already answered `200`.
 
 **The vision budget.** The harness keeps each preview in its history and sends
 it back every turn. One merged vision token covers 32 x 32 pixels, so a
@@ -358,7 +366,9 @@ resource, which it drops.
 A route that refuses comes back as a tool error, `isError: true`, its text
 the server's own error JSON, exactly as a client would read it
 (`{"error": {"message", "type", "code"}}`), then a second text,
-`Retry-After: <seconds>`, when the route sent that header. The agent reads
+`Retry-After: <seconds>`, when the route sent that header (a refusal that
+reaches a `generate_image` call once its progress has begun has none, as
+[its section](#images-generate_image) says). The agent reads
 `model_switching`, `server_not_ready` or any other code as the server says
 it. The connector never retries: the agent sees the server's state and
 decides.
