@@ -102,10 +102,11 @@ the other. They are no configuration fields: `GET /v1/config` and
   the route under `ignis.runtime.decode_routes` (`mtp_head_linear`: `ours`,
   `vendored`, or `none` without the head), and the VRAM plan is the same on
   both.
-- `IGNIS_TMA_DESCRIPTOR_CACHE=0|1` picks, at each model load on Windows, how
-  the 27B's NVFP4 prompt products get their tensor maps: from the device slots
-  the load keeps (`1`, or unset), or by upstream's allocation, copy and free
-  before every product (`0`), the comparison a measurement of the two needs.
+- `IGNIS_TMA_DESCRIPTOR_CACHE=0|1` (from 0.11.0) picks, at each model load on
+  Windows, how the 27B's NVFP4 prompt products get their tensor maps: from the
+  device slots the load keeps (`1`, or unset), or by upstream's allocation,
+  copy and free before every product (`0`), the comparison a measurement of
+  the two needs.
   Under `0` the plan has no `tma_descriptors` line, so the KV pool takes its
   bytes, and the first request after the load pays the device memory pool's
   first allocation again. The bytes the products write are the same either
