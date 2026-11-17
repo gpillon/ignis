@@ -89,6 +89,8 @@ pub(crate) const CHANGES: &str = "change_config, download_model, cancel_download
 #[derive(Clone)]
 pub struct Connector {
     service: StreamableHttpService<Mcp, NeverSessionManager>,
+    /// The server the router serves: whose body limit `/v1/mcp` names.
+    server: Arc<crate::Server>,
 }
 
 impl Connector {
@@ -97,17 +99,21 @@ impl Connector {
     /// itself. `server` is the one `routes` serve: what `generate_image`
     /// reads the models of, and holds its calls on.
     pub fn new(tools: tools::Table, routes: Router, server: Arc<crate::Server>) -> Self {
-        let shared = Arc::new(Shared { instructions: instructions(&tools), tools, routes, server });
+        let shared = Arc::new(Shared { instructions: instructions(&tools), tools, routes, server: Arc::clone(&server) });
         let config = StreamableHttpServerConfig::default()
             .with_legacy_session_mode(false)
             .with_json_response(true)
-            .disable_allowed_hosts();
+            .disable_allowed_hosts()
+            // One limit on a body: the server's own, which holds every `/v1`
+            // body before this route reads it (`api::request_body_limit`).
+            // rmcp's default of its own, 4 MiB, would be a second.
+            .with_max_request_body_bytes(usize::MAX);
         let service = StreamableHttpService::new(
             move || Ok(Mcp(Arc::clone(&shared))),
             Arc::new(NeverSessionManager::default()),
             config,
         );
-        Self { service }
+        Self { service, server }
     }
 }
 
@@ -229,10 +235,11 @@ fn disabled() -> Response {
             (String = "text/event-stream"),
         )),
         (status = 202, description = "A notification, accepted."),
-        (status = 400, description = "Not one JSON-RPC message of MCP, or an `MCP-Protocol-Version` header this server does not speak."),
+        (status = 400, description = "Not one JSON-RPC message of MCP, or an `MCP-Protocol-Version` header this server does not speak; or a body that could not be read, with the error JSON (`invalid_request_error`).", body = crate::api::ApiError),
         (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = crate::api::ApiError),
         (status = 404, description = "The connector is off (`connector_disabled`): `connector.enabled` is false.", body = crate::api::ApiError),
         (status = 406, description = "`Accept` does not name both `application/json` and `text/event-stream`."),
+        (status = 413, description = "The body is over the server's limit on every `/v1` body, 16 MiB on a text-only load and 384 MiB with vision on (`request_body_too_large`).", body = crate::api::ApiError),
         (status = 415, description = "`Content-Type` is not `application/json`."),
     ),
 )]
@@ -243,13 +250,15 @@ pub(crate) async fn mcp(request: Request) -> Response {
     let Some(connector) = request.extensions().get::<Connector>().cloned() else {
         return disabled();
     };
-    // The body is read whole first and kept as written ([`Written`]), up to
-    // the cap rmcp itself holds a body to.
+    // The body is read whole first and kept as written ([`Written`]), held
+    // to the server's limit on every `/v1` body, which its layer set.
     let (mut parts, body) = request.into_parts();
-    let body = match axum::body::to_bytes(body, connector.service.config.max_request_body_bytes).await {
+    let body = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(body) => body,
-        Err(err) if past_its_limit(&err) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(err) if past_its_limit(&err) => {
+            return crate::api::body_too_large(crate::api::request_body_limit(connector.server.active().media.is_some()));
+        }
+        Err(err) => return crate::api::bad_request(&format!("the request body could not be read: {err}")),
     };
     parts.extensions.insert(Written(body.clone()));
     let request = Request::from_parts(parts, Body::from(body));
@@ -257,8 +266,8 @@ pub(crate) async fn mcp(request: Request) -> Response {
     response.map(axum::body::Body::new).into_response()
 }
 
-/// Whether reading a body failed on a length limit: rmcp's cap, or the
-/// server's own for every `/v1` body.
+/// Whether reading a body failed on a length limit: the server's own for
+/// every `/v1` body.
 fn past_its_limit(err: &axum::Error) -> bool {
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(err) = cause {

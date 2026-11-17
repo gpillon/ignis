@@ -24,6 +24,10 @@ as the harness's model too, the agent works on the same server it calls.
   id, so a restart of ignis leaves no harness holding a session that is gone.
   An answer is `application/json`, or an event stream when the call sends
   progress first. There is no stream from the server (`GET` is `405`).
+- **A request's body** is held to the limit every `/v1` body has, 16 MiB on a
+  text-only load and 384 MiB with vision on ([The API](../api/index.md));
+  past it the route answers `413 request_body_too_large`, the server's error
+  JSON. A malformed MCP message is `400`.
 - **It answers through a model switch** and while a model warms up:
   `initialize` and the tool list never wait. A tool's call goes to its route
   and is held, or refused, as a request of the client's own would be.

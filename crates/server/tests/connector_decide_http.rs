@@ -267,15 +267,39 @@ async fn a_model_or_a_thinking_field_is_refused_before_anything_runs() {
 }
 
 /// `/v1/mcp` keeps a request's body as written for `decide`, held to the
-/// cap rmcp holds a body to, 4 MiB: past it the request is refused `413`,
-/// as rmcp refused it, before anything runs.
+/// one limit the server holds every `/v1` body to (16 MiB on a text-only
+/// load), not to rmcp's own default of 4 MiB: a 5 MiB message is read and
+/// answered. Past the limit the request is refused `413
+/// request_body_too_large`, the server's error JSON, whether its
+/// `Content-Length` declared the size or not, before anything runs; a body
+/// that cannot be read is `400`, the error JSON too.
 #[tokio::test]
-async fn a_body_past_the_mcp_cap_is_refused_413() {
+async fn a_body_is_held_to_the_servers_one_limit_and_refused_past_it_with_the_error_json() {
     let (app, compute) = server(ModelFamily::Qwen38_27b);
-    let state = "x".repeat(4 << 20);
+    let padded = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"ping","params":{{"_meta":{{"pad":"{}"}}}}}}"#, "x".repeat(5 << 20));
+    let (status, _, bytes) = exchange(&app, mcp_text(padded, false, None)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes[..bytes.len().min(300)]));
+
+    let state = "x".repeat(ignis_server::api::request_body_limit(false));
     let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"decide","arguments":{{"state":"{state}","questions":{{}}}}}}}}"#);
-    let (status, _, _) = exchange(&app, mcp_text(body, false, None)).await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    for declared in [false, true] {
+        let mut request = mcp_text(body.clone(), false, None);
+        if declared {
+            request.headers_mut().insert(header::CONTENT_LENGTH, body.len().into());
+        }
+        let (status, _, bytes) = exchange(&app, request).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "declared: {declared}");
+        let refused: Value = serde_json::from_slice(&bytes).unwrap_or_else(|err| panic!("declared: {declared}: {err}: {bytes:?}"));
+        assert_eq!(refused["error"]["code"], "request_body_too_large", "{refused}");
+    }
+
+    let cut = futures_util::stream::iter([Ok(Bytes::from_static(b"{\"jsonrpc\"")), Err(std::io::Error::other("the client went away"))]);
+    let mut request = mcp_text("", false, None);
+    *request.body_mut() = Body::from_stream(cut);
+    let (status, _, bytes) = exchange(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let refused: Value = serde_json::from_slice(&bytes).unwrap_or_else(|err| panic!("{err}: {bytes:?}"));
+    assert_eq!(refused["error"]["type"], "invalid_request_error", "{refused}");
     assert!(prefilled(&compute).is_empty());
 }
 

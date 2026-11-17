@@ -90,9 +90,22 @@ pub fn request_body_limit(media: bool) -> usize {
     }
 }
 
+/// The `413` of a request whose body is past [`request_body_limit`],
+/// `limit`: the error JSON every refusal has (`request_body_too_large`),
+/// naming the limit.
+pub(crate) fn body_too_large(limit: usize) -> Response {
+    error_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "invalid_request_error",
+        "request_body_too_large",
+        format!("the request body is over this server's limit of {limit} bytes for the model serving now"),
+    )
+}
+
 /// Cap the request's body at the limit of the model serving when it arrives.
 /// A body past it fails as axum's own limit does, `413`, and a declared length
-/// past it is refused before a byte is read.
+/// past it is refused before a byte is read, with the error JSON
+/// ([`body_too_large`]).
 async fn limit_request_body(State(server): State<Arc<Server>>, request: Request, next: Next) -> Response {
     // The two forms that set the media limit on every load, whatever model
     // serves, keep their own.
@@ -106,7 +119,7 @@ async fn limit_request_body(State(server): State<Arc<Server>>, request: Request,
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok());
     if declared.is_some_and(|declared| declared > limit) {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        return body_too_large(limit);
     }
     let (parts, body) = request.into_parts();
     let body = axum::body::Body::new(http_body_util::Limited::new(body, limit));

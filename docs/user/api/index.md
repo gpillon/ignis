@@ -31,6 +31,7 @@ not.
 | `/v1/detokenize` | POST | Token ids back to text, through the same tokenizer. |
 | `/v1/decide` | POST | The decision endpoint ([Decisions](decide.md)). |
 | `/v1/mcp` | POST | The connector's MCP server, for a coding agent's harness: the server tools, over Streamable HTTP ([The connector](../guides/connector.md), from 0.11.0). Answers through a model switch; each tool's call meets its own route's checks. |
+| `/v1/connector/skill` | GET | The connector's skill, `ignis`, as a `tar.gz`: Node scripts that make and edit images and transcribe recordings on the harness's side, beside its files ([The connector](../guides/connector.md#the-skill), from 0.11.0). |
 | `/v1/systemone` | POST | The same handler on the System One API's own route ([Decisions](decide.md)). |
 | `/v1` | GET | The API reference — a 307 to `/v1/docs/` (ADR 0036). |
 | `/v1/docs/` | GET | Swagger UI over the document, from assets compiled into the binary: no CDN, nothing fetched. Open even with an API key set — it publishes the API's shape, not its load — and *Authorize* is how you drive the keyed routes from the page. |
@@ -46,6 +47,8 @@ address: no key, and never reachable through `--server-expose`.
 load, 384 MiB with `--vision-enabled`, which takes images inline as base64 data URIs.
 Both are past what their own load can use, so an oversized prompt meets the
 refusal that names the real limit — the context — rather than a byte count.
+A request whose declared length is past the limit is refused
+`413 request_body_too_large`, with the error JSON below from 0.11.0.
 
 **Errors** use OpenAI's `{"error": {message, type, code}}` body with the
 matching status: 400 bad request, 404 unknown model, 413 oversized request, 503
