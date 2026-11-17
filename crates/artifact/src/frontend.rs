@@ -364,6 +364,37 @@ impl Tokenizer {
         Ok((output.get_ids().to_vec(), output.get_offsets().to_vec()))
     }
 
+    /// How many leading ids of `ids` (the encoding of `text`, `offsets` its
+    /// byte ranges) a separate encoding of `text[..at]` gives, read off the one
+    /// encoding rather than computed again (GitHub #647), or `None` when it
+    /// cannot be said from it and the caller encodes the head after all.
+    ///
+    /// Read off only at the end of `text` or where an added token starts at
+    /// `at`: the pipeline splits a text at its added tokens before anything
+    /// else and normalizes, pre-tokenizes and models every piece on its own, so
+    /// the pieces before `at`, and their ids, are the same in both texts. A
+    /// match that started before `at` would have to straddle the added token
+    /// found there, which the split's non-overlapping matches rule out. Two
+    /// kinds of added token would break that, and are not read off: one matched
+    /// after normalization (`normalized`), whose piece is normalized across
+    /// `at`; and one that opens on a word character, which a `single_word`
+    /// token ending at `at` reads as a word in `text` and as the end in the
+    /// head. The added tokens the served templates cut at all open on `<`.
+    pub fn prefix_at_added_token(&self, text: &str, at: usize, ids: &[u32], offsets: &[(usize, usize)]) -> Option<usize> {
+        if at == text.len() {
+            return Some(ids.len());
+        }
+        let k = offsets.partition_point(|&(start, _)| start < at);
+        let starts_here = offsets.get(k).is_some_and(|&(start, _)| start == at);
+        let before_ends = k == 0 || offsets[k - 1].1 <= at;
+        if !(starts_here && before_ends) {
+            return None;
+        }
+        let added = self.inner.get_added_vocabulary().get_added_tokens_decoder().get(ids.get(k)?)?;
+        let splits_first = !added.normalized && added.content.starts_with(|c: char| c.is_ascii_punctuation() && c != '_');
+        splits_first.then_some(k)
+    }
+
     /// Whether `id` is a token this tokenizer has — in its vocabulary or among
     /// its added tokens. `decode` skips an id it has no token for rather than
     /// refusing it, so this is what tells a caller its ids are real (GitHub
