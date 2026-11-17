@@ -378,7 +378,7 @@ pub struct Switcher {
     last: Mutex<Option<LastSwitch>>,
     /// The text model the last run of the slot left, once one has left a
     /// text model ([`Switcher::text_model_left`]).
-    left: Mutex<Option<TextModelLeft>>,
+    text_model_left: Mutex<Option<TextModel>>,
     /// Whether the switch under way has said how it ended
     /// ([`Switcher::record`]): a task that dies without having is recorded
     /// as failed by its guard.
@@ -461,16 +461,25 @@ pub struct LastSwitch {
     pub host_plan: Option<ignis_core::residency::HostPlanError>,
 }
 
-/// The text model a switch, a reload, a load or a visit left
-/// ([`Switcher::text_model_left`], spec #656): kept while another model
-/// serves, so that once the image model is loaded the text model a
-/// harness's next turn returns to is still known, with its vision.
+/// A text model and whether it sees images (spec #656): the one loaded, or
+/// the one a switch, a reload, a load or a visit left
+/// ([`Switcher::text_model_left`]), kept while another model serves, so
+/// that once the image model is loaded the text model a harness's next turn
+/// returns to is still known, with its vision.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TextModelLeft {
+pub struct TextModel {
     /// The id it served under.
     pub id: String,
-    /// Whether it took images: loaded with vision on.
+    /// Whether it takes images: loaded with vision on.
     pub vision: bool,
+}
+
+impl TextModel {
+    /// `model` as a text model, with its vision; `None` for a model of
+    /// another kind.
+    pub fn of(model: &ActiveModel) -> Option<Self> {
+        (model.kind() == ModelKind::Text).then(|| Self { id: model.model_id(), vision: model.media.is_some() })
+    }
 }
 
 /// Why an id named alone cannot be switched to (`POST /v1/models/switch`
@@ -550,7 +559,7 @@ impl Switcher {
             catalog_on: AtomicBool::new(false),
             listed: Mutex::new(BTreeMap::new()),
             last: Mutex::new(None),
-            left: Mutex::new(None),
+            text_model_left: Mutex::new(None),
             settled: AtomicBool::new(true),
             start: Mutex::new(None),
             stopping: tokio::sync::watch::Sender::new(false),
@@ -820,8 +829,8 @@ impl Switcher {
     /// enhancer without asking the slot again, so the model it left stays
     /// the one the visit began on. `None` until a run begins on a text
     /// model: a server started on the image model knows none.
-    pub fn text_model_left(&self) -> Option<TextModelLeft> {
-        self.left.lock().expect("left text model lock").clone()
+    pub fn text_model_left(&self) -> Option<TextModel> {
+        self.text_model_left.lock().expect("left text model lock").clone()
     }
 
     /// Say how a switch ended. Called **before** the status leaves
@@ -1307,10 +1316,8 @@ fn begin_run(
         // Spec #656: the text model this run leaves, before anything else
         // can be published, so that the image model is never loaded with
         // it unknown.
-        let leaving = server.active();
-        if leaving.kind() == ModelKind::Text {
-            let left = TextModelLeft { id: leaving.model_id(), vision: leaving.media.is_some() };
-            *switcher.left.lock().expect("left text model lock") = Some(left);
+        if let Some(left) = TextModel::of(&server.active()) {
+            *switcher.text_model_left.lock().expect("left text model lock") = Some(left);
         }
         // The model being replaced is the start model if nothing else said so.
         switcher.note_start(server.active().source.as_ref());

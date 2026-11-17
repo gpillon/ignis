@@ -21,7 +21,7 @@ use ignis_core::image::ImageSize;
 use ignis_server::config::ApiKey;
 use ignis_server::download::Catalog;
 use ignis_server::media::{MediaAcquirer, MediaPolicy};
-use ignis_server::model_switch::{CatalogModels, Switcher, TextModelLeft};
+use ignis_server::model_switch::{CatalogModels, Switcher, TextModel};
 use ignis_server::Server;
 use serde_json::{json, Value};
 
@@ -295,7 +295,7 @@ async fn a_second_call_is_judged_by_the_text_model_switched_away_from_and_switch
         assert_eq!(result["content"][0]["type"], "image", "{prompt}: {result}");
         assert_eq!(server.active().model_id(), IMAGE);
         let remembered = server.switcher.as_ref().unwrap().text_model_left();
-        assert_eq!(remembered, Some(TextModelLeft { id: "mock-a".to_owned(), vision: true }), "{prompt}");
+        assert_eq!(remembered, Some(TextModel { id: "mock-a".to_owned(), vision: true }), "{prompt}");
     }
     assert_eq!(loader.loads(), [IMAGE]);
     assert_eq!(loader.encoded_prompts(), ["a fox", "a second fox"]);

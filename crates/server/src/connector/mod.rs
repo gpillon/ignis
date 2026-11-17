@@ -179,11 +179,7 @@ impl ServerHandler for Mcp {
         };
         // The harness's own key: the route checks it as it would the
         // harness's request.
-        let authorization = context
-            .extensions
-            .get::<axum::http::request::Parts>()
-            .and_then(|parts| parts.headers.get(header::AUTHORIZATION))
-            .cloned();
+        let authorization = parts(&context).and_then(|parts| parts.headers.get(header::AUTHORIZATION)).cloned();
         // A tool whose call is more than its route's has its own module.
         let result = match tool.tool.name.as_ref() {
             decide::TOOL => decide::decide(&self.0.routes, tool, written(&context), authorization).await,
@@ -202,11 +198,15 @@ impl ServerHandler for Mcp {
 #[derive(Clone)]
 pub(crate) struct Written(pub(crate) Bytes);
 
-/// The body `context`'s request was sent with, as written ([`Written`]):
-/// rmcp puts the request's HTTP parts, its extensions among them, in the
-/// context of the call.
+/// The HTTP parts of the request `context`'s call came in, its headers
+/// and its extensions: rmcp puts them in the context of the call.
+fn parts(context: &RequestContext<RoleServer>) -> Option<&axum::http::request::Parts> {
+    context.extensions.get::<axum::http::request::Parts>()
+}
+
+/// The body `context`'s request was sent with, as written ([`Written`]).
 fn written(context: &RequestContext<RoleServer>) -> Option<&Written> {
-    context.extensions.get::<axum::http::request::Parts>()?.extensions.get::<Written>()
+    parts(context)?.extensions.get::<Written>()
 }
 
 /// The `404` of a connector that is off, the one answer both of its routes
@@ -294,6 +294,19 @@ mod tests {
     fn the_change_tools_line_keeps_within_its_share() {
         assert!(super::CHANGES.len() <= 120, "{} bytes", super::CHANGES.len());
         assert_eq!(super::CHANGES.lines().count(), 1);
+    }
+
+    /// The change tools' line names each tool the document lists only with
+    /// `connector.allow_changes`, and no other: its prose restates their
+    /// names.
+    #[test]
+    fn the_change_tools_line_names_the_change_tools_and_no_other() {
+        let document = crate::api::openapi();
+        let (every, read) = (super::tools::Table::from_document(&document, true), super::tools::Table::from_document(&document, false));
+        for tool in every.listed() {
+            let changes = read.named(&tool.name).is_none();
+            assert_eq!(super::CHANGES.contains(tool.name.as_ref()), changes, "{}: {}", tool.name, super::CHANGES);
+        }
     }
 
     /// Spec #656, ticket #662: the skill's two install forms keep within

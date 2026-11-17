@@ -2456,7 +2456,7 @@ Thinking is refused rather than ignored: a decision's prompt ends exactly where 
     // and no thinking field. Its call sends them as the harness wrote them
     // (`crate::connector::decide`).
     extensions(("x-ignis-tool" = json!({
-        "name": "decide",
+        "name": crate::connector::decide::TOOL,
         "description": "Use it to classify or judge content: typed questions about it (yes/no, a choice, a score, a number) answered by reading the model, not by generating. The 27B only: on Flash-Next the server answers model_unsupported.",
         "read_only": false,
         "destructive": false,

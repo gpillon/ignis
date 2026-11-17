@@ -35,7 +35,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::{Body, Bytes};
-use axum::http::{header, HeaderValue, Request, StatusCode};
+use axum::http::{HeaderValue, Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
 use http_body_util::BodyExt;
@@ -52,14 +52,12 @@ use super::call;
 use super::tools::ServerTool;
 use super::Shared;
 use crate::download::command::OnDisk;
+use crate::download_http::DOWNLOAD_TOOL;
+use crate::model_switch::TextModel;
 use crate::Server;
 
 /// The tool's name, as its route's extension declares it.
 pub(crate) const TOOL: &str = "generate_image";
-
-/// The tool that starts a catalog entry's download (ticket #660), listed
-/// only with `connector.allow_changes` on.
-const DOWNLOAD_TOOL: &str = "download_model";
 
 /// The longest edge of the preview the agent sees, in pixels (spec #656):
 /// enough to check the image is the one asked for, a few hundred vision
@@ -142,7 +140,7 @@ pub(super) async fn generate(
     context: &RequestContext<RoleServer>,
 ) -> CallToolResult {
     let (routes, tools) = (&connector.routes, &connector.tools);
-    let fields = match fields(arguments) {
+    let fields = match fields(tool, arguments) {
         Ok(fields) => fields,
         Err(refused) => return call::answer(refused).await,
     };
@@ -216,9 +214,8 @@ fn given_up() -> CallToolResult {
 /// A server that knows none, started on the image model, is taken to see:
 /// nothing says the agent cannot, and no switch is spent on the image.
 fn agent_sees(server: &Server) -> bool {
-    let loaded = server.active();
-    if loaded.kind() == ModelKind::Text {
-        return loaded.media.is_some();
+    if let Some(loaded) = TextModel::of(&server.active()) {
+        return loaded.vision;
     }
     server.switcher.as_ref().and_then(|switcher| switcher.text_model_left()).is_none_or(|left| left.vision)
 }
@@ -234,15 +231,16 @@ fn unseen() -> CallToolResult {
 /// [`unseen`]'s text, the skill's install after it.
 const UNSEEN: &str = "No image was made: the model you run on has vision off, so it could not see one, and making it would switch models for nothing. The ignis skill's generate-image script makes the image as a file: in the skill's folder, ~/.agents/skills/ignis, run node scripts/generate-image.mjs \"<prompt>\" <out.png> [--size WxH]. Without the skill, install it first, with the line for your shell:";
 
-/// The arguments the route is sent: `prompt` and `size`, as given. Any
-/// other is refused, naming it: the route's `n`, `model` and `stream` are
-/// the connector's, so that a call makes one image.
-fn fields(arguments: Option<JsonObject>) -> Result<JsonObject, Response> {
+/// The arguments the route is sent: those the tool's input declares,
+/// `prompt` and `size`, as given. Any other is refused, naming it: the
+/// route's `n`, `model` and `stream` are the connector's, so that a call
+/// makes one image.
+fn fields(tool: &ServerTool, arguments: Option<JsonObject>) -> Result<JsonObject, Response> {
+    let taken = tool.arguments();
     let mut fields = JsonObject::new();
     for (name, value) in arguments.unwrap_or_default() {
-        if !matches!(name.as_str(), "prompt" | "size") {
-            let message = format!("{TOOL} takes `prompt` and `size` only, not `{name}`");
-            return Err(crate::api::bad_request_param(&message, &name));
+        if !taken.contains(&name.as_str()) {
+            return Err(crate::api::bad_request_param(&tool.takes_only(&name), &name));
         }
         fields.insert(name, value);
     }
@@ -264,11 +262,7 @@ enum Pick {
 /// The catalog's image model, read as the agent would read the catalog:
 /// its refusal (a warm-up's `503`, the key's `401`) is the tool's error.
 async fn image_model(routes: &Router, authorization: Option<HeaderValue>) -> Result<Pick, CallToolResult> {
-    let mut request = Request::get("/v1/models/catalog");
-    if let Some(authorization) = authorization {
-        request = request.header(header::AUTHORIZATION, authorization);
-    }
-    let request = request.body(Body::empty()).expect("a GET of a fixed path");
+    let request = call::with_key(Request::get("/v1/models/catalog"), authorization).body(Body::empty()).expect("a GET of a fixed path");
     let response = call::send(routes, request).await;
     if !response.status().is_success() {
         return Err(call::answer(response).await);
@@ -364,7 +358,7 @@ async fn made(
     progress: &mut Progress<'_>,
 ) -> Result<String, CallToolResult> {
     fields.insert("model".to_owned(), Value::String(model));
-    if progress.heard() {
+    if progress.has_token() {
         fields.insert("stream".to_owned(), Value::Bool(true));
     }
     let request = call::request(tool, Some(fields), authorization)
@@ -373,7 +367,7 @@ async fn made(
     if !response.status().is_success() {
         return Err(call::answer(response).await);
     }
-    if progress.heard() {
+    if progress.has_token() {
         return streamed(response, progress).await;
     }
     let body = read(response).await.map_err(|why| unreadable("the image", &why))?;
@@ -473,7 +467,7 @@ impl<'a> Progress<'a> {
     }
 
     /// Whether the call carries a progress token.
-    fn heard(&self) -> bool {
+    fn has_token(&self) -> bool {
         self.token.is_some()
     }
 
@@ -652,9 +646,11 @@ mod tests {
     /// naming it.
     #[tokio::test]
     async fn an_argument_past_prompt_and_size_is_refused_naming_it() {
+        let table = crate::connector::tools::Table::from_document(&crate::api::openapi(), false);
+        let tool = table.named(TOOL).expect("generate_image is listed");
         let arguments = json!({ "prompt": "a fox", "size": "1024x1024" }).as_object().cloned();
-        assert_eq!(Value::Object(fields(arguments).unwrap()), json!({ "prompt": "a fox", "size": "1024x1024" }));
-        let refused = fields(json!({ "prompt": "a fox", "n": 3 }).as_object().cloned()).err().expect("refused");
+        assert_eq!(Value::Object(fields(tool, arguments).unwrap()), json!({ "prompt": "a fox", "size": "1024x1024" }));
+        let refused = fields(tool, json!({ "prompt": "a fox", "n": 3 }).as_object().cloned()).err().expect("refused");
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         let body: Value = serde_json::from_slice(&read(refused).await.unwrap()).unwrap();
         assert_eq!(body["error"]["param"], "n", "{body}");

@@ -33,6 +33,11 @@ use crate::download::command::{file_size, on_disk, room_for, OnDisk};
 use crate::download::{CatalogEntry, Download, DownloadError, Downloader, Ended, EntryLock, Holder, NotLocked};
 use crate::Server;
 
+/// The connector's tool on [`post_model_download`] (spec #656), listed only
+/// with `connector.allow_changes` on: `generate_image`'s error names it when
+/// no image model is on disk.
+pub(crate) const DOWNLOAD_TOOL: &str = "download_model";
+
 /// The downloads a server runs through the API, and how they are fetched:
 /// shared by every clone of the server ([`Server::with_downloads`]).
 pub struct Downloads {
@@ -247,11 +252,11 @@ pub(crate) struct DownloadAccepted {
         (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`), or a model switch is under way (`model_switching`).", body = ApiError),
         (status = 507, description = "The volume of `download.path` has less free space than the entry's bytes still missing plus `download.free_margin` (`download_no_room`): nothing was written, and the message names the bytes needed and the bytes free. The entry's row keeps it as its `download_reason`, `download: failed`, until its next download, the entry complete on disk another way, or a restart.", body = ApiError),
     ),
-    // Spec #656: the connector's `download_model`, listed only with
-    // `connector.allow_changes` on; it answers at once, and `read_catalog`
-    // follows the download.
+    // Spec #656: the connector's `download_model` ([`DOWNLOAD_TOOL`]),
+    // listed only with `connector.allow_changes` on; it answers at once, and
+    // `read_catalog` follows the download.
     extensions(("x-ignis-tool" = json!({
-        "name": "download_model",
+        "name": DOWNLOAD_TOOL,
         "description": "Start downloading a model of the catalog (read_catalog lists the ids) in the background: it answers at once, one download runs at a time, and read_catalog shows its progress. It does not switch to the model.",
         "read_only": false,
         "destructive": false,

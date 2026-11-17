@@ -32,10 +32,6 @@ pub(crate) const TOOL: &str = "decide";
 /// 27B's (Flash-Next has no readouts).
 pub(crate) const INSTRUCTIONS: &str = "decide classifies or judges content with typed questions (yes/no, choice, score) read off the model; the 27B only.";
 
-/// The arguments a call may carry, the route's own: its `model`, which
-/// would switch the server, and its thinking fields are not the tool's.
-const ARGUMENTS: [&str; 2] = ["state", "questions"];
-
 /// Call `decide` through `routes` with the arguments `written` holds,
 /// presenting `authorization`, the harness's own header.
 pub(crate) async fn decide(
@@ -47,22 +43,17 @@ pub(crate) async fn decide(
     let Some(written) = written else {
         return unread("the call's body as the harness wrote it was not kept, and without it the order of its keys would be lost");
     };
-    let body = match arguments(&written.0) {
+    // The arguments the tool's input declares: the route's `model`, which
+    // would switch the server, and its thinking fields are not among them.
+    let body = match arguments(&written.0, &tool.arguments()) {
         Ok(Arguments::Taken(body)) => body,
         Ok(Arguments::Refused(name)) => {
-            let message = format!("{TOOL} takes `state` and `questions` only, not `{name}`");
-            return call::answer(crate::api::bad_request_param(&message, &name)).await;
+            return call::answer(crate::api::bad_request_param(&tool.takes_only(&name), &name)).await;
         }
         Err(why) => return unread(&why),
     };
-    let mut request = Request::builder()
-        .method(tool.method.clone())
-        .uri(&tool.path)
-        .header(header::CONTENT_TYPE, "application/json");
-    if let Some(authorization) = authorization {
-        request = request.header(header::AUTHORIZATION, authorization);
-    }
-    match request.body(Body::from(body)) {
+    let request = Request::builder().method(tool.method.clone()).uri(&tool.path).header(header::CONTENT_TYPE, "application/json");
+    match call::with_key(request, authorization).body(Body::from(body)) {
         Ok(request) => call::answer(call::send(routes, request).await).await,
         Err(err) => unread(&format!("the arguments make no request: {err}")),
     }
@@ -93,10 +84,10 @@ struct Params<'a> {
 
 /// `message`'s arguments for the route: the object's text exactly as it
 /// was written, keys, order, spacing and numbers' spelling, when each key
-/// is one of [`ARGUMENTS`]. No arguments is an empty object, which the
-/// route refuses naming what is missing. Every key is checked, a key
-/// written twice too: the route refuses a duplicate itself.
-fn arguments(message: &[u8]) -> Result<Arguments, String> {
+/// is one of `taken`. No arguments is an empty object, which the route
+/// refuses naming what is missing. Every key is checked, a key written
+/// twice too: the route refuses a duplicate itself.
+fn arguments(message: &[u8], taken: &[&str]) -> Result<Arguments, String> {
     let message: Message = serde_json::from_slice(message).map_err(|err| format!("the call's message does not read: {err}"))?;
     if message.params.name != TOOL {
         return Err(format!("the call's message names `{}`, not `{TOOL}`", message.params.name));
@@ -106,7 +97,7 @@ fn arguments(message: &[u8]) -> Result<Arguments, String> {
     };
     let keys: crate::decide::Ordered<&RawValue> =
         serde_json::from_str(arguments.get()).map_err(|err| format!("the arguments are not one JSON object: {err}"))?;
-    if let Some((name, _)) = keys.entries().iter().find(|(name, _)| !ARGUMENTS.contains(&name.as_str())) {
+    if let Some((name, _)) = keys.entries().iter().find(|(name, _)| !taken.contains(&name.as_str())) {
         return Ok(Arguments::Refused(name.clone()));
     }
     Ok(Arguments::Taken(arguments.get().to_owned()))
@@ -123,6 +114,15 @@ mod tests {
 
     fn call_of(name: &str, arguments: &str) -> Vec<u8> {
         format!(r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"{name}","arguments":{arguments}}}}}"#).into_bytes()
+    }
+
+    /// [`super::arguments`] of `message`, for the tool's input as the
+    /// document declares it.
+    fn arguments(message: &[u8]) -> Result<Arguments, String> {
+        let table = crate::connector::tools::Table::from_document(&crate::api::openapi(), false);
+        let tool = table.named(TOOL).expect("decide is listed");
+        assert_eq!(tool.arguments(), ["questions", "state"]);
+        super::arguments(message, &tool.arguments())
     }
 
     /// Spec #656: the route is sent the `arguments` object byte for byte,

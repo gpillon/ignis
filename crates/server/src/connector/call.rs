@@ -73,15 +73,22 @@ pub(crate) fn request(
         uri.push('?');
         uri.push_str(&serde_urlencoded::to_string(&query).map_err(|err| format!("the arguments make no query: {err}"))?);
     }
-    let mut request = Request::builder().method(tool.method.clone()).uri(uri);
-    if let Some(authorization) = authorization {
-        request = request.header(header::AUTHORIZATION, authorization);
-    }
+    let request = with_key(Request::builder().method(tool.method.clone()).uri(uri), authorization);
     let request = match body {
         Some(body) => request.header(header::CONTENT_TYPE, "application/json").body(Body::from(body)),
         None => request.body(Body::empty()),
     };
     request.map_err(|err| format!("the arguments make no request: {err}"))
+}
+
+/// `request`, presenting `authorization`, the harness's own header, when
+/// its call carried one: the route checks it as it would the harness's own
+/// request.
+pub(crate) fn with_key(request: axum::http::request::Builder, authorization: Option<HeaderValue>) -> axum::http::request::Builder {
+    match authorization {
+        Some(authorization) => request.header(header::AUTHORIZATION, authorization),
+        None => request,
+    }
 }
 
 /// An argument as a query value: a string as it is, a number or a boolean

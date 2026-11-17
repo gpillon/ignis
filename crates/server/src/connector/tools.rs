@@ -144,6 +144,20 @@ impl Table {
 }
 
 impl ServerTool {
+    /// The arguments its input declares (`properties`), which a call may
+    /// carry, in name order.
+    pub fn arguments(&self) -> Vec<&str> {
+        let properties = self.tool.input_schema.get("properties").and_then(|properties| properties.as_object());
+        properties.map_or_else(Vec::new, |properties| properties.keys().map(String::as_str).collect())
+    }
+
+    /// The tool's error text for a call carrying `name`, an argument its
+    /// input does not declare: the ones it does, named.
+    pub fn takes_only(&self, name: &str) -> String {
+        let taken: Vec<String> = self.arguments().iter().map(|argument| format!("`{argument}`")).collect();
+        format!("{} takes {} only, not `{name}`", self.tool.name, taken.join(" and "))
+    }
+
     fn declared(declared: Declaration, method: Method, path: &str) -> Self {
         let takes_arguments = declared.input.is_some();
         let input = declared.input.unwrap_or_else(|| {
