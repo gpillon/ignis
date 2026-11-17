@@ -2082,9 +2082,8 @@ std::size_t trellis_dense_bytes(const ignis_model &model) {
 // slot for each product a prefill traversal runs on the route, its NVFP4 parents (the query, key,
 // gate and value or the GDN input projection, the output projection, the MLP's gate and up, one
 // block a width on either SwiGLU route (GitHub #651), and its down; an exception tensor held in
-// FP8 or BF16 runs elsewhere), at every width the route
-// takes up to the chunk. 0 on a load that keeps none (`tma_descriptor_cache_route`) and on the
-// trellis body, which runs no W4A4 product.
+// FP8 or BF16 runs elsewhere), at every width the route takes up to the chunk. 0 on a load that
+// keeps none (`tma_descriptor_cache_route`) and on the trellis body, which runs no W4A4 product.
 std::size_t tma_descriptor_bytes(const ignis_model &model, uint32_t prefill_chunk_tokens,
                                  const LoadOptions &options) {
   if (!options.tma_descriptor_cache || model.is_trellis_body) {

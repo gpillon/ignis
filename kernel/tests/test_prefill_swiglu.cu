@@ -10,8 +10,9 @@
 //
 // The positive control: at 1,024 tokens the vendored fused kernel, which multiplies gate and up
 // in fp32 before one rounding, writes other bytes than the split route, so a byte compare here
-// tells the two roundings apart. Beside it, the widths the op takes and the measurement switch
-// IGNIS_PREFILL_SWIGLU's parse.
+// tells the two roundings apart. Beside it, the widths the op takes, the entry the layers call
+// under each route (the op at 1,024 under Fused, the vendored dispatch under Split and at a width
+// the op does not take), and the measurement switch IGNIS_PREFILL_SWIGLU's parse.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE, so a missing GPU fails this test.
 
@@ -234,10 +235,41 @@ int main() {
       workspace.reset();
       ninfer::ops::linear_swiglu(x, gate_up, fused, ninfer::ops::LinearPolicy::AllowA4, workspace, plain);
       cuda(cudaStreamSynchronize(plain), "vendored fused kernel");
-      const std::size_t n = differing(host_bf16(fused, count), expected);
+      const std::vector<std::uint16_t> vendored = host_bf16(fused, count);
+      const std::size_t n = differing(vendored, expected);
       check(n > 0, "the vendored fused kernel at 1,024 tokens writes other bytes (" + std::to_string(n) +
                        " of " + std::to_string(count) + " differ)");
+
+      // The layers' entry under each route: Fused runs the op at 1,024, Split the vendored dispatch.
+      for (const ps::Route route : {ps::Route::Fused, ps::Route::Split}) {
+        cuda(cudaMemset(fused_data, 0xff, out_bytes), "cudaMemset");
+        workspace.reset();
+        ps::linear_swiglu(route, x, gate_up, fused, ninfer::ops::LinearPolicy::AllowA4, workspace, plain);
+        cuda(cudaStreamSynchronize(plain), "routed entry");
+        const std::vector<std::uint16_t> got = host_bf16(fused, count);
+        if (route == ps::Route::Fused) {
+          check(differing(got, expected) == 0, "under Fused the layers' entry runs the op at 1,024 tokens");
+        } else {
+          check(differing(got, vendored) == 0, "under Split the layers' entry runs the vendored dispatch at 1,024 tokens");
+        }
+      }
     }
+  }
+  {
+    // A width the op does not take keeps the vendored dispatch under Fused.
+    constexpr std::int32_t kRagged = 1152;
+    const std::size_t count = static_cast<std::size_t>(kIntermediate) * kRagged;
+    const Tensor x(x_data, DType::BF16, {kInput, kRagged});
+    Tensor split(split_data, DType::BF16, {kIntermediate, kRagged});
+    Tensor fused(fused_data, DType::BF16, {kIntermediate, kRagged});
+    cuda(cudaMemset(fused_data, 0xff, out_bytes), "cudaMemset");
+    workspace.reset();
+    ninfer::ops::linear_swiglu(x, gate_up, split, ninfer::ops::LinearPolicy::AllowA4, workspace, plain);
+    workspace.reset();
+    ps::linear_swiglu(ps::Route::Fused, x, gate_up, fused, ninfer::ops::LinearPolicy::AllowA4, workspace, plain);
+    cuda(cudaStreamSynchronize(plain), "routed entry");
+    check(differing(host_bf16(fused, count), host_bf16(split, count)) == 0,
+          "under Fused the layers' entry keeps the vendored dispatch at 1,152 tokens");
   }
   // Each width's descriptor block, once: the same widths again read their slots.
   for (const std::int32_t tokens : kWidths) {

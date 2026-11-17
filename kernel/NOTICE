@@ -231,7 +231,8 @@ The 27B prefill's MLP gate and up product with SwiGLU in its epilogue
   (the product, then SiLU-mul) does, so the output is the split route's byte for byte where
   upstream's, one rounding fewer, differs; two pipeline stages; on Windows the descriptor block
   from the load's device slots (`kernel/src/tma_descriptor_cache.h`). The file headers list the
-  parts. The vendored kernel stays in the subtree, not edited, as the route under
+  parts. The vendored kernel stays in the subtree as it is (its launcher with the ADR 0031 patch
+  of GitHub #650), as the route under
   `IGNIS_PREFILL_SWIGLU=split` at exactly 1,024 tokens (`kernel/vendor/VENDOR.md`); the op is
   held to the split route byte for byte (`kernel/tests/test_prefill_swiglu.cu`).
 

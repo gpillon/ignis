@@ -499,7 +499,8 @@ epilogue, NVFP4 arm only:
   TMA route takes, from 1,024 tokens in whole 256-token tiles, left this op
   for `kernel/src/prefill_swiglu.cu`, an adapted op of its TMA kernel whose
   epilogue rounds as `LinearW4A4Post` does, so 1,024 tokens no longer takes
-  the TMA kernel's one rounding fewer. The files stay here unpatched: every
+  the TMA kernel's one rounding fewer. This leaves the files as they are (the
+  TMA launcher with its #650 patch): every
   other call (decode, verify, narrower or ragged widths, A16) runs them, the
   split route is the oracle the op is held to byte for byte
   (`ignis_kernel_prefill_swiglu_test`), and `IGNIS_PREFILL_SWIGLU=split`
