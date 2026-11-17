@@ -2143,7 +2143,7 @@ Where KV-disk's files go: `model` (beside the artifact), `auto` (the per-user ca
 | Models | all |
 | `/v1/config` | shown by `GET`, not patchable |
 
-Serve the connector's MCP server at /v1/mcp. Off, the route answers 404.
+Serve the connector's MCP server at /v1/mcp and its skill at /v1/connector/skill. Off, both routes answer 404.
 
 ### `connector.allow_changes`
 

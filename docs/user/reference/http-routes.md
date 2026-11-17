@@ -41,6 +41,7 @@ The routes as the server's own OpenAPI document lists them: a route cannot exist
 
 | Method | Path | What it does |
 |---|---|---|
+| GET | `/v1/connector/skill` | The ignis skill, as a tar.gz |
 | POST | `/v1/mcp` | The connector's MCP server |
 
 ## decide

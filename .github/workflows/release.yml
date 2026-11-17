@@ -289,6 +289,15 @@ jobs:
           npm run typecheck
           npm run test
 
+      # The skill's scripts (spec #656) are plain Node with no dependencies,
+      # so the Node set up above runs their tests as they are: no `npm ci`.
+      # `node --test` from inside the folder, since Node 22 reads a directory
+      # argument as a module to run, not a folder to search.
+      - name: Skill script tests
+        if: matrix.host == 'linux' && matrix.shard == 1
+        working-directory: connector
+        run: node --test
+
   # The workspace compiles on a Mac (GitHub #496): arm64, the hardware a Metal
   # backend would run on (#439). macOS is not a target, so this checks and
   # runs nothing -- libraries, binaries, tests and examples compile without

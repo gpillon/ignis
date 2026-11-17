@@ -1257,6 +1257,7 @@ dependencies = [
  "arc-swap",
  "axum",
  "cloudflare-quick-tunnel",
+ "flate2",
  "futures-core",
  "futures-util",
  "getrandom 0.3.4",

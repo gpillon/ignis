@@ -263,6 +263,9 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         // Spec #656: the connector's MCP server, for a coding agent's
         // harness.
         .routes(routes!(crate::connector::mcp))
+        // Its skill, the archive of the scripts that handle files on the
+        // harness's side.
+        .routes(routes!(crate::connector::skill::skill))
         .route("/v1/models", options(cors_preflight))
         .route("/v1/models/switch", options(cors_preflight))
         .route("/v1/models/catalog", options(cors_preflight))
@@ -385,7 +388,10 @@ async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: 
     // Spec #656: the connector's MCP server answers `initialize` and
     // `tools/list` through a switch and a warm-up; each tool's call meets
     // this gate on its own route.
-    let connector_route = req.uri().path() == crate::connector::PATH;
+    // The skill's archive is a static file of the build: no model state
+    // changes it either.
+    let connector_route = req.uri().path() == crate::connector::PATH
+        || (req.method() == axum::http::Method::GET && req.uri().path() == crate::connector::skill::PATH);
     if switch_route || static_route || speech_route || connector_route || req.method() == axum::http::Method::OPTIONS {
         return next.run(req).await;
     }
@@ -4756,6 +4762,8 @@ mod tests {
             // The connector's MCP server: each tool's call is a request of
             // its own route, counted there (spec #656).
             ("POST", "/v1/mcp"),
+            // The skill's archive, a static file of the build.
+            ("GET", "/v1/connector/skill"),
         ];
         let (_, document) = v1_parts();
         let document = serde_json::to_value(&document).expect("the document serializes");

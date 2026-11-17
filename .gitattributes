@@ -58,3 +58,8 @@ crates/server/tests/fixtures/audio/*.m4a binary
 crates/server/tests/fixtures/audio/*.ogg binary
 crates/server/tests/fixtures/audio/*.mka binary
 crates/server/tests/fixtures/audio/*.webm binary
+
+# The skill ignis serves (spec #656) is packed into the binary byte for byte:
+# a CRLF checkout on a Windows host would pack different bytes than Linux does.
+connector/ignis/** text eol=lf
+connector/*.mjs text eol=lf

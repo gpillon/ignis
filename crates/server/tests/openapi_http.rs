@@ -117,6 +117,8 @@ fn the_document_lists_exactly_the_v1_surface() {
         "get /v1/realtime",
         // Spec #656: the connector's MCP server.
         "post /v1/mcp",
+        // Spec #656: its skill, a tar.gz of the scripts for the harness's shell.
+        "get /v1/connector/skill",
     ]
     .into_iter()
     .map(str::to_owned)
