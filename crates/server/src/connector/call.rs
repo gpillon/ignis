@@ -32,8 +32,12 @@ pub(crate) async fn call(
         Ok(request) => request,
         Err(refused) => return CallToolResult::error(vec![ContentBlock::text(refused)]),
     };
-    let response = routes.clone().oneshot(request).await.unwrap_or_else(|never| match never {});
-    answer(response).await
+    answer(send(routes, request).await).await
+}
+
+/// `request`, sent in process through `routes`: the route's answer.
+pub(crate) async fn send(routes: &Router, request: Request<Body>) -> Response {
+    routes.clone().oneshot(request).await.unwrap_or_else(|never| match never {})
 }
 
 /// The request a call of `tool` sends: the fixed query, then the arguments,

@@ -161,7 +161,9 @@ rather than replacing the file:
 
 - A call is cut after `toolCallTimeoutMs`, 60,000 ms by default, and nothing
   extends it.
-- It shows a result's text only: what the connector answers is all text.
+- It shows a result's text only: what the connector answers is all text,
+  but for `generate_image`'s preview, which reaches the model only when its
+  configuration declares image input.
 - It is not part of the connector's gate: the entry is read from its source,
   and its own guide may say more.
 
@@ -205,10 +207,61 @@ in the group and named. A group that does not exist, or a name that is no
 visible field (a hidden field's key counts as unknown), is `400 config_invalid`
 naming it, and nothing else is answered.
 
+### Images: `generate_image`
+
+Makes one image from `prompt`, at an optional `size` (one of `image.sizes`,
+or `auto`), and shows the agent a preview of it. It calls
+[`POST /v1/images/generations`](../api/images.md), naming the image model the
+catalog has on disk, so the agent never needs its id. It is not read-only.
+
+The result is the image first, a PNG preview whose longest edge is at most
+512 px (an image within that is shown at its own size), then one line of
+text: the size made, that this is a preview and is not kept, and that the
+skill's `generate-image` script saves an image at full size to a file.
+
+**The cost.** The card holds one model at a time, so the call switches from
+the text model to the image model, about 10 s, and the agent's next turn,
+which names its own model, switches back by the
+[implicit switch](../api/model-switching.md), about 11 s more. No tool
+switches back. Meanwhile every other client is answered
+`503 model_switching`, and the text model's prompt state is lost: the next
+turn prefills the conversation again
+([prompt reuse](../concepts/kv-cache-and-prompt-reuse.md)). With
+`switch.allow_implicit` off the image route answers `404 model_not_found`,
+and the tool passes it on.
+
+**Seeing the preview** needs vision on in the text model the agent runs on
+([`vision.enabled`](../configuration/vision.md)). qwen-code and DeepSeek
+Harness pass a tool's image to the model only when the harness's
+configuration of the model declares image input; otherwise the model reads
+the line of text alone. With vision off, a harness that passes the image on
+sends it back with each later turn, and ignis refuses those turns
+`vision_disabled`.
+
+**The vision budget.** The harness keeps each preview in its history and sends
+it back every turn. One merged vision token covers 32 x 32 pixels, so a
+512 x 512 preview is 256 tokens, and every image of a request together is
+held to [`vision.max_tokens`](../reference/configuration.md#visionmax_tokens),
+32,768 by default. Past it the request is refused `media_budget_exceeded`. A
+session that makes many images raises it, with `PATCH /v1/config` (it
+reloads the model) or at start.
+
+**No image model on disk.** The tool answers `404 model_not_found`, naming
+the command that fetches it, `ignis-server model download ignis-image-2.1-turbo`,
+run where the server runs, and the tool `download_model` when it is listed.
+On a card that cannot load the image model, the error says why instead.
+
+**Licence.** The image model's weights are under the **Qwen Research
+License: non-commercial use only**, with a "Built with Qwen" notice. Do not
+serve the image model in a commercial product
+([Images](../api/images.md)).
+
 ## Results and errors
 
 A tool's result is the route's answer as text in the result's `content`: the
-one part of a result every harness shows its model. Nothing goes in
+one part of a result every harness shows its model. `generate_image`'s is
+its preview and one line of text instead, as its section above says.
+Nothing goes in
 `structuredContent`, which DeepSeek Harness never shows, and no embedded
 resource, which it drops.
 

@@ -8,6 +8,7 @@
 //! the catalog as text, a refused route coming back as a tool error with the
 //! server's own JSON and `Retry-After`, the key, and `connector.enabled`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,10 +16,14 @@ use std::time::{Duration, Instant};
 use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use http_body_util::BodyExt;
+use ignis_artifact::vision::ProcessorOptions;
+use ignis_core::image::ImageSize;
 use ignis_server::config::file::RealFiles;
 use ignis_server::config::{resolve_with, ApiKey, Config, ConfigOutcome};
 use ignis_server::config_http::ConfigState;
-use ignis_server::model_switch::Switcher;
+use ignis_server::download::Catalog;
+use ignis_server::media::{MediaAcquirer, MediaPolicy};
+use ignis_server::model_switch::{CatalogModels, Switcher};
 use ignis_server::Server;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -26,6 +31,9 @@ use tower::ServiceExt;
 #[path = "support/switch.rs"]
 mod switch_support;
 use switch_support::MockLoader;
+
+#[path = "support/media.rs"]
+mod media;
 
 const PATIENT: Duration = Duration::from_secs(30);
 const KEY: &str = "sk-connector-test";
@@ -178,6 +186,12 @@ async fn initialize_answers_ignis_with_its_instructions() {
     assert!(instructions.len() < 1024, "{} bytes: {instructions}", instructions.len());
     let first_line = instructions.lines().next().unwrap();
     assert!(first_line.starts_with("ignis") && first_line.contains("inference server"), "{first_line}");
+    // An image's cost: the switching, `503` for other clients meanwhile, and
+    // vision to see it.
+    let image = instructions.lines().find(|line| line.starts_with("generate_image")).expect("the image's line");
+    for cost in ["20 s", "503", "vision"] {
+        assert!(image.contains(cost), "{cost}: {image}");
+    }
 
     // The harness's acknowledgement is accepted and answered nothing.
     let initialized = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
@@ -222,11 +236,23 @@ async fn the_tool_list_is_the_same_bytes_through_a_switch_a_patch_and_whatever_m
     let listed: Value = serde_json::from_slice(&before).unwrap();
     let tools = listed["result"]["tools"].as_array().expect("tools");
     let names: Vec<&str> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["describe_config", "read_catalog", "read_config"]);
-    let catalog = &tools[1];
+    assert_eq!(names, ["describe_config", "generate_image", "read_catalog", "read_config"]);
+    let catalog = &tools[2];
     assert_eq!(catalog["annotations"], json!({ "readOnlyHint": true, "destructiveHint": false }));
     assert_eq!(catalog["inputSchema"], json!({ "type": "object", "properties": {} }));
     assert!(!catalog["description"].as_str().unwrap().is_empty());
+    // Spec #656: `generate_image` changes what the server has loaded, so it
+    // is not read-only; it takes a prompt and, optionally, a size.
+    let image = &tools[1];
+    assert_eq!(image["annotations"], json!({ "readOnlyHint": false, "destructiveHint": false }));
+    assert_eq!(image["inputSchema"]["required"], json!(["prompt"]));
+    let mut inputs: Vec<&String> = image["inputSchema"]["properties"].as_object().expect("properties").keys().collect();
+    inputs.sort();
+    assert_eq!(inputs, ["prompt", "size"]);
+    let description = image["description"].as_str().unwrap();
+    for cost in ["503", "vision", "generate-image"] {
+        assert!(description.contains(cost), "{cost}: {description}");
+    }
 
     // A switch held in its load: `/v1/mcp` answers, a chat request is held.
     let release = loader.hold_next_load();
@@ -427,4 +453,172 @@ async fn describe_config_asks_by_group_or_names_and_requires_one() {
     assert_eq!(result["isError"], true, "{result}");
     let error: Value = serde_json::from_str(&text_of(&result)).unwrap();
     assert_eq!(error["error"]["code"], "config_invalid", "{error}");
+}
+
+// ── generate_image ───────────────────────────────────────────────────────
+
+/// The image model's served id: its family's own, the built-in catalog's
+/// image entry.
+const IMAGE: &str = "ignis-image-2.1-turbo";
+
+fn acquirer() -> Arc<MediaAcquirer> {
+    let limits = ProcessorOptions {
+        min_pixels: 32 * 32,
+        max_pixels: 1 << 20,
+        max_encoded_media_bytes: 256 << 20,
+        max_decoded_pixels: 1 << 24,
+        max_raw_patches: 1 << 17,
+        max_vision_tokens: 1 << 15,
+    };
+    Arc::new(MediaAcquirer::new(Arc::new(media::processor(limits.clone())), limits, MediaPolicy::new(false, 0)))
+}
+
+/// A server on `mock-a` with vision on, its catalog the built-in one over an
+/// empty `download.path`: the ids in `on_disk` are on disk at the mock's
+/// artifact, so the image entry is `complete` when it is one of them. With
+/// `implicit`, a request naming one of them switches to it
+/// (`switch.allow_implicit`); without, only a switch by id does. It makes
+/// two image sizes, one past 512 px and one within.
+fn image_server(test: &str, on_disk: &[&str], implicit: bool) -> (Arc<MockLoader>, Server) {
+    let loader = MockLoader::new();
+    loader.vision("mock-a", acquirer());
+    let table: BTreeMap<String, PathBuf> = on_disk.iter().map(|id| (id.to_string(), switch_support::source(id).artifact)).collect();
+    let dir = std::env::temp_dir().join(format!("ignis-connector-http-{test}-models-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let catalog = CatalogModels { catalog: Arc::new(Catalog::built_in().clone()), dir };
+    let switcher = Switcher::new(Arc::clone(&loader) as _, PATIENT).with_catalog(catalog, implicit);
+    let switcher = if implicit { switcher.with_known_models(table) } else { switcher.with_listed_models(table) };
+    let server = Server::from_active(loader.model("mock-a")).with_switcher(switcher);
+    server.update_live(|live| live.image.sizes = vec![ImageSize::new(1024, 640), ImageSize::new(256, 128)]);
+    (loader, server)
+}
+
+/// `generate_image`'s `result` for `arguments`.
+async fn generate(app: &axum::Router, arguments: Value, key: Option<&str>) -> Value {
+    rpc(app, "tools/call", json!({ "name": "generate_image", "arguments": arguments }), key).await
+}
+
+fn unbase64(text: &str) -> Vec<u8> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        b'/' => 63,
+        _ => panic!("not base64: {c}"),
+    };
+    let mut out = Vec::new();
+    for chunk in text.as_bytes().chunks(4) {
+        let digits: Vec<u8> = chunk.iter().filter(|&&c| c != b'=').map(|&c| value(c)).collect();
+        let n = digits.iter().enumerate().fold(0u32, |n, (i, &d)| n | u32::from(d) << (18 - 6 * i));
+        out.extend((0..digits.len() - 1).map(|i| (n >> (16 - 8 * i)) as u8));
+    }
+    out
+}
+
+/// The width and height of a result's image block, a PNG.
+fn image_size(block: &Value) -> (u32, u32) {
+    assert_eq!(block["type"], "image", "{block}");
+    assert_eq!(block["mimeType"], "image/png", "{block}");
+    let reader = png::Decoder::new(std::io::Cursor::new(unbase64(block["data"].as_str().unwrap()))).read_info().expect("a PNG");
+    (reader.info().width, reader.info().height)
+}
+
+/// Spec #656: with vision on, `generate_image` answers the image first, a
+/// PNG preview whose longest edge is at most 512 px and never enlarged, then
+/// one line of text: the size made, that this is a preview, and the skill's
+/// `generate-image` script for the full size. The prompt reaches the image
+/// model as sent.
+#[tokio::test]
+async fn generate_image_answers_a_preview_of_at_most_512_px_and_one_line_of_text() {
+    let (loader, server) = image_server("preview", &[IMAGE, "mock-a"], true);
+    let app = server.app();
+    let result = generate(&app, json!({ "prompt": "a red fox in the snow", "size": "1024x640" }), None).await;
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let content = result["content"].as_array().expect("content");
+    assert_eq!(content.len(), 2, "{result}");
+    assert_eq!(image_size(&content[0]), (512, 320));
+    assert_eq!(content[1]["type"], "text", "{result}");
+    let line = content[1]["text"].as_str().unwrap();
+    assert_eq!(line.lines().count(), 1, "{line}");
+    for said in ["1024x640", "512x320", "preview", "generate-image"] {
+        assert!(line.contains(said), "{said}: {line}");
+    }
+    assert_eq!(loader.encoded_prompts(), ["a red fox in the snow"]);
+
+    // An image within 512 px is shown at its own size.
+    let result = generate(&app, json!({ "prompt": "a small fox", "size": "256x128" }), None).await;
+    let content = result["content"].as_array().expect("content");
+    assert_eq!(image_size(&content[0]), (256, 128), "{result}");
+    assert!(content[1]["text"].as_str().unwrap().contains("256x128"), "{result}");
+}
+
+/// A chat turn naming `model`, sent with `key`, as a harness's next turn.
+async fn chat_turn(app: &axum::Router, model: &str, key: &str) -> (StatusCode, Value) {
+    let body = json!({ "model": model, "messages": [{ "role": "user", "content": "what did you draw?" }], "max_tokens": 3 });
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {key}"));
+    let (status, _, bytes) = exchange(app, request.body(Body::from(body.to_string())).unwrap()).await;
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// Spec #656: `generate_image` reads the catalog and names the image model
+/// it has on disk, with the caller's key, so the server switches to it (a
+/// request naming no model is refused by a text model). No tool switches
+/// back: the agent's next chat turn names its own model, and the implicit
+/// switch returns to it.
+#[tokio::test]
+async fn generate_image_names_the_catalogs_image_model_and_the_next_chat_turn_switches_back() {
+    let (loader, server) = image_server("switch-back", &[IMAGE, "mock-a"], true);
+    let app = server.clone().with_api_key(ApiKey::new(KEY)).app();
+    let result = generate(&app, json!({ "prompt": "a lighthouse at dusk", "size": "1024x640" }), Some(KEY)).await;
+    assert_ne!(result["isError"], json!(true), "{result}");
+    assert_eq!(loader.loads(), [IMAGE]);
+    assert_eq!(server.active().model_id(), IMAGE);
+
+    let (status, answer) = chat_turn(&app, "mock-a", KEY).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["model"], "mock-a");
+    assert_eq!(loader.loads(), [IMAGE, "mock-a"]);
+    assert_eq!(server.active().model_id(), "mock-a");
+}
+
+/// Spec #656: with no image model on disk, `generate_image` is the tool's
+/// error, the server's `model_not_found`, naming the command that fetches
+/// the catalog's image model (and not `download_model`, which is not
+/// listed); nothing loads.
+#[tokio::test]
+async fn without_the_image_model_on_disk_generate_image_names_its_download() {
+    let (loader, server) = image_server("absent", &["mock-a"], true);
+    let app = server.app();
+    let result = generate(&app, json!({ "prompt": "a lighthouse at dusk" }), None).await;
+    assert_eq!(result["isError"], true, "{result}");
+    let content = result["content"].as_array().expect("content");
+    assert_eq!(content.len(), 1, "{result}");
+    let error: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(error["error"]["code"], "model_not_found", "{error}");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("`ignis-server model download {IMAGE}`")), "{message}");
+    assert!(!message.contains("download_model"), "{message}");
+    assert!(loader.loads().is_empty());
+    assert_eq!(server.active().model_id(), "mock-a");
+}
+
+/// Spec #656: with `switch.allow_implicit` off, the image route refuses the
+/// image model by name, `404`, and `generate_image` passes that answer on
+/// as its error, word for word; nothing loads.
+#[tokio::test]
+async fn with_implicit_switching_off_generate_image_passes_the_servers_404_on() {
+    let (loader, server) = image_server("implicit-off", &[IMAGE, "mock-a"], false);
+    let app = server.app();
+    let result = generate(&app, json!({ "prompt": "a lighthouse at dusk" }), None).await;
+    assert_eq!(result["isError"], true, "{result}");
+    let error: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    let (status, direct) = send(&app, Method::POST, "/v1/images/generations", json!({ "model": IMAGE, "prompt": "a lighthouse at dusk" })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{direct}");
+    assert_eq!(error, direct);
+    assert!(loader.loads().is_empty());
 }

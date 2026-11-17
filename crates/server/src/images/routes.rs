@@ -416,6 +416,23 @@ Prompt enhancement (`prompt_enhancement: true`, or `image.prompt_enhancement` wh
         (status = 503, description = "The queue is full (`engine_full`, with `Retry-After`); a model switch is under way (`model_switching`, with `Retry-After`) or did not land (`model_switch_failed`, also when a prompt enhancement visit could not switch back to the image model); the image model was stopped before the job finished (`model_stopped`, with `Retry-After`); or the model was unloaded while idle and loading it again failed (`model_load_failed`); or the server began to stop while the request waited for a switch or a load (`server_stopping`, with `Retry-After`).", body = ApiError),
         (status = 504, description = "The job ran past `--server-request-timeout` from its start (`request_timeout`), whatever `--server-timeout-reply` says: an image cut short is no image.", body = ApiError),
     ),
+    // Spec #656: the connector's `generate_image`, whose call names the
+    // catalog's image model and answers a preview (`crate::connector::image`).
+    extensions(("x-ignis-tool" = json!({
+        "name": "generate_image",
+        "description": "Make one image from a prompt with ignis's image model, and see a preview of it, at most 512 px on its longest edge. Seeing it needs vision on in the model you run on. It is costly: the server switches from your model to the image model, about 10 s, and back on your next turn, about 11 s; the prompt state is lost, and other clients are answered 503 meanwhile. Call it when an image is asked for. To save an image to a file at full size, use the ignis skill's generate-image script instead.",
+        "read_only": false,
+        "destructive": false,
+        "input": {
+            "type": "object",
+            "properties": {
+                "prompt": { "type": "string", "description": "What the image shows." },
+                "size": { "type": "string", "description": "`<width>x<height>`, one of the server's image.sizes (1024x1024 and 2048x2048 among the defaults), or `auto` (the default)." },
+            },
+            "required": ["prompt"],
+            "additionalProperties": false,
+        },
+    }))),
 )]
 pub(crate) async fn create_image(State(server): State<Arc<Server>>, Json(fields): Json<GenerationRequest>) -> Response {
     let request = match checked(fields, &server.live().image) {
