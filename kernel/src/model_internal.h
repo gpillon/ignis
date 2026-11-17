@@ -14,6 +14,7 @@
 #include "prefill_swiglu.h"
 #include "rope_scaling.h"
 #include "tma_descriptor_cache.h"
+#include "w4a4_activation_layout.h"
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
@@ -551,6 +552,13 @@ struct ignis_model {
   // `stream` (kernel/src/tma_descriptor_cache.h; the plan line
   // `tma_descriptor_bytes`); null where the load plans none.
   std::unique_ptr<ignis::tma_descriptors::Cache> tma_descriptors;
+  // GitHub #652 (spec #646): the layout the W4A4 prefill products read their
+  // activations in (enum ignis_w4a4_activation_layout), decided once at load
+  // (model.cu `w4a4_activation_layout_route`), and that layout named for
+  // `stream` (kernel/src/w4a4_activation_layout.h), which every launcher of the
+  // products asks; null with IGNIS_W4A4_ACTIVATION_LAYOUT_NONE.
+  uint32_t w4a4_activation_layout = IGNIS_W4A4_ACTIVATION_LAYOUT_NONE;
+  std::unique_ptr<ignis::w4a4_activation_layout::ForStream> w4a4_activation_layout_stream;
   // GitHub #514: the GDN prefill's route, decided once at load (model.cu
   // `gdn_prefill_route`): our full-rate kernels (kernel/src/gdn_prefill.h)
   // when true, the vendored chunked ones otherwise; read by every GDN

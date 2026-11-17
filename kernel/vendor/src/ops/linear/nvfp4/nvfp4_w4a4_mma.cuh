@@ -406,4 +406,33 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_w4a4_quantize_ke
     scales[static_cast<std::int64_t>(token) * kGroupsPerRow + group] = quantized.scale;
 }
 
+// ignis (GitHub #652, spec #646): nvfp4_w4a4_quantize_kernel's quantization, written K-tile-major
+// for the TMA products (Nvfp4W4a4ActivationLayout::KTileMajor, nvfp4_w4a4_plan.h): the 8 code
+// bytes of 16-wide group `group` of a token go to K tile group / 8, at byte (group % 8) * 8 of
+// the token's 64, and its scale to the pair of K tiles group / 16, at byte group % 16 of the
+// token's 16.
+template <class Geometry, int Threads = 256>
+__global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_w4a4_quantize_k_tile_kernel(
+    const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
+    std::uint8_t* __restrict__ scales, std::int32_t tokens, float input_scale_divisor) {
+    static_assert(Threads == 128 || Threads == 256 || Threads == 512);
+    static_assert(Geometry::kInputRows % 256 == 0);
+    constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
+    const int task =
+        static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+    const int tasks = tokens * kGroupsPerRow;
+    if (task >= tasks) { return; }
+
+    const int token                   = task / kGroupsPerRow;
+    const int group                   = task - token * kGroupsPerRow;
+    const Nvfp4QuantizedK16 quantized = quantize_nvfp4_k16(
+        input + static_cast<std::int64_t>(token) * Geometry::kInputRows + group * 16,
+        input_scale_divisor);
+    auto* code_destination =
+        codes + (static_cast<std::int64_t>(group / 8) * tokens + token) * 64 + (group % 8) * 8;
+    store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));
+    scales[(static_cast<std::int64_t>(group / 16) * tokens + token) * 16 + group % 16] =
+        quantized.scale;
+}
+
 } // namespace ninfer::ops::detail

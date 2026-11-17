@@ -39,12 +39,15 @@ void launch_gemm(const Weight& weight, Tensor& qkv, Tensor& z, Nvfp4W4a4Workspac
 
 void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                  Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
+    // ignis (GitHub #652): the layout the TMA product below reads, as its quantizer wrote it.
+    const Nvfp4W4a4ActivationLayout layout =
+        launch_nvfp4_w4a4_quantize_for_products(x, weight, workspace, stream);
     const std::int32_t tokens = x.ne[1];
     if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_gdn(
-            workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+            workspace.codes, workspace.scales, layout,
+            static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(qkv.data),
             static_cast<__nv_bfloat16*>(z.data), tokens, alpha, stream);
     } else if (tokens == 4) {

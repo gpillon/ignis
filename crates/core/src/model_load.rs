@@ -241,6 +241,8 @@ pub(crate) mod ffi {
 
         pub fn ignis_model_prefill_swiglu(model: *const IgnisModel) -> u32;
 
+        pub fn ignis_model_w4a4_activation_layout(model: *const IgnisModel) -> u32;
+
         pub fn ignis_model_vision_item_max_tokens(model: *const IgnisModel) -> u32;
 
         pub fn ignis_model_free(model: *mut IgnisModel);
@@ -300,6 +302,17 @@ impl Model {
         let code = unsafe { ffi::ignis_model_prefill_swiglu(self.handle) };
         crate::PrefillSwiglu::from_abi(code)
             .unwrap_or_else(|unknown| panic!("ignis_model_prefill_swiglu: unknown route {unknown}"))
+    }
+
+    /// The layout this load's W4A4 prefill products read their activations
+    /// in (GitHub #652), as the leaf decided it at load: K-tile-major where
+    /// the prefill runs the W4A4 TMA route, token-major there under
+    /// `IGNIS_W4A4_ACTIVATION_LAYOUT=token`; `None` on a load whose prefill
+    /// runs no such product.
+    pub fn w4a4_activation_layout(&self) -> Option<crate::W4a4ActivationLayout> {
+        let code = unsafe { ffi::ignis_model_w4a4_activation_layout(self.handle) };
+        crate::W4a4ActivationLayout::from_abi(code)
+            .unwrap_or_else(|unknown| panic!("ignis_model_w4a4_activation_layout: unknown layout {unknown}"))
     }
 
     /// The most merged tokens one media item may hold on this load (GitHub

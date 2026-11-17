@@ -93,9 +93,13 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
                 const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
                 std::int32_t tokens, float alpha, Epilogue epilogue, Output output,
                 cudaStream_t stream) {
+    // ignis (GitHub #652): a schedule reading K-tile-major activations has descriptors of its own.
     const Nvfp4W4a4TmaDescriptors descriptors =
-        make_nvfp4_w4a4_tma_descriptors<Geometry, Schedule::kBlockM>(
-            activation_codes, activation_scales, weight_codes, weight_scales, tokens);
+        Schedule::kKTileActivations
+            ? make_nvfp4_w4a4_tma_k_tile_descriptors<Geometry, Schedule::kBlockM>(
+                  activation_codes, activation_scales, weight_codes, weight_scales, tokens)
+            : make_nvfp4_w4a4_tma_descriptors<Geometry, Schedule::kBlockM>(
+                  activation_codes, activation_scales, weight_codes, weight_scales, tokens);
     constexpr std::size_t kSharedBytes = sizeof(Nvfp4W4a4TmaSharedStorage<Schedule>);
     static const bool kConfigured      = [] {
         CUDA_CHECK(cudaFuncSetAttribute(nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>,
@@ -129,95 +133,126 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ignis (GitHub #652): launch_tma on `Schedule` reading the activations as `activation_layout`
+// says their quantizer wrote them: K-tile-major on the schedule's K-tile-major twin.
+template <class Geometry, class Schedule, class Epilogue, class Output>
+void launch_tma_reading(Nvfp4W4a4ActivationLayout activation_layout,
+                        const std::uint8_t* activation_codes,
+                        const std::uint8_t* activation_scales, const std::uint8_t* weight_codes,
+                        const std::uint8_t* weight_scales, std::int32_t tokens, float alpha,
+                        Epilogue epilogue, Output output, cudaStream_t stream) {
+    if (activation_layout == Nvfp4W4a4ActivationLayout::KTileMajor) {
+        launch_tma<Geometry, Nvfp4W4a4KTileSchedule<Schedule>>(
+            activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
+            epilogue, output, stream);
+        return;
+    }
+    launch_tma<Geometry, Schedule>(activation_codes, activation_scales, weight_codes,
+                                   weight_scales, tokens, alpha, epilogue, output, stream);
+}
+
 template <class Geometry>
 void launch_linear(const std::uint8_t* activation_codes, const std::uint8_t* activation_scales,
-                   const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
-                   __nv_bfloat16* output, std::int32_t tokens, float alpha, cudaStream_t stream) {
-    launch_tma<Geometry, TmaM256N128>(activation_codes, activation_scales, weight_codes,
-                                      weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
-                                      Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, stream);
+                   Nvfp4W4a4ActivationLayout activation_layout, const std::uint8_t* weight_codes,
+                   const std::uint8_t* weight_scales, __nv_bfloat16* output, std::int32_t tokens,
+                   float alpha, cudaStream_t stream) {
+    launch_tma_reading<Geometry, TmaM256N128>(
+        activation_layout, activation_codes, activation_scales, weight_codes, weight_scales,
+        tokens, alpha, Nvfp4IdentityEpilogue{},
+        Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, stream);
 }
 
 } // namespace
 
 void launch_nvfp4_w4a4_tma_linear(Nvfp4Problem problem, const std::uint8_t* activation_codes,
                                   const std::uint8_t* activation_scales,
+                                  Nvfp4W4a4ActivationLayout activation_layout,
                                   const std::uint8_t* weight_codes,
                                   const std::uint8_t* weight_scales, __nv_bfloat16* output,
                                   std::int32_t tokens, float alpha, cudaStream_t stream) {
     switch (problem) {
     case Nvfp4Problem::AttnInput:
-        launch_linear<Nvfp4AttnInputGeometry>(activation_codes, activation_scales, weight_codes,
-                                              weight_scales, output, tokens, alpha, stream);
+        launch_linear<Nvfp4AttnInputGeometry>(activation_codes, activation_scales,
+                                              activation_layout, weight_codes, weight_scales,
+                                              output, tokens, alpha, stream);
         return;
     case Nvfp4Problem::GdnInput:
-        launch_linear<Nvfp4GdnInputGeometry>(activation_codes, activation_scales, weight_codes,
-                                             weight_scales, output, tokens, alpha, stream);
+        launch_linear<Nvfp4GdnInputGeometry>(activation_codes, activation_scales, activation_layout,
+                                             weight_codes, weight_scales, output, tokens, alpha,
+                                             stream);
         return;
     case Nvfp4Problem::MlpGateUp:
-        launch_tma<Nvfp4MlpGateUpGeometry, TmaM256N128S2>(
-            activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
-            Nvfp4IdentityEpilogue{},
+        launch_tma_reading<Nvfp4MlpGateUpGeometry, TmaM256N128S2>(
+            activation_layout, activation_codes, activation_scales, weight_codes, weight_scales,
+            tokens, alpha, Nvfp4IdentityEpilogue{},
             Nvfp4ContiguousOutput{output, Nvfp4MlpGateUpGeometry::kOutputRows}, stream);
         return;
     case Nvfp4Problem::Residual6144:
-        launch_linear<Nvfp4Residual6144Geometry>(activation_codes, activation_scales, weight_codes,
-                                                 weight_scales, output, tokens, alpha, stream);
+        launch_linear<Nvfp4Residual6144Geometry>(activation_codes, activation_scales,
+                                                 activation_layout, weight_codes, weight_scales,
+                                                 output, tokens, alpha, stream);
         return;
     case Nvfp4Problem::Residual17408:
-        launch_linear<Nvfp4Residual17408Geometry>(activation_codes, activation_scales, weight_codes,
-                                                  weight_scales, output, tokens, alpha, stream);
+        launch_linear<Nvfp4Residual17408Geometry>(activation_codes, activation_scales,
+                                                  activation_layout, weight_codes, weight_scales,
+                                                  output, tokens, alpha, stream);
         return;
     }
 }
 
 void launch_nvfp4_w4a4_tma_attention(const std::uint8_t* activation_codes,
                                      const std::uint8_t* activation_scales,
+                                     Nvfp4W4a4ActivationLayout activation_layout,
                                      const std::uint8_t* weight_codes,
                                      const std::uint8_t* weight_scales, __nv_bfloat16* query,
                                      __nv_bfloat16* gate, __nv_bfloat16* key, __nv_bfloat16* value,
                                      std::int32_t tokens, float alpha, cudaStream_t stream) {
-    launch_tma<Nvfp4AttnInputGeometry, TmaM256N128>(
-        activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
-        Nvfp4IdentityEpilogue{}, AttentionOutput{query, key, gate, value}, stream);
+    launch_tma_reading<Nvfp4AttnInputGeometry, TmaM256N128>(
+        activation_layout, activation_codes, activation_scales, weight_codes, weight_scales, tokens,
+        alpha, Nvfp4IdentityEpilogue{}, AttentionOutput{query, key, gate, value}, stream);
 }
 
 void launch_nvfp4_w4a4_tma_gdn(const std::uint8_t* activation_codes,
                                const std::uint8_t* activation_scales,
+                               Nvfp4W4a4ActivationLayout activation_layout,
                                const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
                                __nv_bfloat16* qkv, __nv_bfloat16* z, std::int32_t tokens,
                                float alpha, cudaStream_t stream) {
-    launch_tma<Nvfp4GdnInputGeometry, TmaM256N128>(
-        activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
-        Nvfp4IdentityEpilogue{}, Nvfp4GdnInputOutput{qkv, z}, stream);
+    launch_tma_reading<Nvfp4GdnInputGeometry, TmaM256N128>(
+        activation_layout, activation_codes, activation_scales, weight_codes, weight_scales, tokens,
+        alpha, Nvfp4IdentityEpilogue{}, Nvfp4GdnInputOutput{qkv, z}, stream);
 }
 
 template <class Geometry>
 void launch_linear_add(const std::uint8_t* activation_codes, const std::uint8_t* activation_scales,
+                       Nvfp4W4a4ActivationLayout activation_layout,
                        const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
                        __nv_bfloat16* residual, std::int32_t tokens, float alpha,
                        cudaStream_t stream) {
-    launch_tma<Geometry, TmaM256N128>(
-        activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
-        Nvfp4AddResidualEpilogue{residual, Geometry::kOutputRows},
+    launch_tma_reading<Geometry, TmaM256N128>(
+        activation_layout, activation_codes, activation_scales, weight_codes, weight_scales,
+        tokens, alpha, Nvfp4AddResidualEpilogue{residual, Geometry::kOutputRows},
         Nvfp4ContiguousOutput{residual, Geometry::kOutputRows}, stream);
 }
 
 void launch_nvfp4_w4a4_tma_linear_add(Nvfp4Problem problem, const std::uint8_t* activation_codes,
                                       const std::uint8_t* activation_scales,
+                                      Nvfp4W4a4ActivationLayout activation_layout,
                                       const std::uint8_t* weight_codes,
                                       const std::uint8_t* weight_scales, __nv_bfloat16* residual,
                                       std::int32_t tokens, float alpha, cudaStream_t stream) {
     switch (problem) {
     case Nvfp4Problem::Residual6144:
         launch_linear_add<Nvfp4Residual6144Geometry>(activation_codes, activation_scales,
-                                                     weight_codes, weight_scales, residual, tokens,
-                                                     alpha, stream);
+                                                     activation_layout, weight_codes,
+                                                     weight_scales, residual, tokens, alpha,
+                                                     stream);
         return;
     case Nvfp4Problem::Residual17408:
         launch_linear_add<Nvfp4Residual17408Geometry>(activation_codes, activation_scales,
-                                                      weight_codes, weight_scales, residual, tokens,
-                                                      alpha, stream);
+                                                      activation_layout, weight_codes,
+                                                      weight_scales, residual, tokens, alpha,
+                                                      stream);
         return;
     case Nvfp4Problem::AttnInput:
     case Nvfp4Problem::GdnInput:

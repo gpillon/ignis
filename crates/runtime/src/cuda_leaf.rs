@@ -715,6 +715,9 @@ impl StepLeaf for CudaLeaf {
         // GitHub #651: and the MLP gate and up product's, `fused` unless the
         // measurement switch IGNIS_PREFILL_SWIGLU names `split`, `none` on the
         // trellis body.
+        // GitHub #652: and the layout its W4A4 products read their activations
+        // in, `ktile` unless IGNIS_W4A4_ACTIVATION_LAYOUT=token, `none` where
+        // the prefill runs no such product.
         // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80).
         tracing::info!(
             name: "ignis.runtime.prefill_routes",
@@ -722,6 +725,7 @@ impl StepLeaf for CudaLeaf {
             prefill_attention = self.config.prefill_attention.as_str(),
             gdn_prefill = model.gdn_prefill().as_str(),
             prefill_swiglu = model.prefill_swiglu().map_or("none", |route| route.as_str()),
+            w4a4_activation_layout = model.w4a4_activation_layout().map_or("none", |layout| layout.as_str()),
             "prefill routes"
         );
         // GitHub #572 (spec #570): the attention route of the decode and

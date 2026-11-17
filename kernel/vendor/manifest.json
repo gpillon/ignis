@@ -310,7 +310,12 @@
     },
     {
       "path": "src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu",
-      "sha256": "b9371cc945e853bf105d745d715cdb124406b3f62c95ba7a9b5ea719829af9a0"
+      "sha256": "b9371cc945e853bf105d745d715cdb124406b3f62c95ba7a9b5ea719829af9a0",
+      "patch": {
+        "diff": "patches/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu.diff",
+        "sha256": "c2043d8f9c623d979c7b7a7fa2506f78eb1a14bbf8d04edd47c5750dd3b42619",
+        "reason": "ADR 0031 (GitHub #652, spec #646): the W4A4 TMA route reads its activations K-tile-major, codes [K/128][T][64 bytes] and scales [K/256][T][16 bytes], where upstream's are token-major; the weights, every narrower width and the gate and up's fused route keep upstream's layout, IGNIS_W4A4_ACTIVATION_LAYOUT=token (kernel/src/w4a4_activation_layout.h) gives upstream's back, and the products' output is bit-identical (ignis_kernel_w4a4_activation_layout_test). This file's launcher quantizes through launch_nvfp4_w4a4_quantize_for_products and hands the TMA product the layout it wrote. Measured on the RTX 5090 (spec #646): on the 27B's five prefill shapes the W4A4 TMA products are bound by the L2's tag lookups (76-89% of peak, the tensor pipe busy 67-81% of its active cycles), token-major activations reaching a 256-token tile as 256 pieces of 64 bytes per 128-wide slice of K and their scales as 256 pieces of 16; K-tile-major, the lookups fall 45%, the tensor pipe reaches 87-88% of its active cycles and the five products take 5.5-11.9% less per call in a served prefill."
+      }
     },
     {
       "path": "src/ops/common/bf16_vector.cuh",
@@ -430,7 +435,12 @@
     },
     {
       "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu",
-      "sha256": "3cd26fc71cb9d7ab06579c00a3759e08105374335a5c771960a28d82635bc441"
+      "sha256": "3cd26fc71cb9d7ab06579c00a3759e08105374335a5c771960a28d82635bc441",
+      "patch": {
+        "diff": "patches/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu.diff",
+        "sha256": "20f1d63d3cf05c5e4049f57c57715a1da762a0ad21e48db815190ecf083a9298",
+        "reason": "ADR 0031 (GitHub #652, spec #646): the W4A4 TMA route reads its activations K-tile-major, codes [K/128][T][64 bytes] and scales [K/256][T][16 bytes], where upstream's are token-major; the weights, every narrower width and the gate and up's fused route keep upstream's layout, IGNIS_W4A4_ACTIVATION_LAYOUT=token (kernel/src/w4a4_activation_layout.h) gives upstream's back, and the products' output is bit-identical (ignis_kernel_w4a4_activation_layout_test). This file's launcher quantizes through launch_nvfp4_w4a4_quantize_for_products and hands the TMA product the layout it wrote. Measured on the RTX 5090 (spec #646): on the 27B's five prefill shapes the W4A4 TMA products are bound by the L2's tag lookups (76-89% of peak, the tensor pipe busy 67-81% of its active cycles), token-major activations reaching a 256-token tile as 256 pieces of 64 bytes per 128-wide slice of K and their scales as 256 pieces of 16; K-tile-major, the lookups fall 45%, the tensor pipe reaches 87-88% of its active cycles and the five products take 5.5-11.9% less per call in a served prefill."
+      }
     },
     {
       "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode.cu",
@@ -1001,23 +1011,38 @@
     },
     {
       "path": "src/ops/linear/nvfp4/nvfp4_w4a4.cu",
-      "sha256": "00bb3da1a9cb0cdd600493671fb8dd0f1df171ea28e92984c26fdb893b85a4ca"
+      "sha256": "00bb3da1a9cb0cdd600493671fb8dd0f1df171ea28e92984c26fdb893b85a4ca",
+      "patch": {
+        "diff": "patches/src/ops/linear/nvfp4/nvfp4_w4a4.cu.diff",
+        "sha256": "c38b0f0055883e8394d82f8296e406f81af0f166058ec04a6315eab6f9939cd4",
+        "reason": "ADR 0031 (GitHub #652, spec #646): the W4A4 TMA route reads its activations K-tile-major, codes [K/128][T][64 bytes] and scales [K/256][T][16 bytes], where upstream's are token-major; the weights, every narrower width and the gate and up's fused route keep upstream's layout, IGNIS_W4A4_ACTIVATION_LAYOUT=token (kernel/src/w4a4_activation_layout.h) gives upstream's back, and the products' output is bit-identical (ignis_kernel_w4a4_activation_layout_test). This file defines launch_nvfp4_w4a4_quantize_for_products, K-tile-major on the TMA route's widths where the load running on the stream names it (ignis::w4a4_activation_layout::k_tile_major), token-major elsewhere, and launch_nvfp4_w4a4 quantizes through it and hands the TMA product the layout it wrote. Measured on the RTX 5090 (spec #646): on the 27B's five prefill shapes the W4A4 TMA products are bound by the L2's tag lookups (76-89% of peak, the tensor pipe busy 67-81% of its active cycles), token-major activations reaching a 256-token tile as 256 pieces of 64 bytes per 128-wide slice of K and their scales as 256 pieces of 16; K-tile-major, the lookups fall 45%, the tensor pipe reaches 87-88% of its active cycles and the five products take 5.5-11.9% less per call in a served prefill."
+      }
     },
     {
       "path": "src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh",
-      "sha256": "20d616588b536a7b02822a4a61f4f6b8e655e673db468064e1504de9c3f5b6c7"
+      "sha256": "20d616588b536a7b02822a4a61f4f6b8e655e673db468064e1504de9c3f5b6c7",
+      "patch": {
+        "diff": "patches/src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh.diff",
+        "sha256": "f94fe9bef96c84fe5336429f0b8ddd813aeb680b248ed5782dad6df3f2df1c41",
+        "reason": "ADR 0031 (GitHub #652, spec #646): the W4A4 TMA route reads its activations K-tile-major, codes [K/128][T][64 bytes] and scales [K/256][T][16 bytes], where upstream's are token-major; the weights, every narrower width and the gate and up's fused route keep upstream's layout, IGNIS_W4A4_ACTIVATION_LAYOUT=token (kernel/src/w4a4_activation_layout.h) gives upstream's back, and the products' output is bit-identical (ignis_kernel_w4a4_activation_layout_test). This file adds nvfp4_w4a4_quantize_k_tile_kernel, upstream's quantization written K-tile-major. Measured on the RTX 5090 (spec #646): on the 27B's five prefill shapes the W4A4 TMA products are bound by the L2's tag lookups (76-89% of peak, the tensor pipe busy 67-81% of its active cycles), token-major activations reaching a 256-token tile as 256 pieces of 64 bytes per 128-wide slice of K and their scales as 256 pieces of 16; K-tile-major, the lookups fall 45%, the tensor pipe reaches 87-88% of its active cycles and the five products take 5.5-11.9% less per call in a served prefill."
+      }
     },
     {
       "path": "src/ops/linear/nvfp4/nvfp4_w4a4_plan.h",
-      "sha256": "5a7780c70c7dabf9e1bbdb9e5fd9d6e4ab243125ff728fa224d72d2d807a70b5"
+      "sha256": "5a7780c70c7dabf9e1bbdb9e5fd9d6e4ab243125ff728fa224d72d2d807a70b5",
+      "patch": {
+        "diff": "patches/src/ops/linear/nvfp4/nvfp4_w4a4_plan.h.diff",
+        "sha256": "a44e3321e50523072698c7815c8632c8e8414571c7965b29262c21994449f4a9",
+        "reason": "ADR 0031 (GitHub #652, spec #646): the W4A4 TMA route reads its activations K-tile-major, codes [K/128][T][64 bytes] and scales [K/256][T][16 bytes], where upstream's are token-major; the weights, every narrower width and the gate and up's fused route keep upstream's layout, IGNIS_W4A4_ACTIVATION_LAYOUT=token (kernel/src/w4a4_activation_layout.h) gives upstream's back, and the products' output is bit-identical (ignis_kernel_w4a4_activation_layout_test). This file names the layout (Nvfp4W4a4ActivationLayout) and declares launch_nvfp4_w4a4_quantize_for_products, the quantizer the products take, which returns the layout it wrote. Measured on the RTX 5090 (spec #646): on the 27B's five prefill shapes the W4A4 TMA products are bound by the L2's tag lookups (76-89% of peak, the tensor pipe busy 67-81% of its active cycles), token-major activations reaching a 256-token tile as 256 pieces of 64 bytes per 128-wide slice of K and their scales as 256 pieces of 16; K-tile-major, the lookups fall 45%, the tensor pipe reaches 87-88% of its active cycles and the five products take 5.5-11.9% less per call in a served prefill."
+      }
     },
     {
       "path": "src/ops/linear/nvfp4/nvfp4_w4a4_tma.cu",
       "sha256": "07be8cb501141ba31dbf8b7c6b69d269d82e66a598940278d706a05e430f7054",
       "patch": {
         "diff": "patches/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cu.diff",
-        "sha256": "5f5289b27a5f1e7cb9801c1a0c62e5c72b1f151e84d7b8e5edad24931a274836",
-        "reason": "ADR 0031 (GitHub #650, spec #646): on Windows, where the W4A4 TMA kernels take their tensor maps through a pointer, the launcher first asks ignis's per-load descriptor slots (kernel/src/tma_descriptor_cache.h, ignis::tma_descriptors::device_copy) for a resident device copy of the block and launches on it; only where that answers null (no load's slots serve the stream, a graph capture, a block wider than a slot) does it keep upstream's pool allocation, pageable copy and free before the product. Linux passes the block by value and is unchanged. Output bit-identical (ignis_kernel_tma_descriptor_cache_test). Measured on the RTX 5090 (spec #646's prototype): the allocate, copy and free ran 247 times per 27B prefill chunk, the pool trimmed for ~1 ms at every chunk boundary and its first allocation cost the first request after a load ~110 ms; with the slots the chunk-boundary stall is 1,020 -> 115 us, idle time per chunk 5.4 -> 3.5 ms, -24 ms to the first token of a cold 16K prompt."
+        "sha256": "629fca90d8fd0a1069dc665023488bdaed90ee34dad9d3c9fe0697cfa2109079",
+        "reason": "ADR 0031 (GitHub #650, spec #646): on Windows, where the W4A4 TMA kernels take their tensor maps through a pointer, the launcher first asks ignis's per-load descriptor slots (kernel/src/tma_descriptor_cache.h, ignis::tma_descriptors::device_copy) for a resident device copy of the block and launches on it; only where that answers null (no load's slots serve the stream, a graph capture, a block wider than a slot) does it keep upstream's pool allocation, pageable copy and free before the product. Linux passes the block by value and is unchanged. Output bit-identical (ignis_kernel_tma_descriptor_cache_test). Measured on the RTX 5090 (spec #646's prototype): the allocate, copy and free ran 247 times per 27B prefill chunk, the pool trimmed for ~1 ms at every chunk boundary and its first allocation cost the first request after a load ~110 ms; with the slots the chunk-boundary stall is 1,020 -> 115 us, idle time per chunk 5.4 -> 3.5 ms, -24 ms to the first token of a cold 16K prompt. And ADR 0031 (GitHub #652, spec #646): the W4A4 TMA route reads its activations K-tile-major, codes [K/128][T][64 bytes] and scales [K/256][T][16 bytes], where upstream's are token-major; the weights, every narrower width and the gate and up's fused route keep upstream's layout, IGNIS_W4A4_ACTIVATION_LAYOUT=token (kernel/src/w4a4_activation_layout.h) gives upstream's back, and the products' output is bit-identical (ignis_kernel_w4a4_activation_layout_test). This file builds the K-tile-major descriptors (nvfp4_w4a4_tma.cuh) for a schedule that reads them, and takes the layout as an argument of every product, launching that schedule where the activations are K-tile-major. Measured on the RTX 5090 (spec #646): on the 27B's five prefill shapes the W4A4 TMA products are bound by the L2's tag lookups (76-89% of peak, the tensor pipe busy 67-81% of its active cycles), token-major activations reaching a 256-token tile as 256 pieces of 64 bytes per 128-wide slice of K and their scales as 256 pieces of 16; K-tile-major, the lookups fall 45%, the tensor pipe reaches 87-88% of its active cycles and the five products take 5.5-11.9% less per call in a served prefill."
       }
     },
     {
@@ -1025,13 +1050,18 @@
       "sha256": "24e6a6be6b2f56c7a6be942d954f00326cbef9c8df58047cfe614ef1bbebca1f",
       "patch": {
         "diff": "patches/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh.diff",
-        "sha256": "946850f7e40fc2cee5e895e1d6d8b4c01d986ff37585f527fe7d0861bfea3df1",
-        "reason": "ADR 0031: upstream ee9d5192 (PR #204), hand-merged onto the fork's Windows TMA descriptor and mbarrier spellings. The W4A4 TMA CTAs are rasterised token-fastest so the CTAs sharing a weight tile run together, and each activation-scale box is fetched once per pair of K tiles into a two-slot buffer; stage counts are limited to 2 or 3, where the slot reuse is safe (upstream allows >= 2). Output bit-identical. Upstream: operator x1.09-1.20, prefill +7.7..9.3%. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md."
+        "sha256": "1aac5d9fc56e4fee288979528e3198f0fd3472e831f53be30d300bb2d4f0b43e",
+        "reason": "ADR 0031: upstream ee9d5192 (PR #204), hand-merged onto the fork's Windows TMA descriptor and mbarrier spellings. The W4A4 TMA CTAs are rasterised token-fastest so the CTAs sharing a weight tile run together, and each activation-scale box is fetched once per pair of K tiles into a two-slot buffer; stage counts are limited to 2 or 3, where the slot reuse is safe (upstream allows >= 2). Output bit-identical. Upstream: operator x1.09-1.20, prefill +7.7..9.3%. ignis A/B: docs/findings/2026-09-24-upstream-quick-wins-ab.md. And ADR 0031 (GitHub #652, spec #646): the W4A4 TMA route reads its activations K-tile-major, codes [K/128][T][64 bytes] and scales [K/256][T][16 bytes], where upstream's are token-major; the weights, every narrower width and the gate and up's fused route keep upstream's layout, IGNIS_W4A4_ACTIVATION_LAYOUT=token (kernel/src/w4a4_activation_layout.h) gives upstream's back, and the products' output is bit-identical (ignis_kernel_w4a4_activation_layout_test). This file adds the K-tile-major descriptors, 128-byte boxes for the activation codes (under the 128-byte swizzle) and scales and, over the same bytes, for the weight scales, and a schedule parameter whose kernel reads them. Measured on the RTX 5090 (spec #646): on the 27B's five prefill shapes the W4A4 TMA products are bound by the L2's tag lookups (76-89% of peak, the tensor pipe busy 67-81% of its active cycles), token-major activations reaching a 256-token tile as 256 pieces of 64 bytes per 128-wide slice of K and their scales as 256 pieces of 16; K-tile-major, the lookups fall 45%, the tensor pipe reaches 87-88% of its active cycles and the five products take 5.5-11.9% less per call in a served prefill."
       }
     },
     {
       "path": "src/ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h",
-      "sha256": "746762e9f3d7a81d7cf0dd3181c4255fd70416c139ebe819acd112cb1dcd8681"
+      "sha256": "746762e9f3d7a81d7cf0dd3181c4255fd70416c139ebe819acd112cb1dcd8681",
+      "patch": {
+        "diff": "patches/src/ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h.diff",
+        "sha256": "d829a07063d8d0c8a8973ea518804a1ee88433d15d8aedf41d45524029d23aa2",
+        "reason": "ADR 0031 (GitHub #652, spec #646): the W4A4 TMA route reads its activations K-tile-major, codes [K/128][T][64 bytes] and scales [K/256][T][16 bytes], where upstream's are token-major; the weights, every narrower width and the gate and up's fused route keep upstream's layout, IGNIS_W4A4_ACTIVATION_LAYOUT=token (kernel/src/w4a4_activation_layout.h) gives upstream's back, and the products' output is bit-identical (ignis_kernel_w4a4_activation_layout_test). This file adds the layout argument to the four product launchers. Measured on the RTX 5090 (spec #646): on the 27B's five prefill shapes the W4A4 TMA products are bound by the L2's tag lookups (76-89% of peak, the tensor pipe busy 67-81% of its active cycles), token-major activations reaching a 256-token tile as 256 pieces of 64 bytes per 128-wide slice of K and their scales as 256 pieces of 16; K-tile-major, the lookups fall 45%, the tensor pipe reaches 87-88% of its active cycles and the five products take 5.5-11.9% less per call in a served prefill."
+      }
     },
     {
       "path": "src/ops/linear/q4/q4_dispatch.cpp",
@@ -1269,7 +1299,12 @@
     },
     {
       "path": "src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu",
-      "sha256": "5b5d7b5c409d12b692d73ff9c46c57d0d1c708c04c25f617884a7c5f3e5166ba"
+      "sha256": "5b5d7b5c409d12b692d73ff9c46c57d0d1c708c04c25f617884a7c5f3e5166ba",
+      "patch": {
+        "diff": "patches/src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu.diff",
+        "sha256": "102147e00f1bae0ce3cfd5b95b260f44e6aa6ba325c8cf99ec663f2c8fc73fe5",
+        "reason": "ADR 0031 (GitHub #652, spec #646): the W4A4 TMA route reads its activations K-tile-major, codes [K/128][T][64 bytes] and scales [K/256][T][16 bytes], where upstream's are token-major; the weights, every narrower width and the gate and up's fused route keep upstream's layout, IGNIS_W4A4_ACTIVATION_LAYOUT=token (kernel/src/w4a4_activation_layout.h) gives upstream's back, and the products' output is bit-identical (ignis_kernel_w4a4_activation_layout_test). This file's launcher quantizes through launch_nvfp4_w4a4_quantize_for_products and hands the TMA product the layout it wrote. Measured on the RTX 5090 (spec #646): on the 27B's five prefill shapes the W4A4 TMA products are bound by the L2's tag lookups (76-89% of peak, the tensor pipe busy 67-81% of its active cycles), token-major activations reaching a 256-token tile as 256 pieces of 64 bytes per 128-wide slice of K and their scales as 256 pieces of 16; K-tile-major, the lookups fall 45%, the tensor pipe reaches 87-88% of its active cycles and the five products take 5.5-11.9% less per call in a served prefill."
+      }
     },
     {
       "path": "src/ops/linear_attention/gated_delta_net/chunked/common.cuh",

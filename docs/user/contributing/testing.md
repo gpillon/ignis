@@ -126,6 +126,19 @@ the other. They are no configuration fields: `GET /v1/config` and
   variable. The load logs the route under `ignis.runtime.prefill_routes`
   (`prefill_swiglu`: `fused`, `split`, or `none` on the trellis artifacts,
   whose prefill runs no such product), and the VRAM plan is the same on both.
+- `IGNIS_W4A4_ACTIVATION_LAYOUT=ktile|token` (from 0.11.0) picks, at each
+  model load, the layout the 27B's NVFP4 prompt products read their
+  activations in on an RTX 50 or RTX PRO card: K tile by K tile (`ktile`, or
+  unset), which they read in whole 128-byte lines, or token by token
+  (`token`), the layout of earlier releases, the comparison a measurement of
+  the two needs. The gate and up product's fused SwiGLU (`IGNIS_PREFILL_SWIGLU`
+  above) quantizes its own input and reads it token by token whatever this
+  variable says. The bytes the products write and the VRAM plan are the same
+  either way (`ignis_kernel_w4a4_activation_layout_test`). The load logs the
+  layout under `ignis.runtime.prefill_routes` (`w4a4_activation_layout`:
+  `ktile`, `token`, or `none` where its prefill runs no such product: the
+  trellis artifacts, Flash-Next, an RTX 30 or RTX 40 card, a prefill chunk
+  below 1,024 tokens). Any other value refuses the load, naming the variable.
 
 ## The speech executor's CPU legs
 

@@ -1,8 +1,70 @@
 diff --git a/reference/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh b/vendor/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh
-index 7da369c..e990bb6 100644
+index 7da369c..98063c7 100644
 --- a/reference/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh
 +++ b/vendor/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh
-@@ -167,6 +167,29 @@ __device__ __forceinline__ void nvfp4_mbarrier_arrive_expect_tx(std::uint64_t* b
+@@ -81,7 +81,45 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
+     return descriptors;
+ }
+ 
+-template <int BlockM, int Stages, int MinBlocksPerSm>
++// ignis (GitHub #652, spec #646): the descriptors of a product whose activations are K-tile-major
++// (Nvfp4W4a4ActivationLayout::KTileMajor, nvfp4_w4a4_plan.h). The codes, [K/128][T][64 bytes],
++// are read as 128-byte rows, two tokens each, a K tile of a token tile in one box of BlockM / 2
++// rows under the 128-byte swizzle; the scales, [K/256][T][16 bytes], as 128-byte rows of eight
++// tokens, a pair of K tiles of a token tile in one box of BlockM / 8 rows. The weight codes are
++// read as upstream reads them, and the weight scales, their bytes unchanged, through a box of
++// eight 128-byte rows, the same 1,024 bytes as upstream's sixty-four of 16: every request a whole
++// L2 line.
++template <class Geometry, int BlockM>
++Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_k_tile_descriptors(
++    const std::uint8_t* activation_codes, const std::uint8_t* activation_scales,
++    const std::uint8_t* weight_codes, const std::uint8_t* weight_scales, std::int32_t tokens) {
++    static_assert(Geometry::kInputRows % 256 == 0);
++    constexpr std::uint64_t kKTiles     = Geometry::kInputRows / 128;
++    constexpr std::uint64_t kKTilePairs = Geometry::kInputRows / 256;
++    constexpr std::uint64_t kWeightScaleBytes =
++        static_cast<std::uint64_t>(Geometry::kOutputRows) * Geometry::kInputRows / 16;
++    const auto columns = static_cast<std::uint64_t>(tokens);
++
++    Nvfp4W4a4TmaDescriptors descriptors = make_nvfp4_w4a4_tma_descriptors<Geometry, BlockM>(
++        activation_codes, activation_scales, weight_codes, weight_scales, tokens);
++    descriptors.a_codes = nvfp4_make_tma_2d(
++        const_cast<std::uint8_t*>(activation_codes), CU_TENSOR_MAP_DATA_TYPE_UINT8, 128,
++        kKTiles * columns / 2, 128, 128, BlockM / 2, CU_TENSOR_MAP_SWIZZLE_128B,
++        "encode K-tile-major activation codes TMA");
++    descriptors.a_scales = nvfp4_make_tma_2d(
++        const_cast<std::uint8_t*>(activation_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, 128,
++        kKTilePairs * columns / 8, 128, 128, BlockM / 8, CU_TENSOR_MAP_SWIZZLE_NONE,
++        "encode K-tile-major activation scales TMA");
++    descriptors.b_scales = nvfp4_make_tma_2d(
++        const_cast<std::uint8_t*>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, 128,
++        kWeightScaleBytes / 128, 128, 128, 8, CU_TENSOR_MAP_SWIZZLE_NONE,
++        "encode K-tile-major weight scales TMA");
++    return descriptors;
++}
++
++// ignis (GitHub #652): KTileActivations reads the activations K-tile-major, through
++// make_nvfp4_w4a4_tma_k_tile_descriptors.
++template <int BlockM, int Stages, int MinBlocksPerSm, bool KTileActivations = false>
+ struct Nvfp4W4a4TmaSchedule {
+     static_assert(BlockM == 128 || BlockM == 256);
+     static_assert(Stages >= 2 && Stages <= 4);
+@@ -105,8 +143,14 @@ struct Nvfp4W4a4TmaSchedule {
+     static constexpr int kScaleWordsPerRow = 4;
+     static constexpr int kCodeRowBytes     = 64;
+     static constexpr int kMinBlocksPerSm   = MinBlocksPerSm;
++    static constexpr bool kKTileActivations = KTileActivations;
+ };
+ 
++// ignis (GitHub #652): `Schedule` reading K-tile-major activations.
++template <class Schedule>
++using Nvfp4W4a4KTileSchedule =
++    Nvfp4W4a4TmaSchedule<Schedule::kBlockM, Schedule::kStages, Schedule::kMinBlocksPerSm, true>;
++
+ template <class Schedule>
+ struct Nvfp4W4a4TmaTensorStorage {
+     alignas(
+@@ -167,6 +211,29 @@ __device__ __forceinline__ void nvfp4_mbarrier_arrive_expect_tx(std::uint64_t* b
                   : "memory");
  }
  
@@ -32,7 +94,7 @@ index 7da369c..e990bb6 100644
  __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUtensorMap* descriptor,
                                                    std::int32_t coordinate0,
                                                    std::int32_t coordinate1,
-@@ -202,11 +225,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
+@@ -202,13 +269,23 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
      const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output) {
      static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
      static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
@@ -51,8 +113,15 @@ index 7da369c..e990bb6 100644
 +    const int row_begin   = block_x * Schedule::kBlockN;
  
      if (threadIdx.x == 0) {
++        if constexpr (Schedule::kKTileActivations) {
++            // ignis (GitHub #652): the 128-byte swizzle the consumers undo below repeats every
++            // 1,024 bytes of shared memory, so the stage buffers must start on such a boundary.
++            if ((smem_addr(shared.scratch.tensors.a_codes[0]) & 1023U) != 0U) { __trap(); }
++        }
  #pragma unroll
-@@ -235,12 +263,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
+         for (int stage = 0; stage < Schedule::kStages; ++stage) {
+             nvfp4_mbarrier_init(&shared.full[stage], 1);
+@@ -235,26 +312,57 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                  const int stage                 = k_tile % Schedule::kStages;
                  const std::uint32_t empty_phase = 1U ^ ((k_tile / Schedule::kStages) & 1U);
                  nvfp4_mbarrier_wait(&shared.empty[stage], empty_phase);
@@ -74,22 +143,75 @@ index 7da369c..e990bb6 100644
 +                                                            : kTransactionBytes - kScaleBytes);
  
                  auto& tensors = shared.scratch.tensors;
-                 nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptor_block->a_codes,
-@@ -248,8 +283,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
-                                   &shared.full[stage]);
-                 nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptor_block->b_codes,
-                                   k_tile * Schedule::kCodeRowBytes, row_begin, &shared.full[stage]);
+-                nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptor_block->a_codes,
+-                                  k_tile * Schedule::kCodeRowBytes, token_begin,
+-                                  &shared.full[stage]);
+-                nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptor_block->b_codes,
+-                                  k_tile * Schedule::kCodeRowBytes, row_begin, &shared.full[stage]);
 -                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptor_block->a_scales,
 -                                  (k_tile / 2) * 16, token_begin, &shared.full[stage]);
-+                if (load_scales) {
-+                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1],
-+                                      &descriptor_block->a_scales, (k_tile / 2) * 16, token_begin,
-+                                      &shared.full[stage]);
-+                }
                  const int b_scale_row = ((row_begin / 128) * Geometry::kScaleTilesPerRow +
                                           k_tile * Schedule::kK64PerStage) *
                                          32;
-@@ -304,8 +342,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
+-                nvfp4_tma_load_2d(tensors.b_scales[stage], &descriptor_block->b_scales, 0,
+-                                  b_scale_row, &shared.full[stage]);
++                if constexpr (Schedule::kKTileActivations) {
++                    // ignis (GitHub #652): K tile k_tile of the token tile is 128-byte row
++                    // (k_tile * tokens + token_begin) / 2 of the codes, and the scales of its
++                    // pair of K tiles row ((k_tile / 2) * tokens + token_begin) / 8 of theirs.
++                    const int tokens = static_cast<int>(gridDim.y) * Schedule::kBlockM;
++                    nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptor_block->a_codes, 0,
++                                      (k_tile * tokens + token_begin) / 2, &shared.full[stage]);
++                    nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptor_block->b_codes,
++                                      k_tile * Schedule::kCodeRowBytes, row_begin,
++                                      &shared.full[stage]);
++                    if (load_scales) {
++                        nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1],
++                                          &descriptor_block->a_scales, 0,
++                                          ((k_tile / 2) * tokens + token_begin) / 8,
++                                          &shared.full[stage]);
++                    }
++                    nvfp4_tma_load_2d(tensors.b_scales[stage], &descriptor_block->b_scales, 0,
++                                      b_scale_row / 8, &shared.full[stage]);
++                } else {
++                    nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptor_block->a_codes,
++                                      k_tile * Schedule::kCodeRowBytes, token_begin,
++                                      &shared.full[stage]);
++                    nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptor_block->b_codes,
++                                      k_tile * Schedule::kCodeRowBytes, row_begin,
++                                      &shared.full[stage]);
++                    if (load_scales) {
++                        nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1],
++                                          &descriptor_block->a_scales, (k_tile / 2) * 16,
++                                          token_begin, &shared.full[stage]);
++                    }
++                    nvfp4_tma_load_2d(tensors.b_scales[stage], &descriptor_block->b_scales, 0,
++                                      b_scale_row, &shared.full[stage]);
++                }
+             }
+         }
+         return;
+@@ -296,16 +404,25 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
+             for (int mma_m = 0; mma_m < Schedule::kMmaM; ++mma_m) {
+                 const int row          = warp_m * Schedule::kWarpM + mma_m * 16 + a_row_offset;
+                 const int logical_byte = local_k64 * 32 + a_column_byte;
+-                const int physical_byte =
+-                    ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
+-                const auto* address =
+-                    tensors.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
++                int a_offset           = 0;
++                if constexpr (Schedule::kKTileActivations) {
++                    // ignis (GitHub #652): two tokens to a 128-byte row, its eight 16-byte chunks
++                    // under the 128-byte swizzle.
++                    const int line  = row >> 1;
++                    const int chunk = ((row & 1) << 2) | (logical_byte >> 4);
++                    a_offset = line * 128 + ((chunk ^ (line & 7)) << 4) + (logical_byte & 15);
++                } else {
++                    a_offset = row * Schedule::kCodeRowBytes +
++                               ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
++                }
++                const auto* address = tensors.a_codes[stage] + a_offset;
+                 ldmatrix_x4(a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
                              a_fragments[mma_m][3], smem_addr(address));
                  const int scale_row = warp_m * Schedule::kWarpM + mma_m * 16 + sfa_row;
                  a_scales[mma_m] =

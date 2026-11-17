@@ -35,6 +35,7 @@
 #include "mtp_head.h"
 #include "sampled_draft.h"
 #include "trellis_body.h"
+#include "w4a4_activation_layout.h"
 #include "w8_imma.h"
 
 #include "ignis_dflash2_topk.h"
@@ -1166,6 +1167,10 @@ struct LoadOptions {
   // GitHub #651 (spec #646): the route of the prefill's MLP gate and up product, what the
   // measurement switch IGNIS_PREFILL_SWIGLU names (`prefill_swiglu_switch`).
   ignis::prefill_swiglu::Route prefill_swiglu = ignis::prefill_swiglu::Route::Fused;
+  // GitHub #652 (spec #646): what the measurement switch IGNIS_W4A4_ACTIVATION_LAYOUT names; the
+  // load decides from it, the body, the chunk and the card the layout its W4A4 prefill products
+  // read (`w4a4_activation_layout_route`).
+  ignis::w4a4_activation_layout::Layout w4a4_activation_layout = ignis::w4a4_activation_layout::Layout::KTile;
   // GitHub #576 (ADR 0090): the verify round's draft rule (enum
   // ignis_draft_rule) and, under the sampled draft, the drafter's
   // temperature factor and top-p.
@@ -1277,6 +1282,40 @@ bool hq_decode_attention_switch(ignis::hq_decode_attention::Switch &named) {
   } catch (const std::invalid_argument &e) {
     set_error(std::string("ignis_model_load: ") + e.what());
     return false;
+  }
+  return true;
+}
+
+// GitHub #652 (spec #646): the measurement switch IGNIS_W4A4_ACTIVATION_LAYOUT, read once per load
+// beside the others, so a value it does not know refuses the plan and the load by name.
+bool w4a4_activation_layout_switch(ignis::w4a4_activation_layout::Layout &named) {
+  try {
+    named = ignis::w4a4_activation_layout::layout_for_load();
+  } catch (const std::invalid_argument &e) {
+    set_error(std::string("ignis_model_load: ") + e.what());
+    return false;
+  }
+  return true;
+}
+
+// GitHub #652 (spec #646): the layout the load's W4A4 prefill products read their activations in
+// (enum ignis_w4a4_activation_layout), decided once per load: the one the switch names where the
+// prefill runs the W4A4 TMA route -- the NVFP4 body, chunks of at least 1,024 tokens, a card the
+// products' sm_120a code runs on (compute capability 12) -- and none elsewhere. False (error set)
+// when the device cannot say its generation; the card is asked only where the route could run.
+bool w4a4_activation_layout_route(ignis::w4a4_activation_layout::Layout named, bool trellis_body,
+                                  uint32_t prefill_chunk_tokens, uint32_t &layout) {
+  layout = IGNIS_W4A4_ACTIVATION_LAYOUT_NONE;
+  if (trellis_body || prefill_chunk_tokens < 1024) {
+    return true;
+  }
+  int major = 0;
+  if (!device_major("the W4A4 activation layout", major)) {
+    return false;
+  }
+  if (major == 12) {
+    layout = named == ignis::w4a4_activation_layout::Layout::Token ? IGNIS_W4A4_ACTIVATION_LAYOUT_TOKEN
+                                                                   : IGNIS_W4A4_ACTIVATION_LAYOUT_KTILE;
   }
   return true;
 }
@@ -1619,7 +1658,8 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.drafter_top_p = drafter_top_p;
   if (!gdn_prefill_route(out.gdn_prefill_ours) || !hq_decode_attention_switch(out.hq_decode_attention) ||
       !mtp_head_linear_route(out.mtp_head_linear_ours) ||
-      !tma_descriptor_cache_route(out.tma_descriptor_cache) || !prefill_swiglu_switch(out.prefill_swiglu)) {
+      !tma_descriptor_cache_route(out.tma_descriptor_cache) || !prefill_swiglu_switch(out.prefill_swiglu) ||
+      !w4a4_activation_layout_switch(out.w4a4_activation_layout)) {
     return nullptr;
   }
 
@@ -2549,6 +2589,12 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   if (!hq_decode_attention_route(load.hq_decode_attention, kv_format, model->hq_decode_attention_ours)) {
     return -1;
   }
+  // GitHub #652 (spec #646): the layout the W4A4 prefill products read, named for the model's stream
+  // once it exists (below).
+  if (!w4a4_activation_layout_route(load.w4a4_activation_layout, model->is_trellis_body, prefill_chunk_tokens,
+                                    model->w4a4_activation_layout)) {
+    return -1;
+  }
 
   // GitHub #341: the BF16 exception tensors a load holds in FP8 run on the FP8
   // linear and the W8A8 GEMM (kernel/src/fp8_exception.h), which refuse an
@@ -2668,6 +2714,21 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
           sizes.tma_descriptors / ignis::tma_descriptors::kSlotBytes, model->stream);
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: the TMA descriptor slots: ") + e.what());
+      cudaStreamDestroy(model->stream);
+      model->stream = nullptr;
+      return -1;
+    }
+  }
+  // GitHub #652 (spec #646): every W4A4 TMA product launched on the model's stream from here on
+  // reads its activations in the layout the load decided, which its quantizer then writes.
+  if (model->w4a4_activation_layout != IGNIS_W4A4_ACTIVATION_LAYOUT_NONE) {
+    try {
+      model->w4a4_activation_layout_stream = std::make_unique<ignis::w4a4_activation_layout::ForStream>(
+          model->stream, model->w4a4_activation_layout == IGNIS_W4A4_ACTIVATION_LAYOUT_TOKEN
+                             ? ignis::w4a4_activation_layout::Layout::Token
+                             : ignis::w4a4_activation_layout::Layout::KTile);
+    } catch (const std::exception &e) {
+      set_error(std::string("ignis_model_load: the W4A4 activation layout: ") + e.what());
       cudaStreamDestroy(model->stream);
       model->stream = nullptr;
       return -1;
@@ -2901,6 +2962,13 @@ extern "C" uint32_t ignis_model_prefill_swiglu(const struct ignis_model *model) 
                                                                        : IGNIS_PREFILL_SWIGLU_SPLIT;
 }
 
+extern "C" uint32_t ignis_model_w4a4_activation_layout(const struct ignis_model *model) {
+  if (model == nullptr || model->flash_next) {
+    return IGNIS_W4A4_ACTIVATION_LAYOUT_NONE;
+  }
+  return model->w4a4_activation_layout;
+}
+
 extern "C" void ignis_model_free(struct ignis_model *model) {
   if (model != nullptr) {
     // P3-05 (GitHub #102, ADR 0019): destroy every captured decode graph
@@ -2921,6 +2989,9 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
     }
     // GitHub #650: the descriptor slots stop serving the stream before it goes away.
     model->tma_descriptors.reset();
+    // GitHub #652: and the stream's layout is no longer named, so a stream created at its address
+    // starts from the default.
+    model->w4a4_activation_layout_stream.reset();
     if (model->stream != nullptr) {
       cudaStreamDestroy(model->stream);
     }

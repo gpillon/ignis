@@ -189,6 +189,46 @@ impl PrefillSwiglu {
     }
 }
 
+/// The layout the 27B's W4A4 prefill products read their activations in
+/// (GitHub #652, spec #646), which no load option names: the leaf decides it
+/// once per load, K-tile-major unless the measurement switch
+/// `IGNIS_W4A4_ACTIVATION_LAYOUT=token` names the token-major one, and reports
+/// it ([`crate::model_load::Model::w4a4_activation_layout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum W4a4ActivationLayout {
+    /// Token by token, the layout before GitHub #652: what the switch's
+    /// `token` names.
+    Token,
+    /// K tile by K tile: what a load whose prefill runs the route reads unless
+    /// the switch names the other.
+    KTile,
+}
+
+impl W4a4ActivationLayout {
+    /// `enum ignis_w4a4_activation_layout`: `Ok(None)` for a load whose
+    /// prefill runs no W4A4 TMA product (0: the trellis body, Flash-Next, a
+    /// card below compute capability 12, a chunk below 1,024 tokens),
+    /// `Ok(Some(..))` for 1 (token-major) and 2 (K-tile-major), and the code
+    /// back as the error for any other.
+    pub const fn from_abi(code: u32) -> Result<Option<Self>, u32> {
+        match code {
+            0 => Ok(None),
+            1 => Ok(Some(Self::Token)),
+            2 => Ok(Some(Self::KTile)),
+            unknown => Err(unknown),
+        }
+    }
+
+    /// The switch's own spellings, which the load's
+    /// `ignis.runtime.prefill_routes` line reports (`none` without the products).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Token => "token",
+            Self::KTile => "ktile",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +250,16 @@ mod tests {
         assert_eq!(GdnPrefill::from_abi(1), Some(GdnPrefill::Ours));
         assert_eq!(GdnPrefill::from_abi(2), None);
         assert_eq!((GdnPrefill::Vendored.as_str(), GdnPrefill::Ours.as_str()), ("vendored", "ours"));
+    }
+
+    /// The leaf's codes, and the switch's spellings (GitHub #652).
+    #[test]
+    fn the_w4a4_activation_layouts_are_the_headers_codes() {
+        assert_eq!(W4a4ActivationLayout::from_abi(0), Ok(None));
+        assert_eq!(W4a4ActivationLayout::from_abi(1), Ok(Some(W4a4ActivationLayout::Token)));
+        assert_eq!(W4a4ActivationLayout::from_abi(2), Ok(Some(W4a4ActivationLayout::KTile)));
+        assert_eq!(W4a4ActivationLayout::from_abi(3), Err(3));
+        assert_eq!((W4a4ActivationLayout::Token.as_str(), W4a4ActivationLayout::KTile.as_str()), ("token", "ktile"));
     }
 
     #[test]

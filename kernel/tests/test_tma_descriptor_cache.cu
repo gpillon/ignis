@@ -115,8 +115,8 @@ void launch(const Product &p, cudaStream_t stream) {
                                             p.weight.scales, p.out, kTokens, kAlpha, stream);
   } else {
     nd::launch_nvfp4_w4a4_tma_linear(nd::Nvfp4Problem::Residual6144, p.activation.codes,
-                                     p.activation.scales, p.weight.codes, p.weight.scales, p.out,
-                                     kTokens, kAlpha, stream);
+                                     p.activation.scales, nd::Nvfp4W4a4ActivationLayout::TokenMajor,
+                                     p.weight.codes, p.weight.scales, p.out, kTokens, kAlpha, stream);
   }
 }
 
