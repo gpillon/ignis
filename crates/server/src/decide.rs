@@ -2457,13 +2457,13 @@ Thinking is refused rather than ignored: a decision's prompt ends exactly where 
     // (`crate::connector::decide`).
     extensions(("x-ignis-tool" = json!({
         "name": "decide",
-        "description": "Use it to classify or judge content: typed questions about it (yes/no, a choice, a score, a number, a point or box on an image) answered by reading the model, not by generating. The 27B only: on Flash-Next the server answers model_unsupported.",
+        "description": "Use it to classify or judge content: typed questions about it (yes/no, a choice, a score, a number) answered by reading the model, not by generating. The 27B only: on Flash-Next the server answers model_unsupported.",
         "read_only": false,
         "destructive": false,
         "input": {
             "type": "object",
             "properties": {
-                "state": { "description": "The content to judge: text, JSON (an object's keys are read in the order written), or OpenAI content parts, an image among them." },
+                "state": { "description": "The content to judge: text, or JSON, an object's keys read in the order written." },
                 "questions": {
                     "type": "object",
                     "description": "The questions, keyed by ids you choose and asked in the order written; each answer comes back under its id.",

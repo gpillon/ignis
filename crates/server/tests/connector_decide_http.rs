@@ -20,6 +20,7 @@ use ignis_core::decision::{AnswerAlphabet, LabelTokenizer};
 use ignis_core::mock::MockCompute;
 use ignis_core::types::TokenId;
 use ignis_core::{ConcreteScheduler, SchedulerConfig};
+use ignis_server::config::ApiKey;
 use ignis_server::decoder::TokenDecoder;
 use ignis_server::engine::Engine;
 use ignis_server::template::{ChatMessage, RenderedPrompt, SimpleTemplateProvider, TemplateProvider, TemplateRejection};
@@ -29,6 +30,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 const MODEL: &str = "test-model";
+const KEY: &str = "sk-connector-decide-test";
 
 /// The protocol version the harness negotiated, named on every request
 /// after `initialize`.
@@ -90,12 +92,21 @@ impl TemplateProvider for DecidingTemplate {
 /// A fresh server of `family` on the deterministic mock, its connector on
 /// by default, and the mock, whose prefills say what the model read.
 fn server(family: ModelFamily) -> (axum::Router, Arc<MockCompute>) {
+    server_keyed(family, None)
+}
+
+/// [`server`], started with `key` when there is one.
+fn server_keyed(family: ModelFamily, key: Option<&str>) -> (axum::Router, Arc<MockCompute>) {
     let compute = Arc::new(MockCompute::new());
     let scheduler = ConcreteScheduler::with_config(
         SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
         Arc::clone(&compute) as Arc<dyn ignis_core::Compute>,
     );
     let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(DecidingTemplate)).with_family(family);
+    let server = match key {
+        Some(key) => server.with_api_key(ApiKey::new(key)),
+        None => server,
+    };
     (server.app(), compute)
 }
 
@@ -113,6 +124,11 @@ async fn exchange(app: &axum::Router, request: Request<Body>) -> (StatusCode, By
 /// One JSON-RPC request to `/v1/mcp`, `params` written as given: its
 /// `result`.
 async fn rpc(app: &axum::Router, method: &str, params: &str) -> Value {
+    rpc_keyed(app, method, params, None).await
+}
+
+/// [`rpc`], sent with `key` when there is one.
+async fn rpc_keyed(app: &axum::Router, method: &str, params: &str, key: Option<&str>) -> Value {
     let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
     let mut request = Request::builder()
         .method(Method::POST)
@@ -123,6 +139,9 @@ async fn rpc(app: &axum::Router, method: &str, params: &str) -> Value {
     if method != "initialize" {
         request = request.header("mcp-protocol-version", PROTOCOL);
     }
+    if let Some(key) = key {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
+    }
     let (status, bytes) = exchange(app, request.body(Body::from(body)).unwrap()).await;
     assert_eq!(status, StatusCode::OK, "{method}: {}", String::from_utf8_lossy(&bytes));
     let answer: Value = serde_json::from_slice(&bytes).unwrap();
@@ -131,7 +150,12 @@ async fn rpc(app: &axum::Router, method: &str, params: &str) -> Value {
 
 /// `decide` called with `arguments`, written as given.
 async fn decide(app: &axum::Router, arguments: &str) -> Value {
-    rpc(app, "tools/call", &format!(r#"{{"name":"decide","arguments":{arguments}}}"#)).await
+    decide_keyed(app, arguments, None).await
+}
+
+/// [`decide`], sent with `key` when there is one.
+async fn decide_keyed(app: &axum::Router, arguments: &str, key: Option<&str>) -> Value {
+    rpc_keyed(app, "tools/call", &format!(r#"{{"name":"decide","arguments":{arguments}}}"#), key).await
 }
 
 /// `POST /v1/decide` with `body`, written as given: the route's status and
@@ -158,6 +182,11 @@ fn text_of(result: &Value) -> String {
 const WRITTEN: &str = r#"{"state": {"zeta": "the order record", "alpha": "a note on it"},
  "questions": {"which": {"type": "choice", "instructions": "Which field matters?",
    "criteria": {"zulu": "the record itself", "alpha": "the note"}}}}"#;
+
+/// [`WRITTEN`]'s `state` record and its `choice`'s options, each as
+/// written and with its keys sorted, as MCP's map would hand them over.
+const STATE: [&str; 2] = [r#"{"zeta": "the order record", "alpha": "a note on it"}"#, r#"{"alpha": "a note on it", "zeta": "the order record"}"#];
+const OPTIONS: [&str; 2] = [r#"{"zulu": "the record itself", "alpha": "the note"}"#, r#"{"alpha": "the note", "zulu": "the record itself"}"#];
 
 // ── the tool list ────────────────────────────────────────────────────────
 
@@ -208,16 +237,33 @@ async fn a_decision_through_the_tool_is_the_routes_own_over_the_keys_in_the_orde
     assert_eq!(answer, String::from_utf8_lossy(&body));
     assert_eq!(prefilled(&compute), through_the_tool);
 
-    // The keys sorted, as MCP's map hands them over: another prompt, and
-    // another option at each label.
-    let sorted = serde_json::from_str::<Value>(WRITTEN).unwrap().to_string();
-    let (app, compute) = server(ModelFamily::Qwen38_27b);
-    let (status, body) = direct(&app, &sorted).await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    assert_ne!(prefilled(&compute), through_the_tool, "the fixture tells the orders apart");
-    let sorted: Value = serde_json::from_slice(&body).unwrap();
+    // Each sorted alone, as MCP's map hands them over: the `state` record,
+    // another prompt; the `choice`'s options, another prompt and another
+    // option at each label.
     let written: Value = serde_json::from_str(&answer).unwrap();
-    assert_ne!(sorted["answers"]["which"]["probabilities"], written["answers"]["which"]["probabilities"], "{sorted} {written}");
+    for (what, [as_written, sorted]) in [("the state", STATE), ("the options", OPTIONS)] {
+        assert_eq!(WRITTEN.matches(as_written).count(), 1, "{what}");
+        let (app, compute) = server(ModelFamily::Qwen38_27b);
+        let (status, body) = direct(&app, &WRITTEN.replace(as_written, sorted)).await;
+        assert_eq!(status, StatusCode::OK, "{what}: {}", String::from_utf8_lossy(&body));
+        assert_ne!(prefilled(&compute), through_the_tool, "{what}: the fixture tells the orders apart");
+        if what == "the options" {
+            let sorted: Value = serde_json::from_slice(&body).unwrap();
+            assert_ne!(sorted["answers"]["which"]["probabilities"], written["answers"]["which"]["probabilities"], "{sorted} {written}");
+        }
+    }
+}
+
+/// Spec #656: the call goes to the route with the harness's own key, as
+/// its request would: on a server with a key, the decision is answered.
+#[tokio::test]
+async fn a_decision_is_asked_with_the_harnesss_key() {
+    let (app, compute) = server_keyed(ModelFamily::Qwen38_27b, Some(KEY));
+    let result = decide_keyed(&app, WRITTEN, Some(KEY)).await;
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let answer: Value = serde_json::from_str(&text_of(&result)).unwrap();
+    assert!(answer["answers"]["which"]["choice"].is_string(), "{answer}");
+    assert!(!prefilled(&compute).is_empty());
 }
 
 /// Spec #656: the tool takes no `model`, so it cannot switch the server,
