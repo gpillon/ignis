@@ -11,6 +11,7 @@
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { basename } from 'node:path';
+import { call, refuse } from './lib.mjs';
 
 const USAGE = 'usage: transcribe.mjs <audio> [--out file]';
 
@@ -36,9 +37,6 @@ for (let i = 0; i < args.length; i++) {
 }
 if (audio === undefined) fail(`no audio file given\n${USAGE}`);
 
-const base = (process.env.IGNIS_BASE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
-const key = process.env.IGNIS_API_KEY;
-
 let bytes;
 try {
   bytes = await readFile(audio);
@@ -49,23 +47,9 @@ try {
 const form = new FormData();
 form.append('file', new Blob([bytes]), basename(audio));
 
-let response;
-try {
-  response = await fetch(`${base}/v1/audio/transcriptions`, {
-    method: 'POST',
-    headers: key ? { Authorization: `Bearer ${key}` } : {},
-    body: form,
-  });
-} catch (error) {
-  const why = error.cause?.code || error.cause?.message || error.message;
-  fail(`cannot reach ignis at ${base} (${why}); set IGNIS_BASE_URL to where it runs`);
-}
-
-const body = await response.text();
-if (!response.ok) {
-  process.stderr.write(`transcribe: ignis answered ${response.status}\n${body.trim()}\n`);
-  process.exit(1);
-}
+const answer = await call('transcribe', 'POST', '/v1/audio/transcriptions', { form });
+refuse('transcribe', answer);
+const body = answer.body.toString('utf8');
 
 let text;
 try {
