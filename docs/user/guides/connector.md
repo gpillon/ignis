@@ -204,16 +204,32 @@ the machine the harness runs on. So ignis serves a **skill** too, `ignis`: a
 `SKILL.md` and Node scripts that run in the harness's own shell, beside the
 files, and call ignis's existing routes. ignis touches no file, so it works the
 same with ignis local, on the LAN or behind a tunnel. From 0.11.0 the skill
-holds one script:
+holds three scripts:
 
 | Script | What it does |
 |---|---|
+| `generate-image.mjs <prompt> <out.png> [--size WxH] [--model id]` | Generates an image through `POST /v1/images/generations` and writes the full-size PNG to `out.png`. |
+| `edit-image.mjs <prompt> <out.png> <input...> [--model id]` | Sends the project's pictures (PNG, JPEG or WebP, in order) with the prompt through `POST /v1/images/edits` and writes the PNG to `out.png`. |
 | `transcribe.mjs <audio> [--out file]` | Transcribes a recording through `POST /v1/audio/transcriptions` and prints the transcript, or writes it to `--out`. |
 
 The server serves the skill as one `tar.gz` at `GET /v1/connector/skill`, behind
 the key and, with `connector.enabled` off, a `404`. It is packed when the
 server is built, so it is always the skill that matches the server that gave
 it, and its bytes are the same on every request.
+
+Both image scripts pick the image model from the catalog (`GET
+/v1/models/catalog`) unless `--model` names one: the model loaded if it is an
+image model, else the first on disk that the card can load. With a text model
+loaded, naming the image model is what makes the server switch to it, so the
+first image can take a while (the switch is the server's, and
+`switch.allow_implicit` off refuses it). The scripts wait for the answer: they
+use Node's `http` and `https` modules, not `fetch`, which gives up on a
+response whose headers take more than about five minutes. They print where the
+PNG went, and an error from ignis as the JSON it sent, with a non-zero exit.
+
+The MCP tool `generate_image` covers an image that needs no file: it returns a
+preview of at most 512 px and no file. When the image has to be kept, use
+`generate-image.mjs`, which writes it at full size.
 
 ### Install
 
