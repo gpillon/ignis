@@ -725,7 +725,7 @@ impl StepLeaf for CudaLeaf {
             prefill_attention = self.config.prefill_attention.as_str(),
             gdn_prefill = model.gdn_prefill().as_str(),
             prefill_swiglu = model.prefill_swiglu().map_or("none", |route| route.as_str()),
-            w4a4_activation_layout = model.w4a4_activation_layout().as_str(),
+            w4a4_activation_layout = model.w4a4_activation_layout().map_or("none", |layout| layout.as_str()),
             "prefill routes"
         );
         // GitHub #572 (spec #570): the attention route of the decode and

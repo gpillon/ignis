@@ -196,10 +196,6 @@ impl PrefillSwiglu {
 /// it ([`crate::model_load::Model::w4a4_activation_layout`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum W4a4ActivationLayout {
-    /// A load whose prefill runs no W4A4 TMA product: the trellis body,
-    /// Flash-Next, a card below compute capability 12, a chunk below 1,024
-    /// tokens.
-    None,
     /// Token by token, the layout before GitHub #652: what the switch's
     /// `token` names.
     Token,
@@ -209,21 +205,24 @@ pub enum W4a4ActivationLayout {
 }
 
 impl W4a4ActivationLayout {
-    /// `enum ignis_w4a4_activation_layout`: 0 none, 1 token-major, 2
-    /// K-tile-major; `None` for any other code.
-    pub const fn from_abi(code: u32) -> Option<Self> {
+    /// `enum ignis_w4a4_activation_layout`: `Ok(None)` for a load whose
+    /// prefill runs no W4A4 TMA product (0: the trellis body, Flash-Next, a
+    /// card below compute capability 12, a chunk below 1,024 tokens),
+    /// `Ok(Some(..))` for 1 (token-major) and 2 (K-tile-major), and the code
+    /// back as the error for any other.
+    pub const fn from_abi(code: u32) -> Result<Option<Self>, u32> {
         match code {
-            0 => Some(Self::None),
-            1 => Some(Self::Token),
-            2 => Some(Self::KTile),
-            _ => None,
+            0 => Ok(None),
+            1 => Ok(Some(Self::Token)),
+            2 => Ok(Some(Self::KTile)),
+            unknown => Err(unknown),
         }
     }
 
-    /// The switch's own spellings, and `none`.
+    /// The switch's own spellings, which the load's
+    /// `ignis.runtime.prefill_routes` line reports (`none` without the products).
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::None => "none",
             Self::Token => "token",
             Self::KTile => "ktile",
         }
@@ -256,10 +255,11 @@ mod tests {
     /// The leaf's codes, and the switch's spellings (GitHub #652).
     #[test]
     fn the_w4a4_activation_layouts_are_the_headers_codes() {
-        let layouts = [W4a4ActivationLayout::None, W4a4ActivationLayout::Token, W4a4ActivationLayout::KTile];
-        assert_eq!([0, 1, 2].map(W4a4ActivationLayout::from_abi), layouts.map(Some));
-        assert_eq!(W4a4ActivationLayout::from_abi(3), None);
-        assert_eq!(layouts.map(W4a4ActivationLayout::as_str), ["none", "token", "ktile"]);
+        assert_eq!(W4a4ActivationLayout::from_abi(0), Ok(None));
+        assert_eq!(W4a4ActivationLayout::from_abi(1), Ok(Some(W4a4ActivationLayout::Token)));
+        assert_eq!(W4a4ActivationLayout::from_abi(2), Ok(Some(W4a4ActivationLayout::KTile)));
+        assert_eq!(W4a4ActivationLayout::from_abi(3), Err(3));
+        assert_eq!((W4a4ActivationLayout::Token.as_str(), W4a4ActivationLayout::KTile.as_str()), ("token", "ktile"));
     }
 
     #[test]
