@@ -1870,7 +1870,7 @@ pub(crate) fn held_content(
 /// What the operator's switch at `held` would hold of a request's resolved
 /// `tools` (`raw` as sent), as [`held_tools`] would hold them at `held`,
 /// for the call check (GitHub #641); nothing is compiled until a call needs
-/// it. `None` without metrics, on a model that does not serve structured
+/// it. `None` without metrics, with no tool declared, on a model that does not serve structured
 /// output, and where `held` would leave every normalized tool free: with
 /// thinking on and no single-token `</think>` to hold the content after.
 fn at_held(
@@ -1881,6 +1881,12 @@ fn at_held(
     named: Option<&str>,
 ) -> Option<AtHeld> {
     server.metrics.as_ref()?;
+    // With no tool declared no call is held and none is counted, so nothing
+    // reads the grammar cache: the first such request after a load does not
+    // build it (GitHub #648).
+    if tools.is_empty() {
+        return None;
+    }
     let active = server.active();
     if !active.family.serves_structured_output() {
         return None;
