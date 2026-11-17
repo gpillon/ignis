@@ -210,16 +210,17 @@ and the tool passes it on.
 ([`vision.enabled`](../configuration/vision.md)). qwen-code and DeepSeek
 Harness pass a tool's image to the model only when the harness's
 configuration of the model declares image input; otherwise the model reads
-the line of text alone.
+the line of text alone. With vision off, a harness that passes the image on
+sends it back with each later turn, and ignis refuses those turns
+`vision_disabled`.
 
 **The vision budget.** The harness keeps each preview in its history and sends
 it back every turn. One merged vision token covers 32 x 32 pixels, so a
 512 x 512 preview is 256 tokens, and every image of a request together is
 held to [`vision.max_tokens`](../reference/configuration.md#visionmax_tokens),
-32,768 by default and 4,096 under the `rtx-16gb` and `rtx-12gb` profiles
-([profiles](../reference/profiles.md)). Past it the request is refused
-`media_budget_exceeded`. A session that makes many images raises it, with
-`PATCH /v1/config` (it reloads the model) or at start.
+32,768 by default. Past it the request is refused `media_budget_exceeded`. A
+session that makes many images raises it, with `PATCH /v1/config` (it
+reloads the model) or at start.
 
 **No image model on disk.** The tool answers `404 model_not_found`, naming
 the command that fetches it, `ignis-server model download ignis-image-2.1-turbo`,
@@ -234,8 +235,9 @@ serve the image model in a commercial product
 ## Results and errors
 
 A tool's result is the route's answer as text in the result's `content`: the
-one part of a result every harness shows its model. `generate_image` puts its
-preview before that text. Nothing goes in
+one part of a result every harness shows its model. `generate_image`'s is
+its preview and one line of text instead, as its section above says.
+Nothing goes in
 `structuredContent`, which DeepSeek Harness never shows, and no embedded
 resource, which it drops.
 
