@@ -144,7 +144,7 @@ fn the_tool_extension_sits_on_exactly_the_tools_routes() {
             }
         }
     }
-    let expected: BTreeSet<String> = ["get /v1/models/catalog read_catalog"].into_iter().map(str::to_owned).collect();
+    let expected: BTreeSet<String> = ["get /v1/config read_config", "get /v1/config/fields describe_config", "get /v1/models/catalog read_catalog"].into_iter().map(str::to_owned).collect();
     assert_eq!(tools, expected);
     let mcp = &document["paths"]["/v1/mcp"]["post"];
     assert_eq!(mcp["tags"], serde_json::json!(["connector"]));

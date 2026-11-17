@@ -222,8 +222,8 @@ async fn the_tool_list_is_the_same_bytes_through_a_switch_a_patch_and_whatever_m
     let listed: Value = serde_json::from_slice(&before).unwrap();
     let tools = listed["result"]["tools"].as_array().expect("tools");
     let names: Vec<&str> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["read_catalog"]);
-    let catalog = &tools[0];
+    assert_eq!(names, ["describe_config", "read_catalog", "read_config"]);
+    let catalog = &tools[1];
     assert_eq!(catalog["annotations"], json!({ "readOnlyHint": true, "destructiveHint": false }));
     assert_eq!(catalog["inputSchema"], json!({ "type": "object", "properties": {} }));
     assert!(!catalog["description"].as_str().unwrap().is_empty());
@@ -353,4 +353,78 @@ async fn with_the_connector_off_the_route_answers_404() {
     assert_eq!(refused["error"]["code"], "connector_disabled", "{refused}");
     assert!(refused["error"]["message"].as_str().unwrap().contains("connector.enabled"), "{refused}");
     assert_eq!(get(&app, "/v1/models", None).await.0, StatusCode::OK);
+}
+
+// ── read_config and describe_config ──────────────────────────────────────
+
+fn call_with(name: &str, arguments: Value) -> Value {
+    json!({ "name": name, "arguments": arguments })
+}
+
+fn text_of(result: &Value) -> String {
+    let content = result["content"].as_array().expect("content");
+    assert_eq!(content.len(), 1, "{result}");
+    content[0]["text"].as_str().unwrap().to_owned()
+}
+
+/// `read_config` answers `GET /v1/config?format=yaml` as text, read-only.
+#[tokio::test]
+async fn read_config_answers_the_running_configuration_as_yaml() {
+    let (_, server) = server("read-config");
+    let app = server.with_api_key(ApiKey::new(KEY)).app();
+    let listed = rpc(&app, "tools/list", json!({}), Some(KEY)).await;
+    let tool = listed["tools"].as_array().unwrap().iter().find(|tool| tool["name"] == "read_config").expect("listed");
+    assert_eq!(tool["annotations"], json!({ "readOnlyHint": true, "destructiveHint": false }));
+    assert_eq!(tool["inputSchema"], json!({ "type": "object", "properties": {} }));
+
+    let result = rpc(&app, "tools/call", call("read_config"), Some(KEY)).await;
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let text = text_of(&result);
+    let request = Request::builder().uri("/v1/config?format=yaml").header(header::AUTHORIZATION, format!("Bearer {KEY}"));
+    let (status, _, direct) = exchange(&app, request.body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text.as_bytes(), &direct[..]);
+    assert!(text.contains("server:") && !text.trim_start().starts_with('{'), "{text}");
+}
+
+/// `describe_config` asks by group or by names (a list), requires one of
+/// them, and lists the groups its description reads from the schema.
+#[tokio::test]
+async fn describe_config_asks_by_group_or_names_and_requires_one() {
+    let (_, server) = server("describe-config");
+    let app = server.app();
+    let listed = rpc(&app, "tools/list", json!({}), None).await;
+    let tool = listed["tools"].as_array().unwrap().iter().find(|tool| tool["name"] == "describe_config").expect("listed");
+    assert_eq!(tool["annotations"], json!({ "readOnlyHint": true, "destructiveHint": false }));
+    let description = tool["description"].as_str().unwrap();
+    for group in ignis_server::config_http::visible_groups() {
+        assert!(description.contains(group), "{group} in {description}");
+    }
+    assert!(description.contains(&ignis_server::config_http::groups_sentence()));
+    assert_eq!(tool["inputSchema"]["properties"]["names"]["type"], "array");
+
+    let result = rpc(&app, "tools/call", call_with("describe_config", json!({ "group": "vram" })), None).await;
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let (_, _, direct) = get(&app, "/v1/config/fields?group=vram", None).await;
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&result)).unwrap(), direct);
+
+    let result = rpc(&app, "tools/call", call_with("describe_config", json!({ "names": ["vram.budget_bytes", "server.bind"] })), None).await;
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let fields: Value = serde_json::from_str(&text_of(&result)).unwrap();
+    let keys: Vec<&str> = fields["data"].as_array().unwrap().iter().map(|field| field["file_key"].as_str().unwrap()).collect();
+    assert_eq!(keys.len(), 2, "{fields}");
+    assert!(keys.contains(&"vram.budget_bytes") && keys.contains(&"server.bind"));
+
+    // Neither: refused before the route, a tool error.
+    for arguments in [json!({}), json!({ "group": null })] {
+        let result = rpc(&app, "tools/call", call_with("describe_config", arguments), None).await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(text_of(&result).contains("`group` or `names`"), "{result}");
+    }
+
+    // An unknown group is the route's error, verbatim.
+    let result = rpc(&app, "tools/call", call_with("describe_config", json!({ "group": "nope" })), None).await;
+    assert_eq!(result["isError"], true, "{result}");
+    let error: Value = serde_json::from_str(&text_of(&result)).unwrap();
+    assert_eq!(error["error"]["code"], "config_invalid", "{error}");
 }
