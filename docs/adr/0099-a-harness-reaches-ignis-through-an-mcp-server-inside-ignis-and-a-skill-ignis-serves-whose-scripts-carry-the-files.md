@@ -30,9 +30,12 @@ list left empty, its default.
 **Where the tools are declared.** A tool is declared where its endpoint is:
 an `x-ignis-tool` extension on the endpoint's `#[utoipa::path]` names the
 tool, gives its short description for the model and its `read_only` and
-`destructive` hints, and narrows its input where the route's own is too wide.
-It may fix a query the tool always sends, and mark a tool that changes the
-server. The tool list is built once at start from the OpenAPI document,
+`destructive` hints, and narrows its input where the route's own is too wide
+(`input`). Three keys are optional beside those: `query`, a query the tool
+always sends; `changes`, which marks a tool that changes the server, listed
+only with `connector.allow_changes`; and `require_any`, argument names of which
+a call must carry at least one, else it is the tool's error before the route
+is asked. Any other key fails the table's build. The tool list is built once at start from the OpenAPI document,
 sorted by name, so it is byte-identical whatever model is loaded, and a
 harness's prompt reuse survives it.
 
@@ -106,6 +109,9 @@ the same machine. With the scripts, the server touches no file and
   once a call has its turn, so never by an enhancer a call before it visits,
   and with the image model loaded it reads the text model the server
   switched away from, which it remembers.
+- A call carrying a progress token hears `waiting` while a call before it
+  runs, a message of the connector's own, then the image route's phases
+  (`switching`, `loading`, the job's steps) as MCP progress notifications.
 - The image model never runs beside a text model
   ([ADR 0050](0050-ignis-serves-an-image-model.md)). The next chat turn's
   implicit switch brings the text model back: no tool switches back itself.

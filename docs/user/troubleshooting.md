@@ -513,6 +513,14 @@ entry that is not on disk, the message names the
 `ignis-server model download <id>` that fetches it; a switch never starts a
 download ([Get a model](guides/models.md), [Switching models](api/model-switching.md)).
 
+### `404 connector_disabled`
+
+From 0.11.0: `/v1/mcp` or `/v1/connector/skill` answers it when the server was
+started with the connector off, `--connector-enabled false` (`connector.enabled`
+in the config file, `IGNIS_CONNECTOR_ENABLED`), named in the message. The field
+takes effect at start only, so `PATCH /v1/config` refuses it: turn it on where
+the server starts and restart it ([The connector](guides/connector.md#the-settings)).
+
 ### `409 model_above_card_class`
 
 The request or the switch names a catalog entry that needs a larger card than

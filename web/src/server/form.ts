@@ -24,6 +24,7 @@ const GROUP_TITLES: Record<string, string> = {
   download: "Download",
   ngram: "N-gram table",
   kv_disk: "KV-disk",
+  connector: "Connector",
 };
 
 /** A group's heading; a group this page does not know yet is shown by its key. */

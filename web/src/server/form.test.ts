@@ -11,6 +11,7 @@ import {
   familyName,
   fieldMatches,
   firstSentence,
+  groupTitle,
   inScope,
   namedKeys,
   patchBody,
@@ -464,5 +465,13 @@ describe("drainTimeout", () => {
     expect(drainTimeout(CONFIG)).toBe(30);
     expect(drainTimeout({ switch: { drain_timeout: 0 } })).toBe(0);
     expect(drainTimeout(null)).toBeNull();
+  });
+});
+
+describe("groupTitle", () => {
+  it("titles the connector's group, and shows a group it does not know by its key", () => {
+    expect(groupTitle("connector")).toBe("Connector");
+    expect(groupTitle("kv_disk")).toBe("KV-disk");
+    expect(groupTitle("a_new_group")).toBe("a_new_group");
   });
 });
