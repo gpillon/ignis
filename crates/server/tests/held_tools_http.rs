@@ -14,6 +14,7 @@
 //! above the rest, then the vocabulary in order, so a script that writes the
 //! right number of tokens after a miss comes back in line with it.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,6 +78,8 @@ fn encode(text: &str) -> Vec<TokenId> {
 /// one token.
 struct Vocabulary {
     grammars: Arc<GrammarCache>,
+    /// How many times the grammar cache was asked for.
+    reads: Arc<AtomicUsize>,
     split_think_end: bool,
 }
 
@@ -95,7 +98,7 @@ impl Vocabulary {
             .collect();
         let added = TAGS.iter().map(|(id, tag)| (*id, tag.as_bytes().to_vec())).collect();
         let grammars = Arc::new(GrammarCache::new(Vocab::new(entries, &[STOP]), DEFAULT_CACHE_BYTES).with_added_texts(added));
-        Self { grammars, split_think_end: false }
+        Self { grammars, reads: Arc::default(), split_think_end: false }
     }
 }
 
@@ -129,6 +132,7 @@ impl TemplateProvider for Vocabulary {
     }
 
     fn grammars(&self) -> Option<Arc<GrammarCache>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         Some(self.grammars.clone())
     }
 }
@@ -259,6 +263,38 @@ async fn a_strict_schema_is_compiled_once_in_the_order_sent() {
         assert_eq!(calls.len(), 1);
         assert_eq!((grammars.compiles(), grammars.len()), (2, 2), "the schema as sent, and the tools'");
     }
+}
+
+/// A request that declares no tool builds no grammar cache, metrics on, on
+/// chat completions and on the Responses API (#648); the same request with a
+/// declared tool builds one.
+#[tokio::test]
+async fn a_request_that_declares_no_tool_builds_no_grammar_cache() {
+    let vocabulary = Vocabulary::new();
+    let reads = vocabulary.reads.clone();
+    let scheduler = ConcreteScheduler::with_config(SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() }, Arc::new(MockCompute::new()));
+    let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(vocabulary)).with_seedless_seed(0).with_family(ModelFamily::Qwen38_27b).with_metrics();
+    let responses = format!(r#"{{"model":"{MODEL}","input":"write it","max_output_tokens":8}}"#);
+    for tools in [&[][..], &[SEARCH][..]] {
+        let before = reads.load(Ordering::Relaxed);
+        let (status, _, text) = post(&server, &chat(tools, false, 8)).await;
+        assert_eq!(status, 200, "{text}");
+        let chat_reads = reads.load(Ordering::Relaxed) - before;
+        let request = Request::builder().method("POST").uri("/v1/responses").header("content-type", "application/json");
+        let body = match tools.is_empty() {
+            true => responses.clone(),
+            false => responses.replacen('{', &format!(r#"{{"tools":[{}],"#, flat_search()), 1),
+        };
+        let status = server.app().oneshot(request.body(Body::from(body)).unwrap()).await.unwrap().status().as_u16();
+        assert_eq!(status, 200);
+        let responses_reads = reads.load(Ordering::Relaxed) - before - chat_reads;
+        assert_eq!((chat_reads > 0, responses_reads > 0), (!tools.is_empty(), !tools.is_empty()), "{} tool(s) declared", tools.len());
+    }
+}
+
+/// `search` as the Responses API declares a function.
+fn flat_search() -> &'static str {
+    r#"{"type":"function","name":"search","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}"#
 }
 
 /// The scripts that miss on purpose, each one call to `write_file`, and

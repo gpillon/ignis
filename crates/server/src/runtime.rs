@@ -221,7 +221,7 @@ impl From<&crate::config::Config> for EngineShape {
             opener_page_rides_capture: config
                 .basis
                 .family()
-                .is_some_and(|family| crate::config::arch::opener_page_rides_capture(family, gpu_generation)),
+                .is_some_and(|family| crate::config::arch::opener_page_rides_capture(family, gpu_generation, crate::config::arch::second_tail_cut_requested())),
             gpu_generation,
             retained_device_slots: config.retained_device_slots,
             retained_host_slots: config.retained_host_slots,
@@ -293,7 +293,7 @@ impl EngineShape {
         // GitHub #306: and so is an unnamed decode share, and where the
         // opener's page is published -- on the card's generation (#508).
         let this = Self {
-            opener_page_rides_capture: crate::config::arch::opener_page_rides_capture(family, self.gpu_generation),
+            opener_page_rides_capture: crate::config::arch::opener_page_rides_capture(family, self.gpu_generation, crate::config::arch::second_tail_cut_requested()),
             ..self.with_family_decode_share(family)
         };
         if this.retained_host_named || !this.prompt_reuse {
@@ -2209,11 +2209,12 @@ mod tests {
                 .opener_page_rides_capture,
             "a property of the family, inert while reuse is off"
         );
-        // The 27B's load takes only the decode-share step (`main.rs`), and
-        // nothing on that path may switch it on.
+        // The 27B's load takes only the decode-share step (`main.rs`), which
+        // leaves the shape's own flag alone; fitted to the family it rides on
+        // every card and with none read (GitHub #649).
         let on_27b = unnamed.with_family_decode_share(ModelFamily::Qwen38_27b);
         assert!(!scheduler_config_for_shape("m".into(), on_27b, 64, 1024, 8).opener_page_rides_capture);
-        assert!(!scheduler_config_for_shape("m".into(), unnamed.for_family(ModelFamily::Qwen38_27b), 64, 1024, 8)
+        assert!(scheduler_config_for_shape("m".into(), unnamed.for_family(ModelFamily::Qwen38_27b), 64, 1024, 8)
             .opener_page_rides_capture);
     }
 
@@ -2221,12 +2222,12 @@ mod tests {
     /// rides the capture on the card the start read when it is an Ampere or an
     /// Ada one, on the path its load takes (`load::load_shape`, then its
     /// decode share) and when the shape is fitted to it again; on an RTX 5090
-    /// it keeps its two cuts. Flash-Next's rides on every card.
+    /// too (GitHub #649). Flash-Next's rides on every card.
     #[test]
-    fn the_27b_s_opener_page_rides_the_capture_on_ampere_and_ada_cards() {
+    fn the_27b_s_opener_page_rides_the_capture_on_every_card() {
         use crate::config::profile::{testing, Card};
         use ignis_core::compute::ModelFamily;
-        for (card, rides) in [(testing::rtx_3090(), true), (testing::rtx_4090(), true), (testing::rtx_5090(), false)] {
+        for (card, rides) in [(testing::rtx_3090(), true), (testing::rtx_4090(), true), (testing::rtx_5090(), true)] {
             let name = card.name.clone();
             let crate::config::ConfigOutcome::Config(config) =
                 crate::config::resolve_on(&[], |_| None, &crate::config::file::NoFiles, &|| Card::Read(card.clone())).expect("resolve")

@@ -148,11 +148,16 @@ beyond the best match above it (for KV-disk, 8,192 on Flash-Next and
   of the TTFT of a 1,024-token cold request, and under 2 percent on a 70K prompt
   ([the finding](../../findings/2026-09-18-prompt-reuse-tax-on-short-ttft.md)).
   The bet is that a later request skips more than that. On Flash-Next, and on
-  the 27B on an RTX 30 or RTX 40 card, where a traversal costs clearly more, the
-  publish point rides the opener's cut instead: the capture at the opener hands
-  over the whole pages below it, and the prompt is cut once. What that gives up
-  is the image at the opener's page floor, which only a prompt parting from
-  this one in the last page before its opener would have resumed from.
+  the 27B on every card, the publish point rides the opener's cut instead: the
+  capture at the opener hands over the whole pages below it, and the prompt is
+  cut once. The 27B on an RTX 5090 used to keep the second cut; measured, it
+  cost 45 to 55 ms per request, so it is gone. What that gives up is the image
+  at the opener's page floor, which only a prompt parting from this one in the
+  last 63 tokens before its opener would have resumed from: that request now
+  resumes from the reuse point before it (the previous turn's checkpoint, or
+  the system block). An identical retry, a conversation's next turn and a
+  subagent burst resume as before. The 27B's splits move on Blackwell, so its
+  greedy text can change where two tokens are nearly tied.
 - **A reused request may differ in the last bit.** A reused request and a cold
   prefill split their chunks differently, so they can diverge at near-ties of
   the model's own choice.
