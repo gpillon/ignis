@@ -95,11 +95,11 @@ generated `reference/` none.
 
 - **X.Y.Z is the next release's version**, the one the owner plans it as: the
   markings already in the README and the guide name it
-  (`grep -rni "from 0\." README.md docs/user`). When none does, ask; never infer
-  it from the change.
+  (`grep -rni "from 0\." README.md docs/user docs/site`). When none does, ask;
+  never infer it from the change.
 - **At release time** the version-bump commit removes that version's markings
   and the clauses about the release before it, so the guide reads as the
-  release again (`grep -rni "from X.Y.Z" README.md docs/user`).
+  release again (`grep -rni "from X.Y.Z" README.md docs/user docs/site`).
 
 ## How it is written
 
