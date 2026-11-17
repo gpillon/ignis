@@ -1,9 +1,10 @@
-//! What the download and removal route tests share (GitHub #376-#380),
-//! included via `#[path]` beside `repo.rs`, which the including test declares
-//! as `mod repo`: a request to the mock-backed router, the configuration a
-//! start with some flags resolves, the catalog's rows, read until one says
-//! what a test waits for, the files a models folder holds, and `ignis-server
-//! model download` run in process.
+//! What the download and removal route tests share (GitHub #376-#380), and
+//! the connector's (spec #656), included via `#[path]` beside `repo.rs`,
+//! which the including test declares as `mod repo`: a request to the
+//! mock-backed router, the configuration a start with some flags resolves,
+//! the catalog's rows, read until one says what a test waits for, the
+//! server's status, read until it serves what a test waits for, the files a
+//! models folder holds, and `ignis-server model download` run in process.
 
 #![allow(dead_code)]
 
@@ -81,6 +82,22 @@ pub async fn until_status(app: &axum::Router, wanted: &str) -> Value {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     panic!("`GET /v1/models` never reported {wanted}");
+}
+
+/// `GET /v1/models` until its `status` reads `serving` and `server` meets
+/// `wanted` in the same turn (bounded turns): a switch or a reload publishes
+/// its model, its settings and its status at different moments, so a test
+/// waits for every one it then asserts (CODING_STANDARDS, "A test waits for
+/// the whole end state").
+pub async fn until_serving(app: &axum::Router, server: &ignis_server::Server, wanted: impl Fn(&ignis_server::Server) -> bool) {
+    for _ in 0..10_000 {
+        let (status, body) = send(app, Method::GET, "/v1/models", None).await;
+        if status == StatusCode::OK && body["status"] == "serving" && wanted(server) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("`GET /v1/models` never reported serving with the state wanted: {:?}", server.status());
 }
 
 /// The files under `dir` but the entries' locks (`<artifact>.lock`, GitHub

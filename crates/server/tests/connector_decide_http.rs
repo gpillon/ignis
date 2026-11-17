@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::http::{header, Method, Request, StatusCode};
-use http_body_util::BodyExt;
 use ignis_core::compute::ModelFamily;
 use ignis_core::decision::{AnswerAlphabet, LabelTokenizer};
 use ignis_core::mock::MockCompute;
@@ -27,14 +26,13 @@ use ignis_server::template::{ChatMessage, RenderedPrompt, SimpleTemplateProvider
 use ignis_server::thinking::{ThinkingCapabilities, ThinkingOptions};
 use ignis_server::Server;
 use serde_json::{json, Value};
-use tower::ServiceExt;
+
+#[path = "support/harness.rs"]
+mod harness;
+use harness::{exchange, mcp_text, result_of, rpc_text, PROTOCOL};
 
 const MODEL: &str = "test-model";
 const KEY: &str = "sk-connector-decide-test";
-
-/// The protocol version the harness negotiated, named on every request
-/// after `initialize`.
-const PROTOCOL: &str = "2025-06-18";
 
 /// Just enough tokenizer to name two options: `/v1/decide` refuses a load
 /// whose tokenizer can label none.
@@ -115,12 +113,6 @@ fn prefilled(compute: &MockCompute) -> Vec<Vec<TokenId>> {
     compute.prefill_calls().into_iter().flatten().map(|job| job.tokens).collect()
 }
 
-async fn exchange(app: &axum::Router, request: Request<Body>) -> (StatusCode, Bytes) {
-    let response = app.clone().oneshot(request).await.unwrap();
-    let status = response.status();
-    (status, response.into_body().collect().await.unwrap().to_bytes())
-}
-
 /// One JSON-RPC request to `/v1/mcp`, `params` written as given: its
 /// `result`.
 async fn rpc(app: &axum::Router, method: &str, params: &str) -> Value {
@@ -129,23 +121,7 @@ async fn rpc(app: &axum::Router, method: &str, params: &str) -> Value {
 
 /// [`rpc`], sent with `key` when there is one.
 async fn rpc_keyed(app: &axum::Router, method: &str, params: &str, key: Option<&str>) -> Value {
-    let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
-    let mut request = Request::builder()
-        .method(Method::POST)
-        .uri("/v1/mcp")
-        .header(header::HOST, "ignis.example:8000")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCEPT, "application/json, text/event-stream");
-    if method != "initialize" {
-        request = request.header("mcp-protocol-version", PROTOCOL);
-    }
-    if let Some(key) = key {
-        request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
-    }
-    let (status, bytes) = exchange(app, request.body(Body::from(body)).unwrap()).await;
-    assert_eq!(status, StatusCode::OK, "{method}: {}", String::from_utf8_lossy(&bytes));
-    let answer: Value = serde_json::from_slice(&bytes).unwrap();
-    answer.get("result").cloned().unwrap_or_else(|| panic!("{method}: no result: {answer}"))
+    result_of(method, &rpc_text(app, method, params, key).await)
 }
 
 /// `decide` called with `arguments`, written as given.
@@ -165,7 +141,8 @@ async fn direct(app: &axum::Router, body: &str) -> (StatusCode, Bytes) {
         .method(Method::POST)
         .uri("/v1/decide")
         .header(header::CONTENT_TYPE, "application/json");
-    exchange(app, request.body(Body::from(body.to_owned())).unwrap()).await
+    let (status, _, bytes) = exchange(app, request.body(Body::from(body.to_owned())).unwrap()).await;
+    (status, bytes)
 }
 
 /// The one text a result's `content` holds.
@@ -297,14 +274,7 @@ async fn a_body_past_the_mcp_cap_is_refused_413() {
     let (app, compute) = server(ModelFamily::Qwen38_27b);
     let state = "x".repeat(4 << 20);
     let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"decide","arguments":{{"state":"{state}","questions":{{}}}}}}}}"#);
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("/v1/mcp")
-        .header(header::HOST, "ignis.example:8000")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCEPT, "application/json, text/event-stream")
-        .header("mcp-protocol-version", PROTOCOL);
-    let (status, _) = exchange(&app, request.body(Body::from(body)).unwrap()).await;
+    let (status, _, _) = exchange(&app, mcp_text(body, false, None)).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(prefilled(&compute).is_empty());
 }

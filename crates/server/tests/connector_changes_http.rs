@@ -11,9 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::{Body, Bytes};
-use axum::http::{header, Method, Request, StatusCode};
-use http_body_util::BodyExt;
+use axum::body::Bytes;
 use ignis_server::config::file::RealFiles;
 use ignis_server::config::Config;
 use ignis_server::config_http::ConfigState;
@@ -21,7 +19,6 @@ use ignis_server::download_http::Downloads;
 use ignis_server::model_switch::Switcher;
 use ignis_server::Server;
 use serde_json::{json, Value};
-use tower::ServiceExt;
 
 #[path = "support/switch.rs"]
 mod switch_support;
@@ -33,19 +30,13 @@ use repo::{catalog_served, files_of, Repo};
 
 #[path = "support/model_routes.rs"]
 mod routes;
-use routes::{config, files_in, row, until_row, until_status, PATIENT};
+use routes::{config, files_in, row, until_row, until_serving, PATIENT};
 
-const PROTOCOL: &str = "2025-06-18";
+#[path = "support/harness.rs"]
+mod harness;
+use harness::{config_file, initialize, rpc, rpc_bytes};
+
 const CHANGES: [&str; 3] = ["cancel_download", "change_config", "download_model"];
-
-/// A config file of its own for one test: no test reads the operator's.
-fn config_file(test: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ignis-connector-changes-{test}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("ignis.config.yaml");
-    std::fs::write(&path, "server:\n  request_timeout: 30\n").unwrap();
-    path
-}
 
 /// A server on `mock-a` with a switcher over a catalog of `acme-new`,
 /// downloads from `repo`, the config state a start builds and a connector as
@@ -68,37 +59,9 @@ fn server_on(loader: &Arc<MockLoader>, repo: &Repo, tag: &str, allow_changes: bo
     (server, path, dir)
 }
 
-fn mcp(body: &Value) -> Request<Body> {
-    let mut request = Request::builder()
-        .method(Method::POST)
-        .uri("/v1/mcp")
-        .header(header::HOST, "ignis.example:8000")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCEPT, "application/json, text/event-stream");
-    if body["method"] != "initialize" {
-        request = request.header("mcp-protocol-version", PROTOCOL);
-    }
-    request.body(Body::from(body.to_string())).unwrap()
-}
-
-/// One JSON-RPC request, answered `200`: the raw body.
-async fn rpc_bytes(app: &axum::Router, method: &str, params: Value) -> Bytes {
-    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-    let response = app.clone().oneshot(mcp(&body)).await.unwrap();
-    let status = response.status();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(status, StatusCode::OK, "{method}: {}", String::from_utf8_lossy(&bytes));
-    bytes
-}
-
-async fn rpc(app: &axum::Router, method: &str, params: Value) -> Value {
-    let answer: Value = serde_json::from_slice(&rpc_bytes(app, method, params).await).unwrap();
-    answer.get("result").cloned().unwrap_or_else(|| panic!("{method}: no result: {answer}"))
-}
-
 /// A `tools/call` result.
 async fn call(app: &axum::Router, name: &str, arguments: Value) -> Value {
-    rpc(app, "tools/call", json!({ "name": name, "arguments": arguments })).await
+    rpc(app, "tools/call", json!({ "name": name, "arguments": arguments }), None).await
 }
 
 /// The one text a result carries.
@@ -114,16 +77,12 @@ fn body_of(result: &Value) -> Value {
 }
 
 async fn tools_list(app: &axum::Router) -> Bytes {
-    rpc_bytes(app, "tools/list", json!({})).await
+    rpc_bytes(app, "tools/list", json!({}), None).await
 }
 
 fn names_of(listed: &Bytes) -> Vec<String> {
     let listed: Value = serde_json::from_slice(listed).unwrap();
     listed["result"]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].as_str().unwrap().to_owned()).collect()
-}
-
-fn initialize() -> Value {
-    json!({ "protocolVersion": PROTOCOL, "capabilities": {}, "clientInfo": { "name": "a-harness", "version": "1.0" } })
 }
 
 // ── the list ─────────────────────────────────────────────────────────────
@@ -142,14 +101,14 @@ async fn the_list_has_the_change_tools_only_with_allow_changes_and_is_byte_stabl
     let off = off.app();
     let off_list = tools_list(&off).await;
     assert_eq!(names_of(&off_list), ["decide", "describe_config", "generate_image", "read_catalog", "read_config"]);
-    let result = rpc(&off, "initialize", initialize()).await;
+    let result = rpc(&off, "initialize", initialize(), None).await;
     let instructions = result["instructions"].as_str().unwrap();
     for name in CHANGES {
         assert!(!instructions.contains(name), "{name}: {instructions}");
     }
     // Not listed, not callable: a protocol error, nothing changed.
     let params = json!({ "name": "change_config", "arguments": { "server": { "request_timeout": 5 } } });
-    let answer: Value = serde_json::from_slice(&rpc_bytes(&off, "tools/call", params).await).unwrap();
+    let answer: Value = serde_json::from_slice(&rpc_bytes(&off, "tools/call", params, None).await).unwrap();
     assert!(answer.get("error").is_some(), "{answer}");
 
     let loader = MockLoader::new();
@@ -175,7 +134,7 @@ async fn the_list_has_the_change_tools_only_with_allow_changes_and_is_byte_stabl
     for warning in ["reload", "prompt state", "null"] {
         assert!(description.contains(warning), "{warning}: {description}");
     }
-    let result = rpc(&on, "initialize", initialize()).await;
+    let result = rpc(&on, "initialize", initialize(), None).await;
     let instructions = result["instructions"].as_str().unwrap();
     assert!(instructions.len() < 1024, "{} bytes", instructions.len());
     let last = instructions.lines().last().unwrap();
@@ -243,8 +202,7 @@ async fn change_config_with_a_reload_field_answers_that_it_reloaded() {
     assert_eq!(applied["switching"], json!({ "from": "mock-a", "to": "mock-a" }));
     assert_eq!(server.live().request_timeout, Duration::from_secs(30), "nothing of the patch before the reload serves");
     release.send(()).expect("the held load is waiting");
-    until_status(&app, "serving").await;
-    assert_eq!(server.live().request_timeout, Duration::from_secs(91));
+    until_serving(&app, &server, |server| server.live().request_timeout == Duration::from_secs(91)).await;
     assert!(std::fs::read_to_string(&path).unwrap().contains("kv_host_pool_bytes"));
     let handed = loader.prepared_options();
     let options = handed.last().unwrap().as_ref().expect("the reload hands the patched config to the loader");
@@ -276,7 +234,7 @@ async fn a_download_is_started_with_download_model_followed_in_the_catalog_and_c
     let accepted = body_of(&result);
     assert_eq!((accepted["status"].clone(), accepted["model"].clone()), (json!("downloading"), json!("acme-new")), "{accepted}");
     // Its progress is read through `read_catalog`.
-    until_row(&app, "acme-new", |row| row["bytes_on_disk"] == json!(1 + 4096)).await;
+    until_row(&app, "acme-new", |row| row["bytes_on_disk"] == json!(1 + 4096) && row["download"] == "running").await;
     let catalog = body_of(&call(&app, "read_catalog", json!({})).await);
     assert_eq!(row(&catalog, "acme-new")["download"], "running", "{catalog}");
 
