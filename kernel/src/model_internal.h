@@ -11,6 +11,7 @@
 #include "ignis_step.h"
 #include "ignis_trellis_linear.h"
 
+#include "prefill_swiglu.h"
 #include "rope_scaling.h"
 #include "tma_descriptor_cache.h"
 #include "w4a4_activation_layout.h"
@@ -577,6 +578,11 @@ struct ignis_model {
   // read by every head call (kernel/src/mtp_head.cu `head_linear`), so every
   // graph captured on this load bakes it in. False on a load without the head.
   bool mtp_head_linear_ours = false;
+  // GitHub #651 (spec #646): the route of the prefill's MLP gate and up product, decided once at
+  // load (model.cu `prefill_swiglu_switch`): the fused op (kernel/src/prefill_swiglu.h) at every
+  // width the W4A4 TMA route takes, or the vendored dispatch; read by every MLP call of the NVFP4
+  // body (kernel/src/gdn_layer.cu and gqa_layer.cu `output_and_mlp`). The trellis body runs none.
+  ignis::prefill_swiglu::Route prefill_swiglu = ignis::prefill_swiglu::Route::Split;
   uint64_t vram_bytes = 0;
   // ADR 0062: what of the bound tensors lives in mapped host memory.
   uint64_t host_mapped_bytes = 0;

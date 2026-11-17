@@ -150,6 +150,45 @@ impl GdnPrefill {
     }
 }
 
+/// The route of the 27B prefill's MLP gate and up product on its NVFP4 body
+/// (GitHub #651, spec #646), which no load option names: the leaf reads the
+/// measurement switch `IGNIS_PREFILL_SWIGLU` once per load and reports it
+/// ([`crate::model_load::Model::prefill_swiglu`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefillSwiglu {
+    /// The vendored dispatch: the product, then SiLU-mul, and at exactly
+    /// 1,024 tokens the vendored fused kernel; what `IGNIS_PREFILL_SWIGLU=split`
+    /// names.
+    Split,
+    /// ignis's fused op (`kernel/src/prefill_swiglu.h`), the split route's
+    /// bytes, at every width the W4A4 TMA route takes from 1,024 tokens: the
+    /// default.
+    Fused,
+}
+
+impl PrefillSwiglu {
+    /// `enum ignis_prefill_swiglu`: `Ok(None)` for a load whose prefill runs
+    /// no such product (0: the trellis body, Flash-Next), `Ok(Some(..))` for 1
+    /// (split) and 2 (fused), and the code back as the error for any other.
+    pub const fn from_abi(code: u32) -> Result<Option<Self>, u32> {
+        match code {
+            0 => Ok(None),
+            1 => Ok(Some(Self::Split)),
+            2 => Ok(Some(Self::Fused)),
+            unknown => Err(unknown),
+        }
+    }
+
+    /// The switch's own spellings, which the load's
+    /// `ignis.runtime.prefill_routes` line reports (`none` without the product).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Fused => "fused",
+        }
+    }
+}
+
 /// The layout the 27B's W4A4 prefill products read their activations in
 /// (GitHub #652, spec #646), which no load option names: the leaf decides it
 /// once per load, K-tile-major unless the measurement switch

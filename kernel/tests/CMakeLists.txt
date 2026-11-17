@@ -1211,6 +1211,20 @@ target_link_libraries(ignis_kernel_tma_descriptor_cache_test PRIVATE ignis_kerne
 add_test(NAME ignis_kernel_tma_descriptor_cache_test COMMAND ignis_kernel_tma_descriptor_cache_test)
 set_tests_properties(ignis_kernel_tma_descriptor_cache_test PROPERTIES TIMEOUT 120)
 
+# GitHub #651 (spec #646): OURS -- the 27B prefill's gate and up product with SwiGLU in its
+# epilogue (kernel/src/prefill_swiglu.h), an adapted op: at the 27B's [34816, 5120] shape and at
+# 1,024, 1,280, 2,048 and 4,096 tokens its BF16 output is the split route's (the product, then
+# SwiGLU) byte for byte, on a plain stream and on one a descriptor cache serves; the vendored fused
+# kernel at 1,024 differing is the positive control; the widths it takes, the layers' entry under
+# each route and its switch's parse.
+# GPU (ADR 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_prefill_swiglu_test test_prefill_swiglu.cu)
+target_include_directories(ignis_kernel_prefill_swiglu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src
+  ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_prefill_swiglu_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_prefill_swiglu_test COMMAND ignis_kernel_prefill_swiglu_test)
+set_tests_properties(ignis_kernel_prefill_swiglu_test PROPERTIES TIMEOUT 300)
+
 # GitHub #652 (spec #646): OURS -- the layout the W4A4 prefill products read their activations in
 # (kernel/src/w4a4_activation_layout.h): the switch IGNIS_W4A4_ACTIVATION_LAYOUT as a load reads
 # it, the quantizer's K-tile-major bytes against the stock ones moved, and the 27B's five prefill
@@ -1247,5 +1261,6 @@ set(ignis_sm120a_only_tests
   ignis_kernel_image_encoder_test
   ignis_kernel_image_transformer_test
   ignis_kernel_tma_descriptor_cache_test
+  ignis_kernel_prefill_swiglu_test
   ignis_kernel_w4a4_activation_layout_test)
 set_tests_properties(${ignis_sm120a_only_tests} PROPERTIES LABELS sm120a-only)

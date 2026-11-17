@@ -712,6 +712,9 @@ impl StepLeaf for CudaLeaf {
         // The review of spec #503: the prefill routes this load runs, the
         // gated delta net's among them, which no option names (the leaf decides
         // it from the card, or the measurement switch IGNIS_GDN_PREFILL does).
+        // GitHub #651: and the MLP gate and up product's, `fused` unless the
+        // measurement switch IGNIS_PREFILL_SWIGLU names `split`, `none` on the
+        // trellis body.
         // GitHub #652: and the layout its W4A4 products read their activations
         // in, `ktile` unless IGNIS_W4A4_ACTIVATION_LAYOUT=token, `none` where
         // the prefill runs no such product.
@@ -721,6 +724,7 @@ impl StepLeaf for CudaLeaf {
             prefill_linear = self.config.prefill_linear.as_str(),
             prefill_attention = self.config.prefill_attention.as_str(),
             gdn_prefill = model.gdn_prefill().as_str(),
+            prefill_swiglu = model.prefill_swiglu().map_or("none", |route| route.as_str()),
             w4a4_activation_layout = model.w4a4_activation_layout().as_str(),
             "prefill routes"
         );

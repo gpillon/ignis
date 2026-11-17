@@ -14,6 +14,7 @@
 #include "ignis_seq_internal.h"
 #include "layer_internal.h"
 #include "model_internal.h"
+#include "prefill_swiglu.h"
 #include "trellis_body.h"
 
 #include "ninfer/ops/attn_input_proj.h"
@@ -122,10 +123,11 @@ void output_and_mlp(ignis_model &model, const GqaLayerWeights &weights, const ni
   // forces the A16 route where it is registered (T<=16) and the op's only
   // runnable route above its A16 cap -- the pre-#85 behavior. The scratch
   // was already reserved for AllowA4 at any T (P2-01, GitHub #83), so a
-  // chunk's A4 route needs nothing new.
-  ninfer::ops::linear_swiglu(post, weights.mlp_gate_up, fused,
-                             ignis_linear_swiglu_policy_for(weights.mlp_gate_up.qtype, mode, tokens), arena,
-                             stream);
+  // chunk's A4 route needs nothing new. GitHub #651: under the load's
+  // route, the fused op at the W4A4 TMA widths (kernel/src/prefill_swiglu.h).
+  ignis::prefill_swiglu::linear_swiglu(model.prefill_swiglu, post, weights.mlp_gate_up, fused,
+                                       ignis_linear_swiglu_policy_for(weights.mlp_gate_up.qtype, mode, tokens),
+                                       arena, stream);
   ninfer::ops::linear_add(fused, weights.mlp_down, residual, ignis_policy_for(weights.mlp_down.qtype, mode), arena,
                           stream);
 }

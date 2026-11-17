@@ -239,6 +239,8 @@ pub(crate) mod ffi {
 
         pub fn ignis_model_mtp_head_linear(model: *const IgnisModel) -> u32;
 
+        pub fn ignis_model_prefill_swiglu(model: *const IgnisModel) -> u32;
+
         pub fn ignis_model_w4a4_activation_layout(model: *const IgnisModel) -> u32;
 
         pub fn ignis_model_vision_item_max_tokens(model: *const IgnisModel) -> u32;
@@ -290,6 +292,16 @@ impl Model {
         let code = unsafe { ffi::ignis_model_mtp_head_linear(self.handle) };
         crate::mtp_head::HeadLinear::from_abi(code)
             .unwrap_or_else(|unknown| panic!("ignis_model_mtp_head_linear: unknown route {unknown}"))
+    }
+
+    /// The route this load's prefill runs its MLP gate and up product on
+    /// (GitHub #651), as the leaf decided it at load: fused unless
+    /// `IGNIS_PREFILL_SWIGLU=split`; `None` on the trellis body, which runs no
+    /// such product.
+    pub fn prefill_swiglu(&self) -> Option<crate::PrefillSwiglu> {
+        let code = unsafe { ffi::ignis_model_prefill_swiglu(self.handle) };
+        crate::PrefillSwiglu::from_abi(code)
+            .unwrap_or_else(|unknown| panic!("ignis_model_prefill_swiglu: unknown route {unknown}"))
     }
 
     /// The layout this load's W4A4 prefill products read their activations
