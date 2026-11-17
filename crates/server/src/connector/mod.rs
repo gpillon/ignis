@@ -70,12 +70,14 @@ A failed call returns the server's error JSON and Retry-After; nothing is retrie
 /// scripts handle a file on the harness's side, which no tool can. Both
 /// work with `IGNIS_BASE_URL` unset, and with `IGNIS_API_KEY` unset (a server
 /// without a key ignores the header). The PowerShell form downloads to a file
-/// first, `s` beside the extracted skill: Windows PowerShell 5.1 pipes a
-/// native command's output as text, which would corrupt the archive. At 380
-/// bytes it is the ticket's whole share of the 1 KB; the guide's forms are
-/// the longer ones that clean up.
+/// first, `s`, since Windows PowerShell 5.1 pipes a native command's output
+/// as text, which would corrupt the archive; it does so in the skills folder,
+/// handing `tar` that relative name, which any `tar` reads (Git for
+/// Windows's, first in some `PATH`s, reads `C:` as a host), deletes it, and
+/// goes back where it was. At most 380 bytes, the ticket's share of the 1 KB;
+/// the guide's forms are the longer, spelt-out ones.
 pub(crate) const INSTALL: &str = r#"Skill (files) sh: d=~/.agents/skills;mkdir -p $d;curl -fsS -H "Authorization: Bearer $IGNIS_API_KEY" ${IGNIS_BASE_URL:-http://127.0.0.1:8000}/v1/connector/skill|tar xz -C $d
-ps: $u=$env:IGNIS_BASE_URL;if(!$u){$u='http://127.0.0.1:8000'};$d="$HOME/.agents/skills";md -f $d;curl.exe -fsS -H "Authorization: Bearer $env:IGNIS_API_KEY" -o $d/s $u/v1/connector/skill;tar xzf $d/s -C $d"#;
+ps: $u=$env:IGNIS_BASE_URL;if(!$u){$u='http://127.0.0.1:8000'};md -f ~/.agents/skills|pushd;curl.exe -fsS -H "Authorization: Bearer $env:IGNIS_API_KEY" -o s $u/v1/connector/skill;tar xzf s;rm s;popd"#;
 
 /// The change tools' line in `instructions`, only when they are listed
 /// (`connector.allow_changes`): the harm a patch can do, at 120 bytes at
@@ -290,5 +292,60 @@ mod tests {
     #[test]
     fn the_skill_install_keeps_within_its_share() {
         assert!(super::INSTALL.len() <= 380, "{} bytes", super::INSTALL.len());
+    }
+
+    /// What a PowerShell install form does wrong, if anything. It must work
+    /// in the skills folder (`Push-Location`), download the archive there
+    /// under a relative name, give `tar` that name alone, delete it, and
+    /// leave the shell where it was: a `C:` path is a host name to Git for
+    /// Windows's `tar`, which may come first in `PATH`.
+    fn powershell_install_faults(form: &str) -> Vec<String> {
+        let commands: Vec<&str> = form.split(['\n', ';']).map(str::trim).filter(|command| !command.is_empty()).collect();
+        let at = |found: &dyn Fn(&str) -> bool| commands.iter().position(|command| found(command));
+        let words = |command: &str| command.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        let mut faults = Vec::new();
+        let into = at(&|command| words(command).iter().any(|word| word.ends_with("pushd") || word == "Push-Location"));
+        let back = at(&|command| command == "popd" || command == "Pop-Location");
+        let download = at(&|command| command.starts_with("curl.exe "));
+        let archive = download.and_then(|i| words(commands[i]).into_iter().skip_while(|word| word != "-o").nth(1));
+        let Some(archive) = archive else {
+            return vec![format!("no `curl.exe … -o <file>`: {form}")];
+        };
+        if archive.contains(['/', '\\', '$', ':']) {
+            faults.push(format!("the archive is downloaded to `{archive}`, not a name relative to the skills folder"));
+        }
+        if let Some(into) = into {
+            // The folder named there, or a variable set to it.
+            let set = |word: &str| {
+                commands.iter().any(|command| command.replace(' ', "").starts_with(&format!("{word}=")) && command.ends_with(".agents/skills\""))
+            };
+            if !commands[into].contains(".agents/skills") && !words(commands[into]).iter().any(|word| set(word)) {
+                faults.push(format!("`{}` enters no skills folder", commands[into]));
+            }
+        }
+        let tar = at(&|command| command.starts_with("tar "));
+        if let Some(tar) = tar.filter(|&tar| words(commands[tar]) != ["tar", "xzf", archive.as_str()]) {
+            faults.push(format!("`{}` is not `tar xzf {archive}`", commands[tar]));
+        }
+        let removed = at(&|command| ["rm", "Remove-Item"].iter().any(|remove| words(command) == [*remove, archive.as_str()]));
+        let order = [into, download, tar, removed, back];
+        if order.iter().any(Option::is_none) || !order.windows(2).all(|pair| pair[0] < pair[1]) {
+            faults.push(format!("not in the skills folder, download, `tar`, delete, back: {order:?}"));
+        }
+        faults
+    }
+
+    /// Spec #656, ticket #662: the PowerShell install in `instructions` and
+    /// the guide's work in the skills folder with relative names and leave
+    /// no file behind.
+    #[test]
+    fn the_powershell_installs_work_in_the_skills_folder_and_leave_nothing_behind() {
+        let line = super::INSTALL.lines().find_map(|line| line.strip_prefix("ps: ")).expect("the PowerShell line");
+        assert_eq!(powershell_install_faults(line), Vec::<String>::new(), "{line}");
+        let guide = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/user/guides/connector.md")).unwrap();
+        let block = guide.split("```powershell\n").nth(1).and_then(|rest| rest.split("```").next()).expect("the guide's PowerShell form");
+        assert_eq!(powershell_install_faults(block), Vec::<String>::new(), "{block}");
+        let bad = r#"$d="$HOME/.agents/skills";curl.exe -fsS -o $d/s http://h/v1/connector/skill;tar xzf $d/s -C $d"#;
+        assert_eq!(powershell_install_faults(bad).len(), 3, "{:?}", powershell_install_faults(bad));
     }
 }

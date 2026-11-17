@@ -137,6 +137,16 @@ make test-web       # vitest
 make web-build      # the TypeScript check and the production build
 ```
 
+## The connector's skill
+
+From 0.11.0 the [connector's skill](../guides/connector.md#the-skill), the
+Node scripts in `connector/ignis`, has `node --test` tests in `connector/`.
+They need Node alone, no `npm install`; a change to a script needs them green:
+
+```sh
+make test-connector # cd connector && node --test
+```
+
 ## The guide
 
 A change to `docs/user/` or `docs/site/` builds the site; a link to a missing
@@ -158,4 +168,5 @@ default, or a running server with
 real server). A change that alters a pictured screen retakes its scene.
 
 `make test-all` runs all of the above that need no GPU: `cargo test`, the
-Playground's typecheck and tests, and the guide's tests and build.
+Playground's typecheck and tests, the skill's script tests, and the guide's
+tests and build.

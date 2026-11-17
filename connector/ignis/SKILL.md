@@ -42,8 +42,9 @@ mock-up. `--size` is one of the sizes the server serves (`1024x1024`,
 loaded, else the first on disk. The server may switch models to make the
 image, which takes a while; the script waits for it.
 
-If the image needs no file, because it is only to look at, call the MCP tool
-`generate_image` instead: it returns a small preview and needs no script.
+If the image needs no file, because it is only to look at, call the ignis
+server's tool `generate_image` instead: it returns a small preview and needs
+no script.
 
 ## edit-image
 

@@ -541,6 +541,13 @@ test: ## cargo test, workspace-wide (CPU only, never touches the GPU)
 test-web: $(WEB_DEPS) ## Playground unit tests (vitest)
 	$(NPM) --prefix web run test
 
+# The connector skill's scripts (spec #656): plain Node, no dependencies, so
+# no `npm ci`. `node --test` from inside the folder, since Node 22 reads a
+# directory argument as a module to run, not a folder to search.
+.PHONY: test-connector
+test-connector: ## The connector skill's script tests (node --test, no dependencies)
+	cd connector && $(NODE) --test
+
 .PHONY: typecheck-web
 typecheck-web: $(WEB_DEPS) ## Playground TypeScript check
 	$(NPM) --prefix web run typecheck
@@ -566,7 +573,7 @@ grammar-venv: ## The Python venv the structured-output tests validate answers wi
 	  "$$py" -m pip install --quiet --disable-pip-version-check -r tools/grammar-check/requirements.txt && echo "$$py"
 
 .PHONY: test-all
-test-all: test typecheck-web test-web docs-test docs-build ## Everything CPU-side: cargo test + web typecheck + vitest + the guide's build
+test-all: test typecheck-web test-web test-connector docs-test docs-build ## Everything CPU-side: cargo test + web typecheck + vitest + the skill's node tests + the guide's build
 
 .PHONY: ci
 ci: version-check swagger-ui-check check test-all ## What a CI job would run (no GPU)

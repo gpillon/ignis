@@ -66,10 +66,16 @@ export async function call(tool, method, path, { json, form } = {}) {
   });
 }
 
-/** Exits 1 with the server's own JSON when `answer` is not a 2xx. */
+/**
+ * Exits 1 with the server's own JSON when `answer` is not a 2xx; a 401 with
+ * IGNIS_API_KEY unset says so too, since the key is then what is missing.
+ */
 export function refuse(tool, answer) {
   if (answer.status >= 200 && answer.status < 300) return;
   process.stderr.write(`${tool}: ignis answered ${answer.status}\n${answer.body.toString('utf8').trim()}\n`);
+  if (answer.status === 401 && !config().key) {
+    process.stderr.write(`${tool}: IGNIS_API_KEY is not set: set it to the server's API key\n`);
+  }
   process.exit(1);
 }
 

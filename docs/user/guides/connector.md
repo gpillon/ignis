@@ -405,7 +405,7 @@ use Node's `http` and `https` modules, not `fetch`, which gives up on a
 response whose headers take more than about five minutes. They print where the
 PNG went, and an error from ignis as the JSON it sent, with a non-zero exit.
 
-The MCP tool `generate_image` covers an image that needs no file: it returns a
+The server tool `generate_image` covers an image that needs no file: it returns a
 preview of at most 512 px and no file. When the image has to be kept, use
 `generate-image.mjs`, which writes it at full size.
 
@@ -429,18 +429,21 @@ On Windows, in PowerShell:
 
 ```powershell
 $base = $env:IGNIS_BASE_URL; if (!$base) { $base = 'http://127.0.0.1:8000' }
-$skills = "$HOME/.agents/skills"; $archive = "$env:TEMP/ignis-skill.tgz"
+$skills = "$HOME/.agents/skills"
 New-Item -ItemType Directory -Force $skills | Out-Null
-curl.exe -fsS -H "Authorization: Bearer $env:IGNIS_API_KEY" -o $archive "$base/v1/connector/skill"
-tar xzf $archive -C $skills; Remove-Item $archive
+Push-Location $skills
+curl.exe -fsS -H "Authorization: Bearer $env:IGNIS_API_KEY" -o ignis-skill.tgz "$base/v1/connector/skill"
+tar xzf ignis-skill.tgz; Remove-Item ignis-skill.tgz
+Pop-Location
 ```
 
 The PowerShell form uses `curl.exe`, since `curl` is an alias of
 `Invoke-WebRequest` there, and downloads to a file before `tar` reads it:
 Windows PowerShell 5.1 passes a native command's output through a pipe as
-text, which would corrupt the archive. If another `tar` comes first in `PATH`
-than Windows's own (Git for Windows's, say, which reads `C:` as a host name),
-call `C:\Windows\System32\tar.exe`.
+text, which would corrupt the archive. It works in the skills folder and
+hands `tar` the archive's name alone, so whichever `tar` comes first in
+`PATH` reads it (Git for Windows's reads a `C:` path as a host name), then
+deletes the archive and returns to the folder it started in.
 
 The model gets the same two commands in the connector's `instructions`, a
 shorter form of each, so it can install the skill itself when a user hands it
@@ -455,7 +458,8 @@ a file.
 
 A script exits non-zero on a failure. A missing file or an unreachable server
 is named in the message, and an error from ignis is printed as the JSON the
-server sent.
+server sent; a `401` met with `IGNIS_API_KEY` unset says so too, the variable
+being what is missing.
 
 ### After an upgrade
 

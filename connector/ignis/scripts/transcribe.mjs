@@ -11,44 +11,29 @@
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { call, refuse } from './lib.mjs';
+import { call, fail, parseArgs, refuse } from './lib.mjs';
 
+const TOOL = 'transcribe';
 const USAGE = 'usage: transcribe.mjs <audio> [--out file]';
 
-function fail(message) {
-  process.stderr.write(`transcribe: ${message}\n`);
-  process.exit(1);
-}
-
-let audio;
-let out;
-const args = process.argv.slice(2);
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === '--out') {
-    out = args[++i];
-    if (out === undefined) fail(`--out needs a file\n${USAGE}`);
-  } else if (args[i].startsWith('--')) {
-    fail(`unknown option ${args[i]}\n${USAGE}`);
-  } else if (audio === undefined) {
-    audio = args[i];
-  } else {
-    fail(`one audio file at a time\n${USAGE}`);
-  }
-}
-if (audio === undefined) fail(`no audio file given\n${USAGE}`);
+const { options, positional } = parseArgs(TOOL, USAGE, process.argv.slice(2), ['--out']);
+if (positional.length === 0) fail(TOOL, `no audio file given\n${USAGE}`);
+if (positional.length > 1) fail(TOOL, `one audio file at a time\n${USAGE}`);
+const [audio] = positional;
+const out = options['--out'];
 
 let bytes;
 try {
   bytes = await readFile(audio);
 } catch (error) {
-  fail(`cannot read ${audio}: ${error.code === 'ENOENT' ? 'no such file' : error.message}`);
+  fail(TOOL, `cannot read ${audio}: ${error.code === 'ENOENT' ? 'no such file' : error.message}`);
 }
 
 const form = new FormData();
 form.append('file', new Blob([bytes]), basename(audio));
 
-const answer = await call('transcribe', 'POST', '/v1/audio/transcriptions', { form });
-refuse('transcribe', answer);
+const answer = await call(TOOL, 'POST', '/v1/audio/transcriptions', { form });
+refuse(TOOL, answer);
 const body = answer.body.toString('utf8');
 
 let text;
@@ -57,13 +42,13 @@ try {
 } catch {
   text = undefined;
 }
-if (typeof text !== 'string') fail(`ignis's answer holds no transcript:\n${body.trim()}`);
+if (typeof text !== 'string') fail(TOOL, `ignis's answer holds no transcript:\n${body.trim()}`);
 
 if (out !== undefined) {
   try {
     await writeFile(out, `${text}\n`);
   } catch (error) {
-    fail(`cannot write ${out}: ${error.message}`);
+    fail(TOOL, `cannot write ${out}: ${error.message}`);
   }
 } else {
   process.stdout.write(`${text}\n`);

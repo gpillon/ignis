@@ -57,6 +57,12 @@ until the test suite is green.
   either: its logic lives in pure modules with vitest tests, so a change
   there also needs `npm --prefix web test` and `npm --prefix web run build`
   (the typecheck) green — `make test-web web-build`. `cargo test` covers only the server's `/ui` routes.
+- The connector's skill (`connector/ignis`, spec #656) is not exercised by
+  `cargo test` either: its Node scripts have `node --test` tests in
+  `connector/`, with no dependencies, so a change there also needs
+  `make test-connector` (`cd connector && node --test`) green. `make test-all`
+  runs it, and CI runs it beside the Playground's tests. `cargo test` covers
+  the archive the server packs of the folder and the route that serves it.
 - A `--features cuda` build rebuilds the leaf for you.
   `crates/artifact/build.rs` watches every file under `kernel/src`,
   `kernel/include`, `kernel/tests`, `kernel/vendor/src` and

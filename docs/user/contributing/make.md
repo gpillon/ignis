@@ -21,7 +21,8 @@ Git for Windows' `usr\bin` on `PATH`). `make` alone lists every target.
 | `make web-dev` / `web-mock` | Vite alone, against a running engine or an in-process fake one. |
 | `make smoke` / `canary` | One `/v1/models` + a short completion / the canary suite. |
 | `make metrics` | Scrape the metrics listener (on by default; a server started with `METRICS=0` has none). |
-| `make test` / `test-all` / `ci` | `cargo test` / plus web typecheck and vitest / what a CI job runs. |
+| `make test` / `test-all` / `ci` | `cargo test` / plus web typecheck, vitest and the connector skill's script tests / what a CI job runs. |
+| `make test-connector` | From 0.11.0: the connector skill's script tests, `node --test` in `connector/`; Node alone, no `npm`. |
 | `make grammar-venv` | From 0.11.0: the Python venv at `.scratch/grammar-venv` with the independent JSON Schema validator the structured-output tests check every served answer with. Without it those checks are skipped, saying so; CI installs it, and there a missing one fails them. |
 | `make gpu-status` / `gpu-guard` / `gpu-profile` | Who holds the card / refuse when it is held / the explicit GPU test profile. |
 | `make watch CUDA=0` | Rebuild + restart on every Rust change (cargo-watch). |

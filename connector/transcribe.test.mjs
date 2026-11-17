@@ -128,3 +128,18 @@ test('a trailing slash on IGNIS_BASE_URL does not double the path', async () => 
   await server.close();
   assert.equal(server.requests[0].url, '/v1/audio/transcriptions');
 });
+
+test('a 401 with IGNIS_API_KEY unset says the variable is unset, beside the server JSON', async () => {
+  const refusal = { error: { message: 'invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' } };
+  const server = await stub(() => [401, refusal]);
+  const { file } = await recording();
+  const unset = await run([file], { IGNIS_BASE_URL: server.url });
+  const wrong = await run([file], { IGNIS_BASE_URL: server.url, IGNIS_API_KEY: 'sk-wrong' });
+  await server.close();
+  assert.notEqual(unset.code, 0);
+  assert.match(unset.stderr, /IGNIS_API_KEY is not set/);
+  assert.ok(unset.stderr.includes(JSON.stringify(refusal)), unset.stderr);
+  assert.notEqual(wrong.code, 0);
+  assert.doesNotMatch(wrong.stderr, /IGNIS_API_KEY/);
+  assert.ok(wrong.stderr.includes(JSON.stringify(refusal)), wrong.stderr);
+});

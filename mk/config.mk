@@ -288,4 +288,5 @@ RUNTIME_DIR ?= .scratch/serve
 
 CARGO ?= cargo
 NPM ?= npm
+NODE ?= node
 CARGO_TARGET_DIR ?= target
