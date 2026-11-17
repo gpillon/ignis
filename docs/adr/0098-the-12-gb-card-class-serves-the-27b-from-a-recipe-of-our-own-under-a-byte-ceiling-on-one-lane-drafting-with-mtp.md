@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 amends: [ADR-0063, ADR-0064, ADR-0079]
 ---
 
