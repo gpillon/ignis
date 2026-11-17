@@ -252,7 +252,10 @@ text model, and the tool makes the image.
 Asked for three variants, an agent that sends three calls at once has the
 second and the third wait for the one before to end: the first switches to
 the image model, the others find it loaded. The three cost one switch out
-and one back, and none is answered `503 model_switching`. A waiting call is
+and one back, and none is answered `503 model_switching`. With
+[`image.prompt_enhancement`](../reference/configuration.md#imageprompt_enhancement)
+on (it is off by default), a call made while the image model is loaded
+visits the enhancer to rewrite its prompt, two switches more each. A waiting call is
 not a retry and has no deadline of its own: it waits as long as the call
 before it runs, and the harness's own timeout gives it up. Behind the
 connector, the image route's own queue serves every client, one job at a
@@ -266,7 +269,9 @@ call before it runs, then `switching` and `loading` when it switches, then
 the job's steps, `encoding`, each `denoising` step and `decoding`. pi and
 opencode 1.x reset their 60 s call timeout on progress, and qwen-code its
 300 s idle timer; opencode 2.x gives a call 12 h; DeepSeek Harness sends no
-token and cuts a call at 60 s whatever.
+token and cuts a call at 60 s whatever. The image job of a call with a token
+is held to [`server.stream_timeout`](../reference/configuration.md#serverstream_timeout),
+as a streamed request is; one without, to `server.request_timeout`.
 
 **The vision budget.** The harness keeps each preview in its history and sends
 it back every turn. One merged vision token covers 32 x 32 pixels, so a
