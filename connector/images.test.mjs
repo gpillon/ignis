@@ -99,6 +99,21 @@ test('the catalog pick takes the loaded image model, else the first one on disk 
   assert.equal(JSON.parse(post.body).model, 'img-b');
 });
 
+test('the loaded image model is picked whatever its files, and one this card cannot load never is', async () => {
+  // One rule with the server tool generate_image: the loaded one, else the
+  // first complete on disk this card can load.
+  const loaded = { object: 'list', data: [row('img-a', 'image'), row('img-b', 'image', { loaded: true, on_disk: 'partial' })] };
+  const unloadable = { object: 'list', data: [row('img-big', 'image', { available: false }), row('img-small', 'image')] };
+  const picked = [];
+  for (const catalog of [loaded, unloadable]) {
+    const server = await ignis({ catalog: [200, catalog] });
+    await generate(['a fox', join(await workdir(), 'a.png')], { IGNIS_BASE_URL: server.url });
+    await server.close();
+    picked.push(JSON.parse(server.requests.find((request) => request.method === 'POST').body).model);
+  }
+  assert.deepEqual(picked, ['img-b', 'img-small']);
+});
+
 test('no image model on disk fails naming --model, sending nothing', async () => {
   const server = await ignis({ catalog: [200, { object: 'list', data: [row('ignis-27b', 'text')] }] });
   const out = join(await workdir(), 'a.png');

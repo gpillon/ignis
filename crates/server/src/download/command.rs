@@ -52,7 +52,7 @@ pub enum ListFormat {
 }
 
 /// How much of an entry is under a directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OnDisk {
     /// Every file at its final name with its pinned byte count.

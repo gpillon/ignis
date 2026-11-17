@@ -314,10 +314,12 @@ held to [`vision.max_tokens`](../reference/configuration.md#visionmax_tokens),
 session that makes many images raises it, with `PATCH /v1/config` (it
 reloads the model) or at start.
 
-**No image model on disk.** The tool answers `404 model_not_found`, naming
-the command that fetches it, `ignis-server model download ignis-image-2.1-turbo`,
-run where the server runs, and the tool `download_model` when it is listed.
-On a card that cannot load the image model, the error says why instead.
+**No image model on disk.** The tool names the image model loaded, else the
+first one on disk that the card can load, by the rule the skill's scripts
+pick by. With none, it answers `404 model_not_found`, naming the command that
+fetches one, `ignis-server model download ignis-image-2.1-turbo`, run where
+the server runs, and the tool `download_model` when it is listed. On a card
+that cannot load the image model, the error says why instead.
 
 **Licence.** The image model's weights are under the **Qwen Research
 License: non-commercial use only**, with a "Built with Qwen" notice. Do not

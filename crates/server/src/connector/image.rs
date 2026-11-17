@@ -44,12 +44,14 @@ use ignis_core::image::ImageSize;
 use rmcp::model::{CallToolResult, ContentBlock, JsonObject, ProgressNotificationParam, ProgressToken};
 use rmcp::service::RequestContext;
 use rmcp::RoleServer;
+use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::Value;
 
 use super::call;
 use super::tools::ServerTool;
 use super::Shared;
+use crate::download::command::OnDisk;
 use crate::Server;
 
 /// The tool's name, as its route's extension declares it.
@@ -250,10 +252,12 @@ fn fields(arguments: Option<JsonObject>) -> Result<JsonObject, Response> {
 /// What the catalog has of an image model.
 #[derive(Debug, PartialEq)]
 enum Pick {
-    /// The one to name: the loaded one, else the first on disk.
+    /// The one to name: the loaded one, else the first on disk this card
+    /// can load.
     OnDisk(String),
-    /// None is on disk: the entry a download would fetch, one this card can
-    /// load first, and why this card cannot load it when it cannot.
+    /// None this card can load is on disk: the entry a download would
+    /// fetch, one this card can load first, and why this card cannot load
+    /// it when it cannot.
     Absent { model: String, unavailable: Option<String> },
 }
 
@@ -269,23 +273,50 @@ async fn image_model(routes: &Router, authorization: Option<HeaderValue>) -> Res
     if !response.status().is_success() {
         return Err(call::answer(response).await);
     }
-    let catalog = read(response).await.and_then(|body| serde_json::from_slice(&body).map_err(|err| err.to_string()));
+    let catalog = read(response).await.and_then(|body| serde_json::from_slice::<Catalog>(&body).map_err(|err| err.to_string()));
     match catalog {
-        Ok(catalog) => Ok(pick(&catalog)),
+        Ok(catalog) => Ok(pick(&catalog.data)),
         Err(why) => Err(unreadable("the catalog", &why)),
     }
 }
 
-/// [`Pick`] from `GET /v1/models/catalog`'s body.
-fn pick(catalog: &Value) -> Pick {
-    let rows: Vec<&Value> = catalog["data"].as_array().map_or_else(Vec::new, |rows| rows.iter().filter(|row| row["kind"] == "image").collect());
-    let id = |row: &Value| row["id"].as_str().unwrap_or_default().to_owned();
-    let on_disk = rows.iter().find(|row| row["loaded"] == true).or_else(|| rows.iter().find(|row| row["on_disk"] == "complete"));
-    if let Some(row) = on_disk {
-        return Pick::OnDisk(id(row));
+/// `GET /v1/models/catalog`'s body, as far as [`pick`] reads it.
+#[derive(Debug, Deserialize)]
+struct Catalog {
+    data: Vec<Row>,
+}
+
+/// What [`pick`] reads of a catalog row (`crate::catalog_http`'s, which
+/// only serializes).
+#[derive(Debug, Deserialize)]
+struct Row {
+    id: String,
+    /// Absent when neither the artifact nor the catalog tells.
+    #[serde(default)]
+    kind: Option<String>,
+    on_disk: OnDisk,
+    loaded: bool,
+    available: bool,
+    /// Why this card cannot load it, with `available: false`.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// [`Pick`] from the catalog's `rows`, by the rule the skill's scripts pick
+/// by too (`pickImageModel`, `connector/ignis/scripts/lib.mjs`): the image
+/// model loaded, else the first one complete on disk that this card can
+/// load. With neither, the entry a download would fetch.
+fn pick(rows: &[Row]) -> Pick {
+    let images: Vec<&Row> = rows.iter().filter(|row| row.kind.as_deref() == Some(ModelKind::Image.as_str())).collect();
+    let named = images
+        .iter()
+        .find(|row| row.loaded)
+        .or_else(|| images.iter().find(|row| row.on_disk == OnDisk::Complete && row.available));
+    if let Some(row) = named {
+        return Pick::OnDisk(row.id.clone());
     }
-    match rows.iter().find(|row| row["available"] != false).or_else(|| rows.first()) {
-        Some(row) => Pick::Absent { model: id(row), unavailable: row["reason"].as_str().map(str::to_owned) },
+    match images.iter().find(|row| row.available).or_else(|| images.first()) {
+        Some(row) => Pick::Absent { model: row.id.clone(), unavailable: row.reason.clone().filter(|_| !row.available) },
         // A server built with no catalog lists none: the built-in one has it.
         None => Pick::Absent { model: built_in_image_model(), unavailable: None },
     }
@@ -305,10 +336,11 @@ fn built_in_image_model() -> String {
 /// card cannot load it.
 fn absent(model: &str, unavailable: Option<&str>, download_listed: bool) -> Response {
     let message = match unavailable {
-        Some(reason) => format!("no image model is on disk on this server, and this card cannot load the catalog's: {reason}"),
+        Some(reason) => format!("no image model this card can load is on disk on this server, and this card cannot load the catalog's: {reason}"),
         None => {
-            let mut message =
-                format!("no image model is on disk on this server: `ignis-server model download {model}`, run where the server runs, fetches it");
+            let mut message = format!(
+                "no image model this card can load is on disk on this server: `ignis-server model download {model}`, run where the server runs, fetches it"
+            );
             if download_listed {
                 message.push_str(&format!(", and so does the tool {DOWNLOAD_TOOL} with `model` {model}"));
             }
@@ -535,12 +567,18 @@ mod tests {
         json!({ "id": id, "kind": "image", "on_disk": on_disk, "loaded": loaded, "available": true })
     }
 
+    /// [`super::pick`] of a catalog of `rows`, read as `GET
+    /// /v1/models/catalog`'s body is.
+    fn pick(catalog: &Value) -> Pick {
+        super::pick(&serde_json::from_value::<Catalog>(catalog.clone()).expect("a catalog").data)
+    }
+
     /// The loaded image model wins, else the first on disk; a text model is
     /// never one; with none on disk, the entry a download would fetch, one
     /// this card can load first, else the first with the reason it cannot.
     #[test]
     fn the_pick_is_the_loaded_image_model_else_one_on_disk_else_the_download() {
-        let text = json!({ "id": "text-on-disk", "kind": "text", "on_disk": "complete", "loaded": false });
+        let text = json!({ "id": "text-on-disk", "kind": "text", "on_disk": "complete", "loaded": false, "available": true });
         let catalog = |rows: Vec<Value>| json!({ "object": "list", "data": rows });
         let two = catalog(vec![text.clone(), row("img-a", "complete", false), row("img-b", "complete", true)]);
         assert_eq!(pick(&two), Pick::OnDisk("img-b".into()));
@@ -554,7 +592,19 @@ mod tests {
         let too_big = catalog(vec![big]);
         assert_eq!(pick(&too_big), Pick::Absent { model: "img-big".into(), unavailable: Some("img-big needs a 32 GB card or larger".into()) });
         // No image row at all: the built-in catalog's image model.
-        assert_eq!(pick(&catalog(vec![text])), Pick::Absent { model: "ignis-image-2.1-turbo".into(), unavailable: None });
+        assert_eq!(pick(&catalog(vec![text.clone()])), Pick::Absent { model: "ignis-image-2.1-turbo".into(), unavailable: None });
+        // One rule with the skill's scripts (`lib.mjs`): an image model on
+        // disk that this card cannot load is never named, and the loaded one
+        // is, whatever its files.
+        let mut big_on_disk = row("img-big", "complete", false);
+        big_on_disk["available"] = json!(false);
+        big_on_disk["reason"] = json!("img-big needs a 32 GB card or larger");
+        let skipped = catalog(vec![big_on_disk.clone(), row("img-small", "complete", false)]);
+        assert_eq!(pick(&skipped), Pick::OnDisk("img-small".into()));
+        let only = catalog(vec![big_on_disk, row("img-small", "absent", false)]);
+        assert_eq!(pick(&only), Pick::Absent { model: "img-small".into(), unavailable: None });
+        let loaded = catalog(vec![text, row("img-a", "complete", false), row("img-b", "partial", true)]);
+        assert_eq!(pick(&loaded), Pick::OnDisk("img-b".into()));
     }
 
     async fn error_of(refused: Response) -> Value {

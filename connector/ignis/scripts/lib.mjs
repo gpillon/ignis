@@ -89,9 +89,10 @@ export function parse(tool, answer) {
 }
 
 /**
- * The id of the image model to ask: the one loaded if it is an image model,
- * else the first image model complete on disk this card can load, from
- * GET /v1/models/catalog.
+ * The id of the image model to ask, from GET /v1/models/catalog: the one
+ * loaded if it is an image model, else the first image model complete on
+ * disk this card can load. The server tool generate_image picks by the same
+ * rule.
  */
 export async function pickImageModel(tool) {
   const answer = await call(tool, 'GET', '/v1/models/catalog');
@@ -100,8 +101,8 @@ export async function pickImageModel(tool) {
   if (!Array.isArray(rows)) {
     return fail(tool, `ignis's catalog holds no list of models:\n${answer.body.toString('utf8').trim()}`);
   }
-  const images = rows.filter((row) => row.kind === 'image' && row.on_disk === 'complete' && row.available !== false);
-  const pick = images.find((row) => row.loaded) || images[0];
+  const images = rows.filter((row) => row.kind === 'image');
+  const pick = images.find((row) => row.loaded) || images.find((row) => row.on_disk === 'complete' && row.available !== false);
   if (pick === undefined) {
     return fail(tool, 'ignis has no image model on disk; download one first, or name one with --model');
   }

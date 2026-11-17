@@ -39,8 +39,8 @@ Use it when the image has to be a file in the project: a logo, an asset, a
 mock-up. `--size` is one of the sizes the server serves (`1024x1024`,
 `2048x2048` and the like, or `auto`); without it the server picks. Without
 `--model` the script picks the image model from the server's catalog: the one
-loaded, else the first on disk. The server may switch models to make the
-image, which takes a while; the script waits for it.
+loaded, else the first on disk that the card can load. The server may switch
+models to make the image, which takes a while; the script waits for it.
 
 If the image needs no file, because it is only to look at, call the ignis
 server's tool `generate_image` instead: it returns a small preview and needs
