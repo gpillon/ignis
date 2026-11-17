@@ -614,6 +614,25 @@ async fn without_the_image_model_on_disk_generate_image_names_its_download() {
     assert_eq!(server.active().model_id(), "mock-a");
 }
 
+/// Spec #656, tickets #660 and #661: with `connector.allow_changes` on, so
+/// `download_model` is listed, the same error names that tool beside the
+/// command; nothing loads.
+#[tokio::test]
+async fn with_download_model_listed_generate_image_names_it_beside_the_command() {
+    let (loader, server) = image_server("absent-listed", &["mock-a"], true);
+    let path = config_file("absent-listed");
+    let config = started(&["--config", path.to_str().unwrap(), "--profile", "none", "--connector-allow-changes", "true"]);
+    let app = server.with_connector(config.settings().connector.clone()).app();
+    let result = generate(&app, json!({ "prompt": "a lighthouse at dusk" }), None).await;
+    assert_eq!(result["isError"], true, "{result}");
+    let error: Value = serde_json::from_str(&text_of(&result)).unwrap();
+    assert_eq!(error["error"]["code"], "model_not_found", "{error}");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("`ignis-server model download {IMAGE}`")), "{message}");
+    assert!(message.contains(&format!("download_model with `model` {IMAGE}")), "{message}");
+    assert!(loader.loads().is_empty());
+}
+
 /// Spec #656: with `switch.allow_implicit` off, the image route refuses the
 /// image model by name, `404`, and `generate_image` passes that answer on
 /// as its error, word for word; nothing loads.

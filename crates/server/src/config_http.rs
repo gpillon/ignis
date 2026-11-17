@@ -804,6 +804,16 @@ fn check_speech(server: &Server, next: &Config, patch: &Layer) -> Result<(), Str
         (status = 501, description = "This server has no running configuration, or no model loader to reload with.", body = ApiError),
         (status = 503, description = "The loaded model's first traversal has not run yet, or a model switch is under way; or a reload was needed while the server is stopping (`server_stopping`, with `Retry-After`): none begins, since the process would end under it.", body = ApiError),
     ),
+    // Spec #656: the connector's `change_config`, listed only with
+    // `connector.allow_changes` on. Its input is the patch itself.
+    extensions(("x-ignis-tool" = json!({
+        "name": "change_config",
+        "description": "Change this ignis server's configuration with a JSON merge patch: an object shaped as read_config shows it, only the fields to change, null removing a key (describe_config says which fields change live). Each value is checked as a config file's would be, and one bad field refuses the whole patch. A field that needs a reload reloads the loaded model, which loses its prompt state and answers 503 to every other client until it is back; the answer says whether it reloaded (202) or applied at once (200). The change is written to the config file.",
+        "read_only": false,
+        "destructive": true,
+        "changes": true,
+        "input": { "type": "object", "additionalProperties": true, "description": "The merge patch: for example {\"server\": {\"request_timeout\": 90}}." },
+    }))),
 )]
 pub(crate) async fn patch_config(State(server): State<Arc<Server>>, Json(body): Json<Value>) -> Response {
     let Some(state) = server.config.clone() else {

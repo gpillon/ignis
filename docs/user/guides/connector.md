@@ -311,6 +311,41 @@ License: non-commercial use only**, with a "Built with Qwen" notice. Do not
 serve the image model in a commercial product
 ([Images](../api/images.md)).
 
+### Changing the server: `change_config`, `download_model`, `cancel_download`
+
+These three are listed only when the server was started with
+`connector.allow_changes` on (from 0.11.0; [the settings](#the-settings)).
+Off, the default, they are not in `tools/list` and a call to one is an
+unknown-tool error. The connector's `instructions` name them only then.
+
+`change_config` patches the configuration. It takes one free object, the JSON
+merge patch `PATCH /v1/config` takes, shaped as `read_config` shows the
+configuration: only the fields to change, a `null` removing a key
+(`describe_config` says which fields change live). It is not the schema of
+every field. The result is the server's answer as text: what applied, whether
+it applied at once (`live`) or reloaded the model (`reload`), the
+configuration now running, and whether the change was written to the config
+file. A field that needs a reload reloads the loaded model with the whole
+patch: the model's prompt state is lost, and every other client gets `503`
+until it is back. The tool's description tells the model so, and it is marked
+`destructiveHint`.
+
+`download_model` takes a catalog `model` id, as `read_catalog` lists them,
+calls [`POST /v1/models/download`](models.md) and answers at once: the
+download runs in the background, one at a time, and it does not switch to the
+model. The agent follows its progress through `read_catalog`.
+`cancel_download` calls `POST /v1/models/download/cancel`, marked
+`destructiveHint`: it stops the running download and keeps what it fetched, so
+downloading the model again resumes. A refusal of either (`download_in_progress`,
+`download_disabled`, `download_not_running`) is the tool's error, the server's
+own JSON.
+
+**This is not a security boundary.** The opt-in keeps the three tools out of
+the agent's list and its instructions, nothing more. An agent with a shell and
+the API key can call `PATCH /v1/config` or `POST /v1/models/download` itself.
+Turn it on when you trust the agent with the server; what guards the server is
+the key ([Access](../configuration/access.md)).
+
 ## Results and errors
 
 A tool's result is the route's answer as text in the result's `content`: the

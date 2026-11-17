@@ -247,6 +247,22 @@ pub(crate) struct DownloadAccepted {
         (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`), or a model switch is under way (`model_switching`).", body = ApiError),
         (status = 507, description = "The volume of `download.path` has less free space than the entry's bytes still missing plus `download.free_margin` (`download_no_room`): nothing was written, and the message names the bytes needed and the bytes free. The entry's row keeps it as its `download_reason`, `download: failed`, until its next download, the entry complete on disk another way, or a restart.", body = ApiError),
     ),
+    // Spec #656: the connector's `download_model`, listed only with
+    // `connector.allow_changes` on; it answers at once, and `read_catalog`
+    // follows the download.
+    extensions(("x-ignis-tool" = json!({
+        "name": "download_model",
+        "description": "Start downloading a model of the catalog (read_catalog lists the ids) in the background: it answers at once, one download runs at a time, and read_catalog shows its progress. It does not switch to the model.",
+        "read_only": false,
+        "destructive": false,
+        "changes": true,
+        "input": {
+            "type": "object",
+            "properties": { "model": { "type": "string", "description": "A catalog entry's id." } },
+            "required": ["model"],
+            "additionalProperties": false,
+        },
+    }))),
 )]
 pub(crate) async fn post_model_download(State(server): State<Arc<Server>>, Json(req): Json<DownloadRequest>) -> Response {
     if req.model.trim().is_empty() {
@@ -375,6 +391,15 @@ pub(crate) struct DownloadCancelled {
         (status = 501, description = "This server has no catalog to download from (`download_unavailable`).", body = ApiError),
         (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`).", body = ApiError),
     ),
+    // Spec #656: the connector's `cancel_download`, listed only with
+    // `connector.allow_changes` on.
+    extensions(("x-ignis-tool" = json!({
+        "name": "cancel_download",
+        "description": "Stop the running model download. What it fetched stays on disk, and downloading the same model again resumes from it.",
+        "read_only": false,
+        "destructive": true,
+        "changes": true,
+    }))),
 )]
 pub(crate) async fn post_model_download_cancel(State(server): State<Arc<Server>>) -> Response {
     let Some(downloads) = server.downloads.as_ref() else {

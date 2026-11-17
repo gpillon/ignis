@@ -77,6 +77,11 @@ A failed call returns the server's error JSON and Retry-After; nothing is retrie
 pub(crate) const INSTALL: &str = r#"Skill (files) sh: d=~/.agents/skills;mkdir -p $d;curl -fsS -H "Authorization: Bearer $IGNIS_API_KEY" ${IGNIS_BASE_URL:-http://127.0.0.1:8000}/v1/connector/skill|tar xz -C $d
 ps: $u=$env:IGNIS_BASE_URL;if(!$u){$u='http://127.0.0.1:8000'};$d="$HOME/.agents/skills";md -f $d;curl.exe -fsS -H "Authorization: Bearer $env:IGNIS_API_KEY" -o $d/s $u/v1/connector/skill;tar xzf $d/s -C $d"#;
 
+/// The change tools' line in `instructions`, only when they are listed
+/// (`connector.allow_changes`): the harm a patch can do, at 120 bytes at
+/// most.
+pub(crate) const CHANGES: &str = "change_config, download_model, cancel_download change this server; a patch to a reload field reloads the model.";
+
 /// The connector of one router (`api::router`): its MCP service, over the
 /// tools its document declares and the router their calls go through.
 #[derive(Clone)]
@@ -117,6 +122,10 @@ fn instructions(tools: &tools::Table) -> String {
     }
     text.push('\n');
     text.push_str(INSTALL);
+    if tools.lists_changes() {
+        text.push('\n');
+        text.push_str(CHANGES);
+    }
     text
 }
 
@@ -267,6 +276,13 @@ mod tests {
     fn the_base_instructions_keep_within_their_share() {
         assert!(super::ABOUT.len() <= 200, "{} bytes", super::ABOUT.len());
         assert!(!super::ABOUT.lines().next().unwrap().is_empty());
+    }
+
+    /// Spec #656, ticket #660: the change tools' line keeps within its share.
+    #[test]
+    fn the_change_tools_line_keeps_within_its_share() {
+        assert!(super::CHANGES.len() <= 120, "{} bytes", super::CHANGES.len());
+        assert_eq!(super::CHANGES.lines().count(), 1);
     }
 
     /// Spec #656, ticket #662: the skill's two install forms keep within

@@ -145,11 +145,14 @@ fn the_tool_extension_sits_on_exactly_the_tools_routes() {
         }
     }
     let expected: BTreeSet<String> = [
+        "patch /v1/config change_config",
         "get /v1/config read_config",
         "get /v1/config/fields describe_config",
         "get /v1/models/catalog read_catalog",
         "post /v1/decide decide",
         "post /v1/images/generations generate_image",
+        "post /v1/models/download download_model",
+        "post /v1/models/download/cancel cancel_download",
     ]
     .into_iter()
     .map(str::to_owned)
