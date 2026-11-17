@@ -235,7 +235,7 @@ fn disabled() -> Response {
             (String = "text/event-stream"),
         )),
         (status = 202, description = "A notification, accepted."),
-        (status = 400, description = "Not one JSON-RPC message of MCP, or an `MCP-Protocol-Version` header this server does not speak; or a body that could not be read, with the error JSON (`invalid_request_error`).", body = crate::api::ApiError),
+        (status = 400, description = "Not one JSON-RPC message of MCP, or an `MCP-Protocol-Version` header this server does not speak; or a body that could not be read, which alone is answered with the error JSON (`invalid_request_error`)."),
         (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = crate::api::ApiError),
         (status = 404, description = "The connector is off (`connector_disabled`): `connector.enabled` is false.", body = crate::api::ApiError),
         (status = 406, description = "`Accept` does not name both `application/json` and `text/event-stream`."),
@@ -364,7 +364,8 @@ mod tests {
     fn the_powershell_installs_work_in_the_skills_folder_and_leave_nothing_behind() {
         let line = super::INSTALL.lines().find_map(|line| line.strip_prefix("ps: ")).expect("the PowerShell line");
         assert_eq!(powershell_install_faults(line), Vec::<String>::new(), "{line}");
-        let guide = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/user/guides/connector.md")).unwrap();
+        // A checkout may turn the guide's line ends into CRLF.
+        let guide = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/user/guides/connector.md")).unwrap().replace("\r\n", "\n");
         let block = guide.split("```powershell\n").nth(1).and_then(|rest| rest.split("```").next()).expect("the guide's PowerShell form");
         assert_eq!(powershell_install_faults(block), Vec::<String>::new(), "{block}");
         let bad = r#"$d="$HOME/.agents/skills";curl.exe -fsS -o $d/s http://h/v1/connector/skill;tar xzf $d/s -C $d"#;
