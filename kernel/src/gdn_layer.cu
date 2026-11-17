@@ -24,6 +24,7 @@
 #include "gdn_prefill.h"
 #include "layer_internal.h"
 #include "model_internal.h"
+#include "prefill_swiglu.h"
 #include "trellis_body.h"
 
 // GitHub #339: the verify body's trellis arm convolves the projection it
@@ -108,9 +109,10 @@ void output_and_mlp(ignis_model &model, const GdnLayerWeights &w, const ninfer::
   // (T<=16) and the op's only runnable route above its A16 cap (the pre-
   // #85 behavior); under the engine default AllowA4 at every width, the
   // vendored dispatch's own decision per its token thresholds, GitHub
-  // #85's acceptance.
-  ninfer::ops::linear_swiglu(post, w.mlp_gate_up, fused,
-                             ignis_linear_swiglu_policy_for(w.mlp_gate_up.qtype, mode, T), arena, stream);
+  // #85's acceptance. GitHub #651: under the load's route, the fused op at
+  // the W4A4 TMA widths (kernel/src/prefill_swiglu.h).
+  ignis::prefill_swiglu::linear_swiglu(model.prefill_swiglu, post, w.mlp_gate_up, fused,
+                                       ignis_linear_swiglu_policy_for(w.mlp_gate_up.qtype, mode, T), arena, stream);
   ninfer::ops::linear_add(fused, w.mlp_down, residual, ignis_policy_for(w.mlp_down.qtype, mode), arena, stream);
 }
 

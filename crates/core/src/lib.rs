@@ -151,7 +151,7 @@ pub use kv_format::{
 };
 pub use mock::{FakeDisk, MockCompute, MockSections};
 pub use exception_weights::ExceptionWeights;
-pub use prefill_attention::{GdnPrefill, PrefillAttention, PrefillLinear};
+pub use prefill_attention::{GdnPrefill, PrefillAttention, PrefillLinear, PrefillSwiglu};
 pub use decode_attention::HqDecodeAttention;
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};

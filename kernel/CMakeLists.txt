@@ -361,7 +361,10 @@ file(GLOB_RECURSE IGNIS_KERNEL_SRCS CONFIGURE_DEPENDS
 # default route, the image model's FP8 GEMM and attention (the
 # block-scaled FP8 MMA), and the 27B's warp-specialized hq-e8-2b attention
 # route in the decode and verify rounds (87,408 bytes of static shared memory
-# per block and `mbarrier.try_wait`, spec #570, GitHub #572). On another card
+# per block and `mbarrier.try_wait`, spec #570, GitHub #572), and the 27B
+# prefill's gate and up product with SwiGLU in its epilogue (the block-scaled
+# FP4 MMA and TMA, spec #646, GitHub #651), which runs where the W4A4 TMA
+# route it stands in for runs. On another card
 # the prepare step finds no staged or cluster kernel and Flash-Next keeps its
 # register kernel, and a 27B load finds no image of the route and keeps the
 # vendored one; a launch fails with "no kernel image is available".
@@ -371,13 +374,14 @@ set(IGNIS_KERNEL_SM120A_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/image/fp8_gemm.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/src/image/attn8.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/src/hq_decode_attention_ws.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill_swiglu.cu
 )
 list(LENGTH IGNIS_KERNEL_SRCS kernel_sources)
 list(REMOVE_ITEM IGNIS_KERNEL_SRCS ${IGNIS_KERNEL_SM120A_SRCS})
 list(LENGTH IGNIS_KERNEL_SRCS kernel_sources_left)
 math(EXPR kernel_sources_moved "${kernel_sources} - ${kernel_sources_left}")
-if(NOT kernel_sources_moved EQUAL 5)
-  message(FATAL_ERROR "the sm_120a set's five sources are not all under kernel/src (${kernel_sources_moved} found)")
+if(NOT kernel_sources_moved EQUAL 6)
+  message(FATAL_ERROR "the sm_120a set's six sources are not all under kernel/src (${kernel_sources_moved} found)")
 endif()
 add_library(ignis_kernel_sm120a OBJECT ${IGNIS_KERNEL_SM120A_SRCS})
 set_target_properties(ignis_kernel_sm120a PROPERTIES CUDA_ARCHITECTURES "${IGNIS_SM120A_ARCHITECTURES}")

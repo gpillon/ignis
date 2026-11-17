@@ -9,7 +9,10 @@
 // memory and frees it, before every product: 247 times a chunk of the 27B's prefill, a stall of
 // about 1 ms at every chunk boundary while the pool trims what they left, and about 110 ms for
 // the pool's first allocation, paid by the first request after a load. Their recorded patch
-// (ADR 0031) asks `device_copy` first and keeps upstream's upload where it answers null.
+// (ADR 0031) asks `device_copy` first and keeps upstream's upload where it answers null. Since
+// GitHub #651 the 27B's MLP gate and up product runs ignis's fused op (kernel/src/prefill_swiglu.cu)
+// at those widths, whose launcher asks the same way: one block a call, as the product it stands in
+// for built.
 //
 // A load's cache is a block of slots it allocates at load -- the VRAM plan's `tma_descriptors`
 // line -- serving the launches on the load's stream. A tensor map names only addresses, extents

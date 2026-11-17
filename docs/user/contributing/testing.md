@@ -113,6 +113,19 @@ the other. They are no configuration fields: `GET /v1/config` and
   way (`ignis_kernel_tma_descriptor_cache_test`). Linux passes the maps by
   value and has no slots whatever the variable says. Any other value refuses
   the load, naming the variable.
+- `IGNIS_PREFILL_SWIGLU=split|fused` (from 0.11.0) picks, at each load of
+  the 27B's NVFP4 artifact, how its prefill's MLP multiplies by the gate and
+  up matrix and applies SwiGLU: in one kernel at every chunk width from 1,024
+  tokens in whole 256-token tiles (`fused`, or unset), or by the vendored
+  route 0.10.0 runs (`split`): the product written out in full and a SiLU-mul
+  pass reading it back, and at exactly 1,024 tokens the vendored fused kernel.
+  `fused` writes the split route's bytes at every width
+  (`ignis_kernel_prefill_swiglu_test`); the vendored fused kernel rounds once
+  fewer, so under `split` a 1,024-token chunk computes the MLP with other bits
+  than a 2,048-token one. Any other value refuses the load, naming the
+  variable. The load logs the route under `ignis.runtime.prefill_routes`
+  (`prefill_swiglu`: `fused`, `split`, or `none` on the trellis artifacts,
+  whose prefill runs no such product), and the VRAM plan is the same on both.
 
 ## The speech executor's CPU legs
 

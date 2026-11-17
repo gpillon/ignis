@@ -494,7 +494,17 @@ epilogue, NVFP4 arm only:
   LinearW4A4Post`, inside the vendored plan) falls back to the already-vendored
   `ops::linear` (P1-09/P1-10) plus `ops::silu_mul` (P1-07) rather than its own
   fused kernel, so it compiles with no further vendoring; its own reference
-  test is deferred to G2, same as P1-09's W4A4/TMA route.
+  test is deferred to G2, same as P1-09's W4A4/TMA route. GitHub #651 (spec
+  #646, ADR 0031 option (b)): the 27B's prefill calls at every width the W4A4
+  TMA route takes, from 1,024 tokens in whole 256-token tiles, left this op
+  for `kernel/src/prefill_swiglu.cu`, an adapted op of its TMA kernel whose
+  epilogue rounds as `LinearW4A4Post` does, so 1,024 tokens no longer takes
+  the TMA kernel's one rounding fewer. This leaves the files as they are (the
+  TMA launcher with its #650 patch): every
+  other call (decode, verify, narrower or ragged widths, A16) runs them, the
+  split route is the oracle the op is held to byte for byte
+  (`ignis_kernel_prefill_swiglu_test`), and `IGNIS_PREFILL_SWIGLU=split`
+  puts the whole dispatch back for a comparison.
 - **its reference op test** — `tests/ops/linear_swiglu/test_nvfp4.cpp`
   (**patched**: the reference's file exercises both the A16 route this ticket
   vendors and the A4/large-T route deferred to G2 in one combined `main()`;
