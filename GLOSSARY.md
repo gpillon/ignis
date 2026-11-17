@@ -1654,6 +1654,24 @@ or binary frame from its client since its last response ended; a ping does not
 make it busy. One idle for `server.socket_idle_close` is closed by the server
 (GitHub #329), since an open socket holds a Knative pod.
 
+### Harnesses
+
+**Harness**:
+The program a coding agent runs in (opencode, qwen-code, pi, DeepSeek
+Harness): it calls ignis as its model and may call its tools.
+_Avoid_: client (any program calling the API), agent (the model acting inside
+the harness).
+
+**Connector**:
+What ignis offers a harness beyond chat: its MCP server's **server tools**,
+and the skill whose scripts carry the files.
+_Avoid_: plugin, extension (a harness's own native APIs).
+
+**Server tool**:
+A tool ignis itself offers a harness and runs when it is called; not a tool a
+client declares in a request (a **held tool**, a **strict tool**).
+_Avoid_: MCP tool (the protocol's word), ignis tool.
+
 ### Configuration
 
 **Field**:
