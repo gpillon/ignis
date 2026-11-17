@@ -175,7 +175,9 @@ These are choices, not gaps:
   planned for. Classification goes through `/v1/decide`.
 - No `/v1/completions` and no `/v1/batches`.
 - No audio out (speech is transcribed, never spoken), and no LoRA adapters.
-- No more than one model loaded at once.
+- No second model on the card: one of the nine holds it at a time. The
+  speech model is the exception: it runs beside it, on the CPU
+  ([Speech to text](../api/transcriptions.md)).
 - Not a general engine: other model families are not served.
 
 A request field ignis does not support is refused with a `400` naming it,

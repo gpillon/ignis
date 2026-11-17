@@ -29,6 +29,7 @@ pub mod artifact_template;
 pub mod catalog_http;
 pub mod config;
 pub mod config_http;
+pub mod connector;
 pub mod deadline;
 pub mod decide;
 pub mod decoder;
@@ -166,6 +167,12 @@ pub struct Server {
     /// answers the route `501`: a server built in a test without one has no
     /// endpoint to fetch from.
     pub downloads: Option<std::sync::Arc<download_http::Downloads>>,
+    /// The connector (spec #656): whether `/v1/mcp` serves its MCP server,
+    /// and whether its tools that change the server are listed. Taken from
+    /// the start's configuration: neither field is patchable, so the tool
+    /// list depends on the start alone. On, listing none of those tools, by
+    /// default.
+    pub connector: config::schema::ConnectorGroup,
 }
 
 /// The server-level knobs a live config change may touch (spec config-v2/02
@@ -375,6 +382,7 @@ impl Server {
             image_decodes: std::sync::Arc::default(),
             speech: std::sync::Arc::default(),
             downloads: None,
+            connector: config::schema::ConnectorGroup::default(),
         }
     }
 
@@ -717,6 +725,14 @@ impl Server {
     /// configuration; tests build their own.
     pub fn with_downloads(mut self, downloads: download_http::Downloads) -> Self {
         self.downloads = Some(std::sync::Arc::new(downloads));
+        self
+    }
+
+    /// Serve the connector as `connector` says (spec #656): `main` passes the
+    /// start's `connector` group; a server built without this serves it with
+    /// the group's defaults.
+    pub fn with_connector(mut self, connector: config::schema::ConnectorGroup) -> Self {
+        self.connector = connector;
         self
     }
 

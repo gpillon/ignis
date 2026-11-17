@@ -6,8 +6,8 @@ sidebar:
 ---
 
 Every setting is one **field** in a **group** — `server`, `model`, `vram`,
-`reuse`, `switch`, `spec`, `vision`, `media`, `image`, `speech`, `download`, `ngram`, `kv_disk` —
-and has the same name on every surface
+`reuse`, `switch`, `spec`, `vision`, `media`, `image`, `speech`, `download`, `ngram`, `kv_disk`,
+`connector` (from 0.11.0, [the connector](../guides/connector.md#the-settings)) — and has the same name on every surface
 ([ADR 0046](../../adr/0046-one-declaration-per-config-field.md)):
 
 | Surface | Spelling | Example |

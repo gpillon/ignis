@@ -115,11 +115,40 @@ fn the_document_lists_exactly_the_v1_surface() {
         "post /v1/audio/transcriptions",
         // Spec speech/03: its Realtime transcription session, a WebSocket.
         "get /v1/realtime",
+        // Spec #656: the connector's MCP server.
+        "post /v1/mcp",
     ]
     .into_iter()
     .map(str::to_owned)
     .collect();
     assert_eq!(documented(), expected);
+}
+
+/// Spec #656: the `x-ignis-tool` extension sits on exactly the operations
+/// that are the connector's server tools, each naming its tool; the
+/// connector's own route is documented beside them.
+#[test]
+fn the_tool_extension_sits_on_exactly_the_tools_routes() {
+    let document = document();
+    let mut tools = BTreeSet::new();
+    for (path, item) in document["paths"].as_object().expect("paths") {
+        for (method, operation) in item.as_object().expect("a path item") {
+            if let Some(tool) = operation.get("x-ignis-tool") {
+                tools.insert(format!("{method} {path} {}", tool["name"].as_str().expect("a name")));
+                for hint in ["read_only", "destructive"] {
+                    assert!(tool[hint].is_boolean(), "{method} {path}: {tool}");
+                }
+                assert!(!tool["description"].as_str().unwrap_or_default().is_empty(), "{method} {path}: {tool}");
+            }
+        }
+    }
+    let expected: BTreeSet<String> = ["get /v1/models/catalog read_catalog"].into_iter().map(str::to_owned).collect();
+    assert_eq!(tools, expected);
+    let mcp = &document["paths"]["/v1/mcp"]["post"];
+    assert_eq!(mcp["tags"], serde_json::json!(["connector"]));
+    for status in ["200", "202", "401", "404"] {
+        assert!(mcp["responses"][status].is_object(), "{status}");
+    }
 }
 
 /// Spec playground/05 AC 9: the Server view's routes are in the document

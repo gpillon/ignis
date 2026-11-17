@@ -4750,3 +4750,33 @@ fn a_file_defining_both_16gb_names_is_refused() {
     let err = with_files(&["--config", "c.yaml"], no_env, &files).unwrap_err().0;
     assert!(err.contains("`rtx-16gb`") && err.contains("`rtx50-16gb`"), "{err}");
 }
+
+// ── the connector's group (spec #656) ──
+
+/// Both connector fields resolve from their flag, their env var and the
+/// config file with config v2's precedence; the connector is served by
+/// default and lists no tool that changes the server, and neither field is
+/// patchable: the tool list depends on the start alone.
+#[test]
+fn every_connector_field_resolves_by_precedence_and_neither_is_patchable() {
+    let connector = config(&[]).settings().connector.clone();
+    assert_eq!((connector.enabled, connector.allow_changes), (true, false));
+    // Per field: the file's value, the env var's, the flag's.
+    let cases = [("enabled", "false", "true", "false"), ("allow_changes", "true", "false", "true")];
+    assert_eq!(cases.len(), schema::ConnectorGroup::FIELDS.len(), "every connector field has a case");
+    for (name, file, env, flag) in cases {
+        let meta = schema::field("connector", name).unwrap();
+        assert!(meta.visible && !meta.patchable && !meta.reload_required && !meta.scoped, "{name}");
+        let canonical = |raw: &str| (meta.canonical)(raw).unwrap();
+        let resolved = |config: &Config| config.settings().render()["connector"][name].clone();
+        let files = MemFiles::with(&[("c.yaml", &format!("connector:\n  {name}: {file}\n"))]);
+        let env_var = |key: &str| (key == meta.env()).then(|| env.to_owned());
+        let from_file = with_files(&["--config", "c.yaml"], no_env, &files).unwrap();
+        assert_eq!(resolved(&from_file), canonical(file), "{name}: the file over the default");
+        let from_env = with_files(&["--config", "c.yaml"], env_var, &files).unwrap();
+        assert_eq!(resolved(&from_env), canonical(env), "{name}: the env var over the file");
+        let from_flag = with_files(&["--config", "c.yaml", &meta.flag(), flag], env_var, &files).unwrap();
+        assert_eq!(resolved(&from_flag), canonical(flag), "{name}: the flag over the env var");
+    }
+    assert_eq!(schema::field("connector", "allow_changes").unwrap().flag(), "--connector-allow-changes");
+}

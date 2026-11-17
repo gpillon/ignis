@@ -156,6 +156,14 @@ the same id, or start with `--switch-allow-implicit false`.
 The same holds for any front end that picks ids from `GET /v1/models`, which
 lists every servable model.
 
+### ignis's tools in the harness
+
+From 0.11.0 a coding agent's harness can also add ignis as an MCP server, one
+entry at `http://127.0.0.1:8000/v1/mcp` with the same key. The agent then sees
+the connector's server tools, the models the server can switch to or fetch
+among them. [The connector](../guides/connector.md) has each harness's entry:
+opencode, qwen-code, pi and DeepSeek Harness.
+
 ## Open WebUI and other front ends
 
 Add ignis as an OpenAI-compatible connection with the base URL above (and the
@@ -177,6 +185,8 @@ image tools, the model picker under the prompt box)
 
 ## Next
 
+- [The connector](../guides/connector.md) for ignis's server tools in a
+  coding agent's harness.
 - [Switching models](../api/model-switching.md) for explicit and implicit
   switches and what a request sees during one.
 - [Deadlines](../api/deadlines.md) for how long a request may run and what it

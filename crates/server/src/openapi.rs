@@ -107,6 +107,7 @@ exception, because it runs on the CPU and never holds VRAM, ADR 0067).",
         (name = "decide", description = "Typed decisions read from the readout (ADR 0034)."),
         (name = "images", description = "Images from the image model: generations and edits (ADR 0050)."),
         (name = "audio", description = "Transcripts from the speech model (ADR 0067)."),
+        (name = "connector", description = "The connector's MCP server: server tools for a coding agent's harness."),
     ),
 )]
 pub struct ApiDoc;

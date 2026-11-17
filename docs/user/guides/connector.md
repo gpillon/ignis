@@ -1,0 +1,209 @@
+---
+title: "The connector: ignis's tools in a coding agent's harness"
+description: "Add ignis to opencode, qwen-code, pi or DeepSeek Harness as one MCP server at /v1/mcp: the server tools the agent sees, how a result and an error reach it, and the two settings."
+sidebar:
+  order: 6
+---
+
+From 0.11.0, ignis serves an MCP server of its own at `/v1/mcp`, on the port
+and behind the key the rest of `/v1` has. A coding agent's harness adds it as
+one MCP server entry, and the model in the harness sees ignis's **server
+tools**: what the server can do beyond chat, as tools it can call. With ignis
+as the harness's model too, the agent works on the same server it calls.
+
+## The MCP server
+
+- **The URL** is the base URL's `/v1/mcp`: `http://127.0.0.1:8000/v1/mcp` on
+  the default bind, the server's LAN address or its tunnel's on a server
+  reached from elsewhere ([Access](../configuration/access.md)). Any `Host` is
+  admitted, as on every other route.
+- **The key**, when the server has one, goes in the entry as a header,
+  `Authorization: Bearer <key>`: the same key as the rest of `/v1`. Without
+  it the route answers `401 invalid_api_key`.
+- **Streamable HTTP, stateless.** Every request stands alone, with no session
+  id, so a restart of ignis leaves no harness holding a session that is gone.
+  An answer is `application/json`, or an event stream when the call sends
+  progress first. There is no stream from the server (`GET` is `405`).
+- **It answers through a model switch** and while a model warms up:
+  `initialize` and the tool list never wait. A tool's call goes to its route
+  and is held, or refused, as a request of the client's own would be.
+- **The tool list is fixed at start.** It is the same bytes whatever model is
+  loaded, before and after a switch or a configuration change, so it stays in
+  a harness's prompt prefix and [prompt reuse](../concepts/kv-cache-and-prompt-reuse.md)
+  keeps working. A server started with other connector settings lists other
+  tools.
+- **`instructions`**, which `initialize` answers and most harnesses put in the
+  model's prompt, are fixed at start too: under 1 KB, the first line saying
+  what ignis is.
+
+## Each harness's entry
+
+The entries below are read from each harness's own source at the version
+named; none has been run against ignis yet. Every harness asks for the MCP
+server's URL and, with a key, the `Authorization` header.
+
+The key is read from the harness's environment, as `IGNIS_API_KEY` in the
+entries below: set it to the server's key in the shell the harness starts
+from. On a server with no key, leave the header out.
+
+### opencode
+
+opencode 2.3.0 reads its MCP servers from `opencode.json` (or
+`opencode.jsonc`): `~/.config/opencode/` for every project, the project's
+root or its `.opencode/` folder for one.
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "ignis": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8000/v1/mcp",
+        "oauth": false,
+        "codemode": false,
+        "headers": { "Authorization": "Bearer {env:IGNIS_API_KEY}" }
+      }
+    }
+  }
+}
+```
+
+- `oauth: false`: opencode tries OAuth on a remote server unless told the
+  header is the credential.
+- `codemode: false` declares the tools to the model as tools. With opencode's
+  default, Code Mode, the model reaches them only from code it writes.
+- `{env:IGNIS_API_KEY}` is opencode's own spelling; a variable that is not
+  set becomes an empty key, which the server answers `401`.
+- opencode 1.x takes the server one level up, `"mcp": { "ignis": { … } }`,
+  without `codemode`; 2.x still reads that form.
+- opencode asks before every MCP call, whatever the tool's hints say.
+
+### qwen-code
+
+qwen-code 0.27.4 reads `mcpServers` from `~/.qwen/settings.json`, or from the
+project's `.qwen/settings.json`, whose servers wait for your approval.
+
+```json
+{
+  "mcpServers": {
+    "ignis": {
+      "httpUrl": "http://127.0.0.1:8000/v1/mcp",
+      "headers": { "Authorization": "Bearer $IGNIS_API_KEY" },
+      "alwaysLoadTools": true
+    }
+  }
+}
+```
+
+- `httpUrl` is Streamable HTTP; `url` would be SSE, which ignis does not
+  serve.
+- `alwaysLoadTools: true` puts the tools in the tool list the model gets with
+  every request. Without it qwen-code defers them behind its tool search, and
+  the list in the prompt prefix changes as the agent finds them.
+- `"trust": true` stops qwen-code asking before each call, in a trusted
+  folder, and lets it repeat a read-only call once after an ignis restart.
+- A variable that is not set stays in the header as written
+  (`Bearer $IGNIS_API_KEY`), which the server answers `401`.
+
+### pi
+
+pi 1.5.2 reads `~/.pi/agent/mcp.json`, or `.pi/mcp.json` in a trusted
+project. The command
+
+```sh
+pi mcp add ignis --url http://127.0.0.1:8000/v1/mcp --bearer-token-env-var IGNIS_API_KEY --exposure direct
+```
+
+writes this entry:
+
+```json
+{
+  "mcpServers": {
+    "ignis": {
+      "url": "http://127.0.0.1:8000/v1/mcp",
+      "headers": { "Authorization": "Bearer ${IGNIS_API_KEY}" },
+      "exposure": "direct"
+    }
+  }
+}
+```
+
+- `exposure: "direct"` declares the tools to the model as tools. With pi's
+  default, `codemode`, the model reaches them only from code it writes, and
+  sees only the first line of `instructions`.
+- A variable that is not set fails the server's connection, naming it.
+- A call is cut after `timeout` seconds, 60 by default, unless it sends
+  progress.
+
+### DeepSeek Harness, best effort
+
+DeepSeek Harness dsh-v0.2.2-rc.3 has no MCP settings page: a server is a row
+in a YAML patch, `$DSH_HOME/profiles/<profile>/cordis.patch.yml`
+(`DSH_HOME` is `~/.dsh` by default). Add the row to the file's `insert` list
+rather than replacing the file:
+
+```yaml
+- insert:
+    - id: mcp-ignis
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: ignis
+        transport: streamable-http
+        url: http://127.0.0.1:8000/v1/mcp
+        headers:
+          Authorization: !!js '`Bearer ${process.env.IGNIS_API_KEY}`'
+```
+
+- A call is cut after `toolCallTimeoutMs`, 60,000 ms by default, and nothing
+  extends it.
+- It shows a result's text only: what the connector answers is all text.
+- It is not part of the connector's gate: the entry is read from its source,
+  and its own guide may say more.
+
+## The tools
+
+`tools/list` names each tool with a short description the model reads, and
+two hints: `readOnlyHint` on the tools that only read, `destructiveHint` on
+those whose change cannot be taken back by calling again. Hints are advice to
+the harness: opencode asks before every MCP call whatever they say, qwen-code
+runs read-only tools in parallel, pi passes them on, DeepSeek Harness reads
+none.
+
+### The catalog: `read_catalog`
+
+The models the server can switch to or download, one row each: whether it is
+on disk, which one is loaded, its kind and size, and a running download's
+progress. It calls [`GET /v1/models/catalog`](models.md#the-catalog), takes no
+argument, and is read-only.
+
+## Results and errors
+
+A tool's result is the route's answer as text in the result's `content`: the
+one part of a result every harness shows its model. Nothing goes in
+`structuredContent`, which DeepSeek Harness never shows, and no embedded
+resource, which it drops.
+
+A route that refuses comes back as a tool error, `isError: true`, its text
+the server's own error JSON, exactly as a client would read it
+(`{"error": {"message", "type", "code"}}`), then a second text,
+`Retry-After: <seconds>`, when the route sent that header. The agent reads
+`model_switching`, `server_not_ready` or any other code as the server says
+it. The connector never retries: the agent sees the server's state and
+decides.
+
+## The settings
+
+Two fields in the `connector` group ([every field](../reference/configuration.md)).
+Both take effect at start only: `PATCH /v1/config` refuses them, so the tool
+list depends on how the server started and an agent cannot change it.
+
+| Field | Default | What it does |
+|---|---|---|
+| `connector.enabled` | `true` | Serves the MCP server at `/v1/mcp`. Off, the route answers `404 connector_disabled`. |
+| `connector.allow_changes` | `false` | Lists the tools that change the server (its configuration, a model download) beside those that read it. |
+
+`allow_changes` is not a security boundary. It keeps those tools out of the
+agent's list, but an agent with a shell and the API key can call
+`PATCH /v1/config` or `POST /v1/models/download` itself. What guards the
+server is the key ([Access](../configuration/access.md)).

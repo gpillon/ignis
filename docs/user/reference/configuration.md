@@ -2129,3 +2129,31 @@ KV-disk's budget: a ceiling, cut at start to the volume's free space less 10 GiB
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
 Where KV-disk's files go: `model` (beside the artifact), `auto` (the per-user cache directory under kv-disk), or a directory. They go in an ignis-kv-disk/<pid>-<nonce> directory there, removed at shutdown.
+
+## connector
+
+### `connector.enabled`
+
+| | |
+|---|---|
+| Flag | `--connector-enabled` (may stand bare: `true`) |
+| Env var | `IGNIS_CONNECTOR_ENABLED` |
+| Kind | `bool` |
+| Default | `true` |
+| Models | all |
+| `/v1/config` | shown by `GET`, not patchable |
+
+Serve the connector's MCP server at /v1/mcp. Off, the route answers 404.
+
+### `connector.allow_changes`
+
+| | |
+|---|---|
+| Flag | `--connector-allow-changes` (may stand bare: `true`) |
+| Env var | `IGNIS_CONNECTOR_ALLOW_CHANGES` |
+| Kind | `bool` |
+| Default | `false` |
+| Models | all |
+| `/v1/config` | shown by `GET`, not patchable |
+
+List the connector's tools that change the server (the configuration, a model download) beside those that read it. Not a security boundary: an agent with a shell and the API key can call the routes itself.

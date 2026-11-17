@@ -37,6 +37,12 @@ The routes as the server's own OpenAPI document lists them: a route cannot exist
 | GET | `/v1/config/fields` | The configuration's fields |
 | GET | `/v1/config/origins` | Where each configuration value comes from |
 
+## connector
+
+| Method | Path | What it does |
+|---|---|---|
+| POST | `/v1/mcp` | The connector's MCP server |
+
 ## decide
 
 | Method | Path | What it does |

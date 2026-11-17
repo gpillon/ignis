@@ -125,6 +125,9 @@ async fn limit_request_body(State(server): State<Arc<Server>>, request: Request,
 /// the request's real `trace_id` (`ignis_logging::trace_context`).
 pub fn router(state: Arc<Server>) -> Router {
     let (v1, document) = v1_parts();
+    // Spec #656: the connector's tools, read once from the document this
+    // router serves, as the start's `connector` group lists them.
+    let tools = crate::connector::tools::Table::from_document(&document, state.connector.allow_changes);
     let mut router = v1
         // Innermost: a request that passed the key and uses the model counts
         // as its use until its response ends (spec model-switch/02).
@@ -173,10 +176,20 @@ pub fn router(state: Arc<Server>) -> Router {
     // layer above: no key, no use counted, none of the gate's per-model
     // answers.
     router = router.route("/health", axum::routing::get(health)).route("/ready", axum::routing::get(ready));
-    router
+    let enabled = state.connector.enabled;
+    let router = router
         .layer(middleware::from_fn(cors_headers))
         .layer(TraceLayer::new_for_http().make_span_with(RootSpanMaker))
-        .with_state(state)
+        .with_state(state);
+    // The connector (spec #656): `/v1/mcp` finds it in its request's
+    // extensions, and answers 404 without it. Its tools call their routes
+    // through the router as it stands here, without this layer: so it holds
+    // no reference to itself.
+    if !enabled {
+        return router;
+    }
+    let connector = crate::connector::Connector::new(tools, router.clone());
+    router.layer(axum::Extension(connector))
 }
 
 /// The `/v1` handler routes and the document they generated, built in the
@@ -247,6 +260,9 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         })
         // Spec speech/03: the Realtime transcription session, a WebSocket.
         .routes(routes!(crate::speech::realtime::connect))
+        // Spec #656: the connector's MCP server, for a coding agent's
+        // harness.
+        .routes(routes!(crate::connector::mcp))
         .route("/v1/models", options(cors_preflight))
         .route("/v1/models/switch", options(cors_preflight))
         .route("/v1/models/catalog", options(cors_preflight))
@@ -264,6 +280,7 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         .route("/v1/images/generations", options(cors_preflight))
         .route("/v1/images/edits", options(cors_preflight))
         .route("/v1/audio/transcriptions", options(cors_preflight))
+        .route(crate::connector::PATH, options(cors_preflight))
         .split_for_parts();
     describe_fields(&mut document);
     (router, document)
@@ -365,7 +382,11 @@ async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: 
     // a warm-up, and serves on the CPU through all of them.
     let speech_route = (req.method() == axum::http::Method::POST && req.uri().path() == "/v1/audio/transcriptions")
         || (req.method() == axum::http::Method::GET && req.uri().path() == "/v1/realtime");
-    if switch_route || static_route || speech_route || req.method() == axum::http::Method::OPTIONS {
+    // Spec #656: the connector's MCP server answers `initialize` and
+    // `tools/list` through a switch and a warm-up; each tool's call meets
+    // this gate on its own route.
+    let connector_route = req.uri().path() == crate::connector::PATH;
+    if switch_route || static_route || speech_route || connector_route || req.method() == axum::http::Method::OPTIONS {
         return next.run(req).await;
     }
     let message = match &*status {
@@ -4732,6 +4753,9 @@ mod tests {
             // transcription is no use of it (spec speech/02, Q40).
             ("POST", "/v1/audio/transcriptions"),
             ("GET", "/v1/realtime"),
+            // The connector's MCP server: each tool's call is a request of
+            // its own route, counted there (spec #656).
+            ("POST", "/v1/mcp"),
         ];
         let (_, document) = v1_parts();
         let document = serde_json::to_value(&document).expect("the document serializes");

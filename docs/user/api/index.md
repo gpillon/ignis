@@ -30,6 +30,7 @@ not.
 | `/v1/tokenize` | POST | A body's prompt-token count without serving it ([Counting a prompt](count.md)). |
 | `/v1/detokenize` | POST | Token ids back to text, through the same tokenizer. |
 | `/v1/decide` | POST | The decision endpoint ([Decisions](decide.md)). |
+| `/v1/mcp` | POST | The connector's MCP server, for a coding agent's harness: the server tools, over Streamable HTTP ([The connector](../guides/connector.md), from 0.11.0). Answers through a model switch; each tool's call meets its own route's checks. |
 | `/v1/systemone` | POST | The same handler on the System One API's own route ([Decisions](decide.md)). |
 | `/v1` | GET | The API reference — a 307 to `/v1/docs/` (ADR 0036). |
 | `/v1/docs/` | GET | Swagger UI over the document, from assets compiled into the binary: no CDN, nothing fetched. Open even with an API key set — it publishes the API's shape, not its load — and *Authorize* is how you drive the keyed routes from the page. |

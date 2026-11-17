@@ -66,6 +66,17 @@ png = "0.18"
 # separate decision, spec speech/spec.md "Native code outside `cuda`").
 # MPL-2.0, a dependency and not copied code (ADR 0051).
 symphonia = { version = "0.6.1", default-features = false, features = ["wav", "pcm", "flac", "mp3", "aac", "isomp4", "ogg", "mkv"] }
+# The connector's MCP server (spec #656): rmcp's Streamable HTTP transport,
+# served at `/v1/mcp`. No `macros`: the handler is written by hand over the
+# tool list the OpenAPI document declares.
+rmcp = { version = "3.7", default-features = false, features = ["server", "transport-streamable-http-server"] }
+# `oneshot`: the connector calls the route a tool names in process, through
+# the router, and hands each MCP request to rmcp's service. Already in the
+# tree under axum.
+tower = { workspace = true }
+# A tool's arguments as its route's query (`connector/call.rs`). Already in
+# the tree under axum.
+serde_urlencoded = "0.7"
 
 # `_exit` (GitHub #329, `shutdown::exit_now`): a stop before serving ends the
 # process without running its exit handlers. Already in the tree.
@@ -83,7 +94,6 @@ windows-sys = { workspace = true }
 # The scripted speech executor the integration tests drive (`fake-speech`,
 # below): this crate again, with the feature on, so a shipped build has none.
 ignis-server = { path = ".", features = ["fake-speech"] }
-tower = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The G1 canary gate (ADR 0014, GitHub #76): the teacher-forced agreement
 # scoring + the >= 95% floor live in `ignis_bench::oracle` so the arithmetic

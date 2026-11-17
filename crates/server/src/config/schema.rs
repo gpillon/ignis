@@ -1091,6 +1091,21 @@ config_group! {
     }
 }
 
+config_group! {
+    /// The connector (spec #656): the MCP server a coding agent's harness
+    /// adds as one entry, at `/v1/mcp`, behind the same API key as `/v1`.
+    ConnectorGroup = "connector" {
+        /// Serve the connector's MCP server at /v1/mcp. Off, the route
+        /// answers 404.
+        enabled: Bool = true, NO_RULE, ALL, [Visible];
+        /// List the connector's tools that change the server (the
+        /// configuration, a model download) beside those that read it. Not
+        /// a security boundary: an agent with a shell and the API key can
+        /// call the routes itself.
+        allow_changes: Bool = false, NO_RULE, ALL, [Visible];
+    }
+}
+
 settings! {
     /// The HTTP server.
     server: ServerGroup,
@@ -1120,6 +1135,8 @@ settings! {
     ngram: NgramGroup,
     /// KV-disk.
     kv_disk: KvDiskGroup,
+    /// The connector.
+    connector: ConnectorGroup,
 }
 
 #[cfg(test)]
@@ -1163,6 +1180,7 @@ mod tests {
             (DownloadGroup::NAME, debug_field_names(&DownloadGroup::default())),
             (NgramGroup::NAME, debug_field_names(&NgramGroup::default())),
             (KvDiskGroup::NAME, debug_field_names(&KvDiskGroup::default())),
+            (ConnectorGroup::NAME, debug_field_names(&ConnectorGroup::default())),
         ];
         assert_eq!(groups.len(), GROUPS.len(), "a group missing from one of the two lists");
         for ((name, struct_fields), (table_name, table)) in groups.iter().zip(GROUPS) {
@@ -1179,14 +1197,15 @@ mod tests {
     }
 
     /// The eleven groups spec config-v2/01 §Groups names, the image
-    /// model's (spec image-model/05), the speech model's (spec speech/02) and
-    /// the diarizer's (spec speech/08), no more.
+    /// model's (spec image-model/05), the speech model's (spec speech/02),
+    /// the diarizer's (spec speech/08) and the connector's (spec #656), no
+    /// more.
     #[test]
     fn the_groups_are_the_specs() {
         let names: Vec<&str> = GROUPS.iter().map(|(name, _)| *name).collect();
         assert_eq!(
             names,
-            ["server", "model", "vram", "reuse", "switch", "spec", "vision", "media", "image", "speech", "diarizer", "download", "ngram", "kv_disk"]
+            ["server", "model", "vram", "reuse", "switch", "spec", "vision", "media", "image", "speech", "diarizer", "download", "ngram", "kv_disk", "connector"]
         );
     }
 

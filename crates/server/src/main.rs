@@ -476,7 +476,10 @@ async fn main() {
         .with_socket_idle_close(std::time::Duration::from_secs(u64::from(socket_idle_close_secs)))
         .with_image(running.settings().image.clone())
         .with_speech_group(running.settings().speech.clone())
-        .with_diarizer_group(running.settings().diarizer.clone());
+        .with_diarizer_group(running.settings().diarizer.clone())
+        // Spec #656: the connector's MCP server at `/v1/mcp`, as the start
+        // configures it (neither field is patchable).
+        .with_connector(running.settings().connector.clone());
     // Spec config-v2/02: the running configuration, shown and changed over
     // `GET`/`PATCH /v1/config` and written back to the config file in use;
     // the model loader shares it, so a later switch loads with a live change

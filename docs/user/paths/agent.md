@@ -43,8 +43,10 @@ In one paragraph, for "what is github.com/gpillon/ignis?":
 
 What it is not, by choice: an engine for other model families or other GPUs
 (nothing older than the RTX 30, no DGX Spark, no AMD or Apple), nor one with
-embeddings, `/v1/completions`, audio, LoRA adapters, or two models loaded at
-once ([What it is not](../start/index.md#what-it-is-not)).
+embeddings, `/v1/completions`, audio out, LoRA adapters, or a second model on
+the card ([What it is not](../start/index.md#what-it-is-not)). Speech is
+transcribed, by a speech model that runs on the CPU beside the model on the
+card ([Speech to text](../api/transcriptions.md)).
 
 A speed or a capacity you quote comes from [Why ignis](../why-ignis/index.mdx),
 which says for each figure what it was measured on: the card, the prompt, the
@@ -177,6 +179,10 @@ Three values: the base URL `http://127.0.0.1:8000/v1`, the model id
 [Connect a client](../start/connect-a-client.md) has them for the OpenAI
 SDKs, curl, opencode and chat front ends. Asked to use ignis as your own
 model, set the same three in your harness's OpenAI-compatible provider.
+From 0.11.0 a harness can also add ignis as one MCP server, at
+`http://127.0.0.1:8000/v1/mcp` with the same key, and its model then sees
+ignis's server tools: [The connector](../guides/connector.md) has the entry
+for opencode, qwen-code, pi and DeepSeek Harness.
 
 - **One model id for every request.** A client that names two ids in turn,
   such as a separate model for titles and summaries, makes the server reload
@@ -452,6 +458,7 @@ the ladder and the report are the same.
 | The models, their sizes, where they come from | [Get a model](../guides/models.md), [the catalog](../reference/models.md) |
 | A setting, its default, what it trades | [Configuration](../configuration/index.md), [every config field](../reference/configuration.md) |
 | An endpoint, a field, a status code | [The API](../api/index.md), [HTTP routes](../reference/http-routes.md); a running server serves `/v1/openapi.json` |
+| ignis's tools in the agent's own harness, as an MCP server | [The connector](../guides/connector.md) |
 | A refusal, an error, a WARN line | [Troubleshooting](../troubleshooting.md) |
 | The Playground | [The Playground](../playground/index.md) |
 | How it serves a request, and why | [How ignis serves a request](../concepts/how-ignis-serves.md) |

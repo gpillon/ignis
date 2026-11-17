@@ -334,6 +334,13 @@ fn rows(server: &Server) -> Vec<CatalogRow> {
         (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = ApiError),
         (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`).", body = ApiError),
     ),
+    // Spec #656: the connector's `read_catalog` (`crate::connector::tools`).
+    extensions(("x-ignis-tool" = json!({
+        "name": "read_catalog",
+        "description": "The models this ignis server can switch to or download, one row each: whether it is on disk, which one is loaded, its kind and size, and a running download's progress. Read it before naming a model, and to follow a download.",
+        "read_only": true,
+        "destructive": false,
+    }))),
 )]
 pub(crate) async fn get_models_catalog(State(server): State<Arc<Server>>) -> Json<CatalogList> {
     let server = Server::clone(&server);
