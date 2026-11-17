@@ -231,11 +231,16 @@ int main() {
     swiglu.push_back(p);
   }
 
-  // Upstream's path: a stream no cache serves.
+  // Upstream's path: a stream no cache serves. On Windows it allocates each product's block from
+  // the device's memory pool, which is what the watermark below reads (its positive control).
   clear(linear);
   clear(swiglu);
+  pool_used_high(true);
   run(linear, 1, plain);
   run(swiglu, 1, plain);
+#ifdef _WIN32
+  check(pool_used_high(false) > 0, "upstream's path allocates from the device's memory pool");
+#endif
   const auto linear_plain = outputs(linear);
   const auto swiglu_plain = outputs(swiglu);
 
