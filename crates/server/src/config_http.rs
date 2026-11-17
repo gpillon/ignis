@@ -357,7 +357,7 @@ pub(crate) struct FieldsQuery {
     tag = "config",
     operation_id = "get_config_fields",
     summary = "The configuration's fields",
-    description = "One object per field `GET /v1/config` shows, in declaration order: the field's group and name, the key a config file and a `400` from `PATCH /v1/config` spell it by, its kind, its default, the rule a value must meet (structured in `rule`, as a sentence in `rule_text`), the model families that take it (`null` for all), whether it may be unset (`nullable`), given per family (`scoped`), changed while the server runs (`patchable`) and whether a change reloads the model (`reload_required`). The same declarations `ignis-server help --fields --format json` prints, minus the fields `GET /v1/config` hides.\n\nWithout a query it lists every visible field. `group` (`?group=vram`) keeps one group's fields. `names` keeps the fields whose `file_key` it lists, as one comma-separated list (`?names=vram.budget,server.port`, never a repeated parameter); a name is the `<group>.<field>` key, as `GET /v1/config` nests it, and a hidden field's key is as unknown as a misspelt one. With both, a field must be in the group and named. The order is the declaration order whatever the order of `names`. A group no field is visible in, or a name that is no visible field, is `400 config_invalid` naming it and what it could have been, and the whole request answers nothing.\n\nStatic: it answers whatever state the model is in — during a switch, after a failed one — and on a server with no running configuration.",
+    description = "One object per field `GET /v1/config` shows, in declaration order: the field's group and name, the key a config file and a `400` from `PATCH /v1/config` spell it by, its kind, its default, the rule a value must meet (structured in `rule`, as a sentence in `rule_text`), the model families that take it (`null` for all), whether it may be unset (`nullable`), given per family (`scoped`), changed while the server runs (`patchable`) and whether a change reloads the model (`reload_required`). The same declarations `ignis-server help --fields --format json` prints, minus the fields `GET /v1/config` hides.\n\nWithout a query it lists every visible field. `group` (`?group=vram`) keeps one group's fields. `names` keeps the fields whose `file_key` it lists, as one comma-separated list (`?names=vram.budget_bytes,server.request_timeout`, never a repeated parameter); a name is the `<group>.<field>` key, as `GET /v1/config` nests it, and a hidden field's key is as unknown as a misspelt one. With both, a field must be in the group and named. The order is the declaration order whatever the order of `names`. A group no field is visible in, or a name that is no visible field, is `400 config_invalid` naming it and what it could have been (the groups; a name's group's fields, or the groups when its group is none), and the whole request answers nothing.\n\nStatic: it answers whatever state the model is in — during a switch, after a failed one — and on a server with no running configuration.",
     params(FieldsQuery),
     responses(
         (status = 200, description = "The visible fields, in declaration order.", body = FieldList),
@@ -368,7 +368,7 @@ pub(crate) struct FieldsQuery {
     // by `group` or by `names`, never all of them.
     extensions(("x-ignis-tool" = json!({
         "name": "describe_config",
-        "description": format!("What configuration fields mean: each one's key, kind, default, the rule a value must meet, whether it changes while the server runs and whether a change reloads the model. Give `group`, or `names` (keys like vram.budget), or both; never all fields at once. {}", groups_sentence()),
+        "description": format!("What configuration fields mean: each one's key, kind, default, the rule a value must meet, whether it changes while the server runs and whether a change reloads the model. Give `group`, or `names` (keys like vram.budget_bytes), or both; never all fields at once. {}", groups_sentence()),
         "read_only": true,
         "destructive": false,
         "input": {
@@ -395,12 +395,24 @@ pub(crate) async fn get_config_fields(Query(query): Query<FieldsQuery>) -> Respo
         let known = visible_declarations();
         for name in &wanted {
             if !known.iter().any(|field| field["file_key"] == *name) {
-                return refused("config_invalid", format!("`names` has `{name}`, which is no field: a name is `<group>.<field>`, as `GET /v1/config` nests it"));
+                return refused("config_invalid", format!("`names` has `{name}`, which is no field: {}", alternatives(name, &known)));
             }
         }
         fields.retain(|field| wanted.iter().any(|name| field["file_key"] == *name));
     }
     Json(serde_json::json!({ "object": "list", "data": fields })).into_response()
+}
+
+/// What a name of `names` that is no field could have been, as the refusal
+/// says it: the visible fields of its group, or, when its group is none,
+/// the shape of a name and the groups.
+fn alternatives(name: &str, known: &[Value]) -> String {
+    let group = name.split_once('.').map_or("", |(group, _)| group);
+    let fields: Vec<&str> = known.iter().filter(|field| field["group"] == group).filter_map(|field| field["file_key"].as_str()).collect();
+    if fields.is_empty() {
+        return format!("a name is `<group>.<field>`, as `GET /v1/config` nests it, and the groups are {}", visible_groups().join(", "));
+    }
+    format!("the {group} fields are {}", fields.join(", "))
 }
 
 /// The source of a value, as `GET /v1/config/origins` names it: the

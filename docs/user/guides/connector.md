@@ -225,7 +225,8 @@ list, never a repeated parameter. The fields come back whole and in
 declaration order, whatever the order of the list. With both, a field must be
 in the group and named. A group that does not exist, or a name that is no
 visible field (a hidden field's key counts as unknown), is `400 config_invalid`
-naming it, and nothing else is answered.
+naming it and what it could have been: the groups, or the fields of the
+name's group, so an agent can ask again. Nothing else is answered.
 
 ### Images: `generate_image`
 

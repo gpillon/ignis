@@ -1543,3 +1543,50 @@ async fn the_fields_route_refuses_an_unknown_group_or_name_and_a_hidden_field() 
         assert!(refused.get("data").is_none());
     }
 }
+
+/// The `<group>.<field>` keys `text` gives as examples: each word of field-key
+/// characters with one dot whose first part is a group of the configuration.
+fn example_keys(text: &str) -> Vec<String> {
+    let groups: Vec<&str> = ignis_server::config::schema::GROUPS.iter().map(|(name, _)| *name).collect();
+    text.split(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.'))
+        .map(|word| word.trim_matches('.'))
+        .filter(|word| word.split('.').count() == 2 && groups.contains(&word.split('.').next().unwrap()))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Spec #656: every key the route's description and `describe_config`'s
+/// give as an example is a visible field, so an agent that copies one is
+/// answered; and a name that is no field is refused naming what it could
+/// have been, as the description promises: its group's fields, or the
+/// groups when its group is none.
+#[tokio::test]
+async fn the_fields_examples_are_fields_and_a_name_refused_names_the_alternatives() {
+    let loader = MockLoader::new();
+    let app = server_on(&loader, started(&[])).app();
+    let (_, all) = send(&app, Method::GET, "/v1/config/fields", None).await;
+    let every = file_keys(&all);
+    let (status, document) = send(&app, Method::GET, "/v1/openapi.json", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let operation = &document["paths"]["/v1/config/fields"]["get"];
+    for text in [&operation["description"], &operation["x-ignis-tool"]["description"]] {
+        let text = text.as_str().expect("a description");
+        let examples = example_keys(text);
+        assert!(!examples.is_empty(), "no example key in: {text}");
+        for key in examples {
+            assert!(every.contains(&key), "`{key}` is no visible field: {text}");
+        }
+    }
+
+    let (status, refused) = send(&app, Method::GET, "/v1/config/fields?names=vram.budget", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap();
+    for key in every.iter().filter(|key| key.starts_with("vram.")) {
+        assert!(message.contains(key.as_str()), "{key}: {message}");
+    }
+    let (_, refused) = send(&app, Method::GET, "/v1/config/fields?names=budget_bytes", None).await;
+    let message = refused["error"]["message"].as_str().unwrap();
+    for group in ignis_server::config_http::visible_groups() {
+        assert!(message.contains(group), "{group}: {message}");
+    }
+}
