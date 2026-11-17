@@ -10,6 +10,8 @@
 //! - **A call** goes to its route in process, through the router, with the
 //!   caller's key ([`call`]): it meets every gate a client's request meets,
 //!   and its refusal comes back as the tool's error, the server's own JSON.
+//!   A tool whose call is more than its route's has a module of its own:
+//!   `generate_image` ([`image`]).
 //! - **`/v1/mcp` itself is never held** by the serving gate: `initialize` and
 //!   `tools/list` answer while a model switches or warms up, and a tool's
 //!   own call meets the gate on its route.
@@ -25,6 +27,7 @@
 //! lists the tools that change the server. Both are start-only.
 
 pub mod call;
+pub mod image;
 pub mod tools;
 
 use std::sync::Arc;
@@ -80,8 +83,13 @@ impl Connector {
 }
 
 /// `instructions`, from what `tools` lists.
-fn instructions(_tools: &tools::Table) -> String {
-    ABOUT.to_owned()
+fn instructions(tools: &tools::Table) -> String {
+    let mut text = ABOUT.to_owned();
+    if tools.named(image::TOOL).is_some() {
+        text.push('\n');
+        text.push_str(image::INSTRUCTIONS);
+    }
+    text
 }
 
 /// What every request's handler shares: built once per router.
@@ -130,7 +138,12 @@ impl ServerHandler for Mcp {
             .get::<axum::http::request::Parts>()
             .and_then(|parts| parts.headers.get(header::AUTHORIZATION))
             .cloned();
-        Ok(call::call(&self.0.routes, tool, request.arguments, authorization).await.into())
+        // A tool whose call is more than its route's has its own module.
+        let result = match tool.tool.name.as_ref() {
+            image::TOOL => image::generate(&self.0.routes, &self.0.tools, tool, request.arguments, authorization).await,
+            _ => call::call(&self.0.routes, tool, request.arguments, authorization).await,
+        };
+        Ok(result.into())
     }
 }
 
@@ -141,7 +154,7 @@ impl ServerHandler for Mcp {
     tag = "connector",
     operation_id = "mcp",
     summary = "The connector's MCP server",
-    description = "MCP over Streamable HTTP, for a coding agent's harness: one MCP server entry pointing at this URL, with the same bearer key as the rest of `/v1`. The body is one JSON-RPC message of MCP: `initialize`, `tools/list`, `tools/call`, `ping`, or a notification. Each request stands alone (no `Mcp-Session-Id`, so a restart of the server strands no client): it must carry `Content-Type: application/json` and an `Accept` naming both `application/json` and `text/event-stream`. A `GET` is `405`: there is no server-to-client stream.\n\n`initialize` answers ignis's `instructions`, fixed at start. `tools/list` answers the server tools: the routes whose operation in this document carries an `x-ignis-tool` extension (its `name`, the `description` the model reads, the `read_only` and `destructive` hints, and the narrower `input` it takes), sorted by name, the same bytes whatever model is loaded; the tools that change the server are listed only with `connector.allow_changes` on. `tools/call` calls the tool's route on this server with the caller's key, through every check a request of the client's own would meet, and answers its body as text; a refusal is `isError: true`, its text the route's error JSON, then `Retry-After: <seconds>` when the route sent that header. Nothing is retried.\n\nThis route is never held while a model switches or warms up; a tool's call is held, or refused, as its route is. Any `Host` header is admitted. With `connector.enabled` off it answers `404`.",
+    description = "MCP over Streamable HTTP, for a coding agent's harness: one MCP server entry pointing at this URL, with the same bearer key as the rest of `/v1`. The body is one JSON-RPC message of MCP: `initialize`, `tools/list`, `tools/call`, `ping`, or a notification. Each request stands alone (no `Mcp-Session-Id`, so a restart of the server strands no client): it must carry `Content-Type: application/json` and an `Accept` naming both `application/json` and `text/event-stream`. A `GET` is `405`: there is no server-to-client stream.\n\n`initialize` answers ignis's `instructions`, fixed at start. `tools/list` answers the server tools: the routes whose operation in this document carries an `x-ignis-tool` extension (its `name`, the `description` the model reads, the `read_only` and `destructive` hints, and the narrower `input` it takes), sorted by name, the same bytes whatever model is loaded; the tools that change the server are listed only with `connector.allow_changes` on. `tools/call` calls the tool's route on this server with the caller's key, through every check a request of the client's own would meet, and answers its body as text (`generate_image` answers a PNG preview of its image, at most 512 px on its longest edge, then a line of text); a refusal is `isError: true`, its text the route's error JSON, then `Retry-After: <seconds>` when the route sent that header. Nothing is retried.\n\nThis route is never held while a model switches or warms up; a tool's call is held, or refused, as its route is. Any `Host` header is admitted. With `connector.enabled` off it answers `404`.",
     request_body(content = Object, description = "One JSON-RPC message of MCP."),
     responses(
         (status = 200, description = "A request's JSON-RPC answer: `application/json`, or `text/event-stream` when the call sent a notification first, its last event the answer.", content(
