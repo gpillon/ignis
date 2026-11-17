@@ -69,7 +69,7 @@ symphonia = { version = "0.6.1", default-features = false, features = ["wav", "p
 # The connector's MCP server (spec #656): rmcp's Streamable HTTP transport,
 # served at `/v1/mcp`. No `macros`: the handler is written by hand over the
 # tool list the OpenAPI document declares.
-rmcp = { version = "3.7", default-features = false, features = ["server", "transport-streamable-http-server"] }
+rmcp = { version = "3.10", default-features = false, features = ["server", "transport-streamable-http-server"] }
 # `oneshot`: the connector calls the route a tool names in process, through
 # the router, and hands each MCP request to rmcp's service. Already in the
 # tree under axum.

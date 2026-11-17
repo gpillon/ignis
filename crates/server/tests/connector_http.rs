@@ -30,9 +30,14 @@ use switch_support::MockLoader;
 const PATIENT: Duration = Duration::from_secs(30);
 const KEY: &str = "sk-connector-test";
 
-/// What a harness's MCP client sends on every POST: both media types, and
-/// the server's own address as `Host`, here a name a tunnel or a LAN would
-/// give it, which rmcp refuses unless its Host check is off.
+/// The protocol version the tests' harness asks for in `initialize`, and
+/// names on every request after it, as MCP's Streamable HTTP has a client do.
+const PROTOCOL: &str = "2025-06-18";
+
+/// What a harness's MCP client sends on every POST: both media types, the
+/// server's own address as `Host`, here a name a tunnel or a LAN would give
+/// it, which rmcp refuses unless its Host check is off, and after
+/// `initialize` the protocol version it negotiated.
 fn mcp(body: &Value, key: Option<&str>) -> Request<Body> {
     let mut request = Request::builder()
         .method(Method::POST)
@@ -40,6 +45,9 @@ fn mcp(body: &Value, key: Option<&str>) -> Request<Body> {
         .header(header::HOST, "ignis.example:8000")
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, "application/json, text/event-stream");
+    if body["method"] != "initialize" {
+        request = request.header("mcp-protocol-version", PROTOCOL);
+    }
     if let Some(key) = key {
         request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
     }
@@ -72,7 +80,7 @@ async fn rpc(app: &axum::Router, method: &str, params: Value, key: Option<&str>)
 }
 
 fn initialize() -> Value {
-    json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "a-harness", "version": "1.0" } })
+    json!({ "protocolVersion": PROTOCOL, "capabilities": {}, "clientInfo": { "name": "a-harness", "version": "1.0" } })
 }
 
 fn call(name: &str) -> Value {
@@ -162,6 +170,7 @@ async fn initialize_answers_ignis_with_its_instructions() {
     assert!(headers.get("mcp-session-id").is_none(), "stateless: {headers:?}");
     let answer: Value = serde_json::from_slice(&bytes).unwrap();
     let result = &answer["result"];
+    assert_eq!(result["protocolVersion"], PROTOCOL, "{result}");
     assert_eq!(result["serverInfo"]["name"], "ignis", "{result}");
     assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
     assert!(result["capabilities"]["tools"].is_object(), "{result}");

@@ -44,7 +44,11 @@ server's URL and, with a key, the `Authorization` header.
 
 The key is read from the harness's environment, as `IGNIS_API_KEY` in the
 entries below: set it to the server's key in the shell the harness starts
-from. On a server with no key, leave the header out.
+from. The name is the harness's to choose: the provider example on
+[Connect a client](../start/connect-a-client.md#coding-agents-opencode-and-others)
+reads the key from `IGNIS_SERVER_API_KEY`, the server's own variable, and
+either works where it holds the key. On a server with no key, leave the
+header out.
 
 ### opencode
 
@@ -102,7 +106,7 @@ project's `.qwen/settings.json`, whose servers wait for your approval.
   every request. Without it qwen-code defers them behind its tool search, and
   the list in the prompt prefix changes as the agent finds them.
 - `"trust": true` stops qwen-code asking before each call, in a trusted
-  folder, and lets it repeat a read-only call once after an ignis restart.
+  folder.
 - A variable that is not set stays in the header as written
   (`Bearer $IGNIS_API_KEY`), which the server answers `401`.
 
