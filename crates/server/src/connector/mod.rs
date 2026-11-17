@@ -11,7 +11,8 @@
 //!   caller's key ([`call`]): it meets every gate a client's request meets,
 //!   and its refusal comes back as the tool's error, the server's own JSON.
 //!   A tool whose call is more than its route's has a module of its own:
-//!   `generate_image` ([`image`]).
+//!   `generate_image` ([`image`]), whose calls the server runs one at a
+//!   time, whichever router they came by ([`crate::Server::image_calls`]).
 //! - **`/v1/mcp` itself is never held** by the serving gate: `initialize` and
 //!   `tools/list` answer while a model switches or warms up, and a tool's
 //!   own call meets the gate on its route.
@@ -69,7 +70,7 @@ A failed call returns the server's error JSON and Retry-After; nothing is retrie
 /// native command's output as text, which would corrupt the archive. At 380
 /// bytes it is the ticket's whole share of the 1 KB; the guide's forms are
 /// the longer ones that clean up.
-const INSTALL: &str = r#"Skill (files) sh: d=~/.agents/skills;mkdir -p $d;curl -fsS -H "Authorization: Bearer $IGNIS_API_KEY" ${IGNIS_BASE_URL:-http://127.0.0.1:8000}/v1/connector/skill|tar xz -C $d
+pub(crate) const INSTALL: &str = r#"Skill (files) sh: d=~/.agents/skills;mkdir -p $d;curl -fsS -H "Authorization: Bearer $IGNIS_API_KEY" ${IGNIS_BASE_URL:-http://127.0.0.1:8000}/v1/connector/skill|tar xz -C $d
 ps: $u=$env:IGNIS_BASE_URL;if(!$u){$u='http://127.0.0.1:8000'};$d="$HOME/.agents/skills";md -f $d;curl.exe -fsS -H "Authorization: Bearer $env:IGNIS_API_KEY" -o $d/s $u/v1/connector/skill;tar xzf $d/s -C $d"#;
 
 /// The connector of one router (`api::router`): its MCP service, over the
@@ -82,9 +83,10 @@ pub struct Connector {
 impl Connector {
     /// The connector serving `tools`, each call sent through `routes`: the
     /// server's router without this connector, so it holds no reference to
-    /// itself.
-    pub fn new(tools: tools::Table, routes: Router) -> Self {
-        let shared = Arc::new(Shared { instructions: instructions(&tools), tools, routes });
+    /// itself. `server` is the one `routes` serve: what `generate_image`
+    /// reads the models of, and holds its calls on.
+    pub fn new(tools: tools::Table, routes: Router, server: Arc<crate::Server>) -> Self {
+        let shared = Arc::new(Shared { instructions: instructions(&tools), tools, routes, server });
         let config = StreamableHttpServerConfig::default()
             .with_legacy_session_mode(false)
             .with_json_response(true)
@@ -115,6 +117,7 @@ struct Shared {
     tools: tools::Table,
     instructions: String,
     routes: Router,
+    server: Arc<crate::Server>,
 }
 
 /// The MCP handler of one request (rmcp builds one per request in
@@ -158,7 +161,7 @@ impl ServerHandler for Mcp {
             .cloned();
         // A tool whose call is more than its route's has its own module.
         let result = match tool.tool.name.as_ref() {
-            image::TOOL => image::generate(&self.0.routes, &self.0.tools, tool, request.arguments, authorization).await,
+            image::TOOL => image::generate(&self.0, tool, request.arguments, authorization, &context).await,
             _ => call::call(&self.0.routes, tool, request.arguments, authorization).await,
         };
         Ok(result.into())

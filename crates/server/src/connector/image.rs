@@ -1,36 +1,53 @@
-//! `generate_image` (spec #656, ticket #661): the server tool whose call is
-//! more than its route's. It is declared on `POST /v1/images/generations`
-//! (`crate::images::routes::create_image`), and its call goes, in order:
+//! `generate_image` (spec #656, tickets #661 and #663): the server tool
+//! whose call is more than its route's. It is declared on `POST
+//! /v1/images/generations` (`crate::images::routes::create_image`), and its
+//! call goes, in order:
 //!
-//! 1. [`image_model`]: the catalog's image model on disk, read through
+//! 1. [`agent_sees`]: whether the agent's text model has vision, the one
+//!    loaded or, with the image model loaded, the one the server switched
+//!    away from. Without, the call answers at once naming the skill's
+//!    script ([`unseen`]), and nothing switches for an image nobody sees.
+//! 2. [`ImageCalls`]: the turn. The connector's image calls run one at a
+//!    time, so a call sent while another one's switch runs waits for it to
+//!    end rather than meet its `503 model_switching`, and finds the image
+//!    model loaded: several calls in one turn cost one switch.
+//! 3. [`image_model`]: the catalog's image model on disk, read through
 //!    `GET /v1/models/catalog` with the caller's key. With none, the tool's
 //!    error names the download that fetches it.
-//! 2. [`made`]: the route, naming that model, with the agent's `prompt` and
+//! 4. [`made`]: the route, naming that model, with the agent's `prompt` and
 //!    `size` and nothing else, so one image. Naming it is what switches the
 //!    server to it (`switch.allow_implicit`); nothing switches back: the
 //!    harness's next turn names its own model, and the implicit switch
-//!    returns to it.
-//! 3. [`shown`]: the image as a PNG of at most [`PREVIEW_EDGE`] px on its
+//!    returns to it. A call carrying a progress token reads the route's
+//!    events (`stream: true`), each phase a progress notification
+//!    ([`streamed`]). The turn ends once the image is read off the route.
+//! 5. [`shown`]: the image as a PNG of at most [`PREVIEW_EDGE`] px on its
 //!    longest edge, first, then one line of text.
 //!
 //! Each refusal on the way is the route's own answer, through
-//! [`super::call::answer`]. What the spec puts around these steps next
-//! (ticket #663) goes here too: the vision check on the text model switched
-//! away from, before step 1; the hold that runs the connector's image calls
-//! one at a time, around step 2; and the route's `stream: true` phases as
-//! progress notifications, in step 2.
+//! [`super::call::answer`]; a full image queue among them. A call its
+//! harness gives up, by closing the request as its timeout does, leaves the
+//! line, or drops its route's answer, which cancels its job.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderValue, Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
+use http_body_util::BodyExt;
 use ignis_core::compute::ModelKind;
 use ignis_core::image::ImageSize;
-use rmcp::model::{CallToolResult, ContentBlock, JsonObject};
+use rmcp::model::{CallToolResult, ContentBlock, JsonObject, ProgressNotificationParam, ProgressToken};
+use rmcp::service::RequestContext;
+use rmcp::RoleServer;
+use serde_json::value::RawValue;
 use serde_json::Value;
 
 use super::call;
-use super::tools::{ServerTool, Table};
+use super::tools::ServerTool;
+use super::Shared;
+use crate::Server;
 
 /// The tool's name, as its route's extension declares it.
 pub(crate) const TOOL: &str = "generate_image";
@@ -47,19 +64,90 @@ pub(crate) const PREVIEW_EDGE: u32 = 512;
 /// What `instructions` say of the tool: an image's cost.
 pub(crate) const INSTRUCTIONS: &str = "generate_image costs about 20 s of model switching, out and back on your next turn; other clients get 503 meanwhile, and you see the image only with vision on.";
 
-/// Call `generate_image` with `arguments`, through `routes`, presenting
-/// `authorization`, the harness's own header; `tools` is what the
-/// connector lists.
-pub(crate) async fn generate(
-    routes: &Router,
-    tools: &Table,
+/// The connector's `generate_image` calls (spec #656), one at a time: a
+/// call holds the turn from its read of the catalog until its image is read
+/// off the route, so that a call sent meanwhile never meets the first one's
+/// switch, which would answer it `503 model_switching`, and finds the image
+/// model loaded once its turn comes. Not a retry: behind it, the image
+/// route's own queue serves every client. One per server, shared by every
+/// router it builds ([`crate::Server::image_calls`]).
+#[derive(Debug, Default)]
+pub struct ImageCalls {
+    /// The turn, handed on in the order the calls asked for it.
+    turn: tokio::sync::Mutex<()>,
+    /// The calls waiting for their turn now.
+    waiting: AtomicUsize,
+}
+
+impl ImageCalls {
+    /// How many calls wait for their turn now.
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::SeqCst)
+    }
+
+    /// The turn: at once when no call holds it, else, `waits` run first,
+    /// once every call that asked before has ended; `None` when `given_up`
+    /// comes first, and the call leaves the line. No bound of its own: the
+    /// call ahead ends by its route's own deadlines, and a harness's timeout
+    /// gives a waiting call up.
+    async fn turn(
+        &self,
+        waits: impl std::future::Future<Output = ()>,
+        given_up: impl std::future::Future<Output = ()>,
+    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        if let Ok(turn) = self.turn.try_lock() {
+            return Some(turn);
+        }
+        let _counted = Waiting::count(&self.waiting);
+        let turn = async {
+            waits.await;
+            self.turn.lock().await
+        };
+        tokio::select! {
+            turn = turn => Some(turn),
+            () = given_up => None,
+        }
+    }
+}
+
+/// A call counted in [`ImageCalls::waiting`] until dropped.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn count(waiting: &'a AtomicUsize) -> Self {
+        waiting.fetch_add(1, Ordering::SeqCst);
+        Self(waiting)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Call `generate_image` with `arguments`, through the connector's routes,
+/// presenting `authorization`, the harness's own header; `context` is the
+/// MCP request's.
+pub(super) async fn generate(
+    connector: &Shared,
     tool: &ServerTool,
     arguments: Option<JsonObject>,
     authorization: Option<HeaderValue>,
+    context: &RequestContext<RoleServer>,
 ) -> CallToolResult {
+    let (routes, tools) = (&connector.routes, &connector.tools);
     let fields = match fields(arguments) {
         Ok(fields) => fields,
         Err(refused) => return call::answer(refused).await,
+    };
+    if !agent_sees(&connector.server) {
+        return unseen();
+    }
+    let mut progress = Progress::of(context);
+    let waits = progress.tell("waiting for the image call before this one".to_owned());
+    let Some(turn) = connector.server.image_calls.turn(waits, context.ct.cancelled()).await else {
+        return given_up();
     };
     let model = match image_model(routes, authorization.clone()).await {
         Ok(Pick::OnDisk(model)) => model,
@@ -68,15 +156,48 @@ pub(crate) async fn generate(
         }
         Err(refused) => return refused,
     };
-    let response = match made(routes, tool, fields, model, authorization).await {
-        Ok(response) => response,
-        Err(refused) => return refused,
+    let made = tokio::select! {
+        made = made(routes, tool, fields, model, authorization, &mut progress) => made,
+        // Dropped with the route's answer, the job is cancelled.
+        () = context.ct.cancelled() => return given_up(),
     };
-    if !response.status().is_success() {
-        return call::answer(response).await;
+    drop(turn);
+    match made {
+        Ok(encoded) => shown(encoded).await,
+        Err(refused) => refused,
     }
-    shown(response).await
 }
+
+/// The result of a call its harness gave up (a timeout, a disconnect)
+/// before its image was made: nobody reads it.
+fn given_up() -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text("the call was given up before its image was made")])
+}
+
+/// Whether the agent's text model sees images (spec #656): the loaded
+/// model's vision when it is a text model; with the image model loaded, the
+/// vision of the text model the server switched away from, which the
+/// harness's next turn returns to ([`crate::model_switch::Switcher::text_model_left`]).
+/// A server that knows none, started on the image model, is taken to see:
+/// nothing says the agent cannot, and no switch is spent on the image.
+fn agent_sees(server: &Server) -> bool {
+    let loaded = server.active();
+    if loaded.kind() == ModelKind::Text {
+        return loaded.media.is_some();
+    }
+    server.switcher.as_ref().and_then(|switcher| switcher.text_model_left()).is_none_or(|left| left.vision)
+}
+
+/// What a call answers when the agent's model has vision off: no image, no
+/// switch, and the skill's script that makes one as a file, with the
+/// skill's install. Not an error: the agent asked nothing wrong, and the
+/// way to an image is the script.
+fn unseen() -> CallToolResult {
+    CallToolResult::success(vec![ContentBlock::text(format!("{UNSEEN}\n{}", super::INSTALL))])
+}
+
+/// [`unseen`]'s text, the skill's install after it.
+const UNSEEN: &str = "No image was made: the model you run on has vision off, so it could not see one, and making it would switch models for nothing. The ignis skill's generate-image script makes the image as a file: in the skill's folder, ~/.agents/skills/ignis, run node scripts/generate-image.mjs \"<prompt>\" <out.png> [--size WxH]. Without the skill, install it first, with the line for your shell:";
 
 /// The arguments the route is sent: `prompt` and `size`, as given. Any
 /// other is refused, naming it: the route's `n`, `model` and `stream` are
@@ -164,30 +285,150 @@ fn absent(model: &str, unavailable: Option<&str>, download_listed: bool) -> Resp
     crate::api::error_response(StatusCode::NOT_FOUND, "model_not_found", "model_not_found", message)
 }
 
-/// The route's answer to `fields` naming `model`: one image, or its refusal.
+/// The image the route makes of `fields`, naming `model`: its PNG in
+/// base64, read off the route's whole answer, or the tool's result when the
+/// route refuses. A call that carries a progress token asks for the route's
+/// events (`stream: true`) and tells `progress` each of its phases as it
+/// starts ([`streamed`]).
 async fn made(
     routes: &Router,
     tool: &ServerTool,
     mut fields: JsonObject,
     model: String,
     authorization: Option<HeaderValue>,
-) -> Result<Response, CallToolResult> {
+    progress: &mut Progress<'_>,
+) -> Result<String, CallToolResult> {
     fields.insert("model".to_owned(), Value::String(model));
-    match call::request(tool, Some(fields), authorization) {
-        Ok(request) => Ok(call::send(routes, request).await),
-        Err(refused) => Err(CallToolResult::error(vec![ContentBlock::text(refused)])),
+    if progress.heard() {
+        fields.insert("stream".to_owned(), Value::Bool(true));
+    }
+    let request = call::request(tool, Some(fields), authorization)
+        .map_err(|refused| CallToolResult::error(vec![ContentBlock::text(refused)]))?;
+    let response = call::send(routes, request).await;
+    if !response.status().is_success() {
+        return Err(call::answer(response).await);
+    }
+    if progress.heard() {
+        return streamed(response, progress).await;
+    }
+    let body = read(response).await.map_err(|why| unreadable("the image", &why))?;
+    let answer: Value = serde_json::from_slice(&body).map_err(|err| unreadable("the image", &err.to_string()))?;
+    match answer["data"][0]["b64_json"].as_str() {
+        Some(encoded) => Ok(encoded.to_owned()),
+        None => Err(unreadable("the image", "the answer holds no image")),
     }
 }
 
-/// The route's image as the harness reads it: the preview first, then one
-/// line of text. Decoding, resizing and encoding a picture of a few
-/// megapixels is CPU work: off the async workers.
-async fn shown(response: Response) -> CallToolResult {
-    let body = match read(response).await {
-        Ok(body) => body,
-        Err(why) => return unreadable("the image", &why),
+/// The route's `stream: true` answer, read to its end: each progress event
+/// told to `progress`, the image off its completed event; or the tool's
+/// error from an `error` event, the server's error JSON as a client reads
+/// it from a whole answer (a stream answered `200` before its refusal has
+/// no `Retry-After` to pass on).
+async fn streamed(response: Response, progress: &mut Progress<'_>) -> Result<String, CallToolResult> {
+    let mut body = response.into_body();
+    let mut unread = Vec::new();
+    let mut image = None;
+    loop {
+        while let Some(end) = unread.windows(2).position(|pair| pair == b"\n\n") {
+            let event: Vec<u8> = unread.drain(..end + 2).collect();
+            let Some(data) = event_data(&event) else {
+                continue;
+            };
+            let event: Value = serde_json::from_str(&data).map_err(|err| unreadable("the image's events", &err.to_string()))?;
+            match event["type"].as_str().unwrap_or_default() {
+                "error" => return Err(stream_refused(&data)),
+                kind if kind.ends_with(".progress") => progress.tell(phase(&event)).await,
+                kind if kind.ends_with(".completed") => image = event["b64_json"].as_str().map(str::to_owned),
+                _ => {}
+            }
+        }
+        match body.frame().await {
+            None => break,
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    unread.extend_from_slice(&data);
+                }
+            }
+            Some(Err(err)) => return Err(unreadable("the image's events", &err.to_string())),
+        }
+    }
+    image.ok_or_else(|| unreadable("the image's events", "they ended with no image"))
+}
+
+/// The `data:` lines of one Server-Sent Event, joined; `None` for an event
+/// that has none.
+fn event_data(event: &[u8]) -> Option<String> {
+    let event = String::from_utf8_lossy(event);
+    let lines: Vec<&str> = event
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|data| data.strip_prefix(' ').unwrap_or(data))
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// The tool's error for the route's `error` event `data`: its `error`
+/// object, as the route writes it, in the body a whole answer would have.
+fn stream_refused(data: &str) -> CallToolResult {
+    #[derive(serde::Deserialize)]
+    struct Refused<'a> {
+        #[serde(borrow)]
+        error: &'a RawValue,
+    }
+    let text = match serde_json::from_str::<Refused<'_>>(data) {
+        Ok(refused) => format!("{{\"error\":{}}}", refused.error.get()),
+        Err(_) => data.to_owned(),
     };
-    match tokio::task::spawn_blocking(move || preview(&body)).await {
+    CallToolResult::error(vec![ContentBlock::text(text)])
+}
+
+/// A route's progress event as a notification's message: the phase first
+/// (`switching`, `loading`, `enhancing`, `encoding`, `denoising`,
+/// `decoding`), then, for a phase of several steps, which one.
+fn phase(event: &Value) -> String {
+    let phase = event["phase"].as_str().unwrap_or("working");
+    match (event["step"].as_u64(), event["total"].as_u64()) {
+        (Some(step), Some(total)) if total > 1 => format!("{phase} {step} of {total}"),
+        _ => phase.to_owned(),
+    }
+}
+
+/// Where a call's progress goes (spec #656): MCP progress notifications on
+/// the harness's progress token, when its call carries one, each one's
+/// `progress` one past the last; nowhere otherwise.
+struct Progress<'a> {
+    context: &'a RequestContext<RoleServer>,
+    token: Option<ProgressToken>,
+    told: u32,
+}
+
+impl<'a> Progress<'a> {
+    fn of(context: &'a RequestContext<RoleServer>) -> Self {
+        Self { context, token: context.meta.get_progress_token(), told: 0 }
+    }
+
+    /// Whether the call carries a progress token.
+    fn heard(&self) -> bool {
+        self.token.is_some()
+    }
+
+    /// `message` as the next notification. One that cannot be sent is
+    /// dropped: a harness gone gives the call up by its own token.
+    async fn tell(&mut self, message: String) {
+        let Some(token) = &self.token else {
+            return;
+        };
+        self.told += 1;
+        let note = ProgressNotificationParam::new(token.clone(), f64::from(self.told)).with_message(message);
+        let _ = self.context.peer.notify_progress(note).await;
+    }
+}
+
+/// The image, `encoded`, as the harness reads it: the preview first, then
+/// one line of text. Decoding, resizing and encoding a picture of a few
+/// megapixels is CPU work: off the async workers.
+async fn shown(encoded: String) -> CallToolResult {
+    match tokio::task::spawn_blocking(move || preview(&encoded)).await {
         Ok(Ok(preview)) => {
             let image = ContentBlock::image(crate::images::job::base64(&preview.png), "image/png");
             CallToolResult::success(vec![image, ContentBlock::text(preview.line())])
@@ -218,11 +459,9 @@ impl Preview {
     }
 }
 
-/// The route's JSON answer as a [`Preview`]: its one image as it is when
-/// within [`PREVIEW_EDGE`], else resized to fit it, aspect kept.
-fn preview(answer: &[u8]) -> Result<Preview, String> {
-    let answer: Value = serde_json::from_slice(answer).map_err(|err| err.to_string())?;
-    let encoded = answer["data"][0]["b64_json"].as_str().ok_or("the answer holds no image")?;
+/// The route's image, `encoded`, as a [`Preview`]: as it is when within
+/// [`PREVIEW_EDGE`], else resized to fit it, aspect kept.
+fn preview(encoded: &str) -> Result<Preview, String> {
     let png = crate::media::base64_bytes(encoded).ok_or("the answer's image is not base64")?;
     // The route's own PNG: no bound of a client's to hold it to.
     let image = crate::media::decode_condition_image(&png, u64::MAX)?;
@@ -336,6 +575,48 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         let body: Value = serde_json::from_slice(&read(refused).await.unwrap()).unwrap();
         assert_eq!(body["error"]["param"], "n", "{body}");
+    }
+
+    /// A refusal that comes once the route's events have begun, an `error`
+    /// event (a full queue after a switch), is the tool's error: the body a
+    /// whole answer would have had, its keys in the route's order; and a
+    /// progress event's message is its phase, then its step when it has
+    /// several.
+    #[test]
+    fn an_error_event_is_the_tools_error_and_a_progress_event_names_its_phase() {
+        let event = "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"the image queue is full\",\"type\":\"engine_full\",\"code\":\"engine_full\"}}\n\n";
+        let result = serde_json::to_value(stream_refused(&event_data(event.as_bytes()).unwrap())).unwrap();
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(
+            result["content"][0]["text"],
+            r#"{"error":{"message":"the image queue is full","type":"engine_full","code":"engine_full"}}"#
+        );
+        assert_eq!(event_data(b": a comment\n\n"), None);
+        let progress = |phase: &str, step: u32, total: u32| json!({ "phase": phase, "image": 0, "step": step, "total": total });
+        assert_eq!(phase(&progress("switching", 1, 1)), "switching");
+        assert_eq!(phase(&progress("switching", 2, 2)), "switching 2 of 2");
+        assert_eq!(phase(&progress("denoising", 3, 8)), "denoising 3 of 8");
+    }
+
+    /// A call waits for the turn another holds, counted while it waits; given
+    /// up meanwhile (its harness's timeout), it leaves the line without the
+    /// turn; once the holder ends, the next call has it at once.
+    #[tokio::test]
+    async fn a_call_given_up_while_it_waits_for_its_turn_leaves_the_line() {
+        let calls = ImageCalls::default();
+        let first = calls.turn(async {}, std::future::pending()).await.expect("no call holds the turn");
+        let (give_up, given_up) = tokio::sync::oneshot::channel::<()>();
+        let waiter = calls.turn(async {}, async {
+            let _ = given_up.await;
+        });
+        tokio::pin!(waiter);
+        assert!(futures_util::poll!(&mut waiter).is_pending());
+        assert_eq!(calls.waiting(), 1);
+        give_up.send(()).unwrap();
+        assert!(waiter.await.is_none(), "given up, it has no turn");
+        assert_eq!(calls.waiting(), 0);
+        drop(first);
+        assert!(calls.turn(async {}, std::future::pending()).await.is_some());
     }
 
     /// Spec #656: the image's line of `instructions` keeps within its share

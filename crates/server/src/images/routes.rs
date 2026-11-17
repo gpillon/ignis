@@ -420,7 +420,7 @@ Prompt enhancement (`prompt_enhancement: true`, or `image.prompt_enhancement` wh
     // catalog's image model and answers a preview (`crate::connector::image`).
     extensions(("x-ignis-tool" = json!({
         "name": "generate_image",
-        "description": "Make one image from a prompt with ignis's image model, and see a preview of it, at most 512 px on its longest edge. Seeing it needs vision on in the model you run on. It is costly: the server switches from your model to the image model, about 10 s, and back on your next turn, about 11 s; the prompt state is lost, and other clients are answered 503 meanwhile. Call it when an image is asked for. To save an image to a file at full size, use the ignis skill's generate-image script instead.",
+        "description": "Make one image from a prompt with ignis's image model, and see a preview of it, at most 512 px on its longest edge. Seeing it needs vision on in the model you run on; without it, no image is made and the answer names the skill's script. It is costly: the server switches from your model to the image model, about 10 s, and back on your next turn, about 11 s; the prompt state is lost, and other clients are answered 503 meanwhile. Several calls in one turn run one after another, at one switch. Call it when an image is asked for. To save an image to a file at full size, use the ignis skill's generate-image script instead.",
         "read_only": false,
         "destructive": false,
         "input": {

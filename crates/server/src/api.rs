@@ -177,6 +177,7 @@ pub fn router(state: Arc<Server>) -> Router {
     // answers.
     router = router.route("/health", axum::routing::get(health)).route("/ready", axum::routing::get(ready));
     let enabled = state.connector.enabled;
+    let server = Arc::clone(&state);
     let router = router
         .layer(middleware::from_fn(cors_headers))
         .layer(TraceLayer::new_for_http().make_span_with(RootSpanMaker))
@@ -188,7 +189,7 @@ pub fn router(state: Arc<Server>) -> Router {
     if !enabled {
         return router;
     }
-    let connector = crate::connector::Connector::new(tools, router.clone());
+    let connector = crate::connector::Connector::new(tools, router.clone(), server);
     router.layer(axum::Extension(connector))
 }
 

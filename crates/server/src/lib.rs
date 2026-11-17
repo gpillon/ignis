@@ -173,6 +173,10 @@ pub struct Server {
     /// list depends on the start alone. On, listing none of those tools, by
     /// default.
     pub connector: config::schema::ConnectorGroup,
+    /// The connector's `generate_image` calls, run one at a time (spec #656,
+    /// [`connector::image::ImageCalls`]): shared by every clone, so every
+    /// router a server builds holds the same calls.
+    pub image_calls: std::sync::Arc<connector::image::ImageCalls>,
 }
 
 /// The server-level knobs a live config change may touch (spec config-v2/02
@@ -383,6 +387,7 @@ impl Server {
             speech: std::sync::Arc::default(),
             downloads: None,
             connector: config::schema::ConnectorGroup::default(),
+            image_calls: std::sync::Arc::default(),
         }
     }
 

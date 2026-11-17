@@ -210,9 +210,39 @@ and the tool passes it on.
 ([`vision.enabled`](../configuration/vision.md)). qwen-code and DeepSeek
 Harness pass a tool's image to the model only when the harness's
 configuration of the model declares image input; otherwise the model reads
-the line of text alone. With vision off, a harness that passes the image on
-sends it back with each later turn, and ignis refuses those turns
-`vision_disabled`.
+the line of text alone.
+
+**With vision off** the tool makes no image and switches nothing: it answers
+at once with a line of text naming the skill's `generate-image` script,
+which makes the image as a file, and the skill's install commands, in a
+POSIX shell form and a PowerShell form. An image the model cannot see would
+cost the switch for nothing, and, sent back with each later turn, would have
+those turns refused `vision_disabled`. The check reads the text model the
+agent returns to: the loaded model when it is a text model; with the image
+model loaded, the text model the server switched away from, which it
+remembers. So a second call in the same turn is judged by the agent's own
+model, not by the image model. A server started on the image model knows no
+text model, and the tool makes the image.
+
+**Several images in a turn.** The connector's image calls run one at a time.
+Asked for three variants, an agent that sends three calls at once has the
+second and the third wait for the one before to end: the first switches to
+the image model, the others find it loaded. The three cost one switch out
+and one back, and none is answered `503 model_switching`. A waiting call is
+not a retry and has no deadline of its own: it waits as long as the call
+before it runs, and the harness's own timeout gives it up. Behind the
+connector, the image route's own queue serves every client, one job at a
+time with up to [`image.queue_depth`](../reference/configuration.md#imagequeue_depth)
+waiting; a full queue comes back as the tool's error, `503 engine_full`
+with its `Retry-After`.
+
+**Progress.** A call that carries a progress token hears its phases as MCP
+progress notifications, the answer then an event stream: `waiting` while a
+call before it runs, then `switching` and `loading` when it switches, then
+the job's steps, `encoding`, each `denoising` step and `decoding`. pi and
+opencode 1.x reset their 60 s call timeout on progress, and qwen-code its
+300 s idle timer; opencode 2.x gives a call 12 h; DeepSeek Harness sends no
+token and cuts a call at 60 s whatever.
 
 **The vision budget.** The harness keeps each preview in its history and sends
 it back every turn. One merged vision token covers 32 x 32 pixels, so a
