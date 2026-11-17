@@ -1211,6 +1211,19 @@ target_link_libraries(ignis_kernel_tma_descriptor_cache_test PRIVATE ignis_kerne
 add_test(NAME ignis_kernel_tma_descriptor_cache_test COMMAND ignis_kernel_tma_descriptor_cache_test)
 set_tests_properties(ignis_kernel_tma_descriptor_cache_test PROPERTIES TIMEOUT 120)
 
+# GitHub #651 (spec #646): OURS -- the 27B prefill's gate and up product with SwiGLU in its
+# epilogue (kernel/src/prefill_swiglu.h), an adapted op: at the 27B's [34816, 5120] shape and at
+# 1,024, 1,280, 2,048 and 4,096 tokens its BF16 output is the split route's (the product, then
+# SwiGLU) byte for byte, on a plain stream and on one a descriptor cache serves; the vendored fused
+# kernel at 1,024 differing is the positive control; the widths it takes and its switch's parse.
+# GPU (ADR 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_prefill_swiglu_test test_prefill_swiglu.cu)
+target_include_directories(ignis_kernel_prefill_swiglu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src
+  ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_prefill_swiglu_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_prefill_swiglu_test COMMAND ignis_kernel_prefill_swiglu_test)
+set_tests_properties(ignis_kernel_prefill_swiglu_test PROPERTIES TIMEOUT 300)
+
 # GitHub #456: the tests whose kernels only the sm_120a set holds (kernel/CMakeLists.txt). On a
 # card below compute capability 12.0 they fail at their first launch, "no kernel image", which is
 # the loud failure the set is built for; there run `ctest -LE sm120a-only`. W8 aborts at its
@@ -1234,5 +1247,6 @@ set(ignis_sm120a_only_tests
   ignis_kernel_image_attn_test
   ignis_kernel_image_encoder_test
   ignis_kernel_image_transformer_test
-  ignis_kernel_tma_descriptor_cache_test)
+  ignis_kernel_tma_descriptor_cache_test
+  ignis_kernel_prefill_swiglu_test)
 set_tests_properties(${ignis_sm120a_only_tests} PROPERTIES LABELS sm120a-only)

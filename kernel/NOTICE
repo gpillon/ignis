@@ -213,6 +213,28 @@ both leaf-internal (ADR 0093).
   (`kernel/tests/test_hq_verify_exact.cu`), and as the route of every other card and call
   (`kernel/vendor/VENDOR.md`).
 
+### `kernel/src/prefill_swiglu.cuh` and `kernel/src/prefill_swiglu.cu` (spec #646, GitHub #651)
+The 27B prefill's MLP gate and up product with SwiGLU in its epilogue
+(`ignis::prefill_swiglu::swiglu_tma_kernel`), and its launcher
+(`ignis::prefill_swiglu::gate_up_swiglu`), both leaf-internal.
+- Upstream: the reference, `gpillon/ninfer`, commit `a00648cb828457986cf5b4b4f712b4cbcd7af0d1`
+  (the commit `kernel/vendor/manifest.json` pins), Apache-2.0 (`kernel/vendor/LICENSE`):
+  - `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh`:
+    `nvfp4_linear_swiglu_w4a4_tma_kernel` (the TMA and mbarrier pipeline, each CTA's 64 gate
+    rows and their 64 up rows, the block-scaled FP4 MMA loop and the epilogue's staging), in
+    `prefill_swiglu.cuh`;
+  - `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu`: `make_descriptors` and
+    `launch_nvfp4_linear_swiglu_w4a4_tma`, and `nvfp4_linear_swiglu_plan.cpp`: the TMA arm of
+    `nvfp4_linear_swiglu_dispatch` (the workspace scope, the quantizer, alpha), restated in
+    `prefill_swiglu.cu`.
+- Changed here: the epilogue rounds gate and up to BF16 before the product, as the split route
+  (the product, then SiLU-mul) does, so the output is the split route's byte for byte where
+  upstream's, one rounding fewer, differs; two pipeline stages; on Windows the descriptor block
+  from the load's device slots (`kernel/src/tma_descriptor_cache.h`). The file headers list the
+  parts. The vendored kernel stays in the subtree, not edited, as the route under
+  `IGNIS_PREFILL_SWIGLU=split` at exactly 1,024 tokens (`kernel/vendor/VENDOR.md`); the op is
+  held to the split route byte for byte (`kernel/tests/test_prefill_swiglu.cu`).
+
 ## Per-file provenance (pre-#42 adaptations, superseded by ADR 0010)
 
 ### `kernel/src/nvfp4_gemm_decode.cuh` (ticket 03)

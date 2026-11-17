@@ -712,12 +712,16 @@ impl StepLeaf for CudaLeaf {
         // The review of spec #503: the prefill routes this load runs, the
         // gated delta net's among them, which no option names (the leaf decides
         // it from the card, or the measurement switch IGNIS_GDN_PREFILL does).
+        // GitHub #651: and the MLP gate and up product's, `fused` unless the
+        // measurement switch IGNIS_PREFILL_SWIGLU names `split`, `none` on the
+        // trellis body.
         // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80).
         tracing::info!(
             name: "ignis.runtime.prefill_routes",
             prefill_linear = self.config.prefill_linear.as_str(),
             prefill_attention = self.config.prefill_attention.as_str(),
             gdn_prefill = model.gdn_prefill().as_str(),
+            prefill_swiglu = model.prefill_swiglu().map_or("none", |route| route.as_str()),
             "prefill routes"
         );
         // GitHub #572 (spec #570): the attention route of the decode and

@@ -1163,6 +1163,9 @@ struct LoadOptions {
   // (`tma_descriptor_cache_route`): on Windows, on a card the route runs on, unless the
   // measurement switch IGNIS_TMA_DESCRIPTOR_CACHE=0 names upstream's per-launch upload.
   bool tma_descriptor_cache = false;
+  // GitHub #651 (spec #646): the route of the prefill's MLP gate and up product, what the
+  // measurement switch IGNIS_PREFILL_SWIGLU names (`prefill_swiglu_switch`).
+  ignis::prefill_swiglu::Route prefill_swiglu = ignis::prefill_swiglu::Route::Fused;
   // GitHub #576 (ADR 0090): the verify round's draft rule (enum
   // ignis_draft_rule) and, under the sampled draft, the drafter's
   // temperature factor and top-p.
@@ -1248,6 +1251,21 @@ bool tma_descriptor_cache_route(bool &cache) {
     return false;
   }
   cache = major == 12;
+  return true;
+}
+
+// GitHub #651 (spec #646): the route of the prefill's MLP gate and up product, read once per load
+// from the measurement switch IGNIS_PREFILL_SWIGLU (kernel/src/prefill_swiglu.h): unset or `fused`,
+// the fused op at every width the W4A4 TMA route takes; `split`, the vendored dispatch. Any other
+// value refuses the load by name. No card is asked: the op runs where the route it stands in for
+// runs, the NVFP4 body's W4A4 products, which only a card of compute capability 12 loads.
+bool prefill_swiglu_switch(ignis::prefill_swiglu::Route &route) {
+  try {
+    route = ignis::prefill_swiglu::route_for_load();
+  } catch (const std::invalid_argument &e) {
+    set_error(std::string("ignis_model_load: ") + e.what());
+    return false;
+  }
   return true;
 }
 
@@ -1601,7 +1619,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.drafter_top_p = drafter_top_p;
   if (!gdn_prefill_route(out.gdn_prefill_ours) || !hq_decode_attention_switch(out.hq_decode_attention) ||
       !mtp_head_linear_route(out.mtp_head_linear_ours) ||
-      !tma_descriptor_cache_route(out.tma_descriptor_cache)) {
+      !tma_descriptor_cache_route(out.tma_descriptor_cache) || !prefill_swiglu_switch(out.prefill_swiglu)) {
     return nullptr;
   }
 
@@ -2062,8 +2080,9 @@ std::size_t trellis_dense_bytes(const ignis_model &model) {
 
 // GitHub #650: the W4A4 TMA products' descriptor slots (kernel/src/tma_descriptor_cache.h) -- a
 // slot for each product a prefill traversal runs on the route, its NVFP4 parents (the query, key,
-// gate and value or the GDN input projection, the output projection, the MLP's gate and up and
-// its down; an exception tensor held in FP8 or BF16 runs elsewhere), at every width the route
+// gate and value or the GDN input projection, the output projection, the MLP's gate and up, one
+// block a width on either SwiGLU route (GitHub #651), and its down; an exception tensor held in
+// FP8 or BF16 runs elsewhere), at every width the route
 // takes up to the chunk. 0 on a load that keeps none (`tma_descriptor_cache_route`) and on the
 // trellis body, which runs no W4A4 product.
 std::size_t tma_descriptor_bytes(const ignis_model &model, uint32_t prefill_chunk_tokens,
@@ -2519,6 +2538,9 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // GitHub #514: the GDN prefill's route, read by every GDN prefill call
   // (kernel/src/gdn_layer.cu).
   model->gdn_prefill_ours = load.gdn_prefill_ours;
+  // GitHub #651 (spec #646): the MLP gate and up product's route, read by every MLP call of the
+  // NVFP4 body (kernel/src/gdn_layer.cu and gqa_layer.cu `output_and_mlp`).
+  model->prefill_swiglu = load.prefill_swiglu;
   // GitHub #627 (spec #618): the MTP head's matrices, read by every head call
   // (kernel/src/mtp_head.cu) and so baked into every graph captured after this load.
   model->mtp_head_linear_ours = speculative_backend == IGNIS_SPECULATIVE_MTP && load.mtp_head_linear_ours;
@@ -2870,6 +2892,14 @@ extern "C" uint32_t ignis_model_mtp_head_linear(const struct ignis_model *model)
     return IGNIS_MTP_HEAD_LINEAR_NONE;
   }
   return model->mtp_head_linear_ours ? IGNIS_MTP_HEAD_LINEAR_OURS : IGNIS_MTP_HEAD_LINEAR_VENDORED;
+}
+
+extern "C" uint32_t ignis_model_prefill_swiglu(const struct ignis_model *model) {
+  if (model == nullptr || model->flash_next || model->is_trellis_body) {
+    return IGNIS_PREFILL_SWIGLU_NONE;
+  }
+  return model->prefill_swiglu == ignis::prefill_swiglu::Route::Fused ? IGNIS_PREFILL_SWIGLU_FUSED
+                                                                       : IGNIS_PREFILL_SWIGLU_SPLIT;
 }
 
 extern "C" void ignis_model_free(struct ignis_model *model) {

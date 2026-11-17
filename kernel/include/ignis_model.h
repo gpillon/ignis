@@ -329,6 +329,22 @@ enum ignis_mtp_head_linear {
   IGNIS_MTP_HEAD_LINEAR_OURS = 2,
 };
 
+/* GitHub #651 (spec #646): the route of the 27B prefill's MLP gate and up
+ * product on its NVFP4 body, which no load option names: decided once per load
+ * by the measurement switch IGNIS_PREFILL_SWIGLU (`split` or `fused`; unset is
+ * `fused`) (kernel/src/prefill_swiglu.h). `ignis_model_prefill_swiglu` reports
+ * it. */
+enum ignis_prefill_swiglu {
+  /* A load whose prefill runs no such product: the trellis body, Flash-Next. */
+  IGNIS_PREFILL_SWIGLU_NONE = 0,
+  /* The vendored dispatch: the product, then SiLU-mul, and at exactly 1,024
+   * tokens the vendored fused kernel; what IGNIS_PREFILL_SWIGLU=split names. */
+  IGNIS_PREFILL_SWIGLU_SPLIT = 1,
+  /* ignis's fused op, the split route's bytes, at every width the W4A4 TMA
+   * route takes from 1,024 tokens; the default. */
+  IGNIS_PREFILL_SWIGLU_FUSED = 2,
+};
+
 /* GitHub #414 (ADR 0075): where a vision load keeps the 27B's vision tower
  * and (GitHub #415) its media embedding pool. The binder places the tower and
  * the load checks it is where this says. */
@@ -715,6 +731,11 @@ uint32_t ignis_model_hq_decode_attention(const struct ignis_model *model);
  * graph captured on it holds. IGNIS_MTP_HEAD_LINEAR_NONE for NULL and for a
  * load without the head. */
 uint32_t ignis_model_mtp_head_linear(const struct ignis_model *model);
+
+/* The route a loaded 27B's prefill runs its MLP gate and up product on (enum
+ * ignis_prefill_swiglu; GitHub #651): what the load decided.
+ * IGNIS_PREFILL_SWIGLU_NONE for NULL, the trellis body and Flash-Next. */
+uint32_t ignis_model_prefill_swiglu(const struct ignis_model *model);
 
 /* GitHub #557: the most merged vision tokens one media item may hold on a
  * loaded model -- what its encoder's share of the scratch was sized for, and
