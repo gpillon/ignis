@@ -124,15 +124,15 @@ impl ArtifactTemplateProvider {
     /// opener (GitHub #186, ADR 0029), or `None` when that cannot be said
     /// exactly.
     ///
-    /// The head is tokenized **separately** and required to be a real token
-    /// prefix of the whole prompt. That is not paranoia about the tokenizer:
+    /// The head must tokenize to a real token prefix of the whole prompt
+    /// ([`Self::head_tokens`]). That is not paranoia about the tokenizer:
     /// a BPE merge that spans the boundary would make the head's ids differ
     /// from the prompt's own leading ids, and a checkpoint taken at a
     /// position the two disagree about would hand a later request state for
     /// history it does not have. When they disagree the answer is `None` —
     /// no checkpoint, rather than a wrong one.
-    fn opener_tokens(&self, prompt: &str, tokens: &[TokenId]) -> Option<u32> {
-        self.exact_token_prefix(prompt, ChatTemplate::generation_opener_offset(prompt)?, tokens)
+    fn opener_tokens(&self, prompt: &str, tokens: &[TokenId], offsets: &[(usize, usize)]) -> Option<u32> {
+        self.exact_token_prefix(prompt, ChatTemplate::generation_opener_offset(prompt)?, tokens, offsets)
     }
 
     /// How many leading tokens of `tokens` end `prompt`'s first system block
@@ -144,40 +144,57 @@ impl ArtifactTemplateProvider {
     /// conversation its own near-miss; a *retained prefix* is claimed by
     /// requests that have nothing else in common, so the same slip would hand
     /// a subagent KV pages warmed from a block that is not the one it sent.
-    fn system_block_tokens(&self, messages: &[ChatMessage], prompt: &str, tokens: &[TokenId]) -> Option<u32> {
-        self.exact_token_prefix(prompt, retained_prefix_offset(messages, prompt)?, tokens)
+    fn system_block_tokens(&self, messages: &[ChatMessage], prompt: &str, tokens: &[TokenId], offsets: &[(usize, usize)]) -> Option<u32> {
+        self.exact_token_prefix(prompt, retained_prefix_offset(messages, prompt)?, tokens, offsets)
     }
 
     /// How many leading tokens of `tokens` end at `prompt`'s byte offset `at`,
-    /// or `None` when the head does not tokenize to an exact token prefix of
-    /// the whole prompt.
+    /// or `None` when the head does not tokenize to an exact, non-empty token
+    /// prefix of the whole prompt.
     ///
-    /// The head is tokenized **separately** and required to be a real token
-    /// prefix. That is not paranoia about the tokenizer: a BPE merge that
+    /// The head must tokenize to a real token prefix ([`Self::head_tokens`]).
+    /// That is not paranoia about the tokenizer: a BPE merge that
     /// spans the boundary would make the head's ids differ from the prompt's
     /// own leading ids, and state reused at a position the two disagree about
     /// would be handed to a request whose history is not the one it was built
     /// from. When they disagree the answer is `None` — no reuse, rather than
     /// wrong reuse.
-    fn exact_token_prefix(&self, prompt: &str, at: usize, tokens: &[TokenId]) -> Option<u32> {
-        let head = self.set.tokenizer().encode(&prompt[..at]).ok()?;
-        (!head.is_empty() && tokens.starts_with(&head)).then(|| head.len() as u32)
+    fn exact_token_prefix(&self, prompt: &str, at: usize, tokens: &[TokenId], offsets: &[(usize, usize)]) -> Option<u32> {
+        self.head_tokens(prompt, at, tokens, offsets).filter(|&n| n > 0)
+    }
+
+    /// How many leading tokens of `tokens`, the prompt's one encoding with
+    /// `offsets` its byte ranges, `prompt[..at]` encodes to on its own, or
+    /// `None` when that encoding is not a token prefix of `tokens`.
+    ///
+    /// Read off the one encoding wherever an added token starts at `at`
+    /// (`Tokenizer::prefix_at_added_token`, GitHub #647), which in the chat
+    /// templates the server ships is so at the generation opener, the last
+    /// user query and the end of the system block: there the head's own
+    /// encoding is the prompt's leading ids by construction, so the prompt is
+    /// tokenized once. Anywhere else the head is encoded on its own and
+    /// compared.
+    fn head_tokens(&self, prompt: &str, at: usize, tokens: &[TokenId], offsets: &[(usize, usize)]) -> Option<u32> {
+        let tokenizer = self.set.tokenizer();
+        if let Some(n) = tokenizer.prefix_at_added_token(prompt, at, tokens, offsets) {
+            return Some(n as u32);
+        }
+        let head = tokenizer.encode(&prompt[..at]).ok()?;
+        tokens.starts_with(&head).then(|| head.len() as u32)
     }
 
     /// How many leading tokens of `tokens` end where `prompt`'s **last real
     /// user query** begins (GitHub #187, ADR 0029), or `None` when that cannot
     /// be said exactly.
     ///
-    /// Tokenized separately and required to be a real token prefix, for the
+    /// Required to be a real token prefix ([`Self::head_tokens`]), for the
     /// reason [`Self::opener_tokens`] is: this number is compared against a
     /// retained *checkpoint's* token count, and two offsets the tokenizer
     /// disagrees about would be compared as if they were on one scale. Unlike
     /// the opener, an empty head is a legitimate answer — a conversation whose
     /// very first message is the user's puts its query at token 0.
-    fn user_turn_tokens(&self, prompt: &str, tokens: &[TokenId]) -> Option<u32> {
-        let at = ChatTemplate::last_user_query_offset(prompt)?;
-        let head = self.set.tokenizer().encode(&prompt[..at]).ok()?;
-        tokens.starts_with(&head).then(|| head.len() as u32)
+    fn user_turn_tokens(&self, prompt: &str, tokens: &[TokenId], offsets: &[(usize, usize)]) -> Option<u32> {
+        self.head_tokens(prompt, ChatTemplate::last_user_query_offset(prompt)?, tokens, offsets)
     }
 
     /// The byte offset in `rendered` where each content part of `messages`'
@@ -240,26 +257,28 @@ impl ArtifactTemplateProvider {
             Ok(prompt) => prompt,
             Err(err) => return Err(TemplateRejection { code: "render_failed", message: err }),
         };
-        // GitHub #275: with the text asked for, the tokens and their byte
-        // offsets come from one tokenization, so they cannot disagree.
-        let (tokens, offsets) = match text {
-            true => self.set.tokenizer().encode_with_offsets(&prompt).map(|(ids, offsets)| (ids, Some(offsets))),
-            false => self.set.tokenizer().encode(&prompt).map(|ids| (ids, None)),
-        }
-        .map_err(|err| TemplateRejection { code: "render_failed", message: err.to_string() })?;
+        // GitHub #275: the tokens and their byte offsets come from one
+        // tokenization, so they cannot disagree; GitHub #647: the heads are
+        // read off it where they can be (`Self::head_tokens`), so the prompt
+        // is tokenized once.
+        let (tokens, offsets) = self
+            .set
+            .tokenizer()
+            .encode_with_offsets(&prompt)
+            .map_err(|err| TemplateRejection { code: "render_failed", message: err.to_string() })?;
         let opener_tokens = match description {
             Some(description) => {
-                description_offset(&prompt, description).and_then(|at| self.exact_token_prefix(&prompt, at, &tokens))
+                description_offset(&prompt, description).and_then(|at| self.exact_token_prefix(&prompt, at, &tokens, &offsets))
             }
-            None => self.opener_tokens(&prompt, &tokens),
+            None => self.opener_tokens(&prompt, &tokens, &offsets),
         };
-        let user_turn_tokens = self.user_turn_tokens(&prompt, &tokens);
-        let system_block_tokens = self.system_block_tokens(messages, &prompt, &tokens);
+        let user_turn_tokens = self.user_turn_tokens(&prompt, &tokens, &offsets);
+        let system_block_tokens = self.system_block_tokens(messages, &prompt, &tokens, &offsets);
         let part_ends = match part_ends {
             true => self
                 .part_end_offsets(messages, options, tools, &prompt)
                 .into_iter()
-                .map(|at| at.and_then(|at| self.exact_token_prefix(&prompt, at, &tokens)))
+                .map(|at| at.and_then(|at| self.exact_token_prefix(&prompt, at, &tokens, &offsets)))
                 .collect(),
             false => Vec::new(),
         };
@@ -269,7 +288,7 @@ impl ArtifactTemplateProvider {
             user_turn_tokens,
             system_block_tokens,
             part_ends,
-            text: offsets.map(|offsets| crate::template::PromptText { text: prompt, offsets }),
+            text: text.then(|| crate::template::PromptText { text: prompt, offsets }),
         })
     }
 
@@ -1297,6 +1316,41 @@ You are a careful assistant.<|im_end|>
         assert!(second.tokens.starts_with(&first.tokens[..shared]), "the conversation is the next turn's history");
         assert!(!second.tokens.starts_with(&first.tokens), "the description is not");
         assert_eq!(second.opener_tokens, Some(second.tokens.len() as u32 - (first.tokens.len() - shared) as u32));
+    }
+
+    /// GitHub #647: a head cut where no added token starts cannot be read off
+    /// the prompt's one encoding, and is encoded on its own. Here
+    /// `<|im_start|>` and `<|im_end|>` are added tokens but `<think>` is not, so
+    /// the generation opener's head, cut where `<think>` starts, falls back,
+    /// while the user turn's and the system block's, cut where `<|im_start|>`
+    /// starts, are read off.
+    #[test]
+    fn a_head_not_cut_at_an_added_token_is_encoded_on_its_own_and_counts_the_same() {
+        let mut tokenizer: JsonValue = serde_json::from_str(&char_tokenizer()).expect("a tokenizer");
+        let added = |id: u32, content: &str| {
+            json!({ "id": id, "content": content, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true })
+        };
+        tokenizer["added_tokens"] = json!([added(97, "<|im_start|>"), added(98, "<|im_end|>")]);
+        let (_fixture, _reader, provider) =
+            provider_over(&tokenizer.to_string(), QWEN_SHAPED_TEMPLATE, "server-one-tokenization");
+        let options = ThinkingOptions { enable_thinking: true, ..opts() };
+        let rendered = provider.apply_chat_template(&first_turn(), &options, no_tools()).expect("render");
+        let prompt = provider.render(&first_turn(), &options, no_tools()).expect("render");
+        let (ids, offsets) = provider.set.tokenizer().encode_with_offsets(&prompt).expect("encode");
+        assert_eq!(rendered.tokens, ids);
+        let read_off = |at: usize| provider.set.tokenizer().prefix_at_added_token(&prompt, at, &ids, &offsets);
+        let own_encoding = |at: usize| provider.encode_literal(&prompt[..at]).expect("encode head").len() as u32;
+        let opener = ChatTemplate::generation_opener_offset(&prompt).expect("an opener");
+        assert_eq!(&prompt[opener..], "<think>\n");
+        assert_eq!(read_off(opener), None, "no added token starts at the opener's cut");
+        // The conversation and `<|im_start|>assistant\n`, a token per character
+        // but one per marker: 24 for the system block, 23 for the user turn, 11.
+        assert_eq!(rendered.opener_tokens, Some(58));
+        assert_eq!(rendered.opener_tokens, Some(own_encoding(opener)));
+        let user = ChatTemplate::last_user_query_offset(&prompt).expect("a user query");
+        assert_eq!(read_off(user), Some(24), "an added token starts at the user turn's cut");
+        assert_eq!(rendered.user_turn_tokens, Some(24));
+        assert_eq!(rendered.system_block_tokens, Some(24));
     }
 
     #[test]
