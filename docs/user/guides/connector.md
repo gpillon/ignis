@@ -183,6 +183,30 @@ on disk, which one is loaded, its kind and size, and a running download's
 progress. It calls [`GET /v1/models/catalog`](models.md#the-catalog), takes no
 argument, and is read-only.
 
+### The configuration: `read_config` and `describe_config`
+
+`read_config` is the configuration the server runs with, as the YAML a config
+file holds, live changes included. It calls
+[`GET /v1/config?format=yaml`](../configuration/index.md), takes no argument,
+and is read-only. It is long, so an agent reads it once and asks for the rest
+by field.
+
+`describe_config` says what fields mean: each one's key, kind, default, the
+rule a value must meet, whether it changes while the server runs and whether a
+change reloads the model. It takes `group` (one group's name), `names` (a list
+of keys such as `vram.budget_bytes`, as `read_config` nests them), or both, and
+needs at least one: a call with neither is a tool error, so an agent never reads
+all the fields at once. Its description lists the groups, read from the
+configuration's own table when the server starts. It is read-only.
+
+It calls `GET /v1/config/fields`, which takes the same two filters from any
+client: `?group=vram`, and `?names=vram.budget_bytes,server.bind` as one comma
+list, never a repeated parameter. The fields come back whole and in
+declaration order, whatever the order of the list. With both, a field must be
+in the group and named. A group that does not exist, or a name that is no
+visible field (a hidden field's key counts as unknown), is `400 config_invalid`
+naming it, and nothing else is answered.
+
 ### Images: `generate_image`
 
 Makes one image from `prompt`, at an optional `size` (one of `image.sizes`,

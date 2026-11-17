@@ -200,6 +200,14 @@ pub const STATUS_HEADER: &str = "ignis-model-status";
         (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = ApiError),
         (status = 501, description = "This server was built without a running configuration (`config_unavailable`).", body = ApiError),
     ),
+    // Spec #656: the connector's `read_config`, the YAML a config file is.
+    extensions(("x-ignis-tool" = json!({
+        "name": "read_config",
+        "description": "The configuration this ignis server runs with, as the YAML a config file holds, live changes included. It is long: for what a field means, or to read only some fields, call describe_config.",
+        "read_only": true,
+        "destructive": false,
+        "query": { "format": "yaml" },
+    }))),
 )]
 pub(crate) async fn get_config(State(server): State<Arc<Server>>, Query(query): Query<ConfigQuery>) -> Response {
     let Some(state) = &server.config else {
@@ -320,6 +328,28 @@ pub fn visible_declarations() -> Vec<Value> {
     all_fields().filter(|meta| meta.visible).map(|meta| Value::Object(meta.declaration())).collect()
 }
 
+/// The groups that have a visible field, in declaration order: what
+/// `group` of `GET /v1/config/fields` takes.
+pub fn visible_groups() -> Vec<&'static str> {
+    schema::GROUPS.iter().filter(|(_, fields)| fields.iter().any(|meta| meta.visible)).map(|(name, _)| *name).collect()
+}
+
+/// The sentence the connector's `describe_config` ends its description on:
+/// the groups, read from the schema's table, so the list cannot drift.
+pub fn groups_sentence() -> String {
+    format!("The groups: {}.", visible_groups().join(", "))
+}
+
+/// The query of `GET /v1/config/fields`.
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct FieldsQuery {
+    /// A group's name: only its fields.
+    group: Option<String>,
+    /// Field keys (`<group>.<field>`), one comma-separated list: only those fields.
+    names: Option<String>,
+}
+
 /// `GET /v1/config/fields` — what each visible field is.
 #[utoipa::path(
     get,
@@ -327,14 +357,50 @@ pub fn visible_declarations() -> Vec<Value> {
     tag = "config",
     operation_id = "get_config_fields",
     summary = "The configuration's fields",
-    description = "One object per field `GET /v1/config` shows, in declaration order: the field's group and name, the key a config file and a `400` from `PATCH /v1/config` spell it by, its kind, its default, the rule a value must meet (structured in `rule`, as a sentence in `rule_text`), the model families that take it (`null` for all), whether it may be unset (`nullable`), given per family (`scoped`), changed while the server runs (`patchable`) and whether a change reloads the model (`reload_required`). The same declarations `ignis-server help --fields --format json` prints, minus the fields `GET /v1/config` hides.\n\nStatic: it answers whatever state the model is in — during a switch, after a failed one — and on a server with no running configuration.",
+    description = "One object per field `GET /v1/config` shows, in declaration order: the field's group and name, the key a config file and a `400` from `PATCH /v1/config` spell it by, its kind, its default, the rule a value must meet (structured in `rule`, as a sentence in `rule_text`), the model families that take it (`null` for all), whether it may be unset (`nullable`), given per family (`scoped`), changed while the server runs (`patchable`) and whether a change reloads the model (`reload_required`). The same declarations `ignis-server help --fields --format json` prints, minus the fields `GET /v1/config` hides.\n\nWithout a query it lists every visible field. `group` (`?group=vram`) keeps one group's fields. `names` keeps the fields whose `file_key` it lists, as one comma-separated list (`?names=vram.budget,server.port`, never a repeated parameter); a name is the `<group>.<field>` key, as `GET /v1/config` nests it, and a hidden field's key is as unknown as a misspelt one. With both, a field must be in the group and named. The order is the declaration order whatever the order of `names`. A group no field is visible in, or a name that is no visible field, is `400 config_invalid` naming it and what it could have been, and the whole request answers nothing.\n\nStatic: it answers whatever state the model is in — during a switch, after a failed one — and on a server with no running configuration.",
+    params(FieldsQuery),
     responses(
         (status = 200, description = "The visible fields, in declaration order.", body = FieldList),
+        (status = 400, description = "`group` is not a group, or a name of `names` is not a visible field (`config_invalid`).", body = ApiError),
         (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = ApiError),
     ),
+    // Spec #656: the connector's `describe_config`, which asks for fields
+    // by `group` or by `names`, never all of them.
+    extensions(("x-ignis-tool" = json!({
+        "name": "describe_config",
+        "description": format!("What configuration fields mean: each one's key, kind, default, the rule a value must meet, whether it changes while the server runs and whether a change reloads the model. Give `group`, or `names` (keys like vram.budget), or both; never all fields at once. {}", groups_sentence()),
+        "read_only": true,
+        "destructive": false,
+        "input": {
+            "type": "object",
+            "properties": {
+                "group": { "type": "string", "description": "One group's name." },
+                "names": { "type": "array", "items": { "type": "string" }, "description": "Field keys, group.field, as read_config shows them." },
+            },
+        },
+        "require_any": ["group", "names"],
+    }))),
 )]
-pub(crate) async fn get_config_fields() -> Json<Value> {
-    Json(serde_json::json!({ "object": "list", "data": visible_declarations() }))
+pub(crate) async fn get_config_fields(Query(query): Query<FieldsQuery>) -> Response {
+    let mut fields = visible_declarations();
+    if let Some(group) = &query.group {
+        let groups = visible_groups();
+        if !groups.contains(&group.as_str()) {
+            return refused("config_invalid", format!("`group={group}`: no such group; the groups are {}", groups.join(", ")));
+        }
+        fields.retain(|field| field["group"] == group.as_str());
+    }
+    if let Some(names) = &query.names {
+        let wanted: Vec<&str> = names.split(',').map(str::trim).filter(|name| !name.is_empty()).collect();
+        let known = visible_declarations();
+        for name in &wanted {
+            if !known.iter().any(|field| field["file_key"] == *name) {
+                return refused("config_invalid", format!("`names` has `{name}`, which is no field: a name is `<group>.<field>`, as `GET /v1/config` nests it"));
+            }
+        }
+        fields.retain(|field| wanted.iter().any(|name| field["file_key"] == *name));
+    }
+    Json(serde_json::json!({ "object": "list", "data": fields })).into_response()
 }
 
 /// The source of a value, as `GET /v1/config/origins` names it: the

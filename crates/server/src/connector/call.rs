@@ -53,6 +53,11 @@ pub(crate) fn request(
     let mut body = None;
     if tool.takes_arguments {
         let arguments = arguments.unwrap_or_default();
+        let given = |name: &String| arguments.get(name).is_some_and(|value| !value.is_null());
+        if !tool.require_any.is_empty() && !tool.require_any.iter().any(given) {
+            let names: Vec<String> = tool.require_any.iter().map(|name| format!("`{name}`")).collect();
+            return Err(format!("{}: give {}", tool.tool.name, names.join(" or ")));
+        }
         if in_query {
             for (name, value) in arguments {
                 if let Some(value) = query_value(&name, value)? {
@@ -132,6 +137,7 @@ mod tests {
             query: query.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect::<BTreeMap<_, _>>(),
             takes_arguments,
             changes: false,
+            require_any: Vec::new(),
         }
     }
 

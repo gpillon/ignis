@@ -1483,3 +1483,63 @@ async fn a_patch_naming_an_enhancer_no_switch_reaches_is_refused() {
     assert_eq!(status, StatusCode::OK, "a model the patch itself lists: {applied}");
     assert_eq!(enhancer(), "mock-b");
 }
+
+// ── GET /v1/config/fields?group=&names= (spec #656) ──────────────────────
+
+fn file_keys(list: &Value) -> Vec<String> {
+    list["data"].as_array().unwrap().iter().map(|field| field["file_key"].as_str().unwrap().to_owned()).collect()
+}
+
+/// `group` keeps one group's fields, `names` the fields whose key it lists
+/// (a comma list, in declaration order whatever the list's), both their
+/// intersection; each is the whole list's own declarations.
+#[tokio::test]
+async fn the_fields_route_filters_by_group_and_by_names() {
+    let loader = MockLoader::new();
+    let app = server_on(&loader, started(&[])).app();
+    let (_, all) = send(&app, Method::GET, "/v1/config/fields", None).await;
+    let every = file_keys(&all);
+
+    let (status, vram) = send(&app, Method::GET, "/v1/config/fields?group=vram", None).await;
+    assert_eq!(status, StatusCode::OK, "{vram}");
+    let expected: Vec<String> = every.iter().filter(|key| key.starts_with("vram.")).cloned().collect();
+    assert!(!expected.is_empty());
+    assert_eq!(file_keys(&vram), expected);
+    assert_eq!(vram["object"], "list");
+
+    // Two names, asked out of order, answer in declaration order, whole.
+    let (status, two) = send(&app, Method::GET, "/v1/config/fields?names=vram.budget_bytes,server.bind", None).await;
+    assert_eq!(status, StatusCode::OK, "{two}");
+    let wanted: Vec<String> = every.iter().filter(|key| *key == "vram.budget_bytes" || *key == "server.bind").cloned().collect();
+    assert_eq!(wanted.len(), 2, "both are visible fields");
+    assert_eq!(file_keys(&two), wanted);
+    for field in two["data"].as_array().unwrap() {
+        assert_eq!(field, all["data"].as_array().unwrap().iter().find(|whole| whole["file_key"] == field["file_key"]).unwrap());
+    }
+
+    // Both: the named fields that are in the group.
+    let (_, both) = send(&app, Method::GET, "/v1/config/fields?group=vram&names=vram.budget_bytes,server.bind", None).await;
+    assert_eq!(file_keys(&both), ["vram.budget_bytes"]);
+}
+
+/// An unknown group, an unknown name and a hidden field's key are each the
+/// ordinary error JSON naming what was asked, and nothing else answers.
+#[tokio::test]
+async fn the_fields_route_refuses_an_unknown_group_or_name_and_a_hidden_field() {
+    let loader = MockLoader::new();
+    let app = server_on(&loader, started(&[])).app();
+    let hidden = ignis_server::config::schema::all_fields().find(|meta| !meta.visible).expect("a hidden field").file_key();
+    for (query, named) in [
+        ("group=nope".to_owned(), "group=nope".to_owned()),
+        ("names=vram.budget_bytes,vram.nope".to_owned(), "vram.nope".to_owned()),
+        ("names=budget_bytes".to_owned(), "budget".to_owned()),
+        (format!("names={hidden}"), hidden.clone()),
+    ] {
+        let (status, refused) = send(&app, Method::GET, &format!("/v1/config/fields?{query}"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {refused}");
+        assert_eq!(refused["error"]["code"], "config_invalid", "{refused}");
+        assert_eq!(refused["error"]["type"], "invalid_request_error", "{refused}");
+        assert!(refused["error"]["message"].as_str().unwrap().contains(&named), "{refused}");
+        assert!(refused.get("data").is_none());
+    }
+}

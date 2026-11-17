@@ -206,7 +206,8 @@ section it empties taken out. `GET /v1/config/fields` says what each of those fi
 is: its key, kind, default, rule, the model families that take it, and whether
 a change is live, needs a reload, or can only be made at start — the same
 declarations as `ignis-server help --fields --format json`, minus the fields
-`GET /v1/config` hides. `GET /v1/config/origins` says where each value in force
+`GET /v1/config` hides; `?group=` and `?names=` (a comma list of
+`<group>.<field>` keys) ask for some of them, from 0.11.0. `GET /v1/config/origins` says where each value in force
 comes from, for the shared value and for each model family: the default, the
 profile, the card, the file, an env var, a flag or a live change, whether it
 was set for that family itself, and the flag, env var, file key or profile

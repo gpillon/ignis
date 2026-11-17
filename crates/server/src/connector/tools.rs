@@ -20,7 +20,9 @@
 //! narrower than the route's own (absent, the tool takes no arguments);
 //! `"query"`: query parameters the tool always sends (`{"format": "yaml"}`);
 //! `"changes": true`: the tool changes the server, and is listed only with
-//! `connector.allow_changes` on. A call sends its arguments as the route's
+//! `connector.allow_changes` on; `"require_any": ["group", "names"]`: a call
+//! must carry at least one of those arguments, else it is a tool error
+//! before the route is asked. A call sends its arguments as the route's
 //! query on a `GET` or a `DELETE`, as its JSON body on any other method
 //! ([`super::call`]).
 
@@ -57,6 +59,9 @@ struct Declaration {
     /// Listed only with `connector.allow_changes` on.
     #[serde(default)]
     changes: bool,
+    /// Argument names of which a call must carry at least one.
+    #[serde(default)]
+    require_any: Vec<String>,
 }
 
 /// One server tool: what `tools/list` shows of it, and the route it calls.
@@ -74,6 +79,9 @@ pub struct ServerTool {
     pub takes_arguments: bool,
     /// Whether it changes the server (`connector.allow_changes`).
     pub changes: bool,
+    /// Argument names of which a call must carry at least one (none: no
+    /// requirement).
+    pub require_any: Vec<String>,
 }
 
 /// The tools a connector lists, sorted by name.
@@ -152,6 +160,7 @@ impl ServerTool {
             query: declared.query,
             takes_arguments,
             changes: declared.changes,
+            require_any: declared.require_any,
         }
     }
 }
