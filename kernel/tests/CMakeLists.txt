@@ -1211,12 +1211,14 @@ target_link_libraries(ignis_kernel_tma_descriptor_cache_test PRIVATE ignis_kerne
 add_test(NAME ignis_kernel_tma_descriptor_cache_test COMMAND ignis_kernel_tma_descriptor_cache_test)
 set_tests_properties(ignis_kernel_tma_descriptor_cache_test PROPERTIES TIMEOUT 120)
 
-# GitHub #651 (spec #646): OURS -- the 27B prefill's gate and up product with SwiGLU in its
-# epilogue (kernel/src/prefill_swiglu.h), an adapted op: at the 27B's [34816, 5120] shape and at
-# 1,024, 1,280, 2,048 and 4,096 tokens its BF16 output is the split route's (the product, then
-# SwiGLU) byte for byte, on a plain stream and on one a descriptor cache serves; the vendored fused
-# kernel at 1,024 differing is the positive control; the widths it takes, the layers' entry under
-# each route and its switch's parse.
+# GitHub #651, #653 (spec #646): OURS -- the 27B prefill's gate and up product with SwiGLU in its
+# epilogue (kernel/src/prefill_swiglu.h), an adapted op: at the 27B's MLP shapes and at 1,024,
+# 1,280, 2,048 and 4,096 tokens its BF16 output, its NVFP4 epilogue's codes and scales and the
+# residual after the down product are the split route's (the product, SwiGLU, the down product's
+# quantizer, the down product) byte for byte, K-tile-major on a plain stream and on one a
+# descriptor cache serves, and token-major; the vendored fused kernel at 1,024 differing is the
+# positive control; the widths it takes, the layers' entries under each route, the MLP's blocks
+# uploaded once and its switch's parse.
 # GPU (ADR 0006: no SKIP_RETURN_CODE).
 add_executable(ignis_kernel_prefill_swiglu_test test_prefill_swiglu.cu)
 target_include_directories(ignis_kernel_prefill_swiglu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src

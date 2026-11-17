@@ -712,9 +712,9 @@ impl StepLeaf for CudaLeaf {
         // The review of spec #503: the prefill routes this load runs, the
         // gated delta net's among them, which no option names (the leaf decides
         // it from the card, or the measurement switch IGNIS_GDN_PREFILL does).
-        // GitHub #651: and the MLP gate and up product's, `fused` unless the
-        // measurement switch IGNIS_PREFILL_SWIGLU names `split`, `none` on the
-        // trellis body.
+        // GitHub #651, #653: and the MLP gate and up product's, the epilogue
+        // it runs, `quant` unless the measurement switch IGNIS_PREFILL_SWIGLU
+        // names `fused` or `split`, `none` on the trellis body.
         // GitHub #652: and the layout its W4A4 products read their activations
         // in, `ktile` unless IGNIS_W4A4_ACTIVATION_LAYOUT=token, `none` where
         // the prefill runs no such product.

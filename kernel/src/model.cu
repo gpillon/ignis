@@ -1164,9 +1164,9 @@ struct LoadOptions {
   // (`tma_descriptor_cache_route`): on Windows, on a card the route runs on, unless the
   // measurement switch IGNIS_TMA_DESCRIPTOR_CACHE=0 names upstream's per-launch upload.
   bool tma_descriptor_cache = false;
-  // GitHub #651 (spec #646): the route of the prefill's MLP gate and up product, what the
-  // measurement switch IGNIS_PREFILL_SWIGLU names (`prefill_swiglu_switch`).
-  ignis::prefill_swiglu::Route prefill_swiglu = ignis::prefill_swiglu::Route::Fused;
+  // GitHub #651, #653 (spec #646): the route of the prefill's MLP gate and up product and its
+  // epilogue, what the measurement switch IGNIS_PREFILL_SWIGLU names (`prefill_swiglu_switch`).
+  ignis::prefill_swiglu::Route prefill_swiglu = ignis::prefill_swiglu::Route::Quant;
   // GitHub #652 (spec #646): what the measurement switch IGNIS_W4A4_ACTIVATION_LAYOUT names; the
   // load decides from it, the body, the chunk and the card the layout its W4A4 prefill products
   // read (`w4a4_activation_layout_route`).
@@ -1259,11 +1259,13 @@ bool tma_descriptor_cache_route(bool &cache) {
   return true;
 }
 
-// GitHub #651 (spec #646): the route of the prefill's MLP gate and up product, read once per load
-// from the measurement switch IGNIS_PREFILL_SWIGLU (kernel/src/prefill_swiglu.h): unset or `fused`,
-// the fused op at every width the W4A4 TMA route takes; `split`, the vendored dispatch. Any other
-// value refuses the load by name. No card is asked: the op runs where the route it stands in for
-// runs, the NVFP4 body's W4A4 products, which only a card of compute capability 12 loads.
+// GitHub #651, #653 (spec #646): the route of the prefill's MLP gate and up product, read once per
+// load from the measurement switch IGNIS_PREFILL_SWIGLU (kernel/src/prefill_swiglu.h): unset or
+// `quant`, the fused op at every width the W4A4 TMA route takes, its NVFP4 epilogue where the down
+// product runs on that route and its BF16 one elsewhere; `fused`, the BF16 epilogue at every such
+// width; `split`, the vendored dispatch. Any other value refuses the load by name. No card is
+// asked: the op runs where the route it stands in for runs, the NVFP4 body's W4A4 products, which
+// only a card of compute capability 12 loads.
 bool prefill_swiglu_switch(ignis::prefill_swiglu::Route &route) {
   try {
     route = ignis::prefill_swiglu::route_for_load();
@@ -2577,8 +2579,8 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // GitHub #514: the GDN prefill's route, read by every GDN prefill call
   // (kernel/src/gdn_layer.cu).
   model->gdn_prefill_ours = load.gdn_prefill_ours;
-  // GitHub #651 (spec #646): the MLP gate and up product's route, read by every MLP call of the
-  // NVFP4 body (kernel/src/gdn_layer.cu and gqa_layer.cu `output_and_mlp`).
+  // GitHub #651, #653 (spec #646): the MLP gate and up product's route and epilogue, read by every
+  // MLP call of the NVFP4 body (kernel/src/gdn_layer.cu and gqa_layer.cu `output_and_mlp`).
   model->prefill_swiglu = load.prefill_swiglu;
   // GitHub #627 (spec #618): the MTP head's matrices, read by every head call
   // (kernel/src/mtp_head.cu) and so baked into every graph captured after this load.
@@ -2958,8 +2960,15 @@ extern "C" uint32_t ignis_model_prefill_swiglu(const struct ignis_model *model) 
   if (model == nullptr || model->flash_next || model->is_trellis_body) {
     return IGNIS_PREFILL_SWIGLU_NONE;
   }
-  return model->prefill_swiglu == ignis::prefill_swiglu::Route::Fused ? IGNIS_PREFILL_SWIGLU_FUSED
-                                                                       : IGNIS_PREFILL_SWIGLU_SPLIT;
+  switch (model->prefill_swiglu) {
+  case ignis::prefill_swiglu::Route::Quant:
+    return IGNIS_PREFILL_SWIGLU_QUANT;
+  case ignis::prefill_swiglu::Route::Fused:
+    return IGNIS_PREFILL_SWIGLU_FUSED;
+  case ignis::prefill_swiglu::Route::Split:
+    break;
+  }
+  return IGNIS_PREFILL_SWIGLU_SPLIT;
 }
 
 extern "C" uint32_t ignis_model_w4a4_activation_layout(const struct ignis_model *model) {

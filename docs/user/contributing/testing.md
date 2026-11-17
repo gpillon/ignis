@@ -113,28 +113,39 @@ the other. They are no configuration fields: `GET /v1/config` and
   way (`ignis_kernel_tma_descriptor_cache_test`). Linux passes the maps by
   value and has no slots whatever the variable says. Any other value refuses
   the load, naming the variable.
-- `IGNIS_PREFILL_SWIGLU=split|fused` (from 0.11.0) picks, at each load of
-  the 27B's NVFP4 artifact, how its prefill's MLP multiplies by the gate and
-  up matrix and applies SwiGLU: in one kernel at every chunk width from 1,024
-  tokens in whole 256-token tiles (`fused`, or unset), or by the vendored
-  route 0.10.0 runs (`split`): the product written out in full and a SiLU-mul
-  pass reading it back, and at exactly 1,024 tokens the vendored fused kernel.
-  `fused` writes the split route's bytes at every width
+- `IGNIS_PREFILL_SWIGLU=split|fused|quant` (from 0.11.0) picks, at each load
+  of the 27B's NVFP4 artifact, how its prefill's MLP multiplies by the gate
+  and up matrix and applies SwiGLU. `quant`, or unset: in one kernel at every
+  chunk width from 1,024 tokens in whole 256-token tiles, whose epilogue
+  quantizes each token's SwiGLU output straight into the down product's NVFP4
+  input, so the [17,408 x T] BF16 matrix is never written; in a layer whose
+  down product does not run on the NVFP4 W4A4 route (its weight held as an
+  exception tensor in FP8, say) the same kernel writes that matrix instead.
+  `fused`: the same kernel writing the BF16 matrix in every layer, which the
+  down product then quantizes itself. `split`: the vendored route 0.10.0
+  runs, the product written out in full and a SiLU-mul pass reading it back,
+  and at exactly 1,024 tokens the vendored fused kernel. `quant` and `fused`
+  write the split route's bytes at every width: the BF16 output, the down
+  product's codes and scales, and the residual after it
   (`ignis_kernel_prefill_swiglu_test`); the vendored fused kernel rounds once
   fewer, so under `split` a 1,024-token chunk computes the MLP with other bits
   than a 2,048-token one. Any other value refuses the load, naming the
   variable. The load logs the route under `ignis.runtime.prefill_routes`
-  (`prefill_swiglu`: `fused`, `split`, or `none` on the trellis artifacts,
-  whose prefill runs no such product), and the VRAM plan is the same on both.
+  (`prefill_swiglu`: `quant`, `fused`, `split`, or `none` on the trellis
+  artifacts, whose prefill runs no such product), and the VRAM plan is the
+  same on all three.
 - `IGNIS_W4A4_ACTIVATION_LAYOUT=ktile|token` (from 0.11.0) picks, at each
   model load, the layout the 27B's NVFP4 prompt products read their
   activations in on an RTX 50 or RTX PRO card: K tile by K tile (`ktile`, or
   unset), which they read in whole 128-byte lines, or token by token
   (`token`), the layout of earlier releases, the comparison a measurement of
   the two needs. The gate and up product's fused SwiGLU (`IGNIS_PREFILL_SWIGLU`
-  above) quantizes its own input and reads it token by token whatever this
-  variable says. The bytes the products write and the VRAM plan are the same
-  either way (`ignis_kernel_w4a4_activation_layout_test`). The load logs the
+  above) reads its input in the same layout, and under `quant` writes the
+  down product's input in it too: K-tile-major by default, token-major under
+  `token`, so both variables combine and every combination writes the split
+  route's bytes (`ignis_kernel_prefill_swiglu_test`). The bytes the products
+  write and the VRAM plan are the same either way
+  (`ignis_kernel_w4a4_activation_layout_test`). The load logs the
   layout under `ignis.runtime.prefill_routes` (`w4a4_activation_layout`:
   `ktile`, `token`, or `none` where its prefill runs no such product: the
   trellis artifacts, Flash-Next, an RTX 30 or RTX 40 card, a prefill chunk

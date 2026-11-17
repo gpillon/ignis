@@ -150,9 +150,10 @@ impl GdnPrefill {
     }
 }
 
-/// The route of the 27B prefill's MLP gate and up product on its NVFP4 body
-/// (GitHub #651, spec #646), which no load option names: the leaf reads the
-/// measurement switch `IGNIS_PREFILL_SWIGLU` once per load and reports it
+/// The route of the 27B prefill's MLP gate and up product on its NVFP4 body,
+/// and the epilogue it runs (GitHub #651, #653, spec #646), which no load
+/// option names: the leaf reads the measurement switch `IGNIS_PREFILL_SWIGLU`
+/// once per load and reports it
 /// ([`crate::model_load::Model::prefill_swiglu`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefillSwiglu {
@@ -160,21 +161,28 @@ pub enum PrefillSwiglu {
     /// 1,024 tokens the vendored fused kernel; what `IGNIS_PREFILL_SWIGLU=split`
     /// names.
     Split,
-    /// ignis's fused op (`kernel/src/prefill_swiglu.h`), the split route's
-    /// bytes, at every width the W4A4 TMA route takes from 1,024 tokens: the
-    /// default.
+    /// ignis's fused op (`kernel/src/prefill_swiglu.h`) with its BF16
+    /// epilogue, the split route's bytes, at every width the W4A4 TMA route
+    /// takes from 1,024 tokens; what `IGNIS_PREFILL_SWIGLU=fused` names.
     Fused,
+    /// ignis's fused op with its NVFP4 epilogue, which writes the down
+    /// product's quantized input, wherever the down product runs on the W4A4
+    /// TMA route, and its BF16 epilogue at every other width the op takes: the
+    /// default (GitHub #653).
+    Quant,
 }
 
 impl PrefillSwiglu {
     /// `enum ignis_prefill_swiglu`: `Ok(None)` for a load whose prefill runs
     /// no such product (0: the trellis body, Flash-Next), `Ok(Some(..))` for 1
-    /// (split) and 2 (fused), and the code back as the error for any other.
+    /// (split), 2 (fused) and 3 (quant), and the code back as the error for any
+    /// other.
     pub const fn from_abi(code: u32) -> Result<Option<Self>, u32> {
         match code {
             0 => Ok(None),
             1 => Ok(Some(Self::Split)),
             2 => Ok(Some(Self::Fused)),
+            3 => Ok(Some(Self::Quant)),
             unknown => Err(unknown),
         }
     }
@@ -185,6 +193,7 @@ impl PrefillSwiglu {
         match self {
             Self::Split => "split",
             Self::Fused => "fused",
+            Self::Quant => "quant",
         }
     }
 }

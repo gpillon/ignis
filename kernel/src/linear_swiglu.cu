@@ -20,7 +20,8 @@
 //
 // GitHub #651 (spec #646): the 27B's layers call `ignis::prefill_swiglu::linear_swiglu` below, the
 // same checks under the load's route, which sends every AllowA4 call at a W4A4 TMA width to the
-// fused op (kernel/src/prefill_swiglu.h); `ops::linear_swiglu` stays the vendored dispatch.
+// fused op (kernel/src/prefill_swiglu.h), through its MLP entry (`ignis::prefill_swiglu::mlp`,
+// GitHub #653); `ops::linear_swiglu` stays the vendored dispatch.
 
 #include "ninfer/ops/linear_swiglu.h"
 
@@ -133,14 +134,15 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
 
 namespace ignis::prefill_swiglu {
 
-// GitHub #651 (spec #646): the 27B's prefill calls under the load's route. Under Fused, every
-// AllowA4 call at a width the W4A4 TMA route takes runs the op (kernel/src/prefill_swiglu.h),
+// GitHub #651 (spec #646): the 27B's prefill calls under the load's route. Under Fused, and under
+// Quant where the layers' MLP does not take the NVFP4 epilogue (GitHub #653), every AllowA4 call
+// at a width the W4A4 TMA route takes runs the op's BF16 epilogue (kernel/src/prefill_swiglu.h),
 // 1,024 included, so the vendored fused kernel leaves the 27B's path; every other call, and every
 // call under Split, keeps the vendored dispatch.
 void linear_swiglu(Route route, const ninfer::Tensor& x, const ninfer::Weight& gate_up, ninfer::Tensor& out,
                    ninfer::ops::LinearPolicy policy, ninfer::WorkspaceArena& workspace, cudaStream_t stream) {
     ninfer::ops::validate_call(x, gate_up, out, policy);
-    if (route == Route::Fused && policy == ninfer::ops::LinearPolicy::AllowA4 && takes(x.ne[1])) {
+    if (route != Route::Split && policy == ninfer::ops::LinearPolicy::AllowA4 && takes(x.ne[1])) {
         gate_up_swiglu(x, gate_up, out, workspace, stream);
         return;
     }
