@@ -1,0 +1,21 @@
+diff --git a/reference/src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu b/vendor/src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
+index 4dc44ba..4d51227 100644
+--- a/reference/src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
++++ b/vendor/src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
+@@ -56,12 +56,14 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace w
+ 
+ void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
+-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
++    // ignis (GitHub #652): the layout the TMA product below reads, as its quantizer wrote it.
++    const Nvfp4W4a4ActivationLayout layout =
++        launch_nvfp4_w4a4_quantize_for_products(x, weight, workspace, stream);
+     const std::int32_t tokens  = x.ne[1];
+     const Nvfp4Problem problem = resolve_nvfp4_problem(weight.n, weight.k);
+     if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
+         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+-        launch_nvfp4_w4a4_tma_linear_add(problem, workspace.codes, workspace.scales,
++        launch_nvfp4_w4a4_tma_linear_add(problem, workspace.codes, workspace.scales, layout,
+                                          static_cast<const std::uint8_t*>(weight.qdata),
+                                          static_cast<const std::uint8_t*>(weight.scales),
+                                          static_cast<__nv_bfloat16*>(residual.data), tokens, alpha,

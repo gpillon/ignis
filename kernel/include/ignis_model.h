@@ -329,6 +329,26 @@ enum ignis_mtp_head_linear {
   IGNIS_MTP_HEAD_LINEAR_OURS = 2,
 };
 
+/* GitHub #652 (spec #646): the layout the 27B's W4A4 prefill products read
+ * their activations in, which no load option names: decided once per load,
+ * K-tile-major on a load whose prefill runs the W4A4 TMA route unless the
+ * measurement switch IGNIS_W4A4_ACTIVATION_LAYOUT=token names the token-major
+ * one (kernel/src/w4a4_activation_layout.h). The bytes the products write are
+ * the same in both. `ignis_model_w4a4_activation_layout` reports it. */
+enum ignis_w4a4_activation_layout {
+  /* A load whose prefill runs no W4A4 TMA product: the trellis body,
+   * Flash-Next, a card below compute capability 12, a prefill chunk below
+   * 1,024 tokens. */
+  IGNIS_W4A4_ACTIVATION_LAYOUT_NONE = 0,
+  /* Token by token, the layout before GitHub #652: what
+   * IGNIS_W4A4_ACTIVATION_LAYOUT=token names. */
+  IGNIS_W4A4_ACTIVATION_LAYOUT_TOKEN = 1,
+  /* K tile by K tile, codes [K/128][T][64 bytes] and scales
+   * [K/256][T][16 bytes]: what such a load reads unless the switch names the
+   * other. */
+  IGNIS_W4A4_ACTIVATION_LAYOUT_KTILE = 2,
+};
+
 /* GitHub #414 (ADR 0075): where a vision load keeps the 27B's vision tower
  * and (GitHub #415) its media embedding pool. The binder places the tower and
  * the load checks it is where this says. */
@@ -715,6 +735,12 @@ uint32_t ignis_model_hq_decode_attention(const struct ignis_model *model);
  * graph captured on it holds. IGNIS_MTP_HEAD_LINEAR_NONE for NULL and for a
  * load without the head. */
 uint32_t ignis_model_mtp_head_linear(const struct ignis_model *model);
+
+/* The layout a loaded 27B's W4A4 prefill products read their activations in
+ * (enum ignis_w4a4_activation_layout; GitHub #652): what the load decided.
+ * IGNIS_W4A4_ACTIVATION_LAYOUT_NONE for NULL and for a load whose prefill
+ * runs no W4A4 TMA product. */
+uint32_t ignis_model_w4a4_activation_layout(const struct ignis_model *model);
 
 /* GitHub #557: the most merged vision tokens one media item may hold on a
  * loaded model -- what its encoder's share of the scratch was sized for, and

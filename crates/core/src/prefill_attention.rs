@@ -150,6 +150,47 @@ impl GdnPrefill {
     }
 }
 
+/// The layout the 27B's W4A4 prefill products read their activations in
+/// (GitHub #652, spec #646), which no load option names: the leaf decides it
+/// once per load, K-tile-major unless the measurement switch
+/// `IGNIS_W4A4_ACTIVATION_LAYOUT=token` names the token-major one, and reports
+/// it ([`crate::model_load::Model::w4a4_activation_layout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum W4a4ActivationLayout {
+    /// A load whose prefill runs no W4A4 TMA product: the trellis body,
+    /// Flash-Next, a card below compute capability 12, a chunk below 1,024
+    /// tokens.
+    None,
+    /// Token by token, the layout before GitHub #652: what the switch's
+    /// `token` names.
+    Token,
+    /// K tile by K tile: what a load whose prefill runs the route reads unless
+    /// the switch names the other.
+    KTile,
+}
+
+impl W4a4ActivationLayout {
+    /// `enum ignis_w4a4_activation_layout`: 0 none, 1 token-major, 2
+    /// K-tile-major; `None` for any other code.
+    pub const fn from_abi(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::None),
+            1 => Some(Self::Token),
+            2 => Some(Self::KTile),
+            _ => None,
+        }
+    }
+
+    /// The switch's own spellings, and `none`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Token => "token",
+            Self::KTile => "ktile",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +212,15 @@ mod tests {
         assert_eq!(GdnPrefill::from_abi(1), Some(GdnPrefill::Ours));
         assert_eq!(GdnPrefill::from_abi(2), None);
         assert_eq!((GdnPrefill::Vendored.as_str(), GdnPrefill::Ours.as_str()), ("vendored", "ours"));
+    }
+
+    /// The leaf's codes, and the switch's spellings (GitHub #652).
+    #[test]
+    fn the_w4a4_activation_layouts_are_the_headers_codes() {
+        let layouts = [W4a4ActivationLayout::None, W4a4ActivationLayout::Token, W4a4ActivationLayout::KTile];
+        assert_eq!([0, 1, 2].map(W4a4ActivationLayout::from_abi), layouts.map(Some));
+        assert_eq!(W4a4ActivationLayout::from_abi(3), None);
+        assert_eq!(layouts.map(W4a4ActivationLayout::as_str), ["none", "token", "ktile"]);
     }
 
     #[test]

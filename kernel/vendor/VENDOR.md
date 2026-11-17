@@ -241,7 +241,23 @@ each asks ignis's own slots (`kernel/src/tma_descriptor_cache.h`) for the
 load's resident copy of the block before upstream's allocation, copy and free
 before every product, which stay where no load's slots serve the stream and
 inside a graph capture; Linux passes the maps by value and runs the files as
-upstream does. Two
+upstream does. Since GitHub #652 the TMA route reads its activations
+K-tile-major, codes `[K/128][T][64 bytes]` and scales `[K/256][T][16 bytes]`,
+where upstream's are token-major, under an ADR 0031 patch of every file the
+route's activations cross: `nvfp4_w4a4_plan.h` names the layout and declares
+the quantizer the products take, which writes the layout the load running on
+the stream names (ignis's `kernel/src/w4a4_activation_layout.h`) and says
+which; `nvfp4_w4a4_mma.cuh` and `nvfp4_w4a4.cu` add its K-tile-major kernel;
+`nvfp4_w4a4_tma.cuh`, `nvfp4_w4a4_tma.cu` and `nvfp4_w4a4_tma_launch.h` read
+it, through descriptors of their own, a schedule parameter and a layout
+argument; and the linear's, the attention input's, the GDN input's and the
+linear + residual's launchers (`nvfp4_w4a4.cu`,
+`ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu`,
+`ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu`,
+`ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu`) quantize through it and hand
+the product the layout it wrote. The weights, the gate and up's fused route
+and every narrower width keep upstream's layout, and the products' output is
+the same bytes (`ignis_kernel_w4a4_activation_layout_test`). Two
 small epilogue/output headers from *other* op families are vendored alongside
 it because `nvfp4_w4a4_tma.cu` is the shared W4A4 GEMM kernel those families
 reuse: `ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh` and

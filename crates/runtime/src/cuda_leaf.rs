@@ -712,12 +712,16 @@ impl StepLeaf for CudaLeaf {
         // The review of spec #503: the prefill routes this load runs, the
         // gated delta net's among them, which no option names (the leaf decides
         // it from the card, or the measurement switch IGNIS_GDN_PREFILL does).
+        // GitHub #652: and the layout its W4A4 products read their activations
+        // in, `ktile` unless IGNIS_W4A4_ACTIVATION_LAYOUT=token, `none` where
+        // the prefill runs no such product.
         // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80).
         tracing::info!(
             name: "ignis.runtime.prefill_routes",
             prefill_linear = self.config.prefill_linear.as_str(),
             prefill_attention = self.config.prefill_attention.as_str(),
             gdn_prefill = model.gdn_prefill().as_str(),
+            w4a4_activation_layout = model.w4a4_activation_layout().as_str(),
             "prefill routes"
         );
         // GitHub #572 (spec #570): the attention route of the decode and
