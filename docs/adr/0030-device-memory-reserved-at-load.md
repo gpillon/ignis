@@ -31,7 +31,8 @@ and the 27B's per-process state are not charged twice (#324).
 `ignis.runtime.vram_plan` names its lines in a fixed order (`VramLines` in
 `crates/core/src/vram.rs`): weights, CUDA context, the workspace that prefill
 and the vision encoder share, the 27B trellis body's workspace and dense
-prefill buffer, the media embedding pool, sampling, the decode, verify and
+prefill buffer, the NVFP4 body's TMA descriptor slots on Windows, the media
+embedding pool, sampling, the decode, verify and
 drafter rounds, lane state, the device retained slots, the hq residual window
 of every lane and device slot, and the measured residual. Flash-Next adds
 residency's fixed bytes and the expert cache (`ignis.runtime.flash_next_plan`),
@@ -100,6 +101,16 @@ body's largest matrix that every matrix of a prefill chunk is decoded into in
 turn -- placed after `trellis_workspace`. 0 on a load that runs the fused
 prefill; under the dense prefill `trellis_workspace` holds its INT8
 activations at the chunk in place of the fused prefill's.
+**Amended 2026-11-17 by spec #646** (GitHub #650): a fifteenth plan line,
+`tma_descriptors` -- on Windows, where the NVFP4 body's W4A4 TMA products take
+their tensor maps through a pointer, the device slots that keep them, 512
+bytes for each such product of a prefill traversal at every width the route
+takes up to the load's widest chunk (a multiple of 256 from 1,024 tokens) --
+placed after `trellis_dense`. It replaces an allocation from the device's
+memory pool before every product, which the plan could not state and whose
+first one cost the first request after a load ~110 ms. 0 on Linux, the trellis
+body, Flash-Next, a card below compute capability 12, a chunk below 1,024
+tokens and under the measurement switch `IGNIS_TMA_DESCRIPTOR_CACHE=0`.
 Amended 2026-09-18 (#216, owner decision) where building it settled three
 readings this section had left to the source column — the retained slots'
 capacity, what the KV pool's occupancy counts, and what the KV-RAM arena's

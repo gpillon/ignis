@@ -9,6 +9,14 @@
 #include <cstdint>
 #include <stdexcept>
 
+#ifdef _WIN32
+// ignis (ADR 0031, GitHub #650): the device copy a load keeps of a descriptor block for a launch
+// on its stream, or null (kernel/src/tma_descriptor_cache.h).
+namespace ignis::tma_descriptors {
+const void* device_copy(const void* block, std::size_t size, cudaStream_t stream);
+} // namespace ignis::tma_descriptors
+#endif
+
 namespace ninfer::ops::detail {
 namespace {
 
@@ -92,6 +100,16 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
     constexpr int kPairN = M256N128S3::kBlockN / 2;
     const dim3 grid((Geometry::kOutputRows / 2) / kPairN, tokens / M256N128S3::kBlockM);
 #ifdef _WIN32
+    // ignis (GitHub #650): the load's resident copy of these descriptors, when it keeps one, in
+    // place of an allocation, a copy and a free before every product.
+    if (const void* resident =
+            ignis::tma_descriptors::device_copy(&descriptors, sizeof(descriptors), stream)) {
+        nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
+            <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(
+                static_cast<const Nvfp4W4a4TmaDescriptors*>(resident), alpha, output);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     Nvfp4LinearSwiGluTmaDescriptorBlock block(stream);
     CUDA_CHECK(cudaMemcpyAsync(block.device, &descriptors, sizeof(descriptors),
                                cudaMemcpyHostToDevice, stream));

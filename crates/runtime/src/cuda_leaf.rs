@@ -365,6 +365,7 @@ fn reserved_bytes(
         workspace: model.workspace_bytes,
         trellis_workspace: model.trellis_workspace_bytes,
         trellis_dense: model.trellis_dense_bytes,
+        tma_descriptors: model.tma_descriptor_bytes,
         media_embedding: model.media_embedding_bytes,
         sampling: model.sampling_bytes,
         decode_graph: model.decode_graph_bytes,

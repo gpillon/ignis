@@ -1159,6 +1159,10 @@ struct LoadOptions {
   // GitHub #627 (spec #618): the MTP head's matrices on ours (`mtp_head_linear_route`), which an
   // MTP load runs.
   bool mtp_head_linear_ours = false;
+  // GitHub #650: whether the load keeps its W4A4 TMA products' descriptors on the device
+  // (`tma_descriptor_cache_route`): on Windows, on a card the route runs on, unless the
+  // measurement switch IGNIS_TMA_DESCRIPTOR_CACHE=0 names upstream's per-launch upload.
+  bool tma_descriptor_cache = false;
   // GitHub #576 (ADR 0090): the verify round's draft rule (enum
   // ignis_draft_rule) and, under the sampled draft, the drafter's
   // temperature factor and top-p.
@@ -1217,6 +1221,33 @@ bool mtp_head_linear_route(bool &ours) {
     set_error(std::string("ignis_model_load: ") + e.what());
     return false;
   }
+  return true;
+}
+
+// GitHub #650: whether the load keeps the W4A4 TMA products' descriptor blocks in device slots
+// (kernel/src/tma_descriptor_cache.h), decided once per load: where the launchers take them
+// through a pointer (Windows), on a card the products' sm_120a code runs on (compute capability
+// 12), unless the measurement switch IGNIS_TMA_DESCRIPTOR_CACHE=0 names upstream's per-launch
+// upload; any other value is refused by name. False (error set) on a refusal or when the device
+// cannot say its generation. The card is asked only where the slots could be planned, so a Linux
+// load makes no call it did not make before.
+bool tma_descriptor_cache_route(bool &cache) {
+  cache = false;
+  bool enabled = false;
+  try {
+    enabled = ignis::tma_descriptors::enabled_for_load();
+  } catch (const std::invalid_argument &e) {
+    set_error(std::string("ignis_model_load: ") + e.what());
+    return false;
+  }
+  if (!ignis::tma_descriptors::kThroughPointer || !enabled) {
+    return true;
+  }
+  int major = 0;
+  if (!device_major("the TMA descriptor slots", major)) {
+    return false;
+  }
+  cache = major == 12;
   return true;
 }
 
@@ -1569,7 +1600,8 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.drafter_temperature_factor = drafter_temperature_factor;
   out.drafter_top_p = drafter_top_p;
   if (!gdn_prefill_route(out.gdn_prefill_ours) || !hq_decode_attention_switch(out.hq_decode_attention) ||
-      !mtp_head_linear_route(out.mtp_head_linear_ours)) {
+      !mtp_head_linear_route(out.mtp_head_linear_ours) ||
+      !tma_descriptor_cache_route(out.tma_descriptor_cache)) {
     return nullptr;
   }
 
@@ -1844,6 +1876,8 @@ struct LoadSizes {
   std::size_t trellis_workspace = 0;
   // GitHub #509: the dense prefill's one buffer (0 unless the load runs it).
   std::size_t trellis_dense = 0;
+  // GitHub #650: the W4A4 TMA products' descriptor slots (0 unless the load keeps them).
+  std::size_t tma_descriptors = 0;
   // GitHub #336: the load's decode lanes, which every round line is sized
   // for.
   std::size_t lanes = IGNIS_DECODE_MAX_BATCH;
@@ -1879,6 +1913,7 @@ struct LoadSizes {
     out.drafter_round_bytes = drafter_features + drafter_append_counts + drafter_draws + drafter_scratch;
     out.trellis_workspace_bytes = trellis_workspace;
     out.trellis_dense_bytes = trellis_dense;
+    out.tma_descriptor_bytes = tma_descriptors;
     return out;
   }
 };
@@ -2023,6 +2058,35 @@ std::size_t trellis_dense_bytes(const ignis_model &model) {
     body(tail.up_proj);
   }
   return line;
+}
+
+// GitHub #650: the W4A4 TMA products' descriptor slots (kernel/src/tma_descriptor_cache.h) -- a
+// slot for each product a prefill traversal runs on the route, its NVFP4 parents (the query, key,
+// gate and value or the GDN input projection, the output projection, the MLP's gate and up and
+// its down; an exception tensor held in FP8 or BF16 runs elsewhere), at every width the route
+// takes up to the chunk. 0 on a load that keeps none (`tma_descriptor_cache_route`) and on the
+// trellis body, which runs no W4A4 product.
+std::size_t tma_descriptor_bytes(const ignis_model &model, uint32_t prefill_chunk_tokens,
+                                 const LoadOptions &options) {
+  if (!options.tma_descriptor_cache || model.is_trellis_body) {
+    return 0;
+  }
+  std::size_t products = 0;
+  const auto parent = [&](const ninfer::Weight &w) { products += w.qtype == ninfer::QType::NVFP4 ? 1 : 0; };
+  for (const LayerWeights &layer : model.layers) {
+    if (layer.kind == IGNIS_LAYER_GQA) {
+      parent(layer.gqa.query_key_gate_value);
+      parent(layer.gqa.output);
+      parent(layer.gqa.mlp_gate_up);
+      parent(layer.gqa.mlp_down);
+    } else {
+      parent(layer.gdn.query_key_value_z);
+      parent(layer.gdn.output);
+      parent(layer.gdn.mlp_gate_up);
+      parent(layer.gdn.mlp_down);
+    }
+  }
+  return ignis::tma_descriptors::planned_slots(products, prefill_chunk_tokens) * ignis::tma_descriptors::kSlotBytes;
 }
 
 // The attention readout's room in a prefill chunk's arena (GitHub #260,
@@ -2184,6 +2248,7 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
       sizes.trellis_dense = trellis_dense_bytes(model);
     }
   }
+  sizes.tma_descriptors = tma_descriptor_bytes(model, prefill_chunk_tokens, options);
   return sizes;
 }
 
@@ -2213,6 +2278,7 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
                            bytes(model.decode_graph_slots) + bytes(model.decode_rope_positions);
   out.trellis_workspace_bytes = bytes(model.trellis_workspace_buffer);
   out.trellis_dense_bytes = bytes(model.trellis_dense_buffer);
+  out.tma_descriptor_bytes = model.tma_descriptors != nullptr ? model.tma_descriptors->bytes() : 0;
   if (model.verify != nullptr) {
     out.drafter_round_bytes = bytes(model.verify->features) + bytes(model.verify->append_counts) +
                               bytes(model.verify->draft_candidates) + bytes(model.verify->draft_q) +
@@ -2573,6 +2639,19 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       return -1;
     }
   }
+  // GitHub #650: the W4A4 TMA products' descriptor slots, serving the model's stream from here
+  // on, so a first prefill finds them in place and allocates nothing a later one does not.
+  if (sizes.tma_descriptors > 0) {
+    try {
+      model->tma_descriptors = std::make_unique<ignis::tma_descriptors::Cache>(
+          sizes.tma_descriptors / ignis::tma_descriptors::kSlotBytes, model->stream);
+    } catch (const std::exception &e) {
+      set_error(std::string("ignis_model_load: the TMA descriptor slots: ") + e.what());
+      cudaStreamDestroy(model->stream);
+      model->stream = nullptr;
+      return -1;
+    }
+  }
 
   // GitHub #177: the vision reservation, taken here at load -- before the
   // caller builds its sequence pool -- so enabling vision can never OOM a
@@ -2811,6 +2890,8 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
         }
       }
     }
+    // GitHub #650: the descriptor slots stop serving the stream before it goes away.
+    model->tma_descriptors.reset();
     if (model->stream != nullptr) {
       cudaStreamDestroy(model->stream);
     }

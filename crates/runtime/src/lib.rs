@@ -329,6 +329,9 @@ pub struct ReservedBytes {
     pub trellis_workspace: u64,
     /// The dense prefill's one buffer (GitHub #509); 0 unless the load runs it.
     pub trellis_dense: u64,
+    /// The W4A4 TMA products' descriptor slots (GitHub #650); 0 but on a
+    /// Windows NVFP4 load whose prefill runs the route.
+    pub tma_descriptors: u64,
     pub media_embedding: u64,
     pub sampling: u64,
     pub decode_graph: u64,
@@ -371,6 +374,7 @@ pub fn vram_lines(weights_bytes: u64, cuda_context_bytes: u64, reserved: Reserve
         workspace: reserved.workspace,
         trellis_workspace: reserved.trellis_workspace,
         trellis_dense: reserved.trellis_dense,
+        tma_descriptors: reserved.tma_descriptors,
         media_embedding: reserved.media_embedding,
         sampling: reserved.sampling,
         decode_graph: reserved.decode_graph,
@@ -2658,6 +2662,7 @@ mod tests {
             retained_slots: base + 9,
             hq_residual_window: base + 10,
             trellis_dense: base + 11,
+            tma_descriptors: base + 12,
             kv_pool: 0,
         }
     }

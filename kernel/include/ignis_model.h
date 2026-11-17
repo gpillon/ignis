@@ -557,6 +557,14 @@ struct ignis_model_reservations {
    * largest trellis matrix (in x out bytes), which every matrix is decoded
    * into in turn. 0 unless IGNIS_PREFILL_LINEAR_DENSE. */
   uint64_t trellis_dense_bytes;
+  /* GitHub #650: on Windows, where the NVFP4 body's W4A4 TMA products take
+   * their tensor maps through a pointer, the device slots that keep them: 512
+   * bytes for each such product of a prefill traversal at every width the
+   * TMA route takes up to the prefill chunk (a multiple of 256 from 1,024
+   * tokens). 0 on Linux, on the trellis body, on Flash-Next, on a card below
+   * compute capability 12, below a 1,024-token chunk, and under the
+   * measurement switch IGNIS_TMA_DESCRIPTOR_CACHE=0. */
+  uint64_t tma_descriptor_bytes;
 };
 
 struct ignis_model_stats {
@@ -583,12 +591,13 @@ struct ignis_model_stats {
 #ifdef __cplusplus
 /* Neither struct has a `size` field, so both sides pin their layouts (here,
  * and crates/core/src/model_load.rs's mirror test). */
-static_assert(sizeof(struct ignis_model_reservations) == 72 &&
+static_assert(sizeof(struct ignis_model_reservations) == 80 &&
                   offsetof(struct ignis_model_reservations, trellis_workspace_bytes) == 56 &&
-                  offsetof(struct ignis_model_reservations, trellis_dense_bytes) == 64,
+                  offsetof(struct ignis_model_reservations, trellis_dense_bytes) == 64 &&
+                  offsetof(struct ignis_model_reservations, tma_descriptor_bytes) == 72,
               "ignis_model_reservations drifted from crates/core/src/model_load.rs IgnisModelReservations");
-static_assert(sizeof(struct ignis_model_stats) == 104 && offsetof(struct ignis_model_stats, reserved) == 24 &&
-                  offsetof(struct ignis_model_stats, host_mapped_bytes) == 96,
+static_assert(sizeof(struct ignis_model_stats) == 112 && offsetof(struct ignis_model_stats, reserved) == 24 &&
+                  offsetof(struct ignis_model_stats, host_mapped_bytes) == 104,
               "ignis_model_stats drifted from crates/core/src/model_load.rs IgnisModelStats");
 #endif
 
