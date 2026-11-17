@@ -454,6 +454,9 @@ mod tests {
         /// the INT8 copy of the body's largest matrix on the routes an RTX 30
         /// or 40 card runs, the one line those routes move at this chunk.
         trellis_dense: u64,
+        /// The CUDA context the card measures: the RTX 5090's
+        /// (`CUDA_CONTEXT_5090`) but where a real card read its own.
+        cuda_context: u64,
     }
 
     /// A 12 GB card's whole memory.
@@ -462,17 +465,24 @@ mod tests {
     /// The dense prefill's one buffer on the 27B: 5120 x 17408.
     const TRELLIS_DENSE: u64 = 89_128_960;
 
+    /// The CUDA context the RTX 5090 measured under Windows, #635's load.
+    const CUDA_CONTEXT_5090: u64 = 452_161_536;
+
+    /// The CUDA context an RTX 3060 12 GB measured under Linux with nothing
+    /// else on it, the first real 12 GB card (GitHub #639, 2026-11-17).
+    const CUDA_CONTEXT_3060: u64 = 114_425_856;
+
     impl Rtx12gbLoad {
         /// Blackwell's routes, in `budget` bytes.
         fn in_budget(budget: u64) -> Self {
-            Self { budget, trellis_dense: 0 }
+            Self { budget, trellis_dense: 0, cuda_context: CUDA_CONTEXT_5090 }
         }
 
         /// The plan's lines but the pool's, as #635's load logged them.
         fn lines(&self) -> VramLines {
             VramLines {
                 weights: 9_651_141_632,
-                cuda_context: 452_161_536,
+                cuda_context: self.cuda_context,
                 workspace: 302_433_536,
                 trellis_workspace: 32_134_400,
                 trellis_dense: self.trellis_dense,
@@ -1015,7 +1025,7 @@ mod tests {
     /// by 50 pages and the load adapts one step further, to 81,920.
     #[test]
     fn on_an_rtx_30_or_40_cards_routes_the_dense_buffer_keeps_131072_in_12_gib_and_81920_less_1_gib() {
-        let routes_8x = |budget| Rtx12gbLoad { budget, trellis_dense: TRELLIS_DENSE };
+        let routes_8x = |budget| Rtx12gbLoad { budget, trellis_dense: TRELLIS_DENSE, cuda_context: CUDA_CONTEXT_5090 };
         let adapted = kept(routes_8x(GIB_12).adapt(RTX_12GB_LADDER).0);
         assert_eq!((adapted.attempt, adapted.steps.as_slice()), (rtx_12gb_at(131_072), &[][..]));
         assert_eq!(adapted.plan.kv_page_count, 3_204);
@@ -1043,7 +1053,7 @@ mod tests {
     #[test]
     fn on_a_real_12gb_card_the_derived_budget_gives_each_desktop_its_context() {
         const HEADROOM: u64 = 512 << 20;
-        let derived = |free_mib: u64, trellis_dense: u64| Rtx12gbLoad { budget: (free_mib << 20) - HEADROOM, trellis_dense };
+        let derived = |free_mib: u64, trellis_dense: u64| Rtx12gbLoad { budget: (free_mib << 20) - HEADROOM, trellis_dense, cuda_context: CUDA_CONTEXT_5090 };
         let context = |card: Rtx12gbLoad| card.adapt(RTX_12GB_LADDER).0.ok().map(|adapted| adapted.attempt.max_context);
         // Free MiB at the start; the context on Blackwell's routes, then on an RTX 30 or 40 card's.
         let cases = [
@@ -1066,6 +1076,55 @@ mod tests {
         }
         let step = Rtx12gbLoad::floor_budget(rtx_12gb_at(131_072)) - Rtx12gbLoad::floor_budget(rtx_12gb_at(114_688));
         assert_eq!(step, 160_433_152, "256 pages and their block tables");
+    }
+
+    /// GitHub #639, the first real 12 GB card: an RTX 3060 12 GB under Linux
+    /// with nothing else on it read 12,486,508,544 bytes free at the start
+    /// (11,908 MiB) and a CUDA context of 114,425,856 bytes, the RTX 5090's
+    /// less 337,735,680; its every other line was the RTX 5090's on the routes
+    /// an RTX 30 or 40 card runs. The plan's arithmetic on those lines is the
+    /// plan the card logged, byte for byte: 2,250 pages, 144,000 tokens,
+    /// 131,072 kept, nothing adapted, where at the RTX 5090's context the same
+    /// free memory keeps 98,304. At that context 131,072 tokens need 11,790
+    /// MiB free, not 12,112, and each row of the guide's table keeps more: the
+    /// first two 131,072, then 114,688, 81,920, 65,536, and 32,768 where the
+    /// RTX 5090's context is refused.
+    #[test]
+    fn an_rtx_3060s_own_cuda_context_gives_the_plan_it_logged() {
+        const HEADROOM: u64 = 512 << 20;
+        let card = Rtx12gbLoad {
+            budget: 12_486_508_544 - HEADROOM,
+            trellis_dense: TRELLIS_DENSE,
+            cuda_context: CUDA_CONTEXT_3060,
+        };
+        assert_eq!(card.budget, 11_949_637_632, "the budget the card logged");
+        let (result, attempts) = card.adapt(RTX_12GB_LADDER);
+        let adapted = kept(result);
+        assert_eq!((adapted.attempt, adapted.steps.as_slice()), (rtx_12gb_at(131_072), &[][..]));
+        assert_eq!(attempts, [rtx_12gb_at(131_072)], "one plan");
+        let plan = adapted.plan;
+        assert_eq!((plan.kv_page_count, plan.kv_token_capacity()), (2_250, 144_000));
+        assert_eq!((plan.kv_pool_bytes, plan.total_bytes), (1_410_056_192, 11_949_021_440));
+        let at_the_5090s = Rtx12gbLoad { cuda_context: CUDA_CONTEXT_5090, ..card };
+        assert_eq!(kept(at_the_5090s.adapt(RTX_12GB_LADDER).0).attempt, rtx_12gb_at(98_304));
+
+        let context = |free_mib: u64| {
+            let card = Rtx12gbLoad { budget: (free_mib << 20) - HEADROOM, ..card };
+            card.adapt(RTX_12GB_LADDER).0.ok().map(|adapted| adapted.attempt.max_context)
+        };
+        assert_eq!(context(11_790), Some(131_072));
+        assert_eq!(context(11_789), Some(114_688), "11,790 less 1 MiB");
+        let rows = [
+            (12_032, 131_072),
+            (11_878, 131_072),
+            (11_704, 114_688),
+            (11_468, 81_920),
+            (11_233, 65_536),
+            (10_946, 32_768),
+        ];
+        for (free_mib, max_context) in rows {
+            assert_eq!(context(free_mib), Some(max_context), "{free_mib} MiB free at the RTX 3060's context");
+        }
     }
 
     /// Decision 6: a context the plan holds at two lanes without a spare

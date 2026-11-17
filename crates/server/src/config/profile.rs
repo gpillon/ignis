@@ -270,7 +270,9 @@ pub const NONE_PROFILE: &str = "none";
 /// `--profile auto` finds below 14 GiB. Derived: no 12 GB card exists in the
 /// project, and the class is simulated on the RTX 5090 under a 12 GiB budget,
 /// where the 12 GB artifact loads 131,072 tokens with nothing adapted (#635,
-/// 2026-11-16). It is sized for one user with a desktop on the card: one
+/// 2026-11-16); the first real card, an RTX 3060 12 GB under Linux with
+/// nothing else on it, kept 131,072 too, its CUDA context 114 MB against the
+/// RTX 5090's 452 MB (#639, 2026-11-17). It is sized for one user with a desktop on the card: one
 /// decode lane, where a second costs about 0.87 GB; the
 /// 27B's MTP head as the drafter, at the window #628 measured
 /// ([`ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS`], ADR 0095),

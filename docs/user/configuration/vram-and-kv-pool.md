@@ -138,26 +138,42 @@ that much less than the 5090's keeps 98,304.
 
 ### On a real 12 GB card
 
-A 12 GB card reads about 11.9 GiB in all, and `rtx-12gb` derives its budget:
+A 12 GB card reads about 12 GiB in all, and `rtx-12gb` derives its budget:
 the memory free before the start, as NVML and `nvidia-smi` read it, less
 512 MiB. So the context is what the desktop and the other programs on the
-card leave. These figures are the plan's arithmetic on the lines above, the
-RTX 5090's (its CUDA context among them), not a measurement on a 12 GB card,
-which will confirm or correct them
-([issue #639](https://github.com/gpillon/ignis/issues/639)):
+card leave.
 
-| What else holds the card | Free at the start | Context, RTX 50 card | Context, RTX 30 or 40 card |
-|---|---:|---:|---:|
-| nothing: no display on it | 12,032 MiB | 131,072 | 114,688 |
-| a light desktop, about 0.3 GB | 11,878 MiB | 114,688 | 98,304 |
-| a desktop, about 0.5 GB | 11,704 MiB | 81,920 | 81,920 |
-| a desktop, about 0.75 GB | 11,468 MiB | 65,536 | 49,152 |
-| a desktop, about 1 GB | 11,233 MiB | 32,768 | 32,768 |
-| a desktop, about 1.3 GB | 10,946 MiB | refused | refused |
+The first real card measured, an RTX 3060 12 GB under Linux with nothing
+else on it ([its report](https://github.com/gpillon/ignis/issues/639#issuecomment-6934724053)), read 11,908 MiB
+free at the start and kept 131,072 tokens with nothing adapted, a pool of
+2,250 pages, 144,000 tokens. Its plan is the lines above with the dense
+prefill's buffer, an RTX 30 or 40 card's one line more, and differs in one:
+the CUDA context, which it measured at 114,425,856 bytes, a quarter of the RTX 5090's 452,161,536, and which is
+what let 131,072 hold; at the RTX 5090's context the same free memory keeps
+98,304. Right after the load the process held 74 to 88 MB less than the
+plan's total.
+
+The table is the plan's arithmetic on the RTX 5090's lines, its CUDA
+context among them, read under Windows, and in its last column on the RTX
+3060's context. Whether the card or the system sets the context, one
+reading does not say: a card with a desktop, and cards of the other
+generations, are still to report on
+[issue #639](https://github.com/gpillon/ignis/issues/639).
+
+| What else holds the card | Free at the start | Context, RTX 50 card | Context, RTX 30 or 40 card | Context at the RTX 3060's CUDA context |
+|---|---:|---:|---:|---:|
+| nothing: no display on it | 12,032 MiB | 131,072 | 114,688 | 131,072 |
+| a light desktop, about 0.3 GB | 11,878 MiB | 114,688 | 98,304 | 131,072 |
+| a desktop, about 0.5 GB | 11,704 MiB | 81,920 | 81,920 | 114,688 |
+| a desktop, about 0.75 GB | 11,468 MiB | 65,536 | 49,152 | 81,920 |
+| a desktop, about 1 GB | 11,233 MiB | 32,768 | 32,768 | 65,536 |
+| a desktop, about 1.3 GB | 10,946 MiB | refused | refused | 32,768 |
 
 131,072 tokens need 12,027 MiB free on an RTX 50 card and 12,112 MiB on an
-RTX 30 or 40 card, whose dense prefill buffer is one line more; each
-16,384-token step below needs about 153 MiB less. The first two rows are
+RTX 30 or 40 card, whose dense prefill buffer is one line more, and
+11,790 MiB at the RTX 3060's context; each 16,384-token step below needs
+about 153 MiB less. The RTX 3060 read 124 MiB less free with nothing on it
+than the first row says, and kept 131,072 with 118 MiB to spare. The first two rows are
 within 5 MiB of what their context needs on an RTX 50 card: a few MiB more taken and each
 keeps one step less; the last misses 16,384 tokens by 10 MiB. Your own figure is `nvidia-smi`'s free memory before the
 start, and the load's `ignis.runtime.vram_plan` event says what it kept.

@@ -67,9 +67,12 @@ You can add models of your own with an
     answers to `qwen3.8-27b` there: a start with no flag serves it, on one
     lane, drafting with its MTP head, at up to 131,072 tokens of context,
     stepping down 16,384 at a time to what the card's free memory holds.
-    The RTX 5090 held to a 12 GiB VRAM budget measured 131,072 (no 12 GB card
-    has run it yet); what a real card keeps depends on the memory its desktop
-    leaves, case by case on
+    An RTX 3060 12 GB under Linux with nothing else on it kept 131,072,
+    decoding a long reply at 62.7 tokens a second, its first token 10.2 s
+    after an 8,192-token prompt and 96.3 s after a 65,536-token one
+    ([its report](https://github.com/gpillon/ignis/issues/639#issuecomment-6934724053));
+    with a desktop on the card, what it keeps depends on the memory the
+    desktop leaves, case by case on
     [the VRAM page](../configuration/vram-and-kv-pool.md#on-a-real-12-gb-card)
     ([the profile](../concepts/profiles.md#rtx-12gb)). Against the 16 GB entry
     it gives up a little quality: a KLD against BF16 of 0.0431 against 0.0418,

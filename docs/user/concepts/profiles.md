@@ -299,9 +299,13 @@ Why each:
   and the dense prefill's 89 MB buffer is a line of the VRAM plan, which
   takes pool and, in some budgets, a step of the context
   ([the 12 GB class's plan](../configuration/vram-and-kv-pool.md#the-12-gb-class)).
-- No real 12 GB card has loaded this profile yet: its numbers are the RTX
-  5090's, held to a 12 GiB budget, and a real card's are the same plan's
-  arithmetic until one confirms them
+- Its numbers are the RTX 5090's, held to a 12 GiB budget. The first real
+  12 GB card to load it, an RTX 3060 12 GB under Linux with nothing else on
+  it, kept 131,072 tokens with nothing adapted, on the same plan but for its
+  CUDA context, a quarter of the RTX 5090's
+  ([on a real 12 GB card](../configuration/vram-and-kv-pool.md#on-a-real-12-gb-card)),
+  and decoded a long reply at 62.7 tokens a second. A card with a desktop,
+  and cards of the other generations, are still to report
   ([issue #639](https://github.com/gpillon/ignis/issues/639)).
 
 ### `rtx-24gb`
