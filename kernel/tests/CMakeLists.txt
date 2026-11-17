@@ -1199,6 +1199,18 @@ target_include_directories(ignis_kernel_trellis_body_test PRIVATE ${CMAKE_CURREN
 target_link_libraries(ignis_kernel_trellis_body_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_trellis_body_test COMMAND ignis_kernel_trellis_body_test)
 
+# GitHub #650 (spec #646): OURS -- the W4A4 TMA products' descriptor blocks kept on the device
+# (kernel/src/tma_descriptor_cache.h), through the two vendored launchers: the bytes on a stream a
+# cache serves against upstream's per-launch upload, with a slot for every block and with fewer
+# slots than blocks back to back, nothing from the device's memory pool, and a launch inside a
+# graph capture on upstream's path. A slot rewritten under a kernel still reading it would hang
+# that kernel: the timeout makes it a failure. GPU (ADR 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_tma_descriptor_cache_test test_tma_descriptor_cache.cu)
+target_include_directories(ignis_kernel_tma_descriptor_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_tma_descriptor_cache_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_tma_descriptor_cache_test COMMAND ignis_kernel_tma_descriptor_cache_test)
+set_tests_properties(ignis_kernel_tma_descriptor_cache_test PROPERTIES TIMEOUT 120)
+
 # GitHub #456: the tests whose kernels only the sm_120a set holds (kernel/CMakeLists.txt). On a
 # card below compute capability 12.0 they fail at their first launch, "no kernel image", which is
 # the loud failure the set is built for; there run `ctest -LE sm120a-only`. W8 aborts at its
@@ -1221,5 +1233,6 @@ set(ignis_sm120a_only_tests
   ignis_kernel_image_gemm_test
   ignis_kernel_image_attn_test
   ignis_kernel_image_encoder_test
-  ignis_kernel_image_transformer_test)
+  ignis_kernel_image_transformer_test
+  ignis_kernel_tma_descriptor_cache_test)
 set_tests_properties(${ignis_sm120a_only_tests} PROPERTIES LABELS sm120a-only)

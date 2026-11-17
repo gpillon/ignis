@@ -166,6 +166,11 @@ pub(crate) mod ffi {
         /// body's largest trellis matrix; 0 unless the load runs the dense
         /// prefill.
         pub trellis_dense_bytes: u64,
+        /// GitHub #650: on Windows, the NVFP4 body's W4A4 TMA products'
+        /// descriptor slots (`kernel/src/tma_descriptor_cache.h`); 0 on Linux,
+        /// the trellis body, Flash-Next, a card below compute capability 12, a
+        /// chunk below 1,024 tokens and under `IGNIS_TMA_DESCRIPTOR_CACHE=0`.
+        pub tma_descriptor_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_model_stats`.
@@ -1807,14 +1812,15 @@ mod tests {
         // uint64 x 3, then (GitHub #210) the six uint64 reservation lines,
         // (GitHub #302) the seventh, Flash-Next's activations, (GitHub #339)
         // the eighth, the trellis workspace, (GitHub #509) the ninth, the
-        // dense prefill's buffer, and (ADR 0062) the uint64 host-mapped
-        // bytes. The leaf pins the same sizes (kernel/include/ignis_model.h).
-        assert_eq!(std::mem::size_of::<IgnisModelReservations>(), 72);
+        // dense prefill's buffer, (GitHub #650) the tenth, the TMA
+        // descriptor slots, and (ADR 0062) the uint64 host-mapped bytes. The leaf pins the same sizes (kernel/include/ignis_model.h).
+        assert_eq!(std::mem::size_of::<IgnisModelReservations>(), 80);
         assert_eq!(std::mem::offset_of!(IgnisModelReservations, trellis_workspace_bytes), 56);
         assert_eq!(std::mem::offset_of!(IgnisModelReservations, trellis_dense_bytes), 64);
-        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 104);
+        assert_eq!(std::mem::offset_of!(IgnisModelReservations, tma_descriptor_bytes), 72);
+        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 112);
         assert_eq!(std::mem::offset_of!(IgnisModelStats, reserved), 24);
-        assert_eq!(std::mem::offset_of!(IgnisModelStats, host_mapped_bytes), 96);
+        assert_eq!(std::mem::offset_of!(IgnisModelStats, host_mapped_bytes), 104);
     }
 
     #[test]

@@ -702,6 +702,7 @@ const LINE_LABEL: Record<VramLine, string> = {
   workspace: "Workspace",
   trellis_workspace: "Trellis workspace",
   trellis_dense: "Dense prefill buffer",
+  tma_descriptors: "TMA descriptor slots",
   media_embedding: "Media embedding",
   sampling: "Sampling",
   decode_graph: "Decode graph",

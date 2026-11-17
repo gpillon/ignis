@@ -514,6 +514,8 @@ fn the_round_lines_follow_the_loads_lanes() {
         trellis_workspace: 0,
         // GitHub #509: and runs the fused prefill.
         trellis_dense: 0,
+        // GitHub #650: set per shape below.
+        tma_descriptors: 0,
         media_embedding,
         sampling: 4_623_344,
         decode_graph,
@@ -524,13 +526,18 @@ fn the_round_lines_follow_the_loads_lanes() {
         hq_residual_window: 356_516_480,
         kv_pool: 0,
     };
+    // GitHub #650: on Windows the NVFP4 body's 247 W4A4 TMA products (the 64
+    // layers' four parents less the nine exception tensors) keep a 512-byte
+    // descriptor slot at each width the route takes up to the chunk: five at
+    // 2,048 tokens, one at 1,024. Linux passes the descriptors by value.
+    let descriptor_slots = |widths: u64| if cfg!(windows) { 247 * widths * 512 } else { 0 };
     let shapes = [
         Shape {
             label: "rtx5090",
             max_context_tokens: 917_504,
             prefill_chunk_tokens: 2048,
             vision: Some(vision),
-            main: main(908_592_896, 335_544_320, 82_125_920, 152_139_488),
+            main: ReservedBytes { tma_descriptors: descriptor_slots(5), ..main(908_592_896, 335_544_320, 82_125_920, 152_139_488) },
             decode_graph: [10_266_636, 20_532_248],
         },
         Shape {
@@ -538,7 +545,7 @@ fn the_round_lines_follow_the_loads_lanes() {
             max_context_tokens: 262_144,
             prefill_chunk_tokens: 1024,
             vision: None,
-            main: main(487_837_184, 0, 82_125_888, 152_139_232),
+            main: ReservedBytes { tma_descriptors: descriptor_slots(1), ..main(487_837_184, 0, 82_125_888, 152_139_232) },
             decode_graph: [10_266_632, 20_532_240],
         },
     ];

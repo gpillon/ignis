@@ -233,7 +233,15 @@ warp-specialized SM120 TMA route, which needs the CUDA driver API directly for
 `cuTensorMapEncodeTiled`; since GitHub #329 that call, and its
 `cuGetErrorName`, resolve to our `kernel/src/cuda_driver_shim.cu`, which
 forwards them to the driver through the CUDA runtime, so nothing links the
-driver's library and the vendored file is unchanged). Two
+driver's library and the vendored file is unchanged by it). Since GitHub #650
+`nvfp4_w4a4_tma.cu` and the gate and up's
+`ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu` carry an ADR 0031
+patch: on Windows, where the kernels take their tensor maps through a pointer,
+each asks ignis's own slots (`kernel/src/tma_descriptor_cache.h`) for the
+load's resident copy of the block before upstream's allocation, copy and free
+before every product, which stay where no load's slots serve the stream and
+inside a graph capture; Linux passes the maps by value and runs the files as
+upstream does. Two
 small epilogue/output headers from *other* op families are vendored alongside
 it because `nvfp4_w4a4_tma.cu` is the shared W4A4 GEMM kernel those families
 reuse: `ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh` and

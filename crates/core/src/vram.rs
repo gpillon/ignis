@@ -158,6 +158,13 @@ pub struct VramLines {
     /// matrix of a prefill chunk is decoded into in turn. 0 on a load that
     /// runs the fused prefill.
     pub trellis_dense: u64,
+    /// The NVFP4 body's W4A4 TMA descriptor slots (GitHub #650): on Windows,
+    /// 512 bytes for each W4A4 product of a prefill traversal at every width
+    /// the route takes up to `--model-prefill-chunk` (a multiple of 256 from
+    /// 1,024 tokens), which keep the products' tensor maps on the device. 0 on
+    /// Linux, the trellis body, Flash-Next, an RTX 30 or RTX 40 card and a
+    /// chunk below 1,024 tokens.
+    pub tma_descriptors: u64,
     /// One media item's encoder output (0 without `--vision-enabled`).
     pub media_embedding: u64,
     /// Device sampling's staging buffers and workspace.
@@ -191,7 +198,7 @@ pub struct VramLines {
 impl VramLines {
     /// How many lines a plan has. The arity of [`VramLines::entries`], named
     /// so a reader of the plan does not have to write the number out again.
-    pub const LINES: usize = 14;
+    pub const LINES: usize = 15;
 
     /// `(name, bytes)` in plan order; the names are the `*_bytes` fields of
     /// `ignis.runtime.vram_plan` without the suffix.
@@ -202,6 +209,7 @@ impl VramLines {
             ("workspace", self.workspace),
             ("trellis_workspace", self.trellis_workspace),
             ("trellis_dense", self.trellis_dense),
+            ("tma_descriptors", self.tma_descriptors),
             ("media_embedding", self.media_embedding),
             ("sampling", self.sampling),
             ("decode_graph", self.decode_graph),
@@ -660,6 +668,7 @@ mod tests {
             workspace: 2 * GIB,
             trellis_workspace: 0,
             trellis_dense: 0,
+            tma_descriptors: 0,
             media_embedding: 320 * MIB,
             sampling: 10 * MIB,
             decode_graph: 200 * MIB,
@@ -1303,6 +1312,7 @@ mod tests {
                 "workspace",
                 "trellis_workspace",
                 "trellis_dense",
+                "tma_descriptors",
                 "media_embedding",
                 "sampling",
                 "decode_graph",

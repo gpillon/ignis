@@ -10,6 +10,14 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifdef _WIN32
+// ignis (ADR 0031, GitHub #650): the device copy a load keeps of a descriptor block for a launch
+// on its stream, or null (kernel/src/tma_descriptor_cache.h).
+namespace ignis::tma_descriptors {
+const void* device_copy(const void* block, std::size_t size, cudaStream_t stream);
+} // namespace ignis::tma_descriptors
+#endif
+
 namespace ninfer::ops::detail {
 namespace {
 
@@ -99,6 +107,16 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
 
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN, tokens / Schedule::kBlockM);
 #ifdef _WIN32
+    // ignis (GitHub #650): the load's resident copy of these descriptors, when it keeps one, in
+    // place of an allocation, a copy and a free before every product.
+    if (const void* resident =
+            ignis::tma_descriptors::device_copy(&descriptors, sizeof(descriptors), stream)) {
+        nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>
+            <<<grid, Schedule::kThreads, kSharedBytes, stream>>>(
+                static_cast<const Nvfp4W4a4TmaDescriptors*>(resident), alpha, epilogue, output);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     Nvfp4TmaDescriptorBlock block(stream);
     CUDA_CHECK(cudaMemcpyAsync(block.device, &descriptors, sizeof(descriptors),
                                cudaMemcpyHostToDevice, stream));

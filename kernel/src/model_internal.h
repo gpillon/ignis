@@ -12,6 +12,7 @@
 #include "ignis_trellis_linear.h"
 
 #include "rope_scaling.h"
+#include "tma_descriptor_cache.h"
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
@@ -545,6 +546,10 @@ struct ignis_model {
   // this one buffer (the plan line `trellis_dense_bytes`), null otherwise.
   uint32_t prefill_linear = IGNIS_PREFILL_LINEAR_FUSED;
   std::unique_ptr<ninfer::DeviceBuffer> trellis_dense_buffer;
+  // GitHub #650: on Windows, the W4A4 TMA products' descriptor slots serving
+  // `stream` (kernel/src/tma_descriptor_cache.h; the plan line
+  // `tma_descriptor_bytes`); null where the load plans none.
+  std::unique_ptr<ignis::tma_descriptors::Cache> tma_descriptors;
   // GitHub #514: the GDN prefill's route, decided once at load (model.cu
   // `gdn_prefill_route`): our full-rate kernels (kernel/src/gdn_prefill.h)
   // when true, the vendored chunked ones otherwise; read by every GDN
