@@ -11,7 +11,8 @@
 //!   caller's key ([`call`]): it meets every gate a client's request meets,
 //!   and its refusal comes back as the tool's error, the server's own JSON.
 //!   A tool whose call is more than its route's has a module of its own:
-//!   `generate_image` ([`image`]).
+//!   `decide` ([`decide`]), which sends its arguments as the harness wrote
+//!   them ([`Written`]), and `generate_image` ([`image`]).
 //! - **`/v1/mcp` itself is never held** by the serving gate: `initialize` and
 //!   `tools/list` answer while a model switches or warms up, and a tool's
 //!   own call meets the gate on its route.
@@ -31,12 +32,14 @@
 //! lists the tools that change the server. Both are start-only.
 
 pub mod call;
+pub mod decide;
 pub mod image;
 pub mod skill;
 pub mod tools;
 
 use std::sync::Arc;
 
+use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -101,6 +104,10 @@ impl Connector {
 /// `instructions`, from what `tools` lists.
 fn instructions(tools: &tools::Table) -> String {
     let mut text = ABOUT.to_owned();
+    if tools.named(decide::TOOL).is_some() {
+        text.push('\n');
+        text.push_str(decide::INSTRUCTIONS);
+    }
     if tools.named(image::TOOL).is_some() {
         text.push('\n');
         text.push_str(image::INSTRUCTIONS);
@@ -158,11 +165,27 @@ impl ServerHandler for Mcp {
             .cloned();
         // A tool whose call is more than its route's has its own module.
         let result = match tool.tool.name.as_ref() {
+            decide::TOOL => decide::decide(&self.0.routes, tool, written(&context), authorization).await,
             image::TOOL => image::generate(&self.0.routes, &self.0.tools, tool, request.arguments, authorization).await,
             _ => call::call(&self.0.routes, tool, request.arguments, authorization).await,
         };
         Ok(result.into())
     }
+}
+
+/// The body of a `/v1/mcp` request as the harness wrote it, kept in the
+/// request's extensions by [`mcp`] before rmcp parses it. rmcp hands a tool
+/// its arguments as a `serde_json::Map`, whose keys this build sorts; a tool
+/// whose arguments' key order is part of their meaning reads them here
+/// (`decide`, [`decide`]).
+#[derive(Clone)]
+pub(crate) struct Written(pub(crate) Bytes);
+
+/// The body `context`'s request was sent with, as written ([`Written`]):
+/// rmcp puts the request's HTTP parts, its extensions among them, in the
+/// context of the call.
+fn written(context: &RequestContext<RoleServer>) -> Option<&Written> {
+    context.extensions.get::<axum::http::request::Parts>()?.extensions.get::<Written>()
 }
 
 /// The `404` of a connector that is off, the one answer both of its routes
@@ -205,8 +228,31 @@ pub(crate) async fn mcp(request: Request) -> Response {
     let Some(connector) = request.extensions().get::<Connector>().cloned() else {
         return disabled();
     };
+    // The body is read whole first and kept as written ([`Written`]), up to
+    // the cap rmcp itself holds a body to.
+    let (mut parts, body) = request.into_parts();
+    let body = match axum::body::to_bytes(body, connector.service.config.max_request_body_bytes).await {
+        Ok(body) => body,
+        Err(err) if past_its_limit(&err) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    parts.extensions.insert(Written(body.clone()));
+    let request = Request::from_parts(parts, Body::from(body));
     let response = connector.service.oneshot(request).await.unwrap_or_else(|never| match never {});
     response.map(axum::body::Body::new).into_response()
+}
+
+/// Whether reading a body failed on a length limit: rmcp's cap, or the
+/// server's own for every `/v1` body.
+fn past_its_limit(err: &axum::Error) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = cause {
+        if err.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        cause = err.source();
+    }
+    false
 }
 
 #[cfg(test)]

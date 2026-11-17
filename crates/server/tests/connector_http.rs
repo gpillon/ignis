@@ -236,14 +236,14 @@ async fn the_tool_list_is_the_same_bytes_through_a_switch_a_patch_and_whatever_m
     let listed: Value = serde_json::from_slice(&before).unwrap();
     let tools = listed["result"]["tools"].as_array().expect("tools");
     let names: Vec<&str> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["describe_config", "generate_image", "read_catalog", "read_config"]);
-    let catalog = &tools[2];
+    assert_eq!(names, ["decide", "describe_config", "generate_image", "read_catalog", "read_config"]);
+    let catalog = &tools[3];
     assert_eq!(catalog["annotations"], json!({ "readOnlyHint": true, "destructiveHint": false }));
     assert_eq!(catalog["inputSchema"], json!({ "type": "object", "properties": {} }));
     assert!(!catalog["description"].as_str().unwrap().is_empty());
     // Spec #656: `generate_image` changes what the server has loaded, so it
     // is not read-only; it takes a prompt and, optionally, a size.
-    let image = &tools[1];
+    let image = &tools[2];
     assert_eq!(image["annotations"], json!({ "readOnlyHint": false, "destructiveHint": false }));
     assert_eq!(image["inputSchema"]["required"], json!(["prompt"]));
     let mut inputs: Vec<&String> = image["inputSchema"]["properties"].as_object().expect("properties").keys().collect();

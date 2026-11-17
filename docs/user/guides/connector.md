@@ -176,6 +176,26 @@ the harness: opencode asks before every MCP call whatever they say, qwen-code
 runs read-only tools in parallel, pi passes them on, DeepSeek Harness reads
 none.
 
+### Decisions: `decide`
+
+Asks the model typed questions about some content and answers each one read
+off the model rather than generated: a yes/no as the probability of yes, one
+option of a set, a level of a score, a number, a point or a box on an image.
+It calls [`POST /v1/decide`](../api/decide.md) and answers its body as text.
+It takes the route's `state`, the content, and `questions`, keyed by ids the
+agent chooses, in the route's own shapes, and nothing else: no `model`, so a
+call never switches the server, and no thinking field. Any other argument is
+a tool error naming it, before the route is asked. It is not read-only.
+
+The route reads an object's keys in the order they were written, a `state`
+record's and a `choice`'s options among them, and so does the tool: the
+connector sends the route the arguments exactly as the harness wrote them,
+where an MCP library would hand them on sorted by key.
+
+**The 27B only.** Qwen3.8-Flash-Next has no readouts: on a Flash-Next load
+the tool's error is the server's own `400 model_unsupported`. The
+connector's `instructions` say so in their line on `decide`.
+
 ### The catalog: `read_catalog`
 
 The models the server can switch to or download, one row each: whether it is
