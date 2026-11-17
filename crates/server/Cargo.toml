@@ -106,6 +106,14 @@ ignis-bench = { path = "../bench" }
 # `ws` feature serves, and `futures-util` for its `Sink`/`Stream` halves.
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
+# `tests/connector_skill.rs` reads the skill's archive back (`skill_pack.rs`).
+flate2 = "1.1"
+
+[build-dependencies]
+# `build.rs` packs the `ignis` skill into the tar.gz the server serves (spec
+# #656, `skill_pack.rs`). Already in the tree under `png`; the tar itself is
+# written by hand, so there is no `tar` crate.
+flate2 = "1.1"
 
 [features]
 # Forwards to the artifact crate's VRAM materialization path (ADR 0002) and

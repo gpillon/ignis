@@ -21,10 +21,15 @@
 //!   on a LAN the name is not a loopback one); rmcp's `Origin` list stays
 //!   empty, its default, which checks none.
 //!
-//! `connector.enabled` off answers the route `404`; `connector.allow_changes`
+//! - **The skill** is the connector's other route, `GET /v1/connector/skill`
+//!   ([`skill`]): the `ignis` skill whose scripts handle files on the
+//!   harness's side.
+//!
+//! `connector.enabled` off answers both routes `404`; `connector.allow_changes`
 //! lists the tools that change the server. Both are start-only.
 
 pub mod call;
+pub mod skill;
 pub mod tools;
 
 use std::sync::Arc;
@@ -52,6 +57,17 @@ pub const PATH: &str = "/v1/mcp";
 const ABOUT: &str = "\
 ignis is the inference server this agent's model runs on; these tools reach the rest of it.
 A failed call returns the server's error JSON and Retry-After; nothing is retried for you.";
+
+/// The skill's install, a line per shell, in `instructions`: the skill's
+/// scripts handle a file on the harness's side, which no tool can. Both
+/// work with `IGNIS_BASE_URL` unset, and with `IGNIS_API_KEY` unset (a server
+/// without a key ignores the header). The PowerShell form downloads to a file
+/// first, `s` beside the extracted skill: Windows PowerShell 5.1 pipes a
+/// native command's output as text, which would corrupt the archive. At 380
+/// bytes it is the ticket's whole share of the 1 KB; the guide's forms are
+/// the longer ones that clean up.
+const INSTALL: &str = r#"Skill (files) sh: d=~/.agents/skills;mkdir -p $d;curl -fsS -H "Authorization: Bearer $IGNIS_API_KEY" ${IGNIS_BASE_URL:-http://127.0.0.1:8000}/v1/connector/skill|tar xz -C $d
+ps: $u=$env:IGNIS_BASE_URL;if(!$u){$u='http://127.0.0.1:8000'};$d="$HOME/.agents/skills";md -f $d;curl.exe -fsS -H "Authorization: Bearer $env:IGNIS_API_KEY" -o $d/s $u/v1/connector/skill;tar xzf $d/s -C $d"#;
 
 /// The connector of one router (`api::router`): its MCP service, over the
 /// tools its document declares and the router their calls go through.
@@ -81,7 +97,7 @@ impl Connector {
 
 /// `instructions`, from what `tools` lists.
 fn instructions(_tools: &tools::Table) -> String {
-    ABOUT.to_owned()
+    format!("{ABOUT}\n{INSTALL}")
 }
 
 /// What every request's handler shares: built once per router.
@@ -134,6 +150,17 @@ impl ServerHandler for Mcp {
     }
 }
 
+/// The `404` of a connector that is off, the one answer both of its routes
+/// give.
+fn disabled() -> Response {
+    crate::api::error_response(
+        StatusCode::NOT_FOUND,
+        "invalid_request_error",
+        "connector_disabled",
+        "the connector is off on this server (connector.enabled is false)",
+    )
+}
+
 /// `POST /v1/mcp` — the connector's MCP server.
 #[utoipa::path(
     post,
@@ -161,12 +188,7 @@ pub(crate) async fn mcp(request: Request) -> Response {
     // `connector.enabled` is on; off, or in the router the connector's own
     // calls go through, there is none.
     let Some(connector) = request.extensions().get::<Connector>().cloned() else {
-        return crate::api::error_response(
-            StatusCode::NOT_FOUND,
-            "invalid_request_error",
-            "connector_disabled",
-            "the connector is off on this server (connector.enabled is false)",
-        );
+        return disabled();
     };
     let response = connector.service.oneshot(request).await.unwrap_or_else(|never| match never {});
     response.map(axum::body::Body::new).into_response()
@@ -180,5 +202,12 @@ mod tests {
     fn the_base_instructions_keep_within_their_share() {
         assert!(super::ABOUT.len() <= 200, "{} bytes", super::ABOUT.len());
         assert!(!super::ABOUT.lines().next().unwrap().is_empty());
+    }
+
+    /// Spec #656, ticket #662: the skill's two install forms keep within
+    /// their share of the 1 KB.
+    #[test]
+    fn the_skill_install_keeps_within_its_share() {
+        assert!(super::INSTALL.len() <= 380, "{} bytes", super::INSTALL.len());
     }
 }

@@ -4,10 +4,16 @@
 //!
 //! Writes `$OUT_DIR/playground_assets.rs`, an expression of type
 //! `playground::Assets` (`&[(path, include_bytes!(..))]`).
+//!
+//! Also packs the `ignis` skill (`connector/ignis`, always in the repo) into
+//! `$OUT_DIR/ignis-skill.tar.gz` for `connector::skill` (spec #656), through
+//! `skill_pack.rs`.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+mod skill_pack;
 
 fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -38,6 +44,17 @@ fn main() {
 
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     fs::write(out.join("playground_assets.rs"), table).expect("write playground_assets.rs");
+
+    // The skill: the directory and each file in it, so an edit, an added file
+    // or a removed one packs again.
+    let skill = manifest.join("../../connector").join(skill_pack::NAME);
+    println!("cargo:rerun-if-changed={}", skill.display());
+    println!("cargo:rerun-if-changed=skill_pack.rs");
+    for (name, _) in skill_pack::files(&skill) {
+        let below = name.strip_prefix(&format!("{}/", skill_pack::NAME)).expect("under the skill's name");
+        println!("cargo:rerun-if-changed={}", skill.join(below).display());
+    }
+    fs::write(out.join("ignis-skill.tar.gz"), skill_pack::pack(&skill)).expect("write ignis-skill.tar.gz");
 }
 
 /// Every file under `dir`, keyed by its `/`-separated path below the build

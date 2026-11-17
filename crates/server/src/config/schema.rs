@@ -1095,8 +1095,8 @@ config_group! {
     /// The connector (spec #656): the MCP server a coding agent's harness
     /// adds as one entry, at `/v1/mcp`, behind the same API key as `/v1`.
     ConnectorGroup = "connector" {
-        /// Serve the connector's MCP server at /v1/mcp. Off, the route
-        /// answers 404.
+        /// Serve the connector's MCP server at /v1/mcp and its skill at
+        /// /v1/connector/skill. Off, both routes answer 404.
         enabled: Bool = true, NO_RULE, ALL, [Visible];
         /// List the connector's tools that change the server (the
         /// configuration, a model download) beside those that read it. Not

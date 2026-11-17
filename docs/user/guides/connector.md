@@ -196,6 +196,80 @@ the server's own error JSON, exactly as a client would read it
 it. The connector never retries: the agent sees the server's state and
 decides.
 
+## The skill
+
+A file cannot go through MCP: a model writes a tool's arguments, so a file's
+bytes would pass through the model, and a server reading paths works only on
+the machine the harness runs on. So ignis serves a **skill** too, `ignis`: a
+`SKILL.md` and Node scripts that run in the harness's own shell, beside the
+files, and call ignis's existing routes. ignis touches no file, so it works the
+same with ignis local, on the LAN or behind a tunnel. From 0.11.0 the skill
+holds one script:
+
+| Script | What it does |
+|---|---|
+| `transcribe.mjs <audio> [--out file]` | Transcribes a recording through `POST /v1/audio/transcriptions` and prints the transcript, or writes it to `--out`. |
+
+The server serves the skill as one `tar.gz` at `GET /v1/connector/skill`, behind
+the key and, with `connector.enabled` off, a `404`. It is packed when the
+server is built, so it is always the skill that matches the server that gave
+it, and its bytes are the same on every request.
+
+### Install
+
+One command extracts it into `~/.agents/skills`, where opencode, qwen-code, pi
+and DeepSeek Harness read skills. Run it in the shell of the machine the
+harness runs on; it reads the two variables below, and with `IGNIS_BASE_URL`
+unset it uses a local server. On a server with no key the header is ignored.
+
+On Linux and macOS:
+
+```sh
+mkdir -p ~/.agents/skills
+curl -fsS -H "Authorization: Bearer $IGNIS_API_KEY" \
+  "${IGNIS_BASE_URL:-http://127.0.0.1:8000}/v1/connector/skill" \
+  | tar xz -C ~/.agents/skills
+```
+
+On Windows, in PowerShell:
+
+```powershell
+$base = $env:IGNIS_BASE_URL; if (!$base) { $base = 'http://127.0.0.1:8000' }
+$skills = "$HOME/.agents/skills"; $archive = "$env:TEMP/ignis-skill.tgz"
+New-Item -ItemType Directory -Force $skills | Out-Null
+curl.exe -fsS -H "Authorization: Bearer $env:IGNIS_API_KEY" -o $archive "$base/v1/connector/skill"
+tar xzf $archive -C $skills; Remove-Item $archive
+```
+
+The PowerShell form uses `curl.exe`, since `curl` is an alias of
+`Invoke-WebRequest` there, and downloads to a file before `tar` reads it:
+Windows PowerShell 5.1 passes a native command's output through a pipe as
+text, which would corrupt the archive. If another `tar` comes first in `PATH`
+than Windows's own (Git for Windows's, say, which reads `C:` as a host name),
+call `C:\Windows\System32\tar.exe`.
+
+The model gets the same two commands in the connector's `instructions`, a
+shorter form of each, so it can install the skill itself when a user hands it
+a file.
+
+### The environment
+
+| Variable | Default | What it does |
+|---|---|---|
+| `IGNIS_BASE_URL` | `http://127.0.0.1:8000` | Where ignis is: the server's LAN address or its tunnel's, as for the MCP entry. |
+| `IGNIS_API_KEY` | unset | The server's key, sent as `Authorization: Bearer` only when set. |
+
+A script exits non-zero on a failure. A missing file or an unreachable server
+is named in the message, and an error from ignis is printed as the JSON the
+server sent.
+
+### After an upgrade
+
+The scripts do not check the server's version: a skill from an older ignis
+calls the routes of that version. After upgrading the server, run the install
+command again; it replaces the files of the skill, and the folder always
+matches the server that gave it.
+
 ## The settings
 
 Two fields in the `connector` group ([every field](../reference/configuration.md)).
@@ -204,7 +278,7 @@ list depends on how the server started and an agent cannot change it.
 
 | Field | Default | What it does |
 |---|---|---|
-| `connector.enabled` | `true` | Serves the MCP server at `/v1/mcp`. Off, the route answers `404 connector_disabled`. |
+| `connector.enabled` | `true` | Serves the MCP server at `/v1/mcp` and the skill at `/v1/connector/skill`. Off, both routes answer `404 connector_disabled`. |
 | `connector.allow_changes` | `false` | Lists the tools that change the server (its configuration, a model download) beside those that read it. |
 
 `allow_changes` is not a security boundary. It keeps those tools out of the
