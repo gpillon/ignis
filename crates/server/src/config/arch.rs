@@ -545,26 +545,36 @@ pub fn prefill_linear_refusal(
 
 /// Whether a load of `family` on a card of `generation` publishes its
 /// generation opener's page by the prompt checkpoint's capture, as a
-/// pages-only link (ADR 0029 as amended 2026-10-07 and 2026-11-05, GitHub
-/// #306, #508): the one decision, which [`crate::runtime::EngineShape`] asks
-/// for the load's family and the card the start read.
+/// pages-only link (ADR 0029 as amended 2026-10-07, 2026-11-05 and
+/// 2026-11-17, GitHub #306, #508, #649): the one decision, which
+/// [`crate::runtime::EngineShape`] asks for the load's family and the card the
+/// start read.
 ///
 /// On, a reusable prompt is cut once, at the opener; off, twice, at the
 /// opener's page floor too, where its imaged prefix is published. Flash-Next
-/// rides on every card: its cut is a traversal that re-streams its experts.
-/// The 27B rides on Ampere and Ada, where a traversal of its trellis body
-/// decodes every matrix again and the cut costs clearly more than the ~19 ms
-/// it costs on the RTX 5090. On Blackwell, and with no card read, it keeps
-/// both cuts and the imaged prefix at the floor, its splits unchanged since
-/// #306. The image model and the diarizer capture nothing. A request whose
-/// image spans its opener's page floor lends the pages at its capture on any
-/// load (GitHub #249, `CaptureLink::ImageSpansFloor`).
-pub fn opener_page_rides_capture(family: ModelFamily, generation: Option<GpuGeneration>) -> bool {
+/// and the 27B ride on every card and with no card read: the second cut
+/// measured 45-55 ms per request on the RTX 5090. `second_tail_cut` (the
+/// contributor's `IGNIS_SECOND_TAIL_CUT=1`, read once by
+/// [`second_tail_cut_requested`]) restores main's behaviour for a comparison:
+/// the 27B then rides on Ampere and Ada only. The image model and the
+/// diarizer capture nothing. A request whose image spans its opener's page
+/// floor lends the pages at its capture on any load (GitHub #249,
+/// `CaptureLink::ImageSpansFloor`).
+pub fn opener_page_rides_capture(family: ModelFamily, generation: Option<GpuGeneration>, second_tail_cut: bool) -> bool {
     match family {
         ModelFamily::FlashNext => true,
-        ModelFamily::Qwen38_27b => matches!(generation, Some(GpuGeneration::Ampere | GpuGeneration::Ada)),
+        ModelFamily::Qwen38_27b => !second_tail_cut || matches!(generation, Some(GpuGeneration::Ampere | GpuGeneration::Ada)),
         ModelFamily::QwenImage21 | ModelFamily::Nemotron3Diarization => false,
     }
+}
+
+/// `IGNIS_SECOND_TAIL_CUT=1`: a contributor's measurement switch (GitHub
+/// #649) that gives the 27B on Blackwell its second tail cut back, main's
+/// behaviour before the single cut. Read once per process, where a load
+/// decides.
+pub fn second_tail_cut_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| std::env::var("IGNIS_SECOND_TAIL_CUT").is_ok_and(|value| value.starts_with('1')))
 }
 
 /// The solo widths an `auto` load of `family` on a card of `generation`
@@ -890,22 +900,27 @@ mod tests {
         assert_eq!(prefill_linear_refusal(PrefillLinear::Fp16, never, "--model-prefill-linear"), None);
     }
 
-    /// GitHub #508 (spec #503): the 27B's generation-opener page rides the
-    /// prompt checkpoint's capture on Ampere and Ada, and not on Blackwell nor
-    /// with no card read; Flash-Next's rides it on every card, as since #306;
-    /// the image model and the diarizer capture nothing.
+    /// GitHub #508, #649: the 27B's generation-opener page rides the prompt
+    /// checkpoint's capture on every card and with no card read, Blackwell
+    /// included; `IGNIS_SECOND_TAIL_CUT=1` gives main's behaviour back (Ampere
+    /// and Ada only); Flash-Next's rides it on every card, as since #306; the
+    /// image model and the diarizer capture nothing.
     #[test]
     fn the_opener_page_rides_the_capture_by_family_and_generation() {
         use GpuGeneration::*;
-        let qwen = |generation| opener_page_rides_capture(ModelFamily::Qwen38_27b, generation);
-        assert!(qwen(Some(Ampere)), "the 27B on Ampere: one cut, at the opener");
-        assert!(qwen(Some(Ada)), "the 27B on Ada: one cut, at the opener");
-        assert!(!qwen(Some(Blackwell)), "the 27B on Blackwell keeps its two cuts");
-        assert!(!qwen(None), "no card read: the 27B keeps its two cuts");
+        let qwen = |generation, second_cut| opener_page_rides_capture(ModelFamily::Qwen38_27b, generation, second_cut);
         for generation in [Some(Ampere), Some(Ada), Some(Blackwell), None] {
-            assert!(opener_page_rides_capture(ModelFamily::FlashNext, generation), "Flash-Next on {generation:?}");
-            for family in [ModelFamily::QwenImage21, ModelFamily::Nemotron3Diarization] {
-                assert!(!opener_page_rides_capture(family, generation), "{family:?} on {generation:?}");
+            assert!(qwen(generation, false), "the 27B on {generation:?}: one cut, at the opener");
+        }
+        assert!(qwen(Some(Ampere), true) && qwen(Some(Ada), true), "the switch leaves Ampere and Ada at one cut");
+        assert!(!qwen(Some(Blackwell), true), "the switch: the 27B on Blackwell cuts twice");
+        assert!(!qwen(None, true), "the switch, no card read: two cuts");
+        for second_cut in [false, true] {
+            for generation in [Some(Ampere), Some(Ada), Some(Blackwell), None] {
+                assert!(opener_page_rides_capture(ModelFamily::FlashNext, generation, second_cut), "Flash-Next on {generation:?}");
+                for family in [ModelFamily::QwenImage21, ModelFamily::Nemotron3Diarization] {
+                    assert!(!opener_page_rides_capture(family, generation, second_cut), "{family:?} on {generation:?}");
+                }
             }
         }
     }
