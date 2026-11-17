@@ -14,7 +14,9 @@
 // launchers (`launch_nvfp4_w4a4_quantize_for_products`, ops/linear/nvfp4/nvfp4_w4a4_plan.h, under a
 // recorded patch, ADR 0031) ask `k_tile_major` once per call, quantize in the layout it answers
 // and hand the same layout to the product, so a product always reads what its quantizer wrote;
-// the bytes it writes are the same in either.
+// the bytes it writes are the same in either. ignis's fused gate and up op
+// (kernel/src/prefill_swiglu.h) quantizes its own input with the stock quantizer and reads it
+// token-major whatever the load names.
 //
 // A load decides the layout once (`layout_for_load`) and names it for the stream its prefill runs
 // on (`ForStream`); a stream no load names reads K-tile-major, the default.
