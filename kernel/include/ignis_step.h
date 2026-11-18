@@ -519,6 +519,9 @@ struct ignis_program_stats {
    * graph, and for Flash-Next, which captures its own. */
   uint32_t decode_graph_nodes[IGNIS_DECODE_MAX_BATCH];
   uint32_t verify_graph_nodes[IGNIS_DECODE_MAX_BATCH];
+  /* GitHub #677: entry w-1 is how many of the decode graph's nodes for exact
+   * width w are copies; 0 where `decode_graph_nodes` is. */
+  uint32_t decode_graph_copy_nodes[IGNIS_DECODE_MAX_BATCH];
 };
 
 /* Captures one CUDA graph per exact decode batch width 1..the load's decode
@@ -535,8 +538,10 @@ struct ignis_program_stats {
  * call (every width's capture, sequentially) so the startup cost is
  * measured and reported, not assumed. Returns 0 unless `model` or `pool` is
  * null, or the measurement switch IGNIS_ROUND_TIMING names a value other
- * than `0` or `1` (in which case no width is attempted, `*out_ready_mask`
- * is left unset and ignis_decode_graph_last_error says why).
+ * than `0` or `1`, or IGNIS_DECODE_GRAPH_COPIES one other than `1`, or the
+ * device cannot say its generation (in which case no width is attempted,
+ * `*out_ready_mask` is left unset and ignis_decode_graph_last_error says
+ * why).
  *
  * P5-04 (GitHub #153): on a load with a draft window this call also
  * captures one *verify* graph per exact width at that window, after the
@@ -550,7 +555,13 @@ struct ignis_program_stats {
  * the earlier call captured and captures each width afresh. Each call reads
  * IGNIS_ROUND_TIMING: under `1` every replayed decode and verify round of
  * the 27B is timed on the GPU's clock (kernel/src/step.cu); Flash-Next's
- * rounds never are. */
+ * rounds never are.
+ *
+ * GitHub #677: each call decides, from the card and IGNIS_DECODE_GRAPH_COPIES,
+ * which widths' decode rounds run copy-free from then on, replayed or eager
+ * (kernel/src/decode_graph_copies.h): the width-1 round on a card of compute
+ * capability 12 unless the switch is `1`, main's copying round everywhere
+ * else. Flash-Next's graphs are its own. */
 int32_t ignis_decode_graph_capture(struct ignis_model *model, struct ignis_seq_pool *pool,
                                    uint64_t *out_capture_micros, uint32_t *out_ready_mask);
 

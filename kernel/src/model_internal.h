@@ -734,6 +734,15 @@ struct ignis_model {
   // GitHub #572: each captured graph's node count, 0 for a width not captured
   // (`ignis_program_stats`'s `decode_graph_nodes`).
   std::array<uint32_t, IGNIS_DECODE_MAX_BATCH> decode_graph_nodes{};
+  // GitHub #677: how many of those nodes are copies (`ignis_program_stats`'s
+  // `decode_graph_copy_nodes`).
+  std::array<uint32_t, IGNIS_DECODE_MAX_BATCH> decode_graph_copy_nodes{};
+  // GitHub #677 (spec #672): the decode widths whose traversal runs copy-free,
+  // bit w-1 (kernel/src/decode_graph_copies.h), as the latest
+  // `ignis_decode_graph_capture` decided them from the card and
+  // IGNIS_DECODE_GRAPH_COPIES; every round after it reads them, replayed or
+  // eager. None before a load's first capture: a round then runs main's.
+  uint32_t decode_copy_free_widths = 0;
   // Set by the most recent `ignis_program_decode` call: 1 if it replayed a
   // graph, 0 if it ran the eager loop (`ignis_program_stats`'s
   // `graph_launches`).

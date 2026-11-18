@@ -383,6 +383,11 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
 // `ssm_states` / `conv_states` span the whole pool (every slot, fixed
 // address) rather than one sequence's own view -- see layer_internal.h's
 // declaration and ADR 0019.
+//
+// GitHub #677: `in_residual == out_residual` is the copy-free form the
+// decode traversal asks for (kernel/src/decode_graph.cu): the layer adds into
+// its input in place, and at one column the recurrence reads q, k and v as
+// views of the conv plane. The bytes are main's either way.
 int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
                             uint32_t width, void *in_residual, void *out_residual,
                             uint32_t gdn_layer, LinearPolicyMode mode) {
@@ -467,9 +472,23 @@ int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
                                static_cast<std::size_t>(width) * kElemBytes,
                                static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, stream);
     };
-    cudaError_t err = copy_channel_range(0, qk_width, query);
-    if (err == cudaSuccess) { err = copy_channel_range(qk_width, qk_width, key); }
-    if (err == cudaSuccess) { err = copy_channel_range(2 * qk_width, value_width, value); }
+    // GitHub #677: in the copy-free form at one column the conv plane's q, k
+    // and v channel ranges are contiguous already, so the recurrence reads
+    // them in place: the bytes the copies would move.
+    const bool copy_free = in_residual == out_residual;
+    cudaError_t err = cudaSuccess;
+    if (copy_free && T == 1) {
+      auto *conv = static_cast<std::uint8_t *>(qkv_conv.data);
+      query = ninfer::Tensor(conv, ninfer::DType::BF16, {qk_width, T, 1, 1});
+      key = ninfer::Tensor(conv + static_cast<std::size_t>(qk_width) * kElemBytes, ninfer::DType::BF16,
+                           {qk_width, T, 1, 1});
+      value = ninfer::Tensor(conv + static_cast<std::size_t>(2 * qk_width) * kElemBytes, ninfer::DType::BF16,
+                             {value_width, T, 1, 1});
+    } else {
+      err = copy_channel_range(0, qk_width, query);
+      if (err == cudaSuccess) { err = copy_channel_range(qk_width, qk_width, key); }
+      if (err == cudaSuccess) { err = copy_channel_range(2 * qk_width, value_width, value); }
+    }
     if (err != cudaSuccess) {
       set_error(std::string("ignis_gdn_layer_graph: cudaMemcpy2DAsync(qkv split) failed: ") +
                 cudaGetErrorString(err));
@@ -500,12 +519,17 @@ int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
                                model->rms_norm_eps, gated_out, stream);
 
     ninfer::Tensor residual_view(out_residual, ninfer::DType::BF16, {hidden, T, 1, 1});
-    err = cudaMemcpyAsync(out_residual, in_residual, static_cast<std::size_t>(hidden) * T * 2,
-                          cudaMemcpyDeviceToDevice, stream);
-    if (err != cudaSuccess) {
-      set_error(std::string("ignis_gdn_layer_graph: cudaMemcpyAsync(residual) failed: ") +
-                cudaGetErrorString(err));
-      return -1;
+    // GitHub #677: in the copy-free form the input is the residual already
+    // (the input RMSNorm above was its only other reader), so only distinct
+    // buffers copy it.
+    if (!copy_free) {
+      err = cudaMemcpyAsync(out_residual, in_residual, static_cast<std::size_t>(hidden) * T * 2,
+                            cudaMemcpyDeviceToDevice, stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_gdn_layer_graph: cudaMemcpyAsync(residual) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
     }
     output_and_mlp(*model, w, gated, residual_view, post, fused, *model->decode_graph_scratch, mode, T,
                    stream);

@@ -170,6 +170,19 @@ the other. They are no configuration fields: `GET /v1/config` and
   tracer's. It is read at each capture of the decode graphs, once per load;
   unset, or `0`, nothing is timed and the rounds pay nothing. Any other value
   refuses the load, naming the variable. Flash-Next's rounds are never timed.
+- `IGNIS_DECODE_GRAPH_COPIES=1` (from 0.11.0) gives the 27B the one-lane
+  decode round of earlier releases, the comparison a measurement of the two
+  needs. Unset, an RTX 50 or RTX PRO card runs the one-lane round copy-free:
+  each layer adds its output into its input in place and each GDN layer reads
+  its q, k and v where the convolution wrote them, so the round's graph holds
+  no copy (677 nodes instead of 885 on the NVFP4 artifact with DFlash2); `1`
+  copies them as before. The tokens are the same either way (the round
+  identity test below, arm `decode-graph-copies`). Rounds of two or more
+  lanes, the verify round and an RTX 30 or RTX 40 card copy as before
+  whatever the variable says, and Flash-Next's rounds are its own. It is read
+  at each capture of the decode graphs, once per load; any other value
+  refuses the load, naming the variable. `ignis.runtime.decode_graph_capture`'s
+  `decode_nodes` shows which round each width captured.
 
 ### The round identity test
 

@@ -443,6 +443,15 @@ target_include_directories(ignis_kernel_hq_decode_attention_route_test PRIVATE $
 target_link_libraries(ignis_kernel_hq_decode_attention_route_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_hq_decode_attention_route_test COMMAND ignis_kernel_hq_decode_attention_route_test)
 
+# GitHub #677 (spec #672): OURS -- which decode rounds of the 27B run copy-free
+# (kernel/src/decode_graph_copies.h): the width-1 round on a card of compute
+# capability 12 unless IGNIS_DECODE_GRAPH_COPIES=1, main's on every other card
+# and at every other width, a bad value refused by name. Host-only.
+add_executable(ignis_kernel_decode_graph_copies_test test_decode_graph_copies.cpp)
+target_include_directories(ignis_kernel_decode_graph_copies_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_decode_graph_copies_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_decode_graph_copies_test COMMAND ignis_kernel_decode_graph_copies_test)
+
 # P4-04 (GitHub #122): OURS, not vendored -- the KV append path under both
 # storage formats. It builds two sequence pools differing only in
 # `ignis_seq_pool_spec::kv_format`, appends the same real fixture rows to a
