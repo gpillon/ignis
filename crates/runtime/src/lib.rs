@@ -145,28 +145,46 @@ impl ContextCharge {
 }
 
 /// What a 27B load leaves on the device beside the CUDA context once it is
-/// torn down (GitHub #324), which the plan charges as part of
-/// [`LOAD_RESIDUAL_BYTES`]. Read from the same WDDM counter as
-/// [`CUDA_CONTEXT_BYTES`], on the RTX 5090 (driver 610.88) on 2026-10-15, at
-/// the Makefile's 27B shape: an idle-unloaded server that has loaded the 27B
-/// holds 536,489,984 B (the same to the byte at every unload, an image model's
-/// in between included), one that has only loaded the image model holds
-/// 452,595,712 B, the context alone. Two parts, told apart by a run under
-/// `CUDA_MODULE_LOADING=EAGER`, which loads every module with the context (the
-/// image-only server then holds 72 MiB more):
+/// torn down (GitHub #324, #680): the plan charges it on a process's first 27B
+/// load inside [`LOAD_RESIDUAL_BYTES`], and a later load adds it back. Read
+/// from the same WDDM counter as [`CUDA_CONTEXT_BYTES`], on the RTX 5090 (driver
+/// 610.88) on 2026-10-15, at the Makefile's 27B shape, when every decode and
+/// verify graph still copied device to device: an idle-unloaded server that
+/// had loaded the 27B held 536,489,984 B (the same to the byte at every
+/// unload, an image model's in between included), one that had only loaded the
+/// image model 452,595,712 B, the context alone: 83,894,272 B of state. Three
+/// parts, the first told apart by a run under `CUDA_MODULE_LOADING=EAGER`,
+/// which loads every module with the context (the image-only server then holds
+/// 72 MiB more), the second by the measurement switch of #677 and #680:
 /// - 6 MiB + 8 KiB is module code: CUDA loads the 27B's kernels lazily, on
 ///   their first launch, and keeps them. Under eager loading this part is gone.
-/// - 74 MiB survives eager loading: state the driver sets up for this context
-///   on the 27B's first load and keeps for the context's life. What it is is
-///   not identified. It is not the stack reservation (the stack limit stays at
+/// - 24 MiB goes with the copy nodes of the decode and verify graphs: driver
+///   state those device-to-device copies set up for the context, kept after
+///   the teardown. On 2026-11-18, at `vram_reload_gpu`'s shape against a
+///   context measured at 452,161,536 B, the process held 536,485,888 B after
+///   the teardown under `IGNIS_DECODE_GRAPH_COPIES=1`, and with the copy-free
+///   graphs of compute capability 12.x 511,320,064 B, exactly 24 MiB less
+///   (513,417,216 B on another run).
+/// - 50 MiB survives eager loading and is not identified: state the driver
+///   sets up for this context on the 27B's first load and keeps for the
+///   context's life. It is not the stack reservation (the stack limit stays at
 ///   its 1 KiB default, and a probe kernel with a 512 B frame grows nothing),
 ///   the stream-ordered or graph memory pools (both reserve 0 after the
 ///   teardown, and trimming them frees nothing), freed small allocations or
 ///   pinned host mappings (the driver hands both back).
 ///
-/// The figure moves with the kernels a load runs: `vram_reload_gpu`'s shape
-/// leaves 81,793,024 B, and the build before #324's vision patch 4 KiB less.
-pub const QWEN27B_PROCESS_STATE_BYTES: u64 = 83_894_272;
+/// The constant is the copy-free graphs' state: the 2026-10-15 figure less the
+/// 24 MiB, derived, since the Makefile's shape was not read again; at
+/// `vram_reload_gpu`'s shape it adds back 430,080 B less than the process held
+/// at the lower reading. It is charged again on every card: where the graphs
+/// still copy (every card but compute capability 12.x, the RTX 30 and 40
+/// among them, and the measurement switch) the process holds 24 MiB more than
+/// it, and a reload adds back and plans on that much less than the card has,
+/// never more. The figure moves with the kernels a load runs:
+/// `vram_reload_gpu`'s shape left 2 MiB less of it than the Makefile's on
+/// 2026-10-15 and, with the copying graphs, as much to 4 KiB from #339 on;
+/// the build before #324's vision patch 4 KiB less.
+pub const QWEN27B_PROCESS_STATE_BYTES: u64 = 58_728_448;
 
 /// Set once a 27B load has run in this process (GitHub #324).
 static QWEN27B_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -299,8 +317,8 @@ pub fn plan_start(family: ignis_core::compute::ModelFamily) -> Result<(PlanStart
 
 /// What a load holds beyond every reservation the VRAM plan names (GitHub
 /// #210): allocator rounding, the decode graph captures, handles the kernel
-/// creates lazily, and on a process's first 27B load
-/// [`QWEN27B_PROCESS_STATE_BYTES`], which a later load adds back. Measured on
+/// creates lazily, and on a process's first 27B load its per-process state,
+/// which a later load adds back ([`QWEN27B_PROCESS_STATE_BYTES`]). Measured on
 /// the RTX 5090 on 2026-10-15 (GitHub #324) at the Makefile defaults (512K
 /// hq-e8-2b, YaRN 2, DFlash2/7): the server's WDDM dedicated usage right after
 /// load minus the context and every line the load allocates -- 123,684,272 B
@@ -316,6 +334,12 @@ pub fn plan_start(family: ignis_core::compute::ModelFamily) -> Result<(PlanStart
 /// fewer lanes (GitHub #336) captures fewer and charges the same figure: the
 /// line over-reserves there -- conservative, never short -- until a load at
 /// its own lanes is measured.
+///
+/// Measured with the copying decode and verify graphs, so the 27B's state in
+/// it is the 2026-10-15 figure, 24 MiB above the constant a reload adds back
+/// since the graphs of compute capability 12.x copy nothing (GitHub #680).
+/// Left as it is: a cold start there likely over-reserves by about that much,
+/// which is the safe side; the copy-free graphs' load was not measured.
 pub const LOAD_RESIDUAL_BYTES: u64 = 124_474_800;
 
 /// Device bytes a load holds beside its weights, line by line as the VRAM
@@ -2790,9 +2814,9 @@ mod tests {
     fn a_per_process_figure_below_what_the_plan_charges_again_is_added_back_whole() {
         use ignis_core::compute::ModelFamily::Qwen38_27b;
         // A 27B reload whose plan charges a measured context and the 27B's
-        // state again: 216,000,000 + 83,894,272 bytes, or at the constant
-        // 536,489,984, both above what the 5080 holds.
-        for context in [216_000_000, CUDA_CONTEXT_BYTES] {
+        // state again: 241,200,000 + 58,728,448 bytes, or at the constant
+        // 511,324,160, both above what the 5080 holds.
+        for context in [241_200_000, CUDA_CONTEXT_BYTES] {
             assert_eq!(
                 held_before_load(Qwen38_27b, measured(context), true, Some(RTX5080_HELD)),
                 ProcessHeld { bytes: RTX5080_HELD, source: HeldSource::PerProcess },
@@ -2806,7 +2830,7 @@ mod tests {
         use ignis_core::compute::ModelFamily::Qwen38_27b;
         assert_eq!(
             held_before_load(Qwen38_27b, measured(CONTEXT), true, Some(CONTEXT + STATE + (100 << 20))),
-            ProcessHeld { bytes: 603_164_672, source: HeldSource::PerProcess },
+            ProcessHeld { bytes: 577_998_848, source: HeldSource::PerProcess },
             "the measured context and the 27B's state, no more"
         );
     }
@@ -2815,7 +2839,7 @@ mod tests {
     fn without_a_per_process_figure_what_the_plan_charges_again_is_added_back() {
         use ignis_core::compute::ModelFamily::Qwen38_27b;
         let charged_again = |bytes| ProcessHeld { bytes, source: HeldSource::ChargedAgain };
-        assert_eq!(held_before_load(Qwen38_27b, measured(CONTEXT), true, None), charged_again(603_164_672));
+        assert_eq!(held_before_load(Qwen38_27b, measured(CONTEXT), true, None), charged_again(577_998_848));
         assert_eq!(
             held_before_load(Qwen38_27b, measured(CONTEXT), false, None),
             charged_again(CONTEXT),
@@ -2824,7 +2848,7 @@ mod tests {
         let fallback = Some(ContextCharge { bytes: CUDA_CONTEXT_BYTES, source: ContextSource::Fallback });
         assert_eq!(
             held_before_load(Qwen38_27b, fallback, true, None),
-            charged_again(536_489_984),
+            charged_again(511_324_160),
             "#324's two constants"
         );
         // A first load reads before its context exists: nothing is held.
@@ -2861,7 +2885,7 @@ mod tests {
         // The 27B, Flash-Next, then the 27B again.
         assert_eq!(
             held_before_load(Qwen38_27b, measured(CONTEXT), true, Some(CONTEXT + STATE + FLASH_NEXT_STATE)),
-            per_process(603_164_672)
+            per_process(577_998_848)
         );
     }
 }

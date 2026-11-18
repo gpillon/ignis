@@ -50,9 +50,10 @@ fn options() -> ignis_server::config::Config {
 }
 
 /// How much more than the process holds the add-back may be (GitHub #324):
-/// the 27B's per-process state moves with the kernels a load runs, and this
-/// test's shape leaves 2 MiB less of it than the Makefile's, which the
-/// constant is.
+/// the 27B's per-process state moves with the kernels a load runs: this
+/// test's shape left 2 MiB less of it than the Makefile's, which the constant
+/// was, on 2026-10-15, and with the copy-free decode graphs it reads 2 MiB
+/// apart from one run to the next (GitHub #680).
 #[cfg(windows)]
 const HELD_SLACK_BYTES: u64 = 16 << 20;
 

@@ -154,6 +154,7 @@ The texts differ between the builds, as expected: FP8 weights and yarn:3.5 move 
 - The gap left between rounds is about 250-260 us after a plain round and 537 us after a one-lane verify round. The plain round's deferred return is #669's.
 - **Inference.** Removing kernels alone buys nothing on this card (#679, and the 14-23 us launch): a fusion is worth building where the pass it removes holds the chain and the fused kernel does not take that time back.
 - The device-to-device copies of a plain width-1 round were worth 267 us, against the earlier estimates by their execution alone (about 0.5% of a verify round, [decode round anatomy](2026-09-18-decode-round-anatomy.md); 0.16%, [decode round host idle](2026-09-18-decode-round-host-idle.md)); in the verify graph, where those findings measured, their removal moved nothing beyond the spread. Both findings carry a dated note.
+- **Observed 2026-11-18 (#680).** The copy-free graphs also leave 24 MiB less per-process state after a 27B teardown (`vram_reload_gpu`'s process holds 511,320,064 B, 513,417,216 B on some runs, against 536,485,888 B under `IGNIS_DECODE_GRAPH_COPIES=1`), and the reload constant `QWEN27B_PROCESS_STATE_BYTES` moved with them, from 83,894,272 to 58,728,448 B.
 
 ## Limits and unknowns
 

@@ -2745,7 +2745,7 @@ mod tests {
     /// state is added back.
     const RELOAD_START: ignis_runtime::PlanStart = ignis_runtime::PlanStart {
         free_at_start_bytes: 30 << 30,
-        held: ignis_runtime::ProcessHeld { bytes: 603_164_672, source: ignis_runtime::HeldSource::ChargedAgain },
+        held: ignis_runtime::ProcessHeld { bytes: 577_998_848, source: ignis_runtime::HeldSource::ChargedAgain },
         context: ignis_runtime::ContextCharge { bytes: 519_270_400, source: ignis_runtime::ContextSource::Measured },
     };
 
@@ -3132,7 +3132,7 @@ mod tests {
         // GitHub #324: of which this process already held so much when NVML
         // read it; GitHub #604: a figure the plan charges again, there being
         // no per-process one, beside a context line that was measured.
-        assert_eq!(field("process_held_bytes"), 603_164_672u64);
+        assert_eq!(field("process_held_bytes"), 577_998_848u64);
         assert_eq!(field("process_held_source"), "charged_again");
         assert_eq!(field("cuda_context_bytes"), 519_270_400u64);
         assert_eq!(field("cuda_context_source"), "measured");
