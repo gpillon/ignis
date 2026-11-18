@@ -10,10 +10,11 @@
 
 use std::fmt;
 
-/// `--model-exception-weights`: `bf16` (the default, as stored) or `fp8`.
-/// FP8 is ~3% faster in prefill at the same 4K KLD, but moves two of the
-/// decision fixtures (finding 2026-10-21-the-bf16-exception-tensors-in-fp8),
-/// so it stays opt-in until the owner's call.
+/// How a load holds them: `bf16` (as stored) or `fp8`. The engine's
+/// default is `bf16`, so a load bound directly keeps the stored numerics
+/// unless it names FP8; the server's `model.exception_weights` is an
+/// [`ExceptionWeightsSetting`], `auto` by default, which its config
+/// resolution decides by the card (ADR 0103).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExceptionWeights {
     /// As the artifact stores them.
@@ -55,14 +56,62 @@ impl fmt::Display for ExceptionWeights {
     }
 }
 
+/// `--model-exception-weights` as configured (GitHub #682, ADR 0103):
+/// `auto`, the default, or the weights spelled out. The server's config
+/// resolution decides `auto` beside the card it reads: `fp8` on a card that
+/// runs the block-scaled FP8 MMA (compute capability 12.0), `bf16` on any
+/// other card and when no card is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExceptionWeightsSetting {
+    #[default]
+    Auto,
+    Fixed(ExceptionWeights),
+}
+
+impl ExceptionWeightsSetting {
+    /// The spellings `parse` accepts, canonical first.
+    pub const NAMES: [&'static str; 3] = ["auto", "bf16", "fp8"];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fixed(weights) => weights.as_str(),
+        }
+    }
+
+    /// Case-insensitive.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            other => ExceptionWeights::parse(other)
+                .map(Self::Fixed)
+                .map_err(|_| format!("unknown exception weights `{other}` (expected `auto`, `bf16` or `fp8`)")),
+        }
+    }
+}
+
+impl fmt::Display for ExceptionWeightsSetting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The engine's default stays `bf16` (GitHub #682): `auto` is the
+    /// configured setting's default, which the server resolves.
     #[test]
-    fn bf16_is_the_default() {
+    fn bf16_is_the_engines_default_and_auto_the_settings() {
         assert_eq!(ExceptionWeights::default(), ExceptionWeights::Bf16);
         assert!(!ExceptionWeights::Bf16.is_fp8() && ExceptionWeights::Fp8.is_fp8());
+        assert_eq!(ExceptionWeightsSetting::default(), ExceptionWeightsSetting::Auto);
+        for name in ExceptionWeightsSetting::NAMES {
+            assert_eq!(ExceptionWeightsSetting::parse(name).map(ExceptionWeightsSetting::as_str), Ok(name));
+        }
+        assert_eq!(ExceptionWeightsSetting::parse("FP8"), Ok(ExceptionWeightsSetting::Fixed(ExceptionWeights::Fp8)));
+        assert!(ExceptionWeightsSetting::parse("nvfp4").unwrap_err().contains("`auto`, `bf16` or `fp8`"));
     }
 
     #[test]

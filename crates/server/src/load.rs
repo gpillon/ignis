@@ -533,7 +533,9 @@ fn serve_vision(
 /// resolution's ([`EngineShape::from`]), its vision encoder
 /// sized for the processor's item bound (`vision_item_bound`), and -- spec
 /// 27b-16gb/04 AC 5 -- a drafter's head left to `auto` says what it
-/// resolved to (`ignis.runtime.draft_head`, ADR 0063), once per load.
+/// resolved to (`ignis.runtime.draft_head`, ADR 0063), once per load; a 27B
+/// load says which exception weights it holds and where their setting came
+/// from (`ignis.runtime.exception_weights`, ADR 0103).
 pub fn load_shape(config: &crate::config::Config, vision_item_bound: Option<u64>) -> EngineShape {
     let shape = EngineShape::from(config);
     // The encoder holds one item at a time, and the processor bounds an item
@@ -555,6 +557,13 @@ pub fn load_shape(config: &crate::config::Config, vision_item_bound: Option<u64>
         .filter(|s| !the_27bs_mtp(s) && config.settings().spec.draft_head.is_some_and(|head| head.is_auto()))
     {
         crate::runtime::log_draft_head_auto(speculation.proposal_head());
+    }
+    // GitHub #682 (ADR 0103): what the 27B holds its exception tensors as,
+    // the setting that resolved to it, and where the setting came from.
+    if config.basis.family() == Some(ModelFamily::Qwen38_27b) {
+        let origin = config.basis.resolution().origin("model", "exception_weights");
+        let origin = origin.map_or(crate::config::source::Source::Default, |origin| origin.source);
+        crate::runtime::log_exception_weights(shape.exception_weights, config.settings().model.exception_weights, origin.as_str());
     }
     shape
 }

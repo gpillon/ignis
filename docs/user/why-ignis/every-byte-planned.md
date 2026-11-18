@@ -77,6 +77,7 @@ The budget, line by line, and why a refusal beats a run:
 | Prefill attention without prompt planes: 1,020,474,240 bytes less at 524K tokens | RTX 5090 | [Prefill attention without prompt planes](../../findings/2026-10-21-prefill-attention-without-prompt-planes.md) |
 | Token embedding in host memory: 1.35 GB of VRAM for about 146K more KV tokens, at -0.15% to -0.7% cold prefill (14K-105K) | RTX 5090 | [Token embedding in host memory](../../findings/2026-10-21-token-embedding-in-host-memory.md) |
 | The 5090 profile's 27B context 786,432 up to 917,504 with vision and DFlash2 on: KV pool 944,832 tokens; 950,272 refused by 59 MB, 1,048,576 refused 1.07 GB short | the plan raised until it refused | [Prefill attention without prompt planes](../../findings/2026-10-21-prefill-attention-without-prompt-planes.md) |
+| From 0.11.0, the FP8 exception weights leave the KV pool 534.6 MB more: 917,504 tokens held unadapted with about 29.86 GB free at start, against about 30.39 GB with BF16, which adapted to 786,432 with 29.95 GB free | RTX 5090, `rtx5090` profile, no config file, 2026-11-18 | [ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md) |
 | At a 1 GiB headroom Flash-Next decoded at 4.6 tok/s and the 27B at about 40 tok/s while a browser drew; at 1.5 GiB neither moved | Windows, RTX 5090 | [Headroom and WDDM paging](../../findings/2026-10-09-vram-headroom-wddm-paging.md) |
 
 :::note[Re-measure before you restate]

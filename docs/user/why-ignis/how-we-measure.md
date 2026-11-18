@@ -80,9 +80,12 @@ what ignis does:
   more acceptance than it saves, so the full head is the default and the
   shortlist is opt-in ([`spec.draft_head`](../reference/configuration.md#specdraft_head)).
 - **FP8 for the exception tensors.** It frees 0.53 GB and adds 3% to cold prefill
-  with KLD unchanged, but two decision fixtures move, so it is opt-in
-  ([`model.exception_weights`](../reference/configuration.md#modelexception_weights);
-  [the finding](../../findings/2026-10-21-the-bf16-exception-tensors-in-fp8.md)).
+  with KLD unchanged, but two decision fixtures moved, so it stayed opt-in
+  ([the finding](../../findings/2026-10-21-the-bf16-exception-tensors-in-fp8.md)).
+  Measured again, those two reads proved a coin in both encodings, and from
+  0.11.0 FP8 is the default on the RTX 50 and RTX PRO cards, admitted by the
+  KLD gate ([`model.exception_weights`](../reference/configuration.md#modelexception_weights);
+  [ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
 
 ## Where the kernels come from
 

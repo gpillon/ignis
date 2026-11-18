@@ -1,14 +1,15 @@
 # The 27B's BF16 exception tensors in FP8: −0.53 GB, +3% cold prefill, KLD unchanged, but two decision fixtures move
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-21
 - Last verified: 2026-10-21
 - Scope: kernel / the FP8 arms of `attn_input_proj` and `linear_add` (W8A8 grouped GEMM with a residual epilogue, the FP8 linear's GEMV and tensor-core routes), the row quantizer; artifact / FP8 conversion at load (binder, materializer); serving / the 27B's VRAM plan, cold prefill, decode, a decoding lane's pauses, load time, 4K KLD on the RTX 5090 (PCIe Gen 3)
 - Topic: artifacts-and-gates
 - Related: GitHub #341 (spec [prefill-5090/01](../specs/prefill-5090/01-the-prefill-fixed-part.md), lever 1), [ADR 0065](../adr/0065-the-bf16-exception-tensors-can-be-held-in-fp8.md), [the prefill chunk at 2,048](2026-10-21-the-27b-prefill-chunk-at-2048.md) (the same session's method, the baseline width), [image model kernels](2026-10-13-image-model-kernels-on-the-5090.md) (the W8A8 GEMM), `.scratch/341/`
 - Superseded by: none
-- Summary: Held in FP8 row-scale and converted at load, the 27B's nine BF16 exception matrices free 534.6 MB of VRAM and speed cold prefill 2.8-4.1% at the same 4K KLD (0.0490 against 0.0492), but two decision fixtures move, so FP8 stays opt-in.
+- Corrected by: [ADR 0103](../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md), [the decide regression sets under both exception weights](2026-11-18-the-decide-regression-sets-under-both-exception-weights.md)
+- Summary: Held in FP8 row-scale and converted at load, the 27B's nine BF16 exception matrices free 534.6 MB and speed cold prefill 2.8-4.1% at the same 4K KLD; the two fixture reads that kept FP8 opt-in proved a coin, and FP8 is the default on 12.0.
 
 ## Question
 
@@ -153,6 +154,13 @@ Inferred:
   +0.9 → −3.1), so a single case crossing its threshold is within what the engine's numerics do; the scalar's sign,
   read at 0.0001 uncertainty in BF16 and lost under both FP8 forms, is the one that looks like the weights' own error
   (2.6% against BF16's ~0.4%, E4M3's three mantissa bits: no scale choice reduces it).
+
+  > **Corrected 2026-11-18 (#682).** Read over 17 deterministic routes (the rope table, the GDN prefill, the prompt
+  > attention band, prompt reuse) on 2026-11-17 (#667), the balance's sign is a coin in BF16 too: BF16 reads it right
+  > on 2 of 9 routes and wrong at its served shape. On #675's fourteen arms BF16 reads it right on 3 of 7 and FP8 on
+  > none, both wrong at their served shapes. A sign BF16 misses where it is served is no criterion for the weights,
+  > and the set now prints it as a watch line
+  > ([the regression sets re-registered](2026-11-18-the-decide-regression-sets-under-both-exception-weights.md), [ADR 0103](../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
 - Decode rounds read 0.53 GB less but take as long: the nine are ~3% of a round's bytes, and the FP8 GEMV is not
   faster than the vendored BF16 decode kernels at that share. Not profiled.
 - Per-token E4M3 activations suffice here (no outlier rows, KLD unchanged); block-scaled activations are not needed.
@@ -162,6 +170,10 @@ Inferred:
 - **FP8 is an option, not the default** (`model.exception_weights`, `bf16` by default; ADR 0065 proposed): it is
   faster, smaller and KLD-equal, but it fails two pre-registered decision fixtures, which is the owner's call, not the
   agent's. The artifact does not change either way.
+
+  > **Corrected 2026-11-18 (#682).** FP8 is the default from 0.11.0 on a card of compute capability 12.0
+  > (`model.exception_weights: auto`, `bf16` elsewhere), once ADR 0082's KLD leg at the served shapes admitted it and
+  > the two regression sets were re-registered on arms that name their weights ([ADR 0103](../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
 - **AC 2's fixed part, with the chunk and FP8 levers**: from this session's FP8 legs less #335's attention (~21 / ~45 µs
   at 46K / 105K), ~77 / ~76 µs per token, under the ≤ 85 target at long context; at 8K, the warm-up, ~103.
 - **The 917,504 profile is refused today with either encoding**: it depends on ~0.5 GB of desktop VRAM that moved
@@ -186,6 +198,9 @@ Inferred:
 ## Follow-ups
 
 - Owner: FP8 as the default (and the two fixtures re-registered), or opt-in as built; accept or amend ADR 0065.
+
+  > **Corrected 2026-11-18 (#682).** Decided on 2026-11-17 (#667): FP8 by default where the card runs it, after the
+  > fixtures' re-registration ([ADR 0103](../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
 - The bisection (above) finds no single matrix: a decision on the default is one on how much this fixture's
   knife-edge weighs against +3% prefill, not a choice of which matrices to convert.
 - The 917,504 profile's margin against the desktop (with the chunk lever's finding).

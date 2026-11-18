@@ -97,7 +97,14 @@ a start will use before it runs.
 
 On the RTX 5090 profile the 27B's 917,504-token context fits with vision and
 DFlash2 on, and 950,272 is refused by 59 MB
-([finding](../../findings/2026-10-21-prefill-attention-without-prompt-planes.md)).
+([finding](../../findings/2026-10-21-prefill-attention-without-prompt-planes.md)),
+when the card has enough free at start. From 0.11.0 the 27B holds its exception
+tensors in FP8 on the RTX 50 and RTX PRO cards
+([`model.exception_weights`](../reference/configuration.md#modelexception_weights)), 534.6 MB less than BF16 that the KV pool
+takes: 917,504 tokens fit unadapted with about 29.86 GB free at start, where
+BF16 needs about 30.39 GB. With 29.95 GB free (2026-11-18, the desktop holding
+the rest) the FP8 load kept 917,504 tokens, 77 MB over the context, and a BF16
+one adapted to 786,432 ([ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
 That is the plan working as intended: the context is sized to the card, not
 guessed.
 

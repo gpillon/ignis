@@ -150,7 +150,7 @@ pub use kv_format::{
     KvPlaneSpec, KvPoolPlan, auto_kv_pool_bytes, plan_kv_pool, plan_kv_pool_for_context,
 };
 pub use mock::{FakeDisk, MockCompute, MockSections};
-pub use exception_weights::ExceptionWeights;
+pub use exception_weights::{ExceptionWeights, ExceptionWeightsSetting};
 pub use prefill_attention::{GdnPrefill, PrefillAttention, PrefillLinear, PrefillSwiglu, W4a4ActivationLayout};
 pub use decode_attention::HqDecodeAttention;
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};

@@ -111,6 +111,14 @@ f64 oracle. They must use the helper above rather than reinventing a
 self-skip. The GPU-side coverage also includes the kernel leaf's own op-test
 executable (`kernel/build.ps1 -Test`), which the same runbook applies to.
 
+A 27B GPU test that holds a recorded number or text names its exception
+weights (ADR 0103). A direct bind keeps the engine's `bf16` unless it names
+FP8, but a config resolved through `config::resolve` or `resolve_with` reads
+an injected RTX 5090, where `model.exception_weights: auto` is `fp8`; such a
+test passes `--model-exception-weights`, as the decide sets' arms do. A
+trellis artifact holds no BF16 exception tensor, so there the setting moves
+nothing.
+
 ### Running the profile: `scripts/gpu-profile.ps1`
 
 ADR 0006 calls the guard "a preflight check in the `bench`/test harness",

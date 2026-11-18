@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use ignis_core::image::ImageSize;
 use ignis_core::ngram_cache::CacheLocation;
 use ignis_core::ngram_table::HotBudget;
-use ignis_core::{DraftRule, ExceptionWeights, KvFormat, KvPoolSize, PrefillAttention, PrefillLinear, ProposalHeadSetting, RopeSetting, SpeculativeBackend, VisionResidency};
+use ignis_core::{DraftRule, ExceptionWeightsSetting, KvFormat, KvPoolSize, PrefillAttention, PrefillLinear, ProposalHeadSetting, RopeSetting, SpeculativeBackend, VisionResidency};
 use serde_json::Value;
 
 use super::{ApiKey, ApiKeySetting, Expose, SoloWidth, SpecChoice};
@@ -634,18 +634,19 @@ impl FieldKind for PrefillLinearKind {
     }
 }
 
-/// How the 27B holds its BF16 exception tensors (GitHub #341): `bf16` or `fp8`.
+/// How the 27B holds its BF16 exception tensors (GitHub #341, #682): `auto`,
+/// `bf16` or `fp8`.
 pub struct ExceptionWeightsKind;
 
 impl FieldKind for ExceptionWeightsKind {
-    type Value = ExceptionWeights;
+    type Value = ExceptionWeightsSetting;
     const TAG: &'static str = "exception weights";
 
-    fn parse(raw: &str) -> Result<ExceptionWeights, String> {
-        ExceptionWeights::parse(raw)
+    fn parse(raw: &str) -> Result<ExceptionWeightsSetting, String> {
+        ExceptionWeightsSetting::parse(raw)
     }
 
-    fn render(value: &ExceptionWeights) -> Value {
+    fn render(value: &ExceptionWeightsSetting) -> Value {
         Value::String(value.as_str().to_owned())
     }
 }
@@ -1233,7 +1234,8 @@ mod tests {
         assert_eq!(PrefillAttentionKind::parse("8bit"), Ok(PrefillAttention::Fp8));
         assert_eq!(PrefillLinearKind::parse("INT8"), Ok(PrefillLinear::Int8));
         assert!(PrefillLinearKind::parse("fp8").unwrap_err().contains("int8"));
-        assert_eq!(ExceptionWeightsKind::parse("FP8"), Ok(ExceptionWeights::Fp8));
+        assert_eq!(ExceptionWeightsKind::parse("FP8"), Ok(ExceptionWeightsSetting::Fixed(ignis_core::ExceptionWeights::Fp8)));
+        assert_eq!(ExceptionWeightsKind::parse("Auto"), Ok(ExceptionWeightsSetting::Auto));
         assert!(ExceptionWeightsKind::parse("nvfp4").unwrap_err().contains("bf16"));
         assert_eq!(Effort::parse("LOW"), Ok(ReasoningEffort::Low));
         assert!(Effort::parse("nonsense").unwrap_err().contains("xhigh"));
@@ -1252,7 +1254,8 @@ mod tests {
         round_trips::<PrefillAttentionKind>(PrefillAttention::Fp16);
         round_trips::<PrefillAttentionKind>(PrefillAttention::Int8);
         round_trips::<PrefillLinearKind>(PrefillLinear::Int8);
-        round_trips::<ExceptionWeightsKind>(ExceptionWeights::Fp8);
+        round_trips::<ExceptionWeightsKind>(ExceptionWeightsSetting::Fixed(ignis_core::ExceptionWeights::Fp8));
+        round_trips::<ExceptionWeightsKind>(ExceptionWeightsSetting::Auto);
         round_trips::<SpecBackend>(SpecChoice::Off);
         round_trips::<DeveloperPolicy>(DeveloperMessagePolicy::IntoSystem);
         round_trips::<TimeoutReplyKind>(crate::deadline::TimeoutReply::Error);
