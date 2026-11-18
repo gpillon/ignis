@@ -17,7 +17,9 @@
 //! the chunk so the chunks are the ones a whole-window prefill cuts.
 //! `IGNIS_MODEL_EXCEPTION_WEIGHTS=fp8`, the server's own variable for
 //! `--model-exception-weights`, holds the BF16 exception tensors in FP8
-//! (GitHub #341); unset, they are held as stored, as the server's default.
+//! (GitHub #341); unset, they are held as stored, the engine's default (the
+//! server's `auto` is `fp8` on compute capability 12.0, ADR 0103), and a
+//! KLD leg names them either way.
 //! `IGNIS_MODEL_PREFILL_ATTENTION=fp16`, the server's own variable for
 //! `--model-prefill-attention`, prefills on the FP16 band (GitHub #335): the
 //! band a card below compute capability 12.0 runs, where the 8-bit band traps
@@ -25,6 +27,14 @@
 //! `IGNIS_MODEL_PREFILL_LINEAR=int8`, the variable of `--model-prefill-linear`,
 //! prefills the trellis body on the dense prefill (GitHub #509); unset, the
 //! fused prefill, the default. An NVFP4 artifact refuses `int8` at load.
+//! `IGNIS_MODEL_MAX_CONTEXT`, the variable of `--model-max-context`, is the
+//! context the model and the window's pool are loaded at (GitHub #682: a
+//! served shape's, 917,504 on the RTX 5090); unset, the longest window and
+//! one page. `IGNIS_MODEL_ROPE_SCALING`, the variable of
+//! `--model-rope-scaling`, is the rotary table: `auto`, the default, decides
+//! it from that context as a served load does (no scaling up to 262,144,
+//! YaRN at `context / 262,144` past it), or a table spelled out (`none`,
+//! `yarn:3`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -33,7 +43,7 @@ use ignis_artifact::{CudaDevice, ModelScope, VisionResidency, Reader, bind_model
 use ignis_core::{ExceptionWeights, KvFormat};
 use ignis_core::compute::ModelConfig;
 use ignis_core::model_load::load_qwen38_27b_with_decode_lanes;
-use ignis_core::rope_scaling::RopeScaling;
+use ignis_core::rope_scaling::RopeSetting;
 use ignis_core::{PrefillAttention, PrefillLinear};
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step::{prefill_program, prefill_program_span_logits};
@@ -61,7 +71,15 @@ fn main() {
     let out_dir = PathBuf::from(&args[4]);
     std::fs::create_dir_all(&out_dir).unwrap_or_else(|e| panic!("create {}: {e}", out_dir.display()));
     let longest = windows.iter().map(Vec::len).max().unwrap_or(0) as u32;
-    let max_context = longest.div_ceil(64) * 64 + 64;
+    let max_context = std::env::var("IGNIS_MODEL_MAX_CONTEXT")
+        .map_or(Ok(longest.div_ceil(64) * 64 + 64), |v| v.parse::<u32>())
+        .unwrap_or_else(|e| panic!("IGNIS_MODEL_MAX_CONTEXT: {e}"));
+    assert!(max_context >= longest, "IGNIS_MODEL_MAX_CONTEXT {max_context} is shorter than the longest window, {longest}");
+    let rope_scaling = std::env::var("IGNIS_MODEL_ROPE_SCALING")
+        .map_or(Ok(RopeSetting::Auto), |v| RopeSetting::parse(&v))
+        .and_then(|setting| setting.resolve(max_context))
+        .unwrap_or_else(|e| panic!("IGNIS_MODEL_ROPE_SCALING: {e}"));
+    eprintln!("context: {max_context}, rope scaling: {rope_scaling}");
 
     let reader = Reader::open(Path::new(&args[1])).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let exceptions = std::env::var("IGNIS_MODEL_EXCEPTION_WEIGHTS")
@@ -89,7 +107,7 @@ fn main() {
         kv_format,
         None,
         None,
-        RopeScaling::NONE,
+        rope_scaling,
         prefill_attention,
         prefill_linear,
         ignis_core::N_DECODE_LANES as u32,

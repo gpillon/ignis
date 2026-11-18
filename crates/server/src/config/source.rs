@@ -71,6 +71,20 @@ impl Source {
     pub fn explicit(self) -> bool {
         matches!(self, Source::Patch | Source::Flag | Source::Env | Source::File)
     }
+
+    /// As a load's log line names it: `patch`, `flag`, `env`, `file`,
+    /// `card`, `profile`, `default`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Patch => "patch",
+            Source::Flag => "flag",
+            Source::Env => "env",
+            Source::File => "file",
+            Source::Card => "card",
+            Source::Profile => "profile",
+            Source::Default => "default",
+        }
+    }
 }
 
 /// Where a resolved value came from: the source, and the exact spelling the
@@ -943,9 +957,9 @@ mod tests {
     #[test]
     fn an_explicit_default_is_neither_refused_nor_named() {
         let weights = field("model", "exception_weights").unwrap();
-        let sources = Sources { file: layer(weights, &[(None, "bf16")]), ..Sources::default() };
+        let sources = Sources { file: layer(weights, &[(None, "auto")]), ..Sources::default() };
         let flash = resolve_settings(&sources, Some(ModelFamily::FlashNext), Fit::Start).unwrap();
-        assert!(flash.settings.model.exception_weights == ignis_core::ExceptionWeights::default() && flash.dropped.is_empty());
+        assert!(flash.settings.model.exception_weights == ignis_core::ExceptionWeightsSetting::default() && flash.dropped.is_empty());
         assert!(!flash.explicit("model", "exception_weights"));
         assert_eq!(flash.origin("model", "exception_weights").map(|o| o.source), Some(Source::File), "its origin is still known");
         let fp8 = Sources { file: layer(weights, &[(None, "fp8")]), ..Sources::default() };

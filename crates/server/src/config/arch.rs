@@ -11,7 +11,7 @@
 use std::fmt;
 
 use ignis_core::compute::ModelFamily;
-use ignis_core::{ExceptionWeights, PrefillAttention, PrefillLinear};
+use ignis_core::{ExceptionWeights, ExceptionWeightsSetting, PrefillAttention, PrefillLinear};
 
 use super::profile::CardReading;
 use super::source::{Origin, Source};
@@ -621,14 +621,21 @@ pub fn solo_ladder(family: ModelFamily, generation: Option<GpuGeneration>) -> &'
 }
 
 /// The 27B's BF16 exception tensors on `card` (`--model-exception-weights`,
-/// GitHub #456): held in FP8, they prefill on the W8A8 GEMM, the sm_120a
-/// set's block-scaled FP8 MMA, so on a card that does not run it `fp8` is
-/// refused, naming `spelled`; `bf16`, the default, runs everywhere.
+/// GitHub #456, #682, ADR 0103): held in FP8, they prefill on the W8A8 GEMM,
+/// the sm_120a set's block-scaled FP8 MMA. `auto`, the default, is `fp8` on
+/// a card read that runs it and `bf16` on any other card and when no card is
+/// read; a named `bf16` runs everywhere; a named `fp8` on a card that does
+/// not run it is refused, naming `spelled`.
 pub fn exception_weights(
-    resolved: ExceptionWeights,
+    setting: ExceptionWeightsSetting,
     card: Option<&CardReading>,
     spelled: &str,
 ) -> Result<ExceptionWeights, String> {
+    let resolved = match setting {
+        ExceptionWeightsSetting::Auto if card.is_some_and(|card| runs_sm120a(Some(card))) => return Ok(ExceptionWeights::Fp8),
+        ExceptionWeightsSetting::Auto => return Ok(ExceptionWeights::Bf16),
+        ExceptionWeightsSetting::Fixed(weights) => weights,
+    };
     match card {
         Some(card) if resolved.is_fp8() && !runs_sm120a(Some(card)) => Err(format!(
             "`{spelled} fp8` prefills the exception tensors on the block-scaled FP8 tensor cores, which compute capability 12.0 has and the card, {} ({}), does not: leave it `bf16`",
@@ -734,6 +741,10 @@ mod tests {
         card("NVIDIA GeForce RTX 3090", cc(8, 6), "86;120a")
     }
 
+    fn ada() -> CardReading {
+        card("NVIDIA GeForce RTX 4090", cc(8, 9), "86;120a")
+    }
+
     fn blackwell() -> CardReading {
         card("NVIDIA GeForce RTX 5090", cc(12, 0), "86;120a")
     }
@@ -786,17 +797,38 @@ mod tests {
         }
     }
 
-    /// FP8 exception tensors need the W8A8 GEMM: refused on an Ampere card,
-    /// by the spelling that named them; BF16 runs everywhere.
+    /// FP8 exception tensors need the W8A8 GEMM: a named `fp8` is refused on
+    /// an Ampere and an Ada card, by the spelling that named it; a named
+    /// `bf16` runs everywhere.
     #[test]
     fn fp8_exception_weights_are_refused_on_a_card_without_the_w8a8_gemm() {
         let (fp8, bf16) = (ExceptionWeights::Fp8, ExceptionWeights::Bf16);
+        let named = ExceptionWeightsSetting::Fixed;
         let flag = "--model-exception-weights";
-        let refused = exception_weights(fp8, Some(&ampere()), flag).unwrap_err();
+        let refused = exception_weights(named(fp8), Some(&ampere()), flag).unwrap_err();
         assert!(refused.contains("`--model-exception-weights fp8`") && refused.contains("(8.6)"), "{refused}");
-        assert_eq!(exception_weights(bf16, Some(&ampere()), flag), Ok(bf16));
-        assert_eq!(exception_weights(fp8, Some(&blackwell()), flag), Ok(fp8));
-        assert_eq!(exception_weights(fp8, None, flag), Ok(fp8));
+        let refused = exception_weights(named(fp8), Some(&ada()), flag).unwrap_err();
+        assert!(refused.contains("NVIDIA GeForce RTX 4090 (8.9)"), "{refused}");
+        assert_eq!(exception_weights(named(fp8), Some(&blackwell()), flag), Ok(fp8));
+        assert_eq!(exception_weights(named(fp8), None, flag), Ok(fp8));
+        for card in [Some(ampere()), Some(ada()), Some(blackwell()), None] {
+            assert_eq!(exception_weights(named(bf16), card.as_ref(), flag), Ok(bf16), "{card:?}");
+        }
+    }
+
+    /// GitHub #682 (ADR 0103): `auto` holds the exception tensors in FP8 on
+    /// compute capability 12.0, the RTX 50 and RTX PRO cards, and as stored
+    /// on an Ampere or an Ada card and when no card is read.
+    #[test]
+    fn auto_exception_weights_are_fp8_on_compute_capability_12_0_alone() {
+        let flag = "--model-exception-weights";
+        let pro = card("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", cc(12, 0), "120a");
+        for card in [blackwell(), pro] {
+            assert_eq!(exception_weights(ExceptionWeightsSetting::Auto, Some(&card), flag), Ok(ExceptionWeights::Fp8), "{}", card.name);
+        }
+        for card in [Some(ampere()), Some(ada()), None] {
+            assert_eq!(exception_weights(ExceptionWeightsSetting::Auto, card.as_ref(), flag), Ok(ExceptionWeights::Bf16), "{card:?}");
+        }
     }
 
     /// The loads with no route on an Ampere card are refused before they

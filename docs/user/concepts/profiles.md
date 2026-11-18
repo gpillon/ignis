@@ -90,7 +90,13 @@ Why each:
   the `auto` rope scaling applies YaRN at `context / 262,144`: a factor of 3.5 for
   the 27B and 2.25 for Flash-Next
   ([ADR 0057](../../adr/0057-rope-scaling-is-auto-by-default.md),
-  [ADR 0059](../../adr/0059-flash-next-applies-yarn-on-q-and-k.md)).
+  [ADR 0059](../../adr/0059-flash-next-applies-yarn-on-q-and-k.md)). From 0.11.0
+  the 27B holds its exception tensors in FP8 here
+  ([`model.exception_weights`](../reference/configuration.md#modelexception_weights)),
+  which leaves the KV pool 534.6 MB more: the 917,504 tokens hold unadapted
+  with at least 28,483 MiB free at start, against 28,993 MiB with BF16, and on
+  2026-11-18, with 28,549 MiB free, BF16 adapted to 786,432 tokens and yarn:3
+  while FP8 kept them ([ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
 - **The vision tower and pool in host RAM.** The 5090 stages the 296 MB tower
   for each image and maps the embedding pool in pinned host RAM, so a vision
   load keeps the KV pool of a text-only one ([Vision](../configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live)).

@@ -668,6 +668,24 @@ pub fn log_draft_head_auto(head: ignis_core::ProposalHead) {
     );
 }
 
+/// A 27B load's exception weights (GitHub #682, ADR 0103): the ones it holds,
+/// the setting they resolved from (`auto`, `bf16`, `fp8`) and where that
+/// setting came from (`default`, `profile`, `file`, `env`, `flag`, `patch`).
+pub fn log_exception_weights(
+    weights: ignis_core::ExceptionWeights,
+    setting: ignis_core::ExceptionWeightsSetting,
+    origin: &str,
+) {
+    // hotpath-lint-allow: one line per model load.
+    tracing::info!(
+        name: "ignis.runtime.exception_weights",
+        exception_weights = weights.as_str(),
+        setting = setting.as_str(),
+        origin,
+        "exception_weights {setting} -> {weights} ({origin})"
+    );
+}
+
 /// A Flash-Next load the host plan refused (spec flash-next/03), as an agent
 /// reads it: one `ignis.runtime.flash_next_host_plan_refused` event with
 /// every line, the memory available, the margin, what the plan needed and how
