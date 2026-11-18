@@ -224,7 +224,8 @@ leaf-internal.
     `nvfp4_linear_swiglu_w4a4_tma_kernel` (the TMA and mbarrier pipeline, each CTA's 64 gate
     rows and their 64 up rows, the block-scaled FP4 MMA loop and the epilogue's staging), in
     `prefill_swiglu.cuh`;
-  - `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu`: `make_descriptors` and
+  - `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu`: `make_descriptors` (the
+    weight codes' map in a pair's box, over the W4A4 product's maps for the layout, called) and
     `launch_nvfp4_linear_swiglu_w4a4_tma`, and `nvfp4_linear_swiglu_plan.cpp`: the TMA arm of
     `nvfp4_linear_swiglu_dispatch` (the workspace scope, the quantizer, alpha), restated in
     `prefill_swiglu.cu`.

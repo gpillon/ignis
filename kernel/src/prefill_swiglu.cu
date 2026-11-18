@@ -5,21 +5,23 @@
 // Upstream: the reference, gpillon/ninfer, commit a00648cb828457986cf5b4b4f712b4cbcd7af0d1 (the
 // commit kernel/vendor/manifest.json pins, ADR 0010), Apache-2.0 (kernel/vendor/LICENSE), restated:
 //   src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
-//       make_descriptors (the four tensor maps, their boxes and swizzles) and
+//       make_descriptors (the weight codes' map in a pair's box; the other three the W4A4
+//       product's, called) and
 //       launch_nvfp4_linear_swiglu_w4a4_tma (the shared-memory attribute set once, the grid, and on
 //       Windows the per-launch device copy of the descriptor block);
 //   src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
 //       nvfp4_linear_swiglu_dispatch's TMA arm: one workspace scope, the W4A4 activation scratch,
 //       the vendored quantizer, and alpha = 1 / (input divisor x weight divisor).
 // Called and not copied: allocate_nvfp4_w4a4_workspace, launch_nvfp4_w4a4_quantize_for_products,
-// launch_nvfp4_w4a4_tma_linear_add, nvfp4_make_tma_2d, validate_nvfp4_weight and ops::linear_add.
+// launch_nvfp4_w4a4_tma_linear_add, make_nvfp4_w4a4_tma_descriptors and (under the vendored
+// product's recorded patch) make_nvfp4_w4a4_tma_k_tile_descriptors, nvfp4_make_tma_2d,
+// validate_nvfp4_weight and ops::linear_add.
 // Changed here: the kernel (prefill_swiglu.cuh) and its two stages; the input quantized in the
-// layout the stream's W4A4 products read (GitHub #652, #653), and the tensor maps of the K-tile-major
-// one, as the vendored product's recorded patch builds them (ops/linear/nvfp4/nvfp4_w4a4_tma.cuh
-// make_nvfp4_w4a4_tma_k_tile_descriptors) but for the weight codes' 64-row box of a pair; the
-// NVFP4 epilogue and the down product it feeds (GitHub #653); on Windows the descriptor block is
-// the load's resident copy where its slots serve the stream (kernel/src/tma_descriptor_cache.h),
-// upstream's per-launch copy elsewhere.
+// layout the stream's W4A4 products read (GitHub #652, #653), and its tensor maps the vendored
+// product's for that layout but for the weight codes' 64-row box of a pair; the NVFP4 epilogue and
+// the down product it feeds (GitHub #653); on Windows the descriptor block is the load's resident
+// copy where its slots serve the stream (kernel/src/tma_descriptor_cache.h), upstream's per-launch
+// copy elsewhere.
 #include "prefill_swiglu.h"
 
 #include "prefill_swiglu.cuh"
@@ -51,49 +53,25 @@ constexpr std::int32_t kPairN = GateUpSchedule::kBlockN / 2;
 static_assert(GateUpSchedule::kBlockM == kTileTokens, "the op's token tile is the TMA route's");
 static_assert(DownGeometry::kInputRows == kIntermediate, "the down product reads the SwiGLU output");
 
+// The vendored product's tensor maps for `layout` (ops/linear/nvfp4/nvfp4_w4a4_tma.cuh): the
+// activations token by token, or K tile by K tile under its recorded patch, and the weight scales
+// as it reads them; but the weight codes in boxes of a pair's 64 rows, the gate's and the up's
+// halves of one 128-row tile.
 nd::Nvfp4W4a4TmaDescriptors make_descriptors(Layout layout, const std::uint8_t *activation_codes,
                                              const std::uint8_t *activation_scales,
                                              const std::uint8_t *weight_codes, const std::uint8_t *weight_scales,
                                              std::int32_t tokens) {
   constexpr std::uint32_t kCodeColumns = 64;
-  constexpr std::uint32_t kScaleColumns = 16;
-  constexpr std::uint64_t kWeightScaleBytes =
-      static_cast<std::uint64_t>(Geometry::kOutputRows) * Geometry::kInputRows / 16;
-  nd::Nvfp4W4a4TmaDescriptors d{};
+  nd::Nvfp4W4a4TmaDescriptors d =
+      layout == Layout::KTileMajor
+          ? nd::make_nvfp4_w4a4_tma_k_tile_descriptors<Geometry, GateUpKTileSchedule::kBlockM>(
+                activation_codes, activation_scales, weight_codes, weight_scales, tokens)
+          : nd::make_nvfp4_w4a4_tma_descriptors<Geometry, GateUpSchedule::kBlockM>(
+                activation_codes, activation_scales, weight_codes, weight_scales, tokens);
   d.b_codes = nd::nvfp4_make_tma_2d(const_cast<std::uint8_t *>(weight_codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
                                     Geometry::kCodeBytesPerRow, Geometry::kOutputRows, Geometry::kCodeBytesPerRow,
                                     kCodeColumns, kPairN, CU_TENSOR_MAP_SWIZZLE_64B,
                                     "prefill swiglu: weight codes TMA");
-  if (layout == Layout::KTileMajor) {
-    // Codes [K/128][T][64 bytes] as 128-byte rows of two tokens, a K tile of a token tile in one box;
-    // scales [K/256][T][16 bytes] as 128-byte rows of eight, a pair of K tiles in one box; the weight
-    // scales, their bytes unchanged, in boxes of eight 128-byte rows.
-    constexpr std::uint64_t kKTiles = Geometry::kInputRows / 128;
-    constexpr std::uint64_t kKTilePairs = Geometry::kInputRows / 256;
-    const auto columns = static_cast<std::uint64_t>(tokens);
-    d.a_codes = nd::nvfp4_make_tma_2d(const_cast<std::uint8_t *>(activation_codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                      128, kKTiles * columns / 2, 128, 128, GateUpKTileSchedule::kBlockM / 2,
-                                      CU_TENSOR_MAP_SWIZZLE_128B, "prefill swiglu: K-tile-major activation codes TMA");
-    d.a_scales = nd::nvfp4_make_tma_2d(const_cast<std::uint8_t *>(activation_scales),
-                                       CU_TENSOR_MAP_DATA_TYPE_UINT8, 128, kKTilePairs * columns / 8, 128, 128,
-                                       GateUpKTileSchedule::kBlockM / 8, CU_TENSOR_MAP_SWIZZLE_NONE,
-                                       "prefill swiglu: K-tile-major activation scales TMA");
-    d.b_scales = nd::nvfp4_make_tma_2d(const_cast<std::uint8_t *>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                       128, kWeightScaleBytes / 128, 128, 128, 8, CU_TENSOR_MAP_SWIZZLE_NONE,
-                                       "prefill swiglu: K-tile-major weight scales TMA");
-    return d;
-  }
-  d.a_codes = nd::nvfp4_make_tma_2d(const_cast<std::uint8_t *>(activation_codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                    Geometry::kCodeBytesPerRow, tokens, Geometry::kCodeBytesPerRow, kCodeColumns,
-                                    GateUpSchedule::kBlockM, CU_TENSOR_MAP_SWIZZLE_64B,
-                                    "prefill swiglu: activation codes TMA");
-  d.a_scales = nd::nvfp4_make_tma_2d(const_cast<std::uint8_t *>(activation_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                                     Geometry::kGroupsPerRow, tokens, Geometry::kGroupsPerRow, kScaleColumns,
-                                     GateUpSchedule::kBlockM, CU_TENSOR_MAP_SWIZZLE_NONE,
-                                     "prefill swiglu: activation scales TMA");
-  d.b_scales = nd::nvfp4_make_tma_2d(const_cast<std::uint8_t *>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, 16,
-                                     kWeightScaleBytes / 16, 16, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE,
-                                     "prefill swiglu: weight scales TMA");
   return d;
 }
 
@@ -166,6 +144,12 @@ bool aligned16(const void *p) {
   return p != nullptr && (reinterpret_cast<std::uintptr_t>(p) & 15U) == 0;
 }
 
+// Whether `t` is [rows, tokens], contiguous BF16 at a 16-byte-aligned address.
+bool bf16_matrix(const ninfer::Tensor &t, std::int32_t rows, std::int32_t tokens) {
+  return t.dtype == ninfer::DType::BF16 && t.ne[0] == rows && t.ne[1] == tokens && t.ne[2] == 1 && t.ne[3] == 1 &&
+         t.is_contiguous() && aligned16(t.data);
+}
+
 // The checks every entry of the op makes on its input and its gate and up weight.
 void check_input(const ninfer::Tensor &x, const ninfer::Weight &gate_up) {
   const std::int32_t tokens = x.ne[1];
@@ -173,8 +157,7 @@ void check_input(const ninfer::Tensor &x, const ninfer::Weight &gate_up) {
     throw std::invalid_argument("prefill swiglu: " + std::to_string(tokens) +
                                 " tokens is no width the W4A4 TMA route takes");
   }
-  if (x.dtype != ninfer::DType::BF16 || x.ne[0] != Geometry::kInputRows || x.ne[2] != 1 || x.ne[3] != 1 ||
-      !x.is_contiguous() || !aligned16(x.data)) {
+  if (!bf16_matrix(x, Geometry::kInputRows, tokens)) {
     throw std::invalid_argument("prefill swiglu: x is [5120, T], contiguous BF16");
   }
   if (gate_up.qtype != ninfer::QType::NVFP4 || gate_up.n != Geometry::kOutputRows ||
@@ -203,8 +186,7 @@ void gate_up_swiglu(const ninfer::Tensor &x, const ninfer::Weight &gate_up, ninf
                     ninfer::WorkspaceArena &workspace, cudaStream_t stream) {
   check_input(x, gate_up);
   const std::int32_t tokens = x.ne[1];
-  if (out.dtype != ninfer::DType::BF16 || out.ne[0] != kIntermediate || out.ne[1] != tokens || out.ne[2] != 1 ||
-      out.ne[3] != 1 || !out.is_contiguous() || !aligned16(out.data)) {
+  if (!bf16_matrix(out, kIntermediate, tokens)) {
     throw std::invalid_argument("prefill swiglu: out is [17408, T], contiguous BF16");
   }
   auto scope = workspace.scope();
@@ -242,9 +224,7 @@ void mlp(Route route, const ninfer::Tensor &x, const ninfer::Weight &gate_up,
   }
   check_input(x, gate_up);
   check_down(down);
-  if (residual.dtype != ninfer::DType::BF16 || residual.ne[0] != DownGeometry::kOutputRows ||
-      residual.ne[1] != tokens || residual.ne[2] != 1 || residual.ne[3] != 1 || !residual.is_contiguous() ||
-      !aligned16(residual.data)) {
+  if (!bf16_matrix(residual, DownGeometry::kOutputRows, tokens)) {
     throw std::invalid_argument("prefill swiglu: the residual is [5120, T], contiguous BF16");
   }
   // The op's input scratch first, as gate_up_swiglu's, then the down product's input, which the
