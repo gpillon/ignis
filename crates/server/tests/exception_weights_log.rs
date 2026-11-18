@@ -46,19 +46,21 @@ fn exception_weights_event(config: &ignis_server::config::Config) -> serde_json:
     events[0].clone()
 }
 
-/// A config file of the test's own naming the 27B's exception weights.
-fn config_file(weights: &str) -> std::path::PathBuf {
+/// A config file of the test's own, `name`, holding `text`.
+fn config_file(name: &str, text: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("ignis-exception-weights-log-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("ignis.config.yaml");
-    std::fs::write(&path, format!("model:\n  qwen38:\n    exception_weights: {weights}\n")).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
     path
 }
 
 #[test]
 fn the_load_logs_the_exception_weights_it_holds_and_the_origin_of_their_setting() {
-    let file = config_file("bf16");
+    let file = config_file("named.yaml", "model:\n  qwen38:\n    exception_weights: bf16\n");
     let file = file.to_str().unwrap();
+    let profile = config_file("profile.yaml", "profiles:\n  mine:\n    model:\n      qwen38:\n        exception_weights: bf16\n");
+    let profile = profile.to_str().unwrap();
     let rtx_5090 = || Card::Read(card::rtx_5090());
     for (flags, card, held, setting, origin) in [
         (&["--profile", "rtx5090"][..], rtx_5090(), "fp8", "auto", "default"),
@@ -67,6 +69,7 @@ fn the_load_logs_the_exception_weights_it_holds_and_the_origin_of_their_setting(
         (&["--profile", "rtx5090", "--model-exception-weights", "bf16"], rtx_5090(), "bf16", "bf16", "flag"),
         (&["--profile", "rtx5090", "--model-exception-weights", "fp8"], rtx_5090(), "fp8", "fp8", "flag"),
         (&["--profile", "rtx5090", "--config", file], rtx_5090(), "bf16", "bf16", "file"),
+        (&["--profile", "mine", "--config", profile], rtx_5090(), "bf16", "bf16", "profile"),
     ] {
         let event = exception_weights_event(&the_27b(flags, card));
         assert_eq!(event["body"], format!("exception_weights {setting} -> {held} ({origin})"), "{flags:?}: {event}");
