@@ -2,17 +2,19 @@
 # that file). GitHub #167, spec docs/specs/make/01-linux-hooks.md.
 #
 # Implemented here: the kernel leaf build and its op tests (kernel/build.sh),
-# and the GPU status/guard pair (mk/linux/gpu.sh). Those are what a CUDA=1
-# build and the container image need.
+# the GPU status/guard pair (mk/linux/gpu.sh) and the explicit GPU test
+# profile (scripts/gpu-profile.sh, the counterpart of scripts/gpu-profile.ps1,
+# which writes the marker ignis_core::gpu_profile reads). Those are what a
+# CUDA=1 build and the container image need.
 #
 # Background server control uses mk/linux/server.py, with a detached session,
 # a PID + process identity, and /ready 200 after warmup (GitHub #129, #493).
 # run-ui/dev-ui's foreground session, mk/linux/devui.py, writes the same
 # record with its helpers (GitHub #226).
-# Still to do (a hook below that fails with a clear message today):
-#   - scripts/gpu-profile.sh, the three-stage explicit GPU test profile
-#     (scripts/gpu-profile.ps1's counterpart), which writes the marker
-#     ignis_core::gpu_profile reads
+# Nothing is left to do here: every hook of the contract is implemented.
+# The profile's Linux run on a real card is the one thing no CI runner can
+# do (docs/user/contributing/releases.md); its selftest
+# (mk/linux/gpu-profile-selftest.sh) runs it on stand-ins.
 #
 # `cargo` on Linux: .cargo/config.toml pins build.target to the MSVC triple
 # (cargo has no host-conditional for it), so every cargo call here passes
@@ -23,16 +25,14 @@
 EXE :=
 TARGET_TRIPLE ?= x86_64-unknown-linux-gnu
 
-# $(call todo,<what>): a recipe line that fails with a pointer to this file.
-todo = @echo "error: $1 is not implemented on Linux yet (see mk/os/linux.mk)" >&2; exit 1
-
 KERNEL_BUILD = bash kernel/build.sh
 KERNEL_TEST = bash kernel/build.sh build --test
 KERNEL_BUILD_INPUTS := $(wildcard kernel/build.sh)
 
 GPU_STATUS = bash mk/linux/gpu.sh status
 GPU_GUARD = bash mk/linux/gpu.sh guard $(GPU_THRESHOLD_MIB)
-GPU_PROFILE = $(call todo,the GPU profile)
+# GPU_PROFILE_ARGS are the script's own flags (--skip-kernel-build, ...).
+GPU_PROFILE = TARGET_TRIPLE='$(TARGET_TRIPLE)' bash scripts/gpu-profile.sh $(GPU_PROFILE_ARGS)
 
 SERVER_CTL_ARGS = --pid '$(SERVER_PID)' --log '$(SERVER_LOG)' --url '$(SERVER_URL)' --timeout '$(READY_TIMEOUT)'
 SERVER_START = $(PYTHON) mk/linux/server.py start $(SERVER_CTL_ARGS) -- '$(SERVER_BIN)' $(SERVER_FLAGS)
@@ -44,7 +44,7 @@ SERVER_STATUS = $(PYTHON) mk/linux/server.py status $(SERVER_CTL_ARGS)
 # by a signal make cannot pass on (kill -9).
 DEV_UI = exec $(PYTHON) mk/linux/devui.py $(SERVER_CTL_ARGS) -- '$(SERVER_BIN)' $(SERVER_FLAGS)
 
-# Not a todo, and not OS-specific either: mk/version.sh is text editing over
+# Not OS-specific: mk/version.sh is text editing over
 # four files and serves both hosts, so mk/os/windows.mk names the same one.
 # mk/changelog.sh is git and gh, which are the same on either host.
 VERSION_TOOL = bash mk/version.sh

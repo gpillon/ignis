@@ -271,6 +271,13 @@ jobs:
         shell: bash
         run: bash mk/linux/devui-selftest.sh
 
+      # `make gpu-profile`'s script on Linux (GitHub #226), on stand-in cargo,
+      # kernel build and nvidia-smi: no card is needed.
+      - name: Linux GPU profile selftest
+        if: matrix.host == 'linux' && matrix.shard == 1
+        shell: bash
+        run: bash mk/linux/gpu-profile-selftest.sh
+
       # The Playground's logic is pure TypeScript with no host in it, so one
       # run answers for both (ADR 0026, docs/agents/testing.md). Linux is the
       # cheaper runner.

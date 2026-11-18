@@ -43,8 +43,9 @@ as the harness's model too, the agent works on the same server it calls.
 ## Each harness's entry
 
 The entries below are read from each harness's own source at the version
-named; none has been run against ignis yet. Every harness asks for the MCP
-server's URL and, with a key, the `Authorization` header.
+named. opencode 2.3.0's has been run against ignis, on an RTX 5090; the
+others have not been run yet. Every harness asks for the MCP server's URL
+and, with a key, the `Authorization` header.
 
 The key is read from the harness's environment, as `IGNIS_API_KEY` in the
 entries below: set it to the server's key in the shell the harness starts
@@ -85,6 +86,9 @@ root or its `.opencode/` folder for one.
   set becomes an empty key, which the server answers `401`.
 - opencode 1.x takes the server one level up, `"mcp": { "ignis": { … } }`,
   without `codemode`; 2.x still reads that form.
+- The model sees an image a tool answers, `generate_image`'s preview among
+  them, when its entry declares image input. opencode 2.x spells it on the
+  model under `providers`: `"capabilities": { "input": ["text", "image"] }`.
 - opencode asks before every MCP call, whatever the tool's hints say.
 
 ### qwen-code
