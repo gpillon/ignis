@@ -604,10 +604,11 @@ struct ignis_model_reservations {
   /* GitHub #650: on Windows, where the NVFP4 body's W4A4 TMA products take
    * their tensor maps through a pointer, the device slots that keep them: 512
    * bytes for each such product of a prefill traversal at every width the
-   * TMA route takes up to the prefill chunk (a multiple of 256 from 1,024
-   * tokens). 0 on Linux, on the trellis body, on Flash-Next, on a card below
-   * compute capability 12, below a 1,024-token chunk, and under the
-   * measurement switch IGNIS_TMA_DESCRIPTOR_CACHE=0. */
+   * TMA route takes up to `prefill_chunk_tokens`, the widest chunk the load
+   * is handed (the wider of the prefill chunk and the solo width; a multiple
+   * of 256 from 1,024 tokens). 0 on Linux, on the trellis body, on
+   * Flash-Next, on a card below compute capability 12, below a 1,024-token
+   * chunk, and under the measurement switch IGNIS_TMA_DESCRIPTOR_CACHE=0. */
   uint64_t tma_descriptor_bytes;
 };
 

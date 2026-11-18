@@ -160,10 +160,10 @@ pub struct VramLines {
     pub trellis_dense: u64,
     /// The NVFP4 body's W4A4 TMA descriptor slots (GitHub #650): on Windows,
     /// 512 bytes for each W4A4 product of a prefill traversal at every width
-    /// the route takes up to `--model-prefill-chunk` (a multiple of 256 from
-    /// 1,024 tokens), which keep the products' tensor maps on the device. 0 on
-    /// Linux, the trellis body, Flash-Next, an RTX 30 or RTX 40 card and a
-    /// chunk below 1,024 tokens.
+    /// the route takes up to the wider of `--model-prefill-chunk` and the solo
+    /// width (a multiple of 256 from 1,024 tokens), which keep the products'
+    /// tensor maps on the device. 0 on Linux, the trellis body, Flash-Next, an
+    /// RTX 30 or RTX 40 card and a chunk below 1,024 tokens.
     pub tma_descriptors: u64,
     /// One media item's encoder output (0 without `--vision-enabled`).
     pub media_embedding: u64,
