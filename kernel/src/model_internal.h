@@ -26,6 +26,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 // GitHub #339 (spec 27b-16gb/05a): a trellis body's linears, the 16 GB
@@ -553,11 +554,12 @@ struct ignis_model {
   // `tma_descriptor_bytes`); null where the load plans none.
   std::unique_ptr<ignis::tma_descriptors::Cache> tma_descriptors;
   // GitHub #652 (spec #646): the layout the W4A4 prefill products read their
-  // activations in (enum ignis_w4a4_activation_layout), decided once at load
-  // (model.cu `w4a4_activation_layout_route`), and that layout named for
-  // `stream` (kernel/src/w4a4_activation_layout.h), which every launcher of the
-  // products asks; null with IGNIS_W4A4_ACTIVATION_LAYOUT_NONE.
-  uint32_t w4a4_activation_layout = IGNIS_W4A4_ACTIVATION_LAYOUT_NONE;
+  // activations in, decided once at load (model.cu
+  // `w4a4_activation_layout_route`), none where the prefill runs no W4A4 TMA
+  // product (the C ABI's IGNIS_W4A4_ACTIVATION_LAYOUT_NONE), and that layout
+  // named for `stream` (kernel/src/w4a4_activation_layout.h), which every
+  // launcher of the products asks; null without a layout.
+  std::optional<ignis::w4a4_activation_layout::Layout> w4a4_activation_layout;
   std::unique_ptr<ignis::w4a4_activation_layout::ForStream> w4a4_activation_layout_stream;
   // GitHub #514: the GDN prefill's route, decided once at load (model.cu
   // `gdn_prefill_route`): our full-rate kernels (kernel/src/gdn_prefill.h)

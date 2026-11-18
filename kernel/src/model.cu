@@ -70,6 +70,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -1271,14 +1272,15 @@ bool tma_descriptor_cache_route(bool &cache) {
   return true;
 }
 
-// GitHub #652 (spec #646): the layout the load's W4A4 prefill products read their activations in
-// (enum ignis_w4a4_activation_layout), decided once per load: the one the switch names where the
-// prefill runs the W4A4 TMA route -- the NVFP4 body, chunks of at least 1,024 tokens, a card the
+// GitHub #652 (spec #646): the layout the load's W4A4 prefill products read their activations in,
+// decided once per load: the one the switch names where the prefill runs the W4A4 TMA route
+// (kernel/src/w4a4_tma_route.h) -- the NVFP4 body, chunks of at least 1,024 tokens, a card the
 // products' sm_120a code runs on (compute capability 12) -- and none elsewhere. False (error set)
 // when the device cannot say its generation; the card is asked only where the route could run.
 bool w4a4_activation_layout_route(ignis::w4a4_activation_layout::Layout named, bool trellis_body,
-                                  uint32_t prefill_chunk_tokens, uint32_t &layout) {
-  layout = IGNIS_W4A4_ACTIVATION_LAYOUT_NONE;
+                                  uint32_t prefill_chunk_tokens,
+                                  std::optional<ignis::w4a4_activation_layout::Layout> &layout) {
+  layout.reset();
   if (trellis_body || !ignis::w4a4_tma::reaches(prefill_chunk_tokens)) {
     return true;
   }
@@ -1287,8 +1289,7 @@ bool w4a4_activation_layout_route(ignis::w4a4_activation_layout::Layout named, b
     return false;
   }
   if (ignis::w4a4_tma::runs_on(major)) {
-    layout = named == ignis::w4a4_activation_layout::Layout::Token ? IGNIS_W4A4_ACTIVATION_LAYOUT_TOKEN
-                                                                   : IGNIS_W4A4_ACTIVATION_LAYOUT_KTILE;
+    layout = named;
   }
   return true;
 }
@@ -2701,12 +2702,10 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   }
   // GitHub #652 (spec #646): every W4A4 TMA product launched on the model's stream from here on
   // reads its activations in the layout the load decided, which its quantizer then writes.
-  if (model->w4a4_activation_layout != IGNIS_W4A4_ACTIVATION_LAYOUT_NONE) {
+  if (model->w4a4_activation_layout.has_value()) {
     try {
       model->w4a4_activation_layout_stream = std::make_unique<ignis::w4a4_activation_layout::ForStream>(
-          model->stream, model->w4a4_activation_layout == IGNIS_W4A4_ACTIVATION_LAYOUT_TOKEN
-                             ? ignis::w4a4_activation_layout::Layout::Token
-                             : ignis::w4a4_activation_layout::Layout::KTile);
+          model->stream, *model->w4a4_activation_layout);
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: the W4A4 activation layout: ") + e.what());
       cudaStreamDestroy(model->stream);
@@ -2950,10 +2949,12 @@ extern "C" uint32_t ignis_model_prefill_swiglu(const struct ignis_model *model) 
 }
 
 extern "C" uint32_t ignis_model_w4a4_activation_layout(const struct ignis_model *model) {
-  if (model == nullptr || model->flash_next) {
+  if (model == nullptr || model->flash_next || !model->w4a4_activation_layout.has_value()) {
     return IGNIS_W4A4_ACTIVATION_LAYOUT_NONE;
   }
-  return model->w4a4_activation_layout;
+  return *model->w4a4_activation_layout == ignis::w4a4_activation_layout::Layout::Token
+             ? IGNIS_W4A4_ACTIVATION_LAYOUT_TOKEN
+             : IGNIS_W4A4_ACTIVATION_LAYOUT_KTILE;
 }
 
 extern "C" void ignis_model_free(struct ignis_model *model) {
