@@ -142,18 +142,23 @@ beyond the best match above it (for KV-disk, 8,192 on Flash-Next and
   part of the prompt the request resumed (0 when none), and the request's `done`
   log line names the tier and the kind of reuse.
 - **A tax on short cold prompts.** To be reusable, a prompt is cut at its
-  publish point and again at the generation opener, so one traversal of the model
-  becomes three. Each extra traversal costs a fixed ~19 ms on the RTX 5090
-  because it re-streams the weights. Measured on 2026-09-18, that was 37 percent
-  of the TTFT of a 1,024-token cold request, and under 2 percent on a 70K prompt
+  reuse points: at the generation opener, where its checkpoint is captured,
+  and at the end of its system block when that block is a KV page or more.
+  Each cut adds a traversal of the model, which costs a fixed time because it
+  re-streams the weights: about 19 ms on the RTX 5090, measured on 2026-09-18,
+  when a prompt cut at its publish point and again at the opener took three
+  traversals, 37 percent of the TTFT of a 1,024-token cold request and under 2
+  percent on a 70K prompt
   ([the finding](../../findings/2026-09-18-prompt-reuse-tax-on-short-ttft.md)).
-  The bet is that a later request skips more than that. On Flash-Next, and on
-  the 27B on every card, the publish point rides the opener's cut instead: the
-  capture at the opener hands over the whole pages below it, and the prompt is
-  cut once. The 27B on an RTX 5090 used to keep the second cut; measured, it
-  cost 45 to 55 ms per request, so it is gone. What that gives up is the image
-  at the opener's page floor, which only a prompt parting from this one in the
-  last 63 tokens before its opener would have resumed from: that request now
+  The bet is that a later request skips more than that. On Flash-Next, and
+  from 0.11.0 on the 27B on every card, the opener's page floor has no cut of
+  its own: the capture at the opener hands over the whole pages below it. The
+  0.10.0 release still cuts the 27B there on an RTX 50 or RTX PRO card;
+  measured, that cut cost 45 to 55 ms per request (its traversal and a copy of
+  the state into a host retained slot), so from 0.11.0 it is gone. What that
+  gives up is the image at the opener's page floor, which only a prompt
+  parting from this one in the last 63 tokens before its opener would have
+  resumed from: that request now
   resumes from the reuse point before it (the previous turn's checkpoint, or
   the system block). An identical retry, a conversation's next turn and a
   subagent burst resume as before. The 27B's splits move on Blackwell, so its
