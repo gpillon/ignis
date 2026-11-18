@@ -660,7 +660,7 @@ gpu-guard: ## Refuse when the GPU is held (ninfer, another ignis, a GPU test)
 	@$(GPU_GUARD)
 
 .PHONY: gpu-profile
-gpu-profile: ## The explicit GPU test profile (GPU_PROFILE_ARGS=-SkipKernelBuild ...)
+gpu-profile: ## The explicit GPU test profile (GPU_PROFILE_ARGS: -SkipKernelBuild on Windows, --skip-kernel-build on Linux, ...)
 	$(GPU_PROFILE)
 
 .PHONY: kernel-test
