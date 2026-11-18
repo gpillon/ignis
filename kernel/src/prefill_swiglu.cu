@@ -195,11 +195,8 @@ void check_down(const ninfer::Weight &down) {
 } // namespace
 
 Route route_for_load() {
-  const std::string named = ignis::process_environment(kSwitch);
-  if (named.empty() || named == "quant") return Route::Quant;
-  if (named == "fused") return Route::Fused;
-  if (named == "split") return Route::Split;
-  throw std::invalid_argument(std::string(kSwitch) + " is `split`, `fused` or `quant`, not `" + named + "`");
+  return ignis::named_switch(kSwitch, Route::Quant,
+                             {{"split", Route::Split}, {"fused", Route::Fused}, {"quant", Route::Quant}});
 }
 
 void gate_up_swiglu(const ninfer::Tensor &x, const ninfer::Weight &gate_up, ninfer::Tensor &out,

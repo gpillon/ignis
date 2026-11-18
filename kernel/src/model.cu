@@ -36,6 +36,7 @@
 #include "sampled_draft.h"
 #include "trellis_body.h"
 #include "w4a4_activation_layout.h"
+#include "w4a4_tma_route.h"
 #include "w8_imma.h"
 
 #include "ignis_dflash2_topk.h"
@@ -1165,7 +1166,8 @@ struct LoadOptions {
   // measurement switch IGNIS_TMA_DESCRIPTOR_CACHE=0 names upstream's per-launch upload.
   bool tma_descriptor_cache = false;
   // GitHub #651, #653 (spec #646): the route of the prefill's MLP gate and up product and its
-  // epilogue, what the measurement switch IGNIS_PREFILL_SWIGLU names (`prefill_swiglu_switch`).
+  // epilogue, what the measurement switch IGNIS_PREFILL_SWIGLU names
+  // (`ignis::prefill_swiglu::route_for_load`).
   ignis::prefill_swiglu::Route prefill_swiglu = ignis::prefill_swiglu::Route::Quant;
   // GitHub #652 (spec #646): what the measurement switch IGNIS_W4A4_ACTIVATION_LAYOUT names; the
   // load decides from it, the body, the chunk and the card the layout its W4A4 prefill products
@@ -1187,6 +1189,19 @@ bool device_major(const char *what, int &major) {
   if (err == cudaSuccess) err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
   if (err != cudaSuccess) {
     set_error(std::string("ignis_model_load: the GPU generation for ") + what + ": " + cudaGetErrorString(err));
+    return false;
+  }
+  return true;
+}
+
+// Spec #646: a measurement switch read once per load by `read`, which throws
+// std::invalid_argument naming the variable on a value it does not know, so that value refuses
+// the plan and the load by name. False (error set) on a refusal.
+template <class Read, class Value> bool load_switch(Read read, Value &named) {
+  try {
+    named = read();
+  } catch (const std::invalid_argument &e) {
+    set_error(std::string("ignis_model_load: ") + e.what());
     return false;
   }
   return true;
@@ -1242,10 +1257,7 @@ bool mtp_head_linear_route(bool &ours) {
 bool tma_descriptor_cache_route(bool &cache) {
   cache = false;
   bool enabled = false;
-  try {
-    enabled = ignis::tma_descriptors::enabled_for_load();
-  } catch (const std::invalid_argument &e) {
-    set_error(std::string("ignis_model_load: ") + e.what());
+  if (!load_switch(ignis::tma_descriptors::enabled_for_load, enabled)) {
     return false;
   }
   if (!ignis::tma_descriptors::kThroughPointer || !enabled) {
@@ -1255,48 +1267,7 @@ bool tma_descriptor_cache_route(bool &cache) {
   if (!device_major("the TMA descriptor slots", major)) {
     return false;
   }
-  cache = major == 12;
-  return true;
-}
-
-// GitHub #651, #653 (spec #646): the route of the prefill's MLP gate and up product, read once per
-// load from the measurement switch IGNIS_PREFILL_SWIGLU (kernel/src/prefill_swiglu.h): unset or
-// `quant`, the fused op at every width the W4A4 TMA route takes, its NVFP4 epilogue where the down
-// product runs on that route and its BF16 one elsewhere; `fused`, the BF16 epilogue at every such
-// width; `split`, the vendored dispatch. Any other value refuses the load by name. No card is
-// asked: the op runs where the route it stands in for runs, the NVFP4 body's W4A4 products, which
-// only a card of compute capability 12 loads.
-bool prefill_swiglu_switch(ignis::prefill_swiglu::Route &route) {
-  try {
-    route = ignis::prefill_swiglu::route_for_load();
-  } catch (const std::invalid_argument &e) {
-    set_error(std::string("ignis_model_load: ") + e.what());
-    return false;
-  }
-  return true;
-}
-
-// GitHub #572 (spec #570): the measurement switch IGNIS_HQ_DECODE_ATTENTION, read once per load
-// beside the GDN prefill's, so a value it does not know refuses the plan and the load by name.
-bool hq_decode_attention_switch(ignis::hq_decode_attention::Switch &named) {
-  try {
-    named = ignis::hq_decode_attention::switch_for_load();
-  } catch (const std::invalid_argument &e) {
-    set_error(std::string("ignis_model_load: ") + e.what());
-    return false;
-  }
-  return true;
-}
-
-// GitHub #652 (spec #646): the measurement switch IGNIS_W4A4_ACTIVATION_LAYOUT, read once per load
-// beside the others, so a value it does not know refuses the plan and the load by name.
-bool w4a4_activation_layout_switch(ignis::w4a4_activation_layout::Layout &named) {
-  try {
-    named = ignis::w4a4_activation_layout::layout_for_load();
-  } catch (const std::invalid_argument &e) {
-    set_error(std::string("ignis_model_load: ") + e.what());
-    return false;
-  }
+  cache = ignis::w4a4_tma::runs_on(major);
   return true;
 }
 
@@ -1308,14 +1279,14 @@ bool w4a4_activation_layout_switch(ignis::w4a4_activation_layout::Layout &named)
 bool w4a4_activation_layout_route(ignis::w4a4_activation_layout::Layout named, bool trellis_body,
                                   uint32_t prefill_chunk_tokens, uint32_t &layout) {
   layout = IGNIS_W4A4_ACTIVATION_LAYOUT_NONE;
-  if (trellis_body || prefill_chunk_tokens < 1024) {
+  if (trellis_body || !ignis::w4a4_tma::reaches(prefill_chunk_tokens)) {
     return true;
   }
   int major = 0;
   if (!device_major("the W4A4 activation layout", major)) {
     return false;
   }
-  if (major == 12) {
+  if (ignis::w4a4_tma::runs_on(major)) {
     layout = named == ignis::w4a4_activation_layout::Layout::Token ? IGNIS_W4A4_ACTIVATION_LAYOUT_TOKEN
                                                                    : IGNIS_W4A4_ACTIVATION_LAYOUT_KTILE;
   }
@@ -1658,10 +1629,17 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.draft_rule = draft_rule;
   out.drafter_temperature_factor = drafter_temperature_factor;
   out.drafter_top_p = drafter_top_p;
-  if (!gdn_prefill_route(out.gdn_prefill_ours) || !hq_decode_attention_switch(out.hq_decode_attention) ||
+  // The routes a load decides from the card and a measurement switch, and the switches it reads
+  // on their own, in this order, so a value a switch does not know refuses the plan and the load by
+  // name: IGNIS_HQ_DECODE_ATTENTION (GitHub #572), IGNIS_PREFILL_SWIGLU (GitHub #651, #653: unset
+  // or `quant`, `fused`, `split`) and IGNIS_W4A4_ACTIVATION_LAYOUT (GitHub #652: unset or `ktile`,
+  // `token`).
+  if (!gdn_prefill_route(out.gdn_prefill_ours) ||
+      !load_switch(ignis::hq_decode_attention::switch_for_load, out.hq_decode_attention) ||
       !mtp_head_linear_route(out.mtp_head_linear_ours) ||
-      !tma_descriptor_cache_route(out.tma_descriptor_cache) || !prefill_swiglu_switch(out.prefill_swiglu) ||
-      !w4a4_activation_layout_switch(out.w4a4_activation_layout)) {
+      !tma_descriptor_cache_route(out.tma_descriptor_cache) ||
+      !load_switch(ignis::prefill_swiglu::route_for_load, out.prefill_swiglu) ||
+      !load_switch(ignis::w4a4_activation_layout::layout_for_load, out.w4a4_activation_layout)) {
     return nullptr;
   }
 

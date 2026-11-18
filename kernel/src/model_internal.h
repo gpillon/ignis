@@ -579,7 +579,7 @@ struct ignis_model {
   // graph captured on this load bakes it in. False on a load without the head.
   bool mtp_head_linear_ours = false;
   // GitHub #651, #653 (spec #646): the route of the prefill's MLP gate and up product, decided once
-  // at load (model.cu `prefill_swiglu_switch`): the fused op (kernel/src/prefill_swiglu.h) at every
+  // at load (model.cu `validate_and_bind`): the fused op (kernel/src/prefill_swiglu.h) at every
   // width the W4A4 TMA route takes, its NVFP4 epilogue where the down product runs on that route
   // (Quant) or its BF16 one throughout (Fused), or the vendored dispatch; read by every MLP call of
   // the NVFP4 body (kernel/src/gdn_layer.cu and gqa_layer.cu `output_and_mlp`). The trellis body

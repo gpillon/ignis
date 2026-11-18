@@ -3,6 +3,7 @@
 #include "tma_descriptor_cache.h"
 
 #include "process_environment.h"
+#include "w4a4_tma_route.h"
 
 #include <iterator>
 #include <mutex>
@@ -13,11 +14,6 @@ namespace ignis::tma_descriptors {
 namespace {
 
 constexpr const char *kSwitch = "IGNIS_TMA_DESCRIPTOR_CACHE";
-
-// The vendored dispatch's TMA rule: a call of at least 1,024 tokens, a whole number of 256-token
-// tiles.
-constexpr std::uint32_t kTmaMinTokens = 1024;
-constexpr std::uint32_t kTmaBlockTokens = 256;
 
 // Which load's cache serves a stream. Never destroyed: a launch may run while the process exits.
 struct Registry {
@@ -33,16 +29,11 @@ Registry &registry() {
 } // namespace
 
 bool enabled_for_load() {
-  const std::string named = ignis::process_environment(kSwitch);
-  if (named.empty() || named == "1") return true;
-  if (named == "0") return false;
-  throw std::invalid_argument(std::string(kSwitch) + " is `0` or `1`, not `" + named + "`");
+  return ignis::named_switch(kSwitch, true, {{"0", false}, {"1", true}});
 }
 
 std::size_t planned_slots(std::size_t products, std::uint32_t prefill_chunk_tokens) {
-  if (prefill_chunk_tokens < kTmaMinTokens) return 0;
-  const std::size_t widths = (prefill_chunk_tokens - kTmaMinTokens) / kTmaBlockTokens + 1;
-  return products * widths;
+  return products * ignis::w4a4_tma::widths_up_to(prefill_chunk_tokens);
 }
 
 Cache::Cache(std::size_t slots, cudaStream_t stream)
