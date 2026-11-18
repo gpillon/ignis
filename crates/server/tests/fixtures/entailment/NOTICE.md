@@ -166,9 +166,9 @@ context moves none of these reads.
 | `s-bf16-noreuse` | served | bf16 | 786,432 | yarn:3 | ignis's | fp8 | off |
 | `s-fp8-noreuse` | served | fp8 | 917,504 | yarn:3.5 | ignis's | fp8 | off |
 
-Each arm's reads are the same whatever the order its prompts arrive in:
-every case and draft read the same, bit for bit, in two passes that posted
-them in different orders.
+Each arm's reads repeat: every case and draft read the same, bit for bit,
+in two passes, and the four wordings that moved between the case slots and
+the drafts between them, read after other prompts, did not move either.
 
 The 2026-11-08 measurement had five arms, and none named its exception
 weights: the three live-server arms ran FP8 from a user config file, the two

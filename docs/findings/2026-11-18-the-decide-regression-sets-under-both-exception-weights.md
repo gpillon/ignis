@@ -67,10 +67,12 @@ with the GPU test itself, one load per arm:
   bit. The served arms in process are the live server, chunk 1,024 against
   2,048 and spec off against DFlash2 change nothing here, and those two
   registered arms were FP8.
-- **Order.** Two passes posted the cases and the 24 candidate wordings in
-  different orders, each prompt after a different one: all 588 reads
-  repeated bit for bit. On these prompts an arm's read does not depend on
-  what came before it.
+- **Repeats and order.** Two passes read the cases and the 24 candidate
+  wordings on every arm, and all 588 reads repeated bit for bit. Between the
+  passes four wordings moved between the case slots 19 and 20 and the drafts
+  and two drafts took a new predecessor: those 84 reads, 70 of them after
+  another prompt than the first time, did not move either. Cases 1-18 kept their
+  order, so this shows no more than that.
 - **Context.** FP8 at yarn:3.5 on 786,432 tokens reads all 20 cases as it
   does on 917,504, bit for bit: at an equal rope table the context moves
   nothing here, so the served pairs below, whose contexts differ, differ in
@@ -157,19 +159,24 @@ Observed:
   by at least +2.000.
 - Two ignis-written restatements are gates on every arm, by +1.625 and
   +1.500; four other wordings of the 24 also clear +1.
-- Each arm's reads are deterministic and do not depend on the order the
-  prompts arrive in.
-- On the scalar set's balance FP8 loses the sign on 3 of 7 routes and gains
-  it on none; BF16 has it on only 3 of its 7 routes, and not at its served
-  shape. Its five other cases read right on every arm.
+- Each arm's reads repeat bit for bit, and moving a wording to another
+  place in the order did not move its read.
+- On the scalar set's balance FP8 loses the sign on 3 of the 4 routes both
+  exception weights share (the harness with each GDN prefill, the served
+  start at yarn:3.5) and gains it on none; the fourth, the served start at
+  yarn:3, reads it wrong under both. BF16 has the sign on only 3 of its 7
+  arms, and not at its served shape. The scalar set's five other cases read
+  right on every arm.
 
 Inferred: the entailment set gave no evidence of an error of the FP8 weights;
 its case 1 is a watch case under BF16's own routes too. With cases 19 and 20
 the set asserts only cases clear of the line on every route the card runs,
 under both exception weights, so it no longer stands in the way of the FP8
-default. One item cannot tell a lean of the FP8 weights on the balance's
-sign from a coin: the study's 48 literal negatives (GitHub #667) read 11-28
-right under either encoding, and the minus `scalar` drops is GitHub #671.
+default. On the balance's sign FP8 leans one way on these arms, where the
+study (GitHub #667) found its move on the sign's logit mixed in direction
+over its routes; one item cannot tell a lean of the FP8 weights from a coin,
+the study's 48 literal negatives read 11-28 right under either encoding,
+and the minus `scalar` drops is GitHub #671.
 Either way the balance is no assertion: on the served default it is wrong
 under both.
 

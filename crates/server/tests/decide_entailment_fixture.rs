@@ -13,14 +13,13 @@ mod decide_arms;
 mod entailment;
 
 use decide_arms::{Arm, Surface};
-use entailment::{Origin, Tier};
+use entailment::Origin;
 
-/// Eighteen contributed cases and the two ignis wrote, as GitHub #537's
-/// review allowed (GitHub #675): ten "yes" and ten "no". Each ignis-written
-/// case is a "yes" gate, so the gate holds a "yes" on every arm whatever the
-/// contributed ones read.
+/// Eighteen contributed cases and the two "yes" cases ignis wrote, as GitHub
+/// #537's review allowed (GitHub #675): ten "yes" and ten "no". Which are
+/// gates is the measurement's, held to the rule below.
 #[test]
-fn the_set_is_twenty_cases_the_last_two_ignis_written_yes_gates() {
+fn the_set_is_twenty_cases_the_last_two_ignis_written() {
     let fixture = entailment::load();
     let ids: Vec<u32> = fixture.cases.iter().map(|case| case.id).collect();
     assert_eq!(ids, (1..=20).collect::<Vec<_>>());
@@ -33,9 +32,6 @@ fn the_set_is_twenty_cases_the_last_two_ignis_written_yes_gates() {
     let ignis: Vec<u32> =
         fixture.cases.iter().filter(|case| case.origin == Origin::Ignis).map(|case| case.id).collect();
     assert_eq!(ignis, [19, 20]);
-    for case in fixture.cases.iter().filter(|case| case.origin == Origin::Ignis) {
-        assert!(case.expected && case.tier == Tier::Gate, "case {}: an ignis-written case is a yes gate", case.id);
-    }
 }
 
 #[test]
