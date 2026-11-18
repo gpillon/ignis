@@ -1,4 +1,4 @@
-# The 27B's decode served on the RTX 5090 after spec #672: at equal FP8 exception weights a long JSON answer 10.2% faster, an 8K prompt's answer 9.3%, plain decode 3.1-4.2%, the verify round 7.1% shorter, the one-lane text main's
+# The 27B's decode served on the RTX 5090 after spec #672: at equal FP8 exception weights a long JSON answer 10.2% faster, an 8K prompt's answer 9.3%, plain decode 3.1-4.2%, the plain round 3.6% shorter, the one-lane text main's
 
 - Kind: experiment
 - Status: current
@@ -14,7 +14,7 @@
   [decode round host idle](2026-09-18-decode-round-host-idle.md),
   [the cold prefill after spec #646](2026-11-18-the-27bs-cold-prefill-served-on-the-rtx-5090-after-spec-646.md)
 - Superseded by: none
-- Summary: RTX 5090, 27B NVFP4, FP8 named, served A/B vs main: DFlash2 JSON 346 to 382 tok/s (+10.2%), 8K answer 393 to 430 (+9.3%), plain +3.1-4.2%; verify period -7.1%, plain -3.6%; one-lane text main's; #679 dropped.
+- Summary: RTX 5090, 27B NVFP4, FP8 named, served A/B vs main: DFlash2 JSON 346 to 382 tok/s (+10.2%), 8K answer 393 to 430 (+9.3%), plain +3.1-4.2%; plain round -3.6%, one-lane verify gap 1,108 to 537 us; one-lane text main's.
 
 ## Question
 
@@ -30,7 +30,7 @@ Spec #672 took the 27B's decode round apart on main and built its levers: a DFla
 
 ### Conditions
 
-RTX 5090 under Windows, on a PCIe Gen 3 x16 host, one card and nothing else on it: `nvidia-smi` read 3,340 MiB used before the A/B's legs and 3,285 MiB after, with no other GPU process, and no build ran during any leg. The 27B NVFP4 artifact. Every leg is one server start with an empty config file (no user config file read), the loop guard off and idle unload off. Every lever leg and the A/B's configurations A and B name `--model-exception-weights fp8`. Round timing is `IGNIS_ROUND_TIMING=1` (#674): events recorded on the stream around each replayed round's graph, no tracer, one line per 256 rounds of a kind with the median period, span and gap. Each figure below is the mean of a leg's block medians.
+RTX 5090 under Windows, on a PCIe Gen 3 x16 host, one card, one run on it at a time. The 27B NVFP4 artifact. Every leg is one server start with an empty config file (no user config file read), the loop guard off and idle unload off. The lever legs and the A/B's configurations A and B name `--model-exception-weights fp8`, the context 262,144 and rope none; the lever legs ask greedy (temperature 0, thinking off) for a JSON array of 40 fictional employees, up to 4,000 tokens, one request at a time or, in a burst, 4 or 8 distinct ones at once. Around the A/B's legs `nvidia-smi` read 3,340 MiB used before and 3,285 MiB after, with no other GPU process, and no build ran during any of them. Round timing is `IGNIS_ROUND_TIMING=1` (#674): events recorded on the stream around each replayed round's graph, no tracer, one line per 256 rounds of a kind with the median period, span and gap. Each figure below is the mean of a leg's block medians.
 
 ### The round on main
 
@@ -159,7 +159,8 @@ The texts differ between the builds, as expected: FP8 weights and yarn:3.5 move 
 
 - One machine: an RTX 5090 under Windows (WDDM) on a PCIe Gen 3 host. Two served legs per build per configuration, two or three timing legs per arm.
 - The levers' shares were measured against different baselines (each on the build of its day, with the levers merged before it), so they do not add up: the width-1 plain span shares of #677, #678 and #681 sum to -507 us, and the combined plain span fell 414 us. The difference is not explained here.
-- Config A's verify timing mixes one-lane and wider verify rounds (the burst's); it is not comparable with the one-lane lever legs or the spec's 16.04-16.14 ms.
+- Config A's verify timing mixes one-lane and wider verify rounds (the burst's); it is not comparable with the one-lane lever legs or the spec's 16.04-16.14 ms, and no combined one-lane verify figure was taken.
+- The untraced launch (14-23 us at every width) is the spec's server measurement; the standalone benchmark of the [decode round anatomy](2026-09-18-decode-round-anatomy.md) (0.36-0.73 us a node, warm, no server) disagrees with it and was not re-run, so what that benchmark measured is open.
 - The spec's served prototype figures (478.6 to 506.3 tok/s on a 7,229-token cell, 392.7 to 411.0 on the 8K prompt's answer) came from another session; this A/B's JSON-long cell is not that cell. Main's 8K answer agrees: 393.3 tok/s here, 392.7 there.
 - The burst's text: one leg of N differs on two of its four answers. Inference: which rounds run at which width depends on when each request arrives, as #680's burst legs showed within one build, one differing leg per arm. Byte identity at a fixed width is held by the round identity test, not by this cell.
 - FP8 against BF16 decode at equal text was not measured served; #678's share of a one-lane verify round was not separated; a verify round of two lanes or more runs its exception products on W8A8, which #678 does not reach.
