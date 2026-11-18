@@ -787,7 +787,8 @@ impl StepLeaf for CudaLeaf {
         // allocated -- a per-width capture failure degrades that width to
         // the eager per-lane loop, never model load. `capture_decode_graphs`
         // itself never returns Err for that reason; only a null model/pool
-        // (impossible here) would.
+        // (impossible here) or a value of `IGNIS_ROUND_TIMING` other than
+        // `0` or `1` (GitHub #674) would.
         //
         // Format-independent since P4-05 (GitHub #123): a capture set is one
         // per process either way, and the hq codec keeps fixed bytes per row
