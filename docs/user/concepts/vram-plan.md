@@ -100,11 +100,12 @@ DFlash2 on, and 950,272 is refused by 59 MB
 ([finding](../../findings/2026-10-21-prefill-attention-without-prompt-planes.md)),
 when the card has enough free at start. From 0.11.0 the 27B holds its exception
 tensors in FP8 on the RTX 50 and RTX PRO cards
-([`model.exception_weights`](../reference/configuration.md#modelexception_weights)), 534.6 MB less than BF16 that the KV pool
-takes: 917,504 tokens fit unadapted with about 29.86 GB free at start, where
-BF16 needs about 30.39 GB. With 29.95 GB free (2026-11-18, the desktop holding
-the rest) the FP8 load kept 917,504 tokens, 77 MB over the context, and a BF16
-one adapted to 786,432 ([ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
+([`model.exception_weights`](../reference/configuration.md#modelexception_weights)), and its plan at
+917,504 tokens needs 534.3 MB less than with BF16: under the profile's
+1,200 MiB headroom the context fits unadapted with at least 28,483 MiB free at
+start, where BF16 needs 28,993 MiB. On 2026-11-18, with 28,549 MiB free (the
+desktop holding the rest of the 32,607 MiB), the FP8 load kept 917,504 tokens
+and a BF16 one adapted to 786,432 ([ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
 That is the plan working as intended: the context is sized to the card, not
 guessed.
 

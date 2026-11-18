@@ -47,12 +47,15 @@ loaded at the named context with its table, and each dump scored against the BF1
   wider table costs KLD on its own: BF16 at yarn:3.5 reads 2.8% above BF16 at yarn:3.
 - **At one context and table** (both at 917,504 and yarn:3.5): 1.0046 (0.9807-1.0257), -0.08 points.
 
-**The context the default leaves on the RTX 5090.** Under the `rtx5090` profile's 1,200 MiB headroom, with no config
-file, the 27B keeps the profile's 917,504 tokens unadapted when the card has about 29.86 GB free at start with FP8, and
-about 30.39 GB with BF16. On 2026-11-18, with 29.95 GB free (the desktop and the driver held the rest of the 32 GB),
-BF16 adapted to 786,432 tokens and yarn:3, 47,872 tokens (441 MB) short of the context, and FP8 kept 917,504 and
-yarn:3.5 with 8,384 tokens (77 MB) over it. A desktop holding about 0.5 GB less lets BF16 keep 917,504 as well, as #675
-saw. Under a 1,500 MiB headroom on the same card, BF16 adapted to 720,896 (yarn:2.75) and FP8 to 786,432 (yarn:3).
+**The context the default leaves on the RTX 5090.** At the `rtx5090` profile's shape (917,504 tokens, eight lanes,
+DFlash2, vision) the VRAM plan needs 28,608,687,108 bytes with FP8 and 29,142,942,212 with BF16, one sequence of KV
+included, 534.3 MB apart. Under the profile's 1,200 MiB headroom a start with no config file keeps 917,504 tokens
+unadapted when the card has at least 28,483 MiB free at start with FP8, and 28,993 MiB with BF16; with less it adapts.
+What a default install keeps therefore follows what the desktop holds. On 2026-11-18 the card had 28,549-28,564 MiB of
+its 32,607 MiB free at start (nvidia-smi read 3,624-3,639 MiB used): BF16 adapted to 786,432 tokens and yarn:3, and FP8
+kept 917,504 and yarn:3.5 with 65 MiB to spare. #675 saw BF16 keep 917,504 on a desktop holding about 0.5 GB less.
+Under a 1,500 MiB headroom both thresholds rise by 300 MiB, and on the same desktop BF16 adapted to 720,896 tokens
+(yarn:2.75) and FP8 to 786,432 (yarn:3).
 
 ## Considered options
 
