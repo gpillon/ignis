@@ -389,6 +389,51 @@ struct LayerWeights {
   GdnLayerWeights gdn{};
 };
 
+// GitHub #676 (spec #672): a DFlash2 load's verify rounds stage their inputs
+// and take their accept back through host-mapped memory
+// (kernel/src/deferred_verify.cu, kernel/src/verify_return.h): one kernel
+// copies a round's staged inputs to their device buffers, and one copies its
+// accept into the slot and then writes the ticket the host waits on. Made at
+// load, so nothing page-locks host memory while serving, and freed with the
+// model: a model loaded again in the same process stages through memory of
+// its own.
+//
+// Two slots, one a round, alternating: a round writes its slot only once the
+// round that used it before has run past its last kernel reading it
+// (`used_by`, an event recorded after that round's work), so a slot is never
+// rewritten under a kernel still to read it.
+struct VerifyStaging {
+  static constexpr std::size_t kSlotBytes = 16384;
+  static constexpr std::uint32_t kMaxCopies = 12;
+  struct Copy {
+    void *dst;
+    const void *src;
+    std::uint32_t bytes;
+  };
+  // Copies one kernel makes, in order: passed to it by value.
+  struct Copies {
+    Copy at[kMaxCopies];
+    std::uint32_t count = 0;
+  };
+
+  // The two slots, then the ticket.
+  MappedHostRegion region{2 * kSlotBytes + 64};
+  std::array<cudaEvent_t, 2> used_by{};
+  // This round's slot, the bytes of it written so far, and the copies staged
+  // there and not yet made.
+  int slot = 0;
+  std::size_t used = 0;
+  Copies pending;
+  // The last ticket handed out.
+  std::uint64_t ticket = 0;
+
+  // Zeroes the region and creates the events; throws naming what failed.
+  VerifyStaging();
+  VerifyStaging(const VerifyStaging &) = delete;
+  VerifyStaging &operator=(const VerifyStaging &) = delete;
+  ~VerifyStaging();
+};
+
 // P5-04 (GitHub #153): the verify round's substrate, built at load when the
 // options fixed a draft window (`draft_tokens > 0`, under DFLASH2 or
 // VERIFY_ONLY) and absent otherwise, so a load without a window reserves
@@ -396,7 +441,8 @@ struct LayerWeights {
 //
 // Everything below is a stable device address the verify graphs bake in
 // (ADR 0019 / 0020): the round refreshes the *_staging buffers in place by
-// one H2D copy each before a replay, the traversal writes the rest. `B` is
+// one H2D copy each before a replay (GitHub #676: a DFlash2 load's round, all
+// of them by one kernel from `staging`), the traversal writes the rest. `B` is
 // the load's `decode_lanes` (GitHub #336); `k` is the window; a `[k+1, B]` matrix is
 // contiguous with column `b`'s `k+1` entries adjacent, which is both the
 // vendored `speculative_*` ops' `[K+1,B]` and the traversal's lane-major
@@ -503,6 +549,17 @@ struct IgnisVerifyRound {
   // GitHub #680: how many of those nodes are copies (`ignis_program_stats`'s
   // `verify_graph_copy_nodes`).
   std::array<uint32_t, IGNIS_DECODE_MAX_BATCH> graph_copy_nodes{};
+
+  // GitHub #676: IGNIS_DEFER_VERIFY as the latest `ignis_decode_graph_capture`
+  // read it, on until one reads `0`; the staging a DFlash2 load's rounds take
+  // under it, made at load (null on every other load); the drafter's append
+  // after the commit as one graph per width, captured with the verify graphs
+  // under it; and the rounds that returned with their fold in flight
+  // (`ignis_program_stats`).
+  bool defer = true;
+  std::unique_ptr<VerifyStaging> staging;
+  std::array<cudaGraphExec_t, IGNIS_DECODE_MAX_BATCH> append_exec{};
+  std::uint64_t folds_in_flight = 0;
 
   std::size_t device_bytes() const {
     std::size_t bytes = 0;

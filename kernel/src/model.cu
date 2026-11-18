@@ -2875,6 +2875,9 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
         model->verify->draft_candidates = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_draws / 2);
         model->verify->draft_q = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_draws / 2);
       }
+      // GitHub #676: the host-mapped staging its verify rounds take, page-locked
+      // here rather than while serving.
+      model->verify->staging = std::make_unique<VerifyStaging>();
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: drafter round allocation failed: ") + e.what());
       cudaStreamDestroy(model->stream);
@@ -2965,6 +2968,11 @@ extern "C" uint32_t ignis_model_w4a4_activation_layout(const struct ignis_model 
 
 extern "C" void ignis_model_free(struct ignis_model *model) {
   if (model != nullptr) {
+    // GitHub #676: a verify round's commit may still be on the stream, reading
+    // the buffers and writing the host-mapped staging freed below.
+    if (model->stream != nullptr) {
+      cudaStreamSynchronize(model->stream);
+    }
     // P3-05 (GitHub #102, ADR 0019): destroy every captured decode graph
     // before the stream/scratch it was captured against goes away.
     for (auto &exec : model->decode_graph_exec) {
@@ -2975,6 +2983,13 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
     }
     if (model->verify != nullptr) {
       for (auto &exec : model->verify->graph_exec) {
+        if (exec != nullptr) {
+          cudaGraphExecDestroy(exec);
+          exec = nullptr;
+        }
+      }
+      // GitHub #676: and the drafter's append graphs.
+      for (auto &exec : model->verify->append_exec) {
         if (exec != nullptr) {
           cudaGraphExecDestroy(exec);
           exec = nullptr;

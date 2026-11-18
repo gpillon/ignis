@@ -334,6 +334,15 @@ target_include_directories(ignis_kernel_teacher_forcing_test
                                    ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 add_test(NAME ignis_kernel_teacher_forcing_test COMMAND ignis_kernel_teacher_forcing_test)
 
+# GitHub #676 (spec #672): OURS -- whether a 27B verify round stages through
+# host-mapped memory and whether it returns with its fold in flight, the two
+# host functions the round calls. Header-only and linked against nothing, like
+# the teacher forcing's test above, so it too runs while another process holds
+# the card.
+add_executable(ignis_kernel_verify_return_test test_verify_return.cpp)
+target_include_directories(ignis_kernel_verify_return_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+add_test(NAME ignis_kernel_verify_return_test COMMAND ignis_kernel_verify_return_test)
+
 # P4-03 (GitHub #119): the hq-e8-2b row codec's own op-level oracle. It was
 # FOUND in the reference at `tools/test_kv/`, not `tests/ops/` — that is why
 # no hq arm existed in the vendored `test_gqa_attention.cpp` (P1-15, GitHub
