@@ -101,18 +101,20 @@ int32_t ignis_decode_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
         model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
     ninfer::ops::embedding(ids, model->token_embedding, left, model->stream);
 
-    // GitHub #677 (spec #672, kernel/src/decode_graph_copies.h): at a
+    // GitHub #677, #680 (spec #672, kernel/src/decode_graph_copies.h): at a
     // copy-free width every layer adds its output into its input residual in
     // place (`left` is both), as the prefill's GDN body does since GitHub
     // #507 -- the layer's input RMSNorm is that residual's only other reader,
     // and it runs before the first add -- so no layer copies the residual and
-    // the two buffers never swap; and at one column each GDN layer's
-    // recurrence reads q, k and v as views of the conv output plane, where
-    // they are contiguous already (kernel/src/gdn_layer.cu
-    // `run_gdn_layer_graph`). A layer change keeps both: nothing may read the
-    // layer's input after its first add into the residual, and nothing may
-    // write the conv plane between the conv and the recurrence. Elsewhere
-    // (main's round) each layer copies its input into `right` and adds there.
+    // the two buffers never swap; and each GDN layer's recurrence reads q, k
+    // and v where the conv wrote them: at one column as views of the conv
+    // output plane, where they are contiguous already, past one column as the
+    // planes the split conv writes by lane slot (kernel/src/gdn_layer.cu
+    // `run_gdn_layer_graph`, kernel/src/gdn_conv_split.h). A layer change
+    // keeps both: nothing may read the layer's input after its first add into
+    // the residual, and nothing may write the conv's q, k and v between the
+    // conv and the recurrence. Elsewhere (main's round) each layer copies its
+    // input into `right` and adds there.
     const bool in_place = ignis::decode_graph_copies::takes(model->decode_copy_free_widths, width);
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
       void *out = in_place ? left.data : right.data;
@@ -238,10 +240,19 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
         model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
     ninfer::ops::embedding(ids, model->token_embedding, left, model->stream);
 
+    // GitHub #680 (spec #672, kernel/src/decode_graph_copies.h): copy-free,
+    // every layer adds its output into its input residual in place, as the
+    // decode round does (above), so no layer copies the residual and the
+    // buffers never swap; `left` is each layer's output where the feature
+    // taps below read it either way. The GDN record body writes q, k and v
+    // apart already. Elsewhere (main's round) each layer copies its input
+    // into `right` and adds there.
+    const bool in_place = model->verify_copy_free;
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
+      void *out = in_place ? left.data : right.data;
       const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
-          ? ignis_gqa_layer_run_body_verify(model, pool, layer, width, left.data, right.data, mode)
-          : ignis_gdn_layer_run_body_verify(model, pool, layer, width, left.data, right.data, mode);
+          ? ignis_gqa_layer_run_body_verify(model, pool, layer, width, left.data, out, mode)
+          : ignis_gdn_layer_run_body_verify(model, pool, layer, width, left.data, out, mode);
       if (rc != 0) {
         const char *detail = model->layers[layer].kind == IGNIS_LAYER_GQA
             ? ignis_gqa_layer_last_error()
@@ -250,7 +261,9 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
                   std::to_string(layer) + " failed: " + detail);
         return -1;
       }
-      std::swap(left, right);
+      if (!in_place) {
+        std::swap(left, right);
+      }
       // P5-05 (GitHub #155): `left` is this layer's output now. At a tapped
       // layer every column's output lands in rows [j * hidden, (j + 1) *
       // hidden) of `features` -- the prefill chunk's own tap, over the round's
@@ -379,9 +392,10 @@ uint32_t copy_node_count(cudaGraph_t graph) {
 // `ignis_verify_graph_run_batch`, captured once. Same failure handling as
 // the decode capture below.
 int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, uint32_t width,
-                                   cudaGraphExec_t *out_exec, uint32_t *out_nodes) {
+                                   cudaGraphExec_t *out_exec, uint32_t *out_nodes, uint32_t *out_copies) {
   *out_exec = nullptr;
   *out_nodes = 0;
+  *out_copies = 0;
   // GitHub #577: a teacher-forced round's recording is set only while that
   // round runs eagerly; a graph that baked it in would force serving rounds.
   if (model->verify->forced_tokens != nullptr) {
@@ -408,6 +422,7 @@ int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
     return -1;
   }
   const uint32_t nodes = node_count(graph);
+  const uint32_t copies = copy_node_count(graph);
   cudaGraphExec_t exec = nullptr;
   const cudaError_t inst_err = cudaGraphInstantiate(&exec, graph, 0);
   cudaGraphDestroy(graph);
@@ -418,6 +433,7 @@ int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
   }
   *out_exec = exec;
   *out_nodes = nodes;
+  *out_copies = copies;
   return 0;
 }
 
@@ -533,10 +549,10 @@ bool read_round_timing(ignis_model *model) {
   return true;
 }
 
-// GitHub #677 (spec #672): the decode widths that run copy-free from this capture on
-// (kernel/src/decode_graph_copies.h), from IGNIS_DECODE_GRAPH_COPIES and the card, read at each
-// capture. False (error set) on a value other than `1`, or when the device cannot say its
-// generation.
+// GitHub #677, #680 (spec #672): the decode widths, and whether the verify round, run copy-free
+// from this capture on (kernel/src/decode_graph_copies.h), from IGNIS_DECODE_GRAPH_COPIES and the
+// card, read at each capture. False (error set) on a value other than `1` or `wide`, or when the
+// device cannot say its generation.
 bool read_decode_graph_copies(ignis_model *model) {
   ignis::decode_graph_copies::Switch named = ignis::decode_graph_copies::Switch::Unset;
   try {
@@ -555,6 +571,7 @@ bool read_decode_graph_copies(ignis_model *model) {
     return false;
   }
   model->decode_copy_free_widths = ignis::decode_graph_copies::copy_free_widths(named, major);
+  model->verify_copy_free = ignis::decode_graph_copies::verify_copy_free(named, major);
   return true;
 }
 
@@ -612,6 +629,7 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
     if (model->verify != nullptr) {
       release_graph(model->verify->graph_exec[width - 1], model->verify->graph_ready[width - 1],
                     model->verify->graph_nodes[width - 1]);
+      model->verify->graph_copy_nodes[width - 1] = 0;
     }
   }
   // GitHub #336: the widths the load's lanes serve, and no wider: a round
@@ -640,8 +658,8 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   if (model->verify != nullptr) {
     for (uint32_t width = 1; width <= model->decode_lanes; ++width) {
       cudaGraphExec_t exec = nullptr;
-      if (capture_verify_graph_width(model, pool, width, &exec,
-                                     &model->verify->graph_nodes[width - 1]) == 0) {
+      if (capture_verify_graph_width(model, pool, width, &exec, &model->verify->graph_nodes[width - 1],
+                                     &model->verify->graph_copy_nodes[width - 1]) == 0) {
         model->verify->graph_exec[width - 1] = exec;
         model->verify->graph_ready[width - 1] = true;
       } else {

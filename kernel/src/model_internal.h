@@ -500,6 +500,9 @@ struct IgnisVerifyRound {
   // GitHub #572: each captured graph's node count, 0 for a width not captured
   // (`ignis_program_stats`'s `verify_graph_nodes`).
   std::array<uint32_t, IGNIS_DECODE_MAX_BATCH> graph_nodes{};
+  // GitHub #680: how many of those nodes are copies (`ignis_program_stats`'s
+  // `verify_graph_copy_nodes`).
+  std::array<uint32_t, IGNIS_DECODE_MAX_BATCH> graph_copy_nodes{};
 
   std::size_t device_bytes() const {
     std::size_t bytes = 0;
@@ -743,6 +746,9 @@ struct ignis_model {
   // IGNIS_DECODE_GRAPH_COPIES; every round after it reads them, replayed or
   // eager. None before a load's first capture: a round then runs main's.
   uint32_t decode_copy_free_widths = 0;
+  // GitHub #680: whether the verify round's traversal runs copy-free at every
+  // width, decided at the same capture by the same rule; false before it.
+  bool verify_copy_free = false;
   // Set by the most recent `ignis_program_decode` call: 1 if it replayed a
   // graph, 0 if it ran the eager loop (`ignis_program_stats`'s
   // `graph_launches`).

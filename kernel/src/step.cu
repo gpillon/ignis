@@ -3518,6 +3518,10 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
         model->verify != nullptr && model->verify->graph_ready[width - 1]
             ? model->verify->graph_nodes[width - 1]
             : 0;
+    out_stats->verify_graph_copy_nodes[width - 1] =
+        model->verify != nullptr && model->verify->graph_ready[width - 1]
+            ? model->verify->graph_copy_nodes[width - 1]
+            : 0;
   }
   return 0;
 }

@@ -69,10 +69,13 @@
 //! # The decode graph's nodes
 //!
 //! On the NVFP4 body with DFlash2 the reference's capture and the
-//! `decode-graph-copies` arm's are also held to their nodes (#677,
+//! `decode-graph-copies` arms' are also held to their copies (#677, #680,
 //! [`copy_free_graphs`]): on a card of compute capability 12 the reference's
-//! width-1 graph is [`COPY_FREE_WIDTH_1_NODES`] nodes, none a copy, and the
-//! arm's is main's, with its copies.
+//! decode graphs copy nothing at any width, its width-1 graph is
+//! [`COPY_FREE_WIDTH_1_NODES`] nodes, and its verify graphs keep only the
+//! drafter's [`DRAFTER_COPIES`]; the `decode-graph-copies` arm's are main's,
+//! with their copies, and the `decode-graph-copies-wide` arm's main's but the
+//! width-1 decode graph, which is the reference's.
 //!
 //! # Narrow runs
 //!
@@ -138,6 +141,7 @@ const ARMS: &[Arm] = &[
     // #679's arm, below this line.
 
     // #680's arm, below this line.
+    Arm { name: "decode-graph-copies-wide", switches: &[("IGNIS_DECODE_GRAPH_COPIES", "wide")], graphs: true },
 
     // #681's arm, below this line.
 
@@ -220,13 +224,18 @@ const LOADS: &[Load] = &[
     },
 ];
 
-/// #677: the load whose decode graphs [`copy_free_graphs`] pins, and its
-/// copy-free width-1 graph's nodes on a card of compute capability 12, every
-/// one a kernel; main's round copies each of the 64 layers' residual and each
-/// of the 48 GDN layers' q, k and v out of the conv plane, at every width.
+/// #677, #680: the load whose decode and verify graphs [`copy_free_graphs`]
+/// pins, and its copy-free width-1 decode graph's nodes on a card of compute
+/// capability 12, every one a kernel; main's decode round copies each of the
+/// 64 layers' residual and each of the 48 GDN layers' q, k and v out of the
+/// conv plane, at every width, and main's verify round each layer's residual
+/// beside the drafter's copies: its five feature taps, the final hidden it
+/// keeps and its own forward's sixteen, which no copy-free round removes.
 const COPY_FREE_LOAD: &str = "nvfp4-dflash2";
 const COPY_FREE_WIDTH_1_NODES: u32 = 677;
 const MAIN_COPIES: u32 = 64 + 3 * 48;
+const RESIDUAL_COPIES: u32 = 64;
+const DRAFTER_COPIES: u32 = 5 + 1 + 16;
 
 /// Plain rounds, then verify rounds, at each width of the session.
 const PLAIN_ROUNDS: u32 = 4;
@@ -384,28 +393,41 @@ fn riders<'a, 'p>(seqs: &'a mut [Option<Seq<'p>>], riding: &[usize]) -> Vec<&'a 
     riding.iter().map(|&lane| remaining[lane].take().expect("a live lane, once")).collect()
 }
 
-/// #677: on [`COPY_FREE_LOAD`], the decode graphs the arm's capture left, for
-/// the reference and the arm that names main's copying round: the width-1
-/// round copy-free on a card of compute capability 12 with every switch
-/// unset, [`COPY_FREE_WIDTH_1_NODES`] nodes and no copy; main's
-/// [`MAIN_COPIES`] copies under `IGNIS_DECODE_GRAPH_COPIES=1` and on any other
-/// card, and at every other width under both.
+/// #677, #680: on [`COPY_FREE_LOAD`], the decode and verify graphs the
+/// arm's capture left, for the reference and the arms that name main's
+/// copying rounds. On a card of compute capability 12 with every switch
+/// unset, no decode graph copies, the width-1 one is
+/// [`COPY_FREE_WIDTH_1_NODES`] nodes, and every verify graph copies only the
+/// drafter's [`DRAFTER_COPIES`]; under `IGNIS_DECODE_GRAPH_COPIES=1`, and on
+/// any other card, every decode graph copies main's [`MAIN_COPIES`] and every
+/// verify graph the drafter's and the [`RESIDUAL_COPIES`]; under `wide`, the
+/// same but the width-1 decode graph, the reference's.
 fn copy_free_graphs(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label: &str) {
-    let copies_named = arm.switches.contains(&("IGNIS_DECODE_GRAPH_COPIES", "1"));
-    if load.name != COPY_FREE_LOAD || !(arm.switches.is_empty() || copies_named) {
+    let named = arm.switches.iter().find(|&&(name, _)| name == "IGNIS_DECODE_GRAPH_COPIES").map(|&(_, value)| value);
+    if load.name != COPY_FREE_LOAD || !(arm.switches.is_empty() || named.is_some()) {
         return;
     }
     let (_, (major, _)) = CudaDevice::identity(0).unwrap_or_else(|e| panic!("{label}: device identity: {e}"));
     let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
     let lanes = load.lanes as usize;
     let (nodes, copies) = (&stats.decode_graph_nodes[..lanes], &stats.decode_graph_copy_nodes[..lanes]);
-    println!("round_identity_gpu {label}: arm `{}`: decode graph nodes {nodes:?}, copies {copies:?}", arm.name);
-    let copy_free = major == 12 && !copies_named;
-    assert_eq!(copies[0], if copy_free { 0 } else { MAIN_COPIES }, "{label}: arm `{}`: width 1's copy nodes", arm.name);
-    if major == 12 {
+    let (verify_nodes, verify_copies) = (&stats.verify_graph_nodes[..lanes], &stats.verify_graph_copy_nodes[..lanes]);
+    println!(
+        "round_identity_gpu {label}: arm `{}`: decode graph nodes {nodes:?}, copies {copies:?}; verify graph nodes \
+         {verify_nodes:?}, copies {verify_copies:?}",
+        arm.name
+    );
+    let blackwell = major == 12;
+    let width_1_free = blackwell && named != Some("1");
+    let wide_free = blackwell && named.is_none();
+    assert_eq!(copies[0], if width_1_free { 0 } else { MAIN_COPIES }, "{label}: arm `{}`: width 1's copy nodes", arm.name);
+    if blackwell {
         assert_eq!(nodes[0], COPY_FREE_WIDTH_1_NODES + copies[0], "{label}: arm `{}`: width 1's nodes", arm.name);
     }
-    assert!(copies[1..].iter().all(|&c| c == MAIN_COPIES), "{label}: arm `{}`: widths 2-{lanes} copy as main", arm.name);
+    let wide = if wide_free { 0 } else { MAIN_COPIES };
+    assert!(copies[1..].iter().all(|&c| c == wide), "{label}: arm `{}`: widths 2-{lanes} copy {wide} nodes", arm.name);
+    let verify = DRAFTER_COPIES + if wide_free { 0 } else { RESIDUAL_COPIES };
+    assert!(verify_copies.iter().all(|&c| c == verify), "{label}: arm `{}`: the verify graphs copy {verify} nodes", arm.name);
 }
 
 fn expect_replay(model: &Model, pool: &SeqPool, graphs: bool, what: &str) {
