@@ -645,9 +645,24 @@ switch a model serves without vision only when the model before it had none,
 or when vision is named off for it (`--qwen38flashnext-vision-enabled false`,
 its env var or its config file section), which the switch's
 `ignis.model.switch_vision_off` line names
-([Model switching](api/model-switching.md)). `media_budget_exceeded`: several images together are past
-`--vision-max-tokens` (32,768 by default); a single oversized image is
-downscaled instead ([Vision](configuration/vision.md)).
+([Model switching](api/model-switching.md)).
+
+`media_budget_exceeded`: from 0.11.0, several images that together pass
+`--vision-max-tokens` (32,768 by default) or the 256 MiB media byte budget are
+no longer refused: the oldest are dropped and the model reads a line of text
+where each was ([Vision](configuration/vision.md)); a single oversized image is
+downscaled. What is still refused, wherever the image sits in the request: one
+image whose encoded bytes pass the byte budget, or whose frame passes the
+decoded-pixel limit (64 Mi pixels); more images than the item cap; image URLs
+whose fetched bytes together pass the byte budget (send them inline, as a
+harness does). 0.10.0 refuses several images whose total passes the budget,
+which an agent that resends its image history every turn reaches by itself.
+
+Every media refusal, this one and `invalid_media`, `media_fetch_failed` or
+`media_fetch_timeout`, leaves a WARN line `ignis.media.refused` in the server's
+log from 0.11.0, with the `code`, the `part` refused and, for a budget, the
+`budget`, its `limit` and the amount `requested` ([telemetry](guides/telemetry.md)): the request was
+answered before admission, so no `ignis.request.*` line names it.
 
 ### A `400` naming a `param`
 

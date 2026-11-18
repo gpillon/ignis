@@ -122,3 +122,4 @@ memory of why ignis is built the way it is.
 | [0099](0099-a-harness-reaches-ignis-through-an-mcp-server-inside-ignis-and-a-skill-ignis-serves-whose-scripts-carry-the-files.md) | A harness reaches ignis through an MCP server inside ignis and a skill ignis serves, whose scripts carry the files | proposed | |
 | [0100](0100-the-27b-cuts-a-reusable-prompts-tail-once-at-the-generation-opener-on-every-card.md) | The 27B cuts a reusable prompt's tail once, at the generation opener, on every card | accepted | |
 | [0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md) | On Windows the VRAM plan reserves the W4A4 TMA products' descriptor slots as a line of their own | accepted | |
+| [0102](0102-a-request-whose-images-pass-the-vision-budget-together-drops-its-oldest-a-block-at-a-time-as-text.md) | A request whose images pass the vision budget together drops its oldest, a block at a time, as text | accepted | |

@@ -351,6 +351,43 @@ fn unescape(bytes: &[u8], start: usize) -> (Vec<u8>, usize) {
     (out, bytes.len())
 }
 
+/// An SOF segment's frame size and components, with every check the decoder
+/// makes of them before it allocates the frame.
+fn frame_header(data: &[u8], max_pixels: u64) -> Result<(usize, usize, Vec<Component>), DecodeFailure> {
+    if data.len() < 6 {
+        return Err(invalid("sof: truncated"));
+    }
+    if data[0] != 8 {
+        return Err(unsupported(format!("{}-bit JPEG", data[0])));
+    }
+    let height = (data[1] as usize) << 8 | data[2] as usize;
+    let width = (data[3] as usize) << 8 | data[4] as usize;
+    let count = data[5] as usize;
+    if width == 0 || height == 0 {
+        return Err(invalid("sof: zero image dimension"));
+    }
+    if data.len() != 6 + 3 * count || count == 0 {
+        return Err(invalid("sof: component count mismatch"));
+    }
+    if count != 1 && count != 3 {
+        return Err(unsupported(format!("{count}-component JPEG")));
+    }
+    let pixels = width as u64 * height as u64;
+    if pixels > max_pixels {
+        return Err(DecodeFailure::Pixels(pixels));
+    }
+    let components: Vec<Component> = (0..count)
+        .map(|i| {
+            let c = &data[6 + 3 * i..9 + 3 * i];
+            Component { id: c[0], h: (c[1] >> 4) as usize, v: (c[1] & 0x0f) as usize, quant: c[2] as usize }
+        })
+        .collect();
+    if components.iter().any(|c| c.h == 0 || c.v == 0 || c.h > 4 || c.v > 4 || c.quant >= 4) {
+        return Err(invalid("sof: invalid sampling factor or quant table"));
+    }
+    Ok((width, height, components))
+}
+
 impl Decoder {
     fn dqt(&mut self, mut data: &[u8]) -> Result<(), DecodeFailure> {
         while data.len() >= 65 {
@@ -392,37 +429,8 @@ impl Decoder {
     }
 
     fn sof(&mut self, data: &[u8], progressive: bool, max_pixels: u64) -> Result<(), DecodeFailure> {
-        if data.len() < 6 {
-            return Err(invalid("sof: truncated"));
-        }
-        if data[0] != 8 {
-            return Err(unsupported(format!("{}-bit JPEG", data[0])));
-        }
-        let height = (data[1] as usize) << 8 | data[2] as usize;
-        let width = (data[3] as usize) << 8 | data[4] as usize;
-        let count = data[5] as usize;
-        if width == 0 || height == 0 {
-            return Err(invalid("sof: zero image dimension"));
-        }
-        if data.len() != 6 + 3 * count || count == 0 {
-            return Err(invalid("sof: component count mismatch"));
-        }
-        if count != 1 && count != 3 {
-            return Err(unsupported(format!("{count}-component JPEG")));
-        }
-        let pixels = width as u64 * height as u64;
-        if pixels > max_pixels {
-            return Err(DecodeFailure::Pixels(pixels));
-        }
-        let components: Vec<Component> = (0..count)
-            .map(|i| {
-                let c = &data[6 + 3 * i..9 + 3 * i];
-                Component { id: c[0], h: (c[1] >> 4) as usize, v: (c[1] & 0x0f) as usize, quant: c[2] as usize }
-            })
-            .collect();
-        if components.iter().any(|c| c.h == 0 || c.v == 0 || c.h > 4 || c.v > 4 || c.quant >= 4) {
-            return Err(invalid("sof: invalid sampling factor or quant table"));
-        }
+        let (width, height, components) = frame_header(data, max_pixels)?;
+        let count = components.len();
         let h_max = components.iter().map(|c| c.h).max().unwrap();
         let v_max = components.iter().map(|c| c.v).max().unwrap();
         let (mb_w, mb_h) = (width.div_ceil(h_max * 8), height.div_ceil(v_max * 8));
@@ -1050,6 +1058,30 @@ pub fn decode(bytes: &[u8], max_pixels: u64) -> Result<Rgb8Image, DecodeFailure>
     }
     let rgb = to_rgb(decoder.frame.as_ref().unwrap());
     Ok(orient(rgb, exif_orientation(bytes)))
+}
+
+/// The `(width, height)` [`decode`] gives `bytes`, read from the first frame
+/// header with the checks the decoder makes of it, the EXIF orientation
+/// applied, and no pixel decoded (GitHub #673). A failure past the header (a
+/// table, a scan) is not seen.
+pub fn dimensions(bytes: &[u8], max_pixels: u64) -> Result<(u32, u32), DecodeFailure> {
+    let mut pos = 0;
+    loop {
+        match find_marker(bytes, &mut pos) {
+            None => return Err(invalid("image contains no decoded frame")),
+            Some(0xc0..=0xc2) => {
+                let (width, height, _) = frame_header(segment(bytes, pos)?, max_pixels)?;
+                let (width, height) = (width as u32, height as u32);
+                // `orient` puts the image on its side from orientation 5 on.
+                return Ok(if exif_orientation(bytes) >= 5 { (height, width) } else { (width, height) });
+            }
+            Some(0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf | 0xf7) => {
+                return Err(unsupported("lossless, hierarchical or arithmetic-coded JPEG"));
+            }
+            Some(0xda) => return Err(invalid("sos before sof")),
+            Some(_) => {}
+        }
+    }
 }
 
 #[cfg(test)]

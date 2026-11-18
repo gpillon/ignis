@@ -18,7 +18,12 @@ already seen.
 Images arrive inline as data URIs, or as URLs the server fetches, prepares and
 caches. One merged vision token covers 32x32 pixels, so a 4096x4096 image is
 16,384 tokens. An image past `vision.max_tokens` is downscaled, not refused,
-unless a side would fall below 32 px. The encoder's output, the embedding, is
+unless a side would fall below 32 px. From 0.11.0, images that pass it only
+together are not refused either (0.10.0 refuses them): the oldest are dropped,
+a block of half the budget at a time, and the model reads a line of text where
+each was, so an agent whose history grows by an image a turn keeps working and
+keeps resuming from the turn before between two drops
+([Vision](../configuration/vision.md)). The encoder's output, the embedding, is
 keyed by the image's content digest and its grid and kept in a paged pool
 (ADR 0035). A second request that carries the same image finds it there and
 skips the tower. Image tokens enter the prompt like text, so prefix reuse also
@@ -67,12 +72,15 @@ about one new image takes the same time as before.
   [`vision.embedding_pool_mib`](../reference/configuration.md#visionembedding_pool_mib)
   and, for fetched images, [`media.cache_mib`](../reference/configuration.md#mediacache_mib)
   and [`media.allow_private_network`](../reference/configuration.md#mediaallow_private_network).
-- **Errors**: `vision_disabled` and `media_budget_exceeded`.
+- **Errors**: `vision_disabled` and `media_budget_exceeded`
+  ([what is still refused](../troubleshooting.md#vision_disabled-or-media_budget_exceeded)).
 - **Logs**: the line a request with images ends with, `ignis.request.done`
   or `ignis.request.cancelled`, reports `media.vision_tokens`,
   `media.natural_vision_tokens`, `media.encode_seconds` and
-  `media.cache_hits`, whatever the primitive; a decide question the engine
-  never ran logs none ([telemetry](../guides/telemetry.md)).
+  `media.cache_hits`, whatever the primitive, and from 0.11.0
+  `media.dropped_items` for the images dropped past the budget; a decide
+  question the engine never ran logs none. A request refused for its images
+  leaves `ignis.media.refused` from 0.11.0 ([telemetry](../guides/telemetry.md)).
 - **Playground**: image input in the [chat](../playground/chat.md), and the
   [Decide tab](../playground/decide.md) with an image as the state.
 

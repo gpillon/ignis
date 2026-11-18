@@ -1046,6 +1046,9 @@ async fn prepare_input(
     // fetch's timeout bounds the acquisition.
     let deadline = crate::deadline::after(server.live().request_timeout).into_std();
     let acquired = acquirer.acquire(messages, deadline).await.map_err(media_rejection)?;
+    // GitHub #673: images dropped past the budgets render as text where they
+    // were, and the template pairs the kept ones with their parts in order.
+    let messages = &*acquired.omit_dropped(messages);
     // A media prompt reports no text: a `locate` refuses a parts `state`
     // before it renders one.
     let template = &model_loaded.template;
@@ -1103,7 +1106,24 @@ pub(crate) async fn prepare_decision_request(
 
 /// The response for refused media (GitHub #179): a 400 with the media
 /// code, or the handler's own 504 when the request deadline passed.
+///
+/// The refusal is answered before admission, so no `ignis.request.*` line
+/// says why the client's request failed: it leaves `ignis.media.refused`
+/// instead (GitHub #673), with the code, the part and, for a budget, its
+/// numbers. Never the message: a fetch's names its URL, and a signed URL
+/// carries its signature.
 fn media_rejection(rejection: MediaRejection) -> Response {
+    let budget = rejection.budget;
+    tracing::warn!(
+        name: "ignis.media.refused",
+        status = rejection.status,
+        code = rejection.code,
+        budget = budget.map(|b| crate::media::budget_key(b.budget)),
+        limit = budget.map(|b| b.limit),
+        requested = budget.map(|b| b.requested),
+        part = rejection.part.as_deref(),
+        "request media refused"
+    );
     let status = StatusCode::from_u16(rejection.status).unwrap_or(StatusCode::BAD_REQUEST);
     let type_ = if status == StatusCode::BAD_REQUEST { "invalid_request_error" } else { rejection.code };
     error_response(status, type_, rejection.code, rejection.message)

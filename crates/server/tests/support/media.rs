@@ -19,13 +19,19 @@ use ignis_server::media::Preparer;
 
 /// A flat RGB PNG.
 pub fn png(width: u32, height: u32) -> Vec<u8> {
+    shade(width, height, 100)
+}
+
+/// A flat RGB PNG of grey `level`: images of one size that are not the same
+/// bytes, so each is its own cache entry (GitHub #673).
+pub fn shade(width: u32, height: u32, level: u8) -> Vec<u8> {
     let mut out = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut out, width, height);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().unwrap();
-        writer.write_image_data(&vec![100u8; (width * height * 3) as usize]).unwrap();
+        writer.write_image_data(&vec![level; (width * height * 3) as usize]).unwrap();
     }
     out
 }

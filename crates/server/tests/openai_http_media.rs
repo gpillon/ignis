@@ -102,6 +102,17 @@ fn harness(preparer: Option<Arc<dyn Preparer>>, cache_bytes: u64, max_sequence_t
 
 /// [`harness`], its requests' deadline `timeout`.
 fn harness_timed(preparer: Option<Arc<dyn Preparer>>, cache_bytes: u64, max_sequence_tokens: Option<u32>, timeout: Duration) -> Harness {
+    harness_under(preparer, cache_bytes, max_sequence_tokens, timeout, limits())
+}
+
+/// [`harness_timed`], its media acquired under `limits`.
+fn harness_under(
+    preparer: Option<Arc<dyn Preparer>>,
+    cache_bytes: u64,
+    max_sequence_tokens: Option<u32>,
+    timeout: Duration,
+    limits: ProcessorOptions,
+) -> Harness {
     let mut config = SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() };
     if let Some(tokens) = max_sequence_tokens {
         config.max_sequence_tokens = tokens;
@@ -117,7 +128,7 @@ fn harness_timed(preparer: Option<Arc<dyn Preparer>>, cache_bytes: u64, max_sequ
         None => server,
         Some(preparer) => server.with_media(Arc::new(MediaAcquirer::new(
             preparer,
-            limits(),
+            limits,
             MediaPolicy::new(false, cache_bytes),
         ))),
     };
@@ -208,6 +219,43 @@ async fn a_responses_input_image_item_is_the_same_image_request() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["usage"]["input_tokens"], 7, "{body}");
     assert_expanded(&h.submitted);
+}
+
+/// GitHub #673: two images whose tokens pass the budget together lose the
+/// older, on chat completions and on the Responses API alike: the request is
+/// admitted, the older rendered as the omission text where it was, the newer
+/// kept whole.
+#[tokio::test]
+async fn two_images_past_the_vision_budget_are_admitted_without_the_older_on_both_routes() {
+    use ignis_server::media::OMITTED_IMAGE;
+    use ignis_server::template::TemplateProvider;
+    // 64 x 64 (4 tokens) then 96 x 64 (6), under a budget of 9.
+    let budget = ProcessorOptions { max_vision_tokens: 9, ..limits() };
+    let (older, newer) = (data_uri(&support::media::shade(64, 64, 40)), data_uri(&support::media::shade(96, 64, 200)));
+    let message = json!({"role": "user", "content": [
+        {"type": "text", "text": "what is this"},
+        {"type": "image_url", "image_url": {"url": older}},
+        {"type": "image_url", "image_url": {"url": newer}},
+    ]});
+    let words = |text: &str| SimpleTemplateProvider
+        .apply_chat_template(&[ignis_server::template::ChatMessage::text("user", text)], &Default::default(), &[])
+        .unwrap()
+        .tokens;
+    let expected: Vec<u32> = [words("what is this"), words(OMITTED_IMAGE), vec![IMAGE_PAD_ID; 6]].concat();
+    for (path, body, usage) in [
+        ("/v1/chat/completions", chat(json!([message.clone()])), "prompt_tokens"),
+        ("/v1/responses", json!({"model": MODEL, "max_output_tokens": 4, "input": [message.clone()]}), "input_tokens"),
+    ] {
+        let h = harness_under(Some(Arc::new(processor(budget.clone()))), 0, None, Duration::from_secs(10), budget.clone());
+        let (status, body) = send(&h.app, path, body).await;
+        assert_eq!(status, 200, "{path}: {body}");
+        assert_eq!(body["usage"][usage], expected.len(), "{path}: {body}");
+        let submitted = h.submitted.lock().unwrap();
+        assert_eq!(submitted[0].tokens, expected, "{path}");
+        let multimodal = submitted[0].multimodal.as_ref().expect("the newer image");
+        assert_eq!(multimodal.media.len(), 1, "{path}");
+        assert_eq!(multimodal.media[0].token_span.begin, expected.len() - 6, "{path}");
+    }
 }
 
 #[tokio::test]

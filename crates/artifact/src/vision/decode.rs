@@ -57,6 +57,35 @@ pub fn decode_image(bytes: &[u8], max_pixels: u64) -> Result<Rgb8Image, DecodeFa
     }
 }
 
+/// The `(width, height)` [`decode_image`] gives `bytes`, read from the
+/// format's header without decoding a pixel (GitHub #673): what a request
+/// weighs an image by before deciding whether to prepare it. The same magic
+/// bytes pick the format and the same frame-size limit applies; a failure the
+/// decoder finds past the header is not seen.
+pub fn image_dimensions(bytes: &[u8], max_pixels: u64) -> Result<(u32, u32), DecodeFailure> {
+    let (width, height) = if bytes.is_empty() {
+        return Err(undecodable("media bytes are empty"));
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let mut decoder = png::Decoder::new(Cursor::new(bytes));
+        let header = decoder.read_header_info().map_err(undecodable)?;
+        (header.width, header.height)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        // `decode_gif` draws the first frame on the logical screen.
+        let decoder = gif::DecodeOptions::new().read_info(Cursor::new(bytes)).map_err(undecodable)?;
+        (u32::from(decoder.width()), u32::from(decoder.height()))
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        image_webp::WebPDecoder::new(Cursor::new(bytes)).map_err(undecodable)?.dimensions()
+    } else if bytes.starts_with(&[0xff, 0xd8]) {
+        return jpeg::dimensions(bytes, max_pixels);
+    } else {
+        return Err(DecodeFailure::Invalid(InvalidMedia::Unsupported(
+            "unrecognised image format (PNG, JPEG, WebP and GIF are accepted)".to_owned(),
+        )));
+    };
+    check_pixels(width, height, max_pixels)?;
+    Ok((width, height))
+}
+
 /// Decode `bytes` to RGBA8, picking the decoder from the magic bytes: PNG
 /// (palette and tRNS expanded, 16-bit samples keep their high byte, gray
 /// replicated) and WebP with their alpha, JPEG opaque with its EXIF

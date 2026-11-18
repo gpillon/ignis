@@ -310,9 +310,12 @@ route sent it as an event of a stream it had already answered `200`.
 it back every turn. One merged vision token covers 32 x 32 pixels, so a
 512 x 512 preview is 256 tokens, and every image of a request together is
 held to [`vision.max_tokens`](../reference/configuration.md#visionmax_tokens),
-32,768 by default. Past it the request is refused `media_budget_exceeded`. A
-session that makes many images raises it, with `PATCH /v1/config` (it
-reloads the model) or at start.
+32,768 by default. Past it the oldest previews are dropped, a block of half
+the budget at a time, and the model reads a line of text where each was, so
+the session goes on and keeps resuming from the turn before between two drops
+([Vision](../configuration/vision.md)). A session that wants the model to keep
+seeing more of its images raises it, with `PATCH /v1/config` (it reloads the
+model) or at start.
 
 **No image model on disk.** The tool names the image model loaded, else the
 first one on disk that the card can load, by the rule the skill's scripts

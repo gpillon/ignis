@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::frontend::{ChatMessage, ChatRenderOptions, FrontendSet, Tokenizer};
 
-pub use decode::{decode_image, decode_image_rgba, DecodeFailure};
+pub use decode::{decode_image, decode_image_rgba, image_dimensions, DecodeFailure};
 pub use resize::{smart_resize, Size};
 
 /// Side of one vision patch, in pixels.
@@ -219,6 +219,52 @@ impl ProcessorOptions {
         if grid_of(size).vision_tokens() > self.max_vision_tokens {
             return resize::smart_resize(height, width, (FACTOR * FACTOR) as u64, max_pixels);
         }
+        Ok(size)
+    }
+
+    /// The grid [`VisionProcessor::prepare_media`] gives `bytes` (media item
+    /// `item`), or the refusal it answers, read from the image's header with
+    /// no pixel decoded (GitHub #673): what a request weighs an image by
+    /// before it decides which of its images to prepare. A decode failure past
+    /// the header is the one refusal it cannot see.
+    pub fn header_grid(&self, item: usize, bytes: &[u8]) -> Result<Grid, ProcessorError> {
+        check_budget(Budget::EncodedBytes, self.max_encoded_media_bytes, bytes.len() as u64)?;
+        let (width, height) =
+            decode::image_dimensions(bytes, self.max_decoded_pixels).map_err(|failure| self.decode_error(item, failure))?;
+        self.item_size(item, width, height).map(grid_of)
+    }
+
+    /// A decoder's failure on item `item` as the processor reports it.
+    fn decode_error(&self, item: usize, failure: DecodeFailure) -> ProcessorError {
+        match failure {
+            DecodeFailure::Invalid(reason) => ProcessorError::InvalidMedia { item, reason },
+            DecodeFailure::Pixels(requested) => {
+                ProcessorError::BudgetExceeded { budget: Budget::DecodedPixels, limit: self.max_decoded_pixels, requested }
+            }
+        }
+    }
+
+    /// The size item `item`, decoded to `width x height`, is resized to, held
+    /// to the per-item limits: one place for [`Self::header_grid`] and
+    /// [`VisionProcessor::prepare_media`], so the two cannot disagree.
+    fn item_size(&self, item: usize, width: u32, height: u32) -> Result<resize::Size, ProcessorError> {
+        let size = self.resize_target(height, width).map_err(|error| match error {
+            resize::ResizeError::AspectRatio => {
+                ProcessorError::InvalidMedia { item, reason: InvalidMedia::AspectRatio { width, height } }
+            }
+            resize::ResizeError::InvalidConfiguration => {
+                ProcessorError::InvalidConfig("invalid image resize configuration".to_owned())
+            }
+        })?;
+        let grid = grid_of(size);
+        check_budget(Budget::RawPatches, self.max_raw_patches, grid.raw_patches())?;
+        check_budget(Budget::VisionTokens, self.max_vision_tokens, grid.vision_tokens())?;
+        // Then the item bound, which only the pixel bound can make tighter:
+        // `smart_resize` can land past it -- an upscale to the floor rounds
+        // up, and a side it clamps to one merge factor can push the area over
+        // -- when the bounds are small or sit close. Neither happens at this
+        // artifact's 65,536 / 16,777,216-pixel bounds.
+        check_budget(Budget::ItemVisionTokens, self.max_item_tokens(), grid.vision_tokens())?;
         Ok(size)
     }
 
@@ -432,25 +478,10 @@ impl VisionProcessor {
         let options = &self.options;
         check_budget(Budget::EncodedBytes, options.max_encoded_media_bytes, bytes.len() as u64)?;
         let content_digest: [u8; 32] = Sha256::digest(bytes).into();
-        let image = decode::decode_image(bytes, options.max_decoded_pixels).map_err(|failure| match failure {
-            decode::DecodeFailure::Invalid(reason) => ProcessorError::InvalidMedia { item, reason },
-            decode::DecodeFailure::Pixels(requested) => ProcessorError::BudgetExceeded {
-                budget: Budget::DecodedPixels,
-                limit: options.max_decoded_pixels,
-                requested,
-            },
-        })?;
+        let image = decode::decode_image(bytes, options.max_decoded_pixels)
+            .map_err(|failure| options.decode_error(item, failure))?;
         let (source_width, source_height) = (image.width, image.height);
-        let size = options.resize_target(image.height, image.width)
-            .map_err(|error| match error {
-                resize::ResizeError::AspectRatio => ProcessorError::InvalidMedia {
-                    item,
-                    reason: InvalidMedia::AspectRatio { width: image.width, height: image.height },
-                },
-                resize::ResizeError::InvalidConfiguration => {
-                    ProcessorError::InvalidConfig("invalid image resize configuration".to_owned())
-                }
-            })?;
+        let size = options.item_size(item, image.width, image.height)?;
         let grid = grid_of(size);
         // What the artifact's bounds alone would give, for the log: only
         // worth the second resize when the budget moved the bounds.
@@ -460,14 +491,6 @@ impl VisionProcessor {
             resize::smart_resize(source_height, source_width, options.min_pixels, options.max_pixels)
                 .map_or(grid.vision_tokens(), |natural| grid_of(natural).vision_tokens())
         };
-        check_budget(Budget::RawPatches, options.max_raw_patches, grid.raw_patches())?;
-        check_budget(Budget::VisionTokens, options.max_vision_tokens, grid.vision_tokens())?;
-        // Then the item bound, which only the pixel bound can make tighter:
-        // `smart_resize` can land past it -- an upscale to the floor rounds
-        // up, and a side it clamps to one merge factor can push the area over
-        // -- when the bounds are small or sit close. Neither happens at this
-        // artifact's 65,536 / 16,777,216-pixel bounds.
-        check_budget(Budget::ItemVisionTokens, options.max_item_tokens(), grid.vision_tokens())?;
         let resized = resize::resize_bicubic(image, size);
         Ok(PreparedMedia {
             grid,
@@ -812,6 +835,44 @@ mod tests {
                 assert!(tokens >= 1 && tokens <= budget, "{height} x {width} @ {budget}: {tokens} tokens ({size:?})");
             }
         }
+    }
+
+    /// GitHub #673: the grid an image is weighed by before anything is
+    /// prepared, read from its header, is the grid its preparation gives it,
+    /// refusals included, in every format, under budgets that shrink it and
+    /// limits that refuse it: an EXIF-rotated JPEG comes out on its side, a
+    /// GIF at its screen, not its first frame.
+    #[test]
+    fn the_header_gives_the_grid_and_the_refusals_preparation_gives() {
+        let fixture = |name: &str| std::fs::read(format!("{}/tests/fixtures/vision/images/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let images = [
+            "alpha.png", "animated.gif", "downscale.png", "exif_rotated.jpg", "lossless.webp", "odd_aspect.png",
+            "odd_width.jpg", "on_grid.png", "progressive.jpg", "restart.jpg", "second.png", "strip.png",
+            "strip_too_wide.png", "subsampled_422.jpg", "upscale.png",
+        ];
+        let real = ProcessorOptions { min_pixels: 65_536, max_pixels: 16_777_216, ..options() };
+        let limits = [
+            options(),
+            ProcessorOptions { max_vision_tokens: 16, ..options() },
+            ProcessorOptions { max_vision_tokens: 3, ..options() },
+            real.clone(),
+            ProcessorOptions { max_vision_tokens: 64, ..real },
+            ProcessorOptions { max_decoded_pixels: 4_000, ..options() },
+            ProcessorOptions { max_encoded_media_bytes: 1_000, ..options() },
+        ];
+        let mut refused = 0;
+        for limits in limits {
+            let (_, processor) = processor(limits.clone());
+            for name in images {
+                let bytes = fixture(name);
+                let prepared = processor.prepare_media(3, &bytes).map(|media| media.grid);
+                refused += usize::from(prepared.is_err());
+                assert_eq!(limits.header_grid(3, &bytes), prepared, "{name} under {limits:?}");
+            }
+        }
+        assert!(refused > 0, "some case is a refusal, so both sides of the check are exercised");
+        let rotated = processor(options()).1.prepare_media(0, &fixture("exif_rotated.jpg")).unwrap();
+        assert_ne!(rotated.grid.h, rotated.grid.w, "the rotation case is not square");
     }
 
     #[test]

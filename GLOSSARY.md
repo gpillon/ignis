@@ -1280,7 +1280,9 @@ Turning a request's image parts into prepared **media items** before it is
 admitted: decoding a `data:` URI or fetching a URL under the media policy
 (private addresses refused unless `--media-allow-private-network`, byte cap,
 deadline), then preprocessing, memoized by content digest. A refused image
-refuses its request before admission; nothing reaches the scheduler.
+refuses its request before admission; nothing reaches the scheduler. Images
+that pass the request's budgets only together are not refused: the oldest
+become **dropped images**.
 
 **Media encode**:
 The prefill step that runs the **vision encoder** over one **media item** and
@@ -1312,6 +1314,18 @@ full 16,384: an 8,192-token chunk's scratch holds it alone, a 1,024-token
 chunk's with the ring (#560). An image over it is
 downscaled onto a smaller grid, not refused (#248).
 _Avoid_: envelope (the request's total).
+
+**Image block**:
+A run of a request's images, in prompt order, that together hold at most half
+of the envelope and half of the media byte budget, or one image past half
+alone: the unit a request's images are dropped in (ADR 0102).
+
+**Dropped image**:
+An image of a request whose images together pass the envelope or the media
+byte budget, among the oldest **image blocks** left out to bring the rest
+within both. The model reads, where it was, a line of text saying an image was
+there; it is never prepared nor encoded (ADR 0102).
+_Avoid_: evicted image, truncated history.
 
 **Media embedding**:
 A media item's encoder output, `[hidden, vision tokens]`, leaf-owned. **Held** by a request from its encode until the item's last

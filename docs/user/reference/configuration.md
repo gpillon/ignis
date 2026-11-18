@@ -1125,7 +1125,7 @@ Load the vision tower and reserve its workspace. Flash-Next's needs its vision c
 | Per model | `--qwen38-vision-max-tokens`, `--qwen38flashnext-vision-max-tokens` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-Merged vision tokens per request. An image over it is shrunk to fit, aspect kept; refused only when its aspect ratio cannot fit, or when several images total over it. Needs vision on.
+Merged vision tokens per request. An image over it is shrunk to fit, aspect kept; refused only when its aspect ratio cannot fit. Images that total over it lose the oldest, a block of half of it at a time, each read as a line of text where it was. Needs vision on.
 
 ### `vision.embedding_pool_mib`
 

@@ -1083,6 +1083,10 @@ impl Telemetry {
             media.vision_tokens = media.map(|m| m.vision_tokens),
             media.natural_vision_tokens = media.map(|m| m.natural_vision_tokens),
             media.bytes = media.map(|m| m.media_bytes),
+            // GitHub #673: the oldest images, dropped past the budgets.
+            media.dropped_items = media.map(|m| m.dropped_items),
+            media.dropped_vision_tokens = media.map(|m| m.dropped_vision_tokens),
+            media.dropped_bytes = media.map(|m| m.dropped_bytes),
             media.preprocess_seconds = media.map(|m| m.preprocess_seconds),
             media.cache_hits = media.map(|m| m.cache_hits),
             media.cache_misses = media.map(|m| m.cache_misses),
@@ -1137,6 +1141,10 @@ impl Telemetry {
             media.vision_tokens = media.map(|m| m.vision_tokens),
             media.natural_vision_tokens = media.map(|m| m.natural_vision_tokens),
             media.bytes = media.map(|m| m.media_bytes),
+            // GitHub #673: the oldest images, dropped past the budgets.
+            media.dropped_items = media.map(|m| m.dropped_items),
+            media.dropped_vision_tokens = media.map(|m| m.dropped_vision_tokens),
+            media.dropped_bytes = media.map(|m| m.dropped_bytes),
             media.preprocess_seconds = media.map(|m| m.preprocess_seconds),
             media.cache_hits = media.map(|m| m.cache_hits),
             media.cache_misses = media.map(|m| m.cache_misses),
@@ -1298,6 +1306,10 @@ impl Telemetry {
             media.vision_tokens = media.map(|m| m.vision_tokens),
             media.natural_vision_tokens = media.map(|m| m.natural_vision_tokens),
             media.bytes = media.map(|m| m.media_bytes),
+            // GitHub #673: the oldest images, dropped past the budgets.
+            media.dropped_items = media.map(|m| m.dropped_items),
+            media.dropped_vision_tokens = media.map(|m| m.dropped_vision_tokens),
+            media.dropped_bytes = media.map(|m| m.dropped_bytes),
             media.preprocess_seconds = media.map(|m| m.preprocess_seconds),
             media.cache_hits = media.map(|m| m.cache_hits),
             media.cache_misses = media.map(|m| m.cache_misses),
@@ -1637,6 +1649,9 @@ mod tests {
             vision_tokens: 8,
             natural_vision_tokens: 20,
             media_bytes: 4096,
+            dropped_items: 3,
+            dropped_vision_tokens: 12,
+            dropped_bytes: 6144,
             preprocess_seconds: 0.25,
             cache_hits: 1,
             cache_misses: 1,
@@ -1663,6 +1678,10 @@ mod tests {
         assert_eq!(attributes["media.preprocess_seconds"], 0.25);
         assert_eq!(attributes["media.cache_hits"], 1);
         assert_eq!(attributes["media.cache_misses"], 1);
+        // GitHub #673: the images dropped past the budgets, beside the ones seen.
+        assert_eq!(attributes["media.dropped_items"], 3);
+        assert_eq!(attributes["media.dropped_vision_tokens"], 12);
+        assert_eq!(attributes["media.dropped_bytes"], 6144);
         let text = admitted(2)["attributes"].as_object().unwrap();
         assert!(text.keys().all(|k| !k.starts_with("media.")), "{text:?}");
     }
@@ -1741,6 +1760,9 @@ mod tests {
             vision_tokens: 4,
             natural_vision_tokens: 4,
             media_bytes: 2048,
+            dropped_items: 1,
+            dropped_vision_tokens: 4,
+            dropped_bytes: 1024,
             preprocess_seconds: 0.125,
             cache_hits: 0,
             cache_misses: 1,
@@ -1779,6 +1801,8 @@ mod tests {
         assert_eq!(image["media.preprocess_seconds"], 0.125);
         assert_eq!(image["media.cache_hits"], 0);
         assert_eq!(image["media.cache_misses"], 1);
+        assert_eq!((image["media.dropped_items"].clone(), image["media.dropped_vision_tokens"].clone()), (1.into(), 4.into()));
+        assert_eq!(image["media.dropped_bytes"], 1024);
         let text = done(2);
         assert!(text.keys().all(|k| !k.starts_with("media.")), "{text:?}");
     }
@@ -1809,7 +1833,7 @@ mod tests {
             attributes.into_iter().filter(|(k, _)| k.starts_with("media.")).collect::<Vec<_>>()
         };
         let admitted = media_of("ignis.request.admitted");
-        assert_eq!(admitted.len(), 8, "every media field: {admitted:?}");
+        assert_eq!(admitted.len(), 11, "every media field: {admitted:?}");
         assert_eq!(media_of("ignis.request.done"), admitted);
     }
 
@@ -1826,6 +1850,9 @@ mod tests {
             vision_tokens: 4,
             natural_vision_tokens: 4,
             media_bytes: 2048,
+            dropped_items: 1,
+            dropped_vision_tokens: 4,
+            dropped_bytes: 1024,
             preprocess_seconds: 0.125,
             cache_hits: 0,
             cache_misses: 1,
@@ -1861,6 +1888,8 @@ mod tests {
         assert_eq!(image["media.preprocess_seconds"], 0.125);
         assert_eq!(image["media.cache_hits"], 0);
         assert_eq!(image["media.cache_misses"], 1);
+        assert_eq!((image["media.dropped_items"].clone(), image["media.dropped_vision_tokens"].clone()), (1.into(), 4.into()));
+        assert_eq!(image["media.dropped_bytes"], 1024);
         let raced = media_of("ignis.request.done", 1);
         assert!(raced.is_empty(), "reported once, on cancelled: {raced:?}");
         let text = media_of("ignis.request.cancelled", 2);

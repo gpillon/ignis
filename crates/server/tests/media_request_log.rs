@@ -509,7 +509,7 @@ async fn a_noul_reports_the_same_media_a_point_over_the_same_image_does() {
     // A `point` on a load with no calibrated head is a constrained decode,
     // which takes a lane and so has always reported on `admitted`.
     let admitted = media_on(&point, "ignis.request.admitted");
-    assert_eq!(admitted.len(), 8, "every media field: {admitted:?}");
+    assert_eq!(admitted.len(), 11, "every media field: {admitted:?}");
     // `preprocess_seconds` is each request's own wall clock, so it is
     // compared for being there; everything else is the same number.
     let without_wall_clock = |media: &serde_json::Map<String, Value>| {
@@ -552,7 +552,7 @@ async fn a_question_past_its_deadline_reports_the_encode_it_paid_for_on_cancelle
     let media = media_on(&events, "ignis.request.cancelled");
     assert_eq!(media.get("media.encode_seconds"), Some(&json!(0.25)), "{events:?}");
     assert_eq!(media.get("media.vision_tokens"), Some(&json!(4)), "{media:?}");
-    assert_eq!(media.len(), 8, "every media field: {media:?}");
+    assert_eq!(media.len(), 11, "every media field: {media:?}");
 }
 
 #[tokio::test]

@@ -50,7 +50,13 @@ Everything goes through one structured log on stdout, in the format
   `done` or `cancelled`: `media.items`, `media.vision_tokens` (after any
   downscale to `--vision-max-tokens`) and `media.natural_vision_tokens`,
   `media.bytes`, `media.preprocess_seconds`, `media.encode_seconds` (the
-  vision tower), `media.cache_hits` and `media.cache_misses`. A question
+  vision tower), `media.cache_hits` and `media.cache_misses`. From 0.11.0, a
+  request whose images together pass `--vision-max-tokens` or the media byte
+  budget loses its oldest ([Vision](../configuration/vision.md)), and says so
+  on the same lines: `media.dropped_items`, `media.dropped_vision_tokens` and
+  `media.dropped_bytes`, 0 when none was dropped; `media.items`,
+  `media.vision_tokens` and `media.bytes` then count the images the model
+  saw. A question
   past its deadline, or let go when its client left, reports there the
   encode it paid for before the cancel. A request that takes a decode lane
   reports the same numbers on `admitted` too, where they explain a slow
@@ -66,6 +72,23 @@ Everything goes through one structured log on stdout, in the format
   head question whose image is not a grid the heads can read. It never
   reached the vision tower, and what preparing its image cost is on no
   line.
+- From 0.11.0, a request refused for its images leaves the WARN event
+  `ignis.media.refused`: its media are acquired before admission, so the
+  refusal has no request id and no `ignis.request.*` line. It carries the
+  answer's `status` and `code` (`invalid_media`, `media_budget_exceeded`,
+  `media_fetch_failed`, `media_fetch_timeout`, or `request_timeout` when the
+  deadline passed while the images were prepared), the `part` refused
+  (`message 3 content part 1`; none for a limit on the whole request), never
+  the message the client read, which for a fetch names its URL, and, for a
+  budget, the `budget`
+  (`encoded_bytes`, `decoded_pixels`, `media_items`, `raw_patches`,
+  `vision_tokens` or `item_vision_tokens`), its `limit` and the amount
+  `requested` ([Troubleshooting](../troubleshooting.md#vision_disabled-or-media_budget_exceeded)):
+
+```text
+2026-11-18T10:00:00.000Z  WARN ignis.media.refused - request media refused {budget="encoded_bytes", code="media_budget_exceeded", limit=268435456, part="message 3 content part 1", requested=268500000, status=400}
+```
+
 - The scheduler counters are the DEBUG event `ignis.scheduler.interval`, emitted
   whenever `waiting`, `running` or `kv_evictions` change
   ([ADR 0025](../../adr/0025-scheduler-interval-as-a-log-event.md)):

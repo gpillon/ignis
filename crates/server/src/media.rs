@@ -18,6 +18,7 @@
 //! concurrent identical misses. Dropping the acquisition future — a client
 //! disconnect — stops the work at its next checkpoint.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -26,13 +27,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ignis_artifact::vision::{
-    Budget, DecodeFailure, InvalidMedia, PreparedMedia, ProcessorError, ProcessorOptions, VisionProcessor,
+    Budget, DecodeFailure, Grid, InvalidMedia, PreparedMedia, ProcessorError, ProcessorOptions, VisionProcessor,
 };
 use ignis_core::image::{ImageSize, RgbaImage};
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, Semaphore};
 
-use crate::template::{ChatMessage, MessageContent};
+use crate::template::{ChatMessage, ContentPart, MessageContent};
 
 /// Why a request's media could not be acquired: an OpenAI error `code` and a
 /// message naming the offending message and part. Raised before admission.
@@ -45,12 +46,63 @@ pub struct MediaRejection {
     /// `media_fetch_timeout` or `request_timeout`.
     pub code: &'static str,
     pub message: String,
+    /// The part refused, `message {i} content part {j}`; `None` for a limit
+    /// on the whole request. The refusal's log event names it in place of
+    /// the message, which for a fetch names the URL (GitHub #673).
+    pub part: Option<String>,
+    /// For `media_budget_exceeded`, the budget passed, in numbers: what the
+    /// refusal's log event carries (GitHub #673).
+    pub budget: Option<BudgetExceeded>,
 }
+
+/// A media budget a request passed: which, its limit and the amount the
+/// request reached when it was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetExceeded {
+    pub budget: Budget,
+    pub limit: u64,
+    pub requested: u64,
+}
+
+impl MediaRejection {
+    /// A processor's refusal of the part at `at`.
+    fn processor(at: &str, error: ProcessorError) -> Self {
+        let budget = match error {
+            ProcessorError::BudgetExceeded { budget, limit, requested } => Some(BudgetExceeded { budget, limit, requested }),
+            _ => None,
+        };
+        Self { status: 400, code: error.code(), message: format!("{at}: {error}"), part: Some(at.to_owned()), budget }
+    }
+
+    /// A request-wide budget the request's media passed.
+    fn over(budget: Budget, limit: u64, requested: u64) -> Self {
+        let error = ProcessorError::BudgetExceeded { budget, limit, requested };
+        let budget = Some(BudgetExceeded { budget, limit, requested });
+        Self { status: 400, code: error.code(), message: error.to_string(), part: None, budget }
+    }
+}
+
+/// A media budget's name on the `ignis.media.refused` event (GitHub #673).
+pub fn budget_key(budget: Budget) -> &'static str {
+    match budget {
+        Budget::MediaItems => "media_items",
+        Budget::EncodedBytes => "encoded_bytes",
+        Budget::DecodedPixels => "decoded_pixels",
+        Budget::RawPatches => "raw_patches",
+        Budget::VisionTokens => "vision_tokens",
+        Budget::ItemVisionTokens => "item_vision_tokens",
+    }
+}
+
+/// What a dropped image is rendered as, where it was in the prompt (GitHub
+/// #673, ADR 0102): the model reads that an image was there.
+pub const OMITTED_IMAGE: &str = "[image omitted: past this request's vision budget]";
 
 /// What acquiring a request's media cost, for its `ignis.request.*` events.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MediaStats {
-    /// Media items in the request.
+    /// Media items in the request the model sees: the dropped ones are not
+    /// among them.
     pub items: u32,
     /// Merged vision tokens across the items, as admitted.
     pub vision_tokens: u64,
@@ -60,6 +112,13 @@ pub struct MediaStats {
     pub natural_vision_tokens: u64,
     /// Acquired (encoded) bytes across the items.
     pub media_bytes: u64,
+    /// The request's oldest images, dropped past its budgets and rendered as
+    /// [`OMITTED_IMAGE`] (GitHub #673): never prepared, and not in `items`.
+    pub dropped_items: u32,
+    /// The merged vision tokens the dropped images would have taken.
+    pub dropped_vision_tokens: u64,
+    /// The dropped images' encoded bytes.
+    pub dropped_bytes: u64,
     /// Seconds spent decoding, resizing and packing the items this request
     /// prepared itself (a cache hit costs none).
     pub preprocess_seconds: f64,
@@ -69,6 +128,7 @@ pub struct MediaStats {
     pub cache_misses: u32,
     /// The **first** item's submitted pixel size, `(width, height)`, before
     /// any resize (GitHub #242); `None` when the request carried no media.
+    /// The first the model sees: a dropped image is no answer's frame.
     ///
     /// The first because that is the one a spatial question is about: a
     /// `point` is put to one screenshot, and a `state` carrying several
@@ -112,8 +172,9 @@ impl Preparer for VisionProcessor {
 enum AcquireError {
     /// Malformed source, disallowed address, empty body.
     Invalid(String),
-    /// The item would exceed the request's media byte budget.
-    Budget(String),
+    /// The item would exceed the byte cap it was acquired under: why, and the
+    /// bytes it had reached when it was refused.
+    Budget(String, u64),
     /// The remote could not be reached or answered an error.
     FetchFailed(String),
     /// The remote did not answer within the fetch timeouts.
@@ -123,15 +184,22 @@ enum AcquireError {
 }
 
 impl AcquireError {
-    fn rejection(self, at: &str) -> MediaRejection {
+    /// The refusal of the part at `at`. A byte cap is reported against the
+    /// request's byte budget `limit`, the item's bytes on top of `before`
+    /// (what the request had already spent of it under the same cap).
+    fn rejection(self, at: &str, limit: u64, before: u64) -> MediaRejection {
+        let mut budget = None;
         let (status, code, why) = match self {
             Self::Invalid(why) => (400, "invalid_media", why),
-            Self::Budget(why) => (400, "media_budget_exceeded", why),
+            Self::Budget(why, reached) => {
+                budget = Some(BudgetExceeded { budget: Budget::EncodedBytes, limit, requested: before + reached });
+                (400, "media_budget_exceeded", why)
+            }
             Self::FetchFailed(why) => (400, "media_fetch_failed", why),
             Self::FetchTimeout(why) => (400, "media_fetch_timeout", why),
             Self::Deadline => (504, "request_timeout", "the request deadline passed while its media were acquired".to_owned()),
         };
-        MediaRejection { status, code, message: format!("{at}: {why}") }
+        MediaRejection { status, code, message: format!("{at}: {why}"), part: Some(at.to_owned()), budget }
     }
 }
 
@@ -143,22 +211,28 @@ struct MediaPart {
     url: String,
 }
 
-/// The request's `image_url` parts in prompt order (message order, then part
-/// order — the order the chat template renders their placeholders in).
+/// Where the request's `image_url` parts sit, in prompt order (message
+/// order, then part order — the order the chat template renders their
+/// placeholders in): each one's message index, part index and URL.
 /// `check_content_parts` has already refused every malformed part.
-fn image_parts(messages: &[ChatMessage]) -> Vec<MediaPart> {
-    let mut out = Vec::new();
-    for (i, message) in messages.iter().enumerate() {
-        let MessageContent::Parts(parts) = &message.content else {
-            continue;
+fn image_positions(messages: &[ChatMessage]) -> impl Iterator<Item = (usize, usize, &str)> {
+    messages.iter().enumerate().flat_map(|(i, message)| {
+        let parts = match &message.content {
+            MessageContent::Parts(parts) => parts.as_slice(),
+            MessageContent::Text(_) | MessageContent::Null => &[],
         };
-        for (j, part) in parts.iter().enumerate() {
-            if let ("image_url", Some(url)) = (part.kind.as_deref().unwrap_or_default(), &part.url) {
-                out.push(MediaPart { at: format!("message {i} content part {j}"), url: url.clone() });
-            }
-        }
-    }
-    out
+        parts.iter().enumerate().filter_map(move |(j, part)| match (part.kind.as_deref().unwrap_or_default(), &part.url) {
+            ("image_url", Some(url)) => Some((i, j, url.as_str())),
+            _ => None,
+        })
+    })
+}
+
+/// The request's `image_url` parts in prompt order ([`image_positions`]).
+fn image_parts(messages: &[ChatMessage]) -> Vec<MediaPart> {
+    image_positions(messages)
+        .map(|(i, j, url)| MediaPart { at: format!("message {i} content part {j}"), url: url.to_owned() })
+        .collect()
 }
 
 /// The processor a `--vision-enabled` load prepares images with: the artifact's
@@ -235,13 +309,16 @@ fn decode_data_uri(value: &str, max_bytes: u64) -> Result<Vec<u8>, AcquireError>
     if !header.starts_with("data:") || !header.contains(";base64") {
         return Err(malformed());
     }
-    let over = || AcquireError::Budget(format!("media data exceeds the request media byte budget ({max_bytes} bytes)"));
+    let over = |reached: u64| {
+        AcquireError::Budget(format!("media data exceeds the request media byte budget ({max_bytes} bytes)"), reached)
+    };
     if payload.len() as u64 > (max_bytes / 3 + 1) * 4 {
-        return Err(over());
+        // What the payload would decode to, had it been decoded.
+        return Err(over(payload.len() as u64 / 4 * 3));
     }
     let bytes = decode_base64(payload)?;
     if bytes.len() as u64 > max_bytes {
-        return Err(over());
+        return Err(over(bytes.len() as u64));
     }
     if bytes.is_empty() {
         return Err(AcquireError::Invalid("media source is empty".to_owned()));
@@ -466,14 +543,16 @@ async fn fetch(url: &str, policy: &MediaPolicy, max_bytes: u64, deadline: Instan
         let mut response = client.get(url.clone()).send().await.map_err(fetch_error)?;
         let status = response.status();
         if status.is_success() {
-            let over = || AcquireError::Budget(format!("media URL exceeds the request media byte budget ({max_bytes} bytes)"));
-            if response.content_length().is_some_and(|n| n > max_bytes) {
-                return Err(over());
+            let over = |reached: u64| {
+                AcquireError::Budget(format!("media URL exceeds the request media byte budget ({max_bytes} bytes)"), reached)
+            };
+            if let Some(length) = response.content_length().filter(|&n| n > max_bytes) {
+                return Err(over(length));
             }
             let mut body = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(fetch_error)? {
                 if (body.len() + chunk.len()) as u64 > max_bytes {
-                    return Err(over());
+                    return Err(over((body.len() + chunk.len()) as u64));
                 }
                 body.extend_from_slice(&chunk);
             }
@@ -733,8 +812,104 @@ async fn produce(
 /// A request's prepared media, in prompt order, and what they cost.
 #[derive(Debug, Clone)]
 pub struct AcquiredMedia {
+    /// The kept images, prepared.
     pub media: Vec<PreparedMedia>,
     pub stats: MediaStats,
+    /// How many of the request's image parts, the oldest in prompt order,
+    /// were dropped past its budgets (GitHub #673): they precede every kept
+    /// one, and [`Self::omit_dropped`] renders them as text.
+    pub dropped: usize,
+}
+
+impl AcquiredMedia {
+    /// `messages` as the model reads them (GitHub #673, ADR 0102): each
+    /// dropped image part replaced, where it was, by a text part reading
+    /// [`OMITTED_IMAGE`], so the chat template renders that text there and
+    /// the vision placeholders of the kept images alone, in the order
+    /// [`Self::media`] holds them. Borrowed when nothing was dropped.
+    pub fn omit_dropped<'m>(&self, messages: &'m [ChatMessage]) -> Cow<'m, [ChatMessage]> {
+        if self.dropped == 0 {
+            return Cow::Borrowed(messages);
+        }
+        let dropped: Vec<(usize, usize)> = image_positions(messages).take(self.dropped).map(|(i, j, _)| (i, j)).collect();
+        let mut messages = messages.to_vec();
+        for (i, j) in dropped {
+            let MessageContent::Parts(parts) = &mut messages[i].content else {
+                unreachable!("an image part is in a parts message");
+            };
+            let part = &mut parts[j];
+            *part = ContentPart {
+                kind: Some("text".to_owned()),
+                url: None,
+                text: Some(OMITTED_IMAGE.to_owned()),
+                cache_control: part.cache_control.take(),
+            };
+        }
+        Cow::Owned(messages)
+    }
+}
+
+/// What an image weighs against a request's budgets, read before anything is
+/// prepared (GitHub #673) — or, as a limit, what the budgets allow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Weight {
+    raw_patches: u64,
+    vision_tokens: u64,
+    bytes: u64,
+}
+
+impl Weight {
+    fn of(grid: Grid, bytes: usize) -> Self {
+        Self { raw_patches: grid.raw_patches(), vision_tokens: grid.vision_tokens(), bytes: bytes as u64 }
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            raw_patches: self.raw_patches + other.raw_patches,
+            vision_tokens: self.vision_tokens + other.vision_tokens,
+            bytes: self.bytes + other.bytes,
+        }
+    }
+
+    fn within(self, limit: Self) -> bool {
+        self.raw_patches <= limit.raw_patches && self.vision_tokens <= limit.vision_tokens && self.bytes <= limit.bytes
+    }
+
+    fn half(self) -> Self {
+        Self { raw_patches: self.raw_patches / 2, vision_tokens: self.vision_tokens / 2, bytes: self.bytes / 2 }
+    }
+}
+
+/// How many of a request's oldest images are dropped so that the rest are
+/// within `limit` (GitHub #673, ADR 0102). The images, in prompt order, form
+/// blocks: a block takes images until the next would carry it past half of
+/// `limit` on any count, so an image past half alone is a block of its own.
+/// Over `limit`, the fewest whole blocks are dropped, oldest first, that bring
+/// the rest within it, never the last block; within it, none.
+///
+/// A block's bounds depend only on the images before it, so on a history
+/// that grows at its end a closed block never changes and is dropped once:
+/// the prompt changes at its first image once a block, and between drops the
+/// next request's prompt extends this one's.
+fn dropped_images(weights: &[Weight], limit: Weight) -> usize {
+    let total = |weights: &[Weight]| weights.iter().fold(Weight::default(), |sum, &weight| sum.plus(weight));
+    if total(weights).within(limit) {
+        return 0;
+    }
+    let half = limit.half();
+    let (mut starts, mut block) = (Vec::new(), Weight::default());
+    for (index, &weight) in weights.iter().enumerate() {
+        if index == 0 || !block.plus(weight).within(half) {
+            starts.push(index);
+            block = weight;
+        } else {
+            block = block.plus(weight);
+        }
+    }
+    let last = *starts.last().expect("a request over its budget has an image");
+    // Never past the last block: should it not fit alone, the preparation's
+    // own check refuses the request, as before the rule.
+    starts.into_iter().find(|&start| total(&weights[start..]).within(limit)).unwrap_or(last)
 }
 
 /// Acquires and prepares a request's media (see the module doc). One per
@@ -769,36 +944,68 @@ impl MediaAcquirer {
     }
 
     /// Acquire and prepare every `image_url` part of `messages`, before
-    /// `deadline`. Budgets are enforced as the items arrive, before any
-    /// device work; dropping the returned future stops the work.
+    /// `deadline`, all before any device work; dropping the returned future
+    /// stops the work.
+    ///
+    /// Images whose total passes the request's budgets lose their oldest, in
+    /// whole blocks ([`dropped_images`], GitHub #673): every part's bytes are
+    /// acquired and weighed from its header first, and only the kept ones are
+    /// prepared. What would refuse an image alone refuses the request
+    /// wherever the image is.
     pub async fn acquire(&self, messages: &[ChatMessage], deadline: Instant) -> Result<AcquiredMedia, MediaRejection> {
         let parts = image_parts(messages);
         let limits = &self.limits;
-        let budget = |budget: Budget, limit: u64, requested: u64| MediaRejection {
-            status: 400,
-            code: "media_budget_exceeded",
-            message: ProcessorError::BudgetExceeded { budget, limit, requested }.to_string(),
-        };
         let max_items = (limits.max_raw_patches / 4).min(limits.max_vision_tokens);
         if parts.len() as u64 > max_items {
-            return Err(budget(Budget::MediaItems, max_items, parts.len() as u64));
+            return Err(MediaRejection::over(Budget::MediaItems, max_items, parts.len() as u64));
         }
-        let mut stats = MediaStats { items: parts.len() as u32, ..MediaStats::default() };
-        let mut remaining = limits.max_encoded_media_bytes;
-        let mut tickets = Vec::with_capacity(parts.len());
-        for (item, part) in parts.iter().enumerate() {
-            let acquired = match media_source(&part.url) {
+        // Every part's bytes. An inline image is held to the byte budget
+        // alone; the request's fetches together, as before the rule, since a
+        // fetch has cost its bytes once made.
+        let budget = limits.max_encoded_media_bytes;
+        let mut fetched = 0u64;
+        let mut sources = Vec::with_capacity(parts.len());
+        for part in &parts {
+            let source = media_source(&part.url);
+            let fetching = matches!(source, Ok(MediaSource::Http(_)));
+            let fetch_cap = budget - fetched;
+            let acquired = match source {
                 Err(error) => Err(error),
-                Ok(_) if remaining == 0 => {
-                    Err(AcquireError::Budget("request media exceed the aggregate media byte budget".to_owned()))
-                }
-                Ok(MediaSource::Data(value)) => decode_data_uri(value, remaining),
-                Ok(MediaSource::Http(url)) => tokio::time::timeout_at(deadline.into(), fetch(url, &self.policy, remaining, deadline))
+                Ok(MediaSource::Data(value)) => decode_data_uri(value, budget),
+                Ok(MediaSource::Http(url)) => tokio::time::timeout_at(deadline.into(), fetch(url, &self.policy, fetch_cap, deadline))
                     .await
                     .unwrap_or_else(|_| Err(AcquireError::FetchTimeout("media URL fetch timed out".to_owned()))),
             };
-            let bytes = acquired.map_err(|error| error.rejection(&part.at))?;
-            remaining -= bytes.len() as u64;
+            let bytes = acquired.map_err(|error| error.rejection(&part.at, budget, if fetching { fetched } else { 0 }))?;
+            if fetching {
+                fetched += bytes.len() as u64;
+            }
+            sources.push(bytes);
+        }
+        // What each weighs, from its header, and which are dropped.
+        let weights = parts
+            .iter()
+            .zip(&sources)
+            .enumerate()
+            .map(|(item, (part, bytes))| {
+                limits
+                    .header_grid(item, bytes)
+                    .map(|grid| Weight::of(grid, bytes.len()))
+                    .map_err(|error| MediaRejection::processor(&part.at, error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let limit = Weight { raw_patches: limits.max_raw_patches, vision_tokens: limits.max_vision_tokens, bytes: budget };
+        let dropped = dropped_images(&weights, limit);
+        let mut stats = MediaStats {
+            items: (parts.len() - dropped) as u32,
+            dropped_items: dropped as u32,
+            dropped_vision_tokens: weights[..dropped].iter().map(|w| w.vision_tokens).sum(),
+            dropped_bytes: weights[..dropped].iter().map(|w| w.bytes).sum(),
+            ..MediaStats::default()
+        };
+        // Only the kept images are hashed, cached and prepared.
+        let mut tickets = Vec::with_capacity(parts.len() - dropped);
+        for (item, bytes) in sources.into_iter().enumerate().skip(dropped) {
             stats.media_bytes += bytes.len() as u64;
             // The digest is CPU work on up to the whole byte budget: on the
             // pool, like the preparation it keys.
@@ -809,14 +1016,15 @@ impl MediaAcquirer {
             })
             .await
             .expect("hashing does not panic");
-            tickets.push(self.cache.begin(digest, item, bytes, &self.preparer, &self.pool));
+            tickets.push((item, self.cache.begin(digest, item, bytes, &self.preparer, &self.pool)));
         }
         let (mut raw_patches, mut vision_tokens, mut natural_vision_tokens) = (0u64, 0u64, 0u64);
         let mut media = Vec::with_capacity(tickets.len());
-        for ((item, part), ticket) in parts.iter().enumerate().zip(&tickets) {
+        for (item, ticket) in &tickets {
+            let (item, part) = (*item, &parts[*item]);
             let result = tokio::time::timeout_at(deadline.into(), ticket.wait())
                 .await
-                .map_err(|_| AcquireError::Deadline.rejection(&part.at))?;
+                .map_err(|_| AcquireError::Deadline.rejection(&part.at, budget, 0))?;
             let (prepared, seconds) = match result {
                 Ok(done) => done,
                 Err(BuildError::Processor(error)) => {
@@ -824,7 +1032,7 @@ impl MediaAcquirer {
                         ProcessorError::InvalidMedia { reason, .. } => ProcessorError::InvalidMedia { item, reason },
                         other => other,
                     };
-                    return Err(MediaRejection { status: 400, code: error.code(), message: format!("{}: {error}", part.at) });
+                    return Err(MediaRejection::processor(&part.at, error));
                 }
                 Err(BuildError::Cancelled) => unreachable!("a flight is never cancelled while this request waits on it"),
             };
@@ -835,17 +1043,18 @@ impl MediaAcquirer {
                 }
                 Disposition::Hit | Disposition::Joined => stats.cache_hits += 1,
             }
-            if item == 0 {
+            if media.is_empty() {
                 stats.source_pixels = Some(prepared.source_pixels);
             }
             raw_patches += prepared.grid.raw_patches();
             vision_tokens += prepared.grid.vision_tokens();
             natural_vision_tokens += prepared.natural_vision_tokens;
+            // A backstop: the weights said the kept images fit.
             if raw_patches > limits.max_raw_patches {
-                return Err(budget(Budget::RawPatches, limits.max_raw_patches, raw_patches));
+                return Err(MediaRejection::over(Budget::RawPatches, limits.max_raw_patches, raw_patches));
             }
             if vision_tokens > limits.max_vision_tokens {
-                return Err(budget(Budget::VisionTokens, limits.max_vision_tokens, vision_tokens));
+                return Err(MediaRejection::over(Budget::VisionTokens, limits.max_vision_tokens, vision_tokens));
             }
             media.push(prepared);
         }
@@ -853,7 +1062,7 @@ impl MediaAcquirer {
         stats.vision_tokens = vision_tokens;
         stats.natural_vision_tokens = natural_vision_tokens;
         let media = media.into_iter().map(|m| Arc::try_unwrap(m).unwrap_or_else(|m| (*m).clone())).collect();
-        Ok(AcquiredMedia { media, stats })
+        Ok(AcquiredMedia { media, stats, dropped })
     }
 }
 
@@ -1094,7 +1303,7 @@ mod tests {
         ] {
             let error = decode_data_uri(uri, 1 << 20).unwrap_err();
             assert!(matches!(error, AcquireError::Invalid(_)), "{uri}: {error:?}");
-            assert_eq!(error.rejection("message 0 content part 1").code, "invalid_media");
+            assert_eq!(error.rejection("message 0 content part 1", 1 << 20, 0).code, "invalid_media");
         }
     }
 
@@ -1104,14 +1313,16 @@ mod tests {
         let uri = format!("data:image/png;base64,{}", b64(&bytes));
         assert_eq!(decode_data_uri(&uri, 300).unwrap(), bytes);
         let error = decode_data_uri(&uri, 299).unwrap_err();
-        assert!(matches!(error, AcquireError::Budget(_)), "{error:?}");
-        let rejection = error.rejection("message 1 content part 0");
+        assert!(matches!(error, AcquireError::Budget(_, 300)), "{error:?}");
+        let rejection = error.rejection("message 1 content part 0", 299, 0);
         assert_eq!((rejection.status, rejection.code), (400, "media_budget_exceeded"));
         assert!(rejection.message.starts_with("message 1 content part 0: "), "{}", rejection.message);
+        let numbers = BudgetExceeded { budget: Budget::EncodedBytes, limit: 299, requested: 300 };
+        assert_eq!(rejection.budget, Some(numbers), "the refusal carries its numbers (GitHub #673)");
         // An encoded length that cannot fit is refused before decoding —
         // even when the payload is not valid base64.
         let huge = format!("data:image/png;base64,{}", "*".repeat(1000));
-        assert!(matches!(decode_data_uri(&huge, 10), Err(AcquireError::Budget(_))));
+        assert!(matches!(decode_data_uri(&huge, 10), Err(AcquireError::Budget(_, 750))));
     }
 
     #[test]

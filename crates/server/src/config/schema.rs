@@ -690,8 +690,10 @@ config_group! {
         /// it on for the 27B alone.
         enabled: Bool = false, NO_RULE, VISION_MODELS, [Visible, Patchable, ReloadRequired, Scoped];
         /// Merged vision tokens per request. An image over it is shrunk to
-        /// fit, aspect kept; refused only when its aspect ratio cannot fit, or
-        /// when several images total over it. Needs vision on.
+        /// fit, aspect kept; refused only when its aspect ratio cannot fit.
+        /// Images that total over it lose the oldest, a block of half of it
+        /// at a time, each read as a line of text where it was. Needs vision
+        /// on.
         max_tokens: Tokens = ignis_core::DEFAULT_VISION_MAX_TOKENS, between(1, ignis_core::VISION_MAX_TOKENS_LIMIT as i64), VISION_MODELS,
             [Visible, Patchable, ReloadRequired, Scoped];
         /// Encoded images kept for reuse, in MiB, where `vision.residency`
