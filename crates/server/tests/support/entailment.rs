@@ -1,7 +1,8 @@
-//! The contributed evidence-to-claim entailment set
-//! (`fixtures/entailment/`), shared by its CPU shape check
+//! The evidence-to-claim entailment set (`fixtures/entailment/`): eighteen
+//! contributed cases and two ignis wrote, shared by its CPU shape check
 //! (`decide_entailment_fixture.rs`) and its GPU run
-//! (`decide_entailment_gpu.rs`). Included via `#[path]`, like `media.rs`.
+//! (`decide_entailment_gpu.rs`). Included via `#[path]`, like `media.rs`,
+//! beside `decide_arms.rs`, whose arms the measurement names.
 
 // Each binary reads a different subset (only the GPU run prints `name`).
 #![allow(dead_code)]
@@ -9,10 +10,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use ignis_core::{GdnPrefill, PrefillAttention};
-use serde::de::{Deserializer, Error as _};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
+
+use crate::decide_arms::Arm;
 
 /// What a case's label means to the GPU run. Which tier a case takes follows
 /// from its logits by the fixture's rule ([`tier_by_rule`]).
@@ -28,12 +29,23 @@ pub enum Tier {
     KnownFailure,
 }
 
+/// Who wrote a case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// The contributed set, as ignis corrected it (`NOTICE.md`).
+    Contributed,
+    /// Written by ignis, as GitHub #537's review allowed (cases 19 and 20).
+    Ignis,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Case {
     pub id: u32,
     pub name: String,
     pub expected: bool,
     pub starred: bool,
+    pub origin: Origin,
     pub tier: Tier,
     /// The case's logit on each of the measurement's arms, by arm name.
     pub logits: BTreeMap<String, f64>,
@@ -41,32 +53,14 @@ pub struct Case {
     pub note: String,
 }
 
-/// One route the tiers were measured on, its routes in the spellings the
-/// measurement switch and the option take.
+/// A wording tried for an ignis-written case and not registered, with its
+/// logit on each of the measurement's arms: posted after the twenty cases,
+/// in the file's order, on the same load.
 #[derive(Debug, Deserialize)]
-pub struct Arm {
+pub struct Draft {
     pub name: String,
-    pub surface: String,
-    #[serde(deserialize_with = "gdn_prefill")]
-    pub gdn_prefill: GdnPrefill,
-    #[serde(deserialize_with = "prefill_attention")]
-    pub prefill_attention: PrefillAttention,
-    /// What to run to redo the arm.
-    pub redo: String,
-}
-
-/// `IGNIS_GDN_PREFILL`'s two values.
-fn gdn_prefill<'de, D: Deserializer<'de>>(deserializer: D) -> Result<GdnPrefill, D::Error> {
-    let name = String::deserialize(deserializer)?;
-    [GdnPrefill::Ours, GdnPrefill::Vendored]
-        .into_iter()
-        .find(|route| route.as_str() == name)
-        .ok_or_else(|| D::Error::custom(format!("unknown GDN prefill `{name}` (expected `ours` or `vendored`)")))
-}
-
-/// `--model-prefill-attention`'s values.
-fn prefill_attention<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PrefillAttention, D::Error> {
-    PrefillAttention::parse(&String::deserialize(deserializer)?).map_err(D::Error::custom)
+    pub state: String,
+    pub logits: BTreeMap<String, f64>,
 }
 
 /// The one measurement the tiers come from (see `NOTICE.md`).
@@ -93,6 +87,8 @@ pub struct Fixture {
     /// labels are defined relative to its definition of "support".
     pub question: JsonValue,
     pub cases: Vec<Case>,
+    /// Every wording tried for cases 19 and 20 and not registered.
+    pub drafts: Vec<Draft>,
 }
 
 /// The id the question is asked under, in the request and the answer.
@@ -113,11 +109,18 @@ pub fn tier_by_rule(expected: bool, logits: &[f64]) -> Tier {
     }
 }
 
+/// Read the fixture as it is recorded, unchecked: what the GPU run asserts
+/// and prints, an arm it is measuring for the first time included.
+pub fn read(text: &str) -> Result<Fixture, String> {
+    serde_json::from_str(text).map_err(|e| format!("parse: {e}"))
+}
+
 /// Parse the fixture and check it: every case has a tier and a logit on
-/// every arm, its tier is the one the rule gives from those logits, and
-/// the gate holds a case of each label.
+/// every arm, its tier is the one the rule gives from those logits, the
+/// gate holds a case of each label, and every draft has a logit on every
+/// arm.
 pub fn parse(text: &str) -> Result<Fixture, String> {
-    let fixture: Fixture = serde_json::from_str(text).map_err(|e| format!("parse: {e}"))?;
+    let fixture = read(text)?;
     let arms: Vec<&str> = fixture.measurement.arms.iter().map(|arm| arm.name.as_str()).collect();
     for case in &fixture.cases {
         let mut logits = Vec::new();
@@ -141,6 +144,11 @@ pub fn parse(text: &str) -> Result<Fixture, String> {
             return Err(format!("no gate case has the label {label}"));
         }
     }
+    for draft in &fixture.drafts {
+        if arms.iter().any(|arm| !draft.logits.contains_key(*arm)) || draft.logits.len() != arms.len() {
+            return Err(format!("draft {}: its logits are not one on each arm", draft.name));
+        }
+    }
     Ok(fixture)
 }
 
@@ -159,11 +167,24 @@ pub fn load() -> Fixture {
     parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+/// [`load`] without the checks ([`read`]): the GPU run's.
+pub fn load_recorded() -> Fixture {
+    let path = path();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    read(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
 impl Fixture {
     /// The `/v1/decide` body for one case.
     pub fn request(&self, case: &Case, model: Option<&str>) -> JsonValue {
+        self.request_for(&case.state, model)
+    }
+
+    /// The `/v1/decide` body for the state `state`: a case's or a draft's.
+    pub fn request_for(&self, state: &str, model: Option<&str>) -> JsonValue {
         let mut body = json!({
-            "state": case.state,
+            "state": state,
             "questions": { QUESTION_ID: self.question },
         });
         if let Some(model) = model {
