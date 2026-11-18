@@ -167,7 +167,8 @@ leaf-internal.
   body's three strided copies go; in the prefill, one form for every T and the state in place
   only; in the decode round, one column per lane, each lane's slot both read and written, and
   no valid-column mask. The file header lists the changes. The vendored op stays in the
-  subtree as its oracle and for the width-1 decode, eager and verify forms
+  subtree as its oracle and for the other forms: the eager step, the width-1 decode round and
+  the decode rounds that copy (the measurement switch, cards of other generations)
   (`kernel/vendor/VENDOR.md`).
 
 ### `kernel/src/hq_prompt_common.cuh` (spec #503, GitHub #510)
