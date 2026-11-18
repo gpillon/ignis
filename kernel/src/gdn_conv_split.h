@@ -18,6 +18,12 @@
 // taps in the pool slot the round staged for it, as the vendored snapshot form reads and writes
 // them; its planes are bit for bit `ninfer::ops::causal_conv1d_silu_snapshot` followed by the
 // three strided copies that split its plane in the decode graph's copying form.
+//
+// GitHub #681 (spec #672): `split_conv_slots` with a `Gating` also computes the layer's gating, its
+// fused home (kernel/src/gdn_gating_home.h), in CTAs of their own launched ahead of the conv's in
+// the same grid, so a round's conv and gating are one kernel. Its gates are bit for bit
+// `ninfer::ops::gdn_gating_proj`'s at the 27B's shape, which runs one form at one column and another
+// at 2..8 (kernel/src/gdn_conv_split.cu names both).
 #pragma once
 
 #include "core/tensor.h"
@@ -25,6 +31,19 @@
 #include <cuda_runtime.h>
 
 namespace ignis::gdn_conv {
+
+// The gating `split_conv_slots` computes beside the conv: `ninfer::ops::gdn_gating_proj`'s
+// contiguous-parent form at the 27B's shape. `h` BF16 [5120, B], the layer's normed input, one
+// column per lane; `ab` BF16 [96, 5120] (a in rows 0..47, b in rows 48..95), 16-byte aligned;
+// `a_log` and `dt_bias` FP32 [48]; `g` and `beta` FP32 [48, B], written. Every tensor contiguous.
+struct Gating {
+  const ninfer::Tensor &h;
+  const ninfer::Weight &ab;
+  const ninfer::Tensor &a_log;
+  const ninfer::Tensor &dt_bias;
+  ninfer::Tensor &g;
+  ninfer::Tensor &beta;
+};
 
 // `x` [C, T] BF16, `weight` [C, 4] BF16 (the stored `gdn/convolution`), `conv_state` [C, 3]
 // BF16, read as the taps before the chunk and overwritten with the taps after it; `query`,
@@ -40,10 +59,13 @@ void split_conv(const ninfer::Tensor &x, const ninfer::Tensor &weight, ninfer::T
 // round), whose taps are read before any store and overwritten with the taps after its column
 // (the vendored snapshot form with every lane's initial and base slot the same, the decode
 // graph's). The slots must be distinct. `query`, `key`, `value` BF16 [Cq, B], [Ck, B], [Cv, B]
-// with Cq + Ck + Cv == C, lane b's channels in column b. Every tensor contiguous. Throws
-// std::invalid_argument on anything else; enqueues on `stream` and does not synchronize.
+// with Cq + Ck + Cv == C, lane b's channels in column b; each column contiguous, the columns of a
+// plane `nb[1]` bytes apart, at least the column's own (so three views of one [C, B] plane are the
+// decode graph's copying form's conv plane). Every other tensor contiguous. With `gating`, its
+// gates too (GitHub #681), for the same B lanes. Throws std::invalid_argument on anything else;
+// enqueues on `stream` and does not synchronize.
 void split_conv_slots(const ninfer::Tensor &x, const ninfer::Tensor &weight, ninfer::Tensor &conv_states,
                       const ninfer::Tensor &lane_slots, ninfer::Tensor &query, ninfer::Tensor &key,
-                      ninfer::Tensor &value, cudaStream_t stream);
+                      ninfer::Tensor &value, cudaStream_t stream, const Gating *gating = nullptr);
 
 } // namespace ignis::gdn_conv

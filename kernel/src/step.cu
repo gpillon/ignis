@@ -3623,6 +3623,8 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
       out_stats->drafter_append_graph_ready_mask |= (1u << (width - 1));
     }
   }
+  // GitHub #681: the gating's home; Flash-Next's load never captures the 27B's rounds.
+  out_stats->gdn_gating = static_cast<uint32_t>(model->gdn_gating_home);
   return 0;
 }
 

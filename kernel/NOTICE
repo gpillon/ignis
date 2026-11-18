@@ -150,10 +150,10 @@ The 27B's hq-e8-2b prefill attention without prompt planes (`ignis_hq_prompt_att
   > OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
   > DEALINGS IN THE SOFTWARE.
 
-### `kernel/src/gdn_conv_split.cu` (spec #503, GitHub #507; spec #672, GitHub #680)
+### `kernel/src/gdn_conv_split.cu` (spec #503, GitHub #507; spec #672, GitHub #680, #681)
 The GDN layer's causal conv, writing the query, key and value planes split: the prefill's
 (`ignis::gdn_conv::split_conv`) and the decode round's (`ignis::gdn_conv::split_conv_slots`),
-leaf-internal.
+the latter with the layer's gating beside it where the round asks for it, leaf-internal.
 - Upstream: the reference, `gpillon/ninfer`, commit `a00648cb828457986cf5b4b4f712b4cbcd7af0d1`
   (the commit `kernel/vendor/manifest.json` pins), Apache-2.0 (`kernel/vendor/LICENSE`):
   - `src/ops/kernel/causal_conv1d.cuh`: `causal_conv1d_prefill_pairs_kernel` (a thread per
@@ -162,11 +162,18 @@ leaf-internal.
     round's form, `causal_conv1d_batched_sequence_snapshot_kernel` (a thread per channel and
     lane, the lane's taps from its pool slot and back into it);
   - `src/ops/launcher/causal_conv1d.cu`: `causal_conv1d_prefill_launch`'s grids, and
-    `launch_batched_sequence_snapshot`'s at one column.
+    `launch_batched_sequence_snapshot`'s at one column;
+  - `src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu`, for the gating:
+    `bf16_gdn_gating_proj_gemv_kernel` (a CTA per a or b row, the pair loop's fp32 fma chain,
+    the block reduction, the gate) and `bf16_gdn_gating_proj_small_t_partial_kernel` with
+    `bf16_gdn_gating_proj_small_t_reduce_kernel` (a warp per row and K slice, the slices summed
+    in order, the gate), the forms the 27B's route table runs at one column and at 2..8.
 - Changed here: each output is stored into its own plane by channel range, so the layer
   body's three strided copies go; in the prefill, one form for every T and the state in place
   only; in the decode round, one column per lane, each lane's slot both read and written, and
-  no valid-column mask. The file header lists the changes. The vendored op stays in the
+  no valid-column mask, and planes whose columns may lie apart; the gating's CTAs in the decode
+  round's conv grid, its split-K form one CTA a row that sums its slices itself instead of a
+  second launch. The file header lists the changes. The vendored op stays in the
   subtree as its oracle and for the other forms: the eager step, the width-1 decode round and
   the decode rounds that copy (the measurement switch, cards of other generations)
   (`kernel/vendor/VENDOR.md`).

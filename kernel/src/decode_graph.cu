@@ -17,6 +17,7 @@
 #include "decode_graph_copies.h"
 #include "deferred_verify.h"
 #include "dflash2_drafter.h"
+#include "gdn_gating_home.h"
 #include "ignis_gdn_layer.h"
 #include "ignis_gqa_layer.h"
 #include "layer_internal.h"
@@ -550,6 +551,20 @@ bool read_round_timing(ignis_model *model) {
   return true;
 }
 
+// The device's compute capability major, for a rule that follows the card; false (error set,
+// naming `what`) when the device cannot say it.
+bool device_generation(int *major, const char *what) {
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err == cudaSuccess) err = cudaDeviceGetAttribute(major, cudaDevAttrComputeCapabilityMajor, device);
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_decode_graph_capture: the GPU generation for ") + what + ": " +
+              cudaGetErrorString(err));
+    return false;
+  }
+  return true;
+}
+
 // GitHub #677, #680 (spec #672): the decode widths, and whether the verify round, run copy-free
 // from this capture on (kernel/src/decode_graph_copies.h), from IGNIS_DECODE_GRAPH_COPIES and the
 // card, read at each capture. False (error set) on a value other than `1` or `wide`, or when the
@@ -562,17 +577,40 @@ bool read_decode_graph_copies(ignis_model *model) {
     set_error(std::string("ignis_decode_graph_capture: ") + e.what());
     return false;
   }
-  int device = 0;
   int major = 0;
-  cudaError_t err = cudaGetDevice(&device);
-  if (err == cudaSuccess) err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-  if (err != cudaSuccess) {
-    set_error(std::string("ignis_decode_graph_capture: the GPU generation for the copy-free round: ") +
-              cudaGetErrorString(err));
+  if (!device_generation(&major, "the copy-free round")) {
     return false;
   }
   model->decode_copy_free_widths = ignis::decode_graph_copies::copy_free_widths(named, major);
   model->verify_copy_free = ignis::decode_graph_copies::verify_copy_free(named, major);
+  return true;
+}
+
+// GitHub #681 (spec #672): where each GDN layer's gating runs from this capture on
+// (kernel/src/gdn_gating_home.h), from IGNIS_GDN_GATING and the card, read at each capture; the
+// branch's stream and events are made by the first capture that takes it. False (error set) on a
+// value other than `chain`, `branch` or `fused`, when the device cannot say its generation, or when
+// CUDA cannot make the branch.
+bool read_gdn_gating(ignis_model *model) {
+  ignis::gdn_gating::Home named = ignis::gdn_gating::kUnset;
+  try {
+    named = ignis::gdn_gating::switch_at_capture();
+  } catch (const std::invalid_argument &e) {
+    set_error(std::string("ignis_decode_graph_capture: ") + e.what());
+    return false;
+  }
+  int major = 0;
+  if (!device_generation(&major, "the GDN gating's home")) {
+    return false;
+  }
+  const ignis::gdn_gating::Home home = ignis::gdn_gating::home_on(named, major);
+  std::string error;
+  if (home == ignis::gdn_gating::Home::Branch && model->gdn_gating_branch.stream == nullptr &&
+      !model->gdn_gating_branch.create(&error)) {
+    set_error("ignis_decode_graph_capture: the GDN gating's " + error);
+    return false;
+  }
+  model->gdn_gating_home = home;
   return true;
 }
 
@@ -609,7 +647,7 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
     }
     return rc;
   }
-  if (!read_round_timing(model) || !read_decode_graph_copies(model)) {
+  if (!read_round_timing(model) || !read_decode_graph_copies(model) || !read_gdn_gating(model)) {
     return -1;
   }
   // GitHub #676: IGNIS_DEFER_VERIFY, read at each capture like the round

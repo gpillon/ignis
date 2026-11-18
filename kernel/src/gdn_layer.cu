@@ -21,6 +21,7 @@
 
 #include "ignis_seq_internal.h"
 #include "gdn_conv_split.h"
+#include "gdn_gating_home.h"
 #include "gdn_prefill.h"
 #include "layer_internal.h"
 #include "model_internal.h"
@@ -53,6 +54,7 @@
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -390,6 +392,11 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
 // of the conv plane, and past one column the conv writes them as planes of
 // their own (kernel/src/gdn_conv_split.h `split_conv_slots`). The bytes are
 // main's either way.
+//
+// GitHub #681: the gating runs where the latest capture put it
+// (kernel/src/gdn_gating_home.h): on the round's stream after the conv
+// (main's), on a branch forked after the input RMSNorm and joined before the
+// recurrence, or in the conv's own kernel. Its gates are main's in each.
 int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
                             uint32_t width, void *in_residual, void *out_residual,
                             uint32_t gdn_layer, LinearPolicyMode mode) {
@@ -450,6 +457,19 @@ int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
         weight_tensor(w.input_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
     ninfer::ops::rmsnorm(in, input_norm, model->rms_norm_eps, /*unit_offset=*/true, h, stream);
 
+    // GitHub #681: the branch forks here, once `h` is written; the gating
+    // reads nothing else the round writes.
+    const ninfer::Tensor a_log =
+        weight_tensor(w.a_log, ninfer::DType::FP32, {value_heads, 1, 1, 1});
+    const ninfer::Tensor dt_bias =
+        weight_tensor(w.dt_bias, ninfer::DType::FP32, {value_heads, 1, 1, 1});
+    const ignis::gdn_gating::Home gating_home = model->gdn_gating_home;
+    std::optional<ignis::gdn_gating::Beside> beside;
+    if (gating_home == ignis::gdn_gating::Home::Branch) {
+      beside.emplace(model->gdn_gating_branch, stream, h, w.a_b_projection, a_log, dt_bias,
+                     *model->decode_graph_scratch, g, beta);
+    }
+
     const ninfer::Tensor conv_weight = weight_tensor(
         w.convolution, ninfer::DType::BF16, {conv_channels, kIgnisGdnConvKernel, 1, 1});
     input_projection(*model, w, h, qkv, zbuf, *model->decode_graph_scratch, mode, stream);
@@ -464,7 +484,30 @@ int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     // vendored conv and the copies below would leave.
     const bool copy_free = in_residual == out_residual;
     const bool split = copy_free && T > 1;
-    if (split) {
+    if (gating_home == ignis::gdn_gating::Home::Fused) {
+      // GitHub #681: the gating in the conv's kernel, which writes what the
+      // conv of this form writes: the three planes where they split, else
+      // the one [C, T] plane the views or the copies below read, as three
+      // ranges of its columns.
+      ignis::gdn_conv::Gating gating{h, w.a_b_projection, a_log, dt_bias, g, beta};
+      if (split) {
+        ignis::gdn_conv::split_conv_slots(qkv, conv_weight, conv_states_mut, lane_slots, query, key, value, stream,
+                                          &gating);
+      } else {
+        auto range = [&](std::int32_t offset, std::int32_t width) {
+          ninfer::Tensor plane(static_cast<std::uint8_t *>(qkv_conv.data) + static_cast<std::size_t>(offset) * 2,
+                               ninfer::DType::BF16, {width, T, 1, 1});
+          plane.nb[1] = qkv_conv.nb[1];
+          plane.nb[2] = plane.nb[3] = qkv_conv.nb[1] * T;
+          return plane;
+        };
+        ninfer::Tensor query_range = range(0, qk_width);
+        ninfer::Tensor key_range = range(qk_width, qk_width);
+        ninfer::Tensor value_range = range(2 * qk_width, value_width);
+        ignis::gdn_conv::split_conv_slots(qkv, conv_weight, conv_states_mut, lane_slots, query_range, key_range,
+                                          value_range, stream, &gating);
+      }
+    } else if (split) {
       ignis::gdn_conv::split_conv_slots(qkv, conv_weight, conv_states_mut, lane_slots, query, key, value, stream);
     } else {
       ninfer::Tensor qkv_rows = qkv.view({conv_channels, 1, T, 1});
@@ -507,12 +550,12 @@ int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
       return -1;
     }
 
-    const ninfer::Tensor a_log =
-        weight_tensor(w.a_log, ninfer::DType::FP32, {value_heads, 1, 1, 1});
-    const ninfer::Tensor dt_bias =
-        weight_tensor(w.dt_bias, ninfer::DType::FP32, {value_heads, 1, 1, 1});
-    ninfer::ops::gdn_gating_proj(h, w.a_b_projection, a_log, dt_bias, *model->decode_graph_scratch,
-                                 g, beta, stream);
+    if (gating_home == ignis::gdn_gating::Home::Chain) {
+      ninfer::ops::gdn_gating_proj(h, w.a_b_projection, a_log, dt_bias, *model->decode_graph_scratch,
+                                   g, beta, stream);
+    } else if (beside.has_value()) {
+      beside->join();
+    }
 
     // The snapshot form's [.., W, B] layout with W=1: one token per lane,
     // `width` lanes -- the same contiguous buffers the projections above
@@ -623,6 +666,20 @@ int32_t run_gdn_layer_record(ignis_model *model, ignis_seq_pool *pool, uint32_t 
         weight_tensor(w.input_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
     ninfer::ops::rmsnorm(in, input_norm, model->rms_norm_eps, /*unit_offset=*/true, h, stream);
 
+    // GitHub #681 (kernel/src/gdn_gating_home.h): on the branch, the gating
+    // forks once `h` is written and joins before the recurrence; in its
+    // other homes it runs on the round's stream after the record's conv, as
+    // main's does (the fused home is the decode round's alone).
+    const ninfer::Tensor a_log =
+        weight_tensor(w.a_log, ninfer::DType::FP32, {value_heads, 1, 1, 1});
+    const ninfer::Tensor dt_bias =
+        weight_tensor(w.dt_bias, ninfer::DType::FP32, {value_heads, 1, 1, 1});
+    std::optional<ignis::gdn_gating::Beside> beside;
+    if (model->gdn_gating_home == ignis::gdn_gating::Home::Branch) {
+      beside.emplace(model->gdn_gating_branch, stream, h, w.a_b_projection, a_log, dt_bias,
+                     *model->decode_graph_scratch, g, beta);
+    }
+
     const ninfer::Tensor conv_weight = weight_tensor(
         w.convolution, ninfer::DType::BF16, {conv_channels, kIgnisGdnConvKernel, 1, 1});
     const ninfer::Tensor h_rows = h.view({hidden, W, batch, 1});
@@ -661,12 +718,12 @@ int32_t run_gdn_layer_record(ignis_model *model, ignis_seq_pool *pool, uint32_t 
                                               stream);
     }
 
-    const ninfer::Tensor a_log =
-        weight_tensor(w.a_log, ninfer::DType::FP32, {value_heads, 1, 1, 1});
-    const ninfer::Tensor dt_bias =
-        weight_tensor(w.dt_bias, ninfer::DType::FP32, {value_heads, 1, 1, 1});
-    ninfer::ops::gdn_gating_proj(h, w.a_b_projection, a_log, dt_bias, *model->decode_graph_scratch,
-                                 g, beta, stream);
+    if (beside.has_value()) {
+      beside->join();
+    } else {
+      ninfer::ops::gdn_gating_proj(h, w.a_b_projection, a_log, dt_bias, *model->decode_graph_scratch,
+                                   g, beta, stream);
+    }
 
     ninfer::Tensor recurrent_out = recurrent.view({head_dim, value_heads, W, batch});
     ninfer::ops::gated_delta_net_replay_record(

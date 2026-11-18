@@ -7,6 +7,7 @@
 #pragma once
 
 #include "drafter.h"
+#include "gdn_gating_home.h"
 #include "ignis_model.h"
 #include "ignis_step.h"
 #include "ignis_trellis_linear.h"
@@ -806,6 +807,14 @@ struct ignis_model {
   // GitHub #680: whether the verify round's traversal runs copy-free at every
   // width, decided at the same capture by the same rule; false before it.
   bool verify_copy_free = false;
+  // GitHub #681 (spec #672): where each GDN layer's gating runs in the decode
+  // and verify rounds (kernel/src/gdn_gating_home.h), as the latest
+  // `ignis_decode_graph_capture` decided it from the card and
+  // IGNIS_GDN_GATING; main's chain before a load's first capture.
+  ignis::gdn_gating::Home gdn_gating_home = ignis::gdn_gating::Home::Chain;
+  // Its branch's stream and events, made by the first capture that takes the
+  // branch and destroyed with the model.
+  ignis::flash_next::SideBranch gdn_gating_branch;
   // Set by the most recent `ignis_program_decode` call: 1 if it replayed a
   // graph, 0 if it ran the eager loop (`ignis_program_stats`'s
   // `graph_launches`).

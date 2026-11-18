@@ -3011,6 +3011,8 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
     // GitHub #652: and the stream's layout is no longer named, so a stream created at its address
     // starts from the default.
     model->w4a4_activation_layout_stream.reset();
+    // GitHub #681: the gating's branch, idle once the stream is (every round joins it).
+    model->gdn_gating_branch.destroy();
     if (model->stream != nullptr) {
       cudaStreamDestroy(model->stream);
     }

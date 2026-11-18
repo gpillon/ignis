@@ -142,6 +142,8 @@ pub(crate) mod ffi {
         pub drafter_append_graph_ready_mask: u32,
         /// GitHub #680: the same for the verify graphs.
         pub verify_graph_copy_nodes: [u32; 8],
+        /// GitHub #681: the GDN gating's home, 0 chain, 1 branch, 2 fused.
+        pub gdn_gating: u32,
     }
 
     unsafe extern "C" {
@@ -489,6 +491,13 @@ pub struct ProgramStats {
     /// copies no residual; its drafter's copies stay); 0 where
     /// [`ProgramStats::verify_graph_nodes`] is.
     pub verify_graph_copy_nodes: [u32; 8],
+    /// GitHub #681: where the 27B's GDN layers run their gating in the decode
+    /// and verify rounds, as the latest [`capture_decode_graphs`] decided it
+    /// from the card and `IGNIS_GDN_GATING` (`kernel/src/gdn_gating_home.h`):
+    /// 0 on the round's chain, as before (also before a load's first capture
+    /// and on Flash-Next), 1 on a branch of the graph beside the input
+    /// projection, 2 in the decode round's conv kernel.
+    pub gdn_gating: u32,
 }
 
 /// The result of [`capture_decode_graphs`]: how long capture took and which
@@ -2422,6 +2431,7 @@ pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, Stri
         verify_folds_in_flight: stats.verify_folds_in_flight,
         drafter_append_graph_ready_mask: stats.drafter_append_graph_ready_mask,
         verify_graph_copy_nodes: stats.verify_graph_copy_nodes,
+        gdn_gating: stats.gdn_gating,
     })
 }
 

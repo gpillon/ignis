@@ -534,6 +534,12 @@ struct ignis_program_stats {
   /* GitHub #680: the same for the verify graphs; 0 where `verify_graph_nodes`
    * is. */
   uint32_t verify_graph_copy_nodes[IGNIS_DECODE_MAX_BATCH];
+  /* GitHub #681: where the 27B's GDN layers run their gating in the decode
+   * and verify rounds, as the latest capture decided it from the card and
+   * IGNIS_GDN_GATING: 0 on the round's chain, as before (also before a load's
+   * first capture, and on Flash-Next), 1 on a branch of the graph beside the
+   * input projection, 2 in the decode round's conv kernel. */
+  uint32_t gdn_gating;
 };
 
 /* Captures one CUDA graph per exact decode batch width 1..the load's decode
