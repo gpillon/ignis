@@ -193,8 +193,9 @@ retained tokens:
   different question each time, is therefore prefilled again by every
   conversation, and so is one sent as a user message of its own with the
   question in the next: no reuse point falls between the two. Send the
-  document in the system message instead (its first part, when the system
-  message comes in several), byte for byte the same each time and with the
+  document as the system message instead (the first of them, when the
+  conversation opens with several system messages, which ignis joins into one
+  block cut after the first), byte for byte the same each time and with the
   same tools, and the question in the user message: from the second
   conversation on, each resumes from the retained prefix at the end of that
   block, rounded down to whole KV pages, and prefills only the last partial
