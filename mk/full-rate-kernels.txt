@@ -39,9 +39,10 @@ mma      dense_prefill_gemm_kernel        kernel/src/dense_prefill.cu
 mma      fa_int8_kernel                   kernel/src/hq_prompt_int8.cu
 cuda     tile_vt_group_kernel             kernel/src/hq_prompt_int8.cu
 
-# The split conv of the GDN prefill (#507): CUDA cores.
+# The split conv of the GDN prefill (#507) and of the decode round (#680): CUDA cores.
 cuda     gdn_split_conv_kernel            kernel/src/gdn_conv_split.cu
 cuda     gdn_split_conv_state_kernel      kernel/src/gdn_conv_split.cu
+cuda     gdn_split_conv_slots_kernel      kernel/src/gdn_conv_split.cu
 
 # The 27B's own GDN prefill on 8.x (#514).
 cuda     gdn_prefill_prepare_kernel       kernel/src/gdn_prefill.cu     # #514: the chunk preparation, CUDA cores

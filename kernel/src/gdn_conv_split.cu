@@ -1,15 +1,22 @@
-// ignis kernel leaf: the GDN prefill's causal conv, writing q, k and v split
-// (kernel/src/gdn_conv_split.h; GitHub #507, spec #503) -- an ADAPTED op (ADR 0051 tier 2).
+// ignis kernel leaf: the GDN layer's causal conv, writing q, k and v split
+// (kernel/src/gdn_conv_split.h; GitHub #507, spec #503; GitHub #680, spec #672, the decode
+// round's form) -- an ADAPTED op (ADR 0051 tier 2).
 //
 // Upstream: the reference, gpillon/ninfer, commit a00648cb828457986cf5b4b4f712b4cbcd7af0d1
 // (the commit kernel/vendor/manifest.json pins), Apache-2.0 (kernel/vendor/LICENSE):
 //   src/ops/kernel/causal_conv1d.cuh    causal_conv1d_prefill_pairs_kernel (one thread per token
 //                                       and channel pair, the four taps read from the chunk or
 //                                       from the state, the fp32 accumulation in that order, SiLU,
-//                                       the paired BF16 rounding) and
+//                                       the paired BF16 rounding),
 //                                       causal_conv1d_prefill_state_kernel (the taps after the
-//                                       chunk, its old values held in registers before any store);
-//   src/ops/launcher/causal_conv1d.cu   causal_conv1d_prefill_launch's grids and block widths.
+//                                       chunk, its old values held in registers before any store)
+//                                       and, for the decode round's form,
+//                                       causal_conv1d_batched_sequence_snapshot_kernel (one thread
+//                                       per channel and lane, the lane's taps read from its slot,
+//                                       the fp32 accumulation in that order, SiLU, the BF16
+//                                       rounding, the new taps written to the slot);
+//   src/ops/launcher/causal_conv1d.cu   causal_conv1d_prefill_launch's grids and block widths,
+//                                       and launch_batched_sequence_snapshot's at one column.
 // From the vendored reference, called and not copied: `ninfer::ops::silu` and `div_up`
 // (ops/common/math.cuh).
 //
@@ -21,6 +28,12 @@
 //     kernels. They compute the same expression, so the planes are the same bits
 //     (kernel/tests/test_gdn_conv_split.cu runs every form against this one).
 //   - The pair form only, the state in place only: the layer calls nothing else.
+//   - The decode round's form (GitHub #680): the snapshot kernel at one column per lane, every
+//     lane's initial and base slot the same (the decode graph's in-place form), its output
+//     stored into the query, key or value plane by channel range, as above, instead of the
+//     [C, B] plane the decode graph split with three strided copies past one column; no valid
+//     column mask (the decode round has none). Upstream sends one lane to another kernel
+//     (causal_conv1d_snapshot_decode_kernel), which computes the same expression.
 //
 // Its numerical contract is the vendored op's, which is its oracle (ADR 0031): bit equality.
 
@@ -128,6 +141,54 @@ __global__ void gdn_split_conv_state_kernel(const __nv_bfloat16 *x, __nv_bfloat1
   }
 }
 
+// Upstream's causal_conv1d_batched_sequence_snapshot_kernel at one column, unmasked, every lane's
+// initial and base slot its own `lane_slots` entry, its store split by channel range. The
+// accumulation is upstream's statement for statement: the bits are its bits.
+__global__ void gdn_split_conv_slots_kernel(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
+                                            __nv_bfloat16 *conv_states, const std::int32_t *lane_slots,
+                                            __nv_bfloat16 *query, __nv_bfloat16 *key, __nv_bfloat16 *value,
+                                            std::int32_t C, std::int32_t query_width, std::int32_t key_width,
+                                            std::int64_t slot_stride) {
+  const std::int32_t lane = static_cast<std::int32_t>(blockIdx.y);
+  const std::int64_t c64 = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+  const std::int64_t C64 = static_cast<std::int64_t>(C);
+  if (c64 >= C64) { return; }
+
+  __nv_bfloat16 *slot = conv_states + static_cast<std::int64_t>(lane_slots[lane]) * slot_stride;
+  __nv_bfloat16 s0 = slot[c64];
+  __nv_bfloat16 s1 = slot[C64 + c64];
+  __nv_bfloat16 s2 = slot[2 * C64 + c64];
+  const float w0 = __bfloat162float(weight[c64]);
+  const float w1 = __bfloat162float(weight[C64 + c64]);
+  const float w2 = __bfloat162float(weight[2 * C64 + c64]);
+  const float w3 = __bfloat162float(weight[3 * C64 + c64]);
+
+  const __nv_bfloat16 x0 = x[static_cast<std::int64_t>(lane) * C64 + c64];
+  float acc = 0.0f;
+  acc += w0 * __bfloat162float(s0);
+  acc += w1 * __bfloat162float(s1);
+  acc += w2 * __bfloat162float(s2);
+  acc += w3 * __bfloat162float(x0);
+  const __nv_bfloat16 out = __float2bfloat16_rn(ninfer::ops::silu(acc));
+  s0 = s1;
+  s1 = s2;
+  s2 = x0;
+  slot[c64] = s0;
+  slot[C64 + c64] = s1;
+  slot[2 * C64 + c64] = s2;
+
+  const std::int64_t qw = query_width;
+  const std::int64_t kw = key_width;
+  if (c64 < qw) {
+    query[static_cast<std::int64_t>(lane) * qw + c64] = out;
+  } else if (c64 < qw + kw) {
+    key[static_cast<std::int64_t>(lane) * kw + c64 - qw] = out;
+  } else {
+    const std::int64_t vw = C64 - qw - kw;
+    value[static_cast<std::int64_t>(lane) * vw + c64 - qw - kw] = out;
+  }
+}
+
 [[noreturn]] void refuse(const std::string &why) {
   throw std::invalid_argument("gdn split conv: " + why);
 }
@@ -186,6 +247,48 @@ void split_conv(const ninfer::Tensor &x, const ninfer::Tensor &weight, ninfer::T
   err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(std::string("gdn split conv: state launch failed: ") + cudaGetErrorString(err));
+  }
+}
+
+void split_conv_slots(const ninfer::Tensor &x, const ninfer::Tensor &weight, ninfer::Tensor &conv_states,
+                      const ninfer::Tensor &lane_slots, ninfer::Tensor &query, ninfer::Tensor &key,
+                      ninfer::Tensor &value, cudaStream_t stream) {
+  constexpr int kBlock = 256;
+  const std::int32_t C = x.ne[0];
+  const std::int32_t B = x.ne[1];
+  if (C <= 0 || B <= 0) { refuse("x must have positive channels and lanes"); }
+  const std::int32_t cq = query.ne[0], ck = key.ne[0], cv = value.ne[0];
+  if (cq <= 0 || ck <= 0 || cv <= 0 || static_cast<std::int64_t>(cq) + ck + cv != C) {
+    refuse("the query, key and value widths (" + std::to_string(cq) + " + " + std::to_string(ck) + " + " +
+           std::to_string(cv) + ") must add up to x's " + std::to_string(C) + " channels");
+  }
+  if (query.ne[1] != B || key.ne[1] != B || value.ne[1] != B) {
+    refuse("the query, key and value planes must have x's lanes (" + std::to_string(B) + ")");
+  }
+  require_bf16_plane(x, C, B, "x");
+  require_bf16_plane(weight, C, 4, "weight");
+  require_bf16_plane(query, cq, B, "query");
+  require_bf16_plane(key, ck, B, "key");
+  require_bf16_plane(value, cv, B, "value");
+  if (conv_states.dtype != ninfer::DType::BF16 || conv_states.ne[0] != C || conv_states.ne[1] != 3 ||
+      conv_states.ne[2] < B || conv_states.ne[3] != 1 || !conv_states.is_contiguous() || conv_states.data == nullptr) {
+    refuse("conv_states must be contiguous BF16 [" + std::to_string(C) + ", 3, slots >= " + std::to_string(B) + "]");
+  }
+  if (lane_slots.dtype != ninfer::DType::I32 || lane_slots.ne[0] != B || lane_slots.ne[1] != 1 ||
+      lane_slots.ne[2] != 1 || lane_slots.ne[3] != 1 || !lane_slots.is_contiguous() || lane_slots.data == nullptr) {
+    refuse("lane_slots must be contiguous I32 [" + std::to_string(B) + "]");
+  }
+
+  const dim3 grid(static_cast<unsigned int>(ninfer::ops::div_up(static_cast<std::int64_t>(C), static_cast<std::int64_t>(kBlock))),
+                  static_cast<unsigned int>(B));
+  gdn_split_conv_slots_kernel<<<grid, kBlock, 0, stream>>>(
+      static_cast<const __nv_bfloat16 *>(x.data), static_cast<const __nv_bfloat16 *>(weight.data),
+      static_cast<__nv_bfloat16 *>(conv_states.data), static_cast<const std::int32_t *>(lane_slots.data),
+      static_cast<__nv_bfloat16 *>(query.data), static_cast<__nv_bfloat16 *>(key.data),
+      static_cast<__nv_bfloat16 *>(value.data), C, cq, ck, static_cast<std::int64_t>(C) * 3);
+  const cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("gdn split conv: slot form launch failed: ") + cudaGetErrorString(err));
   }
 }
 

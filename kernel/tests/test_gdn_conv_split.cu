@@ -18,6 +18,13 @@
 //              first three columns read the taps and every channel range lands in its plane.
 //   refusals   a split whose widths do not add up to the input's channels, planes of another T,
 //              and an odd width (the pair form), each refused by name before any launch.
+//   slots      GitHub #680: the decode round's form, `split_conv_slots`, at every width the
+//              27B's decode round runs (1..8 lanes, one column each), against what the decode
+//              graph ran before it: `ninfer::ops::causal_conv1d_silu_snapshot` into one [C, B]
+//              plane, each lane's taps in its slot of a pool wider than the round, then the three
+//              strided copies. The lanes' slots are neither 0..B-1 nor in order, every slot holds
+//              nonzero taps, and the whole pool plane is compared, so a slot no lane names is
+//              shown untouched and each lane's taps are shown moved in its own slot.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE, so a missing or busy GPU fails this
 // test rather than skipping it.
@@ -31,6 +38,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -150,6 +159,97 @@ void split_conv_is_the_vendored_conv_then_the_copies(cudaStream_t stream) {
   }
 }
 
+// GitHub #680: the decode round's pool (more slots than lanes) and the slot each lane rides.
+constexpr int32_t kSlots = 11;
+constexpr int32_t kLaneSlots[8] = {9, 2, 6, 0, 10, 4, 7, 3};
+
+struct SlotInputs {
+  std::vector<uint16_t> x, weight, states;
+  std::vector<int32_t> slots;
+  explicit SlotInputs(int32_t B)
+      : x(bf16_values(200 + static_cast<uint32_t>(B), static_cast<std::size_t>(kChannels) * B, 2.0f)),
+        weight(bf16_values(7, static_cast<std::size_t>(kChannels) * 4, 1.0f)),
+        states(bf16_values(11, static_cast<std::size_t>(kChannels) * 3 * kSlots, 2.0f)),
+        slots(kLaneSlots, kLaneSlots + B) {}
+};
+
+// What the decode graph ran before #680 past one column: the vendored snapshot conv into one
+// [C, B] plane, every lane's initial and base slot its own, then the three strided copies.
+Planes vendored_snapshot_then_copies(const SlotInputs &in, int32_t B, cudaStream_t stream) {
+  DeviceBytes x(in.x.size() * 2), weight(in.weight.size() * 2), states(in.states.size() * 2),
+      slots(in.slots.size() * sizeof(int32_t));
+  DeviceBytes conv(in.x.size() * 2), query(static_cast<std::size_t>(kQuery) * B * 2),
+      key(static_cast<std::size_t>(kKey) * B * 2), value(static_cast<std::size_t>(kValue) * B * 2);
+  upload(x, in.x);
+  upload(weight, in.weight);
+  upload(states, in.states);
+  upload(slots, in.slots);
+  const ninfer::Tensor tx(x.p, ninfer::DType::BF16, {kChannels, 1, B, 1});
+  const ninfer::Tensor tw = bf16_plane(weight, kChannels, 4);
+  ninfer::Tensor ts(states.p, ninfer::DType::BF16, {kChannels, 3, kSlots, 1});
+  const ninfer::Tensor tslots(slots.p, ninfer::DType::I32, {B, 1, 1, 1});
+  ninfer::Tensor tconv(conv.p, ninfer::DType::BF16, {kChannels, 1, B, 1});
+  ninfer::ops::causal_conv1d_silu_snapshot(tx, tw, ts, ninfer::Tensor{}, tslots, tslots, tconv, stream);
+  const auto split = [&](int32_t offset, int32_t width, DeviceBytes &dst) {
+    MOE_CUDA(cudaMemcpy2DAsync(dst.p, static_cast<std::size_t>(width) * 2,
+                               static_cast<const uint8_t *>(conv.p) + static_cast<std::size_t>(offset) * 2,
+                               static_cast<std::size_t>(kChannels) * 2, static_cast<std::size_t>(width) * 2,
+                               static_cast<std::size_t>(B), cudaMemcpyDeviceToDevice, stream));
+  };
+  split(0, kQuery, query);
+  split(kQuery, kKey, key);
+  split(kQuery + kKey, kValue, value);
+  MOE_CUDA(cudaStreamSynchronize(stream));
+  return {download<uint16_t>(query.p, static_cast<std::size_t>(kQuery) * B),
+          download<uint16_t>(key.p, static_cast<std::size_t>(kKey) * B),
+          download<uint16_t>(value.p, static_cast<std::size_t>(kValue) * B),
+          download<uint16_t>(states.p, in.states.size())};
+}
+
+Planes split_conv_slots(const SlotInputs &in, int32_t B, cudaStream_t stream) {
+  DeviceBytes x(in.x.size() * 2), weight(in.weight.size() * 2), states(in.states.size() * 2),
+      slots(in.slots.size() * sizeof(int32_t));
+  DeviceBytes query(static_cast<std::size_t>(kQuery) * B * 2), key(static_cast<std::size_t>(kKey) * B * 2),
+      value(static_cast<std::size_t>(kValue) * B * 2);
+  upload(x, in.x);
+  upload(weight, in.weight);
+  upload(states, in.states);
+  upload(slots, in.slots);
+  const ninfer::Tensor tx = bf16_plane(x, kChannels, B);
+  const ninfer::Tensor tw = bf16_plane(weight, kChannels, 4);
+  ninfer::Tensor ts(states.p, ninfer::DType::BF16, {kChannels, 3, kSlots, 1});
+  const ninfer::Tensor tslots(slots.p, ninfer::DType::I32, {B, 1, 1, 1});
+  ninfer::Tensor tq = bf16_plane(query, kQuery, B);
+  ninfer::Tensor tk = bf16_plane(key, kKey, B);
+  ninfer::Tensor tv = bf16_plane(value, kValue, B);
+  ignis::gdn_conv::split_conv_slots(tx, tw, ts, tslots, tq, tk, tv, stream);
+  MOE_CUDA(cudaStreamSynchronize(stream));
+  return {download<uint16_t>(query.p, static_cast<std::size_t>(kQuery) * B),
+          download<uint16_t>(key.p, static_cast<std::size_t>(kKey) * B),
+          download<uint16_t>(value.p, static_cast<std::size_t>(kValue) * B),
+          download<uint16_t>(states.p, in.states.size())};
+}
+
+void split_conv_slots_is_the_vendored_snapshot_conv_then_the_copies(cudaStream_t stream) {
+  const std::size_t slot_elements = static_cast<std::size_t>(kChannels) * 3;
+  for (int32_t B = 1; B <= 8; ++B) {
+    const SlotInputs in(B);
+    const Planes want = vendored_snapshot_then_copies(in, B, stream);
+    const Planes got = split_conv_slots(in, B, stream);
+    const std::string label = "slots, " + std::to_string(B) + " lane" + (B == 1 ? "" : "s");
+    same_bits(got.query, want.query, label + " query");
+    same_bits(got.key, want.key, label + " key");
+    same_bits(got.value, want.value, label + " value");
+    same_bits(got.state, want.state, label + " pool taps after the round");
+    for (int32_t lane = 0; lane < B; ++lane) {
+      const auto at = static_cast<std::ptrdiff_t>(static_cast<std::size_t>(kLaneSlots[lane]) * slot_elements);
+      const bool moved = !std::equal(want.state.begin() + at, want.state.begin() + at + static_cast<std::ptrdiff_t>(slot_elements),
+                                     in.states.begin() + at);
+      check(moved, label + ": lane " + std::to_string(lane) + "'s taps move in slot " + std::to_string(kLaneSlots[lane]));
+    }
+  }
+}
+
 bool refused(const std::string &label, int32_t q, int32_t k, int32_t v, int32_t T, int32_t value_T,
              const std::string &needle) {
   DeviceBytes x(static_cast<std::size_t>(kChannels) * T * 2), weight(static_cast<std::size_t>(kChannels) * 8),
@@ -189,6 +289,7 @@ int main() {
   cudaStream_t stream = nullptr;
   MOE_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   split_conv_is_the_vendored_conv_then_the_copies(stream);
+  split_conv_slots_is_the_vendored_snapshot_conv_then_the_copies(stream);
   a_split_that_does_not_fit_is_refused();
   MOE_CUDA(cudaStreamDestroy(stream));
   if (g_failed != 0) {
