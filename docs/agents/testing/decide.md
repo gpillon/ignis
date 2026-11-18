@@ -61,8 +61,9 @@ picks the arms, one load each: a comma list of names, or `all`; unset,
 ends with a `logits <arm> {...}` line in the fixture's form, and
 `IGNIS_DECIDE_DRAFTS=1` also reads the recorded drafts (a `drafts <arm>
 {...}` line). `decide_scalar_gpu.rs` runs on the same arms, with the same
-default; its balance case (−0.75) is a printed watch line, never asserted,
-its sign being a coin under both exception weights (#670, #671).
+default; its balance case (−0.75) is a printed watch line, never asserted:
+its sign reads right on 3 of the 14 arms and wrong at both served shapes
+(#670, #671).
 `decide_entailment_fixture.rs` checks the set's shape on CPU: 20 cases, 19
 and 20 ignis's and "yes" gates, every tier the one the rule gives from the
 case's logits, every label a gate case, every arm loading the shape it

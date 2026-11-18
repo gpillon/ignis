@@ -9,10 +9,10 @@
 //! this primitive `number` cannot express at all.
 //!
 //! **The negative is a watch line**, printed and never asserted (GitHub
-//! #675): the sign of the balance's −0.75 is a coin on the 27B in both
-//! exception weights (GitHub #667: BF16 read it right on 2 of 9 routes and
-//! wrong at its served shape), so asserting it reported the route, not a
-//! fault. The minus
+//! #675): the sign of the balance's −0.75 is on the line on the 27B. On
+//! 2026-11-18 it read right on 3 of the 14 registered arms (BF16's, none of
+//! FP8's) and wrong at both exception weights' served shapes, so asserting
+//! it reported the route, not a fault. The minus
 //! `scalar` drops on literal negatives is GitHub #671, and the sign's absence
 //! from `uncertainty` GitHub #670. Every other case is asserted, and every
 //! case's run must close its own object.

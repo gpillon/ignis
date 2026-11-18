@@ -142,7 +142,12 @@ profile (chunk 2,048, DFlash2 at 7, vision on) with each of those values
 named as a flag, resolved with no file and no environment and loaded
 through the server's own load path. `s-bf16-yarn3` and `s-fp8-yarn3.5` are
 each exception weights' served shape on the RTX 5090; every other served
-arm moves one value from its weights' served shape.
+arm moves one value from its weights' served shape. FP8 keeps the profile's
+917,504 tokens. BF16 lowers them to 786,432, and so its rope to yarn:3,
+under a 1.5 GB VRAM headroom (or a desktop holding more of the card); under
+the profile's 1.2 GB on a desktop holding 3 GB it keeps 917,504 and
+yarn:3.5, which `s-bf16-yarn3.5` reads, since at an equal rope table the
+context moves none of these reads.
 
 | arm | surface | weights | context | rope | GDN prefill | prompt attention | prompt reuse |
 |-----|---------|---------|--------:|------|-------------|------------------|--------------|
