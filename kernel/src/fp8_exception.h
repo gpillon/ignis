@@ -20,6 +20,7 @@
 #define IGNIS_FP8_EXCEPTION_H
 
 #include "ignis_fp8_linear.h"
+#include "process_environment.h"
 
 #include "core/arena.h"
 #include "core/layout.h"
@@ -61,6 +62,14 @@ inline QkgvLayout qkgv_layout() {
 inline bool quantizes(ninfer::ops::LinearPolicy policy, std::int32_t tokens) {
   return policy == ninfer::ops::LinearPolicy::AllowA8 && tokens > kGemvTokens;
 }
+
+// GitHub #678 (spec #672): whether the q | k | gate | v projection's GEMV calls take the grouped
+// GEMV's paired form (ignis_fp8_linear_grouped_paired) or its one-row form, as the measurement
+// switch IGNIS_FP8_GEMV_PAIRED names it at each call, so a graph keeps the form its capture read:
+// unset or `1` paired, `0` one-row. The output projection's residual add keeps the one-row form,
+// which measured faster there. Throws std::invalid_argument, naming the variable, on any other
+// value; the load reads it once, so such a value refuses the load.
+inline bool gemv_paired() { return ignis::named_switch("IGNIS_FP8_GEMV_PAIRED", true, {{"0", false}, {"1", true}}); }
 
 struct W8a8Workspace {
   void *codes = nullptr;

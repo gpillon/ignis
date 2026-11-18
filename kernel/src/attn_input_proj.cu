@@ -156,7 +156,10 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
                                                    scratch.scales, cols, 0, stream);
             }
         } else if (cols <= fe::kGemvTokens) {
-            rc = ignis_fp8_linear_grouped(segments, fe::kQkgvSegments, fe::kHidden, x.data, cols, 0, stream);
+            // GitHub #678: the paired form, unless IGNIS_FP8_GEMV_PAIRED=0 names the one-row form.
+            rc = fe::gemv_paired()
+                     ? ignis_fp8_linear_grouped_paired(segments, fe::kQkgvSegments, fe::kHidden, x.data, cols, 0, stream)
+                     : ignis_fp8_linear_grouped(segments, fe::kQkgvSegments, fe::kHidden, x.data, cols, 0, stream);
         } else {
             for (int i = 0; i < fe::kQkgvSegments && rc == 0; ++i) {
                 rc = ignis_fp8_linear(segments[i].weight, segments[i].rows, fe::kHidden, x.data, cols,

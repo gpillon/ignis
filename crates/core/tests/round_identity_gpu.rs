@@ -134,6 +134,8 @@ const ARMS: &[Arm] = &[
     Arm { name: "decode-graph-copies", switches: &[("IGNIS_DECODE_GRAPH_COPIES", "1")], graphs: true },
 
     // #678's arm, below this line.
+    // The FP8 q|k|gate|v projection's one-row GEMV: an `fp8` load's lever (`bf16` runs no FP8 GEMV).
+    Arm { name: "fp8-gemv-one-row", switches: &[("IGNIS_FP8_GEMV_PAIRED", "0")], graphs: true },
 
     // #679's arm, below this line.
 

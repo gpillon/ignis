@@ -7,6 +7,9 @@
 //   swiglu   the shared expert's gate/up pair, silu(g) * u in BF16, against fp64.
 //   grouped  (GitHub #306) GDN's four projections in one grouped GEMV launch against one linear
 //            each, bit for bit, 1..8 tokens; and its refusals.
+//   paired   (GitHub #678) the grouped GEMV's paired form against its one-row form, bit for bit,
+//            1..8 tokens, at the 27B's q | k | gate | v and at four other column widths; and its
+//            refusal past 6144 columns.
 //   add      (GitHub #341) the residual add on both routes against BF16(residual + the fp32
 //            linear), bit for bit.
 //   quantize (GitHub #341) a BF16 weight to the row-scale-v1 payload, every code and scale
@@ -177,6 +180,57 @@ void grouped_arm(int tokens, bool f32_out) {
   }
 }
 
+// GitHub #678: the grouped GEMV's paired form (ignis_fp8_linear_grouped_paired) against its one-row
+// form (ignis_fp8_linear_grouped), bit for bit at 1..8 tokens, every output poisoned first, for
+// segments of `rows` over `cols` columns; fp32 outputs at even token counts, BF16 at odd ones.
+void paired_arm(const std::vector<int> &rows, int cols, const std::string &what) {
+  const int count = static_cast<int>(rows.size());
+  std::vector<std::unique_ptr<DeviceBytes>> w;
+  for (int i = 0; i < count; ++i) {
+    const Fp8Matrix m = make_fp8(static_cast<uint32_t>(5200 + 16 * i + cols), rows[i], cols, 0.004f);
+    w.push_back(std::make_unique<DeviceBytes>(m.payload.size()));
+    upload(*w.back(), m.payload);
+  }
+  for (int tokens = 1; tokens <= IGNIS_FP8_GEMV_MAX_TOKENS; ++tokens) {
+    const bool f32_out = tokens % 2 == 0;
+    std::vector<uint16_t> x(static_cast<std::size_t>(tokens) * cols);
+    for (std::size_t i = 0; i < x.size(); ++i) x[i] = f32_to_bf16(hash_uniform(84, i, 2.0f));
+    DeviceBytes dx(x.size() * 2);
+    upload(dx, x);
+    std::vector<std::unique_ptr<DeviceBytes>> y_one, y_paired;
+    std::vector<ignis_fp8_segment> one(count), paired(count);
+    for (int i = 0; i < count; ++i) {
+      for (auto *ys : {&y_one, &y_paired}) {
+        ys->push_back(std::make_unique<DeviceBytes>(static_cast<std::size_t>(tokens) * rows[i] * (f32_out ? 4 : 2)));
+        MOE_CUDA(cudaMemset(ys->back()->p, 0xFF, ys->back()->bytes));
+      }
+      one[i] = ignis_fp8_segment{w[i]->p, static_cast<uint32_t>(rows[i]), y_one[i]->p};
+      paired[i] = ignis_fp8_segment{w[i]->p, static_cast<uint32_t>(rows[i]), y_paired[i]->p};
+    }
+    MOE_RC(ignis_fp8_linear_grouped(one.data(), count, cols, dx.p, tokens, f32_out ? 1 : 0, nullptr));
+    MOE_RC(ignis_fp8_linear_grouped_paired(paired.data(), count, cols, dx.p, tokens, f32_out ? 1 : 0, nullptr));
+    MOE_CUDA(cudaDeviceSynchronize());
+    bool same = true;
+    for (int i = 0; i < count; ++i) {
+      same = same && download<uint8_t>(y_paired[i]->p, y_paired[i]->bytes) ==
+                         download<uint8_t>(y_one[i]->p, y_one[i]->bytes);
+    }
+    check(same, "fp8 grouped GEMV paired " + what + " x " + std::to_string(tokens) + (f32_out ? " (fp32)" : " (bf16)") +
+                    ": the one-row form's bytes");
+  }
+  std::printf("  grouped paired %s x 1..8 tokens: compared with the one-row form byte for byte\n", what.c_str());
+}
+
+// GitHub #678: what the paired form refuses beyond the grouped call's own limits: past 6144 columns.
+void paired_refusal() {
+  const Fp8Matrix m = make_fp8(5300, 64, 7168, 0.004f);
+  DeviceBytes dw(m.payload.size()), dx(7168 * 2), dy(64 * 2);
+  upload(dw, m.payload);
+  const ignis_fp8_segment one{dw.p, 64, dy.p};
+  check(ignis_fp8_linear_grouped_paired(&one, 1, 7168, dx.p, 1, 0, nullptr) != 0,
+        "fp8 grouped GEMV paired: 7168 columns refused");
+}
+
 // GitHub #341: the residual add against the fp32 linear plus the add on the host, bit for bit, on
 // both routes.
 void linear_add_arm(int tokens) {
@@ -294,6 +348,15 @@ int main() {
   for (int tokens : {1, 3, 8, 64, 1024}) swiglu_arm(tokens);
   for (int tokens : {1, 2, 3, 5, 8}) grouped_arm(tokens, tokens == 3);
   for (int tokens : {1, 3, 8, 9, 200}) linear_add_arm(tokens);
+  // GitHub #678: the paired form at the 27B's q | k | gate | v [14336][5120] and at the widths a
+  // lane's chunks take past or up to a row's end: Flash-Next GDN's four projections at 2560, and one
+  // segment at 640, 4096 and 6144 columns.
+  paired_arm({6144, 1024, 6144, 1024}, 5120, "q|k|gate|v [14336][5120]");
+  paired_arm({10240, 6144, 48, 48}, IGNIS_MOE_HIDDEN, "GDN [16480][2560]");
+  paired_arm({2560}, 640, "[2560][640]");
+  paired_arm({512}, 4096, "[512][4096]");
+  paired_arm({5120}, 6144, "[5120][6144]");
+  paired_refusal();
   quantize_arm(64, 5120);
   quantize_arm(16, 6144);
   quantize_arm(3, 2560);

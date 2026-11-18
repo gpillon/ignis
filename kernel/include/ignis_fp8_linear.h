@@ -51,6 +51,16 @@ typedef struct ignis_fp8_segment {
 int32_t ignis_fp8_linear_grouped(const ignis_fp8_segment *segments, uint32_t count, uint32_t cols,
                                  const void *x, uint32_t tokens, uint32_t y_f32, void *stream);
 
+/* GitHub #678 (spec #672): ignis_fp8_linear_grouped's paired form, the 27B's grouped q | k | gate |
+ * v exception projection at decode widths: two output rows a warp, every code load of a batch
+ * issued before its first multiply-add, each output summed in the one-row form's order, so every
+ * segment's y holds the bytes ignis_fp8_linear_grouped writes. That call's arguments and limits,
+ * and `cols` at most 6144. ignis_fp8_linear_paired_launches counts its launches since the process
+ * started: how a test tells which form a caller ran. */
+int32_t ignis_fp8_linear_grouped_paired(const ignis_fp8_segment *segments, uint32_t count, uint32_t cols,
+                                        const void *x, uint32_t tokens, uint32_t y_f32, void *stream);
+uint64_t ignis_fp8_linear_paired_launches(void);
+
 /* GitHub #341: the residual add, residual[t][r] = BF16(residual[t][r] + y[t][r]) in place, y the
  * fp32 value ignis_fp8_linear computes on the same route (one fp32 add, one rounding); `residual`
  * BF16 [tokens][rows], 8-byte aligned. The 27B's output projections with BF16 activations. */
