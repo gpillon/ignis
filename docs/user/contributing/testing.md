@@ -47,6 +47,9 @@ make gpu-profile    # preflight, the kernel leaf's op tests, the ignored Rust GP
 make kernel-test    # the kernel leaf's CTest op tests alone
 ```
 
+`make gpu-profile` runs `scripts/gpu-profile.ps1` on Windows and
+`scripts/gpu-profile.sh` on Linux ([make](make.md) lists their switches).
+
 The card fits one run at a time, in any worktree: check `make gpu-status`
 before every GPU run.
 

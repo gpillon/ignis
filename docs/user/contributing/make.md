@@ -96,8 +96,13 @@ refuses, waits and keeps the logs as `start` does, but repeats a generated API
 key and public URL on the console, as Windows does. However the session ends
 (Ctrl+C, Vite exiting, the terminal closed, make killed, even with `kill -9`),
 the server gets SIGTERM, its graceful shutdown, and is killed if it still runs
-20 seconds later; a second Ctrl+C ends it at once. `gpu-profile` is the one
-target still Windows-only.
+20 seconds later; a second Ctrl+C ends it at once. `gpu-profile` runs
+`scripts/gpu-profile.sh` on Linux and `scripts/gpu-profile.ps1` on Windows:
+the same three stages, the same marker, the same exit codes. Its switches go
+in `GPU_PROFILE_ARGS`: `-SkipKernelBuild`, `-SkipCargoTests` and
+`-ThresholdMiB 4096` on Windows, `--skip-kernel-build`, `--skip-cargo-tests`
+and `--threshold-mib 4096` on Linux. The Linux script has had no run on a real
+card yet, only its selftest on stand-ins (`mk/linux/gpu-profile-selftest.sh`).
 
 A change to the `Makefile` starts from
 [ADR 0027](../../adr/0027-make-as-the-dev-entrypoint.md), the decision that

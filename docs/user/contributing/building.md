@@ -156,8 +156,12 @@ present, so it does not recompile the C++ leaf each time. On the MSVC triple the
 binary lands in `target/x86_64-pc-windows-msvc/release/`.
 
 Windows is the development host; Linux builds the same engine and is what the
-container image is built from. One `make` target is still Windows-only there,
-the GPU test profile (`gpu-profile`); `mk/os/linux.mk` names it.
+container image is built from. Every `make` target runs on both hosts.
+
+`.cargo/config.toml` pins the build target to the Windows (MSVC) triple, so a
+bare `cargo build` or `cargo test` on Linux needs
+`CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu` in the environment; `make` passes
+`--target` itself and needs nothing.
 
 macOS is not a target: a Mac compiles the workspace without `cuda`
 (`cargo check --workspace --all-targets --target aarch64-apple-darwin`) and

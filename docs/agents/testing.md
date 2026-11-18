@@ -232,7 +232,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gpu-profile.ps1
 ```
 
 `make gpu-profile` runs the same script; `GPU_PROFILE_ARGS` forwards its
-switches (`make gpu-profile GPU_PROFILE_ARGS=-SkipKernelBuild`).
+switches (`make gpu-profile GPU_PROFILE_ARGS=-SkipKernelBuild`). On Linux it
+runs `scripts/gpu-profile.sh` (#226): the same three stages and exit codes,
+`--skip-kernel-build`, `--skip-cargo-tests` and `--threshold-mib <n>`, the
+guard being `mk/linux/gpu.sh` and the marker `${TMPDIR:-/tmp}/ignis-gpu-preflight.ok`.
+Its selftest is `mk/linux/gpu-profile-selftest.sh`; no run on a real Linux
+card has happened yet.
 
 `scripts/gpu-preflight.ps1` still exists as the standalone check
 (`scripts/gpu-profile.ps1` calls it) for a quick "is the GPU free" query
