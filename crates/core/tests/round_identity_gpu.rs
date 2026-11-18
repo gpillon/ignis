@@ -90,10 +90,9 @@
 //! [`COPY_FREE_WIDTH_1_NODES`] nodes, and its verify graphs keep only the
 //! drafter's [`DRAFTER_COPIES`]; the `decode-graph-copies` arm's are main's,
 //! with their copies, and the `decode-graph-copies-wide` arm's main's but the
-//! width-1 decode graph, which is the reference's. #681: the width-1 count is
-//! [`FUSED_GATING_NODES`] fewer where the capture ran the GDN gating in the
-//! conv's kernel, as the capture reports (`ProgramStats::gdn_gating`), and
-//! each `gdn-gating-*` arm's capture reports the home its switch names.
+//! width-1 decode graph, which is the reference's. #681: each `gdn-gating-*`
+//! arm's capture reports the home its switch names
+//! (`ProgramStats::gdn_gating`), and its graphs copy as the reference's do.
 //!
 //! # Narrow runs
 //!
@@ -165,12 +164,11 @@ const ARMS: &[Arm] = &[
     // #680's arm, below this line.
     Arm { name: "decode-graph-copies-wide", switches: &[("IGNIS_DECODE_GRAPH_COPIES", "wide")], graphs: true },
 
-    // #681's arms, below this line: every home of the GDN gating, so that each
+    // #681's arms, below this line: both homes of the GDN gating, so that the
     // one the unset switch does not take is held to the one it takes, whichever
     // that is (kernel/src/gdn_gating_home.h `kUnset`); `chain` is main's.
     Arm { name: "gdn-gating-chain", switches: &[("IGNIS_GDN_GATING", "chain")], graphs: true },
     Arm { name: "gdn-gating-branch", switches: &[("IGNIS_GDN_GATING", "branch")], graphs: true },
-    Arm { name: "gdn-gating-fused", switches: &[("IGNIS_GDN_GATING", "fused")], graphs: true },
 ];
 
 /// One 27B load every arm runs on.
@@ -259,11 +257,8 @@ const LOADS: &[Load] = &[
 /// keeps and its own forward's sixteen, which no copy-free round removes.
 const COPY_FREE_LOAD: &str = "nvfp4-dflash2";
 const COPY_FREE_WIDTH_1_NODES: u32 = 677;
-/// #681: the width-1 decode graph's nodes the fused home of the GDN gating
-/// removes, one a GDN layer (the gating's kernel, now the conv's), and the
-/// home's values in `ProgramStats::gdn_gating`.
-const FUSED_GATING_NODES: u32 = 48;
-const GATING_HOMES: [(&str, u32); 3] = [("chain", 0), ("branch", 1), ("fused", 2)];
+/// #681: the GDN gating's homes, as `ProgramStats::gdn_gating` reports them.
+const GATING_HOMES: [(&str, u32); 2] = [("chain", 0), ("branch", 1)];
 const MAIN_COPIES: u32 = 64 + 3 * 48;
 const RESIDUAL_COPIES: u32 = 64;
 const DRAFTER_COPIES: u32 = 5 + 1 + 16;
@@ -457,8 +452,7 @@ fn riders<'a, 'p>(seqs: &'a mut [Option<Seq<'p>>], riding: &[usize]) -> Vec<&'a 
 /// same but the width-1 decode graph, the reference's. #681: and for the
 /// `gdn-gating-*` arms, which copy as the reference does; on every load each
 /// of them reports its switch's home on a card of compute capability 12 and
-/// main's chain on any other, and the width-1 decode graph is
-/// [`FUSED_GATING_NODES`] fewer where the gating ran in the conv's kernel.
+/// main's chain on any other.
 fn copy_free_graphs(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label: &str) {
     let named = arm.switches.iter().find(|&&(name, _)| name == "IGNIS_DECODE_GRAPH_COPIES").map(|&(_, value)| value);
     let gating = arm.switches.iter().find(|&&(name, _)| name == "IGNIS_GDN_GATING").map(|&(_, value)| value);
@@ -485,8 +479,7 @@ fn copy_free_graphs(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label
     let wide_free = blackwell && named.is_none();
     assert_eq!(copies[0], if width_1_free { 0 } else { MAIN_COPIES }, "{label}: arm `{}`: width 1's copy nodes", arm.name);
     if blackwell {
-        let fused = if stats.gdn_gating == 2 { FUSED_GATING_NODES } else { 0 };
-        assert_eq!(nodes[0], COPY_FREE_WIDTH_1_NODES - fused + copies[0], "{label}: arm `{}`: width 1's nodes", arm.name);
+        assert_eq!(nodes[0], COPY_FREE_WIDTH_1_NODES + copies[0], "{label}: arm `{}`: width 1's nodes", arm.name);
     }
     let wide = if wide_free { 0 } else { MAIN_COPIES };
     assert!(copies[1..].iter().all(|&c| c == wide), "{label}: arm `{}`: widths 2-{lanes} copy {wide} nodes", arm.name);

@@ -791,7 +791,7 @@ impl StepLeaf for CudaLeaf {
         // `0` or `1` (GitHub #674), of `IGNIS_DECODE_GRAPH_COPIES` other
         // than `1` or `wide` (GitHub #677, #680), of `IGNIS_DEFER_VERIFY`
         // other than `0` or `1` (GitHub #676) or of `IGNIS_GDN_GATING` other
-        // than `chain`, `branch` or `fused` (GitHub #681) would.
+        // than `chain` or `branch` (GitHub #681) would.
         //
         // Format-independent since P4-05 (GitHub #123): a capture set is one
         // per process either way, and the hq codec keeps fixed bytes per row

@@ -656,13 +656,12 @@ add_executable(ignis_kernel_gdn_conv_split_test test_gdn_conv_split.cu)
 target_include_directories(ignis_kernel_gdn_conv_split_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_gdn_conv_split_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_gdn_conv_split_test COMMAND ignis_kernel_gdn_conv_split_test)
-# GitHub #681 (spec #672): OURS -- the 27B's GDN gating in its two new homes
+# GitHub #681 (spec #672): OURS -- the 27B's GDN gating on its branch
 # (kernel/src/gdn_gating_home.h) against the vendored op on the round's stream, byte for byte at
-# every decode width 1-8: in the decode round's conv kernel (`split_conv_slots` with a Gating,
-# its conv held to the vendored snapshot conv and the copies in both plane forms), and on a branch
-# of its own, captured and eager, beside a stream that allocates from the same arena and fills it
-# (and at the verify round's 16 and 64 columns); then IGNIS_GDN_GATING's spellings and the card
-# rule. Links ignis_kernel for ours and ignis_vendor for the oracles; no SKIP_RETURN_CODE (ADR 0006).
+# every decode width 1-8 and at the verify round's 16 and 64 columns: on a stream of its own,
+# captured and eager, beside a stream that allocates from the same arena and fills it; then
+# IGNIS_GDN_GATING's spellings and the card rule. Links ignis_kernel for ours and ignis_vendor for
+# the oracles; no SKIP_RETURN_CODE (ADR 0006).
 add_executable(ignis_kernel_gdn_gating_home_test test_gdn_gating_home.cu)
 target_include_directories(ignis_kernel_gdn_gating_home_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_gdn_gating_home_test PRIVATE ignis_kernel ignis_vendor)

@@ -538,7 +538,7 @@ struct ignis_program_stats {
    * and verify rounds, as the latest capture decided it from the card and
    * IGNIS_GDN_GATING: 0 on the round's chain, as before (also before a load's
    * first capture, and on Flash-Next), 1 on a branch of the graph beside the
-   * input projection, 2 in the decode round's conv kernel. */
+   * input projection. */
   uint32_t gdn_gating;
 };
 
@@ -594,7 +594,7 @@ struct ignis_program_stats {
  * A load whose graphs were never captured defers.
  *
  * GitHub #681: each call also decides, from the card and IGNIS_GDN_GATING
- * (`chain`, `branch` or `fused`; unset is the kept home), where each GDN
+ * (`chain` or `branch`; unset is `branch`), where each GDN
  * layer runs its gating in the decode and verify rounds from then on,
  * replayed or eager (kernel/src/gdn_gating_home.h): the home the switch
  * names on a card of compute capability 12, the round's chain on every other

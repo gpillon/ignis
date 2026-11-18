@@ -1,16 +1,10 @@
-// GitHub #681 (spec #672): the 27B's GDN gating in its two new homes (kernel/src/gdn_gating_home.h)
-// against main's, the vendored op on the round's stream -- OURS, not vendored.
+// GitHub #681 (spec #672): the 27B's GDN gating on its branch (kernel/src/gdn_gating_home.h)
+// against the chain's, the vendored op on the round's stream -- OURS, not vendored.
 //
 // The gating's oracle is `ninfer::ops::gdn_gating_proj` at the 27B's shape (the a|b parent
-// [96, 5120], 48 heads), which runs one kernel at one column and a split-K pair at 2..8; each
-// home must leave its g and beta byte for byte, at every width the decode round runs (1..8).
+// [96, 5120], 48 heads), which runs one kernel at one column and a split-K pair at 2..8; the branch
+// must leave its g and beta byte for byte, at every width the decode round runs (1..8).
 //
-//   fused    `ignis::gdn_conv::split_conv_slots` with a Gating, the gating's CTAs in the decode
-//            round's conv kernel: its g and beta against the vendored op, and its conv against
-//            what the round ran without it (the vendored snapshot conv and the three strided
-//            copies), in both forms the decode graph asks of it: the three planes apart (the
-//            copy-free round past one column) and the one [C, B] plane as three ranges of its
-//            columns (the copy-free round at one column, every copying round).
 //   branch   `ignis::gdn_gating::Beside`, the vendored op on a stream of its own forked after the
 //            input is written and joined back, captured into a graph and replayed, then run
 //            eagerly, while the round's stream allocates from the same scratch arena and fills
@@ -18,20 +12,18 @@
 //            workspace must be a span of that arena the round's later allocations do not reach.
 //            At 1..8 columns and at 16 and 64, the verify round's at one and at eight lanes, where
 //            the op takes its cooperative tensor-core form.
-//   switch   IGNIS_GDN_GATING as a capture reads it: unset is kUnset; `chain`, `branch`, `fused`;
-//            any other value refused by name; a card of compute capability 12 takes the switch's
-//            home and every other main's chain.
+//   switch   IGNIS_GDN_GATING as a capture reads it: unset is kUnset; `chain`, `branch`; any other
+//            value refused by name; a card of compute capability 12 takes the switch's home and
+//            every other the chain.
 //
 // The inputs are hashed BF16, a few a rows scaled so that softplus takes its linear branch too.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE, so a missing or busy GPU fails this
 // test rather than skipping it.
 
-#include "gdn_conv_split.h"
 #include "gdn_gating_home.h"
 #include "moe_fixture.h"
 
-#include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 
 #include "core/arena.h"
@@ -63,13 +55,8 @@ using namespace moe_test;
 
 namespace {
 
-// The 27B's gating and conv (crates/core/src/compute.rs `ModelConfig::qwen38_27b`).
+// The 27B's gating (crates/core/src/compute.rs `ModelConfig::qwen38_27b`).
 constexpr int32_t kHeads = 48, kHidden = 5120, kRows = 2 * kHeads;
-constexpr int32_t kQuery = 2048, kKey = 2048, kValue = 6144;
-constexpr int32_t kChannels = kQuery + kKey + kValue;
-// The decode round's pool (more slots than lanes) and the slot each lane rides.
-constexpr int32_t kSlots = 11;
-constexpr int32_t kLaneSlots[8] = {9, 2, 6, 0, 10, 4, 7, 3};
 
 std::vector<uint16_t> bf16_values(uint32_t stream, std::size_t n, float amplitude) {
   std::vector<uint16_t> v(n);
@@ -150,7 +137,7 @@ std::size_t workspace_bytes(int32_t T) {
   return std::max<std::size_t>(ninfer::ops::gdn_gating_proj_workspace_capacity_bytes(kHeads, kHidden, T, T), 1);
 }
 
-// Main's gating: the vendored op on the round's stream.
+// The chain's gating: the vendored op on the round's stream.
 Gates vendored_gating(const Gating &in, cudaStream_t stream) {
   GateBuffers out(in.columns);
   ninfer::DeviceArena ws(workspace_bytes(in.columns) + 4096);
@@ -181,129 +168,6 @@ void same_gates(const Gates &got, const Gates &want, const std::string &label) {
   same_bits(got.beta, want.beta, label + " beta");
 }
 
-// --- fused ----------------------------------------------------------------------------------
-
-struct Planes {
-  std::vector<uint16_t> query, key, value, states;
-};
-
-struct ConvInputs {
-  std::vector<uint16_t> x, weight, states;
-  std::vector<int32_t> slots;
-  explicit ConvInputs(int32_t B)
-      : x(bf16_values(200 + static_cast<uint32_t>(B), static_cast<std::size_t>(kChannels) * B, 2.0f)),
-        weight(bf16_values(7, static_cast<std::size_t>(kChannels) * 4, 1.0f)),
-        states(bf16_values(11, static_cast<std::size_t>(kChannels) * 3 * kSlots, 2.0f)),
-        slots(kLaneSlots, kLaneSlots + B) {}
-};
-
-// What the decode round ran without the fused home: the vendored snapshot conv into one [C, B]
-// plane, then the three strided copies.
-Planes vendored_conv(const ConvInputs &in, int32_t B, cudaStream_t stream) {
-  DeviceBytes x(in.x.size() * 2), weight(in.weight.size() * 2), states(in.states.size() * 2),
-      slots(in.slots.size() * sizeof(int32_t)), conv(in.x.size() * 2);
-  DeviceBytes query(static_cast<std::size_t>(kQuery) * B * 2), key(static_cast<std::size_t>(kKey) * B * 2),
-      value(static_cast<std::size_t>(kValue) * B * 2);
-  upload(x, in.x);
-  upload(weight, in.weight);
-  upload(states, in.states);
-  upload(slots, in.slots);
-  const ninfer::Tensor tx(x.p, ninfer::DType::BF16, {kChannels, 1, B, 1});
-  const ninfer::Tensor tw(weight.p, ninfer::DType::BF16, {kChannels, 4, 1, 1});
-  ninfer::Tensor ts(states.p, ninfer::DType::BF16, {kChannels, 3, kSlots, 1});
-  const ninfer::Tensor tslots(slots.p, ninfer::DType::I32, {B, 1, 1, 1});
-  ninfer::Tensor tconv(conv.p, ninfer::DType::BF16, {kChannels, 1, B, 1});
-  ninfer::ops::causal_conv1d_silu_snapshot(tx, tw, ts, ninfer::Tensor{}, tslots, tslots, tconv, stream);
-  const auto split = [&](int32_t offset, int32_t width, DeviceBytes &dst) {
-    MOE_CUDA(cudaMemcpy2DAsync(dst.p, static_cast<std::size_t>(width) * 2,
-                               static_cast<const uint8_t *>(conv.p) + static_cast<std::size_t>(offset) * 2,
-                               static_cast<std::size_t>(kChannels) * 2, static_cast<std::size_t>(width) * 2,
-                               static_cast<std::size_t>(B), cudaMemcpyDeviceToDevice, stream));
-  };
-  split(0, kQuery, query);
-  split(kQuery, kKey, key);
-  split(kQuery + kKey, kValue, value);
-  MOE_CUDA(cudaStreamSynchronize(stream));
-  return {download<uint16_t>(query.p, static_cast<std::size_t>(kQuery) * B),
-          download<uint16_t>(key.p, static_cast<std::size_t>(kKey) * B),
-          download<uint16_t>(value.p, static_cast<std::size_t>(kValue) * B),
-          download<uint16_t>(states.p, in.states.size())};
-}
-
-// The fused home: the conv with the gating, into three planes apart (`one_plane` false) or into
-// the three ranges of one [C, B] plane, then (one plane) the copies the round runs after it.
-Planes fused(const ConvInputs &in, const Gating &gating_in, int32_t B, bool one_plane, Gates *gates,
-             cudaStream_t stream) {
-  DeviceBytes x(in.x.size() * 2), weight(in.weight.size() * 2), states(in.states.size() * 2),
-      slots(in.slots.size() * sizeof(int32_t)), conv(in.x.size() * 2);
-  DeviceBytes query(static_cast<std::size_t>(kQuery) * B * 2), key(static_cast<std::size_t>(kKey) * B * 2),
-      value(static_cast<std::size_t>(kValue) * B * 2);
-  upload(x, in.x);
-  upload(weight, in.weight);
-  upload(states, in.states);
-  upload(slots, in.slots);
-  GateBuffers out(B);
-  const ninfer::Tensor tx(x.p, ninfer::DType::BF16, {kChannels, B, 1, 1});
-  const ninfer::Tensor tw(weight.p, ninfer::DType::BF16, {kChannels, 4, 1, 1});
-  ninfer::Tensor ts(states.p, ninfer::DType::BF16, {kChannels, 3, kSlots, 1});
-  const ninfer::Tensor tslots(slots.p, ninfer::DType::I32, {B, 1, 1, 1});
-  const ninfer::Tensor h = gating_in.th(), a_log = gating_in.ta(), dt_bias = gating_in.tdt();
-  const ninfer::Weight ab = gating_in.tab();
-  ninfer::Tensor g = out.tg(), beta = out.tbeta();
-  const ignis::gdn_conv::Gating gating{h, ab, a_log, dt_bias, g, beta};
-  if (one_plane) {
-    const auto range = [&](int32_t offset, int32_t width) {
-      ninfer::Tensor t(static_cast<uint8_t *>(conv.p) + static_cast<std::size_t>(offset) * 2, ninfer::DType::BF16,
-                       {width, B, 1, 1});
-      t.nb[1] = static_cast<int64_t>(kChannels) * 2;
-      t.nb[2] = t.nb[3] = t.nb[1] * B;
-      return t;
-    };
-    ninfer::Tensor tq = range(0, kQuery), tk = range(kQuery, kKey), tv = range(kQuery + kKey, kValue);
-    ignis::gdn_conv::split_conv_slots(tx, tw, ts, tslots, tq, tk, tv, stream, &gating);
-    const auto split = [&](int32_t offset, int32_t width, DeviceBytes &dst) {
-      MOE_CUDA(cudaMemcpy2DAsync(dst.p, static_cast<std::size_t>(width) * 2,
-                                 static_cast<const uint8_t *>(conv.p) + static_cast<std::size_t>(offset) * 2,
-                                 static_cast<std::size_t>(kChannels) * 2, static_cast<std::size_t>(width) * 2,
-                                 static_cast<std::size_t>(B), cudaMemcpyDeviceToDevice, stream));
-    };
-    split(0, kQuery, query);
-    split(kQuery, kKey, key);
-    split(kQuery + kKey, kValue, value);
-  } else {
-    ninfer::Tensor tq(query.p, ninfer::DType::BF16, {kQuery, B, 1, 1});
-    ninfer::Tensor tk(key.p, ninfer::DType::BF16, {kKey, B, 1, 1});
-    ninfer::Tensor tv(value.p, ninfer::DType::BF16, {kValue, B, 1, 1});
-    ignis::gdn_conv::split_conv_slots(tx, tw, ts, tslots, tq, tk, tv, stream, &gating);
-  }
-  MOE_CUDA(cudaStreamSynchronize(stream));
-  *gates = out.read();
-  return {download<uint16_t>(query.p, static_cast<std::size_t>(kQuery) * B),
-          download<uint16_t>(key.p, static_cast<std::size_t>(kKey) * B),
-          download<uint16_t>(value.p, static_cast<std::size_t>(kValue) * B),
-          download<uint16_t>(states.p, in.states.size())};
-}
-
-void the_fused_home_leaves_mains_gates_and_conv(cudaStream_t stream) {
-  for (int32_t B = 1; B <= 8; ++B) {
-    const ConvInputs conv_in(B);
-    const Gating gating_in(B);
-    const Planes want = vendored_conv(conv_in, B, stream);
-    const Gates want_gates = vendored_gating(gating_in, stream);
-    for (const bool one_plane : {false, true}) {
-      const std::string label = std::string("fused, ") + std::to_string(B) + " lane" + (B == 1 ? "" : "s") +
-                                (one_plane ? ", one plane" : ", planes apart");
-      Gates gates;
-      const Planes got = fused(conv_in, gating_in, B, one_plane, &gates, stream);
-      same_gates(gates, want_gates, label);
-      same_bits(got.query, want.query, label + " query");
-      same_bits(got.key, want.key, label + " key");
-      same_bits(got.value, want.value, label + " value");
-      same_bits(got.states, want.states, label + " pool taps after the round");
-    }
-  }
-}
-
 // --- branch ---------------------------------------------------------------------------------
 
 // The branch home at `T` columns: the round's stream writes h from a staging copy, the gating
@@ -327,7 +191,8 @@ Gates branch(const Gating &in, const ignis::flash_next::SideBranch &side, bool g
     ninfer::DeviceArena::Scope scope = scratch.scope();
     MOE_CUDA(cudaMemcpyAsync(h.p, in.h.p, h.bytes, cudaMemcpyDeviceToDevice, stream));
     const std::size_t before = scratch.used();
-    ignis::gdn_gating::Beside beside(side, stream, th, ab, a_log, dt_bias, scratch, g, beta);
+    const ignis::gdn_gating::Gating gating{th, ab, a_log, dt_bias, g, beta};
+    ignis::gdn_gating::Beside beside(side, stream, gating, scratch);
     check(scratch.used() - before >= ws, "branch, T=" + std::to_string(T) + ": the gating's workspace is the caller's (" +
                                              std::to_string(scratch.used() - before) + " of " + std::to_string(ws) +
                                              " bytes held)");
@@ -350,7 +215,7 @@ Gates branch(const Gating &in, const ignis::flash_next::SideBranch &side, bool g
   return out.read();
 }
 
-void the_branch_home_leaves_mains_gates(cudaStream_t stream) {
+void the_branch_home_leaves_the_chains_gates(cudaStream_t stream) {
   ignis::flash_next::SideBranch side;
   std::string error;
   check(side.create(&error), "the branch's stream and events" + (error.empty() ? std::string() : ": " + error));
@@ -385,12 +250,10 @@ void the_switch_names_the_home() {
   set_environment(kSwitch, nullptr);
   check(switch_at_capture() == ignis::gdn_gating::kUnset, "unset, the kept home");
   set_environment(kSwitch, "chain");
-  check(switch_at_capture() == Home::Chain, "IGNIS_GDN_GATING=chain, main's");
+  check(switch_at_capture() == Home::Chain, "IGNIS_GDN_GATING=chain, the round of earlier releases");
   set_environment(kSwitch, "branch");
   check(switch_at_capture() == Home::Branch, "IGNIS_GDN_GATING=branch");
-  set_environment(kSwitch, "fused");
-  check(switch_at_capture() == Home::Fused, "IGNIS_GDN_GATING=fused");
-  for (const char *bad : {"0", "1", "Chain", "fuse"}) {
+  for (const char *bad : {"0", "1", "Chain", "fused"}) {
     set_environment(kSwitch, bad);
     bool refused = false;
     try {
@@ -401,11 +264,11 @@ void the_switch_names_the_home() {
     check(refused, std::string("IGNIS_GDN_GATING=") + bad + " is refused by name");
   }
   set_environment(kSwitch, nullptr);
-  for (const Home named : {Home::Chain, Home::Branch, Home::Fused}) {
+  for (const Home named : {Home::Chain, Home::Branch}) {
     check(home_on(named, 12) == named, "compute capability 12 takes the switch's home");
     for (const int major : {7, 8, 9, 10, 11, 13}) {
       check(home_on(named, major) == Home::Chain,
-            "a card of compute capability " + std::to_string(major) + ".x keeps main's chain");
+            "a card of compute capability " + std::to_string(major) + ".x keeps the chain");
     }
   }
 }
@@ -420,8 +283,7 @@ int main() {
   }
   cudaStream_t stream = nullptr;
   MOE_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-  the_fused_home_leaves_mains_gates_and_conv(stream);
-  the_branch_home_leaves_mains_gates(stream);
+  the_branch_home_leaves_the_chains_gates(stream);
   the_switch_names_the_home();
   MOE_CUDA(cudaStreamDestroy(stream));
   if (g_failed != 0) {

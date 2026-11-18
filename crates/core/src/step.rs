@@ -142,7 +142,7 @@ pub(crate) mod ffi {
         pub drafter_append_graph_ready_mask: u32,
         /// GitHub #680: the same for the verify graphs.
         pub verify_graph_copy_nodes: [u32; 8],
-        /// GitHub #681: the GDN gating's home, 0 chain, 1 branch, 2 fused.
+        /// GitHub #681: the GDN gating's home, 0 chain, 1 branch.
         pub gdn_gating: u32,
     }
 
@@ -496,7 +496,7 @@ pub struct ProgramStats {
     /// from the card and `IGNIS_GDN_GATING` (`kernel/src/gdn_gating_home.h`):
     /// 0 on the round's chain, as before (also before a load's first capture
     /// and on Flash-Next), 1 on a branch of the graph beside the input
-    /// projection, 2 in the decode round's conv kernel.
+    /// projection.
     pub gdn_gating: u32,
 }
 

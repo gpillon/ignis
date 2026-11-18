@@ -810,7 +810,7 @@ struct ignis_model {
   // GitHub #681 (spec #672): where each GDN layer's gating runs in the decode
   // and verify rounds (kernel/src/gdn_gating_home.h), as the latest
   // `ignis_decode_graph_capture` decided it from the card and
-  // IGNIS_GDN_GATING; main's chain before a load's first capture.
+  // IGNIS_GDN_GATING; the chain before a load's first capture.
   ignis::gdn_gating::Home gdn_gating_home = ignis::gdn_gating::Home::Chain;
   // Its branch's stream and events, made by the first capture that takes the
   // branch and destroyed with the model.

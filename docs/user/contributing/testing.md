@@ -213,26 +213,20 @@ the other. They are no configuration fields: `GET /v1/config` and
   `bf16` load runs neither. It is read at each call, so a decode graph keeps
   the form its capture read; any other value refuses the load, naming the
   variable.
-- `IGNIS_GDN_GATING=chain|branch|fused` (from 0.11.0) picks, at each capture
-  of the decode graphs, where each GDN layer of the 27B computes its gating
-  (the a and b products of the layer's normed input and the decay and update
-  gates from them) in the decode and verify rounds. `chain` is the round of
-  earlier releases: the gating runs between the convolution and the
-  recurrence, and every layer waits on it. `branch`, the value when unset:
-  it runs on a branch of the graph forked once the input is normed, beside
-  the input projection and the convolution, and joins back before the
-  recurrence. `fused`: it runs in the decode round's convolution kernel, in
-  blocks of its own beside the convolution's; the verify round keeps
-  `chain`'s there. The gates are the same bytes in every home
-  (`ignis_kernel_gdn_gating_home_test`), so the tokens are the same (the
-  round identity test below, arms `gdn-gating-chain`, `gdn-gating-branch` and
-  `gdn-gating-fused`). The node counts are `chain`'s under `branch`; `fused`
-  leaves one node fewer per GDN layer at one lane and two fewer past it (on
-  the NVFP4 artifact with DFlash2, copy-free: 629 nodes instead of 677 at one
-  lane, 693 instead of 789 at two or three, 828 instead of 924 at four to
-  eight) and the verify graphs as they are. An RTX 30 or RTX 40 card keeps
-  `chain` whatever the variable says, and Flash-Next's rounds are its own.
-  Any other value refuses the load, naming the variable.
+- `IGNIS_GDN_GATING=chain|branch` (from 0.11.0) picks, at each capture of
+  the decode graphs, where each GDN layer of the 27B computes its gating (the
+  a and b products of the layer's normed input and the decay and update gates
+  from them) in the decode and verify rounds. `chain` is the round of earlier
+  releases: the gating runs between the convolution and the recurrence, and
+  every layer waits on it. `branch`, the value when unset: it runs on a
+  branch of the graph forked once the input is normed, beside the input
+  projection and the convolution, and joins back before the recurrence. The
+  gates are the same bytes in both (`ignis_kernel_gdn_gating_home_test`), so
+  the tokens are the same (the round identity test below, arms
+  `gdn-gating-chain` and `gdn-gating-branch`), and so are the graphs' node
+  counts. An RTX 30 or RTX 40 card keeps `chain` whatever the variable says,
+  and Flash-Next's rounds are its own. Any other value refuses the load,
+  naming the variable.
 
 ### The round identity test
 

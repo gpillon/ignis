@@ -22,9 +22,8 @@ void check(cudaError_t err, const char *what) {
 
 } // namespace
 
-Beside::Beside(const ignis::flash_next::SideBranch &branch, cudaStream_t stream, const ninfer::Tensor &h,
-               const ninfer::Weight &ab, const ninfer::Tensor &a_log, const ninfer::Tensor &dt_bias,
-               ninfer::DeviceArena &scratch, ninfer::Tensor &g, ninfer::Tensor &beta)
+Beside::Beside(const ignis::flash_next::SideBranch &branch, cudaStream_t stream, const Gating &gating,
+               ninfer::DeviceArena &scratch)
     : branch_(branch), stream_(stream) {
   if (branch.stream == nullptr) {
     throw std::invalid_argument("the gating's branch: no stream (the capture makes it)");
@@ -32,14 +31,17 @@ Beside::Beside(const ignis::flash_next::SideBranch &branch, cudaStream_t stream,
   // The op's own workspace query at this call's columns: the span is the caller's until its scope of
   // `scratch` ends, and the op suballocates it as its own arena.
   const std::size_t bytes = std::max<std::size_t>(
-      ninfer::ops::gdn_gating_proj_workspace_capacity_bytes(ab.n / 2, ab.k, h.ne[1], h.ne[1]), 1);
+      ninfer::ops::gdn_gating_proj_workspace_capacity_bytes(gating.ab.n / 2, gating.ab.k, gating.h.ne[1],
+                                                            gating.h.ne[1]),
+      1);
   const ninfer::DeviceSpan span = scratch.alloc_bytes(bytes);
   check(cudaEventRecord(branch.fork, stream), "the fork");
   check(cudaStreamWaitEvent(branch.stream, branch.fork, 0), "the fork");
   open_ = true;
   try {
     ninfer::DeviceArena workspace(span);
-    ninfer::ops::gdn_gating_proj(h, ab, a_log, dt_bias, workspace, g, beta, branch.stream);
+    ninfer::ops::gdn_gating_proj(gating.h, gating.ab, gating.a_log, gating.dt_bias, workspace, gating.g,
+                                 gating.beta, branch.stream);
     check(cudaEventRecord(branch.join, branch.stream), "the join");
   } catch (...) {
     (void)cudaEventRecord(branch.join, branch.stream);

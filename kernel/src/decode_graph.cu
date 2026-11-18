@@ -509,6 +509,19 @@ int32_t capture_decode_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
   return 0;
 }
 
+// A measurement switch read at each capture by `read`, which throws std::invalid_argument naming
+// the variable on a value it does not know (kernel/src/process_environment.h `named_switch`), so
+// that value refuses the capture by name. False (error set) on a refusal.
+template <class Read, class Value> bool capture_switch(Read read, Value &named) {
+  try {
+    named = read();
+  } catch (const std::invalid_argument &e) {
+    set_error(std::string("ignis_decode_graph_capture: ") + e.what());
+    return false;
+  }
+  return true;
+}
+
 // A width's graph from an earlier capture of the same load, gone before the width captures again
 // (GitHub #674: a measurement switch read at capture, flipped in one process).
 void release_graph(cudaGraphExec_t &exec, bool &ready, uint32_t &nodes) {
@@ -524,10 +537,8 @@ void release_graph(cudaGraphExec_t &exec, bool &ready, uint32_t &nodes) {
 // are made the first time it is on, and every capture starts its blocks afresh. False (error set)
 // on a value other than `0` or `1`, or when CUDA cannot make the events.
 bool read_round_timing(ignis_model *model) {
-  try {
-    model->round_timing = ignis::named_switch("IGNIS_ROUND_TIMING", false, {{"0", false}, {"1", true}});
-  } catch (const std::invalid_argument &e) {
-    set_error(std::string("ignis_decode_graph_capture: ") + e.what());
+  const auto read = [] { return ignis::named_switch("IGNIS_ROUND_TIMING", false, {{"0", false}, {"1", true}}); };
+  if (!capture_switch(read, model->round_timing)) {
     return false;
   }
   for (RoundTiming *timing : {&model->plain_timing, &model->verify_timing}) {
@@ -571,14 +582,9 @@ bool device_generation(int *major, const char *what) {
 // device cannot say its generation.
 bool read_decode_graph_copies(ignis_model *model) {
   ignis::decode_graph_copies::Switch named = ignis::decode_graph_copies::Switch::Unset;
-  try {
-    named = ignis::decode_graph_copies::switch_at_capture();
-  } catch (const std::invalid_argument &e) {
-    set_error(std::string("ignis_decode_graph_capture: ") + e.what());
-    return false;
-  }
   int major = 0;
-  if (!device_generation(&major, "the copy-free round")) {
+  if (!capture_switch(ignis::decode_graph_copies::switch_at_capture, named) ||
+      !device_generation(&major, "the copy-free round")) {
     return false;
   }
   model->decode_copy_free_widths = ignis::decode_graph_copies::copy_free_widths(named, major);
@@ -589,18 +595,13 @@ bool read_decode_graph_copies(ignis_model *model) {
 // GitHub #681 (spec #672): where each GDN layer's gating runs from this capture on
 // (kernel/src/gdn_gating_home.h), from IGNIS_GDN_GATING and the card, read at each capture; the
 // branch's stream and events are made by the first capture that takes it. False (error set) on a
-// value other than `chain`, `branch` or `fused`, when the device cannot say its generation, or when
-// CUDA cannot make the branch.
+// value other than `chain` or `branch`, when the device cannot say its generation, or when CUDA
+// cannot make the branch.
 bool read_gdn_gating(ignis_model *model) {
   ignis::gdn_gating::Home named = ignis::gdn_gating::kUnset;
-  try {
-    named = ignis::gdn_gating::switch_at_capture();
-  } catch (const std::invalid_argument &e) {
-    set_error(std::string("ignis_decode_graph_capture: ") + e.what());
-    return false;
-  }
   int major = 0;
-  if (!device_generation(&major, "the GDN gating's home")) {
+  if (!capture_switch(ignis::gdn_gating::switch_at_capture, named) ||
+      !device_generation(&major, "the GDN gating's home")) {
     return false;
   }
   const ignis::gdn_gating::Home home = ignis::gdn_gating::home_on(named, major);
@@ -652,13 +653,8 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   }
   // GitHub #676: IGNIS_DEFER_VERIFY, read at each capture like the round
   // timing; a load with no window has no verify round to defer.
-  if (model->verify != nullptr) {
-    try {
-      model->verify->defer = ignis::deferred_verify::read_switch();
-    } catch (const std::invalid_argument &e) {
-      set_error(std::string("ignis_decode_graph_capture: ") + e.what());
-      return -1;
-    }
+  if (model->verify != nullptr && !capture_switch(ignis::deferred_verify::read_switch, model->verify->defer)) {
+    return -1;
   }
   const auto began = std::chrono::steady_clock::now();
   uint32_t ready_mask = 0;
