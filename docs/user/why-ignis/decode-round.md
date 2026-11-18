@@ -51,6 +51,8 @@ instead of expanding it into BF16 first, which made it 30% faster at 46K and
 own gated delta net prefill kernels, Blackwell's route because they
 measured faster there, add 4.8% at 46K and 3.9% at 105K against the vendored ones.
 
+From 0.11.0 a cold prompt reaches its first token sooner on the RTX 5090: a cold 16K-token prompt in 1.24 s where 0.10.0 took 1.52 s (-18%), a cold 64K-token one in 5.87 s where it took 6.80 s (-14%), and the first request after a load as fast as the next ones (1.24 s, where 0.10.0 took 1.76 s). Those are medians on the 27B NVFP4 with the context pinned at 262,144 and FP8 exception weights, over 12 and 16 cold requests each, the first token from the client; decode is unchanged. The 46K and 105K rates above were measured on 0.10.0 and are not re-measured for 0.11.0 ([the A/B](../../findings/2026-11-18-the-27bs-cold-prefill-served-on-the-rtx-5090-after-spec-646.md)).
+
 The path of a request through the scheduler, step by step:
 [How ignis serves a request](../concepts/how-ignis-serves.md).
 
@@ -66,6 +68,7 @@ The path of a request through the scheduler, step by step:
 | Round **32.18 ms** at eight lanes | eight lanes, 8 s window | [Top-k, one warp per column](../../findings/2026-09-18-dflash2-topk-one-warp-per-column.md) |
 | **367 tok/s** one lane, **1,065 tok/s** the same eight prompts at once | eight coding prompts, greedy, 512 tokens, 262,144 context, DFlash2 with 7 drafts, no vision | [Quick wins A/B](../../findings/2026-09-24-upstream-quick-wins-ab.md) |
 | Cold prefill **11,344 tok/s** at 46K, 9,008 at 105K; ignis's GDN prefill +4.8% and +3.9% of it against the vendored kernels, one session | the 27B NVFP4, the `rtx5090` profile (2,048-token chunk), RTX 5090 | [The GDN prefill on Blackwell](../../findings/2026-11-08-blackwell-gdn-prefill-on-ignis-kernels.md) |
+| From 0.11.0, a cold 16K prompt **1.24 s** (0.10.0: 1.52 s), a cold 64K prompt **5.87 s** (6.80 s), the first request after a load 1.24 s (1.76 s); decode 389.6 against 389.8 tok/s | the 27B NVFP4, context 262,144, FP8 exception weights, RTX 5090, alternated launches | [The 27B's cold prefill served after spec #646](../../findings/2026-11-18-the-27bs-cold-prefill-served-on-the-rtx-5090-after-spec-646.md) |
 | The 2,048-token chunk: +1.9% at 46K, +2.2% at 105K against 1,024 | the 27B, RTX 5090 | [The 27B's prefill chunk at 2,048](../../findings/2026-10-21-the-27b-prefill-chunk-at-2048.md) |
 | Prefill attention on the compressed KV: +30% at 46K, +53% at 105K against 0.7.2's kernels | one A/B session, RTX 5090 | [Prefill attention without prompt planes](../../findings/2026-10-21-prefill-attention-without-prompt-planes.md) |
 | Per-lane design at four lanes: round 70.2 ms against 17.3 ms (4.06x) | live/live gate, 32K context | [ADR 0020](../../adr/0020-batch-wide-decode-round.md) |
