@@ -533,9 +533,7 @@ fn serve_vision(
 /// resolution's ([`EngineShape::from`]), its vision encoder
 /// sized for the processor's item bound (`vision_item_bound`), and -- spec
 /// 27b-16gb/04 AC 5 -- a drafter's head left to `auto` says what it
-/// resolved to (`ignis.runtime.draft_head`, ADR 0063), once per load; a 27B
-/// load says which exception weights it holds and where their setting came
-/// from (`ignis.runtime.exception_weights`, ADR 0103).
+/// resolved to (`ignis.runtime.draft_head`, ADR 0063), once per load.
 pub fn load_shape(config: &crate::config::Config, vision_item_bound: Option<u64>) -> EngineShape {
     let shape = EngineShape::from(config);
     // The encoder holds one item at a time, and the processor bounds an item
@@ -558,14 +556,23 @@ pub fn load_shape(config: &crate::config::Config, vision_item_bound: Option<u64>
     {
         crate::runtime::log_draft_head_auto(speculation.proposal_head());
     }
-    // GitHub #682 (ADR 0103): what the 27B holds its exception tensors as,
-    // the setting that resolved to it, and where the setting came from.
-    if config.basis.family() == Some(ModelFamily::Qwen38_27b) {
-        let origin = config.basis.resolution().origin("model", "exception_weights");
-        let origin = origin.map_or(crate::config::source::Source::Default, |origin| origin.source);
-        crate::runtime::log_exception_weights(shape.exception_weights, config.settings().model.exception_weights, origin.as_str());
-    }
     shape
+}
+
+/// GitHub #682 (ADR 0103): a 27B load of `shape` says, once, which exception
+/// weights it holds, the setting they resolved from and where the setting
+/// came from (`ignis.runtime.exception_weights`); on a `body` with no BF16
+/// exception tensor, the trellis artifacts', that it holds none, whatever the
+/// setting resolved to.
+pub fn log_exception_weights(config: &crate::config::Config, shape: &EngineShape, body: ignis_artifact::Body27b) {
+    let origin = config.basis.resolution().origin("model", "exception_weights");
+    let origin = origin.map_or(crate::config::source::Source::Default, |origin| origin.source);
+    crate::runtime::log_exception_weights(
+        shape.exception_weights,
+        config.settings().model.exception_weights,
+        origin.as_str(),
+        body == ignis_artifact::Body27b::Nvfp4,
+    );
 }
 
 /// The image model's load (spec image-model/05): its runner — the image
@@ -676,15 +683,21 @@ fn cuda_scheduler_for(
         )
         .map(|(scheduler, reserved, shape)| (scheduler, reserved, shape, Vec::new()))
         .map_err(|error| LoadError::from_flash_next(error, config)),
-        ModelFamily::Qwen38_27b => crate::runtime::qwen27b_load(
-            artifact,
-            model.into(),
-            eos,
-            shape.with_family_decode_share(ModelFamily::Qwen38_27b),
-            thinking_close,
-            &config.kv_disk_location,
-        )
-        .map_err(LoadError::from),
+        ModelFamily::Qwen38_27b => {
+            // An artifact whose body cannot be read fails its load below.
+            if let Ok(body) = crate::loader::body_27b(artifact) {
+                log_exception_weights(config, &shape, body);
+            }
+            crate::runtime::qwen27b_load(
+                artifact,
+                model.into(),
+                eos,
+                shape.with_family_decode_share(ModelFamily::Qwen38_27b),
+                thinking_close,
+                &config.kv_disk_location,
+            )
+            .map_err(LoadError::from)
+        }
         // The image model has no token scheduler: `load_image_model` loads
         // it, never this; nor has the diarizer, which no artifact carries.
         ModelFamily::QwenImage21 | ModelFamily::Nemotron3Diarization => Err(LoadError::LoadFailed(format!("{} has no token scheduler", family.name()))),

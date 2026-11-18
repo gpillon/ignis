@@ -95,6 +95,13 @@ pub fn has_nvfp4_body(artifact: &Path) -> Result<bool> {
     }))
 }
 
+/// The 27B body `artifact` carries (GitHub #682, `ignis_artifact::body_27b`):
+/// the NVFP4 planes, beside the nine BF16 exception tensors, or the trellis
+/// matrices of the 16 and 12 GB card classes, with no exception tensor.
+pub fn body_27b(artifact: &Path) -> Result<ignis_artifact::Body27b> {
+    Ok(ignis_artifact::body_27b(&Reader::open(artifact)?))
+}
+
 /// The kind of the family `artifact`'s header names — the 27B's for an
 /// artifact of no family, as a load serves it; `None` for a file that cannot
 /// be read as a container (a GGUF among them).

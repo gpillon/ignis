@@ -1,7 +1,9 @@
 //! GitHub #682 (ADR 0103): a 27B load says which exception weights it holds,
-//! the setting they resolved from and where that setting came from, through
-//! the seam the GPU load derives its shape at (`load::load_shape`), from a
-//! real resolution with no config file but the test's own.
+//! the setting they resolved from and where that setting came from, and on a
+//! trellis body, which has no BF16 exception tensor, that it holds none:
+//! through the shape the GPU load derives (`load::load_shape`) and the line it
+//! logs for its artifact's body (`load::log_exception_weights`), from a real
+//! resolution with no config file but the test's own.
 //!
 //! Its own test binary: a log capture beside tests that reach the same
 //! callsite with no subscriber can see nothing (tracing caches a callsite's
@@ -9,6 +11,7 @@
 
 use std::sync::Arc;
 
+use ignis_artifact::Body27b;
 use ignis_core::compute::ModelFamily;
 use ignis_server::config::profile::Card;
 use tracing_subscriber::layer::SubscriberExt;
@@ -29,12 +32,16 @@ fn the_27b(flags: &[&str], card: Card) -> ignis_server::config::Config {
     config.for_family(ModelFamily::Qwen38_27b).expect("the 27B")
 }
 
-/// The one `ignis.runtime.exception_weights` event a load of `config` logs
-/// as it derives its shape.
-fn exception_weights_event(config: &ignis_server::config::Config) -> serde_json::Value {
+/// The one `ignis.runtime.exception_weights` event a load of `config` from
+/// an artifact of `body` logs.
+fn exception_weights_event(config: &ignis_server::config::Config, body: Body27b) -> serde_json::Value {
     let sink = Arc::new(ignis_logging::MemorySink::new());
     let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
-    let shape = tracing::subscriber::with_default(subscriber, || ignis_server::load::load_shape(config, None));
+    let shape = tracing::subscriber::with_default(subscriber, || {
+        let shape = ignis_server::load::load_shape(config, None);
+        ignis_server::load::log_exception_weights(config, &shape, body);
+        shape
+    });
     let events: Vec<serde_json::Value> = sink
         .lines()
         .iter()
@@ -62,18 +69,25 @@ fn the_load_logs_the_exception_weights_it_holds_and_the_origin_of_their_setting(
     let profile = config_file("profile.yaml", "profiles:\n  mine:\n    model:\n      qwen38:\n        exception_weights: bf16\n");
     let profile = profile.to_str().unwrap();
     let rtx_5090 = || Card::Read(card::rtx_5090());
-    for (flags, card, held, setting, origin) in [
-        (&["--profile", "rtx5090"][..], rtx_5090(), "fp8", "auto", "default"),
-        (&["--profile", "rtx5090"], Card::Read(card::rtx_4090()), "bf16", "auto", "default"),
-        (&["--profile", "rtx5090"], Card::Absent, "bf16", "auto", "default"),
-        (&["--profile", "rtx5090", "--model-exception-weights", "bf16"], rtx_5090(), "bf16", "bf16", "flag"),
-        (&["--profile", "rtx5090", "--model-exception-weights", "fp8"], rtx_5090(), "fp8", "fp8", "flag"),
-        (&["--profile", "rtx5090", "--config", file], rtx_5090(), "bf16", "bf16", "file"),
-        (&["--profile", "mine", "--config", profile], rtx_5090(), "bf16", "bf16", "profile"),
+    let rtx_5080 = || Card::Read(card::card(16, "NVIDIA GeForce RTX 5080", 12, 0));
+    let (nvfp4, trellis) = (Body27b::Nvfp4, Body27b::Trellis);
+    for (flags, card, body, held, setting, origin) in [
+        (&["--profile", "rtx5090"][..], rtx_5090(), nvfp4, "fp8", "auto", "default"),
+        (&["--profile", "rtx5090"], Card::Read(card::rtx_4090()), nvfp4, "bf16", "auto", "default"),
+        (&["--profile", "rtx5090"], Card::Absent, nvfp4, "bf16", "auto", "default"),
+        (&["--profile", "rtx5090", "--model-exception-weights", "bf16"], rtx_5090(), nvfp4, "bf16", "bf16", "flag"),
+        (&["--profile", "rtx5090", "--model-exception-weights", "fp8"], rtx_5090(), nvfp4, "fp8", "fp8", "flag"),
+        (&["--profile", "rtx5090", "--config", file], rtx_5090(), nvfp4, "bf16", "bf16", "file"),
+        (&["--profile", "mine", "--config", profile], rtx_5090(), nvfp4, "bf16", "bf16", "profile"),
+        // The 16 GB class's trellis artifact on an RTX 50 card: `auto` still
+        // resolves to fp8, and the line says nothing is held in it.
+        (&["--profile", "rtx-16gb"], rtx_5080(), trellis, "fp8", "auto", "default"),
     ] {
-        let event = exception_weights_event(&the_27b(flags, card));
-        assert_eq!(event["body"], format!("exception_weights {setting} -> {held} ({origin})"), "{flags:?}: {event}");
+        let event = exception_weights_event(&the_27b(flags, card), body);
+        let none = if body == trellis { ": the body has no BF16 exception tensor, so none is held" } else { "" };
+        assert_eq!(event["body"], format!("exception_weights {setting} -> {held} ({origin}){none}"), "{flags:?}: {event}");
         let attributes = &event["attributes"];
         assert_eq!((&attributes["exception_weights"], &attributes["setting"], &attributes["origin"]), (&held.into(), &setting.into(), &origin.into()), "{flags:?}: {event}");
+        assert_eq!(attributes["exception_tensors"], body == nvfp4, "{flags:?}: {event}");
     }
 }

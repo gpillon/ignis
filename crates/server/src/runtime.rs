@@ -671,18 +671,23 @@ pub fn log_draft_head_auto(head: ignis_core::ProposalHead) {
 /// A 27B load's exception weights (GitHub #682, ADR 0103): the ones it holds,
 /// the setting they resolved from (`auto`, `bf16`, `fp8`) and where that
 /// setting came from (`default`, `profile`, `file`, `env`, `flag`, `patch`).
+/// Without `exception_tensors`, a body that has none (the trellis artifacts),
+/// the line says that it holds none in the weights the setting resolved to.
 pub fn log_exception_weights(
     weights: ignis_core::ExceptionWeights,
     setting: ignis_core::ExceptionWeightsSetting,
     origin: &str,
+    exception_tensors: bool,
 ) {
+    let held = if exception_tensors { "" } else { ": the body has no BF16 exception tensor, so none is held" };
     // hotpath-lint-allow: one line per model load.
     tracing::info!(
         name: "ignis.runtime.exception_weights",
         exception_weights = weights.as_str(),
         setting = setting.as_str(),
         origin,
-        "exception_weights {setting} -> {weights} ({origin})"
+        exception_tensors,
+        "exception_weights {setting} -> {weights} ({origin}){held}"
     );
 }
 
