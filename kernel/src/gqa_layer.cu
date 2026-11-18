@@ -585,13 +585,19 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     }
 
     ninfer::Tensor residual(out_residual, ninfer::DType::BF16, {hidden, columns, 1, 1});
-    error = cudaMemcpyAsync(out_residual, in_residual,
-                            static_cast<std::size_t>(hidden) * columns * sizeof(uint16_t),
-                            cudaMemcpyDeviceToDevice, stream);
-    if (error != cudaSuccess) {
-      set_error(std::string(op) + ": cudaMemcpyAsync(residual) failed: " +
-                cudaGetErrorString(error));
-      return -1;
+    // GitHub #677: `in_residual == out_residual` is the decode traversal's
+    // copy-free form (kernel/src/decode_graph.cu): the input is the residual
+    // already (the input RMSNorm above was its only other reader), so only
+    // distinct buffers copy it.
+    if (out_residual != in_residual) {
+      error = cudaMemcpyAsync(out_residual, in_residual,
+                              static_cast<std::size_t>(hidden) * columns * sizeof(uint16_t),
+                              cudaMemcpyDeviceToDevice, stream);
+      if (error != cudaSuccess) {
+        set_error(std::string(op) + ": cudaMemcpyAsync(residual) failed: " +
+                  cudaGetErrorString(error));
+        return -1;
+      }
     }
     output_and_mlp(*model, weights, attention, residual, post, fused, *model->decode_graph_scratch, mode, columns,
                    stream);

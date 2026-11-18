@@ -34,14 +34,29 @@
 //! `w - 1` is prefilled between the rounds of the lanes already there, then
 //! the `w` lanes ride [`PLAIN_ROUNDS`] plain rounds and [`VERIFY_ROUNDS`]
 //! verify rounds together, each verify round drafting the load's whole window
-//! (no budget, no stop ids). At the widest, every odd lane is released and
-//! the rest ride verify rounds, then plain ones. So every width from 1 to the
-//! load's lanes runs both kinds of round, from the graphs or eagerly as the
-//! arm says (every round asserts which), and the transitions a lever that
-//! keeps work in flight has to survive all happen: a prefill and a release
-//! between rounds, a width that grows and one that shrinks, a plain round
-//! after a verify round and the reverse. Every round's tokens are compared,
-//! each verify run ended by -1 in its lane's stream.
+//! (no budget, no stop ids). Halfway through the verify rounds come a
+//! constrained round, lane 0 held to a permitted set (the ten digits), which
+//! runs eagerly whatever the arm, then a verify round whose every run the
+//! host cuts one token short, as a grammar's check-first cut does (GitHub
+//! #590): a sampled lane's count of the token cut off comes back to the host,
+//! and the session fails if no run of two or more was cut. At the widest,
+//! every odd lane is released and the rest ride verify rounds, then plain
+//! ones. So every width from 1 to the load's lanes runs every kind of round,
+//! from the graphs or eagerly as the arm says (every round asserts which), and
+//! the transitions a lever that keeps work in flight has to survive all
+//! happen: a prefill and a release between rounds, a width that grows and one
+//! that shrinks, a plain or a constrained round after a verify round and the
+//! reverse. Every round's tokens are compared, each verify run ended by -1 in
+//! its lane's stream.
+//!
+//! GitHub #676: a DFlash2 load's verify rounds return with their fold in
+//! flight unless the arm sets `IGNIS_DEFER_VERIFY=0`, and an MTP load's never
+//! do; each arm's sessions assert which from the load's count of such rounds,
+//! and a capture's drafter append graphs from their ready mask. The NVFP4 body
+//! loads once per exception setting in one process, so a run of both settings
+//! holds a second load's deferred rounds, on staging of its own, to main's
+//! tokens: what the host-mapped memory following the load, not the process,
+//! has to keep.
 //!
 //! On the vision load, lane 0's prompt is a multimodal span whose first four
 //! tokens rotate as a 2x2 image at the prompt's start would, which leaves the
@@ -65,6 +80,14 @@
 //! runs once, as `bf16`. The test binds and loads the model itself and reads
 //! no config file, the user's included. One materialize per load and weights,
 //! released before the next; one model load and one pool serve every arm.
+//!
+//! # The decode graph's nodes
+//!
+//! On the NVFP4 body with DFlash2 the reference's capture and the
+//! `decode-graph-copies` arm's are also held to their nodes (#677,
+//! [`copy_free_graphs`]): on a card of compute capability 12 the reference's
+//! width-1 graph is [`COPY_FREE_WIDTH_1_NODES`] nodes, none a copy, and the
+//! arm's is main's, with its copies.
 //!
 //! # Narrow runs
 //!
@@ -93,8 +116,9 @@ use ignis_core::model_load::{load_qwen38_27b_with_decode_lanes, model_scope, Mod
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS;
 use ignis_core::step::{
-    capture_decode_graphs, decode_program_batch_sampled, decode_program_verify_runs, prefill_program_multimodal,
-    prefill_program_sampled, program_stats, MultimodalPrefill, Redirect, SamplingParams, VerifyLane,
+    capture_decode_graphs, decode_program_batch_permitted, decode_program_batch_sampled, decode_program_verify_cut,
+    decode_program_verify_runs, prefill_program_multimodal, prefill_program_sampled, program_stats, MultimodalPrefill,
+    PermittedLane, Redirect, SamplingParams, VerifyLane,
 };
 use ignis_core::{
     DraftRule, DrafterSampling, ExceptionWeights, KvFormat, PrefillAttention, PrefillLinear, RopeScaling,
@@ -121,10 +145,14 @@ const ARMS: &[Arm] = &[
     // #674: the round timing, an instrument; its arm captures the graphs a second time.
     Arm { name: "round-timing", switches: &[("IGNIS_ROUND_TIMING", "1")], graphs: true },
     // #676's arm, below this line.
+    Arm { name: "defer-verify", switches: &[("IGNIS_DEFER_VERIFY", "0")], graphs: true },
 
     // #677's arm, below this line.
+    Arm { name: "decode-graph-copies", switches: &[("IGNIS_DECODE_GRAPH_COPIES", "1")], graphs: true },
 
     // #678's arm, below this line.
+    // The FP8 q|k|gate|v projection's one-row GEMV: an `fp8` load's lever (`bf16` runs no FP8 GEMV).
+    Arm { name: "fp8-gemv-one-row", switches: &[("IGNIS_FP8_GEMV_PAIRED", "0")], graphs: true },
 
     // #679's arm, below this line.
 
@@ -211,9 +239,21 @@ const LOADS: &[Load] = &[
     },
 ];
 
+/// #677: the load whose decode graphs [`copy_free_graphs`] pins, and its
+/// copy-free width-1 graph's nodes on a card of compute capability 12, every
+/// one a kernel; main's round copies each of the 64 layers' residual and each
+/// of the 48 GDN layers' q, k and v out of the conv plane, at every width.
+const COPY_FREE_LOAD: &str = "nvfp4-dflash2";
+const COPY_FREE_WIDTH_1_NODES: u32 = 677;
+const MAIN_COPIES: u32 = 64 + 3 * 48;
+
 /// Plain rounds, then verify rounds, at each width of the session.
 const PLAIN_ROUNDS: u32 = 4;
 const VERIFY_ROUNDS: u32 = 4;
+/// And, halfway through the verify rounds, one constrained round and one
+/// verify round the host cuts.
+const CONSTRAINED_ROUNDS: u32 = 1;
+const CUT_ROUNDS: u32 = 1;
 /// The most tokens a prompt below takes.
 const PROMPT_TOKENS: u32 = 64;
 /// The load's prefill chunk: every prompt fits one.
@@ -245,10 +285,11 @@ impl Load {
     }
 
     /// The context the session's longest-lived lane needs: its prompt, then
-    /// at each width and once more after the release its plain tokens and
-    /// whole verify runs.
+    /// at each width and once more after the release its plain and
+    /// constrained tokens and whole verify runs.
     fn context(&self) -> u32 {
-        let tokens = PROMPT_TOKENS + (self.lanes + 1) * (PLAIN_ROUNDS + VERIFY_ROUNDS * (self.window + 1));
+        let rounds = PLAIN_ROUNDS + CONSTRAINED_ROUNDS + (VERIFY_ROUNDS + CUT_ROUNDS) * (self.window + 1);
+        let tokens = PROMPT_TOKENS + (self.lanes + 1) * rounds;
         tokens.div_ceil(128) * 128
     }
 }
@@ -312,22 +353,39 @@ fn apply(arm: &Arm) {
     }
 }
 
-fn chat_prompts(reader: &Reader) -> Vec<Vec<i32>> {
+/// What every session reads: one prompt per lane, and the ids the
+/// constrained round holds lane 0 to.
+struct Script {
+    prompts: Vec<Vec<i32>>,
+    permitted: Vec<i32>,
+}
+
+fn script(reader: &Reader) -> Script {
     let frontend = FrontendSet::from_reader(reader).unwrap_or_else(|e| panic!("frontend: {e}"));
-    PROMPTS
+    let encode = |text: &str| -> Vec<i32> {
+        frontend
+            .tokenizer()
+            .encode(text)
+            .unwrap_or_else(|e| panic!("tokenize: {e}"))
+            .into_iter()
+            .map(|id| i32::try_from(id).expect("token id fits i32"))
+            .collect()
+    };
+    let prompts = PROMPTS
         .iter()
         .map(|prompt| {
-            let tokens: Vec<i32> = frontend
-                .tokenizer()
-                .encode(&format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"))
-                .unwrap_or_else(|e| panic!("tokenize: {e}"))
-                .into_iter()
-                .map(|id| i32::try_from(id).expect("token id fits i32"))
-                .collect();
+            let tokens = encode(&format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));
             assert!(tokens.len() as u32 <= PROMPT_TOKENS, "a prompt of {} tokens", tokens.len());
             tokens
         })
-        .collect()
+        .collect();
+    let permitted = (0..10)
+        .map(|digit| match encode(&digit.to_string())[..] {
+            [id] => id,
+            ref ids => panic!("the digit {digit} is {} tokens", ids.len()),
+        })
+        .collect();
+    Script { prompts, permitted }
 }
 
 /// Axis-major `[3, n]` positions of a prompt whose first four tokens rotate
@@ -367,46 +425,112 @@ fn riders<'a, 'p>(seqs: &'a mut [Option<Seq<'p>>], riding: &[usize]) -> Vec<&'a 
     riding.iter().map(|&lane| remaining[lane].take().expect("a live lane, once")).collect()
 }
 
+/// #677: on [`COPY_FREE_LOAD`], the decode graphs the arm's capture left, for
+/// the reference and the arm that names main's copying round: the width-1
+/// round copy-free on a card of compute capability 12 with every switch
+/// unset, [`COPY_FREE_WIDTH_1_NODES`] nodes and no copy; main's
+/// [`MAIN_COPIES`] copies under `IGNIS_DECODE_GRAPH_COPIES=1` and on any other
+/// card, and at every other width under both.
+fn copy_free_graphs(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label: &str) {
+    let copies_named = arm.switches.contains(&("IGNIS_DECODE_GRAPH_COPIES", "1"));
+    if load.name != COPY_FREE_LOAD || !(arm.switches.is_empty() || copies_named) {
+        return;
+    }
+    let (_, (major, _)) = CudaDevice::identity(0).unwrap_or_else(|e| panic!("{label}: device identity: {e}"));
+    let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
+    let lanes = load.lanes as usize;
+    let (nodes, copies) = (&stats.decode_graph_nodes[..lanes], &stats.decode_graph_copy_nodes[..lanes]);
+    println!("round_identity_gpu {label}: arm `{}`: decode graph nodes {nodes:?}, copies {copies:?}", arm.name);
+    let copy_free = major == 12 && !copies_named;
+    assert_eq!(copies[0], if copy_free { 0 } else { MAIN_COPIES }, "{label}: arm `{}`: width 1's copy nodes", arm.name);
+    if major == 12 {
+        assert_eq!(nodes[0], COPY_FREE_WIDTH_1_NODES + copies[0], "{label}: arm `{}`: width 1's nodes", arm.name);
+    }
+    assert!(copies[1..].iter().all(|&c| c == MAIN_COPIES), "{label}: arm `{}`: widths 2-{lanes} copy as main", arm.name);
+}
+
 fn expect_replay(model: &Model, pool: &SeqPool, graphs: bool, what: &str) {
     let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{what}: stats: {e}"));
     assert_eq!(stats.graph_launches, u64::from(graphs), "{what}: graph replay");
 }
 
-/// The session's rounds of one kind over the riding lanes.
+/// A kind of round the session rides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Round {
+    Plain,
+    Verify,
+    /// A plain round, lane 0 held to [`Script::permitted`]: eager on every
+    /// arm, as a constrained round always is.
+    Constrained,
+    /// A verify round whose every run of two or more the host cuts one
+    /// token short.
+    Cut,
+}
+
+/// `count` rounds of one kind over the riding lanes; a cut round counts the
+/// runs it cut into `cuts`.
 #[allow(clippy::too_many_arguments)]
 fn ride(
     model: &Model,
     pool: &SeqPool,
     load: &Load,
+    script: &Script,
     seqs: &mut [Option<Seq<'_>>],
     riding: &[usize],
     sampling: fn(usize) -> SamplingParams,
     graphs: bool,
-    verify: bool,
+    (round, count): (Round, u32),
     committed: &mut Committed,
+    cuts: &mut u32,
     label: &str,
 ) {
     let width = riding.len();
-    for round in 0..if verify { VERIFY_ROUNDS } else { PLAIN_ROUNDS } {
-        let what = format!("{label}: width {width} {} round {round}", if verify { "verify" } else { "plain" });
+    for at in 0..count {
+        let what = format!("{label}: width {width} {round:?} round {at}");
         let mut refs = riders(seqs, riding);
-        if verify {
-            let lanes: Vec<VerifyLane<'_>> =
-                riding.iter().map(|&lane| VerifyLane { sampling: sampling(lane), ..VerifyLane::greedy(&[]) }).collect();
-            let runs = decode_program_verify_runs(model, pool, &mut refs, &lanes, load.window)
+        match round {
+            Round::Verify | Round::Cut => {
+                let lanes: Vec<VerifyLane<'_>> =
+                    riding.iter().map(|&lane| VerifyLane { sampling: sampling(lane), ..VerifyLane::greedy(&[]) }).collect();
+                let runs = if round == Round::Cut {
+                    let mut cut = |_lane: usize, run: &[i32]| -> usize {
+                        if run.len() < 2 {
+                            return 1;
+                        }
+                        *cuts += 1;
+                        run.len() - 1
+                    };
+                    decode_program_verify_cut(model, pool, &mut refs, &lanes, load.window, &vec![true; width], &mut cut)
+                } else {
+                    decode_program_verify_runs(model, pool, &mut refs, &lanes, load.window)
+                }
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
-            expect_replay(model, pool, graphs, &what);
-            for (&lane, run) in riding.iter().zip(runs) {
-                assert_eq!(run.extent, load.window, "{what}: lane {lane} drafts the whole window");
-                committed[lane].extend(run.tokens);
-                committed[lane].push(-1);
+                expect_replay(model, pool, graphs, &what);
+                for (&lane, run) in riding.iter().zip(runs) {
+                    assert_eq!(run.extent, load.window, "{what}: lane {lane} drafts the whole window");
+                    committed[lane].extend(run.tokens);
+                    committed[lane].push(-1);
+                }
             }
-        } else {
-            let params: Vec<SamplingParams> = riding.iter().map(|&lane| sampling(lane)).collect();
-            let drawn = decode_program_batch_sampled(model, pool, &mut refs, &params).unwrap_or_else(|e| panic!("{what}: {e}"));
-            expect_replay(model, pool, graphs, &what);
-            for (&lane, token) in riding.iter().zip(drawn) {
-                committed[lane].push(token);
+            Round::Plain => {
+                let params: Vec<SamplingParams> = riding.iter().map(|&lane| sampling(lane)).collect();
+                let drawn = decode_program_batch_sampled(model, pool, &mut refs, &params).unwrap_or_else(|e| panic!("{what}: {e}"));
+                expect_replay(model, pool, graphs, &what);
+                for (&lane, token) in riding.iter().zip(drawn) {
+                    committed[lane].push(token);
+                }
+            }
+            Round::Constrained => {
+                let lanes: Vec<PermittedLane<'_>> = riding
+                    .iter()
+                    .map(|&lane| PermittedLane { sampling: sampling(lane), permitted: if lane == 0 { &script.permitted } else { &[] } })
+                    .collect();
+                let (drawn, _) =
+                    decode_program_batch_permitted(model, pool, &mut refs, &lanes).unwrap_or_else(|e| panic!("{what}: {e}"));
+                expect_replay(model, pool, false, &what);
+                for (&lane, token) in riding.iter().zip(drawn) {
+                    committed[lane].push(token);
+                }
             }
         }
     }
@@ -414,44 +538,76 @@ fn ride(
 
 /// The session (see the module's note) on `pool`, under the arm's graphs or
 /// eagerly.
-fn session(model: &Model, pool: &SeqPool, load: &Load, prompts: &[Vec<i32>], sampling: fn(usize) -> SamplingParams, graphs: bool, label: &str) -> Committed {
+fn session(model: &Model, pool: &SeqPool, load: &Load, script: &Script, sampling: fn(usize) -> SamplingParams, graphs: bool, label: &str) -> Committed {
     let lanes = load.lanes as usize;
     let mut seqs: Vec<Option<Seq<'_>>> = Vec::with_capacity(lanes);
     let mut committed: Committed = vec![Vec::new(); lanes];
+    let mut cuts = 0;
+    let mut rides = |seqs: &mut [Option<Seq<'_>>], riding: &[usize], rounds: (Round, u32)| {
+        ride(model, pool, load, script, seqs, riding, sampling, graphs, rounds, &mut committed, &mut cuts, label);
+    };
     for width in 1..=lanes {
         let lane = width - 1;
         let mut seq = pool.alloc(load.context()).unwrap_or_else(|e| panic!("{label}: alloc lane {lane}: {e}"));
-        prefill(model, pool, &mut seq, &prompts[lane], sampling(lane), load.vision && lane == 0, &format!("{label}: lane {lane}"));
+        prefill(model, pool, &mut seq, &script.prompts[lane], sampling(lane), load.vision && lane == 0, &format!("{label}: lane {lane}"));
         seqs.push(Some(seq));
         let riding: Vec<usize> = (0..width).collect();
-        ride(model, pool, load, &mut seqs, &riding, sampling, graphs, false, &mut committed, label);
-        ride(model, pool, load, &mut seqs, &riding, sampling, graphs, true, &mut committed, label);
+        rides(&mut seqs, &riding, (Round::Plain, PLAIN_ROUNDS));
+        rides(&mut seqs, &riding, (Round::Verify, VERIFY_ROUNDS / 2));
+        rides(&mut seqs, &riding, (Round::Constrained, CONSTRAINED_ROUNDS));
+        rides(&mut seqs, &riding, (Round::Cut, CUT_ROUNDS));
+        rides(&mut seqs, &riding, (Round::Verify, VERIFY_ROUNDS - VERIFY_ROUNDS / 2));
     }
     if lanes > 1 {
         for seq in seqs.iter_mut().skip(1).step_by(2) {
             *seq = None;
         }
         let riding: Vec<usize> = (0..lanes).step_by(2).collect();
-        ride(model, pool, load, &mut seqs, &riding, sampling, graphs, true, &mut committed, label);
-        ride(model, pool, load, &mut seqs, &riding, sampling, graphs, false, &mut committed, label);
+        rides(&mut seqs, &riding, (Round::Verify, VERIFY_ROUNDS));
+        rides(&mut seqs, &riding, (Round::Plain, PLAIN_ROUNDS));
     }
+    assert!(cuts > 0, "{label}: no verify run of two or more was cut, so no cut took a count back");
     committed
+}
+
+/// GitHub #676: whether the arm's verify rounds return with their fold in
+/// flight: a DFlash2 load's do unless the arm sets `IGNIS_DEFER_VERIFY=0`, an
+/// MTP load's never.
+fn defers_verify(load: &Load, arm: &Arm) -> bool {
+    load.backend == SpeculativeBackend::Dflash2 && !arm.switches.contains(&("IGNIS_DEFER_VERIFY", "0"))
 }
 
 /// The arm's sessions, greedy then sampled, its switches set and, for an arm
 /// that replays graphs, the graphs captured under them.
-fn run(model: &Model, pool: &SeqPool, load: &Load, prompts: &[Vec<i32>], arm: &Arm, label: &str) -> Vec<Committed> {
+fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, label: &str) -> Vec<Committed> {
     apply(arm);
+    let stats = || program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
     if arm.graphs {
         let capture = capture_decode_graphs(model, pool).unwrap_or_else(|e| panic!("{label}: {}: capture: {e}", arm.name));
         let every = (1u32 << load.lanes) - 1;
-        let verify = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}")).verify_graph_ready_mask;
+        let verify = stats().verify_graph_ready_mask;
         assert_eq!((capture.ready_mask, verify), (every, every), "{label}: {}: every width's decode and verify graph", arm.name);
+        let append = stats().drafter_append_graph_ready_mask;
+        let want = if defers_verify(load, arm) { every } else { 0 };
+        assert_eq!(append, want, "{label}: {}: the drafter's append graphs", arm.name);
+        copy_free_graphs(model, pool, load, arm, label);
     }
+    let folds = stats().verify_folds_in_flight;
     let sessions = KINDS
         .iter()
-        .map(|&(kind, sampling)| session(model, pool, load, prompts, sampling, arm.graphs, &format!("{label} {} {kind}", arm.name)))
+        .map(|&(kind, sampling)| session(model, pool, load, script, sampling, arm.graphs, &format!("{label} {} {kind}", arm.name)))
         .collect();
+    // Where the arm defers, every verify round but a cut one leaves its fold
+    // in flight: the rest cut nothing, draft the whole window and take no
+    // penalty count back. A cut round does too when its lanes are greedy.
+    let left = stats().verify_folds_in_flight - folds;
+    let uncut = KINDS.len() as u64 * u64::from((load.lanes + u32::from(load.lanes > 1)) * VERIFY_ROUNDS);
+    if defers_verify(load, arm) {
+        assert!(left >= uncut, "{label}: {}: {left} verify rounds left their fold in flight, not the {uncut} uncut ones", arm.name);
+    } else {
+        assert_eq!(left, 0, "{label}: {}: verify rounds left their fold in flight", arm.name);
+    }
+    println!("round_identity_gpu {label}: arm `{}`: {left} verify rounds returned with their fold in flight", arm.name);
     apply(&REFERENCE);
     sessions
 }
@@ -466,7 +622,7 @@ fn first_difference(want: &Committed, got: &Committed) -> Option<(usize, usize)>
 /// Every selected arm against the reference on one load under one exception
 /// setting: one materialize, one model load, one pool. The arms compared, or
 /// `None` where the profile allows a skip.
-fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: ExceptionWeights, arms: &[&Arm], prompts: &[Vec<i32>]) -> Option<usize> {
+fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: ExceptionWeights, arms: &[&Arm], script: &Script) -> Option<usize> {
     let label = format!("{} {exceptions}", load.name);
     let spec = load.speculation();
     let (plan, handles) = bind_model_scope_27b_with(reader, model_scope(Some(spec), load.vision(), exceptions))
@@ -513,8 +669,8 @@ fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: Excep
         .unwrap_or_else(|e| panic!("{label}: pool: {e}"));
         // An eager arm runs before the load's first capture.
         let eager: Vec<(&Arm, Vec<Committed>)> =
-            arms.iter().filter(|arm| !arm.graphs).map(|&arm| (arm, run(&model, &pool, load, prompts, arm, &label))).collect();
-        let reference = run(&model, &pool, load, prompts, &REFERENCE, &label);
+            arms.iter().filter(|arm| !arm.graphs).map(|&arm| (arm, run(&model, &pool, load, script, arm, &label))).collect();
+        let reference = run(&model, &pool, load, script, &REFERENCE, &label);
         assert_ne!(reference[0], reference[1], "{label}: the sampled lanes commit the greedy lanes' tokens: their settings never reached the sampler");
         let mut compared = 0;
         let mut hold_arm = |arm: &Arm, sessions: Vec<Committed>| {
@@ -542,7 +698,7 @@ fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: Excep
             hold_arm(arm, sessions);
         }
         for &arm in arms.iter().filter(|arm| arm.graphs) {
-            let sessions = run(&model, &pool, load, prompts, arm, &label);
+            let sessions = run(&model, &pool, load, script, arm, &label);
             hold_arm(arm, sessions);
         }
         compared
@@ -575,7 +731,7 @@ fn every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_wi
             continue;
         }
         let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {}: {e}", load.artifact));
-        let prompts = chat_prompts(&reader);
+        let script = script(&reader);
         for exceptions in [ExceptionWeights::Bf16, ExceptionWeights::Fp8] {
             if !weights.contains(&exceptions.as_str()) {
                 continue;
@@ -584,7 +740,7 @@ fn every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_wi
                 println!("round_identity_gpu {}: no BF16 exception tensor, so fp8 is its bf16 load: run once, as bf16", load.name);
                 continue;
             }
-            match hold(&mut device, &reader, load, exceptions, &arms, &prompts) {
+            match hold(&mut device, &reader, load, exceptions, &arms, &script) {
                 Some(arms_held) => compared += arms_held,
                 None => skipped = true,
             }

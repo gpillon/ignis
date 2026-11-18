@@ -131,6 +131,15 @@ pub(crate) mod ffi {
         /// graph and on Flash-Next.
         pub decode_graph_nodes: [u32; 8],
         pub verify_graph_nodes: [u32; 8],
+        /// GitHub #677: entry w-1 how many of the decode graph's nodes for
+        /// exact width w are copies.
+        pub decode_graph_copy_nodes: [u32; 8],
+        /// GitHub #676: the verify rounds of this load that returned with
+        /// their fold in flight.
+        pub verify_folds_in_flight: u64,
+        /// GitHub #676: bit (w-1) set when the DFlash2 drafter's append after
+        /// a verify round's commit is a captured graph at exact width w.
+        pub drafter_append_graph_ready_mask: u32,
     }
 
     unsafe extern "C" {
@@ -459,6 +468,21 @@ pub struct ProgramStats {
     pub decode_graph_nodes: [u32; 8],
     /// The same for the verify graphs.
     pub verify_graph_nodes: [u32; 8],
+    /// Entry `w - 1`: how many of the nodes of the decode graph for width `w`
+    /// are copies (GitHub #677: a copy-free round copies neither a residual
+    /// nor a GDN layer's q, k and v, `kernel/src/decode_graph_copies.h`); 0
+    /// where [`ProgramStats::decode_graph_nodes`] is.
+    pub decode_graph_copy_nodes: [u32; 8],
+    /// GitHub #676: the verify rounds of this load that returned with their
+    /// fold in flight -- the commit's device work still on the stream, every
+    /// later leaf call ordered behind it. Only a DFlash2 load's rounds do,
+    /// unless `IGNIS_DEFER_VERIFY=0`; 0 on every other load.
+    pub verify_folds_in_flight: u64,
+    /// GitHub #676: bit `w - 1` set when the DFlash2 drafter's append after a
+    /// verify round's commit replays a graph captured by
+    /// [`capture_decode_graphs`] at exact width `w`; 0 under
+    /// `IGNIS_DEFER_VERIFY=0` and on every other load.
+    pub drafter_append_graph_ready_mask: u32,
 }
 
 /// The result of [`capture_decode_graphs`]: how long capture took and which
@@ -507,7 +531,9 @@ pub fn last_decode_graph_error() -> String {
 /// reports which widths actually got a graph -- a width whose bit is clear
 /// always runs the eager per-lane loop, exactly as it did before this call.
 /// The one `Err` is a measurement switch read at capture with a value it
-/// does not know (`IGNIS_ROUND_TIMING`, GitHub #674), named in the message.
+/// does not know (`IGNIS_ROUND_TIMING`, GitHub #674;
+/// `IGNIS_DECODE_GRAPH_COPIES`, GitHub #677; `IGNIS_DEFER_VERIFY`, GitHub
+/// #676), named in the message.
 ///
 /// Called again on the same load and pool, it replaces every graph the
 /// earlier call captured: how a test flips such a switch in one process
@@ -2386,6 +2412,9 @@ pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, Stri
         verify_graph_ready_mask: stats.verify_graph_ready_mask,
         decode_graph_nodes: stats.decode_graph_nodes,
         verify_graph_nodes: stats.verify_graph_nodes,
+        decode_graph_copy_nodes: stats.decode_graph_copy_nodes,
+        verify_folds_in_flight: stats.verify_folds_in_flight,
+        drafter_append_graph_ready_mask: stats.drafter_append_graph_ready_mask,
     })
 }
 

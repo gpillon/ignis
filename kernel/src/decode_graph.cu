@@ -14,6 +14,8 @@
 
 #include "ignis_step.h"
 
+#include "decode_graph_copies.h"
+#include "deferred_verify.h"
 #include "dflash2_drafter.h"
 #include "ignis_gdn_layer.h"
 #include "ignis_gqa_layer.h"
@@ -43,6 +45,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -99,10 +102,24 @@ int32_t ignis_decode_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
         model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
     ninfer::ops::embedding(ids, model->token_embedding, left, model->stream);
 
+    // GitHub #677 (spec #672, kernel/src/decode_graph_copies.h): at a
+    // copy-free width every layer adds its output into its input residual in
+    // place (`left` is both), as the prefill's GDN body does since GitHub
+    // #507 -- the layer's input RMSNorm is that residual's only other reader,
+    // and it runs before the first add -- so no layer copies the residual and
+    // the two buffers never swap; and at one column each GDN layer's
+    // recurrence reads q, k and v as views of the conv output plane, where
+    // they are contiguous already (kernel/src/gdn_layer.cu
+    // `run_gdn_layer_graph`). A layer change keeps both: nothing may read the
+    // layer's input after its first add into the residual, and nothing may
+    // write the conv plane between the conv and the recurrence. Elsewhere
+    // (main's round) each layer copies its input into `right` and adds there.
+    const bool in_place = ignis::decode_graph_copies::takes(model->decode_copy_free_widths, width);
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
+      void *out = in_place ? left.data : right.data;
       const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
-          ? ignis_gqa_layer_run_body_graph(model, pool, layer, width, left.data, right.data, mode)
-          : ignis_gdn_layer_run_body_graph(model, pool, layer, width, left.data, right.data, mode);
+          ? ignis_gqa_layer_run_body_graph(model, pool, layer, width, left.data, out, mode)
+          : ignis_gdn_layer_run_body_graph(model, pool, layer, width, left.data, out, mode);
       if (rc != 0) {
         const char *detail = model->layers[layer].kind == IGNIS_LAYER_GQA
             ? ignis_gqa_layer_last_error()
@@ -111,7 +128,9 @@ int32_t ignis_decode_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
                   std::to_string(layer) + " failed: " + detail);
         return -1;
       }
-      std::swap(left, right);
+      if (!in_place) {
+        std::swap(left, right);
+      }
     }
 
     const ninfer::Tensor norm_weight(const_cast<void *>(model->final_norm.qdata), ninfer::DType::BF16,
@@ -332,6 +351,31 @@ uint32_t node_count(cudaGraph_t graph) {
   return static_cast<uint32_t>(nodes);
 }
 
+// GitHub #677: how many of a captured graph's nodes are copies (`ignis_program_stats`); 0 if the
+// runtime cannot say.
+uint32_t copy_node_count(cudaGraph_t graph) {
+  std::size_t count = 0;
+  if (cudaGraphGetNodes(graph, nullptr, &count) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return 0;
+  }
+  std::vector<cudaGraphNode_t> nodes(count);
+  if (count > 0 && cudaGraphGetNodes(graph, nodes.data(), &count) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return 0;
+  }
+  uint32_t copies = 0;
+  for (const cudaGraphNode_t node : nodes) {
+    cudaGraphNodeType type = cudaGraphNodeTypeCount;
+    if (cudaGraphNodeGetType(node, &type) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return 0;
+    }
+    copies += type == cudaGraphNodeTypeMemcpy ? 1 : 0;
+  }
+  return copies;
+}
+
 // P5-04 (GitHub #153): records one width-W verify graph -- exactly
 // `ignis_verify_graph_run_batch`, captured once. Same failure handling as
 // the decode capture below.
@@ -386,9 +430,10 @@ int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
 // the partial graph is discarded and `*out_exec` stays null; the caller
 // leaves this width on the eager fallback.
 int32_t capture_decode_graph_width(ignis_model *model, ignis_seq_pool *pool, uint32_t width,
-                                   cudaGraphExec_t *out_exec, uint32_t *out_nodes) {
+                                   cudaGraphExec_t *out_exec, uint32_t *out_nodes, uint32_t *out_copies) {
   *out_exec = nullptr;
   *out_nodes = 0;
+  *out_copies = 0;
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto batch = static_cast<std::int32_t>(width);
 
@@ -432,6 +477,7 @@ int32_t capture_decode_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
   }
 
   const uint32_t nodes = node_count(graph);
+  const uint32_t copies = copy_node_count(graph);
   cudaGraphExec_t exec = nullptr;
   const cudaError_t inst_err = cudaGraphInstantiate(&exec, graph, 0);
   cudaGraphDestroy(graph);
@@ -442,6 +488,7 @@ int32_t capture_decode_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
   }
   *out_exec = exec;
   *out_nodes = nodes;
+  *out_copies = copies;
   return 0;
 }
 
@@ -487,6 +534,31 @@ bool read_round_timing(ignis_model *model) {
   return true;
 }
 
+// GitHub #677 (spec #672): the decode widths that run copy-free from this capture on
+// (kernel/src/decode_graph_copies.h), from IGNIS_DECODE_GRAPH_COPIES and the card, read at each
+// capture. False (error set) on a value other than `1`, or when the device cannot say its
+// generation.
+bool read_decode_graph_copies(ignis_model *model) {
+  ignis::decode_graph_copies::Switch named = ignis::decode_graph_copies::Switch::Unset;
+  try {
+    named = ignis::decode_graph_copies::switch_at_capture();
+  } catch (const std::invalid_argument &e) {
+    set_error(std::string("ignis_decode_graph_capture: ") + e.what());
+    return false;
+  }
+  int device = 0;
+  int major = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err == cudaSuccess) err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_decode_graph_capture: the GPU generation for the copy-free round: ") +
+              cudaGetErrorString(err));
+    return false;
+  }
+  model->decode_copy_free_widths = ignis::decode_graph_copies::copy_free_widths(named, major);
+  return true;
+}
+
 } // namespace
 
 extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct ignis_seq_pool *pool,
@@ -520,8 +592,18 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
     }
     return rc;
   }
-  if (!read_round_timing(model)) {
+  if (!read_round_timing(model) || !read_decode_graph_copies(model)) {
     return -1;
+  }
+  // GitHub #676: IGNIS_DEFER_VERIFY, read at each capture like the round
+  // timing; a load with no window has no verify round to defer.
+  if (model->verify != nullptr) {
+    try {
+      model->verify->defer = ignis::deferred_verify::read_switch();
+    } catch (const std::invalid_argument &e) {
+      set_error(std::string("ignis_decode_graph_capture: ") + e.what());
+      return -1;
+    }
   }
   const auto began = std::chrono::steady_clock::now();
   uint32_t ready_mask = 0;
@@ -537,17 +619,23 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   for (uint32_t width = 1; width <= IGNIS_DECODE_MAX_BATCH; ++width) {
     release_graph(model->decode_graph_exec[width - 1], model->decode_graph_ready[width - 1],
                   model->decode_graph_nodes[width - 1]);
+    model->decode_graph_copy_nodes[width - 1] = 0;
     if (model->verify != nullptr) {
       release_graph(model->verify->graph_exec[width - 1], model->verify->graph_ready[width - 1],
                     model->verify->graph_nodes[width - 1]);
+      // GitHub #676: and the drafter's append graph.
+      if (model->verify->append_exec[width - 1] != nullptr) {
+        cudaGraphExecDestroy(model->verify->append_exec[width - 1]);
+        model->verify->append_exec[width - 1] = nullptr;
+      }
     }
   }
   // GitHub #336: the widths the load's lanes serve, and no wider: a round
   // past them is refused, so a graph for it would only hold memory.
   for (uint32_t width = 1; width <= model->decode_lanes; ++width) {
     cudaGraphExec_t exec = nullptr;
-    if (capture_decode_graph_width(model, pool, width, &exec,
-                                   &model->decode_graph_nodes[width - 1]) == 0) {
+    if (capture_decode_graph_width(model, pool, width, &exec, &model->decode_graph_nodes[width - 1],
+                                   &model->decode_graph_copy_nodes[width - 1]) == 0) {
       model->decode_graph_exec[width - 1] = exec;
       model->decode_graph_ready[width - 1] = true;
       ready_mask |= (1u << (width - 1));
@@ -575,6 +663,19 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
       } else {
         model->verify->graph_exec[width - 1] = nullptr;
         model->verify->graph_ready[width - 1] = false;
+      }
+    }
+  }
+  // GitHub #676: the DFlash2 drafter's append after a deferring round's
+  // commit, one graph per width, under the same never-refuse-service rule: a
+  // width whose capture failed appends eagerly.
+  if (model->verify != nullptr && model->verify->defer && model->verify->staging != nullptr) {
+    for (uint32_t width = 1; width <= model->decode_lanes; ++width) {
+      std::string error;
+      if (ignis::deferred_verify::capture_append(model, pool, width, &model->verify->append_exec[width - 1],
+                                                 &error) != 0) {
+        set_error("ignis_decode_graph_capture: the drafter's append at width " + std::to_string(width) +
+                  ": " + error);
       }
     }
   }

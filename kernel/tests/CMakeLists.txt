@@ -334,6 +334,15 @@ target_include_directories(ignis_kernel_teacher_forcing_test
                                    ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 add_test(NAME ignis_kernel_teacher_forcing_test COMMAND ignis_kernel_teacher_forcing_test)
 
+# GitHub #676 (spec #672): OURS -- whether a 27B verify round stages through
+# host-mapped memory and whether it returns with its fold in flight, the two
+# host functions the round calls. Header-only and linked against nothing, like
+# the teacher forcing's test above, so it too runs while another process holds
+# the card.
+add_executable(ignis_kernel_verify_return_test test_verify_return.cpp)
+target_include_directories(ignis_kernel_verify_return_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+add_test(NAME ignis_kernel_verify_return_test COMMAND ignis_kernel_verify_return_test)
+
 # P4-03 (GitHub #119): the hq-e8-2b row codec's own op-level oracle. It was
 # FOUND in the reference at `tools/test_kv/`, not `tests/ops/` — that is why
 # no hq arm existed in the vendored `test_gqa_attention.cpp` (P1-15, GitHub
@@ -442,6 +451,15 @@ add_executable(ignis_kernel_hq_decode_attention_route_test test_hq_decode_attent
 target_include_directories(ignis_kernel_hq_decode_attention_route_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_hq_decode_attention_route_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_hq_decode_attention_route_test COMMAND ignis_kernel_hq_decode_attention_route_test)
+
+# GitHub #677 (spec #672): OURS -- which decode rounds of the 27B run copy-free
+# (kernel/src/decode_graph_copies.h): the width-1 round on a card of compute
+# capability 12 unless IGNIS_DECODE_GRAPH_COPIES=1, main's on every other card
+# and at every other width, a bad value refused by name. Host-only.
+add_executable(ignis_kernel_decode_graph_copies_test test_decode_graph_copies.cpp)
+target_include_directories(ignis_kernel_decode_graph_copies_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_decode_graph_copies_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_decode_graph_copies_test COMMAND ignis_kernel_decode_graph_copies_test)
 
 # P4-04 (GitHub #122): OURS, not vendored -- the KV append path under both
 # storage formats. It builds two sequence pools differing only in

@@ -27,6 +27,7 @@
 #include "ignis_step.h"
 
 #include "attention_readout.h"
+#include "fp8_exception.h"
 #include "ignis_dense_prefill.h"
 #include "gdn_prefill.h"
 #include "hq_decode_attention.h"
@@ -1633,14 +1634,17 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   // The routes a load decides from the card and a measurement switch, and the switches it reads
   // on their own, in this order, so a value a switch does not know refuses the plan and the load by
   // name: IGNIS_HQ_DECODE_ATTENTION (GitHub #572), IGNIS_PREFILL_SWIGLU (GitHub #651, #653: unset
-  // or `quant`, `fused`, `split`) and IGNIS_W4A4_ACTIVATION_LAYOUT (GitHub #652: unset or `ktile`,
-  // `token`).
+  // or `quant`, `fused`, `split`), IGNIS_W4A4_ACTIVATION_LAYOUT (GitHub #652: unset or `ktile`,
+  // `token`) and IGNIS_FP8_GEMV_PAIRED (GitHub #678: unset or `1`, `0`; each call of the FP8 q | k |
+  // gate | v projection reads it again, kernel/src/fp8_exception.h).
+  bool fp8_gemv_paired = true;
   if (!gdn_prefill_route(out.gdn_prefill_ours) ||
       !load_switch(ignis::hq_decode_attention::switch_for_load, out.hq_decode_attention) ||
       !mtp_head_linear_route(out.mtp_head_linear_ours) ||
       !tma_descriptor_cache_route(out.tma_descriptor_cache) ||
       !load_switch(ignis::prefill_swiglu::route_for_load, out.prefill_swiglu) ||
-      !load_switch(ignis::w4a4_activation_layout::layout_for_load, out.w4a4_activation_layout)) {
+      !load_switch(ignis::w4a4_activation_layout::layout_for_load, out.w4a4_activation_layout) ||
+      !load_switch(ignis::fp8_exception::gemv_paired, fp8_gemv_paired)) {
     return nullptr;
   }
 
@@ -2871,6 +2875,9 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
         model->verify->draft_candidates = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_draws / 2);
         model->verify->draft_q = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_draws / 2);
       }
+      // GitHub #676: the host-mapped staging its verify rounds take, page-locked
+      // here rather than while serving.
+      model->verify->staging = std::make_unique<VerifyStaging>();
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: drafter round allocation failed: ") + e.what());
       cudaStreamDestroy(model->stream);
@@ -2961,6 +2968,11 @@ extern "C" uint32_t ignis_model_w4a4_activation_layout(const struct ignis_model 
 
 extern "C" void ignis_model_free(struct ignis_model *model) {
   if (model != nullptr) {
+    // GitHub #676: a verify round's commit may still be on the stream, reading
+    // the buffers and writing the host-mapped staging freed below.
+    if (model->stream != nullptr) {
+      cudaStreamSynchronize(model->stream);
+    }
     // P3-05 (GitHub #102, ADR 0019): destroy every captured decode graph
     // before the stream/scratch it was captured against goes away.
     for (auto &exec : model->decode_graph_exec) {
@@ -2971,6 +2983,13 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
     }
     if (model->verify != nullptr) {
       for (auto &exec : model->verify->graph_exec) {
+        if (exec != nullptr) {
+          cudaGraphExecDestroy(exec);
+          exec = nullptr;
+        }
+      }
+      // GitHub #676: and the drafter's append graphs.
+      for (auto &exec : model->verify->append_exec) {
         if (exec != nullptr) {
           cudaGraphExecDestroy(exec);
           exec = nullptr;
