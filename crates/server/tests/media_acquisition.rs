@@ -185,6 +185,35 @@ async fn an_oversize_body_is_over_the_byte_budget_with_or_without_a_length() {
     }
 }
 
+/// GitHub #673: what a request fetches is held to the byte budget together,
+/// as before the rule, since a fetch has cost its bytes once made; an inline
+/// image is held to it alone, and only weighs in the drop.
+#[tokio::test]
+async fn fetched_images_are_held_to_the_byte_budget_together_and_inline_ones_alone() {
+    let port = image_server().await;
+    let url = format!("http://127.0.0.1:{port}/image.png");
+    let bytes = png(64, 64).len() as u64;
+    let under = |budget: u64| acquirer(ProcessorOptions { max_encoded_media_bytes: budget, ..limits() }, MediaPolicy::new(true, 0));
+
+    // Two fetches one byte past the budget together: the second is refused.
+    let refused = assert_refused(acquire(&under(2 * bytes - 1), &[&url, &url]).await, "media_budget_exceeded");
+    assert!(refused.message.starts_with("message 0 content part 2: "), "{}", refused.message);
+    let numbers = refused.budget.expect("its numbers");
+    assert_eq!((numbers.limit, numbers.requested), (2 * bytes - 1, 2 * bytes));
+    // A budget the fetches have spent refuses the next one unfetched: at
+    // least one byte more.
+    let spent = assert_refused(acquire(&under(bytes), &[&url, &url]).await, "media_budget_exceeded");
+    assert_eq!(spent.budget.map(|b| (b.limit, b.requested)), Some((bytes, bytes + 1)));
+
+    // A fetch, then an inline image past what the fetch left of the budget
+    // but within it alone: admitted, the older dropped to bring the two
+    // within it.
+    let inline = newer();
+    assert!(inline.len() as u64 > bytes, "past what the fetch leaves");
+    let acquired = acquire(&under(inline.len() as u64), &[&url, &data_uri(&inline)]).await.unwrap();
+    assert_eq!((acquired.dropped, acquired.media[0].source_pixels), (1, (96, 64)));
+}
+
 #[tokio::test]
 async fn a_body_that_never_finishes_is_a_fetch_timeout() {
     let port = image_server().await;

@@ -76,11 +76,13 @@ Everything goes through one structured log on stdout, in the format
   `ignis.media.refused`: its media are acquired before admission, so the
   refusal has no request id and no `ignis.request.*` line. It carries the
   answer's `status` and `code` (`invalid_media`, `media_budget_exceeded`,
-  `media_fetch_failed`, `media_fetch_timeout`, or `request_timeout` when the
-  deadline passed while the images were prepared), the `part` refused
-  (`message 3 content part 1`; none for a limit on the whole request), never
-  the message the client read, which for a fetch names its URL, and, for a
-  budget, the `budget`
+  `vision_disabled`, `video_unsupported`, `media_fetch_failed`,
+  `media_fetch_timeout`, or `request_timeout` when the deadline passed while
+  the images were prepared), the `part` the acquisition refused
+  (`message 3 content part 1`; none for a limit on the whole request, nor for
+  a refusal the request's parts meet before their images are acquired, such
+  as an image in a system message), never the message the client read, which
+  for a fetch names its URL, and, for a budget, the `budget`
   (`encoded_bytes`, `decoded_pixels`, `media_items`, `raw_patches`,
   `vision_tokens` or `item_vision_tokens`), its `limit` and the amount
   `requested` ([Troubleshooting](../troubleshooting.md#vision_disabled-or-media_budget_exceeded)):

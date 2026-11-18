@@ -338,6 +338,18 @@ impl Budget {
             Self::ItemVisionTokens => "vision tokens in one image",
         }
     }
+
+    /// What the limit counts, as a log attribute names it (GitHub #673).
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::MediaItems => "media_items",
+            Self::EncodedBytes => "encoded_bytes",
+            Self::DecodedPixels => "decoded_pixels",
+            Self::RawPatches => "raw_patches",
+            Self::VisionTokens => "vision_tokens",
+            Self::ItemVisionTokens => "item_vision_tokens",
+        }
+    }
 }
 
 /// A typed processor failure. Every variant is a client-visible 400; see

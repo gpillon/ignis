@@ -1,5 +1,6 @@
 ---
 status: accepted
+amends: [ADR-0099]
 ---
 
 # A request whose images pass the vision budget together drops its oldest, a block at a time, as text
@@ -9,7 +10,9 @@ those images together passed `vision.max_tokens`, ignis refused every later turn
 session died (#673: opencode, 36 crops, 32,557 tokens, then one crop more). ignis already shrank a single image too
 large for the budget (#248); several that passed it only together were refused. The owner chose, at triage on
 2026-11-17, to drop the oldest images in blocks, as the default, with no field to turn it off, and to apply the same
-rule to the byte budget (`max_encoded_media_bytes`).
+rule to the byte budget (`max_encoded_media_bytes`). An image left in a harness's history past `vision.max_tokens` is
+therefore no longer refused on every later turn, as [ADR 0099](0099-a-harness-reaches-ignis-through-an-mcp-server-inside-ignis-and-a-skill-ignis-serves-whose-scripts-carry-the-files.md)
+has it for the connector's previews.
 
 - **Blocks.** A request's image parts, in prompt order, form blocks: a block takes images until the next would carry
   it past half of `vision.max_tokens` in tokens (raw patches with them), or past half of the byte budget in bytes. An
@@ -20,7 +23,9 @@ rule to the byte budget (`max_encoded_media_bytes`).
 - **Why blocks, and why half.** A block's bounds depend only on the images before it, so on a history that grows at
   its end a closed block never changes and each is dropped once: the prompt changes at its first image once a block,
   about every half a budget of new images, and prefix reuse holds between drops. Half is the owner's: it follows
-  `vision.max_tokens`, so it is no field of its own (out of scope at triage, like a field to turn the rule off).
+  `vision.max_tokens`, so it is no field of its own, a deliberate exception to "Limits are config fields"
+  (`CODING_STANDARDS.md`, [ADR 0046](0046-one-declaration-per-config-field.md)) decided at triage, like
+  having no field to turn the rule off.
 - **The placeholder.** A dropped image renders where it was as the text
   `[image omitted: past this request's vision budget]`, not as vision placeholders: the model reads that an image was
   there. The request's parts are rewritten before the template renders them, so every route that takes images (chat

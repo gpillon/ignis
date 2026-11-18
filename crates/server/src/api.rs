@@ -52,7 +52,7 @@ use crate::{ModelSource, ModelStatus, Server};
 use crate::decoder::{Channel, OutputDecoder};
 use crate::deadline::{StreamDeadline, Timeout, TimeoutReply};
 use crate::engine::{CollectError, Completion, Engine, EventStream, Generated, RequestNotes, collect_completion, drain_tokens};
-use crate::media::{has_media, MediaRejection, MediaStats};
+use crate::media::{has_media, BudgetExceeded, MediaRejection, MediaStats};
 use crate::openai_fields::{self, Surface};
 use crate::template::{
     check_roles, ChatMessage, ContentRejection, RenderedPrompt, TemplateProvider,
@@ -1107,26 +1107,35 @@ pub(crate) async fn prepare_decision_request(
 /// The response for refused media (GitHub #179): a 400 with the media
 /// code, or the handler's own 504 when the request deadline passed.
 ///
-/// The refusal is answered before admission, so no `ignis.request.*` line
-/// says why the client's request failed: it leaves `ignis.media.refused`
-/// instead (GitHub #673), with the code, the part and, for a budget, its
-/// numbers. Never the message: a fetch's names its URL, and a signed URL
-/// carries its signature.
+/// It leaves `ignis.media.refused` ([`log_media_refused`]).
 fn media_rejection(rejection: MediaRejection) -> Response {
-    let budget = rejection.budget;
-    tracing::warn!(
-        name: "ignis.media.refused",
-        status = rejection.status,
-        code = rejection.code,
-        budget = budget.map(|b| crate::media::budget_key(b.budget)),
-        limit = budget.map(|b| b.limit),
-        requested = budget.map(|b| b.requested),
-        part = rejection.part.as_deref(),
-        "request media refused"
-    );
+    log_media_refused(rejection.status, rejection.code, rejection.part.as_deref(), rejection.budget);
     let status = StatusCode::from_u16(rejection.status).unwrap_or(StatusCode::BAD_REQUEST);
     let type_ = if status == StatusCode::BAD_REQUEST { "invalid_request_error" } else { rejection.code };
     error_response(status, type_, rejection.code, rejection.message)
+}
+
+/// The codes of a content refusal that refuses the request's images, which
+/// leave `ignis.media.refused` as an acquisition's refusal does.
+const MEDIA_REFUSALS: [&str; 4] = ["invalid_media", "media_budget_exceeded", "vision_disabled", "video_unsupported"];
+
+/// The `ignis.media.refused` event of a request refused for its images
+/// (GitHub #673). The refusal is answered before admission, so no
+/// `ignis.request.*` line says why the client's request failed. It carries
+/// the code, the part the acquisition refused and, for a budget, its numbers;
+/// never the message: a fetch's names its URL, and a signed URL carries its
+/// signature.
+fn log_media_refused(status: u16, code: &str, part: Option<&str>, budget: Option<BudgetExceeded>) {
+    tracing::warn!(
+        name: "ignis.media.refused",
+        status,
+        code,
+        budget = budget.map(|b| b.budget.key()),
+        limit = budget.map(|b| b.limit),
+        requested = budget.map(|b| b.requested),
+        part,
+        "request media refused"
+    );
 }
 
 /// Split an optional `model` into its base id and any Lane tag (`GLOSSARY.md`:
@@ -2571,6 +2580,9 @@ pub(crate) fn bad_request(message: &str) -> Response {
 /// The 400 for refused content parts (GitHub #175): the rejection's own
 /// code, raised before the request reaches the engine.
 pub(crate) fn content_rejection(rejection: ContentRejection) -> Response {
+    if MEDIA_REFUSALS.contains(&rejection.code) {
+        log_media_refused(400, rejection.code, None, None);
+    }
     error_response(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",

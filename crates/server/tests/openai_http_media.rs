@@ -106,13 +106,7 @@ fn harness_timed(preparer: Option<Arc<dyn Preparer>>, cache_bytes: u64, max_sequ
 }
 
 /// [`harness_timed`], its media acquired under `limits`.
-fn harness_under(
-    preparer: Option<Arc<dyn Preparer>>,
-    cache_bytes: u64,
-    max_sequence_tokens: Option<u32>,
-    timeout: Duration,
-    limits: ProcessorOptions,
-) -> Harness {
+fn harness_under(preparer: Option<Arc<dyn Preparer>>, cache_bytes: u64, max_sequence_tokens: Option<u32>, timeout: Duration, limits: ProcessorOptions) -> Harness {
     let mut config = SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() };
     if let Some(tokens) = max_sequence_tokens {
         config.max_sequence_tokens = tokens;

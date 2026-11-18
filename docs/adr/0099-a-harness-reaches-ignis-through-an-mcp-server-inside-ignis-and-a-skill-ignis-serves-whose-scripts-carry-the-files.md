@@ -1,5 +1,6 @@
 ---
 status: proposed
+amended-by: [ADR-0102]
 ---
 
 # A harness reaches ignis through an MCP server inside ignis and a skill ignis serves, whose scripts carry the files

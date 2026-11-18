@@ -82,18 +82,6 @@ impl MediaRejection {
     }
 }
 
-/// A media budget's name on the `ignis.media.refused` event (GitHub #673).
-pub fn budget_key(budget: Budget) -> &'static str {
-    match budget {
-        Budget::MediaItems => "media_items",
-        Budget::EncodedBytes => "encoded_bytes",
-        Budget::DecodedPixels => "decoded_pixels",
-        Budget::RawPatches => "raw_patches",
-        Budget::VisionTokens => "vision_tokens",
-        Budget::ItemVisionTokens => "item_vision_tokens",
-    }
-}
-
 /// What a dropped image is rendered as, where it was in the prompt (GitHub
 /// #673, ADR 0102): the model reads that an image was there.
 pub const OMITTED_IMAGE: &str = "[image omitted: past this request's vision budget]";
@@ -972,6 +960,11 @@ impl MediaAcquirer {
             let acquired = match source {
                 Err(error) => Err(error),
                 Ok(MediaSource::Data(value)) => decode_data_uri(value, budget),
+                // Spent: refused unfetched, as before the rule, at least a
+                // byte more than the fetches before it.
+                Ok(MediaSource::Http(_)) if fetch_cap == 0 => {
+                    Err(AcquireError::Budget("request media exceed the aggregate media byte budget".to_owned(), 1))
+                }
                 Ok(MediaSource::Http(url)) => tokio::time::timeout_at(deadline.into(), fetch(url, &self.policy, fetch_cap, deadline))
                     .await
                     .unwrap_or_else(|_| Err(AcquireError::FetchTimeout("media URL fetch timed out".to_owned()))),

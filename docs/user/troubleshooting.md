@@ -658,10 +658,11 @@ whose fetched bytes together pass the byte budget (send them inline, as a
 harness does). 0.10.0 refuses several images whose total passes the budget,
 which an agent that resends its image history every turn reaches by itself.
 
-Every media refusal, this one and `invalid_media`, `media_fetch_failed` or
-`media_fetch_timeout`, leaves a WARN line `ignis.media.refused` in the server's
-log from 0.11.0, with the `code`, the `part` refused and, for a budget, the
-`budget`, its `limit` and the amount `requested` ([telemetry](guides/telemetry.md)): the request was
+Every media refusal, these two and `invalid_media`, `video_unsupported`,
+`media_fetch_failed` or `media_fetch_timeout`, leaves a WARN line
+`ignis.media.refused` in the server's log from 0.11.0, with the `code`, the
+`part` refused and, for a budget, the `budget`, its `limit` and the amount
+`requested` ([telemetry](guides/telemetry.md)): the request was
 answered before admission, so no `ignis.request.*` line names it.
 
 ### A `400` naming a `param`

@@ -47,24 +47,38 @@ fn limits() -> ProcessorOptions {
     }
 }
 
-/// The router over the mock, acquiring media under `limits`.
-fn app(limits: ProcessorOptions) -> axum::Router {
+/// The router over the mock, acquiring media under `limits`; `None`, a load
+/// without vision.
+fn app_over(limits: Option<ProcessorOptions>) -> axum::Router {
     let scheduler = ConcreteScheduler::with_config(
         SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
         Arc::new(MockCompute::new()),
     );
-    let acquirer = MediaAcquirer::new(Arc::new(processor(limits.clone())), limits, MediaPolicy::new(false, 1 << 20));
-    Server::new(Engine::new(Box::new(scheduler)), Box::new(SimpleTemplateProvider))
-        .with_request_timeout(Duration::from_secs(10))
-        .with_media(Arc::new(acquirer))
-        .app()
+    let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(SimpleTemplateProvider))
+        .with_request_timeout(Duration::from_secs(10));
+    match limits {
+        None => server.app(),
+        Some(limits) => {
+            let acquirer = MediaAcquirer::new(Arc::new(processor(limits.clone())), limits, MediaPolicy::new(false, 1 << 20));
+            server.with_media(Arc::new(acquirer)).app()
+        }
+    }
+}
+
+/// The router over the mock, acquiring media under `limits`.
+fn app(limits: ProcessorOptions) -> axum::Router {
+    app_over(Some(limits))
 }
 
 /// A chat request: a text part, then one image part per URL.
 fn images_request(images: &[&str]) -> Request<Body> {
     let mut content = vec![json!({"type": "text", "text": "what are these"})];
     content.extend(images.iter().map(|url| json!({"type": "image_url", "image_url": {"url": url}})));
-    let body = json!({"model": MODEL, "max_tokens": 4, "messages": [{"role": "user", "content": content}]});
+    chat_request(json!({"model": MODEL, "max_tokens": 4, "messages": [{"role": "user", "content": content}]}))
+}
+
+/// A chat request of `body`.
+fn chat_request(body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -148,7 +162,7 @@ async fn a_request_refused_for_its_media_leaves_one_event_with_the_code_and_the_
     assert_eq!(refusal["severity_text"], "WARN", "{refusal}");
 
     // A refusal that is no budget names its code alone.
-    let response = app.oneshot(images_request(&[&data_uri(&png(201, 1))])).await.unwrap();
+    let response = app.clone().oneshot(images_request(&[&data_uri(&png(201, 1))])).await.unwrap();
     assert_eq!(response.status().as_u16(), 400);
     let events = logged(&sink, "ignis.media.refused", 2).await;
     let refused: Vec<&Value> = events.iter().filter(|e| e["event_name"] == "ignis.media.refused").collect();
@@ -156,4 +170,24 @@ async fn a_request_refused_for_its_media_leaves_one_event_with_the_code_and_the_
     assert_eq!((invalid["code"].clone(), invalid["part"].clone()), (json!("invalid_media"), json!("message 0 content part 1")), "{invalid}");
     assert!(invalid.get("budget").is_none() && invalid.get("limit").is_none(), "{invalid}");
     assert!(events.iter().all(|e| !e["event_name"].as_str().unwrap().starts_with("ignis.request.")), "never admitted");
+
+    // A media refusal answered before the acquisition leaves the same event:
+    // an image in a system message, and an image sent to a load without
+    // vision.
+    let image = json!({"type": "image_url", "image_url": {"url": data_uri(&png(64, 64))}});
+    let in_system = json!({"model": MODEL, "max_tokens": 4, "messages": [
+        {"role": "system", "content": [image.clone()]}, {"role": "user", "content": "hi"},
+    ]});
+    let response = app.oneshot(chat_request(in_system)).await.unwrap();
+    assert_eq!(response.status().as_u16(), 400);
+    let without_vision = json!({"model": MODEL, "max_tokens": 4, "messages": [{"role": "user", "content": [image]}]});
+    let response = app_over(None).oneshot(chat_request(without_vision)).await.unwrap();
+    assert_eq!(response.status().as_u16(), 400);
+    let events = logged(&sink, "ignis.media.refused", 4).await;
+    let codes: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["event_name"] == "ignis.media.refused")
+        .map(|e| &e["attributes"]["code"])
+        .collect();
+    assert_eq!(codes, [&json!("media_budget_exceeded"), &json!("invalid_media"), &json!("invalid_media"), &json!("vision_disabled")]);
 }
