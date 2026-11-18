@@ -363,11 +363,15 @@ P1-14 (GitHub #50) adds the GDN family:
   forms. GitHub #507 (spec #503, ADR 0031 option (b)): the GDN prefill body's
   call left it for `kernel/src/gdn_conv_split.cu`, an adapted op of its
   prefill pair form that writes the query, key and value planes split, so the
-  three strided copies that split this op's single plane are gone. The files
-  stay here unpatched: the decode round's body still runs the snapshot form,
-  and the plain op is the oracle the adapted one is held to
-  bit for bit (`kernel/tests/test_gdn_conv_split.cu`) and the test-only
-  pre-#507 body (`kernel/src/layer_internal.h`).
+  three strided copies that split this op's single plane are gone. GitHub
+  #680 (spec #672): the decode round's copy-free body past one lane left its
+  snapshot form for the same file's `split_conv_slots`, an adapted op of its
+  batched snapshot form at one column that writes the three planes by lane
+  slot. The files stay here unpatched: the eager step, the width-1 decode
+  round and the decode rounds that copy still run the snapshot form, and the
+  plain and snapshot ops are the oracles the adapted ones are held to bit for
+  bit (`kernel/tests/test_gdn_conv_split.cu`), the plain op also the test-only
+  pre-#507 body's (`kernel/src/layer_internal.h`).
 - **gdn_gating** — `ops/kernel/gdn_gating.cuh`, `ops/launcher/gdn_gating.{h,cu}`,
   `ops/wrapper/gdn_gating.cpp`, `ninfer/ops/gdn_gating.h`: the per-head decay
   gate `g = -exp(A_log)*softplus(a+dt_bias)` and update gate

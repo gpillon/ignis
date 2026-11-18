@@ -115,8 +115,8 @@ int32_t ignis_decode_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
     // `run_gdn_layer_graph`, kernel/src/gdn_conv_split.h). A layer change
     // keeps both: nothing may read the layer's input after its first add into
     // the residual, and nothing may write the conv's q, k and v between the
-    // conv and the recurrence. Elsewhere (main's round) each layer copies its
-    // input into `right` and adds there.
+    // conv and the recurrence. Elsewhere (the copying round of earlier
+    // releases) each layer copies its input into `right` and adds there.
     const bool in_place = ignis::decode_graph_copies::takes(model->decode_copy_free_widths, width);
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
       void *out = in_place ? left.data : right.data;
@@ -247,8 +247,8 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
     // decode round does (above), so no layer copies the residual and the
     // buffers never swap; `left` is each layer's output where the feature
     // taps below read it either way. The GDN record body writes q, k and v
-    // apart already. Elsewhere (main's round) each layer copies its input
-    // into `right` and adds there.
+    // apart already. Elsewhere (the copying round of earlier releases) each
+    // layer copies its input into `right` and adds there.
     const bool in_place = model->verify_copy_free;
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
       void *out = in_place ? left.data : right.data;

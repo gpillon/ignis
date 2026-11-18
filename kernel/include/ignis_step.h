@@ -580,7 +580,8 @@ struct ignis_program_stats {
  * verify rounds run copy-free from then on, replayed or eager
  * (kernel/src/decode_graph_copies.h): on a card of compute capability 12
  * every width and the verify round unless the switch is `1`, the width-1
- * round alone under `wide`; main's copying rounds on every other card.
+ * round alone under `wide`; the copying rounds of earlier releases on
+ * every other card.
  * Flash-Next's graphs are its own.
  *
  * GitHub #676: each call also reads IGNIS_DEFER_VERIFY (`0` or `1`, unset

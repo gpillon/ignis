@@ -455,8 +455,8 @@ add_test(NAME ignis_kernel_hq_decode_attention_route_test COMMAND ignis_kernel_h
 # GitHub #677, #680 (spec #672): OURS -- which decode and verify rounds of the
 # 27B run copy-free (kernel/src/decode_graph_copies.h): on a card of compute
 # capability 12 every width and the verify round unless
-# IGNIS_DECODE_GRAPH_COPIES=1, the width-1 round alone under `wide`, main's on
-# every other card, a bad value refused by name. Host-only.
+# IGNIS_DECODE_GRAPH_COPIES=1, the width-1 round alone under `wide`, the copying
+# rounds on every other card, a bad value refused by name. Host-only.
 add_executable(ignis_kernel_decode_graph_copies_test test_decode_graph_copies.cpp)
 target_include_directories(ignis_kernel_decode_graph_copies_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_decode_graph_copies_test PRIVATE ignis_kernel ignis_vendor)

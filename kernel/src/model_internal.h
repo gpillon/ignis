@@ -803,7 +803,8 @@ struct ignis_model {
   // bit w-1 (kernel/src/decode_graph_copies.h), as the latest
   // `ignis_decode_graph_capture` decided them from the card and
   // IGNIS_DECODE_GRAPH_COPIES; every round after it reads them, replayed or
-  // eager. None before a load's first capture: a round then runs main's.
+  // eager. None before a load's first capture: a round then copies, as the
+  // round of earlier releases does.
   uint32_t decode_copy_free_widths = 0;
   // GitHub #680: whether the verify round's traversal runs copy-free at every
   // width, decided at the same capture by the same rule; false before it.

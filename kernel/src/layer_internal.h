@@ -193,7 +193,7 @@ int32_t ignis_gdn_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, igni
 // from any lane's actual position. Returns 0 on success, -1 on a
 // kernel/copy error (see ignis_gqa_layer_last_error). GitHub #677, #680: the
 // same pointer as `in_residual` and `out_residual` asks for the copy-free form
-// (kernel/src/decode_graph_copies.h), main's bytes with no copy: the layer
+// (kernel/src/decode_graph_copies.h), the copying form's bytes with no copy: the layer
 // adds into its input in place, and the GDN body below reads q, k and v as
 // views of its conv plane at one lane and as the planes its split conv
 // writes by lane slot past one.
