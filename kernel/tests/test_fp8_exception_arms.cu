@@ -14,6 +14,9 @@
 //   space  each AllowA8 call runs in an arena of exactly the capacity the workspace query
 //          reports; A16Only reports none.
 //   refusals  AllowA4, a short payload, a wrong shape.
+//   paired (GitHub #678) the form qkgv's GEMV calls take, as the measurement switch
+//          IGNIS_FP8_GEMV_PAIRED names it at each call: unset or `1` the grouped GEMV's paired form,
+//          `0` its one-row form, any other value refused by name; out never takes the paired form.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
@@ -34,8 +37,19 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace moe_test;
 namespace fe = ignis::fp8_exception;
@@ -316,6 +330,74 @@ void out_arms() {
   check(refused, "out: a wrong shape refused");
 }
 
+// Sets (or, with null, removes) a variable in the operating system's environment, as a host
+// process's own runtime does (Rust's std::env::set_var).
+void set_environment(const char *name, const char *value) {
+#ifdef _WIN32
+  SetEnvironmentVariableA(name, value);
+#else
+  if (value != nullptr) {
+    setenv(name, value, 1);
+  } else {
+    unsetenv(name);
+  }
+#endif
+}
+
+// GitHub #678: which form qkgv's GEMV calls run, by the paired form's launch counter, on zeroed
+// weights (test_fp8_linear holds the two forms' bytes to each other): one paired launch a call at 1
+// and 8 tokens under either policy unless IGNIS_FP8_GEMV_PAIRED=0, none past 8 tokens, none for out.
+void paired_arms() {
+  constexpr const char *kSwitch = "IGNIS_FP8_GEMV_PAIRED";
+  const fe::QkgvLayout layout = fe::qkgv_layout();
+  DeviceBytes qkgv(layout.at[fe::kQkgvSegments]), out(ignis_fp8_payload_bytes(kHidden, kOutCols));
+  MOE_CUDA(cudaMemset(qkgv.p, 0, qkgv.bytes));
+  MOE_CUDA(cudaMemset(out.p, 0, out.bytes));
+  const ninfer::Weight wq = fp8_weight(qkgv.p, fe::kQkgvRows, kHidden, qkgv.bytes);
+  const ninfer::Weight wo = fp8_weight(out.p, kHidden, kOutCols, out.bytes);
+  const std::vector<uint16_t> x = activations(4990, 9, kOutCols);
+  DeviceBytes dx(x.size() * 2), dr(9 * kHidden * 2);
+  upload(dx, x);
+  const char *const values[3] = {nullptr, "1", "0"};
+  for (const char *value : values) {
+    set_environment(kSwitch, value);
+    const bool paired = value == nullptr || std::strcmp(value, "1") == 0;
+    const std::string named = std::string(kSwitch) + (value == nullptr ? " unset" : std::string("=") + value);
+    for (int tokens : {1, 8, 9}) {
+      for (LinearPolicy policy : {LinearPolicy::A16Only, LinearPolicy::AllowA8}) {
+        Qkgv o(tokens);
+        const uint64_t before = ignis_fp8_linear_paired_launches();
+        run_qkgv(wq, dx, tokens, o, policy);
+        const uint64_t launches = ignis_fp8_linear_paired_launches() - before;
+        const uint64_t want = paired && tokens <= fe::kGemvTokens ? 1 : 0;
+        std::printf("  paired %s: qkgv %s x %d tokens, %llu paired launch(es)\n", named.c_str(),
+                    policy == LinearPolicy::A16Only ? "A16" : "A8", tokens, static_cast<unsigned long long>(launches));
+        check(launches == want, named + ": qkgv x " + std::to_string(tokens) + " runs the " +
+                                    (want == 1 ? "paired" : "one-row or tensor-core") + " form");
+      }
+    }
+    const uint64_t before = ignis_fp8_linear_paired_launches();
+    const std::size_t capacity = ninfer::ops::linear_add_workspace_capacity_bytes(
+        ninfer::QType::FP8_E4M3FN_ROW_BF16S, kHidden, kOutCols, LinearPolicy::A16Only, 1, 1);
+    ninfer::DeviceArena arena(capacity > 0 ? capacity : 256);
+    const ninfer::Tensor tx(dx.p, ninfer::DType::BF16, {kOutCols, 1});
+    ninfer::Tensor tr(dr.p, ninfer::DType::BF16, {kHidden, 1});
+    ninfer::ops::linear_add(tx, wo, tr, LinearPolicy::A16Only, arena, nullptr);
+    MOE_CUDA(cudaDeviceSynchronize());
+    check(ignis_fp8_linear_paired_launches() == before, named + ": out x 1 keeps the one-row form");
+  }
+  set_environment(kSwitch, "2");
+  bool refused = false;
+  try {
+    Qkgv o(1);
+    run_qkgv(wq, dx, 1, o, LinearPolicy::A16Only);
+  } catch (const std::invalid_argument &e) {
+    refused = std::string(e.what()).find(kSwitch) != std::string::npos;
+  }
+  check(refused, std::string(kSwitch) + "=2 refused by name");
+  set_environment(kSwitch, nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -329,6 +411,7 @@ int main() {
   std::printf("FP8 arms of the 27B's BF16 exception matrices (GitHub #341)\n");
   qkgv_arms();
   out_arms();
+  paired_arms();
   if (g_failed != 0) {
     std::fprintf(stderr, "test_fp8_exception_arms: %d failure(s)\n", g_failed);
     return 1;
