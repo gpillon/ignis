@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 amended-by: [ADR-0102]
 ---
 
