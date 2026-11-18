@@ -188,6 +188,16 @@ the other. They are no configuration fields: `GET /v1/config` and
   at each capture of the decode graphs, once per load; any other value
   refuses the load, naming the variable. `ignis.runtime.decode_graph_capture`'s
   `decode_nodes` and `verify_nodes` show which round each width captured.
+- `IGNIS_FP8_GEMV_PAIRED=0` (from 0.11.0) gives the 27B's grouped q, k, gate
+  and v exception projection under `fp8` exception weights its one-row GEMV
+  back, one output row a warp, the comparison a speed measurement of the
+  paired GEMV needs. Unset, or `1`, a call of 1 to 8 tokens runs the paired
+  GEMV, two output rows a warp, whose outputs are the one-row GEMV's byte for
+  byte (`ignis_kernel_fp8_linear_test`). The residual-add exception product
+  keeps the one-row GEMV either way, as do Flash-Next's FP8 projections, and a
+  `bf16` load runs neither. It is read at each call, so a decode graph keeps
+  the form its capture read; any other value refuses the load, naming the
+  variable.
 
 ### The round identity test
 

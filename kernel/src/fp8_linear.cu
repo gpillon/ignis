@@ -9,6 +9,9 @@
 //
 //   GEMV route, 1..8 tokens: one warp per output row, each lane streaming 16 codes at a time
 //            and accumulating every token in registers in a fixed order, then a fixed butterfly.
+//            Its grouped call's paired form (GitHub #678, ignis_fp8_linear_grouped_paired; up to
+//            6144 columns): two rows a warp, every code load of a batch issued before its first
+//            FMA, each output in the same order and so the same bits (fp8_gemv_rows.cuh).
 //   MMA route, more tokens: 128 x 128 tiles on BF16 tensor cores (m16n8k16, fp32 accumulate),
 //            the codes widened to BF16 exactly in registers; a three-stage cp.async pipeline.
 //
@@ -18,6 +21,7 @@
 // Both routes are deterministic: no atomics, fixed summation order per output.
 
 #include "ignis_fp8_linear.h"
+#include "fp8_gemv_rows.cuh"
 #include "moe_common.cuh"
 
 #include <cuda_bf16.h>
@@ -169,6 +173,87 @@ __global__ void fp8_gemv_grouped_kernel(const __nv_bfloat16 *__restrict__ x, int
   float a0[kGemvMaxTokens];
   gemv_row(s.w[i].codes + static_cast<size_t>(r) * cols, x, tokens, cols, a0);
   store_scaled(a0, __bfloat162float(s.w[i].scales[r]), s.y[i], rows, r, tokens, y_f32);
+}
+
+// ---- the grouped GEMV's paired form (GitHub #678) ----------------------------------------------
+//
+// Two output rows a warp and two warps a CTA, the rows summed by fp8_gemv_rows.cuh: the code
+// vectors of the warp's rows loaded a batch at a time, all of a batch before its first FMA, each
+// activation vector loaded once for both rows, the token count fixed at compile time, the segment
+// table read from the grid constants (fp8_gemv_grouped_kernel copies its table to local memory).
+// gemv_row's order for every output, so fp8_gemv_grouped_kernel's bits: test_fp8_linear holds the
+// two to each other. A lane sums at most kPairChunks 16-code chunks of a row, so the form takes up
+// to kPairChunks * 512 columns: the bound the 27B's 5120 were measured at.
+constexpr int kPairRows = 2;
+constexpr int kPairWarps = 2;
+constexpr int kPairChunks = 12;
+constexpr uint32_t kPairMaxCols = kPairChunks * 512;
+
+template <int TOK>
+__global__ void __launch_bounds__(kPairWarps * 32) fp8_gemv_paired_kernel(const __nv_bfloat16 *__restrict__ x, int cols,
+                                                                         const __grid_constant__ Segments s, int y_f32) {
+  namespace fr = ignis::fp8_rows;
+  const int lane = threadIdx.x & 31;
+  const int row = (blockIdx.x * kPairWarps + (threadIdx.x >> 5)) * kPairRows;
+  if (row >= s.first[s.count]) return;
+  // The rows' segment, by constant indices only (kPairRows divides every segment's rows).
+  Fp8Weight w = s.w[0];
+  void *y = s.y[0];
+  int first = 0, rows = s.first[1];
+#pragma unroll
+  for (int j = 1; j < IGNIS_FP8_MAX_SEGMENTS; ++j) {
+    if (j < s.count && row >= s.first[j]) {
+      w = s.w[j];
+      y = s.y[j];
+      first = s.first[j];
+      rows = s.first[j + 1] - s.first[j];
+    }
+  }
+  const int r0 = row - first;
+  constexpr int kBatch = fr::batch_chunks(kPairRows, kPairChunks);
+  const uint8_t *rows_at[kPairRows];
+#pragma unroll
+  for (int i = 0; i < kPairRows; ++i) rows_at[i] = w.codes + static_cast<size_t>(r0 + i) * cols;
+  float acc[kPairRows][TOK];
+  fr::start(acc);
+#pragma unroll
+  for (int j0 = 0; j0 < kPairChunks; j0 += kBatch) {
+    uint4 codes[kPairRows][kBatch];
+    fr::load_batch(rows_at, cols, lane, j0, codes);
+    fr::hold();
+    fr::accumulate<true>(codes, x, cols, lane, j0, acc);
+  }
+  fr::finish(acc);
+  // Lane l stores row l / TOK's sum against token l % TOK, scaled and rounded as store_scaled does.
+  if (lane >= kPairRows * TOK) return;
+  const int r = r0 + lane / TOK;
+  const int t = lane % TOK;
+  const float v = fr::pick(acc, lane) * __bfloat162float(w.scales[r]);
+  const size_t at = static_cast<size_t>(t) * rows + r;
+  if (y_f32) {
+    static_cast<float *>(y)[at] = v;
+  } else {
+    static_cast<__nv_bfloat16 *>(y)[at] = __float2bfloat16_rn(v);
+  }
+}
+
+std::atomic<uint64_t> g_paired_launches{0};
+
+void launch_paired(int tokens, cudaStream_t st, const __nv_bfloat16 *x, int cols, const Segments &s, int y_f32) {
+  const int warps = s.first[s.count] / kPairRows;
+  const unsigned ctas = static_cast<unsigned>((warps + kPairWarps - 1) / kPairWarps);
+  const unsigned threads = kPairWarps * 32;
+  switch (tokens) {
+  case 1: fp8_gemv_paired_kernel<1><<<ctas, threads, 0, st>>>(x, cols, s, y_f32); break;
+  case 2: fp8_gemv_paired_kernel<2><<<ctas, threads, 0, st>>>(x, cols, s, y_f32); break;
+  case 3: fp8_gemv_paired_kernel<3><<<ctas, threads, 0, st>>>(x, cols, s, y_f32); break;
+  case 4: fp8_gemv_paired_kernel<4><<<ctas, threads, 0, st>>>(x, cols, s, y_f32); break;
+  case 5: fp8_gemv_paired_kernel<5><<<ctas, threads, 0, st>>>(x, cols, s, y_f32); break;
+  case 6: fp8_gemv_paired_kernel<6><<<ctas, threads, 0, st>>>(x, cols, s, y_f32); break;
+  case 7: fp8_gemv_paired_kernel<7><<<ctas, threads, 0, st>>>(x, cols, s, y_f32); break;
+  default: fp8_gemv_paired_kernel<8><<<ctas, threads, 0, st>>>(x, cols, s, y_f32); break;
+  }
+  g_paired_launches.fetch_add(1, std::memory_order_relaxed);
 }
 
 // ---- MMA route ------------------------------------------------------------------------------
@@ -437,6 +522,36 @@ int32_t validate(const char *op, uint32_t rows, uint32_t cols, uint32_t tokens, 
   return 0;
 }
 
+// The grouped calls' checks and their segment table `s` (GitHub #306), for `op`.
+int32_t grouped_segments(const char *op, const ignis_fp8_segment *segments, uint32_t count, uint32_t cols,
+                         const void *x, uint32_t tokens, Segments &s) {
+  if (segments == nullptr || x == nullptr) return fail(std::string(op) + ": NULL pointer");
+  if (count == 0 || count > IGNIS_FP8_MAX_SEGMENTS) {
+    return fail(std::string(op) + ": 1.." + std::to_string(IGNIS_FP8_MAX_SEGMENTS) + " segments");
+  }
+  if (tokens == 0 || tokens > static_cast<uint32_t>(kGemvMaxTokens)) {
+    return fail(std::string(op) + ": the GEMV route's 1.." + std::to_string(kGemvMaxTokens) + " tokens");
+  }
+  if (reinterpret_cast<uintptr_t>(x) & 15) return fail(std::string(op) + ": x must be 16-byte aligned");
+  s = Segments{};
+  s.count = static_cast<int>(count);
+  uint32_t total = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    const ignis_fp8_segment &seg = segments[i];
+    if (seg.weight == nullptr || seg.y == nullptr) return fail(std::string(op) + ": NULL pointer");
+    if (validate(op, seg.rows, cols, tokens, seg.y) != 0) return -1;
+    if (reinterpret_cast<uintptr_t>(seg.weight) & 15) {
+      return fail(std::string(op) + ": every weight must be 16-byte aligned");
+    }
+    s.w[i] = fp8_weight(seg.weight, seg.rows, cols);
+    s.y[i] = seg.y;
+    s.first[i] = static_cast<int>(total);
+    total += seg.rows;
+  }
+  s.first[count] = static_cast<int>(total);
+  return require_fp8_prepared(op);
+}
+
 }  // namespace
 }  // namespace ignis_moe
 
@@ -474,37 +589,28 @@ extern "C" int32_t ignis_fp8_linear(const void *weight, uint32_t rows, uint32_t 
 
 extern "C" int32_t ignis_fp8_linear_grouped(const ignis_fp8_segment *segments, uint32_t count, uint32_t cols,
                                             const void *x, uint32_t tokens, uint32_t y_f32, void *stream) {
-  if (segments == nullptr || x == nullptr) return fail("ignis_fp8_linear_grouped: NULL pointer");
-  if (count == 0 || count > IGNIS_FP8_MAX_SEGMENTS) {
-    return fail("ignis_fp8_linear_grouped: 1.." + std::to_string(IGNIS_FP8_MAX_SEGMENTS) + " segments");
-  }
-  if (tokens == 0 || tokens > static_cast<uint32_t>(kGemvMaxTokens)) {
-    return fail("ignis_fp8_linear_grouped: the GEMV route's 1.." + std::to_string(kGemvMaxTokens) + " tokens");
-  }
-  if (reinterpret_cast<uintptr_t>(x) & 15) return fail("ignis_fp8_linear_grouped: x must be 16-byte aligned");
   Segments s{};
-  s.count = static_cast<int>(count);
-  uint32_t total = 0;
-  for (uint32_t i = 0; i < count; ++i) {
-    const ignis_fp8_segment &seg = segments[i];
-    if (seg.weight == nullptr || seg.y == nullptr) return fail("ignis_fp8_linear_grouped: NULL pointer");
-    if (validate("ignis_fp8_linear_grouped", seg.rows, cols, tokens, seg.y) != 0) return -1;
-    if (reinterpret_cast<uintptr_t>(seg.weight) & 15) {
-      return fail("ignis_fp8_linear_grouped: every weight must be 16-byte aligned");
-    }
-    s.w[i] = fp8_weight(seg.weight, seg.rows, cols);
-    s.y[i] = seg.y;
-    s.first[i] = static_cast<int>(total);
-    total += seg.rows;
-  }
-  s.first[count] = static_cast<int>(total);
-  if (require_fp8_prepared("ignis_fp8_linear_grouped") != 0) return -1;
+  if (grouped_segments("ignis_fp8_linear_grouped", segments, count, cols, x, tokens, s) != 0) return -1;
+  const int total = s.first[s.count];
   const int warps = 8;
   fp8_gemv_grouped_kernel<<<(total + warps - 1) / warps, warps * 32, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const __nv_bfloat16 *>(x), static_cast<int>(tokens), static_cast<int>(cols), s,
       y_f32 != 0 ? 1 : 0);
   return check_launch("ignis_fp8_linear_grouped");
 }
+
+extern "C" int32_t ignis_fp8_linear_grouped_paired(const ignis_fp8_segment *segments, uint32_t count, uint32_t cols,
+                                                   const void *x, uint32_t tokens, uint32_t y_f32, void *stream) {
+  const char *op = "ignis_fp8_linear_grouped_paired";
+  if (cols > kPairMaxCols) return fail(std::string(op) + ": at most " + std::to_string(kPairMaxCols) + " columns");
+  Segments s{};
+  if (grouped_segments(op, segments, count, cols, x, tokens, s) != 0) return -1;
+  launch_paired(static_cast<int>(tokens), static_cast<cudaStream_t>(stream), static_cast<const __nv_bfloat16 *>(x),
+                static_cast<int>(cols), s, y_f32 != 0 ? 1 : 0);
+  return check_launch(op);
+}
+
+extern "C" uint64_t ignis_fp8_linear_paired_launches(void) { return g_paired_launches.load(std::memory_order_relaxed); }
 
 extern "C" int32_t ignis_fp8_linear_add(const void *weight, uint32_t rows, uint32_t cols, const void *x,
                                         uint32_t tokens, void *residual, void *stream) {
