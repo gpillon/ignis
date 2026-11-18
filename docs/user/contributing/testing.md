@@ -155,6 +155,41 @@ the other. They are no configuration fields: `GET /v1/config` and
   `ktile`, `token`, or `none` where its prefill runs no such product: the
   trellis artifacts, Flash-Next, an RTX 30 or RTX 40 card, a prefill chunk
   below 1,024 tokens). Any other value refuses the load, naming the variable.
+- `IGNIS_ROUND_TIMING=1` (from 0.11.0) picks no route: it times each decode
+  and verify round of the 27B that replays its graph, on the GPU's clock and
+  with no tracer, by an event recorded on the stream just before the round's
+  graph and one just after it. Every 256 rounds of a kind, the server's
+  standard error (`.scratch/serve/ignis-server.log.err` under `make start`)
+  gets one line, `ignis leaf: round timing plain n 256: period median … us
+  mean …, span median …, gap median …` (`verify` for the verify rounds): the
+  period from one round's start to the next one's, the graph's span, and the
+  gap from its end to the next round's start, two rounds that begin 50 ms or
+  more apart left out (a request or a prefill between them). This is where a
+  change to the round is read: under Nsight Systems each graph launch costs
+  ~400 us more on the RTX 5090's host, so a launch read off a trace is the
+  tracer's. It is read at each capture of the decode graphs, once per load;
+  unset, or `0`, nothing is timed and the rounds pay nothing. Any other value
+  refuses the load, naming the variable. Flash-Next's rounds are never timed.
+
+### The round identity test
+
+`crates/core/tests/round_identity_gpu.rs` holds two arms of the 27B's decode
+round, chosen by measurement switches, to the same committed tokens: at every
+width the load serves and at its draft window, with greedy and sampled lanes,
+on the NVFP4 artifact with DFlash2, with its MTP head and with vision, and on
+the 16 GB and 12 GB classes' trellis artifacts, each under the exception
+weights it has. Each arm is held to the graphs' replay with every switch
+unset; a change behind a switch of its own adds that switch as an arm, as the
+file says. The whole run materializes eight loads in turn, so a narrow one is
+the usual run:
+
+```sh
+IGNIS_ROUND_IDENTITY_LOADS=nvfp4-dflash2 IGNIS_ROUND_IDENTITY_WEIGHTS=bf16 \
+  cargo test -p ignis-core --features cuda --test round_identity_gpu -- --ignored --nocapture
+```
+
+`IGNIS_ROUND_IDENTITY_ARMS` names the arms the same way. Unset, each of the
+three is everything.
 
 ## The speech executor's CPU legs
 

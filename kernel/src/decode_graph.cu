@@ -31,6 +31,8 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 
+#include "process_environment.h"
+
 #include "core/arena.h"
 #include "core/tensor.h"
 
@@ -443,6 +445,48 @@ int32_t capture_decode_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
   return 0;
 }
 
+// A width's graph from an earlier capture of the same load, gone before the width captures again
+// (GitHub #674: a measurement switch read at capture, flipped in one process).
+void release_graph(cudaGraphExec_t &exec, bool &ready, uint32_t &nodes) {
+  if (exec != nullptr) {
+    cudaGraphExecDestroy(exec);
+    exec = nullptr;
+  }
+  ready = false;
+  nodes = 0;
+}
+
+// GitHub #674: the round timing's switch (kernel/src/step.cu), read at each capture: its events
+// are made the first time it is on, and every capture starts its blocks afresh. False (error set)
+// on a value other than `0` or `1`, or when CUDA cannot make the events.
+bool read_round_timing(ignis_model *model) {
+  try {
+    model->round_timing = ignis::named_switch("IGNIS_ROUND_TIMING", false, {{"0", false}, {"1", true}});
+  } catch (const std::invalid_argument &e) {
+    set_error(std::string("ignis_decode_graph_capture: ") + e.what());
+    return false;
+  }
+  for (RoundTiming *timing : {&model->plain_timing, &model->verify_timing}) {
+    timing->recorded = 0;
+    timing->collected = 0;
+    timing->period.clear();
+    timing->span.clear();
+    timing->gap.clear();
+    for (std::uint64_t i = 0; model->round_timing && i < RoundTiming::kRing; ++i) {
+      for (cudaEvent_t *event : {&timing->pre[i], &timing->post[i]}) {
+        const cudaError_t err = *event == nullptr ? cudaEventCreate(event) : cudaSuccess;
+        if (err != cudaSuccess) {
+          set_error(std::string("ignis_decode_graph_capture: IGNIS_ROUND_TIMING: cudaEventCreate failed: ") +
+                    cudaGetErrorString(err));
+          model->round_timing = false;
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct ignis_seq_pool *pool,
@@ -476,8 +520,28 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
     }
     return rc;
   }
+  if (!read_round_timing(model)) {
+    return -1;
+  }
   const auto began = std::chrono::steady_clock::now();
   uint32_t ready_mask = 0;
+  // GitHub #674: a capture again on the same load (a measurement switch
+  // read at capture, flipped) replaces the graphs it captured before, once
+  // no round of theirs is still on the stream.
+  const cudaError_t synced = cudaStreamSynchronize(model->stream);
+  if (synced != cudaSuccess) {
+    set_error(std::string("ignis_decode_graph_capture: cudaStreamSynchronize failed: ") +
+              cudaGetErrorString(synced));
+    return -1;
+  }
+  for (uint32_t width = 1; width <= IGNIS_DECODE_MAX_BATCH; ++width) {
+    release_graph(model->decode_graph_exec[width - 1], model->decode_graph_ready[width - 1],
+                  model->decode_graph_nodes[width - 1]);
+    if (model->verify != nullptr) {
+      release_graph(model->verify->graph_exec[width - 1], model->verify->graph_ready[width - 1],
+                    model->verify->graph_nodes[width - 1]);
+    }
+  }
   // GitHub #336: the widths the load's lanes serve, and no wider: a round
   // past them is refused, so a graph for it would only hold memory.
   for (uint32_t width = 1; width <= model->decode_lanes; ++width) {

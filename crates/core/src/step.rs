@@ -499,13 +499,19 @@ pub fn last_decode_graph_error() -> String {
 }
 
 /// Captures one CUDA graph per exact decode batch width 1..=8 (P3-05,
-/// GitHub #102, ADR 0019). Call once, after `pool` is created and before any
+/// GitHub #102, ADR 0019). Call after `pool` is created and before any
 /// concurrent [`decode_program_batch`] / [`decode_program_batch_sampled`]
 /// call -- capture is not thread-safe with replay. Every width is attempted
-/// independently: this call always returns `Ok` (the leaf never fails model
-/// availability over a capture failure), and [`DecodeGraphCapture::ready_mask`]
+/// independently: a capture failure never fails this call (the leaf never
+/// fails model availability over one), and [`DecodeGraphCapture::ready_mask`]
 /// reports which widths actually got a graph -- a width whose bit is clear
 /// always runs the eager per-lane loop, exactly as it did before this call.
+/// The one `Err` is a measurement switch read at capture with a value it
+/// does not know (`IGNIS_ROUND_TIMING`, GitHub #674), named in the message.
+///
+/// Called again on the same load and pool, it replaces every graph the
+/// earlier call captured: how a test flips such a switch in one process
+/// (`crates/core/tests/round_identity_gpu.rs`).
 pub fn capture_decode_graphs(model: &Model, pool: &SeqPool) -> Result<DecodeGraphCapture, String> {
     let mut capture_micros: u64 = 0;
     let mut ready_mask: u32 = 0;
@@ -518,7 +524,8 @@ pub fn capture_decode_graphs(model: &Model, pool: &SeqPool) -> Result<DecodeGrap
         )
     };
     if rc != 0 {
-        return Err(last_error());
+        // The capture's own channel, where the leaf says why it refused.
+        return Err(last_decode_graph_error());
     }
     Ok(DecodeGraphCapture {
         capture_micros,

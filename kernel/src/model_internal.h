@@ -523,6 +523,23 @@ struct IgnisVerifyRound {
   }
 };
 
+// GitHub #674: one kind of round's timing under the measurement switch IGNIS_ROUND_TIMING
+// (kernel/src/step.cu): an event recorded on the model's stream just before each replayed round's
+// graph and one just after it, on the GPU's clock. A ring of them, so a round is read once its own
+// events have completed, without waiting on the stream.
+struct RoundTiming {
+  static constexpr std::uint64_t kRing = 16;
+  std::array<cudaEvent_t, kRing> pre{};
+  std::array<cudaEvent_t, kRing> post{};
+  // Rounds whose two events were recorded, and rounds read so far.
+  std::uint64_t recorded = 0;
+  std::uint64_t collected = 0;
+  // The current block's samples, in us.
+  std::vector<float> period;
+  std::vector<float> span;
+  std::vector<float> gap;
+};
+
 // The opaque loaded-model handle (never dereferenced across the boundary).
 struct ignis_model {
   ninfer::Weight token_embedding;
@@ -721,6 +738,12 @@ struct ignis_model {
   // graph, 0 if it ran the eager loop (`ignis_program_stats`'s
   // `graph_launches`).
   uint64_t last_step_graph_launches = 0;
+  // GitHub #674: IGNIS_ROUND_TIMING as the latest `ignis_decode_graph_capture` read it, and the
+  // plain and verify rounds' timings it turns on. Their events are made by the first capture that
+  // turns it on and destroyed with the model.
+  bool round_timing = false;
+  RoundTiming plain_timing;
+  RoundTiming verify_timing;
 
   // P5-02 (GitHub #150): speculation, chosen at load. Under
   // IGNIS_SPECULATIVE_DFLASH2, `dflash2` is bound and the prefill scratch

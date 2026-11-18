@@ -2977,6 +2977,16 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
         }
       }
     }
+    // GitHub #674: the round timing's events, made by a capture under IGNIS_ROUND_TIMING=1.
+    for (RoundTiming *timing : {&model->plain_timing, &model->verify_timing}) {
+      for (std::uint64_t i = 0; i < RoundTiming::kRing; ++i) {
+        for (cudaEvent_t event : {timing->pre[i], timing->post[i]}) {
+          if (event != nullptr) {
+            cudaEventDestroy(event);
+          }
+        }
+      }
+    }
     // GitHub #650: the descriptor slots stop serving the stream before it goes away.
     model->tma_descriptors.reset();
     // GitHub #652: and the stream's layout is no longer named, so a stream created at its address

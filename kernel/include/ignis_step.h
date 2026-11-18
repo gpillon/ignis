@@ -523,8 +523,8 @@ struct ignis_program_stats {
 
 /* Captures one CUDA graph per exact decode batch width 1..the load's decode
  * lanes (P3-05, GitHub #102, ADR 0019; GitHub #336: IGNIS_DECODE_MAX_BATCH
- * unless the load asked for fewer). Must be called once, after `pool` is
- * created and before any concurrent `ignis_program_decode` call -- capture
+ * unless the load asked for fewer). Called after `pool` is created and
+ * before any concurrent `ignis_program_decode` call -- capture
  * is not thread-safe with replay. Every width is attempted independently: a
  * capture failure for one width is logged (see ignis_step_last_error for the
  * last one) and leaves that width's bit clear in `*out_ready_mask`, but does
@@ -534,15 +534,23 @@ struct ignis_program_stats {
  * `*out_capture_micros`, if non-null, receives the wall-clock cost of this
  * call (every width's capture, sequentially) so the startup cost is
  * measured and reported, not assumed. Returns 0 unless `model` or `pool` is
- * null (in which case no width is attempted and `*out_ready_mask` is left
- * unset).
+ * null, or the measurement switch IGNIS_ROUND_TIMING names a value other
+ * than `0` or `1` (in which case no width is attempted, `*out_ready_mask`
+ * is left unset and ignis_decode_graph_last_error says why).
  *
  * P5-04 (GitHub #153): on a load with a draft window this call also
  * captures one *verify* graph per exact width at that window, after the
  * decode graphs; a verify capture failure degrades that width to the eager
  * verify traversal, never refuses service, and is reported through
  * `ignis_program_stats::verify_graph_ready_mask` (the `*out_ready_mask` here
- * stays the decode graphs' own). */
+ * stays the decode graphs' own).
+ *
+ * GitHub #674: called again on the same load, with the same pool (a test
+ * that flips a measurement switch read at capture), it destroys every graph
+ * the earlier call captured and captures each width afresh. Each call reads
+ * IGNIS_ROUND_TIMING: under `1` every replayed decode and verify round of
+ * the 27B is timed on the GPU's clock (kernel/src/step.cu); Flash-Next's
+ * rounds never are. */
 int32_t ignis_decode_graph_capture(struct ignis_model *model, struct ignis_seq_pool *pool,
                                    uint64_t *out_capture_micros, uint32_t *out_ready_mask);
 

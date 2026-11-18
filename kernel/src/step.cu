@@ -68,6 +68,83 @@ void set_error(std::string message) {
   g_last_error = std::move(message);
 }
 
+// GitHub #674: the round timing, the measurement switch IGNIS_ROUND_TIMING=1 (read at each graph
+// capture, kernel/src/decode_graph.cu; off, each call below is one test of a bool). Around every
+// replayed round's graph, an event recorded on the model's stream just before the launch and one
+// just after it: the GPU's clock, with no tracer, which under Nsight Systems adds ~400 us to every
+// graph launch on the RTX 5090's host. `before` is the launch's side.
+void round_timing_mark(ignis_model *model, RoundTiming &timing, bool before) {
+  if (!model->round_timing) {
+    return;
+  }
+  const std::uint64_t at = timing.recorded % RoundTiming::kRing;
+  if (cudaEventRecord(before ? timing.pre[at] : timing.post[at], model->stream) != cudaSuccess) {
+    (void)cudaGetLastError();
+  }
+  if (!before) {
+    ++timing.recorded;
+  }
+}
+
+float round_timing_median(std::vector<float> samples) {
+  std::sort(samples.begin(), samples.end());
+  return samples.empty() ? 0.0f : samples[samples.size() / 2];
+}
+
+// Every timed round of `kind` whose events have completed, read without waiting: its span (the
+// event before its graph to the one after), and with the round of its kind before it its period
+// (event before to event before) and its gap (the earlier round's event after to this one's event
+// before), unless the two began 50 ms or more apart (a request or a prefill between them). Each
+// 256 periods, one line on stderr: their median, their mean, and the block's median span and gap.
+void round_timing_collect(ignis_model *model, RoundTiming &timing, const char *kind) {
+  if (!model->round_timing) {
+    return;
+  }
+  if (timing.recorded > timing.collected + RoundTiming::kRing) {
+    timing.collected = timing.recorded - RoundTiming::kRing;  // those rounds' events were recorded over
+  }
+  while (timing.collected < timing.recorded) {
+    const std::uint64_t round = timing.collected;
+    const std::uint64_t at = round % RoundTiming::kRing;
+    if (cudaEventQuery(timing.post[at]) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return;
+    }
+    float span = 0.0f;
+    if (cudaEventElapsedTime(&span, timing.pre[at], timing.post[at]) == cudaSuccess) {
+      timing.span.push_back(span * 1000.0f);
+    }
+    // The round before it, while its events are still its own.
+    const std::uint64_t previous = (round + RoundTiming::kRing - 1) % RoundTiming::kRing;
+    float period = 0.0f;
+    float gap = 0.0f;
+    if (round > 0 && round - 1 + RoundTiming::kRing >= timing.recorded &&
+        cudaEventElapsedTime(&period, timing.pre[previous], timing.pre[at]) == cudaSuccess &&
+        cudaEventElapsedTime(&gap, timing.post[previous], timing.pre[at]) == cudaSuccess && period < 50.0f) {
+      timing.period.push_back(period * 1000.0f);
+      timing.gap.push_back(gap * 1000.0f);
+    }
+    (void)cudaGetLastError();
+    ++timing.collected;
+    if (timing.period.size() >= 256) {
+      double mean = 0.0;
+      for (const float sample : timing.period) {
+        mean += sample;
+      }
+      mean /= static_cast<double>(timing.period.size());
+      std::fprintf(stderr,
+                   "ignis leaf: round timing %s n %zu: period median %.1f us mean %.1f, span median %.1f, gap "
+                   "median %.1f\n",
+                   kind, timing.period.size(), round_timing_median(timing.period), mean,
+                   round_timing_median(timing.span), round_timing_median(timing.gap));
+      std::fflush(stderr);
+      timing.period.clear();
+      timing.span.clear();
+      timing.gap.clear();
+    }
+  }
+}
+
 // bf16 storage -> f32: bit-exact promotion (bf16 is fp32's top 16 bits, zero
 // extended).
 float bf16_to_f32(std::uint16_t bits) {
@@ -2313,7 +2390,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     // appended some of its columns.
     uncommitted.armed = true;
     if (use_graph) {
+      round_timing_mark(model, model->verify_timing, true);
       const cudaError_t err = cudaGraphLaunch(verify.graph_exec[batch_size - 1], model->stream);
+      round_timing_mark(model, model->verify_timing, false);
       if (err != cudaSuccess) {
         set_error(std::string("ignis_program_decode: cudaGraphLaunch(verify) failed: ") +
                   cudaGetErrorString(err));
@@ -2707,6 +2786,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     }
     model->last_step_kernel_count = model->layers.size();
     model->last_step_graph_launches = use_graph ? 1 : 0;
+    round_timing_collect(model, model->verify_timing, "verify");
   } catch (const std::exception &e) {
     set_error(std::string("ignis_program_decode: ") + e.what());
     return -1;
@@ -3011,7 +3091,9 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
     }
 
     if (use_graph) {
+      round_timing_mark(model, model->plain_timing, true);
       err = cudaGraphLaunch(model->decode_graph_exec[batch_size - 1], model->stream);
+      round_timing_mark(model, model->plain_timing, false);
       if (err != cudaSuccess) {
         set_error(std::string("ignis_program_decode: cudaGraphLaunch failed: ") +
                   cudaGetErrorString(err));
@@ -3103,6 +3185,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
                 cudaGetErrorString(err));
       return -1;
     }
+    round_timing_collect(model, model->plain_timing, "plain");
 
     // GitHub #315 (ADR 0048): each lane's draw, after the anchor this round
     // fed -- a stop id drawn with the lane's reasoning block open becomes
