@@ -50,14 +50,16 @@ Flash-Next). The lines include:
   int8`, the default on an RTX 30 or RTX 40 card), the **dense prefill buffer** (`trellis_dense`): the largest matrix
   decoded to INT8, 89 MB, which every matrix of a prefill chunk is decoded into
   in turn, so it costs the KV pool about that much and no more;
-- on Windows, on the 27B's NVFP4 entries on an RTX 50 or RTX PRO card, the
-  **TMA descriptor slots** (`tma_descriptors`): 512 bytes for each of a prompt
+- from 0.11.0, on Windows, on the 27B's NVFP4 entries on an RTX 50 or RTX PRO
+  card, the **TMA descriptor slots** (`tma_descriptors`): 512 bytes for each of a prompt
   chunk's matrix products (247 on the 27B) at every chunk width from 1,024
   tokens up to the wider of `--model-prefill-chunk` and the solo width, in
   steps of 256: 0.6 MB at a 2,048-token chunk, 3.7 MB at 8,192. They keep each
   product's tensor maps on the device instead of allocating and copying them
-  before every product, so the first request after a load allocates nothing a
-  later one does not. 0 on Linux, which passes the maps by value, on every
+  before every product, as 0.10.0 does, so the first request after a load
+  allocates nothing a later one does not
+  ([ADR 0101](../../adr/0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md)).
+  0 on Linux, which passes the maps by value, on every
   other entry and card, and below a 1,024-token chunk;
 - the **lane state** of every decode lane (on the 27B, about 144 MiB per lane
   for the linear-attention layers);

@@ -335,7 +335,9 @@ enum ignis_mtp_head_linear {
  * (`split`, `fused` or `quant`; unset is `quant`) (kernel/src/prefill_swiglu.h).
  * `ignis_model_prefill_swiglu` reports it. */
 enum ignis_prefill_swiglu {
-  /* A load whose prefill runs no such product: the trellis body, Flash-Next. */
+  /* A load whose prefill runs no W4A4 TMA product, where the layout below is
+   * IGNIS_W4A4_ACTIVATION_LAYOUT_NONE: the trellis body, Flash-Next, a card
+   * below compute capability 12, a prefill chunk below 1,024 tokens. */
   IGNIS_PREFILL_SWIGLU_NONE = 0,
   /* The vendored dispatch: the product, then SiLU-mul, and at exactly 1,024
    * tokens the vendored fused kernel; what IGNIS_PREFILL_SWIGLU=split names. */
@@ -602,10 +604,11 @@ struct ignis_model_reservations {
   /* GitHub #650: on Windows, where the NVFP4 body's W4A4 TMA products take
    * their tensor maps through a pointer, the device slots that keep them: 512
    * bytes for each such product of a prefill traversal at every width the
-   * TMA route takes up to the prefill chunk (a multiple of 256 from 1,024
-   * tokens). 0 on Linux, on the trellis body, on Flash-Next, on a card below
-   * compute capability 12, below a 1,024-token chunk, and under the
-   * measurement switch IGNIS_TMA_DESCRIPTOR_CACHE=0. */
+   * TMA route takes up to `prefill_chunk_tokens`, the widest chunk the load
+   * is handed (the wider of the prefill chunk and the solo width; a multiple
+   * of 256 from 1,024 tokens). 0 on Linux, on the trellis body, on
+   * Flash-Next, on a card below compute capability 12, below a 1,024-token
+   * chunk, and under the measurement switch IGNIS_TMA_DESCRIPTOR_CACHE=0. */
   uint64_t tma_descriptor_bytes;
 };
 
@@ -761,7 +764,8 @@ uint32_t ignis_model_mtp_head_linear(const struct ignis_model *model);
 /* The route a loaded 27B's prefill runs its MLP gate and up product on, and
  * the epilogue it runs (enum ignis_prefill_swiglu; GitHub #651, #653): what
  * the load decided.
- * IGNIS_PREFILL_SWIGLU_NONE for NULL, the trellis body and Flash-Next. */
+ * IGNIS_PREFILL_SWIGLU_NONE for NULL and for a load whose prefill runs no W4A4
+ * TMA product. */
 uint32_t ignis_model_prefill_swiglu(const struct ignis_model *model);
 
 /* The layout a loaded 27B's W4A4 prefill products read their activations in

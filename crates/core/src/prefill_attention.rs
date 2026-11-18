@@ -174,7 +174,8 @@ pub enum PrefillSwiglu {
 
 impl PrefillSwiglu {
     /// `enum ignis_prefill_swiglu`: `Ok(None)` for a load whose prefill runs
-    /// no such product (0: the trellis body, Flash-Next), `Ok(Some(..))` for 1
+    /// no W4A4 TMA product (0: the trellis body, Flash-Next, a card below
+    /// compute capability 12, a chunk below 1,024 tokens), `Ok(Some(..))` for 1
     /// (split), 2 (fused) and 3 (quant), and the code back as the error for any
     /// other.
     pub const fn from_abi(code: u32) -> Result<Option<Self>, u32> {

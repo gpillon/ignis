@@ -554,12 +554,12 @@ pub fn prefill_linear_refusal(
 /// opener's page floor too, where its imaged prefix is published. Flash-Next
 /// and the 27B ride on every card and with no card read: the second cut
 /// measured 45-55 ms per request on the RTX 5090. `second_tail_cut` (the
-/// contributor's `IGNIS_SECOND_TAIL_CUT=1`, read once by
-/// [`second_tail_cut_requested`]) restores main's behaviour for a comparison:
-/// the 27B then rides on Ampere and Ada only. The image model and the
-/// diarizer capture nothing. A request whose image spans its opener's page
-/// floor lends the pages at its capture on any load (GitHub #249,
-/// `CaptureLink::ImageSpansFloor`).
+/// contributor's `IGNIS_SECOND_TAIL_CUT=1`, as a load reads it,
+/// [`second_tail_cut`]) gives the 27B on Blackwell, and with no card read,
+/// the second cut back for a comparison: it then rides on Ampere and Ada only,
+/// as before GitHub #649. The image model and the diarizer capture nothing. A
+/// request whose image spans its opener's page floor lends the pages at its
+/// capture on any load (GitHub #249, `CaptureLink::ImageSpansFloor`).
 pub fn opener_page_rides_capture(family: ModelFamily, generation: Option<GpuGeneration>, second_tail_cut: bool) -> bool {
     match family {
         ModelFamily::FlashNext => true,
@@ -568,13 +568,28 @@ pub fn opener_page_rides_capture(family: ModelFamily, generation: Option<GpuGene
     }
 }
 
-/// `IGNIS_SECOND_TAIL_CUT=1`: a contributor's measurement switch (GitHub
-/// #649) that gives the 27B on Blackwell its second tail cut back, main's
-/// behaviour before the single cut. Read once per process, where a load
-/// decides.
-pub fn second_tail_cut_requested() -> bool {
-    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *REQUESTED.get_or_init(|| std::env::var("IGNIS_SECOND_TAIL_CUT").is_ok_and(|value| value.starts_with('1')))
+/// The contributor's measurement switch that gives the 27B on Blackwell, and
+/// with no card read, its second tail cut back (GitHub #649).
+pub const SECOND_TAIL_CUT_SWITCH: &str = "IGNIS_SECOND_TAIL_CUT";
+
+/// [`SECOND_TAIL_CUT_SWITCH`] as a load reads it, `value` its value in the
+/// environment (GitHub #649): unset or empty, false, the one cut; `1`, true,
+/// the second cut back on the 27B on Blackwell and with no card read; any
+/// other value, the load's refusal naming the variable, as the leaf's own
+/// measurement switches refuse theirs.
+pub fn second_tail_cut(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None | Some("") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!("{SECOND_TAIL_CUT_SWITCH} is `1` or unset, not `{other}`")),
+    }
+}
+
+/// [`second_tail_cut`] of the process environment, which a load reads once
+/// (`load::cuda_scheduler_for`) and no shape or config does.
+pub fn second_tail_cut_for_load() -> Result<bool, String> {
+    let named = std::env::var_os(SECOND_TAIL_CUT_SWITCH);
+    second_tail_cut(named.as_deref().map(std::ffi::OsStr::to_string_lossy).as_deref())
 }
 
 /// The solo widths an `auto` load of `family` on a card of `generation`
@@ -902,9 +917,10 @@ mod tests {
 
     /// GitHub #508, #649: the 27B's generation-opener page rides the prompt
     /// checkpoint's capture on every card and with no card read, Blackwell
-    /// included; `IGNIS_SECOND_TAIL_CUT=1` gives main's behaviour back (Ampere
-    /// and Ada only); Flash-Next's rides it on every card, as since #306; the
-    /// image model and the diarizer capture nothing.
+    /// included; `IGNIS_SECOND_TAIL_CUT=1` gives the 27B on Blackwell and
+    /// with no card read its second cut back, so it rides on Ampere and Ada
+    /// only; Flash-Next's rides it on every card, as since #306; the image
+    /// model and the diarizer capture nothing.
     #[test]
     fn the_opener_page_rides_the_capture_by_family_and_generation() {
         use GpuGeneration::*;
@@ -922,6 +938,20 @@ mod tests {
                     assert!(!opener_page_rides_capture(family, generation, second_cut), "{family:?} on {generation:?}");
                 }
             }
+        }
+    }
+
+    /// GitHub #649: `IGNIS_SECOND_TAIL_CUT` takes `1` and nothing else, as a
+    /// load reads it: unset or empty is the one cut, and any other value is
+    /// refused naming the variable, never read as on or off.
+    #[test]
+    fn the_second_tail_cut_switch_takes_1_or_unset_and_refuses_the_rest_by_name() {
+        assert_eq!(second_tail_cut(None), Ok(false));
+        assert_eq!(second_tail_cut(Some("")), Ok(false));
+        assert_eq!(second_tail_cut(Some("1")), Ok(true));
+        for value in ["true", "10", "0", "on", " 1"] {
+            let refusal = second_tail_cut(Some(value)).expect_err(value);
+            assert!(refusal.contains("IGNIS_SECOND_TAIL_CUT") && refusal.contains(&format!("`{value}`")), "{refusal}");
         }
     }
 

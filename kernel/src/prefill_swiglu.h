@@ -14,7 +14,7 @@
 // weight's input divisor, the codes and scales that product's own quantizer would write, so the
 // matrix is never written.
 //
-// Chosen once per load (model.cu `prefill_swiglu_switch`) by the measurement switch
+// Chosen once per load (model.cu `validate_and_bind`) by the measurement switch
 // IGNIS_PREFILL_SWIGLU: unset, or `quant`, the NVFP4 epilogue wherever the down product runs on
 // the W4A4 TMA route, the BF16 one at every other call the op takes (a down weight held as an
 // exception tensor in FP8, a down product under the test-only A16 override); `fused` the BF16
@@ -33,6 +33,8 @@
 // (kernel/src/tma_descriptor_cache.h), one block per call as the split route's gate and up
 // product had, so the VRAM plan's `tma_descriptors` line counts it unchanged.
 #pragma once
+
+#include "w4a4_tma_route.h"
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -61,12 +63,10 @@ enum class Route {
 // naming the variable, on any other value.
 Route route_for_load();
 
-// The vendored W4A4 TMA route's widths: at least 1,024 tokens, a whole number of 256-token tiles.
-inline constexpr std::int32_t kMinTokens = 1024;
-inline constexpr std::int32_t kTileTokens = 256;
-constexpr bool takes(std::int32_t tokens) {
-  return tokens >= kMinTokens && (tokens % kTileTokens) == 0;
-}
+// The widths the op takes: the vendored W4A4 TMA route's (kernel/src/w4a4_tma_route.h), at least
+// 1,024 tokens in whole 256-token tiles.
+using ignis::w4a4_tma::kTileTokens;
+using ignis::w4a4_tma::takes;
 
 // The op, BF16 epilogue: x [5120, T] BF16 through the 27B's NVFP4 gate and up [34816, 5120] into
 // out [17408, T] BF16, out = BF16(silu(BF16(gate)) * BF16(up)), the split route's bytes.

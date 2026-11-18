@@ -5,8 +5,8 @@
 //     `ktile` names the K-tile-major layout, `token` the token-major one, and any other value is
 //     refused, naming the variable.
 //   - The quantizer the products take (`launch_nvfp4_w4a4_quantize_for_products`), at the 27B's
-//     three K (5,120, 6,144 and 17,408) and 1,024, 2,048 and 4,096 tokens: on a stream no load
-//     names, it writes the stock quantizer's codes and scales K-tile-major, codes
+//     three K (5,120, 6,144 and 17,408) and 1,024, 1,280, 2,048 and 4,096 tokens: on a stream no
+//     load names, it writes the stock quantizer's codes and scales K-tile-major, codes
 //     [K/128][T][64 bytes] and scales [K/256][T][16 bytes], and says so; on a stream named
 //     token-major it writes the stock bytes and says so; and below the TMA route's widths (768
 //     tokens, and 1,100, no whole number of 256-token tiles) it writes the stock bytes whatever
@@ -14,7 +14,7 @@
 //   - The 27B's five prefill products, through the ops its prefill runs them by (attn_input_proj
 //     [14336, 5120], gdn_input_proj [16384, 5120], linear [34816, 5120], the gate and up as
 //     linear_swiglu's split route runs it, and linear_add [5120, 6144] and [5120, 17408]), at the
-//     three widths: on a stream named K-tile-major and served by a descriptor cache
+//     four widths: on a stream named K-tile-major and served by a descriptor cache
 //     (kernel/src/tma_descriptor_cache.h), as a Windows load's prefill is, every output is the one
 //     written on a stream named token-major, byte for byte, while the workspace the op quantized
 //     its activations into holds other bytes.
@@ -254,7 +254,7 @@ bool same(const Quantized &a, const Quantized &b) {
 void check_quantizer(cudaStream_t unnamed, cudaStream_t token) {
   for (std::int32_t k : {5120, 6144, 17408}) {
     const Weight w = nvfp4_weight(128, k);
-    for (std::int32_t tokens : {1024, 2048, 4096}) {
+    for (std::int32_t tokens : {1024, 1280, 2048, 4096}) {
       const Tensor x = activation(k, tokens);
       const Quantized stock = quantize(x, w, false, unnamed);
       const std::string at = "K " + std::to_string(k) + ", " + std::to_string(tokens) + " tokens";
@@ -376,7 +376,7 @@ bool any_nonzero(const std::vector<std::uint8_t> &bytes) {
 void check_products(cudaStream_t token, cudaStream_t k_tile) {
   for (const Product &p : kProducts) {
     const Weight w = nvfp4_weight(p.n, p.k);
-    for (std::int32_t tokens : {1024, 2048, 4096}) {
+    for (std::int32_t tokens : {1024, 1280, 2048, 4096}) {
       const std::string at = std::string(p.name) + ", " + std::to_string(tokens) + " tokens";
       const Tensor x = activation(p.k, tokens);
       const std::vector<Tensor> outputs = outputs_of(p, tokens);

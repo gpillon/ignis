@@ -246,15 +246,16 @@ pub struct SchedulerConfig {
     /// prompt it is given.
     pub prompt_reuse: bool,
     /// Whether the generation opener's page **rides the capture** (ADR 0029
-    /// as amended 2026-10-07 and 2026-11-05, GitHub #306, #508; the server
-    /// decides it at load, by the model's family and the card's GPU
-    /// generation). On, a request that can capture a prompt checkpoint
-    /// publishes nothing at its opener's page floor: the capture hands those
-    /// pages over as a **pages-only link**, and the prefill is cut once, at the
-    /// opener -- Flash-Next, whose extra traversal costs an expert stream, and
-    /// the 27B on Ampere and Ada. Off, they are a chained prefix with an image,
-    /// published at a cut of their own (#187) -- the 27B on Blackwell, whose
-    /// extra traversal costs ~19 ms there.
+    /// as amended 2026-10-07 and 2026-11-05, and ADR 0100, GitHub #306, #508,
+    /// #649; the server decides it at load, by the model's family, the card's
+    /// GPU generation and a measurement switch). On, a request that can
+    /// capture a prompt checkpoint publishes nothing at its opener's page
+    /// floor: the capture hands those pages over as a **pages-only link**, and
+    /// the prefill is cut once, at the opener -- Flash-Next and the 27B on
+    /// every card. Off, they are a chained prefix with an image, published at
+    /// a cut of their own (#187) -- only the 27B on Blackwell, or with no card
+    /// read, under `IGNIS_SECOND_TAIL_CUT=1`: that cut measured 45-55 ms per
+    /// request on the RTX 5090.
     pub opener_page_rides_capture: bool,
     /// GitHub #622 (ADR 0095): how many positions behind its frontier a
     /// sequence of the leaf's pool still writes -- 1 on a 27B load built for

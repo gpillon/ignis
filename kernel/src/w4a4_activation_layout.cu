@@ -29,10 +29,7 @@ Registry &registry() {
 } // namespace
 
 Layout layout_for_load() {
-  const std::string named = ignis::process_environment(kSwitch);
-  if (named.empty() || named == "ktile") return Layout::KTile;
-  if (named == "token") return Layout::Token;
-  throw std::invalid_argument(std::string(kSwitch) + " is `ktile` or `token`, not `" + named + "`");
+  return ignis::named_switch(kSwitch, Layout::KTile, {{"ktile", Layout::KTile}, {"token", Layout::Token}});
 }
 
 ForStream::ForStream(cudaStream_t stream, Layout layout) : stream_(stream) {

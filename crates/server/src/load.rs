@@ -638,7 +638,10 @@ fn cuda_image_runner(
 /// adaptation kept (ADR 0063 §3), Flash-Next's at the item bound its encoder
 /// holds (GitHub #557). Beside it, what the load reserved, that shape and
 /// the adaptations it took, as `ignis.runtime.vram_plan` spells them (empty
-/// on Flash-Next, which adapts nothing).
+/// on Flash-Next, which adapts nothing). GitHub #649: the measurement switch
+/// `IGNIS_SECOND_TAIL_CUT` is read here, once per load, a value it does not
+/// know refusing the load by name, and the shape decides with it where the
+/// opener's page is published.
 #[cfg(feature = "cuda")]
 fn cuda_scheduler_for(
     artifact: &std::path::Path,
@@ -649,7 +652,8 @@ fn cuda_scheduler_for(
     vision_item_bound: Option<u64>,
     thinking_close: Option<Arc<ignis_core::thinking_budget::ThinkingClose>>,
 ) -> Result<(Box<dyn ignis_core::Scheduler>, crate::metrics::LoadReservations, EngineShape, String), LoadError> {
-    let shape = load_shape(config, vision_item_bound);
+    let second_tail_cut = crate::config::arch::second_tail_cut_for_load().map_err(LoadError::LoadFailed)?;
+    let shape = load_shape(config, vision_item_bound).with_second_tail_cut(config.basis.family(), second_tail_cut);
     // GitHub #302: a Flash-Next artifact runs its own program and leaf.
     let loaded = match family {
         ModelFamily::FlashNext => crate::runtime::flash_next_load(
@@ -707,6 +711,10 @@ fn cuda_scheduler_for(
         // from (`auto`, `none` or `yarn:F...`, as configured).
         rope_scaling = %shape.rope_scaling,
         rope_scaling_setting = %config.settings().model.rope_scaling,
+        // GitHub #649: whether a reusable prompt is cut a second time, at its
+        // opener's page floor: only the 27B on Blackwell, or with no card
+        // read, under IGNIS_SECOND_TAIL_CUT=1.
+        second_tail_cut = !shape.opener_page_rides_capture,
         "model loaded on the GPU"
     );
     Ok((Box::new(scheduler), reserved, shape, crate::adaptation::steps_text(&adapted)))
