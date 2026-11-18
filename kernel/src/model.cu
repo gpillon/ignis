@@ -2934,7 +2934,9 @@ extern "C" uint32_t ignis_model_mtp_head_linear(const struct ignis_model *model)
 }
 
 extern "C" uint32_t ignis_model_prefill_swiglu(const struct ignis_model *model) {
-  if (model == nullptr || model->flash_next || model->is_trellis_body) {
+  // None where the load's prefill runs no W4A4 TMA product, the trellis body among them: the
+  // decision the layout's answer below reports (`w4a4_activation_layout_route`).
+  if (model == nullptr || model->flash_next || !model->w4a4_activation_layout.has_value()) {
     return IGNIS_PREFILL_SWIGLU_NONE;
   }
   switch (model->prefill_swiglu) {

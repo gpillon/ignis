@@ -131,8 +131,9 @@ the other. They are no configuration fields: `GET /v1/config` and
   fewer, so under `split` a 1,024-token chunk computes the MLP with other bits
   than a 2,048-token one. Any other value refuses the load, naming the
   variable. The load logs the route under `ignis.runtime.prefill_routes`
-  (`prefill_swiglu`: `quant`, `fused`, `split`, or `none` on the trellis
-  artifacts, whose prefill runs no such product), and the VRAM plan is the
+  (`prefill_swiglu`: `quant`, `fused`, `split`, or `none` where its prefill
+  runs no W4A4 TMA product, as for `w4a4_activation_layout` below: the trellis
+  artifacts, a prefill chunk below 1,024 tokens), and the VRAM plan is the
   same on all three.
 - `IGNIS_W4A4_ACTIVATION_LAYOUT=ktile|token` (from 0.11.0) picks, at each
   model load, the layout the 27B's NVFP4 prompt products read their

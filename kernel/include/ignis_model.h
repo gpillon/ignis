@@ -335,7 +335,9 @@ enum ignis_mtp_head_linear {
  * (`split`, `fused` or `quant`; unset is `quant`) (kernel/src/prefill_swiglu.h).
  * `ignis_model_prefill_swiglu` reports it. */
 enum ignis_prefill_swiglu {
-  /* A load whose prefill runs no such product: the trellis body, Flash-Next. */
+  /* A load whose prefill runs no W4A4 TMA product, where the layout below is
+   * IGNIS_W4A4_ACTIVATION_LAYOUT_NONE: the trellis body, Flash-Next, a card
+   * below compute capability 12, a prefill chunk below 1,024 tokens. */
   IGNIS_PREFILL_SWIGLU_NONE = 0,
   /* The vendored dispatch: the product, then SiLU-mul, and at exactly 1,024
    * tokens the vendored fused kernel; what IGNIS_PREFILL_SWIGLU=split names. */
@@ -761,7 +763,8 @@ uint32_t ignis_model_mtp_head_linear(const struct ignis_model *model);
 /* The route a loaded 27B's prefill runs its MLP gate and up product on, and
  * the epilogue it runs (enum ignis_prefill_swiglu; GitHub #651, #653): what
  * the load decided.
- * IGNIS_PREFILL_SWIGLU_NONE for NULL, the trellis body and Flash-Next. */
+ * IGNIS_PREFILL_SWIGLU_NONE for NULL and for a load whose prefill runs no W4A4
+ * TMA product. */
 uint32_t ignis_model_prefill_swiglu(const struct ignis_model *model);
 
 /* The layout a loaded 27B's W4A4 prefill products read their activations in
