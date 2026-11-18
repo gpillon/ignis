@@ -32,9 +32,32 @@ of a one-lane round with speculation on says what is left: 1,166 graph nodes
 and 15.81 ms of device time, and that time is weight streaming. The NVFP4
 backbone GEMM takes 9.37 ms against a 9.4 ms bound at the card's bandwidth; the
 INT8 output head, which runs twice per round (drafter and verify), is at 86%
-of its bound. Submitting the graph costs about 370 us, 2.2% of the round. The
-device is idle 4.8% of the time, and that is structural: two host
+of its bound. Read under the tracer, submitting the graph cost about 370 us,
+2.2% of the round; timed without it, launching the one-lane graph takes 14-23
+us. The device was idle 4.8% of the time, and that was structural: two host
 synchronisations per verify round, not any one kernel.
+
+From 0.11.0 the round leaves less of its time to the host. A DFlash2 verify
+round stages its inputs with one kernel from memory the GPU maps, the host
+waits for its accept on a ticket there instead of a copy and a synchronize,
+and the round returns with its commit still on the card: on the RTX 5090 the
+gap between two one-lane verify rounds fell from 1,108 to 537 us. On an RTX 50
+or RTX PRO card the decode graph copies nothing: each layer adds its output
+into its input in place and each GDN layer reads q, k and v where its conv
+wrote them, so the NVFP4 artifact's one-lane graph has 677 nodes instead of
+885, every one a kernel, and each GDN layer's gating runs on a branch beside its input
+projection instead of on the round's chain. Under FP8 exception weights, the
+default on those cards ([context and speculation](../configuration/context-and-speculation.md)),
+the grouped exception projection reads two rows a warp. Against the server
+just before these changes, at the same FP8 exception weights, one lane writing
+a 7,172-token JSON answer went from 346 to 382 tok/s (+10.2%), the answer to
+an 8K-token prompt from 393 to 430 (+9.3%), four requests at once from 1,023
+to 1,067 tok/s in aggregate (+4.3%), and plain decode without drafting from
+about 86 to 89-90 tok/s (+3.1% to +4.2%); every one-lane answer is the text
+the server wrote before. Those are means of two launches per build on the 27B
+NVFP4 with the context pinned at 262,144, DFlash2 with 7 drafts, greedy, on
+the RTX 5090; the RTX PRO 6000 has yet to confirm them
+([the A/B](../../findings/2026-11-18-the-27bs-decode-served-on-the-rtx-5090-after-spec-672.md)).
 
 Prefill and decode share one model stream and take turns. The scheduler hands
 the engine one prefill chunk, then runs a decode round for the lanes already
@@ -51,7 +74,7 @@ instead of expanding it into BF16 first, which made it 30% faster at 46K and
 own gated delta net prefill kernels, Blackwell's route because they
 measured faster there, add 4.8% at 46K and 3.9% at 105K against the vendored ones.
 
-From 0.11.0 a cold prompt reaches its first token sooner on the RTX 5090: a cold 16K-token prompt in 1.24 s where the server just before these prefill changes took 1.52 s (-18%), a cold 64K-token one in 5.87 s where it took 6.80 s (-14%), and the first request after a load as fast as the next ones (1.24 s, where it took 1.76 s). Those are medians on the 27B NVFP4 with the context pinned at 262,144 and FP8 exception weights, over 12 and 16 cold requests each, the first token from the client; decode is unchanged. The 46K and 105K rates above were measured on 0.10.0 and are not re-measured for 0.11.0 ([the A/B](../../findings/2026-11-18-the-27bs-cold-prefill-served-on-the-rtx-5090-after-spec-646.md)).
+From 0.11.0 a cold prompt reaches its first token sooner on the RTX 5090: a cold 16K-token prompt in 1.24 s where the server just before these prefill changes took 1.52 s (-18%), a cold 64K-token one in 5.87 s where it took 6.80 s (-14%), and the first request after a load as fast as the next ones (1.24 s, where it took 1.76 s). Those are medians on the 27B NVFP4 with the context pinned at 262,144 and FP8 exception weights, over 12 and 16 cold requests each, the first token from the client; those prefill changes leave decode as it was. The 46K and 105K rates above were measured on 0.10.0 and are not re-measured for 0.11.0 ([the A/B](../../findings/2026-11-18-the-27bs-cold-prefill-served-on-the-rtx-5090-after-spec-646.md)).
 
 The path of a request through the scheduler, step by step:
 [How ignis serves a request](../concepts/how-ignis-serves.md).
@@ -64,11 +87,13 @@ The path of a request through the scheduler, step by step:
 |---|---|---|
 | 1,166 graph nodes, **15.81 ms** device time per round | one lane, DFlash2 with 7 drafts, RTX 5090 | [Decode round anatomy](../../findings/2026-09-18-decode-round-anatomy.md) |
 | Backbone GEMM 9.37 ms against a 9.4 ms bound; output head 1.66 ms against 1.42 ms (86%) | same; weights 18.29 GB, head 1.27 GB | same |
-| Graph submission about 370 us, 2.2% of the round; device idle 4.8% (2.27% at eight lanes) | one lane | same |
+| Graph submission about 370 us, 2.2% of the round, read under the tracer; device idle 4.8% (2.27% at eight lanes) | one lane | same |
 | Round **32.18 ms** at eight lanes | eight lanes, 8 s window | [Top-k, one warp per column](../../findings/2026-09-18-dflash2-topk-one-warp-per-column.md) |
 | **367 tok/s** one lane, **1,065 tok/s** the same eight prompts at once | eight coding prompts, greedy, 512 tokens, 262,144 context, DFlash2 with 7 drafts, no vision | [Quick wins A/B](../../findings/2026-09-24-upstream-quick-wins-ab.md) |
+| From 0.11.0, at equal FP8 exception weights: a 7,172-token JSON answer **382 tok/s** (before: 346), an 8K prompt's answer **430** (393), four at once **1,067** in aggregate (1,023), plain decode 89-90 (86); the same one-lane text | the 27B NVFP4, context 262,144, DFlash2 with 7 drafts (plain decode: drafting off), greedy, RTX 5090, alternated launches | [The 27B's decode served after spec #672](../../findings/2026-11-18-the-27bs-decode-served-on-the-rtx-5090-after-spec-672.md) |
+| From 0.11.0, a one-lane verify round's gap **537 us** (before: 1,108); a plain one-lane round's span 267 us shorter without the graph's 208 copies; launching the one-lane graph 14-23 us | RTX 5090, rounds timed on the GPU clock with no tracer | same |
 | Cold prefill **11,344 tok/s** at 46K, 9,008 at 105K; ignis's GDN prefill +4.8% and +3.9% of it against the vendored kernels, one session | the 27B NVFP4, the `rtx5090` profile (2,048-token chunk), RTX 5090 | [The GDN prefill on Blackwell](../../findings/2026-11-08-blackwell-gdn-prefill-on-ignis-kernels.md) |
-| From 0.11.0, a cold 16K prompt **1.24 s** (before: 1.52 s), a cold 64K prompt **5.87 s** (6.80 s), the first request after a load 1.24 s (1.76 s); decode 389.6 against 389.8 tok/s | the 27B NVFP4, context 262,144, FP8 exception weights, RTX 5090, alternated launches | [The 27B's cold prefill served after spec #646](../../findings/2026-11-18-the-27bs-cold-prefill-served-on-the-rtx-5090-after-spec-646.md) |
+| From 0.11.0, a cold 16K prompt **1.24 s** (before: 1.52 s), a cold 64K prompt **5.87 s** (6.80 s), the first request after a load 1.24 s (1.76 s); decode unchanged by them, 389.6 against 389.8 tok/s | the 27B NVFP4, context 262,144, FP8 exception weights, RTX 5090, alternated launches | [The 27B's cold prefill served after spec #646](../../findings/2026-11-18-the-27bs-cold-prefill-served-on-the-rtx-5090-after-spec-646.md) |
 | The 2,048-token chunk: +1.9% at 46K, +2.2% at 105K against 1,024 | the 27B, RTX 5090 | [The 27B's prefill chunk at 2,048](../../findings/2026-10-21-the-27b-prefill-chunk-at-2048.md) |
 | Prefill attention on the compressed KV: +30% at 46K, +53% at 105K against 0.7.2's kernels | one A/B session, RTX 5090 | [Prefill attention without prompt planes](../../findings/2026-10-21-prefill-attention-without-prompt-planes.md) |
 | Per-lane design at four lanes: round 70.2 ms against 17.3 ms (4.06x) | live/live gate, 32K context | [ADR 0020](../../adr/0020-batch-wide-decode-round.md) |
@@ -80,7 +105,8 @@ eight-lane round is 32.18 ms. "100% of the roofline" is a fit good to about
 ±10%, because the weight accounting is derived. The 367 and 1,065 tok/s are
 greedy coding prompts, the most predictable traffic there is; sampled agent
 turns accept fewer drafted tokens, see [a drafter inside the
-artifact](dflash2.md).
+artifact](dflash2.md). They were measured in September 2026 and are not
+re-measured for 0.11.0, whose decode figures are other cells.
 :::
 
 ## See it, control it
@@ -108,8 +134,10 @@ artifact](dflash2.md).
 - A prompt decoded at eight lanes is not always token-identical to the same
   prompt at one lane: the round's width changes the arithmetic, and a near-tie
   can fall the other way ([batched decode width drift](../../findings/2026-09-14-batched-decode-width-drift.md)).
-- "At the bound" is about kernels. The 4.8% idle would need accept and fold
-  logic that lives on the device, which is not built.
+- "At the bound" is about kernels. What is left between rounds waits on the
+  host: from 0.11.0, 537 us after a one-lane verify round, which waits for its
+  accept, and about 250 us after a plain round, on the RTX 5090. A round
+  decided wholly on the device is not built.
 
 ## Read more
 

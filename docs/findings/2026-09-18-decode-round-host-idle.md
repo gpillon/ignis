@@ -1,7 +1,7 @@
 # A decode round loses ~1 ms to host-side stalls, fixed per round, and the memcpy nodes are not the cause
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
 - Scope: kernel / decode round, CUDA graph replay, device timeline
@@ -13,7 +13,8 @@
   [GQA workspace memset](2026-09-18-gqa-workspace-memset.md),
   [Drafter top-k](2026-09-18-dflash2-topk-one-warp-per-column.md)
 - Superseded by: none
-- Summary: A 27B decode round leaves the device idle ~1 ms in five host-side stalls fixed per round (4.91% of the timeline at one lane, 2.27% at eight); the 224 memcpy/memset nodes cost only their own execution.
+- Corrected by: [the 27B's decode served after spec #672](2026-11-18-the-27bs-decode-served-on-the-rtx-5090-after-spec-672.md)
+- Summary: A 27B verify round leaves the device idle ~1 ms in five host-side stalls fixed per round (4.91% at one lane, 2.27% at eight); its memcpy nodes cost their execution, but a plain one-lane round's 208 copies cost 267 us.
 
 **Hardware:** RTX 5090, exclusive card (ADR 0006).
 **Engine:** production defaults — `hq-e8-2b`, `--max-context 262144`,
@@ -91,6 +92,10 @@ and nothing more: the device resumes 0.10 µs after a residual copy retires.
 Removing them would return ~0.16% of decode, not the several percent the PDL
 argument predicted.
 
+> **Corrected 2026-11-18 (#683).** This holds for the verify round it measured: removing 64 of the verify graph's
+> 86 copies moved its period by -37 us, inside the spread. In a plain one-lane round without drafting, removing the
+> graph's 208 copies took 267 us off the span (-2.4%) on the GPU clock, untraced ([the 27B's decode served after spec #672](2026-11-18-the-27bs-decode-served-on-the-rtx-5090-after-spec-672.md)).
+
 **Observed.** A decode round leaves the device idle for ~1 ms, and that cost is
 **fixed per round**: 847-1,014 µs whether the round serves one lane or eight.
 It is not one bubble but five recurring host-side stalls, the largest of them
@@ -110,6 +115,10 @@ at one — 1.75x the device time for 8x the lanes.
 
 - The residual ping-pong copy and the GDN QKV split copies are not performance
   work. If they are removed it should be for the code, not the clock.
+
+  > **Corrected 2026-11-18 (#683).** In the plain one-lane round they were the clock's too: removing them took
+  > 267 us off its span on the RTX 5090, and from 0.11.0 an RTX 50 or RTX PRO card's decode graph has none ([the 27B's decode served after spec #672](2026-11-18-the-27bs-decode-served-on-the-rtx-5090-after-spec-672.md)).
+
 - The remaining lever in decode is host-side: what runs between a round's
   staging copies and its launch, and between the graph replay and the fold.
   None of it is kernel work.

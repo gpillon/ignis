@@ -1,7 +1,7 @@
 # A decode round is at its bandwidth bound: 1,166 nodes, 4.8% idle, and the compute is weight streaming
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
 - Scope: kernel / decode round, CUDA graph submission cost, roofline accounting
@@ -12,7 +12,8 @@
   [Decode round host idle](2026-09-18-decode-round-host-idle.md),
   [Drafter top-k](2026-09-18-dflash2-topk-one-warp-per-column.md)
 - Superseded by: none
-- Summary: A 27B decode round is 1,166 graph nodes and 15.81 ms of weight streaming at the card's bandwidth (backbone GEMM at 100% of roofline); graph submission is 2.2%, and the headroom left is the 4.8% idle from two host syncs a round.
+- Corrected by: [the 27B's decode served after spec #672](2026-11-18-the-27bs-decode-served-on-the-rtx-5090-after-spec-672.md)
+- Summary: A 27B decode round is 1,166 graph nodes and 15.81 ms of weight streaming at the card's bandwidth (backbone GEMM at roofline); its 370 us graph submission is the tracer's (untraced 14-23 us); the 4.8% idle is two host syncs.
 
 **Hardware:** RTX 5090, exclusive card (ADR 0006).
 **Engine:** production defaults, with the drafter top-k already replaced.
@@ -48,6 +49,11 @@ It is linear, at 0.36-0.73 us per node, with `cudaGraphUpload` already paid and
 the exec relaunched warm. So the ~370 us the server spends there is
 submission, not our code and not a one-time upload — and node count is the
 only lever on it.
+
+> **Corrected 2026-11-18 (#683).** Timed untraced in the server on the GPU clock (spec #672), launching the
+> one-lane decode graph takes 14-23 us whatever its node count (885 nodes or 677), and under Nsight Systems about
+> 400 us more on this host: the ~370 us read here off the trace is the tracer's, and node count is not a lever on
+> the round. The standalone benchmark above was not re-run ([the 27B's decode served after spec #672](2026-11-18-the-27bs-decode-served-on-the-rtx-5090-after-spec-672.md)).
 
 ### What the 1,166 nodes are
 
@@ -98,6 +104,11 @@ platform, so the round's 1,166 nodes cost ~370 us of host submission that the
 device waits through — 2.2% of the round. No single available change removes
 more than about a fifth of it.
 
+> **Corrected 2026-11-18 (#683).** Untraced, the launch takes 14-23 us: the 2.2% is the tracer's. Spec #672 took
+> the two synchronizes this paragraph names out of the DFlash2 verify round: from 0.11.0 the host waits on a ticket
+> in host-mapped memory for the accept and the fold stays in flight, and the gap between one-lane verify rounds
+> fell from 1,108 to 537 us on the RTX 5090 ([the 27B's decode served after spec #672](2026-11-18-the-27bs-decode-served-on-the-rtx-5090-after-spec-672.md)).
+
 **Inference.** Decode's remaining headroom is the 4.8% it spends idle, and
 it is structural rather than per-kernel: ~370 us of graph submission plus
 ~430 us spread over four host-side stalls, which are the two
@@ -120,6 +131,11 @@ change.
   together. If they are removed it should be for the code, as the
   [host idle finding](2026-09-18-decode-round-host-idle.md) already concluded
   for a different reason.
+
+  > **Corrected 2026-11-18 (#683).** In the verify graph, where this was measured, removing 64 of its 86 copies
+  > moved the round by -37 us, inside the spread. In a plain one-lane round without drafting, removing all 208
+  > took 267 us off the span (-2.4%): each copy sits on the round's serial chain ([the 27B's decode served after spec #672](2026-11-18-the-27bs-decode-served-on-the-rtx-5090-after-spec-672.md)).
+
 - Prefill was not re-examined here and is a separate question: it is not
   submission-bound (it enqueues eagerly) and its own layer bodies were only
   ever measured for the workspace memset.

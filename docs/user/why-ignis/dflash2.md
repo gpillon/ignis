@@ -66,7 +66,9 @@ round commits about 3.8 tokens under the sampled draft, the default from
 coding prompts. The sampled-acceptance finding splits the fixed draft's loss
 from a perfect 8-token run into 3.08 tokens to one-hot drafting under sampling
 and 1.47 to the drafter. Plan for the lower figure when you size an agent
-workload.
+workload. The 367 and 1,065 tok/s were measured in September 2026; from 0.11.0
+the verify round itself is shorter on the RTX 5090, with the figures on [One
+round for every lane](decode-round.md).
 :::
 
 ## See it, control it
