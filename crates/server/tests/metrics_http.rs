@@ -632,8 +632,8 @@ async fn labels_stay_within_the_bounded_sets() {
 
     /// The plan's fifteen lines, as ADR 0030 §Observability spells them
     /// (GitHub #339 added `trellis_workspace`, #509 `trellis_dense`, #650
-    /// `tma_descriptors`), then Flash-Next's two and the image model's
-    /// condition budget.
+    /// `tma_descriptors`, ADR 0101), then Flash-Next's two and the image
+    /// model's condition budget.
     const VRAM_LINES: &[&str] = &[
         "weights",
         "cuda_context",
