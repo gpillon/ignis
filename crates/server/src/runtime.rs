@@ -1991,11 +1991,14 @@ mod tests {
         // A resolution says what may adapt and that the rope table is
         // `auto`'s; a shape built by hand adapts nothing (ADR 0063 §3). It also
         // knows the generation of the card it read, the 5090 `resolve`
-        // injects, where a shape built by hand read none (GitHub #508).
+        // injects, where a shape built by hand read none (GitHub #508). On that
+        // card `auto`'s exception weights resolve to fp8 (ADR 0103), where a
+        // shape built by hand keeps the engine's bf16.
         let resolved = EngineShape {
             adaptable: crate::adaptation::Adaptable::ALL,
             rope_setting: ignis_core::RopeSetting::Auto,
             gpu_generation: Some(crate::config::arch::GpuGeneration::Blackwell),
+            exception_weights: ignis_core::ExceptionWeights::Fp8,
             ..EngineShape::default()
         };
         assert_eq!(EngineShape::from(&config), resolved);
