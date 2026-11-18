@@ -168,19 +168,14 @@ impl ArtifactTemplateProvider {
     /// `None` when that encoding is not a token prefix of `tokens`.
     ///
     /// Read off the one encoding wherever an added token starts at `at`
-    /// (`Tokenizer::prefix_at_added_token`, GitHub #647), which in the chat
-    /// templates the server ships is so at the generation opener, the last
-    /// user query and the end of the system block: there the head's own
-    /// encoding is the prompt's leading ids by construction, so the prompt is
-    /// tokenized once. Anywhere else the head is encoded on its own and
-    /// compared.
+    /// (`Tokenizer::head_tokens`, GitHub #647), which in the chat templates the
+    /// server ships is so at the generation opener, the last user query and
+    /// the end of the system block: there the head's own encoding is the
+    /// prompt's leading ids by construction, so the prompt is tokenized once.
+    /// Anywhere else the head is encoded on its own and compared.
     fn head_tokens(&self, prompt: &str, at: usize, tokens: &[TokenId], offsets: &[(usize, usize)]) -> Option<u32> {
-        let tokenizer = self.set.tokenizer();
-        if let Some(n) = tokenizer.prefix_at_added_token(prompt, at, tokens, offsets) {
-            return Some(n as u32);
-        }
-        let head = tokenizer.encode(&prompt[..at]).ok()?;
-        tokens.starts_with(&head).then(|| head.len() as u32)
+        let n = self.set.tokenizer().head_tokens(prompt, at, tokens, offsets).ok()??;
+        Some(n as u32)
     }
 
     /// How many leading tokens of `tokens` end where `prompt`'s **last real

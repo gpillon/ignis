@@ -504,8 +504,11 @@ impl VisionProcessor {
         )?;
         let grids: Vec<Grid> = media.iter().map(|m| m.grid).collect();
         let expanded = layout::expand_placeholders(rendered, &grids, boundaries)?;
-        let encode = |text: &str| tokenizer.encode(text).map_err(|e| ProcessorError::Tokenize(e.to_string()));
-        let token_ids = encode(&expanded.text)?;
+        let tokenize = |e: crate::ArtifactError| ProcessorError::Tokenize(e.to_string());
+        // GitHub #647: the expanded prompt is encoded once, with its byte
+        // offsets, and each boundary's head read off that encoding where it can
+        // be (`Tokenizer::head_tokens`); an empty head is no frontier.
+        let (token_ids, offsets) = tokenizer.encode_with_offsets(&expanded.text).map_err(tokenize)?;
         let frontiers = expanded
             .boundaries
             .iter()
@@ -513,9 +516,8 @@ impl VisionProcessor {
                 if boundary > expanded.text.len() {
                     return Ok(None);
                 }
-                let prefix = encode(&expanded.text[..boundary])?;
-                let exact = !prefix.is_empty() && token_ids.starts_with(&prefix);
-                Ok(exact.then_some(prefix.len() as u32))
+                let head = tokenizer.head_tokens(&expanded.text, boundary, &token_ids, &offsets).map_err(tokenize)?;
+                Ok(head.filter(|&n| n > 0).map(|n| n as u32))
             })
             .collect::<Result<_, ProcessorError>>()?;
         let token_types = layout::token_types(&token_ids);

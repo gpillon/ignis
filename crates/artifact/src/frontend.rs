@@ -395,6 +395,20 @@ impl Tokenizer {
         splits_first.then_some(k)
     }
 
+    /// How many leading ids of `ids` (the encoding of `text`, `offsets` its
+    /// byte ranges) `text[..at]` encodes to on its own, or `None` when that
+    /// encoding is not a prefix of `ids` (GitHub #647): read off the one
+    /// encoding where [`Self::prefix_at_added_token`] can say it, else
+    /// `text[..at]` encoded on its own and compared. What a chat prompt's
+    /// reuse boundaries are counted by, a text one's and an image one's alike.
+    pub fn head_tokens(&self, text: &str, at: usize, ids: &[u32], offsets: &[(usize, usize)]) -> Result<Option<usize>> {
+        if let Some(n) = self.prefix_at_added_token(text, at, ids, offsets) {
+            return Ok(Some(n));
+        }
+        let head = self.encode(&text[..at])?;
+        Ok(ids.starts_with(&head).then_some(head.len()))
+    }
+
     /// Whether `id` is a token this tokenizer has — in its vocabulary or among
     /// its added tokens. `decode` skips an id it has no token for rather than
     /// refusing it, so this is what tells a caller its ids are real (GitHub
