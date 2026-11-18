@@ -591,7 +591,15 @@ struct ignis_program_stats {
  * (`ignis_program_stats::drafter_append_graph_ready_mask`, a failure
  * degrading that width to the eager append); under `0` they take earlier
  * releases' path. Any other value refuses the call like IGNIS_ROUND_TIMING's.
- * A load whose graphs were never captured defers. */
+ * A load whose graphs were never captured defers.
+ *
+ * GitHub #681: each call also decides, from the card and IGNIS_GDN_GATING
+ * (`chain`, `branch` or `fused`; unset is the kept home), where each GDN
+ * layer runs its gating in the decode and verify rounds from then on,
+ * replayed or eager (kernel/src/gdn_gating_home.h): the home the switch
+ * names on a card of compute capability 12, the round's chain on every other
+ * (`ignis_program_stats::gdn_gating`). Any other value refuses the call like
+ * IGNIS_ROUND_TIMING's, and so does a branch whose stream CUDA cannot make. */
 int32_t ignis_decode_graph_capture(struct ignis_model *model, struct ignis_seq_pool *pool,
                                    uint64_t *out_capture_micros, uint32_t *out_ready_mask);
 
