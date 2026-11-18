@@ -118,7 +118,7 @@ The texts differ between the builds, as expected: FP8 weights and yarn:3.5 move 
 
 - A, JSON-long and 8192A: one sha256 per cell in all four legs, both builds.
 - B: one sha256 per cell in all four legs.
-- A, the burst of 4: three legs write the same four answers (M1, N3, M4); N2 differs on 2 of the 4.
+- A, the burst of 4: three legs write the same four answers (M1, N3, M4); N2 differs on 2 of the 4. Main's own build varies the same way: eight bursts in one load of the main exe (config A, 2026-11-18) wrote three variants of the second answer and two of the first, and two of those bursts wrote exactly N2's pair (`360f7c25`, `8f9840f4`). So N2's answers are among main's own.
 - The round identity test (`crates/core/tests/round_identity_gpu.rs`) on the integration build at eb0a823d holds every arm to the reference token for token at widths 1-8 and at the verify window, greedy and sampled lanes: `eager`, `round-timing`, `sync-verify`, `decode-graph-copies`, `decode-graph-copies-wide`, `fp8-gemv-one-row`, `gdn-gating-chain` and `gdn-gating-branch`, on the NVFP4 body with DFlash2, with its MTP head and with vision under bf16 and fp8, and on the 16 GB and 12 GB trellis bodies under bf16: 64 arm passes in 453 s.
 
 ## Finding
@@ -163,7 +163,7 @@ The texts differ between the builds, as expected: FP8 weights and yarn:3.5 move 
 - Config A's verify timing mixes one-lane and wider verify rounds (the burst's); it is not comparable with the one-lane lever legs or the spec's 16.04-16.14 ms, and no combined one-lane verify figure was taken.
 - The untraced launch (14-23 us at every width) is the spec's server measurement; the standalone benchmark of the [decode round anatomy](2026-09-18-decode-round-anatomy.md) (0.36-0.73 us a node, warm, no server) disagrees with it and was not re-run, so what that benchmark measured is open.
 - The spec's served prototype figures (478.6 to 506.3 tok/s on a 7,229-token cell, 392.7 to 411.0 on the 8K prompt's answer) came from another session; this A/B's JSON-long cell is not that cell. Main's 8K answer agrees: 393.3 tok/s here, 392.7 there.
-- The burst's text: one leg of N differs on two of its four answers. Inference: which rounds run at which width depends on when each request arrives, as #680's burst legs showed within one build, one differing leg per arm. Byte identity at a fixed width is held by the round identity test, not by this cell.
+- The burst's text: one leg of N differs on two of its four answers, and main's build varies the same way within one load (above): which rounds run at which width depends on when each request arrives, so a burst has no single text to compare. Byte identity at a fixed width is held by the round identity test, not by this cell.
 - FP8 against BF16 decode at equal text was not measured served; #678's share of a one-lane verify round was not separated; a verify round of two lanes or more runs its exception products on W8A8, which #678 does not reach.
 - Not measured for speed: the MTP loads (their verify rounds keep the synchronous return), the trellis bodies (held by the identity test only), and any card but the RTX 5090. The deferred verify round is on every card's DFlash2 load; the copy-free graphs and the gating branch are on compute capability 12 only, the RTX 30 and 40 cards keep main's graphs.
 
