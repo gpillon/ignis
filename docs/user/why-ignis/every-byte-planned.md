@@ -39,6 +39,11 @@ for the process where it reports one (native Linux), so the reload plans the
 pool its cold start planned, and elsewhere what the plan charges again for
 it, so the reload plans on the memory actually free
 ([ADR 0092](../../adr/0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md)).
+From 0.11.0 the 27B's share of what is charged again is what it leaves on an
+RTX 50 or RTX PRO card, whose decode graphs hold no copies. Where the graphs
+still copy (an RTX 30 or RTX 40 card, or `IGNIS_DECODE_GRAPH_COPIES=1`) the
+process holds 24 MiB more than that, so a reload there plans about 0.3% fewer
+KV pages than its cold start did.
 
 The 27B adapts before it refuses. When the plan cannot hold what its profile
 asks for in the memory the start finds free, the load lowers the values one at
