@@ -198,6 +198,15 @@ struct ignis_seq_pool {
     std::uint64_t next_fence = 1;
     std::unordered_map<std::uint64_t, cudaEvent_t> fences;
     std::vector<cudaEvent_t> spare;
+    /* GitHub #676: recorded on the model's stream by a verify round that
+     * returns with its commit's device work in flight (its lanes' GDN slots,
+     * ring words and drafter windows). The model's stream is a blocking one,
+     * so every copy on it or on the default stream lands behind that work;
+     * this stream is not, so every window it moves waits for the event first
+     * (ignis_seq_pool_order_after_verify_fold), and the pool is not freed
+     * under it. Never recorded on a pool no such round ran on, where a wait
+     * for it waits for nothing. */
+    cudaEvent_t verify_fold = nullptr;
     transfer_lane() = default;
     transfer_lane(const transfer_lane &) = delete;
     transfer_lane &operator=(const transfer_lane &) = delete;
@@ -661,6 +670,11 @@ void ignis_seq_copy_hq_residual(const ignis_seq_pool &pool, std::int32_t slot, v
  * sink rows because the kernels read them with no bit at all. A no-op on a
  * BF16 pool. Throws on a failed memset. */
 void ignis_seq_zero_hq_residual(ignis_seq_pool &pool, std::int32_t slot);
+
+/* GitHub #676: `stream` waits, on the device, for the commit a verify round
+ * of this pool left in flight (`transfer_lane::verify_fold`); nothing when
+ * none was. Throws on a failed wait. Defined in kernel/src/seq.cu. */
+void ignis_seq_pool_order_after_verify_fold(const ignis_seq_pool &pool, cudaStream_t stream);
 
 /* The leaf's thread-local last-error slot -- the one `ignis_seq_last_error`
  * reports. Defined in kernel/src/seq.cu and written by kernel/src/seq_prefix.cu

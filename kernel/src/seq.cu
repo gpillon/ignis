@@ -1191,6 +1191,14 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
       throw std::runtime_error(std::string("cudaStreamCreateWithFlags(transfer) failed: ") +
                                cudaGetErrorString(err));
     }
+    // GitHub #676: what that stream's windows wait for, recorded by a verify
+    // round that leaves its commit in flight.
+    if (const cudaError_t err = cudaEventCreateWithFlags(&pool->transfer.verify_fold, cudaEventDisableTiming);
+        err != cudaSuccess) {
+      pool->transfer.verify_fold = nullptr;
+      throw std::runtime_error(std::string("cudaEventCreateWithFlags(verify fold) failed: ") +
+                               cudaGetErrorString(err));
+    }
 
     *out_pool = pool.release();
     return 0;
@@ -1249,6 +1257,11 @@ const char *ignis_seq_clone_refusal(const ignis_seq_pool &) {
 }
 
 extern "C" void ignis_seq_pool_free(struct ignis_seq_pool *pool) {
+  // GitHub #676: not under a verify round's commit still in flight on the
+  // model's stream, which writes this pool's state.
+  if (pool != nullptr && pool->transfer.verify_fold != nullptr) {
+    cudaEventSynchronize(pool->transfer.verify_fold);
+  }
   delete pool;
 }
 
@@ -1680,6 +1693,9 @@ int32_t snapshot_window(const ignis_seq_pool &pool, const ignis_seq &seq, void *
   window_runs runs(window.offset, window.offset + window.bytes);
   blob_runs(pool, sections, logical_page_ids(seq, pages), seq.slot, head.data(), head.size(),
             reinterpret_cast<unsigned char *>(&progress), runs);
+  // GitHub #676: the sequence's state as its last verify round left it, the
+  // commit that round left in flight landed.
+  ignis_seq_pool_order_after_verify_fold(pool, static_cast<cudaStream_t>(window.stream));
   runs.copy_out(static_cast<unsigned char *>(dst), static_cast<cudaStream_t>(window.stream));
   return 0;
 }
@@ -1706,6 +1722,22 @@ void order_after_default_stream(cudaStream_t stream) {
                              cudaGetErrorString(err));
   }
 }
+
+} // namespace
+
+// GitHub #676: a non-blocking stream behind a verify round's commit left in
+// flight on the model's stream (`transfer_lane::verify_fold`).
+void ignis_seq_pool_order_after_verify_fold(const ignis_seq_pool &pool, cudaStream_t stream) {
+  if (pool.transfer.verify_fold == nullptr) {
+    return;
+  }
+  if (const cudaError_t err = cudaStreamWaitEvent(stream, pool.transfer.verify_fold, 0); err != cudaSuccess) {
+    throw std::runtime_error(std::string("ordering the window after the verify round's commit failed: ") +
+                             cudaGetErrorString(err));
+  }
+}
+
+namespace {
 
 // One window of a restore (ignis_seq_restore with a window). The header and
 // the records are gathered as they arrive and checked, against the pool and
@@ -1790,6 +1822,7 @@ int32_t restore_window(ignis_seq_pool &pool, ignis_seq &seq, const void *src, st
     const std::vector<std::int32_t> pages(own.begin(), own.begin() + state.kv_page_count);
     window_runs runs(window.offset, window.offset + window.bytes);
     blob_runs(pool, sections, pages, seq.slot, nullptr, 0, state.progress.data(), runs);
+    ignis_seq_pool_order_after_verify_fold(pool, static_cast<cudaStream_t>(window.stream));
     runs.copy_in(in, static_cast<cudaStream_t>(window.stream));
   }
   state.fed += window.bytes;
@@ -1834,10 +1867,14 @@ void ignis_seq_write_materialized_window(const ignis_seq_pool &pool, const ignis
   window_runs runs(window.offset, window.offset + window.bytes);
   blob_runs(pool, sections, history, ignis_seq_retained_pool_slot(pool, retained_slot), head.data(), head.size(),
             reinterpret_cast<unsigned char *>(&image), runs);
+  ignis_seq_pool_order_after_verify_fold(pool, static_cast<cudaStream_t>(window.stream));
   runs.copy_out(static_cast<unsigned char *>(dst), static_cast<cudaStream_t>(window.stream));
 }
 
 ignis_seq_pool::transfer_lane::~transfer_lane() {
+  if (verify_fold != nullptr) {
+    cudaEventDestroy(verify_fold);
+  }
   for (const auto &fence : fences) {
     cudaEventDestroy(fence.second);
   }

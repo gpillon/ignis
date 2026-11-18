@@ -14,6 +14,7 @@
 
 #include "ignis_step.h"
 
+#include "deferred_verify.h"
 #include "dflash2_drafter.h"
 #include "ignis_gdn_layer.h"
 #include "ignis_gqa_layer.h"
@@ -523,6 +524,16 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   if (!read_round_timing(model)) {
     return -1;
   }
+  // GitHub #676: IGNIS_DEFER_VERIFY, read at each capture like the round
+  // timing; a load with no window has no verify round to defer.
+  if (model->verify != nullptr) {
+    try {
+      model->verify->defer = ignis::deferred_verify::read_switch();
+    } catch (const std::invalid_argument &e) {
+      set_error(std::string("ignis_decode_graph_capture: ") + e.what());
+      return -1;
+    }
+  }
   const auto began = std::chrono::steady_clock::now();
   uint32_t ready_mask = 0;
   // GitHub #674: a capture again on the same load (a measurement switch
@@ -540,6 +551,11 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
     if (model->verify != nullptr) {
       release_graph(model->verify->graph_exec[width - 1], model->verify->graph_ready[width - 1],
                     model->verify->graph_nodes[width - 1]);
+      // GitHub #676: and the drafter's append graph.
+      if (model->verify->append_exec[width - 1] != nullptr) {
+        cudaGraphExecDestroy(model->verify->append_exec[width - 1]);
+        model->verify->append_exec[width - 1] = nullptr;
+      }
     }
   }
   // GitHub #336: the widths the load's lanes serve, and no wider: a round
@@ -575,6 +591,19 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
       } else {
         model->verify->graph_exec[width - 1] = nullptr;
         model->verify->graph_ready[width - 1] = false;
+      }
+    }
+  }
+  // GitHub #676: the DFlash2 drafter's append after a deferring round's
+  // commit, one graph per width, under the same never-refuse-service rule: a
+  // width whose capture failed appends eagerly.
+  if (model->verify != nullptr && model->verify->defer && model->verify->staging != nullptr) {
+    for (uint32_t width = 1; width <= model->decode_lanes; ++width) {
+      std::string error;
+      if (ignis::deferred_verify::capture_append(model, pool, width, &model->verify->append_exec[width - 1],
+                                                 &error) != 0) {
+        set_error("ignis_decode_graph_capture: the drafter's append at width " + std::to_string(width) +
+                  ": " + error);
       }
     }
   }

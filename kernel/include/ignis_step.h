@@ -519,6 +519,15 @@ struct ignis_program_stats {
    * graph, and for Flash-Next, which captures its own. */
   uint32_t decode_graph_nodes[IGNIS_DECODE_MAX_BATCH];
   uint32_t verify_graph_nodes[IGNIS_DECODE_MAX_BATCH];
+  /* GitHub #676: the verify rounds of this load that returned with their
+   * fold in flight (the commit's device work still on the model's stream,
+   * every later leaf call ordered behind it): a DFlash2 load's, unless
+   * IGNIS_DEFER_VERIFY=0; 0 on every other load. */
+  uint64_t verify_folds_in_flight;
+  /* GitHub #676: bit (w-1) set when the DFlash2 drafter's append after a
+   * verify round's commit replays a graph the latest capture made at exact
+   * width w; 0 under IGNIS_DEFER_VERIFY=0 and on every other load. */
+  uint32_t drafter_append_graph_ready_mask;
 };
 
 /* Captures one CUDA graph per exact decode batch width 1..the load's decode
@@ -550,7 +559,17 @@ struct ignis_program_stats {
  * the earlier call captured and captures each width afresh. Each call reads
  * IGNIS_ROUND_TIMING: under `1` every replayed decode and verify round of
  * the 27B is timed on the GPU's clock (kernel/src/step.cu); Flash-Next's
- * rounds never are. */
+ * rounds never are.
+ *
+ * GitHub #676: each call also reads IGNIS_DEFER_VERIFY (`0` or `1`, unset
+ * is `1`). Under `1` a DFlash2 load's verify rounds wait on the host only for
+ * their accept and return with their commit's device work in flight
+ * (kernel/src/verify_return.h), and this call captures the drafter's append
+ * after the commit as one graph per width
+ * (`ignis_program_stats::drafter_append_graph_ready_mask`, a failure
+ * degrading that width to the eager append); under `0` they take earlier
+ * releases' path. Any other value refuses the call like IGNIS_ROUND_TIMING's.
+ * A load whose graphs were never captured defers. */
 int32_t ignis_decode_graph_capture(struct ignis_model *model, struct ignis_seq_pool *pool,
                                    uint64_t *out_capture_micros, uint32_t *out_ready_mask);
 

@@ -11,6 +11,7 @@
 #include "ignis_step.h"
 
 #include "attention_readout.h"
+#include "deferred_verify.h"
 #include "dflash2_drafter.h"
 #include "ignis_gdn_layer.h"
 #include "ignis_gqa_layer.h"
@@ -25,6 +26,7 @@
 #include "step_internal.h"
 #include "teacher_forcing.h"
 #include "trellis_body.h"
+#include "verify_return.h"
 #include "flash_next/program.h"
 
 #include "ninfer/ops/argmax.h"
@@ -2324,13 +2326,51 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       }
     }
 
+    // GitHub #676: a DFlash2 load's live round stages its inputs through
+    // host-mapped memory and waits on a ticket for its accept
+    // (kernel/src/verify_return.h); every other round copies and synchronizes
+    // as earlier releases do. Its slot is the next round's to wait for once
+    // everything it enqueued has run, whether it commits or fails.
+    VerifyStaging *const staging =
+        ignis_verify_round_maps(verify.defer, dflash2, options.forced_tokens != nullptr) ? verify.staging.get()
+                                                                                       : nullptr;
+    if (staging != nullptr) {
+      const cudaError_t err = ignis::deferred_verify::begin(*staging);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: waiting for the verify staging's slot failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+    }
+    struct SlotRelease {
+      VerifyStaging *staging;
+      cudaStream_t stream;
+      cudaError_t release() {
+        VerifyStaging *const releasing = std::exchange(staging, nullptr);
+        return releasing == nullptr ? cudaSuccess : ignis::deferred_verify::end(*releasing, stream);
+      }
+      ~SlotRelease() { (void)release(); }
+    } slot_release{staging, model->stream};
     const auto stage = [&](ninfer::DeviceBuffer &buffer, const void *host, std::size_t bytes,
                            const char *what) -> bool {
+      if (staging != nullptr && ignis::deferred_verify::stage(*staging, buffer.p, host, bytes)) {
+        return true;
+      }
       const cudaError_t err =
           cudaMemcpyAsync(buffer.p, host, bytes, cudaMemcpyHostToDevice, model->stream);
       if (err != cudaSuccess) {
         set_error(std::string("ignis_program_decode: cudaMemcpyAsync(") + what + ") failed: " +
                   cudaGetErrorString(err));
+        return false;
+      }
+      return true;
+    };
+    // GitHub #676: what `stage` put in the slot, copied by one kernel.
+    const auto flush = [&](const char *what) -> bool {
+      const cudaError_t err =
+          staging == nullptr ? cudaSuccess : ignis::deferred_verify::flush(*staging, model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: staging (") + what + ") failed: " + cudaGetErrorString(err));
         return false;
       }
       return true;
@@ -2353,7 +2393,8 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
                 rope_positions.size() * sizeof(std::int32_t), "verify rope positions")) ||
         !stage(*model->decode_graph_slots, slots.data(), lane_bytes, "verify slots") ||
         !stage(*model->sampling_decode_configs, configs.data(),
-               batch_size * sizeof(ninfer::ops::SamplingConfig), "verify sampling configs")) {
+               batch_size * sizeof(ninfer::ops::SamplingConfig), "verify sampling configs") ||
+        !flush("verify inputs")) {
       return -1;
     }
 
@@ -2406,23 +2447,36 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
 
     std::vector<std::int32_t> licensed(static_cast<std::size_t>(lane_columns) * batch_size, 0);
     std::vector<std::int32_t> accepted(batch_size, 0);
-    cudaError_t err = cudaMemcpyAsync(licensed.data(), verify.licensed_tokens->p,
-                                      licensed.size() * sizeof(std::int32_t),
-                                      cudaMemcpyDeviceToHost, model->stream);
-    if (err == cudaSuccess) {
-      err = cudaMemcpyAsync(accepted.data(), verify.accepted->p, lane_bytes,
+    cudaError_t err = cudaSuccess;
+    // GitHub #676: through the slot, behind the ticket.
+    const ignis::deferred_verify::Readback accept_reads[] = {
+        {licensed.data(), verify.licensed_tokens->p, licensed.size() * sizeof(std::int32_t)},
+        {accepted.data(), verify.accepted->p, lane_bytes}};
+    if (staging != nullptr && ignis::deferred_verify::hand_back(*staging, accept_reads, model->stream, &err)) {
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: waiting for the verify round's accept failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+    } else {
+      err = cudaMemcpyAsync(licensed.data(), verify.licensed_tokens->p,
+                            licensed.size() * sizeof(std::int32_t),
                             cudaMemcpyDeviceToHost, model->stream);
-    }
-    if (err != cudaSuccess) {
-      set_error(std::string("ignis_program_decode: cudaMemcpyAsync(accept results) failed: ") +
-                cudaGetErrorString(err));
-      return -1;
-    }
-    err = cudaStreamSynchronize(model->stream);
-    if (err != cudaSuccess) {
-      set_error(std::string("ignis_program_decode: cudaStreamSynchronize(verify) failed: ") +
-                cudaGetErrorString(err));
-      return -1;
+      if (err == cudaSuccess) {
+        err = cudaMemcpyAsync(accepted.data(), verify.accepted->p, lane_bytes,
+                              cudaMemcpyDeviceToHost, model->stream);
+      }
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: cudaMemcpyAsync(accept results) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+      err = cudaStreamSynchronize(model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: cudaStreamSynchronize(verify) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
     }
 
     // GitHub #267 (test-only): teacher forcing. The pass ran exactly as a
@@ -2544,7 +2598,8 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     // columns whatever it accepts, so that is the range, not the licensed
     // run. Host masks on the round's stream, applied by the vendored kernel
     // (core/kv_ring_bits.h) outside the verify graph -- they change every
-    // round -- and confirmed by the fold's synchronize below.
+    // round -- and confirmed by the fold's synchronize below, or (GitHub #676)
+    // left in flight with the fold.
     // The reference does the same at its commit (program_impl.h:~960).
     if (pool->has_hq_residual()) {
       for (uint64_t i = 0; i < batch_size; ++i) {
@@ -2630,7 +2685,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
 
     // The accepted hidden state per lane (the run's last column's final
     // residual), kept for the drafter's continuation input (P5-05).
-    if (!stage(*verify.selectors, selectors.data(), lane_bytes, "verify selectors")) {
+    if (!stage(*verify.selectors, selectors.data(), lane_bytes, "verify selectors") || !flush("verify selectors")) {
       return -1;
     }
     const ninfer::Tensor hidden_columns(verify.hidden->p, ninfer::DType::BF16,
@@ -2651,10 +2706,16 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       for (uint64_t i = 0; i < batch_size; ++i) {
         append_counts[i] = extents[i] == 0 ? 0 : committed[i];
       }
-      if (!stage(*verify.append_counts, append_counts.data(), lane_bytes, "drafter append counts")) {
+      if (!stage(*verify.append_counts, append_counts.data(), lane_bytes, "drafter append counts") ||
+          !flush("drafter append counts")) {
         return -1;
       }
-      ignis_dflash2_append_round(model, pool, static_cast<std::uint32_t>(batch_size));
+      // GitHub #676: from its graph, on a round that stages.
+      if (staging != nullptr) {
+        ignis::deferred_verify::append_round(model, pool, static_cast<std::uint32_t>(batch_size));
+      } else {
+        ignis_dflash2_append_round(model, pool, static_cast<std::uint32_t>(batch_size));
+      }
       const std::size_t column_bytes =
           kDflash2TapLayers.size() * static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
       for (uint64_t i = 0; i < batch_size; ++i) {
@@ -2672,13 +2733,6 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
           return -1;
         }
       }
-    }
-
-    err = cudaStreamSynchronize(model->stream);
-    if (err != cudaSuccess) {
-      set_error(std::string("ignis_program_decode: cudaStreamSynchronize(fold) failed: ") +
-                cudaGetErrorString(err));
-      return -1;
     }
 
     // The penalty rows: at temperature > 0 the accept kernel counted every
@@ -2712,6 +2766,39 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
         redirect_penalty_move(configs[i], lane_licensed[committed[i] - 1], next_pending[i], &rollback);
       }
     }
+
+    // GitHub #676: a round that staged returns with its fold in flight when
+    // nothing below reads the device on the host (kernel/src/verify_return.h):
+    // every lane's state is committed from the host's numbers, every later
+    // round and leaf call reaches the device behind the fold on this stream
+    // (or the default one), and the pool's windows wait for the event first.
+    // Anything else is confirmed here, as earlier releases did.
+    const bool lane_at_extent_0 =
+        std::any_of(extents.begin(), extents.end(), [](std::int32_t extent) { return extent == 0; });
+    if (ignis_verify_fold_stays_in_flight(staging != nullptr, lane_at_extent_0, !rollback.empty())) {
+      err = slot_release.release();
+      if (err == cudaSuccess) {
+        err = cudaEventRecord(pool->transfer.verify_fold, model->stream);
+      }
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: leaving the verify round's fold in flight failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+      // The queued work goes to the device now, not at the driver's next
+      // submission (Windows batches a stream's launches).
+      if (cudaStreamQuery(model->stream) == cudaErrorNotReady) {
+        (void)cudaGetLastError();
+      }
+      ++verify.folds_in_flight;
+    } else {
+      err = cudaStreamSynchronize(model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: cudaStreamSynchronize(fold) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+    }
     if (!rollback.empty()) {
       err = adjust_penalty_counts(rollback, model->stream);
       if (err != cudaSuccess) {
@@ -2738,8 +2825,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       }
     }
 
-    // Only now, with the fold confirmed on the device, does any lane's
-    // state move (the decode round's own ordering).
+    // Only now, with the fold confirmed on the device -- or, GitHub #676,
+    // queued behind everything before it and ahead of everything after -- does
+    // any lane's state move (the decode round's own ordering).
     uncommitted.armed = false;
     for (uint64_t i = 0; i < batch_size; ++i) {
       sequences[i]->pending_token = next_pending[i];
@@ -3516,6 +3604,15 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
         model->verify != nullptr && model->verify->graph_ready[width - 1]
             ? model->verify->graph_nodes[width - 1]
             : 0;
+  }
+  // GitHub #676: the verify rounds that returned with their fold in flight, and the drafter's append
+  // graphs; a Flash-Next load has no `verify`.
+  out_stats->verify_folds_in_flight = model->verify != nullptr ? model->verify->folds_in_flight : 0;
+  out_stats->drafter_append_graph_ready_mask = 0;
+  for (uint32_t width = 1; model->verify != nullptr && width <= IGNIS_DECODE_MAX_BATCH; ++width) {
+    if (model->verify->append_exec[width - 1] != nullptr) {
+      out_stats->drafter_append_graph_ready_mask |= (1u << (width - 1));
+    }
   }
   return 0;
 }
