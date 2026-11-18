@@ -100,7 +100,7 @@ fn prefill_attention<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Prefi
 impl Arm {
     /// A served arm's start: the `rtx5090` profile, with every value that
     /// moves a read named as a flag, so neither the profile's `auto` nor a
-    /// config file chooses one.
+    /// config file chooses one, and the loop guard off.
     pub fn flags(&self) -> Vec<String> {
         [
             "--profile",
@@ -115,6 +115,8 @@ impl Arm {
             self.prefill_attention.as_str(),
             "--reuse-prompt",
             if self.prompt_reuse { "on" } else { "off" },
+            "--model-loop-guard",
+            "off",
         ]
         .iter()
         .map(|flag| flag.to_string())
