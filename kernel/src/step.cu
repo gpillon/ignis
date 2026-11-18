@@ -3600,6 +3600,8 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   for (uint32_t width = 1; width <= IGNIS_DECODE_MAX_BATCH; ++width) {
     out_stats->decode_graph_nodes[width - 1] =
         model->decode_graph_ready[width - 1] ? model->decode_graph_nodes[width - 1] : 0;
+    out_stats->decode_graph_copy_nodes[width - 1] =
+        model->decode_graph_ready[width - 1] ? model->decode_graph_copy_nodes[width - 1] : 0;
     out_stats->verify_graph_nodes[width - 1] =
         model->verify != nullptr && model->verify->graph_ready[width - 1]
             ? model->verify->graph_nodes[width - 1]

@@ -185,6 +185,29 @@ the other. They are no configuration fields: `GET /v1/config` and
   a sampled lane's run is cut (its penalty counts come back to the server)
   return as earlier releases do. The VRAM plan is the same on both. Any other
   value refuses the load, naming the variable.
+- `IGNIS_DECODE_GRAPH_COPIES=1` (from 0.11.0) gives the 27B the one-lane
+  decode round of earlier releases, the comparison a measurement of the two
+  needs. Unset, an RTX 50 or RTX PRO card runs the one-lane round copy-free:
+  each layer adds its output into its input in place and each GDN layer reads
+  its q, k and v where the convolution wrote them, so the round's graph holds
+  no copy (677 nodes instead of 885 on the NVFP4 artifact with DFlash2); `1`
+  copies them as before. The tokens are the same either way (the round
+  identity test below, arm `decode-graph-copies`). Rounds of two or more
+  lanes, the verify round and an RTX 30 or RTX 40 card copy as before
+  whatever the variable says, and Flash-Next's rounds are its own. It is read
+  at each capture of the decode graphs, once per load; any other value
+  refuses the load, naming the variable. `ignis.runtime.decode_graph_capture`'s
+  `decode_nodes` shows which round each width captured.
+- `IGNIS_FP8_GEMV_PAIRED=0` (from 0.11.0) gives the 27B's grouped q, k, gate
+  and v exception projection under `fp8` exception weights its one-row GEMV
+  back, one output row a warp, the comparison a speed measurement of the
+  paired GEMV needs. Unset, or `1`, a call of 1 to 8 tokens runs the paired
+  GEMV, two output rows a warp, whose outputs are the one-row GEMV's byte for
+  byte (`ignis_kernel_fp8_linear_test`). The residual-add exception product
+  keeps the one-row GEMV either way, as do Flash-Next's FP8 projections, and a
+  `bf16` load runs neither. It is read at each call, so a decode graph keeps
+  the form its capture read; any other value refuses the load, naming the
+  variable.
 
 ### The round identity test
 

@@ -1,27 +1,37 @@
-//! The shape of the contributed entailment set (`fixtures/entailment/`),
-//! checked on CPU so a broken edit to the fixture fails the default suite
-//! rather than the GPU profile. The model's answers are
-//! `decide_entailment_gpu.rs`'s.
+//! The shape of the entailment set (`fixtures/entailment/`), checked on CPU
+//! so a broken edit to the fixture fails the default suite rather than the
+//! GPU profile. The model's answers are `decide_entailment_gpu.rs`'s.
 
 use std::collections::BTreeMap;
 
-use ignis_core::{GdnPrefill, PrefillAttention};
+use ignis_core::{ExceptionWeights, GdnPrefill, PrefillAttention, RopeScaling};
 use ignis_server::decide::{DecideRequest, QuestionKind};
 
+#[path = "support/decide_arms.rs"]
+mod decide_arms;
 #[path = "support/entailment.rs"]
 mod entailment;
 
+use decide_arms::{Arm, Surface};
+use entailment::Origin;
+
+/// Eighteen contributed cases and the two "yes" cases ignis wrote, as GitHub
+/// #537's review allowed (GitHub #675): ten "yes" and ten "no". Which are
+/// gates is the measurement's, held to the rule below.
 #[test]
-fn the_set_is_the_contributed_eighteen_cases_with_their_labels() {
+fn the_set_is_twenty_cases_the_last_two_ignis_written() {
     let fixture = entailment::load();
     let ids: Vec<u32> = fixture.cases.iter().map(|case| case.id).collect();
-    assert_eq!(ids, (1..=18).collect::<Vec<_>>());
+    assert_eq!(ids, (1..=20).collect::<Vec<_>>());
     let expected_true: Vec<u32> =
         fixture.cases.iter().filter(|case| case.expected).map(|case| case.id).collect();
-    assert_eq!(expected_true, [1, 3, 10, 12, 13, 16, 17, 18]);
+    assert_eq!(expected_true, [1, 3, 10, 12, 13, 16, 17, 18, 19, 20]);
     let starred: Vec<u32> =
         fixture.cases.iter().filter(|case| case.starred).map(|case| case.id).collect();
     assert_eq!(starred, [5, 7, 9, 11, 15]);
+    let ignis: Vec<u32> =
+        fixture.cases.iter().filter(|case| case.origin == Origin::Ignis).map(|case| case.id).collect();
+    assert_eq!(ignis, [19, 20]);
 }
 
 #[test]
@@ -64,15 +74,42 @@ fn the_inversion_pairs_share_a_claim_and_split_the_label() {
 /// the case's recorded logits: `load` fails on a tier the logits do not give,
 /// on a case with no tier, on a case with no logit on an arm, and on a label
 /// with no gate case. Nothing here pins which case is which tier, so a new
-/// measurement is a data change; the arms must cover both GDN prefill routes
-/// and the int8 band.
+/// measurement is a data change.
+///
+/// GitHub #675: every arm names its exception weights, context and rope, and
+/// the shape it loads, resolved with no config file, is the one it names.
+/// The arms cover both exception weights on the harness and at each one's
+/// served shape on the RTX 5090, and under each every switch that moves
+/// these reads: the rope table, the vendored GDN prefill, the int8 band and
+/// prompt reuse off.
 #[test]
 fn every_case_has_a_tier_the_rule_gives_and_each_label_has_a_gate_case() {
     let fixture = entailment::load();
     let arms = &fixture.measurement.arms;
-    assert!(arms.iter().any(|arm| arm.gdn_prefill == GdnPrefill::Ours));
-    assert!(arms.iter().any(|arm| arm.gdn_prefill == GdnPrefill::Vendored));
-    assert!(arms.iter().any(|arm| arm.prefill_attention == PrefillAttention::Int8));
+    for arm in arms {
+        let shape = arm.shape();
+        let named = (arm.exception_weights, arm.max_context, arm.rope_scaling, arm.prefill_attention, arm.prompt_reuse);
+        let loads = (shape.exception_weights, shape.max_context, shape.rope_scaling, shape.prefill_attention, shape.prompt_reuse);
+        assert_eq!(loads, named, "arm {}", arm.name);
+    }
+    let table = |rope: &str| RopeScaling::parse(rope).expect("a rope table");
+    let served_shape = |arm: &Arm, weights, context, rope: &str| {
+        arm.surface == Surface::Served
+            && (arm.exception_weights, arm.max_context, arm.rope_scaling) == (weights, context, table(rope))
+            && (arm.gdn_prefill, arm.prefill_attention, arm.prompt_reuse) == (GdnPrefill::Ours, PrefillAttention::Fp8, true)
+    };
+    assert!(arms.iter().any(|arm| served_shape(arm, ExceptionWeights::Bf16, 786_432, "yarn:3")), "BF16's served shape");
+    assert!(arms.iter().any(|arm| served_shape(arm, ExceptionWeights::Fp8, 917_504, "yarn:3.5")), "FP8's served shape");
+    for weights in [ExceptionWeights::Bf16, ExceptionWeights::Fp8] {
+        let under: Vec<&Arm> = arms.iter().filter(|arm| arm.exception_weights == weights).collect();
+        assert!(under.iter().any(|arm| arm.surface == Surface::Harness), "{weights}: the harness");
+        for rope in ["none", "yarn:3", "yarn:3.5"] {
+            assert!(under.iter().any(|arm| arm.rope_scaling == table(rope)), "{weights}: {rope}");
+        }
+        assert!(under.iter().any(|arm| arm.gdn_prefill == GdnPrefill::Vendored), "{weights}: the vendored GDN");
+        assert!(under.iter().any(|arm| arm.prefill_attention == PrefillAttention::Int8), "{weights}: the int8 band");
+        assert!(under.iter().any(|arm| !arm.prompt_reuse), "{weights}: prompt reuse off");
+    }
 }
 
 /// An arm names its routes in the spellings the switch and the option take,
@@ -149,15 +186,18 @@ fn every_cited_name_is_a_public_one() {
         "champion_identified", "exec_sponsor_engaged",
     ];
     let fixture = entailment::load();
-    for case in &fixture.cases {
-        let (_, evidence) = case.state.split_once("\n\n").expect("a claim, then the evidence");
+    // The model read the drafts too (GitHub #675).
+    let cases = fixture.cases.iter().map(|case| (format!("case {}", case.id), &case.state));
+    let drafts = fixture.drafts.iter().map(|draft| (format!("draft {}", draft.name), &draft.state));
+    for (what, state) in cases.chain(drafts) {
+        let (_, evidence) = state.split_once("\n\n").expect("a claim, then the evidence");
         let words = evidence.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'));
         for word in words.filter(|word| !word.is_empty()) {
             if word.contains('_') {
-                assert!(PUBLIC.contains(&word), "case {}: {word} is not a public name", case.id);
+                assert!(PUBLIC.contains(&word), "{what}: {word} is not a public name");
             }
             if word.starts_with(|c: char| c.is_ascii_uppercase()) && word.contains('-') {
-                assert!(word.starts_with("PLAN-"), "case {}: {word} is not a public id", case.id);
+                assert!(word.starts_with("PLAN-"), "{what}: {word} is not a public id");
             }
         }
     }

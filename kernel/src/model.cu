@@ -27,6 +27,7 @@
 #include "ignis_step.h"
 
 #include "attention_readout.h"
+#include "fp8_exception.h"
 #include "ignis_dense_prefill.h"
 #include "gdn_prefill.h"
 #include "hq_decode_attention.h"
@@ -1633,14 +1634,17 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   // The routes a load decides from the card and a measurement switch, and the switches it reads
   // on their own, in this order, so a value a switch does not know refuses the plan and the load by
   // name: IGNIS_HQ_DECODE_ATTENTION (GitHub #572), IGNIS_PREFILL_SWIGLU (GitHub #651, #653: unset
-  // or `quant`, `fused`, `split`) and IGNIS_W4A4_ACTIVATION_LAYOUT (GitHub #652: unset or `ktile`,
-  // `token`).
+  // or `quant`, `fused`, `split`), IGNIS_W4A4_ACTIVATION_LAYOUT (GitHub #652: unset or `ktile`,
+  // `token`) and IGNIS_FP8_GEMV_PAIRED (GitHub #678: unset or `1`, `0`; each call of the FP8 q | k |
+  // gate | v projection reads it again, kernel/src/fp8_exception.h).
+  bool fp8_gemv_paired = true;
   if (!gdn_prefill_route(out.gdn_prefill_ours) ||
       !load_switch(ignis::hq_decode_attention::switch_for_load, out.hq_decode_attention) ||
       !mtp_head_linear_route(out.mtp_head_linear_ours) ||
       !tma_descriptor_cache_route(out.tma_descriptor_cache) ||
       !load_switch(ignis::prefill_swiglu::route_for_load, out.prefill_swiglu) ||
-      !load_switch(ignis::w4a4_activation_layout::layout_for_load, out.w4a4_activation_layout)) {
+      !load_switch(ignis::w4a4_activation_layout::layout_for_load, out.w4a4_activation_layout) ||
+      !load_switch(ignis::fp8_exception::gemv_paired, fp8_gemv_paired)) {
     return nullptr;
   }
 

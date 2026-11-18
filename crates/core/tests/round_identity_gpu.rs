@@ -81,6 +81,14 @@
 //! no config file, the user's included. One materialize per load and weights,
 //! released before the next; one model load and one pool serve every arm.
 //!
+//! # The decode graph's nodes
+//!
+//! On the NVFP4 body with DFlash2 the reference's capture and the
+//! `decode-graph-copies` arm's are also held to their nodes (#677,
+//! [`copy_free_graphs`]): on a card of compute capability 12 the reference's
+//! width-1 graph is [`COPY_FREE_WIDTH_1_NODES`] nodes, none a copy, and the
+//! arm's is main's, with its copies.
+//!
 //! # Narrow runs
 //!
 //! `IGNIS_ROUND_IDENTITY_LOADS` (a comma list of load names),
@@ -140,8 +148,11 @@ const ARMS: &[Arm] = &[
     Arm { name: "defer-verify", switches: &[("IGNIS_DEFER_VERIFY", "0")], graphs: true },
 
     // #677's arm, below this line.
+    Arm { name: "decode-graph-copies", switches: &[("IGNIS_DECODE_GRAPH_COPIES", "1")], graphs: true },
 
     // #678's arm, below this line.
+    // The FP8 q|k|gate|v projection's one-row GEMV: an `fp8` load's lever (`bf16` runs no FP8 GEMV).
+    Arm { name: "fp8-gemv-one-row", switches: &[("IGNIS_FP8_GEMV_PAIRED", "0")], graphs: true },
 
     // #679's arm, below this line.
 
@@ -227,6 +238,14 @@ const LOADS: &[Load] = &[
         exceptions: false,
     },
 ];
+
+/// #677: the load whose decode graphs [`copy_free_graphs`] pins, and its
+/// copy-free width-1 graph's nodes on a card of compute capability 12, every
+/// one a kernel; main's round copies each of the 64 layers' residual and each
+/// of the 48 GDN layers' q, k and v out of the conv plane, at every width.
+const COPY_FREE_LOAD: &str = "nvfp4-dflash2";
+const COPY_FREE_WIDTH_1_NODES: u32 = 677;
+const MAIN_COPIES: u32 = 64 + 3 * 48;
 
 /// Plain rounds, then verify rounds, at each width of the session.
 const PLAIN_ROUNDS: u32 = 4;
@@ -406,6 +425,30 @@ fn riders<'a, 'p>(seqs: &'a mut [Option<Seq<'p>>], riding: &[usize]) -> Vec<&'a 
     riding.iter().map(|&lane| remaining[lane].take().expect("a live lane, once")).collect()
 }
 
+/// #677: on [`COPY_FREE_LOAD`], the decode graphs the arm's capture left, for
+/// the reference and the arm that names main's copying round: the width-1
+/// round copy-free on a card of compute capability 12 with every switch
+/// unset, [`COPY_FREE_WIDTH_1_NODES`] nodes and no copy; main's
+/// [`MAIN_COPIES`] copies under `IGNIS_DECODE_GRAPH_COPIES=1` and on any other
+/// card, and at every other width under both.
+fn copy_free_graphs(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label: &str) {
+    let copies_named = arm.switches.contains(&("IGNIS_DECODE_GRAPH_COPIES", "1"));
+    if load.name != COPY_FREE_LOAD || !(arm.switches.is_empty() || copies_named) {
+        return;
+    }
+    let (_, (major, _)) = CudaDevice::identity(0).unwrap_or_else(|e| panic!("{label}: device identity: {e}"));
+    let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
+    let lanes = load.lanes as usize;
+    let (nodes, copies) = (&stats.decode_graph_nodes[..lanes], &stats.decode_graph_copy_nodes[..lanes]);
+    println!("round_identity_gpu {label}: arm `{}`: decode graph nodes {nodes:?}, copies {copies:?}", arm.name);
+    let copy_free = major == 12 && !copies_named;
+    assert_eq!(copies[0], if copy_free { 0 } else { MAIN_COPIES }, "{label}: arm `{}`: width 1's copy nodes", arm.name);
+    if major == 12 {
+        assert_eq!(nodes[0], COPY_FREE_WIDTH_1_NODES + copies[0], "{label}: arm `{}`: width 1's nodes", arm.name);
+    }
+    assert!(copies[1..].iter().all(|&c| c == MAIN_COPIES), "{label}: arm `{}`: widths 2-{lanes} copy as main", arm.name);
+}
+
 fn expect_replay(model: &Model, pool: &SeqPool, graphs: bool, what: &str) {
     let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{what}: stats: {e}"));
     assert_eq!(stats.graph_launches, u64::from(graphs), "{what}: graph replay");
@@ -547,6 +590,7 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         let append = stats().drafter_append_graph_ready_mask;
         let want = if defers_verify(load, arm) { every } else { 0 };
         assert_eq!(append, want, "{label}: {}: the drafter's append graphs", arm.name);
+        copy_free_graphs(model, pool, load, arm, label);
     }
     let folds = stats().verify_folds_in_flight;
     let sessions = KINDS

@@ -33,19 +33,41 @@ questions on the card through `/v1/decide`, one of them past a window.
 
 ## The entailment fixture
 
-`crates/server/tests/fixtures/entailment/` is a contributed set of 18
-synthetic "does the cited evidence support the claim?" cases for `noul`
-(provenance, ignis's corrections and the tiers in its `NOTICE.md`).
-Each case's tier follows from its logits over five measured arms (the
-harness under each GDN prefill, the live server under each and under the
-int8 prompt-attention band) by one rule, the fixture's `measurement.rule`,
-which `tier_by_rule` in `crates/server/tests/support/entailment.rs` applies;
-the fixture also records the date, the build and every case's logit in every
-arm. `decide_entailment_gpu.rs` asserts the label
-of the `gate` cases only, on the card's default route, and prints every
-case's p(yes) and logit; `watch` and `known_failure` cases are printed, never
-asserted. `decide_entailment_fixture.rs` checks the set's shape on CPU: every
-tier is the one the rule gives from the case's logits, every label has a gate
-case, and every cited name is a public one. A change of the numerics that
-moves a watch case is not a fault; re-measure the five arms and the tiers
-follow.
+`crates/server/tests/fixtures/entailment/` is a set of 20 synthetic "does
+the cited evidence support the claim?" cases for `noul`: 18 contributed,
+and 19 and 20 written by ignis (provenance, ignis's corrections, its own
+cases with every wording tried, and the tiers in its `NOTICE.md`). Each
+case's tier follows from its logits over the fixture's arms by one rule, the
+fixture's `measurement.rule`, which `tier_by_rule` in
+`crates/server/tests/support/entailment.rs` applies; the fixture also
+records the date, the build and every case's logit in every arm.
+
+The arms (GitHub #675: `measurement.arms`, `support/decide_arms.rs`) name
+what moves these reads: the exception weights, the context, the rope table,
+the GDN prefill route, the prompt attention band and prompt reuse. None
+reads a config file. A `harness` arm is the shape the test builds by hand;
+a `served` arm is a start under the `rtx5090` profile with each of those
+values named as a flag, resolved with no file and no environment and loaded
+through the server's load path. The fourteen arms cover BF16 and FP8 on the
+harness and at each one's served shape on the RTX 5090, and under each
+every switch that moves a read: the rope table, the vendored GDN prefill,
+the int8 band, prompt reuse off.
+
+`decide_entailment_gpu.rs` asserts the label of the `gate` cases only, on
+every arm it loads, and prints every case's p(yes) and logit; `watch` and
+`known_failure` cases are printed, never asserted. `IGNIS_DECIDE_ARMS`
+picks the arms, one load each: a comma list of names, or `all`; unset,
+`h-bf16` and `h-fp8`, the harness under each exception weights. Each arm
+ends with a `logits <arm> {...}` line in the fixture's form, and
+`IGNIS_DECIDE_DRAFTS=1` also reads the recorded drafts (a `drafts <arm>
+{...}` line). `decide_scalar_gpu.rs` runs on the same arms, with the same
+default; its balance case (−0.75) is a printed watch line, never asserted:
+its sign reads right on 3 of the 14 arms and wrong at both served shapes
+(#670, #671).
+`decide_entailment_fixture.rs` checks the set's shape on CPU: 20 cases, 19
+and 20 ignis's and "yes" gates, every tier the one the rule gives from the
+case's logits, every label a gate case, every arm loading the shape it
+names, and every cited name a public one. A change of the numerics that
+moves a watch case is not a fault: re-measure every arm
+(`IGNIS_DECIDE_ARMS=all IGNIS_DECIDE_DRAFTS=1`, under 5 minutes on the RTX
+5090) and the tiers follow.

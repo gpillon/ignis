@@ -1,24 +1,31 @@
-//! A contributed regression set for `noul` on "does the cited evidence
-//! support the claim?" (`fixtures/entailment/`, see its `NOTICE.md`):
-//! eighteen synthetic account-planning cases, one fixed question whose
-//! `criteria` define "support" as entailment rather than plausibility.
+//! A regression set for `noul` on "does the cited evidence support the
+//! claim?" (`fixtures/entailment/`, see its `NOTICE.md`): twenty synthetic
+//! account-planning cases, eighteen contributed and two ignis wrote, one
+//! fixed question whose `criteria` define "support" as entailment rather
+//! than plausibility.
 //!
-//! **Only `gate` cases are asserted**, on the card's default route; `watch`
+//! **Only `gate` cases are asserted**, on every arm the run loads; `watch`
 //! and `known_failure` cases are printed, never asserted. Which case is which
-//! tier follows from its logits on every route measured, by the fixture's
-//! one rule (`measurement.rule`, applied by `entailment::tier_by_rule`), so a
+//! tier follows from its logits on every arm measured, by the fixture's one
+//! rule (`measurement.rule`, applied by `entailment::tier_by_rule`), so a
 //! watch case flipping is the numerics moving, not a fault. Every line prints
 //! the logit too: `noul` probabilities move in steps of 0.125 logit (the
 //! logits are bf16), so a drift reads in steps rather than in decimals.
 //!
-//! The tiers come from one measurement of five arms, recorded in the
+//! The tiers come from one measurement of the set's arms, recorded in the
 //! fixture's `measurement` with its date, build, card, the command that
 //! redoes each arm and every case's logit in every arm (`NOTICE.md` tells
-//! the set's provenance). The card's default route runs ignis's GDN prefill
-//! (GitHub #536); `IGNIS_GDN_PREFILL=vendored` runs this test on the vendored
-//! one, where the same gates must hold. GitHub #628: the same gates hold on a
-//! load that drafts with the 27B's MTP head, whose prefill also writes the
-//! head's state; the speculation-off load is the set's own.
+//! the set's provenance). An arm names its exception weights, context, rope,
+//! GDN prefill route, prompt attention and prompt reuse, and reads no config
+//! file (`support/decide_arms.rs`, GitHub #675). `IGNIS_DECIDE_ARMS` picks
+//! the arms, one load each: a comma list of names, or `all`; unset, the
+//! harness's arm under each exception weights (`h-bf16`, `h-fp8`). Each arm
+//! ends with a `logits <arm> {...}` line, its cases' logits as the fixture
+//! records them; with `IGNIS_DECIDE_DRAFTS=1` the fixture's drafts are
+//! posted after the cases and end with a `drafts <arm> {...}` line. That is
+//! how an arm is measured and its record redone. GitHub #628: the same gates
+//! hold on a load that drafts with the 27B's MTP head, whose prefill also
+//! writes the head's state; the speculation-off load is the set's own.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or an unavailable GPU is a **skip**; under the profile
@@ -26,88 +33,22 @@
 
 #![cfg(feature = "cuda")]
 
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
-
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
 use serde_json::Value as JsonValue;
 use tower::ServiceExt;
 
-use ignis_artifact::{FrontendSet, Reader};
-use ignis_core::gpu_profile;
-use ignis_server::Server;
-use ignis_server::engine::Engine;
-use ignis_server::runtime::{EngineShape, cuda_scheduler};
-use ignis_server::telemetry::SystemClock;
-
+#[path = "support/decide_arms.rs"]
+mod decide_arms;
 #[path = "support/entailment.rs"]
 mod entailment;
 
-use entailment::Tier;
+use decide_arms::gpu::Loaded;
+use decide_arms::{Arm, MODEL};
+use entailment::{Fixture, Tier};
 
-const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
-const MODEL: &str = "qwen3.8-27b";
-
-struct Harness {
-    app: Option<axum::Router>,
-    driver: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Harness {
-    fn app(&self) -> &axum::Router {
-        self.app.as_ref().expect("the app is only taken by Drop")
-    }
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        drop(self.app.take());
-        if let Some(driver) = self.driver.take() {
-            let _ = driver.join();
-        }
-    }
-}
-
-fn harness(shape: EngineShape) -> Option<Harness> {
-    let path = Path::new(ARTIFACT);
-    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
-        return None;
-    }
-    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
-    let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
-    let eos = frontend
-        .eos_token_id()
-        .unwrap_or_else(|| panic!("qwen3.8-27b generation config must carry eos_token_id"));
-    let scheduler = match cuda_scheduler(path, MODEL.into(), eos, shape) {
-        Ok((scheduler, reservations)) => {
-            // GitHub #628: a load that drafts binds a verify round, and the
-            // head no drafter round (DFlash2's); the plan's lines say which
-            // load the cases ran on.
-            if let Some(speculation) = shape.speculation {
-                assert_eq!(speculation.backend(), ignis_core::SpeculativeBackend::Mtp);
-                assert!(
-                    reservations.lines.verify_round > 0 && reservations.lines.drafter_round == 0,
-                    "an MTP load plans a verify round and no drafter round: {:?}",
-                    reservations.lines
-                );
-            }
-            scheduler
-        }
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("cuda_scheduler: {e}")) {
-                return None;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
-    };
-    let (engine, driver) = Engine::with_clock_and_driver(Box::new(scheduler), Arc::new(SystemClock));
-    let provider = ignis_server::artifact_template::ArtifactTemplateProvider::new(frontend);
-    let server =
-        Server::new(engine, Box::new(provider)).with_request_timeout(Duration::from_secs(180));
-    Some(Harness { app: Some(server.app()), driver: Some(driver) })
-}
+/// `IGNIS_DECIDE_DRAFTS=1`: an arm also reads the fixture's drafts.
+const DRAFTS_ENV: &str = "IGNIS_DECIDE_DRAFTS";
 
 async fn decide(app: &axum::Router, body: &JsonValue) -> (u16, JsonValue) {
     let request = Request::builder()
@@ -125,10 +66,21 @@ async fn decide(app: &axum::Router, body: &JsonValue) -> (u16, JsonValue) {
     (status, json)
 }
 
+/// p(yes) of `state`, and its logit to the fixture's three decimals.
+async fn p_yes(app: &axum::Router, fixture: &Fixture, state: &str, what: &str) -> (f64, f64) {
+    let (status, response) = decide(app, &fixture.request_for(state, Some(MODEL))).await;
+    assert_eq!(status, 200, "{what}: {response}");
+    let answer = &response["answers"][entailment::QUESTION_ID];
+    assert_eq!(answer["type"], "noul", "{what}: {response}");
+    let p = answer["noul"].as_f64().expect("a probability");
+    let logit = (p / (1.0 - p)).ln();
+    (p, (logit * 1000.0).round() / 1000.0)
+}
+
 #[tokio::test]
 #[ignore = "GPU"]
 async fn the_gate_cases_keep_their_entailment_labels() {
-    gate_cases_keep_their_labels(EngineShape::default()).await;
+    gate_cases_keep_their_labels(None).await;
 }
 
 /// GitHub #628: MTP on against off, the regression set's quality leg.
@@ -136,21 +88,43 @@ async fn the_gate_cases_keep_their_entailment_labels() {
 #[ignore = "GPU"]
 async fn the_gate_cases_keep_their_entailment_labels_on_an_mtp_load() {
     let speculation = ignis_core::Speculation::new(ignis_core::SpeculativeBackend::Mtp, 7).expect("window 7");
-    gate_cases_keep_their_labels(EngineShape { speculation: Some(speculation), ..EngineShape::default() }).await;
+    gate_cases_keep_their_labels(Some(speculation)).await;
 }
 
-async fn gate_cases_keep_their_labels(shape: EngineShape) {
-    let Some(harness) = harness(shape) else { return };
-    let fixture = entailment::load();
+async fn gate_cases_keep_their_labels(speculation: Option<ignis_core::Speculation>) {
+    let fixture = entailment::load_recorded();
+    let drafts = std::env::var(DRAFTS_ENV).is_ok_and(|value| value == "1");
+    let mut wrong = Vec::new();
+    for arm in decide_arms::selected(&fixture.measurement.arms, decide_arms::DEFAULT_ARMS) {
+        let Some(loaded) = arm.load(speculation) else { return };
+        // GitHub #628: a load that drafts binds a verify round, and the
+        // head no drafter round (DFlash2's); the plan's lines say which
+        // load the cases ran on.
+        if speculation.is_some() {
+            let lines = &loaded.reservations.as_ref().expect("the load's plan").lines;
+            assert!(
+                lines.verify_round > 0 && lines.drafter_round == 0,
+                "an MTP load plans a verify round and no drafter round: {lines:?}"
+            );
+        }
+        wrong.extend(arm_keeps_its_gates(&fixture, arm, &loaded, drafts).await);
+    }
+    assert!(
+        wrong.is_empty(),
+        "a gate case lost its entailment label: {wrong:?}\n\
+         The question and its criteria are fixed by the fixture, so a failure here is the \
+         model's reading through this build, not the prompt."
+    );
+}
+
+/// Every case read on `arm`'s load, in the file's order, then its drafts if
+/// asked: the gate cases that lost their label.
+async fn arm_keeps_its_gates(fixture: &Fixture, arm: &Arm, loaded: &Loaded, drafts: bool) -> Vec<String> {
     let mut wrong = Vec::new();
     let mut right = 0;
+    let mut logits = serde_json::Map::new();
     for case in &fixture.cases {
-        let (status, response) = decide(harness.app(), &fixture.request(case, Some(MODEL))).await;
-        assert_eq!(status, 200, "case {}: {response}", case.id);
-        let answer = &response["answers"][entailment::QUESTION_ID];
-        assert_eq!(answer["type"], "noul", "case {}: {response}", case.id);
-        let p = answer["noul"].as_f64().expect("a probability");
-        let logit = (p / (1.0 - p)).ln();
+        let (p, logit) = p_yes(loaded.app(), fixture, &case.state, &format!("case {}", case.id)).await;
         let ok = (p > 0.5) == case.expected;
         right += usize::from(ok);
         let verdict = match (case.tier, ok) {
@@ -168,15 +142,21 @@ async fn gate_cases_keep_their_labels(shape: EngineShape) {
             case.expected,
             case.name
         );
+        logits.insert(case.id.to_string(), logit.into());
         if case.tier == Tier::Gate && !ok {
-            wrong.push(format!("{} ({}): p(yes)={p:.4}", case.id, case.name));
+            wrong.push(format!("{} on {} ({}): p(yes)={p:.4}", case.id, arm.name, case.name));
         }
     }
-    println!("label agreement {right}/{}", fixture.cases.len());
-    assert!(
-        wrong.is_empty(),
-        "a gate case lost its entailment label: {wrong:?}\n\
-         The question and its criteria are fixed by the fixture, so a failure here is the \
-         model's reading through this build, not the prompt."
-    );
+    println!("label agreement {right}/{} on {}", fixture.cases.len(), arm.name);
+    println!("logits {} {}", arm.name, JsonValue::Object(logits));
+    if drafts {
+        let mut read = serde_json::Map::new();
+        for draft in &fixture.drafts {
+            let (p, logit) = p_yes(loaded.app(), fixture, &draft.state, &format!("draft {}", draft.name)).await;
+            println!("draft {:24} p={p:.4} logit={logit:+.3}", draft.name);
+            read.insert(draft.name.clone(), logit.into());
+        }
+        println!("drafts {} {}", arm.name, JsonValue::Object(read));
+    }
+    wrong
 }

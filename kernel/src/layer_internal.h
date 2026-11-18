@@ -191,7 +191,11 @@ int32_t ignis_gdn_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, igni
 // `model->max_context_tokens` (a safe over-approximation every round, per
 // the op's own "host launch-resource promise" contract) rather than derived
 // from any lane's actual position. Returns 0 on success, -1 on a
-// kernel/copy error (see ignis_gqa_layer_last_error).
+// kernel/copy error (see ignis_gqa_layer_last_error). GitHub #677: the same
+// pointer as `in_residual` and `out_residual` asks for the copy-free form
+// (kernel/src/decode_graph_copies.h), main's bytes with no copy: the layer
+// adds into its input in place, and at one lane the GDN body below reads q,
+// k and v as views of its conv plane.
 int32_t ignis_gqa_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
                                        uint32_t width, const void *in_residual, void *out_residual,
                                        LinearPolicyMode mode);
