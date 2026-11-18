@@ -1,13 +1,14 @@
 # The two `/v1/decide` regression sets under both exception weights: FP8 moves them as much as a harmless switch does, and over fourteen named arms only two ignis-written "yes" cases stay gates
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-11-18
 - Last verified: 2026-11-18
 - Scope: tests / the `/v1/decide` regression sets (`decide_entailment_gpu`, `decide_scalar_gpu`, the entailment fixture's arms and tiers, `support/decide_arms.rs`); serving / the 27B's exception weights, rope table, GDN prefill route, prompt attention band and prompt reuse on the RTX 5090
 - Topic: decide-options
 - Related: [GitHub #675](https://github.com/gpillon/ignis/issues/675), [spec #672](https://github.com/gpillon/ignis/issues/672), [GitHub #667](https://github.com/gpillon/ignis/issues/667) (the fixture study), [GitHub #537](https://github.com/gpillon/ignis/issues/537), [GitHub #670](https://github.com/gpillon/ignis/issues/670), [GitHub #671](https://github.com/gpillon/ignis/issues/671), [ADR 0065](../adr/0065-the-bf16-exception-tensors-can-be-held-in-fp8.md), [the BF16 exception tensors in FP8](2026-10-21-the-bf16-exception-tensors-in-fp8.md), [Blackwell's GDN prefill on ignis's kernels](2026-11-08-blackwell-gdn-prefill-on-ignis-kernels.md) (the 2026-11-08 tiers)
 - Superseded by: none
+- Corrected by: [ADR 0103](../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)
 - Summary: RTX 5090, 27B: FP8 exceptions move the 20-case entailment set by an RMS of 1.68-1.89 logits, inside a harmless switch's 1.42-2.10; over 14 named arms no contributed "yes" case stays a gate, two ignis-written ones do.
 
 ## Question
@@ -85,6 +86,16 @@ with the GPU test itself, one load per arm:
   the RTX 5090 is yarn:3 or yarn:3.5 by a few hundred MB of headroom, and FP8
   as the default moves it from yarn:3 only where BF16 adapted. Both BF16
   tables are arms (`s-bf16-yarn3`, `s-bf16-yarn3.5`).
+
+  > **Corrected 2026-11-18 (#682).** What a start keeps follows the VRAM free
+  > at start, for FP8 too ([ADR 0103](../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)): at the
+  > profile's shape, 917,504 tokens hold unadapted under the 1,200 MiB
+  > headroom with at least 28,483 MiB free under FP8 and 28,993 MiB under
+  > BF16, and under 1,500 MiB with 300 MiB more each. FP8 keeps 917,504 under
+  > both headrooms only with at least 28,783 MiB free: with 28,549-28,564 MiB
+  > free, FP8 kept 917,504 and BF16 adapted to 786,432 under 1,200 MiB, and
+  > under 1,500 MiB BF16 adapted to 720,896 (yarn:2.75) and FP8 to 786,432
+  > (yarn:3).
 
 The spread, as the RMS of the change in a case's signed margin between two
 arms over the 20 cases (in brackets: over the 20 cases and the 22 drafts),
@@ -187,6 +198,12 @@ under both.
 - The FP8 default changes the RTX 5090's rope table only where BF16's load
   adapted its context: with the profile's headroom on a desktop holding
   3 GB, BF16 already serves 917,504 tokens at yarn:3.5.
+
+  > **Corrected 2026-11-18 (#682).** BF16 keeps 917,504 there only with at
+  > least 28,993 MiB free at start ([ADR 0103](../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)), which
+  > this desktop is inferred to have left, holding about 0.5 GB less than
+  > the one #682 measured on: there, with 28,549 MiB free, BF16 adapted to
+  > 786,432 and yarn:3 while FP8 kept 917,504 and yarn:3.5.
 - The GPU tests run the harness under each exception weights by default; a
   run over every arm is the measurement itself, under five minutes.
 - The "yes" gates are thin: a change of the numerics that drops case 19 or
