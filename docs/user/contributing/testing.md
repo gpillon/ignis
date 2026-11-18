@@ -180,11 +180,12 @@ the other. They are no configuration fields: `GET /v1/config` and
   its accept copied through pageable memory, a stream synchronize after the
   accept and another after the commit, the comparison a measurement of the two
   needs. The committed tokens are the same either way (the round identity
-  test's `defer-verify` arm below). Whatever the variable says, an MTP load's
-  rounds, a teacher-forced round, and a round where a lane drafts nothing or
-  a sampled lane's run is cut (its penalty counts come back to the server)
-  return as earlier releases do. The VRAM plan is the same on both. Any other
-  value refuses the load, naming the variable.
+  test's `sync-verify` arm below). Whatever the variable says, an MTP load's
+  rounds, a teacher-forced round, a round where a lane drafts nothing or a
+  sampled lane's run is cut (its penalty counts come back to the server), and
+  every round before the load's first capture return as earlier releases do.
+  The VRAM plan is the same on both. Any other value refuses the load, naming
+  the variable.
 - `IGNIS_DECODE_GRAPH_COPIES=1` (from 0.11.0) gives the 27B the decode and
   verify rounds of earlier releases, the comparison a measurement of the two
   needs. Unset, an RTX 50 or RTX PRO card runs them copy-free: each layer adds
@@ -233,8 +234,9 @@ the other. They are no configuration fields: `GET /v1/config` and
 `crates/core/tests/round_identity_gpu.rs` holds two arms of the 27B's decode
 round, chosen by measurement switches, to the same committed tokens: at every
 width the load serves and at its draft window, with greedy and sampled lanes,
-a constrained round and a verify round whose runs the host cuts short, on the
-NVFP4 artifact with DFlash2, with its MTP head and with vision, and on
+a constrained round, a verify round whose runs the host cuts short, a
+teacher-forced verify round and a snapshot and restore of each lane right
+after a verify round, on the NVFP4 artifact with DFlash2, with its MTP head and with vision, and on
 the 16 GB and 12 GB classes' trellis artifacts, each under the exception
 weights it has. Each arm is held to the graphs' replay with every switch
 unset; a change behind a switch of its own adds that switch as an arm, as the

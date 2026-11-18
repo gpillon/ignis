@@ -33,10 +33,10 @@ int main() {
 
   // Which rounds stage through host-mapped memory and wait on a ticket.
   expect(ignis_verify_round_maps(kOn, kDflash2, !kForced), "a DFlash2 load's live round maps");
-  expect(!ignis_verify_round_maps(!kOn, kDflash2, !kForced), "IGNIS_DEFER_VERIFY=0 keeps main's round");
+  expect(!ignis_verify_round_maps(!kOn, kDflash2, !kForced), "IGNIS_DEFER_VERIFY=0 keeps the synchronous round");
   expect(!ignis_verify_round_maps(kOn, !kDflash2, !kForced),
-         "an MTP load's round (its drafter is not DFlash2) keeps main's round");
-  expect(!ignis_verify_round_maps(kOn, kDflash2, kForced), "a teacher-forced round keeps main's round");
+         "an MTP load's round (its drafter is not DFlash2) keeps the synchronous round");
+  expect(!ignis_verify_round_maps(kOn, kDflash2, kForced), "a teacher-forced round keeps the synchronous round");
 
   // Which of them return with the fold in flight.
   constexpr bool kExtent0 = true;  // a lane at extent 0

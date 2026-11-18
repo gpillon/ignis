@@ -552,12 +552,13 @@ struct IgnisVerifyRound {
   std::array<uint32_t, IGNIS_DECODE_MAX_BATCH> graph_copy_nodes{};
 
   // GitHub #676: IGNIS_DEFER_VERIFY as the latest `ignis_decode_graph_capture`
-  // read it, on until one reads `0`; the staging a DFlash2 load's rounds take
+  // read it, off before a load's first capture, as the copy-free round and the
+  // GDN gating's home are (earlier releases' round until then); the staging a DFlash2 load's rounds take
   // under it, made at load (null on every other load); the drafter's append
   // after the commit as one graph per width, captured with the verify graphs
   // under it; and the rounds that returned with their fold in flight
   // (`ignis_program_stats`).
-  bool defer = true;
+  bool defer = false;
   std::unique_ptr<VerifyStaging> staging;
   std::array<cudaGraphExec_t, IGNIS_DECODE_MAX_BATCH> append_exec{};
   std::uint64_t folds_in_flight = 0;

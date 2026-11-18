@@ -39,9 +39,19 @@
 //! runs eagerly whatever the arm, then a verify round whose every run the
 //! host cuts one token short, as a grammar's check-first cut does (GitHub
 //! #590): a sampled lane's count of the token cut off comes back to the host,
-//! and the session fails if no run of two or more was cut. At the widest,
-//! every odd lane is released and the rest ride verify rounds, then plain
-//! ones. So every width from 1 to the load's lanes runs every kind of round,
+//! and the session fails if no run of two or more was cut; then a
+//! teacher-forced verify round (GitHub #267), each lane forced to a run of
+//! the digits, which runs eagerly where a lane samples under the sampled
+//! draft (its recording is on the device, which no graph was captured with)
+//! and so holds the eager verify traversal of each arm, the copy-free one
+//! included, to the reference through the rounds after it. At the widest,
+//! every odd lane is released and the rest ride verify rounds; each of them
+//! is then snapshotted and restored from its snapshot, right after a verify
+//! round that left its fold in flight where the arm defers, so that a
+//! snapshot taken behind a fold still on the device has to carry the
+//! committed state (the `sync-verify` arm's, taken after a synchronized fold,
+//! is the comparison); then they ride plain rounds. So every width from 1 to
+//! the load's lanes runs every kind of round,
 //! from the graphs or eagerly as the arm says (every round asserts which), and
 //! the transitions a lever that keeps work in flight has to survive all
 //! happen: a prefill and a release between rounds, a width that grows and one
@@ -50,9 +60,11 @@
 //! its lane's stream.
 //!
 //! GitHub #676: a DFlash2 load's verify rounds return with their fold in
-//! flight unless the arm sets `IGNIS_DEFER_VERIFY=0`, and an MTP load's never
-//! do; each arm's sessions assert which from the load's count of such rounds,
-//! and a capture's drafter append graphs from their ready mask. The NVFP4 body
+//! flight once its graphs are captured, unless the arm sets
+//! `IGNIS_DEFER_VERIFY=0`, and an MTP load's never do; so the `eager` arm's,
+//! run before the load's first capture, return as `sync-verify`'s do. Each
+//! arm's sessions assert which from the load's count of such rounds, and a
+//! capture's drafter append graphs from their ready mask. The NVFP4 body
 //! loads once per exception setting in one process, so a run of both settings
 //! holds a second load's deferred rounds, on staging of its own, to main's
 //! tokens: what the host-mapped memory following the load, not the process,
@@ -122,7 +134,7 @@ use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS;
 use ignis_core::step::{
     capture_decode_graphs, decode_program_batch_permitted, decode_program_batch_sampled, decode_program_verify_cut,
-    decode_program_verify_runs, prefill_program_multimodal, prefill_program_sampled, program_stats, MultimodalPrefill,
+    decode_program_verify_forced, decode_program_verify_runs, prefill_program_multimodal, prefill_program_sampled, program_stats, MultimodalPrefill,
     PermittedLane, Redirect, SamplingParams, VerifyLane,
 };
 use ignis_core::{
@@ -150,7 +162,7 @@ const ARMS: &[Arm] = &[
     // #674: the round timing, an instrument; its arm captures the graphs a second time.
     Arm { name: "round-timing", switches: &[("IGNIS_ROUND_TIMING", "1")], graphs: true },
     // #676's arm, below this line.
-    Arm { name: "defer-verify", switches: &[("IGNIS_DEFER_VERIFY", "0")], graphs: true },
+    Arm { name: "sync-verify", switches: &[("IGNIS_DEFER_VERIFY", "0")], graphs: true },
 
     // #677's arm, below this line.
     Arm { name: "decode-graph-copies", switches: &[("IGNIS_DECODE_GRAPH_COPIES", "1")], graphs: true },
@@ -266,10 +278,11 @@ const DRAFTER_COPIES: u32 = 5 + 1 + 16;
 /// Plain rounds, then verify rounds, at each width of the session.
 const PLAIN_ROUNDS: u32 = 4;
 const VERIFY_ROUNDS: u32 = 4;
-/// And, halfway through the verify rounds, one constrained round and one
-/// verify round the host cuts.
+/// And, halfway through the verify rounds, one constrained round, one
+/// verify round the host cuts and one teacher-forced verify round.
 const CONSTRAINED_ROUNDS: u32 = 1;
 const CUT_ROUNDS: u32 = 1;
+const FORCED_ROUNDS: u32 = 1;
 /// The most tokens a prompt below takes.
 const PROMPT_TOKENS: u32 = 64;
 /// The load's prefill chunk: every prompt fits one.
@@ -302,9 +315,9 @@ impl Load {
 
     /// The context the session's longest-lived lane needs: its prompt, then
     /// at each width and once more after the release its plain and
-    /// constrained tokens and whole verify runs.
+    /// constrained tokens and whole verify runs, the forced one's included.
     fn context(&self) -> u32 {
-        let rounds = PLAIN_ROUNDS + CONSTRAINED_ROUNDS + (VERIFY_ROUNDS + CUT_ROUNDS) * (self.window + 1);
+        let rounds = PLAIN_ROUNDS + CONSTRAINED_ROUNDS + (VERIFY_ROUNDS + CUT_ROUNDS + FORCED_ROUNDS) * (self.window + 1);
         let tokens = PROMPT_TOKENS + (self.lanes + 1) * rounds;
         tokens.div_ceil(128) * 128
     }
@@ -503,6 +516,10 @@ enum Round {
     /// A verify round whose every run of two or more the host cuts one
     /// token short.
     Cut,
+    /// A teacher-forced verify round, each lane forced to a run of
+    /// [`Script::permitted`]: eager where a lane samples under the sampled
+    /// draft, from the graphs otherwise (the fixed draft forces greedy lanes).
+    Forced,
 }
 
 /// `count` rounds of one kind over the riding lanes; a cut round counts the
@@ -558,6 +575,29 @@ fn ride(
                     committed[lane].push(token);
                 }
             }
+            Round::Forced => {
+                let sampled_draft = load.draft_rule == DraftRule::Sampled;
+                let lanes: Vec<VerifyLane<'_>> = riding
+                    .iter()
+                    .map(|&lane| VerifyLane {
+                        sampling: if sampled_draft { sampling(lane) } else { SamplingParams::greedy() },
+                        ..VerifyLane::greedy(&[])
+                    })
+                    .collect();
+                let recordings: Vec<Vec<i32>> = riding
+                    .iter()
+                    .map(|&lane| (0..=load.window as usize).map(|at| script.permitted[(lane + at) % script.permitted.len()]).collect())
+                    .collect();
+                let forced: Vec<&[i32]> = recordings.iter().map(Vec::as_slice).collect();
+                let runs = decode_program_verify_forced(model, pool, &mut refs, &lanes, load.window, &forced)
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+                let on_device = lanes.iter().any(|lane| lane.sampling.temperature > 0.0);
+                expect_replay(model, pool, graphs && !on_device, &what);
+                for (&lane, run) in riding.iter().zip(runs) {
+                    committed[lane].extend(run.tokens);
+                    committed[lane].push(-1);
+                }
+            }
             Round::Constrained => {
                 let lanes: Vec<PermittedLane<'_>> = riding
                     .iter()
@@ -594,6 +634,7 @@ fn session(model: &Model, pool: &SeqPool, load: &Load, script: &Script, sampling
         rides(&mut seqs, &riding, (Round::Verify, VERIFY_ROUNDS / 2));
         rides(&mut seqs, &riding, (Round::Constrained, CONSTRAINED_ROUNDS));
         rides(&mut seqs, &riding, (Round::Cut, CUT_ROUNDS));
+        rides(&mut seqs, &riding, (Round::Forced, FORCED_ROUNDS));
         rides(&mut seqs, &riding, (Round::Verify, VERIFY_ROUNDS - VERIFY_ROUNDS / 2));
     }
     if lanes > 1 {
@@ -602,6 +643,13 @@ fn session(model: &Model, pool: &SeqPool, load: &Load, script: &Script, sampling
         }
         let riding: Vec<usize> = (0..lanes).step_by(2).collect();
         rides(&mut seqs, &riding, (Round::Verify, VERIFY_ROUNDS));
+        // GitHub #676: each lane's state through a snapshot taken right after
+        // that verify round, and back.
+        for &lane in &riding {
+            let seq = seqs[lane].as_mut().expect("a riding lane");
+            let blob = seq.snapshot().unwrap_or_else(|e| panic!("{label}: snapshot lane {lane}: {e}"));
+            seq.restore(&blob).unwrap_or_else(|e| panic!("{label}: restore lane {lane}: {e}"));
+        }
         rides(&mut seqs, &riding, (Round::Plain, PLAIN_ROUNDS));
     }
     assert!(cuts > 0, "{label}: no verify run of two or more was cut, so no cut took a count back");
@@ -609,10 +657,11 @@ fn session(model: &Model, pool: &SeqPool, load: &Load, script: &Script, sampling
 }
 
 /// GitHub #676: whether the arm's verify rounds return with their fold in
-/// flight: a DFlash2 load's do unless the arm sets `IGNIS_DEFER_VERIFY=0`, an
-/// MTP load's never.
+/// flight: a DFlash2 load's do once its graphs are captured, unless the arm
+/// sets `IGNIS_DEFER_VERIFY=0`; an MTP load's never, nor the `eager` arm's,
+/// which run before the load's first capture.
 fn defers_verify(load: &Load, arm: &Arm) -> bool {
-    load.backend == SpeculativeBackend::Dflash2 && !arm.switches.contains(&("IGNIS_DEFER_VERIFY", "0"))
+    load.backend == SpeculativeBackend::Dflash2 && arm.graphs && !arm.switches.contains(&("IGNIS_DEFER_VERIFY", "0"))
 }
 
 /// The arm's sessions, greedy then sampled, its switches set and, for an arm
@@ -635,9 +684,10 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         .iter()
         .map(|&(kind, sampling)| session(model, pool, load, script, sampling, arm.graphs, &format!("{label} {} {kind}", arm.name)))
         .collect();
-    // Where the arm defers, every verify round but a cut one leaves its fold
-    // in flight: the rest cut nothing, draft the whole window and take no
-    // penalty count back. A cut round does too when its lanes are greedy.
+    // Where the arm defers, every verify round but a cut or a forced one
+    // leaves its fold in flight: the rest cut nothing, draft the whole window
+    // and take no penalty count back. A cut round does too when its lanes are
+    // greedy; a forced round never does.
     let left = stats().verify_folds_in_flight - folds;
     let uncut = KINDS.len() as u64 * u64::from((load.lanes + u32::from(load.lanes > 1)) * VERIFY_ROUNDS);
     if defers_verify(load, arm) {

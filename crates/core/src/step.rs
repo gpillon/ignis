@@ -480,7 +480,8 @@ pub struct ProgramStats {
     /// GitHub #676: the verify rounds of this load that returned with their
     /// fold in flight -- the commit's device work still on the stream, every
     /// later leaf call ordered behind it. Only a DFlash2 load's rounds do,
-    /// unless `IGNIS_DEFER_VERIFY=0`; 0 on every other load.
+    /// from its first [`capture_decode_graphs`] on, unless that capture read
+    /// `IGNIS_DEFER_VERIFY=0`; 0 on every other load.
     pub verify_folds_in_flight: u64,
     /// GitHub #676: bit `w - 1` set when the DFlash2 drafter's append after a
     /// verify round's commit replays a graph captured by

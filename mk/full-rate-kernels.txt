@@ -60,6 +60,10 @@ cuda     w8_imma_split_kernel             kernel/src/w8_imma.cu         # #627: 
 mma      w8_imma_gemm_kernel              kernel/src/w8_imma.cu         # #627: the head's matrices above 8 tokens, s8 x s8 MMA per group
 cuda     w8_rowsplit_gemm_simt_kernel     kernel/vendor/src/ops/linear/w8/w8_rowsplit_gemm_simt.cuh   # #627: vendored, the head's matrices up to 8 tokens (and the vision tower's), fp32 FMA
 
+# The 27B's DFlash2 verify round on every card (spec #672, #676): its inputs staged from
+# host-mapped memory and its accept handed back there, CUDA cores.
+cuda     copy_then_ticket                 kernel/src/deferred_verify.cu # #676: the staged copies, then the ticket the host waits on
+
 # The kernels of the prompt prefill that predate the rule and stay as they are
 # (#488, parked): each leaves the list when #488 converts it.
 exempt   nvfp4_a16_mma_kernel                       # #488: the DFlash2 drafter's prompt prefill, BF16 MMA

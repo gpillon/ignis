@@ -11,7 +11,8 @@
 // lane's state is committed from the host's own numbers, and every later leaf
 // call reaches the device behind that work (kernel/src/deferred_verify.cu).
 // IGNIS_DEFER_VERIFY=0, read at each capture of the decode graphs, gives every
-// round earlier releases' path.
+// round earlier releases' path, which a load's rounds before its first
+// capture take too.
 //
 // Host-only, no CUDA type: kernel/tests/test_verify_return.cpp builds it with
 // no CUDA library, so it runs on a card another process holds.

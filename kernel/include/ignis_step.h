@@ -524,8 +524,8 @@ struct ignis_program_stats {
   uint32_t decode_graph_copy_nodes[IGNIS_DECODE_MAX_BATCH];
   /* GitHub #676: the verify rounds of this load that returned with their
    * fold in flight (the commit's device work still on the model's stream,
-   * every later leaf call ordered behind it): a DFlash2 load's, unless
-   * IGNIS_DEFER_VERIFY=0; 0 on every other load. */
+   * every later leaf call ordered behind it): a DFlash2 load's once a capture
+   * has read IGNIS_DEFER_VERIFY unset or `1`; 0 on every other load. */
   uint64_t verify_folds_in_flight;
   /* GitHub #676: bit (w-1) set when the DFlash2 drafter's append after a
    * verify round's commit replays a graph the latest capture made at exact
@@ -591,7 +591,8 @@ struct ignis_program_stats {
  * (`ignis_program_stats::drafter_append_graph_ready_mask`, a failure
  * degrading that width to the eager append); under `0` they take earlier
  * releases' path. Any other value refuses the call like IGNIS_ROUND_TIMING's.
- * A load whose graphs were never captured defers.
+ * A load whose graphs were never captured takes earlier releases' path, as
+ * under `0`.
  *
  * GitHub #681: each call also decides, from the card and IGNIS_GDN_GATING
  * (`chain` or `branch`; unset is `branch`), where each GDN
