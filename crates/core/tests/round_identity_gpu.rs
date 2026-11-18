@@ -597,8 +597,17 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         .iter()
         .map(|&(kind, sampling)| session(model, pool, load, script, sampling, arm.graphs, &format!("{label} {} {kind}", arm.name)))
         .collect();
+    // Where the arm defers, every verify round but a cut one leaves its fold
+    // in flight: the rest cut nothing, draft the whole window and take no
+    // penalty count back. A cut round does too when its lanes are greedy.
     let left = stats().verify_folds_in_flight - folds;
-    assert_eq!(left > 0, defers_verify(load, arm), "{label}: {}: {left} verify rounds returned with their fold in flight", arm.name);
+    let uncut = KINDS.len() as u64 * u64::from((load.lanes + u32::from(load.lanes > 1)) * VERIFY_ROUNDS);
+    if defers_verify(load, arm) {
+        assert!(left >= uncut, "{label}: {}: {left} verify rounds left their fold in flight, not the {uncut} uncut ones", arm.name);
+    } else {
+        assert_eq!(left, 0, "{label}: {}: verify rounds left their fold in flight", arm.name);
+    }
+    println!("round_identity_gpu {label}: arm `{}`: {left} verify rounds returned with their fold in flight", arm.name);
     apply(&REFERENCE);
     sessions
 }

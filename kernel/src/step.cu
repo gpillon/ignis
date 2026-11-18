@@ -2176,7 +2176,10 @@ struct UncommittedRingColumns {
 // so a lane whose run was cut stands exactly where a per-token decode of the
 // same text would, and one whose run was not stands with t* pending -- what
 // today's round leaves after one token, at every token of the run. The round
-// is atomic: no lane's state moves unless every step succeeded.
+// is atomic: no lane's state moves unless every step succeeded. GitHub #676:
+// a round that leaves its fold in flight (kernel/src/verify_return.h) moves
+// every lane's state once the fold is queued, not confirmed; a fault in it
+// surfaces at the next leaf call that waits on the device.
 int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
                          ignis_seq *const *sequences, uint64_t batch_size,
                          const ignis_sampling_params *sampling, const ignis_decode_options &options,
