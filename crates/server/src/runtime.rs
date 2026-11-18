@@ -75,6 +75,11 @@ pub struct EngineShape {
     /// the config was fitted to and the card's generation, and again by
     /// [`EngineShape::for_family`]; no flag names it.
     pub opener_page_rides_capture: bool,
+    /// The measurement switch `IGNIS_SECOND_TAIL_CUT=1` as the load read it
+    /// (GitHub #649, [`EngineShape::with_second_tail_cut`]): what the opener
+    /// policy above is decided with. False on every shape no load read it
+    /// for: the resolution's, the default, a test's.
+    pub second_tail_cut: bool,
     /// The GPU generation of the card the start read, `None` when it read
     /// none (the mock build, a test's shape): what the opener policy above
     /// is decided by.
@@ -173,6 +178,7 @@ impl Default for EngineShape {
             host_margin_bytes: crate::config::DEFAULT_HOST_MARGIN_BYTES,
             prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
             opener_page_rides_capture: false,
+            second_tail_cut: false,
             gpu_generation: None,
             retained_device_slots: crate::config::DEFAULT_RETAINED_DEVICE_SLOTS,
             retained_host_slots: crate::config::DEFAULT_RETAINED_HOST_SLOTS,
@@ -217,11 +223,13 @@ impl From<&crate::config::Config> for EngineShape {
             host_margin_bytes: config.host_margin_bytes,
             prompt_reuse: config.prompt_reuse,
             // GitHub #508: a config fitted to a family decides it on the card;
-            // one fitted to none leaves it to `for_family`.
+            // one fitted to none leaves it to `for_family`. GitHub #649: the
+            // measurement switch is the load's to read, not the config's.
             opener_page_rides_capture: config
                 .basis
                 .family()
-                .is_some_and(|family| crate::config::arch::opener_page_rides_capture(family, gpu_generation, crate::config::arch::second_tail_cut_requested())),
+                .is_some_and(|family| crate::config::arch::opener_page_rides_capture(family, gpu_generation, false)),
+            second_tail_cut: false,
             gpu_generation,
             retained_device_slots: config.retained_device_slots,
             retained_host_slots: config.retained_host_slots,
@@ -293,7 +301,7 @@ impl EngineShape {
         // GitHub #306: and so is an unnamed decode share, and where the
         // opener's page is published -- on the card's generation (#508).
         let this = Self {
-            opener_page_rides_capture: crate::config::arch::opener_page_rides_capture(family, self.gpu_generation, crate::config::arch::second_tail_cut_requested()),
+            opener_page_rides_capture: crate::config::arch::opener_page_rides_capture(family, self.gpu_generation, self.second_tail_cut),
             ..self.with_family_decode_share(family)
         };
         if this.retained_host_named || !this.prompt_reuse {
@@ -301,6 +309,22 @@ impl EngineShape {
         }
         // The config's own function (ADR 0046), from the lanes as named.
         Self { retained_host_slots: family.default_retained_host_slots(this.decode_lanes), ..this }
+    }
+
+    /// This shape under the measurement switch `IGNIS_SECOND_TAIL_CUT` as a
+    /// load read it (GitHub #649, [`crate::config::arch::second_tail_cut`]):
+    /// where the opener's page is published decided again with it, for
+    /// `family`, the family the config was fitted to, as
+    /// [`EngineShape::from`] decides it, and by [`EngineShape::for_family`]
+    /// from then on. Off, a shape the resolution made is the one it was.
+    pub fn with_second_tail_cut(self, family: Option<ignis_core::compute::ModelFamily>, on: bool) -> Self {
+        Self {
+            opener_page_rides_capture: family.is_some_and(|family| {
+                crate::config::arch::opener_page_rides_capture(family, self.gpu_generation, on)
+            }),
+            second_tail_cut: on,
+            ..self
+        }
     }
 
     /// The solo width this shape stands for (GitHub #489): a width it names,
@@ -2194,11 +2218,11 @@ mod tests {
     }
 
     #[test]
-    fn with_no_card_read_only_a_flash_next_load_lets_the_opener_s_page_ride_the_capture() {
+    fn with_no_card_read_a_load_fitted_to_either_family_lets_the_opener_s_page_ride_the_capture() {
         // ADR 0029 as amended 2026-10-07 (GitHub #306): Flash-Next hands the
-        // pages below an opener over with its checkpoint, the 27B keeps its
-        // imaged prefix at a cut of its own -- on a shape that read no card,
-        // as on Blackwell (GitHub #508).
+        // pages below an opener over with its checkpoint; since GitHub #649
+        // (ADR 0100) so does the 27B, on a shape that read no card as on
+        // every card, unless the load read IGNIS_SECOND_TAIL_CUT=1.
         use ignis_core::compute::ModelFamily;
         let unnamed = EngineShape::default();
         let flash = scheduler_config_for_shape("m".into(), unnamed.for_family(ModelFamily::FlashNext), 64, 1024, 8);
@@ -2216,13 +2240,18 @@ mod tests {
         assert!(!scheduler_config_for_shape("m".into(), on_27b, 64, 1024, 8).opener_page_rides_capture);
         assert!(scheduler_config_for_shape("m".into(), unnamed.for_family(ModelFamily::Qwen38_27b), 64, 1024, 8)
             .opener_page_rides_capture);
+        let switched = unnamed.with_second_tail_cut(Some(ModelFamily::Qwen38_27b), true);
+        assert!(!switched.opener_page_rides_capture, "the switch, no card read: the 27B cuts twice");
+        assert!(!switched.for_family(ModelFamily::Qwen38_27b).opener_page_rides_capture, "and fitted to it again");
+        assert!(switched.for_family(ModelFamily::FlashNext).opener_page_rides_capture, "Flash-Next whatever it says");
     }
 
     /// GitHub #508 (ADR 0029 as amended 2026-11-05): the 27B's opener page
     /// rides the capture on the card the start read when it is an Ampere or an
     /// Ada one, on the path its load takes (`load::load_shape`, then its
     /// decode share) and when the shape is fitted to it again; on an RTX 5090
-    /// too (GitHub #649). Flash-Next's rides on every card.
+    /// too (GitHub #649), unless the load read `IGNIS_SECOND_TAIL_CUT=1`,
+    /// handed here as the load hands it. Flash-Next's rides on every card.
     #[test]
     fn the_27b_s_opener_page_rides_the_capture_on_every_card() {
         use crate::config::profile::{testing, Card};
@@ -2238,6 +2267,12 @@ mod tests {
             let loaded = crate::load::load_shape(&qwen, None).with_family_decode_share(ModelFamily::Qwen38_27b);
             assert_eq!(scheduler_config_for_shape("m".into(), loaded, 64, 1024, 8).opener_page_rides_capture, rides, "{name}");
             assert_eq!(loaded.for_family(ModelFamily::Qwen38_27b).opener_page_rides_capture, rides, "{name}: fitted again");
+            let switched = crate::load::load_shape(&qwen, None)
+                .with_second_tail_cut(qwen.basis.family(), true)
+                .with_family_decode_share(ModelFamily::Qwen38_27b);
+            let one_cut = card.name != testing::rtx_5090().name;
+            assert_eq!(scheduler_config_for_shape("m".into(), switched, 64, 1024, 8).opener_page_rides_capture, one_cut, "{name}: the switch");
+            assert_eq!(switched.for_family(ModelFamily::Qwen38_27b).opener_page_rides_capture, one_cut, "{name}: the switch, fitted again");
             let flash = EngineShape::from(&config).for_family(ModelFamily::FlashNext);
             assert!(scheduler_config_for_shape("m".into(), flash, 64, 1024, 8).opener_page_rides_capture, "{name}: Flash-Next");
         }
@@ -2386,6 +2421,7 @@ mod tests {
             host_margin_bytes: crate::config::DEFAULT_HOST_MARGIN_BYTES,
             prompt_reuse: true,
             opener_page_rides_capture: false,
+            second_tail_cut: false,
             gpu_generation: None,
             retained_device_slots: 2,
             retained_host_slots: 3,

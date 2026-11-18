@@ -66,13 +66,17 @@ the other. They are no configuration fields: `GET /v1/config` and
   attention band beside it, and its VRAM plan is sized for that route. The
   sm_86 gate's quality leg ([Releases](releases.md)) names `ours` beside the
   other two routes, as its limits were measured.
-- `IGNIS_SECOND_TAIL_CUT=1` (from 0.11.0) gives the 27B on an RTX 50 card, or
-  with no card read, its second tail cut back at each model load: the imaged
-  prefix at the generation opener's page floor, main's behaviour before the
-  single cut ([ADR 0100](../../adr/0100-the-27b-cuts-a-reusable-prompts-tail-once-at-the-generation-opener-on-every-card.md)),
+- `IGNIS_SECOND_TAIL_CUT=1` (from 0.11.0) gives the 27B on an RTX 50 or RTX
+  PRO card, or with no card read, its second tail cut back at each model load:
+  a reusable prompt is cut at the generation opener's page floor too, where
+  its imaged prefix is published, as 0.10.0 cuts it there
+  ([ADR 0100](../../adr/0100-the-27b-cuts-a-reusable-prompts-tail-once-at-the-generation-opener-on-every-card.md)),
   the comparison a time-to-first-token measurement needs. Unset, the 27B cuts a
   reusable prompt once, at the opener, on every card. The 27B on an RTX 30 or
-  RTX 40 card and Flash-Next cut once whatever the variable says.
+  RTX 40 card and Flash-Next cut once whatever the variable says. Any other
+  value refuses the load, naming the variable. The load logs what it runs
+  under `ignis.model.loaded` (`second_tail_cut`: `true` only where it cuts a
+  second time).
 - `IGNIS_HQ_DECODE_ATTENTION=ours|vendored` (from 0.11.0) picks the attention
   route of the 27B's decode and verify rounds over `hq-e8-2b` at each model
   load: ignis's warp-specialized route, or the vendored kernel's route it
