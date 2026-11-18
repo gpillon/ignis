@@ -1230,9 +1230,9 @@ set_tests_properties(ignis_kernel_prefill_swiglu_test PROPERTIES TIMEOUT 300)
 # GitHub #652 (spec #646): OURS -- the layout the W4A4 prefill products read their activations in
 # (kernel/src/w4a4_activation_layout.h): the switch IGNIS_W4A4_ACTIVATION_LAYOUT as a load reads
 # it, the quantizer's K-tile-major bytes against the stock ones moved, and the 27B's five prefill
-# products through their ops at 1,024, 2,048 and 4,096 tokens, K-tile-major on a stream a descriptor
-# cache serves against token-major, byte for byte. A tensor map that does not match its reads
-# hangs the product: the timeout makes it a failure. GPU (ADR 0006: no SKIP_RETURN_CODE).
+# products through their ops at 1,024, 1,280, 2,048 and 4,096 tokens, K-tile-major on a stream a
+# descriptor cache serves against token-major, byte for byte. A tensor map that does not match its
+# reads hangs the product: the timeout makes it a failure. GPU (ADR 0006: no SKIP_RETURN_CODE).
 add_executable(ignis_kernel_w4a4_activation_layout_test test_w4a4_activation_layout.cu)
 target_include_directories(ignis_kernel_w4a4_activation_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_w4a4_activation_layout_test PRIVATE ignis_kernel ignis_vendor)
