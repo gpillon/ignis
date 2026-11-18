@@ -132,7 +132,7 @@ beyond the best match above it (for KV-disk, 8,192 on Flash-Next and
 - **Time to first token.** A request that resumes skips prefilling the part it
   matched. At the 27B's cold rate of about 11,300 tokens per second on a 46K
   prompt, reading such a prompt cold takes roughly 4.1 seconds (arithmetic from
-  the README's figure); the resumed part costs a copy instead. A
+  the README's figure, measured on 0.10.0: from 0.11.0 the prefill changes have a cold prompt of 16K to 64K tokens read about 14-18% sooner on the RTX 5090, [measured](../../findings/2026-11-18-the-27bs-cold-prefill-served-on-the-rtx-5090-after-spec-646.md)); the resumed part costs a copy instead. A
   device-to-device clone of 148 MiB of state measured 0.25 ms, and a full-context
   snapshot and restore round trip through host RAM about 90 ms, both far below
   the prefill they replace
