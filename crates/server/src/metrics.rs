@@ -79,6 +79,12 @@ pub struct LoadReservations {
     /// telemetry consumer, which reads it at every tick
     /// ([`crate::Server::with_load_reservations`]).
     pub flash_next: Option<Arc<FlashNextCounterSource>>,
+    /// The draft positions this load's verify rounds report (GitHub #685,
+    /// [`ignis_core::speculation::draft_positions`]), 0 on a load with no
+    /// speculation. Not a reservation either: it sizes the per-position
+    /// speculative families, which print the most positions any load of
+    /// the process reported.
+    pub draft_positions: u32,
 }
 
 impl LoadReservations {
@@ -100,6 +106,7 @@ impl LoadReservations {
             retained_host_bytes: 0,
             kv_disk_bytes: None,
             flash_next: None,
+            draft_positions: 0,
         }
     }
 
@@ -764,6 +771,11 @@ pub struct Metrics {
     spec_accepted: AtomicU64,
     spec_drafted_at: [AtomicU64; ignis_core::types::DRAFT_POSITIONS],
     spec_accepted_at: [AtomicU64; ignis_core::types::DRAFT_POSITIONS],
+    /// The positions those two families print (GitHub #685): the most draft
+    /// positions any load of the process reported, never fewer than
+    /// [`ignis_core::speculation::MIN_DRAFT_POSITIONS`], and never lowered,
+    /// so an unload or a narrower next load takes no series away.
+    spec_positions: AtomicU64,
     /// Per [`TokenizeRoute::ALL`] (GitHub #285). Absent from the exposition
     /// until one of them moves. Counts calls, not requests of the lifecycle
     /// above: a counting route never enters the scheduler.
@@ -958,6 +970,7 @@ impl Metrics {
             spec_accepted: AtomicU64::new(0),
             spec_drafted_at: std::array::from_fn(|_| AtomicU64::new(0)),
             spec_accepted_at: std::array::from_fn(|_| AtomicU64::new(0)),
+            spec_positions: AtomicU64::new(u64::from(ignis_core::speculation::MIN_DRAFT_POSITIONS)),
             tokenize_calls: Default::default(),
             locates: Default::default(),
             image_jobs: Default::default(),
@@ -1326,6 +1339,7 @@ impl Metrics {
         self.retained_host_bytes.store(reserved.retained_host_bytes, Ordering::Relaxed);
         self.kv_disk_loaded.store(u64::from(reserved.kv_disk_bytes.is_some()), Ordering::Relaxed);
         self.kv_disk_capacity_bytes.store(reserved.kv_disk_bytes.unwrap_or(0), Ordering::Relaxed);
+        self.spec_positions.fetch_max(u64::from(reserved.draft_positions), Ordering::Relaxed);
     }
 
     /// Nothing is loaded (spec model-switch/02: the idle clock unloaded the
@@ -1839,9 +1853,11 @@ impl Metrics {
         // verify rounds ends (a load without speculation exports nothing of
         // it). Acceptance is accepted / drafted; per position, a draft at
         // position p counts in `drafted` when a round proposed it and in
-        // `accepted` when the round committed it too.
+        // `accepted` when the round committed it too. GitHub #685: as many
+        // positions as the loads reported.
         let rounds = read(&self.spec_rounds);
         if rounds > 0 {
+            let positions = read(&self.spec_positions) as usize;
             for (name, help, series) in [
                 ("ignis_speculative_rounds_total", "Verify rounds run.", &self.spec_rounds),
                 ("ignis_speculative_drafted_tokens_total", "Draft tokens verified.", &self.spec_drafted),
@@ -1863,7 +1879,7 @@ impl Metrics {
                 ),
             ] {
                 declare(&mut out, name, "counter", help);
-                for (j, series) in family.iter().enumerate() {
+                for (j, series) in family.iter().take(positions).enumerate() {
                     let _ = writeln!(out, "{name}{{position=\"{}\"}} {}", j + 1, read(series));
                 }
             }
@@ -2264,6 +2280,39 @@ mod tests {
         assert_eq!(value(&text, "ignis_speculative_position_drafted_total", "position=\"3\""), "2");
     }
 
+    /// GitHub #685: the per-position families print the draft positions the
+    /// loads report, each sized by its own window. A DFlash2 load, the 27B's
+    /// MTP load and a Flash-Next load each print the seven positions every
+    /// load printed while one cap bounded every drafter, whatever their
+    /// window; an unload takes none away, and a projection no load described
+    /// prints the same seven.
+    #[test]
+    fn the_position_families_print_the_draft_positions_each_load_reports() {
+        use ignis_core::{Speculation, SpeculativeBackend, speculation::FlashNextSpeculation};
+        let printed = |metrics: &Metrics| {
+            let text = metrics.render();
+            ["ignis_speculative_position_drafted_total{", "ignis_speculative_position_accepted_total{"]
+                .map(|family| text.lines().filter(|line| line.starts_with(family)).count())
+        };
+        let loads = [
+            ("dflash2 at 7", Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap().draft_positions()),
+            ("dflash2 at 3", Speculation::new(SpeculativeBackend::Dflash2, 3).unwrap().draft_positions()),
+            ("the 27B's mtp at 7", Speculation::new(SpeculativeBackend::Mtp, 7).unwrap().draft_positions()),
+            ("flash-next's mtp at 2", FlashNextSpeculation::new(SpeculativeBackend::Mtp, 2, 0).unwrap().draft_positions()),
+        ];
+        for (load, draft_positions) in loads {
+            let metrics = Metrics::new();
+            metrics.set_load_reservations(LoadReservations { draft_positions, ..LoadReservations::none() });
+            metrics.record_speculation(&ignis_core::types::SpecCounters::round(2, 1));
+            assert_eq!(printed(&metrics), [7, 7], "{load}");
+            metrics.set_unloaded();
+            assert_eq!(printed(&metrics), [7, 7], "{load}, unloaded");
+        }
+        let undescribed = Metrics::new();
+        undescribed.record_speculation(&ignis_core::types::SpecCounters::round(2, 1));
+        assert_eq!(printed(&undescribed), [7, 7], "no load described");
+    }
+
     /// A load's reservations with nothing in them but KV-disk's budget.
     fn with_disk(kv_disk_bytes: Option<u64>) -> LoadReservations {
         LoadReservations {
@@ -2280,6 +2329,7 @@ mod tests {
             retained_host_bytes: 0,
             kv_disk_bytes,
             flash_next: None,
+            draft_positions: 0,
         }
     }
 
@@ -2742,6 +2792,7 @@ mod tests {
             retained_host_bytes: 7 * 232_532_224,
             kv_disk_bytes: None,
             flash_next: None,
+            draft_positions: 0,
         });
 
         let text = metrics.render();

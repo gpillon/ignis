@@ -225,7 +225,7 @@ use ignis_core::compute::ModelFamily;
 /// (the 27B 19 -> 70 ms a decode round, Flash-Next 4.6 tok/s), at 1.5 GiB
 /// neither moved (finding 2026-10-09-vram-headroom-wddm-paging).
 pub const DEFAULT_VRAM_HEADROOM_BYTES: u64 = 1536 * 1024 * 1024;
-pub use ignis_core::{MAX_DRAFT_TOKENS, ProposalHead, ProposalHeadSetting, Speculation, SpeculativeBackend};
+pub use ignis_core::{ProposalHead, ProposalHeadSetting, Speculation, SpeculativeBackend};
 use ignis_core::{DraftRule, DrafterSampling};
 use ignis_core::speculation::{FLASH_NEXT_DEFAULT_DRAFT_TOKENS, QWEN38_MTP_DEFAULT_DRAFT_TOKENS};
 
@@ -1762,28 +1762,42 @@ fn derive_speculation(
         None if backend == SpeculativeBackend::Mtp => FLASH_NEXT_DEFAULT_DRAFT_TOKENS,
         None => {
             return Err(ConfigError(format!(
-                "`{} {}` requires `--spec-draft-tokens N` (N in 1..={MAX_DRAFT_TOKENS})",
+                "`{} {}` requires `--spec-draft-tokens N` (N in 1..={})",
                 spelled("spec", "backend"),
-                backend.as_str()
+                backend.as_str(),
+                backend.max_draft_tokens()
             )));
         }
     };
     // GitHub #623: a window of 0 is the 27B's MTP head drafting nothing, a
     // load with no speculation (`fit_family` refuses it on Flash-Next's
-    // head). DFlash2 drafts 1 to 7 a round on every model.
+    // head). DFlash2 drafts 1 to its cap a round on every model (GitHub
+    // #685: each range is the drafter's own).
     if tokens == 0 {
         if backend != SpeculativeBackend::Mtp {
             return Err(ConfigError(format!(
-                "`{} 0`: `--spec-backend {}` drafts 1..={MAX_DRAFT_TOKENS} tokens a round (a window of 0 is the 27B's \
+                "`{} 0`: `--spec-backend {}` drafts 1..={} tokens a round (a window of 0 is the 27B's \
                  MTP head's, which then loads no speculation)",
                 spelled("spec", "draft_tokens"),
-                backend.as_str()
+                backend.as_str(),
+                backend.max_draft_tokens()
             )));
         }
         return Ok((None, true));
     }
-    let speculation = Speculation::new(backend, tokens)
-        .map_err(|_| ConfigError(format!("`{}` must be in 1..={MAX_DRAFT_TOKENS}, got {tokens}", spelled("spec", "draft_tokens"))))?;
+    // GitHub #685: a window inside the field's bound (the widest any drafter
+    // takes) but past this drafter's own cap, refused naming the drafter and
+    // its range (from 0 on the 27B's MTP head, a load with no speculation).
+    let speculation = Speculation::new(backend, tokens).map_err(|_| {
+        ConfigError(format!(
+            "`{} {tokens}`: `{} {}` drafts {}..={} tokens a round",
+            spelled("spec", "draft_tokens"),
+            spelled("spec", "backend"),
+            backend.as_str(),
+            u32::from(!the_27bs_mtp),
+            backend.max_draft_tokens()
+        ))
+    })?;
     let drafter = DrafterSampling {
         temperature_factor_milli: s.drafter_temperature_factor,
         top_p_milli: s.drafter_top_p,
@@ -2052,10 +2066,11 @@ fn fit_family(
         match family {
             ModelFamily::FlashNext if s.spec.draft_tokens == Some(0) => {
                 return Err(ConfigError(format!(
-                    "`{} 0`: {}'s MTP head drafts 1..={MAX_DRAFT_TOKENS} tokens a round; a window of 0 is the \
+                    "`{} 0`: {}'s MTP head drafts 1..={} tokens a round; a window of 0 is the \
                      27B's MTP load with no speculation (`{} 0` names it for the 27B alone)",
                     spelled("spec", "draft_tokens"),
                     family.name(),
+                    SpeculativeBackend::Mtp.max_draft_tokens(),
                     schema::field("spec", "draft_tokens").expect("declared").scoped_flag(ModelFamily::Qwen38_27b)
                 )));
             }

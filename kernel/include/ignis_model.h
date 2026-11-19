@@ -249,8 +249,13 @@ enum ignis_speculative_backend {
   IGNIS_SPECULATIVE_MTP = 3,
 };
 
-/* The widest DFlash2 draft window a load accepts. */
+/* The widest draft window a load accepts, per drafter (GitHub #685): each
+ * backend is refused past its own. DFlash2's is held inside the domains of
+ * the vendored ops its verify round and its drafter call run
+ * (kernel/src/draft_window.h), so a cap past them does not build. */
 #define IGNIS_DFLASH2_MAX_DRAFT_TOKENS 7
+#define IGNIS_MTP_MAX_DRAFT_TOKENS 7
+#define IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS 7
 
 /* GitHub #335 (spec 27b-16gb/03 solution 6): how the 27B's prompt attention
  * multiplies its band pass over an hq-e8-2b prefill chunk
@@ -405,9 +410,10 @@ enum ignis_vision_residency {
 struct ignis_model_load_options {
   uint32_t size;
   int32_t speculative_backend; /* enum ignis_speculative_backend */
-  /* The draft window: 1..IGNIS_DFLASH2_MAX_DRAFT_TOKENS under DFLASH2 and
-   * VERIFY_ONLY, 0 with no backend. Fixed for the life of the load: it is
-   * the window the verify graphs are captured at, and the only
+  /* The draft window: 1..IGNIS_DFLASH2_MAX_DRAFT_TOKENS under DFLASH2,
+   * 1..IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS under VERIFY_ONLY,
+   * 1..IGNIS_MTP_MAX_DRAFT_TOKENS under MTP, 0 with no backend. Fixed for the
+   * life of the load: it is the window the verify graphs are captured at, and the only
    * `speculative_window` `ignis_program_decode` accepts besides 0. */
   uint32_t draft_tokens;
   /* The vision envelope in merged vision tokens per request (GitHub #177);

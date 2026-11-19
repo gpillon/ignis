@@ -644,7 +644,7 @@ config_group! {
         /// with `dflash2`; with `mtp` on the 27B 0..=7 (default 7, where 0
         /// loads no speculation), on Flash-Next 1..=7 (default 2). Needs a
         /// backend.
-        draft_tokens: Opt<Tokens> = None, between(0, ignis_core::MAX_DRAFT_TOKENS as i64), ALL, [Visible, Patchable, ReloadRequired, Scoped];
+        draft_tokens: Opt<Tokens> = None, between(0, ignis_core::WIDEST_DRAFT_TOKENS as i64), ALL, [Visible, Patchable, ReloadRequired, Scoped];
         /// Flash-Next's draft row budget: the rows a verify round takes across
         /// lanes, 0 (= 8) or 2..=32; past 8, five to eight lanes draft too.
         draft_rows: Opt<DraftRows> = None, between(0, ignis_core::speculation::FLASH_NEXT_MAX_VERIFY_ROWS as i64), FLASH_NEXT_ONLY,

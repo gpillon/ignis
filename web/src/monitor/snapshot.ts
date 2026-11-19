@@ -140,7 +140,7 @@ export type ExpertPhase = (typeof EXPERT_PHASES)[number];
 export const NGRAM_SOURCES = ["hot", "file"] as const;
 export type NgramSource = (typeof NGRAM_SOURCES)[number];
 
-/** The draft positions a verify round can carry (MAX_DRAFT_TOKENS): the per-position families' labels "1".."7". */
+/** The draft positions every load prints (MIN_DRAFT_POSITIONS, crates/core/src/speculation.rs): the per-position families' labels "1".."7". */
 export const DRAFT_POSITIONS = 7;
 
 /**
