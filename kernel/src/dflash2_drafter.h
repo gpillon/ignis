@@ -43,12 +43,13 @@ void ignis_dflash2_append_context(ignis_model *model, ignis_seq_pool *pool,
                                   ninfer::ops::KVCacheAppendPrefixExecutionEnvelope envelope,
                                   IgnisA16Call call);
 
-// The drafter's forward for a verify round at batch `width`: each lane's
+// The drafter's forward for a verify round at batch `width` and shape
+// `verify` (GitHub #686: the round's): each lane's
 // anchor and `k` mask tokens at positions `base + j`, five layers of two-tap
 // dynamic conv and sliding-window attention over the lane's window, the
 // target's output head over the `k` draft columns, the per-column top-k and
 // the selector lattice walk -- writing the round's drafts straight into
-// `model->verify->drafts` (`[k, width]`). GitHub #576: on a load under the
+// `verify.drafts` (`[k, width]`). GitHub #576: on a load under the
 // sampled draft, each sampling lane's drafts are drawn from the drafter's
 // distribution over the same lattice instead (`ignis_sampled_draft_draw`),
 // which it keeps in `draft_candidates`/`draft_q` for the accept. Reads the
@@ -69,7 +70,7 @@ void ignis_dflash2_append_context(ignis_model *model, ignis_seq_pool *pool,
 // the sampled draft the readout draws as the round does, and `q` receives the
 // distribution each sampling lane's draft was drawn from.
 //
-// GitHub #577 (test-only): with `model->verify->forced_tokens` set (a
+// GitHub #577 (test-only): with `verify.forced_tokens` set (a
 // teacher-forced round, eagerly), the draw drafts along the recording.
 struct Dflash2ProposalReadout {
   std::int32_t *candidate_ids = nullptr; // I32 [width][k][top_k]
@@ -78,11 +79,12 @@ struct Dflash2ProposalReadout {
   std::uint16_t *head_logits  = nullptr; // BF16 [width * k][head rows]
   float *q                    = nullptr; // F32 [width][k][top_k], under the sampled draft
 };
-void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, std::uint32_t width,
-                           const Dflash2ProposalReadout *readout = nullptr);
+void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
+                           std::uint32_t width, const Dflash2ProposalReadout *readout = nullptr);
 
 // The verify round's half of the append: the committed columns' feature
-// taps (`model->verify->features`, written by the traversal) at the round's
-// positions, `model->verify->append_counts` columns per lane (staged by the
-// caller after the cut), into each lane's window.
-void ignis_dflash2_append_round(ignis_model *model, ignis_seq_pool *pool, std::uint32_t width);
+// taps (`verify.features`, written by the traversal) at the round's
+// positions, `verify.append_counts` columns per lane (staged by the
+// caller after the cut), into each lane's window; `shape` is the round's.
+void ignis_dflash2_append_round(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
+                                std::uint32_t width);

@@ -239,7 +239,9 @@ extern "C" int32_t ignis_mtp_readout_round_hidden(struct ignis_model *model, uin
     set_error(std::string("ignis_mtp_readout_round_hidden: ") + refusal);
     return -1;
   }
-  if (model->verify == nullptr) {
+  // GitHub #686: the round of the load's base shape, its one shape.
+  const IgnisVerifyRound *const verify = model->base_shape.get();
+  if (verify == nullptr) {
     set_error("ignis_mtp_readout_round_hidden: the model was loaded without a draft window");
     return -1;
   }
@@ -249,12 +251,12 @@ extern "C" int32_t ignis_mtp_readout_round_hidden(struct ignis_model *model, uin
     return -1;
   }
   const auto hidden = static_cast<std::int32_t>(model->hidden);
-  const auto columns = static_cast<std::int32_t>(lanes * (model->verify->window + 1));
+  const auto columns = static_cast<std::int32_t>(lanes * (verify->window + 1));
   ninfer::DeviceArena::Scope scope = model->scratch->scope();
   try {
     // The commit's own call (kernel/src/mtp_head.cu `commit_rows`): the
     // final norm over the round's kept residual, at the round's width.
-    const ninfer::Tensor residual(model->verify->hidden->p, ninfer::DType::BF16, {hidden, columns, 1, 1});
+    const ninfer::Tensor residual(verify->hidden->p, ninfer::DType::BF16, {hidden, columns, 1, 1});
     ninfer::Tensor normalized = model->scratch->alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
     const ninfer::Tensor gain(const_cast<void *>(model->final_norm.qdata), ninfer::DType::BF16, {hidden, 1, 1, 1});
     ninfer::ops::rmsnorm(residual, gain, model->rms_norm_eps, /*unit_offset=*/true, normalized, model->stream);
@@ -288,7 +290,7 @@ extern "C" int32_t ignis_mtp_readout_chain(struct ignis_model *model, struct ign
     set_error("ignis_mtp_readout_chain: the drafts and scores outputs are required");
     return -1;
   }
-  if (model->verify == nullptr) {
+  if (model->base_shape == nullptr) {
     set_error("ignis_mtp_readout_chain: the model was loaded without a draft window");
     return -1;
   }
@@ -304,7 +306,8 @@ extern "C" int32_t ignis_mtp_readout_chain(struct ignis_model *model, struct ign
     set_error(std::string("ignis_mtp_readout_chain: ") + refusal);
     return -1;
   }
-  IgnisVerifyRound &verify = *model->verify;
+  // GitHub #686: the chain of the load's base shape, its one shape.
+  IgnisVerifyRound &verify = *model->base_shape;
   const std::uint32_t k = verify.window;
   // The caller sized its buffers by its window and extent; the chain runs
   // the load's window.
@@ -384,7 +387,8 @@ extern "C" int32_t ignis_mtp_readout_chain(struct ignis_model *model, struct ign
             "cudaMemcpyAsync(save the head's ring words)");
     }
     std::string error;
-    const int32_t rc = ignis::mtp::propose(*model, *pool, 1, &error, static_cast<std::uint16_t *>(scores.data));
+    const int32_t rc =
+        ignis::mtp::propose(*model, *pool, verify, 1, &error, static_cast<std::uint16_t *>(scores.data));
     // Put back even after a chain that failed part way: it may have appended.
     if (hq) {
       check(cudaMemcpyAsync(head_k, saved_at(0), plane_bytes, cudaMemcpyDeviceToDevice, stream),

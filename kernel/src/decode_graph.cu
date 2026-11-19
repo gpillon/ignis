@@ -177,14 +177,12 @@ int32_t ignis_decode_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
 // keys its stateless RNG by `lengths` (each lane's frontier) and the
 // speculative purposes, so a lane's draws depend on its own seed and
 // position alone -- G3's isolation property, kept by construction.
-int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t width,
-                                     LinearPolicyMode mode) {
+//
+// GitHub #686: at the round's shape `verify`, which every call below is handed.
+int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
+                                     uint32_t width, LinearPolicyMode mode) {
   if (model == nullptr || pool == nullptr) {
     set_error("ignis_verify_graph: null argument");
-    return -1;
-  }
-  if (model->verify == nullptr) {
-    set_error("ignis_verify_graph: the model was loaded without a draft window");
     return -1;
   }
   if (width == 0 || width > model->decode_lanes) {
@@ -192,7 +190,6 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
               std::to_string(model->decode_lanes) + ", the load's decode lanes");
     return -1;
   }
-  IgnisVerifyRound &verify = *model->verify;
   const auto k = static_cast<std::int32_t>(verify.window);
   const std::int32_t lane_columns = k + 1;
   const auto batch = static_cast<std::int32_t>(width);
@@ -218,11 +215,11 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
     // the verify substrate alone's were staged by the round from its caller.
     switch (model->drafter) {
     case IgnisDrafter::kDflash2:
-      ignis_dflash2_propose(model, pool, width);
+      ignis_dflash2_propose(model, pool, verify, width);
       break;
     case IgnisDrafter::kMtp: {
       std::string head_error;
-      if (ignis::mtp::propose(*model, *pool, width, &head_error) != 0) {
+      if (ignis::mtp::propose(*model, *pool, verify, width, &head_error) != 0) {
         set_error("ignis_verify_graph: width " + std::to_string(width) + ": " + head_error);
         return -1;
       }
@@ -253,8 +250,8 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
       void *out = in_place ? left.data : right.data;
       const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
-          ? ignis_gqa_layer_run_body_verify(model, pool, layer, width, left.data, out, mode)
-          : ignis_gdn_layer_run_body_verify(model, pool, layer, width, left.data, out, mode);
+          ? ignis_gqa_layer_run_body_verify(model, pool, verify, layer, width, left.data, out, mode)
+          : ignis_gdn_layer_run_body_verify(model, pool, verify, layer, width, left.data, out, mode);
       if (rc != 0) {
         const char *detail = model->layers[layer].kind == IGNIS_LAYER_GQA
             ? ignis_gqa_layer_last_error()
@@ -391,16 +388,17 @@ uint32_t copy_node_count(cudaGraph_t graph) {
 }
 
 // P5-04 (GitHub #153): records one width-W verify graph -- exactly
-// `ignis_verify_graph_run_batch`, captured once. Same failure handling as
-// the decode capture below.
-int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, uint32_t width,
-                                   cudaGraphExec_t *out_exec, uint32_t *out_nodes, uint32_t *out_copies) {
+// `ignis_verify_graph_run_batch`, captured once at shape `verify` (GitHub
+// #686). Same failure handling as the decode capture below.
+int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
+                                   uint32_t width, cudaGraphExec_t *out_exec, uint32_t *out_nodes,
+                                   uint32_t *out_copies) {
   *out_exec = nullptr;
   *out_nodes = 0;
   *out_copies = 0;
   // GitHub #577: a teacher-forced round's recording is set only while that
   // round runs eagerly; a graph that baked it in would force serving rounds.
-  if (model->verify->forced_tokens != nullptr) {
+  if (verify.forced_tokens != nullptr) {
     set_error("ignis_verify_graph_capture: a teacher-forced round's recording is set");
     return -1;
   }
@@ -411,7 +409,7 @@ int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, uin
     return -1;
   }
   const bool ok =
-      ignis_verify_graph_run_batch(model, pool, width, LinearPolicyMode::kEngineDefault) == 0;
+      ignis_verify_graph_run_batch(model, pool, verify, width, LinearPolicyMode::kEngineDefault) == 0;
   cudaGraph_t graph = nullptr;
   const cudaError_t end_err = cudaStreamEndCapture(model->stream, &graph);
   if (end_err != cudaSuccess) {
@@ -651,9 +649,12 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   if (!read_round_timing(model) || !read_decode_graph_copies(model) || !read_gdn_gating(model)) {
     return -1;
   }
+  // GitHub #686: the shape whose verify and append graphs this capture makes,
+  // the load's base shape; none on a load with no window.
+  IgnisVerifyRound *const shape = model->base_shape.get();
   // GitHub #676: IGNIS_DEFER_VERIFY, read at each capture like the round
   // timing; a load with no window has no verify round to defer.
-  if (model->verify != nullptr && !capture_switch(ignis::deferred_verify::read_switch, model->verify->defer)) {
+  if (shape != nullptr && !capture_switch(ignis::deferred_verify::read_switch, shape->defer)) {
     return -1;
   }
   const auto began = std::chrono::steady_clock::now();
@@ -671,14 +672,14 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
     release_graph(model->decode_graph_exec[width - 1], model->decode_graph_ready[width - 1],
                   model->decode_graph_nodes[width - 1]);
     model->decode_graph_copy_nodes[width - 1] = 0;
-    if (model->verify != nullptr) {
-      release_graph(model->verify->graph_exec[width - 1], model->verify->graph_ready[width - 1],
-                    model->verify->graph_nodes[width - 1]);
-      model->verify->graph_copy_nodes[width - 1] = 0;
+    if (shape != nullptr) {
+      release_graph(shape->graph_exec[width - 1], shape->graph_ready[width - 1],
+                    shape->graph_nodes[width - 1]);
+      shape->graph_copy_nodes[width - 1] = 0;
       // GitHub #676: and the drafter's append graph.
-      if (model->verify->append_exec[width - 1] != nullptr) {
-        cudaGraphExecDestroy(model->verify->append_exec[width - 1]);
-        model->verify->append_exec[width - 1] = nullptr;
+      if (shape->append_exec[width - 1] != nullptr) {
+        cudaGraphExecDestroy(shape->append_exec[width - 1]);
+        shape->append_exec[width - 1] = nullptr;
       }
     }
   }
@@ -705,26 +706,26 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   // load's window, under the same never-refuse-service rule -- a width whose
   // verify capture failed runs the verify traversal eagerly. On an MTP load
   // the head's chain is in them (GitHub #621).
-  if (model->verify != nullptr) {
+  if (shape != nullptr) {
     for (uint32_t width = 1; width <= model->decode_lanes; ++width) {
       cudaGraphExec_t exec = nullptr;
-      if (capture_verify_graph_width(model, pool, width, &exec, &model->verify->graph_nodes[width - 1],
-                                     &model->verify->graph_copy_nodes[width - 1]) == 0) {
-        model->verify->graph_exec[width - 1] = exec;
-        model->verify->graph_ready[width - 1] = true;
+      if (capture_verify_graph_width(model, pool, *shape, width, &exec, &shape->graph_nodes[width - 1],
+                                     &shape->graph_copy_nodes[width - 1]) == 0) {
+        shape->graph_exec[width - 1] = exec;
+        shape->graph_ready[width - 1] = true;
       } else {
-        model->verify->graph_exec[width - 1] = nullptr;
-        model->verify->graph_ready[width - 1] = false;
+        shape->graph_exec[width - 1] = nullptr;
+        shape->graph_ready[width - 1] = false;
       }
     }
   }
   // GitHub #676: the DFlash2 drafter's append after a deferring round's
   // commit, one graph per width, under the same never-refuse-service rule: a
   // width whose capture failed appends eagerly.
-  if (model->verify != nullptr && model->verify->defer && model->verify->staging != nullptr) {
+  if (shape != nullptr && shape->defer && shape->staging != nullptr) {
     for (uint32_t width = 1; width <= model->decode_lanes; ++width) {
       std::string error;
-      if (ignis::deferred_verify::capture_append(model, pool, width, &model->verify->append_exec[width - 1],
+      if (ignis::deferred_verify::capture_append(model, pool, *shape, width, &shape->append_exec[width - 1],
                                                  &error) != 0) {
         set_error("ignis_decode_graph_capture: the drafter's append at width " + std::to_string(width) +
                   ": " + error);

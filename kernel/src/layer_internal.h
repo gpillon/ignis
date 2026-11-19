@@ -224,16 +224,17 @@ int32_t ignis_gdn_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool,
 // value and {g, beta} per valid column -- the fold after accept
 // (`ignis_program_decode`, kernel/src/step.cu) rebuilds the slot from the
 // committed prefix of those records. Both read the residual as
-// `[hidden, (k+1) * width]` and require a windowed load (`model->verify`).
+// `[hidden, (k+1) * width]` and require a windowed load. GitHub #686: `verify`
+// is the round's shape, whose window, staging and records they read.
 // GitHub #680: the same pointer as `in_residual` and `out_residual` asks for
 // the copy-free form, as in the decode bodies above: the layer adds into its
 // input in place.
-int32_t ignis_gqa_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
-                                        uint32_t width, const void *in_residual, void *out_residual,
-                                        LinearPolicyMode mode);
-int32_t ignis_gdn_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
-                                        uint32_t width, const void *in_residual, void *out_residual,
-                                        LinearPolicyMode mode);
+int32_t ignis_gqa_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
+                                        uint32_t layer, uint32_t width, const void *in_residual,
+                                        void *out_residual, LinearPolicyMode mode);
+int32_t ignis_gdn_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
+                                        uint32_t layer, uint32_t width, const void *in_residual,
+                                        void *out_residual, LinearPolicyMode mode);
 
 // GitHub #111: one decode round's whole forward pass -- embedding,
 // every decoder layer's graph-safe body once at `width`-wide batch, final
@@ -254,16 +255,17 @@ int32_t ignis_decode_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
 // staged anchors, drafts, base positions and extents -> the `[k+1, width]`
 // verify ids and positions), the `(k+1) * width`-column traversal of every
 // layer (the verify bodies above), the final norm and output head over every
-// column into `model->verify->logits`, the per-column argmax into
+// column into `verify.logits`, the per-column argmax into
 // `target_tokens`, and the vendored accept kernel writing `licensed_tokens`,
 // `licensed_counts` and `accepted`. The final residual is also copied to
-// `model->verify->hidden` for the accepted-hidden selection the caller does
+// `verify.hidden` for the accepted-hidden selection the caller does
 // after readback. Everything it reads or writes is a stable model-owned
 // address, so the same call records a verify graph and runs a round eagerly.
-// Returns 0 on success, -1 on a leaf/kernel error (see
+// GitHub #686: `verify` is the round's shape, handed down to everything the
+// pass calls. Returns 0 on success, -1 on a leaf/kernel error (see
 // `ignis_decode_graph_last_error`).
-int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t width,
-                                     LinearPolicyMode mode);
+int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
+                                     uint32_t width, LinearPolicyMode mode);
 
 // The Qwen 3.8 topology's GQA layers sit at index 3, 7, 11, ... (every 4th);
 // this is the same relative-index formula `ignis_gqa_layer_step` and

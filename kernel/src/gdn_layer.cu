@@ -600,10 +600,10 @@ int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
 // rollback. Invalid (padded) columns get zero output and no record, per the
 // ops' own contracts. Every address is the pool's, the model's or the verify
 // substrate's, so the body is graph-safe like `run_gdn_layer_graph`.
-int32_t run_gdn_layer_record(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
-                             uint32_t width, void *in_residual, void *out_residual,
+// GitHub #686: the substrate is the round's shape, `verify`.
+int32_t run_gdn_layer_record(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
+                             uint32_t layer, uint32_t width, void *in_residual, void *out_residual,
                              uint32_t gdn_layer, LinearPolicyMode mode) {
-  const IgnisVerifyRound &verify = *model->verify;
   const auto W = static_cast<std::int32_t>(verify.window + 1);
   const auto batch = static_cast<std::int32_t>(width);
   const std::int32_t T = W * batch;
@@ -849,15 +849,11 @@ int32_t ignis_gdn_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool,
 // P5-04 (GitHub #153): validates and dispatches `run_gdn_layer_record` --
 // called once per GDN layer per verify round by
 // `ignis_verify_graph_run_batch` (kernel/src/decode_graph.cu).
-int32_t ignis_gdn_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
-                                        uint32_t width, const void *in_residual, void *out_residual,
-                                        LinearPolicyMode mode) {
+int32_t ignis_gdn_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
+                                        uint32_t layer, uint32_t width, const void *in_residual,
+                                        void *out_residual, LinearPolicyMode mode) {
   if (model == nullptr || pool == nullptr || in_residual == nullptr || out_residual == nullptr) {
     set_error("ignis_gdn_layer_verify: null argument");
-    return -1;
-  }
-  if (model->verify == nullptr) {
-    set_error("ignis_gdn_layer_verify: the model was loaded without a draft window");
     return -1;
   }
   if (layer >= model->layers.size() || model->layers[layer].kind != IGNIS_LAYER_GDN) {
@@ -870,7 +866,7 @@ int32_t ignis_gdn_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool
     return -1;
   }
   const uint32_t gdn_layer = ignis_gdn_relative_layer(layer);
-  return run_gdn_layer_record(model, pool, layer, width, const_cast<void *>(in_residual),
+  return run_gdn_layer_record(model, pool, verify, layer, width, const_cast<void *>(in_residual),
                               out_residual, gdn_layer, mode);
 }
 
