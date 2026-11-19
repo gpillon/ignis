@@ -352,6 +352,7 @@ async fn while_unloaded_the_metrics_show_nothing_reserved() {
         retained_host_bytes: 1 << 30,
         kv_disk_bytes: Some(8 << 30),
         flash_next: None,
+        draft_positions: 0,
     };
     let server = idle_server(&loader, loader.model("mock-a"), IDLE, &[]).with_metrics().with_load_reservations(reserved);
     let metrics = server.metrics_app().expect("metrics are on");
