@@ -3523,6 +3523,30 @@ extern "C" int32_t ignis_program_repair(struct ignis_model *model, struct ignis_
   return 0;
 }
 
+namespace {
+
+// GitHub #686 (spec #684): one round shape's verify round, as
+// `ignis_program_stats` reports it.
+ignis_round_shape_stats round_shape_stats(const IgnisVerifyRound &shape) {
+  ignis_round_shape_stats out{};
+  out.window = shape.window;
+  out.vram_bytes = shape.device_bytes();
+  for (uint32_t width = 1; width <= IGNIS_DECODE_MAX_BATCH; ++width) {
+    if (shape.graph_ready[width - 1]) {
+      out.verify_graph_ready_mask |= 1u << (width - 1);
+      out.verify_graph_nodes[width - 1] = shape.graph_nodes[width - 1];
+      out.verify_graph_copy_nodes[width - 1] = shape.graph_copy_nodes[width - 1];
+    }
+    if (shape.append_exec[width - 1] != nullptr) {
+      out.drafter_append_graph_ready_mask |= 1u << (width - 1);
+    }
+  }
+  out.verify_folds_in_flight = shape.folds_in_flight;
+  return out;
+}
+
+} // namespace
+
 extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
                                          const struct ignis_seq_pool *pool,
                                          struct ignis_program_stats *out_stats) {
@@ -3628,6 +3652,14 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   }
   // GitHub #681: the gating's home; Flash-Next's load never captures the 27B's rounds.
   out_stats->gdn_gating = static_cast<uint32_t>(model->gdn_gating_home);
+  // GitHub #686: each round shape's own, the base shape alone; a Flash-Next load has none.
+  out_stats->round_shapes = 0;
+  for (ignis_round_shape_stats &shape : out_stats->shapes) {
+    shape = ignis_round_shape_stats{};
+  }
+  if (model->base_shape != nullptr) {
+    out_stats->shapes[out_stats->round_shapes++] = round_shape_stats(*model->base_shape);
+  }
   return 0;
 }
 
