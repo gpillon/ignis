@@ -448,6 +448,12 @@ struct VerifyStaging {
 // contiguous with column `b`'s `k+1` entries adjacent, which is both the
 // vendored `speculative_*` ops' `[K+1,B]` and the traversal's lane-major
 // column order (lane b's columns are `b*(k+1) .. b*(k+1)+k`).
+//
+// GitHub #686 (spec #684): one round shape's verify state. A verify round, its
+// graph capture and its replay are handed the shape they run at
+// (`run_verify_round`, `ignis_verify_graph_run_batch`), and everything they
+// call takes it as an argument: nothing inside them reads a shape from the
+// model (`ignis_model::base_shape`).
 struct IgnisVerifyRound {
   uint32_t window = 0; // k
 
@@ -902,7 +908,12 @@ struct ignis_model {
   // P5-04 (GitHub #153): the verify round's substrate, present exactly when
   // `draft_tokens > 0`. Its traversal runs out of `decode_graph_scratch`,
   // which a windowed load sizes for `k+1` columns per lane instead of one.
-  std::unique_ptr<IgnisVerifyRound> verify;
+  // GitHub #686 (spec #684): the load's base shape, its one round shape. Read
+  // here only where a round's shape is chosen (`ignis_program_decode`,
+  // `ignis_decode_graph_capture`) and outside the rounds (the load, its
+  // reservations and teardown, the stats, the readouts, a repair's kept
+  // scores).
+  std::unique_ptr<IgnisVerifyRound> base_shape;
   // GitHub #302: set on a Flash-Next load, whose program the step ABI's
   // entry points dispatch to. It shares this handle's stream, both scratch
   // arenas, the sampling staging, the decode staging and the decode graphs;

@@ -109,6 +109,24 @@ pub(crate) mod ffi {
     pub const IGNIS_PREFILL_COMPUTE_POLICY_ENGINE_DEFAULT: i32 = 0;
     pub const IGNIS_PREFILL_COMPUTE_POLICY_A16_ONLY: i32 = 1;
 
+    /// `IGNIS_ROUND_SHAPES_MAX` (`kernel/include/ignis_step.h`): the most
+    /// round shapes a load builds (GitHub #686).
+    pub const IGNIS_ROUND_SHAPES_MAX: usize = 1;
+
+    /// 1:1 with `struct ignis_round_shape_stats` (GitHub #686): one round
+    /// shape's verify round.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct IgnisRoundShapeStats {
+        pub window: u32,
+        pub verify_graph_ready_mask: u32,
+        pub vram_bytes: u64,
+        pub verify_graph_nodes: [u32; 8],
+        pub verify_graph_copy_nodes: [u32; 8],
+        pub drafter_append_graph_ready_mask: u32,
+        pub verify_folds_in_flight: u64,
+    }
+
     #[repr(C)]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct IgnisProgramStats {
@@ -144,6 +162,10 @@ pub(crate) mod ffi {
         pub verify_graph_copy_nodes: [u32; 8],
         /// GitHub #681: the GDN gating's home, 0 chain, 1 branch.
         pub gdn_gating: u32,
+        /// GitHub #686: the round shapes the load built, and each one's
+        /// verify round, the base shape first.
+        pub round_shapes: u32,
+        pub shapes: [IgnisRoundShapeStats; IGNIS_ROUND_SHAPES_MAX],
     }
 
     unsafe extern "C" {
@@ -499,6 +521,45 @@ pub struct ProgramStats {
     /// and on Flash-Next), 1 on a branch of the graph beside the input
     /// projection.
     pub gdn_gating: u32,
+    /// GitHub #686 (spec #684): how many of [`ProgramStats::round_shapes`]
+    /// the load built: 1 on a 27B load with a draft window (its base shape),
+    /// 0 on one without and on Flash-Next, which keeps its own verify round.
+    pub round_shape_count: u32,
+    /// Each round shape's verify round, the base shape first; the entries
+    /// past [`ProgramStats::round_shape_count`] are zero. See
+    /// [`ProgramStats::shapes`].
+    pub round_shapes: [RoundShapeStats; ffi::IGNIS_ROUND_SHAPES_MAX],
+}
+
+impl ProgramStats {
+    /// The round shapes the load built, the base shape first.
+    pub fn shapes(&self) -> &[RoundShapeStats] {
+        &self.round_shapes[..(self.round_shape_count as usize).min(self.round_shapes.len())]
+    }
+}
+
+/// GitHub #686 (spec #684): one round shape's verify round in
+/// [`ProgramStats`]: the fields of its own that [`ProgramStats`] reports for
+/// the base shape, the shape a load with one shape runs every verify round at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoundShapeStats {
+    /// The shape's draft window: a round at it is `window + 1` columns a lane.
+    pub window: u32,
+    /// Bit `w - 1` set when the shape's verify graph for exact width `w` is
+    /// captured and replayable.
+    pub verify_graph_ready_mask: u32,
+    /// The shape's own device buffers: its verify substrate and its drafter
+    /// round buffers.
+    pub vram_bytes: u64,
+    /// Entry `w - 1`: the node count of the shape's verify graph for width
+    /// `w`, and how many of them are copies; 0 for a width with no graph.
+    pub verify_graph_nodes: [u32; 8],
+    pub verify_graph_copy_nodes: [u32; 8],
+    /// Bit `w - 1` set when the drafter's append after a round at the shape
+    /// replays a graph at exact width `w`.
+    pub drafter_append_graph_ready_mask: u32,
+    /// The rounds at the shape that returned with their fold in flight.
+    pub verify_folds_in_flight: u64,
 }
 
 /// The result of [`capture_decode_graphs`]: how long capture took and which
@@ -2433,6 +2494,16 @@ pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, Stri
         drafter_append_graph_ready_mask: stats.drafter_append_graph_ready_mask,
         verify_graph_copy_nodes: stats.verify_graph_copy_nodes,
         gdn_gating: stats.gdn_gating,
+        round_shape_count: stats.round_shapes,
+        round_shapes: stats.shapes.map(|shape| RoundShapeStats {
+            window: shape.window,
+            verify_graph_ready_mask: shape.verify_graph_ready_mask,
+            vram_bytes: shape.vram_bytes,
+            verify_graph_nodes: shape.verify_graph_nodes,
+            verify_graph_copy_nodes: shape.verify_graph_copy_nodes,
+            drafter_append_graph_ready_mask: shape.drafter_append_graph_ready_mask,
+            verify_folds_in_flight: shape.verify_folds_in_flight,
+        }),
     })
 }
 

@@ -56,6 +56,7 @@ struct ignis_model;
 struct ignis_seq_pool;
 struct ignis_seq;
 struct ignis_media_embedding;
+struct IgnisVerifyRound;
 
 namespace ignis::mtp {
 
@@ -180,8 +181,9 @@ struct RoundRows {
 };
 RoundRows round_rows(std::uint64_t base, std::uint32_t extent, std::uint32_t committed);
 
-// The chain over the round's `width` lanes, from the verify round's staging
-// (`IgnisVerifyRound`: anchors, base positions, extents; the round's slots in
+// The chain over the round's `width` lanes, from the staging of the round's
+// shape `verify` (GitHub #686; `IgnisVerifyRound`: anchors, base positions,
+// extents; the round's slots in
 // `model.decode_graph_slots`): every lane's drafts into `verify.drafts`
 // (I32 [k, width], lane-major), its steps at width `width`. On a vision load
 // step s rotates at the lane's first column's rotation position less one,
@@ -196,24 +198,26 @@ RoundRows round_rows(std::uint64_t base, std::uint32_t extent, std::uint32_t com
 // the proposal readout's (kernel/include/ignis_mtp_readout.h
 // `ignis_mtp_readout_chain`): the same kernels on the same inputs, only the
 // scores' address moves, and the round's logits are left as they were.
-int32_t propose(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, std::string *error,
-                std::uint16_t *step_scores = nullptr);
+int32_t propose(ignis_model &model, ignis_seq_pool &pool, IgnisVerifyRound &verify, std::uint32_t width,
+                std::string *error, std::uint16_t *step_scores = nullptr);
 
 // The commit's rows, eager, after the round's pass: lane b's rows at
 // `positions[b * (k + 1) + j]` (host I32 [k + 1, width]: base_b - 1 + min(j,
 // committed_b - 1)), rotated at `rotation` (the same shape, each position
 // plus the lane's rope delta, GitHub #624; or null: at the positions), its
 // first `committed[b]` (host I32 [width]) columns valid, from the round's own
-// `verify.hidden` and `verify.verify_ids`. The host arrays stay alive until
+// `verify.hidden` and `verify.verify_ids` (`verify`: the round's shape). The host arrays stay alive until
 // the stream synchronizes. Only the rows' keys and values: the head's hidden
 // at a committed row is no draft's. 0, or -1 with `*error`.
-int32_t commit_rows(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, const std::int32_t *positions,
-                    const std::int32_t *rotation, const std::int32_t *committed, std::string *error);
+int32_t commit_rows(ignis_model &model, ignis_seq_pool &pool, const IgnisVerifyRound &verify, std::uint32_t width,
+                    const std::int32_t *positions, const std::int32_t *rotation, const std::int32_t *committed,
+                    std::string *error);
 
 // Each lane's continuation hidden from the run's last committed column,
 // `verify.selected_hidden` (the pre-norm residual the commit selected),
 // normalized as the pass normalized it. 0, or -1 with `*error`.
-int32_t commit_continuation(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, std::string *error);
+int32_t commit_continuation(ignis_model &model, ignis_seq_pool &pool, const IgnisVerifyRound &verify,
+                            std::uint32_t width, std::string *error);
 
 // The round's three small device steps, exposed for their op test
 // (kernel/tests/test_mtp_round.cu). Enqueue only; throw on a launch error.

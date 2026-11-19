@@ -489,6 +489,28 @@ int32_t ignis_decode(struct ignis_model *model, const int32_t *token_ids, uint64
  * if none failed yet). Never NULL. */
 const char *ignis_step_last_error(void);
 
+/* GitHub #686 (spec #684): the most round shapes a 27B load builds, each a
+ * verify round with its own window, buffers and graphs: one, the load's base
+ * shape. */
+#define IGNIS_ROUND_SHAPES_MAX 1
+
+/* GitHub #686: one round shape's verify round, as `ignis_program_stats`
+ * reports it: the shape's draft window (a round at it is `window + 1` columns
+ * a lane); its verify graphs, their node counts and their copy nodes, and its
+ * drafter append graphs, by exact width as the fields of the same names in
+ * `ignis_program_stats` say; its own device buffers (its verify substrate and
+ * its drafter round buffers, a share of the program's `vram_bytes`); and its
+ * rounds that returned with their fold in flight. */
+struct ignis_round_shape_stats {
+  uint32_t window;
+  uint32_t verify_graph_ready_mask;
+  uint64_t vram_bytes;
+  uint32_t verify_graph_nodes[IGNIS_DECODE_MAX_BATCH];
+  uint32_t verify_graph_copy_nodes[IGNIS_DECODE_MAX_BATCH];
+  uint32_t drafter_append_graph_ready_mask;
+  uint64_t verify_folds_in_flight;
+};
+
 /* Runtime counters for the real program entry points.  `kernel_count` is
  * the number of program-layer dispatches in the latest step: the leaf's
  * stable, graph-independent dispatch counter, unaffected by whether that
@@ -540,6 +562,13 @@ struct ignis_program_stats {
    * first capture, and on Flash-Next), 1 on a branch of the graph beside the
    * input projection. */
   uint32_t gdn_gating;
+  /* GitHub #686 (spec #684): the round shapes the load built -- 1 on a 27B
+   * load with a draft window, its base shape; 0 on one without and on
+   * Flash-Next, which keeps its own verify round -- and each one's verify
+   * round, the base shape first; an entry past `round_shapes` is zero. The
+   * verify fields above are the base shape's, `shapes[0]`'s. */
+  uint32_t round_shapes;
+  struct ignis_round_shape_stats shapes[IGNIS_ROUND_SHAPES_MAX];
 };
 
 /* Captures one CUDA graph per exact decode batch width 1..the load's decode

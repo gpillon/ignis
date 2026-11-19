@@ -2326,11 +2326,11 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
   out.trellis_workspace_bytes = bytes(model.trellis_workspace_buffer);
   out.trellis_dense_bytes = bytes(model.trellis_dense_buffer);
   out.tma_descriptor_bytes = model.tma_descriptors != nullptr ? model.tma_descriptors->bytes() : 0;
-  if (model.verify != nullptr) {
-    out.drafter_round_bytes = bytes(model.verify->features) + bytes(model.verify->append_counts) +
-                              bytes(model.verify->draft_candidates) + bytes(model.verify->draft_q) +
-                              capacity(model.verify->drafter_scratch);
-    out.verify_round_bytes = model.verify->device_bytes() - out.drafter_round_bytes;
+  if (model.base_shape != nullptr) {
+    out.drafter_round_bytes = bytes(model.base_shape->features) + bytes(model.base_shape->append_counts) +
+                              bytes(model.base_shape->draft_candidates) + bytes(model.base_shape->draft_q) +
+                              capacity(model.base_shape->drafter_scratch);
+    out.verify_round_bytes = model.base_shape->device_bytes() - out.drafter_round_bytes;
   }
   return out;
 }
@@ -2840,20 +2840,20 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   }
 
   // P5-04 (GitHub #153): the verify round's substrate, for either windowed
-  // backend.
+  // backend: GitHub #686, the load's base shape.
   if (draft_tokens > 0) {
     try {
-      model->verify = build_verify_round(*topology, draft_tokens, vision_max_tokens > 0, load.decode_lanes);
+      model->base_shape = build_verify_round(*topology, draft_tokens, vision_max_tokens > 0, load.decode_lanes);
       // GitHub #576 (ADR 0090): the round's draft rule. The sampled draft's
       // accept takes the same workspace the vendored one does.
-      model->verify->sampled_draft = load.draft_rule == IGNIS_DRAFT_RULE_SAMPLED;
-      model->verify->drafter_temperature_factor = load.drafter_temperature_factor;
-      model->verify->drafter_top_p = load.drafter_top_p;
-      if (model->verify->sampled_draft &&
+      model->base_shape->sampled_draft = load.draft_rule == IGNIS_DRAFT_RULE_SAMPLED;
+      model->base_shape->drafter_temperature_factor = load.drafter_temperature_factor;
+      model->base_shape->drafter_top_p = load.drafter_top_p;
+      if (model->base_shape->sampled_draft &&
           ignis_sampled_accept_workspace_bytes(static_cast<std::int32_t>(topology->vocab),
                                                static_cast<std::int32_t>(draft_tokens),
                                                static_cast<std::int32_t>(load.decode_lanes)) >
-              model->verify->accept_workspace->capacity()) {
+              model->base_shape->accept_workspace->capacity()) {
         throw std::runtime_error("the sampled draft's accept outgrows the accept workspace");
       }
     } catch (const std::exception &e) {
@@ -2870,18 +2870,18 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   switch (model->drafter) {
   case IgnisDrafter::kDflash2:
     try {
-      model->verify->features = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_features);
-      model->verify->append_counts = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_append_counts);
-      model->verify->drafter_scratch = std::make_unique<ninfer::DeviceArena>(sizes.drafter_scratch);
+      model->base_shape->features = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_features);
+      model->base_shape->append_counts = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_append_counts);
+      model->base_shape->drafter_scratch = std::make_unique<ninfer::DeviceArena>(sizes.drafter_scratch);
       // GitHub #576: under the sampled draft, the drafter's q from the draw
       // to the accept, one half of `drafter_draws` each.
       if (sizes.drafter_draws != 0) {
-        model->verify->draft_candidates = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_draws / 2);
-        model->verify->draft_q = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_draws / 2);
+        model->base_shape->draft_candidates = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_draws / 2);
+        model->base_shape->draft_q = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_draws / 2);
       }
       // GitHub #676: the host-mapped staging its verify rounds take, page-locked
       // here rather than while serving.
-      model->verify->staging = std::make_unique<VerifyStaging>();
+      model->base_shape->staging = std::make_unique<VerifyStaging>();
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: drafter round allocation failed: ") + e.what());
       cudaStreamDestroy(model->stream);
@@ -2985,15 +2985,15 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
         exec = nullptr;
       }
     }
-    if (model->verify != nullptr) {
-      for (auto &exec : model->verify->graph_exec) {
+    if (model->base_shape != nullptr) {
+      for (auto &exec : model->base_shape->graph_exec) {
         if (exec != nullptr) {
           cudaGraphExecDestroy(exec);
           exec = nullptr;
         }
       }
       // GitHub #676: and the drafter's append graphs.
-      for (auto &exec : model->verify->append_exec) {
+      for (auto &exec : model->base_shape->append_exec) {
         if (exec != nullptr) {
           cudaGraphExecDestroy(exec);
           exec = nullptr;

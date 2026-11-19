@@ -670,10 +670,9 @@ RoundRows round_rows(std::uint64_t base, std::uint32_t extent, std::uint32_t com
   return rows;
 }
 
-int32_t propose(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, std::string *error,
-                std::uint16_t *step_scores) {
+int32_t propose(ignis_model &model, ignis_seq_pool &pool, IgnisVerifyRound &verify, std::uint32_t width,
+                std::string *error, std::uint16_t *step_scores) {
   try {
-    IgnisVerifyRound &verify = *model.verify;
     const auto window = static_cast<std::int32_t>(verify.window);
     const auto hidden = static_cast<std::int32_t>(model.hidden);
     const auto vocab = static_cast<std::int32_t>(model.vocab);
@@ -732,10 +731,10 @@ int32_t propose(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, s
   }
 }
 
-int32_t commit_rows(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, const std::int32_t *positions,
-                    const std::int32_t *rotation, const std::int32_t *committed, std::string *error) {
+int32_t commit_rows(ignis_model &model, ignis_seq_pool &pool, const IgnisVerifyRound &verify, std::uint32_t width,
+                    const std::int32_t *positions, const std::int32_t *rotation, const std::int32_t *committed,
+                    std::string *error) {
   try {
-    IgnisVerifyRound &verify = *model.verify;
     const auto lane_columns = static_cast<std::int32_t>(verify.window + 1);
     const auto hidden = static_cast<std::int32_t>(model.hidden);
     const auto batch = static_cast<std::int32_t>(width);
@@ -789,13 +788,14 @@ int32_t commit_rows(ignis_model &model, ignis_seq_pool &pool, std::uint32_t widt
   }
 }
 
-int32_t commit_continuation(ignis_model &model, ignis_seq_pool &pool, std::uint32_t width, std::string *error) {
+int32_t commit_continuation(ignis_model &model, ignis_seq_pool &pool, const IgnisVerifyRound &verify,
+                            std::uint32_t width, std::string *error) {
   try {
     const auto hidden = static_cast<std::int32_t>(model.hidden);
     const auto batch = static_cast<std::int32_t>(width);
     ninfer::DeviceArena &arena = *model.decode_graph_scratch;
     ninfer::DeviceArena::Scope scope = arena.scope();
-    const ninfer::Tensor selected(model.verify->selected_hidden->p, ninfer::DType::BF16, {hidden, batch, 1, 1});
+    const ninfer::Tensor selected(verify.selected_hidden->p, ninfer::DType::BF16, {hidden, batch, 1, 1});
     ninfer::Tensor normalized = arena.alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
     // One CTA a column at this width, the pass's own normalization: the bits
     // of the column whose scores drew the lane's pending token.

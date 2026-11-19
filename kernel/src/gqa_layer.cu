@@ -758,19 +758,15 @@ int32_t ignis_gqa_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool,
 }
 
 // P5-04 (GitHub #153): the verify round's GQA body -- `width` lanes at the
-// load's `k+1` verify columns each, positions and valid extents from the
-// verify substrate's staging (model_internal.h `IgnisVerifyRound`), dispatched
+// shape's `k+1` verify columns each, positions and valid extents from the
+// shape's staging (model_internal.h `IgnisVerifyRound`), dispatched
 // once per GQA layer per round by `ignis_verify_graph_run_batch`
 // (kernel/src/decode_graph.cu) under capture, replay or eager alike.
-int32_t ignis_gqa_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
-                                        uint32_t width, const void *in_residual, void *out_residual,
-                                        LinearPolicyMode mode) {
+int32_t ignis_gqa_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
+                                        uint32_t layer, uint32_t width, const void *in_residual,
+                                        void *out_residual, LinearPolicyMode mode) {
   if (model == nullptr || pool == nullptr || in_residual == nullptr || out_residual == nullptr) {
     set_error("ignis_gqa_layer_verify: null argument");
-    return -1;
-  }
-  if (model->verify == nullptr) {
-    set_error("ignis_gqa_layer_verify: the model was loaded without a draft window");
     return -1;
   }
   if (layer >= model->layers.size() || model->layers[layer].kind != IGNIS_LAYER_GQA) {
@@ -786,7 +782,6 @@ int32_t ignis_gqa_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool
     return -1;
   }
   const uint32_t gqa_layer = ignis_gqa_relative_layer(layer);
-  const IgnisVerifyRound &verify = *model->verify;
   // GitHub #195: a vision load rotates the round's columns at `position +
   // rope_delta` from its own staging -- the decode round's rule, at the
   // verify round's column shape. Without vision there is no such buffer and

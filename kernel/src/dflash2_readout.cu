@@ -47,7 +47,7 @@ extern "C" int32_t ignis_dflash2_readout(struct ignis_model *model, struct ignis
     return fail("ignis_dflash2_readout: the drafts, candidates, candidate logits and scores "
                 "outputs are required");
   }
-  if (model->verify == nullptr || model->drafter != IgnisDrafter::kDflash2) {
+  if (model->base_shape == nullptr || model->drafter != IgnisDrafter::kDflash2) {
     return fail("ignis_dflash2_readout: this model was loaded without the DFlash2 drafter");
   }
   if (pool->speculative_backend != model->speculative_backend || !pool->has_dflash2()) {
@@ -56,7 +56,8 @@ extern "C" int32_t ignis_dflash2_readout(struct ignis_model *model, struct ignis
   if (!ignis_seq_belongs_to(*pool, *seq)) {
     return fail("ignis_dflash2_readout: the sequence was not drawn from this pool");
   }
-  IgnisVerifyRound &verify = *model->verify;
+  // GitHub #686: the forward of the load's base shape, its one shape.
+  IgnisVerifyRound &verify = *model->base_shape;
   const std::uint32_t k = verify.window;
   // The caller sized every output by its window; the copies below are the
   // load's, so another window would over- or under-run them.
@@ -140,7 +141,7 @@ extern "C" int32_t ignis_dflash2_readout(struct ignis_model *model, struct ignis
     const Dflash2ProposalReadout sink{readout->out_candidate_ids, readout->out_candidate_logits,
                                       readout->out_scores, readout->out_drafter_logits,
                                       draws ? readout->out_q : nullptr};
-    ignis_dflash2_propose(model, pool, 1, &sink);
+    ignis_dflash2_propose(model, pool, verify, 1, &sink);
   } catch (const std::exception &e) {
     (void)cudaStreamSynchronize(stream);
     return fail(std::string("ignis_dflash2_readout: ") + e.what());
@@ -176,14 +177,16 @@ extern "C" int32_t ignis_verify_readout_logits(struct ignis_model *model, uint32
   if (model == nullptr || out_logits == nullptr) {
     return fail("ignis_verify_readout_logits: null argument");
   }
-  if (model->verify == nullptr) {
+  // GitHub #686: the logits of the load's base shape, its one shape.
+  const IgnisVerifyRound *const verify = model->base_shape.get();
+  if (verify == nullptr) {
     return fail("ignis_verify_readout_logits: this model was loaded without a draft window");
   }
   // The caller sized `out_logits` by its window; the copy below is the
   // load's `k + 1` rows a lane.
-  if (window != model->verify->window) {
+  if (window != verify->window) {
     return fail("ignis_verify_readout_logits: window " + std::to_string(window) +
-                " is not the load's draft window " + std::to_string(model->verify->window));
+                " is not the load's draft window " + std::to_string(verify->window));
   }
   // GitHub #336: the round's buffers, its logits included, are sized for the
   // load's decode lanes, not for IGNIS_DECODE_MAX_BATCH.
@@ -193,9 +196,9 @@ extern "C" int32_t ignis_verify_readout_logits(struct ignis_model *model, uint32
   }
   // `[vocab, k+1, B]` with the vocabulary fastest: the first `lanes` lanes
   // are one contiguous prefix.
-  const std::size_t bytes = static_cast<std::size_t>(model->vocab) * (model->verify->window + 1) *
+  const std::size_t bytes = static_cast<std::size_t>(model->vocab) * (verify->window + 1) *
                             lanes * sizeof(std::uint16_t);
-  cudaError_t err = cudaMemcpyAsync(out_logits, model->verify->logits->p, bytes,
+  cudaError_t err = cudaMemcpyAsync(out_logits, verify->logits->p, bytes,
                                     cudaMemcpyDeviceToHost, model->stream);
   if (err == cudaSuccess) {
     err = cudaStreamSynchronize(model->stream);

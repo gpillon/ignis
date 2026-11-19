@@ -500,6 +500,30 @@ fn copy_free_graphs(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label
     assert!(verify_copies.iter().all(|&c| c == verify), "{label}: arm `{}`: the verify graphs copy {verify} nodes", arm.name);
 }
 
+/// #686 (spec #684): a load builds one round shape, its base shape at the
+/// load's window, and the program's stats report it apart: its graphs are
+/// the load's verify and drafter append graphs, and its VRAM the load's verify
+/// round and drafter round lines.
+fn base_shape_stats(model: &Model, pool: &SeqPool, load: &Load, label: &str) {
+    let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
+    let [base] = stats.shapes() else {
+        panic!("{label}: {} round shapes, not the base shape alone", stats.shapes().len());
+    };
+    assert_eq!(base.window, load.window, "{label}: the base shape's window");
+    assert_eq!(
+        (base.verify_graph_ready_mask, base.drafter_append_graph_ready_mask, base.verify_folds_in_flight),
+        (stats.verify_graph_ready_mask, stats.drafter_append_graph_ready_mask, stats.verify_folds_in_flight),
+        "{label}: the base shape's graphs and folds"
+    );
+    assert_eq!(
+        (base.verify_graph_nodes, base.verify_graph_copy_nodes),
+        (stats.verify_graph_nodes, stats.verify_graph_copy_nodes),
+        "{label}: the base shape's graph nodes"
+    );
+    let reserved = model.stats().reserved;
+    assert_eq!(base.vram_bytes, reserved.verify_round_bytes + reserved.drafter_round_bytes, "{label}: the base shape's VRAM");
+}
+
 fn expect_replay(model: &Model, pool: &SeqPool, graphs: bool, what: &str) {
     let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{what}: stats: {e}"));
     assert_eq!(stats.graph_launches, u64::from(graphs), "{what}: graph replay");
@@ -679,6 +703,7 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         assert_eq!(append, want, "{label}: {}: the drafter's append graphs", arm.name);
         copy_free_graphs(model, pool, load, arm, label);
     }
+    base_shape_stats(model, pool, load, &format!("{label}: {}", arm.name));
     let folds = stats().verify_folds_in_flight;
     let sessions = KINDS
         .iter()

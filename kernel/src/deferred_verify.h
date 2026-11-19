@@ -60,13 +60,15 @@ cudaError_t end(VerifyStaging &staging, cudaStream_t stream);
 // The DFlash2 drafter's append after a verify round's commit at `width` lanes
 // (`ignis_dflash2_append_round`), captured as one graph: its inputs are device
 // buffers and its scratch the drafter's arena from its base, so one capture
-// serves every round at the width. 0 with `*out_exec` set, or -1 with
-// `*error` and nothing held.
-int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, std::uint32_t width, cudaGraphExec_t *out_exec,
-                       std::string *error);
+// serves every round at the width. GitHub #686: at shape `verify`, whose
+// buffers it reads; the caller keeps the graph with that shape's. 0 with
+// `*out_exec` set, or -1 with `*error` and nothing held.
+int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify, std::uint32_t width,
+                       cudaGraphExec_t *out_exec, std::string *error);
 
-// The append at `width` lanes: its graph where the latest capture made one,
-// eagerly otherwise. Throws on a failed launch, as the eager append does.
-void append_round(ignis_model *model, ignis_seq_pool *pool, std::uint32_t width);
+// The append at `width` lanes after a round at shape `verify`: that shape's
+// graph where the latest capture made one, eagerly otherwise. Throws on a
+// failed launch, as the eager append does.
+void append_round(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify, std::uint32_t width);
 
 } // namespace ignis::deferred_verify

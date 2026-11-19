@@ -332,10 +332,10 @@ std::uint64_t stamp_kept_column(ignis_model *model, std::int32_t column) {
 // GitHub #590: whether the scores `kept` names are still the ones its draw
 // was made from -- a decode-logits column no later round or prefill draw has
 // written, or the verify logits of the last verify round, the one that cut
-// the lane's commit.
+// the lane's commit (GitHub #686: the load's base shape's, its one shape).
 bool kept_scores_current(const ignis_model *model, const ignis_kept_scores &kept) {
   if (kept.source == IgnisKeptSource::kVerifyLogits) {
-    const IgnisVerifyRound *verify = model->verify.get();
+    const IgnisVerifyRound *verify = model->base_shape.get();
     return verify != nullptr &&
            static_cast<std::uint64_t>(kept.column) <
                static_cast<std::uint64_t>(model->decode_lanes) * (verify->window + 1) &&
@@ -349,7 +349,7 @@ bool kept_scores_current(const ignis_model *model, const ignis_kept_scores &kept
 // the verify logits are `[vocab, k + 1, decode_lanes]` BF16, one row a column.
 const void *kept_scores_row(ignis_model *model, const ignis_kept_scores &kept) {
   if (kept.source == IgnisKeptSource::kVerifyLogits) {
-    return static_cast<const std::uint8_t *>(model->verify->logits->p) +
+    return static_cast<const std::uint8_t *>(model->base_shape->logits->p) +
            static_cast<std::size_t>(kept.column) * static_cast<std::size_t>(model->vocab) *
                sizeof(std::uint16_t);
   }
@@ -2150,7 +2150,8 @@ struct UncommittedRingColumns {
 };
 
 // P5-04 (GitHub #153): one verify round over `batch_size` lanes at the
-// load's window `k` (spec 05, "The verify round"). The device-side pass is
+// window `k` of its shape `verify` (GitHub #686: the caller's choice, handed
+// to everything the round calls; spec 05, "The verify round"). The device-side pass is
 // `ignis_verify_graph_run_batch` (kernel/src/decode_graph.cu), replayed from
 // the width's verify graph when one is ready and enqueued directly
 // otherwise; this function stages its inputs, reads its outputs back, and
@@ -2180,11 +2181,10 @@ struct UncommittedRingColumns {
 // a round that leaves its fold in flight (kernel/src/verify_return.h) moves
 // every lane's state once the fold is queued, not confirmed; a fault in it
 // surfaces at the next leaf call that waits on the device.
-int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
+int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
                          ignis_seq *const *sequences, uint64_t batch_size,
                          const ignis_sampling_params *sampling, const ignis_decode_options &options,
                          int32_t *out_token_ids) {
-  IgnisVerifyRound &verify = *model->verify;
   const std::uint32_t k = verify.window;
   const std::uint32_t lane_columns = k + 1;
   const auto batch = static_cast<std::int32_t>(batch_size);
@@ -2442,7 +2442,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
                   cudaGetErrorString(err));
         return -1;
       }
-    } else if (ignis_verify_graph_run_batch(model, pool, static_cast<uint32_t>(batch_size),
+    } else if (ignis_verify_graph_run_batch(model, pool, verify, static_cast<uint32_t>(batch_size),
                                             LinearPolicyMode::kEngineDefault) != 0) {
       set_error(std::string("ignis_program_decode: ") + ignis_decode_graph_last_error());
       return -1;
@@ -2678,7 +2678,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
         }
       }
       std::string head_error;
-      if (ignis::mtp::commit_rows(*model, *pool, static_cast<std::uint32_t>(batch_size), head_rows.data(),
+      if (ignis::mtp::commit_rows(*model, *pool, verify, static_cast<std::uint32_t>(batch_size), head_rows.data(),
                                   head_rotation.empty() ? nullptr : head_rotation.data(), committed.data(),
                                   &head_error) != 0) {
         set_error("ignis_program_decode: " + head_error);
@@ -2715,9 +2715,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       }
       // GitHub #676: from its graph, on a round that stages.
       if (staging != nullptr) {
-        ignis::deferred_verify::append_round(model, pool, static_cast<std::uint32_t>(batch_size));
+        ignis::deferred_verify::append_round(model, pool, verify, static_cast<std::uint32_t>(batch_size));
       } else {
-        ignis_dflash2_append_round(model, pool, static_cast<std::uint32_t>(batch_size));
+        ignis_dflash2_append_round(model, pool, verify, static_cast<std::uint32_t>(batch_size));
       }
       const std::size_t column_bytes =
           kDflash2TapLayers.size() * static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
@@ -2816,7 +2816,8 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     // here leaves it the hidden of the lane's unmoved frontier.
     if (mtp) {
       std::string head_error;
-      if (ignis::mtp::commit_continuation(*model, *pool, static_cast<std::uint32_t>(batch_size), &head_error) != 0) {
+      if (ignis::mtp::commit_continuation(*model, *pool, verify, static_cast<std::uint32_t>(batch_size),
+                                          &head_error) != 0) {
         set_error("ignis_program_decode: " + head_error);
         return -1;
       }
@@ -2974,7 +2975,9 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       return -1;
     }
     if (options->speculative_window != 0) {
-      const uint32_t loaded = model->verify == nullptr ? 0 : model->verify->window;
+      // GitHub #686: the round's shape, the load's base shape, its one shape.
+      IgnisVerifyRound *const shape = model->base_shape.get();
+      const uint32_t loaded = shape == nullptr ? 0 : shape->window;
       if (options->speculative_window != loaded) {
         set_error("ignis_program_decode: speculative_window " +
                   std::to_string(options->speculative_window) + " is not the window this model was loaded with (" +
@@ -2999,7 +3002,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       }
       const auto began = std::chrono::steady_clock::now();
       const int32_t rc =
-          run_verify_round(model, pool, sequences, batch_size, sampling, *options, out_token_ids);
+          run_verify_round(model, pool, *shape, sequences, batch_size, sampling, *options, out_token_ids);
       if (rc != 0) {
         return rc;
       }
@@ -3520,6 +3523,30 @@ extern "C" int32_t ignis_program_repair(struct ignis_model *model, struct ignis_
   return 0;
 }
 
+namespace {
+
+// GitHub #686 (spec #684): one round shape's verify round, as
+// `ignis_program_stats` reports it.
+ignis_round_shape_stats round_shape_stats(const IgnisVerifyRound &shape) {
+  ignis_round_shape_stats out{};
+  out.window = shape.window;
+  out.vram_bytes = shape.device_bytes();
+  for (uint32_t width = 1; width <= IGNIS_DECODE_MAX_BATCH; ++width) {
+    if (shape.graph_ready[width - 1]) {
+      out.verify_graph_ready_mask |= 1u << (width - 1);
+      out.verify_graph_nodes[width - 1] = shape.graph_nodes[width - 1];
+      out.verify_graph_copy_nodes[width - 1] = shape.graph_copy_nodes[width - 1];
+    }
+    if (shape.append_exec[width - 1] != nullptr) {
+      out.drafter_append_graph_ready_mask |= 1u << (width - 1);
+    }
+  }
+  out.verify_folds_in_flight = shape.folds_in_flight;
+  return out;
+}
+
+} // namespace
+
 extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
                                          const struct ignis_seq_pool *pool,
                                          struct ignis_program_stats *out_stats) {
@@ -3561,8 +3588,8 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   // P5-04 (GitHub #153): the verify substrate's own buffers, records and
   // accept scratch, present only under a draft window (its traversal scratch
   // is `decode_graph_scratch` above, sized for it at load).
-  if (model->verify != nullptr) {
-    out_stats->vram_bytes += model->verify->device_bytes();
+  if (model->base_shape != nullptr) {
+    out_stats->vram_bytes += model->base_shape->device_bytes();
   }
   // GitHub #177: the media embedding pool (its weights are already in
   // `model->vram_bytes`, and its encoder workspace in `scratch`, GitHub #212)
@@ -3588,7 +3615,7 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
     if (model->decode_graph_ready[width - 1]) {
       ready_mask |= (1u << (width - 1));
     }
-    if (model->verify != nullptr && model->verify->graph_ready[width - 1]) {
+    if (model->base_shape != nullptr && model->base_shape->graph_ready[width - 1]) {
       verify_ready_mask |= (1u << (width - 1));
     }
   }
@@ -3606,25 +3633,33 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
     out_stats->decode_graph_copy_nodes[width - 1] =
         model->decode_graph_ready[width - 1] ? model->decode_graph_copy_nodes[width - 1] : 0;
     out_stats->verify_graph_nodes[width - 1] =
-        model->verify != nullptr && model->verify->graph_ready[width - 1]
-            ? model->verify->graph_nodes[width - 1]
+        model->base_shape != nullptr && model->base_shape->graph_ready[width - 1]
+            ? model->base_shape->graph_nodes[width - 1]
             : 0;
     out_stats->verify_graph_copy_nodes[width - 1] =
-        model->verify != nullptr && model->verify->graph_ready[width - 1]
-            ? model->verify->graph_copy_nodes[width - 1]
+        model->base_shape != nullptr && model->base_shape->graph_ready[width - 1]
+            ? model->base_shape->graph_copy_nodes[width - 1]
             : 0;
   }
   // GitHub #676: the verify rounds that returned with their fold in flight, and the drafter's append
   // graphs; a Flash-Next load has no `verify`.
-  out_stats->verify_folds_in_flight = model->verify != nullptr ? model->verify->folds_in_flight : 0;
+  out_stats->verify_folds_in_flight = model->base_shape != nullptr ? model->base_shape->folds_in_flight : 0;
   out_stats->drafter_append_graph_ready_mask = 0;
-  for (uint32_t width = 1; model->verify != nullptr && width <= IGNIS_DECODE_MAX_BATCH; ++width) {
-    if (model->verify->append_exec[width - 1] != nullptr) {
+  for (uint32_t width = 1; model->base_shape != nullptr && width <= IGNIS_DECODE_MAX_BATCH; ++width) {
+    if (model->base_shape->append_exec[width - 1] != nullptr) {
       out_stats->drafter_append_graph_ready_mask |= (1u << (width - 1));
     }
   }
   // GitHub #681: the gating's home; Flash-Next's load never captures the 27B's rounds.
   out_stats->gdn_gating = static_cast<uint32_t>(model->gdn_gating_home);
+  // GitHub #686: each round shape's own, the base shape alone; a Flash-Next load has none.
+  out_stats->round_shapes = 0;
+  for (ignis_round_shape_stats &shape : out_stats->shapes) {
+    shape = ignis_round_shape_stats{};
+  }
+  if (model->base_shape != nullptr) {
+    out_stats->shapes[out_stats->round_shapes++] = round_shape_stats(*model->base_shape);
+  }
   return 0;
 }
 

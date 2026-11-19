@@ -117,9 +117,8 @@ void ignis_dflash2_append_context(ignis_model *model, ignis_seq_pool *pool,
   }
 }
 
-void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, std::uint32_t width,
-                           const Dflash2ProposalReadout *readout) {
-  IgnisVerifyRound &verify    = *model->verify;
+void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
+                           std::uint32_t width, const Dflash2ProposalReadout *readout) {
   ninfer::DeviceArena &arena  = *verify.drafter_scratch;
   ninfer::DeviceArena::Scope scope = arena.scope();
   const cudaStream_t stream   = model->stream;
@@ -346,8 +345,8 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, std::uint32
   }
 }
 
-void ignis_dflash2_append_round(ignis_model *model, ignis_seq_pool *pool, std::uint32_t width) {
-  IgnisVerifyRound &verify   = *model->verify;
+void ignis_dflash2_append_round(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
+                                std::uint32_t width) {
   ninfer::DeviceArena &arena = *verify.drafter_scratch;
   ninfer::DeviceArena::Scope scope = arena.scope();
   const auto hidden          = static_cast<std::int32_t>(model->hidden);
