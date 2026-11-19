@@ -722,6 +722,7 @@ async fn a_load_with_kv_disk_exports_the_tier_from_the_first_scrape_within_bound
             retained_host_bytes: 0,
             kv_disk_bytes: Some(16 << 30),
             flash_next: None,
+            draft_positions: 0,
         },
     );
     let (api, metrics) = apps(server);

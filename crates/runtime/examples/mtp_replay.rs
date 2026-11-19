@@ -66,8 +66,9 @@ mod replay_load;
 
 use replay_shape::{LoadShape, ShapeFlags};
 
-/// The record's draft positions: the widest window (`MAX_DRAFT_TOKENS`).
-const POSITIONS: usize = ignis_core::MAX_DRAFT_TOKENS as usize;
+/// The record's draft positions: the MTP head's widest window
+/// (`MTP_MAX_DRAFT_TOKENS`).
+const POSITIONS: usize = ignis_core::MTP_MAX_DRAFT_TOKENS as usize;
 const COLUMNS: usize = POSITIONS + 1;
 /// One record's bytes, `tools/mtp-replay/records.py`'s `RECORD` (pinned there
 /// by `test_records.py`).

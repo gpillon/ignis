@@ -2407,6 +2407,7 @@ mod tests {
             retained_host_bytes: 0,
             kv_disk_bytes: Some(16 << 30),
             flash_next: None,
+            draft_positions: 0,
         });
         let mut telemetry = telemetry();
         telemetry.with_metrics(Arc::clone(&metrics));

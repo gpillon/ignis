@@ -684,9 +684,12 @@ pub struct SpecCounters {
     pub accepted_at: [u32; DRAFT_POSITIONS],
 }
 
-/// Draft positions a round can carry: the widest window a load admits
-/// (`MAX_DRAFT_TOKENS`, spec 05).
-pub const DRAFT_POSITIONS: usize = crate::speculation::MAX_DRAFT_TOKENS as usize;
+/// Draft positions the counters can carry: those a load at the widest
+/// window any drafter takes reports (`WIDEST_DRAFT_TOKENS`, GitHub #685).
+/// Each load reports its own ([`crate::speculation::draft_positions`]); the
+/// positions past a round's window stay at zero.
+pub const DRAFT_POSITIONS: usize =
+    crate::speculation::draft_positions(crate::speculation::WIDEST_DRAFT_TOKENS) as usize;
 
 impl SpecCounters {
     /// One verify round that proposed `drafted` tokens and committed
@@ -1114,16 +1117,25 @@ mod tests {
         }
     }
 
+    /// Per-position counts whose first positions are `first`, every later
+    /// position the counters carry at zero (GitHub #685: the counters carry
+    /// the widest window any drafter takes, whatever a round's own).
+    fn at_positions(first: &[u32]) -> [u32; DRAFT_POSITIONS] {
+        let mut counts = [0; DRAFT_POSITIONS];
+        counts[..first.len()].copy_from_slice(first);
+        counts
+    }
+
     #[test]
     fn a_round_marks_the_positions_it_proposed_and_the_run_it_committed() {
         // GitHub #160: seven drafts, the first three committed.
         let round = SpecCounters::round(7, 3);
         assert_eq!(round.rounds, 1);
-        assert_eq!(round.drafted_at, [1; DRAFT_POSITIONS]);
-        assert_eq!(round.accepted_at, [1, 1, 1, 0, 0, 0, 0]);
+        assert_eq!(round.drafted_at, at_positions(&[1; 7]));
+        assert_eq!(round.accepted_at, at_positions(&[1, 1, 1]));
         // A short lane at extent 2, nothing accepted.
         let short = SpecCounters::round(2, 0);
-        assert_eq!(short.drafted_at, [1, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(short.drafted_at, at_positions(&[1, 1]));
         assert_eq!(short.accepted_at, [0; DRAFT_POSITIONS]);
         // Extent 0: proposes nothing, so no position is counted.
         assert_eq!(SpecCounters::round(0, 0).drafted_at, [0; DRAFT_POSITIONS]);
@@ -1138,8 +1150,8 @@ mod tests {
         assert_eq!(total.rounds, 3);
         assert_eq!(total.drafted, 17);
         assert_eq!(total.accepted, 10);
-        assert_eq!(total.drafted_at, [3, 3, 3, 2, 2, 2, 2]);
-        assert_eq!(total.accepted_at, [3, 2, 1, 1, 1, 1, 1]);
+        assert_eq!(total.drafted_at, at_positions(&[3, 3, 3, 2, 2, 2, 2]));
+        assert_eq!(total.accepted_at, at_positions(&[3, 2, 1, 1, 1, 1, 1]));
         assert_eq!(total.acceptance_profile(), "100,67,33,50,50,50,50");
         // A window of 3 prints three slots, never the unused tail.
         let narrow = SpecCounters::round(3, 3) + SpecCounters::round(3, 0);

@@ -11,8 +11,44 @@
 //! arithmetic, so the two cannot drift silently.
 
 /// The widest draft window DFlash2 accepts (the reference's `--spec-draft-tokens`
-/// range for the 27B DFlash2 module, spec 05: `1..7`).
-pub const MAX_DRAFT_TOKENS: u32 = 7;
+/// range for the 27B DFlash2 module, spec 05: `1..7`). The leaf's own is
+/// `IGNIS_DFLASH2_MAX_DRAFT_TOKENS` (`kernel/include/ignis_model.h`), which a
+/// build-time check holds inside the vendored ops' domains
+/// (`kernel/src/draft_window.h`).
+pub const DFLASH2_MAX_DRAFT_TOKENS: u32 = 7;
+
+/// The widest draft window of a model's MTP head, the 27B's and
+/// Flash-Next's (`IGNIS_MTP_MAX_DRAFT_TOKENS`).
+pub const MTP_MAX_DRAFT_TOKENS: u32 = 7;
+
+/// The widest draft window of the verify substrate alone, a test's fake
+/// drafter (`IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS`).
+pub const VERIFY_ONLY_MAX_DRAFT_TOKENS: u32 = 7;
+
+const fn wider(a: u32, b: u32) -> u32 {
+    if a > b { a } else { b }
+}
+
+/// The widest draft window any drafter accepts: the bound of the server's
+/// one `spec.draft_tokens` field, inside which each drafter refuses past its
+/// own cap, and the positions [`crate::types::SpecCounters`] can carry.
+pub const WIDEST_DRAFT_TOKENS: u32 =
+    wider(DFLASH2_MAX_DRAFT_TOKENS, wider(MTP_MAX_DRAFT_TOKENS, VERIFY_ONLY_MAX_DRAFT_TOKENS));
+
+/// The fewest draft positions a load reports: the seven every load
+/// reported while one cap of 7 bounded every drafter, so that a load at a
+/// window of 7 or fewer reports what it did then (a Flash-Next load at 2
+/// drafts still prints positions 1 to 7 on `/metrics`). Past it a load
+/// reports its own window ([`draft_positions`]).
+pub const MIN_DRAFT_POSITIONS: u32 = 7;
+
+/// The draft positions a load at a window of `draft_tokens` reports (GitHub
+/// #685): its rounds' per-position counters ([`crate::types::SpecCounters`])
+/// and the `ignis_speculative_position_*` series `/metrics` prints, the
+/// window but never fewer than [`MIN_DRAFT_POSITIONS`].
+pub const fn draft_positions(draft_tokens: u32) -> u32 {
+    wider(draft_tokens, MIN_DRAFT_POSITIONS)
+}
 
 /// The drafter's layers, KV heads, head width and sliding window (the
 /// reference's `qwen3.8-27b-artifact.md` §15.1).
@@ -96,6 +132,24 @@ impl SpeculativeBackend {
             Self::VerifyOnly => "verify-only",
             Self::Mtp => "mtp",
         }
+    }
+
+    /// The widest draft window this drafter accepts (GitHub #685): each
+    /// holds its own cap, refused past it naming the drafter.
+    pub const fn max_draft_tokens(&self) -> u32 {
+        match self {
+            Self::Dflash2 => DFLASH2_MAX_DRAFT_TOKENS,
+            Self::VerifyOnly => VERIFY_ONLY_MAX_DRAFT_TOKENS,
+            Self::Mtp => MTP_MAX_DRAFT_TOKENS,
+        }
+    }
+
+    /// The refusal of a window outside `1..=max_draft_tokens`, naming the
+    /// drafter, its range and the value.
+    fn refuse_window(&self, draft_tokens: u32) -> Option<String> {
+        let widest = self.max_draft_tokens();
+        (!(1..=widest).contains(&draft_tokens))
+            .then(|| format!("draft tokens must be in 1..{widest} under {}, got {draft_tokens}", self.as_str()))
     }
 
     /// `enum ignis_speculative_backend` (`kernel/include/ignis_model.h`);
@@ -195,15 +249,16 @@ pub struct FlashNextSpeculation {
 }
 
 impl FlashNextSpeculation {
-    /// `draft_tokens` in `1..=MAX_DRAFT_TOKENS`, a row budget of 0 (the
+    /// `draft_tokens` in `1..=` the backend's
+    /// [`SpeculativeBackend::max_draft_tokens`], a row budget of 0 (the
     /// default's [`FLASH_NEXT_DEFAULT_VERIFY_ROWS`]) or
     /// 2..=[`FLASH_NEXT_MAX_VERIFY_ROWS`]; DFlash2 is the 27B's.
     pub fn new(backend: SpeculativeBackend, draft_tokens: u32, row_budget: u32) -> Result<Self, String> {
         if backend == SpeculativeBackend::Dflash2 {
             return Err("DFlash2 is the 27B's drafter; Qwen3.8-Flash-Next drafts with mtp".to_string());
         }
-        if !(1..=MAX_DRAFT_TOKENS).contains(&draft_tokens) {
-            return Err(format!("draft tokens must be in 1..{MAX_DRAFT_TOKENS}, got {draft_tokens}"));
+        if let Some(refusal) = backend.refuse_window(draft_tokens) {
+            return Err(refusal);
         }
         if row_budget > FLASH_NEXT_MAX_VERIFY_ROWS || row_budget == 1 {
             return Err(format!(
@@ -219,6 +274,11 @@ impl FlashNextSpeculation {
 
     pub fn draft_tokens(&self) -> u32 {
         self.draft_tokens
+    }
+
+    /// The draft positions this load reports ([`draft_positions`]).
+    pub fn draft_positions(&self) -> u32 {
+        draft_positions(self.draft_tokens)
     }
 
     pub fn row_budget(&self) -> u32 {
@@ -421,13 +481,12 @@ pub struct Speculation {
 }
 
 impl Speculation {
-    /// `draft_tokens` must be in `1..=MAX_DRAFT_TOKENS`; the refusal names the
-    /// range and the value.
+    /// `draft_tokens` must be in `1..=` the backend's
+    /// [`SpeculativeBackend::max_draft_tokens`]; the refusal names the
+    /// drafter, its range and the value.
     pub fn new(backend: SpeculativeBackend, draft_tokens: u32) -> Result<Self, String> {
-        if !(1..=MAX_DRAFT_TOKENS).contains(&draft_tokens) {
-            return Err(format!(
-                "draft tokens must be in 1..{MAX_DRAFT_TOKENS}, got {draft_tokens}"
-            ));
+        if let Some(refusal) = backend.refuse_window(draft_tokens) {
+            return Err(refusal);
         }
         Ok(Self {
             backend,
@@ -471,6 +530,11 @@ impl Speculation {
 
     pub fn draft_tokens(&self) -> u32 {
         self.draft_tokens
+    }
+
+    /// The draft positions this load reports ([`draft_positions`]).
+    pub fn draft_positions(&self) -> u32 {
+        draft_positions(self.draft_tokens)
     }
 
     /// The device bytes the load's drafter keeps per sequence in a pool of
@@ -661,20 +725,65 @@ mod tests {
         assert!(err.contains("`medium`") && err.contains("full, shortlist or auto"), "{err}");
     }
 
+    /// GitHub #685: the widest window is the drafter's own. Each of DFlash2,
+    /// the MTP head and the verify substrate alone holds its cap, all three
+    /// still 7.
+    const WINDOW_RANGES: [(SpeculativeBackend, u32, &str); 3] = [
+        (SpeculativeBackend::Dflash2, 7, "1..7"),
+        (SpeculativeBackend::Mtp, 7, "1..7"),
+        (SpeculativeBackend::VerifyOnly, 7, "1..7"),
+    ];
+
     #[test]
     fn every_window_in_range_is_accepted() {
-        for n in 1..=7 {
-            let spec = Speculation::new(SpeculativeBackend::Dflash2, n).expect("in range");
-            assert_eq!(spec.draft_tokens(), n);
+        for (backend, widest, _) in WINDOW_RANGES {
+            assert_eq!(backend.max_draft_tokens(), widest, "{}", backend.as_str());
+            for n in 1..=widest {
+                let spec = Speculation::new(backend, n).unwrap_or_else(|e| panic!("{} at {n}: {e}", backend.as_str()));
+                assert_eq!((spec.backend(), spec.draft_tokens()), (backend, n));
+            }
         }
     }
 
     #[test]
     fn a_window_outside_the_range_is_refused_naming_the_range() {
-        for n in [0, 8, 15, u32::MAX] {
-            let err = Speculation::new(SpeculativeBackend::Dflash2, n).expect_err("out of range");
-            assert!(err.contains("1..7"), "{err}");
-            assert!(err.contains(&n.to_string()), "{err}");
+        for (backend, widest, range) in WINDOW_RANGES {
+            for n in [0, 8, 15, 16, u32::MAX] {
+                if (1..=widest).contains(&n) {
+                    continue;
+                }
+                let err = Speculation::new(backend, n).expect_err("out of range");
+                let at = format!("{} at {n}", backend.as_str());
+                assert!(err.contains(&format!("must be in {range} ")), "{at}: {err}");
+                assert!(err.contains(backend.as_str()), "{at}: the refusal names the drafter: {err}");
+                assert!(err.contains(&format!("got {n}")), "{at}: {err}");
+            }
+            // The last window in the range, and the first one past it.
+            assert!(Speculation::new(backend, widest).is_ok(), "{} at {widest}", backend.as_str());
+            assert!(Speculation::new(backend, widest + 1).is_err(), "{} at {}", backend.as_str(), widest + 1);
+        }
+    }
+
+    /// GitHub #685: the draft positions a load reports (its rounds'
+    /// counters, the request log's profile, `/metrics`) are sized by the
+    /// load's own window, never fewer than the seven every load reported
+    /// while one cap bounded every drafter: so every load a drafter at 7
+    /// takes, DFlash2's, the 27B's MTP head's, the verify substrate's and
+    /// Flash-Next's, reports the seven it reported then, whatever its window.
+    #[test]
+    fn every_load_reports_the_seven_draft_positions_it_reported_before_the_cap_split() {
+        for (backend, widest, _) in WINDOW_RANGES {
+            for n in 1..=widest {
+                let positions = Speculation::new(backend, n).unwrap().draft_positions();
+                assert_eq!(positions, 7, "{} at {n}", backend.as_str());
+                assert!(positions as usize <= crate::types::DRAFT_POSITIONS, "the counters hold every position a load reports");
+            }
+        }
+        for backend in [SpeculativeBackend::Mtp, SpeculativeBackend::VerifyOnly] {
+            for n in 1..=7 {
+                let flash_next = FlashNextSpeculation::new(backend, n, 0).unwrap();
+                assert_eq!(flash_next.draft_positions(), 7, "Flash-Next's {} at {n}", backend.as_str());
+            }
         }
     }
 
@@ -760,11 +869,11 @@ mod tests {
         assert_eq!(widths(1, 16), [1; 8]);
         assert_eq!(widths(3, 24), [3, 3, 3, 3, 3, 3, 2, 2]);
         assert_eq!(widths(7, FLASH_NEXT_MAX_VERIFY_ROWS), [7, 7, 7, 7, 5, 4, 3, 3]);
-        for draft in 1..=MAX_DRAFT_TOKENS {
+        for draft in 1..=MTP_MAX_DRAFT_TOKENS {
             assert_eq!(widths(draft, 0), widths(draft, FLASH_NEXT_DEFAULT_VERIFY_ROWS), "0 is the default budget");
         }
         // Every window fits its budget, and none goes past the maximum.
-        for draft in 1..=MAX_DRAFT_TOKENS {
+        for draft in 1..=MTP_MAX_DRAFT_TOKENS {
             for budget in 0..=FLASH_NEXT_MAX_VERIFY_ROWS + 1 {
                 let rows =
                     if budget == 0 { FLASH_NEXT_DEFAULT_VERIFY_ROWS } else { budget.min(FLASH_NEXT_MAX_VERIFY_ROWS) };
@@ -794,7 +903,7 @@ mod tests {
         assert_eq!((rows(3, 16, 8), rows(3, 32, 8)), (16, 32));
         let spec = FlashNextSpeculation::new(SpeculativeBackend::Mtp, 2, 0).expect("valid");
         assert_eq!(spec.decode_rows(3), 6);
-        for draft in 1..=MAX_DRAFT_TOKENS {
+        for draft in 1..=MTP_MAX_DRAFT_TOKENS {
             for budget in 0..=FLASH_NEXT_MAX_VERIFY_ROWS {
                 for lanes in 1..=8 {
                     let widest = (1..=lanes)
@@ -816,7 +925,7 @@ mod tests {
         assert!(err.contains("DFlash2") && err.contains("mtp"), "{err}");
         for draft in [0, 8] {
             let err = FlashNextSpeculation::new(SpeculativeBackend::Mtp, draft, 0).expect_err("out of range");
-            assert!(err.contains("1..7"), "{err}");
+            assert!(err.contains("1..7") && err.contains("mtp"), "{err}");
         }
         for budget in [1, FLASH_NEXT_MAX_VERIFY_ROWS + 1] {
             let err = FlashNextSpeculation::new(SpeculativeBackend::VerifyOnly, 2, budget).expect_err("bad budget");

@@ -189,6 +189,15 @@ fn every_decode_job_carries_the_requests_remaining_budget() {
     assert_eq!(anchors, vec![true, false, false], "only the first round's anchor had left");
 }
 
+/// Per-position counts whose first positions are `first`, every later
+/// position the counters carry at zero (GitHub #685: they carry the widest
+/// window any drafter takes, whatever the mock's rounds draft).
+fn at_positions(first: &[u32]) -> [u32; ignis_core::types::DRAFT_POSITIONS] {
+    let mut counts = [0; ignis_core::types::DRAFT_POSITIONS];
+    counts[..first.len()].copy_from_slice(first);
+    counts
+}
+
 #[test]
 fn speculative_rounds_add_up_on_the_done_event() {
     // Rounds of 3, 1, 3: the mock drafts len - 1 and accepts committed - 1.
@@ -207,8 +216,8 @@ fn speculative_rounds_add_up_on_the_done_event() {
             accepted: 2,
             // GitHub #160: the first and third rounds proposed two drafts
             // each; only the first committed them.
-            drafted_at: [2, 2, 0, 0, 0, 0, 0],
-            accepted_at: [1, 1, 0, 0, 0, 0, 0],
+            drafted_at: at_positions(&[2, 2]),
+            accepted_at: at_positions(&[1, 1]),
         })
     );
 }

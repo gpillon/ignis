@@ -4,8 +4,9 @@
 // Two things are pinned here, both host-only:
 //
 // 1. The options struct is validated before anything is bound (ADR 0016): an
-//    unrecognized size, an unknown backend, a draft window outside 1..7, and
-//    a window with no backend are each refused by name.
+//    unrecognized size, an unknown backend, a draft window outside its
+//    backend's range (each backend's own, GitHub #685) and a window with no
+//    backend are each refused by name.
 // 2. The leaf's drafter schema: under IGNIS_SPECULATIVE_DFLASH2 every one of
 //    the 66 `dflash2/*` tensors is asked for, and a missing or mis-shaped one
 //    fails the load naming it; without the option the same tensors are extras.
@@ -180,17 +181,40 @@ int main() {
     check(contains(m, "speculative_backend") && contains(m, std::to_string(backend)),
           "backend " + std::to_string(backend) + " is refused by name: " + m);
   }
-  // P5-04 (GitHub #153): the verify-only backend takes the same window rule
-  // as DFLASH2 -- the verify graphs are captured at it.
-  for (const int32_t backend : {static_cast<int32_t>(IGNIS_SPECULATIVE_DFLASH2),
-                                static_cast<int32_t>(IGNIS_SPECULATIVE_VERIFY_ONLY)}) {
-    for (const uint32_t window : {0u, 8u, 15u}) {
-      ignis_model_load_options bad = dflash2(window);
-      bad.speculative_backend = backend;
-      const std::string m = load_error({}, &bad);
-      check(contains(m, "draft_tokens") && contains(m, "1..7") && contains(m, std::to_string(window)),
-            "backend " + std::to_string(backend) + " window " + std::to_string(window) +
-                " is refused naming the range: " + m);
+  // The draft window, by backend (GitHub #685): DFLASH2, the verify substrate
+  // alone (P5-04, GitHub #153: its verify graphs are captured at it) and the
+  // MTP head each hold their own cap, all three 7. A window outside its
+  // backend's range is refused naming the option, that range, the value and
+  // the backend; one inside it gets past the check, whatever stops the load
+  // after it.
+  {
+    struct WindowRule {
+      int32_t backend;
+      const char *name;
+      uint32_t widest;
+      const char *range;
+    };
+    const std::vector<WindowRule> rules = {
+        {IGNIS_SPECULATIVE_DFLASH2, "DFLASH2", IGNIS_DFLASH2_MAX_DRAFT_TOKENS, "1..7"},
+        {IGNIS_SPECULATIVE_VERIFY_ONLY, "VERIFY_ONLY", IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS, "1..7"},
+        {IGNIS_SPECULATIVE_MTP, "MTP", IGNIS_MTP_MAX_DRAFT_TOKENS, "1..7"},
+    };
+    for (const WindowRule &rule : rules) {
+      check(rule.widest == 7, std::string(rule.name) + "'s widest window is 7");
+      for (const uint32_t window : {0u, 1u, 7u, 8u, 15u, 16u, 255u}) {
+        ignis_model_load_options options = dflash2(window);
+        options.speculative_backend = rule.backend;
+        const std::string m = load_error({}, &options);
+        const bool range_refusal = contains(m, "draft_tokens") && contains(m, "must be in");
+        const std::string at = std::string(rule.name) + " window " + std::to_string(window);
+        if (window >= 1 && window <= rule.widest) {
+          check(!range_refusal, at + " is in its range, so not refused for it: " + m);
+        } else {
+          check(range_refusal && contains(m, std::string("must be in ") + rule.range + " ") &&
+                    contains(m, "draft_tokens " + std::to_string(window)) && contains(m, rule.name),
+                at + " is refused naming the range " + rule.range + " and the backend: " + m);
+        }
+      }
     }
   }
   {

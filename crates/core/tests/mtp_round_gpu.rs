@@ -1248,8 +1248,10 @@ fn reference_runs(kv: &str) -> Vec<(String, usize, EngineRun)> {
                 accepted: accepted_at.iter().sum(),
                 ..SpecCounters::default()
             };
-            counters.accepted_at.copy_from_slice(&accepted_at);
-            counters.drafted_at.copy_from_slice(&drafted_at);
+            // GitHub #685: the fixture's rows carry the head's window; the
+            // counters carry the widest window any drafter takes.
+            counters.accepted_at[..accepted_at.len()].copy_from_slice(&accepted_at);
+            counters.drafted_at[..drafted_at.len()].copy_from_slice(&drafted_at);
             let generated = numbers("generated_ids").into_iter().map(|x| x as i32).collect();
             let id = row["id"].as_str().expect("id").to_string();
             let prompt_tokens = row["prompt_tokens"].as_u64().expect("prompt_tokens") as usize;

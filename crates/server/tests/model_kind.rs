@@ -257,6 +257,7 @@ async fn metrics_the_tokenize_routes_and_the_models_list_answer_with_the_image_m
         retained_host_bytes: 0,
         kv_disk_bytes: None,
         flash_next: None,
+        draft_positions: 0,
     };
     let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]).with_metrics().with_load_reservations(reserved);
     let (app, metrics) = (server.app(), server.metrics_app().expect("metrics are on"));
@@ -314,6 +315,7 @@ fn text_reservations() -> ignis_server::metrics::LoadReservations {
         retained_host_bytes: 0,
         kv_disk_bytes: None,
         flash_next: None,
+        draft_positions: 0,
     }
 }
 

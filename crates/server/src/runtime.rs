@@ -1532,6 +1532,8 @@ pub fn qwen27b_load(
         retained_host_bytes: reservations.retained_host_bytes,
         kv_disk_bytes,
         flash_next: None,
+        // GitHub #685: the positions its rounds report, by its own window.
+        draft_positions: shape.speculation.map_or(0, |s| s.draft_positions()),
     };
     Ok((sched, reserved, shape, adapted.steps))
 }
@@ -1969,6 +1971,7 @@ pub(crate) fn flash_next_load(
         retained_host_bytes: pool_plan.retained_host_bytes,
         kv_disk_bytes,
         flash_next: Some(counters),
+        draft_positions: speculation.map_or(0, |s| s.draft_positions()),
     };
     Ok((sched, reserved, shape))
 }

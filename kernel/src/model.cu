@@ -27,6 +27,7 @@
 #include "ignis_step.h"
 
 #include "attention_readout.h"
+#include "draft_window.h"
 #include "fp8_exception.h"
 #include "ignis_dense_prefill.h"
 #include "gdn_prefill.h"
@@ -1571,12 +1572,15 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
               " needs a speculative_backend");
     return nullptr;
   }
-  // P5-04 (GitHub #153): VERIFY_ONLY takes the same window rule -- the
-  // verify graphs are captured at it, and the round is refused at any other.
+  // P5-04 (GitHub #153): VERIFY_ONLY takes a window too -- the verify graphs
+  // are captured at it, and the round is refused at any other. GitHub #685:
+  // each backend's range is its own, and the refusal names it.
   if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
-      (draft_tokens < 1 || draft_tokens > IGNIS_DFLASH2_MAX_DRAFT_TOKENS)) {
-    set_error("ignis_model_load: draft_tokens " + std::to_string(draft_tokens) +
-              " must be in 1.." + std::to_string(IGNIS_DFLASH2_MAX_DRAFT_TOKENS));
+      (draft_tokens < 1 || draft_tokens > ignis_max_draft_tokens(speculative_backend))) {
+    set_error("ignis_model_load: draft_tokens " + std::to_string(draft_tokens) + " must be in 1.." +
+              std::to_string(ignis_max_draft_tokens(speculative_backend)) + " under speculative_backend " +
+              std::to_string(speculative_backend) + " (" + ignis_speculative_backend_name(speculative_backend) +
+              ")");
     return nullptr;
   }
   // GitHub #576 (ADR 0090): the draft rule decides what a verify round's
@@ -1988,7 +1992,7 @@ struct LoadSizes {
 // decode route reaches the fused op, so the prefill width asks the dense op
 // instead: the INT8 activations of each shared input's matrices together
 // (`ignis_dense_prefill_workspace_bytes`), past the fused op's counters.
-static_assert(IGNIS_DECODE_MAX_BATCH * (IGNIS_DFLASH2_MAX_DRAFT_TOKENS + 1) <= IGNIS_TRELLIS_DECODE_MAX_TOKENS,
+static_assert(IGNIS_DECODE_MAX_BATCH * (kIgnisWidestDraftTokens + 1) <= IGNIS_TRELLIS_DECODE_MAX_TOKENS,
               "a verify round's head columns (lanes x (k + 1)) must stay on the trellis op's decode route");
 static_assert(kSpanLogitsBlockColumns <= IGNIS_TRELLIS_DECODE_MAX_TOKENS,
               "a span-logits block's head columns must stay on the trellis op's decode route");
