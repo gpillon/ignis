@@ -4,9 +4,9 @@
 // FP8 activations: the same weight payload and cp.async multistage shape, with both operands fed
 // to the tensor cores as E4M3.
 //
-// fp8_gemm.cu instantiates GemmDefaultConfig for ignis_image_gemm_w8a8; the bench's tile sweep
-// (kernel/tests/image_gemm_sweep.cu, built into the test and the bench only) instantiates the
-// others. Everything here has internal linkage, so each translation unit owns its kernels.
+// fp8_gemm.cu instantiates GemmDefaultConfig for ignis_image_gemm_w8a8 and (GitHub #693) a 16-token
+// tile for the *_tile16 calls; the bench's tile sweep (kernel/tests/image_gemm_sweep.cu, built into
+// the test and the bench only) instantiates the others. Everything here has internal linkage, so each translation unit owns its kernels.
 //
 //   operands  A = the activation codes [tokens][cols], B = the weight codes [rows][cols]: both
 //             k-contiguous ("TN"), as mma.sync's row.col form takes them. ldmatrix.b16 delivers
