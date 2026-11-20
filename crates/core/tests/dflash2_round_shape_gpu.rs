@@ -1,18 +1,22 @@
 //! The shape a two-shape DFlash2 load's verify rounds take, on real rounds
-//! (GitHub #689, spec #684): the shape rule as the leaf applies it, the
+//! (GitHub #689, #690, spec #684): the shape rule as the leaf applies it, the
 //! shape policy `all` (a round is one shape for all its lanes, extended at 1
-//! to 4 lanes only when every lane asks), and a lane's ask as part of its
-//! sequence through a snapshot and a restore.
+//! to 4 lanes only when every lane asks), a lane's ask as part of its
+//! sequence through a snapshot and a restore, and the shape policies
+//! `aggregate` and `all` on the same two lanes' forced accepts.
 //!
 //! The rule and the policy are pure functions with their own host-only
 //! tables (`kernel/tests/test_round_shape.cpp`). What those tables cannot hold
 //! is the round around them: that the leaf feeds the rule each lane's own
 //! extent and accept, that a round runs the shape its lanes' asks give it,
-//! that the lanes limit is the extended shape's, and that what a lane asks is
-//! the sequence's, not the handle's. Those are here, on one load: the NVFP4
-//! body, DFlash2 at 15 under the sampled draft, hq-e8-2b, FP8 exception
-//! weights, 8 lanes, the rule at its default thresholds and
-//! `IGNIS_ROUND_SHAPE` unset unless a round names it.
+//! that the lanes limit is the extended shape's, that what a lane asks is
+//! the sequence's, not the handle's, and that the policy reads each lane's
+//! own recent rounds. Those are here, on two loads of one materialized
+//! artifact: the NVFP4 body, DFlash2 at 15 under the sampled draft, hq-e8-2b,
+//! FP8 exception weights, 8 lanes, the rule at its default thresholds and
+//! `IGNIS_ROUND_SHAPE` unset unless a round names it; the first load under
+//! the policy `all` (parts 1 to 4), the second under `aggregate`, the default
+//! (part 4).
 //!
 //! The rounds are live and greedy, on a text the drafter predicts far ahead
 //! (counting), so the accept is the text's, not the test's: the test keeps a
@@ -36,6 +40,16 @@
 //! 3. **A lane's ask is its sequence's**: a lane that asks, snapshotted and
 //!    restored onto a fresh handle and onto its own, still asks; a blob that
 //!    does not ask, restored onto a handle that did, does not.
+//! 4. **The policy on forced accepts** (#690): two lanes, each round
+//!    teacher-forced with drafts the recording agrees with for as many as the
+//!    test says ([`forced_round`]), so the accepts are the test's, not the
+//!    text's. A lane that takes every draft beside one that takes 2 (a high
+//!    expected gain beside a conversation): under `aggregate` its first round
+//!    asking is granted the extended shape and every round after stays
+//!    extended, under `all` every round is base. A lane that takes all 7 of
+//!    a base round and nothing past them (a low one, still asking): under
+//!    `aggregate` its granted round is extended and every round after base,
+//!    its window holding that round; under `all` every round is base.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a **skip**; under the profile the same
@@ -54,10 +68,13 @@ use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::model_load::{load_qwen38_27b_with_decode_lanes, model_scope, Model};
 use ignis_core::seq::{snapshot_format_version, Seq, SeqPool, SeqPoolBudget};
-use ignis_core::step::{capture_decode_graphs, decode_program_verify_runs, prefill_program_sampled, LaneVerifyRun, SamplingParams, VerifyLane};
+use ignis_core::step::{
+    capture_decode_graphs, decode_program_verify_forced_with, decode_program_verify_runs, prefill_program_sampled, LaneVerifyRun,
+    SamplingParams, TeacherForcing, VerifyLane,
+};
 use ignis_core::{
-    DraftRule, DrafterSampling, ExceptionWeights, KvFormat, PrefillAttention, PrefillLinear, RopeScaling, ShapeRule, Speculation,
-    SpeculativeBackend,
+    DraftRule, DrafterSampling, ExceptionWeights, KvFormat, PrefillAttention, PrefillLinear, RopeScaling, ShapeEstimate, ShapePolicy,
+    ShapeRule, Speculation, SpeculativeBackend,
 };
 
 const NVFP4: &str = "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -165,6 +182,90 @@ fn shape(extended: bool) -> &'static str {
     if extended { "the extended shape" } else { "the base shape" }
 }
 
+/// #690: one teacher-forced verify round of `seqs` whose shape the load's
+/// rule and policy choose, lane i's drafts agreeing with its recording for
+/// its first `agree[i]`, so that the target accepts that many of a window
+/// that long: its shape, each lane's accept held to what the forcing gives
+/// it. The recordings walk `text` from `at`.
+fn forced_round(
+    model: &Model,
+    pool: &SeqPool,
+    seqs: &mut [&mut Seq<'_>],
+    agree: &[u32],
+    text: &[i32],
+    at: usize,
+    failures: &mut Vec<String>,
+    what: &str,
+) -> bool {
+    let recordings: Vec<Vec<i32>> = (0..seqs.len())
+        .map(|lane| (0..=WINDOW as usize).map(|j| text[(at + 3 * lane + j) % text.len()]).collect())
+        .collect();
+    let drafts: Vec<Vec<i32>> = recordings
+        .iter()
+        .zip(agree)
+        .map(|(recording, &agree)| {
+            (0..WINDOW as usize)
+                .map(|j| if j < agree as usize { recording[j] } else if recording[j] == 13 { 14 } else { 13 })
+                .collect()
+        })
+        .collect();
+    let recording_refs: Vec<&[i32]> = recordings.iter().map(Vec::as_slice).collect();
+    let draft_refs: Vec<&[i32]> = drafts.iter().map(Vec::as_slice).collect();
+    let lanes = vec![VerifyLane::greedy(&[]); seqs.len()];
+    let forcing = TeacherForcing { shape_window: None, drafts: Some(&draft_refs) };
+    let runs = decode_program_verify_forced_with(model, pool, seqs, &lanes, WINDOW, &recording_refs, forcing)
+        .unwrap_or_else(|e| panic!("{what}: {e}"));
+    let extended = runs[0].extended;
+    if runs.iter().any(|run| run.extended != extended) {
+        failures.push(format!("{what}: one round, lanes of two shapes"));
+    }
+    let window = if extended { WINDOW } else { BASE_WINDOW };
+    for (lane, (run, &agree)) in runs.iter().zip(agree).enumerate() {
+        let accepted = run.tokens.len() as u32 - 1;
+        if (run.extent, accepted) != (window, agree.min(window)) {
+            failures.push(format!(
+                "{what}: lane {lane} drafted {} and took {accepted}, not the forced {window} and {}",
+                run.extent,
+                agree.min(window)
+            ));
+        }
+    }
+    extended
+}
+
+/// #690: part 4 on a load under `policy`: two fresh lanes through the
+/// courses of its note, each round's shape held to the course's.
+fn the_policy_on_forced_accepts(model: &Model, pool: &SeqPool, policy: ShapePolicy, prompt: &[i32], failures: &mut Vec<String>) {
+    const ROUNDS: usize = 6;
+    let aggregate = policy == ShapePolicy::Aggregate;
+    // Lane 0's agreement a round, and the shapes its rounds take under the
+    // policy: the high gain's granted round and every one after extended, the
+    // low gain's granted round alone; under `all` none, lane 1 never asking.
+    let courses: [(&str, u32, [bool; ROUNDS]); 2] = [
+        ("a high expected gain", WINDOW, [false, aggregate, aggregate, aggregate, aggregate, aggregate]),
+        ("a low expected gain", BASE_WINDOW, [false, aggregate, false, false, false, false]),
+    ];
+    for (case, agree, shapes) in courses {
+        let mut lanes: Vec<Seq<'_>> = (0..2)
+            .map(|lane| {
+                let mut seq = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("part 4: alloc lane {lane}: {e}"));
+                prefill_program_sampled(model, pool, &mut seq, prompt, 0, SamplingParams::greedy(), None)
+                    .unwrap_or_else(|e| panic!("part 4: prefill lane {lane}: {e}"));
+                seq
+            })
+            .collect();
+        let [a, b] = &mut lanes[..] else { unreachable!("two lanes") };
+        for (at, &want) in shapes.iter().enumerate() {
+            let what = format!("part 4, `{}`, {case} beside a lane that takes 2: round {at}", policy.as_str());
+            let extended = forced_round(model, pool, &mut [&mut *a, &mut *b], &[agree, 2], prompt, 5 * at, failures, &what);
+            println!("dflash2_round_shape_gpu {what}: {}", if extended { "extended" } else { "base" });
+            if extended != want {
+                failures.push(format!("{what}: ran {} where the policy gives {}", shape(extended), shape(want)));
+            }
+        }
+    }
+}
+
 /// The ask the blob's progress image carries (format 6).
 fn blob_asks(blob: &[u8]) -> u32 {
     let (at, _) = snapshot_blob::section(blob, snapshot_blob::SECTION_PROGRESS);
@@ -203,11 +304,15 @@ fn a_two_shape_loads_rounds_take_the_shape_their_lanes_ask_one_shape_a_round_and
         .collect();
 
     let rule = ShapeRule::default();
-    let spec = Speculation::new(SpeculativeBackend::Dflash2, WINDOW)
+    // #690: parts 1 to 3 hold `all`, named on the first load; the second is
+    // the default's, `aggregate`.
+    let aggregate = Speculation::new(SpeculativeBackend::Dflash2, WINDOW)
         .unwrap_or_else(|e| panic!("speculation: {e}"))
         .with_draft_rule(DraftRule::Sampled, DrafterSampling::default())
         .with_shape_rule(rule)
         .unwrap_or_else(|e| panic!("shape rule: {e}"));
+    assert_eq!(aggregate.shape_policy(), ShapePolicy::Aggregate, "the default policy");
+    let spec = aggregate.with_shape_policy(ShapePolicy::All, ShapeEstimate::default());
     let (plan, handles) =
         bind_model_scope_27b_with(&reader, model_scope(Some(spec), None, ExceptionWeights::Fp8)).unwrap_or_else(|e| panic!("bind: {e}"));
     let mut artifact = match materialize(&reader, &plan, &mut device, None) {
@@ -220,7 +325,7 @@ fn a_two_shape_loads_rounds_take_the_shape_their_lanes_ask_one_shape_a_round_and
         }
     };
     let mut failures: Vec<String> = Vec::new();
-    {
+    let load = |spec: Speculation| {
         let model = load_qwen38_27b_with_decode_lanes(
             &reader,
             &artifact,
@@ -251,6 +356,10 @@ fn a_two_shape_loads_rounds_take_the_shape_their_lanes_ask_one_shape_a_round_and
         .unwrap_or_else(|e| panic!("pool: {e}"));
         set(ROUND_SHAPE, None);
         capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+        (model, pool)
+    };
+    {
+        let (model, pool) = load(spec);
         let fresh = |what: &str| {
             let mut seq = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("{what}: alloc: {e}"));
             prefill_program_sampled(&model, &pool, &mut seq, &prompt, 0, SamplingParams::greedy(), None)
@@ -412,6 +521,13 @@ fn a_two_shape_loads_rounds_take_the_shape_their_lanes_ask_one_shape_a_round_and
             }
         }
         failures.extend(missing);
+
+        // 4. The policy on forced accepts: `all` here, `aggregate` below.
+        the_policy_on_forced_accepts(&model, &pool, ShapePolicy::All, &prompt, &mut failures);
+    }
+    {
+        let (model, pool) = load(aggregate);
+        the_policy_on_forced_accepts(&model, &pool, ShapePolicy::Aggregate, &prompt, &mut failures);
     }
     artifact.release_arena(&mut device).unwrap_or_else(|e| panic!("release: {e}"));
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));

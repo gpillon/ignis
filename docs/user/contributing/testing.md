@@ -264,8 +264,9 @@ the 16 GB and 12 GB classes' trellis artifacts, each under the exception
 weights it has. From 0.11.0 it also loads DFlash2 at 15 and 10 draft tokens
 and vision at 15, under `IGNIS_ROUND_SHAPE=extended`, so every arm holds the
 extended round at 1 to 4 lanes and the base round past them; DFlash2 at 15
-under the shape rule (`nvfp4-dflash2-w15-rule`), every round's shape held to
-what its lanes asked and the same lanes taken from the base shape to the
+under the shape rule and the default shape policy `aggregate`
+(`nvfp4-dflash2-w15-rule`), every round's shape held to what its lanes asked
+and their recent rounds give, and the same lanes taken from the base shape to the
 extended one and back on live and teacher-forced rounds at 1 to 4 lanes; and a
 second test holds a 15-draft load's base rounds to a 7-draft load's tokens. Each arm is
 held to the graphs' replay with every switch unset; a change behind a switch
