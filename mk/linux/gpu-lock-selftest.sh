@@ -225,6 +225,13 @@ says "gpu.sh run, the guard refuses" "GPU guard: refused -- 9000 MiB already res
 [ ! -e "$tmp/state/cmd" ] || fail "gpu.sh run, the guard refuses: the command ran"
 capture lockctl status
 expect_code "gpu.sh run, after the guard refused" 0
+# make watch CUDA=1 GPU_CHECK=0: IGNIS_MK_GPU_GUARD=0 runs the command under the lock with no
+# guard, which here would refuse.
+capture env STUB_USED=9000 IGNIS_MK_GPU_GUARD=0 IGNIS_MK_GPU_CMD='touch "$STUB_DIR/cmd"' bash "$tree/mk/linux/gpu.sh" run 8192 0
+expect_code "gpu.sh run, no guard" 0
+[ -e "$tmp/state/cmd" ] || fail "gpu.sh run, no guard: the command did not run:
+$out"
+rm -f "$tmp/state/cmd"
 
 # --- server.py: start hands the lock to the server, stop and a failed start free it ---------
 

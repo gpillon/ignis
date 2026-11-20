@@ -41,7 +41,8 @@ def lock_path():
 
 
 def identity(pid):
-    """server.py's: the pid, its start time and the boot, or None for a process gone or a zombie."""
+    """The pid, its start time and the boot, or None for a process gone or a zombie: the
+    lock's record and server.py's pid record both name a process by it."""
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
         if fields[0] == "Z":
@@ -185,7 +186,9 @@ def main(argv=None):
             print(f"GPU lock: free ({path})")
             return 0
         print(f"GPU lock: held ({path}) by {describe(record)}")
-        return 0 if args.exempt is not None and record["pid"] == args.exempt else 1
+        # --except's own hold is no refusal: the record names that very process, its pid,
+        # start time and boot.
+        return 0 if args.exempt is not None and same(record, identity(args.exempt) or {}) else 1
     except Held as error:
         print(error, file=sys.stderr)
         return 1

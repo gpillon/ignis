@@ -88,15 +88,23 @@ $NotGpuLegs = @(
     "a_long_monologue_keeps_its_live_text_with_speakers_on"
 )
 
+# Stage 3's cargo flags, which -Test shares (each is explained at stage 3
+# below): the build's, which -Test's listing takes too so that nothing is
+# built twice, and the run's.
+$SweepBuild = @("--workspace", "--exclude", "ignis-speech", "--features", "cuda")
+$SweepRun = @("--test-threads=1", "--nocapture")
+
 # Per-stage wall time (GitHub #135): the profile's cost is the point of this
 # script, so it reports where the time went instead of leaving the reader to
 # add up per-test output.
 $Timings = [ordered]@{}
 
 # A GPU-gated step that failed: report it and leave with its own exit code
-# (not a flattened 1 -- the caller wants to know which code came back).
+# (not a flattened 1 -- the caller wants to know which code came back). The
+# error is not terminating: under "Stop" it would end the script, exit 1,
+# before the exit below.
 function FailWithCode([string]$What, [int]$Code) {
-    Write-Error "GPU profile: $What failed (exit $Code)."
+    Write-Error "GPU profile: $What failed (exit $Code)." -ErrorAction Continue
     exit $Code
 }
 
@@ -155,7 +163,7 @@ try {
     if ($Test.Count -gt 0) {
         # The sweep's build and flags, narrowed to the named tests: one
         # listing that each name resolves, then each test alone.
-        $listed = & cargo test --workspace --exclude ignis-speech --features cuda -- --list --ignored --exact @Test
+        $listed = & cargo test @SweepBuild -- --list --ignored --exact @Test
         if ($LASTEXITCODE -ne 0) { FailWithCode "listing the named tests" $LASTEXITCODE }
         foreach ($GpuTest in $Test) {
             if (@($listed) -notcontains "${GpuTest}: test") {
@@ -167,7 +175,7 @@ try {
         # is the stage's.
         foreach ($GpuTest in $Test) {
             Invoke-Stage "gpu test $GpuTest" {
-                & cargo test --workspace --exclude ignis-speech --features cuda --no-fail-fast -- --ignored --exact --test-threads=1 --nocapture $GpuTest
+                & cargo test @SweepBuild --no-fail-fast -- --ignored --exact @SweepRun $GpuTest
             }
         }
         Write-Host "GPU profile: done. If you stopped the engine that serves your agent, restart it now (runbook step 3, docs/agents/testing.md)."
@@ -230,7 +238,7 @@ try {
         $Skips = @("--skip", $CpuOracleTest)
         foreach ($Leg in $NotGpuLegs) { $Skips += @("--skip", $Leg) }
         Invoke-Stage "gpu tests (serialized)" {
-            & cargo test --workspace --exclude ignis-speech --features cuda --no-fail-fast -- --ignored --test-threads=1 --nocapture @Skips
+            & cargo test @SweepBuild --no-fail-fast -- --ignored @SweepRun @Skips
         }
     }
 

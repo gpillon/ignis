@@ -159,12 +159,15 @@ exited, or whose pid now names another process, holds nothing, so a run killed
 before it could clean up leaves no lock behind. Every way onto the card takes
 it: the profile script for its whole run, `make start`, `run` and `run-ui` for
 the server they start (handed to the server's pid; `make stop` or a failed
-start frees it), `make kernel-test` and `make gpu-run`. `make start` and
-`make gpu-guard` refuse at once while someone else holds it, naming the holder;
-the profile, `make kernel-test` and `make gpu-run` wait for it up to
-`GPU_LOCK_WAIT` seconds (900; the script's `-WaitSeconds` / `--wait-seconds`),
-then fail naming it. The profile waits before its preflight, so a waiting run
-never touches a marker another run owns. The marker stays:
+start frees it), `make watch CUDA=1` for its cargo-watch, `make kernel-test`
+and `make gpu-run`. `make start`, `make watch` and `make gpu-guard` refuse at
+once while someone else holds it, naming the holder; the profile,
+`make kernel-test` and `make gpu-run` wait for it up to `GPU_LOCK_WAIT` seconds
+(900; the script's `-WaitSeconds` / `--wait-seconds`), then fail naming it.
+The profile waits before its preflight, so a waiting run never touches a
+marker another run owns; on Windows a start runs its guard once it holds the
+lock, since the guard's preflight writes and clears that marker too.
+`GPU_CHECK=0` skips the guard, never the lock. The marker stays:
 `ignis_core::gpu_profile` reads it, and a worktree on an older commit knows
 only the marker and the process check. `make gpu-lock-selftest` tests the lock
 and the scripts around it on stand-ins.

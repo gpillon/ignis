@@ -26,7 +26,7 @@ Git for Windows' `usr\bin` on `PATH`). `make` alone lists every target.
 | `make grammar-venv` | From 0.11.0: the Python venv at `.scratch/grammar-venv` with the independent JSON Schema validator the structured-output tests check every served answer with. Without it those checks are skipped, saying so; CI installs it, and there a missing one fails them. |
 | `make gpu-status` / `gpu-guard` / `gpu-profile` | Who holds the card, the GPU lock's holder among it / refuse when it is held / the explicit GPU test profile, whole or (from 0.11.0) only the tests it is given. |
 | `make gpu-run CMD="…"` | From 0.11.0: one sh line under the GPU lock, for GPU work no other target runs (an example run in process, a server started by hand for a bench): waits for the lock up to `GPU_LOCK_WAIT` seconds, runs the guard, then the command as written (`$HOME` reaches sh, not make). |
-| `make watch CUDA=0` | Rebuild + restart on every Rust change (cargo-watch). |
+| `make watch CUDA=0` | Rebuild + restart on every Rust change (cargo-watch); from 0.11.0 `CUDA=1` runs it under the GPU lock. |
 | `make clean` / `distclean` | This profile's binary / everything. |
 
 Knobs go on the command line (`make dev CUDA=0 PROFILE=dev`,
@@ -81,8 +81,10 @@ holder (pid, worktree, command, since when), in `%ProgramData%\ignis\gpu-lock\`
 on Windows and `/tmp/ignis-gpu-lock/` on Linux (`IGNIS_GPU_LOCK_DIR` moves it).
 A CUDA `start`, `run` or `run-ui` takes it before the server starts and hands it
 to the server, which holds it until it exits; `stop` frees it, and so does a
-start that fails. A lock someone else holds refuses the start at once, naming
-the holder, and `GPU_CHECK=0` does not skip it; the guard refuses for it too.
+start that fails. `make watch CUDA=1` holds it for cargo-watch, which restarts
+the server, until it exits. A lock someone else holds refuses the start at
+once, naming the holder, and `GPU_CHECK=0` does not skip it; the guard refuses
+for it too. On Windows the guard of a start runs once the start holds the lock.
 `make kernel-test`, `make gpu-run` and the GPU profile wait for the lock
 instead, up to `GPU_LOCK_WAIT` seconds (900), then fail naming the holder.
 A holder that has exited, or whose pid now names another process, holds

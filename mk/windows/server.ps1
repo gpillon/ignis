@@ -13,9 +13,9 @@
 # console, holding the GPU lock until it exits.
 #
 # With IGNIS_MK_GPU_LOCK=1 (CUDA=1) start and run take the GPU lock before the
-# server starts, refused at once naming its holder, hand it to the server's
-# pid and free it if the start fails; stop frees the lock a stopped server
-# holds.
+# server starts, refused at once naming its holder, run the guard under it
+# with IGNIS_MK_GPU_GUARD=1, hand it to the server's pid and free it if the
+# start fails; stop frees the lock a stopped server holds.
 
 param(
     [Parameter(Mandatory = $true)]
@@ -29,23 +29,21 @@ switch ($Action) {
     'start' {
         Assert-NoServer
         $hold = Lock-GpuForServer 'make start'
-        try { $p = Start-IgnisServer } catch { Unlock-Gpu $hold; throw }
-        $served = Move-GpuLockToServer $hold $p
+        $p = $null
         $outcome = $null
         try {
+            $p = Start-IgnisServer
+            $hold = Move-GpuLockToServer $hold $p
             $outcome = Wait-IgnisReady $p
         } finally {
-            # No outcome: the wait was interrupted (Ctrl+C).
-            if (-not $outcome) {
+            # No outcome: the wait was interrupted (Ctrl+C), or the hand-over failed.
+            if (-not $outcome -and $p) {
                 Stop-Gently $p 0 'ignis-server'
                 Remove-Item $PidFile -ErrorAction SilentlyContinue
-                Write-Host "interrupted before ready: the server was stopped"
+                Write-Host "not ready (interrupted, or the GPU lock's hand-over failed): the server was stopped"
             }
             # Ready, or still loading after the timeout: the server keeps the lock.
-            if ($outcome -ne 'ready' -and $outcome -ne 'timeout') {
-                Unlock-Gpu $served
-                Unlock-Gpu $hold
-            }
+            if ($outcome -ne 'ready' -and $outcome -ne 'timeout') { Unlock-Gpu $hold }
         }
         switch ($outcome) {
             'ready' { exit 0 }
@@ -102,21 +100,9 @@ switch ($Action) {
 
     'run' {
         $hold = Lock-GpuForServer 'make run'
-        $startArgs = @{ FilePath = $Bin; NoNewWindow = $true; PassThru = $true }
+        $startArgs = @{ FilePath = $Bin }
         if ($ServerArgs) { $startArgs.ArgumentList = $ServerArgs }
-        try { $p = Start-Process @startArgs } catch { Unlock-Gpu $hold; throw }
-        $null = $p.Handle
-        $served = Move-GpuLockToServer $hold $p
-        $exited = $false
-        try {
-            while (-not $p.HasExited) { Start-Sleep -Milliseconds 250 }
-            $exited = $true
-        } finally {
-            # Ctrl+C reached the server too: give its graceful shutdown the time.
-            if (-not $exited) { Stop-Gently $p 20 'ignis-server' }
-            Unlock-Gpu $served
-            Unlock-Gpu $hold
-        }
-        exit $p.ExitCode
+        # A Ctrl+C reaches the server too: its graceful shutdown gets the time.
+        exit (Invoke-Foreground $startArgs 'ignis-server' $hold -HandOver)
     }
 }

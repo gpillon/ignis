@@ -11,6 +11,9 @@
 #   GPU_RUN                run $IGNIS_MK_GPU_CMD (a sh line) under the GPU lock,
 #                          waiting up to $(GPU_LOCK_WAIT) seconds for it
 #   GPU_LOCK_SELFTEST      the GPU lock's selftests, on stand-ins
+#   SERVER_GUARD           the prerequisite a CUDA start, run and run-ui runs
+#                          first (gpu-guard), or none where the hooks below run
+#                          the guard themselves once they hold the GPU lock
 #   SERVER_START           start $(SERVER_BIN) in the background, wait for ready
 #                          (CUDA=1: holding the GPU lock)
 #   SERVER_RUN             CUDA=1 `make run`: $(SERVER_BIN) in the foreground,
@@ -56,11 +59,17 @@ GPU_PROFILE = $(PS) -File scripts/gpu-profile.ps1 -WaitSeconds $(GPU_LOCK_WAIT) 
 GPU_RUN = $(PS) -File mk/windows/gpu.ps1 -Action run -ThresholdMiB $(GPU_THRESHOLD_MIB) -WaitSeconds $(GPU_LOCK_WAIT)
 GPU_LOCK_SELFTEST = $(PS) -File mk/windows/gpu-lock-selftest.ps1
 
+# None from make: server.ps1 and devui.ps1 run the guard once they hold the GPU
+# lock (IGNIS_MK_GPU_GUARD). The guard's preflight writes and clears the marker
+# a GPU profile reads, so run before the lock it could clear the marker of a
+# profile that took the lock in between; the profile takes it before its own.
+SERVER_GUARD :=
 # server.ps1 reads its inputs from the environment: the flag string passes
 # through sh and PowerShell untouched that way.
 SERVER_CTL_ENV = IGNIS_MK_BIN='$(SERVER_BIN)' IGNIS_MK_ARGS='$(strip $(SERVER_FLAGS))' \
   IGNIS_MK_PID='$(SERVER_PID)' IGNIS_MK_LOG='$(SERVER_LOG)' IGNIS_MK_URL='$(SERVER_URL)' \
-  IGNIS_MK_READY_TIMEOUT='$(READY_TIMEOUT)' IGNIS_MK_FORCE='$(FORCE)' IGNIS_MK_GPU_LOCK='$(CUDA)'
+  IGNIS_MK_READY_TIMEOUT='$(READY_TIMEOUT)' IGNIS_MK_FORCE='$(FORCE)' IGNIS_MK_GPU_LOCK='$(GPU_LOCKED)' \
+  IGNIS_MK_GPU_GUARD='$(GPU_GUARDED)' IGNIS_MK_GPU_THRESHOLD_MIB='$(GPU_THRESHOLD_MIB)'
 SERVER_START = $(SERVER_CTL_ENV) $(PS) -File mk/windows/server.ps1 -Action start
 SERVER_RUN = $(SERVER_ENV) $(SERVER_CTL_ENV) $(PS) -File mk/windows/server.ps1 -Action run
 SERVER_STOP = $(SERVER_CTL_ENV) $(PS) -File mk/windows/server.ps1 -Action stop

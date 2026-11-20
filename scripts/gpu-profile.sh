@@ -99,6 +99,12 @@ not_gpu_legs=(
     a_long_monologue_keeps_its_live_text_with_speakers_on
 )
 
+# Stage 3's cargo flags, which --test shares (each is explained at stage 3
+# below): the build's, which --test's listing takes too so that nothing is
+# built twice, and the run's.
+sweep_build=(--workspace --exclude ignis-speech --features cuda --target "$target")
+sweep_run=(--test-threads=1 --nocapture)
+
 stage_names=()
 stage_secs=()
 
@@ -176,7 +182,7 @@ echo "GPU profile: preflight passed -- running the profile."
 if [ "${#tests[@]}" -gt 0 ]; then
     # The sweep's build and flags, narrowed to the named tests: one listing
     # that each name resolves, then each test alone.
-    listed="$("$cargo" test --workspace --exclude ignis-speech --features cuda --target "$target" -- --list --ignored --exact "${tests[@]}")"
+    listed="$("$cargo" test "${sweep_build[@]}" -- --list --ignored --exact "${tests[@]}")"
     code=$?
     if [ "$code" -ne 0 ]; then fail_with_code "listing the named tests" "$code"; fi
     for name in "${tests[@]}"; do
@@ -187,7 +193,7 @@ if [ "${#tests[@]}" -gt 0 ]; then
     done
     for name in "${tests[@]}"; do
         invoke_stage "gpu test $name" \
-            "$cargo" test --workspace --exclude ignis-speech --features cuda --target "$target" --no-fail-fast -- --ignored --exact --test-threads=1 --nocapture "$name"
+            "$cargo" test "${sweep_build[@]}" --no-fail-fast -- --ignored --exact "${sweep_run[@]}" "$name"
     done
     echo "GPU profile: done. If you stopped the engine that serves your agent, restart it now (runbook step 3, docs/agents/testing.md)."
     exit 0
@@ -225,7 +231,7 @@ if [ "$skip_cargo" = 0 ]; then
     skips=(--skip "$cpu_oracle_test")
     for leg in "${not_gpu_legs[@]}"; do skips+=(--skip "$leg"); done
     invoke_stage "gpu tests (serialized)" \
-        "$cargo" test --workspace --exclude ignis-speech --features cuda --target "$target" --no-fail-fast -- --ignored --test-threads=1 --nocapture "${skips[@]}"
+        "$cargo" test "${sweep_build[@]}" --no-fail-fast -- --ignored "${sweep_run[@]}" "${skips[@]}"
 fi
 
 echo "GPU profile: done. If you stopped the engine that serves your agent, restart it now (runbook step 3, docs/agents/testing.md)."

@@ -6,11 +6,15 @@
 # as it does, a cargo.cmd and a kernel/build.ps1 that record their arguments, and an
 # nvidia-smi.cmd first on PATH. It checks that the lock names its holder, that a refusal is at
 # once and a wait ends at its limit, both naming the holder, that a dead holder or a reused pid
-# is free, that two takers of one stale record never both win, that a start hands the lock to
-# the server and a stop or a failed start frees it, and the profile's stages and named tests
-# under it. TEMP, TMP and IGNIS_GPU_LOCK_DIR point under a temporary directory it removes, so
-# the profile's marker and the machine's lock are never read or written; no stand-in carries
-# a name the guards look for (ninfer*, ignis-server, ignis-bench, *_gpu-*).
+# is free, that two takers of one stale record never both win, that the holder is read under
+# the lock's mutex, that the guard exempts its caller's very process, that a start hands the
+# lock to the server and a stop, a failed start or a failed hand-over frees it, that a start's
+# guard runs under its hold, that a run can refuse at once and skip the guard (make watch), and
+# the profile's stages and named tests under it, a failing one's exit code its own. TEMP, TMP
+# and IGNIS_GPU_LOCK_DIR point under a temporary directory it removes, so the profile's marker
+# and the machine's lock are never read or written; no stand-in carries a name the guards look
+# for (ninfer*, ignis-server, ignis-bench, *_gpu-*). A hand-over that fails is the copy's
+# gpulock.ps1 with Move-GpuLock throwing under STUB_MOVE_FAILS.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File mk/windows/gpu-lock-selftest.ps1
 
@@ -33,6 +37,8 @@ foreach ($d in @("$tree\scripts", "$tree\mk\windows", "$tree\kernel", "$tree\web
 }
 Copy-Item "$Repo\scripts\gpu-profile.ps1", "$Repo\scripts\gpu-preflight.ps1" "$tree\scripts\"
 Copy-Item "$Repo\mk\windows\gpu.ps1", "$Repo\mk\windows\gpulock.ps1", "$Repo\mk\windows\common.ps1", "$Repo\mk\windows\server.ps1", "$Repo\mk\windows\devui.ps1" "$tree\mk\windows\"
+# A hand-over that fails, in the copy alone: with STUB_MOVE_FAILS set, Move-GpuLock throws.
+Add-Content -Path "$tree\mk\windows\gpulock.ps1" -Encoding ascii -Value "`nif (`$env:STUB_MOVE_FAILS) { function Move-GpuLock { throw 'stand-in: the hand-over failed' } }"
 Set-Content -Path "$tree\web\node_modules\vite\bin\vite.js" -Value '' -Encoding ascii
 
 $env:TEMP = "$tmp\tmp"
@@ -40,7 +46,9 @@ $env:TMP = "$tmp\tmp"
 $env:IGNIS_GPU_LOCK_DIR = "$tmp\lock"
 $env:STUB_DIR = $state
 $env:PATH = "$bin;$env:PATH"
-foreach ($name in @('IGNIS_GPU_CARD', 'IGNIS_MK_FORCE', 'IGNIS_GPU_PROFILE', 'IGNIS_MK_GPU_LOCK')) { Remove-Item "Env:\$name" -ErrorAction SilentlyContinue }
+foreach ($name in @('IGNIS_GPU_CARD', 'IGNIS_MK_FORCE', 'IGNIS_GPU_PROFILE', 'IGNIS_MK_GPU_LOCK', 'IGNIS_MK_GPU_GUARD', 'IGNIS_MK_GPU_THRESHOLD_MIB', 'STUB_MOVE_FAILS')) {
+    Remove-Item "Env:\$name" -ErrorAction SilentlyContinue
+}
 $Lock = "$tmp\lock\gpu-0.lock"
 $Marker = "$tmp\tmp\ignis-gpu-preflight.ok"
 . "$tree\mk\windows\gpulock.ps1"
@@ -49,11 +57,13 @@ if (-not (Get-GpuLockPath).StartsWith($tmp) -or -not [IO.Path]::GetTempPath().St
     exit 1
 }
 
-# The stand-ins.
+# The stand-ins. nvidia-smi copies the lock's record as it stands when asked for the memory in
+# use, the preflight's query.
 Set-Content -Path "$bin\nvidia-smi.cmd" -Encoding ascii -Value @'
 @echo off
 echo %* | findstr /c:"memory.used" >nul
 if not errorlevel 1 (
+  if exist "%IGNIS_GPU_LOCK_DIR%\gpu-0.lock" copy /y "%IGNIS_GPU_LOCK_DIR%\gpu-0.lock" "%STUB_DIR%\lock-at-preflight.json" >nul
   if defined STUB_USED (echo %STUB_USED%) else (echo 100)
   exit /b 0
 )
@@ -181,6 +191,9 @@ $othersOnCard = @(Get-Process | Where-Object {
     $_.ProcessName -like 'ninfer*' -or $_.ProcessName -eq 'ignis-server' -or $_.ProcessName -eq 'ignis-bench' -or $_.ProcessName -like '*_gpu-*'
 }).Count -gt 0
 if ($othersOnCard) { Write-Host "  (GPU processes run on this machine: the cases where the guard passes are skipped)" }
+# The profile runs the preflight alone, which looks for ninfer* only among them.
+$ninferRuns = @(Get-Process -Name 'ninfer*' -ErrorAction SilentlyContinue).Count -gt 0
+if ($ninferRuns) { Write-Host "  (a ninfer process runs on this machine: the cases where the profile's preflight passes are skipped)" }
 
 try {
     # --- the lock ---------------------------------------------------------------------------
@@ -226,11 +239,14 @@ try {
     [IO.File]::WriteAllText($Lock, (@{ pid = $first.Id; name = 'powershell'; started = '1' } | ConvertTo-Json -Compress))
     Assert-That ($null -eq (Get-GpuLockHolder)) "a pid that names a process started later is held"
 
-    # Five takers of one stale record at once: exactly one holds it.
+    # Five takers of one stale record at once: exactly one holds it. The winner holds it until
+    # every taker has written its result (up to 60 s), so none can take it after a release.
     [IO.File]::WriteAllText($Lock, (@{ pid = 999999; name = 'gone'; started = '1' } | ConvertTo-Json -Compress))
     $racers = @(1..5 | ForEach-Object {
         Start-Process -FilePath $PowerShell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-Command',
-            ". '$tree\mk\windows\gpulock.ps1'; try { `$null = Lock-Gpu -Command race; Set-Content ('$state\race.' + `$PID) 'won'; Start-Sleep 12 } catch { Set-Content ('$state\race.' + `$PID) 'lost' }"
+            (". '$tree\mk\windows\gpulock.ps1'; try { `$null = Lock-Gpu -Command race; Set-Content ('$state\race.' + `$PID) 'won'; " +
+             "`$until = (Get-Date).AddSeconds(60); while (@(Get-ChildItem '$state\race.*').Count -lt 5 -and (Get-Date) -lt `$until) { Start-Sleep -Milliseconds 100 } } " +
+             "catch { Set-Content ('$state\race.' + `$PID) 'lost' }")
     })
     $racers | ForEach-Object { $null = $_.Handle; $_.WaitForExit() }
     $won = @(Get-ChildItem "$state\race.*" | Where-Object { (Get-Content $_.FullName -Raw).Trim() -eq 'won' }).Count
@@ -257,7 +273,27 @@ try {
     Invoke-Script "$tree\mk\windows\gpu.ps1" @('-Action', 'guard', '-Holder', $first.Id)
     Assert-That (-not $out.Contains('GPU lock: held')) "the guard, the lock held by its caller: refused for it:`n$out"
     if (-not $othersOnCard) { Assert-Code "the guard, the lock held by its caller" 0 }
+
+    # The holder is read under the mutex every change takes: while another holds it, status waits.
+    $mutex = [IO.File]::Open("$Lock.mutex", 'OpenOrCreate', 'ReadWrite', 'None')
+    $reader = Start-Process -FilePath $PowerShell -NoNewWindow -PassThru -RedirectStandardOutput "$tmp\status.out" `
+        -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tree\mk\windows\gpu.ps1`"", '-Action', 'status'
+    $null = $reader.Handle
+    Start-Sleep -Seconds 3
+    $released = Get-Date
+    $mutex.Dispose()
+    $reader.WaitForExit()
+    Assert-That ($reader.ExitTime -ge $released) "gpu.ps1 status read the lock while its mutex was held (it exited at $($reader.ExitTime.ToString('HH:mm:ss.fff')), the mutex was freed at $($released.ToString('HH:mm:ss.fff')))"
+    Assert-That (([string](Get-Content "$tmp\status.out" -Raw)).Contains("GPU lock: held ($Lock) by pid $($first.Id)")) "gpu.ps1 status, after the mutex: $(Get-Content "$tmp\status.out" -Raw)"
     Unlock-Gpu $hold
+
+    # -Holder exempts the very process the record names, not its pid alone: a record of the
+    # caller's pid whose start time was not read stays held (the fail-closed rule) and refused.
+    [IO.File]::WriteAllText($Lock, (@{ pid = $first.Id; name = 'powershell'; started = ''; worktree = $tree; since = 'then'; command = 'no start time' } | ConvertTo-Json -Compress))
+    Invoke-Script "$tree\mk\windows\gpu.ps1" @('-Action', 'guard', '-Holder', $first.Id)
+    Assert-Code "the guard, the caller's pid with no start time" 1
+    Assert-Says "the guard, the caller's pid with no start time" "GPU guard: refused -- GPU lock: held ($Lock) by pid $($first.Id)"
+    Remove-Item $Lock
     Invoke-Script "$tree\mk\windows\gpu.ps1" @('-Action', 'status')
     Assert-Says "gpu.ps1 status, free" "GPU lock: free ($Lock)"
     Invoke-Script "$tree\mk\windows\gpu.ps1" @('-Action', 'guard') @{ STUB_USED = '9000' }
@@ -284,6 +320,21 @@ try {
     Assert-Code "gpu.ps1 run, the guard refuses" 1
     Assert-That (-not (Test-Path "$state\cmd.lock")) "gpu.ps1 run, the guard refuses: the command ran"
     Assert-That (-not (Test-Path $Lock)) "gpu.ps1 run, the guard refuses: the lock was left behind"
+
+    # make watch CUDA=1's run: -WaitSeconds 0 refuses at once, naming the holder, and with
+    # IGNIS_MK_GPU_GUARD=0 (GPU_CHECK=0) the command holds the lock with no guard, which here
+    # would refuse.
+    $hold = Lock-Gpu -Command 'gpu-profile' -ProcessId $first.Id
+    Invoke-Script "$tree\mk\windows\gpu.ps1" @('-Action', 'run', '-WaitSeconds', '0') @{ IGNIS_MK_GPU_CMD = $cmd }
+    Assert-Code "gpu.ps1 run, no wait" 1
+    Assert-Says "gpu.ps1 run, no wait" "the card is held ($Lock) by pid $($first.Id)"
+    Assert-That (-not $out.Contains('GPU lock: waiting')) "gpu.ps1 run, no wait: it waited:`n$out"
+    Assert-That (-not (Test-Path "$state\cmd.lock")) "gpu.ps1 run, no wait: the command ran"
+    Unlock-Gpu $hold
+    Invoke-Script "$tree\mk\windows\gpu.ps1" @('-Action', 'run', '-WaitSeconds', '0') @{ IGNIS_MK_GPU_CMD = $cmd; IGNIS_MK_GPU_GUARD = '0'; STUB_USED = '9000' }
+    Assert-Code "gpu.ps1 run, no guard" 7
+    Assert-That ((Get-Field "$state\cmd.lock" pid) -eq [string]$childPid) "gpu.ps1 run, no guard: the command ran without the lock under the run's pid ($childPid): $(Get-Content "$state\cmd.lock" -Raw -ErrorAction SilentlyContinue)"
+    Assert-That (-not (Test-Path $Lock)) "gpu.ps1 run, no guard: the lock outlived the run"
 
     # --- server.ps1 and devui.ps1: the server holds the lock, a stop or a failed start frees it
     Write-Host "gpu-lock-selftest: server.ps1, devui.ps1"
@@ -328,6 +379,40 @@ try {
     Assert-That ((Get-Field "$state\lock-seen.json" command) -like 'make run: *') "run: the hold does not say make run"
     Assert-That (-not (Test-Path $Lock)) "run: the lock outlived the server"
 
+    # A hand-over that fails (STUB_MOVE_FAILS): the server started is stopped and the lock freed,
+    # no server left running with no lock naming it.
+    function Get-StubServers { @(Get-Process -Name 'stub-server' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$tmp*" }) }
+    function Assert-HandOverFailed([string]$What) {
+        Assert-Code $What 1
+        Assert-That ((Get-StubServers).Count -eq 0) "$What`: the server still runs:`n$out"
+        Assert-That (-not (Test-Path $Lock)) "$What`: the lock is still there: $(Get-Content $Lock -Raw -ErrorAction SilentlyContinue)"
+        Get-StubServers | Stop-Process -Force
+        Remove-Item $Lock -ErrorAction SilentlyContinue
+    }
+    Reset-State
+    Invoke-Script "$tree\mk\windows\server.ps1" @('-Action', 'start') (Add-Setting $server STUB_MOVE_FAILS '1')
+    Assert-HandOverFailed "start, the hand-over fails"
+    Invoke-Script "$tree\mk\windows\server.ps1" @('-Action', 'run') (Add-Setting (Add-Setting $server STUB_SERVER 'run') STUB_MOVE_FAILS '1')
+    Assert-HandOverFailed "run, the hand-over fails"
+
+    # With IGNIS_MK_GPU_GUARD=1 (GPU_CHECK=1) the guard runs once the start holds the lock: its
+    # preflight, which writes and clears the marker a profile reads, sees the start's hold.
+    $guarded = Add-Setting $server IGNIS_MK_GPU_GUARD '1'
+    if (-not $othersOnCard) {
+        Reset-State
+        Invoke-Script "$tree\mk\windows\server.ps1" @('-Action', 'start') $guarded
+        Assert-Code "start with the guard" 0
+        Assert-That ((Get-Field "$state\lock-at-preflight.json" pid) -eq [string]$childPid -and (Get-Field "$state\lock-at-preflight.json" command) -like 'make start: *') "start with the guard: the preflight ran without the start's hold (pid $childPid): $(Get-Content "$state\lock-at-preflight.json" -Raw -ErrorAction SilentlyContinue)"
+        Assert-That (-not (Test-Path $Marker)) "start with the guard: the guard left a preflight pass behind"
+        Invoke-Script "$tree\mk\windows\server.ps1" @('-Action', 'stop') $server
+    }
+    Reset-State
+    Invoke-Script "$tree\mk\windows\server.ps1" @('-Action', 'start') (Add-Setting $guarded STUB_USED '9000')
+    Assert-Code "start, the guard refuses" 1
+    Assert-That (-not (Test-Path "$state\server.pid")) "start, the guard refuses: the server was started"
+    Assert-That (-not (Test-Path $Lock)) "start, the guard refuses: the lock was left behind"
+    Invoke-Script "$tree\mk\windows\server.ps1" @('-Action', 'stop') $server
+
     if (Get-Command node -ErrorAction SilentlyContinue) {
         # Vite's stand-in is node on an empty vite.js: it exits at once, which ends the session.
         Reset-State
@@ -335,6 +420,9 @@ try {
         $spid = (Get-Content "$state\server.pid" -Raw -ErrorAction SilentlyContinue)
         Assert-That ($spid -and (Get-Field "$state\lock-seen.json" pid) -eq $spid.Trim()) "run-ui: the server saw the lock name pid $(Get-Field "$state\lock-seen.json" pid), not its own ($spid):`n$out"
         Assert-That (-not (Test-Path $Lock)) "run-ui: the lock outlived the session"
+        Reset-State
+        Invoke-Script "$tree\mk\windows\devui.ps1" @() (Add-Setting $server STUB_MOVE_FAILS '1')
+        Assert-HandOverFailed "run-ui, the hand-over fails"
     } else {
         Write-Host "  (no node on PATH: the run-ui session case is skipped)"
     }
@@ -356,7 +444,7 @@ try {
     }
     $on = '| profile=1 marker=yes lock=yes'
     $listing = "cargo test -p ignis-artifact --features cuda --test layer_reference_real -- --list $on"
-    if (-not $othersOnCard) {
+    if (-not $ninferRuns) {
         Invoke-Profile @()
         Assert-Code "profile, a pass" 0
         Assert-That ($calls.Count -eq 4 -and $calls[0] -eq "kernel -Test $on" -and $calls[1] -eq $listing -and
@@ -381,7 +469,7 @@ try {
         Assert-Says "profile, a name that is no #[ignore]d test" "no #[ignore]d test is named 'b_gpu_test'"
 
         Invoke-Profile @('-Test', 'a_gpu_test,b_gpu_test') @{ STUB_LISTED = 'a_gpu_test,b_gpu_test'; STUB_FAIL_TEST = 'a_gpu_test' }
-        Assert-That ($code -ne 0 -and $calls.Count -eq 2) "profile, the first named test fails: exit $code, calls:`n$($calls -join "`n")"
+        Assert-That ($code -eq 5 -and $calls.Count -eq 2) "profile, the first named test fails: exit $code, not the test's 5, calls:`n$($calls -join "`n")"
         Assert-That (-not (Test-Path $Lock) -and -not (Test-Path $Marker)) "profile, a failed test: the lock or the marker outlived the run"
     }
 

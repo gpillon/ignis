@@ -8,8 +8,9 @@
 # command and the time the hold began. A record whose pid is gone, or now names
 # another process (another name or start time), is free, so a holder killed
 # before its finally block leaves nothing standing. Every change of the record
-# (take, hand over, release) is made while a file beside it is held open
-# exclusively, so two that find one stale record cannot both take it.
+# (take, hand over, release), and every read, is made while a file beside it
+# is held open exclusively, so two that find one stale record cannot both take
+# it.
 #
 # It is added beside the preflight marker and the process check of
 # mk/windows/gpu.ps1, not in place of them: ignis_core::gpu_profile reads the
@@ -47,7 +48,10 @@ function Test-GpuLockSame($Record, $Holder) {
 }
 
 # Whether the record's holder still runs: the same pid, name and start time
-# (an unreadable start time counts as the same: free only when proven).
+# (an unreadable start time counts as the same: free only when proven). That
+# is the lock's safe side: a lock wrongly held refuses a run naming its holder,
+# for a human to resolve, while one wrongly free lets two runs onto the card
+# and the loser dies with no diagnostic.
 function Test-GpuLockLive($Record) {
     if (-not $Record) { return $false }
     $now = Get-GpuLockIdentity ([int]$Record.pid)
@@ -65,7 +69,7 @@ function Format-GpuLockHolder($Record) {
 }
 
 # Run $Body with the file beside the lock open exclusively: the critical
-# section of a change. The OS closes it if this process dies.
+# section of a change or a read. The OS closes it if this process dies.
 function Invoke-GpuLockChange([string]$Path, [scriptblock]$Body) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
     $mutex = $null
@@ -147,8 +151,14 @@ function Unlock-Gpu($Holder) {
     }
 }
 
+# Read under the mutex, as every change is made: on PowerShell 5.1 a read
+# beside the writer's File.Replace can fail, the card then read as free, or
+# make the replace throw. No lock directory: no lock was ever taken.
 function Get-GpuLockHolder {
-    $record = Read-GpuLock (Get-GpuLockPath)
-    if (Test-GpuLockLive $record) { return $record }
+    $path = Get-GpuLockPath
+    if (-not (Test-Path -LiteralPath (Split-Path -Parent $path))) { return $null }
+    $state = @{}
+    Invoke-GpuLockChange $path { $state.record = Read-GpuLock $path }
+    if (Test-GpuLockLive $state.record) { return $state.record }
     return $null
 }

@@ -15,10 +15,11 @@
 #                    is removed afterwards: starting a server must not leave
 #                    an authorization for the GPU profile behind.
 #   -Action run      the sh line in $env:IGNIS_MK_GPU_CMD under the GPU lock
-#                    (make gpu-run, make kernel-test): waits up to
-#                    -WaitSeconds for the lock, runs the guard, then the
-#                    command in a kill-on-close job, and frees the lock when
-#                    it exits; the run's exit code is the command's.
+#                    (make gpu-run, make kernel-test, make watch CUDA=1):
+#                    waits up to -WaitSeconds for the lock, runs the guard
+#                    (not with IGNIS_MK_GPU_GUARD=0), then the command in a
+#                    kill-on-close job, and frees the lock when it exits; the
+#                    run's exit code is the command's.
 #
 # The lock is added beside the marker and the process check, not in place of
 # them: ignis_core::gpu_profile reads the marker, and a worktree on an older
@@ -90,7 +91,9 @@ switch ($Action) {
 
     'guard' {
         $held = Get-GpuLockHolder
-        if ($held -and [int]$held.pid -ne $Holder) {
+        # -Holder's own hold is no refusal: the record names that very process,
+        # its pid, name and start time.
+        if ($held -and -not ($Holder -and (Test-GpuLockSame $held (Get-GpuLockIdentity $Holder)))) {
             Write-Host "GPU guard: refused -- $(Show-GpuLock)"
             Write-Host "  wait or ask (docs/agents/testing.md, who holds the card); the lock is free once its holder exits"
             exit 1
@@ -135,31 +138,22 @@ switch ($Action) {
             Write-Host 'gpu.ps1 run: no command (make gpu-run CMD="...")'
             exit 2
         }
+        . (Join-Path $PSScriptRoot 'common.ps1')
+        $job = New-KillOnCloseJob
+        # sh reads the line from the environment, so it crosses no quoting.
+        $sh = (Get-Command sh -ErrorAction Stop).Source
         try {
             $hold = Lock-Gpu -Command "gpu-run: $command" -WaitSeconds $WaitSeconds
         } catch {
             Write-Host $_.Exception.Message
             exit 1
         }
-        $p = $null
-        $code = 1
-        try {
-            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Action guard -ThresholdMiB $ThresholdMiB -Holder $PID
-            if ($LASTEXITCODE -ne 0) { exit 1 }
-            . (Join-Path $PSScriptRoot 'common.ps1')
-            $job = New-KillOnCloseJob
-            # sh reads the line from the environment, so it crosses no quoting.
-            $sh = (Get-Command sh -ErrorAction Stop).Source
-            $p = Start-Process -FilePath $sh -ArgumentList '-c', '"eval \"$IGNIS_MK_GPU_CMD\""' -NoNewWindow -PassThru
-            $null = $p.Handle
-            Add-ProcessToJob $job $p
-            while (-not $p.HasExited) { Start-Sleep -Milliseconds 200 }
-            $code = $p.ExitCode
-        } finally {
-            # Ctrl+C: the command got it too; give it the time to stop.
-            if ($p -and -not $p.HasExited) { Stop-Gently $p 20 'the command' }
+        # IGNIS_MK_GPU_GUARD=0 (make watch with GPU_CHECK=0): the lock alone.
+        if ($env:IGNIS_MK_GPU_GUARD -ne '0' -and -not (Test-GpuGuard $ThresholdMiB)) {
             Unlock-Gpu $hold
+            exit 1
         }
-        exit $code
+        # Ctrl+C: the command got it too, and gets the time to stop.
+        exit (Invoke-Foreground @{ FilePath = $sh; ArgumentList = '-c', '"eval \"$IGNIS_MK_GPU_CMD\""' } 'the command' $hold $job)
     }
 }

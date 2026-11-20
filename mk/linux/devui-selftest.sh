@@ -157,6 +157,7 @@ SERVER_PID := $(SELFTEST)/run/ignis-server.pid
 SERVER_LOG := $(SELFTEST)/run/ignis-server.log
 READY_TIMEOUT ?= 10
 SERVER_ENV = IGNIS_LOG_LEVEL=debug
+GPU_LOCKED = $(filter 1,$(CUDA))
 include mk/os/linux.mk
 .RECIPEPREFIX := >
 .PHONY: run-ui dev-ui

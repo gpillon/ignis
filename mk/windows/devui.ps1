@@ -12,8 +12,9 @@
 #     terminal window), Windows kills them anyway;
 #   - if either child exits on its own, the other is stopped too;
 #   - with IGNIS_MK_GPU_LOCK=1 (CUDA=1) the GPU lock is taken before the
-#     server starts, refused at once naming its holder, handed to the server
-#     and freed when the session ends.
+#     server starts, refused at once naming its holder, the guard run under
+#     it with IGNIS_MK_GPU_GUARD=1, handed to the server and freed when the
+#     session ends.
 #
 # Vite runs as `node vite.js`, not through npm.cmd: a batch file answers
 # Ctrl+C with "Terminate batch job (Y/N)?" and would hold the session open.
@@ -34,7 +35,6 @@ if (-not $Node) {
 
 Assert-NoServer
 $hold = Lock-GpuForServer 'make run-ui'
-$served = $null
 $job = New-KillOnCloseJob
 $server = $null
 $vite = $null
@@ -45,17 +45,21 @@ $code = 0
 
 try {
     $server = Start-IgnisServer -SameConsole
-    $served = Move-GpuLockToServer $hold $server
     Add-ProcessToJob $job $server
+    $hold = Move-GpuLockToServer $hold $server
     if ((Wait-IgnisReady $server) -ne 'ready') {
         $settled = $true
         $code = 1
     }
-}  finally {
+} catch {
+    # A failure (the hand-over among them), which the server did not see:
+    # a Ctrl+C runs no catch block.
+    $settled = $true
+    throw
+} finally {
     if ($settled -or -not $server) {
         Stop-Gently $server 0 'ignis-server'
         Remove-Item $PidFile -ErrorAction SilentlyContinue
-        Unlock-Gpu $served
         Unlock-Gpu $hold
     }
 }
@@ -95,7 +99,6 @@ try {
     Stop-Gently $vite ([Math]::Min($grace, 5)) 'vite'
     Stop-Gently $server $grace 'ignis-server'
     Remove-Item $PidFile -ErrorAction SilentlyContinue
-    Unlock-Gpu $served
     Unlock-Gpu $hold
 }
 exit $code

@@ -40,8 +40,11 @@ GPU_LOCK_SELFTEST = bash mk/linux/gpu-lock-selftest.sh && bash mk/linux/gpu-prof
 GPU_PROFILE = TARGET_TRIPLE='$(TARGET_TRIPLE)' bash scripts/gpu-profile.sh --wait-seconds $(GPU_LOCK_WAIT) $(GPU_PROFILE_ARGS)
 
 SERVER_CTL_ARGS = --pid '$(SERVER_PID)' --log '$(SERVER_LOG)' --url '$(SERVER_URL)' --timeout '$(READY_TIMEOUT)'
+# The guard runs first, from make: on Linux it never touches the marker a GPU
+# profile reads, so a lock taken after it races nothing.
+SERVER_GUARD = $(if $(GPU_GUARDED),gpu-guard)
 # A CUDA server takes the GPU lock before it starts and holds it until it stops.
-SERVER_GPU_LOCK = $(if $(filter 1,$(CUDA)),--gpu-lock)
+SERVER_GPU_LOCK = $(if $(GPU_LOCKED),--gpu-lock)
 SERVER_START = $(PYTHON) mk/linux/server.py start $(SERVER_CTL_ARGS) $(SERVER_GPU_LOCK) -- '$(SERVER_BIN)' $(SERVER_FLAGS)
 SERVER_STOP = $(PYTHON) mk/linux/server.py stop $(SERVER_CTL_ARGS) $(if $(filter 1,$(FORCE)),--force)
 SERVER_STATUS = $(PYTHON) mk/linux/server.py status $(SERVER_CTL_ARGS)

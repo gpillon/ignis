@@ -2,7 +2,8 @@
 # Vendored from the RTX 5080 fork, github.com/xzzqqq/ignis-5080 at 9259978846 (GitHub #493);
 # patched: the readiness loop retries on any OSError (a reset or a slow answer mid-load), not only URLError;
 # start --gpu-lock takes the GPU lock (mk/linux/gpulock.py, GitHub #707), hands it to the server and frees it
-# if the start fails, and stop frees the lock a stopped server holds.
+# if the start fails, and stop frees the lock a stopped server holds; identity() is gpulock.py's, which names
+# a process the same way for the lock.
 """Linux daemon hooks for make; only the recorded process is stopped by default."""
 import argparse
 from contextlib import contextmanager
@@ -24,17 +25,7 @@ import uuid
 # The GPU lock's helpers, imported without leaving a __pycache__ in the tree.
 sys.dont_write_bytecode = True
 import gpulock  # noqa: E402
-
-
-def identity(pid):
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-        if fields[0] == "Z":
-            return None
-        return {"pid": pid, "start_time": fields[19],
-                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
-    except (FileNotFoundError, ProcessLookupError):
-        return None
+from gpulock import identity  # noqa: E402
 
 
 def read_record(path):

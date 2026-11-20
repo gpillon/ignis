@@ -13,8 +13,9 @@
 #            the machine (any worktree counts), a standing profile marker, or
 #            more than IGNIS_GPU_THRESHOLD_MIB already resident.
 #   run      the command in IGNIS_MK_GPU_CMD under the GPU lock (make gpu-run,
-#            make kernel-test): waits up to the third argument's seconds for
-#            the lock, runs the guard, then becomes the command (exec), which
+#            make kernel-test, make watch CUDA=1): waits up to the third
+#            argument's seconds for the lock, runs the guard (not with
+#            IGNIS_MK_GPU_GUARD=0), then becomes the command (exec), which
 #            holds the lock under this pid until it exits.
 #
 # The lock is added beside the marker and the process check, not in place of
@@ -137,7 +138,8 @@ run)
         exit 2
     fi
     lockctl acquire --pid $$ --wait "${3:-900}" --command "gpu-run: $IGNIS_MK_GPU_CMD" || exit 1
-    if ! bash "$here/gpu.sh" guard "$threshold" $$; then
+    # IGNIS_MK_GPU_GUARD=0 (make watch with GPU_CHECK=0): the lock alone.
+    if [ "${IGNIS_MK_GPU_GUARD:-1}" != 0 ] && ! bash "$here/gpu.sh" guard "$threshold" $$; then
         lockctl release --pid $$
         exit 1
     fi
