@@ -76,6 +76,32 @@
 //! the lane at its positions plus that delta, the input a round stages for a
 //! lane with an image.
 //!
+//! # Round shapes (#687)
+//!
+//! A DFlash2 load whose window is past [`BASE_WINDOW`] holds two round
+//! shapes: the base shape, [`BASE_WINDOW`] + 1 columns a lane at every width,
+//! and the extended shape, the load's window + 1 columns a lane at up to
+//! [`EXTENDED_LANES`] lanes. `nvfp4-dflash2-w15`, `nvfp4-dflash2-w10` (a
+//! window whose second attention chunk is 3 columns, not a whole tile) and
+//! `nvfp4-vision-w15` (lane 0 under a rope delta) are such loads, and every
+//! arm of them runs, the reference included, under [`ROUND_SHAPE`]`=extended`
+//! ([`Load::round_shape`]): their verify rounds are extended at widths 1 to
+//! [`EXTENDED_LANES`], and at the base shape past them and wherever the host
+//! cuts a run (a round with a host-cut lane keeps the base shape). Every
+//! verify round asserts the drafts its shape carries ([`round_drafts`]), so
+//! each arm holds the extended round -- from its graphs, eager, deferred and
+//! synchronized, timed, teacher-forced -- to the reference's tokens beside
+//! the base one, and the program's stats report both shapes
+//! ([`round_shape_stats`]).
+//!
+//! The base shape of such a load is the round of a load at [`BASE_WINDOW`]
+//! drafts, token for token: the second test here
+//! ([`a_fifteen_draft_loads_base_rounds_commit_a_seven_draft_loads_tokens`])
+//! runs the session on `nvfp4-dflash2-w15` with the switch unset and on a load
+//! at [`BASE_WINDOW`] that reserves its context ([`Load::sized_for`]), and
+//! compares the two, greedy lanes and sampled ones, at every width; then a
+//! verify round under a value the switch does not know is refused, naming it.
+//!
 //! # Loads and weights
 //!
 //! [`LOADS`]: the NVFP4 body with DFlash2 at 7, with its MTP head at the
@@ -181,7 +207,41 @@ const ARMS: &[Arm] = &[
     // that is (kernel/src/gdn_gating_home.h `kUnset`); `chain` is main's.
     Arm { name: "gdn-gating-chain", switches: &[("IGNIS_GDN_GATING", "chain")], graphs: true },
     Arm { name: "gdn-gating-branch", switches: &[("IGNIS_GDN_GATING", "branch")], graphs: true },
+
+    // #688's arm, below this line.
+
+    // #689's arms, below this line.
+
+    // #691's arms, below this line.
+
+    // #693's arm, below this line.
+
+    // #694's arms, below this line.
+
+    // #695's arms, below this line.
 ];
+
+/// #687: the switch that names a two-shape load's round shape, read at each
+/// verify round; the base shape's drafts a lane, and the most lanes a round
+/// at the extended shape runs.
+const ROUND_SHAPE: &str = "IGNIS_ROUND_SHAPE";
+const BASE_WINDOW: u32 = 7;
+const EXTENDED_LANES: usize = 4;
+/// The load whose base shape the second test holds to a 7-draft load's.
+const TWO_SHAPE_LOAD: &str = "nvfp4-dflash2-w15";
+
+/// #687: the drafts a verify round of `width` lanes carries each lane on
+/// `load`: the load's window on a load of one shape; on a load of two, the
+/// window at the extended shape, where the load runs it
+/// ([`Load::round_shape`]), the round has no more than [`EXTENDED_LANES`]
+/// lanes and no lane the host cuts, and the base shape's [`BASE_WINDOW`]
+/// otherwise.
+fn round_drafts(load: &Load, width: usize, host_cut: bool) -> u32 {
+    if !load.two_shapes() {
+        return load.window;
+    }
+    if load.round_shape == Some("extended") && width <= EXTENDED_LANES && !host_cut { load.window } else { BASE_WINDOW }
+}
 
 /// One 27B load every arm runs on.
 struct Load {
@@ -200,6 +260,13 @@ struct Load {
     vision: bool,
     /// Whether the body holds BF16 exception tensors, which `fp8` converts.
     exceptions: bool,
+    /// #687: the window the session's context is sized for where it is not
+    /// the load's own: a load held to another load's tokens reserves that
+    /// load's context, the envelope its attention splits by.
+    sized_for: Option<u32>,
+    /// #687: [`ROUND_SHAPE`]'s value on every arm of the load, the reference
+    /// included.
+    round_shape: Option<&'static str>,
 }
 
 const NVFP4: &str = "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -217,6 +284,8 @@ const LOADS: &[Load] = &[
         lanes: 8,
         vision: false,
         exceptions: true,
+        sized_for: None,
+        round_shape: None,
     },
     Load {
         name: "nvfp4-mtp",
@@ -227,6 +296,8 @@ const LOADS: &[Load] = &[
         lanes: 8,
         vision: false,
         exceptions: true,
+        sized_for: None,
+        round_shape: None,
     },
     Load {
         name: "nvfp4-vision",
@@ -237,7 +308,65 @@ const LOADS: &[Load] = &[
         lanes: 8,
         vision: true,
         exceptions: true,
+        sized_for: None,
+        round_shape: None,
     },
+    // #687: DFlash2 at 15 drafts, both round shapes, every arm under
+    // `IGNIS_ROUND_SHAPE=extended`: its rounds are extended at widths 1-4 (16
+    // columns a lane) and at the base shape at 5-8 (8).
+    Load {
+        name: "nvfp4-dflash2-w15",
+        artifact: NVFP4,
+        backend: SpeculativeBackend::Dflash2,
+        window: 15,
+        draft_rule: DraftRule::Sampled,
+        lanes: 8,
+        vision: false,
+        exceptions: true,
+        sized_for: None,
+        round_shape: Some("extended"),
+    },
+    // #687: a window between the two shapes' ends, 11 columns a lane: the
+    // extended round's second attention chunk is 3 columns, not a whole tile.
+    Load {
+        name: "nvfp4-dflash2-w10",
+        artifact: NVFP4,
+        backend: SpeculativeBackend::Dflash2,
+        window: 10,
+        draft_rule: DraftRule::Sampled,
+        lanes: 8,
+        vision: false,
+        exceptions: true,
+        sized_for: None,
+        round_shape: Some("extended"),
+    },
+    // #687: both round shapes with vision bound, so that lane 0's extended
+    // rounds rotate at its positions plus a rope delta, staged at the extended
+    // shape's stride.
+    Load {
+        name: "nvfp4-vision-w15",
+        artifact: NVFP4,
+        backend: SpeculativeBackend::Dflash2,
+        window: 15,
+        draft_rule: DraftRule::Sampled,
+        lanes: 8,
+        vision: true,
+        exceptions: true,
+        sized_for: None,
+        round_shape: Some("extended"),
+    },
+    // #688's loads, below this line.
+
+    // #689's loads, below this line.
+
+    // #691's loads, below this line.
+
+    // #693's loads, below this line.
+
+    // #694's loads, below this line.
+
+    // #695's loads, below this line.
+
     Load {
         name: "trellis-16gb",
         artifact: TRELLIS_16GB,
@@ -247,6 +376,8 @@ const LOADS: &[Load] = &[
         lanes: 8,
         vision: false,
         exceptions: false,
+        sized_for: None,
+        round_shape: None,
     },
     Load {
         name: "trellis-12gb",
@@ -257,6 +388,8 @@ const LOADS: &[Load] = &[
         lanes: 8,
         vision: false,
         exceptions: false,
+        sized_for: None,
+        round_shape: None,
     },
 ];
 
@@ -317,9 +450,16 @@ impl Load {
     /// at each width and once more after the release its plain and
     /// constrained tokens and whole verify runs, the forced one's included.
     fn context(&self) -> u32 {
-        let rounds = PLAIN_ROUNDS + CONSTRAINED_ROUNDS + (VERIFY_ROUNDS + CUT_ROUNDS + FORCED_ROUNDS) * (self.window + 1);
+        let window = self.sized_for.unwrap_or(self.window);
+        let rounds = PLAIN_ROUNDS + CONSTRAINED_ROUNDS + (VERIFY_ROUNDS + CUT_ROUNDS + FORCED_ROUNDS) * (window + 1);
         let tokens = PROMPT_TOKENS + (self.lanes + 1) * rounds;
         tokens.div_ceil(128) * 128
+    }
+
+    /// #687: whether the load holds two round shapes: DFlash2 past
+    /// [`BASE_WINDOW`] drafts.
+    fn two_shapes(&self) -> bool {
+        self.backend == SpeculativeBackend::Dflash2 && self.window > BASE_WINDOW
     }
 }
 
@@ -369,12 +509,17 @@ fn selected(variable: &str, known: &[&'static str]) -> Vec<&'static str> {
         .collect()
 }
 
-/// Unsets every switch an arm names, then sets `arm`'s own.
-fn apply(arm: &Arm) {
-    for &(name, _) in ARMS.iter().flat_map(|a| a.switches) {
+/// Unsets every switch an arm names and [`ROUND_SHAPE`], then sets the load's
+/// round shape, if it names one (#687), and `arm`'s own switches.
+fn apply(arm: &Arm, round_shape: Option<&str>) {
+    for name in ARMS.iter().flat_map(|a| a.switches).map(|&(name, _)| name).chain([ROUND_SHAPE]) {
         // SAFETY (test-only): this binary's one test reads and writes the
         // environment on its own thread, where the leaf reads it too.
         unsafe { std::env::remove_var(name) };
+    }
+    if let Some(value) = round_shape {
+        // SAFETY: as above.
+        unsafe { std::env::set_var(ROUND_SHAPE, value) };
     }
     for &(name, value) in arm.switches {
         // SAFETY: as above.
@@ -500,16 +645,22 @@ fn copy_free_graphs(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label
     assert!(verify_copies.iter().all(|&c| c == verify), "{label}: arm `{}`: the verify graphs copy {verify} nodes", arm.name);
 }
 
-/// #686 (spec #684): a load builds one round shape, its base shape at the
-/// load's window, and the program's stats report it apart: its graphs are
-/// the load's verify and drafter append graphs, and its VRAM the load's verify
-/// round and drafter round lines.
-fn base_shape_stats(model: &Model, pool: &SeqPool, load: &Load, label: &str) {
+/// #686 (spec #684): the round shapes a load builds, and the program's stats
+/// report each apart. Its base shape, at the load's window and lanes (#687:
+/// at [`BASE_WINDOW`] on a load of two shapes): its graphs are the load's
+/// verify and drafter append graphs, and its VRAM the load's verify round and
+/// drafter round lines. #687: on a DFlash2 load past [`BASE_WINDOW`] drafts,
+/// its extended shape too, at the load's window and up to [`EXTENDED_LANES`]
+/// lanes, which holds the base shape's buffers and none of its own; its
+/// verify graphs are captured at its every width whenever the base shape's
+/// are, and its append graphs where the base shape's are.
+fn round_shape_stats(model: &Model, pool: &SeqPool, load: &Load, label: &str) {
     let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
-    let [base] = stats.shapes() else {
-        panic!("{label}: {} round shapes, not the base shape alone", stats.shapes().len());
-    };
-    assert_eq!(base.window, load.window, "{label}: the base shape's window");
+    let shapes = stats.shapes();
+    assert_eq!(shapes.len(), if load.two_shapes() { 2 } else { 1 }, "{label}: the round shapes");
+    let base = &shapes[0];
+    let base_window = if load.two_shapes() { BASE_WINDOW } else { load.window };
+    assert_eq!((base.window, base.lanes), (base_window, load.lanes), "{label}: the base shape's window and lanes");
     assert_eq!(
         (base.verify_graph_ready_mask, base.drafter_append_graph_ready_mask, base.verify_folds_in_flight),
         (stats.verify_graph_ready_mask, stats.drafter_append_graph_ready_mask, stats.verify_folds_in_flight),
@@ -522,6 +673,24 @@ fn base_shape_stats(model: &Model, pool: &SeqPool, load: &Load, label: &str) {
     );
     let reserved = model.stats().reserved;
     assert_eq!(base.vram_bytes, reserved.verify_round_bytes + reserved.drafter_round_bytes, "{label}: the base shape's VRAM");
+    if let [_, extended] = shapes {
+        let lanes = load.lanes.min(EXTENDED_LANES as u32);
+        assert_eq!(
+            (extended.window, extended.lanes, extended.vram_bytes),
+            (load.window, lanes, 0),
+            "{label}: the extended shape's window, lanes and own VRAM"
+        );
+        let every = (1u32 << lanes) - 1;
+        let captured = base.verify_graph_ready_mask != 0;
+        assert_eq!(extended.verify_graph_ready_mask, if captured { every } else { 0 }, "{label}: the extended shape's verify graphs");
+        let appends = base.drafter_append_graph_ready_mask != 0;
+        assert_eq!(extended.drafter_append_graph_ready_mask, if appends { every } else { 0 }, "{label}: the extended shape's append graphs");
+        assert!(
+            extended.verify_graph_nodes[..lanes as usize].iter().all(|&nodes| (nodes > 0) == captured),
+            "{label}: the extended shape's graph nodes {:?}",
+            extended.verify_graph_nodes
+        );
+    }
 }
 
 fn expect_replay(model: &Model, pool: &SeqPool, graphs: bool, what: &str) {
@@ -585,8 +754,10 @@ fn ride(
                 }
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
                 expect_replay(model, pool, graphs, &what);
+                // #687: every lane drafts its round shape's whole window.
+                let drafts = round_drafts(load, width, round == Round::Cut);
                 for (&lane, run) in riding.iter().zip(runs) {
-                    assert_eq!(run.extent, load.window, "{what}: lane {lane} drafts the whole window");
+                    assert_eq!(run.extent, drafts, "{what}: lane {lane} drafts its round shape's whole window");
                     committed[lane].extend(run.tokens);
                     committed[lane].push(-1);
                 }
@@ -691,8 +862,12 @@ fn defers_verify(load: &Load, arm: &Arm) -> bool {
 /// The arm's sessions, greedy then sampled, its switches set and, for an arm
 /// that replays graphs, the graphs captured under them.
 fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, label: &str) -> Vec<Committed> {
-    apply(arm);
+    apply(arm, load.round_shape);
     let stats = || program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
+    // #687: the folds left in flight by a round of either shape, and the
+    // rounds at the extended shape, with those of them that ran eagerly.
+    let folds_in_flight = || stats().shapes().iter().map(|shape| shape.verify_folds_in_flight).sum::<u64>();
+    let extended_rounds = || stats().shapes().get(1).map(|shape| (shape.verify_rounds, shape.eager_verify_rounds));
     if arm.graphs {
         let capture = capture_decode_graphs(model, pool).unwrap_or_else(|e| panic!("{label}: {}: capture: {e}", arm.name));
         let every = (1u32 << load.lanes) - 1;
@@ -703,8 +878,9 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         assert_eq!(append, want, "{label}: {}: the drafter's append graphs", arm.name);
         copy_free_graphs(model, pool, load, arm, label);
     }
-    base_shape_stats(model, pool, load, &format!("{label}: {}", arm.name));
-    let folds = stats().verify_folds_in_flight;
+    round_shape_stats(model, pool, load, &format!("{label}: {}", arm.name));
+    let folds = folds_in_flight();
+    let extended_before = extended_rounds();
     let sessions = KINDS
         .iter()
         .map(|&(kind, sampling)| session(model, pool, load, script, sampling, arm.graphs, &format!("{label} {} {kind}", arm.name)))
@@ -713,7 +889,7 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
     // leaves its fold in flight: the rest cut nothing, draft the whole window
     // and take no penalty count back. A cut round does too when its lanes are
     // greedy; a forced round never does.
-    let left = stats().verify_folds_in_flight - folds;
+    let left = folds_in_flight() - folds;
     let uncut = KINDS.len() as u64 * u64::from((load.lanes + u32::from(load.lanes > 1)) * VERIFY_ROUNDS);
     if defers_verify(load, arm) {
         assert!(left >= uncut, "{label}: {}: {left} verify rounds left their fold in flight, not the {uncut} uncut ones", arm.name);
@@ -721,7 +897,21 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         assert_eq!(left, 0, "{label}: {}: verify rounds left their fold in flight", arm.name);
     }
     println!("round_identity_gpu {label}: arm `{}`: {left} verify rounds returned with their fold in flight", arm.name);
-    apply(&REFERENCE);
+    // #687: a load under `extended` ran extended rounds, and an arm with no
+    // graph ran every one of them eagerly; one under the base shape ran none.
+    if let (Some((rounds_before, eager_before)), Some((rounds_after, eager_after))) = (extended_before, extended_rounds()) {
+        let (rounds, eager) = (rounds_after - rounds_before, eager_after - eager_before);
+        if load.round_shape == Some("extended") {
+            assert!(rounds > 0, "{label}: {}: no verify round ran at the extended shape", arm.name);
+        } else {
+            assert_eq!(rounds, 0, "{label}: {}: verify rounds ran at the extended shape", arm.name);
+        }
+        if !arm.graphs {
+            assert_eq!(eager, rounds, "{label}: {}: an extended round replayed a graph", arm.name);
+        }
+        println!("round_identity_gpu {label}: arm `{}`: {rounds} verify rounds at the extended shape, {eager} of them eager", arm.name);
+    }
+    apply(&REFERENCE, None);
     sessions
 }
 
@@ -732,10 +922,16 @@ fn first_difference(want: &Committed, got: &Committed) -> Option<(usize, usize)>
     })
 }
 
-/// Every selected arm against the reference on one load under one exception
-/// setting: one materialize, one model load, one pool. The arms compared, or
-/// `None` where the profile allows a skip.
-fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: ExceptionWeights, arms: &[&Arm], script: &Script) -> Option<usize> {
+/// One load under one exception setting, handed to `body` with its label: one
+/// materialize, one model load, one pool, released before returning. What
+/// `body` returns, or `None` where the profile allows a skip.
+fn with_load<T>(
+    device: &mut CudaDevice,
+    reader: &Reader,
+    load: &Load,
+    exceptions: ExceptionWeights,
+    body: impl FnOnce(&Model, &SeqPool, &str) -> T,
+) -> Option<T> {
     let label = format!("{} {exceptions}", load.name);
     let spec = load.speculation();
     let (plan, handles) = bind_model_scope_27b_with(reader, model_scope(Some(spec), load.vision(), exceptions))
@@ -751,7 +947,7 @@ fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: Excep
     };
     let converted = artifact.stats().fp8_device_bytes;
     assert_eq!(converted > 0, exceptions.is_fp8(), "{label}: {converted} bytes of exception tensors held in FP8");
-    let compared = {
+    let returned = {
         let model = load_qwen38_27b_with_decode_lanes(
             reader,
             &artifact,
@@ -780,10 +976,20 @@ fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: Excep
             Some(load.backend),
         )
         .unwrap_or_else(|e| panic!("{label}: pool: {e}"));
+        body(&model, &pool, &label)
+    };
+    artifact.release_arena(device).unwrap_or_else(|e| panic!("{label}: release: {e}"));
+    Some(returned)
+}
+
+/// Every selected arm against the reference on one load under one exception
+/// setting. The arms compared, or `None` where the profile allows a skip.
+fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: ExceptionWeights, arms: &[&Arm], script: &Script) -> Option<usize> {
+    with_load(device, reader, load, exceptions, |model, pool, label| {
         // An eager arm runs before the load's first capture.
         let eager: Vec<(&Arm, Vec<Committed>)> =
-            arms.iter().filter(|arm| !arm.graphs).map(|&arm| (arm, run(&model, &pool, load, script, arm, &label))).collect();
-        let reference = run(&model, &pool, load, script, &REFERENCE, &label);
+            arms.iter().filter(|arm| !arm.graphs).map(|&arm| (arm, run(model, pool, load, script, arm, label))).collect();
+        let reference = run(model, pool, load, script, &REFERENCE, label);
         assert_ne!(reference[0], reference[1], "{label}: the sampled lanes commit the greedy lanes' tokens: their settings never reached the sampler");
         let mut compared = 0;
         let mut hold_arm = |arm: &Arm, sessions: Vec<Committed>| {
@@ -811,13 +1017,11 @@ fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: Excep
             hold_arm(arm, sessions);
         }
         for &arm in arms.iter().filter(|arm| arm.graphs) {
-            let sessions = run(&model, &pool, load, script, arm, &label);
+            let sessions = run(model, pool, load, script, arm, label);
             hold_arm(arm, sessions);
         }
         compared
-    };
-    artifact.release_arena(device).unwrap_or_else(|e| panic!("{label}: release: {e}"));
-    Some(compared)
+    })
 }
 
 #[test]
@@ -860,4 +1064,89 @@ fn every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_wi
         }
     }
     assert!(compared > 0 || skipped, "no arm was held to the reference: check the IGNIS_ROUND_IDENTITY_* filters");
+}
+
+/// #687: a 15-draft load's rounds at the base shape commit what a load at
+/// [`BASE_WINDOW`] drafts commits, token for token, at every width, with
+/// greedy lanes and with sampled ones, under each exception setting: the load
+/// [`TWO_SHAPE_LOAD`] with [`ROUND_SHAPE`] unset against a load at
+/// [`BASE_WINDOW`] that reserves its context (the context is the envelope the
+/// round's attention splits by, so a load at another context is another
+/// summation order, not another round). Then, on the 15-draft load, a verify
+/// round under a value the switch does not know is refused, naming it: the
+/// proof that a round reads it, which every two-shape load's `extended` rests
+/// on.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn a_fifteen_draft_loads_base_rounds_commit_a_seven_draft_loads_tokens() {
+    let wide = LOADS.iter().find(|load| load.name == TWO_SHAPE_LOAD).expect("the two-shape load is in LOADS");
+    let base = Load { round_shape: None, ..*wide };
+    let seven = Load { name: "nvfp4-dflash2-w7-at-the-w15-context", window: BASE_WINDOW, sized_for: Some(wide.window), round_shape: None, ..*wide };
+    assert_eq!(seven.context(), base.context(), "both loads reserve one context");
+    let weights = selected("IGNIS_ROUND_IDENTITY_WEIGHTS", &ExceptionWeights::NAMES);
+    let mut device = match CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let path = Path::new(base.artifact);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("{}: artifact absent: {}", base.name, base.artifact)) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {}: {e}", base.artifact));
+    let script = script(&reader);
+    let (mut compared, mut skipped) = (0, false);
+    for exceptions in [ExceptionWeights::Bf16, ExceptionWeights::Fp8] {
+        if !weights.contains(&exceptions.as_str()) {
+            continue;
+        }
+        // The load at seven drafts first, released before the 15-draft one.
+        let Some(want) = with_load(&mut device, &reader, &seven, exceptions, |model, pool, label| {
+            run(model, pool, &seven, &script, &REFERENCE, label)
+        }) else {
+            skipped = true;
+            continue;
+        };
+        let Some(got) = with_load(&mut device, &reader, &base, exceptions, |model, pool, label| {
+            let sessions = run(model, pool, &base, &script, &REFERENCE, label);
+            apply(&REFERENCE, Some("no-such-value"));
+            let mut seq = pool.alloc(base.context()).unwrap_or_else(|e| panic!("{label}: alloc: {e}"));
+            prefill(model, pool, &mut seq, &script.prompts[0], greedy(0), false, label);
+            let mut refs = vec![&mut seq];
+            let lanes = [VerifyLane::greedy(&[])];
+            let Err(refused) = decode_program_verify_runs(model, pool, &mut refs, &lanes, base.window) else {
+                panic!("{label}: a verify round under {ROUND_SHAPE}=no-such-value was not refused");
+            };
+            assert!(refused.contains(ROUND_SHAPE), "{label}: the round's refusal names the variable: {refused}");
+            apply(&REFERENCE, None);
+            sessions
+        }) else {
+            skipped = true;
+            continue;
+        };
+        for (((kind, _), want), got) in KINDS.iter().zip(&want).zip(&got) {
+            if let Some((lane, at)) = first_difference(want, got) {
+                let from = at.saturating_sub(4);
+                panic!(
+                    "{} {exceptions}: at the base shape, {kind} lanes: lane {lane} leaves the load at {BASE_WINDOW} \
+                     drafts at token {at}: that load {:?}, the base shape {:?}",
+                    base.name,
+                    &want[lane][from..want[lane].len().min(at + 8)],
+                    &got[lane][from..got[lane].len().min(at + 8)]
+                );
+            }
+        }
+        let tokens: usize = got.iter().flatten().flatten().filter(|&&t| t >= 0).count();
+        println!(
+            "round_identity_gpu {} {exceptions}: the base shape commits the {tokens} tokens of the load at \
+             {BASE_WINDOW} drafts, widths 1..={}, greedy and sampled lanes",
+            base.name, base.lanes
+        );
+        compared += 1;
+    }
+    assert!(compared > 0 || skipped, "no exception setting was compared: check IGNIS_ROUND_IDENTITY_WEIGHTS");
 }

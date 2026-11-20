@@ -255,9 +255,13 @@ a constrained round, a verify round whose runs the host cuts short, a
 teacher-forced verify round and a snapshot and restore of each lane right
 after a verify round, on the NVFP4 artifact with DFlash2, with its MTP head and with vision, and on
 the 16 GB and 12 GB classes' trellis artifacts, each under the exception
-weights it has. Each arm is held to the graphs' replay with every switch
-unset; a change behind a switch of its own adds that switch as an arm, as the
-file says. The whole run materializes eight loads in turn, so a narrow one is
+weights it has. From 0.11.0 it also loads DFlash2 at 15 and 10 draft tokens
+and vision at 15, under `IGNIS_ROUND_SHAPE=extended`, so every arm holds the
+extended round at 1 to 4 lanes and the base round past them, and a second test
+holds a 15-draft load's base rounds to a 7-draft load's tokens. Each arm is
+held to the graphs' replay with every switch unset; a change behind a switch
+of its own adds that switch as an arm, as the file says. The whole run
+materializes fourteen loads in turn, so a narrow one is
 the usual run:
 
 ```sh
