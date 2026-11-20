@@ -631,18 +631,7 @@ fn drop_draft_options_under_off(patch: &mut Layer) -> Result<(), ConfigError> {
         .map(|(_, family, _)| family)
         .collect();
     for family in off {
-        for name in [
-            "draft_tokens",
-            "draft_head",
-            "draft_rule",
-            "drafter_temperature_factor",
-            "drafter_top_p",
-            "shape_enter_accepted",
-            "shape_stay_accepted",
-            "shape_policy",
-            "shape_estimate_rounds",
-            "shape_period_ratios",
-        ] {
+        for name in crate::config::DRAFT_FIELDS {
             let meta = schema::field("spec", name).expect("a declared field");
             // GitHub #576: the draft rule's three are the 27B's alone, held in
             // its section, where a patch homes their group key: the 27B's own

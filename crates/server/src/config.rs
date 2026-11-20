@@ -1692,6 +1692,27 @@ fn derive_diarizer(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> Str
 /// makes. What else only the family decides -- Flash-Next's head refusing 0,
 /// the 27B's MTP load refusing DFlash2's own settings -- is [`fit_family`]'s,
 /// which runs only for the artifact that loads.
+/// Every `spec.` field that shapes a draft beside the backend: the window,
+/// the drafter's head, and DFlash2's own -- its draft rule and its drafter's
+/// sampling (GitHub #576), the shape rule's thresholds (GitHub #689) and the
+/// shape policy's three (GitHub #690). What a start drops with a backend its
+/// model does not draft with, and what a patch's `off` takes out
+/// (`config_http`). The two lists that spell DFlash2's eight with their
+/// values ([`derive_speculation`], [`refuse_dflash2s_settings_under_mtp`])
+/// name the same fields.
+pub(crate) const DRAFT_FIELDS: [&str; 10] = [
+    "draft_tokens",
+    "draft_head",
+    "draft_rule",
+    "drafter_temperature_factor",
+    "drafter_top_p",
+    "shape_enter_accepted",
+    "shape_stay_accepted",
+    "shape_policy",
+    "shape_estimate_rounds",
+    "shape_period_ratios",
+];
+
 fn derive_speculation(
     resolution: &Resolution,
     family: Option<ModelFamily>,
@@ -2095,18 +2116,7 @@ fn fit_family(
         }
         *fitted.speculation = None;
         fitted.dropped.push(schema::field("spec", "backend").expect("declared").flag());
-        for name in [
-            "draft_tokens",
-            "draft_head",
-            "draft_rule",
-            "drafter_temperature_factor",
-            "drafter_top_p",
-            "shape_enter_accepted",
-            "shape_stay_accepted",
-            "shape_policy",
-            "shape_estimate_rounds",
-            "shape_period_ratios",
-        ] {
+        for name in DRAFT_FIELDS {
             if resolution.explicit("spec", name) {
                 fitted.dropped.push(schema::field("spec", name).expect("declared").flag());
             }
