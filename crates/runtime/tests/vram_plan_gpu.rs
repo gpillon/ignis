@@ -716,3 +716,120 @@ fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
         }
     }
 }
+
+/// GitHub #695: the trellis body the 16 GB and 24 GB profiles load.
+const TRELLIS_ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_trellis_sc30-v2.ninfer";
+
+/// GitHub #695: a two-shape load of the trellis body at each profile's own
+/// shape -- `rtx-16gb`'s 262,144 tokens, 1,024-token chunk and 2 lanes,
+/// `rtx-24gb`'s 1,048,576, 2,048 and 8 lanes with 2 device retained slots,
+/// vision on in host memory as both have it -- plans the CPU's lines
+/// (`ignis_core::lane_lines`) at windows of 8, 12 and 15: the verify round's
+/// and the drafter's lines, which hold both shapes, and sampling, the lanes'
+/// state and the hq window, which do not move. Against the plan of the same
+/// load at seven drafts, no line moves but those two and the decode round's
+/// scratch: the trellis workspace does not, whose head's widest call is the
+/// span-logits block's 32 columns at 2 lanes and 64 columns at 8 at either
+/// window. Each delta prints in bytes and in the KV pages it takes from a
+/// pool the budget sizes (at most, rounded up): the configuration reference
+/// and the profiles page quote them. Asked of the leaf's plan only, so
+/// nothing here touches the device but the trellis op's own queries.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn a_two_shape_trellis_loads_round_lines_are_the_cpus_at_the_profiles_lanes() {
+    let path = Path::new(TRELLIS_ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {TRELLIS_ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let at_window = |window: u32| {
+        Speculation::new(SpeculativeBackend::Dflash2, window)
+            .unwrap_or_else(|e| panic!("dflash2-{window}: {e}"))
+            .with_draft_rule(DraftRule::Sampled, DrafterSampling::default())
+    };
+    let seven = at_window(7);
+    let topology = ignis_core::ModelConfig::qwen38_27b();
+    let page_bytes =
+        KvFormat::HqE8_2b.page_bytes(ignis_core::seq::kv_geometry(&topology, Some(SpeculativeBackend::Dflash2)));
+    struct Profile {
+        label: &'static str,
+        max_context_tokens: u32,
+        prefill_chunk_tokens: u32,
+        lanes: u32,
+        vision: Vision,
+        retained_device_slots: u32,
+    }
+    let host = |max_tokens: u32| Vision::new(max_tokens).expect("an envelope").with_residency(VisionResidency::Host);
+    let profiles = [
+        Profile {
+            label: "rtx-16gb",
+            max_context_tokens: 262_144,
+            prefill_chunk_tokens: 1024,
+            lanes: 2,
+            vision: host(4096),
+            retained_device_slots: 0,
+        },
+        Profile {
+            label: "rtx-24gb",
+            max_context_tokens: 1_048_576,
+            prefill_chunk_tokens: 2048,
+            lanes: N_DECODE_LANES as u32,
+            vision: host(ignis_core::DEFAULT_VISION_MAX_TOKENS),
+            retained_device_slots: 2,
+        },
+    ];
+    for profile in &profiles {
+        let scope = model_load::model_scope(Some(seven), Some(profile.vision), ExceptionWeights::Bf16);
+        let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
+        let planned = |speculation: Speculation| {
+            let config = CudaLeafConfig {
+                max_context_tokens: profile.max_context_tokens,
+                kv_format: KvFormat::HqE8_2b,
+                slot_count: profile.lanes,
+                prefill_chunk_tokens: profile.prefill_chunk_tokens,
+                speculation: Some(speculation),
+                vision: Some(profile.vision),
+                retained_device_slots: profile.retained_device_slots,
+                ..CudaLeafConfig::default()
+            };
+            config
+                .plan_reservations(&reader, &plan, &handles)
+                .unwrap_or_else(|e| panic!("{}: plan at {} drafts: {e}", profile.label, speculation.draft_tokens()))
+                .reserved
+        };
+        let base = planned(seven);
+        assert!(base.trellis_workspace > 0, "{}: a trellis body plans its workspace", profile.label);
+        for window in [8, 12, 15] {
+            let wide = at_window(window);
+            let at = planned(wide);
+            let lines = lane_lines(&topology, KvFormat::HqE8_2b, Some(wide), true, profile.lanes, profile.retained_device_slots);
+            let what = format!("{}: {window} drafts at {} lanes", profile.label, profile.lanes);
+            assert_eq!(at.verify_round, lines.verify_round, "{what}: the leaf's verify line is the CPU's");
+            assert_eq!(at.drafter_round, lines.drafter_round, "{what}: the leaf's drafter line is the CPU's");
+            assert_eq!(
+                (at.sampling, at.lane_state, at.hq_residual_window),
+                (lines.sampling, lines.lane_state, lines.hq_residual_window),
+                "{what}: the lines that hold no round shape"
+            );
+            assert_eq!(
+                ReservedBytes { verify_round: base.verify_round, drafter_round: base.drafter_round, decode_graph: base.decode_graph, ..at },
+                base,
+                "{what}: a line moved from the seven-draft load's that holds no round shape (the trellis workspace among them)"
+            );
+            assert!(at.decode_graph >= base.decode_graph, "{what}: the decode round's scratch holds the base shape");
+            if profile.lanes == N_DECODE_LANES as u32 {
+                assert_eq!(at.decode_graph, base.decode_graph, "{what}: both shapes are 64 columns");
+            }
+            let delta = (at.verify_round - base.verify_round) + (at.drafter_round - base.drafter_round) + (at.decode_graph - base.decode_graph);
+            println!(
+                "vram_plan_gpu: trellis {what}: past the seven-draft load, verify +{} B, drafter +{} B, decode round +{} B: \
+                 {delta} B in all, at most {} KV pages of {page_bytes} B (trellis workspace {} B both)",
+                at.verify_round - base.verify_round,
+                at.drafter_round - base.drafter_round,
+                at.decode_graph - base.decode_graph,
+                delta.div_ceil(page_bytes),
+                at.trellis_workspace
+            );
+        }
+    }
+}

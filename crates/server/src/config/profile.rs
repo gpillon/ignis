@@ -882,6 +882,37 @@ mod tests {
         assert!(flash.is_empty(), "no Flash-Next section: Flash-Next on a small card is not this class's");
     }
 
+    /// GitHub #695 (spec #684): a DFlash2 load may name up to 15 drafts on any
+    /// card, unmeasured for speed off the RTX 5090, so every built-in profile
+    /// but `rtx5090`, whose default moves on the spec's served gate, gives the
+    /// 27B DFlash2 at 7, the trellis body's `rtx-16gb` and `rtx-24gb`
+    /// included; and the 12 GB class keeps the MTP head at its own window.
+    #[test]
+    fn every_profile_but_rtx5090_drafts_the_27b_at_seven() {
+        use super::super::source::{resolve_settings, Fit, Sources};
+        use super::super::SpecChoice;
+        use ignis_core::compute::ModelFamily::Qwen38_27b;
+        use ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS;
+        use ignis_core::SpeculativeBackend;
+
+        let mut held = Vec::new();
+        for (name, layer) in built_in() {
+            if name == CardClass::Gb32.profile() {
+                continue;
+            }
+            let sources = Sources { profile: layer, ..Sources::default() };
+            let spec = resolve_settings(&sources, Some(Qwen38_27b), Fit::Start).unwrap().settings.spec;
+            let (backend, window) = if name == CardClass::Gb12.profile() {
+                (SpeculativeBackend::Mtp, QWEN38_MTP_DEFAULT_DRAFT_TOKENS)
+            } else {
+                (SpeculativeBackend::Dflash2, 7)
+            };
+            assert_eq!((spec.backend, spec.draft_tokens), (Some(SpecChoice::Backend(backend)), Some(window)), "{name}");
+            held.push(name);
+        }
+        assert_eq!(held, ["rtx-12gb", "rtx-16gb", "rtx-24gb", "rtxpro6000"], "the profiles held");
+    }
+
     /// The 27B started under `rtxpro6000` takes the profile's Flash-Next-only
     /// n-gram budget as a default it passes over, not a value to refuse.
     #[test]
