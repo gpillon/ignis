@@ -441,12 +441,17 @@ fn a_held_lane_keeps_speculation_and_its_neighbours_keep_their_drafts_and_the_gr
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let artifact = materialize(&reader, &plan, &mut device, None).unwrap_or_else(|e| panic!("materialize: {e}"));
+    let mut artifact = materialize(&reader, &plan, &mut device, None).unwrap_or_else(|e| panic!("materialize: {e}"));
     let spec = Speculation::new(SpeculativeBackend::Dflash2, WINDOW).unwrap();
-    let model =
-        load_qwen38_27b_with_speculation(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT, KvFormat::Bf16, Some(spec))
-            .unwrap_or_else(|e| panic!("model load (dflash2, window {WINDOW}): {e}"));
-    held_beside_free(&model, &prompts, stops, &grammar, KvFormat::Bf16, WINDOW);
+    {
+        let model =
+            load_qwen38_27b_with_speculation(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT, KvFormat::Bf16, Some(spec))
+                .unwrap_or_else(|e| panic!("model load (dflash2, window {WINDOW}): {e}"));
+        held_beside_free(&model, &prompts, stops, &grammar, KvFormat::Bf16, WINDOW);
+    }
+    // #691: the weights go back to the card, where the next test of this
+    // process materializes its own.
+    artifact.release_arena(&mut device).unwrap_or_else(|e| panic!("release: {e}"));
 }
 
 #[test]
