@@ -232,6 +232,20 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, I
     case IgnisDrafter::kNone:
       break;
     }
+    // GitHub #692 (test-only): a teacher-forced round that names its drafts
+    // verifies them in place of the proposal, written over it here -- an
+    // eager round's alone; a capture refuses them (below).
+    if (verify.forced_drafts != nullptr) {
+      const cudaError_t err =
+          cudaMemcpyAsync(verify.drafts->p, verify.forced_drafts,
+                          static_cast<std::size_t>(k) * width * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                          model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_verify_graph: cudaMemcpyAsync(forced drafts) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+    }
     ninfer::ops::speculative_prepare_verify_inputs(anchors, drafts, base_positions, extents,
                                                    verify_ids, positions, model->stream);
 
@@ -403,6 +417,11 @@ int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, Ign
   // round runs eagerly; a graph that baked it in would force serving rounds.
   if (verify.forced_tokens != nullptr) {
     set_error("ignis_verify_graph_capture: a teacher-forced round's recording is set");
+    return -1;
+  }
+  // GitHub #692: so are its forced drafts.
+  if (verify.forced_drafts != nullptr) {
+    set_error("ignis_verify_graph_capture: a teacher-forced round's forced drafts are set");
     return -1;
   }
   cudaError_t err = cudaStreamBeginCapture(model->stream, cudaStreamCaptureModeThreadLocal);

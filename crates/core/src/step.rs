@@ -1428,6 +1428,8 @@ fn program_round(
         host_cut_lanes: std::ptr::null(),
         host_cut: None,
         host_cut_context: std::ptr::null_mut(),
+        forced_drafts: std::ptr::null(),
+        forced_shape_window: 0,
     };
     let mut tokens = vec![-1; handles.len()];
     let rc = unsafe {
@@ -1738,7 +1740,7 @@ pub fn decode_program_verify_runs(
     lanes: &[VerifyLane<'_>],
     window: u32,
 ) -> Result<Vec<LaneVerifyRun>, String> {
-    verify_round(model, pool, sequences, lanes, window, std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), None)
+    verify_round(model, pool, sequences, lanes, window, std::ptr::null(), std::ptr::null_mut(), ForcedOptions::NONE, None)
 }
 
 /// [`decode_program_verify_runs`] with a **verify commit whose cut the host
@@ -1785,7 +1787,7 @@ pub fn decode_program_verify_cut(
         window,
         std::ptr::null(),
         std::ptr::null_mut(),
-        std::ptr::null(),
+        ForcedOptions::NONE,
         Some((&flags, &mut context)),
     );
     if let Some(payload) = context.panic.take() {
@@ -1864,6 +1866,44 @@ pub fn decode_program_verify_forced(
     window: u32,
     forced: &[&[i32]],
 ) -> Result<Vec<LaneVerifyRun>, String> {
+    decode_program_verify_forced_with(model, pool, sequences, lanes, window, forced, TeacherForcing::default())
+}
+
+/// GitHub #692 (spec #684, test-only): what a teacher-forced round
+/// ([`decode_program_verify_forced_with`]) is asked beside its recording --
+/// the numerical-class test's seam, which runs one load's rounds at either
+/// round shape and offers them a text as their drafts. The default asks
+/// nothing: the round of [`decode_program_verify_forced`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TeacherForcing<'a> {
+    /// The window of the round shape the round runs at: the load's draft
+    /// window, or on a DFlash2 load past
+    /// [`crate::speculation::BASE_SHAPE_DRAFT_TOKENS`] drafts the base shape's,
+    /// whatever `IGNIS_ROUND_SHAPE` or a rule would choose. The leaf refuses a
+    /// window no shape of the load has, and a round of more lanes than the
+    /// shape runs. `None`: the shape is chosen as any round's.
+    pub shape_window: Option<u32>,
+    /// Each lane's drafts, `window` of them (the load's window: a round at a
+    /// shape of `k` drafts reads each lane's first `k`), which the round
+    /// verifies in place of the drafter's: its columns hold them, and the
+    /// recording's verdict takes their leading agreement with the recording,
+    /// every one where they are the recording's. A DFlash2 load's, every
+    /// lane greedy; such a round runs eagerly. `None`: the drafter's.
+    pub drafts: Option<&'a [&'a [i32]]>,
+}
+
+/// [`decode_program_verify_forced`], asked `forcing` (GitHub #692): the
+/// round at the shape it names, verifying the drafts it names. Test-only, as
+/// that round is: no serving path calls it.
+pub fn decode_program_verify_forced_with(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    lanes: &[VerifyLane<'_>],
+    window: u32,
+    forced: &[&[i32]],
+    forcing: TeacherForcing<'_>,
+) -> Result<Vec<LaneVerifyRun>, String> {
     if forced.len() != sequences.len() {
         return Err(format!(
             "decode_program_verify_forced: {} forced runs for {} sequences",
@@ -1879,7 +1919,43 @@ pub fn decode_program_verify_forced(
         ));
     }
     let flat: Vec<i32> = forced.iter().flat_map(|run| run.iter().copied()).collect();
-    verify_round(model, pool, sequences, lanes, window, std::ptr::null(), std::ptr::null_mut(), flat.as_ptr(), None)
+    let mut drafts = Vec::new();
+    if let Some(forced_drafts) = forcing.drafts {
+        if forced_drafts.len() != sequences.len() {
+            return Err(format!(
+                "decode_program_verify_forced: {} forced draft rows for {} sequences",
+                forced_drafts.len(),
+                sequences.len()
+            ));
+        }
+        if let Some(index) = forced_drafts.iter().position(|row| row.len() != window as usize) {
+            return Err(format!(
+                "decode_program_verify_forced: lane {index} forces {} drafts, not the window {window}",
+                forced_drafts[index].len()
+            ));
+        }
+        drafts = forced_drafts.iter().flat_map(|row| row.iter().copied()).collect();
+    }
+    let options = ForcedOptions {
+        tokens: flat.as_ptr(),
+        drafts: if forcing.drafts.is_some() { drafts.as_ptr() } else { std::ptr::null() },
+        shape_window: forcing.shape_window.unwrap_or(0),
+    };
+    verify_round(model, pool, sequences, lanes, window, std::ptr::null(), std::ptr::null_mut(), options, None)
+}
+
+/// A teacher-forced round's inputs as the decode options carry them
+/// (`forced_tokens`, and GitHub #692's `forced_drafts` and
+/// `forced_shape_window`): all null on every round no test forces.
+#[derive(Clone, Copy)]
+struct ForcedOptions {
+    tokens: *const i32,
+    drafts: *const i32,
+    shape_window: u32,
+}
+
+impl ForcedOptions {
+    const NONE: Self = Self { tokens: std::ptr::null(), drafts: std::ptr::null(), shape_window: 0 };
 }
 
 /// GitHub #307 (spec flash-next/07): one Flash-Next verify round at the
@@ -1913,7 +1989,7 @@ pub fn decode_flash_next_verify(
     }
     let out_logits =
         out_logits_ptr(out_logits, sequences.len() * columns, flash_next_vocab(), "decode_flash_next_verify")?;
-    verify_round(model, pool, sequences, lanes, window, ngram_rows.as_ptr(), out_logits, std::ptr::null(), None)
+    verify_round(model, pool, sequences, lanes, window, ngram_rows.as_ptr(), out_logits, ForcedOptions::NONE, None)
 }
 
 fn verify_round(
@@ -1924,7 +2000,7 @@ fn verify_round(
     window: u32,
     ngram_rows: *const u8,
     out_logits: *mut u16,
-    forced_tokens: *const i32,
+    forced: ForcedOptions,
     host_cut: Option<(&[u8], &mut HostCutContext<'_>)>,
 ) -> Result<Vec<LaneVerifyRun>, String> {
     if lanes.len() != sequences.len() {
@@ -1993,13 +2069,15 @@ fn verify_round(
         out_drafts: next_drafts.as_mut_ptr(),
         out_reasoning_redirected: redirected.as_mut_ptr(),
         out_logits,
-        forced_tokens,
+        forced_tokens: forced.tokens,
         // GitHub #590: none on every round no lane of which the host cuts.
         host_cut_lanes: host_cut.as_ref().map_or(std::ptr::null(), |(flags, _)| flags.as_ptr()),
         host_cut: host_cut.as_ref().map(|_| host_cut_trampoline as unsafe extern "C" fn(_, _, _, _) -> _),
         host_cut_context: host_cut.map_or(std::ptr::null_mut(), |(_, context)| {
             context as *mut HostCutContext<'_> as *mut std::ffi::c_void
         }),
+        forced_drafts: forced.drafts,
+        forced_shape_window: forced.shape_window,
     };
     let rc = unsafe {
         ffi::ignis_program_decode(

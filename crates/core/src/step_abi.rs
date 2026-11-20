@@ -53,6 +53,14 @@ pub struct IgnisDecodeOptions {
     /// `step::decode_program_verify_cut`.
     pub host_cut: Option<unsafe extern "C" fn(*mut std::ffi::c_void, u64, *const i32, i32) -> i32>,
     pub host_cut_context: *mut std::ffi::c_void,
+    /// GitHub #692, test-only: a teacher-forced round's drafts in place of
+    /// its drafter's, host `[batch][window]`, or null -- see
+    /// `step::decode_program_verify_forced_with`.
+    pub forced_drafts: *const i32,
+    /// GitHub #692, test-only: the window of the round shape a
+    /// teacher-forced round runs at, or 0 for the shape any round's choice
+    /// gives.
+    pub forced_shape_window: u32,
 }
 
 /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
@@ -163,16 +171,19 @@ mod tests {
 
     /// GitHub #267: `ignis_decode_options` with the teacher forcing appended
     /// last, so every field the serving path sets keeps its offset. uint32
-    /// size and window, then ten pointers; the leaf pins the same numbers
+    /// size and window, then thirteen pointers, then GitHub #692's uint32
+    /// and its padding; the leaf pins the same numbers
     /// (kernel/include/ignis_step.h) and refuses any other `size`.
     #[test]
     fn the_decode_options_mirror_is_the_leaf_structs_layout() {
-        assert_eq!(std::mem::size_of::<IgnisDecodeOptions>(), 112);
+        assert_eq!(std::mem::size_of::<IgnisDecodeOptions>(), 128);
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, out_logits), 72);
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, forced_tokens), 80);
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, host_cut_lanes), 88);
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, host_cut), 96);
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, host_cut_context), 104);
+        assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, forced_drafts), 112);
+        assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, forced_shape_window), 120);
     }
 
     /// GitHub #520: `keeps_draw` filled the tail padding after
