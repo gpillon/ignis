@@ -182,8 +182,8 @@ use ignis_core::step::{
     PermittedLane, Redirect, SamplingParams, VerifyLane,
 };
 use ignis_core::{
-    DraftRule, DrafterSampling, ExceptionWeights, KvFormat, PrefillAttention, PrefillLinear, RopeScaling,
-    Speculation, SpeculativeBackend, Vision,
+    DraftRule, DrafterSampling, ExceptionWeights, HqDecodeAttention, KvFormat, PrefillAttention, PrefillLinear,
+    RopeScaling, Speculation, SpeculativeBackend, Vision,
 };
 
 /// One arm of the round: the measurement switches it sets (every other switch
@@ -227,6 +227,9 @@ const ARMS: &[Arm] = &[
     Arm { name: "gdn-gating-branch", switches: &[("IGNIS_GDN_GATING", "branch")], graphs: true },
 
     // #688's arm, below this line.
+    // An extended round's attention on the vendored chunked route, to which the unset switch's
+    // chunks on ignis's route are held at 1-4 lanes, on the loads of two shapes.
+    Arm { name: "extended-attention-vendored", switches: &[(EXTENDED_ATTENTION, "vendored")], graphs: true },
 
     // #689's arms, below this line.
 
@@ -268,6 +271,10 @@ const TWO_SHAPE_LOAD: &str = "nvfp4-dflash2-w15";
 const CROSSING: [Option<&str>; 4] = [Some("base"), Some("extended"), Some("base"), None];
 /// The kinds of round each crossing runs on: live and teacher-forced.
 const CROSSING_KINDS: [Round; 2] = [Round::Verify, Round::Forced];
+
+/// #688: the switch that names the route of an extended round's attention,
+/// read at each capture ([`extended_attention`]).
+const EXTENDED_ATTENTION: &str = "IGNIS_EXTENDED_ATTENTION";
 
 /// #687: the drafts a verify round of `width` lanes carries each lane on
 /// `load`: the load's window on a load of one shape; on a load of two, the
@@ -744,6 +751,25 @@ fn copy_free_graphs(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label
     assert!(verify_copies.iter().all(|&c| c == verify), "{label}: arm `{}`: the verify graphs copy {verify} nodes", arm.name);
 }
 
+/// #688: the route the arm's extended rounds attend on. On a load of two
+/// shapes, ignis's own route in chunks wherever the load's rounds take
+/// ignis's route ([`Model::hq_decode_attention`]), unless the arm's capture
+/// read [`EXTENDED_ATTENTION`]`=vendored`, and the vendored chunked route
+/// otherwise; an arm with no graph runs before the load's first capture, as
+/// the switch unset decides. Nothing on a load of one shape. So the arm on
+/// the vendored chunks, whose tokens equal the reference's, ran on them, and
+/// the reference and the `eager` arm on ignis's.
+fn extended_attention(model: &Model, load: &Load, arm: &Arm, label: &str) {
+    let vendored = arm.graphs && arm.switches.contains(&(EXTENDED_ATTENTION, "vendored"));
+    let ours = model.hq_decode_attention() == HqDecodeAttention::Ours && !vendored;
+    let want = load.two_shapes().then_some(if ours { HqDecodeAttention::Ours } else { HqDecodeAttention::Vendored });
+    let got = model.extended_attention();
+    assert_eq!(got, want, "{label}: arm `{}`: the route of the extended round's attention", arm.name);
+    if let Some(route) = got {
+        println!("round_identity_gpu {label}: arm `{}`: the extended round attends on the {} chunks", arm.name, route.as_str());
+    }
+}
+
 /// #686 (spec #684): the round shapes a load builds, and the program's stats
 /// report each apart. Its base shape, at the load's window and lanes (#687:
 /// at [`BASE_WINDOW`] on a load of two shapes): its graphs are the load's
@@ -1007,6 +1033,7 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         copy_free_graphs(model, pool, load, arm, label);
     }
     round_shape_stats(model, pool, load, &format!("{label}: {}", arm.name));
+    extended_attention(model, load, arm, label);
     let folds = folds_in_flight();
     let extended_before = extended_rounds();
     let sessions = KINDS

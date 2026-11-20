@@ -29,6 +29,7 @@
 #include "attention_readout.h"
 #include "dflash2_small_t.h"
 #include "draft_window.h"
+#include "extended_attention.h"
 #include "fp8_exception.h"
 #include "ignis_dense_prefill.h"
 #include "gdn_prefill.h"
@@ -3174,6 +3175,21 @@ extern "C" uint32_t ignis_model_hq_decode_attention(const struct ignis_model *mo
     return IGNIS_HQ_DECODE_ATTENTION_VENDORED;
   }
   return model->hq_decode_attention_ours ? IGNIS_HQ_DECODE_ATTENTION_OURS : IGNIS_HQ_DECODE_ATTENTION_VENDORED;
+}
+
+// GitHub #688: the rule an extended round's call takes (kernel/src/gqa_layer.cu `run_gqa_layer_batch`), at
+// the shape's columns a lane: a load whose rounds take ignis's route is an hq-e8-2b load.
+extern "C" uint32_t ignis_model_extended_attention(const struct ignis_model *model) {
+  if (model == nullptr || model->flash_next || model->extended_shape == nullptr) {
+    return IGNIS_EXTENDED_ATTENTION_NONE;
+  }
+  const auto columns = static_cast<std::int32_t>(model->extended_shape->window + 1);
+  const bool serves = model->hq_decode_attention_ours &&
+                      ignis::hq_decode_attention::serves_chunked(kIgnisGqaQHeads, columns, ninfer::DType::U8);
+  return ignis::extended_attention::route_of(model->hq_decode_attention_ours, model->extended_attention, serves) ==
+                 ignis::extended_attention::Route::kOurs
+             ? IGNIS_EXTENDED_ATTENTION_OURS
+             : IGNIS_EXTENDED_ATTENTION_VENDORED;
 }
 
 extern "C" uint32_t ignis_model_mtp_head_linear(const struct ignis_model *model) {

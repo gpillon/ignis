@@ -452,16 +452,36 @@ target_include_directories(ignis_kernel_hq_decode_attention_route_test PRIVATE $
 target_link_libraries(ignis_kernel_hq_decode_attention_route_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_hq_decode_attention_route_test COMMAND ignis_kernel_hq_decode_attention_route_test)
 
-# GitHub #687: OURS -- which batch rounds run their one lane's attention in
-# chunks of the small-T tile (kernel/src/round_shape.h): no round of a load at
-# seven drafts or fewer and no base round, over hq-e8-2b or BF16 (the tile is
-# 6 columns there, and a one-lane round of 7 or 8 stays the vendored wrapper's
-# prompt route, as on main), and the one lane of an extended round alone.
-# Host-only.
+# GitHub #687, #688: OURS -- which batch rounds run their attention in chunks
+# of the small-T tile, and on which route (kernel/src/extended_attention.h): no
+# round of a load at seven drafts or fewer and no base round, over hq-e8-2b or
+# BF16 (the tile is 6 columns there, and a one-lane round of 7 or 8 stays the
+# vendored wrapper's prompt route, as on main); every extended round, at 1..4
+# lanes, its chunks on ignis's route exactly where the load takes that route,
+# the route serves the call and IGNIS_EXTENDED_ATTENTION does not name
+# `vendored`. Host-only.
 add_executable(ignis_kernel_one_lane_chunks_test test_one_lane_chunks.cpp)
 target_include_directories(ignis_kernel_one_lane_chunks_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_one_lane_chunks_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_one_lane_chunks_test COMMAND ignis_kernel_one_lane_chunks_test)
+
+# GitHub #688 (spec #684): OURS -- an extended round's attention over
+# hq-e8-2b, 9..16 columns a lane at 1..4 lanes, in the batch body's one chunk
+# loop (kernel/src/extended_attention.h) on ignis's route against the same loop
+# on the vendored chunks, and that loop against the vendored wrapper's own
+# chunked small-T route at 2..4 lanes, at the launcher's seam, on the
+# production cache views and the committed fixture's rows: every output byte
+# and every cache byte the fused append writes, ring marks included, dense and
+# under per-lane valid prefixes that end inside chunk 1, at the chunk boundary
+# and inside chunk 2. ADR 0093's contract past the tile. The route's image is
+# in the sm_120a set alone, so the test is sm120a-only (below). No
+# SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_hq_verify_chunked_exact_test test_hq_verify_chunked_exact.cu)
+target_compile_definitions(ignis_kernel_hq_verify_chunked_exact_test PRIVATE
+  IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
+target_include_directories(ignis_kernel_hq_verify_chunked_exact_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_hq_verify_chunked_exact_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_hq_verify_chunked_exact_test COMMAND ignis_kernel_hq_verify_chunked_exact_test)
 
 # GitHub #689 (spec #684): OURS -- the shape rule and the shape policy `all` of
 # a DFlash2 load of two round shapes (kernel/src/round_shape.h), from tables:
@@ -1343,5 +1363,6 @@ set(ignis_sm120a_only_tests
   ignis_kernel_image_transformer_test
   ignis_kernel_tma_descriptor_cache_test
   ignis_kernel_prefill_swiglu_test
-  ignis_kernel_w4a4_activation_layout_test)
+  ignis_kernel_w4a4_activation_layout_test
+  ignis_kernel_hq_verify_chunked_exact_test)
 set_tests_properties(${ignis_sm120a_only_tests} PROPERTIES LABELS sm120a-only)
