@@ -238,7 +238,7 @@ fn the_head_runs_only_where_read_and_leaves_todays_state(today: &Run, cut: &Run,
 }
 
 fn check_format() {
-    assert_eq!(snapshot_format_version(), 5, "this test reads the version-5 blob layout");
+    assert_eq!(snapshot_format_version(), 6, "this test reads the version-6 blob layout");
 }
 
 fn flash_next_leaf(speculation: Option<FlashNextSpeculation>, prefill_chunk_tokens: u32) -> Option<FlashNextLeaf> {

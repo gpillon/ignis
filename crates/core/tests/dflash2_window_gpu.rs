@@ -363,7 +363,7 @@ fn the_drafter_window_holds_the_projected_context_of_the_prompt() {
     let long = repeated(&sentence, LONG_PROMPT_TOKENS);
     assert!(short.len() > PREFILL_CHUNK as usize && short.len() < WINDOW, "{}", short.len());
     assert!(long.len() > WINDOW && long.len() <= MAX_CONTEXT as usize, "{}", long.len());
-    assert_eq!(snapshot_format_version(), 5, "this test reads the version-5 blob layout");
+    assert_eq!(snapshot_format_version(), 6, "this test reads the version-6 blob layout");
 
     let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
         .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));

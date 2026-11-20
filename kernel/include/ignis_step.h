@@ -848,21 +848,28 @@ struct ignis_decode_options {
    * refuses them). NULL: the drafter's proposals, as always. */
   const int32_t *forced_drafts; /* [batch_size][speculative_window], or NULL */
   uint32_t forced_shape_window; /* 0, or the window of the shape a teacher-forced round runs at */
+  /* GitHub #689 (spec #684): receives the verify round's shape, one for all
+   * its lanes: 0 the base shape -- every round of a load of one shape -- or 1
+   * the extended shape of a DFlash2 load past IGNIS_BASE_SHAPE_DRAFT_TOKENS
+   * drafts. NULL asks for nothing; a plain round writes nothing. */
+  uint32_t *out_round_shape;
 };
 
 #ifdef __cplusplus
 /* Beside the `size` check, both sides pin the layout (here, and
  * crates/core/src/step_abi.rs's mirror test, on CPU): GitHub #267 appended
  * `forced_tokens` after every field the serving path sets, GitHub #590 the
- * host cut after it, and GitHub #692 the forced drafts and shape after that. */
-static_assert(sizeof(struct ignis_decode_options) == 128 &&
+ * host cut after it, GitHub #692 the forced drafts and shape after that,
+ * and GitHub #689 the round's shape after them. */
+static_assert(sizeof(struct ignis_decode_options) == 136 &&
                   offsetof(struct ignis_decode_options, out_logits) == 72 &&
                   offsetof(struct ignis_decode_options, forced_tokens) == 80 &&
                   offsetof(struct ignis_decode_options, host_cut_lanes) == 88 &&
                   offsetof(struct ignis_decode_options, host_cut) == 96 &&
                   offsetof(struct ignis_decode_options, host_cut_context) == 104 &&
                   offsetof(struct ignis_decode_options, forced_drafts) == 112 &&
-                  offsetof(struct ignis_decode_options, forced_shape_window) == 120,
+                  offsetof(struct ignis_decode_options, forced_shape_window) == 120 &&
+                  offsetof(struct ignis_decode_options, out_round_shape) == 128,
               "ignis_decode_options drifted from crates/core/src/step_abi.rs IgnisDecodeOptions");
 #endif
 

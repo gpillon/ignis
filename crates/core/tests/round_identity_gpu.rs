@@ -97,10 +97,28 @@
 //! The base shape of such a load is the round of a load at [`BASE_WINDOW`]
 //! drafts, token for token: the second test here
 //! ([`a_fifteen_draft_loads_base_rounds_commit_a_seven_draft_loads_tokens`])
-//! runs the session on `nvfp4-dflash2-w15` with the switch unset and on a load
-//! at [`BASE_WINDOW`] that reserves its context ([`Load::sized_for`]), and
-//! compares the two, greedy lanes and sampled ones, at every width; then a
+//! runs the session on `nvfp4-dflash2-w15` under [`ROUND_SHAPE`]`=base` and on
+//! a load at [`BASE_WINDOW`] that reserves its context ([`Load::sized_for`]),
+//! and compares the two, greedy lanes and sampled ones, at every width; then a
 //! verify round under a value the switch does not know is refused, naming it.
+//!
+//! # The shape rule (#689)
+//!
+//! With the switch unset a two-shape load's rounds take the shape the shape
+//! rule and the shape policy `all` give them: a round of 1 to
+//! [`EXTENDED_LANES`] lanes is extended when every lane in it asks, and a lane
+//! asks from its own earlier rounds. `nvfp4-dflash2-w15-rule` is such a load
+//! ([`Load::follows_the_rule`]), every arm of it, the reference included. The
+//! session keeps a mirror of each lane's ask, written from the spec's rule at
+//! the default thresholds ([`asks_after`]), moves it by every verify round's
+//! extent and accept (a cut round's by what the target accepted, before the
+//! cut), and holds each round's shape to it, so the rule's own shape changes
+//! fall wherever the text puts them, the same in every arm as in the
+//! reference. Then, at each width the extended shape runs, the session takes
+//! the same lanes from the base shape to the extended one and back, on a live
+//! verify round and on a teacher-forced one, by naming [`ROUND_SHAPE`] for one
+//! round at a time ([`CROSSING`]), and gives the rule the round after: a fold
+//! in flight, a forced round and each arm's switch all cross the change.
 //!
 //! # Loads and weights
 //!
@@ -235,18 +253,45 @@ const BASE_WINDOW: u32 = 7;
 const EXTENDED_LANES: usize = 4;
 /// The load whose base shape the second test holds to a 7-draft load's.
 const TWO_SHAPE_LOAD: &str = "nvfp4-dflash2-w15";
+/// #689: the shapes [`ROUND_SHAPE`] names, one round each, after which a
+/// rule load's lanes cross at each width the extended shape runs: from the
+/// base shape to the extended one and back, then the rule's own.
+const CROSSING: [Option<&str>; 4] = [Some("base"), Some("extended"), Some("base"), None];
+/// The kinds of round each crossing runs on: live and teacher-forced.
+const CROSSING_KINDS: [Round; 2] = [Round::Verify, Round::Forced];
 
 /// #687: the drafts a verify round of `width` lanes carries each lane on
 /// `load`: the load's window on a load of one shape; on a load of two, the
-/// window at the extended shape, where the load runs it
-/// ([`Load::round_shape`]), the round has no more than [`EXTENDED_LANES`]
-/// lanes and no lane the host cuts, and the base shape's [`BASE_WINDOW`]
-/// otherwise.
-fn round_drafts(load: &Load, width: usize, host_cut: bool) -> u32 {
+/// window at the extended shape, where the round has no more than
+/// [`EXTENDED_LANES`] lanes and no lane the host cuts and the shape [`ROUND_SHAPE`]
+/// names (`named`) is `extended`, or (#689) with it unset every lane asks
+/// (`every_lane_asks`), and the base shape's [`BASE_WINDOW`] otherwise.
+fn round_drafts(load: &Load, width: usize, host_cut: bool, named: Option<&str>, every_lane_asks: bool) -> u32 {
     if !load.two_shapes() {
         return load.window;
     }
-    if load.round_shape == Some("extended") && width <= EXTENDED_LANES && !host_cut { load.window } else { BASE_WINDOW }
+    let extended = width <= EXTENDED_LANES
+        && !host_cut
+        && match named {
+            Some(value) => value == "extended",
+            None => every_lane_asks,
+        };
+    if extended { load.window } else { BASE_WINDOW }
+}
+
+/// #689: the spec's shape rule at the default thresholds (enter on all 7 of
+/// a full base round, stay on 6): what a lane asks of its next round after
+/// one at `extended` (else the base shape) of `extent` drafts of which the
+/// target took `accepted`, having asked `asked`.
+fn asks_after(asked: bool, extended: bool, extent: u32, accepted: u32) -> bool {
+    let rule = ignis_core::ShapeRule::default();
+    if extended {
+        accepted >= rule.stay_accepted()
+    } else if extent < BASE_WINDOW {
+        asked
+    } else {
+        accepted >= rule.enter_accepted()
+    }
 }
 
 /// One 27B load every arm runs on.
@@ -364,6 +409,21 @@ const LOADS: &[Load] = &[
     // #688's loads, below this line.
 
     // #689's loads, below this line.
+    // DFlash2 at 15 drafts under the shape rule, every arm with the switch
+    // unset: its rounds take the shape their lanes ask, and its session
+    // crosses the shapes at widths 1-4.
+    Load {
+        name: "nvfp4-dflash2-w15-rule",
+        artifact: NVFP4,
+        backend: SpeculativeBackend::Dflash2,
+        window: 15,
+        draft_rule: DraftRule::Sampled,
+        lanes: 8,
+        vision: false,
+        exceptions: true,
+        sized_for: None,
+        round_shape: None,
+    },
 
     // #691's loads, below this line.
 
@@ -458,8 +518,21 @@ impl Load {
     fn context(&self) -> u32 {
         let window = self.sized_for.unwrap_or(self.window);
         let rounds = PLAIN_ROUNDS + CONSTRAINED_ROUNDS + (VERIFY_ROUNDS + CUT_ROUNDS + FORCED_ROUNDS) * (window + 1);
-        let tokens = PROMPT_TOKENS + (self.lanes + 1) * rounds;
+        // #689: and on a rule load, a crossing at each width the extended
+        // shape runs.
+        let crossings = if self.follows_the_rule() {
+            self.lanes.min(EXTENDED_LANES as u32) * (CROSSING.len() * CROSSING_KINDS.len()) as u32 * (window + 1)
+        } else {
+            0
+        };
+        let tokens = PROMPT_TOKENS + (self.lanes + 1) * rounds + crossings;
         tokens.div_ceil(128) * 128
+    }
+
+    /// #689: whether the load's rounds take the shape the shape rule gives
+    /// them: a load of two shapes with [`ROUND_SHAPE`] unset.
+    fn follows_the_rule(&self) -> bool {
+        self.two_shapes() && self.round_shape.is_none()
     }
 
     /// #687: whether the load holds two round shapes: DFlash2 past
@@ -530,6 +603,17 @@ fn apply(arm: &Arm, round_shape: Option<&str>) {
     for &(name, value) in arm.switches {
         // SAFETY: as above.
         unsafe { std::env::set_var(name, value) };
+    }
+}
+
+/// #689: [`ROUND_SHAPE`] set to `named` for the rounds after, or removed.
+fn set_round_shape(named: Option<&str>) {
+    // SAFETY (test-only): as in `apply`.
+    unsafe {
+        match named {
+            Some(value) => std::env::set_var(ROUND_SHAPE, value),
+            None => std::env::remove_var(ROUND_SHAPE),
+        }
     }
 }
 
@@ -736,18 +820,26 @@ fn ride(
     (round, count): (Round, u32),
     committed: &mut Committed,
     cuts: &mut u32,
+    asks: &mut [bool],
+    named: Option<&str>,
     label: &str,
 ) {
     let width = riding.len();
     for at in 0..count {
         let what = format!("{label}: width {width} {round:?} round {at}");
         let mut refs = riders(seqs, riding);
+        // #689: the drafts each lane's round shape carries, from what its
+        // lanes ask and the shape the switch names.
+        let every_lane_asks = riding.iter().all(|&lane| asks[lane]);
         match round {
             Round::Verify | Round::Cut => {
                 let lanes: Vec<VerifyLane<'_>> =
                     riding.iter().map(|&lane| VerifyLane { sampling: sampling(lane), ..VerifyLane::greedy(&[]) }).collect();
+                // #689: what the target accepted of a cut lane's run, before the cut.
+                let mut accepted_before_cut = vec![0u32; width];
                 let runs = if round == Round::Cut {
-                    let mut cut = |_lane: usize, run: &[i32]| -> usize {
+                    let mut cut = |lane: usize, run: &[i32]| -> usize {
+                        accepted_before_cut[lane] = run.len() as u32 - 1;
                         if run.len() < 2 {
                             return 1;
                         }
@@ -761,9 +853,12 @@ fn ride(
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
                 expect_replay(model, pool, graphs, &what);
                 // #687: every lane drafts its round shape's whole window.
-                let drafts = round_drafts(load, width, round == Round::Cut);
-                for (&lane, run) in riding.iter().zip(runs) {
+                let drafts = round_drafts(load, width, round == Round::Cut, named, every_lane_asks);
+                for (index, (&lane, run)) in riding.iter().zip(runs).enumerate() {
                     assert_eq!(run.extent, drafts, "{what}: lane {lane} drafts its round shape's whole window");
+                    assert_eq!(run.extended, load.two_shapes() && drafts == load.window, "{what}: lane {lane}'s round shape");
+                    let accepted = if round == Round::Cut { accepted_before_cut[index] } else { run.tokens.len() as u32 - 1 };
+                    asks[lane] = asks_after(asks[lane], run.extended, run.extent, accepted);
                     committed[lane].extend(run.tokens);
                     committed[lane].push(-1);
                 }
@@ -794,7 +889,12 @@ fn ride(
                     .unwrap_or_else(|e| panic!("{what}: {e}"));
                 let on_device = lanes.iter().any(|lane| lane.sampling.temperature > 0.0);
                 expect_replay(model, pool, graphs && !on_device, &what);
+                // #689: a teacher-forced round takes its shape as a live one does.
+                let drafts = round_drafts(load, width, false, named, every_lane_asks);
                 for (&lane, run) in riding.iter().zip(runs) {
+                    assert_eq!(run.extent, drafts, "{what}: lane {lane} drafts its round shape's whole window");
+                    assert_eq!(run.extended, load.two_shapes() && drafts == load.window, "{what}: lane {lane}'s round shape");
+                    asks[lane] = asks_after(asks[lane], run.extended, run.extent, run.tokens.len() as u32 - 1);
                     committed[lane].extend(run.tokens);
                     committed[lane].push(-1);
                 }
@@ -822,8 +922,11 @@ fn session(model: &Model, pool: &SeqPool, load: &Load, script: &Script, sampling
     let mut seqs: Vec<Option<Seq<'_>>> = Vec::with_capacity(lanes);
     let mut committed: Committed = vec![Vec::new(); lanes];
     let mut cuts = 0;
-    let mut rides = |seqs: &mut [Option<Seq<'_>>], riding: &[usize], rounds: (Round, u32)| {
-        ride(model, pool, load, script, seqs, riding, sampling, graphs, rounds, &mut committed, &mut cuts, label);
+    // #689: each lane's ask, as the spec's rule moves it; a lane with no
+    // history asks nothing.
+    let mut asks = vec![false; lanes];
+    let mut rides = |seqs: &mut [Option<Seq<'_>>], riding: &[usize], rounds: (Round, u32), named: Option<&str>| {
+        ride(model, pool, load, script, seqs, riding, sampling, graphs, rounds, &mut committed, &mut cuts, &mut asks, named, label);
     };
     for width in 1..=lanes {
         let lane = width - 1;
@@ -831,19 +934,29 @@ fn session(model: &Model, pool: &SeqPool, load: &Load, script: &Script, sampling
         prefill(model, pool, &mut seq, &script.prompts[lane], sampling(lane), load.vision && lane == 0, &format!("{label}: lane {lane}"));
         seqs.push(Some(seq));
         let riding: Vec<usize> = (0..width).collect();
-        rides(&mut seqs, &riding, (Round::Plain, PLAIN_ROUNDS));
-        rides(&mut seqs, &riding, (Round::Verify, VERIFY_ROUNDS / 2));
-        rides(&mut seqs, &riding, (Round::Constrained, CONSTRAINED_ROUNDS));
-        rides(&mut seqs, &riding, (Round::Cut, CUT_ROUNDS));
-        rides(&mut seqs, &riding, (Round::Forced, FORCED_ROUNDS));
-        rides(&mut seqs, &riding, (Round::Verify, VERIFY_ROUNDS - VERIFY_ROUNDS / 2));
+        rides(&mut seqs, &riding, (Round::Plain, PLAIN_ROUNDS), load.round_shape);
+        rides(&mut seqs, &riding, (Round::Verify, VERIFY_ROUNDS / 2), load.round_shape);
+        rides(&mut seqs, &riding, (Round::Constrained, CONSTRAINED_ROUNDS), load.round_shape);
+        rides(&mut seqs, &riding, (Round::Cut, CUT_ROUNDS), load.round_shape);
+        rides(&mut seqs, &riding, (Round::Forced, FORCED_ROUNDS), load.round_shape);
+        rides(&mut seqs, &riding, (Round::Verify, VERIFY_ROUNDS - VERIFY_ROUNDS / 2), load.round_shape);
+        if load.follows_the_rule() && width <= EXTENDED_LANES {
+            // #689: the same lanes from the base shape to the extended one and
+            // back, one round at each shape the switch names, then the rule's.
+            for kind in CROSSING_KINDS {
+                for named in CROSSING {
+                    set_round_shape(named);
+                    rides(&mut seqs, &riding, (kind, 1), named);
+                }
+            }
+        }
     }
     if lanes > 1 {
         for seq in seqs.iter_mut().skip(1).step_by(2) {
             *seq = None;
         }
         let riding: Vec<usize> = (0..lanes).step_by(2).collect();
-        rides(&mut seqs, &riding, (Round::Verify, VERIFY_ROUNDS));
+        rides(&mut seqs, &riding, (Round::Verify, VERIFY_ROUNDS), load.round_shape);
         // GitHub #676: each lane's state through a snapshot taken right after
         // that verify round, and back.
         for &lane in &riding {
@@ -851,7 +964,7 @@ fn session(model: &Model, pool: &SeqPool, load: &Load, script: &Script, sampling
             let blob = seq.snapshot().unwrap_or_else(|e| panic!("{label}: snapshot lane {lane}: {e}"));
             seq.restore(&blob).unwrap_or_else(|e| panic!("{label}: restore lane {lane}: {e}"));
         }
-        rides(&mut seqs, &riding, (Round::Plain, PLAIN_ROUNDS));
+        rides(&mut seqs, &riding, (Round::Plain, PLAIN_ROUNDS), load.round_shape);
     }
     assert!(cuts > 0, "{label}: no verify run of two or more was cut, so no cut took a count back");
     committed
@@ -905,12 +1018,13 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
     println!("round_identity_gpu {label}: arm `{}`: {left} verify rounds returned with their fold in flight", arm.name);
     // #687: a load under `extended` ran extended rounds, and an arm with no
     // graph ran every one of them eagerly; one under the base shape ran none.
+    // #689: so did a load under the rule, whose crossings name `extended`.
     if let (Some((rounds_before, eager_before)), Some((rounds_after, eager_after))) = (extended_before, extended_rounds()) {
         let (rounds, eager) = (rounds_after - rounds_before, eager_after - eager_before);
-        if load.round_shape == Some("extended") {
-            assert!(rounds > 0, "{label}: {}: no verify round ran at the extended shape", arm.name);
-        } else {
+        if load.round_shape == Some("base") {
             assert_eq!(rounds, 0, "{label}: {}: verify rounds ran at the extended shape", arm.name);
+        } else {
+            assert!(rounds > 0, "{label}: {}: no verify round ran at the extended shape", arm.name);
         }
         if !arm.graphs {
             assert_eq!(eager, rounds, "{label}: {}: an extended round replayed a graph", arm.name);
@@ -1086,7 +1200,7 @@ fn every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_wi
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn a_fifteen_draft_loads_base_rounds_commit_a_seven_draft_loads_tokens() {
     let wide = LOADS.iter().find(|load| load.name == TWO_SHAPE_LOAD).expect("the two-shape load is in LOADS");
-    let base = Load { round_shape: None, ..*wide };
+    let base = Load { round_shape: Some("base"), ..*wide };
     let seven = Load { name: "nvfp4-dflash2-w7-at-the-w15-context", window: BASE_WINDOW, sized_for: Some(wide.window), round_shape: None, ..*wide };
     assert_eq!(seven.context(), base.context(), "both loads reserve one context");
     let weights = selected("IGNIS_ROUND_IDENTITY_WEIGHTS", &ExceptionWeights::NAMES);

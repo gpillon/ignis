@@ -1310,6 +1310,8 @@ struct LoadOptions {
   uint32_t draft_rule = IGNIS_DRAFT_RULE_FIXED;
   float drafter_temperature_factor = 0.0f;
   float drafter_top_p = 1.0f;
+  // GitHub #689: the shape rule's thresholds, on a load of two round shapes.
+  ignis::round_shape::ShapeRule shape_rule{};
 };
 
 // The current device's compute capability major, which a load's route choices read: false (error
@@ -1608,6 +1610,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   uint32_t draft_rule = IGNIS_DRAFT_RULE_FIXED;
   float drafter_temperature_factor = 0.0f;
   float drafter_top_p = 1.0f;
+  ignis::round_shape::ShapeRule shape_rule{};
   ignis::RopeScaling rope_scaling{};
   if (options != nullptr) {
     if (options->size != sizeof(struct ignis_model_load_options)) {
@@ -1631,6 +1634,13 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     draft_rule = options->draft_rule;
     drafter_temperature_factor = options->drafter_temperature_factor;
     drafter_top_p = options->drafter_top_p;
+    // GitHub #689: 0 is the rule's default threshold.
+    if (options->shape_enter_accepted != 0) {
+      shape_rule.enter_accepted = options->shape_enter_accepted;
+    }
+    if (options->shape_stay_accepted != 0) {
+      shape_rule.stay_accepted = options->shape_stay_accepted;
+    }
   }
   // GitHub #335: a value the leaf does not know is refused rather than run as
   // one of the three.
@@ -1740,6 +1750,20 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
       return nullptr;
     }
   }
+  // GitHub #689: on a load of two round shapes, a threshold no round could
+  // meet -- an entry past the base window, a stay past the load's own -- is
+  // refused by name rather than served as a rule that never holds a lane at
+  // the extended shape. Every other load never reads them.
+  if (ignis::round_shape::has_extended_shape(speculative_backend, draft_tokens)) {
+    if (const char *field = ignis::round_shape::refused_threshold(shape_rule, static_cast<std::int32_t>(draft_tokens))) {
+      const bool enter = std::string(field) == "shape_enter_accepted";
+      set_error("ignis_model_load: " + std::string(field) + " " +
+                std::to_string(enter ? shape_rule.enter_accepted : shape_rule.stay_accepted) + " must be in 1.." +
+                std::to_string(enter ? IGNIS_BASE_SHAPE_DRAFT_TOKENS : draft_tokens) +
+                (enter ? ", the drafts a base round takes" : ", the drafts this load's extended round takes"));
+      return nullptr;
+    }
+  }
   // GitHub #195: vision and a speculative backend are two independent load
   // options. #178's fence stood until the verify round learned the sequence's
   // `rope_delta` (`IgnisVerifyRound::rope_positions`, staged per round); the
@@ -1763,6 +1787,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.draft_rule = draft_rule;
   out.drafter_temperature_factor = drafter_temperature_factor;
   out.drafter_top_p = drafter_top_p;
+  out.shape_rule = shape_rule;
   // The routes a load decides from the card and a measurement switch, and the switches it reads
   // on their own, in this order, so a value a switch does not know refuses the plan and the load by
   // name: IGNIS_HQ_DECODE_ATTENTION (GitHub #572), IGNIS_PREFILL_SWIGLU (GitHub #651, #653: unset
@@ -3085,6 +3110,8 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       if (sizes.extended_window != 0) {
         model->extended_shape =
             build_extended_shape(*topology, sizes.extended_window, sizes.extended_lanes, *model->base_shape);
+        // GitHub #689: the thresholds its rounds' shape rule reads.
+        model->shape_rule = load.shape_rule;
       }
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: drafter round allocation failed: ") + e.what());

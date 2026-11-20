@@ -218,6 +218,7 @@ fn speculative_rounds_add_up_on_the_done_event() {
             // each; only the first committed them.
             drafted_at: at_positions(&[2, 2]),
             accepted_at: at_positions(&[1, 1]),
+            extended_rounds: 0,
         })
     );
 }

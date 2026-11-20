@@ -288,7 +288,7 @@ text before the loop, with a nudge. See
 
 **Round shape.** The columns a lane and the most lanes of a 27B verify round:
 the *base shape*, or from 0.11.0 on a DFlash2 load past 7 drafts the *extended
-shape*, one for all of a round's lanes. See
+shape*, one for all of a round's lanes, which the *shape rule* chooses. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **Row budget.** The most rows one Flash-Next MTP verify round may take across all
@@ -300,6 +300,13 @@ samples (`--spec-draft-rule sampled`, from 0.11.0): the drafter draws each draft
 from its own distribution and the round takes it by the ratio of the model's
 probability to the drafter's, so the text keeps the model's distribution. See
 [speculative decoding](../concepts/speculative-decoding.md#acceptance-under-sampling).
+
+**Shape rule.** From 0.11.0, on a DFlash2 load past 7 drafts, what each request
+asks of its next verify round from its own earlier rounds: the *extended shape*
+after a base round that took all 7 drafts, while its extended rounds take 6 or
+more (`--spec-shape-enter-accepted`, `--spec-shape-stay-accepted`), the *base
+shape* otherwise. A round of 1 to 4 lanes is extended when every lane in it asks.
+See [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **Scope.** A model family's own section of a field: `qwen38` for the 27B,
 `qwen38flashnext` for Flash-Next. A value in a scope wins over the general one

@@ -564,9 +564,7 @@ bool read_round_timing(ignis_model *model) {
   for (RoundTiming *timing : {&model->plain_timing, &model->verify_timing}) {
     timing->recorded = 0;
     timing->collected = 0;
-    timing->period.clear();
-    timing->span.clear();
-    timing->gap.clear();
+    timing->blocks = {};
     for (std::uint64_t i = 0; model->round_timing && i < RoundTiming::kRing; ++i) {
       for (cudaEvent_t *event : {&timing->pre[i], &timing->post[i]}) {
         const cudaError_t err = *event == nullptr ? cudaEventCreate(event) : cudaSuccess;

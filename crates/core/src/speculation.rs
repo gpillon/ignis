@@ -489,8 +489,61 @@ impl DrafterSampling {
     }
 }
 
+/// GitHub #689 (spec #684): the **shape rule**'s thresholds on a DFlash2
+/// load with an extended round shape (`kernel/src/round_shape.h`
+/// `asks_extended`): a lane asks the extended shape after a base round that
+/// drafted the base shape's whole window and had at least `enter_accepted` of
+/// it taken, and keeps asking while its extended rounds take at least
+/// `stay_accepted`. The server's `spec.shape_enter_accepted` and
+/// `spec.shape_stay_accepted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShapeRule {
+    enter_accepted: u32,
+    stay_accepted: u32,
+}
+
+impl ShapeRule {
+    /// Every draft of a full base window, to enter.
+    pub const DEFAULT_ENTER_ACCEPTED: u32 = BASE_SHAPE_DRAFT_TOKENS;
+    /// Six drafts of an extended round, to stay.
+    pub const DEFAULT_STAY_ACCEPTED: u32 = 6;
+
+    /// `enter_accepted` in `1..=`[`BASE_SHAPE_DRAFT_TOKENS`] and
+    /// `stay_accepted` in `1..=`[`DFLASH2_MAX_DRAFT_TOKENS`]; the refusal
+    /// names the threshold and its range. Whether a load's own window can
+    /// meet the stay threshold is [`Speculation::with_shape_rule`]'s.
+    pub fn new(enter_accepted: u32, stay_accepted: u32) -> Result<Self, String> {
+        if !(1..=BASE_SHAPE_DRAFT_TOKENS).contains(&enter_accepted) {
+            return Err(format!(
+                "the shape rule's entry threshold {enter_accepted} is not in 1..={BASE_SHAPE_DRAFT_TOKENS}, the drafts a base round takes"
+            ));
+        }
+        if !(1..=DFLASH2_MAX_DRAFT_TOKENS).contains(&stay_accepted) {
+            return Err(format!(
+                "the shape rule's stay threshold {stay_accepted} is not in 1..={DFLASH2_MAX_DRAFT_TOKENS}, the drafts an extended round takes"
+            ));
+        }
+        Ok(Self { enter_accepted, stay_accepted })
+    }
+
+    pub fn enter_accepted(&self) -> u32 {
+        self.enter_accepted
+    }
+
+    pub fn stay_accepted(&self) -> u32 {
+        self.stay_accepted
+    }
+}
+
+impl Default for ShapeRule {
+    fn default() -> Self {
+        Self { enter_accepted: Self::DEFAULT_ENTER_ACCEPTED, stay_accepted: Self::DEFAULT_STAY_ACCEPTED }
+    }
+}
+
 /// A validated speculation option: a backend, its draft window, the
-/// drafter's proposal head and the rounds' draft rule.
+/// drafter's proposal head, the rounds' draft rule and (GitHub #689) the
+/// shape rule's thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Speculation {
     backend: SpeculativeBackend,
@@ -498,6 +551,7 @@ pub struct Speculation {
     proposal_head: ProposalHead,
     draft_rule: DraftRule,
     drafter_sampling: DrafterSampling,
+    shape_rule: ShapeRule,
 }
 
 impl Speculation {
@@ -514,7 +568,26 @@ impl Speculation {
             proposal_head: ProposalHead::Full,
             draft_rule: DraftRule::Fixed,
             drafter_sampling: DrafterSampling::default(),
+            shape_rule: ShapeRule::default(),
         })
+    }
+
+    /// The same option with its rounds' shapes chosen by `shape_rule`
+    /// (GitHub #689). On a load with an extended shape a stay threshold past
+    /// the load's window could never keep a lane there, and is refused naming
+    /// the threshold and the window; every other load never reads the rule.
+    pub fn with_shape_rule(self, shape_rule: ShapeRule) -> Result<Self, String> {
+        if self.round_shapes(1).1.is_some() && shape_rule.stay_accepted > self.draft_tokens {
+            return Err(format!(
+                "the shape rule's stay threshold {} is past the window of {} drafts, which no extended round can take",
+                shape_rule.stay_accepted, self.draft_tokens
+            ));
+        }
+        Ok(Self { shape_rule, ..self })
+    }
+
+    pub fn shape_rule(&self) -> ShapeRule {
+        self.shape_rule
     }
 
     /// The same option with the drafter scoring through `proposal_head`.
