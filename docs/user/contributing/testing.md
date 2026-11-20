@@ -224,7 +224,8 @@ the other. They are no configuration fields: `GET /v1/config` and
   two-lane round at the base shape, a prefill chunk of 9 to 16 tokens) runs
   the product of FP8 activations on a tile of 16 tokens and 64 output rows,
   whose outputs are the 128-token tile's byte for byte
-  (`ignis_kernel_fp8_exception_arms_test`). A call of 8 tokens or
+  (`ignis_kernel_fp8_exception_arms_test`), so the tokens are the same (the
+  round identity test below, arm `fp8-w8a8-tile128`). A call of 8 tokens or
   fewer keeps its BF16-activation GEMV and one of 17 or more the 128-token
   tile either way, Flash-Next's FP8 projections are their own, and a `bf16`
   load runs no such product. It is read at each call, so a graph keeps the
@@ -270,8 +271,10 @@ after a verify round, on the NVFP4 artifact with DFlash2, with its MTP head and 
 the 16 GB and 12 GB classes' trellis artifacts, each under the exception
 weights it has. From 0.11.0 it also loads DFlash2 at 15 and 10 draft tokens
 and vision at 15, under `IGNIS_ROUND_SHAPE=extended`, so every arm holds the
-extended round at 1 to 4 lanes and the base round past them, and a second test
-holds a 15-draft load's base rounds to a 7-draft load's tokens. Each arm is
+extended round at 1 to 4 lanes and the base round past them, a second test
+holds a 15-draft load's base rounds to a 7-draft load's tokens, and a third
+holds a prefill whose last chunk is 9 to 16 tokens to the same logits, bit for
+bit, under `IGNIS_FP8_W8A8_TILE16=0` as unset. Each arm is
 held to the graphs' replay with every switch unset; a change behind a switch
 of its own adds that switch as an arm, as the file says. The whole run
 materializes fourteen loads in turn, so a narrow one is
