@@ -183,21 +183,70 @@ impl ContextCharge {
 /// never more. The figure moves with the kernels a load runs:
 /// `vram_reload_gpu`'s shape left 2 MiB less of it than the Makefile's on
 /// 2026-10-15 and, with the copying graphs, as much to 4 KiB from #339 on;
-/// the build before #324's vision patch 4 KiB less.
+/// the build before #324's vision patch 4 KiB less. It is eight lanes'
+/// state: a load of fewer lanes (GitHub #336) captures fewer graphs and
+/// leaves less. On 2026-11-20 (GitHub #687), at `vram_reload_gpu`'s shape
+/// against a context measured at 452,161,536 B (452,030,464 at four lanes), a
+/// 7-draft load's process held 460,988,416 B after its teardown at one lane,
+/// 467,279,872 at two, 473,571,328 at three and 479,862,784 at four, so a
+/// reload there adds back up to 49.9 MB more than the process holds, more
+/// than the card has; no test holds those lanes yet.
 pub const QWEN27B_PROCESS_STATE_BYTES: u64 = 58_728_448;
 
-/// Set once a 27B load has run in this process (GitHub #324).
-static QWEN27B_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// What a 27B load with an extended round shape (GitHub #687: DFlash2 past
+/// seven drafts) leaves on the device once torn down beyond
+/// [`QWEN27B_PROCESS_STATE_BYTES`], by the extended shape's lanes, 1 to 4
+/// (`ignis_core::EXTENDED_SHAPE_MAX_LANES`): driver state the context keeps
+/// after the extended shape's verify and append graphs are gone, as it keeps
+/// the base shape's. Read from the same WDDM counter on the RTX 5090 (driver
+/// 610.88) on 2026-11-20 at `vram_reload_gpu`'s shape, as what one process
+/// held after a 15-draft load's teardown less what it held after a 7-draft
+/// load's at the same lanes: 2,101,248 B at one lane and 8,392,704 at two
+/// (each twice), 16,781,312 at three, 20,975,616 at four, and at eight lanes,
+/// whose extended shape has four, 18,878,464 at windows of 8 and 15 alike and
+/// under `IGNIS_DECODE_GRAPH_COPIES=1` too (536,485,888 B, then 555,364,352).
+/// Four lanes take the lower reading. A cold 15-draft load's process held
+/// 534,388,736 B after its teardown, a cold 7-draft load's 513,417,216: the
+/// same state, 2 MiB apart from one run to the next. It is kept for the
+/// context's life: a 7-draft load after a 15-draft one leaves the process
+/// holding what the 15-draft load left. The widest, 77,606,912 B with
+/// [`QWEN27B_PROCESS_STATE_BYTES`], is still under the 83,894,272 B of the
+/// 27B's state that [`LOAD_RESIDUAL_BYTES`] was measured with, so a reload's
+/// plan charges it again.
+pub const QWEN27B_EXTENDED_SHAPE_STATE_BYTES: [u64; 4] = [2_101_248, 8_392_704, 16_781_312, 18_878_464];
 
-/// Records that a 27B load ran in this process: from then on the process
-/// holds [`QWEN27B_PROCESS_STATE_BYTES`], whatever it loads next.
-pub fn note_qwen27b_loaded() {
-    QWEN27B_LOADED.store(true, std::sync::atomic::Ordering::Relaxed);
+/// What a 27B load whose extended round shape is `extended` (none on a load
+/// at seven drafts or fewer) leaves on the device beside the CUDA context once
+/// torn down: [`QWEN27B_PROCESS_STATE_BYTES`], and its extended shape's
+/// [`QWEN27B_EXTENDED_SHAPE_STATE_BYTES`].
+pub fn qwen27b_state_after(extended: Option<ignis_core::RoundShape>) -> u64 {
+    let extended_bytes = extended.map_or(0, |shape| {
+        let lanes = shape.lanes.clamp(1, QWEN27B_EXTENDED_SHAPE_STATE_BYTES.len() as u32);
+        QWEN27B_EXTENDED_SHAPE_STATE_BYTES[lanes as usize - 1]
+    });
+    QWEN27B_PROCESS_STATE_BYTES + extended_bytes
+}
+
+/// The 27B's per-process state this process holds (GitHub #324, #687): 0
+/// until a 27B load has run, then the most any of its 27B loads left.
+static QWEN27B_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records that a 27B load ran in this process, its extended round shape
+/// `extended`: from then on the process holds what the widest of its 27B
+/// loads left ([`qwen27b_state_after`]), whatever it loads next.
+pub fn note_qwen27b_loaded(extended: Option<ignis_core::RoundShape>) {
+    QWEN27B_STATE.fetch_max(qwen27b_state_after(extended), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether a 27B load has run in this process ([`note_qwen27b_loaded`]).
 pub fn qwen27b_loaded() -> bool {
-    QWEN27B_LOADED.load(std::sync::atomic::Ordering::Relaxed)
+    qwen27b_state() != 0
+}
+
+/// The 27B's per-process state this process holds ([`note_qwen27b_loaded`]):
+/// 0 until a 27B load has run.
+pub fn qwen27b_state() -> u64 {
+    QWEN27B_STATE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// What a load adds back to the free memory NVML reads ([`held_before_load`]),
@@ -236,9 +285,11 @@ impl HeldSource {
 /// than the plan's lines charge again for it. Nothing on the process's first
 /// load, which reads before its `context` exists. Once it exists the plan
 /// charges again the context, its `cuda_context` line, and on a 27B plan,
-/// whose `residual` line charges it, the 27B's per-process state once a 27B
-/// load has run (`qwen27b_loaded`); Flash-Next's plan has no residual line,
-/// and its own per-process state is not measured, so it charges again the
+/// whose `residual` line charges it, the 27B's per-process state,
+/// `qwen27b_state` (what [`qwen27b_state`] reads: 0 before a 27B load has run,
+/// more once one with an extended round shape has); Flash-Next's plan has no
+/// residual line, and its own per-process state is not measured, so it
+/// charges again the
 /// context only. The add-back is `process_bytes`, the driver's own figure for
 /// this process, where there is one, capped at what the plan charges again;
 /// without one, what the plan charges again. With a figure, a model switch or
@@ -248,17 +299,13 @@ impl HeldSource {
 /// above the cap does too. A family's state the plan does not charge is never
 /// added back, so a budget is never more than the card has.
 pub fn held_before_load(
-    family: ignis_core::compute::ModelFamily, context: Option<ContextCharge>, qwen27b_loaded: bool,
+    family: ignis_core::compute::ModelFamily, context: Option<ContextCharge>, qwen27b_state: u64,
     process_bytes: Option<u64>,
 ) -> ProcessHeld {
     let Some(context) = context else {
         return ProcessHeld { bytes: 0, source: HeldSource::Nothing };
     };
-    let qwen27b_state = if family == ignis_core::compute::ModelFamily::Qwen38_27b && qwen27b_loaded {
-        QWEN27B_PROCESS_STATE_BYTES
-    } else {
-        0
-    };
+    let qwen27b_state = if family == ignis_core::compute::ModelFamily::Qwen38_27b { qwen27b_state } else { 0 };
     let charged_again = context.bytes + qwen27b_state;
     match process_bytes {
         Some(bytes) => ProcessHeld { bytes: bytes.min(charged_again), source: HeldSource::PerProcess },
@@ -296,7 +343,7 @@ pub fn plan_start(family: ignis_core::compute::ModelFamily) -> Result<(PlanStart
         CudaDevice::nvml_memory(0).map_err(|e| format!("VRAM budget: free memory is unreadable: {e}"))?;
     let context = CudaDevice::context_reading().map(ContextCharge::of);
     let process_bytes = context.and_then(|_| CudaDevice::nvml_process_bytes(0));
-    let held = held_before_load(family, context, qwen27b_loaded(), process_bytes);
+    let held = held_before_load(family, context, qwen27b_state(), process_bytes);
     let device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
     // This device made the context, or an earlier one did: it was measured then.
     let reading = CudaDevice::context_reading().unwrap_or(ContextReading::Unreadable);
@@ -2818,7 +2865,7 @@ mod tests {
         // 511,324,160, both above what the 5080 holds.
         for context in [241_200_000, CUDA_CONTEXT_BYTES] {
             assert_eq!(
-                held_before_load(Qwen38_27b, measured(context), true, Some(RTX5080_HELD)),
+                held_before_load(Qwen38_27b, measured(context), STATE, Some(RTX5080_HELD)),
                 ProcessHeld { bytes: RTX5080_HELD, source: HeldSource::PerProcess },
                 "context {context}"
             );
@@ -2829,7 +2876,7 @@ mod tests {
     fn a_per_process_figure_above_what_the_plan_charges_again_is_capped() {
         use ignis_core::compute::ModelFamily::Qwen38_27b;
         assert_eq!(
-            held_before_load(Qwen38_27b, measured(CONTEXT), true, Some(CONTEXT + STATE + (100 << 20))),
+            held_before_load(Qwen38_27b, measured(CONTEXT), STATE, Some(CONTEXT + STATE + (100 << 20))),
             ProcessHeld { bytes: 577_998_848, source: HeldSource::PerProcess },
             "the measured context and the 27B's state, no more"
         );
@@ -2839,22 +2886,44 @@ mod tests {
     fn without_a_per_process_figure_what_the_plan_charges_again_is_added_back() {
         use ignis_core::compute::ModelFamily::Qwen38_27b;
         let charged_again = |bytes| ProcessHeld { bytes, source: HeldSource::ChargedAgain };
-        assert_eq!(held_before_load(Qwen38_27b, measured(CONTEXT), true, None), charged_again(577_998_848));
+        assert_eq!(held_before_load(Qwen38_27b, measured(CONTEXT), STATE, None), charged_again(577_998_848));
         assert_eq!(
-            held_before_load(Qwen38_27b, measured(CONTEXT), false, None),
+            held_before_load(Qwen38_27b, measured(CONTEXT), 0, None),
             charged_again(CONTEXT),
             "no 27B has run"
         );
         let fallback = Some(ContextCharge { bytes: CUDA_CONTEXT_BYTES, source: ContextSource::Fallback });
         assert_eq!(
-            held_before_load(Qwen38_27b, fallback, true, None),
+            held_before_load(Qwen38_27b, fallback, STATE, None),
             charged_again(511_324_160),
             "#324's two constants"
         );
         // A first load reads before its context exists: nothing is held.
         let nothing = ProcessHeld { bytes: 0, source: HeldSource::Nothing };
-        assert_eq!(held_before_load(Qwen38_27b, None, false, Some(RTX5080_HELD)), nothing);
-        assert_eq!(held_before_load(Qwen38_27b, None, true, None), nothing);
+        assert_eq!(held_before_load(Qwen38_27b, None, 0, Some(RTX5080_HELD)), nothing);
+        assert_eq!(held_before_load(Qwen38_27b, None, STATE, None), nothing);
+    }
+
+    #[test]
+    fn a_load_past_seven_drafts_leaves_its_extended_shapes_state_and_a_reload_adds_it_back() {
+        use ignis_core::compute::ModelFamily::Qwen38_27b;
+        // GitHub #687: a load at seven drafts or fewer leaves the 27B's state,
+        // one past seven that and its extended shape's, by that shape's lanes.
+        let extended = |lanes| Some(ignis_core::RoundShape { window: 15, lanes });
+        assert_eq!(qwen27b_state_after(None), STATE);
+        assert_eq!(qwen27b_state_after(extended(1)), STATE + 2_101_248);
+        assert_eq!(qwen27b_state_after(extended(4)), 77_606_912, "the extended shape of eight lanes, four lanes");
+        let charged_again = |bytes| ProcessHeld { bytes, source: HeldSource::ChargedAgain };
+        assert_eq!(
+            held_before_load(Qwen38_27b, measured(CONTEXT), qwen27b_state_after(extended(4)), None),
+            charged_again(CONTEXT + 77_606_912)
+        );
+        // The state is the context's for its life: a 7-draft load after a
+        // 15-draft one leaves what the 15-draft load left.
+        note_qwen27b_loaded(extended(4));
+        note_qwen27b_loaded(None);
+        assert_eq!(qwen27b_state(), 77_606_912);
+        assert!(qwen27b_loaded());
     }
 
     #[test]
@@ -2864,7 +2933,7 @@ mod tests {
         // has no residual line, so it charges again the context only.
         for (figure, source) in [(None, HeldSource::ChargedAgain), (Some(CONTEXT + STATE), HeldSource::PerProcess)] {
             assert_eq!(
-                held_before_load(FlashNext, measured(CONTEXT), true, figure),
+                held_before_load(FlashNext, measured(CONTEXT), STATE, figure),
                 ProcessHeld { bytes: CONTEXT, source }
             );
         }
@@ -2879,12 +2948,12 @@ mod tests {
         let per_process = |bytes| ProcessHeld { bytes, source: HeldSource::PerProcess };
         // Flash-Next first, then the 27B: no 27B state yet.
         assert_eq!(
-            held_before_load(Qwen38_27b, measured(CONTEXT), false, Some(CONTEXT + FLASH_NEXT_STATE)),
+            held_before_load(Qwen38_27b, measured(CONTEXT), 0, Some(CONTEXT + FLASH_NEXT_STATE)),
             per_process(CONTEXT)
         );
         // The 27B, Flash-Next, then the 27B again.
         assert_eq!(
-            held_before_load(Qwen38_27b, measured(CONTEXT), true, Some(CONTEXT + STATE + FLASH_NEXT_STATE)),
+            held_before_load(Qwen38_27b, measured(CONTEXT), STATE, Some(CONTEXT + STATE + FLASH_NEXT_STATE)),
             per_process(577_998_848)
         );
     }
