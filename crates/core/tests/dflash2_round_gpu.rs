@@ -391,7 +391,7 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
     // Width 8 carries the four canaries twice: the suite has four prompts.
     let prompts8: Vec<Vec<i32>> = canaries.iter().chain(&canaries).cloned().collect();
     assert!(prompts8.iter().all(|p| p.len() + TOTAL <= MAX_CONTEXT as usize), "a canary outgrows the context");
-    assert_eq!(snapshot_format_version(), 5, "this test reads the version-5 blob layout");
+    assert_eq!(snapshot_format_version(), 6, "this test reads the version-6 blob layout");
 
     let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
         .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));
@@ -763,7 +763,7 @@ fn hq_verify_rounds_clear_the_ring_bits_of_every_rejected_draft() {
         prompts[3].len()
     );
     assert!(prompts.iter().all(|p| p.len() + TOTAL < CONTEXT as usize), "a prompt outgrows the context");
-    assert_eq!(snapshot_format_version(), 5, "this test reads the version-5 blob layout");
+    assert_eq!(snapshot_format_version(), 6, "this test reads the version-6 blob layout");
 
     let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
         .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));
@@ -970,7 +970,7 @@ fn under_the_sampled_draft_the_drafter_draws_and_each_lane_keeps_its_text() {
     let (canaries, stop_ids) = chat_canaries(&reader);
     let prompts8: Vec<Vec<i32>> = canaries.iter().chain(&canaries).cloned().collect();
     assert!(prompts8.iter().all(|p| p.len() + TOTAL <= MAX_CONTEXT as usize), "a canary outgrows the context");
-    assert_eq!(snapshot_format_version(), 5, "this test reads the version-5 blob layout");
+    assert_eq!(snapshot_format_version(), 6, "this test reads the version-6 blob layout");
     let think_end = {
         let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
         let ids = frontend.tokenizer().encode("</think>").unwrap_or_else(|e| panic!("tokenize: {e}"));

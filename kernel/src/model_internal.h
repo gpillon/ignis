@@ -14,6 +14,8 @@
 
 #include "prefill_swiglu.h"
 #include "rope_scaling.h"
+#include "round_shape.h"
+#include "round_timing.h"
 #include "tma_descriptor_cache.h"
 #include "w4a4_activation_layout.h"
 
@@ -637,18 +639,22 @@ struct IgnisVerifyRound {
 // GitHub #674: one kind of round's timing under the measurement switch IGNIS_ROUND_TIMING
 // (kernel/src/step.cu): an event recorded on the model's stream just before each replayed round's
 // graph and one just after it, on the GPU's clock. A ring of them, so a round is read once its own
-// events have completed, without waiting on the stream.
+// events and the next round's launch have completed, without waiting on the stream. GitHub #689:
+// one ring for both of a load's round shapes, each slot naming its round's, so that a round's
+// period runs to the next round of its kind whatever shape that one is
+// (kernel/src/round_timing.h).
 struct RoundTiming {
   static constexpr std::uint64_t kRing = 16;
   std::array<cudaEvent_t, kRing> pre{};
   std::array<cudaEvent_t, kRing> post{};
+  // Each slot's round shape: 0, the base shape, for every plain round and every verify round of a
+  // load of one shape; 1 for an extended round.
+  std::array<std::uint8_t, kRing> shape{};
   // Rounds whose two events were recorded, and rounds read so far.
   std::uint64_t recorded = 0;
   std::uint64_t collected = 0;
-  // The current block's samples, in us.
-  std::vector<float> period;
-  std::vector<float> span;
-  std::vector<float> gap;
+  // The current blocks' samples, one block per round shape.
+  ignis::round_timing::Blocks blocks;
 };
 
 // The opaque loaded-model handle (never dereferenced across the boundary).
@@ -963,6 +969,11 @@ struct ignis_model {
   // window is then IGNIS_BASE_SHAPE_DRAFT_TOKENS -- and null on every other
   // load. Read where `base_shape` is.
   std::unique_ptr<IgnisVerifyRound> extended_shape;
+  // GitHub #689: the shape rule's thresholds a load with an extended shape
+  // takes (`ignis_model_load_options::shape_enter_accepted`,
+  // `shape_stay_accepted`), read where a verify round's shape is chosen and
+  // after it; the defaults, never read, on every other load.
+  ignis::round_shape::ShapeRule shape_rule{};
   // GitHub #302: set on a Flash-Next load, whose program the step ABI's
   // entry points dispatch to. It shares this handle's stream, both scratch
   // arenas, the sampling staging, the decode staging and the decode graphs;

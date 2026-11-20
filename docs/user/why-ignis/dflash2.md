@@ -85,9 +85,11 @@ round for every lane](decode-round.md).
   choice at load.
 - **Metrics**: `ignis_speculative_rounds_total`,
   `ignis_speculative_drafted_tokens_total`,
-  `ignis_speculative_accepted_tokens_total`, and the per-position pair
+  `ignis_speculative_accepted_tokens_total`, the per-position pair
   `ignis_speculative_position_drafted_total` and
-  `ignis_speculative_position_accepted_total` ([metrics](../reference/metrics.md)).
+  `ignis_speculative_position_accepted_total`, and from 0.11.0 the rounds at
+  each round shape, `ignis_speculative_shape_rounds_total`
+  ([metrics](../reference/metrics.md)).
   They appear after the first speculative request; accepted over rounds is
   your live tokens-per-round.
 - **Playground**: the [Monitor](../playground/monitor.md) and the timings

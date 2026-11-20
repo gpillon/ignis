@@ -75,8 +75,9 @@ void set_error(std::string message) {
 // capture, kernel/src/decode_graph.cu; off, each call below is one test of a bool). Around every
 // replayed round's graph, an event recorded on the model's stream just before the launch and one
 // just after it: the GPU's clock, with no tracer, which under Nsight Systems adds ~400 us to every
-// graph launch on the RTX 5090's host. `before` is the launch's side.
-void round_timing_mark(ignis_model *model, RoundTiming &timing, bool before) {
+// graph launch on the RTX 5090's host. `before` is the launch's side; GitHub #689: `shape` the
+// round's shape, 1 for an extended round.
+void round_timing_mark(ignis_model *model, RoundTiming &timing, bool before, std::uint8_t shape = 0) {
   if (!model->round_timing) {
     return;
   }
@@ -84,7 +85,9 @@ void round_timing_mark(ignis_model *model, RoundTiming &timing, bool before) {
   if (cudaEventRecord(before ? timing.pre[at] : timing.post[at], model->stream) != cudaSuccess) {
     (void)cudaGetLastError();
   }
-  if (!before) {
+  if (before) {
+    timing.shape[at] = shape;
+  } else {
     ++timing.recorded;
   }
 }
@@ -94,11 +97,13 @@ float round_timing_median(std::vector<float> samples) {
   return samples.empty() ? 0.0f : samples[samples.size() / 2];
 }
 
-// Every timed round of `kind` whose events have completed, read without waiting: its span (the
-// event before its graph to the one after), and with the round of its kind before it its period
-// (event before to event before) and its gap (the earlier round's event after to this one's event
-// before), unless the two began 50 ms or more apart (a request or a prefill between them). Each
-// 256 periods, one line on stderr: their median, their mean, and the block's median span and gap.
+// Every timed round of `kind` whose events and the next timed round's launch have completed, read
+// without waiting: its span (the event before its graph to the one after), its period (its event
+// before to the next round's) and its gap (its event after to the next round's event before),
+// unless the two began 50 ms or more apart (a request or a prefill between them), each in its round
+// shape's block (kernel/src/round_timing.h). Each 256 periods of a shape, one line on stderr: their
+// median, their mean, and the block's median span and gap, under `kind` for the base shape and
+// `kind extended` for the extended one.
 void round_timing_collect(ignis_model *model, RoundTiming &timing, const char *kind) {
   if (!model->round_timing) {
     return;
@@ -106,44 +111,41 @@ void round_timing_collect(ignis_model *model, RoundTiming &timing, const char *k
   if (timing.recorded > timing.collected + RoundTiming::kRing) {
     timing.collected = timing.recorded - RoundTiming::kRing;  // those rounds' events were recorded over
   }
-  while (timing.collected < timing.recorded) {
+  while (timing.collected + 1 < timing.recorded) {
     const std::uint64_t round = timing.collected;
     const std::uint64_t at = round % RoundTiming::kRing;
-    if (cudaEventQuery(timing.post[at]) != cudaSuccess) {
+    const std::uint64_t next = (round + 1) % RoundTiming::kRing;
+    if (cudaEventQuery(timing.post[at]) != cudaSuccess || cudaEventQuery(timing.pre[next]) != cudaSuccess) {
       (void)cudaGetLastError();
       return;
     }
     float span = 0.0f;
-    if (cudaEventElapsedTime(&span, timing.pre[at], timing.post[at]) == cudaSuccess) {
-      timing.span.push_back(span * 1000.0f);
-    }
-    // The round before it, while its events are still its own.
-    const std::uint64_t previous = (round + RoundTiming::kRing - 1) % RoundTiming::kRing;
     float period = 0.0f;
     float gap = 0.0f;
-    if (round > 0 && round - 1 + RoundTiming::kRing >= timing.recorded &&
-        cudaEventElapsedTime(&period, timing.pre[previous], timing.pre[at]) == cudaSuccess &&
-        cudaEventElapsedTime(&gap, timing.post[previous], timing.pre[at]) == cudaSuccess && period < 50.0f) {
-      timing.period.push_back(period * 1000.0f);
-      timing.gap.push_back(gap * 1000.0f);
+    if (cudaEventElapsedTime(&span, timing.pre[at], timing.post[at]) == cudaSuccess &&
+        cudaEventElapsedTime(&period, timing.pre[at], timing.pre[next]) == cudaSuccess &&
+        cudaEventElapsedTime(&gap, timing.post[at], timing.pre[next]) == cudaSuccess) {
+      ignis::round_timing::add(timing.blocks, timing.shape[at], span, period, gap);
     }
     (void)cudaGetLastError();
     ++timing.collected;
-    if (timing.period.size() >= 256) {
+    for (std::size_t shape = 0; shape < timing.blocks.size(); ++shape) {
+      ignis::round_timing::Block &block = timing.blocks[shape];
+      if (block.period.size() < 256) {
+        continue;
+      }
       double mean = 0.0;
-      for (const float sample : timing.period) {
+      for (const float sample : block.period) {
         mean += sample;
       }
-      mean /= static_cast<double>(timing.period.size());
+      mean /= static_cast<double>(block.period.size());
       std::fprintf(stderr,
-                   "ignis leaf: round timing %s n %zu: period median %.1f us mean %.1f, span median %.1f, gap "
+                   "ignis leaf: round timing %s%s n %zu: period median %.1f us mean %.1f, span median %.1f, gap "
                    "median %.1f\n",
-                   kind, timing.period.size(), round_timing_median(timing.period), mean,
-                   round_timing_median(timing.span), round_timing_median(timing.gap));
+                   kind, shape == 0 ? "" : " extended", block.period.size(), round_timing_median(block.period), mean,
+                   round_timing_median(block.span), round_timing_median(block.gap));
       std::fflush(stderr);
-      timing.period.clear();
-      timing.span.clear();
-      timing.gap.clear();
+      block = {};
     }
   }
 }
@@ -2197,6 +2199,8 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
                          int32_t *out_token_ids) {
   const std::uint32_t k = verify.window;
   const std::uint32_t lane_columns = k + 1;
+  // GitHub #689: whether the round is at its load's extended shape.
+  const bool extended = &verify == model->extended_shape.get();
   // GitHub #687: the caller's arrays are strided by the load's window
   // (`speculative_window`), the round's buffers by its shape's: equal on a
   // load of one shape, and on a load of two at its extended shape; a base
@@ -2457,7 +2461,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
     // appended some of its columns.
     uncommitted.armed = true;
     if (use_graph) {
-      round_timing_mark(model, model->verify_timing, true);
+      round_timing_mark(model, model->verify_timing, true, extended ? 1 : 0);
       const cudaError_t err = cudaGraphLaunch(verify.graph_exec[batch_size - 1], model->stream);
       round_timing_mark(model, model->verify_timing, false);
       if (err != cudaSuccess) {
@@ -2898,6 +2902,18 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
       if (options.out_extents != nullptr) {
         options.out_extents[i] = static_cast<std::uint32_t>(extents[i]);
       }
+      // GitHub #689: on a load of two round shapes, what the lane asks of its
+      // next round (kernel/src/round_shape.h), from this round's shape, its
+      // extent and the drafts the target accepted -- not what a stop or the
+      // host's cut kept: the drafts' quality, not the grammar's.
+      if (model->extended_shape != nullptr) {
+        ignis_seq &seq = *sequences[i];
+        seq.asks_extended_shape = ignis::round_shape::asks_extended(model->shape_rule, seq.asks_extended_shape,
+                                                                    extended, extents[i], accepted[i]);
+      }
+    }
+    if (options.out_round_shape != nullptr) {
+      *options.out_round_shape = extended ? 1 : 0;
     }
     model->last_step_kernel_count = model->layers.size();
     model->last_step_graph_launches = use_graph ? 1 : 0;
@@ -3028,12 +3044,14 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           return -1;
         }
       }
-      // GitHub #687: on a load of two round shapes, the round runs at its base
-      // shape unless IGNIS_ROUND_SHAPE, read here at each round, names the
-      // extended one, which takes a round of no more lanes than it runs and no
-      // lane whose commit the host cuts (kernel/src/round_shape.h).
+      // GitHub #687, #689: on a load of two round shapes, the round runs at the
+      // extended shape when every lane in it asks (the shape rule's asks and
+      // the shape policy `all`), it has no more lanes than that shape runs and
+      // no lane whose commit the host cuts (kernel/src/round_shape.h);
+      // IGNIS_ROUND_SHAPE, read here at each round, forces either shape over
+      // the rule.
       if (model->extended_shape != nullptr) {
-        ignis::round_shape::Named named = ignis::round_shape::Named::kBase;
+        ignis::round_shape::Named named = ignis::round_shape::Named::kRule;
         try {
           named = ignis::round_shape::read_switch();
         } catch (const std::invalid_argument &e) {
@@ -3043,7 +3061,12 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
         const bool host_cut = options->host_cut_lanes != nullptr &&
                               std::any_of(options->host_cut_lanes, options->host_cut_lanes + batch_size,
                                           [](std::uint8_t cut) { return cut != 0; });
-        if (ignis::round_shape::runs_extended(named, batch_size, model->extended_shape->lanes, host_cut)) {
+        std::array<std::uint8_t, IGNIS_DECODE_MAX_BATCH> asks{};
+        for (uint64_t i = 0; i < batch_size; ++i) {
+          asks[i] = sequences[i] != nullptr && sequences[i]->asks_extended_shape ? 1 : 0;
+        }
+        if (ignis::round_shape::runs_extended(named, asks.data(), batch_size, model->extended_shape->lanes,
+                                              host_cut)) {
           shape = model->extended_shape.get();
         }
       }

@@ -1939,6 +1939,57 @@ fn the_draft_rule_is_refused_by_name_where_no_dflash2_drafts() {
     }
 }
 
+/// GitHub #689: the shape rule's two thresholds ride the speculation, 7 to
+/// enter and 6 to stay unless named, by flag or env, each a visible,
+/// patchable reload of the 27B's. A stay threshold past the draft window of
+/// a load with an extended shape is refused naming the field and the window
+/// (no extended round could take it); at 7 drafts or fewer no round reads it.
+/// Outside the fields' ranges, and where no DFlash2 drafts, they are refused
+/// by name.
+#[test]
+fn the_shape_rules_thresholds_ride_the_speculation_and_a_stay_past_the_window_is_refused() {
+    let thresholds = |config: &Config| config.speculation.map(|s| (s.shape_rule().enter_accepted(), s.shape_rule().stay_accepted()));
+    let default = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "15"]);
+    assert_eq!(thresholds(&default), Some((7, 6)));
+    let named = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "15", "--spec-shape-enter-accepted", "5", "--spec-shape-stay-accepted", "15"]);
+    assert_eq!(thresholds(&named), Some((5, 15)));
+    let env = env_map(&[("IGNIS_SPEC_BACKEND", "dflash2"), ("IGNIS_SPEC_DRAFT_TOKENS", "10"), ("IGNIS_SPEC_SHAPE_STAY_ACCEPTED", "10")]);
+    assert_eq!(thresholds(&expect_config(resolve(&[], env).expect("resolve"))), Some((7, 10)));
+    for name in ["shape_enter_accepted", "shape_stay_accepted"] {
+        let meta = schema::field("spec", name).unwrap();
+        assert!(meta.reload_required && meta.visible && meta.patchable, "spec.{name}: a visible, patchable reload");
+        assert!(meta.applies.refused_by(ModelFamily::FlashNext) && !meta.applies.refused_by(ModelFamily::Qwen38_27b), "spec.{name}: the 27B's");
+    }
+    // Past the window, on a load of two shapes: refused naming the field and the window.
+    for window in [8u32, 10, 14] {
+        let past = (window + 1).to_string();
+        let err = refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", &window.to_string(), "--spec-shape-stay-accepted", &past]);
+        assert!(
+            err.contains(&format!("--spec-shape-stay-accepted {past}")) && err.contains(&format!("--spec-draft-tokens {window}")),
+            "window {window}: {err}"
+        );
+        let at = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", &window.to_string(), "--spec-shape-stay-accepted", &window.to_string()]);
+        assert_eq!(thresholds(&at), Some((7, window)), "window {window}: a stay of the whole window is taken");
+    }
+    // A load of one shape never reads it.
+    let one_shape = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7", "--spec-shape-stay-accepted", "12"]);
+    assert_eq!(thresholds(&one_shape), Some((7, 12)));
+    // Outside the fields' ranges.
+    for (flag, raw) in [("--spec-shape-enter-accepted", "8"), ("--spec-shape-enter-accepted", "0"), ("--spec-shape-stay-accepted", "16"), ("--spec-shape-stay-accepted", "0")] {
+        let err = refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "15", flag, raw]);
+        assert!(err.contains(flag) && err.contains(raw), "{flag} {raw}: {err}");
+    }
+    // Where no DFlash2 drafts: no backend, `off`, and the 27B's MTP head.
+    for flag in [["--spec-shape-enter-accepted", "5"], ["--spec-shape-stay-accepted", "4"]] {
+        let err = refused(&["--profile", "none", flag[0], flag[1]]);
+        assert!(err.contains(flag[0]) && err.contains("--spec-backend"), "{err}");
+        let err = refused(&["--spec-backend", "off", flag[0], flag[1]]);
+        assert!(err.contains(flag[0]) && err.contains("off"), "{err}");
+        let err = the_27b_mtp(&["--spec-backend", "mtp", flag[0], flag[1]]).expect_err("DFlash2's").0;
+        assert!(err.contains(flag[0]) && err.contains("the shape rule"), "{err}");
+    }
+}
+
 #[test]
 fn mtp_takes_no_proposal_head_and_spec_off_takes_no_draft_options() {
     let err = refused(&["--spec-backend", "mtp", "--spec-draft-head", "shortlist"]);

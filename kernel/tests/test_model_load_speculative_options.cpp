@@ -306,6 +306,50 @@ int main() {
       }
     }
   }
+  // GitHub #689: the shape rule's thresholds, read on a DFlash2 load past 7
+  // drafts alone: an entry threshold past the base window's 7, or a stay
+  // threshold past the load's window, is refused naming the field and its
+  // range; 0 is the default and every threshold in range reaches the binding.
+  // A load of one shape (7 drafts, the MTP head) never reads them.
+  {
+    for (const uint32_t window : {8u, 10u, 15u}) {
+      for (uint32_t stay = 0; stay <= window + 1; ++stay) {
+        ignis_model_load_options options = dflash2(window);
+        options.shape_stay_accepted = stay;
+        const std::string m = load_error({}, &options);
+        const std::string at = "window " + std::to_string(window) + ", shape_stay_accepted " + std::to_string(stay);
+        if (stay <= window) {
+          check(contains(m, "text/token_embedding"), at + " reaches the binding: " + m);
+        } else {
+          check(contains(m, "shape_stay_accepted " + std::to_string(stay)) &&
+                    contains(m, "1.." + std::to_string(window)),
+                at + " is refused naming the field and the window: " + m);
+        }
+      }
+      for (uint32_t enter = 0; enter <= 8; ++enter) {
+        ignis_model_load_options options = dflash2(window);
+        options.shape_enter_accepted = enter;
+        const std::string m = load_error({}, &options);
+        const std::string at = "window " + std::to_string(window) + ", shape_enter_accepted " + std::to_string(enter);
+        if (enter <= 7) {
+          check(contains(m, "text/token_embedding"), at + " reaches the binding: " + m);
+        } else {
+          check(contains(m, "shape_enter_accepted 8") && contains(m, "1..7"),
+                at + " is refused naming the field and the base window: " + m);
+        }
+      }
+    }
+    for (const int32_t backend : {static_cast<int32_t>(IGNIS_SPECULATIVE_DFLASH2),
+                                  static_cast<int32_t>(IGNIS_SPECULATIVE_MTP)}) {
+      ignis_model_load_options one_shape = dflash2(7);
+      one_shape.speculative_backend = backend;
+      one_shape.shape_enter_accepted = 9;
+      one_shape.shape_stay_accepted = 12;
+      const std::string m = load_error({}, &one_shape);
+      check(!contains(m, "shape_"), "backend " + std::to_string(backend) +
+                                        " at 7 drafts reads no shape threshold: " + m);
+    }
+  }
   // The control arm for the checks above: every valid window gets past them
   // and fails on binding instead.
   for (uint32_t window = 1; window <= IGNIS_DFLASH2_MAX_DRAFT_TOKENS; ++window) {

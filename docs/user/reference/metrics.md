@@ -78,6 +78,7 @@ The metrics listener (on by default, keyless, on loopback) serves these in the P
 | `ignis_speculative_position_accepted_total` | counter | Verify rounds that committed the draft at the position. | after the first request that ran speculative verify rounds |
 | `ignis_speculative_position_drafted_total` | counter | Verify rounds that proposed a draft at the position. | after the first request that ran speculative verify rounds |
 | `ignis_speculative_rounds_total` | counter | Verify rounds run. | after the first request that ran speculative verify rounds |
+| `ignis_speculative_shape_rounds_total` | counter | Verify rounds run, by round shape: base or extended. | after the first request that ran speculative verify rounds |
 | `ignis_speech_audio_seconds_total` | counter | Seconds of audio the completed transcriptions covered. | on a server that has been asked for a transcription |
 | `ignis_speech_commit_wait_seconds` | histogram | Wait from a transcription's commit (a batch request's last byte received) to its transcript, completed ones only. | on a server that has been asked for a transcription |
 | `ignis_speech_queue_length` | gauge | Batch transcriptions waiting behind the one running. | on a server that has been asked for a transcription |
