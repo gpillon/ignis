@@ -17,8 +17,7 @@ signature happens to break.
 Each ticket gets a fresh implementer whose brief points at the spec, the
 ticket and any shared notes, which live in the coordinator's `.scratch/`. An
 implementer is stopped once it reports; follow-up work goes to a new agent with
-a short handoff in the scratchpad, never back to the finished one. At most
-three agents run at once, reviews included.
+a short handoff in the scratchpad, never back to the finished one.
 
 ## Checks
 
