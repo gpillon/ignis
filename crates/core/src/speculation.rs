@@ -541,9 +541,122 @@ impl Default for ShapeRule {
     }
 }
 
+/// GitHub #690 (spec #684): the **shape policy** on a DFlash2 load with an
+/// extended round shape (`kernel/src/round_shape.h` `policy_extends`): how
+/// the lanes' asks of the [`ShapeRule`] become a verify round's shape. A
+/// round of 5 to 8 lanes runs at the base shape under either. The server's
+/// `spec.shape_policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShapePolicy {
+    /// At one lane, the lane's ask. At 2 to 4 lanes, extended when the drafts
+    /// the asking lanes are expected to take past the base window exceed
+    /// what the wider round costs every lane in it ([`ShapeEstimate`]). The
+    /// default.
+    #[default]
+    Aggregate,
+    /// Extended only when every lane in the round asks: no lane pays for
+    /// another.
+    All,
+}
+
+impl ShapePolicy {
+    /// The operator's spellings (`--spec-shape-policy`).
+    pub const NAMES: [&'static str; 2] = ["aggregate", "all"];
+
+    /// Parse the operator's spelling, naming both on a refusal.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "aggregate" => Ok(Self::Aggregate),
+            "all" => Ok(Self::All),
+            other => Err(format!("unknown shape policy `{other}` (expected aggregate or all)")),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Aggregate => "aggregate",
+            Self::All => "all",
+        }
+    }
+
+    /// `enum ignis_shape_policy` (`kernel/include/ignis_model.h`).
+    pub fn abi_code(&self) -> u32 {
+        match self {
+            Self::Aggregate => 0,
+            Self::All => 1,
+        }
+    }
+}
+
+/// GitHub #690: the most verify rounds of its own a lane's expectations read
+/// over (`IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS`).
+pub const SHAPE_ESTIMATE_MAX_ROUNDS: u32 = 64;
+
+/// GitHub #690: what [`ShapePolicy::Aggregate`] reads beside the lanes' asks:
+/// the recent verify rounds of its own each lane's expectations are read over
+/// (the server's `spec.shape_estimate_rounds`), and the extended round's
+/// period over the base round's at 1 to [`EXTENDED_SHAPE_MAX_LANES`] lanes, in
+/// thousandths (`spec.shape_period_ratios`; the one-lane entry is not read, a
+/// lane alone running at the shape it asks). Both defaults are provisional:
+/// the ratios are the RTX 5090's measured before the cost levers, three lanes
+/// the line between two and four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShapeEstimate {
+    rounds: u32,
+    period_ratios_milli: [u32; EXTENDED_SHAPE_MAX_LANES as usize],
+}
+
+impl ShapeEstimate {
+    /// 16 rounds: a lane whose extended rounds do not pay is granted one
+    /// again once its window holds none, which a lane beside it pays for
+    /// once in 17 rounds -- about 1% of its rate at two lanes -- and a lane
+    /// whose text turns predictable waits at most 16 rounds.
+    pub const DEFAULT_ROUNDS: u32 = 16;
+    /// 1.15, 1.23, 1.27 and 1.31 at 1 to 4 lanes.
+    pub const DEFAULT_PERIOD_RATIOS_MILLI: [u32; EXTENDED_SHAPE_MAX_LANES as usize] = [1150, 1230, 1270, 1310];
+    /// The narrowest and widest ratio taken: an extended round costs at
+    /// least a base round and at most twice one, for at most twice its
+    /// columns.
+    pub const PERIOD_RATIO_MILLI_RANGE: std::ops::RangeInclusive<u32> = 1000..=2000;
+
+    /// `rounds` in `1..=`[`SHAPE_ESTIMATE_MAX_ROUNDS`] and every ratio in
+    /// [`Self::PERIOD_RATIO_MILLI_RANGE`]; the refusal names which and its
+    /// range.
+    pub fn new(rounds: u32, period_ratios_milli: [u32; EXTENDED_SHAPE_MAX_LANES as usize]) -> Result<Self, String> {
+        if !(1..=SHAPE_ESTIMATE_MAX_ROUNDS).contains(&rounds) {
+            return Err(format!(
+                "the shape policy's estimate window of {rounds} rounds is not in 1..={SHAPE_ESTIMATE_MAX_ROUNDS}"
+            ));
+        }
+        if let Some(lanes) = period_ratios_milli.iter().position(|ratio| !Self::PERIOD_RATIO_MILLI_RANGE.contains(ratio)) {
+            return Err(format!(
+                "the shape policy's period ratio at {} lane{} ({}) is not in 1..=2",
+                lanes + 1,
+                if lanes == 0 { "" } else { "s" },
+                f64::from(period_ratios_milli[lanes]) / 1000.0
+            ));
+        }
+        Ok(Self { rounds, period_ratios_milli })
+    }
+
+    pub fn rounds(&self) -> u32 {
+        self.rounds
+    }
+
+    pub fn period_ratios_milli(&self) -> [u32; EXTENDED_SHAPE_MAX_LANES as usize] {
+        self.period_ratios_milli
+    }
+}
+
+impl Default for ShapeEstimate {
+    fn default() -> Self {
+        Self { rounds: Self::DEFAULT_ROUNDS, period_ratios_milli: Self::DEFAULT_PERIOD_RATIOS_MILLI }
+    }
+}
+
 /// A validated speculation option: a backend, its draft window, the
-/// drafter's proposal head, the rounds' draft rule and (GitHub #689) the
-/// shape rule's thresholds.
+/// drafter's proposal head, the rounds' draft rule and (GitHub #689, #690)
+/// the shape rule's thresholds and the shape policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Speculation {
     backend: SpeculativeBackend,
@@ -552,6 +665,8 @@ pub struct Speculation {
     draft_rule: DraftRule,
     drafter_sampling: DrafterSampling,
     shape_rule: ShapeRule,
+    shape_policy: ShapePolicy,
+    shape_estimate: ShapeEstimate,
 }
 
 impl Speculation {
@@ -569,6 +684,8 @@ impl Speculation {
             draft_rule: DraftRule::Fixed,
             drafter_sampling: DrafterSampling::default(),
             shape_rule: ShapeRule::default(),
+            shape_policy: ShapePolicy::default(),
+            shape_estimate: ShapeEstimate::default(),
         })
     }
 
@@ -588,6 +705,21 @@ impl Speculation {
 
     pub fn shape_rule(&self) -> ShapeRule {
         self.shape_rule
+    }
+
+    /// The same option with its rounds' shapes chosen from the lanes' asks
+    /// by `shape_policy`, its expectations read as `shape_estimate` says
+    /// (GitHub #690). Every load without an extended shape never reads them.
+    pub fn with_shape_policy(self, shape_policy: ShapePolicy, shape_estimate: ShapeEstimate) -> Self {
+        Self { shape_policy, shape_estimate, ..self }
+    }
+
+    pub fn shape_policy(&self) -> ShapePolicy {
+        self.shape_policy
+    }
+
+    pub fn shape_estimate(&self) -> ShapeEstimate {
+        self.shape_estimate
     }
 
     /// The same option with the drafter scoring through `proposal_head`.

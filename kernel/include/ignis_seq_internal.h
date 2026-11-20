@@ -11,6 +11,7 @@
 #ifndef IGNIS_SEQ_INTERNAL_H
 #define IGNIS_SEQ_INTERNAL_H
 
+#include "ignis_model.h"
 #include "ignis_seq.h"
 
 #include "core/arena.h"
@@ -568,6 +569,17 @@ struct ignis_seq {
   // tie. A prefix or checkpoint claim starts without it, as a cold request
   // does (`ignis_seq_capture_state`).
   bool asks_extended_shape = false;
+  // GitHub #690: on such a load, the sequence's recent verify rounds as the
+  // shape policy `aggregate` reads them (kernel/src/round_shape.h
+  // `record_round`, `estimate_of`): a ring of the widest window's rounds, of
+  // which `shape_rounds_recorded` were written. Empty with no history; only a
+  // verify round of such a load records one. Host-only and never a section:
+  // a snapshot, a restore and a prefix or checkpoint claim leave it empty
+  // (`ignis_seq_apply_progress`), the ask kept -- a lane alone runs at the
+  // shape it asks, and beside others the round's shape already follows its
+  // neighbours, which a restore changes as it changes them.
+  std::array<std::uint8_t, IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS> shape_rounds{};
+  std::uint64_t shape_rounds_recorded = 0;
   // The shared prefix this sequence claims (P4-10, GitHub #126), or null.
   // One reference is held for as long as this handle lives; `shared_pages`
   // restates its page count so every capacity question here can be answered

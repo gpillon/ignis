@@ -339,15 +339,42 @@ int main() {
         }
       }
     }
+    // GitHub #690: and the shape policy's options, by name, the same way.
+    {
+      ignis_model_load_options all = dflash2(15);
+      all.shape_policy = IGNIS_SHAPE_POLICY_ALL;
+      all.shape_estimate_rounds = IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS;
+      all.shape_period_ratios[1] = 1000;
+      all.shape_period_ratios[3] = 2000;
+      const std::string m = load_error({}, &all);
+      check(contains(m, "text/token_embedding"), "`all`, 64 rounds, ratios at 1 and 2 reach the binding: " + m);
+      ignis_model_load_options policy = dflash2(15);
+      policy.shape_policy = 2;
+      const std::string p = load_error({}, &policy);
+      check(contains(p, "shape_policy 2"), "a shape policy that is neither is refused naming the field: " + p);
+      ignis_model_load_options rounds = dflash2(15);
+      rounds.shape_estimate_rounds = IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS + 1;
+      const std::string r = load_error({}, &rounds);
+      check(contains(r, "shape_estimate_rounds 65") && contains(r, "1..64"),
+            "a window past 64 rounds is refused naming the field and its range: " + r);
+      ignis_model_load_options ratios = dflash2(15);
+      ratios.shape_period_ratios[2] = 999;
+      const std::string q = load_error({}, &ratios);
+      check(contains(q, "shape_period_ratios 0,0,999,0") && contains(q, "1000..2000"),
+            "a period ratio under 1 is refused naming the field: " + q);
+    }
     for (const int32_t backend : {static_cast<int32_t>(IGNIS_SPECULATIVE_DFLASH2),
                                   static_cast<int32_t>(IGNIS_SPECULATIVE_MTP)}) {
       ignis_model_load_options one_shape = dflash2(7);
       one_shape.speculative_backend = backend;
       one_shape.shape_enter_accepted = 9;
       one_shape.shape_stay_accepted = 12;
+      one_shape.shape_policy = 2;
+      one_shape.shape_estimate_rounds = 65;
+      one_shape.shape_period_ratios[0] = 999;
       const std::string m = load_error({}, &one_shape);
       check(!contains(m, "shape_"), "backend " + std::to_string(backend) +
-                                        " at 7 drafts reads no shape threshold: " + m);
+                                        " at 7 drafts reads no shape threshold or policy: " + m);
     }
   }
   // The control arm for the checks above: every valid window gets past them

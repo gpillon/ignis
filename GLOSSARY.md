@@ -1149,7 +1149,8 @@ verify and drafter-append graphs per lane count.
 The 27B's verify round at 8 columns a lane (7 drafts) at every lane count up
 to the load's lanes: the one **round shape** of a load at a **draft window**
 of 7 or fewer, and on a DFlash2 load past 7 the shape every round takes unless
-the **shape rule** has every lane in it ask the extended one (#687, #689). Its
+the **shape policy** runs it extended from what the **shape rule** has its
+lanes ask (#687, #689, #690). Its
 buffers are the load's: allocated once, each at the larger of the two shapes'
 sizes.
 
@@ -1175,10 +1176,26 @@ an extended round it asks while that round took at least
 `spec.shape_stay_accepted` (6). It reads what the target accepted, never what
 a stop or a grammar's cut kept, and no confidence from the drafter. The ask is
 the sequence's: a snapshot and a restore carry it, a prefix or checkpoint
-claim starts without it. A round of 1..4 lanes is extended when every lane in
-it asks (the shape policy `all`); a round of 5..8 lanes never is.
-`IGNIS_ROUND_SHAPE=base|extended` forces either shape over it, for
+claim starts without it. The **shape policy** turns a round's asks into its
+shape; a round of 5..8 lanes is never extended.
+`IGNIS_ROUND_SHAPE=base|extended` forces either shape over both, for
 measurement.
+
+**Shape policy**:
+How a **verify round** of a DFlash2 load past 7 drafts takes its **round
+shape** from what the **shape rule** has its lanes ask (#690;
+`spec.shape_policy`). `all`: extended only when every lane asks, so no lane
+pays for another. `aggregate`, the default: at one lane the lane's ask; at
+2..4 lanes extended when the drafts the asking lanes are expected to take past
+position 7 exceed (the extended round's period over the base round's at that
+lane count, `spec.shape_period_ratios`, less one) times the tokens every lane
+is expected to take a base round, each lane's expectations read over its own
+last `spec.shape_estimate_rounds` (16) verify rounds; a lane that asks with no
+extended round among them is granted one, so the estimate has one to read. A
+lane that does not ask then runs the round's 16 columns too and pays for its
+neighbour. The lane's recent rounds are host state, not a section: a restore
+or a claim starts them afresh, the ask kept. A round of 5..8 lanes is at the
+**base shape** under both.
 
 **Near-tie**:
 A split between the token a **decode round** picked and the one a **verify

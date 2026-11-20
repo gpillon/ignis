@@ -989,6 +989,10 @@ struct ignis_model {
   // `shape_stay_accepted`), read where a verify round's shape is chosen and
   // after it; the defaults, never read, on every other load.
   ignis::round_shape::ShapeRule shape_rule{};
+  // GitHub #690: and the shape policy (`ignis_model_load_options::shape_policy`,
+  // `shape_estimate_rounds`, `shape_period_ratios`), read where a verify
+  // round's shape is chosen.
+  ignis::round_shape::ShapePolicy shape_policy{};
   // GitHub #302: set on a Flash-Next load, whose program the step ABI's
   // entry points dispatch to. It shares this handle's stream, both scratch
   // arenas, the sampling staging, the decode staging and the decode graphs;

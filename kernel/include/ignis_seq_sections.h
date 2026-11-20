@@ -473,6 +473,10 @@ inline void ignis_seq_apply_progress(ignis_seq &seq, const ignis_seq_progress_im
   }
   // GitHub #689: the image's ask, never the handle's own from a previous life.
   seq.asks_extended_shape = image.asks_extended_shape != 0;
+  // GitHub #690: and no recent rounds, which the image does not carry: the
+  // handle's own are another life's.
+  seq.shape_rounds = {};
+  seq.shape_rounds_recorded = 0;
 }
 
 /* The physical KV pages a snapshot of `seq` captures: the pages its written
