@@ -191,7 +191,9 @@ cannot be bound refuses the start instead
 changed; `make build` is the fix ([Working with make](contributing/make.md)).
 Before GPU work, `make gpu-status` shows who holds the card, and a CUDA `run`
 or `start` runs a GPU guard that refuses when it is held (`GPU_CHECK=0` skips
-it).
+it). From 0.11.0 a GPU lock another run holds refuses the start too, naming
+that run's pid, worktree and command, and `GPU_CHECK=0` does not skip it: wait
+for that run, or ask whoever started it.
 
 ## Loading a model
 

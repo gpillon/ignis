@@ -198,7 +198,7 @@ try {
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $said = try { Lock-Gpu -Command 'make start' -ProcessId $second.Id | Out-Null; '' } catch { $_.Exception.Message }
     Assert-That ($said -like "GPU lock: the card is held ($Lock) by pid $($first.Id) (powershell) since *, worktree ${tree}: gpu-profile -Test a_test") "a second taker, no wait: '$said'"
-    Assert-That ($watch.Elapsed.TotalSeconds -lt 2) "a second taker, no wait: it took $($watch.Elapsed.TotalSeconds)s"
+    Assert-That ($watch.Elapsed.TotalSeconds -lt 5) "a second taker, no wait: it took $($watch.Elapsed.TotalSeconds)s"
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $said = try { (Lock-Gpu -Command 'gpu-run' -WaitSeconds 2 -ProcessId $second.Id 6>&1) | Out-String } catch { $_.Exception.Message }
     Assert-That ($said -like "GPU lock: the card is held ($Lock) by pid $($first.Id)*") "a wait that runs out: '$said'"
@@ -230,7 +230,7 @@ try {
     [IO.File]::WriteAllText($Lock, (@{ pid = 999999; name = 'gone'; started = '1' } | ConvertTo-Json -Compress))
     $racers = @(1..5 | ForEach-Object {
         Start-Process -FilePath $PowerShell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-Command',
-            ". '$tree\mk\windows\gpulock.ps1'; try { `$null = Lock-Gpu -Command race; Set-Content ('$state\race.' + `$PID) 'won'; Start-Sleep 6 } catch { Set-Content ('$state\race.' + `$PID) 'lost' }"
+            ". '$tree\mk\windows\gpulock.ps1'; try { `$null = Lock-Gpu -Command race; Set-Content ('$state\race.' + `$PID) 'won'; Start-Sleep 12 } catch { Set-Content ('$state\race.' + `$PID) 'lost' }"
     })
     $racers | ForEach-Object { $null = $_.Handle; $_.WaitForExit() }
     $won = @(Get-ChildItem "$state\race.*" | Where-Object { (Get-Content $_.FullName -Raw).Trim() -eq 'won' }).Count

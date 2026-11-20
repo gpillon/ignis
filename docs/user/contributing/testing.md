@@ -42,16 +42,21 @@ print `SKIP:` and return, for a quick local check
 ([ADR 0006](../../adr/0006-exclusive-gpu-testing.md)).
 
 ```sh
-make gpu-status     # VRAM in use, and every process that may hold the card
+make gpu-status     # VRAM in use, every process that may hold the card, the GPU lock's holder
 make gpu-profile    # preflight, the kernel leaf's op tests, the ignored Rust GPU tests
 make kernel-test    # the kernel leaf's CTest op tests alone
+make gpu-run CMD='…'  # from 0.11.0: any other GPU command, under the GPU lock
 ```
 
 `make gpu-profile` runs `scripts/gpu-profile.ps1` on Windows and
-`scripts/gpu-profile.sh` on Linux ([make](make.md) lists their switches).
+`scripts/gpu-profile.sh` on Linux ([make](make.md) lists their switches; from
+0.11.0 `-Test a_test,b_test` / `--test a_test --test b_test` runs only those
+tests).
 
 The card fits one run at a time, in any worktree: check `make gpu-status`
-before every GPU run.
+before every GPU run. From 0.11.0 a GPU lock names who holds the card: a
+server started through make holds it, and the profile, `make kernel-test` and
+`make gpu-run` wait for it ([make](make.md)).
 
 ### Measurement switches
 

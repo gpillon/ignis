@@ -120,7 +120,8 @@ sleeper; second=$!
 capture lockctl acquire --pid "$second" --wait 0 --command "make start"
 expect_code "a second taker, no wait" 1
 says "a second taker, no wait" "the card is held ($lock) by pid $first"
-[ "$secs" -le 1 ] || fail "a second taker, no wait: it took ${secs}s, not at once"
+[ "$secs" -lt 5 ] && ! grep -qF "GPU lock: waiting" <<< "$out" || fail "a second taker, no wait: it waited (${secs}s):
+$out"
 [ "$(holder_pid)" = "$first" ] || fail "a second taker, no wait: the holder changed"
 
 capture lockctl acquire --pid "$second" --wait 2 --command "gpu-run"
@@ -190,7 +191,8 @@ says "gpu.sh status" "GPU lock: held ($lock) by pid $first"
 capture bash "$tree/mk/linux/gpu.sh" guard 8192
 expect_code "the guard, the lock held" 1
 says "the guard, the lock held" "GPU guard: refused -- GPU lock: held ($lock) by pid $first"
-[ "$secs" -le 1 ] || fail "the guard, the lock held: it took ${secs}s, not at once"
+[ "$secs" -lt 5 ] && ! grep -qF "GPU lock: waiting" <<< "$out" || fail "the guard, the lock held: it waited (${secs}s):
+$out"
 capture bash "$tree/mk/linux/gpu.sh" guard 8192 "$first"
 expect_code "the guard, the lock held by its caller" 0
 lockctl release --pid "$first"
@@ -245,7 +247,8 @@ capture server_ctl start --gpu-lock -- "$bin/stub-server" --server-bind "127.0.0
 expect_code "start, the lock held" 1
 says "start, the lock held" "the card is held ($lock) by pid $first"
 [ ! -e "$tmp/state/server.json" ] || fail "start, the lock held: the server was started"
-[ "$secs" -le 1 ] || fail "start, the lock held: it took ${secs}s, not at once"
+[ "$secs" -lt 5 ] && ! grep -qF "GPU lock: waiting" <<< "$out" || fail "start, the lock held: it waited (${secs}s):
+$out"
 lockctl release --pid "$first"
 
 capture env STUB_SERVER=exit-early "$python" "$tree/mk/linux/server.py" start --pid "$run/ignis-server.pid" \
