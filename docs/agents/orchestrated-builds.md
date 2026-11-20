@@ -23,16 +23,28 @@ run, a gate leg) itself, under the GPU rule in `AGENTS.md`, Testing
 (`docs/agents/testing.md`, the GPU test profile).
 
 The local checks run on one host, so code behind the other host's `cfg`
-compiles nowhere before `main`. Before the owner merges the integration
-branch, the coordinator pushes its tip as `ci/<spec>`, with the owner's OK
-since it is a push: the release workflow runs its Linux and Windows test jobs
-on `ci/**` without touching `main`. The coordinator reports both results with
-the branch and deletes `ci/<spec>` once the owner has merged.
+compiles nowhere before `main`: the run on `ci/<spec>` at the end of a build
+is where it compiles first.
 
 ## The end of a build
 
-There is no pull request: the owner merges the integration branch into `main`
-locally, and nothing is pushed until the owner says so.
+There is no pull request. Once every ticket is merged and the review's fixes
+are in, the coordinator lands the integration branch on `main` itself, without
+asking:
+
+1. It merges `main` into the integration branch and pushes the tip as
+   `ci/<spec>`: the release workflow runs its Linux and Windows test jobs on
+   `ci/**` and publishes nothing.
+2. A red job is fixed on the integration branch, within the spec, and pushed
+   again; a fix outside the spec goes to the owner first. A test that fails and
+   then passes on a rerun of the same commit (`gh run rerun --failed`) is
+   flaky: the coordinator opens an issue labelled `bug` and `needs-triage`
+   that names the test, the job and its failing lines, and the green rerun
+   counts. A test that fails its rerun too is a real failure.
+3. With every job of the run green, `main` moves to that commit by fast-forward and is
+   pushed by its SHA, which publishes the `develop` image and prerelease. If
+   `main` moved meanwhile, step 1 runs again.
+4. `ci/<spec>` is deleted, with its Actions caches.
 
 An implementer's merge of the integration branch into its own takes a message
 its brief gives it, such as `Merge 374-integration into the T2 branch before
